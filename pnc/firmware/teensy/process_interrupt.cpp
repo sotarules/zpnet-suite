@@ -1656,6 +1656,30 @@ static volatile uint32_t g_ch2_implicit_rollover_last_vclock_counter32 = 0;
 static volatile uint32_t g_ch2_implicit_rollover_last_ocxo1_counter32 = 0;
 static volatile uint32_t g_ch2_implicit_rollover_last_ocxo2_counter32 = 0;
 
+// Intrinsic CH2 VCLOCK one-second handoff.
+//
+// This is deliberately a steady-state migration only.  VCLOCK_HEARTBEAT still
+// performs SmartZero sampling and the initial/bootstrap publication path; after
+// the first legacy one-second bookend, CH2 owns the recurring +10,000,000-tick
+// VCLOCK edge identity and enqueues a tiny perishable fact for the existing
+// safe drain path.
+static volatile bool     g_vclock_ch2_one_second_enabled = false;
+static volatile uint32_t g_vclock_ch2_one_second_next_counter32 = 0;
+static volatile uint32_t g_vclock_ch2_one_second_enable_count = 0;
+static volatile uint32_t g_vclock_ch2_one_second_reset_count = 0;
+static volatile uint32_t g_vclock_ch2_one_second_service_count = 0;
+static volatile uint32_t g_vclock_ch2_one_second_enqueue_count = 0;
+static volatile uint32_t g_vclock_ch2_one_second_late_count = 0;
+static volatile uint32_t g_vclock_ch2_one_second_late_max_ticks = 0;
+static volatile uint32_t g_vclock_ch2_one_second_catchup_count = 0;
+static volatile uint32_t g_vclock_ch2_one_second_drop_count = 0;
+static volatile uint32_t g_vclock_ch2_one_second_last_target_counter32 = 0;
+static volatile uint32_t g_vclock_ch2_one_second_last_service_counter32 = 0;
+static volatile uint32_t g_vclock_ch2_one_second_last_dwt = 0;
+static volatile uint32_t g_vclock_heartbeat_one_second_legacy_count = 0;
+static volatile uint32_t g_vclock_heartbeat_one_second_handoff_skip_count = 0;
+static volatile uint32_t g_vclock_heartbeat_one_second_fallback_count = 0;
+
 static inline uint32_t clock32_from_ns(uint64_t ns) {
   return (uint32_t)((ns / 100ULL) & 0xFFFFFFFFULL);
 }
@@ -1708,6 +1732,11 @@ static uint32_t project_counter32_from_hw16(const synthetic_clock32_t& c, uint16
 static inline void synthetic_clock_consume_pending_zero_if_any(synthetic_clock32_t& c);
 static void cadence_regression_reset_kind(interrupt_subscriber_kind_t kind);
 static void vclock_fact_ring_reset(void);
+static void vclock_ch2_one_second_disable(void);
+static void vclock_ch2_one_second_enable_after_heartbeat(uint32_t last_counter32);
+static bool vclock_ch2_one_second_already_served_for(uint32_t counter32);
+static void vclock_ch2_one_second_service(uint32_t qtimer_event_dwt,
+                                          uint32_t service_counter32);
 
 static uint32_t vclock_synthetic_from_hardware_low16(uint16_t hardware_low16) {
   if (!g_vclock_clock32.zeroed) return (uint32_t)hardware_low16;
@@ -1735,6 +1764,7 @@ bool interrupt_clock32_zero_from_ns(interrupt_subscriber_kind_t kind, uint64_t n
   if (kind == interrupt_subscriber_kind_t::VCLOCK) {
     vclock_clock_zero_at_hardware_low16(ns, qtimer1_ch0_counter_now());
     g_vclock_lane.logical_count32_at_last_second = g_vclock_clock32.current_counter32;
+    vclock_ch2_one_second_disable();
     cadence_regression_reset_kind(interrupt_subscriber_kind_t::VCLOCK);
     vclock_fact_ring_reset();
     return true;
@@ -1762,6 +1792,7 @@ bool interrupt_clock32_request_zero_from_ns(interrupt_subscriber_kind_t kind, ui
     g_vclock_clock32.pending_zero_ns = ns;
     g_vclock_clock32.pending_zero_counter32 = counter32;
     g_vclock_clock32.pending_zero_count++;
+    vclock_ch2_one_second_disable();
     cadence_regression_reset_kind(interrupt_subscriber_kind_t::VCLOCK);
     vclock_fact_ring_reset();
     return true;
@@ -3236,6 +3267,119 @@ static bool vclock_fact_ring_push_from_isr(vclock_perishable_fact_t fact) {
   return true;
 }
 
+static bool vclock_fact_ring_push_no_arm_from_isr(vclock_perishable_fact_t fact) {
+  if (g_vclock_fact_ring.count >= VCLOCK_PERISHABLE_FACT_RING_SIZE) {
+    g_vclock_fact_ring.overflow_count++;
+    g_vclock_lane.miss_count++;
+    return false;
+  }
+
+  fact.sequence = ++g_vclock_fact_ring.sequence;
+  g_vclock_fact_ring.facts[g_vclock_fact_ring.head] = fact;
+  g_vclock_fact_ring.head =
+      (g_vclock_fact_ring.head + 1U) % VCLOCK_PERISHABLE_FACT_RING_SIZE;
+  g_vclock_fact_ring.count++;
+  g_vclock_fact_ring.enqueue_count++;
+  if (g_vclock_fact_ring.count > g_vclock_fact_ring.high_water) {
+    g_vclock_fact_ring.high_water = g_vclock_fact_ring.count;
+  }
+  return true;
+}
+
+static void vclock_fact_ring_arm_drain_from_timepop(void) {
+  if (g_vclock_fact_ring.count == 0 || g_vclock_fact_ring.drain_armed) return;
+
+  g_vclock_fact_ring.drain_armed = true;
+  g_vclock_fact_ring.asap_arm_count++;
+  const timepop_handle_t h =
+      timepop_arm_asap(vclock_fact_drain_callback, nullptr,
+                       VCLOCK_FACT_DRAIN_NAME);
+  if (h == TIMEPOP_INVALID_HANDLE) {
+    g_vclock_fact_ring.drain_armed = false;
+    g_vclock_fact_ring.asap_fail_count++;
+  }
+}
+
+static void vclock_ch2_one_second_disable(void) {
+  if (g_vclock_ch2_one_second_enabled ||
+      g_vclock_ch2_one_second_next_counter32 != 0) {
+    g_vclock_ch2_one_second_reset_count++;
+  }
+  g_vclock_ch2_one_second_enabled = false;
+  g_vclock_ch2_one_second_next_counter32 = 0;
+}
+
+static void vclock_ch2_one_second_enable_after_heartbeat(uint32_t last_counter32) {
+  g_vclock_ch2_one_second_next_counter32 =
+      last_counter32 + (uint32_t)VCLOCK_COUNTS_PER_SECOND;
+  g_vclock_ch2_one_second_enabled = true;
+  g_vclock_ch2_one_second_enable_count++;
+}
+
+static bool vclock_ch2_one_second_already_served_for(uint32_t counter32) {
+  if (!g_vclock_ch2_one_second_enabled) return false;
+
+  // Normal CH2 ownership means the ISR has already advanced the next gear tooth
+  // beyond this heartbeat's counter identity before TimePop invokes the callback.
+  return (int32_t)(g_vclock_ch2_one_second_next_counter32 - counter32) > 0;
+}
+
+static void vclock_ch2_one_second_service(uint32_t qtimer_event_dwt,
+                                          uint32_t service_counter32) {
+  if (!g_vclock_ch2_one_second_enabled) return;
+  if (!g_vclock_lane.active || !g_rt_vclock || !g_rt_vclock->active) return;
+
+  const uint32_t target_counter32 = g_vclock_ch2_one_second_next_counter32;
+  if ((int32_t)(service_counter32 - target_counter32) < 0) return;
+
+  const uint32_t late_ticks = service_counter32 - target_counter32;
+  uint32_t authored_dwt = qtimer_event_dwt;
+  if (late_ticks != 0) {
+    g_vclock_ch2_one_second_late_count++;
+    if (late_ticks > g_vclock_ch2_one_second_late_max_ticks) {
+      g_vclock_ch2_one_second_late_max_ticks = late_ticks;
+    }
+    authored_dwt -= vclock_cycles_for_ticks(late_ticks);
+  }
+
+  const pps_t witness_pps = g_last_pps_witness_valid ? g_last_pps_witness : pps_t{};
+
+  vclock_perishable_fact_t fact{};
+  fact.observed_dwt_at_event = authored_dwt;
+  fact.target_counter32 = target_counter32;
+  fact.target_low16 = vclock_hardware_low16_from_synthetic(target_counter32);
+  fact.observed_low16 = (uint16_t)(service_counter32 & 0xFFFFU);
+  fact.one_second_due = true;
+  fact.witness_pps_valid = g_last_pps_witness_valid;
+  fact.witness_pps = witness_pps;
+  fact.fallback_sequence = g_pps_gpio_heartbeat.edge_count + 1U;
+
+  g_vclock_ch2_one_second_service_count++;
+  g_vclock_ch2_one_second_last_target_counter32 = target_counter32;
+  g_vclock_ch2_one_second_last_service_counter32 = service_counter32;
+  g_vclock_ch2_one_second_last_dwt = authored_dwt;
+
+  if (vclock_fact_ring_push_no_arm_from_isr(fact)) {
+    g_vclock_ch2_one_second_enqueue_count++;
+  } else {
+    // Leave the target armed so the heartbeat fallback path can still publish
+    // the one-second event rather than silently losing a public bookend.
+    g_vclock_ch2_one_second_drop_count++;
+    return;
+  }
+
+  // Advance as a gear, not as a service-time rubber band.  If service is ever
+  // more than one second late, skip stale teeth diagnostically instead of
+  // trying to flood the drain with catch-up publications.
+  uint32_t next = target_counter32 + (uint32_t)VCLOCK_COUNTS_PER_SECOND;
+  while ((int32_t)(service_counter32 - next) >= 0) {
+    next += (uint32_t)VCLOCK_COUNTS_PER_SECOND;
+    g_vclock_ch2_one_second_catchup_count++;
+    g_vclock_ch2_one_second_drop_count++;
+  }
+  g_vclock_ch2_one_second_next_counter32 = next;
+}
+
 static void vclock_apply_perishable_fact_deferred(
     const vclock_perishable_fact_t& fact) {
   if (!fact.one_second_due || !g_rt_vclock || !g_rt_vclock->active) {
@@ -3613,8 +3757,9 @@ static void ocxo_lane_install_logical_grid(interrupt_subscriber_kind_t kind,
 
 // The old VCLOCK_HEARTBEAT-driven OCXO arming path has been retired.  OCXO1 and
 // OCXO2 now maintain their own 1 kHz compare cadence on their local QTimer
-// channels; VCLOCK_HEARTBEAT remains only the VCLOCK event/bookend and SmartZero
-// sample TimePop heartbeat.  Relay deassertion now runs from intrinsic CH2.
+// channels; VCLOCK_HEARTBEAT remains the SmartZero/bootstrap sample TimePop
+// heartbeat.  Relay deassertion and steady-state VCLOCK one-second bookends now
+// run from intrinsic CH2.
 
 static void vclock_heartbeat_timepop_callback(timepop_ctx_t* ctx,
                                             timepop_diag_t*,
@@ -3628,12 +3773,13 @@ static void vclock_heartbeat_timepop_callback(timepop_ctx_t* ctx,
   g_vclock_heartbeat_fire_count++;
 
   // VCLOCK_HEARTBEAT is a scheduled housekeeping/event-authoring client,
-  // not a rollover owner.  Low-word rollover extension is handled only by
+  // not a rollover owner and no longer the steady-state VCLOCK one-second
+  // authority.  Low-word rollover extension is handled only by
   // interrupt_ch2_implicit_rollover_tend(), which runs before TimePop gets
   // this CH2 event.  Keep the heartbeat's authored counter identity for
-  // SmartZero, PPS_VCLOCK bookends, and reports, but do not refresh the
-  // synthetic clock32 extender here.  Relay deassert countdown has moved to
-  // intrinsic CH2 elapsed-tick service.
+  // SmartZero, bootstrap/failsafe bookends, and reports, but do not refresh the
+  // synthetic clock32 extender here.  Relay deassert countdown and steady-state
+  // VCLOCK one-second authorship have moved to intrinsic CH2 service.
   g_vclock_lane.logical_count32_at_last_second = cadence_counter32;
   g_vclock_heartbeat_vclock_ticks++;
   g_vclock_heartbeat_last_vclock_hw16 = fired_low16;
@@ -3646,6 +3792,11 @@ static void vclock_heartbeat_timepop_callback(timepop_ctx_t* ctx,
                         qtimer_event_dwt,
                         cadence_counter32,
                         fired_low16);
+
+  // CH2 may have enqueued a fixed-grid one-second fact before TimePop invoked
+  // this callback.  Arm the existing safe drain from the heartbeat phase rather
+  // than mutating TimePop's slot table in the pre-TimePop CH2 custody window.
+  vclock_fact_ring_arm_drain_from_timepop();
 
   if (g_rt_vclock) {
     g_rt_vclock->irq_count++;
@@ -3679,45 +3830,62 @@ static void vclock_heartbeat_timepop_callback(timepop_ctx_t* ctx,
         ++g_vclock_lane.tick_mod_1000 >= TICKS_PER_SECOND_EVENT) {
       g_vclock_lane.tick_mod_1000 = 0;
 
-      // PPS_VCLOCK / PPS coincidence diagnostic.
-      uint32_t coincidence_cycles = 0;
-      bool     coincidence_valid  = false;
-      {
-        const pps_vclock_t pvc = store_load_pvc();
-        if (pvc.sequence > 0) {
-          const int32_t cycles_since_pvc =
-              (int32_t)(qtimer_event_dwt - pvc.dwt_at_edge);
-          if (llabs((long long)cycles_since_pvc) <
-              DWT_PPS_COINCIDENCE_THRESHOLD_CYCLES) {
-            coincidence_cycles =
-                (uint32_t)(cycles_since_pvc >= 0 ? cycles_since_pvc
-                                                 : -cycles_since_pvc);
-            coincidence_valid = true;
+      if (vclock_ch2_one_second_already_served_for(cadence_counter32)) {
+        // Normal migrated path: native CH2 authored and enqueued the one-second
+        // fact before TimePop invoked this heartbeat callback.
+        g_vclock_heartbeat_one_second_handoff_skip_count++;
+      } else {
+        // Bootstrap/failsafe path.  The first one-second bookend after startup,
+        // or any unexpected CH2 handoff miss, uses the exact legacy heartbeat
+        // publication path.  That preserves campaign-start and ZERO behavior.
+        if (g_vclock_ch2_one_second_enabled) {
+          g_vclock_heartbeat_one_second_fallback_count++;
+        } else {
+          g_vclock_heartbeat_one_second_legacy_count++;
+        }
+
+        // PPS_VCLOCK / PPS coincidence diagnostic.
+        uint32_t coincidence_cycles = 0;
+        bool     coincidence_valid  = false;
+        {
+          const pps_vclock_t pvc = store_load_pvc();
+          if (pvc.sequence > 0) {
+            const int32_t cycles_since_pvc =
+                (int32_t)(qtimer_event_dwt - pvc.dwt_at_edge);
+            if (llabs((long long)cycles_since_pvc) <
+                DWT_PPS_COINCIDENCE_THRESHOLD_CYCLES) {
+              coincidence_cycles =
+                  (uint32_t)(cycles_since_pvc >= 0 ? cycles_since_pvc
+                                                   : -cycles_since_pvc);
+              coincidence_valid = true;
+            }
           }
         }
-      }
 
-      const pps_t witness_pps = g_last_pps_witness_valid
-          ? g_last_pps_witness
-          : pps_t{};
-      const dwt_repair_diag_t repair =
-          vclock_endpoint_repair_diagnostic(qtimer_event_dwt);
-      publish_vclock_domain_pps_vclock(witness_pps,
-                                        (witness_pps.sequence != 0)
-                                            ? witness_pps.sequence
-                                            : (g_pps_gpio_heartbeat.edge_count + 1),
-                                        qtimer_event_dwt,
-                                        cadence_counter32,
-                                        fired_low16);
+        const pps_t witness_pps = g_last_pps_witness_valid
+            ? g_last_pps_witness
+            : pps_t{};
+        const dwt_repair_diag_t repair =
+            vclock_endpoint_repair_diagnostic(qtimer_event_dwt);
+        publish_vclock_domain_pps_vclock(witness_pps,
+                                          (witness_pps.sequence != 0)
+                                              ? witness_pps.sequence
+                                              : (g_pps_gpio_heartbeat.edge_count + 1),
+                                          qtimer_event_dwt,
+                                          cadence_counter32,
+                                          fired_low16);
 
-      emit_one_second_event(*g_rt_vclock, qtimer_event_dwt,
-                            cadence_counter32,
-                            coincidence_cycles, coincidence_valid, &repair);
+        emit_one_second_event(*g_rt_vclock, qtimer_event_dwt,
+                              cadence_counter32,
+                              coincidence_cycles, coincidence_valid, &repair);
 
-      if (g_pps_edge_dispatch) {
-        timepop_arm_asap(pps_edge_dispatch_trampoline,
-                         nullptr,
-                         "PPS_VCLOCK_DISPATCH");
+        if (g_pps_edge_dispatch) {
+          timepop_arm_asap(pps_edge_dispatch_trampoline,
+                           nullptr,
+                           "PPS_VCLOCK_DISPATCH");
+        }
+
+        vclock_ch2_one_second_enable_after_heartbeat(cadence_counter32);
       }
     }
   } else {
@@ -4747,10 +4915,12 @@ static void qtimer1_isr(void) {
   }
   else if (IMXRT_TMR1.CH[2].CSCTRL & TMR_CSCTRL_TCF1) {
     qtimer1_ch2_clear_compare_flag();
+    const uint32_t qtimer_event_dwt = qtimer_event_dwt_from_isr_entry_raw(isr_entry_dwt_raw);
     interrupt_ch2_implicit_rollover_tend();
     pps_relay_ch2_tick(g_vclock_clock32.current_counter32);
+    vclock_ch2_one_second_service(qtimer_event_dwt,
+                                  g_qtimer1_ch2_last_target_counter32);
     if (g_qtimer1_ch2_handler) {
-      const uint32_t qtimer_event_dwt = qtimer_event_dwt_from_isr_entry_raw(isr_entry_dwt_raw);
       const bridge_projection_t bridge = interrupt_dwt_to_vclock_gnss_projection(qtimer_event_dwt);
       const int64_t  gnss_ns = bridge.gnss_ns;
       bridge_projection_record_stats(interrupt_subscriber_kind_t::TIMEPOP, bridge);
@@ -5159,6 +5329,7 @@ bool interrupt_start(interrupt_subscriber_kind_t kind) {
     g_vclock_lane.active = true;
     g_vclock_lane.phase_bootstrapped = true;
     g_vclock_lane.tick_mod_1000 = 0;
+    vclock_ch2_one_second_disable();
     // VCLOCK_HEARTBEAT is armed once during process_interrupt_init() and is the
     // only 1 ms TimePop cadence source.  Starting VCLOCK must not arm a second
     // cadence slot.
@@ -5203,6 +5374,7 @@ bool interrupt_stop(interrupt_subscriber_kind_t kind) {
   if (kind == interrupt_subscriber_kind_t::VCLOCK) {
     g_vclock_lane.active = false;
     g_vclock_lane.phase_bootstrapped = false;
+    vclock_ch2_one_second_disable();
     // Do not cancel VCLOCK_HEARTBEAT here; it is the system-wide substrate
     // cadence for VCLOCK and the OCXO passive counter domains.
     return true;
@@ -5223,6 +5395,7 @@ bool interrupt_stop(interrupt_subscriber_kind_t kind) {
 void interrupt_request_pps_rebootstrap(void) {
   g_pps_rebootstrap_pending = true;
   g_vclock_epoch_latch = vclock_epoch_latch_t{};
+  vclock_ch2_one_second_disable();
   cadence_regression_reset_kind(interrupt_subscriber_kind_t::VCLOCK);
   vclock_fact_ring_reset();
   // Rebootstrap selects a fresh PPS_VCLOCK edge identity.
@@ -5487,6 +5660,23 @@ static void runtime_reset_vclock_heartbeat_state(void) {
   g_ch2_implicit_rollover_last_vclock_counter32 = 0;
   g_ch2_implicit_rollover_last_ocxo1_counter32 = 0;
   g_ch2_implicit_rollover_last_ocxo2_counter32 = 0;
+
+  g_vclock_ch2_one_second_enabled = false;
+  g_vclock_ch2_one_second_next_counter32 = 0;
+  g_vclock_ch2_one_second_enable_count = 0;
+  g_vclock_ch2_one_second_reset_count = 0;
+  g_vclock_ch2_one_second_service_count = 0;
+  g_vclock_ch2_one_second_enqueue_count = 0;
+  g_vclock_ch2_one_second_late_count = 0;
+  g_vclock_ch2_one_second_late_max_ticks = 0;
+  g_vclock_ch2_one_second_catchup_count = 0;
+  g_vclock_ch2_one_second_drop_count = 0;
+  g_vclock_ch2_one_second_last_target_counter32 = 0;
+  g_vclock_ch2_one_second_last_service_counter32 = 0;
+  g_vclock_ch2_one_second_last_dwt = 0;
+  g_vclock_heartbeat_one_second_legacy_count = 0;
+  g_vclock_heartbeat_one_second_handoff_skip_count = 0;
+  g_vclock_heartbeat_one_second_fallback_count = 0;
 }
 
 static void runtime_reset_ocxo_fact_rings(void) {
@@ -5954,6 +6144,24 @@ static void add_vclock_heartbeat_payload(Payload& p) {
   p.add("vclock_heartbeat_ocxo2_rollover_updates_retired", g_vclock_heartbeat_ocxo2_rollover_updates_retired);
   p.add("vclock_heartbeat_last_vclock_counter32", g_vclock_heartbeat_last_vclock_counter32);
   p.add("vclock_heartbeat_ocxo_rollover_retired", true);
+  p.add("vclock_heartbeat_one_second_authority_retired", true);
+  p.add("vclock_heartbeat_one_second_legacy_count", g_vclock_heartbeat_one_second_legacy_count);
+  p.add("vclock_heartbeat_one_second_handoff_skip_count", g_vclock_heartbeat_one_second_handoff_skip_count);
+  p.add("vclock_heartbeat_one_second_fallback_count", g_vclock_heartbeat_one_second_fallback_count);
+
+  p.add("vclock_ch2_one_second_enabled", g_vclock_ch2_one_second_enabled);
+  p.add("vclock_ch2_one_second_next_counter32", g_vclock_ch2_one_second_next_counter32);
+  p.add("vclock_ch2_one_second_enable_count", g_vclock_ch2_one_second_enable_count);
+  p.add("vclock_ch2_one_second_reset_count", g_vclock_ch2_one_second_reset_count);
+  p.add("vclock_ch2_one_second_service_count", g_vclock_ch2_one_second_service_count);
+  p.add("vclock_ch2_one_second_enqueue_count", g_vclock_ch2_one_second_enqueue_count);
+  p.add("vclock_ch2_one_second_late_count", g_vclock_ch2_one_second_late_count);
+  p.add("vclock_ch2_one_second_late_max_ticks", g_vclock_ch2_one_second_late_max_ticks);
+  p.add("vclock_ch2_one_second_catchup_count", g_vclock_ch2_one_second_catchup_count);
+  p.add("vclock_ch2_one_second_drop_count", g_vclock_ch2_one_second_drop_count);
+  p.add("vclock_ch2_one_second_last_target_counter32", g_vclock_ch2_one_second_last_target_counter32);
+  p.add("vclock_ch2_one_second_last_service_counter32", g_vclock_ch2_one_second_last_service_counter32);
+  p.add("vclock_ch2_one_second_last_dwt", g_vclock_ch2_one_second_last_dwt);
 
   p.add("ch2_implicit_rollover_enabled", CH2_IMPLICIT_ROLLOVER_ENABLED);
   p.add("ch2_implicit_rollover_count", g_ch2_implicit_rollover_count);
@@ -6238,9 +6446,9 @@ static void add_vclock_lane_payload(Payload& p, bool detailed) {
   p.add("kind", "VCLOCK");
   p.add("provider", "QTIMER1");
   p.add("hardware_lane", "QTIMER1_CH2_COMP");
-  p.add("cadence_source", "QTIMER1_CH2_TIMEPOP_VCLOCK_HEARTBEAT");
+  p.add("cadence_source", "QTIMER1_CH2_TIMEPOP_VCLOCK_HEARTBEAT_PLUS_CH2_ONE_SECOND");
   p.add("counter_source", "QTIMER1_CH0_SYNTHETIC_COUNTER32");
-  p.add("event_source", "VCLOCK_HEARTBEAT_1000TH_FIRE");
+  p.add("event_source", "QTIMER1_CH2_INTRINSIC_ONE_SECOND_AFTER_BOOTSTRAP");
   p.add("dwt_authority", "QTIMER1_CH2_TIMEPOP_EVENT_DWT");
 
   add_runtime_lane_summary(p, "vclock", g_rt_vclock);
@@ -6251,6 +6459,15 @@ static void add_vclock_lane_payload(Payload& p, bool detailed) {
   p.add("vclock_compare_target", (uint32_t)g_vclock_lane.compare_target);
   p.add("vclock_tick_mod_1000", g_vclock_lane.tick_mod_1000);
   p.add("vclock_logical_count32", g_vclock_lane.logical_count32_at_last_second);
+  p.add("vclock_ch2_one_second_enabled", g_vclock_ch2_one_second_enabled);
+  p.add("vclock_ch2_one_second_next_counter32", g_vclock_ch2_one_second_next_counter32);
+  p.add("vclock_ch2_one_second_service_count", g_vclock_ch2_one_second_service_count);
+  p.add("vclock_ch2_one_second_enqueue_count", g_vclock_ch2_one_second_enqueue_count);
+  p.add("vclock_ch2_one_second_late_count", g_vclock_ch2_one_second_late_count);
+  p.add("vclock_ch2_one_second_late_max_ticks", g_vclock_ch2_one_second_late_max_ticks);
+  p.add("vclock_heartbeat_one_second_legacy_count", g_vclock_heartbeat_one_second_legacy_count);
+  p.add("vclock_heartbeat_one_second_handoff_skip_count", g_vclock_heartbeat_one_second_handoff_skip_count);
+  p.add("vclock_heartbeat_one_second_fallback_count", g_vclock_heartbeat_one_second_fallback_count);
 
   if (!detailed) return;
 
