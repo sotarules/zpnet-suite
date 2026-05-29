@@ -1724,11 +1724,13 @@ static volatile uint32_t g_ch2_implicit_rollover_last_ocxo2_counter32 = 0;
 
 // Intrinsic CH2 VCLOCK one-second handoff.
 //
-// This is deliberately a steady-state migration only.  VCLOCK_HEARTBEAT still
-// performs SmartZero sampling and the initial/bootstrap publication path; after
-// the first legacy one-second bookend, CH2 owns the recurring +10,000,000-tick
-// VCLOCK edge identity and enqueues a tiny perishable fact for the existing
-// safe drain path.
+// CH2 owns VCLOCK one-second fact authorship, but the first post-epoch target
+// is deliberately seeded on the legacy heartbeat-compatible grid.  The prior
+// attempt to seed the first target directly at selected_epoch + 10,000,000
+// changed the first public bookend phase and destabilized the command path.
+// This version migrates first-bookend publication to CH2 while preserving the
+// old first-bookend identity; after that CH2 advances by exact +10,000,000
+// gear teeth as before.
 static volatile bool     g_vclock_ch2_one_second_enabled = false;
 static volatile uint32_t g_vclock_ch2_one_second_next_counter32 = 0;
 static volatile uint32_t g_vclock_ch2_one_second_enable_count = 0;
@@ -1742,6 +1744,14 @@ static volatile uint32_t g_vclock_ch2_one_second_drop_count = 0;
 static volatile uint32_t g_vclock_ch2_one_second_last_target_counter32 = 0;
 static volatile uint32_t g_vclock_ch2_one_second_last_service_counter32 = 0;
 static volatile uint32_t g_vclock_ch2_one_second_last_dwt = 0;
+static volatile uint32_t g_vclock_ch2_one_second_epoch_enable_count = 0;
+static volatile uint32_t g_vclock_ch2_one_second_epoch_base_counter32 = 0;
+static volatile uint32_t g_vclock_ch2_one_second_epoch_service_counter32 = 0;
+static volatile uint32_t g_vclock_ch2_one_second_epoch_target_counter32 = 0;
+static volatile uint32_t g_vclock_ch2_one_second_epoch_tick_mod_seed = 0;
+static volatile uint32_t g_vclock_ch2_one_second_epoch_remaining_cells = 0;
+static volatile uint32_t g_vclock_ch2_one_second_epoch_residual_ticks = 0;
+static volatile uint32_t g_vclock_ch2_one_second_heartbeat_enable_count = 0;
 static volatile uint32_t g_vclock_heartbeat_one_second_legacy_count = 0;
 static volatile uint32_t g_vclock_heartbeat_one_second_handoff_skip_count = 0;
 static volatile uint32_t g_vclock_heartbeat_one_second_fallback_count = 0;
@@ -1843,6 +1853,10 @@ static void cadence_regression_reset_kind(interrupt_subscriber_kind_t kind);
 static void vclock_fact_ring_reset(void);
 static void vclock_ch2_one_second_disable(void);
 static void vclock_ch2_one_second_enable_after_heartbeat(uint32_t last_counter32);
+static void vclock_ch2_one_second_enable_from_epoch_legacy_grid(
+    uint32_t selected_counter32,
+    uint32_t service_counter32,
+    uint32_t tick_mod_seed);
 static bool vclock_ch2_one_second_already_served_for(uint32_t counter32);
 static void vclock_ch2_one_second_service(uint32_t qtimer_event_dwt,
                                           uint32_t service_counter32);
@@ -3436,11 +3450,43 @@ static void vclock_ch2_one_second_disable(void) {
   g_vclock_ch2_one_second_next_counter32 = 0;
 }
 
+static void vclock_ch2_one_second_enable_from_epoch_legacy_grid(
+    uint32_t selected_counter32,
+    uint32_t service_counter32,
+    uint32_t tick_mod_seed) {
+  // Preserve the last-known-good first-bookend identity while moving the
+  // authorship path itself out of VCLOCK_HEARTBEAT.  In the old path, the
+  // heartbeat consumed the epoch at service_counter32, seeded tick_mod_1000
+  // from selected_to_service_ticks / 10,000, and published the first bookend
+  // when that modulo reached 1000.  Seed CH2 to that same counter identity.
+  const uint32_t bounded_mod = tick_mod_seed % TICKS_PER_SECOND_EVENT;
+  const uint32_t remaining_cells = TICKS_PER_SECOND_EVENT - bounded_mod;
+  const uint32_t target_counter32 =
+      service_counter32 + remaining_cells * VCLOCK_INTERVAL_COUNTS;
+  const uint32_t sacred_target =
+      selected_counter32 + (uint32_t)VCLOCK_COUNTS_PER_SECOND;
+
+  g_vclock_ch2_one_second_next_counter32 = target_counter32;
+  g_vclock_ch2_one_second_enabled = true;
+  g_vclock_ch2_one_second_enable_count++;
+  g_vclock_ch2_one_second_epoch_enable_count++;
+  g_vclock_ch2_one_second_epoch_base_counter32 = selected_counter32;
+  g_vclock_ch2_one_second_epoch_service_counter32 = service_counter32;
+  g_vclock_ch2_one_second_epoch_target_counter32 = target_counter32;
+  g_vclock_ch2_one_second_epoch_tick_mod_seed = bounded_mod;
+  g_vclock_ch2_one_second_epoch_remaining_cells = remaining_cells;
+  g_vclock_ch2_one_second_epoch_residual_ticks =
+      target_counter32 - sacred_target;
+}
+
 static void vclock_ch2_one_second_enable_after_heartbeat(uint32_t last_counter32) {
+  // Emergency fallback re-seed only. Normal bootstrap and steady state should
+  // be armed from the epoch-compatible CH2 path above.
   g_vclock_ch2_one_second_next_counter32 =
       last_counter32 + (uint32_t)VCLOCK_COUNTS_PER_SECOND;
   g_vclock_ch2_one_second_enabled = true;
   g_vclock_ch2_one_second_enable_count++;
+  g_vclock_ch2_one_second_heartbeat_enable_count++;
 }
 
 static bool vclock_ch2_one_second_already_served_for(uint32_t counter32) {
@@ -3637,13 +3683,22 @@ static void vclock_ch2_epoch_native_service(uint32_t qtimer_event_dwt,
   // native CH2 service fact that published the selected epoch.  The next
   // heartbeat will increment from this millisecond-cell position; it will not
   // decide the epoch itself.
-  g_vclock_lane.tick_mod_1000 =
+  const uint32_t tick_mod_seed =
       (selected_to_service_ticks / VCLOCK_INTERVAL_COUNTS) %
       TICKS_PER_SECOND_EVENT;
+  g_vclock_lane.tick_mod_1000 = tick_mod_seed;
   g_vclock_lane.logical_count32_at_last_second = service_counter32;
   g_vclock_lane.compare_target =
       (uint16_t)(g_vclock_epoch_latch.ch3_at_edge +
                  (uint16_t)VCLOCK_INTERVAL_COUNTS);
+
+  // Move the first post-epoch publication path to CH2 without changing the
+  // first public bookend identity from the last-known-good build.  The first
+  // exact selected+1s target remains a future goal, but the previous attempt
+  // changed boot ordering enough to clobber command service.
+  vclock_ch2_one_second_enable_from_epoch_legacy_grid(selected_counter32,
+                                                       service_counter32,
+                                                       tick_mod_seed);
 }
 
 static void vclock_apply_perishable_fact_deferred(
@@ -5956,6 +6011,14 @@ static void runtime_reset_vclock_heartbeat_state(void) {
   g_vclock_ch2_one_second_last_target_counter32 = 0;
   g_vclock_ch2_one_second_last_service_counter32 = 0;
   g_vclock_ch2_one_second_last_dwt = 0;
+  g_vclock_ch2_one_second_epoch_enable_count = 0;
+  g_vclock_ch2_one_second_epoch_base_counter32 = 0;
+  g_vclock_ch2_one_second_epoch_service_counter32 = 0;
+  g_vclock_ch2_one_second_epoch_target_counter32 = 0;
+  g_vclock_ch2_one_second_epoch_tick_mod_seed = 0;
+  g_vclock_ch2_one_second_epoch_remaining_cells = 0;
+  g_vclock_ch2_one_second_epoch_residual_ticks = 0;
+  g_vclock_ch2_one_second_heartbeat_enable_count = 0;
   g_vclock_heartbeat_one_second_legacy_count = 0;
   g_vclock_heartbeat_one_second_handoff_skip_count = 0;
   g_vclock_heartbeat_one_second_fallback_count = 0;
@@ -6414,7 +6477,7 @@ static void add_runtime_payload(Payload& p) {
   p.add("ocxo1_quiet_phase_us", ocxo_phase_ticks_to_us(OCXO1_QUIET_PHASE_TICKS));
   p.add("ocxo2_quiet_phase_ticks", OCXO2_QUIET_PHASE_TICKS);
   p.add("ocxo2_quiet_phase_us", ocxo_phase_ticks_to_us(OCXO2_QUIET_PHASE_TICKS));
-  p.add("timing_arch_step", "CH2_NATIVE_VCLOCK_EPOCH_SMARTZERO_ONE_SECOND_DRAIN");
+  p.add("timing_arch_step", "CH2_NATIVE_VCLOCK_FIRST_1S_LEGACY_GRID");
   p.add("timing_arch_behavior_changed", true);
   p.add("timing_arch_vclock_authority", "QTIMER1_CH2_NATIVE_ROLLOVER_RELAY_EPOCH_1S_SMARTZERO_DRAIN_ARM");
   p.add("timing_arch_ocxo_model", "LOCAL_QTIMER_ONE_SECOND_EDGE_CAPTURE");
@@ -6523,6 +6586,14 @@ static void add_vclock_heartbeat_payload(Payload& p) {
   p.add("vclock_ch2_one_second_enabled", g_vclock_ch2_one_second_enabled);
   p.add("vclock_ch2_one_second_next_counter32", g_vclock_ch2_one_second_next_counter32);
   p.add("vclock_ch2_one_second_enable_count", g_vclock_ch2_one_second_enable_count);
+  p.add("vclock_ch2_one_second_epoch_enable_count", g_vclock_ch2_one_second_epoch_enable_count);
+  p.add("vclock_ch2_one_second_epoch_base_counter32", g_vclock_ch2_one_second_epoch_base_counter32);
+  p.add("vclock_ch2_one_second_epoch_service_counter32", g_vclock_ch2_one_second_epoch_service_counter32);
+  p.add("vclock_ch2_one_second_epoch_target_counter32", g_vclock_ch2_one_second_epoch_target_counter32);
+  p.add("vclock_ch2_one_second_epoch_tick_mod_seed", g_vclock_ch2_one_second_epoch_tick_mod_seed);
+  p.add("vclock_ch2_one_second_epoch_remaining_cells", g_vclock_ch2_one_second_epoch_remaining_cells);
+  p.add("vclock_ch2_one_second_epoch_residual_ticks", g_vclock_ch2_one_second_epoch_residual_ticks);
+  p.add("vclock_ch2_one_second_heartbeat_enable_count", g_vclock_ch2_one_second_heartbeat_enable_count);
   p.add("vclock_ch2_one_second_reset_count", g_vclock_ch2_one_second_reset_count);
   p.add("vclock_ch2_one_second_service_count", g_vclock_ch2_one_second_service_count);
   p.add("vclock_ch2_one_second_enqueue_count", g_vclock_ch2_one_second_enqueue_count);
@@ -6846,6 +6917,14 @@ static void add_vclock_lane_payload(Payload& p, bool detailed) {
   p.add("vclock_logical_count32", g_vclock_lane.logical_count32_at_last_second);
   p.add("vclock_ch2_one_second_enabled", g_vclock_ch2_one_second_enabled);
   p.add("vclock_ch2_one_second_next_counter32", g_vclock_ch2_one_second_next_counter32);
+  p.add("vclock_ch2_one_second_epoch_enable_count", g_vclock_ch2_one_second_epoch_enable_count);
+  p.add("vclock_ch2_one_second_epoch_base_counter32", g_vclock_ch2_one_second_epoch_base_counter32);
+  p.add("vclock_ch2_one_second_epoch_service_counter32", g_vclock_ch2_one_second_epoch_service_counter32);
+  p.add("vclock_ch2_one_second_epoch_target_counter32", g_vclock_ch2_one_second_epoch_target_counter32);
+  p.add("vclock_ch2_one_second_epoch_tick_mod_seed", g_vclock_ch2_one_second_epoch_tick_mod_seed);
+  p.add("vclock_ch2_one_second_epoch_remaining_cells", g_vclock_ch2_one_second_epoch_remaining_cells);
+  p.add("vclock_ch2_one_second_epoch_residual_ticks", g_vclock_ch2_one_second_epoch_residual_ticks);
+  p.add("vclock_ch2_one_second_heartbeat_enable_count", g_vclock_ch2_one_second_heartbeat_enable_count);
   p.add("vclock_ch2_one_second_service_count", g_vclock_ch2_one_second_service_count);
   p.add("vclock_ch2_one_second_enqueue_count", g_vclock_ch2_one_second_enqueue_count);
   p.add("vclock_ch2_one_second_late_count", g_vclock_ch2_one_second_late_count);
@@ -7339,7 +7418,7 @@ static Payload cmd_report(const Payload&) {
   p.add("ocxo1_quiet_phase_us", ocxo_phase_ticks_to_us(OCXO1_QUIET_PHASE_TICKS));
   p.add("ocxo2_quiet_phase_ticks", OCXO2_QUIET_PHASE_TICKS);
   p.add("ocxo2_quiet_phase_us", ocxo_phase_ticks_to_us(OCXO2_QUIET_PHASE_TICKS));
-  p.add("timing_arch_step", "CH2_NATIVE_VCLOCK_EPOCH_SMARTZERO_ONE_SECOND_DRAIN");
+  p.add("timing_arch_step", "CH2_NATIVE_VCLOCK_FIRST_1S_LEGACY_GRID");
   p.add("timing_arch_behavior_changed", true);
   p.add("linear_regression_authored_dwt", LINEAR_REGRESSION_AUTHORED_DWT);
   p.add("linear_regression_diagnostic_only", LINEAR_REGRESSION_DIAGNOSTIC_ONLY);

@@ -25,8 +25,8 @@
 //   remaining VCLOCK_HEARTBEAT TimePop slot is a soft fallback/reporting pulse.
 //   Timing-authoritative VCLOCK duties now run from native CH2 custody: passive
 //   16-bit rollover tending, PPS_RELAY deassert, bootstrap/rebootstrap
-//   selected-epoch publication, steady-state one-second fact authorship,
-//   VCLOCK SmartZero fixed-grid sampling, and VCLOCK fact-drain arming.
+//   selected-epoch publication, first-bookend handoff, steady-state
+//   one-second fact authorship, VCLOCK SmartZero fixed-grid sampling, and VCLOCK fact-drain arming.
 //
 //   TimePop owns scheduler policy only.  process_interrupt owns the CH2
 //   compare-register programming; TimePop requests target updates through
@@ -76,8 +76,10 @@
 //   has processed the CH2 compare event, and back-projects from the CH2 event
 //   DWT to publish the canonical PPS_VCLOCK epoch.
 //
-//   Steady-state VCLOCK one-second facts are also authored by native CH2 on
-//   fixed +10,000,000 tick gear teeth.  VCLOCK_HEARTBEAT remains armed only as
+//   The first post-epoch VCLOCK one-second publication is handed to native
+//   CH2 on the legacy-compatible heartbeat grid; steady-state VCLOCK one-second
+//   facts are authored by native CH2 on fixed +10,000,000 tick gear teeth.
+//   VCLOCK_HEARTBEAT remains armed only as
 //   a soft fallback/reporting pulse; it no longer owns rollover, relay deassert,
 //   selected-epoch publication, one-second authority, SmartZero sampling, or
 //   fact-drain arming.
