@@ -1712,6 +1712,17 @@ static volatile uint32_t g_vclock_ch2_smartzero_last_dwt = 0;
 static volatile uint32_t g_vclock_ch2_smartzero_last_late_ticks = 0;
 static volatile uint32_t g_vclock_heartbeat_smartzero_authority_retired_count = 0;
 
+// Intrinsic CH2 VCLOCK fact-drain arming.
+//
+// CH2 now authors steady-state VCLOCK one-second facts before TimePop handles
+// the same compare event.  The perishable fact still drains through the safe
+// TimePop ASAP path, but the arm decision no longer waits for VCLOCK_HEARTBEAT
+// to be dispatched.  To preserve TimePop ordering, CH2 arms the drain only
+// after the registered TimePop CH2 handler has returned.
+static volatile uint32_t g_vclock_ch2_fact_drain_service_count = 0;
+static volatile uint32_t g_vclock_ch2_fact_drain_arm_count = 0;
+static volatile uint32_t g_vclock_heartbeat_fact_drain_authority_retired_count = 0;
+
 static inline uint32_t clock32_from_ns(uint64_t ns) {
   return (uint32_t)((ns / 100ULL) & 0xFFFFFFFFULL);
 }
@@ -3324,8 +3335,8 @@ static bool vclock_fact_ring_push_no_arm_from_isr(vclock_perishable_fact_t fact)
   return true;
 }
 
-static void vclock_fact_ring_arm_drain_from_timepop(void) {
-  if (g_vclock_fact_ring.count == 0 || g_vclock_fact_ring.drain_armed) return;
+static bool vclock_fact_ring_arm_drain_from_timepop(void) {
+  if (g_vclock_fact_ring.count == 0 || g_vclock_fact_ring.drain_armed) return false;
 
   g_vclock_fact_ring.drain_armed = true;
   g_vclock_fact_ring.asap_arm_count++;
@@ -3335,6 +3346,18 @@ static void vclock_fact_ring_arm_drain_from_timepop(void) {
   if (h == TIMEPOP_INVALID_HANDLE) {
     g_vclock_fact_ring.drain_armed = false;
     g_vclock_fact_ring.asap_fail_count++;
+    return false;
+  }
+
+  return true;
+}
+
+static void vclock_ch2_fact_drain_arm_after_timepop(void) {
+  if (!g_interrupt_runtime_ready) return;
+
+  g_vclock_ch2_fact_drain_service_count++;
+  if (vclock_fact_ring_arm_drain_from_timepop()) {
+    g_vclock_ch2_fact_drain_arm_count++;
   }
 }
 
@@ -3901,10 +3924,11 @@ static void ocxo_lane_install_logical_grid(interrupt_subscriber_kind_t kind,
 }
 
 // The old VCLOCK_HEARTBEAT-driven OCXO arming path has been retired.  OCXO1 and
-// OCXO2 now maintain their own 1 kHz compare cadence on their local QTimer
-// channels; VCLOCK_HEARTBEAT remains the SmartZero/bootstrap sample TimePop
-// heartbeat.  Relay deassertion and steady-state VCLOCK one-second bookends now
-// run from intrinsic CH2.
+// OCXO2 now maintain their own one-second compare custody on their local QTimer
+// channels.  Relay deassertion, steady-state VCLOCK one-second bookends,
+// VCLOCK SmartZero sampling, and VCLOCK fact-drain arming now run from
+// intrinsic CH2.  VCLOCK_HEARTBEAT remains only the bootstrap/fallback and
+// reporting heartbeat.
 
 static void vclock_heartbeat_timepop_callback(timepop_ctx_t* ctx,
                                             timepop_diag_t*,
@@ -3922,10 +3946,10 @@ static void vclock_heartbeat_timepop_callback(timepop_ctx_t* ctx,
   // authority.  Low-word rollover extension is handled only by
   // interrupt_ch2_implicit_rollover_tend(), which runs before TimePop gets
   // this CH2 event.  Keep the heartbeat's authored counter identity for
-  // SmartZero, bootstrap/failsafe bookends, and reports, but do not refresh the
+  // bootstrap/failsafe bookends and reports, but do not refresh the
   // synthetic clock32 extender here.  Relay deassert countdown, steady-state
-  // VCLOCK one-second authorship, and VCLOCK SmartZero sampling have moved to
-  // intrinsic CH2 service.
+  // VCLOCK one-second authorship, VCLOCK SmartZero sampling, and fact-drain
+  // arming have moved to intrinsic/native CH2 service.
   g_vclock_lane.logical_count32_at_last_second = cadence_counter32;
   g_vclock_heartbeat_vclock_ticks++;
   g_vclock_heartbeat_last_vclock_hw16 = fired_low16;
@@ -3938,10 +3962,12 @@ static void vclock_heartbeat_timepop_callback(timepop_ctx_t* ctx,
     g_vclock_heartbeat_smartzero_authority_retired_count++;
   }
 
-  // CH2 may have enqueued a fixed-grid one-second fact before TimePop invoked
-  // this callback.  Arm the existing safe drain from the heartbeat phase rather
-  // than mutating TimePop's slot table in the pre-TimePop CH2 custody window.
-  vclock_fact_ring_arm_drain_from_timepop();
+  // CH2 now arms the VCLOCK fact drain after TimePop's CH2 handler returns.
+  // If a pending fact is still visible here, leave it alone and count the
+  // observation; heartbeat is no longer the drain-arm authority.
+  if (g_vclock_fact_ring.count != 0) {
+    g_vclock_heartbeat_fact_drain_authority_retired_count++;
+  }
 
   if (g_rt_vclock) {
     g_rt_vclock->irq_count++;
@@ -4039,7 +4065,7 @@ static void vclock_heartbeat_timepop_callback(timepop_ctx_t* ctx,
 
   // OCXO lanes are intentionally absent here.  Their 16-bit rollover cadence is
   // now device-local on QTimer2/QTimer3; this TimePop callback is now only the
-  // VCLOCK bootstrap/fallback and safe-drain heartbeat surface.
+  // VCLOCK bootstrap/fallback/reporting heartbeat surface.
 }
 
 static bool vclock_heartbeat_arm_timepop(void) {
@@ -5096,6 +5122,11 @@ static void qtimer1_isr(void) {
 
       g_qtimer1_ch2_handler(event, diag);
     }
+
+    // CH2-authored VCLOCK facts are now drain-armed from native CH2 custody,
+    // but only after TimePop has consumed the compare event.  This preserves
+    // the non-reentrant boundary that kept the previous heartbeat arm safe.
+    vclock_ch2_fact_drain_arm_after_timepop();
   }
   // CH1/CH2 share one vector.  If multiple flags are pending, the
   // unhandled flag remains set and NVIC re-dispatches with a fresh
@@ -5847,6 +5878,10 @@ static void runtime_reset_vclock_heartbeat_state(void) {
   g_vclock_ch2_smartzero_last_dwt = 0;
   g_vclock_ch2_smartzero_last_late_ticks = 0;
   g_vclock_heartbeat_smartzero_authority_retired_count = 0;
+
+  g_vclock_ch2_fact_drain_service_count = 0;
+  g_vclock_ch2_fact_drain_arm_count = 0;
+  g_vclock_heartbeat_fact_drain_authority_retired_count = 0;
 }
 
 static void runtime_reset_ocxo_fact_rings(void) {
@@ -6262,7 +6297,7 @@ static void add_runtime_payload(Payload& p) {
   p.add("ocxo2_quiet_phase_us", ocxo_phase_ticks_to_us(OCXO2_QUIET_PHASE_TICKS));
   p.add("timing_arch_step", "OCXO_ROLLOVER_ONLY_EMA_DWT");
   p.add("timing_arch_behavior_changed", true);
-  p.add("timing_arch_vclock_authority", "QTIMER1_CH2_TIMEPOP_DIRECT_SAFEMODE");
+  p.add("timing_arch_vclock_authority", "QTIMER1_CH2_NATIVE_ROLLOVER_RELAY_1S_SMARTZERO_DRAIN_ARM");
   p.add("timing_arch_ocxo_model", "LOCAL_QTIMER_ONE_SECOND_EDGE_CAPTURE");
   p.add("timing_arch_ocxo_migration_stage", "EMA_DWT_AUTHORITY");
   p.add("subscriber_count", g_subscriber_count);
@@ -6320,6 +6355,11 @@ static void add_vclock_heartbeat_payload(Payload& p) {
   p.add("vclock_heartbeat_one_second_fallback_count", g_vclock_heartbeat_one_second_fallback_count);
   p.add("vclock_heartbeat_smartzero_authority_retired", true);
   p.add("vclock_heartbeat_smartzero_authority_retired_count", g_vclock_heartbeat_smartzero_authority_retired_count);
+  p.add("vclock_heartbeat_fact_drain_authority_retired", true);
+  p.add("vclock_heartbeat_fact_drain_authority_retired_count", g_vclock_heartbeat_fact_drain_authority_retired_count);
+  p.add("vclock_ch2_fact_drain_native_enabled", true);
+  p.add("vclock_ch2_fact_drain_service_count", g_vclock_ch2_fact_drain_service_count);
+  p.add("vclock_ch2_fact_drain_arm_count", g_vclock_ch2_fact_drain_arm_count);
 
   p.add("vclock_ch2_smartzero_native_enabled", VCLOCK_CH2_SMARTZERO_NATIVE_ENABLED);
   p.add("vclock_ch2_smartzero_seeded", g_vclock_ch2_smartzero_seeded);
@@ -6665,6 +6705,11 @@ static void add_vclock_lane_payload(Payload& p, bool detailed) {
   p.add("vclock_heartbeat_one_second_fallback_count", g_vclock_heartbeat_one_second_fallback_count);
   p.add("vclock_heartbeat_smartzero_authority_retired", true);
   p.add("vclock_heartbeat_smartzero_authority_retired_count", g_vclock_heartbeat_smartzero_authority_retired_count);
+  p.add("vclock_heartbeat_fact_drain_authority_retired", true);
+  p.add("vclock_heartbeat_fact_drain_authority_retired_count", g_vclock_heartbeat_fact_drain_authority_retired_count);
+  p.add("vclock_ch2_fact_drain_native_enabled", true);
+  p.add("vclock_ch2_fact_drain_service_count", g_vclock_ch2_fact_drain_service_count);
+  p.add("vclock_ch2_fact_drain_arm_count", g_vclock_ch2_fact_drain_arm_count);
   p.add("vclock_ch2_smartzero_native_enabled", VCLOCK_CH2_SMARTZERO_NATIVE_ENABLED);
   p.add("vclock_ch2_smartzero_seeded", g_vclock_ch2_smartzero_seeded);
   p.add("vclock_ch2_smartzero_next_counter32", g_vclock_ch2_smartzero_next_counter32);
