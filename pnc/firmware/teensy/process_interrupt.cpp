@@ -325,6 +325,145 @@ static constexpr uint32_t INTERRUPT_STEP0_EXPECTED_GPIO6789_PRIORITY = 0;
 
 
 // ============================================================================
+// Passive ISR sanity witness
+// ============================================================================
+//
+// This is intentionally report-only.  It observes event facts already captured
+// by an ISR and records only the smallest standard sanity surface:
+//
+//   CNTR correct/incorrect count + last expected/actual
+//   DWT  correct/incorrect count + last expected/actual
+//
+// It never repairs, suppresses, re-arms, publishes, or changes timing truth.
+// Thresholds are deliberately internal constants so the report stays readable.
+// CNTR expectations are compensated for known read latency; after compensation
+// the expected and actual counter values must match exactly.
+
+static constexpr uint32_t ISR_SANITY_DWT_ERROR_THRESHOLD_CYCLES = 1000U;
+static constexpr uint32_t ISR_SANITY_VCLOCK_CNTR_READ_LATENCY_TICKS = 2U;
+static constexpr uint32_t ISR_SANITY_OCXO_CNTR_READ_LATENCY_TICKS = 1U;
+// OCXO CNTR reads occur after first-instruction DWT capture and a slow
+// peripheral counter read.  The exact observed low word may therefore be the
+// compare tooth plus a tiny positive read-latency advance.  This is not a
+// broad +/- window: negative/early offsets remain hard failures, and anything
+// beyond this small positive read-latency band is counted incorrect.
+static constexpr uint32_t ISR_SANITY_OCXO_CNTR_MIN_READ_LATENCY_TICKS = 0U;
+static constexpr uint32_t ISR_SANITY_OCXO_CNTR_MAX_READ_LATENCY_TICKS = 2U;
+static constexpr uint32_t ISR_SANITY_PPS_CNTR_READ_LATENCY_TICKS = 0U;
+
+struct isr_sanity_diag_t {
+  uint32_t cntr_correct_count = 0;
+  uint32_t cntr_incorrect_count = 0;
+  uint32_t cntr_expected = 0;
+  uint32_t cntr_actual = 0;
+
+  uint32_t dwt_correct_count = 0;
+  uint32_t dwt_incorrect_count = 0;
+  uint32_t dwt_expected = 0;
+  uint32_t dwt_actual = 0;
+};
+
+static isr_sanity_diag_t g_isr_sanity_vclock_ch2 = {};
+static isr_sanity_diag_t g_isr_sanity_ocxo1 = {};
+static isr_sanity_diag_t g_isr_sanity_ocxo2 = {};
+static isr_sanity_diag_t g_isr_sanity_pps = {};
+
+// VCLOCK sanity is recorded on public one-second CH2 facts, not every CH2
+// scheduler fire.  CH2 also carries TimePop scheduling traffic, and applying a
+// single DWT interval expectation to mixed CH2 events creates false errors.
+static bool     g_isr_sanity_vclock_ch2_prev_valid = false;
+static uint32_t g_isr_sanity_vclock_ch2_prev_counter32 = 0;
+static uint32_t g_isr_sanity_vclock_ch2_prev_dwt = 0;
+
+static bool     g_isr_sanity_pps_prev_valid = false;
+static uint32_t g_isr_sanity_pps_prev_counter32 = 0;
+static uint32_t g_isr_sanity_pps_prev_dwt = 0;
+
+static inline uint32_t isr_sanity_abs_i32(int32_t value) {
+  return (uint32_t)(value < 0 ? -(int64_t)value : (int64_t)value);
+}
+
+static void isr_sanity_reset(isr_sanity_diag_t& s) {
+  s = isr_sanity_diag_t{};
+}
+
+static void isr_sanity_record_cntr(isr_sanity_diag_t& s,
+                                   bool has_expectation,
+                                   uint32_t expected,
+                                   uint32_t actual) {
+  if (!has_expectation) return;
+
+  s.cntr_expected = expected;
+  s.cntr_actual = actual;
+
+  if (actual == expected) {
+    s.cntr_correct_count++;
+  } else {
+    s.cntr_incorrect_count++;
+  }
+}
+
+static void isr_sanity_record_cntr_latency_band(isr_sanity_diag_t& s,
+                                                bool has_expectation,
+                                                uint16_t target_low16,
+                                                uint16_t actual_low16,
+                                                uint32_t min_latency_ticks,
+                                                uint32_t max_latency_ticks,
+                                                uint32_t preferred_latency_ticks) {
+  if (!has_expectation) return;
+
+  const uint16_t preferred_expected =
+      (uint16_t)(target_low16 + (uint16_t)preferred_latency_ticks);
+  uint16_t matched_expected = preferred_expected;
+  bool matched = false;
+
+  for (uint32_t latency = min_latency_ticks;
+       latency <= max_latency_ticks;
+       latency++) {
+    const uint16_t candidate = (uint16_t)(target_low16 + (uint16_t)latency);
+    if (actual_low16 == candidate) {
+      matched_expected = candidate;
+      matched = true;
+      break;
+    }
+  }
+
+  s.cntr_expected = (uint32_t)matched_expected;
+  s.cntr_actual = (uint32_t)actual_low16;
+
+  if (matched) {
+    s.cntr_correct_count++;
+  } else {
+    s.cntr_incorrect_count++;
+  }
+}
+
+static void isr_sanity_record_dwt(isr_sanity_diag_t& s,
+                                  bool has_expectation,
+                                  uint32_t expected,
+                                  uint32_t actual) {
+  if (!has_expectation) return;
+
+  s.dwt_expected = expected;
+  s.dwt_actual = actual;
+
+  const int32_t delta = (int32_t)((int64_t)actual - (int64_t)expected);
+  if (isr_sanity_abs_i32(delta) <= ISR_SANITY_DWT_ERROR_THRESHOLD_CYCLES) {
+    s.dwt_correct_count++;
+  } else {
+    s.dwt_incorrect_count++;
+  }
+}
+
+static isr_sanity_diag_t* isr_sanity_for_kind(interrupt_subscriber_kind_t kind) {
+  if (kind == interrupt_subscriber_kind_t::VCLOCK) return &g_isr_sanity_vclock_ch2;
+  if (kind == interrupt_subscriber_kind_t::OCXO1)  return &g_isr_sanity_ocxo1;
+  if (kind == interrupt_subscriber_kind_t::OCXO2)  return &g_isr_sanity_ocxo2;
+  return nullptr;
+}
+
+
+// ============================================================================
 // PPS / PPS_VCLOCK doctrine
 // ============================================================================
 //
@@ -3532,6 +3671,32 @@ static void vclock_ch2_one_second_service(uint32_t qtimer_event_dwt,
   g_vclock_ch2_one_second_last_service_counter32 = service_counter32;
   g_vclock_ch2_one_second_last_dwt = authored_dwt;
 
+  // Passive ISR sanity witness for the public VCLOCK one-second fact.  CNTR
+  // sanity verifies the ambient counter observation after known CH0 read
+  // latency.  DWT sanity compares consecutive authored one-second DWT intervals
+  // against the exact VCLOCK tick interval between their target identities.
+  const uint32_t vclock_cntr_expected =
+      service_counter32 + ISR_SANITY_VCLOCK_CNTR_READ_LATENCY_TICKS;
+  const uint32_t vclock_cntr_actual = g_vclock_clock32.current_counter32;
+  isr_sanity_record_cntr(g_isr_sanity_vclock_ch2,
+                         true,
+                         vclock_cntr_expected,
+                         vclock_cntr_actual);
+
+  if (g_isr_sanity_vclock_ch2_prev_valid) {
+    const uint32_t expected_dwt_delta = vclock_cycles_for_ticks(
+        target_counter32 - g_isr_sanity_vclock_ch2_prev_counter32);
+    const uint32_t actual_dwt_delta =
+        authored_dwt - g_isr_sanity_vclock_ch2_prev_dwt;
+    isr_sanity_record_dwt(g_isr_sanity_vclock_ch2,
+                          true,
+                          expected_dwt_delta,
+                          actual_dwt_delta);
+  }
+  g_isr_sanity_vclock_ch2_prev_valid = true;
+  g_isr_sanity_vclock_ch2_prev_counter32 = target_counter32;
+  g_isr_sanity_vclock_ch2_prev_dwt = authored_dwt;
+
   if (vclock_fact_ring_push_no_arm_from_isr(fact)) {
     g_vclock_ch2_one_second_enqueue_count++;
   } else {
@@ -4841,6 +5006,33 @@ static ocxo_cadence_isr_sample_t ocxo_cadence_capture_perishable_facts(
   sample.arm_to_isr_dwt_cycles =
       isr_entry_dwt_raw - lane.witness_last_arm_dwt_raw;
 
+  // Passive ISR sanity witness.  CNTR sanity compensates the compare
+  // tooth for the tiny positive latency of reading a 10 MHz QuadTimer counter
+  // after first-instruction DWT capture.  This remains exact after
+  // compensation: only target+[0..2] ticks is accepted as a lawful CNTR read;
+  // negative/early values or larger positive offsets are real errors.
+  // DWT sanity compares arming-to-ISR cycles against elapsed OCXO ticks over
+  // the same span.
+  isr_sanity_diag_t* sanity = isr_sanity_for_kind(ctx.kind);
+  if (sanity) {
+    isr_sanity_record_cntr_latency_band(
+        *sanity,
+        sample.had_armed,
+        sample.target_low16,
+        sample.service_counter_low16,
+        ISR_SANITY_OCXO_CNTR_MIN_READ_LATENCY_TICKS,
+        ISR_SANITY_OCXO_CNTR_MAX_READ_LATENCY_TICKS,
+        ISR_SANITY_OCXO_CNTR_READ_LATENCY_TICKS);
+
+    const uint32_t expected_dwt_delta =
+        (uint32_t)dwt_cycles_for_ocxo_ticks_signed(
+            (int32_t)sample.arm_to_isr_ticks);
+    isr_sanity_record_dwt(*sanity,
+                          sample.had_armed,
+                          expected_dwt_delta,
+                          sample.arm_to_isr_dwt_cycles);
+  }
+
   return sample;
 }
 
@@ -5241,6 +5433,7 @@ static void qtimer1_isr(void) {
     // the next compare and update g_qtimer1_ch2_last_target_counter32.
     const uint32_t ch2_event_counter32 = g_qtimer1_ch2_last_target_counter32;
     interrupt_ch2_implicit_rollover_tend();
+
     pps_relay_ch2_tick(g_vclock_clock32.current_counter32);
     vclock_ch2_one_second_service(qtimer_event_dwt,
                                   ch2_event_counter32);
@@ -5531,6 +5724,32 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
 
   g_last_pps_witness = pps;
   g_last_pps_witness_valid = true;
+
+  // Passive PPS ISR sanity witness.  Once a prior PPS exists, CNTR sanity
+  // checks the observed VCLOCK counter interval against exactly one 10 MHz
+  // second, while DWT sanity checks the physical PPS DWT interval against the
+  // current CLOCKS/PPS-derived cycles-per-second ruler.
+  if (g_isr_sanity_pps_prev_valid) {
+    const uint32_t observed_counter_delta =
+        observed_counter32 - g_isr_sanity_pps_prev_counter32;
+    isr_sanity_record_cntr(
+        g_isr_sanity_pps,
+        true,
+        (uint32_t)VCLOCK_COUNTS_PER_SECOND +
+            ISR_SANITY_PPS_CNTR_READ_LATENCY_TICKS,
+        observed_counter_delta);
+
+    const uint32_t observed_dwt_delta =
+        pps.dwt_at_edge - g_isr_sanity_pps_prev_dwt;
+    const uint32_t expected_dwt_delta = interrupt_vclock_cycles_per_second();
+    isr_sanity_record_dwt(g_isr_sanity_pps,
+                          expected_dwt_delta != 0,
+                          expected_dwt_delta,
+                          observed_dwt_delta);
+  }
+  g_isr_sanity_pps_prev_valid = true;
+  g_isr_sanity_pps_prev_counter32 = observed_counter32;
+  g_isr_sanity_pps_prev_dwt = pps.dwt_at_edge;
 
   // Defer epoch-packet publication and PPS entry-latency diagnostic callback.
   // The witness facts above remain immediate because VCLOCK steady-state and
@@ -6064,6 +6283,17 @@ static void runtime_reset_vclock_heartbeat_state(void) {
   g_vclock_heartbeat_epoch_authority_retired_count = 0;
   g_vclock_heartbeat_epoch_pending_skip_count = 0;
 
+  isr_sanity_reset(g_isr_sanity_vclock_ch2);
+  isr_sanity_reset(g_isr_sanity_ocxo1);
+  isr_sanity_reset(g_isr_sanity_ocxo2);
+  isr_sanity_reset(g_isr_sanity_pps);
+  g_isr_sanity_vclock_ch2_prev_valid = false;
+  g_isr_sanity_vclock_ch2_prev_counter32 = 0;
+  g_isr_sanity_vclock_ch2_prev_dwt = 0;
+  g_isr_sanity_pps_prev_valid = false;
+  g_isr_sanity_pps_prev_counter32 = 0;
+  g_isr_sanity_pps_prev_dwt = 0;
+
 }
 
 static void runtime_reset_ocxo_fact_rings(void) {
@@ -6183,6 +6413,22 @@ struct payload_prefix_t {
     p.add(key, value ? value : "");
   }
 };
+
+static void add_isr_sanity_payload(Payload& p,
+                                   const char* prefix,
+                                   const isr_sanity_diag_t& s) {
+  payload_prefix_t out(p, prefix);
+
+  out.add_u32("cntr_correct_count", s.cntr_correct_count);
+  out.add_u32("cntr_incorrect_count", s.cntr_incorrect_count);
+  out.add_u32("cntr_expected", s.cntr_expected);
+  out.add_u32("cntr_actual", s.cntr_actual);
+
+  out.add_u32("dwt_correct_count", s.dwt_correct_count);
+  out.add_u32("dwt_incorrect_count", s.dwt_incorrect_count);
+  out.add_u32("dwt_expected", s.dwt_expected);
+  out.add_u32("dwt_actual", s.dwt_actual);
+}
 
 static void add_bridge_stats_payload(Payload& p,
                                      const char* prefix,
@@ -6479,6 +6725,8 @@ static void add_runtime_payload(Payload& p) {
   p.add("ocxo2_quiet_phase_us", ocxo_phase_ticks_to_us(OCXO2_QUIET_PHASE_TICKS));
   p.add("timing_arch_step", "CH2_NATIVE_VCLOCK_FIRST_1S_LEGACY_GRID");
   p.add("timing_arch_behavior_changed", true);
+  p.add("isr_sanity_witness_enabled", true);
+  p.add("isr_sanity_witness_policy", "REPORT_ONLY_NO_REPAIR_NO_VETO");
   p.add("timing_arch_vclock_authority", "QTIMER1_CH2_NATIVE_ROLLOVER_RELAY_EPOCH_1S_SMARTZERO_DRAIN_ARM");
   p.add("timing_arch_ocxo_model", "LOCAL_QTIMER_ONE_SECOND_EDGE_CAPTURE");
   p.add("timing_arch_ocxo_migration_stage", "EMA_DWT_AUTHORITY");
@@ -6637,6 +6885,7 @@ static void add_pps_payload(Payload& p) {
   p.add("gpio_irq_count", g_gpio_irq_count);
   p.add("gpio_miss_count", g_gpio_miss_count);
   p.add("gpio_edge_count", g_pps_gpio_heartbeat.edge_count);
+  add_isr_sanity_payload(p, "pps_isr_sanity", g_isr_sanity_pps);
 
   p.add("pps_post_isr_deferred", true);
   p.add("pps_post_isr_pending", g_pps_post_isr.pending);
@@ -6969,6 +7218,7 @@ static void add_vclock_lane_payload(Payload& p, bool detailed) {
   p.add("vclock_ch2_smartzero_accepted_count", g_vclock_ch2_smartzero_accepted_count);
   p.add("vclock_ch2_smartzero_rejected_dwt_count", g_vclock_ch2_smartzero_rejected_dwt_count);
   p.add("vclock_ch2_smartzero_rejected_counter_count", g_vclock_ch2_smartzero_rejected_counter_count);
+  add_isr_sanity_payload(p, "isr_sanity", g_isr_sanity_vclock_ch2);
 
   if (!detailed) return;
 
@@ -7317,6 +7567,10 @@ static void add_ocxo_lane_payload(Payload& p,
   add_ocxo_lane_basic_payload(out, lane);
   add_ocxo_witness_service_payload(out, lane);
   add_ocxo_cadence_sample_payload(out, lane);
+  const isr_sanity_diag_t* sanity = isr_sanity_for_kind(ctx.kind);
+  if (sanity) {
+    add_isr_sanity_payload(p, "isr_sanity", *sanity);
+  }
 
   if (!detailed) return;
 
@@ -7420,6 +7674,8 @@ static Payload cmd_report(const Payload&) {
   p.add("ocxo2_quiet_phase_us", ocxo_phase_ticks_to_us(OCXO2_QUIET_PHASE_TICKS));
   p.add("timing_arch_step", "CH2_NATIVE_VCLOCK_FIRST_1S_LEGACY_GRID");
   p.add("timing_arch_behavior_changed", true);
+  p.add("isr_sanity_witness_enabled", true);
+  p.add("isr_sanity_witness_policy", "REPORT_ONLY_NO_REPAIR_NO_VETO");
   p.add("linear_regression_authored_dwt", LINEAR_REGRESSION_AUTHORED_DWT);
   p.add("linear_regression_diagnostic_only", LINEAR_REGRESSION_DIAGNOSTIC_ONLY);
   p.add("vclock_linear_regression_enabled", VCLOCK_LINEAR_REGRESSION_ENABLED);
@@ -7653,6 +7909,11 @@ static void add_lane_summary_object(Payload& parent,
     lane.add("last_event_gnss_ns_at_event", 0ULL);
     lane.add("last_event_gnss_ns_available", false);
   }
+  // Only VCLOCK uses this generic summary helper today.  Keep the compact
+  // sanity surface here so REPORT_LANES can reveal trouble without the full
+  // lane detail report.
+  lane.add("isr_sanity_cntr_incorrect_count", g_isr_sanity_vclock_ch2.cntr_incorrect_count);
+  lane.add("isr_sanity_dwt_incorrect_count", g_isr_sanity_vclock_ch2.dwt_incorrect_count);
   parent.add_object(key, lane);
 }
 
@@ -7704,6 +7965,11 @@ static void add_ocxo_lane_summary_object(Payload& parent,
   o.add("fact_overflow_count", ring.overflow_count);
   o.add("fact_high_water", ring.high_water);
   o.add("fact_asap_fail_count", ring.asap_fail_count);
+  const isr_sanity_diag_t* sanity = isr_sanity_for_kind(ctx.kind);
+  if (sanity) {
+    o.add("isr_sanity_cntr_incorrect_count", sanity->cntr_incorrect_count);
+    o.add("isr_sanity_dwt_incorrect_count", sanity->dwt_incorrect_count);
+  }
   if (rt && rt->has_fired) {
     o.add("last_event_dwt", rt->last_event.dwt_at_event);
     o.add("last_event_counter32", rt->last_event.counter32_at_event);
