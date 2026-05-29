@@ -1680,6 +1680,38 @@ static volatile uint32_t g_vclock_heartbeat_one_second_legacy_count = 0;
 static volatile uint32_t g_vclock_heartbeat_one_second_handoff_skip_count = 0;
 static volatile uint32_t g_vclock_heartbeat_one_second_fallback_count = 0;
 
+// Intrinsic CH2 VCLOCK SmartZero sampling.
+//
+// SmartZero needs adjacent +10,000-tick VCLOCK samples. CH2 fires for the
+// TimePop rail, not exclusively for a 1 kHz heartbeat, so this surface is a
+// fixed-grid sampler rather than an every-CH2-fire sampler. The first CH2
+// event while SmartZero owns VCLOCK seeds the grid; subsequent samples are
+// authored at exact +10,000 counter identities and DWT is back-projected if
+// the CH2 service event is slightly late.
+static constexpr bool     VCLOCK_CH2_SMARTZERO_NATIVE_ENABLED = true;
+static volatile bool     g_vclock_ch2_smartzero_seeded = false;
+static volatile uint32_t g_vclock_ch2_smartzero_next_counter32 = 0;
+static volatile uint32_t g_vclock_ch2_smartzero_reset_count = 0;
+static volatile uint32_t g_vclock_ch2_smartzero_seed_count = 0;
+static volatile uint32_t g_vclock_ch2_smartzero_deactivate_count = 0;
+static volatile uint32_t g_vclock_ch2_smartzero_service_count = 0;
+static volatile uint32_t g_vclock_ch2_smartzero_transaction_skip_count = 0;
+static volatile uint32_t g_vclock_ch2_smartzero_feed_count = 0;
+static volatile uint32_t g_vclock_ch2_smartzero_late_count = 0;
+static volatile uint32_t g_vclock_ch2_smartzero_late_max_ticks = 0;
+static volatile uint32_t g_vclock_ch2_smartzero_resync_count = 0;
+static volatile uint32_t g_vclock_ch2_smartzero_drop_count = 0;
+static volatile uint32_t g_vclock_ch2_smartzero_waiting_for_cps_count = 0;
+static volatile uint32_t g_vclock_ch2_smartzero_first_sample_count = 0;
+static volatile uint32_t g_vclock_ch2_smartzero_accepted_count = 0;
+static volatile uint32_t g_vclock_ch2_smartzero_rejected_dwt_count = 0;
+static volatile uint32_t g_vclock_ch2_smartzero_rejected_counter_count = 0;
+static volatile uint32_t g_vclock_ch2_smartzero_last_target_counter32 = 0;
+static volatile uint32_t g_vclock_ch2_smartzero_last_service_counter32 = 0;
+static volatile uint32_t g_vclock_ch2_smartzero_last_dwt = 0;
+static volatile uint32_t g_vclock_ch2_smartzero_last_late_ticks = 0;
+static volatile uint32_t g_vclock_heartbeat_smartzero_authority_retired_count = 0;
+
 static inline uint32_t clock32_from_ns(uint64_t ns) {
   return (uint32_t)((ns / 100ULL) & 0xFFFFFFFFULL);
 }
@@ -1737,6 +1769,10 @@ static void vclock_ch2_one_second_enable_after_heartbeat(uint32_t last_counter32
 static bool vclock_ch2_one_second_already_served_for(uint32_t counter32);
 static void vclock_ch2_one_second_service(uint32_t qtimer_event_dwt,
                                           uint32_t service_counter32);
+static void vclock_ch2_smartzero_reset_attempt_state(void);
+static void vclock_ch2_smartzero_deactivate(void);
+static void vclock_ch2_smartzero_service(uint32_t qtimer_event_dwt,
+                                         uint32_t service_counter32);
 
 static uint32_t vclock_synthetic_from_hardware_low16(uint16_t hardware_low16) {
   if (!g_vclock_clock32.zeroed) return (uint32_t)hardware_low16;
@@ -2475,6 +2511,7 @@ bool interrupt_smartzero_begin(void) {
     smartzero_reset_lane(i);
   }
   g_smartzero.lanes[0].pub.state = interrupt_smartzero_lane_state_t::ACQUIRING;
+  vclock_ch2_smartzero_reset_attempt_state();
 
   // SmartZero takes temporary custody of the OCXO local compare cadence only
   // when each OCXO lane becomes current.  Stop any running OCXO cadence now so
@@ -2503,6 +2540,7 @@ void interrupt_smartzero_abort(void) {
   }
 
   smartzero_write_end();
+  vclock_ch2_smartzero_deactivate();
 
   // SmartZero may temporarily stop/re-author the OCXO local compare cadence
   // while acquiring lane proofs.  Aborting the *live acquisition attempt* must
@@ -3380,6 +3418,113 @@ static void vclock_ch2_one_second_service(uint32_t qtimer_event_dwt,
   g_vclock_ch2_one_second_next_counter32 = next;
 }
 
+static void vclock_ch2_smartzero_reset_attempt_state(void) {
+  g_vclock_ch2_smartzero_seeded = false;
+  g_vclock_ch2_smartzero_next_counter32 = 0;
+  g_vclock_ch2_smartzero_reset_count++;
+}
+
+static void vclock_ch2_smartzero_deactivate(void) {
+  if (g_vclock_ch2_smartzero_seeded || g_vclock_ch2_smartzero_next_counter32 != 0) {
+    g_vclock_ch2_smartzero_deactivate_count++;
+  }
+  g_vclock_ch2_smartzero_seeded = false;
+  g_vclock_ch2_smartzero_next_counter32 = 0;
+}
+
+static void vclock_ch2_smartzero_record_decision(interrupt_smartzero_decision_t d) {
+  switch (d) {
+    case interrupt_smartzero_decision_t::WAITING_FOR_CPS:
+      g_vclock_ch2_smartzero_waiting_for_cps_count++;
+      break;
+    case interrupt_smartzero_decision_t::FIRST_SAMPLE:
+      g_vclock_ch2_smartzero_first_sample_count++;
+      break;
+    case interrupt_smartzero_decision_t::ACCEPTED:
+      g_vclock_ch2_smartzero_accepted_count++;
+      break;
+    case interrupt_smartzero_decision_t::REJECTED_DWT:
+      g_vclock_ch2_smartzero_rejected_dwt_count++;
+      break;
+    case interrupt_smartzero_decision_t::REJECTED_COUNTER:
+      g_vclock_ch2_smartzero_rejected_counter_count++;
+      break;
+    default:
+      break;
+  }
+}
+
+static void vclock_ch2_smartzero_service(uint32_t qtimer_event_dwt,
+                                         uint32_t service_counter32) {
+  if (!VCLOCK_CH2_SMARTZERO_NATIVE_ENABLED) return;
+
+  if ((g_smartzero.seq & 1U) != 0) {
+    g_vclock_ch2_smartzero_transaction_skip_count++;
+    return;
+  }
+
+  if (!smartzero_is_current_lane(interrupt_subscriber_kind_t::VCLOCK)) {
+    vclock_ch2_smartzero_deactivate();
+    return;
+  }
+
+  g_vclock_ch2_smartzero_service_count++;
+
+  uint32_t target_counter32 = g_vclock_ch2_smartzero_next_counter32;
+  if (!g_vclock_ch2_smartzero_seeded) {
+    target_counter32 = service_counter32;
+    g_vclock_ch2_smartzero_seeded = true;
+    g_vclock_ch2_smartzero_seed_count++;
+  } else if ((int32_t)(service_counter32 - target_counter32) < 0) {
+    return;
+  }
+
+  const uint32_t late_ticks = service_counter32 - target_counter32;
+  if (late_ticks >= SMARTZERO_INTERVAL_TICKS) {
+    // Do not feed a stale tooth that would force SmartZero to observe a
+    // non-adjacent counter delta. Re-seed on the next CH2 event instead.
+    g_vclock_ch2_smartzero_resync_count++;
+    g_vclock_ch2_smartzero_drop_count++;
+    g_vclock_ch2_smartzero_seeded = false;
+    g_vclock_ch2_smartzero_next_counter32 = 0;
+    return;
+  }
+
+  uint32_t authored_dwt = qtimer_event_dwt;
+  if (late_ticks != 0) {
+    g_vclock_ch2_smartzero_late_count++;
+    if (late_ticks > g_vclock_ch2_smartzero_late_max_ticks) {
+      g_vclock_ch2_smartzero_late_max_ticks = late_ticks;
+    }
+    authored_dwt -= vclock_cycles_for_ticks(late_ticks);
+  }
+
+  const uint16_t target_low16 = vclock_hardware_low16_from_synthetic(target_counter32);
+  g_vclock_ch2_smartzero_last_target_counter32 = target_counter32;
+  g_vclock_ch2_smartzero_last_service_counter32 = service_counter32;
+  g_vclock_ch2_smartzero_last_dwt = authored_dwt;
+  g_vclock_ch2_smartzero_last_late_ticks = late_ticks;
+
+  g_vclock_ch2_smartzero_feed_count++;
+  (void)smartzero_feed_sample(interrupt_subscriber_kind_t::VCLOCK,
+                              authored_dwt,
+                              target_counter32,
+                              target_low16);
+
+  const int idx = smartzero_index_for_kind(interrupt_subscriber_kind_t::VCLOCK);
+  if (idx >= 0) {
+    vclock_ch2_smartzero_record_decision(g_smartzero.lanes[idx].pub.last_decision);
+  }
+
+  if (!smartzero_is_current_lane(interrupt_subscriber_kind_t::VCLOCK)) {
+    vclock_ch2_smartzero_deactivate();
+    return;
+  }
+
+  g_vclock_ch2_smartzero_next_counter32 =
+      target_counter32 + SMARTZERO_INTERVAL_TICKS;
+}
+
 static void vclock_apply_perishable_fact_deferred(
     const vclock_perishable_fact_t& fact) {
   if (!fact.one_second_due || !g_rt_vclock || !g_rt_vclock->active) {
@@ -3778,20 +3923,20 @@ static void vclock_heartbeat_timepop_callback(timepop_ctx_t* ctx,
   // interrupt_ch2_implicit_rollover_tend(), which runs before TimePop gets
   // this CH2 event.  Keep the heartbeat's authored counter identity for
   // SmartZero, bootstrap/failsafe bookends, and reports, but do not refresh the
-  // synthetic clock32 extender here.  Relay deassert countdown and steady-state
-  // VCLOCK one-second authorship have moved to intrinsic CH2 service.
+  // synthetic clock32 extender here.  Relay deassert countdown, steady-state
+  // VCLOCK one-second authorship, and VCLOCK SmartZero sampling have moved to
+  // intrinsic CH2 service.
   g_vclock_lane.logical_count32_at_last_second = cadence_counter32;
   g_vclock_heartbeat_vclock_ticks++;
   g_vclock_heartbeat_last_vclock_hw16 = fired_low16;
   g_vclock_heartbeat_last_vclock_counter32 = cadence_counter32;
 
-  // SmartZero VCLOCK samples are the same 1 kHz TimePop fire facts that will
-  // later feed regression.  During zero acquisition they are observations; the
-  // accepted pair decides the canonical VCLOCK zero anchor.
-  smartzero_feed_sample(interrupt_subscriber_kind_t::VCLOCK,
-                        qtimer_event_dwt,
-                        cadence_counter32,
-                        fired_low16);
+  // VCLOCK SmartZero sampling has moved to intrinsic CH2 fixed-grid service.
+  // Keep a retired-authority counter so reports can prove the heartbeat saw
+  // acquisition opportunities without feeding them.
+  if (smartzero_is_current_lane(interrupt_subscriber_kind_t::VCLOCK)) {
+    g_vclock_heartbeat_smartzero_authority_retired_count++;
+  }
 
   // CH2 may have enqueued a fixed-grid one-second fact before TimePop invoked
   // this callback.  Arm the existing safe drain from the heartbeat phase rather
@@ -3893,8 +4038,8 @@ static void vclock_heartbeat_timepop_callback(timepop_ctx_t* ctx,
   }
 
   // OCXO lanes are intentionally absent here.  Their 16-bit rollover cadence is
-  // now device-local on QTimer2/QTimer3; this TimePop callback is the VCLOCK
-  // event/bookend and SmartZero sample surface only.
+  // now device-local on QTimer2/QTimer3; this TimePop callback is now only the
+  // VCLOCK bootstrap/fallback and safe-drain heartbeat surface.
 }
 
 static bool vclock_heartbeat_arm_timepop(void) {
@@ -4920,6 +5065,8 @@ static void qtimer1_isr(void) {
     pps_relay_ch2_tick(g_vclock_clock32.current_counter32);
     vclock_ch2_one_second_service(qtimer_event_dwt,
                                   g_qtimer1_ch2_last_target_counter32);
+    vclock_ch2_smartzero_service(qtimer_event_dwt,
+                                  g_qtimer1_ch2_last_target_counter32);
     if (g_qtimer1_ch2_handler) {
       const bridge_projection_t bridge = interrupt_dwt_to_vclock_gnss_projection(qtimer_event_dwt);
       const int64_t  gnss_ns = bridge.gnss_ns;
@@ -5677,6 +5824,29 @@ static void runtime_reset_vclock_heartbeat_state(void) {
   g_vclock_heartbeat_one_second_legacy_count = 0;
   g_vclock_heartbeat_one_second_handoff_skip_count = 0;
   g_vclock_heartbeat_one_second_fallback_count = 0;
+
+  g_vclock_ch2_smartzero_seeded = false;
+  g_vclock_ch2_smartzero_next_counter32 = 0;
+  g_vclock_ch2_smartzero_reset_count = 0;
+  g_vclock_ch2_smartzero_seed_count = 0;
+  g_vclock_ch2_smartzero_deactivate_count = 0;
+  g_vclock_ch2_smartzero_service_count = 0;
+  g_vclock_ch2_smartzero_transaction_skip_count = 0;
+  g_vclock_ch2_smartzero_feed_count = 0;
+  g_vclock_ch2_smartzero_late_count = 0;
+  g_vclock_ch2_smartzero_late_max_ticks = 0;
+  g_vclock_ch2_smartzero_resync_count = 0;
+  g_vclock_ch2_smartzero_drop_count = 0;
+  g_vclock_ch2_smartzero_waiting_for_cps_count = 0;
+  g_vclock_ch2_smartzero_first_sample_count = 0;
+  g_vclock_ch2_smartzero_accepted_count = 0;
+  g_vclock_ch2_smartzero_rejected_dwt_count = 0;
+  g_vclock_ch2_smartzero_rejected_counter_count = 0;
+  g_vclock_ch2_smartzero_last_target_counter32 = 0;
+  g_vclock_ch2_smartzero_last_service_counter32 = 0;
+  g_vclock_ch2_smartzero_last_dwt = 0;
+  g_vclock_ch2_smartzero_last_late_ticks = 0;
+  g_vclock_heartbeat_smartzero_authority_retired_count = 0;
 }
 
 static void runtime_reset_ocxo_fact_rings(void) {
@@ -6148,6 +6318,31 @@ static void add_vclock_heartbeat_payload(Payload& p) {
   p.add("vclock_heartbeat_one_second_legacy_count", g_vclock_heartbeat_one_second_legacy_count);
   p.add("vclock_heartbeat_one_second_handoff_skip_count", g_vclock_heartbeat_one_second_handoff_skip_count);
   p.add("vclock_heartbeat_one_second_fallback_count", g_vclock_heartbeat_one_second_fallback_count);
+  p.add("vclock_heartbeat_smartzero_authority_retired", true);
+  p.add("vclock_heartbeat_smartzero_authority_retired_count", g_vclock_heartbeat_smartzero_authority_retired_count);
+
+  p.add("vclock_ch2_smartzero_native_enabled", VCLOCK_CH2_SMARTZERO_NATIVE_ENABLED);
+  p.add("vclock_ch2_smartzero_seeded", g_vclock_ch2_smartzero_seeded);
+  p.add("vclock_ch2_smartzero_next_counter32", g_vclock_ch2_smartzero_next_counter32);
+  p.add("vclock_ch2_smartzero_reset_count", g_vclock_ch2_smartzero_reset_count);
+  p.add("vclock_ch2_smartzero_seed_count", g_vclock_ch2_smartzero_seed_count);
+  p.add("vclock_ch2_smartzero_deactivate_count", g_vclock_ch2_smartzero_deactivate_count);
+  p.add("vclock_ch2_smartzero_service_count", g_vclock_ch2_smartzero_service_count);
+  p.add("vclock_ch2_smartzero_transaction_skip_count", g_vclock_ch2_smartzero_transaction_skip_count);
+  p.add("vclock_ch2_smartzero_feed_count", g_vclock_ch2_smartzero_feed_count);
+  p.add("vclock_ch2_smartzero_late_count", g_vclock_ch2_smartzero_late_count);
+  p.add("vclock_ch2_smartzero_late_max_ticks", g_vclock_ch2_smartzero_late_max_ticks);
+  p.add("vclock_ch2_smartzero_resync_count", g_vclock_ch2_smartzero_resync_count);
+  p.add("vclock_ch2_smartzero_drop_count", g_vclock_ch2_smartzero_drop_count);
+  p.add("vclock_ch2_smartzero_waiting_for_cps_count", g_vclock_ch2_smartzero_waiting_for_cps_count);
+  p.add("vclock_ch2_smartzero_first_sample_count", g_vclock_ch2_smartzero_first_sample_count);
+  p.add("vclock_ch2_smartzero_accepted_count", g_vclock_ch2_smartzero_accepted_count);
+  p.add("vclock_ch2_smartzero_rejected_dwt_count", g_vclock_ch2_smartzero_rejected_dwt_count);
+  p.add("vclock_ch2_smartzero_rejected_counter_count", g_vclock_ch2_smartzero_rejected_counter_count);
+  p.add("vclock_ch2_smartzero_last_target_counter32", g_vclock_ch2_smartzero_last_target_counter32);
+  p.add("vclock_ch2_smartzero_last_service_counter32", g_vclock_ch2_smartzero_last_service_counter32);
+  p.add("vclock_ch2_smartzero_last_dwt", g_vclock_ch2_smartzero_last_dwt);
+  p.add("vclock_ch2_smartzero_last_late_ticks", g_vclock_ch2_smartzero_last_late_ticks);
 
   p.add("vclock_ch2_one_second_enabled", g_vclock_ch2_one_second_enabled);
   p.add("vclock_ch2_one_second_next_counter32", g_vclock_ch2_one_second_next_counter32);
@@ -6468,6 +6663,21 @@ static void add_vclock_lane_payload(Payload& p, bool detailed) {
   p.add("vclock_heartbeat_one_second_legacy_count", g_vclock_heartbeat_one_second_legacy_count);
   p.add("vclock_heartbeat_one_second_handoff_skip_count", g_vclock_heartbeat_one_second_handoff_skip_count);
   p.add("vclock_heartbeat_one_second_fallback_count", g_vclock_heartbeat_one_second_fallback_count);
+  p.add("vclock_heartbeat_smartzero_authority_retired", true);
+  p.add("vclock_heartbeat_smartzero_authority_retired_count", g_vclock_heartbeat_smartzero_authority_retired_count);
+  p.add("vclock_ch2_smartzero_native_enabled", VCLOCK_CH2_SMARTZERO_NATIVE_ENABLED);
+  p.add("vclock_ch2_smartzero_seeded", g_vclock_ch2_smartzero_seeded);
+  p.add("vclock_ch2_smartzero_next_counter32", g_vclock_ch2_smartzero_next_counter32);
+  p.add("vclock_ch2_smartzero_service_count", g_vclock_ch2_smartzero_service_count);
+  p.add("vclock_ch2_smartzero_transaction_skip_count", g_vclock_ch2_smartzero_transaction_skip_count);
+  p.add("vclock_ch2_smartzero_feed_count", g_vclock_ch2_smartzero_feed_count);
+  p.add("vclock_ch2_smartzero_late_count", g_vclock_ch2_smartzero_late_count);
+  p.add("vclock_ch2_smartzero_late_max_ticks", g_vclock_ch2_smartzero_late_max_ticks);
+  p.add("vclock_ch2_smartzero_resync_count", g_vclock_ch2_smartzero_resync_count);
+  p.add("vclock_ch2_smartzero_drop_count", g_vclock_ch2_smartzero_drop_count);
+  p.add("vclock_ch2_smartzero_accepted_count", g_vclock_ch2_smartzero_accepted_count);
+  p.add("vclock_ch2_smartzero_rejected_dwt_count", g_vclock_ch2_smartzero_rejected_dwt_count);
+  p.add("vclock_ch2_smartzero_rejected_counter_count", g_vclock_ch2_smartzero_rejected_counter_count);
 
   if (!detailed) return;
 
@@ -6496,6 +6706,15 @@ static void add_vclock_lane_payload(Payload& p, bool detailed) {
   p.add("vclock_perishable_fact_asap_arm_count", g_vclock_fact_ring.asap_arm_count);
   p.add("vclock_perishable_fact_asap_fail_count", g_vclock_fact_ring.asap_fail_count);
   p.add("vclock_perishable_fact_drain_armed", g_vclock_fact_ring.drain_armed);
+  p.add("vclock_ch2_smartzero_reset_count", g_vclock_ch2_smartzero_reset_count);
+  p.add("vclock_ch2_smartzero_seed_count", g_vclock_ch2_smartzero_seed_count);
+  p.add("vclock_ch2_smartzero_deactivate_count", g_vclock_ch2_smartzero_deactivate_count);
+  p.add("vclock_ch2_smartzero_waiting_for_cps_count", g_vclock_ch2_smartzero_waiting_for_cps_count);
+  p.add("vclock_ch2_smartzero_first_sample_count", g_vclock_ch2_smartzero_first_sample_count);
+  p.add("vclock_ch2_smartzero_last_target_counter32", g_vclock_ch2_smartzero_last_target_counter32);
+  p.add("vclock_ch2_smartzero_last_service_counter32", g_vclock_ch2_smartzero_last_service_counter32);
+  p.add("vclock_ch2_smartzero_last_dwt", g_vclock_ch2_smartzero_last_dwt);
+  p.add("vclock_ch2_smartzero_last_late_ticks", g_vclock_ch2_smartzero_last_late_ticks);
   add_regression_payload(p, "vclock", g_regression_vclock);
   p.add("qtimer1_ch1_active", g_qtimer1_ch1_active);
   p.add("qtimer1_ch1_sequence", g_qtimer1_ch1_sequence);
