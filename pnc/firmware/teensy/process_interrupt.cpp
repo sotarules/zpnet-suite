@@ -42,12 +42,12 @@
 // The PPS GPIO ISR captures DWT as its first instruction, then reads the
 // QTimer1 CH0 low-word counter.  process_interrupt maps that low-word
 // hardware observation into the private synthetic 32-bit VCLOCK identity.
-// When a rebootstrap is pending, it
-// records the selected VCLOCK edge.  The recurring TimePop VCLOCK cadence client is armed as a critical recurring
-// ISR slot.  It consumes the next CH2 fire fact, back-projects to the selected
-// edge, refreshes the synthetic VCLOCK low-word anchor before TimePop schedules
-// the next compare, and thereafter emits the one-second VCLOCK events on the
-// TimePop rail.
+// When a rebootstrap is pending, it records the selected VCLOCK edge.
+// Native QTimer1 CH2 custody now consumes that pending edge after TimePop has
+// processed a CH2 compare event, back-projects to the selected edge, and
+// publishes the canonical PPS_VCLOCK epoch.  Native CH2 also owns steady-state
+// VCLOCK one-second fact authorship, VCLOCK SmartZero sampling, PPS_RELAY
+// deassert, fact-drain arming, and passive 16-bit rollover tending.
 // ============================================================================
 
 #include "process_interrupt.h"
@@ -901,6 +901,41 @@ static pps_t g_last_pps_witness = {};
 static bool  g_last_pps_witness_valid = false;
 static vclock_epoch_latch_t g_vclock_epoch_latch = {};
 
+// Intrinsic CH2 PPS/VCLOCK selected-epoch publication.
+//
+// The PPS GPIO ISR remains the selector of the sacred VCLOCK edge identity.
+// Native CH2 now consumes that pending latch after TimePop has processed a CH2
+// compare event, then back-projects from the CH2 event DWT to the selected
+// PPS_VCLOCK edge.  VCLOCK_HEARTBEAT no longer authors bootstrap/rebootstrap
+// publication; it only observes pending epoch work and steps aside.
+static constexpr bool     VCLOCK_CH2_EPOCH_NATIVE_ENABLED = true;
+static constexpr uint32_t VCLOCK_CH2_EPOCH_REJECT_NONE = 0;
+static constexpr uint32_t VCLOCK_CH2_EPOCH_REJECT_BACKDATE_ZERO = 1;
+static constexpr uint32_t VCLOCK_CH2_EPOCH_REJECT_BACKDATE_TOO_LARGE = 2;
+
+static const char* vclock_ch2_epoch_reject_reason_name(uint32_t reason) {
+  switch (reason) {
+    case VCLOCK_CH2_EPOCH_REJECT_BACKDATE_ZERO: return "BACKDATE_ZERO";
+    case VCLOCK_CH2_EPOCH_REJECT_BACKDATE_TOO_LARGE: return "BACKDATE_TOO_LARGE";
+    default: return "NONE";
+  }
+}
+
+static volatile uint32_t g_vclock_ch2_epoch_native_service_count = 0;
+static volatile uint32_t g_vclock_ch2_epoch_native_publish_count = 0;
+static volatile uint32_t g_vclock_ch2_epoch_native_bad_backdate_count = 0;
+static volatile uint32_t g_vclock_ch2_epoch_native_last_reject_reason = VCLOCK_CH2_EPOCH_REJECT_NONE;
+static volatile uint32_t g_vclock_ch2_epoch_native_dispatch_arm_count = 0;
+static volatile uint32_t g_vclock_ch2_epoch_native_dispatch_arm_fail_count = 0;
+static volatile uint32_t g_vclock_ch2_epoch_native_last_selected_counter32 = 0;
+static volatile uint32_t g_vclock_ch2_epoch_native_last_service_counter32 = 0;
+static volatile uint32_t g_vclock_ch2_epoch_native_last_backdate_ticks = 0;
+static volatile uint32_t g_vclock_ch2_epoch_native_last_backdate_cycles = 0;
+static volatile uint32_t g_vclock_ch2_epoch_native_last_sacred_dwt = 0;
+static volatile uint32_t g_vclock_ch2_epoch_native_last_sequence = 0;
+static volatile uint32_t g_vclock_heartbeat_epoch_authority_retired_count = 0;
+static volatile uint32_t g_vclock_heartbeat_epoch_pending_skip_count = 0;
+
 struct dwt_repair_diag_t {
   bool     valid = false;
   bool     candidate = false;
@@ -1041,14 +1076,29 @@ static void publish_vclock_domain_pps_vclock(const pps_t& pps,
   pvc_anchor_publish(pvc);
 }
 
-static void publish_selected_epoch_from_vclock_cadence(uint32_t cadence_counter32,
+static bool publish_selected_epoch_from_vclock_cadence(uint32_t cadence_counter32,
                                                        uint32_t cadence_event_dwt) {
-  if (!g_vclock_epoch_latch.pending) return;
+  if (!g_vclock_epoch_latch.pending) return false;
 
-  const uint32_t backdate_ticks =
-      cadence_counter32 - g_vclock_epoch_latch.counter32_at_edge;
-  if (backdate_ticks == 0 || backdate_ticks > VCLOCK_COUNTS_PER_SECOND) {
-    return;
+  const uint32_t selected_counter32 = g_vclock_epoch_latch.counter32_at_edge;
+  const uint32_t backdate_ticks = cadence_counter32 - selected_counter32;
+
+  g_vclock_ch2_epoch_native_last_selected_counter32 = selected_counter32;
+  g_vclock_ch2_epoch_native_last_service_counter32 = cadence_counter32;
+  g_vclock_ch2_epoch_native_last_backdate_ticks = backdate_ticks;
+
+  if (backdate_ticks == 0) {
+    g_vclock_ch2_epoch_native_bad_backdate_count++;
+    g_vclock_ch2_epoch_native_last_reject_reason =
+        VCLOCK_CH2_EPOCH_REJECT_BACKDATE_ZERO;
+    return false;
+  }
+
+  if (backdate_ticks > VCLOCK_COUNTS_PER_SECOND) {
+    g_vclock_ch2_epoch_native_bad_backdate_count++;
+    g_vclock_ch2_epoch_native_last_reject_reason =
+        VCLOCK_CH2_EPOCH_REJECT_BACKDATE_TOO_LARGE;
+    return false;
   }
 
   const uint32_t backdate_cycles = vclock_cycles_for_ticks(backdate_ticks);
@@ -1060,17 +1110,33 @@ static void publish_selected_epoch_from_vclock_cadence(uint32_t cadence_counter3
   g_vclock_epoch_latch.backdate_cycles = backdate_cycles;
   g_vclock_epoch_latch.sacred_dwt = anchor_dwt;
 
+  g_vclock_ch2_epoch_native_last_backdate_cycles = backdate_cycles;
+  g_vclock_ch2_epoch_native_last_sacred_dwt = anchor_dwt;
+  g_vclock_ch2_epoch_native_last_sequence = g_vclock_epoch_latch.pps.sequence;
+
   publish_vclock_domain_pps_vclock(g_vclock_epoch_latch.pps,
                                     g_vclock_epoch_latch.pps.sequence,
                                     anchor_dwt,
-                                    g_vclock_epoch_latch.counter32_at_edge,
+                                    selected_counter32,
                                     g_vclock_epoch_latch.ch3_at_edge);
 
   g_vclock_epoch_latch.pending = false;
+  g_vclock_ch2_epoch_native_last_reject_reason = VCLOCK_CH2_EPOCH_REJECT_NONE;
+  g_vclock_ch2_epoch_native_publish_count++;
 
   if (g_pps_edge_dispatch) {
-    timepop_arm_asap(pps_edge_dispatch_trampoline, nullptr, "PPS_VCLOCK_EPOCH_DISPATCH");
+    const timepop_handle_t h =
+        timepop_arm_asap(pps_edge_dispatch_trampoline,
+                         nullptr,
+                         "PPS_VCLOCK_EPOCH_DISPATCH");
+    if (h == TIMEPOP_INVALID_HANDLE) {
+      g_vclock_ch2_epoch_native_dispatch_arm_fail_count++;
+    } else {
+      g_vclock_ch2_epoch_native_dispatch_arm_count++;
+    }
   }
+
+  return true;
 }
 
 // ============================================================================
@@ -3548,6 +3614,38 @@ static void vclock_ch2_smartzero_service(uint32_t qtimer_event_dwt,
       target_counter32 + SMARTZERO_INTERVAL_TICKS;
 }
 
+static void vclock_ch2_epoch_native_service(uint32_t qtimer_event_dwt,
+                                             uint32_t service_counter32) {
+  if (!VCLOCK_CH2_EPOCH_NATIVE_ENABLED) return;
+  if (!g_interrupt_runtime_ready || !g_interrupt_hw_ready) return;
+  if (!g_vclock_epoch_latch.pending) return;
+
+  g_vclock_ch2_epoch_native_service_count++;
+
+  const uint32_t selected_counter32 = g_vclock_epoch_latch.counter32_at_edge;
+  const uint32_t selected_to_service_ticks = service_counter32 - selected_counter32;
+  g_vclock_ch2_epoch_native_last_selected_counter32 = selected_counter32;
+  g_vclock_ch2_epoch_native_last_service_counter32 = service_counter32;
+  g_vclock_ch2_epoch_native_last_backdate_ticks = selected_to_service_ticks;
+
+  const bool published =
+      publish_selected_epoch_from_vclock_cadence(service_counter32,
+                                                 qtimer_event_dwt);
+  if (!published) return;
+
+  // Preserve the old heartbeat phase semantics, but author them from the same
+  // native CH2 service fact that published the selected epoch.  The next
+  // heartbeat will increment from this millisecond-cell position; it will not
+  // decide the epoch itself.
+  g_vclock_lane.tick_mod_1000 =
+      (selected_to_service_ticks / VCLOCK_INTERVAL_COUNTS) %
+      TICKS_PER_SECOND_EVENT;
+  g_vclock_lane.logical_count32_at_last_second = service_counter32;
+  g_vclock_lane.compare_target =
+      (uint16_t)(g_vclock_epoch_latch.ch3_at_edge +
+                 (uint16_t)VCLOCK_INTERVAL_COUNTS);
+}
+
 static void vclock_apply_perishable_fact_deferred(
     const vclock_perishable_fact_t& fact) {
   if (!fact.one_second_due || !g_rt_vclock || !g_rt_vclock->active) {
@@ -3925,10 +4023,10 @@ static void ocxo_lane_install_logical_grid(interrupt_subscriber_kind_t kind,
 
 // The old VCLOCK_HEARTBEAT-driven OCXO arming path has been retired.  OCXO1 and
 // OCXO2 now maintain their own one-second compare custody on their local QTimer
-// channels.  Relay deassertion, steady-state VCLOCK one-second bookends,
-// VCLOCK SmartZero sampling, and VCLOCK fact-drain arming now run from
-// intrinsic CH2.  VCLOCK_HEARTBEAT remains only the bootstrap/fallback and
-// reporting heartbeat.
+// channels.  Relay deassertion, bootstrap/rebootstrap selected-epoch
+// publication, steady-state VCLOCK one-second bookends, VCLOCK SmartZero
+// sampling, and VCLOCK fact-drain arming now run from intrinsic CH2.
+// VCLOCK_HEARTBEAT remains only the fallback and reporting heartbeat.
 
 static void vclock_heartbeat_timepop_callback(timepop_ctx_t* ctx,
                                             timepop_diag_t*,
@@ -3948,8 +4046,9 @@ static void vclock_heartbeat_timepop_callback(timepop_ctx_t* ctx,
   // this CH2 event.  Keep the heartbeat's authored counter identity for
   // bootstrap/failsafe bookends and reports, but do not refresh the
   // synthetic clock32 extender here.  Relay deassert countdown, steady-state
-  // VCLOCK one-second authorship, VCLOCK SmartZero sampling, and fact-drain
-  // arming have moved to intrinsic/native CH2 service.
+  // VCLOCK one-second authorship, VCLOCK SmartZero sampling, bootstrap/
+  // rebootstrap selected-epoch publication, and fact-drain arming have moved
+  // to intrinsic/native CH2 service.
   g_vclock_lane.logical_count32_at_last_second = cadence_counter32;
   g_vclock_heartbeat_vclock_ticks++;
   g_vclock_heartbeat_last_vclock_hw16 = fired_low16;
@@ -3983,22 +4082,18 @@ static void vclock_heartbeat_timepop_callback(timepop_ctx_t* ctx,
 
     g_vclock_lane.cadence_hits_total++;
 
-    bool vclock_epoch_consumed_this_fire = false;
     if (g_vclock_epoch_latch.pending) {
-      const uint32_t selected_to_cadence_ticks =
-          cadence_counter32 - g_vclock_epoch_latch.counter32_at_edge;
-      publish_selected_epoch_from_vclock_cadence(cadence_counter32,
-                                                 qtimer_event_dwt);
-      if (!g_vclock_epoch_latch.pending) {
-        g_vclock_lane.tick_mod_1000 =
-            (selected_to_cadence_ticks / VCLOCK_INTERVAL_COUNTS) %
-            TICKS_PER_SECOND_EVENT;
-        vclock_epoch_consumed_this_fire = true;
-      }
+      // Native CH2 tail now publishes bootstrap/rebootstrap selected epochs.
+      // The heartbeat deliberately does not consume the latch or advance the
+      // one-second modulo while the selected epoch is pending; the CH2 service
+      // that publishes the epoch will seed tick_mod_1000 from its own event
+      // facts after TimePop returns.
+      g_vclock_heartbeat_epoch_authority_retired_count++;
+      g_vclock_heartbeat_epoch_pending_skip_count++;
+      return;
     }
 
-    if (!vclock_epoch_consumed_this_fire &&
-        ++g_vclock_lane.tick_mod_1000 >= TICKS_PER_SECOND_EVENT) {
+    if (++g_vclock_lane.tick_mod_1000 >= TICKS_PER_SECOND_EVENT) {
       g_vclock_lane.tick_mod_1000 = 0;
 
       if (vclock_ch2_one_second_already_served_for(cadence_counter32)) {
@@ -4065,7 +4160,7 @@ static void vclock_heartbeat_timepop_callback(timepop_ctx_t* ctx,
 
   // OCXO lanes are intentionally absent here.  Their 16-bit rollover cadence is
   // now device-local on QTimer2/QTimer3; this TimePop callback is now only the
-  // VCLOCK bootstrap/fallback/reporting heartbeat surface.
+  // VCLOCK fallback/reporting heartbeat surface.
 }
 
 static bool vclock_heartbeat_arm_timepop(void) {
@@ -5087,12 +5182,15 @@ static void qtimer1_isr(void) {
   else if (IMXRT_TMR1.CH[2].CSCTRL & TMR_CSCTRL_TCF1) {
     qtimer1_ch2_clear_compare_flag();
     const uint32_t qtimer_event_dwt = qtimer_event_dwt_from_isr_entry_raw(isr_entry_dwt_raw);
+    // Snapshot the fired target before TimePop is invoked; the handler may arm
+    // the next compare and update g_qtimer1_ch2_last_target_counter32.
+    const uint32_t ch2_event_counter32 = g_qtimer1_ch2_last_target_counter32;
     interrupt_ch2_implicit_rollover_tend();
     pps_relay_ch2_tick(g_vclock_clock32.current_counter32);
     vclock_ch2_one_second_service(qtimer_event_dwt,
-                                  g_qtimer1_ch2_last_target_counter32);
+                                  ch2_event_counter32);
     vclock_ch2_smartzero_service(qtimer_event_dwt,
-                                  g_qtimer1_ch2_last_target_counter32);
+                                  ch2_event_counter32);
     if (g_qtimer1_ch2_handler) {
       const bridge_projection_t bridge = interrupt_dwt_to_vclock_gnss_projection(qtimer_event_dwt);
       const int64_t  gnss_ns = bridge.gnss_ns;
@@ -5108,7 +5206,7 @@ static void qtimer1_isr(void) {
       // CH2 compare event identity is the synthetic deadline that
       // process_interrupt armed in hardware on TimePop's behalf.  This is an
       // event fact, not a post-event ambient read.
-      event.counter32_at_event = g_qtimer1_ch2_last_target_counter32;
+      event.counter32_at_event = ch2_event_counter32;
 
       interrupt_capture_diag_t diag{};
       diag.enabled  = true;
@@ -5122,6 +5220,12 @@ static void qtimer1_isr(void) {
 
       g_qtimer1_ch2_handler(event, diag);
     }
+
+    // Bootstrap/rebootstrap PPS_VCLOCK publication is also native CH2 custody
+    // now.  Run it only after TimePop has consumed the compare event, matching
+    // the safe ordering used for VCLOCK fact-drain arming.
+    vclock_ch2_epoch_native_service(qtimer_event_dwt,
+                                    ch2_event_counter32);
 
     // CH2-authored VCLOCK facts are now drain-armed from native CH2 custody,
     // but only after TimePop has consumed the compare event.  This preserves
@@ -5378,10 +5482,10 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
   // rebootstrap consume them.
   pps_post_isr_defer(epoch_cap, isr_entry_dwt_raw);
 
-  // During rebootstrap, PPS selects the sacred VCLOCK edge identity.  The
-  // already-running critical TimePop VCLOCK cadence client consumes the next CH2
-  // fire fact, back-projects to this selected edge, refreshes the synthetic
-  // VCLOCK anchor in ISR context, and publishes the canonical epoch.
+  // During rebootstrap, PPS selects the sacred VCLOCK edge identity.  Native
+  // CH2 custody consumes this pending latch after TimePop has processed the
+  // next CH2 compare fact, back-projects to the selected edge, and publishes
+  // the canonical PPS_VCLOCK epoch.
   if (g_pps_rebootstrap_pending) {
     g_pps_rebootstrap_pending = false;
     g_pps_rebootstrap_count++;
@@ -5882,6 +5986,21 @@ static void runtime_reset_vclock_heartbeat_state(void) {
   g_vclock_ch2_fact_drain_service_count = 0;
   g_vclock_ch2_fact_drain_arm_count = 0;
   g_vclock_heartbeat_fact_drain_authority_retired_count = 0;
+  g_vclock_ch2_epoch_native_service_count = 0;
+  g_vclock_ch2_epoch_native_publish_count = 0;
+  g_vclock_ch2_epoch_native_bad_backdate_count = 0;
+  g_vclock_ch2_epoch_native_last_reject_reason = VCLOCK_CH2_EPOCH_REJECT_NONE;
+  g_vclock_ch2_epoch_native_dispatch_arm_count = 0;
+  g_vclock_ch2_epoch_native_dispatch_arm_fail_count = 0;
+  g_vclock_ch2_epoch_native_last_selected_counter32 = 0;
+  g_vclock_ch2_epoch_native_last_service_counter32 = 0;
+  g_vclock_ch2_epoch_native_last_backdate_ticks = 0;
+  g_vclock_ch2_epoch_native_last_backdate_cycles = 0;
+  g_vclock_ch2_epoch_native_last_sacred_dwt = 0;
+  g_vclock_ch2_epoch_native_last_sequence = 0;
+  g_vclock_heartbeat_epoch_authority_retired_count = 0;
+  g_vclock_heartbeat_epoch_pending_skip_count = 0;
+
 }
 
 static void runtime_reset_ocxo_fact_rings(void) {
@@ -6295,9 +6414,9 @@ static void add_runtime_payload(Payload& p) {
   p.add("ocxo1_quiet_phase_us", ocxo_phase_ticks_to_us(OCXO1_QUIET_PHASE_TICKS));
   p.add("ocxo2_quiet_phase_ticks", OCXO2_QUIET_PHASE_TICKS);
   p.add("ocxo2_quiet_phase_us", ocxo_phase_ticks_to_us(OCXO2_QUIET_PHASE_TICKS));
-  p.add("timing_arch_step", "OCXO_ROLLOVER_ONLY_EMA_DWT");
+  p.add("timing_arch_step", "CH2_NATIVE_VCLOCK_EPOCH_SMARTZERO_ONE_SECOND_DRAIN");
   p.add("timing_arch_behavior_changed", true);
-  p.add("timing_arch_vclock_authority", "QTIMER1_CH2_NATIVE_ROLLOVER_RELAY_1S_SMARTZERO_DRAIN_ARM");
+  p.add("timing_arch_vclock_authority", "QTIMER1_CH2_NATIVE_ROLLOVER_RELAY_EPOCH_1S_SMARTZERO_DRAIN_ARM");
   p.add("timing_arch_ocxo_model", "LOCAL_QTIMER_ONE_SECOND_EDGE_CAPTURE");
   p.add("timing_arch_ocxo_migration_stage", "EMA_DWT_AUTHORITY");
   p.add("subscriber_count", g_subscriber_count);
@@ -6357,6 +6476,23 @@ static void add_vclock_heartbeat_payload(Payload& p) {
   p.add("vclock_heartbeat_smartzero_authority_retired_count", g_vclock_heartbeat_smartzero_authority_retired_count);
   p.add("vclock_heartbeat_fact_drain_authority_retired", true);
   p.add("vclock_heartbeat_fact_drain_authority_retired_count", g_vclock_heartbeat_fact_drain_authority_retired_count);
+  p.add("vclock_heartbeat_epoch_authority_retired", true);
+  p.add("vclock_heartbeat_epoch_authority_retired_count", g_vclock_heartbeat_epoch_authority_retired_count);
+  p.add("vclock_heartbeat_epoch_pending_skip_count", g_vclock_heartbeat_epoch_pending_skip_count);
+  p.add("vclock_ch2_epoch_native_enabled", VCLOCK_CH2_EPOCH_NATIVE_ENABLED);
+  p.add("vclock_ch2_epoch_native_service_count", g_vclock_ch2_epoch_native_service_count);
+  p.add("vclock_ch2_epoch_native_publish_count", g_vclock_ch2_epoch_native_publish_count);
+  p.add("vclock_ch2_epoch_native_bad_backdate_count", g_vclock_ch2_epoch_native_bad_backdate_count);
+  p.add("vclock_ch2_epoch_native_last_reject_reason", g_vclock_ch2_epoch_native_last_reject_reason);
+  p.add("vclock_ch2_epoch_native_last_reject_reason_name", vclock_ch2_epoch_reject_reason_name(g_vclock_ch2_epoch_native_last_reject_reason));
+  p.add("vclock_ch2_epoch_native_dispatch_arm_count", g_vclock_ch2_epoch_native_dispatch_arm_count);
+  p.add("vclock_ch2_epoch_native_dispatch_arm_fail_count", g_vclock_ch2_epoch_native_dispatch_arm_fail_count);
+  p.add("vclock_ch2_epoch_native_last_sequence", g_vclock_ch2_epoch_native_last_sequence);
+  p.add("vclock_ch2_epoch_native_last_selected_counter32", g_vclock_ch2_epoch_native_last_selected_counter32);
+  p.add("vclock_ch2_epoch_native_last_service_counter32", g_vclock_ch2_epoch_native_last_service_counter32);
+  p.add("vclock_ch2_epoch_native_last_backdate_ticks", g_vclock_ch2_epoch_native_last_backdate_ticks);
+  p.add("vclock_ch2_epoch_native_last_backdate_cycles", g_vclock_ch2_epoch_native_last_backdate_cycles);
+  p.add("vclock_ch2_epoch_native_last_sacred_dwt", g_vclock_ch2_epoch_native_last_sacred_dwt);
   p.add("vclock_ch2_fact_drain_native_enabled", true);
   p.add("vclock_ch2_fact_drain_service_count", g_vclock_ch2_fact_drain_service_count);
   p.add("vclock_ch2_fact_drain_arm_count", g_vclock_ch2_fact_drain_arm_count);
@@ -6474,6 +6610,20 @@ static void add_pps_payload(Payload& p) {
   p.add("vclock_epoch_latch_backdate_ticks", g_vclock_epoch_latch.backdate_ticks);
   p.add("vclock_epoch_latch_backdate_cycles", g_vclock_epoch_latch.backdate_cycles);
   p.add("vclock_epoch_latch_sacred_dwt", g_vclock_epoch_latch.sacred_dwt);
+  p.add("vclock_ch2_epoch_native_enabled", VCLOCK_CH2_EPOCH_NATIVE_ENABLED);
+  p.add("vclock_ch2_epoch_native_service_count", g_vclock_ch2_epoch_native_service_count);
+  p.add("vclock_ch2_epoch_native_publish_count", g_vclock_ch2_epoch_native_publish_count);
+  p.add("vclock_ch2_epoch_native_bad_backdate_count", g_vclock_ch2_epoch_native_bad_backdate_count);
+  p.add("vclock_ch2_epoch_native_last_reject_reason", g_vclock_ch2_epoch_native_last_reject_reason);
+  p.add("vclock_ch2_epoch_native_last_reject_reason_name", vclock_ch2_epoch_reject_reason_name(g_vclock_ch2_epoch_native_last_reject_reason));
+  p.add("vclock_ch2_epoch_native_dispatch_arm_count", g_vclock_ch2_epoch_native_dispatch_arm_count);
+  p.add("vclock_ch2_epoch_native_dispatch_arm_fail_count", g_vclock_ch2_epoch_native_dispatch_arm_fail_count);
+  p.add("vclock_ch2_epoch_native_last_sequence", g_vclock_ch2_epoch_native_last_sequence);
+  p.add("vclock_ch2_epoch_native_last_selected_counter32", g_vclock_ch2_epoch_native_last_selected_counter32);
+  p.add("vclock_ch2_epoch_native_last_service_counter32", g_vclock_ch2_epoch_native_last_service_counter32);
+  p.add("vclock_ch2_epoch_native_last_backdate_ticks", g_vclock_ch2_epoch_native_last_backdate_ticks);
+  p.add("vclock_ch2_epoch_native_last_backdate_cycles", g_vclock_ch2_epoch_native_last_backdate_cycles);
+  p.add("vclock_ch2_epoch_native_last_sacred_dwt", g_vclock_ch2_epoch_native_last_sacred_dwt);
 
   pps_t pps; pps_vclock_t pvc;
   store_load(pps, pvc);
@@ -6681,9 +6831,9 @@ static void add_vclock_lane_payload(Payload& p, bool detailed) {
   p.add("kind", "VCLOCK");
   p.add("provider", "QTIMER1");
   p.add("hardware_lane", "QTIMER1_CH2_COMP");
-  p.add("cadence_source", "QTIMER1_CH2_TIMEPOP_VCLOCK_HEARTBEAT_PLUS_CH2_ONE_SECOND");
+  p.add("cadence_source", "QTIMER1_CH2_NATIVE_EPOCH_ONE_SECOND_PLUS_HEARTBEAT_FALLBACK");
   p.add("counter_source", "QTIMER1_CH0_SYNTHETIC_COUNTER32");
-  p.add("event_source", "QTIMER1_CH2_INTRINSIC_ONE_SECOND_AFTER_BOOTSTRAP");
+  p.add("event_source", "QTIMER1_CH2_INTRINSIC_EPOCH_AND_ONE_SECOND");
   p.add("dwt_authority", "QTIMER1_CH2_TIMEPOP_EVENT_DWT");
 
   add_runtime_lane_summary(p, "vclock", g_rt_vclock);
@@ -6707,6 +6857,23 @@ static void add_vclock_lane_payload(Payload& p, bool detailed) {
   p.add("vclock_heartbeat_smartzero_authority_retired_count", g_vclock_heartbeat_smartzero_authority_retired_count);
   p.add("vclock_heartbeat_fact_drain_authority_retired", true);
   p.add("vclock_heartbeat_fact_drain_authority_retired_count", g_vclock_heartbeat_fact_drain_authority_retired_count);
+  p.add("vclock_heartbeat_epoch_authority_retired", true);
+  p.add("vclock_heartbeat_epoch_authority_retired_count", g_vclock_heartbeat_epoch_authority_retired_count);
+  p.add("vclock_heartbeat_epoch_pending_skip_count", g_vclock_heartbeat_epoch_pending_skip_count);
+  p.add("vclock_ch2_epoch_native_enabled", VCLOCK_CH2_EPOCH_NATIVE_ENABLED);
+  p.add("vclock_ch2_epoch_native_service_count", g_vclock_ch2_epoch_native_service_count);
+  p.add("vclock_ch2_epoch_native_publish_count", g_vclock_ch2_epoch_native_publish_count);
+  p.add("vclock_ch2_epoch_native_bad_backdate_count", g_vclock_ch2_epoch_native_bad_backdate_count);
+  p.add("vclock_ch2_epoch_native_last_reject_reason", g_vclock_ch2_epoch_native_last_reject_reason);
+  p.add("vclock_ch2_epoch_native_last_reject_reason_name", vclock_ch2_epoch_reject_reason_name(g_vclock_ch2_epoch_native_last_reject_reason));
+  p.add("vclock_ch2_epoch_native_dispatch_arm_count", g_vclock_ch2_epoch_native_dispatch_arm_count);
+  p.add("vclock_ch2_epoch_native_dispatch_arm_fail_count", g_vclock_ch2_epoch_native_dispatch_arm_fail_count);
+  p.add("vclock_ch2_epoch_native_last_sequence", g_vclock_ch2_epoch_native_last_sequence);
+  p.add("vclock_ch2_epoch_native_last_selected_counter32", g_vclock_ch2_epoch_native_last_selected_counter32);
+  p.add("vclock_ch2_epoch_native_last_service_counter32", g_vclock_ch2_epoch_native_last_service_counter32);
+  p.add("vclock_ch2_epoch_native_last_backdate_ticks", g_vclock_ch2_epoch_native_last_backdate_ticks);
+  p.add("vclock_ch2_epoch_native_last_backdate_cycles", g_vclock_ch2_epoch_native_last_backdate_cycles);
+  p.add("vclock_ch2_epoch_native_last_sacred_dwt", g_vclock_ch2_epoch_native_last_sacred_dwt);
   p.add("vclock_ch2_fact_drain_native_enabled", true);
   p.add("vclock_ch2_fact_drain_service_count", g_vclock_ch2_fact_drain_service_count);
   p.add("vclock_ch2_fact_drain_arm_count", g_vclock_ch2_fact_drain_arm_count);
@@ -7172,7 +7339,7 @@ static Payload cmd_report(const Payload&) {
   p.add("ocxo1_quiet_phase_us", ocxo_phase_ticks_to_us(OCXO1_QUIET_PHASE_TICKS));
   p.add("ocxo2_quiet_phase_ticks", OCXO2_QUIET_PHASE_TICKS);
   p.add("ocxo2_quiet_phase_us", ocxo_phase_ticks_to_us(OCXO2_QUIET_PHASE_TICKS));
-  p.add("timing_arch_step", "OCXO_ROLLOVER_ONLY_EMA_DWT");
+  p.add("timing_arch_step", "CH2_NATIVE_VCLOCK_EPOCH_SMARTZERO_ONE_SECOND_DRAIN");
   p.add("timing_arch_behavior_changed", true);
   p.add("linear_regression_authored_dwt", LINEAR_REGRESSION_AUTHORED_DWT);
   p.add("linear_regression_diagnostic_only", LINEAR_REGRESSION_DIAGNOSTIC_ONLY);

@@ -18,11 +18,15 @@
 //   QTimer1 has a single shared IRQ vector across all four channels.
 //   process_interrupt owns the vector and dispatches in IRQ context:
 //     • CH1 flag set → legacy hosted compare rail, if explicitly armed
-//     • CH2 flag set → passive all-clock rollover tend, then registered
-//                       TimePop scheduler handler
-//   VCLOCK cadence no longer owns a private QTimer1 compare channel.  It is
-//   a critical recurring TimePop slot that runs from the CH2 shared fire facts
-//   and rearms inside the CH2 ISR pass before TimePop chooses the next compare.
+//     • CH2 flag set → passive all-clock rollover tend, native VCLOCK custody
+//                       work, registered TimePop scheduler handler, then CH2-tail
+//                       selected-epoch / fact-drain service
+//   VCLOCK cadence no longer owns a private QTimer1 compare channel.  The
+//   remaining VCLOCK_HEARTBEAT TimePop slot is a soft fallback/reporting pulse.
+//   Timing-authoritative VCLOCK duties now run from native CH2 custody: passive
+//   16-bit rollover tending, PPS_RELAY deassert, bootstrap/rebootstrap
+//   selected-epoch publication, steady-state one-second fact authorship,
+//   VCLOCK SmartZero fixed-grid sampling, and VCLOCK fact-drain arming.
 //
 //   TimePop owns scheduler policy only.  process_interrupt owns the CH2
 //   compare-register programming; TimePop requests target updates through
@@ -68,22 +72,15 @@
 //   The VCLOCK cadence is PPS-anchored but no longer uses QTimer1 CH3.
 //   On the first physical PPS edge after a rebootstrap request, the GPIO ISR
 //   captures the QTimer1 CH0 low-word count and selects the sacred VCLOCK edge.
-//   The already-running VCLOCK_CADENCE TimePop client consumes a CH2 shared
-//   fire fact, back-projects from that cadence event to the selected edge, and
-//   publishes the canonical PPS_VCLOCK epoch.
+//   Native CH2 custody later consumes that pending selected edge, after TimePop
+//   has processed the CH2 compare event, and back-projects from the CH2 event
+//   DWT to publish the canonical PPS_VCLOCK epoch.
 //
-//   VCLOCK_CADENCE is armed with TimePop's critical recurring ISR mode.  During
-//   PPS rebootstrap, process_interrupt re-arms that cadence from the selected
-//   PPS_VCLOCK GNSS base using TimePop's anchored recurring API, so the cadence
-//   grid is:
-//
-//       base_gnss_ns + k * 1 ms
-//
-//   rather than an inherited stale scheduler phase.  Its callback refreshes the
-//   process_interrupt-owned synthetic VCLOCK low-word anchor inside the CH2 ISR
-//   pass, before TimePop calls schedule_next().  This prevents TimePop from
-//   scheduling future compares from a stale synthetic VCLOCK anchor while
-//   preserving the single-compare-rail architecture.
+//   Steady-state VCLOCK one-second facts are also authored by native CH2 on
+//   fixed +10,000,000 tick gear teeth.  VCLOCK_HEARTBEAT remains armed only as
+//   a soft fallback/reporting pulse; it no longer owns rollover, relay deassert,
+//   selected-epoch publication, one-second authority, SmartZero sampling, or
+//   fact-drain arming.
 //
 // ─── PPS GPIO edge — three roles ────────────────────────────────────────────
 //
@@ -779,10 +776,8 @@ bool interrupt_stop(interrupt_subscriber_kind_t kind);
 // PPS-anchored epoch (at boot, ZERO, START).  The next PPS GPIO edge will:
 //   • Capture the VCLOCK counter at ISR entry.
 //   • Select the sacred VCLOCK edge associated with PPS.
-//   • Re-arm the critical TimePop VCLOCK_CADENCE client from the selected
-//     PPS_VCLOCK GNSS base.
-//   • Let that anchored cadence client back-project from its next CH2 shared
-//     fire fact to the selected edge.
+//   • Let native CH2 custody back-project from the next safe CH2 event fact
+//     to the selected edge after TimePop has processed that compare event.
 //   • Reset tick_mod_1000 so the first post-anchor one-second event lands on
 //     the PPS/VCLOCK boundary.
 //   • Seed the private synthetic VCLOCK counter32 from pvc.counter32_at_edge.
