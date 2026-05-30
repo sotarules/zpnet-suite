@@ -21,10 +21,9 @@
 //
 //   • _raw rule   — _raw is reserved for one thing: ARM_DWT_CYCCNT captured
 //                   as the first instruction of an ISR.  The moment a value
-//                   is latency-adjusted, the _raw is gone.  _raw values do
-//                   NOT propagate.  They live in the ISR stack frame and die
-//                   there.  Nothing in a data structure, subscription payload,
-//                   or TIMEBASE fragment carries _raw.
+//                   is latency-adjusted, the _raw is gone.  Raw ISR-entry DWT
+//                   may now appear only on the explicit diagnostic field
+//                   dwt_isr_entry_raw; it is evidence, never event authority.
 //
 // TimePop is the principled exception to the "no DWT conversion in
 // PPS_VCLOCK" rule: it projects CH2 fire facts onto the PPS_VCLOCK timeline
@@ -182,7 +181,7 @@ static constexpr uint32_t OCXO_DWT_SOURCE_EMA_PREDICTED = 2;
 // intermediate 1 kHz facts do not enter a perishable ring.  The published edge
 // DWT is last-published + EMA(observed one-second interval), smoothing the
 // common-mode residuals that defeated the service-forensics experiment.
-static constexpr bool     OCXO_EMA_DWT_AUTHORITY_ENABLED = false;
+static constexpr bool     OCXO_EMA_DWT_AUTHORITY_ENABLED = true;
 static constexpr uint32_t OCXO_EMA_SHIFT = 4;  // alpha = 1/16
 static constexpr uint32_t OCXO_EMA_ALPHA_NUMERATOR = 1;
 static constexpr uint32_t OCXO_EMA_ALPHA_DENOMINATOR = (1U << OCXO_EMA_SHIFT);
@@ -1153,6 +1152,7 @@ struct dwt_repair_diag_t {
   uint32_t original_dwt = 0;
   uint32_t predicted_dwt = 0;
   uint32_t used_dwt = 0;
+  uint32_t isr_entry_dwt_raw = 0;
   int32_t  error_cycles = 0;
   const char* reason = "none";
 };
@@ -1245,6 +1245,7 @@ static dwt_repair_diag_t vclock_endpoint_repair_diagnostic(uint32_t observed_dwt
   r.original_dwt = observed_dwt;
   r.predicted_dwt = 0;
   r.used_dwt = observed_dwt;
+  r.isr_entry_dwt_raw = 0;
   r.error_cycles = 0;
   r.reason = "disabled";
 
@@ -2027,7 +2028,7 @@ static ocxo_runtime_context_t g_ocxo1_ctx = {
   "ocxo1",
   "QTIMER2_CH0_ONE_SECOND_EDGE_COMPARE",
   "QTIMER2_CH0_LOCAL_SYNTHETIC_COUNTER32",
-  "QTIMER2_CH0_ISR_ENTRY_DWT",
+  "QTIMER2_CH0_EMA_PREDICTED_DWT",
   "OCXO1_FACT_DRAIN",
   &g_ocxo1_lane,
   &g_ocxo1_clock32,
@@ -2043,7 +2044,7 @@ static ocxo_runtime_context_t g_ocxo2_ctx = {
   "ocxo2",
   "QTIMER3_CH3_ONE_SECOND_EDGE_COMPARE",
   "QTIMER3_CH3_LOCAL_SYNTHETIC_COUNTER32",
-  "QTIMER3_CH3_ISR_ENTRY_DWT",
+  "QTIMER3_CH3_EMA_PREDICTED_DWT",
   "OCXO2_FACT_DRAIN",
   &g_ocxo2_lane,
   &g_ocxo2_clock32,
@@ -3656,6 +3657,7 @@ static void emit_one_second_event(interrupt_subscriber_runtime_t& rt,
     diag.dwt_original_at_event = repair->original_dwt;
     diag.dwt_predicted_at_event = repair->predicted_dwt;
     diag.dwt_used_at_event = repair->used_dwt;
+    diag.dwt_isr_entry_raw = repair->isr_entry_dwt_raw;
     diag.dwt_synthetic_error_cycles = repair->error_cycles;
     diag.dwt_synthetic_threshold_cycles = VCLOCK_DWT_REPAIR_THRESHOLD_CYCLES;
     diag.dwt_synthetic_reason = repair->reason;
@@ -5419,6 +5421,7 @@ static void ocxo_apply_perishable_fact_deferred(
   ema_diag.original_dwt = observed_dwt;
   ema_diag.predicted_dwt = published_dwt;
   ema_diag.used_dwt = published_dwt;
+  ema_diag.isr_entry_dwt_raw = fact.isr_entry_dwt_raw;
   ema_diag.error_cycles = ema_error_cycles;
   ema_diag.reason = ema_synthetic ? "ocxo_ema" : "ocxo_ema_init";
 
@@ -6019,6 +6022,7 @@ static void qtimer1_isr(void) {
       diag.dwt_at_event       = qtimer_event_dwt;
       diag.gnss_ns_at_event   = event.gnss_ns_at_event;
       diag.counter32_at_event = event.counter32_at_event;
+      diag.dwt_isr_entry_raw  = isr_entry_dwt_raw;
       spinidle_copy_to_diag(diag, spinidle);
       g_spinidle_timepop_last_capture = spinidle;
       bridge_projection_copy_to_diag(diag, bridge);
@@ -7842,6 +7846,12 @@ static void add_runtime_lane_summary(Payload& p,
     out.add_bool("last_diag_gnss_projection_valid",
                  rt->last_diag.gnss_ns_at_event != 0 &&
                  rt->last_diag.anchor_failure_mask == 0);
+    out.add_bool("last_diag_dwt_synthetic", rt->last_diag.dwt_synthetic);
+    out.add_u32("last_diag_dwt_original_at_event", rt->last_diag.dwt_original_at_event);
+    out.add_u32("last_diag_dwt_predicted_at_event", rt->last_diag.dwt_predicted_at_event);
+    out.add_u32("last_diag_dwt_used_at_event", rt->last_diag.dwt_used_at_event);
+    out.add_u32("last_diag_dwt_isr_entry_raw", rt->last_diag.dwt_isr_entry_raw);
+    out.add_i32("last_diag_dwt_synthetic_error_cycles", rt->last_diag.dwt_synthetic_error_cycles);
     out.add_bool("last_diag_spinidle_shadow_valid", rt->last_diag.spinidle_shadow_valid);
     out.add_u32("last_diag_spinidle_shadow_dwt", rt->last_diag.spinidle_shadow_dwt);
     out.add_u32("last_diag_spinidle_shadow_to_isr_entry_cycles",
@@ -7859,6 +7869,12 @@ static void add_runtime_lane_summary(Payload& p,
     out.add_u64("last_diag_gnss_ns_at_event", 0);
     out.add_bool("last_diag_gnss_ns_available", false);
     out.add_bool("last_diag_gnss_projection_valid", false);
+    out.add_bool("last_diag_dwt_synthetic", false);
+    out.add_u32("last_diag_dwt_original_at_event", 0);
+    out.add_u32("last_diag_dwt_predicted_at_event", 0);
+    out.add_u32("last_diag_dwt_used_at_event", 0);
+    out.add_u32("last_diag_dwt_isr_entry_raw", 0);
+    out.add_i32("last_diag_dwt_synthetic_error_cycles", 0);
     out.add_bool("last_diag_spinidle_shadow_valid", false);
     out.add_u32("last_diag_spinidle_shadow_dwt", 0);
     out.add_u32("last_diag_spinidle_shadow_to_isr_entry_cycles", 0);
@@ -8324,6 +8340,18 @@ static void add_ocxo_compact_payload(Payload& p,
                rt && rt->has_fired &&
                rt->last_diag.gnss_ns_at_event != 0 &&
                rt->last_diag.anchor_failure_mask == 0);
+  out.add_bool("last_diag_dwt_synthetic",
+               rt && rt->has_fired && rt->last_diag.dwt_synthetic);
+  out.add_u32("last_diag_dwt_original_at_event",
+              (rt && rt->has_fired) ? rt->last_diag.dwt_original_at_event : 0U);
+  out.add_u32("last_diag_dwt_predicted_at_event",
+              (rt && rt->has_fired) ? rt->last_diag.dwt_predicted_at_event : 0U);
+  out.add_u32("last_diag_dwt_used_at_event",
+              (rt && rt->has_fired) ? rt->last_diag.dwt_used_at_event : 0U);
+  out.add_u32("last_diag_dwt_isr_entry_raw",
+              (rt && rt->has_fired) ? rt->last_diag.dwt_isr_entry_raw : 0U);
+  out.add_i32("last_diag_dwt_synthetic_error_cycles",
+              (rt && rt->has_fired) ? rt->last_diag.dwt_synthetic_error_cycles : 0);
   out.add_bool("last_diag_spinidle_shadow_valid",
                rt && rt->has_fired && rt->last_diag.spinidle_shadow_valid);
   out.add_u32("last_diag_spinidle_shadow_dwt",
@@ -8652,12 +8680,24 @@ static void add_lane_summary_object(Payload& parent,
              rt->last_diag.spinidle_shadow_to_isr_entry_cycles);
     lane.add("last_diag_spinidle_shadow_valid_threshold_cycles",
              rt->last_diag.spinidle_shadow_valid_threshold_cycles);
+    lane.add("last_diag_dwt_synthetic", rt->last_diag.dwt_synthetic);
+    lane.add("last_diag_dwt_original_at_event", rt->last_diag.dwt_original_at_event);
+    lane.add("last_diag_dwt_predicted_at_event", rt->last_diag.dwt_predicted_at_event);
+    lane.add("last_diag_dwt_used_at_event", rt->last_diag.dwt_used_at_event);
+    lane.add("last_diag_dwt_isr_entry_raw", rt->last_diag.dwt_isr_entry_raw);
+    lane.add("last_diag_dwt_synthetic_error_cycles", rt->last_diag.dwt_synthetic_error_cycles);
   } else {
     lane.add("last_diag_spinidle_shadow_valid", false);
     lane.add("last_diag_spinidle_shadow_dwt", 0U);
     lane.add("last_diag_spinidle_shadow_to_isr_entry_cycles", 0U);
     lane.add("last_diag_spinidle_shadow_valid_threshold_cycles",
              SPINIDLE_SHADOW_VALID_THRESHOLD_CYCLES);
+    lane.add("last_diag_dwt_synthetic", false);
+    lane.add("last_diag_dwt_original_at_event", 0U);
+    lane.add("last_diag_dwt_predicted_at_event", 0U);
+    lane.add("last_diag_dwt_used_at_event", 0U);
+    lane.add("last_diag_dwt_isr_entry_raw", 0U);
+    lane.add("last_diag_dwt_synthetic_error_cycles", 0);
   }
 
   // Only VCLOCK uses this generic summary helper today.  Keep the compact

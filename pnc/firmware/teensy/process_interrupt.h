@@ -59,13 +59,13 @@
 //   bridge projection is unavailable; CLOCKS/Alpha owns OCXO measured-GNSS
 //   interval construction from consecutive OCXO edge DWTs.
 //
-//   The _raw rule is absolute: _raw is reserved for one thing only —
+//   The _raw rule is strict: _raw is reserved for one thing only —
 //   ARM_DWT_CYCCNT captured as the first instruction of an ISR.  The
-//   moment a value is latency-adjusted, the _raw is gone.  _raw values
-//   do NOT propagate.  They live in the ISR stack frame and die there.
-//   Nothing in any data structure, subscription payload, or TIMEBASE
-//   fragment carries _raw.  ISR entry parameters retain the suffix as
-//   the visible mark of where the discipline begins.
+//   moment a value is latency-adjusted, the _raw is gone.  The sole
+//   propagation exception is interrupt_capture_diag_t::dwt_isr_entry_raw,
+//   an explicit diagnostic evidence field.  It is never event authority.
+//   ISR entry parameters retain the suffix as the visible mark of where
+//   the discipline begins.
 //
 // ─── PPS-anchored VCLOCK cadence ────────────────────────────────────────────
 //
@@ -265,6 +265,11 @@ struct interrupt_capture_diag_t {
   uint32_t dwt_original_at_event = 0;
   uint32_t dwt_predicted_at_event = 0;
   uint32_t dwt_used_at_event = 0;
+
+  // Explicit ISR-entry evidence.  For OCXO EMA authority this is the actual
+  // first-instruction ARM_DWT_CYCCNT captured by the OCXO ISR.  It is not an
+  // event coordinate and must not be used as timing authority.
+  uint32_t dwt_isr_entry_raw = 0;
   int32_t  dwt_synthetic_error_cycles = 0;
   uint32_t dwt_synthetic_threshold_cycles = 0;
   const char* dwt_synthetic_reason = nullptr;
