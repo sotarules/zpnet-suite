@@ -324,12 +324,12 @@ static constexpr uint32_t INTERRUPT_STEP0_EXPECTED_QTIMER3_PRIORITY  = 16;
 static constexpr uint32_t INTERRUPT_STEP0_EXPECTED_GPIO6789_PRIORITY = 0;
 
 // ============================================================================
-// SpinCatch step 5 — OCXO1 landing-only
+// SpinCatch step 5.6 — OCXO1 landing lead tuning
 // ============================================================================
 //
-// This checkpoint keeps the Step 4 planner surface and enables only a low-duty
+// This checkpoint keeps the Step 4 planner surface and enables an every-second
 // OCXO1 TimePop landing callback.  The callback records the DWT/counter32 at
-// the planned 5 us approach point and immediately returns.  It does not spin,
+// the planned lead-tuned approach point and immediately returns.  It does not spin,
 // does not reprogram or clear any OCXO compare register, does not alter event
 // DWT authority, and does not expand interrupt_capture_diag_t.
 
@@ -339,13 +339,15 @@ static constexpr bool SPINCATCH_VCLOCK_ENABLED = false;
 static constexpr bool SPINCATCH_OCXO1_LANDING_ONLY_ENABLED = true;
 static constexpr bool SPINCATCH_OCXO2_ENABLED = false;
 static constexpr const char* SPINCATCH_REPORT_MODE = "OCXO1_LANDING_ONLY_NO_SPIN";
-static constexpr uint32_t SPINCATCH_APPROACH_US = 5U;
+static constexpr uint32_t SPINCATCH_APPROACH_US = 10U;
 static constexpr uint32_t SPINCATCH_APPROACH_TICKS = SPINCATCH_APPROACH_US * 10U;
-static constexpr uint32_t SPINCATCH_OCXO1_LANDING_DUTY_DIVISOR = 16U;
+static constexpr uint32_t SPINCATCH_OCXO1_LANDING_DUTY_DIVISOR = 1U;
 static constexpr uint32_t SPINCATCH_LANDING_MIN_LEAD_TICKS = 128U;
 static constexpr const char* SPINCATCH_OCXO1_LANDING_NAME = "SPINCATCH_OCXO1_LANDING";
-static_assert(SPINCATCH_APPROACH_TICKS == 50U,
-              "SpinCatch 5 us approach must be 50 ticks at 10 MHz");
+static constexpr uint32_t SPINCATCH_LANDING_ATTEMPT_RING_SIZE = 4U;
+static constexpr uint32_t SPINCATCH_LANDING_STALE_TARGET_PERIODS = 2U;
+static_assert(SPINCATCH_APPROACH_TICKS == 100U,
+              "SpinCatch 10 us approach must be 100 ticks at 10 MHz");
 
 
 // ============================================================================
@@ -1478,8 +1480,8 @@ struct spincatch_lane_report_t {
   uint32_t now_counter32 = 0;
   uint32_t ticks_until_target = 0;
 
-  // Step 5 landing-only surface.  OCXO1 may schedule one low-duty TimePop
-  // landing callback that records its landing facts and returns immediately.
+  // Step 5.5 landing-only surface.  OCXO1 schedules one TimePop
+  // landing callback per one-second event that records its landing facts and returns immediately.
   bool     landing_only_enabled = false;
   bool     landing_pending = false;
   bool     landing_last_success = false;
@@ -1492,6 +1494,12 @@ struct spincatch_lane_report_t {
   uint32_t landing_count = 0;
   uint32_t landing_too_close_count = 0;
   uint32_t landing_target_changed_count = 0;
+  uint32_t landing_attempt_ring_size = SPINCATCH_LANDING_ATTEMPT_RING_SIZE;
+  uint32_t landing_attempt_active_count = 0;
+  uint32_t landing_attempt_stale_count = 0;
+  uint32_t landing_attempt_duplicate_skip_count = 0;
+  uint32_t landing_attempt_ring_full_count = 0;
+  uint32_t landing_attempt_generation = 0;
   uint32_t landing_target_counter32 = 0;
   uint16_t landing_target_low16 = 0;
   uint32_t landing_scheduled_counter32 = 0;
@@ -1519,11 +1527,27 @@ static volatile bool g_spincatch_ocxo2_capture_active = false;
 
 struct spincatch_landing_context_t {
   interrupt_subscriber_kind_t kind = interrupt_subscriber_kind_t::NONE;
+  uint32_t attempt_index = 0;
+  uint32_t generation = 0;
 };
 
-static spincatch_landing_context_t g_spincatch_ocxo1_landing_context = {
-  interrupt_subscriber_kind_t::OCXO1
+struct spincatch_landing_attempt_t {
+  bool active = false;
+  interrupt_subscriber_kind_t kind = interrupt_subscriber_kind_t::NONE;
+  uint32_t generation = 0;
+  timepop_handle_t handle = TIMEPOP_INVALID_HANDLE;
+  uint32_t target_counter32 = 0;
+  uint16_t target_low16 = 0;
+  uint32_t scheduled_counter32 = 0;
+  uint32_t scheduled_ticks_until_target = 0;
+  uint64_t scheduled_delay_ns = 0;
+  uint32_t scheduled_dwt = 0;
 };
+
+static spincatch_landing_attempt_t
+    g_spincatch_ocxo1_attempts[SPINCATCH_LANDING_ATTEMPT_RING_SIZE] = {};
+static spincatch_landing_context_t
+    g_spincatch_ocxo1_landing_contexts[SPINCATCH_LANDING_ATTEMPT_RING_SIZE] = {};
 
 static bool spincatch_enabled_for_kind(interrupt_subscriber_kind_t kind) {
   if (kind == interrupt_subscriber_kind_t::VCLOCK) return SPINCATCH_VCLOCK_ENABLED;
@@ -1585,6 +1609,14 @@ static void spincatch_report_reset_all(void) {
   g_spincatch_ocxo2.enabled = spincatch_enabled_for_kind(interrupt_subscriber_kind_t::OCXO2);
   g_spincatch_ocxo1.landing_only_enabled = SPINCATCH_OCXO1_LANDING_ONLY_ENABLED;
   g_spincatch_ocxo1.landing_duty_divisor = SPINCATCH_OCXO1_LANDING_DUTY_DIVISOR;
+  g_spincatch_ocxo1.landing_attempt_ring_size = SPINCATCH_LANDING_ATTEMPT_RING_SIZE;
+
+  for (uint32_t i = 0; i < SPINCATCH_LANDING_ATTEMPT_RING_SIZE; i++) {
+    g_spincatch_ocxo1_attempts[i] = spincatch_landing_attempt_t{};
+    g_spincatch_ocxo1_landing_contexts[i] = spincatch_landing_context_t{};
+    g_spincatch_ocxo1_landing_contexts[i].kind = interrupt_subscriber_kind_t::OCXO1;
+    g_spincatch_ocxo1_landing_contexts[i].attempt_index = i;
+  }
 
   g_spincatch_vclock_capture_active = false;
   g_spincatch_ocxo1_capture_active = false;
@@ -4938,37 +4970,126 @@ static bool spincatch_current_target_for_kind(interrupt_subscriber_kind_t kind,
   return true;
 }
 
+static spincatch_landing_attempt_t* spincatch_attempts_for_kind(
+    interrupt_subscriber_kind_t kind) {
+  if (kind == interrupt_subscriber_kind_t::OCXO1) return g_spincatch_ocxo1_attempts;
+  return nullptr;
+}
+
+static uint32_t spincatch_landing_attempt_active_count(
+    interrupt_subscriber_kind_t kind) {
+  spincatch_landing_attempt_t* attempts = spincatch_attempts_for_kind(kind);
+  if (!attempts) return 0;
+
+  uint32_t count = 0;
+  for (uint32_t i = 0; i < SPINCATCH_LANDING_ATTEMPT_RING_SIZE; i++) {
+    if (attempts[i].active) count++;
+  }
+  return count;
+}
+
+static void spincatch_landing_refresh_pending(spincatch_lane_report_t& s,
+                                              interrupt_subscriber_kind_t kind) {
+  const uint32_t active = spincatch_landing_attempt_active_count(kind);
+  s.landing_attempt_active_count = active;
+  s.landing_pending = active != 0;
+}
+
+static void spincatch_landing_retire_stale_attempts(
+    interrupt_subscriber_kind_t kind,
+    spincatch_lane_report_t& s,
+    uint32_t current_target_counter32) {
+  spincatch_landing_attempt_t* attempts = spincatch_attempts_for_kind(kind);
+  if (!attempts) return;
+
+  const uint32_t stale_ticks =
+      OCXO_WITNESS_ONE_SECOND_COUNTS * SPINCATCH_LANDING_STALE_TARGET_PERIODS;
+
+  for (uint32_t i = 0; i < SPINCATCH_LANDING_ATTEMPT_RING_SIZE; i++) {
+    spincatch_landing_attempt_t& a = attempts[i];
+    if (!a.active) continue;
+    if ((uint32_t)(current_target_counter32 - a.target_counter32) <= stale_ticks) continue;
+
+    a.active = false;
+    a.handle = TIMEPOP_INVALID_HANDLE;
+    s.landing_attempt_stale_count++;
+    s.missed_count++;
+    s.landing_target_changed_count++;
+    s.landing_last_success = false;
+    s.landing_last_target_changed = true;
+  }
+
+  spincatch_landing_refresh_pending(s, kind);
+}
+
+static bool spincatch_landing_attempt_exists(interrupt_subscriber_kind_t kind,
+                                             uint32_t target_counter32) {
+  spincatch_landing_attempt_t* attempts = spincatch_attempts_for_kind(kind);
+  if (!attempts) return false;
+
+  for (uint32_t i = 0; i < SPINCATCH_LANDING_ATTEMPT_RING_SIZE; i++) {
+    if (attempts[i].active && attempts[i].target_counter32 == target_counter32) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static spincatch_landing_attempt_t* spincatch_landing_alloc_attempt(
+    interrupt_subscriber_kind_t kind,
+    uint32_t* out_index) {
+  spincatch_landing_attempt_t* attempts = spincatch_attempts_for_kind(kind);
+  if (!attempts) return nullptr;
+
+  for (uint32_t i = 0; i < SPINCATCH_LANDING_ATTEMPT_RING_SIZE; i++) {
+    if (!attempts[i].active) {
+      if (out_index) *out_index = i;
+      return &attempts[i];
+    }
+  }
+  return nullptr;
+}
+
 static void spincatch_landing_callback(timepop_ctx_t* ctx,
                                        timepop_diag_t*,
                                        void* user_data) {
   auto* landing_ctx = static_cast<spincatch_landing_context_t*>(user_data);
   if (!landing_ctx) return;
+  if (landing_ctx->attempt_index >= SPINCATCH_LANDING_ATTEMPT_RING_SIZE) return;
 
   spincatch_lane_report_t* s = spincatch_report_for_kind(landing_ctx->kind);
-  if (!s) return;
+  spincatch_landing_attempt_t* attempts = spincatch_attempts_for_kind(landing_ctx->kind);
+  if (!s || !attempts) return;
 
-  s->landing_pending = false;
-  s->landing_handle = TIMEPOP_INVALID_HANDLE;
+  spincatch_landing_attempt_t& attempt = attempts[landing_ctx->attempt_index];
+  if (!attempt.active || attempt.generation != landing_ctx->generation) {
+    // Stale callback from a retired/reused attempt.  The attempt ring makes
+    // this harmless; do not let it perturb the current lane result.
+    spincatch_landing_refresh_pending(*s, landing_ctx->kind);
+    return;
+  }
+
+  attempt.active = false;
+  attempt.handle = TIMEPOP_INVALID_HANDLE;
   s->landing_count++;
 
   interrupt_clock_snapshot_t snap{};
   const bool snap_ok = interrupt_clock_snapshot(landing_ctx->kind, &snap);
 
   const uint32_t landing_counter32 = snap_ok ? snap.counter32 : 0U;
-  const uint32_t target_counter32 = s->landing_target_counter32;
+  const uint32_t target_counter32 = attempt.target_counter32;
   uint32_t current_target = 0;
   const bool current_target_ok =
       spincatch_current_target_for_kind(landing_ctx->kind, current_target);
-  const bool target_still_current =
-      current_target_ok && current_target == target_counter32;
+  const bool target_changed = current_target_ok && current_target != target_counter32;
 
   const int32_t signed_until_target =
       (int32_t)(target_counter32 - landing_counter32);
   const bool before_target = signed_until_target > 0;
-  const bool success = snap_ok && target_still_current && before_target;
+  const bool success = snap_ok && before_target;
 
   s->landing_last_success = success;
-  s->landing_last_target_changed = !target_still_current;
+  s->landing_last_target_changed = target_changed;
   s->landing_dwt = (ctx && ctx->fire_dwt_cyccnt != 0)
       ? ctx->fire_dwt_cyccnt
       : ARM_DWT_CYCCNT;
@@ -4977,15 +5098,19 @@ static void spincatch_landing_callback(timepop_ctx_t* ctx,
   s->landing_ticks_until_target = before_target ? (uint32_t)signed_until_target : 0U;
   s->landing_fire_vclock_raw = ctx ? ctx->fire_vclock_raw : 0U;
   s->landing_fire_dwt = ctx ? ctx->fire_dwt_cyccnt : 0U;
+  s->landing_target_counter32 = target_counter32;
+  s->landing_target_low16 = attempt.target_low16;
 
   if (success) {
     s->success_count++;
   } else {
     s->missed_count++;
-    if (!target_still_current) {
+    if (target_changed) {
       s->landing_target_changed_count++;
     }
   }
+
+  spincatch_landing_refresh_pending(*s, landing_ctx->kind);
 }
 
 static void spincatch_maybe_schedule_ocxo1_landing(
@@ -5002,34 +5127,8 @@ static void spincatch_maybe_schedule_ocxo1_landing(
   s->enabled = true;
   s->landing_only_enabled = true;
   s->landing_duty_divisor = SPINCATCH_OCXO1_LANDING_DUTY_DIVISOR;
+  s->landing_attempt_ring_size = SPINCATCH_LANDING_ATTEMPT_RING_SIZE;
   s->landing_duty_counter++;
-
-  if (s->landing_pending) {
-    uint32_t current_target = 0;
-    const bool current_target_ok =
-        spincatch_current_target_for_kind(ctx.kind, current_target);
-    if (!current_target_ok || current_target != s->landing_target_counter32) {
-      // The TimePop landing callback did not arrive before the OCXO target
-      // advanced.  Clear the token here so one missed one-shot cannot poison
-      // the lane indefinitely.
-      s->landing_pending = false;
-      s->landing_handle = TIMEPOP_INVALID_HANDLE;
-      s->landing_last_success = false;
-      s->landing_last_target_changed = true;
-      s->landing_target_changed_count++;
-      s->missed_count++;
-    } else {
-      s->landing_schedule_skip_count++;
-      s->clash_count++;
-      return;
-    }
-  }
-
-  const uint32_t duty = spincatch_landing_duty_for_kind(ctx.kind);
-  if (duty != 0 && (s->landing_duty_counter % duty) != 0) {
-    s->landing_schedule_skip_count++;
-    return;
-  }
 
   const ocxo_lane_t& lane = *ctx.lane;
   const bool target_valid =
@@ -5037,47 +5136,95 @@ static void spincatch_maybe_schedule_ocxo1_landing(
       lane.witness_target_initialized && lane.cadence_next_counter32 != 0;
   if (!target_valid) {
     s->landing_schedule_skip_count++;
+    spincatch_landing_refresh_pending(*s, ctx.kind);
+    return;
+  }
+
+  const uint32_t target_counter32 = lane.cadence_next_counter32;
+  spincatch_landing_retire_stale_attempts(ctx.kind, *s, target_counter32);
+
+  const uint32_t duty = spincatch_landing_duty_for_kind(ctx.kind);
+  if (duty != 0 && (s->landing_duty_counter % duty) != 0) {
+    s->landing_schedule_skip_count++;
+    spincatch_landing_refresh_pending(*s, ctx.kind);
+    return;
+  }
+
+  if (spincatch_landing_attempt_exists(ctx.kind, target_counter32)) {
+    s->landing_attempt_duplicate_skip_count++;
+    s->landing_schedule_skip_count++;
+    spincatch_landing_refresh_pending(*s, ctx.kind);
     return;
   }
 
   interrupt_clock_snapshot_t snap{};
   if (!interrupt_clock_snapshot(ctx.kind, &snap)) {
     s->landing_schedule_skip_count++;
+    spincatch_landing_refresh_pending(*s, ctx.kind);
     return;
   }
 
-  const uint32_t target_counter32 = lane.cadence_next_counter32;
   const uint32_t remaining_ticks = target_counter32 - snap.counter32;
   if (remaining_ticks == 0 || remaining_ticks > 0x7FFFFFFFUL ||
       remaining_ticks <= (SPINCATCH_APPROACH_TICKS + SPINCATCH_LANDING_MIN_LEAD_TICKS)) {
     s->landing_too_close_count++;
     s->landing_schedule_skip_count++;
+    spincatch_landing_refresh_pending(*s, ctx.kind);
+    return;
+  }
+
+  uint32_t attempt_index = 0;
+  spincatch_landing_attempt_t* attempt =
+      spincatch_landing_alloc_attempt(ctx.kind, &attempt_index);
+  if (!attempt) {
+    s->landing_attempt_ring_full_count++;
+    s->landing_schedule_skip_count++;
+    s->clash_count++;
+    spincatch_landing_refresh_pending(*s, ctx.kind);
     return;
   }
 
   const uint32_t delay_ticks = remaining_ticks - SPINCATCH_APPROACH_TICKS;
   const uint64_t delay_ns = (uint64_t)delay_ticks * 100ULL;
+  const uint32_t generation = ++s->landing_attempt_generation;
+
+  g_spincatch_ocxo1_landing_contexts[attempt_index].kind = ctx.kind;
+  g_spincatch_ocxo1_landing_contexts[attempt_index].attempt_index = attempt_index;
+  g_spincatch_ocxo1_landing_contexts[attempt_index].generation = generation;
 
   const timepop_handle_t h =
       timepop_arm(delay_ns,
                   false,
                   spincatch_landing_callback,
-                  &g_spincatch_ocxo1_landing_context,
-                  SPINCATCH_OCXO1_LANDING_NAME);
+                  &g_spincatch_ocxo1_landing_contexts[attempt_index],
+                  nullptr);
   if (h == TIMEPOP_INVALID_HANDLE) {
     s->landing_schedule_fail_count++;
+    spincatch_landing_refresh_pending(*s, ctx.kind);
     return;
   }
 
+  *attempt = spincatch_landing_attempt_t{};
+  attempt->active = true;
+  attempt->kind = ctx.kind;
+  attempt->generation = generation;
+  attempt->handle = h;
+  attempt->target_counter32 = target_counter32;
+  attempt->target_low16 = lane.cadence_next_low16;
+  attempt->scheduled_counter32 = snap.counter32;
+  attempt->scheduled_ticks_until_target = remaining_ticks;
+  attempt->scheduled_delay_ns = delay_ns;
+  attempt->scheduled_dwt = ARM_DWT_CYCCNT;
+
   s->landing_handle = h;
-  s->landing_pending = true;
   s->landing_schedule_count++;
   s->landing_target_counter32 = target_counter32;
   s->landing_target_low16 = lane.cadence_next_low16;
   s->landing_scheduled_counter32 = snap.counter32;
   s->landing_scheduled_ticks_until_target = remaining_ticks;
   s->landing_scheduled_delay_ns = delay_ns;
-  s->landing_scheduled_dwt = ARM_DWT_CYCCNT;
+  s->landing_scheduled_dwt = attempt->scheduled_dwt;
+  spincatch_landing_refresh_pending(*s, ctx.kind);
 }
 
 static void ocxo_apply_perishable_fact_deferred(
@@ -6827,7 +6974,9 @@ static void spincatch_update_planner_for_report(interrupt_subscriber_kind_t kind
 static void add_spincatch_report_payload(Payload& p,
                                          interrupt_subscriber_kind_t kind) {
   spincatch_update_planner_for_report(kind);
-  const spincatch_lane_report_t* s = spincatch_report_for_kind(kind);
+  spincatch_lane_report_t* s_mut = spincatch_report_for_kind(kind);
+  if (s_mut) spincatch_landing_refresh_pending(*s_mut, kind);
+  const spincatch_lane_report_t* s = s_mut;
 
   p.add("spincatch_supported", s ? s->supported : false);
   p.add("spincatch_enabled", s ? s->enabled : false);
@@ -6863,6 +7012,12 @@ static void add_spincatch_report_payload(Payload& p,
   p.add("spincatch_landing_count", s ? s->landing_count : 0U);
   p.add("spincatch_landing_too_close_count", s ? s->landing_too_close_count : 0U);
   p.add("spincatch_landing_target_changed_count", s ? s->landing_target_changed_count : 0U);
+  p.add("spincatch_landing_attempt_ring_size", s ? s->landing_attempt_ring_size : 0U);
+  p.add("spincatch_landing_attempt_active_count", s ? s->landing_attempt_active_count : 0U);
+  p.add("spincatch_landing_attempt_stale_count", s ? s->landing_attempt_stale_count : 0U);
+  p.add("spincatch_landing_attempt_duplicate_skip_count", s ? s->landing_attempt_duplicate_skip_count : 0U);
+  p.add("spincatch_landing_attempt_ring_full_count", s ? s->landing_attempt_ring_full_count : 0U);
+  p.add("spincatch_landing_attempt_generation", s ? s->landing_attempt_generation : 0U);
   p.add("spincatch_landing_target_counter32", s ? s->landing_target_counter32 : 0U);
   p.add("spincatch_landing_target_low16", s ? (uint32_t)s->landing_target_low16 : 0U);
   p.add("spincatch_landing_scheduled_counter32", s ? s->landing_scheduled_counter32 : 0U);
