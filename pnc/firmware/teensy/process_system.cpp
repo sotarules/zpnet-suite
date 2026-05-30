@@ -22,6 +22,7 @@
 #include "cpu_usage.h"
 #include "util.h"
 #include "timepop.h"
+#include "process_timepop.h"
 #include "debug.h"
 #include "transport.h"   // <-- NEW (for transport_get_info)
 
@@ -40,6 +41,10 @@ extern "C" void enter_bootloader_cleanly(void);
 // --------------------------------------------------------------
 static bool system_shutdown   = false;
 static bool system_bootloader = false;
+
+static bool system_cpu_window_initialized = false;
+static uint64_t system_cpu_window_last_wall_cycles = 0;
+static uint64_t system_cpu_window_last_idle_cycles = 0;
 
 // ================================================================
 // Terminal helpers
@@ -127,10 +132,63 @@ static Payload cmd_report(const Payload& /*args*/) {
   p.add("free_heap_bytes", freeHeapBytes());
   p.add("max_alloc_bytes", maxAllocBytes());
 
-  // CPU usage (authoritative, idle-cycle accounting)
-  p.add("cpu_usage_pct", cpu_usage_get_percent());
+  timepop_idle_witness_snapshot_t idle{};
+  timepop_idle_witness_snapshot(&idle);
+
+  const uint64_t wall_cycles_now = idle.snapshot_wall_cycles;
+  const uint64_t idle_cycles_now = idle.snapshot_total_cycles;
+  uint64_t cpu_window_total_cycles = 0;
+  uint64_t cpu_window_idle_cycles = 0;
+  uint64_t cpu_window_work_cycles = 0;
+  uint32_t cpu_work_pct_milli = 0;
+  uint32_t cpu_idle_spin_pct_milli = 0;
+
+  if (system_cpu_window_initialized) {
+    cpu_window_total_cycles = wall_cycles_now - system_cpu_window_last_wall_cycles;
+    cpu_window_idle_cycles = idle_cycles_now - system_cpu_window_last_idle_cycles;
+    if (cpu_window_idle_cycles > cpu_window_total_cycles) {
+      cpu_window_idle_cycles = cpu_window_total_cycles;
+    }
+    cpu_window_work_cycles =
+        (uint64_t)cpu_window_total_cycles - cpu_window_idle_cycles;
+
+    if (cpu_window_total_cycles != 0) {
+      cpu_work_pct_milli = (uint32_t)((cpu_window_work_cycles * 100000ULL +
+                                       (uint64_t)cpu_window_total_cycles / 2ULL) /
+                                      (uint64_t)cpu_window_total_cycles);
+      cpu_idle_spin_pct_milli = (uint32_t)((cpu_window_idle_cycles * 100000ULL +
+                                            (uint64_t)cpu_window_total_cycles / 2ULL) /
+                                           (uint64_t)cpu_window_total_cycles);
+    }
+  } else {
+    system_cpu_window_initialized = true;
+  }
+
+  system_cpu_window_last_wall_cycles = wall_cycles_now;
+  system_cpu_window_last_idle_cycles = idle_cycles_now;
+
+  // CPU usage now means non-spin foreground/ISR work.  True core occupancy is
+  // intentionally near 100% because the idle DWT witness loop runs when idle.
+  p.add("cpu_usage_pct", cpu_work_pct_milli / 1000.0f);
+  p.add("cpu_work_pct", cpu_work_pct_milli / 1000.0f);
+  p.add("cpu_idle_spin_pct", cpu_idle_spin_pct_milli / 1000.0f);
 
   // CPU usage diagnostics
+  p.add("cpu_work_cycles", (uint32_t)cpu_window_work_cycles);
+  p.add("cpu_idle_spin_cycles", (uint32_t)cpu_window_idle_cycles);
+  p.add("cpu_window_total_cycles", (uint32_t)cpu_window_total_cycles);
+  p.add("cpu_work_cycles64", cpu_window_work_cycles);
+  p.add("cpu_idle_spin_cycles64", cpu_window_idle_cycles);
+  p.add("cpu_window_total_cycles64", cpu_window_total_cycles);
+  p.add("cpu_idle_witness_total_cycles", idle_cycles_now);
+  p.add("cpu_wall_cycles", wall_cycles_now);
+  p.add("cpu_idle_witness_running", idle.running);
+  p.add("cpu_idle_witness_enter_count", idle.enter_count);
+  p.add("cpu_idle_witness_exit_count", idle.exit_count);
+  p.add("cpu_idle_witness_last_residency_cycles", idle.last_residency_cycles);
+
+  // Legacy accounted callback-busy diagnostics.
+  p.add("cpu_accounted_busy_pct", cpu_usage_get_percent());
   p.add("cpu_busy_cycles", cpu_usage_get_busy_cycles());
   p.add("cpu_total_cycles", cpu_usage_get_total_cycles());
   p.add("cpu_sample_window_ms", cpu_usage_get_sample_window_ms());

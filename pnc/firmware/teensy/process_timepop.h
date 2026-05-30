@@ -139,6 +139,11 @@ struct timepop_idle_witness_snapshot_t {
   uint32_t pending_exit_count = 0;
   uint32_t last_enter_dwt = 0;
   uint32_t last_exit_dwt = 0;
+  uint64_t total_cycles = 0;
+  uint64_t snapshot_total_cycles = 0;
+  uint32_t last_residency_cycles = 0;
+  uint32_t snapshot_dwt = 0;
+  uint64_t snapshot_wall_cycles = 0;
 };
 
 bool timepop_idle_witness_snapshot(timepop_idle_witness_snapshot_t* out);

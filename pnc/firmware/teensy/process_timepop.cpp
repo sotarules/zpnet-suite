@@ -429,6 +429,11 @@ static volatile uint32_t diag_idle_witness_exit_count = 0;
 static volatile uint32_t diag_idle_witness_pending_exit_count = 0;
 static volatile uint32_t diag_idle_witness_last_enter_dwt = 0;
 static volatile uint32_t diag_idle_witness_last_exit_dwt = 0;
+static volatile uint64_t diag_idle_witness_total_cycles = 0;
+static volatile uint32_t diag_idle_witness_last_residency_cycles = 0;
+static volatile uint64_t diag_idle_witness_wall_cycles = 0;
+static volatile uint32_t diag_idle_witness_wall_last_dwt = 0;
+static volatile bool     diag_idle_witness_wall_initialized = false;
 
 // ============================================================================
 // Diagnostics
@@ -1244,10 +1249,23 @@ static bool queue_dispatch_cancel_name(const char* name) {
   return queue_dispatch_non_arm_mutation(m);
 }
 
+static inline void timepop_idle_witness_note_wall_cycles(uint32_t now_dwt) {
+  if (!diag_idle_witness_wall_initialized) {
+    diag_idle_witness_wall_last_dwt = now_dwt;
+    diag_idle_witness_wall_initialized = true;
+    return;
+  }
+
+  diag_idle_witness_wall_cycles +=
+      (uint64_t)(uint32_t)(now_dwt - diag_idle_witness_wall_last_dwt);
+  diag_idle_witness_wall_last_dwt = now_dwt;
+}
+
 static void timepop_idle_witness_spin_until_pending(void) {
   if (!TIMEPOP_IDLE_DWT_WITNESS_ENABLED) return;
 
   const uint32_t enter_dwt = ARM_DWT_CYCCNT;
+  timepop_idle_witness_note_wall_cycles(enter_dwt);
   diag_idle_witness_enter_count++;
   diag_idle_witness_last_enter_dwt = enter_dwt;
   diag_idle_witness_running = true;
@@ -1260,8 +1278,12 @@ static void timepop_idle_witness_spin_until_pending(void) {
     // not overwrite the last pre-interrupt shadow with a post-interrupt value.
     const uint32_t dwt = ARM_DWT_CYCCNT;
     if (timepop_pending) {
+      const uint32_t residency = dwt - enter_dwt;
+      timepop_idle_witness_note_wall_cycles(dwt);
       diag_idle_witness_pending_exit_count++;
       diag_idle_witness_last_exit_dwt = dwt;
+      diag_idle_witness_last_residency_cycles = residency;
+      diag_idle_witness_total_cycles += (uint64_t)residency;
       break;
     }
     g_timepop_idle_witness_shadow_dwt = dwt;
@@ -4620,6 +4642,16 @@ bool timepop_idle_witness_snapshot(timepop_idle_witness_snapshot_t* out) {
   out->pending_exit_count = diag_idle_witness_pending_exit_count;
   out->last_enter_dwt = diag_idle_witness_last_enter_dwt;
   out->last_exit_dwt = diag_idle_witness_last_exit_dwt;
+  out->total_cycles = diag_idle_witness_total_cycles;
+  out->last_residency_cycles = diag_idle_witness_last_residency_cycles;
+  out->snapshot_dwt = ARM_DWT_CYCCNT;
+  timepop_idle_witness_note_wall_cycles(out->snapshot_dwt);
+  out->snapshot_total_cycles = out->total_cycles;
+  if (out->running) {
+    out->snapshot_total_cycles +=
+        (uint64_t)(uint32_t)(out->snapshot_dwt - out->last_enter_dwt);
+  }
+  out->snapshot_wall_cycles = diag_idle_witness_wall_cycles;
   return true;
 }
 
@@ -4653,6 +4685,11 @@ static Payload cmd_report(const Payload&) {
   out.add("idle_dwt_witness_pending_exit_count", idle_witness.pending_exit_count);
   out.add("idle_dwt_witness_last_enter_dwt", idle_witness.last_enter_dwt);
   out.add("idle_dwt_witness_last_exit_dwt", idle_witness.last_exit_dwt);
+  out.add("idle_dwt_witness_total_cycles", idle_witness.snapshot_total_cycles);
+  out.add("idle_dwt_witness_completed_cycles", idle_witness.total_cycles);
+  out.add("idle_dwt_witness_last_residency_cycles", idle_witness.last_residency_cycles);
+  out.add("idle_dwt_witness_snapshot_dwt", idle_witness.snapshot_dwt);
+  out.add("idle_dwt_witness_wall_cycles", idle_witness.snapshot_wall_cycles);
   out.add("time_pps_count",    time_pps_count());
   out.add("phase_probe_command", "TIMEPOP.PHASE_PROBE action=START|STOP|RESET phase_us=250 period_us=1000 samples=0");
   out.add("phase_probe_active", g_phase_probe.active);
