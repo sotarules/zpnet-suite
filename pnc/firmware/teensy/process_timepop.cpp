@@ -114,6 +114,7 @@ static constexpr uint32_t MAX_SLOTS = 16;
 static constexpr uint32_t MAX_ASAP_SLOTS = 8;
 static constexpr uint32_t MAX_ALAP_SLOTS = 4;
 static constexpr uint32_t MAX_DISPATCH_MUTATIONS = 24;
+static constexpr bool     TIMEPOP_IDLE_DWT_WITNESS_ENABLED = true;
 static constexpr uint64_t NS_PER_TICK = 100ULL;
 static constexpr uint32_t MAX_DELAY_TICKS = 0x7FFFFFFFU;
 static constexpr uint32_t MIN_DELAY_TICKS = 2;
@@ -416,6 +417,18 @@ static volatile uint32_t dispatch_mutation_count = 0;
 static volatile uint32_t dispatch_depth = 0;
 static volatile timepop_dispatch_phase_t dispatch_phase = timepop_dispatch_phase_t::IDLE;
 static volatile bool dispatch_applying_mutations = false;
+
+// Global idle DWT witness.  This symbol is intentionally exported so ISR-side
+// clients may read the freshest foreground/thread-mode DWT shadow without
+// calling into TimePop.  It is written only by the idle witness loop below.
+volatile uint32_t g_timepop_idle_witness_shadow_dwt = 0;
+
+static volatile bool     diag_idle_witness_running = false;
+static volatile uint32_t diag_idle_witness_enter_count = 0;
+static volatile uint32_t diag_idle_witness_exit_count = 0;
+static volatile uint32_t diag_idle_witness_pending_exit_count = 0;
+static volatile uint32_t diag_idle_witness_last_enter_dwt = 0;
+static volatile uint32_t diag_idle_witness_last_exit_dwt = 0;
 
 // ============================================================================
 // Diagnostics
@@ -944,6 +957,7 @@ static void timepop_dispatch_enter(timepop_dispatch_phase_t phase);
 static void timepop_dispatch_set_phase(timepop_dispatch_phase_t phase);
 static void timepop_dispatch_leave(void);
 static void timepop_apply_dispatch_mutations(const char* context);
+static void timepop_idle_witness_spin_until_pending(void);
 
 // ============================================================================
 // Dispatch-time mutation barrier helpers
@@ -1228,6 +1242,33 @@ static bool queue_dispatch_cancel_name(const char* name) {
   m.kind = timepop_dispatch_mutation_kind_t::CANCEL_NAME;
   m.name = name;
   return queue_dispatch_non_arm_mutation(m);
+}
+
+static void timepop_idle_witness_spin_until_pending(void) {
+  if (!TIMEPOP_IDLE_DWT_WITNESS_ENABLED) return;
+
+  const uint32_t enter_dwt = ARM_DWT_CYCCNT;
+  diag_idle_witness_enter_count++;
+  diag_idle_witness_last_enter_dwt = enter_dwt;
+  diag_idle_witness_running = true;
+
+  for (;;) {
+    // Read first, then test the dispatch-pending bit, and only then publish
+    // the shadow.  If an interrupt sets timepop_pending between the read and
+    // the test, the value we publish is still pre-interrupt evidence.  If the
+    // interrupt already happened before the read, pending is true and we do
+    // not overwrite the last pre-interrupt shadow with a post-interrupt value.
+    const uint32_t dwt = ARM_DWT_CYCCNT;
+    if (timepop_pending) {
+      diag_idle_witness_pending_exit_count++;
+      diag_idle_witness_last_exit_dwt = dwt;
+      break;
+    }
+    g_timepop_idle_witness_shadow_dwt = dwt;
+  }
+
+  diag_idle_witness_running = false;
+  diag_idle_witness_exit_count++;
 }
 
 static bool pop_dispatch_mutation(timepop_dispatch_mutation_t& out) {
@@ -3057,6 +3098,14 @@ void timepop_init(void) {
   dispatch_phase = timepop_dispatch_phase_t::IDLE;
   dispatch_applying_mutations = false;
 
+  g_timepop_idle_witness_shadow_dwt = 0;
+  diag_idle_witness_running = false;
+  diag_idle_witness_enter_count = 0;
+  diag_idle_witness_exit_count = 0;
+  diag_idle_witness_pending_exit_count = 0;
+  diag_idle_witness_last_enter_dwt = 0;
+  diag_idle_witness_last_exit_dwt = 0;
+
   diag_asap_armed = 0;
   diag_asap_dispatched = 0;
   diag_asap_arm_failures = 0;
@@ -4259,6 +4308,7 @@ void timepop_dispatch(void) {
     const uint32_t saved = critical_enter();
     if (!timepop_pending) {
       critical_exit(saved);
+      timepop_idle_witness_spin_until_pending();
       return;
     }
     timepop_pending = false;
@@ -4461,6 +4511,10 @@ void timepop_dispatch(void) {
   }
 
   timepop_dispatch_leave();
+
+  if (!timepop_pending) {
+    timepop_idle_witness_spin_until_pending();
+  }
 }
 // ============================================================================
 // Epoch boundary
@@ -4554,6 +4608,21 @@ uint32_t timepop_active_count(void) {
   return n;
 }
 
+bool timepop_idle_witness_snapshot(timepop_idle_witness_snapshot_t* out) {
+  if (!out) return false;
+
+  out->supported = true;
+  out->enabled = TIMEPOP_IDLE_DWT_WITNESS_ENABLED;
+  out->running = diag_idle_witness_running;
+  out->shadow_dwt = g_timepop_idle_witness_shadow_dwt;
+  out->enter_count = diag_idle_witness_enter_count;
+  out->exit_count = diag_idle_witness_exit_count;
+  out->pending_exit_count = diag_idle_witness_pending_exit_count;
+  out->last_enter_dwt = diag_idle_witness_last_enter_dwt;
+  out->last_exit_dwt = diag_idle_witness_last_exit_dwt;
+  return true;
+}
+
 // ============================================================================
 // REPORT
 // ============================================================================
@@ -4573,6 +4642,17 @@ static Payload cmd_report(const Payload&) {
   out.add("race_recoveries",   diag_race_recoveries);
   out.add("vclock_raw_now",    vclock_count());
   out.add("time_valid",        time_valid());
+  timepop_idle_witness_snapshot_t idle_witness{};
+  timepop_idle_witness_snapshot(&idle_witness);
+  out.add("idle_dwt_witness_supported", idle_witness.supported);
+  out.add("idle_dwt_witness_enabled", idle_witness.enabled);
+  out.add("idle_dwt_witness_running", idle_witness.running);
+  out.add("idle_dwt_shadow_dwt", idle_witness.shadow_dwt);
+  out.add("idle_dwt_witness_enter_count", idle_witness.enter_count);
+  out.add("idle_dwt_witness_exit_count", idle_witness.exit_count);
+  out.add("idle_dwt_witness_pending_exit_count", idle_witness.pending_exit_count);
+  out.add("idle_dwt_witness_last_enter_dwt", idle_witness.last_enter_dwt);
+  out.add("idle_dwt_witness_last_exit_dwt", idle_witness.last_exit_dwt);
   out.add("time_pps_count",    time_pps_count());
   out.add("phase_probe_command", "TIMEPOP.PHASE_PROBE action=START|STOP|RESET phase_us=250 period_us=1000 samples=0");
   out.add("phase_probe_active", g_phase_probe.active);

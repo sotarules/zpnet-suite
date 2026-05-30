@@ -6982,6 +6982,12 @@ static void add_spincatch_report_payload(Payload& p,
   p.add("spincatch_enabled", s ? s->enabled : false);
   p.add("spincatch_planner_enabled", s ? s->planner_enabled : false);
   p.add("spincatch_mode", SPINCATCH_REPORT_MODE);
+  p.add("spincatch_idle_witness_shadow_dwt",
+        (uint32_t)g_timepop_idle_witness_shadow_dwt);
+  p.add("spincatch_idle_witness_age_cycles_at_report",
+        g_timepop_idle_witness_shadow_dwt
+            ? (uint32_t)(ARM_DWT_CYCCNT - g_timepop_idle_witness_shadow_dwt)
+            : 0U);
   p.add("spincatch_success_count", s ? s->success_count : 0U);
   p.add("spincatch_missed_count", s ? s->missed_count : 0U);
   p.add("spincatch_timeout_count", s ? s->timeout_count : 0U);
@@ -8614,11 +8620,28 @@ static void add_ocxo_lane_summary_object(Payload& parent,
   parent.add_object(key, o);
 }
 
+static void add_idle_dwt_witness_payload(Payload& p) {
+  timepop_idle_witness_snapshot_t idle{};
+  timepop_idle_witness_snapshot(&idle);
+  p.add("idle_dwt_witness_supported", idle.supported);
+  p.add("idle_dwt_witness_enabled", idle.enabled);
+  p.add("idle_dwt_witness_running", idle.running);
+  p.add("idle_dwt_shadow_dwt", idle.shadow_dwt);
+  p.add("idle_dwt_shadow_age_cycles_at_report",
+        idle.shadow_dwt ? (uint32_t)(ARM_DWT_CYCCNT - idle.shadow_dwt) : 0U);
+  p.add("idle_dwt_witness_enter_count", idle.enter_count);
+  p.add("idle_dwt_witness_exit_count", idle.exit_count);
+  p.add("idle_dwt_witness_pending_exit_count", idle.pending_exit_count);
+  p.add("idle_dwt_witness_last_enter_dwt", idle.last_enter_dwt);
+  p.add("idle_dwt_witness_last_exit_dwt", idle.last_exit_dwt);
+}
+
 static Payload cmd_report_lanes(const Payload&) {
   Payload p;
   p.add("report", "INTERRUPT_LANES");
   p.add("lane_count", 3);
   p.add("detail_command", "INTERRUPT.REPORT_LANE lane=VCLOCK|OCXO1|OCXO2");
+  add_idle_dwt_witness_payload(p);
 
   add_lane_summary_object(p,
                           "vclock",

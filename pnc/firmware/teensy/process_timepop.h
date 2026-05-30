@@ -123,6 +123,26 @@ void timepop_bootstrap(void);
 void timepop_init(void);
 void process_timepop_register(void);
 
+// Global idle DWT witness.  TimePop updates this foreground/thread-mode
+// shadow whenever scheduled-context dispatch is fully drained and the runtime
+// would otherwise be idle.  ISR clients may read the exported volatile shadow
+// directly; command/report code should use the snapshot helper.
+extern volatile uint32_t g_timepop_idle_witness_shadow_dwt;
+
+struct timepop_idle_witness_snapshot_t {
+  bool supported = false;
+  bool enabled = false;
+  bool running = false;
+  uint32_t shadow_dwt = 0;
+  uint32_t enter_count = 0;
+  uint32_t exit_count = 0;
+  uint32_t pending_exit_count = 0;
+  uint32_t last_enter_dwt = 0;
+  uint32_t last_exit_dwt = 0;
+};
+
+bool timepop_idle_witness_snapshot(timepop_idle_witness_snapshot_t* out);
+
 typedef uint8_t timepop_priority_t;
 static constexpr timepop_priority_t TIMEPOP_PRIORITY_FIRST   = 0U;
 static constexpr timepop_priority_t TIMEPOP_PRIORITY_DEFAULT = 128U;
