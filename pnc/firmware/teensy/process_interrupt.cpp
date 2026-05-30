@@ -323,6 +323,25 @@ static constexpr uint32_t INTERRUPT_STEP0_EXPECTED_QTIMER2_PRIORITY  = 16;
 static constexpr uint32_t INTERRUPT_STEP0_EXPECTED_QTIMER3_PRIORITY  = 16;
 static constexpr uint32_t INTERRUPT_STEP0_EXPECTED_GPIO6789_PRIORITY = 0;
 
+// ============================================================================
+// SpinCatch step 4 — approach planner only
+// ============================================================================
+//
+// This checkpoint keeps the Step 3 passive ISR hook and adds only report-time
+// target/approach planning.  No lane arms TimePop work, no foreground spin loop
+// runs, no compare register is mutated by SpinCatch, and interrupt_capture_diag_t
+// remains unchanged.  The planner reports the already-authored lane target and
+// the synthetic 5 us approach coordinate that later steps may use.
+
+static constexpr bool SPINCATCH_REPORT_SHELL_SUPPORTED = true;
+static constexpr bool SPINCATCH_RUNTIME_ENABLED = false;
+static constexpr bool SPINCATCH_PLANNER_ENABLED = true;
+static constexpr const char* SPINCATCH_REPORT_MODE = "APPROACH_PLANNER_ONLY";
+static constexpr uint32_t SPINCATCH_APPROACH_US = 5U;
+static constexpr uint32_t SPINCATCH_APPROACH_TICKS = SPINCATCH_APPROACH_US * 10U;
+static_assert(SPINCATCH_APPROACH_TICKS == 50U,
+              "SpinCatch 5 us approach must be 50 ticks at 10 MHz");
+
 
 // ============================================================================
 // Passive ISR sanity witness
@@ -1426,6 +1445,92 @@ static volatile interrupt_pps_entry_latency_handler_fn
     g_pps_entry_latency_handler = nullptr;
 
 
+// ============================================================================
+// SpinCatch report-only lane state
+// ============================================================================
+
+struct spincatch_lane_report_t {
+  bool supported = SPINCATCH_REPORT_SHELL_SUPPORTED;
+  bool enabled = SPINCATCH_RUNTIME_ENABLED;
+  bool planner_enabled = SPINCATCH_PLANNER_ENABLED;
+  uint32_t success_count = 0;
+  uint32_t missed_count = 0;
+  uint32_t timeout_count = 0;
+  uint32_t clash_count = 0;
+
+  // Step 4 planner-only surface.  These fields are computed from already-
+  // authored lane targets when reports are requested.  They do not schedule,
+  // arm, spin, alter compare registers, or enter subscriber diagnostics.
+  bool     planner_valid = false;
+  uint32_t planner_count = 0;
+  uint32_t planner_skip_count = 0;
+  uint32_t target_counter32 = 0;
+  uint16_t target_low16 = 0;
+  uint32_t approach_counter32 = 0;
+  uint16_t approach_low16 = 0;
+  uint32_t approach_ticks = SPINCATCH_APPROACH_TICKS;
+  uint32_t approach_us = SPINCATCH_APPROACH_US;
+  uint32_t approach_dwt_cycles = 0;
+  uint32_t now_counter32 = 0;
+  uint32_t ticks_until_target = 0;
+};
+
+static spincatch_lane_report_t g_spincatch_vclock = {};
+static spincatch_lane_report_t g_spincatch_ocxo1 = {};
+static spincatch_lane_report_t g_spincatch_ocxo2 = {};
+
+// Active-token flags are deliberately never armed in Step 4.  They are volatile
+// so the passive ISR hook remains a real hot-path read without allowing the
+// compiler to fold the hook away as unreachable.
+static volatile bool g_spincatch_vclock_capture_active = false;
+static volatile bool g_spincatch_ocxo1_capture_active = false;
+static volatile bool g_spincatch_ocxo2_capture_active = false;
+
+static spincatch_lane_report_t* spincatch_report_for_kind(
+    interrupt_subscriber_kind_t kind) {
+  if (kind == interrupt_subscriber_kind_t::VCLOCK) return &g_spincatch_vclock;
+  if (kind == interrupt_subscriber_kind_t::OCXO1) return &g_spincatch_ocxo1;
+  if (kind == interrupt_subscriber_kind_t::OCXO2) return &g_spincatch_ocxo2;
+  return nullptr;
+}
+
+static volatile bool* spincatch_capture_active_for_kind(
+    interrupt_subscriber_kind_t kind) {
+  if (kind == interrupt_subscriber_kind_t::VCLOCK) return &g_spincatch_vclock_capture_active;
+  if (kind == interrupt_subscriber_kind_t::OCXO1) return &g_spincatch_ocxo1_capture_active;
+  if (kind == interrupt_subscriber_kind_t::OCXO2) return &g_spincatch_ocxo2_capture_active;
+  return nullptr;
+}
+
+static inline void spincatch_note_isr_entry(
+    interrupt_subscriber_kind_t kind,
+    uint32_t target_counter32,
+    uint16_t target_low16,
+    uint32_t isr_entry_dwt_raw) {
+  volatile bool* active = spincatch_capture_active_for_kind(kind);
+  if (!active || !*active) {
+    (void)target_counter32;
+    (void)target_low16;
+    (void)isr_entry_dwt_raw;
+    return;
+  }
+
+  // No lane can reach this branch in Step 4.  Future steps will install the
+  // shadow capture handoff here after the planner-only rung is proven stable.
+  (void)target_counter32;
+  (void)target_low16;
+  (void)isr_entry_dwt_raw;
+}
+
+static void spincatch_report_reset_all(void) {
+  g_spincatch_vclock = spincatch_lane_report_t{};
+  g_spincatch_ocxo1 = spincatch_lane_report_t{};
+  g_spincatch_ocxo2 = spincatch_lane_report_t{};
+  g_spincatch_vclock_capture_active = false;
+  g_spincatch_ocxo1_capture_active = false;
+  g_spincatch_ocxo2_capture_active = false;
+}
+
 
 // ============================================================================
 // Per-lane state
@@ -1997,7 +2102,8 @@ static void vclock_ch2_one_second_enable_from_epoch_legacy_grid(
     uint32_t service_counter32,
     uint32_t tick_mod_seed);
 static bool vclock_ch2_one_second_already_served_for(uint32_t counter32);
-static void vclock_ch2_one_second_service(uint32_t qtimer_event_dwt,
+static void vclock_ch2_one_second_service(uint32_t isr_entry_dwt_raw,
+                                          uint32_t qtimer_event_dwt,
                                           uint32_t service_counter32);
 static void vclock_ch2_smartzero_reset_attempt_state(void);
 static void vclock_ch2_smartzero_deactivate(void);
@@ -3636,13 +3742,20 @@ static bool vclock_ch2_one_second_already_served_for(uint32_t counter32) {
   return (int32_t)(g_vclock_ch2_one_second_next_counter32 - counter32) > 0;
 }
 
-static void vclock_ch2_one_second_service(uint32_t qtimer_event_dwt,
+static void vclock_ch2_one_second_service(uint32_t isr_entry_dwt_raw,
+                                          uint32_t qtimer_event_dwt,
                                           uint32_t service_counter32) {
   if (!g_vclock_ch2_one_second_enabled) return;
   if (!g_vclock_lane.active || !g_rt_vclock || !g_rt_vclock->active) return;
 
   const uint32_t target_counter32 = g_vclock_ch2_one_second_next_counter32;
   if ((int32_t)(service_counter32 - target_counter32) < 0) return;
+
+  const uint16_t target_low16 = vclock_hardware_low16_from_synthetic(target_counter32);
+  spincatch_note_isr_entry(interrupt_subscriber_kind_t::VCLOCK,
+                           target_counter32,
+                           target_low16,
+                           isr_entry_dwt_raw);
 
   const uint32_t late_ticks = service_counter32 - target_counter32;
   uint32_t authored_dwt = qtimer_event_dwt;
@@ -3659,7 +3772,7 @@ static void vclock_ch2_one_second_service(uint32_t qtimer_event_dwt,
   vclock_perishable_fact_t fact{};
   fact.observed_dwt_at_event = authored_dwt;
   fact.target_counter32 = target_counter32;
-  fact.target_low16 = vclock_hardware_low16_from_synthetic(target_counter32);
+  fact.target_low16 = target_low16;
   fact.observed_low16 = (uint16_t)(service_counter32 & 0xFFFFU);
   fact.one_second_due = true;
   fact.witness_pps_valid = g_last_pps_witness_valid;
@@ -4982,6 +5095,10 @@ static ocxo_cadence_isr_sample_t ocxo_cadence_capture_perishable_facts(
 
   sample.target_counter32 = lane.cadence_next_counter32;
   sample.target_low16 = (uint16_t)(sample.target_counter32 & 0xFFFFU);
+  spincatch_note_isr_entry(ctx.kind,
+                           sample.target_counter32,
+                           sample.target_low16,
+                           isr_entry_dwt_raw);
   sample.service_counter_low16 = ocxo_lane_counter_now(lane);
   sample.target_delta_mod65536_ticks =
       (uint32_t)((uint16_t)(sample.service_counter_low16 - sample.target_low16));
@@ -5435,7 +5552,8 @@ static void qtimer1_isr(void) {
     interrupt_ch2_implicit_rollover_tend();
 
     pps_relay_ch2_tick(g_vclock_clock32.current_counter32);
-    vclock_ch2_one_second_service(qtimer_event_dwt,
+    vclock_ch2_one_second_service(isr_entry_dwt_raw,
+                                  qtimer_event_dwt,
                                   ch2_event_counter32);
     vclock_ch2_smartzero_service(qtimer_event_dwt,
                                   ch2_event_counter32);
@@ -6310,6 +6428,7 @@ static void runtime_reset_for_init(void) {
   runtime_bootstrap_synthetic_clocks_if_ready();
   runtime_reset_qtimer_host_state();
   runtime_reset_vclock_heartbeat_state();
+  spincatch_report_reset_all();
   vclock_fact_ring_reset();
   runtime_reset_ocxo_fact_rings();
   cadence_regression_reset_all();
@@ -6413,6 +6532,101 @@ struct payload_prefix_t {
     p.add(key, value ? value : "");
   }
 };
+
+static void spincatch_plan_from_target(spincatch_lane_report_t& s,
+                                       bool target_valid,
+                                       uint32_t target_counter32,
+                                       uint16_t target_low16,
+                                       uint32_t now_counter32) {
+  s.approach_ticks = SPINCATCH_APPROACH_TICKS;
+  s.approach_us = SPINCATCH_APPROACH_US;
+  s.now_counter32 = now_counter32;
+
+  if (!target_valid) {
+    s.planner_valid = false;
+    s.target_counter32 = 0;
+    s.target_low16 = 0;
+    s.approach_counter32 = 0;
+    s.approach_low16 = 0;
+    s.approach_dwt_cycles = 0;
+    s.ticks_until_target = 0;
+    s.planner_skip_count++;
+    return;
+  }
+
+  s.planner_valid = true;
+  s.target_counter32 = target_counter32;
+  s.target_low16 = target_low16;
+  s.approach_counter32 = target_counter32 - SPINCATCH_APPROACH_TICKS;
+  s.approach_low16 = (uint16_t)(target_low16 - (uint16_t)SPINCATCH_APPROACH_TICKS);
+  s.approach_dwt_cycles = vclock_cycles_for_ticks(SPINCATCH_APPROACH_TICKS);
+  s.ticks_until_target = target_counter32 - now_counter32;
+  s.planner_count++;
+}
+
+static void spincatch_update_planner_for_report(interrupt_subscriber_kind_t kind) {
+  spincatch_lane_report_t* s = spincatch_report_for_kind(kind);
+  if (!s || !SPINCATCH_PLANNER_ENABLED) return;
+
+  if (kind == interrupt_subscriber_kind_t::VCLOCK) {
+    const bool target_valid =
+        g_vclock_ch2_one_second_enabled &&
+        g_vclock_ch2_one_second_next_counter32 != 0;
+    const uint32_t target = g_vclock_ch2_one_second_next_counter32;
+    const uint16_t low16 = target_valid
+        ? vclock_hardware_low16_from_synthetic(target)
+        : 0U;
+    const uint32_t now = interrupt_vclock_counter32_observe_ambient();
+    spincatch_plan_from_target(*s, target_valid, target, low16, now);
+    return;
+  }
+
+  ocxo_runtime_context_t* ctx = ocxo_context_for(kind);
+  if (!ctx || !ctx->lane || !ctx->clock32) {
+    spincatch_plan_from_target(*s, false, 0, 0, 0);
+    return;
+  }
+
+  const ocxo_lane_t& lane = *ctx->lane;
+  const bool target_valid =
+      lane.initialized &&
+      lane.cadence_enabled &&
+      lane.witness_target_initialized &&
+      lane.cadence_next_counter32 != 0;
+  spincatch_plan_from_target(*s,
+                             target_valid,
+                             lane.cadence_next_counter32,
+                             target_valid ? lane.cadence_next_low16 : 0U,
+                             ctx->clock32->current_counter32);
+}
+
+static void add_spincatch_report_payload(Payload& p,
+                                         interrupt_subscriber_kind_t kind) {
+  spincatch_update_planner_for_report(kind);
+  const spincatch_lane_report_t* s = spincatch_report_for_kind(kind);
+
+  p.add("spincatch_supported", s ? s->supported : false);
+  p.add("spincatch_enabled", s ? s->enabled : false);
+  p.add("spincatch_planner_enabled", s ? s->planner_enabled : false);
+  p.add("spincatch_mode", SPINCATCH_REPORT_MODE);
+  p.add("spincatch_success_count", s ? s->success_count : 0U);
+  p.add("spincatch_missed_count", s ? s->missed_count : 0U);
+  p.add("spincatch_timeout_count", s ? s->timeout_count : 0U);
+  p.add("spincatch_clash_count", s ? s->clash_count : 0U);
+
+  p.add("spincatch_planner_valid", s ? s->planner_valid : false);
+  p.add("spincatch_planner_count", s ? s->planner_count : 0U);
+  p.add("spincatch_planner_skip_count", s ? s->planner_skip_count : 0U);
+  p.add("spincatch_target_counter32", s ? s->target_counter32 : 0U);
+  p.add("spincatch_target_low16", s ? (uint32_t)s->target_low16 : 0U);
+  p.add("spincatch_approach_counter32", s ? s->approach_counter32 : 0U);
+  p.add("spincatch_approach_low16", s ? (uint32_t)s->approach_low16 : 0U);
+  p.add("spincatch_approach_ticks", s ? s->approach_ticks : 0U);
+  p.add("spincatch_approach_us", s ? s->approach_us : 0U);
+  p.add("spincatch_approach_dwt_cycles", s ? s->approach_dwt_cycles : 0U);
+  p.add("spincatch_now_counter32", s ? s->now_counter32 : 0U);
+  p.add("spincatch_ticks_until_target", s ? s->ticks_until_target : 0U);
+}
 
 static void add_isr_sanity_payload(Payload& p,
                                    const char* prefix,
@@ -7155,6 +7369,7 @@ static void add_vclock_lane_payload(Payload& p, bool detailed) {
   p.add("counter_source", "QTIMER1_CH0_SYNTHETIC_COUNTER32");
   p.add("event_source", "QTIMER1_CH2_INTRINSIC_EPOCH_AND_ONE_SECOND");
   p.add("dwt_authority", "QTIMER1_CH2_TIMEPOP_EVENT_DWT");
+  add_spincatch_report_payload(p, interrupt_subscriber_kind_t::VCLOCK);
 
   add_runtime_lane_summary(p, "vclock", g_rt_vclock);
   p.add("vclock_irq_count", g_vclock_lane.irq_count);
@@ -7563,6 +7778,7 @@ static void add_ocxo_lane_payload(Payload& p,
   payload_prefix_t out(p, ctx.prefix);
 
   add_ocxo_identity_payload(p, ctx);
+  add_spincatch_report_payload(p, ctx.kind);
   add_runtime_lane_summary(p, ctx.prefix, rt);
   add_ocxo_lane_basic_payload(out, lane);
   add_ocxo_witness_service_payload(out, lane);
