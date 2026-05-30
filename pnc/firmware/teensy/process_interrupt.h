@@ -179,8 +179,10 @@ enum class interrupt_event_status_t : uint8_t {
 // ============================================================================
 //
 // VCLOCK and OCXO lanes deliver one event per second to their foreground
-// subscribers (via timepop_arm_asap deferral).  TIMEPOP receives an event
-// on every CH2 compare-match — IRQ-context delivery, no foreground hop.
+// subscribers (via timepop_arm_asap deferral).  VCLOCK/OCXO DWT coordinates
+// may be EMA-authored estimates of the exact edge while raw ISR observations
+// remain diagnostic evidence.  TIMEPOP receives an event on every CH2
+// compare-match — IRQ-context delivery, no foreground hop.
 
 struct interrupt_event_t {
   interrupt_subscriber_kind_t kind     = interrupt_subscriber_kind_t::NONE;
@@ -188,10 +190,10 @@ struct interrupt_event_t {
   interrupt_lane_t            lane     = interrupt_lane_t::NONE;
   interrupt_event_status_t    status   = interrupt_event_status_t::OK;
 
-  // Traditional event-coordinate DWT of the lane's one-second event.
-  // VCLOCK uses the authored TimePop/QTimer event coordinate.  OCXO lanes now
-  // publish an EMA-predicted one-second edge DWT; the ISR-captured endpoint is
-  // retained in diagnostics as dwt_original_at_event.
+  // Authored event-coordinate DWT of the lane's one-second event.
+  // VCLOCK and OCXO lanes may publish EMA-predicted one-second edge DWTs;
+  // ISR-captured endpoints remain diagnostics in dwt_original_at_event and
+  // dwt_isr_entry_raw.
   uint32_t dwt_at_event = 0;
 
   // GNSS ns at the event.  For VCLOCK, authored from the VCLOCK counter
@@ -258,8 +260,8 @@ struct interrupt_capture_diag_t {
   uint32_t spinidle_shadow_valid_threshold_cycles = 0;
 
   // DWT admissibility / repair/prediction audit.  dwt_at_event remains the
-  // authoritative subscriber coordinate.  For OCXO lanes, dwt_synthetic may be
-  // true when the EMA-predicted edge replaces the observed ISR endpoint.
+  // authoritative subscriber coordinate.  For VCLOCK/OCXO lanes, dwt_synthetic
+  // may be true when an EMA-predicted edge replaces the observed ISR endpoint.
   bool     dwt_synthetic = false;
   bool     dwt_repair_candidate = false;
   uint32_t dwt_original_at_event = 0;

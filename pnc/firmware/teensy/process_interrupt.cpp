@@ -27,10 +27,11 @@
 //
 // TimePop is the principled exception to the "no DWT conversion in
 // PPS_VCLOCK" rule: it projects CH2 fire facts onto the PPS_VCLOCK timeline
-// for scheduling diagnostics. OCXO one-second subscribers receive authored
-// OCXO edge facts whose DWT coordinate is EMA-predicted from the lane's
-// completed one-second intervals; CLOCKS/Alpha owns OCXO measured-GNSS
-// interval construction from consecutive OCXO edge DWTs.
+// for scheduling diagnostics. VCLOCK and OCXO one-second subscribers receive
+// authored edge facts whose DWT coordinates may be EMA-predicted from completed
+// one-second intervals; counter32/GNSS identity remains exact authority.
+// CLOCKS/Alpha owns measured-GNSS interval construction from consecutive
+// authored edge DWTs.
 //
 // Lanes:
 //   VCLOCK : TimePop recurring client on QTimer1 CH2 (10 MHz VCLOCK domain)
@@ -135,6 +136,15 @@ static constexpr bool     VCLOCK_DWT_REPAIR_DIAG_ENABLED = false;
 static constexpr uint32_t VCLOCK_DWT_REPAIR_THRESHOLD_CYCLES = 10;
 static constexpr uint32_t VCLOCK_DWT_REPAIR_MIN_HISTORY_COUNT = 8;
 static constexpr uint32_t VCLOCK_DWT_REPAIR_MAX_PREDICTION_RESIDUAL_CYCLES = 25;
+
+// VCLOCK DWT authorship.  VCLOCK counter32 and GNSS identity remain exact
+// authorities; only the DWT coordinate assigned to the exact one-second edge
+// is EMA-authored to suppress the known QTimer 4-cycle quantization floor.
+static constexpr bool     VCLOCK_EMA_DWT_AUTHORITY_ENABLED = true;
+static constexpr uint32_t VCLOCK_EMA_SHIFT = 4;  // alpha = 1/16
+static constexpr uint32_t VCLOCK_EMA_ALPHA_NUMERATOR = 1;
+static constexpr uint32_t VCLOCK_EMA_ALPHA_DENOMINATOR = (1U << VCLOCK_EMA_SHIFT);
+static constexpr uint32_t VCLOCK_EMA_AUDIT_THRESHOLD_CYCLES = 32;
 
 // Epoch-ready PPS capture packet.  The ISR captures the first-instruction DWT
 // and the three lane hardware counters in one tiny custody window.  DWT runs
@@ -1154,6 +1164,7 @@ struct dwt_repair_diag_t {
   uint32_t used_dwt = 0;
   uint32_t isr_entry_dwt_raw = 0;
   int32_t  error_cycles = 0;
+  uint32_t threshold_cycles = 0;
   const char* reason = "none";
 };
 
@@ -1247,6 +1258,7 @@ static dwt_repair_diag_t vclock_endpoint_repair_diagnostic(uint32_t observed_dwt
   r.used_dwt = observed_dwt;
   r.isr_entry_dwt_raw = 0;
   r.error_cycles = 0;
+  r.threshold_cycles = VCLOCK_DWT_REPAIR_THRESHOLD_CYCLES;
   r.reason = "disabled";
 
   g_vclock_repair_stats.last_candidate = false;
@@ -1685,8 +1697,120 @@ struct vclock_lane_t {
   uint32_t miss_count = 0;
   uint32_t bootstrap_count = 0;
   uint32_t cadence_hits_total = 0;
+
+  // VCLOCK EMA DWT authority.  This does not smooth VCLOCK counter32 or GNSS
+  // identity; it only dequantizes the DWT coordinate assigned to the exact
+  // PPS/VCLOCK one-second edge.
+  bool     ema_initialized = false;
+  bool     ema_interval_valid = false;
+  uint32_t ema_last_observed_dwt = 0;
+  uint32_t ema_last_emitted_dwt = 0;
+  uint32_t ema_last_observed_interval_cycles = 0;
+  uint32_t ema_interval_cycles = 0;
+  uint32_t ema_last_predicted_dwt = 0;
+  int32_t  ema_last_error_cycles = 0;
+  uint32_t ema_max_abs_error_cycles = 0;
+  uint32_t ema_update_count = 0;
 };
 static vclock_lane_t g_vclock_lane;
+
+static uint32_t dwt_ema_abs_i32(int32_t value) {
+  return (uint32_t)(value < 0 ? -(int64_t)value : (int64_t)value);
+}
+
+static int32_t dwt_ema_round_shift(int32_t value, uint32_t shift) {
+  if (shift == 0) return value;
+  const int32_t half = (int32_t)(1U << (shift - 1U));
+  if (value >= 0) return (value + half) >> shift;
+  return -(((-value) + half) >> shift);
+}
+
+static void vclock_lane_ema_reset(vclock_lane_t& lane) {
+  lane.ema_initialized = false;
+  lane.ema_interval_valid = false;
+  lane.ema_last_observed_dwt = 0;
+  lane.ema_last_emitted_dwt = 0;
+  lane.ema_last_observed_interval_cycles = 0;
+  lane.ema_interval_cycles = 0;
+  lane.ema_last_predicted_dwt = 0;
+  lane.ema_last_error_cycles = 0;
+  lane.ema_max_abs_error_cycles = 0;
+  lane.ema_update_count = 0;
+  g_vclock_repair_stats = vclock_repair_stats_t{};
+}
+
+static uint32_t vclock_lane_ema_predict_dwt(vclock_lane_t& lane,
+                                            uint32_t observed_dwt,
+                                            bool* out_synthetic,
+                                            int32_t* out_error_cycles) {
+  if (out_synthetic) *out_synthetic = false;
+  if (out_error_cycles) *out_error_cycles = 0;
+
+  if (!VCLOCK_EMA_DWT_AUTHORITY_ENABLED) {
+    return observed_dwt;
+  }
+
+  if (!lane.ema_initialized) {
+    lane.ema_initialized = true;
+    lane.ema_last_observed_dwt = observed_dwt;
+    lane.ema_last_emitted_dwt = observed_dwt;
+    lane.ema_last_predicted_dwt = observed_dwt;
+    lane.ema_last_observed_interval_cycles = 0;
+    lane.ema_last_error_cycles = 0;
+    lane.ema_update_count++;
+
+    g_vclock_repair_stats.last_original_dwt = observed_dwt;
+    g_vclock_repair_stats.last_predicted_dwt = observed_dwt;
+    g_vclock_repair_stats.last_used_dwt = observed_dwt;
+    g_vclock_repair_stats.last_error_cycles = 0;
+    g_vclock_repair_stats.last_candidate = false;
+    g_vclock_repair_stats.last_synthetic = false;
+    return observed_dwt;
+  }
+
+  const uint32_t observed_interval = observed_dwt - lane.ema_last_observed_dwt;
+  lane.ema_last_observed_interval_cycles = observed_interval;
+
+  if (!lane.ema_interval_valid || lane.ema_interval_cycles == 0) {
+    lane.ema_interval_cycles = observed_interval;
+    lane.ema_interval_valid = true;
+  } else {
+    const int32_t err = (int32_t)((int64_t)observed_interval -
+                                  (int64_t)lane.ema_interval_cycles);
+    lane.ema_interval_cycles = (uint32_t)((int64_t)lane.ema_interval_cycles +
+        (int64_t)dwt_ema_round_shift(err, VCLOCK_EMA_SHIFT));
+  }
+
+  const uint32_t predicted = lane.ema_last_emitted_dwt + lane.ema_interval_cycles;
+  const int32_t prediction_error = (int32_t)(observed_dwt - predicted);
+  lane.ema_last_error_cycles = prediction_error;
+  const uint32_t abs_error = dwt_ema_abs_i32(prediction_error);
+  if (abs_error > lane.ema_max_abs_error_cycles) {
+    lane.ema_max_abs_error_cycles = abs_error;
+  }
+
+  lane.ema_last_observed_dwt = observed_dwt;
+  lane.ema_last_emitted_dwt = predicted;
+  lane.ema_last_predicted_dwt = predicted;
+  lane.ema_update_count++;
+
+  g_vclock_repair_stats.candidate_count++;
+  g_vclock_repair_stats.applied_count++;
+  g_vclock_repair_stats.consecutive_candidate_count++;
+  g_vclock_repair_stats.last_original_dwt = observed_dwt;
+  g_vclock_repair_stats.last_predicted_dwt = predicted;
+  g_vclock_repair_stats.last_used_dwt = predicted;
+  g_vclock_repair_stats.last_error_cycles = prediction_error;
+  if (abs_error > g_vclock_repair_stats.max_abs_error_cycles) {
+    g_vclock_repair_stats.max_abs_error_cycles = abs_error;
+  }
+  g_vclock_repair_stats.last_candidate = true;
+  g_vclock_repair_stats.last_synthetic = true;
+
+  if (out_synthetic) *out_synthetic = true;
+  if (out_error_cycles) *out_error_cycles = prediction_error;
+  return predicted;
+}
 
 struct synthetic_clock32_t;
 struct ocxo_runtime_context_t;
@@ -2278,6 +2402,7 @@ bool interrupt_clock32_zero_from_ns(interrupt_subscriber_kind_t kind, uint64_t n
     vclock_ch2_one_second_disable();
     cadence_regression_reset_kind(interrupt_subscriber_kind_t::VCLOCK);
     vclock_fact_ring_reset();
+    vclock_lane_ema_reset(g_vclock_lane);
     return true;
   }
 
@@ -2306,6 +2431,7 @@ bool interrupt_clock32_request_zero_from_ns(interrupt_subscriber_kind_t kind, ui
     vclock_ch2_one_second_disable();
     cadence_regression_reset_kind(interrupt_subscriber_kind_t::VCLOCK);
     vclock_fact_ring_reset();
+    vclock_lane_ema_reset(g_vclock_lane);
     return true;
   }
 
@@ -3659,7 +3785,7 @@ static void emit_one_second_event(interrupt_subscriber_runtime_t& rt,
     diag.dwt_used_at_event = repair->used_dwt;
     diag.dwt_isr_entry_raw = repair->isr_entry_dwt_raw;
     diag.dwt_synthetic_error_cycles = repair->error_cycles;
-    diag.dwt_synthetic_threshold_cycles = VCLOCK_DWT_REPAIR_THRESHOLD_CYCLES;
+    diag.dwt_synthetic_threshold_cycles = repair->threshold_cycles;
     diag.dwt_synthetic_reason = repair->reason;
   }
   if (rt.desc->kind != interrupt_subscriber_kind_t::VCLOCK) {
@@ -3687,6 +3813,7 @@ static constexpr const char* VCLOCK_FACT_DRAIN_NAME = "VCLOCK_FACT_DRAIN";
 
 struct vclock_perishable_fact_t {
   uint32_t sequence = 0;
+  uint32_t isr_entry_dwt_raw = 0;
   uint32_t observed_dwt_at_event = 0;
   uint32_t target_counter32 = 0;
   uint16_t target_low16 = 0;
@@ -3916,6 +4043,7 @@ static void vclock_ch2_one_second_service(uint32_t isr_entry_dwt_raw,
   const pps_t witness_pps = g_last_pps_witness_valid ? g_last_pps_witness : pps_t{};
 
   vclock_perishable_fact_t fact{};
+  fact.isr_entry_dwt_raw = isr_entry_dwt_raw;
   fact.observed_dwt_at_event = authored_dwt;
   fact.target_counter32 = target_counter32;
   fact.target_low16 = target_low16;
@@ -4132,13 +4260,17 @@ static void vclock_apply_perishable_fact_deferred(
     return;
   }
 
-  const uint32_t inferred_dwt = fact.observed_dwt_at_event;
+  const uint32_t observed_dwt = fact.observed_dwt_at_event;
+  bool ema_synthetic = false;
+  int32_t ema_error_cycles = 0;
+  const uint32_t published_dwt = vclock_lane_ema_predict_dwt(
+      g_vclock_lane, observed_dwt, &ema_synthetic, &ema_error_cycles);
 
   uint32_t coincidence_cycles = 0;
   bool coincidence_valid = false;
   if (fact.witness_pps_valid && fact.witness_pps.sequence > 0) {
     const int32_t cycles_since_pps =
-        (int32_t)(inferred_dwt - fact.witness_pps.dwt_at_edge);
+        (int32_t)(published_dwt - fact.witness_pps.dwt_at_edge);
     if (llabs((long long)cycles_since_pps) <
         DWT_PPS_COINCIDENCE_THRESHOLD_CYCLES) {
       coincidence_cycles = (uint32_t)(cycles_since_pps >= 0
@@ -4148,24 +4280,33 @@ static void vclock_apply_perishable_fact_deferred(
     }
   }
 
-  const dwt_repair_diag_t repair =
-      vclock_endpoint_repair_diagnostic(fact.observed_dwt_at_event);
+  dwt_repair_diag_t ema_diag{};
+  ema_diag.valid = true;
+  ema_diag.candidate = ema_synthetic;
+  ema_diag.synthetic = ema_synthetic;
+  ema_diag.original_dwt = observed_dwt;
+  ema_diag.predicted_dwt = published_dwt;
+  ema_diag.used_dwt = published_dwt;
+  ema_diag.isr_entry_dwt_raw = fact.isr_entry_dwt_raw;
+  ema_diag.error_cycles = ema_error_cycles;
+  ema_diag.threshold_cycles = VCLOCK_EMA_AUDIT_THRESHOLD_CYCLES;
+  ema_diag.reason = ema_synthetic ? "vclock_ema" : "vclock_ema_init";
 
   const pps_t witness_pps = fact.witness_pps_valid ? fact.witness_pps : pps_t{};
   publish_vclock_domain_pps_vclock(witness_pps,
                                     (witness_pps.sequence != 0)
                                         ? witness_pps.sequence
                                         : fact.fallback_sequence,
-                                    inferred_dwt,
+                                    published_dwt,
                                     fact.target_counter32,
                                     fact.target_low16);
 
   emit_one_second_event(*g_rt_vclock,
-                        inferred_dwt,
+                        published_dwt,
                         fact.target_counter32,
                         coincidence_cycles,
                         coincidence_valid,
-                        &repair,
+                        &ema_diag,
                         true,
                         nullptr,
                         &fact.spinidle);
@@ -4612,19 +4753,32 @@ static void vclock_heartbeat_timepop_callback(timepop_ctx_t* ctx,
         const pps_t witness_pps = g_last_pps_witness_valid
             ? g_last_pps_witness
             : pps_t{};
-        const dwt_repair_diag_t repair =
-            vclock_endpoint_repair_diagnostic(qtimer_event_dwt);
+        bool ema_synthetic = false;
+        int32_t ema_error_cycles = 0;
+        const uint32_t published_dwt = vclock_lane_ema_predict_dwt(
+            g_vclock_lane, qtimer_event_dwt, &ema_synthetic, &ema_error_cycles);
+        dwt_repair_diag_t ema_diag{};
+        ema_diag.valid = true;
+        ema_diag.candidate = ema_synthetic;
+        ema_diag.synthetic = ema_synthetic;
+        ema_diag.original_dwt = qtimer_event_dwt;
+        ema_diag.predicted_dwt = published_dwt;
+        ema_diag.used_dwt = published_dwt;
+        ema_diag.isr_entry_dwt_raw = 0;
+        ema_diag.error_cycles = ema_error_cycles;
+        ema_diag.threshold_cycles = VCLOCK_EMA_AUDIT_THRESHOLD_CYCLES;
+        ema_diag.reason = ema_synthetic ? "vclock_ema_fallback" : "vclock_ema_init_fallback";
         publish_vclock_domain_pps_vclock(witness_pps,
                                           (witness_pps.sequence != 0)
                                               ? witness_pps.sequence
                                               : (g_pps_gpio_heartbeat.edge_count + 1),
-                                          qtimer_event_dwt,
+                                          published_dwt,
                                           cadence_counter32,
                                           fired_low16);
 
-        emit_one_second_event(*g_rt_vclock, qtimer_event_dwt,
+        emit_one_second_event(*g_rt_vclock, published_dwt,
                               cadence_counter32,
-                              coincidence_cycles, coincidence_valid, &repair);
+                              coincidence_cycles, coincidence_valid, &ema_diag);
 
         if (g_pps_edge_dispatch) {
           timepop_arm_asap(pps_edge_dispatch_trampoline,
@@ -5423,6 +5577,7 @@ static void ocxo_apply_perishable_fact_deferred(
   ema_diag.used_dwt = published_dwt;
   ema_diag.isr_entry_dwt_raw = fact.isr_entry_dwt_raw;
   ema_diag.error_cycles = ema_error_cycles;
+  ema_diag.threshold_cycles = 0;
   ema_diag.reason = ema_synthetic ? "ocxo_ema" : "ocxo_ema_init";
 
   // We are already in TimePop ASAP/foreground context. Dispatch the authored
@@ -6456,6 +6611,7 @@ bool interrupt_start(interrupt_subscriber_kind_t kind) {
     g_vclock_lane.phase_bootstrapped = true;
     g_vclock_lane.tick_mod_1000 = 0;
     vclock_ch2_one_second_disable();
+    vclock_lane_ema_reset(g_vclock_lane);
     // VCLOCK_HEARTBEAT is armed once during process_interrupt_init() and is the
     // only 1 ms TimePop cadence source.  Starting VCLOCK must not arm a second
     // cadence slot.
@@ -6524,6 +6680,7 @@ void interrupt_request_pps_rebootstrap(void) {
   vclock_ch2_one_second_disable();
   cadence_regression_reset_kind(interrupt_subscriber_kind_t::VCLOCK);
   vclock_fact_ring_reset();
+  vclock_lane_ema_reset(g_vclock_lane);
   // Rebootstrap selects a fresh PPS_VCLOCK edge identity.
   g_pvc_anchor_reset_pending = true;
 }
@@ -6762,6 +6919,7 @@ static void runtime_reset_qtimer_host_state(void) {
 }
 
 static void runtime_reset_vclock_heartbeat_state(void) {
+  vclock_lane_ema_reset(g_vclock_lane);
   g_vclock_heartbeat_armed = false;
   g_vclock_heartbeat_arm_count = 0;
   g_vclock_heartbeat_arm_failures = 0;
@@ -7425,6 +7583,10 @@ static void add_runtime_payload(Payload& p) {
   p.add("ocxo_smartzero_surrogates_enabled", OCXO_DISABLE_EXPERIMENT);
   p.add("ocxo_quiet_phase_sampling_enabled", OCXO_QUIET_PHASE_SAMPLING_ENABLED);
   p.add("ocxo_rollover_only_mode", !OCXO_QUIET_PHASE_SAMPLING_ENABLED);
+  p.add("vclock_ema_dwt_authority_enabled", VCLOCK_EMA_DWT_AUTHORITY_ENABLED);
+  p.add("vclock_ema_alpha_numerator", VCLOCK_EMA_ALPHA_NUMERATOR);
+  p.add("vclock_ema_alpha_denominator", VCLOCK_EMA_ALPHA_DENOMINATOR);
+  p.add("vclock_ema_audit_threshold_cycles", VCLOCK_EMA_AUDIT_THRESHOLD_CYCLES);
   p.add("ocxo_ema_dwt_authority_enabled", OCXO_EMA_DWT_AUTHORITY_ENABLED);
   p.add("ocxo_ema_alpha_numerator", OCXO_EMA_ALPHA_NUMERATOR);
   p.add("ocxo_ema_alpha_denominator", OCXO_EMA_ALPHA_DENOMINATOR);
@@ -7579,6 +7741,10 @@ static void add_vclock_heartbeat_payload(Payload& p) {
   p.add("ocxo_cadence_samples_per_second", TICKS_PER_SECOND_EVENT);
   p.add("ocxo_quiet_phase_sampling_enabled", OCXO_QUIET_PHASE_SAMPLING_ENABLED);
   p.add("ocxo_rollover_only_mode", !OCXO_QUIET_PHASE_SAMPLING_ENABLED);
+  p.add("vclock_ema_dwt_authority_enabled", VCLOCK_EMA_DWT_AUTHORITY_ENABLED);
+  p.add("vclock_ema_alpha_numerator", VCLOCK_EMA_ALPHA_NUMERATOR);
+  p.add("vclock_ema_alpha_denominator", VCLOCK_EMA_ALPHA_DENOMINATOR);
+  p.add("vclock_ema_audit_threshold_cycles", VCLOCK_EMA_AUDIT_THRESHOLD_CYCLES);
   p.add("ocxo_ema_dwt_authority_enabled", OCXO_EMA_DWT_AUTHORITY_ENABLED);
   p.add("ocxo_ema_alpha_numerator", OCXO_EMA_ALPHA_NUMERATOR);
   p.add("ocxo_ema_alpha_denominator", OCXO_EMA_ALPHA_DENOMINATOR);
@@ -7892,7 +8058,7 @@ static void add_vclock_lane_payload(Payload& p, bool detailed) {
   p.add("cadence_source", "QTIMER1_CH2_NATIVE_EPOCH_ONE_SECOND_PLUS_HEARTBEAT_FALLBACK");
   p.add("counter_source", "QTIMER1_CH0_SYNTHETIC_COUNTER32");
   p.add("event_source", "QTIMER1_CH2_INTRINSIC_EPOCH_AND_ONE_SECOND");
-  p.add("dwt_authority", "QTIMER1_CH2_TIMEPOP_EVENT_DWT");
+  p.add("dwt_authority", "QTIMER1_CH2_EMA_PREDICTED_DWT");
   add_spincatch_report_payload(p, interrupt_subscriber_kind_t::VCLOCK);
 
   add_runtime_lane_summary(p, "vclock", g_rt_vclock);
@@ -7903,6 +8069,20 @@ static void add_vclock_lane_payload(Payload& p, bool detailed) {
   p.add("vclock_compare_target", (uint32_t)g_vclock_lane.compare_target);
   p.add("vclock_tick_mod_1000", g_vclock_lane.tick_mod_1000);
   p.add("vclock_logical_count32", g_vclock_lane.logical_count32_at_last_second);
+  p.add("vclock_ema_dwt_authority_enabled", VCLOCK_EMA_DWT_AUTHORITY_ENABLED);
+  p.add("vclock_ema_alpha_numerator", VCLOCK_EMA_ALPHA_NUMERATOR);
+  p.add("vclock_ema_alpha_denominator", VCLOCK_EMA_ALPHA_DENOMINATOR);
+  p.add("vclock_ema_audit_threshold_cycles", VCLOCK_EMA_AUDIT_THRESHOLD_CYCLES);
+  p.add("vclock_ema_initialized", g_vclock_lane.ema_initialized);
+  p.add("vclock_ema_interval_valid", g_vclock_lane.ema_interval_valid);
+  p.add("vclock_ema_update_count", g_vclock_lane.ema_update_count);
+  p.add("vclock_ema_last_observed_dwt", g_vclock_lane.ema_last_observed_dwt);
+  p.add("vclock_ema_last_emitted_dwt", g_vclock_lane.ema_last_emitted_dwt);
+  p.add("vclock_ema_last_observed_interval_cycles", g_vclock_lane.ema_last_observed_interval_cycles);
+  p.add("vclock_ema_interval_cycles", g_vclock_lane.ema_interval_cycles);
+  p.add("vclock_ema_last_predicted_dwt", g_vclock_lane.ema_last_predicted_dwt);
+  p.add("vclock_ema_last_error_cycles", g_vclock_lane.ema_last_error_cycles);
+  p.add("vclock_ema_max_abs_error_cycles", g_vclock_lane.ema_max_abs_error_cycles);
   p.add("vclock_ch2_one_second_enabled", g_vclock_ch2_one_second_enabled);
   p.add("vclock_ch2_one_second_next_counter32", g_vclock_ch2_one_second_next_counter32);
   p.add("vclock_ch2_one_second_epoch_enable_count", g_vclock_ch2_one_second_epoch_enable_count);
@@ -8499,6 +8679,12 @@ static Payload cmd_report(const Payload&) {
   p.add("vclock_irq_count", g_vclock_lane.irq_count);
   p.add("vclock_miss_count", g_vclock_lane.miss_count);
   p.add("vclock_linear_regression_enabled", VCLOCK_LINEAR_REGRESSION_ENABLED);
+  p.add("vclock_ema_dwt_authority_enabled", VCLOCK_EMA_DWT_AUTHORITY_ENABLED);
+  p.add("vclock_ema_initialized", g_vclock_lane.ema_initialized);
+  p.add("vclock_ema_update_count", g_vclock_lane.ema_update_count);
+  p.add("vclock_ema_interval_cycles", g_vclock_lane.ema_interval_cycles);
+  p.add("vclock_ema_last_error_cycles", g_vclock_lane.ema_last_error_cycles);
+  p.add("vclock_ema_max_abs_error_cycles", g_vclock_lane.ema_max_abs_error_cycles);
   p.add("vclock_fact_ring_size", VCLOCK_PERISHABLE_FACT_RING_SIZE);
   p.add("vclock_fact_enqueue_count", g_vclock_fact_ring.enqueue_count);
   p.add("vclock_fact_drain_count", g_vclock_fact_ring.drain_count);

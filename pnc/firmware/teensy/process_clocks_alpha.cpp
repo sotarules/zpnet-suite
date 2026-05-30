@@ -107,8 +107,16 @@ static volatile bool g_epoch_initialized = false;
 // short transaction so they cannot observe half-rebased Alpha state.
 static volatile bool g_alpha_epoch_install_in_progress = false;
 
-// Last VCLOCK event DWT, retained only for PPS-vs-VCLOCK phase diagnostics.
+// Last VCLOCK event DWT, retained only for PPS-vs-VCLOCK diagnostics.
+//
+// g_prev_dwt_at_vclock_event is the authored subscriber DWT.  After VCLOCK EMA
+// authority, that value is intentionally synthetic/smoothed and remains the
+// correct timing ruler.  PPS→VCLOCK physical phase, however, must be computed
+// from the observed/original VCLOCK DWT carried in interrupt diagnostics, not
+// from the authored EMA coordinate.
 static volatile uint32_t g_prev_dwt_at_vclock_event = 0;
+static volatile bool     g_prev_observed_dwt_at_vclock_event_valid = false;
+static volatile uint32_t g_prev_observed_dwt_at_vclock_event = 0;
 
 // ── Canonical one-second subtraction state for DWT cycles between PPS/VCLOCK anchors ──
 //
@@ -2485,6 +2493,8 @@ static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
   g_dwt_calibration_valid = saved_dwt_calibration_valid;
   g_counter32_at_pps_vclock = 0;
   g_prev_dwt_at_vclock_event = 0;
+  g_prev_observed_dwt_at_vclock_event_valid = false;
+  g_prev_observed_dwt_at_vclock_event = 0;
   g_prev_pps_vclock_dwt_at_edge = 0;
   g_prev_pps_vclock_dwt_at_edge_valid = false;
   g_pps_dwt_at_edge = 0;
@@ -3006,6 +3016,11 @@ static void vclock_callback(const interrupt_event_t& event,
 
   g_vclock_event_count++;
   g_prev_dwt_at_vclock_event = event.dwt_at_event;
+  g_prev_observed_dwt_at_vclock_event =
+      (diag && diag->dwt_original_at_event != 0)
+          ? diag->dwt_original_at_event
+          : event.dwt_at_event;
+  g_prev_observed_dwt_at_vclock_event_valid = true;
 
   clocks_apply_epoch_counter_edge(g_vclock_clock,
                                   g_vclock_measurement,
@@ -3059,9 +3074,19 @@ static void publish_pps_witness_diag(const pps_edge_snapshot_t& snap) {
     g_pps_dwt_cycles_between_edges_valid = false;
   }
 
+  // Phase is a physical diagnostic, not timing authority.  After VCLOCK
+  // EMA authority, snap.dwt_at_edge is the authored/smoothed PPS_VCLOCK DWT.
+  // Use the observed/original VCLOCK DWT from the interrupt diagnostic path
+  // when available so phase remains a real PPS↔VCLOCK hardware measurement.
+  const uint32_t observed_vclock_dwt_for_phase =
+      g_prev_observed_dwt_at_vclock_event_valid
+          ? g_prev_observed_dwt_at_vclock_event
+          : snap.dwt_at_edge;
+
   g_pps_vclock_phase_cycles =
-      (int32_t)alpha_pps_vclock_phase_cycles_from_edges(physical_pps_dwt,
-                                                        snap.dwt_at_edge);
+      (int32_t)alpha_pps_vclock_phase_cycles_from_edges(
+          physical_pps_dwt,
+          observed_vclock_dwt_for_phase);
   g_prev_pps_dwt_at_edge = physical_pps_dwt;
   g_prev_pps_dwt_at_edge_valid = true;
 
@@ -3074,7 +3099,9 @@ static void publish_pps_witness_diag(const pps_edge_snapshot_t& snap) {
           : 0;
 
   const uint32_t dwt_cycles_from_vclock =
-      snap.dwt_at_edge - g_prev_dwt_at_vclock_event;
+      g_prev_observed_dwt_at_vclock_event_valid
+          ? (uint32_t)(observed_vclock_dwt_for_phase - physical_pps_dwt)
+          : (uint32_t)(snap.dwt_at_edge - g_prev_dwt_at_vclock_event);
   int64_t ns_from_vclock = 0;
   const uint32_t dwt_per_sec = dwt_effective_cycles_per_pps_vclock_second();
   if (dwt_per_sec > 0) {
