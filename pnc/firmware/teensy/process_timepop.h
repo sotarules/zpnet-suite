@@ -89,6 +89,18 @@
 //   lane under PRIMASK and sets the dispatch-pending bit.  ASAP drains before
 //   timed scheduled-context slots; ALAP drains after timed slots.
 //
+//   ASAP/ALAP callbacks are normal scheduled-context code and may call the
+//   public timed TimePop arm/cancel APIs.  TimePop serializes those requests
+//   internally: while a dispatch pass is running, timed-slot arms/cancels are
+//   copied into a fixed, allocation-free mutation queue and applied at dispatch
+//   barriers immediately after the current callback returns.  Clients do not
+//   need to know whether they are running inside ASAP, ALAP, or an ordinary
+//   timed scheduled callback.  The active timed-slot table and CH2 compare
+//   target are mutated only at those safe barriers, never while user callback
+//   code is still on the stack.  Cancel operations are idempotent at the
+//   mutation barrier: cancelling an already-absent handle or name is a
+//   successful no-op, not a scheduler failure.
+//
 //   Critical recurring ISR clients are the white-glove exception for tiny
 //   substrate-maintenance work.  They are still ordinary TimePop slots and
 //   share CH2 fire facts, but their callbacks and recurring rearm happen

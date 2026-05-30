@@ -324,21 +324,26 @@ static constexpr uint32_t INTERRUPT_STEP0_EXPECTED_QTIMER3_PRIORITY  = 16;
 static constexpr uint32_t INTERRUPT_STEP0_EXPECTED_GPIO6789_PRIORITY = 0;
 
 // ============================================================================
-// SpinCatch step 4 — approach planner only
+// SpinCatch step 5 — OCXO1 landing-only
 // ============================================================================
 //
-// This checkpoint keeps the Step 3 passive ISR hook and adds only report-time
-// target/approach planning.  No lane arms TimePop work, no foreground spin loop
-// runs, no compare register is mutated by SpinCatch, and interrupt_capture_diag_t
-// remains unchanged.  The planner reports the already-authored lane target and
-// the synthetic 5 us approach coordinate that later steps may use.
+// This checkpoint keeps the Step 4 planner surface and enables only a low-duty
+// OCXO1 TimePop landing callback.  The callback records the DWT/counter32 at
+// the planned 5 us approach point and immediately returns.  It does not spin,
+// does not reprogram or clear any OCXO compare register, does not alter event
+// DWT authority, and does not expand interrupt_capture_diag_t.
 
 static constexpr bool SPINCATCH_REPORT_SHELL_SUPPORTED = true;
-static constexpr bool SPINCATCH_RUNTIME_ENABLED = false;
 static constexpr bool SPINCATCH_PLANNER_ENABLED = true;
-static constexpr const char* SPINCATCH_REPORT_MODE = "APPROACH_PLANNER_ONLY";
+static constexpr bool SPINCATCH_VCLOCK_ENABLED = false;
+static constexpr bool SPINCATCH_OCXO1_LANDING_ONLY_ENABLED = true;
+static constexpr bool SPINCATCH_OCXO2_ENABLED = false;
+static constexpr const char* SPINCATCH_REPORT_MODE = "OCXO1_LANDING_ONLY_NO_SPIN";
 static constexpr uint32_t SPINCATCH_APPROACH_US = 5U;
 static constexpr uint32_t SPINCATCH_APPROACH_TICKS = SPINCATCH_APPROACH_US * 10U;
+static constexpr uint32_t SPINCATCH_OCXO1_LANDING_DUTY_DIVISOR = 16U;
+static constexpr uint32_t SPINCATCH_LANDING_MIN_LEAD_TICKS = 128U;
+static constexpr const char* SPINCATCH_OCXO1_LANDING_NAME = "SPINCATCH_OCXO1_LANDING";
 static_assert(SPINCATCH_APPROACH_TICKS == 50U,
               "SpinCatch 5 us approach must be 50 ticks at 10 MHz");
 
@@ -1451,16 +1456,15 @@ static volatile interrupt_pps_entry_latency_handler_fn
 
 struct spincatch_lane_report_t {
   bool supported = SPINCATCH_REPORT_SHELL_SUPPORTED;
-  bool enabled = SPINCATCH_RUNTIME_ENABLED;
+  bool enabled = false;
   bool planner_enabled = SPINCATCH_PLANNER_ENABLED;
   uint32_t success_count = 0;
   uint32_t missed_count = 0;
   uint32_t timeout_count = 0;
   uint32_t clash_count = 0;
 
-  // Step 4 planner-only surface.  These fields are computed from already-
-  // authored lane targets when reports are requested.  They do not schedule,
-  // arm, spin, alter compare registers, or enter subscriber diagnostics.
+  // Planner surface.  These fields are computed from already-authored lane
+  // targets.  They do not alter compare registers or event authority.
   bool     planner_valid = false;
   uint32_t planner_count = 0;
   uint32_t planner_skip_count = 0;
@@ -1473,18 +1477,67 @@ struct spincatch_lane_report_t {
   uint32_t approach_dwt_cycles = 0;
   uint32_t now_counter32 = 0;
   uint32_t ticks_until_target = 0;
+
+  // Step 5 landing-only surface.  OCXO1 may schedule one low-duty TimePop
+  // landing callback that records its landing facts and returns immediately.
+  bool     landing_only_enabled = false;
+  bool     landing_pending = false;
+  bool     landing_last_success = false;
+  bool     landing_last_target_changed = false;
+  uint32_t landing_duty_divisor = 0;
+  uint32_t landing_duty_counter = 0;
+  uint32_t landing_schedule_count = 0;
+  uint32_t landing_schedule_skip_count = 0;
+  uint32_t landing_schedule_fail_count = 0;
+  uint32_t landing_count = 0;
+  uint32_t landing_too_close_count = 0;
+  uint32_t landing_target_changed_count = 0;
+  uint32_t landing_target_counter32 = 0;
+  uint16_t landing_target_low16 = 0;
+  uint32_t landing_scheduled_counter32 = 0;
+  uint32_t landing_scheduled_ticks_until_target = 0;
+  uint64_t landing_scheduled_delay_ns = 0;
+  uint32_t landing_scheduled_dwt = 0;
+  uint32_t landing_dwt = 0;
+  uint32_t landing_counter32 = 0;
+  int32_t  landing_offset_ticks = 0;
+  uint32_t landing_ticks_until_target = 0;
+  uint32_t landing_fire_vclock_raw = 0;
+  uint32_t landing_fire_dwt = 0;
+  timepop_handle_t landing_handle = TIMEPOP_INVALID_HANDLE;
 };
 
 static spincatch_lane_report_t g_spincatch_vclock = {};
 static spincatch_lane_report_t g_spincatch_ocxo1 = {};
 static spincatch_lane_report_t g_spincatch_ocxo2 = {};
 
-// Active-token flags are deliberately never armed in Step 4.  They are volatile
-// so the passive ISR hook remains a real hot-path read without allowing the
-// compiler to fold the hook away as unreachable.
+// Active-token flags are deliberately not armed in Step 5.  Landing-only does
+// not use the shadow handoff yet; it only schedules a foreground callback.
 static volatile bool g_spincatch_vclock_capture_active = false;
 static volatile bool g_spincatch_ocxo1_capture_active = false;
 static volatile bool g_spincatch_ocxo2_capture_active = false;
+
+struct spincatch_landing_context_t {
+  interrupt_subscriber_kind_t kind = interrupt_subscriber_kind_t::NONE;
+};
+
+static spincatch_landing_context_t g_spincatch_ocxo1_landing_context = {
+  interrupt_subscriber_kind_t::OCXO1
+};
+
+static bool spincatch_enabled_for_kind(interrupt_subscriber_kind_t kind) {
+  if (kind == interrupt_subscriber_kind_t::VCLOCK) return SPINCATCH_VCLOCK_ENABLED;
+  if (kind == interrupt_subscriber_kind_t::OCXO1) return SPINCATCH_OCXO1_LANDING_ONLY_ENABLED;
+  if (kind == interrupt_subscriber_kind_t::OCXO2) return SPINCATCH_OCXO2_ENABLED;
+  return false;
+}
+
+static uint32_t spincatch_landing_duty_for_kind(interrupt_subscriber_kind_t kind) {
+  if (kind == interrupt_subscriber_kind_t::OCXO1) {
+    return SPINCATCH_OCXO1_LANDING_DUTY_DIVISOR;
+  }
+  return 0U;
+}
 
 static spincatch_lane_report_t* spincatch_report_for_kind(
     interrupt_subscriber_kind_t kind) {
@@ -1515,8 +1568,8 @@ static inline void spincatch_note_isr_entry(
     return;
   }
 
-  // No lane can reach this branch in Step 4.  Future steps will install the
-  // shadow capture handoff here after the planner-only rung is proven stable.
+  // No lane can reach this branch in Step 5.  Future steps will install the
+  // shadow capture handoff here after landing-only is proven stable.
   (void)target_counter32;
   (void)target_low16;
   (void)isr_entry_dwt_raw;
@@ -1526,6 +1579,13 @@ static void spincatch_report_reset_all(void) {
   g_spincatch_vclock = spincatch_lane_report_t{};
   g_spincatch_ocxo1 = spincatch_lane_report_t{};
   g_spincatch_ocxo2 = spincatch_lane_report_t{};
+
+  g_spincatch_vclock.enabled = spincatch_enabled_for_kind(interrupt_subscriber_kind_t::VCLOCK);
+  g_spincatch_ocxo1.enabled = spincatch_enabled_for_kind(interrupt_subscriber_kind_t::OCXO1);
+  g_spincatch_ocxo2.enabled = spincatch_enabled_for_kind(interrupt_subscriber_kind_t::OCXO2);
+  g_spincatch_ocxo1.landing_only_enabled = SPINCATCH_OCXO1_LANDING_ONLY_ENABLED;
+  g_spincatch_ocxo1.landing_duty_divisor = SPINCATCH_OCXO1_LANDING_DUTY_DIVISOR;
+
   g_spincatch_vclock_capture_active = false;
   g_spincatch_ocxo1_capture_active = false;
   g_spincatch_ocxo2_capture_active = false;
@@ -4861,6 +4921,165 @@ static uint32_t ocxo_lane_ema_predict_dwt(ocxo_lane_t& lane,
   return predicted;
 }
 
+static bool spincatch_current_target_for_kind(interrupt_subscriber_kind_t kind,
+                                              uint32_t& target_counter32) {
+  target_counter32 = 0;
+
+  ocxo_runtime_context_t* ctx = ocxo_context_for(kind);
+  if (!ctx || !ctx->lane) return false;
+
+  const ocxo_lane_t& lane = *ctx->lane;
+  if (!lane.initialized || !lane.cadence_enabled ||
+      !lane.witness_target_initialized || lane.cadence_next_counter32 == 0) {
+    return false;
+  }
+
+  target_counter32 = lane.cadence_next_counter32;
+  return true;
+}
+
+static void spincatch_landing_callback(timepop_ctx_t* ctx,
+                                       timepop_diag_t*,
+                                       void* user_data) {
+  auto* landing_ctx = static_cast<spincatch_landing_context_t*>(user_data);
+  if (!landing_ctx) return;
+
+  spincatch_lane_report_t* s = spincatch_report_for_kind(landing_ctx->kind);
+  if (!s) return;
+
+  s->landing_pending = false;
+  s->landing_handle = TIMEPOP_INVALID_HANDLE;
+  s->landing_count++;
+
+  interrupt_clock_snapshot_t snap{};
+  const bool snap_ok = interrupt_clock_snapshot(landing_ctx->kind, &snap);
+
+  const uint32_t landing_counter32 = snap_ok ? snap.counter32 : 0U;
+  const uint32_t target_counter32 = s->landing_target_counter32;
+  uint32_t current_target = 0;
+  const bool current_target_ok =
+      spincatch_current_target_for_kind(landing_ctx->kind, current_target);
+  const bool target_still_current =
+      current_target_ok && current_target == target_counter32;
+
+  const int32_t signed_until_target =
+      (int32_t)(target_counter32 - landing_counter32);
+  const bool before_target = signed_until_target > 0;
+  const bool success = snap_ok && target_still_current && before_target;
+
+  s->landing_last_success = success;
+  s->landing_last_target_changed = !target_still_current;
+  s->landing_dwt = (ctx && ctx->fire_dwt_cyccnt != 0)
+      ? ctx->fire_dwt_cyccnt
+      : ARM_DWT_CYCCNT;
+  s->landing_counter32 = landing_counter32;
+  s->landing_offset_ticks = (int32_t)(landing_counter32 - target_counter32);
+  s->landing_ticks_until_target = before_target ? (uint32_t)signed_until_target : 0U;
+  s->landing_fire_vclock_raw = ctx ? ctx->fire_vclock_raw : 0U;
+  s->landing_fire_dwt = ctx ? ctx->fire_dwt_cyccnt : 0U;
+
+  if (success) {
+    s->success_count++;
+  } else {
+    s->missed_count++;
+    if (!target_still_current) {
+      s->landing_target_changed_count++;
+    }
+  }
+}
+
+static void spincatch_maybe_schedule_ocxo1_landing(
+    ocxo_runtime_context_t& ctx,
+    const interrupt_perishable_fact_t& fact) {
+  if (!SPINCATCH_OCXO1_LANDING_ONLY_ENABLED) return;
+  if (ctx.kind != interrupt_subscriber_kind_t::OCXO1) return;
+  if (!fact.one_second_due) return;
+  if (!ctx.lane || !ctx.clock32) return;
+
+  spincatch_lane_report_t* s = spincatch_report_for_kind(ctx.kind);
+  if (!s) return;
+
+  s->enabled = true;
+  s->landing_only_enabled = true;
+  s->landing_duty_divisor = SPINCATCH_OCXO1_LANDING_DUTY_DIVISOR;
+  s->landing_duty_counter++;
+
+  if (s->landing_pending) {
+    uint32_t current_target = 0;
+    const bool current_target_ok =
+        spincatch_current_target_for_kind(ctx.kind, current_target);
+    if (!current_target_ok || current_target != s->landing_target_counter32) {
+      // The TimePop landing callback did not arrive before the OCXO target
+      // advanced.  Clear the token here so one missed one-shot cannot poison
+      // the lane indefinitely.
+      s->landing_pending = false;
+      s->landing_handle = TIMEPOP_INVALID_HANDLE;
+      s->landing_last_success = false;
+      s->landing_last_target_changed = true;
+      s->landing_target_changed_count++;
+      s->missed_count++;
+    } else {
+      s->landing_schedule_skip_count++;
+      s->clash_count++;
+      return;
+    }
+  }
+
+  const uint32_t duty = spincatch_landing_duty_for_kind(ctx.kind);
+  if (duty != 0 && (s->landing_duty_counter % duty) != 0) {
+    s->landing_schedule_skip_count++;
+    return;
+  }
+
+  const ocxo_lane_t& lane = *ctx.lane;
+  const bool target_valid =
+      lane.initialized && lane.cadence_enabled &&
+      lane.witness_target_initialized && lane.cadence_next_counter32 != 0;
+  if (!target_valid) {
+    s->landing_schedule_skip_count++;
+    return;
+  }
+
+  interrupt_clock_snapshot_t snap{};
+  if (!interrupt_clock_snapshot(ctx.kind, &snap)) {
+    s->landing_schedule_skip_count++;
+    return;
+  }
+
+  const uint32_t target_counter32 = lane.cadence_next_counter32;
+  const uint32_t remaining_ticks = target_counter32 - snap.counter32;
+  if (remaining_ticks == 0 || remaining_ticks > 0x7FFFFFFFUL ||
+      remaining_ticks <= (SPINCATCH_APPROACH_TICKS + SPINCATCH_LANDING_MIN_LEAD_TICKS)) {
+    s->landing_too_close_count++;
+    s->landing_schedule_skip_count++;
+    return;
+  }
+
+  const uint32_t delay_ticks = remaining_ticks - SPINCATCH_APPROACH_TICKS;
+  const uint64_t delay_ns = (uint64_t)delay_ticks * 100ULL;
+
+  const timepop_handle_t h =
+      timepop_arm(delay_ns,
+                  false,
+                  spincatch_landing_callback,
+                  &g_spincatch_ocxo1_landing_context,
+                  SPINCATCH_OCXO1_LANDING_NAME);
+  if (h == TIMEPOP_INVALID_HANDLE) {
+    s->landing_schedule_fail_count++;
+    return;
+  }
+
+  s->landing_handle = h;
+  s->landing_pending = true;
+  s->landing_schedule_count++;
+  s->landing_target_counter32 = target_counter32;
+  s->landing_target_low16 = lane.cadence_next_low16;
+  s->landing_scheduled_counter32 = snap.counter32;
+  s->landing_scheduled_ticks_until_target = remaining_ticks;
+  s->landing_scheduled_delay_ns = delay_ns;
+  s->landing_scheduled_dwt = ARM_DWT_CYCCNT;
+}
+
 static void ocxo_apply_perishable_fact_deferred(
     ocxo_runtime_context_t& ctx,
     const interrupt_perishable_fact_t& fact) {
@@ -5011,6 +5230,11 @@ static void ocxo_apply_perishable_fact_deferred(
                         &ema_diag,
                         true,
                         nullptr);
+
+  // Step 5: schedule at most one low-duty OCXO1 landing-only callback for the
+  // next already-authored one-second target.  This records the TimePop landing
+  // facts only; it never touches the OCXO compare hardware.
+  spincatch_maybe_schedule_ocxo1_landing(ctx, fact);
 }
 
 static void ocxo_fact_drain_callback(timepop_ctx_t*,
@@ -6626,6 +6850,31 @@ static void add_spincatch_report_payload(Payload& p,
   p.add("spincatch_approach_dwt_cycles", s ? s->approach_dwt_cycles : 0U);
   p.add("spincatch_now_counter32", s ? s->now_counter32 : 0U);
   p.add("spincatch_ticks_until_target", s ? s->ticks_until_target : 0U);
+
+  p.add("spincatch_landing_only_enabled", s ? s->landing_only_enabled : false);
+  p.add("spincatch_landing_pending", s ? s->landing_pending : false);
+  p.add("spincatch_landing_last_success", s ? s->landing_last_success : false);
+  p.add("spincatch_landing_last_target_changed", s ? s->landing_last_target_changed : false);
+  p.add("spincatch_landing_duty_divisor", s ? s->landing_duty_divisor : 0U);
+  p.add("spincatch_landing_duty_counter", s ? s->landing_duty_counter : 0U);
+  p.add("spincatch_landing_schedule_count", s ? s->landing_schedule_count : 0U);
+  p.add("spincatch_landing_schedule_skip_count", s ? s->landing_schedule_skip_count : 0U);
+  p.add("spincatch_landing_schedule_fail_count", s ? s->landing_schedule_fail_count : 0U);
+  p.add("spincatch_landing_count", s ? s->landing_count : 0U);
+  p.add("spincatch_landing_too_close_count", s ? s->landing_too_close_count : 0U);
+  p.add("spincatch_landing_target_changed_count", s ? s->landing_target_changed_count : 0U);
+  p.add("spincatch_landing_target_counter32", s ? s->landing_target_counter32 : 0U);
+  p.add("spincatch_landing_target_low16", s ? (uint32_t)s->landing_target_low16 : 0U);
+  p.add("spincatch_landing_scheduled_counter32", s ? s->landing_scheduled_counter32 : 0U);
+  p.add("spincatch_landing_scheduled_ticks_until_target", s ? s->landing_scheduled_ticks_until_target : 0U);
+  p.add("spincatch_landing_scheduled_delay_ns", s ? s->landing_scheduled_delay_ns : 0ULL);
+  p.add("spincatch_landing_scheduled_dwt", s ? s->landing_scheduled_dwt : 0U);
+  p.add("spincatch_landing_dwt", s ? s->landing_dwt : 0U);
+  p.add("spincatch_landing_counter32", s ? s->landing_counter32 : 0U);
+  p.add("spincatch_landing_offset_ticks", s ? s->landing_offset_ticks : 0);
+  p.add("spincatch_landing_ticks_until_target", s ? s->landing_ticks_until_target : 0U);
+  p.add("spincatch_landing_fire_vclock_raw", s ? s->landing_fire_vclock_raw : 0U);
+  p.add("spincatch_landing_fire_dwt", s ? s->landing_fire_dwt : 0U);
 }
 
 static void add_isr_sanity_payload(Payload& p,

@@ -113,6 +113,7 @@
 static constexpr uint32_t MAX_SLOTS = 16;
 static constexpr uint32_t MAX_ASAP_SLOTS = 8;
 static constexpr uint32_t MAX_ALAP_SLOTS = 4;
+static constexpr uint32_t MAX_DISPATCH_MUTATIONS = 24;
 static constexpr uint64_t NS_PER_TICK = 100ULL;
 static constexpr uint32_t MAX_DELAY_TICKS = 0x7FFFFFFFU;
 static constexpr uint32_t MIN_DELAY_TICKS = 2;
@@ -328,6 +329,79 @@ struct deferred_slot_t {
 };
 
 // ============================================================================
+// Dispatch-time timed-slot mutation barrier
+// ============================================================================
+//
+// Public timed TimePop APIs are valid from scheduled-context callbacks,
+// including ASAP and ALAP. During a dispatch pass, user callbacks must not
+// directly mutate the active timed-slot table or reprogram CH2 while TimePop
+// is walking callback state. Such requests are copied into this fixed,
+// allocation-free mutation queue and applied at explicit dispatch barriers
+// immediately after the current callback returns.
+//
+// Deferred ASAP/ALAP arming remains immediate because those lanes are fixed
+// mailboxes, not timed slots, and do not call schedule_next().
+
+enum class timepop_dispatch_phase_t : uint8_t {
+  IDLE = 0,
+  ASAP,
+  TIMED,
+  ALAP,
+  APPLYING_MUTATIONS,
+};
+
+static const char* dispatch_phase_str(timepop_dispatch_phase_t phase) {
+  switch (phase) {
+    case timepop_dispatch_phase_t::ASAP: return "ASAP";
+    case timepop_dispatch_phase_t::TIMED: return "TIMED";
+    case timepop_dispatch_phase_t::ALAP: return "ALAP";
+    case timepop_dispatch_phase_t::APPLYING_MUTATIONS: return "APPLYING_MUTATIONS";
+    default: return "IDLE";
+  }
+}
+
+enum class timepop_dispatch_mutation_kind_t : uint8_t {
+  NONE = 0,
+  ARM_RELATIVE,
+  ARM_ABSOLUTE,
+  ARM_ANCHORED_ISR,
+  ARM_ANCHORED_ISR_COUNTER32,
+  CANCEL_HANDLE,
+  CANCEL_NAME,
+};
+
+static const char* dispatch_mutation_kind_str(timepop_dispatch_mutation_kind_t kind) {
+  switch (kind) {
+    case timepop_dispatch_mutation_kind_t::ARM_RELATIVE: return "ARM_RELATIVE";
+    case timepop_dispatch_mutation_kind_t::ARM_ABSOLUTE: return "ARM_ABSOLUTE";
+    case timepop_dispatch_mutation_kind_t::ARM_ANCHORED_ISR: return "ARM_ANCHORED_ISR";
+    case timepop_dispatch_mutation_kind_t::ARM_ANCHORED_ISR_COUNTER32: return "ARM_ANCHORED_ISR_COUNTER32";
+    case timepop_dispatch_mutation_kind_t::CANCEL_HANDLE: return "CANCEL_HANDLE";
+    case timepop_dispatch_mutation_kind_t::CANCEL_NAME: return "CANCEL_NAME";
+    default: return "NONE";
+  }
+}
+
+struct timepop_dispatch_mutation_t {
+  timepop_dispatch_mutation_kind_t kind = timepop_dispatch_mutation_kind_t::NONE;
+  timepop_handle_t reserved_handle = TIMEPOP_INVALID_HANDLE;
+  timepop_handle_t cancel_handle = TIMEPOP_INVALID_HANDLE;
+
+  uint64_t ns0 = 0;       // delay_ns / period_ns / recurring period
+  int64_t  gnss0 = -1;    // target_gnss_ns / base_gnss_ns
+  uint32_t u32_0 = 0;     // target_dwt / base_counter32
+
+  bool recurring = false;
+  bool isr_callback = false;
+  bool rearm_in_isr = false;
+  timepop_callback_t callback = nullptr;
+  void* user_data = nullptr;
+  const char* name = nullptr;
+  timepop_priority_t priority = TIMEPOP_PRIORITY_DEFAULT;
+  timepop_dispatch_phase_t queued_phase = timepop_dispatch_phase_t::IDLE;
+};
+
+// ============================================================================
 // State
 // ============================================================================
 
@@ -336,6 +410,12 @@ static deferred_slot_t asap_slots[MAX_ASAP_SLOTS];
 static deferred_slot_t alap_slots[MAX_ALAP_SLOTS];
 static volatile bool   timepop_pending = false;
 static uint32_t        next_handle = 1;
+
+static timepop_dispatch_mutation_t dispatch_mutations[MAX_DISPATCH_MUTATIONS];
+static volatile uint32_t dispatch_mutation_count = 0;
+static volatile uint32_t dispatch_depth = 0;
+static volatile timepop_dispatch_phase_t dispatch_phase = timepop_dispatch_phase_t::IDLE;
+static volatile bool dispatch_applying_mutations = false;
 
 // ============================================================================
 // Diagnostics
@@ -373,6 +453,27 @@ static volatile uint32_t diag_alap_arm_while_dispatching = 0;
 
 static volatile uint32_t diag_dispatch_calls     = 0;
 static volatile uint32_t diag_dispatch_callbacks = 0;
+
+static volatile uint32_t diag_dispatch_depth_max = 0;
+static volatile uint32_t diag_dispatch_mutation_queued = 0;
+static volatile uint32_t diag_dispatch_mutation_applied = 0;
+static volatile uint32_t diag_dispatch_mutation_apply_failures = 0;
+static volatile uint32_t diag_dispatch_mutation_overflow = 0;
+static volatile uint32_t diag_dispatch_mutation_high_water = 0;
+static volatile uint32_t diag_dispatch_mutation_apply_passes = 0;
+static volatile uint32_t diag_dispatch_mutation_schedule_next_calls = 0;
+static volatile const char* diag_dispatch_mutation_last_kind = nullptr;
+static volatile const char* diag_dispatch_mutation_last_context = nullptr;
+static volatile const char* diag_dispatch_mutation_last_phase = nullptr;
+static volatile uint32_t diag_dispatch_mutation_last_handle = 0;
+static volatile uint32_t diag_dispatch_mutation_last_queue_depth = 0;
+static volatile uint32_t diag_dispatch_timed_arm_queued = 0;
+static volatile uint32_t diag_dispatch_cancel_queued = 0;
+static volatile uint32_t diag_dispatch_mutation_coalesced = 0;
+static volatile uint32_t diag_dispatch_mutation_cancel_applied = 0;
+static volatile uint32_t diag_dispatch_mutation_cancel_noop = 0;
+static volatile uint32_t diag_dispatch_mutation_cancel_failures = 0;
+static volatile uint32_t diag_dispatch_mutation_arm_failures = 0;
 
 static volatile uint32_t diag_isr_count          = 0;
 static volatile uint32_t diag_rearm_count        = 0;
@@ -776,14 +877,16 @@ static timepop_handle_t arm_anchored_recurring_isr_internal(int64_t base_gnss_ns
                                                             timepop_callback_t callback,
                                                             void* user_data,
                                                             const char* name,
-                                                            timepop_priority_t priority);
+                                                            timepop_priority_t priority,
+                                                            timepop_handle_t forced_handle = TIMEPOP_INVALID_HANDLE);
 static timepop_handle_t arm_anchored_recurring_isr_from_counter32_internal(int64_t base_gnss_ns,
                                                                            uint32_t base_counter32,
                                                                            uint64_t period_gnss_ns,
                                                                            timepop_callback_t callback,
                                                                            void* user_data,
                                                                            const char* name,
-                                                                           timepop_priority_t priority);
+                                                                           timepop_priority_t priority,
+                                                                           timepop_handle_t forced_handle = TIMEPOP_INVALID_HANDLE);
 static timepop_handle_t arm_absolute_slot_internal(int64_t target_gnss_ns,
                                                    bool recurring,
                                                    uint64_t recurring_period_gnss_ns,
@@ -792,7 +895,8 @@ static timepop_handle_t arm_absolute_slot_internal(int64_t target_gnss_ns,
                                                    const char* name,
                                                    bool isr_callback,
                                                    uint32_t target_dwt,
-                                                   timepop_priority_t priority);
+                                                   timepop_priority_t priority,
+                                                   timepop_handle_t forced_handle = TIMEPOP_INVALID_HANDLE);
 static timepop_handle_t arm_relative_slot_internal(uint64_t delay_gnss_ns,
                                                    bool recurring,
                                                    timepop_callback_t callback,
@@ -800,7 +904,481 @@ static timepop_handle_t arm_relative_slot_internal(uint64_t delay_gnss_ns,
                                                    const char* name,
                                                    bool isr_callback,
                                                    bool rearm_in_isr,
-                                                   timepop_priority_t priority);
+                                                   timepop_priority_t priority,
+                                                   timepop_handle_t forced_handle = TIMEPOP_INVALID_HANDLE);
+
+static bool timepop_should_queue_dispatch_mutation(void);
+static timepop_handle_t queue_dispatch_relative_arm(uint64_t delay_gnss_ns,
+                                                    bool recurring,
+                                                    timepop_callback_t callback,
+                                                    void* user_data,
+                                                    const char* name,
+                                                    bool isr_callback,
+                                                    bool rearm_in_isr,
+                                                    timepop_priority_t priority);
+static timepop_handle_t queue_dispatch_absolute_arm(int64_t target_gnss_ns,
+                                                    bool recurring,
+                                                    uint64_t recurring_period_gnss_ns,
+                                                    timepop_callback_t callback,
+                                                    void* user_data,
+                                                    const char* name,
+                                                    bool isr_callback,
+                                                    uint32_t target_dwt,
+                                                    timepop_priority_t priority);
+static timepop_handle_t queue_dispatch_anchored_isr_arm(int64_t base_gnss_ns,
+                                                        uint64_t period_gnss_ns,
+                                                        timepop_callback_t callback,
+                                                        void* user_data,
+                                                        const char* name,
+                                                        timepop_priority_t priority);
+static timepop_handle_t queue_dispatch_anchored_isr_counter32_arm(int64_t base_gnss_ns,
+                                                                  uint32_t base_counter32,
+                                                                  uint64_t period_gnss_ns,
+                                                                  timepop_callback_t callback,
+                                                                  void* user_data,
+                                                                  const char* name,
+                                                                  timepop_priority_t priority);
+static bool queue_dispatch_cancel_handle(timepop_handle_t handle);
+static bool queue_dispatch_cancel_name(const char* name);
+static void timepop_dispatch_enter(timepop_dispatch_phase_t phase);
+static void timepop_dispatch_set_phase(timepop_dispatch_phase_t phase);
+static void timepop_dispatch_leave(void);
+static void timepop_apply_dispatch_mutations(const char* context);
+
+// ============================================================================
+// Dispatch-time mutation barrier helpers
+// ============================================================================
+
+static bool timepop_should_queue_dispatch_mutation(void) {
+  return dispatch_depth != 0 && !dispatch_applying_mutations;
+}
+
+static void timepop_dispatch_enter(timepop_dispatch_phase_t phase) {
+  const uint32_t saved = critical_enter();
+  dispatch_depth++;
+  if (dispatch_depth > diag_dispatch_depth_max) {
+    diag_dispatch_depth_max = dispatch_depth;
+  }
+  dispatch_phase = phase;
+  critical_exit(saved);
+}
+
+static void timepop_dispatch_set_phase(timepop_dispatch_phase_t phase) {
+  const uint32_t saved = critical_enter();
+  dispatch_phase = phase;
+  critical_exit(saved);
+}
+
+static void timepop_dispatch_leave(void) {
+  const uint32_t saved = critical_enter();
+  if (dispatch_depth != 0) dispatch_depth--;
+  if (dispatch_depth == 0) dispatch_phase = timepop_dispatch_phase_t::IDLE;
+  critical_exit(saved);
+}
+
+
+static bool dispatch_mutation_is_arm(timepop_dispatch_mutation_kind_t kind) {
+  return kind == timepop_dispatch_mutation_kind_t::ARM_RELATIVE ||
+         kind == timepop_dispatch_mutation_kind_t::ARM_ABSOLUTE ||
+         kind == timepop_dispatch_mutation_kind_t::ARM_ANCHORED_ISR ||
+         kind == timepop_dispatch_mutation_kind_t::ARM_ANCHORED_ISR_COUNTER32;
+}
+
+static bool dispatch_mutation_name_equals(const timepop_dispatch_mutation_t& m,
+                                          const char* name) {
+  if (!name || !*name || !m.name) return false;
+  return strcmp(m.name, name) == 0;
+}
+
+static void dispatch_mutation_remove_at_unlocked(uint32_t index) {
+  if (index >= dispatch_mutation_count) return;
+  for (uint32_t i = index + 1U; i < dispatch_mutation_count; i++) {
+    dispatch_mutations[i - 1U] = dispatch_mutations[i];
+  }
+  dispatch_mutation_count--;
+  dispatch_mutations[dispatch_mutation_count] = timepop_dispatch_mutation_t{};
+  diag_dispatch_mutation_last_queue_depth = dispatch_mutation_count;
+  diag_dispatch_mutation_coalesced++;
+}
+
+static void dispatch_mutation_coalesce_for_arm_unlocked(const char* name) {
+  if (!name || !*name) return;
+
+  // A queued ARM of a named timed slot performs the normal singleton
+  // replacement when applied, including retirement of an existing same-named
+  // timed slot and any pending same-named deferred request.  Therefore a
+  // queued CANCEL_NAME for the same name immediately before the ARM is
+  // redundant and only burns queue capacity.
+  for (int32_t i = (int32_t)dispatch_mutation_count - 1; i >= 0; i--) {
+    if (dispatch_mutations[i].kind == timepop_dispatch_mutation_kind_t::CANCEL_NAME &&
+        dispatch_mutation_name_equals(dispatch_mutations[i], name)) {
+      dispatch_mutation_remove_at_unlocked((uint32_t)i);
+    }
+  }
+}
+
+static void dispatch_mutation_coalesce_for_cancel_name_unlocked(const char* name) {
+  if (!name || !*name) return;
+
+  // CANCEL_NAME is idempotent.  If a same-named ARM is still queued but not yet
+  // installed, remove that ARM instead of queuing a future cancel for it.  This
+  // preserves the user's postcondition while preventing bursty cancel+arm
+  // traffic from exhausting the fixed mutation queue.  Duplicate same-name
+  // cancels also collapse to a single queued cancel.
+  for (int32_t i = (int32_t)dispatch_mutation_count - 1; i >= 0; i--) {
+    if (!dispatch_mutation_name_equals(dispatch_mutations[i], name)) continue;
+
+    if (dispatch_mutation_is_arm(dispatch_mutations[i].kind) ||
+        dispatch_mutations[i].kind == timepop_dispatch_mutation_kind_t::CANCEL_NAME) {
+      dispatch_mutation_remove_at_unlocked((uint32_t)i);
+    }
+  }
+}
+
+static bool dispatch_mutation_coalesce_for_cancel_handle_unlocked(timepop_handle_t handle) {
+  if (handle == TIMEPOP_INVALID_HANDLE) return false;
+
+  for (int32_t i = (int32_t)dispatch_mutation_count - 1; i >= 0; i--) {
+    if (!dispatch_mutation_is_arm(dispatch_mutations[i].kind)) continue;
+    if (dispatch_mutations[i].reserved_handle != handle) continue;
+
+    dispatch_mutation_remove_at_unlocked((uint32_t)i);
+    diag_dispatch_mutation_cancel_applied++;
+    return true;
+  }
+
+  return false;
+}
+
+static timepop_handle_t queue_dispatch_arm_mutation(timepop_dispatch_mutation_t m) {
+  if (!m.callback) return TIMEPOP_INVALID_HANDLE;
+
+  const uint32_t saved = critical_enter();
+  if (dispatch_mutation_count >= MAX_DISPATCH_MUTATIONS) {
+    diag_dispatch_mutation_overflow++;
+    diag_arm_failures++;
+    critical_exit(saved);
+    return TIMEPOP_INVALID_HANDLE;
+  }
+
+  dispatch_mutation_coalesce_for_arm_unlocked(m.name);
+
+  const timepop_handle_t h = allocate_handle_unlocked();
+  m.reserved_handle = h;
+  m.queued_phase = dispatch_phase;
+  dispatch_mutations[dispatch_mutation_count++] = m;
+  if (dispatch_mutation_count > diag_dispatch_mutation_high_water) {
+    diag_dispatch_mutation_high_water = dispatch_mutation_count;
+  }
+  diag_dispatch_mutation_queued++;
+  diag_dispatch_timed_arm_queued++;
+  diag_dispatch_mutation_last_kind = dispatch_mutation_kind_str(m.kind);
+  diag_dispatch_mutation_last_phase = dispatch_phase_str(m.queued_phase);
+  diag_dispatch_mutation_last_handle = h;
+  diag_dispatch_mutation_last_queue_depth = dispatch_mutation_count;
+  critical_exit(saved);
+  return h;
+}
+
+static bool queue_dispatch_non_arm_mutation(timepop_dispatch_mutation_t m) {
+  const uint32_t saved = critical_enter();
+
+  if (m.kind == timepop_dispatch_mutation_kind_t::CANCEL_NAME) {
+    dispatch_mutation_coalesce_for_cancel_name_unlocked(m.name);
+  } else if (m.kind == timepop_dispatch_mutation_kind_t::CANCEL_HANDLE) {
+    if (dispatch_mutation_coalesce_for_cancel_handle_unlocked(m.cancel_handle)) {
+      diag_dispatch_mutation_queued++;
+      diag_dispatch_cancel_queued++;
+      diag_dispatch_mutation_last_kind = dispatch_mutation_kind_str(m.kind);
+      diag_dispatch_mutation_last_phase = dispatch_phase_str(dispatch_phase);
+      diag_dispatch_mutation_last_handle = m.cancel_handle;
+      diag_dispatch_mutation_last_queue_depth = dispatch_mutation_count;
+      critical_exit(saved);
+      return true;
+    }
+  }
+
+  if (dispatch_mutation_count >= MAX_DISPATCH_MUTATIONS) {
+    diag_dispatch_mutation_overflow++;
+    critical_exit(saved);
+    return false;
+  }
+
+  m.queued_phase = dispatch_phase;
+  dispatch_mutations[dispatch_mutation_count++] = m;
+  if (dispatch_mutation_count > diag_dispatch_mutation_high_water) {
+    diag_dispatch_mutation_high_water = dispatch_mutation_count;
+  }
+  diag_dispatch_mutation_queued++;
+  diag_dispatch_cancel_queued++;
+  diag_dispatch_mutation_last_kind = dispatch_mutation_kind_str(m.kind);
+  diag_dispatch_mutation_last_phase = dispatch_phase_str(m.queued_phase);
+  diag_dispatch_mutation_last_handle =
+      (m.kind == timepop_dispatch_mutation_kind_t::CANCEL_HANDLE)
+          ? m.cancel_handle
+          : 0;
+  diag_dispatch_mutation_last_queue_depth = dispatch_mutation_count;
+  critical_exit(saved);
+  return true;
+}
+
+static timepop_handle_t queue_dispatch_relative_arm(uint64_t delay_gnss_ns,
+                                                    bool recurring,
+                                                    timepop_callback_t callback,
+                                                    void* user_data,
+                                                    const char* name,
+                                                    bool isr_callback,
+                                                    bool rearm_in_isr,
+                                                    timepop_priority_t priority) {
+  if (!callback) return TIMEPOP_INVALID_HANDLE;
+  if (rearm_in_isr && (!recurring || !isr_callback)) return TIMEPOP_INVALID_HANDLE;
+
+  timepop_dispatch_mutation_t m{};
+  m.kind = timepop_dispatch_mutation_kind_t::ARM_RELATIVE;
+  m.ns0 = delay_gnss_ns;
+  m.recurring = recurring;
+  m.isr_callback = isr_callback;
+  m.rearm_in_isr = rearm_in_isr;
+  m.callback = callback;
+  m.user_data = user_data;
+  m.name = name;
+  m.priority = priority;
+  return queue_dispatch_arm_mutation(m);
+}
+
+static timepop_handle_t queue_dispatch_absolute_arm(int64_t target_gnss_ns,
+                                                    bool recurring,
+                                                    uint64_t recurring_period_gnss_ns,
+                                                    timepop_callback_t callback,
+                                                    void* user_data,
+                                                    const char* name,
+                                                    bool isr_callback,
+                                                    uint32_t target_dwt,
+                                                    timepop_priority_t priority) {
+  if (!callback) return TIMEPOP_INVALID_HANDLE;
+  if (target_gnss_ns <= 0) return TIMEPOP_INVALID_HANDLE;
+
+  timepop_dispatch_mutation_t m{};
+  m.kind = timepop_dispatch_mutation_kind_t::ARM_ABSOLUTE;
+  m.ns0 = recurring_period_gnss_ns;
+  m.gnss0 = target_gnss_ns;
+  m.u32_0 = target_dwt;
+  m.recurring = recurring;
+  m.isr_callback = isr_callback;
+  m.callback = callback;
+  m.user_data = user_data;
+  m.name = name;
+  m.priority = priority;
+  return queue_dispatch_arm_mutation(m);
+}
+
+static timepop_handle_t queue_dispatch_anchored_isr_arm(int64_t base_gnss_ns,
+                                                        uint64_t period_gnss_ns,
+                                                        timepop_callback_t callback,
+                                                        void* user_data,
+                                                        const char* name,
+                                                        timepop_priority_t priority) {
+  if (!callback) return TIMEPOP_INVALID_HANDLE;
+  if (base_gnss_ns <= 0 || period_gnss_ns == 0) return TIMEPOP_INVALID_HANDLE;
+
+  timepop_dispatch_mutation_t m{};
+  m.kind = timepop_dispatch_mutation_kind_t::ARM_ANCHORED_ISR;
+  m.ns0 = period_gnss_ns;
+  m.gnss0 = base_gnss_ns;
+  m.callback = callback;
+  m.user_data = user_data;
+  m.name = name;
+  m.priority = priority;
+  return queue_dispatch_arm_mutation(m);
+}
+
+static timepop_handle_t queue_dispatch_anchored_isr_counter32_arm(int64_t base_gnss_ns,
+                                                                  uint32_t base_counter32,
+                                                                  uint64_t period_gnss_ns,
+                                                                  timepop_callback_t callback,
+                                                                  void* user_data,
+                                                                  const char* name,
+                                                                  timepop_priority_t priority) {
+  if (!callback) return TIMEPOP_INVALID_HANDLE;
+  if (base_gnss_ns <= 0 || period_gnss_ns == 0) return TIMEPOP_INVALID_HANDLE;
+
+  timepop_dispatch_mutation_t m{};
+  m.kind = timepop_dispatch_mutation_kind_t::ARM_ANCHORED_ISR_COUNTER32;
+  m.ns0 = period_gnss_ns;
+  m.gnss0 = base_gnss_ns;
+  m.u32_0 = base_counter32;
+  m.callback = callback;
+  m.user_data = user_data;
+  m.name = name;
+  m.priority = priority;
+  return queue_dispatch_arm_mutation(m);
+}
+
+static bool queue_dispatch_cancel_handle(timepop_handle_t handle) {
+  if (handle == TIMEPOP_INVALID_HANDLE) return false;
+  timepop_dispatch_mutation_t m{};
+  m.kind = timepop_dispatch_mutation_kind_t::CANCEL_HANDLE;
+  m.cancel_handle = handle;
+  return queue_dispatch_non_arm_mutation(m);
+}
+
+static bool queue_dispatch_cancel_name(const char* name) {
+  if (!name || !*name) return false;
+  timepop_dispatch_mutation_t m{};
+  m.kind = timepop_dispatch_mutation_kind_t::CANCEL_NAME;
+  m.name = name;
+  return queue_dispatch_non_arm_mutation(m);
+}
+
+static bool pop_dispatch_mutation(timepop_dispatch_mutation_t& out) {
+  const uint32_t saved = critical_enter();
+  if (dispatch_mutation_count == 0) {
+    critical_exit(saved);
+    return false;
+  }
+
+  out = dispatch_mutations[0];
+  for (uint32_t i = 1; i < dispatch_mutation_count; i++) {
+    dispatch_mutations[i - 1] = dispatch_mutations[i];
+  }
+  dispatch_mutation_count--;
+  dispatch_mutations[dispatch_mutation_count] = timepop_dispatch_mutation_t{};
+  diag_dispatch_mutation_last_queue_depth = dispatch_mutation_count;
+  critical_exit(saved);
+  return true;
+}
+
+static void timepop_apply_dispatch_mutations(const char* context) {
+  if (dispatch_applying_mutations) return;
+
+  const uint32_t saved = critical_enter();
+  if (dispatch_mutation_count == 0) {
+    critical_exit(saved);
+    return;
+  }
+  dispatch_applying_mutations = true;
+  const timepop_dispatch_phase_t prior_phase = dispatch_phase;
+  dispatch_phase = timepop_dispatch_phase_t::APPLYING_MUTATIONS;
+  critical_exit(saved);
+
+  diag_dispatch_mutation_apply_passes++;
+  diag_dispatch_mutation_last_context = context;
+  const uint32_t schedule_before = diag_schedule_next_calls_total;
+
+  timepop_dispatch_mutation_t m{};
+  while (pop_dispatch_mutation(m)) {
+    bool ok = false;
+    timepop_handle_t h = TIMEPOP_INVALID_HANDLE;
+
+    diag_dispatch_mutation_last_kind = dispatch_mutation_kind_str(m.kind);
+    diag_dispatch_mutation_last_phase = dispatch_phase_str(m.queued_phase);
+    diag_dispatch_mutation_last_handle =
+        (m.kind == timepop_dispatch_mutation_kind_t::CANCEL_HANDLE)
+            ? m.cancel_handle
+            : m.reserved_handle;
+
+    switch (m.kind) {
+      case timepop_dispatch_mutation_kind_t::ARM_RELATIVE:
+        h = arm_relative_slot_internal(m.ns0,
+                                       m.recurring,
+                                       m.callback,
+                                       m.user_data,
+                                       m.name,
+                                       m.isr_callback,
+                                       m.rearm_in_isr,
+                                       m.priority,
+                                       m.reserved_handle);
+        ok = (h == m.reserved_handle && h != TIMEPOP_INVALID_HANDLE);
+        break;
+
+      case timepop_dispatch_mutation_kind_t::ARM_ABSOLUTE:
+        h = arm_absolute_slot_internal(m.gnss0,
+                                       m.recurring,
+                                       m.ns0,
+                                       m.callback,
+                                       m.user_data,
+                                       m.name,
+                                       m.isr_callback,
+                                       m.u32_0,
+                                       m.priority,
+                                       m.reserved_handle);
+        ok = (h == m.reserved_handle && h != TIMEPOP_INVALID_HANDLE);
+        break;
+
+      case timepop_dispatch_mutation_kind_t::ARM_ANCHORED_ISR:
+        h = arm_anchored_recurring_isr_internal(m.gnss0,
+                                                m.ns0,
+                                                m.callback,
+                                                m.user_data,
+                                                m.name,
+                                                m.priority,
+                                                m.reserved_handle);
+        ok = (h == m.reserved_handle && h != TIMEPOP_INVALID_HANDLE);
+        break;
+
+      case timepop_dispatch_mutation_kind_t::ARM_ANCHORED_ISR_COUNTER32:
+        h = arm_anchored_recurring_isr_from_counter32_internal(m.gnss0,
+                                                               m.u32_0,
+                                                               m.ns0,
+                                                               m.callback,
+                                                               m.user_data,
+                                                               m.name,
+                                                               m.priority,
+                                                               m.reserved_handle);
+        ok = (h == m.reserved_handle && h != TIMEPOP_INVALID_HANDLE);
+        break;
+
+      case timepop_dispatch_mutation_kind_t::CANCEL_HANDLE: {
+        const bool cancelled = timepop_cancel(m.cancel_handle);
+        ok = true;  // cancel is idempotent at the dispatch barrier
+        if (cancelled) diag_dispatch_mutation_cancel_applied++;
+        else diag_dispatch_mutation_cancel_noop++;
+        break;
+      }
+
+      case timepop_dispatch_mutation_kind_t::CANCEL_NAME: {
+        const uint32_t cancelled = timepop_cancel_by_name(m.name);
+        ok = true;  // cancel-by-name postcondition is satisfied even if empty
+        if (cancelled != 0) diag_dispatch_mutation_cancel_applied++;
+        else diag_dispatch_mutation_cancel_noop++;
+        break;
+      }
+
+      default:
+        ok = true;
+        break;
+    }
+
+    if (ok) {
+      diag_dispatch_mutation_applied++;
+    } else {
+      diag_dispatch_mutation_apply_failures++;
+      if (dispatch_mutation_is_arm(m.kind)) {
+        diag_dispatch_mutation_arm_failures++;
+      } else if (m.kind == timepop_dispatch_mutation_kind_t::CANCEL_HANDLE ||
+                 m.kind == timepop_dispatch_mutation_kind_t::CANCEL_NAME) {
+        diag_dispatch_mutation_cancel_failures++;
+      }
+    }
+  }
+
+  const uint32_t schedule_after = diag_schedule_next_calls_total;
+  const uint32_t schedule_delta = schedule_after - schedule_before;
+  if (schedule_delta != 0) {
+    diag_dispatch_mutation_schedule_next_calls += schedule_delta;
+    diag_schedule_next_calls_from_dispatch += schedule_delta;
+    if (diag_schedule_next_calls_from_other >= schedule_delta) {
+      diag_schedule_next_calls_from_other -= schedule_delta;
+    } else {
+      diag_schedule_next_calls_from_other = 0;
+    }
+  }
+
+  const uint32_t saved2 = critical_enter();
+  dispatch_phase = prior_phase;
+  dispatch_applying_mutations = false;
+  critical_exit(saved2);
+}
 
 // ============================================================================
 // Helpers
@@ -2345,6 +2923,8 @@ static void dispatch_deferred_phase(deferred_slot_t* slots_buf,
     dispatched_count++;
     last_dispatch_dwt = end;
 
+    timepop_apply_dispatch_mutations("deferred_callback");
+
     {
       const uint32_t saved = critical_enter();
       if (slots_buf[i].dispatching &&
@@ -2471,6 +3051,11 @@ void timepop_init(void) {
   for (uint32_t i = 0; i < MAX_SLOTS; i++) slots[i] = {};
   for (uint32_t i = 0; i < MAX_ASAP_SLOTS; i++) asap_slots[i] = {};
   for (uint32_t i = 0; i < MAX_ALAP_SLOTS; i++) alap_slots[i] = {};
+  for (uint32_t i = 0; i < MAX_DISPATCH_MUTATIONS; i++) dispatch_mutations[i] = {};
+  dispatch_mutation_count = 0;
+  dispatch_depth = 0;
+  dispatch_phase = timepop_dispatch_phase_t::IDLE;
+  dispatch_applying_mutations = false;
 
   diag_asap_armed = 0;
   diag_asap_dispatched = 0;
@@ -2491,6 +3076,27 @@ void timepop_init(void) {
   diag_alap_replacements = 0;
   diag_alap_cancelled = 0;
   diag_alap_arm_while_dispatching = 0;
+
+  diag_dispatch_depth_max = 0;
+  diag_dispatch_mutation_queued = 0;
+  diag_dispatch_mutation_applied = 0;
+  diag_dispatch_mutation_apply_failures = 0;
+  diag_dispatch_mutation_overflow = 0;
+  diag_dispatch_mutation_high_water = 0;
+  diag_dispatch_mutation_apply_passes = 0;
+  diag_dispatch_mutation_schedule_next_calls = 0;
+  diag_dispatch_mutation_last_kind = nullptr;
+  diag_dispatch_mutation_last_context = nullptr;
+  diag_dispatch_mutation_last_phase = nullptr;
+  diag_dispatch_mutation_last_handle = 0;
+  diag_dispatch_mutation_last_queue_depth = 0;
+  diag_dispatch_timed_arm_queued = 0;
+  diag_dispatch_cancel_queued = 0;
+  diag_dispatch_mutation_coalesced = 0;
+  diag_dispatch_mutation_cancel_applied = 0;
+  diag_dispatch_mutation_cancel_noop = 0;
+  diag_dispatch_mutation_cancel_failures = 0;
+  diag_dispatch_mutation_arm_failures = 0;
 
   diag_deadline_negative_offset = 0;
   diag_deadline_last_target_gnss_ns = -1;
@@ -2556,7 +3162,8 @@ static timepop_handle_t arm_absolute_slot_internal(
   const char*         name,
   bool                isr_callback,
   uint32_t            target_dwt,
-  timepop_priority_t  priority
+  timepop_priority_t  priority,
+  timepop_handle_t    forced_handle
 ) {
   if (!callback) return TIMEPOP_INVALID_HANDLE;
   if (target_gnss_ns <= 0) return TIMEPOP_INVALID_HANDLE;
@@ -2579,7 +3186,10 @@ static timepop_handle_t arm_absolute_slot_internal(
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
     if (slots[i].active) continue;
 
-    const timepop_handle_t h = allocate_handle_unlocked();
+    const timepop_handle_t h =
+        (forced_handle != TIMEPOP_INVALID_HANDLE)
+            ? forced_handle
+            : allocate_handle_unlocked();
 
     slots[i] = {};
     slots[i].active         = true;
@@ -2652,7 +3262,8 @@ static timepop_handle_t arm_anchored_recurring_isr_internal(
   timepop_callback_t  callback,
   void*               user_data,
   const char*         name,
-  timepop_priority_t  priority
+  timepop_priority_t  priority,
+  timepop_handle_t    forced_handle
 ) {
   if (!callback) return TIMEPOP_INVALID_HANDLE;
   if (base_gnss_ns <= 0) return TIMEPOP_INVALID_HANDLE;
@@ -2669,7 +3280,10 @@ static timepop_handle_t arm_anchored_recurring_isr_internal(
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
     if (slots[i].active) continue;
 
-    const timepop_handle_t h = allocate_handle_unlocked();
+    const timepop_handle_t h =
+        (forced_handle != TIMEPOP_INVALID_HANDLE)
+            ? forced_handle
+            : allocate_handle_unlocked();
 
     slots[i] = {};
     slots[i].active = true;
@@ -2717,7 +3331,8 @@ static timepop_handle_t arm_anchored_recurring_isr_from_counter32_internal(
   timepop_callback_t  callback,
   void*               user_data,
   const char*         name,
-  timepop_priority_t  priority
+  timepop_priority_t  priority,
+  timepop_handle_t    forced_handle
 ) {
   if (!callback) return TIMEPOP_INVALID_HANDLE;
   if (base_gnss_ns <= 0) return TIMEPOP_INVALID_HANDLE;
@@ -2734,7 +3349,10 @@ static timepop_handle_t arm_anchored_recurring_isr_from_counter32_internal(
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
     if (slots[i].active) continue;
 
-    const timepop_handle_t h = allocate_handle_unlocked();
+    const timepop_handle_t h =
+        (forced_handle != TIMEPOP_INVALID_HANDLE)
+            ? forced_handle
+            : allocate_handle_unlocked();
 
     slots[i] = {};
     slots[i].active = true;
@@ -2792,7 +3410,8 @@ static timepop_handle_t arm_relative_slot_internal(
   const char*         name,
   bool                isr_callback,
   bool                rearm_in_isr,
-  timepop_priority_t  priority
+  timepop_priority_t  priority,
+  timepop_handle_t    forced_handle
 ) {
   if (!callback) return TIMEPOP_INVALID_HANDLE;
   if (rearm_in_isr && (!recurring || !isr_callback)) return TIMEPOP_INVALID_HANDLE;
@@ -2808,7 +3427,10 @@ static timepop_handle_t arm_relative_slot_internal(
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
     if (slots[i].active) continue;
 
-    const timepop_handle_t h = allocate_handle_unlocked();
+    const timepop_handle_t h =
+        (forced_handle != TIMEPOP_INVALID_HANDLE)
+            ? forced_handle
+            : allocate_handle_unlocked();
 
     slots[i] = {};
     slots[i].active       = true;
@@ -2915,6 +3537,17 @@ timepop_handle_t timepop_arm_with_priority(
   const char*         name,
   timepop_priority_t  priority
 ) {
+  if (timepop_should_queue_dispatch_mutation()) {
+    return queue_dispatch_relative_arm(delay_gnss_ns,
+                                       recurring,
+                                       callback,
+                                       user_data,
+                                       name,
+                                       false,
+                                       false,
+                                       priority);
+  }
+
   return arm_relative_slot_internal(delay_gnss_ns,
                                     recurring,
                                     callback,
@@ -2945,6 +3578,17 @@ timepop_handle_t timepop_arm_recurring_isr_with_priority(
   const char*         name,
   timepop_priority_t  priority
 ) {
+  if (timepop_should_queue_dispatch_mutation()) {
+    return queue_dispatch_relative_arm(period_gnss_ns,
+                                       true,
+                                       callback,
+                                       user_data,
+                                       name,
+                                       true,
+                                       true,
+                                       priority);
+  }
+
   return arm_relative_slot_internal(period_gnss_ns,
                                     true,
                                     callback,
@@ -2979,6 +3623,15 @@ timepop_handle_t timepop_arm_recurring_isr_from_base_with_priority(
   const char*         name,
   timepop_priority_t  priority
 ) {
+  if (timepop_should_queue_dispatch_mutation()) {
+    return queue_dispatch_anchored_isr_arm(base_gnss_ns,
+                                           period_gnss_ns,
+                                           callback,
+                                           user_data,
+                                           name,
+                                           priority);
+  }
+
   return arm_anchored_recurring_isr_internal(base_gnss_ns,
                                              period_gnss_ns,
                                              callback,
@@ -3013,6 +3666,16 @@ timepop_handle_t timepop_arm_recurring_isr_from_base_counter32_with_priority(
   const char*         name,
   timepop_priority_t  priority
 ) {
+  if (timepop_should_queue_dispatch_mutation()) {
+    return queue_dispatch_anchored_isr_counter32_arm(base_gnss_ns,
+                                                     base_counter32,
+                                                     period_gnss_ns,
+                                                     callback,
+                                                     user_data,
+                                                     name,
+                                                     priority);
+  }
+
   return arm_anchored_recurring_isr_from_counter32_internal(base_gnss_ns,
                                                            base_counter32,
                                                            period_gnss_ns,
@@ -3357,6 +4020,18 @@ timepop_handle_t timepop_arm_at_with_priority(
   // Public absolute timers remain one-shot unless a future API supplies an
   // explicit absolute recurrence period.
   (void)recurring;
+  if (timepop_should_queue_dispatch_mutation()) {
+    return queue_dispatch_absolute_arm(target_gnss_ns,
+                                       false,
+                                       0,
+                                       callback,
+                                       user_data,
+                                       name,
+                                       false,
+                                       0,
+                                       priority);
+  }
+
   return arm_absolute_slot_internal(target_gnss_ns,
                                     false,
                                     0,
@@ -3416,6 +4091,18 @@ timepop_handle_t timepop_arm_from_anchor_with_priority(
     return TIMEPOP_INVALID_HANDLE;
   }
 
+  if (timepop_should_queue_dispatch_mutation()) {
+    return queue_dispatch_absolute_arm(target_gnss_ns,
+                                       recurring,
+                                       recurring ? 1000000000ULL : 0ULL,
+                                       callback,
+                                       user_data,
+                                       name,
+                                       false,
+                                       0,
+                                       priority);
+  }
+
   return arm_absolute_slot_internal(target_gnss_ns,
                                     recurring,
                                     recurring ? 1000000000ULL : 0ULL,
@@ -3460,6 +4147,18 @@ timepop_handle_t timepop_arm_ns_with_priority(
   bool                isr_callback,
   timepop_priority_t  priority
 ) {
+  if (timepop_should_queue_dispatch_mutation()) {
+    return queue_dispatch_absolute_arm(target_gnss_ns,
+                                       false,
+                                       0,
+                                       callback,
+                                       user_data,
+                                       name,
+                                       isr_callback,
+                                       target_dwt,
+                                       priority);
+  }
+
   return arm_absolute_slot_internal(target_gnss_ns,
                                     false,
                                     0,
@@ -3477,6 +4176,9 @@ timepop_handle_t timepop_arm_ns_with_priority(
 
 bool timepop_cancel(timepop_handle_t handle) {
   if (handle == TIMEPOP_INVALID_HANDLE) return false;
+  if (timepop_should_queue_dispatch_mutation()) {
+    return queue_dispatch_cancel_handle(handle);
+  }
 
   const uint32_t saved = critical_enter();
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
@@ -3508,6 +4210,9 @@ bool timepop_cancel(timepop_handle_t handle) {
 
 uint32_t timepop_cancel_by_name(const char* name) {
   if (!name) return 0;
+  if (timepop_should_queue_dispatch_mutation()) {
+    return queue_dispatch_cancel_name(name) ? 1U : 0U;
+  }
 
   uint32_t timed_cancelled = 0;
   uint32_t deferred_cancelled = 0;
@@ -3562,11 +4267,15 @@ void timepop_dispatch(void) {
 
   diag_dispatch_calls++;
 
+  timepop_dispatch_enter(timepop_dispatch_phase_t::ASAP);
 
   dispatch_deferred_phase(asap_slots,
                           MAX_ASAP_SLOTS,
                           diag_asap_dispatched,
                           diag_asap_last_dispatch_dwt);
+
+  timepop_apply_dispatch_mutations("after_asap");
+  timepop_dispatch_set_phase(timepop_dispatch_phase_t::TIMED);
 
   const uint32_t dispatch_now = vclock_count();
   (void)dispatch_now;
@@ -3586,6 +4295,7 @@ void timepop_dispatch(void) {
     // manufacture a false SCHEDULE_NEXT expiry.  The slot remains expired until
     // its next appointment is fully authored below.
     const bool callback_already_ran = slots[i].isr_callback_fired;
+    const timepop_handle_t callback_handle = slots[i].handle;
     slots[i].isr_callback_fired = false;
 
     if (!callback_already_ran) {
@@ -3602,6 +4312,8 @@ void timepop_dispatch(void) {
 
       cpu_usage_account_busy(end - start);
       diag_dispatch_callbacks++;
+
+      timepop_apply_dispatch_mutations("timed_callback");
     }
 
     // The callback may have cancelled or otherwise retired this slot.  Do not
@@ -3609,6 +4321,11 @@ void timepop_dispatch(void) {
     if (!slots[i].active) {
       slots[i].expired = false;
       slots[i].isr_callback_fired = false;
+      continue;
+    }
+    if (slots[i].handle != callback_handle) {
+      // A dispatch-time mutation replaced this table entry at a safe barrier.
+      // Do not let the completed callback clean up or rearm the new occupant.
       continue;
     }
 
@@ -3667,6 +4384,7 @@ void timepop_dispatch(void) {
                                vclock_count(),
                                slots[i].target_gnss_ns);
           const uint32_t saved = critical_enter();
+          diag_schedule_next_calls_from_dispatch++;
           schedule_next();
           critical_exit(saved);
         }
@@ -3715,6 +4433,7 @@ void timepop_dispatch(void) {
                              vclock_count(),
                              slots[i].target_gnss_ns);
         const uint32_t saved = critical_enter();
+        diag_schedule_next_calls_from_dispatch++;
         schedule_next();
         critical_exit(saved);
       }
@@ -3725,15 +4444,23 @@ void timepop_dispatch(void) {
     }
   }
 
+  timepop_apply_dispatch_mutations("after_timed");
+  timepop_dispatch_set_phase(timepop_dispatch_phase_t::ALAP);
+
   dispatch_deferred_phase(alap_slots,
                           MAX_ALAP_SLOTS,
                           diag_alap_dispatched,
                           diag_alap_last_dispatch_dwt);
 
+  timepop_apply_dispatch_mutations("after_alap");
+
   if (deferred_any_pending(asap_slots, MAX_ASAP_SLOTS) ||
-      deferred_any_pending(alap_slots, MAX_ALAP_SLOTS)) {
+      deferred_any_pending(alap_slots, MAX_ALAP_SLOTS) ||
+      dispatch_mutation_count != 0) {
     timepop_pending = true;
   }
+
+  timepop_dispatch_leave();
 }
 // ============================================================================
 // Epoch boundary
@@ -3948,6 +4675,43 @@ static Payload cmd_report(const Payload&) {
 
   out.add("dispatch_calls",         diag_dispatch_calls);
   out.add("dispatch_callbacks",     diag_dispatch_callbacks);
+  out.add("dispatch_depth_now",     dispatch_depth);
+  out.add("dispatch_depth_max",     diag_dispatch_depth_max);
+  out.add("dispatch_phase",
+          (const char*)dispatch_phase_str(dispatch_phase));
+  out.add("dispatch_mutation_supported", true);
+  out.add("dispatch_mutation_queue_depth", dispatch_mutation_count);
+  out.add("dispatch_mutation_queue_max", (uint32_t)MAX_DISPATCH_MUTATIONS);
+  out.add("dispatch_mutation_high_water", diag_dispatch_mutation_high_water);
+  out.add("dispatch_mutation_queued", diag_dispatch_mutation_queued);
+  out.add("dispatch_mutation_applied", diag_dispatch_mutation_applied);
+  out.add("dispatch_mutation_apply_failures", diag_dispatch_mutation_apply_failures);
+  out.add("dispatch_mutation_overflow", diag_dispatch_mutation_overflow);
+  out.add("dispatch_mutation_apply_passes", diag_dispatch_mutation_apply_passes);
+  out.add("dispatch_mutation_schedule_next_calls",
+          diag_dispatch_mutation_schedule_next_calls);
+  out.add("dispatch_timed_arm_queued", diag_dispatch_timed_arm_queued);
+  out.add("dispatch_cancel_queued", diag_dispatch_cancel_queued);
+  out.add("dispatch_mutation_coalesced", diag_dispatch_mutation_coalesced);
+  out.add("dispatch_mutation_cancel_applied", diag_dispatch_mutation_cancel_applied);
+  out.add("dispatch_mutation_cancel_noop", diag_dispatch_mutation_cancel_noop);
+  out.add("dispatch_mutation_cancel_failures", diag_dispatch_mutation_cancel_failures);
+  out.add("dispatch_mutation_arm_failures", diag_dispatch_mutation_arm_failures);
+  out.add("dispatch_mutation_last_kind",
+          (const char*)(diag_dispatch_mutation_last_kind
+                            ? diag_dispatch_mutation_last_kind
+                            : ""));
+  out.add("dispatch_mutation_last_context",
+          (const char*)(diag_dispatch_mutation_last_context
+                            ? diag_dispatch_mutation_last_context
+                            : ""));
+  out.add("dispatch_mutation_last_phase",
+          (const char*)(diag_dispatch_mutation_last_phase
+                            ? diag_dispatch_mutation_last_phase
+                            : ""));
+  out.add("dispatch_mutation_last_handle", diag_dispatch_mutation_last_handle);
+  out.add("dispatch_mutation_last_queue_depth",
+          diag_dispatch_mutation_last_queue_depth);
   out.add("schedule_next_calls_total",         diag_schedule_next_calls_total);
   out.add("schedule_next_calls_from_dispatch", diag_schedule_next_calls_from_dispatch);
   out.add("schedule_next_calls_from_other",    diag_schedule_next_calls_from_other);
@@ -4295,6 +5059,15 @@ static Payload cmd_phase_probe(const Payload& args) {
 static Payload cmd_slots(const Payload&) {
   Payload out;
   out.add("slots_active_now", timepop_active_count());
+  out.add("dispatch_mutation_queue_depth", dispatch_mutation_count);
+  out.add("dispatch_mutation_queued", diag_dispatch_mutation_queued);
+  out.add("dispatch_mutation_applied", diag_dispatch_mutation_applied);
+  out.add("dispatch_mutation_apply_failures", diag_dispatch_mutation_apply_failures);
+  out.add("dispatch_mutation_arm_failures", diag_dispatch_mutation_arm_failures);
+  out.add("dispatch_mutation_cancel_failures", diag_dispatch_mutation_cancel_failures);
+  out.add("dispatch_mutation_cancel_noop", diag_dispatch_mutation_cancel_noop);
+  out.add("dispatch_mutation_coalesced", diag_dispatch_mutation_coalesced);
+  out.add("dispatch_mutation_overflow", diag_dispatch_mutation_overflow);
   out.add("slots_high_water", diag_slots_high_water);
   out.add("slots_max", (uint32_t)MAX_SLOTS);
   out.add("vclock_raw_now", vclock_count());
