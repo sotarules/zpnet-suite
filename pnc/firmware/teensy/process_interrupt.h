@@ -248,6 +248,15 @@ struct interrupt_capture_diag_t {
   uint64_t gnss_ns_at_event   = 0;
   uint32_t counter32_at_event = 0;
 
+  // SpinIdle / SpinCatch ISR-entry witness.  These fields are diagnostic only.
+  // shadow_dwt is the last user-mode idle witness value sampled at ISR entry;
+  // shadow_to_isr_entry_cycles is isr_entry_dwt_raw - shadow_dwt.  A valid
+  // shadow means the idle witness was fresh enough to be credible.
+  bool     spinidle_shadow_valid = false;
+  uint32_t spinidle_shadow_dwt = 0;
+  uint32_t spinidle_shadow_to_isr_entry_cycles = 0;
+  uint32_t spinidle_shadow_valid_threshold_cycles = 0;
+
   // DWT admissibility / repair/prediction audit.  dwt_at_event remains the
   // authoritative subscriber coordinate.  For OCXO lanes, dwt_synthetic may be
   // true when the EMA-predicted edge replaces the observed ISR endpoint.
@@ -632,6 +641,12 @@ struct pps_edge_snapshot_t {
   uint32_t physical_pps_dwt_normalized_at_edge = 0;   // carries pps.dwt_at_edge
   uint32_t physical_pps_counter32_at_read      = 0;
   uint16_t physical_pps_ch3_at_read            = 0;
+
+  // SpinIdle / SpinCatch witness captured at PPS GPIO ISR entry.
+  bool     spinidle_shadow_valid = false;
+  uint32_t spinidle_shadow_dwt = 0;
+  uint32_t spinidle_shadow_to_isr_entry_cycles = 0;
+  uint32_t spinidle_shadow_valid_threshold_cycles = 0;
 
   // VCLOCK epoch derivation audit.
   uint32_t vclock_epoch_counter32              = 0;
