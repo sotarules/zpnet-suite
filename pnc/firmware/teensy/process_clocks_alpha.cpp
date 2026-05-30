@@ -537,6 +537,11 @@ struct alpha_lane_forensics_store_t {
   uint32_t diag_boundary_counter32_at_event = 0;
   int32_t  diag_boundary_correction_cycles = 0;
 
+  bool     spinidle_shadow_valid = false;
+  uint32_t spinidle_shadow_dwt = 0;
+  uint32_t spinidle_shadow_to_isr_entry_cycles = 0;
+  uint32_t spinidle_shadow_valid_threshold_cycles = 0;
+
   bool     regression_valid = false;
   uint32_t regression_sequence = 0;
   uint32_t regression_sample_count = 0;
@@ -1769,6 +1774,10 @@ static void alpha_forensics_reset_store(alpha_lane_forensics_store_t& s) {
   s.diag_boundary_dwt_at_event = 0;
   s.diag_boundary_counter32_at_event = 0;
   s.diag_boundary_correction_cycles = 0;
+  s.spinidle_shadow_valid = false;
+  s.spinidle_shadow_dwt = 0;
+  s.spinidle_shadow_to_isr_entry_cycles = 0;
+  s.spinidle_shadow_valid_threshold_cycles = 0;
   s.regression_valid = false;
   s.regression_sequence = 0;
   s.regression_sample_count = 0;
@@ -1932,6 +1941,13 @@ static void alpha_forensics_publish(time_clock_id_t clock_id,
     s->diag_boundary_counter32_at_event = diag->ocxo_boundary_counter32_at_event;
     s->diag_boundary_correction_cycles = diag->ocxo_boundary_correction_cycles;
 
+    s->spinidle_shadow_valid = diag->spinidle_shadow_valid;
+    s->spinidle_shadow_dwt = diag->spinidle_shadow_dwt;
+    s->spinidle_shadow_to_isr_entry_cycles =
+        diag->spinidle_shadow_to_isr_entry_cycles;
+    s->spinidle_shadow_valid_threshold_cycles =
+        diag->spinidle_shadow_valid_threshold_cycles;
+
     s->regression_valid = diag->regression_valid;
     s->regression_sequence = diag->regression_sequence;
     s->regression_sample_count = diag->regression_sample_count;
@@ -2000,6 +2016,10 @@ static void alpha_forensics_publish(time_clock_id_t clock_id,
     s->diag_boundary_dwt_at_event = 0;
     s->diag_boundary_counter32_at_event = 0;
     s->diag_boundary_correction_cycles = 0;
+    s->spinidle_shadow_valid = false;
+    s->spinidle_shadow_dwt = 0;
+    s->spinidle_shadow_to_isr_entry_cycles = 0;
+    s->spinidle_shadow_valid_threshold_cycles = 0;
     s->regression_valid = false;
     s->regression_sequence = 0;
     s->regression_sample_count = 0;
@@ -2110,6 +2130,12 @@ bool clocks_alpha_lane_forensics(time_clock_id_t clock,
     out->diag_boundary_dwt_at_event = s->diag_boundary_dwt_at_event;
     out->diag_boundary_counter32_at_event = s->diag_boundary_counter32_at_event;
     out->diag_boundary_correction_cycles = s->diag_boundary_correction_cycles;
+    out->spinidle_shadow_valid = s->spinidle_shadow_valid;
+    out->spinidle_shadow_dwt = s->spinidle_shadow_dwt;
+    out->spinidle_shadow_to_isr_entry_cycles =
+        s->spinidle_shadow_to_isr_entry_cycles;
+    out->spinidle_shadow_valid_threshold_cycles =
+        s->spinidle_shadow_valid_threshold_cycles;
     out->regression_valid = s->regression_valid;
     out->regression_sequence = s->regression_sequence;
     out->regression_sample_count = s->regression_sample_count;

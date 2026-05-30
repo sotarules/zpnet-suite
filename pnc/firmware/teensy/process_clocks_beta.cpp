@@ -1089,6 +1089,19 @@ static void payload_add_lane_forensics_flat(Payload& p,
   add_i32("forensics_boundary_correction_cycles",
           valid ? f.diag_boundary_correction_cycles : 0);
 
+  // SpinIdle / SpinCatch ISR-entry witness diagnostics.  These are
+  // subscriber-carried process_interrupt facts: the idle shadow DWT sampled
+  // at ISR entry, the cycle distance from shadow to ISR-entry DWT, and the
+  // validity decision under the configured threshold.
+  add_bool("forensics_spincatch_shadow_valid",
+           valid && f.spinidle_shadow_valid);
+  add_u32("forensics_spincatch_shadow_dwt",
+          valid ? f.spinidle_shadow_dwt : 0U);
+  add_u32("forensics_spincatch_shadow_to_isr_entry_cycles",
+          valid ? f.spinidle_shadow_to_isr_entry_cycles : 0U);
+  add_u32("forensics_spincatch_shadow_valid_threshold_cycles",
+          valid ? f.spinidle_shadow_valid_threshold_cycles : 0U);
+
   // Linear-regression diagnostics are disabled in the quiet-phase checkpoint.
   // The zero-valued/invalid surface is kept temporarily so existing report
   // readers do not fail while the OCXO custody experiment is evaluated.
@@ -1242,6 +1255,20 @@ static void payload_add_ocxo_interval_object(Payload& parent,
   interval.add("bridge_interval_valid",
                valid && f.bridge_interval_valid);
   parent.add_object("interval", interval);
+}
+
+static void payload_add_spincatch_object(Payload& parent,
+                                         bool valid,
+                                         const clocks_alpha_lane_forensics_t& f) {
+  Payload spincatch;
+  spincatch.add("valid", valid && f.spinidle_shadow_valid);
+  spincatch.add("shadow_dwt", valid ? f.spinidle_shadow_dwt : 0U);
+  spincatch.add("shadow_to_isr_entry_cycles",
+                 valid ? f.spinidle_shadow_to_isr_entry_cycles : 0U);
+  spincatch.add("shadow_valid_threshold_cycles",
+                 valid ? f.spinidle_shadow_valid_threshold_cycles : 0U);
+  spincatch.add("source", "SPINIDLE_ISR_WITNESS");
+  parent.add_object("spincatch", spincatch);
 }
 
 static void payload_add_lane_forensics_object(Payload& parent,
@@ -1398,6 +1425,7 @@ static void payload_add_vclock_forensics(Payload& p,
   lane.add("counter32_at_pps_vclock", (uint32_t)g_counter32_at_pps_vclock);
   payload_add_clock_measurement_object(lane, g_vclock_clock, g_vclock_measurement);
   payload_add_lane_forensics_object(lane, forensics_valid, f);
+  payload_add_spincatch_object(lane, forensics_valid, f);
   payload_add_lane_regression_object(lane, forensics_valid, f);
   p.add_object("vclock", lane);
 }
@@ -1521,6 +1549,7 @@ static void payload_add_ocxo_forensics(Payload& p,
   payload_add_clock_measurement_object(lane, clock, meas);
   payload_add_ocxo_interval_object(lane, forensics_valid, f);
   payload_add_lane_forensics_object(lane, forensics_valid, f);
+  payload_add_spincatch_object(lane, forensics_valid, f);
   payload_add_ocxo_service_object(lane, forensics_valid, f);
   payload_add_lane_regression_object(lane, forensics_valid, f);
   p.add_object(key, lane);
@@ -2852,6 +2881,16 @@ static void add_alpha_event_payload(Payload& p,
   service.add("boundary_counter32_at_event", f.diag_boundary_counter32_at_event);
   service.add("boundary_correction_cycles", f.diag_boundary_correction_cycles);
   p.add_object("ocxo_service", service);
+
+  Payload spincatch;
+  spincatch.add("valid", f.valid && f.spinidle_shadow_valid);
+  spincatch.add("shadow_dwt", f.valid ? f.spinidle_shadow_dwt : 0U);
+  spincatch.add("shadow_to_isr_entry_cycles",
+                 f.valid ? f.spinidle_shadow_to_isr_entry_cycles : 0U);
+  spincatch.add("shadow_valid_threshold_cycles",
+                 f.valid ? f.spinidle_shadow_valid_threshold_cycles : 0U);
+  spincatch.add("source", "SPINIDLE_ISR_WITNESS");
+  p.add_object("spincatch", spincatch);
 
   Payload regression;
   regression.add("enabled", false);

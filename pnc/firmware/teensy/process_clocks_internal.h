@@ -358,6 +358,13 @@ struct clocks_alpha_lane_forensics_t {
   uint32_t diag_boundary_counter32_at_event;
   int32_t  diag_boundary_correction_cycles;
 
+  // SpinIdle / SpinCatch ISR-entry witness copied from interrupt_capture_diag_t.
+  // These are diagnostic only: Alpha does not use them as timing authority.
+  bool     spinidle_shadow_valid;
+  uint32_t spinidle_shadow_dwt;
+  uint32_t spinidle_shadow_to_isr_entry_cycles;
+  uint32_t spinidle_shadow_valid_threshold_cycles;
+
   bool     regression_valid;
   uint32_t regression_sequence;
   uint32_t regression_sample_count;
