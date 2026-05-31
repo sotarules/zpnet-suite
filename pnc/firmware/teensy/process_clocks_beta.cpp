@@ -2421,6 +2421,13 @@ void clocks_beta_pps(void) {
     timebase_build_stage(TIMEBASE_BUILD_STAGE_STATS);
     payload_add_stats_summary_hierarchical(p);
 
+    // System DAC persistence feed.  The Pi should update the simplified
+    // system config only while the servo is actively tuning; manual/static DAC
+    // values are loaded at START/SET_DAC but are not re-persisted every second.
+    if (clocks_servo_active()) {
+      payload_add_servo_dac_values(p);
+    }
+
     g_timebase_build_complete_count++;
     g_timebase_last_build_complete_campaign_seconds = campaign_seconds;
     timebase_build_stage(TIMEBASE_BUILD_STAGE_BUILD_COMPLETE);
@@ -2516,6 +2523,46 @@ void clocks_beta_pps(void) {
 // Commands
 // ============================================================================
 
+
+static bool payload_try_get_double_alias(const Payload& args,
+                                         double& out,
+                                         const char* k1,
+                                         const char* k2,
+                                         const char* k3) {
+  return (k1 && args.tryGetDouble(k1, out)) ||
+         (k2 && args.tryGetDouble(k2, out)) ||
+         (k3 && args.tryGetDouble(k3, out));
+}
+
+static bool payload_try_get_ocxo1_dac(const Payload& args, double& out) {
+  // New system-config contract: { "ocxo1_dac": <code>, "ocxo2_dac": <code> }.
+  // Retain the old command aliases so existing Pi-side callers do not break.
+  return payload_try_get_double_alias(args, out,
+                                      "ocxo1_dac",
+                                      "dac1",
+                                      "set_dac1");
+}
+
+static bool payload_try_get_ocxo2_dac(const Payload& args, double& out) {
+  return payload_try_get_double_alias(args, out,
+                                      "ocxo2_dac",
+                                      "dac2",
+                                      "set_dac2");
+}
+
+static bool clocks_servo_active(void) {
+  return calibrate_ocxo_mode != servo_mode_t::OFF;
+}
+
+static void payload_add_servo_dac_values(Payload& parent) {
+  // Minimal durable DAC payload.  This is intentionally only the two values
+  // the Pi should persist as the current system DAC configuration.
+  Payload dac;
+  dac.add("ocxo1_dac", ocxo1_dac.dac_fractional);
+  dac.add("ocxo2_dac", ocxo2_dac.dac_fractional);
+  parent.add_object("dac", dac);
+}
+
 static Payload cmd_start(const Payload& args) {
   const char* name = args.getString("campaign");
   if (!name || !*name) {
@@ -2533,8 +2580,12 @@ static Payload cmd_start(const Payload& args) {
   double dac_val;
   bool dac1_ok = true;
   bool dac2_ok = true;
-  if (args.tryGetDouble("set_dac1", dac_val)) dac1_ok = ocxo_dac_set(ocxo1_dac, dac_val);
-  if (args.tryGetDouble("set_dac2", dac_val)) dac2_ok = ocxo_dac_set(ocxo2_dac, dac_val);
+  if (payload_try_get_ocxo1_dac(args, dac_val)) {
+    dac1_ok = ocxo_dac_set(ocxo1_dac, dac_val);
+  }
+  if (payload_try_get_ocxo2_dac(args, dac_val)) {
+    dac2_ok = ocxo_dac_set(ocxo2_dac, dac_val);
+  }
 
   calibrate_ocxo_mode = servo_mode_parse(args.getString("calibrate_ocxo"));
   if (!dac1_ok || !dac2_ok) calibrate_ocxo_mode = servo_mode_t::OFF;
@@ -3808,11 +3859,11 @@ static Payload cmd_set_dac(const Payload& args) {
   double dac_val;
   bool dac1_ok = true;
   bool dac2_ok = true;
-  if (args.tryGetDouble("set_dac1", dac_val)) {
+  if (payload_try_get_ocxo1_dac(args, dac_val)) {
     dac1_ok = ocxo_dac_set(ocxo1_dac, dac_val);
     if (dac1_ok) ocxo_dac_retry_reset(ocxo1_dac);
   }
-  if (args.tryGetDouble("set_dac2", dac_val)) {
+  if (payload_try_get_ocxo2_dac(args, dac_val)) {
     dac2_ok = ocxo_dac_set(ocxo2_dac, dac_val);
     if (dac2_ok) ocxo_dac_retry_reset(ocxo2_dac);
   }
