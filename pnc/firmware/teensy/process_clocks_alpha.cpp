@@ -502,6 +502,27 @@ struct alpha_lane_forensics_store_t {
 
   uint64_t ns_between_edges = 0;
   uint32_t dwt_cycles_between_edges = 0;
+
+  bool     dwt_synthetic = false;
+  bool     dwt_repair_candidate = false;
+  uint32_t dwt_original_at_event = 0;
+  uint32_t dwt_predicted_at_event = 0;
+  uint32_t dwt_used_at_event = 0;
+  uint32_t dwt_isr_entry_raw = 0;
+  int32_t  dwt_synthetic_error_cycles = 0;
+  uint32_t dwt_synthetic_threshold_cycles = 0;
+  bool     dwt_interval_gate_valid = false;
+  bool     dwt_interval_sample_accepted = false;
+  bool     dwt_interval_sample_rejected = false;
+  bool     dwt_interval_ema_updated = false;
+  uint32_t dwt_interval_observed_cycles = 0;
+  uint32_t dwt_interval_prediction_cycles = 0;
+  uint32_t dwt_interval_effective_cycles = 0;
+  int32_t  dwt_interval_residual_cycles = 0;
+  uint32_t dwt_interval_gate_threshold_cycles = 0;
+  uint32_t dwt_interval_accept_count = 0;
+  uint32_t dwt_interval_reject_count = 0;
+
   int64_t  second_residual_ns = 0;
   int64_t  window_error_ns = 0;
   uint32_t window_checks = 0;
@@ -1744,6 +1765,25 @@ static void alpha_forensics_reset_store(alpha_lane_forensics_store_t& s) {
   s.bridge_interval_valid = false;
   s.ns_between_edges = 0;
   s.dwt_cycles_between_edges = 0;
+  s.dwt_synthetic = false;
+  s.dwt_repair_candidate = false;
+  s.dwt_original_at_event = 0;
+  s.dwt_predicted_at_event = 0;
+  s.dwt_used_at_event = 0;
+  s.dwt_isr_entry_raw = 0;
+  s.dwt_synthetic_error_cycles = 0;
+  s.dwt_synthetic_threshold_cycles = 0;
+  s.dwt_interval_gate_valid = false;
+  s.dwt_interval_sample_accepted = false;
+  s.dwt_interval_sample_rejected = false;
+  s.dwt_interval_ema_updated = false;
+  s.dwt_interval_observed_cycles = 0;
+  s.dwt_interval_prediction_cycles = 0;
+  s.dwt_interval_effective_cycles = 0;
+  s.dwt_interval_residual_cycles = 0;
+  s.dwt_interval_gate_threshold_cycles = 0;
+  s.dwt_interval_accept_count = 0;
+  s.dwt_interval_reject_count = 0;
   s.second_residual_ns = 0;
   s.window_error_ns = 0;
   s.window_checks = 0;
@@ -1909,6 +1949,27 @@ static void alpha_forensics_publish(time_clock_id_t clock_id,
   s->window_mismatches = clock.window_mismatches;
 
   if (diag) {
+    s->dwt_synthetic = diag->dwt_synthetic;
+    s->dwt_repair_candidate = diag->dwt_repair_candidate;
+    s->dwt_original_at_event = diag->dwt_original_at_event;
+    s->dwt_predicted_at_event = diag->dwt_predicted_at_event;
+    s->dwt_used_at_event = diag->dwt_used_at_event;
+    s->dwt_isr_entry_raw = diag->dwt_isr_entry_raw;
+    s->dwt_synthetic_error_cycles = diag->dwt_synthetic_error_cycles;
+    s->dwt_synthetic_threshold_cycles = diag->dwt_synthetic_threshold_cycles;
+    s->dwt_interval_gate_valid = diag->dwt_interval_gate_valid;
+    s->dwt_interval_sample_accepted = diag->dwt_interval_sample_accepted;
+    s->dwt_interval_sample_rejected = diag->dwt_interval_sample_rejected;
+    s->dwt_interval_ema_updated = diag->dwt_interval_ema_updated;
+    s->dwt_interval_observed_cycles = diag->dwt_interval_observed_cycles;
+    s->dwt_interval_prediction_cycles = diag->dwt_interval_prediction_cycles;
+    s->dwt_interval_effective_cycles = diag->dwt_interval_effective_cycles;
+    s->dwt_interval_residual_cycles = diag->dwt_interval_residual_cycles;
+    s->dwt_interval_gate_threshold_cycles = diag->dwt_interval_gate_threshold_cycles;
+    s->dwt_interval_accept_count = diag->dwt_interval_accept_count;
+    s->dwt_interval_reject_count = diag->dwt_interval_reject_count;
+
+
     s->diag_anchor_sequence_used = diag->anchor_sequence_used;
     s->diag_anchor_age_slots = diag->anchor_age_slots;
     s->diag_anchor_selection_kind = diag->anchor_selection_kind;
@@ -1990,6 +2051,25 @@ static void alpha_forensics_publish(time_clock_id_t clock_id,
     s->regression_fit_error_abs_gt4_count =
         diag->regression_fit_error_abs_gt4_count;
   } else {
+    s->dwt_synthetic = false;
+    s->dwt_repair_candidate = false;
+    s->dwt_original_at_event = 0;
+    s->dwt_predicted_at_event = 0;
+    s->dwt_used_at_event = 0;
+    s->dwt_isr_entry_raw = 0;
+    s->dwt_synthetic_error_cycles = 0;
+    s->dwt_synthetic_threshold_cycles = 0;
+    s->dwt_interval_gate_valid = false;
+    s->dwt_interval_sample_accepted = false;
+    s->dwt_interval_sample_rejected = false;
+    s->dwt_interval_ema_updated = false;
+    s->dwt_interval_observed_cycles = 0;
+    s->dwt_interval_prediction_cycles = 0;
+    s->dwt_interval_effective_cycles = 0;
+    s->dwt_interval_residual_cycles = 0;
+    s->dwt_interval_gate_threshold_cycles = 0;
+    s->dwt_interval_accept_count = 0;
+    s->dwt_interval_reject_count = 0;
     s->diag_anchor_sequence_used = 0;
     s->diag_anchor_age_slots = 0;
     s->diag_anchor_selection_kind = 0;
@@ -2096,6 +2176,25 @@ bool clocks_alpha_lane_forensics(time_clock_id_t clock,
     out->bridge_interval_valid = s->bridge_interval_valid;
     out->ns_between_edges = s->ns_between_edges;
     out->dwt_cycles_between_edges = s->dwt_cycles_between_edges;
+    out->dwt_synthetic = s->dwt_synthetic;
+    out->dwt_repair_candidate = s->dwt_repair_candidate;
+    out->dwt_original_at_event = s->dwt_original_at_event;
+    out->dwt_predicted_at_event = s->dwt_predicted_at_event;
+    out->dwt_used_at_event = s->dwt_used_at_event;
+    out->dwt_isr_entry_raw = s->dwt_isr_entry_raw;
+    out->dwt_synthetic_error_cycles = s->dwt_synthetic_error_cycles;
+    out->dwt_synthetic_threshold_cycles = s->dwt_synthetic_threshold_cycles;
+    out->dwt_interval_gate_valid = s->dwt_interval_gate_valid;
+    out->dwt_interval_sample_accepted = s->dwt_interval_sample_accepted;
+    out->dwt_interval_sample_rejected = s->dwt_interval_sample_rejected;
+    out->dwt_interval_ema_updated = s->dwt_interval_ema_updated;
+    out->dwt_interval_observed_cycles = s->dwt_interval_observed_cycles;
+    out->dwt_interval_prediction_cycles = s->dwt_interval_prediction_cycles;
+    out->dwt_interval_effective_cycles = s->dwt_interval_effective_cycles;
+    out->dwt_interval_residual_cycles = s->dwt_interval_residual_cycles;
+    out->dwt_interval_gate_threshold_cycles = s->dwt_interval_gate_threshold_cycles;
+    out->dwt_interval_accept_count = s->dwt_interval_accept_count;
+    out->dwt_interval_reject_count = s->dwt_interval_reject_count;
     out->second_residual_ns = s->second_residual_ns;
     out->window_error_ns = s->window_error_ns;
     out->window_checks = s->window_checks;

@@ -313,6 +313,35 @@ struct clocks_alpha_lane_forensics_t {
 
   uint64_t ns_between_edges;
   uint32_t dwt_cycles_between_edges;
+
+  // process_interrupt-authored DWT interval gate audit.  The normal Alpha
+  // timing path consumes last_event_dwt / dwt_cycles_between_edges as the
+  // effective subscriber coordinate.  These fields retain the raw observed
+  // endpoint/interval and the gate decision that decided whether the EMA was
+  // allowed to learn from that sample.
+  bool     dwt_synthetic;
+  bool     dwt_repair_candidate;
+  uint32_t dwt_original_at_event;
+  uint32_t dwt_predicted_at_event;
+  uint32_t dwt_used_at_event;
+  uint32_t dwt_isr_entry_raw;
+  int32_t  dwt_synthetic_error_cycles;
+  uint32_t dwt_synthetic_threshold_cycles;
+  bool     dwt_interval_gate_valid;
+  bool     dwt_interval_sample_accepted;
+  bool     dwt_interval_sample_rejected;
+  bool     dwt_interval_ema_updated;
+  uint32_t dwt_interval_observed_cycles;
+  uint32_t dwt_interval_prediction_cycles;
+  uint32_t dwt_interval_effective_cycles;
+  int32_t  dwt_interval_residual_cycles;
+  uint32_t dwt_interval_gate_threshold_cycles;
+  uint32_t dwt_interval_accept_count;
+  uint32_t dwt_interval_reject_count;
+  bool     dwt_interval_resync_applied;
+  uint32_t dwt_interval_resync_count;
+  uint32_t dwt_interval_reject_streak;
+
   int64_t  second_residual_ns;
   int64_t  window_error_ns;
   uint32_t window_checks;

@@ -1019,6 +1019,44 @@ static void payload_add_lane_forensics_flat(Payload& p,
   add_u32("alpha_event_last_event_dwt", valid ? f.last_event_dwt : 0U);  // raw_cycles alias
   add_u32("forensics_last_event_counter32", valid ? f.last_event_counter32 : 0U);
   add_u32("forensics_dwt_cycles_between_edges", valid ? f.dwt_cycles_between_edges : 0U);
+  add_bool("forensics_dwt_synthetic", valid && f.dwt_synthetic);
+  add_bool("forensics_dwt_repair_candidate", valid && f.dwt_repair_candidate);
+  add_u32("forensics_dwt_original_at_event", valid ? f.dwt_original_at_event : 0U);
+  add_u32("forensics_dwt_predicted_at_event", valid ? f.dwt_predicted_at_event : 0U);
+  add_u32("forensics_dwt_used_at_event", valid ? f.dwt_used_at_event : 0U);
+  add_u32("forensics_dwt_isr_entry_raw", valid ? f.dwt_isr_entry_raw : 0U);
+  add_i32("forensics_dwt_synthetic_error_cycles",
+          valid ? f.dwt_synthetic_error_cycles : 0);
+  add_u32("forensics_dwt_synthetic_threshold_cycles",
+          valid ? f.dwt_synthetic_threshold_cycles : 0U);
+  add_bool("forensics_dwt_interval_gate_valid",
+           valid && f.dwt_interval_gate_valid);
+  add_bool("forensics_dwt_interval_sample_accepted",
+           valid && f.dwt_interval_sample_accepted);
+  add_bool("forensics_dwt_interval_sample_rejected",
+           valid && f.dwt_interval_sample_rejected);
+  add_bool("forensics_dwt_interval_ema_updated",
+           valid && f.dwt_interval_ema_updated);
+  add_u32("forensics_dwt_interval_observed_cycles",
+          valid ? f.dwt_interval_observed_cycles : 0U);
+  add_u32("forensics_dwt_interval_prediction_cycles",
+          valid ? f.dwt_interval_prediction_cycles : 0U);
+  add_u32("forensics_dwt_interval_effective_cycles",
+          valid ? f.dwt_interval_effective_cycles : 0U);
+  add_i32("forensics_dwt_interval_residual_cycles",
+          valid ? f.dwt_interval_residual_cycles : 0);
+  add_u32("forensics_dwt_interval_gate_threshold_cycles",
+          valid ? f.dwt_interval_gate_threshold_cycles : 0U);
+  add_u32("forensics_dwt_interval_accept_count",
+          valid ? f.dwt_interval_accept_count : 0U);
+  add_u32("forensics_dwt_interval_reject_count",
+          valid ? f.dwt_interval_reject_count : 0U);
+  add_bool("forensics_dwt_interval_resync_applied",
+           valid && f.dwt_interval_resync_applied);
+  add_u32("forensics_dwt_interval_resync_count",
+          valid ? f.dwt_interval_resync_count : 0U);
+  add_u32("forensics_dwt_interval_reject_streak",
+          valid ? f.dwt_interval_reject_streak : 0U);
   add_u32("forensics_counter32_delta_since_previous_event",
           valid ? f.counter32_delta_since_previous_event : 0U);
   add_u32("forensics_zero_offset_counter32", valid ? f.zero_offset_counter32 : 0U);
@@ -1280,6 +1318,34 @@ static void payload_add_lane_forensics_object(Payload& parent,
   forensics.add("last_event_dwt", valid ? f.last_event_dwt : 0U);
   forensics.add("last_event_counter32", valid ? f.last_event_counter32 : 0U);
   forensics.add("dwt_cycles_between_edges", valid ? f.dwt_cycles_between_edges : 0U);
+  forensics.add("dwt_synthetic", valid && f.dwt_synthetic);
+  forensics.add("dwt_repair_candidate", valid && f.dwt_repair_candidate);
+  forensics.add("dwt_original_at_event", valid ? f.dwt_original_at_event : 0U);
+  forensics.add("dwt_predicted_at_event", valid ? f.dwt_predicted_at_event : 0U);
+  forensics.add("dwt_used_at_event", valid ? f.dwt_used_at_event : 0U);
+  forensics.add("dwt_isr_entry_raw", valid ? f.dwt_isr_entry_raw : 0U);
+  forensics.add("dwt_synthetic_error_cycles",
+                valid ? f.dwt_synthetic_error_cycles : 0);
+  forensics.add("dwt_synthetic_threshold_cycles",
+                valid ? f.dwt_synthetic_threshold_cycles : 0U);
+
+  Payload gate;
+  gate.add("valid", valid && f.dwt_interval_gate_valid);
+  gate.add("accepted", valid && f.dwt_interval_sample_accepted);
+  gate.add("rejected", valid && f.dwt_interval_sample_rejected);
+  gate.add("ema_updated", valid && f.dwt_interval_ema_updated);
+  gate.add("observed_cycles", valid ? f.dwt_interval_observed_cycles : 0U);
+  gate.add("prediction_cycles", valid ? f.dwt_interval_prediction_cycles : 0U);
+  gate.add("effective_cycles", valid ? f.dwt_interval_effective_cycles : 0U);
+  gate.add("residual_cycles", valid ? f.dwt_interval_residual_cycles : 0);
+  gate.add("threshold_cycles", valid ? f.dwt_interval_gate_threshold_cycles : 0U);
+  gate.add("accept_count", valid ? f.dwt_interval_accept_count : 0U);
+  gate.add("reject_count", valid ? f.dwt_interval_reject_count : 0U);
+  gate.add("resync_applied", valid && f.dwt_interval_resync_applied);
+  gate.add("resync_count", valid ? f.dwt_interval_resync_count : 0U);
+  gate.add("reject_streak", valid ? f.dwt_interval_reject_streak : 0U);
+  forensics.add_object("dwt_interval_gate", gate);
+
   forensics.add("counter32_delta_since_previous_event",
                 valid ? f.counter32_delta_since_previous_event : 0U);
   forensics.add("zero_offset_counter32", valid ? f.zero_offset_counter32 : 0U);
@@ -1292,81 +1358,38 @@ static void payload_add_ocxo_service_object(Payload& parent,
                                             bool valid,
                                             const clocks_alpha_lane_forensics_t& f) {
   Payload service;
+
+  // Keep TIMEBASE_FORENSICS below transport/Payload pressure.  The full OCXO
+  // service surface is still available through focused interrupt/CLOCKS reports;
+  // TIMEBASE_FORENSICS carries only the fields needed to correlate raw-cycle
+  // residuals with compare-service timing and counter-ladder health.
   service.add("class", valid ? f.diag_service_class : 0U);
   service.add("offset_ticks", valid ? f.diag_service_offset_signed_ticks : 0);
   service.add("offset_abs_ticks", valid ? f.diag_service_offset_abs_ticks : 0U);
   service.add("late_ticks", valid ? f.diag_interpreted_late_ticks : 0U);
   service.add("early_ticks", valid ? f.diag_early_ticks : 0U);
-  service.add("target_delta_mod65536_ticks",
-              valid ? f.diag_target_delta_mod65536_ticks : 0U);
   service.add("arm_remaining_ticks", valid ? f.diag_arm_remaining_ticks : 0U);
   service.add("arm_to_isr_ticks", valid ? f.diag_arm_to_isr_ticks : 0U);
   service.add("arm_to_isr_dwt_cycles", valid ? f.diag_arm_to_isr_dwt_cycles : 0U);
-  service.add("perishable_fact_sequence",
-              valid ? f.diag_perishable_fact_sequence : 0U);
   service.add("correction_cycles", valid ? f.diag_service_correction_cycles : 0);
   service.add("corrected_dwt_at_event",
               valid ? f.diag_service_corrected_dwt_at_event : 0U);
-  service.add("fact_ring_overflow_count",
-              valid ? f.diag_fact_ring_overflow_count : 0U);
-  service.add("counter_delta_violation_count",
-              valid ? f.diag_counter_delta_violation_count : 0U);
-  service.add("last_bad_counter_delta", valid ? f.diag_last_bad_counter_delta : 0U);
   service.add("last_counter_delta_ticks", valid ? f.diag_last_counter_delta_ticks : 0U);
-  service.add("sample_phase_valid", valid && f.diag_sample_phase_valid);
-  service.add("sample_phase_ticks", valid ? f.diag_sample_phase_ticks : 0U);
-  service.add("sample_phase_us", valid ? f.diag_sample_phase_us : 0U);
-  service.add("sample_phase_ns", valid ? f.diag_sample_phase_ns : 0U);
-  service.add("sample_period_ticks", valid ? f.diag_sample_period_ticks : 0U);
-  service.add("sample_dwt_at_event", valid ? f.diag_sample_dwt_at_event : 0U);
-  service.add("sample_counter32_at_event",
-              valid ? f.diag_sample_counter32_at_event : 0U);
-  service.add("boundary_dwt_at_event", valid ? f.diag_boundary_dwt_at_event : 0U);
-  service.add("boundary_counter32_at_event",
-              valid ? f.diag_boundary_counter32_at_event : 0U);
-  service.add("boundary_correction_cycles",
-              valid ? f.diag_boundary_correction_cycles : 0);
   parent.add_object("service", service);
 }
 
 static void payload_add_lane_regression_object(Payload& parent,
-                                               bool valid,
-                                               const clocks_alpha_lane_forensics_t& f) {
+                                               bool,
+                                               const clocks_alpha_lane_forensics_t&) {
   Payload regression;
+
+  // Regression is disabled in this build.  Publishing the full zero-valued
+  // regression block in every TIMEBASE_FORENSICS row needlessly consumes the
+  // Payload arena and can prevent the paired forensics row from reaching the Pi.
+  // Keep a tiny shape-stable marker so downstream readers can distinguish
+  // "disabled" from "missing due to schema failure".
   regression.add("enabled", false);
   regression.add("valid", false);
-  regression.add("sequence", valid ? f.regression_sequence : 0U);
-  regression.add("sample_count", valid ? f.regression_sample_count : 0U);
-  regression.add("observed_dwt_at_event",
-                 valid ? f.regression_observed_dwt_at_event : 0U);
-  regression.add("inferred_dwt_at_event",
-                 valid ? f.regression_inferred_dwt_at_event : 0U);
-  regression.add("inferred_minus_observed_cycles",
-                 valid ? f.regression_inferred_minus_observed_cycles : 0);
-  regression.add("target_counter32_at_event",
-                 valid ? f.regression_target_counter32_at_event : 0U);
-  regression.add("target_hardware16_at_event",
-                 valid ? (uint32_t)f.regression_target_hardware16_at_event : 0U);
-  regression.add("observed_hardware16_at_event",
-                 valid ? (uint32_t)f.regression_observed_hardware16_at_event : 0U);
-  regression.add("slope_q16_cycles_per_sample",
-                 valid ? f.regression_slope_q16_cycles_per_sample : 0ULL);
-  regression.add("slope_delta_q16_cycles_per_sample",
-                 valid ? f.regression_slope_delta_q16_cycles_per_sample : 0LL);
-  regression.add("fit_error_mean_q16_cycles",
-                 valid ? f.regression_fit_error_mean_q16_cycles : 0);
-  regression.add("fit_error_stddev_q16_cycles",
-                 valid ? f.regression_fit_error_stddev_q16_cycles : 0U);
-  regression.add("fit_error_min_cycles",
-                 valid ? f.regression_fit_error_min_cycles : 0);
-  regression.add("fit_error_max_cycles",
-                 valid ? f.regression_fit_error_max_cycles : 0);
-  regression.add("fit_error_gt_plus4_count",
-                 valid ? f.regression_fit_error_gt_plus4_count : 0U);
-  regression.add("fit_error_lt_minus4_count",
-                 valid ? f.regression_fit_error_lt_minus4_count : 0U);
-  regression.add("fit_error_abs_gt4_count",
-                 valid ? f.regression_fit_error_abs_gt4_count : 0U);
   parent.add_object("regression", regression);
 }
 

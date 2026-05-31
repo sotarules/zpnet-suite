@@ -146,6 +146,16 @@ static constexpr uint32_t VCLOCK_EMA_ALPHA_NUMERATOR = 1;
 static constexpr uint32_t VCLOCK_EMA_ALPHA_DENOMINATOR = (1U << VCLOCK_EMA_SHIFT);
 static constexpr uint32_t VCLOCK_EMA_AUDIT_THRESHOLD_CYCLES = 32;
 
+// DWT interval admissibility gate.  Thermal drift of the Teensy DWT ruler is
+// slow, so a one-second interval residual above this threshold is treated as
+// an ISR/service excursion rather than a legitimate clock change.  Rejected
+// samples are published as projected DWT endpoints and do not update the EMA.
+static constexpr uint32_t DWT_EMA_INTERVAL_GATE_THRESHOLD_CYCLES = 500U;
+static constexpr uint32_t VCLOCK_EMA_INTERVAL_GATE_THRESHOLD_CYCLES =
+    DWT_EMA_INTERVAL_GATE_THRESHOLD_CYCLES;
+static constexpr uint32_t OCXO_EMA_INTERVAL_GATE_THRESHOLD_CYCLES =
+    DWT_EMA_INTERVAL_GATE_THRESHOLD_CYCLES;
+
 // Epoch-ready PPS capture packet.  The ISR captures the first-instruction DWT
 // and the three lane hardware counters in one tiny custody window.  DWT runs
 // at ~1.008 GHz, so 101 cycles is roughly one 10 MHz tick.  The packet remains
@@ -723,6 +733,7 @@ bool interrupt_last_epoch_capture(interrupt_epoch_capture_t* out) {
 
 static pps_edge_dispatch_fn g_pps_edge_dispatch = nullptr;
 static void pps_edge_dispatch_trampoline(timepop_ctx_t*, timepop_diag_t*, void*);
+static void pps_edge_dispatch_arm_or_call_from_foreground(const char* name);
 
 // ============================================================================
 // DWT cycles-per-second compatibility
@@ -1158,7 +1169,7 @@ static volatile uint32_t g_vclock_heartbeat_epoch_pending_skip_count = 0;
 struct dwt_repair_diag_t {
   bool     valid = false;
   bool     candidate = false;
-  bool     synthetic = false;   // operational replacement applied; currently false
+  bool     synthetic = false;
   uint32_t original_dwt = 0;
   uint32_t predicted_dwt = 0;
   uint32_t used_dwt = 0;
@@ -1166,6 +1177,24 @@ struct dwt_repair_diag_t {
   int32_t  error_cycles = 0;
   uint32_t threshold_cycles = 0;
   const char* reason = "none";
+
+  // One-second DWT interval gate audit.  original_dwt/predicted_dwt/used_dwt
+  // are endpoint facts; these fields expose the interval decision that
+  // protected the EMA from a raw service-time excursion.
+  bool     interval_gate_valid = false;
+  bool     interval_sample_accepted = false;
+  bool     interval_sample_rejected = false;
+  bool     interval_ema_updated = false;
+  uint32_t interval_observed_cycles = 0;
+  uint32_t interval_prediction_cycles = 0;
+  uint32_t interval_effective_cycles = 0;
+  int32_t  interval_residual_cycles = 0;
+  uint32_t interval_gate_threshold_cycles = 0;
+  uint32_t interval_accept_count = 0;
+  uint32_t interval_reject_count = 0;
+  bool     interval_resync_applied = false;
+  uint32_t interval_resync_count = 0;
+  uint32_t interval_reject_streak = 0;
 };
 
 struct vclock_repair_stats_t {
@@ -1708,9 +1737,22 @@ struct vclock_lane_t {
   uint32_t ema_last_observed_interval_cycles = 0;
   uint32_t ema_interval_cycles = 0;
   uint32_t ema_last_predicted_dwt = 0;
+  uint32_t ema_last_interval_prediction_cycles = 0;
+  uint32_t ema_last_effective_interval_cycles = 0;
   int32_t  ema_last_error_cycles = 0;
+  int32_t  ema_last_interval_residual_cycles = 0;
   uint32_t ema_max_abs_error_cycles = 0;
   uint32_t ema_update_count = 0;
+  uint32_t ema_gate_accept_count = 0;
+  uint32_t ema_gate_reject_count = 0;
+  bool     ema_last_interval_gate_valid = false;
+  bool     ema_last_interval_accepted = false;
+  bool     ema_last_interval_rejected = false;
+  bool     ema_last_interval_ema_updated = false;
+  bool     ema_last_interval_resync_applied = false;
+  uint32_t ema_gate_reject_streak = 0;
+  uint32_t ema_gate_resync_count = 0;
+  uint32_t ema_last_rejected_observed_interval_cycles = 0;
 };
 static vclock_lane_t g_vclock_lane;
 
@@ -1733,20 +1775,81 @@ static void vclock_lane_ema_reset(vclock_lane_t& lane) {
   lane.ema_last_observed_interval_cycles = 0;
   lane.ema_interval_cycles = 0;
   lane.ema_last_predicted_dwt = 0;
+  lane.ema_last_interval_prediction_cycles = 0;
+  lane.ema_last_effective_interval_cycles = 0;
   lane.ema_last_error_cycles = 0;
+  lane.ema_last_interval_residual_cycles = 0;
   lane.ema_max_abs_error_cycles = 0;
   lane.ema_update_count = 0;
+  lane.ema_gate_accept_count = 0;
+  lane.ema_gate_reject_count = 0;
+  lane.ema_last_interval_gate_valid = false;
+  lane.ema_last_interval_accepted = false;
+  lane.ema_last_interval_rejected = false;
+  lane.ema_last_interval_ema_updated = false;
+  lane.ema_last_interval_resync_applied = false;
+  lane.ema_gate_reject_streak = 0;
+  lane.ema_gate_resync_count = 0;
+  lane.ema_last_rejected_observed_interval_cycles = 0;
   g_vclock_repair_stats = vclock_repair_stats_t{};
+}
+
+static void dwt_repair_diag_set_interval(dwt_repair_diag_t* out,
+                                         bool gate_valid,
+                                         bool accepted,
+                                         bool rejected,
+                                         bool ema_updated,
+                                         uint32_t observed_cycles,
+                                         uint32_t prediction_cycles,
+                                         uint32_t effective_cycles,
+                                         int32_t residual_cycles,
+                                         uint32_t threshold_cycles,
+                                         uint32_t accept_count,
+                                         uint32_t reject_count,
+                                         bool resync_applied,
+                                         uint32_t resync_count,
+                                         uint32_t reject_streak) {
+  if (!out) return;
+  out->interval_gate_valid = gate_valid;
+  out->interval_sample_accepted = accepted;
+  out->interval_sample_rejected = rejected;
+  out->interval_ema_updated = ema_updated;
+  out->interval_observed_cycles = observed_cycles;
+  out->interval_prediction_cycles = prediction_cycles;
+  out->interval_effective_cycles = effective_cycles;
+  out->interval_residual_cycles = residual_cycles;
+  out->interval_gate_threshold_cycles = threshold_cycles;
+  out->interval_accept_count = accept_count;
+  out->interval_reject_count = reject_count;
+  out->interval_resync_applied = resync_applied;
+  out->interval_resync_count = resync_count;
+  out->interval_reject_streak = reject_streak;
 }
 
 static uint32_t vclock_lane_ema_predict_dwt(vclock_lane_t& lane,
                                             uint32_t observed_dwt,
                                             bool* out_synthetic,
-                                            int32_t* out_error_cycles) {
+                                            int32_t* out_error_cycles,
+                                            dwt_repair_diag_t* out_diag = nullptr) {
   if (out_synthetic) *out_synthetic = false;
   if (out_error_cycles) *out_error_cycles = 0;
+  if (out_diag) {
+    out_diag->interval_gate_threshold_cycles =
+        VCLOCK_EMA_INTERVAL_GATE_THRESHOLD_CYCLES;
+  }
 
   if (!VCLOCK_EMA_DWT_AUTHORITY_ENABLED) {
+    lane.ema_last_observed_dwt = observed_dwt;
+    lane.ema_last_emitted_dwt = observed_dwt;
+    lane.ema_last_predicted_dwt = observed_dwt;
+    dwt_repair_diag_set_interval(out_diag, false, false, false, false,
+                                 0, 0, 0, 0,
+                                 VCLOCK_EMA_INTERVAL_GATE_THRESHOLD_CYCLES,
+                                 lane.ema_gate_accept_count,
+                                 lane.ema_gate_reject_count,
+                                 false,
+                                 lane.ema_gate_resync_count,
+                                 lane.ema_gate_reject_streak);
     return observed_dwt;
   }
 
@@ -1756,7 +1859,17 @@ static uint32_t vclock_lane_ema_predict_dwt(vclock_lane_t& lane,
     lane.ema_last_emitted_dwt = observed_dwt;
     lane.ema_last_predicted_dwt = observed_dwt;
     lane.ema_last_observed_interval_cycles = 0;
+    lane.ema_last_interval_prediction_cycles = 0;
+    lane.ema_last_effective_interval_cycles = 0;
     lane.ema_last_error_cycles = 0;
+    lane.ema_last_interval_residual_cycles = 0;
+    lane.ema_last_interval_gate_valid = false;
+    lane.ema_last_interval_accepted = false;
+    lane.ema_last_interval_rejected = false;
+    lane.ema_last_interval_ema_updated = false;
+    lane.ema_last_interval_resync_applied = false;
+    lane.ema_gate_reject_streak = 0;
+    lane.ema_last_rejected_observed_interval_cycles = 0;
     lane.ema_update_count++;
 
     g_vclock_repair_stats.last_original_dwt = observed_dwt;
@@ -1765,38 +1878,120 @@ static uint32_t vclock_lane_ema_predict_dwt(vclock_lane_t& lane,
     g_vclock_repair_stats.last_error_cycles = 0;
     g_vclock_repair_stats.last_candidate = false;
     g_vclock_repair_stats.last_synthetic = false;
+    dwt_repair_diag_set_interval(out_diag, false, false, false, false,
+                                 0, 0, 0, 0,
+                                 VCLOCK_EMA_INTERVAL_GATE_THRESHOLD_CYCLES,
+                                 lane.ema_gate_accept_count,
+                                 lane.ema_gate_reject_count,
+                                 false,
+                                 lane.ema_gate_resync_count,
+                                 lane.ema_gate_reject_streak);
     return observed_dwt;
   }
 
   const uint32_t observed_interval = observed_dwt - lane.ema_last_observed_dwt;
-  lane.ema_last_observed_interval_cycles = observed_interval;
+  const bool have_prediction = lane.ema_interval_valid &&
+                               lane.ema_interval_cycles != 0;
+  const uint32_t prediction_interval = have_prediction
+      ? lane.ema_interval_cycles
+      : 0U;
+  int32_t interval_residual = 0;
+  bool gate_valid = false;
+  bool accepted = false;
+  bool rejected = false;
+  bool ema_updated = false;
 
-  if (!lane.ema_interval_valid || lane.ema_interval_cycles == 0) {
+  lane.ema_last_observed_interval_cycles = observed_interval;
+  bool resync_applied = false;
+  uint32_t effective_interval = have_prediction ? prediction_interval : observed_interval;
+
+  if (!have_prediction) {
+    // First completed interval seeds the ruler.  There is no lane-local prior
+    // interval yet, so no threshold decision is meaningful on this sample.
     lane.ema_interval_cycles = observed_interval;
-    lane.ema_interval_valid = true;
+    lane.ema_interval_valid = (observed_interval != 0);
+    accepted = lane.ema_interval_valid;
+    ema_updated = lane.ema_interval_valid;
+    if (accepted) {
+      lane.ema_gate_accept_count++;
+      lane.ema_gate_reject_streak = 0;
+      lane.ema_last_rejected_observed_interval_cycles = 0;
+    }
+    effective_interval = lane.ema_interval_cycles;
   } else {
-    const int32_t err = (int32_t)((int64_t)observed_interval -
-                                  (int64_t)lane.ema_interval_cycles);
-    lane.ema_interval_cycles = (uint32_t)((int64_t)lane.ema_interval_cycles +
-        (int64_t)dwt_ema_round_shift(err, VCLOCK_EMA_SHIFT));
+    gate_valid = true;
+    interval_residual = (int32_t)((int64_t)observed_interval -
+                                  (int64_t)prediction_interval);
+    const uint32_t abs_residual = dwt_ema_abs_i32(interval_residual);
+    if (abs_residual > VCLOCK_EMA_INTERVAL_GATE_THRESHOLD_CYCLES) {
+      rejected = true;
+      lane.ema_gate_reject_count++;
+
+      const bool coherent_reject =
+          lane.ema_gate_reject_streak > 0 &&
+          dwt_ema_abs_i32((int32_t)((int64_t)observed_interval -
+                                    (int64_t)lane.ema_last_rejected_observed_interval_cycles)) <=
+              VCLOCK_EMA_INTERVAL_GATE_THRESHOLD_CYCLES;
+      lane.ema_gate_reject_streak++;
+      lane.ema_last_rejected_observed_interval_cycles = observed_interval;
+
+      // Still emit this row using the old effective ruler.  If multiple raw
+      // intervals in a row agree with each other while disagreeing with the
+      // current predictor, the predictor was probably born from a bad seed or
+      // has fallen behind a real state change.  Re-seed only for the NEXT row.
+      if (coherent_reject) {
+        lane.ema_interval_cycles = observed_interval;
+        lane.ema_interval_valid = (observed_interval != 0);
+        lane.ema_gate_resync_count++;
+        resync_applied = true;
+      }
+    } else {
+      accepted = true;
+      ema_updated = true;
+      lane.ema_interval_cycles = (uint32_t)((int64_t)lane.ema_interval_cycles +
+          (int64_t)dwt_ema_round_shift(interval_residual, VCLOCK_EMA_SHIFT));
+      lane.ema_gate_accept_count++;
+      lane.ema_gate_reject_streak = 0;
+      lane.ema_last_rejected_observed_interval_cycles = 0;
+      effective_interval = lane.ema_interval_cycles;
+    }
   }
 
-  const uint32_t predicted = lane.ema_last_emitted_dwt + lane.ema_interval_cycles;
+  const uint32_t previous_emitted_dwt = lane.ema_last_emitted_dwt;
+  const uint32_t predicted = previous_emitted_dwt + effective_interval;
   const int32_t prediction_error = (int32_t)(observed_dwt - predicted);
-  lane.ema_last_error_cycles = prediction_error;
   const uint32_t abs_error = dwt_ema_abs_i32(prediction_error);
+
+  lane.ema_last_error_cycles = prediction_error;
+  lane.ema_last_interval_residual_cycles = interval_residual;
+  lane.ema_last_interval_prediction_cycles = prediction_interval;
+  lane.ema_last_effective_interval_cycles = effective_interval;
+  lane.ema_last_interval_gate_valid = gate_valid;
+  lane.ema_last_interval_accepted = accepted;
+  lane.ema_last_interval_rejected = rejected;
+  lane.ema_last_interval_ema_updated = ema_updated;
+  lane.ema_last_interval_resync_applied = resync_applied;
   if (abs_error > lane.ema_max_abs_error_cycles) {
     lane.ema_max_abs_error_cycles = abs_error;
   }
 
+  // Always advance the observed endpoint.  A single late ISR endpoint poisons
+  // the raw interval on both sides of that endpoint; updating the raw endpoint
+  // lets the following recovery interval be rejected once, then normal service
+  // resumes without permanently locking the EMA to a stale observation.
   lane.ema_last_observed_dwt = observed_dwt;
   lane.ema_last_emitted_dwt = predicted;
   lane.ema_last_predicted_dwt = predicted;
   lane.ema_update_count++;
 
-  g_vclock_repair_stats.candidate_count++;
-  g_vclock_repair_stats.applied_count++;
-  g_vclock_repair_stats.consecutive_candidate_count++;
+  const bool synthetic = (predicted != observed_dwt);
+  if (synthetic) {
+    g_vclock_repair_stats.candidate_count++;
+    g_vclock_repair_stats.applied_count++;
+    g_vclock_repair_stats.consecutive_candidate_count++;
+  } else {
+    g_vclock_repair_stats.consecutive_candidate_count = 0;
+  }
   g_vclock_repair_stats.last_original_dwt = observed_dwt;
   g_vclock_repair_stats.last_predicted_dwt = predicted;
   g_vclock_repair_stats.last_used_dwt = predicted;
@@ -1804,11 +1999,21 @@ static uint32_t vclock_lane_ema_predict_dwt(vclock_lane_t& lane,
   if (abs_error > g_vclock_repair_stats.max_abs_error_cycles) {
     g_vclock_repair_stats.max_abs_error_cycles = abs_error;
   }
-  g_vclock_repair_stats.last_candidate = true;
-  g_vclock_repair_stats.last_synthetic = true;
+  g_vclock_repair_stats.last_candidate = synthetic;
+  g_vclock_repair_stats.last_synthetic = synthetic;
 
-  if (out_synthetic) *out_synthetic = true;
+  if (out_synthetic) *out_synthetic = synthetic;
   if (out_error_cycles) *out_error_cycles = prediction_error;
+  dwt_repair_diag_set_interval(out_diag, gate_valid, accepted, rejected,
+                               ema_updated, observed_interval,
+                               prediction_interval, effective_interval,
+                               interval_residual,
+                               VCLOCK_EMA_INTERVAL_GATE_THRESHOLD_CYCLES,
+                               lane.ema_gate_accept_count,
+                               lane.ema_gate_reject_count,
+                               resync_applied,
+                               lane.ema_gate_resync_count,
+                               lane.ema_gate_reject_streak);
   return predicted;
 }
 
@@ -1988,9 +2193,22 @@ struct ocxo_lane_t {
   uint32_t ema_last_observed_interval_cycles = 0;
   uint32_t ema_interval_cycles = 0;
   uint32_t ema_last_predicted_dwt = 0;
+  uint32_t ema_last_interval_prediction_cycles = 0;
+  uint32_t ema_last_effective_interval_cycles = 0;
   int32_t  ema_last_error_cycles = 0;
+  int32_t  ema_last_interval_residual_cycles = 0;
   uint32_t ema_max_abs_error_cycles = 0;
   uint32_t ema_update_count = 0;
+  uint32_t ema_gate_accept_count = 0;
+  uint32_t ema_gate_reject_count = 0;
+  bool     ema_last_interval_gate_valid = false;
+  bool     ema_last_interval_accepted = false;
+  bool     ema_last_interval_rejected = false;
+  bool     ema_last_interval_ema_updated = false;
+  bool     ema_last_interval_resync_applied = false;
+  uint32_t ema_gate_reject_streak = 0;
+  uint32_t ema_gate_resync_count = 0;
+  uint32_t ema_last_rejected_observed_interval_cycles = 0;
 };
 static ocxo_lane_t g_ocxo1_lane;
 static ocxo_lane_t g_ocxo2_lane;
@@ -3787,6 +4005,20 @@ static void emit_one_second_event(interrupt_subscriber_runtime_t& rt,
     diag.dwt_synthetic_error_cycles = repair->error_cycles;
     diag.dwt_synthetic_threshold_cycles = repair->threshold_cycles;
     diag.dwt_synthetic_reason = repair->reason;
+    diag.dwt_interval_gate_valid = repair->interval_gate_valid;
+    diag.dwt_interval_sample_accepted = repair->interval_sample_accepted;
+    diag.dwt_interval_sample_rejected = repair->interval_sample_rejected;
+    diag.dwt_interval_ema_updated = repair->interval_ema_updated;
+    diag.dwt_interval_observed_cycles = repair->interval_observed_cycles;
+    diag.dwt_interval_prediction_cycles = repair->interval_prediction_cycles;
+    diag.dwt_interval_effective_cycles = repair->interval_effective_cycles;
+    diag.dwt_interval_residual_cycles = repair->interval_residual_cycles;
+    diag.dwt_interval_gate_threshold_cycles = repair->interval_gate_threshold_cycles;
+    diag.dwt_interval_accept_count = repair->interval_accept_count;
+    diag.dwt_interval_reject_count = repair->interval_reject_count;
+    diag.dwt_interval_resync_applied = repair->interval_resync_applied;
+    diag.dwt_interval_resync_count = repair->interval_resync_count;
+    diag.dwt_interval_reject_streak = repair->interval_reject_streak;
   }
   if (rt.desc->kind != interrupt_subscriber_kind_t::VCLOCK) {
     bridge_projection_copy_to_diag(diag, bridge);
@@ -4263,8 +4495,13 @@ static void vclock_apply_perishable_fact_deferred(
   const uint32_t observed_dwt = fact.observed_dwt_at_event;
   bool ema_synthetic = false;
   int32_t ema_error_cycles = 0;
+  dwt_repair_diag_t ema_diag{};
+  ema_diag.valid = true;
+  ema_diag.original_dwt = observed_dwt;
+  ema_diag.isr_entry_dwt_raw = fact.isr_entry_dwt_raw;
+  ema_diag.threshold_cycles = VCLOCK_EMA_AUDIT_THRESHOLD_CYCLES;
   const uint32_t published_dwt = vclock_lane_ema_predict_dwt(
-      g_vclock_lane, observed_dwt, &ema_synthetic, &ema_error_cycles);
+      g_vclock_lane, observed_dwt, &ema_synthetic, &ema_error_cycles, &ema_diag);
 
   uint32_t coincidence_cycles = 0;
   bool coincidence_valid = false;
@@ -4280,17 +4517,14 @@ static void vclock_apply_perishable_fact_deferred(
     }
   }
 
-  dwt_repair_diag_t ema_diag{};
-  ema_diag.valid = true;
   ema_diag.candidate = ema_synthetic;
   ema_diag.synthetic = ema_synthetic;
-  ema_diag.original_dwt = observed_dwt;
   ema_diag.predicted_dwt = published_dwt;
   ema_diag.used_dwt = published_dwt;
-  ema_diag.isr_entry_dwt_raw = fact.isr_entry_dwt_raw;
   ema_diag.error_cycles = ema_error_cycles;
-  ema_diag.threshold_cycles = VCLOCK_EMA_AUDIT_THRESHOLD_CYCLES;
-  ema_diag.reason = ema_synthetic ? "vclock_ema" : "vclock_ema_init";
+  ema_diag.reason = ema_diag.interval_sample_rejected
+      ? "vclock_ema_gate_reject"
+      : (ema_synthetic ? "vclock_ema" : "vclock_ema_init");
 
   const pps_t witness_pps = fact.witness_pps_valid ? fact.witness_pps : pps_t{};
   publish_vclock_domain_pps_vclock(witness_pps,
@@ -4311,11 +4545,7 @@ static void vclock_apply_perishable_fact_deferred(
                         nullptr,
                         &fact.spinidle);
 
-  if (g_pps_edge_dispatch) {
-    timepop_arm_asap(pps_edge_dispatch_trampoline,
-                     nullptr,
-                     "PPS_VCLOCK_DISPATCH");
-  }
+  pps_edge_dispatch_arm_or_call_from_foreground("PPS_VCLOCK_DISPATCH");
 }
 
 static void vclock_fact_drain_callback(timepop_ctx_t*,
@@ -4611,9 +4841,22 @@ static void ocxo_lane_ema_reset(ocxo_lane_t& lane) {
   lane.ema_last_observed_interval_cycles = 0;
   lane.ema_interval_cycles = 0;
   lane.ema_last_predicted_dwt = 0;
+  lane.ema_last_interval_prediction_cycles = 0;
+  lane.ema_last_effective_interval_cycles = 0;
   lane.ema_last_error_cycles = 0;
+  lane.ema_last_interval_residual_cycles = 0;
   lane.ema_max_abs_error_cycles = 0;
   lane.ema_update_count = 0;
+  lane.ema_gate_accept_count = 0;
+  lane.ema_gate_reject_count = 0;
+  lane.ema_last_interval_gate_valid = false;
+  lane.ema_last_interval_accepted = false;
+  lane.ema_last_interval_rejected = false;
+  lane.ema_last_interval_ema_updated = false;
+  lane.ema_last_interval_resync_applied = false;
+  lane.ema_gate_reject_streak = 0;
+  lane.ema_gate_resync_count = 0;
+  lane.ema_last_rejected_observed_interval_cycles = 0;
 }
 
 static void ocxo_lane_stop_local_cadence(ocxo_lane_t& lane, uint32_t reason) {
@@ -4755,19 +4998,21 @@ static void vclock_heartbeat_timepop_callback(timepop_ctx_t* ctx,
             : pps_t{};
         bool ema_synthetic = false;
         int32_t ema_error_cycles = 0;
-        const uint32_t published_dwt = vclock_lane_ema_predict_dwt(
-            g_vclock_lane, qtimer_event_dwt, &ema_synthetic, &ema_error_cycles);
         dwt_repair_diag_t ema_diag{};
         ema_diag.valid = true;
+        ema_diag.original_dwt = qtimer_event_dwt;
+        ema_diag.isr_entry_dwt_raw = 0;
+        ema_diag.threshold_cycles = VCLOCK_EMA_AUDIT_THRESHOLD_CYCLES;
+        const uint32_t published_dwt = vclock_lane_ema_predict_dwt(
+            g_vclock_lane, qtimer_event_dwt, &ema_synthetic, &ema_error_cycles, &ema_diag);
         ema_diag.candidate = ema_synthetic;
         ema_diag.synthetic = ema_synthetic;
-        ema_diag.original_dwt = qtimer_event_dwt;
         ema_diag.predicted_dwt = published_dwt;
         ema_diag.used_dwt = published_dwt;
-        ema_diag.isr_entry_dwt_raw = 0;
         ema_diag.error_cycles = ema_error_cycles;
-        ema_diag.threshold_cycles = VCLOCK_EMA_AUDIT_THRESHOLD_CYCLES;
-        ema_diag.reason = ema_synthetic ? "vclock_ema_fallback" : "vclock_ema_init_fallback";
+        ema_diag.reason = ema_diag.interval_sample_rejected
+            ? "vclock_ema_gate_reject_fallback"
+            : (ema_synthetic ? "vclock_ema_fallback" : "vclock_ema_init_fallback");
         publish_vclock_domain_pps_vclock(witness_pps,
                                           (witness_pps.sequence != 0)
                                               ? witness_pps.sequence
@@ -4780,11 +5025,7 @@ static void vclock_heartbeat_timepop_callback(timepop_ctx_t* ctx,
                               cadence_counter32,
                               coincidence_cycles, coincidence_valid, &ema_diag);
 
-        if (g_pps_edge_dispatch) {
-          timepop_arm_asap(pps_edge_dispatch_trampoline,
-                           nullptr,
-                           "PPS_VCLOCK_DISPATCH");
-        }
+        pps_edge_dispatch_arm_or_call_from_foreground("PPS_VCLOCK_DISPATCH");
 
         vclock_ch2_one_second_enable_after_heartbeat(cadence_counter32);
       }
@@ -5114,11 +5355,27 @@ static int32_t ocxo_ema_round_shift(int32_t value, uint32_t shift) {
 static uint32_t ocxo_lane_ema_predict_dwt(ocxo_lane_t& lane,
                                           uint32_t observed_dwt,
                                           bool* out_synthetic,
-                                          int32_t* out_error_cycles) {
+                                          int32_t* out_error_cycles,
+                                          dwt_repair_diag_t* out_diag = nullptr) {
   if (out_synthetic) *out_synthetic = false;
   if (out_error_cycles) *out_error_cycles = 0;
+  if (out_diag) {
+    out_diag->interval_gate_threshold_cycles =
+        OCXO_EMA_INTERVAL_GATE_THRESHOLD_CYCLES;
+  }
 
   if (!OCXO_EMA_DWT_AUTHORITY_ENABLED) {
+    lane.ema_last_observed_dwt = observed_dwt;
+    lane.ema_last_emitted_dwt = observed_dwt;
+    lane.ema_last_predicted_dwt = observed_dwt;
+    dwt_repair_diag_set_interval(out_diag, false, false, false, false,
+                                 0, 0, 0, 0,
+                                 OCXO_EMA_INTERVAL_GATE_THRESHOLD_CYCLES,
+                                 lane.ema_gate_accept_count,
+                                 lane.ema_gate_reject_count,
+                                 false,
+                                 lane.ema_gate_resync_count,
+                                 lane.ema_gate_reject_streak);
     return observed_dwt;
   }
 
@@ -5128,28 +5385,108 @@ static uint32_t ocxo_lane_ema_predict_dwt(ocxo_lane_t& lane,
     lane.ema_last_emitted_dwt = observed_dwt;
     lane.ema_last_predicted_dwt = observed_dwt;
     lane.ema_last_observed_interval_cycles = 0;
+    lane.ema_last_interval_prediction_cycles = 0;
+    lane.ema_last_effective_interval_cycles = 0;
     lane.ema_last_error_cycles = 0;
+    lane.ema_last_interval_residual_cycles = 0;
+    lane.ema_last_interval_gate_valid = false;
+    lane.ema_last_interval_accepted = false;
+    lane.ema_last_interval_rejected = false;
+    lane.ema_last_interval_ema_updated = false;
+    lane.ema_last_interval_resync_applied = false;
+    lane.ema_gate_reject_streak = 0;
+    lane.ema_last_rejected_observed_interval_cycles = 0;
     lane.ema_update_count++;
+    dwt_repair_diag_set_interval(out_diag, false, false, false, false,
+                                 0, 0, 0, 0,
+                                 OCXO_EMA_INTERVAL_GATE_THRESHOLD_CYCLES,
+                                 lane.ema_gate_accept_count,
+                                 lane.ema_gate_reject_count,
+                                 false,
+                                 lane.ema_gate_resync_count,
+                                 lane.ema_gate_reject_streak);
     return observed_dwt;
   }
 
   const uint32_t observed_interval = observed_dwt - lane.ema_last_observed_dwt;
-  lane.ema_last_observed_interval_cycles = observed_interval;
+  const bool have_prediction = lane.ema_interval_valid &&
+                               lane.ema_interval_cycles != 0;
+  const uint32_t prediction_interval = have_prediction
+      ? lane.ema_interval_cycles
+      : 0U;
+  int32_t interval_residual = 0;
+  bool gate_valid = false;
+  bool accepted = false;
+  bool rejected = false;
+  bool ema_updated = false;
 
-  if (!lane.ema_interval_valid || lane.ema_interval_cycles == 0) {
+  lane.ema_last_observed_interval_cycles = observed_interval;
+  bool resync_applied = false;
+  uint32_t effective_interval = have_prediction ? prediction_interval : observed_interval;
+
+  if (!have_prediction) {
     lane.ema_interval_cycles = observed_interval;
-    lane.ema_interval_valid = true;
+    lane.ema_interval_valid = (observed_interval != 0);
+    accepted = lane.ema_interval_valid;
+    ema_updated = lane.ema_interval_valid;
+    if (accepted) {
+      lane.ema_gate_accept_count++;
+      lane.ema_gate_reject_streak = 0;
+      lane.ema_last_rejected_observed_interval_cycles = 0;
+    }
+    effective_interval = lane.ema_interval_cycles;
   } else {
-    const int32_t err = (int32_t)((int64_t)observed_interval -
-                                  (int64_t)lane.ema_interval_cycles);
-    lane.ema_interval_cycles = (uint32_t)((int64_t)lane.ema_interval_cycles +
-        (int64_t)ocxo_ema_round_shift(err, OCXO_EMA_SHIFT));
+    gate_valid = true;
+    interval_residual = (int32_t)((int64_t)observed_interval -
+                                  (int64_t)prediction_interval);
+    const uint32_t abs_residual = ocxo_ema_abs_i32(interval_residual);
+    if (abs_residual > OCXO_EMA_INTERVAL_GATE_THRESHOLD_CYCLES) {
+      rejected = true;
+      lane.ema_gate_reject_count++;
+
+      const bool coherent_reject =
+          lane.ema_gate_reject_streak > 0 &&
+          ocxo_ema_abs_i32((int32_t)((int64_t)observed_interval -
+                                     (int64_t)lane.ema_last_rejected_observed_interval_cycles)) <=
+              OCXO_EMA_INTERVAL_GATE_THRESHOLD_CYCLES;
+      lane.ema_gate_reject_streak++;
+      lane.ema_last_rejected_observed_interval_cycles = observed_interval;
+
+      // Still emit this row using the old effective ruler.  Coherent repeated
+      // rejects are evidence that the predictor seed is wrong, not that the
+      // clock stopped.  Re-seed only for the NEXT row.
+      if (coherent_reject) {
+        lane.ema_interval_cycles = observed_interval;
+        lane.ema_interval_valid = (observed_interval != 0);
+        lane.ema_gate_resync_count++;
+        resync_applied = true;
+      }
+    } else {
+      accepted = true;
+      ema_updated = true;
+      lane.ema_interval_cycles = (uint32_t)((int64_t)lane.ema_interval_cycles +
+          (int64_t)ocxo_ema_round_shift(interval_residual, OCXO_EMA_SHIFT));
+      lane.ema_gate_accept_count++;
+      lane.ema_gate_reject_streak = 0;
+      lane.ema_last_rejected_observed_interval_cycles = 0;
+      effective_interval = lane.ema_interval_cycles;
+    }
   }
 
-  const uint32_t predicted = lane.ema_last_emitted_dwt + lane.ema_interval_cycles;
+  const uint32_t previous_emitted_dwt = lane.ema_last_emitted_dwt;
+  const uint32_t predicted = previous_emitted_dwt + effective_interval;
   const int32_t prediction_error = (int32_t)(observed_dwt - predicted);
-  lane.ema_last_error_cycles = prediction_error;
   const uint32_t abs_error = ocxo_ema_abs_i32(prediction_error);
+
+  lane.ema_last_error_cycles = prediction_error;
+  lane.ema_last_interval_residual_cycles = interval_residual;
+  lane.ema_last_interval_prediction_cycles = prediction_interval;
+  lane.ema_last_effective_interval_cycles = effective_interval;
+  lane.ema_last_interval_gate_valid = gate_valid;
+  lane.ema_last_interval_accepted = accepted;
+  lane.ema_last_interval_rejected = rejected;
+  lane.ema_last_interval_ema_updated = ema_updated;
+  lane.ema_last_interval_resync_applied = resync_applied;
   if (abs_error > lane.ema_max_abs_error_cycles) {
     lane.ema_max_abs_error_cycles = abs_error;
   }
@@ -5159,8 +5496,19 @@ static uint32_t ocxo_lane_ema_predict_dwt(ocxo_lane_t& lane,
   lane.ema_last_predicted_dwt = predicted;
   lane.ema_update_count++;
 
-  if (out_synthetic) *out_synthetic = true;
+  const bool synthetic = (predicted != observed_dwt);
+  if (out_synthetic) *out_synthetic = synthetic;
   if (out_error_cycles) *out_error_cycles = prediction_error;
+  dwt_repair_diag_set_interval(out_diag, gate_valid, accepted, rejected,
+                               ema_updated, observed_interval,
+                               prediction_interval, effective_interval,
+                               interval_residual,
+                               OCXO_EMA_INTERVAL_GATE_THRESHOLD_CYCLES,
+                               lane.ema_gate_accept_count,
+                               lane.ema_gate_reject_count,
+                               resync_applied,
+                               lane.ema_gate_resync_count,
+                               lane.ema_gate_reject_streak);
   return predicted;
 }
 
@@ -5515,6 +5863,10 @@ static void ocxo_apply_perishable_fact_deferred(
   bool ema_synthetic = false;
   int32_t ema_error_cycles = 0;
   const uint32_t observed_dwt = fact.service_dwt_at_event;
+  dwt_repair_diag_t ema_diag{};
+  ema_diag.valid = true;
+  ema_diag.original_dwt = observed_dwt;
+  ema_diag.isr_entry_dwt_raw = fact.isr_entry_dwt_raw;
 
   // A skipped or duplicated one-second target is a custody discontinuity, not
   // an interval sample.  Do not let it poison the EMA predictor.
@@ -5527,7 +5879,7 @@ static void ocxo_apply_perishable_fact_deferred(
   }
 
   const uint32_t published_dwt = ocxo_lane_ema_predict_dwt(
-      *lane, observed_dwt, &ema_synthetic, &ema_error_cycles);
+      *lane, observed_dwt, &ema_synthetic, &ema_error_cycles, &ema_diag);
 
   ocxo_qtimer_diag_record(ctx,
                           fact.isr_entry_dwt_raw,
@@ -5568,17 +5920,15 @@ static void ocxo_apply_perishable_fact_deferred(
   lane->witness_previous_event_counter32 = fact.target_counter32;
   lane->witness_previous_event_counter32_valid = true;
 
-  dwt_repair_diag_t ema_diag{};
-  ema_diag.valid = true;
   ema_diag.candidate = ema_synthetic;
   ema_diag.synthetic = ema_synthetic;
-  ema_diag.original_dwt = observed_dwt;
   ema_diag.predicted_dwt = published_dwt;
   ema_diag.used_dwt = published_dwt;
-  ema_diag.isr_entry_dwt_raw = fact.isr_entry_dwt_raw;
   ema_diag.error_cycles = ema_error_cycles;
-  ema_diag.threshold_cycles = 0;
-  ema_diag.reason = ema_synthetic ? "ocxo_ema" : "ocxo_ema_init";
+  ema_diag.threshold_cycles = OCXO_EMA_INTERVAL_GATE_THRESHOLD_CYCLES;
+  ema_diag.reason = ema_diag.interval_sample_rejected
+      ? "ocxo_ema_gate_reject"
+      : (ema_synthetic ? "ocxo_ema" : "ocxo_ema_init");
 
   // We are already in TimePop ASAP/foreground context. Dispatch the authored
   // rollover OCXO edge directly from the fact drain.
@@ -6214,6 +6564,22 @@ static void pps_edge_dispatch_trampoline(timepop_ctx_t*, timepop_diag_t*, void*)
 
   const pps_edge_snapshot_t snap = interrupt_last_pps_edge();
   g_pps_edge_dispatch(snap);
+}
+
+static void pps_edge_dispatch_arm_or_call_from_foreground(const char* name) {
+  if (!g_pps_edge_dispatch) return;
+
+  const timepop_handle_t h =
+      timepop_arm_asap(pps_edge_dispatch_trampoline,
+                       nullptr,
+                       name ? name : "PPS_VCLOCK_DISPATCH");
+  if (h == TIMEPOP_INVALID_HANDLE) {
+    // We are already in foreground/deferred context on the steady-state
+    // VCLOCK publication path.  Dropping the dispatch here creates a missing
+    // TIMEBASE row, so fall back to a direct callback instead of losing the
+    // already-authored PPS/VCLOCK bookend.
+    pps_edge_dispatch_trampoline(nullptr, nullptr, nullptr);
+  }
 }
 
 

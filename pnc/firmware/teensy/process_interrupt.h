@@ -276,6 +276,25 @@ struct interrupt_capture_diag_t {
   uint32_t dwt_synthetic_threshold_cycles = 0;
   const char* dwt_synthetic_reason = nullptr;
 
+  // One-second DWT interval gate audit.  These fields preserve the raw
+  // observed cycle interval beside the effective interval that was delivered
+  // to subscribers.  A rejected sample leaves the EMA ruler unchanged and
+  // publishes a projected DWT endpoint instead of the observed endpoint.
+  bool     dwt_interval_gate_valid = false;
+  bool     dwt_interval_sample_accepted = false;
+  bool     dwt_interval_sample_rejected = false;
+  bool     dwt_interval_ema_updated = false;
+  uint32_t dwt_interval_observed_cycles = 0;
+  uint32_t dwt_interval_prediction_cycles = 0;
+  uint32_t dwt_interval_effective_cycles = 0;
+  int32_t  dwt_interval_residual_cycles = 0;
+  uint32_t dwt_interval_gate_threshold_cycles = 0;
+  uint32_t dwt_interval_accept_count = 0;
+  uint32_t dwt_interval_reject_count = 0;
+  bool     dwt_interval_resync_applied = false;
+  uint32_t dwt_interval_resync_count = 0;
+  uint32_t dwt_interval_reject_streak = 0;
+
   // 1 kHz cadence linear-regression audit.  In the diagnostic-only build,
   // subscribers still receive the traditional event DWT in event.dwt_at_event /
   // diag.dwt_at_event.  These fields expose the fitted endpoint and per-second
