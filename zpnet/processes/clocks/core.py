@@ -1208,12 +1208,9 @@ def _baseline_dac_from_report(report: Dict[str, Any]) -> Dict[str, float]:
     forensics = _report_forensics(report)
     out: Dict[str, float] = {}
     for key in ("ocxo1", "ocxo2"):
-        # New fragment shape: fragment.dac.ocxo1_dac / fragment.dac.ocxo2_dac.
-        # Keep older nested/flat fallbacks so historical reports remain readable.
         v = _first_float(
-            _path_get(frag, f"dac.{key}_dac"),
-            _path_get(frag, f"dac.{key}.value"),
             _path_get(forensics, f"dac.{key}.value"),
+            _path_get(frag, f"dac.{key}.value"),
             frag.get(f"{key}_dac"),
             report.get(f"{key}_dac"),
         )
@@ -1285,13 +1282,14 @@ def _configured_boot_dacs(cfg: Dict[str, Any]) -> Tuple[Optional[float], Optiona
     """
     Return DAC values to push to Teensy at boot.
 
-    The simplified SYSTEM DAC contract is intentionally only:
+    Precedence is intentionally explicit:
 
-      {"ocxo1_dac": <float>, "ocxo2_dac": <float>}
+      1. SYSTEM ocxo*_dac — user-selected boot seed, written by SET_DAC
+      2. SYSTEM baseline_dac_mean / baseline_dac — historical baseline fallback
 
-    Historical baseline_dac_mean / baseline_dac fallback is retained only so
-    older config rows can still boot; the live servo persistence path now writes
-    ocxo*_dac directly.
+    The processor thread deliberately stores live campaign DAC observations
+    under last_ocxo*_dac so ordinary TIMEBASE ingestion cannot overwrite the
+    operator-selected boot seed.
     """
     d1 = _first_float(cfg.get("ocxo1_dac"))
     d2 = _first_float(cfg.get("ocxo2_dac"))
@@ -1986,85 +1984,56 @@ def _process_loop() -> None:
         publish("TIMEBASE", timebase)
         _persist_timebase(timebase)
 
-        # Persist OCXO1/OCXO2 DAC fields into campaign payload and SYSTEM config.
+        # Persist live DAC Welford means as the SYSTEM boot seeds (best-effort).
         #
-        # Firmware publishes fragment.dac only while the servo is active.  Treat
-        # that as the authority signal for updating the SYSTEM boot seed: when
-        # the servo is running, the live DAC values are the best current values
-        # for this physical setup and should become the next-run defaults.
-        fragment_dac = frag.get("dac") if isinstance(frag.get("dac"), dict) else {}
-        fragment_dac_ocxo1 = (
-            fragment_dac.get("ocxo1") if isinstance(fragment_dac.get("ocxo1"), dict) else {}
-        )
-        fragment_dac_ocxo2 = (
-            fragment_dac.get("ocxo2") if isinstance(fragment_dac.get("ocxo2"), dict) else {}
-        )
+        # Keep this intentionally boring: the Teensy already publishes the DAC
+        # Welford means in TIMEBASE_FRAGMENT.stats.dac.ocxo*.mean, and the
+        # metrics panel proves those fields are live.  Use those means directly
+        # as the next-run DAC seeds and update both SYSTEM values in one SQL
+        # statement.  No campaign write, no live/last/manual/baseline aliases,
+        # no servo-mode inference gate.
         fragment_stats = frag.get("stats") if isinstance(frag.get("stats"), dict) else {}
         fragment_stats_dac = fragment_stats.get("dac") if isinstance(fragment_stats.get("dac"), dict) else {}
         fragment_stats_dac_ocxo1 = fragment_stats_dac.get("ocxo1") if isinstance(fragment_stats_dac.get("ocxo1"), dict) else {}
         fragment_stats_dac_ocxo2 = fragment_stats_dac.get("ocxo2") if isinstance(fragment_stats_dac.get("ocxo2"), dict) else {}
 
-        # New servo-live shape is fragment.dac.ocxo1_dac / ocxo2_dac.  Keep
-        # nested/flat fallbacks for compatibility with transitional firmware.
-        ocxo1_dac_current = _first_float(
-            fragment_dac.get("ocxo1_dac"),
-            fragment_dac_ocxo1.get("value"),
-            frag.get("ocxo1_dac"),
-        )
-        ocxo2_dac_current = _first_float(
-            fragment_dac.get("ocxo2_dac"),
-            fragment_dac_ocxo2.get("value"),
-            frag.get("ocxo2_dac"),
-        )
-        ocxo1_dac_mean = _first_float(
+        ocxo1_dac_seed = _first_float(
             fragment_stats_dac_ocxo1.get("mean"),
             frag.get("ocxo1_dac_welford_mean"),
-            ocxo1_dac_current,
         )
-        ocxo2_dac_mean = _first_float(
+        ocxo2_dac_seed = _first_float(
             fragment_stats_dac_ocxo2.get("mean"),
             frag.get("ocxo2_dac_welford_mean"),
-            ocxo2_dac_current,
         )
 
-        servo_dac_observed = bool(fragment_dac) and (
-            ocxo1_dac_current is not None or ocxo2_dac_current is not None
-        )
-
-        if ocxo1_dac_current is not None or ocxo2_dac_current is not None:
-            campaign_dac_blob = {
-                "ocxo1_dac": ocxo1_dac_current,
-                "ocxo2_dac": ocxo2_dac_current,
-                "ocxo1_dac_mean": ocxo1_dac_mean,
-                "ocxo2_dac_mean": ocxo2_dac_mean,
-            }
-            campaign_dac_blob = {k: v for k, v in campaign_dac_blob.items() if v is not None}
+        if ocxo1_dac_seed is not None and ocxo2_dac_seed is not None:
             try:
                 with open_db() as conn:
                     cur = conn.cursor()
                     cur.execute(
                         """
-                        UPDATE campaigns
-                        SET payload = payload || %s::jsonb
-                        WHERE campaign = %s
-                          AND active = true
+                        UPDATE config
+                        SET timestamp = now(),
+                            payload = jsonb_set(
+                                jsonb_set(
+                                    COALESCE(payload, '{}'::jsonb),
+                                    '{ocxo1_dac}',
+                                    to_jsonb(%s::double precision),
+                                    true
+                                ),
+                                '{ocxo2_dac}',
+                                to_jsonb(%s::double precision),
+                                true
+                            )
+                        WHERE config_key = 'SYSTEM'
                         """,
-                        (json.dumps(campaign_dac_blob), campaign),
+                        (
+                            round(float(ocxo1_dac_seed), 6),
+                            round(float(ocxo2_dac_seed), 6),
+                        ),
                     )
             except Exception:
-                logging.exception("⚠️ [clocks] failed to persist OCXO DAC values (ignored)")
-
-        if servo_dac_observed:
-            try:
-                persisted = _system_config_set_ocxo_dacs(
-                    ocxo1_dac=ocxo1_dac_current,
-                    ocxo2_dac=ocxo2_dac_current,
-                )
-                if persisted:
-                    logging.debug("🔧 [clocks] live servo DAC persisted to SYSTEM config: %s", persisted)
-            except Exception:
-                logging.exception("⚠️ [clocks] failed to persist live servo DACs to SYSTEM config (ignored)")
-
+                logging.exception("⚠️ [clocks] failed to persist DAC Welford means to SYSTEM config (ignored)")
 
 # ---------------------------------------------------------------------
 # Control-plane: START / STOP / CLEAR / RECOVER
@@ -3441,70 +3410,6 @@ def _system_config_upsert(update_blob: Dict[str, Any]) -> None:
         )
 
 
-_DAC_CONFIG_KEYS_TO_DROP = (
-    # Retired DAC bookkeeping.  SYSTEM should hold only the current best OCXO
-    # DAC boot seeds plus unrelated system-level settings such as location.
-    "baseline_dac",
-    "baseline_dac_mean",
-    "baseline_dac_stats",
-    "last_ocxo1_dac",
-    "last_ocxo2_dac",
-    "last_ocxo1_dac_mean",
-    "last_ocxo2_dac_mean",
-    "last_dac_observed_at_utc",
-    "manual_dac_override",
-    "manual_dac_override_at_utc",
-    "manual_dac_override_source",
-    "manual_dac_override_args",
-    "manual_dac_override_aliases",
-)
-
-
-def _system_config_set_ocxo_dacs(
-    *,
-    ocxo1_dac: Optional[float],
-    ocxo2_dac: Optional[float],
-) -> Dict[str, float]:
-    """
-    Persist the simplified SYSTEM DAC payload.
-
-    Only the current best DAC boot seeds are written.  Existing non-DAC SYSTEM
-    fields (current_location, dither, baseline_ppb, etc.) are preserved; retired
-    DAC aliases/bookkeeping are removed in the same transaction.
-    """
-    update_blob: Dict[str, float] = {}
-    if ocxo1_dac is not None:
-        update_blob["ocxo1_dac"] = round(float(ocxo1_dac), 6)
-    if ocxo2_dac is not None:
-        update_blob["ocxo2_dac"] = round(float(ocxo2_dac), 6)
-
-    if not update_blob:
-        return {}
-
-    removal_expr = "COALESCE(payload, '{}'::jsonb)"
-    for key in _DAC_CONFIG_KEYS_TO_DROP:
-        removal_expr += f" - '{key}'"
-
-    with open_db() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            f"""
-            WITH updated AS (
-                UPDATE config
-                SET payload = ({removal_expr}) || %s::jsonb
-                WHERE config_key = 'SYSTEM'
-                RETURNING 1
-            )
-            INSERT INTO config (config_key, payload)
-            SELECT 'SYSTEM', %s::jsonb
-            WHERE NOT EXISTS (SELECT 1 FROM updated)
-            """,
-            (json.dumps(update_blob), json.dumps(update_blob)),
-        )
-
-    return update_blob
-
-
 def _manual_dac_config_blob(
     *,
     dac1: Optional[float],
@@ -3512,20 +3417,48 @@ def _manual_dac_config_blob(
     input_aliases: Dict[str, str],
 ) -> Dict[str, Any]:
     """
-    Build the simplified SYSTEM DAC payload for an operator DAC override.
+    Build the SYSTEM config payload for an operator DAC override.
 
-    The durable SYSTEM contract is only ocxo1_dac / ocxo2_dac.  Alias metadata
-    is intentionally not persisted; input_aliases is accepted only to keep the
-    call site simple.
+    SET_DAC owns ocxo*_dac as the explicit next-run boot seed.  It also updates
+    baseline_dac_mean / baseline_dac so legacy baseline fallback paths cannot
+    resurrect an older mean from a previous campaign.
     """
-    _ = input_aliases
+    now_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
-    update_blob: Dict[str, Any] = {}
+    existing = _get_system_config()
+    baseline_dac_mean = dict(existing.get("baseline_dac_mean") or {})
+    baseline_dac = dict(existing.get("baseline_dac") or {})
+
+    manual_args: Dict[str, float] = {}
+
+    update_blob: Dict[str, Any] = {
+        "manual_dac_override": True,
+        "manual_dac_override_at_utc": now_utc,
+        "manual_dac_override_source": "CLOCKS.SET_DAC",
+    }
+
     if dac1 is not None:
-        update_blob["ocxo1_dac"] = round(float(dac1), 6)
+        dac1_rounded = round(float(dac1), 6)
+        update_blob["ocxo1_dac"] = dac1_rounded
+        baseline_dac_mean["ocxo1"] = dac1_rounded
+        baseline_dac["ocxo1"] = dac1_rounded
+        manual_args["dac1"] = dac1_rounded
+
     if dac2 is not None:
-        update_blob["ocxo2_dac"] = round(float(dac2), 6)
+        dac2_rounded = round(float(dac2), 6)
+        update_blob["ocxo2_dac"] = dac2_rounded
+        baseline_dac_mean["ocxo2"] = dac2_rounded
+        baseline_dac["ocxo2"] = dac2_rounded
+        manual_args["dac2"] = dac2_rounded
+
+    update_blob["manual_dac_override_args"] = manual_args
+    update_blob["manual_dac_override_aliases"] = input_aliases
+
+    update_blob["baseline_dac_mean"] = baseline_dac_mean
+    update_blob["baseline_dac"] = baseline_dac
+
     return update_blob
+
 
 def cmd_set_dac(args: Optional[dict]) -> Dict[str, Any]:
     """
@@ -3537,8 +3470,9 @@ def cmd_set_dac(args: Optional[dict]) -> Dict[str, Any]:
       DAC1, dac1, set_dac1, ocxo1_dac
       DAC2, dac2, set_dac2, ocxo2_dac
 
-    This command writes only the simplified SYSTEM DAC payload:
-      {"ocxo1_dac": ..., "ocxo2_dac": ...}
+    This command intentionally updates the baseline_dac_mean fallback too.
+    That prevents an older campaign mean from being used to seed the next run
+    after the operator has explicitly selected new DAC values.
 
     It does not push the running Teensy by default; START/boot/recovery will
     push these values through the normal Pi control path.
@@ -3578,17 +3512,20 @@ def cmd_set_dac(args: Optional[dict]) -> Dict[str, Any]:
     )
 
     try:
-        persisted = _system_config_set_ocxo_dacs(
-            ocxo1_dac=update_blob.get("ocxo1_dac"),
-            ocxo2_dac=update_blob.get("ocxo2_dac"),
-        )
+        _system_config_upsert(update_blob)
     except Exception as e:
         logging.exception("❌ [clocks] SET_DAC failed")
         return {"success": False, "message": str(e)}
 
     payload = {
-        "ocxo1_dac": persisted.get("ocxo1_dac"),
-        "ocxo2_dac": persisted.get("ocxo2_dac"),
+        "ocxo1_dac": update_blob.get("ocxo1_dac"),
+        "ocxo2_dac": update_blob.get("ocxo2_dac"),
+        "baseline_dac": update_blob.get("baseline_dac", {}),
+        "baseline_dac_mean": update_blob.get("baseline_dac_mean", {}),
+        "manual_dac_override": True,
+        "manual_dac_override_args": update_blob.get("manual_dac_override_args", {}),
+        "manual_dac_override_aliases": update_blob.get("manual_dac_override_aliases", {}),
+        "manual_dac_override_at_utc": update_blob["manual_dac_override_at_utc"],
         "applies_to": "next START/boot/recovery DAC seed",
         "teensy_pushed_now": False,
     }
