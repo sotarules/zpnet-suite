@@ -1318,8 +1318,12 @@ static void payload_add_lane_forensics_object(Payload& parent,
   forensics.add("last_event_dwt", valid ? f.last_event_dwt : 0U);
   forensics.add("last_event_counter32", valid ? f.last_event_counter32 : 0U);
   forensics.add("dwt_cycles_between_edges", valid ? f.dwt_cycles_between_edges : 0U);
+  forensics.add("counter32_delta_since_previous_event",
+                valid ? f.counter32_delta_since_previous_event : 0U);
+
+  // Raw/effective DWT authority proof.  This is the durable per-row evidence
+  // needed by raw_cycles-style reports after the 500-cycle catastrophic gate.
   forensics.add("dwt_synthetic", valid && f.dwt_synthetic);
-  forensics.add("dwt_repair_candidate", valid && f.dwt_repair_candidate);
   forensics.add("dwt_original_at_event", valid ? f.dwt_original_at_event : 0U);
   forensics.add("dwt_predicted_at_event", valid ? f.dwt_predicted_at_event : 0U);
   forensics.add("dwt_used_at_event", valid ? f.dwt_used_at_event : 0U);
@@ -1333,7 +1337,6 @@ static void payload_add_lane_forensics_object(Payload& parent,
   gate.add("valid", valid && f.dwt_interval_gate_valid);
   gate.add("accepted", valid && f.dwt_interval_sample_accepted);
   gate.add("rejected", valid && f.dwt_interval_sample_rejected);
-  gate.add("ema_updated", valid && f.dwt_interval_ema_updated);
   gate.add("observed_cycles", valid ? f.dwt_interval_observed_cycles : 0U);
   gate.add("prediction_cycles", valid ? f.dwt_interval_prediction_cycles : 0U);
   gate.add("effective_cycles", valid ? f.dwt_interval_effective_cycles : 0U);
@@ -1341,16 +1344,9 @@ static void payload_add_lane_forensics_object(Payload& parent,
   gate.add("threshold_cycles", valid ? f.dwt_interval_gate_threshold_cycles : 0U);
   gate.add("accept_count", valid ? f.dwt_interval_accept_count : 0U);
   gate.add("reject_count", valid ? f.dwt_interval_reject_count : 0U);
-  gate.add("resync_applied", valid && f.dwt_interval_resync_applied);
   gate.add("resync_count", valid ? f.dwt_interval_resync_count : 0U);
-  gate.add("reject_streak", valid ? f.dwt_interval_reject_streak : 0U);
   forensics.add_object("dwt_interval_gate", gate);
 
-  forensics.add("counter32_delta_since_previous_event",
-                valid ? f.counter32_delta_since_previous_event : 0U);
-  forensics.add("zero_offset_counter32", valid ? f.zero_offset_counter32 : 0U);
-  forensics.add("counter32_delta_since_zero_offset",
-                valid ? f.counter32_delta_since_zero_offset : 0U);
   parent.add_object("forensics", forensics);
 }
 
@@ -1359,21 +1355,11 @@ static void payload_add_ocxo_service_object(Payload& parent,
                                             const clocks_alpha_lane_forensics_t& f) {
   Payload service;
 
-  // Keep TIMEBASE_FORENSICS below transport/Payload pressure.  The full OCXO
-  // service surface is still available through focused interrupt/CLOCKS reports;
-  // TIMEBASE_FORENSICS carries only the fields needed to correlate raw-cycle
-  // residuals with compare-service timing and counter-ladder health.
+  // Tiny service/counter ladder proof only.  Full OCXO compare-service timing
+  // remains available through focused interrupt/CLOCKS reports.
   service.add("class", valid ? f.diag_service_class : 0U);
   service.add("offset_ticks", valid ? f.diag_service_offset_signed_ticks : 0);
-  service.add("offset_abs_ticks", valid ? f.diag_service_offset_abs_ticks : 0U);
-  service.add("late_ticks", valid ? f.diag_interpreted_late_ticks : 0U);
-  service.add("early_ticks", valid ? f.diag_early_ticks : 0U);
-  service.add("arm_remaining_ticks", valid ? f.diag_arm_remaining_ticks : 0U);
   service.add("arm_to_isr_ticks", valid ? f.diag_arm_to_isr_ticks : 0U);
-  service.add("arm_to_isr_dwt_cycles", valid ? f.diag_arm_to_isr_dwt_cycles : 0U);
-  service.add("correction_cycles", valid ? f.diag_service_correction_cycles : 0);
-  service.add("corrected_dwt_at_event",
-              valid ? f.diag_service_corrected_dwt_at_event : 0U);
   service.add("last_counter_delta_ticks", valid ? f.diag_last_counter_delta_ticks : 0U);
   parent.add_object("service", service);
 }
@@ -1433,7 +1419,6 @@ static void payload_add_timebase_pair_identity(Payload& p,
 static void payload_add_vclock_fragment(Payload& p, uint64_t public_gnss_ns) {
   Payload lane;
   lane.add("ns", public_gnss_ns);
-  lane.add("gnss_ns_at_pps_vclock", public_gnss_ns);
   lane.add("counter32_at_pps_vclock", (uint32_t)g_counter32_at_pps_vclock);
   p.add_object("vclock", lane);
 }
@@ -1444,12 +1429,13 @@ static void payload_add_vclock_forensics(Payload& p,
                                          const clocks_alpha_lane_forensics_t& f) {
   Payload lane;
   lane.add("ns", public_gnss_ns);
-  lane.add("gnss_ns_at_pps_vclock", public_gnss_ns);
   lane.add("counter32_at_pps_vclock", (uint32_t)g_counter32_at_pps_vclock);
-  payload_add_clock_measurement_object(lane, g_vclock_clock, g_vclock_measurement);
+
+  // TIMEBASE_FORENSICS is now a compact per-row courtroom audit.  Deep
+  // measurement, SpinCatch/SpinIdle, and regression surfaces remain available
+  // through focused reports; the paired 1 Hz stream carries only the DWT
+  // authority proof needed to explain the science row.
   payload_add_lane_forensics_object(lane, forensics_valid, f);
-  payload_add_spincatch_object(lane, forensics_valid, f);
-  payload_add_lane_regression_object(lane, forensics_valid, f);
   p.add_object("vclock", lane);
 }
 
@@ -1465,19 +1451,15 @@ static void payload_add_ocxo_fragment(Payload& p,
                                       int64_t pps_fast_residual_ns) {
   Payload lane;
 
-  // Compact science surface: canonical OCXO clock value at this PPS/VCLOCK row,
-  // the legacy measured side clock, source identity, and PPS-founded residual.
+  // Compact science surface.  The canonical OCXO value is the PPS-projected
+  // clock when available, with measured_gnss_ns retained as the single legacy
+  // side-channel for dashboards/report migration.  Duplicate string aliases
+  // and repeated *_at_pps_vclock names were removed from the durable row.
   lane.add("ns", public_ns);
-  lane.add("ns_at_pps_vclock", public_ns);
-  lane.add("ns_source", pps_projection_valid ? "PPS_PROJECTED"
-                                              : "MEASURED_FALLBACK");
   lane.add("ns_source_id", pps_projection_valid ? 2U : 1U);
   lane.add("pps_projected_valid", pps_projection_valid);
   lane.add("pps_projection_source", pps_projection_valid ? pps_projection_source : 0U);
-
   lane.add("measured_gnss_ns", public_measured_ns);
-  lane.add("measured_gnss_ns_at_pps_vclock", public_measured_ns);
-  lane.add("legacy_measured_gnss_ns", public_measured_ns);
   const int64_t measured_minus_ns =
       (public_measured_ns >= public_ns)
           ? (int64_t)(public_measured_ns - public_ns)
@@ -1508,46 +1490,24 @@ static void payload_add_ocxo_forensics(Payload& p,
                                        uint64_t pps_gnss_interval_ns,
                                        uint64_t pps_clock_interval_ns,
                                        int64_t pps_fast_residual_ns) {
+  (void)clock;
+  (void)meas;
+  (void)public_pps_projected_ns;
+
   Payload lane;
 
+  // Compact forensic surface for the paired TIMEBASE row.  Keep the public
+  // clock value, source identity, the raw PPS-projection value, the PPS-founded
+  // residual, the DWT gate courtroom, and the tiny OCXO service/counter ladder
+  // proof.  Retired quiet-phase sample fields, measurement/window counters,
+  // SpinCatch/SpinIdle, regression, and verbose projection deltas are report-only.
   lane.add("ns", public_ns);
-  lane.add("ns_at_pps_vclock", public_ns);
-  lane.add("ns_source", pps_projection_valid ? "PPS_PROJECTED"
-                                              : "MEASURED_FALLBACK");
   lane.add("ns_source_id", pps_projection_valid ? 2U : 1U);
-
-  lane.add("measured_gnss_ns", public_measured_ns);
-  lane.add("measured_gnss_ns_at_pps_vclock", public_measured_ns);
-  lane.add("legacy_measured_gnss_ns", public_measured_ns);
-  const int64_t measured_minus_ns =
-      (public_measured_ns >= public_ns)
-          ? (int64_t)(public_measured_ns - public_ns)
-          : -(int64_t)(public_ns - public_measured_ns);
-  lane.add("measured_minus_ns", measured_minus_ns);
-
-  const int64_t projected_minus_ns =
-      (!pps_projection_valid)
-          ? 0LL
-          : ((public_pps_projected_ns >= public_ns)
-                 ? (int64_t)(public_pps_projected_ns - public_ns)
-                 : -(int64_t)(public_ns - public_pps_projected_ns));
-  const int64_t projected_minus_measured_ns =
-      (!pps_projection_valid)
-          ? 0LL
-          : ((public_pps_projected_ns >= public_measured_ns)
-                 ? (int64_t)(public_pps_projected_ns - public_measured_ns)
-                 : -(int64_t)(public_measured_ns - public_pps_projected_ns));
   lane.add("pps_projected_valid", pps_projection_valid);
-  lane.add("pps_projected_ns",
-           pps_projection_valid ? public_pps_projected_ns : 0ULL);
   lane.add("pps_projected_raw_ns",
-           pps_projection_valid
-               ? pps_projection.projected_ocxo_ns_at_pps
-               : 0ULL);
-  lane.add("pps_projected_minus_ns", projected_minus_ns);
-  lane.add("pps_projected_minus_measured_ns", projected_minus_measured_ns);
-  lane.add("pps_projection_source",
-           pps_projection_valid ? pps_projection.source : 0U);
+           pps_projection_valid ? pps_projection.projected_ocxo_ns_at_pps : 0ULL);
+  lane.add("pps_projection_source", pps_projection_valid ? pps_projection.source : 0U);
+  lane.add("measured_gnss_ns", public_measured_ns);
 
   payload_add_ocxo_pps_residual_object(lane,
                                        pps_residual_valid,
@@ -1555,26 +1515,8 @@ static void payload_add_ocxo_forensics(Payload& p,
                                        pps_clock_interval_ns,
                                        pps_fast_residual_ns);
 
-  const bool sample_available =
-      forensics_valid && f.sample_gnss_ns_at_event_available;
-  const bool previous_sample_available =
-      forensics_valid && f.previous_sample_gnss_ns_at_event_available;
-  lane.add("sample_gnss_ns_at_event_available", sample_available);
-  lane.add("sample_gnss_ns_at_event",
-           sample_available ? f.sample_gnss_ns_at_event : 0ULL);
-  lane.add("previous_sample_gnss_ns_at_event_available",
-           previous_sample_available);
-  lane.add("previous_sample_gnss_ns_at_event",
-           previous_sample_available
-               ? f.previous_sample_gnss_ns_at_event
-               : 0ULL);
-
-  payload_add_clock_measurement_object(lane, clock, meas);
-  payload_add_ocxo_interval_object(lane, forensics_valid, f);
   payload_add_lane_forensics_object(lane, forensics_valid, f);
-  payload_add_spincatch_object(lane, forensics_valid, f);
   payload_add_ocxo_service_object(lane, forensics_valid, f);
-  payload_add_lane_regression_object(lane, forensics_valid, f);
   p.add_object(key, lane);
 }
 
@@ -2270,7 +2212,6 @@ void clocks_beta_pps(void) {
   // not already PPS-founded, that is an upstream architecture problem.
   const uint64_t public_gnss_ns   = campaign_public_gnss_ns();
   const uint64_t public_dwt_total = campaign_public_dwt_total();
-  const uint64_t public_dwt_ns    = dwt_cycles_to_ns(public_dwt_total);
   const uint64_t public_ocxo1_measured_ns = campaign_public_ocxo1_measured_ns();
   const uint64_t public_ocxo2_measured_ns = campaign_public_ocxo2_measured_ns();
 
@@ -2411,24 +2352,22 @@ void clocks_beta_pps(void) {
       timebase_build_stage(TIMEBASE_BUILD_STAGE_GNSS);
       Payload gnss;
       gnss.add("ns", public_gnss_ns);
-      gnss.add("pps_ns", public_gnss_ns);
-      gnss.add("pps_vclock_ns", public_gnss_ns);
-      gnss.add("vclock_ns", public_gnss_ns);
       gnss.add("ocxo1_ns", public_ocxo1_ns);
       gnss.add("ocxo2_ns", public_ocxo2_ns);
-      gnss.add("ocxo1_measured_ns", public_ocxo1_measured_ns);
-      gnss.add("ocxo2_measured_ns", public_ocxo2_measured_ns);
       p.add_object("gnss", gnss);
     }
 
     {
       timebase_build_stage(TIMEBASE_BUILD_STAGE_DWT);
       Payload dwt;
+      // DWT is a first-class clock, but its native ledger unit is CPU cycles,
+      // not nanoseconds.  Keep a generic value/unit pair for dashboards while
+      // retaining the explicit cycle_count_total name for durable tools.
+      dwt.add("value", public_dwt_total);
+      dwt.add("unit", "cycles");
+      dwt.add("cycles", public_dwt_total);
       dwt.add("cycle_count_total", public_dwt_total);
-      dwt.add("ns", public_dwt_ns);
-      dwt.add("at_pps_vclock", (uint32_t)g_dwt_at_pps_vclock);
       dwt.add("cycles_between_pps_vclock", (uint32_t)g_dwt_cycles_between_pps_vclock);
-      dwt.add("expected_per_pps_vclock", (uint32_t)DWT_EXPECTED_PER_PPS);
       dwt.add("second_residual_cycles",
               (int32_t)((int64_t)g_dwt_cycles_between_pps_vclock -
                         (int64_t)DWT_EXPECTED_PER_PPS));
@@ -2438,8 +2377,6 @@ void clocks_beta_pps(void) {
     {
       timebase_build_stage(TIMEBASE_BUILD_STAGE_PPS);
       Payload pps;
-      pps.add("count", public_count);
-      pps.add("dwt_at_edge", (uint32_t)g_pps_dwt_at_edge);
       pps.add("dwt_cycles_between_edges",
               g_pps_dwt_cycles_between_edges_valid
                   ? (uint32_t)g_pps_dwt_cycles_between_edges
@@ -2520,14 +2457,6 @@ void clocks_beta_pps(void) {
     f.add("paired_fragment_schema", "TIMEBASE_FRAGMENT_V3");
     f.add("paired_fragment_version", 3U);
 
-    {
-      timebase_build_stage(TIMEBASE_BUILD_STAGE_ENVIRONMENTAL);
-      Payload environmental;
-      environmental.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
-      environmental.add("ad5693r_init_ok", g_ad5693r_init_ok);
-      f.add_object("environmental", environmental);
-    }
-
     timebase_build_stage(TIMEBASE_BUILD_STAGE_VCLOCK);
     payload_add_vclock_forensics(f,
                                  public_gnss_ns,
@@ -2567,9 +2496,6 @@ void clocks_beta_pps(void) {
                                pps_residuals.gnss_interval_ns,
                                pps_residuals.ocxo2_interval_ns,
                                pps_residuals.ocxo2_fast_residual_ns);
-
-    timebase_build_stage(TIMEBASE_BUILD_STAGE_DAC);
-    payload_add_dac_summary_hierarchical(f);
 
     g_timebase_forensics_build_complete_count++;
     g_timebase_last_forensics_build_complete_campaign_seconds = campaign_seconds;
