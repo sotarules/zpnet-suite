@@ -440,7 +440,20 @@ def clocks_combined_readout() -> list[str]:
         "dwt_welford_mean",
     )
     if dwt_present:
-        dwt_total = _to_int(_field(r, "dwt.ns", "dwt_ns", "dwt_cycle_count_total"))
+        # DWT is a first-class clock, but its VALUE is a 64-bit cycle
+        # ledger, not a nanosecond ledger.  Prefer the new explicit
+        # TIMEBASE_FRAGMENT field shape:
+        #   fragment.dwt.value / fragment.dwt.cycles / fragment.dwt.cycle_count_total
+        dwt_total = _to_int(_field(
+            r,
+            "dwt.value",
+            "dwt.cycles",
+            "dwt.cycle_count_total",
+            "dwt_cycle_count_total",
+            # Legacy fallbacks retained for older TIMEBASE records.
+            "dwt.ns",
+            "dwt_ns",
+        ))
         dwt_tau   = _to_float(_freq_value(r, "dwt", "tau"))
         dwt_ppb   = _to_float(_freq_value(r, "dwt", "ppb"))
         dwt_raw   = _to_int(_field(r, "dwt.cycles_between_pps_vclock", "dwt_cycles_between_pps_vclock", "dwt_cycle_count_between_pps"))
