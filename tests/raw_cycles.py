@@ -19,9 +19,11 @@ Clock filter:
     VCLOCK, OCXO1, OCXO2
 
 Column doctrine:
-    *_act / *_pred / *_res come from the firmware static-prediction surface.
-    *_gR  is the process_interrupt EMA interval-gate residual.
-    *_syn is published DWT endpoint synthetic error: original - used.
+    *_pred is the static cycle-count prediction interval in DWT cycles.
+    *_act  is the raw actual interval inferred from latency-corrected ISR-at-edge DWT.
+    *_actR is the actual residual: actual - predicted.
+    *_smth is the EMA-smoothed actual interval in DWT cycles.
+    *_smR is the smoothed residual: smoothed - predicted.
     *_adj is OCXO counter-adjacency result: OK / REJ / BAD / ---.
     *_aΔ  is adjacency counter_delta_ticks - expected_counter_delta_ticks.
     *_aN  is cumulative adjacency reject_count.
@@ -640,21 +642,74 @@ def selected_clocks(clock_filter: Optional[str]) -> Tuple[str, ...]:
     return CLOCKS if clock_filter is None else (clock_filter,)
 
 
+
+def _lane_actual_triplet(gate: Dict[str, Any],
+                         fallback_actual: Optional[int],
+                         fallback_pred: Optional[int],
+                         fallback_res: Optional[int]) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+    """Return static prediction, raw actual, and actual residual.
+
+    The raw actual interval is the evidence interval inferred from the
+    latency-corrected ISR-at-edge DWT samples.  TIMEBASE_FORENSICS exposes it
+    as observed_cycles.  The prediction is the static cycle-count prediction
+    surface against which both the raw actual and EMA-smoothed actual are
+    compared.
+    """
+    gate_valid = bool(gate.get("valid"))
+    pred_cycles = gate.get("prediction_cycles") if gate_valid else None
+    actual_cycles = gate.get("observed_cycles") if gate_valid else None
+    actual_residual = gate.get("residual_cycles") if gate_valid else None
+
+    if pred_cycles is None:
+        pred_cycles = fallback_pred
+    if actual_cycles is None:
+        actual_cycles = fallback_actual
+    if actual_residual is None:
+        if actual_cycles is not None and pred_cycles is not None:
+            actual_residual = actual_cycles - pred_cycles
+        else:
+            actual_residual = fallback_res
+
+    return pred_cycles, actual_cycles, actual_residual
+
+
+def _smoothed_pair(pred_cycles: Optional[int],
+                   pub_actual: Optional[int],
+                   pub_res: Optional[int],
+                   gate: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
+    """Return EMA-smoothed actual interval and smoothed residual.
+
+    Prefer the firmware static prediction surface for the published/smoothed
+    value.  On older rows, fall back to the EMA gate effective_cycles, then
+    reconstruct from residual if possible.
+    """
+    smoothed = pub_actual
+    if smoothed is None:
+        smoothed = gate.get("effective_cycles")
+    if smoothed is None and pred_cycles is not None and pub_res is not None:
+        smoothed = pred_cycles + pub_res
+
+    smoothed_res = pub_res
+    if smoothed_res is None and smoothed is not None and pred_cycles is not None:
+        smoothed_res = smoothed - pred_cycles
+
+    return smoothed, smoothed_res
+
 def _headers_for(clock_filter: Optional[str]) -> Tuple[str, str]:
     parts = [
         f"{'pps':>6s}",
-        f"{'p_act':>13s}",
         f"{'p_pred':>13s}",
-        f"{'p_res':>8s}",
+        f"{'p_act':>13s}",
+        f"{'p_actR':>8s}",
     ]
 
     if clock_filter is None or clock_filter == "VCLOCK":
         parts.extend([
-            f"{'v_act':>13s}",
             f"{'v_pred':>13s}",
-            f"{'v_res':>8s}",
-            f"{'v_gR':>8s}",
-            f"{'v_syn':>8s}",
+            f"{'v_act':>13s}",
+            f"{'v_actR':>8s}",
+            f"{'v_smth':>13s}",
+            f"{'v_smR':>8s}",
             f"{'phase':>5s}",
             f"{'v_cΔ':>11s}",
         ])
@@ -664,11 +719,11 @@ def _headers_for(clock_filter: Optional[str]) -> Tuple[str, str]:
             continue
         prefix = "o1" if lane == "OCXO1" else "o2"
         parts.extend([
-            f"{prefix + '_act':>13s}",
             f"{prefix + '_pred':>13s}",
-            f"{prefix + '_res':>8s}",
-            f"{prefix + '_gR':>8s}",
-            f"{prefix + '_syn':>8s}",
+            f"{prefix + '_act':>13s}",
+            f"{prefix + '_actR':>8s}",
+            f"{prefix + '_smth':>13s}",
+            f"{prefix + '_smR':>8s}",
             f"{prefix + '_adj':>5s}",
             f"{prefix + '_aΔ':>9s}",
             f"{prefix + '_aN':>6s}",
@@ -685,18 +740,18 @@ def _headers_for(clock_filter: Optional[str]) -> Tuple[str, str]:
 def _row_line(row: Dict[str, Any], clock_filter: Optional[str]) -> str:
     parts = [
         f"{row['pps_count']:>6d}",
-        _fmt_int(row["pps_actual"], 13),
         _fmt_int(row["pps_pred"], 13),
-        _fmt_int(row["pps_res"], 8, signed=True),
+        _fmt_int(row["pps_actual"], 13),
+        _fmt_int(row["pps_act_res"], 8, signed=True),
     ]
 
     if clock_filter is None or clock_filter == "VCLOCK":
         parts.extend([
-            _fmt_int(row["v_actual"], 13),
             _fmt_int(row["v_pred"], 13),
-            _fmt_int(row["v_res"], 8, signed=True),
-            _fmt_int(row["v_gate_residual"], 8, signed=True),
-            _fmt_int(row["v_synthetic_error"], 8, signed=True),
+            _fmt_int(row["v_actual"], 13),
+            _fmt_int(row["v_act_res"], 8, signed=True),
+            _fmt_int(row["v_smoothed"], 13),
+            _fmt_int(row["v_smoothed_res"], 8, signed=True),
             _fmt_int(row["phase"], 5),
             _fmt_int(row["v_cdelta"], 11),
         ])
@@ -707,11 +762,11 @@ def _row_line(row: Dict[str, Any], clock_filter: Optional[str]) -> str:
         key = "o1" if lane == "OCXO1" else "o2"
         data = row[key]
         parts.extend([
-            _fmt_int(data["actual"], 13),
             _fmt_int(data["pred"], 13),
-            _fmt_int(data["res"], 8, signed=True),
-            _fmt_int(data["gate_residual"], 8, signed=True),
-            _fmt_int(data["synthetic_error"], 8, signed=True),
+            _fmt_int(data["actual"], 13),
+            _fmt_int(data["act_res"], 8, signed=True),
+            _fmt_int(data["smoothed"], 13),
+            _fmt_int(data["smoothed_res"], 8, signed=True),
             _fmt_str(data["adj_tag"], 5),
             _fmt_int(data["adj_delta_error"], 9, signed=True),
             _fmt_int(data["adj_reject_count"], 6),
@@ -762,36 +817,53 @@ def collect_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]
             phase = abs(_signed_delta_u32(vclock_dwt, physical_pps_dwt))
 
         pps_actual, pps_pred, pps_res = lane_prediction(frag, pred, "pps")
-        v_actual, v_pred, v_res = lane_prediction(frag, pred, "vclock")
-        o1_actual, o1_pred, o1_res = lane_prediction(frag, pred, "ocxo1")
-        o2_actual, o2_pred, o2_res = lane_prediction(frag, pred, "ocxo2")
+        v_pub_actual, v_pub_pred, v_pub_res = lane_prediction(frag, pred, "vclock")
+        o1_pub_actual, o1_pub_pred, o1_pub_res = lane_prediction(frag, pred, "ocxo1")
+        o2_pub_actual, o2_pub_pred, o2_pub_res = lane_prediction(frag, pred, "ocxo2")
 
         if pps_actual is None and physical_pps_dwt is not None and prev_physical_pps_dwt is not None:
             pps_actual = _delta_u32(physical_pps_dwt, prev_physical_pps_dwt)
-        if v_actual is None and vclock_dwt is not None and prev_vclock_dwt is not None:
-            v_actual = _delta_u32(vclock_dwt, prev_vclock_dwt)
+        if pps_res is None and pps_actual is not None and pps_pred is not None:
+            pps_res = pps_actual - pps_pred
+
+        if v_pub_actual is None and vclock_dwt is not None and prev_vclock_dwt is not None:
+            v_pub_actual = _delta_u32(vclock_dwt, prev_vclock_dwt)
+        if v_pub_res is None and v_pub_actual is not None and v_pub_pred is not None:
+            v_pub_res = v_pub_actual - v_pub_pred
 
         v_gate = dwt_gate_diag(root, frag, forensic, "vclock")
+        v_pred, v_actual, v_act_res = _lane_actual_triplet(
+            v_gate, v_pub_actual, v_pub_pred, v_pub_res)
+        v_smoothed, v_smoothed_res = _smoothed_pair(
+            v_pred, v_pub_actual, v_pub_res, v_gate)
+
         vclock_event_counter32 = vclock_counter32_at_event(root, frag, forensic)
         v_cdelta = lane_counter_delta(root, frag, forensic, "vclock")
         if v_cdelta is None and vclock_event_counter32 is not None and prev_vclock_counter32 is not None:
             v_cdelta = _delta_u32(vclock_event_counter32, prev_vclock_counter32)
 
         def lane_data(lane_name: str,
-                      actual: Optional[int],
-                      pred_val: Optional[int],
-                      res: Optional[int]) -> Dict[str, Any]:
+                      pub_actual: Optional[int],
+                      pub_pred: Optional[int],
+                      pub_res: Optional[int]) -> Dict[str, Any]:
             gate = dwt_gate_diag(root, frag, forensic, lane_name)
             adj = adjacency_diag(root, frag, forensic, lane_name)
             svc = service_diag(root, frag, forensic, lane_name)
             cdelta = lane_counter_delta(root, frag, forensic, lane_name)
             if cdelta is None:
                 cdelta = svc.get("last_counter_delta")
+
+            pred_cycles, actual_cycles, act_res = _lane_actual_triplet(
+                gate, pub_actual, pub_pred, pub_res)
+            smoothed_cycles, smoothed_res = _smoothed_pair(
+                pred_cycles, pub_actual, pub_res, gate)
+
             return {
-                "actual": actual,
-                "pred": pred_val,
-                "res": res,
-                "gate_residual": gate["residual_cycles"],
+                "actual": actual_cycles,
+                "pred": pred_cycles,
+                "act_res": act_res,
+                "smoothed": smoothed_cycles,
+                "smoothed_res": smoothed_res,
                 "gate_accepted": gate["accepted"],
                 "gate_rejected": gate["rejected"],
                 "gate_reject_count": gate["reject_count"],
@@ -815,16 +887,16 @@ def collect_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]
             "pps_count": pps_count,
             "pps_actual": pps_actual,
             "pps_pred": pps_pred,
-            "pps_res": pps_res,
+            "pps_act_res": pps_res,
             "phase": phase,
             "v_actual": v_actual,
             "v_pred": v_pred,
-            "v_res": v_res,
-            "v_gate_residual": v_gate["residual_cycles"],
-            "v_synthetic_error": v_gate["synthetic_error"],
+            "v_act_res": v_act_res,
+            "v_smoothed": v_smoothed,
+            "v_smoothed_res": v_smoothed_res,
             "v_cdelta": v_cdelta,
-            "o1": lane_data("ocxo1", o1_actual, o1_pred, o1_res),
-            "o2": lane_data("ocxo2", o2_actual, o2_pred, o2_res),
+            "o1": lane_data("ocxo1", o1_pub_actual, o1_pub_pred, o1_pub_res),
+            "o2": lane_data("ocxo2", o2_pub_actual, o2_pub_pred, o2_pub_res),
             "dwt_ppb": dwt_ppb_from_schema(root, frag),
         })
 
@@ -855,9 +927,9 @@ def analyze(campaign: str, limit: int = 0, clock_filter: Optional[str] = None) -
     print()
     print("Residual-focused raw cycle + adjacency audit")
     print("═════════════════════════════════════════════")
-    print("  act/pred/res are firmware static prediction surfaces: residual = actual - prior actual.")
-    print("  *_gR is the process_interrupt EMA gate residual for the same row.")
-    print("  *_syn is synthetic DWT endpoint error: original - used; nonzero means smoothing/projection.")
+    print("  *_pred is the static cycle-count prediction interval.")
+    print("  *_actR is actual residual: actual - predicted.")
+    print("  *_smth is the EMA-smoothed actual interval; *_smR = smoothed - predicted.")
     print("  *_adj is OCXO counter-adjacency: OK, REJ, BAD, or ---.")
     print("  *_aΔ is counter_delta_ticks - expected_counter_delta_ticks; normal is 0.")
     print("  *_aN is cumulative adjacency reject count.")
@@ -878,25 +950,22 @@ def analyze(campaign: str, limit: int = 0, clock_filter: Optional[str] = None) -
 
     stats: Dict[str, Welford] = {
         "pps_actual": Welford(),
-        "pps_residual": Welford(),
+        "pps_actual_residual": Welford(),
         "phase": Welford(),
         "vclock_actual": Welford(),
-        "vclock_residual": Welford(),
-        "vclock_gate_residual": Welford(),
-        "vclock_synthetic_error": Welford(),
+        "vclock_actual_residual": Welford(),
+        "vclock_smoothed_residual": Welford(),
         "vclock_counter32_delta": Welford(),
         "ocxo1_actual": Welford(),
-        "ocxo1_residual": Welford(),
-        "ocxo1_gate_residual": Welford(),
-        "ocxo1_synthetic_error": Welford(),
+        "ocxo1_actual_residual": Welford(),
+        "ocxo1_smoothed_residual": Welford(),
         "ocxo1_adjacency_delta": Welford(),
         "ocxo1_adjacency_reject_count": Welford(),
         "ocxo1_counter32_delta": Welford(),
         "ocxo1_service_offset": Welford(),
         "ocxo2_actual": Welford(),
-        "ocxo2_residual": Welford(),
-        "ocxo2_gate_residual": Welford(),
-        "ocxo2_synthetic_error": Welford(),
+        "ocxo2_actual_residual": Welford(),
+        "ocxo2_smoothed_residual": Welford(),
         "ocxo2_adjacency_delta": Welford(),
         "ocxo2_adjacency_reject_count": Welford(),
         "ocxo2_counter32_delta": Welford(),
@@ -905,8 +974,8 @@ def analyze(campaign: str, limit: int = 0, clock_filter: Optional[str] = None) -
 
     coverage = {
         "rows": 0,
-        "vclock_counter32_delta": 0,
         "vclock_gate": 0,
+        "vclock_counter32_delta": 0,
         "ocxo1_gate": 0,
         "ocxo2_gate": 0,
         "ocxo1_adjacency": 0,
@@ -926,30 +995,28 @@ def analyze(campaign: str, limit: int = 0, clock_filter: Optional[str] = None) -
     for row in collected:
         coverage["rows"] += 1
         add_optional(stats["pps_actual"], row["pps_actual"])
-        add_optional(stats["pps_residual"], row["pps_res"])
+        add_optional(stats["pps_actual_residual"], row["pps_act_res"])
         add_optional(stats["phase"], row["phase"])
         add_optional(stats["vclock_actual"], row["v_actual"])
-        add_optional(stats["vclock_residual"], row["v_res"])
-        add_optional(stats["vclock_gate_residual"], row["v_gate_residual"])
-        add_optional(stats["vclock_synthetic_error"], row["v_synthetic_error"])
+        add_optional(stats["vclock_actual_residual"], row["v_act_res"])
+        add_optional(stats["vclock_smoothed_residual"], row["v_smoothed_res"])
         add_optional(stats["vclock_counter32_delta"], row["v_cdelta"])
+        if row["v_act_res"] is not None:
+            coverage["vclock_gate"] += 1
         if row["v_cdelta"] is not None:
             coverage["vclock_counter32_delta"] += 1
-        if row["v_gate_residual"] is not None:
-            coverage["vclock_gate"] += 1
 
         for key, lane_name in (("o1", "ocxo1"), ("o2", "ocxo2")):
             d = row[key]
             add_optional(stats[f"{lane_name}_actual"], d["actual"])
-            add_optional(stats[f"{lane_name}_residual"], d["res"])
-            add_optional(stats[f"{lane_name}_gate_residual"], d["gate_residual"])
-            add_optional(stats[f"{lane_name}_synthetic_error"], d["synthetic_error"])
+            add_optional(stats[f"{lane_name}_actual_residual"], d["act_res"])
+            add_optional(stats[f"{lane_name}_smoothed_residual"], d["smoothed_res"])
             add_optional(stats[f"{lane_name}_adjacency_delta"], d["adj_delta_error"])
             add_optional(stats[f"{lane_name}_adjacency_reject_count"], d["adj_reject_count"])
             add_optional(stats[f"{lane_name}_counter32_delta"], d["counter_delta"])
             add_optional(stats[f"{lane_name}_service_offset"], d["service_offset"])
 
-            if d["gate_residual"] is not None:
+            if d["act_res"] is not None:
                 coverage[f"{lane_name}_gate"] += 1
             if d["adj_valid"]:
                 coverage[f"{lane_name}_adjacency"] += 1
@@ -962,21 +1029,25 @@ def analyze(campaign: str, limit: int = 0, clock_filter: Optional[str] = None) -
             cls = service_class_short(d["service_class"])
             service_class_counts[lane_name][cls] = service_class_counts[lane_name].get(cls, 0) + 1
 
-        if row["v_res"] is not None and abs(row["v_res"]) >= EXCURSION_THRESHOLD_CYCLES:
+        if row["v_act_res"] is not None and abs(row["v_act_res"]) >= EXCURSION_THRESHOLD_CYCLES:
+            vclock_excursions.append(row)
+        elif row["v_smoothed_res"] is not None and abs(row["v_smoothed_res"]) >= EXCURSION_THRESHOLD_CYCLES:
             vclock_excursions.append(row)
 
         for key in ("o1", "o2"):
             d = row[key]
-            if d["res"] is not None and abs(d["res"]) >= EXCURSION_THRESHOLD_CYCLES:
+            act_hit = d["act_res"] is not None and abs(d["act_res"]) >= EXCURSION_THRESHOLD_CYCLES
+            sm_hit = d["smoothed_res"] is not None and abs(d["smoothed_res"]) >= EXCURSION_THRESHOLD_CYCLES
+            if act_hit or sm_hit:
                 excursions.append({"row": row, "lane": key, "data": d})
 
     print("Schema coverage")
     print("═══════════════")
     print(f"  rows                         = {coverage['rows']:,}")
-    print(f"  VCLOCK gate rows             = {coverage['vclock_gate']:,}")
+    print(f"  VCLOCK actual gate rows         = {coverage['vclock_gate']:,}")
     print(f"  VCLOCK counter32 delta rows  = {coverage['vclock_counter32_delta']:,}")
-    print(f"  OCXO1 gate rows              = {coverage['ocxo1_gate']:,}")
-    print(f"  OCXO2 gate rows              = {coverage['ocxo2_gate']:,}")
+    print(f"  OCXO1 actual gate rows          = {coverage['ocxo1_gate']:,}")
+    print(f"  OCXO2 actual gate rows          = {coverage['ocxo2_gate']:,}")
     print(f"  OCXO1 adjacency rows         = {coverage['ocxo1_adjacency']:,}")
     print(f"  OCXO2 adjacency rows         = {coverage['ocxo2_adjacency']:,}")
     print(f"  OCXO1 adjacency rejects      = {coverage['ocxo1_adjacency_rejected']:,}")
@@ -992,23 +1063,21 @@ def analyze(campaign: str, limit: int = 0, clock_filter: Optional[str] = None) -
     print("Summary")
     print("═══════")
     _print_welford("PPS actual cycles", stats["pps_actual"])
-    _print_welford("PPS static residual", stats["pps_residual"])
+    _print_welford("PPS actual residual", stats["pps_actual_residual"])
     _print_welford("PPS→VCLOCK phase offset", stats["phase"])
 
     if clock_filter is None or clock_filter == "VCLOCK":
         _print_welford("VCLOCK actual cycles", stats["vclock_actual"])
-        _print_welford("VCLOCK static residual", stats["vclock_residual"])
-        _print_welford("VCLOCK EMA gate residual", stats["vclock_gate_residual"])
-        _print_welford("VCLOCK synthetic error", stats["vclock_synthetic_error"])
+        _print_welford("VCLOCK actual residual", stats["vclock_actual_residual"])
+        _print_welford("VCLOCK smoothed residual", stats["vclock_smoothed_residual"])
         _print_welford("VCLOCK counter32 delta", stats["vclock_counter32_delta"], unit="ticks")
 
     for lane_name, label in (("ocxo1", "OCXO1"), ("ocxo2", "OCXO2")):
         if clock_filter is not None and clock_filter != label:
             continue
         _print_welford(f"{label} actual cycles", stats[f"{lane_name}_actual"])
-        _print_welford(f"{label} static residual", stats[f"{lane_name}_residual"])
-        _print_welford(f"{label} EMA gate residual", stats[f"{lane_name}_gate_residual"])
-        _print_welford(f"{label} synthetic error", stats[f"{lane_name}_synthetic_error"])
+        _print_welford(f"{label} actual residual", stats[f"{lane_name}_actual_residual"])
+        _print_welford(f"{label} smoothed residual", stats[f"{lane_name}_smoothed_residual"])
         _print_welford(f"{label} adjacency delta", stats[f"{lane_name}_adjacency_delta"], unit="ticks")
         _print_welford(f"{label} adjacency reject count", stats[f"{lane_name}_adjacency_reject_count"], unit="rejects")
         _print_welford(f"{label} counter32 delta", stats[f"{lane_name}_counter32_delta"], unit="ticks")
@@ -1016,34 +1085,35 @@ def analyze(campaign: str, limit: int = 0, clock_filter: Optional[str] = None) -
     print()
 
     if clock_filter is None or clock_filter == "VCLOCK":
-        print(f"VCLOCK residual excursions (|residual| ≥ {EXCURSION_THRESHOLD_CYCLES} cycles)")
+        print(f"VCLOCK residual excursions (|actR| or |smR| ≥ {EXCURSION_THRESHOLD_CYCLES} cycles)")
         print("════════════════════════════════════════════════════════════")
         if not vclock_excursions:
             print("  none")
         else:
             h = (
-                f"{'pps':>6s} {'v_res':>8s} {'v_act':>13s} {'v_pred':>13s} "
-                f"{'v_gR':>8s} {'v_syn':>8s} {'v_cΔ':>11s} {'phase':>5s} {'p_res':>8s}"
+                f"{'pps':>6s} {'v_actR':>8s} {'v_smth':>13s} {'v_smR':>8s} {'v_pred':>13s} {'v_act':>13s} "
+                f"{'v_cΔ':>11s} {'phase':>5s} {'p_actR':>8s}"
             )
             print(h)
-            print(f"{'─'*6} {'─'*8} {'─'*13} {'─'*13} {'─'*8} {'─'*8} {'─'*11} {'─'*5} {'─'*8}")
+            print(f"{'─'*6} {'─'*8} {'─'*13} {'─'*8} {'─'*13} {'─'*13} {'─'*11} {'─'*5} {'─'*8}")
             for row in vclock_excursions[:60]:
                 print(
                     f"{row['pps_count']:>6d} "
-                    f"{_fmt_int(row['v_res'], 8, signed=True)} "
-                    f"{_fmt_int(row['v_actual'], 13)} {_fmt_int(row['v_pred'], 13)} "
-                    f"{_fmt_int(row['v_gate_residual'], 8, signed=True)} "
-                    f"{_fmt_int(row['v_synthetic_error'], 8, signed=True)} "
+                    f"{_fmt_int(row['v_act_res'], 8, signed=True)} "
+                    f"{_fmt_int(row['v_smoothed'], 13)} "
+                    f"{_fmt_int(row['v_smoothed_res'], 8, signed=True)} "
+                    f"{_fmt_int(row['v_pred'], 13)} "
+                    f"{_fmt_int(row['v_actual'], 13)} "
                     f"{_fmt_int(row['v_cdelta'], 11)} "
                     f"{_fmt_int(row['phase'], 5)} "
-                    f"{_fmt_int(row['pps_res'], 8, signed=True)}"
+                    f"{_fmt_int(row['pps_act_res'], 8, signed=True)}"
                 )
             if len(vclock_excursions) > 60:
                 print(f"  ... {len(vclock_excursions) - 60:,} more VCLOCK excursion rows omitted")
         print()
 
     if clock_filter is None or clock_filter in ("OCXO1", "OCXO2"):
-        print(f"OCXO residual excursions (|residual| ≥ {EXCURSION_THRESHOLD_CYCLES} cycles)")
+        print(f"OCXO residual excursions (|actR| or |smR| ≥ {EXCURSION_THRESHOLD_CYCLES} cycles)")
         print("════════════════════════════════════════════════════════════")
         filtered = [
             ex for ex in excursions
@@ -1055,28 +1125,30 @@ def analyze(campaign: str, limit: int = 0, clock_filter: Optional[str] = None) -
             print("  none")
         else:
             h = (
-                f"{'pps':>6s} {'lane':>5s} {'res':>8s} {'act':>13s} {'pred':>13s} "
-                f"{'gR':>8s} {'syn':>8s} {'adj':>5s} {'aΔ':>9s} {'aN':>6s} "
-                f"{'cΔ':>11s} {'svc':>7s} {'p_res':>8s} {'v_res':>8s}"
+                f"{'pps':>6s} {'lane':>5s} {'actR':>8s} {'smth':>13s} {'smR':>8s} "
+                f"{'pred':>13s} {'act':>13s} {'adj':>5s} {'aΔ':>9s} {'aN':>6s} "
+                f"{'cΔ':>11s} {'svc':>7s} {'p_actR':>8s} {'v_actR':>8s} {'v_smR':>8s}"
             )
             print(h)
-            print(f"{'─'*6} {'─'*5} {'─'*8} {'─'*13} {'─'*13} {'─'*8} {'─'*8} {'─'*5} {'─'*9} {'─'*6} {'─'*11} {'─'*7} {'─'*8} {'─'*8}")
+            print(f"{'─'*6} {'─'*5} {'─'*8} {'─'*13} {'─'*8} {'─'*13} {'─'*13} {'─'*5} {'─'*9} {'─'*6} {'─'*11} {'─'*7} {'─'*8} {'─'*8} {'─'*8}")
             for ex in filtered[:60]:
                 row = ex["row"]
                 d = ex["data"]
                 print(
                     f"{row['pps_count']:>6d} {ex['lane']:>5s} "
-                    f"{_fmt_int(d['res'], 8, signed=True)} "
-                    f"{_fmt_int(d['actual'], 13)} {_fmt_int(d['pred'], 13)} "
-                    f"{_fmt_int(d['gate_residual'], 8, signed=True)} "
-                    f"{_fmt_int(d['synthetic_error'], 8, signed=True)} "
+                    f"{_fmt_int(d['act_res'], 8, signed=True)} "
+                    f"{_fmt_int(d['smoothed'], 13)} "
+                    f"{_fmt_int(d['smoothed_res'], 8, signed=True)} "
+                    f"{_fmt_int(d['pred'], 13)} "
+                    f"{_fmt_int(d['actual'], 13)} "
                     f"{_fmt_str(d['adj_tag'], 5)} "
                     f"{_fmt_int(d['adj_delta_error'], 9, signed=True)} "
                     f"{_fmt_int(d['adj_reject_count'], 6)} "
                     f"{_fmt_int(d['counter_delta'], 11)} "
                     f"{_fmt_int(d['service_offset'], 7, signed=True)} "
-                    f"{_fmt_int(row['pps_res'], 8, signed=True)} "
-                    f"{_fmt_int(row['v_res'], 8, signed=True)}"
+                    f"{_fmt_int(row['pps_act_res'], 8, signed=True)} "
+                    f"{_fmt_int(row['v_act_res'], 8, signed=True)} "
+                    f"{_fmt_int(row['v_smoothed_res'], 8, signed=True)}"
                 )
             if len(filtered) > 60:
                 print(f"  ... {len(filtered) - 60:,} more excursion rows omitted")
@@ -1084,11 +1156,11 @@ def analyze(campaign: str, limit: int = 0, clock_filter: Optional[str] = None) -
 
     print("Notes")
     print("═════")
-    print("  • p_* columns are the physical PPS static-prediction rail.")
-    print("  • v_cΔ is VCLOCK counter32 delta. Normal is 10,000,000.")
-    print("  • *_gR is the firmware EMA interval-gate residual for that event.")
-    print("  • *_syn is DWT original-at-event minus used-at-event. Nonzero means the")
-    print("    subscriber-facing DWT endpoint was synthetic/smoothed.")
+    print("  • *_pred is the static cycle-count prediction interval.")
+    print("  • *_act is the raw actual interval inferred from latency-corrected ISR-at-edge DWT.")
+    print("  • *_actR = actual - predicted.")
+    print("  • *_smth is the EMA-smoothed actual interval; *_smR = smoothed - predicted.")
+    print("  • p_* columns are the physical PPS rail; PPS has no separate smoothed rail here.")
     print("  • *_adj is OCXO adjacency status: OK=counter lineage intact, REJ=guard rejected")
     print("    the event, BAD=valid adjacency surface but not OK/rejected, ---=not applicable/missing.")
     print("  • *_aΔ is counter_delta_ticks - expected_counter_delta_ticks. Normal is 0.")
@@ -1097,7 +1169,6 @@ def analyze(campaign: str, limit: int = 0, clock_filter: Optional[str] = None) -
     print("  • *_svc is compact OCXO compare-service offset in 10 MHz ticks.")
     print("  • Use a clock filter for narrower one-line rows, e.g. raw_cycles Adjacent3 OCXO2.")
     print()
-
 
 def parse_args(argv: List[str]) -> Tuple[str, int, Optional[str]]:
     if len(argv) < 2:

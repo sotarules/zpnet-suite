@@ -195,22 +195,25 @@ static constexpr uint32_t OCXO_DWT_SOURCE_NONE = 0;
 static constexpr uint32_t OCXO_DWT_SOURCE_ISR_ENTRY = 1;
 static constexpr uint32_t OCXO_DWT_SOURCE_EMA_PREDICTED = 2;
 
-// EMA authority for OCXO one-second DWT publication.  The ISR still maintains
-// a 1 kHz rollover ladder because the 16-bit QuadTimer cannot compare a full
-// second directly.  Only the 1000th rollover fact is deferred to foreground;
-// intermediate 1 kHz facts do not enter a perishable ring.  The published edge
-// DWT is last-published + EMA(observed one-second interval), smoothing the
-// common-mode residuals that defeated the service-forensics experiment.
+// EMA authority for OCXO one-second DWT publication.  In steady state each
+// OCXO lane publishes a single local one-second edge compare.  The 16-bit
+// hardware compare is armed only when the authored one-second target is inside
+// a safe low-word window; CH2 implicit rollover tending keeps the synthetic
+// 32-bit lane projection fresh between those one-second edges.  SmartZero is
+// the remaining short-cadence user and temporarily owns +10,000-tick samples
+// during acquisition only.  The subscriber-facing edge DWT is last-published
+// + EMA(observed one-second interval), smoothing service/custody excursions
+// while preserving raw ISR DWT as diagnostics.
 static constexpr bool     OCXO_EMA_DWT_AUTHORITY_ENABLED = true;
 static constexpr uint32_t OCXO_EMA_SHIFT = 4;  // alpha = 1/16
 static constexpr uint32_t OCXO_EMA_ALPHA_NUMERATOR = 1;
 static constexpr uint32_t OCXO_EMA_ALPHA_DENOMINATOR = (1U << OCXO_EMA_SHIFT);
 
-// OCXO lane-local cadence.  OCXO1/OCXO2 own a small 1 kHz rollover-only
-// compare ladder in their own 10 MHz domains.  Every compare ISR schedules
-// the next +10,000 tick target.  Every 1000th local cadence fact becomes the
-// public one-second OCXO event consumed by Alpha; the other 999 ticks are
-// local rollover maintenance only.
+// OCXO local target constants.  Normal OCXO operation is one-second edge
+// compare custody: each public event is exactly 10,000,000 OCXO ticks after
+// the previous authored target.  OCXO_CADENCE_INTERVAL_TICKS remains the
+// SmartZero acquisition sample spacing and the low-word arm-window scale; it
+// is not a steady-state 1 kHz OCXO publication ladder.
 static constexpr uint32_t OCXO_CADENCE_INTERVAL_TICKS = 10000U;
 static constexpr uint32_t OCXO_WITNESS_ONE_SECOND_COUNTS =
     (uint32_t)VCLOCK_COUNTS_PER_SECOND;
@@ -218,18 +221,16 @@ static_assert(OCXO_WITNESS_ONE_SECOND_COUNTS == 10000000U,
               "OCXO witness edge interval must be one 10 MHz second");
 static_assert(OCXO_WITNESS_ONE_SECOND_COUNTS ==
               (OCXO_CADENCE_INTERVAL_TICKS * TICKS_PER_SECOND_EVENT),
-              "OCXO one-second event must be exactly 1000 local cadence samples");
+              "OCXO one-second interval must equal 1000 SmartZero sample ticks");
 static constexpr uint32_t OCXO_WITNESS_ARM_WINDOW_TICKS = OCXO_CADENCE_INTERVAL_TICKS;
 static constexpr uint32_t OCXO_WITNESS_MIN_ARM_LEAD_TICKS = 64U;
 
-// Quiet-phase OCXO custody — retired/dormant.
+// OCXO quiet-phase report surface.
 //
-// The OCXO local compare ladders still hop at 1 kHz because a 10 MHz / 1 s
-// hardware compare does not fit in the 16-bit QuadTimer compare span.  The
-// quiet-phase experiment is now disabled; the lane publishes only logical
-// rollover events, and the subscriber-facing DWT is EMA-predicted.  The constants
-// remain visible as report/back-compat surfaces while the old experiment is
-// unwound.
+// These constants describe the nominal phase placement of OCXO lane samples
+// inside the VCLOCK millisecond cell.  They are retained as report/back-compat
+// surfaces, but steady-state OCXO publication is now the local one-second edge
+// compare.  SmartZero may still use +10,000-tick acquisition samples.
 static constexpr bool     OCXO_QUIET_PHASE_SAMPLING_ENABLED = true;
 static constexpr uint32_t OCXO_QUIET_PHASE_PERIOD_TICKS = OCXO_CADENCE_INTERVAL_TICKS;
 static constexpr uint32_t OCXO1_QUIET_PHASE_TICKS = 2500U;  // +250 us
@@ -343,26 +344,26 @@ static constexpr uint32_t INTERRUPT_STEP0_EXPECTED_QTIMER3_PRIORITY  = 16;
 static constexpr uint32_t INTERRUPT_STEP0_EXPECTED_GPIO6789_PRIORITY = 0;
 
 // ============================================================================
-// SpinCatch step 5.6 — OCXO1 landing lead tuning
+// SpinCatch landing-only witness — symmetric OCXO lead tuning
 // ============================================================================
 //
-// This checkpoint keeps the Step 4 planner surface and enables an every-second
-// OCXO1 TimePop landing callback.  The callback records the DWT/counter32 at
-// the planned lead-tuned approach point and immediately returns.  It does not spin,
-// does not reprogram or clear any OCXO compare register, does not alter event
-// DWT authority, and does not expand interrupt_capture_diag_t.
+// SpinCatch looping is now system-wide TimePop idle work.  The per-lane surface
+// below is landing-only and deliberately symmetric for OCXO1/OCXO2: after each
+// published OCXO one-second fact, schedule a low-duty TimePop callback before
+// the next already-authored target.  The callback records DWT/counter32 landing
+// facts and immediately returns.  It does not spin, does not reprogram or clear
+// any OCXO compare register, does not alter event DWT authority, and does not
+// expand interrupt_capture_diag_t.
 
 static constexpr bool SPINCATCH_REPORT_SHELL_SUPPORTED = true;
 static constexpr bool SPINCATCH_PLANNER_ENABLED = true;
 static constexpr bool SPINCATCH_VCLOCK_ENABLED = false;
-static constexpr bool SPINCATCH_OCXO1_LANDING_ONLY_ENABLED = true;
-static constexpr bool SPINCATCH_OCXO2_ENABLED = false;
-static constexpr const char* SPINCATCH_REPORT_MODE = "OCXO1_LANDING_ONLY_NO_SPIN";
+static constexpr bool SPINCATCH_OCXO_LANDING_ONLY_ENABLED = true;
+static constexpr const char* SPINCATCH_REPORT_MODE = "OCXO_SYMMETRIC_LANDING_ONLY_NO_SPIN";
 static constexpr uint32_t SPINCATCH_APPROACH_US = 10U;
 static constexpr uint32_t SPINCATCH_APPROACH_TICKS = SPINCATCH_APPROACH_US * 10U;
-static constexpr uint32_t SPINCATCH_OCXO1_LANDING_DUTY_DIVISOR = 1U;
+static constexpr uint32_t SPINCATCH_OCXO_LANDING_DUTY_DIVISOR = 1U;
 static constexpr uint32_t SPINCATCH_LANDING_MIN_LEAD_TICKS = 128U;
-static constexpr const char* SPINCATCH_OCXO1_LANDING_NAME = "SPINCATCH_OCXO1_LANDING";
 static constexpr uint32_t SPINCATCH_LANDING_ATTEMPT_RING_SIZE = 4U;
 static constexpr uint32_t SPINCATCH_LANDING_STALE_TARGET_PERIODS = 2U;
 static_assert(SPINCATCH_APPROACH_TICKS == 100U,
@@ -1579,8 +1580,8 @@ struct spincatch_lane_report_t {
   uint32_t now_counter32 = 0;
   uint32_t ticks_until_target = 0;
 
-  // Step 5.5 landing-only surface.  OCXO1 schedules one TimePop
-  // landing callback per one-second event that records its landing facts and returns immediately.
+  // Landing-only surface.  OCXO1 and OCXO2 schedule the same TimePop
+  // callback pattern per one-second event; callbacks record landing facts and return immediately.
   bool     landing_only_enabled = false;
   bool     landing_pending = false;
   bool     landing_last_success = false;
@@ -1645,19 +1646,26 @@ struct spincatch_landing_attempt_t {
 
 static spincatch_landing_attempt_t
     g_spincatch_ocxo1_attempts[SPINCATCH_LANDING_ATTEMPT_RING_SIZE] = {};
+static spincatch_landing_attempt_t
+    g_spincatch_ocxo2_attempts[SPINCATCH_LANDING_ATTEMPT_RING_SIZE] = {};
 static spincatch_landing_context_t
     g_spincatch_ocxo1_landing_contexts[SPINCATCH_LANDING_ATTEMPT_RING_SIZE] = {};
+static spincatch_landing_context_t
+    g_spincatch_ocxo2_landing_contexts[SPINCATCH_LANDING_ATTEMPT_RING_SIZE] = {};
 
 static bool spincatch_enabled_for_kind(interrupt_subscriber_kind_t kind) {
   if (kind == interrupt_subscriber_kind_t::VCLOCK) return SPINCATCH_VCLOCK_ENABLED;
-  if (kind == interrupt_subscriber_kind_t::OCXO1) return SPINCATCH_OCXO1_LANDING_ONLY_ENABLED;
-  if (kind == interrupt_subscriber_kind_t::OCXO2) return SPINCATCH_OCXO2_ENABLED;
+  if (kind == interrupt_subscriber_kind_t::OCXO1 ||
+      kind == interrupt_subscriber_kind_t::OCXO2) {
+    return SPINCATCH_OCXO_LANDING_ONLY_ENABLED;
+  }
   return false;
 }
 
 static uint32_t spincatch_landing_duty_for_kind(interrupt_subscriber_kind_t kind) {
-  if (kind == interrupt_subscriber_kind_t::OCXO1) {
-    return SPINCATCH_OCXO1_LANDING_DUTY_DIVISOR;
+  if (kind == interrupt_subscriber_kind_t::OCXO1 ||
+      kind == interrupt_subscriber_kind_t::OCXO2) {
+    return SPINCATCH_OCXO_LANDING_DUTY_DIVISOR;
   }
   return 0U;
 }
@@ -1706,15 +1714,23 @@ static void spincatch_report_reset_all(void) {
   g_spincatch_vclock.enabled = spincatch_enabled_for_kind(interrupt_subscriber_kind_t::VCLOCK);
   g_spincatch_ocxo1.enabled = spincatch_enabled_for_kind(interrupt_subscriber_kind_t::OCXO1);
   g_spincatch_ocxo2.enabled = spincatch_enabled_for_kind(interrupt_subscriber_kind_t::OCXO2);
-  g_spincatch_ocxo1.landing_only_enabled = SPINCATCH_OCXO1_LANDING_ONLY_ENABLED;
-  g_spincatch_ocxo1.landing_duty_divisor = SPINCATCH_OCXO1_LANDING_DUTY_DIVISOR;
+
+  g_spincatch_ocxo1.landing_only_enabled = SPINCATCH_OCXO_LANDING_ONLY_ENABLED;
+  g_spincatch_ocxo1.landing_duty_divisor = SPINCATCH_OCXO_LANDING_DUTY_DIVISOR;
   g_spincatch_ocxo1.landing_attempt_ring_size = SPINCATCH_LANDING_ATTEMPT_RING_SIZE;
+  g_spincatch_ocxo2.landing_only_enabled = SPINCATCH_OCXO_LANDING_ONLY_ENABLED;
+  g_spincatch_ocxo2.landing_duty_divisor = SPINCATCH_OCXO_LANDING_DUTY_DIVISOR;
+  g_spincatch_ocxo2.landing_attempt_ring_size = SPINCATCH_LANDING_ATTEMPT_RING_SIZE;
 
   for (uint32_t i = 0; i < SPINCATCH_LANDING_ATTEMPT_RING_SIZE; i++) {
     g_spincatch_ocxo1_attempts[i] = spincatch_landing_attempt_t{};
+    g_spincatch_ocxo2_attempts[i] = spincatch_landing_attempt_t{};
     g_spincatch_ocxo1_landing_contexts[i] = spincatch_landing_context_t{};
+    g_spincatch_ocxo2_landing_contexts[i] = spincatch_landing_context_t{};
     g_spincatch_ocxo1_landing_contexts[i].kind = interrupt_subscriber_kind_t::OCXO1;
+    g_spincatch_ocxo2_landing_contexts[i].kind = interrupt_subscriber_kind_t::OCXO2;
     g_spincatch_ocxo1_landing_contexts[i].attempt_index = i;
+    g_spincatch_ocxo2_landing_contexts[i].attempt_index = i;
   }
 
   g_spincatch_vclock_capture_active = false;
@@ -2049,10 +2065,11 @@ struct ocxo_lane_t {
   uint32_t bootstrap_count = 0;
   uint32_t cadence_hits_total = 0;
 
-  // Lane-local 1 kHz rollover cadence.  This is the device-centric substrate
-  // that will later carry the regression window.  The compare target is a
-  // process_interrupt-authored synthetic counter32 identity; the low 16 bits
-  // are merely the hardware projection used to arm the local QTimer channel.
+  // Lane-local compare custody.  In steady state this is a one-second edge
+  // target; during SmartZero it temporarily becomes a +10,000-tick acquisition
+  // target.  The compare target is a process_interrupt-authored synthetic
+  // counter32 identity; the low 16 bits are merely the hardware projection
+  // used to arm the local QTimer channel.
   bool     cadence_enabled = false;
   bool     cadence_armed = false;
   bool     cadence_epoch_valid = false;
@@ -2099,8 +2116,9 @@ struct ocxo_lane_t {
   uint32_t cadence_last_reason = OCXO_CADENCE_REASON_NONE;
   uint32_t cadence_user_callback_count = 0;
 
-  // Once-per-second OCXO witness surface.  This is now derived from the 1000th
-  // lane-local cadence sample rather than armed as a separate compare target.
+  // Once-per-second OCXO witness surface.  In steady state this is the local
+  // one-second compare target itself.  During SmartZero this surface remains
+  // quiet until acquisition re-authors the normal one-second grid.
   bool     witness_target_initialized = false;
   bool     witness_armed = false;
   uint32_t witness_target_counter32 = 0;
@@ -3171,9 +3189,9 @@ static void smartzero_arm_ocxo_lane(interrupt_subscriber_kind_t kind) {
   synthetic_clock32_t* clock32 = synthetic_clock_for_kind(kind);
   if (!lane || !clock32 || !lane->initialized) return;
 
-  // SmartZero now rides the same lane-local 1 kHz compare cadence that will
-  // later feed regression.  The compare target is the authored sample
-  // identity; service-time low-word reads remain diagnostics only.
+  // SmartZero temporarily rides the same OCXO compare ISR with +10,000-tick
+  // acquisition samples.  The compare target is the authored sample identity;
+  // service-time low-word reads remain diagnostics only.
   ocxo_lane_stop_local_cadence(*lane, OCXO_CADENCE_REASON_SMARTZERO);
 
   const uint16_t hw16 = ocxo_lane_counter_now(*lane);
@@ -3332,10 +3350,11 @@ static bool smartzero_feed_sample(interrupt_subscriber_kind_t kind,
   return false;
 }
 
-// OCXO SmartZero samples are now served by the same lane-local 1 kHz
-// compare cadence used for normal rollover custody.  There is intentionally
-// no separate SmartZero ISR path here; the unified OCXO cadence ISR feeds
-// smartzero_feed_sample() with the authored compare-target identity.
+// OCXO SmartZero samples are served by the same local OCXO compare ISR used
+// for steady-state one-second edge capture.  There is intentionally no
+// separate SmartZero ISR path here; SmartZero temporarily changes the next
+// authored target spacing to +10,000 ticks and feeds smartzero_feed_sample()
+// with that authored compare-target identity.
 
 bool interrupt_smartzero_begin(void) {
   if (!g_interrupt_runtime_ready || !g_interrupt_hw_ready) return false;
@@ -3383,11 +3402,11 @@ void interrupt_smartzero_abort(void) {
   smartzero_write_end();
   vclock_ch2_smartzero_deactivate();
 
-  // SmartZero may temporarily stop/re-author the OCXO local compare cadence
+  // SmartZero may temporarily stop/re-author the OCXO local compare path
   // while acquiring lane proofs.  Aborting the *live acquisition attempt* must
   // not silently disable active clock service.  If an OCXO lane is active,
-  // restore its normal local 1 kHz cadence from the currently installed grid;
-  // if it is inactive, leave it stopped as before.
+  // restore its normal one-second edge compare from the currently installed
+  // grid; if it is inactive, leave it stopped as before.
   if (!OCXO1_DISABLED) {
     if (g_ocxo1_lane.active) {
       (void)ocxo_lane_start_local_cadence(interrupt_subscriber_kind_t::OCXO1,
@@ -5127,8 +5146,8 @@ static void ocxo_lane_disable_compare(ocxo_lane_t& lane) {
 //   1. capture first-instruction DWT,
 //   2. clear the compare flag,
 //   3. compute the latency-adjusted event DWT,
-//   4. re-arm the next 1 kHz compare,
-//   5. refresh the synthetic 32-bit lane anchor,
+//   4. refresh the synthetic 32-bit lane anchor,
+//   5. arm the next compare (one-second normally, +10,000 during SmartZero),
 //   6. enqueue the perishable fact for foreground interpretation.
 //
 // Dynamic 100 Hz prediction has been retired. The old single-slot OCXO
@@ -5142,11 +5161,13 @@ static void ocxo_lane_disable_compare(ocxo_lane_t& lane) {
 //
 // The former build enqueued every 1 kHz OCXO cadence sample and asked
 // foreground TimePop ASAP to drain/interpret them. That proved too expensive.
-// The rollover-only build keeps the 1 kHz hardware ladder but enqueues only
-// the 1000th sample that represents an OCXO one-second event. Intermediate
-// cadence ticks rearm the local compare and update small lane counters only.
+// Steady-state OCXO now enqueues only the local one-second edge compare.
+// SmartZero may temporarily use +10,000-tick acquisition samples, but those
+// samples do not publish as OCXO one-second events until SmartZero re-authors
+// the normal one-second grid.
 //
-// The ring remains per-lane and loss-visible, but its normal rate is now 1 Hz.
+// The ring remains per-lane and loss-visible, with a normal publication rate
+// of 1 Hz per active OCXO lane.
 
 static constexpr uint32_t OCXO_PERISHABLE_FACT_RING_SIZE = 32;
 
@@ -5621,6 +5642,14 @@ static bool spincatch_current_target_for_kind(interrupt_subscriber_kind_t kind,
 static spincatch_landing_attempt_t* spincatch_attempts_for_kind(
     interrupt_subscriber_kind_t kind) {
   if (kind == interrupt_subscriber_kind_t::OCXO1) return g_spincatch_ocxo1_attempts;
+  if (kind == interrupt_subscriber_kind_t::OCXO2) return g_spincatch_ocxo2_attempts;
+  return nullptr;
+}
+
+static spincatch_landing_context_t* spincatch_landing_contexts_for_kind(
+    interrupt_subscriber_kind_t kind) {
+  if (kind == interrupt_subscriber_kind_t::OCXO1) return g_spincatch_ocxo1_landing_contexts;
+  if (kind == interrupt_subscriber_kind_t::OCXO2) return g_spincatch_ocxo2_landing_contexts;
   return nullptr;
 }
 
@@ -5761,20 +5790,23 @@ static void spincatch_landing_callback(timepop_ctx_t* ctx,
   spincatch_landing_refresh_pending(*s, landing_ctx->kind);
 }
 
-static void spincatch_maybe_schedule_ocxo1_landing(
+static void spincatch_maybe_schedule_ocxo_landing(
     ocxo_runtime_context_t& ctx,
     const interrupt_perishable_fact_t& fact) {
-  if (!SPINCATCH_OCXO1_LANDING_ONLY_ENABLED) return;
-  if (ctx.kind != interrupt_subscriber_kind_t::OCXO1) return;
+  if (!SPINCATCH_OCXO_LANDING_ONLY_ENABLED) return;
+  if (ctx.kind != interrupt_subscriber_kind_t::OCXO1 &&
+      ctx.kind != interrupt_subscriber_kind_t::OCXO2) return;
   if (!fact.one_second_due) return;
   if (!ctx.lane || !ctx.clock32) return;
 
   spincatch_lane_report_t* s = spincatch_report_for_kind(ctx.kind);
-  if (!s) return;
+  spincatch_landing_context_t* contexts =
+      spincatch_landing_contexts_for_kind(ctx.kind);
+  if (!s || !contexts) return;
 
   s->enabled = true;
   s->landing_only_enabled = true;
-  s->landing_duty_divisor = SPINCATCH_OCXO1_LANDING_DUTY_DIVISOR;
+  s->landing_duty_divisor = SPINCATCH_OCXO_LANDING_DUTY_DIVISOR;
   s->landing_attempt_ring_size = SPINCATCH_LANDING_ATTEMPT_RING_SIZE;
   s->landing_duty_counter++;
 
@@ -5836,15 +5868,15 @@ static void spincatch_maybe_schedule_ocxo1_landing(
   const uint64_t delay_ns = (uint64_t)delay_ticks * 100ULL;
   const uint32_t generation = ++s->landing_attempt_generation;
 
-  g_spincatch_ocxo1_landing_contexts[attempt_index].kind = ctx.kind;
-  g_spincatch_ocxo1_landing_contexts[attempt_index].attempt_index = attempt_index;
-  g_spincatch_ocxo1_landing_contexts[attempt_index].generation = generation;
+  contexts[attempt_index].kind = ctx.kind;
+  contexts[attempt_index].attempt_index = attempt_index;
+  contexts[attempt_index].generation = generation;
 
   const timepop_handle_t h =
       timepop_arm(delay_ns,
                   false,
                   spincatch_landing_callback,
-                  &g_spincatch_ocxo1_landing_contexts[attempt_index],
+                  &contexts[attempt_index],
                   nullptr);
   if (h == TIMEPOP_INVALID_HANDLE) {
     s->landing_schedule_fail_count++;
@@ -6033,10 +6065,11 @@ static void ocxo_apply_perishable_fact_deferred(
                         nullptr,
                         &fact.spinidle);
 
-  // Step 5: schedule at most one low-duty OCXO1 landing-only callback for the
-  // next already-authored one-second target.  This records the TimePop landing
-  // facts only; it never touches the OCXO compare hardware.
-  spincatch_maybe_schedule_ocxo1_landing(ctx, fact);
+  // Schedule at most one low-duty landing-only callback for the next
+  // already-authored OCXO target.  OCXO1 and OCXO2 use identical scheduling,
+  // attempt-ring, and reporting rules.  This records the TimePop landing facts
+  // only; it never touches the OCXO compare hardware.
+  spincatch_maybe_schedule_ocxo_landing(ctx, fact);
 }
 
 static void ocxo_fact_drain_callback(timepop_ctx_t*,
@@ -8652,7 +8685,7 @@ static void add_ocxo_identity_payload(Payload& p,
   p.add("hardware_lane", interrupt_lane_str(ctx.lane_id));
   p.add("cadence_source", ctx.cadence_source);
   p.add("counter_source", ctx.counter_source);
-  p.add("event_source", "LOCAL_CADENCE_1000TH_ROLLOVER_EMA_EDGE");
+  p.add("event_source", "LOCAL_ONE_SECOND_EDGE_COMPARE_EMA_DWT");
   p.add("dwt_authority", ctx.dwt_authority);
 }
 
