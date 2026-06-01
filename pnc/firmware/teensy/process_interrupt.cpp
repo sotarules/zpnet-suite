@@ -205,7 +205,7 @@ static constexpr uint32_t OCXO_DWT_SOURCE_EMA_PREDICTED = 2;
 // + EMA(observed one-second interval), smoothing service/custody excursions
 // while preserving raw ISR DWT as diagnostics.
 static constexpr bool     OCXO_EMA_DWT_AUTHORITY_ENABLED = true;
-static constexpr uint32_t OCXO_EMA_SHIFT = 4;  // alpha = 1/16
+static constexpr uint32_t OCXO_EMA_SHIFT = 7;  // alpha = 1/128 MULE CHANGE
 static constexpr uint32_t OCXO_EMA_ALPHA_NUMERATOR = 1;
 static constexpr uint32_t OCXO_EMA_ALPHA_DENOMINATOR = (1U << OCXO_EMA_SHIFT);
 
