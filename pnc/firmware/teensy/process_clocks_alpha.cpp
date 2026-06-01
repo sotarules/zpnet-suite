@@ -522,6 +522,16 @@ struct alpha_lane_forensics_store_t {
   uint32_t dwt_interval_gate_threshold_cycles = 0;
   uint32_t dwt_interval_accept_count = 0;
   uint32_t dwt_interval_reject_count = 0;
+  bool     dwt_interval_resync_applied = false;
+  uint32_t dwt_interval_resync_count = 0;
+  uint32_t dwt_interval_reject_streak = 0;
+
+  bool     dwt_interval_adjacency_gate_valid = false;
+  bool     dwt_interval_adjacency_ok = false;
+  bool     dwt_interval_adjacency_rejected = false;
+  uint32_t dwt_interval_counter_delta_ticks = 0;
+  uint32_t dwt_interval_expected_counter_delta_ticks = 0;
+  uint32_t dwt_interval_adjacency_reject_count = 0;
 
   int64_t  second_residual_ns = 0;
   int64_t  window_error_ns = 0;
@@ -1784,6 +1794,15 @@ static void alpha_forensics_reset_store(alpha_lane_forensics_store_t& s) {
   s.dwt_interval_gate_threshold_cycles = 0;
   s.dwt_interval_accept_count = 0;
   s.dwt_interval_reject_count = 0;
+  s.dwt_interval_resync_applied = false;
+  s.dwt_interval_resync_count = 0;
+  s.dwt_interval_reject_streak = 0;
+  s.dwt_interval_adjacency_gate_valid = false;
+  s.dwt_interval_adjacency_ok = false;
+  s.dwt_interval_adjacency_rejected = false;
+  s.dwt_interval_counter_delta_ticks = 0;
+  s.dwt_interval_expected_counter_delta_ticks = 0;
+  s.dwt_interval_adjacency_reject_count = 0;
   s.second_residual_ns = 0;
   s.window_error_ns = 0;
   s.window_checks = 0;
@@ -1968,7 +1987,20 @@ static void alpha_forensics_publish(time_clock_id_t clock_id,
     s->dwt_interval_gate_threshold_cycles = diag->dwt_interval_gate_threshold_cycles;
     s->dwt_interval_accept_count = diag->dwt_interval_accept_count;
     s->dwt_interval_reject_count = diag->dwt_interval_reject_count;
-
+    s->dwt_interval_resync_applied = diag->dwt_interval_resync_applied;
+    s->dwt_interval_resync_count = diag->dwt_interval_resync_count;
+    s->dwt_interval_reject_streak = diag->dwt_interval_reject_streak;
+    s->dwt_interval_adjacency_gate_valid =
+        diag->dwt_interval_adjacency_gate_valid;
+    s->dwt_interval_adjacency_ok = diag->dwt_interval_adjacency_ok;
+    s->dwt_interval_adjacency_rejected =
+        diag->dwt_interval_adjacency_rejected;
+    s->dwt_interval_counter_delta_ticks =
+        diag->dwt_interval_counter_delta_ticks;
+    s->dwt_interval_expected_counter_delta_ticks =
+        diag->dwt_interval_expected_counter_delta_ticks;
+    s->dwt_interval_adjacency_reject_count =
+        diag->dwt_interval_adjacency_reject_count;
 
     s->diag_anchor_sequence_used = diag->anchor_sequence_used;
     s->diag_anchor_age_slots = diag->anchor_age_slots;
@@ -2070,6 +2102,15 @@ static void alpha_forensics_publish(time_clock_id_t clock_id,
     s->dwt_interval_gate_threshold_cycles = 0;
     s->dwt_interval_accept_count = 0;
     s->dwt_interval_reject_count = 0;
+    s->dwt_interval_resync_applied = false;
+    s->dwt_interval_resync_count = 0;
+    s->dwt_interval_reject_streak = 0;
+    s->dwt_interval_adjacency_gate_valid = false;
+    s->dwt_interval_adjacency_ok = false;
+    s->dwt_interval_adjacency_rejected = false;
+    s->dwt_interval_counter_delta_ticks = 0;
+    s->dwt_interval_expected_counter_delta_ticks = 0;
+    s->dwt_interval_adjacency_reject_count = 0;
     s->diag_anchor_sequence_used = 0;
     s->diag_anchor_age_slots = 0;
     s->diag_anchor_selection_kind = 0;
@@ -2195,6 +2236,20 @@ bool clocks_alpha_lane_forensics(time_clock_id_t clock,
     out->dwt_interval_gate_threshold_cycles = s->dwt_interval_gate_threshold_cycles;
     out->dwt_interval_accept_count = s->dwt_interval_accept_count;
     out->dwt_interval_reject_count = s->dwt_interval_reject_count;
+    out->dwt_interval_resync_applied = s->dwt_interval_resync_applied;
+    out->dwt_interval_resync_count = s->dwt_interval_resync_count;
+    out->dwt_interval_reject_streak = s->dwt_interval_reject_streak;
+    out->dwt_interval_adjacency_gate_valid =
+        s->dwt_interval_adjacency_gate_valid;
+    out->dwt_interval_adjacency_ok = s->dwt_interval_adjacency_ok;
+    out->dwt_interval_adjacency_rejected =
+        s->dwt_interval_adjacency_rejected;
+    out->dwt_interval_counter_delta_ticks =
+        s->dwt_interval_counter_delta_ticks;
+    out->dwt_interval_expected_counter_delta_ticks =
+        s->dwt_interval_expected_counter_delta_ticks;
+    out->dwt_interval_adjacency_reject_count =
+        s->dwt_interval_adjacency_reject_count;
     out->second_residual_ns = s->second_residual_ns;
     out->window_error_ns = s->window_error_ns;
     out->window_checks = s->window_checks;

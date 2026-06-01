@@ -295,6 +295,17 @@ struct interrupt_capture_diag_t {
   uint32_t dwt_interval_resync_count = 0;
   uint32_t dwt_interval_reject_streak = 0;
 
+  // OCXO event-lineage audit.  For OCXO1/OCXO2, a normal one-second event
+  // must advance exactly 10,000,000 target ticks from the previous published
+  // event.  A failed adjacency check means the raw DWT endpoint is evidence
+  // only; the subscriber DWT is projected from the existing EMA ruler.
+  bool     dwt_interval_adjacency_gate_valid = false;
+  bool     dwt_interval_adjacency_ok = false;
+  bool     dwt_interval_adjacency_rejected = false;
+  uint32_t dwt_interval_counter_delta_ticks = 0;
+  uint32_t dwt_interval_expected_counter_delta_ticks = 0;
+  uint32_t dwt_interval_adjacency_reject_count = 0;
+
   // 1 kHz cadence linear-regression audit.  In the diagnostic-only build,
   // subscribers still receive the traditional event DWT in event.dwt_at_event /
   // diag.dwt_at_event.  These fields expose the fitted endpoint and per-second
@@ -379,6 +390,11 @@ struct interrupt_capture_diag_t {
   uint32_t ocxo_counter_delta_violation_count = 0;
   uint32_t ocxo_last_bad_counter_delta = 0;
   uint32_t ocxo_last_counter_delta_ticks = 0;
+  uint32_t ocxo_expected_counter_delta_ticks = 0;
+  bool     ocxo_counter_adjacency_valid = false;
+  bool     ocxo_counter_adjacency_ok = false;
+  bool     ocxo_counter_adjacency_rejected = false;
+  uint32_t ocxo_counter_adjacency_reject_count = 0;
 
   // OCXO sample phase.  Quiet-phase publication has been retired in the
   // rollover-only EMA build, so these fields are normally false/zero.  They are

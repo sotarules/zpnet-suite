@@ -1057,6 +1057,23 @@ static void payload_add_lane_forensics_flat(Payload& p,
           valid ? f.dwt_interval_resync_count : 0U);
   add_u32("forensics_dwt_interval_reject_streak",
           valid ? f.dwt_interval_reject_streak : 0U);
+
+  // Counter-adjacency trap propagated from process_interrupt.  This is the
+  // durable proof raw_cycles needs to decide whether a synthetic DWT endpoint
+  // came from a normal EMA interval gate or from a broken one-second lineage.
+  add_bool("forensics_dwt_interval_adjacency_gate_valid",
+           valid && f.dwt_interval_adjacency_gate_valid);
+  add_bool("forensics_dwt_interval_adjacency_ok",
+           valid && f.dwt_interval_adjacency_ok);
+  add_bool("forensics_dwt_interval_adjacency_rejected",
+           valid && f.dwt_interval_adjacency_rejected);
+  add_u32("forensics_dwt_interval_counter_delta_ticks",
+          valid ? f.dwt_interval_counter_delta_ticks : 0U);
+  add_u32("forensics_dwt_interval_expected_counter_delta_ticks",
+          valid ? f.dwt_interval_expected_counter_delta_ticks : 0U);
+  add_u32("forensics_dwt_interval_adjacency_reject_count",
+          valid ? f.dwt_interval_adjacency_reject_count : 0U);
+
   add_u32("forensics_counter32_delta_since_previous_event",
           valid ? f.counter32_delta_since_previous_event : 0U);
   add_u32("forensics_zero_offset_counter32", valid ? f.zero_offset_counter32 : 0U);
@@ -1344,8 +1361,22 @@ static void payload_add_lane_forensics_object(Payload& parent,
   gate.add("threshold_cycles", valid ? f.dwt_interval_gate_threshold_cycles : 0U);
   gate.add("accept_count", valid ? f.dwt_interval_accept_count : 0U);
   gate.add("reject_count", valid ? f.dwt_interval_reject_count : 0U);
+  gate.add("resync_applied", valid && f.dwt_interval_resync_applied);
   gate.add("resync_count", valid ? f.dwt_interval_resync_count : 0U);
+  gate.add("reject_streak", valid ? f.dwt_interval_reject_streak : 0U);
   forensics.add_object("dwt_interval_gate", gate);
+
+  Payload adjacency;
+  adjacency.add("valid", valid && f.dwt_interval_adjacency_gate_valid);
+  adjacency.add("ok", valid && f.dwt_interval_adjacency_ok);
+  adjacency.add("rejected", valid && f.dwt_interval_adjacency_rejected);
+  adjacency.add("counter_delta_ticks",
+                valid ? f.dwt_interval_counter_delta_ticks : 0U);
+  adjacency.add("expected_counter_delta_ticks",
+                valid ? f.dwt_interval_expected_counter_delta_ticks : 0U);
+  adjacency.add("reject_count",
+                valid ? f.dwt_interval_adjacency_reject_count : 0U);
+  forensics.add_object("dwt_interval_adjacency", adjacency);
 
   parent.add_object("forensics", forensics);
 }
@@ -2081,6 +2112,19 @@ static bool clocks_try_finish_pending_smartzero(void) {
   return true;
 }
 
+static bool clocks_servo_active(void) {
+  return calibrate_ocxo_mode != servo_mode_t::OFF;
+}
+
+static void payload_add_servo_dac_values(Payload& parent) {
+  // Minimal durable DAC payload.  This is intentionally only the two values
+  // the Pi should persist as the current system DAC configuration.
+  Payload dac;
+  dac.add("ocxo1_dac", ocxo1_dac.dac_fractional);
+  dac.add("ocxo2_dac", ocxo2_dac.dac_fractional);
+  parent.add_object("dac", dac);
+}
+
 // ============================================================================
 // clocks_beta_pps — invoked from alpha's pps_selector_callback
 // ============================================================================
@@ -2550,19 +2594,6 @@ static bool payload_try_get_ocxo2_dac(const Payload& args, double& out) {
                                       "set_dac2");
 }
 
-static bool clocks_servo_active(void) {
-  return calibrate_ocxo_mode != servo_mode_t::OFF;
-}
-
-static void payload_add_servo_dac_values(Payload& parent) {
-  // Minimal durable DAC payload.  This is intentionally only the two values
-  // the Pi should persist as the current system DAC configuration.
-  Payload dac;
-  dac.add("ocxo1_dac", ocxo1_dac.dac_fractional);
-  dac.add("ocxo2_dac", ocxo2_dac.dac_fractional);
-  parent.add_object("dac", dac);
-}
-
 static Payload cmd_start(const Payload& args) {
   const char* name = args.getString("campaign");
   if (!name || !*name) {
@@ -2832,6 +2863,19 @@ static void add_alpha_event_payload(Payload& p,
 
   p.add("ns_between_edges", f.ns_between_edges);
   p.add("dwt_cycles_between_edges", f.dwt_cycles_between_edges);
+
+  Payload dwt_interval_adjacency;
+  dwt_interval_adjacency.add("valid", f.dwt_interval_adjacency_gate_valid);
+  dwt_interval_adjacency.add("ok", f.dwt_interval_adjacency_ok);
+  dwt_interval_adjacency.add("rejected", f.dwt_interval_adjacency_rejected);
+  dwt_interval_adjacency.add("counter_delta_ticks",
+                             f.dwt_interval_counter_delta_ticks);
+  dwt_interval_adjacency.add("expected_counter_delta_ticks",
+                             f.dwt_interval_expected_counter_delta_ticks);
+  dwt_interval_adjacency.add("reject_count",
+                             f.dwt_interval_adjacency_reject_count);
+  p.add_object("dwt_interval_adjacency", dwt_interval_adjacency);
+
   p.add("second_residual_ns", f.second_residual_ns);
   p.add("window_error_ns", f.window_error_ns);
   p.add("window_checks", f.window_checks);

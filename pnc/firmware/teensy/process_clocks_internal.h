@@ -342,6 +342,18 @@ struct clocks_alpha_lane_forensics_t {
   uint32_t dwt_interval_resync_count;
   uint32_t dwt_interval_reject_streak;
 
+  // process_interrupt-authored counter-adjacency audit.  For OCXO lanes this
+  // proves whether the DWT interval sample was formed from adjacent one-second
+  // target identities.  A rejected adjacency sample is custody evidence only:
+  // process_interrupt publishes the predicted DWT endpoint and preserves the
+  // observed endpoint here for TIMEBASE_FORENSICS/raw_cycles.
+  bool     dwt_interval_adjacency_gate_valid;
+  bool     dwt_interval_adjacency_ok;
+  bool     dwt_interval_adjacency_rejected;
+  uint32_t dwt_interval_counter_delta_ticks;
+  uint32_t dwt_interval_expected_counter_delta_ticks;
+  uint32_t dwt_interval_adjacency_reject_count;
+
   int64_t  second_residual_ns;
   int64_t  window_error_ns;
   uint32_t window_checks;
