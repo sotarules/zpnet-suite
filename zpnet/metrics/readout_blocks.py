@@ -529,9 +529,16 @@ def _dac_report_dither_summary(report_dac: dict | None, lane: str) -> str:
         return "ON"
     if low is None or high is None:
         return f"{rate}Hz"
+
+    # Dither windows are usually 0..10 at the safe 10 Hz rate.  Pad the
+    # counters so a 10-count bucket does not shift the DAC row horizontally
+    # when adjacent windows contain single-digit counts.
+    low_s = f"{low:02d}"
+    high_s = f"{high:02d}"
+
     if low_code is None or high_code is None:
-        return f"{rate}Hz {low}/{high}"
-    return f"{rate}Hz {low_code}:{low} {high_code}:{high}"
+        return f"{rate}Hz {low_s}/{high_s}"
+    return f"{rate}Hz {low_code}:{low_s} {high_code}:{high_s}"
 
 
 def _dac_detail_lines(r: dict, baseline: dict | None, report_dac: dict | None,
@@ -767,7 +774,7 @@ def clocks_combined_readout() -> list[str]:
     baseline_campaign = baseline.get("baseline_campaign", "?") if baseline else None
 
     servo_str = servo_state
-    baseline_str = f"BASELINE: #{baseline_id} ({baseline_campaign})" if baseline_id else "BASELINE: NONE"
+    baseline_str = f"BASELINE: {baseline_campaign}" if baseline_id else "BASELINE: NONE"
 
     lines.append(
         f"CAMPAIGN: {campaign}  ELAPSED: {elapsed}  n={n}"
@@ -947,31 +954,6 @@ def clocks_combined_readout() -> list[str]:
         W_MEAN, W_SD, W_SE, W_N, W_BASE, W_NOW, W_DELTA,
     ))
 
-    # ── Interrupt/event witnesses ──
-    lines.append("")
-    lines.append(
-        f"{'INT':<{W_NAME}}"
-        f"{'END_GNSS_NS':>22}"
-        f"{'DELTA_NS':>14}"
-    )
-
-    pps_vclock_end = _to_int(_field(r, "gnss.pps_vclock_ns", "gnss.vclock_ns", "vclock.ns", "pps_vclock_ns", "vclock_ns", "gnss_ns"))
-    pps_vclock_delta = _to_int(_field(r, "ocxo1.pps_residual.gnss_interval_ns", "ocxo2.pps_residual.gnss_interval_ns"))
-    lines.append(
-        f"{'PPS/V':<{W_NAME}}"
-        f"{_comma_int(pps_vclock_end, 22)}"
-        f"{_comma_int(pps_vclock_delta, 14)}"
-    )
-
-    for name, key in [("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")]:
-        ocxo_end = _to_int(_field(r, f"{key}.sample_gnss_ns_at_event", f"{key}.event_gnss_ns", f"{key}_diag_gnss_ns_at_event"))
-        ocxo_delta = _to_int(_field(r, f"{key}.interval.bridge_gnss_ns_between_edges", f"{key}.measurement.gnss_ns_between_edges", f"{key}_gnss_ns_between_edges"))
-        lines.append(
-            f"{name:<{W_NAME}}"
-            f"{_comma_int(ocxo_end, 22)}"
-            f"{_comma_int(ocxo_delta, 14)}"
-        )
-
     lines.append("")
 
     # ── NOW servo detail (only shown when servo mode is NOW) ──
@@ -1011,31 +993,79 @@ def clocks_combined_readout() -> list[str]:
     lines.append("")
 
     # ── DWT detail ──
-    dwt_actual    = _field(r, "dwt.cycles_between_pps_vclock", "dwt_cycles_between_pps_vclock", "dwt_cycle_count_between_pps")
-    dwt_expected  = _field(r, "dwt.expected_per_pps_vclock", "dwt_expected_per_pps_vclock", "dwt_expected_per_pps")
-    dwt_at_anchor = _field(r, "dwt.at_pps_vclock", "dwt_at_pps_vclock", "dwt_cycle_count_at_pps")
-    dwt_cycles_64 = _field(r, "dwt.cycle_count_total", "dwt_cycle_count_total")
-    gnss_ns_64    = _field(r, "gnss.ns", "gnss_ns")
+    dwt_actual = _to_int(_field(
+        r,
+        "dwt.cycles_between_pps_vclock",
+        "dwt_cycles_between_pps_vclock",
+        "dwt_cycle_count_between_pps",
+    ))
+    dwt_residual = _to_int(_field(
+        r,
+        "dwt.second_residual_cycles",
+        "dwt_second_residual_cycles",
+    ))
+
+    # EXPECTED is the firmware's next-second DWT-cycle prediction, not the
+    # nominal 1.008 GHz constant.  In the current paired TIMEBASE schema, the
+    # DWT row is driven by the PPS/GPIO witness interval, so its prediction
+    # lives on prediction.pps.* rather than prediction.dwt.*.  Older aliases
+    # remain as compatibility fallbacks.
+    dwt_expected = _to_int(_field(
+        r,
+        "prediction.pps.prediction_cycles",
+        "prediction.pps.static_prediction_cycles",
+        "pps_prediction_cycles",
+        "pps_static_prediction_cycles",
+        "prediction.dwt.prediction_cycles",
+        "prediction.dwt.static_prediction_cycles",
+        "dwt.prediction_cycles",
+        "dwt.static_prediction_cycles",
+    ))
+    # Only fall back to explicit expected fields if they are non-nominal; older
+    # firmware used these names for the fixed 1.008 GHz constant, which is no
+    # longer the desired display here.
+    if dwt_expected is None:
+        explicit_expected = _to_int(_field(
+            r,
+            "dwt.expected_per_pps_vclock",
+            "dwt_expected_per_pps_vclock",
+            "dwt_expected_per_pps",
+            "dwt.expected_cycles_per_second",
+            "dwt_expected_cycles_per_second",
+            "dwt.expected_cycles",
+            "dwt_expected_cycles",
+        ))
+        if explicit_expected is not None and explicit_expected != 1008000000:
+            dwt_expected = explicit_expected
+
+    dwt_at_anchor = _field(
+        r,
+        "dwt.at_pps_vclock",
+        "dwt_at_pps_vclock",
+        "dwt_cycle_count_at_pps",
+    )
+    dwt_cycles_64 = _field(
+        r,
+        "dwt.cycle_count_total",
+        "dwt_cycle_count_total",
+    )
     if any(v is not None for v in [dwt_actual, dwt_expected, dwt_at_anchor, dwt_cycles_64]):
         dwt_label_w = 12
         dwt_num_w = 20
+        edge_label_w = 11
+        edge_num_w = 14
+        counter32 = _field(r, "counter32_at_pps_vclock", "qtimer_at_pps")
         lines.append(
             f"DWT   "
             f"{'EXPECTED:':>{dwt_label_w}} {_comma_int(dwt_expected, dwt_num_w)}"
             f"    {'ACTUAL:':<{dwt_label_w}} {_comma_int(dwt_actual, dwt_num_w)}"
-            f"    {'DWT@PPS/V:':>11} {_comma_int(dwt_at_anchor, 14)}"
+            f"    {'DWT@PPS/V:':<{edge_label_w}} {_comma_int(dwt_at_anchor, edge_num_w)}"
         )
-        dwt_ns_64 = _field(r, "dwt.ns", "dwt_ns")
-        counter32 = _field(r, "counter32_at_pps_vclock", "qtimer_at_pps")
         lines.append(
             f"      "
             f"{'DWT_CYCLES:':>{dwt_label_w}} {_comma_int(dwt_cycles_64, dwt_num_w)}"
-            f"    {'DWT_NS:':<{dwt_label_w}} {_comma_int(dwt_ns_64, dwt_num_w)}"
-            f"    {'CTR32:':>11} {_comma_int(counter32, 14)}"
-        )
-        lines.append(
-            f"      "
-            f"{'GNSS_NS:':>{dwt_label_w}} {_comma_int(gnss_ns_64, dwt_num_w)}"
+            f"    {'':<{dwt_label_w}} {'':>{dwt_num_w}}"
+            f"    {'CTR32:':<{edge_label_w}} {_comma_int(counter32, edge_num_w)}"
         )
         lines.append("")
 
