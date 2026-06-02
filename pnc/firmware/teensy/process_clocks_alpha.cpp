@@ -187,16 +187,16 @@ servo_mode_t calibrate_ocxo_mode = servo_mode_t::OFF;
 
 const char* servo_mode_str(servo_mode_t mode) {
   switch (mode) {
+    case servo_mode_t::MEAN:  return "MEAN";
     case servo_mode_t::TOTAL: return "TOTAL";
-    case servo_mode_t::NOW:   return "NOW";
     default:                  return "OFF";
   }
 }
 
 servo_mode_t servo_mode_parse(const char* s) {
   if (!s || !*s) return servo_mode_t::OFF;
+  if (!strcasecmp(s, "MEAN"))  return servo_mode_t::MEAN;
   if (!strcasecmp(s, "TOTAL")) return servo_mode_t::TOTAL;
-  if (!strcasecmp(s, "NOW"))   return servo_mode_t::NOW;
   return servo_mode_t::OFF;
 }
 

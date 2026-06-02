@@ -344,44 +344,90 @@ def _derived_tau_ppb(actual_cycles, prediction_cycles):
 def _servo_state(r: dict) -> str:
     """Return the best available OCXO servo state for the header.
 
-    The authoritative field has moved between fragment and forensics payloads
-    over time, so search all known locations before falling back to IDLE.
+    New TIMEBASE_FRAGMENT / TIMEBASE_FORENSICS rows carry explicit servo_mode
+    and servo_active fields at the pair-identity level; active rows also carry
+    dac.calibrate_ocxo / dac.servo_mode beside the persisted DAC values.
+    Prefer those explicit firmware-authored fields.  ACTIVE remains only as a
+    legacy fallback for older records whose DAC persistence object proves the
+    servo was running but does not name the selected mode.
     """
     keys = (
         "dac.calibrate_ocxo",
+        "dac.servo_mode",
+        "dac.mode",
+        "servo.mode",
+        "servo_mode",
+        "calibrate_ocxo",
+        "forensics.dac.calibrate_ocxo",
+        "forensics.dac.servo_mode",
+        "forensics.dac.mode",
+        "forensics.servo.mode",
+        "forensics.servo_mode",
+        "forensics.calibrate_ocxo",
         "environmental.calibrate_ocxo",
         "forensics.environmental.calibrate_ocxo",
-        "calibrate_ocxo",
     )
+    saw_explicit_off = False
     for key in keys:
         val = _field(r, key, default=None)
-        if val is not None:
-            s = str(val).strip().upper()
-            if s and s not in ("OFF", "NONE", "IDLE"):
-                return s
-            if s == "OFF":
-                # Keep looking; some CLOCKS reports carry OFF in the fragment
-                # while the paired forensics object has the active servo mode.
-                continue
+        if val is None:
+            continue
+        s = str(val).strip().upper()
+        if s and s not in ("OFF", "NONE", "IDLE"):
+            return s
+        if s in ("OFF", "NONE", "IDLE"):
+            saw_explicit_off = True
 
-    # Last-ditch inference from the selected servo-input source.
+    # Last-ditch inference from any published servo-input source.  This covers
+    # detailed CLOCKS.REPORT_DAC-style payloads and older TIMEBASE builds that
+    # carried the selected input surface.
     for lane in ("ocxo1", "ocxo2"):
         for key in (
             f"dac.{lane}.servo_input.selected_source",
+            f"dac.{lane}.servo_input.selected_source_id",
             f"{lane}.servo_input.selected_source",
+            f"{lane}.servo_input.selected_source_id",
             f"forensics.dac.{lane}.servo_input.selected_source",
+            f"forensics.dac.{lane}.servo_input.selected_source_id",
             f"forensics.{lane}.servo_input.selected_source",
+            f"forensics.{lane}.servo_input.selected_source_id",
         ):
             val = _field(r, key, default=None)
             if val is None:
                 continue
-            s = str(val).strip().upper()
-            if "NOW" in s:
-                return "NOW"
-            if "TOTAL" in s or "WELFORD" in s or "MEAN" in s:
-                return "TOTAL"
 
-    return "IDLE"
+            # Refactored firmware mode ids:
+            #   1 = MEAN, 2 = TOTAL.  Older builds used id 1 for TOTAL and
+            #   id 2 for NOW, so prefer string names when available.
+            if isinstance(val, (int, float)):
+                if int(val) == 1:
+                    return "MEAN"
+                if int(val) == 2:
+                    return "TOTAL"
+
+            s = str(val).strip().upper()
+            if "TOTAL" in s or "TAU" in s:
+                return "TOTAL"
+            if "MEAN" in s or "WELFORD" in s:
+                return "MEAN"
+
+    # Explicit activity without explicit mode should be rare after the Beta
+    # fix, but preserve a clear fallback so the panel never lies and calls an
+    # active servo IDLE.
+    for key in ("servo_active", "dac.servo_active", "forensics.servo_active", "forensics.dac.servo_active"):
+        val = _field(r, key, default=None)
+        if val is True or str(val).strip().lower() == "true":
+            return "ACTIVE"
+
+    # Legacy TIMEBASE_FRAGMENT_V3 only included fragment.dac while
+    # clocks_servo_active() was true.  That minimal persistence feed proved
+    # activity but not mode.
+    dac_o1 = _field(r, "dac.ocxo1_dac", "dac.ocxo1.value", "ocxo1_dac", default=None)
+    dac_o2 = _field(r, "dac.ocxo2_dac", "dac.ocxo2.value", "ocxo2_dac", default=None)
+    if dac_o1 is not None or dac_o2 is not None:
+        return "ACTIVE"
+
+    return "IDLE" if saw_explicit_off else "IDLE"
 
 
 # ---------------------------------------------------------------------

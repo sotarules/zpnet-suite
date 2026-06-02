@@ -652,8 +652,8 @@ extern ocxo_dac_state_t ocxo2_dac;
 
 enum class servo_mode_t : uint8_t {
   OFF   = 0,
-  TOTAL = 1,
-  NOW   = 2,
+  MEAN  = 1,
+  TOTAL = 2,
 };
 
 extern servo_mode_t calibrate_ocxo_mode;
@@ -665,6 +665,11 @@ static constexpr int32_t  SERVO_MAX_STEP                = 64;
 static constexpr uint32_t SERVO_SETTLE_SECONDS          = 5;
 static constexpr uint32_t SERVO_MIN_SAMPLES             = 10;
 static constexpr uint16_t SERVO_MIN_DAC_CODE_DELTA_LSB  = 1;
+
+// Servo control doctrine:
+//   positive ppb/tau>1 -> OCXO running fast  -> lower DAC code
+//   negative ppb/tau<1 -> OCXO running slow  -> raise DAC code
+// The DAC transfer is monotonic positive: higher DAC voltage makes the OCXO faster.
 
 bool ocxo_dac_set(ocxo_dac_state_t& s, double value);
 void ocxo_dac_predictor_reset(ocxo_dac_state_t& s);
