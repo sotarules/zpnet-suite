@@ -55,6 +55,10 @@ def _get_pi_clocks_report() -> dict:
     return send_command(machine="PI", subsystem="CLOCKS", command="REPORT")["payload"]
 
 
+def _get_pi_clocks_report_dac() -> dict:
+    return send_command(machine="TEENSY", subsystem="CLOCKS", command="REPORT_DAC")["payload"]
+
+
 def _get_clocks_baseline() -> dict | None:
     try:
         resp = send_command(machine="PI", subsystem="CLOCKS", command="BASELINE_INFO")
@@ -220,6 +224,19 @@ def _to_float(v):
         return float(v)
     except Exception:
         return None
+
+
+def _to_bool(v):
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return None
+    s = str(v).strip().lower()
+    if s in ("true", "1", "yes", "on"):
+        return True
+    if s in ("false", "0", "no", "off"):
+        return False
+    return None
 
 
 def _to_int(v):
@@ -475,6 +492,89 @@ def _dac_label(dac_code):
     return f"{code:>.3f} {volts:.6f}V"
 
 
+def _dac_report_lane(report_dac: dict | None, lane: str) -> dict:
+    if not isinstance(report_dac, dict):
+        return {}
+    obj = report_dac.get(lane)
+    return obj if isinstance(obj, dict) else {}
+
+
+def _dac_report_value(report_dac: dict | None, lane: str):
+    obj = _dac_report_lane(report_dac, lane)
+    dither = obj.get("dither") if isinstance(obj.get("dither"), dict) else {}
+    return _to_float(obj.get("dac") if obj.get("dac") is not None else dither.get("desired"))
+
+
+def _dac_current_value(r: dict, report_dac: dict | None, lane: str):
+    val = _dac_value(r, lane)
+    return val if val is not None else _dac_report_value(report_dac, lane)
+
+
+def _dac_report_dither_summary(report_dac: dict | None, lane: str) -> str:
+    obj = _dac_report_lane(report_dac, lane)
+    d = obj.get("dither") if isinstance(obj.get("dither"), dict) else {}
+    if not d:
+        return ""
+
+    enabled = _to_bool(d.get("enabled"))
+    rate = _to_int(d.get("rate_hz"))
+    low = _to_int(d.get("last_window_low_count"))
+    high = _to_int(d.get("last_window_high_count"))
+    low_code = _to_int(d.get("last_window_low_code"))
+    high_code = _to_int(d.get("last_window_high_code"))
+
+    if enabled is not True:
+        return "OFF"
+    if rate is None:
+        return "ON"
+    if low is None or high is None:
+        return f"{rate}Hz"
+    if low_code is None or high_code is None:
+        return f"{rate}Hz {low}/{high}"
+    return f"{rate}Hz {low_code}:{low} {high_code}:{high}"
+
+
+def _dac_detail_lines(r: dict, baseline: dict | None, report_dac: dict | None,
+                      W_NAME: int, W_VALUE: int, W_TAU: int, W_PPB: int,
+                      W_RAW: int, W_RES: int, W_MEAN: int, W_SD: int,
+                      W_SE: int, W_N: int, W_BASE: int, W_NOW: int,
+                      W_DELTA: int) -> list[str]:
+    lines: list[str] = []
+    dither_width = W_TAU + W_PPB + W_RAW + W_RES
+
+    lines.append(
+        f"{'DAC':<{W_NAME}}"
+        f"{'VALUE/VOUT':>{W_VALUE}}"
+        f"{'':>{dither_width}}"
+        f"{'MEAN':>{W_MEAN}}"
+        f"{'SD':>{W_SD}}"
+        f"{'SE':>{W_SE}}"
+        f"{'N':>{W_N}}"
+        f"  "
+        f"{'BASE':>{W_BASE}}"
+        f"{'NOW':>{W_NOW}}"
+        f"{'DELTA':>{W_DELTA}}"
+    )
+    for name, key in [("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")]:
+        dac_now = _dac_current_value(r, report_dac, key)
+        dac_label = _dac_label(dac_now)
+        dither_summary = _dac_report_dither_summary(report_dac, key)
+
+        base_dac = None
+        if baseline:
+            base_dac = baseline.get("baseline_dac_mean", {}).get(key)
+
+        lines.append(
+            f"{name:<{W_NAME}}"
+            f"{dac_label:>{W_VALUE}}"
+            f"{dither_summary:>{dither_width}}"
+            f"{_welford_cols_fragment(r, f'{key}_dac', W_MEAN, W_SD, W_SE, W_N)}"
+            f"  {_baseline_comp(base_dac, dac_now)}"
+        )
+
+    return lines
+
+
 # ---------------------------------------------------------------------
 # Status header
 # ---------------------------------------------------------------------
@@ -615,6 +715,12 @@ def clocks_combined_readout() -> list[str]:
     except Exception:
         return ["CLOCKS: UNAVAILABLE"]
 
+    report_dac = None
+    try:
+        report_dac = _get_pi_clocks_report_dac()
+    except Exception:
+        report_dac = None
+
     report = p.get("report") if isinstance(p.get("report"), dict) else p
     state = report.get("campaign_state") or p.get("campaign_state")
     if state is None:
@@ -622,7 +728,31 @@ def clocks_combined_readout() -> list[str]:
         # wrapper did not include campaign_state.
         state = "STARTED" if _fragment_root(report) else "IDLE"
     if state != "STARTED":
-        return [f"CLOCKS: {state}"]
+        lines.append(f"CLOCKS: {state}")
+        lines.append("")
+
+        baseline = _get_clocks_baseline()
+        W_NAME  = 6
+        W_VALUE = 20
+        W_TAU   = 18
+        W_PPB   = 10
+        W_RAW   = 14
+        W_RES   = 8
+        W_MEAN  = 10
+        W_SD    = 8
+        W_SE    = 8
+        W_N     = 6
+        W_BASE  = 10
+        W_NOW   = 10
+        W_DELTA = 10
+
+        lines.extend(_dac_detail_lines(
+            report, baseline, report_dac,
+            W_NAME, W_VALUE, W_TAU, W_PPB, W_RAW, W_RES,
+            W_MEAN, W_SD, W_SE, W_N, W_BASE, W_NOW, W_DELTA,
+        ))
+        lines.append("")
+        return lines
 
     r = report
     campaign = r.get("campaign", "?")
@@ -811,40 +941,11 @@ def clocks_combined_readout() -> list[str]:
 
     # ── DAC detail ──
     lines.append("")
-    lines.append(
-        f"{'DAC':<{W_NAME}}"
-        f"{'VALUE/VOUT':>{W_VALUE}}"
-        f"{'':>{W_TAU}}"
-        f"{'':>{W_PPB}}"
-        f"{'':>{W_RAW}}"
-        f"{'':>{W_RES}}"
-        f"{'MEAN':>{W_MEAN}}"
-        f"{'SD':>{W_SD}}"
-        f"{'SE':>{W_SE}}"
-        f"{'N':>{W_N}}"
-        f"  "
-        f"{'BASE':>{W_BASE}}"
-        f"{'NOW':>{W_NOW}}"
-        f"{'DELTA':>{W_DELTA}}"
-    )
-    for name, key in [("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")]:
-        dac_now = _dac_value(r, key)
-        dac_label = _dac_label(dac_now)
-
-        base_dac = None
-        if baseline:
-            base_dac = baseline.get("baseline_dac_mean", {}).get(key)
-
-        lines.append(
-            f"{name:<{W_NAME}}"
-            f"{dac_label:>{W_VALUE}}"
-            f"{'':>{W_TAU}}"
-            f"{'':>{W_PPB}}"
-            f"{'':>{W_RAW}}"
-            f"{'':>{W_RES}}"
-            f"{_welford_cols_fragment(r, f'{key}_dac', W_MEAN, W_SD, W_SE, W_N)}"
-            f"  {_baseline_comp(base_dac, dac_now)}"
-        )
+    lines.extend(_dac_detail_lines(
+        r, baseline, report_dac,
+        W_NAME, W_VALUE, W_TAU, W_PPB, W_RAW, W_RES,
+        W_MEAN, W_SD, W_SE, W_N, W_BASE, W_NOW, W_DELTA,
+    ))
 
     # ── Interrupt/event witnesses ──
     lines.append("")

@@ -1656,6 +1656,193 @@ static void payload_add_dac_summary_hierarchical(Payload& p) {
 }
 
 // ============================================================================
+// Always-on OCXO DAC sigma-delta realization
+// ============================================================================
+
+static constexpr uint32_t OCXO_DAC_DITHER_DEFAULT_RATE_HZ = 100U;
+static constexpr uint32_t OCXO_DAC_DITHER_MIN_RATE_HZ = 1U;
+static constexpr uint32_t OCXO_DAC_DITHER_MAX_RATE_HZ = 1000U;
+static constexpr uint32_t OCXO_DAC_DITHER_NS_PER_SECOND = 1000000000UL;
+static constexpr const char* OCXO_DAC_DITHER_NAME = "OCXO_DAC_DITHER";
+
+static timepop_handle_t g_ocxo_dac_dither_handle = TIMEPOP_INVALID_HANDLE;
+static uint32_t g_ocxo_dac_dither_rate_hz = OCXO_DAC_DITHER_DEFAULT_RATE_HZ;
+static uint32_t g_ocxo_dac_dither_period_ns =
+    OCXO_DAC_DITHER_NS_PER_SECOND / OCXO_DAC_DITHER_DEFAULT_RATE_HZ;
+static uint32_t g_ocxo_dac_dither_arm_count = 0;
+static uint32_t g_ocxo_dac_dither_arm_fail_count = 0;
+
+static double ocxo_dac_last_window_average(const ocxo_dac_state_t& s) {
+  const uint32_t ticks = s.dither_last_window_tick_count;
+  if (ticks == 0) return s.dac_fractional;
+  const uint32_t high = s.dither_last_window_high_count;
+  return (double)s.dither_last_window_low_code + ((double)high / (double)ticks);
+}
+
+static void payload_add_dac_dither_object(Payload& parent,
+                                          const char* key,
+                                          const ocxo_dac_state_t& s) {
+  Payload d;
+  d.add("enabled", s.dither_enabled);
+  d.add("rate_hz", s.dither_rate_hz);
+  d.add("period_ns", s.dither_period_ns);
+  d.add("effective_window_ticks", s.dither_effective_window_ticks);
+  d.add("desired_q16", s.dac_desired_q16);
+  d.add("desired", s.dac_fractional, 6);
+  d.add("hw_code", (uint32_t)s.dac_hw_code);
+  d.add("low_code", (uint32_t)s.dither_low_code);
+  d.add("high_code", (uint32_t)s.dither_high_code);
+  d.add("fraction_q16", s.dither_fraction_q16);
+  d.add("accumulator_q16", s.dither_accumulator_q16);
+  d.add("last_selected_hw_code", (uint32_t)s.dither_last_selected_hw_code);
+
+  d.add("window_sequence", s.dither_window_sequence);
+  d.add("window_tick_count", s.dither_window_tick_count);
+  d.add("window_low_count", s.dither_window_low_count);
+  d.add("window_high_count", s.dither_window_high_count);
+  d.add("last_window_tick_count", s.dither_last_window_tick_count);
+  d.add("last_window_low_count", s.dither_last_window_low_count);
+  d.add("last_window_high_count", s.dither_last_window_high_count);
+  d.add("last_window_low_code", (uint32_t)s.dither_last_window_low_code);
+  d.add("last_window_high_code", (uint32_t)s.dither_last_window_high_code);
+  d.add("last_window_average", ocxo_dac_last_window_average(s), 6);
+
+  d.add("tick_count_total", s.dither_tick_count_total);
+  d.add("write_attempts", s.dither_write_attempts);
+  d.add("write_successes", s.dither_write_successes);
+  d.add("write_failures", s.dither_write_failures);
+  d.add("write_skip_same_code_count", s.dither_write_skip_same_code_count);
+  d.add("not_ready_count", s.dither_not_ready_count);
+  parent.add_object(key, d);
+}
+
+static void ocxo_dac_dither_roll_window(ocxo_dac_state_t& s) {
+  s.dither_last_window_tick_count = s.dither_window_tick_count;
+  s.dither_last_window_low_count = s.dither_window_low_count;
+  s.dither_last_window_high_count = s.dither_window_high_count;
+  s.dither_last_window_low_code = s.dither_low_code;
+  s.dither_last_window_high_code = s.dither_high_code;
+
+  s.dither_window_sequence++;
+  s.dither_window_tick_count = 0;
+  s.dither_window_low_count = 0;
+  s.dither_window_high_count = 0;
+}
+
+static void ocxo_dac_dither_apply(ocxo_dac_state_t& s) {
+  if (!s.dither_enabled) return;
+
+  const uint32_t desired_q16 = s.dac_desired_q16;
+  const uint16_t low = (uint16_t)(desired_q16 >> 16);
+  const uint32_t frac = desired_q16 & 0xFFFFUL;
+  const uint16_t high = (low >= 65535U || frac == 0U)
+      ? low
+      : (uint16_t)(low + 1U);
+
+  if (low != s.dither_low_code || high != s.dither_high_code) {
+    s.dither_low_code = low;
+    s.dither_high_code = high;
+    s.dither_accumulator_q16 = 0;
+  }
+  s.dither_fraction_q16 = frac;
+
+  uint16_t selected = low;
+  if (high != low && frac != 0U) {
+    s.dither_accumulator_q16 += frac;
+    if (s.dither_accumulator_q16 >= 0x10000UL) {
+      selected = high;
+      s.dither_accumulator_q16 -= 0x10000UL;
+    }
+  } else {
+    s.dither_accumulator_q16 = 0;
+  }
+
+  s.dither_tick_count_total++;
+  s.dither_window_tick_count++;
+  if (selected == high && high != low) {
+    s.dither_window_high_count++;
+  } else {
+    s.dither_window_low_count++;
+  }
+  s.dither_last_selected_hw_code = selected;
+
+  if (!g_ad5693r_init_ok) {
+    s.dither_not_ready_count++;
+  } else if (selected == s.dac_hw_code) {
+    s.dither_write_skip_same_code_count++;
+  } else {
+    s.dither_write_attempts++;
+    if (ocxo_dac_write_hw_code(s, selected, false)) {
+      s.dither_write_successes++;
+    } else {
+      // Dither writes are opportunistic.  Occasional I2C failures are evidence,
+      // not campaign-fatal faults; the next tick will try again if still needed.
+      s.dither_write_failures++;
+    }
+  }
+
+  const uint32_t window_ticks = s.dither_effective_window_ticks ? s.dither_effective_window_ticks : 1U;
+  if (s.dither_window_tick_count >= window_ticks) {
+    ocxo_dac_dither_roll_window(s);
+  }
+}
+
+static void ocxo_dac_dither_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
+  ocxo_dac_dither_apply(ocxo1_dac);
+  ocxo_dac_dither_apply(ocxo2_dac);
+}
+
+static void ocxo_dac_dither_apply_rate_to_lane(ocxo_dac_state_t& s) {
+  s.dither_rate_hz = g_ocxo_dac_dither_rate_hz;
+  s.dither_period_ns = g_ocxo_dac_dither_period_ns;
+  s.dither_effective_window_ticks = g_ocxo_dac_dither_rate_hz;
+}
+
+static void ocxo_dac_dither_apply_rate_to_all(void) {
+  ocxo_dac_dither_apply_rate_to_lane(ocxo1_dac);
+  ocxo_dac_dither_apply_rate_to_lane(ocxo2_dac);
+}
+
+bool clocks_dac_dither_set_rate_hz(uint32_t rate_hz) {
+  if (rate_hz < OCXO_DAC_DITHER_MIN_RATE_HZ ||
+      rate_hz > OCXO_DAC_DITHER_MAX_RATE_HZ) {
+    return false;
+  }
+
+  const uint32_t period_ns = OCXO_DAC_DITHER_NS_PER_SECOND / rate_hz;
+  if (period_ns == 0) return false;
+
+  if (g_ocxo_dac_dither_handle != TIMEPOP_INVALID_HANDLE) {
+    timepop_cancel(g_ocxo_dac_dither_handle);
+    g_ocxo_dac_dither_handle = TIMEPOP_INVALID_HANDLE;
+  }
+
+  g_ocxo_dac_dither_rate_hz = rate_hz;
+  g_ocxo_dac_dither_period_ns = period_ns;
+  ocxo_dac_dither_apply_rate_to_all();
+  ocxo_dac_dither_roll_window(ocxo1_dac);
+  ocxo_dac_dither_roll_window(ocxo2_dac);
+
+  const timepop_handle_t h = timepop_arm((uint64_t)g_ocxo_dac_dither_period_ns,
+                                         true,
+                                         ocxo_dac_dither_callback,
+                                         nullptr,
+                                         OCXO_DAC_DITHER_NAME);
+  if (h == TIMEPOP_INVALID_HANDLE) {
+    g_ocxo_dac_dither_arm_fail_count++;
+    return false;
+  }
+  g_ocxo_dac_dither_handle = h;
+  g_ocxo_dac_dither_arm_count++;
+  return true;
+}
+
+void clocks_dac_dither_begin(void) {
+  if (g_ocxo_dac_dither_handle != TIMEPOP_INVALID_HANDLE) return;
+  (void)clocks_dac_dither_set_rate_hz(g_ocxo_dac_dither_rate_hz);
+}
+
+// ============================================================================
 // Slope servo tuning
 // ============================================================================
 
@@ -1794,6 +1981,17 @@ static void ocxo_dac_queue_intent(ocxo_dac_state_t& dac, double step) {
   dac.pacing_pending_since_second = campaign_seconds;
   dac.pacing_last_request_second = campaign_seconds;
   dac.pacing_intents++;
+}
+
+static void ocxo_dac_apply_synthetic_servo_step(ocxo_dac_state_t& dac,
+                                                double step) {
+  const double before = dac.dac_fractional;
+  (void)ocxo_dac_set_desired(dac, before + step);
+  const double applied = dac.dac_fractional - before;
+  dac.servo_last_step = applied;
+  dac.servo_adjustments++;
+  dac.pacing_intents++;
+  dac.pacing_last_request_second = campaign_seconds;
 }
 
 static void ocxo_dac_commit_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
@@ -1960,13 +2158,12 @@ static void ocxo_servo_slope(ocxo_dac_state_t& dac,
   if (step >  (double)SERVO_MAX_STEP) step =  (double)SERVO_MAX_STEP;
   if (step < -(double)SERVO_MAX_STEP) step = -(double)SERVO_MAX_STEP;
 
-  if (fabs(step) < SERVO_MIN_STEP_LSB) {
+  if (fabs(step) < 0.000001) {
     ocxo_dac_clear_pending(dac);
     return;
   }
 
-  dac.servo_last_step = step;
-  ocxo_dac_queue_intent(dac, step);
+  ocxo_dac_apply_synthetic_servo_step(dac, step);
 }
 
 static void ocxo_servo_mean(ocxo_dac_state_t& dac,
@@ -2001,8 +2198,6 @@ static void ocxo_calibration_servo(void) {
     ocxo_servo_total(ocxo1_dac, g_servo_input_ocxo1);
     ocxo_servo_total(ocxo2_dac, g_servo_input_ocxo2);
   }
-
-  ocxo_dac_schedule_paced_commit();
 }
 
 // ============================================================================
@@ -2117,6 +2312,25 @@ static bool clocks_servo_active(void) {
   return calibrate_ocxo_mode != servo_mode_t::OFF;
 }
 
+static void payload_add_dac_dither_compact(Payload& parent,
+                                           const char* key,
+                                           const ocxo_dac_state_t& s) {
+  Payload d;
+  d.add("enabled", s.dither_enabled);
+  d.add("rate_hz", s.dither_rate_hz);
+  d.add("period_ns", s.dither_period_ns);
+  d.add("desired", s.dac_fractional, 6);
+  d.add("hw_code", (uint32_t)s.dac_hw_code);
+  d.add("low_code", (uint32_t)s.dither_last_window_low_code);
+  d.add("high_code", (uint32_t)s.dither_last_window_high_code);
+  d.add("low_count_1s", s.dither_last_window_low_count);
+  d.add("high_count_1s", s.dither_last_window_high_count);
+  d.add("tick_count_1s", s.dither_last_window_tick_count);
+  d.add("average_1s", ocxo_dac_last_window_average(s), 6);
+  d.add("write_failures", s.dither_write_failures);
+  parent.add_object(key, d);
+}
+
 static void payload_add_servo_dac_values(Payload& parent) {
   // Minimal durable DAC payload.  This is intentionally only the values the Pi
   // should persist as the current system DAC configuration, plus the explicit
@@ -2127,6 +2341,17 @@ static void payload_add_servo_dac_values(Payload& parent) {
   dac.add("servo_active", clocks_servo_active());
   dac.add("ocxo1_dac", ocxo1_dac.dac_fractional);
   dac.add("ocxo2_dac", ocxo2_dac.dac_fractional);
+  dac.add("ocxo1_hw_code", (uint32_t)ocxo1_dac.dac_hw_code);
+  dac.add("ocxo2_hw_code", (uint32_t)ocxo2_dac.dac_hw_code);
+  dac.add("dither_rate_hz", g_ocxo_dac_dither_rate_hz);
+  dac.add("dither_period_ns", g_ocxo_dac_dither_period_ns);
+  dac.add("dither_min_rate_hz", OCXO_DAC_DITHER_MIN_RATE_HZ);
+  dac.add("dither_max_rate_hz", OCXO_DAC_DITHER_MAX_RATE_HZ);
+
+  Payload dither;
+  payload_add_dac_dither_compact(dither, "ocxo1", ocxo1_dac);
+  payload_add_dac_dither_compact(dither, "ocxo2", ocxo2_dac);
+  dac.add_object("dither", dither);
   parent.add_object("dac", dac);
 }
 
@@ -3316,6 +3541,7 @@ static void add_dac_payload(Payload& p) {
   o1.add("servo_control_ppb", ocxo1_dac.servo_predicted_residual, 6);
   o1.add("servo_predictor_updates", ocxo1_dac.servo_predictor_updates);
   payload_add_servo_input_diag(o1, g_servo_input_ocxo1);
+  payload_add_dac_dither_object(o1, "dither", ocxo1_dac);
   o1.add("pacing_pending", ocxo1_dac.pacing_pending);
   o1.add("pacing_pending_target", ocxo1_dac.pacing_pending_target, 6);
   o1.add("pacing_pending_step", ocxo1_dac.pacing_pending_step, 6);
@@ -3352,6 +3578,7 @@ static void add_dac_payload(Payload& p) {
   o2.add("servo_control_ppb", ocxo2_dac.servo_predicted_residual, 6);
   o2.add("servo_predictor_updates", ocxo2_dac.servo_predictor_updates);
   payload_add_servo_input_diag(o2, g_servo_input_ocxo2);
+  payload_add_dac_dither_object(o2, "dither", ocxo2_dac);
   o2.add("pacing_pending", ocxo2_dac.pacing_pending);
   o2.add("pacing_pending_target", ocxo2_dac.pacing_pending_target, 6);
   o2.add("pacing_pending_step", ocxo2_dac.pacing_pending_step, 6);
@@ -3371,6 +3598,13 @@ static void add_dac_payload(Payload& p) {
 
   p.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
   p.add("ad5693r_init_ok", g_ad5693r_init_ok);
+  p.add("dither_handle", g_ocxo_dac_dither_handle);
+  p.add("dither_rate_hz", g_ocxo_dac_dither_rate_hz);
+  p.add("dither_period_ns", g_ocxo_dac_dither_period_ns);
+  p.add("dither_min_rate_hz", OCXO_DAC_DITHER_MIN_RATE_HZ);
+  p.add("dither_max_rate_hz", OCXO_DAC_DITHER_MAX_RATE_HZ);
+  p.add("dither_arm_count", g_ocxo_dac_dither_arm_count);
+  p.add("dither_arm_fail_count", g_ocxo_dac_dither_arm_fail_count);
   p.add("commit_scheduled", g_ocxo_dac_commit_scheduled);
   p.add("last_schedule_second", g_ocxo_dac_last_schedule_second);
   p.add("last_commit_second", g_ocxo_dac_last_commit_second);
@@ -3917,6 +4151,43 @@ static Payload cmd_report_dac(const Payload&) {
   return p;
 }
 
+static Payload cmd_dither(const Payload& args) {
+  bool enabled = true;
+  (void)args.tryGetBool("dither", enabled);
+
+  uint32_t requested_rate = g_ocxo_dac_dither_rate_hz;
+  (void)args.tryGetUInt("rate_hz", requested_rate);
+  (void)args.tryGetUInt("hz", requested_rate);
+  (void)args.tryGetUInt("frequency_hz", requested_rate);
+
+  Payload p;
+  if (requested_rate != g_ocxo_dac_dither_rate_hz) {
+    if (!clocks_dac_dither_set_rate_hz(requested_rate)) {
+      p.add("status", "bad_rate_hz");
+      p.add("requested_rate_hz", requested_rate);
+      p.add("min_rate_hz", OCXO_DAC_DITHER_MIN_RATE_HZ);
+      p.add("max_rate_hz", OCXO_DAC_DITHER_MAX_RATE_HZ);
+      return p;
+    }
+  } else if (g_ocxo_dac_dither_handle == TIMEPOP_INVALID_HANDLE) {
+    clocks_dac_dither_begin();
+  }
+
+  ocxo1_dac.dither_enabled = enabled;
+  ocxo2_dac.dither_enabled = enabled;
+
+  p.add("status", "ok");
+  p.add("dither", enabled);
+  p.add("rate_hz", g_ocxo_dac_dither_rate_hz);
+  p.add("period_ns", g_ocxo_dac_dither_period_ns);
+  p.add("min_rate_hz", OCXO_DAC_DITHER_MIN_RATE_HZ);
+  p.add("max_rate_hz", OCXO_DAC_DITHER_MAX_RATE_HZ);
+  p.add("handle", g_ocxo_dac_dither_handle);
+  p.add("arm_count", g_ocxo_dac_dither_arm_count);
+  p.add("arm_fail_count", g_ocxo_dac_dither_arm_fail_count);
+  return p;
+}
+
 static Payload cmd_set_dac(const Payload& args) {
   ocxo_dac_pacing_abort_all();
 
@@ -3924,11 +4195,13 @@ static Payload cmd_set_dac(const Payload& args) {
   bool dac1_ok = true;
   bool dac2_ok = true;
   if (payload_try_get_ocxo1_dac(args, dac_val)) {
-    dac1_ok = ocxo_dac_set(ocxo1_dac, dac_val);
+    dac1_ok = ocxo_dac_set_desired(ocxo1_dac, dac_val);
+    ocxo_dac_dither_reset(ocxo1_dac);
     if (dac1_ok) ocxo_dac_retry_reset(ocxo1_dac);
   }
   if (payload_try_get_ocxo2_dac(args, dac_val)) {
-    dac2_ok = ocxo_dac_set(ocxo2_dac, dac_val);
+    dac2_ok = ocxo_dac_set_desired(ocxo2_dac, dac_val);
+    ocxo_dac_dither_reset(ocxo2_dac);
     if (dac2_ok) ocxo_dac_retry_reset(ocxo2_dac);
   }
 
@@ -3937,6 +4210,13 @@ static Payload cmd_set_dac(const Payload& args) {
   p.add("ocxo2_dac", ocxo2_dac.dac_fractional);
   p.add("ocxo1_dac_last_write_ok", ocxo1_dac.io_last_write_ok);
   p.add("ocxo2_dac_last_write_ok", ocxo2_dac.io_last_write_ok);
+  p.add("ocxo1_dac_hw_code", (uint32_t)ocxo1_dac.dac_hw_code);
+  p.add("ocxo2_dac_hw_code", (uint32_t)ocxo2_dac.dac_hw_code);
+  p.add("dither_realizes_desired", true);
+  p.add("dither_rate_hz", g_ocxo_dac_dither_rate_hz);
+  p.add("dither_period_ns", g_ocxo_dac_dither_period_ns);
+  p.add("dither_min_rate_hz", OCXO_DAC_DITHER_MIN_RATE_HZ);
+  p.add("dither_max_rate_hz", OCXO_DAC_DITHER_MAX_RATE_HZ);
   p.add("status", (dac1_ok && dac2_ok) ? "ok" : "dac_write_fault");
   return p;
 }
@@ -3970,6 +4250,7 @@ static const process_command_entry_t CLOCKS_COMMANDS[] = {
   { "REPORT_PREDICTION",       cmd_report_prediction       },
   { "REPORT_STATS",      cmd_report_stats      },
   { "REPORT_DAC",        cmd_report_dac        },
+  { "DITHER",            cmd_dither            },
   { "WATCHDOG_TEST",     cmd_watchdog_test     },
   { "SET_DAC",           cmd_set_dac           },
   { nullptr,              nullptr               }

@@ -168,12 +168,39 @@ static volatile uint32_t g_vclock_event_count = 0;
 // OCXO DAC defaults
 // ============================================================================
 
+static constexpr uint32_t OCXO_DAC_Q16_SHIFT = 16U;
+static constexpr uint32_t OCXO_DAC_Q16_ONE   = (1UL << OCXO_DAC_Q16_SHIFT);
+static constexpr uint32_t OCXO_DAC_Q16_MAX   = ((uint32_t)65535U << OCXO_DAC_Q16_SHIFT);
+
+static uint32_t ocxo_dac_value_to_q16(double value) {
+  if (value < 0.0) value = 0.0;
+  if (value > 65535.0) value = 65535.0;
+  const double scaled = value * (double)OCXO_DAC_Q16_ONE;
+  const double rounded = scaled + 0.5;
+  if (rounded >= (double)OCXO_DAC_Q16_MAX) return OCXO_DAC_Q16_MAX;
+  return (uint32_t)rounded;
+}
+
+static double ocxo_dac_q16_to_value(uint32_t q16) {
+  return (double)q16 / (double)OCXO_DAC_Q16_ONE;
+}
+
 static ocxo_dac_state_t make_default_ocxo_dac_state() {
   ocxo_dac_state_t s = {};
   s.dac_fractional = (double)AD5693R_DAC_DEFAULT;
   s.dac_hw_code = AD5693R_DAC_DEFAULT;
   s.dac_min = 0;
   s.dac_max = 65535;
+  s.dac_desired_q16 = ((uint32_t)AD5693R_DAC_DEFAULT << OCXO_DAC_Q16_SHIFT);
+  s.dither_enabled = true;
+  s.dither_rate_hz = 100U;
+  s.dither_period_ns = 10000000U;
+  s.dither_effective_window_ticks = 100U;
+  s.dither_low_code = AD5693R_DAC_DEFAULT;
+  s.dither_high_code = AD5693R_DAC_DEFAULT;
+  s.dither_last_selected_hw_code = AD5693R_DAC_DEFAULT;
+  s.dither_last_window_low_code = AD5693R_DAC_DEFAULT;
+  s.dither_last_window_high_code = AD5693R_DAC_DEFAULT;
   s.io_last_write_ok = true;
   s.io_last_attempted_hw_code = AD5693R_DAC_DEFAULT;
   s.io_last_good_hw_code = AD5693R_DAC_DEFAULT;
@@ -200,10 +227,36 @@ servo_mode_t servo_mode_parse(const char* s) {
   return servo_mode_t::OFF;
 }
 
-static bool ocxo_dac_write_hw(ocxo_dac_state_t& s, double value);
+void ocxo_dac_dither_reset(ocxo_dac_state_t& s) {
+  s.dither_accumulator_q16 = 0;
+  s.dither_fraction_q16 = s.dac_desired_q16 & 0xFFFFUL;
+  s.dither_low_code = (uint16_t)(s.dac_desired_q16 >> OCXO_DAC_Q16_SHIFT);
+  s.dither_high_code = (s.dither_low_code >= 65535U || s.dither_fraction_q16 == 0)
+      ? s.dither_low_code
+      : (uint16_t)(s.dither_low_code + 1U);
+  s.dither_last_selected_hw_code = s.dac_hw_code;
+  s.dither_window_tick_count = 0;
+  s.dither_window_low_count = 0;
+  s.dither_window_high_count = 0;
+}
+
+bool ocxo_dac_set_desired(ocxo_dac_state_t& s, double value) {
+  const uint32_t old_q16 = s.dac_desired_q16;
+  const uint16_t old_low = (uint16_t)(old_q16 >> OCXO_DAC_Q16_SHIFT);
+
+  const uint32_t q16 = ocxo_dac_value_to_q16(value);
+  s.dac_desired_q16 = q16;
+  s.dac_fractional = ocxo_dac_q16_to_value(q16);
+
+  const uint16_t new_low = (uint16_t)(q16 >> OCXO_DAC_Q16_SHIFT);
+  if (new_low != old_low) {
+    s.dither_accumulator_q16 = 0;
+  }
+  return true;
+}
 
 bool ocxo_dac_set(ocxo_dac_state_t& s, double value) {
-  return ocxo_dac_write_hw(s, value);
+  return ocxo_dac_set_desired(s, value);
 }
 
 void ocxo_dac_predictor_reset(ocxo_dac_state_t& s) {
@@ -227,15 +280,14 @@ void ocxo_dac_retry_reset(ocxo_dac_state_t& s) {
   s.io_last_failure_stage = 0;
 }
 
-static bool ocxo_dac_write_hw(ocxo_dac_state_t& s, double value) {
-  if (value < (double)s.dac_min) value = (double)s.dac_min;
-  if (value > (double)s.dac_max) value = (double)s.dac_max;
-
-  uint16_t hw_code = (uint16_t)(value + 0.5);
+bool ocxo_dac_write_hw_code(ocxo_dac_state_t& s,
+                            uint16_t hw_code,
+                            bool latch_fault) {
+  if ((uint32_t)hw_code < s.dac_min) hw_code = (uint16_t)s.dac_min;
+  if ((uint32_t)hw_code > s.dac_max) hw_code = (uint16_t)s.dac_max;
   s.io_last_attempted_hw_code = hw_code;
 
   if (hw_code == s.dac_hw_code) {
-    s.dac_fractional = value;
     s.io_last_write_ok = true;
     s.io_last_failure_stage = 0;
     return true;
@@ -245,7 +297,7 @@ static bool ocxo_dac_write_hw(ocxo_dac_state_t& s, double value) {
 
   if (!g_ad5693r_init_ok) {
     s.io_last_write_ok = false;
-    s.io_fault_latched = true;
+    if (latch_fault) s.io_fault_latched = true;
     s.io_write_failures++;
     s.io_last_failure_stage = 3;
     return false;
@@ -256,7 +308,7 @@ static bool ocxo_dac_write_hw(ocxo_dac_state_t& s, double value) {
 
   if (!ad5693r_write_input(addr, hw_code)) {
     s.io_last_write_ok = false;
-    s.io_fault_latched = true;
+    if (latch_fault) s.io_fault_latched = true;
     s.io_write_failures++;
     s.io_last_failure_stage = 1;
     return false;
@@ -264,13 +316,12 @@ static bool ocxo_dac_write_hw(ocxo_dac_state_t& s, double value) {
 
   if (!ad5693r_update_dac(addr)) {
     s.io_last_write_ok = false;
-    s.io_fault_latched = true;
+    if (latch_fault) s.io_fault_latched = true;
     s.io_write_failures++;
     s.io_last_failure_stage = 2;
     return false;
   }
 
-  s.dac_fractional = value;
   s.dac_hw_code = hw_code;
   s.io_last_write_ok = true;
   s.io_write_successes++;
@@ -3441,6 +3492,8 @@ void process_clocks_init(void) {
 
   (void)ocxo_dac_set(ocxo1_dac, (double)AD5693R_DAC_DEFAULT);
   (void)ocxo_dac_set(ocxo2_dac, (double)AD5693R_DAC_DEFAULT);
+  ocxo_dac_dither_reset(ocxo1_dac);
+  ocxo_dac_dither_reset(ocxo2_dac);
 
   pinMode(GNSS_LOCK_PIN, INPUT);
 
@@ -3449,5 +3502,6 @@ void process_clocks_init(void) {
   subscribe_clock(interrupt_subscriber_kind_t::OCXO2, ocxo2_callback);
 
   interrupt_pps_edge_register_dispatch(pps_selector_callback);
+  clocks_dac_dither_begin();
   (void)clocks_alpha_begin_smartzero_epoch("startup");
 }

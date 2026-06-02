@@ -609,6 +609,11 @@ struct ocxo_dac_state_t {
   uint32_t dac_min;
   uint32_t dac_max;
 
+  // Synthetic real DAC authority.  The servo and Pi control plane write this
+  // real-valued target; the always-on dither layer realizes it as an adjacent-
+  // code AD5693R stream.  Q16 avoids ISR/foreground double races.
+  uint32_t dac_desired_q16;
+
   double   servo_last_step;
   double   servo_last_residual;
   uint32_t servo_settle_count;
@@ -632,6 +637,37 @@ struct ocxo_dac_state_t {
   uint32_t pacing_deferred_count;
   uint32_t pacing_commit_count;
   uint32_t pacing_skip_small_delta_count;
+
+  // Always-on sigma-delta realization diagnostics.  Window counters are tick
+  // counts, not I2C write counts: skipped same-code writes still represent
+  // held-output dwell time and therefore count toward the effective average.
+  bool     dither_enabled;
+  uint32_t dither_rate_hz;
+  uint32_t dither_period_ns;
+  uint32_t dither_effective_window_ticks;
+  uint32_t dither_accumulator_q16;
+  uint32_t dither_fraction_q16;
+  uint16_t dither_low_code;
+  uint16_t dither_high_code;
+  uint16_t dither_last_selected_hw_code;
+
+  uint32_t dither_tick_count_total;
+  uint32_t dither_window_sequence;
+  uint32_t dither_window_tick_count;
+  uint32_t dither_window_low_count;
+  uint32_t dither_window_high_count;
+
+  uint32_t dither_last_window_tick_count;
+  uint32_t dither_last_window_low_count;
+  uint32_t dither_last_window_high_count;
+  uint16_t dither_last_window_low_code;
+  uint16_t dither_last_window_high_code;
+
+  uint32_t dither_write_attempts;
+  uint32_t dither_write_successes;
+  uint32_t dither_write_failures;
+  uint32_t dither_write_skip_same_code_count;
+  uint32_t dither_not_ready_count;
 
   bool     io_last_write_ok;
   bool     io_fault_latched;
@@ -672,9 +708,16 @@ static constexpr uint16_t SERVO_MIN_DAC_CODE_DELTA_LSB  = 1;
 // The DAC transfer is monotonic positive: higher DAC voltage makes the OCXO faster.
 
 bool ocxo_dac_set(ocxo_dac_state_t& s, double value);
+bool ocxo_dac_set_desired(ocxo_dac_state_t& s, double value);
+bool ocxo_dac_write_hw_code(ocxo_dac_state_t& s,
+                            uint16_t hw_code,
+                            bool latch_fault = true);
+void ocxo_dac_dither_reset(ocxo_dac_state_t& s);
 void ocxo_dac_predictor_reset(ocxo_dac_state_t& s);
 void ocxo_dac_io_reset(ocxo_dac_state_t& s);
 void ocxo_dac_retry_reset(ocxo_dac_state_t& s);
+void clocks_dac_dither_begin(void);
+bool clocks_dac_dither_set_rate_hz(uint32_t rate_hz);
 
 // ============================================================================
 // Campaign warmup suppression

@@ -1984,26 +1984,21 @@ def _process_loop() -> None:
         publish("TIMEBASE", timebase)
         _persist_timebase(timebase)
 
-        # Persist live DAC Welford means as the SYSTEM boot seeds (best-effort).
+        # Persist live desired DAC values as the SYSTEM boot seeds (best-effort).
         #
-        # Keep this intentionally boring: the Teensy already publishes the DAC
-        # Welford means in TIMEBASE_FRAGMENT.stats.dac.ocxo*.mean, and the
-        # metrics panel proves those fields are live.  Use those means directly
-        # as the next-run DAC seeds and update both SYSTEM values in one SQL
-        # statement.  No campaign write, no live/last/manual/baseline aliases,
-        # no servo-mode inference gate.
-        fragment_stats = frag.get("stats") if isinstance(frag.get("stats"), dict) else {}
-        fragment_stats_dac = fragment_stats.get("dac") if isinstance(fragment_stats.get("dac"), dict) else {}
-        fragment_stats_dac_ocxo1 = fragment_stats_dac.get("ocxo1") if isinstance(fragment_stats_dac.get("ocxo1"), dict) else {}
-        fragment_stats_dac_ocxo2 = fragment_stats_dac.get("ocxo2") if isinstance(fragment_stats_dac.get("ocxo2"), dict) else {}
-
+        # DAC Welfords are still useful servo-effort statistics, but they are
+        # not actuator state.  With 1 kHz sigma-delta realization, the boot seed
+        # is the Teensy-authored synthetic real DAC value that the dither layer
+        # is honoring, not a historical mean that can lag the current target.
         ocxo1_dac_seed = _first_float(
-            fragment_stats_dac_ocxo1.get("mean"),
-            frag.get("ocxo1_dac_welford_mean"),
+            _path_get(frag, "dac.ocxo1_dac"),
+            _path_get(frag, "dac.ocxo1.value"),
+            frag.get("ocxo1_dac"),
         )
         ocxo2_dac_seed = _first_float(
-            fragment_stats_dac_ocxo2.get("mean"),
-            frag.get("ocxo2_dac_welford_mean"),
+            _path_get(frag, "dac.ocxo2_dac"),
+            _path_get(frag, "dac.ocxo2.value"),
+            frag.get("ocxo2_dac"),
         )
 
         if ocxo1_dac_seed is not None and ocxo2_dac_seed is not None:
@@ -3474,8 +3469,8 @@ def cmd_set_dac(args: Optional[dict]) -> Dict[str, Any]:
     That prevents an older campaign mean from being used to seed the next run
     after the operator has explicitly selected new DAC values.
 
-    It does not push the running Teensy by default; START/boot/recovery will
-    push these values through the normal Pi control path.
+    It also pushes the running Teensy best-effort so the always-on dither layer
+    begins honoring the new synthetic real value immediately.
     """
     if not args:
         return {
@@ -3517,6 +3512,23 @@ def cmd_set_dac(args: Optional[dict]) -> Dict[str, Any]:
         logging.exception("❌ [clocks] SET_DAC failed")
         return {"success": False, "message": str(e)}
 
+    teensy_pushed_now = False
+    teensy_push_error = None
+    teensy_message = None
+    try:
+        teensy_args: Dict[str, Any] = {}
+        if has_dac1 and dac1 is not None:
+            teensy_args["set_dac1"] = str(float(dac1))
+        if has_dac2 and dac2 is not None:
+            teensy_args["set_dac2"] = str(float(dac2))
+        if teensy_args:
+            resp = send_command(machine="TEENSY", subsystem="CLOCKS", command="SET_DAC", args=teensy_args)
+            teensy_pushed_now = bool(resp.get("success"))
+            teensy_message = resp.get("message")
+    except Exception as e:
+        teensy_push_error = str(e)
+        logging.exception("⚠️ [clocks] SET_DAC persisted but Teensy push failed")
+
     payload = {
         "ocxo1_dac": update_blob.get("ocxo1_dac"),
         "ocxo2_dac": update_blob.get("ocxo2_dac"),
@@ -3526,8 +3538,11 @@ def cmd_set_dac(args: Optional[dict]) -> Dict[str, Any]:
         "manual_dac_override_args": update_blob.get("manual_dac_override_args", {}),
         "manual_dac_override_aliases": update_blob.get("manual_dac_override_aliases", {}),
         "manual_dac_override_at_utc": update_blob["manual_dac_override_at_utc"],
-        "applies_to": "next START/boot/recovery DAC seed",
-        "teensy_pushed_now": False,
+        "applies_to": "current Teensy desired DAC and next START/boot/recovery DAC seed",
+        "teensy_pushed_now": teensy_pushed_now,
+        "teensy_message": teensy_message,
+        "teensy_push_error": teensy_push_error,
+        "dither_realizes_desired": True,
     }
 
     logging.info("🔧 [clocks] SET_DAC boot seed override: %s", payload)
@@ -3536,10 +3551,11 @@ def cmd_set_dac(args: Optional[dict]) -> Dict[str, Any]:
 
 def cmd_set_dither(args: Optional[dict]) -> Dict[str, Any]:
     """
-    DITHER(dither)
+    DITHER(dither, rate_hz=None)
 
-    Update the global OCXO dithering flag in the SYSTEM config record.
-    This is a system-level setting, not a campaign attribute.
+    Update the global OCXO dithering flag and optional dither frequency in the
+    SYSTEM config record.  This is a system-level setting, not a campaign
+    attribute.
     """
     if not args or "dither" not in args:
         return {"success": False, "message": "DITHER requires 'dither' argument"}
@@ -3558,31 +3574,52 @@ def cmd_set_dither(args: Optional[dict]) -> Dict[str, Any]:
     else:
         return {"success": False, "message": f"Invalid dither value: {raw}"}
 
+    rate_hz = None
+    for key in ("rate_hz", "hz", "frequency_hz"):
+        if key in args and args.get(key) is not None:
+            try:
+                rate_hz = int(args.get(key))
+            except (TypeError, ValueError):
+                return {"success": False, "message": f"Invalid dither rate for {key}: {args.get(key)!r}"}
+            break
+
+    if rate_hz is not None and not (1 <= rate_hz <= 1000):
+        return {"success": False, "message": f"dither rate_hz must be 1..1000, got {rate_hz}"}
+
     update_blob = {"dither": dither}
+    if rate_hz is not None:
+        update_blob["dither_rate_hz"] = int(rate_hz)
 
     try:
         with open_db() as conn:
             cur = conn.cursor()
             cur.execute(
                 """
-                UPDATE config
-                SET payload = payload || %s::jsonb
-                WHERE config_key = 'SYSTEM'
+                WITH updated AS (
+                    UPDATE config
+                    SET payload = COALESCE(payload, '{}'::jsonb) || %s::jsonb
+                    WHERE config_key = 'SYSTEM'
+                    RETURNING 1
+                )
+                INSERT INTO config (config_key, payload)
+                SELECT 'SYSTEM', %s::jsonb
+                WHERE NOT EXISTS (SELECT 1 FROM updated)
                 """,
-                (json.dumps(update_blob),),
+                (json.dumps(update_blob), json.dumps(update_blob)),
             )
-            if cur.rowcount == 0:
-                return {"success": False, "message": "No SYSTEM config record found"}
     except Exception as e:
         logging.exception("❌ [clocks] DITHER failed")
         return {"success": False, "message": str(e)}
 
     try:
+        teensy_args: Dict[str, Any] = {"dither": dither}
+        if rate_hz is not None:
+            teensy_args["rate_hz"] = int(rate_hz)
         teensy_resp = send_command(
             machine="TEENSY",
             subsystem="CLOCKS",
             command="DITHER",
-            args={"dither": dither},
+            args=teensy_args,
         )
     except Exception as e:
         logging.exception("⚠️ [clocks] DITHER persisted but Teensy update failed")
@@ -3599,6 +3636,7 @@ def cmd_set_dither(args: Optional[dict]) -> Dict[str, Any]:
         "payload": {
             **update_blob,
             "teensy_message": teensy_resp.get("message"),
+            "teensy_payload": teensy_resp.get("payload"),
         },
     }
 
@@ -3645,6 +3683,44 @@ def run() -> None:
     # starts or recovers.
     try:
         cfg = _get_system_config()
+
+        boot_dither = cfg.get("dither")
+        boot_dither_bool = None
+        if isinstance(boot_dither, bool):
+            boot_dither_bool = boot_dither
+        elif isinstance(boot_dither, str):
+            lowered = boot_dither.strip().lower()
+            if lowered in ("true", "1", "yes", "on"):
+                boot_dither_bool = True
+            elif lowered in ("false", "0", "no", "off"):
+                boot_dither_bool = False
+        boot_rate_hz = None
+        try:
+            if cfg.get("dither_rate_hz") is not None:
+                boot_rate_hz = int(cfg.get("dither_rate_hz"))
+        except (TypeError, ValueError):
+            boot_rate_hz = None
+        if boot_dither_bool is not None or boot_rate_hz is not None:
+            try:
+                dither_args: Dict[str, Any] = {}
+                if boot_dither_bool is not None:
+                    dither_args["dither"] = boot_dither_bool
+                else:
+                    dither_args["dither"] = True
+                if boot_rate_hz is not None:
+                    dither_args["rate_hz"] = boot_rate_hz
+                resp = send_command(
+                    machine="TEENSY",
+                    subsystem="CLOCKS",
+                    command="DITHER",
+                    args=dither_args,
+                )
+                logging.info(
+                    "🔧 [clocks] boot dither push: dither=%s rate_hz=%s resp=%s",
+                    boot_dither_bool, boot_rate_hz, resp.get("message", "?"),
+                )
+            except Exception:
+                logging.exception("⚠️ [clocks] boot dither push failed (ignored)")
 
         boot_dac1, boot_dac2, boot_dac_source = _configured_boot_dacs(cfg)
         if boot_dac1 is not None or boot_dac2 is not None:
