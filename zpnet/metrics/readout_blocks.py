@@ -40,7 +40,7 @@ Column layout (INT rows):
 
 from zpnet.processes.processes import send_command
 
-VREF = 3.002
+VREF = 3.003
 
 
 # ---------------------------------------------------------------------
@@ -422,12 +422,57 @@ def _servo_state(r: dict) -> str:
     # Legacy TIMEBASE_FRAGMENT_V3 only included fragment.dac while
     # clocks_servo_active() was true.  That minimal persistence feed proved
     # activity but not mode.
-    dac_o1 = _field(r, "dac.ocxo1_dac", "dac.ocxo1.value", "ocxo1_dac", default=None)
-    dac_o2 = _field(r, "dac.ocxo2_dac", "dac.ocxo2.value", "ocxo2_dac", default=None)
+    dac_o1 = _dac_value(r, "ocxo1")
+    dac_o2 = _dac_value(r, "ocxo2")
     if dac_o1 is not None or dac_o2 is not None:
         return "ACTIVE"
 
     return "IDLE" if saw_explicit_off else "IDLE"
+
+
+# ---------------------------------------------------------------------
+# DAC presentation helpers
+# ---------------------------------------------------------------------
+
+DAC_CODE_MAX = 65535.0
+DAC_CODE_SCALE = 65536.0
+
+
+def _dac_value(r: dict, lane: str):
+    """Return the instantaneous firmware-published AD5693R DAC code.
+
+    TIMEBASE_FRAGMENT_V3 currently publishes the live servo output as
+    fragment.dac.ocxo1_dac / fragment.dac.ocxo2_dac.  Older/detail reports may
+    carry dac.<lane>.value, dac.<lane>.dac, or a flat <lane>_dac key.  This
+    helper intentionally reads only already-published firmware fields; the Pi
+    does no servo reconstruction here.
+    """
+    return _to_float(_field(
+        r,
+        f"dac.{lane}_dac",
+        f"dac.{lane}.value",
+        f"dac.{lane}.dac",
+        f"dac.{lane}.code",
+        f"dac.{lane}.dac_code",
+        f"{lane}_dac",
+        f"{lane}_dac_code",
+    ))
+
+
+def _dac_voltage(dac_code):
+    code = _to_float(dac_code)
+    if code is None:
+        return None
+    # AD5693R ideal unipolar transfer: VOUT = VREF * D / 2^16.
+    return code * VREF / DAC_CODE_SCALE
+
+
+def _dac_label(dac_code):
+    code = _to_float(dac_code)
+    volts = _dac_voltage(code)
+    if code is None or volts is None:
+        return "---"
+    return f"{code:>.3f} {volts:.6f}V"
 
 
 # ---------------------------------------------------------------------
@@ -768,7 +813,7 @@ def clocks_combined_readout() -> list[str]:
     lines.append("")
     lines.append(
         f"{'DAC':<{W_NAME}}"
-        f"{'':>{W_VALUE}}"
+        f"{'VALUE/VOUT':>{W_VALUE}}"
         f"{'':>{W_TAU}}"
         f"{'':>{W_PPB}}"
         f"{'':>{W_RAW}}"
@@ -783,9 +828,8 @@ def clocks_combined_readout() -> list[str]:
         f"{'DELTA':>{W_DELTA}}"
     )
     for name, key in [("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")]:
-        dac_now = _to_float(_field(r, f"dac.{key}.value", f"{key}_dac"))
-        dac_volts = (dac_now * VREF / 65535.0) if dac_now is not None else None
-        dac_label = f"{dac_now:>.3f} {dac_volts:.5f}V" if dac_now is not None else "---"
+        dac_now = _dac_value(r, key)
+        dac_label = _dac_label(dac_now)
 
         base_dac = None
         if baseline:
@@ -845,9 +889,9 @@ def clocks_combined_readout() -> list[str]:
             if selected == 0.0 and not _field(r, f"dac.{key}.servo_input.selected_valid", default=False):
                 selected = _to_float(_field(r, f"{key}.pps_residual.fast_residual_ns"))
             edge_gnss_ns = _to_int(_field(r, f"{key}.sample_gnss_ns_at_event", f"{key}_diag_gnss_ns_at_event"))
-            dac_now = _to_float(_field(r, f"dac.{key}.value", f"{key}_dac"))
+            dac_now = _dac_value(r, key)
             pps_ns = _to_int(_field(r, f"{key}.ns", f"gnss.{key}_ns", f"{key}_ns", f"{key}_ns_at_pps_vclock", f"{key}_ns_count_at_pps"))
-            v_now = (dac_now * VREF / 65535.0) if dac_now is not None else None
+            v_now = _dac_voltage(dac_now)
             lines.append(
                 f"{name:<{W_NAME}}"
                 f"{_sign_float(selected, 12, 1)}"
