@@ -3965,6 +3965,13 @@ static void payload_add_ocxo_pps_projection_lane(Payload& parent,
   counters.add("invalid_no_interval_count", s.invalid_no_interval_count);
   counters.add("invalid_target_out_of_window_count",
                s.invalid_target_out_of_window_count);
+  counters.add("static_projection_advance_count",
+               s.static_projection_advance_count);
+  counters.add("last_static_projection_advance_count",
+               s.last_static_projection_advance_count);
+  counters.add("max_static_projection_advance_count",
+               s.max_static_projection_advance_count);
+  counters.add("max_target_overrun_cycles", s.max_target_overrun_cycles);
   lane.add_object("counters", counters);
 
   Payload pps;
@@ -3999,6 +4006,8 @@ static void payload_add_ocxo_pps_projection_lane(Payload& parent,
   projection.add("interval_dwt_cycles", s.interval_dwt_cycles);
   projection.add("interval_ocxo_ns", s.interval_ocxo_ns);
   projection.add("target_delta_cycles", s.target_delta_cycles);
+  projection.add("target_delta_raw_cycles", s.target_delta_raw_cycles);
+  projection.add("target_overrun_cycles", s.target_overrun_cycles);
   projection.add("target_remaining_cycles", s.target_remaining_cycles);
   projection.add("projected_ocxo_ns_at_pps", s.projected_ocxo_ns_at_pps);
   projection.add("projected_minus_existing_pps_ns",
@@ -4012,6 +4021,9 @@ static void payload_add_ocxo_pps_projection_lane(Payload& parent,
   static_prediction.add("completed_interval_count",
                         s.static_prediction_completed_interval_count);
   static_prediction.add("valid", s.static_prediction_valid);
+  static_prediction.add("advance_limit", s.static_projection_advance_limit);
+  static_prediction.add("last_advance_count",
+                        s.last_static_projection_advance_count);
   lane.add_object("static_prediction", static_prediction);
 
   parent.add_object(key, lane);

@@ -532,6 +532,19 @@ struct clocks_alpha_ocxo_pps_projection_snapshot_t {
   uint32_t invalid_no_interval_count;
   uint32_t invalid_target_out_of_window_count;
 
+  // Static projection advancement diagnostics.  When the latest observed OCXO
+  // edge is behind the PPS/VCLOCK target by more than one OCXO interval, Alpha
+  // may advance the synthetic static edge a bounded number of one-second
+  // intervals before projecting.  These fields expose that decision instead of
+  // collapsing it into TARGET_OUT_OF_WINDOW.
+  uint32_t static_projection_advance_count;        // cumulative advanced edges
+  uint32_t last_static_projection_advance_count;   // advanced edges this compute
+  uint32_t max_static_projection_advance_count;    // max advanced edges in one compute
+  uint32_t static_projection_advance_limit;        // configured cap
+  uint32_t target_delta_raw_cycles;                // pps_dwt - original edge0_dwt
+  uint32_t target_overrun_cycles;                  // raw delta beyond one interval
+  uint32_t max_target_overrun_cycles;              // cumulative max overrun seen
+
   // 0=NONE, 1=ACTUAL_BRACKET, 2=STATIC_NEXT_EDGE.
   uint32_t source;
   uint32_t last_invalid_reason;

@@ -1286,6 +1286,14 @@ static constexpr uint32_t ALPHA_OCXO_PPS_PROJECTION_INVALID_NO_EDGE = 1;
 static constexpr uint32_t ALPHA_OCXO_PPS_PROJECTION_INVALID_NO_INTERVAL = 2;
 static constexpr uint32_t ALPHA_OCXO_PPS_PROJECTION_INVALID_TARGET_OUT_OF_WINDOW = 3;
 
+// Static PPS projection may find that the latest observed OCXO edge is one or
+// two synthetic one-second intervals behind the PPS/VCLOCK target.  That is a
+// custody timing phase issue, not an OCXO event failure.  Advance the static
+// edge a small bounded number of intervals before declaring the target out of
+// window.  Keep this intentionally small so a truly backward or stale DWT
+// relationship still fails loudly.
+static constexpr uint32_t ALPHA_OCXO_PPS_STATIC_ADVANCE_LIMIT = 2U;
+
 struct alpha_ocxo_edge_fact_t {
   bool     valid = false;
   uint32_t dwt_at_edge = 0;
@@ -1407,6 +1415,24 @@ static void alpha_ocxo_edge_history_record(time_clock_id_t clock,
   h->update_count++;
 }
 
+static alpha_ocxo_edge_fact_t alpha_ocxo_project_static_next_edge(
+    const alpha_ocxo_edge_fact_t& edge,
+    uint32_t interval_cycles) {
+  alpha_ocxo_edge_fact_t projected = edge;
+  projected.dwt_at_edge = edge.dwt_at_edge + interval_cycles;
+  projected.counter32_at_edge =
+      edge.counter32_at_edge + (uint32_t)VCLOCK_COUNTS_PER_SECOND;
+  projected.ocxo_ns_at_edge = edge.ocxo_ns_at_edge + NS_PER_SECOND_U64;
+
+  // This edge is a projection, not an observed Alpha measured-ledger edge.
+  projected.measured_ns_at_edge = 0;
+  projected.sample_gnss_available = false;
+  projected.sample_gnss_ns_at_event = 0;
+  projected.boundary_gnss_available = false;
+  projected.boundary_gnss_ns_at_edge = 0;
+  return projected;
+}
+
 static uint32_t alpha_ocxo_latest_actual_interval_cycles(
     time_clock_id_t clock,
     uint32_t* out_completed_interval_count,
@@ -1433,7 +1459,15 @@ static void alpha_ocxo_pps_projection_set_invalid(
     uint32_t pps_sequence,
     uint32_t pps_dwt_at_edge,
     uint64_t pps_vclock_ns,
-    uint64_t existing_pps_ns) {
+    uint64_t existing_pps_ns,
+    const alpha_ocxo_edge_fact_t* edge0 = nullptr,
+    const alpha_ocxo_edge_fact_t* edge1 = nullptr,
+    uint32_t latest_actual_interval_cycles = 0,
+    uint32_t completed_interval_count = 0,
+    bool static_prediction_valid = false,
+    uint32_t target_delta_raw_cycles = 0,
+    uint32_t target_overrun_cycles = 0,
+    uint32_t last_static_advance_count = 0) {
   alpha_ocxo_pps_projection_store_t* s = alpha_ocxo_pps_projection_store(clock);
   if (!s) return;
 
@@ -1442,6 +1476,9 @@ static void alpha_ocxo_pps_projection_set_invalid(
   const uint32_t no_edge_count = s->v.invalid_no_edge_count;
   const uint32_t no_interval_count = s->v.invalid_no_interval_count;
   const uint32_t out_of_window_count = s->v.invalid_target_out_of_window_count;
+  const uint32_t prior_static_advance_total = s->v.static_projection_advance_count;
+  const uint32_t prior_static_advance_max = s->v.max_static_projection_advance_count;
+  const uint32_t prior_target_overrun_max = s->v.max_target_overrun_cycles;
 
   clocks_alpha_ocxo_pps_projection_snapshot_t local{};
   local.clock_id = (uint32_t)((uint8_t)clock);
@@ -1459,8 +1496,49 @@ static void alpha_ocxo_pps_projection_set_invalid(
   local.pps_sequence = pps_sequence;
   local.pps_dwt_at_edge = pps_dwt_at_edge;
   local.pps_vclock_ns = pps_vclock_ns;
+
+  if (edge0) {
+    local.edge0_dwt_at_edge = edge0->dwt_at_edge;
+    local.edge0_counter32_at_edge = edge0->counter32_at_edge;
+    local.edge0_ocxo_ns_at_edge = edge0->ocxo_ns_at_edge;
+    local.edge0_measured_ns_at_edge = edge0->measured_ns_at_edge;
+    local.edge0_sample_gnss_available = edge0->sample_gnss_available;
+    local.edge0_sample_gnss_ns_at_event = edge0->sample_gnss_ns_at_event;
+    local.edge0_boundary_gnss_available = edge0->boundary_gnss_available;
+    local.edge0_boundary_gnss_ns_at_edge = edge0->boundary_gnss_ns_at_edge;
+  }
+  if (edge1) {
+    local.edge1_dwt_at_edge = edge1->dwt_at_edge;
+    local.edge1_counter32_at_edge = edge1->counter32_at_edge;
+    local.edge1_ocxo_ns_at_edge = edge1->ocxo_ns_at_edge;
+    local.edge1_measured_ns_at_edge = edge1->measured_ns_at_edge;
+    local.edge1_sample_gnss_available = edge1->sample_gnss_available;
+    local.edge1_sample_gnss_ns_at_event = edge1->sample_gnss_ns_at_event;
+    local.edge1_boundary_gnss_available = edge1->boundary_gnss_available;
+    local.edge1_boundary_gnss_ns_at_edge = edge1->boundary_gnss_ns_at_edge;
+  }
+
   local.projected_minus_existing_pps_ns = 0;
   local.projected_minus_vclock_ns = 0;
+  local.latest_actual_interval_cycles = latest_actual_interval_cycles;
+  local.static_prediction_completed_interval_count = completed_interval_count;
+  local.static_prediction_valid = static_prediction_valid;
+  local.static_projection_advance_count =
+      prior_static_advance_total + last_static_advance_count;
+  local.last_static_projection_advance_count = last_static_advance_count;
+  local.max_static_projection_advance_count =
+      (last_static_advance_count > prior_static_advance_max)
+          ? last_static_advance_count
+          : prior_static_advance_max;
+  local.static_projection_advance_limit = ALPHA_OCXO_PPS_STATIC_ADVANCE_LIMIT;
+  local.target_delta_raw_cycles = target_delta_raw_cycles;
+  local.target_overrun_cycles = target_overrun_cycles;
+  local.max_target_overrun_cycles =
+      (target_overrun_cycles > prior_target_overrun_max)
+          ? target_overrun_cycles
+          : prior_target_overrun_max;
+
+  (void)existing_pps_ns;
 
   s->seq++;
   clocks_alpha_dmb();
@@ -1482,7 +1560,10 @@ static bool alpha_ocxo_pps_projection_build(
     uint64_t existing_pps_ns,
     uint32_t latest_actual_interval_cycles,
     uint32_t completed_interval_count,
-    bool static_prediction_valid) {
+    bool static_prediction_valid,
+    uint32_t last_static_advance_count,
+    uint32_t target_delta_raw_cycles,
+    uint32_t target_overrun_cycles) {
   alpha_ocxo_pps_projection_store_t* s = alpha_ocxo_pps_projection_store(clock);
   if (!s || interval_cycles == 0) return false;
 
@@ -1538,6 +1619,17 @@ static bool alpha_ocxo_pps_projection_build(
   local.latest_actual_interval_cycles = latest_actual_interval_cycles;
   local.static_prediction_completed_interval_count = completed_interval_count;
   local.static_prediction_valid = static_prediction_valid;
+  local.static_projection_advance_count += last_static_advance_count;
+  local.last_static_projection_advance_count = last_static_advance_count;
+  if (last_static_advance_count > local.max_static_projection_advance_count) {
+    local.max_static_projection_advance_count = last_static_advance_count;
+  }
+  local.static_projection_advance_limit = ALPHA_OCXO_PPS_STATIC_ADVANCE_LIMIT;
+  local.target_delta_raw_cycles = target_delta_raw_cycles;
+  local.target_overrun_cycles = target_overrun_cycles;
+  if (target_overrun_cycles > local.max_target_overrun_cycles) {
+    local.max_target_overrun_cycles = target_overrun_cycles;
+  }
 
   s->seq++;
   clocks_alpha_dmb();
@@ -1579,7 +1671,8 @@ static void alpha_ocxo_pps_projection_compute(time_clock_id_t clock,
               h->previous, h->current, actual_interval, target_delta,
               pps_sequence, pps_dwt_at_edge, pps_vclock_ns, existing_pps_ns,
               latest_actual_interval_cycles, completed_interval_count,
-              static_prediction_valid)) {
+              static_prediction_valid,
+              0U, target_delta, 0U)) {
         return;
       }
     }
@@ -1588,39 +1681,61 @@ static void alpha_ocxo_pps_projection_compute(time_clock_id_t clock,
   if (latest_actual_interval_cycles == 0) {
     alpha_ocxo_pps_projection_set_invalid(
         clock, ALPHA_OCXO_PPS_PROJECTION_INVALID_NO_INTERVAL,
-        pps_sequence, pps_dwt_at_edge, pps_vclock_ns, existing_pps_ns);
+        pps_sequence, pps_dwt_at_edge, pps_vclock_ns, existing_pps_ns,
+        &h->current, h->previous_valid ? &h->previous : nullptr,
+        latest_actual_interval_cycles, completed_interval_count,
+        static_prediction_valid,
+        pps_dwt_at_edge - h->current.dwt_at_edge, 0U, 0U);
     return;
   }
 
-  const uint32_t target_delta = pps_dwt_at_edge - h->current.dwt_at_edge;
+  const uint32_t raw_target_delta = pps_dwt_at_edge - h->current.dwt_at_edge;
+  const uint32_t raw_target_overrun =
+      (raw_target_delta > latest_actual_interval_cycles)
+          ? (raw_target_delta - latest_actual_interval_cycles)
+          : 0U;
+
+  alpha_ocxo_edge_fact_t edge0 = h->current;
+  uint32_t target_delta = raw_target_delta;
+  uint32_t static_advance_count = 0;
+
+  while (target_delta > latest_actual_interval_cycles &&
+         static_advance_count < ALPHA_OCXO_PPS_STATIC_ADVANCE_LIMIT) {
+    edge0 = alpha_ocxo_project_static_next_edge(edge0,
+                                                latest_actual_interval_cycles);
+    static_advance_count++;
+    target_delta = pps_dwt_at_edge - edge0.dwt_at_edge;
+  }
+
   if (target_delta > latest_actual_interval_cycles) {
+    const uint32_t unresolved_overrun = target_delta - latest_actual_interval_cycles;
     alpha_ocxo_pps_projection_set_invalid(
         clock, ALPHA_OCXO_PPS_PROJECTION_INVALID_TARGET_OUT_OF_WINDOW,
-        pps_sequence, pps_dwt_at_edge, pps_vclock_ns, existing_pps_ns);
+        pps_sequence, pps_dwt_at_edge, pps_vclock_ns, existing_pps_ns,
+        &edge0, nullptr,
+        latest_actual_interval_cycles, completed_interval_count,
+        static_prediction_valid,
+        raw_target_delta, unresolved_overrun, static_advance_count);
     return;
   }
 
-  alpha_ocxo_edge_fact_t projected_next = h->current;
-  projected_next.dwt_at_edge = h->current.dwt_at_edge + latest_actual_interval_cycles;
-  projected_next.counter32_at_edge =
-      h->current.counter32_at_edge + (uint32_t)VCLOCK_COUNTS_PER_SECOND;
-  projected_next.ocxo_ns_at_edge = h->current.ocxo_ns_at_edge + NS_PER_SECOND_U64;
-  // This edge is a projection, not an observed Alpha measured-ledger edge.
-  projected_next.measured_ns_at_edge = 0;
-  projected_next.sample_gnss_available = false;
-  projected_next.sample_gnss_ns_at_event = 0;
-  projected_next.boundary_gnss_available = false;
-  projected_next.boundary_gnss_ns_at_edge = 0;
+  alpha_ocxo_edge_fact_t projected_next =
+      alpha_ocxo_project_static_next_edge(edge0, latest_actual_interval_cycles);
 
   if (!alpha_ocxo_pps_projection_build(
           clock, ALPHA_OCXO_PPS_PROJECTION_SOURCE_STATIC_NEXT_EDGE,
-          h->current, projected_next, latest_actual_interval_cycles,
+          edge0, projected_next, latest_actual_interval_cycles,
           target_delta, pps_sequence, pps_dwt_at_edge, pps_vclock_ns,
           existing_pps_ns, latest_actual_interval_cycles,
-          completed_interval_count, static_prediction_valid)) {
+          completed_interval_count, static_prediction_valid,
+          static_advance_count, raw_target_delta, raw_target_overrun)) {
     alpha_ocxo_pps_projection_set_invalid(
         clock, ALPHA_OCXO_PPS_PROJECTION_INVALID_NO_INTERVAL,
-        pps_sequence, pps_dwt_at_edge, pps_vclock_ns, existing_pps_ns);
+        pps_sequence, pps_dwt_at_edge, pps_vclock_ns, existing_pps_ns,
+        &edge0, &projected_next,
+        latest_actual_interval_cycles, completed_interval_count,
+        static_prediction_valid,
+        raw_target_delta, raw_target_overrun, static_advance_count);
   }
 }
 
