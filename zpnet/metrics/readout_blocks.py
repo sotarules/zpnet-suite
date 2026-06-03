@@ -59,6 +59,10 @@ def _get_pi_clocks_report_dac() -> dict:
     return send_command(machine="TEENSY", subsystem="CLOCKS", command="REPORT_DAC")["payload"]
 
 
+def _get_pi_gnss_report() -> dict:
+    return send_command(machine="PI", subsystem="GNSS", command="REPORT")["payload"]
+
+
 def _get_clocks_baseline() -> dict | None:
     try:
         resp = send_command(machine="PI", subsystem="CLOCKS", command="BASELINE_INFO")
@@ -69,6 +73,166 @@ def _get_clocks_baseline() -> dict | None:
     except Exception:
         pass
     return None
+
+
+
+# ---------------------------------------------------------------------
+# GNSS normalization
+# ---------------------------------------------------------------------
+
+def _merge_missing(dst: dict, src: dict | None) -> dict:
+    if not isinstance(src, dict):
+        return dst
+    for key, value in src.items():
+        if value is not None and dst.get(key) is None:
+            dst[key] = value
+    return dst
+
+
+def _derive_gnss_lock_quality(g: dict) -> str:
+    explicit = g.get("lock_quality")
+    if explicit:
+        return str(explicit).upper()
+
+    freq_mode = str(g.get("freq_mode_name") or "").upper()
+    time_status = str(g.get("time_status") or "").upper()
+    traim = str(g.get("traim") or "").upper()
+    pps_valid = _to_bool(g.get("pps_valid"))
+    pps_active = _to_bool(g.get("pps_active"))
+
+    acc = _to_float(g.get("estimated_accuracy_ns"))
+    timing_err = _to_float(g.get("pps_timing_error_ns"))
+    hdop = _to_float(g.get("hdop"))
+    sats = _to_int(g.get("satellites"))
+
+    fine_lock = freq_mode == "FINE_LOCK"
+    time_locked = time_status in ("LS_FIX", "UTC", "LOCKED", "FIX")
+    traim_ok = traim in ("OK", "", "NONE")
+    pps_ok = (pps_valid is not False) and (pps_active is not False)
+    acc_ok = acc is None or acc <= 50.0
+    timing_ok = timing_err is None or abs(timing_err) <= 100.0
+    hdop_ok = hdop is None or hdop <= 1.5
+    sats_ok = sats is None or sats >= 8
+
+    if fine_lock and time_locked and traim_ok and pps_ok and acc_ok and timing_ok and hdop_ok and sats_ok:
+        return "STRONG"
+    if fine_lock and time_locked:
+        return "STRONG"
+    if fine_lock or time_locked or pps_ok:
+        return "MEDIUM"
+    return "WEAK"
+
+
+def _gnss_from_direct_report() -> dict:
+    try:
+        p = _get_pi_gnss_report()
+    except Exception:
+        return {}
+
+    if not isinstance(p, dict):
+        return {}
+
+    discipline = p.get("discipline", {}) if isinstance(p.get("discipline"), dict) else {}
+    clock = p.get("clock", {}) if isinstance(p.get("clock"), dict) else {}
+    integrity = p.get("integrity", {}) if isinstance(p.get("integrity"), dict) else {}
+    survey = p.get("survey_mode", {}) if isinstance(p.get("survey_mode"), dict) else {}
+    pps = p.get("pps", {}) if isinstance(p.get("pps"), dict) else {}
+
+    return {
+        "lock_quality": p.get("lock_quality"),
+        "pos_mode": integrity.get("pos_mode") or survey.get("receiver_mode"),
+        "freq_mode_name": discipline.get("freq_mode_name"),
+        "satellites": p.get("satellites"),
+        "hdop": p.get("hdop"),
+        "traim": integrity.get("traim"),
+        "latitude_deg": p.get("latitude_deg"),
+        "longitude_deg": p.get("longitude_deg"),
+        "altitude_m": p.get("altitude_m"),
+        "ellipsoid_height_m": p.get("ellipsoid_height_m"),
+        "geoid_sep_m": p.get("geoid_sep_m"),
+        "pps_valid": p.get("pps_valid"),
+        "pps_active": pps.get("active"),
+        "estimated_accuracy_ns": pps.get("estimated_accuracy_ns"),
+        "pps_timing_error_ns": discipline.get("pps_timing_error_ns"),
+        "time_status": clock.get("time_status_name"),
+        "pps_sync": clock.get("pps_sync"),
+        "clock_drift_ppb": clock.get("drift_ppb"),
+        "temperature_c": clock.get("temperature_c"),
+    }
+
+
+def _gnss_from_timebase(r: dict) -> dict:
+    return {
+        "lock_quality": _field(r, "gnss.lock_quality"),
+        "pos_mode": _field(r, "gnss.pos_mode"),
+        "freq_mode_name": _field(r, "gnss.freq_mode_name"),
+        "satellites": _field(r, "gnss.satellites"),
+        "hdop": _field(r, "gnss.hdop"),
+        "traim": _field(r, "gnss.traim"),
+        "latitude_deg": _field(r, "gnss.latitude_deg", "location.latitude_deg"),
+        "longitude_deg": _field(r, "gnss.longitude_deg", "location.longitude_deg"),
+        "altitude_m": _field(r, "environment.gnss_altitude_m", "gnss.altitude_m"),
+        "ellipsoid_height_m": _field(r, "environment.ellipsoid_height_m", "gnss.ellipsoid_height_m"),
+        "geoid_sep_m": _field(r, "environment.geoid_sep_m", "gnss.geoid_sep_m"),
+        "pps_valid": _field(r, "gnss.pps_valid"),
+        "pps_active": _field(r, "gnss.pps_active"),
+        "estimated_accuracy_ns": _field(r, "gnss.estimated_accuracy_ns"),
+        "pps_timing_error_ns": _field(r, "gnss.pps_timing_error_ns"),
+        "time_status": _field(r, "gnss.time_status"),
+        "pps_sync": _field(r, "gnss.pps_sync"),
+        "clock_drift_ppb": _field(r, "gnss.clock_drift_ppb"),
+        "temperature_c": _field(r, "gnss.temperature_c", "environment.gnss_temp_c"),
+    }
+
+
+def _gnss_from_system_snapshot(snapshot: dict) -> dict:
+    if not isinstance(snapshot, dict):
+        return {}
+
+    gnss = snapshot.get("gnss", {}) if isinstance(snapshot.get("gnss"), dict) else {}
+    discipline = gnss.get("discipline", {}) if isinstance(gnss.get("discipline"), dict) else {}
+    clock = gnss.get("clock", {}) if isinstance(gnss.get("clock"), dict) else {}
+    integrity = gnss.get("integrity", {}) if isinstance(gnss.get("integrity"), dict) else {}
+    survey = gnss.get("survey_mode", {}) if isinstance(gnss.get("survey_mode"), dict) else {}
+    pps = gnss.get("pps", {}) if isinstance(gnss.get("pps"), dict) else {}
+
+    return {
+        "lock_quality": gnss.get("lock_quality"),
+        "pos_mode": gnss.get("pos_mode") or integrity.get("pos_mode") or survey.get("receiver_mode"),
+        "freq_mode_name": gnss.get("freq_mode_name") or discipline.get("freq_mode_name"),
+        "satellites": gnss.get("satellites"),
+        "hdop": gnss.get("hdop"),
+        "traim": gnss.get("traim") or integrity.get("traim"),
+        "latitude_deg": gnss.get("latitude_deg"),
+        "longitude_deg": gnss.get("longitude_deg"),
+        "altitude_m": gnss.get("altitude_m"),
+        "ellipsoid_height_m": gnss.get("ellipsoid_height_m"),
+        "geoid_sep_m": gnss.get("geoid_sep_m"),
+        "pps_valid": gnss.get("pps_valid"),
+        "pps_active": pps.get("active"),
+        "estimated_accuracy_ns": gnss.get("estimated_accuracy_ns") or pps.get("estimated_accuracy_ns"),
+        "pps_timing_error_ns": gnss.get("pps_timing_error_ns") or discipline.get("pps_timing_error_ns"),
+        "time_status": gnss.get("time_status") or clock.get("time_status_name"),
+        "pps_sync": gnss.get("pps_sync") or clock.get("pps_sync"),
+        "clock_drift_ppb": gnss.get("clock_drift_ppb") or clock.get("drift_ppb"),
+        "temperature_c": gnss.get("temperature_c") or clock.get("temperature_c"),
+    }
+
+
+def _gnss_status(r: dict | None = None, snapshot: dict | None = None) -> dict:
+    # Priority order:
+    #   1. Direct PI/GNSS report, if available.
+    #   2. Current TIMEBASE record carried by the CLOCKS report.
+    #   3. Consolidated SYSTEM report as a compatibility fallback.
+    g: dict = {}
+    _merge_missing(g, _gnss_from_direct_report())
+    if r is not None:
+        _merge_missing(g, _gnss_from_timebase(r))
+    if snapshot is not None:
+        _merge_missing(g, _gnss_from_system_snapshot(snapshot))
+
+    g["lock_quality"] = _derive_gnss_lock_quality(g)
+    return g
 
 
 # ---------------------------------------------------------------------
@@ -593,7 +757,12 @@ def status_header() -> str:
         net = s.get("network", {}).get("network_status", "?")
         pi_health = s.get("pi", {}).get("health_state", "?")
         teensy_health = s.get("teensy", {}).get("health_state", "?")
-        gnss_lock = s.get("gnss", {}).get("lock_quality", "?")
+        try:
+            clocks_report = _get_pi_clocks_report()
+        except Exception:
+            clocks_report = {}
+        gnss_status = _gnss_status(clocks_report, s)
+        gnss_lock = gnss_status.get("lock_quality", "?")
 
         bat_v = "?"
         power = s.get("power", {})
@@ -1074,16 +1243,14 @@ def clocks_combined_readout() -> list[str]:
         snapshot = _get_system_snapshot()
     except Exception:
         snapshot = {}
-    gnss = snapshot.get("gnss", {})
-    discipline = gnss.get("discipline", {})
-    freq_mode_name = discipline.get("freq_mode_name", "?") if isinstance(discipline, dict) else str(discipline)
-    survey = gnss.get("survey_mode", {})
-    pos_mode = survey.get("receiver_mode", "?") if isinstance(survey, dict) else "?"
-    integrity = gnss.get("integrity", {})
-    traim = integrity.get("traim", "?") if isinstance(integrity, dict) else "?"
-    sats = gnss.get("satellites", "?")
+
+    gnss = _gnss_status(r, snapshot)
+    freq_mode_name = gnss.get("freq_mode_name") or "?"
+    pos_mode = gnss.get("pos_mode") or "?"
+    traim = gnss.get("traim") or "?"
+    sats = gnss.get("satellites") if gnss.get("satellites") is not None else "?"
     hdop = gnss.get("hdop")
-    hdop_str = f"{hdop:.2f}" if hdop is not None else "---"
+    hdop_str = f"{float(hdop):.2f}" if hdop is not None else "---"
     lat = gnss.get("latitude_deg")
     lon = gnss.get("longitude_deg")
     alt_gnss = gnss.get("altitude_m")
@@ -1098,14 +1265,14 @@ def clocks_combined_readout() -> list[str]:
     )
     pos_parts = []
     if lat is not None and lon is not None:
-        pos_parts.append(f"LAT: {lat:.6f}")
-        pos_parts.append(f"LON: {lon:.6f}")
+        pos_parts.append(f"LAT: {float(lat):.6f}")
+        pos_parts.append(f"LON: {float(lon):.6f}")
     if alt_gnss is not None:
-        pos_parts.append(f"ALT(MSL): {alt_gnss:.1f}m")
+        pos_parts.append(f"ALT(MSL): {float(alt_gnss):.1f}m")
     if ellipsoid is not None:
-        pos_parts.append(f"ELLIP: {ellipsoid:.1f}m")
+        pos_parts.append(f"ELLIP: {float(ellipsoid):.1f}m")
     if geoid is not None:
-        pos_parts.append(f"GEOID: {geoid:.1f}m")
+        pos_parts.append(f"GEOID: {float(geoid):.1f}m")
     if pos_parts:
         gnss_line += "  " + "  ".join(pos_parts)
     lines.append(gnss_line)

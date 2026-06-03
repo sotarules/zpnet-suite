@@ -1596,6 +1596,13 @@ struct servo_input_diag_t {
   double   total_ppb = 0.0;
   bool     total_input_valid = false;
 
+  double   total_catchup_target_now_ppb = 0.0;
+  double   total_catchup_control_error_ppb = 0.0;
+  double   total_catchup_elapsed_seconds = 0.0;
+  double   total_catchup_horizon_seconds = 0.0;
+  double   total_catchup_max_target_ppb = 0.0;
+  bool     total_catchup_active = false;
+
   double   now_ppb = 0.0;
   bool     now_input_valid = false;
 
@@ -1633,6 +1640,12 @@ static void payload_add_servo_input_diag(Payload& lane,
   input.add("total_tau", d.total_tau, 12);
   input.add("total_ppb", d.total_ppb, 6);
   input.add("total_input_valid", d.total_input_valid);
+  input.add("total_catchup_active", d.total_catchup_active);
+  input.add("total_catchup_target_now_ppb", d.total_catchup_target_now_ppb, 6);
+  input.add("total_catchup_control_error_ppb", d.total_catchup_control_error_ppb, 6);
+  input.add("total_catchup_elapsed_seconds", d.total_catchup_elapsed_seconds, 3);
+  input.add("total_catchup_horizon_seconds", d.total_catchup_horizon_seconds, 3);
+  input.add("total_catchup_max_target_ppb", d.total_catchup_max_target_ppb, 3);
   input.add("now_ppb", d.now_ppb, 6);
   input.add("now_input_valid", d.now_input_valid);
   lane.add_object("servo_input", input);
@@ -1964,8 +1977,25 @@ static constexpr double SERVO_MIN_STEP_LSB = 1.0;
 static constexpr double SERVO_MEAN_FILTER_ALPHA = 0.35;
 static constexpr double SERVO_MEAN_GAIN = 1.00;
 
-static constexpr double SERVO_TOTAL_FILTER_ALPHA = 0.60;
-static constexpr double SERVO_TOTAL_GAIN = 2.00;
+static constexpr double SERVO_TOTAL_FILTER_ALPHA = 0.45;
+static constexpr double SERVO_TOTAL_GAIN = 0.75;
+static constexpr double SERVO_TOTAL_DEADBAND_PPB = 1.0;
+
+// TOTAL mode is the long-haul science servo, but pure campaign-total tau is
+// slow to correct because early accumulated error remains in the denominator.
+// Shape TOTAL into a catch-up controller: compute the instantaneous ppb we
+// want the OCXO to run at so the campaign-total error burns down over a fixed
+// horizon, then servo the latest PPS residual toward that moving target.
+//
+// Example:
+//   total_ppb = -80 at t=900s, horizon=120s
+//   desired_now_ppb = +600 ppb (clamped)
+//   control_error = now_ppb - desired_now_ppb
+//
+// Negative control_error raises DAC and speeds the OCXO; as total_ppb approaches
+// zero the desired_now target collapses naturally toward zero.
+static constexpr double SERVO_TOTAL_CATCHUP_HORIZON_SECONDS = 120.0;
+static constexpr double SERVO_TOTAL_CATCHUP_MAX_TARGET_PPB = 700.0;
 
 // NOW mode is deliberately immediate: no settle gate, no slope averaging, and
 // a small deadband.  It is a live plant-response/test mode that chases the
@@ -1982,6 +2012,22 @@ static double servo_total_tau_from_public(uint64_t public_gnss_ns,
 
 static double servo_total_ppb_from_tau(double tau) {
   return (tau - 1.0) * 1.0e9;
+}
+
+static double servo_clamp(double value, double limit) {
+  if (value > limit) return limit;
+  if (value < -limit) return -limit;
+  return value;
+}
+
+static double servo_total_catchup_target_now_ppb(double total_ppb,
+                                                 uint64_t elapsed_seconds) {
+  if (elapsed_seconds == 0) return 0.0;
+
+  const double elapsed = (double)elapsed_seconds;
+  const double target =
+      -total_ppb * (elapsed / SERVO_TOTAL_CATCHUP_HORIZON_SECONDS);
+  return servo_clamp(target, SERVO_TOTAL_CATCHUP_MAX_TARGET_PPB);
 }
 
 static void servo_input_diag_update(servo_input_diag_t& d,
@@ -2012,6 +2058,23 @@ static void servo_input_diag_update(servo_input_diag_t& d,
   d.now_ppb = pps_residual_valid ? (double)pps_fast_residual_ns : 0.0;
   d.now_input_valid = pps_residual_valid;
 
+  d.total_catchup_elapsed_seconds = (double)campaign_seconds;
+  d.total_catchup_horizon_seconds = SERVO_TOTAL_CATCHUP_HORIZON_SECONDS;
+  d.total_catchup_max_target_ppb = SERVO_TOTAL_CATCHUP_MAX_TARGET_PPB;
+  d.total_catchup_target_now_ppb = 0.0;
+  d.total_catchup_control_error_ppb = 0.0;
+  d.total_catchup_active = false;
+
+  if (d.total_input_valid && d.now_input_valid) {
+    d.total_catchup_target_now_ppb =
+        servo_total_catchup_target_now_ppb(d.total_ppb, campaign_seconds);
+    d.total_catchup_control_error_ppb =
+        d.now_ppb - d.total_catchup_target_now_ppb;
+    d.total_catchup_active = true;
+  } else {
+    d.total_catchup_control_error_ppb = d.total_ppb;
+  }
+
   d.selected_residual_ns = 0;
   if (calibrate_ocxo_mode == servo_mode_t::MEAN) {
     d.selected_source = SERVO_INPUT_SOURCE_MEAN_PPS_RESIDUAL_WELFORD;
@@ -2021,7 +2084,9 @@ static void servo_input_diag_update(servo_input_diag_t& d,
   } else if (calibrate_ocxo_mode == servo_mode_t::TOTAL) {
     d.selected_source = SERVO_INPUT_SOURCE_TOTAL_PUBLIC_TAU;
     d.selected_input_valid = d.total_input_valid;
-    d.selected_input_ppb = d.total_input_valid ? d.total_ppb : 0.0;
+    d.selected_input_ppb = d.total_input_valid
+        ? d.total_catchup_control_error_ppb
+        : 0.0;
     d.selected_residual_ns = (int64_t)d.selected_input_ppb;
   } else if (calibrate_ocxo_mode == servo_mode_t::NOW) {
     d.selected_source = SERVO_INPUT_SOURCE_NOW_PPS_RESIDUAL;
@@ -2312,11 +2377,22 @@ static void ocxo_servo_total(ocxo_dac_state_t& dac,
                              const servo_input_diag_t& input) {
   if (!input.total_input_valid) return;
 
-  dac.servo_settle_count++;
-  if (dac.servo_settle_count < SERVO_SETTLE_SECONDS) return;
-
-  ocxo_servo_slope(dac, input, SERVO_TOTAL_FILTER_ALPHA, SERVO_TOTAL_GAIN);
+  // TOTAL now runs every second.  The selected ppb has already been shaped into
+  // a catch-up control error:
+  //
+  //   selected_ppb = now_ppb - desired_now_ppb
+  //
+  // where desired_now_ppb is the instantaneous rate needed to burn down the
+  // campaign-total error over SERVO_TOTAL_CATCHUP_HORIZON_SECONDS.  This makes
+  // TOTAL aggressive when the accumulated error is large, while naturally
+  // flattening as the total error approaches zero.
   dac.servo_settle_count = 0;
+  ocxo_servo_slope(dac,
+                   input,
+                   SERVO_TOTAL_FILTER_ALPHA,
+                   SERVO_TOTAL_GAIN,
+                   SERVO_TOTAL_DEADBAND_PPB,
+                   true);
 }
 
 static void ocxo_servo_now(ocxo_dac_state_t& dac,
