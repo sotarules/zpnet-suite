@@ -1410,6 +1410,83 @@ static void payload_add_lane_regression_object(Payload& parent,
   parent.add_object("regression", regression);
 }
 
+// ============================================================================
+// OCXO cycle-domain residual diagnostic
+// ============================================================================
+//
+// Courtroom-only diagnostic for the current OCXO normalization investigation.
+// The authoritative OCXO residual remains the PPS-founded public nanosecond
+// residual.  Welfords, tau, and servo input continue to consume only that
+// traditional surface.
+//
+// This object compares the GNSS/PPS one-second DWT interval and each OCXO
+// one-second DWT interval in the same Teensy DWT coordinate species.  If the
+// nanosecond-domain residual and this same-yardstick cycle residual diverge in
+// common mode, the residual path is leaking DWT normalization error.
+//
+// Sign convention is aligned with pps_residual.fast_residual_ns:
+//   positive diagnostic_fast_residual_cycles => OCXO running fast.
+//
+// Since a fast OCXO produces a shorter OCXO one-second period in DWT cycles,
+// the sign-aligned diagnostic is:
+//
+//   diagnostic_fast_residual_cycles = gnss_actual_cycles - ocxo_actual_cycles
+//
+// The raw Dave-subtraction is also published as clock_minus_gnss_actual_cycles.
+
+struct ocxo_cycle_residual_diag_t {
+  bool     valid = false;
+  bool     traditional_valid = false;
+
+  uint32_t gnss_prediction_cycles = 0;
+  uint32_t clock_prediction_cycles = 0;
+  int64_t  prediction_fast_residual_cycles = 0;
+  int64_t  clock_minus_gnss_prediction_cycles = 0;
+
+  uint32_t gnss_actual_cycles = 0;
+  uint32_t clock_actual_cycles = 0;
+  int64_t  diagnostic_fast_residual_cycles = 0;
+  int64_t  clock_minus_gnss_actual_cycles = 0;
+
+  int64_t  traditional_fast_residual_ns = 0;
+  int64_t  diagnostic_minus_traditional = 0;
+};
+
+static ocxo_cycle_residual_diag_t ocxo_cycle_residual_diag_build(
+    const clocks_static_prediction_snapshot_t& gnss,
+    const clocks_static_prediction_snapshot_t& clock,
+    bool traditional_valid,
+    int64_t traditional_fast_residual_ns) {
+  ocxo_cycle_residual_diag_t d{};
+
+  d.valid = gnss.valid && clock.valid &&
+      gnss.actual_cycles != 0U && clock.actual_cycles != 0U;
+  d.traditional_valid = traditional_valid;
+
+  d.gnss_prediction_cycles = gnss.static_prediction_cycles;
+  d.clock_prediction_cycles = clock.static_prediction_cycles;
+  d.prediction_fast_residual_cycles =
+      (int64_t)gnss.static_prediction_cycles -
+      (int64_t)clock.static_prediction_cycles;
+  d.clock_minus_gnss_prediction_cycles =
+      (int64_t)clock.static_prediction_cycles -
+      (int64_t)gnss.static_prediction_cycles;
+
+  d.gnss_actual_cycles = gnss.actual_cycles;
+  d.clock_actual_cycles = clock.actual_cycles;
+  d.diagnostic_fast_residual_cycles =
+      (int64_t)gnss.actual_cycles - (int64_t)clock.actual_cycles;
+  d.clock_minus_gnss_actual_cycles =
+      (int64_t)clock.actual_cycles - (int64_t)gnss.actual_cycles;
+
+  d.traditional_fast_residual_ns =
+      traditional_valid ? traditional_fast_residual_ns : 0LL;
+  d.diagnostic_minus_traditional =
+      traditional_valid ? (d.diagnostic_fast_residual_cycles -
+                           traditional_fast_residual_ns) : 0LL;
+  return d;
+}
+
 static void payload_add_ocxo_pps_residual_object(Payload& parent,
                                                 bool valid,
                                                 uint64_t gnss_interval_ns,
@@ -1422,6 +1499,41 @@ static void payload_add_ocxo_pps_residual_object(Payload& parent,
   residual.add("fast_residual_ns", valid ? fast_residual_ns : 0LL);
   residual.add("positive_means", "clock_fast");
   parent.add_object("pps_residual", residual);
+}
+
+static void payload_add_ocxo_cycle_residual_diag_object(
+    Payload& parent,
+    const ocxo_cycle_residual_diag_t& d) {
+  Payload diag;
+
+  diag.add("valid", d.valid);
+  diag.add("diagnostic_only", true);
+  diag.add("doctrine", "DWT_SAME_YARDSTICK_RESIDUAL_CHECK");
+  diag.add("positive_means", "clock_fast");
+  diag.add("welford_source", false);
+  diag.add("servo_source", false);
+
+  diag.add("gnss_prediction_cycles", d.gnss_prediction_cycles);
+  diag.add("clock_prediction_cycles", d.clock_prediction_cycles);
+  diag.add("prediction_fast_residual_cycles",
+           d.prediction_fast_residual_cycles);
+  diag.add("clock_minus_gnss_prediction_cycles",
+           d.clock_minus_gnss_prediction_cycles);
+
+  diag.add("gnss_actual_cycles", d.gnss_actual_cycles);
+  diag.add("clock_actual_cycles", d.clock_actual_cycles);
+  diag.add("diagnostic_fast_residual_cycles",
+           d.diagnostic_fast_residual_cycles);
+  diag.add("clock_minus_gnss_actual_cycles",
+           d.clock_minus_gnss_actual_cycles);
+
+  diag.add("traditional_residual_valid", d.traditional_valid);
+  diag.add("traditional_fast_residual_ns",
+           d.traditional_fast_residual_ns);
+  diag.add("diagnostic_minus_traditional",
+           d.diagnostic_minus_traditional);
+
+  parent.add_object("cycle_residual_diagnostic", diag);
 }
 
 static void payload_add_timebase_pair_identity(Payload& p,
@@ -1527,7 +1639,8 @@ static void payload_add_ocxo_forensics(Payload& p,
                                        bool pps_residual_valid,
                                        uint64_t pps_gnss_interval_ns,
                                        uint64_t pps_clock_interval_ns,
-                                       int64_t pps_fast_residual_ns) {
+                                       int64_t pps_fast_residual_ns,
+                                       const ocxo_cycle_residual_diag_t& cycle_diag) {
   (void)clock;
   (void)meas;
   (void)public_pps_projected_ns;
@@ -1552,6 +1665,8 @@ static void payload_add_ocxo_forensics(Payload& p,
                                        pps_gnss_interval_ns,
                                        pps_clock_interval_ns,
                                        pps_fast_residual_ns);
+
+  payload_add_ocxo_cycle_residual_diag_object(lane, cycle_diag);
 
   payload_add_lane_forensics_object(lane, forensics_valid, f);
   payload_add_ocxo_service_object(lane, forensics_valid, f);
@@ -2765,6 +2880,26 @@ void clocks_beta_pps(void) {
                                     ocxo1_pps_projected_valid,
                                     ocxo2_pps_projected_valid);
 
+  // ── Cycle-domain residual diagnostics ──
+  //
+  // These are forensic-only.  They deliberately do not feed Welford, tau, or
+  // servo control.  They compare each OCXO one-second DWT interval against the
+  // GNSS/PPS one-second DWT interval using the same moving Teensy yardstick.
+  const clocks_static_prediction_snapshot_t pps_cycle_prediction =
+      prediction_snapshot_for_pps();
+  const clocks_static_prediction_snapshot_t ocxo1_cycle_prediction =
+      prediction_snapshot_for_clock(time_clock_id_t::OCXO1);
+  const clocks_static_prediction_snapshot_t ocxo2_cycle_prediction =
+      prediction_snapshot_for_clock(time_clock_id_t::OCXO2);
+  const ocxo_cycle_residual_diag_t ocxo1_cycle_residual_diag =
+      ocxo_cycle_residual_diag_build(pps_cycle_prediction, ocxo1_cycle_prediction,
+                                     pps_residuals.ocxo1_valid,
+                                     pps_residuals.ocxo1_fast_residual_ns);
+  const ocxo_cycle_residual_diag_t ocxo2_cycle_residual_diag =
+      ocxo_cycle_residual_diag_build(pps_cycle_prediction, ocxo2_cycle_prediction,
+                                     pps_residuals.ocxo2_valid,
+                                     pps_residuals.ocxo2_fast_residual_ns);
+
   // VCLOCK measurement Welford — bridge-interpolation self-test.
   // Sample in ns; mean == ppb under the "ns/sec == ppb" identity.
   if (g_vclock_measurement.gnss_ns_between_edges != 0) {
@@ -2999,7 +3134,8 @@ void clocks_beta_pps(void) {
                                pps_residuals.ocxo1_valid,
                                pps_residuals.gnss_interval_ns,
                                pps_residuals.ocxo1_interval_ns,
-                               pps_residuals.ocxo1_fast_residual_ns);
+                               pps_residuals.ocxo1_fast_residual_ns,
+                               ocxo1_cycle_residual_diag);
 
     timebase_build_stage(TIMEBASE_BUILD_STAGE_OCXO2);
     payload_add_ocxo_forensics(f,
@@ -3016,7 +3152,8 @@ void clocks_beta_pps(void) {
                                pps_residuals.ocxo2_valid,
                                pps_residuals.gnss_interval_ns,
                                pps_residuals.ocxo2_interval_ns,
-                               pps_residuals.ocxo2_fast_residual_ns);
+                               pps_residuals.ocxo2_fast_residual_ns,
+                               ocxo2_cycle_residual_diag);
 
     g_timebase_forensics_build_complete_count++;
     g_timebase_last_forensics_build_complete_campaign_seconds = campaign_seconds;
