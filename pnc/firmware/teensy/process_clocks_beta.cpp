@@ -1656,21 +1656,63 @@ static void payload_add_dac_summary_hierarchical(Payload& p) {
 }
 
 // ============================================================================
-// Always-on OCXO DAC sigma-delta realization
+// Always-on OCXO DAC SyncDAC realization
 // ============================================================================
+//
+// SyncDAC runs a fixed 1 kHz virtual timing grid but does not write the DAC at
+// 1 kHz.  Each one-second frame is divided into ten 100 ms cells.  The desired
+// fractional DAC code selects the total HIGH dwell time in milliseconds for
+// that frame; the dwell time is then distributed across the ten cells with a
+// small Bresenham-style remainder spread.  Within each cell, the output holds
+// one adjacent code for part of the cell and the other adjacent code for the
+// remainder.  I2C writes occur only at LOW/HIGH state boundaries and are capped
+// to keep the shared SMBus topology safe.
+//
+// Example: desired 59745.763 -> LOW=59745, HIGH=59746.
+//   HIGH dwell = 763 ms/sec, LOW dwell = 237 ms/sec.
+//   Cells receive either 76 or 77 ms of HIGH dwell so the full second realizes
+//   59745.763 while using sparse DAC state changes.
 
-static constexpr uint32_t OCXO_DAC_DITHER_DEFAULT_RATE_HZ = 100U;
-static constexpr uint32_t OCXO_DAC_DITHER_MIN_RATE_HZ = 1U;
-static constexpr uint32_t OCXO_DAC_DITHER_MAX_RATE_HZ = 1000U;
-static constexpr uint32_t OCXO_DAC_DITHER_NS_PER_SECOND = 1000000000UL;
-static constexpr const char* OCXO_DAC_DITHER_NAME = "OCXO_DAC_DITHER";
+static constexpr uint32_t OCXO_DAC_SYNCDAC_EXECUTION_HZ = 1000U;
+static constexpr uint32_t OCXO_DAC_SYNCDAC_PERIOD_NS = 1000000U;
+static constexpr uint32_t OCXO_DAC_SYNCDAC_FRAME_TICKS = 1000U;
+static constexpr uint32_t OCXO_DAC_SYNCDAC_CELL_COUNT = 10U;
+static constexpr uint32_t OCXO_DAC_SYNCDAC_CELL_TICKS =
+    OCXO_DAC_SYNCDAC_FRAME_TICKS / OCXO_DAC_SYNCDAC_CELL_COUNT;
+static constexpr uint32_t OCXO_DAC_SYNCDAC_MAX_WRITES_PER_FRAME = 20U;
+static constexpr const char* OCXO_DAC_SYNCDAC_NAME = "OCXO_DAC_SYNCDAC_1KHZ";
+static constexpr const char* OCXO_DAC_REALIZATION_MODE = "SYNCDAC";
+
+static_assert(OCXO_DAC_SYNCDAC_EXECUTION_HZ == 1000U,
+              "SyncDAC execution grid is fixed at 1 kHz");
+static_assert(OCXO_DAC_SYNCDAC_CELL_COUNT * OCXO_DAC_SYNCDAC_CELL_TICKS ==
+              OCXO_DAC_SYNCDAC_FRAME_TICKS,
+              "SyncDAC cells must fill exactly one second");
 
 static timepop_handle_t g_ocxo_dac_dither_handle = TIMEPOP_INVALID_HANDLE;
-static uint32_t g_ocxo_dac_dither_rate_hz = OCXO_DAC_DITHER_DEFAULT_RATE_HZ;
-static uint32_t g_ocxo_dac_dither_period_ns =
-    OCXO_DAC_DITHER_NS_PER_SECOND / OCXO_DAC_DITHER_DEFAULT_RATE_HZ;
 static uint32_t g_ocxo_dac_dither_arm_count = 0;
 static uint32_t g_ocxo_dac_dither_arm_fail_count = 0;
+
+static uint32_t ocxo_dac_syncdac_high_ms_from_fraction(uint32_t frac_q16) {
+  if (frac_q16 == 0U) return 0U;
+  const uint32_t high_ms =
+      (uint32_t)(((uint64_t)frac_q16 * (uint64_t)OCXO_DAC_SYNCDAC_FRAME_TICKS +
+                  32768ULL) >> 16);
+  return (high_ms > OCXO_DAC_SYNCDAC_FRAME_TICKS)
+      ? OCXO_DAC_SYNCDAC_FRAME_TICKS
+      : high_ms;
+}
+
+static uint32_t ocxo_dac_syncdac_cell_high_ms(uint32_t total_high_ms,
+                                              uint32_t cell_index) {
+  const uint32_t base = total_high_ms / OCXO_DAC_SYNCDAC_CELL_COUNT;
+  const uint32_t rem  = total_high_ms % OCXO_DAC_SYNCDAC_CELL_COUNT;
+  const uint32_t extra_before = (cell_index * rem) / OCXO_DAC_SYNCDAC_CELL_COUNT;
+  const uint32_t extra_after  = ((cell_index + 1U) * rem) / OCXO_DAC_SYNCDAC_CELL_COUNT;
+  const uint32_t extra = extra_after - extra_before;
+  const uint32_t high = base + extra;
+  return (high > OCXO_DAC_SYNCDAC_CELL_TICKS) ? OCXO_DAC_SYNCDAC_CELL_TICKS : high;
+}
 
 static double ocxo_dac_last_window_average(const ocxo_dac_state_t& s) {
   const uint32_t ticks = s.dither_last_window_tick_count;
@@ -1684,25 +1726,40 @@ static void payload_add_dac_dither_object(Payload& parent,
                                           const ocxo_dac_state_t& s) {
   Payload d;
   d.add("enabled", s.dither_enabled);
-  d.add("rate_hz", s.dither_rate_hz);
-  d.add("period_ns", s.dither_period_ns);
-  d.add("effective_window_ticks", s.dither_effective_window_ticks);
+  d.add("mode", OCXO_DAC_REALIZATION_MODE);
+  d.add("execution_hz", OCXO_DAC_SYNCDAC_EXECUTION_HZ);
+  d.add("rate_hz", OCXO_DAC_SYNCDAC_EXECUTION_HZ);  // compatibility alias
+  d.add("period_ns", OCXO_DAC_SYNCDAC_PERIOD_NS);
+  d.add("grid_hz", OCXO_DAC_SYNCDAC_EXECUTION_HZ);
+  d.add("frame_ticks", OCXO_DAC_SYNCDAC_FRAME_TICKS);
+  d.add("cell_count", OCXO_DAC_SYNCDAC_CELL_COUNT);
+  d.add("cell_ticks", OCXO_DAC_SYNCDAC_CELL_TICKS);
+  d.add("max_writes_per_frame", OCXO_DAC_SYNCDAC_MAX_WRITES_PER_FRAME);
   d.add("desired_q16", s.dac_desired_q16);
   d.add("desired", s.dac_fractional, 6);
   d.add("hw_code", (uint32_t)s.dac_hw_code);
   d.add("low_code", (uint32_t)s.dither_low_code);
   d.add("high_code", (uint32_t)s.dither_high_code);
   d.add("fraction_q16", s.dither_fraction_q16);
-  d.add("accumulator_q16", s.dither_accumulator_q16);
   d.add("last_selected_hw_code", (uint32_t)s.dither_last_selected_hw_code);
+
+  d.add("frame_tick", s.syncdac_frame_tick);
+  d.add("cell_index", s.syncdac_cell_index);
+  d.add("cell_tick", s.syncdac_cell_tick);
+  d.add("high_ms_per_second", s.syncdac_high_ms_per_second);
+  d.add("low_ms_per_second", s.syncdac_low_ms_per_second);
+  d.add("high_ms_this_cell", s.syncdac_high_ms_this_cell);
+  d.add("low_ms_this_cell", s.syncdac_low_ms_this_cell);
 
   d.add("window_sequence", s.dither_window_sequence);
   d.add("window_tick_count", s.dither_window_tick_count);
-  d.add("window_low_count", s.dither_window_low_count);
-  d.add("window_high_count", s.dither_window_high_count);
+  d.add("window_low_ms", s.dither_window_low_count);
+  d.add("window_high_ms", s.dither_window_high_count);
   d.add("last_window_tick_count", s.dither_last_window_tick_count);
-  d.add("last_window_low_count", s.dither_last_window_low_count);
-  d.add("last_window_high_count", s.dither_last_window_high_count);
+  d.add("last_window_low_ms", s.dither_last_window_low_count);
+  d.add("last_window_high_ms", s.dither_last_window_high_count);
+  d.add("last_window_low_count", s.dither_last_window_low_count);    // compatibility alias
+  d.add("last_window_high_count", s.dither_last_window_high_count);  // compatibility alias
   d.add("last_window_low_code", (uint32_t)s.dither_last_window_low_code);
   d.add("last_window_high_code", (uint32_t)s.dither_last_window_high_code);
   d.add("last_window_average", ocxo_dac_last_window_average(s), 6);
@@ -1713,6 +1770,15 @@ static void payload_add_dac_dither_object(Payload& parent,
   d.add("write_failures", s.dither_write_failures);
   d.add("write_skip_same_code_count", s.dither_write_skip_same_code_count);
   d.add("not_ready_count", s.dither_not_ready_count);
+  d.add("writes_this_frame", s.syncdac_write_attempts_this_frame);
+  d.add("write_successes_this_frame", s.syncdac_write_successes_this_frame);
+  d.add("write_failures_this_frame", s.syncdac_write_failures_this_frame);
+  d.add("write_suppressed_this_frame", s.syncdac_write_suppressed_this_frame);
+  d.add("last_window_write_attempts", s.syncdac_last_window_write_attempts);
+  d.add("last_window_write_successes", s.syncdac_last_window_write_successes);
+  d.add("last_window_write_failures", s.syncdac_last_window_write_failures);
+  d.add("last_window_write_suppressed", s.syncdac_last_window_write_suppressed);
+  d.add("write_budget_suppressed_total", s.syncdac_write_budget_suppressed_total);
   parent.add_object(key, d);
 }
 
@@ -1722,16 +1788,22 @@ static void ocxo_dac_dither_roll_window(ocxo_dac_state_t& s) {
   s.dither_last_window_high_count = s.dither_window_high_count;
   s.dither_last_window_low_code = s.dither_low_code;
   s.dither_last_window_high_code = s.dither_high_code;
+  s.syncdac_last_window_write_attempts = s.syncdac_write_attempts_this_frame;
+  s.syncdac_last_window_write_successes = s.syncdac_write_successes_this_frame;
+  s.syncdac_last_window_write_failures = s.syncdac_write_failures_this_frame;
+  s.syncdac_last_window_write_suppressed = s.syncdac_write_suppressed_this_frame;
 
   s.dither_window_sequence++;
   s.dither_window_tick_count = 0;
   s.dither_window_low_count = 0;
   s.dither_window_high_count = 0;
+  s.syncdac_write_attempts_this_frame = 0;
+  s.syncdac_write_successes_this_frame = 0;
+  s.syncdac_write_failures_this_frame = 0;
+  s.syncdac_write_suppressed_this_frame = 0;
 }
 
-static void ocxo_dac_dither_apply(ocxo_dac_state_t& s) {
-  if (!s.dither_enabled) return;
-
+static void ocxo_dac_syncdac_refresh_codes(ocxo_dac_state_t& s) {
   const uint32_t desired_q16 = s.dac_desired_q16;
   const uint16_t low = (uint16_t)(desired_q16 >> 16);
   const uint32_t frac = desired_q16 & 0xFFFFUL;
@@ -1739,50 +1811,102 @@ static void ocxo_dac_dither_apply(ocxo_dac_state_t& s) {
       ? low
       : (uint16_t)(low + 1U);
 
-  if (low != s.dither_low_code || high != s.dither_high_code) {
-    s.dither_low_code = low;
-    s.dither_high_code = high;
-    s.dither_accumulator_q16 = 0;
-  }
   s.dither_fraction_q16 = frac;
+  s.dither_low_code = low;
+  s.dither_high_code = high;
+  s.dither_accumulator_q16 = 0;
+  s.syncdac_high_ms_per_second = ocxo_dac_syncdac_high_ms_from_fraction(frac);
+  s.syncdac_low_ms_per_second =
+      OCXO_DAC_SYNCDAC_FRAME_TICKS - s.syncdac_high_ms_per_second;
+}
 
-  uint16_t selected = low;
-  if (high != low && frac != 0U) {
-    s.dither_accumulator_q16 += frac;
-    if (s.dither_accumulator_q16 >= 0x10000UL) {
-      selected = high;
-      s.dither_accumulator_q16 -= 0x10000UL;
-    }
-  } else {
-    s.dither_accumulator_q16 = 0;
+static uint16_t ocxo_dac_syncdac_selected_code(ocxo_dac_state_t& s) {
+  const uint32_t cell = s.syncdac_frame_tick / OCXO_DAC_SYNCDAC_CELL_TICKS;
+  const uint32_t pos  = s.syncdac_frame_tick % OCXO_DAC_SYNCDAC_CELL_TICKS;
+  const uint32_t high_ms = ocxo_dac_syncdac_cell_high_ms(
+      s.syncdac_high_ms_per_second, cell);
+  const uint32_t low_ms = OCXO_DAC_SYNCDAC_CELL_TICKS - high_ms;
+
+  s.syncdac_cell_index = cell;
+  s.syncdac_cell_tick = pos;
+  s.syncdac_high_ms_this_cell = high_ms;
+  s.syncdac_low_ms_this_cell = low_ms;
+
+  if (s.dither_high_code == s.dither_low_code || high_ms == 0U) {
+    return s.dither_low_code;
+  }
+  if (high_ms >= OCXO_DAC_SYNCDAC_CELL_TICKS) {
+    return s.dither_high_code;
   }
 
-  s.dither_tick_count_total++;
-  s.dither_window_tick_count++;
-  if (selected == high && high != low) {
-    s.dither_window_high_count++;
-  } else {
-    s.dither_window_low_count++;
+  // Alternate the order so cell boundaries usually preserve the previous code.
+  // This avoids a large phase-oriented one-second block and also reduces bus
+  // traffic while preserving the exact per-cell dwell ratio.
+  const bool high_first = ((cell & 1U) != 0U);
+  if (high_first) {
+    return (pos < high_ms) ? s.dither_high_code : s.dither_low_code;
   }
+  return (pos < low_ms) ? s.dither_low_code : s.dither_high_code;
+}
+
+static void ocxo_dac_syncdac_write_selected(ocxo_dac_state_t& s,
+                                            uint16_t selected) {
   s.dither_last_selected_hw_code = selected;
 
   if (!g_ad5693r_init_ok) {
     s.dither_not_ready_count++;
-  } else if (selected == s.dac_hw_code) {
-    s.dither_write_skip_same_code_count++;
-  } else {
-    s.dither_write_attempts++;
-    if (ocxo_dac_write_hw_code(s, selected, false)) {
-      s.dither_write_successes++;
-    } else {
-      // Dither writes are opportunistic.  Occasional I2C failures are evidence,
-      // not campaign-fatal faults; the next tick will try again if still needed.
-      s.dither_write_failures++;
-    }
+    return;
   }
 
-  const uint32_t window_ticks = s.dither_effective_window_ticks ? s.dither_effective_window_ticks : 1U;
-  if (s.dither_window_tick_count >= window_ticks) {
+  if (selected == s.dac_hw_code) {
+    s.dither_write_skip_same_code_count++;
+    return;
+  }
+
+  if (s.syncdac_write_attempts_this_frame >=
+      OCXO_DAC_SYNCDAC_MAX_WRITES_PER_FRAME) {
+    s.syncdac_write_suppressed_this_frame++;
+    s.syncdac_write_budget_suppressed_total++;
+    return;
+  }
+
+  s.syncdac_write_attempts_this_frame++;
+  s.dither_write_attempts++;
+  if (ocxo_dac_write_hw_code(s, selected, false)) {
+    s.syncdac_write_successes_this_frame++;
+    s.dither_write_successes++;
+  } else {
+    // SyncDAC writes are opportunistic.  Occasional I2C failures are evidence,
+    // not campaign-fatal faults; the next scheduled edge will try again if
+    // still needed and within the frame write budget.
+    s.syncdac_write_failures_this_frame++;
+    s.dither_write_failures++;
+  }
+}
+
+static void ocxo_dac_dither_apply(ocxo_dac_state_t& s) {
+  if (!s.dither_enabled) return;
+
+  s.dither_rate_hz = OCXO_DAC_SYNCDAC_EXECUTION_HZ;
+  s.dither_period_ns = OCXO_DAC_SYNCDAC_PERIOD_NS;
+  s.dither_effective_window_ticks = OCXO_DAC_SYNCDAC_FRAME_TICKS;
+
+  ocxo_dac_syncdac_refresh_codes(s);
+  const uint16_t selected = ocxo_dac_syncdac_selected_code(s);
+
+  s.dither_tick_count_total++;
+  s.dither_window_tick_count++;
+  if (selected == s.dither_high_code && s.dither_high_code != s.dither_low_code) {
+    s.dither_window_high_count++;
+  } else {
+    s.dither_window_low_count++;
+  }
+
+  ocxo_dac_syncdac_write_selected(s, selected);
+
+  s.syncdac_frame_tick++;
+  if (s.syncdac_frame_tick >= OCXO_DAC_SYNCDAC_FRAME_TICKS) {
+    s.syncdac_frame_tick = 0;
     ocxo_dac_dither_roll_window(s);
   }
 }
@@ -1792,54 +1916,26 @@ static void ocxo_dac_dither_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
   ocxo_dac_dither_apply(ocxo2_dac);
 }
 
-static void ocxo_dac_dither_apply_rate_to_lane(ocxo_dac_state_t& s) {
-  s.dither_rate_hz = g_ocxo_dac_dither_rate_hz;
-  s.dither_period_ns = g_ocxo_dac_dither_period_ns;
-  s.dither_effective_window_ticks = g_ocxo_dac_dither_rate_hz;
-}
+void clocks_dac_dither_begin(void) {
+  if (g_ocxo_dac_dither_handle != TIMEPOP_INVALID_HANDLE) return;
+  ocxo1_dac.dither_rate_hz = OCXO_DAC_SYNCDAC_EXECUTION_HZ;
+  ocxo1_dac.dither_period_ns = OCXO_DAC_SYNCDAC_PERIOD_NS;
+  ocxo1_dac.dither_effective_window_ticks = OCXO_DAC_SYNCDAC_FRAME_TICKS;
+  ocxo2_dac.dither_rate_hz = OCXO_DAC_SYNCDAC_EXECUTION_HZ;
+  ocxo2_dac.dither_period_ns = OCXO_DAC_SYNCDAC_PERIOD_NS;
+  ocxo2_dac.dither_effective_window_ticks = OCXO_DAC_SYNCDAC_FRAME_TICKS;
 
-static void ocxo_dac_dither_apply_rate_to_all(void) {
-  ocxo_dac_dither_apply_rate_to_lane(ocxo1_dac);
-  ocxo_dac_dither_apply_rate_to_lane(ocxo2_dac);
-}
-
-bool clocks_dac_dither_set_rate_hz(uint32_t rate_hz) {
-  if (rate_hz < OCXO_DAC_DITHER_MIN_RATE_HZ ||
-      rate_hz > OCXO_DAC_DITHER_MAX_RATE_HZ) {
-    return false;
-  }
-
-  const uint32_t period_ns = OCXO_DAC_DITHER_NS_PER_SECOND / rate_hz;
-  if (period_ns == 0) return false;
-
-  if (g_ocxo_dac_dither_handle != TIMEPOP_INVALID_HANDLE) {
-    timepop_cancel(g_ocxo_dac_dither_handle);
-    g_ocxo_dac_dither_handle = TIMEPOP_INVALID_HANDLE;
-  }
-
-  g_ocxo_dac_dither_rate_hz = rate_hz;
-  g_ocxo_dac_dither_period_ns = period_ns;
-  ocxo_dac_dither_apply_rate_to_all();
-  ocxo_dac_dither_roll_window(ocxo1_dac);
-  ocxo_dac_dither_roll_window(ocxo2_dac);
-
-  const timepop_handle_t h = timepop_arm((uint64_t)g_ocxo_dac_dither_period_ns,
+  const timepop_handle_t h = timepop_arm((uint64_t)OCXO_DAC_SYNCDAC_PERIOD_NS,
                                          true,
                                          ocxo_dac_dither_callback,
                                          nullptr,
-                                         OCXO_DAC_DITHER_NAME);
+                                         OCXO_DAC_SYNCDAC_NAME);
   if (h == TIMEPOP_INVALID_HANDLE) {
     g_ocxo_dac_dither_arm_fail_count++;
-    return false;
+    return;
   }
   g_ocxo_dac_dither_handle = h;
   g_ocxo_dac_dither_arm_count++;
-  return true;
-}
-
-void clocks_dac_dither_begin(void) {
-  if (g_ocxo_dac_dither_handle != TIMEPOP_INVALID_HANDLE) return;
-  (void)clocks_dac_dither_set_rate_hz(g_ocxo_dac_dither_rate_hz);
 }
 
 // ============================================================================
@@ -2317,16 +2413,21 @@ static void payload_add_dac_dither_compact(Payload& parent,
                                            const ocxo_dac_state_t& s) {
   Payload d;
   d.add("enabled", s.dither_enabled);
-  d.add("rate_hz", s.dither_rate_hz);
-  d.add("period_ns", s.dither_period_ns);
+  d.add("mode", OCXO_DAC_REALIZATION_MODE);
+  d.add("rate_hz", OCXO_DAC_SYNCDAC_EXECUTION_HZ);
+  d.add("period_ns", OCXO_DAC_SYNCDAC_PERIOD_NS);
   d.add("desired", s.dac_fractional, 6);
   d.add("hw_code", (uint32_t)s.dac_hw_code);
   d.add("low_code", (uint32_t)s.dither_last_window_low_code);
   d.add("high_code", (uint32_t)s.dither_last_window_high_code);
   d.add("low_count_1s", s.dither_last_window_low_count);
   d.add("high_count_1s", s.dither_last_window_high_count);
+  d.add("low_ms_1s", s.dither_last_window_low_count);
+  d.add("high_ms_1s", s.dither_last_window_high_count);
   d.add("tick_count_1s", s.dither_last_window_tick_count);
   d.add("average_1s", ocxo_dac_last_window_average(s), 6);
+  d.add("writes_1s", s.syncdac_last_window_write_attempts);
+  d.add("write_suppressed_1s", s.syncdac_last_window_write_suppressed);
   d.add("write_failures", s.dither_write_failures);
   parent.add_object(key, d);
 }
@@ -2343,10 +2444,13 @@ static void payload_add_servo_dac_values(Payload& parent) {
   dac.add("ocxo2_dac", ocxo2_dac.dac_fractional);
   dac.add("ocxo1_hw_code", (uint32_t)ocxo1_dac.dac_hw_code);
   dac.add("ocxo2_hw_code", (uint32_t)ocxo2_dac.dac_hw_code);
-  dac.add("dither_rate_hz", g_ocxo_dac_dither_rate_hz);
-  dac.add("dither_period_ns", g_ocxo_dac_dither_period_ns);
-  dac.add("dither_min_rate_hz", OCXO_DAC_DITHER_MIN_RATE_HZ);
-  dac.add("dither_max_rate_hz", OCXO_DAC_DITHER_MAX_RATE_HZ);
+  dac.add("dither_mode", OCXO_DAC_REALIZATION_MODE);
+  dac.add("dither_rate_hz", OCXO_DAC_SYNCDAC_EXECUTION_HZ);
+  dac.add("dither_period_ns", OCXO_DAC_SYNCDAC_PERIOD_NS);
+  dac.add("dither_grid_hz", OCXO_DAC_SYNCDAC_EXECUTION_HZ);
+  dac.add("dither_cell_count", OCXO_DAC_SYNCDAC_CELL_COUNT);
+  dac.add("dither_cell_ticks", OCXO_DAC_SYNCDAC_CELL_TICKS);
+  dac.add("dither_max_writes_per_frame", OCXO_DAC_SYNCDAC_MAX_WRITES_PER_FRAME);
 
   Payload dither;
   payload_add_dac_dither_compact(dither, "ocxo1", ocxo1_dac);
@@ -3599,10 +3703,13 @@ static void add_dac_payload(Payload& p) {
   p.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
   p.add("ad5693r_init_ok", g_ad5693r_init_ok);
   p.add("dither_handle", g_ocxo_dac_dither_handle);
-  p.add("dither_rate_hz", g_ocxo_dac_dither_rate_hz);
-  p.add("dither_period_ns", g_ocxo_dac_dither_period_ns);
-  p.add("dither_min_rate_hz", OCXO_DAC_DITHER_MIN_RATE_HZ);
-  p.add("dither_max_rate_hz", OCXO_DAC_DITHER_MAX_RATE_HZ);
+  p.add("dither_mode", OCXO_DAC_REALIZATION_MODE);
+  p.add("dither_rate_hz", OCXO_DAC_SYNCDAC_EXECUTION_HZ);
+  p.add("dither_period_ns", OCXO_DAC_SYNCDAC_PERIOD_NS);
+  p.add("dither_grid_hz", OCXO_DAC_SYNCDAC_EXECUTION_HZ);
+  p.add("dither_cell_count", OCXO_DAC_SYNCDAC_CELL_COUNT);
+  p.add("dither_cell_ticks", OCXO_DAC_SYNCDAC_CELL_TICKS);
+  p.add("dither_max_writes_per_frame", OCXO_DAC_SYNCDAC_MAX_WRITES_PER_FRAME);
   p.add("dither_arm_count", g_ocxo_dac_dither_arm_count);
   p.add("dither_arm_fail_count", g_ocxo_dac_dither_arm_fail_count);
   p.add("commit_scheduled", g_ocxo_dac_commit_scheduled);
@@ -4155,33 +4262,27 @@ static Payload cmd_dither(const Payload& args) {
   bool enabled = true;
   (void)args.tryGetBool("dither", enabled);
 
-  uint32_t requested_rate = g_ocxo_dac_dither_rate_hz;
-  (void)args.tryGetUInt("rate_hz", requested_rate);
-  (void)args.tryGetUInt("hz", requested_rate);
-  (void)args.tryGetUInt("frequency_hz", requested_rate);
-
-  Payload p;
-  if (requested_rate != g_ocxo_dac_dither_rate_hz) {
-    if (!clocks_dac_dither_set_rate_hz(requested_rate)) {
-      p.add("status", "bad_rate_hz");
-      p.add("requested_rate_hz", requested_rate);
-      p.add("min_rate_hz", OCXO_DAC_DITHER_MIN_RATE_HZ);
-      p.add("max_rate_hz", OCXO_DAC_DITHER_MAX_RATE_HZ);
-      return p;
-    }
-  } else if (g_ocxo_dac_dither_handle == TIMEPOP_INVALID_HANDLE) {
-    clocks_dac_dither_begin();
-  }
-
   ocxo1_dac.dither_enabled = enabled;
   ocxo2_dac.dither_enabled = enabled;
 
+  if (g_ocxo_dac_dither_handle == TIMEPOP_INVALID_HANDLE) {
+    clocks_dac_dither_begin();
+  }
+
+  Payload p;
   p.add("status", "ok");
   p.add("dither", enabled);
-  p.add("rate_hz", g_ocxo_dac_dither_rate_hz);
-  p.add("period_ns", g_ocxo_dac_dither_period_ns);
-  p.add("min_rate_hz", OCXO_DAC_DITHER_MIN_RATE_HZ);
-  p.add("max_rate_hz", OCXO_DAC_DITHER_MAX_RATE_HZ);
+  p.add("mode", OCXO_DAC_REALIZATION_MODE);
+  p.add("rate_fixed", true);
+  p.add("rate_args_ignored", true);
+  p.add("execution_hz", OCXO_DAC_SYNCDAC_EXECUTION_HZ);
+  p.add("rate_hz", OCXO_DAC_SYNCDAC_EXECUTION_HZ);
+  p.add("period_ns", OCXO_DAC_SYNCDAC_PERIOD_NS);
+  p.add("grid_hz", OCXO_DAC_SYNCDAC_EXECUTION_HZ);
+  p.add("frame_ticks", OCXO_DAC_SYNCDAC_FRAME_TICKS);
+  p.add("cell_count", OCXO_DAC_SYNCDAC_CELL_COUNT);
+  p.add("cell_ticks", OCXO_DAC_SYNCDAC_CELL_TICKS);
+  p.add("max_writes_per_frame", OCXO_DAC_SYNCDAC_MAX_WRITES_PER_FRAME);
   p.add("handle", g_ocxo_dac_dither_handle);
   p.add("arm_count", g_ocxo_dac_dither_arm_count);
   p.add("arm_fail_count", g_ocxo_dac_dither_arm_fail_count);
@@ -4213,10 +4314,13 @@ static Payload cmd_set_dac(const Payload& args) {
   p.add("ocxo1_dac_hw_code", (uint32_t)ocxo1_dac.dac_hw_code);
   p.add("ocxo2_dac_hw_code", (uint32_t)ocxo2_dac.dac_hw_code);
   p.add("dither_realizes_desired", true);
-  p.add("dither_rate_hz", g_ocxo_dac_dither_rate_hz);
-  p.add("dither_period_ns", g_ocxo_dac_dither_period_ns);
-  p.add("dither_min_rate_hz", OCXO_DAC_DITHER_MIN_RATE_HZ);
-  p.add("dither_max_rate_hz", OCXO_DAC_DITHER_MAX_RATE_HZ);
+  p.add("dither_mode", OCXO_DAC_REALIZATION_MODE);
+  p.add("dither_rate_hz", OCXO_DAC_SYNCDAC_EXECUTION_HZ);
+  p.add("dither_period_ns", OCXO_DAC_SYNCDAC_PERIOD_NS);
+  p.add("dither_grid_hz", OCXO_DAC_SYNCDAC_EXECUTION_HZ);
+  p.add("dither_cell_count", OCXO_DAC_SYNCDAC_CELL_COUNT);
+  p.add("dither_cell_ticks", OCXO_DAC_SYNCDAC_CELL_TICKS);
+  p.add("dither_max_writes_per_frame", OCXO_DAC_SYNCDAC_MAX_WRITES_PER_FRAME);
   p.add("status", (dac1_ok && dac2_ok) ? "ok" : "dac_write_fault");
   return p;
 }

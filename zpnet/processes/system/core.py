@@ -169,9 +169,36 @@ REG_DATA      = 0xF7
 EXPECTED_CHIP_ID = 0x60
 SEA_LEVEL_PRESSURE_HPA = 1013.25
 
+# BME280 is on the shared legacy SMBus with the OCXO DACs.  SyncDAC keeps DAC
+# writes sparse, but the BME280 calibration/data read is still a multi-register
+# transaction and can occasionally lose arbitration / NACK mid-sequence.  Treat
+# environmental telemetry as best-effort context: retry a few times, then
+# publish a stale/error payload instead of killing the SYSTEM poller.
+BME280_RETRY_COUNT = 3
+BME280_RETRY_DELAY_SEC = 0.05
+
+_BME280_CAL_CACHE: Optional[dict] = None
+_BME280_LAST_GOOD: Optional[dict] = None
+_BME280_READ_FAIL_COUNT = 0
+_BME280_CONSECUTIVE_FAIL_COUNT = 0
+_BME280_RECOVERY_COUNT = 0
+
 REG_CURRENT = 0x01
 REG_VOLTAGE = 0x02
 REG_POWER   = 0x03
+
+# INA260s share SMBus surfaces with other active devices.  Individual register
+# reads are short, but sparse SyncDAC writes or other bus activity can still
+# collide with a read_word_data transaction.  Treat power telemetry as
+# best-effort context: retry transient I/O errors and publish stale/error rail
+# payloads instead of terminating the SYSTEM poller.
+INA260_RETRY_COUNT = 3
+INA260_RETRY_DELAY_SEC = 0.03
+
+_INA260_LAST_GOOD: Dict[Tuple[int, int], dict] = {}
+_INA260_READ_FAIL_COUNT: Dict[Tuple[int, int], int] = {}
+_INA260_CONSECUTIVE_FAIL_COUNT: Dict[Tuple[int, int], int] = {}
+_INA260_RECOVERY_COUNT: Dict[Tuple[int, int], int] = {}
 
 # ------------------------------------------------------------------
 # Battery monitoring (legacy: battery_monitor)
@@ -708,24 +735,32 @@ def compensate_humidity(adc_H: int, t_fine: float, cal: dict) -> float:
     return max(0.0, min(100.0, h))
 
 
-def build_environment_status() -> dict:
-    """
-    Read environmental data from BME280.
+def _build_environment_status_once() -> dict:
+    """Perform one complete BME280 transaction sequence.
 
-    Semantics:
-      • Either returns a complete, truthful payload
-      • Or raises
+    This helper is intentionally allowed to raise.  The public
+    build_environment_status() wrapper owns retry/stale-payload behavior.
     """
+    global _BME280_CAL_CACHE
+
     with open_i2c(I2C_BUS_LEGACY) as bus:
         chip_id = bus.read_byte_data(BME280_ADDR, REG_ID)
         if chip_id != EXPECTED_CHIP_ID:
             raise RuntimeError(f"unexpected BME280 chip ID 0x{chip_id:02X}")
 
-        # Forced mode, oversampling x1
+        # Forced mode, oversampling x1.
+        #
+        # These writes are normal BME280 control-plane writes: ctrl_hum selects
+        # humidity oversampling, and ctrl_meas selects pressure/temperature
+        # oversampling plus measurement mode.  The calibration table is static
+        # after boot, so cache it after the first successful read to reduce the
+        # transaction footprint on the shared SMBus.
         bus.write_byte_data(BME280_ADDR, REG_CTRL_HUM, 0x01)
         bus.write_byte_data(BME280_ADDR, REG_CTRL_MEAS, 0x27)
 
-        cal = read_bme280_calibration(bus)
+        if _BME280_CAL_CACHE is None:
+            _BME280_CAL_CACHE = read_bme280_calibration(bus)
+        cal = _BME280_CAL_CACHE
 
         data = bus.read_i2c_block_data(BME280_ADDR, REG_DATA, 8)
         adc_P = (data[0] << 12) | (data[1] << 4) | (data[2] >> 4)
@@ -745,8 +780,97 @@ def build_environment_status() -> dict:
             "pressure_hpa": round(pressure_hpa, 2),
             "humidity_pct": round(humidity_pct, 2),
             "altitude_m": round(altitude_m, 1),
+            "read_ok": True,
+            "stale": False,
+            "retry_count": 0,
+            "read_fail_count": _BME280_READ_FAIL_COUNT,
+            "consecutive_fail_count": 0,
+            "recovery_count": _BME280_RECOVERY_COUNT,
+            "last_error": "",
             "health_state": "NOMINAL",
         }
+
+
+def _bme280_failure_payload(error: Exception, attempts: int) -> dict:
+    base = dict(_BME280_LAST_GOOD) if _BME280_LAST_GOOD else {
+        "sensor_address": "0x76",
+        "sensor_present": False,
+        "temperature_c": None,
+        "pressure_hpa": None,
+        "humidity_pct": None,
+        "altitude_m": None,
+    }
+
+    base.update({
+        "read_ok": False,
+        "stale": _BME280_LAST_GOOD is not None,
+        "retry_count": max(0, attempts - 1),
+        "read_fail_count": _BME280_READ_FAIL_COUNT,
+        "consecutive_fail_count": _BME280_CONSECUTIVE_FAIL_COUNT,
+        "recovery_count": _BME280_RECOVERY_COUNT,
+        "last_error": f"{type(error).__name__}: {error}",
+        "health_state": "HOLD",
+    })
+    return base
+
+
+def build_environment_status() -> dict:
+    """
+    Read environmental data from BME280.
+
+    Semantics:
+      • Returns a complete fresh payload when the BME280 transaction succeeds
+      • Retries transient I2C failures a small number of times
+      • Returns last-known-good/stale telemetry after exhausted retries
+      • Never terminates the SYSTEM poller because of BME280 bus contention
+    """
+    global _BME280_LAST_GOOD
+    global _BME280_READ_FAIL_COUNT
+    global _BME280_CONSECUTIVE_FAIL_COUNT
+    global _BME280_RECOVERY_COUNT
+
+    last_error: Exception | None = None
+
+    for attempt in range(1, BME280_RETRY_COUNT + 1):
+        try:
+            payload = _build_environment_status_once()
+            if _BME280_CONSECUTIVE_FAIL_COUNT:
+                _BME280_RECOVERY_COUNT += 1
+            _BME280_CONSECUTIVE_FAIL_COUNT = 0
+            payload["read_fail_count"] = _BME280_READ_FAIL_COUNT
+            payload["consecutive_fail_count"] = 0
+            payload["recovery_count"] = _BME280_RECOVERY_COUNT
+            payload["retry_count"] = attempt - 1
+            _BME280_LAST_GOOD = dict(payload)
+            return payload
+        except OSError as e:
+            last_error = e
+            _BME280_READ_FAIL_COUNT += 1
+            _BME280_CONSECUTIVE_FAIL_COUNT += 1
+            if attempt < BME280_RETRY_COUNT:
+                logging.warning(
+                    "[system] BME280 transient I2C error on attempt %d/%d: %s",
+                    attempt,
+                    BME280_RETRY_COUNT,
+                    e,
+                )
+                time.sleep(BME280_RETRY_DELAY_SEC)
+        except Exception as e:
+            last_error = e
+            _BME280_READ_FAIL_COUNT += 1
+            _BME280_CONSECUTIVE_FAIL_COUNT += 1
+            if attempt < BME280_RETRY_COUNT:
+                logging.warning(
+                    "[system] BME280 read error on attempt %d/%d: %s",
+                    attempt,
+                    BME280_RETRY_COUNT,
+                    e,
+                )
+                time.sleep(BME280_RETRY_DELAY_SEC)
+
+    logging.exception("[system] BME280 read failed after retries")
+    return _bme280_failure_payload(last_error or RuntimeError("unknown BME280 error"),
+                                   BME280_RETRY_COUNT)
 
 # ------------------------------------------------------------------
 # Power monitoring helpers (legacy: power_monitor)
@@ -780,14 +904,147 @@ def read_ina260(bus_id: int, bus: SMBus, addr: int) -> dict:
     }
 
 
+def _ina260_key(bus_id: int, addr: int) -> Tuple[int, int]:
+    return (bus_id, addr)
+
+
+def _ina260_counter_get(store: Dict[Tuple[int, int], int],
+                        bus_id: int,
+                        addr: int) -> int:
+    return store.get(_ina260_key(bus_id, addr), 0)
+
+
+def _ina260_counter_set(store: Dict[Tuple[int, int], int],
+                        bus_id: int,
+                        addr: int,
+                        value: int) -> None:
+    store[_ina260_key(bus_id, addr)] = value
+
+
+def _ina260_failure_payload(bus_id: int,
+                            addr: int,
+                            err: BaseException,
+                            retry_count: int) -> dict:
+    key = _ina260_key(bus_id, addr)
+    last_good = _INA260_LAST_GOOD.get(key)
+    base = dict(last_good) if last_good else {
+        "volts": None,
+        "amps": None,
+        "watts": None,
+    }
+    base.update({
+        "read_ok": False,
+        "stale": last_good is not None,
+        "retry_count": retry_count,
+        "read_fail_count": _ina260_counter_get(_INA260_READ_FAIL_COUNT, bus_id, addr),
+        "consecutive_fail_count": _ina260_counter_get(_INA260_CONSECUTIVE_FAIL_COUNT, bus_id, addr),
+        "recovery_count": _ina260_counter_get(_INA260_RECOVERY_COUNT, bus_id, addr),
+        "last_error": str(err),
+        "health_state": "HOLD",
+    })
+    return base
+
+
+def read_ina260_defensive(bus_id: int, bus: SMBus, addr: int) -> dict:
+    """Read one INA260 rail with retry/stale-payload behavior.
+
+    INA260 readings are useful context and battery-accounting inputs, but an
+    occasional SMBus I/O error should not terminate the SYSTEM poller.  A
+    successful read becomes the last-known-good payload for that bus/address.
+    """
+    key = _ina260_key(bus_id, addr)
+    last_error: BaseException | None = None
+
+    for attempt in range(1, INA260_RETRY_COUNT + 1):
+        try:
+            payload = read_ina260(bus_id, bus, addr)
+            if _ina260_counter_get(_INA260_CONSECUTIVE_FAIL_COUNT, bus_id, addr):
+                _ina260_counter_set(
+                    _INA260_RECOVERY_COUNT,
+                    bus_id,
+                    addr,
+                    _ina260_counter_get(_INA260_RECOVERY_COUNT, bus_id, addr) + 1,
+                )
+            _ina260_counter_set(_INA260_CONSECUTIVE_FAIL_COUNT, bus_id, addr, 0)
+
+            payload.update({
+                "read_ok": True,
+                "stale": False,
+                "retry_count": attempt - 1,
+                "read_fail_count": _ina260_counter_get(_INA260_READ_FAIL_COUNT, bus_id, addr),
+                "consecutive_fail_count": 0,
+                "recovery_count": _ina260_counter_get(_INA260_RECOVERY_COUNT, bus_id, addr),
+                "last_error": "",
+                "health_state": "NOMINAL",
+            })
+            _INA260_LAST_GOOD[key] = dict(payload)
+            return payload
+
+        except OSError as e:
+            last_error = e
+            _ina260_counter_set(
+                _INA260_READ_FAIL_COUNT,
+                bus_id,
+                addr,
+                _ina260_counter_get(_INA260_READ_FAIL_COUNT, bus_id, addr) + 1,
+            )
+            _ina260_counter_set(
+                _INA260_CONSECUTIVE_FAIL_COUNT,
+                bus_id,
+                addr,
+                _ina260_counter_get(_INA260_CONSECUTIVE_FAIL_COUNT, bus_id, addr) + 1,
+            )
+            if attempt < INA260_RETRY_COUNT:
+                logging.warning(
+                    "[system] INA260 i2c-%d/0x%02X transient I2C error on attempt %d/%d: %s",
+                    bus_id,
+                    addr,
+                    attempt,
+                    INA260_RETRY_COUNT,
+                    e,
+                )
+                time.sleep(INA260_RETRY_DELAY_SEC)
+
+    logging.warning(
+        "[system] INA260 i2c-%d/0x%02X read failed after retries: %s",
+        bus_id,
+        addr,
+        last_error,
+    )
+    return _ina260_failure_payload(
+        bus_id,
+        addr,
+        last_error or RuntimeError("unknown INA260 error"),
+        INA260_RETRY_COUNT,
+    )
+
+
+def _ina260_bus_open_failure_payload(bus_id: int,
+                                     addr: int,
+                                     err: BaseException) -> dict:
+    _ina260_counter_set(
+        _INA260_READ_FAIL_COUNT,
+        bus_id,
+        addr,
+        _ina260_counter_get(_INA260_READ_FAIL_COUNT, bus_id, addr) + 1,
+    )
+    _ina260_counter_set(
+        _INA260_CONSECUTIVE_FAIL_COUNT,
+        bus_id,
+        addr,
+        _ina260_counter_get(_INA260_CONSECUTIVE_FAIL_COUNT, bus_id, addr) + 1,
+    )
+    return _ina260_failure_payload(bus_id, addr, err, 0)
+
+
 def build_power_status() -> dict:
     """
     Build power rail snapshot from INA260 sensors.
 
     Semantics:
       • Observation only
-      • No inference
-      • No per-rail fault masking
+      • Per-rail I2C failures are nonfatal telemetry faults
+      • Last-known-good rail values are retained as stale context
       • Boundary at SMBus acquisition
 
     Mongo / MiniMongo constraint:
@@ -796,31 +1053,44 @@ def build_power_status() -> dict:
       • Human-readable domain names live in the inner "label" field.
     """
     snapshot: dict[str, dict[str, dict]] = {}
+    all_nominal = True
 
     for bus_id, devices in POWER_CONFIG_BY_BUS.items():
         bus_key = f"i2c-{bus_id}"
         results: dict[str, dict] = {}
         snapshot[bus_key] = results
 
-        with open_i2c(bus_id) as bus:
+        try:
+            with open_i2c(bus_id) as bus:
+                for addr, cfg in devices.items():
+                    reading = read_ina260_defensive(bus_id, bus, addr)
+                    if not reading.get("read_ok", False):
+                        all_nominal = False
+
+                    # MiniMongo-safe key: address only (no periods)
+                    rail_key = f"0x{addr:02X}"
+
+                    results[rail_key] = {
+                        "label": cfg["label"],
+                        "address": rail_key,
+                        "ideal_voltage_v": cfg["ideal_voltage_v"],
+                        **reading,
+                    }
+
+        except Exception as e:
+            logging.exception("[system] INA260 power bus i2c-%d failed", bus_id)
+            all_nominal = False
             for addr, cfg in devices.items():
-                reading = read_ina260(bus_id, bus, addr)
-                label = cfg["label"]
-
-                # MiniMongo-safe key: address only (no periods)
                 rail_key = f"0x{addr:02X}"
-
                 results[rail_key] = {
-                    "label": label,
+                    "label": cfg["label"],
                     "address": rail_key,
                     "ideal_voltage_v": cfg["ideal_voltage_v"],
-                    "volts": reading["volts"],
-                    "amps": reading["amps"],
-                    "watts": reading["watts"],
+                    **_ina260_bus_open_failure_payload(bus_id, addr, e),
                 }
 
     return {
-        "health_state": "NOMINAL",
+        "health_state": "NOMINAL" if all_nominal else "HOLD",
         **snapshot,
     }
 

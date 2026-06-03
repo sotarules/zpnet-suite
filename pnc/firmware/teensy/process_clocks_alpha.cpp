@@ -193,9 +193,9 @@ static ocxo_dac_state_t make_default_ocxo_dac_state() {
   s.dac_max = 65535;
   s.dac_desired_q16 = ((uint32_t)AD5693R_DAC_DEFAULT << OCXO_DAC_Q16_SHIFT);
   s.dither_enabled = true;
-  s.dither_rate_hz = 100U;
-  s.dither_period_ns = 10000000U;
-  s.dither_effective_window_ticks = 100U;
+  s.dither_rate_hz = 1000U;
+  s.dither_period_ns = 1000000U;
+  s.dither_effective_window_ticks = 1000U;
   s.dither_low_code = AD5693R_DAC_DEFAULT;
   s.dither_high_code = AD5693R_DAC_DEFAULT;
   s.dither_last_selected_hw_code = AD5693R_DAC_DEFAULT;
@@ -228,6 +228,9 @@ servo_mode_t servo_mode_parse(const char* s) {
 }
 
 void ocxo_dac_dither_reset(ocxo_dac_state_t& s) {
+  s.dither_rate_hz = 1000U;
+  s.dither_period_ns = 1000000U;
+  s.dither_effective_window_ticks = 1000U;
   s.dither_accumulator_q16 = 0;
   s.dither_fraction_q16 = s.dac_desired_q16 & 0xFFFFUL;
   s.dither_low_code = (uint16_t)(s.dac_desired_q16 >> OCXO_DAC_Q16_SHIFT);
@@ -238,6 +241,17 @@ void ocxo_dac_dither_reset(ocxo_dac_state_t& s) {
   s.dither_window_tick_count = 0;
   s.dither_window_low_count = 0;
   s.dither_window_high_count = 0;
+  s.syncdac_frame_tick = 0;
+  s.syncdac_cell_index = 0;
+  s.syncdac_cell_tick = 0;
+  s.syncdac_high_ms_per_second = 0;
+  s.syncdac_low_ms_per_second = 1000U;
+  s.syncdac_high_ms_this_cell = 0;
+  s.syncdac_low_ms_this_cell = 100U;
+  s.syncdac_write_attempts_this_frame = 0;
+  s.syncdac_write_successes_this_frame = 0;
+  s.syncdac_write_failures_this_frame = 0;
+  s.syncdac_write_suppressed_this_frame = 0;
 }
 
 bool ocxo_dac_set_desired(ocxo_dac_state_t& s, double value) {

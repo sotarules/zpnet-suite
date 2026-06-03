@@ -530,11 +530,11 @@ def _dac_report_dither_summary(report_dac: dict | None, lane: str) -> str:
     if low is None or high is None:
         return f"{rate}Hz"
 
-    # Dither windows are usually 0..10 at the safe 10 Hz rate.  Pad the
-    # counters so a 10-count bucket does not shift the DAC row horizontally
-    # when adjacent windows contain single-digit counts.
-    low_s = f"{low:02d}"
-    high_s = f"{high:02d}"
+    # SyncDAC reports one-second dwell targets/counts on a 1 ms grid.  Pad
+    # the millisecond buckets to three digits so 1/2-digit dwell values do not
+    # shift the DAC row horizontally beside larger values.
+    low_s = f"{low:03d}"
+    high_s = f"{high:03d}"
 
     if low_code is None or high_code is None:
         return f"{rate}Hz {low_s}/{high_s}"

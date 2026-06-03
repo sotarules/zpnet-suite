@@ -638,14 +638,15 @@ struct ocxo_dac_state_t {
   uint32_t pacing_commit_count;
   uint32_t pacing_skip_small_delta_count;
 
-  // Always-on sigma-delta realization diagnostics.  Window counters are tick
-  // counts, not I2C write counts: skipped same-code writes still represent
-  // held-output dwell time and therefore count toward the effective average.
+  // Always-on SyncDAC realization diagnostics.  The engine executes on a
+  // fixed 1 kHz virtual timing grid, but I2C writes occur only at scheduled
+  // LOW/HIGH dwell boundaries and are capped per one-second frame.  Window
+  // counters are millisecond dwell ticks, not I2C write counts.
   bool     dither_enabled;
-  uint32_t dither_rate_hz;
-  uint32_t dither_period_ns;
-  uint32_t dither_effective_window_ticks;
-  uint32_t dither_accumulator_q16;
+  uint32_t dither_rate_hz;               // fixed execution grid: 1000 Hz
+  uint32_t dither_period_ns;             // fixed execution period: 1 ms
+  uint32_t dither_effective_window_ticks; // fixed one-second frame: 1000 ticks
+  uint32_t dither_accumulator_q16;       // retired sigma-delta field; kept zero
   uint32_t dither_fraction_q16;
   uint16_t dither_low_code;
   uint16_t dither_high_code;
@@ -654,12 +655,12 @@ struct ocxo_dac_state_t {
   uint32_t dither_tick_count_total;
   uint32_t dither_window_sequence;
   uint32_t dither_window_tick_count;
-  uint32_t dither_window_low_count;
-  uint32_t dither_window_high_count;
+  uint32_t dither_window_low_count;      // LOW dwell milliseconds this frame
+  uint32_t dither_window_high_count;     // HIGH dwell milliseconds this frame
 
   uint32_t dither_last_window_tick_count;
-  uint32_t dither_last_window_low_count;
-  uint32_t dither_last_window_high_count;
+  uint32_t dither_last_window_low_count; // LOW dwell milliseconds last frame
+  uint32_t dither_last_window_high_count;// HIGH dwell milliseconds last frame
   uint16_t dither_last_window_low_code;
   uint16_t dither_last_window_high_code;
 
@@ -668,6 +669,23 @@ struct ocxo_dac_state_t {
   uint32_t dither_write_failures;
   uint32_t dither_write_skip_same_code_count;
   uint32_t dither_not_ready_count;
+
+  uint32_t syncdac_frame_tick;
+  uint32_t syncdac_cell_index;
+  uint32_t syncdac_cell_tick;
+  uint32_t syncdac_high_ms_per_second;
+  uint32_t syncdac_low_ms_per_second;
+  uint32_t syncdac_high_ms_this_cell;
+  uint32_t syncdac_low_ms_this_cell;
+  uint32_t syncdac_write_attempts_this_frame;
+  uint32_t syncdac_write_successes_this_frame;
+  uint32_t syncdac_write_failures_this_frame;
+  uint32_t syncdac_write_suppressed_this_frame;
+  uint32_t syncdac_last_window_write_attempts;
+  uint32_t syncdac_last_window_write_successes;
+  uint32_t syncdac_last_window_write_failures;
+  uint32_t syncdac_last_window_write_suppressed;
+  uint32_t syncdac_write_budget_suppressed_total;
 
   bool     io_last_write_ok;
   bool     io_fault_latched;
@@ -717,7 +735,6 @@ void ocxo_dac_predictor_reset(ocxo_dac_state_t& s);
 void ocxo_dac_io_reset(ocxo_dac_state_t& s);
 void ocxo_dac_retry_reset(ocxo_dac_state_t& s);
 void clocks_dac_dither_begin(void);
-bool clocks_dac_dither_set_rate_hz(uint32_t rate_hz);
 
 // ============================================================================
 // Campaign warmup suppression
