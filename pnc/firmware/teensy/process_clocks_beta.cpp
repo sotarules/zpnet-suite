@@ -1561,11 +1561,13 @@ static void payload_add_ocxo_forensics(Payload& p,
 // Step E servo source doctrine. Servo input is explicitly the PPS-founded
 // OCXO slope surface introduced in Step D. MEAN consumes the Welford mean of
 // public PPS-edge residuals (ns/sec == ppb). TOTAL consumes the total public
-// OCXO/GNSS ratio over the campaign (tau). No instantaneous phase-snap mode is
-// supported: the servo kills slope; it does not chase one-row residuals.
+// OCXO/GNSS ratio over the campaign (tau). NOW consumes the most recent
+// PPS-founded one-second residual directly. NOW is intentionally aggressive
+// and exists for live plant-response testing and fast visible convergence.
 static constexpr uint32_t SERVO_INPUT_SOURCE_NONE = 0;
 static constexpr uint32_t SERVO_INPUT_SOURCE_MEAN_PPS_RESIDUAL_WELFORD = 1;
 static constexpr uint32_t SERVO_INPUT_SOURCE_TOTAL_PUBLIC_TAU = 2;
+static constexpr uint32_t SERVO_INPUT_SOURCE_NOW_PPS_RESIDUAL = 3;
 
 static const char* servo_input_source_name(uint32_t source) {
   switch (source) {
@@ -1573,6 +1575,8 @@ static const char* servo_input_source_name(uint32_t source) {
       return "PPS_RESIDUAL_WELFORD_MEAN_PPB";
     case SERVO_INPUT_SOURCE_TOTAL_PUBLIC_TAU:
       return "PUBLIC_OCXO_TOTAL_TAU";
+    case SERVO_INPUT_SOURCE_NOW_PPS_RESIDUAL:
+      return "PPS_RESIDUAL_NOW_PPB";
     default:
       return "NONE";
   }
@@ -1592,9 +1596,13 @@ struct servo_input_diag_t {
   double   total_ppb = 0.0;
   bool     total_input_valid = false;
 
+  double   now_ppb = 0.0;
+  bool     now_input_valid = false;
+
   uint32_t selected_source = SERVO_INPUT_SOURCE_NONE;
   bool     selected_input_valid = false;
   double   selected_input_ppb = 0.0;
+  int64_t  selected_residual_ns = 0;
 };
 
 static servo_input_diag_t g_servo_input_ocxo1 = {};
@@ -1614,6 +1622,7 @@ static void payload_add_servo_input_diag(Payload& lane,
   input.add("selected_source_id", d.selected_source);
   input.add("selected_valid", d.selected_input_valid);
   input.add("selected_ppb", d.selected_input_ppb, 6);
+  input.add("selected_residual_ns", d.selected_residual_ns);
   input.add("pps_residual_valid", d.pps_residual_valid);
   input.add("pps_fast_residual_ns", d.pps_fast_residual_ns);
   input.add("pps_gnss_interval_ns", d.pps_gnss_interval_ns);
@@ -1624,6 +1633,8 @@ static void payload_add_servo_input_diag(Payload& lane,
   input.add("total_tau", d.total_tau, 12);
   input.add("total_ppb", d.total_ppb, 6);
   input.add("total_input_valid", d.total_input_valid);
+  input.add("now_ppb", d.now_ppb, 6);
+  input.add("now_input_valid", d.now_input_valid);
   lane.add_object("servo_input", input);
 }
 
@@ -1956,6 +1967,13 @@ static constexpr double SERVO_MEAN_GAIN = 1.00;
 static constexpr double SERVO_TOTAL_FILTER_ALPHA = 0.60;
 static constexpr double SERVO_TOTAL_GAIN = 2.00;
 
+// NOW mode is deliberately immediate: no settle gate, no slope averaging, and
+// a small deadband.  It is a live plant-response/test mode that chases the
+// most recent PPS-founded one-second residual directly.
+static constexpr double SERVO_NOW_FILTER_ALPHA = 1.00;
+static constexpr double SERVO_NOW_GAIN = 1.00;
+static constexpr double SERVO_NOW_DEADBAND_PPB = 0.5;
+
 static double servo_total_tau_from_public(uint64_t public_gnss_ns,
                                           uint64_t public_clock_ns) {
   if (public_gnss_ns == 0) return 1.0;
@@ -1988,18 +2006,33 @@ static void servo_input_diag_update(servo_input_diag_t& d,
   d.total_input_valid = total_input_valid && pps_residual_valid &&
                         (campaign_seconds >= SERVO_MIN_SAMPLES);
 
+  // A one-second residual in ns is numerically ppb over a one-second gate.
+  // NOW intentionally consumes this value directly rather than averaging it
+  // into MEAN or folding it into campaign-total tau.
+  d.now_ppb = pps_residual_valid ? (double)pps_fast_residual_ns : 0.0;
+  d.now_input_valid = pps_residual_valid;
+
+  d.selected_residual_ns = 0;
   if (calibrate_ocxo_mode == servo_mode_t::MEAN) {
     d.selected_source = SERVO_INPUT_SOURCE_MEAN_PPS_RESIDUAL_WELFORD;
     d.selected_input_valid = d.mean_input_valid;
     d.selected_input_ppb = d.mean_input_valid ? d.mean_welford_ppb : 0.0;
+    d.selected_residual_ns = (int64_t)d.selected_input_ppb;
   } else if (calibrate_ocxo_mode == servo_mode_t::TOTAL) {
     d.selected_source = SERVO_INPUT_SOURCE_TOTAL_PUBLIC_TAU;
     d.selected_input_valid = d.total_input_valid;
     d.selected_input_ppb = d.total_input_valid ? d.total_ppb : 0.0;
+    d.selected_residual_ns = (int64_t)d.selected_input_ppb;
+  } else if (calibrate_ocxo_mode == servo_mode_t::NOW) {
+    d.selected_source = SERVO_INPUT_SOURCE_NOW_PPS_RESIDUAL;
+    d.selected_input_valid = d.now_input_valid;
+    d.selected_input_ppb = d.now_input_valid ? d.now_ppb : 0.0;
+    d.selected_residual_ns = pps_residual_valid ? pps_fast_residual_ns : 0;
   } else {
     d.selected_source = SERVO_INPUT_SOURCE_NONE;
     d.selected_input_valid = false;
     d.selected_input_ppb = 0.0;
+    d.selected_residual_ns = 0;
   }
 }
 
@@ -2205,7 +2238,9 @@ static double servo_soft_landing_scale(double abs_ppb) {
 static void ocxo_servo_slope(ocxo_dac_state_t& dac,
                              const servo_input_diag_t& input,
                              double filter_alpha,
-                             double gain) {
+                             double gain,
+                             double deadband_ppb = SERVO_CONTROL_DEADBAND_PPB,
+                             bool use_soft_landing = true) {
   if (!input.selected_input_valid) return;
 
   const double ppb = input.selected_input_ppb;
@@ -2238,12 +2273,12 @@ static void ocxo_servo_slope(ocxo_dac_state_t& dac,
 
   const double control_ppb = dac.servo_predicted_residual;
   const double abs_ppb = fabs(control_ppb);
-  if (abs_ppb < SERVO_CONTROL_DEADBAND_PPB) {
+  if (abs_ppb < deadband_ppb) {
     ocxo_dac_clear_pending(dac);
     return;
   }
 
-  const double landing_scale = servo_soft_landing_scale(abs_ppb);
+  const double landing_scale = use_soft_landing ? servo_soft_landing_scale(abs_ppb) : 1.0;
 
   // Sign law:
   //   positive ppb / tau > 1  -> OCXO fast -> lower DAC -> negative step
@@ -2284,6 +2319,21 @@ static void ocxo_servo_total(ocxo_dac_state_t& dac,
   dac.servo_settle_count = 0;
 }
 
+static void ocxo_servo_now(ocxo_dac_state_t& dac,
+                           const servo_input_diag_t& input) {
+  if (!input.now_input_valid) return;
+
+  // NOW chases the current one-second residual directly.  There is no settle
+  // divider and no soft landing: SyncDAC can realize sub-LSB corrections, so
+  // even small residuals are useful as live plant-response evidence.
+  dac.servo_settle_count = 0;
+  ocxo_servo_slope(dac, input,
+                   SERVO_NOW_FILTER_ALPHA,
+                   SERVO_NOW_GAIN,
+                   SERVO_NOW_DEADBAND_PPB,
+                   false);
+}
+
 static void ocxo_calibration_servo(void) {
   if (calibrate_ocxo_mode == servo_mode_t::OFF) return;
 
@@ -2293,6 +2343,9 @@ static void ocxo_calibration_servo(void) {
   } else if (calibrate_ocxo_mode == servo_mode_t::TOTAL) {
     ocxo_servo_total(ocxo1_dac, g_servo_input_ocxo1);
     ocxo_servo_total(ocxo2_dac, g_servo_input_ocxo2);
+  } else if (calibrate_ocxo_mode == servo_mode_t::NOW) {
+    ocxo_servo_now(ocxo1_dac, g_servo_input_ocxo1);
+    ocxo_servo_now(ocxo2_dac, g_servo_input_ocxo2);
   }
 }
 

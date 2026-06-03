@@ -708,6 +708,7 @@ enum class servo_mode_t : uint8_t {
   OFF   = 0,
   MEAN  = 1,
   TOTAL = 2,
+  NOW   = 3,
 };
 
 extern servo_mode_t calibrate_ocxo_mode;
