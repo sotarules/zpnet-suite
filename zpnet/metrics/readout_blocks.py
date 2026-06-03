@@ -776,11 +776,9 @@ def status_header() -> str:
 
         battery = s.get("battery", {})
         pct = battery.get("remaining_pct")
-        bat_pct = f"{pct:.0f}%" if pct is not None else "?"
-
         return (
             f" NET: {net}"
-            f"  BAT: {bat_v} {bat_pct}"
+            f"  BAT: {bat_v}"
             f"  PI: {pi_health}"
             f"  TEENSY: {teensy_health}"
             f"  GNSS: {gnss_lock}"
@@ -1124,36 +1122,6 @@ def clocks_combined_readout() -> list[str]:
     ))
 
     lines.append("")
-
-    # ── NOW servo detail (only shown when servo mode is NOW) ──
-    if servo_state == "NOW":
-        lines.append(
-            f"{'CAL':<{W_NAME}}"
-            f"{'SEL_RES':>12}"
-            f"{'EDGE_GNSS':>20}"
-            f"  "
-            f"{'DAC':>10}"
-            f"{'V_OUT':>10}"
-            f"{'PPS/V_NS':>16}"
-        )
-        for name, key in [("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")]:
-            selected = _to_float(_field(r, f"dac.{key}.servo_input.selected_residual_ns"))
-            if selected == 0.0 and not _field(r, f"dac.{key}.servo_input.selected_valid", default=False):
-                selected = _to_float(_field(r, f"{key}.pps_residual.fast_residual_ns"))
-            edge_gnss_ns = _to_int(_field(r, f"{key}.sample_gnss_ns_at_event", f"{key}_diag_gnss_ns_at_event"))
-            dac_now = _dac_value(r, key)
-            pps_ns = _to_int(_field(r, f"{key}.ns", f"gnss.{key}_ns", f"{key}_ns", f"{key}_ns_at_pps_vclock", f"{key}_ns_count_at_pps"))
-            v_now = _dac_voltage(dac_now)
-            lines.append(
-                f"{name:<{W_NAME}}"
-                f"{_sign_float(selected, 12, 1)}"
-                f"{_comma_int(edge_gnss_ns, 20)}"
-                f"  "
-                f"{_fmt(dac_now, '>10.3f', 10)}"
-                f"{_fmt(v_now, '>10.5f', 10)}"
-                f"{_comma_int(pps_ns, 16)}"
-            )
-        lines.append("")
 
     # ── Time ──
     gnss_time = r.get("gnss_time_utc", "---")
