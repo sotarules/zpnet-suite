@@ -1267,6 +1267,19 @@ static uint32_t vclock_cycles_for_ticks(uint32_t vclock_ticks) {
                     (uint64_t)VCLOCK_COUNTS_PER_SECOND);
 }
 
+static int32_t vclock_cycles_for_ticks_signed(int32_t vclock_ticks) {
+  const uint32_t cycles = interrupt_vclock_cycles_per_second();
+  if (cycles == 0 || vclock_ticks == 0) return 0;
+
+  const int64_t numerator =
+      (int64_t)vclock_ticks * (int64_t)cycles;
+  const int64_t denom = (int64_t)VCLOCK_COUNTS_PER_SECOND;
+  if (numerator >= 0) {
+    return (int32_t)((numerator + denom / 2) / denom);
+  }
+  return (int32_t)(-(((-numerator) + denom / 2) / denom));
+}
+
 static uint32_t pps_vclock_phase_cycles_from_edges(const pps_t& pps,
                                                    const pps_vclock_t& pvc) {
   // Scalar PPS→VCLOCK phase, by definition less than one 10 MHz tick.
@@ -1424,6 +1437,124 @@ static inline uint32_t pps_vclock_dwt_from_pps_isr_entry_raw(uint32_t isr_entry_
 
 static inline uint32_t qtimer_event_dwt_from_isr_entry_raw(uint32_t isr_entry_dwt_raw) {
   return isr_entry_dwt_raw - (QTIMER_TOTAL_LATENCY - STIMULUS_LAUNCH_LATENCY_CYCLES);
+}
+
+
+// ============================================================================
+// Shared QTimer capture diagnostic helpers
+// ============================================================================
+//
+// This packet is the diagnostic standard for every QTimer compare path.  It is
+// intentionally not an authority mechanism.  It records raw ISR entry, fixed
+// latency normalization, authored target identity, service-time counter
+// evidence, target correction, and final subscriber DWT so reports can compare
+// VCLOCK/TimePop/OCXO using one vocabulary.
+
+static inline uint32_t qtimer_fixed_latency_correction_cycles(void) {
+  return QTIMER_TOTAL_LATENCY - STIMULUS_LAUNCH_LATENCY_CYCLES;
+}
+
+static inline uint32_t qtimer_abs_i32(int32_t value) {
+  return (uint32_t)(value < 0 ? -(int64_t)value : (int64_t)value);
+}
+
+static interrupt_qtimer_capture_diag_t qtimer_capture_make(
+    interrupt_subscriber_kind_t kind,
+    interrupt_provider_kind_t provider,
+    interrupt_lane_t lane,
+    uint32_t isr_entry_dwt_raw,
+    uint32_t fixed_latency_event_dwt,
+    uint32_t target_counter32,
+    uint16_t target_low16) {
+  interrupt_qtimer_capture_diag_t c{};
+  c.diagnostic_valid = true;
+  c.diagnostic_only = true;
+  c.kind = kind;
+  c.provider = provider;
+  c.lane = lane;
+  c.isr_entry_dwt_raw = isr_entry_dwt_raw;
+  c.fixed_latency_correction_cycles = qtimer_fixed_latency_correction_cycles();
+  c.fixed_latency_event_dwt = fixed_latency_event_dwt;
+  c.target_valid = true;
+  c.target_counter32 = target_counter32;
+  c.target_low16 = target_low16;
+  c.event_identity_valid = true;
+  c.event_identity_counter32 = target_counter32;
+  c.event_identity_low16 = target_low16;
+  c.target_corrected_dwt_at_event = fixed_latency_event_dwt;
+  c.observed_dwt_for_interval = fixed_latency_event_dwt;
+  c.subscriber_dwt_at_event = fixed_latency_event_dwt;
+  c.authority_policy = "FIXED_LATENCY_EVENT_DWT";
+  return c;
+}
+
+static void qtimer_capture_set_event_identity(
+    interrupt_qtimer_capture_diag_t& c,
+    uint32_t event_identity_counter32,
+    uint16_t event_identity_low16) {
+  c.event_identity_valid = true;
+  c.event_identity_counter32 = event_identity_counter32;
+  c.event_identity_low16 = event_identity_low16;
+}
+
+static void qtimer_capture_set_service_counter(
+    interrupt_qtimer_capture_diag_t& c,
+    uint32_t service_counter32,
+    uint16_t service_low16) {
+  if (!c.target_valid) return;
+
+  c.service_counter_valid = true;
+  c.service_counter32 = service_counter32;
+  c.service_low16 = service_low16;
+  c.target_delta_mod65536_ticks =
+      (uint32_t)((uint16_t)(service_low16 - c.target_low16));
+
+  // Prefer the full synthetic service counter when available. The low-word
+  // modular delta remains forensic evidence, but this signed offset answers
+  // the lane-independent question: service_counter32 - target_counter32.
+  c.service_offset_signed_ticks =
+      (int32_t)(service_counter32 - c.target_counter32);
+  c.service_was_early = c.service_offset_signed_ticks < 0;
+  if (c.service_was_early) {
+    c.service_early_ticks = qtimer_abs_i32(c.service_offset_signed_ticks);
+    c.service_late_ticks = 0;
+    c.service_offset_abs_ticks = c.service_early_ticks;
+  } else {
+    c.service_late_ticks = (uint32_t)c.service_offset_signed_ticks;
+    c.service_early_ticks = 0;
+    c.service_offset_abs_ticks = c.service_late_ticks;
+  }
+}
+
+static void qtimer_capture_set_target_correction(
+    interrupt_qtimer_capture_diag_t& c,
+    int32_t correction_ticks,
+    int32_t correction_cycles,
+    uint32_t corrected_dwt,
+    bool used_as_observed_endpoint) {
+  c.target_correction_valid = true;
+  c.target_correction_ticks = correction_ticks;
+  c.target_correction_cycles = correction_cycles;
+  c.target_corrected_dwt_at_event = corrected_dwt;
+  c.target_correction_used_as_observed_endpoint = used_as_observed_endpoint;
+  if (used_as_observed_endpoint) {
+    c.observed_dwt_for_interval = corrected_dwt;
+    c.authority_policy = "TARGET_CORRECTED_DWT";
+  }
+}
+
+static void qtimer_capture_set_observed_endpoint(
+    interrupt_qtimer_capture_diag_t& c,
+    uint32_t observed_dwt_for_interval,
+    const char* authority_policy) {
+  c.observed_dwt_for_interval = observed_dwt_for_interval;
+  c.authority_policy = authority_policy;
+}
+
+static void qtimer_capture_set_subscriber_dwt(
+    interrupt_qtimer_capture_diag_t& c,
+    uint32_t subscriber_dwt_at_event) {
+  c.subscriber_dwt_at_event = subscriber_dwt_at_event;
 }
 
 // ============================================================================
@@ -2624,7 +2755,9 @@ static void vclock_ch2_one_second_enable_from_epoch_legacy_grid(
 static bool vclock_ch2_one_second_already_served_for(uint32_t counter32);
 static void vclock_ch2_one_second_service(uint32_t isr_entry_dwt_raw,
                                           uint32_t qtimer_event_dwt,
-                                          uint32_t service_counter32,
+                                          uint32_t ch2_event_counter32,
+                                          uint32_t ambient_service_counter32,
+                                          uint16_t ambient_service_low16,
                                           const spinidle_isr_capture_t& spinidle);
 static void vclock_ch2_smartzero_reset_attempt_state(void);
 static void vclock_ch2_smartzero_deactivate(void);
@@ -4004,7 +4137,8 @@ static void emit_one_second_event(interrupt_subscriber_runtime_t& rt,
                                   const dwt_repair_diag_t* repair = nullptr,
                                   bool dispatch_immediately = false,
                                   const cadence_regression_result_t* regression = nullptr,
-                                  const spinidle_isr_capture_t* spinidle = nullptr) {
+                                  const spinidle_isr_capture_t* spinidle = nullptr,
+                                  const interrupt_qtimer_capture_diag_t* qtimer_capture = nullptr) {
   if (!rt.active) return;
 
   interrupt_event_t event {};
@@ -4040,6 +4174,13 @@ static void emit_one_second_event(interrupt_subscriber_runtime_t& rt,
   copy_regression_diag(diag, regression);
   if (spinidle) {
     spinidle_copy_to_diag(diag, *spinidle);
+  }
+  if (qtimer_capture) {
+    diag.qtimer_capture = *qtimer_capture;
+    diag.qtimer_capture.subscriber_dwt_at_event = dwt_at_event;
+    if (diag.dwt_isr_entry_raw == 0) {
+      diag.dwt_isr_entry_raw = qtimer_capture->isr_entry_dwt_raw;
+    }
   }
   if (repair) {
     diag.dwt_synthetic = repair->synthetic;
@@ -4109,6 +4250,7 @@ struct vclock_perishable_fact_t {
   pps_t witness_pps{};
   uint32_t fallback_sequence = 0;
   spinidle_isr_capture_t spinidle{};
+  interrupt_qtimer_capture_diag_t qtimer_capture{};
 };
 
 struct vclock_perishable_ring_t {
@@ -4302,13 +4444,15 @@ static bool vclock_ch2_one_second_already_served_for(uint32_t counter32) {
 
 static void vclock_ch2_one_second_service(uint32_t isr_entry_dwt_raw,
                                           uint32_t qtimer_event_dwt,
-                                          uint32_t service_counter32,
+                                          uint32_t ch2_event_counter32,
+                                          uint32_t ambient_service_counter32,
+                                          uint16_t ambient_service_low16,
                                           const spinidle_isr_capture_t& spinidle) {
   if (!g_vclock_ch2_one_second_enabled) return;
   if (!g_vclock_lane.active || !g_rt_vclock || !g_rt_vclock->active) return;
 
   const uint32_t target_counter32 = g_vclock_ch2_one_second_next_counter32;
-  if ((int32_t)(service_counter32 - target_counter32) < 0) return;
+  if ((int32_t)(ch2_event_counter32 - target_counter32) < 0) return;
 
   const uint16_t target_low16 = vclock_hardware_low16_from_synthetic(target_counter32);
   spincatch_note_isr_entry(interrupt_subscriber_kind_t::VCLOCK,
@@ -4316,8 +4460,23 @@ static void vclock_ch2_one_second_service(uint32_t isr_entry_dwt_raw,
                            target_low16,
                            isr_entry_dwt_raw);
 
-  const uint32_t late_ticks = service_counter32 - target_counter32;
+  const uint32_t late_ticks = ch2_event_counter32 - target_counter32;
   uint32_t authored_dwt = qtimer_event_dwt;
+  interrupt_qtimer_capture_diag_t qtimer_capture = qtimer_capture_make(
+      interrupt_subscriber_kind_t::VCLOCK,
+      interrupt_provider_kind_t::QTIMER1,
+      interrupt_lane_t::QTIMER1_CH2_COMP,
+      isr_entry_dwt_raw,
+      qtimer_event_dwt,
+      target_counter32,
+      target_low16);
+  qtimer_capture_set_event_identity(
+      qtimer_capture,
+      ch2_event_counter32,
+      vclock_hardware_low16_from_synthetic(ch2_event_counter32));
+  qtimer_capture_set_service_counter(qtimer_capture,
+                                      ambient_service_counter32,
+                                      ambient_service_low16);
   if (late_ticks != 0) {
     g_vclock_ch2_one_second_late_count++;
     if (late_ticks > g_vclock_ch2_one_second_late_max_ticks) {
@@ -4325,6 +4484,12 @@ static void vclock_ch2_one_second_service(uint32_t isr_entry_dwt_raw,
     }
     authored_dwt -= vclock_cycles_for_ticks(late_ticks);
   }
+  qtimer_capture_set_target_correction(
+      qtimer_capture,
+      (int32_t)late_ticks,
+      (int32_t)vclock_cycles_for_ticks(late_ticks),
+      authored_dwt,
+      true);
 
   const pps_t witness_pps = g_last_pps_witness_valid ? g_last_pps_witness : pps_t{};
 
@@ -4333,7 +4498,8 @@ static void vclock_ch2_one_second_service(uint32_t isr_entry_dwt_raw,
   fact.observed_dwt_at_event = authored_dwt;
   fact.target_counter32 = target_counter32;
   fact.target_low16 = target_low16;
-  fact.observed_low16 = (uint16_t)(service_counter32 & 0xFFFFU);
+  fact.observed_low16 = (uint16_t)(ch2_event_counter32 & 0xFFFFU);
+  fact.qtimer_capture = qtimer_capture;
   fact.one_second_due = true;
   fact.witness_pps_valid = g_last_pps_witness_valid;
   fact.witness_pps = witness_pps;
@@ -4342,7 +4508,7 @@ static void vclock_ch2_one_second_service(uint32_t isr_entry_dwt_raw,
 
   g_vclock_ch2_one_second_service_count++;
   g_vclock_ch2_one_second_last_target_counter32 = target_counter32;
-  g_vclock_ch2_one_second_last_service_counter32 = service_counter32;
+  g_vclock_ch2_one_second_last_service_counter32 = ch2_event_counter32;
   g_vclock_ch2_one_second_last_dwt = authored_dwt;
 
   // Passive ISR sanity witness for the public VCLOCK one-second fact.  CNTR
@@ -4350,7 +4516,7 @@ static void vclock_ch2_one_second_service(uint32_t isr_entry_dwt_raw,
   // latency.  DWT sanity compares consecutive authored one-second DWT intervals
   // against the exact VCLOCK tick interval between their target identities.
   const uint32_t vclock_cntr_expected =
-      service_counter32 + ISR_SANITY_VCLOCK_CNTR_READ_LATENCY_TICKS;
+      ch2_event_counter32 + ISR_SANITY_VCLOCK_CNTR_READ_LATENCY_TICKS;
   const uint32_t vclock_cntr_actual = g_vclock_clock32.current_counter32;
   isr_sanity_record_cntr(g_isr_sanity_vclock_ch2,
                          true,
@@ -4384,7 +4550,7 @@ static void vclock_ch2_one_second_service(uint32_t isr_entry_dwt_raw,
   // more than one second late, skip stale teeth diagnostically instead of
   // trying to flood the drain with catch-up publications.
   uint32_t next = target_counter32 + (uint32_t)VCLOCK_COUNTS_PER_SECOND;
-  while ((int32_t)(service_counter32 - next) >= 0) {
+  while ((int32_t)(ch2_event_counter32 - next) >= 0) {
     next += (uint32_t)VCLOCK_COUNTS_PER_SECOND;
     g_vclock_ch2_one_second_catchup_count++;
     g_vclock_ch2_one_second_drop_count++;
@@ -4580,6 +4746,9 @@ static void vclock_apply_perishable_fact_deferred(
       ? "vclock_ema_gate_reject"
       : (ema_synthetic ? "vclock_ema" : "vclock_ema_init");
 
+  interrupt_qtimer_capture_diag_t qtimer_capture = fact.qtimer_capture;
+  qtimer_capture_set_subscriber_dwt(qtimer_capture, published_dwt);
+
   const pps_t witness_pps = fact.witness_pps_valid ? fact.witness_pps : pps_t{};
   publish_vclock_domain_pps_vclock(witness_pps,
                                     (witness_pps.sequence != 0)
@@ -4597,7 +4766,8 @@ static void vclock_apply_perishable_fact_deferred(
                         &ema_diag,
                         true,
                         nullptr,
-                        &fact.spinidle);
+                        &fact.spinidle,
+                        &qtimer_capture);
 
   pps_edge_dispatch_arm_or_call_from_foreground("PPS_VCLOCK_DISPATCH");
 }
@@ -5183,6 +5353,7 @@ struct interrupt_perishable_fact_t {
   uint32_t isr_entry_dwt_raw = 0;
   uint32_t service_dwt_at_event = 0;
   spinidle_isr_capture_t spinidle{};
+  interrupt_qtimer_capture_diag_t qtimer_capture{};
 
   // Authored target identity.  This is the event identity, not an ambient read.
   uint32_t target_counter32 = 0;
@@ -6053,6 +6224,19 @@ static void ocxo_apply_perishable_fact_deferred(
             ? "ocxo_ema_gate_reject"
             : (ema_synthetic ? "ocxo_ema" : "ocxo_ema_init"));
 
+  interrupt_qtimer_capture_diag_t qtimer_capture = fact.qtimer_capture;
+  qtimer_capture_set_target_correction(
+      qtimer_capture,
+      (int32_t)fact.service_offset_ticks,
+      correction_cycles,
+      corrected_dwt,
+      false);
+  qtimer_capture_set_observed_endpoint(
+      qtimer_capture,
+      observed_dwt,
+      "OCXO_SERVICE_DWT_AT_EVENT_UNCORRECTED");
+  qtimer_capture_set_subscriber_dwt(qtimer_capture, published_dwt);
+
   // We are already in TimePop ASAP/foreground context. Dispatch the authored
   // rollover OCXO edge directly from the fact drain.
   emit_one_second_event(*rt,
@@ -6063,7 +6247,8 @@ static void ocxo_apply_perishable_fact_deferred(
                         &ema_diag,
                         true,
                         nullptr,
-                        &fact.spinidle);
+                        &fact.spinidle,
+                        &qtimer_capture);
 
   // Schedule at most one low-duty landing-only callback for the next
   // already-authored OCXO target.  OCXO1 and OCXO2 use identical scheduling,
@@ -6093,6 +6278,7 @@ struct ocxo_cadence_isr_sample_t {
   uint32_t isr_csctrl_entry = 0;
   uint32_t isr_csctrl_after_program = 0;
   uint32_t event_dwt = 0;
+  interrupt_qtimer_capture_diag_t qtimer_capture{};
 
   bool had_armed = false;
   bool had_active_rt = false;
@@ -6223,6 +6409,25 @@ static void ocxo_cadence_acknowledge_and_timestamp(
   ocxo_lane_clear_compare_flag(*ctx.lane);
   sample.event_dwt =
       qtimer_event_dwt_from_isr_entry_raw(sample.isr_entry_dwt_raw);
+
+  sample.qtimer_capture = qtimer_capture_make(
+      ctx.kind,
+      ctx.provider,
+      ctx.lane_id,
+      sample.isr_entry_dwt_raw,
+      sample.event_dwt,
+      sample.target_counter32,
+      sample.target_low16);
+  const uint32_t service_counter32 = (uint32_t)(
+      (int64_t)sample.target_counter32 +
+      (int64_t)sample.service_offset_signed_ticks);
+  qtimer_capture_set_service_counter(sample.qtimer_capture,
+                                      service_counter32,
+                                      sample.service_counter_low16);
+  qtimer_capture_set_observed_endpoint(
+      sample.qtimer_capture,
+      sample.event_dwt,
+      "OCXO_SERVICE_DWT_AT_EVENT_UNCORRECTED");
 }
 
 static void ocxo_cadence_update_synthetic_identity(
@@ -6370,6 +6575,7 @@ static interrupt_perishable_fact_t ocxo_cadence_build_perishable_fact(
   fact.isr_entry_dwt_raw = sample.isr_entry_dwt_raw;
   fact.service_dwt_at_event = sample.event_dwt;
   fact.spinidle = sample.spinidle;
+  fact.qtimer_capture = sample.qtimer_capture;
   fact.target_counter32 = sample.target_counter32;
   fact.target_low16 = sample.target_low16;
   fact.service_counter_low16 = sample.service_counter_low16;
@@ -6612,17 +6818,49 @@ static void qtimer1_isr(void) {
     qtimer1_ch1_bridge_isr(isr_entry_dwt_raw);
   }
   else if (IMXRT_TMR1.CH[2].CSCTRL & TMR_CSCTRL_TCF1) {
+    const uint16_t ch2_service_low16 = qtimer1_ch0_counter_now();
+    const uint32_t ch2_service_counter32 =
+        vclock_synthetic_from_hardware_low16(ch2_service_low16);
     qtimer1_ch2_clear_compare_flag();
     const uint32_t qtimer_event_dwt = qtimer_event_dwt_from_isr_entry_raw(isr_entry_dwt_raw);
     // Snapshot the fired target before TimePop is invoked; the handler may arm
     // the next compare and update g_qtimer1_ch2_last_target_counter32.
     const uint32_t ch2_event_counter32 = g_qtimer1_ch2_last_target_counter32;
+    const uint16_t ch2_event_low16 =
+        vclock_hardware_low16_from_synthetic(ch2_event_counter32);
+    interrupt_qtimer_capture_diag_t timepop_qtimer_capture = qtimer_capture_make(
+        interrupt_subscriber_kind_t::TIMEPOP,
+        interrupt_provider_kind_t::QTIMER1,
+        interrupt_lane_t::QTIMER1_CH2_COMP,
+        isr_entry_dwt_raw,
+        qtimer_event_dwt,
+        ch2_event_counter32,
+        ch2_event_low16);
+    qtimer_capture_set_service_counter(timepop_qtimer_capture,
+                                        ch2_service_counter32,
+                                        ch2_service_low16);
+    const int32_t timepop_target_correction_cycles =
+        vclock_cycles_for_ticks_signed(
+            timepop_qtimer_capture.service_offset_signed_ticks);
+    qtimer_capture_set_target_correction(
+        timepop_qtimer_capture,
+        timepop_qtimer_capture.service_offset_signed_ticks,
+        timepop_target_correction_cycles,
+        (uint32_t)((int64_t)qtimer_event_dwt -
+                   (int64_t)timepop_target_correction_cycles),
+        false);
+    qtimer_capture_set_observed_endpoint(
+        timepop_qtimer_capture,
+        qtimer_event_dwt,
+        "TIMEPOP_FIXED_LATENCY_EVENT_DWT");
     interrupt_ch2_implicit_rollover_tend();
 
     pps_relay_ch2_tick(g_vclock_clock32.current_counter32);
     vclock_ch2_one_second_service(isr_entry_dwt_raw,
                                   qtimer_event_dwt,
                                   ch2_event_counter32,
+                                  ch2_service_counter32,
+                                  ch2_service_low16,
                                   spinidle);
     vclock_ch2_smartzero_service(qtimer_event_dwt,
                                   ch2_event_counter32);
@@ -6652,6 +6890,9 @@ static void qtimer1_isr(void) {
       diag.gnss_ns_at_event   = event.gnss_ns_at_event;
       diag.counter32_at_event = event.counter32_at_event;
       diag.dwt_isr_entry_raw  = isr_entry_dwt_raw;
+      qtimer_capture_set_subscriber_dwt(timepop_qtimer_capture,
+                                        qtimer_event_dwt);
+      diag.qtimer_capture = timepop_qtimer_capture;
       spinidle_copy_to_diag(diag, spinidle);
       g_spinidle_timepop_last_capture = spinidle;
       bridge_projection_copy_to_diag(diag, bridge);
@@ -7635,6 +7876,64 @@ struct payload_prefix_t {
   }
 };
 
+static void add_qtimer_capture_summary(
+    payload_prefix_t& out,
+    const interrupt_qtimer_capture_diag_t* c) {
+  const interrupt_qtimer_capture_diag_t empty{};
+  const interrupt_qtimer_capture_diag_t& q = c ? *c : empty;
+
+  out.add_bool("last_diag_qtimer_capture_valid", q.diagnostic_valid);
+  out.add_bool("last_diag_qtimer_capture_diagnostic_only", q.diagnostic_only);
+  out.add_u32("last_diag_qtimer_capture_provider", (uint32_t)((uint8_t)q.provider));
+  out.add_u32("last_diag_qtimer_capture_lane", (uint32_t)((uint8_t)q.lane));
+  out.add_u32("last_diag_qtimer_capture_kind", (uint32_t)((uint8_t)q.kind));
+
+  out.add_u32("last_diag_qtimer_isr_entry_dwt_raw", q.isr_entry_dwt_raw);
+  out.add_u32("last_diag_qtimer_fixed_latency_correction_cycles",
+              q.fixed_latency_correction_cycles);
+  out.add_u32("last_diag_qtimer_fixed_latency_event_dwt",
+              q.fixed_latency_event_dwt);
+
+  out.add_bool("last_diag_qtimer_target_valid", q.target_valid);
+  out.add_u32("last_diag_qtimer_target_counter32", q.target_counter32);
+  out.add_u32("last_diag_qtimer_target_low16", (uint32_t)q.target_low16);
+  out.add_bool("last_diag_qtimer_event_identity_valid", q.event_identity_valid);
+  out.add_u32("last_diag_qtimer_event_identity_counter32",
+              q.event_identity_counter32);
+  out.add_u32("last_diag_qtimer_event_identity_low16",
+              (uint32_t)q.event_identity_low16);
+
+  out.add_bool("last_diag_qtimer_service_counter_valid", q.service_counter_valid);
+  out.add_u32("last_diag_qtimer_service_counter32", q.service_counter32);
+  out.add_u32("last_diag_qtimer_service_low16", (uint32_t)q.service_low16);
+  out.add_i32("last_diag_qtimer_service_offset_signed_ticks",
+              q.service_offset_signed_ticks);
+  out.add_u32("last_diag_qtimer_service_offset_abs_ticks",
+              q.service_offset_abs_ticks);
+  out.add_bool("last_diag_qtimer_service_was_early", q.service_was_early);
+  out.add_u32("last_diag_qtimer_service_late_ticks", q.service_late_ticks);
+  out.add_u32("last_diag_qtimer_service_early_ticks", q.service_early_ticks);
+  out.add_u32("last_diag_qtimer_target_delta_mod65536_ticks",
+              q.target_delta_mod65536_ticks);
+
+  out.add_bool("last_diag_qtimer_target_correction_valid",
+               q.target_correction_valid);
+  out.add_i32("last_diag_qtimer_target_correction_ticks",
+              q.target_correction_ticks);
+  out.add_i32("last_diag_qtimer_target_correction_cycles",
+              q.target_correction_cycles);
+  out.add_u32("last_diag_qtimer_target_corrected_dwt_at_event",
+              q.target_corrected_dwt_at_event);
+  out.add_bool("last_diag_qtimer_target_correction_used_as_observed_endpoint",
+               q.target_correction_used_as_observed_endpoint);
+
+  out.add_u32("last_diag_qtimer_observed_dwt_for_interval",
+              q.observed_dwt_for_interval);
+  out.add_str("last_diag_qtimer_authority_policy", q.authority_policy);
+  out.add_u32("last_diag_qtimer_subscriber_dwt_at_event",
+              q.subscriber_dwt_at_event);
+}
+
 static void spincatch_plan_from_target(spincatch_lane_report_t& s,
                                        bool target_valid,
                                        uint32_t target_counter32,
@@ -8482,6 +8781,8 @@ static void add_runtime_lane_summary(Payload& p,
                                      const char* prefix,
                                      const interrupt_subscriber_runtime_t* rt) {
   payload_prefix_t out(p, prefix);
+  const interrupt_qtimer_capture_diag_t* qtimer_capture =
+      (rt && rt->has_fired) ? &rt->last_diag.qtimer_capture : nullptr;
 
   out.add_bool("subscribed", rt ? rt->subscribed : false);
   out.add_bool("active", rt ? rt->active : false);
@@ -8539,6 +8840,8 @@ static void add_runtime_lane_summary(Payload& p,
     out.add_u32("last_diag_anchor_selection_kind", 0);
     out.add_u32("last_diag_anchor_failure_mask", 0);
   }
+
+  add_qtimer_capture_summary(out, qtimer_capture);
 }
 static void add_vclock_lane_payload(Payload& p, bool detailed) {
   p.add("lane", "VCLOCK");
@@ -8956,6 +9259,14 @@ static void add_ocxo_qtimer_payload(payload_prefix_t& out,
   out.add_u32("qtimer_last_event_dwt", qdiag.event_dwt);
   out.add_u32("qtimer_last_dwt_coordinate_source",
               qdiag.dwt_coordinate_source);
+
+  // Shared capture packet from the last subscriber event.  The legacy qtimer_*
+  // fields above are OCXO-specific; last_diag_qtimer_* is the symmetric packet
+  // used to compare VCLOCK, OCXO1, and OCXO2 with identical vocabulary.
+  const interrupt_subscriber_runtime_t* rt = ocxo_runtime_for(ctx);
+  const interrupt_qtimer_capture_diag_t* qtimer_capture =
+      (rt && rt->has_fired) ? &rt->last_diag.qtimer_capture : nullptr;
+  add_qtimer_capture_summary(out, qtimer_capture);
 }
 
 static void add_ocxo_perishable_ring_payload(payload_prefix_t& out,
@@ -9033,6 +9344,13 @@ static void add_ocxo_compact_payload(Payload& p,
               (rt && rt->has_fired) ? rt->last_diag.dwt_isr_entry_raw : 0U);
   out.add_i32("last_diag_dwt_synthetic_error_cycles",
               (rt && rt->has_fired) ? rt->last_diag.dwt_synthetic_error_cycles : 0);
+
+  // Shared QTimer capture packet — deliberately mirrored in the OCXO summary
+  // so REPORT_LANE summary gives the same apples-to-apples fields as VCLOCK.
+  const interrupt_qtimer_capture_diag_t* qtimer_capture =
+      (rt && rt->has_fired) ? &rt->last_diag.qtimer_capture : nullptr;
+  add_qtimer_capture_summary(out, qtimer_capture);
+
   out.add_bool("last_diag_spinidle_shadow_valid",
                rt && rt->has_fired && rt->last_diag.spinidle_shadow_valid);
   out.add_u32("last_diag_spinidle_shadow_dwt",
@@ -9712,6 +10030,13 @@ static void add_vclock_lane_fact_ring_section(Payload& p) {
 }
 
 static void add_vclock_lane_qtimer_section(Payload& p) {
+  payload_prefix_t out(p, "vclock");
+  const interrupt_qtimer_capture_diag_t* qtimer_capture =
+      (g_rt_vclock && g_rt_vclock->has_fired)
+          ? &g_rt_vclock->last_diag.qtimer_capture
+          : nullptr;
+  add_qtimer_capture_summary(out, qtimer_capture);
+
   p.add("qtimer1_ch1_active", g_qtimer1_ch1_active);
   p.add("qtimer1_ch1_sequence", g_qtimer1_ch1_sequence);
   p.add("qtimer1_ch1_target_counter32", g_qtimer1_ch1_target_counter32);

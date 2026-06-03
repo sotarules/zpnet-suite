@@ -233,6 +233,74 @@ struct interrupt_event_t {
   bool     pps_coincidence_valid  = false;
 };
 
+
+// ============================================================================
+// Shared QTimer ISR capture diagnostic
+// ============================================================================
+//
+// This is the apples-to-apples evidence packet for QTimer compare events.  It
+// records the first-instruction ISR DWT, the fixed latency-adjusted service
+// coordinate, the authored compare target, any ambient service counter read,
+// and every target/service correction that was computed.  It is diagnostic
+// only: subscriber authority remains interrupt_event_t::dwt_at_event.
+
+struct interrupt_qtimer_capture_diag_t {
+  bool diagnostic_valid = false;
+  bool diagnostic_only = true;
+
+  interrupt_provider_kind_t   provider = interrupt_provider_kind_t::NONE;
+  interrupt_lane_t            lane = interrupt_lane_t::NONE;
+  interrupt_subscriber_kind_t kind = interrupt_subscriber_kind_t::NONE;
+
+  // First-instruction raw DWT and the common fixed QTimer latency correction.
+  uint32_t isr_entry_dwt_raw = 0;
+  uint32_t fixed_latency_correction_cycles = 0;
+  uint32_t fixed_latency_event_dwt = 0;
+
+  // Authored compare-target identity.
+  bool     target_valid = false;
+  uint32_t target_counter32 = 0;
+  uint16_t target_low16 = 0;
+
+  // Event identity used by the current subscriber path.  For OCXO this is the
+  // authored target; for VCLOCK/TimePop CH2 this is the CH2 compare deadline
+  // that process_interrupt armed on TimePop's behalf.
+  bool     event_identity_valid = false;
+  uint32_t event_identity_counter32 = 0;
+  uint16_t event_identity_low16 = 0;
+
+  // Ambient service-time counter observation, when the path has one.
+  bool     service_counter_valid = false;
+  uint32_t service_counter32 = 0;
+  uint16_t service_low16 = 0;
+  int32_t  service_offset_signed_ticks = 0;
+  uint32_t service_offset_abs_ticks = 0;
+  bool     service_was_early = false;
+  uint32_t service_late_ticks = 0;
+  uint32_t service_early_ticks = 0;
+  uint32_t target_delta_mod65536_ticks = 0;
+
+  // Target/service correction.  Positive correction cycles mean the ISR was
+  // observed after the target tooth and the corrected coordinate is earlier
+  // than fixed_latency_event_dwt.  For OCXO this is currently witness-only;
+  // for VCLOCK it documents the target-authored endpoint before EMA.
+  bool     target_correction_valid = false;
+  int32_t  target_correction_ticks = 0;
+  int32_t  target_correction_cycles = 0;
+  uint32_t target_corrected_dwt_at_event = 0;
+  bool     target_correction_used_as_observed_endpoint = false;
+
+  // Endpoint actually fed to the lane EMA/gate.  This may be the fixed-latency
+  // service DWT, or a target/backdate-corrected DWT, depending on lane policy.
+  uint32_t observed_dwt_for_interval = 0;
+  const char* authority_policy = nullptr;
+
+  // Final subscriber-facing coordinate for this event.  This mirrors
+  // interrupt_event_t::dwt_at_event and makes the full chain visible in one
+  // packet: raw -> fixed latency -> target correction -> subscriber DWT.
+  uint32_t subscriber_dwt_at_event = 0;
+};
+
 // ============================================================================
 // Diagnostic surface — carried alongside every one-second event
 // ============================================================================
@@ -275,6 +343,11 @@ struct interrupt_capture_diag_t {
   int32_t  dwt_synthetic_error_cycles = 0;
   uint32_t dwt_synthetic_threshold_cycles = 0;
   const char* dwt_synthetic_reason = nullptr;
+
+  // Shared QTimer capture packet.  This is intentionally independent of the
+  // legacy dwt_original/predicted/used fields so reports can compare every
+  // QTimer lane using the same vocabulary.
+  interrupt_qtimer_capture_diag_t qtimer_capture{};
 
   // One-second DWT interval gate audit.  These fields preserve the raw
   // observed cycle interval beside the effective interval that was delivered

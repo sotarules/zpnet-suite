@@ -327,6 +327,12 @@ struct clocks_alpha_lane_forensics_t {
   uint32_t dwt_isr_entry_raw;
   int32_t  dwt_synthetic_error_cycles;
   uint32_t dwt_synthetic_threshold_cycles;
+
+  // Shared process_interrupt QTimer capture packet.  This is the apples-to-
+  // apples evidence surface for comparing VCLOCK, OCXO1, and OCXO2 ISR
+  // capture/target-correction policy in TIMEBASE_FORENSICS.
+  interrupt_qtimer_capture_diag_t qtimer_capture;
+
   bool     dwt_interval_gate_valid;
   bool     dwt_interval_sample_accepted;
   bool     dwt_interval_sample_rejected;
