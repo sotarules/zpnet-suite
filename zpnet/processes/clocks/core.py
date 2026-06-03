@@ -953,6 +953,16 @@ def _begin_sync_wait(expected_pps: int) -> None:
         _sync_event.clear()
 
 
+def _clear_sync_wait() -> None:
+    """Disarm any synchronous START/RECOVER wait latch."""
+    global _sync_expected_pps_vclock, _sync_fragment
+
+    with _sync_lock:
+        _sync_expected_pps_vclock = None
+        _sync_fragment = None
+        _sync_event.clear()
+
+
 def _end_sync_wait(timeout_s: float = SYNC_FRAGMENT_TIMEOUT_S) -> Tuple[Dict[str, Any], float]:
     """Block until the sync fragment arrives or timeout.  Hard fault on timeout."""
     global _sync_expected_pps_vclock
@@ -2201,12 +2211,9 @@ def cmd_start(args: Optional[dict]) -> dict:
 
     _reset_trackers()
 
-    with _sync_lock:
-        # START is asynchronous, so no START-specific sync latch remains armed.
-        # RECOVER still uses the sync wait machinery.
-        _sync_expected_pps_vclock = None
-        _sync_fragment = None
-        _sync_event.clear()
+    # START is asynchronous, so no START-specific sync latch remains armed.
+    # RECOVER still uses the sync wait machinery.
+    _clear_sync_wait()
 
     _accepted_pps_vclock_count = None
     _diag["accepted_pps_count"] = None
@@ -2602,8 +2609,7 @@ def _recover_campaign() -> None:
         _drain_timebase_ingress_and_pending()
 
         _reset_trackers()
-
-        _begin_sync_wait(expected_pps=1)
+        _clear_sync_wait()
 
         teensy_args: Dict[str, Any] = {"campaign": campaign_name}
         recover_ocxo1_dac = campaign_payload.get("ocxo1_dac")
@@ -2616,36 +2622,42 @@ def _recover_campaign() -> None:
         if recover_calibrate:
             teensy_args["calibrate_ocxo"] = recover_calibrate
 
-        logging.info("📡 [recovery/cold] @%s arming TEENSY START: pps_vclock_count=0; waiting for first post-warmup fragment", system_time_z())
-        _request_teensy_start(campaign=campaign_name, pps_vclock_count=0, args=teensy_args)
+        _accepted_pps_vclock_count = None
+        _diag["accepted_pps_count"] = None
+        _diag["accepted_pps_vclock_count"] = None
 
-        try:
-            frag, waited_s = _end_sync_wait()
-        except Exception:
-            raise
+        _mark_start_waiting(campaign_name)
 
-        teensy_pps_vclock_count = _extract_teensy_pps_vclock_count(frag)
-        _accepted_pps_vclock_count = int(teensy_pps_vclock_count)
-        _diag["accepted_pps_count"] = _accepted_pps_vclock_count
-        _diag["accepted_pps_vclock_count"] = _accepted_pps_vclock_count
-
-        _drain_timebase_ingress_and_pending()
-
-        _reset_trackers()
+        # Cold recovery has no prior TIMEBASE row to recover from.  Treat it as
+        # an async START of the existing active campaign, matching cmd_start().
+        # The normal processor thread will accept the first complete
+        # TIMEBASE_FRAGMENT/TIMEBASE_FORENSICS pair whenever it arrives.
         _campaign_active = True
 
         logging.info(
-            "✅ [recovery/cold] @%s campaign '%s' cold-restarted — TIMEBASE begins\n"
-            "    waited = %.3fs",
-            system_time_z(), campaign_name, waited_s,
+            "📡 [recovery/cold] @%s arming TEENSY START asynchronously: "
+            "pps_vclock_count=0; waiting for first pair in processor thread",
+            system_time_z(),
+        )
+        try:
+            _request_teensy_start(campaign=campaign_name, pps_vclock_count=0, args=teensy_args)
+        except Exception:
+            _campaign_active = False
+            _accepted_pps_vclock_count = None
+            _clear_start_wait_state()
+            raise
+
+        logging.info(
+            "▶️ [recovery/cold] @%s START requested asynchronously — campaign '%s' active",
+            system_time_z(), campaign_name,
         )
 
         _diag["last_recovery"] = {
             "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "campaign": campaign_name,
-            "mode": "cold_restart",
-            "teensy_pps_vclock_count": int(teensy_pps_vclock_count),
-            "pps_count": int(teensy_pps_vclock_count),
+            "mode": "cold_restart_async",
+            "sync_wait_removed": True,
+            "waiting_for_first_fragment": True,
         }
         return
 
@@ -3669,7 +3681,7 @@ def run() -> None:
         "Four clock domains: GNSS (reference), DWT, OCXO1, OCXO2. "
         "DWT/OCXO1/OCXO2 prediction stats from Teensy are authoritative. "
         "Pi-side Welford for DWT/OCXO1/OCXO2 removed. GNSS stream canary retained. "
-        "Recovery: campaign deactivated + queue drained + late reset; valid fragments are never rejected for count mismatch. START is asynchronous. "
+        "Recovery: campaign deactivated + queue drained + late reset; valid fragments are never rejected for count mismatch. START and cold recovery are asynchronous. "
         "START while active performs seamless flash-cut to new campaign. "
         "Commands: START, STOP, RESUME, REPORT, CLEAR, DELETE, SET_DAC, DITHER, "
         "SET_BASELINE, BASELINE_INFO, LIST_CAMPAIGNS, CLOCKS_INFO. "
@@ -3773,7 +3785,15 @@ def run() -> None:
         except Exception:
             logging.exception("⚠️ [clocks] failed to reconcile GNSS mode at boot idle")
     else:
-        _recover_campaign()
+        try:
+            _recover_campaign()
+        except Exception:
+            # Boot must not die merely because campaign recovery/startup is
+            # waiting or failed.  Keep the command interface alive so the
+            # operator can REPORT, STOP, CLEAR, DELETE, or START explicitly.
+            logging.exception("💥 [clocks] boot recovery failed; CLOCKS command interface remains available")
+            _campaign_active = False
+            _clear_sync_wait()
 
     # Block forever
     logging.info("🏁 [clocks] entering main loop")
