@@ -7,10 +7,12 @@
 //
 //   • Stimulus source pin  — TimePop callback drives HIGH/LOW.
 //   • GPIO sink            — GPIO interrupt sees the source rising edge.
+//   • GPT witness sink     — GPT2 external-clock/OCR1 compare ISR
+//                            sees the same stimulus edge through timer fabric.
 //
 // QTimer2 is no longer used by witness.  OCXO1 now owns QTimer2 CH0 through
-// process_interrupt, so witness preserves only the GPIO round-trip path and
-// TimePop-based bridge/phase reports.
+// process_interrupt, so witness preserves the GPIO round-trip path plus a
+// narrow GPT external-clock compare witness for timer-fabric latency tests.
 //
 // The PPS/VCLOCK bridge and phase witness no longer use QTimer1 CH1 or any
 // process_interrupt-hosted compare plumbing.  They are ordinary TimePop
@@ -28,6 +30,7 @@
 //   BRIDGE        — DWT/GNSS bridge check using TimePop fire facts.
 //   GPIO_DELAY    — simple digitalWriteFast HIGH stimulus cost.
 //   QTIMER_READ   — GPIO ISR-to-VCLOCK counter observation delay/cost.
+//   GPT_STIM      — stimulus-to-GPT external-clock/OCR compare ISR latency.
 //   DWT_READ      — consecutive DWT read-cost measurement.
 //   ENTRY_LATENCY — spin-shadow ISR entry latency for PPS.
 //   PPS_PHASE     — PPS/VCLOCK phase inferred from TimePop witness events.
@@ -35,6 +38,7 @@
 //
 // Test cadence:
 //   • 100 ms: GPIO HIGH   (visible 1 Hz heartbeat; away from PPS)
+//              The same rising edge may be wired to GPIO and GPT witness input.
 //   • 600 ms: GPIO LOW    (500 ms high duty interval)
 //
 // The waveform slots are armed as one-shots once per scheduler cycle.  Do not
@@ -66,8 +70,35 @@
 static constexpr int WITNESS_STIMULUS_PIN = 24;
 static constexpr int WITNESS_GPIO_PIN     = 26;
 
-static constexpr uint64_t GPIO_HIGH_OFFSET_NS   = 100000000ULL;
-static constexpr uint64_t GPIO_LOW_OFFSET_NS    = 600000000ULL;
+// GPT external-clock witness.
+//
+// Wire WITNESS_STIMULUS_PIN to WITNESS_GPIO_PIN and WITNESS_GPT_PIN.  The
+// witness uses GPT2 OCR1 for CNT+1 immediately before driving the stimulus
+// HIGH.  The rising edge should increment GPT2's external-clock counter and
+// fire the OCR1 compare interrupt.
+//
+// Pin 25 is intentionally adjacent to the existing A10/A12 witness pair.  It
+// must be muxed to the GPT2 external clock input on the target Teensy build.
+// If the board revision uses a different exposed GPTx_CLK pad, only these
+// constants and witness_gpt_configure_pin() should change.
+static constexpr int  WITNESS_GPT_PIN = 14;
+static constexpr const char* WITNESS_GPT_PROVIDER = "GPT2_OCR1_EXTCLK";
+static constexpr uint32_t WITNESS_GPT_IRQ_PRIORITY = 32;
+
+// GPT register bits used locally.  Teensy core versions normally provide some
+// of these, but keeping local names makes the witness self-contained.
+#define GPT_CR_EN              (1u << 0)
+#define GPT_CR_ENMOD           (1u << 1)
+#define GPT_CR_CLKSRC(n)       (((uint32_t)(n) & 7u) << 6)
+#define GPT_CR_FRR             (1u << 9)
+#define GPT_CR_SWR             (1u << 15)
+#define GPT_IR_OF1IE           (1u << 0)
+#define GPT_SR_OF1             (1u << 0)
+
+static constexpr uint32_t GPT_CR_CLKSRC_EXTERNAL = 3u;
+
+static constexpr uint64_t GPIO_HIGH_OFFSET_NS   = 500500000ULL;  // PPS + 500.500 ms quiet-phase stimulus
+static constexpr uint64_t GPIO_LOW_OFFSET_NS    = 600500000ULL;  // 100 ms high interval after quiet-phase stimulus
 static constexpr uint64_t WITNESS_CYCLE_PERIOD_NS = 1000000000ULL;
 
 static constexpr const char* GPIO_HIGH_NAME   = "WITNESS_GPIO_HIGH";
@@ -81,6 +112,7 @@ static constexpr uint32_t ENTRY_LATENCY_TIMEOUT_CYCLES = 100000U;  // ~99 us @ 1
 static constexpr const char* ENTRY_PPS_SPIN_NAME = "ENTRY_LATENCY_PPS_SPIN";
 
 static constexpr uint32_t VCLOCK_TICKS_PER_SECOND_U32 = 10000000U;
+static constexpr uint32_t WITNESS_GPT_COMPARE_LEAD_TICKS = 1U;
 
 static pps_t witness_last_physical_pps_diag(void) {
   const pps_edge_snapshot_t snap = interrupt_last_pps_edge();
@@ -155,7 +187,7 @@ static volatile uint32_t g_witness_last_stop_dwt = 0;
 static volatile uint32_t g_witness_cycle_count = 0;
 static volatile uint32_t g_witness_cycle_reschedules = 0;
 
-enum class witness_window_t : uint8_t { NONE = 0, GPIO };
+enum class witness_window_t : uint8_t { NONE = 0, GPIO, GPIO_GPT };
 static volatile witness_window_t g_active_window = witness_window_t::NONE;
 
 static volatile bool g_source_high = false;
@@ -174,6 +206,73 @@ static volatile uint32_t g_gpio_wrong_window = 0;
 
 static welford_t g_source_welford = {};
 static welford_t g_gpio_welford = {};
+
+// ============================================================================
+// GPT_STIM — stimulus-to-GPT external-clock compare ISR latency
+// ============================================================================
+//
+// This is the first GPT custody probe.  A TimePop callback arms GPT1 OCR1 for
+// CNT+1, then drives WITNESS_STIMULUS_PIN HIGH.  If the stimulus pin is wired
+// to WITNESS_GPT_PIN and that pin is muxed to GPT2 external clock, the rising
+// edge increments GPT2 CNT and should immediately satisfy OCR1.
+//
+// The GPT ISR captures ARM_DWT_CYCCNT as its first instruction.  The report
+// compares that timestamp to the same stimulus DWT used by the GPIO round-trip
+// report.  This is intentionally parallel to the OCXO question: can a timer
+// compare event deliver a stable ISR-entry DWT when the timer source is a
+// stimulus edge?
+
+static volatile bool     g_gpt_configured = false;
+static volatile bool     g_gpt_armed = false;
+static volatile uint32_t g_gpt_arm_count = 0;
+static volatile uint32_t g_gpt_arm_fail_count = 0;
+static volatile uint32_t g_gpt_hits = 0;
+static volatile uint32_t g_gpt_false_irq = 0;
+static volatile uint32_t g_gpt_wrong_window = 0;
+static volatile uint32_t g_gpt_sr_at_isr = 0;
+static volatile uint32_t g_gpt_cnt_at_arm = 0;
+static volatile uint32_t g_gpt_expected_counter = 0;
+static volatile uint32_t g_gpt_cnt_at_isr = 0;
+static volatile int32_t  g_gpt_counter_residual_ticks = 0;
+static volatile uint32_t g_gpt_dwt_at_arm = 0;
+static volatile uint32_t g_gpt_dwt_at_isr = 0;
+static volatile uint32_t g_gpt_delta_cycles = 0;
+static volatile uint32_t g_gpt_entry_to_counter_read_cycles = 0;
+static welford_t g_gpt_welford = {};
+static welford_t g_gpt_counter_residual_welford = {};
+static welford_t g_gpt_entry_to_counter_read_welford = {};
+
+
+// GPT OCR1 forensics.  These are deliberately redundant register snapshots so
+// GPT_STIM can tell whether the counter, compare register, status flag, and
+// interrupt mask agree.
+static volatile uint32_t g_gpt_live_cnt = 0;
+static volatile uint32_t g_gpt_live_sr = 0;
+static volatile uint32_t g_gpt_live_ir = 0;
+static volatile uint32_t g_gpt_live_cr = 0;
+static volatile uint32_t g_gpt_live_pr = 0;
+static volatile uint32_t g_gpt_live_ocr1 = 0;
+static volatile int32_t  g_gpt_live_ocr1_delta = 0;
+static volatile bool     g_gpt_live_of1_pending = false;
+static volatile bool     g_gpt_live_of1_irq_enabled = false;
+static volatile uint32_t g_gpt_compare_flag_seen_poll_count = 0;
+static volatile uint32_t g_gpt_compare_flag_clear_poll_count = 0;
+static volatile uint32_t g_gpt_compare_missed_poll_count = 0;
+static volatile bool     g_gpt_ladder_mode = true;
+static volatile uint32_t g_gpt_ladder_step_ticks = 1;
+static volatile uint32_t g_gpt_ladder_rearm_count = 0;
+static volatile uint32_t g_gpt_ladder_last_prev_ocr1 = 0;
+static volatile uint32_t g_gpt_ladder_last_next_ocr1 = 0;
+static volatile int32_t  g_gpt_ladder_last_cnt_minus_prev_ocr1 = 0;
+static volatile uint32_t g_gpt_arm_too_close_count = 0;
+static volatile uint32_t g_gpt_arm_cnt_after_ocr_count = 0;
+static volatile uint32_t g_gpt_arm_cnt_equal_ocr_count = 0;
+static volatile uint32_t g_gpt_arm_live_sr_after_arm = 0;
+static volatile uint32_t g_gpt_arm_live_ir_after_arm = 0;
+static volatile uint32_t g_gpt_arm_live_cr_after_arm = 0;
+static volatile uint32_t g_gpt_arm_live_cnt_after_arm = 0;
+
+
 
 // ============================================================================
 // QTIMER_READ — cost of obtaining a VCLOCK counter observation inside GPIO ISR
@@ -366,6 +465,7 @@ static welford_t g_bridge_dynamic_residual_welford = {};
 // ============================================================================
 
 void witness_gpio_isr(void);
+void witness_gpt2_isr(void);
 
 static void gpio_high_callback(timepop_ctx_t*, timepop_diag_t*, void*);
 static void gpio_low_callback(timepop_ctx_t*, timepop_diag_t*, void*);
@@ -377,19 +477,217 @@ static bool entry_latency_arm_pps_spin(void);
 static bool witness_ensure_scheduled(void);
 static Payload witness_state_payload(void);
 
+
+// ============================================================================
+// GPT_STIM helpers
+// ============================================================================
+
+
+static inline void witness_gpt_refresh_live_registers(void) {
+  const uint32_t cnt = GPT2_CNT;
+  const uint32_t sr = GPT2_SR;
+  const uint32_t ir = GPT2_IR;
+  const uint32_t cr = GPT2_CR;
+  const uint32_t pr = GPT2_PR;
+  const uint32_t ocr1 = GPT2_OCR1;
+
+  g_gpt_live_cnt = cnt;
+  g_gpt_live_sr = sr;
+  g_gpt_live_ir = ir;
+  g_gpt_live_cr = cr;
+  g_gpt_live_pr = pr;
+  g_gpt_live_ocr1 = ocr1;
+  g_gpt_live_ocr1_delta = (int32_t)((int64_t)ocr1 - (int64_t)cnt);
+  g_gpt_live_of1_pending = (sr & GPT_SR_OF1) != 0;
+  g_gpt_live_of1_irq_enabled = (ir & GPT_IR_OF1IE) != 0;
+
+  if (g_gpt_live_of1_pending) {
+    g_gpt_compare_flag_seen_poll_count++;
+  }
+}
+
+static inline void witness_gpt_clear_compare_flag(void) {
+  if ((GPT2_SR & GPT_SR_OF1) != 0) {
+    g_gpt_compare_flag_clear_poll_count++;
+  }
+  GPT2_SR = GPT_SR_OF1;
+}
+
+static inline void witness_gpt_disable_compare_irq(void) {
+  GPT2_IR &= ~GPT_IR_OF1IE;
+}
+
+static inline void witness_gpt_enable_compare_irq(void) {
+  GPT2_IR |= GPT_IR_OF1IE;
+}
+
+static void witness_gpt_configure_pin(void) {
+  // Known-good POC route:
+  //   Teensy pin 14
+  //   Pad GPIO_AD_B1_02
+  //   ALT8 -> GPT2_CLK
+  //
+  // The SELECT_INPUT daisy is mandatory; without it GPT2_CNT does not see
+  // the external edge even though the pad mux appears configured.
+  IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B1_02 = 8;
+
+  IOMUXC_SW_PAD_CTL_PAD_GPIO_AD_B1_02 =
+      IOMUXC_PAD_HYS |
+      IOMUXC_PAD_PKE |
+      IOMUXC_PAD_PUE |
+      IOMUXC_PAD_DSE(4);
+
+  IOMUXC_GPT2_IPP_IND_CLKIN_SELECT_INPUT = 1;
+}
+
+static void witness_gpt_init_hardware(void) {
+  if (g_gpt_configured) return;
+
+  witness_gpt_configure_pin();
+
+  // Old proven POC pattern:
+  //   GPT2 external clock via pin 14
+  //   FRR set
+  //   OCR1 initialized before EN
+  //   IRQ enabled continuously
+  CCM_CCGR0 |= CCM_CCGR0_GPT2_BUS(CCM_CCGR_ON);
+
+  GPT2_CR = 0;
+  GPT2_SR = 0x3Fu;
+  GPT2_PR = 0;
+  GPT2_CR = GPT_CR_CLKSRC(3) | GPT_CR_FRR;
+
+  const uint32_t cnt = GPT2_CNT;
+  const uint32_t target = cnt + WITNESS_GPT_COMPARE_LEAD_TICKS;
+  GPT2_OCR1 = target;
+  GPT2_SR = GPT_SR_OF1;
+  GPT2_IR |= GPT_IR_OF1IE;
+
+  attachInterruptVector(IRQ_GPT2, witness_gpt2_isr);
+  NVIC_SET_PRIORITY(IRQ_GPT2, WITNESS_GPT_IRQ_PRIORITY);
+  NVIC_ENABLE_IRQ(IRQ_GPT2);
+
+  GPT2_CR |= GPT_CR_EN;
+
+  g_gpt_cnt_at_arm = cnt;
+  g_gpt_expected_counter = target;
+  g_gpt_dwt_at_arm = ARM_DWT_CYCCNT;
+  g_gpt_armed = true;
+  g_gpt_arm_count++;
+  g_gpt_configured = true;
+
+  witness_gpt_refresh_live_registers();
+}
+
+static bool witness_gpt_arm_next_stimulus(void) {
+  if (!g_gpt_configured || !g_witness_running) {
+    g_gpt_arm_fail_count++;
+    return false;
+  }
+
+  // Continuous-ladder doctrine: foreground never chases OCR1.  GPT2_OCR1 is
+  // kept in the future by the GPT ISR itself.  This function remains as a
+  // liveness hook for reports and future commands.
+  witness_gpt_refresh_live_registers();
+
+  if ((GPT2_SR & GPT_SR_OF1) != 0) {
+    g_gpt_compare_flag_seen_poll_count++;
+  }
+
+  const int32_t delta =
+      (int32_t)((int64_t)GPT2_OCR1 - (int64_t)GPT2_CNT);
+  if (delta < -1 && (GPT2_SR & GPT_SR_OF1) == 0) {
+    g_gpt_compare_missed_poll_count++;
+  }
+
+  return true;
+}
+
+void witness_gpt2_isr(void) {
+  const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;
+  const uint32_t sr = GPT2_SR;
+
+  GPT2_SR = GPT_SR_OF1;
+
+  if ((sr & GPT_SR_OF1) == 0) {
+    g_gpt_false_irq++;
+    witness_gpt_refresh_live_registers();
+    return;
+  }
+
+  const uint32_t before_counter = ARM_DWT_CYCCNT;
+  const uint32_t cnt = GPT2_CNT;
+  const uint32_t after_counter = ARM_DWT_CYCCNT;
+
+  const uint32_t prev_ocr1 = GPT2_OCR1;
+  uint32_t next_ocr1 = prev_ocr1;
+
+  // Keep OCR1 strictly in the future.  The old POC used OCR1 += 1, which is
+  // fine when the ISR lands before CNT reaches the next rung.  Our witness has
+  // shown CNT can already equal/pass that rung, so advance until the target is
+  // ahead of the observed GPT count.
+  do {
+    next_ocr1 += g_gpt_ladder_step_ticks;
+  } while ((int32_t)((int64_t)next_ocr1 - (int64_t)cnt) <= 0);
+
+  GPT2_OCR1 = next_ocr1;
+
+  const int32_t counter_residual =
+      (int32_t)((int64_t)cnt - (int64_t)prev_ocr1);
+  const uint32_t entry_to_counter_read = after_counter - isr_entry_dwt_raw;
+
+  g_gpt_sr_at_isr = sr;
+  g_gpt_dwt_at_isr = isr_entry_dwt_raw;
+  g_gpt_cnt_at_isr = cnt;
+  g_gpt_counter_residual_ticks = counter_residual;
+  g_gpt_entry_to_counter_read_cycles = entry_to_counter_read;
+  g_gpt_armed = true;
+
+  g_gpt_ladder_rearm_count++;
+  g_gpt_ladder_last_prev_ocr1 = prev_ocr1;
+  g_gpt_ladder_last_next_ocr1 = next_ocr1;
+  g_gpt_ladder_last_cnt_minus_prev_ocr1 = counter_residual;
+  g_gpt_expected_counter = next_ocr1;
+
+  welford_update(g_gpt_entry_to_counter_read_welford,
+                 (int32_t)entry_to_counter_read);
+  welford_update(g_gpt_counter_residual_welford, counter_residual);
+
+  if (!g_witness_running ||
+      (g_active_window != witness_window_t::GPIO_GPT &&
+       g_active_window != witness_window_t::GPIO)) {
+    g_gpt_wrong_window++;
+    witness_gpt_refresh_live_registers();
+    return;
+  }
+
+  const uint32_t delta_cycles = isr_entry_dwt_raw - g_source_dwt_at_emit;
+  g_gpt_delta_cycles = delta_cycles;
+  g_gpt_hits++;
+  welford_update(g_gpt_welford, (int32_t)delta_cycles);
+
+  (void)before_counter;
+  witness_gpt_refresh_live_registers();
+}
+
 // ============================================================================
 // Source drive
 // ============================================================================
 
 static void witness_drive_high(void) {
   const uint32_t dwt_before = ARM_DWT_CYCCNT;
+
+  // Publish the common stimulus timestamp before driving the pin.  GPIO/GPT
+  // ISRs can then subtract against the correct edge attempt even if they
+  // arrive before this function completes.
+  g_source_dwt_before = dwt_before;
+  g_source_dwt_at_emit = dwt_before;
+
   digitalWriteFast(WITNESS_STIMULUS_PIN, HIGH);
   const uint32_t dwt_after = ARM_DWT_CYCCNT;
 
-  g_source_dwt_before = dwt_before;
   g_source_dwt_after = dwt_after;
   g_source_stim_cycles = dwt_after - dwt_before;
-  g_source_dwt_at_emit = dwt_before;
   g_source_emits++;
   g_source_high = true;
 
@@ -585,7 +883,8 @@ void witness_gpio_isr(void) {
 
   capture_qtimer_read_sample(isr_entry_dwt_raw);
 
-  if (g_active_window != witness_window_t::GPIO) {
+  if (g_active_window != witness_window_t::GPIO &&
+      g_active_window != witness_window_t::GPIO_GPT) {
     g_gpio_wrong_window++;
     return;
   }
@@ -605,7 +904,7 @@ void witness_gpio_isr(void) {
 static void gpio_high_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
   if (!g_witness_running) return;
 
-  g_active_window = witness_window_t::GPIO;
+  g_active_window = witness_window_t::GPIO_GPT;
   pinMode(WITNESS_GPIO_PIN, INPUT);
   attachInterrupt(digitalPinToInterrupt(WITNESS_GPIO_PIN), witness_gpio_isr, RISING);
   witness_drive_high();
@@ -781,8 +1080,9 @@ static Payload ns_welford_payload(const welford_t& w) {
 
 static const char* witness_window_str(witness_window_t w) {
   switch (w) {
-    case witness_window_t::GPIO:   return "GPIO";
-    default:                       return "NONE";
+    case witness_window_t::GPIO:     return "GPIO";
+    case witness_window_t::GPIO_GPT: return "GPIO_GPT";
+    default:                         return "NONE";
   }
 }
 
@@ -801,6 +1101,8 @@ static Payload witness_state_payload(void) {
   timepop_state.add("cycle_armed", g_witness_schedule_armed);
   timepop_state.add("cycle_count", g_witness_cycle_count);
   timepop_state.add("cycle_reschedules", g_witness_cycle_reschedules);
+  timepop_state.add("gpio_high_offset_ns", GPIO_HIGH_OFFSET_NS);
+  timepop_state.add("gpio_low_offset_ns", GPIO_LOW_OFFSET_NS);
   timepop_state.add("bridge_armed", g_bridge_armed);
   timepop_state.add("entry_pps_armed", g_entry_pps.armed);
   timepop_state.add("entry_pps_spin_active", g_entry_pps.spin_active);
@@ -814,6 +1116,28 @@ static Payload witness_state_payload(void) {
   gpio.add("gpio_hits", g_gpio_hits);
   gpio.add("gpio_wrong_window", g_gpio_wrong_window);
   p.add_object("gpio", gpio);
+
+  Payload gpt;
+  gpt.add("enabled", true);
+  gpt.add("configured", g_gpt_configured);
+  gpt.add("provider", WITNESS_GPT_PROVIDER);
+  gpt.add("stimulus_pin", (uint32_t)WITNESS_STIMULUS_PIN);
+  gpt.add("gpt_pin", (uint32_t)WITNESS_GPT_PIN);
+  gpt.add("armed", g_gpt_armed);
+  gpt.add("arm_count", g_gpt_arm_count);
+  gpt.add("arm_fail_count", g_gpt_arm_fail_count);
+  gpt.add("hits", g_gpt_hits);
+  gpt.add("false_irq", g_gpt_false_irq);
+  gpt.add("wrong_window", g_gpt_wrong_window);
+  witness_gpt_refresh_live_registers();
+  gpt.add("live_cnt", g_gpt_live_cnt);
+  gpt.add("live_sr", g_gpt_live_sr);
+  gpt.add("live_ir", g_gpt_live_ir);
+  gpt.add("live_ocr1", g_gpt_live_ocr1);
+  gpt.add("of1_pending", g_gpt_live_of1_pending);
+  gpt.add("of1_irq_enabled", g_gpt_live_of1_irq_enabled);
+  gpt.add("compare_missed_poll_count", g_gpt_compare_missed_poll_count);
+  p.add_object("gpt", gpt);
 
   Payload bridge;
   bridge.add("armed", g_bridge_armed);
@@ -1129,6 +1453,90 @@ static Payload cmd_dwt_read(const Payload&) {
   return p;
 }
 
+
+// ============================================================================
+// GPT_STIM command
+// ============================================================================
+
+static Payload cmd_gpt_stim(const Payload&) {
+  witness_gpt_refresh_live_registers();
+  (void)witness_ensure_scheduled();
+
+  Payload p;
+  p.add("model", "GPT_EXTERNAL_CLOCK_COMPARE_STIMULUS");
+  p.add("enabled", true);
+  p.add("provider", WITNESS_GPT_PROVIDER);
+  p.add("stimulus_pin", (uint32_t)WITNESS_STIMULUS_PIN);
+  p.add("gpio_pin", (uint32_t)WITNESS_GPIO_PIN);
+  p.add("gpt_pin", (uint32_t)WITNESS_GPT_PIN);
+  p.add("hardware_ready", g_witness_hw_ready);
+  p.add("runtime_ready", g_witness_runtime_ready);
+  p.add("irqs_enabled", g_witness_irqs_enabled);
+  p.add("configured", g_gpt_configured);
+  p.add("armed", g_gpt_armed);
+  p.add("arm_count", g_gpt_arm_count);
+  p.add("arm_fail_count", g_gpt_arm_fail_count);
+  p.add("hits", g_gpt_hits);
+  p.add("false_irq", g_gpt_false_irq);
+  p.add("wrong_window", g_gpt_wrong_window);
+
+  Payload last;
+  last.add("source_dwt_at_emit", g_source_dwt_at_emit);
+  last.add("dwt_at_arm", g_gpt_dwt_at_arm);
+  last.add("dwt_at_isr", g_gpt_dwt_at_isr);
+  last.add("delta_cycles", g_gpt_delta_cycles);
+  last.add("delta_ns", cycles_to_ns((double)g_gpt_delta_cycles));
+  last.add("cnt_at_arm", g_gpt_cnt_at_arm);
+  last.add("expected_counter", g_gpt_expected_counter);
+  last.add("cnt_at_isr", g_gpt_cnt_at_isr);
+  last.add("counter_residual_ticks", g_gpt_counter_residual_ticks);
+  last.add("sr_at_isr", g_gpt_sr_at_isr);
+  last.add("entry_to_counter_read_cycles", g_gpt_entry_to_counter_read_cycles);
+  last.add("entry_to_counter_read_ns", cycles_to_ns((double)g_gpt_entry_to_counter_read_cycles));
+  p.add_object("last", last);
+
+  p.add_object("latency", welford_payload(g_gpt_welford));
+  p.add_object("counter_residual", welford_payload(g_gpt_counter_residual_welford));
+  p.add_object("entry_to_counter_read", welford_payload(g_gpt_entry_to_counter_read_welford));
+
+  Payload live;
+  live.add("cnt", g_gpt_live_cnt);
+  live.add("sr", g_gpt_live_sr);
+  live.add("ir", g_gpt_live_ir);
+  live.add("cr", g_gpt_live_cr);
+  live.add("pr", g_gpt_live_pr);
+  live.add("ocr1", g_gpt_live_ocr1);
+  live.add("ocr1_delta", g_gpt_live_ocr1_delta);
+  live.add("of1_pending", g_gpt_live_of1_pending);
+  live.add("of1_irq_enabled", g_gpt_live_of1_irq_enabled);
+  live.add("compare_flag_seen_poll_count", g_gpt_compare_flag_seen_poll_count);
+  live.add("compare_flag_clear_poll_count", g_gpt_compare_flag_clear_poll_count);
+  live.add("compare_missed_poll_count", g_gpt_compare_missed_poll_count);
+  p.add_object("live", live);
+
+  Payload arm;
+  arm.add("too_close_count", g_gpt_arm_too_close_count);
+  arm.add("cnt_equal_ocr_count", g_gpt_arm_cnt_equal_ocr_count);
+  arm.add("cnt_after_ocr_count", g_gpt_arm_cnt_after_ocr_count);
+  arm.add("cnt_after_arm", g_gpt_arm_live_cnt_after_arm);
+  arm.add("sr_after_arm", g_gpt_arm_live_sr_after_arm);
+  arm.add("ir_after_arm", g_gpt_arm_live_ir_after_arm);
+  arm.add("cr_after_arm", g_gpt_arm_live_cr_after_arm);
+  p.add_object("arm_forensics", arm);
+
+
+  Payload ladder;
+  ladder.add("mode", g_gpt_ladder_mode);
+  ladder.add("step_ticks", g_gpt_ladder_step_ticks);
+  ladder.add("rearm_count", g_gpt_ladder_rearm_count);
+  ladder.add("last_prev_ocr1", g_gpt_ladder_last_prev_ocr1);
+  ladder.add("last_next_ocr1", g_gpt_ladder_last_next_ocr1);
+  ladder.add("last_cnt_minus_prev_ocr1", g_gpt_ladder_last_cnt_minus_prev_ocr1);
+  p.add_object("ladder", ladder);
+
+  return p;
+}
+
 // ============================================================================
 // QTIMER_READ command
 // ============================================================================
@@ -1305,6 +1713,8 @@ static Payload cmd_round_trip(const Payload&) {
 
   Payload p;
   p.add("model", "GPIO_ROUND_TRIP_LATENCY_SUMMARY");
+  p.add("gpio_high_offset_ns", GPIO_HIGH_OFFSET_NS);
+  p.add("gpio_low_offset_ns", GPIO_LOW_OFFSET_NS);
 
   Payload stimulate;
   stimulate.add("last_cycles", g_source_stim_cycles);
@@ -1318,6 +1728,34 @@ static Payload cmd_round_trip(const Payload&) {
   gpio.add_object("welford", welford_payload(g_gpio_welford));
   p.add_object("gpio", gpio);
 
+
+
+  Payload gpt;
+  gpt.add("enabled", true);
+  gpt.add("configured", g_gpt_configured);
+  gpt.add("armed", g_gpt_armed);
+  gpt.add("provider", WITNESS_GPT_PROVIDER);
+  gpt.add("stimulus_pin", (uint32_t)WITNESS_STIMULUS_PIN);
+  gpt.add("gpt_pin", (uint32_t)WITNESS_GPT_PIN);
+  gpt.add("hits", g_gpt_hits);
+  gpt.add("false_irq", g_gpt_false_irq);
+  gpt.add("wrong_window", g_gpt_wrong_window);
+  gpt.add("last_cycles", g_gpt_delta_cycles);
+  gpt.add("last_ns", cycles_to_ns((double)g_gpt_delta_cycles));
+  gpt.add("counter_residual_ticks", g_gpt_counter_residual_ticks);
+  gpt.add("entry_to_counter_read_cycles", g_gpt_entry_to_counter_read_cycles);
+  gpt.add("entry_to_counter_read_ns",
+          cycles_to_ns((double)g_gpt_entry_to_counter_read_cycles));
+  gpt.add("cnt_at_arm", g_gpt_cnt_at_arm);
+  gpt.add("expected_counter", g_gpt_expected_counter);
+  gpt.add("cnt_at_isr", g_gpt_cnt_at_isr);
+  gpt.add("sr_at_isr", g_gpt_sr_at_isr);
+  gpt.add_object("welford", welford_payload(g_gpt_welford));
+  gpt.add_object("counter_residual_welford",
+                 welford_payload(g_gpt_counter_residual_welford));
+  gpt.add_object("entry_to_counter_read_welford",
+                 welford_payload(g_gpt_entry_to_counter_read_welford));
+  p.add_object("gpt", gpt);
 
   return p;
 }
@@ -1333,6 +1771,8 @@ void process_witness_init_hardware(void) {
   digitalWriteFast(WITNESS_STIMULUS_PIN, LOW);
 
   pinMode(WITNESS_GPIO_PIN, INPUT);
+
+  witness_gpt_init_hardware();
 
   g_witness_hw_ready = true;
 }
@@ -1359,6 +1799,27 @@ void process_witness_init(void) {
 
   welford_reset(g_source_welford);
   welford_reset(g_gpio_welford);
+
+  g_gpt_armed = g_gpt_configured;
+  g_gpt_arm_count = 0;
+  g_gpt_arm_fail_count = 0;
+  g_gpt_hits = 0;
+  g_gpt_false_irq = 0;
+  g_gpt_wrong_window = 0;
+  g_gpt_sr_at_isr = 0;
+  g_gpt_cnt_at_arm = 0;
+  g_gpt_expected_counter = 0;
+  g_gpt_cnt_at_isr = 0;
+  g_gpt_counter_residual_ticks = 0;
+  g_gpt_dwt_at_arm = 0;
+  g_gpt_dwt_at_isr = 0;
+  g_gpt_delta_cycles = 0;
+  g_gpt_entry_to_counter_read_cycles = 0;
+  welford_reset(g_gpt_welford);
+  welford_reset(g_gpt_counter_residual_welford);
+  welford_reset(g_gpt_entry_to_counter_read_welford);
+  witness_gpt_refresh_live_registers();
+
   g_qtimer_read_samples = 0;
   g_qtimer_read_dwt_at_isr = 0;
   g_qtimer_read_dwt_before_counter_read = 0;
@@ -1441,6 +1902,7 @@ static const process_command_entry_t WITNESS_COMMANDS[] = {
   { "PPS_PHASE",   cmd_pps_phase   },
   { "GPIO_DELAY",  cmd_gpio_delay  },
   { "QTIMER_READ", cmd_qtimer_read },
+  { "GPT_STIM",    cmd_gpt_stim    },
   { "DWT_READ",    cmd_dwt_read    },
   { "ENTRY_LATENCY", cmd_entry_latency },
   { "ROUND_TRIP",  cmd_round_trip  },
