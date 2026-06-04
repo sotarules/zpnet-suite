@@ -1029,7 +1029,6 @@ static void payload_add_lane_forensics_flat(Payload& p,
           valid ? f.dwt_synthetic_error_cycles : 0);
   add_u32("forensics_dwt_synthetic_threshold_cycles",
           valid ? f.dwt_synthetic_threshold_cycles : 0U);
-
   add_bool("forensics_dwt_interval_gate_valid",
            valid && f.dwt_interval_gate_valid);
   add_bool("forensics_dwt_interval_sample_accepted",
@@ -1313,29 +1312,6 @@ static void payload_add_ocxo_interval_object(Payload& parent,
   parent.add_object("interval", interval);
 }
 
-static void payload_add_qtimer_capture_compact_object(
-    Payload& parent,
-    bool valid,
-    const clocks_alpha_lane_forensics_t& f) {
-  const interrupt_qtimer_capture_diag_t& q = f.qtimer_capture;
-  const bool qvalid = valid && q.diagnostic_valid;
-
-  // Compact, TIMEBASE-safe QTimer capture witness.
-  // Full per-lane QTimer packets remain available through INTERRUPT.REPORT_LANE.
-  // These fields are the minimum needed for raw dump reports to compare
-  // service-time DWT intervals against target-corrected intervals.
-  Payload qcap;
-  qcap.add("valid", qvalid);
-  qcap.add("svc", qvalid ? q.service_offset_signed_ticks : 0);
-  qcap.add("cc", qvalid ? q.target_correction_cycles : 0);
-  qcap.add("fix", qvalid ? q.fixed_latency_event_dwt : 0U);
-  qcap.add("cor", qvalid ? q.target_corrected_dwt_at_event : 0U);
-  qcap.add("obs", qvalid ? q.observed_dwt_for_interval : 0U);
-  qcap.add("sub", qvalid ? q.subscriber_dwt_at_event : 0U);
-  qcap.add("used", qvalid && q.target_correction_used_as_observed_endpoint);
-  parent.add_object("qcap", qcap);
-}
-
 static void payload_add_spincatch_object(Payload& parent,
                                          bool valid,
                                          const clocks_alpha_lane_forensics_t& f) {
@@ -1373,8 +1349,6 @@ static void payload_add_lane_forensics_object(Payload& parent,
                 valid ? f.dwt_synthetic_error_cycles : 0);
   forensics.add("dwt_synthetic_threshold_cycles",
                 valid ? f.dwt_synthetic_threshold_cycles : 0U);
-
-  payload_add_qtimer_capture_compact_object(forensics, valid, f);
 
   Payload gate;
   gate.add("valid", valid && f.dwt_interval_gate_valid);

@@ -578,9 +578,6 @@ struct alpha_lane_forensics_store_t {
   uint32_t dwt_isr_entry_raw = 0;
   int32_t  dwt_synthetic_error_cycles = 0;
   uint32_t dwt_synthetic_threshold_cycles = 0;
-
-  interrupt_qtimer_capture_diag_t qtimer_capture{};
-
   bool     dwt_interval_gate_valid = false;
   bool     dwt_interval_sample_accepted = false;
   bool     dwt_interval_sample_rejected = false;
@@ -1968,7 +1965,6 @@ static void alpha_forensics_reset_store(alpha_lane_forensics_store_t& s) {
   s.dwt_isr_entry_raw = 0;
   s.dwt_synthetic_error_cycles = 0;
   s.dwt_synthetic_threshold_cycles = 0;
-  s.qtimer_capture = interrupt_qtimer_capture_diag_t{};
   s.dwt_interval_gate_valid = false;
   s.dwt_interval_sample_accepted = false;
   s.dwt_interval_sample_rejected = false;
@@ -2162,7 +2158,6 @@ static void alpha_forensics_publish(time_clock_id_t clock_id,
     s->dwt_isr_entry_raw = diag->dwt_isr_entry_raw;
     s->dwt_synthetic_error_cycles = diag->dwt_synthetic_error_cycles;
     s->dwt_synthetic_threshold_cycles = diag->dwt_synthetic_threshold_cycles;
-    s->qtimer_capture = diag->qtimer_capture;
     s->dwt_interval_gate_valid = diag->dwt_interval_gate_valid;
     s->dwt_interval_sample_accepted = diag->dwt_interval_sample_accepted;
     s->dwt_interval_sample_rejected = diag->dwt_interval_sample_rejected;
@@ -2278,7 +2273,6 @@ static void alpha_forensics_publish(time_clock_id_t clock_id,
     s->dwt_isr_entry_raw = 0;
     s->dwt_synthetic_error_cycles = 0;
     s->dwt_synthetic_threshold_cycles = 0;
-    s->qtimer_capture = interrupt_qtimer_capture_diag_t{};
     s->dwt_interval_gate_valid = false;
     s->dwt_interval_sample_accepted = false;
     s->dwt_interval_sample_rejected = false;
@@ -2413,7 +2407,6 @@ bool clocks_alpha_lane_forensics(time_clock_id_t clock,
     out->dwt_isr_entry_raw = s->dwt_isr_entry_raw;
     out->dwt_synthetic_error_cycles = s->dwt_synthetic_error_cycles;
     out->dwt_synthetic_threshold_cycles = s->dwt_synthetic_threshold_cycles;
-    out->qtimer_capture = s->qtimer_capture;
     out->dwt_interval_gate_valid = s->dwt_interval_gate_valid;
     out->dwt_interval_sample_accepted = s->dwt_interval_sample_accepted;
     out->dwt_interval_sample_rejected = s->dwt_interval_sample_rejected;
