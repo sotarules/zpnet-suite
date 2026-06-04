@@ -35,8 +35,8 @@
 //
 // Lanes:
 //   VCLOCK : TimePop recurring client on QTimer1 CH2 (10 MHz VCLOCK domain)
-//   OCXO1  : QTimer2 CH0, PCS=0, one-second edge compare only
-//   OCXO2  : QTimer3 CH3, PCS=3, one-second edge compare only
+//   OCXO1  : OCXO custody backend (Step 1: QTimer2 CH0 one-second edge compare)
+//   OCXO2  : OCXO custody backend (Step 1: QTimer3 CH3 one-second edge compare)
 //   TimePop: QTimer1 CH2, varied compare intervals (foreground scheduler)
 //
 // The PPS GPIO ISR captures DWT as its first instruction, then reads the
@@ -186,8 +186,9 @@ static_assert((PPS_RELAY_OFF_NS % VCLOCK_HEARTBEAT_PERIOD_NS) == 0ULL,
 static_assert(PPS_RELAY_OFF_CADENCE_TICKS == 500U,
               "PPS relay off interval should be 500 cadence ticks");
 
-// OCXO DWT authorship.  OCXO1 and OCXO2 live on separate QuadTimer
-// modules/vectors.  Each OCXO ISR still captures ARM_DWT_CYCCNT as first
+// OCXO DWT authorship.  OCXO1 and OCXO2 live behind a narrow local
+// timer-custody abstraction.  Step 1 keeps the backend as the existing
+// QuadTimer modules/vectors.  Each OCXO ISR still captures ARM_DWT_CYCCNT as first
 // instruction for private evidence, but the subscriber-facing OCXO DWT is now
 // the lane-local EMA prediction of the one-second edge.  The raw ISR capture
 // is diagnostic only.
@@ -2048,8 +2049,34 @@ static uint32_t vclock_lane_ema_predict_dwt(vclock_lane_t& lane,
 struct synthetic_clock32_t;
 struct ocxo_runtime_context_t;
 
+// ============================================================================
+// OCXO timer-custody backend seam
+// ============================================================================
+//
+// Step 1 is deliberately behavior-neutral: both OCXO lanes still use the
+// existing QTimer2/QTimer3 hardware path.  The backend field and helpers below
+// move every OCXO counter/compare/status/DWT-latency decision behind one seam
+// so the GPT spike can replace custody without perturbing subscriber contracts.
+
+enum class ocxo_timer_backend_t : uint8_t {
+  QTIMER16 = 0,
+  GPT32    = 1,  // Reserved for later spike steps; not selected in Step 1.
+};
+
+static const char* ocxo_timer_backend_name(ocxo_timer_backend_t backend) {
+  switch (backend) {
+    case ocxo_timer_backend_t::QTIMER16: return "QTIMER16";
+    case ocxo_timer_backend_t::GPT32:    return "GPT32_RESERVED";
+    default:                            return "UNKNOWN";
+  }
+}
+
 struct ocxo_lane_t {
   const char* name = nullptr;
+  ocxo_timer_backend_t backend = ocxo_timer_backend_t::QTIMER16;
+
+  // Active Step 1 backend fields.  Future GPT custody should leave these
+  // QTimer members unused and implement only the ocxo_lane_* helper seam.
   IMXRT_TMR_t* module = nullptr;
   uint8_t      channel = 0;
   uint8_t      pcs = 0;
@@ -2069,7 +2096,7 @@ struct ocxo_lane_t {
   // target; during SmartZero it temporarily becomes a +10,000-tick acquisition
   // target.  The compare target is a process_interrupt-authored synthetic
   // counter32 identity; the low 16 bits are merely the hardware projection
-  // used to arm the local QTimer channel.
+  // used to arm the local timer backend.
   bool     cadence_enabled = false;
   bool     cadence_armed = false;
   bool     cadence_epoch_valid = false;
@@ -2255,6 +2282,12 @@ static ocxo_lane_t g_ocxo2_lane;
 
 static ocxo_lane_t* ocxo_lane_for(interrupt_subscriber_kind_t kind);
 static inline uint16_t ocxo_lane_counter_now(const ocxo_lane_t& lane);
+static inline uint32_t ocxo_lane_status_now(const ocxo_lane_t& lane);
+static inline uint32_t ocxo_lane_compare_value_now(const ocxo_lane_t& lane);
+static inline bool ocxo_lane_compare_enabled_now(const ocxo_lane_t& lane);
+static inline bool ocxo_lane_compare_flag_now(const ocxo_lane_t& lane);
+static inline uint32_t ocxo_lane_event_dwt_from_isr_entry_raw(const ocxo_lane_t& lane,
+                                                              uint32_t isr_entry_dwt_raw);
 static void ocxo_lane_program_compare(ocxo_lane_t& lane, uint16_t target_low16);
 static void ocxo_lane_disable_compare(ocxo_lane_t& lane);
 static void ocxo_lane_clear_compare_flag(ocxo_lane_t& lane);
@@ -2738,10 +2771,10 @@ static inline uint32_t synthetic_clock_advance_at_hardware(synthetic_clock32_t& 
 
 uint32_t interrupt_qtimer1_counter32_now(void)   { return vclock_synthetic_from_hardware_low16(qtimer1_ch0_counter_now()); }
 uint16_t interrupt_qtimer2_ch0_counter_now(void) {
-  return OCXO1_DISABLED ? 0U : IMXRT_TMR2.CH[0].CNTR;
+  return OCXO1_DISABLED ? 0U : ocxo_lane_counter_now(g_ocxo1_lane);
 }
 uint16_t interrupt_qtimer3_ch3_counter_now(void) {
-  return OCXO2_DISABLED ? 0U : IMXRT_TMR3.CH[3].CNTR;
+  return OCXO2_DISABLED ? 0U : ocxo_lane_counter_now(g_ocxo2_lane);
 }
 
 // Forward declarations for compare helpers defined below.
@@ -2935,7 +2968,7 @@ static void interrupt_ch2_implicit_rollover_tend(void) {
   // existing QTimer2/QTimer3 cadence ladders still own OCXO scheduled event
   // identity and one-second publication; this path is only rollover insurance.
   if (!OCXO1_DISABLED && g_ocxo1_lane.initialized) {
-    const uint16_t ocxo1_hw16 = IMXRT_TMR2.CH[0].CNTR;
+    const uint16_t ocxo1_hw16 = ocxo_lane_counter_now(g_ocxo1_lane);
     synthetic_clock_observe_hw16_no_pending_zero(g_ocxo1_clock32, ocxo1_hw16);
     g_ch2_implicit_rollover_ocxo1_updates++;
     g_ch2_implicit_rollover_last_ocxo1_hw16 = ocxo1_hw16;
@@ -2948,7 +2981,7 @@ static void interrupt_ch2_implicit_rollover_tend(void) {
   }
 
   if (!OCXO2_DISABLED && g_ocxo2_lane.initialized) {
-    const uint16_t ocxo2_hw16 = IMXRT_TMR3.CH[3].CNTR;
+    const uint16_t ocxo2_hw16 = ocxo_lane_counter_now(g_ocxo2_lane);
     synthetic_clock_observe_hw16_no_pending_zero(g_ocxo2_clock32, ocxo2_hw16);
     g_ch2_implicit_rollover_ocxo2_updates++;
     g_ch2_implicit_rollover_last_ocxo2_hw16 = ocxo2_hw16;
@@ -2974,7 +3007,7 @@ bool interrupt_clock_snapshot(interrupt_subscriber_kind_t kind, interrupt_clock_
 
   if (kind == interrupt_subscriber_kind_t::OCXO1) {
     if (OCXO1_DISABLED) return false;
-    const uint16_t hw = IMXRT_TMR2.CH[0].CNTR;
+    const uint16_t hw = ocxo_lane_counter_now(g_ocxo1_lane);
     out->hardware16 = hw;
     out->counter32 = project_counter32_from_hw16(g_ocxo1_clock32, hw);
     out->ns64 = project_ns64_from_hw16(g_ocxo1_clock32, hw);
@@ -2983,7 +3016,7 @@ bool interrupt_clock_snapshot(interrupt_subscriber_kind_t kind, interrupt_clock_
 
   if (kind == interrupt_subscriber_kind_t::OCXO2) {
     if (OCXO2_DISABLED) return false;
-    const uint16_t hw = IMXRT_TMR3.CH[3].CNTR;
+    const uint16_t hw = ocxo_lane_counter_now(g_ocxo2_lane);
     out->hardware16 = hw;
     out->counter32 = project_counter32_from_hw16(g_ocxo2_clock32, hw);
     out->ns64 = project_ns64_from_hw16(g_ocxo2_clock32, hw);
@@ -4717,7 +4750,7 @@ static void ocxo_lane_program_local_cadence_compare(ocxo_lane_t& lane,
                                                     uint32_t reason) {
   const uint16_t target_low16 = (uint16_t)(target_counter32 & 0xFFFFU);
 
-  lane.cadence_last_program_csctrl_before = lane.module->CH[lane.channel].CSCTRL;
+  lane.cadence_last_program_csctrl_before = ocxo_lane_status_now(lane);
   lane.cadence_last_program_flag_before =
       (lane.cadence_last_program_csctrl_before & TMR_CSCTRL_TCF1) != 0;
   lane.cadence_last_program_enabled_before =
@@ -4733,7 +4766,7 @@ static void ocxo_lane_program_local_cadence_compare(ocxo_lane_t& lane,
 
   ocxo_lane_program_compare(lane, target_low16);
 
-  lane.cadence_last_program_csctrl_after = lane.module->CH[lane.channel].CSCTRL;
+  lane.cadence_last_program_csctrl_after = ocxo_lane_status_now(lane);
   lane.cadence_last_program_flag_after =
       (lane.cadence_last_program_csctrl_after & TMR_CSCTRL_TCF1) != 0;
   lane.cadence_last_program_enabled_after =
@@ -5123,10 +5156,52 @@ static bool vclock_heartbeat_arm_timepop(void) {
 }
 
 // ============================================================================
-// OCXO lanes — QTimer2 CH0 / QTimer3 CH3
+// OCXO lanes — timer-backend custody (Step 1 backend: QTimer2 CH0 / QTimer3 CH3)
 // ============================================================================
 //
+static inline bool ocxo_lane_backend_is_qtimer(const ocxo_lane_t& lane) {
+  return lane.backend == ocxo_timer_backend_t::QTIMER16 && lane.module != nullptr;
+}
+
+static inline uint32_t ocxo_lane_status_now(const ocxo_lane_t& lane) {
+  if (!ocxo_lane_backend_is_qtimer(lane)) return 0U;
+  return (uint32_t)lane.module->CH[lane.channel].CSCTRL;
+}
+
+static inline uint32_t ocxo_lane_compare_value_now(const ocxo_lane_t& lane) {
+  if (!ocxo_lane_backend_is_qtimer(lane)) return 0U;
+  return (uint32_t)lane.module->CH[lane.channel].COMP1;
+}
+
+static inline bool ocxo_lane_compare_enabled_now(const ocxo_lane_t& lane) {
+  return (ocxo_lane_status_now(lane) & TMR_CSCTRL_TCF1EN) != 0;
+}
+
+static inline bool ocxo_lane_compare_flag_now(const ocxo_lane_t& lane) {
+  return (ocxo_lane_status_now(lane) & TMR_CSCTRL_TCF1) != 0;
+}
+
+static inline bool ocxo_lane_compare_flag_pending(const ocxo_lane_t& lane) {
+  return ocxo_lane_compare_flag_now(lane);
+}
+
+static inline uint16_t ocxo_lane_counter_now(const ocxo_lane_t& lane) {
+  if (!ocxo_lane_backend_is_qtimer(lane)) return 0U;
+  return lane.module->CH[lane.channel].CNTR;
+}
+
+static inline uint32_t ocxo_lane_event_dwt_from_isr_entry_raw(const ocxo_lane_t& lane,
+                                                              uint32_t isr_entry_dwt_raw) {
+  // Step 1 keeps the existing QTimer latency correction.  The lane parameter
+  // is present so GPT can install its own fixed-latency model later without
+  // touching the OCXO subscriber path.
+  (void)lane;
+  return qtimer_event_dwt_from_isr_entry_raw(isr_entry_dwt_raw);
+}
+
 static void ocxo_lane_program_compare(ocxo_lane_t& lane, uint16_t target_low16) {
+  if (!ocxo_lane_backend_is_qtimer(lane)) return;
+
   if (lane.module == &IMXRT_TMR2 && lane.channel == 0) {
     qtimer2_ch0_program_compare(target_low16);
   } else if (lane.module == &IMXRT_TMR3) {
@@ -5135,6 +5210,8 @@ static void ocxo_lane_program_compare(ocxo_lane_t& lane, uint16_t target_low16) 
 }
 
 static void ocxo_lane_disable_compare(ocxo_lane_t& lane) {
+  if (!ocxo_lane_backend_is_qtimer(lane)) return;
+
   if (lane.module == &IMXRT_TMR2 && lane.channel == 0) {
     qtimer2_ch0_disable_compare();
   } else if (lane.module == &IMXRT_TMR3) {
@@ -5356,15 +5433,9 @@ static bool ocxo_fact_ring_push_from_isr(ocxo_runtime_context_t& ctx,
 }
 
 
-static inline bool ocxo_lane_compare_flag_pending(const ocxo_lane_t& lane) {
-  return (lane.module->CH[lane.channel].CSCTRL & TMR_CSCTRL_TCF1) != 0;
-}
-
-static inline uint16_t ocxo_lane_counter_now(const ocxo_lane_t& lane) {
-  return lane.module->CH[lane.channel].CNTR;
-}
-
 static void ocxo_lane_clear_compare_flag(ocxo_lane_t& lane) {
+  if (!ocxo_lane_backend_is_qtimer(lane)) return;
+
   if (lane.module == &IMXRT_TMR2 && lane.channel == 0) {
     qtimer2_ch0_clear_compare_flag();
   } else if (lane.module == &IMXRT_TMR3) {
@@ -6222,7 +6293,7 @@ static void ocxo_cadence_acknowledge_and_timestamp(
   // before any foreground work is requested.
   ocxo_lane_clear_compare_flag(*ctx.lane);
   sample.event_dwt =
-      qtimer_event_dwt_from_isr_entry_raw(sample.isr_entry_dwt_raw);
+      ocxo_lane_event_dwt_from_isr_entry_raw(*ctx.lane, sample.isr_entry_dwt_raw);
 }
 
 static void ocxo_cadence_update_synthetic_identity(
@@ -6314,7 +6385,7 @@ static void ocxo_cadence_rearm_or_stop(
     // inside smartzero_feed_sample().  The accepted lane now transitions into
     // normal one-second edge-capture mode; do not overwrite the newly prepared
     // target with the just-serviced SmartZero sample +10,000.
-    sample.isr_csctrl_after_program = lane.module->CH[lane.channel].CSCTRL;
+    sample.isr_csctrl_after_program = ocxo_lane_status_now(lane);
     return;
   }
 
@@ -6322,7 +6393,7 @@ static void ocxo_cadence_rearm_or_stop(
   const bool keep_running = lane.active || keep_for_smartzero;
   if (!keep_running) {
     ocxo_lane_stop_local_cadence(lane, OCXO_CADENCE_REASON_STOP);
-    sample.isr_csctrl_after_program = lane.module->CH[lane.channel].CSCTRL;
+    sample.isr_csctrl_after_program = ocxo_lane_status_now(lane);
     return;
   }
 
@@ -6354,7 +6425,7 @@ static void ocxo_cadence_rearm_or_stop(
                                         OCXO_CADENCE_REASON_REARM);
   }
 
-  sample.isr_csctrl_after_program = lane.module->CH[lane.channel].CSCTRL;
+  sample.isr_csctrl_after_program = ocxo_lane_status_now(lane);
 }
 
 static interrupt_perishable_fact_t ocxo_cadence_build_perishable_fact(
@@ -6432,7 +6503,7 @@ static void ocxo_cadence_compare_isr(ocxo_runtime_context_t& ctx,
                                      const spinidle_isr_capture_t& spinidle) {
   ocxo_lane_t& lane = *ctx.lane;
 
-  const uint32_t isr_csctrl_entry = lane.module->CH[lane.channel].CSCTRL;
+  const uint32_t isr_csctrl_entry = ocxo_lane_status_now(lane);
   if (!ocxo_cadence_classify_irq(ctx, isr_csctrl_entry)) return;
 
   ocxo_cadence_isr_sample_t sample =
@@ -6868,8 +6939,8 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
   const bool ocxo_capture_hw_ready =
       (OCXO1_DISABLED || ocxo1_capture_hw_ready) &&
       (OCXO2_DISABLED || ocxo2_capture_hw_ready);
-  const uint16_t ocxo1_hardware16 = ocxo1_capture_hw_ready ? IMXRT_TMR2.CH[0].CNTR : 0;
-  const uint16_t ocxo2_hardware16 = ocxo2_capture_hw_ready ? IMXRT_TMR3.CH[3].CNTR : 0;
+  const uint16_t ocxo1_hardware16 = ocxo1_capture_hw_ready ? ocxo_lane_counter_now(g_ocxo1_lane) : 0;
+  const uint16_t ocxo2_hardware16 = ocxo2_capture_hw_ready ? ocxo_lane_counter_now(g_ocxo2_lane) : 0;
   const uint32_t epoch_capture_end_raw = ARM_DWT_CYCCNT;
 
   const uint16_t ch3_now = hardware_low16;
@@ -7242,55 +7313,87 @@ static void qtimer1_init_ch2_scheduler(void) {
   IMXRT_TMR1.CH[2].CTRL   = TMR_CTRL_CM(1) | TMR_CTRL_PCS(0);
 }
 
-void process_interrupt_init_hardware(void) {
-  if (g_interrupt_hw_ready) return;
+static void ocxo_lane_bind_qtimer_backend(ocxo_lane_t& lane,
+                                          const char* name,
+                                          IMXRT_TMR_t* module,
+                                          uint8_t channel,
+                                          uint8_t pcs,
+                                          int input_pin) {
+  lane.name = name;
+  lane.backend = ocxo_timer_backend_t::QTIMER16;
+  lane.module = module;
+  lane.channel = channel;
+  lane.pcs = pcs;
+  lane.input_pin = input_pin;
+  lane.initialized = false;
+}
 
-  g_ocxo1_lane.name = "OCXO1";
-  g_ocxo1_lane.module = &IMXRT_TMR2;
-  g_ocxo1_lane.channel = 0;
-  g_ocxo1_lane.pcs = 0;
-  g_ocxo1_lane.input_pin = OCXO1_PIN;
+static void ocxo_lane_init_qtimer_backend(ocxo_lane_t& lane) {
+  lane.initialized = false;
+  if (!ocxo_lane_backend_is_qtimer(lane)) return;
 
-  g_ocxo2_lane.name = "OCXO2";
-  g_ocxo2_lane.module = &IMXRT_TMR3;
-  g_ocxo2_lane.channel = 3;
-  g_ocxo2_lane.pcs = 3;
-  g_ocxo2_lane.input_pin = OCXO2_PIN;
-
-  pinMode(GNSS_PPS_RELAY, OUTPUT);
-  digitalWriteFast(GNSS_PPS_RELAY, LOW);
-  g_pps_relay_pin_initialized = true;
-
-  if (!OCXO1_DISABLED) {
+  if (lane.module == &IMXRT_TMR2 && lane.channel == 0) {
     CCM_CCGR6 |= CCM_CCGR6_QTIMER2(CCM_CCGR_ON);
-    *(portConfigRegister(OCXO1_PIN)) = 1;
+    *(portConfigRegister(lane.input_pin)) = 1;
     IOMUXC_QTIMER2_TIMER0_SELECT_INPUT = 1;
 
     IMXRT_TMR2.CH[0].CTRL = 0; IMXRT_TMR2.CH[0].SCTRL = 0;
     IMXRT_TMR2.CH[0].CSCTRL = 0; IMXRT_TMR2.CH[0].LOAD = 0;
     IMXRT_TMR2.CH[0].CNTR = 0; IMXRT_TMR2.CH[0].COMP1 = 0xFFFF;
     IMXRT_TMR2.CH[0].CMPLD1 = 0xFFFF; IMXRT_TMR2.CH[0].CMPLD2 = 0;
-    IMXRT_TMR2.CH[0].CTRL = TMR_CTRL_CM(1) | TMR_CTRL_PCS(g_ocxo1_lane.pcs);
+    IMXRT_TMR2.CH[0].CTRL = TMR_CTRL_CM(1) | TMR_CTRL_PCS(lane.pcs);
     qtimer2_ch0_disable_compare();
     IMXRT_TMR2.ENBL |= 0x0001;
+    lane.initialized = true;
+    return;
   }
 
-  if (!OCXO2_DISABLED) {
+  if (lane.module == &IMXRT_TMR3 && lane.channel == 3) {
     CCM_CCGR6 |= CCM_CCGR6_QTIMER3(CCM_CCGR_ON);
-    *(portConfigRegister(OCXO2_PIN)) = 1;
+    *(portConfigRegister(lane.input_pin)) = 1;
     IOMUXC_QTIMER3_TIMER3_SELECT_INPUT = 1;
 
     IMXRT_TMR3.CH[3].CTRL = 0; IMXRT_TMR3.CH[3].SCTRL = 0;
     IMXRT_TMR3.CH[3].CSCTRL = 0; IMXRT_TMR3.CH[3].LOAD = 0;
     IMXRT_TMR3.CH[3].CNTR = 0; IMXRT_TMR3.CH[3].COMP1 = 0xFFFF;
     IMXRT_TMR3.CH[3].CMPLD1 = 0xFFFF;
-    IMXRT_TMR3.CH[3].CTRL = TMR_CTRL_CM(1) | TMR_CTRL_PCS(g_ocxo2_lane.pcs);
+    IMXRT_TMR3.CH[3].CTRL = TMR_CTRL_CM(1) | TMR_CTRL_PCS(lane.pcs);
     qtimer3_disable_compare(3);
     IMXRT_TMR3.ENBL |= (uint16_t)(1U << 3);
+    lane.initialized = true;
+  }
+}
+
+static void ocxo_lane_init_hardware(ocxo_lane_t& lane) {
+  switch (lane.backend) {
+    case ocxo_timer_backend_t::QTIMER16:
+      ocxo_lane_init_qtimer_backend(lane);
+      return;
+    case ocxo_timer_backend_t::GPT32:
+    default:
+      // GPT custody is intentionally scaffold-only in Step 1.
+      lane.initialized = false;
+      return;
+  }
+}
+
+void process_interrupt_init_hardware(void) {
+  if (g_interrupt_hw_ready) return;
+
+  ocxo_lane_bind_qtimer_backend(g_ocxo1_lane, "OCXO1", &IMXRT_TMR2, 0, 0, OCXO1_PIN);
+  ocxo_lane_bind_qtimer_backend(g_ocxo2_lane, "OCXO2", &IMXRT_TMR3, 3, 3, OCXO2_PIN);
+
+  pinMode(GNSS_PPS_RELAY, OUTPUT);
+  digitalWriteFast(GNSS_PPS_RELAY, LOW);
+  g_pps_relay_pin_initialized = true;
+
+  if (!OCXO1_DISABLED) {
+    ocxo_lane_init_hardware(g_ocxo1_lane);
   }
 
-  g_ocxo1_lane.initialized = !OCXO1_DISABLED;
-  g_ocxo2_lane.initialized = !OCXO2_DISABLED;
+  if (!OCXO2_DISABLED) {
+    ocxo_lane_init_hardware(g_ocxo2_lane);
+  }
 
   // QTimer1 synchronized channel start: ENBL=0 first, configure CH0/CH1/CH2
   // fully, then a single ENBL write starts the active VCLOCK-domain channels
@@ -7386,11 +7489,11 @@ static void runtime_bootstrap_synthetic_clocks_if_ready(void) {
 
   vclock_clock_bootstrap_from_hw16(qtimer1_ch0_counter_now());
   if (!OCXO1_DISABLED && g_ocxo1_lane.initialized) {
-    synthetic_clock_bootstrap_from_hw16(g_ocxo1_clock32, IMXRT_TMR2.CH[0].CNTR);
+    synthetic_clock_bootstrap_from_hw16(g_ocxo1_clock32, ocxo_lane_counter_now(g_ocxo1_lane));
     g_ocxo1_lane.logical_count32_at_last_second = g_ocxo1_clock32.current_counter32;
   }
   if (!OCXO2_DISABLED && g_ocxo2_lane.initialized) {
-    synthetic_clock_bootstrap_from_hw16(g_ocxo2_clock32, IMXRT_TMR3.CH[3].CNTR);
+    synthetic_clock_bootstrap_from_hw16(g_ocxo2_clock32, ocxo_lane_counter_now(g_ocxo2_lane));
     g_ocxo2_lane.logical_count32_at_last_second = g_ocxo2_clock32.current_counter32;
   }
 }
@@ -8685,6 +8788,7 @@ static void add_ocxo_identity_payload(Payload& p,
   p.add("kind", ctx.name);
   p.add("provider", interrupt_provider_kind_str(ctx.provider));
   p.add("hardware_lane", interrupt_lane_str(ctx.lane_id));
+  p.add("timer_backend", ctx.lane ? ocxo_timer_backend_name(ctx.lane->backend) : "NONE");
   p.add("cadence_source", ctx.cadence_source);
   p.add("counter_source", ctx.counter_source);
   p.add("event_source", "LOCAL_ONE_SECOND_EDGE_COMPARE_EMA_DWT");
@@ -8931,14 +9035,45 @@ static void add_ocxo_qtimer_payload(payload_prefix_t& out,
                                     const ocxo_runtime_context_t& ctx,
                                     const ocxo_qtimer_diag_t& qdiag) {
   const ocxo_lane_t& lane = *ctx.lane;
-  const uint16_t csctrl = lane.module->CH[lane.channel].CSCTRL;
-  const bool compare_enabled = (csctrl & TMR_CSCTRL_TCF1EN) != 0;
-  const bool compare_flag = (csctrl & TMR_CSCTRL_TCF1) != 0;
+  const uint32_t status = ocxo_lane_status_now(lane);
+  const uint32_t counter = (uint32_t)ocxo_lane_counter_now(lane);
+  const uint32_t compare = ocxo_lane_compare_value_now(lane);
+  const bool compare_enabled = ocxo_lane_compare_enabled_now(lane);
+  const bool compare_flag = ocxo_lane_compare_flag_now(lane);
 
+  out.add_str("timer_backend", ocxo_timer_backend_name(lane.backend));
+  out.add_str("timer_provider", interrupt_provider_kind_str(ctx.provider));
+  out.add_str("timer_lane", interrupt_lane_str(ctx.lane_id));
+  out.add_u32("timer_count", qdiag.count);
+  out.add_u32("timer_counter", counter);
+  out.add_u32("timer_compare", compare);
+  out.add_u32("timer_status", status);
+  out.add_bool("timer_compare_enabled", compare_enabled);
+  out.add_bool("timer_compare_flag", compare_flag);
+  out.add_bool("timer_compare_live", compare_enabled && compare_flag);
+  out.add_u32("timer_last_late_ticks", qdiag.late_ticks);
+  out.add_u32("timer_last_interpreted_late_ticks", qdiag.interpreted_late_ticks);
+  out.add_u32("timer_last_early_ticks", qdiag.early_ticks);
+  out.add_i32("timer_last_service_offset_signed_ticks",
+              qdiag.service_offset_signed_ticks);
+  out.add_u32("timer_last_service_offset_abs_ticks",
+              qdiag.service_offset_abs_ticks);
+  out.add_u32("timer_last_target_delta_mod65536_ticks",
+              qdiag.target_delta_mod65536_ticks);
+  out.add_u32("timer_last_target_low16", (uint32_t)qdiag.target_low16);
+  out.add_u32("timer_last_isr_counter_low16",
+              (uint32_t)qdiag.isr_counter_low16);
+  out.add_u32("timer_last_dwt_raw", qdiag.dwt_raw);
+  out.add_u32("timer_last_event_dwt", qdiag.event_dwt);
+  out.add_u32("timer_last_dwt_coordinate_source",
+              qdiag.dwt_coordinate_source);
+
+  // Step 1 compatibility aliases.  Keep qtimer_* stable while publishing the
+  // new generic timer_* custody surface beside it.
   out.add_u32("qtimer_count", qdiag.count);
-  out.add_u32("qtimer_counter", (uint32_t)lane.module->CH[lane.channel].CNTR);
-  out.add_u32("qtimer_comp1", (uint32_t)lane.module->CH[lane.channel].COMP1);
-  out.add_u32("qtimer_csctrl", (uint32_t)csctrl);
+  out.add_u32("qtimer_counter", counter);
+  out.add_u32("qtimer_comp1", compare);
+  out.add_u32("qtimer_csctrl", status);
   out.add_bool("qtimer_compare_enabled", compare_enabled);
   out.add_bool("qtimer_compare_flag", compare_flag);
   out.add_bool("qtimer_compare_live", compare_enabled && compare_flag);
@@ -10139,6 +10274,8 @@ const char* interrupt_provider_kind_str(interrupt_provider_kind_t provider) {
     case interrupt_provider_kind_t::QTIMER2:  return "QTIMER2";
     case interrupt_provider_kind_t::QTIMER3:  return "QTIMER3";
     case interrupt_provider_kind_t::GPIO6789: return "GPIO6789";
+    case interrupt_provider_kind_t::GPT1:     return "GPT1";
+    case interrupt_provider_kind_t::GPT2:     return "GPT2";
     default:                                  return "NONE";
   }
 }
@@ -10151,6 +10288,8 @@ const char* interrupt_lane_str(interrupt_lane_t lane) {
     case interrupt_lane_t::QTIMER2_CH0_COMP: return "QTIMER2_CH0_COMP";
     case interrupt_lane_t::QTIMER3_CH3_COMP: return "QTIMER3_CH3_COMP";
     case interrupt_lane_t::GPIO_EDGE:        return "GPIO_EDGE";
+    case interrupt_lane_t::GPT1_OCR1_COMP:   return "GPT1_OCR1_COMP";
+    case interrupt_lane_t::GPT2_OCR1_COMP:   return "GPT2_OCR1_COMP";
     default:                                 return "NONE";
   }
 }

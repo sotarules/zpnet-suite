@@ -113,10 +113,10 @@
 //              TimePop coalesces duplicate deadlines onto one perishable ISR
 //              fact surface and avoids a competing VCLOCK preemption rail.
 //
-//     OCXO1  : QTimer2 CH0 local compare every +10,000 OCXO ticks.
-//     OCXO2  : QTimer3 CH3 local compare every +10,000 OCXO ticks.
+//     OCXO1  : local OCXO custody backend; current Step 1 backend is QTimer2 CH0.
+//     OCXO2  : local OCXO custody backend; current Step 1 backend is QTimer3 CH3.
 //
-//   OCXO compare ISRs schedule the next +10,000-tick target immediately.  The
+//   OCXO backend ISRs schedule the next +10,000-tick target immediately.  The
 //   intermediate 1 kHz ticks are rollover maintenance only.  Every 1000th OCXO
 //   cadence tick is deferred to foreground as a one-second event consumed by
 //   CLOCKS/Alpha.  Its subscriber-facing DWT is EMA-predicted from completed
@@ -155,6 +155,10 @@ enum class interrupt_provider_kind_t : uint8_t {
   QTIMER2,
   QTIMER3,
   GPIO6789,
+  // Reserved for the OCXO GPT custody spike. Appended so existing numeric
+  // provider identities remain stable in current reports.
+  GPT1,
+  GPT2,
 };
 
 enum class interrupt_lane_t : uint8_t {
@@ -165,6 +169,10 @@ enum class interrupt_lane_t : uint8_t {
   QTIMER2_CH0_COMP,
   QTIMER3_CH3_COMP,
   GPIO_EDGE,
+  // Reserved for the OCXO GPT custody spike. Appended so existing numeric
+  // lane identities remain stable in current reports.
+  GPT1_OCR1_COMP,
+  GPT2_OCR1_COMP,
 };
 
 enum class interrupt_event_status_t : uint8_t {
@@ -749,7 +757,7 @@ struct interrupt_epoch_capture_t {
 
 bool interrupt_last_epoch_capture(interrupt_epoch_capture_t* out);
 
-// Re-author OCXO QuadTimer compare cadence from CLOCKS logical zero.
+// Re-author OCXO local timer compare cadence from CLOCKS logical zero.
 //
 // Once CLOCKS has selected the OCXO zero-offset counter32 values, this call
 // makes each local compare rail land on that lane's 1 kHz logical grid:
