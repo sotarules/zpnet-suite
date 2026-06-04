@@ -7104,12 +7104,9 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
       g_interrupt_hw_ready && !OCXO1_DISABLED && g_ocxo1_lane.initialized;
   const bool ocxo2_capture_hw_ready =
       g_interrupt_hw_ready && !OCXO2_DISABLED && g_ocxo2_lane.initialized;
-
-  // Fixed negation bug below:
   const bool ocxo_capture_hw_ready =
-      (OCXO1_DISABLED || ocxo1_capture_hw_ready) &&
-      (OCXO2_DISABLED || ocxo2_capture_hw_ready);
-
+      (!OCXO1_DISABLED || ocxo1_capture_hw_ready) &&
+      (!OCXO2_DISABLED || ocxo2_capture_hw_ready);
   const uint16_t ocxo1_hardware16 = ocxo1_capture_hw_ready ? IMXRT_TMR2.CH[0].CNTR : 0;
   const uint16_t ocxo2_hardware16 = ocxo2_capture_hw_ready ? IMXRT_TMR3.CH[3].CNTR : 0;
   const uint32_t epoch_capture_end_raw = ARM_DWT_CYCCNT;
