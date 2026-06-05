@@ -9109,6 +9109,12 @@ static FLASHMEM void add_ocxo_witness_service_payload(payload_prefix_t& out,
   out.add_u32("ema_update_count", lane.ema_update_count);
   out.add_u32("ema_last_observed_dwt", lane.ema_last_observed_dwt);
   out.add_u32("ema_last_emitted_dwt", lane.ema_last_emitted_dwt);
+  const int32_t ema_endpoint_bias_cycles =
+      (int32_t)(lane.ema_last_emitted_dwt - lane.ema_last_observed_dwt);
+  out.add_bool("ema_endpoint_bias_valid", lane.ema_initialized);
+  out.add_i32("ema_endpoint_bias_cycles", ema_endpoint_bias_cycles);
+  out.add_u32("ema_endpoint_bias_abs_cycles",
+              ocxo_ema_abs_i32(ema_endpoint_bias_cycles));
   out.add_u32("ema_last_observed_interval_cycles",
               lane.ema_last_observed_interval_cycles);
   out.add_u32("ema_interval_cycles", lane.ema_interval_cycles);
@@ -9873,6 +9879,25 @@ static FLASHMEM void add_vclock_lane_ema_section(Payload& p) {
   p.add("vclock_ema_update_count", g_vclock_lane.ema_update_count);
   p.add("vclock_ema_last_observed_dwt", g_vclock_lane.ema_last_observed_dwt);
   p.add("vclock_ema_last_emitted_dwt", g_vclock_lane.ema_last_emitted_dwt);
+  const int32_t vclock_ema_endpoint_bias_cycles =
+      (int32_t)(g_vclock_lane.ema_last_emitted_dwt -
+                g_vclock_lane.ema_last_observed_dwt);
+  p.add("vclock_ema_endpoint_bias_valid", g_vclock_lane.ema_initialized);
+  p.add("vclock_ema_endpoint_bias_cycles", vclock_ema_endpoint_bias_cycles);
+  p.add("vclock_ema_endpoint_bias_abs_cycles",
+        dwt_ema_abs_i32(vclock_ema_endpoint_bias_cycles));
+  const rolling_lr_result_t& vclock_lr_last = g_rolling_lr_vclock.last_result;
+  p.add("vclock_ema_endpoint_bias_vs_lr_valid", vclock_lr_last.valid);
+  p.add("vclock_ema_endpoint_bias_vs_lr_cycles",
+        vclock_lr_last.valid
+            ? (int32_t)(g_vclock_lane.ema_last_emitted_dwt -
+                        vclock_lr_last.inferred_dwt_at_event)
+            : 0);
+  p.add("vclock_ema_endpoint_bias_vs_lr_abs_cycles",
+        vclock_lr_last.valid
+            ? dwt_ema_abs_i32((int32_t)(g_vclock_lane.ema_last_emitted_dwt -
+                                        vclock_lr_last.inferred_dwt_at_event))
+            : 0U);
   p.add("vclock_ema_last_observed_interval_cycles", g_vclock_lane.ema_last_observed_interval_cycles);
   p.add("vclock_ema_interval_cycles", g_vclock_lane.ema_interval_cycles);
   p.add("vclock_ema_last_predicted_dwt", g_vclock_lane.ema_last_predicted_dwt);
@@ -10066,6 +10091,25 @@ static FLASHMEM void add_ocxo_lane_ema_section(Payload& p,
   out.add_u32("ema_update_count", lane.ema_update_count);
   out.add_u32("ema_last_observed_dwt", lane.ema_last_observed_dwt);
   out.add_u32("ema_last_emitted_dwt", lane.ema_last_emitted_dwt);
+  const int32_t ema_endpoint_bias_cycles =
+      (int32_t)(lane.ema_last_emitted_dwt - lane.ema_last_observed_dwt);
+  out.add_bool("ema_endpoint_bias_valid", lane.ema_initialized);
+  out.add_i32("ema_endpoint_bias_cycles", ema_endpoint_bias_cycles);
+  out.add_u32("ema_endpoint_bias_abs_cycles",
+              ocxo_ema_abs_i32(ema_endpoint_bias_cycles));
+  const rolling_lr_dwt_lane_t* rolling = rolling_lr_for_const(ctx.kind);
+  const bool rolling_lr_valid = rolling && rolling->last_result.valid;
+  out.add_bool("ema_endpoint_bias_vs_lr_valid", rolling_lr_valid);
+  out.add_i32("ema_endpoint_bias_vs_lr_cycles",
+              rolling_lr_valid
+                  ? (int32_t)(lane.ema_last_emitted_dwt -
+                              rolling->last_result.inferred_dwt_at_event)
+                  : 0);
+  out.add_u32("ema_endpoint_bias_vs_lr_abs_cycles",
+              rolling_lr_valid
+                  ? ocxo_ema_abs_i32((int32_t)(lane.ema_last_emitted_dwt -
+                                               rolling->last_result.inferred_dwt_at_event))
+                  : 0U);
   out.add_u32("ema_last_observed_interval_cycles", lane.ema_last_observed_interval_cycles);
   out.add_u32("ema_interval_cycles", lane.ema_interval_cycles);
   out.add_u32("ema_last_predicted_dwt", lane.ema_last_predicted_dwt);
