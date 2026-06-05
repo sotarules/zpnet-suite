@@ -215,15 +215,21 @@ static Payload cmd_report(const Payload& /*args*/) {
 //   • No transport emission
 //
 // Invariant checks:
-//   If the system is healthy, the following MUST hold:
+//   PROCESS_INFO is itself an RPC handler. While this report is being built,
+//   the current command has already been received/routed/invoked, but it has
+//   not yet completed and its response has not yet been sent. Therefore a
+//   healthy snapshot may legitimately show exactly one handler in flight:
+//
 //     received == routed + error_missing_fields
 //                        + error_unknown_subsys
 //                        + error_unknown_command
 //     routed == handler_invoked
 //     handler_invoked == handler_completed
+//        OR handler_invoked == handler_completed + 1
 //     handler_completed == response_sent
 //
-//   Any deviation is a smoking gun.
+//   More than one in-flight handler, or completed responses not sent, remains
+//   a smoking gun.
 // ============================================================================
 
 static Payload cmd_process_info(const Payload& /*args*/) {
@@ -267,9 +273,21 @@ static Payload cmd_process_info(const Payload& /*args*/) {
                                + info.error_unknown_subsys
                                + info.error_unknown_command;
 
+    const uint32_t handler_inflight =
+        (info.handler_invoked >= info.handler_completed)
+            ? (info.handler_invoked - info.handler_completed)
+            : 0xFFFFFFFFUL;
+    const uint32_t response_pending =
+        (info.handler_completed >= info.response_sent)
+            ? (info.handler_completed - info.response_sent)
+            : 0xFFFFFFFFUL;
+
+    p.add("rpc_handler_inflight", handler_inflight);
+    p.add("rpc_response_pending", response_pending);
+
     p.add("invariant_received_ok",  info.received == expected_received);
-    p.add("invariant_handler_ok",   info.handler_invoked == info.handler_completed);
-    p.add("invariant_response_ok",  info.handler_completed == info.response_sent);
+    p.add("invariant_handler_ok",   handler_inflight <= 1U);
+    p.add("invariant_response_ok",  response_pending == 0U);
 
     return p;
 }
