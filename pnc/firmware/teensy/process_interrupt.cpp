@@ -408,42 +408,44 @@ static void statistical_dwt_reset_all(void) {
 // Rolling linear-regression DWT estimator shell
 // ============================================================================
 //
-// First safe pass for the EMA -> linear-regression migration.  This creates a
-// generalized, parameterized, rolling-window regression model and report
-// surface only.  No samples are fed here, no cadence is added, no subscriber
-// DWT authority changes, and no Alpha/Beta/TIMEBASE propagation changes.
-//
-// Future feed steps should accumulate 1 kHz sample evidence into per-second
-// segments, then roll those segment aggregates across ROLLING_LR_WINDOW_SECONDS
-// without retaining a 5000-sample raw ring.  That keeps memory bounded while
-// giving the estimator a multi-second line fit at each one-second checkpoint.
+// Conservative VCLOCK-only diagnostic feed for the EMA -> linear-regression
+// migration.  LR remains report-only and never authors subscriber DWT.  A
+// normal named TimePop client supplies clean event-coordinate DWT/VCLOCK facts
+// at 10 Hz.  The foreground VCLOCK fact drain finalizes one current-second
+// aggregate after EMA authority is known.  No OCXO cadence, SmartZero,
+// subscriber authority, or Alpha/Beta/TIMEBASE behavior changes occur here.
 
 static constexpr bool     ROLLING_LR_DWT_ESTIMATOR_ENABLED = true;
 static constexpr bool     ROLLING_LR_DWT_AUTHORITY_ENABLED = false;
 static constexpr bool     ROLLING_LR_DWT_REPORT_ONLY = true;
-static constexpr bool     ROLLING_LR_VCLOCK_SHADOW_FEED_ENABLED = false;
+static constexpr bool     ROLLING_LR_VCLOCK_SHADOW_FEED_ENABLED = true;
 static constexpr bool     ROLLING_LR_OCXO_SHADOW_FEED_ENABLED = false;
-static constexpr uint32_t ROLLING_LR_SAMPLE_RATE_HZ = 1000U;
-static constexpr uint32_t ROLLING_LR_COUNTER_DELTA_TICKS = OCXO_CADENCE_INTERVAL_TICKS;
-static constexpr uint32_t ROLLING_LR_WINDOW_SECONDS = 5U;
-static constexpr uint32_t ROLLING_LR_MAX_WINDOW_SECONDS = 10U;
+static constexpr uint32_t ROLLING_LR_SAMPLE_RATE_HZ = 10U;
+static constexpr uint32_t ROLLING_LR_COUNTER_DELTA_TICKS =
+    (uint32_t)(VCLOCK_COUNTS_PER_SECOND / ROLLING_LR_SAMPLE_RATE_HZ);
+static constexpr uint32_t ROLLING_LR_WINDOW_SECONDS = 1U;
+static constexpr uint32_t ROLLING_LR_MAX_WINDOW_SECONDS = 1U;
 static constexpr uint32_t ROLLING_LR_WINDOW_CAPACITY_SAMPLES =
     ROLLING_LR_WINDOW_SECONDS * ROLLING_LR_SAMPLE_RATE_HZ;
-static constexpr uint32_t ROLLING_LR_MIN_VALID_SAMPLES =
-    (ROLLING_LR_WINDOW_CAPACITY_SAMPLES >= 2000U)
-        ? (ROLLING_LR_WINDOW_CAPACITY_SAMPLES / 2U)
-        : 700U;
+static constexpr uint32_t ROLLING_LR_MIN_VALID_SAMPLES = 6U;
 static constexpr uint32_t ROLLING_LR_FIT_ERROR_THRESHOLD_CYCLES = 4U;
 static constexpr uint32_t ROLLING_LR_FIT_ERROR_LOOSE_THRESHOLD_CYCLES = 10U;
+static constexpr uint64_t VCLOCK_LR_DIAG_PERIOD_NS =
+    (uint64_t)GNSS_NS_PER_SECOND / (uint64_t)ROLLING_LR_SAMPLE_RATE_HZ;
+static constexpr const char* VCLOCK_LR_DIAG_NAME = "VCLOCK_LR_DIAG_10HZ";
 
-static_assert(ROLLING_LR_WINDOW_SECONDS >= 1U,
-              "Rolling LR window must be at least one second");
+static_assert(ROLLING_LR_WINDOW_SECONDS == 1U,
+              "VCLOCK LR diagnostic pass intentionally uses one-second windows");
 static_assert(ROLLING_LR_WINDOW_SECONDS <= ROLLING_LR_MAX_WINDOW_SECONDS,
               "Rolling LR window exceeds retained segment capacity");
-static_assert(ROLLING_LR_SAMPLE_RATE_HZ == 1000U,
-              "Rolling LR first pass expects 1 kHz sample cadence");
-static_assert(ROLLING_LR_COUNTER_DELTA_TICKS == 10000U,
-              "Rolling LR samples are expected to be +10,000 10 MHz ticks");
+static_assert(ROLLING_LR_SAMPLE_RATE_HZ == 10U,
+              "VCLOCK LR diagnostic pass starts at 10 Hz");
+static_assert((VCLOCK_COUNTS_PER_SECOND % ROLLING_LR_SAMPLE_RATE_HZ) == 0U,
+              "VCLOCK LR period must divide the 10 MHz VCLOCK second");
+static_assert(ROLLING_LR_COUNTER_DELTA_TICKS == 1000000U,
+              "10 Hz LR samples are expected every 1,000,000 VCLOCK ticks");
+static_assert((GNSS_NS_PER_SECOND % ROLLING_LR_SAMPLE_RATE_HZ) == 0LL,
+              "10 Hz LR period must divide one GNSS second exactly");
 
 struct rolling_lr_segment_t {
   bool     active = false;
@@ -456,8 +458,8 @@ struct rolling_lr_segment_t {
   uint64_t first_dwt64_rel = 0;
   uint64_t last_dwt64_rel = 0;
 
-  // Aggregate sums for future O(1) rolling regression maintenance.  They stay
-  // zero in this shell pass because feed is disabled.
+  // Retained for report-schema continuity.  The 10 Hz VCLOCK pass uses the
+  // lane-level one-second sums below, not retained raw sample storage.
   uint64_t sum_x = 0;
   int64_t  sum_y = 0;
   uint64_t sum_xx = 0;
@@ -480,6 +482,19 @@ struct rolling_lr_result_t {
   uint32_t inferred_dwt_at_event = 0;
   int32_t  inferred_minus_observed_cycles = 0;
   int32_t  inferred_minus_authority_cycles = 0;
+  int32_t  observed_minus_authority_cycles = 0;
+
+  bool     pps_dwt_valid = false;
+  uint32_t pps_dwt_at_event = 0;
+  int32_t  observed_minus_pps_cycles = 0;
+  int32_t  authority_minus_pps_cycles = 0;
+  int32_t  inferred_minus_pps_cycles = 0;
+
+  uint32_t base_counter32 = 0;
+  uint32_t base_dwt32 = 0;
+  uint32_t target_ticks_from_base = 0;
+  uint32_t nominal_dwt_at_event = 0;
+  int32_t  inferred_minus_nominal_cycles = 0;
 
   uint64_t slope_q16_cycles_per_sample = 0;
   int64_t  slope_delta_q16_cycles_per_sample = 0;
@@ -1548,6 +1563,283 @@ static uint32_t vclock_cycles_for_ticks(uint32_t vclock_ticks) {
   return (uint32_t)(((uint64_t)cycles * (uint64_t)vclock_ticks +
                      (uint64_t)VCLOCK_COUNTS_PER_SECOND / 2ULL) /
                     (uint64_t)VCLOCK_COUNTS_PER_SECOND);
+}
+
+
+static void rolling_lr_clear_current_window(rolling_lr_dwt_lane_t& r) {
+  r.window_active = false;
+  r.segment_count = 0;
+  r.active_segment_index = 0;
+  r.active_segment_sample_count = 0;
+  r.window_sample_count = 0;
+  r.window_base_counter32 = 0;
+  r.window_base_dwt32 = 0;
+  r.window_base_dwt64 = 0;
+  r.last_sample_counter32 = 0;
+  r.last_sample_dwt32 = 0;
+  r.last_sample_dwt64 = 0;
+  r.rolling_sum_x = 0;
+  r.rolling_sum_y = 0;
+  r.rolling_sum_xx = 0;
+  r.rolling_sum_xy = 0;
+  r.rolling_sum_yy = 0;
+}
+
+static void rolling_lr_begin_vclock_window(rolling_lr_dwt_lane_t& r,
+                                           uint32_t counter32,
+                                           uint32_t dwt32) {
+  rolling_lr_clear_current_window(r);
+  r.window_active = true;
+  r.window_sequence++;
+  r.segment_sequence = r.window_sequence;
+  r.segment_count = 1;
+  r.active_segment_index = 0;
+  r.window_base_counter32 = counter32;
+  r.window_base_dwt32 = dwt32;
+  r.window_base_dwt64 = (uint64_t)dwt32;
+}
+
+static void rolling_lr_feed_vclock_sample_from_timepop(uint32_t counter32,
+                                                       uint32_t dwt32) {
+  if (!ROLLING_LR_DWT_ESTIMATOR_ENABLED ||
+      !ROLLING_LR_VCLOCK_SHADOW_FEED_ENABLED) {
+    return;
+  }
+
+  rolling_lr_dwt_lane_t& r = g_rolling_lr_vclock;
+  if (!r.enabled || !r.sample_feed_enabled ||
+      r.kind != interrupt_subscriber_kind_t::VCLOCK) {
+    return;
+  }
+
+  if (!r.window_active) {
+    rolling_lr_begin_vclock_window(r, counter32, dwt32);
+  }
+
+  uint32_t x_ticks = counter32 - r.window_base_counter32;
+
+  // A one-second diagnostic window should never span more than a little over
+  // one VCLOCK second.  If it does, start fresh rather than fitting stale
+  // samples across a counter/lifecycle discontinuity.
+  if (x_ticks > (uint32_t)VCLOCK_COUNTS_PER_SECOND +
+                    ROLLING_LR_COUNTER_DELTA_TICKS) {
+    r.counter_discontinuity_count++;
+    rolling_lr_begin_vclock_window(r, counter32, dwt32);
+    x_ticks = 0;
+  }
+
+  if (r.window_sample_count != 0 &&
+      (int32_t)(counter32 - r.last_sample_counter32) <= 0) {
+    r.counter_discontinuity_count++;
+    rolling_lr_begin_vclock_window(r, counter32, dwt32);
+    x_ticks = 0;
+  }
+
+  if (r.window_sample_count != 0 &&
+      (int32_t)(dwt32 - r.last_sample_dwt32) < 0) {
+    r.dwt_wrap_count++;
+  }
+
+  const uint32_t dwt_delta = dwt32 - r.window_base_dwt32;
+  const uint32_t nominal_delta = vclock_cycles_for_ticks(x_ticks);
+  const int32_t residual_cycles =
+      (int32_t)((int64_t)dwt_delta - (int64_t)nominal_delta);
+
+  const uint64_t x = (uint64_t)x_ticks;
+  const int64_t y = (int64_t)residual_cycles;
+
+  r.rolling_sum_x += x;
+  r.rolling_sum_y += y;
+  r.rolling_sum_xx += x * x;
+  r.rolling_sum_xy += (int64_t)x * y;
+  r.rolling_sum_yy += (uint64_t)((int64_t)y * (int64_t)y);
+
+  r.window_sample_count++;
+  r.active_segment_sample_count = r.window_sample_count;
+  r.sample_total_count++;
+  r.last_sample_counter32 = counter32;
+  r.last_sample_dwt32 = dwt32;
+  r.last_sample_dwt64 = (uint64_t)dwt32;
+}
+
+static FLASHMEM void rolling_lr_finalize_vclock_window(uint32_t target_counter32,
+                                              uint32_t observed_dwt,
+                                              uint32_t authority_dwt,
+                                              const pps_t& witness_pps,
+                                              bool witness_pps_valid) {
+  if (!ROLLING_LR_DWT_ESTIMATOR_ENABLED ||
+      !ROLLING_LR_VCLOCK_SHADOW_FEED_ENABLED) {
+    return;
+  }
+
+  rolling_lr_dwt_lane_t& r = g_rolling_lr_vclock;
+  rolling_lr_result_t result{};
+  result.sequence = r.window_sequence;
+  result.window_seconds = 1U;
+  result.sample_count = r.window_sample_count;
+  result.segment_count = r.segment_count;
+  result.target_counter32_at_event = target_counter32;
+  result.observed_dwt_at_event = observed_dwt;
+  result.authority_dwt_at_event = authority_dwt;
+  result.observed_minus_authority_cycles = (int32_t)(observed_dwt - authority_dwt);
+  result.pps_dwt_valid = witness_pps_valid && witness_pps.sequence != 0;
+  result.pps_dwt_at_event = result.pps_dwt_valid ? witness_pps.dwt_at_edge : 0U;
+
+  const bool was_active = r.window_active;
+  const uint32_t sample_count = r.window_sample_count;
+  const uint32_t base_counter32 = r.window_base_counter32;
+  const uint32_t base_dwt32 = r.window_base_dwt32;
+  const uint64_t sx = r.rolling_sum_x;
+  const int64_t sy = r.rolling_sum_y;
+  const uint64_t sxx = r.rolling_sum_xx;
+  const int64_t sxy = r.rolling_sum_xy;
+  const uint64_t syy = r.rolling_sum_yy;
+
+  // The next TimePop diagnostic sample starts a new current-second window.
+  rolling_lr_clear_current_window(r);
+
+  if (!was_active || !r.enabled || !r.sample_feed_enabled ||
+      r.kind != interrupt_subscriber_kind_t::VCLOCK ||
+      sample_count < r.min_valid_samples) {
+    r.insufficient_count++;
+    result.valid = false;
+    result.confidence_ok = false;
+    result.fallback_would_apply = true;
+    r.last_result = result;
+    return;
+  }
+
+  if ((int32_t)(target_counter32 - base_counter32) < 0) {
+    r.counter_discontinuity_count++;
+    result.valid = false;
+    result.confidence_ok = false;
+    result.fallback_would_apply = true;
+    r.last_result = result;
+    return;
+  }
+
+  const uint32_t target_ticks = target_counter32 - base_counter32;
+  if (target_ticks > (uint32_t)VCLOCK_COUNTS_PER_SECOND +
+                         ROLLING_LR_COUNTER_DELTA_TICKS) {
+    r.counter_discontinuity_count++;
+    result.valid = false;
+    result.confidence_ok = false;
+    result.fallback_would_apply = true;
+    r.last_result = result;
+    return;
+  }
+
+  const uint64_t n = (uint64_t)sample_count;
+  const uint64_t n_sxx = n * sxx;
+  const uint64_t sx_sx = sx * sx;
+  if (n_sxx <= sx_sx) {
+    r.no_fit_count++;
+    result.valid = false;
+    result.confidence_ok = false;
+    result.fallback_would_apply = true;
+    r.last_result = result;
+    return;
+  }
+  const uint64_t denom_u = n_sxx - sx_sx;
+
+  const double n_d = (double)n;
+  const double sx_d = (double)sx;
+  const double sy_d = (double)sy;
+  const double sxx_d = (double)sxx;
+  const double sxy_d = (double)sxy;
+  const double syy_d = (double)syy;
+  const double denom_d = n_d * sxx_d - sx_d * sx_d;
+  if (!(denom_d > 0.0)) {
+    r.no_fit_count++;
+    result.valid = false;
+    result.confidence_ok = false;
+    result.fallback_would_apply = true;
+    r.last_result = result;
+    return;
+  }
+
+  // Fit residual cycles against exact VCLOCK tick offset.  The previous
+  // sample-index formulation lost sub-sample phase and could be tens of
+  // microseconds wrong at 10 Hz.  This formulation evaluates the line at the
+  // exact one-second target tick.
+  const double slope_residual_cycles_per_tick =
+      (n_d * sxy_d - sx_d * sy_d) / denom_d;
+  const double intercept_residual_cycles =
+      (sy_d - slope_residual_cycles_per_tick * sx_d) / n_d;
+  const double residual_target =
+      intercept_residual_cycles +
+      slope_residual_cycles_per_tick * (double)target_ticks;
+  const int64_t residual_target_cycles = (int64_t)(residual_target +
+      (residual_target >= 0.0 ? 0.5 : -0.5));
+
+  const uint32_t nominal_target_cycles = vclock_cycles_for_ticks(target_ticks);
+  const uint32_t nominal_dwt = base_dwt32 + nominal_target_cycles;
+  const uint32_t inferred_dwt =
+      (uint32_t)((int64_t)nominal_dwt + residual_target_cycles);
+
+  const double mean_residual_cycles = sy_d / n_d;
+  const double sse =
+      syy_d +
+      slope_residual_cycles_per_tick * slope_residual_cycles_per_tick * sxx_d +
+      intercept_residual_cycles * intercept_residual_cycles * n_d +
+      2.0 * slope_residual_cycles_per_tick * intercept_residual_cycles * sx_d -
+      2.0 * slope_residual_cycles_per_tick * sxy_d -
+      2.0 * intercept_residual_cycles * sy_d;
+  const double variance = (sse > 0.0) ? (sse / n_d) : 0.0;
+  const uint32_t stddev_q16 = (variance > 0.0)
+      ? (uint32_t)(sqrt(variance) * 65536.0 + 0.5)
+      : 0U;
+
+  result.valid = true;
+  result.confidence_ok = true;
+  result.fallback_would_apply = false;
+  result.inferred_dwt_at_event = inferred_dwt;
+  result.inferred_minus_observed_cycles = (int32_t)(inferred_dwt - observed_dwt);
+  result.inferred_minus_authority_cycles = (int32_t)(inferred_dwt - authority_dwt);
+  if (result.pps_dwt_valid) {
+    result.observed_minus_pps_cycles = (int32_t)(observed_dwt - result.pps_dwt_at_event);
+    result.authority_minus_pps_cycles = (int32_t)(authority_dwt - result.pps_dwt_at_event);
+    result.inferred_minus_pps_cycles = (int32_t)(inferred_dwt - result.pps_dwt_at_event);
+  }
+  result.base_counter32 = base_counter32;
+  result.base_dwt32 = base_dwt32;
+  result.target_ticks_from_base = target_ticks;
+  result.nominal_dwt_at_event = nominal_dwt;
+  result.inferred_minus_nominal_cycles = (int32_t)(inferred_dwt - nominal_dwt);
+  const double full_slope_cycles_per_sample =
+      (double)vclock_cycles_for_ticks(ROLLING_LR_COUNTER_DELTA_TICKS) +
+      slope_residual_cycles_per_tick * (double)ROLLING_LR_COUNTER_DELTA_TICKS;
+  const int64_t slope_q16 = (int64_t)(full_slope_cycles_per_sample *
+                                       65536.0 +
+                                       (full_slope_cycles_per_sample >= 0.0
+                                            ? 0.5
+                                            : -0.5));
+  const int64_t intercept_q16 = (int64_t)(intercept_residual_cycles *
+                                           65536.0 +
+                                           (intercept_residual_cycles >= 0.0
+                                                ? 0.5
+                                                : -0.5));
+  const int64_t mean_q16 = (int64_t)(mean_residual_cycles * 65536.0 +
+                                     (mean_residual_cycles >= 0.0 ? 0.5 : -0.5));
+
+  result.slope_q16_cycles_per_sample =
+      (slope_q16 >= 0) ? (uint64_t)slope_q16 : 0ULL;
+  result.slope_delta_q16_cycles_per_sample = r.previous_slope_valid
+      ? ((int64_t)result.slope_q16_cycles_per_sample -
+         (int64_t)r.previous_slope_q16_cycles_per_sample)
+      : 0;
+  result.intercept_q16_cycles = (int32_t)intercept_q16;
+  result.fit_error_mean_q16_cycles = (int32_t)mean_q16;
+  result.fit_error_stddev_q16_cycles = stddev_q16;
+  result.fit_error_min_cycles = 0;
+  result.fit_error_max_cycles = 0;
+  result.fit_error_abs_gt4_count = 0;
+  result.fit_error_abs_gt10_count = 0;
+
+  r.previous_slope_valid = true;
+  r.previous_slope_q16_cycles_per_sample = result.slope_q16_cycles_per_sample;
+  r.last_result = result;
+  r.finalize_count++;
 }
 
 static uint32_t pps_vclock_phase_cycles_from_edges(const pps_t& pps,
@@ -2746,6 +3038,18 @@ static volatile uint16_t g_vclock_heartbeat_last_ocxo2_hw16_retired = 0;
 static volatile uint32_t g_vclock_heartbeat_last_vclock_counter32 = 0;
 static volatile uint32_t g_vclock_heartbeat_last_ocxo1_counter32_retired = 0;
 static volatile uint32_t g_vclock_heartbeat_last_ocxo2_counter32_retired = 0;
+
+// VCLOCK linear-regression diagnostic client.  It is intentionally a normal
+// named TimePop client, not hidden work inside VCLOCK_HEARTBEAT or native CH2
+// custody.  EMA remains the only subscriber-facing DWT authority.
+static volatile bool     g_vclock_lr_diag_timepop_armed = false;
+static volatile uint32_t g_vclock_lr_diag_timepop_arm_count = 0;
+static volatile uint32_t g_vclock_lr_diag_timepop_arm_failures = 0;
+static volatile uint32_t g_vclock_lr_diag_timepop_fire_count = 0;
+static volatile uint32_t g_vclock_lr_diag_timepop_inactive_skip_count = 0;
+static volatile uint32_t g_vclock_lr_diag_timepop_sample_feed_count = 0;
+static volatile uint32_t g_vclock_lr_diag_timepop_last_counter32 = 0;
+static volatile uint32_t g_vclock_lr_diag_timepop_last_dwt = 0;
 
 // Passive CH2 rollover tend — surgical coexistence layer.
 //
@@ -4561,6 +4865,12 @@ static void vclock_apply_perishable_fact_deferred(
   const uint32_t published_dwt = vclock_lane_ema_predict_dwt(
       g_vclock_lane, observed_dwt, &ema_synthetic, &ema_error_cycles, &ema_diag);
 
+  rolling_lr_finalize_vclock_window(fact.target_counter32,
+                                    observed_dwt,
+                                    published_dwt,
+                                    fact.witness_pps,
+                                    fact.witness_pps_valid);
+
   uint32_t coincidence_cycles = 0;
   bool coincidence_valid = false;
   if (fact.witness_pps_valid && fact.witness_pps.sequence > 0) {
@@ -5057,6 +5367,51 @@ static void vclock_heartbeat_timepop_callback(timepop_ctx_t* ctx,
   // OCXO lanes are intentionally absent here.  Their 16-bit rollover cadence is
   // now device-local on QTimer2/QTimer3; this TimePop callback is now only the
   // VCLOCK fallback/reporting heartbeat surface.
+}
+
+static void vclock_lr_diag_timepop_callback(timepop_ctx_t* ctx,
+                                           timepop_diag_t*,
+                                           void*) {
+  if (!ctx || !g_interrupt_hw_ready || !g_interrupt_runtime_ready) return;
+
+  g_vclock_lr_diag_timepop_fire_count++;
+  g_vclock_lr_diag_timepop_last_counter32 = ctx->fire_vclock_raw;
+  g_vclock_lr_diag_timepop_last_dwt = ctx->fire_dwt_cyccnt;
+
+  if (!g_vclock_lane.active || !g_rt_vclock || !g_rt_vclock->active) {
+    g_vclock_lr_diag_timepop_inactive_skip_count++;
+    return;
+  }
+
+  rolling_lr_feed_vclock_sample_from_timepop(ctx->fire_vclock_raw,
+                                             ctx->fire_dwt_cyccnt);
+  g_vclock_lr_diag_timepop_sample_feed_count++;
+}
+
+static bool vclock_lr_diag_arm_timepop(void) {
+  if (!g_interrupt_hw_ready || !g_interrupt_runtime_ready) return false;
+  if (!ROLLING_LR_DWT_ESTIMATOR_ENABLED ||
+      !ROLLING_LR_VCLOCK_SHADOW_FEED_ENABLED) {
+    g_vclock_lr_diag_timepop_armed = false;
+    return true;
+  }
+
+  timepop_cancel_by_name(VCLOCK_LR_DIAG_NAME);
+  const timepop_handle_t h =
+      timepop_arm(VCLOCK_LR_DIAG_PERIOD_NS,
+                  true,
+                  vclock_lr_diag_timepop_callback,
+                  nullptr,
+                  VCLOCK_LR_DIAG_NAME);
+  if (h == TIMEPOP_INVALID_HANDLE) {
+    g_vclock_lr_diag_timepop_armed = false;
+    g_vclock_lr_diag_timepop_arm_failures++;
+    return false;
+  }
+
+  g_vclock_lr_diag_timepop_armed = true;
+  g_vclock_lr_diag_timepop_arm_count++;
+  return true;
 }
 
 static bool vclock_heartbeat_arm_timepop(void) {
@@ -7459,6 +7814,15 @@ static FLASHMEM void runtime_reset_vclock_heartbeat_state(void) {
   g_vclock_heartbeat_last_ocxo1_counter32_retired = 0;
   g_vclock_heartbeat_last_ocxo2_counter32_retired = 0;
 
+  g_vclock_lr_diag_timepop_armed = false;
+  g_vclock_lr_diag_timepop_arm_count = 0;
+  g_vclock_lr_diag_timepop_arm_failures = 0;
+  g_vclock_lr_diag_timepop_fire_count = 0;
+  g_vclock_lr_diag_timepop_inactive_skip_count = 0;
+  g_vclock_lr_diag_timepop_sample_feed_count = 0;
+  g_vclock_lr_diag_timepop_last_counter32 = 0;
+  g_vclock_lr_diag_timepop_last_dwt = 0;
+
   g_ch2_implicit_rollover_count = 0;
   g_ch2_implicit_rollover_vclock_updates = 0;
   g_ch2_implicit_rollover_ocxo1_updates = 0;
@@ -7580,6 +7944,7 @@ void FLASHMEM process_interrupt_init(void) {
 
   g_interrupt_runtime_ready = true;
   (void)vclock_heartbeat_arm_timepop();
+  (void)vclock_lr_diag_arm_timepop();
 }
 
 void FLASHMEM process_interrupt_enable_irqs(void) {
@@ -7854,6 +8219,22 @@ static FLASHMEM void add_rolling_lr_payload(Payload& p,
                ROLLING_LR_VCLOCK_SHADOW_FEED_ENABLED);
   out.add_bool("rolling_lr_ocxo_shadow_feed_enabled",
                ROLLING_LR_OCXO_SHADOW_FEED_ENABLED);
+  out.add_bool("rolling_lr_timepop_client_enabled",
+               ROLLING_LR_VCLOCK_SHADOW_FEED_ENABLED);
+  out.add_str("rolling_lr_timepop_client_name", VCLOCK_LR_DIAG_NAME);
+  out.add_u64("rolling_lr_timepop_client_period_ns", VCLOCK_LR_DIAG_PERIOD_NS);
+  out.add_bool("rolling_lr_timepop_client_armed", g_vclock_lr_diag_timepop_armed);
+  out.add_u32("rolling_lr_timepop_client_arm_count", g_vclock_lr_diag_timepop_arm_count);
+  out.add_u32("rolling_lr_timepop_client_arm_failures", g_vclock_lr_diag_timepop_arm_failures);
+  out.add_u32("rolling_lr_timepop_client_fire_count", g_vclock_lr_diag_timepop_fire_count);
+  out.add_u32("rolling_lr_timepop_client_inactive_skip_count",
+              g_vclock_lr_diag_timepop_inactive_skip_count);
+  out.add_u32("rolling_lr_timepop_client_sample_feed_count",
+              g_vclock_lr_diag_timepop_sample_feed_count);
+  out.add_u32("rolling_lr_timepop_client_last_counter32",
+              g_vclock_lr_diag_timepop_last_counter32);
+  out.add_u32("rolling_lr_timepop_client_last_dwt",
+              g_vclock_lr_diag_timepop_last_dwt);
   out.add_u32("rolling_lr_sample_rate_hz", r.sample_rate_hz);
   out.add_u32("rolling_lr_counter_delta_ticks", r.counter_delta_ticks);
   out.add_u32("rolling_lr_window_seconds", r.window_seconds);
@@ -7864,7 +8245,7 @@ static FLASHMEM void add_rolling_lr_payload(Payload& p,
               ROLLING_LR_FIT_ERROR_THRESHOLD_CYCLES);
   out.add_u32("rolling_lr_fit_error_loose_threshold_cycles",
               ROLLING_LR_FIT_ERROR_LOOSE_THRESHOLD_CYCLES);
-  out.add_str("rolling_lr_memory_model", "SEGMENT_SUMS_NO_RAW_SAMPLE_RING");
+  out.add_str("rolling_lr_memory_model", "TIMEPOP_10HZ_1S_TICK_RESIDUAL_SUMS_NO_RAW_RING");
 
   out.add_u32("rolling_lr_reset_count", r.reset_count);
   out.add_u32("rolling_lr_sample_total_count", r.sample_total_count);
@@ -7912,11 +8293,29 @@ static FLASHMEM void add_rolling_lr_payload(Payload& p,
               last.target_counter32_at_event);
   out.add_u32("rolling_lr_last_observed_dwt", last.observed_dwt_at_event);
   out.add_u32("rolling_lr_last_authority_dwt", last.authority_dwt_at_event);
+  out.add_u32("rolling_lr_last_ema_dwt", last.authority_dwt_at_event);
   out.add_u32("rolling_lr_last_inferred_dwt", last.inferred_dwt_at_event);
+  out.add_u32("rolling_lr_last_nominal_dwt", last.nominal_dwt_at_event);
+  out.add_u32("rolling_lr_last_base_counter32", last.base_counter32);
+  out.add_u32("rolling_lr_last_base_dwt32", last.base_dwt32);
+  out.add_u32("rolling_lr_last_target_ticks_from_base",
+              last.target_ticks_from_base);
+  out.add_bool("rolling_lr_last_pps_dwt_valid", last.pps_dwt_valid);
+  out.add_u32("rolling_lr_last_pps_dwt", last.pps_dwt_at_event);
+  out.add_i32("rolling_lr_last_observed_minus_authority_cycles",
+              last.observed_minus_authority_cycles);
   out.add_i32("rolling_lr_last_inferred_minus_observed_cycles",
               last.inferred_minus_observed_cycles);
   out.add_i32("rolling_lr_last_inferred_minus_authority_cycles",
               last.inferred_minus_authority_cycles);
+  out.add_i32("rolling_lr_last_inferred_minus_nominal_cycles",
+              last.inferred_minus_nominal_cycles);
+  out.add_i32("rolling_lr_last_observed_minus_pps_cycles",
+              last.observed_minus_pps_cycles);
+  out.add_i32("rolling_lr_last_authority_minus_pps_cycles",
+              last.authority_minus_pps_cycles);
+  out.add_i32("rolling_lr_last_inferred_minus_pps_cycles",
+              last.inferred_minus_pps_cycles);
   out.add_u64("rolling_lr_last_slope_q16_cycles_per_sample",
               last.slope_q16_cycles_per_sample);
   out.add_i64("rolling_lr_last_slope_delta_q16_cycles_per_sample",
@@ -8133,10 +8532,14 @@ static FLASHMEM void add_runtime_payload(Payload& p) {
   p.add("rolling_lr_vclock_shadow_feed_enabled", ROLLING_LR_VCLOCK_SHADOW_FEED_ENABLED);
   p.add("rolling_lr_ocxo_shadow_feed_enabled", ROLLING_LR_OCXO_SHADOW_FEED_ENABLED);
   p.add("rolling_lr_sample_rate_hz", ROLLING_LR_SAMPLE_RATE_HZ);
+  p.add("rolling_lr_timepop_client_enabled", ROLLING_LR_VCLOCK_SHADOW_FEED_ENABLED);
+  p.add("rolling_lr_timepop_client_name", VCLOCK_LR_DIAG_NAME);
+  p.add("rolling_lr_timepop_client_period_ns", (uint64_t)VCLOCK_LR_DIAG_PERIOD_NS);
+  p.add("rolling_lr_timepop_client_armed", g_vclock_lr_diag_timepop_armed);
   p.add("rolling_lr_window_seconds", ROLLING_LR_WINDOW_SECONDS);
   p.add("rolling_lr_window_capacity_samples", ROLLING_LR_WINDOW_CAPACITY_SAMPLES);
   p.add("rolling_lr_min_valid_samples", ROLLING_LR_MIN_VALID_SAMPLES);
-  p.add("rolling_lr_memory_model", "SEGMENT_SUMS_NO_RAW_SAMPLE_RING");
+  p.add("rolling_lr_memory_model", "TIMEPOP_10HZ_1S_TICK_RESIDUAL_SUMS_NO_RAW_RING");
   p.add("ocxo_compare_live_requires_enabled_and_flag", true);
   p.add("lane_report_command", "INTERRUPT.REPORT_LANES");
   p.add("single_lane_report_command", "INTERRUPT.REPORT_LANE lane=VCLOCK|OCXO1|OCXO2");
