@@ -307,6 +307,121 @@ static constexpr bool VCLOCK_LINEAR_REGRESSION_ENABLED = false;
 static constexpr bool LINEAR_REGRESSION_AUTHORED_DWT = false;
 static constexpr bool LINEAR_REGRESSION_DIAGNOSTIC_ONLY = false;
 
+
+// ============================================================================
+// Step 2 First — generalized statistical DWT estimator shell
+// ============================================================================
+//
+// This pass is intentionally report-only and behavior-neutral.  It creates the
+// reusable statistical-estimator state and lane-report surface, but it does not
+// feed samples, does not add OCXO 1 kHz hardware cadence, does not alter
+// SmartZero, does not change EMA authority, and does not propagate through
+// Alpha/Beta/TIMEBASE.  The next steps can feed VCLOCK/OCXO evidence one lane
+// at a time after this shell proves harmless.
+
+static constexpr bool     STATISTICAL_DWT_ESTIMATOR_ENABLED = true;
+static constexpr bool     STATISTICAL_DWT_AUTHORITY_ENABLED = false;
+static constexpr bool     STATISTICAL_DWT_REPORT_ONLY = true;
+static constexpr bool     STATISTICAL_VCLOCK_SHADOW_FEED_ENABLED = false;
+static constexpr bool     STATISTICAL_OCXO_1KHZ_CADENCE_ENABLED = false;
+static constexpr uint32_t STATISTICAL_SAMPLE_RATE_HZ = 1000U;
+static constexpr uint32_t STATISTICAL_COUNTER_DELTA_TICKS = 10000U;
+static constexpr int32_t  STATISTICAL_ACCEPT_NEG_CYCLES = -4;
+static constexpr int32_t  STATISTICAL_ACCEPT_ZERO_CYCLES = 0;
+static constexpr int32_t  STATISTICAL_ACCEPT_POS_CYCLES = 4;
+static constexpr uint32_t STATISTICAL_ACCEPT_TOLERANCE_CYCLES = 0U;
+static constexpr uint32_t STATISTICAL_MIN_VALID_SAMPLES = 700U;
+static constexpr uint32_t STATISTICAL_MAX_REJECTED_SAMPLES = 300U;
+
+struct statistical_dwt_lane_t {
+  interrupt_subscriber_kind_t kind = interrupt_subscriber_kind_t::NONE;
+  bool     enabled = STATISTICAL_DWT_ESTIMATOR_ENABLED;
+  bool     authority_enabled = STATISTICAL_DWT_AUTHORITY_ENABLED;
+  bool     report_only = STATISTICAL_DWT_REPORT_ONLY;
+  bool     sample_feed_enabled = false;
+
+  uint32_t reset_count = 0;
+  uint32_t window_sequence = 0;
+  uint32_t sample_total_count = 0;
+  uint32_t finalize_count = 0;
+
+  bool     window_active = false;
+  uint32_t window_sample_count = 0;
+  uint32_t window_accepted_count = 0;
+  uint32_t window_rejected_count = 0;
+  uint32_t window_neg4_count = 0;
+  uint32_t window_zero_count = 0;
+  uint32_t window_pos4_count = 0;
+  uint32_t window_other_count = 0;
+  uint32_t window_base_dwt = 0;
+  uint32_t window_base_counter32 = 0;
+  uint32_t window_prediction_cycles = 0;
+
+  bool     last_valid = false;
+  bool     last_confidence_ok = false;
+  bool     last_fallback_would_apply = false;
+  uint32_t last_sequence = 0;
+  uint32_t last_total_samples = 0;
+  uint32_t last_accepted_samples = 0;
+  uint32_t last_rejected_samples = 0;
+  uint32_t last_neg4_count = 0;
+  uint32_t last_zero_count = 0;
+  uint32_t last_pos4_count = 0;
+  uint32_t last_other_count = 0;
+  int32_t  last_adjustment_cycles = 0;
+  uint32_t last_base_dwt = 0;
+  uint32_t last_prediction_cycles = 0;
+  uint32_t last_predicted_dwt_at_edge = 0;
+  uint32_t last_candidate_dwt_at_edge = 0;
+  uint32_t last_observed_dwt_at_edge = 0;
+  uint32_t last_counter32_at_edge = 0;
+  uint32_t last_reject_pct_milli = 0;
+  uint32_t last_confidence_milli = 0;
+};
+
+static statistical_dwt_lane_t g_statistical_vclock = {};
+static statistical_dwt_lane_t g_statistical_ocxo1 = {};
+static statistical_dwt_lane_t g_statistical_ocxo2 = {};
+
+static statistical_dwt_lane_t* statistical_dwt_for(
+    interrupt_subscriber_kind_t kind) {
+  if (kind == interrupt_subscriber_kind_t::VCLOCK) return &g_statistical_vclock;
+  if (kind == interrupt_subscriber_kind_t::OCXO1)  return &g_statistical_ocxo1;
+  if (kind == interrupt_subscriber_kind_t::OCXO2)  return &g_statistical_ocxo2;
+  return nullptr;
+}
+
+static const statistical_dwt_lane_t* statistical_dwt_for_const(
+    interrupt_subscriber_kind_t kind) {
+  return statistical_dwt_for(kind);
+}
+
+static void statistical_dwt_reset_kind(interrupt_subscriber_kind_t kind) {
+  statistical_dwt_lane_t* s = statistical_dwt_for(kind);
+  if (!s) return;
+
+  const uint32_t prior_reset_count = s->reset_count;
+  *s = statistical_dwt_lane_t{};
+  s->kind = kind;
+  s->enabled = STATISTICAL_DWT_ESTIMATOR_ENABLED;
+  s->authority_enabled = STATISTICAL_DWT_AUTHORITY_ENABLED;
+  s->report_only = STATISTICAL_DWT_REPORT_ONLY;
+  s->sample_feed_enabled =
+      (kind == interrupt_subscriber_kind_t::VCLOCK)
+          ? STATISTICAL_VCLOCK_SHADOW_FEED_ENABLED
+          : STATISTICAL_OCXO_1KHZ_CADENCE_ENABLED;
+  s->reset_count = prior_reset_count + 1U;
+}
+
+static void statistical_dwt_reset_all(void) {
+  g_statistical_vclock.kind = interrupt_subscriber_kind_t::VCLOCK;
+  g_statistical_ocxo1.kind = interrupt_subscriber_kind_t::OCXO1;
+  g_statistical_ocxo2.kind = interrupt_subscriber_kind_t::OCXO2;
+  statistical_dwt_reset_kind(interrupt_subscriber_kind_t::VCLOCK);
+  statistical_dwt_reset_kind(interrupt_subscriber_kind_t::OCXO1);
+  statistical_dwt_reset_kind(interrupt_subscriber_kind_t::OCXO2);
+}
+
 // ============================================================================
 // Symmetric OCXO disable matrix (temporary A/B experiment surface)
 // ============================================================================
@@ -2692,6 +2807,7 @@ bool interrupt_clock32_zero_from_ns(interrupt_subscriber_kind_t kind, uint64_t n
     g_vclock_lane.logical_count32_at_last_second = g_vclock_clock32.current_counter32;
     vclock_ch2_one_second_disable();
     cadence_regression_reset_kind(interrupt_subscriber_kind_t::VCLOCK);
+    statistical_dwt_reset_kind(interrupt_subscriber_kind_t::VCLOCK);
     vclock_fact_ring_reset();
     vclock_lane_ema_reset(g_vclock_lane);
     return true;
@@ -2721,6 +2837,7 @@ bool interrupt_clock32_request_zero_from_ns(interrupt_subscriber_kind_t kind, ui
     g_vclock_clock32.pending_zero_count++;
     vclock_ch2_one_second_disable();
     cadence_regression_reset_kind(interrupt_subscriber_kind_t::VCLOCK);
+    statistical_dwt_reset_kind(interrupt_subscriber_kind_t::VCLOCK);
     vclock_fact_ring_reset();
     vclock_lane_ema_reset(g_vclock_lane);
     return true;
@@ -4973,6 +5090,7 @@ static void ocxo_lane_install_logical_grid(interrupt_subscriber_kind_t kind,
   lane.witness_previous_event_counter32 = 0;
   lane.witness_last_counter_delta_ticks = 0;
   cadence_regression_reset_kind(kind);
+  statistical_dwt_reset_kind(kind);
 
   if (lane.active || smartzero_is_current_lane(kind)) {
     (void)ocxo_lane_start_local_cadence(kind, lane, clock32, reason);
@@ -7639,6 +7757,7 @@ static void runtime_reset_for_init(void) {
   vclock_fact_ring_reset();
   runtime_reset_ocxo_fact_rings();
   cadence_regression_reset_all();
+  statistical_dwt_reset_all();
 }
 
 void process_interrupt_init(void) {
@@ -7959,6 +8078,68 @@ static void add_regression_payload(Payload& p,
               last.fit_error_abs_gt4_count);
 }
 
+
+static void add_statistical_dwt_payload(Payload& p,
+                                        const char* prefix,
+                                        const statistical_dwt_lane_t& s) {
+  payload_prefix_t out(p, prefix);
+
+  out.add_bool("statistical_enabled", s.enabled);
+  out.add_bool("statistical_authority_enabled", s.authority_enabled);
+  out.add_bool("statistical_report_only", s.report_only);
+  out.add_bool("statistical_sample_feed_enabled", s.sample_feed_enabled);
+  out.add_bool("statistical_vclock_shadow_feed_enabled",
+               STATISTICAL_VCLOCK_SHADOW_FEED_ENABLED);
+  out.add_bool("statistical_ocxo_1khz_cadence_enabled",
+               STATISTICAL_OCXO_1KHZ_CADENCE_ENABLED);
+  out.add_u32("statistical_sample_rate_hz", STATISTICAL_SAMPLE_RATE_HZ);
+  out.add_u32("statistical_counter_delta_ticks", STATISTICAL_COUNTER_DELTA_TICKS);
+  out.add_i32("statistical_accept_neg_cycles", STATISTICAL_ACCEPT_NEG_CYCLES);
+  out.add_i32("statistical_accept_zero_cycles", STATISTICAL_ACCEPT_ZERO_CYCLES);
+  out.add_i32("statistical_accept_pos_cycles", STATISTICAL_ACCEPT_POS_CYCLES);
+  out.add_u32("statistical_accept_tolerance_cycles",
+              STATISTICAL_ACCEPT_TOLERANCE_CYCLES);
+  out.add_u32("statistical_min_valid_samples", STATISTICAL_MIN_VALID_SAMPLES);
+  out.add_u32("statistical_max_rejected_samples", STATISTICAL_MAX_REJECTED_SAMPLES);
+
+  out.add_u32("statistical_reset_count", s.reset_count);
+  out.add_u32("statistical_window_sequence", s.window_sequence);
+  out.add_u32("statistical_sample_total_count", s.sample_total_count);
+  out.add_u32("statistical_finalize_count", s.finalize_count);
+  out.add_bool("statistical_window_active", s.window_active);
+  out.add_u32("statistical_window_sample_count", s.window_sample_count);
+  out.add_u32("statistical_window_accepted_count", s.window_accepted_count);
+  out.add_u32("statistical_window_rejected_count", s.window_rejected_count);
+  out.add_u32("statistical_window_neg4_count", s.window_neg4_count);
+  out.add_u32("statistical_window_zero_count", s.window_zero_count);
+  out.add_u32("statistical_window_pos4_count", s.window_pos4_count);
+  out.add_u32("statistical_window_other_count", s.window_other_count);
+  out.add_u32("statistical_window_base_dwt", s.window_base_dwt);
+  out.add_u32("statistical_window_base_counter32", s.window_base_counter32);
+  out.add_u32("statistical_window_prediction_cycles", s.window_prediction_cycles);
+
+  out.add_bool("statistical_last_valid", s.last_valid);
+  out.add_bool("statistical_last_confidence_ok", s.last_confidence_ok);
+  out.add_bool("statistical_last_fallback_would_apply", s.last_fallback_would_apply);
+  out.add_u32("statistical_last_sequence", s.last_sequence);
+  out.add_u32("statistical_last_total_samples", s.last_total_samples);
+  out.add_u32("statistical_last_accepted_samples", s.last_accepted_samples);
+  out.add_u32("statistical_last_rejected_samples", s.last_rejected_samples);
+  out.add_u32("statistical_last_neg4_count", s.last_neg4_count);
+  out.add_u32("statistical_last_zero_count", s.last_zero_count);
+  out.add_u32("statistical_last_pos4_count", s.last_pos4_count);
+  out.add_u32("statistical_last_other_count", s.last_other_count);
+  out.add_i32("statistical_last_adjustment_cycles", s.last_adjustment_cycles);
+  out.add_u32("statistical_last_base_dwt", s.last_base_dwt);
+  out.add_u32("statistical_last_prediction_cycles", s.last_prediction_cycles);
+  out.add_u32("statistical_last_predicted_dwt_at_edge", s.last_predicted_dwt_at_edge);
+  out.add_u32("statistical_last_candidate_dwt_at_edge", s.last_candidate_dwt_at_edge);
+  out.add_u32("statistical_last_observed_dwt_at_edge", s.last_observed_dwt_at_edge);
+  out.add_u32("statistical_last_counter32_at_edge", s.last_counter32_at_edge);
+  out.add_u32("statistical_last_reject_pct_milli", s.last_reject_pct_milli);
+  out.add_u32("statistical_last_confidence_milli", s.last_confidence_milli);
+}
+
 static uint32_t regression_abs_i32(int32_t value) {
   return (uint32_t)(value < 0 ? -(int64_t)value : (int64_t)value);
 }
@@ -8205,6 +8386,12 @@ static void add_runtime_payload(Payload& p) {
   p.add("vclock_heartbeat_retained", true);
   p.add("vclock_heartbeat_rollover_owner", false);
   p.add("ocxo_native_1khz_cadence_retired", true);
+  p.add("statistical_dwt_estimator_enabled", STATISTICAL_DWT_ESTIMATOR_ENABLED);
+  p.add("statistical_dwt_authority_enabled", STATISTICAL_DWT_AUTHORITY_ENABLED);
+  p.add("statistical_dwt_report_only", STATISTICAL_DWT_REPORT_ONLY);
+  p.add("statistical_vclock_shadow_feed_enabled", STATISTICAL_VCLOCK_SHADOW_FEED_ENABLED);
+  p.add("statistical_ocxo_1khz_cadence_enabled", STATISTICAL_OCXO_1KHZ_CADENCE_ENABLED);
+  p.add("statistical_sample_rate_hz", STATISTICAL_SAMPLE_RATE_HZ);
   p.add("ocxo_compare_live_requires_enabled_and_flag", true);
   p.add("lane_report_command", "INTERRUPT.REPORT_LANES");
   p.add("single_lane_report_command", "INTERRUPT.REPORT_LANE lane=VCLOCK|OCXO1|OCXO2");
@@ -9341,6 +9528,11 @@ static Payload cmd_report(const Payload&) {
         g_regression_vclock.last_result.fit_error_stddev_q16_cycles);
   p.add("vclock_regression_last_fit_error_abs_gt4_count",
         g_regression_vclock.last_result.fit_error_abs_gt4_count);
+  p.add("vclock_statistical_enabled", g_statistical_vclock.enabled);
+  p.add("vclock_statistical_sample_feed_enabled", g_statistical_vclock.sample_feed_enabled);
+  p.add("vclock_statistical_last_valid", g_statistical_vclock.last_valid);
+  p.add("vclock_statistical_last_accepted_samples", g_statistical_vclock.last_accepted_samples);
+  p.add("vclock_statistical_last_rejected_samples", g_statistical_vclock.last_rejected_samples);
 
   add_ocxo_compact_payload(p, g_ocxo1_ctx);
   add_ocxo_compact_payload(p, g_ocxo2_ctx);
@@ -9659,9 +9851,9 @@ static void add_idle_dwt_witness_payload(Payload& p) {
 // bounded section at a time.
 
 static const char* REPORT_LANE_VCLOCK_SECTIONS =
-    "summary ema ch2 epoch smartzero fact_ring clock32 qtimer regression spincatch isr";
+    "summary ema statistical ch2 epoch smartzero fact_ring clock32 qtimer regression spincatch isr";
 static const char* REPORT_LANE_OCXO_SECTIONS =
-    "summary ema service scheduler witness qtimer ring clock32 regression spincatch isr";
+    "summary ema statistical service scheduler witness qtimer ring clock32 regression spincatch isr";
 
 static const char* report_lane_section_arg(const Payload& args) {
   const char* section = args.getString("section");
@@ -9870,6 +10062,8 @@ static bool add_vclock_lane_section(Payload& p, const char* section) {
     add_vclock_lane_summary_section(p);
   } else if (report_lane_section_is(section, "ema")) {
     add_vclock_lane_ema_section(p);
+  } else if (report_lane_section_is(section, "statistical")) {
+    add_statistical_dwt_payload(p, "vclock", g_statistical_vclock);
   } else if (report_lane_section_is(section, "ch2")) {
     add_vclock_lane_ch2_section(p);
   } else if (report_lane_section_is(section, "epoch")) {
@@ -9984,6 +10178,9 @@ static bool add_ocxo_lane_section(Payload& p,
     add_ocxo_lane_summary_section(p, ctx);
   } else if (report_lane_section_is(section, "ema")) {
     add_ocxo_lane_ema_section(p, ctx);
+  } else if (report_lane_section_is(section, "statistical")) {
+    const statistical_dwt_lane_t* statistical = statistical_dwt_for_const(ctx.kind);
+    if (statistical) add_statistical_dwt_payload(p, ctx.prefix, *statistical);
   } else if (report_lane_section_is(section, "service")) {
     add_ocxo_witness_service_payload(out, *ctx.lane);
   } else if (report_lane_section_is(section, "scheduler")) {
