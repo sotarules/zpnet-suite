@@ -50,7 +50,7 @@ static uint64_t system_cpu_window_last_idle_cycles = 0;
 // Terminal helpers
 // ================================================================
 
-static void enter_bootloader_cb(timepop_ctx_t*, timepop_diag_t*, void*) {
+static FLASHMEM void enter_bootloader_cb(timepop_ctx_t*, timepop_diag_t*, void*) {
 
   // Idempotent, higher priority than shutdown
   if (system_bootloader) {
@@ -110,7 +110,7 @@ void system_enter_quiescence(void) {
 //   • No aggregation
 //   • No inference
 // ------------------------------------------------------------
-static Payload cmd_report(const Payload& /*args*/) {
+static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
 
   Payload p;
 
@@ -232,7 +232,7 @@ static Payload cmd_report(const Payload& /*args*/) {
 //   a smoking gun.
 // ============================================================================
 
-static Payload cmd_process_info(const Payload& /*args*/) {
+static FLASHMEM Payload cmd_process_info(const Payload& /*args*/) {
 
     process_rpc_info_t info{};
     process_get_rpc_info(&info);
@@ -302,7 +302,7 @@ static Payload cmd_process_info(const Payload& /*args*/) {
 //   • No allocation beyond Payload
 //   • No transport emission
 // ------------------------------------------------------------
-static Payload cmd_transport_info(const Payload& /*args*/) {
+static FLASHMEM Payload cmd_transport_info(const Payload& /*args*/) {
 
   transport_info_t info;
   transport_get_info(&info);
@@ -383,7 +383,7 @@ static Payload cmd_transport_info(const Payload& /*args*/) {
 //   • No allocation beyond Payload
 //   • No transport emission
 // ------------------------------------------------------------
-static Payload cmd_payload_info(const Payload& /*args*/) {
+static FLASHMEM Payload cmd_payload_info(const Payload& /*args*/) {
 
   payload_info_t info{};
   payload_get_info(&info);
@@ -442,7 +442,7 @@ static Payload cmd_payload_info(const Payload& /*args*/) {
 //   • No transport emission
 // ============================================================================
 
-static Payload cmd_memory_info(const Payload& /*args*/) {
+static FLASHMEM Payload cmd_memory_info(const Payload& /*args*/) {
 
     memory_info_t info{};
     memory_info_get(&info);
@@ -484,10 +484,104 @@ static Payload cmd_memory_info(const Payload& /*args*/) {
     return p;
 }
 
+
+// ============================================================================
+// cmd_footprint_info — compile-time/static footprint visibility
+// ============================================================================
+//
+// Register in your SYSTEM process command table as:
+//
+//   { "FOOTPRINT_INFO", cmd_footprint_info },
+//
+// Query from Pi:
+//   .tc system footprint_info
+//
+// Semantics:
+//   • Read-only
+//   • Snapshot-only
+//   • No scheduler work
+//   • No persistent state
+//   • Reports compile-time sizeof(...) facts for structures visible here
+//
+// This report is intentionally SYSTEM-local.  It exposes framework and SYSTEM
+// structure sizes without pulling private process_interrupt implementation
+// types into public headers.  Process-private feature footprints should be
+// reported by the owning process next to the private structs they measure.
+// ============================================================================
+
+static FLASHMEM Payload cmd_footprint_info(const Payload& /*args*/) {
+
+  Payload p;
+
+  p.add("report", "SYSTEM_FOOTPRINT_INFO");
+  p.add("scope", "SYSTEM_VISIBLE_TYPES_ONLY");
+  p.add("private_process_types_included", false);
+  p.add("notes", "Use owning process reports for private feature structs");
+
+  // ==========================================================
+  // ABI / scalar sizes
+  // ==========================================================
+
+  p.add("sizeof_bool",    (uint32_t)sizeof(bool));
+  p.add("sizeof_char",    (uint32_t)sizeof(char));
+  p.add("sizeof_int",     (uint32_t)sizeof(int));
+  p.add("sizeof_long",    (uint32_t)sizeof(long));
+  p.add("sizeof_float",   (uint32_t)sizeof(float));
+  p.add("sizeof_double",  (uint32_t)sizeof(double));
+  p.add("sizeof_pointer", (uint32_t)sizeof(void*));
+  p.add("sizeof_size_t",  (uint32_t)sizeof(size_t));
+  p.add("sizeof_uint32_t", (uint32_t)sizeof(uint32_t));
+  p.add("sizeof_uint64_t", (uint32_t)sizeof(uint64_t));
+
+  // ==========================================================
+  // Core framework / report types visible to SYSTEM
+  // ==========================================================
+
+  p.add("sizeof_payload",             (uint32_t)sizeof(Payload));
+  p.add("sizeof_payload_array",       (uint32_t)sizeof(PayloadArray));
+  p.add("sizeof_memory_info_t",       (uint32_t)sizeof(memory_info_t));
+  p.add("sizeof_process_rpc_info_t",  (uint32_t)sizeof(process_rpc_info_t));
+  p.add("sizeof_transport_info_t",    (uint32_t)sizeof(transport_info_t));
+  p.add("sizeof_process_command_entry_t",
+        (uint32_t)sizeof(process_command_entry_t));
+  p.add("sizeof_process_vtable_t",    (uint32_t)sizeof(process_vtable_t));
+  p.add("sizeof_timepop_ctx_t",       (uint32_t)sizeof(timepop_ctx_t));
+  p.add("sizeof_timepop_diag_t",      (uint32_t)sizeof(timepop_diag_t));
+  p.add("sizeof_timepop_idle_witness_snapshot_t",
+        (uint32_t)sizeof(timepop_idle_witness_snapshot_t));
+
+  // ==========================================================
+  // SYSTEM module-local static state known to this translation unit
+  // ==========================================================
+
+  p.add("system_local_static_known_bytes",
+        (uint32_t)(sizeof(system_shutdown) +
+                   sizeof(system_bootloader) +
+                   sizeof(system_cpu_window_initialized) +
+                   sizeof(system_cpu_window_last_wall_cycles) +
+                   sizeof(system_cpu_window_last_idle_cycles)));
+
+  // ==========================================================
+  // Current macro memory context for correlation with sizeof deltas
+  // ==========================================================
+
+  memory_info_t mem{};
+  memory_info_get(&mem);
+  p.add("dtcm_total_current",       mem.dtcm_total);
+  p.add("dtcm_static_current",      mem.dtcm_static);
+  p.add("dtcm_stack_avail_current", mem.dtcm_stack_avail);
+  p.add("heap_total_current",       mem.heap_total);
+  p.add("heap_used_current",        mem.heap_used);
+  p.add("heap_free_total_current",  mem.heap_free_total);
+  p.add("heap_arena_high_water",    mem.heap_arena_high_water);
+
+  return p;
+}
+
 // ------------------------------------------------------------
 // ENTER_BOOTLOADER — terminal, irreversible
 // ------------------------------------------------------------
-static Payload cmd_enter_bootloader(const Payload& /*args*/) {
+static FLASHMEM Payload cmd_enter_bootloader(const Payload& /*args*/) {
 
   timepop_arm(
     FLASH_DELAY_NS,
@@ -509,7 +603,7 @@ static Payload cmd_enter_bootloader(const Payload& /*args*/) {
 // ------------------------------------------------------------
 // SHUTDOWN — terminal, irreversible
 // ------------------------------------------------------------
-static Payload cmd_shutdown(const Payload& /*args*/) {
+static FLASHMEM Payload cmd_shutdown(const Payload& /*args*/) {
 
   {
     Payload ev;
@@ -524,7 +618,7 @@ static Payload cmd_shutdown(const Payload& /*args*/) {
 // ------------------------------------------------------------
 // PROCESS_LIST — registry introspection (diagnostic only)
 // ------------------------------------------------------------
-static Payload cmd_process_list(const Payload&) {
+static FLASHMEM Payload cmd_process_list(const Payload&) {
 
   Payload p;
   PayloadArray arr;
@@ -542,7 +636,7 @@ static Payload cmd_process_list(const Payload&) {
 // ------------------------------------------------------------
 // DEBUG — raw debug channel test
 // ------------------------------------------------------------
-static Payload cmd_debug(const Payload& args) {
+static FLASHMEM Payload cmd_debug(const Payload& args) {
 
   Payload resp;
 
@@ -570,7 +664,7 @@ static Payload cmd_debug(const Payload& args) {
 // ------------------------------------------------------------
 // STATUS — simple response of liveness
 // ------------------------------------------------------------
-static Payload cmd_status(const Payload& /*args*/) {
+static FLASHMEM Payload cmd_status(const Payload& /*args*/) {
   return ok_payload();
 }
 
@@ -584,6 +678,7 @@ static const process_command_entry_t SYSTEM_COMMANDS[] = {
   { "TRANSPORT_INFO",   cmd_transport_info   },
   { "PAYLOAD_INFO",     cmd_payload_info     },
   { "MEMORY_INFO",      cmd_memory_info      },
+  { "FOOTPRINT_INFO",   cmd_footprint_info   },
   { "ENTER_BOOTLOADER", cmd_enter_bootloader },
   { "SHUTDOWN",         cmd_shutdown         },
   { "PROCESS_LIST",     cmd_process_list     },
@@ -598,6 +693,6 @@ static const process_vtable_t SYSTEM_PROCESS = {
   .subscriptions = nullptr,
 };
 
-void process_system_register(void) {
+void FLASHMEM process_system_register(void) {
   process_register("SYSTEM", &SYSTEM_PROCESS);
 }

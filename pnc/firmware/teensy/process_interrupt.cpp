@@ -1427,7 +1427,7 @@ static constexpr uint32_t VCLOCK_CH2_EPOCH_REJECT_NONE = 0;
 static constexpr uint32_t VCLOCK_CH2_EPOCH_REJECT_BACKDATE_ZERO = 1;
 static constexpr uint32_t VCLOCK_CH2_EPOCH_REJECT_BACKDATE_TOO_LARGE = 2;
 
-static const char* vclock_ch2_epoch_reject_reason_name(uint32_t reason) {
+static FLASHMEM const char* vclock_ch2_epoch_reject_reason_name(uint32_t reason) {
   switch (reason) {
     case VCLOCK_CH2_EPOCH_REJECT_BACKDATE_ZERO: return "BACKDATE_ZERO";
     case VCLOCK_CH2_EPOCH_REJECT_BACKDATE_TOO_LARGE: return "BACKDATE_TOO_LARGE";
@@ -2313,7 +2313,7 @@ enum class ocxo_timer_backend_t : uint8_t {
   GPT32    = 1,  // Reserved for later spike steps; not selected in Step 1.
 };
 
-static const char* ocxo_timer_backend_name(ocxo_timer_backend_t backend) {
+static FLASHMEM const char* ocxo_timer_backend_name(ocxo_timer_backend_t backend) {
   switch (backend) {
     case ocxo_timer_backend_t::QTIMER16: return "QTIMER16";
     case ocxo_timer_backend_t::GPT32:    return "GPT32_RESERVED";
@@ -3395,7 +3395,7 @@ static void smartzero_install_disabled_surrogates_locked(void) {
   smartzero_install_disabled_surrogate_locked(2);
 }
 
-static const char* smartzero_decision_name(interrupt_smartzero_decision_t d) {
+static FLASHMEM const char* smartzero_decision_name(interrupt_smartzero_decision_t d) {
   switch (d) {
     case interrupt_smartzero_decision_t::WAITING_FOR_CPS:  return "WAITING_FOR_CPS";
     case interrupt_smartzero_decision_t::FIRST_SAMPLE:     return "FIRST_SAMPLE";
@@ -3406,7 +3406,7 @@ static const char* smartzero_decision_name(interrupt_smartzero_decision_t d) {
   }
 }
 
-static const char* smartzero_lane_state_name(interrupt_smartzero_lane_state_t s) {
+static FLASHMEM const char* smartzero_lane_state_name(interrupt_smartzero_lane_state_t s) {
   switch (s) {
     case interrupt_smartzero_lane_state_t::ACQUIRING: return "ACQUIRING";
     case interrupt_smartzero_lane_state_t::LOCKED:    return "LOCKED";
@@ -3414,7 +3414,7 @@ static const char* smartzero_lane_state_name(interrupt_smartzero_lane_state_t s)
   }
 }
 
-static const char* smartzero_phase_name(interrupt_smartzero_phase_t p) {
+static FLASHMEM const char* smartzero_phase_name(interrupt_smartzero_phase_t p) {
   switch (p) {
     case interrupt_smartzero_phase_t::RUNNING:  return "RUNNING";
     case interrupt_smartzero_phase_t::COMPLETE: return "COMPLETE";
@@ -4621,7 +4621,7 @@ static void vclock_fact_drain_callback(timepop_ctx_t*,
 // Cadence surfaces — VCLOCK TimePop heartbeat + OCXO lane-local compare custody
 // ============================================================================
 
-static const char* ocxo_schedule_decision_name(uint32_t decision) {
+static FLASHMEM const char* ocxo_schedule_decision_name(uint32_t decision) {
   switch (decision) {
     case OCXO_SCHEDULE_DECISION_INACTIVE: return "INACTIVE";
     case OCXO_SCHEDULE_DECISION_ALREADY_ARMED: return "ALREADY_ARMED";
@@ -4634,7 +4634,7 @@ static const char* ocxo_schedule_decision_name(uint32_t decision) {
   }
 }
 
-static const char* ocxo_service_class_name(uint32_t service_class) {
+static FLASHMEM const char* ocxo_service_class_name(uint32_t service_class) {
   switch (service_class) {
     case OCXO_SERVICE_CLASS_FALSE_IRQ: return "FALSE_IRQ";
     case OCXO_SERVICE_CLASS_EARLY_PRETARGET: return "EARLY_PRETARGET";
@@ -4643,7 +4643,7 @@ static const char* ocxo_service_class_name(uint32_t service_class) {
   }
 }
 
-static const char* ocxo_cadence_reason_name(uint32_t reason) {
+static FLASHMEM const char* ocxo_cadence_reason_name(uint32_t reason) {
   switch (reason) {
     case OCXO_CADENCE_REASON_BOOTSTRAP:    return "BOOTSTRAP";
     case OCXO_CADENCE_REASON_START:        return "START";
@@ -7196,7 +7196,7 @@ void interrupt_prespin_service(timepop_ctx_t*, timepop_diag_t*, void*) {}
 // Hardware + runtime init
 // ============================================================================
 
-static void qtimer1_init_vclock_base(void) {
+static FLASHMEM void qtimer1_init_vclock_base(void) {
   CCM_CCGR6 |= CCM_CCGR6_QTIMER1(CCM_CCGR_ON);
 
   *(portConfigRegister(10)) = 1;
@@ -7232,7 +7232,7 @@ static void qtimer1_init_vclock_base(void) {
   (void)IMXRT_TMR1.CH[0].CNTR;
 }
 
-static void qtimer1_init_ch2_scheduler(void) {
+static FLASHMEM void qtimer1_init_ch2_scheduler(void) {
   IMXRT_TMR1.CH[2].CTRL   = 0;
   IMXRT_TMR1.CH[2].CNTR   = 0;
   IMXRT_TMR1.CH[2].LOAD   = 0;
@@ -7243,7 +7243,7 @@ static void qtimer1_init_ch2_scheduler(void) {
   IMXRT_TMR1.CH[2].CTRL   = TMR_CTRL_CM(1) | TMR_CTRL_PCS(0);
 }
 
-static void ocxo_lane_bind_qtimer_backend(ocxo_lane_t& lane,
+static FLASHMEM void ocxo_lane_bind_qtimer_backend(ocxo_lane_t& lane,
                                           const char* name,
                                           IMXRT_TMR_t* module,
                                           uint8_t channel,
@@ -7258,7 +7258,7 @@ static void ocxo_lane_bind_qtimer_backend(ocxo_lane_t& lane,
   lane.initialized = false;
 }
 
-static void ocxo_lane_init_qtimer_backend(ocxo_lane_t& lane) {
+static FLASHMEM void ocxo_lane_init_qtimer_backend(ocxo_lane_t& lane) {
   lane.initialized = false;
   if (!ocxo_lane_backend_is_qtimer(lane)) return;
 
@@ -7294,7 +7294,7 @@ static void ocxo_lane_init_qtimer_backend(ocxo_lane_t& lane) {
   }
 }
 
-static void ocxo_lane_init_hardware(ocxo_lane_t& lane) {
+static FLASHMEM void ocxo_lane_init_hardware(ocxo_lane_t& lane) {
   switch (lane.backend) {
     case ocxo_timer_backend_t::QTIMER16:
       ocxo_lane_init_qtimer_backend(lane);
@@ -7307,7 +7307,7 @@ static void ocxo_lane_init_hardware(ocxo_lane_t& lane) {
   }
 }
 
-void process_interrupt_init_hardware(void) {
+void FLASHMEM process_interrupt_init_hardware(void) {
   if (g_interrupt_hw_ready) return;
 
   ocxo_lane_bind_qtimer_backend(g_ocxo1_lane, "OCXO1", &IMXRT_TMR2, 0, 0, OCXO1_PIN);
@@ -7343,7 +7343,7 @@ void process_interrupt_init_hardware(void) {
   g_interrupt_hw_ready = true;
 }
 
-static void runtime_init_subscribers(void) {
+static FLASHMEM void runtime_init_subscribers(void) {
   g_subscriber_count = 0;
   g_rt_vclock = nullptr;
   g_rt_ocxo1 = nullptr;
@@ -7361,7 +7361,7 @@ static void runtime_init_subscribers(void) {
   }
 }
 
-static void runtime_reset_pps_state(void) {
+static FLASHMEM void runtime_reset_pps_state(void) {
   g_pps_gpio_heartbeat = pps_gpio_heartbeat_t{};
   g_gpio_irq_count = 0;
   g_gpio_miss_count = 0;
@@ -7387,7 +7387,7 @@ static void runtime_reset_pps_state(void) {
   g_pps_rebootstrap_count = 0;
 }
 
-static void runtime_reset_snapshot_and_bridge_state(void) {
+static FLASHMEM void runtime_reset_snapshot_and_bridge_state(void) {
   g_store = snapshot_store_t{};
   g_epoch_capture_store = epoch_capture_store_t{};
   pvc_anchor_ring_reset();
@@ -7398,20 +7398,20 @@ static void runtime_reset_snapshot_and_bridge_state(void) {
   g_pps_entry_latency_handler = nullptr;
 }
 
-static void runtime_reset_smartzero_state(void) {
+static FLASHMEM void runtime_reset_smartzero_state(void) {
   g_smartzero = smartzero_runtime_t{};
   for (uint32_t i = 0; i < SMARTZERO_LANE_COUNT; i++) {
     smartzero_reset_lane(i);
   }
 }
 
-static void runtime_reset_clock32_state(void) {
+static FLASHMEM void runtime_reset_clock32_state(void) {
   g_vclock_clock32 = vclock_synthetic_clock32_t{};
   g_ocxo1_clock32 = synthetic_clock32_t{};
   g_ocxo2_clock32 = synthetic_clock32_t{};
 }
 
-static void runtime_bootstrap_synthetic_clocks_if_ready(void) {
+static FLASHMEM void runtime_bootstrap_synthetic_clocks_if_ready(void) {
   // Defensive birth anchors.  These are not logical ZERO operations; they
   // simply make process_interrupt's synthetic coordinate extenders safe before
   // CLOCKS has installed a user/campaign epoch.
@@ -7428,7 +7428,7 @@ static void runtime_bootstrap_synthetic_clocks_if_ready(void) {
   }
 }
 
-static void runtime_reset_qtimer_host_state(void) {
+static FLASHMEM void runtime_reset_qtimer_host_state(void) {
   g_qtimer1_ch1_sequence = 0;
   g_qtimer1_ch1_target_counter32 = 0;
   g_qtimer1_ch1_next_compare_counter32 = 0;
@@ -7443,7 +7443,7 @@ static void runtime_reset_qtimer_host_state(void) {
   g_ocxo2_qtimer_diag = ocxo_qtimer_diag_t{};
 }
 
-static void runtime_reset_vclock_heartbeat_state(void) {
+static FLASHMEM void runtime_reset_vclock_heartbeat_state(void) {
   vclock_lane_ema_reset(g_vclock_lane);
   g_vclock_heartbeat_armed = false;
   g_vclock_heartbeat_arm_count = 0;
@@ -7551,12 +7551,12 @@ static void runtime_reset_vclock_heartbeat_state(void) {
 
 }
 
-static void runtime_reset_ocxo_fact_rings(void) {
+static FLASHMEM void runtime_reset_ocxo_fact_rings(void) {
   if (!OCXO1_DISABLED) ocxo_fact_ring_reset(g_ocxo1_ctx);
   if (!OCXO2_DISABLED) ocxo_fact_ring_reset(g_ocxo2_ctx);
 }
 
-static void runtime_reset_for_init(void) {
+static FLASHMEM void runtime_reset_for_init(void) {
   runtime_init_subscribers();
   runtime_reset_pps_state();
   runtime_reset_snapshot_and_bridge_state();
@@ -7573,7 +7573,7 @@ static void runtime_reset_for_init(void) {
   rolling_lr_reset_all();
 }
 
-void process_interrupt_init(void) {
+void FLASHMEM process_interrupt_init(void) {
   if (g_interrupt_runtime_ready) return;
 
   runtime_reset_for_init();
@@ -7582,7 +7582,7 @@ void process_interrupt_init(void) {
   (void)vclock_heartbeat_arm_timepop();
 }
 
-void process_interrupt_enable_irqs(void) {
+void FLASHMEM process_interrupt_enable_irqs(void) {
   if (g_interrupt_irqs_enabled) return;
 
   attachInterruptVector(IRQ_QTIMER1, qtimer1_isr);
@@ -7672,7 +7672,7 @@ struct payload_prefix_t {
   }
 };
 
-static void spincatch_plan_from_target(spincatch_lane_report_t& s,
+static FLASHMEM void spincatch_plan_from_target(spincatch_lane_report_t& s,
                                        bool target_valid,
                                        uint32_t target_counter32,
                                        uint16_t target_low16,
@@ -7703,7 +7703,7 @@ static void spincatch_plan_from_target(spincatch_lane_report_t& s,
   s.planner_count++;
 }
 
-static void spincatch_update_planner_for_report(interrupt_subscriber_kind_t kind) {
+static FLASHMEM void spincatch_update_planner_for_report(interrupt_subscriber_kind_t kind) {
   spincatch_lane_report_t* s = spincatch_report_for_kind(kind);
   if (!s || !SPINCATCH_PLANNER_ENABLED) return;
 
@@ -7739,7 +7739,7 @@ static void spincatch_update_planner_for_report(interrupt_subscriber_kind_t kind
                              ctx->clock32->current_counter32);
 }
 
-static void add_spincatch_report_payload(Payload& p,
+static FLASHMEM void add_spincatch_report_payload(Payload& p,
                                          interrupt_subscriber_kind_t kind) {
   spincatch_update_planner_for_report(kind);
   spincatch_lane_report_t* s_mut = spincatch_report_for_kind(kind);
@@ -7808,7 +7808,7 @@ static void add_spincatch_report_payload(Payload& p,
   p.add("spincatch_landing_fire_dwt", s ? s->landing_fire_dwt : 0U);
 }
 
-static void add_isr_sanity_payload(Payload& p,
+static FLASHMEM void add_isr_sanity_payload(Payload& p,
                                    const char* prefix,
                                    const isr_sanity_diag_t& s) {
   payload_prefix_t out(p, prefix);
@@ -7824,7 +7824,7 @@ static void add_isr_sanity_payload(Payload& p,
   out.add_u32("dwt_actual", s.dwt_actual);
 }
 
-static void add_bridge_stats_payload(Payload& p,
+static FLASHMEM void add_bridge_stats_payload(Payload& p,
                                      const char* prefix,
                                      const bridge_anchor_stats_t& s) {
   payload_prefix_t out(p, prefix);
@@ -7840,7 +7840,7 @@ static void add_bridge_stats_payload(Payload& p,
   out.add_u32("anchor_last_failure_mask", s.last_anchor_failure_mask);
 }
 
-static void add_rolling_lr_payload(Payload& p,
+static FLASHMEM void add_rolling_lr_payload(Payload& p,
                                    const char* prefix,
                                    const rolling_lr_dwt_lane_t& r) {
   payload_prefix_t out(p, prefix);
@@ -7937,7 +7937,7 @@ static void add_rolling_lr_payload(Payload& p,
               last.fit_error_abs_gt10_count);
 }
 
-static void add_regression_payload(Payload& p,
+static FLASHMEM void add_regression_payload(Payload& p,
                                    const char* prefix,
                                    const cadence_regression_lane_t& r) {
   payload_prefix_t out(p, prefix);
@@ -7991,7 +7991,7 @@ static void add_regression_payload(Payload& p,
   if (rolling) add_rolling_lr_payload(p, prefix, *rolling);
 }
 
-static void add_statistical_dwt_payload(Payload& p,
+static FLASHMEM void add_statistical_dwt_payload(Payload& p,
                                         const char* prefix,
                                         const statistical_dwt_lane_t& s) {
   payload_prefix_t out(p, prefix);
@@ -8052,7 +8052,7 @@ static void add_statistical_dwt_payload(Payload& p,
   out.add_u32("statistical_last_confidence_milli", s.last_confidence_milli);
 }
 
-static void add_priority_payload(Payload& p) {
+static FLASHMEM void add_priority_payload(Payload& p) {
   p.add("qtimer1_sovereign_priority_expected", INTERRUPT_STEP0_EXPECTED_QTIMER1_PRIORITY);
   p.add("qtimer1_sovereign_priority_applied", g_step0_qtimer1_priority_applied);
   p.add("qtimer1_sovereign_priority_ok",
@@ -8081,7 +8081,7 @@ static void add_priority_payload(Payload& p) {
   p.add("irq_gpio6789_configured_by_interrupt", g_step0_gpio6789_configured_by_interrupt);
 }
 
-static void add_runtime_payload(Payload& p) {
+static FLASHMEM void add_runtime_payload(Payload& p) {
   p.add("hardware_ready", g_interrupt_hw_ready);
   p.add("runtime_ready",  g_interrupt_runtime_ready);
   p.add("irqs_enabled",   g_interrupt_irqs_enabled);
@@ -8143,7 +8143,7 @@ static void add_runtime_payload(Payload& p) {
   p.add("regression_samples_report_command", "disabled");
 }
 
-static void add_ocxo_cadence_report_payload(Payload& p,
+static FLASHMEM void add_ocxo_cadence_report_payload(Payload& p,
                                            const ocxo_runtime_context_t& ctx) {
   const ocxo_lane_t& lane = *ctx.lane;
   payload_prefix_t out(p, ctx.prefix);
@@ -8166,7 +8166,7 @@ static void add_ocxo_cadence_report_payload(Payload& p,
               ocxo_cadence_reason_name(lane.cadence_last_reason));
 }
 
-static void add_vclock_heartbeat_payload(Payload& p) {
+static FLASHMEM void add_vclock_heartbeat_payload(Payload& p) {
   p.add("vclock_heartbeat_period_ns", (uint64_t)VCLOCK_HEARTBEAT_PERIOD_NS);
   p.add("vclock_heartbeat_armed", g_vclock_heartbeat_armed);
   p.add("vclock_heartbeat_arm_count", g_vclock_heartbeat_arm_count);
@@ -8283,7 +8283,7 @@ static void add_vclock_heartbeat_payload(Payload& p) {
   add_ocxo_cadence_report_payload(p, g_ocxo1_ctx);
   add_ocxo_cadence_report_payload(p, g_ocxo2_ctx);
 }
-static void add_pps_payload(Payload& p) {
+static FLASHMEM void add_pps_payload(Payload& p) {
   p.add("gpio_irq_count", g_gpio_irq_count);
   p.add("gpio_miss_count", g_gpio_miss_count);
   p.add("gpio_edge_count", g_pps_gpio_heartbeat.edge_count);
@@ -8370,7 +8370,7 @@ static void add_pps_payload(Payload& p) {
   p.add("pps_edge_dispatch_registered", g_pps_edge_dispatch != nullptr);
 }
 
-static void add_epoch_capture_payload(Payload& p) {
+static FLASHMEM void add_epoch_capture_payload(Payload& p) {
   interrupt_epoch_capture_t epoch_cap{};
   const bool epoch_cap_ok = interrupt_last_epoch_capture(&epoch_cap);
   p.add("epoch_capture_available", epoch_cap_ok);
@@ -8389,7 +8389,7 @@ static void add_epoch_capture_payload(Payload& p) {
   p.add("epoch_capture_ocxo2_counter32", epoch_cap.ocxo2_counter32);
 }
 
-static void add_dynamic_cps_payload(Payload& p) {
+static FLASHMEM void add_dynamic_cps_payload(Payload& p) {
   const uint32_t dynamic_cps = interrupt_dynamic_cps();
   p.add("dynamic_cps_owner", "CLOCKS_STATIC_PPS");
   p.add("dynamic_cps", dynamic_cps);
@@ -8401,7 +8401,7 @@ static void add_dynamic_cps_payload(Payload& p) {
 }
 
 
-static void add_smartzero_lane_payload(Payload& parent,
+static FLASHMEM void add_smartzero_lane_payload(Payload& parent,
                                        const char* key,
                                        const interrupt_smartzero_lane_snapshot_t& z) {
   Payload p;
@@ -8438,7 +8438,7 @@ static void add_smartzero_lane_payload(Payload& parent,
   parent.add_object(key, p);
 }
 
-static void add_smartzero_payload(Payload& p) {
+static FLASHMEM void add_smartzero_payload(Payload& p) {
   interrupt_smartzero_snapshot_t z{};
   (void)interrupt_smartzero_live_snapshot(&z);
 
@@ -8486,7 +8486,7 @@ static void add_smartzero_payload(Payload& p) {
   p.add_object("smartzero", legacy_lanes);  // legacy live alias
 }
 
-static void add_vclock_clock32_payload(Payload& p, const char* prefix) {
+static FLASHMEM void add_vclock_clock32_payload(Payload& p, const char* prefix) {
   payload_prefix_t out(p, prefix);
 
   out.add_bool("clock32_zeroed", g_vclock_clock32.zeroed);
@@ -8502,7 +8502,7 @@ static void add_vclock_clock32_payload(Payload& p, const char* prefix) {
   out.add_u32("clock32_minder_update_count", g_vclock_clock32.minder_update_count);
   out.add_u32("clock32_pending_zero_count", g_vclock_clock32.pending_zero_count);
 }
-static void add_ocxo_clock32_payload(Payload& p,
+static FLASHMEM void add_ocxo_clock32_payload(Payload& p,
                                      const char* prefix,
                                      const synthetic_clock32_t& clock32) {
   payload_prefix_t out(p, prefix);
@@ -8515,7 +8515,7 @@ static void add_ocxo_clock32_payload(Payload& p,
   out.add_u32("clock32_zero_count", clock32.zero_count);
   out.add_u32("clock32_minder_update_count", clock32.minder_update_count);
 }
-static void add_runtime_lane_summary(Payload& p,
+static FLASHMEM void add_runtime_lane_summary(Payload& p,
                                      const char* prefix,
                                      const interrupt_subscriber_runtime_t* rt) {
   payload_prefix_t out(p, prefix);
@@ -8577,7 +8577,7 @@ static void add_runtime_lane_summary(Payload& p,
     out.add_u32("last_diag_anchor_failure_mask", 0);
   }
 }
-static void add_ocxo_identity_payload(Payload& p,
+static FLASHMEM void add_ocxo_identity_payload(Payload& p,
                                       const ocxo_runtime_context_t& ctx) {
   p.add("lane", ctx.name);
   p.add("kind", ctx.name);
@@ -8590,7 +8590,7 @@ static void add_ocxo_identity_payload(Payload& p,
   p.add("dwt_authority", ctx.dwt_authority);
 }
 
-static void add_ocxo_lane_basic_payload(payload_prefix_t& out,
+static FLASHMEM void add_ocxo_lane_basic_payload(payload_prefix_t& out,
                                         const ocxo_lane_t& lane) {
   out.add_bool("initialized", lane.initialized);
   out.add_bool("active", lane.active);
@@ -8642,7 +8642,7 @@ static void add_ocxo_lane_basic_payload(payload_prefix_t& out,
   out.add_u32("witness_last_arm_remaining_ticks", lane.witness_last_arm_remaining_ticks);
 }
 
-static void add_ocxo_witness_service_payload(payload_prefix_t& out,
+static FLASHMEM void add_ocxo_witness_service_payload(payload_prefix_t& out,
                                              const ocxo_lane_t& lane) {
   out.add_u32("witness_last_target_delta_mod65536_ticks",
               lane.witness_last_target_delta_mod65536_ticks);
@@ -8718,7 +8718,7 @@ static void add_ocxo_witness_service_payload(payload_prefix_t& out,
               ocxo_schedule_decision_name(lane.witness_schedule_last_decision));
 }
 
-static void add_ocxo_witness_detail_payload(payload_prefix_t& out,
+static FLASHMEM void add_ocxo_witness_detail_payload(payload_prefix_t& out,
                                             const ocxo_lane_t& lane) {
   out.add_u32("witness_schedule_last_current_counter32",
               lane.witness_schedule_last_current_counter32);
@@ -8801,7 +8801,7 @@ static void add_ocxo_witness_detail_payload(payload_prefix_t& out,
                lane.witness_last_arm_to_isr_ticks <= 256U);
 }
 
-static void add_ocxo_qtimer_payload(payload_prefix_t& out,
+static FLASHMEM void add_ocxo_qtimer_payload(payload_prefix_t& out,
                                     const ocxo_runtime_context_t& ctx,
                                     const ocxo_qtimer_diag_t& qdiag) {
   const ocxo_lane_t& lane = *ctx.lane;
@@ -8865,7 +8865,7 @@ static void add_ocxo_qtimer_payload(payload_prefix_t& out,
               qdiag.dwt_coordinate_source);
 }
 
-static void add_ocxo_perishable_ring_payload(payload_prefix_t& out,
+static FLASHMEM void add_ocxo_perishable_ring_payload(payload_prefix_t& out,
                                              const ocxo_runtime_context_t& ctx) {
   const ocxo_perishable_ring_t& ring = ocxo_fact_ring_for(ctx);
 
@@ -8880,7 +8880,7 @@ static void add_ocxo_perishable_ring_payload(payload_prefix_t& out,
   out.add_bool("perishable_fact_drain_armed", ring.drain_armed);
 }
 
-static void add_ocxo_compact_payload(Payload& p,
+static FLASHMEM void add_ocxo_compact_payload(Payload& p,
                                      const ocxo_runtime_context_t& ctx) {
   const interrupt_subscriber_runtime_t* rt = ocxo_runtime_for(ctx);
   const ocxo_lane_t& lane = *ctx.lane;
@@ -8970,7 +8970,7 @@ static void add_ocxo_compact_payload(Payload& p,
   }
 }
 
-static Payload cmd_report(const Payload&) {
+static FLASHMEM Payload cmd_report(const Payload&) {
   Payload p;
   p.add("report", "INTERRUPT_COMPACT");
   p.add("subreports",
@@ -9093,7 +9093,7 @@ static Payload cmd_report(const Payload&) {
 
   return p;
 }
-static Payload cmd_report_status(const Payload&) {
+static FLASHMEM Payload cmd_report_status(const Payload&) {
   Payload p;
   p.add("report", "INTERRUPT_STATUS");
   add_runtime_payload(p);
@@ -9101,7 +9101,7 @@ static Payload cmd_report_status(const Payload&) {
   return p;
 }
 
-static Payload cmd_report_pps(const Payload&) {
+static FLASHMEM Payload cmd_report_pps(const Payload&) {
   Payload p;
   p.add("report", "INTERRUPT_PPS");
   add_pps_payload(p);
@@ -9109,7 +9109,7 @@ static Payload cmd_report_pps(const Payload&) {
   return p;
 }
 
-static Payload cmd_report_cadence(const Payload&) {
+static FLASHMEM Payload cmd_report_cadence(const Payload&) {
   Payload p;
   p.add("report", "INTERRUPT_CADENCE");
   add_vclock_heartbeat_payload(p);
@@ -9117,14 +9117,14 @@ static Payload cmd_report_cadence(const Payload&) {
   return p;
 }
 
-static Payload cmd_report_smartzero(const Payload&) {
+static FLASHMEM Payload cmd_report_smartzero(const Payload&) {
   Payload p;
   p.add("report", "INTERRUPT_SMARTZERO");
   add_smartzero_payload(p);
   return p;
 }
 
-static void add_pvc_anchor_entry_payload(Payload& p,
+static FLASHMEM void add_pvc_anchor_entry_payload(Payload& p,
                                          const char* prefix,
                                          const pvc_anchor_record_t& a,
                                          bool present) {
@@ -9143,7 +9143,7 @@ static void add_pvc_anchor_entry_payload(Payload& p,
   out.add_u32("cps", present ? a.cps : 0U);
 }
 
-static void add_bridge_payload(Payload& p) {
+static FLASHMEM void add_bridge_payload(Payload& p) {
   p.add("pvc_anchor_ring_count", g_pvc_anchor_count);
   p.add("pvc_anchor_ring_head", g_pvc_anchor_head);
   p.add("pvc_anchor_ring_seq", g_pvc_anchor_seq);
@@ -9210,14 +9210,14 @@ static void add_bridge_payload(Payload& p) {
   add_bridge_stats_payload(p, "ocxo2", g_bridge_stats_ocxo2);
 }
 
-static Payload cmd_report_bridge(const Payload&) {
+static FLASHMEM Payload cmd_report_bridge(const Payload&) {
   Payload p;
   p.add("report", "INTERRUPT_BRIDGE");
   add_bridge_payload(p);
   return p;
 }
 
-static void add_lane_summary_object(Payload& parent,
+static FLASHMEM void add_lane_summary_object(Payload& parent,
                                     const char* key,
                                     const char* name,
                                     const interrupt_subscriber_runtime_t* rt,
@@ -9282,7 +9282,7 @@ static void add_lane_summary_object(Payload& parent,
   parent.add_object(key, lane);
 }
 
-static void add_ocxo_lane_summary_object(Payload& parent,
+static FLASHMEM void add_ocxo_lane_summary_object(Payload& parent,
                                          const char* key,
                                          const ocxo_runtime_context_t& ctx) {
   const interrupt_subscriber_runtime_t* rt = ocxo_runtime_for(ctx);
@@ -9374,7 +9374,7 @@ static void add_ocxo_lane_summary_object(Payload& parent,
   parent.add_object(key, o);
 }
 
-static void add_idle_dwt_witness_payload(Payload& p) {
+static FLASHMEM void add_idle_dwt_witness_payload(Payload& p) {
   timepop_idle_witness_snapshot_t idle{};
   timepop_idle_witness_snapshot(&idle);
   p.add("idle_dwt_witness_supported", idle.supported);
@@ -9409,14 +9409,14 @@ static const char* REPORT_LANE_VCLOCK_SECTIONS =
 static const char* REPORT_LANE_OCXO_SECTIONS =
     "summary ema statistical service scheduler witness qtimer ring clock32 regression spincatch isr";
 
-static const char* report_lane_section_arg(const Payload& args) {
+static FLASHMEM const char* report_lane_section_arg(const Payload& args) {
   const char* section = args.getString("section");
   if (!section || !*section) section = args.getString("detail");
   if (!section || !*section) section = "summary";
   return section;
 }
 
-static void add_report_lane_header(Payload& p,
+static FLASHMEM void add_report_lane_header(Payload& p,
                                    const char* lane,
                                    const char* section,
                                    const char* sections) {
@@ -9427,11 +9427,11 @@ static void add_report_lane_header(Payload& p,
   p.add("usage", "INTERRUPT.REPORT_LANE lane=VCLOCK|OCXO1|OCXO2 section=<section>");
 }
 
-static bool report_lane_section_is(const char* section, const char* name) {
+static FLASHMEM bool report_lane_section_is(const char* section, const char* name) {
   return section && name && !strcasecmp(section, name);
 }
 
-static void add_vclock_lane_summary_section(Payload& p) {
+static FLASHMEM void add_vclock_lane_summary_section(Payload& p) {
   p.add("kind", "VCLOCK");
   p.add("provider", "QTIMER1");
   p.add("hardware_lane", "QTIMER1_CH2_COMP");
@@ -9460,7 +9460,7 @@ static void add_vclock_lane_summary_section(Payload& p) {
   add_isr_sanity_payload(p, "isr_sanity", g_isr_sanity_vclock_ch2);
 }
 
-static void add_vclock_lane_ema_section(Payload& p) {
+static FLASHMEM void add_vclock_lane_ema_section(Payload& p) {
   p.add("vclock_ema_dwt_authority_enabled", VCLOCK_EMA_DWT_AUTHORITY_ENABLED);
   p.add("vclock_ema_alpha_numerator", VCLOCK_EMA_ALPHA_NUMERATOR);
   p.add("vclock_ema_alpha_denominator", VCLOCK_EMA_ALPHA_DENOMINATOR);
@@ -9515,7 +9515,7 @@ static void add_vclock_lane_ema_section(Payload& p) {
   p.add("vclock_dwt_repair_max_abs_error_cycles", g_vclock_repair_stats.max_abs_error_cycles);
 }
 
-static void add_vclock_lane_ch2_section(Payload& p) {
+static FLASHMEM void add_vclock_lane_ch2_section(Payload& p) {
   p.add("vclock_ch2_one_second_enabled", g_vclock_ch2_one_second_enabled);
   p.add("vclock_ch2_one_second_next_counter32", g_vclock_ch2_one_second_next_counter32);
   p.add("vclock_ch2_one_second_enable_count", g_vclock_ch2_one_second_enable_count);
@@ -9538,7 +9538,7 @@ static void add_vclock_lane_ch2_section(Payload& p) {
   p.add("vclock_heartbeat_one_second_fallback_count", g_vclock_heartbeat_one_second_fallback_count);
 }
 
-static void add_vclock_lane_epoch_section(Payload& p) {
+static FLASHMEM void add_vclock_lane_epoch_section(Payload& p) {
   p.add("vclock_ch2_epoch_native_enabled", VCLOCK_CH2_EPOCH_NATIVE_ENABLED);
   p.add("vclock_ch2_epoch_native_service_count", g_vclock_ch2_epoch_native_service_count);
   p.add("vclock_ch2_epoch_native_publish_count", g_vclock_ch2_epoch_native_publish_count);
@@ -9557,7 +9557,7 @@ static void add_vclock_lane_epoch_section(Payload& p) {
   p.add("vclock_heartbeat_epoch_pending_skip_count", g_vclock_heartbeat_epoch_pending_skip_count);
 }
 
-static void add_vclock_lane_smartzero_section(Payload& p) {
+static FLASHMEM void add_vclock_lane_smartzero_section(Payload& p) {
   p.add("vclock_ch2_smartzero_native_enabled", VCLOCK_CH2_SMARTZERO_NATIVE_ENABLED);
   p.add("vclock_ch2_smartzero_seeded", g_vclock_ch2_smartzero_seeded);
   p.add("vclock_ch2_smartzero_next_counter32", g_vclock_ch2_smartzero_next_counter32);
@@ -9582,7 +9582,7 @@ static void add_vclock_lane_smartzero_section(Payload& p) {
   p.add("vclock_ch2_smartzero_last_late_ticks", g_vclock_ch2_smartzero_last_late_ticks);
 }
 
-static void add_vclock_lane_fact_ring_section(Payload& p) {
+static FLASHMEM void add_vclock_lane_fact_ring_section(Payload& p) {
   p.add("vclock_perishable_fact_ring_size", VCLOCK_PERISHABLE_FACT_RING_SIZE);
   p.add("vclock_perishable_fact_ring_count", g_vclock_fact_ring.count);
   p.add("vclock_perishable_fact_enqueue_count", g_vclock_fact_ring.enqueue_count);
@@ -9594,7 +9594,7 @@ static void add_vclock_lane_fact_ring_section(Payload& p) {
   p.add("vclock_perishable_fact_drain_armed", g_vclock_fact_ring.drain_armed);
 }
 
-static void add_vclock_lane_qtimer_section(Payload& p) {
+static FLASHMEM void add_vclock_lane_qtimer_section(Payload& p) {
   p.add("qtimer1_ch1_active", g_qtimer1_ch1_active);
   p.add("qtimer1_ch1_sequence", g_qtimer1_ch1_sequence);
   p.add("qtimer1_ch1_target_counter32", g_qtimer1_ch1_target_counter32);
@@ -9611,7 +9611,7 @@ static void add_vclock_lane_qtimer_section(Payload& p) {
   p.add("ch2_implicit_rollover_last_vclock_counter32", g_ch2_implicit_rollover_last_vclock_counter32);
 }
 
-static bool add_vclock_lane_section(Payload& p, const char* section) {
+static FLASHMEM bool add_vclock_lane_section(Payload& p, const char* section) {
   if (report_lane_section_is(section, "summary")) {
     add_vclock_lane_summary_section(p);
   } else if (report_lane_section_is(section, "ema")) {
@@ -9643,13 +9643,13 @@ static bool add_vclock_lane_section(Payload& p, const char* section) {
   return true;
 }
 
-static void add_ocxo_lane_summary_section(Payload& p,
+static FLASHMEM void add_ocxo_lane_summary_section(Payload& p,
                                           const ocxo_runtime_context_t& ctx) {
   add_ocxo_identity_payload(p, ctx);
   add_ocxo_compact_payload(p, ctx);
 }
 
-static void add_ocxo_lane_ema_section(Payload& p,
+static FLASHMEM void add_ocxo_lane_ema_section(Payload& p,
                                       const ocxo_runtime_context_t& ctx) {
   const ocxo_lane_t& lane = *ctx.lane;
   const interrupt_subscriber_runtime_t* rt = ocxo_runtime_for(ctx);
@@ -9708,7 +9708,7 @@ static void add_ocxo_lane_ema_section(Payload& p,
   }
 }
 
-static void add_ocxo_lane_scheduler_section(Payload& p,
+static FLASHMEM void add_ocxo_lane_scheduler_section(Payload& p,
                                             const ocxo_runtime_context_t& ctx) {
   const ocxo_lane_t& lane = *ctx.lane;
   payload_prefix_t out(p, ctx.prefix);
@@ -9724,7 +9724,7 @@ static void add_ocxo_lane_scheduler_section(Payload& p,
   out.add_u32("witness_schedule_last_target_low16", (uint32_t)lane.witness_schedule_last_target_low16);
 }
 
-static bool add_ocxo_lane_section(Payload& p,
+static FLASHMEM bool add_ocxo_lane_section(Payload& p,
                                   const ocxo_runtime_context_t& ctx,
                                   const char* section) {
   payload_prefix_t out(p, ctx.prefix);
@@ -9762,7 +9762,7 @@ static bool add_ocxo_lane_section(Payload& p,
   return true;
 }
 
-static Payload cmd_report_lanes(const Payload&) {
+static FLASHMEM Payload cmd_report_lanes(const Payload&) {
   Payload p;
   p.add("report", "INTERRUPT_LANES");
   p.add("lane_count", 3);
@@ -9789,7 +9789,7 @@ static Payload cmd_report_lanes(const Payload&) {
   return p;
 }
 
-static Payload cmd_report_lane(const Payload& args) {
+static FLASHMEM Payload cmd_report_lane(const Payload& args) {
   const char* lane = args.getString("lane");
   if (!lane || !*lane) lane = args.getString("name");
   const char* section = report_lane_section_arg(args);
@@ -9849,7 +9849,7 @@ static const process_vtable_t INTERRUPT_PROCESS = {
   .subscriptions = nullptr
 };
 
-void process_interrupt_register(void) {
+void FLASHMEM process_interrupt_register(void) {
   process_register("INTERRUPT", &INTERRUPT_PROCESS);
 }
 
@@ -9858,7 +9858,7 @@ void process_interrupt_register(void) {
 // Stringifiers
 // ============================================================================
 
-const char* interrupt_subscriber_kind_str(interrupt_subscriber_kind_t kind) {
+const char* FLASHMEM interrupt_subscriber_kind_str(interrupt_subscriber_kind_t kind) {
   switch (kind) {
     case interrupt_subscriber_kind_t::VCLOCK:  return "VCLOCK";
     case interrupt_subscriber_kind_t::OCXO1:   return "OCXO1";
@@ -9868,7 +9868,7 @@ const char* interrupt_subscriber_kind_str(interrupt_subscriber_kind_t kind) {
   }
 }
 
-const char* interrupt_provider_kind_str(interrupt_provider_kind_t provider) {
+const char* FLASHMEM interrupt_provider_kind_str(interrupt_provider_kind_t provider) {
   switch (provider) {
     case interrupt_provider_kind_t::QTIMER1:  return "QTIMER1";
     case interrupt_provider_kind_t::QTIMER2:  return "QTIMER2";
@@ -9880,7 +9880,7 @@ const char* interrupt_provider_kind_str(interrupt_provider_kind_t provider) {
   }
 }
 
-const char* interrupt_lane_str(interrupt_lane_t lane) {
+const char* FLASHMEM interrupt_lane_str(interrupt_lane_t lane) {
   switch (lane) {
     case interrupt_lane_t::QTIMER1_CH1_COMP: return "QTIMER1_CH1_COMP";
     case interrupt_lane_t::QTIMER1_CH2_COMP: return "QTIMER1_CH2_COMP";
