@@ -5,8 +5,9 @@
 // Interrupt custody and low-word counter cadence:
 //
 //   • VCLOCK lane   (critical recurring TimePop client on QTimer1 CH2)
-//   • OCXO lanes    (local 1 kHz QTimer rollover ladder on QTimer2 CH0 / QTimer3 CH3;
-//                    only every 1000th tick publishes a one-second event)
+//   • OCXO lanes    (local QTimer compare custody on QTimer2 CH0 / QTimer3 CH3;
+//                    diagnostic LR may run at 10 Hz, but only the exact
+//                    one-second gear tooth publishes a subscriber event)
 //   • Cadence minder (TimePop VCLOCK/relay heartbeat; no longer OCXO rollover owner)
 //   • CH2 implicit rollover tend (passive ISR seatbelt for all 16-bit clock extenders;
 //                    coexists with CADENCE_MINDER and the OCXO local cadence ladders)
@@ -104,7 +105,7 @@
 // ─── Per-lane cadence mechanics ─────────────────────────────────────────────
 //
 //   Three lanes (VCLOCK, OCXO1, OCXO2) produce one-second subscriber events.
-//   The 1 kHz custody model is now lane-centric:
+//   The custody model is lane-centric:
 //
 //     VCLOCK : TimePop critical recurring ISR slot, +10000 counts/interval
 //              in the GNSS-disciplined 10 MHz VCLOCK domain.  QTimer1 CH0 is
@@ -116,11 +117,13 @@
 //     OCXO1  : local OCXO custody backend; current Step 1 backend is QTimer2 CH0.
 //     OCXO2  : local OCXO custody backend; current Step 1 backend is QTimer3 CH3.
 //
-//   OCXO backend ISRs schedule the next +10,000-tick target immediately.  The
-//   intermediate 1 kHz ticks are rollover maintenance only.  Every 1000th OCXO
-//   cadence tick is deferred to foreground as a one-second event consumed by
-//   CLOCKS/Alpha.  Its subscriber-facing DWT is EMA-predicted from completed
-//   one-second intervals, while the ISR-captured DWT remains diagnostic.
+//   OCXO backend ISRs own authored local compare targets.  In diagnostic LR
+//   mode the steady-state target spacing is 10 Hz (+1,000,000 ticks):
+//   intermediate samples feed the report-only linear-regression estimator,
+//   while the exact one-second gear tooth is deferred to foreground as the
+//   subscriber event consumed by CLOCKS/Alpha.  Its subscriber-facing DWT
+//   remains EMA-predicted from completed one-second intervals in this pass,
+//   while ISR-captured/corrected DWT remains diagnostic evidence.
 // ============================================================================
 
 #pragma once
@@ -314,7 +317,7 @@ struct interrupt_capture_diag_t {
   uint32_t dwt_interval_expected_counter_delta_ticks = 0;
   uint32_t dwt_interval_adjacency_reject_count = 0;
 
-  // 1 kHz cadence linear-regression audit.  In the diagnostic-only build,
+  // Linear-regression cadence audit.  In the diagnostic-only build,
   // subscribers still receive the traditional event DWT in event.dwt_at_event /
   // diag.dwt_at_event.  These fields expose the fitted endpoint and per-second
   // fit quality side-by-side without changing timing authority.
@@ -760,15 +763,10 @@ bool interrupt_last_epoch_capture(interrupt_epoch_capture_t* out);
 // Re-author OCXO local timer compare cadence from CLOCKS logical zero.
 //
 // Once CLOCKS has selected the OCXO zero-offset counter32 values, this call
-// makes each local compare rail land on that lane's 1 kHz logical grid:
-//
-//   epoch + 10,000
-//   epoch + 20,000
-//   ...
-//   epoch + 10,000,000
-//
-// Every thousandth cadence event is the OCXO-local one-second edge delivered
-// to Alpha.  Intermediate 1 kHz ticks are rollover maintenance only.
+// installs the lane's logical grid. SmartZero still uses +10,000-tick
+// acquisition samples. Steady-state diagnostic LR uses +1,000,000-tick compare
+// samples when enabled, while exact +10,000,000-tick grid teeth remain the
+// OCXO-local one-second edges delivered to Alpha.
 void interrupt_ocxo_logical_grid_epoch(uint32_t ocxo1_epoch_counter32,
                                        uint32_t ocxo2_epoch_counter32);
 
