@@ -35,8 +35,8 @@
 //
 // Lanes:
 //   VCLOCK : TimePop recurring client on QTimer1 CH2 (10 MHz VCLOCK domain)
-//   OCXO1  : OCXO custody backend (Step 1: QTimer2 CH0 one-second edge compare)
-//   OCXO2  : OCXO custody backend (Step 1: QTimer3 CH3 one-second edge compare)
+//   OCXO1  : QTimer2 CH0, PCS=0, one-second edge compare only
+//   OCXO2  : QTimer3 CH3, PCS=3, one-second edge compare only
 //   TimePop: QTimer1 CH2, varied compare intervals (foreground scheduler)
 //
 // The PPS GPIO ISR captures DWT as its first instruction, then reads the
@@ -186,9 +186,8 @@ static_assert((PPS_RELAY_OFF_NS % VCLOCK_HEARTBEAT_PERIOD_NS) == 0ULL,
 static_assert(PPS_RELAY_OFF_CADENCE_TICKS == 500U,
               "PPS relay off interval should be 500 cadence ticks");
 
-// OCXO DWT authorship.  OCXO1 and OCXO2 live behind a narrow local
-// timer-custody abstraction.  Step 1 keeps the backend as the existing
-// QuadTimer modules/vectors.  Each OCXO ISR still captures ARM_DWT_CYCCNT as first
+// OCXO DWT authorship.  OCXO1 and OCXO2 live on separate QuadTimer
+// modules/vectors.  Each OCXO ISR still captures ARM_DWT_CYCCNT as first
 // instruction for private evidence, but the subscriber-facing OCXO DWT is now
 // the lane-local EMA prediction of the one-second edge.  The raw ISR capture
 // is diagnostic only.
@@ -271,338 +270,41 @@ static constexpr uint32_t OCXO_SERVICE_CLASS_FALSE_IRQ              = 1;
 static constexpr uint32_t OCXO_SERVICE_CLASS_EARLY_PRETARGET        = 2;
 static constexpr uint32_t OCXO_SERVICE_CLASS_ON_OR_AFTER_TARGET     = 3;
 
-// Legacy cadence-regression engine retired.
-//
-// The former disabled cadence_regression_* implementation retained a
-// 1000-sample DWT window per lane plus floating-point fit/report helpers. Even
-// while disabled, those windows consumed scarce static RAM. The rolling LR
-// shell below is the only supported regression path going forward; the legacy
-// report surface remains as a zero/retired compatibility stub so existing
-// REPORT_LANE section=regression commands keep working during the migration.
-static constexpr bool     LEGACY_CADENCE_REGRESSION_RETIRED = true;
-static constexpr uint32_t LEGACY_CADENCE_REGRESSION_RECLAIMED_SAMPLE_SLOTS =
-    3U * TICKS_PER_SECOND_EVENT;
-static constexpr uint32_t LEGACY_CADENCE_REGRESSION_RECLAIMED_SAMPLE_BYTES =
-    LEGACY_CADENCE_REGRESSION_RECLAIMED_SAMPLE_SLOTS * sizeof(int32_t);
+// Linear regression is intentionally disabled for the quiet-phase custody
+// checkpoint.  The code surface remains compiled for later reactivation, but
+// no VCLOCK/OCXO samples are fed and no subscriber-facing diagnostic result is
+// populated.  This removes regression as a confounder while we validate whether
+// phase-separated OCXO custody alone collapses the raw cycle residuals.
 static constexpr bool     OCXO_LINEAR_REGRESSION_ENABLED = false;
-static constexpr bool     VCLOCK_LINEAR_REGRESSION_ENABLED = false;
-static constexpr bool     LINEAR_REGRESSION_AUTHORED_DWT = false;
-static constexpr bool     LINEAR_REGRESSION_DIAGNOSTIC_ONLY = false;
+static constexpr uint32_t REGRESSION_SAMPLES_PER_SECOND = TICKS_PER_SECOND_EVENT;
+static constexpr uint32_t REGRESSION_COUNTER_DELTA_TICKS = OCXO_CADENCE_INTERVAL_TICKS;
+static constexpr uint32_t REGRESSION_MIN_SAMPLE_COUNT = 16;
+static constexpr int32_t  REGRESSION_FIT_ERROR_THRESHOLD_CYCLES = 4;
+static constexpr double   REGRESSION_Q16_SCALE = 65536.0;
 
-// ============================================================================
-// Step 2 First — generalized statistical DWT estimator shell
-// ============================================================================
+// REGRESSION_SAMPLES report discipline.
 //
-// This pass is intentionally report-only and behavior-neutral.  It creates the
-// reusable statistical-estimator state and lane-report surface, but it does not
-// feed samples, does not add OCXO 1 kHz hardware cadence, does not alter
-// SmartZero, does not change EMA authority, and does not propagate through
-// Alpha/Beta/TIMEBASE.  The next steps can feed VCLOCK/OCXO evidence one lane
-// at a time after this shell proves harmless.
+// This command is deliberately live-only and allocates no retained 1000-sample
+// windows.  A prior diagnostic build retained per-sample windows for every
+// lane and destabilized the runtime by consuming too much RAM.  This version
+// only inspects the existing live regression window already present in the
+// baseline HEALTH: EXCELLENT build.
+static constexpr uint32_t REGRESSION_SAMPLE_REPORT_SLICE_LIMIT = 8;
+static constexpr uint32_t REGRESSION_SAMPLE_REPORT_EXTREME_LIMIT = 4;
 
-static constexpr bool     STATISTICAL_DWT_ESTIMATOR_ENABLED = true;
-static constexpr bool     STATISTICAL_DWT_AUTHORITY_ENABLED = false;
-static constexpr bool     STATISTICAL_DWT_REPORT_ONLY = true;
-static constexpr bool     STATISTICAL_VCLOCK_SHADOW_FEED_ENABLED = false;
-static constexpr bool     STATISTICAL_OCXO_1KHZ_CADENCE_ENABLED = false;
-static constexpr uint32_t STATISTICAL_SAMPLE_RATE_HZ = 1000U;
-static constexpr uint32_t STATISTICAL_COUNTER_DELTA_TICKS = 10000U;
-static constexpr int32_t  STATISTICAL_ACCEPT_NEG_CYCLES = -4;
-static constexpr int32_t  STATISTICAL_ACCEPT_ZERO_CYCLES = 0;
-static constexpr int32_t  STATISTICAL_ACCEPT_POS_CYCLES = 4;
-static constexpr uint32_t STATISTICAL_ACCEPT_TOLERANCE_CYCLES = 0U;
-static constexpr uint32_t STATISTICAL_MIN_VALID_SAMPLES = 700U;
-static constexpr uint32_t STATISTICAL_MAX_REJECTED_SAMPLES = 300U;
+static_assert(REGRESSION_SAMPLES_PER_SECOND == 1000U,
+              "Regression windows are expected to be 1 kHz / one second");
 
-struct statistical_dwt_lane_t {
-  interrupt_subscriber_kind_t kind = interrupt_subscriber_kind_t::NONE;
-  bool     enabled = STATISTICAL_DWT_ESTIMATOR_ENABLED;
-  bool     authority_enabled = STATISTICAL_DWT_AUTHORITY_ENABLED;
-  bool     report_only = STATISTICAL_DWT_REPORT_ONLY;
-  bool     sample_feed_enabled = false;
+// VCLOCK regression remains disabled until it gets a non-dropping double-buffered
+// 1000-sample window.  The old 32-slot fact ring proved too small for the 1 kHz
+// VCLOCK rail and must not participate in timing authority.
+static constexpr bool VCLOCK_LINEAR_REGRESSION_ENABLED = false;
 
-  uint32_t reset_count = 0;
-  uint32_t window_sequence = 0;
-  uint32_t sample_total_count = 0;
-  uint32_t finalize_count = 0;
-
-  bool     window_active = false;
-  uint32_t window_sample_count = 0;
-  uint32_t window_accepted_count = 0;
-  uint32_t window_rejected_count = 0;
-  uint32_t window_neg4_count = 0;
-  uint32_t window_zero_count = 0;
-  uint32_t window_pos4_count = 0;
-  uint32_t window_other_count = 0;
-  uint32_t window_base_dwt = 0;
-  uint32_t window_base_counter32 = 0;
-  uint32_t window_prediction_cycles = 0;
-
-  bool     last_valid = false;
-  bool     last_confidence_ok = false;
-  bool     last_fallback_would_apply = false;
-  uint32_t last_sequence = 0;
-  uint32_t last_total_samples = 0;
-  uint32_t last_accepted_samples = 0;
-  uint32_t last_rejected_samples = 0;
-  uint32_t last_neg4_count = 0;
-  uint32_t last_zero_count = 0;
-  uint32_t last_pos4_count = 0;
-  uint32_t last_other_count = 0;
-  int32_t  last_adjustment_cycles = 0;
-  uint32_t last_base_dwt = 0;
-  uint32_t last_prediction_cycles = 0;
-  uint32_t last_predicted_dwt_at_edge = 0;
-  uint32_t last_candidate_dwt_at_edge = 0;
-  uint32_t last_observed_dwt_at_edge = 0;
-  uint32_t last_counter32_at_edge = 0;
-  uint32_t last_reject_pct_milli = 0;
-  uint32_t last_confidence_milli = 0;
-};
-
-static statistical_dwt_lane_t g_statistical_vclock = {};
-static statistical_dwt_lane_t g_statistical_ocxo1 = {};
-static statistical_dwt_lane_t g_statistical_ocxo2 = {};
-
-static statistical_dwt_lane_t* statistical_dwt_for(
-    interrupt_subscriber_kind_t kind) {
-  if (kind == interrupt_subscriber_kind_t::VCLOCK) return &g_statistical_vclock;
-  if (kind == interrupt_subscriber_kind_t::OCXO1)  return &g_statistical_ocxo1;
-  if (kind == interrupt_subscriber_kind_t::OCXO2)  return &g_statistical_ocxo2;
-  return nullptr;
-}
-
-static const statistical_dwt_lane_t* statistical_dwt_for_const(
-    interrupt_subscriber_kind_t kind) {
-  return statistical_dwt_for(kind);
-}
-
-static void statistical_dwt_reset_kind(interrupt_subscriber_kind_t kind) {
-  statistical_dwt_lane_t* s = statistical_dwt_for(kind);
-  if (!s) return;
-
-  const uint32_t prior_reset_count = s->reset_count;
-  *s = statistical_dwt_lane_t{};
-  s->kind = kind;
-  s->enabled = STATISTICAL_DWT_ESTIMATOR_ENABLED;
-  s->authority_enabled = STATISTICAL_DWT_AUTHORITY_ENABLED;
-  s->report_only = STATISTICAL_DWT_REPORT_ONLY;
-  s->sample_feed_enabled =
-      (kind == interrupt_subscriber_kind_t::VCLOCK)
-          ? STATISTICAL_VCLOCK_SHADOW_FEED_ENABLED
-          : STATISTICAL_OCXO_1KHZ_CADENCE_ENABLED;
-  s->reset_count = prior_reset_count + 1U;
-}
-
-static void statistical_dwt_reset_all(void) {
-  g_statistical_vclock.kind = interrupt_subscriber_kind_t::VCLOCK;
-  g_statistical_ocxo1.kind = interrupt_subscriber_kind_t::OCXO1;
-  g_statistical_ocxo2.kind = interrupt_subscriber_kind_t::OCXO2;
-  statistical_dwt_reset_kind(interrupt_subscriber_kind_t::VCLOCK);
-  statistical_dwt_reset_kind(interrupt_subscriber_kind_t::OCXO1);
-  statistical_dwt_reset_kind(interrupt_subscriber_kind_t::OCXO2);
-}
-
-
-// ============================================================================
-// Rolling linear-regression DWT estimator shell
-// ============================================================================
-//
-// Conservative VCLOCK-only diagnostic feed for the EMA -> linear-regression
-// migration.  LR remains report-only and never authors subscriber DWT.  A
-// normal named TimePop client supplies clean event-coordinate DWT/VCLOCK facts
-// at 10 Hz.  The foreground VCLOCK fact drain finalizes one current-second
-// aggregate after EMA authority is known.  No OCXO cadence, SmartZero,
-// subscriber authority, or Alpha/Beta/TIMEBASE behavior changes occur here.
-
-static constexpr bool     ROLLING_LR_DWT_ESTIMATOR_ENABLED = true;
-static constexpr bool     ROLLING_LR_DWT_AUTHORITY_ENABLED = false;
-static constexpr bool     ROLLING_LR_DWT_REPORT_ONLY = true;
-static constexpr bool     ROLLING_LR_VCLOCK_SHADOW_FEED_ENABLED = true;
-static constexpr bool     ROLLING_LR_OCXO_SHADOW_FEED_ENABLED = false;
-static constexpr uint32_t ROLLING_LR_SAMPLE_RATE_HZ = 10U;
-static constexpr uint32_t ROLLING_LR_COUNTER_DELTA_TICKS =
-    (uint32_t)(VCLOCK_COUNTS_PER_SECOND / ROLLING_LR_SAMPLE_RATE_HZ);
-static constexpr uint32_t ROLLING_LR_WINDOW_SECONDS = 1U;
-static constexpr uint32_t ROLLING_LR_MAX_WINDOW_SECONDS = 1U;
-static constexpr uint32_t ROLLING_LR_WINDOW_CAPACITY_SAMPLES =
-    ROLLING_LR_WINDOW_SECONDS * ROLLING_LR_SAMPLE_RATE_HZ;
-static constexpr uint32_t ROLLING_LR_MIN_VALID_SAMPLES = 6U;
-static constexpr uint32_t ROLLING_LR_FIT_ERROR_THRESHOLD_CYCLES = 4U;
-static constexpr uint32_t ROLLING_LR_FIT_ERROR_LOOSE_THRESHOLD_CYCLES = 10U;
-static constexpr uint64_t VCLOCK_LR_DIAG_PERIOD_NS =
-    (uint64_t)GNSS_NS_PER_SECOND / (uint64_t)ROLLING_LR_SAMPLE_RATE_HZ;
-static constexpr const char* VCLOCK_LR_DIAG_NAME = "VCLOCK_LR_DIAG_10HZ";
-
-static_assert(ROLLING_LR_WINDOW_SECONDS == 1U,
-              "VCLOCK LR diagnostic pass intentionally uses one-second windows");
-static_assert(ROLLING_LR_WINDOW_SECONDS <= ROLLING_LR_MAX_WINDOW_SECONDS,
-              "Rolling LR window exceeds retained segment capacity");
-static_assert(ROLLING_LR_SAMPLE_RATE_HZ == 10U,
-              "VCLOCK LR diagnostic pass starts at 10 Hz");
-static_assert((VCLOCK_COUNTS_PER_SECOND % ROLLING_LR_SAMPLE_RATE_HZ) == 0U,
-              "VCLOCK LR period must divide the 10 MHz VCLOCK second");
-static_assert(ROLLING_LR_COUNTER_DELTA_TICKS == 1000000U,
-              "10 Hz LR samples are expected every 1,000,000 VCLOCK ticks");
-static_assert((GNSS_NS_PER_SECOND % ROLLING_LR_SAMPLE_RATE_HZ) == 0LL,
-              "10 Hz LR period must divide one GNSS second exactly");
-
-struct rolling_lr_segment_t {
-  bool     active = false;
-  uint32_t sequence = 0;
-  uint32_t sample_count = 0;
-  uint32_t first_counter32 = 0;
-  uint32_t last_counter32 = 0;
-  uint32_t first_dwt32 = 0;
-  uint32_t last_dwt32 = 0;
-  uint64_t first_dwt64_rel = 0;
-  uint64_t last_dwt64_rel = 0;
-
-  // Retained for report-schema continuity.  The 10 Hz VCLOCK pass uses the
-  // lane-level one-second sums below, not retained raw sample storage.
-  uint64_t sum_x = 0;
-  int64_t  sum_y = 0;
-  uint64_t sum_xx = 0;
-  int64_t  sum_xy = 0;
-  uint64_t sum_yy = 0;
-};
-
-struct rolling_lr_result_t {
-  bool     valid = false;
-  bool     confidence_ok = false;
-  bool     fallback_would_apply = false;
-  uint32_t sequence = 0;
-  uint32_t window_seconds = ROLLING_LR_WINDOW_SECONDS;
-  uint32_t sample_count = 0;
-  uint32_t segment_count = 0;
-
-  uint32_t target_counter32_at_event = 0;
-  uint32_t observed_dwt_at_event = 0;
-  uint32_t authority_dwt_at_event = 0;
-  uint32_t inferred_dwt_at_event = 0;
-  int32_t  inferred_minus_observed_cycles = 0;
-  int32_t  inferred_minus_authority_cycles = 0;
-  int32_t  observed_minus_authority_cycles = 0;
-
-  bool     pps_dwt_valid = false;
-  uint32_t pps_dwt_at_event = 0;
-  int32_t  observed_minus_pps_cycles = 0;
-  int32_t  authority_minus_pps_cycles = 0;
-  int32_t  inferred_minus_pps_cycles = 0;
-
-  uint32_t base_counter32 = 0;
-  uint32_t base_dwt32 = 0;
-  uint32_t target_ticks_from_base = 0;
-  uint32_t nominal_dwt_at_event = 0;
-  int32_t  inferred_minus_nominal_cycles = 0;
-
-  uint64_t slope_q16_cycles_per_sample = 0;
-  int64_t  slope_delta_q16_cycles_per_sample = 0;
-  int32_t  intercept_q16_cycles = 0;
-  int32_t  fit_error_mean_q16_cycles = 0;
-  uint32_t fit_error_stddev_q16_cycles = 0;
-  int32_t  fit_error_min_cycles = 0;
-  int32_t  fit_error_max_cycles = 0;
-  uint32_t fit_error_abs_gt4_count = 0;
-  uint32_t fit_error_abs_gt10_count = 0;
-};
-
-struct rolling_lr_dwt_lane_t {
-  interrupt_subscriber_kind_t kind = interrupt_subscriber_kind_t::NONE;
-  bool     enabled = ROLLING_LR_DWT_ESTIMATOR_ENABLED;
-  bool     authority_enabled = ROLLING_LR_DWT_AUTHORITY_ENABLED;
-  bool     report_only = ROLLING_LR_DWT_REPORT_ONLY;
-  bool     sample_feed_enabled = false;
-
-  uint32_t window_seconds = ROLLING_LR_WINDOW_SECONDS;
-  uint32_t sample_rate_hz = ROLLING_LR_SAMPLE_RATE_HZ;
-  uint32_t counter_delta_ticks = ROLLING_LR_COUNTER_DELTA_TICKS;
-  uint32_t window_capacity_samples = ROLLING_LR_WINDOW_CAPACITY_SAMPLES;
-  uint32_t min_valid_samples = ROLLING_LR_MIN_VALID_SAMPLES;
-
-  uint32_t reset_count = 0;
-  uint32_t sample_total_count = 0;
-  uint32_t finalize_count = 0;
-  uint32_t insufficient_count = 0;
-  uint32_t counter_discontinuity_count = 0;
-  uint32_t dwt_wrap_count = 0;
-  uint32_t dropped_segment_count = 0;
-  uint32_t no_fit_count = 0;
-
-  bool     window_active = false;
-  uint32_t window_sequence = 0;
-  uint32_t segment_sequence = 0;
-  uint32_t segment_count = 0;
-  uint32_t active_segment_index = 0;
-  uint32_t active_segment_sample_count = 0;
-  uint32_t window_sample_count = 0;
-
-  uint32_t window_base_counter32 = 0;
-  uint32_t window_base_dwt32 = 0;
-  uint64_t window_base_dwt64 = 0;
-  uint32_t last_sample_counter32 = 0;
-  uint32_t last_sample_dwt32 = 0;
-  uint64_t last_sample_dwt64 = 0;
-
-  uint64_t rolling_sum_x = 0;
-  int64_t  rolling_sum_y = 0;
-  uint64_t rolling_sum_xx = 0;
-  int64_t  rolling_sum_xy = 0;
-  uint64_t rolling_sum_yy = 0;
-
-  bool     previous_slope_valid = false;
-  uint64_t previous_slope_q16_cycles_per_sample = 0;
-
-  rolling_lr_segment_t segments[ROLLING_LR_MAX_WINDOW_SECONDS]{};
-  rolling_lr_result_t last_result{};
-};
-
-static rolling_lr_dwt_lane_t g_rolling_lr_vclock = {};
-static rolling_lr_dwt_lane_t g_rolling_lr_ocxo1 = {};
-static rolling_lr_dwt_lane_t g_rolling_lr_ocxo2 = {};
-
-static rolling_lr_dwt_lane_t* rolling_lr_for(interrupt_subscriber_kind_t kind) {
-  if (kind == interrupt_subscriber_kind_t::VCLOCK) return &g_rolling_lr_vclock;
-  if (kind == interrupt_subscriber_kind_t::OCXO1)  return &g_rolling_lr_ocxo1;
-  if (kind == interrupt_subscriber_kind_t::OCXO2)  return &g_rolling_lr_ocxo2;
-  return nullptr;
-}
-
-static const rolling_lr_dwt_lane_t* rolling_lr_for_const(
-    interrupt_subscriber_kind_t kind) {
-  return rolling_lr_for(kind);
-}
-
-static void rolling_lr_reset_kind(interrupt_subscriber_kind_t kind) {
-  rolling_lr_dwt_lane_t* r = rolling_lr_for(kind);
-  if (!r) return;
-
-  const uint32_t prior_reset_count = r->reset_count;
-  *r = rolling_lr_dwt_lane_t{};
-  r->kind = kind;
-  r->enabled = ROLLING_LR_DWT_ESTIMATOR_ENABLED;
-  r->authority_enabled = ROLLING_LR_DWT_AUTHORITY_ENABLED;
-  r->report_only = ROLLING_LR_DWT_REPORT_ONLY;
-  r->sample_feed_enabled =
-      (kind == interrupt_subscriber_kind_t::VCLOCK)
-          ? ROLLING_LR_VCLOCK_SHADOW_FEED_ENABLED
-          : ROLLING_LR_OCXO_SHADOW_FEED_ENABLED;
-  r->window_seconds = ROLLING_LR_WINDOW_SECONDS;
-  r->sample_rate_hz = ROLLING_LR_SAMPLE_RATE_HZ;
-  r->counter_delta_ticks = ROLLING_LR_COUNTER_DELTA_TICKS;
-  r->window_capacity_samples = ROLLING_LR_WINDOW_CAPACITY_SAMPLES;
-  r->min_valid_samples = ROLLING_LR_MIN_VALID_SAMPLES;
-  r->reset_count = prior_reset_count + 1U;
-}
-
-static void rolling_lr_reset_all(void) {
-  g_rolling_lr_vclock.kind = interrupt_subscriber_kind_t::VCLOCK;
-  g_rolling_lr_ocxo1.kind = interrupt_subscriber_kind_t::OCXO1;
-  g_rolling_lr_ocxo2.kind = interrupt_subscriber_kind_t::OCXO2;
-  rolling_lr_reset_kind(interrupt_subscriber_kind_t::VCLOCK);
-  rolling_lr_reset_kind(interrupt_subscriber_kind_t::OCXO1);
-  rolling_lr_reset_kind(interrupt_subscriber_kind_t::OCXO2);
-}
+// Regression is experimental/diagnostic in this build.  The subscriber-facing
+// DWT stays traditional while regression_inferred_dwt_at_event exposes what the
+// fitted edge would have been.
+static constexpr bool LINEAR_REGRESSION_AUTHORED_DWT = false;
+static constexpr bool LINEAR_REGRESSION_DIAGNOSTIC_ONLY = false;
 
 // ============================================================================
 // Symmetric OCXO disable matrix (temporary A/B experiment surface)
@@ -1442,7 +1144,7 @@ static constexpr uint32_t VCLOCK_CH2_EPOCH_REJECT_NONE = 0;
 static constexpr uint32_t VCLOCK_CH2_EPOCH_REJECT_BACKDATE_ZERO = 1;
 static constexpr uint32_t VCLOCK_CH2_EPOCH_REJECT_BACKDATE_TOO_LARGE = 2;
 
-static FLASHMEM const char* vclock_ch2_epoch_reject_reason_name(uint32_t reason) {
+static const char* vclock_ch2_epoch_reject_reason_name(uint32_t reason) {
   switch (reason) {
     case VCLOCK_CH2_EPOCH_REJECT_BACKDATE_ZERO: return "BACKDATE_ZERO";
     case VCLOCK_CH2_EPOCH_REJECT_BACKDATE_TOO_LARGE: return "BACKDATE_TOO_LARGE";
@@ -1565,283 +1267,6 @@ static uint32_t vclock_cycles_for_ticks(uint32_t vclock_ticks) {
                     (uint64_t)VCLOCK_COUNTS_PER_SECOND);
 }
 
-
-static void rolling_lr_clear_current_window(rolling_lr_dwt_lane_t& r) {
-  r.window_active = false;
-  r.segment_count = 0;
-  r.active_segment_index = 0;
-  r.active_segment_sample_count = 0;
-  r.window_sample_count = 0;
-  r.window_base_counter32 = 0;
-  r.window_base_dwt32 = 0;
-  r.window_base_dwt64 = 0;
-  r.last_sample_counter32 = 0;
-  r.last_sample_dwt32 = 0;
-  r.last_sample_dwt64 = 0;
-  r.rolling_sum_x = 0;
-  r.rolling_sum_y = 0;
-  r.rolling_sum_xx = 0;
-  r.rolling_sum_xy = 0;
-  r.rolling_sum_yy = 0;
-}
-
-static void rolling_lr_begin_vclock_window(rolling_lr_dwt_lane_t& r,
-                                           uint32_t counter32,
-                                           uint32_t dwt32) {
-  rolling_lr_clear_current_window(r);
-  r.window_active = true;
-  r.window_sequence++;
-  r.segment_sequence = r.window_sequence;
-  r.segment_count = 1;
-  r.active_segment_index = 0;
-  r.window_base_counter32 = counter32;
-  r.window_base_dwt32 = dwt32;
-  r.window_base_dwt64 = (uint64_t)dwt32;
-}
-
-static void rolling_lr_feed_vclock_sample_from_timepop(uint32_t counter32,
-                                                       uint32_t dwt32) {
-  if (!ROLLING_LR_DWT_ESTIMATOR_ENABLED ||
-      !ROLLING_LR_VCLOCK_SHADOW_FEED_ENABLED) {
-    return;
-  }
-
-  rolling_lr_dwt_lane_t& r = g_rolling_lr_vclock;
-  if (!r.enabled || !r.sample_feed_enabled ||
-      r.kind != interrupt_subscriber_kind_t::VCLOCK) {
-    return;
-  }
-
-  if (!r.window_active) {
-    rolling_lr_begin_vclock_window(r, counter32, dwt32);
-  }
-
-  uint32_t x_ticks = counter32 - r.window_base_counter32;
-
-  // A one-second diagnostic window should never span more than a little over
-  // one VCLOCK second.  If it does, start fresh rather than fitting stale
-  // samples across a counter/lifecycle discontinuity.
-  if (x_ticks > (uint32_t)VCLOCK_COUNTS_PER_SECOND +
-                    ROLLING_LR_COUNTER_DELTA_TICKS) {
-    r.counter_discontinuity_count++;
-    rolling_lr_begin_vclock_window(r, counter32, dwt32);
-    x_ticks = 0;
-  }
-
-  if (r.window_sample_count != 0 &&
-      (int32_t)(counter32 - r.last_sample_counter32) <= 0) {
-    r.counter_discontinuity_count++;
-    rolling_lr_begin_vclock_window(r, counter32, dwt32);
-    x_ticks = 0;
-  }
-
-  if (r.window_sample_count != 0 &&
-      (int32_t)(dwt32 - r.last_sample_dwt32) < 0) {
-    r.dwt_wrap_count++;
-  }
-
-  const uint32_t dwt_delta = dwt32 - r.window_base_dwt32;
-  const uint32_t nominal_delta = vclock_cycles_for_ticks(x_ticks);
-  const int32_t residual_cycles =
-      (int32_t)((int64_t)dwt_delta - (int64_t)nominal_delta);
-
-  const uint64_t x = (uint64_t)x_ticks;
-  const int64_t y = (int64_t)residual_cycles;
-
-  r.rolling_sum_x += x;
-  r.rolling_sum_y += y;
-  r.rolling_sum_xx += x * x;
-  r.rolling_sum_xy += (int64_t)x * y;
-  r.rolling_sum_yy += (uint64_t)((int64_t)y * (int64_t)y);
-
-  r.window_sample_count++;
-  r.active_segment_sample_count = r.window_sample_count;
-  r.sample_total_count++;
-  r.last_sample_counter32 = counter32;
-  r.last_sample_dwt32 = dwt32;
-  r.last_sample_dwt64 = (uint64_t)dwt32;
-}
-
-static FLASHMEM void rolling_lr_finalize_vclock_window(uint32_t target_counter32,
-                                              uint32_t observed_dwt,
-                                              uint32_t authority_dwt,
-                                              const pps_t& witness_pps,
-                                              bool witness_pps_valid) {
-  if (!ROLLING_LR_DWT_ESTIMATOR_ENABLED ||
-      !ROLLING_LR_VCLOCK_SHADOW_FEED_ENABLED) {
-    return;
-  }
-
-  rolling_lr_dwt_lane_t& r = g_rolling_lr_vclock;
-  rolling_lr_result_t result{};
-  result.sequence = r.window_sequence;
-  result.window_seconds = 1U;
-  result.sample_count = r.window_sample_count;
-  result.segment_count = r.segment_count;
-  result.target_counter32_at_event = target_counter32;
-  result.observed_dwt_at_event = observed_dwt;
-  result.authority_dwt_at_event = authority_dwt;
-  result.observed_minus_authority_cycles = (int32_t)(observed_dwt - authority_dwt);
-  result.pps_dwt_valid = witness_pps_valid && witness_pps.sequence != 0;
-  result.pps_dwt_at_event = result.pps_dwt_valid ? witness_pps.dwt_at_edge : 0U;
-
-  const bool was_active = r.window_active;
-  const uint32_t sample_count = r.window_sample_count;
-  const uint32_t base_counter32 = r.window_base_counter32;
-  const uint32_t base_dwt32 = r.window_base_dwt32;
-  const uint64_t sx = r.rolling_sum_x;
-  const int64_t sy = r.rolling_sum_y;
-  const uint64_t sxx = r.rolling_sum_xx;
-  const int64_t sxy = r.rolling_sum_xy;
-  const uint64_t syy = r.rolling_sum_yy;
-
-  // The next TimePop diagnostic sample starts a new current-second window.
-  rolling_lr_clear_current_window(r);
-
-  if (!was_active || !r.enabled || !r.sample_feed_enabled ||
-      r.kind != interrupt_subscriber_kind_t::VCLOCK ||
-      sample_count < r.min_valid_samples) {
-    r.insufficient_count++;
-    result.valid = false;
-    result.confidence_ok = false;
-    result.fallback_would_apply = true;
-    r.last_result = result;
-    return;
-  }
-
-  if ((int32_t)(target_counter32 - base_counter32) < 0) {
-    r.counter_discontinuity_count++;
-    result.valid = false;
-    result.confidence_ok = false;
-    result.fallback_would_apply = true;
-    r.last_result = result;
-    return;
-  }
-
-  const uint32_t target_ticks = target_counter32 - base_counter32;
-  if (target_ticks > (uint32_t)VCLOCK_COUNTS_PER_SECOND +
-                         ROLLING_LR_COUNTER_DELTA_TICKS) {
-    r.counter_discontinuity_count++;
-    result.valid = false;
-    result.confidence_ok = false;
-    result.fallback_would_apply = true;
-    r.last_result = result;
-    return;
-  }
-
-  const uint64_t n = (uint64_t)sample_count;
-  const uint64_t n_sxx = n * sxx;
-  const uint64_t sx_sx = sx * sx;
-  if (n_sxx <= sx_sx) {
-    r.no_fit_count++;
-    result.valid = false;
-    result.confidence_ok = false;
-    result.fallback_would_apply = true;
-    r.last_result = result;
-    return;
-  }
-  const uint64_t denom_u = n_sxx - sx_sx;
-
-  const double n_d = (double)n;
-  const double sx_d = (double)sx;
-  const double sy_d = (double)sy;
-  const double sxx_d = (double)sxx;
-  const double sxy_d = (double)sxy;
-  const double syy_d = (double)syy;
-  const double denom_d = n_d * sxx_d - sx_d * sx_d;
-  if (!(denom_d > 0.0)) {
-    r.no_fit_count++;
-    result.valid = false;
-    result.confidence_ok = false;
-    result.fallback_would_apply = true;
-    r.last_result = result;
-    return;
-  }
-
-  // Fit residual cycles against exact VCLOCK tick offset.  The previous
-  // sample-index formulation lost sub-sample phase and could be tens of
-  // microseconds wrong at 10 Hz.  This formulation evaluates the line at the
-  // exact one-second target tick.
-  const double slope_residual_cycles_per_tick =
-      (n_d * sxy_d - sx_d * sy_d) / denom_d;
-  const double intercept_residual_cycles =
-      (sy_d - slope_residual_cycles_per_tick * sx_d) / n_d;
-  const double residual_target =
-      intercept_residual_cycles +
-      slope_residual_cycles_per_tick * (double)target_ticks;
-  const int64_t residual_target_cycles = (int64_t)(residual_target +
-      (residual_target >= 0.0 ? 0.5 : -0.5));
-
-  const uint32_t nominal_target_cycles = vclock_cycles_for_ticks(target_ticks);
-  const uint32_t nominal_dwt = base_dwt32 + nominal_target_cycles;
-  const uint32_t inferred_dwt =
-      (uint32_t)((int64_t)nominal_dwt + residual_target_cycles);
-
-  const double mean_residual_cycles = sy_d / n_d;
-  const double sse =
-      syy_d +
-      slope_residual_cycles_per_tick * slope_residual_cycles_per_tick * sxx_d +
-      intercept_residual_cycles * intercept_residual_cycles * n_d +
-      2.0 * slope_residual_cycles_per_tick * intercept_residual_cycles * sx_d -
-      2.0 * slope_residual_cycles_per_tick * sxy_d -
-      2.0 * intercept_residual_cycles * sy_d;
-  const double variance = (sse > 0.0) ? (sse / n_d) : 0.0;
-  const uint32_t stddev_q16 = (variance > 0.0)
-      ? (uint32_t)(sqrt(variance) * 65536.0 + 0.5)
-      : 0U;
-
-  result.valid = true;
-  result.confidence_ok = true;
-  result.fallback_would_apply = false;
-  result.inferred_dwt_at_event = inferred_dwt;
-  result.inferred_minus_observed_cycles = (int32_t)(inferred_dwt - observed_dwt);
-  result.inferred_minus_authority_cycles = (int32_t)(inferred_dwt - authority_dwt);
-  if (result.pps_dwt_valid) {
-    result.observed_minus_pps_cycles = (int32_t)(observed_dwt - result.pps_dwt_at_event);
-    result.authority_minus_pps_cycles = (int32_t)(authority_dwt - result.pps_dwt_at_event);
-    result.inferred_minus_pps_cycles = (int32_t)(inferred_dwt - result.pps_dwt_at_event);
-  }
-  result.base_counter32 = base_counter32;
-  result.base_dwt32 = base_dwt32;
-  result.target_ticks_from_base = target_ticks;
-  result.nominal_dwt_at_event = nominal_dwt;
-  result.inferred_minus_nominal_cycles = (int32_t)(inferred_dwt - nominal_dwt);
-  const double full_slope_cycles_per_sample =
-      (double)vclock_cycles_for_ticks(ROLLING_LR_COUNTER_DELTA_TICKS) +
-      slope_residual_cycles_per_tick * (double)ROLLING_LR_COUNTER_DELTA_TICKS;
-  const int64_t slope_q16 = (int64_t)(full_slope_cycles_per_sample *
-                                       65536.0 +
-                                       (full_slope_cycles_per_sample >= 0.0
-                                            ? 0.5
-                                            : -0.5));
-  const int64_t intercept_q16 = (int64_t)(intercept_residual_cycles *
-                                           65536.0 +
-                                           (intercept_residual_cycles >= 0.0
-                                                ? 0.5
-                                                : -0.5));
-  const int64_t mean_q16 = (int64_t)(mean_residual_cycles * 65536.0 +
-                                     (mean_residual_cycles >= 0.0 ? 0.5 : -0.5));
-
-  result.slope_q16_cycles_per_sample =
-      (slope_q16 >= 0) ? (uint64_t)slope_q16 : 0ULL;
-  result.slope_delta_q16_cycles_per_sample = r.previous_slope_valid
-      ? ((int64_t)result.slope_q16_cycles_per_sample -
-         (int64_t)r.previous_slope_q16_cycles_per_sample)
-      : 0;
-  result.intercept_q16_cycles = (int32_t)intercept_q16;
-  result.fit_error_mean_q16_cycles = (int32_t)mean_q16;
-  result.fit_error_stddev_q16_cycles = stddev_q16;
-  result.fit_error_min_cycles = 0;
-  result.fit_error_max_cycles = 0;
-  result.fit_error_abs_gt4_count = 0;
-  result.fit_error_abs_gt10_count = 0;
-
-  r.previous_slope_valid = true;
-  r.previous_slope_q16_cycles_per_sample = result.slope_q16_cycles_per_sample;
-  r.last_result = result;
-  r.finalize_count++;
-}
-
 static uint32_t pps_vclock_phase_cycles_from_edges(const pps_t& pps,
                                                    const pps_vclock_t& pvc) {
   // Scalar PPS→VCLOCK phase, by definition less than one 10 MHz tick.
@@ -1863,6 +1288,34 @@ static uint32_t pps_vclock_phase_cycles_from_edges(const pps_t& pps,
   return (uint32_t)((phase_scaled +
                      (uint64_t)VCLOCK_COUNTS_PER_SECOND / 2ULL) /
                     (uint64_t)VCLOCK_COUNTS_PER_SECOND);
+}
+
+static dwt_repair_diag_t vclock_endpoint_repair_diagnostic(uint32_t observed_dwt) {
+  dwt_repair_diag_t r{};
+  r.valid = false;
+  r.candidate = false;
+  r.synthetic = false;
+  r.original_dwt = observed_dwt;
+  r.predicted_dwt = 0;
+  r.used_dwt = observed_dwt;
+  r.isr_entry_dwt_raw = 0;
+  r.error_cycles = 0;
+  r.threshold_cycles = VCLOCK_DWT_REPAIR_THRESHOLD_CYCLES;
+  r.reason = "disabled";
+
+  g_vclock_repair_stats.last_candidate = false;
+  g_vclock_repair_stats.last_synthetic = false;
+  g_vclock_repair_stats.last_original_dwt = observed_dwt;
+  g_vclock_repair_stats.last_predicted_dwt = 0;
+  g_vclock_repair_stats.last_used_dwt = observed_dwt;
+  g_vclock_repair_stats.last_error_cycles = 0;
+  g_vclock_repair_stats.consecutive_candidate_count = 0;
+
+  if (!VCLOCK_DWT_REPAIR_DIAG_ENABLED) {
+    return r;
+  }
+
+  return r;
 }
 
 static void publish_vclock_domain_pps_vclock(const pps_t& pps,
@@ -2033,6 +1486,10 @@ static bridge_projection_t interrupt_dwt_to_vclock_gnss_projection(uint32_t dwt_
 
   out.anchor_failure_mask |= ANCHOR_FAIL_NO_PLAUSIBLE;
   return out;
+}
+
+static int64_t interrupt_project_dwt_to_vclock_gnss_ns(uint32_t dwt_at_event) {
+  return interrupt_dwt_to_vclock_gnss_projection(dwt_at_event).gnss_ns;
 }
 
 // ============================================================================
@@ -2591,34 +2048,8 @@ static uint32_t vclock_lane_ema_predict_dwt(vclock_lane_t& lane,
 struct synthetic_clock32_t;
 struct ocxo_runtime_context_t;
 
-// ============================================================================
-// OCXO timer-custody backend seam
-// ============================================================================
-//
-// Step 1 is deliberately behavior-neutral: both OCXO lanes still use the
-// existing QTimer2/QTimer3 hardware path.  The backend field and helpers below
-// move every OCXO counter/compare/status/DWT-latency decision behind one seam
-// so the GPT spike can replace custody without perturbing subscriber contracts.
-
-enum class ocxo_timer_backend_t : uint8_t {
-  QTIMER16 = 0,
-  GPT32    = 1,  // Reserved for later spike steps; not selected in Step 1.
-};
-
-static FLASHMEM const char* ocxo_timer_backend_name(ocxo_timer_backend_t backend) {
-  switch (backend) {
-    case ocxo_timer_backend_t::QTIMER16: return "QTIMER16";
-    case ocxo_timer_backend_t::GPT32:    return "GPT32_RESERVED";
-    default:                            return "UNKNOWN";
-  }
-}
-
 struct ocxo_lane_t {
   const char* name = nullptr;
-  ocxo_timer_backend_t backend = ocxo_timer_backend_t::QTIMER16;
-
-  // Active Step 1 backend fields.  Future GPT custody should leave these
-  // QTimer members unused and implement only the ocxo_lane_* helper seam.
   IMXRT_TMR_t* module = nullptr;
   uint8_t      channel = 0;
   uint8_t      pcs = 0;
@@ -2638,7 +2069,7 @@ struct ocxo_lane_t {
   // target; during SmartZero it temporarily becomes a +10,000-tick acquisition
   // target.  The compare target is a process_interrupt-authored synthetic
   // counter32 identity; the low 16 bits are merely the hardware projection
-  // used to arm the local timer backend.
+  // used to arm the local QTimer channel.
   bool     cadence_enabled = false;
   bool     cadence_armed = false;
   bool     cadence_epoch_valid = false;
@@ -2824,12 +2255,6 @@ static ocxo_lane_t g_ocxo2_lane;
 
 static ocxo_lane_t* ocxo_lane_for(interrupt_subscriber_kind_t kind);
 static inline uint16_t ocxo_lane_counter_now(const ocxo_lane_t& lane);
-static inline uint32_t ocxo_lane_status_now(const ocxo_lane_t& lane);
-static inline uint32_t ocxo_lane_compare_value_now(const ocxo_lane_t& lane);
-static inline bool ocxo_lane_compare_enabled_now(const ocxo_lane_t& lane);
-static inline bool ocxo_lane_compare_flag_now(const ocxo_lane_t& lane);
-static inline uint32_t ocxo_lane_event_dwt_from_isr_entry_raw(const ocxo_lane_t& lane,
-                                                              uint32_t isr_entry_dwt_raw);
 static void ocxo_lane_program_compare(ocxo_lane_t& lane, uint16_t target_low16);
 static void ocxo_lane_disable_compare(ocxo_lane_t& lane);
 static void ocxo_lane_clear_compare_flag(ocxo_lane_t& lane);
@@ -3021,6 +2446,10 @@ static bool ocxo_kind_disabled(interrupt_subscriber_kind_t kind) {
   return false;
 }
 
+static bool ocxo_context_disabled(const ocxo_runtime_context_t& ctx) {
+  return ocxo_kind_disabled(ctx.kind);
+}
+
 static interrupt_subscriber_runtime_t* ocxo_runtime_for(const ocxo_runtime_context_t& ctx) {
   return ctx.rt_slot ? *ctx.rt_slot : nullptr;
 }
@@ -3038,18 +2467,6 @@ static volatile uint16_t g_vclock_heartbeat_last_ocxo2_hw16_retired = 0;
 static volatile uint32_t g_vclock_heartbeat_last_vclock_counter32 = 0;
 static volatile uint32_t g_vclock_heartbeat_last_ocxo1_counter32_retired = 0;
 static volatile uint32_t g_vclock_heartbeat_last_ocxo2_counter32_retired = 0;
-
-// VCLOCK linear-regression diagnostic client.  It is intentionally a normal
-// named TimePop client, not hidden work inside VCLOCK_HEARTBEAT or native CH2
-// custody.  EMA remains the only subscriber-facing DWT authority.
-static volatile bool     g_vclock_lr_diag_timepop_armed = false;
-static volatile uint32_t g_vclock_lr_diag_timepop_arm_count = 0;
-static volatile uint32_t g_vclock_lr_diag_timepop_arm_failures = 0;
-static volatile uint32_t g_vclock_lr_diag_timepop_fire_count = 0;
-static volatile uint32_t g_vclock_lr_diag_timepop_inactive_skip_count = 0;
-static volatile uint32_t g_vclock_lr_diag_timepop_sample_feed_count = 0;
-static volatile uint32_t g_vclock_lr_diag_timepop_last_counter32 = 0;
-static volatile uint32_t g_vclock_lr_diag_timepop_last_dwt = 0;
 
 // Passive CH2 rollover tend — surgical coexistence layer.
 //
@@ -3242,8 +2659,6 @@ bool interrupt_clock32_zero_from_ns(interrupt_subscriber_kind_t kind, uint64_t n
     g_vclock_lane.logical_count32_at_last_second = g_vclock_clock32.current_counter32;
     vclock_ch2_one_second_disable();
     cadence_regression_reset_kind(interrupt_subscriber_kind_t::VCLOCK);
-    statistical_dwt_reset_kind(interrupt_subscriber_kind_t::VCLOCK);
-    rolling_lr_reset_kind(interrupt_subscriber_kind_t::VCLOCK);
     vclock_fact_ring_reset();
     vclock_lane_ema_reset(g_vclock_lane);
     return true;
@@ -3273,8 +2688,6 @@ bool interrupt_clock32_request_zero_from_ns(interrupt_subscriber_kind_t kind, ui
     g_vclock_clock32.pending_zero_count++;
     vclock_ch2_one_second_disable();
     cadence_regression_reset_kind(interrupt_subscriber_kind_t::VCLOCK);
-    statistical_dwt_reset_kind(interrupt_subscriber_kind_t::VCLOCK);
-    rolling_lr_reset_kind(interrupt_subscriber_kind_t::VCLOCK);
     vclock_fact_ring_reset();
     vclock_lane_ema_reset(g_vclock_lane);
     return true;
@@ -3325,10 +2738,10 @@ static inline uint32_t synthetic_clock_advance_at_hardware(synthetic_clock32_t& 
 
 uint32_t interrupt_qtimer1_counter32_now(void)   { return vclock_synthetic_from_hardware_low16(qtimer1_ch0_counter_now()); }
 uint16_t interrupt_qtimer2_ch0_counter_now(void) {
-  return OCXO1_DISABLED ? 0U : ocxo_lane_counter_now(g_ocxo1_lane);
+  return OCXO1_DISABLED ? 0U : IMXRT_TMR2.CH[0].CNTR;
 }
 uint16_t interrupt_qtimer3_ch3_counter_now(void) {
-  return OCXO2_DISABLED ? 0U : ocxo_lane_counter_now(g_ocxo2_lane);
+  return OCXO2_DISABLED ? 0U : IMXRT_TMR3.CH[3].CNTR;
 }
 
 // Forward declarations for compare helpers defined below.
@@ -3522,7 +2935,7 @@ static void interrupt_ch2_implicit_rollover_tend(void) {
   // existing QTimer2/QTimer3 cadence ladders still own OCXO scheduled event
   // identity and one-second publication; this path is only rollover insurance.
   if (!OCXO1_DISABLED && g_ocxo1_lane.initialized) {
-    const uint16_t ocxo1_hw16 = ocxo_lane_counter_now(g_ocxo1_lane);
+    const uint16_t ocxo1_hw16 = IMXRT_TMR2.CH[0].CNTR;
     synthetic_clock_observe_hw16_no_pending_zero(g_ocxo1_clock32, ocxo1_hw16);
     g_ch2_implicit_rollover_ocxo1_updates++;
     g_ch2_implicit_rollover_last_ocxo1_hw16 = ocxo1_hw16;
@@ -3535,7 +2948,7 @@ static void interrupt_ch2_implicit_rollover_tend(void) {
   }
 
   if (!OCXO2_DISABLED && g_ocxo2_lane.initialized) {
-    const uint16_t ocxo2_hw16 = ocxo_lane_counter_now(g_ocxo2_lane);
+    const uint16_t ocxo2_hw16 = IMXRT_TMR3.CH[3].CNTR;
     synthetic_clock_observe_hw16_no_pending_zero(g_ocxo2_clock32, ocxo2_hw16);
     g_ch2_implicit_rollover_ocxo2_updates++;
     g_ch2_implicit_rollover_last_ocxo2_hw16 = ocxo2_hw16;
@@ -3561,7 +2974,7 @@ bool interrupt_clock_snapshot(interrupt_subscriber_kind_t kind, interrupt_clock_
 
   if (kind == interrupt_subscriber_kind_t::OCXO1) {
     if (OCXO1_DISABLED) return false;
-    const uint16_t hw = ocxo_lane_counter_now(g_ocxo1_lane);
+    const uint16_t hw = IMXRT_TMR2.CH[0].CNTR;
     out->hardware16 = hw;
     out->counter32 = project_counter32_from_hw16(g_ocxo1_clock32, hw);
     out->ns64 = project_ns64_from_hw16(g_ocxo1_clock32, hw);
@@ -3570,7 +2983,7 @@ bool interrupt_clock_snapshot(interrupt_subscriber_kind_t kind, interrupt_clock_
 
   if (kind == interrupt_subscriber_kind_t::OCXO2) {
     if (OCXO2_DISABLED) return false;
-    const uint16_t hw = ocxo_lane_counter_now(g_ocxo2_lane);
+    const uint16_t hw = IMXRT_TMR3.CH[3].CNTR;
     out->hardware16 = hw;
     out->counter32 = project_counter32_from_hw16(g_ocxo2_clock32, hw);
     out->ns64 = project_ns64_from_hw16(g_ocxo2_clock32, hw);
@@ -3699,7 +3112,7 @@ static void smartzero_install_disabled_surrogates_locked(void) {
   smartzero_install_disabled_surrogate_locked(2);
 }
 
-static FLASHMEM const char* smartzero_decision_name(interrupt_smartzero_decision_t d) {
+static const char* smartzero_decision_name(interrupt_smartzero_decision_t d) {
   switch (d) {
     case interrupt_smartzero_decision_t::WAITING_FOR_CPS:  return "WAITING_FOR_CPS";
     case interrupt_smartzero_decision_t::FIRST_SAMPLE:     return "FIRST_SAMPLE";
@@ -3710,7 +3123,7 @@ static FLASHMEM const char* smartzero_decision_name(interrupt_smartzero_decision
   }
 }
 
-static FLASHMEM const char* smartzero_lane_state_name(interrupt_smartzero_lane_state_t s) {
+static const char* smartzero_lane_state_name(interrupt_smartzero_lane_state_t s) {
   switch (s) {
     case interrupt_smartzero_lane_state_t::ACQUIRING: return "ACQUIRING";
     case interrupt_smartzero_lane_state_t::LOCKED:    return "LOCKED";
@@ -3718,7 +3131,7 @@ static FLASHMEM const char* smartzero_lane_state_name(interrupt_smartzero_lane_s
   }
 }
 
-static FLASHMEM const char* smartzero_phase_name(interrupt_smartzero_phase_t p) {
+static const char* smartzero_phase_name(interrupt_smartzero_phase_t p) {
   switch (p) {
     case interrupt_smartzero_phase_t::RUNNING:  return "RUNNING";
     case interrupt_smartzero_phase_t::COMPLETE: return "COMPLETE";
@@ -4171,26 +3584,31 @@ static const char* dispatch_timer_name(interrupt_subscriber_kind_t kind) {
 }
 
 // ============================================================================
-// Retired legacy cadence-regression compatibility shell
+// Shared 1 kHz linear regression engine
 // ============================================================================
-//
-// The old cadence_regression engine has been removed. It kept one retained
-// int32_t[1000] sample window for each of VCLOCK, OCXO1, and OCXO2, plus
-// floating-point fit helpers. That cost roughly 12 KB of static RAM before any
-// live feed was enabled. Keep only tiny zero-valued compatibility state so
-// existing reset/report call sites and public field names remain stable while
-// the new rolling_lr_* estimator becomes the only regression implementation.
+
+struct cadence_regression_sample_t {
+  interrupt_subscriber_kind_t kind = interrupt_subscriber_kind_t::NONE;
+  uint32_t observed_dwt_at_event = 0;
+  uint32_t target_counter32_at_event = 0;
+  uint16_t target_hardware16_at_event = 0;
+  uint16_t observed_hardware16_at_event = 0;
+  bool one_second_due = false;
+};
 
 struct cadence_regression_result_t {
   bool valid = false;
   uint32_t sequence = 0;
   uint32_t sample_count = 0;
+
   uint32_t observed_dwt_at_event = 0;
   uint32_t inferred_dwt_at_event = 0;
   int32_t inferred_minus_observed_cycles = 0;
+
   uint32_t target_counter32_at_event = 0;
   uint16_t target_hardware16_at_event = 0;
   uint16_t observed_hardware16_at_event = 0;
+
   uint64_t slope_q16_cycles_per_sample = 0;
   int64_t slope_delta_q16_cycles_per_sample = 0;
   int32_t fit_error_mean_q16_cycles = 0;
@@ -4204,13 +3622,56 @@ struct cadence_regression_result_t {
 
 struct cadence_regression_lane_t {
   interrupt_subscriber_kind_t kind = interrupt_subscriber_kind_t::NONE;
+  bool window_active = false;
+  uint32_t sequence = 0;
+  uint32_t sample_total_count = 0;
   uint32_t reset_count = 0;
+  uint32_t insufficient_count = 0;
+  uint32_t counter_discontinuity_count = 0;
+
+  uint32_t sample_count = 0;
+  uint32_t base_counter32 = 0;
+  uint32_t base_observed_dwt = 0;
+  uint32_t last_counter32 = 0;
+  uint32_t last_observed_dwt = 0;
+
+  bool previous_slope_valid = false;
+  double previous_slope_cycles_per_sample = 0.0;
+
+  int32_t observed_dwt_rel[REGRESSION_SAMPLES_PER_SECOND]{};
   cadence_regression_result_t last_result{};
 };
 
 static cadence_regression_lane_t g_regression_vclock = {};
 static cadence_regression_lane_t g_regression_ocxo1 = {};
 static cadence_regression_lane_t g_regression_ocxo2 = {};
+
+static int32_t regression_round_i32(double value) {
+  return (int32_t)((value >= 0.0) ? (value + 0.5) : (value - 0.5));
+}
+
+static uint64_t regression_round_u64_q16(double value) {
+  if (value <= 0.0) return 0ULL;
+  return (uint64_t)(value * REGRESSION_Q16_SCALE + 0.5);
+}
+
+static uint32_t regression_round_u32_q16(double value) {
+  if (value <= 0.0) return 0U;
+  const double scaled = value * REGRESSION_Q16_SCALE + 0.5;
+  return (scaled > (double)UINT32_MAX) ? UINT32_MAX : (uint32_t)scaled;
+}
+
+static int32_t regression_round_i32_q16(double value) {
+  const double scaled = value * REGRESSION_Q16_SCALE;
+  if (scaled > (double)INT32_MAX) return INT32_MAX;
+  if (scaled < (double)INT32_MIN) return INT32_MIN;
+  return regression_round_i32(scaled);
+}
+
+static int64_t regression_round_i64_q16(double value) {
+  const double scaled = value * REGRESSION_Q16_SCALE;
+  return (int64_t)((scaled >= 0.0) ? (scaled + 0.5) : (scaled - 0.5));
+}
 
 static cadence_regression_lane_t*
 cadence_regression_for(interrupt_subscriber_kind_t kind) {
@@ -4225,12 +3686,23 @@ cadence_regression_for_const(interrupt_subscriber_kind_t kind) {
   return cadence_regression_for(kind);
 }
 
+static void cadence_regression_reset_window(cadence_regression_lane_t& r) {
+  r.window_active = false;
+  r.sample_count = 0;
+  r.base_counter32 = 0;
+  r.base_observed_dwt = 0;
+  r.last_counter32 = 0;
+  r.last_observed_dwt = 0;
+}
+
 static void cadence_regression_reset_kind(interrupt_subscriber_kind_t kind) {
   cadence_regression_lane_t* r = cadence_regression_for(kind);
   if (!r) return;
+
+  const interrupt_subscriber_kind_t saved_kind = r->kind;
   const uint32_t prior_reset_count = r->reset_count;
   *r = cadence_regression_lane_t{};
-  r->kind = kind;
+  r->kind = (saved_kind == interrupt_subscriber_kind_t::NONE) ? kind : saved_kind;
   r->reset_count = prior_reset_count + 1U;
 }
 
@@ -4243,11 +3715,198 @@ static void cadence_regression_reset_all(void) {
   g_regression_ocxo2.kind = interrupt_subscriber_kind_t::OCXO2;
 }
 
-static void copy_regression_diag(interrupt_capture_diag_t&, 
-                                 const cadence_regression_result_t*) {
-  // Legacy cadence-regression diagnostics are retired. The public diag fields
-  // remain zero-initialized for compatibility until the new rolling_lr_* path is
-  // explicitly promoted into the subscriber diagnostic payload.
+static cadence_regression_result_t
+cadence_regression_result_from_sample(cadence_regression_lane_t& r,
+                                      const cadence_regression_sample_t& sample,
+                                      bool valid) {
+  cadence_regression_result_t out{};
+  out.valid = valid;
+  out.sequence = r.sequence;
+  out.sample_count = r.sample_count;
+  out.observed_dwt_at_event = sample.observed_dwt_at_event;
+  out.inferred_dwt_at_event = sample.observed_dwt_at_event;
+  out.inferred_minus_observed_cycles = 0;
+  out.target_counter32_at_event = sample.target_counter32_at_event;
+  out.target_hardware16_at_event = sample.target_hardware16_at_event;
+  out.observed_hardware16_at_event = sample.observed_hardware16_at_event;
+  return out;
+}
+
+static cadence_regression_result_t
+cadence_regression_finalize(cadence_regression_lane_t& r,
+                            const cadence_regression_sample_t& event_sample) {
+  const uint32_t n = r.sample_count;
+  if (n < REGRESSION_MIN_SAMPLE_COUNT) {
+    r.insufficient_count++;
+    cadence_regression_result_t out =
+        cadence_regression_result_from_sample(r, event_sample, false);
+    r.last_result = out;
+    return out;
+  }
+
+  double sum_x = 0.0;
+  double sum_y = 0.0;
+  double sum_xx = 0.0;
+  double sum_xy = 0.0;
+
+  for (uint32_t i = 0; i < n; i++) {
+    const double x = (double)i;
+    const double y = (double)r.observed_dwt_rel[i];
+    sum_x += x;
+    sum_y += y;
+    sum_xx += x * x;
+    sum_xy += x * y;
+  }
+
+  const double denom = (double)n * sum_xx - sum_x * sum_x;
+  if (denom == 0.0) {
+    r.insufficient_count++;
+    cadence_regression_result_t out =
+        cadence_regression_result_from_sample(r, event_sample, false);
+    r.last_result = out;
+    return out;
+  }
+
+  const double slope = ((double)n * sum_xy - sum_x * sum_y) / denom;
+  const double intercept = (sum_y - slope * sum_x) / (double)n;
+  const double x_event = (double)(n - 1U);
+  const double inferred_rel_d = intercept + slope * x_event;
+  const int32_t inferred_rel = regression_round_i32(inferred_rel_d);
+
+  double mean = 0.0;
+  double m2 = 0.0;
+  int32_t min_err = INT32_MAX;
+  int32_t max_err = INT32_MIN;
+  uint32_t gt_plus4 = 0;
+  uint32_t lt_minus4 = 0;
+  uint32_t abs_gt4 = 0;
+
+  for (uint32_t i = 0; i < n; i++) {
+    const double estimate = intercept + slope * (double)i;
+    const double err_d = estimate - (double)r.observed_dwt_rel[i];
+    const int32_t err = regression_round_i32(err_d);
+
+    const double d1 = err_d - mean;
+    mean += d1 / (double)(i + 1U);
+    const double d2 = err_d - mean;
+    m2 += d1 * d2;
+
+    if (err < min_err) min_err = err;
+    if (err > max_err) max_err = err;
+    if (err_d > (double)REGRESSION_FIT_ERROR_THRESHOLD_CYCLES) gt_plus4++;
+    if (err_d < (double)(-REGRESSION_FIT_ERROR_THRESHOLD_CYCLES)) lt_minus4++;
+    if (fabs(err_d) > (double)REGRESSION_FIT_ERROR_THRESHOLD_CYCLES) abs_gt4++;
+  }
+
+  const double variance = (n >= 2U) ? (m2 / (double)(n - 1U)) : 0.0;
+  const double stddev = sqrt(variance < 0.0 ? 0.0 : variance);
+
+  r.sequence++;
+  cadence_regression_result_t out{};
+  out.valid = true;
+  out.sequence = r.sequence;
+  out.sample_count = n;
+  out.observed_dwt_at_event = event_sample.observed_dwt_at_event;
+  out.inferred_dwt_at_event = r.base_observed_dwt + (uint32_t)inferred_rel;
+  out.inferred_minus_observed_cycles =
+      (int32_t)(out.inferred_dwt_at_event - event_sample.observed_dwt_at_event);
+  out.target_counter32_at_event = event_sample.target_counter32_at_event;
+  out.target_hardware16_at_event = event_sample.target_hardware16_at_event;
+  out.observed_hardware16_at_event = event_sample.observed_hardware16_at_event;
+  out.slope_q16_cycles_per_sample = regression_round_u64_q16(slope);
+  out.slope_delta_q16_cycles_per_sample = r.previous_slope_valid
+      ? regression_round_i64_q16(slope - r.previous_slope_cycles_per_sample)
+      : 0;
+  out.fit_error_mean_q16_cycles = regression_round_i32_q16(mean);
+  out.fit_error_stddev_q16_cycles = regression_round_u32_q16(stddev);
+  out.fit_error_min_cycles = min_err;
+  out.fit_error_max_cycles = max_err;
+  out.fit_error_gt_plus4_count = gt_plus4;
+  out.fit_error_lt_minus4_count = lt_minus4;
+  out.fit_error_abs_gt4_count = abs_gt4;
+
+  r.previous_slope_cycles_per_sample = slope;
+  r.previous_slope_valid = true;
+  r.last_result = out;
+  return out;
+}
+
+static cadence_regression_result_t
+cadence_regression_feed_sample(interrupt_subscriber_kind_t kind,
+                               const cadence_regression_sample_t& sample) {
+  cadence_regression_lane_t* r = cadence_regression_for(kind);
+  if (!r) return cadence_regression_result_t{};
+
+  r->sample_total_count++;
+
+  if (!r->window_active || r->sample_count >= REGRESSION_SAMPLES_PER_SECOND) {
+    cadence_regression_reset_window(*r);
+    r->window_active = true;
+    r->base_counter32 = sample.target_counter32_at_event;
+    r->base_observed_dwt = sample.observed_dwt_at_event;
+  } else {
+    const uint32_t expected_counter =
+        r->base_counter32 + r->sample_count * REGRESSION_COUNTER_DELTA_TICKS;
+    if (sample.target_counter32_at_event != expected_counter) {
+      r->counter_discontinuity_count++;
+      cadence_regression_reset_window(*r);
+      r->window_active = true;
+      r->base_counter32 = sample.target_counter32_at_event;
+      r->base_observed_dwt = sample.observed_dwt_at_event;
+    }
+  }
+
+  const uint32_t idx = r->sample_count;
+  if (idx < REGRESSION_SAMPLES_PER_SECOND) {
+    r->observed_dwt_rel[idx] =
+        (int32_t)(sample.observed_dwt_at_event - r->base_observed_dwt);
+    r->sample_count++;
+  }
+
+  r->last_counter32 = sample.target_counter32_at_event;
+  r->last_observed_dwt = sample.observed_dwt_at_event;
+
+  if (!sample.one_second_due) {
+    return cadence_regression_result_t{};
+  }
+
+  cadence_regression_result_t out = cadence_regression_finalize(*r, sample);
+  cadence_regression_reset_window(*r);
+  return out;
+}
+
+static void copy_regression_diag(interrupt_capture_diag_t& diag,
+                                 const cadence_regression_result_t* r) {
+  if (!r) return;
+
+  diag.regression_valid = r->valid;
+  diag.regression_sequence = r->sequence;
+  diag.regression_sample_count = r->sample_count;
+  diag.regression_observed_dwt_at_event = r->observed_dwt_at_event;
+  diag.regression_inferred_dwt_at_event = r->inferred_dwt_at_event;
+  diag.regression_inferred_minus_observed_cycles =
+      r->inferred_minus_observed_cycles;
+  diag.regression_target_counter32_at_event = r->target_counter32_at_event;
+  diag.regression_target_hardware16_at_event = r->target_hardware16_at_event;
+  diag.regression_observed_hardware16_at_event =
+      r->observed_hardware16_at_event;
+  diag.regression_slope_q16_cycles_per_sample =
+      r->slope_q16_cycles_per_sample;
+  diag.regression_slope_delta_q16_cycles_per_sample =
+      r->slope_delta_q16_cycles_per_sample;
+  diag.regression_fit_error_mean_q16_cycles =
+      r->fit_error_mean_q16_cycles;
+  diag.regression_fit_error_stddev_q16_cycles =
+      r->fit_error_stddev_q16_cycles;
+  diag.regression_fit_error_min_cycles = r->fit_error_min_cycles;
+  diag.regression_fit_error_max_cycles = r->fit_error_max_cycles;
+  diag.regression_fit_error_gt_plus4_count = r->fit_error_gt_plus4_count;
+  diag.regression_fit_error_lt_minus4_count = r->fit_error_lt_minus4_count;
+  diag.regression_fit_error_abs_gt4_count = r->fit_error_abs_gt4_count;
+
+  // Diagnostic-only build: do not promote the fitted DWT into any legacy
+  // correction/authority field.  Alpha/Beta can compare diag.dwt_at_event
+  // against regression_inferred_dwt_at_event without changing physics math.
 }
 
 // ============================================================================
@@ -4504,6 +4163,39 @@ static bool vclock_fact_ring_pop(vclock_perishable_fact_t& out) {
     g_vclock_fact_ring.drain_armed = false;
   }
   __enable_irq();
+  return true;
+}
+
+static bool vclock_fact_ring_push_from_isr(vclock_perishable_fact_t fact) {
+  if (g_vclock_fact_ring.count >= VCLOCK_PERISHABLE_FACT_RING_SIZE) {
+    g_vclock_fact_ring.overflow_count++;
+    g_vclock_lane.miss_count++;
+    return false;
+  }
+
+  fact.sequence = ++g_vclock_fact_ring.sequence;
+  g_vclock_fact_ring.facts[g_vclock_fact_ring.head] = fact;
+  g_vclock_fact_ring.head =
+      (g_vclock_fact_ring.head + 1U) % VCLOCK_PERISHABLE_FACT_RING_SIZE;
+  g_vclock_fact_ring.count++;
+  g_vclock_fact_ring.enqueue_count++;
+  if (g_vclock_fact_ring.count > g_vclock_fact_ring.high_water) {
+    g_vclock_fact_ring.high_water = g_vclock_fact_ring.count;
+  }
+
+  if (!g_vclock_fact_ring.drain_armed) {
+    g_vclock_fact_ring.drain_armed = true;
+    g_vclock_fact_ring.asap_arm_count++;
+    const timepop_handle_t h =
+        timepop_arm_asap(vclock_fact_drain_callback, nullptr,
+                         VCLOCK_FACT_DRAIN_NAME);
+    if (h == TIMEPOP_INVALID_HANDLE) {
+      g_vclock_fact_ring.drain_armed = false;
+      g_vclock_fact_ring.asap_fail_count++;
+      return false;
+    }
+  }
+
   return true;
 }
 
@@ -4865,12 +4557,6 @@ static void vclock_apply_perishable_fact_deferred(
   const uint32_t published_dwt = vclock_lane_ema_predict_dwt(
       g_vclock_lane, observed_dwt, &ema_synthetic, &ema_error_cycles, &ema_diag);
 
-  rolling_lr_finalize_vclock_window(fact.target_counter32,
-                                    observed_dwt,
-                                    published_dwt,
-                                    fact.witness_pps,
-                                    fact.witness_pps_valid);
-
   uint32_t coincidence_cycles = 0;
   bool coincidence_valid = false;
   if (fact.witness_pps_valid && fact.witness_pps.sequence > 0) {
@@ -4931,7 +4617,7 @@ static void vclock_fact_drain_callback(timepop_ctx_t*,
 // Cadence surfaces — VCLOCK TimePop heartbeat + OCXO lane-local compare custody
 // ============================================================================
 
-static FLASHMEM const char* ocxo_schedule_decision_name(uint32_t decision) {
+static const char* ocxo_schedule_decision_name(uint32_t decision) {
   switch (decision) {
     case OCXO_SCHEDULE_DECISION_INACTIVE: return "INACTIVE";
     case OCXO_SCHEDULE_DECISION_ALREADY_ARMED: return "ALREADY_ARMED";
@@ -4944,7 +4630,7 @@ static FLASHMEM const char* ocxo_schedule_decision_name(uint32_t decision) {
   }
 }
 
-static FLASHMEM const char* ocxo_service_class_name(uint32_t service_class) {
+static const char* ocxo_service_class_name(uint32_t service_class) {
   switch (service_class) {
     case OCXO_SERVICE_CLASS_FALSE_IRQ: return "FALSE_IRQ";
     case OCXO_SERVICE_CLASS_EARLY_PRETARGET: return "EARLY_PRETARGET";
@@ -4953,7 +4639,7 @@ static FLASHMEM const char* ocxo_service_class_name(uint32_t service_class) {
   }
 }
 
-static FLASHMEM const char* ocxo_cadence_reason_name(uint32_t reason) {
+static const char* ocxo_cadence_reason_name(uint32_t reason) {
   switch (reason) {
     case OCXO_CADENCE_REASON_BOOTSTRAP:    return "BOOTSTRAP";
     case OCXO_CADENCE_REASON_START:        return "START";
@@ -4980,12 +4666,58 @@ static uint32_t ocxo_phase_ticks_to_ns(uint32_t phase_ticks) {
   return phase_ticks * 100U;
 }
 
+static uint32_t ocxo_quiet_phase_next_target(interrupt_subscriber_kind_t kind,
+                                             ocxo_lane_t& lane,
+                                             const synthetic_clock32_t& clock32) {
+  const uint32_t desired_phase = ocxo_quiet_phase_ticks_for(kind);
+  const uint32_t vclock_now = interrupt_vclock_counter32_observe_ambient();
+  const uint32_t vclock_phase = vclock_now % OCXO_QUIET_PHASE_PERIOD_TICKS;
+
+  uint32_t ticks_until =
+      (desired_phase + OCXO_QUIET_PHASE_PERIOD_TICKS - vclock_phase) %
+      OCXO_QUIET_PHASE_PERIOD_TICKS;
+
+  // A phase exactly "now" or too close to program safely belongs to the next
+  // millisecond cell.  This keeps first arming out of the hardware race window.
+  if (ticks_until < OCXO_QUIET_PHASE_MIN_LEAD_TICKS) {
+    ticks_until += OCXO_QUIET_PHASE_PERIOD_TICKS;
+  }
+
+  lane.cadence_sample_phase_valid = true;
+  lane.cadence_sample_phase_ticks = desired_phase;
+  lane.cadence_sample_phase_us = ocxo_phase_ticks_to_us(desired_phase);
+  lane.cadence_sample_phase_ns = ocxo_phase_ticks_to_ns(desired_phase);
+  lane.cadence_sample_period_ticks = OCXO_QUIET_PHASE_PERIOD_TICKS;
+  lane.cadence_phase_align_start_count++;
+  lane.cadence_last_phase_align_vclock_counter32 = vclock_now;
+  lane.cadence_last_phase_align_vclock_phase_ticks = vclock_phase;
+  lane.cadence_last_phase_align_ticks_until_target = ticks_until;
+  lane.cadence_last_phase_align_ocxo_counter32 = clock32.current_counter32;
+
+  return clock32.current_counter32 + ticks_until;
+}
+
+static uint32_t ocxo_grid_next_target_after(uint32_t epoch_counter32,
+                                            uint32_t current_counter32) {
+  const uint32_t delta = current_counter32 - epoch_counter32;
+
+  // If the epoch appears to be in the modular future, use the first cadence
+  // target after the epoch.  This can only happen across a 32-bit wrap or when
+  // a caller deliberately re-authors a future logical grid.
+  if (delta > 0x7FFFFFFFUL) {
+    return epoch_counter32 + OCXO_CADENCE_INTERVAL_TICKS;
+  }
+
+  const uint32_t steps_completed = delta / OCXO_CADENCE_INTERVAL_TICKS;
+  return epoch_counter32 + ((steps_completed + 1U) * OCXO_CADENCE_INTERVAL_TICKS);
+}
+
 static void ocxo_lane_program_local_cadence_compare(ocxo_lane_t& lane,
                                                     uint32_t target_counter32,
                                                     uint32_t reason) {
   const uint16_t target_low16 = (uint16_t)(target_counter32 & 0xFFFFU);
 
-  lane.cadence_last_program_csctrl_before = ocxo_lane_status_now(lane);
+  lane.cadence_last_program_csctrl_before = lane.module->CH[lane.channel].CSCTRL;
   lane.cadence_last_program_flag_before =
       (lane.cadence_last_program_csctrl_before & TMR_CSCTRL_TCF1) != 0;
   lane.cadence_last_program_enabled_before =
@@ -5001,7 +4733,7 @@ static void ocxo_lane_program_local_cadence_compare(ocxo_lane_t& lane,
 
   ocxo_lane_program_compare(lane, target_low16);
 
-  lane.cadence_last_program_csctrl_after = ocxo_lane_status_now(lane);
+  lane.cadence_last_program_csctrl_after = lane.module->CH[lane.channel].CSCTRL;
   lane.cadence_last_program_flag_after =
       (lane.cadence_last_program_csctrl_after & TMR_CSCTRL_TCF1) != 0;
   lane.cadence_last_program_enabled_after =
@@ -5208,8 +4940,6 @@ static void ocxo_lane_install_logical_grid(interrupt_subscriber_kind_t kind,
   lane.witness_previous_event_counter32 = 0;
   lane.witness_last_counter_delta_ticks = 0;
   cadence_regression_reset_kind(kind);
-  statistical_dwt_reset_kind(kind);
-  rolling_lr_reset_kind(kind);
 
   if (lane.active || smartzero_is_current_lane(kind)) {
     (void)ocxo_lane_start_local_cadence(kind, lane, clock32, reason);
@@ -5369,51 +5099,6 @@ static void vclock_heartbeat_timepop_callback(timepop_ctx_t* ctx,
   // VCLOCK fallback/reporting heartbeat surface.
 }
 
-static void vclock_lr_diag_timepop_callback(timepop_ctx_t* ctx,
-                                           timepop_diag_t*,
-                                           void*) {
-  if (!ctx || !g_interrupt_hw_ready || !g_interrupt_runtime_ready) return;
-
-  g_vclock_lr_diag_timepop_fire_count++;
-  g_vclock_lr_diag_timepop_last_counter32 = ctx->fire_vclock_raw;
-  g_vclock_lr_diag_timepop_last_dwt = ctx->fire_dwt_cyccnt;
-
-  if (!g_vclock_lane.active || !g_rt_vclock || !g_rt_vclock->active) {
-    g_vclock_lr_diag_timepop_inactive_skip_count++;
-    return;
-  }
-
-  rolling_lr_feed_vclock_sample_from_timepop(ctx->fire_vclock_raw,
-                                             ctx->fire_dwt_cyccnt);
-  g_vclock_lr_diag_timepop_sample_feed_count++;
-}
-
-static bool vclock_lr_diag_arm_timepop(void) {
-  if (!g_interrupt_hw_ready || !g_interrupt_runtime_ready) return false;
-  if (!ROLLING_LR_DWT_ESTIMATOR_ENABLED ||
-      !ROLLING_LR_VCLOCK_SHADOW_FEED_ENABLED) {
-    g_vclock_lr_diag_timepop_armed = false;
-    return true;
-  }
-
-  timepop_cancel_by_name(VCLOCK_LR_DIAG_NAME);
-  const timepop_handle_t h =
-      timepop_arm(VCLOCK_LR_DIAG_PERIOD_NS,
-                  true,
-                  vclock_lr_diag_timepop_callback,
-                  nullptr,
-                  VCLOCK_LR_DIAG_NAME);
-  if (h == TIMEPOP_INVALID_HANDLE) {
-    g_vclock_lr_diag_timepop_armed = false;
-    g_vclock_lr_diag_timepop_arm_failures++;
-    return false;
-  }
-
-  g_vclock_lr_diag_timepop_armed = true;
-  g_vclock_lr_diag_timepop_arm_count++;
-  return true;
-}
-
 static bool vclock_heartbeat_arm_timepop(void) {
   if (!g_interrupt_hw_ready || !g_interrupt_runtime_ready) return false;
 
@@ -5438,52 +5123,10 @@ static bool vclock_heartbeat_arm_timepop(void) {
 }
 
 // ============================================================================
-// OCXO lanes — timer-backend custody (Step 1 backend: QTimer2 CH0 / QTimer3 CH3)
+// OCXO lanes — QTimer2 CH0 / QTimer3 CH3
 // ============================================================================
 //
-static inline bool ocxo_lane_backend_is_qtimer(const ocxo_lane_t& lane) {
-  return lane.backend == ocxo_timer_backend_t::QTIMER16 && lane.module != nullptr;
-}
-
-static inline uint32_t ocxo_lane_status_now(const ocxo_lane_t& lane) {
-  if (!ocxo_lane_backend_is_qtimer(lane)) return 0U;
-  return (uint32_t)lane.module->CH[lane.channel].CSCTRL;
-}
-
-static inline uint32_t ocxo_lane_compare_value_now(const ocxo_lane_t& lane) {
-  if (!ocxo_lane_backend_is_qtimer(lane)) return 0U;
-  return (uint32_t)lane.module->CH[lane.channel].COMP1;
-}
-
-static inline bool ocxo_lane_compare_enabled_now(const ocxo_lane_t& lane) {
-  return (ocxo_lane_status_now(lane) & TMR_CSCTRL_TCF1EN) != 0;
-}
-
-static inline bool ocxo_lane_compare_flag_now(const ocxo_lane_t& lane) {
-  return (ocxo_lane_status_now(lane) & TMR_CSCTRL_TCF1) != 0;
-}
-
-static inline bool ocxo_lane_compare_flag_pending(const ocxo_lane_t& lane) {
-  return ocxo_lane_compare_flag_now(lane);
-}
-
-static inline uint16_t ocxo_lane_counter_now(const ocxo_lane_t& lane) {
-  if (!ocxo_lane_backend_is_qtimer(lane)) return 0U;
-  return lane.module->CH[lane.channel].CNTR;
-}
-
-static inline uint32_t ocxo_lane_event_dwt_from_isr_entry_raw(const ocxo_lane_t& lane,
-                                                              uint32_t isr_entry_dwt_raw) {
-  // Step 1 keeps the existing QTimer latency correction.  The lane parameter
-  // is present so GPT can install its own fixed-latency model later without
-  // touching the OCXO subscriber path.
-  (void)lane;
-  return qtimer_event_dwt_from_isr_entry_raw(isr_entry_dwt_raw);
-}
-
 static void ocxo_lane_program_compare(ocxo_lane_t& lane, uint16_t target_low16) {
-  if (!ocxo_lane_backend_is_qtimer(lane)) return;
-
   if (lane.module == &IMXRT_TMR2 && lane.channel == 0) {
     qtimer2_ch0_program_compare(target_low16);
   } else if (lane.module == &IMXRT_TMR3) {
@@ -5492,8 +5135,6 @@ static void ocxo_lane_program_compare(ocxo_lane_t& lane, uint16_t target_low16) 
 }
 
 static void ocxo_lane_disable_compare(ocxo_lane_t& lane) {
-  if (!ocxo_lane_backend_is_qtimer(lane)) return;
-
   if (lane.module == &IMXRT_TMR2 && lane.channel == 0) {
     qtimer2_ch0_disable_compare();
   } else if (lane.module == &IMXRT_TMR3) {
@@ -5715,9 +5356,15 @@ static bool ocxo_fact_ring_push_from_isr(ocxo_runtime_context_t& ctx,
 }
 
 
-static void ocxo_lane_clear_compare_flag(ocxo_lane_t& lane) {
-  if (!ocxo_lane_backend_is_qtimer(lane)) return;
+static inline bool ocxo_lane_compare_flag_pending(const ocxo_lane_t& lane) {
+  return (lane.module->CH[lane.channel].CSCTRL & TMR_CSCTRL_TCF1) != 0;
+}
 
+static inline uint16_t ocxo_lane_counter_now(const ocxo_lane_t& lane) {
+  return lane.module->CH[lane.channel].CNTR;
+}
+
+static void ocxo_lane_clear_compare_flag(ocxo_lane_t& lane) {
   if (lane.module == &IMXRT_TMR2 && lane.channel == 0) {
     qtimer2_ch0_clear_compare_flag();
   } else if (lane.module == &IMXRT_TMR3) {
@@ -6575,7 +6222,7 @@ static void ocxo_cadence_acknowledge_and_timestamp(
   // before any foreground work is requested.
   ocxo_lane_clear_compare_flag(*ctx.lane);
   sample.event_dwt =
-      ocxo_lane_event_dwt_from_isr_entry_raw(*ctx.lane, sample.isr_entry_dwt_raw);
+      qtimer_event_dwt_from_isr_entry_raw(sample.isr_entry_dwt_raw);
 }
 
 static void ocxo_cadence_update_synthetic_identity(
@@ -6667,7 +6314,7 @@ static void ocxo_cadence_rearm_or_stop(
     // inside smartzero_feed_sample().  The accepted lane now transitions into
     // normal one-second edge-capture mode; do not overwrite the newly prepared
     // target with the just-serviced SmartZero sample +10,000.
-    sample.isr_csctrl_after_program = ocxo_lane_status_now(lane);
+    sample.isr_csctrl_after_program = lane.module->CH[lane.channel].CSCTRL;
     return;
   }
 
@@ -6675,7 +6322,7 @@ static void ocxo_cadence_rearm_or_stop(
   const bool keep_running = lane.active || keep_for_smartzero;
   if (!keep_running) {
     ocxo_lane_stop_local_cadence(lane, OCXO_CADENCE_REASON_STOP);
-    sample.isr_csctrl_after_program = ocxo_lane_status_now(lane);
+    sample.isr_csctrl_after_program = lane.module->CH[lane.channel].CSCTRL;
     return;
   }
 
@@ -6707,7 +6354,7 @@ static void ocxo_cadence_rearm_or_stop(
                                         OCXO_CADENCE_REASON_REARM);
   }
 
-  sample.isr_csctrl_after_program = ocxo_lane_status_now(lane);
+  sample.isr_csctrl_after_program = lane.module->CH[lane.channel].CSCTRL;
 }
 
 static interrupt_perishable_fact_t ocxo_cadence_build_perishable_fact(
@@ -6785,7 +6432,7 @@ static void ocxo_cadence_compare_isr(ocxo_runtime_context_t& ctx,
                                      const spinidle_isr_capture_t& spinidle) {
   ocxo_lane_t& lane = *ctx.lane;
 
-  const uint32_t isr_csctrl_entry = ocxo_lane_status_now(lane);
+  const uint32_t isr_csctrl_entry = lane.module->CH[lane.channel].CSCTRL;
   if (!ocxo_cadence_classify_irq(ctx, isr_csctrl_entry)) return;
 
   ocxo_cadence_isr_sample_t sample =
@@ -7221,8 +6868,8 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
   const bool ocxo_capture_hw_ready =
       (OCXO1_DISABLED || ocxo1_capture_hw_ready) &&
       (OCXO2_DISABLED || ocxo2_capture_hw_ready);
-  const uint16_t ocxo1_hardware16 = ocxo1_capture_hw_ready ? ocxo_lane_counter_now(g_ocxo1_lane) : 0;
-  const uint16_t ocxo2_hardware16 = ocxo2_capture_hw_ready ? ocxo_lane_counter_now(g_ocxo2_lane) : 0;
+  const uint16_t ocxo1_hardware16 = ocxo1_capture_hw_ready ? IMXRT_TMR2.CH[0].CNTR : 0;
+  const uint16_t ocxo2_hardware16 = ocxo2_capture_hw_ready ? IMXRT_TMR3.CH[3].CNTR : 0;
   const uint32_t epoch_capture_end_raw = ARM_DWT_CYCCNT;
 
   const uint16_t ch3_now = hardware_low16;
@@ -7449,7 +7096,6 @@ bool interrupt_start(interrupt_subscriber_kind_t kind) {
   if (!rt || !rt->desc) return false;
   rt->start_count++;
   cadence_regression_reset_kind(kind);
-  rolling_lr_reset_kind(kind);
 
   if (kind == interrupt_subscriber_kind_t::VCLOCK) {
     rt->active = true;
@@ -7498,7 +7144,6 @@ bool interrupt_stop(interrupt_subscriber_kind_t kind) {
   rt->active = false;
   rt->stop_count++;
   cadence_regression_reset_kind(kind);
-  rolling_lr_reset_kind(kind);
 
   if (kind == interrupt_subscriber_kind_t::VCLOCK) {
     g_vclock_lane.active = false;
@@ -7526,7 +7171,6 @@ void interrupt_request_pps_rebootstrap(void) {
   g_vclock_epoch_latch = vclock_epoch_latch_t{};
   vclock_ch2_one_second_disable();
   cadence_regression_reset_kind(interrupt_subscriber_kind_t::VCLOCK);
-  rolling_lr_reset_kind(interrupt_subscriber_kind_t::VCLOCK);
   vclock_fact_ring_reset();
   vclock_lane_ema_reset(g_vclock_lane);
   // Rebootstrap selects a fresh PPS_VCLOCK edge identity.
@@ -7551,7 +7195,7 @@ void interrupt_prespin_service(timepop_ctx_t*, timepop_diag_t*, void*) {}
 // Hardware + runtime init
 // ============================================================================
 
-static FLASHMEM void qtimer1_init_vclock_base(void) {
+static void qtimer1_init_vclock_base(void) {
   CCM_CCGR6 |= CCM_CCGR6_QTIMER1(CCM_CCGR_ON);
 
   *(portConfigRegister(10)) = 1;
@@ -7587,7 +7231,7 @@ static FLASHMEM void qtimer1_init_vclock_base(void) {
   (void)IMXRT_TMR1.CH[0].CNTR;
 }
 
-static FLASHMEM void qtimer1_init_ch2_scheduler(void) {
+static void qtimer1_init_ch2_scheduler(void) {
   IMXRT_TMR1.CH[2].CTRL   = 0;
   IMXRT_TMR1.CH[2].CNTR   = 0;
   IMXRT_TMR1.CH[2].LOAD   = 0;
@@ -7598,87 +7242,55 @@ static FLASHMEM void qtimer1_init_ch2_scheduler(void) {
   IMXRT_TMR1.CH[2].CTRL   = TMR_CTRL_CM(1) | TMR_CTRL_PCS(0);
 }
 
-static FLASHMEM void ocxo_lane_bind_qtimer_backend(ocxo_lane_t& lane,
-                                          const char* name,
-                                          IMXRT_TMR_t* module,
-                                          uint8_t channel,
-                                          uint8_t pcs,
-                                          int input_pin) {
-  lane.name = name;
-  lane.backend = ocxo_timer_backend_t::QTIMER16;
-  lane.module = module;
-  lane.channel = channel;
-  lane.pcs = pcs;
-  lane.input_pin = input_pin;
-  lane.initialized = false;
-}
-
-static FLASHMEM void ocxo_lane_init_qtimer_backend(ocxo_lane_t& lane) {
-  lane.initialized = false;
-  if (!ocxo_lane_backend_is_qtimer(lane)) return;
-
-  if (lane.module == &IMXRT_TMR2 && lane.channel == 0) {
-    CCM_CCGR6 |= CCM_CCGR6_QTIMER2(CCM_CCGR_ON);
-    *(portConfigRegister(lane.input_pin)) = 1;
-    IOMUXC_QTIMER2_TIMER0_SELECT_INPUT = 1;
-
-    IMXRT_TMR2.CH[0].CTRL = 0; IMXRT_TMR2.CH[0].SCTRL = 0;
-    IMXRT_TMR2.CH[0].CSCTRL = 0; IMXRT_TMR2.CH[0].LOAD = 0;
-    IMXRT_TMR2.CH[0].CNTR = 0; IMXRT_TMR2.CH[0].COMP1 = 0xFFFF;
-    IMXRT_TMR2.CH[0].CMPLD1 = 0xFFFF; IMXRT_TMR2.CH[0].CMPLD2 = 0;
-    IMXRT_TMR2.CH[0].CTRL = TMR_CTRL_CM(1) | TMR_CTRL_PCS(lane.pcs);
-    qtimer2_ch0_disable_compare();
-    IMXRT_TMR2.ENBL |= 0x0001;
-    lane.initialized = true;
-    return;
-  }
-
-  if (lane.module == &IMXRT_TMR3 && lane.channel == 3) {
-    CCM_CCGR6 |= CCM_CCGR6_QTIMER3(CCM_CCGR_ON);
-    *(portConfigRegister(lane.input_pin)) = 1;
-    IOMUXC_QTIMER3_TIMER3_SELECT_INPUT = 1;
-
-    IMXRT_TMR3.CH[3].CTRL = 0; IMXRT_TMR3.CH[3].SCTRL = 0;
-    IMXRT_TMR3.CH[3].CSCTRL = 0; IMXRT_TMR3.CH[3].LOAD = 0;
-    IMXRT_TMR3.CH[3].CNTR = 0; IMXRT_TMR3.CH[3].COMP1 = 0xFFFF;
-    IMXRT_TMR3.CH[3].CMPLD1 = 0xFFFF;
-    IMXRT_TMR3.CH[3].CTRL = TMR_CTRL_CM(1) | TMR_CTRL_PCS(lane.pcs);
-    qtimer3_disable_compare(3);
-    IMXRT_TMR3.ENBL |= (uint16_t)(1U << 3);
-    lane.initialized = true;
-  }
-}
-
-static FLASHMEM void ocxo_lane_init_hardware(ocxo_lane_t& lane) {
-  switch (lane.backend) {
-    case ocxo_timer_backend_t::QTIMER16:
-      ocxo_lane_init_qtimer_backend(lane);
-      return;
-    case ocxo_timer_backend_t::GPT32:
-    default:
-      // GPT custody is intentionally scaffold-only in Step 1.
-      lane.initialized = false;
-      return;
-  }
-}
-
-void FLASHMEM process_interrupt_init_hardware(void) {
+void process_interrupt_init_hardware(void) {
   if (g_interrupt_hw_ready) return;
 
-  ocxo_lane_bind_qtimer_backend(g_ocxo1_lane, "OCXO1", &IMXRT_TMR2, 0, 0, OCXO1_PIN);
-  ocxo_lane_bind_qtimer_backend(g_ocxo2_lane, "OCXO2", &IMXRT_TMR3, 3, 3, OCXO2_PIN);
+  g_ocxo1_lane.name = "OCXO1";
+  g_ocxo1_lane.module = &IMXRT_TMR2;
+  g_ocxo1_lane.channel = 0;
+  g_ocxo1_lane.pcs = 0;
+  g_ocxo1_lane.input_pin = OCXO1_PIN;
+
+  g_ocxo2_lane.name = "OCXO2";
+  g_ocxo2_lane.module = &IMXRT_TMR3;
+  g_ocxo2_lane.channel = 3;
+  g_ocxo2_lane.pcs = 3;
+  g_ocxo2_lane.input_pin = OCXO2_PIN;
 
   pinMode(GNSS_PPS_RELAY, OUTPUT);
   digitalWriteFast(GNSS_PPS_RELAY, LOW);
   g_pps_relay_pin_initialized = true;
 
   if (!OCXO1_DISABLED) {
-    ocxo_lane_init_hardware(g_ocxo1_lane);
+    CCM_CCGR6 |= CCM_CCGR6_QTIMER2(CCM_CCGR_ON);
+    *(portConfigRegister(OCXO1_PIN)) = 1;
+    IOMUXC_QTIMER2_TIMER0_SELECT_INPUT = 1;
+
+    IMXRT_TMR2.CH[0].CTRL = 0; IMXRT_TMR2.CH[0].SCTRL = 0;
+    IMXRT_TMR2.CH[0].CSCTRL = 0; IMXRT_TMR2.CH[0].LOAD = 0;
+    IMXRT_TMR2.CH[0].CNTR = 0; IMXRT_TMR2.CH[0].COMP1 = 0xFFFF;
+    IMXRT_TMR2.CH[0].CMPLD1 = 0xFFFF; IMXRT_TMR2.CH[0].CMPLD2 = 0;
+    IMXRT_TMR2.CH[0].CTRL = TMR_CTRL_CM(1) | TMR_CTRL_PCS(g_ocxo1_lane.pcs);
+    qtimer2_ch0_disable_compare();
+    IMXRT_TMR2.ENBL |= 0x0001;
   }
 
   if (!OCXO2_DISABLED) {
-    ocxo_lane_init_hardware(g_ocxo2_lane);
+    CCM_CCGR6 |= CCM_CCGR6_QTIMER3(CCM_CCGR_ON);
+    *(portConfigRegister(OCXO2_PIN)) = 1;
+    IOMUXC_QTIMER3_TIMER3_SELECT_INPUT = 1;
+
+    IMXRT_TMR3.CH[3].CTRL = 0; IMXRT_TMR3.CH[3].SCTRL = 0;
+    IMXRT_TMR3.CH[3].CSCTRL = 0; IMXRT_TMR3.CH[3].LOAD = 0;
+    IMXRT_TMR3.CH[3].CNTR = 0; IMXRT_TMR3.CH[3].COMP1 = 0xFFFF;
+    IMXRT_TMR3.CH[3].CMPLD1 = 0xFFFF;
+    IMXRT_TMR3.CH[3].CTRL = TMR_CTRL_CM(1) | TMR_CTRL_PCS(g_ocxo2_lane.pcs);
+    qtimer3_disable_compare(3);
+    IMXRT_TMR3.ENBL |= (uint16_t)(1U << 3);
   }
+
+  g_ocxo1_lane.initialized = !OCXO1_DISABLED;
+  g_ocxo2_lane.initialized = !OCXO2_DISABLED;
 
   // QTimer1 synchronized channel start: ENBL=0 first, configure CH0/CH1/CH2
   // fully, then a single ENBL write starts the active VCLOCK-domain channels
@@ -7698,7 +7310,7 @@ void FLASHMEM process_interrupt_init_hardware(void) {
   g_interrupt_hw_ready = true;
 }
 
-static FLASHMEM void runtime_init_subscribers(void) {
+static void runtime_init_subscribers(void) {
   g_subscriber_count = 0;
   g_rt_vclock = nullptr;
   g_rt_ocxo1 = nullptr;
@@ -7716,7 +7328,7 @@ static FLASHMEM void runtime_init_subscribers(void) {
   }
 }
 
-static FLASHMEM void runtime_reset_pps_state(void) {
+static void runtime_reset_pps_state(void) {
   g_pps_gpio_heartbeat = pps_gpio_heartbeat_t{};
   g_gpio_irq_count = 0;
   g_gpio_miss_count = 0;
@@ -7742,7 +7354,7 @@ static FLASHMEM void runtime_reset_pps_state(void) {
   g_pps_rebootstrap_count = 0;
 }
 
-static FLASHMEM void runtime_reset_snapshot_and_bridge_state(void) {
+static void runtime_reset_snapshot_and_bridge_state(void) {
   g_store = snapshot_store_t{};
   g_epoch_capture_store = epoch_capture_store_t{};
   pvc_anchor_ring_reset();
@@ -7753,20 +7365,20 @@ static FLASHMEM void runtime_reset_snapshot_and_bridge_state(void) {
   g_pps_entry_latency_handler = nullptr;
 }
 
-static FLASHMEM void runtime_reset_smartzero_state(void) {
+static void runtime_reset_smartzero_state(void) {
   g_smartzero = smartzero_runtime_t{};
   for (uint32_t i = 0; i < SMARTZERO_LANE_COUNT; i++) {
     smartzero_reset_lane(i);
   }
 }
 
-static FLASHMEM void runtime_reset_clock32_state(void) {
+static void runtime_reset_clock32_state(void) {
   g_vclock_clock32 = vclock_synthetic_clock32_t{};
   g_ocxo1_clock32 = synthetic_clock32_t{};
   g_ocxo2_clock32 = synthetic_clock32_t{};
 }
 
-static FLASHMEM void runtime_bootstrap_synthetic_clocks_if_ready(void) {
+static void runtime_bootstrap_synthetic_clocks_if_ready(void) {
   // Defensive birth anchors.  These are not logical ZERO operations; they
   // simply make process_interrupt's synthetic coordinate extenders safe before
   // CLOCKS has installed a user/campaign epoch.
@@ -7774,16 +7386,16 @@ static FLASHMEM void runtime_bootstrap_synthetic_clocks_if_ready(void) {
 
   vclock_clock_bootstrap_from_hw16(qtimer1_ch0_counter_now());
   if (!OCXO1_DISABLED && g_ocxo1_lane.initialized) {
-    synthetic_clock_bootstrap_from_hw16(g_ocxo1_clock32, ocxo_lane_counter_now(g_ocxo1_lane));
+    synthetic_clock_bootstrap_from_hw16(g_ocxo1_clock32, IMXRT_TMR2.CH[0].CNTR);
     g_ocxo1_lane.logical_count32_at_last_second = g_ocxo1_clock32.current_counter32;
   }
   if (!OCXO2_DISABLED && g_ocxo2_lane.initialized) {
-    synthetic_clock_bootstrap_from_hw16(g_ocxo2_clock32, ocxo_lane_counter_now(g_ocxo2_lane));
+    synthetic_clock_bootstrap_from_hw16(g_ocxo2_clock32, IMXRT_TMR3.CH[3].CNTR);
     g_ocxo2_lane.logical_count32_at_last_second = g_ocxo2_clock32.current_counter32;
   }
 }
 
-static FLASHMEM void runtime_reset_qtimer_host_state(void) {
+static void runtime_reset_qtimer_host_state(void) {
   g_qtimer1_ch1_sequence = 0;
   g_qtimer1_ch1_target_counter32 = 0;
   g_qtimer1_ch1_next_compare_counter32 = 0;
@@ -7798,7 +7410,7 @@ static FLASHMEM void runtime_reset_qtimer_host_state(void) {
   g_ocxo2_qtimer_diag = ocxo_qtimer_diag_t{};
 }
 
-static FLASHMEM void runtime_reset_vclock_heartbeat_state(void) {
+static void runtime_reset_vclock_heartbeat_state(void) {
   vclock_lane_ema_reset(g_vclock_lane);
   g_vclock_heartbeat_armed = false;
   g_vclock_heartbeat_arm_count = 0;
@@ -7813,15 +7425,6 @@ static FLASHMEM void runtime_reset_vclock_heartbeat_state(void) {
   g_vclock_heartbeat_last_vclock_counter32 = 0;
   g_vclock_heartbeat_last_ocxo1_counter32_retired = 0;
   g_vclock_heartbeat_last_ocxo2_counter32_retired = 0;
-
-  g_vclock_lr_diag_timepop_armed = false;
-  g_vclock_lr_diag_timepop_arm_count = 0;
-  g_vclock_lr_diag_timepop_arm_failures = 0;
-  g_vclock_lr_diag_timepop_fire_count = 0;
-  g_vclock_lr_diag_timepop_inactive_skip_count = 0;
-  g_vclock_lr_diag_timepop_sample_feed_count = 0;
-  g_vclock_lr_diag_timepop_last_counter32 = 0;
-  g_vclock_lr_diag_timepop_last_dwt = 0;
 
   g_ch2_implicit_rollover_count = 0;
   g_ch2_implicit_rollover_vclock_updates = 0;
@@ -7915,12 +7518,12 @@ static FLASHMEM void runtime_reset_vclock_heartbeat_state(void) {
 
 }
 
-static FLASHMEM void runtime_reset_ocxo_fact_rings(void) {
+static void runtime_reset_ocxo_fact_rings(void) {
   if (!OCXO1_DISABLED) ocxo_fact_ring_reset(g_ocxo1_ctx);
   if (!OCXO2_DISABLED) ocxo_fact_ring_reset(g_ocxo2_ctx);
 }
 
-static FLASHMEM void runtime_reset_for_init(void) {
+static void runtime_reset_for_init(void) {
   runtime_init_subscribers();
   runtime_reset_pps_state();
   runtime_reset_snapshot_and_bridge_state();
@@ -7933,21 +7536,18 @@ static FLASHMEM void runtime_reset_for_init(void) {
   vclock_fact_ring_reset();
   runtime_reset_ocxo_fact_rings();
   cadence_regression_reset_all();
-  statistical_dwt_reset_all();
-  rolling_lr_reset_all();
 }
 
-void FLASHMEM process_interrupt_init(void) {
+void process_interrupt_init(void) {
   if (g_interrupt_runtime_ready) return;
 
   runtime_reset_for_init();
 
   g_interrupt_runtime_ready = true;
   (void)vclock_heartbeat_arm_timepop();
-  (void)vclock_lr_diag_arm_timepop();
 }
 
-void FLASHMEM process_interrupt_enable_irqs(void) {
+void process_interrupt_enable_irqs(void) {
   if (g_interrupt_irqs_enabled) return;
 
   attachInterruptVector(IRQ_QTIMER1, qtimer1_isr);
@@ -8037,7 +7637,7 @@ struct payload_prefix_t {
   }
 };
 
-static FLASHMEM void spincatch_plan_from_target(spincatch_lane_report_t& s,
+static void spincatch_plan_from_target(spincatch_lane_report_t& s,
                                        bool target_valid,
                                        uint32_t target_counter32,
                                        uint16_t target_low16,
@@ -8068,7 +7668,7 @@ static FLASHMEM void spincatch_plan_from_target(spincatch_lane_report_t& s,
   s.planner_count++;
 }
 
-static FLASHMEM void spincatch_update_planner_for_report(interrupt_subscriber_kind_t kind) {
+static void spincatch_update_planner_for_report(interrupt_subscriber_kind_t kind) {
   spincatch_lane_report_t* s = spincatch_report_for_kind(kind);
   if (!s || !SPINCATCH_PLANNER_ENABLED) return;
 
@@ -8104,7 +7704,7 @@ static FLASHMEM void spincatch_update_planner_for_report(interrupt_subscriber_ki
                              ctx->clock32->current_counter32);
 }
 
-static FLASHMEM void add_spincatch_report_payload(Payload& p,
+static void add_spincatch_report_payload(Payload& p,
                                          interrupt_subscriber_kind_t kind) {
   spincatch_update_planner_for_report(kind);
   spincatch_lane_report_t* s_mut = spincatch_report_for_kind(kind);
@@ -8173,7 +7773,7 @@ static FLASHMEM void add_spincatch_report_payload(Payload& p,
   p.add("spincatch_landing_fire_dwt", s ? s->landing_fire_dwt : 0U);
 }
 
-static FLASHMEM void add_isr_sanity_payload(Payload& p,
+static void add_isr_sanity_payload(Payload& p,
                                    const char* prefix,
                                    const isr_sanity_diag_t& s) {
   payload_prefix_t out(p, prefix);
@@ -8189,7 +7789,7 @@ static FLASHMEM void add_isr_sanity_payload(Payload& p,
   out.add_u32("dwt_actual", s.dwt_actual);
 }
 
-static FLASHMEM void add_bridge_stats_payload(Payload& p,
+static void add_bridge_stats_payload(Payload& p,
                                      const char* prefix,
                                      const bridge_anchor_stats_t& s) {
   payload_prefix_t out(p, prefix);
@@ -8205,154 +7805,23 @@ static FLASHMEM void add_bridge_stats_payload(Payload& p,
   out.add_u32("anchor_last_failure_mask", s.last_anchor_failure_mask);
 }
 
-static FLASHMEM void add_rolling_lr_payload(Payload& p,
-                                   const char* prefix,
-                                   const rolling_lr_dwt_lane_t& r) {
-  payload_prefix_t out(p, prefix);
-  const rolling_lr_result_t& last = r.last_result;
-
-  out.add_bool("rolling_lr_enabled", r.enabled);
-  out.add_bool("rolling_lr_authority_enabled", r.authority_enabled);
-  out.add_bool("rolling_lr_report_only", r.report_only);
-  out.add_bool("rolling_lr_sample_feed_enabled", r.sample_feed_enabled);
-  out.add_bool("rolling_lr_vclock_shadow_feed_enabled",
-               ROLLING_LR_VCLOCK_SHADOW_FEED_ENABLED);
-  out.add_bool("rolling_lr_ocxo_shadow_feed_enabled",
-               ROLLING_LR_OCXO_SHADOW_FEED_ENABLED);
-  out.add_bool("rolling_lr_timepop_client_enabled",
-               ROLLING_LR_VCLOCK_SHADOW_FEED_ENABLED);
-  out.add_str("rolling_lr_timepop_client_name", VCLOCK_LR_DIAG_NAME);
-  out.add_u64("rolling_lr_timepop_client_period_ns", VCLOCK_LR_DIAG_PERIOD_NS);
-  out.add_bool("rolling_lr_timepop_client_armed", g_vclock_lr_diag_timepop_armed);
-  out.add_u32("rolling_lr_timepop_client_arm_count", g_vclock_lr_diag_timepop_arm_count);
-  out.add_u32("rolling_lr_timepop_client_arm_failures", g_vclock_lr_diag_timepop_arm_failures);
-  out.add_u32("rolling_lr_timepop_client_fire_count", g_vclock_lr_diag_timepop_fire_count);
-  out.add_u32("rolling_lr_timepop_client_inactive_skip_count",
-              g_vclock_lr_diag_timepop_inactive_skip_count);
-  out.add_u32("rolling_lr_timepop_client_sample_feed_count",
-              g_vclock_lr_diag_timepop_sample_feed_count);
-  out.add_u32("rolling_lr_timepop_client_last_counter32",
-              g_vclock_lr_diag_timepop_last_counter32);
-  out.add_u32("rolling_lr_timepop_client_last_dwt",
-              g_vclock_lr_diag_timepop_last_dwt);
-  out.add_u32("rolling_lr_sample_rate_hz", r.sample_rate_hz);
-  out.add_u32("rolling_lr_counter_delta_ticks", r.counter_delta_ticks);
-  out.add_u32("rolling_lr_window_seconds", r.window_seconds);
-  out.add_u32("rolling_lr_max_window_seconds", ROLLING_LR_MAX_WINDOW_SECONDS);
-  out.add_u32("rolling_lr_window_capacity_samples", r.window_capacity_samples);
-  out.add_u32("rolling_lr_min_valid_samples", r.min_valid_samples);
-  out.add_u32("rolling_lr_fit_error_threshold_cycles",
-              ROLLING_LR_FIT_ERROR_THRESHOLD_CYCLES);
-  out.add_u32("rolling_lr_fit_error_loose_threshold_cycles",
-              ROLLING_LR_FIT_ERROR_LOOSE_THRESHOLD_CYCLES);
-  out.add_str("rolling_lr_memory_model", "TIMEPOP_10HZ_1S_TICK_RESIDUAL_SUMS_NO_RAW_RING");
-
-  out.add_u32("rolling_lr_reset_count", r.reset_count);
-  out.add_u32("rolling_lr_sample_total_count", r.sample_total_count);
-  out.add_u32("rolling_lr_finalize_count", r.finalize_count);
-  out.add_u32("rolling_lr_insufficient_count", r.insufficient_count);
-  out.add_u32("rolling_lr_counter_discontinuity_count",
-              r.counter_discontinuity_count);
-  out.add_u32("rolling_lr_dwt_wrap_count", r.dwt_wrap_count);
-  out.add_u32("rolling_lr_dropped_segment_count", r.dropped_segment_count);
-  out.add_u32("rolling_lr_no_fit_count", r.no_fit_count);
-
-  out.add_bool("rolling_lr_window_active", r.window_active);
-  out.add_u32("rolling_lr_window_sequence", r.window_sequence);
-  out.add_u32("rolling_lr_segment_sequence", r.segment_sequence);
-  out.add_u32("rolling_lr_segment_count", r.segment_count);
-  out.add_u32("rolling_lr_active_segment_index", r.active_segment_index);
-  out.add_u32("rolling_lr_active_segment_sample_count",
-              r.active_segment_sample_count);
-  out.add_u32("rolling_lr_window_sample_count", r.window_sample_count);
-  out.add_u32("rolling_lr_window_base_counter32", r.window_base_counter32);
-  out.add_u32("rolling_lr_window_base_dwt32", r.window_base_dwt32);
-  out.add_u64("rolling_lr_window_base_dwt64", r.window_base_dwt64);
-  out.add_u32("rolling_lr_last_sample_counter32", r.last_sample_counter32);
-  out.add_u32("rolling_lr_last_sample_dwt32", r.last_sample_dwt32);
-  out.add_u64("rolling_lr_last_sample_dwt64", r.last_sample_dwt64);
-
-  out.add_u64("rolling_lr_sum_x", r.rolling_sum_x);
-  out.add_i64("rolling_lr_sum_y", r.rolling_sum_y);
-  out.add_u64("rolling_lr_sum_xx", r.rolling_sum_xx);
-  out.add_i64("rolling_lr_sum_xy", r.rolling_sum_xy);
-  out.add_u64("rolling_lr_sum_yy", r.rolling_sum_yy);
-  out.add_bool("rolling_lr_previous_slope_valid", r.previous_slope_valid);
-  out.add_u64("rolling_lr_previous_slope_q16_cycles_per_sample",
-              r.previous_slope_q16_cycles_per_sample);
-
-  out.add_bool("rolling_lr_last_valid", last.valid);
-  out.add_bool("rolling_lr_last_confidence_ok", last.confidence_ok);
-  out.add_bool("rolling_lr_last_fallback_would_apply",
-               last.fallback_would_apply);
-  out.add_u32("rolling_lr_last_sequence", last.sequence);
-  out.add_u32("rolling_lr_last_window_seconds", last.window_seconds);
-  out.add_u32("rolling_lr_last_sample_count", last.sample_count);
-  out.add_u32("rolling_lr_last_segment_count", last.segment_count);
-  out.add_u32("rolling_lr_last_target_counter32",
-              last.target_counter32_at_event);
-  out.add_u32("rolling_lr_last_observed_dwt", last.observed_dwt_at_event);
-  out.add_u32("rolling_lr_last_authority_dwt", last.authority_dwt_at_event);
-  out.add_u32("rolling_lr_last_ema_dwt", last.authority_dwt_at_event);
-  out.add_u32("rolling_lr_last_inferred_dwt", last.inferred_dwt_at_event);
-  out.add_u32("rolling_lr_last_nominal_dwt", last.nominal_dwt_at_event);
-  out.add_u32("rolling_lr_last_base_counter32", last.base_counter32);
-  out.add_u32("rolling_lr_last_base_dwt32", last.base_dwt32);
-  out.add_u32("rolling_lr_last_target_ticks_from_base",
-              last.target_ticks_from_base);
-  out.add_bool("rolling_lr_last_pps_dwt_valid", last.pps_dwt_valid);
-  out.add_u32("rolling_lr_last_pps_dwt", last.pps_dwt_at_event);
-  out.add_i32("rolling_lr_last_observed_minus_authority_cycles",
-              last.observed_minus_authority_cycles);
-  out.add_i32("rolling_lr_last_inferred_minus_observed_cycles",
-              last.inferred_minus_observed_cycles);
-  out.add_i32("rolling_lr_last_inferred_minus_authority_cycles",
-              last.inferred_minus_authority_cycles);
-  out.add_i32("rolling_lr_last_inferred_minus_nominal_cycles",
-              last.inferred_minus_nominal_cycles);
-  out.add_i32("rolling_lr_last_observed_minus_pps_cycles",
-              last.observed_minus_pps_cycles);
-  out.add_i32("rolling_lr_last_authority_minus_pps_cycles",
-              last.authority_minus_pps_cycles);
-  out.add_i32("rolling_lr_last_inferred_minus_pps_cycles",
-              last.inferred_minus_pps_cycles);
-  out.add_u64("rolling_lr_last_slope_q16_cycles_per_sample",
-              last.slope_q16_cycles_per_sample);
-  out.add_i64("rolling_lr_last_slope_delta_q16_cycles_per_sample",
-              last.slope_delta_q16_cycles_per_sample);
-  out.add_i32("rolling_lr_last_intercept_q16_cycles",
-              last.intercept_q16_cycles);
-  out.add_i32("rolling_lr_last_fit_error_mean_q16_cycles",
-              last.fit_error_mean_q16_cycles);
-  out.add_u32("rolling_lr_last_fit_error_stddev_q16_cycles",
-              last.fit_error_stddev_q16_cycles);
-  out.add_i32("rolling_lr_last_fit_error_min_cycles",
-              last.fit_error_min_cycles);
-  out.add_i32("rolling_lr_last_fit_error_max_cycles",
-              last.fit_error_max_cycles);
-  out.add_u32("rolling_lr_last_fit_error_abs_gt4_count",
-              last.fit_error_abs_gt4_count);
-  out.add_u32("rolling_lr_last_fit_error_abs_gt10_count",
-              last.fit_error_abs_gt10_count);
-}
-
-static FLASHMEM void add_regression_payload(Payload& p,
+static void add_regression_payload(Payload& p,
                                    const char* prefix,
                                    const cadence_regression_lane_t& r) {
   payload_prefix_t out(p, prefix);
   const cadence_regression_result_t& last = r.last_result;
 
-  out.add_bool("regression_enabled", false);
-  out.add_bool("regression_retired", LEGACY_CADENCE_REGRESSION_RETIRED);
-  out.add_u32("regression_reclaimed_sample_slots",
-              LEGACY_CADENCE_REGRESSION_RECLAIMED_SAMPLE_SLOTS);
-  out.add_u32("regression_reclaimed_sample_bytes",
-              LEGACY_CADENCE_REGRESSION_RECLAIMED_SAMPLE_BYTES);
-  out.add_u32("regression_sample_total_count", 0U);
-  out.add_u32("regression_window_sample_count", 0U);
+  out.add_bool("regression_enabled",
+               r.kind == interrupt_subscriber_kind_t::VCLOCK
+                   ? VCLOCK_LINEAR_REGRESSION_ENABLED
+                   : OCXO_LINEAR_REGRESSION_ENABLED);
+  out.add_u32("regression_samples_per_second", REGRESSION_SAMPLES_PER_SECOND);
+  out.add_u32("regression_sample_total_count", r.sample_total_count);
+  out.add_u32("regression_window_sample_count", r.sample_count);
   out.add_u32("regression_reset_count", r.reset_count);
-  out.add_u32("regression_insufficient_count", 0U);
-  out.add_u32("regression_counter_discontinuity_count", 0U);
+  out.add_u32("regression_insufficient_count", r.insufficient_count);
+  out.add_u32("regression_counter_discontinuity_count",
+              r.counter_discontinuity_count);
 
   out.add_bool("regression_last_valid", last.valid);
   out.add_u32("regression_last_sequence", last.sequence);
@@ -8385,73 +7854,186 @@ static FLASHMEM void add_regression_payload(Payload& p,
               last.fit_error_lt_minus4_count);
   out.add_u32("regression_last_fit_error_abs_gt4_count",
               last.fit_error_abs_gt4_count);
-
-  const rolling_lr_dwt_lane_t* rolling = rolling_lr_for_const(r.kind);
-  if (rolling) add_rolling_lr_payload(p, prefix, *rolling);
 }
 
-static FLASHMEM void add_statistical_dwt_payload(Payload& p,
-                                        const char* prefix,
-                                        const statistical_dwt_lane_t& s) {
-  payload_prefix_t out(p, prefix);
-
-  out.add_bool("statistical_enabled", s.enabled);
-  out.add_bool("statistical_authority_enabled", s.authority_enabled);
-  out.add_bool("statistical_report_only", s.report_only);
-  out.add_bool("statistical_sample_feed_enabled", s.sample_feed_enabled);
-  out.add_bool("statistical_vclock_shadow_feed_enabled",
-               STATISTICAL_VCLOCK_SHADOW_FEED_ENABLED);
-  out.add_bool("statistical_ocxo_1khz_cadence_enabled",
-               STATISTICAL_OCXO_1KHZ_CADENCE_ENABLED);
-  out.add_u32("statistical_sample_rate_hz", STATISTICAL_SAMPLE_RATE_HZ);
-  out.add_u32("statistical_counter_delta_ticks", STATISTICAL_COUNTER_DELTA_TICKS);
-  out.add_i32("statistical_accept_neg_cycles", STATISTICAL_ACCEPT_NEG_CYCLES);
-  out.add_i32("statistical_accept_zero_cycles", STATISTICAL_ACCEPT_ZERO_CYCLES);
-  out.add_i32("statistical_accept_pos_cycles", STATISTICAL_ACCEPT_POS_CYCLES);
-  out.add_u32("statistical_accept_tolerance_cycles",
-              STATISTICAL_ACCEPT_TOLERANCE_CYCLES);
-  out.add_u32("statistical_min_valid_samples", STATISTICAL_MIN_VALID_SAMPLES);
-  out.add_u32("statistical_max_rejected_samples", STATISTICAL_MAX_REJECTED_SAMPLES);
-
-  out.add_u32("statistical_reset_count", s.reset_count);
-  out.add_u32("statistical_window_sequence", s.window_sequence);
-  out.add_u32("statistical_sample_total_count", s.sample_total_count);
-  out.add_u32("statistical_finalize_count", s.finalize_count);
-  out.add_bool("statistical_window_active", s.window_active);
-  out.add_u32("statistical_window_sample_count", s.window_sample_count);
-  out.add_u32("statistical_window_accepted_count", s.window_accepted_count);
-  out.add_u32("statistical_window_rejected_count", s.window_rejected_count);
-  out.add_u32("statistical_window_neg4_count", s.window_neg4_count);
-  out.add_u32("statistical_window_zero_count", s.window_zero_count);
-  out.add_u32("statistical_window_pos4_count", s.window_pos4_count);
-  out.add_u32("statistical_window_other_count", s.window_other_count);
-  out.add_u32("statistical_window_base_dwt", s.window_base_dwt);
-  out.add_u32("statistical_window_base_counter32", s.window_base_counter32);
-  out.add_u32("statistical_window_prediction_cycles", s.window_prediction_cycles);
-
-  out.add_bool("statistical_last_valid", s.last_valid);
-  out.add_bool("statistical_last_confidence_ok", s.last_confidence_ok);
-  out.add_bool("statistical_last_fallback_would_apply", s.last_fallback_would_apply);
-  out.add_u32("statistical_last_sequence", s.last_sequence);
-  out.add_u32("statistical_last_total_samples", s.last_total_samples);
-  out.add_u32("statistical_last_accepted_samples", s.last_accepted_samples);
-  out.add_u32("statistical_last_rejected_samples", s.last_rejected_samples);
-  out.add_u32("statistical_last_neg4_count", s.last_neg4_count);
-  out.add_u32("statistical_last_zero_count", s.last_zero_count);
-  out.add_u32("statistical_last_pos4_count", s.last_pos4_count);
-  out.add_u32("statistical_last_other_count", s.last_other_count);
-  out.add_i32("statistical_last_adjustment_cycles", s.last_adjustment_cycles);
-  out.add_u32("statistical_last_base_dwt", s.last_base_dwt);
-  out.add_u32("statistical_last_prediction_cycles", s.last_prediction_cycles);
-  out.add_u32("statistical_last_predicted_dwt_at_edge", s.last_predicted_dwt_at_edge);
-  out.add_u32("statistical_last_candidate_dwt_at_edge", s.last_candidate_dwt_at_edge);
-  out.add_u32("statistical_last_observed_dwt_at_edge", s.last_observed_dwt_at_edge);
-  out.add_u32("statistical_last_counter32_at_edge", s.last_counter32_at_edge);
-  out.add_u32("statistical_last_reject_pct_milli", s.last_reject_pct_milli);
-  out.add_u32("statistical_last_confidence_milli", s.last_confidence_milli);
+static uint32_t regression_abs_i32(int32_t value) {
+  return (uint32_t)(value < 0 ? -(int64_t)value : (int64_t)value);
 }
 
-static FLASHMEM void add_priority_payload(Payload& p) {
+static interrupt_subscriber_kind_t regression_kind_from_lane_arg(const char* lane) {
+  if (!lane || !*lane) return interrupt_subscriber_kind_t::NONE;
+  if (!strcasecmp(lane, "VCLOCK") || !strcasecmp(lane, "VCLK")) {
+    return interrupt_subscriber_kind_t::VCLOCK;
+  }
+  if (!strcasecmp(lane, "OCXO1") || !strcasecmp(lane, "O1")) {
+    return interrupt_subscriber_kind_t::OCXO1;
+  }
+  if (!strcasecmp(lane, "OCXO2") || !strcasecmp(lane, "O2")) {
+    return interrupt_subscriber_kind_t::OCXO2;
+  }
+  return interrupt_subscriber_kind_t::NONE;
+}
+
+static bool regression_live_fit_params(const cadence_regression_lane_t& r,
+                                       double& slope,
+                                       double& intercept) {
+  const uint32_t n = r.sample_count;
+  if (n < REGRESSION_MIN_SAMPLE_COUNT || n > REGRESSION_SAMPLES_PER_SECOND) {
+    slope = 0.0;
+    intercept = 0.0;
+    return false;
+  }
+
+  double sum_x = 0.0;
+  double sum_y = 0.0;
+  double sum_xx = 0.0;
+  double sum_xy = 0.0;
+
+  for (uint32_t i = 0; i < n; i++) {
+    const double x = (double)i;
+    const double y = (double)r.observed_dwt_rel[i];
+    sum_x += x;
+    sum_y += y;
+    sum_xx += x * x;
+    sum_xy += x * y;
+  }
+
+  const double denom = (double)n * sum_xx - sum_x * sum_x;
+  if (denom == 0.0) {
+    slope = 0.0;
+    intercept = 0.0;
+    return false;
+  }
+
+  slope = ((double)n * sum_xy - sum_x * sum_y) / denom;
+  intercept = (sum_y - slope * sum_x) / (double)n;
+  return true;
+}
+
+static int32_t regression_live_fit_error_cycles(const cadence_regression_lane_t& r,
+                                                uint32_t index,
+                                                double slope,
+                                                double intercept) {
+  if (index >= r.sample_count || index >= REGRESSION_SAMPLES_PER_SECOND) return 0;
+  const double estimate = intercept + slope * (double)index;
+  const double err_d = estimate - (double)r.observed_dwt_rel[index];
+  return regression_round_i32(err_d);
+}
+
+static void regression_append_csv_u32(char* buf, size_t len,
+                                      uint32_t& used,
+                                      uint32_t value) {
+  if (used >= len) return;
+  const int n = snprintf(buf + used, len - used,
+                         used == 0 ? "%lu" : ",%lu",
+                         (unsigned long)value);
+  if (n > 0) {
+    const uint32_t add = (uint32_t)n;
+    used = (add >= (len - used)) ? (uint32_t)(len - 1U) : (used + add);
+  }
+}
+
+static void regression_append_csv_i32(char* buf, size_t len,
+                                      uint32_t& used,
+                                      int32_t value) {
+  if (used >= len) return;
+  const int n = snprintf(buf + used, len - used,
+                         used == 0 ? "%ld" : ",%ld",
+                         (long)value);
+  if (n > 0) {
+    const uint32_t add = (uint32_t)n;
+    used = (add >= (len - used)) ? (uint32_t)(len - 1U) : (used + add);
+  }
+}
+
+static void add_regression_sample_scalar(Payload& p,
+                                         const cadence_regression_lane_t& r,
+                                         uint32_t index,
+                                         uint32_t ordinal,
+                                         bool fit_valid,
+                                         double slope,
+                                         double intercept) {
+  if (index >= r.sample_count || index >= REGRESSION_SAMPLES_PER_SECOND) return;
+
+  char key[64];
+  const uint32_t target_counter32 =
+      r.base_counter32 + index * REGRESSION_COUNTER_DELTA_TICKS;
+  const int32_t observed_rel = r.observed_dwt_rel[index];
+  const uint32_t observed_dwt = r.base_observed_dwt + (uint32_t)observed_rel;
+  const int32_t fit_error = fit_valid
+      ? regression_live_fit_error_cycles(r, index, slope, intercept)
+      : 0;
+
+  snprintf(key, sizeof(key), "sample_%02lu_i", (unsigned long)ordinal);
+  p.add(key, index);
+  snprintf(key, sizeof(key), "sample_%02lu_target_counter32", (unsigned long)ordinal);
+  p.add(key, target_counter32);
+  snprintf(key, sizeof(key), "sample_%02lu_observed_dwt_rel", (unsigned long)ordinal);
+  p.add(key, observed_rel);
+  snprintf(key, sizeof(key), "sample_%02lu_observed_dwt", (unsigned long)ordinal);
+  p.add(key, observed_dwt);
+  snprintf(key, sizeof(key), "sample_%02lu_fit_valid", (unsigned long)ordinal);
+  p.add(key, fit_valid);
+  snprintf(key, sizeof(key), "sample_%02lu_fit_error_cycles", (unsigned long)ordinal);
+  p.add(key, fit_error);
+  snprintf(key, sizeof(key), "sample_%02lu_abs_fit_error_cycles", (unsigned long)ordinal);
+  p.add(key, fit_valid ? regression_abs_i32(fit_error) : 0U);
+}
+
+static void add_regression_extreme_csv(Payload& p,
+                                       const cadence_regression_lane_t& r,
+                                       bool best,
+                                       bool fit_valid,
+                                       double slope,
+                                       double intercept) {
+  uint32_t chosen[REGRESSION_SAMPLE_REPORT_EXTREME_LIMIT]{};
+  uint32_t scores[REGRESSION_SAMPLE_REPORT_EXTREME_LIMIT]{};
+  uint32_t chosen_count = 0;
+
+  if (fit_valid) {
+    for (uint32_t i = 0; i < r.sample_count && i < REGRESSION_SAMPLES_PER_SECOND; i++) {
+      const int32_t err = regression_live_fit_error_cycles(r, i, slope, intercept);
+      const uint32_t score = regression_abs_i32(err);
+      uint32_t pos = chosen_count;
+      if (best) {
+        while (pos > 0 && score < scores[pos - 1U]) pos--;
+      } else {
+        while (pos > 0 && score > scores[pos - 1U]) pos--;
+      }
+      if (pos >= REGRESSION_SAMPLE_REPORT_EXTREME_LIMIT) continue;
+      if (chosen_count < REGRESSION_SAMPLE_REPORT_EXTREME_LIMIT) chosen_count++;
+      for (uint32_t j = chosen_count - 1U; j > pos; j--) {
+        chosen[j] = chosen[j - 1U];
+        scores[j] = scores[j - 1U];
+      }
+      chosen[pos] = i;
+      scores[pos] = score;
+    }
+  }
+
+  char idx_csv[96] = {};
+  char abs_csv[96] = {};
+  char err_csv[96] = {};
+  uint32_t idx_used = 0, abs_used = 0, err_used = 0;
+  for (uint32_t i = 0; i < chosen_count; i++) {
+    const uint32_t idx = chosen[i];
+    const int32_t err = regression_live_fit_error_cycles(r, idx, slope, intercept);
+    regression_append_csv_u32(idx_csv, sizeof(idx_csv), idx_used, idx);
+    regression_append_csv_u32(abs_csv, sizeof(abs_csv), abs_used, scores[i]);
+    regression_append_csv_i32(err_csv, sizeof(err_csv), err_used, err);
+  }
+
+  p.add(best ? "best_abs_error_count" : "worst_abs_error_count", chosen_count);
+  p.add(best ? "best_abs_error_indices" : "worst_abs_error_indices", idx_csv);
+  p.add(best ? "best_abs_error_abs_cycles" : "worst_abs_error_abs_cycles", abs_csv);
+  p.add(best ? "best_abs_error_cycles" : "worst_abs_error_cycles", err_csv);
+}
+
+// ============================================================================
+// Commands
+// ============================================================================
+
+static void add_priority_payload(Payload& p) {
   p.add("qtimer1_sovereign_priority_expected", INTERRUPT_STEP0_EXPECTED_QTIMER1_PRIORITY);
   p.add("qtimer1_sovereign_priority_applied", g_step0_qtimer1_priority_applied);
   p.add("qtimer1_sovereign_priority_ok",
@@ -8480,7 +8062,7 @@ static FLASHMEM void add_priority_payload(Payload& p) {
   p.add("irq_gpio6789_configured_by_interrupt", g_step0_gpio6789_configured_by_interrupt);
 }
 
-static FLASHMEM void add_runtime_payload(Payload& p) {
+static void add_runtime_payload(Payload& p) {
   p.add("hardware_ready", g_interrupt_hw_ready);
   p.add("runtime_ready",  g_interrupt_runtime_ready);
   p.add("irqs_enabled",   g_interrupt_irqs_enabled);
@@ -8520,33 +8102,13 @@ static FLASHMEM void add_runtime_payload(Payload& p) {
   p.add("vclock_heartbeat_retained", true);
   p.add("vclock_heartbeat_rollover_owner", false);
   p.add("ocxo_native_1khz_cadence_retired", true);
-  p.add("statistical_dwt_estimator_enabled", STATISTICAL_DWT_ESTIMATOR_ENABLED);
-  p.add("statistical_dwt_authority_enabled", STATISTICAL_DWT_AUTHORITY_ENABLED);
-  p.add("statistical_dwt_report_only", STATISTICAL_DWT_REPORT_ONLY);
-  p.add("statistical_vclock_shadow_feed_enabled", STATISTICAL_VCLOCK_SHADOW_FEED_ENABLED);
-  p.add("statistical_ocxo_1khz_cadence_enabled", STATISTICAL_OCXO_1KHZ_CADENCE_ENABLED);
-  p.add("statistical_sample_rate_hz", STATISTICAL_SAMPLE_RATE_HZ);
-  p.add("rolling_lr_dwt_estimator_enabled", ROLLING_LR_DWT_ESTIMATOR_ENABLED);
-  p.add("rolling_lr_dwt_authority_enabled", ROLLING_LR_DWT_AUTHORITY_ENABLED);
-  p.add("rolling_lr_dwt_report_only", ROLLING_LR_DWT_REPORT_ONLY);
-  p.add("rolling_lr_vclock_shadow_feed_enabled", ROLLING_LR_VCLOCK_SHADOW_FEED_ENABLED);
-  p.add("rolling_lr_ocxo_shadow_feed_enabled", ROLLING_LR_OCXO_SHADOW_FEED_ENABLED);
-  p.add("rolling_lr_sample_rate_hz", ROLLING_LR_SAMPLE_RATE_HZ);
-  p.add("rolling_lr_timepop_client_enabled", ROLLING_LR_VCLOCK_SHADOW_FEED_ENABLED);
-  p.add("rolling_lr_timepop_client_name", VCLOCK_LR_DIAG_NAME);
-  p.add("rolling_lr_timepop_client_period_ns", (uint64_t)VCLOCK_LR_DIAG_PERIOD_NS);
-  p.add("rolling_lr_timepop_client_armed", g_vclock_lr_diag_timepop_armed);
-  p.add("rolling_lr_window_seconds", ROLLING_LR_WINDOW_SECONDS);
-  p.add("rolling_lr_window_capacity_samples", ROLLING_LR_WINDOW_CAPACITY_SAMPLES);
-  p.add("rolling_lr_min_valid_samples", ROLLING_LR_MIN_VALID_SAMPLES);
-  p.add("rolling_lr_memory_model", "TIMEPOP_10HZ_1S_TICK_RESIDUAL_SUMS_NO_RAW_RING");
   p.add("ocxo_compare_live_requires_enabled_and_flag", true);
   p.add("lane_report_command", "INTERRUPT.REPORT_LANES");
   p.add("single_lane_report_command", "INTERRUPT.REPORT_LANE lane=VCLOCK|OCXO1|OCXO2");
   p.add("regression_samples_report_command", "disabled");
 }
 
-static FLASHMEM void add_ocxo_cadence_report_payload(Payload& p,
+static void add_ocxo_cadence_report_payload(Payload& p,
                                            const ocxo_runtime_context_t& ctx) {
   const ocxo_lane_t& lane = *ctx.lane;
   payload_prefix_t out(p, ctx.prefix);
@@ -8569,7 +8131,7 @@ static FLASHMEM void add_ocxo_cadence_report_payload(Payload& p,
               ocxo_cadence_reason_name(lane.cadence_last_reason));
 }
 
-static FLASHMEM void add_vclock_heartbeat_payload(Payload& p) {
+static void add_vclock_heartbeat_payload(Payload& p) {
   p.add("vclock_heartbeat_period_ns", (uint64_t)VCLOCK_HEARTBEAT_PERIOD_NS);
   p.add("vclock_heartbeat_armed", g_vclock_heartbeat_armed);
   p.add("vclock_heartbeat_arm_count", g_vclock_heartbeat_arm_count);
@@ -8686,7 +8248,7 @@ static FLASHMEM void add_vclock_heartbeat_payload(Payload& p) {
   add_ocxo_cadence_report_payload(p, g_ocxo1_ctx);
   add_ocxo_cadence_report_payload(p, g_ocxo2_ctx);
 }
-static FLASHMEM void add_pps_payload(Payload& p) {
+static void add_pps_payload(Payload& p) {
   p.add("gpio_irq_count", g_gpio_irq_count);
   p.add("gpio_miss_count", g_gpio_miss_count);
   p.add("gpio_edge_count", g_pps_gpio_heartbeat.edge_count);
@@ -8773,7 +8335,7 @@ static FLASHMEM void add_pps_payload(Payload& p) {
   p.add("pps_edge_dispatch_registered", g_pps_edge_dispatch != nullptr);
 }
 
-static FLASHMEM void add_epoch_capture_payload(Payload& p) {
+static void add_epoch_capture_payload(Payload& p) {
   interrupt_epoch_capture_t epoch_cap{};
   const bool epoch_cap_ok = interrupt_last_epoch_capture(&epoch_cap);
   p.add("epoch_capture_available", epoch_cap_ok);
@@ -8792,7 +8354,7 @@ static FLASHMEM void add_epoch_capture_payload(Payload& p) {
   p.add("epoch_capture_ocxo2_counter32", epoch_cap.ocxo2_counter32);
 }
 
-static FLASHMEM void add_dynamic_cps_payload(Payload& p) {
+static void add_dynamic_cps_payload(Payload& p) {
   const uint32_t dynamic_cps = interrupt_dynamic_cps();
   p.add("dynamic_cps_owner", "CLOCKS_STATIC_PPS");
   p.add("dynamic_cps", dynamic_cps);
@@ -8804,7 +8366,7 @@ static FLASHMEM void add_dynamic_cps_payload(Payload& p) {
 }
 
 
-static FLASHMEM void add_smartzero_lane_payload(Payload& parent,
+static void add_smartzero_lane_payload(Payload& parent,
                                        const char* key,
                                        const interrupt_smartzero_lane_snapshot_t& z) {
   Payload p;
@@ -8841,7 +8403,7 @@ static FLASHMEM void add_smartzero_lane_payload(Payload& parent,
   parent.add_object(key, p);
 }
 
-static FLASHMEM void add_smartzero_payload(Payload& p) {
+static void add_smartzero_payload(Payload& p) {
   interrupt_smartzero_snapshot_t z{};
   (void)interrupt_smartzero_live_snapshot(&z);
 
@@ -8889,7 +8451,7 @@ static FLASHMEM void add_smartzero_payload(Payload& p) {
   p.add_object("smartzero", legacy_lanes);  // legacy live alias
 }
 
-static FLASHMEM void add_vclock_clock32_payload(Payload& p, const char* prefix) {
+static void add_vclock_clock32_payload(Payload& p, const char* prefix) {
   payload_prefix_t out(p, prefix);
 
   out.add_bool("clock32_zeroed", g_vclock_clock32.zeroed);
@@ -8905,7 +8467,7 @@ static FLASHMEM void add_vclock_clock32_payload(Payload& p, const char* prefix) 
   out.add_u32("clock32_minder_update_count", g_vclock_clock32.minder_update_count);
   out.add_u32("clock32_pending_zero_count", g_vclock_clock32.pending_zero_count);
 }
-static FLASHMEM void add_ocxo_clock32_payload(Payload& p,
+static void add_ocxo_clock32_payload(Payload& p,
                                      const char* prefix,
                                      const synthetic_clock32_t& clock32) {
   payload_prefix_t out(p, prefix);
@@ -8918,7 +8480,7 @@ static FLASHMEM void add_ocxo_clock32_payload(Payload& p,
   out.add_u32("clock32_zero_count", clock32.zero_count);
   out.add_u32("clock32_minder_update_count", clock32.minder_update_count);
 }
-static FLASHMEM void add_runtime_lane_summary(Payload& p,
+static void add_runtime_lane_summary(Payload& p,
                                      const char* prefix,
                                      const interrupt_subscriber_runtime_t* rt) {
   payload_prefix_t out(p, prefix);
@@ -8980,20 +8542,156 @@ static FLASHMEM void add_runtime_lane_summary(Payload& p,
     out.add_u32("last_diag_anchor_failure_mask", 0);
   }
 }
-static FLASHMEM void add_ocxo_identity_payload(Payload& p,
+static void add_vclock_lane_payload(Payload& p, bool detailed) {
+  p.add("lane", "VCLOCK");
+  p.add("kind", "VCLOCK");
+  p.add("provider", "QTIMER1");
+  p.add("hardware_lane", "QTIMER1_CH2_COMP");
+  p.add("cadence_source", "QTIMER1_CH2_NATIVE_EPOCH_ONE_SECOND_PLUS_HEARTBEAT_FALLBACK");
+  p.add("counter_source", "QTIMER1_CH0_SYNTHETIC_COUNTER32");
+  p.add("event_source", "QTIMER1_CH2_INTRINSIC_EPOCH_AND_ONE_SECOND");
+  p.add("dwt_authority", "QTIMER1_CH2_EMA_PREDICTED_DWT");
+  add_spincatch_report_payload(p, interrupt_subscriber_kind_t::VCLOCK);
+
+  add_runtime_lane_summary(p, "vclock", g_rt_vclock);
+  p.add("vclock_irq_count", g_vclock_lane.irq_count);
+  p.add("vclock_miss_count", g_vclock_lane.miss_count);
+  p.add("vclock_bootstrap_count", g_vclock_lane.bootstrap_count);
+  p.add("vclock_cadence_hits_total", g_vclock_lane.cadence_hits_total);
+  p.add("vclock_compare_target", (uint32_t)g_vclock_lane.compare_target);
+  p.add("vclock_tick_mod_1000", g_vclock_lane.tick_mod_1000);
+  p.add("vclock_logical_count32", g_vclock_lane.logical_count32_at_last_second);
+  p.add("vclock_ema_dwt_authority_enabled", VCLOCK_EMA_DWT_AUTHORITY_ENABLED);
+  p.add("vclock_ema_alpha_numerator", VCLOCK_EMA_ALPHA_NUMERATOR);
+  p.add("vclock_ema_alpha_denominator", VCLOCK_EMA_ALPHA_DENOMINATOR);
+  p.add("vclock_ema_audit_threshold_cycles", VCLOCK_EMA_AUDIT_THRESHOLD_CYCLES);
+  p.add("vclock_ema_initialized", g_vclock_lane.ema_initialized);
+  p.add("vclock_ema_interval_valid", g_vclock_lane.ema_interval_valid);
+  p.add("vclock_ema_update_count", g_vclock_lane.ema_update_count);
+  p.add("vclock_ema_last_observed_dwt", g_vclock_lane.ema_last_observed_dwt);
+  p.add("vclock_ema_last_emitted_dwt", g_vclock_lane.ema_last_emitted_dwt);
+  p.add("vclock_ema_last_observed_interval_cycles", g_vclock_lane.ema_last_observed_interval_cycles);
+  p.add("vclock_ema_interval_cycles", g_vclock_lane.ema_interval_cycles);
+  p.add("vclock_ema_last_predicted_dwt", g_vclock_lane.ema_last_predicted_dwt);
+  p.add("vclock_ema_last_error_cycles", g_vclock_lane.ema_last_error_cycles);
+  p.add("vclock_ema_max_abs_error_cycles", g_vclock_lane.ema_max_abs_error_cycles);
+  p.add("vclock_ch2_one_second_enabled", g_vclock_ch2_one_second_enabled);
+  p.add("vclock_ch2_one_second_next_counter32", g_vclock_ch2_one_second_next_counter32);
+  p.add("vclock_ch2_one_second_epoch_enable_count", g_vclock_ch2_one_second_epoch_enable_count);
+  p.add("vclock_ch2_one_second_epoch_base_counter32", g_vclock_ch2_one_second_epoch_base_counter32);
+  p.add("vclock_ch2_one_second_epoch_service_counter32", g_vclock_ch2_one_second_epoch_service_counter32);
+  p.add("vclock_ch2_one_second_epoch_target_counter32", g_vclock_ch2_one_second_epoch_target_counter32);
+  p.add("vclock_ch2_one_second_epoch_tick_mod_seed", g_vclock_ch2_one_second_epoch_tick_mod_seed);
+  p.add("vclock_ch2_one_second_epoch_remaining_cells", g_vclock_ch2_one_second_epoch_remaining_cells);
+  p.add("vclock_ch2_one_second_epoch_residual_ticks", g_vclock_ch2_one_second_epoch_residual_ticks);
+  p.add("vclock_ch2_one_second_heartbeat_enable_count", g_vclock_ch2_one_second_heartbeat_enable_count);
+  p.add("vclock_ch2_one_second_service_count", g_vclock_ch2_one_second_service_count);
+  p.add("vclock_ch2_one_second_enqueue_count", g_vclock_ch2_one_second_enqueue_count);
+  p.add("vclock_ch2_one_second_late_count", g_vclock_ch2_one_second_late_count);
+  p.add("vclock_ch2_one_second_late_max_ticks", g_vclock_ch2_one_second_late_max_ticks);
+  p.add("vclock_heartbeat_one_second_legacy_count", g_vclock_heartbeat_one_second_legacy_count);
+  p.add("vclock_heartbeat_one_second_handoff_skip_count", g_vclock_heartbeat_one_second_handoff_skip_count);
+  p.add("vclock_heartbeat_one_second_fallback_count", g_vclock_heartbeat_one_second_fallback_count);
+  p.add("vclock_heartbeat_smartzero_authority_retired", true);
+  p.add("vclock_heartbeat_smartzero_authority_retired_count", g_vclock_heartbeat_smartzero_authority_retired_count);
+  p.add("vclock_heartbeat_fact_drain_authority_retired", true);
+  p.add("vclock_heartbeat_fact_drain_authority_retired_count", g_vclock_heartbeat_fact_drain_authority_retired_count);
+  p.add("vclock_heartbeat_epoch_authority_retired", true);
+  p.add("vclock_heartbeat_epoch_authority_retired_count", g_vclock_heartbeat_epoch_authority_retired_count);
+  p.add("vclock_heartbeat_epoch_pending_skip_count", g_vclock_heartbeat_epoch_pending_skip_count);
+  p.add("vclock_ch2_epoch_native_enabled", VCLOCK_CH2_EPOCH_NATIVE_ENABLED);
+  p.add("vclock_ch2_epoch_native_service_count", g_vclock_ch2_epoch_native_service_count);
+  p.add("vclock_ch2_epoch_native_publish_count", g_vclock_ch2_epoch_native_publish_count);
+  p.add("vclock_ch2_epoch_native_bad_backdate_count", g_vclock_ch2_epoch_native_bad_backdate_count);
+  p.add("vclock_ch2_epoch_native_last_reject_reason", g_vclock_ch2_epoch_native_last_reject_reason);
+  p.add("vclock_ch2_epoch_native_last_reject_reason_name", vclock_ch2_epoch_reject_reason_name(g_vclock_ch2_epoch_native_last_reject_reason));
+  p.add("vclock_ch2_epoch_native_dispatch_arm_count", g_vclock_ch2_epoch_native_dispatch_arm_count);
+  p.add("vclock_ch2_epoch_native_dispatch_arm_fail_count", g_vclock_ch2_epoch_native_dispatch_arm_fail_count);
+  p.add("vclock_ch2_epoch_native_last_sequence", g_vclock_ch2_epoch_native_last_sequence);
+  p.add("vclock_ch2_epoch_native_last_selected_counter32", g_vclock_ch2_epoch_native_last_selected_counter32);
+  p.add("vclock_ch2_epoch_native_last_service_counter32", g_vclock_ch2_epoch_native_last_service_counter32);
+  p.add("vclock_ch2_epoch_native_last_backdate_ticks", g_vclock_ch2_epoch_native_last_backdate_ticks);
+  p.add("vclock_ch2_epoch_native_last_backdate_cycles", g_vclock_ch2_epoch_native_last_backdate_cycles);
+  p.add("vclock_ch2_epoch_native_last_sacred_dwt", g_vclock_ch2_epoch_native_last_sacred_dwt);
+  p.add("vclock_ch2_fact_drain_native_enabled", true);
+  p.add("vclock_ch2_fact_drain_service_count", g_vclock_ch2_fact_drain_service_count);
+  p.add("vclock_ch2_fact_drain_arm_count", g_vclock_ch2_fact_drain_arm_count);
+  p.add("vclock_ch2_smartzero_native_enabled", VCLOCK_CH2_SMARTZERO_NATIVE_ENABLED);
+  p.add("vclock_ch2_smartzero_seeded", g_vclock_ch2_smartzero_seeded);
+  p.add("vclock_ch2_smartzero_next_counter32", g_vclock_ch2_smartzero_next_counter32);
+  p.add("vclock_ch2_smartzero_service_count", g_vclock_ch2_smartzero_service_count);
+  p.add("vclock_ch2_smartzero_transaction_skip_count", g_vclock_ch2_smartzero_transaction_skip_count);
+  p.add("vclock_ch2_smartzero_feed_count", g_vclock_ch2_smartzero_feed_count);
+  p.add("vclock_ch2_smartzero_late_count", g_vclock_ch2_smartzero_late_count);
+  p.add("vclock_ch2_smartzero_late_max_ticks", g_vclock_ch2_smartzero_late_max_ticks);
+  p.add("vclock_ch2_smartzero_resync_count", g_vclock_ch2_smartzero_resync_count);
+  p.add("vclock_ch2_smartzero_drop_count", g_vclock_ch2_smartzero_drop_count);
+  p.add("vclock_ch2_smartzero_accepted_count", g_vclock_ch2_smartzero_accepted_count);
+  p.add("vclock_ch2_smartzero_rejected_dwt_count", g_vclock_ch2_smartzero_rejected_dwt_count);
+  p.add("vclock_ch2_smartzero_rejected_counter_count", g_vclock_ch2_smartzero_rejected_counter_count);
+  add_isr_sanity_payload(p, "isr_sanity", g_isr_sanity_vclock_ch2);
+
+  if (!detailed) return;
+
+  p.add("vclock_dwt_repair_enabled", false);
+  p.add("vclock_dwt_repair_threshold_cycles", VCLOCK_DWT_REPAIR_THRESHOLD_CYCLES);
+  p.add("vclock_dwt_repair_min_history_count", VCLOCK_DWT_REPAIR_MIN_HISTORY_COUNT);
+  p.add("vclock_dwt_repair_max_prediction_residual_cycles", VCLOCK_DWT_REPAIR_MAX_PREDICTION_RESIDUAL_CYCLES);
+  p.add("vclock_dwt_repair_candidate_count", g_vclock_repair_stats.candidate_count);
+  p.add("vclock_dwt_repair_applied_count", g_vclock_repair_stats.applied_count);
+  p.add("vclock_dwt_repair_consecutive_candidate_count", g_vclock_repair_stats.consecutive_candidate_count);
+  p.add("vclock_dwt_repair_last_candidate", g_vclock_repair_stats.last_candidate);
+  p.add("vclock_dwt_repair_last_synthetic", g_vclock_repair_stats.last_synthetic);
+  p.add("vclock_dwt_repair_last_original_dwt", g_vclock_repair_stats.last_original_dwt);
+  p.add("vclock_dwt_repair_last_predicted_dwt", g_vclock_repair_stats.last_predicted_dwt);
+  p.add("vclock_dwt_repair_last_used_dwt", g_vclock_repair_stats.last_used_dwt);
+  p.add("vclock_dwt_repair_last_error_cycles", g_vclock_repair_stats.last_error_cycles);
+  p.add("vclock_dwt_repair_max_abs_error_cycles", g_vclock_repair_stats.max_abs_error_cycles);
+
+  add_vclock_clock32_payload(p, "vclock");
+  p.add("vclock_perishable_fact_ring_size", VCLOCK_PERISHABLE_FACT_RING_SIZE);
+  p.add("vclock_perishable_fact_ring_count", g_vclock_fact_ring.count);
+  p.add("vclock_perishable_fact_enqueue_count", g_vclock_fact_ring.enqueue_count);
+  p.add("vclock_perishable_fact_drain_count", g_vclock_fact_ring.drain_count);
+  p.add("vclock_perishable_fact_overflow_count", g_vclock_fact_ring.overflow_count);
+  p.add("vclock_perishable_fact_high_water", g_vclock_fact_ring.high_water);
+  p.add("vclock_perishable_fact_asap_arm_count", g_vclock_fact_ring.asap_arm_count);
+  p.add("vclock_perishable_fact_asap_fail_count", g_vclock_fact_ring.asap_fail_count);
+  p.add("vclock_perishable_fact_drain_armed", g_vclock_fact_ring.drain_armed);
+  p.add("vclock_ch2_smartzero_reset_count", g_vclock_ch2_smartzero_reset_count);
+  p.add("vclock_ch2_smartzero_seed_count", g_vclock_ch2_smartzero_seed_count);
+  p.add("vclock_ch2_smartzero_deactivate_count", g_vclock_ch2_smartzero_deactivate_count);
+  p.add("vclock_ch2_smartzero_waiting_for_cps_count", g_vclock_ch2_smartzero_waiting_for_cps_count);
+  p.add("vclock_ch2_smartzero_first_sample_count", g_vclock_ch2_smartzero_first_sample_count);
+  p.add("vclock_ch2_smartzero_last_target_counter32", g_vclock_ch2_smartzero_last_target_counter32);
+  p.add("vclock_ch2_smartzero_last_service_counter32", g_vclock_ch2_smartzero_last_service_counter32);
+  p.add("vclock_ch2_smartzero_last_dwt", g_vclock_ch2_smartzero_last_dwt);
+  p.add("vclock_ch2_smartzero_last_late_ticks", g_vclock_ch2_smartzero_last_late_ticks);
+  add_regression_payload(p, "vclock", g_regression_vclock);
+  p.add("qtimer1_ch1_active", g_qtimer1_ch1_active);
+  p.add("qtimer1_ch1_sequence", g_qtimer1_ch1_sequence);
+  p.add("qtimer1_ch1_target_counter32", g_qtimer1_ch1_target_counter32);
+  p.add("qtimer1_ch1_next_compare_counter32", g_qtimer1_ch1_next_compare_counter32);
+  p.add("qtimer1_ch1_arm_count", g_qtimer1_ch1_arm_count);
+  p.add("qtimer1_ch1_fire_count", g_qtimer1_ch1_fire_count);
+  p.add("qtimer1_ch1_hop_count", g_qtimer1_ch1_hop_count);
+  p.add("qtimer1_ch2_last_target_counter32", g_qtimer1_ch2_last_target_counter32);
+  p.add("qtimer1_ch2_arm_count", g_qtimer1_ch2_arm_count);
+}
+
+static void add_ocxo_identity_payload(Payload& p,
                                       const ocxo_runtime_context_t& ctx) {
   p.add("lane", ctx.name);
   p.add("kind", ctx.name);
   p.add("provider", interrupt_provider_kind_str(ctx.provider));
   p.add("hardware_lane", interrupt_lane_str(ctx.lane_id));
-  p.add("timer_backend", ctx.lane ? ocxo_timer_backend_name(ctx.lane->backend) : "NONE");
   p.add("cadence_source", ctx.cadence_source);
   p.add("counter_source", ctx.counter_source);
   p.add("event_source", "LOCAL_ONE_SECOND_EDGE_COMPARE_EMA_DWT");
   p.add("dwt_authority", ctx.dwt_authority);
 }
 
-static FLASHMEM void add_ocxo_lane_basic_payload(payload_prefix_t& out,
+static void add_ocxo_lane_basic_payload(payload_prefix_t& out,
                                         const ocxo_lane_t& lane) {
   out.add_bool("initialized", lane.initialized);
   out.add_bool("active", lane.active);
@@ -9045,7 +8743,7 @@ static FLASHMEM void add_ocxo_lane_basic_payload(payload_prefix_t& out,
   out.add_u32("witness_last_arm_remaining_ticks", lane.witness_last_arm_remaining_ticks);
 }
 
-static FLASHMEM void add_ocxo_witness_service_payload(payload_prefix_t& out,
+static void add_ocxo_witness_service_payload(payload_prefix_t& out,
                                              const ocxo_lane_t& lane) {
   out.add_u32("witness_last_target_delta_mod65536_ticks",
               lane.witness_last_target_delta_mod65536_ticks);
@@ -9121,7 +8819,32 @@ static FLASHMEM void add_ocxo_witness_service_payload(payload_prefix_t& out,
               ocxo_schedule_decision_name(lane.witness_schedule_last_decision));
 }
 
-static FLASHMEM void add_ocxo_witness_detail_payload(payload_prefix_t& out,
+static void add_ocxo_cadence_sample_payload(payload_prefix_t& out,
+                                            const ocxo_lane_t& lane) {
+  out.add_u32("cadence_last_target_counter32", lane.cadence_last_target_counter32);
+  out.add_u32("cadence_last_target_low16", (uint32_t)lane.cadence_last_target_low16);
+  out.add_u32("cadence_last_service_low16", (uint32_t)lane.cadence_last_service_low16);
+  out.add_u32("cadence_last_fire_dwt", lane.cadence_last_fire_dwt);
+  out.add_u32("cadence_last_isr_entry_dwt_raw", lane.cadence_last_isr_entry_dwt_raw);
+  out.add_i32("cadence_last_service_offset_signed_ticks",
+              lane.cadence_last_service_offset_signed_ticks);
+  out.add_u32("cadence_last_service_offset_abs_ticks",
+              lane.cadence_last_service_offset_abs_ticks);
+  out.add_u32("cadence_last_interpreted_late_ticks",
+              lane.cadence_last_interpreted_late_ticks);
+  out.add_u32("cadence_last_early_ticks", lane.cadence_last_early_ticks);
+  out.add_bool("cadence_last_was_early", lane.cadence_last_was_early);
+  out.add_bool("cadence_last_one_second_due", lane.cadence_last_one_second_due);
+  out.add_bool("ema_initialized", lane.ema_initialized);
+  out.add_u32("ema_update_count", lane.ema_update_count);
+  out.add_u32("ema_last_observed_interval_cycles",
+              lane.ema_last_observed_interval_cycles);
+  out.add_u32("ema_interval_cycles", lane.ema_interval_cycles);
+  out.add_u32("ema_last_predicted_dwt", lane.ema_last_predicted_dwt);
+  out.add_i32("ema_last_error_cycles", lane.ema_last_error_cycles);
+}
+
+static void add_ocxo_witness_detail_payload(payload_prefix_t& out,
                                             const ocxo_lane_t& lane) {
   out.add_u32("witness_schedule_last_current_counter32",
               lane.witness_schedule_last_current_counter32);
@@ -9204,49 +8927,18 @@ static FLASHMEM void add_ocxo_witness_detail_payload(payload_prefix_t& out,
                lane.witness_last_arm_to_isr_ticks <= 256U);
 }
 
-static FLASHMEM void add_ocxo_qtimer_payload(payload_prefix_t& out,
+static void add_ocxo_qtimer_payload(payload_prefix_t& out,
                                     const ocxo_runtime_context_t& ctx,
                                     const ocxo_qtimer_diag_t& qdiag) {
   const ocxo_lane_t& lane = *ctx.lane;
-  const uint32_t status = ocxo_lane_status_now(lane);
-  const uint32_t counter = (uint32_t)ocxo_lane_counter_now(lane);
-  const uint32_t compare = ocxo_lane_compare_value_now(lane);
-  const bool compare_enabled = ocxo_lane_compare_enabled_now(lane);
-  const bool compare_flag = ocxo_lane_compare_flag_now(lane);
+  const uint16_t csctrl = lane.module->CH[lane.channel].CSCTRL;
+  const bool compare_enabled = (csctrl & TMR_CSCTRL_TCF1EN) != 0;
+  const bool compare_flag = (csctrl & TMR_CSCTRL_TCF1) != 0;
 
-  out.add_str("timer_backend", ocxo_timer_backend_name(lane.backend));
-  out.add_str("timer_provider", interrupt_provider_kind_str(ctx.provider));
-  out.add_str("timer_lane", interrupt_lane_str(ctx.lane_id));
-  out.add_u32("timer_count", qdiag.count);
-  out.add_u32("timer_counter", counter);
-  out.add_u32("timer_compare", compare);
-  out.add_u32("timer_status", status);
-  out.add_bool("timer_compare_enabled", compare_enabled);
-  out.add_bool("timer_compare_flag", compare_flag);
-  out.add_bool("timer_compare_live", compare_enabled && compare_flag);
-  out.add_u32("timer_last_late_ticks", qdiag.late_ticks);
-  out.add_u32("timer_last_interpreted_late_ticks", qdiag.interpreted_late_ticks);
-  out.add_u32("timer_last_early_ticks", qdiag.early_ticks);
-  out.add_i32("timer_last_service_offset_signed_ticks",
-              qdiag.service_offset_signed_ticks);
-  out.add_u32("timer_last_service_offset_abs_ticks",
-              qdiag.service_offset_abs_ticks);
-  out.add_u32("timer_last_target_delta_mod65536_ticks",
-              qdiag.target_delta_mod65536_ticks);
-  out.add_u32("timer_last_target_low16", (uint32_t)qdiag.target_low16);
-  out.add_u32("timer_last_isr_counter_low16",
-              (uint32_t)qdiag.isr_counter_low16);
-  out.add_u32("timer_last_dwt_raw", qdiag.dwt_raw);
-  out.add_u32("timer_last_event_dwt", qdiag.event_dwt);
-  out.add_u32("timer_last_dwt_coordinate_source",
-              qdiag.dwt_coordinate_source);
-
-  // Step 1 compatibility aliases.  Keep qtimer_* stable while publishing the
-  // new generic timer_* custody surface beside it.
   out.add_u32("qtimer_count", qdiag.count);
-  out.add_u32("qtimer_counter", counter);
-  out.add_u32("qtimer_comp1", compare);
-  out.add_u32("qtimer_csctrl", status);
+  out.add_u32("qtimer_counter", (uint32_t)lane.module->CH[lane.channel].CNTR);
+  out.add_u32("qtimer_comp1", (uint32_t)lane.module->CH[lane.channel].COMP1);
+  out.add_u32("qtimer_csctrl", (uint32_t)csctrl);
   out.add_bool("qtimer_compare_enabled", compare_enabled);
   out.add_bool("qtimer_compare_flag", compare_flag);
   out.add_bool("qtimer_compare_live", compare_enabled && compare_flag);
@@ -9268,7 +8960,7 @@ static FLASHMEM void add_ocxo_qtimer_payload(payload_prefix_t& out,
               qdiag.dwt_coordinate_source);
 }
 
-static FLASHMEM void add_ocxo_perishable_ring_payload(payload_prefix_t& out,
+static void add_ocxo_perishable_ring_payload(payload_prefix_t& out,
                                              const ocxo_runtime_context_t& ctx) {
   const ocxo_perishable_ring_t& ring = ocxo_fact_ring_for(ctx);
 
@@ -9283,7 +8975,36 @@ static FLASHMEM void add_ocxo_perishable_ring_payload(payload_prefix_t& out,
   out.add_bool("perishable_fact_drain_armed", ring.drain_armed);
 }
 
-static FLASHMEM void add_ocxo_compact_payload(Payload& p,
+static void add_ocxo_lane_payload(Payload& p,
+                                  const ocxo_runtime_context_t& ctx,
+                                  bool detailed) {
+  const ocxo_lane_t& lane = *ctx.lane;
+  const synthetic_clock32_t& clock32 = *ctx.clock32;
+  const interrupt_subscriber_runtime_t* rt = ocxo_runtime_for(ctx);
+  const ocxo_qtimer_diag_t& qdiag = *ctx.qtimer_diag;
+  payload_prefix_t out(p, ctx.prefix);
+
+  add_ocxo_identity_payload(p, ctx);
+  add_spincatch_report_payload(p, ctx.kind);
+  add_runtime_lane_summary(p, ctx.prefix, rt);
+  add_ocxo_lane_basic_payload(out, lane);
+  add_ocxo_witness_service_payload(out, lane);
+  add_ocxo_cadence_sample_payload(out, lane);
+  const isr_sanity_diag_t* sanity = isr_sanity_for_kind(ctx.kind);
+  if (sanity) {
+    add_isr_sanity_payload(p, "isr_sanity", *sanity);
+  }
+
+  if (!detailed) return;
+
+  add_ocxo_witness_detail_payload(out, lane);
+  add_ocxo_clock32_payload(p, ctx.prefix, clock32);
+  add_ocxo_qtimer_payload(out, ctx, qdiag);
+  add_ocxo_perishable_ring_payload(out, ctx);
+  const cadence_regression_lane_t* regression = cadence_regression_for_const(ctx.kind);
+  if (regression) add_regression_payload(p, ctx.prefix, *regression);
+}
+static void add_ocxo_compact_payload(Payload& p,
                                      const ocxo_runtime_context_t& ctx) {
   const interrupt_subscriber_runtime_t* rt = ocxo_runtime_for(ctx);
   const ocxo_lane_t& lane = *ctx.lane;
@@ -9373,7 +9094,7 @@ static FLASHMEM void add_ocxo_compact_payload(Payload& p,
   }
 }
 
-static FLASHMEM Payload cmd_report(const Payload&) {
+static Payload cmd_report(const Payload&) {
   Payload p;
   p.add("report", "INTERRUPT_COMPACT");
   p.add("subreports",
@@ -9485,18 +9206,13 @@ static FLASHMEM Payload cmd_report(const Payload&) {
         g_regression_vclock.last_result.fit_error_stddev_q16_cycles);
   p.add("vclock_regression_last_fit_error_abs_gt4_count",
         g_regression_vclock.last_result.fit_error_abs_gt4_count);
-  p.add("vclock_statistical_enabled", g_statistical_vclock.enabled);
-  p.add("vclock_statistical_sample_feed_enabled", g_statistical_vclock.sample_feed_enabled);
-  p.add("vclock_statistical_last_valid", g_statistical_vclock.last_valid);
-  p.add("vclock_statistical_last_accepted_samples", g_statistical_vclock.last_accepted_samples);
-  p.add("vclock_statistical_last_rejected_samples", g_statistical_vclock.last_rejected_samples);
 
   add_ocxo_compact_payload(p, g_ocxo1_ctx);
   add_ocxo_compact_payload(p, g_ocxo2_ctx);
 
   return p;
 }
-static FLASHMEM Payload cmd_report_status(const Payload&) {
+static Payload cmd_report_status(const Payload&) {
   Payload p;
   p.add("report", "INTERRUPT_STATUS");
   add_runtime_payload(p);
@@ -9504,7 +9220,7 @@ static FLASHMEM Payload cmd_report_status(const Payload&) {
   return p;
 }
 
-static FLASHMEM Payload cmd_report_pps(const Payload&) {
+static Payload cmd_report_pps(const Payload&) {
   Payload p;
   p.add("report", "INTERRUPT_PPS");
   add_pps_payload(p);
@@ -9512,7 +9228,7 @@ static FLASHMEM Payload cmd_report_pps(const Payload&) {
   return p;
 }
 
-static FLASHMEM Payload cmd_report_cadence(const Payload&) {
+static Payload cmd_report_cadence(const Payload&) {
   Payload p;
   p.add("report", "INTERRUPT_CADENCE");
   add_vclock_heartbeat_payload(p);
@@ -9520,14 +9236,14 @@ static FLASHMEM Payload cmd_report_cadence(const Payload&) {
   return p;
 }
 
-static FLASHMEM Payload cmd_report_smartzero(const Payload&) {
+static Payload cmd_report_smartzero(const Payload&) {
   Payload p;
   p.add("report", "INTERRUPT_SMARTZERO");
   add_smartzero_payload(p);
   return p;
 }
 
-static FLASHMEM void add_pvc_anchor_entry_payload(Payload& p,
+static void add_pvc_anchor_entry_payload(Payload& p,
                                          const char* prefix,
                                          const pvc_anchor_record_t& a,
                                          bool present) {
@@ -9546,7 +9262,7 @@ static FLASHMEM void add_pvc_anchor_entry_payload(Payload& p,
   out.add_u32("cps", present ? a.cps : 0U);
 }
 
-static FLASHMEM void add_bridge_payload(Payload& p) {
+static void add_bridge_payload(Payload& p) {
   p.add("pvc_anchor_ring_count", g_pvc_anchor_count);
   p.add("pvc_anchor_ring_head", g_pvc_anchor_head);
   p.add("pvc_anchor_ring_seq", g_pvc_anchor_seq);
@@ -9613,14 +9329,14 @@ static FLASHMEM void add_bridge_payload(Payload& p) {
   add_bridge_stats_payload(p, "ocxo2", g_bridge_stats_ocxo2);
 }
 
-static FLASHMEM Payload cmd_report_bridge(const Payload&) {
+static Payload cmd_report_bridge(const Payload&) {
   Payload p;
   p.add("report", "INTERRUPT_BRIDGE");
   add_bridge_payload(p);
   return p;
 }
 
-static FLASHMEM void add_lane_summary_object(Payload& parent,
+static void add_lane_summary_object(Payload& parent,
                                     const char* key,
                                     const char* name,
                                     const interrupt_subscriber_runtime_t* rt,
@@ -9685,7 +9401,7 @@ static FLASHMEM void add_lane_summary_object(Payload& parent,
   parent.add_object(key, lane);
 }
 
-static FLASHMEM void add_ocxo_lane_summary_object(Payload& parent,
+static void add_ocxo_lane_summary_object(Payload& parent,
                                          const char* key,
                                          const ocxo_runtime_context_t& ctx) {
   const interrupt_subscriber_runtime_t* rt = ocxo_runtime_for(ctx);
@@ -9777,7 +9493,7 @@ static FLASHMEM void add_ocxo_lane_summary_object(Payload& parent,
   parent.add_object(key, o);
 }
 
-static FLASHMEM void add_idle_dwt_witness_payload(Payload& p) {
+static void add_idle_dwt_witness_payload(Payload& p) {
   timepop_idle_witness_snapshot_t idle{};
   timepop_idle_witness_snapshot(&idle);
   p.add("idle_dwt_witness_supported", idle.supported);
@@ -9808,18 +9524,18 @@ static FLASHMEM void add_idle_dwt_witness_payload(Payload& p) {
 // bounded section at a time.
 
 static const char* REPORT_LANE_VCLOCK_SECTIONS =
-    "summary ema statistical ch2 epoch smartzero fact_ring clock32 qtimer regression spincatch isr";
+    "summary ema ch2 epoch smartzero fact_ring clock32 qtimer regression spincatch isr";
 static const char* REPORT_LANE_OCXO_SECTIONS =
-    "summary ema statistical service scheduler witness qtimer ring clock32 regression spincatch isr";
+    "summary ema service scheduler witness qtimer ring clock32 regression spincatch isr";
 
-static FLASHMEM const char* report_lane_section_arg(const Payload& args) {
+static const char* report_lane_section_arg(const Payload& args) {
   const char* section = args.getString("section");
   if (!section || !*section) section = args.getString("detail");
   if (!section || !*section) section = "summary";
   return section;
 }
 
-static FLASHMEM void add_report_lane_header(Payload& p,
+static void add_report_lane_header(Payload& p,
                                    const char* lane,
                                    const char* section,
                                    const char* sections) {
@@ -9830,11 +9546,11 @@ static FLASHMEM void add_report_lane_header(Payload& p,
   p.add("usage", "INTERRUPT.REPORT_LANE lane=VCLOCK|OCXO1|OCXO2 section=<section>");
 }
 
-static FLASHMEM bool report_lane_section_is(const char* section, const char* name) {
+static bool report_lane_section_is(const char* section, const char* name) {
   return section && name && !strcasecmp(section, name);
 }
 
-static FLASHMEM void add_vclock_lane_summary_section(Payload& p) {
+static void add_vclock_lane_summary_section(Payload& p) {
   p.add("kind", "VCLOCK");
   p.add("provider", "QTIMER1");
   p.add("hardware_lane", "QTIMER1_CH2_COMP");
@@ -9863,7 +9579,7 @@ static FLASHMEM void add_vclock_lane_summary_section(Payload& p) {
   add_isr_sanity_payload(p, "isr_sanity", g_isr_sanity_vclock_ch2);
 }
 
-static FLASHMEM void add_vclock_lane_ema_section(Payload& p) {
+static void add_vclock_lane_ema_section(Payload& p) {
   p.add("vclock_ema_dwt_authority_enabled", VCLOCK_EMA_DWT_AUTHORITY_ENABLED);
   p.add("vclock_ema_alpha_numerator", VCLOCK_EMA_ALPHA_NUMERATOR);
   p.add("vclock_ema_alpha_denominator", VCLOCK_EMA_ALPHA_DENOMINATOR);
@@ -9918,7 +9634,7 @@ static FLASHMEM void add_vclock_lane_ema_section(Payload& p) {
   p.add("vclock_dwt_repair_max_abs_error_cycles", g_vclock_repair_stats.max_abs_error_cycles);
 }
 
-static FLASHMEM void add_vclock_lane_ch2_section(Payload& p) {
+static void add_vclock_lane_ch2_section(Payload& p) {
   p.add("vclock_ch2_one_second_enabled", g_vclock_ch2_one_second_enabled);
   p.add("vclock_ch2_one_second_next_counter32", g_vclock_ch2_one_second_next_counter32);
   p.add("vclock_ch2_one_second_enable_count", g_vclock_ch2_one_second_enable_count);
@@ -9941,7 +9657,7 @@ static FLASHMEM void add_vclock_lane_ch2_section(Payload& p) {
   p.add("vclock_heartbeat_one_second_fallback_count", g_vclock_heartbeat_one_second_fallback_count);
 }
 
-static FLASHMEM void add_vclock_lane_epoch_section(Payload& p) {
+static void add_vclock_lane_epoch_section(Payload& p) {
   p.add("vclock_ch2_epoch_native_enabled", VCLOCK_CH2_EPOCH_NATIVE_ENABLED);
   p.add("vclock_ch2_epoch_native_service_count", g_vclock_ch2_epoch_native_service_count);
   p.add("vclock_ch2_epoch_native_publish_count", g_vclock_ch2_epoch_native_publish_count);
@@ -9960,7 +9676,7 @@ static FLASHMEM void add_vclock_lane_epoch_section(Payload& p) {
   p.add("vclock_heartbeat_epoch_pending_skip_count", g_vclock_heartbeat_epoch_pending_skip_count);
 }
 
-static FLASHMEM void add_vclock_lane_smartzero_section(Payload& p) {
+static void add_vclock_lane_smartzero_section(Payload& p) {
   p.add("vclock_ch2_smartzero_native_enabled", VCLOCK_CH2_SMARTZERO_NATIVE_ENABLED);
   p.add("vclock_ch2_smartzero_seeded", g_vclock_ch2_smartzero_seeded);
   p.add("vclock_ch2_smartzero_next_counter32", g_vclock_ch2_smartzero_next_counter32);
@@ -9985,7 +9701,7 @@ static FLASHMEM void add_vclock_lane_smartzero_section(Payload& p) {
   p.add("vclock_ch2_smartzero_last_late_ticks", g_vclock_ch2_smartzero_last_late_ticks);
 }
 
-static FLASHMEM void add_vclock_lane_fact_ring_section(Payload& p) {
+static void add_vclock_lane_fact_ring_section(Payload& p) {
   p.add("vclock_perishable_fact_ring_size", VCLOCK_PERISHABLE_FACT_RING_SIZE);
   p.add("vclock_perishable_fact_ring_count", g_vclock_fact_ring.count);
   p.add("vclock_perishable_fact_enqueue_count", g_vclock_fact_ring.enqueue_count);
@@ -9997,7 +9713,7 @@ static FLASHMEM void add_vclock_lane_fact_ring_section(Payload& p) {
   p.add("vclock_perishable_fact_drain_armed", g_vclock_fact_ring.drain_armed);
 }
 
-static FLASHMEM void add_vclock_lane_qtimer_section(Payload& p) {
+static void add_vclock_lane_qtimer_section(Payload& p) {
   p.add("qtimer1_ch1_active", g_qtimer1_ch1_active);
   p.add("qtimer1_ch1_sequence", g_qtimer1_ch1_sequence);
   p.add("qtimer1_ch1_target_counter32", g_qtimer1_ch1_target_counter32);
@@ -10014,13 +9730,11 @@ static FLASHMEM void add_vclock_lane_qtimer_section(Payload& p) {
   p.add("ch2_implicit_rollover_last_vclock_counter32", g_ch2_implicit_rollover_last_vclock_counter32);
 }
 
-static FLASHMEM bool add_vclock_lane_section(Payload& p, const char* section) {
+static bool add_vclock_lane_section(Payload& p, const char* section) {
   if (report_lane_section_is(section, "summary")) {
     add_vclock_lane_summary_section(p);
   } else if (report_lane_section_is(section, "ema")) {
     add_vclock_lane_ema_section(p);
-  } else if (report_lane_section_is(section, "statistical")) {
-    add_statistical_dwt_payload(p, "vclock", g_statistical_vclock);
   } else if (report_lane_section_is(section, "ch2")) {
     add_vclock_lane_ch2_section(p);
   } else if (report_lane_section_is(section, "epoch")) {
@@ -10046,13 +9760,13 @@ static FLASHMEM bool add_vclock_lane_section(Payload& p, const char* section) {
   return true;
 }
 
-static FLASHMEM void add_ocxo_lane_summary_section(Payload& p,
+static void add_ocxo_lane_summary_section(Payload& p,
                                           const ocxo_runtime_context_t& ctx) {
   add_ocxo_identity_payload(p, ctx);
   add_ocxo_compact_payload(p, ctx);
 }
 
-static FLASHMEM void add_ocxo_lane_ema_section(Payload& p,
+static void add_ocxo_lane_ema_section(Payload& p,
                                       const ocxo_runtime_context_t& ctx) {
   const ocxo_lane_t& lane = *ctx.lane;
   const interrupt_subscriber_runtime_t* rt = ocxo_runtime_for(ctx);
@@ -10111,7 +9825,7 @@ static FLASHMEM void add_ocxo_lane_ema_section(Payload& p,
   }
 }
 
-static FLASHMEM void add_ocxo_lane_scheduler_section(Payload& p,
+static void add_ocxo_lane_scheduler_section(Payload& p,
                                             const ocxo_runtime_context_t& ctx) {
   const ocxo_lane_t& lane = *ctx.lane;
   payload_prefix_t out(p, ctx.prefix);
@@ -10127,7 +9841,7 @@ static FLASHMEM void add_ocxo_lane_scheduler_section(Payload& p,
   out.add_u32("witness_schedule_last_target_low16", (uint32_t)lane.witness_schedule_last_target_low16);
 }
 
-static FLASHMEM bool add_ocxo_lane_section(Payload& p,
+static bool add_ocxo_lane_section(Payload& p,
                                   const ocxo_runtime_context_t& ctx,
                                   const char* section) {
   payload_prefix_t out(p, ctx.prefix);
@@ -10135,9 +9849,6 @@ static FLASHMEM bool add_ocxo_lane_section(Payload& p,
     add_ocxo_lane_summary_section(p, ctx);
   } else if (report_lane_section_is(section, "ema")) {
     add_ocxo_lane_ema_section(p, ctx);
-  } else if (report_lane_section_is(section, "statistical")) {
-    const statistical_dwt_lane_t* statistical = statistical_dwt_for_const(ctx.kind);
-    if (statistical) add_statistical_dwt_payload(p, ctx.prefix, *statistical);
   } else if (report_lane_section_is(section, "service")) {
     add_ocxo_witness_service_payload(out, *ctx.lane);
   } else if (report_lane_section_is(section, "scheduler")) {
@@ -10165,7 +9876,7 @@ static FLASHMEM bool add_ocxo_lane_section(Payload& p,
   return true;
 }
 
-static FLASHMEM Payload cmd_report_lanes(const Payload&) {
+static Payload cmd_report_lanes(const Payload&) {
   Payload p;
   p.add("report", "INTERRUPT_LANES");
   p.add("lane_count", 3);
@@ -10192,7 +9903,7 @@ static FLASHMEM Payload cmd_report_lanes(const Payload&) {
   return p;
 }
 
-static FLASHMEM Payload cmd_report_lane(const Payload& args) {
+static Payload cmd_report_lane(const Payload& args) {
   const char* lane = args.getString("lane");
   if (!lane || !*lane) lane = args.getString("name");
   const char* section = report_lane_section_arg(args);
@@ -10234,6 +9945,157 @@ static FLASHMEM Payload cmd_report_lane(const Payload& args) {
   return p;
 }
 
+static Payload cmd_regression_samples(const Payload& args) {
+  const char* lane = args.getString("lane");
+  if (!lane || !*lane) lane = args.getString("name");
+
+  Payload p;
+  p.add("report", "INTERRUPT_REGRESSION_SAMPLES");
+  p.add("usage", "INTERRUPT.REGRESSION_SAMPLES lane=OCXO1|OCXO2|VCLOCK offset=0 count=8 threshold=4");
+  p.add("implementation", "LIVE_ONLY_NO_RETAINED_WINDOWS");
+  p.add("memory_policy", "NO_NEW_SAMPLE_BUFFERS");
+  p.add("completed_window_available", false);
+
+  const interrupt_subscriber_kind_t kind = regression_kind_from_lane_arg(lane);
+  if (kind == interrupt_subscriber_kind_t::NONE) {
+    p.add("error", lane && *lane ? "unknown lane" : "missing lane parameter");
+    if (lane) p.add("lane", lane);
+    return p;
+  }
+
+  const cadence_regression_lane_t* r = cadence_regression_for_const(kind);
+  if (!r) {
+    p.add("error", "no regression lane");
+    p.add("lane", interrupt_subscriber_kind_str(kind));
+    return p;
+  }
+
+  uint32_t offset = args.getUInt("offset", 0U);
+  uint32_t count = args.getUInt("count", REGRESSION_SAMPLE_REPORT_SLICE_LIMIT);
+  uint32_t threshold = args.getUInt(
+      "threshold", (uint32_t)REGRESSION_FIT_ERROR_THRESHOLD_CYCLES);
+  if (count == 0 || count > REGRESSION_SAMPLE_REPORT_SLICE_LIMIT) {
+    count = REGRESSION_SAMPLE_REPORT_SLICE_LIMIT;
+  }
+
+  const cadence_regression_result_t& last = r->last_result;
+  const uint32_t n = (r->sample_count > REGRESSION_SAMPLES_PER_SECOND)
+      ? REGRESSION_SAMPLES_PER_SECOND
+      : r->sample_count;
+
+  double slope = 0.0;
+  double intercept = 0.0;
+  const bool fit_valid = regression_live_fit_params(*r, slope, intercept);
+
+  int32_t fit_min = 0;
+  int32_t fit_max = 0;
+  uint32_t abs_le4 = 0;
+  uint32_t abs_le8 = 0;
+  uint32_t abs_le12 = 0;
+  uint32_t abs_le20 = 0;
+  uint32_t abs_le50 = 0;
+  uint32_t abs_le100 = 0;
+  uint32_t abs_gt100 = 0;
+  uint32_t gate_accepted = 0;
+
+  if (fit_valid) {
+    fit_min = INT32_MAX;
+    fit_max = INT32_MIN;
+    for (uint32_t i = 0; i < n; i++) {
+      const int32_t err = regression_live_fit_error_cycles(*r, i, slope, intercept);
+      const uint32_t abs_err = regression_abs_i32(err);
+      if (err < fit_min) fit_min = err;
+      if (err > fit_max) fit_max = err;
+      if (abs_err <= 4U) abs_le4++;
+      if (abs_err <= 8U) abs_le8++;
+      if (abs_err <= 12U) abs_le12++;
+      if (abs_err <= 20U) abs_le20++;
+      if (abs_err <= 50U) abs_le50++;
+      if (abs_err <= 100U) abs_le100++; else abs_gt100++;
+      if (abs_err <= threshold) gate_accepted++;
+    }
+  }
+
+  const uint32_t last_index = (n > 0) ? (n - 1U) : 0U;
+  const int32_t inferred_rel = fit_valid
+      ? regression_round_i32(intercept + slope * (double)last_index)
+      : 0;
+  const uint32_t inferred_dwt = fit_valid
+      ? (r->base_observed_dwt + (uint32_t)inferred_rel)
+      : 0U;
+  const int32_t inferred_minus_observed = (fit_valid && n > 0)
+      ? (int32_t)(inferred_dwt - r->last_observed_dwt)
+      : 0;
+
+  p.add("lane", interrupt_subscriber_kind_str(kind));
+  p.add("regression_samples_per_second", REGRESSION_SAMPLES_PER_SECOND);
+  p.add("regression_counter_delta_ticks", REGRESSION_COUNTER_DELTA_TICKS);
+  p.add("linear_regression_authored_dwt", LINEAR_REGRESSION_AUTHORED_DWT);
+  p.add("linear_regression_diagnostic_only", LINEAR_REGRESSION_DIAGNOSTIC_ONLY);
+  p.add("sample_total_count", r->sample_total_count);
+  p.add("live_window_sample_count", n);
+  p.add("window_sample_count", n);
+  p.add("reset_count", r->reset_count);
+  p.add("insufficient_count", r->insufficient_count);
+  p.add("counter_discontinuity_count", r->counter_discontinuity_count);
+
+  p.add("regression_last_valid", last.valid);
+  p.add("regression_last_sequence", last.sequence);
+  p.add("regression_last_sample_count", last.sample_count);
+  p.add("regression_last_observed_dwt", last.observed_dwt_at_event);
+  p.add("regression_last_inferred_dwt", last.inferred_dwt_at_event);
+  p.add("regression_last_inferred_minus_observed_cycles",
+        last.inferred_minus_observed_cycles);
+
+  p.add("report_source", fit_valid ? "live_window_provisional_fit" : "live_window_raw");
+  p.add("selected_window_is_live", true);
+  p.add("selected_window_is_completed", false);
+  p.add("live_window_fit_valid", fit_valid);
+  p.add("regression_window_valid", n > 0);
+  p.add("regression_window_sequence", r->sequence);
+  p.add("regression_window_sample_count", n);
+  p.add("regression_window_base_counter32", r->base_counter32);
+  p.add("regression_window_base_observed_dwt", r->base_observed_dwt);
+  p.add("regression_window_event_target_counter32", r->last_counter32);
+  p.add("regression_window_event_observed_dwt", r->last_observed_dwt);
+  p.add("regression_window_event_inferred_dwt", inferred_dwt);
+  p.add("regression_window_event_inferred_minus_observed_cycles",
+        inferred_minus_observed);
+
+  p.add("fit_error_min_cycles", fit_valid ? fit_min : 0);
+  p.add("fit_error_max_cycles", fit_valid ? fit_max : 0);
+  p.add("abs_error_le4_count", abs_le4);
+  p.add("abs_error_le8_count", abs_le8);
+  p.add("abs_error_le12_count", abs_le12);
+  p.add("abs_error_le20_count", abs_le20);
+  p.add("abs_error_le50_count", abs_le50);
+  p.add("abs_error_le100_count", abs_le100);
+  p.add("abs_error_gt100_count", abs_gt100);
+  p.add("gate_threshold_cycles", threshold);
+  p.add("gate_accepted_count", fit_valid ? gate_accepted : 0U);
+  p.add("gate_rejected_count", fit_valid ? (n - gate_accepted) : 0U);
+
+  p.add("sample_slice_offset", offset);
+  p.add("sample_slice_count_requested", count);
+  p.add("sample_slice_limit", REGRESSION_SAMPLE_REPORT_SLICE_LIMIT);
+  p.add("sample_encoding", "flat_scalar_fields_no_service_offsets");
+
+  if (n > 0) {
+    if (offset >= n) offset = n - 1U;
+    if (offset + count > n) count = n - offset;
+    p.add("sample_slice_count_returned", count);
+    for (uint32_t i = 0; i < count; i++) {
+      add_regression_sample_scalar(p, *r, offset + i, i, fit_valid, slope, intercept);
+    }
+  } else {
+    p.add("sample_slice_count_returned", 0U);
+  }
+
+  add_regression_extreme_csv(p, *r, true, fit_valid, slope, intercept);
+  add_regression_extreme_csv(p, *r, false, fit_valid, slope, intercept);
+  return p;
+}
+
 static const process_command_entry_t INTERRUPT_COMMANDS[] = {
   { "REPORT",          cmd_report          },
   { "REPORT_STATUS",   cmd_report_status   },
@@ -10252,7 +10114,7 @@ static const process_vtable_t INTERRUPT_PROCESS = {
   .subscriptions = nullptr
 };
 
-void FLASHMEM process_interrupt_register(void) {
+void process_interrupt_register(void) {
   process_register("INTERRUPT", &INTERRUPT_PROCESS);
 }
 
@@ -10261,7 +10123,7 @@ void FLASHMEM process_interrupt_register(void) {
 // Stringifiers
 // ============================================================================
 
-const char* FLASHMEM interrupt_subscriber_kind_str(interrupt_subscriber_kind_t kind) {
+const char* interrupt_subscriber_kind_str(interrupt_subscriber_kind_t kind) {
   switch (kind) {
     case interrupt_subscriber_kind_t::VCLOCK:  return "VCLOCK";
     case interrupt_subscriber_kind_t::OCXO1:   return "OCXO1";
@@ -10271,19 +10133,17 @@ const char* FLASHMEM interrupt_subscriber_kind_str(interrupt_subscriber_kind_t k
   }
 }
 
-const char* FLASHMEM interrupt_provider_kind_str(interrupt_provider_kind_t provider) {
+const char* interrupt_provider_kind_str(interrupt_provider_kind_t provider) {
   switch (provider) {
     case interrupt_provider_kind_t::QTIMER1:  return "QTIMER1";
     case interrupt_provider_kind_t::QTIMER2:  return "QTIMER2";
     case interrupt_provider_kind_t::QTIMER3:  return "QTIMER3";
     case interrupt_provider_kind_t::GPIO6789: return "GPIO6789";
-    case interrupt_provider_kind_t::GPT1:     return "GPT1";
-    case interrupt_provider_kind_t::GPT2:     return "GPT2";
     default:                                  return "NONE";
   }
 }
 
-const char* FLASHMEM interrupt_lane_str(interrupt_lane_t lane) {
+const char* interrupt_lane_str(interrupt_lane_t lane) {
   switch (lane) {
     case interrupt_lane_t::QTIMER1_CH1_COMP: return "QTIMER1_CH1_COMP";
     case interrupt_lane_t::QTIMER1_CH2_COMP: return "QTIMER1_CH2_COMP";
@@ -10291,8 +10151,6 @@ const char* FLASHMEM interrupt_lane_str(interrupt_lane_t lane) {
     case interrupt_lane_t::QTIMER2_CH0_COMP: return "QTIMER2_CH0_COMP";
     case interrupt_lane_t::QTIMER3_CH3_COMP: return "QTIMER3_CH3_COMP";
     case interrupt_lane_t::GPIO_EDGE:        return "GPIO_EDGE";
-    case interrupt_lane_t::GPT1_OCR1_COMP:   return "GPT1_OCR1_COMP";
-    case interrupt_lane_t::GPT2_OCR1_COMP:   return "GPT2_OCR1_COMP";
     default:                                 return "NONE";
   }
 }
