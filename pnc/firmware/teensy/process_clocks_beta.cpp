@@ -199,7 +199,7 @@ static bool     g_timebase_last_ocxo2_pps_projected = false;
 static bool     g_timebase_last_ocxo1_pps_residual_valid = false;
 static bool     g_timebase_last_ocxo2_pps_residual_valid = false;
 
-static FLASHMEM const char* timebase_build_stage_name(uint32_t stage) {
+static const char* timebase_build_stage_name(uint32_t stage) {
   switch (stage) {
     case TIMEBASE_BUILD_STAGE_ENTRY: return "ENTRY";
     case TIMEBASE_BUILD_STAGE_STOP_GATE: return "STOP_GATE";
@@ -640,7 +640,7 @@ double welford_stderr(const welford_t& w) {
 // All six fields are always emitted, regardless of n.  Downstream
 // consumers can rely on the complete set being present in every
 // fragment after campaign start.
-static FLASHMEM void publish_welford(Payload& p, const char* prefix, const welford_t& w) {
+static void publish_welford(Payload& p, const char* prefix, const welford_t& w) {
   char key[80];
 
   snprintf(key, sizeof(key), "%s_welford_n", prefix);
@@ -666,7 +666,7 @@ static FLASHMEM void publish_welford(Payload& p, const char* prefix, const welfo
 // under the uniform sign convention (positive = clock running fast).
 // tau = 1.0 + ppb / 1e9.
 
-static FLASHMEM const char* smartzero_lane_state_name_beta(interrupt_smartzero_lane_state_t s) {
+static const char* smartzero_lane_state_name_beta(interrupt_smartzero_lane_state_t s) {
   switch (s) {
     case interrupt_smartzero_lane_state_t::ACQUIRING: return "ACQUIRING";
     case interrupt_smartzero_lane_state_t::LOCKED:    return "LOCKED";
@@ -674,7 +674,7 @@ static FLASHMEM const char* smartzero_lane_state_name_beta(interrupt_smartzero_l
   }
 }
 
-static FLASHMEM const char* smartzero_phase_name_beta(interrupt_smartzero_phase_t p) {
+static const char* smartzero_phase_name_beta(interrupt_smartzero_phase_t p) {
   switch (p) {
     case interrupt_smartzero_phase_t::RUNNING:  return "RUNNING";
     case interrupt_smartzero_phase_t::COMPLETE: return "COMPLETE";
@@ -683,7 +683,7 @@ static FLASHMEM const char* smartzero_phase_name_beta(interrupt_smartzero_phase_
   }
 }
 
-static FLASHMEM const char* smartzero_decision_name_beta(interrupt_smartzero_decision_t d) {
+static const char* smartzero_decision_name_beta(interrupt_smartzero_decision_t d) {
   switch (d) {
     case interrupt_smartzero_decision_t::WAITING_FOR_CPS:  return "WAITING_FOR_CPS";
     case interrupt_smartzero_decision_t::FIRST_SAMPLE:     return "FIRST_SAMPLE";
@@ -694,7 +694,7 @@ static FLASHMEM const char* smartzero_decision_name_beta(interrupt_smartzero_dec
   }
 }
 
-static FLASHMEM void payload_add_smartzero_lane(Payload& parent,
+static void payload_add_smartzero_lane(Payload& parent,
                                        const char* key,
                                        const interrupt_smartzero_lane_snapshot_t& z) {
   Payload lane;
@@ -724,7 +724,7 @@ static FLASHMEM void payload_add_smartzero_lane(Payload& parent,
   parent.add_object(key, lane);
 }
 
-static FLASHMEM void payload_add_smartzero_snapshot_object(
+static void payload_add_smartzero_snapshot_object(
   Payload& parent,
   const char* key,
   const interrupt_smartzero_snapshot_t& z,
@@ -758,7 +758,7 @@ static FLASHMEM void payload_add_smartzero_snapshot_object(
   parent.add_object(key, obj);
 }
 
-static FLASHMEM void payload_add_prefixed_smartzero_compact(
+static void payload_add_prefixed_smartzero_compact(
   Payload& p,
   const char* prefix,
   const interrupt_smartzero_snapshot_t& z,
@@ -791,7 +791,7 @@ static FLASHMEM void payload_add_prefixed_smartzero_compact(
   add_u32("current_lane_index", z.current_lane_index);
 }
 
-static FLASHMEM void payload_add_smartzero_install_transaction(Payload& p) {
+static void payload_add_smartzero_install_transaction(Payload& p) {
   p.add("smartzero_install_in_progress", clocks_alpha_epoch_install_in_progress());
   p.add("smartzero_install_attempt_count",
         clocks_alpha_smartzero_install_attempt_count());
@@ -825,7 +825,7 @@ static FLASHMEM void payload_add_smartzero_install_transaction(Payload& p) {
         clocks_alpha_smartzero_install_last_reason());
 }
 
-static FLASHMEM void payload_add_smartzero_summary(Payload& p) {
+static void payload_add_smartzero_summary(Payload& p) {
   interrupt_smartzero_snapshot_t live{};
   (void)interrupt_smartzero_live_snapshot(&live);
 
@@ -892,7 +892,7 @@ static FLASHMEM void payload_add_smartzero_summary(Payload& p) {
   p.add_object("smartzero", live_lanes);
 }
 
-static FLASHMEM void publish_freq(Payload& p, const char* clock_name, double ppb_value) {
+static void publish_freq(Payload& p, const char* clock_name, double ppb_value) {
   char key[80];
   const double tau_value = 1.0 + ppb_value / 1e9;
 
@@ -917,7 +917,7 @@ static clocks_static_prediction_snapshot_t prediction_snapshot_for_clock(time_cl
   return s;
 }
 
-static FLASHMEM void prediction_add_legacy_lane_summary(Payload& prediction,
+static void prediction_add_legacy_lane_summary(Payload& prediction,
                                                const char* prefix,
                                                const clocks_static_prediction_snapshot_t& s) {
   char key[96];
@@ -941,7 +941,7 @@ static FLASHMEM void prediction_add_legacy_lane_summary(Payload& prediction,
   add_i32("static_residual_cycles", s.static_residual_cycles);
 }
 
-static FLASHMEM void payload_add_flat_prediction_lane(Payload& p,
+static void payload_add_flat_prediction_lane(Payload& p,
                                              const char* prefix,
                                              const clocks_static_prediction_snapshot_t& s) {
   char key[96];
@@ -965,7 +965,7 @@ static FLASHMEM void payload_add_flat_prediction_lane(Payload& p,
   add_i32("residual_cycles", s.static_residual_cycles);
 }
 
-static FLASHMEM void payload_add_prediction_summary(Payload& p) {
+static void payload_add_prediction_summary(Payload& p) {
   const clocks_static_prediction_snapshot_t pps = prediction_snapshot_for_pps();
   const clocks_static_prediction_snapshot_t vclock = prediction_snapshot_for_clock(time_clock_id_t::VCLOCK);
   const clocks_static_prediction_snapshot_t ocxo1 = prediction_snapshot_for_clock(time_clock_id_t::OCXO1);
@@ -989,7 +989,7 @@ static FLASHMEM void payload_add_prediction_summary(Payload& p) {
 }
 
 
-static FLASHMEM void payload_add_lane_forensics_flat(Payload& p,
+static void payload_add_lane_forensics_flat(Payload& p,
                                             const char* prefix,
                                             bool valid,
                                             const clocks_alpha_lane_forensics_t& f) {
@@ -1283,7 +1283,7 @@ static void payload_add_prediction_summary_hierarchical(Payload& p) {
   p.add_object("prediction", prediction);
 }
 
-static FLASHMEM void payload_add_clock_measurement_object(Payload& parent,
+static void payload_add_clock_measurement_object(Payload& parent,
                                                  const clock_state_t& clock,
                                                  const clock_measurement_t& meas) {
   Payload measurement;
@@ -1297,7 +1297,7 @@ static FLASHMEM void payload_add_clock_measurement_object(Payload& parent,
   parent.add_object("measurement", measurement);
 }
 
-static FLASHMEM void payload_add_ocxo_interval_object(Payload& parent,
+static void payload_add_ocxo_interval_object(Payload& parent,
                                              bool valid,
                                              const clocks_alpha_lane_forensics_t& f) {
   Payload interval;
@@ -1312,7 +1312,7 @@ static FLASHMEM void payload_add_ocxo_interval_object(Payload& parent,
   parent.add_object("interval", interval);
 }
 
-static FLASHMEM void payload_add_spincatch_object(Payload& parent,
+static void payload_add_spincatch_object(Payload& parent,
                                          bool valid,
                                          const clocks_alpha_lane_forensics_t& f) {
   Payload spincatch;
@@ -1396,63 +1396,17 @@ static void payload_add_ocxo_service_object(Payload& parent,
 }
 
 static void payload_add_lane_regression_object(Payload& parent,
-                                               bool valid,
-                                               const clocks_alpha_lane_forensics_t& f) {
+                                               bool,
+                                               const clocks_alpha_lane_forensics_t&) {
   Payload regression;
 
-  // Compact report-only LR edge proof for TIMEBASE_FORENSICS.  The LR engine
-  // remains diagnostic-only in this pass: subscribers/TIMEBASE authority still
-  // use the existing DWT path, while this object carries the independent
-  // current-window inferred DWT-at-edge beside observed and EMA/authority DWT
-  // facts for raw_cycles-style review.
-  const bool lr_valid = valid && f.regression_valid;
-  const uint32_t authority_dwt = valid ? f.dwt_used_at_event : 0U;
-  const int32_t inferred_minus_authority =
-      (lr_valid && authority_dwt != 0U)
-          ? (int32_t)(f.regression_inferred_dwt_at_event - authority_dwt)
-          : 0;
-
-  regression.add("enabled", true);
-  regression.add("report_only", true);
-  regression.add("authority_enabled", false);
-  regression.add("valid", lr_valid);
-  regression.add("sequence", lr_valid ? f.regression_sequence : 0U);
-  regression.add("sample_count", lr_valid ? f.regression_sample_count : 0U);
-
-  // The three DWT endpoints raw_cycles wants side-by-side:
-  //   observed  — service-offset-corrected target-edge DWT from process_interrupt
-  //   inferred  — LR current-window estimate at the one-second target
-  //   authority — current subscriber/EMA DWT endpoint carried in the diag
-  regression.add("observed_dwt_at_event",
-                 lr_valid ? f.regression_observed_dwt_at_event : 0U);
-  regression.add("inferred_dwt_at_event",
-                 lr_valid ? f.regression_inferred_dwt_at_event : 0U);
-  regression.add("authority_dwt_at_event",
-                 lr_valid ? authority_dwt : 0U);
-  regression.add("authority_source", "EMA_DIAG_DWT_USED_AT_EVENT");
-  regression.add("inferred_minus_observed_cycles",
-                 lr_valid ? f.regression_inferred_minus_observed_cycles : 0);
-  regression.add("inferred_minus_authority_cycles",
-                 lr_valid ? inferred_minus_authority : 0);
-
-  regression.add("target_counter32_at_event",
-                 lr_valid ? f.regression_target_counter32_at_event : 0U);
-  regression.add("target_hardware16_at_event",
-                 lr_valid ? (uint32_t)f.regression_target_hardware16_at_event : 0U);
-  regression.add("observed_hardware16_at_event",
-                 lr_valid ? (uint32_t)f.regression_observed_hardware16_at_event : 0U);
-
-  // Keep fit quality compact.  Detailed lifecycle/segment fields stay in the
-  // focused interrupt lane reports to protect the 1 Hz forensics payload.
-  regression.add("slope_delta_q16_cycles_per_sample",
-                 lr_valid ? f.regression_slope_delta_q16_cycles_per_sample : 0LL);
-  regression.add("fit_error_mean_q16_cycles",
-                 lr_valid ? f.regression_fit_error_mean_q16_cycles : 0);
-  regression.add("fit_error_stddev_q16_cycles",
-                 lr_valid ? f.regression_fit_error_stddev_q16_cycles : 0U);
-  regression.add("fit_error_abs_gt4_count",
-                 lr_valid ? f.regression_fit_error_abs_gt4_count : 0U);
-
+  // Regression is disabled in this build.  Publishing the full zero-valued
+  // regression block in every TIMEBASE_FORENSICS row needlessly consumes the
+  // Payload arena and can prevent the paired forensics row from reaching the Pi.
+  // Keep a tiny shape-stable marker so downstream readers can distinguish
+  // "disabled" from "missing due to schema failure".
+  regression.add("enabled", false);
+  regression.add("valid", false);
   parent.add_object("regression", regression);
 }
 
@@ -1628,11 +1582,10 @@ static void payload_add_vclock_forensics(Payload& p,
   lane.add("counter32_at_pps_vclock", (uint32_t)g_counter32_at_pps_vclock);
 
   // TIMEBASE_FORENSICS is now a compact per-row courtroom audit.  Deep
-  // measurement and SpinCatch/SpinIdle remain available through focused
-  // reports; the paired 1 Hz stream carries DWT authority proof plus the
-  // compact LR inferred-edge witness needed by raw_cycles.
+  // measurement, SpinCatch/SpinIdle, and regression surfaces remain available
+  // through focused reports; the paired 1 Hz stream carries only the DWT
+  // authority proof needed to explain the science row.
   payload_add_lane_forensics_object(lane, forensics_valid, f);
-  payload_add_lane_regression_object(lane, forensics_valid, f);
   p.add_object("vclock", lane);
 }
 
@@ -1696,10 +1649,9 @@ static void payload_add_ocxo_forensics(Payload& p,
 
   // Compact forensic surface for the paired TIMEBASE row.  Keep the public
   // clock value, source identity, the raw PPS-projection value, the PPS-founded
-  // residual, the DWT gate courtroom, the tiny OCXO service/counter ladder
-  // proof, and the compact LR inferred-edge witness.  Retired quiet-phase
-  // sample fields, measurement/window counters, SpinCatch/SpinIdle, and verbose
-  // projection deltas remain report-only.
+  // residual, the DWT gate courtroom, and the tiny OCXO service/counter ladder
+  // proof.  Retired quiet-phase sample fields, measurement/window counters,
+  // SpinCatch/SpinIdle, regression, and verbose projection deltas are report-only.
   lane.add("ns", public_ns);
   lane.add("ns_source_id", pps_projection_valid ? 2U : 1U);
   lane.add("pps_projected_valid", pps_projection_valid);
@@ -1718,7 +1670,6 @@ static void payload_add_ocxo_forensics(Payload& p,
 
   payload_add_lane_forensics_object(lane, forensics_valid, f);
   payload_add_ocxo_service_object(lane, forensics_valid, f);
-  payload_add_lane_regression_object(lane, forensics_valid, f);
   p.add_object(key, lane);
 }
 
@@ -1783,7 +1734,7 @@ static void servo_input_diag_reset(servo_input_diag_t& d) {
   d = servo_input_diag_t{};
 }
 
-static FLASHMEM void payload_add_servo_input_diag(Payload& lane,
+static void payload_add_servo_input_diag(Payload& lane,
                                          const servo_input_diag_t& d) {
   Payload input;
   input.add("control_doctrine", "SLOPE_NEUTRALIZATION");
@@ -1815,7 +1766,7 @@ static FLASHMEM void payload_add_servo_input_diag(Payload& lane,
   lane.add_object("servo_input", input);
 }
 
-static FLASHMEM void payload_add_dac_summary_hierarchical(Payload& p) {
+static void payload_add_dac_summary_hierarchical(Payload& p) {
   Payload dac;
   dac.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
   dac.add("ad5693r_init_ok", g_ad5693r_init_ok);
@@ -1909,7 +1860,7 @@ static double ocxo_dac_last_window_average(const ocxo_dac_state_t& s) {
   return (double)s.dither_last_window_low_code + ((double)high / (double)ticks);
 }
 
-static FLASHMEM void payload_add_dac_dither_object(Payload& parent,
+static void payload_add_dac_dither_object(Payload& parent,
                                           const char* key,
                                           const ocxo_dac_state_t& s) {
   Payload d;
@@ -3250,7 +3201,7 @@ static bool payload_try_get_ocxo2_dac(const Payload& args, double& out) {
                                       "set_dac2");
 }
 
-static FLASHMEM Payload cmd_start(const Payload& args) {
+static Payload cmd_start(const Payload& args) {
   const char* name = args.getString("campaign");
   if (!name || !*name) {
     Payload err;
@@ -3324,7 +3275,7 @@ static FLASHMEM Payload cmd_start(const Payload& args) {
   return p;
 }
 
-static FLASHMEM Payload cmd_stop(const Payload&) {
+static Payload cmd_stop(const Payload&) {
   const bool had_live_smartzero = interrupt_smartzero_running();
   const bool had_pending_start = request_start;
   const bool had_pending_zero = request_zero;
@@ -3366,7 +3317,7 @@ static FLASHMEM Payload cmd_stop(const Payload&) {
 }
 
 
-static FLASHMEM Payload cmd_zero(const Payload&) {
+static Payload cmd_zero(const Payload&) {
   request_start = false;
   request_stop = false;
   request_recover = false;
@@ -3403,7 +3354,7 @@ static FLASHMEM Payload cmd_zero(const Payload&) {
   return p;
 }
 
-static FLASHMEM Payload cmd_recover(const Payload& args) {
+static Payload cmd_recover(const Payload& args) {
   const char* s_dwt_ns = args.getString("dwt_ns");
   const char* s_gnss   = args.getString("gnss_ns");
   const char* s_ocxo1  = args.getString("ocxo1_ns");
@@ -3431,7 +3382,7 @@ static FLASHMEM Payload cmd_recover(const Payload& args) {
   return p;
 }
 
-static FLASHMEM Payload cmd_watchdog_test(const Payload&) {
+static Payload cmd_watchdog_test(const Payload&) {
   clocks_watchdog_anomaly("watchdog_test");
   Payload p;
   p.add("status", "watchdog_anomaly_requested");
@@ -3443,11 +3394,11 @@ static FLASHMEM Payload cmd_watchdog_test(const Payload&) {
 // CLOCKS report forensics
 // ============================================================================
 
-static FLASHMEM int64_t signed_delta_u64(uint64_t a, uint64_t b) {
+static int64_t signed_delta_u64(uint64_t a, uint64_t b) {
   return (a >= b) ? (int64_t)(a - b) : -(int64_t)(b - a);
 }
 
-static FLASHMEM uint32_t apparent_cps_from_projection(uint32_t elapsed_cycles,
+static uint32_t apparent_cps_from_projection(uint32_t elapsed_cycles,
                                              uint64_t projected_ns) {
   if (projected_ns == 0) return 0;
   const uint64_t cps =
@@ -3456,14 +3407,14 @@ static FLASHMEM uint32_t apparent_cps_from_projection(uint32_t elapsed_cycles,
   return (cps > (uint64_t)UINT32_MAX) ? UINT32_MAX : (uint32_t)cps;
 }
 
-static FLASHMEM double ppb_fast_vs_vclock(uint32_t vclock_cycles,
+static double ppb_fast_vs_vclock(uint32_t vclock_cycles,
                                  uint32_t lane_cycles) {
   if (vclock_cycles == 0 || lane_cycles == 0) return 0.0;
   return (((double)vclock_cycles - (double)lane_cycles) /
           (double)vclock_cycles) * 1.0e9;
 }
 
-static FLASHMEM void add_alpha_event_payload(Payload& p,
+static void add_alpha_event_payload(Payload& p,
                                     const clocks_alpha_lane_forensics_t& f,
                                     const clocks_alpha_lane_forensics_t* vclock_ref) {
   p.add("valid", f.valid);
@@ -3630,7 +3581,7 @@ static FLASHMEM void add_alpha_event_payload(Payload& p,
   p.add_object("regression", regression);
 }
 
-static FLASHMEM void add_projection_payload(Payload& p,
+static void add_projection_payload(Payload& p,
                                    time_clock_id_t clock_id,
                                    uint32_t report_dwt,
                                    uint64_t report_ns,
@@ -3666,7 +3617,7 @@ static FLASHMEM void add_projection_payload(Payload& p,
   (void)clock_id;
 }
 
-static FLASHMEM void add_clock_forensics_payload(Payload& p,
+static void add_clock_forensics_payload(Payload& p,
                                         uint32_t report_dwt,
                                         uint64_t vclock_ns,
                                         bool vclock_ok,
@@ -3734,7 +3685,7 @@ static FLASHMEM void add_clock_forensics_payload(Payload& p,
 }
 
 
-static FLASHMEM void add_single_clock_forensics_payload(Payload& p,
+static void add_single_clock_forensics_payload(Payload& p,
                                                const char* key,
                                                time_clock_id_t clock_id,
                                                uint32_t report_dwt,
@@ -3776,7 +3727,7 @@ static FLASHMEM void add_single_clock_forensics_payload(Payload& p,
 // for the Teensy transport/heap budget.  Keep CLOCKS.REPORT small and make each
 // heavy surface explicitly opt-in through a focused command.
 
-static FLASHMEM void add_summary_payload(Payload& p) {
+static void add_summary_payload(Payload& p) {
   Payload summary;
   const uint32_t report_dwt = DWT_CYCCNT;
   const uint64_t dwt64_cycles_at_report = clocks_dwt_cycles_at_dwt(report_dwt);
@@ -3802,7 +3753,7 @@ static FLASHMEM void add_summary_payload(Payload& p) {
   p.add_object("summary", summary);
 }
 
-static FLASHMEM void add_campaign_payload(Payload& p) {
+static void add_campaign_payload(Payload& p) {
   p.add("campaign_state",
         campaign_state == clocks_campaign_state_t::STARTED ? "STARTED" : "STOPPED");
   p.add("campaign", campaign_name);
@@ -3824,7 +3775,7 @@ static FLASHMEM void add_campaign_payload(Payload& p) {
         (uint32_t)g_campaign_warmup_suppressed_total);
 }
 
-static FLASHMEM void add_epoch_payload(Payload& p) {
+static void add_epoch_payload(Payload& p) {
   p.add("epoch_pending", clocks_epoch_pending());
   p.add("epoch_owner", "CLOCKS_SMARTZERO");
   p.add("epoch_source", "SMARTZERO");
@@ -3887,7 +3838,7 @@ static FLASHMEM void add_epoch_payload(Payload& p) {
   p.add("interrupt_pps_rebootstrap_pending", interrupt_pps_rebootstrap_pending());
 }
 
-static FLASHMEM void add_compact_smartzero_status(Payload& p) {
+static void add_compact_smartzero_status(Payload& p) {
   interrupt_smartzero_snapshot_t installed{};
   const bool installed_valid = clocks_alpha_epoch_last_smartzero(&installed);
   const bool installed_backing_epoch = clocks_alpha_installed_smartzero_backing_epoch();
@@ -3940,7 +3891,7 @@ static FLASHMEM void add_compact_smartzero_status(Payload& p) {
   p.add("smartzero_abort_count", live.abort_count);
 }
 
-static FLASHMEM void add_dac_payload(Payload& p) {
+static void add_dac_payload(Payload& p) {
   Payload o1;
   o1.add("dac", ocxo1_dac.dac_fractional);
   o1.add("dac_hw_code", (uint32_t)ocxo1_dac.dac_hw_code);
@@ -4038,7 +3989,7 @@ static FLASHMEM void add_dac_payload(Payload& p) {
 }
 
 
-static FLASHMEM const char* alpha_flow_stage_name_beta(uint32_t stage) {
+static const char* alpha_flow_stage_name_beta(uint32_t stage) {
   switch (stage) {
     case 1:  return "CALLBACK_ENTRY";
     case 2:  return "REJECT_EPOCH";
@@ -4059,7 +4010,7 @@ static FLASHMEM const char* alpha_flow_stage_name_beta(uint32_t stage) {
   }
 }
 
-static FLASHMEM void payload_add_alpha_flow_lane(Payload& parent,
+static void payload_add_alpha_flow_lane(Payload& parent,
                                         const char* key,
                                         time_clock_id_t clock,
                                         bool detailed) {
@@ -4187,7 +4138,7 @@ static FLASHMEM void payload_add_alpha_flow_lane(Payload& parent,
   parent.add_object(key, p);
 }
 
-static FLASHMEM const char* ocxo_pps_projection_source_name(uint32_t source) {
+static const char* ocxo_pps_projection_source_name(uint32_t source) {
   switch (source) {
     case 1: return "ACTUAL_BRACKET";
     case 2: return "STATIC_NEXT_EDGE";
@@ -4195,7 +4146,7 @@ static FLASHMEM const char* ocxo_pps_projection_source_name(uint32_t source) {
   }
 }
 
-static FLASHMEM const char* ocxo_pps_projection_invalid_reason_name(uint32_t reason) {
+static const char* ocxo_pps_projection_invalid_reason_name(uint32_t reason) {
   switch (reason) {
     case 1: return "NO_EDGE";
     case 2: return "NO_INTERVAL";
@@ -4204,7 +4155,7 @@ static FLASHMEM const char* ocxo_pps_projection_invalid_reason_name(uint32_t rea
   }
 }
 
-static FLASHMEM void payload_add_ocxo_pps_projection_lane(Payload& parent,
+static void payload_add_ocxo_pps_projection_lane(Payload& parent,
                                                  const char* key,
                                                  time_clock_id_t clock) {
   clocks_alpha_ocxo_pps_projection_snapshot_t s{};
@@ -4291,7 +4242,7 @@ static FLASHMEM void payload_add_ocxo_pps_projection_lane(Payload& parent,
   parent.add_object(key, lane);
 }
 
-static FLASHMEM Payload cmd_report_ocxo_pps_projection(const Payload&) {
+static Payload cmd_report_ocxo_pps_projection(const Payload&) {
   Payload p;
   p.add("report", "CLOCKS_OCXO_PPS_PROJECTION");
   p.add("description",
@@ -4301,7 +4252,7 @@ static FLASHMEM Payload cmd_report_ocxo_pps_projection(const Payload&) {
   return p;
 }
 
-static FLASHMEM Payload cmd_report_timebase_publish(const Payload&) {
+static Payload cmd_report_timebase_publish(const Payload&) {
   Payload p;
   p.add("report", "CLOCKS_TIMEBASE_PUBLISH");
   p.add("description", "Report-only TIMEBASE_FRAGMENT / TIMEBASE_FORENSICS build/publish flight recorder");
@@ -4385,7 +4336,7 @@ static FLASHMEM Payload cmd_report_timebase_publish(const Payload&) {
   return p;
 }
 
-static FLASHMEM Payload cmd_report(const Payload&) {
+static Payload cmd_report(const Payload&) {
   Payload p;
   p.add("report", "CLOCKS_COMPACT");
   p.add("subreports", "REPORT_STATUS REPORT_SUMMARY REPORT_EPOCH REPORT_SMARTZERO REPORT_INSTALLED_SMARTZERO REPORT_LIVE_SMARTZERO REPORT_FORENSICS REPORT_FORENSICS_VCLOCK REPORT_FORENSICS_OCXO1 REPORT_FORENSICS_OCXO2 REPORT_OCXO_PPS_PROJECTION REPORT_TIMEBASE_PUBLISH REPORT_ALPHA_FLOW REPORT_ALPHA_FLOW_VCLOCK REPORT_ALPHA_FLOW_OCXO1 REPORT_ALPHA_FLOW_OCXO2 REPORT_PREDICTION REPORT_STATS REPORT_DAC");
@@ -4406,7 +4357,7 @@ static FLASHMEM Payload cmd_report(const Payload&) {
   return p;
 }
 
-static FLASHMEM Payload cmd_report_status(const Payload&) {
+static Payload cmd_report_status(const Payload&) {
   Payload p;
   p.add("report", "CLOCKS_STATUS");
   add_campaign_payload(p);
@@ -4415,28 +4366,28 @@ static FLASHMEM Payload cmd_report_status(const Payload&) {
   return p;
 }
 
-static FLASHMEM Payload cmd_report_summary(const Payload&) {
+static Payload cmd_report_summary(const Payload&) {
   Payload p;
   p.add("report", "CLOCKS_SUMMARY");
   add_summary_payload(p);
   return p;
 }
 
-static FLASHMEM Payload cmd_report_epoch(const Payload&) {
+static Payload cmd_report_epoch(const Payload&) {
   Payload p;
   p.add("report", "CLOCKS_EPOCH");
   add_epoch_payload(p);
   return p;
 }
 
-static FLASHMEM Payload cmd_report_smartzero(const Payload&) {
+static Payload cmd_report_smartzero(const Payload&) {
   Payload p;
   p.add("report", "CLOCKS_SMARTZERO");
   payload_add_smartzero_summary(p);
   return p;
 }
 
-static FLASHMEM Payload cmd_report_installed_smartzero(const Payload&) {
+static Payload cmd_report_installed_smartzero(const Payload&) {
   Payload p;
   p.add("report", "CLOCKS_INSTALLED_SMARTZERO");
   interrupt_smartzero_snapshot_t installed{};
@@ -4454,7 +4405,7 @@ static FLASHMEM Payload cmd_report_installed_smartzero(const Payload&) {
   return p;
 }
 
-static FLASHMEM Payload cmd_report_live_smartzero(const Payload&) {
+static Payload cmd_report_live_smartzero(const Payload&) {
   Payload p;
   p.add("report", "CLOCKS_LIVE_SMARTZERO");
   interrupt_smartzero_snapshot_t live{};
@@ -4463,7 +4414,7 @@ static FLASHMEM Payload cmd_report_live_smartzero(const Payload&) {
   return p;
 }
 
-static FLASHMEM Payload cmd_report_forensics(const Payload&) {
+static Payload cmd_report_forensics(const Payload&) {
   Payload p;
   p.add("report", "CLOCKS_FORENSICS");
   const uint32_t report_dwt = DWT_CYCCNT;
@@ -4480,7 +4431,7 @@ static FLASHMEM Payload cmd_report_forensics(const Payload&) {
   return p;
 }
 
-static FLASHMEM Payload cmd_report_forensics_vclock(const Payload&) {
+static Payload cmd_report_forensics_vclock(const Payload&) {
   Payload p;
   p.add("report", "CLOCKS_FORENSICS_VCLOCK");
   const uint32_t report_dwt = DWT_CYCCNT;
@@ -4492,7 +4443,7 @@ static FLASHMEM Payload cmd_report_forensics_vclock(const Payload&) {
   return p;
 }
 
-static FLASHMEM Payload cmd_report_forensics_ocxo1(const Payload&) {
+static Payload cmd_report_forensics_ocxo1(const Payload&) {
   Payload p;
   p.add("report", "CLOCKS_FORENSICS_OCXO1");
   const uint32_t report_dwt = DWT_CYCCNT;
@@ -4506,7 +4457,7 @@ static FLASHMEM Payload cmd_report_forensics_ocxo1(const Payload&) {
   return p;
 }
 
-static FLASHMEM Payload cmd_report_forensics_ocxo2(const Payload&) {
+static Payload cmd_report_forensics_ocxo2(const Payload&) {
   Payload p;
   p.add("report", "CLOCKS_FORENSICS_OCXO2");
   const uint32_t report_dwt = DWT_CYCCNT;
@@ -4521,7 +4472,7 @@ static FLASHMEM Payload cmd_report_forensics_ocxo2(const Payload&) {
 }
 
 
-static FLASHMEM Payload cmd_report_alpha_flow(const Payload&) {
+static Payload cmd_report_alpha_flow(const Payload&) {
   Payload p;
   p.add("report", "CLOCKS_ALPHA_FLOW");
   p.add("description", "Alpha subscriber-event flow counters; report-only, not TIMEBASE");
@@ -4533,35 +4484,35 @@ static FLASHMEM Payload cmd_report_alpha_flow(const Payload&) {
   return p;
 }
 
-static FLASHMEM Payload cmd_report_alpha_flow_vclock(const Payload&) {
+static Payload cmd_report_alpha_flow_vclock(const Payload&) {
   Payload p;
   p.add("report", "CLOCKS_ALPHA_FLOW_VCLOCK");
   payload_add_alpha_flow_lane(p, "vclock", time_clock_id_t::VCLOCK, true);
   return p;
 }
 
-static FLASHMEM Payload cmd_report_alpha_flow_ocxo1(const Payload&) {
+static Payload cmd_report_alpha_flow_ocxo1(const Payload&) {
   Payload p;
   p.add("report", "CLOCKS_ALPHA_FLOW_OCXO1");
   payload_add_alpha_flow_lane(p, "ocxo1", time_clock_id_t::OCXO1, true);
   return p;
 }
 
-static FLASHMEM Payload cmd_report_alpha_flow_ocxo2(const Payload&) {
+static Payload cmd_report_alpha_flow_ocxo2(const Payload&) {
   Payload p;
   p.add("report", "CLOCKS_ALPHA_FLOW_OCXO2");
   payload_add_alpha_flow_lane(p, "ocxo2", time_clock_id_t::OCXO2, true);
   return p;
 }
 
-static FLASHMEM Payload cmd_report_prediction(const Payload&) {
+static Payload cmd_report_prediction(const Payload&) {
   Payload p;
   p.add("report", "CLOCKS_PREDICTION");
   payload_add_prediction_summary(p);
   return p;
 }
 
-static FLASHMEM Payload cmd_report_stats(const Payload&) {
+static Payload cmd_report_stats(const Payload&) {
   Payload p;
   p.add("report", "CLOCKS_STATS");
   publish_welford(p, "dwt",          welford_dwt);
@@ -4578,14 +4529,14 @@ static FLASHMEM Payload cmd_report_stats(const Payload&) {
   return p;
 }
 
-static FLASHMEM Payload cmd_report_dac(const Payload&) {
+static Payload cmd_report_dac(const Payload&) {
   Payload p;
   p.add("report", "CLOCKS_DAC");
   add_dac_payload(p);
   return p;
 }
 
-static FLASHMEM Payload cmd_dither(const Payload& args) {
+static Payload cmd_dither(const Payload& args) {
   bool enabled = true;
   (void)args.tryGetBool("dither", enabled);
 
@@ -4616,7 +4567,7 @@ static FLASHMEM Payload cmd_dither(const Payload& args) {
   return p;
 }
 
-static FLASHMEM Payload cmd_set_dac(const Payload& args) {
+static Payload cmd_set_dac(const Payload& args) {
   ocxo_dac_pacing_abort_all();
 
   double dac_val;

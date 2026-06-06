@@ -987,7 +987,7 @@ static void alpha_event_flow_note_snapshot_missing_store(time_clock_id_t clock) 
   f->last_failure_stage = ALPHA_FLOW_STAGE_FORENSICS_SNAPSHOT;
 }
 
-FLASHMEM bool clocks_alpha_event_flow_snapshot(time_clock_id_t clock,
+bool clocks_alpha_event_flow_snapshot(time_clock_id_t clock,
                                       clocks_alpha_event_flow_snapshot_t* out) {
   if (!out) return false;
   alpha_event_flow_store_t* f = alpha_event_flow_store(clock);
@@ -2618,7 +2618,7 @@ static volatile bool     g_alpha_smartzero_install_last_success = false;
 static volatile bool     g_alpha_smartzero_install_last_atomic = false;
 static char              g_alpha_smartzero_install_last_reason[32] = {0};
 
-static FLASHMEM const char* smartzero_install_stage_name(uint32_t stage) {
+static const char* smartzero_install_stage_name(uint32_t stage) {
   switch (stage) {
     case SMARTZERO_INSTALL_STAGE_IDLE:             return "IDLE";
     case SMARTZERO_INSTALL_STAGE_SNAPSHOT:         return "SNAPSHOT";
@@ -2634,7 +2634,7 @@ static FLASHMEM const char* smartzero_install_stage_name(uint32_t stage) {
   }
 }
 
-FLASHMEM bool clocks_alpha_epoch_last_smartzero(interrupt_smartzero_snapshot_t* out) {
+bool clocks_alpha_epoch_last_smartzero(interrupt_smartzero_snapshot_t* out) {
   if (!out) return false;
   *out = g_alpha_epoch_last_smartzero;
   return out->complete;
@@ -2657,78 +2657,78 @@ bool clocks_alpha_installed_smartzero_backing_epoch(void) {
              g_alpha_smartzero_install_last_committed_smartzero_sequence;
 }
 
-FLASHMEM bool clocks_alpha_epoch_install_in_progress(void) {
+bool clocks_alpha_epoch_install_in_progress(void) {
   return g_alpha_epoch_install_in_progress;
 }
-FLASHMEM uint32_t clocks_alpha_smartzero_install_attempt_count(void) {
+uint32_t clocks_alpha_smartzero_install_attempt_count(void) {
   return g_alpha_smartzero_install_attempt_count;
 }
-FLASHMEM uint32_t clocks_alpha_smartzero_install_commit_count(void) {
+uint32_t clocks_alpha_smartzero_install_commit_count(void) {
   return g_alpha_smartzero_install_commit_count;
 }
-FLASHMEM uint32_t clocks_alpha_smartzero_install_failure_count(void) {
+uint32_t clocks_alpha_smartzero_install_failure_count(void) {
   return g_alpha_smartzero_install_failure_count;
 }
-FLASHMEM uint32_t clocks_alpha_smartzero_install_last_stage(void) {
+uint32_t clocks_alpha_smartzero_install_last_stage(void) {
   return g_alpha_smartzero_install_last_stage;
 }
-FLASHMEM const char* clocks_alpha_smartzero_install_last_stage_name(void) {
+const char* clocks_alpha_smartzero_install_last_stage_name(void) {
   return smartzero_install_stage_name(g_alpha_smartzero_install_last_stage);
 }
-FLASHMEM uint32_t clocks_alpha_smartzero_install_last_failure_stage(void) {
+uint32_t clocks_alpha_smartzero_install_last_failure_stage(void) {
   return g_alpha_smartzero_install_last_failure_stage;
 }
-FLASHMEM const char* clocks_alpha_smartzero_install_last_failure_stage_name(void) {
+const char* clocks_alpha_smartzero_install_last_failure_stage_name(void) {
   return smartzero_install_stage_name(g_alpha_smartzero_install_last_failure_stage);
 }
-FLASHMEM uint32_t clocks_alpha_smartzero_install_last_failure_code(void) {
+uint32_t clocks_alpha_smartzero_install_last_failure_code(void) {
   return g_alpha_smartzero_install_last_failure_code;
 }
-FLASHMEM uint32_t clocks_alpha_smartzero_install_last_live_sequence(void) {
+uint32_t clocks_alpha_smartzero_install_last_live_sequence(void) {
   return g_alpha_smartzero_install_last_live_sequence;
 }
-FLASHMEM uint32_t clocks_alpha_smartzero_install_last_prior_epoch_sequence(void) {
+uint32_t clocks_alpha_smartzero_install_last_prior_epoch_sequence(void) {
   return g_alpha_smartzero_install_last_prior_epoch_sequence;
 }
-FLASHMEM uint32_t clocks_alpha_smartzero_install_last_committed_epoch_sequence(void) {
+uint32_t clocks_alpha_smartzero_install_last_committed_epoch_sequence(void) {
   return g_alpha_smartzero_install_last_committed_epoch_sequence;
 }
-FLASHMEM uint32_t clocks_alpha_smartzero_install_last_committed_smartzero_sequence(void) {
+uint32_t clocks_alpha_smartzero_install_last_committed_smartzero_sequence(void) {
   return g_alpha_smartzero_install_last_committed_smartzero_sequence;
 }
-FLASHMEM bool clocks_alpha_smartzero_install_last_success(void) {
+bool clocks_alpha_smartzero_install_last_success(void) {
   return g_alpha_smartzero_install_last_success;
 }
-FLASHMEM bool clocks_alpha_smartzero_install_last_atomic(void) {
+bool clocks_alpha_smartzero_install_last_atomic(void) {
   return g_alpha_smartzero_install_last_atomic;
 }
-FLASHMEM const char* clocks_alpha_smartzero_install_last_reason(void) {
+const char* clocks_alpha_smartzero_install_last_reason(void) {
   return g_alpha_smartzero_install_last_reason;
 }
 
-FLASHMEM uint32_t clocks_alpha_smartzero_begin_count(void) { return g_alpha_smartzero_begin_count; }
-FLASHMEM uint32_t clocks_alpha_smartzero_begin_failures(void) { return g_alpha_smartzero_begin_failures; }
-FLASHMEM bool clocks_alpha_smartzero_pending_active(void) { return g_alpha_smartzero_pending_active; }
-FLASHMEM const char* clocks_alpha_smartzero_pending_reason(void) {
+uint32_t clocks_alpha_smartzero_begin_count(void) { return g_alpha_smartzero_begin_count; }
+uint32_t clocks_alpha_smartzero_begin_failures(void) { return g_alpha_smartzero_begin_failures; }
+bool clocks_alpha_smartzero_pending_active(void) { return g_alpha_smartzero_pending_active; }
+const char* clocks_alpha_smartzero_pending_reason(void) {
   return g_alpha_smartzero_pending_active ? g_alpha_smartzero_pending_reason : "";
 }
-FLASHMEM void clocks_alpha_smartzero_pending_clear(void) {
+void clocks_alpha_smartzero_pending_clear(void) {
   g_alpha_smartzero_pending_active = false;
   g_alpha_smartzero_pending_reason[0] = '\0';
 }
-FLASHMEM bool clocks_alpha_smartzero_last_begin_preserved_epoch(void) {
+bool clocks_alpha_smartzero_last_begin_preserved_epoch(void) {
   return g_alpha_smartzero_last_begin_preserved_epoch;
 }
-FLASHMEM uint32_t clocks_alpha_smartzero_last_begin_preserved_epoch_sequence(void) {
+uint32_t clocks_alpha_smartzero_last_begin_preserved_epoch_sequence(void) {
   return g_alpha_smartzero_last_begin_preserved_epoch_sequence;
 }
-FLASHMEM uint32_t clocks_alpha_smartzero_begin_preserved_epoch_count(void) {
+uint32_t clocks_alpha_smartzero_begin_preserved_epoch_count(void) {
   return g_alpha_smartzero_begin_preserved_epoch_count;
 }
-FLASHMEM uint32_t clocks_alpha_smartzero_begin_cold_count(void) {
+uint32_t clocks_alpha_smartzero_begin_cold_count(void) {
   return g_alpha_smartzero_begin_cold_count;
 }
-FLASHMEM const char* clocks_alpha_smartzero_last_begin_reason(void) {
+const char* clocks_alpha_smartzero_last_begin_reason(void) {
   return g_alpha_smartzero_last_begin_reason;
 }
 
@@ -3067,26 +3067,26 @@ bool clocks_alpha_zero_from_interrupt_capture(const char* reason) {
   return clocks_alpha_zero_from_smartzero(reason);
 }
 
-FLASHMEM uint32_t clocks_alpha_epoch_sequence(void) { return g_alpha_epoch_sequence; }
-FLASHMEM uint32_t clocks_alpha_epoch_install_count(void) { return g_alpha_epoch_install_count; }
-FLASHMEM uint32_t clocks_alpha_epoch_install_failures(void) { return g_alpha_epoch_install_failures; }
-FLASHMEM uint32_t clocks_alpha_epoch_last_capture_sequence(void) { return g_alpha_epoch_last_capture_sequence; }
-FLASHMEM uint32_t clocks_alpha_epoch_last_capture_window_cycles(void) { return g_alpha_epoch_last_capture_window_cycles; }
-FLASHMEM bool clocks_alpha_epoch_last_vclock_capture_valid(void) { return g_alpha_epoch_last_vclock_capture_valid; }
-FLASHMEM bool clocks_alpha_epoch_last_all_lanes_valid(void) { return g_alpha_epoch_last_all_lanes_valid; }
-FLASHMEM uint32_t clocks_alpha_epoch_last_dwt_at_edge(void) { return g_alpha_epoch_last_dwt_at_edge; }
-FLASHMEM uint32_t clocks_alpha_epoch_last_vclock_counter32(void) { return g_alpha_epoch_last_vclock_counter32; }
-FLASHMEM uint32_t clocks_alpha_epoch_last_ocxo1_counter32(void) { return g_alpha_epoch_last_ocxo1_counter32; }
-FLASHMEM uint32_t clocks_alpha_epoch_last_ocxo2_counter32(void) { return g_alpha_epoch_last_ocxo2_counter32; }
-FLASHMEM bool clocks_alpha_epoch_last_vclock_zero_valid(void) { return g_alpha_epoch_last_vclock_zero_valid; }
-FLASHMEM bool clocks_alpha_epoch_last_ocxo1_zero_valid(void) { return g_alpha_epoch_last_ocxo1_zero_valid; }
-FLASHMEM bool clocks_alpha_epoch_last_ocxo2_zero_valid(void) { return g_alpha_epoch_last_ocxo2_zero_valid; }
-FLASHMEM uint16_t clocks_alpha_epoch_last_vclock_hardware16_observed(void) { return g_alpha_epoch_last_vclock_hardware16_observed; }
-FLASHMEM uint16_t clocks_alpha_epoch_last_vclock_hardware16_selected(void) { return g_alpha_epoch_last_vclock_hardware16_selected; }
-FLASHMEM uint16_t clocks_alpha_epoch_last_ocxo1_hardware16(void) { return g_alpha_epoch_last_ocxo1_hardware16; }
-FLASHMEM uint16_t clocks_alpha_epoch_last_ocxo2_hardware16(void) { return g_alpha_epoch_last_ocxo2_hardware16; }
-FLASHMEM const char* clocks_alpha_epoch_last_reason(void) { return g_alpha_epoch_last_reason; }
-FLASHMEM bool clocks_alpha_epoch_initialized(void) { return g_epoch_initialized && !g_alpha_epoch_install_in_progress; }
+uint32_t clocks_alpha_epoch_sequence(void) { return g_alpha_epoch_sequence; }
+uint32_t clocks_alpha_epoch_install_count(void) { return g_alpha_epoch_install_count; }
+uint32_t clocks_alpha_epoch_install_failures(void) { return g_alpha_epoch_install_failures; }
+uint32_t clocks_alpha_epoch_last_capture_sequence(void) { return g_alpha_epoch_last_capture_sequence; }
+uint32_t clocks_alpha_epoch_last_capture_window_cycles(void) { return g_alpha_epoch_last_capture_window_cycles; }
+bool clocks_alpha_epoch_last_vclock_capture_valid(void) { return g_alpha_epoch_last_vclock_capture_valid; }
+bool clocks_alpha_epoch_last_all_lanes_valid(void) { return g_alpha_epoch_last_all_lanes_valid; }
+uint32_t clocks_alpha_epoch_last_dwt_at_edge(void) { return g_alpha_epoch_last_dwt_at_edge; }
+uint32_t clocks_alpha_epoch_last_vclock_counter32(void) { return g_alpha_epoch_last_vclock_counter32; }
+uint32_t clocks_alpha_epoch_last_ocxo1_counter32(void) { return g_alpha_epoch_last_ocxo1_counter32; }
+uint32_t clocks_alpha_epoch_last_ocxo2_counter32(void) { return g_alpha_epoch_last_ocxo2_counter32; }
+bool clocks_alpha_epoch_last_vclock_zero_valid(void) { return g_alpha_epoch_last_vclock_zero_valid; }
+bool clocks_alpha_epoch_last_ocxo1_zero_valid(void) { return g_alpha_epoch_last_ocxo1_zero_valid; }
+bool clocks_alpha_epoch_last_ocxo2_zero_valid(void) { return g_alpha_epoch_last_ocxo2_zero_valid; }
+uint16_t clocks_alpha_epoch_last_vclock_hardware16_observed(void) { return g_alpha_epoch_last_vclock_hardware16_observed; }
+uint16_t clocks_alpha_epoch_last_vclock_hardware16_selected(void) { return g_alpha_epoch_last_vclock_hardware16_selected; }
+uint16_t clocks_alpha_epoch_last_ocxo1_hardware16(void) { return g_alpha_epoch_last_ocxo1_hardware16; }
+uint16_t clocks_alpha_epoch_last_ocxo2_hardware16(void) { return g_alpha_epoch_last_ocxo2_hardware16; }
+const char* clocks_alpha_epoch_last_reason(void) { return g_alpha_epoch_last_reason; }
+bool clocks_alpha_epoch_initialized(void) { return g_epoch_initialized && !g_alpha_epoch_install_in_progress; }
 
 // ============================================================================
 // Direct event application

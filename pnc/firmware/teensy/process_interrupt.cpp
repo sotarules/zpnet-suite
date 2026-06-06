@@ -35,10 +35,8 @@
 //
 // Lanes:
 //   VCLOCK : TimePop recurring client on QTimer1 CH2 (10 MHz VCLOCK domain)
-//   OCXO1  : OCXO custody backend (QTimer2 CH0; diagnostic 100 Hz compare
-//            ladder when LR is enabled, with only exact one-second teeth public)
-//   OCXO2  : OCXO custody backend (QTimer3 CH3; symmetric diagnostic 100 Hz
-//            compare ladder and one-second publication rule)
+//   OCXO1  : OCXO custody backend (Step 1: QTimer2 CH0 one-second edge compare)
+//   OCXO2  : OCXO custody backend (Step 1: QTimer3 CH3 one-second edge compare)
 //   TimePop: QTimer1 CH2, varied compare intervals (foreground scheduler)
 //
 // The PPS GPIO ISR captures DWT as its first instruction, then reads the
@@ -198,16 +196,15 @@ static constexpr uint32_t OCXO_DWT_SOURCE_NONE = 0;
 static constexpr uint32_t OCXO_DWT_SOURCE_ISR_ENTRY = 1;
 static constexpr uint32_t OCXO_DWT_SOURCE_EMA_PREDICTED = 2;
 
-// EMA authority for OCXO one-second DWT publication.  In diagnostic LR mode
-// each active OCXO lane uses the same local compare owner at 100 Hz; intermediate
-// targets feed the report-only LR estimator, and exact one-second teeth keep
-// the existing EMA/subscriber publication path.  The 16-bit hardware compare is
-// armed only when the next authored target is inside a safe low-word window;
-// CH2 implicit rollover tending keeps the synthetic 32-bit lane projection
-// fresh between targets.  SmartZero still temporarily owns +10,000-tick samples
-// during acquisition only.  The subscriber-facing edge DWT remains
-// last-published + EMA(observed one-second interval), while raw/corrected ISR
-// DWT remains diagnostic evidence for LR/reporting.
+// EMA authority for OCXO one-second DWT publication.  In steady state each
+// OCXO lane publishes a single local one-second edge compare.  The 16-bit
+// hardware compare is armed only when the authored one-second target is inside
+// a safe low-word window; CH2 implicit rollover tending keeps the synthetic
+// 32-bit lane projection fresh between those one-second edges.  SmartZero is
+// the remaining short-cadence user and temporarily owns +10,000-tick samples
+// during acquisition only.  The subscriber-facing edge DWT is last-published
+// + EMA(observed one-second interval), smoothing service/custody excursions
+// while preserving raw ISR DWT as diagnostics.
 static constexpr bool     OCXO_EMA_DWT_AUTHORITY_ENABLED = true;
 static constexpr uint32_t OCXO_EMA_SHIFT = 7;  // alpha = 1/128 MULE CHANGE
 static constexpr uint32_t OCXO_EMA_ALPHA_NUMERATOR = 1;
@@ -411,20 +408,19 @@ static void statistical_dwt_reset_all(void) {
 // Rolling linear-regression DWT estimator shell
 // ============================================================================
 //
-// Diagnostic-only EMA -> linear-regression migration surface.  VCLOCK samples
-// are supplied by a normal named TimePop client at 100 Hz.  OCXO1/OCXO2 samples
-// are supplied by their own authored local compare targets at the same 100 Hz
-// cadence: intermediate targets feed the LR accumulator only, while the
-// one-second gear tooth still runs the existing EMA/subscriber publication path.
-// LR remains report-only and never authors subscriber DWT in this pass.
+// Conservative VCLOCK-only diagnostic feed for the EMA -> linear-regression
+// migration.  LR remains report-only and never authors subscriber DWT.  A
+// normal named TimePop client supplies clean event-coordinate DWT/VCLOCK facts
+// at 10 Hz.  The foreground VCLOCK fact drain finalizes one current-second
+// aggregate after EMA authority is known.  No OCXO cadence, SmartZero,
+// subscriber authority, or Alpha/Beta/TIMEBASE behavior changes occur here.
 
 static constexpr bool     ROLLING_LR_DWT_ESTIMATOR_ENABLED = true;
 static constexpr bool     ROLLING_LR_DWT_AUTHORITY_ENABLED = false;
 static constexpr bool     ROLLING_LR_DWT_REPORT_ONLY = true;
 static constexpr bool     ROLLING_LR_VCLOCK_SHADOW_FEED_ENABLED = true;
-static constexpr bool     ROLLING_LR_OCXO_SHADOW_FEED_ENABLED = true;
-static constexpr bool     ROLLING_LR_OCXO_COMPARE_FEED_ENABLED = true;
-static constexpr uint32_t ROLLING_LR_SAMPLE_RATE_HZ = 100U;
+static constexpr bool     ROLLING_LR_OCXO_SHADOW_FEED_ENABLED = false;
+static constexpr uint32_t ROLLING_LR_SAMPLE_RATE_HZ = 10U;
 static constexpr uint32_t ROLLING_LR_COUNTER_DELTA_TICKS =
     (uint32_t)(VCLOCK_COUNTS_PER_SECOND / ROLLING_LR_SAMPLE_RATE_HZ);
 static constexpr uint32_t ROLLING_LR_WINDOW_SECONDS = 1U;
@@ -436,25 +432,20 @@ static constexpr uint32_t ROLLING_LR_FIT_ERROR_THRESHOLD_CYCLES = 4U;
 static constexpr uint32_t ROLLING_LR_FIT_ERROR_LOOSE_THRESHOLD_CYCLES = 10U;
 static constexpr uint64_t VCLOCK_LR_DIAG_PERIOD_NS =
     (uint64_t)GNSS_NS_PER_SECOND / (uint64_t)ROLLING_LR_SAMPLE_RATE_HZ;
-static constexpr const char* VCLOCK_LR_DIAG_NAME = "VCLOCK_LR_DIAG_100HZ";
+static constexpr const char* VCLOCK_LR_DIAG_NAME = "VCLOCK_LR_DIAG_10HZ";
 
 static_assert(ROLLING_LR_WINDOW_SECONDS == 1U,
               "VCLOCK LR diagnostic pass intentionally uses one-second windows");
 static_assert(ROLLING_LR_WINDOW_SECONDS <= ROLLING_LR_MAX_WINDOW_SECONDS,
               "Rolling LR window exceeds retained segment capacity");
-static_assert(ROLLING_LR_SAMPLE_RATE_HZ == 100U,
-              "VCLOCK LR diagnostic pass starts at 100 Hz");
+static_assert(ROLLING_LR_SAMPLE_RATE_HZ == 10U,
+              "VCLOCK LR diagnostic pass starts at 10 Hz");
 static_assert((VCLOCK_COUNTS_PER_SECOND % ROLLING_LR_SAMPLE_RATE_HZ) == 0U,
               "VCLOCK LR period must divide the 10 MHz VCLOCK second");
-static_assert(ROLLING_LR_COUNTER_DELTA_TICKS == 100000U,
-              "100 Hz LR samples are expected every 100,000 VCLOCK ticks");
+static_assert(ROLLING_LR_COUNTER_DELTA_TICKS == 1000000U,
+              "10 Hz LR samples are expected every 1,000,000 VCLOCK ticks");
 static_assert((GNSS_NS_PER_SECOND % ROLLING_LR_SAMPLE_RATE_HZ) == 0LL,
-              "100 Hz LR period must divide one GNSS second exactly");
-static_assert((OCXO_WITNESS_ONE_SECOND_COUNTS % ROLLING_LR_SAMPLE_RATE_HZ) == 0U,
-              "OCXO LR sample rate must divide the 10 MHz OCXO second");
-static_assert(ROLLING_LR_COUNTER_DELTA_TICKS ==
-              (OCXO_WITNESS_ONE_SECOND_COUNTS / ROLLING_LR_SAMPLE_RATE_HZ),
-              "OCXO LR samples should use the same 100 Hz target spacing");
+              "10 Hz LR period must divide one GNSS second exactly");
 
 struct rolling_lr_segment_t {
   bool     active = false;
@@ -467,7 +458,7 @@ struct rolling_lr_segment_t {
   uint64_t first_dwt64_rel = 0;
   uint64_t last_dwt64_rel = 0;
 
-  // Retained for report-schema continuity.  The 100 Hz VCLOCK pass uses the
+  // Retained for report-schema continuity.  The 10 Hz VCLOCK pass uses the
   // lane-level one-second sums below, not retained raw sample storage.
   uint64_t sum_x = 0;
   int64_t  sum_y = 0;
@@ -484,12 +475,6 @@ struct rolling_lr_result_t {
   uint32_t window_seconds = ROLLING_LR_WINDOW_SECONDS;
   uint32_t sample_count = 0;
   uint32_t segment_count = 0;
-
-  // Finalized-window lifecycle.  These make it clear whether a REPORT read is
-  // showing a newly finalized second or the same finalized result while the
-  // next active window is still filling.
-  uint32_t finalize_count_at_result = 0;
-  uint32_t sample_total_count_at_result = 0;
 
   uint32_t target_counter32_at_event = 0;
   uint32_t observed_dwt_at_event = 0;
@@ -508,12 +493,6 @@ struct rolling_lr_result_t {
   uint32_t base_counter32 = 0;
   uint32_t base_dwt32 = 0;
   uint32_t target_ticks_from_base = 0;
-  uint32_t target_sample_index = 0;
-  uint32_t samples_before_target_count = 0;
-  uint32_t samples_after_target_count = 0;
-  bool     target_sample_included = false;
-  bool     target_is_last_sample = false;
-  bool     target_is_extrapolated = false;
   uint32_t nominal_dwt_at_event = 0;
   int32_t  inferred_minus_nominal_cycles = 0;
 
@@ -1558,8 +1537,6 @@ static vclock_repair_stats_t g_vclock_repair_stats = {};
 // would be worse than unavailable because it could be mistaken for CLOCKS'
 // campaign GNSS ledger.
 
-static bool ocxo_kind_disabled(interrupt_subscriber_kind_t kind);
-
 static int64_t vclock_gnss_from_counter32(uint32_t) {
   return -1;
 }
@@ -1608,9 +1585,9 @@ static void rolling_lr_clear_current_window(rolling_lr_dwt_lane_t& r) {
   r.rolling_sum_yy = 0;
 }
 
-static void rolling_lr_begin_window(rolling_lr_dwt_lane_t& r,
-                                    uint32_t counter32,
-                                    uint32_t dwt32) {
+static void rolling_lr_begin_vclock_window(rolling_lr_dwt_lane_t& r,
+                                           uint32_t counter32,
+                                           uint32_t dwt32) {
   rolling_lr_clear_current_window(r);
   r.window_active = true;
   r.window_sequence++;
@@ -1622,65 +1599,39 @@ static void rolling_lr_begin_window(rolling_lr_dwt_lane_t& r,
   r.window_base_dwt64 = (uint64_t)dwt32;
 }
 
-static uint32_t rolling_lr_nominal_cycles_for_ticks(
-    interrupt_subscriber_kind_t kind,
-    uint32_t ticks) {
-  // All three lane counters are nominal 10 MHz rulers in this diagnostic pass.
-  // Use the current CLOCKS/PPS-derived DWT-cycles-per-GNSS-second scalar as
-  // the nominal line and let LR fit the lane-local residual slope/intercept.
-  (void)kind;
-  return vclock_cycles_for_ticks(ticks);
-}
-
-static bool rolling_lr_feed_enabled_for_kind(interrupt_subscriber_kind_t kind) {
-  const rolling_lr_dwt_lane_t* r = rolling_lr_for_const(kind);
-  if (!ROLLING_LR_DWT_ESTIMATOR_ENABLED || !r || !r->enabled ||
-      !r->sample_feed_enabled || r->kind != kind) {
-    return false;
+static void rolling_lr_feed_vclock_sample_from_timepop(uint32_t counter32,
+                                                       uint32_t dwt32) {
+  if (!ROLLING_LR_DWT_ESTIMATOR_ENABLED ||
+      !ROLLING_LR_VCLOCK_SHADOW_FEED_ENABLED) {
+    return;
   }
 
-  if (kind == interrupt_subscriber_kind_t::VCLOCK) {
-    return ROLLING_LR_VCLOCK_SHADOW_FEED_ENABLED;
+  rolling_lr_dwt_lane_t& r = g_rolling_lr_vclock;
+  if (!r.enabled || !r.sample_feed_enabled ||
+      r.kind != interrupt_subscriber_kind_t::VCLOCK) {
+    return;
   }
-
-  if (kind == interrupt_subscriber_kind_t::OCXO1 ||
-      kind == interrupt_subscriber_kind_t::OCXO2) {
-    return ROLLING_LR_OCXO_COMPARE_FEED_ENABLED &&
-           ROLLING_LR_OCXO_SHADOW_FEED_ENABLED &&
-           !ocxo_kind_disabled(kind);
-  }
-
-  return false;
-}
-
-static void rolling_lr_feed_sample(interrupt_subscriber_kind_t kind,
-                                   uint32_t counter32,
-                                   uint32_t dwt32) {
-  if (!rolling_lr_feed_enabled_for_kind(kind)) return;
-
-  rolling_lr_dwt_lane_t* lane = rolling_lr_for(kind);
-  if (!lane) return;
-  rolling_lr_dwt_lane_t& r = *lane;
 
   if (!r.window_active) {
-    rolling_lr_begin_window(r, counter32, dwt32);
+    rolling_lr_begin_vclock_window(r, counter32, dwt32);
   }
 
   uint32_t x_ticks = counter32 - r.window_base_counter32;
 
   // A one-second diagnostic window should never span more than a little over
-  // one lane second.  If it does, start fresh rather than fitting stale samples
-  // across a counter/lifecycle discontinuity.
-  if (x_ticks > (uint32_t)VCLOCK_COUNTS_PER_SECOND + r.counter_delta_ticks) {
+  // one VCLOCK second.  If it does, start fresh rather than fitting stale
+  // samples across a counter/lifecycle discontinuity.
+  if (x_ticks > (uint32_t)VCLOCK_COUNTS_PER_SECOND +
+                    ROLLING_LR_COUNTER_DELTA_TICKS) {
     r.counter_discontinuity_count++;
-    rolling_lr_begin_window(r, counter32, dwt32);
+    rolling_lr_begin_vclock_window(r, counter32, dwt32);
     x_ticks = 0;
   }
 
   if (r.window_sample_count != 0 &&
       (int32_t)(counter32 - r.last_sample_counter32) <= 0) {
     r.counter_discontinuity_count++;
-    rolling_lr_begin_window(r, counter32, dwt32);
+    rolling_lr_begin_vclock_window(r, counter32, dwt32);
     x_ticks = 0;
   }
 
@@ -1690,7 +1641,7 @@ static void rolling_lr_feed_sample(interrupt_subscriber_kind_t kind,
   }
 
   const uint32_t dwt_delta = dwt32 - r.window_base_dwt32;
-  const uint32_t nominal_delta = rolling_lr_nominal_cycles_for_ticks(kind, x_ticks);
+  const uint32_t nominal_delta = vclock_cycles_for_ticks(x_ticks);
   const int32_t residual_cycles =
       (int32_t)((int64_t)dwt_delta - (int64_t)nominal_delta);
 
@@ -1711,43 +1662,22 @@ static void rolling_lr_feed_sample(interrupt_subscriber_kind_t kind,
   r.last_sample_dwt64 = (uint64_t)dwt32;
 }
 
-static void rolling_lr_feed_vclock_sample_from_timepop(uint32_t counter32,
-                                                       uint32_t dwt32) {
-  rolling_lr_feed_sample(interrupt_subscriber_kind_t::VCLOCK,
-                         counter32,
-                         dwt32);
-}
-
-static void rolling_lr_feed_ocxo_sample(interrupt_subscriber_kind_t kind,
-                                        uint32_t target_counter32,
-                                        uint32_t target_edge_dwt) {
-  if (kind != interrupt_subscriber_kind_t::OCXO1 &&
-      kind != interrupt_subscriber_kind_t::OCXO2) {
+static FLASHMEM void rolling_lr_finalize_vclock_window(uint32_t target_counter32,
+                                              uint32_t observed_dwt,
+                                              uint32_t authority_dwt,
+                                              const pps_t& witness_pps,
+                                              bool witness_pps_valid) {
+  if (!ROLLING_LR_DWT_ESTIMATOR_ENABLED ||
+      !ROLLING_LR_VCLOCK_SHADOW_FEED_ENABLED) {
     return;
   }
 
-  rolling_lr_feed_sample(kind, target_counter32, target_edge_dwt);
-}
-
-static FLASHMEM void rolling_lr_finalize_window(interrupt_subscriber_kind_t kind,
-                                                uint32_t target_counter32,
-                                                uint32_t observed_dwt,
-                                                uint32_t authority_dwt,
-                                                const pps_t& witness_pps,
-                                                bool witness_pps_valid) {
-  if (!rolling_lr_feed_enabled_for_kind(kind)) return;
-
-  rolling_lr_dwt_lane_t* lane = rolling_lr_for(kind);
-  if (!lane) return;
-  rolling_lr_dwt_lane_t& r = *lane;
-
+  rolling_lr_dwt_lane_t& r = g_rolling_lr_vclock;
   rolling_lr_result_t result{};
   result.sequence = r.window_sequence;
-  result.window_seconds = r.window_seconds;
+  result.window_seconds = 1U;
   result.sample_count = r.window_sample_count;
   result.segment_count = r.segment_count;
-  result.finalize_count_at_result = r.finalize_count + 1U;
-  result.sample_total_count_at_result = r.sample_total_count;
   result.target_counter32_at_event = target_counter32;
   result.observed_dwt_at_event = observed_dwt;
   result.authority_dwt_at_event = authority_dwt;
@@ -1765,10 +1695,11 @@ static FLASHMEM void rolling_lr_finalize_window(interrupt_subscriber_kind_t kind
   const int64_t sxy = r.rolling_sum_xy;
   const uint64_t syy = r.rolling_sum_yy;
 
-  // The next lane diagnostic sample starts a new current-second window.
+  // The next TimePop diagnostic sample starts a new current-second window.
   rolling_lr_clear_current_window(r);
 
-  if (!was_active || !r.enabled || !r.sample_feed_enabled || r.kind != kind ||
+  if (!was_active || !r.enabled || !r.sample_feed_enabled ||
+      r.kind != interrupt_subscriber_kind_t::VCLOCK ||
       sample_count < r.min_valid_samples) {
     r.insufficient_count++;
     result.valid = false;
@@ -1788,7 +1719,8 @@ static FLASHMEM void rolling_lr_finalize_window(interrupt_subscriber_kind_t kind
   }
 
   const uint32_t target_ticks = target_counter32 - base_counter32;
-  if (target_ticks > (uint32_t)VCLOCK_COUNTS_PER_SECOND + r.counter_delta_ticks) {
+  if (target_ticks > (uint32_t)VCLOCK_COUNTS_PER_SECOND +
+                         ROLLING_LR_COUNTER_DELTA_TICKS) {
     r.counter_discontinuity_count++;
     result.valid = false;
     result.confidence_ok = false;
@@ -1796,30 +1728,6 @@ static FLASHMEM void rolling_lr_finalize_window(interrupt_subscriber_kind_t kind
     r.last_result = result;
     return;
   }
-
-  if (r.counter_delta_ticks != 0 &&
-      (target_ticks % r.counter_delta_ticks) == 0U) {
-    result.target_sample_index = target_ticks / r.counter_delta_ticks;
-    result.target_sample_included = result.target_sample_index < sample_count;
-  } else {
-    result.target_sample_index = 0xFFFFFFFFUL;
-    result.target_sample_included = false;
-  }
-  result.samples_before_target_count =
-      (result.target_sample_index == 0xFFFFFFFFUL)
-          ? sample_count
-          : ((result.target_sample_index < sample_count)
-                 ? result.target_sample_index
-                 : sample_count);
-  result.samples_after_target_count = result.target_sample_included
-      ? (sample_count - result.target_sample_index - 1U)
-      : ((sample_count > result.samples_before_target_count)
-             ? (sample_count - result.samples_before_target_count)
-             : 0U);
-  result.target_is_last_sample = result.target_sample_included &&
-      (result.target_sample_index + 1U == sample_count);
-  result.target_is_extrapolated = !result.target_sample_included &&
-      (result.samples_after_target_count == 0U);
 
   const uint64_t n = (uint64_t)sample_count;
   const uint64_t n_sxx = n * sxx;
@@ -1832,6 +1740,7 @@ static FLASHMEM void rolling_lr_finalize_window(interrupt_subscriber_kind_t kind
     r.last_result = result;
     return;
   }
+  const uint64_t denom_u = n_sxx - sx_sx;
 
   const double n_d = (double)n;
   const double sx_d = (double)sx;
@@ -1849,9 +1758,10 @@ static FLASHMEM void rolling_lr_finalize_window(interrupt_subscriber_kind_t kind
     return;
   }
 
-  // Fit residual cycles against exact lane-local tick offset.  VCLOCK and both
-  // OCXOs use the same nominal 10 MHz ruler, but the fit is lane-local and is
-  // evaluated at the exact one-second target tooth for that lane.
+  // Fit residual cycles against exact VCLOCK tick offset.  The previous
+  // sample-index formulation lost sub-sample phase and could be tens of
+  // microseconds wrong at 10 Hz.  This formulation evaluates the line at the
+  // exact one-second target tick.
   const double slope_residual_cycles_per_tick =
       (n_d * sxy_d - sx_d * sy_d) / denom_d;
   const double intercept_residual_cycles =
@@ -1862,8 +1772,7 @@ static FLASHMEM void rolling_lr_finalize_window(interrupt_subscriber_kind_t kind
   const int64_t residual_target_cycles = (int64_t)(residual_target +
       (residual_target >= 0.0 ? 0.5 : -0.5));
 
-  const uint32_t nominal_target_cycles =
-      rolling_lr_nominal_cycles_for_ticks(kind, target_ticks);
+  const uint32_t nominal_target_cycles = vclock_cycles_for_ticks(target_ticks);
   const uint32_t nominal_dwt = base_dwt32 + nominal_target_cycles;
   const uint32_t inferred_dwt =
       (uint32_t)((int64_t)nominal_dwt + residual_target_cycles);
@@ -1898,8 +1807,8 @@ static FLASHMEM void rolling_lr_finalize_window(interrupt_subscriber_kind_t kind
   result.nominal_dwt_at_event = nominal_dwt;
   result.inferred_minus_nominal_cycles = (int32_t)(inferred_dwt - nominal_dwt);
   const double full_slope_cycles_per_sample =
-      (double)rolling_lr_nominal_cycles_for_ticks(kind, r.counter_delta_ticks) +
-      slope_residual_cycles_per_tick * (double)r.counter_delta_ticks;
+      (double)vclock_cycles_for_ticks(ROLLING_LR_COUNTER_DELTA_TICKS) +
+      slope_residual_cycles_per_tick * (double)ROLLING_LR_COUNTER_DELTA_TICKS;
   const int64_t slope_q16 = (int64_t)(full_slope_cycles_per_sample *
                                        65536.0 +
                                        (full_slope_cycles_per_sample >= 0.0
@@ -1931,31 +1840,6 @@ static FLASHMEM void rolling_lr_finalize_window(interrupt_subscriber_kind_t kind
   r.previous_slope_q16_cycles_per_sample = result.slope_q16_cycles_per_sample;
   r.last_result = result;
   r.finalize_count++;
-}
-
-static FLASHMEM void rolling_lr_finalize_vclock_window(uint32_t target_counter32,
-                                                       uint32_t observed_dwt,
-                                                       uint32_t authority_dwt,
-                                                       const pps_t& witness_pps,
-                                                       bool witness_pps_valid) {
-  rolling_lr_finalize_window(interrupt_subscriber_kind_t::VCLOCK,
-                             target_counter32,
-                             observed_dwt,
-                             authority_dwt,
-                             witness_pps,
-                             witness_pps_valid);
-}
-
-static FLASHMEM void rolling_lr_finalize_ocxo_window(interrupt_subscriber_kind_t kind,
-                                                     uint32_t target_counter32,
-                                                     uint32_t observed_dwt,
-                                                     uint32_t authority_dwt) {
-  rolling_lr_finalize_window(kind,
-                             target_counter32,
-                             observed_dwt,
-                             authority_dwt,
-                             pps_t{},
-                             false);
 }
 
 static uint32_t pps_vclock_phase_cycles_from_edges(const pps_t& pps,
@@ -2971,17 +2855,9 @@ static bool ocxo_lane_start_local_cadence_at_target(interrupt_subscriber_kind_t 
                                                     synthetic_clock32_t& clock32,
                                                     uint32_t target_counter32,
                                                     uint32_t reason);
-static bool ocxo_rolling_lr_enabled_for_lane(interrupt_subscriber_kind_t kind,
-                                             const ocxo_lane_t& lane);
-static uint32_t ocxo_normal_cadence_interval_ticks(interrupt_subscriber_kind_t kind,
-                                                   const ocxo_lane_t& lane);
-static uint32_t ocxo_normal_next_target_after(interrupt_subscriber_kind_t kind,
-                                              const ocxo_lane_t& lane,
-                                              uint32_t epoch_counter32,
-                                              uint32_t current_counter32);
-static bool ocxo_normal_target_is_one_second(interrupt_subscriber_kind_t kind,
-                                             const ocxo_lane_t& lane,
-                                             uint32_t target_counter32);
+static uint32_t ocxo_one_second_next_target_after(
+    uint32_t epoch_counter32,
+    uint32_t current_counter32);
 static void ocxo_lane_program_local_cadence_compare(
     ocxo_lane_t& lane,
     uint32_t target_counter32,
@@ -3107,7 +2983,7 @@ static ocxo_runtime_context_t g_ocxo1_ctx = {
   interrupt_lane_t::QTIMER2_CH0_COMP,
   "OCXO1",
   "ocxo1",
-  "QTIMER2_CH0_OCXO_LR_DIAG_COMPARE_CADENCE",
+  "QTIMER2_CH0_ONE_SECOND_EDGE_COMPARE",
   "QTIMER2_CH0_LOCAL_SYNTHETIC_COUNTER32",
   "QTIMER2_CH0_EMA_PREDICTED_DWT",
   "OCXO1_FACT_DRAIN",
@@ -3123,7 +2999,7 @@ static ocxo_runtime_context_t g_ocxo2_ctx = {
   interrupt_lane_t::QTIMER3_CH3_COMP,
   "OCXO2",
   "ocxo2",
-  "QTIMER3_CH3_OCXO_LR_DIAG_COMPARE_CADENCE",
+  "QTIMER3_CH3_ONE_SECOND_EDGE_COMPARE",
   "QTIMER3_CH3_LOCAL_SYNTHETIC_COUNTER32",
   "QTIMER3_CH3_EMA_PREDICTED_DWT",
   "OCXO2_FACT_DRAIN",
@@ -3561,7 +3437,7 @@ static void synthetic_clock_observe_hw16_no_pending_zero(
 }
 
 static void ocxo_lane_maybe_arm_one_second_compare(
-    interrupt_subscriber_kind_t kind,
+    interrupt_subscriber_kind_t,
     ocxo_lane_t& lane,
     synthetic_clock32_t& clock32,
     uint32_t reason) {
@@ -3571,12 +3447,9 @@ static void ocxo_lane_maybe_arm_one_second_compare(
   const uint32_t remaining = lane.cadence_next_counter32 - clock32.current_counter32;
   if (remaining == 0 || remaining > 0x7FFFFFFFUL) {
     const uint32_t next_target = lane.cadence_epoch_valid
-        ? ocxo_normal_next_target_after(kind,
-                                        lane,
-                                        lane.cadence_epoch_counter32,
-                                        clock32.current_counter32)
-        : (clock32.current_counter32 +
-           ocxo_normal_cadence_interval_ticks(kind, lane));
+        ? ocxo_one_second_next_target_after(lane.cadence_epoch_counter32,
+                                            clock32.current_counter32)
+        : (clock32.current_counter32 + OCXO_WITNESS_ONE_SECOND_COUNTS);
     lane.cadence_next_counter32 = next_target;
     lane.cadence_next_low16 = (uint16_t)(next_target & 0xFFFFU);
     lane.compare_target = lane.cadence_next_low16;
@@ -3607,12 +3480,9 @@ static void ocxo_lane_maybe_arm_one_second_compare(
     lane.witness_schedule_last_decision = OCXO_SCHEDULE_DECISION_TOO_CLOSE;
     lane.witness_schedule_last_ticks_until_arm_window = 0;
     const uint32_t next_target = lane.cadence_epoch_valid
-        ? ocxo_normal_next_target_after(kind,
-                                        lane,
-                                        lane.cadence_epoch_counter32,
-                                        clock32.current_counter32)
-        : (clock32.current_counter32 +
-           ocxo_normal_cadence_interval_ticks(kind, lane));
+        ? ocxo_one_second_next_target_after(lane.cadence_epoch_counter32,
+                                            clock32.current_counter32)
+        : (clock32.current_counter32 + OCXO_WITNESS_ONE_SECOND_COUNTS);
     lane.cadence_next_counter32 = next_target;
     lane.cadence_next_low16 = (uint16_t)(next_target & 0xFFFFU);
     lane.compare_target = lane.cadence_next_low16;
@@ -4376,53 +4246,8 @@ static void cadence_regression_reset_all(void) {
 static void copy_regression_diag(interrupt_capture_diag_t&, 
                                  const cadence_regression_result_t*) {
   // Legacy cadence-regression diagnostics are retired. The public diag fields
-  // are now populated from the compact rolling_lr_* estimator below.
-}
-
-static void copy_rolling_lr_diag(interrupt_capture_diag_t& diag,
-                                 interrupt_subscriber_kind_t kind) {
-  const rolling_lr_dwt_lane_t* lane = rolling_lr_for_const(kind);
-  if (!lane || !lane->enabled) return;
-
-  const rolling_lr_result_t& r = lane->last_result;
-
-  // Publish the most recently finalized rolling-LR one-second window into the
-  // existing subscriber diagnostic regression surface.  This is diagnostic-only:
-  // the event DWT has already been authored by the current EMA/authority path.
-  diag.regression_valid = r.valid;
-  diag.regression_sequence = r.sequence;
-  diag.regression_sample_count = r.sample_count;
-  diag.regression_observed_dwt_at_event = r.observed_dwt_at_event;
-  diag.regression_inferred_dwt_at_event = r.inferred_dwt_at_event;
-  diag.regression_inferred_minus_observed_cycles =
-      r.inferred_minus_observed_cycles;
-  diag.regression_target_counter32_at_event = r.target_counter32_at_event;
-  diag.regression_target_hardware16_at_event =
-      (uint16_t)(r.target_counter32_at_event & 0xFFFFU);
-
-  // The rolling-LR sums/no-raw-ring model does not retain a separate observed
-  // hardware low-word for the finalized edge.  Use the authored target tooth as
-  // the hardware identity; service-time low-word remains available on the OCXO
-  // service diagnostics.
-  diag.regression_observed_hardware16_at_event =
-      (uint16_t)(r.target_counter32_at_event & 0xFFFFU);
-
-  diag.regression_slope_q16_cycles_per_sample =
-      r.slope_q16_cycles_per_sample;
-  diag.regression_slope_delta_q16_cycles_per_sample =
-      r.slope_delta_q16_cycles_per_sample;
-  diag.regression_fit_error_mean_q16_cycles =
-      r.fit_error_mean_q16_cycles;
-  diag.regression_fit_error_stddev_q16_cycles =
-      r.fit_error_stddev_q16_cycles;
-  diag.regression_fit_error_min_cycles = r.fit_error_min_cycles;
-  diag.regression_fit_error_max_cycles = r.fit_error_max_cycles;
-
-  // The compact rolling-LR model currently keeps aggregate outlier counts only.
-  // Preserve the legacy +/- counters as zero and publish the honest abs counter.
-  diag.regression_fit_error_gt_plus4_count = 0;
-  diag.regression_fit_error_lt_minus4_count = 0;
-  diag.regression_fit_error_abs_gt4_count = r.fit_error_abs_gt4_count;
+  // remain zero-initialized for compatibility until the new rolling_lr_* path is
+  // explicitly promoted into the subscriber diagnostic payload.
 }
 
 // ============================================================================
@@ -4554,7 +4379,6 @@ static void emit_one_second_event(interrupt_subscriber_runtime_t& rt,
   interrupt_capture_diag_t diag {};
   fill_diag(diag, rt, event);
   copy_regression_diag(diag, regression);
-  copy_rolling_lr_diag(diag, rt.desc->kind);
   if (spinidle) {
     spinidle_copy_to_diag(diag, *spinidle);
   }
@@ -5222,51 +5046,15 @@ static bool ocxo_lane_start_local_cadence_at_target(interrupt_subscriber_kind_t,
   return true;
 }
 
-static bool ocxo_rolling_lr_enabled_for_lane(interrupt_subscriber_kind_t kind,
-                                             const ocxo_lane_t& lane) {
-  if (!ROLLING_LR_DWT_ESTIMATOR_ENABLED ||
-      !ROLLING_LR_OCXO_COMPARE_FEED_ENABLED ||
-      !ROLLING_LR_OCXO_SHADOW_FEED_ENABLED ||
-      !lane.cadence_epoch_valid ||
-      ocxo_kind_disabled(kind)) {
-    return false;
-  }
-
-  if (kind != interrupt_subscriber_kind_t::OCXO1 &&
-      kind != interrupt_subscriber_kind_t::OCXO2) {
-    return false;
-  }
-
-  const rolling_lr_dwt_lane_t* r = rolling_lr_for_const(kind);
-  return r && r->enabled && r->sample_feed_enabled && r->kind == kind;
-}
-
-static uint32_t ocxo_normal_cadence_interval_ticks(interrupt_subscriber_kind_t kind,
-                                                   const ocxo_lane_t& lane) {
-  return ocxo_rolling_lr_enabled_for_lane(kind, lane)
-      ? ROLLING_LR_COUNTER_DELTA_TICKS
-      : OCXO_WITNESS_ONE_SECOND_COUNTS;
-}
-
-static uint32_t ocxo_normal_next_target_after(interrupt_subscriber_kind_t kind,
-                                              const ocxo_lane_t& lane,
-                                              uint32_t epoch_counter32,
-                                              uint32_t current_counter32) {
-  const uint32_t interval = ocxo_normal_cadence_interval_ticks(kind, lane);
+static uint32_t ocxo_one_second_next_target_after(
+    uint32_t epoch_counter32,
+    uint32_t current_counter32) {
   const uint32_t delta = current_counter32 - epoch_counter32;
   if (delta > 0x7FFFFFFFUL) {
-    return epoch_counter32 + interval;
+    return epoch_counter32 + OCXO_WITNESS_ONE_SECOND_COUNTS;
   }
-  const uint32_t completed = delta / interval;
-  return epoch_counter32 + ((completed + 1U) * interval);
-}
-
-static bool ocxo_normal_target_is_one_second(interrupt_subscriber_kind_t kind,
-                                             const ocxo_lane_t& lane,
-                                             uint32_t target_counter32) {
-  if (!ocxo_rolling_lr_enabled_for_lane(kind, lane)) return true;
-  const uint32_t ticks_from_epoch = target_counter32 - lane.cadence_epoch_counter32;
-  return (ticks_from_epoch % OCXO_WITNESS_ONE_SECOND_COUNTS) == 0U;
+  const uint32_t seconds_completed = delta / OCXO_WITNESS_ONE_SECOND_COUNTS;
+  return epoch_counter32 + ((seconds_completed + 1U) * OCXO_WITNESS_ONE_SECOND_COUNTS);
 }
 
 static void ocxo_lane_prepare_one_second_target(
@@ -5325,16 +5113,13 @@ static bool ocxo_lane_start_local_cadence(interrupt_subscriber_kind_t kind,
 
   uint32_t target = 0;
   if (lane.cadence_epoch_valid) {
-    target = ocxo_normal_next_target_after(kind,
-                                           lane,
-                                           lane.cadence_epoch_counter32,
-                                           clock32.current_counter32);
+    target = ocxo_one_second_next_target_after(lane.cadence_epoch_counter32,
+                                               clock32.current_counter32);
   } else {
-    // Pre-logical-grid fallback: produce one authored edge from the current
+    // Pre-logical-grid fallback: produce one one-second edge from the current
     // ambient OCXO coordinate.  CLOCKS normally installs the logical grid
     // immediately after SmartZero, so this should be transient.
-    target = clock32.current_counter32 +
-             ocxo_normal_cadence_interval_ticks(kind, lane);
+    target = clock32.current_counter32 + OCXO_WITNESS_ONE_SECOND_COUNTS;
   }
 
   if (OCXO_QUIET_PHASE_SAMPLING_ENABLED &&
@@ -5347,13 +5132,13 @@ static bool ocxo_lane_start_local_cadence(interrupt_subscriber_kind_t kind,
     lane.cadence_sample_phase_ticks = ocxo_quiet_phase_ticks_for(kind);
     lane.cadence_sample_phase_us = ocxo_phase_ticks_to_us(lane.cadence_sample_phase_ticks);
     lane.cadence_sample_phase_ns = ocxo_phase_ticks_to_ns(lane.cadence_sample_phase_ticks);
-    lane.cadence_sample_period_ticks = ocxo_normal_cadence_interval_ticks(kind, lane);
+    lane.cadence_sample_period_ticks = OCXO_WITNESS_ONE_SECOND_COUNTS;
   } else {
     lane.cadence_sample_phase_valid = false;
     lane.cadence_sample_phase_ticks = 0;
     lane.cadence_sample_phase_us = 0;
     lane.cadence_sample_phase_ns = 0;
-    lane.cadence_sample_period_ticks = ocxo_normal_cadence_interval_ticks(kind, lane);
+    lane.cadence_sample_period_ticks = OCXO_WITNESS_ONE_SECOND_COUNTS;
   }
 
   if (!lane.phase_bootstrapped) {
@@ -5735,14 +5520,13 @@ static void ocxo_lane_disable_compare(ocxo_lane_t& lane) {
 //
 // The former build enqueued every 1 kHz OCXO cadence sample and asked
 // foreground TimePop ASAP to drain/interpret them. That proved too expensive.
-// This diagnostic LR pass enqueues only 100 Hz authored OCXO compare samples.
-// Intermediate samples feed LR; only the one-second gear tooth runs the
-// existing EMA/subscriber publication path. SmartZero may temporarily use
-// +10,000-tick acquisition samples, but those samples do not publish as OCXO
-// one-second events until SmartZero re-authors the normal grid.
+// Steady-state OCXO now enqueues only the local one-second edge compare.
+// SmartZero may temporarily use +10,000-tick acquisition samples, but those
+// samples do not publish as OCXO one-second events until SmartZero re-authors
+// the normal one-second grid.
 //
-// The ring remains per-lane and loss-visible, with a normal diagnostic rate
-// of 100 Hz per active OCXO lane.
+// The ring remains per-lane and loss-visible, with a normal publication rate
+// of 1 Hz per active OCXO lane.
 
 static constexpr uint32_t OCXO_PERISHABLE_FACT_RING_SIZE = 32;
 
@@ -6484,8 +6268,8 @@ static void ocxo_apply_perishable_fact_deferred(
 
   interrupt_subscriber_runtime_t* rt = ocxo_runtime_for(ctx);
 
-  // Lane-local foreground cadence hook.  In this diagnostic pass it drains
-  // both intermediate LR samples and the public one-second edge facts.
+  // First-pass lane-local cadence user callback hook.  Linear regression is
+  // disabled for this checkpoint, so this remains a visible no-op count.
   lane->cadence_user_callback_count++;
 
   const ocxo_perishable_ring_t& ring = ocxo_fact_ring_for(ctx);
@@ -6500,15 +6284,6 @@ static void ocxo_apply_perishable_fact_deferred(
   const uint32_t corrected_dwt =
       (uint32_t)((int64_t)fact.service_dwt_at_event -
                  (int64_t)correction_cycles);
-
-  const bool lr_sample_active =
-      ocxo_rolling_lr_enabled_for_lane(ctx.kind, *lane) && fact.had_active_rt;
-  if (lr_sample_active) {
-    // The LR observation is the authored OCXO target tooth paired with its
-    // service-offset-corrected DWT coordinate.  The raw service DWT remains
-    // visible to EMA/report diagnostics but is not the target-edge geometry.
-    rolling_lr_feed_ocxo_sample(ctx.kind, fact.target_counter32, corrected_dwt);
-  }
 
   lane->witness_last_fact_sequence = fact.sequence;
   lane->witness_last_fact_one_second_due = fact.one_second_due;
@@ -6551,8 +6326,9 @@ static void ocxo_apply_perishable_fact_deferred(
     lane->witness_on_or_after_service_count++;
   }
 
-  // Intermediate LR samples stop here after feeding the report-only estimator.
-  // Exact one-second teeth continue into the existing EMA/subscriber path.
+  // Linear regression is disabled and the OCXO per-sample forensic experiment
+  // has been retired from the hot path.  Only one-second rollover facts reach
+  // this foreground drain.
 
   if (!fact.one_second_due || !rt || !rt->active) {
     return;
@@ -6578,13 +6354,6 @@ static void ocxo_apply_perishable_fact_deferred(
   const uint32_t published_dwt = ocxo_lane_ema_predict_dwt(
       *lane, observed_dwt, counter_adjacency_valid, counter_delta_ticks,
       &ema_synthetic, &ema_error_cycles, &ema_diag);
-
-  if (lr_sample_active) {
-    rolling_lr_finalize_ocxo_window(ctx.kind,
-                                    fact.target_counter32,
-                                    corrected_dwt,
-                                    published_dwt);
-  }
 
   ocxo_qtimer_diag_record(ctx,
                           fact.isr_entry_dwt_raw,
@@ -6861,23 +6630,10 @@ static void ocxo_cadence_update_sample_phase(
     }
     sample.one_second_due = false;
   } else {
-    // In steady state the OCXO compare cadence may be diagnostic 100 Hz LR
-    // sampling.  Only the exact one-second gear tooth publishes a subscriber
-    // event; intermediate authored targets feed LR only.
-    sample.one_second_due =
-        ocxo_normal_target_is_one_second(ctx.kind, lane, sample.target_counter32);
-    if (sample.one_second_due) {
-      lane.cadence_one_second_due_count++;
-      lane.tick_mod_1000 = 0;
-    } else if (ocxo_rolling_lr_enabled_for_lane(ctx.kind, lane)) {
-      const uint32_t ticks_from_epoch =
-          sample.target_counter32 - lane.cadence_epoch_counter32;
-      lane.tick_mod_1000 =
-          (ticks_from_epoch / ROLLING_LR_COUNTER_DELTA_TICKS) %
-          ROLLING_LR_SAMPLE_RATE_HZ;
-    } else {
-      lane.tick_mod_1000 = 0;
-    }
+    // In steady state each OCXO compare is a one-second edge capture.
+    sample.one_second_due = true;
+    lane.cadence_one_second_due_count++;
+    lane.tick_mod_1000 = 0;
   }
   lane.cadence_last_one_second_due = sample.one_second_due;
 }
@@ -6945,8 +6701,7 @@ static void ocxo_cadence_rearm_or_stop(
     ocxo_lane_program_local_cadence_compare(lane, next_target,
                                             OCXO_CADENCE_REASON_REARM);
   } else {
-    next_target = sample.target_counter32 +
-                  ocxo_normal_cadence_interval_ticks(ctx.kind, lane);
+    next_target = sample.target_counter32 + OCXO_WITNESS_ONE_SECOND_COUNTS;
     ocxo_lane_prepare_one_second_target(ctx.kind, lane, *ctx.clock32,
                                         next_target,
                                         OCXO_CADENCE_REASON_REARM);
@@ -7050,11 +6805,7 @@ static void ocxo_cadence_compare_isr(ocxo_runtime_context_t& ctx,
   ocxo_cadence_rearm_or_stop(ctx, sample, cadence_reauthored_by_smartzero);
   ocxo_cadence_update_one_second_witness(ctx, sample);
 
-  const bool lr_sample_due =
-      ocxo_rolling_lr_enabled_for_lane(ctx.kind, lane) &&
-      !sample.was_smartzero_current;
-
-  if ((sample.one_second_due || lr_sample_due) && sample.had_active_rt) {
+  if (sample.one_second_due && sample.had_active_rt) {
     interrupt_perishable_fact_t fact =
         ocxo_cadence_build_perishable_fact(ctx, sample);
     ocxo_cadence_enqueue_fact(ctx, fact);
@@ -7733,9 +7484,9 @@ bool interrupt_start(interrupt_subscriber_kind_t kind) {
   lane->tick_mod_1000 = 0;
   ocxo_lane_ema_reset(*lane);
 
-  // OCXO lanes own one local compare chain.  With diagnostic LR enabled this
-  // chain starts on the next 100 Hz target from the installed logical grid;
-  // otherwise it starts on the next one-second edge.
+  // OCXO lanes now own only their local one-second edge compare.  Start the
+  // one-second edge compare from the installed logical grid when available;
+  // otherwise birth from the current low-word observation.
   return ocxo_lane_start_local_cadence(kind, *lane,
                                        *synthetic_clock_for_kind(kind),
                                        OCXO_CADENCE_REASON_START);
@@ -8468,43 +8219,22 @@ static FLASHMEM void add_rolling_lr_payload(Payload& p,
                ROLLING_LR_VCLOCK_SHADOW_FEED_ENABLED);
   out.add_bool("rolling_lr_ocxo_shadow_feed_enabled",
                ROLLING_LR_OCXO_SHADOW_FEED_ENABLED);
-  const bool is_vclock_lr = r.kind == interrupt_subscriber_kind_t::VCLOCK;
-  const bool is_ocxo_lr = r.kind == interrupt_subscriber_kind_t::OCXO1 ||
-                          r.kind == interrupt_subscriber_kind_t::OCXO2;
-  out.add_str("rolling_lr_feed_source",
-              is_vclock_lr ? "TIMEPOP_100HZ_CLIENT" :
-                  (is_ocxo_lr ? "OCXO_LOCAL_COMPARE_100HZ" : "NONE"));
-  out.add_bool("rolling_lr_ocxo_compare_feed_enabled",
-               is_ocxo_lr && ROLLING_LR_OCXO_COMPARE_FEED_ENABLED);
-  out.add_u32("rolling_lr_ocxo_compare_sample_interval_ticks",
-              is_ocxo_lr ? ROLLING_LR_COUNTER_DELTA_TICKS : 0U);
-  out.add_u32("rolling_lr_ocxo_compare_public_interval_ticks",
-              is_ocxo_lr ? OCXO_WITNESS_ONE_SECOND_COUNTS : 0U);
-  out.add_str("rolling_lr_observed_dwt_model",
-              is_ocxo_lr ? "SERVICE_OFFSET_CORRECTED_TARGET_EDGE_DWT"
-                         : "EVENT_COORDINATE_DWT");
   out.add_bool("rolling_lr_timepop_client_enabled",
-               is_vclock_lr && ROLLING_LR_VCLOCK_SHADOW_FEED_ENABLED);
-  out.add_str("rolling_lr_timepop_client_name",
-              is_vclock_lr ? VCLOCK_LR_DIAG_NAME : "");
-  out.add_u64("rolling_lr_timepop_client_period_ns",
-              is_vclock_lr ? VCLOCK_LR_DIAG_PERIOD_NS : 0ULL);
-  out.add_bool("rolling_lr_timepop_client_armed",
-               is_vclock_lr && g_vclock_lr_diag_timepop_armed);
-  out.add_u32("rolling_lr_timepop_client_arm_count",
-              is_vclock_lr ? g_vclock_lr_diag_timepop_arm_count : 0U);
-  out.add_u32("rolling_lr_timepop_client_arm_failures",
-              is_vclock_lr ? g_vclock_lr_diag_timepop_arm_failures : 0U);
-  out.add_u32("rolling_lr_timepop_client_fire_count",
-              is_vclock_lr ? g_vclock_lr_diag_timepop_fire_count : 0U);
+               ROLLING_LR_VCLOCK_SHADOW_FEED_ENABLED);
+  out.add_str("rolling_lr_timepop_client_name", VCLOCK_LR_DIAG_NAME);
+  out.add_u64("rolling_lr_timepop_client_period_ns", VCLOCK_LR_DIAG_PERIOD_NS);
+  out.add_bool("rolling_lr_timepop_client_armed", g_vclock_lr_diag_timepop_armed);
+  out.add_u32("rolling_lr_timepop_client_arm_count", g_vclock_lr_diag_timepop_arm_count);
+  out.add_u32("rolling_lr_timepop_client_arm_failures", g_vclock_lr_diag_timepop_arm_failures);
+  out.add_u32("rolling_lr_timepop_client_fire_count", g_vclock_lr_diag_timepop_fire_count);
   out.add_u32("rolling_lr_timepop_client_inactive_skip_count",
-              is_vclock_lr ? g_vclock_lr_diag_timepop_inactive_skip_count : 0U);
+              g_vclock_lr_diag_timepop_inactive_skip_count);
   out.add_u32("rolling_lr_timepop_client_sample_feed_count",
-              is_vclock_lr ? g_vclock_lr_diag_timepop_sample_feed_count : 0U);
+              g_vclock_lr_diag_timepop_sample_feed_count);
   out.add_u32("rolling_lr_timepop_client_last_counter32",
-              is_vclock_lr ? g_vclock_lr_diag_timepop_last_counter32 : 0U);
+              g_vclock_lr_diag_timepop_last_counter32);
   out.add_u32("rolling_lr_timepop_client_last_dwt",
-              is_vclock_lr ? g_vclock_lr_diag_timepop_last_dwt : 0U);
+              g_vclock_lr_diag_timepop_last_dwt);
   out.add_u32("rolling_lr_sample_rate_hz", r.sample_rate_hz);
   out.add_u32("rolling_lr_counter_delta_ticks", r.counter_delta_ticks);
   out.add_u32("rolling_lr_window_seconds", r.window_seconds);
@@ -8515,12 +8245,7 @@ static FLASHMEM void add_rolling_lr_payload(Payload& p,
               ROLLING_LR_FIT_ERROR_THRESHOLD_CYCLES);
   out.add_u32("rolling_lr_fit_error_loose_threshold_cycles",
               ROLLING_LR_FIT_ERROR_LOOSE_THRESHOLD_CYCLES);
-  out.add_str("rolling_lr_memory_model",
-              is_vclock_lr
-                  ? "TIMEPOP_100HZ_1S_TICK_RESIDUAL_SUMS_NO_RAW_RING"
-                  : (is_ocxo_lr
-                         ? "OCXO_COMPARE_100HZ_1S_TARGET_EDGE_RESIDUAL_SUMS_NO_RAW_RING"
-                         : "NONE"));
+  out.add_str("rolling_lr_memory_model", "TIMEPOP_10HZ_1S_TICK_RESIDUAL_SUMS_NO_RAW_RING");
 
   out.add_u32("rolling_lr_reset_count", r.reset_count);
   out.add_u32("rolling_lr_sample_total_count", r.sample_total_count);
@@ -8561,13 +8286,6 @@ static FLASHMEM void add_rolling_lr_payload(Payload& p,
   out.add_bool("rolling_lr_last_fallback_would_apply",
                last.fallback_would_apply);
   out.add_u32("rolling_lr_last_sequence", last.sequence);
-  out.add_u32("rolling_lr_last_finalize_count", last.finalize_count_at_result);
-  out.add_u32("rolling_lr_last_finalize_sample_total_count",
-              last.sample_total_count_at_result);
-  out.add_u32("rolling_lr_last_finalize_age_samples",
-              r.sample_total_count - last.sample_total_count_at_result);
-  out.add_u32("rolling_lr_last_active_window_sequence_now",
-              r.window_sequence);
   out.add_u32("rolling_lr_last_window_seconds", last.window_seconds);
   out.add_u32("rolling_lr_last_sample_count", last.sample_count);
   out.add_u32("rolling_lr_last_segment_count", last.segment_count);
@@ -8582,32 +8300,6 @@ static FLASHMEM void add_rolling_lr_payload(Payload& p,
   out.add_u32("rolling_lr_last_base_dwt32", last.base_dwt32);
   out.add_u32("rolling_lr_last_target_ticks_from_base",
               last.target_ticks_from_base);
-  out.add_u32("rolling_lr_last_target_sample_index",
-              last.target_sample_index);
-  out.add_bool("rolling_lr_last_target_sample_included",
-               last.target_sample_included);
-  out.add_bool("rolling_lr_last_target_is_last_sample",
-               last.target_is_last_sample);
-  out.add_bool("rolling_lr_last_target_is_extrapolated",
-               last.target_is_extrapolated);
-  out.add_u32("rolling_lr_last_samples_before_target_count",
-              last.samples_before_target_count);
-  out.add_u32("rolling_lr_last_samples_after_target_count",
-              last.samples_after_target_count);
-  out.add_bool("rolling_lr_last_window_contains_boundary_sample",
-               last.target_sample_included);
-  out.add_bool("rolling_lr_last_window_predicts_boundary",
-               !last.target_sample_included);
-  out.add_bool("rolling_lr_last_window_interpolates_boundary",
-               last.target_sample_included &&
-               last.samples_before_target_count != 0U &&
-               last.samples_after_target_count != 0U);
-  out.add_bool("rolling_lr_last_window_extrapolates_boundary",
-               last.target_is_extrapolated);
-  out.add_bool("rolling_lr_last_window_target_after_samples",
-               last.target_is_extrapolated);
-  out.add_bool("rolling_lr_last_window_target_is_final_sample",
-               last.target_is_last_sample);
   out.add_bool("rolling_lr_last_pps_dwt_valid", last.pps_dwt_valid);
   out.add_u32("rolling_lr_last_pps_dwt", last.pps_dwt_at_event);
   out.add_i32("rolling_lr_last_observed_minus_authority_cycles",
@@ -8817,7 +8509,7 @@ static FLASHMEM void add_runtime_payload(Payload& p) {
   p.add("isr_sanity_witness_enabled", true);
   p.add("isr_sanity_witness_policy", "REPORT_ONLY_NO_REPAIR_NO_VETO");
   p.add("timing_arch_vclock_authority", "QTIMER1_CH2_NATIVE_ROLLOVER_RELAY_EPOCH_1S_SMARTZERO_DRAIN_ARM");
-  p.add("timing_arch_ocxo_model", "LOCAL_QTIMER_100HZ_DIAGNOSTIC_LR_COMPARE_EMA_AUTHORITY");
+  p.add("timing_arch_ocxo_model", "LOCAL_QTIMER_ONE_SECOND_EDGE_CAPTURE");
   p.add("timing_arch_ocxo_migration_stage", "EMA_DWT_AUTHORITY");
   p.add("subscriber_count", g_subscriber_count);
   p.add("single_cadence_agent", false);
@@ -8839,7 +8531,6 @@ static FLASHMEM void add_runtime_payload(Payload& p) {
   p.add("rolling_lr_dwt_report_only", ROLLING_LR_DWT_REPORT_ONLY);
   p.add("rolling_lr_vclock_shadow_feed_enabled", ROLLING_LR_VCLOCK_SHADOW_FEED_ENABLED);
   p.add("rolling_lr_ocxo_shadow_feed_enabled", ROLLING_LR_OCXO_SHADOW_FEED_ENABLED);
-  p.add("rolling_lr_ocxo_compare_feed_enabled", ROLLING_LR_OCXO_COMPARE_FEED_ENABLED);
   p.add("rolling_lr_sample_rate_hz", ROLLING_LR_SAMPLE_RATE_HZ);
   p.add("rolling_lr_timepop_client_enabled", ROLLING_LR_VCLOCK_SHADOW_FEED_ENABLED);
   p.add("rolling_lr_timepop_client_name", VCLOCK_LR_DIAG_NAME);
@@ -8848,7 +8539,7 @@ static FLASHMEM void add_runtime_payload(Payload& p) {
   p.add("rolling_lr_window_seconds", ROLLING_LR_WINDOW_SECONDS);
   p.add("rolling_lr_window_capacity_samples", ROLLING_LR_WINDOW_CAPACITY_SAMPLES);
   p.add("rolling_lr_min_valid_samples", ROLLING_LR_MIN_VALID_SAMPLES);
-  p.add("rolling_lr_memory_model", "VCLOCK_TIMEPOP_100HZ_AND_OCXO_COMPARE_100HZ_1S_SUMS_NO_RAW_RING");
+  p.add("rolling_lr_memory_model", "TIMEPOP_10HZ_1S_TICK_RESIDUAL_SUMS_NO_RAW_RING");
   p.add("ocxo_compare_live_requires_enabled_and_flag", true);
   p.add("lane_report_command", "INTERRUPT.REPORT_LANES");
   p.add("single_lane_report_command", "INTERRUPT.REPORT_LANE lane=VCLOCK|OCXO1|OCXO2");
@@ -9418,12 +9109,6 @@ static FLASHMEM void add_ocxo_witness_service_payload(payload_prefix_t& out,
   out.add_u32("ema_update_count", lane.ema_update_count);
   out.add_u32("ema_last_observed_dwt", lane.ema_last_observed_dwt);
   out.add_u32("ema_last_emitted_dwt", lane.ema_last_emitted_dwt);
-  const int32_t ema_endpoint_bias_cycles =
-      (int32_t)(lane.ema_last_emitted_dwt - lane.ema_last_observed_dwt);
-  out.add_bool("ema_endpoint_bias_valid", lane.ema_initialized);
-  out.add_i32("ema_endpoint_bias_cycles", ema_endpoint_bias_cycles);
-  out.add_u32("ema_endpoint_bias_abs_cycles",
-              ocxo_ema_abs_i32(ema_endpoint_bias_cycles));
   out.add_u32("ema_last_observed_interval_cycles",
               lane.ema_last_observed_interval_cycles);
   out.add_u32("ema_interval_cycles", lane.ema_interval_cycles);
@@ -10188,25 +9873,6 @@ static FLASHMEM void add_vclock_lane_ema_section(Payload& p) {
   p.add("vclock_ema_update_count", g_vclock_lane.ema_update_count);
   p.add("vclock_ema_last_observed_dwt", g_vclock_lane.ema_last_observed_dwt);
   p.add("vclock_ema_last_emitted_dwt", g_vclock_lane.ema_last_emitted_dwt);
-  const int32_t vclock_ema_endpoint_bias_cycles =
-      (int32_t)(g_vclock_lane.ema_last_emitted_dwt -
-                g_vclock_lane.ema_last_observed_dwt);
-  p.add("vclock_ema_endpoint_bias_valid", g_vclock_lane.ema_initialized);
-  p.add("vclock_ema_endpoint_bias_cycles", vclock_ema_endpoint_bias_cycles);
-  p.add("vclock_ema_endpoint_bias_abs_cycles",
-        dwt_ema_abs_i32(vclock_ema_endpoint_bias_cycles));
-  const rolling_lr_result_t& vclock_lr_last = g_rolling_lr_vclock.last_result;
-  p.add("vclock_ema_endpoint_bias_vs_lr_valid", vclock_lr_last.valid);
-  p.add("vclock_ema_endpoint_bias_vs_lr_cycles",
-        vclock_lr_last.valid
-            ? (int32_t)(g_vclock_lane.ema_last_emitted_dwt -
-                        vclock_lr_last.inferred_dwt_at_event)
-            : 0);
-  p.add("vclock_ema_endpoint_bias_vs_lr_abs_cycles",
-        vclock_lr_last.valid
-            ? dwt_ema_abs_i32((int32_t)(g_vclock_lane.ema_last_emitted_dwt -
-                                        vclock_lr_last.inferred_dwt_at_event))
-            : 0U);
   p.add("vclock_ema_last_observed_interval_cycles", g_vclock_lane.ema_last_observed_interval_cycles);
   p.add("vclock_ema_interval_cycles", g_vclock_lane.ema_interval_cycles);
   p.add("vclock_ema_last_predicted_dwt", g_vclock_lane.ema_last_predicted_dwt);
@@ -10400,25 +10066,6 @@ static FLASHMEM void add_ocxo_lane_ema_section(Payload& p,
   out.add_u32("ema_update_count", lane.ema_update_count);
   out.add_u32("ema_last_observed_dwt", lane.ema_last_observed_dwt);
   out.add_u32("ema_last_emitted_dwt", lane.ema_last_emitted_dwt);
-  const int32_t ema_endpoint_bias_cycles =
-      (int32_t)(lane.ema_last_emitted_dwt - lane.ema_last_observed_dwt);
-  out.add_bool("ema_endpoint_bias_valid", lane.ema_initialized);
-  out.add_i32("ema_endpoint_bias_cycles", ema_endpoint_bias_cycles);
-  out.add_u32("ema_endpoint_bias_abs_cycles",
-              ocxo_ema_abs_i32(ema_endpoint_bias_cycles));
-  const rolling_lr_dwt_lane_t* rolling = rolling_lr_for_const(ctx.kind);
-  const bool rolling_lr_valid = rolling && rolling->last_result.valid;
-  out.add_bool("ema_endpoint_bias_vs_lr_valid", rolling_lr_valid);
-  out.add_i32("ema_endpoint_bias_vs_lr_cycles",
-              rolling_lr_valid
-                  ? (int32_t)(lane.ema_last_emitted_dwt -
-                              rolling->last_result.inferred_dwt_at_event)
-                  : 0);
-  out.add_u32("ema_endpoint_bias_vs_lr_abs_cycles",
-              rolling_lr_valid
-                  ? ocxo_ema_abs_i32((int32_t)(lane.ema_last_emitted_dwt -
-                                               rolling->last_result.inferred_dwt_at_event))
-                  : 0U);
   out.add_u32("ema_last_observed_interval_cycles", lane.ema_last_observed_interval_cycles);
   out.add_u32("ema_interval_cycles", lane.ema_interval_cycles);
   out.add_u32("ema_last_predicted_dwt", lane.ema_last_predicted_dwt);
