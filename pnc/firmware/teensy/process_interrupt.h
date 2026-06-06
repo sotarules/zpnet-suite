@@ -6,7 +6,7 @@
 //
 //   • VCLOCK lane   (critical recurring TimePop client on QTimer1 CH2)
 //   • OCXO lanes    (local QTimer compare custody on QTimer2 CH0 / QTimer3 CH3;
-//                    diagnostic LR may run at 10 Hz, but only the exact
+//                    diagnostic LR may run at 100 Hz, but only the exact
 //                    one-second gear tooth publishes a subscriber event)
 //   • Cadence minder (TimePop VCLOCK/relay heartbeat; no longer OCXO rollover owner)
 //   • CH2 implicit rollover tend (passive ISR seatbelt for all 16-bit clock extenders;
@@ -118,7 +118,7 @@
 //     OCXO2  : local OCXO custody backend; current Step 1 backend is QTimer3 CH3.
 //
 //   OCXO backend ISRs own authored local compare targets.  In diagnostic LR
-//   mode the steady-state target spacing is 10 Hz (+1,000,000 ticks):
+//   mode the steady-state target spacing is 100 Hz (+100,000 ticks):
 //   intermediate samples feed the report-only linear-regression estimator,
 //   while the exact one-second gear tooth is deferred to foreground as the
 //   subscriber event consumed by CLOCKS/Alpha.  Its subscriber-facing DWT
@@ -764,7 +764,7 @@ bool interrupt_last_epoch_capture(interrupt_epoch_capture_t* out);
 //
 // Once CLOCKS has selected the OCXO zero-offset counter32 values, this call
 // installs the lane's logical grid. SmartZero still uses +10,000-tick
-// acquisition samples. Steady-state diagnostic LR uses +1,000,000-tick compare
+// acquisition samples. Steady-state diagnostic LR uses +100,000-tick compare
 // samples when enabled, while exact +10,000,000-tick grid teeth remain the
 // OCXO-local one-second edges delivered to Alpha.
 void interrupt_ocxo_logical_grid_epoch(uint32_t ocxo1_epoch_counter32,

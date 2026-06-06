@@ -35,9 +35,9 @@
 //
 // Lanes:
 //   VCLOCK : TimePop recurring client on QTimer1 CH2 (10 MHz VCLOCK domain)
-//   OCXO1  : OCXO custody backend (QTimer2 CH0; diagnostic 10 Hz compare
+//   OCXO1  : OCXO custody backend (QTimer2 CH0; diagnostic 100 Hz compare
 //            ladder when LR is enabled, with only exact one-second teeth public)
-//   OCXO2  : OCXO custody backend (QTimer3 CH3; symmetric diagnostic 10 Hz
+//   OCXO2  : OCXO custody backend (QTimer3 CH3; symmetric diagnostic 100 Hz
 //            compare ladder and one-second publication rule)
 //   TimePop: QTimer1 CH2, varied compare intervals (foreground scheduler)
 //
@@ -199,7 +199,7 @@ static constexpr uint32_t OCXO_DWT_SOURCE_ISR_ENTRY = 1;
 static constexpr uint32_t OCXO_DWT_SOURCE_EMA_PREDICTED = 2;
 
 // EMA authority for OCXO one-second DWT publication.  In diagnostic LR mode
-// each active OCXO lane uses the same local compare owner at 10 Hz; intermediate
+// each active OCXO lane uses the same local compare owner at 100 Hz; intermediate
 // targets feed the report-only LR estimator, and exact one-second teeth keep
 // the existing EMA/subscriber publication path.  The 16-bit hardware compare is
 // armed only when the next authored target is inside a safe low-word window;
@@ -412,8 +412,8 @@ static void statistical_dwt_reset_all(void) {
 // ============================================================================
 //
 // Diagnostic-only EMA -> linear-regression migration surface.  VCLOCK samples
-// are supplied by a normal named TimePop client at 10 Hz.  OCXO1/OCXO2 samples
-// are supplied by their own authored local compare targets at the same 10 Hz
+// are supplied by a normal named TimePop client at 100 Hz.  OCXO1/OCXO2 samples
+// are supplied by their own authored local compare targets at the same 100 Hz
 // cadence: intermediate targets feed the LR accumulator only, while the
 // one-second gear tooth still runs the existing EMA/subscriber publication path.
 // LR remains report-only and never authors subscriber DWT in this pass.
@@ -424,7 +424,7 @@ static constexpr bool     ROLLING_LR_DWT_REPORT_ONLY = true;
 static constexpr bool     ROLLING_LR_VCLOCK_SHADOW_FEED_ENABLED = true;
 static constexpr bool     ROLLING_LR_OCXO_SHADOW_FEED_ENABLED = true;
 static constexpr bool     ROLLING_LR_OCXO_COMPARE_FEED_ENABLED = true;
-static constexpr uint32_t ROLLING_LR_SAMPLE_RATE_HZ = 10U;
+static constexpr uint32_t ROLLING_LR_SAMPLE_RATE_HZ = 100U;
 static constexpr uint32_t ROLLING_LR_COUNTER_DELTA_TICKS =
     (uint32_t)(VCLOCK_COUNTS_PER_SECOND / ROLLING_LR_SAMPLE_RATE_HZ);
 static constexpr uint32_t ROLLING_LR_WINDOW_SECONDS = 1U;
@@ -436,25 +436,25 @@ static constexpr uint32_t ROLLING_LR_FIT_ERROR_THRESHOLD_CYCLES = 4U;
 static constexpr uint32_t ROLLING_LR_FIT_ERROR_LOOSE_THRESHOLD_CYCLES = 10U;
 static constexpr uint64_t VCLOCK_LR_DIAG_PERIOD_NS =
     (uint64_t)GNSS_NS_PER_SECOND / (uint64_t)ROLLING_LR_SAMPLE_RATE_HZ;
-static constexpr const char* VCLOCK_LR_DIAG_NAME = "VCLOCK_LR_DIAG_10HZ";
+static constexpr const char* VCLOCK_LR_DIAG_NAME = "VCLOCK_LR_DIAG_100HZ";
 
 static_assert(ROLLING_LR_WINDOW_SECONDS == 1U,
               "VCLOCK LR diagnostic pass intentionally uses one-second windows");
 static_assert(ROLLING_LR_WINDOW_SECONDS <= ROLLING_LR_MAX_WINDOW_SECONDS,
               "Rolling LR window exceeds retained segment capacity");
-static_assert(ROLLING_LR_SAMPLE_RATE_HZ == 10U,
-              "VCLOCK LR diagnostic pass starts at 10 Hz");
+static_assert(ROLLING_LR_SAMPLE_RATE_HZ == 100U,
+              "VCLOCK LR diagnostic pass starts at 100 Hz");
 static_assert((VCLOCK_COUNTS_PER_SECOND % ROLLING_LR_SAMPLE_RATE_HZ) == 0U,
               "VCLOCK LR period must divide the 10 MHz VCLOCK second");
-static_assert(ROLLING_LR_COUNTER_DELTA_TICKS == 1000000U,
-              "10 Hz LR samples are expected every 1,000,000 VCLOCK ticks");
+static_assert(ROLLING_LR_COUNTER_DELTA_TICKS == 100000U,
+              "100 Hz LR samples are expected every 100,000 VCLOCK ticks");
 static_assert((GNSS_NS_PER_SECOND % ROLLING_LR_SAMPLE_RATE_HZ) == 0LL,
-              "10 Hz LR period must divide one GNSS second exactly");
+              "100 Hz LR period must divide one GNSS second exactly");
 static_assert((OCXO_WITNESS_ONE_SECOND_COUNTS % ROLLING_LR_SAMPLE_RATE_HZ) == 0U,
               "OCXO LR sample rate must divide the 10 MHz OCXO second");
 static_assert(ROLLING_LR_COUNTER_DELTA_TICKS ==
               (OCXO_WITNESS_ONE_SECOND_COUNTS / ROLLING_LR_SAMPLE_RATE_HZ),
-              "OCXO LR samples should use the same 10 Hz target spacing");
+              "OCXO LR samples should use the same 100 Hz target spacing");
 
 struct rolling_lr_segment_t {
   bool     active = false;
@@ -467,7 +467,7 @@ struct rolling_lr_segment_t {
   uint64_t first_dwt64_rel = 0;
   uint64_t last_dwt64_rel = 0;
 
-  // Retained for report-schema continuity.  The 10 Hz VCLOCK pass uses the
+  // Retained for report-schema continuity.  The 100 Hz VCLOCK pass uses the
   // lane-level one-second sums below, not retained raw sample storage.
   uint64_t sum_x = 0;
   int64_t  sum_y = 0;
@@ -5689,14 +5689,14 @@ static void ocxo_lane_disable_compare(ocxo_lane_t& lane) {
 //
 // The former build enqueued every 1 kHz OCXO cadence sample and asked
 // foreground TimePop ASAP to drain/interpret them. That proved too expensive.
-// This diagnostic LR pass enqueues only 10 Hz authored OCXO compare samples.
+// This diagnostic LR pass enqueues only 100 Hz authored OCXO compare samples.
 // Intermediate samples feed LR; only the one-second gear tooth runs the
 // existing EMA/subscriber publication path. SmartZero may temporarily use
 // +10,000-tick acquisition samples, but those samples do not publish as OCXO
 // one-second events until SmartZero re-authors the normal grid.
 //
 // The ring remains per-lane and loss-visible, with a normal diagnostic rate
-// of 10 Hz per active OCXO lane.
+// of 100 Hz per active OCXO lane.
 
 static constexpr uint32_t OCXO_PERISHABLE_FACT_RING_SIZE = 32;
 
@@ -6815,7 +6815,7 @@ static void ocxo_cadence_update_sample_phase(
     }
     sample.one_second_due = false;
   } else {
-    // In steady state the OCXO compare cadence may be diagnostic 10 Hz LR
+    // In steady state the OCXO compare cadence may be diagnostic 100 Hz LR
     // sampling.  Only the exact one-second gear tooth publishes a subscriber
     // event; intermediate authored targets feed LR only.
     sample.one_second_due =
@@ -7688,7 +7688,7 @@ bool interrupt_start(interrupt_subscriber_kind_t kind) {
   ocxo_lane_ema_reset(*lane);
 
   // OCXO lanes own one local compare chain.  With diagnostic LR enabled this
-  // chain starts on the next 10 Hz target from the installed logical grid;
+  // chain starts on the next 100 Hz target from the installed logical grid;
   // otherwise it starts on the next one-second edge.
   return ocxo_lane_start_local_cadence(kind, *lane,
                                        *synthetic_clock_for_kind(kind),
@@ -8426,8 +8426,8 @@ static FLASHMEM void add_rolling_lr_payload(Payload& p,
   const bool is_ocxo_lr = r.kind == interrupt_subscriber_kind_t::OCXO1 ||
                           r.kind == interrupt_subscriber_kind_t::OCXO2;
   out.add_str("rolling_lr_feed_source",
-              is_vclock_lr ? "TIMEPOP_10HZ_CLIENT" :
-                  (is_ocxo_lr ? "OCXO_LOCAL_COMPARE_10HZ" : "NONE"));
+              is_vclock_lr ? "TIMEPOP_100HZ_CLIENT" :
+                  (is_ocxo_lr ? "OCXO_LOCAL_COMPARE_100HZ" : "NONE"));
   out.add_bool("rolling_lr_ocxo_compare_feed_enabled",
                is_ocxo_lr && ROLLING_LR_OCXO_COMPARE_FEED_ENABLED);
   out.add_u32("rolling_lr_ocxo_compare_sample_interval_ticks",
@@ -8471,9 +8471,9 @@ static FLASHMEM void add_rolling_lr_payload(Payload& p,
               ROLLING_LR_FIT_ERROR_LOOSE_THRESHOLD_CYCLES);
   out.add_str("rolling_lr_memory_model",
               is_vclock_lr
-                  ? "TIMEPOP_10HZ_1S_TICK_RESIDUAL_SUMS_NO_RAW_RING"
+                  ? "TIMEPOP_100HZ_1S_TICK_RESIDUAL_SUMS_NO_RAW_RING"
                   : (is_ocxo_lr
-                         ? "OCXO_COMPARE_10HZ_1S_TARGET_EDGE_RESIDUAL_SUMS_NO_RAW_RING"
+                         ? "OCXO_COMPARE_100HZ_1S_TARGET_EDGE_RESIDUAL_SUMS_NO_RAW_RING"
                          : "NONE"));
 
   out.add_u32("rolling_lr_reset_count", r.reset_count);
@@ -8771,7 +8771,7 @@ static FLASHMEM void add_runtime_payload(Payload& p) {
   p.add("isr_sanity_witness_enabled", true);
   p.add("isr_sanity_witness_policy", "REPORT_ONLY_NO_REPAIR_NO_VETO");
   p.add("timing_arch_vclock_authority", "QTIMER1_CH2_NATIVE_ROLLOVER_RELAY_EPOCH_1S_SMARTZERO_DRAIN_ARM");
-  p.add("timing_arch_ocxo_model", "LOCAL_QTIMER_10HZ_DIAGNOSTIC_LR_COMPARE_EMA_AUTHORITY");
+  p.add("timing_arch_ocxo_model", "LOCAL_QTIMER_100HZ_DIAGNOSTIC_LR_COMPARE_EMA_AUTHORITY");
   p.add("timing_arch_ocxo_migration_stage", "EMA_DWT_AUTHORITY");
   p.add("subscriber_count", g_subscriber_count);
   p.add("single_cadence_agent", false);
@@ -8802,7 +8802,7 @@ static FLASHMEM void add_runtime_payload(Payload& p) {
   p.add("rolling_lr_window_seconds", ROLLING_LR_WINDOW_SECONDS);
   p.add("rolling_lr_window_capacity_samples", ROLLING_LR_WINDOW_CAPACITY_SAMPLES);
   p.add("rolling_lr_min_valid_samples", ROLLING_LR_MIN_VALID_SAMPLES);
-  p.add("rolling_lr_memory_model", "VCLOCK_TIMEPOP_10HZ_AND_OCXO_COMPARE_10HZ_1S_SUMS_NO_RAW_RING");
+  p.add("rolling_lr_memory_model", "VCLOCK_TIMEPOP_100HZ_AND_OCXO_COMPARE_100HZ_1S_SUMS_NO_RAW_RING");
   p.add("ocxo_compare_live_requires_enabled_and_flag", true);
   p.add("lane_report_command", "INTERRUPT.REPORT_LANES");
   p.add("single_lane_report_command", "INTERRUPT.REPORT_LANE lane=VCLOCK|OCXO1|OCXO2");
