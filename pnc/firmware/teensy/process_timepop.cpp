@@ -145,6 +145,32 @@ static constexpr uint32_t PHASE_PROBE_MASK_CPU_USAGE      = 1u << 5;
 static constexpr uint32_t PHASE_PROBE_MASK_PHASE_PROBE    = 1u << 6;
 static constexpr uint32_t PHASE_PROBE_MASK_OTHER          = 1u << 7;
 
+// TimePop-owned software-IRQ shadow scheduler handoff probe.
+//
+// Step 1C only proves that a lower-priority, TimePop-owned NVIC interrupt can
+// be pended from the CH2 ISR and run before thread-mode work resumes.  It
+// intentionally performs no scheduling, callback dispatch, slot mutation, or
+// compare arming.
+//
+// We deliberately avoid PendSV here.  Teensy core owns PendSV/EventResponder,
+// while IRQ_SOFTWARE is an ordinary external interrupt that TimePop can attach,
+// prioritize, enable, pend, and inspect directly.  The existing pendsv_shadow_*
+// report names are retained for continuity with Step 1A/1B, but the mechanism
+// reported below is IRQ_SOFTWARE via NVIC_ISPR.
+static constexpr bool         TIMEPOP_PENDSV_SHADOW_ENABLED = true;
+static constexpr uint32_t     TIMEPOP_PENDSV_SHADOW_PRIORITY = 16U;
+static constexpr IRQ_NUMBER_t TIMEPOP_PENDSV_SHADOW_IRQ = IRQ_SOFTWARE;
+static constexpr const char*  TIMEPOP_PENDSV_SHADOW_MECHANISM = "IRQ_SOFTWARE_ISPR";
+static constexpr const char*  TIMEPOP_PENDSV_SHADOW_TRIGGER = "NVIC_ISPR";
+
+// ARMv7-M NVIC external interrupt register banks.
+static constexpr uint32_t TIMEPOP_NVIC_ISER_ADDR = 0xE000E100UL;
+static constexpr uint32_t TIMEPOP_NVIC_ICER_ADDR = 0xE000E180UL;
+static constexpr uint32_t TIMEPOP_NVIC_ISPR_ADDR = 0xE000E200UL;
+static constexpr uint32_t TIMEPOP_NVIC_ICPR_ADDR = 0xE000E280UL;
+static constexpr uint32_t TIMEPOP_NVIC_IABR_ADDR = 0xE000E300UL;
+static constexpr uint32_t TIMEPOP_NVIC_IPR_ADDR  = 0xE000E400UL;
+
 
 // ============================================================================
 // Slot
@@ -161,14 +187,6 @@ enum class timepop_fire_capture_source_t : uint8_t {
   IRQ_CH2,
   SCHEDULE_NEXT,
 };
-
-static const char* fire_capture_source_str(timepop_fire_capture_source_t source) {
-  switch (source) {
-    case timepop_fire_capture_source_t::IRQ_CH2:        return "IRQ_CH2";
-    case timepop_fire_capture_source_t::SCHEDULE_NEXT: return "SCHEDULE_NEXT";
-    default:                                           return "NONE";
-  }
-}
 
 enum class timepop_arm_source_t : uint8_t {
   NONE = 0,
@@ -504,6 +522,68 @@ static volatile uint32_t diag_isr_recurring_rearm_failures = 0;
 static volatile uint32_t diag_schedule_next_calls_total = 0;
 static volatile uint32_t diag_schedule_next_calls_from_dispatch = 0;
 static volatile uint32_t diag_schedule_next_calls_from_other = 0;
+
+// Software-IRQ shadow-mode diagnostics.  These counters are deliberately
+// separate from scheduler behavior: Step 1C only tests the lower-priority
+// interrupt handoff plumbing.  The pendsv_shadow_* field names are retained so
+// existing host-side report readers do not need to change while we prove the
+// mechanism.
+static volatile bool     diag_pendsv_shadow_configured = false;
+static volatile bool     diag_pendsv_shadow_pending = false;
+static volatile bool     diag_pendsv_shadow_running = false;
+static volatile uint32_t diag_pendsv_shadow_configure_count = 0;
+static volatile uint32_t diag_pendsv_shadow_request_count = 0;
+static volatile uint32_t diag_pendsv_shadow_served_request_count = 0;
+static volatile uint32_t diag_pendsv_shadow_request_unconfigured_count = 0;
+static volatile uint32_t diag_pendsv_shadow_coalesced_request_count = 0;
+static volatile uint32_t diag_pendsv_shadow_entry_count = 0;
+static volatile uint32_t diag_pendsv_shadow_exit_count = 0;
+static volatile uint32_t diag_pendsv_shadow_spurious_entry_count = 0;
+static volatile uint32_t diag_pendsv_shadow_reentry_count = 0;
+static volatile uint32_t diag_pendsv_shadow_latency_sample_count = 0;
+static volatile uint32_t diag_pendsv_shadow_last_request_dwt = 0;
+static volatile uint32_t diag_pendsv_shadow_last_entry_dwt = 0;
+static volatile uint32_t diag_pendsv_shadow_last_exit_dwt = 0;
+static volatile uint32_t diag_pendsv_shadow_last_latency_cycles = 0;
+static volatile uint32_t diag_pendsv_shadow_min_latency_cycles = UINT32_MAX;
+static volatile uint32_t diag_pendsv_shadow_max_latency_cycles = 0;
+static volatile uint64_t diag_pendsv_shadow_latency_cycles_sum = 0;
+static volatile uint32_t diag_pendsv_shadow_last_body_cycles = 0;
+static volatile uint32_t diag_pendsv_shadow_max_body_cycles = 0;
+static volatile const char* diag_pendsv_shadow_last_request_context = nullptr;
+
+static volatile uint32_t diag_pendsv_shadow_irq_number = 0;
+static volatile uint32_t diag_pendsv_shadow_irq_index = 0;
+static volatile uint32_t diag_pendsv_shadow_irq_mask = 0;
+static volatile uint32_t diag_pendsv_shadow_priority_applied = 0xFFFFFFFFUL;
+static volatile uint32_t diag_pendsv_shadow_priority_live = 0xFFFFFFFFUL;
+static volatile uint32_t diag_pendsv_shadow_iser_word = 0;
+static volatile uint32_t diag_pendsv_shadow_ispr_word = 0;
+static volatile uint32_t diag_pendsv_shadow_iabr_word = 0;
+static volatile bool     diag_pendsv_shadow_enabled_bit = false;
+static volatile bool     diag_pendsv_shadow_pending_bit = false;
+static volatile bool     diag_pendsv_shadow_active_bit = false;
+
+static volatile uint32_t diag_pendsv_shadow_request_ipsr = 0;
+static volatile uint32_t diag_pendsv_shadow_request_primask = 0;
+static volatile uint32_t diag_pendsv_shadow_request_basepri = 0;
+static volatile uint32_t diag_pendsv_shadow_request_faultmask = 0;
+static volatile bool     diag_pendsv_shadow_request_pre_enabled_bit = false;
+static volatile bool     diag_pendsv_shadow_request_pre_pending_bit = false;
+static volatile bool     diag_pendsv_shadow_request_pre_active_bit = false;
+static volatile bool     diag_pendsv_shadow_request_post_enabled_bit = false;
+static volatile bool     diag_pendsv_shadow_request_post_pending_bit = false;
+static volatile bool     diag_pendsv_shadow_request_post_active_bit = false;
+
+static volatile uint32_t diag_pendsv_shadow_entry_ipsr = 0;
+static volatile uint32_t diag_pendsv_shadow_entry_primask = 0;
+static volatile uint32_t diag_pendsv_shadow_entry_basepri = 0;
+static volatile uint32_t diag_pendsv_shadow_entry_faultmask = 0;
+static volatile bool     diag_pendsv_shadow_entry_enabled_bit = false;
+static volatile bool     diag_pendsv_shadow_entry_pending_bit = false;
+static volatile bool     diag_pendsv_shadow_entry_active_bit = false;
+static volatile bool     diag_pendsv_shadow_exit_pending_bit = false;
+static volatile bool     diag_pendsv_shadow_exit_active_bit = false;
 
 // Normal precision fires should be authored by IRQ_CH2.  If schedule_next()
 // discovers an already-past timed slot, TimePop still records and surfaces
@@ -963,6 +1043,11 @@ static void timepop_dispatch_set_phase(timepop_dispatch_phase_t phase);
 static void timepop_dispatch_leave(void);
 static void timepop_apply_dispatch_mutations(const char* context);
 static void timepop_idle_witness_spin_until_pending(void);
+static void timepop_pendsv_shadow_configure(void);
+static void timepop_pendsv_shadow_reset(void);
+static void timepop_pendsv_shadow_request_from_irq(const char* context);
+static void timepop_pendsv_shadow_service(void);
+static void timepop_pendsv_shadow_software_irq_isr(void);
 
 // ============================================================================
 // Dispatch-time mutation barrier helpers
@@ -1291,6 +1376,318 @@ static void timepop_idle_witness_spin_until_pending(void) {
 
   diag_idle_witness_running = false;
   diag_idle_witness_exit_count++;
+}
+
+static inline uint32_t timepop_pendsv_shadow_irq_number(void) {
+  return (uint32_t)TIMEPOP_PENDSV_SHADOW_IRQ;
+}
+
+static inline uint32_t timepop_pendsv_shadow_irq_index(void) {
+  return timepop_pendsv_shadow_irq_number() >> 5;
+}
+
+static inline uint32_t timepop_pendsv_shadow_irq_mask(void) {
+  return (1UL << (timepop_pendsv_shadow_irq_number() & 31U));
+}
+
+static inline volatile uint32_t& timepop_nvic_iser_word(uint32_t irq) {
+  volatile uint32_t* const regs = (volatile uint32_t*)TIMEPOP_NVIC_ISER_ADDR;
+  return regs[irq >> 5];
+}
+
+static inline volatile uint32_t& timepop_nvic_icer_word(uint32_t irq) {
+  volatile uint32_t* const regs = (volatile uint32_t*)TIMEPOP_NVIC_ICER_ADDR;
+  return regs[irq >> 5];
+}
+
+static inline volatile uint32_t& timepop_nvic_ispr_word(uint32_t irq) {
+  volatile uint32_t* const regs = (volatile uint32_t*)TIMEPOP_NVIC_ISPR_ADDR;
+  return regs[irq >> 5];
+}
+
+static inline volatile uint32_t& timepop_nvic_icpr_word(uint32_t irq) {
+  volatile uint32_t* const regs = (volatile uint32_t*)TIMEPOP_NVIC_ICPR_ADDR;
+  return regs[irq >> 5];
+}
+
+static inline volatile uint32_t& timepop_nvic_iabr_word(uint32_t irq) {
+  volatile uint32_t* const regs = (volatile uint32_t*)TIMEPOP_NVIC_IABR_ADDR;
+  return regs[irq >> 5];
+}
+
+static inline volatile uint8_t& timepop_nvic_ipr_byte(uint32_t irq) {
+  volatile uint8_t* const regs = (volatile uint8_t*)TIMEPOP_NVIC_IPR_ADDR;
+  return regs[irq];
+}
+
+static inline void timepop_irq_barrier(void) {
+  __asm__ volatile ("dsb" ::: "memory");
+  __asm__ volatile ("isb" ::: "memory");
+}
+
+static inline uint32_t timepop_read_ipsr(void) {
+  uint32_t v = 0;
+  __asm__ volatile ("mrs %0, ipsr" : "=r" (v));
+  return v;
+}
+
+static inline uint32_t timepop_read_primask(void) {
+  uint32_t v = 0;
+  __asm__ volatile ("mrs %0, primask" : "=r" (v));
+  return v;
+}
+
+static inline uint32_t timepop_read_basepri(void) {
+  uint32_t v = 0;
+  __asm__ volatile ("mrs %0, basepri" : "=r" (v));
+  return v;
+}
+
+static inline uint32_t timepop_read_faultmask(void) {
+  uint32_t v = 0;
+  __asm__ volatile ("mrs %0, faultmask" : "=r" (v));
+  return v;
+}
+
+static inline bool timepop_pendsv_shadow_enabled_bit(void) {
+  const uint32_t irq = timepop_pendsv_shadow_irq_number();
+  return (timepop_nvic_iser_word(irq) & timepop_pendsv_shadow_irq_mask()) != 0;
+}
+
+static inline bool timepop_pendsv_shadow_pending_bit(void) {
+  const uint32_t irq = timepop_pendsv_shadow_irq_number();
+  return (timepop_nvic_ispr_word(irq) & timepop_pendsv_shadow_irq_mask()) != 0;
+}
+
+static inline bool timepop_pendsv_shadow_active_bit(void) {
+  const uint32_t irq = timepop_pendsv_shadow_irq_number();
+  return (timepop_nvic_iabr_word(irq) & timepop_pendsv_shadow_irq_mask()) != 0;
+}
+
+static void timepop_pendsv_shadow_update_nvic_diag(void) {
+  const uint32_t irq = timepop_pendsv_shadow_irq_number();
+  diag_pendsv_shadow_irq_number = irq;
+  diag_pendsv_shadow_irq_index = timepop_pendsv_shadow_irq_index();
+  diag_pendsv_shadow_irq_mask = timepop_pendsv_shadow_irq_mask();
+  diag_pendsv_shadow_priority_live = timepop_nvic_ipr_byte(irq);
+  diag_pendsv_shadow_iser_word = timepop_nvic_iser_word(irq);
+  diag_pendsv_shadow_ispr_word = timepop_nvic_ispr_word(irq);
+  diag_pendsv_shadow_iabr_word = timepop_nvic_iabr_word(irq);
+  diag_pendsv_shadow_enabled_bit =
+      (diag_pendsv_shadow_iser_word & diag_pendsv_shadow_irq_mask) != 0;
+  diag_pendsv_shadow_pending_bit =
+      (diag_pendsv_shadow_ispr_word & diag_pendsv_shadow_irq_mask) != 0;
+  diag_pendsv_shadow_active_bit =
+      (diag_pendsv_shadow_iabr_word & diag_pendsv_shadow_irq_mask) != 0;
+  diag_pendsv_shadow_pending =
+      (diag_pendsv_shadow_request_count != diag_pendsv_shadow_served_request_count) ||
+      diag_pendsv_shadow_pending_bit;
+}
+
+static void timepop_pendsv_shadow_reset(void) {
+  diag_pendsv_shadow_pending = false;
+  diag_pendsv_shadow_running = false;
+  diag_pendsv_shadow_request_count = 0;
+  diag_pendsv_shadow_served_request_count = 0;
+  diag_pendsv_shadow_request_unconfigured_count = 0;
+  diag_pendsv_shadow_coalesced_request_count = 0;
+  diag_pendsv_shadow_entry_count = 0;
+  diag_pendsv_shadow_exit_count = 0;
+  diag_pendsv_shadow_spurious_entry_count = 0;
+  diag_pendsv_shadow_reentry_count = 0;
+  diag_pendsv_shadow_latency_sample_count = 0;
+  diag_pendsv_shadow_last_request_dwt = 0;
+  diag_pendsv_shadow_last_entry_dwt = 0;
+  diag_pendsv_shadow_last_exit_dwt = 0;
+  diag_pendsv_shadow_last_latency_cycles = 0;
+  diag_pendsv_shadow_min_latency_cycles = UINT32_MAX;
+  diag_pendsv_shadow_max_latency_cycles = 0;
+  diag_pendsv_shadow_latency_cycles_sum = 0;
+  diag_pendsv_shadow_last_body_cycles = 0;
+  diag_pendsv_shadow_max_body_cycles = 0;
+  diag_pendsv_shadow_last_request_context = nullptr;
+
+  diag_pendsv_shadow_irq_number = timepop_pendsv_shadow_irq_number();
+  diag_pendsv_shadow_irq_index = timepop_pendsv_shadow_irq_index();
+  diag_pendsv_shadow_irq_mask = timepop_pendsv_shadow_irq_mask();
+  diag_pendsv_shadow_priority_applied = 0xFFFFFFFFUL;
+  diag_pendsv_shadow_priority_live = 0xFFFFFFFFUL;
+  diag_pendsv_shadow_iser_word = 0;
+  diag_pendsv_shadow_ispr_word = 0;
+  diag_pendsv_shadow_iabr_word = 0;
+  diag_pendsv_shadow_enabled_bit = false;
+  diag_pendsv_shadow_pending_bit = false;
+  diag_pendsv_shadow_active_bit = false;
+
+  diag_pendsv_shadow_request_ipsr = 0;
+  diag_pendsv_shadow_request_primask = 0;
+  diag_pendsv_shadow_request_basepri = 0;
+  diag_pendsv_shadow_request_faultmask = 0;
+  diag_pendsv_shadow_request_pre_enabled_bit = false;
+  diag_pendsv_shadow_request_pre_pending_bit = false;
+  diag_pendsv_shadow_request_pre_active_bit = false;
+  diag_pendsv_shadow_request_post_enabled_bit = false;
+  diag_pendsv_shadow_request_post_pending_bit = false;
+  diag_pendsv_shadow_request_post_active_bit = false;
+
+  diag_pendsv_shadow_entry_ipsr = 0;
+  diag_pendsv_shadow_entry_primask = 0;
+  diag_pendsv_shadow_entry_basepri = 0;
+  diag_pendsv_shadow_entry_faultmask = 0;
+  diag_pendsv_shadow_entry_enabled_bit = false;
+  diag_pendsv_shadow_entry_pending_bit = false;
+  diag_pendsv_shadow_entry_active_bit = false;
+  diag_pendsv_shadow_exit_pending_bit = false;
+  diag_pendsv_shadow_exit_active_bit = false;
+}
+
+static void timepop_pendsv_shadow_configure(void) {
+  if (!TIMEPOP_PENDSV_SHADOW_ENABLED) return;
+  if (diag_pendsv_shadow_configured) {
+    timepop_pendsv_shadow_update_nvic_diag();
+    return;
+  }
+
+  const uint32_t irq = timepop_pendsv_shadow_irq_number();
+  const uint32_t mask = timepop_pendsv_shadow_irq_mask();
+
+  attachInterruptVector(TIMEPOP_PENDSV_SHADOW_IRQ,
+                        timepop_pendsv_shadow_software_irq_isr);
+
+  // Start from an unambiguous NVIC state before enabling the POC IRQ.
+  timepop_nvic_icpr_word(irq) = mask;
+  timepop_irq_barrier();
+
+  NVIC_SET_PRIORITY(TIMEPOP_PENDSV_SHADOW_IRQ,
+                    TIMEPOP_PENDSV_SHADOW_PRIORITY);
+  diag_pendsv_shadow_priority_applied = TIMEPOP_PENDSV_SHADOW_PRIORITY;
+
+  NVIC_ENABLE_IRQ(TIMEPOP_PENDSV_SHADOW_IRQ);
+  timepop_irq_barrier();
+
+  diag_pendsv_shadow_configured = true;
+  diag_pendsv_shadow_configure_count++;
+
+  timepop_pendsv_shadow_update_nvic_diag();
+}
+
+static void timepop_pendsv_shadow_request_from_irq(const char* context) {
+  if (!TIMEPOP_PENDSV_SHADOW_ENABLED) return;
+
+  const uint32_t irq = timepop_pendsv_shadow_irq_number();
+  const uint32_t mask = timepop_pendsv_shadow_irq_mask();
+  const uint32_t request_dwt = ARM_DWT_CYCCNT;
+
+  if (!diag_pendsv_shadow_configured) {
+    diag_pendsv_shadow_request_unconfigured_count++;
+    timepop_pendsv_shadow_configure();
+  }
+
+  timepop_pendsv_shadow_update_nvic_diag();
+
+  diag_pendsv_shadow_request_ipsr = timepop_read_ipsr();
+  diag_pendsv_shadow_request_primask = timepop_read_primask();
+  diag_pendsv_shadow_request_basepri = timepop_read_basepri();
+  diag_pendsv_shadow_request_faultmask = timepop_read_faultmask();
+  diag_pendsv_shadow_request_pre_enabled_bit = diag_pendsv_shadow_enabled_bit;
+  diag_pendsv_shadow_request_pre_pending_bit = diag_pendsv_shadow_pending_bit;
+  diag_pendsv_shadow_request_pre_active_bit = diag_pendsv_shadow_active_bit;
+
+  if (diag_pendsv_shadow_pending || diag_pendsv_shadow_running ||
+      diag_pendsv_shadow_request_count != diag_pendsv_shadow_served_request_count) {
+    diag_pendsv_shadow_coalesced_request_count++;
+  }
+
+  diag_pendsv_shadow_request_count++;
+  diag_pendsv_shadow_pending = true;
+  diag_pendsv_shadow_last_request_dwt = request_dwt;
+  diag_pendsv_shadow_last_request_context = context;
+
+  // Directly pend the TimePop-owned software IRQ.  This is the simplest POC
+  // for the final architecture's lower-priority scheduler handoff: priority-0
+  // timing ISR requests priority-16 work, then returns.
+  timepop_nvic_ispr_word(irq) = mask;
+  timepop_irq_barrier();
+
+  diag_pendsv_shadow_request_post_enabled_bit =
+      (timepop_nvic_iser_word(irq) & mask) != 0;
+  diag_pendsv_shadow_request_post_pending_bit =
+      (timepop_nvic_ispr_word(irq) & mask) != 0;
+  diag_pendsv_shadow_request_post_active_bit =
+      (timepop_nvic_iabr_word(irq) & mask) != 0;
+
+  timepop_pendsv_shadow_update_nvic_diag();
+}
+
+static void timepop_pendsv_shadow_service(void) {
+  const uint32_t entry_dwt = ARM_DWT_CYCCNT;
+
+  diag_pendsv_shadow_entry_count++;
+  diag_pendsv_shadow_last_entry_dwt = entry_dwt;
+  diag_pendsv_shadow_entry_ipsr = timepop_read_ipsr();
+  diag_pendsv_shadow_entry_primask = timepop_read_primask();
+  diag_pendsv_shadow_entry_basepri = timepop_read_basepri();
+  diag_pendsv_shadow_entry_faultmask = timepop_read_faultmask();
+  timepop_pendsv_shadow_update_nvic_diag();
+  diag_pendsv_shadow_entry_enabled_bit = diag_pendsv_shadow_enabled_bit;
+  diag_pendsv_shadow_entry_pending_bit = diag_pendsv_shadow_pending_bit;
+  diag_pendsv_shadow_entry_active_bit = diag_pendsv_shadow_active_bit;
+
+  if (diag_pendsv_shadow_running) {
+    diag_pendsv_shadow_reentry_count++;
+    return;
+  }
+
+  diag_pendsv_shadow_running = true;
+
+  const uint32_t requests_seen = diag_pendsv_shadow_request_count;
+  const uint32_t requests_previously_served =
+      diag_pendsv_shadow_served_request_count;
+  const bool had_unserved_request = requests_seen != requests_previously_served;
+
+  if (had_unserved_request) {
+    diag_pendsv_shadow_served_request_count = requests_seen;
+    diag_pendsv_shadow_pending = false;
+
+    const uint32_t request_dwt = diag_pendsv_shadow_last_request_dwt;
+    if (request_dwt != 0) {
+      const uint32_t latency = entry_dwt - request_dwt;
+      diag_pendsv_shadow_latency_sample_count++;
+      diag_pendsv_shadow_last_latency_cycles = latency;
+      diag_pendsv_shadow_latency_cycles_sum += (uint64_t)latency;
+      if (latency < diag_pendsv_shadow_min_latency_cycles) {
+        diag_pendsv_shadow_min_latency_cycles = latency;
+      }
+      if (latency > diag_pendsv_shadow_max_latency_cycles) {
+        diag_pendsv_shadow_max_latency_cycles = latency;
+      }
+    }
+  } else {
+    diag_pendsv_shadow_spurious_entry_count++;
+    diag_pendsv_shadow_pending = false;
+  }
+
+  // Shadow mode stops here.  No scheduling, no callbacks, no slot mutation,
+  // and no compare rearming happen in the software IRQ during Step 1C.
+  const uint32_t exit_dwt = ARM_DWT_CYCCNT;
+  const uint32_t body_cycles = exit_dwt - entry_dwt;
+  diag_pendsv_shadow_last_exit_dwt = exit_dwt;
+  diag_pendsv_shadow_last_body_cycles = body_cycles;
+  if (body_cycles > diag_pendsv_shadow_max_body_cycles) {
+    diag_pendsv_shadow_max_body_cycles = body_cycles;
+  }
+
+  timepop_pendsv_shadow_update_nvic_diag();
+  diag_pendsv_shadow_exit_pending_bit = diag_pendsv_shadow_pending_bit;
+  diag_pendsv_shadow_exit_active_bit = diag_pendsv_shadow_active_bit;
+
+  diag_pendsv_shadow_running = false;
+  diag_pendsv_shadow_exit_count++;
+  timepop_pendsv_shadow_update_nvic_diag();
+}
+
+static void timepop_pendsv_shadow_software_irq_isr(void) {
+  timepop_pendsv_shadow_service();
 }
 
 static bool pop_dispatch_mutation(timepop_dispatch_mutation_t& out) {
@@ -2934,6 +3331,7 @@ void timepop_qtimer1_ch2_handler(const interrupt_event_t& event,
 
   diag_schedule_next_calls_from_other++;
   schedule_next();
+  timepop_pendsv_shadow_request_from_irq("qtimer1_ch2_irq_tail");
 }
 
 
@@ -3127,6 +3525,11 @@ void timepop_init(void) {
   diag_idle_witness_pending_exit_count = 0;
   diag_idle_witness_last_enter_dwt = 0;
   diag_idle_witness_last_exit_dwt = 0;
+
+  diag_pendsv_shadow_configured = false;
+  diag_pendsv_shadow_configure_count = 0;
+  timepop_pendsv_shadow_reset();
+  timepop_pendsv_shadow_configure();
 
   diag_asap_armed = 0;
   diag_asap_dispatched = 0;
@@ -4832,6 +5235,97 @@ static Payload cmd_report(const Payload&) {
   out.add("schedule_next_calls_total",         diag_schedule_next_calls_total);
   out.add("schedule_next_calls_from_dispatch", diag_schedule_next_calls_from_dispatch);
   out.add("schedule_next_calls_from_other",    diag_schedule_next_calls_from_other);
+  out.add("pendsv_shadow_supported",           true);
+  out.add("pendsv_shadow_enabled",             TIMEPOP_PENDSV_SHADOW_ENABLED);
+  out.add("pendsv_shadow_mechanism",           TIMEPOP_PENDSV_SHADOW_MECHANISM);
+  out.add("pendsv_shadow_trigger_method",      TIMEPOP_PENDSV_SHADOW_TRIGGER);
+  out.add("pendsv_shadow_private_irq",         true);
+  out.add("pendsv_shadow_irq",                 (uint32_t)TIMEPOP_PENDSV_SHADOW_IRQ);
+  out.add("pendsv_shadow_priority",            TIMEPOP_PENDSV_SHADOW_PRIORITY);
+  out.add("pendsv_shadow_configured",          diag_pendsv_shadow_configured);
+  out.add("pendsv_shadow_configure_count",     diag_pendsv_shadow_configure_count);
+  out.add("pendsv_shadow_pending",             diag_pendsv_shadow_pending);
+  out.add("pendsv_shadow_running",             diag_pendsv_shadow_running);
+  out.add("pendsv_shadow_request_count",       diag_pendsv_shadow_request_count);
+  out.add("pendsv_shadow_served_request_count",
+          diag_pendsv_shadow_served_request_count);
+  out.add("pendsv_shadow_unserved_request_count",
+          diag_pendsv_shadow_request_count - diag_pendsv_shadow_served_request_count);
+  out.add("pendsv_shadow_request_unconfigured_count",
+          diag_pendsv_shadow_request_unconfigured_count);
+  out.add("pendsv_shadow_coalesced_request_count",
+          diag_pendsv_shadow_coalesced_request_count);
+  out.add("pendsv_shadow_entry_count",         diag_pendsv_shadow_entry_count);
+  out.add("pendsv_shadow_exit_count",          diag_pendsv_shadow_exit_count);
+  out.add("pendsv_shadow_spurious_entry_count",
+          diag_pendsv_shadow_spurious_entry_count);
+  out.add("pendsv_shadow_reentry_count",       diag_pendsv_shadow_reentry_count);
+  out.add("pendsv_shadow_latency_sample_count",
+          diag_pendsv_shadow_latency_sample_count);
+  out.add("pendsv_shadow_last_request_dwt",    diag_pendsv_shadow_last_request_dwt);
+  out.add("pendsv_shadow_last_entry_dwt",      diag_pendsv_shadow_last_entry_dwt);
+  out.add("pendsv_shadow_last_exit_dwt",       diag_pendsv_shadow_last_exit_dwt);
+  out.add("pendsv_shadow_last_latency_cycles",
+          diag_pendsv_shadow_last_latency_cycles);
+  out.add("pendsv_shadow_min_latency_cycles",
+          diag_pendsv_shadow_latency_sample_count
+              ? diag_pendsv_shadow_min_latency_cycles
+              : 0U);
+  out.add("pendsv_shadow_max_latency_cycles",
+          diag_pendsv_shadow_max_latency_cycles);
+  out.add("pendsv_shadow_mean_latency_cycles",
+          diag_pendsv_shadow_latency_sample_count
+              ? (uint32_t)(diag_pendsv_shadow_latency_cycles_sum /
+                           (uint64_t)diag_pendsv_shadow_latency_sample_count)
+              : 0U);
+  out.add("pendsv_shadow_last_body_cycles",
+          diag_pendsv_shadow_last_body_cycles);
+  out.add("pendsv_shadow_max_body_cycles",
+          diag_pendsv_shadow_max_body_cycles);
+  out.add("pendsv_shadow_last_request_context",
+          (const char*)(diag_pendsv_shadow_last_request_context
+                            ? diag_pendsv_shadow_last_request_context
+                            : ""));
+
+  timepop_pendsv_shadow_update_nvic_diag();
+  out.add("pendsv_shadow_irq_number",          diag_pendsv_shadow_irq_number);
+  out.add("pendsv_shadow_irq_index",           diag_pendsv_shadow_irq_index);
+  out.add("pendsv_shadow_irq_mask",            diag_pendsv_shadow_irq_mask);
+  out.add("pendsv_shadow_priority_applied",    diag_pendsv_shadow_priority_applied);
+  out.add("pendsv_shadow_priority_live",       diag_pendsv_shadow_priority_live);
+  out.add("pendsv_shadow_iser_word",           diag_pendsv_shadow_iser_word);
+  out.add("pendsv_shadow_ispr_word",           diag_pendsv_shadow_ispr_word);
+  out.add("pendsv_shadow_iabr_word",           diag_pendsv_shadow_iabr_word);
+  out.add("pendsv_shadow_enabled_bit",         diag_pendsv_shadow_enabled_bit);
+  out.add("pendsv_shadow_pending_bit",         diag_pendsv_shadow_pending_bit);
+  out.add("pendsv_shadow_active_bit",          diag_pendsv_shadow_active_bit);
+
+  out.add("pendsv_shadow_request_ipsr",        diag_pendsv_shadow_request_ipsr);
+  out.add("pendsv_shadow_request_primask",     diag_pendsv_shadow_request_primask);
+  out.add("pendsv_shadow_request_basepri",     diag_pendsv_shadow_request_basepri);
+  out.add("pendsv_shadow_request_faultmask",   diag_pendsv_shadow_request_faultmask);
+  out.add("pendsv_shadow_request_pre_enabled_bit",
+          diag_pendsv_shadow_request_pre_enabled_bit);
+  out.add("pendsv_shadow_request_pre_pending_bit",
+          diag_pendsv_shadow_request_pre_pending_bit);
+  out.add("pendsv_shadow_request_pre_active_bit",
+          diag_pendsv_shadow_request_pre_active_bit);
+  out.add("pendsv_shadow_request_post_enabled_bit",
+          diag_pendsv_shadow_request_post_enabled_bit);
+  out.add("pendsv_shadow_request_post_pending_bit",
+          diag_pendsv_shadow_request_post_pending_bit);
+  out.add("pendsv_shadow_request_post_active_bit",
+          diag_pendsv_shadow_request_post_active_bit);
+
+  out.add("pendsv_shadow_entry_ipsr",          diag_pendsv_shadow_entry_ipsr);
+  out.add("pendsv_shadow_entry_primask",       diag_pendsv_shadow_entry_primask);
+  out.add("pendsv_shadow_entry_basepri",       diag_pendsv_shadow_entry_basepri);
+  out.add("pendsv_shadow_entry_faultmask",     diag_pendsv_shadow_entry_faultmask);
+  out.add("pendsv_shadow_entry_enabled_bit",   diag_pendsv_shadow_entry_enabled_bit);
+  out.add("pendsv_shadow_entry_pending_bit",   diag_pendsv_shadow_entry_pending_bit);
+  out.add("pendsv_shadow_entry_active_bit",    diag_pendsv_shadow_entry_active_bit);
+  out.add("pendsv_shadow_exit_pending_bit",    diag_pendsv_shadow_exit_pending_bit);
+  out.add("pendsv_shadow_exit_active_bit",     diag_pendsv_shadow_exit_active_bit);
   out.add("schedule_next_expired_passes",      diag_schedule_next_expired_passes);
   out.add("schedule_next_expired_slots",       diag_schedule_next_expired_slots);
   out.add("schedule_next_late_max_ticks",      diag_schedule_next_late_max_ticks);
@@ -5211,6 +5705,19 @@ static Payload cmd_slots(const Payload&) {
   out.add("epoch_change_count", diag_epoch_change_count);
   out.add("epoch_last_anchor_pps_count", diag_epoch_last_anchor_pps_count);
   out.add("schedule_next_expired_passes", diag_schedule_next_expired_passes);
+  timepop_pendsv_shadow_update_nvic_diag();
+  out.add("pendsv_shadow_mechanism", TIMEPOP_PENDSV_SHADOW_MECHANISM);
+  out.add("pendsv_shadow_trigger_method", TIMEPOP_PENDSV_SHADOW_TRIGGER);
+  out.add("pendsv_shadow_irq", (uint32_t)TIMEPOP_PENDSV_SHADOW_IRQ);
+  out.add("pendsv_shadow_configured", diag_pendsv_shadow_configured);
+  out.add("pendsv_shadow_enabled_bit", diag_pendsv_shadow_enabled_bit);
+  out.add("pendsv_shadow_pending_bit", diag_pendsv_shadow_pending_bit);
+  out.add("pendsv_shadow_active_bit", diag_pendsv_shadow_active_bit);
+  out.add("pendsv_shadow_request_count", diag_pendsv_shadow_request_count);
+  out.add("pendsv_shadow_served_request_count", diag_pendsv_shadow_served_request_count);
+  out.add("pendsv_shadow_entry_count", diag_pendsv_shadow_entry_count);
+  out.add("pendsv_shadow_pending", diag_pendsv_shadow_pending);
+  out.add("pendsv_shadow_max_latency_cycles", diag_pendsv_shadow_max_latency_cycles);
   out.add("schedule_next_expired_slots", diag_schedule_next_expired_slots);
   out.add("schedule_next_late_max_ticks", diag_schedule_next_late_max_ticks);
   out.add("missed_deadline_slots", diag_missed_deadline_slots);
