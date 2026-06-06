@@ -1204,7 +1204,7 @@ static uint32_t alpha_static_prediction_clock_id(time_clock_id_t clock) {
   return (uint32_t)((uint8_t)clock);
 }
 
-FLASHMEM bool clocks_static_prediction_snapshot(time_clock_id_t clock,
+bool clocks_static_prediction_snapshot(time_clock_id_t clock,
                                        clocks_static_prediction_snapshot_t* out) {
   if (!out) return false;
   alpha_static_prediction_store_t* s = alpha_static_prediction_store(clock);
@@ -1263,7 +1263,7 @@ static bool alpha_static_prediction_snapshot_store(const alpha_static_prediction
   return false;
 }
 
-FLASHMEM bool clocks_static_prediction_pps_snapshot(clocks_static_prediction_snapshot_t* out) {
+bool clocks_static_prediction_pps_snapshot(clocks_static_prediction_snapshot_t* out) {
   return alpha_static_prediction_snapshot_store(g_static_prediction_pps, 0U, out);
 }
 
@@ -1739,7 +1739,7 @@ static void alpha_ocxo_pps_projection_compute(time_clock_id_t clock,
   }
 }
 
-FLASHMEM bool clocks_alpha_ocxo_pps_projection_snapshot(
+bool clocks_alpha_ocxo_pps_projection_snapshot(
     time_clock_id_t clock,
     clocks_alpha_ocxo_pps_projection_snapshot_t* out) {
   if (!out) return false;
@@ -2356,7 +2356,7 @@ static void alpha_forensics_publish(time_clock_id_t clock_id,
   alpha_event_flow_note_forensics_publish(clock_id, *s);
 }
 
-FLASHMEM bool clocks_alpha_lane_forensics(time_clock_id_t clock,
+bool clocks_alpha_lane_forensics(time_clock_id_t clock,
                                  clocks_alpha_lane_forensics_t* out) {
   if (!out) return false;
   alpha_event_flow_note_snapshot_request(clock);

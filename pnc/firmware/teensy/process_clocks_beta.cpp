@@ -905,13 +905,13 @@ static FLASHMEM void publish_freq(Payload& p, const char* clock_name, double ppb
 
 
 
-static FLASHMEM clocks_static_prediction_snapshot_t prediction_snapshot_for_pps(void) {
+static clocks_static_prediction_snapshot_t prediction_snapshot_for_pps(void) {
   clocks_static_prediction_snapshot_t s{};
   (void)clocks_static_prediction_pps_snapshot(&s);
   return s;
 }
 
-static FLASHMEM clocks_static_prediction_snapshot_t prediction_snapshot_for_clock(time_clock_id_t clock) {
+static clocks_static_prediction_snapshot_t prediction_snapshot_for_clock(time_clock_id_t clock) {
   clocks_static_prediction_snapshot_t s{};
   (void)clocks_static_prediction_snapshot(clock, &s);
   return s;
@@ -1215,7 +1215,7 @@ static FLASHMEM void payload_add_lane_forensics_flat(Payload& p,
 // Keep the legacy flat helpers above for focused reports and transition tools;
 // the publication pair itself uses the helpers below.
 
-static FLASHMEM void payload_add_welford_object(Payload& parent,
+static void payload_add_welford_object(Payload& parent,
                                        const char* key,
                                        const welford_t& w) {
   Payload obj;
@@ -1228,13 +1228,13 @@ static FLASHMEM void payload_add_welford_object(Payload& parent,
   parent.add_object(key, obj);
 }
 
-static FLASHMEM void payload_add_frequency_fields(Payload& obj, double ppb_value) {
+static void payload_add_frequency_fields(Payload& obj, double ppb_value) {
   const double tau_value = 1.0 + ppb_value / 1e9;
   obj.add("tau", tau_value, 12);
   obj.add("ppb", ppb_value, 3);
 }
 
-static FLASHMEM void payload_add_stats_clock(Payload& parent,
+static void payload_add_stats_clock(Payload& parent,
                                     const char* key,
                                     const welford_t& w,
                                     bool include_frequency) {
@@ -1246,7 +1246,7 @@ static FLASHMEM void payload_add_stats_clock(Payload& parent,
   parent.add_object(key, obj);
 }
 
-static FLASHMEM void payload_add_stats_summary_hierarchical(Payload& p) {
+static void payload_add_stats_summary_hierarchical(Payload& p) {
   Payload stats;
   payload_add_stats_clock(stats, "dwt", welford_dwt, true);
   payload_add_stats_clock(stats, "vclock", welford_vclock, true);
@@ -1262,7 +1262,7 @@ static FLASHMEM void payload_add_stats_summary_hierarchical(Payload& p) {
   p.add_object("stats", stats);
 }
 
-static FLASHMEM void payload_add_prediction_lane_object(Payload& parent,
+static void payload_add_prediction_lane_object(Payload& parent,
                                                const char* key,
                                                const clocks_static_prediction_snapshot_t& s) {
   Payload lane;
@@ -1274,7 +1274,7 @@ static FLASHMEM void payload_add_prediction_lane_object(Payload& parent,
   parent.add_object(key, lane);
 }
 
-static FLASHMEM void payload_add_prediction_summary_hierarchical(Payload& p) {
+static void payload_add_prediction_summary_hierarchical(Payload& p) {
   Payload prediction;
   payload_add_prediction_lane_object(prediction, "pps", prediction_snapshot_for_pps());
   payload_add_prediction_lane_object(prediction, "vclock", prediction_snapshot_for_clock(time_clock_id_t::VCLOCK));
@@ -1326,7 +1326,7 @@ static FLASHMEM void payload_add_spincatch_object(Payload& parent,
   parent.add_object("spincatch", spincatch);
 }
 
-static FLASHMEM void payload_add_lane_forensics_object(Payload& parent,
+static void payload_add_lane_forensics_object(Payload& parent,
                                               bool valid,
                                               const clocks_alpha_lane_forensics_t& f) {
   Payload forensics;
@@ -1381,7 +1381,7 @@ static FLASHMEM void payload_add_lane_forensics_object(Payload& parent,
   parent.add_object("forensics", forensics);
 }
 
-static FLASHMEM void payload_add_ocxo_service_object(Payload& parent,
+static void payload_add_ocxo_service_object(Payload& parent,
                                             bool valid,
                                             const clocks_alpha_lane_forensics_t& f) {
   Payload service;
@@ -1395,7 +1395,7 @@ static FLASHMEM void payload_add_ocxo_service_object(Payload& parent,
   parent.add_object("service", service);
 }
 
-static FLASHMEM void payload_add_lane_regression_object(Payload& parent,
+static void payload_add_lane_regression_object(Payload& parent,
                                                bool valid,
                                                const clocks_alpha_lane_forensics_t& f) {
   Payload regression;
@@ -1498,7 +1498,7 @@ struct ocxo_cycle_residual_diag_t {
   int64_t  diagnostic_minus_traditional = 0;
 };
 
-static FLASHMEM ocxo_cycle_residual_diag_t ocxo_cycle_residual_diag_build(
+static ocxo_cycle_residual_diag_t ocxo_cycle_residual_diag_build(
     const clocks_static_prediction_snapshot_t& gnss,
     const clocks_static_prediction_snapshot_t& clock,
     bool traditional_valid,
@@ -1533,7 +1533,7 @@ static FLASHMEM ocxo_cycle_residual_diag_t ocxo_cycle_residual_diag_build(
   return d;
 }
 
-static FLASHMEM void payload_add_ocxo_pps_residual_object(Payload& parent,
+static void payload_add_ocxo_pps_residual_object(Payload& parent,
                                                 bool valid,
                                                 uint64_t gnss_interval_ns,
                                                 uint64_t clock_interval_ns,
@@ -1547,7 +1547,7 @@ static FLASHMEM void payload_add_ocxo_pps_residual_object(Payload& parent,
   parent.add_object("pps_residual", residual);
 }
 
-static FLASHMEM void payload_add_ocxo_cycle_residual_diag_object(
+static void payload_add_ocxo_cycle_residual_diag_object(
     Payload& parent,
     const ocxo_cycle_residual_diag_t& d) {
   Payload diag;
@@ -1582,7 +1582,7 @@ static FLASHMEM void payload_add_ocxo_cycle_residual_diag_object(
   parent.add_object("cycle_residual_diagnostic", diag);
 }
 
-static FLASHMEM void payload_add_timebase_pair_identity(Payload& p,
+static void payload_add_timebase_pair_identity(Payload& p,
                                                const char* schema,
                                                const char* version_key,
                                                uint32_t version,
@@ -1612,14 +1612,14 @@ static FLASHMEM void payload_add_timebase_pair_identity(Payload& p,
   p.add("servo_active", calibrate_ocxo_mode != servo_mode_t::OFF);
 }
 
-static FLASHMEM void payload_add_vclock_fragment(Payload& p, uint64_t public_gnss_ns) {
+static void payload_add_vclock_fragment(Payload& p, uint64_t public_gnss_ns) {
   Payload lane;
   lane.add("ns", public_gnss_ns);
   lane.add("counter32_at_pps_vclock", (uint32_t)g_counter32_at_pps_vclock);
   p.add_object("vclock", lane);
 }
 
-static FLASHMEM void payload_add_vclock_forensics(Payload& p,
+static void payload_add_vclock_forensics(Payload& p,
                                          uint64_t public_gnss_ns,
                                          bool forensics_valid,
                                          const clocks_alpha_lane_forensics_t& f) {
@@ -1636,7 +1636,7 @@ static FLASHMEM void payload_add_vclock_forensics(Payload& p,
   p.add_object("vclock", lane);
 }
 
-static FLASHMEM void payload_add_ocxo_fragment(Payload& p,
+static void payload_add_ocxo_fragment(Payload& p,
                                       const char* key,
                                       uint64_t public_ns,
                                       uint64_t public_measured_ns,
@@ -1672,7 +1672,7 @@ static FLASHMEM void payload_add_ocxo_fragment(Payload& p,
   p.add_object(key, lane);
 }
 
-static FLASHMEM void payload_add_ocxo_forensics(Payload& p,
+static void payload_add_ocxo_forensics(Payload& p,
                                        const char* key,
                                        uint64_t public_ns,
                                        uint64_t public_measured_ns,
@@ -2701,7 +2701,7 @@ static bool clocks_servo_active(void) {
   return calibrate_ocxo_mode != servo_mode_t::OFF;
 }
 
-static FLASHMEM void payload_add_dac_dither_compact(Payload& parent,
+static void payload_add_dac_dither_compact(Payload& parent,
                                            const char* key,
                                            const ocxo_dac_state_t& s) {
   Payload d;
@@ -2725,7 +2725,7 @@ static FLASHMEM void payload_add_dac_dither_compact(Payload& parent,
   parent.add_object(key, d);
 }
 
-static FLASHMEM void payload_add_servo_dac_values(Payload& parent) {
+static void payload_add_servo_dac_values(Payload& parent) {
   // Minimal durable DAC payload.  This is intentionally only the values the Pi
   // should persist as the current system DAC configuration, plus the explicit
   // servo mode that explains why this object is present in the TIMEBASE row.
