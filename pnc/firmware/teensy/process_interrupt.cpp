@@ -4376,8 +4376,53 @@ static void cadence_regression_reset_all(void) {
 static void copy_regression_diag(interrupt_capture_diag_t&, 
                                  const cadence_regression_result_t*) {
   // Legacy cadence-regression diagnostics are retired. The public diag fields
-  // remain zero-initialized for compatibility until the new rolling_lr_* path is
-  // explicitly promoted into the subscriber diagnostic payload.
+  // are now populated from the compact rolling_lr_* estimator below.
+}
+
+static void copy_rolling_lr_diag(interrupt_capture_diag_t& diag,
+                                 interrupt_subscriber_kind_t kind) {
+  const rolling_lr_dwt_lane_t* lane = rolling_lr_for_const(kind);
+  if (!lane || !lane->enabled) return;
+
+  const rolling_lr_result_t& r = lane->last_result;
+
+  // Publish the most recently finalized rolling-LR one-second window into the
+  // existing subscriber diagnostic regression surface.  This is diagnostic-only:
+  // the event DWT has already been authored by the current EMA/authority path.
+  diag.regression_valid = r.valid;
+  diag.regression_sequence = r.sequence;
+  diag.regression_sample_count = r.sample_count;
+  diag.regression_observed_dwt_at_event = r.observed_dwt_at_event;
+  diag.regression_inferred_dwt_at_event = r.inferred_dwt_at_event;
+  diag.regression_inferred_minus_observed_cycles =
+      r.inferred_minus_observed_cycles;
+  diag.regression_target_counter32_at_event = r.target_counter32_at_event;
+  diag.regression_target_hardware16_at_event =
+      (uint16_t)(r.target_counter32_at_event & 0xFFFFU);
+
+  // The rolling-LR sums/no-raw-ring model does not retain a separate observed
+  // hardware low-word for the finalized edge.  Use the authored target tooth as
+  // the hardware identity; service-time low-word remains available on the OCXO
+  // service diagnostics.
+  diag.regression_observed_hardware16_at_event =
+      (uint16_t)(r.target_counter32_at_event & 0xFFFFU);
+
+  diag.regression_slope_q16_cycles_per_sample =
+      r.slope_q16_cycles_per_sample;
+  diag.regression_slope_delta_q16_cycles_per_sample =
+      r.slope_delta_q16_cycles_per_sample;
+  diag.regression_fit_error_mean_q16_cycles =
+      r.fit_error_mean_q16_cycles;
+  diag.regression_fit_error_stddev_q16_cycles =
+      r.fit_error_stddev_q16_cycles;
+  diag.regression_fit_error_min_cycles = r.fit_error_min_cycles;
+  diag.regression_fit_error_max_cycles = r.fit_error_max_cycles;
+
+  // The compact rolling-LR model currently keeps aggregate outlier counts only.
+  // Preserve the legacy +/- counters as zero and publish the honest abs counter.
+  diag.regression_fit_error_gt_plus4_count = 0;
+  diag.regression_fit_error_lt_minus4_count = 0;
+  diag.regression_fit_error_abs_gt4_count = r.fit_error_abs_gt4_count;
 }
 
 // ============================================================================
@@ -4509,6 +4554,7 @@ static void emit_one_second_event(interrupt_subscriber_runtime_t& rt,
   interrupt_capture_diag_t diag {};
   fill_diag(diag, rt, event);
   copy_regression_diag(diag, regression);
+  copy_rolling_lr_diag(diag, rt.desc->kind);
   if (spinidle) {
     spinidle_copy_to_diag(diag, *spinidle);
   }

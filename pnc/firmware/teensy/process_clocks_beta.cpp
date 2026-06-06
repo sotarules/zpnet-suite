@@ -1396,17 +1396,63 @@ static void payload_add_ocxo_service_object(Payload& parent,
 }
 
 static void payload_add_lane_regression_object(Payload& parent,
-                                               bool,
-                                               const clocks_alpha_lane_forensics_t&) {
+                                               bool valid,
+                                               const clocks_alpha_lane_forensics_t& f) {
   Payload regression;
 
-  // Regression is disabled in this build.  Publishing the full zero-valued
-  // regression block in every TIMEBASE_FORENSICS row needlessly consumes the
-  // Payload arena and can prevent the paired forensics row from reaching the Pi.
-  // Keep a tiny shape-stable marker so downstream readers can distinguish
-  // "disabled" from "missing due to schema failure".
-  regression.add("enabled", false);
-  regression.add("valid", false);
+  // Compact report-only LR edge proof for TIMEBASE_FORENSICS.  The LR engine
+  // remains diagnostic-only in this pass: subscribers/TIMEBASE authority still
+  // use the existing DWT path, while this object carries the independent
+  // current-window inferred DWT-at-edge beside observed and EMA/authority DWT
+  // facts for raw_cycles-style review.
+  const bool lr_valid = valid && f.regression_valid;
+  const uint32_t authority_dwt = valid ? f.dwt_used_at_event : 0U;
+  const int32_t inferred_minus_authority =
+      (lr_valid && authority_dwt != 0U)
+          ? (int32_t)(f.regression_inferred_dwt_at_event - authority_dwt)
+          : 0;
+
+  regression.add("enabled", true);
+  regression.add("report_only", true);
+  regression.add("authority_enabled", false);
+  regression.add("valid", lr_valid);
+  regression.add("sequence", lr_valid ? f.regression_sequence : 0U);
+  regression.add("sample_count", lr_valid ? f.regression_sample_count : 0U);
+
+  // The three DWT endpoints raw_cycles wants side-by-side:
+  //   observed  — service-offset-corrected target-edge DWT from process_interrupt
+  //   inferred  — LR current-window estimate at the one-second target
+  //   authority — current subscriber/EMA DWT endpoint carried in the diag
+  regression.add("observed_dwt_at_event",
+                 lr_valid ? f.regression_observed_dwt_at_event : 0U);
+  regression.add("inferred_dwt_at_event",
+                 lr_valid ? f.regression_inferred_dwt_at_event : 0U);
+  regression.add("authority_dwt_at_event",
+                 lr_valid ? authority_dwt : 0U);
+  regression.add("authority_source", "EMA_DIAG_DWT_USED_AT_EVENT");
+  regression.add("inferred_minus_observed_cycles",
+                 lr_valid ? f.regression_inferred_minus_observed_cycles : 0);
+  regression.add("inferred_minus_authority_cycles",
+                 lr_valid ? inferred_minus_authority : 0);
+
+  regression.add("target_counter32_at_event",
+                 lr_valid ? f.regression_target_counter32_at_event : 0U);
+  regression.add("target_hardware16_at_event",
+                 lr_valid ? (uint32_t)f.regression_target_hardware16_at_event : 0U);
+  regression.add("observed_hardware16_at_event",
+                 lr_valid ? (uint32_t)f.regression_observed_hardware16_at_event : 0U);
+
+  // Keep fit quality compact.  Detailed lifecycle/segment fields stay in the
+  // focused interrupt lane reports to protect the 1 Hz forensics payload.
+  regression.add("slope_delta_q16_cycles_per_sample",
+                 lr_valid ? f.regression_slope_delta_q16_cycles_per_sample : 0LL);
+  regression.add("fit_error_mean_q16_cycles",
+                 lr_valid ? f.regression_fit_error_mean_q16_cycles : 0);
+  regression.add("fit_error_stddev_q16_cycles",
+                 lr_valid ? f.regression_fit_error_stddev_q16_cycles : 0U);
+  regression.add("fit_error_abs_gt4_count",
+                 lr_valid ? f.regression_fit_error_abs_gt4_count : 0U);
+
   parent.add_object("regression", regression);
 }
 
@@ -1582,10 +1628,11 @@ static void payload_add_vclock_forensics(Payload& p,
   lane.add("counter32_at_pps_vclock", (uint32_t)g_counter32_at_pps_vclock);
 
   // TIMEBASE_FORENSICS is now a compact per-row courtroom audit.  Deep
-  // measurement, SpinCatch/SpinIdle, and regression surfaces remain available
-  // through focused reports; the paired 1 Hz stream carries only the DWT
-  // authority proof needed to explain the science row.
+  // measurement and SpinCatch/SpinIdle remain available through focused
+  // reports; the paired 1 Hz stream carries DWT authority proof plus the
+  // compact LR inferred-edge witness needed by raw_cycles.
   payload_add_lane_forensics_object(lane, forensics_valid, f);
+  payload_add_lane_regression_object(lane, forensics_valid, f);
   p.add_object("vclock", lane);
 }
 
@@ -1649,9 +1696,10 @@ static void payload_add_ocxo_forensics(Payload& p,
 
   // Compact forensic surface for the paired TIMEBASE row.  Keep the public
   // clock value, source identity, the raw PPS-projection value, the PPS-founded
-  // residual, the DWT gate courtroom, and the tiny OCXO service/counter ladder
-  // proof.  Retired quiet-phase sample fields, measurement/window counters,
-  // SpinCatch/SpinIdle, regression, and verbose projection deltas are report-only.
+  // residual, the DWT gate courtroom, the tiny OCXO service/counter ladder
+  // proof, and the compact LR inferred-edge witness.  Retired quiet-phase
+  // sample fields, measurement/window counters, SpinCatch/SpinIdle, and verbose
+  // projection deltas remain report-only.
   lane.add("ns", public_ns);
   lane.add("ns_source_id", pps_projection_valid ? 2U : 1U);
   lane.add("pps_projected_valid", pps_projection_valid);
@@ -1670,6 +1718,7 @@ static void payload_add_ocxo_forensics(Payload& p,
 
   payload_add_lane_forensics_object(lane, forensics_valid, f);
   payload_add_ocxo_service_object(lane, forensics_valid, f);
+  payload_add_lane_regression_object(lane, forensics_valid, f);
   p.add_object(key, lane);
 }
 
