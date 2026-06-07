@@ -540,6 +540,44 @@ static volatile uint32_t diag_schedule_next_calls_total = 0;
 static volatile uint32_t diag_schedule_next_calls_from_dispatch = 0;
 static volatile uint32_t diag_schedule_next_calls_from_other = 0;
 
+// Scheduler pressure diagnostics.
+//
+// These counters classify scheduler lateness without changing behavior. A
+// too-close deadline is not a corrupted event fact; it means TimePop refused to
+// arm CH2 inside the unsafe compare race window. This surface lets us decide
+// whether regular scheduled-context work is simply delayed as designed, or
+// whether the scheduler itself is experiencing pressure/starvation.
+static volatile bool     diag_schedule_pressure_supported = true;
+static volatile uint32_t diag_schedule_next_body_cycles_last = 0;
+static volatile uint32_t diag_schedule_next_body_cycles_max = 0;
+static volatile uint32_t diag_schedule_next_arm_margin_ticks_last = 0;
+static volatile uint32_t diag_schedule_next_arm_margin_ticks_min = UINT32_MAX;
+static volatile uint32_t diag_schedule_next_arm_margin_ticks_max = 0;
+static volatile uint32_t diag_schedule_next_final_safety_count = 0;
+static volatile uint32_t diag_schedule_next_too_close_count = 0;
+static volatile uint32_t diag_schedule_next_exact_no_irq_count = 0;
+static volatile uint32_t diag_schedule_next_passed_count = 0;
+static volatile uint32_t diag_schedule_next_invalid_time_count = 0;
+static volatile uint32_t diag_schedule_next_too_close_max_ticks = 0;
+static volatile uint32_t diag_schedule_next_passed_late_max_ticks = 0;
+static volatile const char* diag_schedule_next_last_pressure_source = nullptr;
+static volatile const char* diag_schedule_next_last_pressure_name = nullptr;
+static volatile uint32_t diag_schedule_next_last_pressure_deadline = 0;
+static volatile uint32_t diag_schedule_next_last_pressure_now = 0;
+static volatile uint32_t diag_schedule_next_last_pressure_distance_ticks = 0;
+static volatile uint32_t diag_schedule_next_last_pressure_late_ticks = 0;
+
+// Scheduled-context callback latency. This is intentionally distinct from
+// event-fact latency. Regular work is allowed to run late; the question is
+// whether the lateness stays bounded while timing facts remain safely captured.
+static volatile uint32_t diag_timed_dispatch_latency_count = 0;
+static volatile uint32_t diag_timed_dispatch_latency_last_cycles = 0;
+static volatile uint32_t diag_timed_dispatch_latency_max_cycles = 0;
+static volatile uint64_t diag_timed_dispatch_latency_cycles_sum = 0;
+static volatile uint32_t diag_timed_dispatch_callback_body_last_cycles = 0;
+static volatile uint32_t diag_timed_dispatch_callback_body_max_cycles = 0;
+static volatile const char* diag_timed_dispatch_last_name = nullptr;
+
 // Software-IRQ shadow-mode diagnostics.  These counters are deliberately
 // separate from scheduler behavior: Step 1C only tests the lower-priority
 // interrupt handoff plumbing.  The pendsv_shadow_* field names are retained so
@@ -896,7 +934,7 @@ static bool phase_probe_start(uint32_t phase_us, uint32_t period_us, uint32_t sa
 static void phase_probe_stop(void);
 static void phase_probe_reset_stats_unlocked(void);
 static void phase_probe_note_irq_pass(const bool expired_this_pass[MAX_SLOTS], uint32_t now, uint32_t dwt);
-static void add_phase_probe_payload(Payload& out);
+static FLASHMEM void add_phase_probe_payload(Payload& out);
 
 static void timepop_record_anchor_snapshot(const time_anchor_snapshot_t& snap,
                                            const char* context);
@@ -3070,6 +3108,7 @@ static inline void ch2_arm_compare(uint32_t target_counter32) {
 // precision fire fact from foreground/scheduler context.
 
 static void schedule_next(void) {
+  const uint32_t schedule_body_start_dwt = ARM_DWT_CYCCNT;
   diag_schedule_next_calls_total++;
 
   const uint32_t now = vclock_count();
@@ -3090,6 +3129,14 @@ static void schedule_next(void) {
     if (!scheduler_time_valid &&
         slots[i].is_absolute &&
         !slots[i].recurring_base_counter32_fixed) {
+      diag_schedule_next_invalid_time_count++;
+      diag_schedule_next_last_pressure_source = "schedule_next_invalid_time";
+      diag_schedule_next_last_pressure_name = slots[i].name;
+      diag_schedule_next_last_pressure_deadline = slots[i].deadline;
+      diag_schedule_next_last_pressure_now = now;
+      diag_schedule_next_last_pressure_distance_ticks = slots[i].deadline - now;
+      diag_schedule_next_last_pressure_late_ticks = 0;
+
       timepop_quarantine_missed_deadline(slots[i],
                                          now,
                                          scheduler_dwt,
@@ -3110,10 +3157,38 @@ static void schedule_next(void) {
       // it safely program a compare that is already at/inside the hardware race
       // window.  Quarantine the missed slot: recurring slots are re-authored
       // onto their next lawful deadline, one-shots are cancelled.
+      const char* pressure_source = too_close
+          ? "schedule_next_too_close"
+          : (exact ? "schedule_next_exact_no_irq" : "schedule_next_passed");
+      const uint32_t pressure_distance = slots[i].deadline - now;
+      const uint32_t pressure_late =
+          passed ? deadline_lateness_ticks(slots[i].deadline, now) : 0U;
+
       diag_schedule_next_expired_passes++;
+      if (too_close) {
+        diag_schedule_next_too_close_count++;
+        if (pressure_distance > diag_schedule_next_too_close_max_ticks) {
+          diag_schedule_next_too_close_max_ticks = pressure_distance;
+        }
+      } else if (exact) {
+        diag_schedule_next_exact_no_irq_count++;
+      } else {
+        diag_schedule_next_passed_count++;
+        if (pressure_late > diag_schedule_next_passed_late_max_ticks) {
+          diag_schedule_next_passed_late_max_ticks = pressure_late;
+        }
+      }
+
+      diag_schedule_next_last_pressure_source = pressure_source;
+      diag_schedule_next_last_pressure_name = slots[i].name;
+      diag_schedule_next_last_pressure_deadline = slots[i].deadline;
+      diag_schedule_next_last_pressure_now = now;
+      diag_schedule_next_last_pressure_distance_ticks = pressure_distance;
+      diag_schedule_next_last_pressure_late_ticks = pressure_late;
+
       if (passed) {
         diag_schedule_next_expired_slots++;
-        const uint32_t late_ticks = deadline_lateness_ticks(slots[i].deadline, now);
+        const uint32_t late_ticks = pressure_late;
         update_max_u32(diag_schedule_next_late_max_ticks, late_ticks);
         diag_schedule_next_last_expired_slot = i;
         diag_schedule_next_last_expired_handle = slots[i].handle;
@@ -3127,9 +3202,7 @@ static void schedule_next(void) {
       timepop_quarantine_missed_deadline(slots[i],
                                          now,
                                          scheduler_dwt,
-                                         too_close ? "schedule_next_too_close"
-                                                   : (exact ? "schedule_next_exact_no_irq"
-                                                            : "schedule_next_passed"),
+                                         pressure_source,
                                          too_close);
       if (!slots[i].active || slots[i].expired) continue;
     }
@@ -3166,10 +3239,27 @@ static void schedule_next(void) {
   if ((target - now) < SCHEDULE_MIN_ARM_LEAD_TICKS) {
     target = now + HEARTBEAT_TICKS;
     diag_heartbeat_rearms++;
+    diag_schedule_next_final_safety_count++;
+  }
+
+  const uint32_t final_margin = target - now;
+  diag_schedule_next_arm_margin_ticks_last = final_margin;
+  if (final_margin < diag_schedule_next_arm_margin_ticks_min) {
+    diag_schedule_next_arm_margin_ticks_min = final_margin;
+  }
+  if (final_margin > diag_schedule_next_arm_margin_ticks_max) {
+    diag_schedule_next_arm_margin_ticks_max = final_margin;
   }
 
   ch2_arm_compare(target);
   diag_rearm_count++;
+
+  const uint32_t schedule_body_cycles =
+      (uint32_t)(ARM_DWT_CYCCNT - schedule_body_start_dwt);
+  diag_schedule_next_body_cycles_last = schedule_body_cycles;
+  if (schedule_body_cycles > diag_schedule_next_body_cycles_max) {
+    diag_schedule_next_body_cycles_max = schedule_body_cycles;
+  }
 }
 
 // ============================================================================
@@ -3787,6 +3877,33 @@ void timepop_init(void) {
   diag_dispatch_mutation_cancel_noop = 0;
   diag_dispatch_mutation_cancel_failures = 0;
   diag_dispatch_mutation_arm_failures = 0;
+
+  diag_schedule_next_body_cycles_last = 0;
+  diag_schedule_next_body_cycles_max = 0;
+  diag_schedule_next_arm_margin_ticks_last = 0;
+  diag_schedule_next_arm_margin_ticks_min = UINT32_MAX;
+  diag_schedule_next_arm_margin_ticks_max = 0;
+  diag_schedule_next_final_safety_count = 0;
+  diag_schedule_next_too_close_count = 0;
+  diag_schedule_next_exact_no_irq_count = 0;
+  diag_schedule_next_passed_count = 0;
+  diag_schedule_next_invalid_time_count = 0;
+  diag_schedule_next_too_close_max_ticks = 0;
+  diag_schedule_next_passed_late_max_ticks = 0;
+  diag_schedule_next_last_pressure_source = nullptr;
+  diag_schedule_next_last_pressure_name = nullptr;
+  diag_schedule_next_last_pressure_deadline = 0;
+  diag_schedule_next_last_pressure_now = 0;
+  diag_schedule_next_last_pressure_distance_ticks = 0;
+  diag_schedule_next_last_pressure_late_ticks = 0;
+
+  diag_timed_dispatch_latency_count = 0;
+  diag_timed_dispatch_latency_last_cycles = 0;
+  diag_timed_dispatch_latency_max_cycles = 0;
+  diag_timed_dispatch_latency_cycles_sum = 0;
+  diag_timed_dispatch_callback_body_last_cycles = 0;
+  diag_timed_dispatch_callback_body_max_cycles = 0;
+  diag_timed_dispatch_last_name = nullptr;
 
   diag_deadline_negative_offset = 0;
   diag_deadline_last_target_gnss_ns = -1;
@@ -4997,11 +5114,29 @@ void timepop_dispatch(void) {
       timepop_diag_t diag;
       slot_build_diag(slots[i], 0, diag);
 
-      uint32_t start = ARM_DWT_CYCCNT;
-      slots[i].callback(&ctx, &diag, slots[i].user_data);
-      uint32_t end   = ARM_DWT_CYCCNT;
+      const uint32_t start = ARM_DWT_CYCCNT;
 
-      cpu_usage_account_busy(end - start);
+      if (ctx.fire_dwt_cyccnt != 0) {
+        const uint32_t latency = start - ctx.fire_dwt_cyccnt;
+        diag_timed_dispatch_latency_count++;
+        diag_timed_dispatch_latency_last_cycles = latency;
+        diag_timed_dispatch_latency_cycles_sum += (uint64_t)latency;
+        if (latency > diag_timed_dispatch_latency_max_cycles) {
+          diag_timed_dispatch_latency_max_cycles = latency;
+        }
+        diag_timed_dispatch_last_name = slots[i].name;
+      }
+
+      slots[i].callback(&ctx, &diag, slots[i].user_data);
+
+      const uint32_t end = ARM_DWT_CYCCNT;
+      const uint32_t body_cycles = end - start;
+      diag_timed_dispatch_callback_body_last_cycles = body_cycles;
+      if (body_cycles > diag_timed_dispatch_callback_body_max_cycles) {
+        diag_timed_dispatch_callback_body_max_cycles = body_cycles;
+      }
+
+      cpu_usage_account_busy(body_cycles);
       diag_dispatch_callbacks++;
 
       timepop_apply_dispatch_mutations("timed_callback");
@@ -5278,7 +5413,7 @@ bool timepop_idle_witness_snapshot(timepop_idle_witness_snapshot_t* out) {
 // REPORT
 // ============================================================================
 
-static Payload cmd_report(const Payload&) {
+static FLASHMEM Payload cmd_report(const Payload&) {
   Payload out;
 
   out.add("isr_fires",         isr_fire_count);
@@ -5451,6 +5586,64 @@ static Payload cmd_report(const Payload&) {
   out.add("schedule_next_calls_total",         diag_schedule_next_calls_total);
   out.add("schedule_next_calls_from_dispatch", diag_schedule_next_calls_from_dispatch);
   out.add("schedule_next_calls_from_other",    diag_schedule_next_calls_from_other);
+  out.add("schedule_pressure_supported", diag_schedule_pressure_supported);
+  out.add("schedule_next_body_cycles_last", diag_schedule_next_body_cycles_last);
+  out.add("schedule_next_body_cycles_max", diag_schedule_next_body_cycles_max);
+  out.add("schedule_next_arm_margin_ticks_last",
+          diag_schedule_next_arm_margin_ticks_last);
+  out.add("schedule_next_arm_margin_ticks_min",
+          diag_schedule_next_arm_margin_ticks_min == UINT32_MAX
+              ? 0U
+              : diag_schedule_next_arm_margin_ticks_min);
+  out.add("schedule_next_arm_margin_ticks_max",
+          diag_schedule_next_arm_margin_ticks_max);
+  out.add("schedule_next_final_safety_count",
+          diag_schedule_next_final_safety_count);
+  out.add("schedule_next_too_close_count", diag_schedule_next_too_close_count);
+  out.add("schedule_next_exact_no_irq_count",
+          diag_schedule_next_exact_no_irq_count);
+  out.add("schedule_next_passed_count", diag_schedule_next_passed_count);
+  out.add("schedule_next_invalid_time_count",
+          diag_schedule_next_invalid_time_count);
+  out.add("schedule_next_too_close_max_ticks",
+          diag_schedule_next_too_close_max_ticks);
+  out.add("schedule_next_passed_late_max_ticks",
+          diag_schedule_next_passed_late_max_ticks);
+  out.add("schedule_next_last_pressure_source",
+          (const char*)(diag_schedule_next_last_pressure_source
+                            ? diag_schedule_next_last_pressure_source
+                            : ""));
+  out.add("schedule_next_last_pressure_name",
+          (const char*)(diag_schedule_next_last_pressure_name
+                            ? diag_schedule_next_last_pressure_name
+                            : ""));
+  out.add("schedule_next_last_pressure_deadline",
+          diag_schedule_next_last_pressure_deadline);
+  out.add("schedule_next_last_pressure_now",
+          diag_schedule_next_last_pressure_now);
+  out.add("schedule_next_last_pressure_distance_ticks",
+          diag_schedule_next_last_pressure_distance_ticks);
+  out.add("schedule_next_last_pressure_late_ticks",
+          diag_schedule_next_last_pressure_late_ticks);
+
+  out.add("timed_dispatch_latency_count", diag_timed_dispatch_latency_count);
+  out.add("timed_dispatch_latency_last_cycles",
+          diag_timed_dispatch_latency_last_cycles);
+  out.add("timed_dispatch_latency_max_cycles",
+          diag_timed_dispatch_latency_max_cycles);
+  out.add("timed_dispatch_latency_mean_cycles",
+          diag_timed_dispatch_latency_count
+              ? (uint32_t)(diag_timed_dispatch_latency_cycles_sum /
+                           (uint64_t)diag_timed_dispatch_latency_count)
+              : 0U);
+  out.add("timed_dispatch_callback_body_last_cycles",
+          diag_timed_dispatch_callback_body_last_cycles);
+  out.add("timed_dispatch_callback_body_max_cycles",
+          diag_timed_dispatch_callback_body_max_cycles);
+  out.add("timed_dispatch_last_name",
+          (const char*)(diag_timed_dispatch_last_name
+                            ? diag_timed_dispatch_last_name
+                            : ""));
   out.add("pendsv_shadow_supported",           true);
   out.add("pendsv_shadow_enabled",             TIMEPOP_PENDSV_SHADOW_ENABLED);
   out.add("pendsv_shadow_mechanism",           TIMEPOP_PENDSV_SHADOW_MECHANISM);
@@ -5696,7 +5889,7 @@ static Payload cmd_report(const Payload&) {
 // compare is selected.
 
 
-static void add_timers_array(Payload& out) {
+static FLASHMEM void add_timers_array(Payload& out) {
   PayloadArray timers;
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
     if (!slots[i].active) continue;
@@ -5744,7 +5937,7 @@ static void add_timers_array(Payload& out) {
   out.add_array("timers", timers);
 }
 
-static void add_phase_probe_payload(Payload& out) {
+static FLASHMEM void add_phase_probe_payload(Payload& out) {
   const uint32_t saved = critical_enter();
   const phase_probe_state_t p = g_phase_probe;
   const phase_probe_irq_pass_t pass = g_phase_probe_irq_pass;
@@ -5856,7 +6049,7 @@ static void add_phase_probe_payload(Payload& out) {
   out.add("phase_probe_irq_pass_alap_dispatching_count", pass.alap_dispatching_count);
 }
 
-static Payload cmd_phase_probe(const Payload& args) {
+static FLASHMEM Payload cmd_phase_probe(const Payload& args) {
   Payload out;
   out.add("report", "TIMEPOP_PHASE_PROBE");
   out.add("usage", "TIMEPOP.PHASE_PROBE action=START|STOP|RESET phase_us=250 period_us=1000 samples=0 threshold_cycles=1024");
@@ -5911,7 +6104,7 @@ static Payload cmd_phase_probe(const Payload& args) {
   return out;
 }
 
-static Payload cmd_slots(const Payload&) {
+static FLASHMEM Payload cmd_slots(const Payload&) {
   Payload out;
   out.add("slots_active_now", timepop_active_count());
   out.add("dispatch_mutation_queue_depth", dispatch_mutation_count);
@@ -5949,6 +6142,16 @@ static Payload cmd_slots(const Payload&) {
   out.add("epoch_change_count", diag_epoch_change_count);
   out.add("epoch_last_anchor_pps_count", diag_epoch_last_anchor_pps_count);
   out.add("schedule_next_expired_passes", diag_schedule_next_expired_passes);
+  out.add("schedule_next_too_close_count", diag_schedule_next_too_close_count);
+  out.add("schedule_next_passed_count", diag_schedule_next_passed_count);
+  out.add("schedule_next_final_safety_count", diag_schedule_next_final_safety_count);
+  out.add("schedule_next_body_cycles_max", diag_schedule_next_body_cycles_max);
+  out.add("schedule_next_arm_margin_ticks_min",
+          diag_schedule_next_arm_margin_ticks_min == UINT32_MAX
+              ? 0U
+              : diag_schedule_next_arm_margin_ticks_min);
+  out.add("timed_dispatch_latency_max_cycles",
+          diag_timed_dispatch_latency_max_cycles);
   timepop_pendsv_shadow_update_nvic_diag();
   out.add("pendsv_shadow_mechanism", TIMEPOP_PENDSV_SHADOW_MECHANISM);
   out.add("pendsv_shadow_trigger_method", TIMEPOP_PENDSV_SHADOW_TRIGGER);
