@@ -8,7 +8,7 @@
 //   • priority-queue slot scheduling
 //   • PPS/VCLOCK phase-locked recurring series
 //   • shared captured fire facts for same-event timed clients
-//   • critical recurring ISR clients that callback/rearm before schedule_next
+//   • critical recurring scheduler clients that callback/rearm before schedule_next
 //   • fixed non-slot deferred callback dispatch
 //   • instrumentation / reports
 //   • scheduler policy for QTimer1 CH2 compare deadlines
@@ -17,17 +17,21 @@
 //   • PPS/GPIO interrupt custody
 //   • OCXO interrupt custody
 //   • QTimer1 vector custody — process_interrupt owns IRQ_QTIMER1 and
-//     dispatches CH2 to TimePop's registered handler in IRQ context
+//     dispatches CH2 to TimePop's registered handler from its priority
+//     handoff context
 //   • QTimer1 CH0/CH2 hardware mode init — process_interrupt does
 //     the one-time CTRL/SCTRL/CSCTRL/COMP1/CMPLD1 setup
 //
-// Those are owned by process_interrupt.
+// Those are owned by process_interrupt. TimePop also does not own a private
+// scheduler IRQ / priority-handoff tier; CH2 scheduler processing runs
+// directly when process_interrupt invokes the registered handler from its
+// handoff context.
 //
 // QTimer1 CH2 hosted-handler API (TimePop is the hosted client):
 //
 //   QTimer1 has only one IRQ vector shared across all four channels.
-//   process_interrupt owns the vector and dispatches CH2 in IRQ context to
-//   TimePop's registered handler.  VCLOCK cadence is no longer a separate
+//   process_interrupt owns the vector and dispatches CH2 from its priority-16
+//   handoff context to TimePop's registered handler.  VCLOCK cadence is no longer a separate
 //   QTimer1 compare path; it is a TimePop critical recurring ISR client.
 //
 //   The handler receives a normalized DWT-at-edge capture for the CH2 event.
@@ -101,10 +105,12 @@
 //   mutation barrier: cancelling an already-absent handle or name is a
 //   successful no-op, not a scheduler failure.
 //
-//   Critical recurring ISR clients are the white-glove exception for tiny
+//   Critical recurring scheduler clients are the white-glove exception for tiny
 //   substrate-maintenance work.  They are still ordinary TimePop slots and
 //   share CH2 fire facts, but their callbacks and recurring rearm happen
-//   inside the CH2 IRQ pass before schedule_next() selects the next compare.
+//   inside the CH2 scheduler pass before schedule_next() selects the next compare.
+//   This pass is invoked from process_interrupt's handoff tier; TimePop does
+//   not own a private priority-handoff IRQ.
 //
 //   Timed slots may also carry a service priority. Lower numeric priority runs
 //   first when multiple timed slots share one exact CH2 fire fact. Priority
@@ -210,7 +216,7 @@ timepop_handle_t timepop_arm_ns_with_priority(
 // The first target is the first grid point strictly after current GNSS time.
 // Later rearms remain on the original base grid; missed intervals are skipped
 // rather than accumulated from the late service time.  Callback/rearm run in
-// the CH2 IRQ pass, matching timepop_arm_recurring_isr().
+// the CH2 scheduler pass, matching timepop_arm_recurring_isr().
 timepop_handle_t timepop_arm_recurring_isr_from_base(
   int64_t             base_gnss_ns,
   uint64_t            period_gnss_ns,
@@ -261,23 +267,4 @@ timepop_handle_t timepop_arm_recurring_isr_from_base_counter32_with_priority(
 // or cancelled before scheduling continues.
 void timepop_epoch_changed(uint32_t epoch_sequence);
 
-// Diagnostic command surface:
-//
-//   TIMEPOP.PHASE_PROBE action=START phase_us=250 period_us=1000 samples=0
-//   TIMEPOP.PHASE_PROBE
-//   TIMEPOP.PHASE_PROBE action=STOP
-//   TIMEPOP.PHASE_PROBE action=RESET
-//
-// PHASE_PROBE is a report-only quiet-zone instrument.  It arms a tiny critical
-// recurring ISR slot at a fixed phase within the VCLOCK period and records
-// scalar statistics about co-expired timed slots, deferred backlog, exact-fire
-// error, and DWT prediction error.  It does not alter scheduler policy or
-// timing authority.
 
-// QTimer1 CH2 IRQ-context handler.  Registered with process_interrupt
-// at init.  Called by process_interrupt's qtimer1_isr dispatcher on
-// every CH2 compare-match, in IRQ context, with the standard event
-// and diag payloads filled in by the dispatcher.
-//
-void timepop_qtimer1_ch2_handler(const interrupt_event_t& event,
-                                 const interrupt_capture_diag_t& diag);

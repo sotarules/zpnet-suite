@@ -25,9 +25,9 @@
 //   • timed slot priority       — lower numeric priority runs first when
 //     multiple timed slots share one captured CH2 fire fact. ASAP/ALAP are
 //     fixed deferred lanes and intentionally do not participate.
-//   • critical ISR recurring    — timepop_arm_recurring_isr(period_ns, ...)
-//     The callback and recurring rearm happen inside the CH2 IRQ pass before
-//     schedule_next() selects the next compare.  Use only for tiny substrate
+//   • critical scheduler recurring — timepop_arm_recurring_isr(period_ns, ...)
+//     The callback and recurring rearm happen inside the CH2 scheduler pass
+//     before schedule_next() selects the next compare.  Use only for tiny substrate
 //    maintenance callbacks that TimePop itself depends on for safe scheduling.
 //   • counter-base anchored ISR recurring
 //      timepop_arm_recurring_isr_from_base_counter32(base_gnss_ns,
@@ -63,7 +63,7 @@
 // Dispatch timing:
 //
 //   process_interrupt owns QTimer1 hardware and invokes TimePop's CH2 handler
-//   in IRQ context with a normalized DWT capture and synthetic VCLOCK
+//   from its priority-handoff context with a normalized DWT capture and synthetic VCLOCK
 //   counter32 event identity.  TimePop uses that event fact to expire slots.
 //   It does not reinterpret PPS/VCLOCK phase and it does not read timer
 //   hardware directly.
@@ -128,51 +128,14 @@ static constexpr uint32_t ONE_HZ_TICKS = 10000000U;
 static constexpr bool     TIMEPOP_SLOT_PRIORITY_ORDERING_ENABLED = true;
 static constexpr const char* WITNESS_SCHEDULER_NAME = "WITNESS_SCHEDULER";
 
-// Phase-probe diagnostic.  This is a tiny critical recurring ISR client used
-// to measure quiet zones inside a VCLOCK period.  It records scalar counters
-// only; JSON/report work happens later in command context.
-static constexpr const char* PHASE_PROBE_NAME = "PHASE_PROBE";
-static constexpr uint32_t PHASE_PROBE_DEFAULT_PHASE_US = 250U;
-static constexpr uint32_t PHASE_PROBE_DEFAULT_PERIOD_US = 1000U;
-static constexpr uint32_t PHASE_PROBE_DEFAULT_LATENCY_THRESHOLD_CYCLES = 1024U;
-static constexpr uint32_t PHASE_PROBE_MAX_PERIOD_US = 1000000U;
-static constexpr uint32_t PHASE_PROBE_MASK_CADENCE_MINDER = 1u << 0;
-static constexpr uint32_t PHASE_PROBE_MASK_TRANSPORT_RX   = 1u << 1;
-static constexpr uint32_t PHASE_PROBE_MASK_TRANSPORT_TX   = 1u << 2;
-static constexpr uint32_t PHASE_PROBE_MASK_PUBLISH_EVENTS = 1u << 3;
-static constexpr uint32_t PHASE_PROBE_MASK_WITNESS_SCHED  = 1u << 4;
-static constexpr uint32_t PHASE_PROBE_MASK_CPU_USAGE      = 1u << 5;
-static constexpr uint32_t PHASE_PROBE_MASK_PHASE_PROBE    = 1u << 6;
-static constexpr uint32_t PHASE_PROBE_MASK_OTHER          = 1u << 7;
-
-// TimePop-owned software-IRQ scheduler handoff.
+// CH2 scheduler custody.
 //
-// Step 2 moves TimePop's CH2 scheduler work out of the QTimer1 priority-0 ISR.
-// The hosted CH2 handler now only copies the already-authored event facts into
-// a fixed ring and pends IRQ_SOFTWARE at priority 16.  The old CH2 TimePop
-// processing body runs from that lower-priority scheduler interrupt.
-//
-// We deliberately avoid PendSV here.  Teensy core owns PendSV/EventResponder,
-// while IRQ_SOFTWARE is an ordinary external interrupt that TimePop can attach,
-// prioritize, enable, pend, and inspect directly.  The existing pendsv_shadow_*
-// report names are retained for continuity with Step 1A/1B/1C, but the
-// mechanism reported below is now the real IRQ16 CH2 scheduler path.
-static constexpr bool         TIMEPOP_PENDSV_SHADOW_ENABLED = true;
-static constexpr uint32_t     TIMEPOP_PENDSV_SHADOW_PRIORITY = 16U;
-static constexpr IRQ_NUMBER_t TIMEPOP_PENDSV_SHADOW_IRQ = IRQ_SOFTWARE;
-static constexpr const char*  TIMEPOP_PENDSV_SHADOW_MECHANISM = "IRQ_SOFTWARE_CH2_DEFERRED";
-static constexpr const char*  TIMEPOP_PENDSV_SHADOW_TRIGGER = "NVIC_ISPR";
-static constexpr uint32_t     TIMEPOP_CH2_DEFERRED_QUEUE_CAPACITY = 16U;
-static constexpr uint32_t     TIMEPOP_CH2_DEFERRED_QUEUE_MASK = TIMEPOP_CH2_DEFERRED_QUEUE_CAPACITY - 1U;
-static constexpr uint32_t     TIMEPOP_CH2_DEFERRED_DRAIN_BUDGET = 8U;
-
-// ARMv7-M NVIC external interrupt register banks.
-static constexpr uint32_t TIMEPOP_NVIC_ISER_ADDR = 0xE000E100UL;
-static constexpr uint32_t TIMEPOP_NVIC_ICER_ADDR = 0xE000E180UL;
-static constexpr uint32_t TIMEPOP_NVIC_ISPR_ADDR = 0xE000E200UL;
-static constexpr uint32_t TIMEPOP_NVIC_ICPR_ADDR = 0xE000E280UL;
-static constexpr uint32_t TIMEPOP_NVIC_IABR_ADDR = 0xE000E300UL;
-static constexpr uint32_t TIMEPOP_NVIC_IPR_ADDR  = 0xE000E400UL;
+// process_interrupt now owns the priority handoff tier.  By the time
+// process_interrupt invokes TimePop's registered CH2 handler, the priority-0
+// hardware capture has already escaped into process_interrupt's priority-16
+// handoff context.  TimePop therefore processes CH2 event facts directly; it
+// does not own a private scheduler IRQ or second CH2 queue.
+static constexpr const char* TIMEPOP_CH2_SERVICE_CONTEXT = "PROCESS_INTERRUPT_HANDOFF_DIRECT";
 
 
 // ============================================================================
@@ -423,14 +386,6 @@ struct timepop_dispatch_mutation_t {
   timepop_dispatch_phase_t queued_phase = timepop_dispatch_phase_t::IDLE;
 };
 
-struct timepop_ch2_deferred_event_t {
-  interrupt_event_t event{};
-  interrupt_capture_diag_t diag{};
-  uint32_t enqueue_dwt = 0;
-  uint32_t sequence = 0;
-};
-
-
 // ============================================================================
 // State
 // ============================================================================
@@ -446,12 +401,6 @@ static volatile uint32_t dispatch_mutation_count = 0;
 static volatile uint32_t dispatch_depth = 0;
 static volatile timepop_dispatch_phase_t dispatch_phase = timepop_dispatch_phase_t::IDLE;
 static volatile bool dispatch_applying_mutations = false;
-
-static timepop_ch2_deferred_event_t ch2_deferred_events[TIMEPOP_CH2_DEFERRED_QUEUE_CAPACITY];
-static volatile uint32_t ch2_deferred_head = 0;
-static volatile uint32_t ch2_deferred_tail = 0;
-static volatile uint32_t ch2_deferred_sequence = 0;
-
 
 // Global idle DWT witness.  This symbol is intentionally exported so ISR-side
 // clients may read the freshest foreground/thread-mode DWT shadow without
@@ -578,89 +527,15 @@ static volatile uint32_t diag_timed_dispatch_callback_body_last_cycles = 0;
 static volatile uint32_t diag_timed_dispatch_callback_body_max_cycles = 0;
 static volatile const char* diag_timed_dispatch_last_name = nullptr;
 
-// Software-IRQ shadow-mode diagnostics.  These counters are deliberately
-// separate from scheduler behavior: Step 1C only tests the lower-priority
-// interrupt handoff plumbing.  The pendsv_shadow_* field names are retained so
-// existing host-side report readers do not need to change while we prove the
-// mechanism.
-static volatile bool     diag_pendsv_shadow_configured = false;
-static volatile bool     diag_pendsv_shadow_pending = false;
-static volatile bool     diag_pendsv_shadow_running = false;
-static volatile uint32_t diag_pendsv_shadow_configure_count = 0;
-static volatile uint32_t diag_pendsv_shadow_request_count = 0;
-static volatile uint32_t diag_pendsv_shadow_served_request_count = 0;
-static volatile uint32_t diag_pendsv_shadow_request_unconfigured_count = 0;
-static volatile uint32_t diag_pendsv_shadow_coalesced_request_count = 0;
-static volatile uint32_t diag_pendsv_shadow_entry_count = 0;
-static volatile uint32_t diag_pendsv_shadow_exit_count = 0;
-static volatile uint32_t diag_pendsv_shadow_spurious_entry_count = 0;
-static volatile uint32_t diag_pendsv_shadow_reentry_count = 0;
-static volatile uint32_t diag_pendsv_shadow_latency_sample_count = 0;
-static volatile uint32_t diag_pendsv_shadow_last_request_dwt = 0;
-static volatile uint32_t diag_pendsv_shadow_last_entry_dwt = 0;
-static volatile uint32_t diag_pendsv_shadow_last_exit_dwt = 0;
-static volatile uint32_t diag_pendsv_shadow_last_latency_cycles = 0;
-static volatile uint32_t diag_pendsv_shadow_min_latency_cycles = UINT32_MAX;
-static volatile uint32_t diag_pendsv_shadow_max_latency_cycles = 0;
-static volatile uint64_t diag_pendsv_shadow_latency_cycles_sum = 0;
-static volatile uint32_t diag_pendsv_shadow_last_body_cycles = 0;
-static volatile uint32_t diag_pendsv_shadow_max_body_cycles = 0;
-static volatile const char* diag_pendsv_shadow_last_request_context = nullptr;
-
-static volatile uint32_t diag_pendsv_shadow_irq_number = 0;
-static volatile uint32_t diag_pendsv_shadow_irq_index = 0;
-static volatile uint32_t diag_pendsv_shadow_irq_mask = 0;
-static volatile uint32_t diag_pendsv_shadow_priority_applied = 0xFFFFFFFFUL;
-static volatile uint32_t diag_pendsv_shadow_priority_live = 0xFFFFFFFFUL;
-static volatile uint32_t diag_pendsv_shadow_iser_word = 0;
-static volatile uint32_t diag_pendsv_shadow_ispr_word = 0;
-static volatile uint32_t diag_pendsv_shadow_iabr_word = 0;
-static volatile bool     diag_pendsv_shadow_enabled_bit = false;
-static volatile bool     diag_pendsv_shadow_pending_bit = false;
-static volatile bool     diag_pendsv_shadow_active_bit = false;
-
-static volatile uint32_t diag_pendsv_shadow_request_ipsr = 0;
-static volatile uint32_t diag_pendsv_shadow_request_primask = 0;
-static volatile uint32_t diag_pendsv_shadow_request_basepri = 0;
-static volatile uint32_t diag_pendsv_shadow_request_faultmask = 0;
-static volatile bool     diag_pendsv_shadow_request_pre_enabled_bit = false;
-static volatile bool     diag_pendsv_shadow_request_pre_pending_bit = false;
-static volatile bool     diag_pendsv_shadow_request_pre_active_bit = false;
-static volatile bool     diag_pendsv_shadow_request_post_enabled_bit = false;
-static volatile bool     diag_pendsv_shadow_request_post_pending_bit = false;
-static volatile bool     diag_pendsv_shadow_request_post_active_bit = false;
-
-static volatile uint32_t diag_pendsv_shadow_entry_ipsr = 0;
-static volatile uint32_t diag_pendsv_shadow_entry_primask = 0;
-static volatile uint32_t diag_pendsv_shadow_entry_basepri = 0;
-static volatile uint32_t diag_pendsv_shadow_entry_faultmask = 0;
-static volatile bool     diag_pendsv_shadow_entry_enabled_bit = false;
-static volatile bool     diag_pendsv_shadow_entry_pending_bit = false;
-static volatile bool     diag_pendsv_shadow_entry_active_bit = false;
-static volatile bool     diag_pendsv_shadow_exit_pending_bit = false;
-static volatile bool     diag_pendsv_shadow_exit_active_bit = false;
-
-static volatile uint32_t diag_ch2_irq0_capture_count = 0;
-static volatile uint32_t diag_ch2_deferred_enqueue_count = 0;
-static volatile uint32_t diag_ch2_deferred_dequeue_count = 0;
-static volatile uint32_t diag_ch2_deferred_overflow_count = 0;
-static volatile uint32_t diag_ch2_deferred_high_water = 0;
-static volatile uint32_t diag_ch2_deferred_last_depth = 0;
-static volatile uint32_t diag_ch2_deferred_last_sequence_enqueued = 0;
-static volatile uint32_t diag_ch2_deferred_last_sequence_dequeued = 0;
-static volatile uint32_t diag_ch2_deferred_last_enqueue_dwt = 0;
-static volatile uint32_t diag_ch2_deferred_last_dequeue_dwt = 0;
-static volatile uint32_t diag_ch2_deferred_last_event_counter32 = 0;
-static volatile uint32_t diag_ch2_deferred_last_event_dwt = 0;
-static volatile uint32_t diag_ch2_deferred_last_drain_count = 0;
-static volatile uint32_t diag_ch2_deferred_drain_pass_count = 0;
-static volatile uint32_t diag_ch2_deferred_drain_empty_count = 0;
-static volatile uint32_t diag_ch2_deferred_drain_budget_exhausted_count = 0;
-static volatile uint32_t diag_ch2_deferred_repend_count = 0;
-static volatile uint32_t diag_ch2_deferred_process_body_cycles = 0;
-static volatile uint32_t diag_ch2_deferred_process_body_cycles_max = 0;
-static volatile uint32_t diag_ch2_deferred_capture_to_process_cycles = 0;
-static volatile uint32_t diag_ch2_deferred_capture_to_process_cycles_max = 0;
+// CH2 scheduler-entry diagnostics.
+//
+// TimePop no longer owns a private priority handoff.  These counters measure
+// the direct CH2 scheduler pass invoked by process_interrupt's handoff tier.
+static volatile uint32_t diag_ch2_direct_call_count = 0;
+static volatile uint32_t diag_ch2_direct_body_cycles_last = 0;
+static volatile uint32_t diag_ch2_direct_body_cycles_max = 0;
+static volatile uint32_t diag_ch2_direct_last_event_counter32 = 0;
+static volatile uint32_t diag_ch2_direct_last_event_dwt = 0;
 
 
 // Normal precision fires should be authored by IRQ_CH2.  If schedule_next()
@@ -741,118 +616,6 @@ static volatile uint32_t diag_irq_late_max_ticks = 0;
 static volatile uint32_t diag_irq_event_gnss_mismatch_count = 0;
 static volatile int64_t  diag_irq_event_gnss_last_delta_ns = 0;
 
-struct phase_probe_irq_pass_t {
-  uint32_t sequence = 0;
-  uint32_t now = 0;
-  uint32_t dwt = 0;
-  uint32_t exact_slot_count = 0;
-  uint32_t non_probe_exact_slot_count = 0;
-  uint32_t isr_callback_slot_count = 0;
-  uint32_t scheduled_callback_slot_count = 0;
-  uint32_t name_mask = 0;
-  uint32_t asap_pending_count = 0;
-  uint32_t asap_dispatching_count = 0;
-  uint32_t alap_pending_count = 0;
-  uint32_t alap_dispatching_count = 0;
-};
-
-struct phase_probe_stats_t {
-  uint32_t sample_count = 0;
-  uint32_t quiet_count = 0;
-  uint32_t not_quiet_count = 0;
-
-  int64_t fire_error_ticks_sum = 0;
-  int32_t fire_error_ticks_min = INT32_MAX;
-  int32_t fire_error_ticks_max = INT32_MIN;
-  uint32_t fire_error_nonzero_count = 0;
-  uint32_t fire_error_abs_gt1_count = 0;
-  uint32_t fire_error_abs_gt4_count = 0;
-
-  uint32_t spin_error_valid_count = 0;
-  int64_t spin_error_cycles_sum = 0;
-  int32_t spin_error_cycles_min = INT32_MAX;
-  int32_t spin_error_cycles_max = INT32_MIN;
-  uint32_t spin_error_abs_gt4_count = 0;
-  uint32_t spin_error_abs_gt8_count = 0;
-  uint32_t spin_error_abs_gt20_count = 0;
-  uint32_t spin_error_abs_gt50_count = 0;
-  uint32_t spin_error_abs_gt100_count = 0;
-
-  uint32_t coexpired_exact_sum = 0;
-  uint32_t coexpired_non_probe_sum = 0;
-  uint32_t coexpired_exact_max = 0;
-  uint32_t coexpired_non_probe_max = 0;
-  uint32_t coexpired_non_probe_count = 0;
-  uint32_t coexpired_cadence_minder_count = 0;
-  uint32_t coexpired_transport_rx_count = 0;
-  uint32_t coexpired_transport_tx_count = 0;
-  uint32_t coexpired_publish_events_count = 0;
-  uint32_t coexpired_witness_scheduler_count = 0;
-  uint32_t coexpired_cpu_usage_count = 0;
-  uint32_t coexpired_other_count = 0;
-
-  uint32_t asap_pending_sum = 0;
-  uint32_t asap_pending_max = 0;
-  uint32_t asap_pending_nonzero_count = 0;
-  uint32_t alap_pending_sum = 0;
-  uint32_t alap_pending_max = 0;
-  uint32_t alap_pending_nonzero_count = 0;
-
-  uint64_t callback_latency_cycles_sum = 0;
-  uint32_t callback_latency_cycles_min = UINT32_MAX;
-  uint32_t callback_latency_cycles_max = 0;
-  uint32_t callback_latency_le128_count = 0;
-  uint32_t callback_latency_le256_count = 0;
-  uint32_t callback_latency_le512_count = 0;
-  uint32_t callback_latency_le1024_count = 0;
-  uint32_t callback_latency_le2048_count = 0;
-  uint32_t callback_latency_gt2048_count = 0;
-
-  uint64_t body_cycles_sum = 0;
-  uint32_t body_cycles_max = 0;
-};
-
-struct phase_probe_state_t {
-  bool active = false;
-  bool armed = false;
-  bool complete = false;
-  timepop_handle_t handle = TIMEPOP_INVALID_HANDLE;
-  uint32_t start_count = 0;
-  uint32_t stop_count = 0;
-  uint32_t arm_fail_count = 0;
-
-  uint32_t phase_us = PHASE_PROBE_DEFAULT_PHASE_US;
-  uint32_t phase_ticks = PHASE_PROBE_DEFAULT_PHASE_US * 10U;
-  uint32_t period_us = PHASE_PROBE_DEFAULT_PERIOD_US;
-  uint32_t period_ticks = PHASE_PROBE_DEFAULT_PERIOD_US * 10U;
-  uint32_t latency_threshold_cycles = PHASE_PROBE_DEFAULT_LATENCY_THRESHOLD_CYCLES;
-  uint32_t sample_limit = 0;
-
-  uint32_t base_counter32 = 0;
-  uint32_t first_target_counter32 = 0;
-  int64_t base_gnss_ns = -1;
-  int64_t first_target_gnss_ns = -1;
-  uint32_t anchor_pps_count = 0;
-  uint32_t anchor_qtimer_at_pps = 0;
-  uint32_t start_now_counter32 = 0;
-  uint32_t start_now_phase_ticks = 0;
-
-  uint32_t last_fire_counter32 = 0;
-  uint32_t last_deadline = 0;
-  uint32_t last_fire_dwt = 0;
-  uint32_t last_callback_entry_dwt = 0;
-  uint32_t last_callback_latency_cycles = 0;
-  int32_t last_fire_error_ticks = 0;
-  int32_t last_spin_error_cycles = 0;
-  uint32_t last_irq_pass_sequence = 0;
-  uint32_t last_irq_pass_name_mask = 0;
-
-  phase_probe_stats_t stats{};
-};
-
-static phase_probe_irq_pass_t g_phase_probe_irq_pass = {};
-static phase_probe_state_t g_phase_probe = {};
-
 // Epoch changes rebase the VCLOCK synthetic coordinate system. Existing
 // timed deadlines must not survive that boundary; recurring slots are
 // re-authored into the new epoch and one-shot timed slots are cancelled.
@@ -929,12 +692,6 @@ static volatile uint32_t diag_epoch_last_schedule_next_calls_after = 0;
 // conceptual layer without C++ declaration-order surprises.
 
 static void schedule_next(void);
-static void phase_probe_callback(timepop_ctx_t* ctx, timepop_diag_t* diag, void* user_data);
-static bool phase_probe_start(uint32_t phase_us, uint32_t period_us, uint32_t sample_limit, uint32_t latency_threshold_cycles);
-static void phase_probe_stop(void);
-static void phase_probe_reset_stats_unlocked(void);
-static void phase_probe_note_irq_pass(const bool expired_this_pass[MAX_SLOTS], uint32_t now, uint32_t dwt);
-static FLASHMEM void add_phase_probe_payload(Payload& out);
 
 static void timepop_record_anchor_snapshot(const time_anchor_snapshot_t& snap,
                                            const char* context);
@@ -1121,20 +878,6 @@ static void timepop_dispatch_set_phase(timepop_dispatch_phase_t phase);
 static void timepop_dispatch_leave(void);
 static void timepop_apply_dispatch_mutations(const char* context);
 static void timepop_idle_witness_spin_until_pending(void);
-static void timepop_pendsv_shadow_configure(void);
-static void timepop_pendsv_shadow_reset(void);
-static void timepop_pendsv_shadow_request_from_irq(const char* context);
-static void timepop_pendsv_shadow_service(void);
-static void timepop_pendsv_shadow_software_irq_isr(void);
-static uint32_t timepop_ch2_deferred_pending_count(void);
-static bool timepop_ch2_deferred_enqueue(const interrupt_event_t& event,
-                                         const interrupt_capture_diag_t& diag);
-static bool timepop_ch2_deferred_dequeue(timepop_ch2_deferred_event_t& out);
-static void timepop_ch2_deferred_reset(void);
-static void timepop_ch2_deferred_process_event(const timepop_ch2_deferred_event_t& item);
-static void timepop_pendsv_shadow_pend_raw(void);
-
-
 // ============================================================================
 // Dispatch-time mutation barrier helpers
 // ============================================================================
@@ -1462,462 +1205,6 @@ static void timepop_idle_witness_spin_until_pending(void) {
 
   diag_idle_witness_running = false;
   diag_idle_witness_exit_count++;
-}
-
-static inline uint32_t timepop_pendsv_shadow_irq_number(void) {
-  return (uint32_t)TIMEPOP_PENDSV_SHADOW_IRQ;
-}
-
-static inline uint32_t timepop_pendsv_shadow_irq_index(void) {
-  return timepop_pendsv_shadow_irq_number() >> 5;
-}
-
-static inline uint32_t timepop_pendsv_shadow_irq_mask(void) {
-  return (1UL << (timepop_pendsv_shadow_irq_number() & 31U));
-}
-
-static inline volatile uint32_t& timepop_nvic_iser_word(uint32_t irq) {
-  volatile uint32_t* const regs = (volatile uint32_t*)TIMEPOP_NVIC_ISER_ADDR;
-  return regs[irq >> 5];
-}
-
-static inline volatile uint32_t& timepop_nvic_icer_word(uint32_t irq) {
-  volatile uint32_t* const regs = (volatile uint32_t*)TIMEPOP_NVIC_ICER_ADDR;
-  return regs[irq >> 5];
-}
-
-static inline volatile uint32_t& timepop_nvic_ispr_word(uint32_t irq) {
-  volatile uint32_t* const regs = (volatile uint32_t*)TIMEPOP_NVIC_ISPR_ADDR;
-  return regs[irq >> 5];
-}
-
-static inline volatile uint32_t& timepop_nvic_icpr_word(uint32_t irq) {
-  volatile uint32_t* const regs = (volatile uint32_t*)TIMEPOP_NVIC_ICPR_ADDR;
-  return regs[irq >> 5];
-}
-
-static inline volatile uint32_t& timepop_nvic_iabr_word(uint32_t irq) {
-  volatile uint32_t* const regs = (volatile uint32_t*)TIMEPOP_NVIC_IABR_ADDR;
-  return regs[irq >> 5];
-}
-
-static inline volatile uint8_t& timepop_nvic_ipr_byte(uint32_t irq) {
-  volatile uint8_t* const regs = (volatile uint8_t*)TIMEPOP_NVIC_IPR_ADDR;
-  return regs[irq];
-}
-
-static inline void timepop_irq_barrier(void) {
-  __asm__ volatile ("dsb" ::: "memory");
-  __asm__ volatile ("isb" ::: "memory");
-}
-
-static inline uint32_t timepop_read_ipsr(void) {
-  uint32_t v = 0;
-  __asm__ volatile ("mrs %0, ipsr" : "=r" (v));
-  return v;
-}
-
-static inline uint32_t timepop_read_primask(void) {
-  uint32_t v = 0;
-  __asm__ volatile ("mrs %0, primask" : "=r" (v));
-  return v;
-}
-
-static inline uint32_t timepop_read_basepri(void) {
-  uint32_t v = 0;
-  __asm__ volatile ("mrs %0, basepri" : "=r" (v));
-  return v;
-}
-
-static inline uint32_t timepop_read_faultmask(void) {
-  uint32_t v = 0;
-  __asm__ volatile ("mrs %0, faultmask" : "=r" (v));
-  return v;
-}
-
-static inline bool timepop_pendsv_shadow_enabled_bit(void) {
-  const uint32_t irq = timepop_pendsv_shadow_irq_number();
-  return (timepop_nvic_iser_word(irq) & timepop_pendsv_shadow_irq_mask()) != 0;
-}
-
-static inline bool timepop_pendsv_shadow_pending_bit(void) {
-  const uint32_t irq = timepop_pendsv_shadow_irq_number();
-  return (timepop_nvic_ispr_word(irq) & timepop_pendsv_shadow_irq_mask()) != 0;
-}
-
-static inline bool timepop_pendsv_shadow_active_bit(void) {
-  const uint32_t irq = timepop_pendsv_shadow_irq_number();
-  return (timepop_nvic_iabr_word(irq) & timepop_pendsv_shadow_irq_mask()) != 0;
-}
-
-static void timepop_pendsv_shadow_update_nvic_diag(void) {
-  const uint32_t irq = timepop_pendsv_shadow_irq_number();
-  diag_pendsv_shadow_irq_number = irq;
-  diag_pendsv_shadow_irq_index = timepop_pendsv_shadow_irq_index();
-  diag_pendsv_shadow_irq_mask = timepop_pendsv_shadow_irq_mask();
-  diag_pendsv_shadow_priority_live = timepop_nvic_ipr_byte(irq);
-  diag_pendsv_shadow_iser_word = timepop_nvic_iser_word(irq);
-  diag_pendsv_shadow_ispr_word = timepop_nvic_ispr_word(irq);
-  diag_pendsv_shadow_iabr_word = timepop_nvic_iabr_word(irq);
-  diag_pendsv_shadow_enabled_bit =
-      (diag_pendsv_shadow_iser_word & diag_pendsv_shadow_irq_mask) != 0;
-  diag_pendsv_shadow_pending_bit =
-      (diag_pendsv_shadow_ispr_word & diag_pendsv_shadow_irq_mask) != 0;
-  diag_pendsv_shadow_active_bit =
-      (diag_pendsv_shadow_iabr_word & diag_pendsv_shadow_irq_mask) != 0;
-  diag_pendsv_shadow_pending =
-      (diag_pendsv_shadow_request_count != diag_pendsv_shadow_served_request_count) ||
-      diag_pendsv_shadow_pending_bit;
-}
-
-static uint32_t timepop_ch2_deferred_pending_count(void) {
-  return (ch2_deferred_head - ch2_deferred_tail) &
-         TIMEPOP_CH2_DEFERRED_QUEUE_MASK;
-}
-
-static void timepop_ch2_deferred_reset(void) {
-  ch2_deferred_head = 0;
-  ch2_deferred_tail = 0;
-  ch2_deferred_sequence = 0;
-  for (uint32_t i = 0; i < TIMEPOP_CH2_DEFERRED_QUEUE_CAPACITY; i++) {
-    ch2_deferred_events[i] = timepop_ch2_deferred_event_t{};
-  }
-
-  diag_ch2_irq0_capture_count = 0;
-  diag_ch2_deferred_enqueue_count = 0;
-  diag_ch2_deferred_dequeue_count = 0;
-  diag_ch2_deferred_overflow_count = 0;
-  diag_ch2_deferred_high_water = 0;
-  diag_ch2_deferred_last_depth = 0;
-  diag_ch2_deferred_last_sequence_enqueued = 0;
-  diag_ch2_deferred_last_sequence_dequeued = 0;
-  diag_ch2_deferred_last_enqueue_dwt = 0;
-  diag_ch2_deferred_last_dequeue_dwt = 0;
-  diag_ch2_deferred_last_event_counter32 = 0;
-  diag_ch2_deferred_last_event_dwt = 0;
-  diag_ch2_deferred_last_drain_count = 0;
-  diag_ch2_deferred_drain_pass_count = 0;
-  diag_ch2_deferred_drain_empty_count = 0;
-  diag_ch2_deferred_drain_budget_exhausted_count = 0;
-  diag_ch2_deferred_repend_count = 0;
-  diag_ch2_deferred_process_body_cycles = 0;
-  diag_ch2_deferred_process_body_cycles_max = 0;
-  diag_ch2_deferred_capture_to_process_cycles = 0;
-  diag_ch2_deferred_capture_to_process_cycles_max = 0;
-}
-
-static bool timepop_ch2_deferred_enqueue(const interrupt_event_t& event,
-                                         const interrupt_capture_diag_t& diag) {
-  diag_ch2_irq0_capture_count++;
-
-  const uint32_t head = ch2_deferred_head;
-  const uint32_t next = (head + 1U) & TIMEPOP_CH2_DEFERRED_QUEUE_MASK;
-  if (next == ch2_deferred_tail) {
-    diag_ch2_deferred_overflow_count++;
-    return false;
-  }
-
-  timepop_ch2_deferred_event_t& slot = ch2_deferred_events[head];
-  slot.event = event;
-  slot.diag = diag;
-  slot.enqueue_dwt = ARM_DWT_CYCCNT;
-  slot.sequence = ++ch2_deferred_sequence;
-
-  __asm__ volatile ("dmb" ::: "memory");
-  ch2_deferred_head = next;
-
-  const uint32_t depth = timepop_ch2_deferred_pending_count();
-  diag_ch2_deferred_enqueue_count++;
-  diag_ch2_deferred_last_depth = depth;
-  if (depth > diag_ch2_deferred_high_water) {
-    diag_ch2_deferred_high_water = depth;
-  }
-  diag_ch2_deferred_last_sequence_enqueued = slot.sequence;
-  diag_ch2_deferred_last_enqueue_dwt = slot.enqueue_dwt;
-  diag_ch2_deferred_last_event_counter32 = event.counter32_at_event;
-  diag_ch2_deferred_last_event_dwt = event.dwt_at_event;
-  return true;
-}
-
-static bool timepop_ch2_deferred_dequeue(timepop_ch2_deferred_event_t& out) {
-  const uint32_t tail = ch2_deferred_tail;
-  if (tail == ch2_deferred_head) return false;
-
-  __asm__ volatile ("dmb" ::: "memory");
-  out = ch2_deferred_events[tail];
-  ch2_deferred_events[tail] = timepop_ch2_deferred_event_t{};
-  ch2_deferred_tail = (tail + 1U) & TIMEPOP_CH2_DEFERRED_QUEUE_MASK;
-
-  diag_ch2_deferred_dequeue_count++;
-  diag_ch2_deferred_last_depth = timepop_ch2_deferred_pending_count();
-  diag_ch2_deferred_last_sequence_dequeued = out.sequence;
-  diag_ch2_deferred_last_dequeue_dwt = ARM_DWT_CYCCNT;
-  return true;
-}
-
-static void timepop_pendsv_shadow_pend_raw(void) {
-  const uint32_t irq = timepop_pendsv_shadow_irq_number();
-  const uint32_t mask = timepop_pendsv_shadow_irq_mask();
-  timepop_nvic_ispr_word(irq) = mask;
-  timepop_irq_barrier();
-}
-
-
-static void timepop_pendsv_shadow_reset(void) {
-  diag_pendsv_shadow_pending = false;
-  diag_pendsv_shadow_running = false;
-  diag_pendsv_shadow_request_count = 0;
-  diag_pendsv_shadow_served_request_count = 0;
-  diag_pendsv_shadow_request_unconfigured_count = 0;
-  diag_pendsv_shadow_coalesced_request_count = 0;
-  diag_pendsv_shadow_entry_count = 0;
-  diag_pendsv_shadow_exit_count = 0;
-  diag_pendsv_shadow_spurious_entry_count = 0;
-  diag_pendsv_shadow_reentry_count = 0;
-  diag_pendsv_shadow_latency_sample_count = 0;
-  diag_pendsv_shadow_last_request_dwt = 0;
-  diag_pendsv_shadow_last_entry_dwt = 0;
-  diag_pendsv_shadow_last_exit_dwt = 0;
-  diag_pendsv_shadow_last_latency_cycles = 0;
-  diag_pendsv_shadow_min_latency_cycles = UINT32_MAX;
-  diag_pendsv_shadow_max_latency_cycles = 0;
-  diag_pendsv_shadow_latency_cycles_sum = 0;
-  diag_pendsv_shadow_last_body_cycles = 0;
-  diag_pendsv_shadow_max_body_cycles = 0;
-  diag_pendsv_shadow_last_request_context = nullptr;
-
-  diag_pendsv_shadow_irq_number = timepop_pendsv_shadow_irq_number();
-  diag_pendsv_shadow_irq_index = timepop_pendsv_shadow_irq_index();
-  diag_pendsv_shadow_irq_mask = timepop_pendsv_shadow_irq_mask();
-  diag_pendsv_shadow_priority_applied = 0xFFFFFFFFUL;
-  diag_pendsv_shadow_priority_live = 0xFFFFFFFFUL;
-  diag_pendsv_shadow_iser_word = 0;
-  diag_pendsv_shadow_ispr_word = 0;
-  diag_pendsv_shadow_iabr_word = 0;
-  diag_pendsv_shadow_enabled_bit = false;
-  diag_pendsv_shadow_pending_bit = false;
-  diag_pendsv_shadow_active_bit = false;
-
-  diag_pendsv_shadow_request_ipsr = 0;
-  diag_pendsv_shadow_request_primask = 0;
-  diag_pendsv_shadow_request_basepri = 0;
-  diag_pendsv_shadow_request_faultmask = 0;
-  diag_pendsv_shadow_request_pre_enabled_bit = false;
-  diag_pendsv_shadow_request_pre_pending_bit = false;
-  diag_pendsv_shadow_request_pre_active_bit = false;
-  diag_pendsv_shadow_request_post_enabled_bit = false;
-  diag_pendsv_shadow_request_post_pending_bit = false;
-  diag_pendsv_shadow_request_post_active_bit = false;
-
-  diag_pendsv_shadow_entry_ipsr = 0;
-  diag_pendsv_shadow_entry_primask = 0;
-  diag_pendsv_shadow_entry_basepri = 0;
-  diag_pendsv_shadow_entry_faultmask = 0;
-  diag_pendsv_shadow_entry_enabled_bit = false;
-  diag_pendsv_shadow_entry_pending_bit = false;
-  diag_pendsv_shadow_entry_active_bit = false;
-  diag_pendsv_shadow_exit_pending_bit = false;
-  diag_pendsv_shadow_exit_active_bit = false;
-
-  timepop_ch2_deferred_reset();
-}
-
-static void timepop_pendsv_shadow_configure(void) {
-  if (!TIMEPOP_PENDSV_SHADOW_ENABLED) return;
-  if (diag_pendsv_shadow_configured) {
-    timepop_pendsv_shadow_update_nvic_diag();
-    return;
-  }
-
-  const uint32_t irq = timepop_pendsv_shadow_irq_number();
-  const uint32_t mask = timepop_pendsv_shadow_irq_mask();
-
-  attachInterruptVector(TIMEPOP_PENDSV_SHADOW_IRQ,
-                        timepop_pendsv_shadow_software_irq_isr);
-
-  // Start from an unambiguous NVIC state before enabling the POC IRQ.
-  timepop_nvic_icpr_word(irq) = mask;
-  timepop_irq_barrier();
-
-  NVIC_SET_PRIORITY(TIMEPOP_PENDSV_SHADOW_IRQ,
-                    TIMEPOP_PENDSV_SHADOW_PRIORITY);
-  diag_pendsv_shadow_priority_applied = TIMEPOP_PENDSV_SHADOW_PRIORITY;
-
-  NVIC_ENABLE_IRQ(TIMEPOP_PENDSV_SHADOW_IRQ);
-  timepop_irq_barrier();
-
-  diag_pendsv_shadow_configured = true;
-  diag_pendsv_shadow_configure_count++;
-
-  timepop_pendsv_shadow_update_nvic_diag();
-}
-
-static void timepop_pendsv_shadow_request_from_irq(const char* context) {
-  if (!TIMEPOP_PENDSV_SHADOW_ENABLED) return;
-
-  const uint32_t irq = timepop_pendsv_shadow_irq_number();
-  const uint32_t mask = timepop_pendsv_shadow_irq_mask();
-  const uint32_t request_dwt = ARM_DWT_CYCCNT;
-
-  if (!diag_pendsv_shadow_configured) {
-    diag_pendsv_shadow_request_unconfigured_count++;
-    timepop_pendsv_shadow_configure();
-  }
-
-  timepop_pendsv_shadow_update_nvic_diag();
-
-  diag_pendsv_shadow_request_ipsr = timepop_read_ipsr();
-  diag_pendsv_shadow_request_primask = timepop_read_primask();
-  diag_pendsv_shadow_request_basepri = timepop_read_basepri();
-  diag_pendsv_shadow_request_faultmask = timepop_read_faultmask();
-  diag_pendsv_shadow_request_pre_enabled_bit = diag_pendsv_shadow_enabled_bit;
-  diag_pendsv_shadow_request_pre_pending_bit = diag_pendsv_shadow_pending_bit;
-  diag_pendsv_shadow_request_pre_active_bit = diag_pendsv_shadow_active_bit;
-
-  const bool scheduler_already_pending_or_running =
-      diag_pendsv_shadow_pending || diag_pendsv_shadow_running ||
-      diag_pendsv_shadow_request_count != diag_pendsv_shadow_served_request_count;
-  if (scheduler_already_pending_or_running) {
-    diag_pendsv_shadow_coalesced_request_count++;
-  }
-
-  diag_pendsv_shadow_request_count++;
-  diag_pendsv_shadow_pending = true;
-  diag_pendsv_shadow_last_request_dwt = request_dwt;
-  diag_pendsv_shadow_last_request_context = context;
-
-  // Directly pend the TimePop-owned software IRQ unless it is already running.
-  // If priority-0 capture interrupts the IRQ16 drain, the running drain loop or
-  // its final ring check will pick up the newly enqueued event and re-pend if
-  // needed.  Avoiding an unconditional active re-pend prevents harmless but
-  // noisy empty IRQ16 passes.
-  if (!diag_pendsv_shadow_running) {
-    timepop_pendsv_shadow_pend_raw();
-  }
-
-  diag_pendsv_shadow_request_post_enabled_bit =
-      (timepop_nvic_iser_word(irq) & mask) != 0;
-  diag_pendsv_shadow_request_post_pending_bit =
-      (timepop_nvic_ispr_word(irq) & mask) != 0;
-  diag_pendsv_shadow_request_post_active_bit =
-      (timepop_nvic_iabr_word(irq) & mask) != 0;
-
-  timepop_pendsv_shadow_update_nvic_diag();
-}
-
-static void timepop_pendsv_shadow_service(void) {
-  const uint32_t entry_dwt = ARM_DWT_CYCCNT;
-
-  diag_pendsv_shadow_entry_count++;
-  diag_pendsv_shadow_last_entry_dwt = entry_dwt;
-  diag_pendsv_shadow_entry_ipsr = timepop_read_ipsr();
-  diag_pendsv_shadow_entry_primask = timepop_read_primask();
-  diag_pendsv_shadow_entry_basepri = timepop_read_basepri();
-  diag_pendsv_shadow_entry_faultmask = timepop_read_faultmask();
-  timepop_pendsv_shadow_update_nvic_diag();
-  diag_pendsv_shadow_entry_enabled_bit = diag_pendsv_shadow_enabled_bit;
-  diag_pendsv_shadow_entry_pending_bit = diag_pendsv_shadow_pending_bit;
-  diag_pendsv_shadow_entry_active_bit = diag_pendsv_shadow_active_bit;
-
-  if (diag_pendsv_shadow_running) {
-    diag_pendsv_shadow_reentry_count++;
-    if (timepop_ch2_deferred_pending_count() != 0) {
-      diag_ch2_deferred_repend_count++;
-      timepop_pendsv_shadow_pend_raw();
-    }
-    return;
-  }
-
-  diag_pendsv_shadow_running = true;
-  diag_ch2_deferred_drain_pass_count++;
-
-  uint32_t drained = 0;
-  bool sampled_latency = false;
-
-  for (; drained < TIMEPOP_CH2_DEFERRED_DRAIN_BUDGET; drained++) {
-    timepop_ch2_deferred_event_t item{};
-    if (!timepop_ch2_deferred_dequeue(item)) break;
-
-    const uint32_t process_start_dwt = ARM_DWT_CYCCNT;
-    const uint32_t capture_to_process =
-        (item.enqueue_dwt != 0) ? (process_start_dwt - item.enqueue_dwt) : 0U;
-    diag_ch2_deferred_capture_to_process_cycles = capture_to_process;
-    if (capture_to_process > diag_ch2_deferred_capture_to_process_cycles_max) {
-      diag_ch2_deferred_capture_to_process_cycles_max = capture_to_process;
-    }
-
-    if (!sampled_latency && item.enqueue_dwt != 0) {
-      const uint32_t latency = entry_dwt - item.enqueue_dwt;
-      diag_pendsv_shadow_latency_sample_count++;
-      diag_pendsv_shadow_last_latency_cycles = latency;
-      diag_pendsv_shadow_latency_cycles_sum += (uint64_t)latency;
-      if (latency < diag_pendsv_shadow_min_latency_cycles) {
-        diag_pendsv_shadow_min_latency_cycles = latency;
-      }
-      if (latency > diag_pendsv_shadow_max_latency_cycles) {
-        diag_pendsv_shadow_max_latency_cycles = latency;
-      }
-      sampled_latency = true;
-    }
-
-    timepop_ch2_deferred_process_event(item);
-
-    const uint32_t process_cycles = ARM_DWT_CYCCNT - process_start_dwt;
-    diag_ch2_deferred_process_body_cycles = process_cycles;
-    if (process_cycles > diag_ch2_deferred_process_body_cycles_max) {
-      diag_ch2_deferred_process_body_cycles_max = process_cycles;
-    }
-
-    diag_pendsv_shadow_served_request_count++;
-  }
-
-  diag_ch2_deferred_last_drain_count = drained;
-  if (drained == 0) {
-    diag_ch2_deferred_drain_empty_count++;
-    diag_pendsv_shadow_spurious_entry_count++;
-  }
-
-  const uint32_t remaining = timepop_ch2_deferred_pending_count();
-  if (remaining != 0) {
-    diag_ch2_deferred_drain_budget_exhausted_count++;
-    diag_ch2_deferred_repend_count++;
-    diag_pendsv_shadow_pending = true;
-    timepop_pendsv_shadow_pend_raw();
-  } else {
-    diag_pendsv_shadow_pending =
-        diag_pendsv_shadow_request_count != diag_pendsv_shadow_served_request_count;
-  }
-
-  const uint32_t exit_dwt = ARM_DWT_CYCCNT;
-  const uint32_t body_cycles = exit_dwt - entry_dwt;
-  diag_pendsv_shadow_last_exit_dwt = exit_dwt;
-  diag_pendsv_shadow_last_body_cycles = body_cycles;
-  if (body_cycles > diag_pendsv_shadow_max_body_cycles) {
-    diag_pendsv_shadow_max_body_cycles = body_cycles;
-  }
-
-  timepop_pendsv_shadow_update_nvic_diag();
-  diag_pendsv_shadow_exit_pending_bit = diag_pendsv_shadow_pending_bit;
-  diag_pendsv_shadow_exit_active_bit = diag_pendsv_shadow_active_bit;
-
-  diag_pendsv_shadow_running = false;
-  diag_pendsv_shadow_exit_count++;
-
-  // A priority-0 CH2 event may have arrived after the drain loop observed an
-  // empty ring but before we cleared running.  The producer already pended the
-  // IRQ, but re-pending here keeps the handoff explicit and harmlessly
-  // coalesces in the NVIC.
-  if (timepop_ch2_deferred_pending_count() != 0) {
-    diag_ch2_deferred_repend_count++;
-    diag_pendsv_shadow_pending = true;
-    timepop_pendsv_shadow_pend_raw();
-  }
-
-  timepop_pendsv_shadow_update_nvic_diag();
-}
-
-static void timepop_pendsv_shadow_software_irq_isr(void) {
-  timepop_pendsv_shadow_service();
 }
 
 static bool pop_dispatch_mutation(timepop_dispatch_mutation_t& out) {
@@ -2505,81 +1792,6 @@ static inline bool slot_name_equals(const timepop_slot_t& slot, const char* name
   return slot.name && name && strcmp(slot.name, name) == 0;
 }
 
-static uint32_t phase_probe_abs_i32(int32_t value) {
-  return (uint32_t)(value < 0 ? -(int64_t)value : (int64_t)value);
-}
-
-static int32_t phase_probe_mean_milli(int64_t sum, uint32_t count) {
-  if (count == 0) return 0;
-  const bool neg = sum < 0;
-  const uint64_t mag = neg ? (uint64_t)(-sum) : (uint64_t)sum;
-  const uint64_t mean = (mag * 1000ULL + (uint64_t)count / 2ULL) / (uint64_t)count;
-  const int64_t signed_mean = neg ? -(int64_t)mean : (int64_t)mean;
-  if (signed_mean > (int64_t)INT32_MAX) return INT32_MAX;
-  if (signed_mean < (int64_t)INT32_MIN) return INT32_MIN;
-  return (int32_t)signed_mean;
-}
-
-static uint32_t phase_probe_ratio_permille(uint32_t num, uint32_t den) {
-  if (den == 0) return 0;
-  return (uint32_t)(((uint64_t)num * 1000ULL + (uint64_t)den / 2ULL) / (uint64_t)den);
-}
-
-static uint32_t phase_probe_mean_count_milli(uint32_t sum, uint32_t count) {
-  if (count == 0) return 0;
-  return (uint32_t)(((uint64_t)sum * 1000ULL + (uint64_t)count / 2ULL) / (uint64_t)count);
-}
-
-static uint32_t phase_probe_name_mask_for_name(const char* name) {
-  if (!name || !*name) return 0;
-  if (strcmp(name, PHASE_PROBE_NAME) == 0) return PHASE_PROBE_MASK_PHASE_PROBE;
-  if (strcmp(name, "CADENCE_MINDER") == 0) return PHASE_PROBE_MASK_CADENCE_MINDER;
-  if (strcmp(name, "transport-rx") == 0) return PHASE_PROBE_MASK_TRANSPORT_RX;
-  if (strcmp(name, "transport-tx") == 0) return PHASE_PROBE_MASK_TRANSPORT_TX;
-  if (strcmp(name, "publish-events") == 0) return PHASE_PROBE_MASK_PUBLISH_EVENTS;
-  if (strcmp(name, WITNESS_SCHEDULER_NAME) == 0) return PHASE_PROBE_MASK_WITNESS_SCHED;
-  if (strcmp(name, "cpu-usage") == 0) return PHASE_PROBE_MASK_CPU_USAGE;
-  return PHASE_PROBE_MASK_OTHER;
-}
-
-static void phase_probe_reset_stats_unlocked(void) {
-  g_phase_probe.stats = phase_probe_stats_t{};
-  g_phase_probe.complete = false;
-  g_phase_probe.last_fire_counter32 = 0;
-  g_phase_probe.last_deadline = 0;
-  g_phase_probe.last_fire_dwt = 0;
-  g_phase_probe.last_callback_entry_dwt = 0;
-  g_phase_probe.last_callback_latency_cycles = 0;
-  g_phase_probe.last_fire_error_ticks = 0;
-  g_phase_probe.last_spin_error_cycles = 0;
-  g_phase_probe.last_irq_pass_sequence = 0;
-  g_phase_probe.last_irq_pass_name_mask = 0;
-}
-
-static void phase_probe_note_irq_pass(const bool expired_this_pass[MAX_SLOTS],
-                                      uint32_t now,
-                                      uint32_t dwt) {
-  phase_probe_irq_pass_t pass{};
-  pass.sequence = g_phase_probe_irq_pass.sequence + 1U;
-  pass.now = now;
-  pass.dwt = dwt;
-
-  for (uint32_t i = 0; i < MAX_SLOTS; i++) {
-    if (!expired_this_pass[i]) continue;
-    pass.exact_slot_count++;
-    pass.name_mask |= phase_probe_name_mask_for_name(slots[i].name);
-    if (!slot_name_equals(slots[i], PHASE_PROBE_NAME)) pass.non_probe_exact_slot_count++;
-    if (slots[i].isr_callback) pass.isr_callback_slot_count++;
-    else pass.scheduled_callback_slot_count++;
-  }
-
-  pass.asap_pending_count = deferred_pending_count(asap_slots, MAX_ASAP_SLOTS);
-  pass.asap_dispatching_count = deferred_dispatching_count(asap_slots, MAX_ASAP_SLOTS);
-  pass.alap_pending_count = deferred_pending_count(alap_slots, MAX_ALAP_SLOTS);
-  pass.alap_dispatching_count = deferred_dispatching_count(alap_slots, MAX_ALAP_SLOTS);
-  g_phase_probe_irq_pass = pass;
-}
-
 static inline bool slot_is_one_hz_recurring(const timepop_slot_t& slot) {
   return slot.active && slot.recurring && slot.period_ticks == ONE_HZ_TICKS;
 }
@@ -2717,7 +1929,7 @@ static bool rearm_recurring_slot_for_epoch(timepop_slot_t& slot) {
 
 // Re-arm a critical recurring ISR slot before schedule_next() chooses the next
 // CH2 compare.  This path must not depend on foreground dispatch.  It uses the
-// already-authored CH2 fire facts from the current IRQ pass and falls back to a
+// already-authored CH2 fire facts from the current scheduler pass and falls back to a
 // relative deadline from the captured VCLOCK identity if the absolute GNSS
 // anchor is not yet usable.
 static bool rearm_recurring_slot_from_irq(timepop_slot_t& slot,
@@ -3373,13 +2585,13 @@ static uint32_t select_next_scheduled_callback_slot_by_priority(
 // QTimer1 CH2 handler — TimePop priority queue scheduler
 // ============================================================================
 //
-// IRQ-context handler called by process_interrupt's qtimer1_isr
-// dispatcher on every CH2 compare-match.  Receives the standard
-// event/diag payload — DWT and counter32 already filled in by the dispatcher.
-// TimePop authors fire_gnss_ns from that counter32 identity using VCLOCK
-// arithmetic; any GNSS value in the interrupt payload is diagnostic.  The
-// CH2 TCF1 flag is cleared by the dispatcher before this runs, so we don't
-// clear it ourselves.
+// Scheduler-context handler called by process_interrupt after priority-0
+// QTimer1 capture has been handed to process_interrupt's priority-16 custody
+// tier.  Receives the standard event/diag payload — DWT and counter32 already
+// filled in by the dispatcher. TimePop authors fire_gnss_ns from that
+// counter32 identity using VCLOCK arithmetic; any GNSS value in the interrupt
+// payload is diagnostic. The CH2 TCF1 flag is cleared by process_interrupt
+// before this runs, so TimePop never touches QTimer hardware here.
 //
 static void timepop_process_ch2_event_in_scheduler_irq(const interrupt_event_t& event,
                                                        const interrupt_capture_diag_t& /*diag*/) {
@@ -3568,8 +2780,6 @@ static void timepop_process_ch2_event_in_scheduler_irq(const interrupt_event_t& 
     }
   }
 
-  phase_probe_note_irq_pass(expired_this_pass, now, dwt_entry);
-
   // Phase 2: now that the fire facts are stable for all simultaneous slots,
   // dispatch any IRQ-context callbacks.  Slots without isr_callback will be
   // dispatched later by timepop_dispatch() using the same stored context.
@@ -3616,29 +2826,24 @@ static void timepop_process_ch2_event_in_scheduler_irq(const interrupt_event_t& 
 }
 
 
-static void timepop_ch2_deferred_process_event(const timepop_ch2_deferred_event_t& item) {
-  timepop_process_ch2_event_in_scheduler_irq(item.event, item.diag);
-}
-
 void timepop_qtimer1_ch2_handler(const interrupt_event_t& event,
                                  const interrupt_capture_diag_t& diag) {
-  // Priority-0 hosted CH2 path: copy only the already-authored event facts and
-  // request lower-priority scheduler service.  No slot scan, no callbacks, no
-  // schedule_next(), and no compare rearm happen here anymore.
-  const bool enqueued = timepop_ch2_deferred_enqueue(event, diag);
-  if (!enqueued) {
-    // The event could not be transported, so make the failure loud and still
-    // pend the scheduler IRQ in case space opens before the next CH2 event.
-    // No inline fallback is attempted here because re-entering TimePop while
-    // IRQ16 is processing the slot table would be worse than a loud failure.
-  }
+  // process_interrupt already transported the CH2 hardware event out of the
+  // priority-0 capture tier.  TimePop receives immutable event facts in the
+  // process_interrupt handoff context and performs scheduler policy directly.
+  diag_ch2_direct_call_count++;
+  diag_ch2_direct_last_event_counter32 = event.counter32_at_event;
+  diag_ch2_direct_last_event_dwt = event.dwt_at_event;
 
-  if (enqueued) {
-    timepop_pendsv_shadow_request_from_irq("qtimer1_ch2_deferred_enqueue");
-  } else {
-    timepop_pendsv_shadow_pend_raw();
+  const uint32_t body_start = ARM_DWT_CYCCNT;
+  timepop_process_ch2_event_in_scheduler_irq(event, diag);
+  const uint32_t body_cycles = ARM_DWT_CYCCNT - body_start;
+  diag_ch2_direct_body_cycles_last = body_cycles;
+  if (body_cycles > diag_ch2_direct_body_cycles_max) {
+    diag_ch2_direct_body_cycles_max = body_cycles;
   }
 }
+
 
 
 static inline void build_deferred_ctx(timepop_handle_t handle, timepop_ctx_t& ctx) {
@@ -3832,10 +3037,11 @@ void timepop_init(void) {
   diag_idle_witness_last_enter_dwt = 0;
   diag_idle_witness_last_exit_dwt = 0;
 
-  diag_pendsv_shadow_configured = false;
-  diag_pendsv_shadow_configure_count = 0;
-  timepop_pendsv_shadow_reset();
-  timepop_pendsv_shadow_configure();
+  diag_ch2_direct_call_count = 0;
+  diag_ch2_direct_body_cycles_last = 0;
+  diag_ch2_direct_body_cycles_max = 0;
+  diag_ch2_direct_last_event_counter32 = 0;
+  diag_ch2_direct_last_event_dwt = 0;
 
   diag_asap_armed = 0;
   diag_asap_dispatched = 0;
@@ -3948,10 +3154,10 @@ void timepop_init(void) {
   diag_epoch_last_schedule_next_calls_before = 0;
   diag_epoch_last_schedule_next_calls_after = 0;
   // QTimer1 hardware (CH0/CH2) is initialized by
-  // process_interrupt_init_hardware().  IRQ vector and NVIC priority
-  // are owned by process_interrupt_enable_irqs().  We just register
-  // our CH2 handler here; the dispatcher will invoke it in IRQ
-  // context with a fully-populated event/diag payload.
+  // process_interrupt_init_hardware().  IRQ vector, capture priority, and
+  // priority handoff are owned by process_interrupt.  We just register our
+  // CH2 handler here; process_interrupt invokes it from its handoff context
+  // with a fully-populated event/diag payload.
   interrupt_register_qtimer1_ch2_handler(timepop_qtimer1_ch2_handler);
 
   const uint32_t saved = critical_enter();
@@ -4490,259 +3696,6 @@ timepop_handle_t timepop_arm_recurring_isr_from_base_counter32_with_priority(
                                                            user_data,
                                                            name,
                                                            priority);
-}
-
-static bool phase_probe_compute_first_target(uint32_t phase_us,
-                                             uint32_t period_us,
-                                             uint32_t& out_phase_ticks,
-                                             uint32_t& out_period_ticks,
-                                             uint32_t& out_base_counter32,
-                                             uint32_t& out_first_target_counter32,
-                                             int64_t& out_base_gnss_ns,
-                                             int64_t& out_first_target_gnss_ns,
-                                             uint32_t& out_anchor_pps_count,
-                                             uint32_t& out_anchor_qtimer_at_pps,
-                                             uint32_t& out_now_counter32,
-                                             uint32_t& out_now_phase_ticks) {
-  if (period_us == 0 || period_us > PHASE_PROBE_MAX_PERIOD_US) return false;
-
-  const uint64_t period_ticks64 = ((uint64_t)period_us * 1000ULL) / NS_PER_TICK;
-  const uint64_t phase_ticks64 = ((uint64_t)phase_us * 1000ULL) / NS_PER_TICK;
-  if (period_ticks64 < MIN_DELAY_TICKS || period_ticks64 > MAX_DELAY_TICKS) return false;
-
-  const uint32_t period_ticks = (uint32_t)period_ticks64;
-  const uint32_t phase_ticks = (uint32_t)(phase_ticks64 % period_ticks64);
-
-  const time_anchor_snapshot_t snap = timepop_anchor_snapshot("phase_probe_start");
-  if (!snap.ok || !snap.valid || snap.pps_count < 1) return false;
-
-  const uint32_t now = vclock_count();
-  const uint32_t ticks_since_pps = now - snap.qtimer_at_pps;
-  const uint32_t now_phase_ticks = ticks_since_pps % period_ticks;
-
-  uint64_t intervals = 0;
-  if (ticks_since_pps >= phase_ticks) {
-    intervals = ((uint64_t)(ticks_since_pps - phase_ticks) / period_ticks) + 1ULL;
-  }
-
-  const uint64_t target_from_pps_ticks64 =
-      (uint64_t)phase_ticks + intervals * (uint64_t)period_ticks;
-  if (target_from_pps_ticks64 > 0xFFFFFFFFULL) return false;
-
-  const uint32_t target_from_pps_ticks = (uint32_t)target_from_pps_ticks64;
-  const uint32_t first_target_counter32 = snap.qtimer_at_pps + target_from_pps_ticks;
-  const uint32_t base_counter32 = first_target_counter32 - period_ticks;
-
-  const int64_t anchor_pps_gnss_ns =
-      (int64_t)(snap.pps_count - 1U) * (int64_t)1000000000LL;
-  const int64_t first_target_gnss_ns =
-      anchor_pps_gnss_ns + (int64_t)target_from_pps_ticks * (int64_t)NS_PER_TICK;
-  const int64_t base_gnss_ns = first_target_gnss_ns - (int64_t)period_us * 1000LL;
-  if (base_gnss_ns <= 0 || first_target_gnss_ns <= 0) return false;
-
-  out_phase_ticks = phase_ticks;
-  out_period_ticks = period_ticks;
-  out_base_counter32 = base_counter32;
-  out_first_target_counter32 = first_target_counter32;
-  out_base_gnss_ns = base_gnss_ns;
-  out_first_target_gnss_ns = first_target_gnss_ns;
-  out_anchor_pps_count = snap.pps_count;
-  out_anchor_qtimer_at_pps = snap.qtimer_at_pps;
-  out_now_counter32 = now;
-  out_now_phase_ticks = now_phase_ticks;
-  return true;
-}
-
-static bool phase_probe_start(uint32_t phase_us,
-                              uint32_t period_us,
-                              uint32_t sample_limit,
-                              uint32_t latency_threshold_cycles) {
-  uint32_t phase_ticks = 0;
-  uint32_t period_ticks = 0;
-  uint32_t base_counter32 = 0;
-  uint32_t first_target_counter32 = 0;
-  int64_t base_gnss_ns = -1;
-  int64_t first_target_gnss_ns = -1;
-  uint32_t anchor_pps_count = 0;
-  uint32_t anchor_qtimer_at_pps = 0;
-  uint32_t now_counter32 = 0;
-  uint32_t now_phase_ticks = 0;
-
-  if (!phase_probe_compute_first_target(phase_us,
-                                        period_us,
-                                        phase_ticks,
-                                        period_ticks,
-                                        base_counter32,
-                                        first_target_counter32,
-                                        base_gnss_ns,
-                                        first_target_gnss_ns,
-                                        anchor_pps_count,
-                                        anchor_qtimer_at_pps,
-                                        now_counter32,
-                                        now_phase_ticks)) {
-    g_phase_probe.arm_fail_count++;
-    return false;
-  }
-
-  (void)timepop_cancel_by_name(PHASE_PROBE_NAME);
-
-  const uint32_t saved = critical_enter();
-  g_phase_probe.active = false;
-  g_phase_probe.armed = false;
-  g_phase_probe.complete = false;
-  g_phase_probe.handle = TIMEPOP_INVALID_HANDLE;
-  g_phase_probe.phase_us = phase_us;
-  g_phase_probe.phase_ticks = phase_ticks;
-  g_phase_probe.period_us = period_us;
-  g_phase_probe.period_ticks = period_ticks;
-  g_phase_probe.latency_threshold_cycles = latency_threshold_cycles;
-  g_phase_probe.sample_limit = sample_limit;
-  g_phase_probe.base_counter32 = base_counter32;
-  g_phase_probe.first_target_counter32 = first_target_counter32;
-  g_phase_probe.base_gnss_ns = base_gnss_ns;
-  g_phase_probe.first_target_gnss_ns = first_target_gnss_ns;
-  g_phase_probe.anchor_pps_count = anchor_pps_count;
-  g_phase_probe.anchor_qtimer_at_pps = anchor_qtimer_at_pps;
-  g_phase_probe.start_now_counter32 = now_counter32;
-  g_phase_probe.start_now_phase_ticks = now_phase_ticks;
-  phase_probe_reset_stats_unlocked();
-  critical_exit(saved);
-
-  const timepop_handle_t h = arm_anchored_recurring_isr_from_counter32_internal(
-      base_gnss_ns,
-      base_counter32,
-      (uint64_t)period_us * 1000ULL,
-      phase_probe_callback,
-      nullptr,
-      PHASE_PROBE_NAME,
-      TIMEPOP_PRIORITY_DEFAULT);
-
-  const uint32_t saved2 = critical_enter();
-  if (h == TIMEPOP_INVALID_HANDLE) {
-    g_phase_probe.active = false;
-    g_phase_probe.armed = false;
-    g_phase_probe.handle = TIMEPOP_INVALID_HANDLE;
-    g_phase_probe.arm_fail_count++;
-    critical_exit(saved2);
-    return false;
-  }
-
-  g_phase_probe.active = true;
-  g_phase_probe.armed = true;
-  g_phase_probe.handle = h;
-  g_phase_probe.start_count++;
-  critical_exit(saved2);
-  return true;
-}
-
-static void phase_probe_stop(void) {
-  (void)timepop_cancel_by_name(PHASE_PROBE_NAME);
-  const uint32_t saved = critical_enter();
-  g_phase_probe.active = false;
-  g_phase_probe.armed = false;
-  g_phase_probe.handle = TIMEPOP_INVALID_HANDLE;
-  g_phase_probe.stop_count++;
-  critical_exit(saved);
-}
-
-static void phase_probe_callback(timepop_ctx_t* ctx,
-                                 timepop_diag_t* diag,
-                                 void*) {
-  const uint32_t body_start = ARM_DWT_CYCCNT;
-  if (!ctx || !g_phase_probe.active) return;
-
-  phase_probe_stats_t& s = g_phase_probe.stats;
-  s.sample_count++;
-
-  const uint32_t callback_latency_cycles = body_start - ctx->fire_dwt_cyccnt;
-  s.callback_latency_cycles_sum += (uint64_t)callback_latency_cycles;
-  if (callback_latency_cycles < s.callback_latency_cycles_min) {
-    s.callback_latency_cycles_min = callback_latency_cycles;
-  }
-  if (callback_latency_cycles > s.callback_latency_cycles_max) {
-    s.callback_latency_cycles_max = callback_latency_cycles;
-  }
-  if (callback_latency_cycles <= 128U) s.callback_latency_le128_count++;
-  if (callback_latency_cycles <= 256U) s.callback_latency_le256_count++;
-  if (callback_latency_cycles <= 512U) s.callback_latency_le512_count++;
-  if (callback_latency_cycles <= 1024U) s.callback_latency_le1024_count++;
-  if (callback_latency_cycles <= 2048U) s.callback_latency_le2048_count++;
-  if (callback_latency_cycles > 2048U) s.callback_latency_gt2048_count++;
-
-  const int32_t fire_error_ticks = ctx->fire_gnss_error_ns / (int32_t)NS_PER_TICK;
-  s.fire_error_ticks_sum += (int64_t)fire_error_ticks;
-  if (fire_error_ticks < s.fire_error_ticks_min) s.fire_error_ticks_min = fire_error_ticks;
-  if (fire_error_ticks > s.fire_error_ticks_max) s.fire_error_ticks_max = fire_error_ticks;
-  const uint32_t abs_fire = phase_probe_abs_i32(fire_error_ticks);
-  if (fire_error_ticks != 0) s.fire_error_nonzero_count++;
-  if (abs_fire > 1U) s.fire_error_abs_gt1_count++;
-  if (abs_fire > 4U) s.fire_error_abs_gt4_count++;
-
-  if (diag && diag->prediction_valid) {
-    const int32_t spin = diag->spin_error_cycles;
-    s.spin_error_valid_count++;
-    s.spin_error_cycles_sum += (int64_t)spin;
-    if (spin < s.spin_error_cycles_min) s.spin_error_cycles_min = spin;
-    if (spin > s.spin_error_cycles_max) s.spin_error_cycles_max = spin;
-    const uint32_t abs_spin = phase_probe_abs_i32(spin);
-    if (abs_spin > 4U) s.spin_error_abs_gt4_count++;
-    if (abs_spin > 8U) s.spin_error_abs_gt8_count++;
-    if (abs_spin > 20U) s.spin_error_abs_gt20_count++;
-    if (abs_spin > 50U) s.spin_error_abs_gt50_count++;
-    if (abs_spin > 100U) s.spin_error_abs_gt100_count++;
-    g_phase_probe.last_spin_error_cycles = spin;
-  }
-
-  const phase_probe_irq_pass_t pass = g_phase_probe_irq_pass;
-  s.coexpired_exact_sum += pass.exact_slot_count;
-  s.coexpired_non_probe_sum += pass.non_probe_exact_slot_count;
-  if (pass.exact_slot_count > s.coexpired_exact_max) s.coexpired_exact_max = pass.exact_slot_count;
-  if (pass.non_probe_exact_slot_count > s.coexpired_non_probe_max) {
-    s.coexpired_non_probe_max = pass.non_probe_exact_slot_count;
-  }
-  if (pass.non_probe_exact_slot_count != 0) s.coexpired_non_probe_count++;
-
-  s.asap_pending_sum += pass.asap_pending_count;
-  if (pass.asap_pending_count > s.asap_pending_max) s.asap_pending_max = pass.asap_pending_count;
-  if (pass.asap_pending_count != 0) s.asap_pending_nonzero_count++;
-  s.alap_pending_sum += pass.alap_pending_count;
-  if (pass.alap_pending_count > s.alap_pending_max) s.alap_pending_max = pass.alap_pending_count;
-  if (pass.alap_pending_count != 0) s.alap_pending_nonzero_count++;
-
-  const uint32_t non_probe_mask = pass.name_mask & ~PHASE_PROBE_MASK_PHASE_PROBE;
-  if (callback_latency_cycles <= g_phase_probe.latency_threshold_cycles &&
-      non_probe_mask == 0 && pass.non_probe_exact_slot_count == 0 &&
-      pass.asap_pending_count == 0 && pass.asap_dispatching_count == 0 &&
-      pass.alap_pending_count == 0 && pass.alap_dispatching_count == 0) {
-    s.quiet_count++;
-  } else {
-    s.not_quiet_count++;
-  }
-
-  if (non_probe_mask & PHASE_PROBE_MASK_CADENCE_MINDER) s.coexpired_cadence_minder_count++;
-  if (non_probe_mask & PHASE_PROBE_MASK_TRANSPORT_RX) s.coexpired_transport_rx_count++;
-  if (non_probe_mask & PHASE_PROBE_MASK_TRANSPORT_TX) s.coexpired_transport_tx_count++;
-  if (non_probe_mask & PHASE_PROBE_MASK_PUBLISH_EVENTS) s.coexpired_publish_events_count++;
-  if (non_probe_mask & PHASE_PROBE_MASK_WITNESS_SCHED) s.coexpired_witness_scheduler_count++;
-  if (non_probe_mask & PHASE_PROBE_MASK_CPU_USAGE) s.coexpired_cpu_usage_count++;
-  if (non_probe_mask & PHASE_PROBE_MASK_OTHER) s.coexpired_other_count++;
-
-  g_phase_probe.last_fire_counter32 = ctx->fire_vclock_raw;
-  g_phase_probe.last_deadline = ctx->deadline;
-  g_phase_probe.last_fire_dwt = ctx->fire_dwt_cyccnt;
-  g_phase_probe.last_callback_entry_dwt = body_start;
-  g_phase_probe.last_callback_latency_cycles = callback_latency_cycles;
-  g_phase_probe.last_fire_error_ticks = fire_error_ticks;
-  g_phase_probe.last_irq_pass_sequence = pass.sequence;
-  g_phase_probe.last_irq_pass_name_mask = pass.name_mask;
-
-  const uint32_t body_cycles = ARM_DWT_CYCCNT - body_start;
-  s.body_cycles_sum += (uint64_t)body_cycles;
-  if (body_cycles > s.body_cycles_max) s.body_cycles_max = body_cycles;
-
-  if (g_phase_probe.sample_limit != 0 && s.sample_count >= g_phase_probe.sample_limit) {
-    g_phase_probe.complete = true;
-  }
 }
 
 timepop_handle_t timepop_arm_asap(
@@ -5445,16 +4398,6 @@ static FLASHMEM Payload cmd_report(const Payload&) {
   out.add("idle_dwt_witness_snapshot_dwt", idle_witness.snapshot_dwt);
   out.add("idle_dwt_witness_wall_cycles", idle_witness.snapshot_wall_cycles);
   out.add("time_pps_count",    time_pps_count());
-  out.add("phase_probe_command", "TIMEPOP.PHASE_PROBE action=START|STOP|RESET phase_us=250 period_us=1000 samples=0");
-  out.add("phase_probe_active", g_phase_probe.active);
-  out.add("phase_probe_phase_us", g_phase_probe.phase_us);
-  out.add("phase_probe_period_us", g_phase_probe.period_us);
-  out.add("phase_probe_sample_count", g_phase_probe.stats.sample_count);
-  out.add("phase_probe_callback_latency_max_cycles",
-          g_phase_probe.stats.callback_latency_cycles_max);
-  out.add("phase_probe_quiet_permille",
-          phase_probe_ratio_permille(g_phase_probe.stats.quiet_count,
-                                     g_phase_probe.stats.sample_count));
 
   out.add("slot_priority_supported", true);
   out.add("slot_priority_ordering_enabled", TIMEPOP_SLOT_PRIORITY_ORDERING_ENABLED);
@@ -5644,125 +4587,13 @@ static FLASHMEM Payload cmd_report(const Payload&) {
           (const char*)(diag_timed_dispatch_last_name
                             ? diag_timed_dispatch_last_name
                             : ""));
-  out.add("pendsv_shadow_supported",           true);
-  out.add("pendsv_shadow_enabled",             TIMEPOP_PENDSV_SHADOW_ENABLED);
-  out.add("pendsv_shadow_mechanism",           TIMEPOP_PENDSV_SHADOW_MECHANISM);
-  out.add("pendsv_shadow_trigger_method",      TIMEPOP_PENDSV_SHADOW_TRIGGER);
-  out.add("pendsv_shadow_private_irq",         true);
-  out.add("pendsv_shadow_irq",                 (uint32_t)TIMEPOP_PENDSV_SHADOW_IRQ);
-  out.add("pendsv_shadow_priority",            TIMEPOP_PENDSV_SHADOW_PRIORITY);
-  out.add("pendsv_shadow_configured",          diag_pendsv_shadow_configured);
-  out.add("pendsv_shadow_configure_count",     diag_pendsv_shadow_configure_count);
-  out.add("pendsv_shadow_pending",             diag_pendsv_shadow_pending);
-  out.add("pendsv_shadow_running",             diag_pendsv_shadow_running);
-  out.add("pendsv_shadow_request_count",       diag_pendsv_shadow_request_count);
-  out.add("pendsv_shadow_served_request_count",
-          diag_pendsv_shadow_served_request_count);
-  out.add("pendsv_shadow_unserved_request_count",
-          diag_pendsv_shadow_request_count - diag_pendsv_shadow_served_request_count);
-  out.add("pendsv_shadow_request_unconfigured_count",
-          diag_pendsv_shadow_request_unconfigured_count);
-  out.add("pendsv_shadow_coalesced_request_count",
-          diag_pendsv_shadow_coalesced_request_count);
-  out.add("pendsv_shadow_entry_count",         diag_pendsv_shadow_entry_count);
-  out.add("pendsv_shadow_exit_count",          diag_pendsv_shadow_exit_count);
-  out.add("pendsv_shadow_spurious_entry_count",
-          diag_pendsv_shadow_spurious_entry_count);
-  out.add("pendsv_shadow_reentry_count",       diag_pendsv_shadow_reentry_count);
-  out.add("pendsv_shadow_latency_sample_count",
-          diag_pendsv_shadow_latency_sample_count);
-  out.add("pendsv_shadow_last_request_dwt",    diag_pendsv_shadow_last_request_dwt);
-  out.add("pendsv_shadow_last_entry_dwt",      diag_pendsv_shadow_last_entry_dwt);
-  out.add("pendsv_shadow_last_exit_dwt",       diag_pendsv_shadow_last_exit_dwt);
-  out.add("pendsv_shadow_last_latency_cycles",
-          diag_pendsv_shadow_last_latency_cycles);
-  out.add("pendsv_shadow_min_latency_cycles",
-          diag_pendsv_shadow_latency_sample_count
-              ? diag_pendsv_shadow_min_latency_cycles
-              : 0U);
-  out.add("pendsv_shadow_max_latency_cycles",
-          diag_pendsv_shadow_max_latency_cycles);
-  out.add("pendsv_shadow_mean_latency_cycles",
-          diag_pendsv_shadow_latency_sample_count
-              ? (uint32_t)(diag_pendsv_shadow_latency_cycles_sum /
-                           (uint64_t)diag_pendsv_shadow_latency_sample_count)
-              : 0U);
-  out.add("pendsv_shadow_last_body_cycles",
-          diag_pendsv_shadow_last_body_cycles);
-  out.add("pendsv_shadow_max_body_cycles",
-          diag_pendsv_shadow_max_body_cycles);
-  out.add("pendsv_shadow_last_request_context",
-          (const char*)(diag_pendsv_shadow_last_request_context
-                            ? diag_pendsv_shadow_last_request_context
-                            : ""));
+  out.add("ch2_service_context", TIMEPOP_CH2_SERVICE_CONTEXT);
+  out.add("ch2_direct_call_count", diag_ch2_direct_call_count);
+  out.add("ch2_direct_body_cycles_last", diag_ch2_direct_body_cycles_last);
+  out.add("ch2_direct_body_cycles_max", diag_ch2_direct_body_cycles_max);
+  out.add("ch2_direct_last_event_counter32", diag_ch2_direct_last_event_counter32);
+  out.add("ch2_direct_last_event_dwt", diag_ch2_direct_last_event_dwt);
 
-  out.add("ch2_irq0_capture_count", diag_ch2_irq0_capture_count);
-  out.add("ch2_deferred_queue_capacity", (uint32_t)TIMEPOP_CH2_DEFERRED_QUEUE_CAPACITY);
-  out.add("ch2_deferred_drain_budget", (uint32_t)TIMEPOP_CH2_DEFERRED_DRAIN_BUDGET);
-  out.add("ch2_deferred_pending_count", timepop_ch2_deferred_pending_count());
-  out.add("ch2_deferred_enqueue_count", diag_ch2_deferred_enqueue_count);
-  out.add("ch2_deferred_dequeue_count", diag_ch2_deferred_dequeue_count);
-  out.add("ch2_deferred_overflow_count", diag_ch2_deferred_overflow_count);
-  out.add("ch2_deferred_high_water", diag_ch2_deferred_high_water);
-  out.add("ch2_deferred_last_depth", diag_ch2_deferred_last_depth);
-  out.add("ch2_deferred_last_sequence_enqueued", diag_ch2_deferred_last_sequence_enqueued);
-  out.add("ch2_deferred_last_sequence_dequeued", diag_ch2_deferred_last_sequence_dequeued);
-  out.add("ch2_deferred_last_enqueue_dwt", diag_ch2_deferred_last_enqueue_dwt);
-  out.add("ch2_deferred_last_dequeue_dwt", diag_ch2_deferred_last_dequeue_dwt);
-  out.add("ch2_deferred_last_event_counter32", diag_ch2_deferred_last_event_counter32);
-  out.add("ch2_deferred_last_event_dwt", diag_ch2_deferred_last_event_dwt);
-  out.add("ch2_deferred_last_drain_count", diag_ch2_deferred_last_drain_count);
-  out.add("ch2_deferred_drain_pass_count", diag_ch2_deferred_drain_pass_count);
-  out.add("ch2_deferred_drain_empty_count", diag_ch2_deferred_drain_empty_count);
-  out.add("ch2_deferred_drain_budget_exhausted_count",
-          diag_ch2_deferred_drain_budget_exhausted_count);
-  out.add("ch2_deferred_repend_count", diag_ch2_deferred_repend_count);
-  out.add("ch2_deferred_process_body_cycles", diag_ch2_deferred_process_body_cycles);
-  out.add("ch2_deferred_process_body_cycles_max", diag_ch2_deferred_process_body_cycles_max);
-  out.add("ch2_deferred_capture_to_process_cycles",
-          diag_ch2_deferred_capture_to_process_cycles);
-  out.add("ch2_deferred_capture_to_process_cycles_max",
-          diag_ch2_deferred_capture_to_process_cycles_max);
-
-  timepop_pendsv_shadow_update_nvic_diag();
-  out.add("pendsv_shadow_irq_number",          diag_pendsv_shadow_irq_number);
-  out.add("pendsv_shadow_irq_index",           diag_pendsv_shadow_irq_index);
-  out.add("pendsv_shadow_irq_mask",            diag_pendsv_shadow_irq_mask);
-  out.add("pendsv_shadow_priority_applied",    diag_pendsv_shadow_priority_applied);
-  out.add("pendsv_shadow_priority_live",       diag_pendsv_shadow_priority_live);
-  out.add("pendsv_shadow_iser_word",           diag_pendsv_shadow_iser_word);
-  out.add("pendsv_shadow_ispr_word",           diag_pendsv_shadow_ispr_word);
-  out.add("pendsv_shadow_iabr_word",           diag_pendsv_shadow_iabr_word);
-  out.add("pendsv_shadow_enabled_bit",         diag_pendsv_shadow_enabled_bit);
-  out.add("pendsv_shadow_pending_bit",         diag_pendsv_shadow_pending_bit);
-  out.add("pendsv_shadow_active_bit",          diag_pendsv_shadow_active_bit);
-
-  out.add("pendsv_shadow_request_ipsr",        diag_pendsv_shadow_request_ipsr);
-  out.add("pendsv_shadow_request_primask",     diag_pendsv_shadow_request_primask);
-  out.add("pendsv_shadow_request_basepri",     diag_pendsv_shadow_request_basepri);
-  out.add("pendsv_shadow_request_faultmask",   diag_pendsv_shadow_request_faultmask);
-  out.add("pendsv_shadow_request_pre_enabled_bit",
-          diag_pendsv_shadow_request_pre_enabled_bit);
-  out.add("pendsv_shadow_request_pre_pending_bit",
-          diag_pendsv_shadow_request_pre_pending_bit);
-  out.add("pendsv_shadow_request_pre_active_bit",
-          diag_pendsv_shadow_request_pre_active_bit);
-  out.add("pendsv_shadow_request_post_enabled_bit",
-          diag_pendsv_shadow_request_post_enabled_bit);
-  out.add("pendsv_shadow_request_post_pending_bit",
-          diag_pendsv_shadow_request_post_pending_bit);
-  out.add("pendsv_shadow_request_post_active_bit",
-          diag_pendsv_shadow_request_post_active_bit);
-
-  out.add("pendsv_shadow_entry_ipsr",          diag_pendsv_shadow_entry_ipsr);
-  out.add("pendsv_shadow_entry_primask",       diag_pendsv_shadow_entry_primask);
-  out.add("pendsv_shadow_entry_basepri",       diag_pendsv_shadow_entry_basepri);
-  out.add("pendsv_shadow_entry_faultmask",     diag_pendsv_shadow_entry_faultmask);
-  out.add("pendsv_shadow_entry_enabled_bit",   diag_pendsv_shadow_entry_enabled_bit);
-  out.add("pendsv_shadow_entry_pending_bit",   diag_pendsv_shadow_entry_pending_bit);
-  out.add("pendsv_shadow_entry_active_bit",    diag_pendsv_shadow_entry_active_bit);
-  out.add("pendsv_shadow_exit_pending_bit",    diag_pendsv_shadow_exit_pending_bit);
-  out.add("pendsv_shadow_exit_active_bit",     diag_pendsv_shadow_exit_active_bit);
   out.add("schedule_next_expired_passes",      diag_schedule_next_expired_passes);
   out.add("schedule_next_expired_slots",       diag_schedule_next_expired_slots);
   out.add("schedule_next_late_max_ticks",      diag_schedule_next_late_max_ticks);
@@ -5885,7 +4716,7 @@ static FLASHMEM Payload cmd_report(const Payload&) {
 // process_interrupt owns IRQ_QTIMER1 and dispatches CH2 to TimePop's
 // registered handler.  VCLOCK cadence and any other white-glove substrate
 // maintenance clients are represented as TimePop slots; critical recurring
-// ISR slots can callback and rearm inside this CH2 IRQ pass before the next
+// ISR-named slots can callback and rearm inside this CH2 scheduler pass before the next
 // compare is selected.
 
 
@@ -5937,173 +4768,6 @@ static FLASHMEM void add_timers_array(Payload& out) {
   out.add_array("timers", timers);
 }
 
-static FLASHMEM void add_phase_probe_payload(Payload& out) {
-  const uint32_t saved = critical_enter();
-  const phase_probe_state_t p = g_phase_probe;
-  const phase_probe_irq_pass_t pass = g_phase_probe_irq_pass;
-  critical_exit(saved);
-
-  const phase_probe_stats_t& s = p.stats;
-  const uint32_t n = s.sample_count;
-  const uint32_t spin_n = s.spin_error_valid_count;
-
-  out.add("phase_probe_available", true);
-  out.add("phase_probe_active", p.active);
-  out.add("phase_probe_armed", p.armed);
-  out.add("phase_probe_complete", p.complete);
-  out.add("phase_probe_handle", p.handle);
-  out.add("phase_probe_start_count", p.start_count);
-  out.add("phase_probe_stop_count", p.stop_count);
-  out.add("phase_probe_arm_fail_count", p.arm_fail_count);
-  out.add("phase_probe_phase_us", p.phase_us);
-  out.add("phase_probe_phase_ticks", p.phase_ticks);
-  out.add("phase_probe_period_us", p.period_us);
-  out.add("phase_probe_period_ticks", p.period_ticks);
-  out.add("phase_probe_latency_threshold_cycles", p.latency_threshold_cycles);
-  out.add("phase_probe_sample_limit", p.sample_limit);
-  out.add("phase_probe_sample_count", n);
-  out.add("phase_probe_quiet_count", s.quiet_count);
-  out.add("phase_probe_not_quiet_count", s.not_quiet_count);
-  out.add("phase_probe_quiet_permille", phase_probe_ratio_permille(s.quiet_count, n));
-
-  out.add("phase_probe_base_counter32", p.base_counter32);
-  out.add("phase_probe_first_target_counter32", p.first_target_counter32);
-  out.add("phase_probe_base_gnss_ns", p.base_gnss_ns);
-  out.add("phase_probe_first_target_gnss_ns", p.first_target_gnss_ns);
-  out.add("phase_probe_anchor_pps_count", p.anchor_pps_count);
-  out.add("phase_probe_anchor_qtimer_at_pps", p.anchor_qtimer_at_pps);
-  out.add("phase_probe_start_now_counter32", p.start_now_counter32);
-  out.add("phase_probe_start_now_phase_ticks", p.start_now_phase_ticks);
-
-  out.add("phase_probe_last_fire_counter32", p.last_fire_counter32);
-  out.add("phase_probe_last_deadline", p.last_deadline);
-  out.add("phase_probe_last_fire_dwt", p.last_fire_dwt);
-  out.add("phase_probe_last_callback_entry_dwt", p.last_callback_entry_dwt);
-  out.add("phase_probe_last_callback_latency_cycles", p.last_callback_latency_cycles);
-  out.add("phase_probe_last_fire_error_ticks", p.last_fire_error_ticks);
-  out.add("phase_probe_last_spin_error_cycles", p.last_spin_error_cycles);
-  out.add("phase_probe_last_irq_pass_sequence", p.last_irq_pass_sequence);
-  out.add("phase_probe_last_irq_pass_name_mask", p.last_irq_pass_name_mask);
-
-  out.add("phase_probe_fire_error_mean_milli_ticks", phase_probe_mean_milli(s.fire_error_ticks_sum, n));
-  out.add("phase_probe_fire_error_min_ticks", n ? s.fire_error_ticks_min : 0);
-  out.add("phase_probe_fire_error_max_ticks", n ? s.fire_error_ticks_max : 0);
-  out.add("phase_probe_fire_error_nonzero_count", s.fire_error_nonzero_count);
-  out.add("phase_probe_fire_error_abs_gt1_count", s.fire_error_abs_gt1_count);
-  out.add("phase_probe_fire_error_abs_gt4_count", s.fire_error_abs_gt4_count);
-
-  out.add("phase_probe_spin_error_valid_count", spin_n);
-  out.add("phase_probe_spin_error_mean_milli_cycles", phase_probe_mean_milli(s.spin_error_cycles_sum, spin_n));
-  out.add("phase_probe_spin_error_min_cycles", spin_n ? s.spin_error_cycles_min : 0);
-  out.add("phase_probe_spin_error_max_cycles", spin_n ? s.spin_error_cycles_max : 0);
-  out.add("phase_probe_spin_error_abs_gt4_count", s.spin_error_abs_gt4_count);
-  out.add("phase_probe_spin_error_abs_gt8_count", s.spin_error_abs_gt8_count);
-  out.add("phase_probe_spin_error_abs_gt20_count", s.spin_error_abs_gt20_count);
-  out.add("phase_probe_spin_error_abs_gt50_count", s.spin_error_abs_gt50_count);
-  out.add("phase_probe_spin_error_abs_gt100_count", s.spin_error_abs_gt100_count);
-
-  out.add("phase_probe_coexpired_exact_mean_milli", phase_probe_mean_count_milli(s.coexpired_exact_sum, n));
-  out.add("phase_probe_coexpired_non_probe_mean_milli", phase_probe_mean_count_milli(s.coexpired_non_probe_sum, n));
-  out.add("phase_probe_coexpired_exact_max", s.coexpired_exact_max);
-  out.add("phase_probe_coexpired_non_probe_max", s.coexpired_non_probe_max);
-  out.add("phase_probe_coexpired_non_probe_count", s.coexpired_non_probe_count);
-  out.add("phase_probe_coexpired_cadence_minder_count", s.coexpired_cadence_minder_count);
-  out.add("phase_probe_coexpired_transport_rx_count", s.coexpired_transport_rx_count);
-  out.add("phase_probe_coexpired_transport_tx_count", s.coexpired_transport_tx_count);
-  out.add("phase_probe_coexpired_publish_events_count", s.coexpired_publish_events_count);
-  out.add("phase_probe_coexpired_witness_scheduler_count", s.coexpired_witness_scheduler_count);
-  out.add("phase_probe_coexpired_cpu_usage_count", s.coexpired_cpu_usage_count);
-  out.add("phase_probe_coexpired_other_count", s.coexpired_other_count);
-
-  out.add("phase_probe_asap_pending_mean_milli", phase_probe_mean_count_milli(s.asap_pending_sum, n));
-  out.add("phase_probe_asap_pending_max", s.asap_pending_max);
-  out.add("phase_probe_asap_pending_nonzero_count", s.asap_pending_nonzero_count);
-  out.add("phase_probe_alap_pending_mean_milli", phase_probe_mean_count_milli(s.alap_pending_sum, n));
-  out.add("phase_probe_alap_pending_max", s.alap_pending_max);
-  out.add("phase_probe_alap_pending_nonzero_count", s.alap_pending_nonzero_count);
-
-  out.add("phase_probe_callback_latency_mean_cycles", n ? (uint32_t)(s.callback_latency_cycles_sum / (uint64_t)n) : 0U);
-  out.add("phase_probe_callback_latency_min_cycles", n ? s.callback_latency_cycles_min : 0U);
-  out.add("phase_probe_callback_latency_max_cycles", s.callback_latency_cycles_max);
-  out.add("phase_probe_callback_latency_le128_count", s.callback_latency_le128_count);
-  out.add("phase_probe_callback_latency_le256_count", s.callback_latency_le256_count);
-  out.add("phase_probe_callback_latency_le512_count", s.callback_latency_le512_count);
-  out.add("phase_probe_callback_latency_le1024_count", s.callback_latency_le1024_count);
-  out.add("phase_probe_callback_latency_le2048_count", s.callback_latency_le2048_count);
-  out.add("phase_probe_callback_latency_gt2048_count", s.callback_latency_gt2048_count);
-
-  out.add("phase_probe_body_cycles_mean", n ? (uint32_t)(s.body_cycles_sum / (uint64_t)n) : 0U);
-  out.add("phase_probe_body_cycles_max", s.body_cycles_max);
-
-  out.add("phase_probe_irq_pass_sequence", pass.sequence);
-  out.add("phase_probe_irq_pass_now", pass.now);
-  out.add("phase_probe_irq_pass_dwt", pass.dwt);
-  out.add("phase_probe_irq_pass_exact_slot_count", pass.exact_slot_count);
-  out.add("phase_probe_irq_pass_non_probe_exact_slot_count", pass.non_probe_exact_slot_count);
-  out.add("phase_probe_irq_pass_isr_callback_slot_count", pass.isr_callback_slot_count);
-  out.add("phase_probe_irq_pass_scheduled_callback_slot_count", pass.scheduled_callback_slot_count);
-  out.add("phase_probe_irq_pass_name_mask", pass.name_mask);
-  out.add("phase_probe_irq_pass_asap_pending_count", pass.asap_pending_count);
-  out.add("phase_probe_irq_pass_asap_dispatching_count", pass.asap_dispatching_count);
-  out.add("phase_probe_irq_pass_alap_pending_count", pass.alap_pending_count);
-  out.add("phase_probe_irq_pass_alap_dispatching_count", pass.alap_dispatching_count);
-}
-
-static FLASHMEM Payload cmd_phase_probe(const Payload& args) {
-  Payload out;
-  out.add("report", "TIMEPOP_PHASE_PROBE");
-  out.add("usage", "TIMEPOP.PHASE_PROBE action=START|STOP|RESET phase_us=250 period_us=1000 samples=0 threshold_cycles=1024");
-  out.add("units", "phase_us within period_us; 1 VCLOCK tick = 100 ns; mean_milli fields are value*1000");
-
-  const char* action = args.getString("action");
-  if (!action || !*action) action = args.getString("mode");
-  const uint32_t requested_phase = args.getUInt("phase_us", UINT32_MAX);
-  const uint32_t requested_period = args.getUInt("period_us", UINT32_MAX);
-  const uint32_t requested_samples = args.getUInt("samples", UINT32_MAX);
-  const uint32_t requested_threshold = args.getUInt("threshold_cycles", UINT32_MAX);
-
-  const bool start = action &&
-      (!strcasecmp(action, "START") || !strcasecmp(action, "ON") || !strcasecmp(action, "ARM"));
-  const bool stop = action &&
-      (!strcasecmp(action, "STOP") || !strcasecmp(action, "OFF") || !strcasecmp(action, "CANCEL"));
-  const bool reset = action &&
-      (!strcasecmp(action, "RESET") || !strcasecmp(action, "CLEAR"));
-
-  if (stop) {
-    phase_probe_stop();
-    out.add("command_result", "stopped");
-  } else if (reset) {
-    const uint32_t saved = critical_enter();
-    phase_probe_reset_stats_unlocked();
-    critical_exit(saved);
-    out.add("command_result", "reset");
-  } else if (start || requested_phase != UINT32_MAX || requested_period != UINT32_MAX ||
-             requested_samples != UINT32_MAX) {
-    const uint32_t phase_us = (requested_phase == UINT32_MAX)
-        ? g_phase_probe.phase_us
-        : requested_phase;
-    const uint32_t period_us = (requested_period == UINT32_MAX)
-        ? g_phase_probe.period_us
-        : requested_period;
-    const uint32_t sample_limit = (requested_samples == UINT32_MAX)
-        ? 0U
-        : requested_samples;
-    const uint32_t threshold_cycles = (requested_threshold == UINT32_MAX)
-        ? (g_phase_probe.latency_threshold_cycles
-              ? g_phase_probe.latency_threshold_cycles
-              : PHASE_PROBE_DEFAULT_LATENCY_THRESHOLD_CYCLES)
-        : requested_threshold;
-    const bool ok = phase_probe_start(phase_us, period_us, sample_limit, threshold_cycles);
-    out.add("command_result", ok ? "started" : "start_failed");
-    out.add("command_ok", ok);
-  } else {
-    out.add("command_result", "report");
-  }
-
-  add_phase_probe_payload(out);
-  return out;
-}
-
 static FLASHMEM Payload cmd_slots(const Payload&) {
   Payload out;
   out.add("slots_active_now", timepop_active_count());
@@ -6121,15 +4785,6 @@ static FLASHMEM Payload cmd_slots(const Payload&) {
   out.add("vclock_raw_now", vclock_count());
   out.add("time_valid", time_valid());
   out.add("time_pps_count", time_pps_count());
-  out.add("phase_probe_active", g_phase_probe.active);
-  out.add("phase_probe_phase_us", g_phase_probe.phase_us);
-  out.add("phase_probe_period_us", g_phase_probe.period_us);
-  out.add("phase_probe_sample_count", g_phase_probe.stats.sample_count);
-  out.add("phase_probe_callback_latency_max_cycles",
-          g_phase_probe.stats.callback_latency_cycles_max);
-  out.add("phase_probe_quiet_permille",
-          phase_probe_ratio_permille(g_phase_probe.stats.quiet_count,
-                                     g_phase_probe.stats.sample_count));
   out.add("anchor_snapshot_last_ok", diag_anchor_snapshot_last_ok);
   out.add("anchor_snapshot_last_valid", diag_anchor_snapshot_last_valid);
   out.add("anchor_snapshot_last_pps_count", diag_anchor_snapshot_last_pps_count);
@@ -6152,29 +4807,9 @@ static FLASHMEM Payload cmd_slots(const Payload&) {
               : diag_schedule_next_arm_margin_ticks_min);
   out.add("timed_dispatch_latency_max_cycles",
           diag_timed_dispatch_latency_max_cycles);
-  timepop_pendsv_shadow_update_nvic_diag();
-  out.add("pendsv_shadow_mechanism", TIMEPOP_PENDSV_SHADOW_MECHANISM);
-  out.add("pendsv_shadow_trigger_method", TIMEPOP_PENDSV_SHADOW_TRIGGER);
-  out.add("pendsv_shadow_irq", (uint32_t)TIMEPOP_PENDSV_SHADOW_IRQ);
-  out.add("pendsv_shadow_configured", diag_pendsv_shadow_configured);
-  out.add("pendsv_shadow_enabled_bit", diag_pendsv_shadow_enabled_bit);
-  out.add("pendsv_shadow_pending_bit", diag_pendsv_shadow_pending_bit);
-  out.add("pendsv_shadow_active_bit", diag_pendsv_shadow_active_bit);
-  out.add("pendsv_shadow_request_count", diag_pendsv_shadow_request_count);
-  out.add("pendsv_shadow_served_request_count", diag_pendsv_shadow_served_request_count);
-  out.add("pendsv_shadow_entry_count", diag_pendsv_shadow_entry_count);
-  out.add("pendsv_shadow_pending", diag_pendsv_shadow_pending);
-  out.add("pendsv_shadow_max_latency_cycles", diag_pendsv_shadow_max_latency_cycles);
-  out.add("ch2_irq0_capture_count", diag_ch2_irq0_capture_count);
-  out.add("ch2_deferred_pending_count", timepop_ch2_deferred_pending_count());
-  out.add("ch2_deferred_enqueue_count", diag_ch2_deferred_enqueue_count);
-  out.add("ch2_deferred_dequeue_count", diag_ch2_deferred_dequeue_count);
-  out.add("ch2_deferred_overflow_count", diag_ch2_deferred_overflow_count);
-  out.add("ch2_deferred_high_water", diag_ch2_deferred_high_water);
-  out.add("ch2_deferred_drain_budget_exhausted_count",
-          diag_ch2_deferred_drain_budget_exhausted_count);
-  out.add("ch2_deferred_process_body_cycles_max",
-          diag_ch2_deferred_process_body_cycles_max);
+  out.add("ch2_service_context", TIMEPOP_CH2_SERVICE_CONTEXT);
+  out.add("ch2_direct_call_count", diag_ch2_direct_call_count);
+  out.add("ch2_direct_body_cycles_max", diag_ch2_direct_body_cycles_max);
   out.add("schedule_next_expired_slots", diag_schedule_next_expired_slots);
   out.add("schedule_next_late_max_ticks", diag_schedule_next_late_max_ticks);
   out.add("missed_deadline_slots", diag_missed_deadline_slots);
@@ -6197,7 +4832,6 @@ static FLASHMEM Payload cmd_slots(const Payload&) {
 static const process_command_entry_t TIMEPOP_COMMANDS[] = {
   { "REPORT",                 cmd_report                 },
   { "SLOTS",                  cmd_slots                  },
-  { "PHASE_PROBE",            cmd_phase_probe            },
   { nullptr,                  nullptr                    }
 };
 
