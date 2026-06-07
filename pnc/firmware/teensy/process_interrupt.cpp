@@ -330,18 +330,45 @@ static constexpr uint32_t OCXO_DISABLED_COUNT =
     (OCXO1_DISABLED ? 1U : 0U) + (OCXO2_DISABLED ? 1U : 0U);
 
 // ============================================================================
-// Step 0 migration baseline — report-only safety rails
+// Priority handoff migration baseline — safety rails
 // ============================================================================
 //
-// These constants and mirrors do not change interrupt behavior. They simply
-// make the current timing architecture and applied NVIC priorities visible in
-// INTERRUPT.REPORT before any future migration step touches cadence ownership
-// or OCXO event authorship.
+// These constants and mirrors make the current capture/handoff architecture and
+// applied NVIC priorities visible in INTERRUPT.REPORT.  This release changes
+// interrupt behavior deliberately: priority 0 becomes reentry-safe capture,
+// and priority 16 performs custody continuation.
 
-static constexpr uint32_t INTERRUPT_STEP0_EXPECTED_QTIMER1_PRIORITY  = 0;
-static constexpr uint32_t INTERRUPT_STEP0_EXPECTED_QTIMER2_PRIORITY  = 16;
-static constexpr uint32_t INTERRUPT_STEP0_EXPECTED_QTIMER3_PRIORITY  = 16;
-static constexpr uint32_t INTERRUPT_STEP0_EXPECTED_GPIO6789_PRIORITY = 0;
+// Priority doctrine for the reentry-safe capture / priority-handoff migration.
+//
+// Priority 0 is the sacred capture tier.  It must capture immutable hardware
+// facts, defuse the interrupt source, enqueue a reentry-safe capture packet,
+// pend the handoff tier, and exit.  Priority 16 is the handoff tier: still
+// interrupt context, still before foreground/ASAP, but no longer able to delay
+// sacred priority-0 clock capture.
+static constexpr uint32_t INTERRUPT_PRIORITY_CAPTURE        = 0;
+static constexpr uint32_t INTERRUPT_PRIORITY_HANDOFF        = 16;
+static constexpr uint32_t INTERRUPT_PRIORITY_BACKGROUND_IRQ = 32;
+
+static constexpr uint32_t INTERRUPT_STEP0_EXPECTED_QTIMER1_PRIORITY  = INTERRUPT_PRIORITY_CAPTURE;
+static constexpr uint32_t INTERRUPT_STEP0_EXPECTED_QTIMER2_PRIORITY  = INTERRUPT_PRIORITY_CAPTURE;
+static constexpr uint32_t INTERRUPT_STEP0_EXPECTED_QTIMER3_PRIORITY  = INTERRUPT_PRIORITY_CAPTURE;
+static constexpr uint32_t INTERRUPT_STEP0_EXPECTED_GPIO6789_PRIORITY = INTERRUPT_PRIORITY_CAPTURE;
+
+// TimePop currently owns IRQ_SOFTWARE(70) for its POC handoff.  process_interrupt
+// deliberately uses an adjacent normal external IRQ so the two POCs can coexist
+// until TimePop's duplicate handoff layer is retired.
+static constexpr uint32_t     INTERRUPT_HANDOFF_IRQ_NUMBER = 71U;
+static constexpr IRQ_NUMBER_t INTERRUPT_HANDOFF_IRQ =
+    (IRQ_NUMBER_t)INTERRUPT_HANDOFF_IRQ_NUMBER;
+static constexpr const char*  INTERRUPT_HANDOFF_IRQ_NAME = "NVIC_EXTERNAL_71";
+static constexpr const char*  INTERRUPT_CAPTURE_DISCIPLINE = "REENTRY_SAFE_CAPTURE";
+static constexpr const char*  INTERRUPT_HANDOFF_MECHANISM = "NVIC_ISPR_PRIORITY_HANDOFF";
+static constexpr uint32_t     INTERRUPT_HANDOFF_DRAIN_BUDGET = 32U;
+
+static constexpr uint32_t HANDOFF_QTIMER1_CH1_RING_SIZE = 8U;
+static constexpr uint32_t HANDOFF_QTIMER1_CH2_RING_SIZE = 16U;
+static constexpr uint32_t HANDOFF_OCXO_RING_SIZE = 8U;
+static constexpr uint32_t HANDOFF_PPS_RING_SIZE = 4U;
 
 // ============================================================================
 // SpinCatch landing-only witness — symmetric OCXO lead tuning
@@ -2630,6 +2657,10 @@ static void vclock_ch2_smartzero_reset_attempt_state(void);
 static void vclock_ch2_smartzero_deactivate(void);
 static void vclock_ch2_smartzero_service(uint32_t qtimer_event_dwt,
                                          uint32_t service_counter32);
+
+static void interrupt_handoff_configure(void);
+static void interrupt_handoff_request_from_capture_isr(const char* context);
+static void interrupt_handoff_service_isr(void);
 
 static uint32_t vclock_synthetic_from_hardware_low16(uint16_t hardware_low16) {
   if (!g_vclock_clock32.zeroed) return (uint32_t)hardware_low16;
@@ -5142,17 +5173,15 @@ static void ocxo_lane_disable_compare(ocxo_lane_t& lane) {
   }
 }
 
-// ISR discipline for OCXO lanes is intentionally flat and tiny:
+// ISR discipline for OCXO lanes is reentry-safe capture only:
 //   1. capture first-instruction DWT,
-//   2. clear the compare flag,
-//   3. compute the latency-adjusted event DWT,
-//   4. refresh the synthetic 32-bit lane anchor,
-//   5. arm the next compare (one-second normally, +10,000 during SmartZero),
-//   6. enqueue the perishable fact for foreground interpretation.
+//   2. snapshot only perishable hardware/state facts,
+//   3. clear/defuse the compare flag,
+//   4. enqueue the immutable capture packet,
+//   5. pend the priority-16 handoff tier and exit.
 //
-// Dynamic 100 Hz prediction has been retired. The old single-slot OCXO
-// deferred edge mailbox is gone; the one-second fact ring is the sole OCXO
-// ISR-to-foreground handoff.
+// The handoff tier computes event-DWT, service offset, SmartZero state,
+// synthetic identity updates, rearm/stop policy, and foreground fact enqueue.
 // ============================================================================
 
 // ----------------------------------------------------------------------------
@@ -6116,6 +6145,494 @@ struct ocxo_cadence_isr_sample_t {
   bool one_second_due = false;
 };
 
+// ============================================================================
+// Priority handoff tier — reentry-safe capture packets
+// ============================================================================
+//
+// Priority-0 ISRs capture immutable packets only.  The handoff tier runs at
+// priority 16 and performs the former ISR continuation work: event authorship,
+// rollover tending, SmartZero feed/rearm, TimePop delivery, and ASAP drain
+// arming.  Per-source rings make priority-0 capture reentry-safe: a later
+// interrupt cannot overwrite an earlier packet before the handoff tier owns it.
+
+struct interrupt_handoff_source_diag_t {
+  volatile uint32_t capture_count = 0;
+  volatile uint32_t enqueue_count = 0;
+  volatile uint32_t dequeue_count = 0;
+  volatile uint32_t overrun_count = 0;
+  volatile uint32_t high_water = 0;
+  volatile uint32_t pending_count = 0;
+  volatile uint32_t last_sequence = 0;
+  volatile uint32_t last_capture_dwt = 0;
+  volatile uint32_t last_handoff_entry_dwt = 0;
+  volatile uint32_t last_capture_to_handoff_cycles = 0;
+  volatile uint32_t max_capture_to_handoff_cycles = 0;
+  volatile uint32_t last_priority0_body_cycles = 0;
+  volatile uint32_t max_priority0_body_cycles = 0;
+  volatile uint32_t last_handoff_body_cycles = 0;
+  volatile uint32_t max_handoff_body_cycles = 0;
+};
+
+struct interrupt_handoff_diag_t {
+  volatile bool configured = false;
+  volatile bool running = false;
+  volatile bool pending = false;
+  volatile uint32_t configure_count = 0;
+  volatile uint32_t request_count = 0;
+  volatile uint32_t entry_count = 0;
+  volatile uint32_t exit_count = 0;
+  volatile uint32_t served_request_count = 0;
+  volatile uint32_t unserved_request_count = 0;
+  volatile uint32_t spurious_entry_count = 0;
+  volatile uint32_t reentry_count = 0;
+  volatile uint32_t repend_count = 0;
+  volatile uint32_t drain_pass_count = 0;
+  volatile uint32_t drain_budget_exhausted_count = 0;
+  volatile uint32_t last_request_dwt = 0;
+  volatile uint32_t last_entry_dwt = 0;
+  volatile uint32_t last_exit_dwt = 0;
+  volatile uint32_t last_latency_cycles = 0;
+  volatile uint32_t min_latency_cycles = UINT32_MAX;
+  volatile uint32_t max_latency_cycles = 0;
+  volatile uint64_t latency_cycles_sum = 0;
+  volatile uint32_t latency_sample_count = 0;
+  volatile uint32_t last_body_cycles = 0;
+  volatile uint32_t max_body_cycles = 0;
+  volatile uint32_t last_request_ipsr = 0;
+  volatile uint32_t entry_ipsr = 0;
+  volatile uint32_t last_request_primask = 0;
+  volatile uint32_t entry_primask = 0;
+  volatile const char* last_request_context = nullptr;
+};
+
+static interrupt_handoff_diag_t g_interrupt_handoff = {};
+static interrupt_handoff_source_diag_t g_handoff_qtimer1_ch1 = {};
+static interrupt_handoff_source_diag_t g_handoff_qtimer1_ch2 = {};
+static interrupt_handoff_source_diag_t g_handoff_ocxo1 = {};
+static interrupt_handoff_source_diag_t g_handoff_ocxo2 = {};
+static interrupt_handoff_source_diag_t g_handoff_pps = {};
+static volatile uint32_t g_interrupt_capture_sequence = 0;
+static volatile uint32_t g_pps_capture_sequence = 0;
+
+struct qtimer1_ch1_capture_packet_t {
+  uint32_t sequence = 0;
+  uint32_t isr_entry_dwt_raw = 0;
+  uint32_t capture_exit_dwt = 0;
+  uint32_t csctrl_entry = 0;
+  bool active_at_capture = false;
+  uint32_t target_counter32 = 0;
+  uint32_t next_compare_counter32 = 0;
+  spinidle_isr_capture_t spinidle{};
+};
+
+struct qtimer1_ch2_capture_packet_t {
+  uint32_t sequence = 0;
+  uint32_t isr_entry_dwt_raw = 0;
+  uint32_t ch2_event_counter32 = 0;
+  uint32_t capture_exit_dwt = 0;
+  uint32_t csctrl_entry = 0;
+  spinidle_isr_capture_t spinidle{};
+};
+
+struct ocxo_capture_packet_t {
+  uint32_t sequence = 0;
+  uint32_t isr_entry_dwt_raw = 0;
+  interrupt_subscriber_kind_t kind = interrupt_subscriber_kind_t::NONE;
+  uint32_t capture_exit_dwt = 0;
+  spinidle_isr_capture_t spinidle{};
+
+  // Raw/near-raw capture facts.  Priority 0 deliberately avoids service
+  // classification, event-DWT authorship, SmartZero decisions, synthetic
+  // identity updates, and rearm policy.
+  uint32_t csctrl_entry = 0;
+  uint16_t service_counter_low16 = 0;
+  uint32_t target_counter32 = 0;
+  uint16_t target_low16 = 0;
+  bool cadence_enabled = false;
+  bool cadence_armed = false;
+  bool lane_active = false;
+  bool rt_present = false;
+  bool rt_active = false;
+  uint32_t arm_remaining_ticks = 0;
+  uint16_t arm_low16 = 0;
+  uint32_t arm_dwt_raw = 0;
+};
+
+struct pps_capture_packet_t {
+  uint32_t sequence = 0;
+  uint32_t isr_entry_dwt_raw = 0;
+  uint32_t capture_after_vclock_raw = 0;
+  uint32_t capture_end_raw = 0;
+  uint32_t capture_exit_dwt = 0;
+  uint16_t vclock_hardware16_observed = 0;
+  uint16_t ocxo1_hardware16 = 0;
+  uint16_t ocxo2_hardware16 = 0;
+  bool ocxo1_capture_hw_ready = false;
+  bool ocxo2_capture_hw_ready = false;
+  bool ocxo_capture_hw_ready = false;
+  bool rebootstrap_pending_at_capture = false;
+  spinidle_isr_capture_t spinidle{};
+};
+
+template <typename T, uint32_t N>
+struct interrupt_capture_ring_t {
+  T items[N]{};
+  volatile uint32_t head = 0;
+  volatile uint32_t tail = 0;
+  volatile uint32_t count = 0;
+};
+
+static interrupt_capture_ring_t<qtimer1_ch1_capture_packet_t,
+                                HANDOFF_QTIMER1_CH1_RING_SIZE>
+    g_qtimer1_ch1_capture_ring;
+static interrupt_capture_ring_t<qtimer1_ch2_capture_packet_t,
+                                HANDOFF_QTIMER1_CH2_RING_SIZE>
+    g_qtimer1_ch2_capture_ring;
+static interrupt_capture_ring_t<ocxo_capture_packet_t, HANDOFF_OCXO_RING_SIZE>
+    g_ocxo1_capture_ring;
+static interrupt_capture_ring_t<ocxo_capture_packet_t, HANDOFF_OCXO_RING_SIZE>
+    g_ocxo2_capture_ring;
+static interrupt_capture_ring_t<pps_capture_packet_t, HANDOFF_PPS_RING_SIZE>
+    g_pps_capture_ring;
+
+static inline volatile uint32_t& interrupt_nvic_ispr_word(uint32_t irq) {
+  volatile uint32_t* const ispr = (volatile uint32_t*)0xE000E200UL;
+  return ispr[irq >> 5];
+}
+
+static inline volatile uint32_t& interrupt_nvic_iser_word(uint32_t irq) {
+  volatile uint32_t* const iser = (volatile uint32_t*)0xE000E100UL;
+  return iser[irq >> 5];
+}
+
+static inline volatile uint32_t& interrupt_nvic_icpr_word(uint32_t irq) {
+  volatile uint32_t* const icpr = (volatile uint32_t*)0xE000E280UL;
+  return icpr[irq >> 5];
+}
+
+static inline volatile uint32_t& interrupt_nvic_iabr_word(uint32_t irq) {
+  volatile uint32_t* const iabr = (volatile uint32_t*)0xE000E300UL;
+  return iabr[irq >> 5];
+}
+
+static inline uint32_t interrupt_nvic_irq_mask(uint32_t irq) {
+  return 1UL << (irq & 31U);
+}
+
+static inline void interrupt_handoff_barrier(void) {
+  __asm__ volatile ("dsb" ::: "memory");
+  __asm__ volatile ("isb" ::: "memory");
+}
+
+static inline uint32_t interrupt_ipsr(void) {
+  uint32_t v = 0;
+  __asm__ volatile ("mrs %0, ipsr" : "=r" (v) :: "memory");
+  return v;
+}
+
+static inline uint32_t interrupt_primask(void) {
+  uint32_t v = 0;
+  __asm__ volatile ("mrs %0, primask" : "=r" (v) :: "memory");
+  return v;
+}
+
+template <typename T, uint32_t N>
+static bool capture_ring_push_from_priority0(
+    interrupt_capture_ring_t<T, N>& ring,
+    interrupt_handoff_source_diag_t& diag,
+    T packet) {
+  if (ring.count >= N) {
+    diag.overrun_count++;
+    return false;
+  }
+
+  packet.sequence = ++g_interrupt_capture_sequence;
+  ring.items[ring.head] = packet;
+  ring.head = (ring.head + 1U) % N;
+  ring.count++;
+
+  diag.capture_count++;
+  diag.enqueue_count++;
+  diag.pending_count = ring.count;
+  diag.last_sequence = packet.sequence;
+  diag.last_capture_dwt = packet.isr_entry_dwt_raw;
+  if (ring.count > diag.high_water) diag.high_water = ring.count;
+  return true;
+}
+
+template <typename T, uint32_t N>
+static bool capture_ring_pop_for_handoff(
+    interrupt_capture_ring_t<T, N>& ring,
+    interrupt_handoff_source_diag_t& diag,
+    T& out) {
+  __disable_irq();
+  if (ring.count == 0) {
+    __enable_irq();
+    return false;
+  }
+  out = ring.items[ring.tail];
+  ring.tail = (ring.tail + 1U) % N;
+  ring.count--;
+  diag.dequeue_count++;
+  diag.pending_count = ring.count;
+  __enable_irq();
+  return true;
+}
+
+template <typename T, uint32_t N>
+static bool capture_ring_peek_sequence(
+    interrupt_capture_ring_t<T, N>& ring,
+    uint32_t& seq) {
+  __disable_irq();
+  if (ring.count == 0) {
+    __enable_irq();
+    return false;
+  }
+  seq = ring.items[ring.tail].sequence;
+  __enable_irq();
+  return true;
+}
+
+static bool interrupt_handoff_any_pending(void) {
+  return g_qtimer1_ch1_capture_ring.count != 0 ||
+         g_qtimer1_ch2_capture_ring.count != 0 ||
+         g_ocxo1_capture_ring.count != 0 ||
+         g_ocxo2_capture_ring.count != 0 ||
+         g_pps_capture_ring.count != 0;
+}
+
+static void interrupt_handoff_note_priority0_body(
+    interrupt_handoff_source_diag_t& diag,
+    uint32_t isr_entry_dwt_raw) {
+  const uint32_t body = ARM_DWT_CYCCNT - isr_entry_dwt_raw;
+  diag.last_priority0_body_cycles = body;
+  if (body > diag.max_priority0_body_cycles) {
+    diag.max_priority0_body_cycles = body;
+  }
+}
+
+static void interrupt_handoff_note_source_entry(
+    interrupt_handoff_source_diag_t& diag,
+    uint32_t capture_dwt,
+    uint32_t handoff_entry_dwt) {
+  const uint32_t latency = handoff_entry_dwt - capture_dwt;
+  diag.last_handoff_entry_dwt = handoff_entry_dwt;
+  diag.last_capture_to_handoff_cycles = latency;
+  if (latency > diag.max_capture_to_handoff_cycles) {
+    diag.max_capture_to_handoff_cycles = latency;
+  }
+}
+
+static void interrupt_handoff_note_source_body(
+    interrupt_handoff_source_diag_t& diag,
+    uint32_t start_dwt) {
+  const uint32_t body = ARM_DWT_CYCCNT - start_dwt;
+  diag.last_handoff_body_cycles = body;
+  if (body > diag.max_handoff_body_cycles) {
+    diag.max_handoff_body_cycles = body;
+  }
+}
+
+static void interrupt_handoff_request_from_capture_isr(const char* context) {
+  g_interrupt_handoff.request_count++;
+  g_interrupt_handoff.pending = true;
+  g_interrupt_handoff.last_request_dwt = ARM_DWT_CYCCNT;
+  g_interrupt_handoff.last_request_context = context;
+  g_interrupt_handoff.last_request_ipsr = interrupt_ipsr();
+  g_interrupt_handoff.last_request_primask = interrupt_primask();
+
+  interrupt_nvic_ispr_word(INTERRUPT_HANDOFF_IRQ_NUMBER) =
+      interrupt_nvic_irq_mask(INTERRUPT_HANDOFF_IRQ_NUMBER);
+  interrupt_handoff_barrier();
+}
+
+static void interrupt_handoff_configure(void) {
+  if (g_interrupt_handoff.configured) return;
+
+  attachInterruptVector(INTERRUPT_HANDOFF_IRQ, interrupt_handoff_service_isr);
+  NVIC_SET_PRIORITY(INTERRUPT_HANDOFF_IRQ, INTERRUPT_PRIORITY_HANDOFF);
+  interrupt_nvic_icpr_word(INTERRUPT_HANDOFF_IRQ_NUMBER) =
+      interrupt_nvic_irq_mask(INTERRUPT_HANDOFF_IRQ_NUMBER);
+  interrupt_handoff_barrier();
+  NVIC_ENABLE_IRQ(INTERRUPT_HANDOFF_IRQ);
+
+  g_interrupt_handoff.configured = true;
+  g_interrupt_handoff.configure_count++;
+}
+
+static void interrupt_handoff_process_qtimer1_ch1(
+    const qtimer1_ch1_capture_packet_t& packet);
+static void interrupt_handoff_process_qtimer1_ch2(
+    const qtimer1_ch2_capture_packet_t& packet);
+static void interrupt_handoff_process_ocxo(ocxo_runtime_context_t& ctx,
+                                           const ocxo_capture_packet_t& packet);
+static void interrupt_handoff_process_pps(const pps_capture_packet_t& packet);
+
+static bool interrupt_handoff_drain_one_oldest(uint32_t handoff_entry_dwt) {
+  bool have = false;
+  uint32_t best_seq = 0xFFFFFFFFUL;
+  uint32_t seq = 0;
+  enum source_t : uint8_t { SRC_NONE, SRC_CH1, SRC_CH2, SRC_OCXO1, SRC_OCXO2, SRC_PPS };
+  source_t best = SRC_NONE;
+
+  if (capture_ring_peek_sequence(g_qtimer1_ch1_capture_ring, seq) && seq < best_seq) {
+    best_seq = seq; best = SRC_CH1; have = true;
+  }
+  if (capture_ring_peek_sequence(g_qtimer1_ch2_capture_ring, seq) && seq < best_seq) {
+    best_seq = seq; best = SRC_CH2; have = true;
+  }
+  if (capture_ring_peek_sequence(g_ocxo1_capture_ring, seq) && seq < best_seq) {
+    best_seq = seq; best = SRC_OCXO1; have = true;
+  }
+  if (capture_ring_peek_sequence(g_ocxo2_capture_ring, seq) && seq < best_seq) {
+    best_seq = seq; best = SRC_OCXO2; have = true;
+  }
+  if (capture_ring_peek_sequence(g_pps_capture_ring, seq) && seq < best_seq) {
+    best_seq = seq; best = SRC_PPS; have = true;
+  }
+  if (!have) return false;
+
+  const uint32_t body_start = ARM_DWT_CYCCNT;
+  switch (best) {
+    case SRC_CH1: {
+      qtimer1_ch1_capture_packet_t packet{};
+      if (capture_ring_pop_for_handoff(g_qtimer1_ch1_capture_ring,
+                                       g_handoff_qtimer1_ch1,
+                                       packet)) {
+        interrupt_handoff_note_source_entry(g_handoff_qtimer1_ch1,
+                                            packet.isr_entry_dwt_raw,
+                                            handoff_entry_dwt);
+        interrupt_handoff_process_qtimer1_ch1(packet);
+        interrupt_handoff_note_source_body(g_handoff_qtimer1_ch1, body_start);
+        return true;
+      }
+      break;
+    }
+    case SRC_CH2: {
+      qtimer1_ch2_capture_packet_t packet{};
+      if (capture_ring_pop_for_handoff(g_qtimer1_ch2_capture_ring,
+                                       g_handoff_qtimer1_ch2,
+                                       packet)) {
+        interrupt_handoff_note_source_entry(g_handoff_qtimer1_ch2,
+                                            packet.isr_entry_dwt_raw,
+                                            handoff_entry_dwt);
+        interrupt_handoff_process_qtimer1_ch2(packet);
+        interrupt_handoff_note_source_body(g_handoff_qtimer1_ch2, body_start);
+        return true;
+      }
+      break;
+    }
+    case SRC_OCXO1: {
+      ocxo_capture_packet_t packet{};
+      if (capture_ring_pop_for_handoff(g_ocxo1_capture_ring,
+                                       g_handoff_ocxo1,
+                                       packet)) {
+        interrupt_handoff_note_source_entry(g_handoff_ocxo1,
+                                            packet.isr_entry_dwt_raw,
+                                            handoff_entry_dwt);
+        interrupt_handoff_process_ocxo(g_ocxo1_ctx, packet);
+        interrupt_handoff_note_source_body(g_handoff_ocxo1, body_start);
+        return true;
+      }
+      break;
+    }
+    case SRC_OCXO2: {
+      ocxo_capture_packet_t packet{};
+      if (capture_ring_pop_for_handoff(g_ocxo2_capture_ring,
+                                       g_handoff_ocxo2,
+                                       packet)) {
+        interrupt_handoff_note_source_entry(g_handoff_ocxo2,
+                                            packet.isr_entry_dwt_raw,
+                                            handoff_entry_dwt);
+        interrupt_handoff_process_ocxo(g_ocxo2_ctx, packet);
+        interrupt_handoff_note_source_body(g_handoff_ocxo2, body_start);
+        return true;
+      }
+      break;
+    }
+    case SRC_PPS: {
+      pps_capture_packet_t packet{};
+      if (capture_ring_pop_for_handoff(g_pps_capture_ring,
+                                       g_handoff_pps,
+                                       packet)) {
+        interrupt_handoff_note_source_entry(g_handoff_pps,
+                                            packet.isr_entry_dwt_raw,
+                                            handoff_entry_dwt);
+        interrupt_handoff_process_pps(packet);
+        interrupt_handoff_note_source_body(g_handoff_pps, body_start);
+        return true;
+      }
+      break;
+    }
+    default:
+      break;
+  }
+  return false;
+}
+
+static void interrupt_handoff_service_isr(void) {
+  const uint32_t entry_dwt = ARM_DWT_CYCCNT;  // first instruction: handoff latency proof.
+
+  if (g_interrupt_handoff.running) {
+    g_interrupt_handoff.reentry_count++;
+    return;
+  }
+
+  g_interrupt_handoff.running = true;
+  g_interrupt_handoff.entry_count++;
+  g_interrupt_handoff.last_entry_dwt = entry_dwt;
+  g_interrupt_handoff.entry_ipsr = interrupt_ipsr();
+  g_interrupt_handoff.entry_primask = interrupt_primask();
+
+  if (g_interrupt_handoff.pending) {
+    g_interrupt_handoff.pending = false;
+    g_interrupt_handoff.served_request_count++;
+    const uint32_t latency = entry_dwt - g_interrupt_handoff.last_request_dwt;
+    g_interrupt_handoff.last_latency_cycles = latency;
+    if (latency < g_interrupt_handoff.min_latency_cycles) {
+      g_interrupt_handoff.min_latency_cycles = latency;
+    }
+    if (latency > g_interrupt_handoff.max_latency_cycles) {
+      g_interrupt_handoff.max_latency_cycles = latency;
+    }
+    g_interrupt_handoff.latency_cycles_sum += (uint64_t)latency;
+    g_interrupt_handoff.latency_sample_count++;
+  } else if (!interrupt_handoff_any_pending()) {
+    g_interrupt_handoff.spurious_entry_count++;
+  }
+
+  uint32_t drained = 0;
+  while (drained < INTERRUPT_HANDOFF_DRAIN_BUDGET &&
+         interrupt_handoff_drain_one_oldest(entry_dwt)) {
+    drained++;
+  }
+  g_interrupt_handoff.drain_pass_count++;
+
+  if (interrupt_handoff_any_pending()) {
+    g_interrupt_handoff.drain_budget_exhausted_count++;
+    g_interrupt_handoff.repend_count++;
+    g_interrupt_handoff.pending = true;
+    interrupt_nvic_ispr_word(INTERRUPT_HANDOFF_IRQ_NUMBER) =
+        interrupt_nvic_irq_mask(INTERRUPT_HANDOFF_IRQ_NUMBER);
+    interrupt_handoff_barrier();
+  }
+
+  g_interrupt_handoff.running = false;
+  g_interrupt_handoff.exit_count++;
+  g_interrupt_handoff.last_exit_dwt = ARM_DWT_CYCCNT;
+  g_interrupt_handoff.last_body_cycles =
+      g_interrupt_handoff.last_exit_dwt - entry_dwt;
+  if (g_interrupt_handoff.last_body_cycles > g_interrupt_handoff.max_body_cycles) {
+    g_interrupt_handoff.max_body_cycles = g_interrupt_handoff.last_body_cycles;
+  }
+
+  if (g_interrupt_handoff.request_count >= g_interrupt_handoff.served_request_count) {
+    g_interrupt_handoff.unserved_request_count =
+        g_interrupt_handoff.request_count - g_interrupt_handoff.served_request_count;
+  }
+}
+
+
 static bool ocxo_cadence_classify_irq(ocxo_runtime_context_t& ctx,
                                       uint32_t isr_csctrl_entry) {
   ocxo_lane_t& lane = *ctx.lane;
@@ -6427,26 +6944,142 @@ static void ocxo_cadence_enqueue_fact(
   }
 }
 
-static void ocxo_cadence_compare_isr(ocxo_runtime_context_t& ctx,
-                                     uint32_t isr_entry_dwt_raw,
-                                     const spinidle_isr_capture_t& spinidle) {
+static void ocxo_cadence_capture_priority0(ocxo_runtime_context_t& ctx,
+                                           uint32_t isr_entry_dwt_raw) {
+  ocxo_lane_t& lane = *ctx.lane;
+  interrupt_handoff_source_diag_t& diag =
+      (ctx.kind == interrupt_subscriber_kind_t::OCXO1)
+          ? g_handoff_ocxo1
+          : g_handoff_ocxo2;
+
+  const uint32_t csctrl_entry = lane.module->CH[lane.channel].CSCTRL;
+
+  // False/unowned IRQs are defused in the capture tier; there is no meaningful
+  // edge packet to hand off.
+  if ((csctrl_entry & TMR_CSCTRL_TCF1) == 0) {
+    lane.cadence_false_irq_count++;
+    lane.witness_false_irq_count++;
+    interrupt_handoff_note_priority0_body(diag, isr_entry_dwt_raw);
+    return;
+  }
+
+  if (!lane.cadence_enabled || !lane.cadence_armed) {
+    lane.cadence_false_irq_count++;
+    lane.witness_false_irq_count++;
+    ocxo_lane_clear_compare_flag(lane);
+    ocxo_lane_disable_compare(lane);
+    lane.cadence_armed = false;
+    lane.witness_armed = false;
+    interrupt_handoff_note_priority0_body(diag, isr_entry_dwt_raw);
+    return;
+  }
+
+  ocxo_capture_packet_t packet{};
+  packet.isr_entry_dwt_raw = isr_entry_dwt_raw;
+  packet.kind = ctx.kind;
+  packet.csctrl_entry = csctrl_entry;
+  packet.service_counter_low16 = ocxo_lane_counter_now(lane);
+  packet.target_counter32 = lane.cadence_next_counter32;
+  packet.target_low16 = (uint16_t)(packet.target_counter32 & 0xFFFFU);
+  packet.cadence_enabled = lane.cadence_enabled;
+  packet.cadence_armed = lane.cadence_armed;
+  packet.lane_active = lane.active;
+  interrupt_subscriber_runtime_t* const rt_at_capture = ocxo_runtime_for(ctx);
+  packet.rt_present = (rt_at_capture != nullptr);
+  packet.rt_active = rt_at_capture && rt_at_capture->active;
+  packet.arm_remaining_ticks = lane.witness_last_arm_remaining_ticks;
+  packet.arm_low16 = lane.witness_last_arm_low16;
+  packet.arm_dwt_raw = lane.witness_last_arm_dwt_raw;
+
+  // Defuse the hardware source immediately.  Compare rearm/stop decisions are
+  // handoff-tier custody.
+  ocxo_lane_clear_compare_flag(lane);
+
+  // SpinIdle is an ISR-entry witness; capture it only after the truly
+  // perishable hardware facts are already snapshotted.
+  packet.spinidle = spinidle_capture_at_isr_entry(isr_entry_dwt_raw);
+  packet.capture_exit_dwt = ARM_DWT_CYCCNT;
+
+  interrupt_capture_ring_t<ocxo_capture_packet_t, HANDOFF_OCXO_RING_SIZE>& ring =
+      (ctx.kind == interrupt_subscriber_kind_t::OCXO1)
+          ? g_ocxo1_capture_ring
+          : g_ocxo2_capture_ring;
+
+  if (capture_ring_push_from_priority0(ring, diag, packet)) {
+    interrupt_handoff_request_from_capture_isr(ctx.kind == interrupt_subscriber_kind_t::OCXO1
+        ? "qtimer2_ocxo1_capture"
+        : "qtimer3_ocxo2_capture");
+  } else {
+    lane.miss_count++;
+  }
+  interrupt_handoff_note_priority0_body(diag, isr_entry_dwt_raw);
+}
+
+static void interrupt_handoff_process_ocxo(ocxo_runtime_context_t& ctx,
+                                           const ocxo_capture_packet_t& packet) {
   ocxo_lane_t& lane = *ctx.lane;
 
-  const uint32_t isr_csctrl_entry = lane.module->CH[lane.channel].CSCTRL;
-  if (!ocxo_cadence_classify_irq(ctx, isr_csctrl_entry)) return;
+  ocxo_cadence_isr_sample_t sample{};
+  sample.rt = ocxo_runtime_for(ctx);
+  sample.isr_entry_dwt_raw = packet.isr_entry_dwt_raw;
+  sample.spinidle = packet.spinidle;
+  sample.isr_csctrl_entry = packet.csctrl_entry;
+  sample.had_armed = packet.cadence_armed;
+  sample.had_active_rt = packet.rt_active && packet.lane_active;
+  sample.was_smartzero_current = smartzero_is_current_lane(ctx.kind);
+  sample.target_counter32 = packet.target_counter32;
+  sample.target_low16 = packet.target_low16;
+  sample.service_counter_low16 = packet.service_counter_low16;
+  sample.target_delta_mod65536_ticks =
+      (uint32_t)((uint16_t)(sample.service_counter_low16 - sample.target_low16));
+  sample.service_offset_signed_ticks =
+      (int16_t)((uint16_t)sample.target_delta_mod65536_ticks);
+  sample.service_was_early = (sample.service_offset_signed_ticks < 0);
+  sample.early_ticks = sample.service_was_early
+      ? (uint32_t)(-(int32_t)sample.service_offset_signed_ticks)
+      : 0U;
+  sample.interpreted_late_ticks = sample.service_was_early
+      ? 0U
+      : (uint32_t)sample.service_offset_signed_ticks;
+  sample.service_offset_abs_ticks = sample.service_was_early
+      ? sample.early_ticks
+      : sample.interpreted_late_ticks;
+  sample.arm_remaining_ticks = packet.arm_remaining_ticks;
+  sample.arm_to_isr_ticks =
+      (uint32_t)((uint16_t)(sample.service_counter_low16 - packet.arm_low16));
+  sample.arm_to_isr_dwt_cycles =
+      sample.isr_entry_dwt_raw - packet.arm_dwt_raw;
+  sample.event_dwt = qtimer_event_dwt_from_isr_entry_raw(sample.isr_entry_dwt_raw);
 
-  ocxo_cadence_isr_sample_t sample =
-      ocxo_cadence_capture_perishable_facts(ctx,
-                                            isr_entry_dwt_raw,
-                                            isr_csctrl_entry,
-                                            spinidle);
-  ocxo_cadence_acknowledge_and_timestamp(ctx, sample);
+  if (sample.rt) sample.rt->irq_count++;
+  spincatch_note_isr_entry(ctx.kind,
+                           sample.target_counter32,
+                           sample.target_low16,
+                           sample.isr_entry_dwt_raw);
+
+  isr_sanity_diag_t* sanity = isr_sanity_for_kind(ctx.kind);
+  if (sanity) {
+    isr_sanity_record_cntr_latency_band(
+        *sanity,
+        sample.had_armed,
+        sample.target_low16,
+        sample.service_counter_low16,
+        ISR_SANITY_OCXO_CNTR_MIN_READ_LATENCY_TICKS,
+        ISR_SANITY_OCXO_CNTR_MAX_READ_LATENCY_TICKS,
+        ISR_SANITY_OCXO_CNTR_READ_LATENCY_TICKS);
+
+    const uint32_t expected_dwt_delta =
+        (uint32_t)dwt_cycles_for_ocxo_ticks_signed(
+            (int32_t)sample.arm_to_isr_ticks);
+    isr_sanity_record_dwt(*sanity,
+                          sample.had_armed,
+                          expected_dwt_delta,
+                          sample.arm_to_isr_dwt_cycles);
+  }
+
   ocxo_cadence_update_synthetic_identity(ctx, sample);
   ocxo_cadence_update_sample_phase(ctx, sample);
 
-  // Preserve the existing SmartZero custody rule: feed the sample before
-  // deciding whether the local cadence remains owned by SmartZero or by the
-  // normal active lane.
   const bool cadence_reauthored_by_smartzero =
       ocxo_cadence_feed_smartzero(ctx, sample);
   ocxo_cadence_rearm_or_stop(ctx, sample, cadence_reauthored_by_smartzero);
@@ -6457,18 +7090,18 @@ static void ocxo_cadence_compare_isr(ocxo_runtime_context_t& ctx,
         ocxo_cadence_build_perishable_fact(ctx, sample);
     ocxo_cadence_enqueue_fact(ctx, fact);
   }
+
+  lane.cadence_last_one_second_due = sample.one_second_due;
 }
 
 static void qtimer2_isr(void) {
   const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;  // SACRED: first instruction.
-  const spinidle_isr_capture_t spinidle = spinidle_capture_at_isr_entry(isr_entry_dwt_raw);
-  ocxo_cadence_compare_isr(g_ocxo1_ctx, isr_entry_dwt_raw, spinidle);
+  ocxo_cadence_capture_priority0(g_ocxo1_ctx, isr_entry_dwt_raw);
 }
 
 static void qtimer3_isr(void) {
   const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;  // SACRED: first instruction.
-  const spinidle_isr_capture_t spinidle = spinidle_capture_at_isr_entry(isr_entry_dwt_raw);
-  ocxo_cadence_compare_isr(g_ocxo2_ctx, isr_entry_dwt_raw, spinidle);
+  ocxo_cadence_capture_priority0(g_ocxo2_ctx, isr_entry_dwt_raw);
 }
 
 // ============================================================================
@@ -6565,17 +7198,37 @@ uint16_t interrupt_qtimer1_ch2_counter_now(void) { return IMXRT_TMR1.CH[2].CNTR;
 uint16_t interrupt_qtimer1_ch2_comp1_now(void)   { return IMXRT_TMR1.CH[2].COMP1; }
 uint16_t interrupt_qtimer1_ch2_csctrl_now(void)  { return IMXRT_TMR1.CH[2].CSCTRL; }
 
-static void qtimer1_ch1_bridge_isr(uint32_t isr_entry_dwt_raw) {
+static void qtimer1_ch1_capture_priority0(uint32_t isr_entry_dwt_raw,
+                                            uint32_t csctrl_entry) {
   qtimer1_ch1_clear_compare_flag();
 
-  if (!g_qtimer1_ch1_active) {
+  qtimer1_ch1_capture_packet_t packet{};
+  packet.isr_entry_dwt_raw = isr_entry_dwt_raw;
+  packet.csctrl_entry = csctrl_entry;
+  packet.active_at_capture = g_qtimer1_ch1_active;
+  packet.target_counter32 = g_qtimer1_ch1_target_counter32;
+  packet.next_compare_counter32 = g_qtimer1_ch1_next_compare_counter32;
+  packet.capture_exit_dwt = ARM_DWT_CYCCNT;
+
+  if (capture_ring_push_from_priority0(g_qtimer1_ch1_capture_ring,
+                                       g_handoff_qtimer1_ch1,
+                                       packet)) {
+    interrupt_handoff_request_from_capture_isr("qtimer1_ch1_capture");
+  }
+  interrupt_handoff_note_priority0_body(g_handoff_qtimer1_ch1,
+                                        isr_entry_dwt_raw);
+}
+
+static void interrupt_handoff_process_qtimer1_ch1(
+    const qtimer1_ch1_capture_packet_t& packet) {
+  if (!packet.active_at_capture) {
     qtimer1_ch1_disable_compare_hw();
     return;
   }
 
-  const uint32_t fired_counter32 = g_qtimer1_ch1_next_compare_counter32;
+  const uint32_t fired_counter32 = packet.next_compare_counter32;
 
-  if (fired_counter32 != g_qtimer1_ch1_target_counter32) {
+  if (fired_counter32 != packet.target_counter32) {
     g_qtimer1_ch1_hop_count++;
     qtimer1_ch1_schedule_next_hop();
     return;
@@ -6586,16 +7239,16 @@ static void qtimer1_ch1_bridge_isr(uint32_t isr_entry_dwt_raw) {
   g_qtimer1_ch1_fire_count++;
 
   const uint32_t qtimer_event_dwt =
-      qtimer_event_dwt_from_isr_entry_raw(isr_entry_dwt_raw);
+      qtimer_event_dwt_from_isr_entry_raw(packet.isr_entry_dwt_raw);
   const int64_t gnss_ns = vclock_gnss_from_counter32(fired_counter32);
 
   interrupt_qtimer1_ch1_compare_event_t event{};
   event.sequence = ++g_qtimer1_ch1_sequence;
-  event.target_counter32 = g_qtimer1_ch1_target_counter32;
+  event.target_counter32 = packet.target_counter32;
   event.counter32_at_event = fired_counter32;
   event.counter32_residual_ticks =
-      (int32_t)(fired_counter32 - g_qtimer1_ch1_target_counter32);
-  event.isr_entry_dwt_raw = isr_entry_dwt_raw;
+      (int32_t)(fired_counter32 - packet.target_counter32);
+  event.isr_entry_dwt_raw = packet.isr_entry_dwt_raw;
   event.dwt_at_event = qtimer_event_dwt;
   event.gnss_ns_at_event = gnss_ns;
 
@@ -6604,76 +7257,95 @@ static void qtimer1_ch1_bridge_isr(uint32_t isr_entry_dwt_raw) {
   }
 }
 
+static void interrupt_handoff_process_qtimer1_ch2(
+    const qtimer1_ch2_capture_packet_t& packet) {
+  const uint32_t isr_entry_dwt_raw = packet.isr_entry_dwt_raw;
+  const uint32_t qtimer_event_dwt = qtimer_event_dwt_from_isr_entry_raw(isr_entry_dwt_raw);
+  const uint32_t ch2_event_counter32 = packet.ch2_event_counter32;
+  const spinidle_isr_capture_t& spinidle = packet.spinidle;
+
+  interrupt_ch2_implicit_rollover_tend();
+
+  pps_relay_ch2_tick(g_vclock_clock32.current_counter32);
+  vclock_ch2_one_second_service(isr_entry_dwt_raw,
+                                qtimer_event_dwt,
+                                ch2_event_counter32,
+                                spinidle);
+  vclock_ch2_smartzero_service(qtimer_event_dwt,
+                               ch2_event_counter32);
+  if (g_qtimer1_ch2_handler) {
+    const bridge_projection_t bridge = interrupt_dwt_to_vclock_gnss_projection(qtimer_event_dwt);
+    const int64_t  gnss_ns = bridge.gnss_ns;
+    bridge_projection_record_stats(interrupt_subscriber_kind_t::TIMEPOP, bridge);
+
+    interrupt_event_t event{};
+    event.kind     = interrupt_subscriber_kind_t::TIMEPOP;
+    event.provider = interrupt_provider_kind_t::QTIMER1;
+    event.lane     = interrupt_lane_t::QTIMER1_CH2_COMP;
+    event.status   = interrupt_event_status_t::OK;
+    event.dwt_at_event       = qtimer_event_dwt;
+    event.gnss_ns_at_event   = (gnss_ns >= 0) ? (uint64_t)gnss_ns : 0;
+    event.counter32_at_event = ch2_event_counter32;
+
+    interrupt_capture_diag_t diag{};
+    diag.enabled  = true;
+    diag.provider = interrupt_provider_kind_t::QTIMER1;
+    diag.lane     = interrupt_lane_t::QTIMER1_CH2_COMP;
+    diag.kind     = interrupt_subscriber_kind_t::TIMEPOP;
+    diag.dwt_at_event       = qtimer_event_dwt;
+    diag.gnss_ns_at_event   = event.gnss_ns_at_event;
+    diag.counter32_at_event = event.counter32_at_event;
+    diag.dwt_isr_entry_raw  = isr_entry_dwt_raw;
+    spinidle_copy_to_diag(diag, spinidle);
+    g_spinidle_timepop_last_capture = spinidle;
+    bridge_projection_copy_to_diag(diag, bridge);
+
+    g_qtimer1_ch2_handler(event, diag);
+  }
+
+  vclock_ch2_epoch_native_service(qtimer_event_dwt,
+                                  ch2_event_counter32);
+  vclock_ch2_fact_drain_arm_after_timepop();
+}
+
+static void qtimer1_ch2_capture_priority0(uint32_t isr_entry_dwt_raw,
+                                            uint32_t csctrl_entry) {
+  qtimer1_ch2_clear_compare_flag();
+
+  qtimer1_ch2_capture_packet_t packet{};
+  packet.isr_entry_dwt_raw = isr_entry_dwt_raw;
+  packet.ch2_event_counter32 = g_qtimer1_ch2_last_target_counter32;
+  packet.csctrl_entry = csctrl_entry;
+
+  // SpinIdle is diagnostic evidence. Capture it only after the indispensable
+  // CH2 flag/target facts have been snapshotted and the source defused.
+  packet.spinidle = spinidle_capture_at_isr_entry(isr_entry_dwt_raw);
+  packet.capture_exit_dwt = ARM_DWT_CYCCNT;
+
+  if (capture_ring_push_from_priority0(g_qtimer1_ch2_capture_ring,
+                                       g_handoff_qtimer1_ch2,
+                                       packet)) {
+    interrupt_handoff_request_from_capture_isr("qtimer1_ch2_capture");
+  }
+  interrupt_handoff_note_priority0_body(g_handoff_qtimer1_ch2,
+                                        isr_entry_dwt_raw);
+}
+
 static void qtimer1_isr(void) {
   const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;  // SACRED: first instruction.
-  const spinidle_isr_capture_t spinidle = spinidle_capture_at_isr_entry(isr_entry_dwt_raw);
 
-  if (IMXRT_TMR1.CH[1].CSCTRL & TMR_CSCTRL_TCF1) {
-    qtimer1_ch1_bridge_isr(isr_entry_dwt_raw);
+  const uint32_t ch1_csctrl = IMXRT_TMR1.CH[1].CSCTRL;
+  if (ch1_csctrl & TMR_CSCTRL_TCF1) {
+    qtimer1_ch1_capture_priority0(isr_entry_dwt_raw, ch1_csctrl);
   }
-  else if (IMXRT_TMR1.CH[2].CSCTRL & TMR_CSCTRL_TCF1) {
-    qtimer1_ch2_clear_compare_flag();
-    const uint32_t qtimer_event_dwt = qtimer_event_dwt_from_isr_entry_raw(isr_entry_dwt_raw);
-    // Snapshot the fired target before TimePop is invoked; the handler may arm
-    // the next compare and update g_qtimer1_ch2_last_target_counter32.
-    const uint32_t ch2_event_counter32 = g_qtimer1_ch2_last_target_counter32;
-    interrupt_ch2_implicit_rollover_tend();
-
-    pps_relay_ch2_tick(g_vclock_clock32.current_counter32);
-    vclock_ch2_one_second_service(isr_entry_dwt_raw,
-                                  qtimer_event_dwt,
-                                  ch2_event_counter32,
-                                  spinidle);
-    vclock_ch2_smartzero_service(qtimer_event_dwt,
-                                  ch2_event_counter32);
-    if (g_qtimer1_ch2_handler) {
-      const bridge_projection_t bridge = interrupt_dwt_to_vclock_gnss_projection(qtimer_event_dwt);
-      const int64_t  gnss_ns = bridge.gnss_ns;
-      bridge_projection_record_stats(interrupt_subscriber_kind_t::TIMEPOP, bridge);
-
-      interrupt_event_t event{};
-      event.kind     = interrupt_subscriber_kind_t::TIMEPOP;
-      event.provider = interrupt_provider_kind_t::QTIMER1;
-      event.lane     = interrupt_lane_t::QTIMER1_CH2_COMP;
-      event.status   = interrupt_event_status_t::OK;
-      event.dwt_at_event       = qtimer_event_dwt;
-      event.gnss_ns_at_event   = (gnss_ns >= 0) ? (uint64_t)gnss_ns : 0;
-      // CH2 compare event identity is the synthetic deadline that
-      // process_interrupt armed in hardware on TimePop's behalf.  This is an
-      // event fact, not a post-event ambient read.
-      event.counter32_at_event = ch2_event_counter32;
-
-      interrupt_capture_diag_t diag{};
-      diag.enabled  = true;
-      diag.provider = interrupt_provider_kind_t::QTIMER1;
-      diag.lane     = interrupt_lane_t::QTIMER1_CH2_COMP;
-      diag.kind     = interrupt_subscriber_kind_t::TIMEPOP;
-      diag.dwt_at_event       = qtimer_event_dwt;
-      diag.gnss_ns_at_event   = event.gnss_ns_at_event;
-      diag.counter32_at_event = event.counter32_at_event;
-      diag.dwt_isr_entry_raw  = isr_entry_dwt_raw;
-      spinidle_copy_to_diag(diag, spinidle);
-      g_spinidle_timepop_last_capture = spinidle;
-      bridge_projection_copy_to_diag(diag, bridge);
-
-      g_qtimer1_ch2_handler(event, diag);
+  else {
+    const uint32_t ch2_csctrl = IMXRT_TMR1.CH[2].CSCTRL;
+    if (ch2_csctrl & TMR_CSCTRL_TCF1) {
+      qtimer1_ch2_capture_priority0(isr_entry_dwt_raw, ch2_csctrl);
     }
-
-    // Bootstrap/rebootstrap PPS_VCLOCK publication is also native CH2 custody
-    // now.  Run it only after TimePop has consumed the compare event, matching
-    // the safe ordering used for VCLOCK fact-drain arming.
-    vclock_ch2_epoch_native_service(qtimer_event_dwt,
-                                    ch2_event_counter32);
-
-    // CH2-authored VCLOCK facts are now drain-armed from native CH2 custody,
-    // but only after TimePop has consumed the compare event.  This preserves
-    // the non-reentrant boundary that kept the previous heartbeat arm safe.
-    vclock_ch2_fact_drain_arm_after_timepop();
   }
-  // CH1/CH2 share one vector.  If multiple flags are pending, the
-  // unhandled flag remains set and NVIC re-dispatches with a fresh
-  // first-instruction _raw capture.  VCLOCK cadence no longer owns CH3; it
-  // is a normal TimePop client on CH2.
+  // CH1/CH2 share one vector. If multiple flags are pending, the unhandled flag
+  // remains set and NVIC re-dispatches with a fresh first-instruction capture.
 }
 
 // ============================================================================
@@ -6836,41 +7508,18 @@ static void pps_post_isr_defer(const interrupt_epoch_capture_t& cap,
   }
 }
 
-void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
-  const spinidle_isr_capture_t spinidle = spinidle_capture_at_isr_entry(isr_entry_dwt_raw);
+static void interrupt_handoff_process_pps(const pps_capture_packet_t& packet) {
+  const uint32_t isr_entry_dwt_raw = packet.isr_entry_dwt_raw;
+  const spinidle_isr_capture_t& spinidle = packet.spinidle;
   g_spinidle_pps_last_capture = spinidle;
 
-  // PPS GPIO is a witness/selector only.  It captures the physical PPS facts
-  // and, during rebootstrap, selects the VCLOCK-domain edge identity.  It does
-  // NOT author the public PPS/VCLOCK DWT coordinate; that coordinate is later
-  // authored by the TimePop VCLOCK cadence client on QTimer1 CH2 so all public
-  // DWT captures live in one TimePop event-coordinate system.
-  //
-  // Zero-offset capture doctrine: immediately after the first-instruction
-  // DWT raw capture, read the three 10 MHz lane counters in one custody
-  // window.  The raw 16-bit reads are retained as forensic-only evidence;
-  // runtime timing math consumes the synthetic 32-bit lane coordinates below.
   const uint32_t epoch_capture_start_raw = isr_entry_dwt_raw;
-  const uint16_t hardware_low16 = qtimer1_ch0_counter_now();
-  const uint32_t epoch_capture_after_vclock_raw = ARM_DWT_CYCCNT;
-
-  // Defensive boot rule: VCLOCK is mandatory and QTimer1 CH0 is initialized
-  // before IRQs are enabled.  OCXO raw reads are desirable, but they are not
-  // allowed to become a boot-time dependency unless QTimer3 lane hardware is
-  // known initialized.  This keeps PPS witness/selector work alive even if an
-  // OCXO lane is not ready yet.
-  const bool ocxo1_capture_hw_ready =
-      g_interrupt_hw_ready && !OCXO1_DISABLED && g_ocxo1_lane.initialized;
-  const bool ocxo2_capture_hw_ready =
-      g_interrupt_hw_ready && !OCXO2_DISABLED && g_ocxo2_lane.initialized;
-
-  // Fixed incorrect negation:
-  const bool ocxo_capture_hw_ready =
-      (OCXO1_DISABLED || ocxo1_capture_hw_ready) &&
-      (OCXO2_DISABLED || ocxo2_capture_hw_ready);
-  const uint16_t ocxo1_hardware16 = ocxo1_capture_hw_ready ? IMXRT_TMR2.CH[0].CNTR : 0;
-  const uint16_t ocxo2_hardware16 = ocxo2_capture_hw_ready ? IMXRT_TMR3.CH[3].CNTR : 0;
-  const uint32_t epoch_capture_end_raw = ARM_DWT_CYCCNT;
+  const uint16_t hardware_low16 = packet.vclock_hardware16_observed;
+  const uint32_t epoch_capture_after_vclock_raw = packet.capture_after_vclock_raw;
+  const bool ocxo_capture_hw_ready = packet.ocxo_capture_hw_ready;
+  const uint16_t ocxo1_hardware16 = packet.ocxo1_hardware16;
+  const uint16_t ocxo2_hardware16 = packet.ocxo2_hardware16;
+  const uint32_t epoch_capture_end_raw = packet.capture_end_raw;
 
   const uint16_t ch3_now = hardware_low16;
 
@@ -6889,10 +7538,10 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
   const uint32_t selected_counter32 =
       observed_counter32 - VCLOCK_EPOCH_OBSERVED_TICKS_AFTER_SELECTED;
 
-  const uint32_t ocxo1_counter32 = ocxo1_capture_hw_ready
+  const uint32_t ocxo1_counter32 = packet.ocxo1_capture_hw_ready
       ? project_counter32_from_hw16(g_ocxo1_clock32, ocxo1_hardware16)
       : 0;
-  const uint32_t ocxo2_counter32 = ocxo2_capture_hw_ready
+  const uint32_t ocxo2_counter32 = packet.ocxo2_capture_hw_ready
       ? project_counter32_from_hw16(g_ocxo2_clock32, ocxo2_hardware16)
       : 0;
 
@@ -6915,9 +7564,6 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
   epoch_cap.all_lanes_capture_valid =
       ocxo_capture_hw_ready &&
       epoch_cap.capture_window_cycles <= EPOCH_CAPTURE_MAX_WINDOW_CYCLES;
-  // A packet is operationally selectable only after interrupt runtime has
-  // finished initialization.  This prevents a boot-time partial capture from
-  // being mistaken for a CLOCKS.ZERO epoch packet.
   epoch_cap.valid = g_interrupt_runtime_ready && epoch_cap.vclock_capture_valid;
   epoch_cap.vclock_hardware16_observed = hardware_low16;
   epoch_cap.vclock_hardware16_selected = selected_low16;
@@ -6936,10 +7582,6 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
   g_last_pps_witness = pps;
   g_last_pps_witness_valid = true;
 
-  // Passive PPS ISR sanity witness.  Once a prior PPS exists, CNTR sanity
-  // checks the observed VCLOCK counter interval against exactly one 10 MHz
-  // second, while DWT sanity checks the physical PPS DWT interval against the
-  // current CLOCKS/PPS-derived cycles-per-second ruler.
   if (g_isr_sanity_pps_prev_valid) {
     const uint32_t observed_counter_delta =
         observed_counter32 - g_isr_sanity_pps_prev_counter32;
@@ -6962,16 +7604,9 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
   g_isr_sanity_pps_prev_counter32 = observed_counter32;
   g_isr_sanity_pps_prev_dwt = pps.dwt_at_edge;
 
-  // Defer epoch-packet publication and PPS entry-latency diagnostic callback.
-  // The witness facts above remain immediate because VCLOCK steady-state and
-  // rebootstrap consume them.
   pps_post_isr_defer(epoch_cap, isr_entry_dwt_raw);
 
-  // During rebootstrap, PPS selects the sacred VCLOCK edge identity.  Native
-  // CH2 custody consumes this pending latch after TimePop has processed the
-  // next CH2 compare fact, back-projects to the selected edge, and publishes
-  // the canonical PPS_VCLOCK epoch.
-  if (g_pps_rebootstrap_pending) {
+  if (packet.rebootstrap_pending_at_capture && g_pps_rebootstrap_pending) {
     g_pps_rebootstrap_pending = false;
     g_pps_rebootstrap_count++;
 
@@ -6996,6 +7631,38 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
     g_vclock_lane.logical_count32_at_last_second = selected_counter32;
     vclock_clock_anchor_hardware_low16(selected_counter32, selected_low16);
   }
+}
+
+void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
+  pps_capture_packet_t packet{};
+  packet.sequence = ++g_pps_capture_sequence;
+  packet.isr_entry_dwt_raw = isr_entry_dwt_raw;
+
+  packet.vclock_hardware16_observed = qtimer1_ch0_counter_now();
+  packet.capture_after_vclock_raw = ARM_DWT_CYCCNT;
+
+  packet.ocxo1_capture_hw_ready =
+      g_interrupt_hw_ready && !OCXO1_DISABLED && g_ocxo1_lane.initialized;
+  packet.ocxo2_capture_hw_ready =
+      g_interrupt_hw_ready && !OCXO2_DISABLED && g_ocxo2_lane.initialized;
+  packet.ocxo_capture_hw_ready =
+      (OCXO1_DISABLED || packet.ocxo1_capture_hw_ready) &&
+      (OCXO2_DISABLED || packet.ocxo2_capture_hw_ready);
+  packet.ocxo1_hardware16 = packet.ocxo1_capture_hw_ready ? IMXRT_TMR2.CH[0].CNTR : 0;
+  packet.ocxo2_hardware16 = packet.ocxo2_capture_hw_ready ? IMXRT_TMR3.CH[3].CNTR : 0;
+  packet.capture_end_raw = ARM_DWT_CYCCNT;
+  packet.spinidle = spinidle_capture_at_isr_entry(isr_entry_dwt_raw);
+  packet.capture_exit_dwt = ARM_DWT_CYCCNT;
+  packet.rebootstrap_pending_at_capture = g_pps_rebootstrap_pending;
+
+  if (capture_ring_push_from_priority0(g_pps_capture_ring,
+                                       g_handoff_pps,
+                                       packet)) {
+    interrupt_handoff_request_from_capture_isr("pps_gpio_capture");
+  } else {
+    g_gpio_miss_count++;
+  }
+  interrupt_handoff_note_priority0_body(g_handoff_pps, isr_entry_dwt_raw);
 }
 
 static void pps_gpio_isr(void) {
@@ -7516,6 +8183,20 @@ static void runtime_reset_vclock_heartbeat_state(void) {
   g_spinidle_pps_last_capture = spinidle_isr_capture_t{};
   g_spinidle_timepop_last_capture = spinidle_isr_capture_t{};
 
+  g_interrupt_handoff = interrupt_handoff_diag_t{};
+  g_handoff_qtimer1_ch1 = interrupt_handoff_source_diag_t{};
+  g_handoff_qtimer1_ch2 = interrupt_handoff_source_diag_t{};
+  g_handoff_ocxo1 = interrupt_handoff_source_diag_t{};
+  g_handoff_ocxo2 = interrupt_handoff_source_diag_t{};
+  g_handoff_pps = interrupt_handoff_source_diag_t{};
+  g_qtimer1_ch1_capture_ring = interrupt_capture_ring_t<qtimer1_ch1_capture_packet_t, HANDOFF_QTIMER1_CH1_RING_SIZE>{};
+  g_qtimer1_ch2_capture_ring = interrupt_capture_ring_t<qtimer1_ch2_capture_packet_t, HANDOFF_QTIMER1_CH2_RING_SIZE>{};
+  g_ocxo1_capture_ring = interrupt_capture_ring_t<ocxo_capture_packet_t, HANDOFF_OCXO_RING_SIZE>{};
+  g_ocxo2_capture_ring = interrupt_capture_ring_t<ocxo_capture_packet_t, HANDOFF_OCXO_RING_SIZE>{};
+  g_pps_capture_ring = interrupt_capture_ring_t<pps_capture_packet_t, HANDOFF_PPS_RING_SIZE>{};
+  g_interrupt_capture_sequence = 0;
+  g_pps_capture_sequence = 0;
+
 }
 
 static void runtime_reset_ocxo_fact_rings(void) {
@@ -7544,11 +8225,14 @@ void process_interrupt_init(void) {
   runtime_reset_for_init();
 
   g_interrupt_runtime_ready = true;
+  interrupt_handoff_configure();
   (void)vclock_heartbeat_arm_timepop();
 }
 
 void process_interrupt_enable_irqs(void) {
   if (g_interrupt_irqs_enabled) return;
+
+  interrupt_handoff_configure();
 
   attachInterruptVector(IRQ_QTIMER1, qtimer1_isr);
   // VCLOCK/TimePop QTimer1 is the sovereign timing rail.  Keep the entire
@@ -8060,6 +8744,11 @@ static void add_priority_payload(Payload& p) {
   p.add("irq_qtimer2_enabled_by_interrupt", g_step0_qtimer2_irq_enabled_by_interrupt);
   p.add("irq_qtimer3_enabled_by_interrupt", g_step0_qtimer3_irq_enabled_by_interrupt);
   p.add("irq_gpio6789_configured_by_interrupt", g_step0_gpio6789_configured_by_interrupt);
+  p.add("capture_priority", INTERRUPT_PRIORITY_CAPTURE);
+  p.add("handoff_priority", INTERRUPT_PRIORITY_HANDOFF);
+  p.add("background_irq_priority", INTERRUPT_PRIORITY_BACKGROUND_IRQ);
+  p.add("handoff_irq", INTERRUPT_HANDOFF_IRQ_NUMBER);
+  p.add("handoff_irq_name", INTERRUPT_HANDOFF_IRQ_NAME);
 }
 
 static void add_runtime_payload(Payload& p) {
@@ -8106,6 +8795,11 @@ static void add_runtime_payload(Payload& p) {
   p.add("lane_report_command", "INTERRUPT.REPORT_LANES");
   p.add("single_lane_report_command", "INTERRUPT.REPORT_LANE lane=VCLOCK|OCXO1|OCXO2");
   p.add("regression_samples_report_command", "disabled");
+  p.add("capture_discipline", INTERRUPT_CAPTURE_DISCIPLINE);
+  p.add("handoff_mechanism", INTERRUPT_HANDOFF_MECHANISM);
+  p.add("handoff_irq", INTERRUPT_HANDOFF_IRQ_NUMBER);
+  p.add("handoff_priority", INTERRUPT_PRIORITY_HANDOFF);
+  p.add("handoff_report_command", "INTERRUPT.REPORT_HANDOFF");
 }
 
 static void add_ocxo_cadence_report_payload(Payload& p,
@@ -9094,12 +9788,109 @@ static void add_ocxo_compact_payload(Payload& p,
   }
 }
 
-static Payload cmd_report(const Payload&) {
+static void add_handoff_source_payload(Payload& p,
+                                       const char* prefix,
+                                       const interrupt_handoff_source_diag_t& d,
+                                       uint32_t capacity) {
+  payload_prefix_t out(p, prefix);
+  out.add_u32("capture_ring_capacity", capacity);
+  out.add_u32("capture_count", d.capture_count);
+  out.add_u32("capture_enqueue_count", d.enqueue_count);
+  out.add_u32("capture_dequeue_count", d.dequeue_count);
+  out.add_u32("capture_overrun_count", d.overrun_count);
+  out.add_u32("capture_high_water", d.high_water);
+  out.add_u32("capture_pending_count", d.pending_count);
+  out.add_u32("last_sequence", d.last_sequence);
+  out.add_u32("last_capture_dwt", d.last_capture_dwt);
+  out.add_u32("last_handoff_entry_dwt", d.last_handoff_entry_dwt);
+  out.add_u32("capture_to_handoff_cycles_last", d.last_capture_to_handoff_cycles);
+  out.add_u32("capture_to_handoff_cycles_max", d.max_capture_to_handoff_cycles);
+  out.add_u32("priority0_body_cycles_last", d.last_priority0_body_cycles);
+  out.add_u32("priority0_body_cycles_max", d.max_priority0_body_cycles);
+  out.add_u32("handoff_body_cycles_last", d.last_handoff_body_cycles);
+  out.add_u32("handoff_body_cycles_max", d.max_handoff_body_cycles);
+}
+
+static void add_handoff_payload(Payload& p) {
+  const uint32_t irq = INTERRUPT_HANDOFF_IRQ_NUMBER;
+  const uint32_t mask = interrupt_nvic_irq_mask(irq);
+  const uint32_t iser = interrupt_nvic_iser_word(irq);
+  const uint32_t ispr = interrupt_nvic_ispr_word(irq);
+  const uint32_t iabr = interrupt_nvic_iabr_word(irq);
+
+  p.add("capture_discipline", INTERRUPT_CAPTURE_DISCIPLINE);
+  p.add("handoff_mechanism", INTERRUPT_HANDOFF_MECHANISM);
+  p.add("handoff_irq_name", INTERRUPT_HANDOFF_IRQ_NAME);
+  p.add("handoff_irq", INTERRUPT_HANDOFF_IRQ_NUMBER);
+  p.add("handoff_irq_index", irq >> 5);
+  p.add("handoff_irq_mask", mask);
+  p.add("handoff_priority", INTERRUPT_PRIORITY_HANDOFF);
+  p.add("handoff_configured", g_interrupt_handoff.configured);
+  p.add("handoff_configure_count", g_interrupt_handoff.configure_count);
+  p.add("handoff_running", g_interrupt_handoff.running);
+  p.add("handoff_pending", g_interrupt_handoff.pending);
+  p.add("handoff_enabled_bit", (iser & mask) != 0);
+  p.add("handoff_pending_bit", (ispr & mask) != 0);
+  p.add("handoff_active_bit", (iabr & mask) != 0);
+  p.add("handoff_iser_word", iser);
+  p.add("handoff_ispr_word", ispr);
+  p.add("handoff_iabr_word", iabr);
+  p.add("handoff_request_count", g_interrupt_handoff.request_count);
+  p.add("handoff_entry_count", g_interrupt_handoff.entry_count);
+  p.add("handoff_exit_count", g_interrupt_handoff.exit_count);
+  p.add("handoff_served_request_count", g_interrupt_handoff.served_request_count);
+  p.add("handoff_unserved_request_count", g_interrupt_handoff.unserved_request_count);
+  p.add("handoff_spurious_entry_count", g_interrupt_handoff.spurious_entry_count);
+  p.add("handoff_reentry_count", g_interrupt_handoff.reentry_count);
+  p.add("handoff_repend_count", g_interrupt_handoff.repend_count);
+  p.add("handoff_drain_budget", INTERRUPT_HANDOFF_DRAIN_BUDGET);
+  p.add("handoff_drain_pass_count", g_interrupt_handoff.drain_pass_count);
+  p.add("handoff_drain_budget_exhausted_count",
+        g_interrupt_handoff.drain_budget_exhausted_count);
+  p.add("handoff_last_request_context",
+        (const char*)(g_interrupt_handoff.last_request_context
+                          ? g_interrupt_handoff.last_request_context
+                          : ""));
+  p.add("handoff_last_request_dwt", g_interrupt_handoff.last_request_dwt);
+  p.add("handoff_last_entry_dwt", g_interrupt_handoff.last_entry_dwt);
+  p.add("handoff_last_exit_dwt", g_interrupt_handoff.last_exit_dwt);
+  p.add("handoff_last_latency_cycles", g_interrupt_handoff.last_latency_cycles);
+  p.add("handoff_min_latency_cycles",
+        g_interrupt_handoff.min_latency_cycles == UINT32_MAX
+            ? 0U
+            : g_interrupt_handoff.min_latency_cycles);
+  p.add("handoff_max_latency_cycles", g_interrupt_handoff.max_latency_cycles);
+  p.add("handoff_mean_latency_cycles",
+        g_interrupt_handoff.latency_sample_count
+            ? (uint32_t)(g_interrupt_handoff.latency_cycles_sum /
+                         (uint64_t)g_interrupt_handoff.latency_sample_count)
+            : 0U);
+  p.add("handoff_latency_sample_count", g_interrupt_handoff.latency_sample_count);
+  p.add("handoff_last_body_cycles", g_interrupt_handoff.last_body_cycles);
+  p.add("handoff_max_body_cycles", g_interrupt_handoff.max_body_cycles);
+  p.add("handoff_last_request_ipsr", g_interrupt_handoff.last_request_ipsr);
+  p.add("handoff_entry_ipsr", g_interrupt_handoff.entry_ipsr);
+  p.add("handoff_last_request_primask", g_interrupt_handoff.last_request_primask);
+  p.add("handoff_entry_primask", g_interrupt_handoff.entry_primask);
+
+  add_handoff_source_payload(p, "handoff_qtimer1_ch1", g_handoff_qtimer1_ch1,
+                             HANDOFF_QTIMER1_CH1_RING_SIZE);
+  add_handoff_source_payload(p, "handoff_qtimer1_ch2", g_handoff_qtimer1_ch2,
+                             HANDOFF_QTIMER1_CH2_RING_SIZE);
+  add_handoff_source_payload(p, "handoff_ocxo1", g_handoff_ocxo1,
+                             HANDOFF_OCXO_RING_SIZE);
+  add_handoff_source_payload(p, "handoff_ocxo2", g_handoff_ocxo2,
+                             HANDOFF_OCXO_RING_SIZE);
+  add_handoff_source_payload(p, "handoff_pps", g_handoff_pps,
+                             HANDOFF_PPS_RING_SIZE);
+}
+
+static FLASHMEM Payload cmd_report(const Payload&) {
   Payload p;
   p.add("report", "INTERRUPT_COMPACT");
   p.add("subreports",
         "REPORT_STATUS REPORT_PPS REPORT_CADENCE REPORT_SMARTZERO "
-        "REPORT_BRIDGE REPORT_LANES REPORT_LANE");
+        "REPORT_BRIDGE REPORT_HANDOFF REPORT_LANES REPORT_LANE");
   p.add("regression_samples_report_command", "disabled");
 
   // Keep the default INTERRUPT.REPORT deliberately small.  The former
@@ -9139,6 +9930,23 @@ static Payload cmd_report(const Payload&) {
   p.add("ocxo_native_1khz_cadence_retired", true);
   p.add("ocxo_perishable_fact_capture", true);
   p.add("ocxo_fact_ring_size", OCXO_PERISHABLE_FACT_RING_SIZE);
+  p.add("capture_discipline", INTERRUPT_CAPTURE_DISCIPLINE);
+  p.add("handoff_mechanism", INTERRUPT_HANDOFF_MECHANISM);
+  p.add("handoff_irq", INTERRUPT_HANDOFF_IRQ_NUMBER);
+  p.add("handoff_priority", INTERRUPT_PRIORITY_HANDOFF);
+  p.add("handoff_configured", g_interrupt_handoff.configured);
+  p.add("handoff_request_count", g_interrupt_handoff.request_count);
+  p.add("handoff_entry_count", g_interrupt_handoff.entry_count);
+  p.add("handoff_exit_count", g_interrupt_handoff.exit_count);
+  p.add("handoff_unserved_request_count", g_interrupt_handoff.unserved_request_count);
+  p.add("handoff_reentry_count", g_interrupt_handoff.reentry_count);
+  p.add("handoff_spurious_entry_count", g_interrupt_handoff.spurious_entry_count);
+  p.add("handoff_max_latency_cycles", g_interrupt_handoff.max_latency_cycles);
+  p.add("handoff_max_body_cycles", g_interrupt_handoff.max_body_cycles);
+  p.add("handoff_qtimer1_ch2_overrun_count", g_handoff_qtimer1_ch2.overrun_count);
+  p.add("handoff_ocxo1_overrun_count", g_handoff_ocxo1.overrun_count);
+  p.add("handoff_ocxo2_overrun_count", g_handoff_ocxo2.overrun_count);
+  p.add("handoff_pps_overrun_count", g_handoff_pps.overrun_count);
 
   p.add("qtimer1_priority_ok",
         g_step0_qtimer1_priority_applied == INTERRUPT_STEP0_EXPECTED_QTIMER1_PRIORITY);
@@ -9212,7 +10020,7 @@ static Payload cmd_report(const Payload&) {
 
   return p;
 }
-static Payload cmd_report_status(const Payload&) {
+static FLASHMEM Payload cmd_report_status(const Payload&) {
   Payload p;
   p.add("report", "INTERRUPT_STATUS");
   add_runtime_payload(p);
@@ -9220,7 +10028,7 @@ static Payload cmd_report_status(const Payload&) {
   return p;
 }
 
-static Payload cmd_report_pps(const Payload&) {
+static FLASHMEM Payload cmd_report_pps(const Payload&) {
   Payload p;
   p.add("report", "INTERRUPT_PPS");
   add_pps_payload(p);
@@ -9228,7 +10036,7 @@ static Payload cmd_report_pps(const Payload&) {
   return p;
 }
 
-static Payload cmd_report_cadence(const Payload&) {
+static FLASHMEM Payload cmd_report_cadence(const Payload&) {
   Payload p;
   p.add("report", "INTERRUPT_CADENCE");
   add_vclock_heartbeat_payload(p);
@@ -9236,7 +10044,7 @@ static Payload cmd_report_cadence(const Payload&) {
   return p;
 }
 
-static Payload cmd_report_smartzero(const Payload&) {
+static FLASHMEM Payload cmd_report_smartzero(const Payload&) {
   Payload p;
   p.add("report", "INTERRUPT_SMARTZERO");
   add_smartzero_payload(p);
@@ -9329,7 +10137,14 @@ static void add_bridge_payload(Payload& p) {
   add_bridge_stats_payload(p, "ocxo2", g_bridge_stats_ocxo2);
 }
 
-static Payload cmd_report_bridge(const Payload&) {
+static FLASHMEM Payload cmd_report_handoff(const Payload&) {
+  Payload p;
+  p.add("report", "INTERRUPT_HANDOFF");
+  add_handoff_payload(p);
+  return p;
+}
+
+static FLASHMEM Payload cmd_report_bridge(const Payload&) {
   Payload p;
   p.add("report", "INTERRUPT_BRIDGE");
   add_bridge_payload(p);
@@ -9876,7 +10691,7 @@ static bool add_ocxo_lane_section(Payload& p,
   return true;
 }
 
-static Payload cmd_report_lanes(const Payload&) {
+static FLASHMEM Payload cmd_report_lanes(const Payload&) {
   Payload p;
   p.add("report", "INTERRUPT_LANES");
   p.add("lane_count", 3);
@@ -9903,7 +10718,7 @@ static Payload cmd_report_lanes(const Payload&) {
   return p;
 }
 
-static Payload cmd_report_lane(const Payload& args) {
+static FLASHMEM Payload cmd_report_lane(const Payload& args) {
   const char* lane = args.getString("lane");
   if (!lane || !*lane) lane = args.getString("name");
   const char* section = report_lane_section_arg(args);
@@ -9945,7 +10760,7 @@ static Payload cmd_report_lane(const Payload& args) {
   return p;
 }
 
-static Payload cmd_regression_samples(const Payload& args) {
+static FLASHMEM Payload cmd_regression_samples(const Payload& args) {
   const char* lane = args.getString("lane");
   if (!lane || !*lane) lane = args.getString("name");
 
@@ -10103,6 +10918,7 @@ static const process_command_entry_t INTERRUPT_COMMANDS[] = {
   { "REPORT_CADENCE",  cmd_report_cadence  },
   { "REPORT_SMARTZERO", cmd_report_smartzero },
   { "REPORT_BRIDGE",   cmd_report_bridge   },
+  { "REPORT_HANDOFF", cmd_report_handoff },
   { "REPORT_LANES",    cmd_report_lanes    },
   { "REPORT_LANE",     cmd_report_lane     },
   { nullptr,           nullptr             }

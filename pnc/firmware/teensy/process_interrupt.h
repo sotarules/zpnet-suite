@@ -4,11 +4,18 @@
 //
 // Interrupt custody and low-word counter cadence:
 //
+//   Reentry-safe capture is now the priority-0 law.  Hardware ISRs capture
+//   immutable packets, defuse the source, pend the priority handoff tier, and
+//   exit.  The handoff tier runs as an ordinary NVIC interrupt at priority 16:
+//   still interrupt context, still before foreground/ASAP, but no longer able
+//   to delay sacred priority-0 clock capture.
+//
 //   • VCLOCK lane   (critical recurring TimePop client on QTimer1 CH2)
-//   • OCXO lanes    (local 1 kHz QTimer rollover ladder on QTimer2 CH0 / QTimer3 CH3;
-//                    only every 1000th tick publishes a one-second event)
+//   • OCXO lanes    (local QTimer one-second compare on QTimer2 CH0 / QTimer3 CH3;
+//                    SmartZero may temporarily use +10,000-tick acquisition)
+//   • Priority handoff (process_interrupt-owned priority-16 continuation tier)
 //   • Cadence minder (TimePop VCLOCK/relay heartbeat; no longer OCXO rollover owner)
-//   • CH2 implicit rollover tend (passive ISR seatbelt for all 16-bit clock extenders;
+//   • CH2 implicit rollover tend (handoff-tier seatbelt for 16-bit clock extenders;
 //                    coexists with CADENCE_MINDER and the OCXO local cadence ladders)
 //   • TimePop       (QTimer1 CH2, hosted scheduler/client rail)
 //   • PPS GPIO edge (diagnostics + dispatch authority + epoch anchor)
@@ -16,11 +23,12 @@
 // QTimer1 vector custody:
 //
 //   QTimer1 has a single shared IRQ vector across all four channels.
-//   process_interrupt owns the vector and dispatches in IRQ context:
-//     • CH1 flag set → legacy hosted compare rail, if explicitly armed
-//     • CH2 flag set → passive all-clock rollover tend, native VCLOCK custody
-//                       work, registered TimePop scheduler handler, then CH2-tail
-//                       selected-epoch / fact-drain service
+//   process_interrupt owns the vector.  At priority 0 it captures CH1/CH2
+//   packets only; the priority handoff tier performs the continuation work:
+//     • CH1 packet → legacy hosted compare rail / hop continuation
+//     • CH2 packet → passive all-clock rollover tend, native VCLOCK custody
+//                    work, registered TimePop scheduler handler, then CH2-tail
+//                    selected-epoch / fact-drain service
 //   VCLOCK cadence no longer owns a private QTimer1 compare channel.  The
 //   remaining VCLOCK_HEARTBEAT TimePop slot is a soft fallback/reporting pulse.
 //   Timing-authoritative VCLOCK duties now run from native CH2 custody: passive
@@ -116,11 +124,11 @@
 //     OCXO1  : QTimer2 CH0 local compare every +10,000 OCXO ticks.
 //     OCXO2  : QTimer3 CH3 local compare every +10,000 OCXO ticks.
 //
-//   OCXO compare ISRs schedule the next +10,000-tick target immediately.  The
-//   intermediate 1 kHz ticks are rollover maintenance only.  Every 1000th OCXO
-//   cadence tick is deferred to foreground as a one-second event consumed by
-//   CLOCKS/Alpha.  Its subscriber-facing DWT is EMA-predicted from completed
-//   one-second intervals, while the ISR-captured DWT remains diagnostic.
+//   OCXO compare ISRs now perform reentry-safe capture only.  The priority
+//   handoff tier updates synthetic identity, feeds SmartZero, rearms/stops the
+//   local compare, and enqueues any one-second fact for ASAP interpretation.
+//   The subscriber-facing DWT is EMA-predicted from completed one-second
+//   intervals, while the ISR-captured DWT remains diagnostic.
 // ============================================================================
 
 #pragma once
@@ -939,15 +947,15 @@ uint16_t interrupt_qtimer1_ch1_comp1_now(void);
 uint16_t interrupt_qtimer1_ch1_csctrl_now(void);
 
 // ============================================================================
-// QTimer1 CH2 IRQ-context handler — TimePop scheduler heartbeat
+// QTimer1 CH2 handoff-tier handler — TimePop scheduler heartbeat
 // ============================================================================
 //
 // TimePop registers a single CH2 handler at init.  process_interrupt's
-// QTimer1 ISR captures DWT as the first instruction, then on every CH2
-// compare-match assembles a standard interrupt_event_t and
-// interrupt_capture_diag_t (kind = TIMEPOP) and invokes this handler in
-// IRQ context.  Unlike VCLOCK/OCXO subscriptions, CH2 delivery is NOT
-// foreground-deferred — TimePop IS the foreground dispatcher.
+// QTimer1 priority-0 ISR captures only the immutable CH2 packet and pends the
+// priority handoff tier.  The handoff tier assembles the standard
+// interrupt_event_t and interrupt_capture_diag_t (kind = TIMEPOP) and invokes
+// this handler at NVIC priority 16.  CH2 delivery is still not foreground-
+// deferred, but it no longer runs inside sacred priority-0 capture custody.
 //
 // Pass nullptr to unregister.  Only one CH2 handler may be registered.
 
