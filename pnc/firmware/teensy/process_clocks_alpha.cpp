@@ -1871,37 +1871,29 @@ static void alpha_ocxo_pps_projection_compute(time_clock_id_t clock,
       alpha_ocxo_latest_actual_interval_cycles(
           clock, &completed_interval_count, &static_prediction_valid);
 
+  // Actual bracket first.  This is an ordered modular-DWT relationship between
+  // two consecutive OCXO edge facts.  Unsigned subtraction is the correct
+  // geometry here, including across a DWT32 wrap.  Do not apply the "signed
+  // near" helper as a veto: a lawful forward target may occupy a modular
+  // position that looks negative in half-range signed arithmetic.
   if (h->previous_valid && h->previous.valid && h->current.valid &&
       h->current.dwt64_at_edge >= h->previous.dwt64_at_edge) {
     const uint64_t actual_interval64 =
         h->current.dwt64_at_edge - h->previous.dwt64_at_edge;
-    const int32_t target_delta_signed_from_prev =
-        alpha_dwt32_signed_delta_near(h->previous.dwt_at_edge,
-                                      pps_dwt_at_edge);
-    const uint32_t legacy_target_delta_from_prev =
+    const uint32_t target_delta_from_prev =
         pps_dwt_at_edge - h->previous.dwt_at_edge;
 
-    if (target_delta_signed_from_prev < 0) {
-      alpha_projection_guard_note_pps_backward(clock,
-                                               pps_sequence,
-                                               pps_dwt_at_edge,
-                                               h->previous.dwt_at_edge,
-                                               target_delta_signed_from_prev,
-                                               legacy_target_delta_from_prev);
-    }
-
-    if (target_delta_signed_from_prev >= 0 &&
-        actual_interval64 != 0 &&
+    if (actual_interval64 != 0 &&
         actual_interval64 <= 0xFFFFFFFFULL &&
-        (uint64_t)target_delta_signed_from_prev <= actual_interval64) {
+        (uint64_t)target_delta_from_prev <= actual_interval64) {
       if (alpha_ocxo_pps_projection_build(
               clock, ALPHA_OCXO_PPS_PROJECTION_SOURCE_ACTUAL_BRACKET,
               h->previous, h->current, (uint32_t)actual_interval64,
-              (uint32_t)target_delta_signed_from_prev,
+              target_delta_from_prev,
               pps_sequence, pps_dwt_at_edge, pps_vclock_ns, existing_pps_ns,
               latest_actual_interval_cycles, completed_interval_count,
               static_prediction_valid,
-              0U, legacy_target_delta_from_prev, 0U)) {
+              0U, target_delta_from_prev, 0U)) {
         return;
       }
     }
@@ -1919,62 +1911,25 @@ static void alpha_ocxo_pps_projection_compute(time_clock_id_t clock,
     return;
   }
 
-  const int32_t raw_target_delta_signed =
-      alpha_dwt32_signed_delta_near(h->current.dwt_at_edge, pps_dwt_at_edge);
-  const uint32_t raw_target_delta_legacy =
+  // Static projection path.
+  //
+  // The PPS/VCLOCK target can be one or two OCXO one-second intervals beyond
+  // the most recent observed OCXO edge.  At 1.008 GHz, two legal forward DWT
+  // intervals can exceed 2^31 cycles, so signed-near DWT classification is the
+  // wrong validity test.  Treat DWT32 as an ordered modular coordinate and
+  // repeatedly advance the synthetic edge by the measured one-second interval.
+  // If the target lands inside the bounded projected interval, the projection
+  // is valid.  If it still does not land after ALPHA_OCXO_PPS_STATIC_ADVANCE_LIMIT
+  // advances, only then declare TARGET_OUT_OF_WINDOW.
+  const uint32_t raw_target_delta =
       pps_dwt_at_edge - h->current.dwt_at_edge;
-
-  if (raw_target_delta_signed < 0) {
-    alpha_projection_guard_note_pps_backward(clock,
-                                             pps_sequence,
-                                             pps_dwt_at_edge,
-                                             h->current.dwt_at_edge,
-                                             raw_target_delta_signed,
-                                             raw_target_delta_legacy);
-    alpha_ocxo_pps_projection_set_invalid(
-        clock,
-        ALPHA_OCXO_PPS_PROJECTION_INVALID_TARGET_OUT_OF_WINDOW,
-        pps_sequence,
-        pps_dwt_at_edge,
-        pps_vclock_ns,
-        existing_pps_ns,
-        &h->current,
-        h->previous_valid ? &h->previous : nullptr,
-        latest_actual_interval_cycles,
-        completed_interval_count,
-        static_prediction_valid,
-        raw_target_delta_legacy,
-        raw_target_delta_legacy,
-        0U);
-    return;
-  }
-
-  if ((uint32_t)raw_target_delta_signed > alpha_projection_signed_window_cycles()) {
-    alpha_ocxo_pps_projection_set_invalid(
-        clock,
-        ALPHA_OCXO_PPS_PROJECTION_INVALID_TARGET_OUT_OF_WINDOW,
-        pps_sequence,
-        pps_dwt_at_edge,
-        pps_vclock_ns,
-        existing_pps_ns,
-        &h->current,
-        h->previous_valid ? &h->previous : nullptr,
-        latest_actual_interval_cycles,
-        completed_interval_count,
-        static_prediction_valid,
-        raw_target_delta_legacy,
-        raw_target_delta_legacy,
-        0U);
-    return;
-  }
-
   const uint32_t raw_target_overrun =
-      ((uint32_t)raw_target_delta_signed > latest_actual_interval_cycles)
-          ? ((uint32_t)raw_target_delta_signed - latest_actual_interval_cycles)
+      (raw_target_delta > latest_actual_interval_cycles)
+          ? (raw_target_delta - latest_actual_interval_cycles)
           : 0U;
 
   alpha_ocxo_edge_fact_t edge0 = h->current;
-  uint32_t target_delta = (uint32_t)raw_target_delta_signed;
+  uint32_t target_delta = raw_target_delta;
   uint32_t static_advance_count = 0;
 
   while (target_delta > latest_actual_interval_cycles &&
@@ -1982,49 +1937,19 @@ static void alpha_ocxo_pps_projection_compute(time_clock_id_t clock,
     edge0 = alpha_ocxo_project_static_next_edge(edge0,
                                                 latest_actual_interval_cycles);
     static_advance_count++;
-
-    const int32_t signed_from_advanced =
-        alpha_dwt32_signed_delta_near(edge0.dwt_at_edge, pps_dwt_at_edge);
-    const uint32_t legacy_from_advanced =
-        pps_dwt_at_edge - edge0.dwt_at_edge;
-
-    if (signed_from_advanced < 0) {
-      alpha_projection_guard_note_pps_backward(clock,
-                                               pps_sequence,
-                                               pps_dwt_at_edge,
-                                               edge0.dwt_at_edge,
-                                               signed_from_advanced,
-                                               legacy_from_advanced);
-      alpha_ocxo_pps_projection_set_invalid(
-          clock,
-          ALPHA_OCXO_PPS_PROJECTION_INVALID_TARGET_OUT_OF_WINDOW,
-          pps_sequence,
-          pps_dwt_at_edge,
-          pps_vclock_ns,
-          existing_pps_ns,
-          &edge0,
-          nullptr,
-          latest_actual_interval_cycles,
-          completed_interval_count,
-          static_prediction_valid,
-          raw_target_delta_legacy,
-          legacy_from_advanced,
-          static_advance_count);
-      return;
-    }
-
-    target_delta = (uint32_t)signed_from_advanced;
+    target_delta = pps_dwt_at_edge - edge0.dwt_at_edge;
   }
 
   if (target_delta > latest_actual_interval_cycles) {
-    const uint32_t unresolved_overrun = target_delta - latest_actual_interval_cycles;
+    const uint32_t unresolved_overrun =
+        target_delta - latest_actual_interval_cycles;
     alpha_ocxo_pps_projection_set_invalid(
         clock, ALPHA_OCXO_PPS_PROJECTION_INVALID_TARGET_OUT_OF_WINDOW,
         pps_sequence, pps_dwt_at_edge, pps_vclock_ns, existing_pps_ns,
         &edge0, nullptr,
         latest_actual_interval_cycles, completed_interval_count,
         static_prediction_valid,
-        raw_target_delta_legacy, unresolved_overrun, static_advance_count);
+        raw_target_delta, unresolved_overrun, static_advance_count);
     return;
   }
 
@@ -2037,14 +1962,14 @@ static void alpha_ocxo_pps_projection_compute(time_clock_id_t clock,
           target_delta, pps_sequence, pps_dwt_at_edge, pps_vclock_ns,
           existing_pps_ns, latest_actual_interval_cycles,
           completed_interval_count, static_prediction_valid,
-          static_advance_count, raw_target_delta_legacy, raw_target_overrun)) {
+          static_advance_count, raw_target_delta, raw_target_overrun)) {
     alpha_ocxo_pps_projection_set_invalid(
         clock, ALPHA_OCXO_PPS_PROJECTION_INVALID_NO_INTERVAL,
         pps_sequence, pps_dwt_at_edge, pps_vclock_ns, existing_pps_ns,
         &edge0, &projected_next,
         latest_actual_interval_cycles, completed_interval_count,
         static_prediction_valid,
-        raw_target_delta_legacy, raw_target_overrun, static_advance_count);
+        raw_target_delta, raw_target_overrun, static_advance_count);
   }
 }
 
