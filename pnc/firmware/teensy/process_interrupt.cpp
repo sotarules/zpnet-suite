@@ -87,6 +87,11 @@ void clocks_watchdog_anomaly(const char* reason,
 // Constants
 // ============================================================================
 
+// Memory-pressure trim profile.  Keep the new priority-handoff forensics intact,
+// but retire bulky legacy diagnostic buffers that are no longer part of timing
+// authority.
+static constexpr bool INTERRUPT_REDUCED_DIAGNOSTICS = true;
+
 // The GPIO/QTimer latency constants are measured by the latency calibration
 // process as full software-stimulus-to-ISR paths.  process_interrupt needs the
 // event-coordinate ISR-entry correction, so subtract the known software pin
@@ -295,10 +300,16 @@ static constexpr uint32_t REGRESSION_SAMPLE_REPORT_EXTREME_LIMIT = 4;
 static_assert(REGRESSION_SAMPLES_PER_SECOND == 1000U,
               "Regression windows are expected to be 1 kHz / one second");
 
+
 // VCLOCK regression remains disabled until it gets a non-dropping double-buffered
 // 1000-sample window.  The old 32-slot fact ring proved too small for the 1 kHz
 // VCLOCK rail and must not participate in timing authority.
 static constexpr bool VCLOCK_LINEAR_REGRESSION_ENABLED = false;
+static constexpr bool REGRESSION_ANY_ENABLED =
+    VCLOCK_LINEAR_REGRESSION_ENABLED || OCXO_LINEAR_REGRESSION_ENABLED;
+static constexpr uint32_t REGRESSION_RETAINED_SAMPLE_COUNT =
+    REGRESSION_ANY_ENABLED ? REGRESSION_SAMPLES_PER_SECOND : 1U;
+
 
 // Regression is experimental/diagnostic in this build.  The subscriber-facing
 // DWT stays traditional while regression_inferred_dwt_at_event exposes what the
@@ -383,15 +394,15 @@ static constexpr uint32_t HANDOFF_PPS_RING_SIZE = 4U;
 // expand interrupt_capture_diag_t.
 
 static constexpr bool SPINCATCH_REPORT_SHELL_SUPPORTED = true;
-static constexpr bool SPINCATCH_PLANNER_ENABLED = true;
+static constexpr bool SPINCATCH_PLANNER_ENABLED = false;
 static constexpr bool SPINCATCH_VCLOCK_ENABLED = false;
-static constexpr bool SPINCATCH_OCXO_LANDING_ONLY_ENABLED = true;
-static constexpr const char* SPINCATCH_REPORT_MODE = "OCXO_SYMMETRIC_LANDING_ONLY_NO_SPIN";
+static constexpr bool SPINCATCH_OCXO_LANDING_ONLY_ENABLED = false;
+static constexpr const char* SPINCATCH_REPORT_MODE = "RETIRED_MEMORY_TRIM";
 static constexpr uint32_t SPINCATCH_APPROACH_US = 10U;
 static constexpr uint32_t SPINCATCH_APPROACH_TICKS = SPINCATCH_APPROACH_US * 10U;
 static constexpr uint32_t SPINCATCH_OCXO_LANDING_DUTY_DIVISOR = 1U;
 static constexpr uint32_t SPINCATCH_LANDING_MIN_LEAD_TICKS = 128U;
-static constexpr uint32_t SPINCATCH_LANDING_ATTEMPT_RING_SIZE = 4U;
+static constexpr uint32_t SPINCATCH_LANDING_ATTEMPT_RING_SIZE = 1U;
 static constexpr uint32_t SPINCATCH_LANDING_STALE_TARGET_PERIODS = 2U;
 static_assert(SPINCATCH_APPROACH_TICKS == 100U,
               "SpinCatch 10 us approach must be 100 ticks at 10 MHz");
@@ -3669,7 +3680,7 @@ struct cadence_regression_lane_t {
   bool previous_slope_valid = false;
   double previous_slope_cycles_per_sample = 0.0;
 
-  int32_t observed_dwt_rel[REGRESSION_SAMPLES_PER_SECOND]{};
+  int32_t observed_dwt_rel[REGRESSION_RETAINED_SAMPLE_COUNT]{};
   cadence_regression_result_t last_result{};
 };
 
@@ -3865,6 +3876,15 @@ cadence_regression_finalize(cadence_regression_lane_t& r,
 static cadence_regression_result_t
 cadence_regression_feed_sample(interrupt_subscriber_kind_t kind,
                                const cadence_regression_sample_t& sample) {
+  (void)sample;
+  if ((kind == interrupt_subscriber_kind_t::VCLOCK &&
+       !VCLOCK_LINEAR_REGRESSION_ENABLED) ||
+      ((kind == interrupt_subscriber_kind_t::OCXO1 ||
+        kind == interrupt_subscriber_kind_t::OCXO2) &&
+       !OCXO_LINEAR_REGRESSION_ENABLED)) {
+    return cadence_regression_result_t{};
+  }
+
   cadence_regression_lane_t* r = cadence_regression_for(kind);
   if (!r) return cadence_regression_result_t{};
 
@@ -4125,7 +4145,7 @@ static void emit_one_second_event(interrupt_subscriber_runtime_t& rt,
 // VCLOCK perishable cadence fact ring
 // ============================================================================
 
-static constexpr uint32_t VCLOCK_PERISHABLE_FACT_RING_SIZE = 32;
+static constexpr uint32_t VCLOCK_PERISHABLE_FACT_RING_SIZE = 8;
 static constexpr const char* VCLOCK_FACT_DRAIN_NAME = "VCLOCK_FACT_DRAIN";
 
 struct vclock_perishable_fact_t {
@@ -5198,7 +5218,7 @@ static void ocxo_lane_disable_compare(ocxo_lane_t& lane) {
 // The ring remains per-lane and loss-visible, with a normal publication rate
 // of 1 Hz per active OCXO lane.
 
-static constexpr uint32_t OCXO_PERISHABLE_FACT_RING_SIZE = 32;
+static constexpr uint32_t OCXO_PERISHABLE_FACT_RING_SIZE = 8;
 
 struct interrupt_perishable_fact_t {
   interrupt_subscriber_kind_t kind = interrupt_subscriber_kind_t::NONE;
@@ -8321,7 +8341,7 @@ struct payload_prefix_t {
   }
 };
 
-static void spincatch_plan_from_target(spincatch_lane_report_t& s,
+static FLASHMEM void spincatch_plan_from_target(spincatch_lane_report_t& s,
                                        bool target_valid,
                                        uint32_t target_counter32,
                                        uint16_t target_low16,
@@ -8352,7 +8372,7 @@ static void spincatch_plan_from_target(spincatch_lane_report_t& s,
   s.planner_count++;
 }
 
-static void spincatch_update_planner_for_report(interrupt_subscriber_kind_t kind) {
+static FLASHMEM void spincatch_update_planner_for_report(interrupt_subscriber_kind_t kind) {
   spincatch_lane_report_t* s = spincatch_report_for_kind(kind);
   if (!s || !SPINCATCH_PLANNER_ENABLED) return;
 
@@ -8388,7 +8408,7 @@ static void spincatch_update_planner_for_report(interrupt_subscriber_kind_t kind
                              ctx->clock32->current_counter32);
 }
 
-static void add_spincatch_report_payload(Payload& p,
+static FLASHMEM void add_spincatch_report_payload(Payload& p,
                                          interrupt_subscriber_kind_t kind) {
   spincatch_update_planner_for_report(kind);
   spincatch_lane_report_t* s_mut = spincatch_report_for_kind(kind);
@@ -8457,7 +8477,7 @@ static void add_spincatch_report_payload(Payload& p,
   p.add("spincatch_landing_fire_dwt", s ? s->landing_fire_dwt : 0U);
 }
 
-static void add_isr_sanity_payload(Payload& p,
+static FLASHMEM void add_isr_sanity_payload(Payload& p,
                                    const char* prefix,
                                    const isr_sanity_diag_t& s) {
   payload_prefix_t out(p, prefix);
@@ -8473,7 +8493,7 @@ static void add_isr_sanity_payload(Payload& p,
   out.add_u32("dwt_actual", s.dwt_actual);
 }
 
-static void add_bridge_stats_payload(Payload& p,
+static FLASHMEM void add_bridge_stats_payload(Payload& p,
                                      const char* prefix,
                                      const bridge_anchor_stats_t& s) {
   payload_prefix_t out(p, prefix);
@@ -8489,7 +8509,7 @@ static void add_bridge_stats_payload(Payload& p,
   out.add_u32("anchor_last_failure_mask", s.last_anchor_failure_mask);
 }
 
-static void add_regression_payload(Payload& p,
+static FLASHMEM void add_regression_payload(Payload& p,
                                    const char* prefix,
                                    const cadence_regression_lane_t& r) {
   payload_prefix_t out(p, prefix);
@@ -8540,11 +8560,11 @@ static void add_regression_payload(Payload& p,
               last.fit_error_abs_gt4_count);
 }
 
-static uint32_t regression_abs_i32(int32_t value) {
+static FLASHMEM uint32_t regression_abs_i32(int32_t value) {
   return (uint32_t)(value < 0 ? -(int64_t)value : (int64_t)value);
 }
 
-static interrupt_subscriber_kind_t regression_kind_from_lane_arg(const char* lane) {
+static FLASHMEM interrupt_subscriber_kind_t regression_kind_from_lane_arg(const char* lane) {
   if (!lane || !*lane) return interrupt_subscriber_kind_t::NONE;
   if (!strcasecmp(lane, "VCLOCK") || !strcasecmp(lane, "VCLK")) {
     return interrupt_subscriber_kind_t::VCLOCK;
@@ -8558,7 +8578,7 @@ static interrupt_subscriber_kind_t regression_kind_from_lane_arg(const char* lan
   return interrupt_subscriber_kind_t::NONE;
 }
 
-static bool regression_live_fit_params(const cadence_regression_lane_t& r,
+static FLASHMEM bool regression_live_fit_params(const cadence_regression_lane_t& r,
                                        double& slope,
                                        double& intercept) {
   const uint32_t n = r.sample_count;
@@ -8594,7 +8614,7 @@ static bool regression_live_fit_params(const cadence_regression_lane_t& r,
   return true;
 }
 
-static int32_t regression_live_fit_error_cycles(const cadence_regression_lane_t& r,
+static FLASHMEM int32_t regression_live_fit_error_cycles(const cadence_regression_lane_t& r,
                                                 uint32_t index,
                                                 double slope,
                                                 double intercept) {
@@ -8604,7 +8624,7 @@ static int32_t regression_live_fit_error_cycles(const cadence_regression_lane_t&
   return regression_round_i32(err_d);
 }
 
-static void regression_append_csv_u32(char* buf, size_t len,
+static FLASHMEM void regression_append_csv_u32(char* buf, size_t len,
                                       uint32_t& used,
                                       uint32_t value) {
   if (used >= len) return;
@@ -8617,7 +8637,7 @@ static void regression_append_csv_u32(char* buf, size_t len,
   }
 }
 
-static void regression_append_csv_i32(char* buf, size_t len,
+static FLASHMEM void regression_append_csv_i32(char* buf, size_t len,
                                       uint32_t& used,
                                       int32_t value) {
   if (used >= len) return;
@@ -8630,7 +8650,7 @@ static void regression_append_csv_i32(char* buf, size_t len,
   }
 }
 
-static void add_regression_sample_scalar(Payload& p,
+static FLASHMEM void add_regression_sample_scalar(Payload& p,
                                          const cadence_regression_lane_t& r,
                                          uint32_t index,
                                          uint32_t ordinal,
@@ -8664,7 +8684,7 @@ static void add_regression_sample_scalar(Payload& p,
   p.add(key, fit_valid ? regression_abs_i32(fit_error) : 0U);
 }
 
-static void add_regression_extreme_csv(Payload& p,
+static FLASHMEM void add_regression_extreme_csv(Payload& p,
                                        const cadence_regression_lane_t& r,
                                        bool best,
                                        bool fit_valid,
@@ -8717,7 +8737,7 @@ static void add_regression_extreme_csv(Payload& p,
 // Commands
 // ============================================================================
 
-static void add_priority_payload(Payload& p) {
+static FLASHMEM void add_priority_payload(Payload& p) {
   p.add("qtimer1_sovereign_priority_expected", INTERRUPT_STEP0_EXPECTED_QTIMER1_PRIORITY);
   p.add("qtimer1_sovereign_priority_applied", g_step0_qtimer1_priority_applied);
   p.add("qtimer1_sovereign_priority_ok",
@@ -8751,10 +8771,13 @@ static void add_priority_payload(Payload& p) {
   p.add("handoff_irq_name", INTERRUPT_HANDOFF_IRQ_NAME);
 }
 
-static void add_runtime_payload(Payload& p) {
+static FLASHMEM void add_runtime_payload(Payload& p) {
   p.add("hardware_ready", g_interrupt_hw_ready);
   p.add("runtime_ready",  g_interrupt_runtime_ready);
   p.add("irqs_enabled",   g_interrupt_irqs_enabled);
+  p.add("reduced_diagnostics_enabled", INTERRUPT_REDUCED_DIAGNOSTICS);
+  p.add("regression_retained_sample_count", REGRESSION_RETAINED_SAMPLE_COUNT);
+  p.add("spincatch_diagnostics_retired", !SPINCATCH_OCXO_LANDING_ONLY_ENABLED);
   p.add("ocxo_disable_experiment", OCXO_DISABLE_EXPERIMENT);
   p.add("ocxo_disabled_count", OCXO_DISABLED_COUNT);
   p.add("ocxo1_disabled", OCXO1_DISABLED);
@@ -8795,6 +8818,9 @@ static void add_runtime_payload(Payload& p) {
   p.add("lane_report_command", "INTERRUPT.REPORT_LANES");
   p.add("single_lane_report_command", "INTERRUPT.REPORT_LANE lane=VCLOCK|OCXO1|OCXO2");
   p.add("regression_samples_report_command", "disabled");
+  p.add("reduced_diagnostics_enabled", INTERRUPT_REDUCED_DIAGNOSTICS);
+  p.add("regression_retained_sample_count", REGRESSION_RETAINED_SAMPLE_COUNT);
+  p.add("spincatch_diagnostics_retired", !SPINCATCH_OCXO_LANDING_ONLY_ENABLED);
   p.add("capture_discipline", INTERRUPT_CAPTURE_DISCIPLINE);
   p.add("handoff_mechanism", INTERRUPT_HANDOFF_MECHANISM);
   p.add("handoff_irq", INTERRUPT_HANDOFF_IRQ_NUMBER);
@@ -8802,7 +8828,7 @@ static void add_runtime_payload(Payload& p) {
   p.add("handoff_report_command", "INTERRUPT.REPORT_HANDOFF");
 }
 
-static void add_ocxo_cadence_report_payload(Payload& p,
+static FLASHMEM void add_ocxo_cadence_report_payload(Payload& p,
                                            const ocxo_runtime_context_t& ctx) {
   const ocxo_lane_t& lane = *ctx.lane;
   payload_prefix_t out(p, ctx.prefix);
@@ -8825,7 +8851,7 @@ static void add_ocxo_cadence_report_payload(Payload& p,
               ocxo_cadence_reason_name(lane.cadence_last_reason));
 }
 
-static void add_vclock_heartbeat_payload(Payload& p) {
+static FLASHMEM void add_vclock_heartbeat_payload(Payload& p) {
   p.add("vclock_heartbeat_period_ns", (uint64_t)VCLOCK_HEARTBEAT_PERIOD_NS);
   p.add("vclock_heartbeat_armed", g_vclock_heartbeat_armed);
   p.add("vclock_heartbeat_arm_count", g_vclock_heartbeat_arm_count);
@@ -8942,7 +8968,7 @@ static void add_vclock_heartbeat_payload(Payload& p) {
   add_ocxo_cadence_report_payload(p, g_ocxo1_ctx);
   add_ocxo_cadence_report_payload(p, g_ocxo2_ctx);
 }
-static void add_pps_payload(Payload& p) {
+static FLASHMEM void add_pps_payload(Payload& p) {
   p.add("gpio_irq_count", g_gpio_irq_count);
   p.add("gpio_miss_count", g_gpio_miss_count);
   p.add("gpio_edge_count", g_pps_gpio_heartbeat.edge_count);
@@ -9029,7 +9055,7 @@ static void add_pps_payload(Payload& p) {
   p.add("pps_edge_dispatch_registered", g_pps_edge_dispatch != nullptr);
 }
 
-static void add_epoch_capture_payload(Payload& p) {
+static FLASHMEM void add_epoch_capture_payload(Payload& p) {
   interrupt_epoch_capture_t epoch_cap{};
   const bool epoch_cap_ok = interrupt_last_epoch_capture(&epoch_cap);
   p.add("epoch_capture_available", epoch_cap_ok);
@@ -9048,7 +9074,7 @@ static void add_epoch_capture_payload(Payload& p) {
   p.add("epoch_capture_ocxo2_counter32", epoch_cap.ocxo2_counter32);
 }
 
-static void add_dynamic_cps_payload(Payload& p) {
+static FLASHMEM void add_dynamic_cps_payload(Payload& p) {
   const uint32_t dynamic_cps = interrupt_dynamic_cps();
   p.add("dynamic_cps_owner", "CLOCKS_STATIC_PPS");
   p.add("dynamic_cps", dynamic_cps);
@@ -9060,7 +9086,7 @@ static void add_dynamic_cps_payload(Payload& p) {
 }
 
 
-static void add_smartzero_lane_payload(Payload& parent,
+static FLASHMEM void add_smartzero_lane_payload(Payload& parent,
                                        const char* key,
                                        const interrupt_smartzero_lane_snapshot_t& z) {
   Payload p;
@@ -9097,7 +9123,7 @@ static void add_smartzero_lane_payload(Payload& parent,
   parent.add_object(key, p);
 }
 
-static void add_smartzero_payload(Payload& p) {
+static FLASHMEM void add_smartzero_payload(Payload& p) {
   interrupt_smartzero_snapshot_t z{};
   (void)interrupt_smartzero_live_snapshot(&z);
 
@@ -9145,7 +9171,7 @@ static void add_smartzero_payload(Payload& p) {
   p.add_object("smartzero", legacy_lanes);  // legacy live alias
 }
 
-static void add_vclock_clock32_payload(Payload& p, const char* prefix) {
+static FLASHMEM void add_vclock_clock32_payload(Payload& p, const char* prefix) {
   payload_prefix_t out(p, prefix);
 
   out.add_bool("clock32_zeroed", g_vclock_clock32.zeroed);
@@ -9161,7 +9187,7 @@ static void add_vclock_clock32_payload(Payload& p, const char* prefix) {
   out.add_u32("clock32_minder_update_count", g_vclock_clock32.minder_update_count);
   out.add_u32("clock32_pending_zero_count", g_vclock_clock32.pending_zero_count);
 }
-static void add_ocxo_clock32_payload(Payload& p,
+static FLASHMEM void add_ocxo_clock32_payload(Payload& p,
                                      const char* prefix,
                                      const synthetic_clock32_t& clock32) {
   payload_prefix_t out(p, prefix);
@@ -9174,7 +9200,7 @@ static void add_ocxo_clock32_payload(Payload& p,
   out.add_u32("clock32_zero_count", clock32.zero_count);
   out.add_u32("clock32_minder_update_count", clock32.minder_update_count);
 }
-static void add_runtime_lane_summary(Payload& p,
+static FLASHMEM void add_runtime_lane_summary(Payload& p,
                                      const char* prefix,
                                      const interrupt_subscriber_runtime_t* rt) {
   payload_prefix_t out(p, prefix);
@@ -9236,7 +9262,7 @@ static void add_runtime_lane_summary(Payload& p,
     out.add_u32("last_diag_anchor_failure_mask", 0);
   }
 }
-static void add_vclock_lane_payload(Payload& p, bool detailed) {
+static FLASHMEM void add_vclock_lane_payload(Payload& p, bool detailed) {
   p.add("lane", "VCLOCK");
   p.add("kind", "VCLOCK");
   p.add("provider", "QTIMER1");
@@ -9373,7 +9399,7 @@ static void add_vclock_lane_payload(Payload& p, bool detailed) {
   p.add("qtimer1_ch2_arm_count", g_qtimer1_ch2_arm_count);
 }
 
-static void add_ocxo_identity_payload(Payload& p,
+static FLASHMEM void add_ocxo_identity_payload(Payload& p,
                                       const ocxo_runtime_context_t& ctx) {
   p.add("lane", ctx.name);
   p.add("kind", ctx.name);
@@ -9385,7 +9411,7 @@ static void add_ocxo_identity_payload(Payload& p,
   p.add("dwt_authority", ctx.dwt_authority);
 }
 
-static void add_ocxo_lane_basic_payload(payload_prefix_t& out,
+static FLASHMEM void add_ocxo_lane_basic_payload(payload_prefix_t& out,
                                         const ocxo_lane_t& lane) {
   out.add_bool("initialized", lane.initialized);
   out.add_bool("active", lane.active);
@@ -9437,7 +9463,7 @@ static void add_ocxo_lane_basic_payload(payload_prefix_t& out,
   out.add_u32("witness_last_arm_remaining_ticks", lane.witness_last_arm_remaining_ticks);
 }
 
-static void add_ocxo_witness_service_payload(payload_prefix_t& out,
+static FLASHMEM void add_ocxo_witness_service_payload(payload_prefix_t& out,
                                              const ocxo_lane_t& lane) {
   out.add_u32("witness_last_target_delta_mod65536_ticks",
               lane.witness_last_target_delta_mod65536_ticks);
@@ -9513,7 +9539,7 @@ static void add_ocxo_witness_service_payload(payload_prefix_t& out,
               ocxo_schedule_decision_name(lane.witness_schedule_last_decision));
 }
 
-static void add_ocxo_cadence_sample_payload(payload_prefix_t& out,
+static FLASHMEM void add_ocxo_cadence_sample_payload(payload_prefix_t& out,
                                             const ocxo_lane_t& lane) {
   out.add_u32("cadence_last_target_counter32", lane.cadence_last_target_counter32);
   out.add_u32("cadence_last_target_low16", (uint32_t)lane.cadence_last_target_low16);
@@ -9538,7 +9564,7 @@ static void add_ocxo_cadence_sample_payload(payload_prefix_t& out,
   out.add_i32("ema_last_error_cycles", lane.ema_last_error_cycles);
 }
 
-static void add_ocxo_witness_detail_payload(payload_prefix_t& out,
+static FLASHMEM void add_ocxo_witness_detail_payload(payload_prefix_t& out,
                                             const ocxo_lane_t& lane) {
   out.add_u32("witness_schedule_last_current_counter32",
               lane.witness_schedule_last_current_counter32);
@@ -9621,7 +9647,7 @@ static void add_ocxo_witness_detail_payload(payload_prefix_t& out,
                lane.witness_last_arm_to_isr_ticks <= 256U);
 }
 
-static void add_ocxo_qtimer_payload(payload_prefix_t& out,
+static FLASHMEM void add_ocxo_qtimer_payload(payload_prefix_t& out,
                                     const ocxo_runtime_context_t& ctx,
                                     const ocxo_qtimer_diag_t& qdiag) {
   const ocxo_lane_t& lane = *ctx.lane;
@@ -9654,7 +9680,7 @@ static void add_ocxo_qtimer_payload(payload_prefix_t& out,
               qdiag.dwt_coordinate_source);
 }
 
-static void add_ocxo_perishable_ring_payload(payload_prefix_t& out,
+static FLASHMEM void add_ocxo_perishable_ring_payload(payload_prefix_t& out,
                                              const ocxo_runtime_context_t& ctx) {
   const ocxo_perishable_ring_t& ring = ocxo_fact_ring_for(ctx);
 
@@ -9669,7 +9695,7 @@ static void add_ocxo_perishable_ring_payload(payload_prefix_t& out,
   out.add_bool("perishable_fact_drain_armed", ring.drain_armed);
 }
 
-static void add_ocxo_lane_payload(Payload& p,
+static FLASHMEM void add_ocxo_lane_payload(Payload& p,
                                   const ocxo_runtime_context_t& ctx,
                                   bool detailed) {
   const ocxo_lane_t& lane = *ctx.lane;
@@ -9698,7 +9724,7 @@ static void add_ocxo_lane_payload(Payload& p,
   const cadence_regression_lane_t* regression = cadence_regression_for_const(ctx.kind);
   if (regression) add_regression_payload(p, ctx.prefix, *regression);
 }
-static void add_ocxo_compact_payload(Payload& p,
+static FLASHMEM void add_ocxo_compact_payload(Payload& p,
                                      const ocxo_runtime_context_t& ctx) {
   const interrupt_subscriber_runtime_t* rt = ocxo_runtime_for(ctx);
   const ocxo_lane_t& lane = *ctx.lane;
@@ -9788,7 +9814,7 @@ static void add_ocxo_compact_payload(Payload& p,
   }
 }
 
-static void add_handoff_source_payload(Payload& p,
+static FLASHMEM void add_handoff_source_payload(Payload& p,
                                        const char* prefix,
                                        const interrupt_handoff_source_diag_t& d,
                                        uint32_t capacity) {
@@ -9811,7 +9837,7 @@ static void add_handoff_source_payload(Payload& p,
   out.add_u32("handoff_body_cycles_max", d.max_handoff_body_cycles);
 }
 
-static void add_handoff_payload(Payload& p) {
+static FLASHMEM void add_handoff_payload(Payload& p) {
   const uint32_t irq = INTERRUPT_HANDOFF_IRQ_NUMBER;
   const uint32_t mask = interrupt_nvic_irq_mask(irq);
   const uint32_t iser = interrupt_nvic_iser_word(irq);
@@ -10051,7 +10077,7 @@ static FLASHMEM Payload cmd_report_smartzero(const Payload&) {
   return p;
 }
 
-static void add_pvc_anchor_entry_payload(Payload& p,
+static FLASHMEM void add_pvc_anchor_entry_payload(Payload& p,
                                          const char* prefix,
                                          const pvc_anchor_record_t& a,
                                          bool present) {
@@ -10070,7 +10096,7 @@ static void add_pvc_anchor_entry_payload(Payload& p,
   out.add_u32("cps", present ? a.cps : 0U);
 }
 
-static void add_bridge_payload(Payload& p) {
+static FLASHMEM void add_bridge_payload(Payload& p) {
   p.add("pvc_anchor_ring_count", g_pvc_anchor_count);
   p.add("pvc_anchor_ring_head", g_pvc_anchor_head);
   p.add("pvc_anchor_ring_seq", g_pvc_anchor_seq);
@@ -10151,7 +10177,7 @@ static FLASHMEM Payload cmd_report_bridge(const Payload&) {
   return p;
 }
 
-static void add_lane_summary_object(Payload& parent,
+static FLASHMEM void add_lane_summary_object(Payload& parent,
                                     const char* key,
                                     const char* name,
                                     const interrupt_subscriber_runtime_t* rt,
@@ -10216,7 +10242,7 @@ static void add_lane_summary_object(Payload& parent,
   parent.add_object(key, lane);
 }
 
-static void add_ocxo_lane_summary_object(Payload& parent,
+static FLASHMEM void add_ocxo_lane_summary_object(Payload& parent,
                                          const char* key,
                                          const ocxo_runtime_context_t& ctx) {
   const interrupt_subscriber_runtime_t* rt = ocxo_runtime_for(ctx);
@@ -10308,7 +10334,7 @@ static void add_ocxo_lane_summary_object(Payload& parent,
   parent.add_object(key, o);
 }
 
-static void add_idle_dwt_witness_payload(Payload& p) {
+static FLASHMEM void add_idle_dwt_witness_payload(Payload& p) {
   timepop_idle_witness_snapshot_t idle{};
   timepop_idle_witness_snapshot(&idle);
   p.add("idle_dwt_witness_supported", idle.supported);
@@ -10343,14 +10369,14 @@ static const char* REPORT_LANE_VCLOCK_SECTIONS =
 static const char* REPORT_LANE_OCXO_SECTIONS =
     "summary ema service scheduler witness qtimer ring clock32 regression spincatch isr";
 
-static const char* report_lane_section_arg(const Payload& args) {
+static FLASHMEM const char* report_lane_section_arg(const Payload& args) {
   const char* section = args.getString("section");
   if (!section || !*section) section = args.getString("detail");
   if (!section || !*section) section = "summary";
   return section;
 }
 
-static void add_report_lane_header(Payload& p,
+static FLASHMEM void add_report_lane_header(Payload& p,
                                    const char* lane,
                                    const char* section,
                                    const char* sections) {
@@ -10361,11 +10387,11 @@ static void add_report_lane_header(Payload& p,
   p.add("usage", "INTERRUPT.REPORT_LANE lane=VCLOCK|OCXO1|OCXO2 section=<section>");
 }
 
-static bool report_lane_section_is(const char* section, const char* name) {
+static FLASHMEM bool report_lane_section_is(const char* section, const char* name) {
   return section && name && !strcasecmp(section, name);
 }
 
-static void add_vclock_lane_summary_section(Payload& p) {
+static FLASHMEM void add_vclock_lane_summary_section(Payload& p) {
   p.add("kind", "VCLOCK");
   p.add("provider", "QTIMER1");
   p.add("hardware_lane", "QTIMER1_CH2_COMP");
@@ -10394,7 +10420,7 @@ static void add_vclock_lane_summary_section(Payload& p) {
   add_isr_sanity_payload(p, "isr_sanity", g_isr_sanity_vclock_ch2);
 }
 
-static void add_vclock_lane_ema_section(Payload& p) {
+static FLASHMEM void add_vclock_lane_ema_section(Payload& p) {
   p.add("vclock_ema_dwt_authority_enabled", VCLOCK_EMA_DWT_AUTHORITY_ENABLED);
   p.add("vclock_ema_alpha_numerator", VCLOCK_EMA_ALPHA_NUMERATOR);
   p.add("vclock_ema_alpha_denominator", VCLOCK_EMA_ALPHA_DENOMINATOR);
@@ -10449,7 +10475,7 @@ static void add_vclock_lane_ema_section(Payload& p) {
   p.add("vclock_dwt_repair_max_abs_error_cycles", g_vclock_repair_stats.max_abs_error_cycles);
 }
 
-static void add_vclock_lane_ch2_section(Payload& p) {
+static FLASHMEM void add_vclock_lane_ch2_section(Payload& p) {
   p.add("vclock_ch2_one_second_enabled", g_vclock_ch2_one_second_enabled);
   p.add("vclock_ch2_one_second_next_counter32", g_vclock_ch2_one_second_next_counter32);
   p.add("vclock_ch2_one_second_enable_count", g_vclock_ch2_one_second_enable_count);
@@ -10472,7 +10498,7 @@ static void add_vclock_lane_ch2_section(Payload& p) {
   p.add("vclock_heartbeat_one_second_fallback_count", g_vclock_heartbeat_one_second_fallback_count);
 }
 
-static void add_vclock_lane_epoch_section(Payload& p) {
+static FLASHMEM void add_vclock_lane_epoch_section(Payload& p) {
   p.add("vclock_ch2_epoch_native_enabled", VCLOCK_CH2_EPOCH_NATIVE_ENABLED);
   p.add("vclock_ch2_epoch_native_service_count", g_vclock_ch2_epoch_native_service_count);
   p.add("vclock_ch2_epoch_native_publish_count", g_vclock_ch2_epoch_native_publish_count);
@@ -10491,7 +10517,7 @@ static void add_vclock_lane_epoch_section(Payload& p) {
   p.add("vclock_heartbeat_epoch_pending_skip_count", g_vclock_heartbeat_epoch_pending_skip_count);
 }
 
-static void add_vclock_lane_smartzero_section(Payload& p) {
+static FLASHMEM void add_vclock_lane_smartzero_section(Payload& p) {
   p.add("vclock_ch2_smartzero_native_enabled", VCLOCK_CH2_SMARTZERO_NATIVE_ENABLED);
   p.add("vclock_ch2_smartzero_seeded", g_vclock_ch2_smartzero_seeded);
   p.add("vclock_ch2_smartzero_next_counter32", g_vclock_ch2_smartzero_next_counter32);
@@ -10516,7 +10542,7 @@ static void add_vclock_lane_smartzero_section(Payload& p) {
   p.add("vclock_ch2_smartzero_last_late_ticks", g_vclock_ch2_smartzero_last_late_ticks);
 }
 
-static void add_vclock_lane_fact_ring_section(Payload& p) {
+static FLASHMEM void add_vclock_lane_fact_ring_section(Payload& p) {
   p.add("vclock_perishable_fact_ring_size", VCLOCK_PERISHABLE_FACT_RING_SIZE);
   p.add("vclock_perishable_fact_ring_count", g_vclock_fact_ring.count);
   p.add("vclock_perishable_fact_enqueue_count", g_vclock_fact_ring.enqueue_count);
@@ -10528,7 +10554,7 @@ static void add_vclock_lane_fact_ring_section(Payload& p) {
   p.add("vclock_perishable_fact_drain_armed", g_vclock_fact_ring.drain_armed);
 }
 
-static void add_vclock_lane_qtimer_section(Payload& p) {
+static FLASHMEM void add_vclock_lane_qtimer_section(Payload& p) {
   p.add("qtimer1_ch1_active", g_qtimer1_ch1_active);
   p.add("qtimer1_ch1_sequence", g_qtimer1_ch1_sequence);
   p.add("qtimer1_ch1_target_counter32", g_qtimer1_ch1_target_counter32);
@@ -10545,7 +10571,7 @@ static void add_vclock_lane_qtimer_section(Payload& p) {
   p.add("ch2_implicit_rollover_last_vclock_counter32", g_ch2_implicit_rollover_last_vclock_counter32);
 }
 
-static bool add_vclock_lane_section(Payload& p, const char* section) {
+static FLASHMEM bool add_vclock_lane_section(Payload& p, const char* section) {
   if (report_lane_section_is(section, "summary")) {
     add_vclock_lane_summary_section(p);
   } else if (report_lane_section_is(section, "ema")) {
@@ -10575,13 +10601,13 @@ static bool add_vclock_lane_section(Payload& p, const char* section) {
   return true;
 }
 
-static void add_ocxo_lane_summary_section(Payload& p,
+static FLASHMEM void add_ocxo_lane_summary_section(Payload& p,
                                           const ocxo_runtime_context_t& ctx) {
   add_ocxo_identity_payload(p, ctx);
   add_ocxo_compact_payload(p, ctx);
 }
 
-static void add_ocxo_lane_ema_section(Payload& p,
+static FLASHMEM void add_ocxo_lane_ema_section(Payload& p,
                                       const ocxo_runtime_context_t& ctx) {
   const ocxo_lane_t& lane = *ctx.lane;
   const interrupt_subscriber_runtime_t* rt = ocxo_runtime_for(ctx);
@@ -10640,7 +10666,7 @@ static void add_ocxo_lane_ema_section(Payload& p,
   }
 }
 
-static void add_ocxo_lane_scheduler_section(Payload& p,
+static FLASHMEM void add_ocxo_lane_scheduler_section(Payload& p,
                                             const ocxo_runtime_context_t& ctx) {
   const ocxo_lane_t& lane = *ctx.lane;
   payload_prefix_t out(p, ctx.prefix);
@@ -10656,7 +10682,7 @@ static void add_ocxo_lane_scheduler_section(Payload& p,
   out.add_u32("witness_schedule_last_target_low16", (uint32_t)lane.witness_schedule_last_target_low16);
 }
 
-static bool add_ocxo_lane_section(Payload& p,
+static FLASHMEM bool add_ocxo_lane_section(Payload& p,
                                   const ocxo_runtime_context_t& ctx,
                                   const char* section) {
   payload_prefix_t out(p, ctx.prefix);
@@ -10930,7 +10956,7 @@ static const process_vtable_t INTERRUPT_PROCESS = {
   .subscriptions = nullptr
 };
 
-void process_interrupt_register(void) {
+FLASHMEM void process_interrupt_register(void) {
   process_register("INTERRUPT", &INTERRUPT_PROCESS);
 }
 
