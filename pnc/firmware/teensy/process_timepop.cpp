@@ -145,23 +145,26 @@ static constexpr uint32_t PHASE_PROBE_MASK_CPU_USAGE      = 1u << 5;
 static constexpr uint32_t PHASE_PROBE_MASK_PHASE_PROBE    = 1u << 6;
 static constexpr uint32_t PHASE_PROBE_MASK_OTHER          = 1u << 7;
 
-// TimePop-owned software-IRQ shadow scheduler handoff probe.
+// TimePop-owned software-IRQ scheduler handoff.
 //
-// Step 1C only proves that a lower-priority, TimePop-owned NVIC interrupt can
-// be pended from the CH2 ISR and run before thread-mode work resumes.  It
-// intentionally performs no scheduling, callback dispatch, slot mutation, or
-// compare arming.
+// Step 2 moves TimePop's CH2 scheduler work out of the QTimer1 priority-0 ISR.
+// The hosted CH2 handler now only copies the already-authored event facts into
+// a fixed ring and pends IRQ_SOFTWARE at priority 16.  The old CH2 TimePop
+// processing body runs from that lower-priority scheduler interrupt.
 //
 // We deliberately avoid PendSV here.  Teensy core owns PendSV/EventResponder,
 // while IRQ_SOFTWARE is an ordinary external interrupt that TimePop can attach,
 // prioritize, enable, pend, and inspect directly.  The existing pendsv_shadow_*
-// report names are retained for continuity with Step 1A/1B, but the mechanism
-// reported below is IRQ_SOFTWARE via NVIC_ISPR.
+// report names are retained for continuity with Step 1A/1B/1C, but the
+// mechanism reported below is now the real IRQ16 CH2 scheduler path.
 static constexpr bool         TIMEPOP_PENDSV_SHADOW_ENABLED = true;
 static constexpr uint32_t     TIMEPOP_PENDSV_SHADOW_PRIORITY = 16U;
 static constexpr IRQ_NUMBER_t TIMEPOP_PENDSV_SHADOW_IRQ = IRQ_SOFTWARE;
-static constexpr const char*  TIMEPOP_PENDSV_SHADOW_MECHANISM = "IRQ_SOFTWARE_ISPR";
+static constexpr const char*  TIMEPOP_PENDSV_SHADOW_MECHANISM = "IRQ_SOFTWARE_CH2_DEFERRED";
 static constexpr const char*  TIMEPOP_PENDSV_SHADOW_TRIGGER = "NVIC_ISPR";
+static constexpr uint32_t     TIMEPOP_CH2_DEFERRED_QUEUE_CAPACITY = 16U;
+static constexpr uint32_t     TIMEPOP_CH2_DEFERRED_QUEUE_MASK = TIMEPOP_CH2_DEFERRED_QUEUE_CAPACITY - 1U;
+static constexpr uint32_t     TIMEPOP_CH2_DEFERRED_DRAIN_BUDGET = 8U;
 
 // ARMv7-M NVIC external interrupt register banks.
 static constexpr uint32_t TIMEPOP_NVIC_ISER_ADDR = 0xE000E100UL;
@@ -420,6 +423,14 @@ struct timepop_dispatch_mutation_t {
   timepop_dispatch_phase_t queued_phase = timepop_dispatch_phase_t::IDLE;
 };
 
+struct timepop_ch2_deferred_event_t {
+  interrupt_event_t event{};
+  interrupt_capture_diag_t diag{};
+  uint32_t enqueue_dwt = 0;
+  uint32_t sequence = 0;
+};
+
+
 // ============================================================================
 // State
 // ============================================================================
@@ -435,6 +446,12 @@ static volatile uint32_t dispatch_mutation_count = 0;
 static volatile uint32_t dispatch_depth = 0;
 static volatile timepop_dispatch_phase_t dispatch_phase = timepop_dispatch_phase_t::IDLE;
 static volatile bool dispatch_applying_mutations = false;
+
+static timepop_ch2_deferred_event_t ch2_deferred_events[TIMEPOP_CH2_DEFERRED_QUEUE_CAPACITY];
+static volatile uint32_t ch2_deferred_head = 0;
+static volatile uint32_t ch2_deferred_tail = 0;
+static volatile uint32_t ch2_deferred_sequence = 0;
+
 
 // Global idle DWT witness.  This symbol is intentionally exported so ISR-side
 // clients may read the freshest foreground/thread-mode DWT shadow without
@@ -584,6 +601,29 @@ static volatile bool     diag_pendsv_shadow_entry_pending_bit = false;
 static volatile bool     diag_pendsv_shadow_entry_active_bit = false;
 static volatile bool     diag_pendsv_shadow_exit_pending_bit = false;
 static volatile bool     diag_pendsv_shadow_exit_active_bit = false;
+
+static volatile uint32_t diag_ch2_irq0_capture_count = 0;
+static volatile uint32_t diag_ch2_deferred_enqueue_count = 0;
+static volatile uint32_t diag_ch2_deferred_dequeue_count = 0;
+static volatile uint32_t diag_ch2_deferred_overflow_count = 0;
+static volatile uint32_t diag_ch2_deferred_high_water = 0;
+static volatile uint32_t diag_ch2_deferred_last_depth = 0;
+static volatile uint32_t diag_ch2_deferred_last_sequence_enqueued = 0;
+static volatile uint32_t diag_ch2_deferred_last_sequence_dequeued = 0;
+static volatile uint32_t diag_ch2_deferred_last_enqueue_dwt = 0;
+static volatile uint32_t diag_ch2_deferred_last_dequeue_dwt = 0;
+static volatile uint32_t diag_ch2_deferred_last_event_counter32 = 0;
+static volatile uint32_t diag_ch2_deferred_last_event_dwt = 0;
+static volatile uint32_t diag_ch2_deferred_last_drain_count = 0;
+static volatile uint32_t diag_ch2_deferred_drain_pass_count = 0;
+static volatile uint32_t diag_ch2_deferred_drain_empty_count = 0;
+static volatile uint32_t diag_ch2_deferred_drain_budget_exhausted_count = 0;
+static volatile uint32_t diag_ch2_deferred_repend_count = 0;
+static volatile uint32_t diag_ch2_deferred_process_body_cycles = 0;
+static volatile uint32_t diag_ch2_deferred_process_body_cycles_max = 0;
+static volatile uint32_t diag_ch2_deferred_capture_to_process_cycles = 0;
+static volatile uint32_t diag_ch2_deferred_capture_to_process_cycles_max = 0;
+
 
 // Normal precision fires should be authored by IRQ_CH2.  If schedule_next()
 // discovers an already-past timed slot, TimePop still records and surfaces
@@ -1048,6 +1088,14 @@ static void timepop_pendsv_shadow_reset(void);
 static void timepop_pendsv_shadow_request_from_irq(const char* context);
 static void timepop_pendsv_shadow_service(void);
 static void timepop_pendsv_shadow_software_irq_isr(void);
+static uint32_t timepop_ch2_deferred_pending_count(void);
+static bool timepop_ch2_deferred_enqueue(const interrupt_event_t& event,
+                                         const interrupt_capture_diag_t& diag);
+static bool timepop_ch2_deferred_dequeue(timepop_ch2_deferred_event_t& out);
+static void timepop_ch2_deferred_reset(void);
+static void timepop_ch2_deferred_process_event(const timepop_ch2_deferred_event_t& item);
+static void timepop_pendsv_shadow_pend_raw(void);
+
 
 // ============================================================================
 // Dispatch-time mutation barrier helpers
@@ -1484,6 +1532,99 @@ static void timepop_pendsv_shadow_update_nvic_diag(void) {
       diag_pendsv_shadow_pending_bit;
 }
 
+static uint32_t timepop_ch2_deferred_pending_count(void) {
+  return (ch2_deferred_head - ch2_deferred_tail) &
+         TIMEPOP_CH2_DEFERRED_QUEUE_MASK;
+}
+
+static void timepop_ch2_deferred_reset(void) {
+  ch2_deferred_head = 0;
+  ch2_deferred_tail = 0;
+  ch2_deferred_sequence = 0;
+  for (uint32_t i = 0; i < TIMEPOP_CH2_DEFERRED_QUEUE_CAPACITY; i++) {
+    ch2_deferred_events[i] = timepop_ch2_deferred_event_t{};
+  }
+
+  diag_ch2_irq0_capture_count = 0;
+  diag_ch2_deferred_enqueue_count = 0;
+  diag_ch2_deferred_dequeue_count = 0;
+  diag_ch2_deferred_overflow_count = 0;
+  diag_ch2_deferred_high_water = 0;
+  diag_ch2_deferred_last_depth = 0;
+  diag_ch2_deferred_last_sequence_enqueued = 0;
+  diag_ch2_deferred_last_sequence_dequeued = 0;
+  diag_ch2_deferred_last_enqueue_dwt = 0;
+  diag_ch2_deferred_last_dequeue_dwt = 0;
+  diag_ch2_deferred_last_event_counter32 = 0;
+  diag_ch2_deferred_last_event_dwt = 0;
+  diag_ch2_deferred_last_drain_count = 0;
+  diag_ch2_deferred_drain_pass_count = 0;
+  diag_ch2_deferred_drain_empty_count = 0;
+  diag_ch2_deferred_drain_budget_exhausted_count = 0;
+  diag_ch2_deferred_repend_count = 0;
+  diag_ch2_deferred_process_body_cycles = 0;
+  diag_ch2_deferred_process_body_cycles_max = 0;
+  diag_ch2_deferred_capture_to_process_cycles = 0;
+  diag_ch2_deferred_capture_to_process_cycles_max = 0;
+}
+
+static bool timepop_ch2_deferred_enqueue(const interrupt_event_t& event,
+                                         const interrupt_capture_diag_t& diag) {
+  diag_ch2_irq0_capture_count++;
+
+  const uint32_t head = ch2_deferred_head;
+  const uint32_t next = (head + 1U) & TIMEPOP_CH2_DEFERRED_QUEUE_MASK;
+  if (next == ch2_deferred_tail) {
+    diag_ch2_deferred_overflow_count++;
+    return false;
+  }
+
+  timepop_ch2_deferred_event_t& slot = ch2_deferred_events[head];
+  slot.event = event;
+  slot.diag = diag;
+  slot.enqueue_dwt = ARM_DWT_CYCCNT;
+  slot.sequence = ++ch2_deferred_sequence;
+
+  __asm__ volatile ("dmb" ::: "memory");
+  ch2_deferred_head = next;
+
+  const uint32_t depth = timepop_ch2_deferred_pending_count();
+  diag_ch2_deferred_enqueue_count++;
+  diag_ch2_deferred_last_depth = depth;
+  if (depth > diag_ch2_deferred_high_water) {
+    diag_ch2_deferred_high_water = depth;
+  }
+  diag_ch2_deferred_last_sequence_enqueued = slot.sequence;
+  diag_ch2_deferred_last_enqueue_dwt = slot.enqueue_dwt;
+  diag_ch2_deferred_last_event_counter32 = event.counter32_at_event;
+  diag_ch2_deferred_last_event_dwt = event.dwt_at_event;
+  return true;
+}
+
+static bool timepop_ch2_deferred_dequeue(timepop_ch2_deferred_event_t& out) {
+  const uint32_t tail = ch2_deferred_tail;
+  if (tail == ch2_deferred_head) return false;
+
+  __asm__ volatile ("dmb" ::: "memory");
+  out = ch2_deferred_events[tail];
+  ch2_deferred_events[tail] = timepop_ch2_deferred_event_t{};
+  ch2_deferred_tail = (tail + 1U) & TIMEPOP_CH2_DEFERRED_QUEUE_MASK;
+
+  diag_ch2_deferred_dequeue_count++;
+  diag_ch2_deferred_last_depth = timepop_ch2_deferred_pending_count();
+  diag_ch2_deferred_last_sequence_dequeued = out.sequence;
+  diag_ch2_deferred_last_dequeue_dwt = ARM_DWT_CYCCNT;
+  return true;
+}
+
+static void timepop_pendsv_shadow_pend_raw(void) {
+  const uint32_t irq = timepop_pendsv_shadow_irq_number();
+  const uint32_t mask = timepop_pendsv_shadow_irq_mask();
+  timepop_nvic_ispr_word(irq) = mask;
+  timepop_irq_barrier();
+}
+
+
 static void timepop_pendsv_shadow_reset(void) {
   diag_pendsv_shadow_pending = false;
   diag_pendsv_shadow_running = false;
@@ -1539,6 +1680,8 @@ static void timepop_pendsv_shadow_reset(void) {
   diag_pendsv_shadow_entry_active_bit = false;
   diag_pendsv_shadow_exit_pending_bit = false;
   diag_pendsv_shadow_exit_active_bit = false;
+
+  timepop_ch2_deferred_reset();
 }
 
 static void timepop_pendsv_shadow_configure(void) {
@@ -1593,8 +1736,10 @@ static void timepop_pendsv_shadow_request_from_irq(const char* context) {
   diag_pendsv_shadow_request_pre_pending_bit = diag_pendsv_shadow_pending_bit;
   diag_pendsv_shadow_request_pre_active_bit = diag_pendsv_shadow_active_bit;
 
-  if (diag_pendsv_shadow_pending || diag_pendsv_shadow_running ||
-      diag_pendsv_shadow_request_count != diag_pendsv_shadow_served_request_count) {
+  const bool scheduler_already_pending_or_running =
+      diag_pendsv_shadow_pending || diag_pendsv_shadow_running ||
+      diag_pendsv_shadow_request_count != diag_pendsv_shadow_served_request_count;
+  if (scheduler_already_pending_or_running) {
     diag_pendsv_shadow_coalesced_request_count++;
   }
 
@@ -1603,11 +1748,14 @@ static void timepop_pendsv_shadow_request_from_irq(const char* context) {
   diag_pendsv_shadow_last_request_dwt = request_dwt;
   diag_pendsv_shadow_last_request_context = context;
 
-  // Directly pend the TimePop-owned software IRQ.  This is the simplest POC
-  // for the final architecture's lower-priority scheduler handoff: priority-0
-  // timing ISR requests priority-16 work, then returns.
-  timepop_nvic_ispr_word(irq) = mask;
-  timepop_irq_barrier();
+  // Directly pend the TimePop-owned software IRQ unless it is already running.
+  // If priority-0 capture interrupts the IRQ16 drain, the running drain loop or
+  // its final ring check will pick up the newly enqueued event and re-pend if
+  // needed.  Avoiding an unconditional active re-pend prevents harmless but
+  // noisy empty IRQ16 passes.
+  if (!diag_pendsv_shadow_running) {
+    timepop_pendsv_shadow_pend_raw();
+  }
 
   diag_pendsv_shadow_request_post_enabled_bit =
       (timepop_nvic_iser_word(irq) & mask) != 0;
@@ -1635,23 +1783,33 @@ static void timepop_pendsv_shadow_service(void) {
 
   if (diag_pendsv_shadow_running) {
     diag_pendsv_shadow_reentry_count++;
+    if (timepop_ch2_deferred_pending_count() != 0) {
+      diag_ch2_deferred_repend_count++;
+      timepop_pendsv_shadow_pend_raw();
+    }
     return;
   }
 
   diag_pendsv_shadow_running = true;
+  diag_ch2_deferred_drain_pass_count++;
 
-  const uint32_t requests_seen = diag_pendsv_shadow_request_count;
-  const uint32_t requests_previously_served =
-      diag_pendsv_shadow_served_request_count;
-  const bool had_unserved_request = requests_seen != requests_previously_served;
+  uint32_t drained = 0;
+  bool sampled_latency = false;
 
-  if (had_unserved_request) {
-    diag_pendsv_shadow_served_request_count = requests_seen;
-    diag_pendsv_shadow_pending = false;
+  for (; drained < TIMEPOP_CH2_DEFERRED_DRAIN_BUDGET; drained++) {
+    timepop_ch2_deferred_event_t item{};
+    if (!timepop_ch2_deferred_dequeue(item)) break;
 
-    const uint32_t request_dwt = diag_pendsv_shadow_last_request_dwt;
-    if (request_dwt != 0) {
-      const uint32_t latency = entry_dwt - request_dwt;
+    const uint32_t process_start_dwt = ARM_DWT_CYCCNT;
+    const uint32_t capture_to_process =
+        (item.enqueue_dwt != 0) ? (process_start_dwt - item.enqueue_dwt) : 0U;
+    diag_ch2_deferred_capture_to_process_cycles = capture_to_process;
+    if (capture_to_process > diag_ch2_deferred_capture_to_process_cycles_max) {
+      diag_ch2_deferred_capture_to_process_cycles_max = capture_to_process;
+    }
+
+    if (!sampled_latency && item.enqueue_dwt != 0) {
+      const uint32_t latency = entry_dwt - item.enqueue_dwt;
       diag_pendsv_shadow_latency_sample_count++;
       diag_pendsv_shadow_last_latency_cycles = latency;
       diag_pendsv_shadow_latency_cycles_sum += (uint64_t)latency;
@@ -1661,14 +1819,37 @@ static void timepop_pendsv_shadow_service(void) {
       if (latency > diag_pendsv_shadow_max_latency_cycles) {
         diag_pendsv_shadow_max_latency_cycles = latency;
       }
+      sampled_latency = true;
     }
-  } else {
-    diag_pendsv_shadow_spurious_entry_count++;
-    diag_pendsv_shadow_pending = false;
+
+    timepop_ch2_deferred_process_event(item);
+
+    const uint32_t process_cycles = ARM_DWT_CYCCNT - process_start_dwt;
+    diag_ch2_deferred_process_body_cycles = process_cycles;
+    if (process_cycles > diag_ch2_deferred_process_body_cycles_max) {
+      diag_ch2_deferred_process_body_cycles_max = process_cycles;
+    }
+
+    diag_pendsv_shadow_served_request_count++;
   }
 
-  // Shadow mode stops here.  No scheduling, no callbacks, no slot mutation,
-  // and no compare rearming happen in the software IRQ during Step 1C.
+  diag_ch2_deferred_last_drain_count = drained;
+  if (drained == 0) {
+    diag_ch2_deferred_drain_empty_count++;
+    diag_pendsv_shadow_spurious_entry_count++;
+  }
+
+  const uint32_t remaining = timepop_ch2_deferred_pending_count();
+  if (remaining != 0) {
+    diag_ch2_deferred_drain_budget_exhausted_count++;
+    diag_ch2_deferred_repend_count++;
+    diag_pendsv_shadow_pending = true;
+    timepop_pendsv_shadow_pend_raw();
+  } else {
+    diag_pendsv_shadow_pending =
+        diag_pendsv_shadow_request_count != diag_pendsv_shadow_served_request_count;
+  }
+
   const uint32_t exit_dwt = ARM_DWT_CYCCNT;
   const uint32_t body_cycles = exit_dwt - entry_dwt;
   diag_pendsv_shadow_last_exit_dwt = exit_dwt;
@@ -1683,6 +1864,17 @@ static void timepop_pendsv_shadow_service(void) {
 
   diag_pendsv_shadow_running = false;
   diag_pendsv_shadow_exit_count++;
+
+  // A priority-0 CH2 event may have arrived after the drain loop observed an
+  // empty ring but before we cleared running.  The producer already pended the
+  // IRQ, but re-pending here keeps the handoff explicit and harmlessly
+  // coalesces in the NVIC.
+  if (timepop_ch2_deferred_pending_count() != 0) {
+    diag_ch2_deferred_repend_count++;
+    diag_pendsv_shadow_pending = true;
+    timepop_pendsv_shadow_pend_raw();
+  }
+
   timepop_pendsv_shadow_update_nvic_diag();
 }
 
@@ -3099,8 +3291,8 @@ static uint32_t select_next_scheduled_callback_slot_by_priority(
 // CH2 TCF1 flag is cleared by the dispatcher before this runs, so we don't
 // clear it ourselves.
 //
-void timepop_qtimer1_ch2_handler(const interrupt_event_t& event,
-                                 const interrupt_capture_diag_t& /*diag*/) {
+static void timepop_process_ch2_event_in_scheduler_irq(const interrupt_event_t& event,
+                                                       const interrupt_capture_diag_t& /*diag*/) {
 
   const uint32_t dwt_entry      = event.dwt_at_event;
   const uint32_t now            = event.counter32_at_event;
@@ -3331,7 +3523,31 @@ void timepop_qtimer1_ch2_handler(const interrupt_event_t& event,
 
   diag_schedule_next_calls_from_other++;
   schedule_next();
-  timepop_pendsv_shadow_request_from_irq("qtimer1_ch2_irq_tail");
+}
+
+
+static void timepop_ch2_deferred_process_event(const timepop_ch2_deferred_event_t& item) {
+  timepop_process_ch2_event_in_scheduler_irq(item.event, item.diag);
+}
+
+void timepop_qtimer1_ch2_handler(const interrupt_event_t& event,
+                                 const interrupt_capture_diag_t& diag) {
+  // Priority-0 hosted CH2 path: copy only the already-authored event facts and
+  // request lower-priority scheduler service.  No slot scan, no callbacks, no
+  // schedule_next(), and no compare rearm happen here anymore.
+  const bool enqueued = timepop_ch2_deferred_enqueue(event, diag);
+  if (!enqueued) {
+    // The event could not be transported, so make the failure loud and still
+    // pend the scheduler IRQ in case space opens before the next CH2 event.
+    // No inline fallback is attempted here because re-entering TimePop while
+    // IRQ16 is processing the slot table would be worse than a loud failure.
+  }
+
+  if (enqueued) {
+    timepop_pendsv_shadow_request_from_irq("qtimer1_ch2_deferred_enqueue");
+  } else {
+    timepop_pendsv_shadow_pend_raw();
+  }
 }
 
 
@@ -5287,6 +5503,34 @@ static Payload cmd_report(const Payload&) {
                             ? diag_pendsv_shadow_last_request_context
                             : ""));
 
+  out.add("ch2_irq0_capture_count", diag_ch2_irq0_capture_count);
+  out.add("ch2_deferred_queue_capacity", (uint32_t)TIMEPOP_CH2_DEFERRED_QUEUE_CAPACITY);
+  out.add("ch2_deferred_drain_budget", (uint32_t)TIMEPOP_CH2_DEFERRED_DRAIN_BUDGET);
+  out.add("ch2_deferred_pending_count", timepop_ch2_deferred_pending_count());
+  out.add("ch2_deferred_enqueue_count", diag_ch2_deferred_enqueue_count);
+  out.add("ch2_deferred_dequeue_count", diag_ch2_deferred_dequeue_count);
+  out.add("ch2_deferred_overflow_count", diag_ch2_deferred_overflow_count);
+  out.add("ch2_deferred_high_water", diag_ch2_deferred_high_water);
+  out.add("ch2_deferred_last_depth", diag_ch2_deferred_last_depth);
+  out.add("ch2_deferred_last_sequence_enqueued", diag_ch2_deferred_last_sequence_enqueued);
+  out.add("ch2_deferred_last_sequence_dequeued", diag_ch2_deferred_last_sequence_dequeued);
+  out.add("ch2_deferred_last_enqueue_dwt", diag_ch2_deferred_last_enqueue_dwt);
+  out.add("ch2_deferred_last_dequeue_dwt", diag_ch2_deferred_last_dequeue_dwt);
+  out.add("ch2_deferred_last_event_counter32", diag_ch2_deferred_last_event_counter32);
+  out.add("ch2_deferred_last_event_dwt", diag_ch2_deferred_last_event_dwt);
+  out.add("ch2_deferred_last_drain_count", diag_ch2_deferred_last_drain_count);
+  out.add("ch2_deferred_drain_pass_count", diag_ch2_deferred_drain_pass_count);
+  out.add("ch2_deferred_drain_empty_count", diag_ch2_deferred_drain_empty_count);
+  out.add("ch2_deferred_drain_budget_exhausted_count",
+          diag_ch2_deferred_drain_budget_exhausted_count);
+  out.add("ch2_deferred_repend_count", diag_ch2_deferred_repend_count);
+  out.add("ch2_deferred_process_body_cycles", diag_ch2_deferred_process_body_cycles);
+  out.add("ch2_deferred_process_body_cycles_max", diag_ch2_deferred_process_body_cycles_max);
+  out.add("ch2_deferred_capture_to_process_cycles",
+          diag_ch2_deferred_capture_to_process_cycles);
+  out.add("ch2_deferred_capture_to_process_cycles_max",
+          diag_ch2_deferred_capture_to_process_cycles_max);
+
   timepop_pendsv_shadow_update_nvic_diag();
   out.add("pendsv_shadow_irq_number",          diag_pendsv_shadow_irq_number);
   out.add("pendsv_shadow_irq_index",           diag_pendsv_shadow_irq_index);
@@ -5718,6 +5962,16 @@ static Payload cmd_slots(const Payload&) {
   out.add("pendsv_shadow_entry_count", diag_pendsv_shadow_entry_count);
   out.add("pendsv_shadow_pending", diag_pendsv_shadow_pending);
   out.add("pendsv_shadow_max_latency_cycles", diag_pendsv_shadow_max_latency_cycles);
+  out.add("ch2_irq0_capture_count", diag_ch2_irq0_capture_count);
+  out.add("ch2_deferred_pending_count", timepop_ch2_deferred_pending_count());
+  out.add("ch2_deferred_enqueue_count", diag_ch2_deferred_enqueue_count);
+  out.add("ch2_deferred_dequeue_count", diag_ch2_deferred_dequeue_count);
+  out.add("ch2_deferred_overflow_count", diag_ch2_deferred_overflow_count);
+  out.add("ch2_deferred_high_water", diag_ch2_deferred_high_water);
+  out.add("ch2_deferred_drain_budget_exhausted_count",
+          diag_ch2_deferred_drain_budget_exhausted_count);
+  out.add("ch2_deferred_process_body_cycles_max",
+          diag_ch2_deferred_process_body_cycles_max);
   out.add("schedule_next_expired_slots", diag_schedule_next_expired_slots);
   out.add("schedule_next_late_max_ticks", diag_schedule_next_late_max_ticks);
   out.add("missed_deadline_slots", diag_missed_deadline_slots);
