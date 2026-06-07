@@ -1343,7 +1343,15 @@ struct alpha_ocxo_pps_projection_guard_t {
   uint32_t last_reference_dwt32 = 0;
   int32_t  last_signed_delta_cycles = 0;
   uint32_t last_legacy_unsigned_delta_cycles = 0;
+
+  // Projection-vs-measured is a diagnostic offset, not an absolute validity
+  // invariant.  The nominal OCXO ledger and measured GNSS-elapsed ledger may
+  // legitimately have a large fixed separation after SmartZero/START base
+  // selection.  The pathology is a sudden jump in that separation, not the
+  // separation itself.
+  bool     last_projected_minus_measured_valid = false;
   int64_t  last_projected_minus_measured_ns = 0;
+  int64_t  last_projected_minus_measured_jump_ns = 0;
 };
 
 static alpha_ocxo_edge_history_t g_ocxo1_edge_history = {};
@@ -1739,30 +1747,44 @@ static bool alpha_ocxo_pps_projection_build(
 
   const int64_t projected_minus_existing =
       alpha_signed_delta_u64(projected_ns, existing_pps_ns);
-  if (existing_pps_ns != 0 &&
-      alpha_abs_u64_from_i64(projected_minus_existing) >
-          ALPHA_OCXO_PPS_PROJECTION_SANITY_WINDOW_NS) {
-    alpha_projection_guard_note_sanity_reject(clock,
-                                              pps_sequence,
-                                              pps_dwt_at_edge,
-                                              edge0.dwt_at_edge,
-                                              projected_minus_existing);
-    alpha_ocxo_pps_projection_set_invalid(
-        clock,
-        ALPHA_OCXO_PPS_PROJECTION_INVALID_TARGET_OUT_OF_WINDOW,
-        pps_sequence,
-        pps_dwt_at_edge,
-        pps_vclock_ns,
-        existing_pps_ns,
-        &edge0,
-        &edge1,
-        latest_actual_interval_cycles,
-        completed_interval_count,
-        static_prediction_valid,
-        target_delta_raw_cycles,
-        target_overrun_cycles,
-        last_static_advance_count);
-    return true;
+
+  // Guard the *jump* in the projection-vs-measured diagnostic offset, not the
+  // absolute offset itself.  IRQ5 proved the absolute offset can be hundreds of
+  // milliseconds after a clean START/SmartZero base selection while the target
+  // geometry is perfectly valid.  The original 2^44 pathology was a one-row
+  // discontinuity in this offset, so that is the invariant we enforce.
+  alpha_ocxo_pps_projection_guard_t* guard =
+      alpha_ocxo_pps_projection_guard(clock);
+  if (existing_pps_ns != 0 && guard &&
+      guard->last_projected_minus_measured_valid) {
+    const int64_t offset_jump =
+        projected_minus_existing - guard->last_projected_minus_measured_ns;
+    guard->last_projected_minus_measured_jump_ns = offset_jump;
+
+    if (alpha_abs_u64_from_i64(offset_jump) >
+        ALPHA_OCXO_PPS_PROJECTION_SANITY_WINDOW_NS) {
+      alpha_projection_guard_note_sanity_reject(clock,
+                                                pps_sequence,
+                                                pps_dwt_at_edge,
+                                                edge0.dwt_at_edge,
+                                                offset_jump);
+      alpha_ocxo_pps_projection_set_invalid(
+          clock,
+          ALPHA_OCXO_PPS_PROJECTION_INVALID_TARGET_OUT_OF_WINDOW,
+          pps_sequence,
+          pps_dwt_at_edge,
+          pps_vclock_ns,
+          existing_pps_ns,
+          &edge0,
+          &edge1,
+          latest_actual_interval_cycles,
+          completed_interval_count,
+          static_prediction_valid,
+          target_delta_raw_cycles,
+          target_overrun_cycles,
+          last_static_advance_count);
+      return true;
+    }
   }
 
   clocks_alpha_ocxo_pps_projection_snapshot_t local = s->v;
@@ -1800,6 +1822,11 @@ static bool alpha_ocxo_pps_projection_build(
   local.target_remaining_cycles = interval_cycles - target_delta_cycles;
   local.projected_ocxo_ns_at_pps = projected_ns;
   local.projected_minus_existing_pps_ns = projected_minus_existing;
+  if (guard && existing_pps_ns != 0) {
+    guard->last_projected_minus_measured_valid = true;
+    guard->last_projected_minus_measured_ns = projected_minus_existing;
+    guard->last_projected_minus_measured_jump_ns = 0;
+  }
   local.projected_minus_vclock_ns =
       alpha_signed_delta_u64(projected_ns, pps_vclock_ns);
   local.latest_actual_interval_cycles = latest_actual_interval_cycles;
