@@ -42,6 +42,11 @@ from zpnet.processes.processes import send_command
 
 VREF = 3.003
 
+DAC_FINE_STEP = 1.0
+DAC_COARSE_STEP = 10.0
+DAC_MIN_CODE = 0.0
+DAC_MAX_CODE = 65535.0
+
 
 # ---------------------------------------------------------------------
 # Data fetchers
@@ -615,7 +620,6 @@ def _servo_state(r: dict) -> str:
 # DAC presentation helpers
 # ---------------------------------------------------------------------
 
-DAC_CODE_MAX = 65535.0
 DAC_CODE_SCALE = 65536.0
 
 
@@ -672,6 +676,91 @@ def _dac_report_value(report_dac: dict | None, lane: str):
 def _dac_current_value(r: dict, report_dac: dict | None, lane: str):
     val = _dac_value(r, lane)
     return val if val is not None else _dac_report_value(report_dac, lane)
+
+
+def _clamp_dac_code(value: float) -> float:
+    if value < DAC_MIN_CODE:
+        return DAC_MIN_CODE
+    if value > DAC_MAX_CODE:
+        return DAC_MAX_CODE
+    return value
+
+
+def _manual_dac_current_value(lane: str) -> float:
+    """Fetch the live DAC value for keyboard nudging.
+
+    Prefer the current CLOCKS report/TIMEBASE value and fall back to the
+    Teensy REPORT_DAC surface so manual control still works before a campaign
+    has emitted a fresh TIMEBASE row.
+    """
+    report = {}
+    try:
+        p = _get_pi_clocks_report()
+        report = p.get("report") if isinstance(p.get("report"), dict) else p
+    except Exception:
+        report = {}
+
+    report_dac = None
+    try:
+        report_dac = _get_pi_clocks_report_dac()
+    except Exception:
+        report_dac = None
+
+    current = _dac_current_value(report, report_dac, lane)
+    if current is None:
+        raise RuntimeError(f"{lane.upper()} DAC value unavailable")
+
+    return float(current)
+
+
+def adjust_ocxo_dac(*, lane: str, direction: int, step_kind: str) -> dict:
+    """Apply one keyboard DAC nudge through PI CLOCKS SET_DAC.
+
+    The Pi command is the authority for manual DAC updates: it persists the
+    SYSTEM config seed and best-effort pushes TEENSY CLOCKS SET_DAC.  Metrics
+    only selects the new value and invokes that control-plane command.
+    """
+    if lane not in ("ocxo1", "ocxo2"):
+        raise ValueError(f"unknown DAC lane: {lane!r}")
+    if direction not in (-1, 1):
+        raise ValueError(f"invalid DAC direction: {direction!r}")
+
+    coarse = "coarse" in str(step_kind).lower()
+    step = DAC_COARSE_STEP if coarse else DAC_FINE_STEP
+    old_value = _manual_dac_current_value(lane)
+    new_value = _clamp_dac_code(old_value + float(direction) * step)
+
+    arg_name = "DAC1" if lane == "ocxo1" else "DAC2"
+    resp = send_command(
+        machine="PI",
+        subsystem="CLOCKS",
+        command="SET_DAC",
+        args={arg_name: f"{new_value:.6f}"},
+    )
+
+    ok = bool(resp.get("success"))
+    msg = resp.get("message") or ("OK" if ok else "FAILED")
+    payload = resp.get("payload", {}) if isinstance(resp.get("payload"), dict) else {}
+    teensy_pushed = payload.get("teensy_pushed_now")
+
+    volts = _dac_voltage(new_value)
+    voltage_text = f"{volts:.6f}V" if volts is not None else "---"
+    prefix = "DAC" if ok else "DAC FAILED"
+    suffix = "" if teensy_pushed is not False else " (persisted; Teensy push not confirmed)"
+
+    return {
+        "success": ok,
+        "message": (
+            f"{prefix}: {lane.upper()} {step_kind} "
+            f"{old_value:.3f} -> {new_value:.3f} ({voltage_text}) "
+            f"PI CLOCKS SET_DAC: {msg}{suffix}"
+        ),
+        "old_value": old_value,
+        "new_value": new_value,
+        "step": step,
+        "lane": lane,
+        "response": resp,
+    }
 
 
 def _dac_report_dither_summary(report_dac: dict | None, lane: str) -> str:
