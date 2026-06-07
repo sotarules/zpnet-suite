@@ -110,6 +110,12 @@ extern volatile uint32_t g_pps_dwt_at_edge;
 extern volatile uint32_t g_pps_dwt_cycles_between_edges;
 extern volatile bool     g_pps_dwt_cycles_between_edges_valid;
 
+// Alpha OCXO PPS projection guard counters.  Alpha owns the fix and the
+// counters; Beta only surfaces them through focused reports so the normal
+// TIMEBASE pair remains lean and brutally honest.
+extern uint32_t clocks_alpha_ocxo_projection_guard_legacy_wrap_count(time_clock_id_t clock);
+extern uint32_t clocks_alpha_ocxo_projection_guard_sanity_reject_count(time_clock_id_t clock);
+
 // ============================================================================
 // TIMEBASE publication-tail diagnostics
 // ============================================================================
@@ -4185,6 +4191,13 @@ static void payload_add_ocxo_pps_projection_lane(Payload& parent,
   counters.add("max_static_projection_advance_count",
                s.max_static_projection_advance_count);
   counters.add("max_target_overrun_cycles", s.max_target_overrun_cycles);
+  counters.add("guard_legacy_wrap_count",
+               clocks_alpha_ocxo_projection_guard_legacy_wrap_count(clock));
+  counters.add("guard_sanity_reject_count",
+               clocks_alpha_ocxo_projection_guard_sanity_reject_count(clock));
+  counters.add("guard_total_count",
+               clocks_alpha_ocxo_projection_guard_legacy_wrap_count(clock) +
+               clocks_alpha_ocxo_projection_guard_sanity_reject_count(clock));
   lane.add_object("counters", counters);
 
   Payload pps;
@@ -4249,6 +4262,142 @@ static Payload cmd_report_ocxo_pps_projection(const Payload&) {
         "Report-only Alpha projection of OCXO clock ns to the PPS/VCLOCK DWT edge; not TIMEBASE authority yet");
   payload_add_ocxo_pps_projection_lane(p, "ocxo1", time_clock_id_t::OCXO1);
   payload_add_ocxo_pps_projection_lane(p, "ocxo2", time_clock_id_t::OCXO2);
+  return p;
+}
+
+
+static uint64_t beta_abs_i64(int64_t value) {
+  if (value >= 0) return (uint64_t)value;
+  return (uint64_t)(-(value + 1)) + 1ULL;
+}
+
+static const char* ocxo_projection_guard_lane_verdict(bool snapshot_ok,
+                                                      const clocks_alpha_ocxo_pps_projection_snapshot_t& s,
+                                                      uint32_t legacy_wrap_count,
+                                                      uint32_t sanity_reject_count) {
+  if (legacy_wrap_count != 0U || sanity_reject_count != 0U) {
+    return "GUARD_CAUGHT_PROJECTION_FAULT";
+  }
+  if (!snapshot_ok) return "SNAPSHOT_UNAVAILABLE";
+  if (!s.valid) return "PROJECTION_NOT_READY_OR_INVALID";
+  return "CLEAN";
+}
+
+static void payload_add_ocxo_projection_guard_lane(Payload& parent,
+                                                   const char* key,
+                                                   time_clock_id_t clock) {
+  clocks_alpha_ocxo_pps_projection_snapshot_t s{};
+  const bool snapshot_ok = clocks_alpha_ocxo_pps_projection_snapshot(clock, &s);
+  const uint32_t legacy_wrap_count =
+      clocks_alpha_ocxo_projection_guard_legacy_wrap_count(clock);
+  const uint32_t sanity_reject_count =
+      clocks_alpha_ocxo_projection_guard_sanity_reject_count(clock);
+  const uint32_t guard_total = legacy_wrap_count + sanity_reject_count;
+
+  Payload lane;
+  lane.add("snapshot_ok", snapshot_ok);
+  lane.add("valid", s.valid);
+  lane.add("clock_id", s.clock_id);
+  lane.add("verdict", ocxo_projection_guard_lane_verdict(snapshot_ok, s,
+                                                         legacy_wrap_count,
+                                                         sanity_reject_count));
+  lane.add("guard_total_count", guard_total);
+  lane.add("guard_legacy_wrap_count", legacy_wrap_count);
+  lane.add("guard_sanity_reject_count", sanity_reject_count);
+  lane.add("guard_clean", guard_total == 0U);
+
+  Payload identity;
+  identity.add("source", s.source);
+  identity.add("source_name", ocxo_pps_projection_source_name(s.source));
+  identity.add("last_invalid_reason", s.last_invalid_reason);
+  identity.add("last_invalid_reason_name",
+               ocxo_pps_projection_invalid_reason_name(s.last_invalid_reason));
+  identity.add("update_count", s.update_count);
+  identity.add("compute_count", s.compute_count);
+  identity.add("invalid_no_edge_count", s.invalid_no_edge_count);
+  identity.add("invalid_no_interval_count", s.invalid_no_interval_count);
+  identity.add("invalid_target_out_of_window_count",
+               s.invalid_target_out_of_window_count);
+  lane.add_object("identity", identity);
+
+  Payload pps;
+  pps.add("sequence", s.pps_sequence);
+  pps.add("dwt_at_edge", s.pps_dwt_at_edge);
+  pps.add("vclock_ns", s.pps_vclock_ns);
+  lane.add_object("pps", pps);
+
+  Payload edge0;
+  edge0.add("dwt_at_edge", s.edge0_dwt_at_edge);
+  edge0.add("counter32_at_edge", s.edge0_counter32_at_edge);
+  edge0.add("ocxo_ns_at_edge", s.edge0_ocxo_ns_at_edge);
+  edge0.add("measured_ns_at_edge", s.edge0_measured_ns_at_edge);
+  lane.add_object("edge0", edge0);
+
+  Payload edge1;
+  edge1.add("dwt_at_edge", s.edge1_dwt_at_edge);
+  edge1.add("counter32_at_edge", s.edge1_counter32_at_edge);
+  edge1.add("ocxo_ns_at_edge", s.edge1_ocxo_ns_at_edge);
+  edge1.add("measured_ns_at_edge", s.edge1_measured_ns_at_edge);
+  lane.add_object("edge1", edge1);
+
+  Payload projection;
+  projection.add("interval_dwt_cycles", s.interval_dwt_cycles);
+  projection.add("interval_ocxo_ns", s.interval_ocxo_ns);
+  projection.add("target_delta_cycles", s.target_delta_cycles);
+  projection.add("target_delta_raw_cycles", s.target_delta_raw_cycles);
+  projection.add("target_remaining_cycles", s.target_remaining_cycles);
+  projection.add("target_overrun_cycles", s.target_overrun_cycles);
+  projection.add("projected_ocxo_ns_at_pps", s.projected_ocxo_ns_at_pps);
+  projection.add("projected_minus_existing_pps_ns",
+                 s.projected_minus_existing_pps_ns);
+  projection.add("projected_minus_existing_pps_abs_ns",
+                 beta_abs_i64(s.projected_minus_existing_pps_ns));
+  projection.add("projected_minus_vclock_ns", s.projected_minus_vclock_ns);
+  projection.add("projected_minus_vclock_abs_ns",
+                 beta_abs_i64(s.projected_minus_vclock_ns));
+  projection.add("target_delta_inside_interval",
+                 s.interval_dwt_cycles != 0U &&
+                 s.target_delta_cycles <= s.interval_dwt_cycles);
+  lane.add_object("projection", projection);
+
+  Payload static_projection;
+  static_projection.add("latest_actual_interval_cycles",
+                        s.latest_actual_interval_cycles);
+  static_projection.add("completed_interval_count",
+                        s.static_prediction_completed_interval_count);
+  static_projection.add("valid", s.static_prediction_valid);
+  static_projection.add("advance_limit", s.static_projection_advance_limit);
+  static_projection.add("advance_total_count",
+                        s.static_projection_advance_count);
+  static_projection.add("last_advance_count",
+                        s.last_static_projection_advance_count);
+  static_projection.add("max_advance_count",
+                        s.max_static_projection_advance_count);
+  static_projection.add("max_target_overrun_cycles",
+                        s.max_target_overrun_cycles);
+  lane.add_object("static_projection", static_projection);
+
+  parent.add_object(key, lane);
+}
+
+static Payload cmd_report_ocxo_projection_guard(const Payload&) {
+  Payload p;
+  p.add("report", "CLOCKS_OCXO_PROJECTION_GUARD");
+  p.add("description",
+        "Alpha OCXO PPS-projection guard counters and last projection snapshot; report-only, not TIMEBASE");
+  p.add("doctrine",
+        "Alpha must reject modulo/wrap projection ghosts before Beta consumes public ns");
+  p.add("beta_policy", "observe_only_no_projection_repair");
+  p.add("fault_signature", "2^44_minus_small_ns_or_large_measured_minus_public_jump");
+  payload_add_ocxo_projection_guard_lane(p, "ocxo1", time_clock_id_t::OCXO1);
+  payload_add_ocxo_projection_guard_lane(p, "ocxo2", time_clock_id_t::OCXO2);
+  const uint32_t total_guard_count =
+      clocks_alpha_ocxo_projection_guard_legacy_wrap_count(time_clock_id_t::OCXO1) +
+      clocks_alpha_ocxo_projection_guard_sanity_reject_count(time_clock_id_t::OCXO1) +
+      clocks_alpha_ocxo_projection_guard_legacy_wrap_count(time_clock_id_t::OCXO2) +
+      clocks_alpha_ocxo_projection_guard_sanity_reject_count(time_clock_id_t::OCXO2);
+  p.add("guard_total_count", total_guard_count);
+  p.add("guard_clean", total_guard_count == 0U);
   return p;
 }
 
@@ -4339,7 +4488,7 @@ static Payload cmd_report_timebase_publish(const Payload&) {
 static Payload cmd_report(const Payload&) {
   Payload p;
   p.add("report", "CLOCKS_COMPACT");
-  p.add("subreports", "REPORT_STATUS REPORT_SUMMARY REPORT_EPOCH REPORT_SMARTZERO REPORT_INSTALLED_SMARTZERO REPORT_LIVE_SMARTZERO REPORT_FORENSICS REPORT_FORENSICS_VCLOCK REPORT_FORENSICS_OCXO1 REPORT_FORENSICS_OCXO2 REPORT_OCXO_PPS_PROJECTION REPORT_TIMEBASE_PUBLISH REPORT_ALPHA_FLOW REPORT_ALPHA_FLOW_VCLOCK REPORT_ALPHA_FLOW_OCXO1 REPORT_ALPHA_FLOW_OCXO2 REPORT_PREDICTION REPORT_STATS REPORT_DAC");
+  p.add("subreports", "REPORT_STATUS REPORT_SUMMARY REPORT_EPOCH REPORT_SMARTZERO REPORT_INSTALLED_SMARTZERO REPORT_LIVE_SMARTZERO REPORT_FORENSICS REPORT_FORENSICS_VCLOCK REPORT_FORENSICS_OCXO1 REPORT_FORENSICS_OCXO2 REPORT_OCXO_PPS_PROJECTION REPORT_OCXO_PROJECTION_GUARD REPORT_TIMEBASE_PUBLISH REPORT_ALPHA_FLOW REPORT_ALPHA_FLOW_VCLOCK REPORT_ALPHA_FLOW_OCXO1 REPORT_ALPHA_FLOW_OCXO2 REPORT_PREDICTION REPORT_STATS REPORT_DAC");
   add_summary_payload(p);
   add_campaign_payload(p);
 
@@ -4624,6 +4773,7 @@ static const process_command_entry_t CLOCKS_COMMANDS[] = {
   { "REPORT_FORENSICS_OCXO1",  cmd_report_forensics_ocxo1  },
   { "REPORT_FORENSICS_OCXO2",  cmd_report_forensics_ocxo2  },
   { "REPORT_OCXO_PPS_PROJECTION", cmd_report_ocxo_pps_projection },
+  { "REPORT_OCXO_PROJECTION_GUARD", cmd_report_ocxo_projection_guard },
   { "REPORT_TIMEBASE_PUBLISH", cmd_report_timebase_publish },
   { "REPORT_ALPHA_FLOW",       cmd_report_alpha_flow       },
   { "REPORT_ALPHA_FLOW_VCLOCK", cmd_report_alpha_flow_vclock },

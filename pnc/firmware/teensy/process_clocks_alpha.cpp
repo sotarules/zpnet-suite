@@ -1084,6 +1084,7 @@ struct alpha_measured_ns_clock_t {
   bool     initialized = false;
   uint64_t ns_at_edge = 0;
   uint32_t dwt_at_edge = 0;
+  uint64_t dwt64_at_edge = 0;
 };
 
 static alpha_measured_ns_clock_t g_ocxo1_measured_ns = {};
@@ -1286,6 +1287,13 @@ static constexpr uint32_t ALPHA_OCXO_PPS_PROJECTION_INVALID_NO_EDGE = 1;
 static constexpr uint32_t ALPHA_OCXO_PPS_PROJECTION_INVALID_NO_INTERVAL = 2;
 static constexpr uint32_t ALPHA_OCXO_PPS_PROJECTION_INVALID_TARGET_OUT_OF_WINDOW = 3;
 
+// Keep the public snapshot schema unchanged for this surgical fix: new wrap
+// and sanity failures are counted on alpha-local guard counters and reported
+// through the existing TARGET_OUT_OF_WINDOW invalid bucket until we wire a
+// dedicated diagnostic report.
+static constexpr uint64_t ALPHA_OCXO_PPS_PROJECTION_SANITY_WINDOW_NS = 100000000ULL;
+static constexpr uint32_t ALPHA_OCXO_PPS_PROJECTION_MAX_SIGNED_DWT_SECONDS = 3U;
+
 // Static PPS projection may find that the latest observed OCXO edge is one or
 // two synthetic one-second intervals behind the PPS/VCLOCK target.  That is a
 // custody timing phase issue, not an OCXO event failure.  Advance the static
@@ -1297,6 +1305,7 @@ static constexpr uint32_t ALPHA_OCXO_PPS_STATIC_ADVANCE_LIMIT = 2U;
 struct alpha_ocxo_edge_fact_t {
   bool     valid = false;
   uint32_t dwt_at_edge = 0;
+  uint64_t dwt64_at_edge = 0;
   uint32_t counter32_at_edge = 0;
   uint64_t ocxo_ns_at_edge = 0;
   uint64_t measured_ns_at_edge = 0;
@@ -1321,10 +1330,28 @@ struct alpha_ocxo_pps_projection_store_t {
   clocks_alpha_ocxo_pps_projection_snapshot_t v = {};
 };
 
+struct alpha_ocxo_pps_projection_guard_t {
+  uint32_t measured_projection_signed_backward_count = 0;
+  uint32_t measured_projection_legacy_unsigned_wrap_count = 0;
+  uint32_t measured_projection_reject_count = 0;
+  uint32_t pps_projection_signed_backward_count = 0;
+  uint32_t pps_projection_legacy_unsigned_wrap_count = 0;
+  uint32_t pps_projection_sanity_reject_count = 0;
+
+  uint32_t last_pps_sequence = 0;
+  uint32_t last_target_dwt32 = 0;
+  uint32_t last_reference_dwt32 = 0;
+  int32_t  last_signed_delta_cycles = 0;
+  uint32_t last_legacy_unsigned_delta_cycles = 0;
+  int64_t  last_projected_minus_measured_ns = 0;
+};
+
 static alpha_ocxo_edge_history_t g_ocxo1_edge_history = {};
 static alpha_ocxo_edge_history_t g_ocxo2_edge_history = {};
 static alpha_ocxo_pps_projection_store_t g_ocxo1_pps_projection = {};
 static alpha_ocxo_pps_projection_store_t g_ocxo2_pps_projection = {};
+static alpha_ocxo_pps_projection_guard_t g_ocxo1_pps_projection_guard = {};
+static alpha_ocxo_pps_projection_guard_t g_ocxo2_pps_projection_guard = {};
 
 static alpha_ocxo_edge_history_t* alpha_ocxo_edge_history(time_clock_id_t clock) {
   switch (clock) {
@@ -1347,6 +1374,130 @@ static int64_t alpha_signed_delta_u64(uint64_t a, uint64_t b) {
   return (a >= b) ? (int64_t)(a - b) : -(int64_t)(b - a);
 }
 
+static alpha_ocxo_pps_projection_guard_t* alpha_ocxo_pps_projection_guard(
+    time_clock_id_t clock) {
+  switch (clock) {
+    case time_clock_id_t::OCXO1: return &g_ocxo1_pps_projection_guard;
+    case time_clock_id_t::OCXO2: return &g_ocxo2_pps_projection_guard;
+    default:                    return nullptr;
+  }
+}
+
+static uint64_t alpha_abs_u64_from_i64(int64_t value) {
+  return (value >= 0) ? (uint64_t)value : (uint64_t)(-value);
+}
+
+static int32_t alpha_dwt32_signed_delta_near(uint32_t from_dwt32,
+                                             uint32_t to_dwt32) {
+  const uint32_t u = (uint32_t)(to_dwt32 - from_dwt32);
+  if (u <= 0x7FFFFFFFUL) {
+    return (int32_t)u;
+  }
+  const uint32_t magnitude = (uint32_t)((~u) + 1U);
+  if (magnitude == 0x80000000UL) {
+    return (int32_t)(-2147483647 - 1);
+  }
+  return -(int32_t)magnitude;
+}
+
+static uint64_t alpha_dwt_cycles_to_gnss_ns_u64(uint64_t dwt_cycles) {
+  const uint32_t dwt_per_second = dwt_effective_cycles_per_pps_vclock_second();
+  if (dwt_per_second == 0) {
+    clocks_watchdog_anomaly("alpha_dwt_cps_zero_u64",
+                            (uint32_t)dwt_cycles,
+                            (uint32_t)(dwt_cycles >> 32),
+                            0,
+                            0);
+    return 0;
+  }
+  return (dwt_cycles * NS_PER_SECOND_U64 +
+          (uint64_t)dwt_per_second / 2ULL) /
+         (uint64_t)dwt_per_second;
+}
+
+static int64_t alpha_dwt_cycles_to_gnss_ns_i64(int64_t dwt_cycles) {
+  const uint64_t abs_cycles = alpha_abs_u64_from_i64(dwt_cycles);
+  const uint64_t abs_ns = alpha_dwt_cycles_to_gnss_ns_u64(abs_cycles);
+  return (dwt_cycles >= 0) ? (int64_t)abs_ns : -(int64_t)abs_ns;
+}
+
+static uint32_t alpha_projection_signed_window_cycles(void) {
+  const uint32_t cps = dwt_effective_cycles_per_pps_vclock_second();
+  const uint32_t base = cps ? cps : (uint32_t)DWT_EXPECTED_PER_PPS;
+  return base * ALPHA_OCXO_PPS_PROJECTION_MAX_SIGNED_DWT_SECONDS;
+}
+
+static void alpha_projection_guard_remember_delta(time_clock_id_t clock,
+                                                  uint32_t pps_sequence,
+                                                  uint32_t target_dwt32,
+                                                  uint32_t reference_dwt32,
+                                                  int32_t signed_delta_cycles,
+                                                  uint32_t legacy_unsigned_delta_cycles) {
+  alpha_ocxo_pps_projection_guard_t* g = alpha_ocxo_pps_projection_guard(clock);
+  if (!g) return;
+  g->last_pps_sequence = pps_sequence;
+  g->last_target_dwt32 = target_dwt32;
+  g->last_reference_dwt32 = reference_dwt32;
+  g->last_signed_delta_cycles = signed_delta_cycles;
+  g->last_legacy_unsigned_delta_cycles = legacy_unsigned_delta_cycles;
+}
+
+static void alpha_projection_guard_note_measured_backward(time_clock_id_t clock,
+                                                          uint32_t target_dwt32,
+                                                          uint32_t reference_dwt32,
+                                                          int32_t signed_delta_cycles,
+                                                          uint32_t legacy_unsigned_delta_cycles) {
+  alpha_ocxo_pps_projection_guard_t* g = alpha_ocxo_pps_projection_guard(clock);
+  if (!g) return;
+  g->measured_projection_signed_backward_count++;
+  if (legacy_unsigned_delta_cycles > alpha_projection_signed_window_cycles()) {
+    g->measured_projection_legacy_unsigned_wrap_count++;
+  }
+  alpha_projection_guard_remember_delta(clock, 0, target_dwt32, reference_dwt32,
+                                        signed_delta_cycles, legacy_unsigned_delta_cycles);
+}
+
+static void alpha_projection_guard_note_pps_backward(time_clock_id_t clock,
+                                                     uint32_t pps_sequence,
+                                                     uint32_t target_dwt32,
+                                                     uint32_t reference_dwt32,
+                                                     int32_t signed_delta_cycles,
+                                                     uint32_t legacy_unsigned_delta_cycles) {
+  alpha_ocxo_pps_projection_guard_t* g = alpha_ocxo_pps_projection_guard(clock);
+  if (!g) return;
+  g->pps_projection_signed_backward_count++;
+  if (legacy_unsigned_delta_cycles > alpha_projection_signed_window_cycles()) {
+    g->pps_projection_legacy_unsigned_wrap_count++;
+  }
+  alpha_projection_guard_remember_delta(clock, pps_sequence, target_dwt32, reference_dwt32,
+                                        signed_delta_cycles, legacy_unsigned_delta_cycles);
+}
+
+static void alpha_projection_guard_note_sanity_reject(time_clock_id_t clock,
+                                                      uint32_t pps_sequence,
+                                                      uint32_t target_dwt32,
+                                                      uint32_t reference_dwt32,
+                                                      int64_t projected_minus_measured_ns) {
+  alpha_ocxo_pps_projection_guard_t* g = alpha_ocxo_pps_projection_guard(clock);
+  if (!g) return;
+  g->pps_projection_sanity_reject_count++;
+  g->last_pps_sequence = pps_sequence;
+  g->last_target_dwt32 = target_dwt32;
+  g->last_reference_dwt32 = reference_dwt32;
+  g->last_projected_minus_measured_ns = projected_minus_measured_ns;
+}
+
+uint32_t clocks_alpha_ocxo_projection_guard_legacy_wrap_count(time_clock_id_t clock) {
+  const alpha_ocxo_pps_projection_guard_t* g = alpha_ocxo_pps_projection_guard(clock);
+  return g ? (g->measured_projection_legacy_unsigned_wrap_count +
+              g->pps_projection_legacy_unsigned_wrap_count) : 0U;
+}
+
+uint32_t clocks_alpha_ocxo_projection_guard_sanity_reject_count(time_clock_id_t clock) {
+  const alpha_ocxo_pps_projection_guard_t* g = alpha_ocxo_pps_projection_guard(clock);
+  return g ? g->pps_projection_sanity_reject_count : 0U;
+}
+
 static void alpha_ocxo_pps_projection_reset_store(
     alpha_ocxo_pps_projection_store_t& s, uint32_t clock_id) {
   s.seq++;
@@ -1360,6 +1511,8 @@ static void alpha_ocxo_pps_projection_reset_store(
 static void alpha_ocxo_pps_projection_reset_all(void) {
   g_ocxo1_edge_history = alpha_ocxo_edge_history_t{};
   g_ocxo2_edge_history = alpha_ocxo_edge_history_t{};
+  g_ocxo1_pps_projection_guard = alpha_ocxo_pps_projection_guard_t{};
+  g_ocxo2_pps_projection_guard = alpha_ocxo_pps_projection_guard_t{};
   alpha_ocxo_pps_projection_reset_store(
       g_ocxo1_pps_projection, (uint32_t)((uint8_t)time_clock_id_t::OCXO1));
   alpha_ocxo_pps_projection_reset_store(
@@ -1376,6 +1529,7 @@ static void alpha_ocxo_edge_history_install_zero(time_clock_id_t clock,
   h->current_valid = true;
   h->current.valid = true;
   h->current.dwt_at_edge = dwt_at_edge;
+  h->current.dwt64_at_edge = clocks_dwt_cycles_at_dwt(dwt_at_edge);
   h->current.counter32_at_edge = counter32_at_edge;
   h->current.ocxo_ns_at_edge = 0;
   h->current.measured_ns_at_edge = 0;
@@ -1398,6 +1552,10 @@ static void alpha_ocxo_edge_history_record(time_clock_id_t clock,
   alpha_ocxo_edge_fact_t fact{};
   fact.valid = true;
   fact.dwt_at_edge = dwt_at_edge;
+  fact.dwt64_at_edge = h->current_valid
+      ? (h->current.dwt64_at_edge +
+         (uint64_t)((uint32_t)(dwt_at_edge - h->current.dwt_at_edge)))
+      : clocks_dwt_cycles_at_dwt(dwt_at_edge);
   fact.counter32_at_edge = counter32_at_edge;
   fact.ocxo_ns_at_edge = ocxo_ns_at_edge;
   fact.measured_ns_at_edge = measured_ns_at_edge;
@@ -1420,6 +1578,7 @@ static alpha_ocxo_edge_fact_t alpha_ocxo_project_static_next_edge(
     uint32_t interval_cycles) {
   alpha_ocxo_edge_fact_t projected = edge;
   projected.dwt_at_edge = edge.dwt_at_edge + interval_cycles;
+  projected.dwt64_at_edge = edge.dwt64_at_edge + (uint64_t)interval_cycles;
   projected.counter32_at_edge =
       edge.counter32_at_edge + (uint32_t)VCLOCK_COUNTS_PER_SECOND;
   projected.ocxo_ns_at_edge = edge.ocxo_ns_at_edge + NS_PER_SECOND_U64;
@@ -1578,6 +1737,34 @@ static bool alpha_ocxo_pps_projection_build(
       (uint64_t)interval_cycles;
   const uint64_t projected_ns = edge0.ocxo_ns_at_edge + projected_delta_ns;
 
+  const int64_t projected_minus_existing =
+      alpha_signed_delta_u64(projected_ns, existing_pps_ns);
+  if (existing_pps_ns != 0 &&
+      alpha_abs_u64_from_i64(projected_minus_existing) >
+          ALPHA_OCXO_PPS_PROJECTION_SANITY_WINDOW_NS) {
+    alpha_projection_guard_note_sanity_reject(clock,
+                                              pps_sequence,
+                                              pps_dwt_at_edge,
+                                              edge0.dwt_at_edge,
+                                              projected_minus_existing);
+    alpha_ocxo_pps_projection_set_invalid(
+        clock,
+        ALPHA_OCXO_PPS_PROJECTION_INVALID_TARGET_OUT_OF_WINDOW,
+        pps_sequence,
+        pps_dwt_at_edge,
+        pps_vclock_ns,
+        existing_pps_ns,
+        &edge0,
+        &edge1,
+        latest_actual_interval_cycles,
+        completed_interval_count,
+        static_prediction_valid,
+        target_delta_raw_cycles,
+        target_overrun_cycles,
+        last_static_advance_count);
+    return true;
+  }
+
   clocks_alpha_ocxo_pps_projection_snapshot_t local = s->v;
   local.valid = true;
   local.clock_id = (uint32_t)((uint8_t)clock);
@@ -1612,8 +1799,7 @@ static bool alpha_ocxo_pps_projection_build(
   local.target_delta_cycles = target_delta_cycles;
   local.target_remaining_cycles = interval_cycles - target_delta_cycles;
   local.projected_ocxo_ns_at_pps = projected_ns;
-  local.projected_minus_existing_pps_ns =
-      alpha_signed_delta_u64(projected_ns, existing_pps_ns);
+  local.projected_minus_existing_pps_ns = projected_minus_existing;
   local.projected_minus_vclock_ns =
       alpha_signed_delta_u64(projected_ns, pps_vclock_ns);
   local.latest_actual_interval_cycles = latest_actual_interval_cycles;
@@ -1658,45 +1844,110 @@ static void alpha_ocxo_pps_projection_compute(time_clock_id_t clock,
       alpha_ocxo_latest_actual_interval_cycles(
           clock, &completed_interval_count, &static_prediction_valid);
 
-  // Prefer an actual bracketing pair when the latest OCXO event has already
-  // arrived after this PPS edge.  Otherwise use the latest edge plus the
-  // static next-edge DWT projection.
-  if (h->previous_valid && h->previous.valid && h->current.valid) {
-    const uint32_t actual_interval =
-        h->current.dwt_at_edge - h->previous.dwt_at_edge;
-    const uint32_t target_delta = pps_dwt_at_edge - h->previous.dwt_at_edge;
-    if (actual_interval != 0 && target_delta <= actual_interval) {
+  if (h->previous_valid && h->previous.valid && h->current.valid &&
+      h->current.dwt64_at_edge >= h->previous.dwt64_at_edge) {
+    const uint64_t actual_interval64 =
+        h->current.dwt64_at_edge - h->previous.dwt64_at_edge;
+    const int32_t target_delta_signed_from_prev =
+        alpha_dwt32_signed_delta_near(h->previous.dwt_at_edge,
+                                      pps_dwt_at_edge);
+    const uint32_t legacy_target_delta_from_prev =
+        pps_dwt_at_edge - h->previous.dwt_at_edge;
+
+    if (target_delta_signed_from_prev < 0) {
+      alpha_projection_guard_note_pps_backward(clock,
+                                               pps_sequence,
+                                               pps_dwt_at_edge,
+                                               h->previous.dwt_at_edge,
+                                               target_delta_signed_from_prev,
+                                               legacy_target_delta_from_prev);
+    }
+
+    if (target_delta_signed_from_prev >= 0 &&
+        actual_interval64 != 0 &&
+        actual_interval64 <= 0xFFFFFFFFULL &&
+        (uint64_t)target_delta_signed_from_prev <= actual_interval64) {
       if (alpha_ocxo_pps_projection_build(
               clock, ALPHA_OCXO_PPS_PROJECTION_SOURCE_ACTUAL_BRACKET,
-              h->previous, h->current, actual_interval, target_delta,
+              h->previous, h->current, (uint32_t)actual_interval64,
+              (uint32_t)target_delta_signed_from_prev,
               pps_sequence, pps_dwt_at_edge, pps_vclock_ns, existing_pps_ns,
               latest_actual_interval_cycles, completed_interval_count,
               static_prediction_valid,
-              0U, target_delta, 0U)) {
+              0U, legacy_target_delta_from_prev, 0U)) {
         return;
       }
     }
   }
 
   if (latest_actual_interval_cycles == 0) {
+    const uint32_t legacy_delta = pps_dwt_at_edge - h->current.dwt_at_edge;
     alpha_ocxo_pps_projection_set_invalid(
         clock, ALPHA_OCXO_PPS_PROJECTION_INVALID_NO_INTERVAL,
         pps_sequence, pps_dwt_at_edge, pps_vclock_ns, existing_pps_ns,
         &h->current, h->previous_valid ? &h->previous : nullptr,
         latest_actual_interval_cycles, completed_interval_count,
         static_prediction_valid,
-        pps_dwt_at_edge - h->current.dwt_at_edge, 0U, 0U);
+        legacy_delta, 0U, 0U);
     return;
   }
 
-  const uint32_t raw_target_delta = pps_dwt_at_edge - h->current.dwt_at_edge;
+  const int32_t raw_target_delta_signed =
+      alpha_dwt32_signed_delta_near(h->current.dwt_at_edge, pps_dwt_at_edge);
+  const uint32_t raw_target_delta_legacy =
+      pps_dwt_at_edge - h->current.dwt_at_edge;
+
+  if (raw_target_delta_signed < 0) {
+    alpha_projection_guard_note_pps_backward(clock,
+                                             pps_sequence,
+                                             pps_dwt_at_edge,
+                                             h->current.dwt_at_edge,
+                                             raw_target_delta_signed,
+                                             raw_target_delta_legacy);
+    alpha_ocxo_pps_projection_set_invalid(
+        clock,
+        ALPHA_OCXO_PPS_PROJECTION_INVALID_TARGET_OUT_OF_WINDOW,
+        pps_sequence,
+        pps_dwt_at_edge,
+        pps_vclock_ns,
+        existing_pps_ns,
+        &h->current,
+        h->previous_valid ? &h->previous : nullptr,
+        latest_actual_interval_cycles,
+        completed_interval_count,
+        static_prediction_valid,
+        raw_target_delta_legacy,
+        raw_target_delta_legacy,
+        0U);
+    return;
+  }
+
+  if ((uint32_t)raw_target_delta_signed > alpha_projection_signed_window_cycles()) {
+    alpha_ocxo_pps_projection_set_invalid(
+        clock,
+        ALPHA_OCXO_PPS_PROJECTION_INVALID_TARGET_OUT_OF_WINDOW,
+        pps_sequence,
+        pps_dwt_at_edge,
+        pps_vclock_ns,
+        existing_pps_ns,
+        &h->current,
+        h->previous_valid ? &h->previous : nullptr,
+        latest_actual_interval_cycles,
+        completed_interval_count,
+        static_prediction_valid,
+        raw_target_delta_legacy,
+        raw_target_delta_legacy,
+        0U);
+    return;
+  }
+
   const uint32_t raw_target_overrun =
-      (raw_target_delta > latest_actual_interval_cycles)
-          ? (raw_target_delta - latest_actual_interval_cycles)
+      ((uint32_t)raw_target_delta_signed > latest_actual_interval_cycles)
+          ? ((uint32_t)raw_target_delta_signed - latest_actual_interval_cycles)
           : 0U;
 
   alpha_ocxo_edge_fact_t edge0 = h->current;
-  uint32_t target_delta = raw_target_delta;
+  uint32_t target_delta = (uint32_t)raw_target_delta_signed;
   uint32_t static_advance_count = 0;
 
   while (target_delta > latest_actual_interval_cycles &&
@@ -1704,7 +1955,38 @@ static void alpha_ocxo_pps_projection_compute(time_clock_id_t clock,
     edge0 = alpha_ocxo_project_static_next_edge(edge0,
                                                 latest_actual_interval_cycles);
     static_advance_count++;
-    target_delta = pps_dwt_at_edge - edge0.dwt_at_edge;
+
+    const int32_t signed_from_advanced =
+        alpha_dwt32_signed_delta_near(edge0.dwt_at_edge, pps_dwt_at_edge);
+    const uint32_t legacy_from_advanced =
+        pps_dwt_at_edge - edge0.dwt_at_edge;
+
+    if (signed_from_advanced < 0) {
+      alpha_projection_guard_note_pps_backward(clock,
+                                               pps_sequence,
+                                               pps_dwt_at_edge,
+                                               edge0.dwt_at_edge,
+                                               signed_from_advanced,
+                                               legacy_from_advanced);
+      alpha_ocxo_pps_projection_set_invalid(
+          clock,
+          ALPHA_OCXO_PPS_PROJECTION_INVALID_TARGET_OUT_OF_WINDOW,
+          pps_sequence,
+          pps_dwt_at_edge,
+          pps_vclock_ns,
+          existing_pps_ns,
+          &edge0,
+          nullptr,
+          latest_actual_interval_cycles,
+          completed_interval_count,
+          static_prediction_valid,
+          raw_target_delta_legacy,
+          legacy_from_advanced,
+          static_advance_count);
+      return;
+    }
+
+    target_delta = (uint32_t)signed_from_advanced;
   }
 
   if (target_delta > latest_actual_interval_cycles) {
@@ -1715,7 +1997,7 @@ static void alpha_ocxo_pps_projection_compute(time_clock_id_t clock,
         &edge0, nullptr,
         latest_actual_interval_cycles, completed_interval_count,
         static_prediction_valid,
-        raw_target_delta, unresolved_overrun, static_advance_count);
+        raw_target_delta_legacy, unresolved_overrun, static_advance_count);
     return;
   }
 
@@ -1728,14 +2010,14 @@ static void alpha_ocxo_pps_projection_compute(time_clock_id_t clock,
           target_delta, pps_sequence, pps_dwt_at_edge, pps_vclock_ns,
           existing_pps_ns, latest_actual_interval_cycles,
           completed_interval_count, static_prediction_valid,
-          static_advance_count, raw_target_delta, raw_target_overrun)) {
+          static_advance_count, raw_target_delta_legacy, raw_target_overrun)) {
     alpha_ocxo_pps_projection_set_invalid(
         clock, ALPHA_OCXO_PPS_PROJECTION_INVALID_NO_INTERVAL,
         pps_sequence, pps_dwt_at_edge, pps_vclock_ns, existing_pps_ns,
         &edge0, &projected_next,
         latest_actual_interval_cycles, completed_interval_count,
         static_prediction_valid,
-        raw_target_delta, raw_target_overrun, static_advance_count);
+        raw_target_delta_legacy, raw_target_overrun, static_advance_count);
   }
 }
 
@@ -1857,15 +2139,7 @@ static alpha_measured_ns_clock_t* alpha_measured_ns_store(time_clock_id_t clock)
 }
 
 static uint64_t alpha_dwt_cycles_to_gnss_ns(uint32_t dwt_cycles) {
-  const uint32_t dwt_per_second = dwt_effective_cycles_per_pps_vclock_second();
-  if (dwt_per_second == 0) {
-    clocks_watchdog_anomaly("alpha_dwt_cps_zero", dwt_cycles, 0, 0, 0);
-    return 0;
-  }
-
-  return ((uint64_t)dwt_cycles * NS_PER_SECOND_U64 +
-          (uint64_t)dwt_per_second / 2ULL) /
-         (uint64_t)dwt_per_second;
+  return alpha_dwt_cycles_to_gnss_ns_u64((uint64_t)dwt_cycles);
 }
 
 static uint64_t alpha_ocxo_seed_ns_at_first_edge(uint32_t raw_edge_dwt) {
@@ -1890,6 +2164,7 @@ static uint64_t alpha_ocxo_apply_measured_second(time_clock_id_t clock,
   if (!m->initialized) {
     m->initialized = true;
     m->dwt_at_edge = raw_edge_dwt;
+    m->dwt64_at_edge = clocks_dwt_cycles_at_dwt(raw_edge_dwt);
     m->ns_at_edge = alpha_ocxo_seed_ns_at_first_edge(raw_edge_dwt);
     if (out_dwt_cycles) *out_dwt_cycles = 0;
     if (out_real_interval_ns) *out_real_interval_ns = 0;
@@ -1898,6 +2173,7 @@ static uint64_t alpha_ocxo_apply_measured_second(time_clock_id_t clock,
   }
 
   const uint32_t dwt_cycles = raw_edge_dwt - m->dwt_at_edge;
+  const uint64_t dwt64_at_edge = m->dwt64_at_edge + (uint64_t)dwt_cycles;
   const uint64_t real_interval_ns = alpha_dwt_cycles_to_gnss_ns(dwt_cycles);
   const int64_t residual_fast_ns =
       (int64_t)NS_PER_SECOND_U64 - (int64_t)real_interval_ns;
@@ -1907,6 +2183,7 @@ static uint64_t alpha_ocxo_apply_measured_second(time_clock_id_t clock,
   // not an ideal +1e9-per-edge nominal ledger.
   m->ns_at_edge += real_interval_ns;
   m->dwt_at_edge = raw_edge_dwt;
+  m->dwt64_at_edge = dwt64_at_edge;
 
   if (out_dwt_cycles) *out_dwt_cycles = dwt_cycles;
   if (out_real_interval_ns) *out_real_interval_ns = real_interval_ns;
@@ -1923,8 +2200,46 @@ static uint64_t alpha_ocxo_project_measured_ns_to_dwt(time_clock_id_t clock,
     return 0;
   }
 
-  const uint32_t delta_cycles = target_dwt - m->dwt_at_edge;
-  return m->ns_at_edge + alpha_dwt_cycles_to_gnss_ns(delta_cycles);
+  if (!m->initialized) return 0;
+
+  const int32_t signed_delta_cycles =
+      alpha_dwt32_signed_delta_near(m->dwt_at_edge, target_dwt);
+  const uint32_t legacy_unsigned_delta = target_dwt - m->dwt_at_edge;
+
+  if (signed_delta_cycles < 0) {
+    alpha_projection_guard_note_measured_backward(clock,
+                                                  target_dwt,
+                                                  m->dwt_at_edge,
+                                                  signed_delta_cycles,
+                                                  legacy_unsigned_delta);
+  }
+
+  if (alpha_abs_u64_from_i64((int64_t)signed_delta_cycles) >
+      (uint64_t)alpha_projection_signed_window_cycles()) {
+    alpha_ocxo_pps_projection_guard_t* g = alpha_ocxo_pps_projection_guard(clock);
+    if (g) g->measured_projection_reject_count++;
+    clocks_watchdog_anomaly("alpha_ocxo_project_dwt_window",
+                            (uint32_t)((uint8_t)clock),
+                            target_dwt,
+                            m->dwt_at_edge,
+                            legacy_unsigned_delta);
+    return m->ns_at_edge;
+  }
+
+  const int64_t delta_ns =
+      alpha_dwt_cycles_to_gnss_ns_i64((int64_t)signed_delta_cycles);
+
+  if (delta_ns < 0) {
+    const uint64_t back_ns = (uint64_t)(-delta_ns);
+    if (back_ns > m->ns_at_edge) {
+      alpha_ocxo_pps_projection_guard_t* g = alpha_ocxo_pps_projection_guard(clock);
+      if (g) g->measured_projection_reject_count++;
+      return 0;
+    }
+    return m->ns_at_edge - back_ns;
+  }
+
+  return m->ns_at_edge + (uint64_t)delta_ns;
 }
 
 static void alpha_forensics_reset_store(alpha_lane_forensics_store_t& s) {
@@ -2992,9 +3307,11 @@ bool clocks_alpha_zero_from_smartzero(const char* reason) {
   g_ocxo1_measured_ns.initialized = true;
   g_ocxo1_measured_ns.ns_at_edge = 0;
   g_ocxo1_measured_ns.dwt_at_edge = ocxo1.anchor_dwt;
+  g_ocxo1_measured_ns.dwt64_at_edge = clocks_dwt_cycles_at_dwt(ocxo1.anchor_dwt);
   g_ocxo2_measured_ns.initialized = true;
   g_ocxo2_measured_ns.ns_at_edge = 0;
   g_ocxo2_measured_ns.dwt_at_edge = ocxo2.anchor_dwt;
+  g_ocxo2_measured_ns.dwt64_at_edge = clocks_dwt_cycles_at_dwt(ocxo2.anchor_dwt);
 
   alpha_ocxo_edge_history_install_zero(time_clock_id_t::OCXO1,
                                        ocxo1.anchor_dwt,
