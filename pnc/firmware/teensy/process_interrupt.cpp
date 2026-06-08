@@ -26,7 +26,7 @@
 //                   dwt_isr_entry_raw; it is evidence, never event authority.
 //
 // TimePop is the principled exception to the "no DWT conversion in
-// PPS_VCLOCK" rule: it projects CH2 fire facts onto the PPS_VCLOCK timeline
+// PPS_VCLOCK" rule: it projects legacy-CH2-API / actual-CH1 fire facts onto the PPS_VCLOCK timeline
 // for scheduling diagnostics. VCLOCK and OCXO one-second subscribers receive
 // authored edge facts whose DWT coordinates may be EMA-predicted from completed
 // one-second intervals; counter32/GNSS identity remains exact authority.
@@ -34,18 +34,18 @@
 // authored edge DWTs.
 //
 // Lanes:
-//   VCLOCK : TimePop recurring client on QTimer1 CH2 (10 MHz VCLOCK domain)
-//   OCXO1  : QTimer2 CH0, PCS=0, one-second edge compare only
-//   OCXO2  : QTimer3 CH3, PCS=3, one-second edge compare only
-//   TimePop: QTimer1 CH2, varied compare intervals (foreground scheduler)
+//   VCLOCK : QTimer1 CH0 counter + CH1 compare (TimePop legacy CH2 API wraps CH1)
+//   OCXO1  : QTimer2 CH0 counter + CH1 compare
+//   OCXO2  : QTimer3 CH3 physical adapter (pin 15 routes to TIMER3; pin 19/TIMER0 is SMBus SCL)
+//   TimePop: QTimer1 CH1 varied compare intervals (foreground scheduler)
 //
 // The PPS GPIO ISR captures DWT as its first instruction, then reads the
 // QTimer1 CH0 low-word counter.  process_interrupt maps that low-word
 // hardware observation into the private synthetic 32-bit VCLOCK identity.
 // When a rebootstrap is pending, it records the selected VCLOCK edge.
-// Native QTimer1 CH2 custody now consumes that pending edge after TimePop has
-// processed a CH2 compare event, back-projects to the selected edge, and
-// publishes the canonical PPS_VCLOCK epoch.  Native CH2 also owns steady-state
+// Native QTimer1 CH1 custody now consumes that pending edge after TimePop has
+// processed a legacy-CH2-API / actual-CH1 compare event, back-projects to the selected edge, and
+// publishes the canonical PPS_VCLOCK epoch.  Native CH1 also owns steady-state
 // VCLOCK one-second fact authorship, VCLOCK SmartZero sampling, PPS_RELAY
 // deassert, fact-drain arming, and passive 16-bit rollover tending.
 // ============================================================================
@@ -172,7 +172,7 @@ static constexpr uint32_t EPOCH_CAPTURE_MAX_WINDOW_CYCLES =
 // VCLOCK/relay TimePop heartbeat.
 //
 // VCLOCK_HEARTBEAT remains a critical recurring TimePop ISR client on the
-// sovereign QTimer1 CH2 rail, but it is no longer a rollover owner.  VCLOCK still uses this rail deliberately:
+// sovereign QTimer1 CH1 rail, but it is no longer a rollover owner.  VCLOCK still uses this rail deliberately:
 // TimePop's same-deadline coalescing keeps VCLOCK facts on one perishable ISR
 // surface and avoids introducing a competing preemptive VCLOCK compare.
 static constexpr uint64_t VCLOCK_HEARTBEAT_PERIOD_NS = 1000000ULL;
@@ -180,7 +180,7 @@ static constexpr const char* VCLOCK_HEARTBEAT_NAME = "VCLOCK_HEARTBEAT";
 
 // PPS relay ownership lives in process_interrupt because the visible relay edge
 // is a physical PPS witness.  The rising edge is asserted directly inside the
-// PPS GPIO ISR; the 500 ms deassert is driven by intrinsic QTimer1 CH2
+// PPS GPIO ISR; the 500 ms deassert is driven by intrinsic QTimer1 CH1
 // elapsed-tick service so relay-off no longer depends on VCLOCK_HEARTBEAT
 // callback dispatch.
 static constexpr uint64_t PPS_RELAY_OFF_NS = 500000000ULL;
@@ -380,6 +380,35 @@ static constexpr uint32_t HANDOFF_QTIMER1_CH1_RING_SIZE = 8U;
 static constexpr uint32_t HANDOFF_QTIMER1_CH2_RING_SIZE = 16U;
 static constexpr uint32_t HANDOFF_OCXO_RING_SIZE = 8U;
 static constexpr uint32_t HANDOFF_PPS_RING_SIZE = 4U;
+
+
+// ============================================================================
+// Uniform QuadTimer lane doctrine — experiment
+// ============================================================================
+//
+// Primary clock lanes now use the same hardware channel roles:
+//   CH0 = passive 16-bit counter observation
+//   CH1 = active compare rail
+//
+// The public TimePop API still uses its historical "CH2" function names so
+// process_timepop does not need to move in this experiment; those calls now
+// target QTimer1 CH1 internally.  The legacy hosted QTimer1 CH1 service rail
+// is disabled in this build so QTimer1 does not carry a second active compare
+// geometry while we test the clock-lane equivalence claim.
+static constexpr uint8_t QTIMER_CLOCK_COUNTER_CH = 0;
+static constexpr uint8_t QTIMER_CLOCK_COMPARE_CH = 1;
+static constexpr uint8_t QTIMER1_AUX_COMPARE_CH  = 2;  // retired/off
+static constexpr uint8_t QTIMER_CLOCK_PCS        = 0;
+// OCXO2 physical adapter:
+//
+// Teensy pin 15 is physically routed to QTimer3 TIMER3, not TIMER0.  Pin 19
+// would be the clean QTimer3 TIMER0 sibling, but it is occupied by SMBus SCL
+// in this system.  Therefore OCXO2 deliberately remains a documented physical
+// exception: QTimer3 CH3 counter+compare, PCS=3.
+static constexpr uint8_t QTIMER3_OCXO2_PHYSICAL_CH  = 3;
+static constexpr uint8_t QTIMER3_OCXO2_PHYSICAL_PCS = 3;
+static constexpr const char* QTIMER_UNIFORM_DOCTRINE =
+    "CLOCK_CH0_COUNTER_CH1_COMPARE_EXCEPT_OCXO2_PIN15_QTIMER3_CH3_ADAPTER";
 
 // ============================================================================
 // SpinCatch landing-only witness — symmetric OCXO lead tuning
@@ -1561,8 +1590,8 @@ struct interrupt_subscriber_runtime_t {
 };
 
 static const interrupt_subscriber_descriptor_t DESCRIPTORS[] = {
-  { interrupt_subscriber_kind_t::VCLOCK, "VCLOCK", interrupt_provider_kind_t::QTIMER1, interrupt_lane_t::QTIMER1_CH2_COMP },
-  { interrupt_subscriber_kind_t::OCXO1,  "OCXO1",  interrupt_provider_kind_t::QTIMER2, interrupt_lane_t::QTIMER2_CH0_COMP },
+  { interrupt_subscriber_kind_t::VCLOCK, "VCLOCK", interrupt_provider_kind_t::QTIMER1, interrupt_lane_t::QTIMER1_CH1_COMP },
+  { interrupt_subscriber_kind_t::OCXO1,  "OCXO1",  interrupt_provider_kind_t::QTIMER2, interrupt_lane_t::QTIMER2_CH1_COMP },
   { interrupt_subscriber_kind_t::OCXO2,  "OCXO2",  interrupt_provider_kind_t::QTIMER3, interrupt_lane_t::QTIMER3_CH3_COMP },
 };
 
@@ -2093,7 +2122,9 @@ struct ocxo_runtime_context_t;
 struct ocxo_lane_t {
   const char* name = nullptr;
   IMXRT_TMR_t* module = nullptr;
-  uint8_t      channel = 0;
+  uint8_t      channel = 0;  // legacy alias for active compare channel
+  uint8_t      counter_channel = 0;  // passive counter channel
+  uint8_t      compare_channel = 0;  // active compare channel
   uint8_t      pcs = 0;
   int          input_pin = -1;
   bool     initialized = false;
@@ -2447,12 +2478,12 @@ struct ocxo_runtime_context_t {
 static ocxo_runtime_context_t g_ocxo1_ctx = {
   interrupt_subscriber_kind_t::OCXO1,
   interrupt_provider_kind_t::QTIMER2,
-  interrupt_lane_t::QTIMER2_CH0_COMP,
+  interrupt_lane_t::QTIMER2_CH1_COMP,
   "OCXO1",
   "ocxo1",
-  "QTIMER2_CH0_ONE_SECOND_EDGE_COMPARE",
+  "QTIMER2_CH1_ONE_SECOND_EDGE_COMPARE_CH0_COUNTER",
   "QTIMER2_CH0_LOCAL_SYNTHETIC_COUNTER32",
-  "QTIMER2_CH0_EMA_PREDICTED_DWT",
+  "QTIMER2_CH1_EMA_PREDICTED_DWT",
   "OCXO1_FACT_DRAIN",
   &g_ocxo1_lane,
   &g_ocxo1_clock32,
@@ -2466,8 +2497,8 @@ static ocxo_runtime_context_t g_ocxo2_ctx = {
   interrupt_lane_t::QTIMER3_CH3_COMP,
   "OCXO2",
   "ocxo2",
-  "QTIMER3_CH3_ONE_SECOND_EDGE_COMPARE",
-  "QTIMER3_CH3_LOCAL_SYNTHETIC_COUNTER32",
+  "QTIMER3_CH3_ONE_SECOND_EDGE_COMPARE_PHYSICAL_ADAPTER",
+  "QTIMER3_CH3_LOCAL_SYNTHETIC_COUNTER32_PIN15_ADAPTER",
   "QTIMER3_CH3_EMA_PREDICTED_DWT",
   "OCXO2_FACT_DRAIN",
   &g_ocxo2_lane,
@@ -2513,7 +2544,7 @@ static volatile uint32_t g_vclock_heartbeat_last_ocxo2_counter32_retired = 0;
 // Passive CH2 rollover tend — surgical coexistence layer.
 //
 // This is deliberately not a scheduled service and not an event source.  It
-// runs from the QTimer1 CH2 ISR path and merely refreshes process_interrupt's
+// runs from the QTimer1 CH1 ISR path and merely refreshes process_interrupt's
 // synthetic 32-bit ambient projections from current 16-bit hardware reads.
 // Existing VCLOCK_HEARTBEAT and OCXO local cadence event authorship remain intact.
 static constexpr bool     CH2_IMPLICIT_ROLLOVER_ENABLED = true;
@@ -2784,15 +2815,15 @@ static inline uint32_t synthetic_clock_advance_at_hardware(synthetic_clock32_t& 
 
 uint32_t interrupt_qtimer1_counter32_now(void)   { return vclock_synthetic_from_hardware_low16(qtimer1_ch0_counter_now()); }
 uint16_t interrupt_qtimer2_ch0_counter_now(void) {
-  return OCXO1_DISABLED ? 0U : IMXRT_TMR2.CH[0].CNTR;
+  return OCXO1_DISABLED ? 0U : IMXRT_TMR2.CH[QTIMER_CLOCK_COUNTER_CH].CNTR;
+}
+uint16_t interrupt_qtimer3_ch0_counter_now(void) {
+  return OCXO2_DISABLED ? 0U : IMXRT_TMR3.CH[QTIMER_CLOCK_COUNTER_CH].CNTR;
 }
 uint16_t interrupt_qtimer3_ch3_counter_now(void) {
-  return OCXO2_DISABLED ? 0U : IMXRT_TMR3.CH[3].CNTR;
+  // OCXO2 physical adapter: pin 15 is QTimer3 TIMER3.
+  return OCXO2_DISABLED ? 0U : IMXRT_TMR3.CH[QTIMER3_OCXO2_PHYSICAL_CH].CNTR;
 }
-
-// Forward declarations for compare helpers defined below.
-static void qtimer2_ch0_program_compare(uint16_t target_low16);
-static void qtimer3_program_compare(uint8_t ch, uint16_t target_low16);
 
 static inline uint32_t cadence_mod_for_ticks(uint32_t ticks, uint32_t interval) {
   if (interval == 0) return 0;
@@ -2981,7 +3012,7 @@ static void interrupt_ch2_implicit_rollover_tend(void) {
   // existing QTimer2/QTimer3 cadence ladders still own OCXO scheduled event
   // identity and one-second publication; this path is only rollover insurance.
   if (!OCXO1_DISABLED && g_ocxo1_lane.initialized) {
-    const uint16_t ocxo1_hw16 = IMXRT_TMR2.CH[0].CNTR;
+    const uint16_t ocxo1_hw16 = IMXRT_TMR2.CH[QTIMER_CLOCK_COUNTER_CH].CNTR;
     synthetic_clock_observe_hw16_no_pending_zero(g_ocxo1_clock32, ocxo1_hw16);
     g_ch2_implicit_rollover_ocxo1_updates++;
     g_ch2_implicit_rollover_last_ocxo1_hw16 = ocxo1_hw16;
@@ -2994,7 +3025,7 @@ static void interrupt_ch2_implicit_rollover_tend(void) {
   }
 
   if (!OCXO2_DISABLED && g_ocxo2_lane.initialized) {
-    const uint16_t ocxo2_hw16 = IMXRT_TMR3.CH[3].CNTR;
+    const uint16_t ocxo2_hw16 = IMXRT_TMR3.CH[g_ocxo2_lane.counter_channel].CNTR;
     synthetic_clock_observe_hw16_no_pending_zero(g_ocxo2_clock32, ocxo2_hw16);
     g_ch2_implicit_rollover_ocxo2_updates++;
     g_ch2_implicit_rollover_last_ocxo2_hw16 = ocxo2_hw16;
@@ -3020,7 +3051,7 @@ bool interrupt_clock_snapshot(interrupt_subscriber_kind_t kind, interrupt_clock_
 
   if (kind == interrupt_subscriber_kind_t::OCXO1) {
     if (OCXO1_DISABLED) return false;
-    const uint16_t hw = IMXRT_TMR2.CH[0].CNTR;
+    const uint16_t hw = IMXRT_TMR2.CH[QTIMER_CLOCK_COUNTER_CH].CNTR;
     out->hardware16 = hw;
     out->counter32 = project_counter32_from_hw16(g_ocxo1_clock32, hw);
     out->ns64 = project_ns64_from_hw16(g_ocxo1_clock32, hw);
@@ -3029,7 +3060,7 @@ bool interrupt_clock_snapshot(interrupt_subscriber_kind_t kind, interrupt_clock_
 
   if (kind == interrupt_subscriber_kind_t::OCXO2) {
     if (OCXO2_DISABLED) return false;
-    const uint16_t hw = IMXRT_TMR3.CH[3].CNTR;
+    const uint16_t hw = IMXRT_TMR3.CH[g_ocxo2_lane.counter_channel].CNTR;
     out->hardware16 = hw;
     out->counter32 = project_counter32_from_hw16(g_ocxo2_clock32, hw);
     out->ns64 = project_ns64_from_hw16(g_ocxo2_clock32, hw);
@@ -3531,75 +3562,63 @@ bool interrupt_smartzero_snapshot(interrupt_smartzero_snapshot_t* out) {
 // Compare channel helpers
 // ============================================================================
 
-static inline void qtimer1_ch1_clear_compare_flag(void) {
-  IMXRT_TMR1.CH[1].CSCTRL &= ~(TMR_CSCTRL_TCF1 | TMR_CSCTRL_TCF2);
+static inline void qtimer_clear_compare_flag(IMXRT_TMR_t& module, uint8_t ch) {
+  module.CH[ch].CSCTRL &= ~(TMR_CSCTRL_TCF1 | TMR_CSCTRL_TCF2);
+  (void)module.CH[ch].CSCTRL;
 }
 
-static inline void qtimer1_ch1_program_compare(uint16_t target_low16) {
-  qtimer1_ch1_clear_compare_flag();
-  IMXRT_TMR1.CH[1].COMP1  = target_low16;
-  IMXRT_TMR1.CH[1].CMPLD1 = target_low16;
-  qtimer1_ch1_clear_compare_flag();
-  IMXRT_TMR1.CH[1].CSCTRL |= TMR_CSCTRL_TCF1EN;
+static inline void qtimer_program_compare(IMXRT_TMR_t& module,
+                                          uint8_t ch,
+                                          uint16_t target_low16) {
+  qtimer_clear_compare_flag(module, ch);
+  module.CH[ch].COMP1  = target_low16;
+  module.CH[ch].CMPLD1 = target_low16;
+  qtimer_clear_compare_flag(module, ch);
+  module.CH[ch].CSCTRL |= TMR_CSCTRL_TCF1EN;
+}
+
+static inline void qtimer_disable_compare(IMXRT_TMR_t& module, uint8_t ch) {
+  module.CH[ch].CSCTRL &= ~TMR_CSCTRL_TCF1EN;
+  qtimer_clear_compare_flag(module, ch);
+  qtimer_clear_compare_flag(module, ch);
+}
+
+// Legacy QTimer1 CH1 hosted-rail API is deliberately disabled while the
+// uniform clock-lane experiment is active.  QTimer1 CH1 is now the sole VCLOCK
+// compare rail used by TimePop through the historical CH2 API.
+static inline void qtimer1_ch1_clear_compare_flag(void) {
+  qtimer_clear_compare_flag(IMXRT_TMR1, QTIMER1_AUX_COMPARE_CH);
+}
+
+static inline void qtimer1_ch1_program_compare(uint16_t) {
+  // Disabled: do not program QTimer1 CH2 or the uniform CH1 rail.
 }
 
 static inline void qtimer1_ch1_disable_compare_hw(void) {
-  IMXRT_TMR1.CH[1].CSCTRL &= ~TMR_CSCTRL_TCF1EN;
-  qtimer1_ch1_clear_compare_flag();
+  qtimer_disable_compare(IMXRT_TMR1, QTIMER1_AUX_COMPARE_CH);
 }
 
+// Legacy QTimer1 CH2 TimePop API now drives the uniform CH1 compare channel.
+// The name remains so process_timepop does not need to be part of this patch.
 static inline void qtimer1_ch2_clear_compare_flag(void) {
-  IMXRT_TMR1.CH[2].CSCTRL &= ~(TMR_CSCTRL_TCF1 | TMR_CSCTRL_TCF2);
+  qtimer_clear_compare_flag(IMXRT_TMR1, QTIMER_CLOCK_COMPARE_CH);
 }
 
 static inline void qtimer1_ch2_program_compare(uint16_t target_low16) {
-  qtimer1_ch2_clear_compare_flag();
-  IMXRT_TMR1.CH[2].COMP1  = target_low16;
-  IMXRT_TMR1.CH[2].CMPLD1 = target_low16;
-  qtimer1_ch2_clear_compare_flag();
-  IMXRT_TMR1.CH[2].CSCTRL |= TMR_CSCTRL_TCF1EN;
+  qtimer_program_compare(IMXRT_TMR1, QTIMER_CLOCK_COMPARE_CH, target_low16);
 }
 
-// QuadTimer compare flags are cleared by writing the flag bits low in CSCTRL.
-// Match the QTimer1 CH1/CH2 clear idiom.
-static inline void qtimer2_ch0_clear_compare_flag(void) {
-  IMXRT_TMR2.CH[0].CSCTRL &= ~(TMR_CSCTRL_TCF1 | TMR_CSCTRL_TCF2);
-  (void)IMXRT_TMR2.CH[0].CSCTRL;
+static inline void ocxo_compare_clear_flag(const ocxo_lane_t& lane) {
+  qtimer_clear_compare_flag(*lane.module, lane.compare_channel);
 }
 
-static inline void qtimer2_ch0_program_compare(uint16_t target_low16) {
-  qtimer2_ch0_clear_compare_flag();
-  IMXRT_TMR2.CH[0].COMP1  = target_low16;
-  IMXRT_TMR2.CH[0].CMPLD1 = target_low16;
-  qtimer2_ch0_clear_compare_flag();
-  IMXRT_TMR2.CH[0].CSCTRL |= TMR_CSCTRL_TCF1EN;
+static inline void ocxo_compare_program(const ocxo_lane_t& lane,
+                                        uint16_t target_low16) {
+  qtimer_program_compare(*lane.module, lane.compare_channel, target_low16);
 }
 
-static inline void qtimer2_ch0_disable_compare(void) {
-  IMXRT_TMR2.CH[0].CSCTRL &= ~TMR_CSCTRL_TCF1EN;
-  qtimer2_ch0_clear_compare_flag();
-  qtimer2_ch0_clear_compare_flag();
-}
-
-// QuadTimer compare flags are cleared by writing the flag bits low in CSCTRL.
-// Match the QTimer1 CH1/CH2 clear idiom.
-static inline void qtimer3_clear_compare_flag(uint8_t ch) {
-  IMXRT_TMR3.CH[ch].CSCTRL &= ~(TMR_CSCTRL_TCF1 | TMR_CSCTRL_TCF2);
-  (void)IMXRT_TMR3.CH[ch].CSCTRL;
-}
-
-static inline void qtimer3_program_compare(uint8_t ch, uint16_t target_low16) {
-  qtimer3_clear_compare_flag(ch);
-  IMXRT_TMR3.CH[ch].COMP1  = target_low16;
-  IMXRT_TMR3.CH[ch].CMPLD1 = target_low16;
-  qtimer3_clear_compare_flag(ch);
-  IMXRT_TMR3.CH[ch].CSCTRL |= TMR_CSCTRL_TCF1EN;
-}
-
-static inline void qtimer3_disable_compare(uint8_t ch) {
-  IMXRT_TMR3.CH[ch].CSCTRL &= ~TMR_CSCTRL_TCF1EN;
-  qtimer3_clear_compare_flag(ch);
-  qtimer3_clear_compare_flag(ch);
+static inline void ocxo_compare_disable(const ocxo_lane_t& lane) {
+  qtimer_disable_compare(*lane.module, lane.compare_channel);
 }
 
 // ============================================================================
@@ -4782,7 +4801,7 @@ static void ocxo_lane_program_local_cadence_compare(ocxo_lane_t& lane,
                                                     uint32_t reason) {
   const uint16_t target_low16 = (uint16_t)(target_counter32 & 0xFFFFU);
 
-  lane.cadence_last_program_csctrl_before = lane.module->CH[lane.channel].CSCTRL;
+  lane.cadence_last_program_csctrl_before = lane.module->CH[lane.compare_channel].CSCTRL;
   lane.cadence_last_program_flag_before =
       (lane.cadence_last_program_csctrl_before & TMR_CSCTRL_TCF1) != 0;
   lane.cadence_last_program_enabled_before =
@@ -4798,7 +4817,7 @@ static void ocxo_lane_program_local_cadence_compare(ocxo_lane_t& lane,
 
   ocxo_lane_program_compare(lane, target_low16);
 
-  lane.cadence_last_program_csctrl_after = lane.module->CH[lane.channel].CSCTRL;
+  lane.cadence_last_program_csctrl_after = lane.module->CH[lane.compare_channel].CSCTRL;
   lane.cadence_last_program_flag_after =
       (lane.cadence_last_program_csctrl_after & TMR_CSCTRL_TCF1) != 0;
   lane.cadence_last_program_enabled_after =
@@ -5190,23 +5209,15 @@ static bool vclock_heartbeat_arm_timepop(void) {
 }
 
 // ============================================================================
-// OCXO lanes — QTimer2 CH0 / QTimer3 CH3
+// OCXO lanes — OCXO1 uniform CH0/CH1; OCXO2 pin15 physical adapter on QTimer3 CH3
 // ============================================================================
 //
 static void ocxo_lane_program_compare(ocxo_lane_t& lane, uint16_t target_low16) {
-  if (lane.module == &IMXRT_TMR2 && lane.channel == 0) {
-    qtimer2_ch0_program_compare(target_low16);
-  } else if (lane.module == &IMXRT_TMR3) {
-    qtimer3_program_compare(lane.channel, target_low16);
-  }
+  ocxo_compare_program(lane, target_low16);
 }
 
 static void ocxo_lane_disable_compare(ocxo_lane_t& lane) {
-  if (lane.module == &IMXRT_TMR2 && lane.channel == 0) {
-    qtimer2_ch0_disable_compare();
-  } else if (lane.module == &IMXRT_TMR3) {
-    qtimer3_disable_compare(lane.channel);
-  }
+  ocxo_compare_disable(lane);
 }
 
 // ISR discipline for OCXO lanes is reentry-safe capture only:
@@ -5422,19 +5433,15 @@ static bool ocxo_fact_ring_push_from_isr(ocxo_runtime_context_t& ctx,
 
 
 static inline bool ocxo_lane_compare_flag_pending(const ocxo_lane_t& lane) {
-  return (lane.module->CH[lane.channel].CSCTRL & TMR_CSCTRL_TCF1) != 0;
+  return (lane.module->CH[lane.compare_channel].CSCTRL & TMR_CSCTRL_TCF1) != 0;
 }
 
 static inline uint16_t ocxo_lane_counter_now(const ocxo_lane_t& lane) {
-  return lane.module->CH[lane.channel].CNTR;
+  return lane.module->CH[lane.counter_channel].CNTR;
 }
 
 static void ocxo_lane_clear_compare_flag(ocxo_lane_t& lane) {
-  if (lane.module == &IMXRT_TMR2 && lane.channel == 0) {
-    qtimer2_ch0_clear_compare_flag();
-  } else if (lane.module == &IMXRT_TMR3) {
-    qtimer3_clear_compare_flag(lane.channel);
-  }
+  ocxo_compare_clear_flag(lane);
 }
 
 static void ocxo_qtimer_diag_record(ocxo_runtime_context_t& ctx,
@@ -6870,7 +6877,7 @@ static void ocxo_cadence_rearm_or_stop(
     // inside smartzero_feed_sample().  The accepted lane now transitions into
     // normal one-second edge-capture mode; do not overwrite the newly prepared
     // target with the just-serviced SmartZero sample +10,000.
-    sample.isr_csctrl_after_program = lane.module->CH[lane.channel].CSCTRL;
+    sample.isr_csctrl_after_program = lane.module->CH[lane.compare_channel].CSCTRL;
     return;
   }
 
@@ -6878,7 +6885,7 @@ static void ocxo_cadence_rearm_or_stop(
   const bool keep_running = lane.active || keep_for_smartzero;
   if (!keep_running) {
     ocxo_lane_stop_local_cadence(lane, OCXO_CADENCE_REASON_STOP);
-    sample.isr_csctrl_after_program = lane.module->CH[lane.channel].CSCTRL;
+    sample.isr_csctrl_after_program = lane.module->CH[lane.compare_channel].CSCTRL;
     return;
   }
 
@@ -6910,7 +6917,7 @@ static void ocxo_cadence_rearm_or_stop(
                                         OCXO_CADENCE_REASON_REARM);
   }
 
-  sample.isr_csctrl_after_program = lane.module->CH[lane.channel].CSCTRL;
+  sample.isr_csctrl_after_program = lane.module->CH[lane.compare_channel].CSCTRL;
 }
 
 static interrupt_perishable_fact_t ocxo_cadence_build_perishable_fact(
@@ -6991,7 +6998,7 @@ static void ocxo_cadence_capture_priority0(ocxo_runtime_context_t& ctx,
           ? g_handoff_ocxo1
           : g_handoff_ocxo2;
 
-  const uint32_t csctrl_entry = lane.module->CH[lane.channel].CSCTRL;
+  const uint32_t csctrl_entry = lane.module->CH[lane.compare_channel].CSCTRL;
 
   // False/unowned IRQs are defused in the capture tier; there is no meaningful
   // edge packet to hand off.
@@ -7199,14 +7206,10 @@ static void qtimer1_ch1_schedule_next_hop(void) {
 }
 
 bool interrupt_qtimer1_ch1_arm_compare(uint32_t target_counter32) {
-  if (!g_interrupt_hw_ready) return false;
-
-  g_qtimer1_ch1_target_counter32 = target_counter32;
-  g_qtimer1_ch1_active = true;
+  (void)target_counter32;
   g_qtimer1_ch1_arm_count++;
-
-  qtimer1_ch1_schedule_next_hop();
-  return g_qtimer1_ch1_active;
+  g_qtimer1_ch1_active = false;
+  return false;
 }
 
 void interrupt_qtimer1_ch1_disable_compare(void) {
@@ -7214,9 +7217,9 @@ void interrupt_qtimer1_ch1_disable_compare(void) {
   qtimer1_ch1_disable_compare_hw();
 }
 
-uint16_t interrupt_qtimer1_ch1_counter_now(void) { return IMXRT_TMR1.CH[1].CNTR; }
-uint16_t interrupt_qtimer1_ch1_comp1_now(void)   { return IMXRT_TMR1.CH[1].COMP1; }
-uint16_t interrupt_qtimer1_ch1_csctrl_now(void)  { return IMXRT_TMR1.CH[1].CSCTRL; }
+uint16_t interrupt_qtimer1_ch1_counter_now(void) { return IMXRT_TMR1.CH[QTIMER1_AUX_COMPARE_CH].CNTR; }
+uint16_t interrupt_qtimer1_ch1_comp1_now(void)   { return IMXRT_TMR1.CH[QTIMER1_AUX_COMPARE_CH].COMP1; }
+uint16_t interrupt_qtimer1_ch1_csctrl_now(void)  { return IMXRT_TMR1.CH[QTIMER1_AUX_COMPARE_CH].CSCTRL; }
 
 // ============================================================================
 // TimePop hardware service API
@@ -7233,9 +7236,9 @@ void interrupt_qtimer1_ch2_arm_compare(uint32_t target_counter32) {
   qtimer1_ch2_program_compare(hardware_target);
 }
 
-uint16_t interrupt_qtimer1_ch2_counter_now(void) { return IMXRT_TMR1.CH[2].CNTR; }
-uint16_t interrupt_qtimer1_ch2_comp1_now(void)   { return IMXRT_TMR1.CH[2].COMP1; }
-uint16_t interrupt_qtimer1_ch2_csctrl_now(void)  { return IMXRT_TMR1.CH[2].CSCTRL; }
+uint16_t interrupt_qtimer1_ch2_counter_now(void) { return IMXRT_TMR1.CH[QTIMER_CLOCK_COMPARE_CH].CNTR; }
+uint16_t interrupt_qtimer1_ch2_comp1_now(void)   { return IMXRT_TMR1.CH[QTIMER_CLOCK_COMPARE_CH].COMP1; }
+uint16_t interrupt_qtimer1_ch2_csctrl_now(void)  { return IMXRT_TMR1.CH[QTIMER_CLOCK_COMPARE_CH].CSCTRL; }
 
 static void qtimer1_ch1_capture_priority0(uint32_t isr_entry_dwt_raw,
                                             uint32_t csctrl_entry) {
@@ -7320,7 +7323,7 @@ static void interrupt_handoff_process_qtimer1_ch2(
     interrupt_event_t event{};
     event.kind     = interrupt_subscriber_kind_t::TIMEPOP;
     event.provider = interrupt_provider_kind_t::QTIMER1;
-    event.lane     = interrupt_lane_t::QTIMER1_CH2_COMP;
+    event.lane     = interrupt_lane_t::QTIMER1_CH1_COMP;
     event.status   = interrupt_event_status_t::OK;
     event.dwt_at_event       = qtimer_event_dwt;
     event.gnss_ns_at_event   = (gnss_ns >= 0) ? (uint64_t)gnss_ns : 0;
@@ -7329,7 +7332,7 @@ static void interrupt_handoff_process_qtimer1_ch2(
     interrupt_capture_diag_t diag{};
     diag.enabled  = true;
     diag.provider = interrupt_provider_kind_t::QTIMER1;
-    diag.lane     = interrupt_lane_t::QTIMER1_CH2_COMP;
+    diag.lane     = interrupt_lane_t::QTIMER1_CH1_COMP;
     diag.kind     = interrupt_subscriber_kind_t::TIMEPOP;
     diag.dwt_at_event       = qtimer_event_dwt;
     diag.gnss_ns_at_event   = event.gnss_ns_at_event;
@@ -7378,18 +7381,18 @@ static void qtimer1_ch2_capture_priority0(uint32_t isr_entry_dwt_raw,
 static void qtimer1_isr(void) {
   const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;  // SACRED: first instruction.
 
-  const uint32_t ch1_csctrl = IMXRT_TMR1.CH[1].CSCTRL;
-  if (ch1_csctrl & TMR_CSCTRL_TCF1) {
-    qtimer1_ch1_capture_priority0(isr_entry_dwt_raw, ch1_csctrl);
+  // Uniform doctrine: QTimer1 CH1 is the sole VCLOCK/TimePop compare rail.
+  const uint32_t primary_csctrl = IMXRT_TMR1.CH[QTIMER_CLOCK_COMPARE_CH].CSCTRL;
+  if (primary_csctrl & TMR_CSCTRL_TCF1) {
+    qtimer1_ch2_capture_priority0(isr_entry_dwt_raw, primary_csctrl);
+    return;
   }
-  else {
-    const uint32_t ch2_csctrl = IMXRT_TMR1.CH[2].CSCTRL;
-    if (ch2_csctrl & TMR_CSCTRL_TCF1) {
-      qtimer1_ch2_capture_priority0(isr_entry_dwt_raw, ch2_csctrl);
-    }
+
+  // Defensive defuse for the retired auxiliary CH2 rail.
+  const uint32_t aux_csctrl = IMXRT_TMR1.CH[QTIMER1_AUX_COMPARE_CH].CSCTRL;
+  if (aux_csctrl & TMR_CSCTRL_TCF1) {
+    qtimer1_ch1_clear_compare_flag();
   }
-  // CH1/CH2 share one vector. If multiple flags are pending, the unhandled flag
-  // remains set and NVIC re-dispatches with a fresh first-instruction capture.
 }
 
 // ============================================================================
@@ -7426,7 +7429,7 @@ static void pps_edge_dispatch_arm_or_call_from_foreground(const char* name) {
 static void pps_relay_assert_from_isr(uint32_t sequence) {
   // PPS relay HIGH is a physical PPS witness and stays in ISR context.
   // Relay LOW is intentionally *not* scheduled through TimePop.  Instead,
-  // intrinsic QTimer1 CH2 service counts elapsed 1 ms VCLOCK cells and
+  // intrinsic QTimer1 CH1 service counts elapsed 1 ms VCLOCK cells and
   // deasserts the relay when the counter reaches zero.  This removes
   // relay-off from TimePop callback/ASAP/one-shot slot mutation entirely.
   digitalWriteFast(GNSS_PPS_RELAY, HIGH);
@@ -7692,8 +7695,8 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
   packet.ocxo_capture_hw_ready =
       (OCXO1_DISABLED || packet.ocxo1_capture_hw_ready) &&
       (OCXO2_DISABLED || packet.ocxo2_capture_hw_ready);
-  packet.ocxo1_hardware16 = packet.ocxo1_capture_hw_ready ? IMXRT_TMR2.CH[0].CNTR : 0;
-  packet.ocxo2_hardware16 = packet.ocxo2_capture_hw_ready ? IMXRT_TMR3.CH[3].CNTR : 0;
+  packet.ocxo1_hardware16 = packet.ocxo1_capture_hw_ready ? IMXRT_TMR2.CH[QTIMER_CLOCK_COUNTER_CH].CNTR : 0;
+  packet.ocxo2_hardware16 = packet.ocxo2_capture_hw_ready ? IMXRT_TMR3.CH[g_ocxo2_lane.counter_channel].CNTR : 0;
   packet.capture_end_raw = ARM_DWT_CYCCNT;
   packet.spinidle = spinidle_capture_at_isr_entry(isr_entry_dwt_raw);
   packet.capture_exit_dwt = ARM_DWT_CYCCNT;
@@ -7906,6 +7909,20 @@ void interrupt_prespin_service(timepop_ctx_t*, timepop_diag_t*, void*) {}
 // Hardware + runtime init
 // ============================================================================
 
+static void qtimer_init_count_compare_channel(IMXRT_TMR_t& module,
+                                                uint8_t ch,
+                                                uint8_t pcs) {
+  module.CH[ch].CTRL   = 0;
+  module.CH[ch].SCTRL  = 0;
+  module.CH[ch].CSCTRL = 0;
+  module.CH[ch].LOAD   = 0;
+  module.CH[ch].CNTR   = 0;
+  module.CH[ch].COMP1  = 0xFFFF;
+  module.CH[ch].CMPLD1 = 0xFFFF;
+  module.CH[ch].CMPLD2 = 0;
+  module.CH[ch].CTRL   = TMR_CTRL_CM(1) | TMR_CTRL_PCS(pcs);
+}
+
 static void qtimer1_init_vclock_base(void) {
   CCM_CCGR6 |= CCM_CCGR6_QTIMER1(CCM_CCGR_ON);
 
@@ -7913,44 +7930,30 @@ static void qtimer1_init_vclock_base(void) {
   IOMUXC_SW_PAD_CTL_PAD_GPIO_B0_00 =
       IOMUXC_PAD_HYS | IOMUXC_PAD_PKE | IOMUXC_PAD_PUE | IOMUXC_PAD_DSE(4);
 
-  IMXRT_TMR1.CH[0].CTRL = 0;
-  IMXRT_TMR1.CH[1].CTRL = 0;
+  qtimer_init_count_compare_channel(IMXRT_TMR1, QTIMER_CLOCK_COUNTER_CH, 0);
+  qtimer_init_count_compare_channel(IMXRT_TMR1, QTIMER_CLOCK_COMPARE_CH, 0);
 
-  IMXRT_TMR1.CH[0].SCTRL  = 0;
-  IMXRT_TMR1.CH[0].CSCTRL = 0;
-  IMXRT_TMR1.CH[0].LOAD   = 0;
-  IMXRT_TMR1.CH[0].CNTR   = 0;
-  IMXRT_TMR1.CH[0].COMP1  = 0xFFFF;
-  IMXRT_TMR1.CH[0].CMPLD1 = 0xFFFF;
-  IMXRT_TMR1.CH[0].CTRL   = TMR_CTRL_CM(1) | TMR_CTRL_PCS(0);
+  // Uniform clock role: QTimer1 CH0 is the VCLOCK low-word counter; QTimer1
+  // CH1 is the active compare rail used by TimePop through the legacy CH2 API.
+  qtimer_disable_compare(IMXRT_TMR1, QTIMER_CLOCK_COMPARE_CH);
 
-  // CH1 is an independent VCLOCK-domain compare rail hosted by
-  // process_interrupt for clients such as process_witness.  It is NOT a
-  // cascade high word.
-  IMXRT_TMR1.CH[1].SCTRL  = 0;
-  IMXRT_TMR1.CH[1].CSCTRL = 0;
-  IMXRT_TMR1.CH[1].LOAD   = 0;
-  IMXRT_TMR1.CH[1].CNTR   = 0;
-  IMXRT_TMR1.CH[1].COMP1  = 0xFFFF;
-  IMXRT_TMR1.CH[1].CMPLD1 = 0xFFFF;
-  IMXRT_TMR1.CH[1].CTRL   = TMR_CTRL_CM(1) | TMR_CTRL_PCS(0);
-  qtimer1_ch1_disable_compare_hw();
+  IMXRT_TMR1.CH[QTIMER_CLOCK_COUNTER_CH].CSCTRL &= ~TMR_CSCTRL_TCF1EN;
+  IMXRT_TMR1.CH[QTIMER_CLOCK_COUNTER_CH].CSCTRL |=  TMR_CSCTRL_TCF1;
 
-  IMXRT_TMR1.CH[0].CSCTRL &= ~TMR_CSCTRL_TCF1EN;
-  IMXRT_TMR1.CH[0].CSCTRL |=  TMR_CSCTRL_TCF1;
-
-  (void)IMXRT_TMR1.CH[0].CNTR;
+  (void)IMXRT_TMR1.CH[QTIMER_CLOCK_COUNTER_CH].CNTR;
 }
 
 static void qtimer1_init_ch2_scheduler(void) {
-  IMXRT_TMR1.CH[2].CTRL   = 0;
-  IMXRT_TMR1.CH[2].CNTR   = 0;
-  IMXRT_TMR1.CH[2].LOAD   = 0;
-  IMXRT_TMR1.CH[2].COMP1  = 0xFFFF;
-  IMXRT_TMR1.CH[2].CMPLD1 = 0xFFFF;
-  IMXRT_TMR1.CH[2].SCTRL  = 0;
-  IMXRT_TMR1.CH[2].CSCTRL = TMR_CSCTRL_TCF1EN;
-  IMXRT_TMR1.CH[2].CTRL   = TMR_CTRL_CM(1) | TMR_CTRL_PCS(0);
+  // Historical name retained; actual scheduler hardware is QTimer1 CH1.
+  // Keep QTimer1 CH2 explicitly off so VCLOCK has only CH0 counter + CH1 compare.
+  IMXRT_TMR1.CH[QTIMER1_AUX_COMPARE_CH].CTRL = 0;
+  IMXRT_TMR1.CH[QTIMER1_AUX_COMPARE_CH].SCTRL = 0;
+  IMXRT_TMR1.CH[QTIMER1_AUX_COMPARE_CH].CSCTRL = 0;
+  IMXRT_TMR1.CH[QTIMER1_AUX_COMPARE_CH].LOAD = 0;
+  IMXRT_TMR1.CH[QTIMER1_AUX_COMPARE_CH].CNTR = 0;
+  IMXRT_TMR1.CH[QTIMER1_AUX_COMPARE_CH].COMP1 = 0xFFFF;
+  IMXRT_TMR1.CH[QTIMER1_AUX_COMPARE_CH].CMPLD1 = 0xFFFF;
+  IMXRT_TMR1.CH[QTIMER1_AUX_COMPARE_CH].CMPLD2 = 0;
 }
 
 void process_interrupt_init_hardware(void) {
@@ -7958,14 +7961,18 @@ void process_interrupt_init_hardware(void) {
 
   g_ocxo1_lane.name = "OCXO1";
   g_ocxo1_lane.module = &IMXRT_TMR2;
-  g_ocxo1_lane.channel = 0;
-  g_ocxo1_lane.pcs = 0;
+  g_ocxo1_lane.channel = QTIMER_CLOCK_COMPARE_CH;
+  g_ocxo1_lane.counter_channel = QTIMER_CLOCK_COUNTER_CH;
+  g_ocxo1_lane.compare_channel = QTIMER_CLOCK_COMPARE_CH;
+  g_ocxo1_lane.pcs = QTIMER_CLOCK_PCS;
   g_ocxo1_lane.input_pin = OCXO1_PIN;
 
   g_ocxo2_lane.name = "OCXO2";
   g_ocxo2_lane.module = &IMXRT_TMR3;
-  g_ocxo2_lane.channel = 3;
-  g_ocxo2_lane.pcs = 3;
+  g_ocxo2_lane.channel = QTIMER3_OCXO2_PHYSICAL_CH;
+  g_ocxo2_lane.counter_channel = QTIMER3_OCXO2_PHYSICAL_CH;
+  g_ocxo2_lane.compare_channel = QTIMER3_OCXO2_PHYSICAL_CH;
+  g_ocxo2_lane.pcs = QTIMER3_OCXO2_PHYSICAL_PCS;
   g_ocxo2_lane.input_pin = OCXO2_PIN;
 
   pinMode(GNSS_PPS_RELAY, OUTPUT);
@@ -7975,48 +7982,69 @@ void process_interrupt_init_hardware(void) {
   if (!OCXO1_DISABLED) {
     CCM_CCGR6 |= CCM_CCGR6_QTIMER2(CCM_CCGR_ON);
     *(portConfigRegister(OCXO1_PIN)) = 1;
+    #if defined(IOMUXC_QTIMER2_TIMER0_SELECT_INPUT)
     IOMUXC_QTIMER2_TIMER0_SELECT_INPUT = 1;
+    #endif
 
-    IMXRT_TMR2.CH[0].CTRL = 0; IMXRT_TMR2.CH[0].SCTRL = 0;
-    IMXRT_TMR2.CH[0].CSCTRL = 0; IMXRT_TMR2.CH[0].LOAD = 0;
-    IMXRT_TMR2.CH[0].CNTR = 0; IMXRT_TMR2.CH[0].COMP1 = 0xFFFF;
-    IMXRT_TMR2.CH[0].CMPLD1 = 0xFFFF; IMXRT_TMR2.CH[0].CMPLD2 = 0;
-    IMXRT_TMR2.CH[0].CTRL = TMR_CTRL_CM(1) | TMR_CTRL_PCS(g_ocxo1_lane.pcs);
-    qtimer2_ch0_disable_compare();
-    IMXRT_TMR2.ENBL |= 0x0001;
+    IMXRT_TMR2.ENBL &= ~(uint16_t)((1U << QTIMER_CLOCK_COUNTER_CH) |
+                                   (1U << QTIMER_CLOCK_COMPARE_CH));
+    qtimer_init_count_compare_channel(IMXRT_TMR2, QTIMER_CLOCK_COUNTER_CH,
+                                      g_ocxo1_lane.pcs);
+    qtimer_init_count_compare_channel(IMXRT_TMR2, QTIMER_CLOCK_COMPARE_CH,
+                                      g_ocxo1_lane.pcs);
+    ocxo_lane_disable_compare(g_ocxo1_lane);
+    IMXRT_TMR2.CH[QTIMER_CLOCK_COUNTER_CH].CNTR = 0;
+    IMXRT_TMR2.CH[QTIMER_CLOCK_COMPARE_CH].CNTR = 0;
+    IMXRT_TMR2.ENBL |= (uint16_t)((1U << QTIMER_CLOCK_COUNTER_CH) |
+                                  (1U << QTIMER_CLOCK_COMPARE_CH));
   }
 
   if (!OCXO2_DISABLED) {
     CCM_CCGR6 |= CCM_CCGR6_QTIMER3(CCM_CCGR_ON);
     *(portConfigRegister(OCXO2_PIN)) = 1;
+    #if defined(IOMUXC_QTIMER3_TIMER0_SELECT_INPUT)
+    IOMUXC_QTIMER3_TIMER0_SELECT_INPUT = 0;
+    #endif
+    #if defined(IOMUXC_QTIMER3_TIMER3_SELECT_INPUT)
     IOMUXC_QTIMER3_TIMER3_SELECT_INPUT = 1;
+    #endif
 
-    IMXRT_TMR3.CH[3].CTRL = 0; IMXRT_TMR3.CH[3].SCTRL = 0;
-    IMXRT_TMR3.CH[3].CSCTRL = 0; IMXRT_TMR3.CH[3].LOAD = 0;
-    IMXRT_TMR3.CH[3].CNTR = 0; IMXRT_TMR3.CH[3].COMP1 = 0xFFFF;
-    IMXRT_TMR3.CH[3].CMPLD1 = 0xFFFF;
-    IMXRT_TMR3.CH[3].CTRL = TMR_CTRL_CM(1) | TMR_CTRL_PCS(g_ocxo2_lane.pcs);
-    qtimer3_disable_compare(3);
-    IMXRT_TMR3.ENBL |= (uint16_t)(1U << 3);
+    IMXRT_TMR3.ENBL &= ~(uint16_t)((1U << QTIMER_CLOCK_COUNTER_CH) |
+                                   (1U << QTIMER_CLOCK_COMPARE_CH) |
+                                   (1U << QTIMER3_OCXO2_PHYSICAL_CH));
+
+    // Defuse the failed uniform CH0/CH1 attempt explicitly.  Pin 15 does not
+    // feed QTimer3 TIMER0 on this board; CH0/CH1 remain off for OCXO2.
+    IMXRT_TMR3.CH[QTIMER_CLOCK_COUNTER_CH].CTRL = 0;
+    IMXRT_TMR3.CH[QTIMER_CLOCK_COUNTER_CH].SCTRL = 0;
+    IMXRT_TMR3.CH[QTIMER_CLOCK_COUNTER_CH].CSCTRL = 0;
+    IMXRT_TMR3.CH[QTIMER_CLOCK_COMPARE_CH].CTRL = 0;
+    IMXRT_TMR3.CH[QTIMER_CLOCK_COMPARE_CH].SCTRL = 0;
+    IMXRT_TMR3.CH[QTIMER_CLOCK_COMPARE_CH].CSCTRL = 0;
+
+    qtimer_init_count_compare_channel(IMXRT_TMR3,
+                                      QTIMER3_OCXO2_PHYSICAL_CH,
+                                      g_ocxo2_lane.pcs);
+    ocxo_lane_disable_compare(g_ocxo2_lane);
+    IMXRT_TMR3.CH[QTIMER3_OCXO2_PHYSICAL_CH].CNTR = 0;
+    IMXRT_TMR3.ENBL |= (uint16_t)(1U << QTIMER3_OCXO2_PHYSICAL_CH);
   }
 
   g_ocxo1_lane.initialized = !OCXO1_DISABLED;
   g_ocxo2_lane.initialized = !OCXO2_DISABLED;
 
-  // QTimer1 synchronized channel start: ENBL=0 first, configure CH0/CH1/CH2
-  // fully, then a single ENBL write starts the active VCLOCK-domain channels
-  // on the same edge.  CH2 is the only enabled compare channel; VCLOCK cadence
-  // is expressed as a normal TimePop client.
+  // QTimer1 synchronized channel start: ENBL=0 first, configure CH0/CH1
+  // fully, then a single ENBL write starts the VCLOCK counter and the uniform
+  // CH1 TimePop compare rail together.
   IMXRT_TMR1.ENBL = 0;
   qtimer1_init_vclock_base();
   qtimer1_init_ch2_scheduler();
   g_vclock_lane.initialized = true;
-  IMXRT_TMR1.CH[0].CNTR = 0;
-  IMXRT_TMR1.CH[1].CNTR = 0;
-  IMXRT_TMR1.CH[2].CNTR = 0;
-  // Only CH0 (passive VCLOCK counter) and CH2 (TimePop scheduler compare)
-  // are enabled.  VCLOCK cadence is now a TimePop client; CH3 remains off.
-  IMXRT_TMR1.ENBL = 0x05;
+  IMXRT_TMR1.CH[QTIMER_CLOCK_COUNTER_CH].CNTR = 0;
+  IMXRT_TMR1.CH[QTIMER_CLOCK_COMPARE_CH].CNTR = 0;
+  IMXRT_TMR1.CH[QTIMER1_AUX_COMPARE_CH].CNTR = 0;
+  IMXRT_TMR1.ENBL = (uint16_t)((1U << QTIMER_CLOCK_COUNTER_CH) |
+                               (1U << QTIMER_CLOCK_COMPARE_CH));
 
   g_interrupt_hw_ready = true;
 }
@@ -8097,11 +8125,11 @@ static void runtime_bootstrap_synthetic_clocks_if_ready(void) {
 
   vclock_clock_bootstrap_from_hw16(qtimer1_ch0_counter_now());
   if (!OCXO1_DISABLED && g_ocxo1_lane.initialized) {
-    synthetic_clock_bootstrap_from_hw16(g_ocxo1_clock32, IMXRT_TMR2.CH[0].CNTR);
+    synthetic_clock_bootstrap_from_hw16(g_ocxo1_clock32, IMXRT_TMR2.CH[QTIMER_CLOCK_COUNTER_CH].CNTR);
     g_ocxo1_lane.logical_count32_at_last_second = g_ocxo1_clock32.current_counter32;
   }
   if (!OCXO2_DISABLED && g_ocxo2_lane.initialized) {
-    synthetic_clock_bootstrap_from_hw16(g_ocxo2_clock32, IMXRT_TMR3.CH[3].CNTR);
+    synthetic_clock_bootstrap_from_hw16(g_ocxo2_clock32, IMXRT_TMR3.CH[g_ocxo2_lane.counter_channel].CNTR);
     g_ocxo2_lane.logical_count32_at_last_second = g_ocxo2_clock32.current_counter32;
   }
 }
@@ -8761,6 +8789,252 @@ static FLASHMEM void add_regression_extreme_csv(Payload& p,
 // Commands
 // ============================================================================
 
+static FLASHMEM void payload_add_hex32(Payload& p, const char* key, uint32_t value) {
+  char buf[16];
+  snprintf(buf, sizeof(buf), "0x%08lX", (unsigned long)value);
+  p.add(key, buf);
+}
+
+static FLASHMEM void payload_add_hex16(Payload& p, const char* key, uint16_t value) {
+  char buf[12];
+  snprintf(buf, sizeof(buf), "0x%04lX", (unsigned long)value);
+  p.add(key, buf);
+}
+
+static FLASHMEM void add_qtimer_channel_regs(Payload& parent,
+                                             const char* key,
+                                             IMXRT_TMR_t* module,
+                                             uint8_t ch,
+                                             const char* role) {
+  Payload r;
+  r.add("channel", (uint32_t)ch);
+  r.add("role", role ? role : "");
+  payload_add_hex32(r, "CTRL", module->CH[ch].CTRL);
+  payload_add_hex32(r, "SCTRL", module->CH[ch].SCTRL);
+  payload_add_hex32(r, "CSCTRL", module->CH[ch].CSCTRL);
+  payload_add_hex32(r, "LOAD", module->CH[ch].LOAD);
+  payload_add_hex32(r, "CNTR", module->CH[ch].CNTR);
+  payload_add_hex32(r, "COMP1", module->CH[ch].COMP1);
+  payload_add_hex32(r, "CMPLD1", module->CH[ch].CMPLD1);
+  payload_add_hex32(r, "CMPLD2", module->CH[ch].CMPLD2);
+  parent.add_object(key, r);
+}
+
+static FLASHMEM void add_qtimer_module_regs(Payload& parent,
+                                            const char* key,
+                                            IMXRT_TMR_t* module,
+                                            uint8_t counter_ch,
+                                            uint8_t compare_ch,
+                                            uint8_t pcs,
+                                            bool enabled) {
+  Payload m;
+  m.add("enabled_by_build", enabled);
+  m.add("counter_channel", (uint32_t)counter_ch);
+  m.add("compare_channel", (uint32_t)compare_ch);
+  m.add("pcs", (uint32_t)pcs);
+  payload_add_hex16(m, "ENBL", module->ENBL);
+  add_qtimer_channel_regs(m, "counter", module, counter_ch, "counter_ch0");
+  add_qtimer_channel_regs(m, "compare", module, compare_ch, "compare_ch1");
+  parent.add_object(key, m);
+}
+
+static FLASHMEM void add_qtimer_lane_regs_flat(Payload& p,
+                                               const char* lane,
+                                               const char* provider,
+                                               IMXRT_TMR_t* module,
+                                               uint8_t counter_ch,
+                                               uint8_t compare_ch,
+                                               uint8_t pcs,
+                                               bool enabled) {
+  p.add("lane", lane ? lane : "");
+  p.add("provider", provider ? provider : "");
+  p.add("enabled_by_build", enabled);
+  p.add("counter_channel", (uint32_t)counter_ch);
+  p.add("compare_channel", (uint32_t)compare_ch);
+  p.add("pcs", (uint32_t)pcs);
+  payload_add_hex16(p, "ENBL", module->ENBL);
+
+  IMXRT_TMR_CH_t& c = module->CH[counter_ch];
+  payload_add_hex32(p, "counter_CTRL", c.CTRL);
+  payload_add_hex32(p, "counter_SCTRL", c.SCTRL);
+  payload_add_hex32(p, "counter_CSCTRL", c.CSCTRL);
+  payload_add_hex32(p, "counter_LOAD", c.LOAD);
+  payload_add_hex32(p, "counter_CNTR", c.CNTR);
+  payload_add_hex32(p, "counter_COMP1", c.COMP1);
+  payload_add_hex32(p, "counter_CMPLD1", c.CMPLD1);
+  payload_add_hex32(p, "counter_CMPLD2", c.CMPLD2);
+
+  IMXRT_TMR_CH_t& k = module->CH[compare_ch];
+  payload_add_hex32(p, "compare_CTRL", k.CTRL);
+  payload_add_hex32(p, "compare_SCTRL", k.SCTRL);
+  payload_add_hex32(p, "compare_CSCTRL", k.CSCTRL);
+  payload_add_hex32(p, "compare_LOAD", k.LOAD);
+  payload_add_hex32(p, "compare_CNTR", k.CNTR);
+  payload_add_hex32(p, "compare_COMP1", k.COMP1);
+  payload_add_hex32(p, "compare_CMPLD1", k.CMPLD1);
+  payload_add_hex32(p, "compare_CMPLD2", k.CMPLD2);
+}
+
+static FLASHMEM void add_qtimer_lane_iomux_flat(Payload& p, const char* lane) {
+  if (!lane || !strcasecmp(lane, "VCLOCK") || !strcasecmp(lane, "VCLK")) {
+    payload_add_hex32(p, "pin_mux", (uint32_t)(*portConfigRegister(10)));
+    return;
+  }
+  if (!strcasecmp(lane, "OCXO1") || !strcasecmp(lane, "O1")) {
+    payload_add_hex32(p, "pin_mux", (uint32_t)(*portConfigRegister(OCXO1_PIN)));
+    #if defined(IOMUXC_QTIMER2_TIMER0_SELECT_INPUT)
+    payload_add_hex32(p, "timer0_select_input", (uint32_t)IOMUXC_QTIMER2_TIMER0_SELECT_INPUT);
+    #endif
+    return;
+  }
+  if (!strcasecmp(lane, "OCXO2") || !strcasecmp(lane, "O2")) {
+    payload_add_hex32(p, "pin_mux", (uint32_t)(*portConfigRegister(OCXO2_PIN)));
+    #if defined(IOMUXC_QTIMER3_TIMER0_SELECT_INPUT)
+    payload_add_hex32(p, "timer0_select_input", (uint32_t)IOMUXC_QTIMER3_TIMER0_SELECT_INPUT);
+    #endif
+    #if defined(IOMUXC_QTIMER3_TIMER3_SELECT_INPUT)
+    payload_add_hex32(p, "timer3_select_input", (uint32_t)IOMUXC_QTIMER3_TIMER3_SELECT_INPUT);
+    #endif
+    return;
+  }
+}
+
+static FLASHMEM Payload cmd_report_qtimer_regs(const Payload& args) {
+  Payload p;
+  p.add("report", "INTERRUPT_QTIMER_REGS");
+  p.add("format", "compact_lane_flat_raw_u32_v3");
+  p.add("hex", false);
+  p.add("doctrine", QTIMER_UNIFORM_DOCTRINE);
+
+  const char* lane_arg = args.getString("lane");
+  if (!lane_arg) lane_arg = "";
+
+  const interrupt_subscriber_kind_t lane = regression_kind_from_lane_arg(lane_arg);
+  const bool want_all = (!lane_arg || !*lane_arg || !strcasecmp(lane_arg, "ALL"));
+
+  if (want_all) {
+    p.add("usage", "INTERRUPT.REPORT_QTIMER_REGS lane=VCLOCK|OCXO1|OCXO2");
+    p.add("note", "Compact default intentionally omits register dumps; request one lane to avoid payload/transport limits");
+    p.add("vclock", "QTIMER1 CH0 counter / CH1 compare");
+    p.add("ocxo1", "QTIMER2 CH0 counter / CH1 compare");
+    p.add("ocxo2", "QTIMER3 CH3 physical adapter on pin15; CH0/CH1 unavailable because pin19 is SMBus SCL");
+    p.add("vclock_ready", g_interrupt_hw_ready);
+    p.add("ocxo1_ready", !OCXO1_DISABLED && g_ocxo1_lane.initialized);
+    p.add("ocxo2_ready", !OCXO2_DISABLED && g_ocxo2_lane.initialized);
+    return p;
+  }
+
+  if (lane == interrupt_subscriber_kind_t::VCLOCK) {
+    p.add("lane", "VCLOCK");
+    p.add("module", "QTIMER1");
+    p.add("ready", g_interrupt_hw_ready);
+    p.add("counter_ch", 0U);
+    p.add("compare_ch", 1U);
+    p.add("pcs", 0U);
+    p.add("enbl", (uint32_t)IMXRT_TMR1.ENBL);
+
+    p.add("counter_CTRL",   (uint32_t)IMXRT_TMR1.CH[0].CTRL);
+    p.add("counter_SCTRL",  (uint32_t)IMXRT_TMR1.CH[0].SCTRL);
+    p.add("counter_CSCTRL", (uint32_t)IMXRT_TMR1.CH[0].CSCTRL);
+    p.add("counter_LOAD",   (uint32_t)IMXRT_TMR1.CH[0].LOAD);
+    p.add("counter_CNTR",   (uint32_t)IMXRT_TMR1.CH[0].CNTR);
+    p.add("counter_COMP1",  (uint32_t)IMXRT_TMR1.CH[0].COMP1);
+    p.add("counter_CMPLD1", (uint32_t)IMXRT_TMR1.CH[0].CMPLD1);
+    p.add("counter_CMPLD2", (uint32_t)IMXRT_TMR1.CH[0].CMPLD2);
+
+    p.add("compare_CTRL",   (uint32_t)IMXRT_TMR1.CH[1].CTRL);
+    p.add("compare_SCTRL",  (uint32_t)IMXRT_TMR1.CH[1].SCTRL);
+    p.add("compare_CSCTRL", (uint32_t)IMXRT_TMR1.CH[1].CSCTRL);
+    p.add("compare_LOAD",   (uint32_t)IMXRT_TMR1.CH[1].LOAD);
+    p.add("compare_CNTR",   (uint32_t)IMXRT_TMR1.CH[1].CNTR);
+    p.add("compare_COMP1",  (uint32_t)IMXRT_TMR1.CH[1].COMP1);
+    p.add("compare_CMPLD1", (uint32_t)IMXRT_TMR1.CH[1].CMPLD1);
+    p.add("compare_CMPLD2", (uint32_t)IMXRT_TMR1.CH[1].CMPLD2);
+
+    p.add("pin_mux", (uint32_t)(*portConfigRegister(10)));
+    p.add("public_api_note", "TimePop compatibility API name may still say CH2; hardware doctrine reports CH1 compare");
+    return p;
+  }
+
+  if (lane == interrupt_subscriber_kind_t::OCXO1) {
+    p.add("lane", "OCXO1");
+    p.add("module", "QTIMER2");
+    p.add("ready", !OCXO1_DISABLED && g_ocxo1_lane.initialized);
+    p.add("counter_ch", 0U);
+    p.add("compare_ch", 1U);
+    p.add("pcs", (uint32_t)g_ocxo1_lane.pcs);
+    p.add("enbl", (uint32_t)IMXRT_TMR2.ENBL);
+
+    p.add("counter_CTRL",   (uint32_t)IMXRT_TMR2.CH[0].CTRL);
+    p.add("counter_SCTRL",  (uint32_t)IMXRT_TMR2.CH[0].SCTRL);
+    p.add("counter_CSCTRL", (uint32_t)IMXRT_TMR2.CH[0].CSCTRL);
+    p.add("counter_LOAD",   (uint32_t)IMXRT_TMR2.CH[0].LOAD);
+    p.add("counter_CNTR",   (uint32_t)IMXRT_TMR2.CH[0].CNTR);
+    p.add("counter_COMP1",  (uint32_t)IMXRT_TMR2.CH[0].COMP1);
+    p.add("counter_CMPLD1", (uint32_t)IMXRT_TMR2.CH[0].CMPLD1);
+    p.add("counter_CMPLD2", (uint32_t)IMXRT_TMR2.CH[0].CMPLD2);
+
+    p.add("compare_CTRL",   (uint32_t)IMXRT_TMR2.CH[1].CTRL);
+    p.add("compare_SCTRL",  (uint32_t)IMXRT_TMR2.CH[1].SCTRL);
+    p.add("compare_CSCTRL", (uint32_t)IMXRT_TMR2.CH[1].CSCTRL);
+    p.add("compare_LOAD",   (uint32_t)IMXRT_TMR2.CH[1].LOAD);
+    p.add("compare_CNTR",   (uint32_t)IMXRT_TMR2.CH[1].CNTR);
+    p.add("compare_COMP1",  (uint32_t)IMXRT_TMR2.CH[1].COMP1);
+    p.add("compare_CMPLD1", (uint32_t)IMXRT_TMR2.CH[1].CMPLD1);
+    p.add("compare_CMPLD2", (uint32_t)IMXRT_TMR2.CH[1].CMPLD2);
+
+    p.add("pin_mux", (uint32_t)(*portConfigRegister(OCXO1_PIN)));
+#if defined(IOMUXC_QTIMER2_TIMER0_SELECT_INPUT)
+    p.add("timer0_select_input", (uint32_t)IOMUXC_QTIMER2_TIMER0_SELECT_INPUT);
+#endif
+    return p;
+  }
+
+  if (lane == interrupt_subscriber_kind_t::OCXO2) {
+    p.add("lane", "OCXO2");
+    p.add("module", "QTIMER3");
+    p.add("ready", !OCXO2_DISABLED && g_ocxo2_lane.initialized);
+    p.add("physical_adapter", true);
+    p.add("adapter_reason", "pin15 routes to QTimer3 TIMER3; pin19/TIMER0 is SMBus SCL");
+    p.add("counter_ch", (uint32_t)g_ocxo2_lane.counter_channel);
+    p.add("compare_ch", (uint32_t)g_ocxo2_lane.compare_channel);
+    p.add("pcs", (uint32_t)g_ocxo2_lane.pcs);
+    p.add("enbl", (uint32_t)IMXRT_TMR3.ENBL);
+
+    p.add("counter_CTRL",   (uint32_t)IMXRT_TMR3.CH[g_ocxo2_lane.counter_channel].CTRL);
+    p.add("counter_SCTRL",  (uint32_t)IMXRT_TMR3.CH[g_ocxo2_lane.counter_channel].SCTRL);
+    p.add("counter_CSCTRL", (uint32_t)IMXRT_TMR3.CH[g_ocxo2_lane.counter_channel].CSCTRL);
+    p.add("counter_LOAD",   (uint32_t)IMXRT_TMR3.CH[g_ocxo2_lane.counter_channel].LOAD);
+    p.add("counter_CNTR",   (uint32_t)IMXRT_TMR3.CH[g_ocxo2_lane.counter_channel].CNTR);
+    p.add("counter_COMP1",  (uint32_t)IMXRT_TMR3.CH[g_ocxo2_lane.counter_channel].COMP1);
+    p.add("counter_CMPLD1", (uint32_t)IMXRT_TMR3.CH[g_ocxo2_lane.counter_channel].CMPLD1);
+    p.add("counter_CMPLD2", (uint32_t)IMXRT_TMR3.CH[g_ocxo2_lane.counter_channel].CMPLD2);
+
+    p.add("compare_CTRL",   (uint32_t)IMXRT_TMR3.CH[g_ocxo2_lane.compare_channel].CTRL);
+    p.add("compare_SCTRL",  (uint32_t)IMXRT_TMR3.CH[g_ocxo2_lane.compare_channel].SCTRL);
+    p.add("compare_CSCTRL", (uint32_t)IMXRT_TMR3.CH[g_ocxo2_lane.compare_channel].CSCTRL);
+    p.add("compare_LOAD",   (uint32_t)IMXRT_TMR3.CH[g_ocxo2_lane.compare_channel].LOAD);
+    p.add("compare_CNTR",   (uint32_t)IMXRT_TMR3.CH[g_ocxo2_lane.compare_channel].CNTR);
+    p.add("compare_COMP1",  (uint32_t)IMXRT_TMR3.CH[g_ocxo2_lane.compare_channel].COMP1);
+    p.add("compare_CMPLD1", (uint32_t)IMXRT_TMR3.CH[g_ocxo2_lane.compare_channel].CMPLD1);
+    p.add("compare_CMPLD2", (uint32_t)IMXRT_TMR3.CH[g_ocxo2_lane.compare_channel].CMPLD2);
+
+    p.add("pin_mux", (uint32_t)(*portConfigRegister(OCXO2_PIN)));
+#if defined(IOMUXC_QTIMER3_TIMER0_SELECT_INPUT)
+    p.add("timer0_select_input", (uint32_t)IOMUXC_QTIMER3_TIMER0_SELECT_INPUT);
+#endif
+#if defined(IOMUXC_QTIMER3_TIMER3_SELECT_INPUT)
+    p.add("timer3_select_input", (uint32_t)IOMUXC_QTIMER3_TIMER3_SELECT_INPUT);
+#endif
+    return p;
+  }
+
+  p.add("error", "unknown lane");
+  p.add("lane", lane_arg ? lane_arg : "");
+  p.add("usage", "INTERRUPT.REPORT_QTIMER_REGS lane=VCLOCK|OCXO1|OCXO2");
+  return p;
+}
+
 static FLASHMEM void add_priority_payload(Payload& p) {
   p.add("qtimer1_sovereign_priority_expected", INTERRUPT_STEP0_EXPECTED_QTIMER1_PRIORITY);
   p.add("qtimer1_sovereign_priority_applied", g_step0_qtimer1_priority_applied);
@@ -8822,12 +9096,12 @@ static FLASHMEM void add_runtime_payload(Payload& p) {
   p.add("ocxo1_quiet_phase_us", ocxo_phase_ticks_to_us(OCXO1_QUIET_PHASE_TICKS));
   p.add("ocxo2_quiet_phase_ticks", OCXO2_QUIET_PHASE_TICKS);
   p.add("ocxo2_quiet_phase_us", ocxo_phase_ticks_to_us(OCXO2_QUIET_PHASE_TICKS));
-  p.add("timing_arch_step", "CH2_NATIVE_VCLOCK_FIRST_1S_LEGACY_GRID");
+  p.add("timing_arch_step", "UNIFORM_CH0_COUNTER_CH1_COMPARE_WITH_OCXO2_PIN15_CH3_ADAPTER");
   p.add("timing_arch_behavior_changed", true);
   p.add("isr_sanity_witness_enabled", true);
   p.add("isr_sanity_witness_policy", "REPORT_ONLY_NO_REPAIR_NO_VETO");
-  p.add("timing_arch_vclock_authority", "QTIMER1_CH2_NATIVE_ROLLOVER_RELAY_EPOCH_1S_SMARTZERO_DRAIN_ARM");
-  p.add("timing_arch_ocxo_model", "LOCAL_QTIMER_ONE_SECOND_EDGE_CAPTURE");
+  p.add("timing_arch_vclock_authority", "QTIMER1_CH0_COUNTER_CH1_COMPARE_ROLLOVER_RELAY_EPOCH_1S_SMARTZERO_DRAIN_ARM");
+  p.add("timing_arch_ocxo_model", "OCXO1_CH0_CH1_OCXO2_PIN15_QTIMER3_CH3_PHYSICAL_ADAPTER");
   p.add("timing_arch_ocxo_migration_stage", "EMA_DWT_AUTHORITY");
   p.add("subscriber_count", g_subscriber_count);
   p.add("single_cadence_agent", false);
@@ -9290,11 +9564,11 @@ static FLASHMEM void add_vclock_lane_payload(Payload& p, bool detailed) {
   p.add("lane", "VCLOCK");
   p.add("kind", "VCLOCK");
   p.add("provider", "QTIMER1");
-  p.add("hardware_lane", "QTIMER1_CH2_COMP");
-  p.add("cadence_source", "QTIMER1_CH2_NATIVE_EPOCH_ONE_SECOND_PLUS_HEARTBEAT_FALLBACK");
+  p.add("hardware_lane", "QTIMER1_CH1_COMP");
+  p.add("cadence_source", "QTIMER1_CH1_UNIFORM_NATIVE_EPOCH_ONE_SECOND_PLUS_HEARTBEAT_FALLBACK");
   p.add("counter_source", "QTIMER1_CH0_SYNTHETIC_COUNTER32");
-  p.add("event_source", "QTIMER1_CH2_INTRINSIC_EPOCH_AND_ONE_SECOND");
-  p.add("dwt_authority", "QTIMER1_CH2_EMA_PREDICTED_DWT");
+  p.add("event_source", "QTIMER1_CH1_INTRINSIC_EPOCH_AND_ONE_SECOND");
+  p.add("dwt_authority", "QTIMER1_CH1_EMA_PREDICTED_DWT");
   add_spincatch_report_payload(p, interrupt_subscriber_kind_t::VCLOCK);
 
   add_runtime_lane_summary(p, "vclock", g_rt_vclock);
@@ -9675,7 +9949,7 @@ static FLASHMEM void add_ocxo_qtimer_payload(payload_prefix_t& out,
                                     const ocxo_runtime_context_t& ctx,
                                     const ocxo_qtimer_diag_t& qdiag) {
   const ocxo_lane_t& lane = *ctx.lane;
-  const uint16_t csctrl = lane.module->CH[lane.channel].CSCTRL;
+  const uint16_t csctrl = lane.module->CH[lane.compare_channel].CSCTRL;
   const bool compare_enabled = (csctrl & TMR_CSCTRL_TCF1EN) != 0;
   const bool compare_flag = (csctrl & TMR_CSCTRL_TCF1) != 0;
 
@@ -9980,7 +10254,7 @@ static FLASHMEM Payload cmd_report(const Payload&) {
   p.add("ocxo1_quiet_phase_us", ocxo_phase_ticks_to_us(OCXO1_QUIET_PHASE_TICKS));
   p.add("ocxo2_quiet_phase_ticks", OCXO2_QUIET_PHASE_TICKS);
   p.add("ocxo2_quiet_phase_us", ocxo_phase_ticks_to_us(OCXO2_QUIET_PHASE_TICKS));
-  p.add("timing_arch_step", "CH2_NATIVE_VCLOCK_FIRST_1S_LEGACY_GRID");
+  p.add("timing_arch_step", "UNIFORM_CH0_COUNTER_CH1_COMPARE_WITH_OCXO2_PIN15_CH3_ADAPTER");
   p.add("timing_arch_behavior_changed", true);
   p.add("isr_sanity_witness_enabled", true);
   p.add("isr_sanity_witness_policy", "REPORT_ONLY_NO_REPAIR_NO_VETO");
@@ -10434,11 +10708,11 @@ static FLASHMEM bool report_lane_section_is(const char* section, const char* nam
 static FLASHMEM void add_vclock_lane_summary_section(Payload& p) {
   p.add("kind", "VCLOCK");
   p.add("provider", "QTIMER1");
-  p.add("hardware_lane", "QTIMER1_CH2_COMP");
-  p.add("cadence_source", "QTIMER1_CH2_NATIVE_EPOCH_ONE_SECOND_PLUS_HEARTBEAT_FALLBACK");
+  p.add("hardware_lane", "QTIMER1_CH1_COMP");
+  p.add("cadence_source", "QTIMER1_CH1_UNIFORM_NATIVE_EPOCH_ONE_SECOND_PLUS_HEARTBEAT_FALLBACK");
   p.add("counter_source", "QTIMER1_CH0_SYNTHETIC_COUNTER32");
-  p.add("event_source", "QTIMER1_CH2_INTRINSIC_EPOCH_AND_ONE_SECOND");
-  p.add("dwt_authority", "QTIMER1_CH2_EMA_PREDICTED_DWT");
+  p.add("event_source", "QTIMER1_CH1_INTRINSIC_EPOCH_AND_ONE_SECOND");
+  p.add("dwt_authority", "QTIMER1_CH1_EMA_PREDICTED_DWT");
 
   add_runtime_lane_summary(p, "vclock", g_rt_vclock);
   p.add("vclock_irq_count", g_vclock_lane.irq_count);
@@ -10995,6 +11269,7 @@ static const process_command_entry_t INTERRUPT_COMMANDS[] = {
   { "REPORT_HANDOFF", cmd_report_handoff },
   { "REPORT_LANES",    cmd_report_lanes    },
   { "REPORT_LANE",     cmd_report_lane     },
+  { "REPORT_QTIMER_REGS", cmd_report_qtimer_regs },
   { nullptr,           nullptr             }
 };
 
@@ -11039,6 +11314,9 @@ const char* interrupt_lane_str(interrupt_lane_t lane) {
     case interrupt_lane_t::QTIMER1_CH2_COMP: return "QTIMER1_CH2_COMP";
     case interrupt_lane_t::QTIMER1_CH3_COMP: return "QTIMER1_CH3_COMP";
     case interrupt_lane_t::QTIMER2_CH0_COMP: return "QTIMER2_CH0_COMP";
+    case interrupt_lane_t::QTIMER2_CH1_COMP: return "QTIMER2_CH1_COMP";
+    case interrupt_lane_t::QTIMER3_CH0_COMP: return "QTIMER3_CH0_COMP";
+    case interrupt_lane_t::QTIMER3_CH1_COMP: return "QTIMER3_CH1_COMP";
     case interrupt_lane_t::QTIMER3_CH3_COMP: return "QTIMER3_CH3_COMP";
     case interrupt_lane_t::GPIO_EDGE:        return "GPIO_EDGE";
     default:                                 return "NONE";

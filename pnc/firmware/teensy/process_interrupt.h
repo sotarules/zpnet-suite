@@ -10,35 +10,34 @@
 //   still interrupt context, still before foreground/ASAP, but no longer able
 //   to delay sacred priority-0 clock capture.
 //
-//   • VCLOCK lane   (critical recurring TimePop client on QTimer1 CH2)
-//   • OCXO lanes    (local QTimer one-second compare on QTimer2 CH0 / QTimer3 CH3;
+//   • VCLOCK lane   (critical recurring TimePop client on QTimer1 CH1)
+//   • OCXO lanes    (local QTimer one-second compare on QTimer2 CH1 / QTimer3 CH1 with CH0 counters;
 //                    SmartZero may temporarily use +10,000-tick acquisition)
 //   • Priority handoff (process_interrupt-owned priority-16 continuation tier)
 //   • Cadence minder (TimePop VCLOCK/relay heartbeat; no longer OCXO rollover owner)
-//   • CH2 implicit rollover tend (handoff-tier seatbelt for 16-bit clock extenders;
+//   • CH1 implicit rollover tend (handoff-tier seatbelt for 16-bit clock extenders;
 //                    coexists with CADENCE_MINDER and the OCXO local cadence ladders)
-//   • TimePop       (QTimer1 CH2, hosted scheduler/client rail)
+//   • TimePop       (QTimer1 CH1, hosted scheduler/client rail)
 //   • PPS GPIO edge (diagnostics + dispatch authority + epoch anchor)
 //
 // QTimer1 vector custody:
 //
 //   QTimer1 has a single shared IRQ vector across all four channels.
-//   process_interrupt owns the vector.  At priority 0 it captures CH1/CH2
-//   packets only; the priority handoff tier performs the continuation work:
-//     • CH1 packet → legacy hosted compare rail / hop continuation
-//     • CH2 packet → passive all-clock rollover tend, native VCLOCK custody
-//                    work, registered TimePop scheduler handler, then CH2-tail
+//   process_interrupt owns the vector.  At priority 0 it captures the CH1
+//   uniform compare packet; the priority handoff tier performs the continuation work:
+//     • CH1 packet → passive all-clock rollover tend, native VCLOCK custody
+//                    work, registered TimePop scheduler handler, then compare-tail
 //                    selected-epoch / fact-drain service
-//   VCLOCK cadence no longer owns a private QTimer1 compare channel.  The
-//   remaining VCLOCK_HEARTBEAT TimePop slot is a soft fallback/reporting pulse.
-//   Timing-authoritative VCLOCK duties now run from native CH2 custody: passive
+//   VCLOCK cadence no longer owns a separate private QTimer1 compare channel.
+//   The remaining VCLOCK_HEARTBEAT TimePop slot is a soft fallback/reporting pulse.
+//   Timing-authoritative VCLOCK duties now run from native CH1 custody: passive
 //   16-bit rollover tending, PPS_RELAY deassert, bootstrap/rebootstrap
 //   selected-epoch publication, first-bookend handoff, steady-state
 //   one-second fact authorship, VCLOCK SmartZero fixed-grid sampling, and VCLOCK fact-drain arming.
 //
-//   TimePop owns scheduler policy only.  process_interrupt owns the CH2
-//   compare-register programming; TimePop requests target updates through
-//   interrupt_qtimer1_ch2_arm_compare().  TimePop registers its CH2 handler
+//   TimePop owns scheduler policy only.  process_interrupt owns the CH1
+//   compare-register programming; TimePop still requests target updates through
+//   the legacy interrupt_qtimer1_ch2_arm_compare() compatibility API.  TimePop registers its handler
 //   via interrupt_register_qtimer1_ch2_handler at init time.
 //
 // ─── PPS / PPS_VCLOCK doctrine ──────────────────────────────────────────────
@@ -62,7 +61,7 @@
 //                     ns — the ns value always ends in "00".
 //
 //   PPS_VCLOCK ns is computed from VCLOCK counter ticks × 100 ns,
-//   never from DWT.  TimePop uses the DWT bridge for CH2 fire diagnostics.
+//   never from DWT.  TimePop uses the DWT bridge for uniform CH1 fire diagnostics (legacy API name CH2).
 //   OCXO subscribers receive authored OCXO edge DWT/counter facts even when
 //   bridge projection is unavailable; CLOCKS/Alpha owns OCXO measured-GNSS
 //   interval construction from consecutive OCXO edge DWTs.
@@ -80,13 +79,13 @@
 //   The VCLOCK cadence is PPS-anchored but no longer uses QTimer1 CH3.
 //   On the first physical PPS edge after a rebootstrap request, the GPIO ISR
 //   captures the QTimer1 CH0 low-word count and selects the sacred VCLOCK edge.
-//   Native CH2 custody later consumes that pending selected edge, after TimePop
-//   has processed the CH2 compare event, and back-projects from the CH2 event
-//   DWT to publish the canonical PPS_VCLOCK epoch.
+//   Native uniform-CH1 custody later consumes that pending selected edge, after TimePop
+//   has processed the CH1 compare event, and back-projects from the CH1 event
+//   DWT to publish the canonical PPS_VCLOCK epoch.  Legacy public names still say CH2.
 //
 //   The first post-epoch VCLOCK one-second publication is handed to native
-//   CH2 on the legacy-compatible heartbeat grid; steady-state VCLOCK one-second
-//   facts are authored by native CH2 on fixed +10,000,000 tick gear teeth.
+//   uniform-CH1 custody on the legacy-compatible heartbeat grid; steady-state
+//   VCLOCK one-second facts are authored by CH1 on fixed +10,000,000 tick gear teeth.
 //   VCLOCK_HEARTBEAT remains armed only as
 //   a soft fallback/reporting pulse; it no longer owns rollover, relay deassert,
 //   selected-epoch publication, one-second authority, SmartZero sampling, or
@@ -116,13 +115,13 @@
 //
 //     VCLOCK : TimePop critical recurring ISR slot, +10000 counts/interval
 //              in the GNSS-disciplined 10 MHz VCLOCK domain.  QTimer1 CH0 is
-//              the passive low-word VCLOCK counter; QTimer1 CH2 is the only
+//              the passive low-word VCLOCK counter; QTimer1 CH1 is the only
 //              active TimePop compare rail.  This asymmetry is intentional:
 //              TimePop coalesces duplicate deadlines onto one perishable ISR
 //              fact surface and avoids a competing VCLOCK preemption rail.
 //
-//     OCXO1  : QTimer2 CH0 local compare every +10,000 OCXO ticks.
-//     OCXO2  : QTimer3 CH3 local compare every +10,000 OCXO ticks.
+//     OCXO1  : QTimer2 CH0 counter / CH1 compare.
+//     OCXO2  : QTimer3 CH0 counter / CH1 compare.
 //
 //   OCXO compare ISRs now perform reentry-safe capture only.  The priority
 //   handoff tier updates synthetic identity, feeds SmartZero, rearms/stops the
@@ -171,6 +170,9 @@ enum class interrupt_lane_t : uint8_t {
   QTIMER1_CH2_COMP,
   QTIMER1_CH3_COMP,
   QTIMER2_CH0_COMP,
+  QTIMER2_CH1_COMP,
+  QTIMER3_CH0_COMP,
+  QTIMER3_CH1_COMP,
   QTIMER3_CH3_COMP,
   GPIO_EDGE,
 };
@@ -183,7 +185,7 @@ enum class interrupt_event_status_t : uint8_t {
 
 // ============================================================================
 // One-second event — VCLOCK / OCXO subscribers (every 1000 ticks)
-// CH2 cadence event — TimePop (every QTimer1 CH2 compare-match)
+// CH1 cadence event — TimePop (every QTimer1 CH1 compare-match)
 // ============================================================================
 //
 // VCLOCK and OCXO lanes deliver one event per second to their foreground
@@ -227,10 +229,10 @@ struct interrupt_event_t {
   //
   //     pps_coincidence_cycles = dwt_at_event − pvc.dwt_at_edge
   //
-  // Under PPS-anchored operation the CH3 one-second compare-match and
+  // Under PPS-anchored operation the VCLOCK one-second compare-match and
   // the PPS GPIO edge are the same physical moment at the receiver,
   // modulo sub-nanosecond propagation.  Steady-state cycles is a small
-  // positive number dominated by GPIO ISR body duration plus CH3 entry
+  // positive number dominated by GPIO ISR body duration plus compare entry
   // latency.
   //
   // pps_coincidence_valid is true iff:
@@ -922,18 +924,13 @@ void interrupt_register_pps_entry_latency_handler(
     interrupt_pps_entry_latency_handler_fn cb);
 
 // ============================================================================
-// QTimer1 CH1 compare service — hosted hardware rail for process_witness
+// QTimer1 CH1 compare service — retired compatibility surface for process_witness
 // ============================================================================
 //
-// CH1 is a VCLOCK-domain compare rail owned by process_interrupt. Clients do
-// not touch QTimer1 registers. A client registers a single IRQ-context handler
-// and asks process_interrupt to arm a synthetic 32-bit VCLOCK target.
-// process_interrupt advances any required 16-bit compare hops internally and
-// invokes the handler only at the requested target event.
-//
-// The same CH1 rail is also used internally once per PPS as a near-future
-// VCLOCK phase probe. process_interrupt arbitrates these targets so hosted
-// callers do not directly fight the PPS probe.
+// In the uniform clock-lane experiment, QTimer1 CH1 is reserved for TimePop
+// through the historical interrupt_qtimer1_ch2_* compatibility API.  The old
+// hosted CH1 arming API is retained for source compatibility but returns false
+// and does not program any compare rail.
 
 struct interrupt_qtimer1_ch1_compare_event_t {
   uint32_t sequence = 0;
@@ -964,11 +961,12 @@ uint16_t interrupt_qtimer1_ch1_comp1_now(void);
 uint16_t interrupt_qtimer1_ch1_csctrl_now(void);
 
 // ============================================================================
-// QTimer1 CH2 handoff-tier handler — TimePop scheduler heartbeat
+// QTimer1 CH1 handoff-tier handler — TimePop scheduler heartbeat
 // ============================================================================
 //
-// TimePop registers a single CH2 handler at init.  process_interrupt's
-// QTimer1 priority-0 ISR captures only the immutable CH2 packet and pends the
+// TimePop registers through the legacy CH2-named handler at init.  In the
+// uniform geometry build this maps to QTimer1 CH1 hardware; process_interrupt's
+// QTimer1 priority-0 ISR captures only the immutable compare packet and pends the
 // priority handoff tier.  The handoff tier assembles the standard
 // interrupt_event_t and interrupt_capture_diag_t (kind = TIMEPOP) and invokes
 // this handler at NVIC priority 16.  CH2 delivery is still not foreground-
@@ -983,15 +981,17 @@ using interrupt_qtimer1_ch2_handler_fn =
 void interrupt_register_qtimer1_ch2_handler(interrupt_qtimer1_ch2_handler_fn cb);
 
 // ============================================================================
-// TimePop hardware service API — process_interrupt owns QTimer1 CH2 hardware
+// TimePop hardware service API — process_interrupt owns QTimer1 CH1 hardware
 // ============================================================================
 //
 // TimePop remains the scheduling policy engine, but it no longer programs
-// QTimer1 CH2 or reads the VCLOCK counter directly.  It asks process_interrupt
+// QTimer1 CH1 or reads the VCLOCK counter directly.  It asks process_interrupt
 // to perform hardware actions and to provide explicitly ambient scheduling
 // observations.  These observations are NOT event facts.
 
 uint32_t interrupt_vclock_counter32_observe_ambient(void);
+// Legacy CH2-named compatibility API.  In the uniform geometry build this
+// programs QTimer1 CH1, so all clocks use CH0 as counter and CH1 as compare.
 void     interrupt_qtimer1_ch2_arm_compare(uint32_t target_counter32);
 
 // ============================================================================
@@ -1038,6 +1038,8 @@ void process_interrupt_gpio6789_irq  (uint32_t isr_entry_dwt_raw);
 // ============================================================================
 
 uint16_t interrupt_qtimer2_ch0_counter_now(void);
+uint16_t interrupt_qtimer3_ch0_counter_now(void);
+// Legacy name; returns QTimer3 CH0 in the uniform geometry build.
 uint16_t interrupt_qtimer3_ch3_counter_now(void);
 uint32_t interrupt_qtimer1_counter32_now (void);
 
