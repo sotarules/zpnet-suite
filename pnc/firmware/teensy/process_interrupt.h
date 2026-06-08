@@ -280,6 +280,23 @@ struct interrupt_capture_diag_t {
   // first-instruction ARM_DWT_CYCCNT captured by the OCXO ISR.  It is not an
   // event coordinate and must not be used as timing authority.
   uint32_t dwt_isr_entry_raw = 0;
+
+  // Timestamp lineage audit.  This makes the custody chain visible to
+  // subscribers and TIMEBASE:
+  //
+  //   dwt_isr_entry_raw
+  //       -> latency/service-adjusted observed event coordinate
+  //       -> subscriber-published/used DWT coordinate
+  //
+  // dwt_event_from_isr_entry_raw is the latency-adjusted event coordinate
+  // derived from the raw ISR entry capture before EMA/projection authorship.
+  // The *_minus_event fields expose how far the subscriber-facing coordinate
+  // moved away from that observed event coordinate.
+  uint32_t dwt_event_from_isr_entry_raw = 0;
+  int32_t  dwt_isr_entry_to_event_correction_cycles = 0;
+  int32_t  dwt_published_minus_event_cycles = 0;
+  int32_t  dwt_used_minus_event_cycles = 0;
+
   int32_t  dwt_synthetic_error_cycles = 0;
   uint32_t dwt_synthetic_threshold_cycles = 0;
   const char* dwt_synthetic_reason = nullptr;

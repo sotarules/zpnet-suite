@@ -576,6 +576,10 @@ struct alpha_lane_forensics_store_t {
   uint32_t dwt_predicted_at_event = 0;
   uint32_t dwt_used_at_event = 0;
   uint32_t dwt_isr_entry_raw = 0;
+  uint32_t dwt_event_from_isr_entry_raw = 0;
+  int32_t  dwt_isr_entry_to_event_correction_cycles = 0;
+  int32_t  dwt_published_minus_event_cycles = 0;
+  int32_t  dwt_used_minus_event_cycles = 0;
   int32_t  dwt_synthetic_error_cycles = 0;
   uint32_t dwt_synthetic_threshold_cycles = 0;
   bool     dwt_interval_gate_valid = false;
@@ -2230,6 +2234,10 @@ static void alpha_forensics_reset_store(alpha_lane_forensics_store_t& s) {
   s.dwt_predicted_at_event = 0;
   s.dwt_used_at_event = 0;
   s.dwt_isr_entry_raw = 0;
+  s.dwt_event_from_isr_entry_raw = 0;
+  s.dwt_isr_entry_to_event_correction_cycles = 0;
+  s.dwt_published_minus_event_cycles = 0;
+  s.dwt_used_minus_event_cycles = 0;
   s.dwt_synthetic_error_cycles = 0;
   s.dwt_synthetic_threshold_cycles = 0;
   s.dwt_interval_gate_valid = false;
@@ -2423,6 +2431,12 @@ static void alpha_forensics_publish(time_clock_id_t clock_id,
     s->dwt_predicted_at_event = diag->dwt_predicted_at_event;
     s->dwt_used_at_event = diag->dwt_used_at_event;
     s->dwt_isr_entry_raw = diag->dwt_isr_entry_raw;
+    s->dwt_event_from_isr_entry_raw = diag->dwt_event_from_isr_entry_raw;
+    s->dwt_isr_entry_to_event_correction_cycles =
+        diag->dwt_isr_entry_to_event_correction_cycles;
+    s->dwt_published_minus_event_cycles =
+        diag->dwt_published_minus_event_cycles;
+    s->dwt_used_minus_event_cycles = diag->dwt_used_minus_event_cycles;
     s->dwt_synthetic_error_cycles = diag->dwt_synthetic_error_cycles;
     s->dwt_synthetic_threshold_cycles = diag->dwt_synthetic_threshold_cycles;
     s->dwt_interval_gate_valid = diag->dwt_interval_gate_valid;
@@ -2538,6 +2552,10 @@ static void alpha_forensics_publish(time_clock_id_t clock_id,
     s->dwt_predicted_at_event = 0;
     s->dwt_used_at_event = 0;
     s->dwt_isr_entry_raw = 0;
+    s->dwt_event_from_isr_entry_raw = 0;
+    s->dwt_isr_entry_to_event_correction_cycles = 0;
+    s->dwt_published_minus_event_cycles = 0;
+    s->dwt_used_minus_event_cycles = 0;
     s->dwt_synthetic_error_cycles = 0;
     s->dwt_synthetic_threshold_cycles = 0;
     s->dwt_interval_gate_valid = false;
@@ -2672,6 +2690,12 @@ bool clocks_alpha_lane_forensics(time_clock_id_t clock,
     out->dwt_predicted_at_event = s->dwt_predicted_at_event;
     out->dwt_used_at_event = s->dwt_used_at_event;
     out->dwt_isr_entry_raw = s->dwt_isr_entry_raw;
+    out->dwt_event_from_isr_entry_raw = s->dwt_event_from_isr_entry_raw;
+    out->dwt_isr_entry_to_event_correction_cycles =
+        s->dwt_isr_entry_to_event_correction_cycles;
+    out->dwt_published_minus_event_cycles =
+        s->dwt_published_minus_event_cycles;
+    out->dwt_used_minus_event_cycles = s->dwt_used_minus_event_cycles;
     out->dwt_synthetic_error_cycles = s->dwt_synthetic_error_cycles;
     out->dwt_synthetic_threshold_cycles = s->dwt_synthetic_threshold_cycles;
     out->dwt_interval_gate_valid = s->dwt_interval_gate_valid;

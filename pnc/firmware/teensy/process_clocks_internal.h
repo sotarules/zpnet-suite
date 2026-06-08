@@ -325,6 +325,10 @@ struct clocks_alpha_lane_forensics_t {
   uint32_t dwt_predicted_at_event;
   uint32_t dwt_used_at_event;
   uint32_t dwt_isr_entry_raw;
+  uint32_t dwt_event_from_isr_entry_raw;
+  int32_t  dwt_isr_entry_to_event_correction_cycles;
+  int32_t  dwt_published_minus_event_cycles;
+  int32_t  dwt_used_minus_event_cycles;
   int32_t  dwt_synthetic_error_cycles;
   uint32_t dwt_synthetic_threshold_cycles;
   bool     dwt_interval_gate_valid;

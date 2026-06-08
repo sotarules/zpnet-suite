@@ -1213,6 +1213,8 @@ struct dwt_repair_diag_t {
   uint32_t predicted_dwt = 0;
   uint32_t used_dwt = 0;
   uint32_t isr_entry_dwt_raw = 0;
+  uint32_t event_dwt_from_isr_entry_raw = 0;
+  int32_t  isr_entry_to_event_correction_cycles = 0;
   int32_t  error_cycles = 0;
   uint32_t threshold_cycles = 0;
   const char* reason = "none";
@@ -1337,6 +1339,8 @@ static dwt_repair_diag_t vclock_endpoint_repair_diagnostic(uint32_t observed_dwt
   r.predicted_dwt = 0;
   r.used_dwt = observed_dwt;
   r.isr_entry_dwt_raw = 0;
+  r.event_dwt_from_isr_entry_raw = observed_dwt;
+  r.isr_entry_to_event_correction_cycles = 0;
   r.error_cycles = 0;
   r.threshold_cycles = VCLOCK_DWT_REPAIR_THRESHOLD_CYCLES;
   r.reason = "disabled";
@@ -4099,6 +4103,13 @@ static void emit_one_second_event(interrupt_subscriber_runtime_t& rt,
     diag.dwt_predicted_at_event = repair->predicted_dwt;
     diag.dwt_used_at_event = repair->used_dwt;
     diag.dwt_isr_entry_raw = repair->isr_entry_dwt_raw;
+    diag.dwt_event_from_isr_entry_raw = repair->event_dwt_from_isr_entry_raw;
+    diag.dwt_isr_entry_to_event_correction_cycles =
+        repair->isr_entry_to_event_correction_cycles;
+    diag.dwt_published_minus_event_cycles =
+        (int32_t)(event.dwt_at_event - repair->event_dwt_from_isr_entry_raw);
+    diag.dwt_used_minus_event_cycles =
+        (int32_t)(repair->used_dwt - repair->event_dwt_from_isr_entry_raw);
     diag.dwt_synthetic_error_cycles = repair->error_cycles;
     diag.dwt_synthetic_threshold_cycles = repair->threshold_cycles;
     diag.dwt_synthetic_reason = repair->reason;
@@ -4604,6 +4615,9 @@ static void vclock_apply_perishable_fact_deferred(
   ema_diag.valid = true;
   ema_diag.original_dwt = observed_dwt;
   ema_diag.isr_entry_dwt_raw = fact.isr_entry_dwt_raw;
+  ema_diag.event_dwt_from_isr_entry_raw = observed_dwt;
+  ema_diag.isr_entry_to_event_correction_cycles =
+      (int32_t)(observed_dwt - fact.isr_entry_dwt_raw);
   ema_diag.threshold_cycles = VCLOCK_EMA_AUDIT_THRESHOLD_CYCLES;
   const uint32_t published_dwt = vclock_lane_ema_predict_dwt(
       g_vclock_lane, observed_dwt, &ema_synthetic, &ema_error_cycles, &ema_diag);
@@ -5113,6 +5127,8 @@ static void vclock_heartbeat_timepop_callback(timepop_ctx_t* ctx,
         ema_diag.valid = true;
         ema_diag.original_dwt = qtimer_event_dwt;
         ema_diag.isr_entry_dwt_raw = 0;
+        ema_diag.event_dwt_from_isr_entry_raw = qtimer_event_dwt;
+        ema_diag.isr_entry_to_event_correction_cycles = 0;
         ema_diag.threshold_cycles = VCLOCK_EMA_AUDIT_THRESHOLD_CYCLES;
         const uint32_t published_dwt = vclock_lane_ema_predict_dwt(
             g_vclock_lane, qtimer_event_dwt, &ema_synthetic, &ema_error_cycles, &ema_diag);
@@ -6037,6 +6053,9 @@ static void ocxo_apply_perishable_fact_deferred(
   ema_diag.valid = true;
   ema_diag.original_dwt = observed_dwt;
   ema_diag.isr_entry_dwt_raw = fact.isr_entry_dwt_raw;
+  ema_diag.event_dwt_from_isr_entry_raw = observed_dwt;
+  ema_diag.isr_entry_to_event_correction_cycles =
+      (int32_t)(observed_dwt - fact.isr_entry_dwt_raw);
 
   // A skipped or duplicated one-second target is a custody discontinuity, not
   // an interval sample.  The EMA function uses this adjacency fact to publish
@@ -7316,6 +7335,11 @@ static void interrupt_handoff_process_qtimer1_ch2(
     diag.gnss_ns_at_event   = event.gnss_ns_at_event;
     diag.counter32_at_event = event.counter32_at_event;
     diag.dwt_isr_entry_raw  = isr_entry_dwt_raw;
+    diag.dwt_event_from_isr_entry_raw = qtimer_event_dwt;
+    diag.dwt_isr_entry_to_event_correction_cycles =
+        (int32_t)(qtimer_event_dwt - isr_entry_dwt_raw);
+    diag.dwt_published_minus_event_cycles = 0;
+    diag.dwt_used_minus_event_cycles = 0;
     spinidle_copy_to_diag(diag, spinidle);
     g_spinidle_timepop_last_capture = spinidle;
     bridge_projection_copy_to_diag(diag, bridge);
@@ -9753,6 +9777,22 @@ static FLASHMEM void add_ocxo_compact_payload(Payload& p,
               (rt && rt->has_fired) ? rt->last_diag.dwt_used_at_event : 0U);
   out.add_u32("last_diag_dwt_isr_entry_raw",
               (rt && rt->has_fired) ? rt->last_diag.dwt_isr_entry_raw : 0U);
+  out.add_u32("last_diag_dwt_event_from_isr_entry_raw",
+              (rt && rt->has_fired)
+                  ? rt->last_diag.dwt_event_from_isr_entry_raw
+                  : 0U);
+  out.add_i32("last_diag_dwt_isr_entry_to_event_correction_cycles",
+              (rt && rt->has_fired)
+                  ? rt->last_diag.dwt_isr_entry_to_event_correction_cycles
+                  : 0);
+  out.add_i32("last_diag_dwt_published_minus_event_cycles",
+              (rt && rt->has_fired)
+                  ? rt->last_diag.dwt_published_minus_event_cycles
+                  : 0);
+  out.add_i32("last_diag_dwt_used_minus_event_cycles",
+              (rt && rt->has_fired)
+                  ? rt->last_diag.dwt_used_minus_event_cycles
+                  : 0);
   out.add_i32("last_diag_dwt_synthetic_error_cycles",
               (rt && rt->has_fired) ? rt->last_diag.dwt_synthetic_error_cycles : 0);
   out.add_bool("last_diag_spinidle_shadow_valid",
@@ -10450,6 +10490,14 @@ static FLASHMEM void add_vclock_lane_ema_section(Payload& p) {
     p.add("last_diag_dwt_predicted_at_event", d.dwt_predicted_at_event);
     p.add("last_diag_dwt_used_at_event", d.dwt_used_at_event);
     p.add("last_diag_dwt_isr_entry_raw", d.dwt_isr_entry_raw);
+    p.add("last_diag_dwt_event_from_isr_entry_raw",
+          d.dwt_event_from_isr_entry_raw);
+    p.add("last_diag_dwt_isr_entry_to_event_correction_cycles",
+          d.dwt_isr_entry_to_event_correction_cycles);
+    p.add("last_diag_dwt_published_minus_event_cycles",
+          d.dwt_published_minus_event_cycles);
+    p.add("last_diag_dwt_used_minus_event_cycles",
+          d.dwt_used_minus_event_cycles);
     p.add("last_diag_dwt_synthetic_error_cycles", d.dwt_synthetic_error_cycles);
     p.add("last_diag_dwt_interval_gate_valid", d.dwt_interval_gate_valid);
     p.add("last_diag_dwt_interval_sample_accepted", d.dwt_interval_sample_accepted);

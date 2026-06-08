@@ -1031,6 +1031,14 @@ static void payload_add_lane_forensics_flat(Payload& p,
   add_u32("forensics_dwt_predicted_at_event", valid ? f.dwt_predicted_at_event : 0U);
   add_u32("forensics_dwt_used_at_event", valid ? f.dwt_used_at_event : 0U);
   add_u32("forensics_dwt_isr_entry_raw", valid ? f.dwt_isr_entry_raw : 0U);
+  add_u32("forensics_dwt_event_from_isr_entry_raw",
+          valid ? f.dwt_event_from_isr_entry_raw : 0U);
+  add_i32("forensics_dwt_isr_entry_to_event_correction_cycles",
+          valid ? f.dwt_isr_entry_to_event_correction_cycles : 0);
+  add_i32("forensics_dwt_published_minus_event_cycles",
+          valid ? f.dwt_published_minus_event_cycles : 0);
+  add_i32("forensics_dwt_used_minus_event_cycles",
+          valid ? f.dwt_used_minus_event_cycles : 0);
   add_i32("forensics_dwt_synthetic_error_cycles",
           valid ? f.dwt_synthetic_error_cycles : 0);
   add_u32("forensics_dwt_synthetic_threshold_cycles",
@@ -1351,6 +1359,14 @@ static void payload_add_lane_forensics_object(Payload& parent,
   forensics.add("dwt_predicted_at_event", valid ? f.dwt_predicted_at_event : 0U);
   forensics.add("dwt_used_at_event", valid ? f.dwt_used_at_event : 0U);
   forensics.add("dwt_isr_entry_raw", valid ? f.dwt_isr_entry_raw : 0U);
+  forensics.add("dwt_event_from_isr_entry_raw",
+                valid ? f.dwt_event_from_isr_entry_raw : 0U);
+  forensics.add("dwt_isr_entry_to_event_correction_cycles",
+                valid ? f.dwt_isr_entry_to_event_correction_cycles : 0);
+  forensics.add("dwt_published_minus_event_cycles",
+                valid ? f.dwt_published_minus_event_cycles : 0);
+  forensics.add("dwt_used_minus_event_cycles",
+                valid ? f.dwt_used_minus_event_cycles : 0);
   forensics.add("dwt_synthetic_error_cycles",
                 valid ? f.dwt_synthetic_error_cycles : 0);
   forensics.add("dwt_synthetic_threshold_cycles",
@@ -3473,6 +3489,24 @@ static void add_alpha_event_payload(Payload& p,
             f.bridge_residual_ns - vclock_ref->bridge_residual_ns);
     }
   }
+
+  Payload dwt_authority;
+  dwt_authority.add("synthetic", f.dwt_synthetic);
+  dwt_authority.add("original_at_event", f.dwt_original_at_event);
+  dwt_authority.add("predicted_at_event", f.dwt_predicted_at_event);
+  dwt_authority.add("used_at_event", f.dwt_used_at_event);
+  dwt_authority.add("isr_entry_raw", f.dwt_isr_entry_raw);
+  dwt_authority.add("event_from_isr_entry_raw",
+                    f.dwt_event_from_isr_entry_raw);
+  dwt_authority.add("isr_entry_to_event_correction_cycles",
+                    f.dwt_isr_entry_to_event_correction_cycles);
+  dwt_authority.add("published_minus_event_cycles",
+                    f.dwt_published_minus_event_cycles);
+  dwt_authority.add("used_minus_event_cycles",
+                    f.dwt_used_minus_event_cycles);
+  dwt_authority.add("synthetic_error_cycles",
+                    f.dwt_synthetic_error_cycles);
+  p.add_object("dwt_authority", dwt_authority);
 
   p.add("ns_between_edges", f.ns_between_edges);
   p.add("dwt_cycles_between_edges", f.dwt_cycles_between_edges);
