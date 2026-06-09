@@ -74,8 +74,8 @@
 //   independent rails:
 //     PPS    — physical GPIO PPS edge-to-edge DWT interval
 //     VCLOCK — canonical PPS/VCLOCK lattice edge-to-edge DWT interval
-//     OCXO1  — OCXO1 EMA-predicted boundary-to-boundary DWT interval
-//     OCXO2  — OCXO2 EMA-predicted boundary-to-boundary DWT interval
+//     OCXO1  — OCXO1 authored edge-to-edge DWT interval
+//     OCXO2  — OCXO2 authored edge-to-edge DWT interval
 //   Beta publishes the compact audit.
 //
 // VCLOCK as measured peer of OCXO:
@@ -295,10 +295,10 @@ struct clocks_alpha_lane_forensics_t {
   uint64_t event_gnss_ns;
   uint64_t previous_event_gnss_ns;
 
-  // Process_interrupt-authored GNSS witness for the subscriber event.  In the
-  // rollover-only EMA build, OCXO lanes normally arrive already at the logical
-  // one-second edge; the older quiet-zone sample fields remain compatibility
-  // surfaces only.
+  // Process_interrupt-authored GNSS witness for the subscriber event.  OCXO
+  // lanes are now consumed as ordinary edge facts.  The older quiet-zone sample
+  // and boundary fields remain compatibility/report surfaces only and should
+  // publish as sample == boundary with zero correction.
   bool     sample_gnss_ns_at_event_available;
   bool     previous_sample_gnss_ns_at_event_available;
   uint64_t sample_gnss_ns_at_event;
@@ -453,7 +453,7 @@ struct clocks_alpha_event_flow_snapshot_t {
   uint32_t callback_rejected_epoch_not_ready_count;
 
   uint32_t apply_entry_count;
-  uint32_t apply_phase_projected_count;
+  uint32_t apply_phase_projected_count;  // retired; should remain zero
   uint32_t apply_ticks64_success_count;
   uint32_t apply_ticks64_failure_count;
   uint32_t apply_measured_second_count;
@@ -484,7 +484,7 @@ struct clocks_alpha_event_flow_snapshot_t {
   uint32_t last_callback_diag_service_class;
   int32_t  last_callback_diag_service_offset_ticks;
   uint32_t last_callback_diag_perishable_fact_sequence;
-  bool     last_callback_sample_phase_valid;
+  bool     last_callback_sample_phase_valid;  // retired; should remain false
   uint32_t last_callback_sample_phase_ticks;
 
   uint32_t last_rejected_dwt_at_event;

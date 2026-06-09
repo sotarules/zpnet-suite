@@ -8,10 +8,11 @@
 // mirror.  No slot staging, no installed event wrappers, no late hardware
 // reads masquerading as event truth.
 //
-// OCXO events are now delivered as rollover-only one-second events whose DWT
-// coordinate is EMA-predicted by process_interrupt from completed one-second
-// intervals.  Alpha still accepts the older sample-phase diagnostic surface for
-// compatibility, but the normal EMA path arrives already at the logical edge.
+// OCXO events are delivered as rollover-only one-second events whose DWT
+// coordinate is authored by process_interrupt from completed one-second
+// intervals.  The older quiet-zone/sample-phase back-projection path is retired:
+// Alpha now treats OCXO subscriber events as ordinary clock-edge facts and never
+// subtracts the historical 250 us / 750 us offsets from DWT or counter identity.
 //
 // PPS is a selector/witness. process_interrupt authors the selected PPS/VCLOCK
 // edge identity, while the physical PPS/GPIO DWT witness supplies the smooth
@@ -803,8 +804,11 @@ static void alpha_event_flow_note_callback(time_clock_id_t clock,
     f->last_callback_diag_service_class = diag->ocxo_service_class;
     f->last_callback_diag_service_offset_ticks = diag->ocxo_service_offset_signed_ticks;
     f->last_callback_diag_perishable_fact_sequence = diag->ocxo_perishable_fact_sequence;
-    f->last_callback_sample_phase_valid = diag->ocxo_sample_phase_valid;
-    f->last_callback_sample_phase_ticks = diag->ocxo_sample_phase_ticks;
+    // Retired quiet-phase/sample-offset doctrine: process_interrupt may still
+    // carry legacy sample-phase fields, but Alpha no longer treats them as an
+    // active transformation or reports them as accepted callback state.
+    f->last_callback_sample_phase_valid = false;
+    f->last_callback_sample_phase_ticks = 0;
   } else {
     f->callback_diag_missing_count++;
     f->last_callback_diag_anchor_selection_kind = 0;
@@ -841,20 +845,6 @@ static void alpha_event_flow_note_apply_entry(time_clock_id_t clock) {
   if (!f) return;
   f->apply_entry_count++;
   f->last_stage = ALPHA_FLOW_STAGE_APPLY_ENTRY;
-}
-
-static void alpha_event_flow_note_phase(time_clock_id_t clock,
-                                        uint32_t phase_ticks,
-                                        uint32_t phase_cycles,
-                                        const interrupt_event_t& applied_event) {
-  alpha_event_flow_store_t* f = alpha_event_flow_store(clock);
-  if (!f) return;
-  f->apply_phase_projected_count++;
-  f->last_stage = ALPHA_FLOW_STAGE_PHASE_PROJECTED;
-  f->last_applied_phase_ticks = phase_ticks;
-  f->last_applied_phase_cycles = phase_cycles;
-  f->last_applied_dwt_at_event = applied_event.dwt_at_event;
-  f->last_applied_counter32_at_event = applied_event.counter32_at_event;
 }
 
 static void alpha_event_flow_note_ticks64(time_clock_id_t clock,
@@ -1108,8 +1098,8 @@ static inline void clocks_alpha_dmb(void) {
 // symmetric rails are tracked independently:
 //   PPS    — physical GPIO PPS edge-to-edge DWT interval
 //   VCLOCK — canonical PPS/VCLOCK lattice edge-to-edge DWT interval
-//   OCXO1  — OCXO1 EMA-predicted edge-to-edge DWT interval
-//   OCXO2  — OCXO2 EMA-predicted edge-to-edge DWT interval
+//   OCXO1  — OCXO1 authored edge-to-edge DWT interval
+//   OCXO2  — OCXO2 authored edge-to-edge DWT interval
 
 struct alpha_static_prediction_store_t {
   volatile uint32_t seq = 0;
@@ -1277,7 +1267,7 @@ bool clocks_static_prediction_pps_snapshot(clocks_static_prediction_snapshot_t* 
 // ============================================================================
 //
 // Step A for the PPS-founded OCXO clock standard.  Alpha records OCXO
-// boundary edge facts and, once per PPS/VCLOCK row, computes what the OCXO
+// edge facts and, once per PPS/VCLOCK row, computes what the OCXO
 // clock's own nanosecond ledger would have read at that PPS/VCLOCK DWT
 // coordinate.  This is not yet promoted into g_ocxo*_measured_gnss_ns_at_pps_vclock
 // and it does not feed TIMEBASE/Welfords/servo.
@@ -3401,22 +3391,6 @@ static uint32_t alpha_physics_dwt_at_event(time_clock_id_t clock,
   return event.dwt_at_event;
 }
 
-static uint32_t alpha_dwt_cycles_for_10mhz_ticks(uint32_t ticks,
-                                                 uint32_t cycles_per_second) {
-  if (ticks == 0 || cycles_per_second == 0) return 0;
-  return (uint32_t)(((uint64_t)cycles_per_second * (uint64_t)ticks +
-                     (uint64_t)VCLOCK_COUNTS_PER_SECOND / 2ULL) /
-                    (uint64_t)VCLOCK_COUNTS_PER_SECOND);
-}
-
-static uint32_t alpha_phase_backprojection_cps(const clock_measurement_t& meas) {
-  if (meas.dwt_cycles_between_edges != 0) {
-    return meas.dwt_cycles_between_edges;
-  }
-  const uint32_t effective = dwt_effective_cycles_per_pps_vclock_second();
-  return effective ? effective : (uint32_t)DWT_EXPECTED_PER_PPS;
-}
-
 static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
                                             clock_measurement_t& meas,
                                             const interrupt_event_t& event,
@@ -3428,34 +3402,34 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
   const bool had_previous = (meas.prev_dwt_at_edge != 0);
 
   interrupt_event_t applied_event = event;
-  const uint32_t sample_physics_dwt =
+  const uint32_t physics_dwt =
       alpha_physics_dwt_at_event(time_clock, event, diag);
-  uint32_t phase_ticks = 0;
-  uint32_t phase_cycles = 0;
 
-  if (is_ocxo && diag && diag->ocxo_sample_phase_valid) {
-    phase_ticks = diag->ocxo_sample_phase_ticks;
-    phase_cycles = alpha_dwt_cycles_for_10mhz_ticks(
-        phase_ticks, alpha_phase_backprojection_cps(meas));
-    applied_event.dwt_at_event = sample_physics_dwt - phase_cycles;
-    applied_event.counter32_at_event = event.counter32_at_event - phase_ticks;
-    alpha_event_flow_note_phase(time_clock, phase_ticks, phase_cycles, applied_event);
-  } else {
-    applied_event.dwt_at_event = sample_physics_dwt;
-  }
+  // Retired quiet-zone/sample-offset doctrine.  OCXO subscriber events are now
+  // ordinary edge facts.  Do not subtract the historical +250 us / +750 us
+  // sample phase from either DWT or counter32; doing so creates an OCXO-only
+  // boundary transform in the raw custody chain.
+  applied_event.dwt_at_event = physics_dwt;
 
   interrupt_capture_diag_t local_diag{};
   const interrupt_capture_diag_t* applied_diag = diag;
   if (diag) {
     local_diag = *diag;
     if (is_ocxo) {
-      local_diag.ocxo_sample_dwt_at_event =
-          diag->ocxo_sample_dwt_at_event ? diag->ocxo_sample_dwt_at_event : event.dwt_at_event;
-      local_diag.ocxo_sample_counter32_at_event =
-          diag->ocxo_sample_counter32_at_event ? diag->ocxo_sample_counter32_at_event : event.counter32_at_event;
+      // Preserve the old field names as passive compatibility surfaces, but
+      // publish the new truth: sample == boundary == applied event, with zero
+      // phase correction.  process_interrupt may still populate legacy
+      // ocxo_sample_phase_* diagnostics; Alpha deliberately retires them here.
+      local_diag.ocxo_sample_phase_valid = false;
+      local_diag.ocxo_sample_phase_ticks = 0;
+      local_diag.ocxo_sample_phase_ns = 0;
+      local_diag.ocxo_sample_phase_us = 0;
+      local_diag.ocxo_sample_period_ticks = 0;
+      local_diag.ocxo_sample_dwt_at_event = applied_event.dwt_at_event;
+      local_diag.ocxo_sample_counter32_at_event = applied_event.counter32_at_event;
       local_diag.ocxo_boundary_dwt_at_event = applied_event.dwt_at_event;
       local_diag.ocxo_boundary_counter32_at_event = applied_event.counter32_at_event;
-      local_diag.ocxo_boundary_correction_cycles = (int32_t)phase_cycles;
+      local_diag.ocxo_boundary_correction_cycles = 0;
       local_diag.dwt_at_event = applied_event.dwt_at_event;
       local_diag.counter32_at_event = applied_event.counter32_at_event;
     }
@@ -3509,22 +3483,8 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
     const uint64_t sample_gnss_ns_at_event = sample_gnss_available
         ? event.gnss_ns_at_event
         : 0ULL;
-    uint64_t boundary_gnss_ns_at_edge = 0;
-    bool boundary_gnss_available = false;
-    if (sample_gnss_available) {
-      const uint32_t dwt_per_second =
-          dwt_effective_cycles_per_pps_vclock_second();
-      if (dwt_per_second != 0) {
-        const uint64_t phase_ns =
-            ((uint64_t)phase_cycles * NS_PER_SECOND_U64 +
-             (uint64_t)dwt_per_second / 2ULL) /
-            (uint64_t)dwt_per_second;
-        if (sample_gnss_ns_at_event >= phase_ns) {
-          boundary_gnss_ns_at_edge = sample_gnss_ns_at_event - phase_ns;
-          boundary_gnss_available = true;
-        }
-      }
-    }
+    const uint64_t boundary_gnss_ns_at_edge = sample_gnss_ns_at_event;
+    const bool boundary_gnss_available = sample_gnss_available;
 
     alpha_ocxo_edge_history_record(time_clock,
                                    applied_event.dwt_at_event,
@@ -3535,8 +3495,8 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
                                    sample_gnss_ns_at_event,
                                    boundary_gnss_available,
                                    boundary_gnss_ns_at_edge,
-                                   phase_ticks,
-                                   phase_cycles);
+                                   0U,
+                                   0U);
 
     dwt_cycles_between_edges = measured_dwt_cycles;
     gnss_ns_between_edges = real_interval_ns;

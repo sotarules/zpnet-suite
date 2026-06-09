@@ -1134,9 +1134,9 @@ static void payload_add_lane_forensics_flat(Payload& p,
   add_u32("forensics_last_counter_delta_ticks",
           valid ? f.diag_last_counter_delta_ticks : 0U);
 
-  // Quiet-zone OCXO sample phase / Alpha boundary projection.  raw_cycles can
-  // continue to use forensics_last_event_dwt as the Alpha-applied boundary DWT
-  // while these fields expose the observed sample and the subtracted phase.
+  // Retired quiet-zone OCXO sample phase / Alpha boundary projection.
+  // Alpha now publishes sample == boundary == applied event and keeps the
+  // correction fields zero; the field names remain for report compatibility.
   add_bool("forensics_sample_phase_valid",
            valid && f.diag_sample_phase_valid);
   add_u32("forensics_sample_phase_ticks",
@@ -4035,7 +4035,7 @@ static const char* alpha_flow_stage_name_beta(uint32_t stage) {
     case 2:  return "REJECT_EPOCH";
     case 3:  return "CALLBACK_ACCEPTED";
     case 4:  return "APPLY_ENTRY";
-    case 5:  return "PHASE_PROJECTED";
+    case 5:  return "PHASE_PROJECTED_RETIRED";
     case 6:  return "TICKS64_OK";
     case 7:  return "TICKS64_FAIL";
     case 8:  return "MEASURED_SECOND";
