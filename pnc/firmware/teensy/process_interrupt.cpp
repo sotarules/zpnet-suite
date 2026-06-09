@@ -318,6 +318,92 @@ static constexpr bool LINEAR_REGRESSION_AUTHORED_DWT = false;
 static constexpr bool LINEAR_REGRESSION_DIAGNOSTIC_ONLY = false;
 
 // ============================================================================
+// Raw ISR-entry DWT interval probe
+// ============================================================================
+//
+// Diagnostic-only truth recorder.  This deliberately captures the simplest
+// possible one-second interval surface:
+//
+//   interval[n] = isr_entry_dwt_raw[n] - isr_entry_dwt_raw[n-1]
+//
+// No latency correction, no event-coordinate conversion, no EMA, no bridge
+// projection, and no subscriber DWT authority participate.  The report exists
+// to compare literal first-instruction ISR-entry timing for VCLOCK, OCXO1, and
+// OCXO2 with the richer event-coordinate custody chain.
+static constexpr uint32_t ISR_RAW_DWT_INTERVAL_RING_SIZE = 128U;
+
+struct isr_raw_dwt_interval_probe_t {
+  uint32_t endpoint_count = 0;
+  uint32_t interval_count = 0;
+  uint32_t write_index = 0;  // next interval slot to write
+  bool     last_dwt_valid = false;
+  uint32_t last_isr_entry_dwt_raw = 0;
+  bool     last_interval_valid = false;
+  uint32_t last_interval_cycles = 0;
+  int32_t  last_interval_delta_cycles = 0;
+  uint32_t intervals[ISR_RAW_DWT_INTERVAL_RING_SIZE]{};
+};
+
+static isr_raw_dwt_interval_probe_t g_raw_dwt_probe_vclock = {};
+static isr_raw_dwt_interval_probe_t g_raw_dwt_probe_ocxo1 = {};
+static isr_raw_dwt_interval_probe_t g_raw_dwt_probe_ocxo2 = {};
+
+static isr_raw_dwt_interval_probe_t*
+isr_raw_dwt_probe_for(interrupt_subscriber_kind_t kind) {
+  if (kind == interrupt_subscriber_kind_t::VCLOCK) return &g_raw_dwt_probe_vclock;
+  if (kind == interrupt_subscriber_kind_t::OCXO1)  return &g_raw_dwt_probe_ocxo1;
+  if (kind == interrupt_subscriber_kind_t::OCXO2)  return &g_raw_dwt_probe_ocxo2;
+  return nullptr;
+}
+
+static const isr_raw_dwt_interval_probe_t*
+isr_raw_dwt_probe_for_const(interrupt_subscriber_kind_t kind) {
+  return isr_raw_dwt_probe_for(kind);
+}
+
+static void isr_raw_dwt_probe_reset(interrupt_subscriber_kind_t kind) {
+  isr_raw_dwt_interval_probe_t* p = isr_raw_dwt_probe_for(kind);
+  if (!p) return;
+  *p = isr_raw_dwt_interval_probe_t{};
+}
+
+static void isr_raw_dwt_probe_reset_all(void) {
+  isr_raw_dwt_probe_reset(interrupt_subscriber_kind_t::VCLOCK);
+  isr_raw_dwt_probe_reset(interrupt_subscriber_kind_t::OCXO1);
+  isr_raw_dwt_probe_reset(interrupt_subscriber_kind_t::OCXO2);
+}
+
+static void isr_raw_dwt_probe_record(interrupt_subscriber_kind_t kind,
+                                     uint32_t isr_entry_dwt_raw) {
+  isr_raw_dwt_interval_probe_t* p = isr_raw_dwt_probe_for(kind);
+  if (!p) return;
+
+  p->endpoint_count++;
+
+  if (p->last_dwt_valid) {
+    const uint32_t interval = isr_entry_dwt_raw - p->last_isr_entry_dwt_raw;
+    const bool have_previous_interval = p->last_interval_valid;
+
+    p->intervals[p->write_index] = interval;
+    p->write_index =
+        (p->write_index + 1U) % ISR_RAW_DWT_INTERVAL_RING_SIZE;
+    if (p->interval_count < ISR_RAW_DWT_INTERVAL_RING_SIZE) {
+      p->interval_count++;
+    }
+
+    p->last_interval_delta_cycles = have_previous_interval
+        ? (int32_t)((int64_t)interval - (int64_t)p->last_interval_cycles)
+        : 0;
+    p->last_interval_cycles = interval;
+    p->last_interval_valid = true;
+  }
+
+  p->last_isr_entry_dwt_raw = isr_entry_dwt_raw;
+  p->last_dwt_valid = true;
+}
+
+
+// ============================================================================
 // Symmetric OCXO disable matrix (temporary A/B experiment surface)
 // ============================================================================
 //
@@ -4391,6 +4477,9 @@ static void vclock_ch2_one_second_service(uint32_t isr_entry_dwt_raw,
   const uint32_t target_counter32 = g_vclock_ch2_one_second_next_counter32;
   if ((int32_t)(service_counter32 - target_counter32) < 0) return;
 
+  isr_raw_dwt_probe_record(interrupt_subscriber_kind_t::VCLOCK,
+                           isr_entry_dwt_raw);
+
   const uint16_t target_low16 = vclock_hardware_low16_from_synthetic(target_counter32);
   spincatch_note_isr_entry(interrupt_subscriber_kind_t::VCLOCK,
                            target_counter32,
@@ -7126,6 +7215,10 @@ static void interrupt_handoff_process_ocxo(ocxo_runtime_context_t& ctx,
   ocxo_cadence_update_synthetic_identity(ctx, sample);
   ocxo_cadence_update_sample_phase(ctx, sample);
 
+  if (sample.one_second_due && sample.had_active_rt) {
+    isr_raw_dwt_probe_record(ctx.kind, sample.isr_entry_dwt_raw);
+  }
+
   const bool cadence_reauthored_by_smartzero =
       ocxo_cadence_feed_smartzero(ctx, sample);
   ocxo_cadence_rearm_or_stop(ctx, sample, cadence_reauthored_by_smartzero);
@@ -8254,6 +8347,7 @@ static void runtime_reset_vclock_heartbeat_state(void) {
   g_isr_sanity_pps_prev_dwt = 0;
   g_spinidle_pps_last_capture = spinidle_isr_capture_t{};
   g_spinidle_timepop_last_capture = spinidle_isr_capture_t{};
+  isr_raw_dwt_probe_reset_all();
 
   g_interrupt_handoff = interrupt_handoff_diag_t{};
   g_handoff_qtimer1_ch1 = interrupt_handoff_source_diag_t{};
@@ -8702,6 +8796,233 @@ static FLASHMEM void regression_append_csv_i32(char* buf, size_t len,
   }
 }
 
+
+static FLASHMEM bool isr_raw_dwt_probe_snapshot(
+    interrupt_subscriber_kind_t kind,
+    isr_raw_dwt_interval_probe_t& out) {
+  const isr_raw_dwt_interval_probe_t* src = isr_raw_dwt_probe_for_const(kind);
+  if (!src) {
+    out = isr_raw_dwt_interval_probe_t{};
+    return false;
+  }
+
+  uint32_t primask = 0;
+  __asm__ volatile ("mrs %0, primask" : "=r" (primask) :: "memory");
+  __disable_irq();
+  out = *src;
+  if ((primask & 1U) == 0U) {
+    __enable_irq();
+  }
+
+  return true;
+}
+
+static FLASHMEM uint32_t isr_raw_dwt_probe_chrono_index(
+    const isr_raw_dwt_interval_probe_t& s,
+    uint32_t ordinal) {
+  if (s.interval_count == 0) return 0;
+  const uint32_t start =
+      (s.write_index + ISR_RAW_DWT_INTERVAL_RING_SIZE - s.interval_count) %
+      ISR_RAW_DWT_INTERVAL_RING_SIZE;
+  return (start + ordinal) % ISR_RAW_DWT_INTERVAL_RING_SIZE;
+}
+
+static FLASHMEM void isr_raw_dwt_probe_append_csv_u32(char* buf,
+                                             size_t len,
+                                             uint32_t& used,
+                                             uint32_t value) {
+  if (used >= len) return;
+  const int n = snprintf(buf + used, len - used,
+                         used == 0 ? "%lu" : ",%lu",
+                         (unsigned long)value);
+  if (n > 0) {
+    const uint32_t add = (uint32_t)n;
+    used = (add >= (len - used)) ? (uint32_t)(len - 1U) : (used + add);
+  }
+}
+
+static FLASHMEM void isr_raw_dwt_probe_append_csv_i32(char* buf,
+                                             size_t len,
+                                             uint32_t& used,
+                                             int32_t value) {
+  if (used >= len) return;
+  const int n = snprintf(buf + used, len - used,
+                         used == 0 ? "%ld" : ",%ld",
+                         (long)value);
+  if (n > 0) {
+    const uint32_t add = (uint32_t)n;
+    used = (add >= (len - used)) ? (uint32_t)(len - 1U) : (used + add);
+  }
+}
+
+static FLASHMEM void isr_raw_dwt_probe_add_summary(Payload& p,
+                                          const isr_raw_dwt_interval_probe_t& s,
+                                          bool include_csv) {
+  const uint32_t n = s.interval_count;
+
+  double mean = 0.0;
+  double m2 = 0.0;
+  uint32_t min_v = UINT32_MAX;
+  uint32_t max_v = 0;
+
+  double fd_mean = 0.0;
+  double fd_m2 = 0.0;
+  int32_t fd_min = INT32_MAX;
+  int32_t fd_max = INT32_MIN;
+  uint32_t fd_n = 0;
+  uint32_t prev = 0;
+
+  static char interval_csv[2048];
+  static char first_difference_csv[1536];
+  if (include_csv) {
+    interval_csv[0] = '\0';
+    first_difference_csv[0] = '\0';
+  }
+  uint32_t interval_used = 0;
+  uint32_t fd_used = 0;
+
+  for (uint32_t i = 0; i < n; i++) {
+    const uint32_t idx = isr_raw_dwt_probe_chrono_index(s, i);
+    const uint32_t v = s.intervals[idx];
+
+    if (v < min_v) min_v = v;
+    if (v > max_v) max_v = v;
+
+    const double d1 = (double)v - mean;
+    mean += d1 / (double)(i + 1U);
+    const double d2 = (double)v - mean;
+    m2 += d1 * d2;
+
+    if (include_csv) {
+      isr_raw_dwt_probe_append_csv_u32(interval_csv,
+                                       sizeof(interval_csv),
+                                       interval_used,
+                                       v);
+    }
+
+    if (i > 0) {
+      const int32_t fd = (int32_t)((int64_t)v - (int64_t)prev);
+      if (fd < fd_min) fd_min = fd;
+      if (fd > fd_max) fd_max = fd;
+      fd_n++;
+
+      const double fd_d1 = (double)fd - fd_mean;
+      fd_mean += fd_d1 / (double)fd_n;
+      const double fd_d2 = (double)fd - fd_mean;
+      fd_m2 += fd_d1 * fd_d2;
+
+      if (include_csv) {
+        isr_raw_dwt_probe_append_csv_i32(first_difference_csv,
+                                         sizeof(first_difference_csv),
+                                         fd_used,
+                                         fd);
+      }
+    }
+
+    prev = v;
+  }
+
+  const double variance = (n >= 2U) ? (m2 / (double)(n - 1U)) : 0.0;
+  const double stddev = sqrt(variance < 0.0 ? 0.0 : variance);
+  const double se = (n > 0) ? (stddev / sqrt((double)n)) : 0.0;
+
+  const double fd_variance =
+      (fd_n >= 2U) ? (fd_m2 / (double)(fd_n - 1U)) : 0.0;
+  const double fd_stddev = sqrt(fd_variance < 0.0 ? 0.0 : fd_variance);
+  const double fd_stderr = (fd_n > 0) ? (fd_stddev / sqrt((double)fd_n)) : 0.0;
+
+  p.add("endpoint_count", s.endpoint_count);
+  p.add("interval_count", n);
+  p.add("interval_capacity", ISR_RAW_DWT_INTERVAL_RING_SIZE);
+  p.add("write_index", s.write_index);
+  p.add("last_dwt_valid", s.last_dwt_valid);
+  p.add("last_isr_entry_dwt_raw", s.last_isr_entry_dwt_raw);
+  p.add("last_interval_valid", s.last_interval_valid);
+  p.add("last_interval_cycles", s.last_interval_cycles);
+  p.add("last_interval_delta_cycles", s.last_interval_delta_cycles);
+
+  p.add("interval_mean_cycles", (double)((n > 0) ? mean : 0.0));
+  p.add("interval_stddev_cycles", (double)((n >= 2U) ? stddev : 0.0));
+  p.add("interval_stderr_cycles", (double)((n > 0) ? se : 0.0));
+  p.add("interval_min_cycles", (n > 0) ? min_v : 0U);
+  p.add("interval_max_cycles", (n > 0) ? max_v : 0U);
+
+  p.add("first_difference_count", fd_n);
+  p.add("first_difference_mean_cycles", (double)((fd_n > 0) ? fd_mean : 0.0));
+  p.add("first_difference_stddev_cycles", (double)((fd_n >= 2U) ? fd_stddev : 0.0));
+  p.add("first_difference_stderr_cycles", (double)((fd_n > 0) ? fd_stderr : 0.0));
+  p.add("first_difference_min_cycles", (fd_n > 0) ? fd_min : 0);
+  p.add("first_difference_max_cycles", (fd_n > 0) ? fd_max : 0);
+
+  if (include_csv) {
+    p.add("sample_encoding", "csv_chronological_oldest_to_newest");
+    p.add("interval_cycles_csv", interval_csv);
+    p.add("first_difference_cycles_csv", first_difference_csv);
+  }
+}
+
+static FLASHMEM Payload cmd_report_ocxo_isr_raw_dwt(const Payload& args) {
+  const char* lane_arg = args.getString("lane");
+  if (!lane_arg || !*lane_arg) lane_arg = args.getString("name");
+
+  Payload p;
+  p.add("report", "INTERRUPT_OCXO_ISR_RAW_DWT");
+  p.add("schema", "ISR_RAW_DWT_INTERVAL_RING_V1");
+  p.add("doctrine", "literal_first_instruction_isr_entry_dwt_intervals_no_correction_no_projection_no_ema");
+  p.add("usage", "INTERRUPT.REPORT_OCXO_ISR_RAW_DWT lane=VCLOCK|OCXO1|OCXO2");
+  p.add("ring_capacity", ISR_RAW_DWT_INTERVAL_RING_SIZE);
+
+  const bool want_all =
+      !lane_arg || !*lane_arg || !strcasecmp(lane_arg, "ALL");
+  if (want_all) {
+    p.add("lane", "ALL");
+    p.add("note", "lane=ALL returns compact summaries only; request one lane for CSV samples");
+
+    Payload vclock;
+    isr_raw_dwt_interval_probe_t v{};
+    (void)isr_raw_dwt_probe_snapshot(interrupt_subscriber_kind_t::VCLOCK, v);
+    vclock.add("lane", "VCLOCK");
+    isr_raw_dwt_probe_add_summary(vclock, v, false);
+    p.add_object("vclock", vclock);
+
+    Payload ocxo1;
+    isr_raw_dwt_interval_probe_t o1{};
+    (void)isr_raw_dwt_probe_snapshot(interrupt_subscriber_kind_t::OCXO1, o1);
+    ocxo1.add("lane", "OCXO1");
+    isr_raw_dwt_probe_add_summary(ocxo1, o1, false);
+    p.add_object("ocxo1", ocxo1);
+
+    Payload ocxo2;
+    isr_raw_dwt_interval_probe_t o2{};
+    (void)isr_raw_dwt_probe_snapshot(interrupt_subscriber_kind_t::OCXO2, o2);
+    ocxo2.add("lane", "OCXO2");
+    isr_raw_dwt_probe_add_summary(ocxo2, o2, false);
+    p.add_object("ocxo2", ocxo2);
+    return p;
+  }
+
+  const interrupt_subscriber_kind_t kind = regression_kind_from_lane_arg(lane_arg);
+  if (kind != interrupt_subscriber_kind_t::VCLOCK &&
+      kind != interrupt_subscriber_kind_t::OCXO1 &&
+      kind != interrupt_subscriber_kind_t::OCXO2) {
+    p.add("error", "unknown lane");
+    p.add("lane", lane_arg ? lane_arg : "");
+    return p;
+  }
+
+  isr_raw_dwt_interval_probe_t snapshot{};
+  const bool ok = isr_raw_dwt_probe_snapshot(kind, snapshot);
+
+  p.add("lane", interrupt_subscriber_kind_str(kind));
+  p.add("snapshot_ok", ok);
+  p.add("source_field", "ARM_DWT_CYCCNT captured as first instruction of the lane's one-second ISR service");
+  p.add("vclock_note", "VCLOCK records only native one-second CH2 service facts, not every 1ms TimePop fire");
+  p.add("ocxo_note", "OCXO records only active steady-state one-second facts, not SmartZero 1kHz acquisition samples");
+  isr_raw_dwt_probe_add_summary(p, snapshot, true);
+  return p;
+}
+
+
 static FLASHMEM void add_regression_sample_scalar(Payload& p,
                                          const cadence_regression_lane_t& r,
                                          uint32_t index,
@@ -9124,6 +9445,7 @@ static FLASHMEM void add_runtime_payload(Payload& p) {
   p.add("handoff_irq", INTERRUPT_HANDOFF_IRQ_NUMBER);
   p.add("handoff_priority", INTERRUPT_PRIORITY_HANDOFF);
   p.add("handoff_report_command", "INTERRUPT.REPORT_HANDOFF");
+  p.add("ocxo_isr_raw_dwt_report_command", "INTERRUPT.REPORT_OCXO_ISR_RAW_DWT lane=VCLOCK|OCXO1|OCXO2");
 }
 
 static FLASHMEM void add_ocxo_cadence_report_payload(Payload& p,
@@ -11270,6 +11592,7 @@ static const process_command_entry_t INTERRUPT_COMMANDS[] = {
   { "REPORT_LANES",    cmd_report_lanes    },
   { "REPORT_LANE",     cmd_report_lane     },
   { "REPORT_QTIMER_REGS", cmd_report_qtimer_regs },
+  { "REPORT_OCXO_ISR_RAW_DWT", cmd_report_ocxo_isr_raw_dwt },
   { nullptr,           nullptr             }
 };
 
