@@ -169,22 +169,9 @@ static volatile uint32_t g_vclock_event_count = 0;
 // OCXO DAC defaults
 // ============================================================================
 
-static constexpr uint32_t OCXO_DAC_Q16_SHIFT = 16U;
-static constexpr uint32_t OCXO_DAC_Q16_ONE   = (1UL << OCXO_DAC_Q16_SHIFT);
-static constexpr uint32_t OCXO_DAC_Q16_MAX   = ((uint32_t)65535U << OCXO_DAC_Q16_SHIFT);
-
-static uint32_t ocxo_dac_value_to_q16(double value) {
-  if (value < 0.0) value = 0.0;
-  if (value > 65535.0) value = 65535.0;
-  const double scaled = value * (double)OCXO_DAC_Q16_ONE;
-  const double rounded = scaled + 0.5;
-  if (rounded >= (double)OCXO_DAC_Q16_MAX) return OCXO_DAC_Q16_MAX;
-  return (uint32_t)rounded;
-}
-
-static double ocxo_dac_q16_to_value(uint32_t q16) {
-  return (double)q16 / (double)OCXO_DAC_Q16_ONE;
-}
+// The DAC target remains a real-valued control/persistence surface, but the
+// AD5693R receives only the nearest static integer code.  There is no
+// fractional-code realization layer in this build.
 
 static ocxo_dac_state_t make_default_ocxo_dac_state() {
   ocxo_dac_state_t s = {};
@@ -192,16 +179,6 @@ static ocxo_dac_state_t make_default_ocxo_dac_state() {
   s.dac_hw_code = AD5693R_DAC_DEFAULT;
   s.dac_min = 0;
   s.dac_max = 65535;
-  s.dac_desired_q16 = ((uint32_t)AD5693R_DAC_DEFAULT << OCXO_DAC_Q16_SHIFT);
-  s.dither_enabled = true;
-  s.dither_rate_hz = 1000U;
-  s.dither_period_ns = 1000000U;
-  s.dither_effective_window_ticks = 1000U;
-  s.dither_low_code = AD5693R_DAC_DEFAULT;
-  s.dither_high_code = AD5693R_DAC_DEFAULT;
-  s.dither_last_selected_hw_code = AD5693R_DAC_DEFAULT;
-  s.dither_last_window_low_code = AD5693R_DAC_DEFAULT;
-  s.dither_last_window_high_code = AD5693R_DAC_DEFAULT;
   s.io_last_write_ok = true;
   s.io_last_attempted_hw_code = AD5693R_DAC_DEFAULT;
   s.io_last_good_hw_code = AD5693R_DAC_DEFAULT;
@@ -230,46 +207,12 @@ servo_mode_t servo_mode_parse(const char* s) {
   return servo_mode_t::OFF;
 }
 
-void ocxo_dac_dither_reset(ocxo_dac_state_t& s) {
-  s.dither_rate_hz = 1000U;
-  s.dither_period_ns = 1000000U;
-  s.dither_effective_window_ticks = 1000U;
-  s.dither_accumulator_q16 = 0;
-  s.dither_fraction_q16 = s.dac_desired_q16 & 0xFFFFUL;
-  s.dither_low_code = (uint16_t)(s.dac_desired_q16 >> OCXO_DAC_Q16_SHIFT);
-  s.dither_high_code = (s.dither_low_code >= 65535U || s.dither_fraction_q16 == 0)
-      ? s.dither_low_code
-      : (uint16_t)(s.dither_low_code + 1U);
-  s.dither_last_selected_hw_code = s.dac_hw_code;
-  s.dither_window_tick_count = 0;
-  s.dither_window_low_count = 0;
-  s.dither_window_high_count = 0;
-  s.syncdac_frame_tick = 0;
-  s.syncdac_cell_index = 0;
-  s.syncdac_cell_tick = 0;
-  s.syncdac_high_ms_per_second = 0;
-  s.syncdac_low_ms_per_second = 1000U;
-  s.syncdac_high_ms_this_cell = 0;
-  s.syncdac_low_ms_this_cell = 100U;
-  s.syncdac_write_attempts_this_frame = 0;
-  s.syncdac_write_successes_this_frame = 0;
-  s.syncdac_write_failures_this_frame = 0;
-  s.syncdac_write_suppressed_this_frame = 0;
-}
-
 bool ocxo_dac_set_desired(ocxo_dac_state_t& s, double value) {
-  const uint32_t old_q16 = s.dac_desired_q16;
-  const uint16_t old_low = (uint16_t)(old_q16 >> OCXO_DAC_Q16_SHIFT);
+  const double target = ocxo_dac_clamp_real_value(value);
+  const uint16_t hw_code = ocxo_dac_rounded_hw_code_from_value(target);
 
-  const uint32_t q16 = ocxo_dac_value_to_q16(value);
-  s.dac_desired_q16 = q16;
-  s.dac_fractional = ocxo_dac_q16_to_value(q16);
-
-  const uint16_t new_low = (uint16_t)(q16 >> OCXO_DAC_Q16_SHIFT);
-  if (new_low != old_low) {
-    s.dither_accumulator_q16 = 0;
-  }
-  return true;
+  s.dac_fractional = target;
+  return ocxo_dac_write_hw_code(s, hw_code, true);
 }
 
 bool ocxo_dac_set(ocxo_dac_state_t& s, double value) {
@@ -3876,9 +3819,6 @@ void process_clocks_init(void) {
 
   (void)ocxo_dac_set(ocxo1_dac, (double)AD5693R_DAC_DEFAULT);
   (void)ocxo_dac_set(ocxo2_dac, (double)AD5693R_DAC_DEFAULT);
-  ocxo_dac_dither_reset(ocxo1_dac);
-  ocxo_dac_dither_reset(ocxo2_dac);
-
   pinMode(GNSS_LOCK_PIN, INPUT);
 
   subscribe_clock(interrupt_subscriber_kind_t::VCLOCK, vclock_callback);
@@ -3886,6 +3826,5 @@ void process_clocks_init(void) {
   subscribe_clock(interrupt_subscriber_kind_t::OCXO2, ocxo2_callback);
 
   interrupt_pps_edge_register_dispatch(pps_selector_callback);
-  clocks_dac_dither_begin();
   (void)clocks_alpha_begin_smartzero_epoch("startup");
 }

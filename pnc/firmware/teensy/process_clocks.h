@@ -27,8 +27,8 @@
 //     Must be called before full process init so DWT timing is available.
 //
 //   Phase 2: process_clocks_init()
-//     Configures OCXO DACs (both), PPS ISR, relay pins, and arms
-//     the OCXO dither timer.  Must be called AFTER timepop_init().
+//     Configures OCXO DACs (both), PPS ISR, relay pins, and CLOCKS
+//     state.  Must be called AFTER timepop_init().
 //
 // DWT-to-GNSS Calibration:
 //
