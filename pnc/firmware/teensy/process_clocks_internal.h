@@ -691,16 +691,45 @@ static constexpr uint16_t SERVO_MIN_DAC_CODE_DELTA_LSB  = 1;
 //   positive ppb/tau>1 -> OCXO running fast  -> lower DAC code
 //   negative ppb/tau<1 -> OCXO running slow  -> raise DAC code
 // The DAC transfer is monotonic positive: higher DAC voltage makes the OCXO faster.
+//
+// DAC voltage doctrine:
+//   The AD5693R OCXO DACs are configured for internal 2.5 V reference with
+//   2× gain, giving an approximate 0..5 V hardware span.  OCXO EFC authority
+//   is intentionally hard-limited below 3.3 V at the DAC-code boundary.  This
+//   ceiling is a drop-dead hardware-protection invariant, not merely a UI hint.
+
+static constexpr double OCXO_DAC_INTERNAL_REF_VOLTAGE = 2.5;
+static constexpr double OCXO_DAC_OUTPUT_GAIN = 2.0;
+static constexpr double OCXO_DAC_OUTPUT_FULL_SCALE_VOLTAGE =
+    OCXO_DAC_INTERNAL_REF_VOLTAGE * OCXO_DAC_OUTPUT_GAIN;
+static constexpr double OCXO_DAC_SAFE_MAX_OUTPUT_VOLTAGE = 3.3;
+static constexpr uint16_t OCXO_DAC_SAFE_MAX_HW_CODE =
+    (uint16_t)((OCXO_DAC_SAFE_MAX_OUTPUT_VOLTAGE /
+                OCXO_DAC_OUTPUT_FULL_SCALE_VOLTAGE) *
+                   65535.0 + 0.5);
+
+static_assert(OCXO_DAC_OUTPUT_FULL_SCALE_VOLTAGE >
+              OCXO_DAC_SAFE_MAX_OUTPUT_VOLTAGE,
+              "OCXO DAC safety ceiling must be below full scale");
+static_assert(OCXO_DAC_SAFE_MAX_HW_CODE < 65535,
+              "OCXO DAC safety ceiling must clamp the 0..5 V span");
 
 static inline double ocxo_dac_clamp_real_value(double value) {
   if (value < 0.0) return 0.0;
-  if (value > 65535.0) return 65535.0;
+  if (value > (double)OCXO_DAC_SAFE_MAX_HW_CODE) {
+    return (double)OCXO_DAC_SAFE_MAX_HW_CODE;
+  }
   return value;
 }
 
 static inline uint16_t ocxo_dac_rounded_hw_code_from_value(double value) {
   const double clamped = ocxo_dac_clamp_real_value(value);
   return (uint16_t)(clamped + 0.5);
+}
+
+static inline double ocxo_dac_voltage_from_code(double code) {
+  return (ocxo_dac_clamp_real_value(code) / 65535.0) *
+         OCXO_DAC_OUTPUT_FULL_SCALE_VOLTAGE;
 }
 
 bool ocxo_dac_set(ocxo_dac_state_t& s, double value);

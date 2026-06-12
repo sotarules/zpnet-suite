@@ -171,7 +171,9 @@ static volatile uint32_t g_vclock_event_count = 0;
 
 // The DAC target remains a real-valued control/persistence surface, but the
 // AD5693R receives only the nearest static integer code.  There is no
-// fractional-code realization layer in this build.
+// fractional-code realization layer in this build.  The DACs are configured
+// for AD5693R internal 2.5 V reference with 2× gain; external VREF is not used.
+// A hard 3.3 V equivalent ceiling is enforced at the DAC-code boundary.
 //
 // Diagnostic kill switch: when false, CLOCKS may still retain DAC intent in
 // memory/reporting, but it must not initialize, write, update, latch, or
@@ -185,8 +187,8 @@ static ocxo_dac_state_t make_default_ocxo_dac_state() {
   ocxo_dac_state_t s = {};
   s.dac_fractional = (double)AD5693R_DAC_DEFAULT;
   s.dac_hw_code = AD5693R_DAC_DEFAULT;
-  s.dac_min = 0;
-  s.dac_max = 65535;
+  s.dac_min = AD5693R_DAC_MIN;
+  s.dac_max = OCXO_DAC_SAFE_MAX_HW_CODE;
   s.io_last_write_ok = true;
   s.io_last_attempted_hw_code = AD5693R_DAC_DEFAULT;
   s.io_last_good_hw_code = AD5693R_DAC_DEFAULT;
@@ -251,7 +253,13 @@ void ocxo_dac_retry_reset(ocxo_dac_state_t& s) {
 bool ocxo_dac_write_hw_code(ocxo_dac_state_t& s,
                             uint16_t hw_code,
                             bool latch_fault) {
+  // Drop-dead EFC protection: regardless of caller state, servo math, config,
+  // or a corrupt dac_max field, never author a hardware code above the
+  // 3.3 V equivalent ceiling for the internal-VREF/2× DAC span.
   if ((uint32_t)hw_code < s.dac_min) hw_code = (uint16_t)s.dac_min;
+  if ((uint32_t)hw_code > (uint32_t)OCXO_DAC_SAFE_MAX_HW_CODE) {
+    hw_code = OCXO_DAC_SAFE_MAX_HW_CODE;
+  }
   if ((uint32_t)hw_code > s.dac_max) hw_code = (uint16_t)s.dac_max;
   s.io_last_attempted_hw_code = hw_code;
 

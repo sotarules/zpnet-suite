@@ -12,14 +12,17 @@
 //   0x4E (A0 = HIGH)   → OCXO1 CTL
 //   0x4C (A0 = LOW)    → OCXO2 CTL
 //
-// This driver is currently configured for EXTERNAL VREF bring-up.
+// This driver is configured for INTERNAL VREF operation. The external VREF
+// pin is deliberately not used for OCXO control because the shared external
+// reference topology produced common-mode EFC modulation in hardware tests.
+//
 // The intended control word is:
 //
 //   PD1:PD0 = 00   normal mode
-//   REF     = 1    internal reference disabled
-//   GAIN    = 0    1× gain, output span = 0..VREF
+//   REF     = 0    internal reference enabled
+//   GAIN    = 1    2× gain, output span ≈ 0..5 V
 //
-//   Control word = 0x1000
+//   Control word = 0x0800
 //
 // I2C write protocol (3 bytes after address):
 //
@@ -50,15 +53,20 @@ static constexpr uint16_t AD5693R_DAC_MAX = 65535;
 // Default DAC value at init
 static constexpr uint16_t AD5693R_DAC_DEFAULT = 32768;
 
-// Control word: normal mode, external VREF, 1× gain
+// Control words.  The active production configuration is internal VREF with
+// 2× output gain, yielding an approximate 0..5 V full-scale span from the
+// AD5693R's internal 2.5 V reference.  The external-VREF word is retained only
+// as an explicit diagnostic escape hatch for bench tests.
+static constexpr uint16_t AD5693R_CTRL_INTERNAL_VREF_2X = 0x0800;
 static constexpr uint16_t AD5693R_CTRL_EXTERNAL_VREF_1X = 0x1000;
+static constexpr uint16_t AD5693R_CTRL_ACTIVE = AD5693R_CTRL_INTERNAL_VREF_2X;
 
 // ============================================================================
 // Lifecycle
 // ============================================================================
 
-// Initialize both DACs: configure control registers for external VREF,
-// 1× gain, normal mode, then write the default value and force an
+// Initialize both DACs: configure control registers for internal VREF,
+// 2× gain, normal mode, then write the default value and force an
 // explicit DAC update.
 //
 // Wire.begin() must have been called before this.

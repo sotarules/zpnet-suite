@@ -12,7 +12,8 @@
 // Uses Wire (Bus 1, pins 18/19) — shared with INA260s, BME280,
 // and EV5491 laser controller.
 //
-// This configuration targets EXTERNAL VREF operation.
+// This configuration targets INTERNAL VREF, 2× gain operation.
+// External VREF is no longer used by the OCXO DAC control path.
 //
 // AD5693R control register bits:
 //   D15 = RESET
@@ -80,7 +81,7 @@ bool ad5693r_read_input_register(uint8_t addr, uint16_t& out_value) {
 }
 
 static bool ad5693r_configure(uint8_t addr) {
-  return ad5693r_write_ctrl(addr, AD5693R_CTRL_EXTERNAL_VREF_1X);
+  return ad5693r_write_ctrl(addr, AD5693R_CTRL_ACTIVE);
 }
 
 static bool ad5693r_prime_default(uint8_t addr) {

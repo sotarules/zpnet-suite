@@ -1519,16 +1519,34 @@ static void payload_add_servo_input_diag(Payload& lane,
 // AD5693R integer code and written as a single static value.  There is no
 // fractional-code modulation engine, no recurring TimePop callback, and no
 // adjacent-code streaming path.
+//
+// The AD5693R is now configured for internal 2.5 V reference with 2× gain.
+// External VREF is not part of the OCXO DAC authority path.  Because that
+// yields an approximate 0..5 V span, CLOCKS hard-clamps all DAC intent to the
+// 3.3 V equivalent code before any hardware write can occur.
 
 static constexpr const char* OCXO_DAC_REALIZATION_MODE = "STATIC_ROUNDED";
+static constexpr const char* OCXO_DAC_REFERENCE_MODE = "INTERNAL_VREF_2X";
 
 static void payload_add_dac_realization_object(Payload& parent,
                                                const char* key,
                                                const ocxo_dac_state_t& s) {
   Payload r;
   r.add("mode", OCXO_DAC_REALIZATION_MODE);
+  r.add("reference_mode", OCXO_DAC_REFERENCE_MODE);
+  r.add("external_vref_used", false);
+  r.add("internal_ref_voltage", OCXO_DAC_INTERNAL_REF_VOLTAGE, 6);
+  r.add("output_gain", OCXO_DAC_OUTPUT_GAIN, 3);
+  r.add("output_full_scale_voltage", OCXO_DAC_OUTPUT_FULL_SCALE_VOLTAGE, 6);
+  r.add("safe_max_output_voltage", OCXO_DAC_SAFE_MAX_OUTPUT_VOLTAGE, 6);
+  r.add("safe_max_hw_code", (uint32_t)OCXO_DAC_SAFE_MAX_HW_CODE);
   r.add("fractional_target", s.dac_fractional, 6);
+  r.add("fractional_target_voltage",
+        ocxo_dac_voltage_from_code(s.dac_fractional), 6);
   r.add("rounded_hw_code", (uint32_t)s.dac_hw_code);
+  r.add("rounded_hw_voltage",
+        ocxo_dac_voltage_from_code((double)s.dac_hw_code), 6);
+  r.add("safe_ceiling_active", true);
   r.add("static_rounded_only", true);
   r.add("fractional_stream_possible", false);
   r.add("recurring_timer_possible", false);
@@ -2020,7 +2038,15 @@ static void payload_add_servo_dac_values(Payload& parent) {
   dac.add("ocxo2_dac", ocxo2_dac.dac_fractional);
   dac.add("ocxo1_hw_code", (uint32_t)ocxo1_dac.dac_hw_code);
   dac.add("ocxo2_hw_code", (uint32_t)ocxo2_dac.dac_hw_code);
+  dac.add("ocxo1_voltage",
+          ocxo_dac_voltage_from_code((double)ocxo1_dac.dac_hw_code), 6);
+  dac.add("ocxo2_voltage",
+          ocxo_dac_voltage_from_code((double)ocxo2_dac.dac_hw_code), 6);
   dac.add("realization_mode", OCXO_DAC_REALIZATION_MODE);
+  dac.add("reference_mode", OCXO_DAC_REFERENCE_MODE);
+  dac.add("external_vref_used", false);
+  dac.add("safe_max_output_voltage", OCXO_DAC_SAFE_MAX_OUTPUT_VOLTAGE, 6);
+  dac.add("safe_max_hw_code", (uint32_t)OCXO_DAC_SAFE_MAX_HW_CODE);
   dac.add("static_rounded_only", true);
   dac.add("fractional_stream_possible", false);
   dac.add("recurring_timer_possible", false);
@@ -2597,6 +2623,15 @@ static Payload cmd_start(const Payload& args) {
   p.add("epoch_reason", clocks_alpha_epoch_last_reason());
   p.add("ocxo1_dac", ocxo1_dac.dac_fractional);
   p.add("ocxo2_dac", ocxo2_dac.dac_fractional);
+  p.add("ocxo1_dac_hw_code", (uint32_t)ocxo1_dac.dac_hw_code);
+  p.add("ocxo2_dac_hw_code", (uint32_t)ocxo2_dac.dac_hw_code);
+  p.add("ocxo1_dac_voltage",
+        ocxo_dac_voltage_from_code((double)ocxo1_dac.dac_hw_code), 6);
+  p.add("ocxo2_dac_voltage",
+        ocxo_dac_voltage_from_code((double)ocxo2_dac.dac_hw_code), 6);
+  p.add("dac_reference_mode", OCXO_DAC_REFERENCE_MODE);
+  p.add("dac_safe_max_output_voltage", OCXO_DAC_SAFE_MAX_OUTPUT_VOLTAGE, 6);
+  p.add("dac_safe_max_hw_code", (uint32_t)OCXO_DAC_SAFE_MAX_HW_CODE);
   p.add("ocxo1_dac_last_write_ok", ocxo1_dac.io_last_write_ok);
   p.add("ocxo2_dac_last_write_ok", ocxo2_dac.io_last_write_ok);
   p.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
@@ -3242,6 +3277,10 @@ static void add_dac_payload(Payload& p) {
   Payload o1;
   o1.add("dac", ocxo1_dac.dac_fractional);
   o1.add("dac_hw_code", (uint32_t)ocxo1_dac.dac_hw_code);
+  o1.add("dac_voltage",
+         ocxo_dac_voltage_from_code((double)ocxo1_dac.dac_hw_code), 6);
+  o1.add("dac_fractional_voltage",
+         ocxo_dac_voltage_from_code(ocxo1_dac.dac_fractional), 6);
   o1.add("dac_min", ocxo1_dac.dac_min);
   o1.add("dac_max", ocxo1_dac.dac_max);
   o1.add("servo_last_step", ocxo1_dac.servo_last_step, 6);
@@ -3279,6 +3318,10 @@ static void add_dac_payload(Payload& p) {
   Payload o2;
   o2.add("dac", ocxo2_dac.dac_fractional);
   o2.add("dac_hw_code", (uint32_t)ocxo2_dac.dac_hw_code);
+  o2.add("dac_voltage",
+         ocxo_dac_voltage_from_code((double)ocxo2_dac.dac_hw_code), 6);
+  o2.add("dac_fractional_voltage",
+         ocxo_dac_voltage_from_code(ocxo2_dac.dac_fractional), 6);
   o2.add("dac_min", ocxo2_dac.dac_min);
   o2.add("dac_max", ocxo2_dac.dac_max);
   o2.add("servo_last_step", ocxo2_dac.servo_last_step, 6);
@@ -3316,6 +3359,13 @@ static void add_dac_payload(Payload& p) {
   p.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
   p.add("ad5693r_init_ok", g_ad5693r_init_ok);
   p.add("realization_mode", OCXO_DAC_REALIZATION_MODE);
+  p.add("reference_mode", OCXO_DAC_REFERENCE_MODE);
+  p.add("external_vref_used", false);
+  p.add("internal_ref_voltage", OCXO_DAC_INTERNAL_REF_VOLTAGE, 6);
+  p.add("output_gain", OCXO_DAC_OUTPUT_GAIN, 3);
+  p.add("output_full_scale_voltage", OCXO_DAC_OUTPUT_FULL_SCALE_VOLTAGE, 6);
+  p.add("safe_max_output_voltage", OCXO_DAC_SAFE_MAX_OUTPUT_VOLTAGE, 6);
+  p.add("safe_max_hw_code", (uint32_t)OCXO_DAC_SAFE_MAX_HW_CODE);
   p.add("static_rounded_only", true);
   p.add("fractional_stream_possible", false);
   p.add("recurring_timer_possible", false);
@@ -4042,7 +4092,18 @@ static Payload cmd_set_dac(const Payload& args) {
   p.add("ocxo2_dac_last_write_ok", ocxo2_dac.io_last_write_ok);
   p.add("ocxo1_dac_hw_code", (uint32_t)ocxo1_dac.dac_hw_code);
   p.add("ocxo2_dac_hw_code", (uint32_t)ocxo2_dac.dac_hw_code);
+  p.add("ocxo1_dac_voltage",
+        ocxo_dac_voltage_from_code((double)ocxo1_dac.dac_hw_code), 6);
+  p.add("ocxo2_dac_voltage",
+        ocxo_dac_voltage_from_code((double)ocxo2_dac.dac_hw_code), 6);
   p.add("realization_mode", OCXO_DAC_REALIZATION_MODE);
+  p.add("reference_mode", OCXO_DAC_REFERENCE_MODE);
+  p.add("external_vref_used", false);
+  p.add("internal_ref_voltage", OCXO_DAC_INTERNAL_REF_VOLTAGE, 6);
+  p.add("output_gain", OCXO_DAC_OUTPUT_GAIN, 3);
+  p.add("output_full_scale_voltage", OCXO_DAC_OUTPUT_FULL_SCALE_VOLTAGE, 6);
+  p.add("safe_max_output_voltage", OCXO_DAC_SAFE_MAX_OUTPUT_VOLTAGE, 6);
+  p.add("safe_max_hw_code", (uint32_t)OCXO_DAC_SAFE_MAX_HW_CODE);
   p.add("static_rounded_only", true);
   p.add("fractional_stream_possible", false);
   p.add("recurring_timer_possible", false);
