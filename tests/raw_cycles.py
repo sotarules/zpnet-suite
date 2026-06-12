@@ -1,5 +1,5 @@
 """
-ZPNet Raw Cycles — residual-separated prediction + adjacency audit.
+ZPNet Raw Cycles — EMA vs PPS-Yardstick side-by-side cycle audit.
 
 Reads TIMEBASE rows for a campaign and prints a compact one-second DWT-cycle
 audit. The report stays deliberately one-line-per-second.
@@ -23,21 +23,27 @@ Column doctrine:
     p_act  is the physical PPS actual interval.
     p_Δ    is physical PPS actual[n] - physical PPS actual[n-1].
 
-    *_raw   is the raw/evidence interval from TIMEBASE_FORENSICS
-            dwt_interval_gate.observed_cycles when available.
-    *_rawΔ  is the old-style raw first-difference residual:
-            raw[n] - raw[n-1].
-    *_gPred is the EMA/gate prediction interval from process_interrupt.
-    *_gateR is the EMA/gate residual: raw - gPred.
-    *_pub   is the subscriber-facing published/smoothed interval from the
-            firmware static prediction surface, falling back to gate effective.
-    *_pubΔ  is the old-style published first-difference residual:
-            pub[n] - pub[n-1].
+    *_raw      is the raw/evidence interval from TIMEBASE_FORENSICS
+               dwt_interval_gate.observed_cycles when available.
+    *_rawΔ     is the raw first-difference residual: raw[n] - raw[n-1].
+    *_ema      is the subscriber-facing published interval.  Today this is
+               EMA-authored (formerly printed as *_pub); the rename tells
+               the truth about its provenance.
+    *_emaΔ     is ema[n] - ema[n-1].
 
-    *_adj is OCXO counter-adjacency result: OK / REJ / BAD / ---.
-    *_aΔ  is adjacency counter_delta_ticks - expected_counter_delta_ticks.
-    *_aN  is cumulative adjacency reject_count.
-    *_svc is compact OCXO compare-service offset in 10 MHz ticks.
+    *_inferred is the PPS-Yardstick inferred interval (heir apparent to the
+               EMA): prior chain interval scaled by the physical PPS-to-PPS
+               yardstick ratio, carried in Q16, validated by raw.
+    *_imo      is inferred - observed for this second: the yardstick
+               scorecard.  Sub-lattice |imo| means the inference is tracking
+               truth tighter than the 4-cycle QTimer quantization floor.
+    *_walk     is the free-running yardstick chain endpoint minus the
+               observed endpoint: cumulative chain-walk audit.
+    *_y        is the yardstick row tag: OK, EXC (gate excursion), STAL
+               (stale PPS yardstick, interval held), SEED (chain reseeded
+               this row), or --- (rail not valid on this row).
+
+    *_cΔ       is counter32 delta since the previous event (lineage proof).
 """
 
 from __future__ import annotations
@@ -572,6 +578,81 @@ def adjacency_tag(adj: Dict[str, Any]) -> str:
     return "BAD"
 
 
+def yardstick_diag(root: Dict[str, Any],
+                   frag: Dict[str, Any],
+                   forensic: Dict[str, Any],
+                   lane: str) -> Dict[str, Any]:
+    """Extract the PPS-Yardstick inference object for one OCXO lane.
+
+    Source of truth is TIMEBASE_FORENSICS lane forensics dwt_yardstick.
+    Flat-key fallbacks follow the house extraction convention so older or
+    transitional rows still render with --- rather than crashing.
+    """
+    f = lane_forensics_obj(root, frag, forensic, lane)
+    y = f.get("dwt_yardstick") if isinstance(f.get("dwt_yardstick"), dict) else {}
+    prefix = f"{lane}_forensics_dwt_yardstick_"
+
+    return {
+        "valid": _first_bool(y.get("valid"), f.get("dwt_yardstick_valid"),
+                             frag.get(prefix + "valid"),
+                             root.get(prefix + "valid")),
+        "stale": _first_bool(y.get("stale"), f.get("dwt_yardstick_stale"),
+                             frag.get(prefix + "stale"),
+                             root.get(prefix + "stale")),
+        "seeded": _first_bool(y.get("seeded"), f.get("dwt_yardstick_seeded"),
+                              frag.get(prefix + "seeded"),
+                              root.get(prefix + "seeded")),
+        "excursion": _first_bool(y.get("excursion"), f.get("dwt_yardstick_excursion"),
+                                 frag.get(prefix + "excursion"),
+                                 root.get(prefix + "excursion")),
+        "pps_sequence": _first_int(y.get("pps_sequence"),
+                                   f.get("dwt_yardstick_pps_sequence")),
+        "pps_seq_delta": _first_int(y.get("pps_seq_delta"),
+                                    f.get("dwt_yardstick_pps_seq_delta")),
+        "g_now": _first_int(y.get("g_now_cycles"),
+                            f.get("dwt_yardstick_g_now_cycles")),
+        "g_prev": _first_int(y.get("g_prev_cycles"),
+                             f.get("dwt_yardstick_g_prev_cycles")),
+        "inferred": _first_int(y.get("inferred_interval_cycles"),
+                               f.get("dwt_yardstick_inferred_interval_cycles"),
+                               frag.get(prefix + "inferred_interval_cycles"),
+                               root.get(prefix + "inferred_interval_cycles")),
+        "observed": _first_int(y.get("observed_interval_cycles"),
+                               f.get("dwt_yardstick_observed_interval_cycles")),
+        "imo": _first_int(y.get("inferred_minus_observed_cycles"),
+                          f.get("dwt_yardstick_inferred_minus_observed_cycles"),
+                          frag.get(prefix + "inferred_minus_observed_cycles"),
+                          root.get(prefix + "inferred_minus_observed_cycles")),
+        "endpoint_dwt": _first_int(y.get("inferred_endpoint_dwt"),
+                                   f.get("dwt_yardstick_inferred_endpoint_dwt")),
+        "endpoint_frac_q16": _first_int(y.get("inferred_endpoint_frac_q16"),
+                                        f.get("dwt_yardstick_inferred_endpoint_frac_q16")),
+        "walk": _first_int(y.get("endpoint_minus_observed_cycles"),
+                           f.get("dwt_yardstick_endpoint_minus_observed_cycles"),
+                           frag.get(prefix + "endpoint_minus_observed_cycles"),
+                           root.get(prefix + "endpoint_minus_observed_cycles")),
+        "threshold": _first_int(y.get("gate_threshold_cycles"),
+                                f.get("dwt_yardstick_gate_threshold_cycles")),
+        "agree_count": _first_int(y.get("gate_agree_count"),
+                                  f.get("dwt_yardstick_gate_agree_count")),
+        "excursion_count": _first_int(y.get("gate_excursion_count"),
+                                      f.get("dwt_yardstick_gate_excursion_count")),
+    }
+
+
+def yardstick_tag(y: Dict[str, Any]) -> str:
+    if not y.get("valid"):
+        return "---"
+    if y.get("seeded"):
+        return "SEED"
+    if y.get("excursion"):
+        return "EXC"
+    if y.get("stale"):
+        return "STAL"
+    return "OK"
+
+
+
 def service_diag(root: Dict[str, Any],
                  frag: Dict[str, Any],
                  forensic: Dict[str, Any],
@@ -663,17 +744,18 @@ def _lane_cycle_surfaces(gate: Dict[str, Any],
                          pub_actual: Optional[int],
                          pub_pred: Optional[int],
                          pub_res: Optional[int]) -> Dict[str, Any]:
-    """Return the raw, gate, and published interval surfaces for one lane.
+    """Return the raw and EMA-published interval surfaces for one lane.
 
-    The key doctrine is that these are three different questions:
+    The key doctrine is that these are two different questions:
 
-      rawΔ  : did the raw evidence interval change from the prior raw interval?
-      gateR : did raw evidence disagree with the EMA/gate prediction?
-      pubΔ  : did the published interval change from the prior published interval?
+      rawΔ : did the raw evidence interval change from the prior raw interval?
+      emaΔ : did the EMA-published interval change from the prior one?
 
-    Older rows may not expose dwt_interval_gate. In that case raw falls back to
-    the published/static surface so legacy reports still render, while gateR is
-    left blank unless a real gate prediction exists.
+    (The yardstick surface is extracted separately by yardstick_diag; its
+    scorecard *_imo is firmware-computed, not derived here.)
+
+    Older rows may not expose dwt_interval_gate. In that case raw falls back
+    to the published/static surface so legacy reports still render.
     """
     gate_valid = bool(gate.get("valid"))
 
@@ -681,22 +763,19 @@ def _lane_cycle_surfaces(gate: Dict[str, Any],
     if raw is None:
         raw = pub_actual
 
-    gate_pred = gate.get("prediction_cycles") if gate_valid else None
-    gate_res = gate.get("residual_cycles") if gate_valid else None
-    if gate_res is None and raw is not None and gate_pred is not None:
-        gate_res = raw - gate_pred
-
-    published = pub_actual
-    if published is None and gate_valid:
-        published = gate.get("effective_cycles")
-    if published is None and pub_pred is not None and pub_res is not None:
-        published = pub_pred + pub_res
+    # Stage 2 authority note: the firmware static prediction surface
+    # (pub_actual) now carries the yardstick-published interval, so the EMA
+    # column must source from the EMA rail itself: dwt_interval_gate
+    # effective_cycles remains EMA-authored in every firmware version.
+    ema = gate.get("effective_cycles") if gate_valid else None
+    if ema is None:
+        ema = pub_actual
+    if ema is None and pub_pred is not None and pub_res is not None:
+        ema = pub_pred + pub_res
 
     return {
         "raw": raw,
-        "gate_pred": gate_pred,
-        "gate_res": gate_res,
-        "published": published,
+        "ema": ema,
         "gate_valid": gate_valid,
         "gate_accepted": gate.get("accepted"),
         "gate_rejected": gate.get("rejected"),
@@ -705,7 +784,6 @@ def _lane_cycle_surfaces(gate: Dict[str, Any],
         "synthetic": gate.get("synthetic"),
         "synthetic_error": gate.get("synthetic_error"),
     }
-
 
 def _headers_for(clock_filter: Optional[str]) -> Tuple[str, str]:
     parts = [
@@ -719,10 +797,8 @@ def _headers_for(clock_filter: Optional[str]) -> Tuple[str, str]:
         parts.extend([
             f"{'v_raw':>13s}",
             f"{'v_rawΔ':>8s}",
-            f"{'v_gPred':>13s}",
-            f"{'v_gateR':>8s}",
-            f"{'v_pub':>13s}",
-            f"{'v_pubΔ':>8s}",
+            f"{'v_ema':>13s}",
+            f"{'v_emaΔ':>8s}",
             f"{'phase':>5s}",
             f"{'v_cΔ':>11s}",
         ])
@@ -734,14 +810,12 @@ def _headers_for(clock_filter: Optional[str]) -> Tuple[str, str]:
         parts.extend([
             f"{prefix + '_raw':>13s}",
             f"{prefix + '_rawΔ':>8s}",
-            f"{prefix + '_gPred':>13s}",
-            f"{prefix + '_gateR':>8s}",
-            f"{prefix + '_pub':>13s}",
-            f"{prefix + '_pubΔ':>8s}",
-            f"{prefix + '_adj':>5s}",
-            f"{prefix + '_aΔ':>9s}",
-            f"{prefix + '_aN':>6s}",
-            f"{prefix + '_svc':>7s}",
+            f"{prefix + '_ema':>13s}",
+            f"{prefix + '_emaΔ':>8s}",
+            f"{prefix + '_inferred':>13s}",
+            f"{prefix + '_imo':>7s}",
+            f"{prefix + '_walk':>8s}",
+            f"{prefix + '_y':>5s}",
             f"{prefix + '_cΔ':>11s}",
         ])
 
@@ -749,7 +823,6 @@ def _headers_for(clock_filter: Optional[str]) -> Tuple[str, str]:
     header = "  ".join(parts)
     sep = "  ".join("─" * len(p) for p in parts)
     return header, sep
-
 
 def _row_line(row: Dict[str, Any], clock_filter: Optional[str]) -> str:
     parts = [
@@ -763,10 +836,8 @@ def _row_line(row: Dict[str, Any], clock_filter: Optional[str]) -> str:
         parts.extend([
             _fmt_int(row["v_raw"], 13),
             _fmt_int(row["v_raw_delta"], 8, signed=True),
-            _fmt_int(row["v_gate_pred"], 13),
-            _fmt_int(row["v_gate_res"], 8, signed=True),
-            _fmt_int(row["v_pub"], 13),
-            _fmt_int(row["v_pub_delta"], 8, signed=True),
+            _fmt_int(row["v_ema"], 13),
+            _fmt_int(row["v_ema_delta"], 8, signed=True),
             _fmt_int(row["phase"], 5),
             _fmt_int(row["v_cdelta"], 11),
         ])
@@ -779,20 +850,17 @@ def _row_line(row: Dict[str, Any], clock_filter: Optional[str]) -> str:
         parts.extend([
             _fmt_int(data["raw"], 13),
             _fmt_int(data["raw_delta"], 8, signed=True),
-            _fmt_int(data["gate_pred"], 13),
-            _fmt_int(data["gate_res"], 8, signed=True),
-            _fmt_int(data["pub"], 13),
-            _fmt_int(data["pub_delta"], 8, signed=True),
-            _fmt_str(data["adj_tag"], 5),
-            _fmt_int(data["adj_delta_error"], 9, signed=True),
-            _fmt_int(data["adj_reject_count"], 6),
-            _fmt_int(data["service_offset"], 7, signed=True),
+            _fmt_int(data["ema"], 13),
+            _fmt_int(data["ema_delta"], 8, signed=True),
+            _fmt_int(data["inferred"], 13),
+            _fmt_int(data["imo"], 7, signed=True),
+            _fmt_int(data["walk"], 8, signed=True),
+            _fmt_str(data["y_tag"], 5),
             _fmt_int(data["counter_delta"], 11),
         ])
 
     parts.append(_fmt_float(row["dwt_ppb"], 10, 3, signed=True))
     return "  ".join(parts)
-
 
 def collect_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]:
     out: List[Dict[str, Any]] = []
@@ -809,7 +877,7 @@ def collect_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]
         "ocxo1": None,
         "ocxo2": None,
     }
-    prev_pub_interval: Dict[str, Optional[int]] = {
+    prev_ema_interval: Dict[str, Optional[int]] = {
         "vclock": None,
         "ocxo1": None,
         "ocxo2": None,
@@ -817,13 +885,13 @@ def collect_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]
 
     def reset_deltas_after_gap() -> None:
         nonlocal prev_physical_pps_dwt, prev_vclock_dwt, prev_vclock_counter32
-        nonlocal prev_pps_interval, prev_raw_interval, prev_pub_interval
+        nonlocal prev_pps_interval, prev_raw_interval, prev_ema_interval
         prev_physical_pps_dwt = None
         prev_vclock_dwt = None
         prev_vclock_counter32 = None
         prev_pps_interval = None
         prev_raw_interval = {"vclock": None, "ocxo1": None, "ocxo2": None}
-        prev_pub_interval = {"vclock": None, "ocxo1": None, "ocxo2": None}
+        prev_ema_interval = {"vclock": None, "ocxo1": None, "ocxo2": None}
 
     for rec in rows:
         root = _root(rec)
@@ -864,7 +932,7 @@ def collect_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]
         v_gate = dwt_gate_diag(root, frag, forensic, "vclock")
         v_surface = _lane_cycle_surfaces(v_gate, v_pub_actual, v_pub_pred, _v_pub_res)
         v_raw_delta = _interval_delta(v_surface["raw"], prev_raw_interval["vclock"])
-        v_pub_delta = _interval_delta(v_surface["published"], prev_pub_interval["vclock"])
+        v_ema_delta = _interval_delta(v_surface["ema"], prev_ema_interval["vclock"])
 
         vclock_event_counter32 = vclock_counter32_at_event(root, frag, forensic)
         v_cdelta = lane_counter_delta(root, frag, forensic, "vclock")
@@ -878,21 +946,47 @@ def collect_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]
             gate = dwt_gate_diag(root, frag, forensic, lane_name)
             adj = adjacency_diag(root, frag, forensic, lane_name)
             svc = service_diag(root, frag, forensic, lane_name)
+            yard = yardstick_diag(root, frag, forensic, lane_name)
             cdelta = lane_counter_delta(root, frag, forensic, lane_name)
             if cdelta is None:
                 cdelta = svc.get("last_counter_delta")
 
             surface = _lane_cycle_surfaces(gate, pub_actual, pub_pred, pub_res)
             raw_delta = _interval_delta(surface["raw"], prev_raw_interval[lane_name])
-            pub_delta = _interval_delta(surface["published"], prev_pub_interval[lane_name])
+            ema_delta = _interval_delta(surface["ema"], prev_ema_interval[lane_name])
+
+            # Firmware-computed scorecards; fall back to local arithmetic only
+            # when the firmware surface is present but a field is missing.
+            imo = yard.get("imo")
+            if imo is None and yard.get("inferred") is not None and surface["raw"] is not None:
+                imo = yard["inferred"] - surface["raw"]
+
+            # Derived side-by-side error: EMA published interval minus raw
+            # evidence interval, the direct competitor of imo.
+            emo = (
+                surface["ema"] - surface["raw"]
+                if surface["ema"] is not None and surface["raw"] is not None
+                else None
+            )
 
             return {
                 "raw": surface["raw"],
                 "raw_delta": raw_delta,
-                "gate_pred": surface["gate_pred"],
-                "gate_res": surface["gate_res"],
-                "pub": surface["published"],
-                "pub_delta": pub_delta,
+                "ema": surface["ema"],
+                "ema_delta": ema_delta,
+                "emo": emo,
+                "inferred": yard.get("inferred"),
+                "imo": imo,
+                "walk": yard.get("walk"),
+                "y_tag": yardstick_tag(yard),
+                "y_valid": yard.get("valid"),
+                "y_stale": yard.get("stale"),
+                "y_seeded": yard.get("seeded"),
+                "y_excursion": yard.get("excursion"),
+                "y_agree_count": yard.get("agree_count"),
+                "y_excursion_count": yard.get("excursion_count"),
+                "y_threshold": yard.get("threshold"),
+                "y_pps_seq_delta": yard.get("pps_seq_delta"),
                 "gate_valid": surface["gate_valid"],
                 "gate_accepted": surface["gate_accepted"],
                 "gate_rejected": surface["gate_rejected"],
@@ -901,14 +995,8 @@ def collect_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]
                 "synthetic": surface["synthetic"],
                 "synthetic_error": surface["synthetic_error"],
                 "adj_valid": adj["valid"],
-                "adj_ok": adj["ok"],
                 "adj_rejected": adj["rejected"],
-                "adj_tag": adjacency_tag(adj),
-                "adj_counter_delta": adj["counter_delta"],
-                "adj_expected": adj["expected"],
-                "adj_delta_error": adj["delta_error"],
                 "adj_reject_count": adj["reject_count"],
-                "service_offset": svc["service_offset"],
                 "service_class": svc["service_class"],
                 "counter_delta": cdelta,
             }
@@ -924,10 +1012,8 @@ def collect_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]
             "phase": phase,
             "v_raw": v_surface["raw"],
             "v_raw_delta": v_raw_delta,
-            "v_gate_pred": v_surface["gate_pred"],
-            "v_gate_res": v_surface["gate_res"],
-            "v_pub": v_surface["published"],
-            "v_pub_delta": v_pub_delta,
+            "v_ema": v_surface["ema"],
+            "v_ema_delta": v_ema_delta,
             "v_gate_valid": v_surface["gate_valid"],
             "v_gate_accepted": v_surface["gate_accepted"],
             "v_gate_rejected": v_surface["gate_rejected"],
@@ -950,19 +1036,37 @@ def collect_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]
 
         if v_surface["raw"] is not None:
             prev_raw_interval["vclock"] = v_surface["raw"]
-        if v_surface["published"] is not None:
-            prev_pub_interval["vclock"] = v_surface["published"]
+        if v_surface["ema"] is not None:
+            prev_ema_interval["vclock"] = v_surface["ema"]
         for lane_name, data in (("ocxo1", o1), ("ocxo2", o2)):
             if data["raw"] is not None:
                 prev_raw_interval[lane_name] = data["raw"]
-            if data["pub"] is not None:
-                prev_pub_interval[lane_name] = data["pub"]
+            if data["ema"] is not None:
+                prev_ema_interval[lane_name] = data["ema"]
 
     return out, gaps
 
-
 def _residual_hit(*values: Optional[int]) -> bool:
     return any(v is not None and abs(v) >= EXCURSION_THRESHOLD_CYCLES for v in values)
+
+
+def _walk_slope_cycles_per_second(samples: List[Tuple[int, int]]) -> Optional[float]:
+    """Least-squares slope of chain walk vs pps_count, in cycles/second.
+
+    samples are (pps_count, walk_cycles) pairs from rows where the yardstick
+    rail was valid.  The slope is the campaign-scale chain-walk rate: the
+    decisive Stage 2/3 anchor-policy datum.
+    """
+    n = len(samples)
+    if n < 2:
+        return None
+    mean_x = sum(x for x, _ in samples) / n
+    mean_y = sum(y for _, y in samples) / n
+    sxx = sum((x - mean_x) ** 2 for x, _ in samples)
+    if sxx == 0:
+        return None
+    sxy = sum((x - mean_x) * (y - mean_y) for x, y in samples)
+    return sxy / sxx
 
 
 def analyze(campaign: str, limit: int = 0, clock_filter: Optional[str] = None) -> None:
@@ -979,17 +1083,16 @@ def analyze(campaign: str, limit: int = 0, clock_filter: Optional[str] = None) -
     clock_label = "ALL" if clock_filter is None else clock_filter
     print(f"Campaign: {campaign}  ({len(rows):,} rows, view={clock_label})")
     print()
-    print("Residual-separated raw cycle + adjacency audit")
-    print("═══════════════════════════════════════════════")
-    print("  *_rawΔ  = raw interval[n] - raw interval[n-1]  (old-style raw residual).")
-    print("  *_gateR = raw interval - EMA/gate prediction   (gate disagreement).")
-    print("  *_pubΔ  = published interval[n] - published interval[n-1].")
-    print("  *_raw is the raw/evidence interval; *_pub is subscriber-facing published/smoothed.")
-    print("  *_gPred is the EMA/gate prediction interval used for *_gateR.")
-    print("  *_adj is OCXO counter-adjacency: OK, REJ, BAD, or ---.")
-    print("  *_aΔ is counter_delta_ticks - expected_counter_delta_ticks; normal is 0.")
-    print("  *_aN is cumulative adjacency reject count.")
-    print("  *_svc is compact OCXO compare-service offset in 10 MHz ticks.")
+    print("EMA vs PPS-Yardstick side-by-side cycle audit")
+    print("═════════════════════════════════════════════")
+    print("  *_rawΔ     = raw interval[n] - raw interval[n-1].")
+    print("  *_ema      = subscriber-facing published interval (EMA-authored today).")
+    print("  *_emaΔ     = ema[n] - ema[n-1].")
+    print("  *_inferred = PPS-Yardstick inferred interval (heir apparent).")
+    print("  *_imo      = inferred - observed: the yardstick per-second scorecard.")
+    print("  *_walk     = free-running yardstick chain endpoint - observed endpoint.")
+    print("  *_y        = yardstick tag: OK / EXC / STAL / SEED / ---.")
+    print("  *_cΔ       = counter32 delta since previous event (lineage proof).")
     print()
 
     header, sep = _headers_for(clock_filter)
@@ -1010,49 +1113,48 @@ def analyze(campaign: str, limit: int = 0, clock_filter: Optional[str] = None) -
         "phase": Welford(),
         "vclock_raw_interval": Welford(),
         "vclock_raw_delta": Welford(),
-        "vclock_gate_residual": Welford(),
-        "vclock_published_interval": Welford(),
-        "vclock_published_delta": Welford(),
+        "vclock_ema_interval": Welford(),
+        "vclock_ema_delta": Welford(),
         "vclock_counter32_delta": Welford(),
-        "ocxo1_raw_interval": Welford(),
-        "ocxo1_raw_delta": Welford(),
-        "ocxo1_gate_residual": Welford(),
-        "ocxo1_published_interval": Welford(),
-        "ocxo1_published_delta": Welford(),
-        "ocxo1_adjacency_delta": Welford(),
-        "ocxo1_adjacency_reject_count": Welford(),
-        "ocxo1_counter32_delta": Welford(),
-        "ocxo1_service_offset": Welford(),
-        "ocxo2_raw_interval": Welford(),
-        "ocxo2_raw_delta": Welford(),
-        "ocxo2_gate_residual": Welford(),
-        "ocxo2_published_interval": Welford(),
-        "ocxo2_published_delta": Welford(),
-        "ocxo2_adjacency_delta": Welford(),
-        "ocxo2_adjacency_reject_count": Welford(),
-        "ocxo2_counter32_delta": Welford(),
-        "ocxo2_service_offset": Welford(),
     }
+    for lane_name in ("ocxo1", "ocxo2"):
+        stats[f"{lane_name}_raw_interval"] = Welford()
+        stats[f"{lane_name}_raw_delta"] = Welford()
+        stats[f"{lane_name}_ema_interval"] = Welford()
+        stats[f"{lane_name}_ema_delta"] = Welford()
+        stats[f"{lane_name}_inferred_interval"] = Welford()
+        stats[f"{lane_name}_imo"] = Welford()
+        stats[f"{lane_name}_emo"] = Welford()
+        stats[f"{lane_name}_abs_imo"] = Welford()
+        stats[f"{lane_name}_abs_emo"] = Welford()
+        stats[f"{lane_name}_walk"] = Welford()
+        stats[f"{lane_name}_counter32_delta"] = Welford()
 
     coverage = {
         "rows": 0,
         "vclock_gate": 0,
-        "vclock_counter32_delta": 0,
         "ocxo1_gate": 0,
         "ocxo2_gate": 0,
-        "ocxo1_adjacency": 0,
-        "ocxo2_adjacency": 0,
+        "ocxo1_yardstick": 0,
+        "ocxo2_yardstick": 0,
+        "ocxo1_yardstick_stale": 0,
+        "ocxo2_yardstick_stale": 0,
+        "ocxo1_yardstick_seeded": 0,
+        "ocxo2_yardstick_seeded": 0,
+        "ocxo1_yardstick_excursions": 0,
+        "ocxo2_yardstick_excursions": 0,
         "ocxo1_adjacency_rejected": 0,
         "ocxo2_adjacency_rejected": 0,
-        "ocxo1_counter32_delta": 0,
-        "ocxo2_counter32_delta": 0,
-        "ocxo1_service": 0,
-        "ocxo2_service": 0,
+    }
+    last_counts = {
+        "ocxo1": {"agree": None, "excursion": None, "threshold": None},
+        "ocxo2": {"agree": None, "excursion": None, "threshold": None},
     }
 
     service_class_counts = {"ocxo1": {}, "ocxo2": {}}
     excursions: List[Dict[str, Any]] = []
     vclock_excursions: List[Dict[str, Any]] = []
+    walk_samples = {"ocxo1": [], "ocxo2": []}
 
     for row in collected:
         coverage["rows"] += 1
@@ -1061,65 +1163,81 @@ def analyze(campaign: str, limit: int = 0, clock_filter: Optional[str] = None) -
         add_optional(stats["phase"], row["phase"])
         add_optional(stats["vclock_raw_interval"], row["v_raw"])
         add_optional(stats["vclock_raw_delta"], row["v_raw_delta"])
-        add_optional(stats["vclock_gate_residual"], row["v_gate_res"])
-        add_optional(stats["vclock_published_interval"], row["v_pub"])
-        add_optional(stats["vclock_published_delta"], row["v_pub_delta"])
+        add_optional(stats["vclock_ema_interval"], row["v_ema"])
+        add_optional(stats["vclock_ema_delta"], row["v_ema_delta"])
         add_optional(stats["vclock_counter32_delta"], row["v_cdelta"])
         if row["v_gate_valid"]:
             coverage["vclock_gate"] += 1
-        if row["v_cdelta"] is not None:
-            coverage["vclock_counter32_delta"] += 1
 
         for key, lane_name in (("o1", "ocxo1"), ("o2", "ocxo2")):
             d = row[key]
             add_optional(stats[f"{lane_name}_raw_interval"], d["raw"])
             add_optional(stats[f"{lane_name}_raw_delta"], d["raw_delta"])
-            add_optional(stats[f"{lane_name}_gate_residual"], d["gate_res"])
-            add_optional(stats[f"{lane_name}_published_interval"], d["pub"])
-            add_optional(stats[f"{lane_name}_published_delta"], d["pub_delta"])
-            add_optional(stats[f"{lane_name}_adjacency_delta"], d["adj_delta_error"])
-            add_optional(stats[f"{lane_name}_adjacency_reject_count"], d["adj_reject_count"])
+            add_optional(stats[f"{lane_name}_ema_interval"], d["ema"])
+            add_optional(stats[f"{lane_name}_ema_delta"], d["ema_delta"])
             add_optional(stats[f"{lane_name}_counter32_delta"], d["counter_delta"])
-            add_optional(stats[f"{lane_name}_service_offset"], d["service_offset"])
 
             if d["gate_valid"]:
                 coverage[f"{lane_name}_gate"] += 1
-            if d["adj_valid"]:
-                coverage[f"{lane_name}_adjacency"] += 1
             if d["adj_rejected"]:
                 coverage[f"{lane_name}_adjacency_rejected"] += 1
-            if d["counter_delta"] is not None:
-                coverage[f"{lane_name}_counter32_delta"] += 1
-            if d["service_offset"] is not None:
-                coverage[f"{lane_name}_service"] += 1
             cls = service_class_short(d["service_class"])
             service_class_counts[lane_name][cls] = service_class_counts[lane_name].get(cls, 0) + 1
 
-        if _residual_hit(row["v_raw_delta"], row["v_gate_res"], row["v_pub_delta"]):
+            if d["y_valid"]:
+                coverage[f"{lane_name}_yardstick"] += 1
+                add_optional(stats[f"{lane_name}_inferred_interval"], d["inferred"])
+                add_optional(stats[f"{lane_name}_walk"], d["walk"])
+                if d["walk"] is not None:
+                    walk_samples[lane_name].append((row["pps_count"], d["walk"]))
+                if d["y_stale"]:
+                    coverage[f"{lane_name}_yardstick_stale"] += 1
+                if d["y_seeded"]:
+                    coverage[f"{lane_name}_yardstick_seeded"] += 1
+                if d["y_excursion"]:
+                    coverage[f"{lane_name}_yardstick_excursions"] += 1
+                else:
+                    # Head-to-head scorecards on agree seconds only: excursion
+                    # seconds are observed-side corruption by definition, and
+                    # both rails are judged against the same clean evidence.
+                    if not d["y_seeded"]:
+                        add_optional(stats[f"{lane_name}_imo"], d["imo"])
+                        add_optional(stats[f"{lane_name}_emo"], d["emo"])
+                        if d["imo"] is not None:
+                            stats[f"{lane_name}_abs_imo"].update(abs(float(d["imo"])))
+                        if d["emo"] is not None:
+                            stats[f"{lane_name}_abs_emo"].update(abs(float(d["emo"])))
+                if d["y_agree_count"] is not None:
+                    last_counts[lane_name]["agree"] = d["y_agree_count"]
+                if d["y_excursion_count"] is not None:
+                    last_counts[lane_name]["excursion"] = d["y_excursion_count"]
+                if d["y_threshold"] is not None:
+                    last_counts[lane_name]["threshold"] = d["y_threshold"]
+
+        if _residual_hit(row["v_raw_delta"], row["v_ema_delta"]):
             vclock_excursions.append(row)
 
         for key in ("o1", "o2"):
             d = row[key]
-            if _residual_hit(d["raw_delta"], d["gate_res"], d["pub_delta"]):
+            if _residual_hit(d["raw_delta"], d["ema_delta"]) or d["y_excursion"]:
                 excursions.append({"row": row, "lane": key, "data": d})
 
     print("Schema coverage")
     print("═══════════════")
-    print(f"  rows                         = {coverage['rows']:,}")
-    print(f"  VCLOCK gate rows             = {coverage['vclock_gate']:,}")
-    print(f"  VCLOCK counter32 delta rows  = {coverage['vclock_counter32_delta']:,}")
-    print(f"  OCXO1 gate rows              = {coverage['ocxo1_gate']:,}")
-    print(f"  OCXO2 gate rows              = {coverage['ocxo2_gate']:,}")
-    print(f"  OCXO1 adjacency rows         = {coverage['ocxo1_adjacency']:,}")
-    print(f"  OCXO2 adjacency rows         = {coverage['ocxo2_adjacency']:,}")
-    print(f"  OCXO1 adjacency rejects      = {coverage['ocxo1_adjacency_rejected']:,}")
-    print(f"  OCXO2 adjacency rejects      = {coverage['ocxo2_adjacency_rejected']:,}")
-    print(f"  OCXO1 counter32 delta rows   = {coverage['ocxo1_counter32_delta']:,}")
-    print(f"  OCXO2 counter32 delta rows   = {coverage['ocxo2_counter32_delta']:,}")
-    print(f"  OCXO1 service rows           = {coverage['ocxo1_service']:,}")
-    print(f"  OCXO2 service rows           = {coverage['ocxo2_service']:,}")
-    print(f"  OCXO1 service classes        = {service_class_counts['ocxo1']}")
-    print(f"  OCXO2 service classes        = {service_class_counts['ocxo2']}")
+    print(f"  rows                          = {coverage['rows']:,}")
+    print(f"  VCLOCK gate rows              = {coverage['vclock_gate']:,}")
+    print(f"  OCXO1 gate rows               = {coverage['ocxo1_gate']:,}")
+    print(f"  OCXO2 gate rows               = {coverage['ocxo2_gate']:,}")
+    print(f"  OCXO1 yardstick rows          = {coverage['ocxo1_yardstick']:,}")
+    print(f"  OCXO2 yardstick rows          = {coverage['ocxo2_yardstick']:,}")
+    print(f"  OCXO1 yardstick stale/seeded  = {coverage['ocxo1_yardstick_stale']:,} / {coverage['ocxo1_yardstick_seeded']:,}")
+    print(f"  OCXO2 yardstick stale/seeded  = {coverage['ocxo2_yardstick_stale']:,} / {coverage['ocxo2_yardstick_seeded']:,}")
+    print(f"  OCXO1 yardstick excursions    = {coverage['ocxo1_yardstick_excursions']:,}")
+    print(f"  OCXO2 yardstick excursions    = {coverage['ocxo2_yardstick_excursions']:,}")
+    print(f"  OCXO1 adjacency rejects       = {coverage['ocxo1_adjacency_rejected']:,}")
+    print(f"  OCXO2 adjacency rejects       = {coverage['ocxo2_adjacency_rejected']:,}")
+    print(f"  OCXO1 service classes         = {service_class_counts['ocxo1']}")
+    print(f"  OCXO2 service classes         = {service_class_counts['ocxo2']}")
     print()
 
     print("Summary")
@@ -1131,9 +1249,8 @@ def analyze(campaign: str, limit: int = 0, clock_filter: Optional[str] = None) -
     if clock_filter is None or clock_filter == "VCLOCK":
         _print_welford("VCLOCK raw interval", stats["vclock_raw_interval"])
         _print_welford("VCLOCK raw first-difference residual", stats["vclock_raw_delta"])
-        _print_welford("VCLOCK EMA gate residual", stats["vclock_gate_residual"])
-        _print_welford("VCLOCK published interval", stats["vclock_published_interval"])
-        _print_welford("VCLOCK published first-difference residual", stats["vclock_published_delta"])
+        _print_welford("VCLOCK EMA published interval", stats["vclock_ema_interval"])
+        _print_welford("VCLOCK EMA published first-difference", stats["vclock_ema_delta"])
         _print_welford("VCLOCK counter32 delta", stats["vclock_counter32_delta"], unit="ticks")
 
     for lane_name, label in (("ocxo1", "OCXO1"), ("ocxo2", "OCXO2")):
@@ -1141,37 +1258,57 @@ def analyze(campaign: str, limit: int = 0, clock_filter: Optional[str] = None) -
             continue
         _print_welford(f"{label} raw interval", stats[f"{lane_name}_raw_interval"])
         _print_welford(f"{label} raw first-difference residual", stats[f"{lane_name}_raw_delta"])
-        _print_welford(f"{label} EMA gate residual", stats[f"{lane_name}_gate_residual"])
-        _print_welford(f"{label} published interval", stats[f"{lane_name}_published_interval"])
-        _print_welford(f"{label} published first-difference residual", stats[f"{lane_name}_published_delta"])
-        _print_welford(f"{label} adjacency delta", stats[f"{lane_name}_adjacency_delta"], unit="ticks")
-        _print_welford(f"{label} adjacency reject count", stats[f"{lane_name}_adjacency_reject_count"], unit="rejects")
+        _print_welford(f"{label} EMA published interval", stats[f"{lane_name}_ema_interval"])
+        _print_welford(f"{label} EMA published first-difference", stats[f"{lane_name}_ema_delta"])
+        _print_welford(f"{label} yardstick inferred interval", stats[f"{lane_name}_inferred_interval"])
         _print_welford(f"{label} counter32 delta", stats[f"{lane_name}_counter32_delta"], unit="ticks")
-        _print_welford(f"{label} service offset", stats[f"{lane_name}_service_offset"], unit="ticks")
     print()
 
+    if clock_filter is None or clock_filter in ("OCXO1", "OCXO2"):
+        print("Head-to-head: EMA vs PPS-Yardstick (agree seconds, same raw evidence)")
+        print("══════════════════════════════════════════════════════════════════════")
+        print("  emo = ema published - raw observed   (EMA per-second error)")
+        print("  imo = inferred - raw observed        (yardstick per-second error)")
+        print()
+        for lane_name, label in (("ocxo1", "OCXO1"), ("ocxo2", "OCXO2")):
+            if clock_filter is not None and clock_filter != label:
+                continue
+            _print_welford(f"{label} EMA error (emo)", stats[f"{lane_name}_emo"])
+            _print_welford(f"{label} EMA |error|", stats[f"{lane_name}_abs_emo"])
+            _print_welford(f"{label} yardstick error (imo)", stats[f"{lane_name}_imo"])
+            _print_welford(f"{label} yardstick |error|", stats[f"{lane_name}_abs_imo"])
+            _print_welford(f"{label} chain walk (endpoint - observed)", stats[f"{lane_name}_walk"])
+            slope = _walk_slope_cycles_per_second(walk_samples[lane_name])
+            counts = last_counts[lane_name]
+            slope_text = "---" if slope is None else f"{slope:+.4f} cycles/s"
+            print(f"  {label} chain walk slope (least squares)        {slope_text}")
+            print(
+                f"  {label} cumulative gate counts                   "
+                f"agree={counts['agree']}  excursion={counts['excursion']}  "
+                f"threshold={counts['threshold']}"
+            )
+            print()
+
     if clock_filter is None or clock_filter == "VCLOCK":
-        print(f"VCLOCK residual excursions (|rawΔ| or |gateR| or |pubΔ| ≥ {EXCURSION_THRESHOLD_CYCLES} cycles)")
-        print("════════════════════════════════════════════════════════════════════════════")
+        print(f"VCLOCK residual excursions (|rawΔ| or |emaΔ| ≥ {EXCURSION_THRESHOLD_CYCLES} cycles)")
+        print("════════════════════════════════════════════════════════════")
         if not vclock_excursions:
             print("  none")
         else:
             h = (
-                f"{'pps':>6s} {'rawΔ':>8s} {'gateR':>8s} {'pubΔ':>8s} "
-                f"{'raw':>13s} {'gPred':>13s} {'pub':>13s} "
+                f"{'pps':>6s} {'rawΔ':>8s} {'emaΔ':>8s} "
+                f"{'raw':>13s} {'ema':>13s} "
                 f"{'v_cΔ':>11s} {'phase':>5s} {'p_Δ':>8s}"
             )
             print(h)
-            print(f"{'─'*6} {'─'*8} {'─'*8} {'─'*8} {'─'*13} {'─'*13} {'─'*13} {'─'*11} {'─'*5} {'─'*8}")
+            print(f"{'─'*6} {'─'*8} {'─'*8} {'─'*13} {'─'*13} {'─'*11} {'─'*5} {'─'*8}")
             for row in vclock_excursions[:60]:
                 print(
                     f"{row['pps_count']:>6d} "
                     f"{_fmt_int(row['v_raw_delta'], 8, signed=True)} "
-                    f"{_fmt_int(row['v_gate_res'], 8, signed=True)} "
-                    f"{_fmt_int(row['v_pub_delta'], 8, signed=True)} "
+                    f"{_fmt_int(row['v_ema_delta'], 8, signed=True)} "
                     f"{_fmt_int(row['v_raw'], 13)} "
-                    f"{_fmt_int(row['v_gate_pred'], 13)} "
-                    f"{_fmt_int(row['v_pub'], 13)} "
+                    f"{_fmt_int(row['v_ema'], 13)} "
                     f"{_fmt_int(row['v_cdelta'], 11)} "
                     f"{_fmt_int(row['phase'], 5)} "
                     f"{_fmt_int(row['pps_delta'], 8, signed=True)}"
@@ -1181,8 +1318,8 @@ def analyze(campaign: str, limit: int = 0, clock_filter: Optional[str] = None) -
         print()
 
     if clock_filter is None or clock_filter in ("OCXO1", "OCXO2"):
-        print(f"OCXO residual excursions (|rawΔ| or |gateR| or |pubΔ| ≥ {EXCURSION_THRESHOLD_CYCLES} cycles)")
-        print("════════════════════════════════════════════════════════════════════════")
+        print(f"OCXO residual excursions (|rawΔ| or |emaΔ| ≥ {EXCURSION_THRESHOLD_CYCLES} cycles, or yardstick EXC)")
+        print("══════════════════════════════════════════════════════════════════════════════")
         filtered = [
             ex for ex in excursions
             if clock_filter is None or
@@ -1193,32 +1330,28 @@ def analyze(campaign: str, limit: int = 0, clock_filter: Optional[str] = None) -
             print("  none")
         else:
             h = (
-                f"{'pps':>6s} {'lane':>5s} {'rawΔ':>8s} {'gateR':>8s} {'pubΔ':>8s} "
-                f"{'raw':>13s} {'gPred':>13s} {'pub':>13s} {'adj':>5s} {'aΔ':>9s} {'aN':>6s} "
-                f"{'cΔ':>11s} {'svc':>7s} {'p_Δ':>8s} {'v_rawΔ':>8s} {'v_gateR':>8s} {'v_pubΔ':>8s}"
+                f"{'pps':>6s} {'lane':>5s} {'rawΔ':>8s} {'emaΔ':>8s} {'imo':>7s} {'walk':>8s} "
+                f"{'raw':>13s} {'ema':>13s} {'inferred':>13s} {'y':>5s} "
+                f"{'cΔ':>11s} {'p_Δ':>8s} {'v_rawΔ':>8s}"
             )
             print(h)
-            print(f"{'─'*6} {'─'*5} {'─'*8} {'─'*8} {'─'*8} {'─'*13} {'─'*13} {'─'*13} {'─'*5} {'─'*9} {'─'*6} {'─'*11} {'─'*7} {'─'*8} {'─'*8} {'─'*8} {'─'*8}")
+            print(f"{'─'*6} {'─'*5} {'─'*8} {'─'*8} {'─'*7} {'─'*8} {'─'*13} {'─'*13} {'─'*13} {'─'*5} {'─'*11} {'─'*8} {'─'*8}")
             for ex in filtered[:60]:
                 row = ex["row"]
                 d = ex["data"]
                 print(
                     f"{row['pps_count']:>6d} {ex['lane']:>5s} "
                     f"{_fmt_int(d['raw_delta'], 8, signed=True)} "
-                    f"{_fmt_int(d['gate_res'], 8, signed=True)} "
-                    f"{_fmt_int(d['pub_delta'], 8, signed=True)} "
+                    f"{_fmt_int(d['ema_delta'], 8, signed=True)} "
+                    f"{_fmt_int(d['imo'], 7, signed=True)} "
+                    f"{_fmt_int(d['walk'], 8, signed=True)} "
                     f"{_fmt_int(d['raw'], 13)} "
-                    f"{_fmt_int(d['gate_pred'], 13)} "
-                    f"{_fmt_int(d['pub'], 13)} "
-                    f"{_fmt_str(d['adj_tag'], 5)} "
-                    f"{_fmt_int(d['adj_delta_error'], 9, signed=True)} "
-                    f"{_fmt_int(d['adj_reject_count'], 6)} "
+                    f"{_fmt_int(d['ema'], 13)} "
+                    f"{_fmt_int(d['inferred'], 13)} "
+                    f"{_fmt_str(d['y_tag'], 5)} "
                     f"{_fmt_int(d['counter_delta'], 11)} "
-                    f"{_fmt_int(d['service_offset'], 7, signed=True)} "
                     f"{_fmt_int(row['pps_delta'], 8, signed=True)} "
-                    f"{_fmt_int(row['v_raw_delta'], 8, signed=True)} "
-                    f"{_fmt_int(row['v_gate_res'], 8, signed=True)} "
-                    f"{_fmt_int(row['v_pub_delta'], 8, signed=True)}"
+                    f"{_fmt_int(row['v_raw_delta'], 8, signed=True)}"
                 )
             if len(filtered) > 60:
                 print(f"  ... {len(filtered) - 60:,} more excursion rows omitted")
@@ -1228,20 +1361,24 @@ def analyze(campaign: str, limit: int = 0, clock_filter: Optional[str] = None) -
     print("═════")
     print("  • *_raw is the raw/evidence interval from dwt_interval_gate.observed_cycles when present.")
     print("  • *_rawΔ = raw[n] - raw[n-1]. This is the old-style raw first-difference residual.")
-    print("  • *_gPred is process_interrupt's EMA/gate prediction interval.")
-    print("  • *_gateR = raw - gPred. This is predictor disagreement, not first-difference jitter.")
-    print("  • *_pub is the subscriber-facing published/smoothed interval.")
-    print("  • *_pubΔ = pub[n] - pub[n-1]. This is the old-style published residual.")
+    print("  • *_ema is the subscriber-facing published interval; today it is EMA-authored")
+    print("    (this column was previously printed as *_pub).")
+    print("  • *_emaΔ = ema[n] - ema[n-1].")
+    print("  • *_inferred is the PPS-Yardstick inferred interval: prior chain interval scaled")
+    print("    by the physical PPS-to-PPS yardstick ratio, carried in Q16 fixed point.")
+    print("  • *_imo = inferred - observed (firmware-computed). Sub-lattice |imo| means the")
+    print("    inference tracks truth tighter than the 4-cycle QTimer quantization floor.")
+    print("  • *_walk is the free-running chain endpoint minus observed endpoint: the")
+    print("    cumulative chain-walk audit that decides the Stage 2/3 anchor policy.")
+    print("  • *_y tags: OK, EXC (gate excursion: observed disagreed with inference beyond")
+    print("    threshold), STAL (no fresh PPS yardstick; interval held), SEED (chain")
+    print("    reseeded this row), --- (rail not valid).")
+    print("  • Head-to-head emo/imo are computed over agree seconds only: both rails judged")
+    print("    against the same clean raw evidence.")
     print("  • p_* columns are the physical PPS rail; PPS has no separate gate/published rail here.")
-    print("  • *_adj is OCXO adjacency status: OK=counter lineage intact, REJ=guard rejected")
-    print("    the event, BAD=valid adjacency surface but not OK/rejected, ---=not applicable/missing.")
-    print("  • *_aΔ is counter_delta_ticks - expected_counter_delta_ticks. Normal is 0.")
-    print("  • *_aN is cumulative adjacency reject count.")
     print("  • *_cΔ is Alpha/process_interrupt counter32 delta since the previous event.")
-    print("  • *_svc is compact OCXO compare-service offset in 10 MHz ticks.")
-    print("  • Use a clock filter for narrower one-line rows, e.g. raw_cycles Symmetry2 VCLOCK.")
+    print("  • Use a clock filter for narrower one-line rows, e.g. raw_cycles Plover1 OCXO2.")
     print()
-
 
 def parse_args(argv: List[str]) -> Tuple[str, int, Optional[str]]:
     if len(argv) < 2:

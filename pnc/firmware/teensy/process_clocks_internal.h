@@ -358,6 +358,34 @@ struct clocks_alpha_lane_forensics_t {
   uint32_t dwt_interval_expected_counter_delta_ticks;
   uint32_t dwt_interval_adjacency_reject_count;
 
+  // process_interrupt-authored PPS-Yardstick inference audit (Stage 1 --
+  // observational rail).  dwt_at_event remains EMA-authored; these fields
+  // carry the parallel yardstick surface per row so TIMEBASE/raw_cycles can
+  // adjudicate the Stage 2 authority flip side-by-side with the EMA math.
+  bool     dwt_yardstick_valid;
+  bool     dwt_yardstick_stale;
+  bool     dwt_yardstick_seeded;
+  bool     dwt_yardstick_excursion;
+  uint32_t dwt_yardstick_pps_sequence;
+  uint32_t dwt_yardstick_pps_seq_delta;
+  uint32_t dwt_yardstick_g_now_cycles;
+  uint32_t dwt_yardstick_g_prev_cycles;
+  uint32_t dwt_yardstick_inferred_interval_cycles;
+  uint32_t dwt_yardstick_observed_interval_cycles;
+  int32_t  dwt_yardstick_inferred_minus_observed_cycles;
+  uint32_t dwt_yardstick_inferred_endpoint_dwt;
+  uint32_t dwt_yardstick_inferred_endpoint_frac_q16;
+  int32_t  dwt_yardstick_endpoint_minus_observed_cycles;
+  uint32_t dwt_yardstick_gate_threshold_cycles;
+  uint32_t dwt_yardstick_gate_agree_count;
+  uint32_t dwt_yardstick_gate_excursion_count;
+  bool     dwt_yardstick_authority;
+  uint32_t dwt_ema_dwt_at_event;
+  uint32_t dwt_yardstick_auth_endpoint_dwt;
+  uint32_t dwt_yardstick_auth_endpoint_frac_q16;
+  int32_t  dwt_yardstick_auth_error_cycles;
+  bool     dwt_yardstick_auth_anchor_applied;
+
   int64_t  second_residual_ns;
   int64_t  window_error_ns;
   uint32_t window_checks;

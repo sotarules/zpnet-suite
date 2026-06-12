@@ -333,6 +333,42 @@ struct interrupt_capture_diag_t {
   uint32_t dwt_interval_expected_counter_delta_ticks = 0;
   uint32_t dwt_interval_adjacency_reject_count = 0;
 
+  // PPS-Yardstick OCXO DWT inference audit (Stage 1 -- observational only).
+  // dwt_at_event remains EMA-authored; these fields expose the parallel
+  // yardstick rail: the unquantized PPS yardstick pair it consumed, the
+  // inferred Q16 interval/endpoint, the gate verdict it WOULD have given,
+  // and chain-walk evidence, so TIMEBASE can adjudicate the Stage 2
+  // authority flip from live campaign data.
+  bool     dwt_yardstick_valid = false;
+  bool     dwt_yardstick_stale = false;
+  bool     dwt_yardstick_seeded = false;
+  bool     dwt_yardstick_excursion = false;
+  uint32_t dwt_yardstick_pps_sequence = 0;
+  uint32_t dwt_yardstick_pps_seq_delta = 0;
+  uint32_t dwt_yardstick_g_now_cycles = 0;
+  uint32_t dwt_yardstick_g_prev_cycles = 0;
+  uint32_t dwt_yardstick_inferred_interval_cycles = 0;
+  uint32_t dwt_yardstick_observed_interval_cycles = 0;
+  int32_t  dwt_yardstick_inferred_minus_observed_cycles = 0;
+  uint32_t dwt_yardstick_inferred_endpoint_dwt = 0;
+  uint32_t dwt_yardstick_inferred_endpoint_frac_q16 = 0;
+  int32_t  dwt_yardstick_endpoint_minus_observed_cycles = 0;
+  uint32_t dwt_yardstick_gate_threshold_cycles = 0;
+  uint32_t dwt_yardstick_gate_agree_count = 0;
+  uint32_t dwt_yardstick_gate_excursion_count = 0;
+
+  // Stage 2 authority audit.  dwt_at_event is now yardstick-anchored when
+  // dwt_yardstick_authority is true; dwt_ema_dwt_at_event preserves the EMA
+  // rail's would-have-been endpoint as a diagnostic for side-by-side
+  // TIMEBASE analysis.  The auth_* fields expose the anchored publication
+  // ledger: endpoint, PI loop error, and whether the anchor fired.
+  bool     dwt_yardstick_authority = false;
+  uint32_t dwt_ema_dwt_at_event = 0;
+  uint32_t dwt_yardstick_auth_endpoint_dwt = 0;
+  uint32_t dwt_yardstick_auth_endpoint_frac_q16 = 0;
+  int32_t  dwt_yardstick_auth_error_cycles = 0;
+  bool     dwt_yardstick_auth_anchor_applied = false;
+
   // 1 kHz cadence linear-regression audit.  In the diagnostic-only build,
   // subscribers still receive the traditional event DWT in event.dwt_at_event /
   // diag.dwt_at_event.  These fields expose the fitted endpoint and per-second

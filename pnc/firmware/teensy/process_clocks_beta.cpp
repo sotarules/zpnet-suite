@@ -1093,6 +1093,7 @@ static void payload_add_lane_forensics_object(Payload& parent,
   forensics.add("dwt_synthetic", valid && f.dwt_synthetic);
   forensics.add("dwt_original_at_event", valid ? f.dwt_original_at_event : 0U);
   forensics.add("dwt_predicted_at_event", valid ? f.dwt_predicted_at_event : 0U);
+  forensics.add("dwt_ema_dwt_at_event", valid ? f.dwt_ema_dwt_at_event : 0U);
   forensics.add("dwt_used_at_event", valid ? f.dwt_used_at_event : 0U);
   forensics.add("dwt_isr_entry_raw", valid ? f.dwt_isr_entry_raw : 0U);
   forensics.add("dwt_event_from_isr_entry_raw",
@@ -1135,6 +1136,48 @@ static void payload_add_lane_forensics_object(Payload& parent,
   adjacency.add("reject_count",
                 valid ? f.dwt_interval_adjacency_reject_count : 0U);
   forensics.add_object("dwt_interval_adjacency", adjacency);
+
+  // PPS-Yardstick inference rail (Stage 1 -- observational).  Compact per-row
+  // evidence: the unquantized PPS yardstick pair consumed, the inferred Q16
+  // interval/endpoint, the gate verdict it WOULD have given, and chain-walk
+  // audit, published beside the EMA surfaces above for side-by-side analysis.
+  Payload yardstick;
+  yardstick.add("valid", valid && f.dwt_yardstick_valid);
+  yardstick.add("stale", valid && f.dwt_yardstick_stale);
+  yardstick.add("seeded", valid && f.dwt_yardstick_seeded);
+  yardstick.add("excursion", valid && f.dwt_yardstick_excursion);
+  yardstick.add("pps_sequence", valid ? f.dwt_yardstick_pps_sequence : 0U);
+  yardstick.add("pps_seq_delta", valid ? f.dwt_yardstick_pps_seq_delta : 0U);
+  yardstick.add("g_now_cycles", valid ? f.dwt_yardstick_g_now_cycles : 0U);
+  yardstick.add("g_prev_cycles", valid ? f.dwt_yardstick_g_prev_cycles : 0U);
+  yardstick.add("inferred_interval_cycles",
+                valid ? f.dwt_yardstick_inferred_interval_cycles : 0U);
+  yardstick.add("observed_interval_cycles",
+                valid ? f.dwt_yardstick_observed_interval_cycles : 0U);
+  yardstick.add("inferred_minus_observed_cycles",
+                valid ? f.dwt_yardstick_inferred_minus_observed_cycles : 0);
+  yardstick.add("inferred_endpoint_dwt",
+                valid ? f.dwt_yardstick_inferred_endpoint_dwt : 0U);
+  yardstick.add("inferred_endpoint_frac_q16",
+                valid ? f.dwt_yardstick_inferred_endpoint_frac_q16 : 0U);
+  yardstick.add("endpoint_minus_observed_cycles",
+                valid ? f.dwt_yardstick_endpoint_minus_observed_cycles : 0);
+  yardstick.add("gate_threshold_cycles",
+                valid ? f.dwt_yardstick_gate_threshold_cycles : 0U);
+  yardstick.add("gate_agree_count",
+                valid ? f.dwt_yardstick_gate_agree_count : 0U);
+  yardstick.add("gate_excursion_count",
+                valid ? f.dwt_yardstick_gate_excursion_count : 0U);
+  yardstick.add("authority", valid && f.dwt_yardstick_authority);
+  yardstick.add("auth_endpoint_dwt",
+                valid ? f.dwt_yardstick_auth_endpoint_dwt : 0U);
+  yardstick.add("auth_endpoint_frac_q16",
+                valid ? f.dwt_yardstick_auth_endpoint_frac_q16 : 0U);
+  yardstick.add("auth_error_cycles",
+                valid ? f.dwt_yardstick_auth_error_cycles : 0);
+  yardstick.add("auth_anchor_applied",
+                valid && f.dwt_yardstick_auth_anchor_applied);
+  forensics.add_object("dwt_yardstick", yardstick);
 
   parent.add_object("forensics", forensics);
 }

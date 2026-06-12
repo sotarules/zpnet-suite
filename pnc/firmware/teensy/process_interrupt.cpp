@@ -214,6 +214,66 @@ static constexpr uint32_t OCXO_EMA_SHIFT = 7;  // alpha = 1/128 MULE CHANGE
 static constexpr uint32_t OCXO_EMA_ALPHA_NUMERATOR = 1;
 static constexpr uint32_t OCXO_EMA_ALPHA_DENOMINATOR = (1U << OCXO_EMA_SHIFT);
 
+// PPS-Yardstick OCXO DWT inference (Stage 1 -- OBSERVATIONAL ONLY).
+//
+// Model: the physical PPS-to-PPS DWT interval (GPIO path, unquantized) is the
+// live yardstick for Teensy CPU-clock drift.  The OCXO's own second is stable
+// to ~1e-11, so the only lawful second-to-second change in its measured DWT
+// interval is that same yardstick drift:
+//
+//   O_inferred[n] = O_chain[n-1] * G_now / G_prev
+//
+// carried in Q16 fixed point so sub-cycle truth accumulates instead of being
+// re-quantized each second.  The QTimer-measured interval (4-cycle lattice)
+// is demoted to validator: agreement within the gate band confirms the
+// inferred value; disagreement marks an excursion of the ISR/service
+// displacement class.
+//
+// In Stage 1 the EMA remains the published DWT authority.  The yardstick rail
+// runs in parallel and publishes its full audit through dwt_repair_diag_t /
+// interrupt_capture_diag_t and the lane report, so live campaigns can decide
+// the gate threshold, PPS-jitter handling, and chain seed/anchor policy
+// before any authority flip.
+static constexpr bool     OCXO_YARDSTICK_DWT_AUTHORITY_ENABLED = true;  // Stage 2: yardstick is authority
+static constexpr uint32_t OCXO_YARDSTICK_GATE_THRESHOLD_CYCLES = 16;
+// Stage 2 anchored authority rail.  The published endpoint is a PI-anchored
+// yardstick chain: each second the anchored interval is scaled by the same
+// PPS yardstick step as the free chain, the endpoint advances by it, and on
+// gate-agree seconds the observed endpoint corrects the loop:
+//
+//   err       = observed - anchored_endpoint        (Q16)
+//   endpoint += err >> ANCHOR_P_SHIFT               (proportional, phase)
+//   interval += err >> ANCHOR_I_SHIFT               (integral, frequency)
+//
+// Plover2 measured a +2 cycle/seed-bias interval and a +1.76 cycles/s free
+// chain walk.  A proportional-only anchor would park K * bias cycles off
+// truth; the integral term drives steady-state error to ZERO under constant
+// interval bias and slowly absorbs real per-lane oven drift -- it is what
+// makes the two lanes individual.  With P=1/8 and I=1/256 at 1 Hz the loop
+// is critically damped (zeta = 1) and the +/-2 cycle observed lattice noise
+// reaches the published endpoint attenuated to ~0.25 cycles.  On excursion
+// seconds no correction is applied: the rail coasts on pure inference (the
+// excursion guard).  Unlike the EMA, the yardstick feed-forward carries the
+// thermal slope, so the loop only ever fights zero-mean noise and bias --
+// there is no systematic lag and no integer dead zone.
+static constexpr uint32_t OCXO_YARDSTICK_ANCHOR_P_SHIFT = 3;   // 1/8
+static constexpr uint32_t OCXO_YARDSTICK_ANCHOR_I_SHIFT = 8;   // 1/256
+// Coherent repeated excursions mean the OCXO genuinely moved (servo step /
+// retrace), not that the measurement glitched; reseed the chain after this
+// many coherent excursions instead of diverging forever.
+static constexpr uint32_t OCXO_YARDSTICK_COHERENT_RESEED_STREAK = 3;
+// Chain endpoint is carried modulo 2^48 in Q16, which is exactly modulo 2^32
+// DWT cycles -- wrap arithmetic stays consistent with the uint32 DWT domain.
+static constexpr uint64_t YARDSTICK_ENDPOINT_Q16_MASK = (1ULL << 48) - 1ULL;
+// A one-second PPS yardstick interval qualifies only if the VCLOCK counter
+// advanced one nominal second within this tick tolerance (100 us).  Outside
+// the band the interval is a dropout/multi-second artifact, not a yardstick.
+static constexpr uint32_t PPS_YARDSTICK_COUNTER_TOLERANCE_TICKS = 1000U;
+// Sanity bound on the per-second yardstick step.  |G_now - G_prev| beyond
+// ~100 ppm/s is physically impossible thermal slew and also protects the
+// 64-bit interval-scaling product from overflow.
+static constexpr uint32_t PPS_YARDSTICK_MAX_ABS_DELTA_G_CYCLES = 100000U;
+
 // OCXO local target constants.  Normal OCXO operation is one-second edge
 // compare custody: each public event is exactly 10,000,000 OCXO ticks after
 // the previous authored target.  OCXO_CADENCE_INTERVAL_TICKS remains the
@@ -781,6 +841,100 @@ static pps_vclock_t store_load_pvc(void) {
   pps_vclock_t pvc;
   store_load(pps, pvc);
   return pvc;
+}
+
+// ============================================================================
+// PPS yardstick store (seqlock) -- physical PPS-to-PPS DWT interval pair
+// ============================================================================
+//
+// Authored once per PPS edge from the GPIO ISR.  G_now and G_prev are
+// consecutive physical one-second DWT intervals measured on the unquantized
+// GPIO path.  Their ratio is the live CPU-clock (yardstick) drift consumed by
+// the OCXO yardstick inference rail.  An interval qualifies only when the
+// VCLOCK counter delta across the same edge pair is one nominal second within
+// PPS_YARDSTICK_COUNTER_TOLERANCE_TICKS; a non-qualifying edge clears the
+// pair so a GNSS dropout cannot masquerade as thermal drift.
+
+struct pps_yardstick_store_t {
+  volatile uint32_t seq = 0;
+  volatile bool     valid = false;             // both intervals present
+  volatile uint32_t sequence = 0;              // PPS edge count closing G_now
+  volatile uint32_t interval_now_cycles = 0;   // G_now
+  volatile uint32_t interval_prev_cycles = 0;  // G_prev
+  volatile uint32_t accept_count = 0;
+  volatile uint32_t reject_count = 0;
+  volatile uint32_t reset_count = 0;
+};
+
+static pps_yardstick_store_t g_pps_yardstick;
+
+struct pps_yardstick_snapshot_t {
+  bool     valid = false;
+  uint32_t sequence = 0;
+  uint32_t interval_now_cycles = 0;
+  uint32_t interval_prev_cycles = 0;
+  uint32_t accept_count = 0;
+  uint32_t reject_count = 0;
+  uint32_t reset_count = 0;
+};
+
+// Single writer (PPS GPIO ISR); foreground readers via pps_yardstick_load.
+static void pps_yardstick_record_interval(uint32_t pps_sequence,
+                                          uint32_t interval_cycles,
+                                          uint32_t counter_delta_ticks) {
+  const uint32_t nominal = (uint32_t)VCLOCK_COUNTS_PER_SECOND;
+  const uint32_t tick_error = (counter_delta_ticks >= nominal)
+      ? counter_delta_ticks - nominal
+      : nominal - counter_delta_ticks;
+
+  g_pps_yardstick.seq++;
+  dmb_barrier();
+  if (tick_error <= PPS_YARDSTICK_COUNTER_TOLERANCE_TICKS &&
+      interval_cycles != 0) {
+    g_pps_yardstick.interval_prev_cycles = g_pps_yardstick.interval_now_cycles;
+    g_pps_yardstick.interval_now_cycles = interval_cycles;
+    g_pps_yardstick.valid = (g_pps_yardstick.interval_prev_cycles != 0);
+    g_pps_yardstick.sequence = pps_sequence;
+    g_pps_yardstick.accept_count++;
+  } else {
+    g_pps_yardstick.interval_prev_cycles = 0;
+    g_pps_yardstick.interval_now_cycles = 0;
+    g_pps_yardstick.valid = false;
+    g_pps_yardstick.sequence = pps_sequence;
+    g_pps_yardstick.reject_count++;
+  }
+  dmb_barrier();
+  g_pps_yardstick.seq++;
+}
+
+static bool pps_yardstick_load(pps_yardstick_snapshot_t& out) {
+  for (int attempt = 0; attempt < 4; attempt++) {
+    const uint32_t s1 = g_pps_yardstick.seq;
+    dmb_barrier();
+    out.valid = g_pps_yardstick.valid;
+    out.sequence = g_pps_yardstick.sequence;
+    out.interval_now_cycles = g_pps_yardstick.interval_now_cycles;
+    out.interval_prev_cycles = g_pps_yardstick.interval_prev_cycles;
+    out.accept_count = g_pps_yardstick.accept_count;
+    out.reject_count = g_pps_yardstick.reject_count;
+    out.reset_count = g_pps_yardstick.reset_count;
+    dmb_barrier();
+    const uint32_t s2 = g_pps_yardstick.seq;
+    if (s1 == s2 && (s1 & 1u) == 0u) return true;
+  }
+  out = pps_yardstick_snapshot_t{};
+  return false;
+}
+
+static void pps_yardstick_reset(void) {
+  g_pps_yardstick.seq++;
+  dmb_barrier();
+  g_pps_yardstick.valid = false;
+  g_pps_yardstick.interval_now_cycles = 0;
+  g_pps_yardstick.interval_prev_cycles = 0;
+  g_pps_yardstick.reset_count++;
+  dmb_barrier();
+  g_pps_yardstick.seq++;
 }
 
 // ============================================================================
@@ -1363,6 +1517,37 @@ struct dwt_repair_diag_t {
   uint32_t interval_counter_delta_ticks = 0;
   uint32_t interval_expected_counter_delta_ticks = 0;
   uint32_t interval_adjacency_reject_count = 0;
+
+  // PPS-Yardstick inference audit (Stage 1 -- observational).  These fields
+  // run in parallel with the EMA decision above; they change no authority.
+  bool     yardstick_valid = false;
+  bool     yardstick_stale = false;
+  bool     yardstick_seeded_this_event = false;
+  bool     yardstick_excursion = false;
+  uint32_t yardstick_pps_sequence = 0;
+  uint32_t yardstick_pps_seq_delta = 0;
+  uint32_t yardstick_g_now_cycles = 0;
+  uint32_t yardstick_g_prev_cycles = 0;
+  uint32_t yardstick_inferred_interval_cycles = 0;
+  uint32_t yardstick_observed_interval_cycles = 0;
+  int32_t  yardstick_inferred_minus_observed_cycles = 0;
+  uint32_t yardstick_inferred_endpoint_dwt = 0;
+  uint32_t yardstick_inferred_endpoint_frac_q16 = 0;
+  int32_t  yardstick_endpoint_minus_observed_cycles = 0;
+  uint32_t yardstick_gate_threshold_cycles = 0;
+  uint32_t yardstick_gate_agree_count = 0;
+  uint32_t yardstick_gate_excursion_count = 0;
+
+  // Stage 2 authority audit.  ema_dwt_at_event preserves the EMA rail's
+  // would-have-been endpoint as a diagnostic (the EMA no longer publishes).
+  // The yardstick_auth_* fields expose the anchored publication ledger:
+  // endpoint, PI loop error, and whether the anchor correction fired.
+  bool     yardstick_authority = false;
+  uint32_t ema_dwt_at_event = 0;
+  uint32_t yardstick_auth_endpoint_dwt = 0;
+  uint32_t yardstick_auth_endpoint_frac_q16 = 0;
+  int32_t  yardstick_auth_error_cycles = 0;
+  bool     yardstick_auth_anchor_applied = false;
 };
 
 struct vclock_repair_stats_t {
@@ -2374,6 +2559,64 @@ struct ocxo_lane_t {
   uint32_t ema_last_counter_delta_ticks = 0;
   uint32_t ema_expected_counter_delta_ticks = OCXO_WITNESS_ONE_SECOND_COUNTS;
   uint32_t ema_adjacency_reject_count = 0;
+
+  // PPS-Yardstick inference rail (Stage 1 -- observational, not authority).
+  // The chain is the inferred OCXO DWT ledger: interval and free-running
+  // endpoint carried in Q16 fixed-point cycles (endpoint modulo 2^48 Q16 ==
+  // 2^32 DWT cycles).  This rail keeps its own previous-observed baseline so
+  // it never depends on EMA internals.
+  bool     yardstick_chain_valid = false;
+  uint64_t yardstick_chain_endpoint_q16 = 0;
+  uint64_t yardstick_chain_interval_q16 = 0;
+  bool     yardstick_last_used_pps_sequence_valid = false;
+  uint32_t yardstick_last_used_pps_sequence = 0;
+  bool     yardstick_prev_observed_valid = false;
+  uint32_t yardstick_prev_observed_dwt = 0;
+
+  uint32_t yardstick_update_count = 0;
+  uint32_t yardstick_seed_count = 0;
+  uint32_t yardstick_stale_hold_count = 0;
+  uint32_t yardstick_gate_agree_count = 0;
+  uint32_t yardstick_gate_excursion_count = 0;
+  uint32_t yardstick_adjacency_reseed_count = 0;
+  uint32_t yardstick_coherent_reseed_count = 0;
+  uint32_t yardstick_excursion_streak = 0;
+  uint32_t yardstick_last_excursion_observed_interval_cycles = 0;
+
+  bool     yardstick_last_valid = false;
+  bool     yardstick_last_stale = false;
+  bool     yardstick_last_excursion = false;
+  uint32_t yardstick_last_g_now_cycles = 0;
+  uint32_t yardstick_last_g_prev_cycles = 0;
+  uint32_t yardstick_last_pps_seq_delta = 0;
+  uint32_t yardstick_last_inferred_interval_cycles = 0;
+  uint32_t yardstick_last_observed_interval_cycles = 0;
+  int32_t  yardstick_last_inferred_minus_observed_cycles = 0;
+  int32_t  yardstick_last_endpoint_minus_observed_cycles = 0;
+
+  // Steady-state audit accumulators (agree seconds only; excursion seconds
+  // are by definition observed-side corruption and would poison the
+  // seed-bias / chain-walk evidence these exist to collect).
+  int32_t  yardstick_endpoint_minus_observed_min_cycles = 0;
+  int32_t  yardstick_endpoint_minus_observed_max_cycles = 0;
+  uint32_t yardstick_max_abs_inferred_minus_observed_cycles = 0;
+  int64_t  yardstick_sum_inferred_minus_observed_cycles = 0;
+
+  // Stage 2 anchored authority rail (publishes dwt_at_event when
+  // OCXO_YARDSTICK_DWT_AUTHORITY_ENABLED).  Separate Q16 state from the free
+  // chain above: the free chain stays a pure physics audit; the anchored
+  // rail is the PI-corrected publication ledger.
+  bool     yardstick_auth_valid = false;
+  uint64_t yardstick_auth_endpoint_q16 = 0;
+  uint64_t yardstick_auth_interval_q16 = 0;
+  uint32_t yardstick_auth_publish_count = 0;
+  uint32_t yardstick_auth_agree_publish_count = 0;
+  uint32_t yardstick_auth_excursion_publish_count = 0;
+  uint32_t yardstick_auth_stale_publish_count = 0;
+  uint32_t yardstick_auth_observed_fallback_count = 0;
+  uint32_t yardstick_auth_anchor_correction_count = 0;
+  int32_t  yardstick_auth_last_error_cycles = 0;
+  uint32_t yardstick_auth_last_published_dwt = 0;
 };
 static ocxo_lane_t g_ocxo1_lane;
 static ocxo_lane_t g_ocxo2_lane;
@@ -2414,6 +2657,7 @@ static void ocxo_lane_program_local_cadence_compare(
     uint32_t reason);
 static void ocxo_lane_stop_local_cadence(ocxo_lane_t& lane, uint32_t reason);
 static void ocxo_lane_ema_reset(ocxo_lane_t& lane);
+static void ocxo_lane_yardstick_reset(ocxo_lane_t& lane);
 static void ocxo_lane_install_logical_grid(interrupt_subscriber_kind_t kind,
                                            ocxo_lane_t& lane,
                                            synthetic_clock32_t& clock32,
@@ -3997,6 +4241,41 @@ static void emit_one_second_event(interrupt_subscriber_runtime_t& rt,
         repair->interval_expected_counter_delta_ticks;
     diag.dwt_interval_adjacency_reject_count =
         repair->interval_adjacency_reject_count;
+    diag.dwt_yardstick_valid = repair->yardstick_valid;
+    diag.dwt_yardstick_stale = repair->yardstick_stale;
+    diag.dwt_yardstick_seeded = repair->yardstick_seeded_this_event;
+    diag.dwt_yardstick_excursion = repair->yardstick_excursion;
+    diag.dwt_yardstick_pps_sequence = repair->yardstick_pps_sequence;
+    diag.dwt_yardstick_pps_seq_delta = repair->yardstick_pps_seq_delta;
+    diag.dwt_yardstick_g_now_cycles = repair->yardstick_g_now_cycles;
+    diag.dwt_yardstick_g_prev_cycles = repair->yardstick_g_prev_cycles;
+    diag.dwt_yardstick_inferred_interval_cycles =
+        repair->yardstick_inferred_interval_cycles;
+    diag.dwt_yardstick_observed_interval_cycles =
+        repair->yardstick_observed_interval_cycles;
+    diag.dwt_yardstick_inferred_minus_observed_cycles =
+        repair->yardstick_inferred_minus_observed_cycles;
+    diag.dwt_yardstick_inferred_endpoint_dwt =
+        repair->yardstick_inferred_endpoint_dwt;
+    diag.dwt_yardstick_inferred_endpoint_frac_q16 =
+        repair->yardstick_inferred_endpoint_frac_q16;
+    diag.dwt_yardstick_endpoint_minus_observed_cycles =
+        repair->yardstick_endpoint_minus_observed_cycles;
+    diag.dwt_yardstick_gate_threshold_cycles =
+        repair->yardstick_gate_threshold_cycles;
+    diag.dwt_yardstick_gate_agree_count = repair->yardstick_gate_agree_count;
+    diag.dwt_yardstick_gate_excursion_count =
+        repair->yardstick_gate_excursion_count;
+    diag.dwt_yardstick_authority = repair->yardstick_authority;
+    diag.dwt_ema_dwt_at_event = repair->ema_dwt_at_event;
+    diag.dwt_yardstick_auth_endpoint_dwt =
+        repair->yardstick_auth_endpoint_dwt;
+    diag.dwt_yardstick_auth_endpoint_frac_q16 =
+        repair->yardstick_auth_endpoint_frac_q16;
+    diag.dwt_yardstick_auth_error_cycles =
+        repair->yardstick_auth_error_cycles;
+    diag.dwt_yardstick_auth_anchor_applied =
+        repair->yardstick_auth_anchor_applied;
   }
   if (rt.desc->kind != interrupt_subscriber_kind_t::VCLOCK) {
     bridge_projection_copy_to_diag(diag, bridge);
@@ -4770,6 +5049,50 @@ static void ocxo_lane_ema_reset(ocxo_lane_t& lane) {
   lane.ema_adjacency_reject_count = 0;
 }
 
+static void ocxo_lane_yardstick_reset(ocxo_lane_t& lane) {
+  lane.yardstick_chain_valid = false;
+  lane.yardstick_chain_endpoint_q16 = 0;
+  lane.yardstick_chain_interval_q16 = 0;
+  lane.yardstick_last_used_pps_sequence_valid = false;
+  lane.yardstick_last_used_pps_sequence = 0;
+  lane.yardstick_prev_observed_valid = false;
+  lane.yardstick_prev_observed_dwt = 0;
+  lane.yardstick_update_count = 0;
+  lane.yardstick_seed_count = 0;
+  lane.yardstick_stale_hold_count = 0;
+  lane.yardstick_gate_agree_count = 0;
+  lane.yardstick_gate_excursion_count = 0;
+  lane.yardstick_adjacency_reseed_count = 0;
+  lane.yardstick_coherent_reseed_count = 0;
+  lane.yardstick_excursion_streak = 0;
+  lane.yardstick_last_excursion_observed_interval_cycles = 0;
+  lane.yardstick_last_valid = false;
+  lane.yardstick_last_stale = false;
+  lane.yardstick_last_excursion = false;
+  lane.yardstick_last_g_now_cycles = 0;
+  lane.yardstick_last_g_prev_cycles = 0;
+  lane.yardstick_last_pps_seq_delta = 0;
+  lane.yardstick_last_inferred_interval_cycles = 0;
+  lane.yardstick_last_observed_interval_cycles = 0;
+  lane.yardstick_last_inferred_minus_observed_cycles = 0;
+  lane.yardstick_last_endpoint_minus_observed_cycles = 0;
+  lane.yardstick_endpoint_minus_observed_min_cycles = 0;
+  lane.yardstick_endpoint_minus_observed_max_cycles = 0;
+  lane.yardstick_max_abs_inferred_minus_observed_cycles = 0;
+  lane.yardstick_sum_inferred_minus_observed_cycles = 0;
+  lane.yardstick_auth_valid = false;
+  lane.yardstick_auth_endpoint_q16 = 0;
+  lane.yardstick_auth_interval_q16 = 0;
+  lane.yardstick_auth_publish_count = 0;
+  lane.yardstick_auth_agree_publish_count = 0;
+  lane.yardstick_auth_excursion_publish_count = 0;
+  lane.yardstick_auth_stale_publish_count = 0;
+  lane.yardstick_auth_observed_fallback_count = 0;
+  lane.yardstick_auth_anchor_correction_count = 0;
+  lane.yardstick_auth_last_error_cycles = 0;
+  lane.yardstick_auth_last_published_dwt = 0;
+}
+
 static void ocxo_lane_stop_local_cadence(ocxo_lane_t& lane, uint32_t reason) {
   lane.cadence_enabled = false;
   lane.cadence_armed = false;
@@ -4787,6 +5110,7 @@ static void ocxo_lane_install_logical_grid(interrupt_subscriber_kind_t kind,
   lane.cadence_epoch_counter32 = epoch_counter32;
   lane.tick_mod_1000 = 0;
   ocxo_lane_ema_reset(lane);
+  ocxo_lane_yardstick_reset(lane);
   lane.witness_previous_event_counter32_valid = false;
   lane.witness_previous_event_counter32 = 0;
   lane.witness_last_counter_delta_ticks = 0;
@@ -5461,6 +5785,322 @@ static uint32_t ocxo_lane_ema_predict_dwt(ocxo_lane_t& lane,
   return predicted;
 }
 
+// ============================================================================
+// PPS-Yardstick OCXO DWT inference (Stage 1 -- OBSERVATIONAL ONLY)
+// ============================================================================
+//
+// Parallel rail beside the OCXO EMA authority.  Nothing this function
+// computes changes the published dwt_at_event in Stage 1; every result is
+// recorded in lane state and dwt_repair_diag_t so live campaigns can
+// adjudicate the Stage 2 authority flip.
+//
+// Per event:
+//   1. Load the PPS yardstick pair (G_now, G_prev).  A non-advancing PPS
+//      sequence, an unusable pair, or an insane step is STALE: the chain
+//      interval holds (pure last-second prediction) and is flagged.
+//   2. Scale the chain interval by the yardstick step:
+//        O' = O * G_now / G_prev = O + (O * (G_now - G_prev)) / G_prev
+//      computed exactly in 64-bit Q16 (the delta form avoids overflow; it is
+//      the exact ratio, not a first-order approximation).
+//   3. Advance the free-running chain endpoint by the inferred interval.
+//   4. Validate against the QTimer-observed interval (4-cycle lattice):
+//      agreement within OCXO_YARDSTICK_GATE_THRESHOLD_CYCLES confirms the
+//      inference; a violation is an excursion of the ISR/service
+//      displacement class.
+//   5. Coherent repeated excursions (observed intervals agreeing with each
+//      other) mean the OCXO genuinely moved; reseed the chain from the
+//      observed surface instead of diverging.
+//
+// Known Stage-1 limitation, deliberately measured rather than masked: the
+// chain interval is seeded from ONE quantized observation and may carry up
+// to ~one lattice step of constant seed bias.  Seed bias appears as (a) a
+// constant offset in the agree-second inferred-minus-observed mean and (b) a
+// linear endpoint walk at that same rate.  Stage-1 telemetry exposes both so
+// Stage 2 can choose the seed/anchor policy from data.
+
+static uint32_t ocxo_lane_yardstick_observe(ocxo_lane_t& lane,
+                                            uint32_t observed_dwt,
+                                            bool counter_adjacency_valid,
+                                            uint32_t counter_delta_ticks,
+                                            dwt_repair_diag_t* out_diag,
+                                            const char** out_reason) {
+  const char* reason = "ocxo_yardstick_init";
+  uint32_t published_dwt = observed_dwt;
+
+  const bool counter_adjacency_ok =
+      !counter_adjacency_valid ||
+      counter_delta_ticks == OCXO_WITNESS_ONE_SECOND_COUNTS;
+
+  pps_yardstick_snapshot_t y{};
+  const bool y_loaded = pps_yardstick_load(y);
+  const bool y_usable = y_loaded && y.valid &&
+                        y.interval_now_cycles != 0 &&
+                        y.interval_prev_cycles != 0;
+
+  uint32_t pps_seq_delta = 0;
+  if (y_usable) {
+    pps_seq_delta = lane.yardstick_last_used_pps_sequence_valid
+        ? (y.sequence - lane.yardstick_last_used_pps_sequence)
+        : 1U;
+  }
+
+  const int64_t delta_g = y_usable
+      ? (int64_t)y.interval_now_cycles - (int64_t)y.interval_prev_cycles
+      : 0;
+  const bool delta_g_sane =
+      (delta_g >= -(int64_t)PPS_YARDSTICK_MAX_ABS_DELTA_G_CYCLES) &&
+      (delta_g <=  (int64_t)PPS_YARDSTICK_MAX_ABS_DELTA_G_CYCLES);
+
+  const bool stale = !y_usable || pps_seq_delta == 0 || !delta_g_sane;
+
+  // Observed one-second interval against this rail's own previous endpoint.
+  const bool have_observed_interval = lane.yardstick_prev_observed_valid;
+  const uint32_t observed_interval = have_observed_interval
+      ? (observed_dwt - lane.yardstick_prev_observed_dwt)
+      : 0U;
+
+  bool seeded = false;
+  bool excursion = false;
+  bool anchor_applied = false;
+  int32_t auth_error_cycles = 0;
+  int32_t inferred_minus_observed = 0;
+  int32_t endpoint_minus_observed = 0;
+  uint32_t inferred_interval_rounded = 0;
+
+  if (counter_adjacency_valid && !counter_adjacency_ok) {
+    // Non-adjacent target identity: the interval ending at this edge is not
+    // a lawful one-second sample.  Drop both rails; the next adjacent pair
+    // reseeds them.  The edge itself is real and is published as observed.
+    lane.yardstick_chain_valid = false;
+    lane.yardstick_auth_valid = false;
+    lane.yardstick_adjacency_reseed_count++;
+    lane.yardstick_excursion_streak = 0;
+    lane.yardstick_auth_observed_fallback_count++;
+    reason = "ocxo_yardstick_adjacency_observed";
+  } else if (!lane.yardstick_chain_valid) {
+    if (have_observed_interval && observed_interval != 0) {
+      // Seed both rails from the first lawful observed interval (quantized;
+      // the anchor's integral term absorbs the seed bias in steady state).
+      lane.yardstick_chain_valid = true;
+      lane.yardstick_chain_interval_q16 = ((uint64_t)observed_interval) << 16;
+      lane.yardstick_chain_endpoint_q16 =
+          (((uint64_t)observed_dwt) << 16) & YARDSTICK_ENDPOINT_Q16_MASK;
+      lane.yardstick_auth_valid = true;
+      lane.yardstick_auth_interval_q16 = ((uint64_t)observed_interval) << 16;
+      lane.yardstick_auth_endpoint_q16 =
+          (((uint64_t)observed_dwt) << 16) & YARDSTICK_ENDPOINT_Q16_MASK;
+      lane.yardstick_seed_count++;
+      lane.yardstick_excursion_streak = 0;
+      seeded = true;
+      inferred_interval_rounded = observed_interval;
+      reason = "ocxo_yardstick_seed";
+    } else {
+      lane.yardstick_auth_observed_fallback_count++;
+      reason = "ocxo_yardstick_init";
+    }
+  } else {
+    // ---- Free chain (Stage 1 physics audit, unchanged) ----
+    if (!stale) {
+      const int64_t correction_q16 =
+          ((int64_t)lane.yardstick_chain_interval_q16 * delta_g) /
+          (int64_t)y.interval_prev_cycles;
+      lane.yardstick_chain_interval_q16 =
+          (uint64_t)((int64_t)lane.yardstick_chain_interval_q16 +
+                     correction_q16);
+    } else {
+      lane.yardstick_stale_hold_count++;
+    }
+
+    lane.yardstick_chain_endpoint_q16 =
+        (lane.yardstick_chain_endpoint_q16 +
+         lane.yardstick_chain_interval_q16) &
+        YARDSTICK_ENDPOINT_Q16_MASK;
+
+    inferred_interval_rounded =
+        (uint32_t)((lane.yardstick_chain_interval_q16 + 0x8000ULL) >> 16);
+
+    // ---- Anchored authority rail: scale and advance with the same step ----
+    if (!stale) {
+      const int64_t auth_correction_q16 =
+          ((int64_t)lane.yardstick_auth_interval_q16 * delta_g) /
+          (int64_t)y.interval_prev_cycles;
+      lane.yardstick_auth_interval_q16 =
+          (uint64_t)((int64_t)lane.yardstick_auth_interval_q16 +
+                     auth_correction_q16);
+    }
+    lane.yardstick_auth_endpoint_q16 =
+        (lane.yardstick_auth_endpoint_q16 +
+         lane.yardstick_auth_interval_q16) &
+        YARDSTICK_ENDPOINT_Q16_MASK;
+
+    if (have_observed_interval && observed_interval != 0) {
+      inferred_minus_observed =
+          (int32_t)(inferred_interval_rounded - observed_interval);
+      const uint32_t abs_imo = (uint32_t)(inferred_minus_observed < 0
+          ? -(int64_t)inferred_minus_observed
+          : (int64_t)inferred_minus_observed);
+      excursion = abs_imo > OCXO_YARDSTICK_GATE_THRESHOLD_CYCLES;
+
+      const uint32_t inferred_endpoint_dwt =
+          (uint32_t)(lane.yardstick_chain_endpoint_q16 >> 16);
+      endpoint_minus_observed =
+          (int32_t)(inferred_endpoint_dwt - observed_dwt);
+
+      // PI loop error: observed minus advanced anchored endpoint, in Q16,
+      // sign-extended from the 48-bit modular endpoint domain.
+      int64_t err_q16 =
+          (int64_t)(((((uint64_t)observed_dwt) << 16) -
+                     lane.yardstick_auth_endpoint_q16) &
+                    YARDSTICK_ENDPOINT_Q16_MASK);
+      if (err_q16 > (int64_t)(YARDSTICK_ENDPOINT_Q16_MASK >> 1)) {
+        err_q16 -= (int64_t)(YARDSTICK_ENDPOINT_Q16_MASK + 1ULL);
+      }
+      auth_error_cycles = (int32_t)(err_q16 >> 16);
+
+      if (excursion) {
+        lane.yardstick_gate_excursion_count++;
+
+        const int32_t coherence = (int32_t)(observed_interval -
+            lane.yardstick_last_excursion_observed_interval_cycles);
+        const uint32_t abs_coherence = (uint32_t)(coherence < 0
+            ? -(int64_t)coherence
+            : (int64_t)coherence);
+        const bool coherent = lane.yardstick_excursion_streak > 0 &&
+            abs_coherence <= OCXO_YARDSTICK_GATE_THRESHOLD_CYCLES;
+        lane.yardstick_excursion_streak++;
+        lane.yardstick_last_excursion_observed_interval_cycles =
+            observed_interval;
+
+        if (coherent &&
+            lane.yardstick_excursion_streak >=
+                OCXO_YARDSTICK_COHERENT_RESEED_STREAK) {
+          lane.yardstick_chain_interval_q16 =
+              ((uint64_t)observed_interval) << 16;
+          lane.yardstick_chain_endpoint_q16 =
+              (((uint64_t)observed_dwt) << 16) & YARDSTICK_ENDPOINT_Q16_MASK;
+          lane.yardstick_auth_interval_q16 =
+              ((uint64_t)observed_interval) << 16;
+          lane.yardstick_auth_endpoint_q16 =
+              (((uint64_t)observed_dwt) << 16) & YARDSTICK_ENDPOINT_Q16_MASK;
+          lane.yardstick_coherent_reseed_count++;
+          lane.yardstick_excursion_streak = 0;
+        }
+
+        // Excursion guard: the observed edge is quarantined evidence; the
+        // anchored rail coasts on pure inference and publishes it.
+        lane.yardstick_auth_excursion_publish_count++;
+        reason = "ocxo_yardstick_excursion_guard";
+      } else {
+        lane.yardstick_gate_agree_count++;
+        lane.yardstick_excursion_streak = 0;
+
+        lane.yardstick_sum_inferred_minus_observed_cycles +=
+            (int64_t)inferred_minus_observed;
+        if (abs_imo > lane.yardstick_max_abs_inferred_minus_observed_cycles) {
+          lane.yardstick_max_abs_inferred_minus_observed_cycles = abs_imo;
+        }
+        if (lane.yardstick_gate_agree_count == 1U ||
+            endpoint_minus_observed <
+                lane.yardstick_endpoint_minus_observed_min_cycles) {
+          lane.yardstick_endpoint_minus_observed_min_cycles =
+              endpoint_minus_observed;
+        }
+        if (lane.yardstick_gate_agree_count == 1U ||
+            endpoint_minus_observed >
+                lane.yardstick_endpoint_minus_observed_max_cycles) {
+          lane.yardstick_endpoint_minus_observed_max_cycles =
+              endpoint_minus_observed;
+        }
+
+        // Anchor correction (agree seconds only).
+        lane.yardstick_auth_endpoint_q16 =
+            (uint64_t)((int64_t)lane.yardstick_auth_endpoint_q16 +
+                       (err_q16 >> OCXO_YARDSTICK_ANCHOR_P_SHIFT)) &
+            YARDSTICK_ENDPOINT_Q16_MASK;
+        lane.yardstick_auth_interval_q16 =
+            (uint64_t)((int64_t)lane.yardstick_auth_interval_q16 +
+                       (err_q16 >> OCXO_YARDSTICK_ANCHOR_I_SHIFT));
+        lane.yardstick_auth_anchor_correction_count++;
+        anchor_applied = true;
+
+        lane.yardstick_auth_agree_publish_count++;
+        reason = stale ? "ocxo_yardstick_stale_hold" : "ocxo_yardstick";
+      }
+      if (stale && !excursion) {
+        lane.yardstick_auth_stale_publish_count++;
+        reason = "ocxo_yardstick_stale_hold";
+      }
+    } else if (stale) {
+      lane.yardstick_auth_stale_publish_count++;
+      reason = "ocxo_yardstick_stale_hold";
+    } else {
+      reason = "ocxo_yardstick";
+    }
+
+    published_dwt =
+        (uint32_t)((lane.yardstick_auth_endpoint_q16 + 0x8000ULL) >> 16);
+    lane.yardstick_auth_publish_count++;
+    lane.yardstick_update_count++;
+  }
+
+  // Consume the yardstick step and advance this rail's observed baseline.
+  if (y_usable && pps_seq_delta != 0) {
+    lane.yardstick_last_used_pps_sequence = y.sequence;
+    lane.yardstick_last_used_pps_sequence_valid = true;
+  }
+  lane.yardstick_prev_observed_dwt = observed_dwt;
+  lane.yardstick_prev_observed_valid = true;
+
+  lane.yardstick_last_valid = lane.yardstick_chain_valid;
+  lane.yardstick_last_stale = stale;
+  lane.yardstick_last_excursion = excursion;
+  lane.yardstick_last_g_now_cycles = y_usable ? y.interval_now_cycles : 0U;
+  lane.yardstick_last_g_prev_cycles = y_usable ? y.interval_prev_cycles : 0U;
+  lane.yardstick_last_pps_seq_delta = pps_seq_delta;
+  lane.yardstick_last_inferred_interval_cycles = inferred_interval_rounded;
+  lane.yardstick_last_observed_interval_cycles = observed_interval;
+  lane.yardstick_last_inferred_minus_observed_cycles = inferred_minus_observed;
+  lane.yardstick_last_endpoint_minus_observed_cycles = endpoint_minus_observed;
+  lane.yardstick_auth_last_error_cycles = auth_error_cycles;
+  lane.yardstick_auth_last_published_dwt = published_dwt;
+
+  if (out_diag) {
+    out_diag->yardstick_valid = lane.yardstick_chain_valid;
+    out_diag->yardstick_stale = stale;
+    out_diag->yardstick_seeded_this_event = seeded;
+    out_diag->yardstick_excursion = excursion;
+    out_diag->yardstick_pps_sequence = y_usable ? y.sequence : 0U;
+    out_diag->yardstick_pps_seq_delta = pps_seq_delta;
+    out_diag->yardstick_g_now_cycles = y_usable ? y.interval_now_cycles : 0U;
+    out_diag->yardstick_g_prev_cycles = y_usable ? y.interval_prev_cycles : 0U;
+    out_diag->yardstick_inferred_interval_cycles = inferred_interval_rounded;
+    out_diag->yardstick_observed_interval_cycles = observed_interval;
+    out_diag->yardstick_inferred_minus_observed_cycles =
+        inferred_minus_observed;
+    out_diag->yardstick_inferred_endpoint_dwt =
+        (uint32_t)(lane.yardstick_chain_endpoint_q16 >> 16);
+    out_diag->yardstick_inferred_endpoint_frac_q16 =
+        (uint32_t)(lane.yardstick_chain_endpoint_q16 & 0xFFFFULL);
+    out_diag->yardstick_endpoint_minus_observed_cycles =
+        endpoint_minus_observed;
+    out_diag->yardstick_gate_threshold_cycles =
+        OCXO_YARDSTICK_GATE_THRESHOLD_CYCLES;
+    out_diag->yardstick_gate_agree_count = lane.yardstick_gate_agree_count;
+    out_diag->yardstick_gate_excursion_count =
+        lane.yardstick_gate_excursion_count;
+    out_diag->yardstick_authority = OCXO_YARDSTICK_DWT_AUTHORITY_ENABLED;
+    out_diag->yardstick_auth_endpoint_dwt =
+        (uint32_t)(lane.yardstick_auth_endpoint_q16 >> 16);
+    out_diag->yardstick_auth_endpoint_frac_q16 =
+        (uint32_t)(lane.yardstick_auth_endpoint_q16 & 0xFFFFULL);
+    out_diag->yardstick_auth_error_cycles = auth_error_cycles;
+    out_diag->yardstick_auth_anchor_applied = anchor_applied;
+  }
+
+  if (out_reason) *out_reason = reason;
+  return published_dwt;
+}
+
 static bool spincatch_current_target_for_kind(interrupt_subscriber_kind_t kind,
                                               uint32_t& target_counter32) {
   target_counter32 = 0;
@@ -5840,9 +6480,25 @@ static void ocxo_apply_perishable_fact_deferred(
       ? (fact.target_counter32 - lane->witness_previous_event_counter32)
       : 0U;
 
-  const uint32_t published_dwt = ocxo_lane_ema_predict_dwt(
+  // EMA rail (diagnostic since Stage 2).  Still computed every second with
+  // full gate/adjacency audit so TIMEBASE can compare it against the
+  // yardstick authority; its endpoint no longer publishes.
+  const uint32_t ema_published_dwt = ocxo_lane_ema_predict_dwt(
       *lane, observed_dwt, counter_adjacency_valid, counter_delta_ticks,
       &ema_synthetic, &ema_error_cycles, &ema_diag);
+
+  // PPS-Yardstick anchored authority rail (Stage 2).  Free chain remains the
+  // physics audit; the anchored PI rail produces the published endpoint.
+  const char* yardstick_reason = "ocxo_yardstick_init";
+  const uint32_t yardstick_published_dwt = ocxo_lane_yardstick_observe(
+      *lane, observed_dwt, counter_adjacency_valid, counter_delta_ticks,
+      &ema_diag, &yardstick_reason);
+
+  const uint32_t published_dwt = OCXO_YARDSTICK_DWT_AUTHORITY_ENABLED
+      ? yardstick_published_dwt
+      : ema_published_dwt;
+  const bool published_synthetic = (published_dwt != observed_dwt);
+  ema_diag.ema_dwt_at_event = ema_published_dwt;
 
   ocxo_qtimer_diag_record(ctx,
                           fact.isr_entry_dwt_raw,
@@ -5855,7 +6511,7 @@ static void ocxo_apply_perishable_fact_deferred(
                           fact.target_delta_mod65536_ticks,
                           fact.target_low16,
                           fact.service_counter_low16,
-                          ema_synthetic);
+                          published_synthetic);
 
   lane->witness_fire_count++;
   lane->irq_count++;
@@ -5883,17 +6539,27 @@ static void ocxo_apply_perishable_fact_deferred(
   lane->witness_previous_event_counter32 = fact.target_counter32;
   lane->witness_previous_event_counter32_valid = true;
 
-  ema_diag.candidate = ema_synthetic;
-  ema_diag.synthetic = ema_synthetic;
+  // Truthful authority audit.  Under yardstick authority the published
+  // endpoint, its error against the observed edge, the gate threshold, and
+  // the reason string all describe the yardstick rail; the EMA rail's
+  // endpoint and full interval-gate audit remain in the diag as diagnostics.
+  ema_diag.candidate = published_synthetic;
+  ema_diag.synthetic = published_synthetic;
   ema_diag.predicted_dwt = published_dwt;
   ema_diag.used_dwt = published_dwt;
-  ema_diag.error_cycles = ema_error_cycles;
-  ema_diag.threshold_cycles = OCXO_EMA_INTERVAL_GATE_THRESHOLD_CYCLES;
-  ema_diag.reason = ema_diag.interval_adjacency_rejected
-      ? "ocxo_counter_adjacency_reject_projected"
-      : (ema_diag.interval_sample_rejected
-            ? "ocxo_ema_gate_reject"
-            : (ema_synthetic ? "ocxo_ema" : "ocxo_ema_init"));
+  if (OCXO_YARDSTICK_DWT_AUTHORITY_ENABLED) {
+    ema_diag.error_cycles = (int32_t)(published_dwt - observed_dwt);
+    ema_diag.threshold_cycles = OCXO_YARDSTICK_GATE_THRESHOLD_CYCLES;
+    ema_diag.reason = yardstick_reason;
+  } else {
+    ema_diag.error_cycles = ema_error_cycles;
+    ema_diag.threshold_cycles = OCXO_EMA_INTERVAL_GATE_THRESHOLD_CYCLES;
+    ema_diag.reason = ema_diag.interval_adjacency_rejected
+        ? "ocxo_counter_adjacency_reject_projected"
+        : (ema_diag.interval_sample_rejected
+              ? "ocxo_ema_gate_reject"
+              : (ema_synthetic ? "ocxo_ema" : "ocxo_ema_init"));
+  }
 
   // We are already in TimePop ASAP/foreground context. Dispatch the authored
   // rollover OCXO edge directly from the fact drain.
@@ -7287,6 +7953,13 @@ static void interrupt_handoff_process_pps(const pps_capture_packet_t& packet) {
                           expected_dwt_delta != 0,
                           expected_dwt_delta,
                           observed_dwt_delta);
+
+    // Author the PPS yardstick pair for the OCXO yardstick inference rail.
+    // observed_dwt_delta is the unquantized GPIO-path one-second interval;
+    // observed_counter_delta qualifies it as one nominal VCLOCK second.
+    pps_yardstick_record_interval(pps.sequence,
+                                  observed_dwt_delta,
+                                  observed_counter_delta);
   }
   g_isr_sanity_pps_prev_valid = true;
   g_isr_sanity_pps_prev_counter32 = observed_counter32;
@@ -7484,6 +8157,7 @@ bool interrupt_start(interrupt_subscriber_kind_t kind) {
   lane->phase_bootstrapped = true;
   lane->tick_mod_1000 = 0;
   ocxo_lane_ema_reset(*lane);
+  ocxo_lane_yardstick_reset(*lane);
 
   // OCXO lanes now own only their local one-second edge compare.  Start the
   // one-second edge compare from the installed logical grid when available;
@@ -7893,6 +8567,7 @@ static void runtime_reset_vclock_heartbeat_state(void) {
   g_isr_sanity_pps_prev_valid = false;
   g_isr_sanity_pps_prev_counter32 = 0;
   g_isr_sanity_pps_prev_dwt = 0;
+  pps_yardstick_reset();
   g_spinidle_pps_last_capture = spinidle_isr_capture_t{};
   g_spinidle_timepop_last_capture = spinidle_isr_capture_t{};
   isr_raw_dwt_probe_reset_all();
@@ -8692,6 +9367,10 @@ static FLASHMEM void add_runtime_payload(Payload& p) {
   p.add("ocxo_ema_dwt_authority_enabled", OCXO_EMA_DWT_AUTHORITY_ENABLED);
   p.add("ocxo_ema_alpha_numerator", OCXO_EMA_ALPHA_NUMERATOR);
   p.add("ocxo_ema_alpha_denominator", OCXO_EMA_ALPHA_DENOMINATOR);
+  p.add("ocxo_yardstick_dwt_authority_enabled", OCXO_YARDSTICK_DWT_AUTHORITY_ENABLED);
+  p.add("ocxo_yardstick_gate_threshold_cycles", OCXO_YARDSTICK_GATE_THRESHOLD_CYCLES);
+  p.add("ocxo_yardstick_anchor_p_shift", OCXO_YARDSTICK_ANCHOR_P_SHIFT);
+  p.add("ocxo_yardstick_anchor_i_shift", OCXO_YARDSTICK_ANCHOR_I_SHIFT);
   p.add("ocxo1_quiet_phase_ticks", OCXO1_QUIET_PHASE_TICKS);
   p.add("ocxo1_quiet_phase_us", ocxo_phase_ticks_to_us(OCXO1_QUIET_PHASE_TICKS));
   p.add("ocxo2_quiet_phase_ticks", OCXO2_QUIET_PHASE_TICKS);
@@ -8859,6 +9538,10 @@ static FLASHMEM void add_vclock_heartbeat_payload(Payload& p) {
   p.add("ocxo_ema_dwt_authority_enabled", OCXO_EMA_DWT_AUTHORITY_ENABLED);
   p.add("ocxo_ema_alpha_numerator", OCXO_EMA_ALPHA_NUMERATOR);
   p.add("ocxo_ema_alpha_denominator", OCXO_EMA_ALPHA_DENOMINATOR);
+  p.add("ocxo_yardstick_dwt_authority_enabled", OCXO_YARDSTICK_DWT_AUTHORITY_ENABLED);
+  p.add("ocxo_yardstick_gate_threshold_cycles", OCXO_YARDSTICK_GATE_THRESHOLD_CYCLES);
+  p.add("ocxo_yardstick_anchor_p_shift", OCXO_YARDSTICK_ANCHOR_P_SHIFT);
+  p.add("ocxo_yardstick_anchor_i_shift", OCXO_YARDSTICK_ANCHOR_I_SHIFT);
   p.add("ocxo_quiet_phase_period_ticks", OCXO_QUIET_PHASE_PERIOD_TICKS);
   p.add("ocxo1_quiet_phase_ticks", OCXO1_QUIET_PHASE_TICKS);
   p.add("ocxo1_quiet_phase_us", ocxo_phase_ticks_to_us(OCXO1_QUIET_PHASE_TICKS));
@@ -10398,6 +11081,92 @@ static FLASHMEM void add_ocxo_lane_ema_section(Payload& p,
   }
 }
 
+static FLASHMEM void add_ocxo_lane_yardstick_section(Payload& p,
+                                      const ocxo_runtime_context_t& ctx) {
+  const ocxo_lane_t& lane = *ctx.lane;
+  payload_prefix_t out(p, ctx.prefix);
+
+  out.add_bool("yardstick_dwt_authority_enabled",
+               OCXO_YARDSTICK_DWT_AUTHORITY_ENABLED);
+  out.add_u32("yardstick_gate_threshold_cycles",
+              OCXO_YARDSTICK_GATE_THRESHOLD_CYCLES);
+  out.add_bool("yardstick_chain_valid", lane.yardstick_chain_valid);
+  out.add_u32("yardstick_update_count", lane.yardstick_update_count);
+  out.add_u32("yardstick_seed_count", lane.yardstick_seed_count);
+  out.add_u32("yardstick_stale_hold_count", lane.yardstick_stale_hold_count);
+  out.add_u32("yardstick_gate_agree_count", lane.yardstick_gate_agree_count);
+  out.add_u32("yardstick_gate_excursion_count",
+              lane.yardstick_gate_excursion_count);
+  out.add_u32("yardstick_excursion_streak", lane.yardstick_excursion_streak);
+  out.add_u32("yardstick_adjacency_reseed_count",
+              lane.yardstick_adjacency_reseed_count);
+  out.add_u32("yardstick_coherent_reseed_count",
+              lane.yardstick_coherent_reseed_count);
+  out.add_bool("yardstick_last_stale", lane.yardstick_last_stale);
+  out.add_bool("yardstick_last_excursion", lane.yardstick_last_excursion);
+  out.add_u32("yardstick_last_g_now_cycles", lane.yardstick_last_g_now_cycles);
+  out.add_u32("yardstick_last_g_prev_cycles",
+              lane.yardstick_last_g_prev_cycles);
+  out.add_u32("yardstick_last_pps_seq_delta",
+              lane.yardstick_last_pps_seq_delta);
+  out.add_u32("yardstick_last_inferred_interval_cycles",
+              lane.yardstick_last_inferred_interval_cycles);
+  out.add_u32("yardstick_last_observed_interval_cycles",
+              lane.yardstick_last_observed_interval_cycles);
+  out.add_i32("yardstick_last_inferred_minus_observed_cycles",
+              lane.yardstick_last_inferred_minus_observed_cycles);
+  out.add_i32("yardstick_last_endpoint_minus_observed_cycles",
+              lane.yardstick_last_endpoint_minus_observed_cycles);
+  out.add_i32("yardstick_endpoint_minus_observed_min_cycles",
+              lane.yardstick_endpoint_minus_observed_min_cycles);
+  out.add_i32("yardstick_endpoint_minus_observed_max_cycles",
+              lane.yardstick_endpoint_minus_observed_max_cycles);
+  out.add_u32("yardstick_max_abs_inferred_minus_observed_cycles",
+              lane.yardstick_max_abs_inferred_minus_observed_cycles);
+
+  // Mean of inferred-minus-observed over agree seconds, in millicycles:
+  // the campaign estimate of chain seed bias.
+  const int64_t agree_n = (int64_t)lane.yardstick_gate_agree_count;
+  const int64_t mean_millicycles = (agree_n > 0)
+      ? (lane.yardstick_sum_inferred_minus_observed_cycles * 1000) / agree_n
+      : 0;
+  out.add_i32("yardstick_mean_inferred_minus_observed_millicycles",
+              (int32_t)mean_millicycles);
+
+  // Stage 2 anchored authority rail.
+  out.add_bool("yardstick_authority_enabled", OCXO_YARDSTICK_DWT_AUTHORITY_ENABLED);
+  out.add_u32("yardstick_anchor_p_shift", OCXO_YARDSTICK_ANCHOR_P_SHIFT);
+  out.add_u32("yardstick_anchor_i_shift", OCXO_YARDSTICK_ANCHOR_I_SHIFT);
+  out.add_bool("yardstick_auth_valid", lane.yardstick_auth_valid);
+  out.add_u32("yardstick_auth_publish_count", lane.yardstick_auth_publish_count);
+  out.add_u32("yardstick_auth_agree_publish_count",
+              lane.yardstick_auth_agree_publish_count);
+  out.add_u32("yardstick_auth_excursion_publish_count",
+              lane.yardstick_auth_excursion_publish_count);
+  out.add_u32("yardstick_auth_stale_publish_count",
+              lane.yardstick_auth_stale_publish_count);
+  out.add_u32("yardstick_auth_observed_fallback_count",
+              lane.yardstick_auth_observed_fallback_count);
+  out.add_u32("yardstick_auth_anchor_correction_count",
+              lane.yardstick_auth_anchor_correction_count);
+  out.add_i32("yardstick_auth_last_error_cycles",
+              lane.yardstick_auth_last_error_cycles);
+  out.add_u32("yardstick_auth_last_published_dwt",
+              lane.yardstick_auth_last_published_dwt);
+
+  // Shared PPS yardstick store state.
+  pps_yardstick_snapshot_t y{};
+  const bool y_loaded = pps_yardstick_load(y);
+  out.add_bool("pps_yardstick_loaded", y_loaded);
+  out.add_bool("pps_yardstick_valid", y.valid);
+  out.add_u32("pps_yardstick_sequence", y.sequence);
+  out.add_u32("pps_yardstick_interval_now_cycles", y.interval_now_cycles);
+  out.add_u32("pps_yardstick_interval_prev_cycles", y.interval_prev_cycles);
+  out.add_u32("pps_yardstick_accept_count", y.accept_count);
+  out.add_u32("pps_yardstick_reject_count", y.reject_count);
+  out.add_u32("pps_yardstick_reset_count", y.reset_count);
+}
+
 static FLASHMEM void add_ocxo_lane_scheduler_section(Payload& p,
                                             const ocxo_runtime_context_t& ctx) {
   const ocxo_lane_t& lane = *ctx.lane;
@@ -10422,6 +11191,8 @@ static FLASHMEM bool add_ocxo_lane_section(Payload& p,
     add_ocxo_lane_summary_section(p, ctx);
   } else if (report_lane_section_is(section, "ema")) {
     add_ocxo_lane_ema_section(p, ctx);
+  } else if (report_lane_section_is(section, "yardstick")) {
+    add_ocxo_lane_yardstick_section(p, ctx);
   } else if (report_lane_section_is(section, "service")) {
     add_ocxo_witness_service_payload(out, *ctx.lane);
   } else if (report_lane_section_is(section, "scheduler")) {
