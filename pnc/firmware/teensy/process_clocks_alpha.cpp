@@ -172,6 +172,14 @@ static volatile uint32_t g_vclock_event_count = 0;
 // The DAC target remains a real-valued control/persistence surface, but the
 // AD5693R receives only the nearest static integer code.  There is no
 // fractional-code realization layer in this build.
+//
+// Diagnostic kill switch: when false, CLOCKS may still retain DAC intent in
+// memory/reporting, but it must not initialize, write, update, latch, or
+// otherwise transact with the physical AD5693R DACs.  This is deliberately
+// stronger than disabling dithering: it makes DAC voltage authorship impossible
+// inside firmware so OCXO residual tests can isolate whether any DAC touch
+// perturbs the analog/control-voltage environment.
+static constexpr bool OCXO_DAC_HARDWARE_TOUCH_ENABLED = true;
 
 static ocxo_dac_state_t make_default_ocxo_dac_state() {
   ocxo_dac_state_t s = {};
@@ -246,6 +254,21 @@ bool ocxo_dac_write_hw_code(ocxo_dac_state_t& s,
   if ((uint32_t)hw_code < s.dac_min) hw_code = (uint16_t)s.dac_min;
   if ((uint32_t)hw_code > s.dac_max) hw_code = (uint16_t)s.dac_max;
   s.io_last_attempted_hw_code = hw_code;
+
+  if (!OCXO_DAC_HARDWARE_TOUCH_ENABLED) {
+    // Diagnostic no-touch mode:
+    //   - no ad5693r_init() requirement
+    //   - no I2C write_input
+    //   - no DAC update/latch
+    //   - no claim that the physical DAC code changed
+    //
+    // Return success so START/SET_DAC/servo can proceed while the hardware
+    // output remains whatever the board/power state left it at.
+    s.io_last_write_ok = true;
+    s.io_last_failure_stage = 0;
+    (void)latch_fault;
+    return true;
+  }
 
   if (hw_code == s.dac_hw_code) {
     s.io_last_write_ok = true;
@@ -3810,15 +3833,29 @@ void process_clocks_init(void) {
   // edge and its epoch-ready capture packet.
   interrupt_request_pps_rebootstrap();
 
-  g_ad5693r_init_ok = ad5693r_init();
+  g_ad5693r_init_ok = OCXO_DAC_HARDWARE_TOUCH_ENABLED
+      ? ad5693r_init()
+      : false;
 
   ocxo_dac_io_reset(ocxo1_dac);
   ocxo_dac_io_reset(ocxo2_dac);
   ocxo_dac_predictor_reset(ocxo1_dac);
   ocxo_dac_predictor_reset(ocxo2_dac);
 
-  (void)ocxo_dac_set(ocxo1_dac, (double)AD5693R_DAC_DEFAULT);
-  (void)ocxo_dac_set(ocxo2_dac, (double)AD5693R_DAC_DEFAULT);
+  if (OCXO_DAC_HARDWARE_TOUCH_ENABLED) {
+    (void)ocxo_dac_set(ocxo1_dac, (double)AD5693R_DAC_DEFAULT);
+    (void)ocxo_dac_set(ocxo2_dac, (double)AD5693R_DAC_DEFAULT);
+  } else {
+    // Memory-only startup intent.  Do not touch DAC hardware and do not
+    // report an I/O fault merely because this diagnostic build refuses all
+    // DAC transactions.
+    ocxo1_dac.dac_fractional = (double)AD5693R_DAC_DEFAULT;
+    ocxo2_dac.dac_fractional = (double)AD5693R_DAC_DEFAULT;
+    ocxo1_dac.io_last_write_ok = true;
+    ocxo2_dac.io_last_write_ok = true;
+    ocxo1_dac.io_last_failure_stage = 0;
+    ocxo2_dac.io_last_failure_stage = 0;
+  }
   pinMode(GNSS_LOCK_PIN, INPUT);
 
   subscribe_clock(interrupt_subscriber_kind_t::VCLOCK, vclock_callback);
