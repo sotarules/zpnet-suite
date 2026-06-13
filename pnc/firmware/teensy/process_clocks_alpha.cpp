@@ -541,6 +541,11 @@ struct alpha_lane_forensics_store_t {
   uint64_t bridge_gnss_ns_between_edges = 0;
   int64_t  bridge_residual_ns = 0;
   bool     bridge_interval_valid = false;
+  bool     bridge_anchored = false;
+  int32_t  bridge_phi_cycles = 0;
+  uint32_t bridge_span_cycles = 0;
+  uint32_t bridge_resolved_count = 0;
+  uint32_t bridge_fallback_count = 0;
 
   uint64_t ns_between_edges = 0;
   uint32_t dwt_cycles_between_edges = 0;
@@ -1076,11 +1081,64 @@ static alpha_lane_logical_ticks_t g_ocxo2_ticks64 = {};
 // counter-ticks × 100 ns and not ideal +1e9-per-edge nominal ledgers. The raw
 // tick ledger remains the identity surface. The measured ledger advances by
 // the projected GNSS duration between consecutive OCXO one-second edges.
+// ============================================================================
+// GNSS bridge anchors: bookend interpolation for the science residual
+// ============================================================================
+//
+// The OCXO measured-second math previously dead-reckoned: it converted the
+// ENTIRE ~1.008e9-cycle OCXO second to nanoseconds through one raw, possibly
+// stale cycles-per-second sample, and accumulated the result into a ledger
+// that GNSS truth never re-entered.  Any mismatch between that single cps
+// sample and the true average XTAL rate over the OCXO's own second landed
+// one-for-one (cycles ~= ns) in the science residual -- common-mode across
+// both lanes (same sample), thermally correlated, +/-5..14 ns at slope
+// reversals (Zero3).  Two ovens were blamed for a naked crystal.
+//
+// The replacement is the bookend construction: per second we record one
+// bridge anchor -- the physical PPS witness DWT paired with its exact GNSS
+// nanosecond coordinate (epoch + k*1e9; GNSS seconds are truth by
+// definition).  An OCXO edge's GNSS-ns is then interpolated between the two
+// anchors that BRACKET it, using the cps measured across that very bracket:
+//
+//   ns(E) = ns(A_n) + (E - dwt(A_n)) * (ns(A_n+1) - ns(A_n))
+//                                    / (dwt(A_n+1) - dwt(A_n))
+//
+// Anchor-to-anchor distance contributes exactly k*1e9 with ZERO ruler
+// dependence; the wandering XTAL touches only the short phase stub, scaled
+// by the phase fraction.  Each bookend is nailed to ~a cycle, the measured
+// ledger is computed absolutely (errors no longer integrate), and Teensy
+// thermal drift is neutralized by construction.  The closing anchor arrives
+// one second after the edge, so resolved measurements lag one second --
+// which costs the Welford science nothing.
+struct alpha_bridge_anchor_t {
+  bool     valid = false;
+  uint32_t dwt = 0;
+  uint64_t gnss_ns = 0;
+};
+static constexpr uint32_t ALPHA_BRIDGE_ANCHOR_RING_SIZE = 4U;
+// A pending edge unresolved after this many subsequent OCXO edges falls back
+// to legacy ratio conversion (GNSS holdover), truthfully counted.
+static constexpr uint32_t ALPHA_BRIDGE_PENDING_MAX_AGE_EVENTS = 3U;
+static alpha_bridge_anchor_t g_bridge_anchors[ALPHA_BRIDGE_ANCHOR_RING_SIZE] = {};
+static uint32_t g_bridge_anchor_total = 0;
+
 struct alpha_measured_ns_clock_t {
   bool     initialized = false;
-  uint64_t ns_at_edge = 0;
-  uint32_t dwt_at_edge = 0;
+  uint64_t ns_at_edge = 0;        // GNSS ns at the most recent RESOLVED edge
+  uint32_t dwt_at_edge = 0;       // DWT of the most recent RESOLVED edge
   uint64_t dwt64_at_edge = 0;
+
+  // Newest edge awaiting its closing bridge anchor (one-second resolution lag).
+  bool     pending_valid = false;
+  uint32_t pending_edge_dwt = 0;
+  uint32_t pending_age_events = 0;
+
+  // Bridge evidence.
+  bool     last_resolved_via_bridge = false;
+  uint32_t bridge_resolved_count = 0;
+  uint32_t bridge_fallback_count = 0;
+  int32_t  bridge_last_phi_cycles = 0;
+  uint32_t bridge_last_span_cycles = 0;
 };
 
 static alpha_measured_ns_clock_t g_ocxo1_measured_ns = {};
@@ -1425,6 +1483,58 @@ static int64_t alpha_dwt_cycles_to_gnss_ns_i64(int64_t dwt_cycles) {
   return (dwt_cycles >= 0) ? (int64_t)abs_ns : -(int64_t)abs_ns;
 }
 
+static void alpha_bridge_anchor_record(uint32_t dwt, uint64_t gnss_ns) {
+  g_bridge_anchors[g_bridge_anchor_total % ALPHA_BRIDGE_ANCHOR_RING_SIZE] =
+      alpha_bridge_anchor_t{true, dwt, gnss_ns};
+  g_bridge_anchor_total++;
+}
+
+static void alpha_bridge_anchor_reset(void) {
+  for (uint32_t i = 0; i < ALPHA_BRIDGE_ANCHOR_RING_SIZE; i++) {
+    g_bridge_anchors[i] = alpha_bridge_anchor_t{};
+  }
+  g_bridge_anchor_total = 0;
+}
+
+// Interpolate the GNSS nanosecond coordinate of edge_dwt between the two
+// recorded anchors that bracket it.  Returns false if no bracketing pair is
+// available yet (the closing anchor has not arrived, or anchors are stale).
+static bool alpha_bridge_interpolate_gnss_ns(uint32_t edge_dwt,
+                                             uint64_t* out_gnss_ns,
+                                             int32_t* out_phi_cycles,
+                                             uint32_t* out_span_cycles) {
+  if (g_bridge_anchor_total < 2U) return false;
+  const uint32_t available =
+      g_bridge_anchor_total < ALPHA_BRIDGE_ANCHOR_RING_SIZE
+          ? g_bridge_anchor_total
+          : ALPHA_BRIDGE_ANCHOR_RING_SIZE;
+  // Walk consecutive anchor pairs oldest -> newest.
+  for (uint32_t k = g_bridge_anchor_total - available;
+       k + 1U < g_bridge_anchor_total; k++) {
+    const alpha_bridge_anchor_t& lo =
+        g_bridge_anchors[k % ALPHA_BRIDGE_ANCHOR_RING_SIZE];
+    const alpha_bridge_anchor_t& hi =
+        g_bridge_anchors[(k + 1U) % ALPHA_BRIDGE_ANCHOR_RING_SIZE];
+    if (!lo.valid || !hi.valid) continue;
+    const int32_t from_lo = alpha_dwt32_signed_delta_near(lo.dwt, edge_dwt);
+    const int32_t to_hi = alpha_dwt32_signed_delta_near(edge_dwt, hi.dwt);
+    if (from_lo < 0 || to_hi <= 0) continue;
+    const uint32_t span_cycles = hi.dwt - lo.dwt;
+    if (span_cycles == 0 || hi.gnss_ns <= lo.gnss_ns) continue;
+    const uint64_t span_ns = hi.gnss_ns - lo.gnss_ns;
+    const uint64_t phi = (uint64_t)(uint32_t)from_lo;
+    const uint64_t interp_ns =
+        lo.gnss_ns +
+        (phi * span_ns + (uint64_t)span_cycles / 2ULL) /
+            (uint64_t)span_cycles;
+    if (out_gnss_ns) *out_gnss_ns = interp_ns;
+    if (out_phi_cycles) *out_phi_cycles = from_lo;
+    if (out_span_cycles) *out_span_cycles = span_cycles;
+    return true;
+  }
+  return false;
+}
+
 static uint32_t alpha_projection_signed_window_cycles(void) {
   const uint32_t cps = dwt_effective_cycles_per_pps_vclock_second();
   const uint32_t base = cps ? cps : (uint32_t)DWT_EXPECTED_PER_PPS;
@@ -1764,6 +1874,13 @@ static bool alpha_ocxo_pps_projection_build(
                                                 pps_dwt_at_edge,
                                                 edge0.dwt_at_edge,
                                                 offset_jump);
+      // Heal: adopt the new offset as the baseline so this guard rejects a
+      // single discontinuity, not every subsequent second.  A non-healing
+      // latch here turned a one-time ledger-units change into a permanent
+      // projection outage (Envelope1).  Defenseless doctrine: a guard may
+      // veto one bad row, never silently disable the surface forever.
+      guard->last_projected_minus_measured_ns = projected_minus_existing;
+      guard->last_projected_minus_measured_jump_ns = offset_jump;
       alpha_ocxo_pps_projection_set_invalid(
           clock,
           ALPHA_OCXO_PPS_PROJECTION_INVALID_TARGET_OUT_OF_WINDOW,
@@ -2074,6 +2191,7 @@ static bool alpha_ticks64_project_counter32(time_clock_id_t clock,
 }
 
 static void alpha_measured_ns_reset_all(void) {
+  alpha_bridge_anchor_reset();
   g_ocxo1_measured_ns = alpha_measured_ns_clock_t{};
   g_ocxo2_measured_ns = alpha_measured_ns_clock_t{};
 }
@@ -2109,33 +2227,94 @@ static uint64_t alpha_ocxo_apply_measured_second(time_clock_id_t clock,
     return 0;
   }
 
-  if (!m->initialized) {
-    m->initialized = true;
-    m->dwt_at_edge = raw_edge_dwt;
-    m->dwt64_at_edge = clocks_dwt_cycles_at_dwt(raw_edge_dwt);
-    m->ns_at_edge = alpha_ocxo_seed_ns_at_first_edge(raw_edge_dwt);
-    if (out_dwt_cycles) *out_dwt_cycles = 0;
-    if (out_real_interval_ns) *out_real_interval_ns = 0;
-    if (out_residual_fast_ns) *out_residual_fast_ns = 0;
-    return m->ns_at_edge;
+  if (out_dwt_cycles) *out_dwt_cycles = 0;
+  if (out_real_interval_ns) *out_real_interval_ns = 0;
+  if (out_residual_fast_ns) *out_residual_fast_ns = 0;
+
+  // Resolve the pending edge against the bridge anchors.  The closing
+  // anchor for edge E arrives one second after E, and always before the
+  // next OCXO edge in normal operation, so resolution happens here with a
+  // one-edge lag.  Resolved coordinates are ABSOLUTE GNSS interpolations:
+  // the measured ledger is re-anchored to truth every second and errors do
+  // not integrate.
+  if (m->pending_valid) {
+    uint64_t pending_gnss_ns = 0;
+    int32_t phi_cycles = 0;
+    uint32_t span_cycles = 0;
+    const bool bracketed = alpha_bridge_interpolate_gnss_ns(
+        m->pending_edge_dwt, &pending_gnss_ns, &phi_cycles, &span_cycles);
+
+    bool resolve_legacy = false;
+    if (!bracketed) {
+      m->pending_age_events++;
+      if (m->pending_age_events >= ALPHA_BRIDGE_PENDING_MAX_AGE_EVENTS) {
+        // GNSS holdover: anchors stalled.  Fall back to legacy whole-second
+        // ratio conversion for this edge, truthfully counted.  This is the
+        // pre-bridge math and carries its ruler exposure; the counter is the
+        // audit trail.
+        resolve_legacy = true;
+      }
+    }
+
+    if (bracketed || resolve_legacy) {
+      uint64_t resolved_ns = pending_gnss_ns;
+      if (resolve_legacy) {
+        const uint32_t legacy_cycles = m->pending_edge_dwt - m->dwt_at_edge;
+        resolved_ns = m->initialized
+            ? m->ns_at_edge + alpha_dwt_cycles_to_gnss_ns(legacy_cycles)
+            : alpha_ocxo_seed_ns_at_first_edge(m->pending_edge_dwt);
+        m->bridge_fallback_count++;
+        m->last_resolved_via_bridge = false;
+      } else {
+        m->bridge_resolved_count++;
+        m->last_resolved_via_bridge = true;
+        m->bridge_last_phi_cycles = phi_cycles;
+        m->bridge_last_span_cycles = span_cycles;
+      }
+
+      if (m->initialized) {
+        const uint32_t dwt_cycles = m->pending_edge_dwt - m->dwt_at_edge;
+        if (resolved_ns > m->ns_at_edge) {
+          const uint64_t real_interval_ns = resolved_ns - m->ns_at_edge;
+          const int64_t residual_fast_ns =
+              (int64_t)NS_PER_SECOND_U64 - (int64_t)real_interval_ns;
+          if (out_dwt_cycles) *out_dwt_cycles = dwt_cycles;
+          if (out_real_interval_ns) *out_real_interval_ns = real_interval_ns;
+          if (out_residual_fast_ns) *out_residual_fast_ns = residual_fast_ns;
+        } else {
+          clocks_watchdog_anomaly("alpha_bridge_nonmonotonic_ns",
+                                  (uint32_t)((uint8_t)clock),
+                                  m->pending_edge_dwt,
+                                  (uint32_t)resolved_ns,
+                                  (uint32_t)m->ns_at_edge);
+        }
+        m->dwt64_at_edge += (uint64_t)dwt_cycles;
+      } else {
+        m->initialized = true;
+        m->dwt64_at_edge = clocks_dwt_cycles_at_dwt(m->pending_edge_dwt);
+      }
+      m->ns_at_edge = resolved_ns;
+      m->dwt_at_edge = m->pending_edge_dwt;
+      m->pending_valid = false;
+      m->pending_age_events = 0;
+    }
   }
 
-  const uint32_t dwt_cycles = raw_edge_dwt - m->dwt_at_edge;
-  const uint64_t dwt64_at_edge = m->dwt64_at_edge + (uint64_t)dwt_cycles;
-  const uint64_t real_interval_ns = alpha_dwt_cycles_to_gnss_ns(dwt_cycles);
-  const int64_t residual_fast_ns =
-      (int64_t)NS_PER_SECOND_U64 - (int64_t)real_interval_ns;
+  // Stash this edge as the new pending observation.  If an old pending is
+  // still unresolved (should not happen below the age guard), force the
+  // legacy path next call rather than silently dropping evidence.
+  if (!m->pending_valid) {
+    m->pending_edge_dwt = raw_edge_dwt;
+    m->pending_valid = true;
+    m->pending_age_events = 0;
+  } else {
+    m->pending_age_events = ALPHA_BRIDGE_PENDING_MAX_AGE_EVENTS;
+  }
 
-  // The measured OCXO ledger is the accumulated GNSS duration between OCXO
-  // one-second edges.  This is intentionally not counter ticks × 100 ns and
-  // not an ideal +1e9-per-edge nominal ledger.
-  m->ns_at_edge += real_interval_ns;
-  m->dwt_at_edge = raw_edge_dwt;
-  m->dwt64_at_edge = dwt64_at_edge;
-
-  if (out_dwt_cycles) *out_dwt_cycles = dwt_cycles;
-  if (out_real_interval_ns) *out_real_interval_ns = real_interval_ns;
-  if (out_residual_fast_ns) *out_residual_fast_ns = residual_fast_ns;
+  if (!m->initialized) {
+    // Display-only continuity during the one-to-two second bridge warm-up.
+    return alpha_ocxo_seed_ns_at_first_edge(raw_edge_dwt);
+  }
   return m->ns_at_edge;
 }
 
@@ -2218,6 +2397,11 @@ static void alpha_forensics_reset_store(alpha_lane_forensics_store_t& s) {
   s.bridge_gnss_ns_between_edges = 0;
   s.bridge_residual_ns = 0;
   s.bridge_interval_valid = false;
+  s.bridge_anchored = false;
+  s.bridge_phi_cycles = 0;
+  s.bridge_span_cycles = 0;
+  s.bridge_resolved_count = 0;
+  s.bridge_fallback_count = 0;
   s.ns_between_edges = 0;
   s.dwt_cycles_between_edges = 0;
   s.dwt_synthetic = false;
@@ -2432,6 +2616,11 @@ static void alpha_forensics_publish(time_clock_id_t clock_id,
   s->bridge_gnss_ns_between_edges = bridge_gnss_ns_between_edges;
   s->bridge_residual_ns = bridge_residual_ns;
   s->bridge_interval_valid = bridge_interval_valid;
+  s->bridge_anchored = meas.bridge_anchored;
+  s->bridge_phi_cycles = meas.bridge_phi_cycles;
+  s->bridge_span_cycles = meas.bridge_span_cycles;
+  s->bridge_resolved_count = meas.bridge_resolved_count;
+  s->bridge_fallback_count = meas.bridge_fallback_count;
   s->ns_between_edges = meas.gnss_ns_between_edges;
   s->dwt_cycles_between_edges = meas.dwt_cycles_between_edges;
   s->second_residual_ns = meas.second_residual_ns;
@@ -2743,6 +2932,11 @@ bool clocks_alpha_lane_forensics(time_clock_id_t clock,
     out->bridge_gnss_ns_between_edges = s->bridge_gnss_ns_between_edges;
     out->bridge_residual_ns = s->bridge_residual_ns;
     out->bridge_interval_valid = s->bridge_interval_valid;
+    out->bridge_anchored = s->bridge_anchored;
+    out->bridge_phi_cycles = s->bridge_phi_cycles;
+    out->bridge_span_cycles = s->bridge_span_cycles;
+    out->bridge_resolved_count = s->bridge_resolved_count;
+    out->bridge_fallback_count = s->bridge_fallback_count;
     out->ns_between_edges = s->ns_between_edges;
     out->dwt_cycles_between_edges = s->dwt_cycles_between_edges;
     out->dwt_synthetic = s->dwt_synthetic;
@@ -3565,11 +3759,25 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
     uint32_t measured_dwt_cycles = 0;
     uint64_t real_interval_ns = 0;
     int64_t residual_fast_ns = 0;
+    // Science edge species: the observed ISR coordinate feeds the bookends.
+    // Its lattice/latency noise is white and unbiased, which the Welford
+    // surfaces average honestly; the published anchored endpoint stays the
+    // subscriber surface.  Long-term ruling (2026-06-12): the lower-envelope
+    // projection replaces this as the science edge once the slope engine
+    // exists.
+    const uint32_t science_edge_dwt =
+        (applied_diag != nullptr && applied_diag->dwt_original_at_event != 0U)
+            ? applied_diag->dwt_original_at_event
+            : applied_event.dwt_at_event;
     ns_now = alpha_ocxo_apply_measured_second(time_clock,
-                                              applied_event.dwt_at_event,
+                                              science_edge_dwt,
                                               &measured_dwt_cycles,
                                               &real_interval_ns,
                                               &residual_fast_ns);
+    // The PPS projection and its sanity guard both speak the bridge-resolved
+    // absolute GNSS ledger; feed the edge history that same species so the
+    // guard compares like with like.  (ns_now is that ledger.)
+    const uint64_t ocxo_ledger_ns_for_history = ns_now;
     alpha_event_flow_note_measured(time_clock, measured_dwt_cycles,
                                    real_interval_ns, residual_fast_ns, ns_now);
 
@@ -3583,7 +3791,7 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
     alpha_ocxo_edge_history_record(time_clock,
                                    applied_event.dwt_at_event,
                                    applied_event.counter32_at_event,
-                                   counter_ns_now,
+                                   ocxo_ledger_ns_for_history,
                                    ns_now,
                                    sample_gnss_available,
                                    sample_gnss_ns_at_event,
@@ -3596,6 +3804,16 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
     gnss_ns_between_edges = real_interval_ns;
     second_residual_ns = residual_fast_ns;
     window_error_ns = -residual_fast_ns;
+
+    const alpha_measured_ns_clock_t* mstore = alpha_measured_ns_store(time_clock);
+    if (mstore) {
+      meas.bridge_anchored =
+          (real_interval_ns != 0) && mstore->last_resolved_via_bridge;
+      meas.bridge_phi_cycles = mstore->bridge_last_phi_cycles;
+      meas.bridge_span_cycles = mstore->bridge_last_span_cycles;
+      meas.bridge_resolved_count = mstore->bridge_resolved_count;
+      meas.bridge_fallback_count = mstore->bridge_fallback_count;
+    }
   } else if (had_previous) {
     const uint64_t previous_bridge_gnss_ns = meas.prev_gnss_ns_at_edge;
     const bool bridge_interval_available =
@@ -3837,6 +4055,22 @@ static bool alpha_sample_all_clocks_at_pps_vclock(const pps_edge_snapshot_t& sna
                                     snap.dwt_at_edge,
                                     vclock_ns,
                                     ocxo2_ns);
+
+  // Record this second's bridge anchor: the physical PPS witness DWT
+  // (unquantized GPIO rail) paired with its GNSS nanosecond coordinate.
+  // vclock_ns is the canonical PPS/VCLOCK ledger value; the physical PPS
+  // precedes the canonical edge by the measured phase, so subtract it.
+  // Constant pairing offsets cancel in bookend differences by construction.
+  {
+    const int32_t phase_cycles = g_pps_vclock_phase_cycles;
+    const uint64_t phase_ns = phase_cycles > 0
+        ? alpha_dwt_cycles_to_gnss_ns((uint32_t)phase_cycles)
+        : 0ULL;
+    const uint64_t pps_gnss_ns =
+        vclock_ns > phase_ns ? vclock_ns - phase_ns : vclock_ns;
+    alpha_bridge_anchor_record(snap.physical_pps_dwt_normalized_at_edge,
+                               pps_gnss_ns);
+  }
 
   g_gnss_ns_at_pps_vclock = vclock_ns;
   g_ocxo1_measured_gnss_ns_at_pps_vclock = ocxo1_ns;

@@ -256,8 +256,76 @@ static constexpr uint32_t OCXO_YARDSTICK_GATE_THRESHOLD_CYCLES = 16;
 // excursion guard).  Unlike the EMA, the yardstick feed-forward carries the
 // thermal slope, so the loop only ever fights zero-mean noise and bias --
 // there is no systematic lag and no integer dead zone.
-static constexpr uint32_t OCXO_YARDSTICK_ANCHOR_P_SHIFT = 3;   // 1/8
-static constexpr uint32_t OCXO_YARDSTICK_ANCHOR_I_SHIFT = 8;   // 1/256
+// Retuned 2026-06-12 from Zero3 evidence: at P=1/8, I=1/256 the loop's
+// standing endpoint error is ~8x any interval mistune and its ~100 s natural
+// period sat next to the campaign's thermal oscillation; the published
+// endpoint wandered +/-25 cycles common-mode (aerr columns, raw_cycles).
+// P=1/2 caps the standing error at ~2x interval mistune; I=1/64 drops the
+// loop period to ~16 s (zeta = 2, overdamped) so it recovers between thermal
+// reversals.  Cost: ~1 extra cycle of lattice noise in the published
+// endpoint, against the +/-25 it eliminates.
+static constexpr uint32_t OCXO_YARDSTICK_ANCHOR_P_SHIFT = 1;   // 1/2
+static constexpr uint32_t OCXO_YARDSTICK_ANCHOR_I_SHIFT = 6;   // 1/64
+
+// Anchor acquisition gear shift.  A cold or re-seeded anchor rail carries the
+// seed's quantization bias in its interval; with tracking-gain integral
+// (1/256) the loop parks at ~8x that bias for tens of seconds (P-term
+// balance, tau ~ 30 s) -- demonstrably unconverged state that correctly
+// blocks zero-worthiness but slows cold-boot readiness.  For the first
+// OCXO_YARDSTICK_ANCHOR_FAST_LOCK_SECONDS agree seconds after any seed or
+// reseed the integral runs at acquisition gain (1/32, tau ~ 4 s), then
+// drops to tracking gain.  Qualification thresholds are unchanged: the gate
+// demands the same settled evidence; the loop simply earns it sooner.
+static constexpr uint32_t OCXO_YARDSTICK_ANCHOR_FAST_LOCK_SECONDS = 32;
+static constexpr uint32_t OCXO_YARDSTICK_ANCHOR_FAST_I_SHIFT = 4;  // 1/16
+
+// ============================================================================
+// SmartZero Generation 2 ("ZeroWorthy") -- convergence-qualified zero, Stage A
+// ============================================================================
+//
+// Doctrine: zero is the SELECTION of an already-qualified canonical second,
+// not the acquisition of new proof.  The v1 SmartZero pair test certifies
+// that one millisecond of custody was mechanically clean (a glitch detector,
+// ~4 ppm stringency over its 1 ms baseline); it cannot see common-mode
+// displacement, lattice phase, or post-restart oven retrace -- all of which
+// it enshrines into the epoch.  Gen-2 instead maintains a continuous
+// per-lane ZERO-WORTHY verdict from the yardstick authority rail:
+//
+//   A lane is zero-worthy when, for ZERO_WORTHY_STREAK_SECONDS consecutive
+//   seconds, every second was a clean gate-agree second (no excursion, no
+//   stale yardstick, no adjacency fault, no reseed), the PI anchor loop
+//   error stayed within ZERO_WORTHY_MAX_ABS_AUTH_ERROR_CYCLES, and the
+//   window sum of loop errors stayed within
+//   ZERO_WORTHY_MAX_ABS_ERROR_SUM_CYCLES.
+//
+// The window-sum criterion is the retrace detector: the PI loop converts a
+// drifting oven into a persistent small same-sign error -- each second
+// individually innocent, the sum guilty (Plover3's post-flash retrace ran
+// ~+4 cycles/s of sustained loop error and must disqualify zeroing).
+//
+// An 8-second streak at gate threshold 16 over one-second baselines is an
+// effective parts-per-billion, two-independent-witness qualification; a
+// displacement common to both edges of one v1 millisecond pair cannot
+// survive eight seconds of agreement between the QTimer lane rail and the
+// PPS/GPIO yardstick without being real physics.
+//
+// Stage A is OBSERVATIONAL: verdicts, streaks, and disqualification
+// forensics are maintained and reported (INTERRUPT.REPORT_LANE
+// section=zero_worthy), and epoch capture packets are counted as
+// qualified/unqualified, but ZERO authority remains with v1 SmartZero until
+// SMARTZERO2_SELECTION_AUTHORITY_ENABLED flips after live validation.
+static constexpr bool     SMARTZERO2_SELECTION_AUTHORITY_ENABLED = false;
+static constexpr uint32_t ZERO_WORTHY_STREAK_SECONDS = 8;
+// Bounds recalibrated from live Zero1 evidence (2026-06-12): at tracking
+// gain the anchor loop error on hardware carries the physical PPS witness
+// jitter through the yardstick feed-forward, so steady-state |auth_error|
+// runs hotter than the noiseless simulation predicted and a 6-cycle bound
+// thrashed on error magnitude.  10/40 keeps the same shape (window mean
+// bound = magnitude/2) while remaining well inside the 16-cycle excursion
+// gate; the raw_cycles anchor-error histogram and policy table are the
+// instruments for refining these from campaign data.
+static constexpr int32_t  ZERO_WORTHY_MAX_ABS_AUTH_ERROR_CYCLES = 10;
+static constexpr int32_t  ZERO_WORTHY_MAX_ABS_ERROR_SUM_CYCLES = 40;
 // Coherent repeated excursions mean the OCXO genuinely moved (servo step /
 // retrace), not that the measurement glitched; reseed the chain after this
 // many coherent excursions instead of diverging forever.
@@ -947,6 +1015,21 @@ static void pps_yardstick_reset(void) {
 // 32-bit lane coordinates.  ZERO consumers select this already-authored packet
 // later.
 
+// SmartZero Gen-2 system-level worthiness evidence.  all_lanes_worthy is
+// authored in deferred dispatch context (lane fact drain) and read by the
+// PPS ISR when stamping epoch capture qualification counters; it is a single
+// volatile bool, so the cross-context read is coherent.
+struct smartzero2_system_t {
+  volatile bool all_lanes_worthy = false;
+  uint32_t all_worthy_second_count = 0;
+  uint32_t all_worthy_streak_seconds = 0;
+  uint32_t first_all_worthy_pps_sequence = 0;
+  uint32_t last_pps_sequence_checked = 0;
+  uint32_t epoch_captures_qualified = 0;
+  uint32_t epoch_captures_unqualified = 0;
+};
+static smartzero2_system_t g_smartzero2;
+
 struct epoch_capture_store_t {
   volatile uint32_t seq = 0;
 
@@ -982,6 +1065,12 @@ static epoch_capture_store_t g_epoch_capture_store;
 
 static void epoch_capture_publish(const interrupt_epoch_capture_t& cap) {
   g_epoch_capture_store.seq++;
+  // Gen-2 evidence: would this capture packet have been selection-eligible?
+  if (g_smartzero2.all_lanes_worthy) {
+    g_smartzero2.epoch_captures_qualified++;
+  } else {
+    g_smartzero2.epoch_captures_unqualified++;
+  }
   dmb_barrier();
 
   g_epoch_capture_store.valid = cap.valid;
@@ -2617,6 +2706,35 @@ struct ocxo_lane_t {
   uint32_t yardstick_auth_anchor_correction_count = 0;
   int32_t  yardstick_auth_last_error_cycles = 0;
   uint32_t yardstick_auth_last_published_dwt = 0;
+  uint32_t yardstick_auth_fast_lock_remaining_seconds = 0;
+
+  // SmartZero Gen-2 zero-worthiness (Stage A, observational).  Ring of the
+  // last ZERO_WORTHY_STREAK_SECONDS clean-second anchor loop errors; any
+  // unclean second empties the ring.  zw_worthy requires a full ring with a
+  // bounded window sum.
+  int32_t  zw_error_ring[ZERO_WORTHY_STREAK_SECONDS] = {};
+  uint8_t  zw_ring_index = 0;
+  uint8_t  zw_ring_count = 0;
+  int32_t  zw_window_error_sum = 0;
+  uint32_t zw_window_max_abs_error = 0;
+  uint32_t zw_clean_streak_seconds = 0;
+  bool     zw_worthy = false;
+  uint32_t zw_worthy_streak_seconds = 0;
+  uint32_t zw_seconds_evaluated = 0;
+  uint32_t zw_worthy_second_count = 0;
+  uint32_t zw_transition_count = 0;
+  uint32_t zw_first_worthy_after_seconds = 0;  // 0 = never yet worthy
+  const char* zw_last_disqualify_reason = "zw_never_evaluated";
+  uint32_t zw_disqualify_rail_invalid_count = 0;
+  uint32_t zw_disqualify_excursion_count = 0;
+  uint32_t zw_disqualify_stale_count = 0;
+  uint32_t zw_disqualify_seed_count = 0;
+  uint32_t zw_disqualify_adjacency_count = 0;
+  uint32_t zw_disqualify_no_interval_count = 0;
+  uint32_t zw_disqualify_error_magnitude_count = 0;
+  uint32_t zw_disqualify_error_sum_count = 0;
+  uint32_t zw_disqualify_streak_building_count = 0;
+  uint32_t zw_disqualify_fast_lock_count = 0;
 };
 static ocxo_lane_t g_ocxo1_lane;
 static ocxo_lane_t g_ocxo2_lane;
@@ -5091,6 +5209,33 @@ static void ocxo_lane_yardstick_reset(ocxo_lane_t& lane) {
   lane.yardstick_auth_anchor_correction_count = 0;
   lane.yardstick_auth_last_error_cycles = 0;
   lane.yardstick_auth_last_published_dwt = 0;
+  lane.yardstick_auth_fast_lock_remaining_seconds = 0;
+
+  for (uint32_t i = 0; i < ZERO_WORTHY_STREAK_SECONDS; i++) {
+    lane.zw_error_ring[i] = 0;
+  }
+  lane.zw_ring_index = 0;
+  lane.zw_ring_count = 0;
+  lane.zw_window_error_sum = 0;
+  lane.zw_window_max_abs_error = 0;
+  lane.zw_clean_streak_seconds = 0;
+  lane.zw_worthy = false;
+  lane.zw_worthy_streak_seconds = 0;
+  lane.zw_seconds_evaluated = 0;
+  lane.zw_worthy_second_count = 0;
+  lane.zw_transition_count = 0;
+  lane.zw_first_worthy_after_seconds = 0;
+  lane.zw_last_disqualify_reason = "zw_reset";
+  lane.zw_disqualify_rail_invalid_count = 0;
+  lane.zw_disqualify_excursion_count = 0;
+  lane.zw_disqualify_stale_count = 0;
+  lane.zw_disqualify_seed_count = 0;
+  lane.zw_disqualify_adjacency_count = 0;
+  lane.zw_disqualify_no_interval_count = 0;
+  lane.zw_disqualify_error_magnitude_count = 0;
+  lane.zw_disqualify_error_sum_count = 0;
+  lane.zw_disqualify_streak_building_count = 0;
+  lane.zw_disqualify_fast_lock_count = 0;
 }
 
 static void ocxo_lane_stop_local_cadence(ocxo_lane_t& lane, uint32_t reason) {
@@ -5818,6 +5963,173 @@ static uint32_t ocxo_lane_ema_predict_dwt(ocxo_lane_t& lane,
 // linear endpoint walk at that same rate.  Stage-1 telemetry exposes both so
 // Stage 2 can choose the seed/anchor policy from data.
 
+// SmartZero Gen-2 per-second worthiness classification.  Exactly one kind is
+// assigned per observed second by ocxo_lane_yardstick_observe.
+enum class zero_worthy_second_kind_t : uint8_t {
+  AGREE,                 // clean gate-agree second, fresh yardstick
+  EXCURSION,             // gate excursion (incl. both halves of a paired transient)
+  STALE,                 // no fresh PPS yardstick this second
+  SEED,                  // chain (re)seeded from observed this second
+  RAIL_INVALID,          // chain not yet valid (init)
+  ADJACENCY_FAULT,       // non-1-second counter lineage
+  NO_OBSERVED_INTERVAL,  // chained but no prior observed endpoint (degenerate)
+};
+
+static void ocxo_lane_zero_worthy_update(ocxo_lane_t& lane,
+                                         zero_worthy_second_kind_t kind,
+                                         int32_t auth_error_cycles,
+                                         bool anchor_fast_lock_active) {
+  lane.zw_seconds_evaluated++;
+  const bool was_worthy = lane.zw_worthy;
+
+  const char* disqualify = nullptr;
+  switch (kind) {
+    case zero_worthy_second_kind_t::AGREE:
+      break;
+    case zero_worthy_second_kind_t::EXCURSION:
+      disqualify = "zw_gate_excursion";
+      lane.zw_disqualify_excursion_count++;
+      break;
+    case zero_worthy_second_kind_t::STALE:
+      disqualify = "zw_yardstick_stale";
+      lane.zw_disqualify_stale_count++;
+      break;
+    case zero_worthy_second_kind_t::SEED:
+      disqualify = "zw_chain_seed";
+      lane.zw_disqualify_seed_count++;
+      break;
+    case zero_worthy_second_kind_t::RAIL_INVALID:
+      disqualify = "zw_rail_invalid";
+      lane.zw_disqualify_rail_invalid_count++;
+      break;
+    case zero_worthy_second_kind_t::ADJACENCY_FAULT:
+      disqualify = "zw_counter_adjacency";
+      lane.zw_disqualify_adjacency_count++;
+      break;
+    case zero_worthy_second_kind_t::NO_OBSERVED_INTERVAL:
+      disqualify = "zw_no_observed_interval";
+      lane.zw_disqualify_no_interval_count++;
+      break;
+  }
+
+  if (!disqualify && kind == zero_worthy_second_kind_t::AGREE) {
+    if (anchor_fast_lock_active) {
+      // Acquisition-gain seconds are definitionally not converged state:
+      // the hot integral (1/32) passes lattice and PPS-witness noise into
+      // the interval at 8x tracking gain.  They are excluded from
+      // worthiness eligibility so they neither qualify a zero nor pollute
+      // the magnitude/sum disqualification statistics.
+      disqualify = "zw_fast_lock_acquisition";
+      lane.zw_disqualify_fast_lock_count++;
+    }
+  }
+  if (!disqualify && kind == zero_worthy_second_kind_t::AGREE) {
+    const int32_t abs_err = auth_error_cycles < 0
+        ? -auth_error_cycles : auth_error_cycles;
+    if (abs_err > ZERO_WORTHY_MAX_ABS_AUTH_ERROR_CYCLES) {
+      disqualify = "zw_auth_error_magnitude";
+      lane.zw_disqualify_error_magnitude_count++;
+    }
+  }
+
+  if (disqualify) {
+    // Any unclean second empties the window: the streak restarts from zero.
+    for (uint32_t i = 0; i < ZERO_WORTHY_STREAK_SECONDS; i++) {
+      lane.zw_error_ring[i] = 0;
+    }
+    lane.zw_ring_index = 0;
+    lane.zw_ring_count = 0;
+    lane.zw_window_error_sum = 0;
+    lane.zw_window_max_abs_error = 0;
+    lane.zw_clean_streak_seconds = 0;
+    lane.zw_worthy = false;
+    lane.zw_worthy_streak_seconds = 0;
+    lane.zw_last_disqualify_reason = disqualify;
+    if (was_worthy) lane.zw_transition_count++;
+    return;
+  }
+
+  // Clean second: push the anchor loop error into the ring.
+  if (lane.zw_ring_count == ZERO_WORTHY_STREAK_SECONDS) {
+    lane.zw_window_error_sum -= lane.zw_error_ring[lane.zw_ring_index];
+  } else {
+    lane.zw_ring_count++;
+  }
+  lane.zw_error_ring[lane.zw_ring_index] = auth_error_cycles;
+  lane.zw_window_error_sum += auth_error_cycles;
+  lane.zw_ring_index =
+      (uint8_t)((lane.zw_ring_index + 1U) % ZERO_WORTHY_STREAK_SECONDS);
+  lane.zw_clean_streak_seconds++;
+
+  uint32_t max_abs = 0;
+  for (uint32_t i = 0; i < lane.zw_ring_count; i++) {
+    const int32_t v = lane.zw_error_ring[i];
+    const uint32_t a = (uint32_t)(v < 0 ? -v : v);
+    if (a > max_abs) max_abs = a;
+  }
+  lane.zw_window_max_abs_error = max_abs;
+
+  bool worthy = false;
+  if (lane.zw_ring_count < ZERO_WORTHY_STREAK_SECONDS) {
+    lane.zw_last_disqualify_reason = "zw_streak_building";
+    lane.zw_disqualify_streak_building_count++;
+  } else {
+    const int32_t abs_sum = lane.zw_window_error_sum < 0
+        ? -lane.zw_window_error_sum : lane.zw_window_error_sum;
+    if (abs_sum > ZERO_WORTHY_MAX_ABS_ERROR_SUM_CYCLES) {
+      // The retrace detector: persistent same-sign loop error means the
+      // oven is still moving; the anchor would memorialize a transient.
+      lane.zw_last_disqualify_reason = "zw_error_sum_retrace";
+      lane.zw_disqualify_error_sum_count++;
+    } else {
+      worthy = true;
+    }
+  }
+
+  lane.zw_worthy = worthy;
+  if (worthy) {
+    lane.zw_worthy_second_count++;
+    lane.zw_worthy_streak_seconds++;
+    if (lane.zw_first_worthy_after_seconds == 0) {
+      lane.zw_first_worthy_after_seconds = lane.zw_seconds_evaluated;
+    }
+  } else {
+    lane.zw_worthy_streak_seconds = 0;
+  }
+  if (worthy != was_worthy) lane.zw_transition_count++;
+}
+
+// System-level all-lanes verdict.  Disabled lanes are vacuously worthy,
+// mirroring v1 SmartZero's synthetic proof for disabled lanes.  Counting is
+// keyed to the PPS yardstick sequence so each qualified GNSS second is
+// counted exactly once even though both lanes call through here.
+static void smartzero2_system_update(uint32_t pps_sequence) {
+  ocxo_lane_t* l1 = ocxo_lane_for(interrupt_subscriber_kind_t::OCXO1);
+  ocxo_lane_t* l2 = ocxo_lane_for(interrupt_subscriber_kind_t::OCXO2);
+  const bool l1_ok =
+      ocxo_kind_disabled(interrupt_subscriber_kind_t::OCXO1) ||
+      (l1 && l1->zw_worthy);
+  const bool l2_ok =
+      ocxo_kind_disabled(interrupt_subscriber_kind_t::OCXO2) ||
+      (l2 && l2->zw_worthy);
+  const bool all = l1_ok && l2_ok;
+  g_smartzero2.all_lanes_worthy = all;
+
+  if (pps_sequence != 0 &&
+      pps_sequence != g_smartzero2.last_pps_sequence_checked) {
+    g_smartzero2.last_pps_sequence_checked = pps_sequence;
+    if (all) {
+      g_smartzero2.all_worthy_second_count++;
+      g_smartzero2.all_worthy_streak_seconds++;
+      if (g_smartzero2.first_all_worthy_pps_sequence == 0) {
+        g_smartzero2.first_all_worthy_pps_sequence = pps_sequence;
+      }
+    } else {
+      g_smartzero2.all_worthy_streak_seconds = 0;
+    }
+  }
+}
+
 static uint32_t ocxo_lane_yardstick_observe(ocxo_lane_t& lane,
                                             uint32_t observed_dwt,
                                             bool counter_adjacency_valid,
@@ -5866,6 +6178,9 @@ static uint32_t ocxo_lane_yardstick_observe(ocxo_lane_t& lane,
   int32_t inferred_minus_observed = 0;
   int32_t endpoint_minus_observed = 0;
   uint32_t inferred_interval_rounded = 0;
+  zero_worthy_second_kind_t zw_kind =
+      zero_worthy_second_kind_t::RAIL_INVALID;
+  bool zw_fast_lock_active = false;
 
   if (counter_adjacency_valid && !counter_adjacency_ok) {
     // Non-adjacent target identity: the interval ending at this edge is not
@@ -5877,6 +6192,7 @@ static uint32_t ocxo_lane_yardstick_observe(ocxo_lane_t& lane,
     lane.yardstick_excursion_streak = 0;
     lane.yardstick_auth_observed_fallback_count++;
     reason = "ocxo_yardstick_adjacency_observed";
+    zw_kind = zero_worthy_second_kind_t::ADJACENCY_FAULT;
   } else if (!lane.yardstick_chain_valid) {
     if (have_observed_interval && observed_interval != 0) {
       // Seed both rails from the first lawful observed interval (quantized;
@@ -5892,14 +6208,20 @@ static uint32_t ocxo_lane_yardstick_observe(ocxo_lane_t& lane,
       lane.yardstick_seed_count++;
       lane.yardstick_excursion_streak = 0;
       seeded = true;
+      lane.yardstick_auth_fast_lock_remaining_seconds =
+          OCXO_YARDSTICK_ANCHOR_FAST_LOCK_SECONDS;
       inferred_interval_rounded = observed_interval;
       reason = "ocxo_yardstick_seed";
+      zw_kind = zero_worthy_second_kind_t::SEED;
     } else {
       lane.yardstick_auth_observed_fallback_count++;
       reason = "ocxo_yardstick_init";
+      zw_kind = zero_worthy_second_kind_t::RAIL_INVALID;
     }
   } else {
     // ---- Free chain (Stage 1 physics audit, unchanged) ----
+    zw_fast_lock_active =
+        lane.yardstick_auth_fast_lock_remaining_seconds > 0U;
     if (!stale) {
       const int64_t correction_q16 =
           ((int64_t)lane.yardstick_chain_interval_q16 * delta_g) /
@@ -5984,12 +6306,15 @@ static uint32_t ocxo_lane_yardstick_observe(ocxo_lane_t& lane,
               (((uint64_t)observed_dwt) << 16) & YARDSTICK_ENDPOINT_Q16_MASK;
           lane.yardstick_coherent_reseed_count++;
           lane.yardstick_excursion_streak = 0;
+          lane.yardstick_auth_fast_lock_remaining_seconds =
+              OCXO_YARDSTICK_ANCHOR_FAST_LOCK_SECONDS;
         }
 
         // Excursion guard: the observed edge is quarantined evidence; the
         // anchored rail coasts on pure inference and publishes it.
         lane.yardstick_auth_excursion_publish_count++;
         reason = "ocxo_yardstick_excursion_guard";
+        zw_kind = zero_worthy_second_kind_t::EXCURSION;
       } else {
         lane.yardstick_gate_agree_count++;
         lane.yardstick_excursion_streak = 0;
@@ -6017,14 +6342,23 @@ static uint32_t ocxo_lane_yardstick_observe(ocxo_lane_t& lane,
             (uint64_t)((int64_t)lane.yardstick_auth_endpoint_q16 +
                        (err_q16 >> OCXO_YARDSTICK_ANCHOR_P_SHIFT)) &
             YARDSTICK_ENDPOINT_Q16_MASK;
+        const uint32_t anchor_i_shift =
+            lane.yardstick_auth_fast_lock_remaining_seconds > 0U
+                ? OCXO_YARDSTICK_ANCHOR_FAST_I_SHIFT
+                : OCXO_YARDSTICK_ANCHOR_I_SHIFT;
         lane.yardstick_auth_interval_q16 =
             (uint64_t)((int64_t)lane.yardstick_auth_interval_q16 +
-                       (err_q16 >> OCXO_YARDSTICK_ANCHOR_I_SHIFT));
+                       (err_q16 >> anchor_i_shift));
+        if (lane.yardstick_auth_fast_lock_remaining_seconds > 0U) {
+          lane.yardstick_auth_fast_lock_remaining_seconds--;
+        }
         lane.yardstick_auth_anchor_correction_count++;
         anchor_applied = true;
 
         lane.yardstick_auth_agree_publish_count++;
         reason = stale ? "ocxo_yardstick_stale_hold" : "ocxo_yardstick";
+        zw_kind = stale ? zero_worthy_second_kind_t::STALE
+                        : zero_worthy_second_kind_t::AGREE;
       }
       if (stale && !excursion) {
         lane.yardstick_auth_stale_publish_count++;
@@ -6033,8 +6367,10 @@ static uint32_t ocxo_lane_yardstick_observe(ocxo_lane_t& lane,
     } else if (stale) {
       lane.yardstick_auth_stale_publish_count++;
       reason = "ocxo_yardstick_stale_hold";
+      zw_kind = zero_worthy_second_kind_t::NO_OBSERVED_INTERVAL;
     } else {
       reason = "ocxo_yardstick";
+      zw_kind = zero_worthy_second_kind_t::NO_OBSERVED_INTERVAL;
     }
 
     published_dwt =
@@ -6050,6 +6386,10 @@ static uint32_t ocxo_lane_yardstick_observe(ocxo_lane_t& lane,
   }
   lane.yardstick_prev_observed_dwt = observed_dwt;
   lane.yardstick_prev_observed_valid = true;
+
+  ocxo_lane_zero_worthy_update(lane, zw_kind, auth_error_cycles,
+                               zw_fast_lock_active);
+  smartzero2_system_update(y_usable ? y.sequence : 0U);
 
   lane.yardstick_last_valid = lane.yardstick_chain_valid;
   lane.yardstick_last_stale = stale;
@@ -8699,6 +9039,11 @@ struct payload_prefix_t {
     p.add(key, value);
   }
 
+  void add_string(const char* suffix, const char* value) {
+    make_key(suffix);
+    p.add(key, value ? value : "");
+  }
+
   void add_i64(const char* suffix, int64_t value) {
     make_key(suffix);
     p.add(key, value);
@@ -9371,6 +9716,17 @@ static FLASHMEM void add_runtime_payload(Payload& p) {
   p.add("ocxo_yardstick_gate_threshold_cycles", OCXO_YARDSTICK_GATE_THRESHOLD_CYCLES);
   p.add("ocxo_yardstick_anchor_p_shift", OCXO_YARDSTICK_ANCHOR_P_SHIFT);
   p.add("ocxo_yardstick_anchor_i_shift", OCXO_YARDSTICK_ANCHOR_I_SHIFT);
+  p.add("ocxo_yardstick_anchor_fast_lock_seconds",
+        OCXO_YARDSTICK_ANCHOR_FAST_LOCK_SECONDS);
+  p.add("ocxo_yardstick_anchor_fast_i_shift",
+        OCXO_YARDSTICK_ANCHOR_FAST_I_SHIFT);
+  p.add("smartzero2_selection_authority_enabled",
+        SMARTZERO2_SELECTION_AUTHORITY_ENABLED);
+  p.add("zero_worthy_streak_seconds", ZERO_WORTHY_STREAK_SECONDS);
+  p.add("zero_worthy_max_abs_auth_error_cycles",
+        ZERO_WORTHY_MAX_ABS_AUTH_ERROR_CYCLES);
+  p.add("zero_worthy_max_abs_error_sum_cycles",
+        ZERO_WORTHY_MAX_ABS_ERROR_SUM_CYCLES);
   p.add("ocxo1_quiet_phase_ticks", OCXO1_QUIET_PHASE_TICKS);
   p.add("ocxo1_quiet_phase_us", ocxo_phase_ticks_to_us(OCXO1_QUIET_PHASE_TICKS));
   p.add("ocxo2_quiet_phase_ticks", OCXO2_QUIET_PHASE_TICKS);
@@ -9542,6 +9898,17 @@ static FLASHMEM void add_vclock_heartbeat_payload(Payload& p) {
   p.add("ocxo_yardstick_gate_threshold_cycles", OCXO_YARDSTICK_GATE_THRESHOLD_CYCLES);
   p.add("ocxo_yardstick_anchor_p_shift", OCXO_YARDSTICK_ANCHOR_P_SHIFT);
   p.add("ocxo_yardstick_anchor_i_shift", OCXO_YARDSTICK_ANCHOR_I_SHIFT);
+  p.add("ocxo_yardstick_anchor_fast_lock_seconds",
+        OCXO_YARDSTICK_ANCHOR_FAST_LOCK_SECONDS);
+  p.add("ocxo_yardstick_anchor_fast_i_shift",
+        OCXO_YARDSTICK_ANCHOR_FAST_I_SHIFT);
+  p.add("smartzero2_selection_authority_enabled",
+        SMARTZERO2_SELECTION_AUTHORITY_ENABLED);
+  p.add("zero_worthy_streak_seconds", ZERO_WORTHY_STREAK_SECONDS);
+  p.add("zero_worthy_max_abs_auth_error_cycles",
+        ZERO_WORTHY_MAX_ABS_AUTH_ERROR_CYCLES);
+  p.add("zero_worthy_max_abs_error_sum_cycles",
+        ZERO_WORTHY_MAX_ABS_ERROR_SUM_CYCLES);
   p.add("ocxo_quiet_phase_period_ticks", OCXO_QUIET_PHASE_PERIOD_TICKS);
   p.add("ocxo1_quiet_phase_ticks", OCXO1_QUIET_PHASE_TICKS);
   p.add("ocxo1_quiet_phase_us", ocxo_phase_ticks_to_us(OCXO1_QUIET_PHASE_TICKS));
@@ -10774,7 +11141,7 @@ static FLASHMEM void add_idle_dwt_witness_payload(Payload& p) {
 static const char* REPORT_LANE_VCLOCK_SECTIONS =
     "summary ema ch2 epoch smartzero fact_ring clock32 qtimer regression spincatch isr";
 static const char* REPORT_LANE_OCXO_SECTIONS =
-    "summary ema service scheduler witness qtimer ring clock32 regression spincatch isr";
+    "summary ema yardstick zero_worthy service scheduler witness qtimer ring clock32 regression spincatch isr";
 
 static FLASHMEM const char* report_lane_section_arg(const Payload& args) {
   const char* section = args.getString("section");
@@ -11081,6 +11448,67 @@ static FLASHMEM void add_ocxo_lane_ema_section(Payload& p,
   }
 }
 
+static FLASHMEM void add_ocxo_lane_zero_worthy_section(Payload& p,
+                                       const ocxo_runtime_context_t& ctx) {
+  const ocxo_lane_t& lane = *ctx.lane;
+  payload_prefix_t out(p, ctx.prefix);
+
+  // Qualification policy constants.
+  out.add_bool("zw_selection_authority_enabled",
+               SMARTZERO2_SELECTION_AUTHORITY_ENABLED);
+  out.add_u32("zw_streak_seconds_required", ZERO_WORTHY_STREAK_SECONDS);
+  out.add_i32("zw_max_abs_auth_error_cycles",
+              ZERO_WORTHY_MAX_ABS_AUTH_ERROR_CYCLES);
+  out.add_i32("zw_max_abs_error_sum_cycles",
+              ZERO_WORTHY_MAX_ABS_ERROR_SUM_CYCLES);
+
+  // Live verdict.
+  out.add_bool("zw_worthy", lane.zw_worthy);
+  out.add_u32("zw_worthy_streak_seconds", lane.zw_worthy_streak_seconds);
+  out.add_u32("zw_clean_streak_seconds", lane.zw_clean_streak_seconds);
+  out.add_u32("zw_ring_count", lane.zw_ring_count);
+  out.add_i32("zw_window_error_sum_cycles", lane.zw_window_error_sum);
+  out.add_u32("zw_window_max_abs_error_cycles", lane.zw_window_max_abs_error);
+  out.add_string("zw_last_disqualify_reason", lane.zw_last_disqualify_reason);
+
+  // Efficacy evidence.
+  out.add_u32("zw_seconds_evaluated", lane.zw_seconds_evaluated);
+  out.add_u32("zw_worthy_second_count", lane.zw_worthy_second_count);
+  out.add_u32("zw_first_worthy_after_seconds",
+              lane.zw_first_worthy_after_seconds);
+  out.add_u32("zw_transition_count", lane.zw_transition_count);
+
+  // Disqualification forensics.
+  out.add_u32("zw_dq_rail_invalid", lane.zw_disqualify_rail_invalid_count);
+  out.add_u32("zw_dq_excursion", lane.zw_disqualify_excursion_count);
+  out.add_u32("zw_dq_stale", lane.zw_disqualify_stale_count);
+  out.add_u32("zw_dq_seed", lane.zw_disqualify_seed_count);
+  out.add_u32("zw_dq_adjacency", lane.zw_disqualify_adjacency_count);
+  out.add_u32("zw_dq_no_interval", lane.zw_disqualify_no_interval_count);
+  out.add_u32("zw_dq_error_magnitude",
+              lane.zw_disqualify_error_magnitude_count);
+  out.add_u32("zw_dq_error_sum_retrace", lane.zw_disqualify_error_sum_count);
+  out.add_u32("zw_dq_streak_building",
+              lane.zw_disqualify_streak_building_count);
+  out.add_u32("zw_dq_fast_lock_acquisition",
+              lane.zw_disqualify_fast_lock_count);
+  out.add_u32("zw_fast_lock_remaining_seconds",
+              lane.yardstick_auth_fast_lock_remaining_seconds);
+
+  // System-level verdict (unprefixed: one truth, reported on either lane).
+  p.add("smartzero2_all_lanes_worthy", (bool)g_smartzero2.all_lanes_worthy);
+  p.add("smartzero2_all_worthy_streak_seconds",
+        g_smartzero2.all_worthy_streak_seconds);
+  p.add("smartzero2_all_worthy_second_count",
+        g_smartzero2.all_worthy_second_count);
+  p.add("smartzero2_first_all_worthy_pps_sequence",
+        g_smartzero2.first_all_worthy_pps_sequence);
+  p.add("smartzero2_epoch_captures_qualified",
+        g_smartzero2.epoch_captures_qualified);
+  p.add("smartzero2_epoch_captures_unqualified",
+        g_smartzero2.epoch_captures_unqualified);
+}
+
 static FLASHMEM void add_ocxo_lane_yardstick_section(Payload& p,
                                       const ocxo_runtime_context_t& ctx) {
   const ocxo_lane_t& lane = *ctx.lane;
@@ -11151,6 +11579,8 @@ static FLASHMEM void add_ocxo_lane_yardstick_section(Payload& p,
               lane.yardstick_auth_anchor_correction_count);
   out.add_i32("yardstick_auth_last_error_cycles",
               lane.yardstick_auth_last_error_cycles);
+  out.add_u32("yardstick_auth_fast_lock_remaining_seconds",
+              lane.yardstick_auth_fast_lock_remaining_seconds);
   out.add_u32("yardstick_auth_last_published_dwt",
               lane.yardstick_auth_last_published_dwt);
 
@@ -11193,6 +11623,8 @@ static FLASHMEM bool add_ocxo_lane_section(Payload& p,
     add_ocxo_lane_ema_section(p, ctx);
   } else if (report_lane_section_is(section, "yardstick")) {
     add_ocxo_lane_yardstick_section(p, ctx);
+  } else if (report_lane_section_is(section, "zero_worthy")) {
+    add_ocxo_lane_zero_worthy_section(p, ctx);
   } else if (report_lane_section_is(section, "service")) {
     add_ocxo_witness_service_payload(out, *ctx.lane);
   } else if (report_lane_section_is(section, "scheduler")) {

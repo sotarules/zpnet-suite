@@ -249,6 +249,15 @@ struct clock_measurement_t {
   // Previous-edge tracking, used to compute the deltas above.
   volatile uint64_t prev_gnss_ns_at_edge;
   volatile uint32_t prev_dwt_at_edge;
+
+  // Bridge bookend evidence (OCXO lanes): whether the last resolved interval
+  // came from bracketing-anchor interpolation, the resolved edge's phase
+  // offset from its lower anchor, the bracket span, and lifetime counts.
+  volatile bool     bridge_anchored;
+  volatile int32_t  bridge_phi_cycles;
+  volatile uint32_t bridge_span_cycles;
+  volatile uint32_t bridge_resolved_count;
+  volatile uint32_t bridge_fallback_count;
 };
 
 extern clock_state_t       g_vclock_clock;
@@ -310,6 +319,11 @@ struct clocks_alpha_lane_forensics_t {
   uint64_t bridge_gnss_ns_between_edges;
   int64_t  bridge_residual_ns;
   bool     bridge_interval_valid;
+  bool     bridge_anchored;
+  int32_t  bridge_phi_cycles;
+  uint32_t bridge_span_cycles;
+  uint32_t bridge_resolved_count;
+  uint32_t bridge_fallback_count;
 
   uint64_t ns_between_edges;
   uint32_t dwt_cycles_between_edges;

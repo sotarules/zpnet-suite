@@ -637,6 +637,15 @@ def yardstick_diag(root: Dict[str, Any],
                                   f.get("dwt_yardstick_gate_agree_count")),
         "excursion_count": _first_int(y.get("gate_excursion_count"),
                                       f.get("dwt_yardstick_gate_excursion_count")),
+        # Stage 2 anchored authority audit.
+        "authority": _first_bool(y.get("authority"),
+                                 f.get("dwt_yardstick_authority")),
+        "auth_endpoint_dwt": _first_int(y.get("auth_endpoint_dwt"),
+                                        f.get("dwt_yardstick_auth_endpoint_dwt")),
+        "auth_error": _first_int(y.get("auth_error_cycles"),
+                                 f.get("dwt_yardstick_auth_error_cycles")),
+        "anchor_applied": _first_bool(y.get("auth_anchor_applied"),
+                                      f.get("dwt_yardstick_auth_anchor_applied")),
     }
 
 
@@ -814,6 +823,7 @@ def _headers_for(clock_filter: Optional[str]) -> Tuple[str, str]:
             f"{prefix + '_emaΔ':>8s}",
             f"{prefix + '_inferred':>13s}",
             f"{prefix + '_imo':>7s}",
+            f"{prefix + '_aerr':>7s}",
             f"{prefix + '_walk':>8s}",
             f"{prefix + '_y':>5s}",
             f"{prefix + '_cΔ':>11s}",
@@ -854,6 +864,7 @@ def _row_line(row: Dict[str, Any], clock_filter: Optional[str]) -> str:
             _fmt_int(data["ema_delta"], 8, signed=True),
             _fmt_int(data["inferred"], 13),
             _fmt_int(data["imo"], 7, signed=True),
+            _fmt_int(data["aerr"], 7, signed=True),
             _fmt_int(data["walk"], 8, signed=True),
             _fmt_str(data["y_tag"], 5),
             _fmt_int(data["counter_delta"], 11),
@@ -977,6 +988,9 @@ def collect_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]
                 "emo": emo,
                 "inferred": yard.get("inferred"),
                 "imo": imo,
+                "aerr": yard.get("auth_error"),
+                "authority": yard.get("authority"),
+                "anchor_applied": yard.get("anchor_applied"),
                 "walk": yard.get("walk"),
                 "y_tag": yardstick_tag(yard),
                 "y_valid": yard.get("valid"),
@@ -1050,6 +1064,54 @@ def _residual_hit(*values: Optional[int]) -> bool:
     return any(v is not None and abs(v) >= EXCURSION_THRESHOLD_CYCLES for v in values)
 
 
+# Zero-worthiness policy candidates: (max |aerr| per second, max |window sum|).
+# The firmware window length is fixed at 8 seconds; the firmware additionally
+# excludes anchor fast-lock (acquisition gain) seconds, which TIMEBASE rows
+# cannot see, so simulated readiness is slightly OPTIMISTIC near restarts.
+ZW_POLICY_CANDIDATES: List[Tuple[int, int]] = [
+    (6, 24), (8, 32), (10, 40), (12, 48), (16, 64),
+]
+ZW_POLICY_WINDOW_SECONDS = 8
+
+
+def _simulate_zero_worthy(seq: List[Tuple[str, Optional[int]]],
+                          max_abs_err: int,
+                          max_abs_sum: int) -> Tuple[int, int, Optional[int]]:
+    """Replay the firmware zero-worthiness verdict over (y_tag, aerr) rows.
+
+    A second is clean when the yardstick tag is OK and |aerr| is within the
+    magnitude bound; any other second empties the window.  Worthy requires a
+    full window with |sum| within the sum bound.  Returns (worthy_seconds,
+    max_worthy_streak, first_worthy_row_index_1_based).
+    """
+    ring: List[int] = []
+    worthy_seconds = 0
+    streak = 0
+    max_streak = 0
+    first: Optional[int] = None
+    for i, (tag, aerr) in enumerate(seq, start=1):
+        clean = tag == "OK" and aerr is not None and abs(int(aerr)) <= max_abs_err
+        if not clean:
+            ring.clear()
+            streak = 0
+            continue
+        ring.append(int(aerr))
+        if len(ring) > ZW_POLICY_WINDOW_SECONDS:
+            ring.pop(0)
+        worthy = (len(ring) == ZW_POLICY_WINDOW_SECONDS and
+                  abs(sum(ring)) <= max_abs_sum)
+        if worthy:
+            worthy_seconds += 1
+            streak += 1
+            if streak > max_streak:
+                max_streak = streak
+            if first is None:
+                first = i
+        else:
+            streak = 0
+    return worthy_seconds, max_streak, first
+
+
 def _walk_slope_cycles_per_second(samples: List[Tuple[int, int]]) -> Optional[float]:
     """Least-squares slope of chain walk vs pps_count, in cycles/second.
 
@@ -1090,6 +1152,9 @@ def analyze(campaign: str, limit: int = 0, clock_filter: Optional[str] = None) -
     print("  *_emaΔ     = ema[n] - ema[n-1].")
     print("  *_inferred = PPS-Yardstick inferred interval (heir apparent).")
     print("  *_imo      = inferred - observed: the yardstick per-second scorecard.")
+    print("  *_aerr     = anchored authority PI loop error: observed - anchored")
+    print("               endpoint, pre-correction.  The published-rail health signal")
+    print("               and the SmartZero Gen-2 zero-worthiness input.")
     print("  *_walk     = free-running yardstick chain endpoint - observed endpoint.")
     print("  *_y        = yardstick tag: OK / EXC / STAL / SEED / ---.")
     print("  *_cΔ       = counter32 delta since previous event (lineage proof).")
@@ -1128,6 +1193,8 @@ def analyze(campaign: str, limit: int = 0, clock_filter: Optional[str] = None) -
         stats[f"{lane_name}_abs_imo"] = Welford()
         stats[f"{lane_name}_abs_emo"] = Welford()
         stats[f"{lane_name}_walk"] = Welford()
+        stats[f"{lane_name}_aerr"] = Welford()
+        stats[f"{lane_name}_abs_aerr"] = Welford()
         stats[f"{lane_name}_counter32_delta"] = Welford()
 
     coverage = {
@@ -1155,6 +1222,13 @@ def analyze(campaign: str, limit: int = 0, clock_filter: Optional[str] = None) -
     excursions: List[Dict[str, Any]] = []
     vclock_excursions: List[Dict[str, Any]] = []
     walk_samples = {"ocxo1": [], "ocxo2": []}
+    # Anchor-loop error sequences (in row order) feed the zero-worthiness
+    # policy simulation; histogram counts |aerr| on agree seconds.
+    aerr_seq = {"ocxo1": [], "ocxo2": []}
+    aerr_hist_bins = [(0, 2), (3, 4), (5, 6), (7, 8), (9, 10),
+                      (11, 12), (13, 16), (17, None)]
+    aerr_hist = {"ocxo1": [0] * len(aerr_hist_bins),
+                 "ocxo2": [0] * len(aerr_hist_bins)}
 
     for row in collected:
         coverage["rows"] += 1
@@ -1184,6 +1258,8 @@ def analyze(campaign: str, limit: int = 0, clock_filter: Optional[str] = None) -
             cls = service_class_short(d["service_class"])
             service_class_counts[lane_name][cls] = service_class_counts[lane_name].get(cls, 0) + 1
 
+            aerr_seq[lane_name].append((d["y_tag"], d["aerr"]))
+
             if d["y_valid"]:
                 coverage[f"{lane_name}_yardstick"] += 1
                 add_optional(stats[f"{lane_name}_inferred_interval"], d["inferred"])
@@ -1203,6 +1279,14 @@ def analyze(campaign: str, limit: int = 0, clock_filter: Optional[str] = None) -
                     if not d["y_seeded"]:
                         add_optional(stats[f"{lane_name}_imo"], d["imo"])
                         add_optional(stats[f"{lane_name}_emo"], d["emo"])
+                        add_optional(stats[f"{lane_name}_aerr"], d["aerr"])
+                        if d["aerr"] is not None:
+                            a = abs(int(d["aerr"]))
+                            stats[f"{lane_name}_abs_aerr"].update(float(a))
+                            for bi, (lo, hi) in enumerate(aerr_hist_bins):
+                                if a >= lo and (hi is None or a <= hi):
+                                    aerr_hist[lane_name][bi] += 1
+                                    break
                         if d["imo"] is not None:
                             stats[f"{lane_name}_abs_imo"].update(abs(float(d["imo"])))
                         if d["emo"] is not None:
@@ -1277,6 +1361,15 @@ def analyze(campaign: str, limit: int = 0, clock_filter: Optional[str] = None) -
             _print_welford(f"{label} EMA |error|", stats[f"{lane_name}_abs_emo"])
             _print_welford(f"{label} yardstick error (imo)", stats[f"{lane_name}_imo"])
             _print_welford(f"{label} yardstick |error|", stats[f"{lane_name}_abs_imo"])
+            _print_welford(f"{label} anchor loop error (aerr)", stats[f"{lane_name}_aerr"])
+            _print_welford(f"{label} anchor loop |error|", stats[f"{lane_name}_abs_aerr"])
+            if stats[f"{lane_name}_abs_aerr"].n > 0:
+                cells = []
+                for (lo, hi), ct in zip(aerr_hist_bins, aerr_hist[lane_name]):
+                    rng = f"{lo}-{hi}" if hi is not None else f"{lo}+"
+                    cells.append(f"{rng}:{ct}")
+                print(f"  {label} |aerr| histogram (agree seconds)          "
+                      + "  ".join(cells))
             _print_welford(f"{label} chain walk (endpoint - observed)", stats[f"{lane_name}_walk"])
             slope = _walk_slope_cycles_per_second(walk_samples[lane_name])
             counts = last_counts[lane_name]
@@ -1287,6 +1380,29 @@ def analyze(campaign: str, limit: int = 0, clock_filter: Optional[str] = None) -
                 f"agree={counts['agree']}  excursion={counts['excursion']}  "
                 f"threshold={counts['threshold']}"
             )
+            print()
+
+        print("Zero-worthiness policy simulation (SmartZero Gen-2 tuning)")
+        print("══════════════════════════════════════════════════════════")
+        print("  Firmware verdict replayed over this campaign's per-second anchor loop")
+        print("  errors for candidate (|aerr| bound / |window sum| bound) policies,")
+        print(f"  window = {ZW_POLICY_WINDOW_SECONDS} s.  Fast-lock (acquisition) exclusion is not")
+        print("  visible in TIMEBASE, so readiness near restarts reads optimistic.")
+        print()
+        for lane_name, label in (("ocxo1", "OCXO1"), ("ocxo2", "OCXO2")):
+            if clock_filter is not None and clock_filter != label:
+                continue
+            seq = aerr_seq[lane_name]
+            evaluated = len(seq)
+            print(f"  {label}  ({evaluated} rows)")
+            print(f"    {'policy':>12s}  {'worthy_s':>8s}  {'worthy_%':>8s}  "
+                  f"{'max_streak':>10s}  {'first_worthy_row':>16s}")
+            for mag, sumb in ZW_POLICY_CANDIDATES:
+                ws, mstreak, first = _simulate_zero_worthy(seq, mag, sumb)
+                pct = (100.0 * ws / evaluated) if evaluated else 0.0
+                first_text = "never" if first is None else str(first)
+                print(f"    {f'{mag}/{sumb}':>12s}  {ws:>8d}  {pct:>7.1f}%  "
+                      f"{mstreak:>10d}  {first_text:>16s}")
             print()
 
     if clock_filter is None or clock_filter == "VCLOCK":
@@ -1368,6 +1484,9 @@ def analyze(campaign: str, limit: int = 0, clock_filter: Optional[str] = None) -
     print("    by the physical PPS-to-PPS yardstick ratio, carried in Q16 fixed point.")
     print("  • *_imo = inferred - observed (firmware-computed). Sub-lattice |imo| means the")
     print("    inference tracks truth tighter than the 4-cycle QTimer quantization floor.")
+    print("  • *_aerr is the Stage 2 anchored authority loop error (observed minus")
+    print("    anchored endpoint, pre-correction).  Its Welford/histogram and the")
+    print("    zero-worthiness policy table are the SmartZero Gen-2 tuning instruments.")
     print("  • *_walk is the free-running chain endpoint minus observed endpoint: the")
     print("    cumulative chain-walk audit that decides the Stage 2/3 anchor policy.")
     print("  • *_y tags: OK, EXC (gate excursion: observed disagreed with inference beyond")

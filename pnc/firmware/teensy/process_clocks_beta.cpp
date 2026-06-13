@@ -2853,6 +2853,11 @@ static void add_alpha_event_payload(Payload& p,
   p.add("bridge_interval_valid", f.bridge_interval_valid);
   p.add("bridge_gnss_ns_between_edges", f.bridge_gnss_ns_between_edges);
   p.add("bridge_residual_ns", f.bridge_residual_ns);
+  p.add("bridge_anchored", f.bridge_anchored);
+  p.add("bridge_phi_cycles", f.bridge_phi_cycles);
+  p.add("bridge_span_cycles", f.bridge_span_cycles);
+  p.add("bridge_resolved_count", f.bridge_resolved_count);
+  p.add("bridge_fallback_count", f.bridge_fallback_count);
 
   if (vclock_ref && vclock_ref->valid && f.valid) {
     p.add("event_delta_vs_vclock_ns",
