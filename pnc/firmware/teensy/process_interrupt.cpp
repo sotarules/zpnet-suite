@@ -6802,7 +6802,9 @@ static void ocxo_apply_perishable_fact_deferred(
 
   bool ema_synthetic = false;
   int32_t ema_error_cycles = 0;
-  const uint32_t observed_dwt = fact.service_dwt_at_event;
+
+  const uint32_t observed_dwt = corrected_dwt;
+
   dwt_repair_diag_t ema_diag{};
   ema_diag.valid = true;
   ema_diag.original_dwt = observed_dwt;
