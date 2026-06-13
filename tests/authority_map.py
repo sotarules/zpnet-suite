@@ -1,7 +1,7 @@
 """
-ZPNet Authority Map v3 — TIMEBASE source/provenance audit.
+ZPNet Authority Map v4 — TIMEBASE source/provenance audit.
 
-Step-1 report for the OCXO residual cleanup plan.  This script does not alter
+Step-2 report for the OCXO residual cleanup plan.  This script does not alter
 firmware behavior.  It reads persisted TIMEBASE rows and prints, row by row,
 which timing surfaces are currently acting as authority versus witness.
 
@@ -341,11 +341,13 @@ def collect_rows(records: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
             )
             public_interval_ns = _delta(pub_ns, prev_pub)
             public_fast_residual_from_ns = (
-                NS_PER_SECOND - public_interval_ns
+                public_interval_ns - NS_PER_SECOND
                 if public_interval_ns is not None else None
             )
 
             pps_resid = _first_int(residual.get("fast_residual_ns"))
+            residual_source_id = _first_int(residual.get("source_id"))
+            residual_source = residual.get("source") if isinstance(residual.get("source"), str) else "---"
             if measured_ns is not None:
                 previous_measured_ns[lane] = measured_ns
             if pub_ns is not None:
@@ -376,7 +378,10 @@ def collect_rows(records: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
                     "public_interval_ns": public_interval_ns,
                     "public_fast_residual_from_ns": public_fast_residual_from_ns,
                     "pps_fast_residual_ns": pps_resid,
+                    "residual_source_id": residual_source_id,
+                    "residual_source": residual_source,
                     "pps_minus_measured_residual": _delta(pps_resid, measured_edge_fast_residual_ns),
+                    "public_minus_science_residual": _delta(public_fast_residual_from_ns, pps_resid),
                     "traditional_residual_valid": _first_bool(cycle_diag.get("traditional_residual_valid")),
                     "diagnostic_fast_residual_cycles": _first_int(cycle_diag.get("diagnostic_fast_residual_cycles")),
                     "clock_minus_gnss_actual_cycles": _first_int(cycle_diag.get("clock_minus_gnss_actual_cycles")),
@@ -412,14 +417,16 @@ def print_table(rows: List[Dict[str, Any]], verbose: bool = False) -> None:
     print("═════════════")
     print("ns_src: PPS_PROJECTED is Beta public authority; MEASURED is measured fallback.")
     print("proj: ACTUAL_BRACKET / STATIC_NEXT_EDGE are Alpha PPS-projection sources.")
+    print("res_src: pps_residual.source when firmware exposes it; BRIDGE_EDGE_INTERVAL is Step-2 science.")
     print("meas_ns: compact Alpha measured_gnss_ns side-channel; meas_fast is computed from consecutive meas_ns values.")
-    print("meas_fast uses the SAME sign convention as pps_resid: positive means clock_fast.")
+    print("meas_fast/public_fast use the same sign convention as pps_resid: positive means clock_fast.")
     print()
 
     header = (
-        f"{'pps':>6s}  {'lane':>5s}  {'ns_src':>13s}  {'proj':>16s}  "
+        f"{'pps':>6s}  {'lane':>5s}  {'ns_src':>13s}  {'proj':>16s}  {'res_src':>16s}  "
         f"{'pub-meas':>11s}  {'wit-meas':>11s}  "
-        f"{'pps_resid':>9s}  {'meas_fast':>10s}  {'pps-meas':>9s}  "
+        f"{'sci_resid':>9s}  {'meas_fast':>10s}  {'sci-meas':>9s}  "
+        f"{'pub_fast':>9s}  {'pub-sci':>8s}  "
         f"{'dwt_src':>9s}  {'pub-event':>9s}  {'auth_err':>8s}  {'imo':>6s}  {'cΔ':>10s}"
     )
     print(header)
@@ -430,11 +437,14 @@ def print_table(rows: List[Dict[str, Any]], verbose: bool = False) -> None:
             f"{r['lane']:>5s}  "
             f"{_fmt_src(r['ns_source'], 13)}  "
             f"{_fmt_src(r['pps_projection_source'], 16)}  "
+            f"{_fmt_src(r['residual_source'], 16)}  "
             f"{_fmt_int(r['public_minus_measured'], 11, signed=True)}  "
             f"{_fmt_int(r['witness_minus_measured'], 11, signed=True)}  "
             f"{_fmt_int(r['pps_fast_residual_ns'], 9, signed=True)}  "
             f"{_fmt_int(r['measured_edge_fast_residual_ns'], 10, signed=True)}  "
             f"{_fmt_int(r['pps_minus_measured_residual'], 9, signed=True)}  "
+            f"{_fmt_int(r['public_fast_residual_from_ns'], 9, signed=True)}  "
+            f"{_fmt_int(r['public_minus_science_residual'], 8, signed=True)}  "
             f"{_fmt_src(r['dwt_source'], 9)}  "
             f"{_fmt_int(r['dwt_published_minus_event_cycles'], 9, signed=True)}  "
             f"{_fmt_int(r['yardstick_auth_error'], 8, signed=True)}  "
@@ -447,7 +457,8 @@ def print_table(rows: List[Dict[str, Any]], verbose: bool = False) -> None:
                 f"measured_ns={_fmt_int(r['measured_ns'])}  "
                 f"witness_ns={_fmt_int(r['subscriber_witness_ns'])}  "
                 f"pps_proj_raw_ns={_fmt_int(r['pps_projected_raw_ns'])}  "
-                f"raw_minus_meas={_fmt_int(r['projected_raw_minus_measured'], signed=True)}"
+                f"raw_minus_meas={_fmt_int(r['projected_raw_minus_measured'], signed=True)}  "
+                f"residual_source_id={_fmt_int(r['residual_source_id'])}"
             )
             print(
                 f"        event_dwt={_fmt_int(r['event_dwt'])}  "
@@ -518,7 +529,8 @@ def print_summary(rows: List[Dict[str, Any]]) -> None:
     print("───────────────")
     print("  • Step 1 changes no firmware authority. Any residual change is unrelated to this report.")
     print("  • measured_edge_fast_residual_ns uses the same sign as pps_fast_residual_ns: positive means clock_fast.")
-    print("  • If pps_fast_residual_ns breathes while measured_edge_fast_residual_ns is quiet, the PPS projection surface is suspect.")
+    print("  • After Step 2, res_src should be BRIDGE_EDGE_INTERVAL and sci_resid should follow Alpha bridge-edge science.")
+    print("  • public_minus_science_residual shows how far the public PPS projection diverges from the science residual.")
     print("  • If pps_projection_source is mostly STATIC_NEXT_EDGE, the metrics panel is seeing open-second projection geometry.")
     print("  • If witness_minus_measured stays blank, TIMEBASE does not currently expose process_interrupt's GNSS witness field.")
     print("  • If you need bridge_resolved_count/fallback/phi/span row-by-row, Beta must add those compact Alpha fields to TIMEBASE_FORENSICS.")
