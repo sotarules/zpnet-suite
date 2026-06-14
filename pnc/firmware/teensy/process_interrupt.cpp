@@ -403,132 +403,19 @@ static constexpr uint32_t OCXO_SERVICE_CLASS_FALSE_IRQ              = 1;
 static constexpr uint32_t OCXO_SERVICE_CLASS_EARLY_PRETARGET        = 2;
 static constexpr uint32_t OCXO_SERVICE_CLASS_ON_OR_AFTER_TARGET     = 3;
 
-// Linear regression is intentionally disabled for the quiet-phase custody
-// checkpoint.  The code surface remains compiled for later reactivation, but
-// no VCLOCK/OCXO samples are fed and no subscriber-facing diagnostic result is
-// populated.  This removes regression as a confounder while we validate whether
-// phase-separated OCXO custody alone collapses the raw cycle residuals.
-static constexpr bool     OCXO_LINEAR_REGRESSION_ENABLED = false;
-static constexpr uint32_t REGRESSION_SAMPLES_PER_SECOND = TICKS_PER_SECOND_EVENT;
-static constexpr uint32_t REGRESSION_COUNTER_DELTA_TICKS = OCXO_CADENCE_INTERVAL_TICKS;
-static constexpr uint32_t REGRESSION_MIN_SAMPLE_COUNT = 16;
-static constexpr int32_t  REGRESSION_FIT_ERROR_THRESHOLD_CYCLES = 4;
-static constexpr double   REGRESSION_Q16_SCALE = 65536.0;
-
-// REGRESSION_SAMPLES report discipline.
-//
-// This command is deliberately live-only and allocates no retained 1000-sample
-// windows.  A prior diagnostic build retained per-sample windows for every
-// lane and destabilized the runtime by consuming too much RAM.  This version
-// only inspects the existing live regression window already present in the
-// baseline HEALTH: EXCELLENT build.
-static constexpr uint32_t REGRESSION_SAMPLE_REPORT_SLICE_LIMIT = 8;
-static constexpr uint32_t REGRESSION_SAMPLE_REPORT_EXTREME_LIMIT = 4;
-
-static_assert(REGRESSION_SAMPLES_PER_SECOND == 1000U,
-              "Regression windows are expected to be 1 kHz / one second");
-
-
-// VCLOCK regression remains disabled until it gets a non-dropping double-buffered
-// 1000-sample window.  The old 32-slot fact ring proved too small for the 1 kHz
-// VCLOCK rail and must not participate in timing authority.
-static constexpr bool VCLOCK_LINEAR_REGRESSION_ENABLED = false;
-static constexpr bool REGRESSION_ANY_ENABLED =
-    VCLOCK_LINEAR_REGRESSION_ENABLED || OCXO_LINEAR_REGRESSION_ENABLED;
-static constexpr uint32_t REGRESSION_RETAINED_SAMPLE_COUNT =
-    REGRESSION_ANY_ENABLED ? REGRESSION_SAMPLES_PER_SECOND : 1U;
-
-
-// Regression is experimental/diagnostic in this build.  The subscriber-facing
-// DWT stays traditional while regression_inferred_dwt_at_event exposes what the
-// fitted edge would have been.
-static constexpr bool LINEAR_REGRESSION_AUTHORED_DWT = false;
-static constexpr bool LINEAR_REGRESSION_DIAGNOSTIC_ONLY = false;
+// Lower-envelope edge inference supersedes the old linear-regression experiment.
+// No regression constants/state/windows remain in process_interrupt.
 
 // ============================================================================
-// Raw ISR-entry DWT interval probe
+// Raw ISR-entry DWT interval probe — retired
 // ============================================================================
-//
-// Diagnostic-only truth recorder.  This deliberately captures the simplest
-// possible one-second interval surface:
-//
-//   interval[n] = isr_entry_dwt_raw[n] - isr_entry_dwt_raw[n-1]
-//
-// No latency correction, no event-coordinate conversion, no EMA, no bridge
-// projection, and no subscriber DWT authority participate.  The report exists
-// to compare literal first-instruction ISR-entry timing for VCLOCK, OCXO1, and
-// OCXO2 with the richer event-coordinate custody chain.
-static constexpr uint32_t ISR_RAW_DWT_INTERVAL_RING_SIZE = 128U;
-
-struct isr_raw_dwt_interval_probe_t {
-  uint32_t endpoint_count = 0;
-  uint32_t interval_count = 0;
-  uint32_t write_index = 0;  // next interval slot to write
-  bool     last_dwt_valid = false;
-  uint32_t last_isr_entry_dwt_raw = 0;
-  bool     last_interval_valid = false;
-  uint32_t last_interval_cycles = 0;
-  int32_t  last_interval_delta_cycles = 0;
-  uint32_t intervals[ISR_RAW_DWT_INTERVAL_RING_SIZE]{};
-};
-
-static isr_raw_dwt_interval_probe_t g_raw_dwt_probe_vclock = {};
-static isr_raw_dwt_interval_probe_t g_raw_dwt_probe_ocxo1 = {};
-static isr_raw_dwt_interval_probe_t g_raw_dwt_probe_ocxo2 = {};
-
-static isr_raw_dwt_interval_probe_t*
-isr_raw_dwt_probe_for(interrupt_subscriber_kind_t kind) {
-  if (kind == interrupt_subscriber_kind_t::VCLOCK) return &g_raw_dwt_probe_vclock;
-  if (kind == interrupt_subscriber_kind_t::OCXO1)  return &g_raw_dwt_probe_ocxo1;
-  if (kind == interrupt_subscriber_kind_t::OCXO2)  return &g_raw_dwt_probe_ocxo2;
-  return nullptr;
-}
-
-static const isr_raw_dwt_interval_probe_t*
-isr_raw_dwt_probe_for_const(interrupt_subscriber_kind_t kind) {
-  return isr_raw_dwt_probe_for(kind);
-}
-
-static void isr_raw_dwt_probe_reset(interrupt_subscriber_kind_t kind) {
-  isr_raw_dwt_interval_probe_t* p = isr_raw_dwt_probe_for(kind);
-  if (!p) return;
-  *p = isr_raw_dwt_interval_probe_t{};
-}
-
-static void isr_raw_dwt_probe_reset_all(void) {
-  isr_raw_dwt_probe_reset(interrupt_subscriber_kind_t::VCLOCK);
-  isr_raw_dwt_probe_reset(interrupt_subscriber_kind_t::OCXO1);
-  isr_raw_dwt_probe_reset(interrupt_subscriber_kind_t::OCXO2);
-}
-
-static void isr_raw_dwt_probe_record(interrupt_subscriber_kind_t kind,
-                                     uint32_t isr_entry_dwt_raw) {
-  isr_raw_dwt_interval_probe_t* p = isr_raw_dwt_probe_for(kind);
-  if (!p) return;
-
-  p->endpoint_count++;
-
-  if (p->last_dwt_valid) {
-    const uint32_t interval = isr_entry_dwt_raw - p->last_isr_entry_dwt_raw;
-    const bool have_previous_interval = p->last_interval_valid;
-
-    p->intervals[p->write_index] = interval;
-    p->write_index =
-        (p->write_index + 1U) % ISR_RAW_DWT_INTERVAL_RING_SIZE;
-    if (p->interval_count < ISR_RAW_DWT_INTERVAL_RING_SIZE) {
-      p->interval_count++;
-    }
-
-    p->last_interval_delta_cycles = have_previous_interval
-        ? (int32_t)((int64_t)interval - (int64_t)p->last_interval_cycles)
-        : 0;
-    p->last_interval_cycles = interval;
-    p->last_interval_valid = true;
-  }
-
-  p->last_isr_entry_dwt_raw = isr_entry_dwt_raw;
-  p->last_dwt_valid = true;
-}
+// The raw first-instruction DWT value is still carried on the event diagnostic
+// surface as dwt_isr_entry_raw.  The retained rolling interval recorder and
+// CSV report were transitional diagnostics and are no longer part of the
+// operational custody path.
+static inline void isr_raw_dwt_probe_reset_all(void) {}
+static inline void isr_raw_dwt_probe_record(interrupt_subscriber_kind_t,
+                                            uint32_t) {}
 
 
 // ============================================================================
@@ -625,65 +512,29 @@ static constexpr const char* QTIMER_UNIFORM_DOCTRINE =
     "CLOCK_CH0_COUNTER_CH1_COMPARE_EXCEPT_OCXO2_PIN15_QTIMER3_CH3_ADAPTER";
 
 // ============================================================================
-// SpinCatch landing-only witness — symmetric OCXO lead tuning
+// SpinCatch landing-only witness — retired
 // ============================================================================
-//
-// SpinCatch looping is now system-wide TimePop idle work.  The per-lane surface
-// below is landing-only and deliberately symmetric for OCXO1/OCXO2: after each
-// published OCXO one-second fact, schedule a low-duty TimePop callback before
-// the next already-authored target.  The callback records DWT/counter32 landing
-// facts and immediately returns.  It does not spin, does not reprogram or clear
-// any OCXO compare register, does not alter event DWT authority, and does not
-// expand interrupt_capture_diag_t.
+static inline void spincatch_note_isr_entry(interrupt_subscriber_kind_t,
+                                            uint32_t,
+                                            uint16_t,
+                                            uint32_t) {}
+static inline void spincatch_report_reset_all(void) {}
+static void spincatch_maybe_schedule_ocxo_landing(struct ocxo_runtime_context_t&,
+                                                  const struct interrupt_perishable_fact_t&);
 
-static constexpr bool SPINCATCH_REPORT_SHELL_SUPPORTED = true;
-static constexpr bool SPINCATCH_PLANNER_ENABLED = false;
-static constexpr bool SPINCATCH_VCLOCK_ENABLED = false;
-static constexpr bool SPINCATCH_OCXO_LANDING_ONLY_ENABLED = false;
-static constexpr const char* SPINCATCH_REPORT_MODE = "RETIRED_MEMORY_TRIM";
-static constexpr uint32_t SPINCATCH_APPROACH_US = 10U;
-static constexpr uint32_t SPINCATCH_APPROACH_TICKS = SPINCATCH_APPROACH_US * 10U;
-static constexpr uint32_t SPINCATCH_OCXO_LANDING_DUTY_DIVISOR = 1U;
-static constexpr uint32_t SPINCATCH_LANDING_MIN_LEAD_TICKS = 128U;
-static constexpr uint32_t SPINCATCH_LANDING_ATTEMPT_RING_SIZE = 1U;
-static constexpr uint32_t SPINCATCH_LANDING_STALE_TARGET_PERIODS = 2U;
-static_assert(SPINCATCH_APPROACH_TICKS == 100U,
-              "SpinCatch 10 us approach must be 100 ticks at 10 MHz");
 
 // ============================================================================
-// SpinIdle ISR-entry witness
+// SpinIdle ISR-entry witness — retired
 // ============================================================================
-//
-// Step 6.1 turns SpinCatch into an ISR-side admissibility test against the
-// global TimePop-owned idle DWT witness.  This remains diagnostic only: it
-// does not repair, replace, veto, or re-author any event DWT.
-
-static constexpr bool     SPINIDLE_ISR_WITNESS_SUPPORTED = true;
-static constexpr bool     SPINIDLE_ISR_WITNESS_ENABLED = true;
-static constexpr uint32_t SPINIDLE_SHADOW_VALID_THRESHOLD_CYCLES = 100U;
-
 struct spinidle_isr_capture_t {
-  bool supported = SPINIDLE_ISR_WITNESS_SUPPORTED;
-  bool enabled = SPINIDLE_ISR_WITNESS_ENABLED;
   bool shadow_valid = false;
   uint32_t shadow_dwt = 0;
   uint32_t shadow_to_isr_entry_cycles = 0;
-  uint32_t threshold_cycles = SPINIDLE_SHADOW_VALID_THRESHOLD_CYCLES;
+  uint32_t threshold_cycles = 0;
 };
-
-static inline spinidle_isr_capture_t spinidle_capture_at_isr_entry(
-    uint32_t isr_entry_dwt_raw) {
-  spinidle_isr_capture_t c{};
-  c.shadow_dwt = (uint32_t)g_timepop_idle_witness_shadow_dwt;
-  c.threshold_cycles = SPINIDLE_SHADOW_VALID_THRESHOLD_CYCLES;
-  c.shadow_to_isr_entry_cycles = c.shadow_dwt
-      ? (uint32_t)(isr_entry_dwt_raw - c.shadow_dwt)
-      : 0xFFFFFFFFUL;
-  c.shadow_valid = c.enabled && c.shadow_dwt != 0 &&
-      c.shadow_to_isr_entry_cycles <= c.threshold_cycles;
-  return c;
+static inline spinidle_isr_capture_t spinidle_capture_at_isr_entry(uint32_t) {
+  return spinidle_isr_capture_t{};
 }
-
 static inline void spinidle_copy_to_diag(interrupt_capture_diag_t& diag,
                                          const spinidle_isr_capture_t& c) {
   diag.spinidle_shadow_valid = c.shadow_valid;
@@ -691,143 +542,26 @@ static inline void spinidle_copy_to_diag(interrupt_capture_diag_t& diag,
   diag.spinidle_shadow_to_isr_entry_cycles = c.shadow_to_isr_entry_cycles;
   diag.spinidle_shadow_valid_threshold_cycles = c.threshold_cycles;
 }
-
 static spinidle_isr_capture_t g_spinidle_pps_last_capture = {};
 static spinidle_isr_capture_t g_spinidle_timepop_last_capture = {};
 
 
 // ============================================================================
-// Passive ISR sanity witness
+// Passive ISR sanity witness — retired
 // ============================================================================
-//
-// This is intentionally report-only.  It observes event facts already captured
-// by an ISR and records only the smallest standard sanity surface:
-//
-//   CNTR correct/incorrect count + last expected/actual
-//   DWT  correct/incorrect count + last expected/actual
-//
-// It never repairs, suppresses, re-arms, publishes, or changes timing truth.
-// Thresholds are deliberately internal constants so the report stays readable.
-// CNTR expectations are compensated for known read latency; after compensation
-// the expected and actual counter values must match exactly.
-
-static constexpr uint32_t ISR_SANITY_DWT_ERROR_THRESHOLD_CYCLES = 1000U;
-static constexpr uint32_t ISR_SANITY_VCLOCK_CNTR_READ_LATENCY_TICKS = 2U;
-static constexpr uint32_t ISR_SANITY_OCXO_CNTR_READ_LATENCY_TICKS = 1U;
-// OCXO CNTR reads occur after first-instruction DWT capture and a slow
-// peripheral counter read.  The exact observed low word may therefore be the
-// compare tooth plus a tiny positive read-latency advance.  This is not a
-// broad +/- window: negative/early offsets remain hard failures, and anything
-// beyond this small positive read-latency band is counted incorrect.
-static constexpr uint32_t ISR_SANITY_OCXO_CNTR_MIN_READ_LATENCY_TICKS = 0U;
-static constexpr uint32_t ISR_SANITY_OCXO_CNTR_MAX_READ_LATENCY_TICKS = 2U;
-static constexpr uint32_t ISR_SANITY_PPS_CNTR_READ_LATENCY_TICKS = 0U;
-
-struct isr_sanity_diag_t {
-  uint32_t cntr_correct_count = 0;
-  uint32_t cntr_incorrect_count = 0;
-  uint32_t cntr_expected = 0;
-  uint32_t cntr_actual = 0;
-
-  uint32_t dwt_correct_count = 0;
-  uint32_t dwt_incorrect_count = 0;
-  uint32_t dwt_expected = 0;
-  uint32_t dwt_actual = 0;
-};
-
+struct isr_sanity_diag_t {};
 static isr_sanity_diag_t g_isr_sanity_vclock_ch2 = {};
 static isr_sanity_diag_t g_isr_sanity_ocxo1 = {};
 static isr_sanity_diag_t g_isr_sanity_ocxo2 = {};
 static isr_sanity_diag_t g_isr_sanity_pps = {};
-
-// VCLOCK sanity is recorded on public one-second CH2 facts, not every CH2
-// scheduler fire.  CH2 also carries TimePop scheduling traffic, and applying a
-// single DWT interval expectation to mixed CH2 events creates false errors.
-static bool     g_isr_sanity_vclock_ch2_prev_valid = false;
-static uint32_t g_isr_sanity_vclock_ch2_prev_counter32 = 0;
-static uint32_t g_isr_sanity_vclock_ch2_prev_dwt = 0;
-
-static bool     g_isr_sanity_pps_prev_valid = false;
-static uint32_t g_isr_sanity_pps_prev_counter32 = 0;
-static uint32_t g_isr_sanity_pps_prev_dwt = 0;
-
-static inline uint32_t isr_sanity_abs_i32(int32_t value) {
-  return (uint32_t)(value < 0 ? -(int64_t)value : (int64_t)value);
-}
-
-static void isr_sanity_reset(isr_sanity_diag_t& s) {
-  s = isr_sanity_diag_t{};
-}
-
-static void isr_sanity_record_cntr(isr_sanity_diag_t& s,
-                                   bool has_expectation,
-                                   uint32_t expected,
-                                   uint32_t actual) {
-  if (!has_expectation) return;
-
-  s.cntr_expected = expected;
-  s.cntr_actual = actual;
-
-  if (actual == expected) {
-    s.cntr_correct_count++;
-  } else {
-    s.cntr_incorrect_count++;
-  }
-}
-
-static void isr_sanity_record_cntr_latency_band(isr_sanity_diag_t& s,
-                                                bool has_expectation,
-                                                uint16_t target_low16,
-                                                uint16_t actual_low16,
-                                                uint32_t min_latency_ticks,
-                                                uint32_t max_latency_ticks,
-                                                uint32_t preferred_latency_ticks) {
-  if (!has_expectation) return;
-
-  const uint16_t preferred_expected =
-      (uint16_t)(target_low16 + (uint16_t)preferred_latency_ticks);
-  uint16_t matched_expected = preferred_expected;
-  bool matched = false;
-
-  for (uint32_t latency = min_latency_ticks;
-       latency <= max_latency_ticks;
-       latency++) {
-    const uint16_t candidate = (uint16_t)(target_low16 + (uint16_t)latency);
-    if (actual_low16 == candidate) {
-      matched_expected = candidate;
-      matched = true;
-      break;
-    }
-  }
-
-  s.cntr_expected = (uint32_t)matched_expected;
-  s.cntr_actual = (uint32_t)actual_low16;
-
-  if (matched) {
-    s.cntr_correct_count++;
-  } else {
-    s.cntr_incorrect_count++;
-  }
-}
-
-static void isr_sanity_record_dwt(isr_sanity_diag_t& s,
-                                  bool has_expectation,
-                                  uint32_t expected,
-                                  uint32_t actual) {
-  if (!has_expectation) return;
-
-  s.dwt_expected = expected;
-  s.dwt_actual = actual;
-
-  const int32_t delta = (int32_t)((int64_t)actual - (int64_t)expected);
-  if (isr_sanity_abs_i32(delta) <= ISR_SANITY_DWT_ERROR_THRESHOLD_CYCLES) {
-    s.dwt_correct_count++;
-  } else {
-    s.dwt_incorrect_count++;
-  }
-}
-
-static isr_sanity_diag_t* isr_sanity_for_kind(interrupt_subscriber_kind_t kind) {
+static inline void isr_sanity_reset(isr_sanity_diag_t&) {}
+static inline void isr_sanity_record_cntr(isr_sanity_diag_t&, bool, uint32_t, uint32_t) {}
+static inline void isr_sanity_record_cntr_latency_band(isr_sanity_diag_t&, bool,
+                                                       uint16_t, uint16_t,
+                                                       uint32_t, uint32_t,
+                                                       uint32_t) {}
+static inline void isr_sanity_record_dwt(isr_sanity_diag_t&, bool, uint32_t, uint32_t) {}
+static inline isr_sanity_diag_t* isr_sanity_for_kind(interrupt_subscriber_kind_t kind) {
   if (kind == interrupt_subscriber_kind_t::VCLOCK) return &g_isr_sanity_vclock_ch2;
   if (kind == interrupt_subscriber_kind_t::OCXO1)  return &g_isr_sanity_ocxo1;
   if (kind == interrupt_subscriber_kind_t::OCXO2)  return &g_isr_sanity_ocxo2;
@@ -935,6 +669,9 @@ struct pps_yardstick_store_t {
 };
 
 static pps_yardstick_store_t g_pps_yardstick;
+static bool     g_pps_yardstick_prev_valid = false;
+static uint32_t g_pps_yardstick_prev_counter32 = 0;
+static uint32_t g_pps_yardstick_prev_dwt = 0;
 
 struct pps_yardstick_snapshot_t {
   bool     valid = false;
@@ -1947,193 +1684,6 @@ static interrupt_subscriber_runtime_t* g_rt_ocxo2  = nullptr;
 
 static volatile interrupt_pps_entry_latency_handler_fn
     g_pps_entry_latency_handler = nullptr;
-
-
-// ============================================================================
-// SpinCatch report-only lane state
-// ============================================================================
-
-struct spincatch_lane_report_t {
-  bool supported = SPINCATCH_REPORT_SHELL_SUPPORTED;
-  bool enabled = false;
-  bool planner_enabled = SPINCATCH_PLANNER_ENABLED;
-  uint32_t success_count = 0;
-  uint32_t missed_count = 0;
-  uint32_t timeout_count = 0;
-  uint32_t clash_count = 0;
-
-  // Planner surface.  These fields are computed from already-authored lane
-  // targets.  They do not alter compare registers or event authority.
-  bool     planner_valid = false;
-  uint32_t planner_count = 0;
-  uint32_t planner_skip_count = 0;
-  uint32_t target_counter32 = 0;
-  uint16_t target_low16 = 0;
-  uint32_t approach_counter32 = 0;
-  uint16_t approach_low16 = 0;
-  uint32_t approach_ticks = SPINCATCH_APPROACH_TICKS;
-  uint32_t approach_us = SPINCATCH_APPROACH_US;
-  uint32_t approach_dwt_cycles = 0;
-  uint32_t now_counter32 = 0;
-  uint32_t ticks_until_target = 0;
-
-  // Landing-only surface.  OCXO1 and OCXO2 schedule the same TimePop
-  // callback pattern per one-second event; callbacks record landing facts and return immediately.
-  bool     landing_only_enabled = false;
-  bool     landing_pending = false;
-  bool     landing_last_success = false;
-  bool     landing_last_target_changed = false;
-  uint32_t landing_duty_divisor = 0;
-  uint32_t landing_duty_counter = 0;
-  uint32_t landing_schedule_count = 0;
-  uint32_t landing_schedule_skip_count = 0;
-  uint32_t landing_schedule_fail_count = 0;
-  uint32_t landing_count = 0;
-  uint32_t landing_too_close_count = 0;
-  uint32_t landing_target_changed_count = 0;
-  uint32_t landing_attempt_ring_size = SPINCATCH_LANDING_ATTEMPT_RING_SIZE;
-  uint32_t landing_attempt_active_count = 0;
-  uint32_t landing_attempt_stale_count = 0;
-  uint32_t landing_attempt_duplicate_skip_count = 0;
-  uint32_t landing_attempt_ring_full_count = 0;
-  uint32_t landing_attempt_generation = 0;
-  uint32_t landing_target_counter32 = 0;
-  uint16_t landing_target_low16 = 0;
-  uint32_t landing_scheduled_counter32 = 0;
-  uint32_t landing_scheduled_ticks_until_target = 0;
-  uint64_t landing_scheduled_delay_ns = 0;
-  uint32_t landing_scheduled_dwt = 0;
-  uint32_t landing_dwt = 0;
-  uint32_t landing_counter32 = 0;
-  int32_t  landing_offset_ticks = 0;
-  uint32_t landing_ticks_until_target = 0;
-  uint32_t landing_fire_vclock_raw = 0;
-  uint32_t landing_fire_dwt = 0;
-  timepop_handle_t landing_handle = TIMEPOP_INVALID_HANDLE;
-};
-
-static spincatch_lane_report_t g_spincatch_vclock = {};
-static spincatch_lane_report_t g_spincatch_ocxo1 = {};
-static spincatch_lane_report_t g_spincatch_ocxo2 = {};
-
-// Active-token flags are deliberately not armed in Step 5.  Landing-only does
-// not use the shadow handoff yet; it only schedules a foreground callback.
-static volatile bool g_spincatch_vclock_capture_active = false;
-static volatile bool g_spincatch_ocxo1_capture_active = false;
-static volatile bool g_spincatch_ocxo2_capture_active = false;
-
-struct spincatch_landing_context_t {
-  interrupt_subscriber_kind_t kind = interrupt_subscriber_kind_t::NONE;
-  uint32_t attempt_index = 0;
-  uint32_t generation = 0;
-};
-
-struct spincatch_landing_attempt_t {
-  bool active = false;
-  interrupt_subscriber_kind_t kind = interrupt_subscriber_kind_t::NONE;
-  uint32_t generation = 0;
-  timepop_handle_t handle = TIMEPOP_INVALID_HANDLE;
-  uint32_t target_counter32 = 0;
-  uint16_t target_low16 = 0;
-  uint32_t scheduled_counter32 = 0;
-  uint32_t scheduled_ticks_until_target = 0;
-  uint64_t scheduled_delay_ns = 0;
-  uint32_t scheduled_dwt = 0;
-};
-
-static spincatch_landing_attempt_t
-    g_spincatch_ocxo1_attempts[SPINCATCH_LANDING_ATTEMPT_RING_SIZE] = {};
-static spincatch_landing_attempt_t
-    g_spincatch_ocxo2_attempts[SPINCATCH_LANDING_ATTEMPT_RING_SIZE] = {};
-static spincatch_landing_context_t
-    g_spincatch_ocxo1_landing_contexts[SPINCATCH_LANDING_ATTEMPT_RING_SIZE] = {};
-static spincatch_landing_context_t
-    g_spincatch_ocxo2_landing_contexts[SPINCATCH_LANDING_ATTEMPT_RING_SIZE] = {};
-
-static bool spincatch_enabled_for_kind(interrupt_subscriber_kind_t kind) {
-  if (kind == interrupt_subscriber_kind_t::VCLOCK) return SPINCATCH_VCLOCK_ENABLED;
-  if (kind == interrupt_subscriber_kind_t::OCXO1 ||
-      kind == interrupt_subscriber_kind_t::OCXO2) {
-    return SPINCATCH_OCXO_LANDING_ONLY_ENABLED;
-  }
-  return false;
-}
-
-static uint32_t spincatch_landing_duty_for_kind(interrupt_subscriber_kind_t kind) {
-  if (kind == interrupt_subscriber_kind_t::OCXO1 ||
-      kind == interrupt_subscriber_kind_t::OCXO2) {
-    return SPINCATCH_OCXO_LANDING_DUTY_DIVISOR;
-  }
-  return 0U;
-}
-
-static spincatch_lane_report_t* spincatch_report_for_kind(
-    interrupt_subscriber_kind_t kind) {
-  if (kind == interrupt_subscriber_kind_t::VCLOCK) return &g_spincatch_vclock;
-  if (kind == interrupt_subscriber_kind_t::OCXO1) return &g_spincatch_ocxo1;
-  if (kind == interrupt_subscriber_kind_t::OCXO2) return &g_spincatch_ocxo2;
-  return nullptr;
-}
-
-static volatile bool* spincatch_capture_active_for_kind(
-    interrupt_subscriber_kind_t kind) {
-  if (kind == interrupt_subscriber_kind_t::VCLOCK) return &g_spincatch_vclock_capture_active;
-  if (kind == interrupt_subscriber_kind_t::OCXO1) return &g_spincatch_ocxo1_capture_active;
-  if (kind == interrupt_subscriber_kind_t::OCXO2) return &g_spincatch_ocxo2_capture_active;
-  return nullptr;
-}
-
-static inline void spincatch_note_isr_entry(
-    interrupt_subscriber_kind_t kind,
-    uint32_t target_counter32,
-    uint16_t target_low16,
-    uint32_t isr_entry_dwt_raw) {
-  volatile bool* active = spincatch_capture_active_for_kind(kind);
-  if (!active || !*active) {
-    (void)target_counter32;
-    (void)target_low16;
-    (void)isr_entry_dwt_raw;
-    return;
-  }
-
-  // No lane can reach this branch in Step 5.  Future steps will install the
-  // shadow capture handoff here after landing-only is proven stable.
-  (void)target_counter32;
-  (void)target_low16;
-  (void)isr_entry_dwt_raw;
-}
-
-static void spincatch_report_reset_all(void) {
-  g_spincatch_vclock = spincatch_lane_report_t{};
-  g_spincatch_ocxo1 = spincatch_lane_report_t{};
-  g_spincatch_ocxo2 = spincatch_lane_report_t{};
-
-  g_spincatch_vclock.enabled = spincatch_enabled_for_kind(interrupt_subscriber_kind_t::VCLOCK);
-  g_spincatch_ocxo1.enabled = spincatch_enabled_for_kind(interrupt_subscriber_kind_t::OCXO1);
-  g_spincatch_ocxo2.enabled = spincatch_enabled_for_kind(interrupt_subscriber_kind_t::OCXO2);
-
-  g_spincatch_ocxo1.landing_only_enabled = SPINCATCH_OCXO_LANDING_ONLY_ENABLED;
-  g_spincatch_ocxo1.landing_duty_divisor = SPINCATCH_OCXO_LANDING_DUTY_DIVISOR;
-  g_spincatch_ocxo1.landing_attempt_ring_size = SPINCATCH_LANDING_ATTEMPT_RING_SIZE;
-  g_spincatch_ocxo2.landing_only_enabled = SPINCATCH_OCXO_LANDING_ONLY_ENABLED;
-  g_spincatch_ocxo2.landing_duty_divisor = SPINCATCH_OCXO_LANDING_DUTY_DIVISOR;
-  g_spincatch_ocxo2.landing_attempt_ring_size = SPINCATCH_LANDING_ATTEMPT_RING_SIZE;
-
-  for (uint32_t i = 0; i < SPINCATCH_LANDING_ATTEMPT_RING_SIZE; i++) {
-    g_spincatch_ocxo1_attempts[i] = spincatch_landing_attempt_t{};
-    g_spincatch_ocxo2_attempts[i] = spincatch_landing_attempt_t{};
-    g_spincatch_ocxo1_landing_contexts[i] = spincatch_landing_context_t{};
-    g_spincatch_ocxo2_landing_contexts[i] = spincatch_landing_context_t{};
-    g_spincatch_ocxo1_landing_contexts[i].kind = interrupt_subscriber_kind_t::OCXO1;
-    g_spincatch_ocxo2_landing_contexts[i].kind = interrupt_subscriber_kind_t::OCXO2;
-    g_spincatch_ocxo1_landing_contexts[i].attempt_index = i;
-    g_spincatch_ocxo2_landing_contexts[i].attempt_index = i;
-  }
-
-  g_spincatch_vclock_capture_active = false;
-  g_spincatch_ocxo1_capture_active = false;
-  g_spincatch_ocxo2_capture_active = false;
-}
 
 
 // ============================================================================
@@ -4059,134 +3609,17 @@ static const char* dispatch_timer_name(interrupt_subscriber_kind_t kind) {
 }
 
 // ============================================================================
-// Shared 1 kHz linear regression engine
+// 1 kHz linear regression — retired
 // ============================================================================
+// Lower-envelope edge authority supersedes the disabled linear-regression
+// experiment.  The old regression state/window/report code is removed; these
+// no-op shims preserve call sites until the public diagnostic ABI is narrowed.
+struct cadence_regression_result_t {};
+static inline void cadence_regression_reset_kind(interrupt_subscriber_kind_t) {}
+static inline void cadence_regression_reset_all(void) {}
+static inline void copy_regression_diag(interrupt_capture_diag_t&,
+                                        const cadence_regression_result_t*) {}
 
-struct cadence_regression_sample_t {
-  interrupt_subscriber_kind_t kind = interrupt_subscriber_kind_t::NONE;
-  uint32_t observed_dwt_at_event = 0;
-  uint32_t target_counter32_at_event = 0;
-  uint16_t target_hardware16_at_event = 0;
-  uint16_t observed_hardware16_at_event = 0;
-  bool one_second_due = false;
-};
-
-struct cadence_regression_result_t {
-  bool valid = false;
-  uint32_t sequence = 0;
-  uint32_t sample_count = 0;
-
-  uint32_t observed_dwt_at_event = 0;
-  uint32_t inferred_dwt_at_event = 0;
-  int32_t inferred_minus_observed_cycles = 0;
-
-  uint32_t target_counter32_at_event = 0;
-  uint16_t target_hardware16_at_event = 0;
-  uint16_t observed_hardware16_at_event = 0;
-
-  uint64_t slope_q16_cycles_per_sample = 0;
-  int64_t slope_delta_q16_cycles_per_sample = 0;
-  int32_t fit_error_mean_q16_cycles = 0;
-  uint32_t fit_error_stddev_q16_cycles = 0;
-  int32_t fit_error_min_cycles = 0;
-  int32_t fit_error_max_cycles = 0;
-  uint32_t fit_error_gt_plus4_count = 0;
-  uint32_t fit_error_lt_minus4_count = 0;
-  uint32_t fit_error_abs_gt4_count = 0;
-};
-
-struct cadence_regression_lane_t {
-  interrupt_subscriber_kind_t kind = interrupt_subscriber_kind_t::NONE;
-  bool window_active = false;
-  uint32_t sequence = 0;
-  uint32_t sample_total_count = 0;
-  uint32_t reset_count = 0;
-  uint32_t insufficient_count = 0;
-  uint32_t counter_discontinuity_count = 0;
-
-  uint32_t sample_count = 0;
-  uint32_t base_counter32 = 0;
-  uint32_t base_observed_dwt = 0;
-  uint32_t last_counter32 = 0;
-  uint32_t last_observed_dwt = 0;
-
-  bool previous_slope_valid = false;
-  double previous_slope_cycles_per_sample = 0.0;
-
-  int32_t observed_dwt_rel[REGRESSION_RETAINED_SAMPLE_COUNT]{};
-  cadence_regression_result_t last_result{};
-};
-
-static cadence_regression_lane_t g_regression_vclock = {};
-static cadence_regression_lane_t g_regression_ocxo1 = {};
-static cadence_regression_lane_t g_regression_ocxo2 = {};
-
-static cadence_regression_lane_t*
-cadence_regression_for(interrupt_subscriber_kind_t kind) {
-  if (kind == interrupt_subscriber_kind_t::VCLOCK) return &g_regression_vclock;
-  if (kind == interrupt_subscriber_kind_t::OCXO1)  return &g_regression_ocxo1;
-  if (kind == interrupt_subscriber_kind_t::OCXO2)  return &g_regression_ocxo2;
-  return nullptr;
-}
-
-static const cadence_regression_lane_t*
-cadence_regression_for_const(interrupt_subscriber_kind_t kind) {
-  return cadence_regression_for(kind);
-}
-
-static void cadence_regression_reset_kind(interrupt_subscriber_kind_t kind) {
-  cadence_regression_lane_t* r = cadence_regression_for(kind);
-  if (!r) return;
-
-  const interrupt_subscriber_kind_t saved_kind = r->kind;
-  const uint32_t prior_reset_count = r->reset_count;
-  *r = cadence_regression_lane_t{};
-  r->kind = (saved_kind == interrupt_subscriber_kind_t::NONE) ? kind : saved_kind;
-  r->reset_count = prior_reset_count + 1U;
-}
-
-static void cadence_regression_reset_all(void) {
-  g_regression_vclock = cadence_regression_lane_t{};
-  g_regression_ocxo1 = cadence_regression_lane_t{};
-  g_regression_ocxo2 = cadence_regression_lane_t{};
-  g_regression_vclock.kind = interrupt_subscriber_kind_t::VCLOCK;
-  g_regression_ocxo1.kind = interrupt_subscriber_kind_t::OCXO1;
-  g_regression_ocxo2.kind = interrupt_subscriber_kind_t::OCXO2;
-}
-
-static void copy_regression_diag(interrupt_capture_diag_t& diag,
-                                 const cadence_regression_result_t* r) {
-  if (!r) return;
-
-  diag.regression_valid = r->valid;
-  diag.regression_sequence = r->sequence;
-  diag.regression_sample_count = r->sample_count;
-  diag.regression_observed_dwt_at_event = r->observed_dwt_at_event;
-  diag.regression_inferred_dwt_at_event = r->inferred_dwt_at_event;
-  diag.regression_inferred_minus_observed_cycles =
-      r->inferred_minus_observed_cycles;
-  diag.regression_target_counter32_at_event = r->target_counter32_at_event;
-  diag.regression_target_hardware16_at_event = r->target_hardware16_at_event;
-  diag.regression_observed_hardware16_at_event =
-      r->observed_hardware16_at_event;
-  diag.regression_slope_q16_cycles_per_sample =
-      r->slope_q16_cycles_per_sample;
-  diag.regression_slope_delta_q16_cycles_per_sample =
-      r->slope_delta_q16_cycles_per_sample;
-  diag.regression_fit_error_mean_q16_cycles =
-      r->fit_error_mean_q16_cycles;
-  diag.regression_fit_error_stddev_q16_cycles =
-      r->fit_error_stddev_q16_cycles;
-  diag.regression_fit_error_min_cycles = r->fit_error_min_cycles;
-  diag.regression_fit_error_max_cycles = r->fit_error_max_cycles;
-  diag.regression_fit_error_gt_plus4_count = r->fit_error_gt_plus4_count;
-  diag.regression_fit_error_lt_minus4_count = r->fit_error_lt_minus4_count;
-  diag.regression_fit_error_abs_gt4_count = r->fit_error_abs_gt4_count;
-
-  // Diagnostic-only build: do not promote the fitted DWT into any legacy
-  // correction/authority field.  Alpha/Beta can compare diag.dwt_at_event
-  // against regression_inferred_dwt_at_event without changing physics math.
-}
 
 // ============================================================================
 // Diag fill + event dispatch
@@ -4636,31 +4069,7 @@ static void vclock_ch2_one_second_service(uint32_t isr_entry_dwt_raw,
   g_vclock_ch2_one_second_last_service_counter32 = service_counter32;
   g_vclock_ch2_one_second_last_dwt = authored_dwt;
 
-  // Passive ISR sanity witness for the public VCLOCK one-second fact.  CNTR
-  // sanity verifies the ambient counter observation after known CH0 read
-  // latency.  DWT sanity compares consecutive authored one-second DWT intervals
-  // against the exact VCLOCK tick interval between their target identities.
-  const uint32_t vclock_cntr_expected =
-      service_counter32 + ISR_SANITY_VCLOCK_CNTR_READ_LATENCY_TICKS;
-  const uint32_t vclock_cntr_actual = g_vclock_clock32.current_counter32;
-  isr_sanity_record_cntr(g_isr_sanity_vclock_ch2,
-                         true,
-                         vclock_cntr_expected,
-                         vclock_cntr_actual);
-
-  if (g_isr_sanity_vclock_ch2_prev_valid) {
-    const uint32_t expected_dwt_delta = vclock_cycles_for_ticks(
-        target_counter32 - g_isr_sanity_vclock_ch2_prev_counter32);
-    const uint32_t actual_dwt_delta =
-        authored_dwt - g_isr_sanity_vclock_ch2_prev_dwt;
-    isr_sanity_record_dwt(g_isr_sanity_vclock_ch2,
-                          true,
-                          expected_dwt_delta,
-                          actual_dwt_delta);
-  }
-  g_isr_sanity_vclock_ch2_prev_valid = true;
-  g_isr_sanity_vclock_ch2_prev_counter32 = target_counter32;
-  g_isr_sanity_vclock_ch2_prev_dwt = authored_dwt;
+  // Passive ISR sanity witness retired.
 
   if (vclock_fact_ring_push_no_arm_from_isr(fact)) {
     g_vclock_ch2_one_second_enqueue_count++;
@@ -6441,290 +5850,8 @@ static uint32_t ocxo_lane_yardstick_observe(ocxo_lane_t& lane,
   return published_dwt;
 }
 
-static bool spincatch_current_target_for_kind(interrupt_subscriber_kind_t kind,
-                                              uint32_t& target_counter32) {
-  target_counter32 = 0;
-
-  ocxo_runtime_context_t* ctx = ocxo_context_for(kind);
-  if (!ctx || !ctx->lane) return false;
-
-  const ocxo_lane_t& lane = *ctx->lane;
-  if (!lane.initialized || !lane.cadence_enabled ||
-      !lane.witness_target_initialized || lane.cadence_next_counter32 == 0) {
-    return false;
-  }
-
-  target_counter32 = lane.cadence_next_counter32;
-  return true;
-}
-
-static spincatch_landing_attempt_t* spincatch_attempts_for_kind(
-    interrupt_subscriber_kind_t kind) {
-  if (kind == interrupt_subscriber_kind_t::OCXO1) return g_spincatch_ocxo1_attempts;
-  if (kind == interrupt_subscriber_kind_t::OCXO2) return g_spincatch_ocxo2_attempts;
-  return nullptr;
-}
-
-static spincatch_landing_context_t* spincatch_landing_contexts_for_kind(
-    interrupt_subscriber_kind_t kind) {
-  if (kind == interrupt_subscriber_kind_t::OCXO1) return g_spincatch_ocxo1_landing_contexts;
-  if (kind == interrupt_subscriber_kind_t::OCXO2) return g_spincatch_ocxo2_landing_contexts;
-  return nullptr;
-}
-
-static uint32_t spincatch_landing_attempt_active_count(
-    interrupt_subscriber_kind_t kind) {
-  spincatch_landing_attempt_t* attempts = spincatch_attempts_for_kind(kind);
-  if (!attempts) return 0;
-
-  uint32_t count = 0;
-  for (uint32_t i = 0; i < SPINCATCH_LANDING_ATTEMPT_RING_SIZE; i++) {
-    if (attempts[i].active) count++;
-  }
-  return count;
-}
-
-static void spincatch_landing_refresh_pending(spincatch_lane_report_t& s,
-                                              interrupt_subscriber_kind_t kind) {
-  const uint32_t active = spincatch_landing_attempt_active_count(kind);
-  s.landing_attempt_active_count = active;
-  s.landing_pending = active != 0;
-}
-
-static void spincatch_landing_retire_stale_attempts(
-    interrupt_subscriber_kind_t kind,
-    spincatch_lane_report_t& s,
-    uint32_t current_target_counter32) {
-  spincatch_landing_attempt_t* attempts = spincatch_attempts_for_kind(kind);
-  if (!attempts) return;
-
-  const uint32_t stale_ticks =
-      OCXO_WITNESS_ONE_SECOND_COUNTS * SPINCATCH_LANDING_STALE_TARGET_PERIODS;
-
-  for (uint32_t i = 0; i < SPINCATCH_LANDING_ATTEMPT_RING_SIZE; i++) {
-    spincatch_landing_attempt_t& a = attempts[i];
-    if (!a.active) continue;
-    if ((uint32_t)(current_target_counter32 - a.target_counter32) <= stale_ticks) continue;
-
-    a.active = false;
-    a.handle = TIMEPOP_INVALID_HANDLE;
-    s.landing_attempt_stale_count++;
-    s.missed_count++;
-    s.landing_target_changed_count++;
-    s.landing_last_success = false;
-    s.landing_last_target_changed = true;
-  }
-
-  spincatch_landing_refresh_pending(s, kind);
-}
-
-static bool spincatch_landing_attempt_exists(interrupt_subscriber_kind_t kind,
-                                             uint32_t target_counter32) {
-  spincatch_landing_attempt_t* attempts = spincatch_attempts_for_kind(kind);
-  if (!attempts) return false;
-
-  for (uint32_t i = 0; i < SPINCATCH_LANDING_ATTEMPT_RING_SIZE; i++) {
-    if (attempts[i].active && attempts[i].target_counter32 == target_counter32) {
-      return true;
-    }
-  }
-  return false;
-}
-
-static spincatch_landing_attempt_t* spincatch_landing_alloc_attempt(
-    interrupt_subscriber_kind_t kind,
-    uint32_t* out_index) {
-  spincatch_landing_attempt_t* attempts = spincatch_attempts_for_kind(kind);
-  if (!attempts) return nullptr;
-
-  for (uint32_t i = 0; i < SPINCATCH_LANDING_ATTEMPT_RING_SIZE; i++) {
-    if (!attempts[i].active) {
-      if (out_index) *out_index = i;
-      return &attempts[i];
-    }
-  }
-  return nullptr;
-}
-
-static void spincatch_landing_callback(timepop_ctx_t* ctx,
-                                       timepop_diag_t*,
-                                       void* user_data) {
-  auto* landing_ctx = static_cast<spincatch_landing_context_t*>(user_data);
-  if (!landing_ctx) return;
-  if (landing_ctx->attempt_index >= SPINCATCH_LANDING_ATTEMPT_RING_SIZE) return;
-
-  spincatch_lane_report_t* s = spincatch_report_for_kind(landing_ctx->kind);
-  spincatch_landing_attempt_t* attempts = spincatch_attempts_for_kind(landing_ctx->kind);
-  if (!s || !attempts) return;
-
-  spincatch_landing_attempt_t& attempt = attempts[landing_ctx->attempt_index];
-  if (!attempt.active || attempt.generation != landing_ctx->generation) {
-    // Stale callback from a retired/reused attempt.  The attempt ring makes
-    // this harmless; do not let it perturb the current lane result.
-    spincatch_landing_refresh_pending(*s, landing_ctx->kind);
-    return;
-  }
-
-  attempt.active = false;
-  attempt.handle = TIMEPOP_INVALID_HANDLE;
-  s->landing_count++;
-
-  interrupt_clock_snapshot_t snap{};
-  const bool snap_ok = interrupt_clock_snapshot(landing_ctx->kind, &snap);
-
-  const uint32_t landing_counter32 = snap_ok ? snap.counter32 : 0U;
-  const uint32_t target_counter32 = attempt.target_counter32;
-  uint32_t current_target = 0;
-  const bool current_target_ok =
-      spincatch_current_target_for_kind(landing_ctx->kind, current_target);
-  const bool target_changed = current_target_ok && current_target != target_counter32;
-
-  const int32_t signed_until_target =
-      (int32_t)(target_counter32 - landing_counter32);
-  const bool before_target = signed_until_target > 0;
-  const bool success = snap_ok && before_target;
-
-  s->landing_last_success = success;
-  s->landing_last_target_changed = target_changed;
-  s->landing_dwt = (ctx && ctx->fire_dwt_cyccnt != 0)
-      ? ctx->fire_dwt_cyccnt
-      : ARM_DWT_CYCCNT;
-  s->landing_counter32 = landing_counter32;
-  s->landing_offset_ticks = (int32_t)(landing_counter32 - target_counter32);
-  s->landing_ticks_until_target = before_target ? (uint32_t)signed_until_target : 0U;
-  s->landing_fire_vclock_raw = ctx ? ctx->fire_vclock_raw : 0U;
-  s->landing_fire_dwt = ctx ? ctx->fire_dwt_cyccnt : 0U;
-  s->landing_target_counter32 = target_counter32;
-  s->landing_target_low16 = attempt.target_low16;
-
-  if (success) {
-    s->success_count++;
-  } else {
-    s->missed_count++;
-    if (target_changed) {
-      s->landing_target_changed_count++;
-    }
-  }
-
-  spincatch_landing_refresh_pending(*s, landing_ctx->kind);
-}
-
 static void spincatch_maybe_schedule_ocxo_landing(
-    ocxo_runtime_context_t& ctx,
-    const interrupt_perishable_fact_t& fact) {
-  if (!SPINCATCH_OCXO_LANDING_ONLY_ENABLED) return;
-  if (ctx.kind != interrupt_subscriber_kind_t::OCXO1 &&
-      ctx.kind != interrupt_subscriber_kind_t::OCXO2) return;
-  if (!fact.one_second_due) return;
-  if (!ctx.lane || !ctx.clock32) return;
-
-  spincatch_lane_report_t* s = spincatch_report_for_kind(ctx.kind);
-  spincatch_landing_context_t* contexts =
-      spincatch_landing_contexts_for_kind(ctx.kind);
-  if (!s || !contexts) return;
-
-  s->enabled = true;
-  s->landing_only_enabled = true;
-  s->landing_duty_divisor = SPINCATCH_OCXO_LANDING_DUTY_DIVISOR;
-  s->landing_attempt_ring_size = SPINCATCH_LANDING_ATTEMPT_RING_SIZE;
-  s->landing_duty_counter++;
-
-  const ocxo_lane_t& lane = *ctx.lane;
-  const bool target_valid =
-      lane.initialized && lane.cadence_enabled &&
-      lane.witness_target_initialized && lane.cadence_next_counter32 != 0;
-  if (!target_valid) {
-    s->landing_schedule_skip_count++;
-    spincatch_landing_refresh_pending(*s, ctx.kind);
-    return;
-  }
-
-  const uint32_t target_counter32 = lane.cadence_next_counter32;
-  spincatch_landing_retire_stale_attempts(ctx.kind, *s, target_counter32);
-
-  const uint32_t duty = spincatch_landing_duty_for_kind(ctx.kind);
-  if (duty != 0 && (s->landing_duty_counter % duty) != 0) {
-    s->landing_schedule_skip_count++;
-    spincatch_landing_refresh_pending(*s, ctx.kind);
-    return;
-  }
-
-  if (spincatch_landing_attempt_exists(ctx.kind, target_counter32)) {
-    s->landing_attempt_duplicate_skip_count++;
-    s->landing_schedule_skip_count++;
-    spincatch_landing_refresh_pending(*s, ctx.kind);
-    return;
-  }
-
-  interrupt_clock_snapshot_t snap{};
-  if (!interrupt_clock_snapshot(ctx.kind, &snap)) {
-    s->landing_schedule_skip_count++;
-    spincatch_landing_refresh_pending(*s, ctx.kind);
-    return;
-  }
-
-  const uint32_t remaining_ticks = target_counter32 - snap.counter32;
-  if (remaining_ticks == 0 || remaining_ticks > 0x7FFFFFFFUL ||
-      remaining_ticks <= (SPINCATCH_APPROACH_TICKS + SPINCATCH_LANDING_MIN_LEAD_TICKS)) {
-    s->landing_too_close_count++;
-    s->landing_schedule_skip_count++;
-    spincatch_landing_refresh_pending(*s, ctx.kind);
-    return;
-  }
-
-  uint32_t attempt_index = 0;
-  spincatch_landing_attempt_t* attempt =
-      spincatch_landing_alloc_attempt(ctx.kind, &attempt_index);
-  if (!attempt) {
-    s->landing_attempt_ring_full_count++;
-    s->landing_schedule_skip_count++;
-    s->clash_count++;
-    spincatch_landing_refresh_pending(*s, ctx.kind);
-    return;
-  }
-
-  const uint32_t delay_ticks = remaining_ticks - SPINCATCH_APPROACH_TICKS;
-  const uint64_t delay_ns = (uint64_t)delay_ticks * 100ULL;
-  const uint32_t generation = ++s->landing_attempt_generation;
-
-  contexts[attempt_index].kind = ctx.kind;
-  contexts[attempt_index].attempt_index = attempt_index;
-  contexts[attempt_index].generation = generation;
-
-  const timepop_handle_t h =
-      timepop_arm(delay_ns,
-                  false,
-                  spincatch_landing_callback,
-                  &contexts[attempt_index],
-                  nullptr);
-  if (h == TIMEPOP_INVALID_HANDLE) {
-    s->landing_schedule_fail_count++;
-    spincatch_landing_refresh_pending(*s, ctx.kind);
-    return;
-  }
-
-  *attempt = spincatch_landing_attempt_t{};
-  attempt->active = true;
-  attempt->kind = ctx.kind;
-  attempt->generation = generation;
-  attempt->handle = h;
-  attempt->target_counter32 = target_counter32;
-  attempt->target_low16 = lane.cadence_next_low16;
-  attempt->scheduled_counter32 = snap.counter32;
-  attempt->scheduled_ticks_until_target = remaining_ticks;
-  attempt->scheduled_delay_ns = delay_ns;
-  attempt->scheduled_dwt = ARM_DWT_CYCCNT;
-
-  s->landing_handle = h;
-  s->landing_schedule_count++;
-  s->landing_target_counter32 = target_counter32;
-  s->landing_target_low16 = lane.cadence_next_low16;
-  s->landing_scheduled_counter32 = snap.counter32;
-  s->landing_scheduled_ticks_until_target = remaining_ticks;
-  s->landing_scheduled_delay_ns = delay_ns;
-  s->landing_scheduled_dwt = attempt->scheduled_dwt;
-  spincatch_landing_refresh_pending(*s, ctx.kind);
-}
+    ocxo_runtime_context_t&, const interrupt_perishable_fact_t&) {}
 
 static void ocxo_apply_perishable_fact_deferred(
     ocxo_runtime_context_t& ctx,
@@ -7769,26 +6896,6 @@ static void interrupt_handoff_process_ocxo(ocxo_runtime_context_t& ctx,
                            sample.target_low16,
                            sample.isr_entry_dwt_raw);
 
-  isr_sanity_diag_t* sanity = isr_sanity_for_kind(ctx.kind);
-  if (sanity) {
-    isr_sanity_record_cntr_latency_band(
-        *sanity,
-        sample.had_armed,
-        sample.target_low16,
-        sample.service_counter_low16,
-        ISR_SANITY_OCXO_CNTR_MIN_READ_LATENCY_TICKS,
-        ISR_SANITY_OCXO_CNTR_MAX_READ_LATENCY_TICKS,
-        ISR_SANITY_OCXO_CNTR_READ_LATENCY_TICKS);
-
-    const uint32_t expected_dwt_delta =
-        (uint32_t)dwt_cycles_for_ocxo_ticks_signed(
-            (int32_t)sample.arm_to_isr_ticks);
-    isr_sanity_record_dwt(*sanity,
-                          sample.had_armed,
-                          expected_dwt_delta,
-                          sample.arm_to_isr_dwt_cycles);
-  }
-
   ocxo_cadence_update_synthetic_identity(ctx, sample);
   ocxo_cadence_update_sample_phase(ctx, sample);
 
@@ -8278,34 +7385,17 @@ static void interrupt_handoff_process_pps(const pps_capture_packet_t& packet) {
   g_last_pps_witness = pps;
   g_last_pps_witness_valid = true;
 
-  if (g_isr_sanity_pps_prev_valid) {
+  if (g_pps_yardstick_prev_valid) {
     const uint32_t observed_counter_delta =
-        observed_counter32 - g_isr_sanity_pps_prev_counter32;
-    isr_sanity_record_cntr(
-        g_isr_sanity_pps,
-        true,
-        (uint32_t)VCLOCK_COUNTS_PER_SECOND +
-            ISR_SANITY_PPS_CNTR_READ_LATENCY_TICKS,
-        observed_counter_delta);
-
-    const uint32_t observed_dwt_delta =
-        pps.dwt_at_edge - g_isr_sanity_pps_prev_dwt;
-    const uint32_t expected_dwt_delta = interrupt_vclock_cycles_per_second();
-    isr_sanity_record_dwt(g_isr_sanity_pps,
-                          expected_dwt_delta != 0,
-                          expected_dwt_delta,
-                          observed_dwt_delta);
-
-    // Author the PPS yardstick pair for the OCXO yardstick inference rail.
-    // observed_dwt_delta is the unquantized GPIO-path one-second interval;
-    // observed_counter_delta qualifies it as one nominal VCLOCK second.
+        observed_counter32 - g_pps_yardstick_prev_counter32;
+    const uint32_t observed_dwt_delta = pps.dwt_at_edge - g_pps_yardstick_prev_dwt;
     pps_yardstick_record_interval(pps.sequence,
                                   observed_dwt_delta,
                                   observed_counter_delta);
   }
-  g_isr_sanity_pps_prev_valid = true;
-  g_isr_sanity_pps_prev_counter32 = observed_counter32;
-  g_isr_sanity_pps_prev_dwt = pps.dwt_at_edge;
+  g_pps_yardstick_prev_valid = true;
+  g_pps_yardstick_prev_counter32 = observed_counter32;
+  g_pps_yardstick_prev_dwt = pps.dwt_at_edge;
 
   pps_post_isr_defer(epoch_cap, isr_entry_dwt_raw);
 
@@ -8903,13 +7993,10 @@ static void runtime_reset_vclock_heartbeat_state(void) {
   isr_sanity_reset(g_isr_sanity_ocxo1);
   isr_sanity_reset(g_isr_sanity_ocxo2);
   isr_sanity_reset(g_isr_sanity_pps);
-  g_isr_sanity_vclock_ch2_prev_valid = false;
-  g_isr_sanity_vclock_ch2_prev_counter32 = 0;
-  g_isr_sanity_vclock_ch2_prev_dwt = 0;
-  g_isr_sanity_pps_prev_valid = false;
-  g_isr_sanity_pps_prev_counter32 = 0;
-  g_isr_sanity_pps_prev_dwt = 0;
   pps_yardstick_reset();
+  g_pps_yardstick_prev_valid = false;
+  g_pps_yardstick_prev_counter32 = 0;
+  g_pps_yardstick_prev_dwt = 0;
   g_spinidle_pps_last_capture = spinidle_isr_capture_t{};
   g_spinidle_timepop_last_capture = spinidle_isr_capture_t{};
   isr_raw_dwt_probe_reset_all();
@@ -9009,2718 +8096,239 @@ void process_interrupt_enable_irqs(void) {
 }
 
 
-struct payload_prefix_t {
-  Payload& p;
-  const char* prefix;
-  char key[96];
-
-  payload_prefix_t(Payload& payload, const char* prefix_name)
-      : p(payload), prefix(prefix_name ? prefix_name : "") {}
-
-  void make_key(const char* suffix) {
-    snprintf(key, sizeof(key), "%s_%s", prefix, suffix ? suffix : "");
-  }
-
-  void add_bool(const char* suffix, bool value) {
-    make_key(suffix);
-    p.add(key, value);
-  }
-
-  void add_u32(const char* suffix, uint32_t value) {
-    make_key(suffix);
-    p.add(key, value);
-  }
-
-  void add_i32(const char* suffix, int32_t value) {
-    make_key(suffix);
-    p.add(key, value);
-  }
-
-  void add_u64(const char* suffix, uint64_t value) {
-    make_key(suffix);
-    p.add(key, value);
-  }
-
-  void add_string(const char* suffix, const char* value) {
-    make_key(suffix);
-    p.add(key, value ? value : "");
-  }
-
-  void add_i64(const char* suffix, int64_t value) {
-    make_key(suffix);
-    p.add(key, value);
-  }
-
-  void add_str(const char* suffix, const char* value) {
-    make_key(suffix);
-    p.add(key, value ? value : "");
-  }
-};
-
-static FLASHMEM void spincatch_plan_from_target(spincatch_lane_report_t& s,
-                                       bool target_valid,
-                                       uint32_t target_counter32,
-                                       uint16_t target_low16,
-                                       uint32_t now_counter32) {
-  s.approach_ticks = SPINCATCH_APPROACH_TICKS;
-  s.approach_us = SPINCATCH_APPROACH_US;
-  s.now_counter32 = now_counter32;
-
-  if (!target_valid) {
-    s.planner_valid = false;
-    s.target_counter32 = 0;
-    s.target_low16 = 0;
-    s.approach_counter32 = 0;
-    s.approach_low16 = 0;
-    s.approach_dwt_cycles = 0;
-    s.ticks_until_target = 0;
-    s.planner_skip_count++;
-    return;
-  }
-
-  s.planner_valid = true;
-  s.target_counter32 = target_counter32;
-  s.target_low16 = target_low16;
-  s.approach_counter32 = target_counter32 - SPINCATCH_APPROACH_TICKS;
-  s.approach_low16 = (uint16_t)(target_low16 - (uint16_t)SPINCATCH_APPROACH_TICKS);
-  s.approach_dwt_cycles = vclock_cycles_for_ticks(SPINCATCH_APPROACH_TICKS);
-  s.ticks_until_target = target_counter32 - now_counter32;
-  s.planner_count++;
-}
-
-static FLASHMEM void spincatch_update_planner_for_report(interrupt_subscriber_kind_t kind) {
-  spincatch_lane_report_t* s = spincatch_report_for_kind(kind);
-  if (!s || !SPINCATCH_PLANNER_ENABLED) return;
-
-  if (kind == interrupt_subscriber_kind_t::VCLOCK) {
-    const bool target_valid =
-        g_vclock_ch2_one_second_enabled &&
-        g_vclock_ch2_one_second_next_counter32 != 0;
-    const uint32_t target = g_vclock_ch2_one_second_next_counter32;
-    const uint16_t low16 = target_valid
-        ? vclock_hardware_low16_from_synthetic(target)
-        : 0U;
-    const uint32_t now = interrupt_vclock_counter32_observe_ambient();
-    spincatch_plan_from_target(*s, target_valid, target, low16, now);
-    return;
-  }
-
-  ocxo_runtime_context_t* ctx = ocxo_context_for(kind);
-  if (!ctx || !ctx->lane || !ctx->clock32) {
-    spincatch_plan_from_target(*s, false, 0, 0, 0);
-    return;
-  }
-
-  const ocxo_lane_t& lane = *ctx->lane;
-  const bool target_valid =
-      lane.initialized &&
-      lane.cadence_enabled &&
-      lane.witness_target_initialized &&
-      lane.cadence_next_counter32 != 0;
-  spincatch_plan_from_target(*s,
-                             target_valid,
-                             lane.cadence_next_counter32,
-                             target_valid ? lane.cadence_next_low16 : 0U,
-                             ctx->clock32->current_counter32);
-}
-
-static FLASHMEM void add_spincatch_report_payload(Payload& p,
-                                         interrupt_subscriber_kind_t kind) {
-  spincatch_update_planner_for_report(kind);
-  spincatch_lane_report_t* s_mut = spincatch_report_for_kind(kind);
-  if (s_mut) spincatch_landing_refresh_pending(*s_mut, kind);
-  const spincatch_lane_report_t* s = s_mut;
-
-  p.add("spincatch_supported", s ? s->supported : false);
-  p.add("spincatch_enabled", s ? s->enabled : false);
-  p.add("spincatch_planner_enabled", s ? s->planner_enabled : false);
-  p.add("spincatch_mode", SPINCATCH_REPORT_MODE);
-  p.add("spincatch_idle_witness_shadow_dwt",
-        (uint32_t)g_timepop_idle_witness_shadow_dwt);
-  p.add("spincatch_idle_witness_age_cycles_at_report",
-        g_timepop_idle_witness_shadow_dwt
-            ? (uint32_t)(ARM_DWT_CYCCNT - g_timepop_idle_witness_shadow_dwt)
-            : 0U);
-  p.add("spincatch_shadow_valid_threshold_cycles",
-        SPINIDLE_SHADOW_VALID_THRESHOLD_CYCLES);
-  p.add("spincatch_success_count", s ? s->success_count : 0U);
-  p.add("spincatch_missed_count", s ? s->missed_count : 0U);
-  p.add("spincatch_timeout_count", s ? s->timeout_count : 0U);
-  p.add("spincatch_clash_count", s ? s->clash_count : 0U);
-
-  p.add("spincatch_planner_valid", s ? s->planner_valid : false);
-  p.add("spincatch_planner_count", s ? s->planner_count : 0U);
-  p.add("spincatch_planner_skip_count", s ? s->planner_skip_count : 0U);
-  p.add("spincatch_target_counter32", s ? s->target_counter32 : 0U);
-  p.add("spincatch_target_low16", s ? (uint32_t)s->target_low16 : 0U);
-  p.add("spincatch_approach_counter32", s ? s->approach_counter32 : 0U);
-  p.add("spincatch_approach_low16", s ? (uint32_t)s->approach_low16 : 0U);
-  p.add("spincatch_approach_ticks", s ? s->approach_ticks : 0U);
-  p.add("spincatch_approach_us", s ? s->approach_us : 0U);
-  p.add("spincatch_approach_dwt_cycles", s ? s->approach_dwt_cycles : 0U);
-  p.add("spincatch_now_counter32", s ? s->now_counter32 : 0U);
-  p.add("spincatch_ticks_until_target", s ? s->ticks_until_target : 0U);
-
-  p.add("spincatch_landing_only_enabled", s ? s->landing_only_enabled : false);
-  p.add("spincatch_landing_pending", s ? s->landing_pending : false);
-  p.add("spincatch_landing_last_success", s ? s->landing_last_success : false);
-  p.add("spincatch_landing_last_target_changed", s ? s->landing_last_target_changed : false);
-  p.add("spincatch_landing_duty_divisor", s ? s->landing_duty_divisor : 0U);
-  p.add("spincatch_landing_duty_counter", s ? s->landing_duty_counter : 0U);
-  p.add("spincatch_landing_schedule_count", s ? s->landing_schedule_count : 0U);
-  p.add("spincatch_landing_schedule_skip_count", s ? s->landing_schedule_skip_count : 0U);
-  p.add("spincatch_landing_schedule_fail_count", s ? s->landing_schedule_fail_count : 0U);
-  p.add("spincatch_landing_count", s ? s->landing_count : 0U);
-  p.add("spincatch_landing_too_close_count", s ? s->landing_too_close_count : 0U);
-  p.add("spincatch_landing_target_changed_count", s ? s->landing_target_changed_count : 0U);
-  p.add("spincatch_landing_attempt_ring_size", s ? s->landing_attempt_ring_size : 0U);
-  p.add("spincatch_landing_attempt_active_count", s ? s->landing_attempt_active_count : 0U);
-  p.add("spincatch_landing_attempt_stale_count", s ? s->landing_attempt_stale_count : 0U);
-  p.add("spincatch_landing_attempt_duplicate_skip_count", s ? s->landing_attempt_duplicate_skip_count : 0U);
-  p.add("spincatch_landing_attempt_ring_full_count", s ? s->landing_attempt_ring_full_count : 0U);
-  p.add("spincatch_landing_attempt_generation", s ? s->landing_attempt_generation : 0U);
-  p.add("spincatch_landing_target_counter32", s ? s->landing_target_counter32 : 0U);
-  p.add("spincatch_landing_target_low16", s ? (uint32_t)s->landing_target_low16 : 0U);
-  p.add("spincatch_landing_scheduled_counter32", s ? s->landing_scheduled_counter32 : 0U);
-  p.add("spincatch_landing_scheduled_ticks_until_target", s ? s->landing_scheduled_ticks_until_target : 0U);
-  p.add("spincatch_landing_scheduled_delay_ns", s ? s->landing_scheduled_delay_ns : 0ULL);
-  p.add("spincatch_landing_scheduled_dwt", s ? s->landing_scheduled_dwt : 0U);
-  p.add("spincatch_landing_dwt", s ? s->landing_dwt : 0U);
-  p.add("spincatch_landing_counter32", s ? s->landing_counter32 : 0U);
-  p.add("spincatch_landing_offset_ticks", s ? s->landing_offset_ticks : 0);
-  p.add("spincatch_landing_ticks_until_target", s ? s->landing_ticks_until_target : 0U);
-  p.add("spincatch_landing_fire_vclock_raw", s ? s->landing_fire_vclock_raw : 0U);
-  p.add("spincatch_landing_fire_dwt", s ? s->landing_fire_dwt : 0U);
-}
-
-static FLASHMEM void add_isr_sanity_payload(Payload& p,
-                                   const char* prefix,
-                                   const isr_sanity_diag_t& s) {
-  payload_prefix_t out(p, prefix);
-
-  out.add_u32("cntr_correct_count", s.cntr_correct_count);
-  out.add_u32("cntr_incorrect_count", s.cntr_incorrect_count);
-  out.add_u32("cntr_expected", s.cntr_expected);
-  out.add_u32("cntr_actual", s.cntr_actual);
-
-  out.add_u32("dwt_correct_count", s.dwt_correct_count);
-  out.add_u32("dwt_incorrect_count", s.dwt_incorrect_count);
-  out.add_u32("dwt_expected", s.dwt_expected);
-  out.add_u32("dwt_actual", s.dwt_actual);
-}
-
-static FLASHMEM void add_bridge_stats_payload(Payload& p,
-                                     const char* prefix,
-                                     const bridge_anchor_stats_t& s) {
-  payload_prefix_t out(p, prefix);
-
-  out.add_u32("anchor_latest_count", s.latest_count);
-  out.add_u32("anchor_previous_count", s.previous_count);
-  out.add_u32("anchor_older_count", s.older_count);
-  out.add_u32("anchor_failed_count", s.failed_count);
-  out.add_u32("anchor_last_selection_kind", s.last_selection_kind);
-  out.add_u32("anchor_last_age_slots", s.last_anchor_age_slots);
-  out.add_u32("anchor_last_sequence_used", s.last_anchor_sequence_used);
-  out.add_u64("anchor_last_ns_delta", s.last_anchor_ns_delta);
-  out.add_u32("anchor_last_failure_mask", s.last_anchor_failure_mask);
-}
-
-static FLASHMEM void add_regression_payload(Payload& p,
-                                   const char* prefix,
-                                   const cadence_regression_lane_t& r) {
-  payload_prefix_t out(p, prefix);
-  const cadence_regression_result_t& last = r.last_result;
-
-  out.add_bool("regression_enabled",
-               r.kind == interrupt_subscriber_kind_t::VCLOCK
-                   ? VCLOCK_LINEAR_REGRESSION_ENABLED
-                   : OCXO_LINEAR_REGRESSION_ENABLED);
-  out.add_u32("regression_samples_per_second", REGRESSION_SAMPLES_PER_SECOND);
-  out.add_u32("regression_sample_total_count", r.sample_total_count);
-  out.add_u32("regression_window_sample_count", r.sample_count);
-  out.add_u32("regression_reset_count", r.reset_count);
-  out.add_u32("regression_insufficient_count", r.insufficient_count);
-  out.add_u32("regression_counter_discontinuity_count",
-              r.counter_discontinuity_count);
-
-  out.add_bool("regression_last_valid", last.valid);
-  out.add_u32("regression_last_sequence", last.sequence);
-  out.add_u32("regression_last_sample_count", last.sample_count);
-  out.add_u32("regression_last_observed_dwt", last.observed_dwt_at_event);
-  out.add_u32("regression_last_inferred_dwt", last.inferred_dwt_at_event);
-  out.add_i32("regression_last_inferred_minus_observed_cycles",
-              last.inferred_minus_observed_cycles);
-  out.add_u32("regression_last_target_counter32",
-              last.target_counter32_at_event);
-  out.add_u32("regression_last_target_hardware16",
-              (uint32_t)last.target_hardware16_at_event);
-  out.add_u32("regression_last_observed_hardware16",
-              (uint32_t)last.observed_hardware16_at_event);
-  out.add_u64("regression_last_slope_q16_cycles_per_sample",
-              last.slope_q16_cycles_per_sample);
-  out.add_i64("regression_last_slope_delta_q16_cycles_per_sample",
-              last.slope_delta_q16_cycles_per_sample);
-  out.add_i32("regression_last_fit_error_mean_q16_cycles",
-              last.fit_error_mean_q16_cycles);
-  out.add_u32("regression_last_fit_error_stddev_q16_cycles",
-              last.fit_error_stddev_q16_cycles);
-  out.add_i32("regression_last_fit_error_min_cycles",
-              last.fit_error_min_cycles);
-  out.add_i32("regression_last_fit_error_max_cycles",
-              last.fit_error_max_cycles);
-  out.add_u32("regression_last_fit_error_gt_plus4_count",
-              last.fit_error_gt_plus4_count);
-  out.add_u32("regression_last_fit_error_lt_minus4_count",
-              last.fit_error_lt_minus4_count);
-  out.add_u32("regression_last_fit_error_abs_gt4_count",
-              last.fit_error_abs_gt4_count);
-}
-
-static FLASHMEM interrupt_subscriber_kind_t regression_kind_from_lane_arg(const char* lane) {
-  if (!lane || !*lane) return interrupt_subscriber_kind_t::NONE;
-  if (!strcasecmp(lane, "VCLOCK") || !strcasecmp(lane, "VCLK")) {
-    return interrupt_subscriber_kind_t::VCLOCK;
-  }
-  if (!strcasecmp(lane, "OCXO1") || !strcasecmp(lane, "O1")) {
-    return interrupt_subscriber_kind_t::OCXO1;
-  }
-  if (!strcasecmp(lane, "OCXO2") || !strcasecmp(lane, "O2")) {
-    return interrupt_subscriber_kind_t::OCXO2;
-  }
-  return interrupt_subscriber_kind_t::NONE;
-}
-
-
-static FLASHMEM bool isr_raw_dwt_probe_snapshot(
-    interrupt_subscriber_kind_t kind,
-    isr_raw_dwt_interval_probe_t& out) {
-  const isr_raw_dwt_interval_probe_t* src = isr_raw_dwt_probe_for_const(kind);
-  if (!src) {
-    out = isr_raw_dwt_interval_probe_t{};
-    return false;
-  }
-
-  uint32_t primask = 0;
-  __asm__ volatile ("mrs %0, primask" : "=r" (primask) :: "memory");
-  __disable_irq();
-  out = *src;
-  if ((primask & 1U) == 0U) {
-    __enable_irq();
-  }
-
-  return true;
-}
-
-static FLASHMEM uint32_t isr_raw_dwt_probe_chrono_index(
-    const isr_raw_dwt_interval_probe_t& s,
-    uint32_t ordinal) {
-  if (s.interval_count == 0) return 0;
-  const uint32_t start =
-      (s.write_index + ISR_RAW_DWT_INTERVAL_RING_SIZE - s.interval_count) %
-      ISR_RAW_DWT_INTERVAL_RING_SIZE;
-  return (start + ordinal) % ISR_RAW_DWT_INTERVAL_RING_SIZE;
-}
-
-static FLASHMEM void isr_raw_dwt_probe_append_csv_u32(char* buf,
-                                             size_t len,
-                                             uint32_t& used,
-                                             uint32_t value) {
-  if (used >= len) return;
-  const int n = snprintf(buf + used, len - used,
-                         used == 0 ? "%lu" : ",%lu",
-                         (unsigned long)value);
-  if (n > 0) {
-    const uint32_t add = (uint32_t)n;
-    used = (add >= (len - used)) ? (uint32_t)(len - 1U) : (used + add);
-  }
-}
-
-static FLASHMEM void isr_raw_dwt_probe_append_csv_i32(char* buf,
-                                             size_t len,
-                                             uint32_t& used,
-                                             int32_t value) {
-  if (used >= len) return;
-  const int n = snprintf(buf + used, len - used,
-                         used == 0 ? "%ld" : ",%ld",
-                         (long)value);
-  if (n > 0) {
-    const uint32_t add = (uint32_t)n;
-    used = (add >= (len - used)) ? (uint32_t)(len - 1U) : (used + add);
-  }
-}
-
-static FLASHMEM void isr_raw_dwt_probe_add_summary(Payload& p,
-                                          const isr_raw_dwt_interval_probe_t& s,
-                                          bool include_csv) {
-  const uint32_t n = s.interval_count;
-
-  double mean = 0.0;
-  double m2 = 0.0;
-  uint32_t min_v = UINT32_MAX;
-  uint32_t max_v = 0;
-
-  double fd_mean = 0.0;
-  double fd_m2 = 0.0;
-  int32_t fd_min = INT32_MAX;
-  int32_t fd_max = INT32_MIN;
-  uint32_t fd_n = 0;
-  uint32_t prev = 0;
-
-  static char interval_csv[2048];
-  static char first_difference_csv[1536];
-  if (include_csv) {
-    interval_csv[0] = '\0';
-    first_difference_csv[0] = '\0';
-  }
-  uint32_t interval_used = 0;
-  uint32_t fd_used = 0;
-
-  for (uint32_t i = 0; i < n; i++) {
-    const uint32_t idx = isr_raw_dwt_probe_chrono_index(s, i);
-    const uint32_t v = s.intervals[idx];
-
-    if (v < min_v) min_v = v;
-    if (v > max_v) max_v = v;
-
-    const double d1 = (double)v - mean;
-    mean += d1 / (double)(i + 1U);
-    const double d2 = (double)v - mean;
-    m2 += d1 * d2;
-
-    if (include_csv) {
-      isr_raw_dwt_probe_append_csv_u32(interval_csv,
-                                       sizeof(interval_csv),
-                                       interval_used,
-                                       v);
-    }
-
-    if (i > 0) {
-      const int32_t fd = (int32_t)((int64_t)v - (int64_t)prev);
-      if (fd < fd_min) fd_min = fd;
-      if (fd > fd_max) fd_max = fd;
-      fd_n++;
-
-      const double fd_d1 = (double)fd - fd_mean;
-      fd_mean += fd_d1 / (double)fd_n;
-      const double fd_d2 = (double)fd - fd_mean;
-      fd_m2 += fd_d1 * fd_d2;
-
-      if (include_csv) {
-        isr_raw_dwt_probe_append_csv_i32(first_difference_csv,
-                                         sizeof(first_difference_csv),
-                                         fd_used,
-                                         fd);
-      }
-    }
-
-    prev = v;
-  }
-
-  const double variance = (n >= 2U) ? (m2 / (double)(n - 1U)) : 0.0;
-  const double stddev = sqrt(variance < 0.0 ? 0.0 : variance);
-  const double se = (n > 0) ? (stddev / sqrt((double)n)) : 0.0;
-
-  const double fd_variance =
-      (fd_n >= 2U) ? (fd_m2 / (double)(fd_n - 1U)) : 0.0;
-  const double fd_stddev = sqrt(fd_variance < 0.0 ? 0.0 : fd_variance);
-  const double fd_stderr = (fd_n > 0) ? (fd_stddev / sqrt((double)fd_n)) : 0.0;
-
-  p.add("endpoint_count", s.endpoint_count);
-  p.add("interval_count", n);
-  p.add("interval_capacity", ISR_RAW_DWT_INTERVAL_RING_SIZE);
-  p.add("write_index", s.write_index);
-  p.add("last_dwt_valid", s.last_dwt_valid);
-  p.add("last_isr_entry_dwt_raw", s.last_isr_entry_dwt_raw);
-  p.add("last_interval_valid", s.last_interval_valid);
-  p.add("last_interval_cycles", s.last_interval_cycles);
-  p.add("last_interval_delta_cycles", s.last_interval_delta_cycles);
-
-  p.add("interval_mean_cycles", (double)((n > 0) ? mean : 0.0));
-  p.add("interval_stddev_cycles", (double)((n >= 2U) ? stddev : 0.0));
-  p.add("interval_stderr_cycles", (double)((n > 0) ? se : 0.0));
-  p.add("interval_min_cycles", (n > 0) ? min_v : 0U);
-  p.add("interval_max_cycles", (n > 0) ? max_v : 0U);
-
-  p.add("first_difference_count", fd_n);
-  p.add("first_difference_mean_cycles", (double)((fd_n > 0) ? fd_mean : 0.0));
-  p.add("first_difference_stddev_cycles", (double)((fd_n >= 2U) ? fd_stddev : 0.0));
-  p.add("first_difference_stderr_cycles", (double)((fd_n > 0) ? fd_stderr : 0.0));
-  p.add("first_difference_min_cycles", (fd_n > 0) ? fd_min : 0);
-  p.add("first_difference_max_cycles", (fd_n > 0) ? fd_max : 0);
-
-  if (include_csv) {
-    p.add("sample_encoding", "csv_chronological_oldest_to_newest");
-    p.add("interval_cycles_csv", interval_csv);
-    p.add("first_difference_cycles_csv", first_difference_csv);
-  }
-}
-
-static FLASHMEM Payload cmd_report_ocxo_isr_raw_dwt(const Payload& args) {
-  const char* lane_arg = args.getString("lane");
-  if (!lane_arg || !*lane_arg) lane_arg = args.getString("name");
-
-  Payload p;
-  p.add("report", "INTERRUPT_OCXO_ISR_RAW_DWT");
-  p.add("schema", "ISR_RAW_DWT_INTERVAL_RING_V1");
-  p.add("doctrine", "literal_first_instruction_isr_entry_dwt_intervals_no_correction_no_projection_no_ema");
-  p.add("usage", "INTERRUPT.REPORT_OCXO_ISR_RAW_DWT lane=VCLOCK|OCXO1|OCXO2");
-  p.add("ring_capacity", ISR_RAW_DWT_INTERVAL_RING_SIZE);
-
-  const bool want_all =
-      !lane_arg || !*lane_arg || !strcasecmp(lane_arg, "ALL");
-  if (want_all) {
-    p.add("lane", "ALL");
-    p.add("note", "lane=ALL returns compact summaries only; request one lane for CSV samples");
-
-    Payload vclock;
-    isr_raw_dwt_interval_probe_t v{};
-    (void)isr_raw_dwt_probe_snapshot(interrupt_subscriber_kind_t::VCLOCK, v);
-    vclock.add("lane", "VCLOCK");
-    isr_raw_dwt_probe_add_summary(vclock, v, false);
-    p.add_object("vclock", vclock);
-
-    Payload ocxo1;
-    isr_raw_dwt_interval_probe_t o1{};
-    (void)isr_raw_dwt_probe_snapshot(interrupt_subscriber_kind_t::OCXO1, o1);
-    ocxo1.add("lane", "OCXO1");
-    isr_raw_dwt_probe_add_summary(ocxo1, o1, false);
-    p.add_object("ocxo1", ocxo1);
-
-    Payload ocxo2;
-    isr_raw_dwt_interval_probe_t o2{};
-    (void)isr_raw_dwt_probe_snapshot(interrupt_subscriber_kind_t::OCXO2, o2);
-    ocxo2.add("lane", "OCXO2");
-    isr_raw_dwt_probe_add_summary(ocxo2, o2, false);
-    p.add_object("ocxo2", ocxo2);
-    return p;
-  }
-
-  const interrupt_subscriber_kind_t kind = regression_kind_from_lane_arg(lane_arg);
-  if (kind != interrupt_subscriber_kind_t::VCLOCK &&
-      kind != interrupt_subscriber_kind_t::OCXO1 &&
-      kind != interrupt_subscriber_kind_t::OCXO2) {
-    p.add("error", "unknown lane");
-    p.add("lane", lane_arg ? lane_arg : "");
-    return p;
-  }
-
-  isr_raw_dwt_interval_probe_t snapshot{};
-  const bool ok = isr_raw_dwt_probe_snapshot(kind, snapshot);
-
-  p.add("lane", interrupt_subscriber_kind_str(kind));
-  p.add("snapshot_ok", ok);
-  p.add("source_field", "ARM_DWT_CYCCNT captured as first instruction of the lane's one-second ISR service");
-  p.add("vclock_note", "VCLOCK records only native one-second CH2 service facts, not every 1ms TimePop fire");
-  p.add("ocxo_note", "OCXO records only active steady-state one-second facts, not SmartZero 1kHz acquisition samples");
-  isr_raw_dwt_probe_add_summary(p, snapshot, true);
-  return p;
-}
-
-
 // ============================================================================
-// Commands
+// Lean command/report surface
 // ============================================================================
+// process_interrupt reports now expose only operational custody state.  Legacy
+// lane courtroom dumps, regression windows, SpinCatch/SpinIdle, raw-DWT CSVs,
+// and register museum reports were removed to reduce payload and maintenance
+// pressure.  Permanent edge-authority courtroom fields will be added here in
+// the next phase.
 
-static FLASHMEM Payload cmd_report_qtimer_regs(const Payload& args) {
-  Payload p;
-  p.add("report", "INTERRUPT_QTIMER_REGS");
-  p.add("format", "compact_lane_flat_raw_u32_v3");
-  p.add("hex", false);
-  p.add("doctrine", QTIMER_UNIFORM_DOCTRINE);
-
-  const char* lane_arg = args.getString("lane");
-  if (!lane_arg) lane_arg = "";
-
-  const interrupt_subscriber_kind_t lane = regression_kind_from_lane_arg(lane_arg);
-  const bool want_all = (!lane_arg || !*lane_arg || !strcasecmp(lane_arg, "ALL"));
-
-  if (want_all) {
-    p.add("usage", "INTERRUPT.REPORT_QTIMER_REGS lane=VCLOCK|OCXO1|OCXO2");
-    p.add("note", "Compact default intentionally omits register dumps; request one lane to avoid payload/transport limits");
-    p.add("vclock", "QTIMER1 CH0 counter / CH1 compare");
-    p.add("ocxo1", "QTIMER2 CH0 counter / CH1 compare");
-    p.add("ocxo2", "QTIMER3 CH3 physical adapter on pin15; CH0/CH1 unavailable because pin19 is SMBus SCL");
-    p.add("vclock_ready", g_interrupt_hw_ready);
-    p.add("ocxo1_ready", !OCXO1_DISABLED && g_ocxo1_lane.initialized);
-    p.add("ocxo2_ready", !OCXO2_DISABLED && g_ocxo2_lane.initialized);
-    return p;
-  }
-
-  if (lane == interrupt_subscriber_kind_t::VCLOCK) {
-    p.add("lane", "VCLOCK");
-    p.add("module", "QTIMER1");
-    p.add("ready", g_interrupt_hw_ready);
-    p.add("counter_ch", 0U);
-    p.add("compare_ch", 1U);
-    p.add("pcs", 0U);
-    p.add("enbl", (uint32_t)IMXRT_TMR1.ENBL);
-
-    p.add("counter_CTRL",   (uint32_t)IMXRT_TMR1.CH[0].CTRL);
-    p.add("counter_SCTRL",  (uint32_t)IMXRT_TMR1.CH[0].SCTRL);
-    p.add("counter_CSCTRL", (uint32_t)IMXRT_TMR1.CH[0].CSCTRL);
-    p.add("counter_LOAD",   (uint32_t)IMXRT_TMR1.CH[0].LOAD);
-    p.add("counter_CNTR",   (uint32_t)IMXRT_TMR1.CH[0].CNTR);
-    p.add("counter_COMP1",  (uint32_t)IMXRT_TMR1.CH[0].COMP1);
-    p.add("counter_CMPLD1", (uint32_t)IMXRT_TMR1.CH[0].CMPLD1);
-    p.add("counter_CMPLD2", (uint32_t)IMXRT_TMR1.CH[0].CMPLD2);
-
-    p.add("compare_CTRL",   (uint32_t)IMXRT_TMR1.CH[1].CTRL);
-    p.add("compare_SCTRL",  (uint32_t)IMXRT_TMR1.CH[1].SCTRL);
-    p.add("compare_CSCTRL", (uint32_t)IMXRT_TMR1.CH[1].CSCTRL);
-    p.add("compare_LOAD",   (uint32_t)IMXRT_TMR1.CH[1].LOAD);
-    p.add("compare_CNTR",   (uint32_t)IMXRT_TMR1.CH[1].CNTR);
-    p.add("compare_COMP1",  (uint32_t)IMXRT_TMR1.CH[1].COMP1);
-    p.add("compare_CMPLD1", (uint32_t)IMXRT_TMR1.CH[1].CMPLD1);
-    p.add("compare_CMPLD2", (uint32_t)IMXRT_TMR1.CH[1].CMPLD2);
-
-    p.add("pin_mux", (uint32_t)(*portConfigRegister(10)));
-    p.add("public_api_note", "TimePop compatibility API name may still say CH2; hardware doctrine reports CH1 compare");
-    return p;
-  }
-
-  if (lane == interrupt_subscriber_kind_t::OCXO1) {
-    p.add("lane", "OCXO1");
-    p.add("module", "QTIMER2");
-    p.add("ready", !OCXO1_DISABLED && g_ocxo1_lane.initialized);
-    p.add("counter_ch", 0U);
-    p.add("compare_ch", 1U);
-    p.add("pcs", (uint32_t)g_ocxo1_lane.pcs);
-    p.add("enbl", (uint32_t)IMXRT_TMR2.ENBL);
-
-    p.add("counter_CTRL",   (uint32_t)IMXRT_TMR2.CH[0].CTRL);
-    p.add("counter_SCTRL",  (uint32_t)IMXRT_TMR2.CH[0].SCTRL);
-    p.add("counter_CSCTRL", (uint32_t)IMXRT_TMR2.CH[0].CSCTRL);
-    p.add("counter_LOAD",   (uint32_t)IMXRT_TMR2.CH[0].LOAD);
-    p.add("counter_CNTR",   (uint32_t)IMXRT_TMR2.CH[0].CNTR);
-    p.add("counter_COMP1",  (uint32_t)IMXRT_TMR2.CH[0].COMP1);
-    p.add("counter_CMPLD1", (uint32_t)IMXRT_TMR2.CH[0].CMPLD1);
-    p.add("counter_CMPLD2", (uint32_t)IMXRT_TMR2.CH[0].CMPLD2);
-
-    p.add("compare_CTRL",   (uint32_t)IMXRT_TMR2.CH[1].CTRL);
-    p.add("compare_SCTRL",  (uint32_t)IMXRT_TMR2.CH[1].SCTRL);
-    p.add("compare_CSCTRL", (uint32_t)IMXRT_TMR2.CH[1].CSCTRL);
-    p.add("compare_LOAD",   (uint32_t)IMXRT_TMR2.CH[1].LOAD);
-    p.add("compare_CNTR",   (uint32_t)IMXRT_TMR2.CH[1].CNTR);
-    p.add("compare_COMP1",  (uint32_t)IMXRT_TMR2.CH[1].COMP1);
-    p.add("compare_CMPLD1", (uint32_t)IMXRT_TMR2.CH[1].CMPLD1);
-    p.add("compare_CMPLD2", (uint32_t)IMXRT_TMR2.CH[1].CMPLD2);
-
-    p.add("pin_mux", (uint32_t)(*portConfigRegister(OCXO1_PIN)));
-#if defined(IOMUXC_QTIMER2_TIMER0_SELECT_INPUT)
-    p.add("timer0_select_input", (uint32_t)IOMUXC_QTIMER2_TIMER0_SELECT_INPUT);
-#endif
-    return p;
-  }
-
-  if (lane == interrupt_subscriber_kind_t::OCXO2) {
-    p.add("lane", "OCXO2");
-    p.add("module", "QTIMER3");
-    p.add("ready", !OCXO2_DISABLED && g_ocxo2_lane.initialized);
-    p.add("physical_adapter", true);
-    p.add("adapter_reason", "pin15 routes to QTimer3 TIMER3; pin19/TIMER0 is SMBus SCL");
-    p.add("counter_ch", (uint32_t)g_ocxo2_lane.counter_channel);
-    p.add("compare_ch", (uint32_t)g_ocxo2_lane.compare_channel);
-    p.add("pcs", (uint32_t)g_ocxo2_lane.pcs);
-    p.add("enbl", (uint32_t)IMXRT_TMR3.ENBL);
-
-    p.add("counter_CTRL",   (uint32_t)IMXRT_TMR3.CH[g_ocxo2_lane.counter_channel].CTRL);
-    p.add("counter_SCTRL",  (uint32_t)IMXRT_TMR3.CH[g_ocxo2_lane.counter_channel].SCTRL);
-    p.add("counter_CSCTRL", (uint32_t)IMXRT_TMR3.CH[g_ocxo2_lane.counter_channel].CSCTRL);
-    p.add("counter_LOAD",   (uint32_t)IMXRT_TMR3.CH[g_ocxo2_lane.counter_channel].LOAD);
-    p.add("counter_CNTR",   (uint32_t)IMXRT_TMR3.CH[g_ocxo2_lane.counter_channel].CNTR);
-    p.add("counter_COMP1",  (uint32_t)IMXRT_TMR3.CH[g_ocxo2_lane.counter_channel].COMP1);
-    p.add("counter_CMPLD1", (uint32_t)IMXRT_TMR3.CH[g_ocxo2_lane.counter_channel].CMPLD1);
-    p.add("counter_CMPLD2", (uint32_t)IMXRT_TMR3.CH[g_ocxo2_lane.counter_channel].CMPLD2);
-
-    p.add("compare_CTRL",   (uint32_t)IMXRT_TMR3.CH[g_ocxo2_lane.compare_channel].CTRL);
-    p.add("compare_SCTRL",  (uint32_t)IMXRT_TMR3.CH[g_ocxo2_lane.compare_channel].SCTRL);
-    p.add("compare_CSCTRL", (uint32_t)IMXRT_TMR3.CH[g_ocxo2_lane.compare_channel].CSCTRL);
-    p.add("compare_LOAD",   (uint32_t)IMXRT_TMR3.CH[g_ocxo2_lane.compare_channel].LOAD);
-    p.add("compare_CNTR",   (uint32_t)IMXRT_TMR3.CH[g_ocxo2_lane.compare_channel].CNTR);
-    p.add("compare_COMP1",  (uint32_t)IMXRT_TMR3.CH[g_ocxo2_lane.compare_channel].COMP1);
-    p.add("compare_CMPLD1", (uint32_t)IMXRT_TMR3.CH[g_ocxo2_lane.compare_channel].CMPLD1);
-    p.add("compare_CMPLD2", (uint32_t)IMXRT_TMR3.CH[g_ocxo2_lane.compare_channel].CMPLD2);
-
-    p.add("pin_mux", (uint32_t)(*portConfigRegister(OCXO2_PIN)));
-#if defined(IOMUXC_QTIMER3_TIMER0_SELECT_INPUT)
-    p.add("timer0_select_input", (uint32_t)IOMUXC_QTIMER3_TIMER0_SELECT_INPUT);
-#endif
-#if defined(IOMUXC_QTIMER3_TIMER3_SELECT_INPUT)
-    p.add("timer3_select_input", (uint32_t)IOMUXC_QTIMER3_TIMER3_SELECT_INPUT);
-#endif
-    return p;
-  }
-
-  p.add("error", "unknown lane");
-  p.add("lane", lane_arg ? lane_arg : "");
-  p.add("usage", "INTERRUPT.REPORT_QTIMER_REGS lane=VCLOCK|OCXO1|OCXO2");
-  return p;
+static FLASHMEM void add_runtime_summary(Payload& p,
+                                         const char* prefix,
+                                         interrupt_subscriber_runtime_t* rt,
+                                         uint32_t irq_count,
+                                         uint32_t event_count) {
+  char key[64];
+  snprintf(key, sizeof(key), "%s_subscribed", prefix); p.add(key, rt ? rt->subscribed : false);
+  snprintf(key, sizeof(key), "%s_active", prefix);     p.add(key, rt ? rt->active : false);
+  snprintf(key, sizeof(key), "%s_started", prefix);    p.add(key, rt ? rt->start_count : 0U);
+  snprintf(key, sizeof(key), "%s_stopped", prefix);    p.add(key, rt ? rt->stop_count : 0U);
+  snprintf(key, sizeof(key), "%s_irq_count", prefix);  p.add(key, irq_count);
+  snprintf(key, sizeof(key), "%s_event_count", prefix);p.add(key, event_count);
 }
 
-static FLASHMEM void add_priority_payload(Payload& p) {
-  p.add("qtimer1_sovereign_priority_expected", INTERRUPT_STEP0_EXPECTED_QTIMER1_PRIORITY);
-  p.add("qtimer1_sovereign_priority_applied", g_step0_qtimer1_priority_applied);
-  p.add("qtimer1_sovereign_priority_ok",
-        g_step0_qtimer1_priority_applied == INTERRUPT_STEP0_EXPECTED_QTIMER1_PRIORITY);
-
-  p.add("qtimer2_priority_expected", INTERRUPT_STEP0_EXPECTED_QTIMER2_PRIORITY);
-  p.add("qtimer2_priority_applied", g_step0_qtimer2_priority_applied);
-  p.add("qtimer2_priority_ok",
-        OCXO1_DISABLED ||
-        g_step0_qtimer2_priority_applied == INTERRUPT_STEP0_EXPECTED_QTIMER2_PRIORITY);
-
-  p.add("qtimer3_priority_expected", INTERRUPT_STEP0_EXPECTED_QTIMER3_PRIORITY);
-  p.add("qtimer3_priority_applied", g_step0_qtimer3_priority_applied);
-  p.add("qtimer3_priority_ok",
-        OCXO2_DISABLED ||
-        g_step0_qtimer3_priority_applied == INTERRUPT_STEP0_EXPECTED_QTIMER3_PRIORITY);
-
-  p.add("gpio6789_priority_expected", INTERRUPT_STEP0_EXPECTED_GPIO6789_PRIORITY);
-  p.add("gpio6789_priority_applied", g_step0_gpio6789_priority_applied);
-  p.add("gpio6789_priority_ok",
-        g_step0_gpio6789_priority_applied == INTERRUPT_STEP0_EXPECTED_GPIO6789_PRIORITY);
-
-  p.add("irq_qtimer1_enabled_by_interrupt", g_step0_qtimer1_irq_enabled_by_interrupt);
-  p.add("irq_qtimer2_enabled_by_interrupt", g_step0_qtimer2_irq_enabled_by_interrupt);
-  p.add("irq_qtimer3_enabled_by_interrupt", g_step0_qtimer3_irq_enabled_by_interrupt);
-  p.add("irq_gpio6789_configured_by_interrupt", g_step0_gpio6789_configured_by_interrupt);
-  p.add("capture_priority", INTERRUPT_PRIORITY_CAPTURE);
-  p.add("handoff_priority", INTERRUPT_PRIORITY_HANDOFF);
-  p.add("background_irq_priority", INTERRUPT_PRIORITY_BACKGROUND_IRQ);
-  p.add("handoff_irq", INTERRUPT_HANDOFF_IRQ_NUMBER);
-  p.add("handoff_irq_name", INTERRUPT_HANDOFF_IRQ_NAME);
-}
-
-static FLASHMEM void add_runtime_payload(Payload& p) {
-  p.add("hardware_ready", g_interrupt_hw_ready);
-  p.add("runtime_ready",  g_interrupt_runtime_ready);
-  p.add("irqs_enabled",   g_interrupt_irqs_enabled);
-  p.add("reduced_diagnostics_enabled", INTERRUPT_REDUCED_DIAGNOSTICS);
-  p.add("regression_retained_sample_count", REGRESSION_RETAINED_SAMPLE_COUNT);
-  p.add("spincatch_diagnostics_retired", !SPINCATCH_OCXO_LANDING_ONLY_ENABLED);
-  p.add("ocxo_disable_experiment", OCXO_DISABLE_EXPERIMENT);
-  p.add("ocxo_disabled_count", OCXO_DISABLED_COUNT);
-  p.add("ocxo1_disabled", OCXO1_DISABLED);
-  p.add("ocxo2_disabled", OCXO2_DISABLED);
-  p.add("ocxo1_irq_qtimer2_disabled", OCXO1_DISABLED);
-  p.add("ocxo2_irq_qtimer3_disabled", OCXO2_DISABLED);
-  p.add("ocxo_smartzero_surrogates_enabled", OCXO_DISABLE_EXPERIMENT);
-  p.add("ocxo_quiet_phase_sampling_enabled", OCXO_QUIET_PHASE_SAMPLING_ENABLED);
-  p.add("ocxo_rollover_only_mode", !OCXO_QUIET_PHASE_SAMPLING_ENABLED);
-  p.add("vclock_ema_dwt_authority_enabled", VCLOCK_EMA_DWT_AUTHORITY_ENABLED);
-  p.add("vclock_ema_alpha_numerator", VCLOCK_EMA_ALPHA_NUMERATOR);
-  p.add("vclock_ema_alpha_denominator", VCLOCK_EMA_ALPHA_DENOMINATOR);
-  p.add("vclock_ema_audit_threshold_cycles", VCLOCK_EMA_AUDIT_THRESHOLD_CYCLES);
-  p.add("ocxo_ema_dwt_authority_enabled", OCXO_EMA_DWT_AUTHORITY_ENABLED);
-  p.add("ocxo_ema_alpha_numerator", OCXO_EMA_ALPHA_NUMERATOR);
-  p.add("ocxo_ema_alpha_denominator", OCXO_EMA_ALPHA_DENOMINATOR);
-  p.add("ocxo_yardstick_dwt_authority_enabled", OCXO_YARDSTICK_DWT_AUTHORITY_ENABLED);
-  p.add("ocxo_yardstick_gate_threshold_cycles", OCXO_YARDSTICK_GATE_THRESHOLD_CYCLES);
-  p.add("ocxo_yardstick_anchor_p_shift", OCXO_YARDSTICK_ANCHOR_P_SHIFT);
-  p.add("ocxo_yardstick_anchor_i_shift", OCXO_YARDSTICK_ANCHOR_I_SHIFT);
-  p.add("ocxo_yardstick_anchor_fast_lock_seconds",
-        OCXO_YARDSTICK_ANCHOR_FAST_LOCK_SECONDS);
-  p.add("ocxo_yardstick_anchor_fast_i_shift",
-        OCXO_YARDSTICK_ANCHOR_FAST_I_SHIFT);
-  p.add("smartzero2_selection_authority_enabled",
-        SMARTZERO2_SELECTION_AUTHORITY_ENABLED);
-  p.add("zero_worthy_streak_seconds", ZERO_WORTHY_STREAK_SECONDS);
-  p.add("zero_worthy_max_abs_auth_error_cycles",
-        ZERO_WORTHY_MAX_ABS_AUTH_ERROR_CYCLES);
-  p.add("zero_worthy_max_abs_error_sum_cycles",
-        ZERO_WORTHY_MAX_ABS_ERROR_SUM_CYCLES);
-  p.add("ocxo1_quiet_phase_ticks", OCXO1_QUIET_PHASE_TICKS);
-  p.add("ocxo1_quiet_phase_us", ocxo_phase_ticks_to_us(OCXO1_QUIET_PHASE_TICKS));
-  p.add("ocxo2_quiet_phase_ticks", OCXO2_QUIET_PHASE_TICKS);
-  p.add("ocxo2_quiet_phase_us", ocxo_phase_ticks_to_us(OCXO2_QUIET_PHASE_TICKS));
-  p.add("timing_arch_step", "UNIFORM_CH0_COUNTER_CH1_COMPARE_WITH_OCXO2_PIN15_CH3_ADAPTER");
-  p.add("timing_arch_behavior_changed", true);
-  p.add("isr_sanity_witness_enabled", true);
-  p.add("isr_sanity_witness_policy", "REPORT_ONLY_NO_REPAIR_NO_VETO");
-  p.add("timing_arch_vclock_authority", "QTIMER1_CH0_COUNTER_CH1_COMPARE_ROLLOVER_RELAY_EPOCH_1S_SMARTZERO_DRAIN_ARM");
-  p.add("timing_arch_ocxo_model", "OCXO1_CH0_CH1_OCXO2_PIN15_QTIMER3_CH3_PHYSICAL_ADAPTER");
-  p.add("timing_arch_ocxo_migration_stage", "EMA_DWT_AUTHORITY");
-  p.add("subscriber_count", g_subscriber_count);
-  p.add("single_cadence_agent", false);
-  p.add("vclock_heartbeat_isr_mode", true);
-  p.add("ch2_implicit_rollover_enabled", CH2_IMPLICIT_ROLLOVER_ENABLED);
-  p.add("ch2_implicit_rollover_policy",
-        "PASSIVE_COEXISTS_WITH_VCLOCK_HEARTBEAT_AND_OCXO_LOCAL_CADENCE");
-  p.add("vclock_heartbeat_retained", true);
-  p.add("vclock_heartbeat_rollover_owner", false);
-  p.add("ocxo_native_1khz_cadence_retired", true);
-  p.add("ocxo_compare_live_requires_enabled_and_flag", true);
-  p.add("lane_report_command", "INTERRUPT.REPORT_LANES");
-  p.add("single_lane_report_command", "INTERRUPT.REPORT_LANE lane=VCLOCK|OCXO1|OCXO2");
-  p.add("regression_samples_report_command", "disabled");
-  p.add("reduced_diagnostics_enabled", INTERRUPT_REDUCED_DIAGNOSTICS);
-  p.add("regression_retained_sample_count", REGRESSION_RETAINED_SAMPLE_COUNT);
-  p.add("spincatch_diagnostics_retired", !SPINCATCH_OCXO_LANDING_ONLY_ENABLED);
-  p.add("capture_discipline", INTERRUPT_CAPTURE_DISCIPLINE);
-  p.add("handoff_mechanism", INTERRUPT_HANDOFF_MECHANISM);
-  p.add("handoff_irq", INTERRUPT_HANDOFF_IRQ_NUMBER);
-  p.add("handoff_priority", INTERRUPT_PRIORITY_HANDOFF);
-  p.add("handoff_report_command", "INTERRUPT.REPORT_HANDOFF");
-  p.add("ocxo_isr_raw_dwt_report_command", "INTERRUPT.REPORT_OCXO_ISR_RAW_DWT lane=VCLOCK|OCXO1|OCXO2");
-}
-
-static FLASHMEM void add_ocxo_cadence_report_payload(Payload& p,
-                                           const ocxo_runtime_context_t& ctx) {
+static FLASHMEM void add_ocxo_lean_lane(Payload& p,
+                                        const char* prefix,
+                                        ocxo_runtime_context_t& ctx) {
   const ocxo_lane_t& lane = *ctx.lane;
-  payload_prefix_t out(p, ctx.prefix);
-
-  out.add_bool("cadence_enabled", lane.cadence_enabled);
-  out.add_bool("cadence_armed", lane.cadence_armed);
-  out.add_bool("cadence_epoch_valid", lane.cadence_epoch_valid);
-  out.add_u32("cadence_epoch_counter32", lane.cadence_epoch_counter32);
-  out.add_bool("cadence_sample_phase_valid", lane.cadence_sample_phase_valid);
-  out.add_u32("cadence_sample_phase_ticks", lane.cadence_sample_phase_ticks);
-  out.add_u32("cadence_sample_phase_us", lane.cadence_sample_phase_us);
-  out.add_u32("cadence_sample_phase_ns", lane.cadence_sample_phase_ns);
-  out.add_u32("cadence_sample_period_ticks", lane.cadence_sample_period_ticks);
-  out.add_u32("cadence_next_counter32", lane.cadence_next_counter32);
-  out.add_u32("cadence_fire_count", lane.cadence_fire_count);
-  out.add_u32("cadence_one_second_due_count", lane.cadence_one_second_due_count);
-  out.add_u32("cadence_false_irq_count", lane.cadence_false_irq_count);
-  out.add_u32("cadence_last_reason", lane.cadence_last_reason);
-  out.add_str("cadence_last_reason_name",
-              ocxo_cadence_reason_name(lane.cadence_last_reason));
-}
-
-static FLASHMEM void add_vclock_heartbeat_payload(Payload& p) {
-  p.add("vclock_heartbeat_period_ns", (uint64_t)VCLOCK_HEARTBEAT_PERIOD_NS);
-  p.add("vclock_heartbeat_armed", g_vclock_heartbeat_armed);
-  p.add("vclock_heartbeat_arm_count", g_vclock_heartbeat_arm_count);
-  p.add("vclock_heartbeat_arm_failures", g_vclock_heartbeat_arm_failures);
-  p.add("vclock_heartbeat_fire_count", g_vclock_heartbeat_fire_count);
-  p.add("vclock_heartbeat_vclock_ticks", g_vclock_heartbeat_vclock_ticks);
-  p.add("vclock_heartbeat_ocxo1_rollover_updates_retired", g_vclock_heartbeat_ocxo1_rollover_updates_retired);
-  p.add("vclock_heartbeat_ocxo2_rollover_updates_retired", g_vclock_heartbeat_ocxo2_rollover_updates_retired);
-  p.add("vclock_heartbeat_last_vclock_counter32", g_vclock_heartbeat_last_vclock_counter32);
-  p.add("vclock_heartbeat_ocxo_rollover_retired", true);
-  p.add("vclock_heartbeat_one_second_authority_retired", true);
-  p.add("vclock_heartbeat_one_second_legacy_count", g_vclock_heartbeat_one_second_legacy_count);
-  p.add("vclock_heartbeat_one_second_handoff_skip_count", g_vclock_heartbeat_one_second_handoff_skip_count);
-  p.add("vclock_heartbeat_one_second_fallback_count", g_vclock_heartbeat_one_second_fallback_count);
-  p.add("vclock_heartbeat_smartzero_authority_retired", true);
-  p.add("vclock_heartbeat_smartzero_authority_retired_count", g_vclock_heartbeat_smartzero_authority_retired_count);
-  p.add("vclock_heartbeat_fact_drain_authority_retired", true);
-  p.add("vclock_heartbeat_fact_drain_authority_retired_count", g_vclock_heartbeat_fact_drain_authority_retired_count);
-  p.add("vclock_heartbeat_epoch_authority_retired", true);
-  p.add("vclock_heartbeat_epoch_authority_retired_count", g_vclock_heartbeat_epoch_authority_retired_count);
-  p.add("vclock_heartbeat_epoch_pending_skip_count", g_vclock_heartbeat_epoch_pending_skip_count);
-  p.add("vclock_ch2_epoch_native_enabled", VCLOCK_CH2_EPOCH_NATIVE_ENABLED);
-  p.add("vclock_ch2_epoch_native_service_count", g_vclock_ch2_epoch_native_service_count);
-  p.add("vclock_ch2_epoch_native_publish_count", g_vclock_ch2_epoch_native_publish_count);
-  p.add("vclock_ch2_epoch_native_bad_backdate_count", g_vclock_ch2_epoch_native_bad_backdate_count);
-  p.add("vclock_ch2_epoch_native_last_reject_reason", g_vclock_ch2_epoch_native_last_reject_reason);
-  p.add("vclock_ch2_epoch_native_last_reject_reason_name", vclock_ch2_epoch_reject_reason_name(g_vclock_ch2_epoch_native_last_reject_reason));
-  p.add("vclock_ch2_epoch_native_dispatch_arm_count", g_vclock_ch2_epoch_native_dispatch_arm_count);
-  p.add("vclock_ch2_epoch_native_dispatch_arm_fail_count", g_vclock_ch2_epoch_native_dispatch_arm_fail_count);
-  p.add("vclock_ch2_epoch_native_last_sequence", g_vclock_ch2_epoch_native_last_sequence);
-  p.add("vclock_ch2_epoch_native_last_selected_counter32", g_vclock_ch2_epoch_native_last_selected_counter32);
-  p.add("vclock_ch2_epoch_native_last_service_counter32", g_vclock_ch2_epoch_native_last_service_counter32);
-  p.add("vclock_ch2_epoch_native_last_backdate_ticks", g_vclock_ch2_epoch_native_last_backdate_ticks);
-  p.add("vclock_ch2_epoch_native_last_backdate_cycles", g_vclock_ch2_epoch_native_last_backdate_cycles);
-  p.add("vclock_ch2_epoch_native_last_sacred_dwt", g_vclock_ch2_epoch_native_last_sacred_dwt);
-  p.add("vclock_ch2_fact_drain_native_enabled", true);
-  p.add("vclock_ch2_fact_drain_service_count", g_vclock_ch2_fact_drain_service_count);
-  p.add("vclock_ch2_fact_drain_arm_count", g_vclock_ch2_fact_drain_arm_count);
-
-  p.add("vclock_ch2_smartzero_native_enabled", VCLOCK_CH2_SMARTZERO_NATIVE_ENABLED);
-  p.add("vclock_ch2_smartzero_seeded", g_vclock_ch2_smartzero_seeded);
-  p.add("vclock_ch2_smartzero_next_counter32", g_vclock_ch2_smartzero_next_counter32);
-  p.add("vclock_ch2_smartzero_reset_count", g_vclock_ch2_smartzero_reset_count);
-  p.add("vclock_ch2_smartzero_seed_count", g_vclock_ch2_smartzero_seed_count);
-  p.add("vclock_ch2_smartzero_deactivate_count", g_vclock_ch2_smartzero_deactivate_count);
-  p.add("vclock_ch2_smartzero_service_count", g_vclock_ch2_smartzero_service_count);
-  p.add("vclock_ch2_smartzero_transaction_skip_count", g_vclock_ch2_smartzero_transaction_skip_count);
-  p.add("vclock_ch2_smartzero_feed_count", g_vclock_ch2_smartzero_feed_count);
-  p.add("vclock_ch2_smartzero_late_count", g_vclock_ch2_smartzero_late_count);
-  p.add("vclock_ch2_smartzero_late_max_ticks", g_vclock_ch2_smartzero_late_max_ticks);
-  p.add("vclock_ch2_smartzero_resync_count", g_vclock_ch2_smartzero_resync_count);
-  p.add("vclock_ch2_smartzero_drop_count", g_vclock_ch2_smartzero_drop_count);
-  p.add("vclock_ch2_smartzero_waiting_for_cps_count", g_vclock_ch2_smartzero_waiting_for_cps_count);
-  p.add("vclock_ch2_smartzero_first_sample_count", g_vclock_ch2_smartzero_first_sample_count);
-  p.add("vclock_ch2_smartzero_accepted_count", g_vclock_ch2_smartzero_accepted_count);
-  p.add("vclock_ch2_smartzero_rejected_dwt_count", g_vclock_ch2_smartzero_rejected_dwt_count);
-  p.add("vclock_ch2_smartzero_rejected_counter_count", g_vclock_ch2_smartzero_rejected_counter_count);
-  p.add("vclock_ch2_smartzero_last_target_counter32", g_vclock_ch2_smartzero_last_target_counter32);
-  p.add("vclock_ch2_smartzero_last_service_counter32", g_vclock_ch2_smartzero_last_service_counter32);
-  p.add("vclock_ch2_smartzero_last_dwt", g_vclock_ch2_smartzero_last_dwt);
-  p.add("vclock_ch2_smartzero_last_late_ticks", g_vclock_ch2_smartzero_last_late_ticks);
-
-  p.add("vclock_ch2_one_second_enabled", g_vclock_ch2_one_second_enabled);
-  p.add("vclock_ch2_one_second_next_counter32", g_vclock_ch2_one_second_next_counter32);
-  p.add("vclock_ch2_one_second_enable_count", g_vclock_ch2_one_second_enable_count);
-  p.add("vclock_ch2_one_second_epoch_enable_count", g_vclock_ch2_one_second_epoch_enable_count);
-  p.add("vclock_ch2_one_second_epoch_base_counter32", g_vclock_ch2_one_second_epoch_base_counter32);
-  p.add("vclock_ch2_one_second_epoch_service_counter32", g_vclock_ch2_one_second_epoch_service_counter32);
-  p.add("vclock_ch2_one_second_epoch_target_counter32", g_vclock_ch2_one_second_epoch_target_counter32);
-  p.add("vclock_ch2_one_second_epoch_tick_mod_seed", g_vclock_ch2_one_second_epoch_tick_mod_seed);
-  p.add("vclock_ch2_one_second_epoch_remaining_cells", g_vclock_ch2_one_second_epoch_remaining_cells);
-  p.add("vclock_ch2_one_second_epoch_residual_ticks", g_vclock_ch2_one_second_epoch_residual_ticks);
-  p.add("vclock_ch2_one_second_heartbeat_enable_count", g_vclock_ch2_one_second_heartbeat_enable_count);
-  p.add("vclock_ch2_one_second_reset_count", g_vclock_ch2_one_second_reset_count);
-  p.add("vclock_ch2_one_second_service_count", g_vclock_ch2_one_second_service_count);
-  p.add("vclock_ch2_one_second_enqueue_count", g_vclock_ch2_one_second_enqueue_count);
-  p.add("vclock_ch2_one_second_late_count", g_vclock_ch2_one_second_late_count);
-  p.add("vclock_ch2_one_second_late_max_ticks", g_vclock_ch2_one_second_late_max_ticks);
-  p.add("vclock_ch2_one_second_catchup_count", g_vclock_ch2_one_second_catchup_count);
-  p.add("vclock_ch2_one_second_drop_count", g_vclock_ch2_one_second_drop_count);
-  p.add("vclock_ch2_one_second_last_target_counter32", g_vclock_ch2_one_second_last_target_counter32);
-  p.add("vclock_ch2_one_second_last_service_counter32", g_vclock_ch2_one_second_last_service_counter32);
-  p.add("vclock_ch2_one_second_last_dwt", g_vclock_ch2_one_second_last_dwt);
-
-  p.add("ch2_implicit_rollover_enabled", CH2_IMPLICIT_ROLLOVER_ENABLED);
-  p.add("ch2_implicit_rollover_count", g_ch2_implicit_rollover_count);
-  p.add("ch2_implicit_rollover_vclock_updates", g_ch2_implicit_rollover_vclock_updates);
-  p.add("ch2_implicit_rollover_ocxo1_updates", g_ch2_implicit_rollover_ocxo1_updates);
-  p.add("ch2_implicit_rollover_ocxo2_updates", g_ch2_implicit_rollover_ocxo2_updates);
-  p.add("ch2_implicit_rollover_last_vclock_hw16", (uint32_t)g_ch2_implicit_rollover_last_vclock_hw16);
-  p.add("ch2_implicit_rollover_last_ocxo1_hw16", (uint32_t)g_ch2_implicit_rollover_last_ocxo1_hw16);
-  p.add("ch2_implicit_rollover_last_ocxo2_hw16", (uint32_t)g_ch2_implicit_rollover_last_ocxo2_hw16);
-  p.add("ch2_implicit_rollover_last_vclock_counter32", g_ch2_implicit_rollover_last_vclock_counter32);
-  p.add("ch2_implicit_rollover_last_ocxo1_counter32", g_ch2_implicit_rollover_last_ocxo1_counter32);
-  p.add("ch2_implicit_rollover_last_ocxo2_counter32", g_ch2_implicit_rollover_last_ocxo2_counter32);
-
-  p.add("ocxo_cadence_interval_ticks", OCXO_CADENCE_INTERVAL_TICKS);
-  p.add("ocxo_one_second_edge_interval_ticks", OCXO_WITNESS_ONE_SECOND_COUNTS);
-  p.add("ocxo_cadence_samples_per_second", TICKS_PER_SECOND_EVENT);
-  p.add("ocxo_quiet_phase_sampling_enabled", OCXO_QUIET_PHASE_SAMPLING_ENABLED);
-  p.add("ocxo_rollover_only_mode", !OCXO_QUIET_PHASE_SAMPLING_ENABLED);
-  p.add("vclock_ema_dwt_authority_enabled", VCLOCK_EMA_DWT_AUTHORITY_ENABLED);
-  p.add("vclock_ema_alpha_numerator", VCLOCK_EMA_ALPHA_NUMERATOR);
-  p.add("vclock_ema_alpha_denominator", VCLOCK_EMA_ALPHA_DENOMINATOR);
-  p.add("vclock_ema_audit_threshold_cycles", VCLOCK_EMA_AUDIT_THRESHOLD_CYCLES);
-  p.add("ocxo_ema_dwt_authority_enabled", OCXO_EMA_DWT_AUTHORITY_ENABLED);
-  p.add("ocxo_ema_alpha_numerator", OCXO_EMA_ALPHA_NUMERATOR);
-  p.add("ocxo_ema_alpha_denominator", OCXO_EMA_ALPHA_DENOMINATOR);
-  p.add("ocxo_yardstick_dwt_authority_enabled", OCXO_YARDSTICK_DWT_AUTHORITY_ENABLED);
-  p.add("ocxo_yardstick_gate_threshold_cycles", OCXO_YARDSTICK_GATE_THRESHOLD_CYCLES);
-  p.add("ocxo_yardstick_anchor_p_shift", OCXO_YARDSTICK_ANCHOR_P_SHIFT);
-  p.add("ocxo_yardstick_anchor_i_shift", OCXO_YARDSTICK_ANCHOR_I_SHIFT);
-  p.add("ocxo_yardstick_anchor_fast_lock_seconds",
-        OCXO_YARDSTICK_ANCHOR_FAST_LOCK_SECONDS);
-  p.add("ocxo_yardstick_anchor_fast_i_shift",
-        OCXO_YARDSTICK_ANCHOR_FAST_I_SHIFT);
-  p.add("smartzero2_selection_authority_enabled",
-        SMARTZERO2_SELECTION_AUTHORITY_ENABLED);
-  p.add("zero_worthy_streak_seconds", ZERO_WORTHY_STREAK_SECONDS);
-  p.add("zero_worthy_max_abs_auth_error_cycles",
-        ZERO_WORTHY_MAX_ABS_AUTH_ERROR_CYCLES);
-  p.add("zero_worthy_max_abs_error_sum_cycles",
-        ZERO_WORTHY_MAX_ABS_ERROR_SUM_CYCLES);
-  p.add("ocxo_quiet_phase_period_ticks", OCXO_QUIET_PHASE_PERIOD_TICKS);
-  p.add("ocxo1_quiet_phase_ticks", OCXO1_QUIET_PHASE_TICKS);
-  p.add("ocxo1_quiet_phase_us", ocxo_phase_ticks_to_us(OCXO1_QUIET_PHASE_TICKS));
-  p.add("ocxo2_quiet_phase_ticks", OCXO2_QUIET_PHASE_TICKS);
-  p.add("ocxo2_quiet_phase_us", ocxo_phase_ticks_to_us(OCXO2_QUIET_PHASE_TICKS));
-  add_ocxo_cadence_report_payload(p, g_ocxo1_ctx);
-  add_ocxo_cadence_report_payload(p, g_ocxo2_ctx);
-}
-static FLASHMEM void add_pps_payload(Payload& p) {
-  p.add("gpio_irq_count", g_gpio_irq_count);
-  p.add("gpio_miss_count", g_gpio_miss_count);
-  p.add("gpio_edge_count", g_pps_gpio_heartbeat.edge_count);
-  p.add("pps_spinidle_shadow_valid", g_spinidle_pps_last_capture.shadow_valid);
-  p.add("pps_spinidle_shadow_dwt", g_spinidle_pps_last_capture.shadow_dwt);
-  p.add("pps_spinidle_shadow_to_isr_entry_cycles",
-        g_spinidle_pps_last_capture.shadow_to_isr_entry_cycles);
-  p.add("pps_spinidle_shadow_valid_threshold_cycles",
-        g_spinidle_pps_last_capture.threshold_cycles);
-  add_isr_sanity_payload(p, "pps_isr_sanity", g_isr_sanity_pps);
-
-  p.add("pps_post_isr_deferred", true);
-  p.add("pps_post_isr_pending", g_pps_post_isr.pending);
-  p.add("pps_post_isr_arm_count", g_pps_post_isr.arm_count);
-  p.add("pps_post_isr_drain_count", g_pps_post_isr.drain_count);
-  p.add("pps_post_isr_overwrite_count", g_pps_post_isr.overwrite_count);
-  p.add("pps_post_isr_asap_fail_count", g_pps_post_isr.asap_fail_count);
-  p.add("pps_post_isr_last_sequence", g_pps_post_isr.last_sequence);
-  p.add("pps_post_isr_last_capture_window_cycles",
-        g_pps_post_isr.last_capture_window_cycles);
-
-  p.add("pps_relay_owner", "process_interrupt");
-  p.add("pps_relay_assert_in_isr", true);
-  p.add("pps_relay_deassert_in_timepop", false);
-  p.add("pps_relay_deassert_in_vclock_heartbeat", false);
-  p.add("pps_relay_deassert_in_ch2", true);
-  p.add("pps_relay_rearm_deassert_every_pps", true);
-  p.add("pps_relay_off_ns", (uint64_t)PPS_RELAY_OFF_NS);
-  p.add("pps_relay_off_cadence_ticks", PPS_RELAY_OFF_CADENCE_TICKS);
-  p.add("pps_relay_pin_initialized", g_pps_relay_pin_initialized);
-  p.add("pps_relay_timer_active", g_pps_relay_timer_active);
-  p.add("pps_relay_deassert_arm_pending", g_pps_relay_deassert_arm_pending);
-  p.add("pps_relay_deassert_countdown_ticks", g_pps_relay_deassert_countdown_ticks);
-  p.add("pps_relay_assert_count", g_pps_relay_assert_count);
-  p.add("pps_relay_deassert_count", g_pps_relay_deassert_count);
-  p.add("pps_relay_deassert_arm_count", g_pps_relay_deassert_arm_count);
-  p.add("pps_relay_deassert_arm_fail_count", g_pps_relay_deassert_arm_fail_count);
-  p.add("pps_relay_deassert_arm_skip_count", g_pps_relay_deassert_arm_skip_count);
-  p.add("pps_relay_last_assert_sequence", g_pps_relay_last_assert_sequence);
-  p.add("pps_relay_ch2_tick_valid", g_pps_relay_ch2_tick_valid);
-  p.add("pps_relay_ch2_last_counter32", g_pps_relay_ch2_last_counter32);
-  p.add("pps_relay_ch2_tick_count", g_pps_relay_ch2_tick_count);
-  p.add("pps_relay_ch2_catchup_count", g_pps_relay_ch2_catchup_count);
-
-  p.add("pps_rebootstrap_pending", g_pps_rebootstrap_pending);
-  p.add("pps_rebootstrap_count",   g_pps_rebootstrap_count);
-  p.add("vclock_epoch_latch_pending", g_vclock_epoch_latch.pending);
-  p.add("vclock_epoch_latch_counter32", g_vclock_epoch_latch.counter32_at_edge);
-  p.add("vclock_epoch_latch_observed_counter32", g_vclock_epoch_latch.observed_counter32);
-  p.add("vclock_epoch_latch_first_cadence_counter32", g_vclock_epoch_latch.first_cadence_counter32);
-  p.add("vclock_epoch_latch_first_cadence_dwt", g_vclock_epoch_latch.first_cadence_dwt);
-  p.add("vclock_epoch_latch_backdate_ticks", g_vclock_epoch_latch.backdate_ticks);
-  p.add("vclock_epoch_latch_backdate_cycles", g_vclock_epoch_latch.backdate_cycles);
-  p.add("vclock_epoch_latch_sacred_dwt", g_vclock_epoch_latch.sacred_dwt);
-  p.add("vclock_ch2_epoch_native_enabled", VCLOCK_CH2_EPOCH_NATIVE_ENABLED);
-  p.add("vclock_ch2_epoch_native_service_count", g_vclock_ch2_epoch_native_service_count);
-  p.add("vclock_ch2_epoch_native_publish_count", g_vclock_ch2_epoch_native_publish_count);
-  p.add("vclock_ch2_epoch_native_bad_backdate_count", g_vclock_ch2_epoch_native_bad_backdate_count);
-  p.add("vclock_ch2_epoch_native_last_reject_reason", g_vclock_ch2_epoch_native_last_reject_reason);
-  p.add("vclock_ch2_epoch_native_last_reject_reason_name", vclock_ch2_epoch_reject_reason_name(g_vclock_ch2_epoch_native_last_reject_reason));
-  p.add("vclock_ch2_epoch_native_dispatch_arm_count", g_vclock_ch2_epoch_native_dispatch_arm_count);
-  p.add("vclock_ch2_epoch_native_dispatch_arm_fail_count", g_vclock_ch2_epoch_native_dispatch_arm_fail_count);
-  p.add("vclock_ch2_epoch_native_last_sequence", g_vclock_ch2_epoch_native_last_sequence);
-  p.add("vclock_ch2_epoch_native_last_selected_counter32", g_vclock_ch2_epoch_native_last_selected_counter32);
-  p.add("vclock_ch2_epoch_native_last_service_counter32", g_vclock_ch2_epoch_native_last_service_counter32);
-  p.add("vclock_ch2_epoch_native_last_backdate_ticks", g_vclock_ch2_epoch_native_last_backdate_ticks);
-  p.add("vclock_ch2_epoch_native_last_backdate_cycles", g_vclock_ch2_epoch_native_last_backdate_cycles);
-  p.add("vclock_ch2_epoch_native_last_sacred_dwt", g_vclock_ch2_epoch_native_last_sacred_dwt);
-
-  pps_t pps; pps_vclock_t pvc;
-  store_load(pps, pvc);
-
-  p.add("pps_sequence",          pps.sequence);
-  p.add("pps_dwt_at_edge",       pps.dwt_at_edge);
-  p.add("pps_counter32_at_edge", pps.counter32_at_edge);
-  p.add("pps_ch3_at_edge",       (uint32_t)pps.ch3_at_edge);
-
-  p.add("pps_vclock_sequence",          pvc.sequence);
-  p.add("pps_vclock_dwt_at_edge",       pvc.dwt_at_edge);
-  p.add("pps_vclock_counter32_at_edge", pvc.counter32_at_edge);
-  p.add("pps_vclock_ch3_at_edge",       (uint32_t)pvc.ch3_at_edge);
-  p.add("pps_vclock_phase_cycles", pps_vclock_phase_cycles_from_edges(pps, pvc));
-
-  p.add("pps_edge_dispatch_registered", g_pps_edge_dispatch != nullptr);
-}
-
-static FLASHMEM void add_epoch_capture_payload(Payload& p) {
-  interrupt_epoch_capture_t epoch_cap{};
-  const bool epoch_cap_ok = interrupt_last_epoch_capture(&epoch_cap);
-  p.add("epoch_capture_available", epoch_cap_ok);
-  p.add("epoch_capture_valid", epoch_cap.valid);
-  p.add("epoch_capture_sequence", epoch_cap.sequence);
-  p.add("epoch_capture_window_cycles", epoch_cap.capture_window_cycles);
-  p.add("epoch_capture_max_window_cycles", EPOCH_CAPTURE_MAX_WINDOW_CYCLES);
-  p.add("epoch_capture_vclock_read_offset_cycles", epoch_cap.vclock_read_offset_cycles);
-  p.add("epoch_capture_vclock_dwt_at_edge", epoch_cap.vclock_dwt_at_edge);
-  p.add("epoch_capture_vclock_valid", epoch_cap.vclock_capture_valid);
-  p.add("epoch_capture_all_lanes_valid", epoch_cap.all_lanes_capture_valid);
-  p.add("epoch_capture_vclock_hardware16_observed", (uint32_t)epoch_cap.vclock_hardware16_observed);
-  p.add("epoch_capture_vclock_hardware16_selected", (uint32_t)epoch_cap.vclock_hardware16_selected);
-  p.add("epoch_capture_vclock_counter32", epoch_cap.vclock_counter32);
-  p.add("epoch_capture_ocxo1_counter32", epoch_cap.ocxo1_counter32);
-  p.add("epoch_capture_ocxo2_counter32", epoch_cap.ocxo2_counter32);
-}
-
-static FLASHMEM void add_dynamic_cps_payload(Payload& p) {
-  const uint32_t dynamic_cps = interrupt_dynamic_cps();
-  p.add("dynamic_cps_owner", "CLOCKS_STATIC_PPS");
-  p.add("dynamic_cps", dynamic_cps);
-  p.add("dynamic_cps_valid", dynamic_cps != 0);
-  p.add("dynamic_cps_pps_sequence", g_pps_gpio_heartbeat.edge_count);
-  p.add("dynamic_cps_last_pvc_dwt_at_edge", g_pps_gpio_heartbeat.last_dwt);
-  p.add("dynamic_cps_last_reseed_value", dynamic_cps);
-  p.add("dynamic_cps_last_reseed_was_computed", dynamic_cps != 0);
-}
-
-
-static FLASHMEM void add_smartzero_lane_payload(Payload& parent,
-                                       const char* key,
-                                       const interrupt_smartzero_lane_snapshot_t& z) {
-  Payload p;
-  p.add("kind", interrupt_subscriber_kind_str(z.kind));
-  p.add("state", smartzero_lane_state_name(z.state));
-  p.add("last_decision", smartzero_decision_name(z.last_decision));
-  p.add("sample_count", z.sample_count);
-  p.add("interval_attempt_count", z.interval_attempt_count);
-  p.add("accepted_count", z.accepted_count);
-  p.add("rejected_count", z.rejected_count);
-  p.add("waiting_for_cps_count", z.waiting_for_cps_count);
-  p.add("cps_used", z.cps_used);
-  p.add("expected_interval_cycles", z.expected_interval_cycles);
-  p.add("tolerance_cycles", z.tolerance_cycles);
-  p.add("required_counter_delta_ticks", z.required_counter_delta_ticks);
-  p.add("last_sample_dwt", z.last_sample_dwt);
-  p.add("last_sample_counter32", z.last_sample_counter32);
-  p.add("last_sample_hardware16", (uint32_t)z.last_sample_hardware16);
-  p.add("previous_sample_dwt", z.previous_sample_dwt);
-  p.add("previous_sample_counter32", z.previous_sample_counter32);
-  p.add("previous_sample_hardware16", (uint32_t)z.previous_sample_hardware16);
-  p.add("last_interval_cycles", z.last_interval_cycles);
-  p.add("last_interval_error_cycles", z.last_interval_error_cycles);
-  p.add("max_abs_interval_error_cycles", z.max_abs_interval_error_cycles);
-  p.add("last_counter_delta_ticks", z.last_counter_delta_ticks);
-  p.add("anchor_dwt", z.anchor_dwt);
-  p.add("anchor_counter32", z.anchor_counter32);
-  p.add("anchor_hardware16", (uint32_t)z.anchor_hardware16);
-  p.add("anchor_pair_previous_dwt", z.anchor_pair_previous_dwt);
-  p.add("anchor_pair_previous_counter32", z.anchor_pair_previous_counter32);
-  p.add("arm_count", z.arm_count);
-  p.add("fire_count", z.fire_count);
-  p.add("next_target_counter32", z.next_target_counter32);
-  parent.add_object(key, p);
-}
-
-static FLASHMEM void add_smartzero_payload(Payload& p) {
-  interrupt_smartzero_snapshot_t z{};
-  (void)interrupt_smartzero_live_snapshot(&z);
-
-  // Explicit live-acquisition surface.  This is NOT the installed epoch proof.
-  p.add("live_smartzero_phase", smartzero_phase_name(z.phase));
-  p.add("live_smartzero_running", z.running);
-  p.add("live_smartzero_complete", z.complete);
-  p.add("live_smartzero_aborted", z.aborted);
-  p.add("live_smartzero_sequence", z.sequence);
-  p.add("live_smartzero_begin_count", z.begin_count);
-  p.add("live_smartzero_complete_count", z.complete_count);
-  p.add("live_smartzero_abort_count", z.abort_count);
-  p.add("live_smartzero_current_lane_index", z.current_lane_index);
-  p.add("live_smartzero_current_lane", interrupt_subscriber_kind_str(z.current_lane));
-  p.add("live_smartzero_sample_rate_hz", z.sample_rate_hz);
-  p.add("live_smartzero_counter_delta_ticks", z.counter_delta_ticks);
-  p.add("live_smartzero_tolerance_cycles", z.tolerance_cycles);
-
-  // Legacy aliases retained for existing tooling.  These names refer to the
-  // live acquisition attempt only; CLOCKS reports the installed proof.
-  p.add("smartzero_phase", smartzero_phase_name(z.phase));
-  p.add("smartzero_running", z.running);
-  p.add("smartzero_complete", z.complete);
-  p.add("smartzero_aborted", z.aborted);
-  p.add("smartzero_sequence", z.sequence);
-  p.add("smartzero_begin_count", z.begin_count);
-  p.add("smartzero_complete_count", z.complete_count);
-  p.add("smartzero_abort_count", z.abort_count);
-  p.add("smartzero_current_lane_index", z.current_lane_index);
-  p.add("smartzero_current_lane", interrupt_subscriber_kind_str(z.current_lane));
-  p.add("smartzero_sample_rate_hz", z.sample_rate_hz);
-  p.add("smartzero_counter_delta_ticks", z.counter_delta_ticks);
-  p.add("smartzero_tolerance_cycles", z.tolerance_cycles);
-
-  Payload live_lanes;
-  add_smartzero_lane_payload(live_lanes, "vclock", z.lanes[0]);
-  add_smartzero_lane_payload(live_lanes, "ocxo1", z.lanes[1]);
-  add_smartzero_lane_payload(live_lanes, "ocxo2", z.lanes[2]);
-  p.add_object("live_smartzero", live_lanes);
-
-  Payload legacy_lanes;
-  add_smartzero_lane_payload(legacy_lanes, "vclock", z.lanes[0]);
-  add_smartzero_lane_payload(legacy_lanes, "ocxo1", z.lanes[1]);
-  add_smartzero_lane_payload(legacy_lanes, "ocxo2", z.lanes[2]);
-  p.add_object("smartzero", legacy_lanes);  // legacy live alias
-}
-
-static FLASHMEM void add_vclock_clock32_payload(Payload& p, const char* prefix) {
-  payload_prefix_t out(p, prefix);
-
-  out.add_bool("clock32_zeroed", g_vclock_clock32.zeroed);
-  out.add_u64("clock32_zero_ns", g_vclock_clock32.zero_ns);
-  out.add_u32("clock32_zero_counter32", g_vclock_clock32.zero_counter32);
-  out.add_u32("clock32_current", g_vclock_clock32.current_counter32);
-  out.add_u32("clock32_hardware_low16_at_zero", (uint32_t)g_vclock_clock32.hardware_low16_at_zero);
-  out.add_u32("clock32_hardware_low16_at_current", (uint32_t)g_vclock_clock32.hardware_low16_at_current);
-  out.add_bool("clock32_hardware_anchor_valid", g_vclock_clock32.hardware_anchor_valid);
-  out.add_u32("clock32_hardware_anchor_update_count", g_vclock_clock32.hardware_anchor_update_count);
-  out.add_bool("clock32_pending_zero", g_vclock_clock32.pending_zero);
-  out.add_u32("clock32_zero_count", g_vclock_clock32.zero_count);
-  out.add_u32("clock32_minder_update_count", g_vclock_clock32.minder_update_count);
-  out.add_u32("clock32_pending_zero_count", g_vclock_clock32.pending_zero_count);
-}
-static FLASHMEM void add_ocxo_clock32_payload(Payload& p,
-                                     const char* prefix,
-                                     const synthetic_clock32_t& clock32) {
-  payload_prefix_t out(p, prefix);
-
-  out.add_bool("clock32_zeroed", clock32.zeroed);
-  out.add_u64("clock32_zero_ns", clock32.zero_ns);
-  out.add_u32("clock32_zero_counter32", clock32.zero_counter32);
-  out.add_u32("clock32_current", clock32.current_counter32);
-  out.add_bool("clock32_pending_zero", clock32.pending_zero);
-  out.add_u32("clock32_zero_count", clock32.zero_count);
-  out.add_u32("clock32_minder_update_count", clock32.minder_update_count);
-}
-static FLASHMEM void add_runtime_lane_summary(Payload& p,
-                                     const char* prefix,
-                                     const interrupt_subscriber_runtime_t* rt) {
-  payload_prefix_t out(p, prefix);
-
-  out.add_bool("subscribed", rt ? rt->subscribed : false);
-  out.add_bool("active", rt ? rt->active : false);
-  out.add_bool("has_fired", rt ? rt->has_fired : false);
-  out.add_u32("start_count", rt ? rt->start_count : 0U);
-  out.add_u32("stop_count", rt ? rt->stop_count : 0U);
-  out.add_u32("irq_count", rt ? rt->irq_count : 0U);
-  out.add_u32("dispatch_count", rt ? rt->dispatch_count : 0U);
-  out.add_u32("event_count", rt ? rt->event_count : 0U);
-  if (rt && rt->has_fired) {
-    out.add_u32("last_event_dwt", rt->last_event.dwt_at_event);
-    out.add_u32("last_event_counter32", rt->last_event.counter32_at_event);
-    out.add_u64("last_event_gnss_ns_at_event", rt->last_event.gnss_ns_at_event);
-    out.add_bool("last_event_gnss_ns_available", rt->last_event.gnss_ns_at_event != 0);
-    out.add_u32("last_event_status", (uint32_t)((uint8_t)rt->last_event.status));
-    out.add_u64("last_diag_gnss_ns_at_event", rt->last_diag.gnss_ns_at_event);
-    out.add_bool("last_diag_gnss_ns_available", rt->last_diag.gnss_ns_at_event != 0);
-    out.add_bool("last_diag_gnss_projection_valid",
-                 rt->last_diag.gnss_ns_at_event != 0 &&
-                 rt->last_diag.anchor_failure_mask == 0);
-    out.add_bool("last_diag_dwt_synthetic", rt->last_diag.dwt_synthetic);
-    out.add_u32("last_diag_dwt_original_at_event", rt->last_diag.dwt_original_at_event);
-    out.add_u32("last_diag_dwt_predicted_at_event", rt->last_diag.dwt_predicted_at_event);
-    out.add_u32("last_diag_dwt_used_at_event", rt->last_diag.dwt_used_at_event);
-    out.add_u32("last_diag_dwt_isr_entry_raw", rt->last_diag.dwt_isr_entry_raw);
-    out.add_i32("last_diag_dwt_synthetic_error_cycles", rt->last_diag.dwt_synthetic_error_cycles);
-    out.add_bool("last_diag_spinidle_shadow_valid", rt->last_diag.spinidle_shadow_valid);
-    out.add_u32("last_diag_spinidle_shadow_dwt", rt->last_diag.spinidle_shadow_dwt);
-    out.add_u32("last_diag_spinidle_shadow_to_isr_entry_cycles",
-                rt->last_diag.spinidle_shadow_to_isr_entry_cycles);
-    out.add_u32("last_diag_spinidle_shadow_valid_threshold_cycles",
-                rt->last_diag.spinidle_shadow_valid_threshold_cycles);
-    out.add_u32("last_diag_anchor_selection_kind", rt->last_diag.anchor_selection_kind);
-    out.add_u32("last_diag_anchor_failure_mask", rt->last_diag.anchor_failure_mask);
-  } else {
-    out.add_u32("last_event_dwt", 0);
-    out.add_u32("last_event_counter32", 0);
-    out.add_u64("last_event_gnss_ns_at_event", 0);
-    out.add_bool("last_event_gnss_ns_available", false);
-    out.add_u32("last_event_status", 0);
-    out.add_u64("last_diag_gnss_ns_at_event", 0);
-    out.add_bool("last_diag_gnss_ns_available", false);
-    out.add_bool("last_diag_gnss_projection_valid", false);
-    out.add_bool("last_diag_dwt_synthetic", false);
-    out.add_u32("last_diag_dwt_original_at_event", 0);
-    out.add_u32("last_diag_dwt_predicted_at_event", 0);
-    out.add_u32("last_diag_dwt_used_at_event", 0);
-    out.add_u32("last_diag_dwt_isr_entry_raw", 0);
-    out.add_i32("last_diag_dwt_synthetic_error_cycles", 0);
-    out.add_bool("last_diag_spinidle_shadow_valid", false);
-    out.add_u32("last_diag_spinidle_shadow_dwt", 0);
-    out.add_u32("last_diag_spinidle_shadow_to_isr_entry_cycles", 0);
-    out.add_u32("last_diag_spinidle_shadow_valid_threshold_cycles",
-                SPINIDLE_SHADOW_VALID_THRESHOLD_CYCLES);
-    out.add_u32("last_diag_anchor_selection_kind", 0);
-    out.add_u32("last_diag_anchor_failure_mask", 0);
-  }
-}
-static FLASHMEM void add_ocxo_identity_payload(Payload& p,
-                                      const ocxo_runtime_context_t& ctx) {
-  p.add("lane", ctx.name);
-  p.add("kind", ctx.name);
-  p.add("provider", interrupt_provider_kind_str(ctx.provider));
-  p.add("hardware_lane", interrupt_lane_str(ctx.lane_id));
-  p.add("cadence_source", ctx.cadence_source);
-  p.add("counter_source", ctx.counter_source);
-  p.add("event_source", "LOCAL_ONE_SECOND_EDGE_COMPARE_EMA_DWT");
-  p.add("dwt_authority", ctx.dwt_authority);
-}
-
-static FLASHMEM void add_ocxo_lane_basic_payload(payload_prefix_t& out,
-                                        const ocxo_lane_t& lane) {
-  out.add_bool("initialized", lane.initialized);
-  out.add_bool("active", lane.active);
-  out.add_u32("irq_count", lane.irq_count);
-  out.add_u32("miss_count", lane.miss_count);
-  out.add_u32("bootstrap_count", lane.bootstrap_count);
-  out.add_u32("cadence_hits_total", lane.cadence_hits_total);
-  out.add_bool("cadence_enabled", lane.cadence_enabled);
-  out.add_bool("cadence_armed", lane.cadence_armed);
-  out.add_bool("cadence_epoch_valid", lane.cadence_epoch_valid);
-  out.add_u32("cadence_epoch_counter32", lane.cadence_epoch_counter32);
-  out.add_u32("cadence_interval_ticks", OCXO_CADENCE_INTERVAL_TICKS);
-  out.add_bool("cadence_sample_phase_valid", lane.cadence_sample_phase_valid);
-  out.add_u32("cadence_sample_phase_ticks", lane.cadence_sample_phase_ticks);
-  out.add_u32("cadence_sample_phase_us", lane.cadence_sample_phase_us);
-  out.add_u32("cadence_sample_phase_ns", lane.cadence_sample_phase_ns);
-  out.add_u32("cadence_sample_period_ticks", lane.cadence_sample_period_ticks);
-  out.add_u32("cadence_phase_align_start_count", lane.cadence_phase_align_start_count);
-  out.add_u32("cadence_last_phase_align_vclock_counter32", lane.cadence_last_phase_align_vclock_counter32);
-  out.add_u32("cadence_last_phase_align_vclock_phase_ticks", lane.cadence_last_phase_align_vclock_phase_ticks);
-  out.add_u32("cadence_last_phase_align_ticks_until_target", lane.cadence_last_phase_align_ticks_until_target);
-  out.add_u32("cadence_last_phase_align_ocxo_counter32", lane.cadence_last_phase_align_ocxo_counter32);
-  out.add_u32("cadence_next_counter32", lane.cadence_next_counter32);
-  out.add_u32("cadence_next_low16", (uint32_t)lane.cadence_next_low16);
-  out.add_u32("cadence_fire_count", lane.cadence_fire_count);
-  out.add_u32("cadence_arm_count", lane.cadence_arm_count);
-  out.add_u32("cadence_rearm_count", lane.cadence_rearm_count);
-  out.add_u32("cadence_false_irq_count", lane.cadence_false_irq_count);
-  out.add_u32("cadence_one_second_due_count", lane.cadence_one_second_due_count);
-  out.add_u32("cadence_user_callback_count", lane.cadence_user_callback_count);
-  out.add_u32("cadence_last_reason", lane.cadence_last_reason);
-  out.add_str("cadence_last_reason_name",
-              ocxo_cadence_reason_name(lane.cadence_last_reason));
-  out.add_u32("compare_target", (uint32_t)lane.compare_target);
-  out.add_u32("tick_mod_1000", lane.tick_mod_1000);
-  out.add_u32("logical_count32", lane.logical_count32_at_last_second);
-
-  out.add_bool("witness_target_initialized", lane.witness_target_initialized);
-  out.add_bool("witness_armed", lane.witness_armed);
-  out.add_u32("witness_arm_count", lane.witness_arm_count);
-  out.add_u32("witness_fire_count", lane.witness_fire_count);
-  out.add_u32("witness_false_irq_count", lane.witness_false_irq_count);
-  out.add_u32("witness_missed_target_count", lane.witness_missed_target_count);
-  out.add_u32("witness_late_arm_count", lane.witness_late_arm_count);
-  out.add_u32("witness_target_counter32", lane.witness_target_counter32);
-  out.add_u32("witness_last_event_dwt", lane.witness_last_event_dwt);
-  out.add_u32("witness_last_event_counter32", lane.witness_last_event_counter32);
-  out.add_u32("witness_last_late_ticks", lane.witness_last_late_ticks);
-  out.add_u32("witness_last_arm_remaining_ticks", lane.witness_last_arm_remaining_ticks);
-}
-
-static FLASHMEM void add_ocxo_witness_service_payload(payload_prefix_t& out,
-                                             const ocxo_lane_t& lane) {
-  out.add_u32("witness_last_target_delta_mod65536_ticks",
-              lane.witness_last_target_delta_mod65536_ticks);
-  out.add_i32("witness_last_service_offset_signed_ticks",
-              lane.witness_last_service_offset_signed_ticks);
-  out.add_u32("witness_last_early_ticks", lane.witness_last_early_ticks);
-  out.add_u32("witness_last_interpreted_late_ticks",
-              lane.witness_last_interpreted_late_ticks);
-  out.add_u32("witness_last_service_offset_abs_ticks",
-              lane.witness_last_service_offset_abs_ticks);
-  out.add_bool("witness_last_service_was_early",
-               lane.witness_last_service_was_early);
-  out.add_bool("witness_last_service_was_on_or_after_target",
-               lane.witness_last_service_was_on_or_after_target);
-  out.add_bool("witness_last_event_published", lane.witness_last_event_published);
-  out.add_u32("witness_last_service_class", lane.witness_last_service_class);
-  out.add_str("witness_last_service_class_name",
-              ocxo_service_class_name(lane.witness_last_service_class));
-  out.add_u32("witness_service_count", lane.witness_service_count);
-  out.add_u32("witness_early_service_count", lane.witness_early_service_count);
-  out.add_u32("witness_on_or_after_service_count",
-              lane.witness_on_or_after_service_count);
-  out.add_u32("witness_valid_publish_count", lane.witness_valid_publish_count);
-  out.add_u32("witness_early_service_published_count",
-              lane.witness_early_service_published_count);
-  out.add_u32("witness_last_fact_sequence", lane.witness_last_fact_sequence);
-  out.add_bool("witness_last_fact_one_second_due",
-               lane.witness_last_fact_one_second_due);
-  out.add_i32("witness_last_service_correction_cycles",
-              lane.witness_last_service_correction_cycles);
-  out.add_u32("witness_last_service_corrected_dwt",
-              lane.witness_last_service_corrected_dwt);
-  out.add_u32("witness_last_counter_delta_ticks",
-              lane.witness_last_counter_delta_ticks);
-  out.add_u32("witness_counter_delta_violation_count",
-              lane.witness_counter_delta_violation_count);
-  out.add_u32("witness_last_bad_counter_delta",
-              lane.witness_last_bad_counter_delta);
-  out.add_bool("ema_last_adjacency_gate_valid",
-               lane.ema_last_adjacency_gate_valid);
-  out.add_bool("ema_last_adjacency_ok", lane.ema_last_adjacency_ok);
-  out.add_bool("ema_last_adjacency_rejected",
-               lane.ema_last_adjacency_rejected);
-  out.add_u32("ema_last_counter_delta_ticks",
-              lane.ema_last_counter_delta_ticks);
-  out.add_u32("ema_expected_counter_delta_ticks",
-              lane.ema_expected_counter_delta_ticks);
-  out.add_u32("ema_adjacency_reject_count",
-              lane.ema_adjacency_reject_count);
-  out.add_u32("witness_fact_enqueue_count", lane.witness_fact_enqueue_count);
-  out.add_u32("witness_fact_drain_count", lane.witness_fact_drain_count);
-  out.add_u32("witness_fact_overflow_count", lane.witness_fact_overflow_count);
-  out.add_u32("witness_fact_high_water", lane.witness_fact_high_water);
-  out.add_u32("witness_fact_asap_arm_count", lane.witness_fact_asap_arm_count);
-  out.add_u32("witness_fact_asap_fail_count", lane.witness_fact_asap_fail_count);
-  out.add_bool("ema_dwt_authority_enabled", OCXO_EMA_DWT_AUTHORITY_ENABLED);
-  out.add_u32("ema_alpha_numerator", OCXO_EMA_ALPHA_NUMERATOR);
-  out.add_u32("ema_alpha_denominator", OCXO_EMA_ALPHA_DENOMINATOR);
-  out.add_bool("ema_initialized", lane.ema_initialized);
-  out.add_bool("ema_interval_valid", lane.ema_interval_valid);
-  out.add_u32("ema_update_count", lane.ema_update_count);
-  out.add_u32("ema_last_observed_dwt", lane.ema_last_observed_dwt);
-  out.add_u32("ema_last_emitted_dwt", lane.ema_last_emitted_dwt);
-  out.add_u32("ema_last_observed_interval_cycles",
-              lane.ema_last_observed_interval_cycles);
-  out.add_u32("ema_interval_cycles", lane.ema_interval_cycles);
-  out.add_u32("ema_last_predicted_dwt", lane.ema_last_predicted_dwt);
-  out.add_i32("ema_last_error_cycles", lane.ema_last_error_cycles);
-  out.add_u32("ema_max_abs_error_cycles", lane.ema_max_abs_error_cycles);
-  out.add_u32("witness_schedule_last_decision",
-              lane.witness_schedule_last_decision);
-  out.add_str("witness_schedule_last_decision_name",
-              ocxo_schedule_decision_name(lane.witness_schedule_last_decision));
-}
-
-static FLASHMEM void add_ocxo_witness_detail_payload(payload_prefix_t& out,
-                                            const ocxo_lane_t& lane) {
-  out.add_u32("witness_schedule_last_current_counter32",
-              lane.witness_schedule_last_current_counter32);
-  out.add_u32("witness_schedule_last_target_counter32",
-              lane.witness_schedule_last_target_counter32);
-  out.add_u32("witness_schedule_last_remaining_ticks",
-              lane.witness_schedule_last_remaining_ticks);
-  out.add_u32("witness_schedule_last_phase_ticks",
-              lane.witness_schedule_last_phase_ticks);
-  out.add_u32("witness_schedule_last_ticks_until_arm_window",
-              lane.witness_schedule_last_ticks_until_arm_window);
-  out.add_u32("witness_schedule_last_current_low16",
-              (uint32_t)lane.witness_schedule_last_current_low16);
-  out.add_u32("witness_schedule_last_target_low16",
-              (uint32_t)lane.witness_schedule_last_target_low16);
-
-  out.add_u32("witness_last_arm_dwt_raw", lane.witness_last_arm_dwt_raw);
-  out.add_u32("witness_last_arm_counter32", lane.witness_last_arm_counter32);
-  out.add_u32("witness_last_arm_low16", (uint32_t)lane.witness_last_arm_low16);
-  out.add_u32("witness_last_arm_target_counter32",
-              lane.witness_last_arm_target_counter32);
-  out.add_u32("witness_last_arm_target_low16",
-              (uint32_t)lane.witness_last_arm_target_low16);
-  out.add_u32("witness_last_arm_to_isr_ticks",
-              lane.witness_last_arm_to_isr_ticks);
-  out.add_u32("witness_last_arm_to_isr_dwt_cycles",
-              lane.witness_last_arm_to_isr_dwt_cycles);
-  out.add_i32("witness_last_arm_remaining_minus_early_ticks",
-              (int32_t)lane.witness_last_arm_remaining_ticks -
-              (int32_t)lane.witness_last_early_ticks);
-
-  out.add_u32("witness_last_program_csctrl_before",
-              lane.witness_last_program_csctrl_before);
-  out.add_u32("witness_last_program_csctrl_after",
-              lane.witness_last_program_csctrl_after);
-  out.add_bool("witness_last_program_flag_before",
-               lane.witness_last_program_flag_before);
-  out.add_bool("witness_last_program_flag_after",
-               lane.witness_last_program_flag_after);
-  out.add_bool("witness_last_program_enabled_before",
-               lane.witness_last_program_enabled_before);
-  out.add_bool("witness_last_program_enabled_after",
-               lane.witness_last_program_enabled_after);
-
-  out.add_u32("cadence_last_program_csctrl_before",
-              lane.cadence_last_program_csctrl_before);
-  out.add_u32("cadence_last_program_csctrl_after",
-              lane.cadence_last_program_csctrl_after);
-  out.add_bool("cadence_last_program_flag_before",
-               lane.cadence_last_program_flag_before);
-  out.add_bool("cadence_last_program_flag_after",
-               lane.cadence_last_program_flag_after);
-  out.add_bool("cadence_last_program_enabled_before",
-               lane.cadence_last_program_enabled_before);
-  out.add_bool("cadence_last_program_enabled_after",
-               lane.cadence_last_program_enabled_after);
-
-  out.add_u32("witness_last_isr_csctrl_entry",
-              lane.witness_last_isr_csctrl_entry);
-  out.add_u32("witness_last_isr_csctrl_after_disable",
-              lane.witness_last_isr_csctrl_after_disable);
-  out.add_bool("witness_last_isr_compare_flag_entry",
-               lane.witness_last_isr_compare_flag_entry);
-  out.add_bool("witness_last_isr_compare_enabled_entry",
-               lane.witness_last_isr_compare_enabled_entry);
-  out.add_bool("witness_last_isr_compare_flag_after_disable",
-               lane.witness_last_isr_compare_flag_after_disable);
-  out.add_bool("witness_last_isr_compare_enabled_after_disable",
-               lane.witness_last_isr_compare_enabled_after_disable);
-  out.add_bool("witness_last_irq_had_armed", lane.witness_last_irq_had_armed);
-  out.add_bool("witness_last_irq_had_active_rt",
-               lane.witness_last_irq_had_active_rt);
-
-  out.add_u32("witness_last_target_low16",
-              (uint32_t)lane.witness_last_target_low16);
-  out.add_u32("witness_last_isr_counter_low16",
-              (uint32_t)lane.witness_last_isr_counter_low16);
-  out.add_bool("witness_last_service_early_immediate_after_arm",
-               lane.witness_last_service_was_early &&
-               lane.witness_last_arm_to_isr_ticks <= 256U);
-}
-
-static FLASHMEM void add_ocxo_qtimer_payload(payload_prefix_t& out,
-                                    const ocxo_runtime_context_t& ctx,
-                                    const ocxo_qtimer_diag_t& qdiag) {
-  const ocxo_lane_t& lane = *ctx.lane;
-  const uint16_t csctrl = lane.module->CH[lane.compare_channel].CSCTRL;
-  const bool compare_enabled = (csctrl & TMR_CSCTRL_TCF1EN) != 0;
-  const bool compare_flag = (csctrl & TMR_CSCTRL_TCF1) != 0;
-
-  out.add_u32("qtimer_count", qdiag.count);
-  out.add_u32("qtimer_counter", (uint32_t)lane.module->CH[lane.channel].CNTR);
-  out.add_u32("qtimer_comp1", (uint32_t)lane.module->CH[lane.channel].COMP1);
-  out.add_u32("qtimer_csctrl", (uint32_t)csctrl);
-  out.add_bool("qtimer_compare_enabled", compare_enabled);
-  out.add_bool("qtimer_compare_flag", compare_flag);
-  out.add_bool("qtimer_compare_live", compare_enabled && compare_flag);
-  out.add_u32("qtimer_last_late_ticks", qdiag.late_ticks);
-  out.add_u32("qtimer_last_interpreted_late_ticks", qdiag.interpreted_late_ticks);
-  out.add_u32("qtimer_last_early_ticks", qdiag.early_ticks);
-  out.add_i32("qtimer_last_service_offset_signed_ticks",
-              qdiag.service_offset_signed_ticks);
-  out.add_u32("qtimer_last_service_offset_abs_ticks",
-              qdiag.service_offset_abs_ticks);
-  out.add_u32("qtimer_last_target_delta_mod65536_ticks",
-              qdiag.target_delta_mod65536_ticks);
-  out.add_u32("qtimer_last_target_low16", (uint32_t)qdiag.target_low16);
-  out.add_u32("qtimer_last_isr_counter_low16",
-              (uint32_t)qdiag.isr_counter_low16);
-  out.add_u32("qtimer_last_dwt_raw", qdiag.dwt_raw);
-  out.add_u32("qtimer_last_event_dwt", qdiag.event_dwt);
-  out.add_u32("qtimer_last_dwt_coordinate_source",
-              qdiag.dwt_coordinate_source);
-}
-
-static FLASHMEM void add_ocxo_perishable_ring_payload(payload_prefix_t& out,
-                                             const ocxo_runtime_context_t& ctx) {
-  const ocxo_perishable_ring_t& ring = ocxo_fact_ring_for(ctx);
-
-  out.add_u32("perishable_fact_ring_size", OCXO_PERISHABLE_FACT_RING_SIZE);
-  out.add_u32("perishable_fact_ring_count", ring.count);
-  out.add_u32("perishable_fact_enqueue_count", ring.enqueue_count);
-  out.add_u32("perishable_fact_drain_count", ring.drain_count);
-  out.add_u32("perishable_fact_overflow_count", ring.overflow_count);
-  out.add_u32("perishable_fact_high_water", ring.high_water);
-  out.add_u32("perishable_fact_asap_arm_count", ring.asap_arm_count);
-  out.add_u32("perishable_fact_asap_fail_count", ring.asap_fail_count);
-  out.add_bool("perishable_fact_drain_armed", ring.drain_armed);
-}
-
-static FLASHMEM void add_ocxo_compact_payload(Payload& p,
-                                     const ocxo_runtime_context_t& ctx) {
-  const interrupt_subscriber_runtime_t* rt = ocxo_runtime_for(ctx);
-  const ocxo_lane_t& lane = *ctx.lane;
-  const ocxo_perishable_ring_t& ring = ocxo_fact_ring_for(ctx);
-  payload_prefix_t out(p, ctx.prefix);
-
-  out.add_u32("event_count", rt ? rt->event_count : 0U);
-  out.add_u32("dispatch_count", rt ? rt->dispatch_count : 0U);
-  out.add_u64("last_event_gnss_ns_at_event",
-              (rt && rt->has_fired) ? rt->last_event.gnss_ns_at_event : 0ULL);
-  out.add_bool("last_event_gnss_ns_available",
-               rt && rt->has_fired && rt->last_event.gnss_ns_at_event != 0);
-  out.add_u64("last_diag_gnss_ns_at_event",
-              (rt && rt->has_fired) ? rt->last_diag.gnss_ns_at_event : 0ULL);
-  out.add_bool("last_diag_gnss_projection_valid",
-               rt && rt->has_fired &&
-               rt->last_diag.gnss_ns_at_event != 0 &&
-               rt->last_diag.anchor_failure_mask == 0);
-  out.add_bool("last_diag_dwt_synthetic",
-               rt && rt->has_fired && rt->last_diag.dwt_synthetic);
-  out.add_u32("last_diag_dwt_original_at_event",
-              (rt && rt->has_fired) ? rt->last_diag.dwt_original_at_event : 0U);
-  out.add_u32("last_diag_dwt_predicted_at_event",
-              (rt && rt->has_fired) ? rt->last_diag.dwt_predicted_at_event : 0U);
-  out.add_u32("last_diag_dwt_used_at_event",
-              (rt && rt->has_fired) ? rt->last_diag.dwt_used_at_event : 0U);
-  out.add_u32("last_diag_dwt_isr_entry_raw",
-              (rt && rt->has_fired) ? rt->last_diag.dwt_isr_entry_raw : 0U);
-  out.add_u32("last_diag_dwt_event_from_isr_entry_raw",
-              (rt && rt->has_fired)
-                  ? rt->last_diag.dwt_event_from_isr_entry_raw
-                  : 0U);
-  out.add_i32("last_diag_dwt_isr_entry_to_event_correction_cycles",
-              (rt && rt->has_fired)
-                  ? rt->last_diag.dwt_isr_entry_to_event_correction_cycles
-                  : 0);
-  out.add_i32("last_diag_dwt_published_minus_event_cycles",
-              (rt && rt->has_fired)
-                  ? rt->last_diag.dwt_published_minus_event_cycles
-                  : 0);
-  out.add_i32("last_diag_dwt_used_minus_event_cycles",
-              (rt && rt->has_fired)
-                  ? rt->last_diag.dwt_used_minus_event_cycles
-                  : 0);
-  out.add_i32("last_diag_dwt_synthetic_error_cycles",
-              (rt && rt->has_fired) ? rt->last_diag.dwt_synthetic_error_cycles : 0);
-  out.add_bool("last_diag_spinidle_shadow_valid",
-               rt && rt->has_fired && rt->last_diag.spinidle_shadow_valid);
-  out.add_u32("last_diag_spinidle_shadow_dwt",
-              (rt && rt->has_fired) ? rt->last_diag.spinidle_shadow_dwt : 0U);
-  out.add_u32("last_diag_spinidle_shadow_to_isr_entry_cycles",
-              (rt && rt->has_fired)
-                  ? rt->last_diag.spinidle_shadow_to_isr_entry_cycles
-                  : 0U);
-  out.add_u32("last_diag_spinidle_shadow_valid_threshold_cycles",
-              (rt && rt->has_fired)
-                  ? rt->last_diag.spinidle_shadow_valid_threshold_cycles
-                  : SPINIDLE_SHADOW_VALID_THRESHOLD_CYCLES);
-  out.add_u32("irq_count", lane.irq_count);
-  out.add_u32("miss_count", lane.miss_count);
-  out.add_bool("cadence_enabled", lane.cadence_enabled);
-  out.add_bool("cadence_armed", lane.cadence_armed);
-  out.add_u32("cadence_fire_count", lane.cadence_fire_count);
-  out.add_u32("cadence_one_second_due_count", lane.cadence_one_second_due_count);
-  out.add_u32("cadence_false_irq_count", lane.cadence_false_irq_count);
-  out.add_u32("cadence_next_counter32", lane.cadence_next_counter32);
-  out.add_bool("cadence_sample_phase_valid", lane.cadence_sample_phase_valid);
-  out.add_u32("cadence_sample_phase_ticks", lane.cadence_sample_phase_ticks);
-  out.add_u32("cadence_sample_phase_us", lane.cadence_sample_phase_us);
-  out.add_i32("cadence_service_offset_ticks",
-              lane.cadence_last_service_offset_signed_ticks);
-  out.add_i32("service_offset_ticks", lane.witness_last_service_offset_signed_ticks);
-  out.add_u32("counter_delta_violation_count", lane.witness_counter_delta_violation_count);
-  out.add_bool("ema_last_adjacency_rejected", lane.ema_last_adjacency_rejected);
-  out.add_u32("ema_last_counter_delta_ticks", lane.ema_last_counter_delta_ticks);
-  out.add_u32("ema_expected_counter_delta_ticks", lane.ema_expected_counter_delta_ticks);
-  out.add_u32("ema_adjacency_reject_count", lane.ema_adjacency_reject_count);
-  out.add_u32("missed_target_count", lane.witness_missed_target_count);
-  out.add_u32("false_irq_count", lane.witness_false_irq_count);
-  out.add_u32("late_arm_count", lane.witness_late_arm_count);
-  out.add_u32("fact_enqueue_count", ring.enqueue_count);
-  out.add_u32("fact_drain_count", ring.drain_count);
-  out.add_u32("fact_overflow_count", ring.overflow_count);
-  out.add_u32("fact_high_water", ring.high_water);
-  out.add_u32("fact_asap_fail_count", ring.asap_fail_count);
-  out.add_bool("ema_dwt_authority_enabled", OCXO_EMA_DWT_AUTHORITY_ENABLED);
-  out.add_bool("ema_initialized", lane.ema_initialized);
-  out.add_u32("ema_update_count", lane.ema_update_count);
-  out.add_u32("ema_interval_cycles", lane.ema_interval_cycles);
-  out.add_i32("ema_last_error_cycles", lane.ema_last_error_cycles);
-  out.add_bool("linear_regression_enabled", OCXO_LINEAR_REGRESSION_ENABLED);
-
-  const cadence_regression_lane_t* regression = cadence_regression_for_const(ctx.kind);
-  if (regression) {
-    out.add_bool("regression_last_valid", regression->last_result.valid);
-    out.add_u32("regression_last_sample_count", regression->last_result.sample_count);
-    out.add_i32("regression_last_inferred_minus_observed_cycles",
-                regression->last_result.inferred_minus_observed_cycles);
-    out.add_u32("regression_last_fit_error_stddev_q16_cycles",
-                regression->last_result.fit_error_stddev_q16_cycles);
-    out.add_u32("regression_last_fit_error_abs_gt4_count",
-                regression->last_result.fit_error_abs_gt4_count);
-  }
-}
-
-static FLASHMEM void add_handoff_source_payload(Payload& p,
-                                       const char* prefix,
-                                       const interrupt_handoff_source_diag_t& d,
-                                       uint32_t capacity) {
-  payload_prefix_t out(p, prefix);
-  out.add_u32("capture_ring_capacity", capacity);
-  out.add_u32("capture_count", d.capture_count);
-  out.add_u32("capture_enqueue_count", d.enqueue_count);
-  out.add_u32("capture_dequeue_count", d.dequeue_count);
-  out.add_u32("capture_overrun_count", d.overrun_count);
-  out.add_u32("capture_high_water", d.high_water);
-  out.add_u32("capture_pending_count", d.pending_count);
-  out.add_u32("last_sequence", d.last_sequence);
-  out.add_u32("last_capture_dwt", d.last_capture_dwt);
-  out.add_u32("last_handoff_entry_dwt", d.last_handoff_entry_dwt);
-  out.add_u32("capture_to_handoff_cycles_last", d.last_capture_to_handoff_cycles);
-  out.add_u32("capture_to_handoff_cycles_max", d.max_capture_to_handoff_cycles);
-  out.add_u32("priority0_body_cycles_last", d.last_priority0_body_cycles);
-  out.add_u32("priority0_body_cycles_max", d.max_priority0_body_cycles);
-  out.add_u32("handoff_body_cycles_last", d.last_handoff_body_cycles);
-  out.add_u32("handoff_body_cycles_max", d.max_handoff_body_cycles);
-}
-
-static FLASHMEM void add_handoff_payload(Payload& p) {
-  const uint32_t irq = INTERRUPT_HANDOFF_IRQ_NUMBER;
-  const uint32_t mask = interrupt_nvic_irq_mask(irq);
-  const uint32_t iser = interrupt_nvic_iser_word(irq);
-  const uint32_t ispr = interrupt_nvic_ispr_word(irq);
-  const uint32_t iabr = interrupt_nvic_iabr_word(irq);
-
-  p.add("capture_discipline", INTERRUPT_CAPTURE_DISCIPLINE);
-  p.add("handoff_mechanism", INTERRUPT_HANDOFF_MECHANISM);
-  p.add("handoff_irq_name", INTERRUPT_HANDOFF_IRQ_NAME);
-  p.add("handoff_irq", INTERRUPT_HANDOFF_IRQ_NUMBER);
-  p.add("handoff_irq_index", irq >> 5);
-  p.add("handoff_irq_mask", mask);
-  p.add("handoff_priority", INTERRUPT_PRIORITY_HANDOFF);
-  p.add("handoff_configured", g_interrupt_handoff.configured);
-  p.add("handoff_configure_count", g_interrupt_handoff.configure_count);
-  p.add("handoff_running", g_interrupt_handoff.running);
-  p.add("handoff_pending", g_interrupt_handoff.pending);
-  p.add("handoff_enabled_bit", (iser & mask) != 0);
-  p.add("handoff_pending_bit", (ispr & mask) != 0);
-  p.add("handoff_active_bit", (iabr & mask) != 0);
-  p.add("handoff_iser_word", iser);
-  p.add("handoff_ispr_word", ispr);
-  p.add("handoff_iabr_word", iabr);
-  p.add("handoff_request_count", g_interrupt_handoff.request_count);
-  p.add("handoff_entry_count", g_interrupt_handoff.entry_count);
-  p.add("handoff_exit_count", g_interrupt_handoff.exit_count);
-  p.add("handoff_served_request_count", g_interrupt_handoff.served_request_count);
-  p.add("handoff_unserved_request_count", g_interrupt_handoff.unserved_request_count);
-  p.add("handoff_spurious_entry_count", g_interrupt_handoff.spurious_entry_count);
-  p.add("handoff_reentry_count", g_interrupt_handoff.reentry_count);
-  p.add("handoff_repend_count", g_interrupt_handoff.repend_count);
-  p.add("handoff_drain_budget", INTERRUPT_HANDOFF_DRAIN_BUDGET);
-  p.add("handoff_drain_pass_count", g_interrupt_handoff.drain_pass_count);
-  p.add("handoff_drain_budget_exhausted_count",
-        g_interrupt_handoff.drain_budget_exhausted_count);
-  p.add("handoff_last_request_context",
-        (const char*)(g_interrupt_handoff.last_request_context
-                          ? g_interrupt_handoff.last_request_context
-                          : ""));
-  p.add("handoff_last_request_dwt", g_interrupt_handoff.last_request_dwt);
-  p.add("handoff_last_entry_dwt", g_interrupt_handoff.last_entry_dwt);
-  p.add("handoff_last_exit_dwt", g_interrupt_handoff.last_exit_dwt);
-  p.add("handoff_last_latency_cycles", g_interrupt_handoff.last_latency_cycles);
-  p.add("handoff_min_latency_cycles",
-        g_interrupt_handoff.min_latency_cycles == UINT32_MAX
-            ? 0U
-            : g_interrupt_handoff.min_latency_cycles);
-  p.add("handoff_max_latency_cycles", g_interrupt_handoff.max_latency_cycles);
-  p.add("handoff_mean_latency_cycles",
-        g_interrupt_handoff.latency_sample_count
-            ? (uint32_t)(g_interrupt_handoff.latency_cycles_sum /
-                         (uint64_t)g_interrupt_handoff.latency_sample_count)
-            : 0U);
-  p.add("handoff_latency_sample_count", g_interrupt_handoff.latency_sample_count);
-  p.add("handoff_last_body_cycles", g_interrupt_handoff.last_body_cycles);
-  p.add("handoff_max_body_cycles", g_interrupt_handoff.max_body_cycles);
-  p.add("handoff_last_request_ipsr", g_interrupt_handoff.last_request_ipsr);
-  p.add("handoff_entry_ipsr", g_interrupt_handoff.entry_ipsr);
-  p.add("handoff_last_request_primask", g_interrupt_handoff.last_request_primask);
-  p.add("handoff_entry_primask", g_interrupt_handoff.entry_primask);
-
-  add_handoff_source_payload(p, "handoff_qtimer1_ch1", g_handoff_qtimer1_ch1,
-                             HANDOFF_QTIMER1_CH1_RING_SIZE);
-  add_handoff_source_payload(p, "handoff_qtimer1_ch2", g_handoff_qtimer1_ch2,
-                             HANDOFF_QTIMER1_CH2_RING_SIZE);
-  add_handoff_source_payload(p, "handoff_ocxo1", g_handoff_ocxo1,
-                             HANDOFF_OCXO_RING_SIZE);
-  add_handoff_source_payload(p, "handoff_ocxo2", g_handoff_ocxo2,
-                             HANDOFF_OCXO_RING_SIZE);
-  add_handoff_source_payload(p, "handoff_pps", g_handoff_pps,
-                             HANDOFF_PPS_RING_SIZE);
+  char key[80];
+  snprintf(key, sizeof(key), "%s_initialized", prefix); p.add(key, lane.initialized);
+  snprintf(key, sizeof(key), "%s_active", prefix); p.add(key, lane.active);
+  snprintf(key, sizeof(key), "%s_irq_count", prefix); p.add(key, lane.irq_count);
+  snprintf(key, sizeof(key), "%s_witness_fire_count", prefix); p.add(key, lane.witness_fire_count);
+  snprintf(key, sizeof(key), "%s_counter_delta", prefix); p.add(key, lane.witness_last_counter_delta_ticks);
+  snprintf(key, sizeof(key), "%s_bad_counter_delta", prefix); p.add(key, lane.witness_last_bad_counter_delta);
+  snprintf(key, sizeof(key), "%s_bad_counter_count", prefix); p.add(key, lane.witness_counter_delta_violation_count);
+  snprintf(key, sizeof(key), "%s_dwt_at_edge", prefix); p.add(key, lane.witness_last_event_dwt);
+  snprintf(key, sizeof(key), "%s_counter32_at_edge", prefix); p.add(key, lane.witness_last_event_counter32);
+  snprintf(key, sizeof(key), "%s_yardstick_valid", prefix); p.add(key, lane.yardstick_last_valid);
+  snprintf(key, sizeof(key), "%s_yardstick_stale", prefix); p.add(key, lane.yardstick_last_stale);
+  snprintf(key, sizeof(key), "%s_yardstick_excursion", prefix); p.add(key, lane.yardstick_last_excursion);
+  snprintf(key, sizeof(key), "%s_yardstick_imo", prefix); p.add(key, lane.yardstick_last_inferred_minus_observed_cycles);
+  snprintf(key, sizeof(key), "%s_yardstick_auth_error", prefix); p.add(key, lane.yardstick_auth_last_error_cycles);
+  snprintf(key, sizeof(key), "%s_zero_worthy", prefix); p.add(key, lane.zw_worthy);
+  snprintf(key, sizeof(key), "%s_fact_overflow", prefix); p.add(key, lane.witness_fact_overflow_count);
 }
 
 static FLASHMEM Payload cmd_report(const Payload&) {
   Payload p;
-  p.add("report", "INTERRUPT_COMPACT");
-  p.add("subreports",
-        "REPORT_STATUS REPORT_PPS REPORT_CADENCE REPORT_SMARTZERO "
-        "REPORT_BRIDGE REPORT_HANDOFF REPORT_LANES REPORT_LANE");
-  p.add("regression_samples_report_command", "disabled");
-
-  // Keep the default INTERRUPT.REPORT deliberately small.  The former
-  // monolithic report carried PPS, epoch capture, SmartZero lane proof,
-  // bridge, cadence, and lane forensics all at once; after the perishable
-  // fact pass it can exceed the transport/payload budget.  This compact
-  // report is a health dashboard only.  Heavy surfaces are explicit opt-in
-  // subreports below.
-  p.add("hardware_ready", g_interrupt_hw_ready);
-  p.add("runtime_ready",  g_interrupt_runtime_ready);
-  p.add("irqs_enabled",   g_interrupt_irqs_enabled);
-  p.add("ocxo_disable_experiment", OCXO_DISABLE_EXPERIMENT);
-  p.add("ocxo_disabled_count", OCXO_DISABLED_COUNT);
-  p.add("ocxo1_disabled", OCXO1_DISABLED);
-  p.add("ocxo2_disabled", OCXO2_DISABLED);
-  p.add("ocxo1_irq_qtimer2_disabled", OCXO1_DISABLED);
-  p.add("ocxo2_irq_qtimer3_disabled", OCXO2_DISABLED);
-  p.add("ocxo_smartzero_surrogates_enabled", OCXO_DISABLE_EXPERIMENT);
-  p.add("ocxo_quiet_phase_sampling_enabled", OCXO_QUIET_PHASE_SAMPLING_ENABLED);
-  p.add("ocxo1_quiet_phase_ticks", OCXO1_QUIET_PHASE_TICKS);
-  p.add("ocxo1_quiet_phase_us", ocxo_phase_ticks_to_us(OCXO1_QUIET_PHASE_TICKS));
-  p.add("ocxo2_quiet_phase_ticks", OCXO2_QUIET_PHASE_TICKS);
-  p.add("ocxo2_quiet_phase_us", ocxo_phase_ticks_to_us(OCXO2_QUIET_PHASE_TICKS));
-  p.add("timing_arch_step", "UNIFORM_CH0_COUNTER_CH1_COMPARE_WITH_OCXO2_PIN15_CH3_ADAPTER");
-  p.add("timing_arch_behavior_changed", true);
-  p.add("isr_sanity_witness_enabled", true);
-  p.add("isr_sanity_witness_policy", "REPORT_ONLY_NO_REPAIR_NO_VETO");
-  p.add("linear_regression_authored_dwt", LINEAR_REGRESSION_AUTHORED_DWT);
-  p.add("linear_regression_diagnostic_only", LINEAR_REGRESSION_DIAGNOSTIC_ONLY);
-  p.add("vclock_linear_regression_enabled", VCLOCK_LINEAR_REGRESSION_ENABLED);
-  p.add("ocxo_linear_regression_enabled", OCXO_LINEAR_REGRESSION_ENABLED);
-  p.add("single_cadence_agent", false);
-  p.add("vclock_heartbeat_isr_mode", true);
-  p.add("vclock_heartbeat_retained", true);
-  p.add("ocxo_lane_local_cadence", false);
-  p.add("ocxo_one_second_edge_compare", true);
-  p.add("ocxo_native_1khz_cadence_retired", true);
-  p.add("ocxo_perishable_fact_capture", true);
-  p.add("ocxo_fact_ring_size", OCXO_PERISHABLE_FACT_RING_SIZE);
-  p.add("capture_discipline", INTERRUPT_CAPTURE_DISCIPLINE);
-  p.add("handoff_mechanism", INTERRUPT_HANDOFF_MECHANISM);
-  p.add("handoff_irq", INTERRUPT_HANDOFF_IRQ_NUMBER);
-  p.add("handoff_priority", INTERRUPT_PRIORITY_HANDOFF);
-  p.add("handoff_configured", g_interrupt_handoff.configured);
-  p.add("handoff_request_count", g_interrupt_handoff.request_count);
-  p.add("handoff_entry_count", g_interrupt_handoff.entry_count);
-  p.add("handoff_exit_count", g_interrupt_handoff.exit_count);
-  p.add("handoff_unserved_request_count", g_interrupt_handoff.unserved_request_count);
-  p.add("handoff_reentry_count", g_interrupt_handoff.reentry_count);
-  p.add("handoff_spurious_entry_count", g_interrupt_handoff.spurious_entry_count);
-  p.add("handoff_max_latency_cycles", g_interrupt_handoff.max_latency_cycles);
-  p.add("handoff_max_body_cycles", g_interrupt_handoff.max_body_cycles);
-  p.add("handoff_qtimer1_ch2_overrun_count", g_handoff_qtimer1_ch2.overrun_count);
-  p.add("handoff_ocxo1_overrun_count", g_handoff_ocxo1.overrun_count);
-  p.add("handoff_ocxo2_overrun_count", g_handoff_ocxo2.overrun_count);
-  p.add("handoff_pps_overrun_count", g_handoff_pps.overrun_count);
-
-  p.add("qtimer1_priority_ok",
-        g_step0_qtimer1_priority_applied == INTERRUPT_STEP0_EXPECTED_QTIMER1_PRIORITY);
-  p.add("qtimer2_priority_ok",
-        OCXO1_DISABLED ||
-        g_step0_qtimer2_priority_applied == INTERRUPT_STEP0_EXPECTED_QTIMER2_PRIORITY);
-  p.add("qtimer3_priority_ok",
-        OCXO2_DISABLED ||
-        g_step0_qtimer3_priority_applied == INTERRUPT_STEP0_EXPECTED_QTIMER3_PRIORITY);
-  p.add("gpio6789_priority_ok",
-        g_step0_gpio6789_priority_applied == INTERRUPT_STEP0_EXPECTED_GPIO6789_PRIORITY);
-
-  p.add("gpio_edge_count", g_pps_gpio_heartbeat.edge_count);
-  p.add("gpio_irq_count", g_gpio_irq_count);
-  p.add("gpio_miss_count", g_gpio_miss_count);
-  p.add("pps_post_isr_pending", g_pps_post_isr.pending);
-  p.add("pps_post_isr_overwrite_count", g_pps_post_isr.overwrite_count);
-  p.add("pps_post_isr_asap_fail_count", g_pps_post_isr.asap_fail_count);
-  p.add("pps_rebootstrap_pending", g_pps_rebootstrap_pending);
-  p.add("vclock_epoch_latch_pending", g_vclock_epoch_latch.pending);
-
-  p.add("vclock_heartbeat_armed", g_vclock_heartbeat_armed);
-  p.add("vclock_heartbeat_fire_count", g_vclock_heartbeat_fire_count);
-  p.add("vclock_heartbeat_arm_failures", g_vclock_heartbeat_arm_failures);
-  p.add("vclock_heartbeat_vclock_ticks", g_vclock_heartbeat_vclock_ticks);
-  p.add("vclock_heartbeat_ocxo1_rollover_updates_retired", g_vclock_heartbeat_ocxo1_rollover_updates_retired);
-  p.add("vclock_heartbeat_ocxo2_rollover_updates_retired", g_vclock_heartbeat_ocxo2_rollover_updates_retired);
-  p.add("ch2_implicit_rollover_enabled", CH2_IMPLICIT_ROLLOVER_ENABLED);
-  p.add("ch2_implicit_rollover_count", g_ch2_implicit_rollover_count);
-  p.add("ch2_implicit_rollover_vclock_updates", g_ch2_implicit_rollover_vclock_updates);
-  p.add("ch2_implicit_rollover_ocxo1_updates", g_ch2_implicit_rollover_ocxo1_updates);
-  p.add("ch2_implicit_rollover_ocxo2_updates", g_ch2_implicit_rollover_ocxo2_updates);
-
-  interrupt_smartzero_snapshot_t z{};
-  (void)interrupt_smartzero_live_snapshot(&z);
-  p.add("live_smartzero_phase", smartzero_phase_name(z.phase));
-  p.add("live_smartzero_running", z.running);
-  p.add("live_smartzero_complete", z.complete);
-  p.add("live_smartzero_aborted", z.aborted);
-  p.add("live_smartzero_sequence", z.sequence);
-  p.add("live_smartzero_current_lane", interrupt_subscriber_kind_str(z.current_lane));
-
-  p.add("vclock_event_count", g_rt_vclock ? g_rt_vclock->event_count : 0U);
-  p.add("vclock_dispatch_count", g_rt_vclock ? g_rt_vclock->dispatch_count : 0U);
-  p.add("vclock_irq_count", g_vclock_lane.irq_count);
-  p.add("vclock_miss_count", g_vclock_lane.miss_count);
-  p.add("vclock_linear_regression_enabled", VCLOCK_LINEAR_REGRESSION_ENABLED);
-  p.add("vclock_ema_dwt_authority_enabled", VCLOCK_EMA_DWT_AUTHORITY_ENABLED);
-  p.add("vclock_ema_initialized", g_vclock_lane.ema_initialized);
-  p.add("vclock_ema_update_count", g_vclock_lane.ema_update_count);
-  p.add("vclock_ema_interval_cycles", g_vclock_lane.ema_interval_cycles);
-  p.add("vclock_ema_last_error_cycles", g_vclock_lane.ema_last_error_cycles);
-  p.add("vclock_ema_max_abs_error_cycles", g_vclock_lane.ema_max_abs_error_cycles);
-  p.add("vclock_fact_ring_size", VCLOCK_PERISHABLE_FACT_RING_SIZE);
-  p.add("vclock_fact_enqueue_count", g_vclock_fact_ring.enqueue_count);
-  p.add("vclock_fact_drain_count", g_vclock_fact_ring.drain_count);
-  p.add("vclock_fact_overflow_count", g_vclock_fact_ring.overflow_count);
-  p.add("vclock_fact_high_water", g_vclock_fact_ring.high_water);
-  p.add("vclock_fact_asap_fail_count", g_vclock_fact_ring.asap_fail_count);
-  p.add("vclock_regression_last_valid", g_regression_vclock.last_result.valid);
-  p.add("vclock_regression_last_sample_count", g_regression_vclock.last_result.sample_count);
-  p.add("vclock_regression_last_inferred_minus_observed_cycles",
-        g_regression_vclock.last_result.inferred_minus_observed_cycles);
-  p.add("vclock_regression_last_fit_error_stddev_q16_cycles",
-        g_regression_vclock.last_result.fit_error_stddev_q16_cycles);
-  p.add("vclock_regression_last_fit_error_abs_gt4_count",
-        g_regression_vclock.last_result.fit_error_abs_gt4_count);
-
-  add_ocxo_compact_payload(p, g_ocxo1_ctx);
-  add_ocxo_compact_payload(p, g_ocxo2_ctx);
-
+  p.add("report", "INTERRUPT_LEAN");
+  p.add("schema", "INTERRUPT_LEAN_V1");
+  p.add("available_reports", "REPORT_STATUS REPORT_PPS REPORT_CADENCE REPORT_SMARTZERO REPORT_BRIDGE REPORT_HANDOFF REPORT_LANES REPORT_LANE");
+  p.add("hw_ready", g_interrupt_hw_ready);
+  p.add("runtime_ready", g_interrupt_runtime_ready);
+  p.add("irqs_enabled", g_interrupt_irqs_enabled);
+  p.add("diagnostic_policy", "OPERATIONAL_CUSTODY_ONLY");
+  p.add("retired", "linear_regression spincatch spinidle isr_sanity raw_dwt_csv qtimer_register_museum");
   return p;
 }
+
 static FLASHMEM Payload cmd_report_status(const Payload&) {
   Payload p;
   p.add("report", "INTERRUPT_STATUS");
-  add_runtime_payload(p);
-  add_priority_payload(p);
+  p.add("hw_ready", g_interrupt_hw_ready);
+  p.add("runtime_ready", g_interrupt_runtime_ready);
+  p.add("irqs_enabled", g_interrupt_irqs_enabled);
+  p.add("handoff_configured", g_interrupt_handoff.configured);
+  p.add("handoff_pending", g_interrupt_handoff.pending);
+  p.add("pps_rebootstrap_pending", g_pps_rebootstrap_pending);
+  p.add("q1_priority", (uint32_t)g_step0_qtimer1_priority_applied);
+  p.add("q2_priority", (uint32_t)g_step0_qtimer2_priority_applied);
+  p.add("q3_priority", (uint32_t)g_step0_qtimer3_priority_applied);
+  p.add("gpio_priority", (uint32_t)g_step0_gpio6789_priority_applied);
+  add_runtime_summary(p, "vclock", g_rt_vclock, g_vclock_lane.irq_count, g_rt_vclock ? g_rt_vclock->event_count : 0U);
+  add_runtime_summary(p, "ocxo1", g_rt_ocxo1, g_ocxo1_lane.irq_count, g_ocxo1_lane.witness_fire_count);
+  add_runtime_summary(p, "ocxo2", g_rt_ocxo2, g_ocxo2_lane.irq_count, g_ocxo2_lane.witness_fire_count);
   return p;
 }
 
 static FLASHMEM Payload cmd_report_pps(const Payload&) {
   Payload p;
   p.add("report", "INTERRUPT_PPS");
-  add_pps_payload(p);
-  add_epoch_capture_payload(p);
+  p.add("edge_count", g_pps_gpio_heartbeat.edge_count);
+  p.add("gpio_irq_count", g_gpio_irq_count);
+  p.add("gpio_miss_count", g_gpio_miss_count);
+  p.add("last_pvc_dwt", g_pps_gpio_heartbeat.last_dwt);
+  p.add("relay_assert_count", (uint32_t)g_pps_relay_assert_count);
+  p.add("relay_deassert_count", (uint32_t)g_pps_relay_deassert_count);
+  p.add("post_isr_arm_count", (uint32_t)g_pps_post_isr.arm_count);
+  p.add("post_isr_drain_count", (uint32_t)g_pps_post_isr.drain_count);
+  p.add("post_isr_overwrite_count", (uint32_t)g_pps_post_isr.overwrite_count);
+  pps_t pps{}; pps_vclock_t pvc{}; store_load(pps, pvc);
+  p.add("pps_sequence", pps.sequence);
+  p.add("pps_dwt_at_edge", pps.dwt_at_edge);
+  p.add("pvc_sequence", pvc.sequence);
+  p.add("pvc_dwt_at_edge", pvc.dwt_at_edge);
+  p.add("pvc_counter32_at_edge", pvc.counter32_at_edge);
+  pps_yardstick_snapshot_t y{}; (void)pps_yardstick_load(y);
+  p.add("yardstick_valid", y.valid);
+  p.add("yardstick_sequence", y.sequence);
+  p.add("yardstick_g_now", y.interval_now_cycles);
+  p.add("yardstick_g_prev", y.interval_prev_cycles);
+  p.add("yardstick_accept_count", y.accept_count);
+  p.add("yardstick_reject_count", y.reject_count);
   return p;
 }
 
 static FLASHMEM Payload cmd_report_cadence(const Payload&) {
   Payload p;
   p.add("report", "INTERRUPT_CADENCE");
-  add_vclock_heartbeat_payload(p);
-  add_dynamic_cps_payload(p);
+  p.add("vclock_heartbeat_armed", (bool)g_vclock_heartbeat_armed);
+  p.add("vclock_heartbeat_fire_count", (uint32_t)g_vclock_heartbeat_fire_count);
+  p.add("vclock_ch2_one_second_enabled", (bool)g_vclock_ch2_one_second_enabled);
+  p.add("vclock_ch2_one_second_service_count", (uint32_t)g_vclock_ch2_one_second_service_count);
+  p.add("vclock_ch2_one_second_enqueue_count", (uint32_t)g_vclock_ch2_one_second_enqueue_count);
+  p.add("vclock_ch2_one_second_drop_count", (uint32_t)g_vclock_ch2_one_second_drop_count);
+  p.add("ch2_rollover_count", (uint32_t)g_ch2_implicit_rollover_count);
+  add_ocxo_lean_lane(p, "ocxo1", g_ocxo1_ctx);
+  add_ocxo_lean_lane(p, "ocxo2", g_ocxo2_ctx);
   return p;
 }
 
 static FLASHMEM Payload cmd_report_smartzero(const Payload&) {
   Payload p;
   p.add("report", "INTERRUPT_SMARTZERO");
-  add_smartzero_payload(p);
-  return p;
-}
-
-static FLASHMEM void add_pvc_anchor_entry_payload(Payload& p,
-                                         const char* prefix,
-                                         const pvc_anchor_record_t& a,
-                                         bool present) {
-  payload_prefix_t out(p, prefix);
-  const bool label_present = present && a.gnss_ns_at_edge >= 0;
-  const bool cps_present = present && a.cps_valid && a.cps != 0;
-
-  out.add_bool("present", present);
-  out.add_bool("gnss_label_present", label_present);
-  out.add_bool("cps_valid", cps_present);
-  out.add_bool("usable", label_present && cps_present);
-  out.add_u32("sequence", present ? a.sequence : 0U);
-  out.add_u32("dwt_at_edge", present ? a.dwt_at_edge : 0U);
-  out.add_u32("counter32_at_edge", present ? a.counter32_at_edge : 0U);
-  out.add_i64("gnss_ns_at_edge", present ? a.gnss_ns_at_edge : -1);
-  out.add_u32("cps", present ? a.cps : 0U);
-}
-
-static FLASHMEM void add_bridge_payload(Payload& p) {
-  p.add("pvc_anchor_ring_count", g_pvc_anchor_count);
-  p.add("pvc_anchor_ring_head", g_pvc_anchor_head);
-  p.add("pvc_anchor_ring_seq", g_pvc_anchor_seq);
-  p.add("pvc_anchor_reset_pending", g_pvc_anchor_reset_pending);
-
-  pvc_anchor_record_t anchors[PVC_ANCHOR_RING_SIZE];
-  uint32_t snapshot_count = 0;
-  const bool snapshot_ok = pvc_anchor_snapshot(anchors, snapshot_count);
-  uint32_t label_count = 0;
-  uint32_t cps_valid_count = 0;
-  uint32_t usable_count = 0;
-
-  if (snapshot_ok) {
-    for (uint32_t i = 0; i < snapshot_count; i++) {
-      const bool has_label = anchors[i].gnss_ns_at_edge >= 0;
-      const bool has_cps = anchors[i].cps_valid && anchors[i].cps != 0;
-      if (has_label) label_count++;
-      if (has_cps) cps_valid_count++;
-      if (has_label && has_cps) usable_count++;
-    }
+  p.add("phase", smartzero_phase_name(g_smartzero.phase));
+  p.add("running", g_smartzero.running);
+  p.add("complete", g_smartzero.complete);
+  p.add("sequence", g_smartzero.sequence);
+  p.add("begin_count", g_smartzero.begin_count);
+  p.add("complete_count", g_smartzero.complete_count);
+  p.add("abort_count", g_smartzero.abort_count);
+  p.add("current_lane_index", g_smartzero.current_lane_index);
+  p.add("all_lanes_worthy", (bool)g_smartzero2.all_lanes_worthy);
+  p.add("all_worthy_second_count", g_smartzero2.all_worthy_second_count);
+  for (uint32_t i = 0; i < SMARTZERO_LANE_COUNT; i++) {
+    char prefix[24]; snprintf(prefix, sizeof(prefix), "lane%u_", (unsigned)i);
+    char key[48];
+    const auto& lane = g_smartzero.lanes[i].pub;
+    snprintf(key, sizeof(key), "%skind", prefix); p.add(key, interrupt_subscriber_kind_str(lane.kind));
+    snprintf(key, sizeof(key), "%sstate", prefix); p.add(key, smartzero_lane_state_name(lane.state));
+    snprintf(key, sizeof(key), "%sdecision", prefix); p.add(key, smartzero_decision_name(lane.last_decision));
+    snprintf(key, sizeof(key), "%saccepted", prefix); p.add(key, lane.accepted_count);
+    snprintf(key, sizeof(key), "%srejected", prefix); p.add(key, lane.rejected_count);
+    snprintf(key, sizeof(key), "%sanchor_dwt", prefix); p.add(key, lane.anchor_dwt);
+    snprintf(key, sizeof(key), "%sanchor_counter32", prefix); p.add(key, lane.anchor_counter32);
   }
-
-  p.add("pvc_anchor_snapshot_ok", snapshot_ok);
-  p.add("pvc_anchor_snapshot_count", snapshot_ok ? snapshot_count : 0U);
-  p.add("pvc_anchor_label_count", label_count);
-  p.add("pvc_anchor_cps_valid_count", cps_valid_count);
-  p.add("pvc_anchor_usable_count", usable_count);
-  p.add("pvc_anchor_label_update_count", g_pvc_anchor_label_update_count);
-  p.add("pvc_anchor_label_miss_count", g_pvc_anchor_label_miss_count);
-  p.add("pvc_anchor_label_invalid_count", g_pvc_anchor_label_invalid_count);
-  p.add("pvc_anchor_label_last_success", g_pvc_anchor_label_last_success);
-  p.add("pvc_anchor_label_last_sequence", g_pvc_anchor_label_last_sequence);
-  p.add("pvc_anchor_label_last_counter32", g_pvc_anchor_label_last_counter32);
-  p.add("pvc_anchor_label_last_gnss_ns", g_pvc_anchor_label_last_gnss_ns);
-  p.add("pvc_anchor_label_last_cps", g_pvc_anchor_label_last_cps);
-  p.add("pvc_anchor_label_last_match_age_slots",
-        g_pvc_anchor_label_last_match_age_slots);
-  p.add("pvc_anchor_label_last_match_index",
-        g_pvc_anchor_label_last_match_index);
-
-  add_pvc_anchor_entry_payload(p, "pvc_anchor_latest",
-                               snapshot_ok && snapshot_count > 0
-                                   ? anchors[0]
-                                   : pvc_anchor_record_t{},
-                               snapshot_ok && snapshot_count > 0);
-  add_pvc_anchor_entry_payload(p, "pvc_anchor_previous",
-                               snapshot_ok && snapshot_count > 1
-                                   ? anchors[1]
-                                   : pvc_anchor_record_t{},
-                               snapshot_ok && snapshot_count > 1);
-  add_pvc_anchor_entry_payload(p, "pvc_anchor_older2",
-                               snapshot_ok && snapshot_count > 2
-                                   ? anchors[2]
-                                   : pvc_anchor_record_t{},
-                               snapshot_ok && snapshot_count > 2);
-  add_pvc_anchor_entry_payload(p, "pvc_anchor_older3",
-                               snapshot_ok && snapshot_count > 3
-                                   ? anchors[3]
-                                   : pvc_anchor_record_t{},
-                               snapshot_ok && snapshot_count > 3);
-
-  add_bridge_stats_payload(p, "timepop", g_bridge_stats_timepop);
-  add_bridge_stats_payload(p, "ocxo1", g_bridge_stats_ocxo1);
-  add_bridge_stats_payload(p, "ocxo2", g_bridge_stats_ocxo2);
-}
-
-static FLASHMEM Payload cmd_report_handoff(const Payload&) {
-  Payload p;
-  p.add("report", "INTERRUPT_HANDOFF");
-  add_handoff_payload(p);
   return p;
 }
 
 static FLASHMEM Payload cmd_report_bridge(const Payload&) {
   Payload p;
   p.add("report", "INTERRUPT_BRIDGE");
-  add_bridge_payload(p);
+  p.add("anchor_count", (uint32_t)g_pvc_anchor_count);
+  p.add("anchor_head", (uint32_t)g_pvc_anchor_head);
+  p.add("label_update_count", g_pvc_anchor_label_update_count);
+  p.add("label_miss_count", g_pvc_anchor_label_miss_count);
+  p.add("label_invalid_count", g_pvc_anchor_label_invalid_count);
+  p.add("last_label_sequence", g_pvc_anchor_label_last_sequence);
+  p.add("last_label_success", g_pvc_anchor_label_last_success);
+  p.add("timepop_failed", g_bridge_stats_timepop.failed_count);
+  p.add("ocxo1_failed", g_bridge_stats_ocxo1.failed_count);
+  p.add("ocxo2_failed", g_bridge_stats_ocxo2.failed_count);
   return p;
 }
 
-static FLASHMEM void add_lane_summary_object(Payload& parent,
-                                    const char* key,
-                                    const char* name,
-                                    const interrupt_subscriber_runtime_t* rt,
-                                    uint32_t irq_count,
-                                    uint32_t miss_count,
-                                    uint32_t tick_mod_1000,
-                                    uint32_t logical_count32) {
-  Payload lane;
-  lane.add("lane", name);
-  lane.add("subscribed", rt ? rt->subscribed : false);
-  lane.add("active", rt ? rt->active : false);
-  lane.add("has_fired", rt ? rt->has_fired : false);
-  lane.add("event_count", rt ? rt->event_count : 0U);
-  lane.add("dispatch_count", rt ? rt->dispatch_count : 0U);
-  lane.add("irq_count", irq_count);
-  lane.add("miss_count", miss_count);
-  lane.add("tick_mod_1000", tick_mod_1000);
-  lane.add("logical_count32", logical_count32);
-  if (rt && rt->has_fired) {
-    lane.add("last_event_dwt", rt->last_event.dwt_at_event);
-    lane.add("last_event_counter32", rt->last_event.counter32_at_event);
-    lane.add("last_event_gnss_ns_at_event", rt->last_event.gnss_ns_at_event);
-    lane.add("last_event_gnss_ns_available", rt->last_event.gnss_ns_at_event != 0);
-  } else {
-    lane.add("last_event_dwt", 0U);
-    lane.add("last_event_counter32", 0U);
-    lane.add("last_event_gnss_ns_at_event", 0ULL);
-    lane.add("last_event_gnss_ns_available", false);
-  }
-  if (rt && rt->has_fired) {
-    lane.add("last_diag_spinidle_shadow_valid", rt->last_diag.spinidle_shadow_valid);
-    lane.add("last_diag_spinidle_shadow_dwt", rt->last_diag.spinidle_shadow_dwt);
-    lane.add("last_diag_spinidle_shadow_to_isr_entry_cycles",
-             rt->last_diag.spinidle_shadow_to_isr_entry_cycles);
-    lane.add("last_diag_spinidle_shadow_valid_threshold_cycles",
-             rt->last_diag.spinidle_shadow_valid_threshold_cycles);
-    lane.add("last_diag_dwt_synthetic", rt->last_diag.dwt_synthetic);
-    lane.add("last_diag_dwt_original_at_event", rt->last_diag.dwt_original_at_event);
-    lane.add("last_diag_dwt_predicted_at_event", rt->last_diag.dwt_predicted_at_event);
-    lane.add("last_diag_dwt_used_at_event", rt->last_diag.dwt_used_at_event);
-    lane.add("last_diag_dwt_isr_entry_raw", rt->last_diag.dwt_isr_entry_raw);
-    lane.add("last_diag_dwt_synthetic_error_cycles", rt->last_diag.dwt_synthetic_error_cycles);
-  } else {
-    lane.add("last_diag_spinidle_shadow_valid", false);
-    lane.add("last_diag_spinidle_shadow_dwt", 0U);
-    lane.add("last_diag_spinidle_shadow_to_isr_entry_cycles", 0U);
-    lane.add("last_diag_spinidle_shadow_valid_threshold_cycles",
-             SPINIDLE_SHADOW_VALID_THRESHOLD_CYCLES);
-    lane.add("last_diag_dwt_synthetic", false);
-    lane.add("last_diag_dwt_original_at_event", 0U);
-    lane.add("last_diag_dwt_predicted_at_event", 0U);
-    lane.add("last_diag_dwt_used_at_event", 0U);
-    lane.add("last_diag_dwt_isr_entry_raw", 0U);
-    lane.add("last_diag_dwt_synthetic_error_cycles", 0);
-  }
-
-  // Only VCLOCK uses this generic summary helper today.  Keep the compact
-  // sanity surface here so REPORT_LANES can reveal trouble without the full
-  // lane detail report.
-  lane.add("isr_sanity_cntr_incorrect_count", g_isr_sanity_vclock_ch2.cntr_incorrect_count);
-  lane.add("isr_sanity_dwt_incorrect_count", g_isr_sanity_vclock_ch2.dwt_incorrect_count);
-  parent.add_object(key, lane);
+static FLASHMEM void add_handoff_source(Payload& p,
+                                        const char* prefix,
+                                        const interrupt_handoff_source_diag_t& s) {
+  char key[64];
+  snprintf(key, sizeof(key), "%s_capture", prefix); p.add(key, (uint32_t)s.capture_count);
+  snprintf(key, sizeof(key), "%s_enqueue", prefix); p.add(key, (uint32_t)s.enqueue_count);
+  snprintf(key, sizeof(key), "%s_dequeue", prefix); p.add(key, (uint32_t)s.dequeue_count);
+  snprintf(key, sizeof(key), "%s_overrun", prefix); p.add(key, (uint32_t)s.overrun_count);
+  snprintf(key, sizeof(key), "%s_high_water", prefix); p.add(key, (uint32_t)s.high_water);
+  snprintf(key, sizeof(key), "%s_pending", prefix); p.add(key, (uint32_t)s.pending_count);
+  snprintf(key, sizeof(key), "%s_max_latency", prefix); p.add(key, (uint32_t)s.max_capture_to_handoff_cycles);
 }
 
-static FLASHMEM void add_ocxo_lane_summary_object(Payload& parent,
-                                         const char* key,
-                                         const ocxo_runtime_context_t& ctx) {
-  const interrupt_subscriber_runtime_t* rt = ocxo_runtime_for(ctx);
-  const ocxo_lane_t& lane = *ctx.lane;
-  const ocxo_perishable_ring_t& ring = ocxo_fact_ring_for(ctx);
-
-  Payload o;
-  o.add("lane", ctx.name);
-  o.add("subscribed", rt ? rt->subscribed : false);
-  o.add("active", rt ? rt->active : false);
-  o.add("has_fired", rt ? rt->has_fired : false);
-  o.add("event_count", rt ? rt->event_count : 0U);
-  o.add("dispatch_count", rt ? rt->dispatch_count : 0U);
-  o.add("irq_count", lane.irq_count);
-  o.add("miss_count", lane.miss_count);
-  o.add("tick_mod_1000", lane.tick_mod_1000);
-  o.add("logical_count32", lane.logical_count32_at_last_second);
-  o.add("cadence_enabled", lane.cadence_enabled);
-  o.add("cadence_armed", lane.cadence_armed);
-  o.add("cadence_epoch_valid", lane.cadence_epoch_valid);
-  o.add("cadence_epoch_counter32", lane.cadence_epoch_counter32);
-  o.add("cadence_next_counter32", lane.cadence_next_counter32);
-  o.add("cadence_fire_count", lane.cadence_fire_count);
-  o.add("cadence_arm_count", lane.cadence_arm_count);
-  o.add("cadence_rearm_count", lane.cadence_rearm_count);
-  o.add("cadence_false_irq_count", lane.cadence_false_irq_count);
-  o.add("cadence_one_second_due_count", lane.cadence_one_second_due_count);
-  o.add("cadence_last_service_offset_ticks",
-        lane.cadence_last_service_offset_signed_ticks);
-  o.add("cadence_last_reason", lane.cadence_last_reason);
-  o.add("cadence_last_reason_name",
-        ocxo_cadence_reason_name(lane.cadence_last_reason));
-  o.add("witness_arm_count", lane.witness_arm_count);
-  o.add("witness_fire_count", lane.witness_fire_count);
-  o.add("witness_last_counter_delta_ticks", lane.witness_last_counter_delta_ticks);
-  o.add("witness_counter_delta_violation_count", lane.witness_counter_delta_violation_count);
-  o.add("ema_last_adjacency_rejected", lane.ema_last_adjacency_rejected);
-  o.add("ema_last_counter_delta_ticks", lane.ema_last_counter_delta_ticks);
-  o.add("ema_expected_counter_delta_ticks", lane.ema_expected_counter_delta_ticks);
-  o.add("ema_adjacency_reject_count", lane.ema_adjacency_reject_count);
-  o.add("witness_missed_target_count", lane.witness_missed_target_count);
-  o.add("witness_false_irq_count", lane.witness_false_irq_count);
-  o.add("witness_late_arm_count", lane.witness_late_arm_count);
-  o.add("witness_service_offset_ticks", lane.witness_last_service_offset_signed_ticks);
-  o.add("witness_service_class", lane.witness_last_service_class);
-  o.add("witness_service_class_name", ocxo_service_class_name(lane.witness_last_service_class));
-  o.add("fact_enqueue_count", ring.enqueue_count);
-  o.add("fact_drain_count", ring.drain_count);
-  o.add("fact_overflow_count", ring.overflow_count);
-  o.add("fact_high_water", ring.high_water);
-  o.add("fact_asap_fail_count", ring.asap_fail_count);
-  const isr_sanity_diag_t* sanity = isr_sanity_for_kind(ctx.kind);
-  if (sanity) {
-    o.add("isr_sanity_cntr_incorrect_count", sanity->cntr_incorrect_count);
-    o.add("isr_sanity_dwt_incorrect_count", sanity->dwt_incorrect_count);
-  }
-  if (rt && rt->has_fired) {
-    o.add("last_event_dwt", rt->last_event.dwt_at_event);
-    o.add("last_event_counter32", rt->last_event.counter32_at_event);
-    o.add("last_event_gnss_ns_at_event", rt->last_event.gnss_ns_at_event);
-    o.add("last_event_gnss_ns_available", rt->last_event.gnss_ns_at_event != 0);
-    o.add("last_diag_gnss_ns_at_event", rt->last_diag.gnss_ns_at_event);
-    o.add("last_diag_gnss_projection_valid",
-          rt->last_diag.gnss_ns_at_event != 0 &&
-          rt->last_diag.anchor_failure_mask == 0);
-    o.add("last_diag_spinidle_shadow_valid", rt->last_diag.spinidle_shadow_valid);
-    o.add("last_diag_spinidle_shadow_dwt", rt->last_diag.spinidle_shadow_dwt);
-    o.add("last_diag_spinidle_shadow_to_isr_entry_cycles",
-          rt->last_diag.spinidle_shadow_to_isr_entry_cycles);
-    o.add("last_diag_spinidle_shadow_valid_threshold_cycles",
-          rt->last_diag.spinidle_shadow_valid_threshold_cycles);
-    o.add("last_diag_anchor_selection_kind", rt->last_diag.anchor_selection_kind);
-    o.add("last_diag_anchor_failure_mask", rt->last_diag.anchor_failure_mask);
-  } else {
-    o.add("last_event_dwt", 0U);
-    o.add("last_event_counter32", 0U);
-    o.add("last_event_gnss_ns_at_event", 0ULL);
-    o.add("last_event_gnss_ns_available", false);
-    o.add("last_diag_gnss_ns_at_event", 0ULL);
-    o.add("last_diag_gnss_projection_valid", false);
-    o.add("last_diag_spinidle_shadow_valid", false);
-    o.add("last_diag_spinidle_shadow_dwt", 0U);
-    o.add("last_diag_spinidle_shadow_to_isr_entry_cycles", 0U);
-    o.add("last_diag_spinidle_shadow_valid_threshold_cycles",
-          SPINIDLE_SHADOW_VALID_THRESHOLD_CYCLES);
-    o.add("last_diag_anchor_selection_kind", 0U);
-    o.add("last_diag_anchor_failure_mask", 0U);
-  }
-  parent.add_object(key, o);
-}
-
-static FLASHMEM void add_idle_dwt_witness_payload(Payload& p) {
-  timepop_idle_witness_snapshot_t idle{};
-  timepop_idle_witness_snapshot(&idle);
-  p.add("idle_dwt_witness_supported", idle.supported);
-  p.add("idle_dwt_witness_enabled", idle.enabled);
-  p.add("idle_dwt_witness_running", idle.running);
-  p.add("idle_dwt_shadow_dwt", idle.shadow_dwt);
-  p.add("idle_dwt_shadow_age_cycles_at_report",
-        idle.shadow_dwt ? (uint32_t)(ARM_DWT_CYCCNT - idle.shadow_dwt) : 0U);
-  p.add("idle_dwt_witness_enter_count", idle.enter_count);
-  p.add("idle_dwt_witness_exit_count", idle.exit_count);
-  p.add("idle_dwt_witness_pending_exit_count", idle.pending_exit_count);
-  p.add("spinidle_isr_witness_supported", SPINIDLE_ISR_WITNESS_SUPPORTED);
-  p.add("spinidle_isr_witness_enabled", SPINIDLE_ISR_WITNESS_ENABLED);
-  p.add("spinidle_shadow_valid_threshold_cycles",
-        SPINIDLE_SHADOW_VALID_THRESHOLD_CYCLES);
-  p.add("idle_dwt_witness_last_enter_dwt", idle.last_enter_dwt);
-  p.add("idle_dwt_witness_last_exit_dwt", idle.last_exit_dwt);
-}
-
-
-// ============================================================================
-// Sectioned lane reports
-// ============================================================================
-//
-// REPORT_LANE used to return every lane detail surface at once.  That payload
-// is now large enough to overrun the command transport on the Pi side.  Keep
-// the default single-lane report compact and require callers to request one
-// bounded section at a time.
-
-static const char* REPORT_LANE_VCLOCK_SECTIONS =
-    "summary ema ch2 epoch smartzero fact_ring clock32 qtimer regression spincatch isr";
-static const char* REPORT_LANE_OCXO_SECTIONS =
-    "summary ema yardstick zero_worthy service scheduler witness qtimer ring clock32 regression spincatch isr";
-
-static FLASHMEM const char* report_lane_section_arg(const Payload& args) {
-  const char* section = args.getString("section");
-  if (!section || !*section) section = args.getString("detail");
-  if (!section || !*section) section = "summary";
-  return section;
-}
-
-static FLASHMEM void add_report_lane_header(Payload& p,
-                                   const char* lane,
-                                   const char* section,
-                                   const char* sections) {
-  p.add("report", "lane_section");
-  p.add("lane", lane ? lane : "");
-  p.add("section", section ? section : "summary");
-  p.add("available_sections", sections ? sections : "");
-  p.add("usage", "INTERRUPT.REPORT_LANE lane=VCLOCK|OCXO1|OCXO2 section=<section>");
-}
-
-static FLASHMEM bool report_lane_section_is(const char* section, const char* name) {
-  return section && name && !strcasecmp(section, name);
-}
-
-static FLASHMEM void add_vclock_lane_summary_section(Payload& p) {
-  p.add("kind", "VCLOCK");
-  p.add("provider", "QTIMER1");
-  p.add("hardware_lane", "QTIMER1_CH1_COMP");
-  p.add("cadence_source", "QTIMER1_CH1_UNIFORM_NATIVE_EPOCH_ONE_SECOND_PLUS_HEARTBEAT_FALLBACK");
-  p.add("counter_source", "QTIMER1_CH0_SYNTHETIC_COUNTER32");
-  p.add("event_source", "QTIMER1_CH1_INTRINSIC_EPOCH_AND_ONE_SECOND");
-  p.add("dwt_authority", "QTIMER1_CH1_EMA_PREDICTED_DWT");
-
-  add_runtime_lane_summary(p, "vclock", g_rt_vclock);
-  p.add("vclock_irq_count", g_vclock_lane.irq_count);
-  p.add("vclock_miss_count", g_vclock_lane.miss_count);
-  p.add("vclock_bootstrap_count", g_vclock_lane.bootstrap_count);
-  p.add("vclock_cadence_hits_total", g_vclock_lane.cadence_hits_total);
-  p.add("vclock_tick_mod_1000", g_vclock_lane.tick_mod_1000);
-  p.add("vclock_logical_count32", g_vclock_lane.logical_count32_at_last_second);
-  p.add("vclock_ema_initialized", g_vclock_lane.ema_initialized);
-  p.add("vclock_ema_interval_valid", g_vclock_lane.ema_interval_valid);
-  p.add("vclock_ema_update_count", g_vclock_lane.ema_update_count);
-  p.add("vclock_ema_interval_cycles", g_vclock_lane.ema_interval_cycles);
-  p.add("vclock_ema_last_error_cycles", g_vclock_lane.ema_last_error_cycles);
-  p.add("vclock_fact_ring_count", g_vclock_fact_ring.count);
-  p.add("vclock_fact_enqueue_count", g_vclock_fact_ring.enqueue_count);
-  p.add("vclock_fact_drain_count", g_vclock_fact_ring.drain_count);
-  p.add("vclock_fact_overflow_count", g_vclock_fact_ring.overflow_count);
-  p.add("vclock_fact_high_water", g_vclock_fact_ring.high_water);
-  add_isr_sanity_payload(p, "isr_sanity", g_isr_sanity_vclock_ch2);
-}
-
-static FLASHMEM void add_vclock_lane_ema_section(Payload& p) {
-  p.add("vclock_ema_dwt_authority_enabled", VCLOCK_EMA_DWT_AUTHORITY_ENABLED);
-  p.add("vclock_ema_alpha_numerator", VCLOCK_EMA_ALPHA_NUMERATOR);
-  p.add("vclock_ema_alpha_denominator", VCLOCK_EMA_ALPHA_DENOMINATOR);
-  p.add("vclock_ema_audit_threshold_cycles", VCLOCK_EMA_AUDIT_THRESHOLD_CYCLES);
-  p.add("vclock_ema_initialized", g_vclock_lane.ema_initialized);
-  p.add("vclock_ema_interval_valid", g_vclock_lane.ema_interval_valid);
-  p.add("vclock_ema_update_count", g_vclock_lane.ema_update_count);
-  p.add("vclock_ema_last_observed_dwt", g_vclock_lane.ema_last_observed_dwt);
-  p.add("vclock_ema_last_emitted_dwt", g_vclock_lane.ema_last_emitted_dwt);
-  p.add("vclock_ema_last_observed_interval_cycles", g_vclock_lane.ema_last_observed_interval_cycles);
-  p.add("vclock_ema_interval_cycles", g_vclock_lane.ema_interval_cycles);
-  p.add("vclock_ema_last_predicted_dwt", g_vclock_lane.ema_last_predicted_dwt);
-  p.add("vclock_ema_last_interval_prediction_cycles", g_vclock_lane.ema_last_interval_prediction_cycles);
-  p.add("vclock_ema_last_effective_interval_cycles", g_vclock_lane.ema_last_effective_interval_cycles);
-  p.add("vclock_ema_last_interval_residual_cycles", g_vclock_lane.ema_last_interval_residual_cycles);
-  p.add("vclock_ema_last_error_cycles", g_vclock_lane.ema_last_error_cycles);
-  p.add("vclock_ema_max_abs_error_cycles", g_vclock_lane.ema_max_abs_error_cycles);
-  p.add("vclock_ema_gate_accept_count", g_vclock_lane.ema_gate_accept_count);
-  p.add("vclock_ema_gate_reject_count", g_vclock_lane.ema_gate_reject_count);
-  p.add("vclock_ema_gate_resync_count", g_vclock_lane.ema_gate_resync_count);
-  p.add("vclock_ema_gate_reject_streak", g_vclock_lane.ema_gate_reject_streak);
-
-  if (g_rt_vclock && g_rt_vclock->has_fired) {
-    const interrupt_capture_diag_t& d = g_rt_vclock->last_diag;
-    p.add("last_diag_dwt_synthetic", d.dwt_synthetic);
-    p.add("last_diag_dwt_original_at_event", d.dwt_original_at_event);
-    p.add("last_diag_dwt_predicted_at_event", d.dwt_predicted_at_event);
-    p.add("last_diag_dwt_used_at_event", d.dwt_used_at_event);
-    p.add("last_diag_dwt_isr_entry_raw", d.dwt_isr_entry_raw);
-    p.add("last_diag_dwt_event_from_isr_entry_raw",
-          d.dwt_event_from_isr_entry_raw);
-    p.add("last_diag_dwt_isr_entry_to_event_correction_cycles",
-          d.dwt_isr_entry_to_event_correction_cycles);
-    p.add("last_diag_dwt_published_minus_event_cycles",
-          d.dwt_published_minus_event_cycles);
-    p.add("last_diag_dwt_used_minus_event_cycles",
-          d.dwt_used_minus_event_cycles);
-    p.add("last_diag_dwt_synthetic_error_cycles", d.dwt_synthetic_error_cycles);
-    p.add("last_diag_dwt_interval_gate_valid", d.dwt_interval_gate_valid);
-    p.add("last_diag_dwt_interval_sample_accepted", d.dwt_interval_sample_accepted);
-    p.add("last_diag_dwt_interval_sample_rejected", d.dwt_interval_sample_rejected);
-    p.add("last_diag_dwt_interval_ema_updated", d.dwt_interval_ema_updated);
-    p.add("last_diag_dwt_interval_observed_cycles", d.dwt_interval_observed_cycles);
-    p.add("last_diag_dwt_interval_prediction_cycles", d.dwt_interval_prediction_cycles);
-    p.add("last_diag_dwt_interval_effective_cycles", d.dwt_interval_effective_cycles);
-    p.add("last_diag_dwt_interval_residual_cycles", d.dwt_interval_residual_cycles);
-    p.add("last_diag_dwt_interval_reject_streak", d.dwt_interval_reject_streak);
-  }
-
-  p.add("vclock_dwt_repair_enabled", false);
-  p.add("vclock_dwt_repair_candidate_count", g_vclock_repair_stats.candidate_count);
-  p.add("vclock_dwt_repair_applied_count", g_vclock_repair_stats.applied_count);
-  p.add("vclock_dwt_repair_consecutive_candidate_count", g_vclock_repair_stats.consecutive_candidate_count);
-  p.add("vclock_dwt_repair_last_candidate", g_vclock_repair_stats.last_candidate);
-  p.add("vclock_dwt_repair_last_synthetic", g_vclock_repair_stats.last_synthetic);
-  p.add("vclock_dwt_repair_last_original_dwt", g_vclock_repair_stats.last_original_dwt);
-  p.add("vclock_dwt_repair_last_predicted_dwt", g_vclock_repair_stats.last_predicted_dwt);
-  p.add("vclock_dwt_repair_last_used_dwt", g_vclock_repair_stats.last_used_dwt);
-  p.add("vclock_dwt_repair_last_error_cycles", g_vclock_repair_stats.last_error_cycles);
-  p.add("vclock_dwt_repair_max_abs_error_cycles", g_vclock_repair_stats.max_abs_error_cycles);
-}
-
-static FLASHMEM void add_vclock_lane_ch2_section(Payload& p) {
-  p.add("vclock_ch2_one_second_enabled", g_vclock_ch2_one_second_enabled);
-  p.add("vclock_ch2_one_second_next_counter32", g_vclock_ch2_one_second_next_counter32);
-  p.add("vclock_ch2_one_second_enable_count", g_vclock_ch2_one_second_enable_count);
-  p.add("vclock_ch2_one_second_epoch_enable_count", g_vclock_ch2_one_second_epoch_enable_count);
-  p.add("vclock_ch2_one_second_heartbeat_enable_count", g_vclock_ch2_one_second_heartbeat_enable_count);
-  p.add("vclock_ch2_one_second_reset_count", g_vclock_ch2_one_second_reset_count);
-  p.add("vclock_ch2_one_second_service_count", g_vclock_ch2_one_second_service_count);
-  p.add("vclock_ch2_one_second_enqueue_count", g_vclock_ch2_one_second_enqueue_count);
-  p.add("vclock_ch2_one_second_late_count", g_vclock_ch2_one_second_late_count);
-  p.add("vclock_ch2_one_second_late_max_ticks", g_vclock_ch2_one_second_late_max_ticks);
-  p.add("vclock_ch2_one_second_catchup_count", g_vclock_ch2_one_second_catchup_count);
-  p.add("vclock_ch2_one_second_drop_count", g_vclock_ch2_one_second_drop_count);
-  p.add("vclock_ch2_one_second_last_target_counter32", g_vclock_ch2_one_second_last_target_counter32);
-  p.add("vclock_ch2_one_second_last_service_counter32", g_vclock_ch2_one_second_last_service_counter32);
-  p.add("vclock_ch2_one_second_last_dwt", g_vclock_ch2_one_second_last_dwt);
-  p.add("vclock_ch2_fact_drain_service_count", g_vclock_ch2_fact_drain_service_count);
-  p.add("vclock_ch2_fact_drain_arm_count", g_vclock_ch2_fact_drain_arm_count);
-  p.add("vclock_heartbeat_one_second_legacy_count", g_vclock_heartbeat_one_second_legacy_count);
-  p.add("vclock_heartbeat_one_second_handoff_skip_count", g_vclock_heartbeat_one_second_handoff_skip_count);
-  p.add("vclock_heartbeat_one_second_fallback_count", g_vclock_heartbeat_one_second_fallback_count);
-}
-
-static FLASHMEM void add_vclock_lane_epoch_section(Payload& p) {
-  p.add("vclock_ch2_epoch_native_enabled", VCLOCK_CH2_EPOCH_NATIVE_ENABLED);
-  p.add("vclock_ch2_epoch_native_service_count", g_vclock_ch2_epoch_native_service_count);
-  p.add("vclock_ch2_epoch_native_publish_count", g_vclock_ch2_epoch_native_publish_count);
-  p.add("vclock_ch2_epoch_native_bad_backdate_count", g_vclock_ch2_epoch_native_bad_backdate_count);
-  p.add("vclock_ch2_epoch_native_last_reject_reason", g_vclock_ch2_epoch_native_last_reject_reason);
-  p.add("vclock_ch2_epoch_native_last_reject_reason_name", vclock_ch2_epoch_reject_reason_name(g_vclock_ch2_epoch_native_last_reject_reason));
-  p.add("vclock_ch2_epoch_native_dispatch_arm_count", g_vclock_ch2_epoch_native_dispatch_arm_count);
-  p.add("vclock_ch2_epoch_native_dispatch_arm_fail_count", g_vclock_ch2_epoch_native_dispatch_arm_fail_count);
-  p.add("vclock_ch2_epoch_native_last_sequence", g_vclock_ch2_epoch_native_last_sequence);
-  p.add("vclock_ch2_epoch_native_last_selected_counter32", g_vclock_ch2_epoch_native_last_selected_counter32);
-  p.add("vclock_ch2_epoch_native_last_service_counter32", g_vclock_ch2_epoch_native_last_service_counter32);
-  p.add("vclock_ch2_epoch_native_last_backdate_ticks", g_vclock_ch2_epoch_native_last_backdate_ticks);
-  p.add("vclock_ch2_epoch_native_last_backdate_cycles", g_vclock_ch2_epoch_native_last_backdate_cycles);
-  p.add("vclock_ch2_epoch_native_last_sacred_dwt", g_vclock_ch2_epoch_native_last_sacred_dwt);
-  p.add("vclock_heartbeat_epoch_authority_retired_count", g_vclock_heartbeat_epoch_authority_retired_count);
-  p.add("vclock_heartbeat_epoch_pending_skip_count", g_vclock_heartbeat_epoch_pending_skip_count);
-}
-
-static FLASHMEM void add_vclock_lane_smartzero_section(Payload& p) {
-  p.add("vclock_ch2_smartzero_native_enabled", VCLOCK_CH2_SMARTZERO_NATIVE_ENABLED);
-  p.add("vclock_ch2_smartzero_seeded", g_vclock_ch2_smartzero_seeded);
-  p.add("vclock_ch2_smartzero_next_counter32", g_vclock_ch2_smartzero_next_counter32);
-  p.add("vclock_ch2_smartzero_reset_count", g_vclock_ch2_smartzero_reset_count);
-  p.add("vclock_ch2_smartzero_seed_count", g_vclock_ch2_smartzero_seed_count);
-  p.add("vclock_ch2_smartzero_deactivate_count", g_vclock_ch2_smartzero_deactivate_count);
-  p.add("vclock_ch2_smartzero_service_count", g_vclock_ch2_smartzero_service_count);
-  p.add("vclock_ch2_smartzero_transaction_skip_count", g_vclock_ch2_smartzero_transaction_skip_count);
-  p.add("vclock_ch2_smartzero_feed_count", g_vclock_ch2_smartzero_feed_count);
-  p.add("vclock_ch2_smartzero_late_count", g_vclock_ch2_smartzero_late_count);
-  p.add("vclock_ch2_smartzero_late_max_ticks", g_vclock_ch2_smartzero_late_max_ticks);
-  p.add("vclock_ch2_smartzero_resync_count", g_vclock_ch2_smartzero_resync_count);
-  p.add("vclock_ch2_smartzero_drop_count", g_vclock_ch2_smartzero_drop_count);
-  p.add("vclock_ch2_smartzero_waiting_for_cps_count", g_vclock_ch2_smartzero_waiting_for_cps_count);
-  p.add("vclock_ch2_smartzero_first_sample_count", g_vclock_ch2_smartzero_first_sample_count);
-  p.add("vclock_ch2_smartzero_accepted_count", g_vclock_ch2_smartzero_accepted_count);
-  p.add("vclock_ch2_smartzero_rejected_dwt_count", g_vclock_ch2_smartzero_rejected_dwt_count);
-  p.add("vclock_ch2_smartzero_rejected_counter_count", g_vclock_ch2_smartzero_rejected_counter_count);
-  p.add("vclock_ch2_smartzero_last_target_counter32", g_vclock_ch2_smartzero_last_target_counter32);
-  p.add("vclock_ch2_smartzero_last_service_counter32", g_vclock_ch2_smartzero_last_service_counter32);
-  p.add("vclock_ch2_smartzero_last_dwt", g_vclock_ch2_smartzero_last_dwt);
-  p.add("vclock_ch2_smartzero_last_late_ticks", g_vclock_ch2_smartzero_last_late_ticks);
-}
-
-static FLASHMEM void add_vclock_lane_fact_ring_section(Payload& p) {
-  p.add("vclock_perishable_fact_ring_size", VCLOCK_PERISHABLE_FACT_RING_SIZE);
-  p.add("vclock_perishable_fact_ring_count", g_vclock_fact_ring.count);
-  p.add("vclock_perishable_fact_enqueue_count", g_vclock_fact_ring.enqueue_count);
-  p.add("vclock_perishable_fact_drain_count", g_vclock_fact_ring.drain_count);
-  p.add("vclock_perishable_fact_overflow_count", g_vclock_fact_ring.overflow_count);
-  p.add("vclock_perishable_fact_high_water", g_vclock_fact_ring.high_water);
-  p.add("vclock_perishable_fact_asap_arm_count", g_vclock_fact_ring.asap_arm_count);
-  p.add("vclock_perishable_fact_asap_fail_count", g_vclock_fact_ring.asap_fail_count);
-  p.add("vclock_perishable_fact_drain_armed", g_vclock_fact_ring.drain_armed);
-}
-
-static FLASHMEM void add_vclock_lane_qtimer_section(Payload& p) {
-  p.add("qtimer1_ch1_active", g_qtimer1_ch1_active);
-  p.add("qtimer1_ch1_sequence", g_qtimer1_ch1_sequence);
-  p.add("qtimer1_ch1_target_counter32", g_qtimer1_ch1_target_counter32);
-  p.add("qtimer1_ch1_next_compare_counter32", g_qtimer1_ch1_next_compare_counter32);
-  p.add("qtimer1_ch1_arm_count", g_qtimer1_ch1_arm_count);
-  p.add("qtimer1_ch1_fire_count", g_qtimer1_ch1_fire_count);
-  p.add("qtimer1_ch1_hop_count", g_qtimer1_ch1_hop_count);
-  p.add("qtimer1_ch2_last_target_counter32", g_qtimer1_ch2_last_target_counter32);
-  p.add("qtimer1_ch2_arm_count", g_qtimer1_ch2_arm_count);
-  p.add("ch2_implicit_rollover_enabled", CH2_IMPLICIT_ROLLOVER_ENABLED);
-  p.add("ch2_implicit_rollover_count", g_ch2_implicit_rollover_count);
-  p.add("ch2_implicit_rollover_vclock_updates", g_ch2_implicit_rollover_vclock_updates);
-  p.add("ch2_implicit_rollover_last_vclock_hw16", (uint32_t)g_ch2_implicit_rollover_last_vclock_hw16);
-  p.add("ch2_implicit_rollover_last_vclock_counter32", g_ch2_implicit_rollover_last_vclock_counter32);
-}
-
-static FLASHMEM bool add_vclock_lane_section(Payload& p, const char* section) {
-  if (report_lane_section_is(section, "summary")) {
-    add_vclock_lane_summary_section(p);
-  } else if (report_lane_section_is(section, "ema")) {
-    add_vclock_lane_ema_section(p);
-  } else if (report_lane_section_is(section, "ch2")) {
-    add_vclock_lane_ch2_section(p);
-  } else if (report_lane_section_is(section, "epoch")) {
-    add_vclock_lane_epoch_section(p);
-  } else if (report_lane_section_is(section, "smartzero")) {
-    add_vclock_lane_smartzero_section(p);
-  } else if (report_lane_section_is(section, "fact_ring") ||
-             report_lane_section_is(section, "ring")) {
-    add_vclock_lane_fact_ring_section(p);
-  } else if (report_lane_section_is(section, "clock32")) {
-    add_vclock_clock32_payload(p, "vclock");
-  } else if (report_lane_section_is(section, "qtimer")) {
-    add_vclock_lane_qtimer_section(p);
-  } else if (report_lane_section_is(section, "regression")) {
-    add_regression_payload(p, "vclock", g_regression_vclock);
-  } else if (report_lane_section_is(section, "spincatch")) {
-    add_spincatch_report_payload(p, interrupt_subscriber_kind_t::VCLOCK);
-  } else if (report_lane_section_is(section, "isr")) {
-    add_isr_sanity_payload(p, "isr_sanity", g_isr_sanity_vclock_ch2);
-  } else {
-    return false;
-  }
-  return true;
-}
-
-static FLASHMEM void add_ocxo_lane_summary_section(Payload& p,
-                                          const ocxo_runtime_context_t& ctx) {
-  add_ocxo_identity_payload(p, ctx);
-  add_ocxo_compact_payload(p, ctx);
-}
-
-static FLASHMEM void add_ocxo_lane_ema_section(Payload& p,
-                                      const ocxo_runtime_context_t& ctx) {
-  const ocxo_lane_t& lane = *ctx.lane;
-  const interrupt_subscriber_runtime_t* rt = ocxo_runtime_for(ctx);
-  payload_prefix_t out(p, ctx.prefix);
-
-  out.add_bool("ema_dwt_authority_enabled", OCXO_EMA_DWT_AUTHORITY_ENABLED);
-  out.add_u32("ema_alpha_numerator", OCXO_EMA_ALPHA_NUMERATOR);
-  out.add_u32("ema_alpha_denominator", OCXO_EMA_ALPHA_DENOMINATOR);
-  out.add_bool("ema_initialized", lane.ema_initialized);
-  out.add_bool("ema_interval_valid", lane.ema_interval_valid);
-  out.add_u32("ema_update_count", lane.ema_update_count);
-  out.add_u32("ema_last_observed_dwt", lane.ema_last_observed_dwt);
-  out.add_u32("ema_last_emitted_dwt", lane.ema_last_emitted_dwt);
-  out.add_u32("ema_last_observed_interval_cycles", lane.ema_last_observed_interval_cycles);
-  out.add_u32("ema_interval_cycles", lane.ema_interval_cycles);
-  out.add_u32("ema_last_predicted_dwt", lane.ema_last_predicted_dwt);
-  out.add_u32("ema_last_interval_prediction_cycles", lane.ema_last_interval_prediction_cycles);
-  out.add_u32("ema_last_effective_interval_cycles", lane.ema_last_effective_interval_cycles);
-  out.add_i32("ema_last_interval_residual_cycles", lane.ema_last_interval_residual_cycles);
-  out.add_i32("ema_last_error_cycles", lane.ema_last_error_cycles);
-  out.add_u32("ema_max_abs_error_cycles", lane.ema_max_abs_error_cycles);
-  out.add_u32("ema_gate_accept_count", lane.ema_gate_accept_count);
-  out.add_u32("ema_gate_reject_count", lane.ema_gate_reject_count);
-  out.add_u32("ema_gate_resync_count", lane.ema_gate_resync_count);
-  out.add_u32("ema_gate_reject_streak", lane.ema_gate_reject_streak);
-  out.add_bool("ema_last_adjacency_gate_valid", lane.ema_last_adjacency_gate_valid);
-  out.add_bool("ema_last_adjacency_ok", lane.ema_last_adjacency_ok);
-  out.add_bool("ema_last_adjacency_rejected", lane.ema_last_adjacency_rejected);
-  out.add_u32("ema_last_counter_delta_ticks", lane.ema_last_counter_delta_ticks);
-  out.add_u32("ema_expected_counter_delta_ticks", lane.ema_expected_counter_delta_ticks);
-  out.add_u32("ema_adjacency_reject_count", lane.ema_adjacency_reject_count);
-
-  if (rt && rt->has_fired) {
-    const interrupt_capture_diag_t& d = rt->last_diag;
-    out.add_bool("last_diag_dwt_synthetic", d.dwt_synthetic);
-    out.add_u32("last_diag_dwt_original_at_event", d.dwt_original_at_event);
-    out.add_u32("last_diag_dwt_predicted_at_event", d.dwt_predicted_at_event);
-    out.add_u32("last_diag_dwt_used_at_event", d.dwt_used_at_event);
-    out.add_u32("last_diag_dwt_isr_entry_raw", d.dwt_isr_entry_raw);
-    out.add_i32("last_diag_dwt_synthetic_error_cycles", d.dwt_synthetic_error_cycles);
-    out.add_bool("last_diag_dwt_interval_adjacency_gate_valid", d.dwt_interval_adjacency_gate_valid);
-    out.add_bool("last_diag_dwt_interval_adjacency_ok", d.dwt_interval_adjacency_ok);
-    out.add_bool("last_diag_dwt_interval_adjacency_rejected", d.dwt_interval_adjacency_rejected);
-    out.add_u32("last_diag_dwt_interval_counter_delta_ticks", d.dwt_interval_counter_delta_ticks);
-    out.add_u32("last_diag_dwt_interval_expected_counter_delta_ticks", d.dwt_interval_expected_counter_delta_ticks);
-    out.add_u32("last_diag_dwt_interval_adjacency_reject_count", d.dwt_interval_adjacency_reject_count);
-    out.add_bool("last_diag_dwt_interval_gate_valid", d.dwt_interval_gate_valid);
-    out.add_bool("last_diag_dwt_interval_sample_accepted", d.dwt_interval_sample_accepted);
-    out.add_bool("last_diag_dwt_interval_sample_rejected", d.dwt_interval_sample_rejected);
-    out.add_bool("last_diag_dwt_interval_ema_updated", d.dwt_interval_ema_updated);
-    out.add_u32("last_diag_dwt_interval_observed_cycles", d.dwt_interval_observed_cycles);
-    out.add_u32("last_diag_dwt_interval_prediction_cycles", d.dwt_interval_prediction_cycles);
-    out.add_u32("last_diag_dwt_interval_effective_cycles", d.dwt_interval_effective_cycles);
-    out.add_i32("last_diag_dwt_interval_residual_cycles", d.dwt_interval_residual_cycles);
-    out.add_u32("last_diag_dwt_interval_reject_streak", d.dwt_interval_reject_streak);
-  }
-}
-
-static FLASHMEM void add_ocxo_lane_zero_worthy_section(Payload& p,
-                                       const ocxo_runtime_context_t& ctx) {
-  const ocxo_lane_t& lane = *ctx.lane;
-  payload_prefix_t out(p, ctx.prefix);
-
-  // Qualification policy constants.
-  out.add_bool("zw_selection_authority_enabled",
-               SMARTZERO2_SELECTION_AUTHORITY_ENABLED);
-  out.add_u32("zw_streak_seconds_required", ZERO_WORTHY_STREAK_SECONDS);
-  out.add_i32("zw_max_abs_auth_error_cycles",
-              ZERO_WORTHY_MAX_ABS_AUTH_ERROR_CYCLES);
-  out.add_i32("zw_max_abs_error_sum_cycles",
-              ZERO_WORTHY_MAX_ABS_ERROR_SUM_CYCLES);
-
-  // Live verdict.
-  out.add_bool("zw_worthy", lane.zw_worthy);
-  out.add_u32("zw_worthy_streak_seconds", lane.zw_worthy_streak_seconds);
-  out.add_u32("zw_clean_streak_seconds", lane.zw_clean_streak_seconds);
-  out.add_u32("zw_ring_count", lane.zw_ring_count);
-  out.add_i32("zw_window_error_sum_cycles", lane.zw_window_error_sum);
-  out.add_u32("zw_window_max_abs_error_cycles", lane.zw_window_max_abs_error);
-  out.add_string("zw_last_disqualify_reason", lane.zw_last_disqualify_reason);
-
-  // Efficacy evidence.
-  out.add_u32("zw_seconds_evaluated", lane.zw_seconds_evaluated);
-  out.add_u32("zw_worthy_second_count", lane.zw_worthy_second_count);
-  out.add_u32("zw_first_worthy_after_seconds",
-              lane.zw_first_worthy_after_seconds);
-  out.add_u32("zw_transition_count", lane.zw_transition_count);
-
-  // Disqualification forensics.
-  out.add_u32("zw_dq_rail_invalid", lane.zw_disqualify_rail_invalid_count);
-  out.add_u32("zw_dq_excursion", lane.zw_disqualify_excursion_count);
-  out.add_u32("zw_dq_stale", lane.zw_disqualify_stale_count);
-  out.add_u32("zw_dq_seed", lane.zw_disqualify_seed_count);
-  out.add_u32("zw_dq_adjacency", lane.zw_disqualify_adjacency_count);
-  out.add_u32("zw_dq_no_interval", lane.zw_disqualify_no_interval_count);
-  out.add_u32("zw_dq_error_magnitude",
-              lane.zw_disqualify_error_magnitude_count);
-  out.add_u32("zw_dq_error_sum_retrace", lane.zw_disqualify_error_sum_count);
-  out.add_u32("zw_dq_streak_building",
-              lane.zw_disqualify_streak_building_count);
-  out.add_u32("zw_dq_fast_lock_acquisition",
-              lane.zw_disqualify_fast_lock_count);
-  out.add_u32("zw_fast_lock_remaining_seconds",
-              lane.yardstick_auth_fast_lock_remaining_seconds);
-
-  // System-level verdict (unprefixed: one truth, reported on either lane).
-  p.add("smartzero2_all_lanes_worthy", (bool)g_smartzero2.all_lanes_worthy);
-  p.add("smartzero2_all_worthy_streak_seconds",
-        g_smartzero2.all_worthy_streak_seconds);
-  p.add("smartzero2_all_worthy_second_count",
-        g_smartzero2.all_worthy_second_count);
-  p.add("smartzero2_first_all_worthy_pps_sequence",
-        g_smartzero2.first_all_worthy_pps_sequence);
-  p.add("smartzero2_epoch_captures_qualified",
-        g_smartzero2.epoch_captures_qualified);
-  p.add("smartzero2_epoch_captures_unqualified",
-        g_smartzero2.epoch_captures_unqualified);
-}
-
-static FLASHMEM void add_ocxo_lane_yardstick_section(Payload& p,
-                                      const ocxo_runtime_context_t& ctx) {
-  const ocxo_lane_t& lane = *ctx.lane;
-  payload_prefix_t out(p, ctx.prefix);
-
-  out.add_bool("yardstick_dwt_authority_enabled",
-               OCXO_YARDSTICK_DWT_AUTHORITY_ENABLED);
-  out.add_u32("yardstick_gate_threshold_cycles",
-              OCXO_YARDSTICK_GATE_THRESHOLD_CYCLES);
-  out.add_bool("yardstick_chain_valid", lane.yardstick_chain_valid);
-  out.add_u32("yardstick_update_count", lane.yardstick_update_count);
-  out.add_u32("yardstick_seed_count", lane.yardstick_seed_count);
-  out.add_u32("yardstick_stale_hold_count", lane.yardstick_stale_hold_count);
-  out.add_u32("yardstick_gate_agree_count", lane.yardstick_gate_agree_count);
-  out.add_u32("yardstick_gate_excursion_count",
-              lane.yardstick_gate_excursion_count);
-  out.add_u32("yardstick_excursion_streak", lane.yardstick_excursion_streak);
-  out.add_u32("yardstick_adjacency_reseed_count",
-              lane.yardstick_adjacency_reseed_count);
-  out.add_u32("yardstick_coherent_reseed_count",
-              lane.yardstick_coherent_reseed_count);
-  out.add_bool("yardstick_last_stale", lane.yardstick_last_stale);
-  out.add_bool("yardstick_last_excursion", lane.yardstick_last_excursion);
-  out.add_u32("yardstick_last_g_now_cycles", lane.yardstick_last_g_now_cycles);
-  out.add_u32("yardstick_last_g_prev_cycles",
-              lane.yardstick_last_g_prev_cycles);
-  out.add_u32("yardstick_last_pps_seq_delta",
-              lane.yardstick_last_pps_seq_delta);
-  out.add_u32("yardstick_last_inferred_interval_cycles",
-              lane.yardstick_last_inferred_interval_cycles);
-  out.add_u32("yardstick_last_observed_interval_cycles",
-              lane.yardstick_last_observed_interval_cycles);
-  out.add_i32("yardstick_last_inferred_minus_observed_cycles",
-              lane.yardstick_last_inferred_minus_observed_cycles);
-  out.add_i32("yardstick_last_endpoint_minus_observed_cycles",
-              lane.yardstick_last_endpoint_minus_observed_cycles);
-  out.add_i32("yardstick_endpoint_minus_observed_min_cycles",
-              lane.yardstick_endpoint_minus_observed_min_cycles);
-  out.add_i32("yardstick_endpoint_minus_observed_max_cycles",
-              lane.yardstick_endpoint_minus_observed_max_cycles);
-  out.add_u32("yardstick_max_abs_inferred_minus_observed_cycles",
-              lane.yardstick_max_abs_inferred_minus_observed_cycles);
-
-  // Mean of inferred-minus-observed over agree seconds, in millicycles:
-  // the campaign estimate of chain seed bias.
-  const int64_t agree_n = (int64_t)lane.yardstick_gate_agree_count;
-  const int64_t mean_millicycles = (agree_n > 0)
-      ? (lane.yardstick_sum_inferred_minus_observed_cycles * 1000) / agree_n
-      : 0;
-  out.add_i32("yardstick_mean_inferred_minus_observed_millicycles",
-              (int32_t)mean_millicycles);
-
-  // Stage 2 anchored authority rail.
-  out.add_bool("yardstick_authority_enabled", OCXO_YARDSTICK_DWT_AUTHORITY_ENABLED);
-  out.add_u32("yardstick_anchor_p_shift", OCXO_YARDSTICK_ANCHOR_P_SHIFT);
-  out.add_u32("yardstick_anchor_i_shift", OCXO_YARDSTICK_ANCHOR_I_SHIFT);
-  out.add_bool("yardstick_auth_valid", lane.yardstick_auth_valid);
-  out.add_u32("yardstick_auth_publish_count", lane.yardstick_auth_publish_count);
-  out.add_u32("yardstick_auth_agree_publish_count",
-              lane.yardstick_auth_agree_publish_count);
-  out.add_u32("yardstick_auth_excursion_publish_count",
-              lane.yardstick_auth_excursion_publish_count);
-  out.add_u32("yardstick_auth_stale_publish_count",
-              lane.yardstick_auth_stale_publish_count);
-  out.add_u32("yardstick_auth_observed_fallback_count",
-              lane.yardstick_auth_observed_fallback_count);
-  out.add_u32("yardstick_auth_anchor_correction_count",
-              lane.yardstick_auth_anchor_correction_count);
-  out.add_i32("yardstick_auth_last_error_cycles",
-              lane.yardstick_auth_last_error_cycles);
-  out.add_u32("yardstick_auth_fast_lock_remaining_seconds",
-              lane.yardstick_auth_fast_lock_remaining_seconds);
-  out.add_u32("yardstick_auth_last_published_dwt",
-              lane.yardstick_auth_last_published_dwt);
-
-  // Shared PPS yardstick store state.
-  pps_yardstick_snapshot_t y{};
-  const bool y_loaded = pps_yardstick_load(y);
-  out.add_bool("pps_yardstick_loaded", y_loaded);
-  out.add_bool("pps_yardstick_valid", y.valid);
-  out.add_u32("pps_yardstick_sequence", y.sequence);
-  out.add_u32("pps_yardstick_interval_now_cycles", y.interval_now_cycles);
-  out.add_u32("pps_yardstick_interval_prev_cycles", y.interval_prev_cycles);
-  out.add_u32("pps_yardstick_accept_count", y.accept_count);
-  out.add_u32("pps_yardstick_reject_count", y.reject_count);
-  out.add_u32("pps_yardstick_reset_count", y.reset_count);
-}
-
-static FLASHMEM void add_ocxo_lane_scheduler_section(Payload& p,
-                                            const ocxo_runtime_context_t& ctx) {
-  const ocxo_lane_t& lane = *ctx.lane;
-  payload_prefix_t out(p, ctx.prefix);
-  add_ocxo_lane_basic_payload(out, lane);
-  out.add_u32("witness_schedule_last_decision", lane.witness_schedule_last_decision);
-  out.add_str("witness_schedule_last_decision_name", ocxo_schedule_decision_name(lane.witness_schedule_last_decision));
-  out.add_u32("witness_schedule_last_current_counter32", lane.witness_schedule_last_current_counter32);
-  out.add_u32("witness_schedule_last_target_counter32", lane.witness_schedule_last_target_counter32);
-  out.add_u32("witness_schedule_last_remaining_ticks", lane.witness_schedule_last_remaining_ticks);
-  out.add_u32("witness_schedule_last_phase_ticks", lane.witness_schedule_last_phase_ticks);
-  out.add_u32("witness_schedule_last_ticks_until_arm_window", lane.witness_schedule_last_ticks_until_arm_window);
-  out.add_u32("witness_schedule_last_current_low16", (uint32_t)lane.witness_schedule_last_current_low16);
-  out.add_u32("witness_schedule_last_target_low16", (uint32_t)lane.witness_schedule_last_target_low16);
-}
-
-static FLASHMEM bool add_ocxo_lane_section(Payload& p,
-                                  const ocxo_runtime_context_t& ctx,
-                                  const char* section) {
-  payload_prefix_t out(p, ctx.prefix);
-  if (report_lane_section_is(section, "summary")) {
-    add_ocxo_lane_summary_section(p, ctx);
-  } else if (report_lane_section_is(section, "ema")) {
-    add_ocxo_lane_ema_section(p, ctx);
-  } else if (report_lane_section_is(section, "yardstick")) {
-    add_ocxo_lane_yardstick_section(p, ctx);
-  } else if (report_lane_section_is(section, "zero_worthy")) {
-    add_ocxo_lane_zero_worthy_section(p, ctx);
-  } else if (report_lane_section_is(section, "service")) {
-    add_ocxo_witness_service_payload(out, *ctx.lane);
-  } else if (report_lane_section_is(section, "scheduler")) {
-    add_ocxo_lane_scheduler_section(p, ctx);
-  } else if (report_lane_section_is(section, "witness")) {
-    add_ocxo_witness_detail_payload(out, *ctx.lane);
-  } else if (report_lane_section_is(section, "qtimer")) {
-    add_ocxo_qtimer_payload(out, ctx, *ctx.qtimer_diag);
-  } else if (report_lane_section_is(section, "ring") ||
-             report_lane_section_is(section, "fact_ring")) {
-    add_ocxo_perishable_ring_payload(out, ctx);
-  } else if (report_lane_section_is(section, "clock32")) {
-    add_ocxo_clock32_payload(p, ctx.prefix, *ctx.clock32);
-  } else if (report_lane_section_is(section, "regression")) {
-    const cadence_regression_lane_t* regression = cadence_regression_for_const(ctx.kind);
-    if (regression) add_regression_payload(p, ctx.prefix, *regression);
-  } else if (report_lane_section_is(section, "spincatch")) {
-    add_spincatch_report_payload(p, ctx.kind);
-  } else if (report_lane_section_is(section, "isr")) {
-    const isr_sanity_diag_t* sanity = isr_sanity_for_kind(ctx.kind);
-    if (sanity) add_isr_sanity_payload(p, "isr_sanity", *sanity);
-  } else {
-    return false;
-  }
-  return true;
+static FLASHMEM Payload cmd_report_handoff(const Payload&) {
+  Payload p;
+  p.add("report", "INTERRUPT_HANDOFF");
+  p.add("configured", (bool)g_interrupt_handoff.configured);
+  p.add("request_count", (uint32_t)g_interrupt_handoff.request_count);
+  p.add("entry_count", (uint32_t)g_interrupt_handoff.entry_count);
+  p.add("served_request_count", (uint32_t)g_interrupt_handoff.served_request_count);
+  p.add("reentry_count", (uint32_t)g_interrupt_handoff.reentry_count);
+  p.add("repend_count", (uint32_t)g_interrupt_handoff.repend_count);
+  p.add("max_latency_cycles", (uint32_t)g_interrupt_handoff.max_latency_cycles);
+  p.add("max_body_cycles", (uint32_t)g_interrupt_handoff.max_body_cycles);
+  add_handoff_source(p, "ch1", g_handoff_qtimer1_ch1);
+  add_handoff_source(p, "ch2", g_handoff_qtimer1_ch2);
+  add_handoff_source(p, "ocxo1", g_handoff_ocxo1);
+  add_handoff_source(p, "ocxo2", g_handoff_ocxo2);
+  add_handoff_source(p, "pps", g_handoff_pps);
+  return p;
 }
 
 static FLASHMEM Payload cmd_report_lanes(const Payload&) {
   Payload p;
   p.add("report", "INTERRUPT_LANES");
-  p.add("lane_count", 3);
-  p.add("detail_command", "INTERRUPT.REPORT_LANE lane=VCLOCK|OCXO1|OCXO2 section=summary|ema|...");
-  add_idle_dwt_witness_payload(p);
-
-  add_lane_summary_object(p,
-                          "vclock",
-                          "VCLOCK",
-                          g_rt_vclock,
-                          g_vclock_lane.irq_count,
-                          g_vclock_lane.miss_count,
-                          g_vclock_lane.tick_mod_1000,
-                          g_vclock_lane.logical_count32_at_last_second);
-
-  add_ocxo_lane_summary_object(p,
-                               "ocxo1",
-                               g_ocxo1_ctx);
-
-  add_ocxo_lane_summary_object(p,
-                               "ocxo2",
-                               g_ocxo2_ctx);
-
+  add_runtime_summary(p, "vclock", g_rt_vclock, g_vclock_lane.irq_count, g_rt_vclock ? g_rt_vclock->event_count : 0U);
+  add_ocxo_lean_lane(p, "ocxo1", g_ocxo1_ctx);
+  add_ocxo_lean_lane(p, "ocxo2", g_ocxo2_ctx);
   return p;
 }
 
 static FLASHMEM Payload cmd_report_lane(const Payload& args) {
   const char* lane = args.getString("lane");
   if (!lane || !*lane) lane = args.getString("name");
-  const char* section = report_lane_section_arg(args);
-
   Payload p;
-
-  if (!lane || !*lane) {
-    add_report_lane_header(p, "", section, "");
-    p.add("error", "missing lane parameter");
-    return p;
-  }
-
+  p.add("report", "INTERRUPT_LANE");
+  p.add("lane", lane ? lane : "");
+  if (!lane || !*lane) { p.add("error", "missing lane parameter"); return p; }
   if (!strcasecmp(lane, "VCLOCK") || !strcasecmp(lane, "VCLK")) {
-    add_report_lane_header(p, "VCLOCK", section, REPORT_LANE_VCLOCK_SECTIONS);
-    if (!add_vclock_lane_section(p, section)) {
-      p.add("error", "unknown section for VCLOCK");
-    }
+    add_runtime_summary(p, "vclock", g_rt_vclock, g_vclock_lane.irq_count, g_rt_vclock ? g_rt_vclock->event_count : 0U);
+    p.add("logical_count32", g_vclock_lane.logical_count32_at_last_second);
+    p.add("tick_mod_1000", g_vclock_lane.tick_mod_1000);
+    p.add("ch2_one_second_enabled", (bool)g_vclock_ch2_one_second_enabled);
+    p.add("ch2_next_counter32", (uint32_t)g_vclock_ch2_one_second_next_counter32);
     return p;
   }
-
-  if (!strcasecmp(lane, "OCXO1") || !strcasecmp(lane, "O1")) {
-    add_report_lane_header(p, "OCXO1", section, REPORT_LANE_OCXO_SECTIONS);
-    if (!add_ocxo_lane_section(p, g_ocxo1_ctx, section)) {
-      p.add("error", "unknown section for OCXO1");
-    }
-    return p;
-  }
-
-  if (!strcasecmp(lane, "OCXO2") || !strcasecmp(lane, "O2")) {
-    add_report_lane_header(p, "OCXO2", section, REPORT_LANE_OCXO_SECTIONS);
-    if (!add_ocxo_lane_section(p, g_ocxo2_ctx, section)) {
-      p.add("error", "unknown section for OCXO2");
-    }
-    return p;
-  }
-
-  add_report_lane_header(p, lane, section, "");
+  if (!strcasecmp(lane, "OCXO1") || !strcasecmp(lane, "O1")) { add_ocxo_lean_lane(p, "ocxo1", g_ocxo1_ctx); return p; }
+  if (!strcasecmp(lane, "OCXO2") || !strcasecmp(lane, "O2")) { add_ocxo_lean_lane(p, "ocxo2", g_ocxo2_ctx); return p; }
   p.add("error", "unknown lane");
   return p;
+}
+
+static FLASHMEM Payload cmd_report_qtimer_regs(const Payload&) {
+  Payload p; p.add("report", "INTERRUPT_QTIMER_REGS"); p.add("retired", true); return p;
+}
+
+static FLASHMEM Payload cmd_report_ocxo_isr_raw_dwt(const Payload&) {
+  Payload p; p.add("report", "INTERRUPT_OCXO_ISR_RAW_DWT"); p.add("retired", true); return p;
 }
 
 static const process_command_entry_t INTERRUPT_COMMANDS[] = {
