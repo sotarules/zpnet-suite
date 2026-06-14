@@ -476,6 +476,62 @@ bool clocks_alpha_lane_forensics(time_clock_id_t clock,
                                  clocks_alpha_lane_forensics_t* out);
 
 // ============================================================================
+// PPS/VCLOCK edge authority courtroom
+// ============================================================================
+//
+// Durable per-PPS proof of the selected PPS/VCLOCK DWT coordinate.  This is
+// the permanent TIMEBASE_FORENSICS collateral for the foundational edge
+// authority claim: the physical PPS witness, the VCLOCK observed edge, the
+// predictor/lower-envelope candidate, the chosen coordinate, the agreement
+// gate, and the tautological GNSS self-map check.
+
+struct clocks_pps_vclock_edge_forensics_t {
+  bool     valid;
+  uint32_t sequence;
+  uint32_t update_count;
+  uint32_t reject_count;
+
+  uint32_t authority_dwt_at_edge;
+  uint32_t pps_dwt_at_edge;
+  uint32_t vclock_observed_dwt_at_edge;
+  uint32_t vclock_predicted_dwt_at_edge;
+  uint32_t pps_projected_vclock_dwt_at_edge;
+
+  bool     observed_phase_valid;
+  bool     learned_phase_valid;
+  uint32_t observed_phase_cycles;
+  uint32_t learned_phase_cycles;
+
+  uint32_t gate_cycles;
+  uint32_t agreement_span_cycles;
+  uint32_t decision;
+  uint32_t invalid_mask;
+
+  int32_t  authority_minus_pps_cycles;
+  int32_t  authority_minus_vclock_observed_cycles;
+  int32_t  authority_minus_prediction_cycles;
+  int32_t  prediction_minus_pps_projected_cycles;
+  int32_t  pps_projected_minus_observed_cycles;
+  int32_t  observed_minus_prediction_cycles;
+
+  uint32_t counter32_at_edge;
+  uint16_t ch3_at_edge;
+  uint32_t dwt_cycles_per_second;
+  uint32_t dwt_cycles_between_edges;
+  uint32_t effective_dwt_cycles_per_second;
+
+  bool     gnss_self_map_valid;
+  bool     gnss_self_error_ok;
+  uint32_t gnss_self_error_gate_ns;
+  uint64_t expected_gnss_ns_at_edge;
+  uint64_t mapped_gnss_ns_at_edge;
+  int64_t  gnss_self_error_ns;
+};
+
+bool clocks_alpha_pps_vclock_edge_forensics(
+    clocks_pps_vclock_edge_forensics_t* out);
+
+// ============================================================================
 // Alpha event-flow forensic snapshots
 // ============================================================================
 //

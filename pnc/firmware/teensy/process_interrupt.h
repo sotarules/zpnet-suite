@@ -341,6 +341,58 @@ struct pps_vclock_t {
   int64_t  gnss_ns_at_edge   = -1;
 };
 
+// PPS/VCLOCK edge authority courtroom.  process_interrupt publishes the
+// selected VCLOCK edge's DWT coordinate as a lawful inference from three
+// witnesses: the physical PPS GPIO edge plus learned phase, the VCLOCK/QTimer
+// observed edge, and the predictor/lower-envelope candidate.
+static constexpr uint32_t PPS_VCLOCK_EDGE_DECISION_NONE = 0;
+static constexpr uint32_t PPS_VCLOCK_EDGE_DECISION_LOWER_LAWFUL = 1;
+static constexpr uint32_t PPS_VCLOCK_EDGE_DECISION_PREDICTION_FALLBACK = 2;
+static constexpr uint32_t PPS_VCLOCK_EDGE_DECISION_PPS_PHASE_FALLBACK = 3;
+static constexpr uint32_t PPS_VCLOCK_EDGE_DECISION_OBSERVED_FALLBACK = 4;
+
+static constexpr uint32_t PPS_VCLOCK_EDGE_INVALID_NONE = 0;
+static constexpr uint32_t PPS_VCLOCK_EDGE_INVALID_NO_PPS = 1u << 0;
+static constexpr uint32_t PPS_VCLOCK_EDGE_INVALID_NO_OBSERVED = 1u << 1;
+static constexpr uint32_t PPS_VCLOCK_EDGE_INVALID_NO_PREDICTION = 1u << 2;
+static constexpr uint32_t PPS_VCLOCK_EDGE_INVALID_NO_PHASE = 1u << 3;
+static constexpr uint32_t PPS_VCLOCK_EDGE_INVALID_AGREEMENT = 1u << 4;
+static constexpr uint32_t PPS_VCLOCK_EDGE_INVALID_OBSERVED_EARLY = 1u << 5;
+
+struct pps_vclock_edge_authority_t {
+  bool     valid = false;
+  uint32_t sequence = 0;
+  uint32_t update_count = 0;
+  uint32_t reject_count = 0;
+
+  uint32_t authority_dwt_at_edge = 0;
+  uint32_t pps_dwt_at_edge = 0;
+  uint32_t vclock_observed_dwt_at_edge = 0;
+  uint32_t vclock_predicted_dwt_at_edge = 0;
+  uint32_t pps_projected_vclock_dwt_at_edge = 0;
+
+  bool     observed_phase_valid = false;
+  bool     learned_phase_valid = false;
+  uint32_t observed_phase_cycles = 0;
+  uint32_t learned_phase_cycles = 0;
+
+  uint32_t gate_cycles = 0;
+  uint32_t agreement_span_cycles = 0;
+  uint32_t decision = PPS_VCLOCK_EDGE_DECISION_NONE;
+  uint32_t invalid_mask = PPS_VCLOCK_EDGE_INVALID_NONE;
+
+  int32_t  authority_minus_pps_cycles = 0;
+  int32_t  authority_minus_vclock_observed_cycles = 0;
+  int32_t  authority_minus_prediction_cycles = 0;
+  int32_t  prediction_minus_pps_projected_cycles = 0;
+  int32_t  pps_projected_minus_observed_cycles = 0;
+  int32_t  observed_minus_prediction_cycles = 0;
+
+  uint32_t counter32_at_edge = 0;
+  uint16_t ch3_at_edge = 0;
+  uint32_t dwt_cycles_per_second = 0;
+};
+
 struct pps_vclock_phase_estimate_t {
   bool     valid = false;
 
@@ -385,6 +437,9 @@ struct pps_edge_snapshot_t {
   int32_t  vclock_epoch_counter32_offset_ticks = 0;
   int32_t  vclock_epoch_dwt_offset_cycles      = 0;
   bool     vclock_epoch_selected               = false;
+
+  // PPS/VCLOCK edge authority courtroom copied from process_interrupt.
+  pps_vclock_edge_authority_t vclock_edge_authority{};
 };
 
 struct interrupt_epoch_capture_t {

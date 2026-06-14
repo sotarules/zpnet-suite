@@ -110,6 +110,11 @@ static constexpr int32_t  VCLOCK_EPOCH_COUNTER32_OFFSET_TICKS   = 0;
 static constexpr uint32_t VCLOCK_EPOCH_OBSERVED_TICKS_AFTER_SELECTED = 2;
 static constexpr int64_t  GNSS_NS_PER_SECOND                    = 1000000000LL;
 
+// PPS/VCLOCK edge authority tribunal.  The three candidates are deliberately
+// kept tiny so the hot path publishes one chosen DWT coordinate plus compact
+// courtroom collateral: PPS+learned-phase, VCLOCK observed, and predictor.
+static constexpr uint32_t PPS_VCLOCK_EDGE_AGREEMENT_GATE_CYCLES = 8U;
+
 // DWT→PPS_VCLOCK anchor selection for OCXO/TimePop event projection.
 // A DWT event near a PPS boundary may be serviced after the PPS ISR has
 // published the next anchor.  The latest anchor can therefore be coherent but
@@ -1456,14 +1461,213 @@ static uint32_t pps_vclock_phase_cycles_from_edges(const pps_t& pps,
                     (uint64_t)VCLOCK_COUNTS_PER_SECOND);
 }
 
+static pps_vclock_edge_authority_t g_pps_vclock_edge_authority = {};
+static bool     g_pps_vclock_phase_lower_valid = false;
+static uint32_t g_pps_vclock_phase_lower_cycles = 0;
+static uint32_t g_pps_vclock_edge_authority_update_count = 0;
+static uint32_t g_pps_vclock_edge_authority_reject_count = 0;
+
+static int32_t pps_vclock_signed_delta_near(uint32_t from_dwt,
+                                            uint32_t to_dwt) {
+  const uint32_t u = (uint32_t)(to_dwt - from_dwt);
+  if (u <= 0x7FFFFFFFUL) return (int32_t)u;
+  const uint32_t magnitude = (uint32_t)((~u) + 1U);
+  if (magnitude == 0x80000000UL) return (int32_t)(-2147483647 - 1);
+  return -(int32_t)magnitude;
+}
+
+
+static void pps_vclock_edge_authority_reset(void) {
+  g_pps_vclock_edge_authority = pps_vclock_edge_authority_t{};
+  g_pps_vclock_phase_lower_valid = false;
+  g_pps_vclock_phase_lower_cycles = 0;
+  g_pps_vclock_edge_authority_update_count = 0;
+  g_pps_vclock_edge_authority_reject_count = 0;
+}
+
+static pps_vclock_edge_authority_t pps_vclock_edge_authority_build(
+    const pps_t& pps,
+    uint32_t sequence,
+    uint32_t predicted_dwt_at_edge,
+    uint32_t observed_dwt_at_edge,
+    uint32_t counter32_at_edge,
+    uint16_t ch3_at_edge) {
+  pps_vclock_edge_authority_t a{};
+  a.sequence = sequence;
+  a.update_count = ++g_pps_vclock_edge_authority_update_count;
+  a.gate_cycles = PPS_VCLOCK_EDGE_AGREEMENT_GATE_CYCLES;
+  a.pps_dwt_at_edge = pps.dwt_at_edge;
+  a.vclock_observed_dwt_at_edge = observed_dwt_at_edge;
+  a.vclock_predicted_dwt_at_edge = predicted_dwt_at_edge;
+  a.counter32_at_edge = counter32_at_edge;
+  a.ch3_at_edge = ch3_at_edge;
+  a.dwt_cycles_per_second = interrupt_vclock_cycles_per_second();
+
+  const bool pps_valid = (pps.sequence != 0 && pps.dwt_at_edge != 0);
+  const bool observed_valid = (observed_dwt_at_edge != 0);
+  const bool prediction_valid = (predicted_dwt_at_edge != 0);
+
+  if (!pps_valid) a.invalid_mask |= PPS_VCLOCK_EDGE_INVALID_NO_PPS;
+  if (!observed_valid) a.invalid_mask |= PPS_VCLOCK_EDGE_INVALID_NO_OBSERVED;
+  if (!prediction_valid) a.invalid_mask |= PPS_VCLOCK_EDGE_INVALID_NO_PREDICTION;
+
+  if (pps_valid && observed_valid) {
+    pps_vclock_t observed_pvc{};
+    observed_pvc.sequence = sequence;
+    observed_pvc.dwt_at_edge = observed_dwt_at_edge;
+    observed_pvc.counter32_at_edge = counter32_at_edge;
+    observed_pvc.ch3_at_edge = ch3_at_edge;
+    a.observed_phase_cycles = pps_vclock_phase_cycles_from_edges(pps, observed_pvc);
+    a.observed_phase_valid = true;
+
+    if (!g_pps_vclock_phase_lower_valid ||
+        a.observed_phase_cycles < g_pps_vclock_phase_lower_cycles) {
+      g_pps_vclock_phase_lower_cycles = a.observed_phase_cycles;
+      g_pps_vclock_phase_lower_valid = true;
+    }
+  }
+
+  a.learned_phase_valid = g_pps_vclock_phase_lower_valid;
+  a.learned_phase_cycles = g_pps_vclock_phase_lower_cycles;
+  if (!a.learned_phase_valid) {
+    a.invalid_mask |= PPS_VCLOCK_EDGE_INVALID_NO_PHASE;
+  }
+
+  const bool pps_candidate_valid = pps_valid && a.learned_phase_valid;
+  if (pps_candidate_valid) {
+    a.pps_projected_vclock_dwt_at_edge =
+        pps.dwt_at_edge + a.learned_phase_cycles;
+  }
+
+  const uint32_t reference_dwt = prediction_valid
+      ? predicted_dwt_at_edge
+      : (pps_candidate_valid
+            ? a.pps_projected_vclock_dwt_at_edge
+            : observed_dwt_at_edge);
+  int32_t min_delta = INT32_MAX;
+  int32_t max_delta = INT32_MIN;
+  uint32_t candidate_count = 0;
+
+  if (pps_candidate_valid) {
+    const int32_t d = pps_vclock_signed_delta_near(
+        reference_dwt, a.pps_projected_vclock_dwt_at_edge);
+    if (d < min_delta) min_delta = d;
+    if (d > max_delta) max_delta = d;
+    candidate_count++;
+  }
+  if (observed_valid) {
+    const int32_t d = pps_vclock_signed_delta_near(
+        reference_dwt, observed_dwt_at_edge);
+    if (d < min_delta) min_delta = d;
+    if (d > max_delta) max_delta = d;
+    candidate_count++;
+  }
+  if (prediction_valid) {
+    const int32_t d = pps_vclock_signed_delta_near(
+        reference_dwt, predicted_dwt_at_edge);
+    if (d < min_delta) min_delta = d;
+    if (d > max_delta) max_delta = d;
+    candidate_count++;
+  }
+
+  a.agreement_span_cycles = (candidate_count != 0)
+      ? (uint32_t)((int64_t)max_delta - (int64_t)min_delta)
+      : 0U;
+
+  const bool all_candidates_valid = pps_candidate_valid &&
+                                    observed_valid &&
+                                    prediction_valid;
+  if (!all_candidates_valid ||
+      a.agreement_span_cycles > PPS_VCLOCK_EDGE_AGREEMENT_GATE_CYCLES) {
+    a.invalid_mask |= PPS_VCLOCK_EDGE_INVALID_AGREEMENT;
+  }
+
+  if (observed_valid && prediction_valid &&
+      pps_vclock_signed_delta_near(predicted_dwt_at_edge,
+                                   observed_dwt_at_edge) <
+          -(int32_t)PPS_VCLOCK_EDGE_AGREEMENT_GATE_CYCLES) {
+    // An observed edge substantially before the predictor violates the
+    // one-sided latency law.  Record the violation even if the fallback below
+    // keeps the system alive.
+    a.invalid_mask |= PPS_VCLOCK_EDGE_INVALID_OBSERVED_EARLY;
+  }
+
+  a.valid = (a.invalid_mask == PPS_VCLOCK_EDGE_INVALID_NONE);
+  const uint32_t least_late_candidate = candidate_count != 0
+      ? (uint32_t)(reference_dwt + min_delta)
+      : 0U;
+
+  if (a.valid) {
+    // Least-late lawful candidate wins.  This demotes observed lateness and
+    // QTimer lattice displacement to witness evidence while preserving a
+    // tight agreement gate against fantasy prediction.
+    a.authority_dwt_at_edge = least_late_candidate;
+    a.decision = PPS_VCLOCK_EDGE_DECISION_LOWER_LAWFUL;
+  } else {
+    g_pps_vclock_edge_authority_reject_count++;
+    // Even on an invalid row, keep the one-sided latency law visible in the
+    // coordinate: publish the least-late available candidate rather than
+    // blindly trusting a late observation or predictor.  The invalid_mask is
+    // the courtroom verdict that the row failed its proof.
+    a.authority_dwt_at_edge = least_late_candidate;
+    if (prediction_valid && a.authority_dwt_at_edge == predicted_dwt_at_edge) {
+      a.decision = PPS_VCLOCK_EDGE_DECISION_PREDICTION_FALLBACK;
+    } else if (pps_candidate_valid &&
+               a.authority_dwt_at_edge == a.pps_projected_vclock_dwt_at_edge) {
+      a.decision = PPS_VCLOCK_EDGE_DECISION_PPS_PHASE_FALLBACK;
+    } else {
+      a.decision = PPS_VCLOCK_EDGE_DECISION_OBSERVED_FALLBACK;
+    }
+  }
+  a.reject_count = g_pps_vclock_edge_authority_reject_count;
+
+  a.authority_minus_pps_cycles = pps_valid
+      ? pps_vclock_signed_delta_near(pps.dwt_at_edge, a.authority_dwt_at_edge)
+      : 0;
+  a.authority_minus_vclock_observed_cycles = observed_valid
+      ? pps_vclock_signed_delta_near(observed_dwt_at_edge, a.authority_dwt_at_edge)
+      : 0;
+  a.authority_minus_prediction_cycles = prediction_valid
+      ? pps_vclock_signed_delta_near(predicted_dwt_at_edge, a.authority_dwt_at_edge)
+      : 0;
+  a.prediction_minus_pps_projected_cycles =
+      (prediction_valid && pps_candidate_valid)
+          ? pps_vclock_signed_delta_near(a.pps_projected_vclock_dwt_at_edge,
+                                         predicted_dwt_at_edge)
+          : 0;
+  a.pps_projected_minus_observed_cycles =
+      (observed_valid && pps_candidate_valid)
+          ? pps_vclock_signed_delta_near(observed_dwt_at_edge,
+                                         a.pps_projected_vclock_dwt_at_edge)
+          : 0;
+  a.observed_minus_prediction_cycles =
+      (observed_valid && prediction_valid)
+          ? pps_vclock_signed_delta_near(predicted_dwt_at_edge,
+                                         observed_dwt_at_edge)
+          : 0;
+
+  g_pps_vclock_edge_authority = a;
+  return a;
+}
+
 static void publish_vclock_domain_pps_vclock(const pps_t& pps,
                                              uint32_t sequence,
                                              uint32_t dwt_at_edge,
                                              uint32_t counter32_at_edge,
-                                             uint16_t ch3_at_edge) {
+                                             uint16_t ch3_at_edge,
+                                             uint32_t observed_dwt_at_edge = 0) {
+  const uint32_t observed_dwt = observed_dwt_at_edge ? observed_dwt_at_edge : dwt_at_edge;
+  const pps_vclock_edge_authority_t authority =
+      pps_vclock_edge_authority_build(pps,
+                                      sequence,
+                                      dwt_at_edge,
+                                      observed_dwt,
+                                      counter32_at_edge,
+                                      ch3_at_edge);
+
   pps_vclock_t pvc;
   pvc.sequence = sequence;
-  pvc.dwt_at_edge = dwt_at_edge;
+  pvc.dwt_at_edge = authority.authority_dwt_at_edge;
   pvc.counter32_at_edge = counter32_at_edge;
   pvc.ch3_at_edge = ch3_at_edge;
   pvc.gnss_ns_at_edge = -1;  // GNSS labels are CLOCKS-owned.
@@ -4290,7 +4494,8 @@ static void vclock_apply_perishable_fact_deferred(
                                         : fact.fallback_sequence,
                                     published_dwt,
                                     fact.target_counter32,
-                                    fact.target_low16);
+                                    fact.target_low16,
+                                    observed_dwt);
 
   emit_one_second_event(*g_rt_vclock,
                         published_dwt,
@@ -4810,7 +5015,8 @@ static void vclock_heartbeat_timepop_callback(timepop_ctx_t* ctx,
                                               : (g_pps_gpio_heartbeat.edge_count + 1),
                                           published_dwt,
                                           cadence_counter32,
-                                          fired_low16);
+                                          fired_low16,
+                                          qtimer_event_dwt);
 
         emit_one_second_event(*g_rt_vclock, published_dwt,
                               cadence_counter32,
@@ -7483,6 +7689,31 @@ pps_vclock_t interrupt_last_pps_vclock(void) {
   return store_load_pvc();
 }
 
+bool interrupt_last_pps_vclock_phase_estimate(
+    pps_vclock_phase_estimate_t* out) {
+  if (!out) return false;
+  const pps_vclock_edge_authority_t a = g_pps_vclock_edge_authority;
+  pps_vclock_phase_estimate_t e{};
+  e.valid = a.learned_phase_valid || a.valid;
+  e.lattice_dwt_at_edge = a.vclock_observed_dwt_at_edge;
+  e.estimated_dwt_at_edge = a.authority_dwt_at_edge;
+  e.correction_cycles = a.vclock_observed_dwt_at_edge
+      ? pps_vclock_signed_delta_near(a.vclock_observed_dwt_at_edge,
+                                     a.authority_dwt_at_edge)
+      : 0;
+  e.phase_mod_scaled_cycles = a.learned_phase_cycles;
+  e.tick_scaled_cycles = vclock_cycles_for_ticks(1U);
+  e.scale = 1U;
+  e.dwt_cycles_per_second = a.dwt_cycles_per_second;
+  e.pps_sequence = a.sequence;
+  e.pvc_sequence = a.sequence;
+  e.pps_dwt_at_edge = a.pps_dwt_at_edge;
+  e.pps_counter32_at_edge = a.counter32_at_edge;
+  e.pvc_counter32_at_edge = a.counter32_at_edge;
+  *out = e;
+  return e.valid;
+}
+
 // Legacy projection.  Field map:
 //   snapshot.dwt_at_edge       <- pvc.dwt_at_edge       (PPS_VCLOCK)
 //   snapshot.counter32_at_edge <- pvc.counter32_at_edge (PPS_VCLOCK)
@@ -7523,6 +7754,7 @@ pps_edge_snapshot_t interrupt_last_pps_edge(void) {
   out.vclock_epoch_counter32_offset_ticks = VCLOCK_EPOCH_COUNTER32_OFFSET_TICKS;
   out.vclock_epoch_dwt_offset_cycles      = CANONICAL_VCLOCK_EPOCH_MINUS_RAW_PPS_ISR_CYCLES;
   out.vclock_epoch_selected               = true;
+  out.vclock_edge_authority = g_pps_vclock_edge_authority;
   return out;
 }
 
@@ -7836,6 +8068,7 @@ static void runtime_reset_pps_state(void) {
   g_last_pps_witness_valid = false;
   g_vclock_epoch_latch = vclock_epoch_latch_t{};
   g_vclock_repair_stats = vclock_repair_stats_t{};
+  pps_vclock_edge_authority_reset();
   g_pps_rebootstrap_pending = false;
   g_pps_rebootstrap_count = 0;
 }

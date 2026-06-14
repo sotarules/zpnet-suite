@@ -137,6 +137,9 @@ volatile uint32_t g_pps_dwt_cycles_between_edges = 0;
 volatile bool     g_pps_dwt_cycles_between_edges_valid = false;
 volatile int32_t  g_pps_vclock_phase_cycles = 0;
 
+static volatile uint32_t g_pps_vclock_edge_forensics_seq = 0;
+static clocks_pps_vclock_edge_forensics_t g_pps_vclock_edge_forensics = {};
+
 static volatile uint32_t g_prev_pps_dwt_at_edge = 0;
 static volatile bool     g_prev_pps_dwt_at_edge_valid = false;
 
@@ -157,6 +160,107 @@ static uint32_t alpha_pps_vclock_phase_cycles_from_edges(uint32_t pps_dwt_at_edg
   return (uint32_t)((phase_scaled +
                      (uint64_t)VCLOCK_COUNTS_PER_SECOND / 2ULL) /
                     (uint64_t)VCLOCK_COUNTS_PER_SECOND);
+}
+
+static inline void clocks_alpha_dmb(void);
+
+static uint64_t alpha_pps_vclock_abs_i64(int64_t value) {
+  return (value >= 0) ? (uint64_t)value : (uint64_t)(-value);
+}
+
+static void alpha_pps_vclock_edge_forensics_reset(void) {
+  g_pps_vclock_edge_forensics_seq++;
+  clocks_alpha_dmb();
+  g_pps_vclock_edge_forensics = clocks_pps_vclock_edge_forensics_t{};
+  clocks_alpha_dmb();
+  g_pps_vclock_edge_forensics_seq++;
+}
+
+static void alpha_pps_vclock_edge_forensics_publish(
+    const pps_edge_snapshot_t& snap,
+    bool gnss_self_map_valid,
+    uint64_t expected_gnss_ns,
+    uint64_t mapped_gnss_ns,
+    int64_t gnss_self_error_ns,
+    uint32_t dwt_cycles_between_edges,
+    uint32_t effective_dwt_cycles_per_second) {
+  const uint32_t prior_update_count = g_pps_vclock_edge_forensics.update_count;
+  const pps_vclock_edge_authority_t& a = snap.vclock_edge_authority;
+
+  clocks_pps_vclock_edge_forensics_t local{};
+  local.valid = a.valid;
+  local.sequence = snap.sequence;
+  local.update_count = prior_update_count + 1U;
+  local.reject_count = a.reject_count;
+
+  local.authority_dwt_at_edge = snap.dwt_at_edge;
+  local.pps_dwt_at_edge = snap.physical_pps_dwt_normalized_at_edge;
+  local.vclock_observed_dwt_at_edge = a.vclock_observed_dwt_at_edge;
+  local.vclock_predicted_dwt_at_edge = a.vclock_predicted_dwt_at_edge;
+  local.pps_projected_vclock_dwt_at_edge =
+      a.pps_projected_vclock_dwt_at_edge;
+
+  local.observed_phase_valid = a.observed_phase_valid;
+  local.learned_phase_valid = a.learned_phase_valid;
+  local.observed_phase_cycles = a.observed_phase_cycles;
+  local.learned_phase_cycles = a.learned_phase_cycles;
+
+  local.gate_cycles = a.gate_cycles;
+  local.agreement_span_cycles = a.agreement_span_cycles;
+  local.decision = a.decision;
+  local.invalid_mask = a.invalid_mask;
+
+  local.authority_minus_pps_cycles = a.authority_minus_pps_cycles;
+  local.authority_minus_vclock_observed_cycles =
+      a.authority_minus_vclock_observed_cycles;
+  local.authority_minus_prediction_cycles =
+      a.authority_minus_prediction_cycles;
+  local.prediction_minus_pps_projected_cycles =
+      a.prediction_minus_pps_projected_cycles;
+  local.pps_projected_minus_observed_cycles =
+      a.pps_projected_minus_observed_cycles;
+  local.observed_minus_prediction_cycles = a.observed_minus_prediction_cycles;
+
+  local.counter32_at_edge = snap.counter32_at_edge;
+  local.ch3_at_edge = snap.ch3_at_edge;
+  local.dwt_cycles_per_second = a.dwt_cycles_per_second;
+  local.dwt_cycles_between_edges = dwt_cycles_between_edges;
+  local.effective_dwt_cycles_per_second = effective_dwt_cycles_per_second;
+
+  local.gnss_self_map_valid = gnss_self_map_valid;
+  local.gnss_self_error_gate_ns = 1U;
+  local.expected_gnss_ns_at_edge = expected_gnss_ns;
+  local.mapped_gnss_ns_at_edge = mapped_gnss_ns;
+  local.gnss_self_error_ns = gnss_self_error_ns;
+  local.gnss_self_error_ok = gnss_self_map_valid &&
+      alpha_pps_vclock_abs_i64(gnss_self_error_ns) <=
+          (uint64_t)local.gnss_self_error_gate_ns;
+
+  g_pps_vclock_edge_forensics_seq++;
+  clocks_alpha_dmb();
+  g_pps_vclock_edge_forensics = local;
+  clocks_alpha_dmb();
+  g_pps_vclock_edge_forensics_seq++;
+}
+
+bool clocks_alpha_pps_vclock_edge_forensics(
+    clocks_pps_vclock_edge_forensics_t* out) {
+  if (!out) return false;
+
+  for (int attempt = 0; attempt < 4; attempt++) {
+    const uint32_t seq1 = g_pps_vclock_edge_forensics_seq;
+    clocks_alpha_dmb();
+    clocks_pps_vclock_edge_forensics_t local = g_pps_vclock_edge_forensics;
+    clocks_alpha_dmb();
+    const uint32_t seq2 = g_pps_vclock_edge_forensics_seq;
+    if (seq1 == seq2 && (seq1 & 1u) == 0u) {
+      *out = local;
+      return local.update_count != 0;
+    }
+  }
+
+  *out = clocks_pps_vclock_edge_forensics_t{};
+  return false;
 }
 
 // VCLOCK event counter — increments on every vclock_callback invocation
@@ -3406,6 +3510,7 @@ static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
   g_pps_dwt_cycles_between_edges = 0;
   g_pps_dwt_cycles_between_edges_valid = false;
   g_pps_vclock_phase_cycles = 0;
+  alpha_pps_vclock_edge_forensics_reset();
   g_prev_pps_dwt_at_edge = 0;
   g_prev_pps_dwt_at_edge_valid = false;
   g_vclock_event_count = 0;
@@ -3984,10 +4089,15 @@ static void publish_pps_witness_diag(const pps_edge_snapshot_t& snap) {
           ? g_prev_observed_dwt_at_vclock_event
           : snap.dwt_at_edge;
 
-  g_pps_vclock_phase_cycles =
-      (int32_t)alpha_pps_vclock_phase_cycles_from_edges(
-          physical_pps_dwt,
-          observed_vclock_dwt_for_phase);
+  if (snap.vclock_edge_authority.learned_phase_valid) {
+    g_pps_vclock_phase_cycles =
+        (int32_t)snap.vclock_edge_authority.learned_phase_cycles;
+  } else {
+    g_pps_vclock_phase_cycles =
+        (int32_t)alpha_pps_vclock_phase_cycles_from_edges(
+            physical_pps_dwt,
+            observed_vclock_dwt_for_phase);
+  }
   g_prev_pps_dwt_at_edge = physical_pps_dwt;
   g_prev_pps_dwt_at_edge_valid = true;
 
@@ -4104,14 +4214,31 @@ static void update_pps_vclock_bridge_anchor(const pps_edge_snapshot_t& snap) {
                                        &vclock_ns)) {
     return;
   }
-  if (!alpha_sample_all_clocks_at_pps_vclock(snap, vclock_ns)) {
-    return;
-  }
 
   const uint32_t effective_dwt_cycles_per_second =
       g_pps_dwt_cycles_between_edges_valid
           ? (uint32_t)g_pps_dwt_cycles_between_edges
           : dwt_between_pps;
+
+  const uint64_t previous_vclock_ns = g_gnss_ns_at_pps_vclock;
+  const bool gnss_self_map_valid =
+      g_prev_pps_vclock_dwt_at_edge_valid &&
+      effective_dwt_cycles_per_second != 0U;
+  const uint64_t mapped_gnss_ns = gnss_self_map_valid
+      ? (previous_vclock_ns +
+         ((uint64_t)dwt_between_pps * NS_PER_SECOND_U64 +
+          (uint64_t)effective_dwt_cycles_per_second / 2ULL) /
+             (uint64_t)effective_dwt_cycles_per_second)
+      : 0ULL;
+  const int64_t gnss_self_error_ns = gnss_self_map_valid
+      ? ((mapped_gnss_ns >= vclock_ns)
+             ? (int64_t)(mapped_gnss_ns - vclock_ns)
+             : -(int64_t)(vclock_ns - mapped_gnss_ns))
+      : 0LL;
+
+  if (!alpha_sample_all_clocks_at_pps_vclock(snap, vclock_ns)) {
+    return;
+  }
 
   // Attach Alpha's campaign GNSS label and PPS/GPIO-derived static CPS to
   // the already-authored process_interrupt PPS_VCLOCK anchor. This makes the
@@ -4121,6 +4248,14 @@ static void update_pps_vclock_bridge_anchor(const pps_edge_snapshot_t& snap) {
                                     snap.counter32_at_edge,
                                     vclock_ns,
                                     effective_dwt_cycles_per_second);
+
+  alpha_pps_vclock_edge_forensics_publish(snap,
+                                           gnss_self_map_valid,
+                                           vclock_ns,
+                                           mapped_gnss_ns,
+                                           gnss_self_error_ns,
+                                           dwt_between_pps,
+                                           effective_dwt_cycles_per_second);
 
   g_dwt_cycles_between_pps_vclock = effective_dwt_cycles_per_second;
   g_dwt_cycle_count_total += (uint64_t)effective_dwt_cycles_per_second;

@@ -1084,6 +1084,86 @@ static void payload_add_prediction_summary_hierarchical(Payload& p) {
   p.add_object("prediction", prediction);
 }
 
+static const char* pps_vclock_edge_decision_name(uint32_t decision) {
+  switch (decision) {
+    case PPS_VCLOCK_EDGE_DECISION_LOWER_LAWFUL:
+      return "LOWER_LAWFUL";
+    case PPS_VCLOCK_EDGE_DECISION_PREDICTION_FALLBACK:
+      return "PREDICTION_FALLBACK";
+    case PPS_VCLOCK_EDGE_DECISION_PPS_PHASE_FALLBACK:
+      return "PPS_PHASE_FALLBACK";
+    case PPS_VCLOCK_EDGE_DECISION_OBSERVED_FALLBACK:
+      return "OBSERVED_FALLBACK";
+    default:
+      return "NONE";
+  }
+}
+
+static void payload_add_pps_vclock_edge_forensics(
+    Payload& parent,
+    bool available,
+    const clocks_pps_vclock_edge_forensics_t& e) {
+  Payload edge;
+  edge.add("available", available);
+  edge.add("valid", available && e.valid);
+  edge.add("sequence", available ? e.sequence : 0U);
+  edge.add("update_count", available ? e.update_count : 0U);
+  edge.add("reject_count", available ? e.reject_count : 0U);
+
+  edge.add("authority_dwt_at_edge", available ? e.authority_dwt_at_edge : 0U);
+  edge.add("pps_dwt_at_edge", available ? e.pps_dwt_at_edge : 0U);
+  edge.add("vclock_observed_dwt_at_edge",
+           available ? e.vclock_observed_dwt_at_edge : 0U);
+  edge.add("vclock_predicted_dwt_at_edge",
+           available ? e.vclock_predicted_dwt_at_edge : 0U);
+  edge.add("pps_projected_vclock_dwt_at_edge",
+           available ? e.pps_projected_vclock_dwt_at_edge : 0U);
+
+  edge.add("decision", pps_vclock_edge_decision_name(available ? e.decision : 0U));
+  edge.add("decision_id", available ? e.decision : 0U);
+  edge.add("invalid_mask", available ? e.invalid_mask : 0U);
+  edge.add("gate_cycles", available ? e.gate_cycles : 0U);
+  edge.add("agreement_span_cycles", available ? e.agreement_span_cycles : 0U);
+
+  edge.add("observed_phase_valid", available && e.observed_phase_valid);
+  edge.add("learned_phase_valid", available && e.learned_phase_valid);
+  edge.add("observed_phase_cycles", available ? e.observed_phase_cycles : 0U);
+  edge.add("learned_phase_cycles", available ? e.learned_phase_cycles : 0U);
+
+  edge.add("authority_minus_pps_cycles",
+           available ? e.authority_minus_pps_cycles : 0);
+  edge.add("authority_minus_vclock_observed_cycles",
+           available ? e.authority_minus_vclock_observed_cycles : 0);
+  edge.add("authority_minus_prediction_cycles",
+           available ? e.authority_minus_prediction_cycles : 0);
+  edge.add("prediction_minus_pps_projected_cycles",
+           available ? e.prediction_minus_pps_projected_cycles : 0);
+  edge.add("pps_projected_minus_observed_cycles",
+           available ? e.pps_projected_minus_observed_cycles : 0);
+  edge.add("observed_minus_prediction_cycles",
+           available ? e.observed_minus_prediction_cycles : 0);
+
+  edge.add("counter32_at_edge", available ? e.counter32_at_edge : 0U);
+  edge.add("ch3_at_edge", available ? (uint32_t)e.ch3_at_edge : 0U);
+  edge.add("dwt_cycles_per_second", available ? e.dwt_cycles_per_second : 0U);
+  edge.add("dwt_cycles_between_edges",
+           available ? e.dwt_cycles_between_edges : 0U);
+  edge.add("effective_dwt_cycles_per_second",
+           available ? e.effective_dwt_cycles_per_second : 0U);
+
+  edge.add("gnss_self_map_valid", available && e.gnss_self_map_valid);
+  edge.add("gnss_self_error_ok", available && e.gnss_self_error_ok);
+  edge.add("gnss_self_error_gate_ns",
+           available ? e.gnss_self_error_gate_ns : 0U);
+  edge.add("expected_gnss_ns_at_edge",
+           available ? e.expected_gnss_ns_at_edge : 0ULL);
+  edge.add("mapped_gnss_ns_at_edge",
+           available ? e.mapped_gnss_ns_at_edge : 0ULL);
+  edge.add("gnss_self_error_ns", available ? e.gnss_self_error_ns : 0LL);
+
+  parent.add_object("pps_vclock_edge", edge);
+}
+
 static void payload_add_lane_forensics_object(Payload& parent,
                                               bool valid,
                                               const clocks_alpha_lane_forensics_t& f) {
@@ -1345,6 +1425,7 @@ static void payload_add_timebase_pair_identity(Payload& p,
   p.add("teensy_pps_count",        public_count);
   p.add("pps_count",               public_count);
   p.add("gnss_ns",                 public_gnss_ns);
+  p.add("pps_vclock_gnss_ns_at_edge", public_gnss_ns);
   p.add("dwt_at_pps_vclock",       (uint32_t)g_dwt_at_pps_vclock);
   p.add("dwt_cycles_between_pps_vclock", (uint32_t)g_dwt_cycles_between_pps_vclock);
   p.add("counter32_at_pps_vclock", (uint32_t)g_counter32_at_pps_vclock);
@@ -2221,6 +2302,10 @@ void clocks_beta_pps(void) {
   const bool ocxo2_forensics_valid =
       clocks_alpha_lane_forensics(time_clock_id_t::OCXO2, &ocxo2_forensics);
 
+  clocks_pps_vclock_edge_forensics_t pps_vclock_edge_forensics{};
+  const bool pps_vclock_edge_forensics_valid =
+      clocks_alpha_pps_vclock_edge_forensics(&pps_vclock_edge_forensics);
+
   clocks_alpha_ocxo_pps_projection_snapshot_t ocxo1_pps_projection{};
   clocks_alpha_ocxo_pps_projection_snapshot_t ocxo2_pps_projection{};
   const bool ocxo1_pps_projection_ok =
@@ -2521,6 +2606,10 @@ void clocks_beta_pps(void) {
     f.add("paired_fragment_topic", "TIMEBASE_FRAGMENT");
     f.add("paired_fragment_schema", "TIMEBASE_FRAGMENT_V3");
     f.add("paired_fragment_version", 3U);
+
+    payload_add_pps_vclock_edge_forensics(f,
+                                          pps_vclock_edge_forensics_valid,
+                                          pps_vclock_edge_forensics);
 
     timebase_build_stage(TIMEBASE_BUILD_STAGE_VCLOCK);
     payload_add_vclock_forensics(f,
