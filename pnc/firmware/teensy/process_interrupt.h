@@ -33,6 +33,7 @@ enum class interrupt_provider_kind_t : uint8_t {
 
 enum class interrupt_lane_t : uint8_t {
   NONE = 0,
+  QTIMER1_CH0_COMP,
   QTIMER1_CH1_COMP,
   QTIMER1_CH2_COMP,
   QTIMER1_CH3_COMP,

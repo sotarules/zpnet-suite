@@ -35,10 +35,13 @@ static constexpr uint64_t NS_PER_MICROSECOND = 1000ULL;
 // share the same nominal frequency. These constants are used
 // for ISR-level residual computation and PPS edge validation.
 //
-// All three domains count at 10 MHz (100 ns per tick):
-//   GNSS VCLOCK on QTimer1 ch0+ch1 (single-edge, CM=1)
-//   OCXO1 on GPT1 (single-edge)
-//   OCXO2 on GPT2 (single-edge)
+// All three domains count at 10 MHz (100 ns per tick).  Clock lanes now use
+// the pin-bound same-channel doctrine: the channel that receives the physical
+// clock input also owns compare-match event custody.
+//   GNSS VCLOCK on QTimer1 CH0, pin 10 (count + compare)
+//   OCXO1      on QTimer2 CH0, pin 13 (count + compare)
+//   OCXO2      on QTimer3 CH3, pin 15 (count + compare)
+//   TimePop    on QTimer1 CH2 as scheduler only
 //
 
 // Expected ticks per PPS second at 10 MHz
@@ -109,7 +112,7 @@ static const int PHOTODIODE_ANALOG_PIN = 22;
 //
 // GNSS_VCLK_PIN:
 //   10 MHz VCLOCK square wave from GF-8802 (pin 10)
-//   Counted by QTimer1 ch0+ch1 (single-edge, 100 ns per tick)
+//   Counted and compared by QTimer1 CH0 (single-edge, 100 ns per tick)
 //
 // GNSS_LOCK_PIN:
 //   GNSS lock status (true/false)
@@ -124,21 +127,21 @@ static constexpr int OCXO1_PIN = 13;
 static constexpr int OCXO2_PIN = 15;
 
 // --------------------------------------------------------------
-// QTimer1 cascade configuration
+// QTimer1 channel configuration
 // --------------------------------------------------------------
 //
-// QTimer1 is used for GNSS VCLOCK counting and scheduling.
+// QTimer1 hosts two deliberately separate duties.
 //
-// ch0: primary external count source on pin 10 (GNSS 10 MHz, CM=1)
-// ch1: cascaded extension for 32-bit range (CM=7)
-// ch2: TimePop dynamic compare scheduler (priority queue, CM=1)
-// ch3: TIME_TEST compare (VCLOCK edge capture for time audit)
+// ch0: VCLOCK pin-bound clock lane on pin 10: count + compare authority
+// ch1: retired / reserved; not timing authority
+// ch2: TimePop dynamic compare scheduler only; not VCLOCK authority
+// ch3: reserved diagnostic/time-test rail if needed
 //
 // The raw QTimer count is in 10 MHz ticks (100 ns per tick).
 // No domain translation is required — one tick = one GNSS cycle.
 //
-// The 32-bit QTimer value is read in the PPS ISR alongside
-// GPT1_CNT, GPT2_CNT, and DWT_CYCCNT.
+// The synthetic 32-bit VCLOCK identity is reconstructed from QTimer1 CH0;
+// sibling channels are not used to author VCLOCK timing facts.
 //
 static constexpr uint32_t QTIMER1_CH0_BITS = 16;
 static constexpr uint32_t QTIMER1_CH0_MASK = 0xFFFF;
@@ -147,22 +150,16 @@ static constexpr uint32_t QTIMER1_CH0_MASK = 0xFFFF;
 // Timer hardware summary
 // --------------------------------------------------------------
 //
-// Domain    Timer           Pin   Clock Source           Resolution
-// -------   -------------   ---   --------------------   ----------
-// DWT       ARM_DWT_CYCCNT   —    CPU core (1008 MHz)    ~1 ns
-// GNSS      QTimer1 ch0+1    10   GF-8802 VCLOCK 10 MHz  100 ns
-// OCXO1     QTimer3 ch2      14   AOCJY1-A #1   10 MHz   100 ns
-// OCXO2     QTimer3 ch3      15   AOCJY1-A #2   10 MHz   100 ns
+// Domain    Timer/Channel    Pin   Clock Source           Resolution
+// -------   ---------------  ---   --------------------   ----------
+// DWT       ARM_DWT_CYCCNT    —    CPU core (1008 MHz)    ~1 ns
+// GNSS      QTimer1 CH0       10   GF-8802 VCLOCK 10 MHz  100 ns
+// OCXO1     QTimer2 CH0       13   AOCJY1-A #1   10 MHz   100 ns
+// OCXO2     QTimer3 CH3       15   AOCJY1-A #2   10 MHz   100 ns
+// TimePop   QTimer1 CH2       —    scheduler rail         100 ns domain
 //
-// All timing domains free-run continuously.
-// All are captured simultaneously in the PPS ISR.
-// GPT1 and GPT2 are 32-bit native.
-// QTimer1 is 16-bit cascaded to 32-bit (wraps at ~429 seconds).
-// 64-bit extension is via delta accumulation where needed.
-//
-// GNSS VCLOCK is intentionally hosted on QTimer1 because it is the
-// sovereign clock domain used by TimePop and broader timing semantics.
-// OCXO2 is hosted on GPT2.
+// Clock lanes use same-channel count + compare custody.  The scheduler rail
+// may wake callbacks but must not author VCLOCK edge identity.
 //
 
 // --------------------------------------------------------------
@@ -221,14 +218,9 @@ static constexpr uint32_t MAX_INTERRUPT_SUBSCRIBERS = 8;
 
 static constexpr uint32_t VCLOCK_INTERVAL_COUNTS = 10000U;  // 1 ms at 10 MHz
 
-// OCXO cadence (deliberately distinct from VCLOCK).
-//
-// Experimental config: each OCXO lane fires every 2 ms (20000 OCXO ticks).
-// 500 compares per OCXO second × 20000 ticks = 10,000,000 ticks = 1 s.
-//
-// Phase offset between the two lanes is OCXO_INTERVAL_COUNTS / 2 (1 ms).
-// OCXO1 fires on even ms boundaries, OCXO2 fires on odd ms boundaries.
-// They cannot share an ISR window.
+// OCXO cadence constants retained for acquisition/report compatibility.
+// Steady-state OCXO publication is a one-second compare on each lane's
+// pin-bound channel; SmartZero may still use short acquisition samples.
 static constexpr uint32_t OCXO_INTERVAL_COUNTS = 20000U;       // 2 ms at 10 MHz
 static constexpr uint32_t OCXO_COUNTS_PER_SECOND = 10000000U;
 static constexpr uint32_t OCXO_PHASE_OFFSET_TICKS =

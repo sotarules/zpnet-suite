@@ -64,22 +64,23 @@ IO24 (GPIO24)     Orange        SCL2               Rail SCL2 (Orange)           
 FINAL DECISION:
 
   • No re-wiring required.
-  • VCLOCK remains on QTimer1.
-  • OCXO1 and OCXO2 remain on QTimer3 CH2/CH3.
-  • 16-bit counters retained with correct rollover reconstruction.
-  • Quantization eliminated (GPT path removed).
-  • Symmetry implemented in software.
+  • Each clock lane uses its pin-bound QTimer channel for BOTH count and compare.
+  • VCLOCK remains on QTimer1 CH0 / pin 10.
+  • OCXO1 remains on QTimer2 CH0 / pin 13.
+  • OCXO2 remains on QTimer3 CH3 / pin 15.
+  • TimePop remains a scheduler on QTimer1 CH2 and is not VCLOCK authority.
 
 FINAL TIMER TOPOLOGY:
 
-  QTimer1 → VCLOCK → pin 10
-  QTimer2 → OCXO1  → pin 13 (CH0)
-  QTimer3 → OCXO2  → pin 15 (CH3)
+  QTimer1 CH0 → VCLOCK → pin 10  (count + compare)
+  QTimer2 CH0 → OCXO1  → pin 13  (count + compare)
+  QTimer3 CH3 → OCXO2  → pin 15  (count + compare)
+  QTimer1 CH2 → TimePop scheduler only
 
 CRITICAL PIN NOTES:
 
-  Pin 11 = QTIMER1_TIMER2 (CH2) — TimePop compare scheduler
-  DO NOT use pin 11 for external clock input
+  QTimer1 CH2 is reserved for TimePop compare scheduling.
+  DO NOT use QTimer1 CH2 as VCLOCK edge authority.
 
 -------------------------------------------------------------------------------
 
@@ -89,10 +90,10 @@ VIN           White         VIN_5V5            INA260 (5.5 V rail)              
 GND           Black         GND                Battery branching ground             Direct return to battery
 1             Twisted Pair  GNSS_PPS_IN        GF-8802 PPS                          1 Hz absolute time reference
 4             Green         GNSS_LOCK_IN       GF-8802 LOCK                         Lock status signal
-10            Twisted Pair  GNSS_10MHZ_IN      GF-8802 VCLOCK                       QTimer1 ch0+ch1
+10            Twisted Pair  GNSS_10MHZ_IN      GF-8802 VCLOCK                       QTimer1 CH0 count+compare
 
-13            Twisted Pair  OCXO1_10MHZ_IN     OCXO1                                QTimer3 CH0
-15            Twisted Pair  OCXO2_10MHZ_IN     OCXO2                                QTimer3 CH3
+13            Twisted Pair  OCXO1_10MHZ_IN     OCXO1                                QTimer2 CH0 count+compare
+15            Twisted Pair  OCXO2_10MHZ_IN     OCXO2                                QTimer3 CH3 count+compare
 18            Blue          SDA1               Rail bus SDA1
 19            Yellow        SCL1               Rail bus SCL1
 20            White         LASER_PD_PLUS      Laser diode PD+
@@ -106,10 +107,10 @@ GND           Black         GND                Battery branching ground         
 -------------------------------------------------------------------------------
 Timer hardware binding summary:
 
-  Pin 13  →  QTimer2 CH0
-  Pin 15  →  QTimer3 CH3
-  Pin 10  →  QTimer1 ch0+ch1
-  Pin 10  →  QTimer1 ch2 compare
+  Pin 10  →  QTimer1 CH0  VCLOCK count + compare authority
+  Pin 13  →  QTimer2 CH0  OCXO1 count + compare authority
+  Pin 15  →  QTimer3 CH3  OCXO2 count + compare authority
+  QTimer1 CH2             TimePop scheduler only
 
 =============================================================================*/
 
@@ -122,7 +123,7 @@ Timer hardware binding summary:
 Signal Name          Source          Destination       Frequency    Timer HW
 ----------------------------------------------------------------------------------------------------------
 GNSS_PPS_IN          GF-8802 P17     Teensy pin 1      1 Hz         GPIO IRQ
-GNSS_10MHZ_IN        GF-8802 P11     Teensy pin 10     10 MHz       QTimer1
+GNSS_10MHZ_IN        GF-8802 P11     Teensy pin 10     10 MHz       QTimer1 CH0
 OCXO1_10MHZ_IN       OCXO1           Teensy pin 13     10 MHz       QTimer2 CH0
 OCXO2_10MHZ_IN       OCXO2           Teensy pin 15     10 MHz       QTimer3 CH3
 GNSS_PPS_RELAY       Teensy pin 32   Pi GPIO18/25      1 Hz         —
@@ -139,12 +140,12 @@ GNSS_PPS_RELAY       Teensy pin 32   Pi GPIO18/25      1 Hz         —
   VREF source    ←  Teensy pin 23
   Power          →  Dedicated 5V domain
 
-QTimer3 CH2, 16-bit free-running external clock count.
+QTimer2 CH0, 16-bit free-running external clock count + compare.
 Rollover handled in software.
 
 Shield drain at OCXO1 end.
 
-History: GPT1 → QTimer2 → QTimer4 → QTimer3 CH2 (final stable)
+History: GPT1 → QTimer2 → QTimer4 → split-channel experiment → QTimer2 CH0 same-channel custody.
 
 =============================================================================*/
 
@@ -158,10 +159,11 @@ History: GPT1 → QTimer2 → QTimer4 → QTimer3 CH2 (final stable)
   VREF source    ←  Teensy pin 23
   Power          →  Dedicated 5V domain
 
-QTimer3 CH3, 16-bit free-running external clock count.
+QTimer3 CH3, 16-bit free-running external clock count + compare.
 Rollover handled in software.
 
-Symmetric with OCXO1.
+Symmetric with OCXO1 by doctrine: same-channel count + compare, even though
+the channel number is pin-routing-specific.
 
 =============================================================================*/
 
