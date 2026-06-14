@@ -2304,9 +2304,13 @@ struct ocxo_lane_t {
   uint32_t witness_last_arm_dwt_raw = 0;
   uint32_t witness_last_arm_counter32 = 0;
   uint16_t witness_last_arm_low16 = 0;
+  uint16_t witness_last_arm_compare_low16 = 0;
+  uint32_t witness_last_arm_counter_minus_compare_ticks = 0;
+  uint32_t witness_last_arm_compare_remaining_ticks = 0;
   uint32_t witness_last_arm_target_counter32 = 0;
   uint16_t witness_last_arm_target_low16 = 0;
   uint32_t witness_last_arm_to_isr_ticks = 0;
+  uint32_t witness_last_compare_arm_to_isr_ticks = 0;
   uint32_t witness_last_arm_to_isr_dwt_cycles = 0;
   uint32_t witness_last_program_csctrl_before = 0;
   uint32_t witness_last_program_csctrl_after = 0;
@@ -2328,6 +2332,12 @@ struct ocxo_lane_t {
 
   uint16_t witness_last_target_low16 = 0;
   uint16_t witness_last_isr_counter_low16 = 0;
+  uint16_t witness_last_isr_compare_low16 = 0;
+  uint32_t witness_last_isr_counter_minus_compare_ticks = 0;
+  uint32_t witness_last_compare_delta_mod65536_ticks = 0;
+  int32_t  witness_last_compare_service_offset_signed_ticks = 0;
+  uint32_t witness_last_compare_interpreted_late_ticks = 0;
+  uint32_t witness_last_compare_early_ticks = 0;
   uint32_t witness_last_target_delta_mod65536_ticks = 0;
   uint32_t witness_last_interpreted_late_ticks = 0;
   uint32_t witness_last_early_ticks = 0;
@@ -2495,6 +2505,7 @@ static ocxo_lane_t g_ocxo2_lane;
 
 static ocxo_lane_t* ocxo_lane_for(interrupt_subscriber_kind_t kind);
 static inline uint16_t ocxo_lane_counter_now(const ocxo_lane_t& lane);
+static inline uint16_t ocxo_lane_compare_counter_now(const ocxo_lane_t& lane);
 static void ocxo_lane_program_compare(ocxo_lane_t& lane, uint16_t target_low16);
 static void ocxo_lane_disable_compare(ocxo_lane_t& lane);
 static void ocxo_lane_clear_compare_flag(ocxo_lane_t& lane);
@@ -3114,6 +3125,7 @@ static void ocxo_lane_maybe_arm_one_second_compare(
   }
 
   const uint16_t hw16 = ocxo_lane_counter_now(lane);
+  const uint16_t cmp16 = ocxo_lane_compare_counter_now(lane);
   lane.witness_schedule_last_current_counter32 = clock32.current_counter32;
   lane.witness_schedule_last_target_counter32 = lane.cadence_next_counter32;
   lane.witness_schedule_last_remaining_ticks = remaining;
@@ -3148,6 +3160,11 @@ static void ocxo_lane_maybe_arm_one_second_compare(
   lane.witness_last_arm_dwt_raw = ARM_DWT_CYCCNT;
   lane.witness_last_arm_counter32 = clock32.current_counter32;
   lane.witness_last_arm_low16 = hw16;
+  lane.witness_last_arm_compare_low16 = cmp16;
+  lane.witness_last_arm_counter_minus_compare_ticks =
+      (uint32_t)((uint16_t)(hw16 - cmp16));
+  lane.witness_last_arm_compare_remaining_ticks =
+      (uint32_t)((uint16_t)(lane.cadence_next_low16 - cmp16));
   lane.witness_last_arm_target_counter32 = lane.cadence_next_counter32;
   lane.witness_last_arm_target_low16 = lane.cadence_next_low16;
   lane.witness_last_arm_remaining_ticks = remaining;
@@ -3869,6 +3886,25 @@ static void fill_diag(interrupt_capture_diag_t& diag,
       diag.ocxo_arm_remaining_ticks = lane->witness_last_arm_remaining_ticks;
       diag.ocxo_arm_to_isr_ticks = lane->witness_last_arm_to_isr_ticks;
       diag.ocxo_arm_to_isr_dwt_cycles = lane->witness_last_arm_to_isr_dwt_cycles;
+      diag.ocxo_arm_counter_low16 = lane->witness_last_arm_low16;
+      diag.ocxo_arm_compare_low16 = lane->witness_last_arm_compare_low16;
+      diag.ocxo_arm_counter_minus_compare_ticks =
+          lane->witness_last_arm_counter_minus_compare_ticks;
+      diag.ocxo_arm_compare_remaining_ticks =
+          lane->witness_last_arm_compare_remaining_ticks;
+      diag.ocxo_isr_counter_low16 = lane->witness_last_isr_counter_low16;
+      diag.ocxo_isr_compare_low16 = lane->witness_last_isr_compare_low16;
+      diag.ocxo_isr_counter_minus_compare_ticks =
+          lane->witness_last_isr_counter_minus_compare_ticks;
+      diag.ocxo_compare_delta_mod65536_ticks =
+          lane->witness_last_compare_delta_mod65536_ticks;
+      diag.ocxo_compare_service_offset_signed_ticks =
+          lane->witness_last_compare_service_offset_signed_ticks;
+      diag.ocxo_compare_interpreted_late_ticks =
+          lane->witness_last_compare_interpreted_late_ticks;
+      diag.ocxo_compare_early_ticks = lane->witness_last_compare_early_ticks;
+      diag.ocxo_compare_arm_to_isr_ticks =
+          lane->witness_last_compare_arm_to_isr_ticks;
       diag.ocxo_perishable_fact_sequence = lane->witness_last_fact_sequence;
       diag.ocxo_service_correction_cycles =
           lane->witness_last_service_correction_cycles;
@@ -4616,6 +4652,7 @@ static bool ocxo_lane_start_local_cadence_at_target(interrupt_subscriber_kind_t,
   if (!lane.initialized) return false;
 
   const uint16_t hw16 = ocxo_lane_counter_now(lane);
+  const uint16_t cmp16 = ocxo_lane_compare_counter_now(lane);
   synthetic_clock_tend_from_hw16(clock32, hw16);
 
   lane.cadence_enabled = true;
@@ -4623,6 +4660,11 @@ static bool ocxo_lane_start_local_cadence_at_target(interrupt_subscriber_kind_t,
   lane.witness_last_arm_dwt_raw = ARM_DWT_CYCCNT;
   lane.witness_last_arm_counter32 = clock32.current_counter32;
   lane.witness_last_arm_low16 = hw16;
+  lane.witness_last_arm_compare_low16 = cmp16;
+  lane.witness_last_arm_counter_minus_compare_ticks =
+      (uint32_t)((uint16_t)(hw16 - cmp16));
+  lane.witness_last_arm_compare_remaining_ticks =
+      (uint32_t)((uint16_t)(((uint16_t)(target_counter32 & 0xFFFFU)) - cmp16));
   lane.witness_last_arm_target_counter32 = target_counter32;
   lane.witness_last_arm_target_low16 = (uint16_t)(target_counter32 & 0xFFFFU);
   lane.witness_last_arm_remaining_ticks = target_counter32 - clock32.current_counter32;
@@ -4658,6 +4700,7 @@ static void ocxo_lane_prepare_one_second_target(
     uint32_t target_counter32,
     uint32_t reason) {
   const uint16_t hw16 = ocxo_lane_counter_now(lane);
+  const uint16_t cmp16 = ocxo_lane_compare_counter_now(lane);
   synthetic_clock_tend_from_hw16(clock32, hw16);
 
   lane.cadence_enabled = true;
@@ -4672,6 +4715,11 @@ static void ocxo_lane_prepare_one_second_target(
   lane.witness_target_low16 = lane.cadence_next_low16;
   lane.witness_last_arm_counter32 = clock32.current_counter32;
   lane.witness_last_arm_low16 = hw16;
+  lane.witness_last_arm_compare_low16 = cmp16;
+  lane.witness_last_arm_counter_minus_compare_ticks =
+      (uint32_t)((uint16_t)(hw16 - cmp16));
+  lane.witness_last_arm_compare_remaining_ticks =
+      (uint32_t)((uint16_t)(lane.cadence_next_low16 - cmp16));
   lane.witness_last_arm_target_counter32 = target_counter32;
   lane.witness_last_arm_target_low16 = lane.cadence_next_low16;
   lane.witness_last_arm_remaining_ticks = target_counter32 - clock32.current_counter32;
@@ -5115,8 +5163,23 @@ struct interrupt_perishable_fact_t {
   uint32_t target_counter32 = 0;
   uint16_t target_low16 = 0;
 
+  // Split-channel low-word witnesses.  counter_* is the passive identity rail;
+  // compare_* is the active hardware compare rail.  If OCXO1's CH0/CH1 split
+  // is manufacturing excursions, these values will show phase plateaus/jumps.
+  uint16_t arm_counter_low16 = 0;
+  uint16_t arm_compare_low16 = 0;
+  uint32_t arm_counter_minus_compare_ticks = 0;
+  uint32_t arm_compare_remaining_ticks = 0;
+
   // Hardware observation at ISR service time.
   uint16_t service_counter_low16 = 0;
+  uint16_t service_compare_low16 = 0;
+  uint32_t service_counter_minus_compare_ticks = 0;
+  uint32_t compare_delta_mod65536_ticks = 0;
+  int16_t compare_service_offset_ticks = 0;
+  uint32_t compare_interpreted_late_ticks = 0;
+  uint32_t compare_early_ticks = 0;
+  uint32_t compare_arm_to_isr_ticks = 0;
   int16_t service_offset_ticks = 0;
   uint32_t service_offset_abs_ticks = 0;
   uint32_t interpreted_late_ticks = 0;
@@ -5289,6 +5352,10 @@ static inline bool ocxo_lane_compare_flag_pending(const ocxo_lane_t& lane) {
 
 static inline uint16_t ocxo_lane_counter_now(const ocxo_lane_t& lane) {
   return lane.module->CH[lane.counter_channel].CNTR;
+}
+
+static inline uint16_t ocxo_lane_compare_counter_now(const ocxo_lane_t& lane) {
+  return lane.module->CH[lane.compare_channel].CNTR;
 }
 
 static void ocxo_lane_clear_compare_flag(ocxo_lane_t& lane) {
@@ -6093,6 +6160,18 @@ static void ocxo_apply_perishable_fact_deferred(
   lane->witness_last_irq_had_active_rt = fact.had_active_rt;
   lane->witness_last_target_low16 = fact.target_low16;
   lane->witness_last_isr_counter_low16 = fact.service_counter_low16;
+  lane->witness_last_isr_compare_low16 = fact.service_compare_low16;
+  lane->witness_last_isr_counter_minus_compare_ticks =
+      fact.service_counter_minus_compare_ticks;
+  lane->witness_last_compare_delta_mod65536_ticks =
+      fact.compare_delta_mod65536_ticks;
+  lane->witness_last_compare_service_offset_signed_ticks =
+      (int32_t)fact.compare_service_offset_ticks;
+  lane->witness_last_compare_interpreted_late_ticks =
+      fact.compare_interpreted_late_ticks;
+  lane->witness_last_compare_early_ticks = fact.compare_early_ticks;
+  lane->witness_last_compare_arm_to_isr_ticks =
+      fact.compare_arm_to_isr_ticks;
   lane->witness_last_target_delta_mod65536_ticks =
       fact.target_delta_mod65536_ticks;
   lane->witness_last_interpreted_late_ticks = fact.interpreted_late_ticks;
@@ -6283,10 +6362,21 @@ struct ocxo_cadence_isr_sample_t {
 
   uint32_t target_counter32 = 0;
   uint16_t target_low16 = 0;
+  uint16_t arm_counter_low16 = 0;
+  uint16_t arm_compare_low16 = 0;
+  uint32_t arm_counter_minus_compare_ticks = 0;
+  uint32_t arm_compare_remaining_ticks = 0;
   uint16_t service_counter_low16 = 0;
+  uint16_t service_compare_low16 = 0;
+  uint32_t service_counter_minus_compare_ticks = 0;
   uint32_t target_delta_mod65536_ticks = 0;
+  uint32_t compare_delta_mod65536_ticks = 0;
 
   int16_t service_offset_signed_ticks = 0;
+  int16_t compare_service_offset_signed_ticks = 0;
+  uint32_t compare_interpreted_late_ticks = 0;
+  uint32_t compare_early_ticks = 0;
+  uint32_t compare_arm_to_isr_ticks = 0;
   bool service_was_early = false;
   uint32_t early_ticks = 0;
   uint32_t interpreted_late_ticks = 0;
@@ -6400,6 +6490,7 @@ struct ocxo_capture_packet_t {
   // identity updates, and rearm policy.
   uint32_t csctrl_entry = 0;
   uint16_t service_counter_low16 = 0;
+  uint16_t service_compare_low16 = 0;
   uint32_t target_counter32 = 0;
   uint16_t target_low16 = 0;
   bool cadence_enabled = false;
@@ -6409,6 +6500,7 @@ struct ocxo_capture_packet_t {
   bool rt_active = false;
   uint32_t arm_remaining_ticks = 0;
   uint16_t arm_low16 = 0;
+  uint16_t arm_compare_low16 = 0;
   uint32_t arm_dwt_raw = 0;
 };
 
@@ -6901,9 +6993,15 @@ static void ocxo_cadence_rearm_or_stop(
       smartzero_write_end();
     }
 
+    const uint16_t cmp16 = ocxo_lane_compare_counter_now(lane);
     lane.witness_last_arm_dwt_raw = ARM_DWT_CYCCNT;
     lane.witness_last_arm_counter32 = sample.target_counter32;
     lane.witness_last_arm_low16 = sample.target_low16;
+    lane.witness_last_arm_compare_low16 = cmp16;
+    lane.witness_last_arm_counter_minus_compare_ticks =
+        (uint32_t)((uint16_t)(sample.target_low16 - cmp16));
+    lane.witness_last_arm_compare_remaining_ticks =
+        (uint32_t)((uint16_t)(((uint16_t)(next_target & 0xFFFFU)) - cmp16));
     lane.witness_last_arm_target_counter32 = next_target;
     lane.witness_last_arm_target_low16 = (uint16_t)(next_target & 0xFFFFU);
     lane.witness_last_arm_remaining_ticks = OCXO_CADENCE_INTERVAL_TICKS;
@@ -6934,7 +7032,20 @@ static interrupt_perishable_fact_t ocxo_cadence_build_perishable_fact(
   fact.spinidle = sample.spinidle;
   fact.target_counter32 = sample.target_counter32;
   fact.target_low16 = sample.target_low16;
+  fact.arm_counter_low16 = sample.arm_counter_low16;
+  fact.arm_compare_low16 = sample.arm_compare_low16;
+  fact.arm_counter_minus_compare_ticks = sample.arm_counter_minus_compare_ticks;
+  fact.arm_compare_remaining_ticks = sample.arm_compare_remaining_ticks;
   fact.service_counter_low16 = sample.service_counter_low16;
+  fact.service_compare_low16 = sample.service_compare_low16;
+  fact.service_counter_minus_compare_ticks =
+      sample.service_counter_minus_compare_ticks;
+  fact.compare_delta_mod65536_ticks = sample.compare_delta_mod65536_ticks;
+  fact.compare_service_offset_ticks =
+      sample.compare_service_offset_signed_ticks;
+  fact.compare_interpreted_late_ticks = sample.compare_interpreted_late_ticks;
+  fact.compare_early_ticks = sample.compare_early_ticks;
+  fact.compare_arm_to_isr_ticks = sample.compare_arm_to_isr_ticks;
   fact.service_offset_ticks = sample.service_offset_signed_ticks;
   fact.service_offset_abs_ticks = sample.service_offset_abs_ticks;
   fact.interpreted_late_ticks = sample.interpreted_late_ticks;
@@ -7024,6 +7135,7 @@ static void ocxo_cadence_capture_priority0(ocxo_runtime_context_t& ctx,
   packet.kind = ctx.kind;
   packet.csctrl_entry = csctrl_entry;
   packet.service_counter_low16 = ocxo_lane_counter_now(lane);
+  packet.service_compare_low16 = ocxo_lane_compare_counter_now(lane);
   packet.target_counter32 = lane.cadence_next_counter32;
   packet.target_low16 = (uint16_t)(packet.target_counter32 & 0xFFFFU);
   packet.cadence_enabled = lane.cadence_enabled;
@@ -7034,6 +7146,7 @@ static void ocxo_cadence_capture_priority0(ocxo_runtime_context_t& ctx,
   packet.rt_active = rt_at_capture && rt_at_capture->active;
   packet.arm_remaining_ticks = lane.witness_last_arm_remaining_ticks;
   packet.arm_low16 = lane.witness_last_arm_low16;
+  packet.arm_compare_low16 = lane.witness_last_arm_compare_low16;
   packet.arm_dwt_raw = lane.witness_last_arm_dwt_raw;
 
   // Defuse the hardware source immediately.  Compare rearm/stop decisions are
@@ -7074,11 +7187,24 @@ static void interrupt_handoff_process_ocxo(ocxo_runtime_context_t& ctx,
   sample.was_smartzero_current = smartzero_is_current_lane(ctx.kind);
   sample.target_counter32 = packet.target_counter32;
   sample.target_low16 = packet.target_low16;
+  sample.arm_counter_low16 = packet.arm_low16;
+  sample.arm_compare_low16 = packet.arm_compare_low16;
+  sample.arm_counter_minus_compare_ticks =
+      (uint32_t)((uint16_t)(sample.arm_counter_low16 - sample.arm_compare_low16));
+  sample.arm_compare_remaining_ticks =
+      (uint32_t)((uint16_t)(sample.target_low16 - sample.arm_compare_low16));
   sample.service_counter_low16 = packet.service_counter_low16;
+  sample.service_compare_low16 = packet.service_compare_low16;
+  sample.service_counter_minus_compare_ticks =
+      (uint32_t)((uint16_t)(sample.service_counter_low16 - sample.service_compare_low16));
   sample.target_delta_mod65536_ticks =
       (uint32_t)((uint16_t)(sample.service_counter_low16 - sample.target_low16));
+  sample.compare_delta_mod65536_ticks =
+      (uint32_t)((uint16_t)(sample.service_compare_low16 - sample.target_low16));
   sample.service_offset_signed_ticks =
       (int16_t)((uint16_t)sample.target_delta_mod65536_ticks);
+  sample.compare_service_offset_signed_ticks =
+      (int16_t)((uint16_t)sample.compare_delta_mod65536_ticks);
   sample.service_was_early = (sample.service_offset_signed_ticks < 0);
   sample.early_ticks = sample.service_was_early
       ? (uint32_t)(-(int32_t)sample.service_offset_signed_ticks)
@@ -7089,6 +7215,15 @@ static void interrupt_handoff_process_ocxo(ocxo_runtime_context_t& ctx,
   sample.service_offset_abs_ticks = sample.service_was_early
       ? sample.early_ticks
       : sample.interpreted_late_ticks;
+  const bool compare_was_early = (sample.compare_service_offset_signed_ticks < 0);
+  sample.compare_early_ticks = compare_was_early
+      ? (uint32_t)(-(int32_t)sample.compare_service_offset_signed_ticks)
+      : 0U;
+  sample.compare_interpreted_late_ticks = compare_was_early
+      ? 0U
+      : (uint32_t)sample.compare_service_offset_signed_ticks;
+  sample.compare_arm_to_isr_ticks =
+      (uint32_t)((uint16_t)(sample.service_compare_low16 - packet.arm_compare_low16));
   sample.arm_remaining_ticks = packet.arm_remaining_ticks;
   sample.arm_to_isr_ticks =
       (uint32_t)((uint16_t)(sample.service_counter_low16 - packet.arm_low16));

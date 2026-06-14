@@ -196,6 +196,23 @@ struct interrupt_capture_diag_t {
   uint32_t ocxo_arm_to_isr_ticks = 0;
   uint32_t ocxo_arm_to_isr_dwt_cycles = 0;
 
+  // Split-channel compare/counter custody witness.  OCXO1 currently uses
+  // QTimer2 CH0 as the passive counter and CH1 as the active compare rail;
+  // OCXO2 uses one physical CH3 rail.  These fields prove whether the counter
+  // rail and compare rail remain phase-coherent across arm->ISR.
+  uint16_t ocxo_arm_counter_low16 = 0;
+  uint16_t ocxo_arm_compare_low16 = 0;
+  uint32_t ocxo_arm_counter_minus_compare_ticks = 0;
+  uint32_t ocxo_arm_compare_remaining_ticks = 0;
+  uint16_t ocxo_isr_counter_low16 = 0;
+  uint16_t ocxo_isr_compare_low16 = 0;
+  uint32_t ocxo_isr_counter_minus_compare_ticks = 0;
+  uint32_t ocxo_compare_delta_mod65536_ticks = 0;
+  int32_t  ocxo_compare_service_offset_signed_ticks = 0;
+  uint32_t ocxo_compare_interpreted_late_ticks = 0;
+  uint32_t ocxo_compare_early_ticks = 0;
+  uint32_t ocxo_compare_arm_to_isr_ticks = 0;
+
   uint32_t ocxo_perishable_fact_sequence = 0;
   int32_t  ocxo_service_correction_cycles = 0;
   uint32_t ocxo_service_corrected_dwt_at_event = 0;

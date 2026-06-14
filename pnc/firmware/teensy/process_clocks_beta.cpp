@@ -1113,40 +1113,13 @@ static void payload_add_pps_vclock_edge_forensics(
 
   edge.add("authority_dwt_at_edge", available ? e.authority_dwt_at_edge : 0U);
   edge.add("pps_dwt_at_edge", available ? e.pps_dwt_at_edge : 0U);
-  edge.add("vclock_observed_dwt_at_edge",
-           available ? e.vclock_observed_dwt_at_edge : 0U);
-  edge.add("vclock_predicted_dwt_at_edge",
-           available ? e.vclock_predicted_dwt_at_edge : 0U);
-  edge.add("pps_projected_vclock_dwt_at_edge",
-           available ? e.pps_projected_vclock_dwt_at_edge : 0U);
-
   edge.add("decision", pps_vclock_edge_decision_name(available ? e.decision : 0U));
   edge.add("decision_id", available ? e.decision : 0U);
   edge.add("invalid_mask", available ? e.invalid_mask : 0U);
-  edge.add("gate_cycles", available ? e.gate_cycles : 0U);
-  edge.add("agreement_span_cycles", available ? e.agreement_span_cycles : 0U);
-
-  edge.add("observed_phase_valid", available && e.observed_phase_valid);
-  edge.add("learned_phase_valid", available && e.learned_phase_valid);
-  edge.add("observed_phase_cycles", available ? e.observed_phase_cycles : 0U);
-  edge.add("learned_phase_cycles", available ? e.learned_phase_cycles : 0U);
-
   edge.add("authority_minus_pps_cycles",
            available ? e.authority_minus_pps_cycles : 0);
-  edge.add("authority_minus_vclock_observed_cycles",
-           available ? e.authority_minus_vclock_observed_cycles : 0);
-  edge.add("authority_minus_prediction_cycles",
-           available ? e.authority_minus_prediction_cycles : 0);
-  edge.add("prediction_minus_pps_projected_cycles",
-           available ? e.prediction_minus_pps_projected_cycles : 0);
-  edge.add("pps_projected_minus_observed_cycles",
-           available ? e.pps_projected_minus_observed_cycles : 0);
-  edge.add("observed_minus_prediction_cycles",
-           available ? e.observed_minus_prediction_cycles : 0);
-
   edge.add("counter32_at_edge", available ? e.counter32_at_edge : 0U);
   edge.add("ch3_at_edge", available ? (uint32_t)e.ch3_at_edge : 0U);
-  edge.add("dwt_cycles_per_second", available ? e.dwt_cycles_per_second : 0U);
   edge.add("dwt_cycles_between_edges",
            available ? e.dwt_cycles_between_edges : 0U);
   edge.add("effective_dwt_cycles_per_second",
@@ -1161,12 +1134,6 @@ static void payload_add_pps_vclock_edge_forensics(
   edge.add("mapped_gnss_ns_at_edge",
            available ? e.mapped_gnss_ns_at_edge : 0ULL);
   edge.add("gnss_self_error_ns", available ? e.gnss_self_error_ns : 0LL);
-  edge.add("counter_identity_valid", available && e.counter_identity_valid);
-  edge.add("counter_identity_gnss_ns_at_edge",
-           available ? e.counter_identity_gnss_ns_at_edge : 0ULL);
-  edge.add("counter_identity_minus_expected_ns",
-           available ? e.counter_identity_minus_expected_ns : 0LL);
-
   parent.add_object("pps_vclock_edge", edge);
 }
 
@@ -1212,7 +1179,6 @@ static void payload_add_lane_forensics_object(Payload& parent,
   gate.add("effective_cycles", valid ? f.dwt_interval_effective_cycles : 0U);
   gate.add("residual_cycles", valid ? f.dwt_interval_residual_cycles : 0);
   gate.add("threshold_cycles", valid ? f.dwt_interval_gate_threshold_cycles : 0U);
-  gate.add("accept_count", valid ? f.dwt_interval_accept_count : 0U);
   gate.add("reject_count", valid ? f.dwt_interval_reject_count : 0U);
   gate.add("resync_applied", valid && f.dwt_interval_resync_applied);
   gate.add("resync_count", valid ? f.dwt_interval_resync_count : 0U);
@@ -1250,10 +1216,6 @@ static void payload_add_lane_forensics_object(Payload& parent,
                 valid ? f.dwt_yardstick_observed_interval_cycles : 0U);
   yardstick.add("inferred_minus_observed_cycles",
                 valid ? f.dwt_yardstick_inferred_minus_observed_cycles : 0);
-  yardstick.add("inferred_endpoint_dwt",
-                valid ? f.dwt_yardstick_inferred_endpoint_dwt : 0U);
-  yardstick.add("inferred_endpoint_frac_q16",
-                valid ? f.dwt_yardstick_inferred_endpoint_frac_q16 : 0U);
   yardstick.add("endpoint_minus_observed_cycles",
                 valid ? f.dwt_yardstick_endpoint_minus_observed_cycles : 0);
   yardstick.add("gate_threshold_cycles",
@@ -1263,10 +1225,6 @@ static void payload_add_lane_forensics_object(Payload& parent,
   yardstick.add("gate_excursion_count",
                 valid ? f.dwt_yardstick_gate_excursion_count : 0U);
   yardstick.add("authority", valid && f.dwt_yardstick_authority);
-  yardstick.add("auth_endpoint_dwt",
-                valid ? f.dwt_yardstick_auth_endpoint_dwt : 0U);
-  yardstick.add("auth_endpoint_frac_q16",
-                valid ? f.dwt_yardstick_auth_endpoint_frac_q16 : 0U);
   yardstick.add("auth_error_cycles",
                 valid ? f.dwt_yardstick_auth_error_cycles : 0);
   yardstick.add("auth_anchor_applied",
@@ -1277,16 +1235,77 @@ static void payload_add_lane_forensics_object(Payload& parent,
 }
 
 static void payload_add_ocxo_service_object(Payload& parent,
+                                            interrupt_subscriber_kind_t kind,
                                             bool valid,
                                             const clocks_alpha_lane_forensics_t& f) {
   Payload service;
+  const interrupt_capture_diag_t* direct_diag = valid ? interrupt_last_diag(kind) : nullptr;
+  const bool direct_valid = direct_diag && direct_diag->enabled &&
+                            direct_diag->kind == kind &&
+                            direct_diag->counter32_at_event == f.last_event_counter32;
 
-  // Tiny service/counter ladder proof only.  Full OCXO compare-service timing
-  // remains available through focused interrupt/CLOCKS reports.
+  // Excursion hunt surface.  Keep this object numerically compact, but publish
+  // the compare-service and perishable-fact custody fields needed to decide
+  // whether a bad raw interval was born in compare presentation, low-word
+  // generation math, or deferred fact association.
   service.add("class", valid ? f.diag_service_class : 0U);
   service.add("offset_ticks", valid ? f.diag_service_offset_signed_ticks : 0);
+  service.add("offset_abs_ticks", valid ? f.diag_service_offset_abs_ticks : 0U);
+  service.add("interpreted_late_ticks", valid ? f.diag_interpreted_late_ticks : 0U);
+  service.add("early_ticks", valid ? f.diag_early_ticks : 0U);
+  service.add("target_delta_mod65536_ticks",
+              valid ? f.diag_target_delta_mod65536_ticks : 0U);
+  service.add("arm_remaining_ticks", valid ? f.diag_arm_remaining_ticks : 0U);
   service.add("arm_to_isr_ticks", valid ? f.diag_arm_to_isr_ticks : 0U);
-  service.add("last_counter_delta_ticks", valid ? f.diag_last_counter_delta_ticks : 0U);
+  service.add("arm_to_isr_dwt_cycles",
+              valid ? f.diag_arm_to_isr_dwt_cycles : 0U);
+
+  // Counter-vs-compare rail courtroom.  These are read directly from the
+  // latest process_interrupt diagnostic because Alpha's durable lane snapshot
+  // intentionally stays smaller than this temporary split-channel autopsy.
+  service.add("arm_counter_low16",
+              direct_valid ? (uint32_t)direct_diag->ocxo_arm_counter_low16 : 0U);
+  service.add("arm_compare_low16",
+              direct_valid ? (uint32_t)direct_diag->ocxo_arm_compare_low16 : 0U);
+  service.add("arm_counter_minus_compare_ticks",
+              direct_valid ? direct_diag->ocxo_arm_counter_minus_compare_ticks : 0U);
+  service.add("arm_compare_remaining_ticks",
+              direct_valid ? direct_diag->ocxo_arm_compare_remaining_ticks : 0U);
+  service.add("isr_counter_low16",
+              direct_valid ? (uint32_t)direct_diag->ocxo_isr_counter_low16 : 0U);
+  service.add("isr_compare_low16",
+              direct_valid ? (uint32_t)direct_diag->ocxo_isr_compare_low16 : 0U);
+  service.add("isr_counter_minus_compare_ticks",
+              direct_valid ? direct_diag->ocxo_isr_counter_minus_compare_ticks : 0U);
+  service.add("compare_target_delta_mod65536_ticks",
+              direct_valid ? direct_diag->ocxo_compare_delta_mod65536_ticks : 0U);
+  service.add("compare_offset_ticks",
+              direct_valid ? direct_diag->ocxo_compare_service_offset_signed_ticks : 0);
+  service.add("compare_interpreted_late_ticks",
+              direct_valid ? direct_diag->ocxo_compare_interpreted_late_ticks : 0U);
+  service.add("compare_early_ticks",
+              direct_valid ? direct_diag->ocxo_compare_early_ticks : 0U);
+  service.add("compare_arm_to_isr_ticks",
+              direct_valid ? direct_diag->ocxo_compare_arm_to_isr_ticks : 0U);
+
+  service.add("perishable_fact_sequence",
+              valid ? f.diag_perishable_fact_sequence : 0U);
+  service.add("service_correction_cycles",
+              valid ? f.diag_service_correction_cycles : 0);
+  service.add("service_corrected_dwt_at_event",
+              valid ? f.diag_service_corrected_dwt_at_event : 0U);
+  service.add("fact_ring_overflow_count",
+              valid ? f.diag_fact_ring_overflow_count : 0U);
+  service.add("counter_delta_violation_count",
+              valid ? f.diag_counter_delta_violation_count : 0U);
+  service.add("last_bad_counter_delta",
+              valid ? f.diag_last_bad_counter_delta : 0U);
+  service.add("last_counter_delta_ticks",
+              valid ? f.diag_last_counter_delta_ticks : 0U);
+  service.add("sample_dwt_at_event",
+              valid ? f.diag_sample_dwt_at_event : 0U);
+  service.add("sample_counter32_at_event",
+              valid ? f.diag_sample_counter32_at_event : 0U);
   parent.add_object("service", service);
 }
 
@@ -1546,10 +1565,18 @@ static void payload_add_ocxo_forensics(Payload& p,
                                        pps_clock_interval_ns,
                                        pps_fast_residual_ns);
 
-  payload_add_ocxo_cycle_residual_diag_object(lane, cycle_diag);
+  // Temporarily suppress the same-yardstick residual object in
+  // TIMEBASE_FORENSICS to make room for the OCXO compare-service excursion
+  // dossier below.  The scalar science residual remains in pps_residual, and
+  // the static prediction/object rails still expose the underlying cycles.
+  (void)cycle_diag;
 
   payload_add_lane_forensics_object(lane, forensics_valid, f);
-  payload_add_ocxo_service_object(lane, forensics_valid, f);
+  const interrupt_subscriber_kind_t service_kind =
+      (key && key[4] == '1')
+          ? interrupt_subscriber_kind_t::OCXO1
+          : interrupt_subscriber_kind_t::OCXO2;
+  payload_add_ocxo_service_object(lane, service_kind, forensics_valid, f);
   p.add_object(key, lane);
 }
 
