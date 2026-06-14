@@ -526,6 +526,10 @@ struct clocks_pps_vclock_edge_forensics_t {
   uint64_t expected_gnss_ns_at_edge;
   uint64_t mapped_gnss_ns_at_edge;
   int64_t  gnss_self_error_ns;
+
+  bool     counter_identity_valid;
+  uint64_t counter_identity_gnss_ns_at_edge;
+  int64_t  counter_identity_minus_expected_ns;
 };
 
 bool clocks_alpha_pps_vclock_edge_forensics(

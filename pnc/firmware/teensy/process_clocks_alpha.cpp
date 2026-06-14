@@ -183,7 +183,9 @@ static void alpha_pps_vclock_edge_forensics_publish(
     uint64_t mapped_gnss_ns,
     int64_t gnss_self_error_ns,
     uint32_t dwt_cycles_between_edges,
-    uint32_t effective_dwt_cycles_per_second) {
+    uint32_t effective_dwt_cycles_per_second,
+    bool counter_identity_valid,
+    uint64_t counter_identity_ns) {
   const uint32_t prior_update_count = g_pps_vclock_edge_forensics.update_count;
   const pps_vclock_edge_authority_t& a = snap.vclock_edge_authority;
 
@@ -235,6 +237,15 @@ static void alpha_pps_vclock_edge_forensics_publish(
   local.gnss_self_error_ok = gnss_self_map_valid &&
       alpha_pps_vclock_abs_i64(gnss_self_error_ns) <=
           (uint64_t)local.gnss_self_error_gate_ns;
+
+  local.counter_identity_valid = counter_identity_valid;
+  local.counter_identity_gnss_ns_at_edge =
+      counter_identity_valid ? counter_identity_ns : 0ULL;
+  local.counter_identity_minus_expected_ns = counter_identity_valid
+      ? ((counter_identity_ns >= expected_gnss_ns)
+             ? (int64_t)(counter_identity_ns - expected_gnss_ns)
+             : -(int64_t)(expected_gnss_ns - counter_identity_ns))
+      : 0LL;
 
   g_pps_vclock_edge_forensics_seq++;
   clocks_alpha_dmb();
@@ -4207,20 +4218,24 @@ static void update_pps_vclock_bridge_anchor(const pps_edge_snapshot_t& snap) {
 
   const uint32_t dwt_between_pps = snap.dwt_at_edge - g_prev_pps_vclock_dwt_at_edge;
 
-  uint64_t vclock_ns = 0;
-  if (!alpha_ticks64_project_counter32(time_clock_id_t::VCLOCK,
-                                       snap.counter32_at_edge,
-                                       nullptr,
-                                       &vclock_ns)) {
-    return;
-  }
+  uint64_t counter_identity_ns = 0;
+  const bool counter_identity_valid =
+      alpha_ticks64_project_counter32(time_clock_id_t::VCLOCK,
+                                      snap.counter32_at_edge,
+                                      nullptr,
+                                      &counter_identity_ns);
+
+  // PPS/VCLOCK GNSS identity is tautological: each selected PPS/VCLOCK edge is
+  // the next integer GNSS second.  The counter-derived value is retained as a
+  // courtroom witness, but the canonical GNSS label is the exact +1e9 ledger.
+  const uint64_t previous_vclock_ns = g_gnss_ns_at_pps_vclock;
+  const uint64_t vclock_ns = previous_vclock_ns + NS_PER_SECOND_U64;
 
   const uint32_t effective_dwt_cycles_per_second =
       g_pps_dwt_cycles_between_edges_valid
           ? (uint32_t)g_pps_dwt_cycles_between_edges
           : dwt_between_pps;
 
-  const uint64_t previous_vclock_ns = g_gnss_ns_at_pps_vclock;
   const bool gnss_self_map_valid =
       g_prev_pps_vclock_dwt_at_edge_valid &&
       effective_dwt_cycles_per_second != 0U;
@@ -4255,7 +4270,9 @@ static void update_pps_vclock_bridge_anchor(const pps_edge_snapshot_t& snap) {
                                            mapped_gnss_ns,
                                            gnss_self_error_ns,
                                            dwt_between_pps,
-                                           effective_dwt_cycles_per_second);
+                                           effective_dwt_cycles_per_second,
+                                           counter_identity_valid,
+                                           counter_identity_ns);
 
   g_dwt_cycles_between_pps_vclock = effective_dwt_cycles_per_second;
   g_dwt_cycle_count_total += (uint64_t)effective_dwt_cycles_per_second;
