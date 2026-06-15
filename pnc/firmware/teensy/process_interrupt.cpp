@@ -6469,28 +6469,69 @@ struct qtimer1_vclock_capture_packet_t {
   spinidle_isr_capture_t spinidle{};
 };
 
-struct ocxo_capture_packet_t {
-  uint32_t sequence = 0;
+struct ocxo_1khz_tend_capture_t {
+  // Priority-0-only 1 kHz gear-tooth record.  This structure maintains the
+  // local +10,000 tick ladder and may feed SmartZero, but it is never the
+  // subscriber-facing OCXO one-second capture contract.
   uint32_t isr_entry_dwt_raw = 0;
-  interrupt_subscriber_kind_t kind = interrupt_subscriber_kind_t::NONE;
   uint32_t capture_exit_dwt = 0;
   spinidle_isr_capture_t spinidle{};
 
-  // Raw/near-raw capture facts.  Priority 0 deliberately avoids service
-  // classification, event-DWT authorship, SmartZero decisions, synthetic
-  // identity updates, and rearm policy.
   uint32_t csctrl_entry = 0;
   uint16_t service_counter_low16 = 0;
   uint16_t service_compare_low16 = 0;
   uint32_t target_counter32 = 0;
   uint16_t target_low16 = 0;
-  bool cadence_enabled = false;
   bool cadence_armed = false;
   bool lane_active = false;
-  bool rt_present = false;
   bool rt_active = false;
-  bool was_smartzero_current = false;
-  bool one_second_due = false;
+  uint32_t tick_mod_at_event = 0;
+  uint32_t arm_remaining_ticks = 0;
+  uint16_t arm_low16 = 0;
+  uint16_t arm_compare_low16 = 0;
+  uint32_t arm_dwt_raw = 0;
+  uint32_t csctrl_after_program = 0;
+};
+
+struct ocxo_1khz_sample_capture_packet_t {
+  // Handoff packet for SmartZero/acquisition samples.  It is deliberately not
+  // shaped like the one-second OCXO edge packet, so a millisecond sample
+  // cannot masquerade as subscriber timing truth.
+  uint32_t sequence = 0;
+  uint32_t isr_entry_dwt_raw = 0;
+  uint32_t capture_exit_dwt = 0;
+  spinidle_isr_capture_t spinidle{};
+
+  uint32_t csctrl_entry = 0;
+  uint16_t service_counter_low16 = 0;
+  uint16_t service_compare_low16 = 0;
+  uint32_t target_counter32 = 0;
+  uint16_t target_low16 = 0;
+  bool cadence_armed = false;
+  uint32_t tick_mod_at_event = 0;
+  uint32_t arm_remaining_ticks = 0;
+  uint16_t arm_low16 = 0;
+  uint16_t arm_compare_low16 = 0;
+  uint32_t arm_dwt_raw = 0;
+  uint32_t csctrl_after_program = 0;
+};
+
+struct ocxo_one_second_capture_packet_t {
+  // Subscriber-facing OCXO one-second capture packet.  This packet is born
+  // only on the exact 1000th +10,000 tick tooth of the local OCXO ladder.
+  // It carries no SmartZero/cadence-purpose flags; it is the special event.
+  uint32_t sequence = 0;
+  uint32_t isr_entry_dwt_raw = 0;
+  uint32_t capture_exit_dwt = 0;
+  spinidle_isr_capture_t spinidle{};
+
+  uint32_t csctrl_entry = 0;
+  uint16_t service_counter_low16 = 0;
+  uint16_t service_compare_low16 = 0;
+  uint32_t target_counter32 = 0;
+  uint16_t target_low16 = 0;
+  bool cadence_armed = false;
+  bool had_active_rt = false;
   uint32_t tick_mod_at_event = 0;
   uint32_t arm_remaining_ticks = 0;
   uint16_t arm_low16 = 0;
@@ -6532,10 +6573,18 @@ static interrupt_capture_ring_t<qtimer1_vclock_capture_packet_t,
 static interrupt_capture_ring_t<qtimer1_ch2_capture_packet_t,
                                 HANDOFF_QTIMER1_CH2_RING_SIZE>
     g_qtimer1_ch2_capture_ring;
-static interrupt_capture_ring_t<ocxo_capture_packet_t, HANDOFF_OCXO_RING_SIZE>
-    g_ocxo1_capture_ring;
-static interrupt_capture_ring_t<ocxo_capture_packet_t, HANDOFF_OCXO_RING_SIZE>
-    g_ocxo2_capture_ring;
+static interrupt_capture_ring_t<ocxo_1khz_sample_capture_packet_t,
+                                HANDOFF_OCXO_RING_SIZE>
+    g_ocxo1_1khz_sample_capture_ring;
+static interrupt_capture_ring_t<ocxo_1khz_sample_capture_packet_t,
+                                HANDOFF_OCXO_RING_SIZE>
+    g_ocxo2_1khz_sample_capture_ring;
+static interrupt_capture_ring_t<ocxo_one_second_capture_packet_t,
+                                HANDOFF_OCXO_RING_SIZE>
+    g_ocxo1_one_second_capture_ring;
+static interrupt_capture_ring_t<ocxo_one_second_capture_packet_t,
+                                HANDOFF_OCXO_RING_SIZE>
+    g_ocxo2_one_second_capture_ring;
 static interrupt_capture_ring_t<pps_capture_packet_t, HANDOFF_PPS_RING_SIZE>
     g_pps_capture_ring;
 
@@ -6641,8 +6690,10 @@ static bool interrupt_handoff_any_pending(void) {
   return g_qtimer1_ch1_capture_ring.count != 0 ||
          g_qtimer1_vclock_capture_ring.count != 0 ||
          g_qtimer1_ch2_capture_ring.count != 0 ||
-         g_ocxo1_capture_ring.count != 0 ||
-         g_ocxo2_capture_ring.count != 0 ||
+         g_ocxo1_1khz_sample_capture_ring.count != 0 ||
+         g_ocxo2_1khz_sample_capture_ring.count != 0 ||
+         g_ocxo1_one_second_capture_ring.count != 0 ||
+         g_ocxo2_one_second_capture_ring.count != 0 ||
          g_pps_capture_ring.count != 0;
 }
 
@@ -6711,15 +6762,29 @@ static void interrupt_handoff_process_qtimer1_vclock(
     const qtimer1_vclock_capture_packet_t& packet);
 static void interrupt_handoff_process_qtimer1_ch2(
     const qtimer1_ch2_capture_packet_t& packet);
-static void interrupt_handoff_process_ocxo(ocxo_runtime_context_t& ctx,
-                                           const ocxo_capture_packet_t& packet);
+static void interrupt_handoff_process_ocxo_1khz_sample(
+    ocxo_runtime_context_t& ctx,
+    const ocxo_1khz_sample_capture_packet_t& packet);
+static void interrupt_handoff_process_ocxo_one_second(
+    ocxo_runtime_context_t& ctx,
+    const ocxo_one_second_capture_packet_t& packet);
 static void interrupt_handoff_process_pps(const pps_capture_packet_t& packet);
 
 static bool interrupt_handoff_drain_one_oldest(uint32_t handoff_entry_dwt) {
   bool have = false;
   uint32_t best_seq = 0xFFFFFFFFUL;
   uint32_t seq = 0;
-  enum source_t : uint8_t { SRC_NONE, SRC_CH1, SRC_VCLOCK, SRC_CH2, SRC_OCXO1, SRC_OCXO2, SRC_PPS };
+  enum source_t : uint8_t {
+    SRC_NONE,
+    SRC_CH1,
+    SRC_VCLOCK,
+    SRC_CH2,
+    SRC_OCXO1_1KHZ,
+    SRC_OCXO1_1S,
+    SRC_OCXO2_1KHZ,
+    SRC_OCXO2_1S,
+    SRC_PPS
+  };
   source_t best = SRC_NONE;
 
   if (capture_ring_peek_sequence(g_qtimer1_ch1_capture_ring, seq) && seq < best_seq) {
@@ -6731,11 +6796,17 @@ static bool interrupt_handoff_drain_one_oldest(uint32_t handoff_entry_dwt) {
   if (capture_ring_peek_sequence(g_qtimer1_ch2_capture_ring, seq) && seq < best_seq) {
     best_seq = seq; best = SRC_CH2; have = true;
   }
-  if (capture_ring_peek_sequence(g_ocxo1_capture_ring, seq) && seq < best_seq) {
-    best_seq = seq; best = SRC_OCXO1; have = true;
+  if (capture_ring_peek_sequence(g_ocxo1_1khz_sample_capture_ring, seq) && seq < best_seq) {
+    best_seq = seq; best = SRC_OCXO1_1KHZ; have = true;
   }
-  if (capture_ring_peek_sequence(g_ocxo2_capture_ring, seq) && seq < best_seq) {
-    best_seq = seq; best = SRC_OCXO2; have = true;
+  if (capture_ring_peek_sequence(g_ocxo1_one_second_capture_ring, seq) && seq < best_seq) {
+    best_seq = seq; best = SRC_OCXO1_1S; have = true;
+  }
+  if (capture_ring_peek_sequence(g_ocxo2_1khz_sample_capture_ring, seq) && seq < best_seq) {
+    best_seq = seq; best = SRC_OCXO2_1KHZ; have = true;
+  }
+  if (capture_ring_peek_sequence(g_ocxo2_one_second_capture_ring, seq) && seq < best_seq) {
+    best_seq = seq; best = SRC_OCXO2_1S; have = true;
   }
   if (capture_ring_peek_sequence(g_pps_capture_ring, seq) && seq < best_seq) {
     best_seq = seq; best = SRC_PPS; have = true;
@@ -6786,29 +6857,57 @@ static bool interrupt_handoff_drain_one_oldest(uint32_t handoff_entry_dwt) {
       }
       break;
     }
-    case SRC_OCXO1: {
-      ocxo_capture_packet_t packet{};
-      if (capture_ring_pop_for_handoff(g_ocxo1_capture_ring,
+    case SRC_OCXO1_1KHZ: {
+      ocxo_1khz_sample_capture_packet_t packet{};
+      if (capture_ring_pop_for_handoff(g_ocxo1_1khz_sample_capture_ring,
                                        g_handoff_ocxo1,
                                        packet)) {
         interrupt_handoff_note_source_entry(g_handoff_ocxo1,
                                             packet.isr_entry_dwt_raw,
                                             handoff_entry_dwt);
-        interrupt_handoff_process_ocxo(g_ocxo1_ctx, packet);
+        interrupt_handoff_process_ocxo_1khz_sample(g_ocxo1_ctx, packet);
         interrupt_handoff_note_source_body(g_handoff_ocxo1, body_start);
         return true;
       }
       break;
     }
-    case SRC_OCXO2: {
-      ocxo_capture_packet_t packet{};
-      if (capture_ring_pop_for_handoff(g_ocxo2_capture_ring,
+    case SRC_OCXO1_1S: {
+      ocxo_one_second_capture_packet_t packet{};
+      if (capture_ring_pop_for_handoff(g_ocxo1_one_second_capture_ring,
+                                       g_handoff_ocxo1,
+                                       packet)) {
+        interrupt_handoff_note_source_entry(g_handoff_ocxo1,
+                                            packet.isr_entry_dwt_raw,
+                                            handoff_entry_dwt);
+        interrupt_handoff_process_ocxo_one_second(g_ocxo1_ctx, packet);
+        interrupt_handoff_note_source_body(g_handoff_ocxo1, body_start);
+        return true;
+      }
+      break;
+    }
+    case SRC_OCXO2_1KHZ: {
+      ocxo_1khz_sample_capture_packet_t packet{};
+      if (capture_ring_pop_for_handoff(g_ocxo2_1khz_sample_capture_ring,
                                        g_handoff_ocxo2,
                                        packet)) {
         interrupt_handoff_note_source_entry(g_handoff_ocxo2,
                                             packet.isr_entry_dwt_raw,
                                             handoff_entry_dwt);
-        interrupt_handoff_process_ocxo(g_ocxo2_ctx, packet);
+        interrupt_handoff_process_ocxo_1khz_sample(g_ocxo2_ctx, packet);
+        interrupt_handoff_note_source_body(g_handoff_ocxo2, body_start);
+        return true;
+      }
+      break;
+    }
+    case SRC_OCXO2_1S: {
+      ocxo_one_second_capture_packet_t packet{};
+      if (capture_ring_pop_for_handoff(g_ocxo2_one_second_capture_ring,
+                                       g_handoff_ocxo2,
+                                       packet)) {
+        interrupt_handoff_note_source_entry(g_handoff_ocxo2,
+                                            packet.isr_entry_dwt_raw,
+                                            handoff_entry_dwt);
+        interrupt_handoff_process_ocxo_one_second(g_ocxo2_ctx, packet);
         interrupt_handoff_note_source_body(g_handoff_ocxo2, body_start);
         return true;
       }
@@ -7025,6 +7124,128 @@ static void ocxo_cadence_enqueue_fact(
   }
 }
 
+static void ocxo_1khz_packet_from_tend_capture(
+    ocxo_1khz_sample_capture_packet_t& packet,
+    const ocxo_1khz_tend_capture_t& tick) {
+  packet.isr_entry_dwt_raw = tick.isr_entry_dwt_raw;
+  packet.capture_exit_dwt = tick.capture_exit_dwt;
+  packet.spinidle = tick.spinidle;
+  packet.csctrl_entry = tick.csctrl_entry;
+  packet.service_counter_low16 = tick.service_counter_low16;
+  packet.service_compare_low16 = tick.service_compare_low16;
+  packet.target_counter32 = tick.target_counter32;
+  packet.target_low16 = tick.target_low16;
+  packet.cadence_armed = tick.cadence_armed;
+  packet.tick_mod_at_event = tick.tick_mod_at_event;
+  packet.arm_remaining_ticks = tick.arm_remaining_ticks;
+  packet.arm_low16 = tick.arm_low16;
+  packet.arm_compare_low16 = tick.arm_compare_low16;
+  packet.arm_dwt_raw = tick.arm_dwt_raw;
+  packet.csctrl_after_program = tick.csctrl_after_program;
+}
+
+static void ocxo_one_second_packet_from_tend_capture(
+    ocxo_one_second_capture_packet_t& packet,
+    const ocxo_1khz_tend_capture_t& tick) {
+  packet.isr_entry_dwt_raw = tick.isr_entry_dwt_raw;
+  packet.capture_exit_dwt = tick.capture_exit_dwt;
+  packet.spinidle = tick.spinidle;
+  packet.csctrl_entry = tick.csctrl_entry;
+  packet.service_counter_low16 = tick.service_counter_low16;
+  packet.service_compare_low16 = tick.service_compare_low16;
+  packet.target_counter32 = tick.target_counter32;
+  packet.target_low16 = tick.target_low16;
+  packet.cadence_armed = tick.cadence_armed;
+  packet.had_active_rt = tick.rt_active && tick.lane_active;
+  packet.tick_mod_at_event = tick.tick_mod_at_event;
+  packet.arm_remaining_ticks = tick.arm_remaining_ticks;
+  packet.arm_low16 = tick.arm_low16;
+  packet.arm_compare_low16 = tick.arm_compare_low16;
+  packet.arm_dwt_raw = tick.arm_dwt_raw;
+  packet.csctrl_after_program = tick.csctrl_after_program;
+}
+
+template <typename PacketT>
+static void ocxo_fill_common_handoff_sample(
+    ocxo_runtime_context_t& ctx,
+    const PacketT& packet,
+    ocxo_cadence_isr_sample_t& sample) {
+  sample.rt = ocxo_runtime_for(ctx);
+  sample.isr_entry_dwt_raw = packet.isr_entry_dwt_raw;
+  sample.spinidle = packet.spinidle;
+  sample.isr_csctrl_entry = packet.csctrl_entry;
+  sample.had_armed = packet.cadence_armed;
+  sample.target_counter32 = packet.target_counter32;
+  sample.target_low16 = packet.target_low16;
+  sample.arm_counter_low16 = packet.arm_low16;
+  sample.arm_compare_low16 = packet.arm_compare_low16;
+  sample.arm_counter_minus_compare_ticks =
+      (uint32_t)((uint16_t)(sample.arm_counter_low16 - sample.arm_compare_low16));
+  sample.arm_compare_remaining_ticks =
+      (uint32_t)((uint16_t)(sample.target_low16 - sample.arm_compare_low16));
+  sample.service_counter_low16 = packet.service_counter_low16;
+  sample.service_compare_low16 = packet.service_compare_low16;
+  sample.service_counter_minus_compare_ticks =
+      (uint32_t)((uint16_t)(sample.service_counter_low16 - sample.service_compare_low16));
+  sample.target_delta_mod65536_ticks =
+      (uint32_t)((uint16_t)(sample.service_counter_low16 - sample.target_low16));
+  sample.compare_delta_mod65536_ticks =
+      (uint32_t)((uint16_t)(sample.service_compare_low16 - sample.target_low16));
+  sample.service_offset_signed_ticks =
+      (int16_t)((uint16_t)sample.target_delta_mod65536_ticks);
+  sample.compare_service_offset_signed_ticks =
+      (int16_t)((uint16_t)sample.compare_delta_mod65536_ticks);
+  sample.service_was_early = (sample.service_offset_signed_ticks < 0);
+  sample.early_ticks = sample.service_was_early
+      ? (uint32_t)(-(int32_t)sample.service_offset_signed_ticks)
+      : 0U;
+  sample.interpreted_late_ticks = sample.service_was_early
+      ? 0U
+      : (uint32_t)sample.service_offset_signed_ticks;
+  sample.service_offset_abs_ticks = sample.service_was_early
+      ? sample.early_ticks
+      : sample.interpreted_late_ticks;
+  const bool compare_was_early = (sample.compare_service_offset_signed_ticks < 0);
+  sample.compare_early_ticks = compare_was_early
+      ? (uint32_t)(-(int32_t)sample.compare_service_offset_signed_ticks)
+      : 0U;
+  sample.compare_interpreted_late_ticks = compare_was_early
+      ? 0U
+      : (uint32_t)sample.compare_service_offset_signed_ticks;
+  sample.compare_arm_to_isr_ticks =
+      (uint32_t)((uint16_t)(sample.service_compare_low16 - packet.arm_compare_low16));
+  sample.arm_dwt_raw = packet.arm_dwt_raw;
+  sample.arm_remaining_ticks = packet.arm_remaining_ticks;
+  sample.arm_to_isr_ticks =
+      (uint32_t)((uint16_t)(sample.service_counter_low16 - packet.arm_low16));
+  sample.arm_to_isr_dwt_cycles =
+      sample.isr_entry_dwt_raw - packet.arm_dwt_raw;
+  sample.event_dwt = qtimer_event_dwt_from_isr_entry_raw(sample.isr_entry_dwt_raw);
+  sample.isr_csctrl_after_program = packet.csctrl_after_program;
+}
+
+static ocxo_cadence_isr_sample_t ocxo_sample_from_1khz_capture(
+    ocxo_runtime_context_t& ctx,
+    const ocxo_1khz_sample_capture_packet_t& packet) {
+  ocxo_cadence_isr_sample_t sample{};
+  ocxo_fill_common_handoff_sample(ctx, packet, sample);
+  sample.had_active_rt = false;
+  sample.was_smartzero_current = true;
+  sample.one_second_due = false;
+  return sample;
+}
+
+static ocxo_cadence_isr_sample_t ocxo_sample_from_one_second_capture(
+    ocxo_runtime_context_t& ctx,
+    const ocxo_one_second_capture_packet_t& packet) {
+  ocxo_cadence_isr_sample_t sample{};
+  ocxo_fill_common_handoff_sample(ctx, packet, sample);
+  sample.had_active_rt = packet.had_active_rt;
+  sample.was_smartzero_current = false;
+  sample.one_second_due = true;
+  return sample;
+}
+
 static void ocxo_cadence_capture_priority0(ocxo_runtime_context_t& ctx,
                                            uint32_t isr_entry_dwt_raw) {
   ocxo_lane_t& lane = *ctx.lane;
@@ -7084,27 +7305,22 @@ static void ocxo_cadence_capture_priority0(ocxo_runtime_context_t& ctx,
       (!was_smartzero_current && lane.cadence_epoch_valid && event_tick_mod == 0U);
   const bool keep_running = lane.active || was_smartzero_current;
 
-  ocxo_capture_packet_t packet{};
-  packet.isr_entry_dwt_raw = isr_entry_dwt_raw;
-  packet.kind = ctx.kind;
-  packet.csctrl_entry = csctrl_entry;
-  packet.service_counter_low16 = service_counter_low16;
-  packet.service_compare_low16 = service_compare_low16;
-  packet.target_counter32 = target_counter32;
-  packet.target_low16 = target_low16;
-  packet.cadence_enabled = lane.cadence_enabled;
-  packet.cadence_armed = lane.cadence_armed;
-  packet.lane_active = lane.active;
+  ocxo_1khz_tend_capture_t tick{};
+  tick.isr_entry_dwt_raw = isr_entry_dwt_raw;
+  tick.csctrl_entry = csctrl_entry;
+  tick.service_counter_low16 = service_counter_low16;
+  tick.service_compare_low16 = service_compare_low16;
+  tick.target_counter32 = target_counter32;
+  tick.target_low16 = target_low16;
+  tick.cadence_armed = lane.cadence_armed;
+  tick.lane_active = lane.active;
   interrupt_subscriber_runtime_t* const rt_at_capture = ocxo_runtime_for(ctx);
-  packet.rt_present = (rt_at_capture != nullptr);
-  packet.rt_active = rt_at_capture && rt_at_capture->active;
-  packet.was_smartzero_current = was_smartzero_current;
-  packet.one_second_due = one_second_due;
-  packet.tick_mod_at_event = event_tick_mod;
-  packet.arm_remaining_ticks = lane.witness_last_arm_remaining_ticks;
-  packet.arm_low16 = lane.witness_last_arm_low16;
-  packet.arm_compare_low16 = lane.witness_last_arm_compare_low16;
-  packet.arm_dwt_raw = lane.witness_last_arm_dwt_raw;
+  tick.rt_active = rt_at_capture && rt_at_capture->active;
+  tick.tick_mod_at_event = event_tick_mod;
+  tick.arm_remaining_ticks = lane.witness_last_arm_remaining_ticks;
+  tick.arm_low16 = lane.witness_last_arm_low16;
+  tick.arm_compare_low16 = lane.witness_last_arm_compare_low16;
+  tick.arm_dwt_raw = lane.witness_last_arm_dwt_raw;
 
   // Defuse the source and immediately advance the OCXO gear train in priority
   // 0.  The armed compare target is the only authority for the lane's 32-bit
@@ -7229,26 +7445,49 @@ static void ocxo_cadence_capture_priority0(ocxo_runtime_context_t& ctx,
     lane.witness_armed = false;
     lane.cadence_last_reason = OCXO_CADENCE_REASON_STOP;
   }
-  packet.csctrl_after_program = lane.module->CH[lane.compare_channel].CSCTRL;
+  tick.csctrl_after_program = lane.module->CH[lane.compare_channel].CSCTRL;
 
   // SpinIdle is an ISR-entry witness; capture it only after the truly
   // perishable hardware facts are already snapshotted and the next gear tooth
   // is either armed or deliberately stopped.
-  packet.spinidle = spinidle_capture_at_isr_entry(isr_entry_dwt_raw);
-  packet.capture_exit_dwt = ARM_DWT_CYCCNT;
+  tick.spinidle = spinidle_capture_at_isr_entry(isr_entry_dwt_raw);
+  tick.capture_exit_dwt = ARM_DWT_CYCCNT;
 
-  const bool needs_handoff = was_smartzero_current ||
-      (one_second_due && packet.rt_active && packet.lane_active);
-  if (needs_handoff) {
-    interrupt_capture_ring_t<ocxo_capture_packet_t, HANDOFF_OCXO_RING_SIZE>& ring =
+  const bool needs_1khz_sample_handoff = was_smartzero_current;
+  const bool needs_one_second_handoff =
+      one_second_due && tick.rt_active && tick.lane_active;
+
+  if (needs_1khz_sample_handoff) {
+    ocxo_1khz_sample_capture_packet_t packet{};
+    ocxo_1khz_packet_from_tend_capture(packet, tick);
+    interrupt_capture_ring_t<ocxo_1khz_sample_capture_packet_t,
+                             HANDOFF_OCXO_RING_SIZE>& ring =
         (ctx.kind == interrupt_subscriber_kind_t::OCXO1)
-            ? g_ocxo1_capture_ring
-            : g_ocxo2_capture_ring;
+            ? g_ocxo1_1khz_sample_capture_ring
+            : g_ocxo2_1khz_sample_capture_ring;
 
     if (capture_ring_push_from_priority0(ring, diag, packet)) {
-      interrupt_handoff_request_from_capture_isr(ctx.kind == interrupt_subscriber_kind_t::OCXO1
-          ? "qtimer2_ocxo1_capture"
-          : "qtimer3_ocxo2_capture");
+      interrupt_handoff_request_from_capture_isr(
+          ctx.kind == interrupt_subscriber_kind_t::OCXO1
+              ? "qtimer2_ocxo1_1khz_sample"
+              : "qtimer3_ocxo2_1khz_sample");
+    } else {
+      lane.miss_count++;
+    }
+  } else if (needs_one_second_handoff) {
+    ocxo_one_second_capture_packet_t packet{};
+    ocxo_one_second_packet_from_tend_capture(packet, tick);
+    interrupt_capture_ring_t<ocxo_one_second_capture_packet_t,
+                             HANDOFF_OCXO_RING_SIZE>& ring =
+        (ctx.kind == interrupt_subscriber_kind_t::OCXO1)
+            ? g_ocxo1_one_second_capture_ring
+            : g_ocxo2_one_second_capture_ring;
+
+    if (capture_ring_push_from_priority0(ring, diag, packet)) {
+      interrupt_handoff_request_from_capture_isr(
+          ctx.kind == interrupt_subscriber_kind_t::OCXO1
+              ? "qtimer2_ocxo1_one_second"
+              : "qtimer3_ocxo2_one_second");
     } else {
       lane.miss_count++;
     }
@@ -7261,68 +7500,14 @@ static void ocxo_cadence_capture_priority0(ocxo_runtime_context_t& ctx,
 }
 
 
-static void interrupt_handoff_process_ocxo(ocxo_runtime_context_t& ctx,
-                                           const ocxo_capture_packet_t& packet) {
+static void interrupt_handoff_process_ocxo_1khz_sample(
+    ocxo_runtime_context_t& ctx,
+    const ocxo_1khz_sample_capture_packet_t& packet) {
   ocxo_lane_t& lane = *ctx.lane;
+  ocxo_cadence_isr_sample_t sample =
+      ocxo_sample_from_1khz_capture(ctx, packet);
 
-  ocxo_cadence_isr_sample_t sample{};
-  sample.rt = ocxo_runtime_for(ctx);
-  sample.isr_entry_dwt_raw = packet.isr_entry_dwt_raw;
-  sample.spinidle = packet.spinidle;
-  sample.isr_csctrl_entry = packet.csctrl_entry;
-  sample.had_armed = packet.cadence_armed;
-  sample.had_active_rt = packet.rt_active && packet.lane_active;
-  sample.was_smartzero_current = packet.was_smartzero_current;
-  sample.one_second_due = packet.one_second_due;
-  sample.target_counter32 = packet.target_counter32;
-  sample.target_low16 = packet.target_low16;
-  sample.arm_counter_low16 = packet.arm_low16;
-  sample.arm_compare_low16 = packet.arm_compare_low16;
-  sample.arm_counter_minus_compare_ticks =
-      (uint32_t)((uint16_t)(sample.arm_counter_low16 - sample.arm_compare_low16));
-  sample.arm_compare_remaining_ticks =
-      (uint32_t)((uint16_t)(sample.target_low16 - sample.arm_compare_low16));
-  sample.service_counter_low16 = packet.service_counter_low16;
-  sample.service_compare_low16 = packet.service_compare_low16;
-  sample.service_counter_minus_compare_ticks =
-      (uint32_t)((uint16_t)(sample.service_counter_low16 - sample.service_compare_low16));
-  sample.target_delta_mod65536_ticks =
-      (uint32_t)((uint16_t)(sample.service_counter_low16 - sample.target_low16));
-  sample.compare_delta_mod65536_ticks =
-      (uint32_t)((uint16_t)(sample.service_compare_low16 - sample.target_low16));
-  sample.service_offset_signed_ticks =
-      (int16_t)((uint16_t)sample.target_delta_mod65536_ticks);
-  sample.compare_service_offset_signed_ticks =
-      (int16_t)((uint16_t)sample.compare_delta_mod65536_ticks);
-  sample.service_was_early = (sample.service_offset_signed_ticks < 0);
-  sample.early_ticks = sample.service_was_early
-      ? (uint32_t)(-(int32_t)sample.service_offset_signed_ticks)
-      : 0U;
-  sample.interpreted_late_ticks = sample.service_was_early
-      ? 0U
-      : (uint32_t)sample.service_offset_signed_ticks;
-  sample.service_offset_abs_ticks = sample.service_was_early
-      ? sample.early_ticks
-      : sample.interpreted_late_ticks;
-  const bool compare_was_early = (sample.compare_service_offset_signed_ticks < 0);
-  sample.compare_early_ticks = compare_was_early
-      ? (uint32_t)(-(int32_t)sample.compare_service_offset_signed_ticks)
-      : 0U;
-  sample.compare_interpreted_late_ticks = compare_was_early
-      ? 0U
-      : (uint32_t)sample.compare_service_offset_signed_ticks;
-  sample.compare_arm_to_isr_ticks =
-      (uint32_t)((uint16_t)(sample.service_compare_low16 - packet.arm_compare_low16));
-  sample.arm_dwt_raw = packet.arm_dwt_raw;
-  sample.arm_remaining_ticks = packet.arm_remaining_ticks;
-  sample.arm_to_isr_ticks =
-      (uint32_t)((uint16_t)(sample.service_counter_low16 - packet.arm_low16));
-  sample.arm_to_isr_dwt_cycles =
-      sample.isr_entry_dwt_raw - packet.arm_dwt_raw;
-  sample.event_dwt = qtimer_event_dwt_from_isr_entry_raw(sample.isr_entry_dwt_raw);
-  sample.isr_csctrl_after_program = packet.csctrl_after_program;
-
-  if (sample.rt && (sample.was_smartzero_current || sample.one_second_due)) {
+  if (sample.rt) {
     sample.rt->irq_count++;
   }
   spincatch_note_isr_entry(ctx.kind,
@@ -7330,27 +7515,43 @@ static void interrupt_handoff_process_ocxo(ocxo_runtime_context_t& ctx,
                            sample.target_low16,
                            sample.isr_entry_dwt_raw);
 
-  // The OCXO gear tooth and synthetic 32-bit identity were already advanced
-  // in the priority-0 compare ISR.  Handoff only interprets the immutable
-  // packet for SmartZero and one-second publication.
-  lane.cadence_last_one_second_due = sample.one_second_due;
-
-  if (sample.one_second_due && sample.had_active_rt) {
-    isr_raw_dwt_probe_record(ctx.kind, sample.isr_entry_dwt_raw);
-  }
-
+  // This path is intentionally 1 kHz/acquisition only.  It can advance
+  // SmartZero state, but it cannot enqueue an OCXO one-second publication.
+  lane.cadence_last_one_second_due = false;
   const bool cadence_reauthored_by_smartzero =
       ocxo_cadence_feed_smartzero(ctx, sample);
   (void)cadence_reauthored_by_smartzero;
+}
 
-  if (sample.one_second_due && sample.had_active_rt) {
+
+static void interrupt_handoff_process_ocxo_one_second(
+    ocxo_runtime_context_t& ctx,
+    const ocxo_one_second_capture_packet_t& packet) {
+  ocxo_lane_t& lane = *ctx.lane;
+  ocxo_cadence_isr_sample_t sample =
+      ocxo_sample_from_one_second_capture(ctx, packet);
+
+  if (sample.rt) {
+    sample.rt->irq_count++;
+  }
+  spincatch_note_isr_entry(ctx.kind,
+                           sample.target_counter32,
+                           sample.target_low16,
+                           sample.isr_entry_dwt_raw);
+
+  // This is the only OCXO handoff path allowed to create a one-second fact.
+  lane.cadence_last_one_second_due = true;
+
+  if (sample.had_active_rt) {
+    isr_raw_dwt_probe_record(ctx.kind, sample.isr_entry_dwt_raw);
     interrupt_perishable_fact_t fact =
         ocxo_cadence_build_perishable_fact(ctx, sample);
     ocxo_cadence_enqueue_fact(ctx, fact);
   }
 
-  lane.cadence_last_one_second_due = sample.one_second_due;
+  lane.cadence_last_one_second_due = true;
 }
+
 
 static void qtimer2_isr(void) {
   const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;  // SACRED: first instruction.
@@ -8533,8 +8734,10 @@ static void runtime_reset_vclock_heartbeat_state(void) {
   g_qtimer1_ch1_capture_ring = interrupt_capture_ring_t<qtimer1_ch1_capture_packet_t, HANDOFF_QTIMER1_CH1_RING_SIZE>{};
   g_qtimer1_vclock_capture_ring = interrupt_capture_ring_t<qtimer1_vclock_capture_packet_t, HANDOFF_QTIMER1_CH1_RING_SIZE>{};
   g_qtimer1_ch2_capture_ring = interrupt_capture_ring_t<qtimer1_ch2_capture_packet_t, HANDOFF_QTIMER1_CH2_RING_SIZE>{};
-  g_ocxo1_capture_ring = interrupt_capture_ring_t<ocxo_capture_packet_t, HANDOFF_OCXO_RING_SIZE>{};
-  g_ocxo2_capture_ring = interrupt_capture_ring_t<ocxo_capture_packet_t, HANDOFF_OCXO_RING_SIZE>{};
+  g_ocxo1_1khz_sample_capture_ring = interrupt_capture_ring_t<ocxo_1khz_sample_capture_packet_t, HANDOFF_OCXO_RING_SIZE>{};
+  g_ocxo2_1khz_sample_capture_ring = interrupt_capture_ring_t<ocxo_1khz_sample_capture_packet_t, HANDOFF_OCXO_RING_SIZE>{};
+  g_ocxo1_one_second_capture_ring = interrupt_capture_ring_t<ocxo_one_second_capture_packet_t, HANDOFF_OCXO_RING_SIZE>{};
+  g_ocxo2_one_second_capture_ring = interrupt_capture_ring_t<ocxo_one_second_capture_packet_t, HANDOFF_OCXO_RING_SIZE>{};
   g_pps_capture_ring = interrupt_capture_ring_t<pps_capture_packet_t, HANDOFF_PPS_RING_SIZE>{};
   g_interrupt_capture_sequence = 0;
   g_pps_capture_sequence = 0;
