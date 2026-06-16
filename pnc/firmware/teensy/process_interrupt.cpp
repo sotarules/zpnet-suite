@@ -2371,6 +2371,26 @@ struct dwt_capture_lane_t {
   uint32_t generation_gate_early_reject_count = 0;
   uint32_t generation_gate_late_accept_count = 0;
   uint32_t generation_gate_far_late_accept_count = 0;
+  uint32_t generation_gate_max_far_late_delta_ticks = 0;
+
+  bool     generation_gate_last_far_late_valid = false;
+  uint32_t generation_gate_last_far_late_resolved_counter32 = 0;
+  uint32_t generation_gate_last_far_late_target_counter32 = 0;
+  int32_t  generation_gate_last_far_late_delta_ticks = 0;
+  uint16_t generation_gate_last_far_late_ambient_low16 = 0;
+  uint16_t generation_gate_last_far_late_target_low16 = 0;
+  uint32_t generation_gate_last_far_late_clock32_current_counter32 = 0;
+  uint16_t generation_gate_last_far_late_clock32_hardware16 = 0;
+  int32_t  generation_gate_last_far_late_slipledger_ticks = 0;
+  uint32_t generation_gate_last_far_late_target_semantic_delta_ticks = 0;
+  uint32_t generation_gate_last_far_late_target_hardware_delta_ticks = 0;
+  int32_t  generation_gate_last_far_late_domain_skew_ticks = 0;
+  uint32_t generation_gate_last_far_late_isr_entry_dwt_raw = 0;
+  uint32_t generation_gate_last_far_late_tick_mod = 0;
+  bool     generation_gate_last_far_late_one_second_due = false;
+  bool     generation_gate_last_far_late_smartzero = false;
+  const char* generation_gate_last_far_late_reason = "none";
+
   bool     generation_gate_last_accepted = false;
   uint32_t generation_gate_last_resolved_counter32 = 0;
   uint32_t generation_gate_last_target_counter32 = 0;
@@ -2471,6 +2491,7 @@ static void dwt_capture_reset_lane(dwt_capture_lane_t& s) {
   s.last_failure_reason = "none";
   s.generation_gate_last_reason = "reset";
   s.generation_gate_last_reject_reason = "none";
+  s.generation_gate_last_far_late_reason = "none";
 }
 
 static void dwt_capture_reset_all(void) {
@@ -2530,6 +2551,26 @@ static bool dwt_capture_record_generation_gate(
       s.generation_gate_late_accept_count++;
       if ((uint32_t)delta > DWT_CAPTURE_GENERATION_LATE_ACCEPT_WARN_TICKS) {
         s.generation_gate_far_late_accept_count++;
+        if ((uint32_t)delta > s.generation_gate_max_far_late_delta_ticks) {
+          s.generation_gate_max_far_late_delta_ticks = (uint32_t)delta;
+        }
+        s.generation_gate_last_far_late_valid = true;
+        s.generation_gate_last_far_late_resolved_counter32 = resolved_counter32;
+        s.generation_gate_last_far_late_target_counter32 = target_counter32;
+        s.generation_gate_last_far_late_delta_ticks = delta;
+        s.generation_gate_last_far_late_ambient_low16 = ambient_low16;
+        s.generation_gate_last_far_late_target_low16 = target_low16;
+        s.generation_gate_last_far_late_clock32_current_counter32 = clock32_current_counter32;
+        s.generation_gate_last_far_late_clock32_hardware16 = clock32_hardware16;
+        s.generation_gate_last_far_late_slipledger_ticks = slipledger_ticks;
+        s.generation_gate_last_far_late_target_semantic_delta_ticks = target_semantic_delta_ticks;
+        s.generation_gate_last_far_late_target_hardware_delta_ticks = target_hardware_delta_ticks;
+        s.generation_gate_last_far_late_domain_skew_ticks = domain_skew_ticks;
+        s.generation_gate_last_far_late_isr_entry_dwt_raw = isr_entry_dwt_raw;
+        s.generation_gate_last_far_late_tick_mod = tick_mod;
+        s.generation_gate_last_far_late_one_second_due = one_second_due;
+        s.generation_gate_last_far_late_smartzero = smartzero;
+        s.generation_gate_last_far_late_reason = reason;
       }
     }
   } else {
@@ -9978,6 +10019,23 @@ static FLASHMEM void add_generation_gate_lane(Payload& p,
   add_u32("generation_gate_early_reject_count", s.generation_gate_early_reject_count);
   add_u32("generation_gate_late_accept_count", s.generation_gate_late_accept_count);
   add_u32("generation_gate_far_late_accept_count", s.generation_gate_far_late_accept_count);
+  add_u32("generation_gate_max_far_late_delta_ticks", s.generation_gate_max_far_late_delta_ticks);
+
+  add_bool("generation_gate_last_far_late_valid", s.generation_gate_last_far_late_valid);
+  add_str("generation_gate_last_far_late_reason", s.generation_gate_last_far_late_reason);
+  add_i32("generation_gate_last_far_late_delta_ticks", s.generation_gate_last_far_late_delta_ticks);
+  add_u32("generation_gate_last_far_late_resolved_counter32", s.generation_gate_last_far_late_resolved_counter32);
+  add_u32("generation_gate_last_far_late_target_counter32", s.generation_gate_last_far_late_target_counter32);
+  add_u32("generation_gate_last_far_late_target_low16", (uint32_t)s.generation_gate_last_far_late_target_low16);
+  add_u32("generation_gate_last_far_late_service_counter_low16", (uint32_t)s.generation_gate_last_far_late_ambient_low16);
+  add_u32("generation_gate_last_far_late_clock32_current_counter32", s.generation_gate_last_far_late_clock32_current_counter32);
+  add_u32("generation_gate_last_far_late_clock32_hardware16", (uint32_t)s.generation_gate_last_far_late_clock32_hardware16);
+  add_i32("generation_gate_last_far_late_slipledger_ticks", s.generation_gate_last_far_late_slipledger_ticks);
+  add_u32("generation_gate_last_far_late_target_semantic_delta_ticks", s.generation_gate_last_far_late_target_semantic_delta_ticks);
+  add_u32("generation_gate_last_far_late_target_hardware_delta_ticks", s.generation_gate_last_far_late_target_hardware_delta_ticks);
+  add_i32("generation_gate_last_far_late_domain_skew_ticks", s.generation_gate_last_far_late_domain_skew_ticks);
+  add_u32("generation_gate_last_far_late_tick_mod", s.generation_gate_last_far_late_tick_mod);
+  add_bool("generation_gate_last_far_late_one_second_due", s.generation_gate_last_far_late_one_second_due);
 
   add_bool("generation_gate_last_accepted", s.generation_gate_last_accepted);
   add_str("generation_gate_last_reason", s.generation_gate_last_reason);
@@ -10498,6 +10556,10 @@ static FLASHMEM void add_dwt_capture_lane(Payload& p,
   add_u32("generation_gate_reject_count", s.generation_gate_reject_count);
   add_u32("generation_gate_early_reject_count", s.generation_gate_early_reject_count);
   add_u32("generation_gate_far_late_accept_count", s.generation_gate_far_late_accept_count);
+  add_u32("generation_gate_max_far_late_delta_ticks", s.generation_gate_max_far_late_delta_ticks);
+  add_bool("generation_gate_last_far_late_valid", s.generation_gate_last_far_late_valid);
+  add_i32("generation_gate_last_far_late_delta_ticks", s.generation_gate_last_far_late_delta_ticks);
+  add_i32("generation_gate_last_far_late_domain_skew_ticks", s.generation_gate_last_far_late_domain_skew_ticks);
   add_bool("generation_gate_last_accepted", s.generation_gate_last_accepted);
   add_str("generation_gate_last_reason", s.generation_gate_last_reason);
   add_i32("generation_gate_last_delta_ticks", s.generation_gate_last_delta_ticks);
