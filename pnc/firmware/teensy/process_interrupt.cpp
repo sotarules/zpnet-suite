@@ -9910,41 +9910,89 @@ static FLASHMEM void add_runtime_summary(Payload& p,
   snprintf(key, sizeof(key), "%s_event_count", prefix);p.add(key, event_count);
 }
 
+
+static FLASHMEM void add_generation_gate_lane(Payload& p,
+                                              const char* prefix,
+                                              const dwt_capture_lane_t& s) {
+  char key[128];
+  auto add_bool = [&](const char* suffix, bool value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value);
+  };
+  auto add_u32 = [&](const char* suffix, uint32_t value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value);
+  };
+  auto add_i32 = [&](const char* suffix, int32_t value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value);
+  };
+  auto add_str = [&](const char* suffix, const char* value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value ? value : "");
+  };
+
+  add_u32("generation_gate_observe_count", s.generation_gate_observe_count);
+  add_u32("generation_gate_accept_count", s.generation_gate_accept_count);
+  add_u32("generation_gate_reject_count", s.generation_gate_reject_count);
+  add_u32("generation_gate_early_reject_count", s.generation_gate_early_reject_count);
+  add_u32("generation_gate_late_accept_count", s.generation_gate_late_accept_count);
+  add_u32("generation_gate_far_late_accept_count", s.generation_gate_far_late_accept_count);
+
+  add_bool("generation_gate_last_accepted", s.generation_gate_last_accepted);
+  add_str("generation_gate_last_reason", s.generation_gate_last_reason);
+  add_i32("generation_gate_last_delta_ticks", s.generation_gate_last_delta_ticks);
+  add_u32("generation_gate_last_resolved_counter32", s.generation_gate_last_resolved_counter32);
+  add_u32("generation_gate_last_target_counter32", s.generation_gate_last_target_counter32);
+  add_u32("generation_gate_last_target_low16", (uint32_t)s.generation_gate_last_target_low16);
+  add_u32("generation_gate_last_service_counter_low16", (uint32_t)s.generation_gate_last_ambient_low16);
+  add_u32("generation_gate_last_clock32_current_counter32", s.generation_gate_last_clock32_current_counter32);
+  add_u32("generation_gate_last_clock32_hardware16", (uint32_t)s.generation_gate_last_clock32_hardware16);
+  add_i32("generation_gate_last_slipledger_ticks", s.generation_gate_last_slipledger_ticks);
+  add_u32("generation_gate_last_target_semantic_delta_ticks", s.generation_gate_last_target_semantic_delta_ticks);
+  add_u32("generation_gate_last_target_hardware_delta_ticks", s.generation_gate_last_target_hardware_delta_ticks);
+  add_i32("generation_gate_last_domain_skew_ticks", s.generation_gate_last_domain_skew_ticks);
+  add_u32("generation_gate_last_tick_mod", s.generation_gate_last_tick_mod);
+  add_bool("generation_gate_last_one_second_due", s.generation_gate_last_one_second_due);
+
+  add_bool("generation_gate_last_reject_valid", s.generation_gate_last_reject_valid);
+  add_str("generation_gate_last_reject_reason", s.generation_gate_last_reject_reason);
+  add_i32("generation_gate_last_reject_delta_ticks", s.generation_gate_last_reject_delta_ticks);
+  add_u32("generation_gate_last_reject_resolved_counter32", s.generation_gate_last_reject_resolved_counter32);
+  add_u32("generation_gate_last_reject_target_counter32", s.generation_gate_last_reject_target_counter32);
+  add_u32("generation_gate_last_reject_target_low16", (uint32_t)s.generation_gate_last_reject_target_low16);
+  add_u32("generation_gate_last_reject_service_counter_low16", (uint32_t)s.generation_gate_last_reject_ambient_low16);
+  add_u32("generation_gate_last_reject_clock32_current_counter32", s.generation_gate_last_reject_clock32_current_counter32);
+  add_u32("generation_gate_last_reject_clock32_hardware16", (uint32_t)s.generation_gate_last_reject_clock32_hardware16);
+  add_i32("generation_gate_last_reject_slipledger_ticks", s.generation_gate_last_reject_slipledger_ticks);
+  add_u32("generation_gate_last_reject_target_semantic_delta_ticks", s.generation_gate_last_reject_target_semantic_delta_ticks);
+  add_u32("generation_gate_last_reject_target_hardware_delta_ticks", s.generation_gate_last_reject_target_hardware_delta_ticks);
+  add_i32("generation_gate_last_reject_domain_skew_ticks", s.generation_gate_last_reject_domain_skew_ticks);
+  add_u32("generation_gate_last_reject_tick_mod", s.generation_gate_last_reject_tick_mod);
+  add_bool("generation_gate_last_reject_one_second_due", s.generation_gate_last_reject_one_second_due);
+}
+
 static FLASHMEM void add_ocxo_lean_lane(Payload& p,
                                         const char* prefix,
-                                        ocxo_runtime_context_t& ctx) {
+                                        ocxo_runtime_context_t& ctx,
+                                        const char* section = nullptr) {
   const ocxo_lane_t& lane = *ctx.lane;
   const synthetic_clock32_t* const clock32 = ctx.clock32;
   const interrupt_subscriber_runtime_t* const rt =
       ctx.rt_slot ? *ctx.rt_slot : nullptr;
+  const char* requested_section = (section && *section) ? section : "summary";
 
-  const uint16_t live_hw16 = lane.initialized ? ocxo_lane_counter_now(lane) : 0U;
-  const uint16_t live_compare_hw16 =
-      lane.initialized ? ocxo_lane_compare_counter_now(lane) : 0U;
-  const uint32_t clock32_current = clock32 ? clock32->current_counter32 : 0U;
-  const uint32_t clock32_zero = clock32 ? clock32->zero_counter32 : 0U;
-  const uint16_t clock32_hw_anchor = clock32 ? clock32->hardware16 : 0U;
-  const uint32_t live_low16_delta_from_clock32 =
-      (lane.initialized && clock32)
-          ? (uint32_t)((uint16_t)(live_hw16 - clock32_hw_anchor))
-          : 0U;
-  const uint32_t live_projected_counter32 =
-      (lane.initialized && clock32)
-          ? (clock32_current + live_low16_delta_from_clock32)
-          : clock32_current;
-  const uint32_t live_delta_from_clock32 = live_low16_delta_from_clock32;
-  const uint32_t next_minus_clock32 =
-      lane.cadence_enabled ? (lane.cadence_next_counter32 - clock32_current) : 0U;
-  const uint32_t next_minus_live =
-      lane.cadence_enabled ? (lane.cadence_next_counter32 - live_projected_counter32) : 0U;
-  const uint32_t epoch_to_clock32 =
-      lane.cadence_epoch_valid ? (clock32_current - lane.cadence_epoch_counter32) : 0U;
-  const uint32_t epoch_to_next =
-      lane.cadence_epoch_valid ? (lane.cadence_next_counter32 - lane.cadence_epoch_counter32) : 0U;
-  const uint32_t live_compare_csctrl =
-      lane.initialized ? lane.module->CH[lane.compare_channel].CSCTRL : 0U;
-  const uint16_t live_compare_comp1 =
-      lane.initialized ? lane.module->CH[lane.compare_channel].COMP1 : 0U;
+  const bool want_summary = !strcasecmp(requested_section, "summary") ||
+                            !strcasecmp(requested_section, "lean");
+  const bool want_clock = !strcasecmp(requested_section, "clock");
+  const bool want_gate = !strcasecmp(requested_section, "gate") ||
+                         !strcasecmp(requested_section, "generation") ||
+                         !strcasecmp(requested_section, "generation_gate");
+  const bool want_service = !strcasecmp(requested_section, "service");
+  const bool want_yardstick = !strcasecmp(requested_section, "yardstick") ||
+                              !strcasecmp(requested_section, "zero");
+  const bool want_slipledger = !strcasecmp(requested_section, "slipledger") ||
+                               !strcasecmp(requested_section, "slip");
 
   char key[112];
   auto add_bool = [&](const char* suffix, bool value) {
@@ -9964,184 +10012,281 @@ static FLASHMEM void add_ocxo_lean_lane(Payload& p,
     p.add(key, value ? value : "");
   };
 
+  add_str("section", requested_section);
+  add_str("available_sections", "summary clock gate service yardstick slipledger");
+  if (!(want_summary || want_clock || want_gate || want_service ||
+        want_yardstick || want_slipledger)) {
+    add_str("error", "unknown section");
+    return;
+  }
+
+  // Snapshot the cross-field coordinate state as one small critical-section
+  // read.  The foreground report is not timing authority, but mixed reads
+  // across a 1 kHz ISR rearm can otherwise make fields such as
+  // cadence_next_minus_live_ticks appear impossible by exactly one gear tooth.
+  bool     clock32_zeroed = false;
+  bool     clock32_pending_zero = false;
+  uint32_t clock32_pending_zero_counter32 = 0;
+  uint32_t clock32_pending_zero_count = 0;
+  uint32_t clock32_current = 0;
+  uint32_t clock32_zero = 0;
+  uint16_t clock32_hw_anchor = 0;
+  uint32_t clock32_minder_update_count = 0;
+  bool     cadence_enabled = false;
+  bool     cadence_armed = false;
+  bool     cadence_epoch_valid = false;
+  uint32_t cadence_epoch_counter32 = 0;
+  uint32_t cadence_next_counter32 = 0;
+  uint16_t cadence_next_low16 = 0;
+
+  uint32_t primask = 0;
+  __asm__ volatile ("mrs %0, primask" : "=r" (primask) :: "memory");
+  __disable_irq();
+  if (clock32) {
+    clock32_zeroed = clock32->zeroed;
+    clock32_pending_zero = clock32->pending_zero;
+    clock32_pending_zero_counter32 = clock32->pending_zero_counter32;
+    clock32_pending_zero_count = clock32->pending_zero_count;
+    clock32_current = clock32->current_counter32;
+    clock32_zero = clock32->zero_counter32;
+    clock32_hw_anchor = clock32->hardware16;
+    clock32_minder_update_count = clock32->minder_update_count;
+  }
+  cadence_enabled = lane.cadence_enabled;
+  cadence_armed = lane.cadence_armed;
+  cadence_epoch_valid = lane.cadence_epoch_valid;
+  cadence_epoch_counter32 = lane.cadence_epoch_counter32;
+  cadence_next_counter32 = lane.cadence_next_counter32;
+  cadence_next_low16 = lane.cadence_next_low16;
+  if ((primask & 1U) == 0U) {
+    __enable_irq();
+  }
+
+  const uint16_t live_hw16 = lane.initialized ? ocxo_lane_counter_now(lane) : 0U;
+  const uint16_t live_compare_hw16 =
+      lane.initialized ? ocxo_lane_compare_counter_now(lane) : 0U;
+  const uint32_t live_low16_delta_from_clock32 =
+      (lane.initialized && clock32)
+          ? (uint32_t)((uint16_t)(live_hw16 - clock32_hw_anchor))
+          : 0U;
+  const uint32_t live_projected_counter32 =
+      (lane.initialized && clock32)
+          ? (clock32_current + live_low16_delta_from_clock32)
+          : clock32_current;
+  const uint32_t live_delta_from_clock32 = live_low16_delta_from_clock32;
+  const uint32_t next_minus_clock32 =
+      cadence_enabled ? (cadence_next_counter32 - clock32_current) : 0U;
+  const uint32_t next_minus_live =
+      cadence_enabled ? (cadence_next_counter32 - live_projected_counter32) : 0U;
+  const uint32_t epoch_to_clock32 =
+      cadence_epoch_valid ? (clock32_current - cadence_epoch_counter32) : 0U;
+  const uint32_t epoch_to_next =
+      cadence_epoch_valid ? (cadence_next_counter32 - cadence_epoch_counter32) : 0U;
+  const uint32_t live_compare_csctrl =
+      lane.initialized ? lane.module->CH[lane.compare_channel].CSCTRL : 0U;
+  const uint16_t live_compare_comp1 =
+      lane.initialized ? lane.module->CH[lane.compare_channel].COMP1 : 0U;
+
+  const dwt_capture_lane_t& gate = dwt_capture_for_ocxo_kind(ctx.kind);
+
+  // Always-return summary: keep this deliberately small.  Expensive surfaces
+  // live behind section=clock/gate/service/yardstick/slipledger so one bad
+  // report cannot starve the command socket or force a service restart.
   add_str("kind", interrupt_subscriber_kind_str(ctx.kind));
-  add_str("cadence_source", ctx.cadence_source);
-  add_str("counter_source", ctx.counter_source);
-  add_str("dwt_authority", ctx.dwt_authority);
   add_bool("initialized", lane.initialized);
   add_bool("active", lane.active);
-  add_bool("runtime_present", rt != nullptr);
   add_bool("runtime_active", rt ? rt->active : false);
   add_bool("subscribed", rt ? rt->subscribed : false);
   add_u32("runtime_event_count", rt ? rt->event_count : 0U);
-  add_u32("runtime_dispatch_count", rt ? rt->dispatch_count : 0U);
-  add_u32("runtime_start_count", rt ? rt->start_count : 0U);
-  add_u32("runtime_stop_count", rt ? rt->stop_count : 0U);
-
   add_u32("irq_count", lane.irq_count);
-  add_u32("witness_fire_count", lane.witness_fire_count);
+  add_u32("cadence_fire_count", lane.cadence_fire_count);
+  add_u32("valid_publish_count", lane.witness_valid_publish_count);
   add_u32("counter_delta", lane.witness_last_counter_delta_ticks);
-  add_u32("bad_counter_delta", lane.witness_last_bad_counter_delta);
   add_u32("bad_counter_count", lane.witness_counter_delta_violation_count);
-  add_u32("dwt_at_edge", lane.witness_last_event_dwt);
-  add_u32("counter32_at_edge", lane.witness_last_event_counter32);
-
-  // Current same-channel low-word / synthetic-extension evidence.  These are
-  // foreground report reads only: they do not author event facts.
-  add_bool("clock32_zeroed", clock32 ? clock32->zeroed : false);
-  add_bool("clock32_pending_zero", clock32 ? clock32->pending_zero : false);
-  add_u32("clock32_pending_zero_counter32",
-          clock32 ? clock32->pending_zero_counter32 : 0U);
-  add_u32("clock32_pending_zero_count",
-          clock32 ? clock32->pending_zero_count : 0U);
-  add_u32("clock32_zero_counter32", clock32_zero);
+  add_bool("cadence_enabled", cadence_enabled);
+  add_bool("cadence_armed", cadence_armed);
+  add_u32("cadence_next_counter32", cadence_next_counter32);
+  add_u32("cadence_next_low16", (uint32_t)cadence_next_low16);
+  add_u32("cadence_next_minus_live_ticks", next_minus_live);
   add_u32("clock32_current_counter32", clock32_current);
   add_u32("clock32_hardware16_anchor", (uint32_t)clock32_hw_anchor);
-  add_u32("clock32_minder_update_count", clock32 ? clock32->minder_update_count : 0U);
+  add_bool("clock32_pending_zero", clock32_pending_zero);
+  add_u32("clock32_pending_zero_count", clock32_pending_zero_count);
   add_u32("live_hw16", (uint32_t)live_hw16);
-  add_u32("live_compare_hw16", (uint32_t)live_compare_hw16);
-  add_u32("live_counter_minus_compare_ticks",
-          (uint32_t)((uint16_t)(live_hw16 - live_compare_hw16)));
   add_u32("live_projected_counter32", live_projected_counter32);
-  add_u32("live_delta_from_clock32_ticks", live_delta_from_clock32);
   add_u32("live_low16_delta_from_clock32_ticks", live_low16_delta_from_clock32);
-  add_u32("live_compare_comp1", (uint32_t)live_compare_comp1);
-  add_u32("live_compare_csctrl", live_compare_csctrl);
-  add_bool("live_compare_flag", (live_compare_csctrl & TMR_CSCTRL_TCF1) != 0);
-  add_bool("live_compare_enabled", (live_compare_csctrl & TMR_CSCTRL_TCF1EN) != 0);
-
-  // Logical-grid / one-second target state.  These fields are the generation
-  // proof for the delayed-start pathology: epoch, current synthetic counter,
-  // next target, remaining-to-window, and last arming decision must all live
-  // in the same 32-bit generation.
-  add_bool("cadence_enabled", lane.cadence_enabled);
-  add_bool("cadence_armed", lane.cadence_armed);
-  add_bool("cadence_epoch_valid", lane.cadence_epoch_valid);
-  add_u32("cadence_epoch_counter32", lane.cadence_epoch_counter32);
-  add_u32("cadence_next_counter32", lane.cadence_next_counter32);
-  add_u32("cadence_next_low16", (uint32_t)lane.cadence_next_low16);
-  add_u32("cadence_next_minus_clock32_ticks", next_minus_clock32);
-  add_u32("cadence_next_minus_live_ticks", next_minus_live);
-  add_u32("cadence_epoch_to_clock32_ticks", epoch_to_clock32);
-  add_u32("cadence_epoch_to_next_ticks", epoch_to_next);
-  add_u32("cadence_arm_count", lane.cadence_arm_count);
-  add_u32("cadence_rearm_count", lane.cadence_rearm_count);
-  add_u32("cadence_fire_count", lane.cadence_fire_count);
-  add_u32("isr_ladder_fire_count", lane.cadence_fire_count);
-  add_u32("isr_ladder_minder_update_count", clock32 ? clock32->minder_update_count : 0U);
-  add_u32("cadence_false_irq_count", lane.cadence_false_irq_count);
-  add_u32("cadence_one_second_due_count", lane.cadence_one_second_due_count);
-  add_bool("cadence_last_one_second_due", lane.cadence_last_one_second_due);
-  add_u32("cadence_last_reason_id", lane.cadence_last_reason);
-  add_str("cadence_last_reason", ocxo_cadence_reason_name(lane.cadence_last_reason));
-  add_bool("cadence_last_program_enabled_after", lane.cadence_last_program_enabled_after);
-  add_bool("cadence_last_program_flag_after", lane.cadence_last_program_flag_after);
-
-  add_bool("smartzero_current_lane", smartzero_is_current_lane(ctx.kind));
-  add_bool("witness_target_initialized", lane.witness_target_initialized);
-  add_bool("witness_armed", lane.witness_armed);
-  add_u32("witness_target_counter32", lane.witness_target_counter32);
-  add_u32("witness_target_low16", (uint32_t)lane.witness_target_low16);
-  add_u32("witness_arm_count", lane.witness_arm_count);
-  add_u32("witness_late_arm_count", lane.witness_late_arm_count);
-  add_u32("generation_guard_block_count",
-          lane.witness_generation_guard_block_count);
-  add_u32("generation_guard_last_remaining_ticks",
-          lane.witness_generation_guard_last_remaining_ticks);
-  add_u32("generation_guard_last_current_counter32",
-          lane.witness_generation_guard_last_current_counter32);
-  add_u32("generation_guard_last_target_counter32",
-          lane.witness_generation_guard_last_target_counter32);
-  add_u32("generation_guard_last_reason_id",
-          lane.witness_generation_guard_last_reason);
-  add_str("generation_guard_last_reason",
-          ocxo_cadence_reason_name(lane.witness_generation_guard_last_reason));
-  add_u32("witness_false_irq_count", lane.witness_false_irq_count);
-
-  add_u32("schedule_decision_id", lane.witness_schedule_last_decision);
-  add_str("schedule_decision",
-          ocxo_schedule_decision_name(lane.witness_schedule_last_decision));
-  add_u32("schedule_current_counter32", lane.witness_schedule_last_current_counter32);
-  add_u32("schedule_target_counter32", lane.witness_schedule_last_target_counter32);
-  add_u32("schedule_remaining_ticks", lane.witness_schedule_last_remaining_ticks);
-  add_u32("schedule_phase_ticks", lane.witness_schedule_last_phase_ticks);
-  add_u32("schedule_ticks_until_arm_window",
-          lane.witness_schedule_last_ticks_until_arm_window);
-  add_u32("schedule_current_low16", (uint32_t)lane.witness_schedule_last_current_low16);
-  add_u32("schedule_target_low16", (uint32_t)lane.witness_schedule_last_target_low16);
-
-  add_u32("arm_dwt_raw", lane.witness_last_arm_dwt_raw);
-  add_u32("arm_counter32", lane.witness_last_arm_counter32);
-  add_u32("arm_low16", (uint32_t)lane.witness_last_arm_low16);
-  add_u32("arm_compare_low16", (uint32_t)lane.witness_last_arm_compare_low16);
-  add_u32("arm_counter_minus_compare_ticks",
-          lane.witness_last_arm_counter_minus_compare_ticks);
-  add_u32("arm_compare_remaining_ticks", lane.witness_last_arm_compare_remaining_ticks);
-  add_u32("arm_target_counter32", lane.witness_last_arm_target_counter32);
-  add_u32("arm_target_low16", (uint32_t)lane.witness_last_arm_target_low16);
-  add_u32("arm_remaining_ticks", lane.witness_last_arm_remaining_ticks);
-  add_u32("arm_to_isr_ticks", lane.witness_last_arm_to_isr_ticks);
-  add_u32("arm_to_isr_dwt_cycles", lane.witness_last_arm_to_isr_dwt_cycles);
-
-  add_u32("service_class_id", lane.witness_last_service_class);
-  add_str("service_class", ocxo_service_class_name(lane.witness_last_service_class));
-  add_i32("service_offset_ticks", lane.witness_last_service_offset_signed_ticks);
-  add_u32("service_offset_abs_ticks", lane.witness_last_service_offset_abs_ticks);
-  add_u32("target_delta_mod65536_ticks", lane.witness_last_target_delta_mod65536_ticks);
-  add_u32("interpreted_late_ticks", lane.witness_last_interpreted_late_ticks);
-  add_u32("early_ticks", lane.witness_last_early_ticks);
-  add_u32("isr_counter_low16", (uint32_t)lane.witness_last_isr_counter_low16);
-  add_u32("isr_compare_low16", (uint32_t)lane.witness_last_isr_compare_low16);
-  add_u32("isr_counter_minus_compare_ticks",
-          lane.witness_last_isr_counter_minus_compare_ticks);
-  add_u32("compare_delta_mod65536_ticks", lane.witness_last_compare_delta_mod65536_ticks);
-  add_i32("compare_offset_ticks", lane.witness_last_compare_service_offset_signed_ticks);
-  add_u32("compare_interpreted_late_ticks", lane.witness_last_compare_interpreted_late_ticks);
-  add_u32("compare_early_ticks", lane.witness_last_compare_early_ticks);
-  add_u32("compare_arm_to_isr_ticks", lane.witness_last_compare_arm_to_isr_ticks);
-  add_bool("last_event_published", lane.witness_last_event_published);
-  add_bool("last_irq_had_armed", lane.witness_last_irq_had_armed);
-  add_bool("last_irq_had_active_rt", lane.witness_last_irq_had_active_rt);
-  add_u32("service_count", lane.witness_service_count);
-  add_u32("valid_publish_count", lane.witness_valid_publish_count);
-  add_u32("early_service_count", lane.witness_early_service_count);
-  add_u32("on_or_after_service_count", lane.witness_on_or_after_service_count);
-
-  add_u32("fact_sequence", lane.witness_last_fact_sequence);
-  add_u32("fact_enqueue_count", lane.witness_fact_enqueue_count);
-  add_u32("fact_drain_count", lane.witness_fact_drain_count);
-  add_u32("fact_high_water", lane.witness_fact_high_water);
-  add_u32("fact_asap_arm_count", lane.witness_fact_asap_arm_count);
-  add_u32("fact_asap_fail_count", lane.witness_fact_asap_fail_count);
-  add_u32("fact_overflow", lane.witness_fact_overflow_count);
-
-  add_bool("yardstick_valid", lane.yardstick_last_valid);
-  add_bool("yardstick_stale", lane.yardstick_last_stale);
+  add_u32("generation_gate_reject_count", gate.generation_gate_reject_count);
+  add_u32("generation_gate_early_reject_count", gate.generation_gate_early_reject_count);
+  add_u32("generation_gate_far_late_accept_count", gate.generation_gate_far_late_accept_count);
+  add_bool("generation_gate_last_accepted", gate.generation_gate_last_accepted);
+  add_i32("generation_gate_last_delta_ticks", gate.generation_gate_last_delta_ticks);
+  add_i32("generation_gate_last_domain_skew_ticks", gate.generation_gate_last_domain_skew_ticks);
+  add_bool("generation_gate_last_reject_valid", gate.generation_gate_last_reject_valid);
+  add_i32("generation_gate_last_reject_delta_ticks", gate.generation_gate_last_reject_delta_ticks);
+  add_i32("generation_gate_last_reject_domain_skew_ticks", gate.generation_gate_last_reject_domain_skew_ticks);
+  add_i32("slipledger_ticks", lane.slip.ledger_ticks);
+  add_u32("slipledger_correction_count", lane.slip.correction_count);
+  add_u32("slipledger_violation_count", lane.slip.violation_count);
   add_bool("yardstick_excursion", lane.yardstick_last_excursion);
-  add_i32("yardstick_imo", lane.yardstick_last_inferred_minus_observed_cycles);
   add_i32("yardstick_auth_error", lane.yardstick_auth_last_error_cycles);
   add_bool("zero_worthy", lane.zw_worthy);
 
-  add_bool("slipledger_active", SLIPLEDGER_OCXO_ACTIVE);
-  add_i32("slipledger_ticks", lane.slip.ledger_ticks);
-  add_i32("slipledger_last_event_ticks", lane.slip.last_event_ticks);
-  add_u32("slipledger_generation", lane.slip.generation);
-  add_u32("slipledger_observe_count", lane.slip.observe_count);
-  add_u32("slipledger_violation_count", lane.slip.violation_count);
-  add_u32("slipledger_correction_count", lane.slip.correction_count);
-  add_u32("slipledger_resync_absurd_dwt_error_count",
-          lane.slip.resync_absurd_dwt_error_count);
-  add_u32("slipledger_resync_target_discontinuity_count",
-          lane.slip.resync_target_discontinuity_count);
-  add_u32("slipledger_one_second_violation_count", lane.slip.one_second_violation_count);
-  add_u32("slipledger_one_second_correction_count", lane.slip.one_second_correction_count);
-  add_i32("slipledger_last_dwt_error_cycles", lane.slip.last_dwt_error_cycles);
-  add_u32("slipledger_last_observed_dwt", lane.slip.last_observed_dwt_at_event);
-  add_u32("slipledger_last_authored_dwt", lane.slip.last_authored_dwt_at_event);
-  add_u32("slipledger_last_correction_reason_code", lane.slip.last_correction_reason);
-  add_i32("slipledger_last_correction_ticks", lane.slip.last_correction_ticks);
-  add_i32("slipledger_last_correction_dwt_error_cycles", lane.slip.last_correction_dwt_error_cycles);
-  add_str("slipledger_last_reason", slipledger_reason_name(lane.slip.last_reason));
+  if (want_summary) return;
+
+  if (want_gate) {
+    add_generation_gate_lane(p, prefix, gate);
+    return;
+  }
+
+  if (want_clock) {
+    add_str("cadence_source", ctx.cadence_source);
+    add_str("counter_source", ctx.counter_source);
+    add_str("dwt_authority", ctx.dwt_authority);
+    add_bool("clock32_zeroed", clock32_zeroed);
+    add_u32("clock32_zero_counter32", clock32_zero);
+    add_u32("clock32_pending_zero_counter32", clock32_pending_zero_counter32);
+    add_u32("clock32_minder_update_count", clock32_minder_update_count);
+    add_u32("live_compare_hw16", (uint32_t)live_compare_hw16);
+    add_u32("live_counter_minus_compare_ticks",
+            (uint32_t)((uint16_t)(live_hw16 - live_compare_hw16)));
+    add_u32("live_delta_from_clock32_ticks", live_delta_from_clock32);
+    add_u32("live_compare_comp1", (uint32_t)live_compare_comp1);
+    add_u32("live_compare_csctrl", live_compare_csctrl);
+    add_bool("live_compare_flag", (live_compare_csctrl & TMR_CSCTRL_TCF1) != 0);
+    add_bool("live_compare_enabled", (live_compare_csctrl & TMR_CSCTRL_TCF1EN) != 0);
+    add_bool("cadence_epoch_valid", cadence_epoch_valid);
+    add_u32("cadence_epoch_counter32", cadence_epoch_counter32);
+    add_u32("cadence_next_minus_clock32_ticks", next_minus_clock32);
+    add_u32("cadence_epoch_to_clock32_ticks", epoch_to_clock32);
+    add_u32("cadence_epoch_to_next_ticks", epoch_to_next);
+    add_u32("cadence_arm_count", lane.cadence_arm_count);
+    add_u32("cadence_rearm_count", lane.cadence_rearm_count);
+    add_u32("cadence_false_irq_count", lane.cadence_false_irq_count);
+    add_u32("cadence_one_second_due_count", lane.cadence_one_second_due_count);
+    add_bool("cadence_last_one_second_due", lane.cadence_last_one_second_due);
+    add_u32("cadence_last_reason_id", lane.cadence_last_reason);
+    add_str("cadence_last_reason", ocxo_cadence_reason_name(lane.cadence_last_reason));
+    add_bool("cadence_last_program_enabled_after", lane.cadence_last_program_enabled_after);
+    add_bool("cadence_last_program_flag_after", lane.cadence_last_program_flag_after);
+    add_bool("smartzero_current_lane", smartzero_is_current_lane(ctx.kind));
+    return;
+  }
+
+  if (want_service) {
+    add_u32("witness_fire_count", lane.witness_fire_count);
+    add_u32("bad_counter_delta", lane.witness_last_bad_counter_delta);
+    add_u32("dwt_at_edge", lane.witness_last_event_dwt);
+    add_u32("counter32_at_edge", lane.witness_last_event_counter32);
+    add_bool("witness_target_initialized", lane.witness_target_initialized);
+    add_bool("witness_armed", lane.witness_armed);
+    add_u32("witness_target_counter32", lane.witness_target_counter32);
+    add_u32("witness_target_low16", (uint32_t)lane.witness_target_low16);
+    add_u32("witness_arm_count", lane.witness_arm_count);
+    add_u32("witness_late_arm_count", lane.witness_late_arm_count);
+    add_u32("generation_guard_block_count", lane.witness_generation_guard_block_count);
+    add_u32("generation_guard_last_remaining_ticks", lane.witness_generation_guard_last_remaining_ticks);
+    add_u32("generation_guard_last_current_counter32", lane.witness_generation_guard_last_current_counter32);
+    add_u32("generation_guard_last_target_counter32", lane.witness_generation_guard_last_target_counter32);
+    add_u32("generation_guard_last_reason_id", lane.witness_generation_guard_last_reason);
+    add_str("generation_guard_last_reason", ocxo_cadence_reason_name(lane.witness_generation_guard_last_reason));
+    add_u32("witness_false_irq_count", lane.witness_false_irq_count);
+    add_u32("schedule_decision_id", lane.witness_schedule_last_decision);
+    add_str("schedule_decision", ocxo_schedule_decision_name(lane.witness_schedule_last_decision));
+    add_u32("schedule_current_counter32", lane.witness_schedule_last_current_counter32);
+    add_u32("schedule_target_counter32", lane.witness_schedule_last_target_counter32);
+    add_u32("schedule_remaining_ticks", lane.witness_schedule_last_remaining_ticks);
+    add_u32("schedule_current_low16", (uint32_t)lane.witness_schedule_last_current_low16);
+    add_u32("schedule_target_low16", (uint32_t)lane.witness_schedule_last_target_low16);
+    add_u32("arm_dwt_raw", lane.witness_last_arm_dwt_raw);
+    add_u32("arm_counter32", lane.witness_last_arm_counter32);
+    add_u32("arm_low16", (uint32_t)lane.witness_last_arm_low16);
+    add_u32("arm_compare_low16", (uint32_t)lane.witness_last_arm_compare_low16);
+    add_u32("arm_remaining_ticks", lane.witness_last_arm_remaining_ticks);
+    add_u32("arm_to_isr_ticks", lane.witness_last_arm_to_isr_ticks);
+    add_u32("arm_to_isr_dwt_cycles", lane.witness_last_arm_to_isr_dwt_cycles);
+    add_u32("service_class_id", lane.witness_last_service_class);
+    add_str("service_class", ocxo_service_class_name(lane.witness_last_service_class));
+    add_i32("service_offset_ticks", lane.witness_last_service_offset_signed_ticks);
+    add_u32("service_offset_abs_ticks", lane.witness_last_service_offset_abs_ticks);
+    add_u32("target_delta_mod65536_ticks", lane.witness_last_target_delta_mod65536_ticks);
+    add_u32("interpreted_late_ticks", lane.witness_last_interpreted_late_ticks);
+    add_u32("early_ticks", lane.witness_last_early_ticks);
+    add_u32("isr_counter_low16", (uint32_t)lane.witness_last_isr_counter_low16);
+    add_u32("isr_compare_low16", (uint32_t)lane.witness_last_isr_compare_low16);
+    add_u32("compare_delta_mod65536_ticks", lane.witness_last_compare_delta_mod65536_ticks);
+    add_i32("compare_offset_ticks", lane.witness_last_compare_service_offset_signed_ticks);
+    add_u32("compare_interpreted_late_ticks", lane.witness_last_compare_interpreted_late_ticks);
+    add_u32("compare_early_ticks", lane.witness_last_compare_early_ticks);
+    add_u32("compare_arm_to_isr_ticks", lane.witness_last_compare_arm_to_isr_ticks);
+    add_bool("last_event_published", lane.witness_last_event_published);
+    add_bool("last_irq_had_armed", lane.witness_last_irq_had_armed);
+    add_bool("last_irq_had_active_rt", lane.witness_last_irq_had_active_rt);
+    add_u32("service_count", lane.witness_service_count);
+    add_u32("early_service_count", lane.witness_early_service_count);
+    add_u32("on_or_after_service_count", lane.witness_on_or_after_service_count);
+    add_u32("fact_sequence", lane.witness_last_fact_sequence);
+    add_u32("fact_enqueue_count", lane.witness_fact_enqueue_count);
+    add_u32("fact_drain_count", lane.witness_fact_drain_count);
+    add_u32("fact_high_water", lane.witness_fact_high_water);
+    add_u32("fact_asap_arm_count", lane.witness_fact_asap_arm_count);
+    add_u32("fact_asap_fail_count", lane.witness_fact_asap_fail_count);
+    add_u32("fact_overflow", lane.witness_fact_overflow_count);
+    return;
+  }
+
+  if (want_yardstick) {
+    add_bool("yardstick_valid", lane.yardstick_last_valid);
+    add_bool("yardstick_stale", lane.yardstick_last_stale);
+    add_i32("yardstick_imo", lane.yardstick_last_inferred_minus_observed_cycles);
+    add_u32("yardstick_update_count", lane.yardstick_update_count);
+    add_u32("yardstick_seed_count", lane.yardstick_seed_count);
+    add_u32("yardstick_gate_agree_count", lane.yardstick_gate_agree_count);
+    add_u32("yardstick_gate_excursion_count", lane.yardstick_gate_excursion_count);
+    add_i32("yardstick_endpoint_minus_observed_cycles", lane.yardstick_last_endpoint_minus_observed_cycles);
+    add_u32("yardstick_auth_publish_count", lane.yardstick_auth_publish_count);
+    add_u32("yardstick_auth_anchor_correction_count", lane.yardstick_auth_anchor_correction_count);
+    add_i32("yardstick_auth_error_cycles", lane.yardstick_auth_last_error_cycles);
+    add_u32("yardstick_auth_last_published_dwt", lane.yardstick_auth_last_published_dwt);
+    add_bool("zero_worthy", lane.zw_worthy);
+    add_u32("zw_clean_streak_seconds", lane.zw_clean_streak_seconds);
+    add_u32("zw_worthy_streak_seconds", lane.zw_worthy_streak_seconds);
+    add_u32("zw_seconds_evaluated", lane.zw_seconds_evaluated);
+    add_i32("zw_window_error_sum", lane.zw_window_error_sum);
+    add_u32("zw_window_max_abs_error", lane.zw_window_max_abs_error);
+    add_str("zw_last_disqualify_reason", lane.zw_last_disqualify_reason);
+    return;
+  }
+
+  if (want_slipledger) {
+    add_bool("slipledger_active", SLIPLEDGER_OCXO_ACTIVE);
+    add_i32("slipledger_last_event_ticks", lane.slip.last_event_ticks);
+    add_u32("slipledger_generation", lane.slip.generation);
+    add_u32("slipledger_observe_count", lane.slip.observe_count);
+    add_u32("slipledger_ok_count", lane.slip.ok_count);
+    add_u32("slipledger_noop_violation_count", lane.slip.noop_violation_count);
+    add_u32("slipledger_early_count", lane.slip.early_count);
+    add_u32("slipledger_late_count", lane.slip.late_count);
+    add_u32("slipledger_resync_absurd_dwt_error_count", lane.slip.resync_absurd_dwt_error_count);
+    add_u32("slipledger_resync_target_discontinuity_count", lane.slip.resync_target_discontinuity_count);
+    add_u32("slipledger_one_second_observe_count", lane.slip.one_second_observe_count);
+    add_u32("slipledger_one_second_ok_count", lane.slip.one_second_ok_count);
+    add_u32("slipledger_one_second_violation_count", lane.slip.one_second_violation_count);
+    add_u32("slipledger_one_second_correction_count", lane.slip.one_second_correction_count);
+    add_bool("slipledger_last_corrected", lane.slip.last_event_corrected);
+    add_bool("slipledger_last_violation", lane.slip.last_event_violation);
+    add_i32("slipledger_last_dwt_error_cycles", lane.slip.last_dwt_error_cycles);
+    add_u32("slipledger_last_expected_dwt", lane.slip.last_expected_dwt_at_event);
+    add_u32("slipledger_last_observed_dwt", lane.slip.last_observed_dwt_at_event);
+    add_u32("slipledger_last_authored_dwt", lane.slip.last_authored_dwt_at_event);
+    add_u32("slipledger_last_target_counter32", lane.slip.last_target_counter32);
+    add_u32("slipledger_last_hardware_target_low16", (uint32_t)lane.slip.last_hardware_target_low16);
+    add_u32("slipledger_last_ambient_low16", (uint32_t)lane.slip.last_ambient_low16);
+    add_u32("slipledger_last_correction_reason_code", lane.slip.last_correction_reason);
+    add_i32("slipledger_last_correction_ticks", lane.slip.last_correction_ticks);
+    add_i32("slipledger_last_correction_dwt_error_cycles", lane.slip.last_correction_dwt_error_cycles);
+    add_str("slipledger_last_reason", slipledger_reason_name(lane.slip.last_reason));
+    return;
+  }
 }
 
 static FLASHMEM Payload cmd_report(const Payload&) {
@@ -10149,6 +10294,7 @@ static FLASHMEM Payload cmd_report(const Payload&) {
   p.add("report", "INTERRUPT_LEAN");
   p.add("schema", "INTERRUPT_LEAN_V1");
   p.add("available_reports", "REPORT_STATUS REPORT_PPS REPORT_CADENCE REPORT_SMARTZERO REPORT_BRIDGE REPORT_HANDOFF REPORT_DWT_CAPTURE REPORT_LANES REPORT_LANE");
+  p.add("report_lane_sections", "summary clock gate service yardstick slipledger");
   p.add("hw_ready", g_interrupt_hw_ready);
   p.add("runtime_ready", g_interrupt_runtime_ready);
   p.add("irqs_enabled", g_interrupt_irqs_enabled);
@@ -10285,93 +10431,24 @@ static FLASHMEM void add_dwt_capture_lane(Payload& p,
     p.add(key, value ? value : "");
   };
 
-  // Keep REPORT_DWT_CAPTURE deliberately small.  The full V2 forensic payload
-  // can exceed the command/JSON response budget and make the command appear to
-  // hang even though the timing runtime is healthy.  This compact report is the
-  // live verdict surface for the generation gate; detailed forensics remain in
-  // TIMEBASE/raw_cycles excursion rows.
+  // Minimal always-return surface.  Detailed generation-gate algebra is now
+  // exposed on REPORT_LANE, where the caller can request one OCXO at a time.
   add_u32("observe_count", s.observe_count);
-  add_u32("cntr_10000_count", s.cntr_interval_10000_count);
   add_u32("cntr_not_10000_count", s.cntr_interval_not_10000_count);
-  add_u32("cntr_short_count", s.cntr_interval_short_count);
-  add_u32("cntr_long_count", s.cntr_interval_long_count);
   add_u32("coherent_early_suspect_count", s.coherent_early_suspect_count);
-  add_u32("one_second_observe_count", s.one_second_observe_count);
   add_u32("one_second_not_10000_count", s.one_second_not_10000_count);
-
   add_u32("generation_gate_observe_count", s.generation_gate_observe_count);
   add_u32("generation_gate_accept_count", s.generation_gate_accept_count);
   add_u32("generation_gate_reject_count", s.generation_gate_reject_count);
-  add_u32("generation_gate_early_reject_count",
-          s.generation_gate_early_reject_count);
-  add_u32("generation_gate_late_accept_count",
-          s.generation_gate_late_accept_count);
-  add_u32("generation_gate_far_late_accept_count",
-          s.generation_gate_far_late_accept_count);
-
-  add_bool("generation_gate_last_accepted",
-           s.generation_gate_last_accepted);
+  add_u32("generation_gate_early_reject_count", s.generation_gate_early_reject_count);
+  add_u32("generation_gate_far_late_accept_count", s.generation_gate_far_late_accept_count);
+  add_bool("generation_gate_last_accepted", s.generation_gate_last_accepted);
   add_str("generation_gate_last_reason", s.generation_gate_last_reason);
-  add_i32("generation_gate_last_delta_ticks",
-          s.generation_gate_last_delta_ticks);
-  add_u32("generation_gate_last_resolved_counter32",
-          s.generation_gate_last_resolved_counter32);
-  add_u32("generation_gate_last_target_counter32",
-          s.generation_gate_last_target_counter32);
-  add_u32("generation_gate_last_ambient_low16",
-          (uint32_t)s.generation_gate_last_ambient_low16);
-  add_u32("generation_gate_last_target_low16",
-          (uint32_t)s.generation_gate_last_target_low16);
-  add_u32("generation_gate_last_service_counter_low16",
-          (uint32_t)s.generation_gate_last_ambient_low16);
-  add_u32("generation_gate_last_clock32_current_counter32",
-          s.generation_gate_last_clock32_current_counter32);
-  add_u32("generation_gate_last_clock32_hardware16",
-          (uint32_t)s.generation_gate_last_clock32_hardware16);
-  add_i32("generation_gate_last_slipledger_ticks",
-          s.generation_gate_last_slipledger_ticks);
-  add_u32("generation_gate_last_target_semantic_delta_ticks",
-          s.generation_gate_last_target_semantic_delta_ticks);
-  add_u32("generation_gate_last_target_hardware_delta_ticks",
-          s.generation_gate_last_target_hardware_delta_ticks);
-  add_i32("generation_gate_last_domain_skew_ticks",
-          s.generation_gate_last_domain_skew_ticks);
-  add_u32("generation_gate_last_tick_mod", s.generation_gate_last_tick_mod);
-  add_bool("generation_gate_last_one_second_due",
-           s.generation_gate_last_one_second_due);
-
-  add_bool("generation_gate_last_reject_valid",
-           s.generation_gate_last_reject_valid);
-  add_str("generation_gate_last_reject_reason",
-          s.generation_gate_last_reject_reason);
-  add_i32("generation_gate_last_reject_delta_ticks",
-          s.generation_gate_last_reject_delta_ticks);
-  add_u32("generation_gate_last_reject_resolved_counter32",
-          s.generation_gate_last_reject_resolved_counter32);
-  add_u32("generation_gate_last_reject_target_counter32",
-          s.generation_gate_last_reject_target_counter32);
-  add_u32("generation_gate_last_reject_ambient_low16",
-          (uint32_t)s.generation_gate_last_reject_ambient_low16);
-  add_u32("generation_gate_last_reject_target_low16",
-          (uint32_t)s.generation_gate_last_reject_target_low16);
-  add_u32("generation_gate_last_reject_service_counter_low16",
-          (uint32_t)s.generation_gate_last_reject_ambient_low16);
-  add_u32("generation_gate_last_reject_clock32_current_counter32",
-          s.generation_gate_last_reject_clock32_current_counter32);
-  add_u32("generation_gate_last_reject_clock32_hardware16",
-          (uint32_t)s.generation_gate_last_reject_clock32_hardware16);
-  add_i32("generation_gate_last_reject_slipledger_ticks",
-          s.generation_gate_last_reject_slipledger_ticks);
-  add_u32("generation_gate_last_reject_target_semantic_delta_ticks",
-          s.generation_gate_last_reject_target_semantic_delta_ticks);
-  add_u32("generation_gate_last_reject_target_hardware_delta_ticks",
-          s.generation_gate_last_reject_target_hardware_delta_ticks);
-  add_i32("generation_gate_last_reject_domain_skew_ticks",
-          s.generation_gate_last_reject_domain_skew_ticks);
-  add_u32("generation_gate_last_reject_tick_mod",
-          s.generation_gate_last_reject_tick_mod);
-  add_bool("generation_gate_last_reject_one_second_due",
-           s.generation_gate_last_reject_one_second_due);
+  add_i32("generation_gate_last_delta_ticks", s.generation_gate_last_delta_ticks);
+  add_i32("generation_gate_last_domain_skew_ticks", s.generation_gate_last_domain_skew_ticks);
+  add_bool("generation_gate_last_reject_valid", s.generation_gate_last_reject_valid);
+  add_i32("generation_gate_last_reject_delta_ticks", s.generation_gate_last_reject_delta_ticks);
+  add_i32("generation_gate_last_reject_domain_skew_ticks", s.generation_gate_last_reject_domain_skew_ticks);
 }
 
 
@@ -10428,25 +10505,18 @@ static FLASHMEM void add_slipledger_lane(Payload& p,
 static FLASHMEM Payload cmd_report_dwt_capture(const Payload&) {
   Payload p;
   p.add("report", "DWT_CAPTURE");
-  p.add("schema", "DWT_CAPTURE_V5_SLIPLEDGER_ABSURD_RESYNC");
-  p.add("doctrine", "GENERATION_GATE_PLUS_SLIPLEDGER_DWT_LAWFUL_ARMING_WITH_ABSURD_ERROR_RESEED");
-  p.add("hypothesis", "HARDWARE_COUNTER_PHASE_SLIP_CORRECTED_BY_SIGNED_LEDGER");
-  p.add("payload_policy", "COMPACT_ALWAYS_RETURNS");
+  p.add("schema", "DWT_CAPTURE_V6_COMPACT_GENERATION_GATE_SUMMARY");
+  p.add("doctrine", "GENERATION_GATE_SUMMARY_REPORT_LANE_HAS_FULL_ALGEBRA");
+  p.add("payload_policy", "ULTRA_COMPACT_ALWAYS_RETURNS");
   p.add("expected_cntr_interval_ticks", DWT_CAPTURE_EXPECTED_CNTR_INTERVAL_TICKS);
   p.add("dwt_gate_cycles", DWT_CAPTURE_DWT_INTERVAL_GATE_CYCLES);
   p.add("generation_late_accept_warn_ticks",
         DWT_CAPTURE_GENERATION_LATE_ACCEPT_WARN_TICKS);
-  p.add("slipledger_1khz_gate_cycles", SLIPLEDGER_1KHZ_GATE_CYCLES);
-  p.add("slipledger_absurd_dwt_error_cycles",
-        SLIPLEDGER_ABSURD_DWT_ERROR_CYCLES);
   p.add("slipledger_ocxo_active", SLIPLEDGER_OCXO_ACTIVE);
   p.add("slipledger_vclock_active", SLIPLEDGER_VCLOCK_ACTIVE);
   add_dwt_capture_lane(p, "vclock", g_dwt_capture_vclock);
-  add_slipledger_lane(p, "vclock", g_vclock_lane.slip, SLIPLEDGER_VCLOCK_ACTIVE);
   add_dwt_capture_lane(p, "ocxo1", g_dwt_capture_ocxo1);
-  add_slipledger_lane(p, "ocxo1", g_ocxo1_lane.slip, SLIPLEDGER_OCXO_ACTIVE);
   add_dwt_capture_lane(p, "ocxo2", g_dwt_capture_ocxo2);
-  add_slipledger_lane(p, "ocxo2", g_ocxo2_lane.slip, SLIPLEDGER_OCXO_ACTIVE);
   return p;
 }
 
@@ -10517,8 +10587,10 @@ static FLASHMEM Payload cmd_report_lane(const Payload& args) {
     p.add("slipledger_last_reason", slipledger_reason_name(g_vclock_lane.slip.last_reason));
     return p;
   }
-  if (!strcasecmp(lane, "OCXO1") || !strcasecmp(lane, "O1")) { add_ocxo_lean_lane(p, "ocxo1", g_ocxo1_ctx); return p; }
-  if (!strcasecmp(lane, "OCXO2") || !strcasecmp(lane, "O2")) { add_ocxo_lean_lane(p, "ocxo2", g_ocxo2_ctx); return p; }
+  const char* section = args.getString("section");
+  if (!section || !*section) section = args.getString("detail");
+  if (!strcasecmp(lane, "OCXO1") || !strcasecmp(lane, "O1")) { add_ocxo_lean_lane(p, "ocxo1", g_ocxo1_ctx, section); return p; }
+  if (!strcasecmp(lane, "OCXO2") || !strcasecmp(lane, "O2")) { add_ocxo_lean_lane(p, "ocxo2", g_ocxo2_ctx, section); return p; }
   p.add("error", "unknown lane");
   return p;
 }
