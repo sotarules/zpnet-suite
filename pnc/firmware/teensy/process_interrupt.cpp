@@ -1341,6 +1341,39 @@ struct dwt_repair_diag_t {
   uint32_t threshold_cycles = 0;
   const char* reason = "none";
 
+  bool     slipledger_active = false;
+  bool     slipledger_event_corrected = false;
+  bool     slipledger_event_violation = false;
+  int32_t  slipledger_ticks = 0;
+  int32_t  slipledger_event_ticks = 0;
+  uint32_t slipledger_generation = 0;
+  uint32_t slipledger_observe_count = 0;
+  uint32_t slipledger_ok_count = 0;
+  uint32_t slipledger_violation_count = 0;
+  uint32_t slipledger_correction_count = 0;
+  uint32_t slipledger_noop_violation_count = 0;
+  uint32_t slipledger_early_count = 0;
+  uint32_t slipledger_late_count = 0;
+  uint32_t slipledger_one_second_observe_count = 0;
+  uint32_t slipledger_one_second_ok_count = 0;
+  uint32_t slipledger_one_second_violation_count = 0;
+  uint32_t slipledger_one_second_correction_count = 0;
+  uint32_t slipledger_last_expected_dwt = 0;
+  uint32_t slipledger_last_observed_dwt = 0;
+  uint32_t slipledger_last_authored_dwt = 0;
+  uint32_t slipledger_last_expected_interval_cycles = 0;
+  uint32_t slipledger_last_observed_interval_cycles = 0;
+  int32_t  slipledger_last_dwt_error_cycles = 0;
+  uint32_t slipledger_last_target_counter32 = 0;
+  uint16_t slipledger_last_hardware_target_low16 = 0;
+  uint16_t slipledger_last_ambient_low16 = 0;
+  uint32_t slipledger_last_tick_mod = 0;
+  uint32_t slipledger_reason_code = 0;
+  uint32_t slipledger_last_correction_reason_code = 0;
+  int32_t  slipledger_last_correction_ticks = 0;
+  int32_t  slipledger_last_correction_dwt_error_cycles = 0;
+  const char* slipledger_reason = "none";
+
   // One-second DWT interval gate audit.  original_dwt/predicted_dwt/used_dwt
   // are endpoint facts; these fields expose the interval decision that
   // protected the EMA from a raw service-time excursion.
@@ -1915,6 +1948,297 @@ static volatile interrupt_pps_entry_latency_handler_fn
 // ============================================================================
 // Per-lane state
 // ============================================================================
+// ============================================================================
+// SlipLedger — signed hardware-counter phase correction
+// ============================================================================
+//
+// QTimer compare hardware is retained as the wakeup mechanism, but the
+// semantic +10,000 tick ladder is DWT-lawful.  If a lane reaches the authored
+// compare target too early/late in DWT time, the hardware counter phase has
+// slipped relative to the semantic schedule.  Do not mutate clock truth; mutate
+// only this signed mapping:
+//
+//   semantic_counter32 = hardware_counter32 + slip_ledger_ticks
+//   hardware_compare_low16 = semantic_target32 - slip_ledger_ticks
+//
+// OCXO lanes apply the correction immediately.  VCLOCK carries the same audit
+// surface, but its sovereign rail remains observational in this checkpoint.
+static constexpr bool     SLIPLEDGER_OCXO_ACTIVE = true;
+static constexpr bool     SLIPLEDGER_VCLOCK_ACTIVE = false;
+static constexpr uint32_t SLIPLEDGER_1KHZ_GATE_CYCLES = 16U;
+static constexpr int32_t  SLIPLEDGER_MAX_ABS_TICKS = 1000000;
+
+static constexpr uint32_t SLIPLEDGER_REASON_NONE = 0;
+static constexpr uint32_t SLIPLEDGER_REASON_FIRST_SAMPLE = 1;
+static constexpr uint32_t SLIPLEDGER_REASON_OK = 2;
+static constexpr uint32_t SLIPLEDGER_REASON_EARLY_CORRECTED = 3;
+static constexpr uint32_t SLIPLEDGER_REASON_LATE_CORRECTED = 4;
+static constexpr uint32_t SLIPLEDGER_REASON_VIOLATION_NO_TICK_CORRECTION = 5;
+static constexpr uint32_t SLIPLEDGER_REASON_CLAMPED = 6;
+
+static const char* slipledger_reason_name(uint32_t reason) {
+  switch (reason) {
+    case SLIPLEDGER_REASON_FIRST_SAMPLE: return "first_sample";
+    case SLIPLEDGER_REASON_OK: return "ok";
+    case SLIPLEDGER_REASON_EARLY_CORRECTED: return "early_corrected";
+    case SLIPLEDGER_REASON_LATE_CORRECTED: return "late_corrected";
+    case SLIPLEDGER_REASON_VIOLATION_NO_TICK_CORRECTION:
+      return "violation_no_tick_correction";
+    case SLIPLEDGER_REASON_CLAMPED: return "correction_clamped";
+    default: return "none";
+  }
+}
+
+struct slipledger_lane_t {
+  bool     previous_valid = false;
+  uint32_t previous_target_counter32 = 0;
+  uint32_t previous_authored_dwt_at_event = 0;
+
+  int32_t  ledger_ticks = 0;
+  uint32_t generation = 0;
+
+  uint32_t first_sample_count = 0;
+  uint32_t observe_count = 0;
+  uint32_t ok_count = 0;
+  uint32_t violation_count = 0;
+  uint32_t correction_count = 0;
+  uint32_t noop_violation_count = 0;
+  uint32_t early_count = 0;
+  uint32_t late_count = 0;
+
+  uint32_t one_second_observe_count = 0;
+  uint32_t one_second_ok_count = 0;
+  uint32_t one_second_violation_count = 0;
+  uint32_t one_second_correction_count = 0;
+
+  bool     last_active = false;
+  bool     last_event_corrected = false;
+  bool     last_event_violation = false;
+  uint32_t last_reason = SLIPLEDGER_REASON_NONE;
+  int32_t  last_event_ticks = 0;
+  int32_t  last_ledger_ticks = 0;
+  uint32_t last_target_counter32 = 0;
+  uint16_t last_hardware_target_low16 = 0;
+  uint16_t last_ambient_low16 = 0;
+  uint32_t last_tick_mod = 0;
+  uint32_t last_correction_reason = SLIPLEDGER_REASON_NONE;
+  int32_t  last_correction_ticks = 0;
+  int32_t  last_correction_dwt_error_cycles = 0;
+  bool     last_one_second_due = false;
+  bool     last_smartzero = false;
+  uint32_t last_expected_dwt_at_event = 0;
+  uint32_t last_observed_dwt_at_event = 0;
+  uint32_t last_authored_dwt_at_event = 0;
+  uint32_t last_expected_interval_cycles = 0;
+  uint32_t last_observed_interval_cycles = 0;
+  int32_t  last_dwt_error_cycles = 0;
+};
+
+struct slipledger_decision_t {
+  uint32_t authored_dwt_at_event = 0;
+  int32_t  correction_ticks = 0;
+  bool     corrected = false;
+  bool     violation = false;
+  uint32_t reason = SLIPLEDGER_REASON_NONE;
+};
+
+static inline void slipledger_reset(slipledger_lane_t& s) {
+  s = slipledger_lane_t{};
+  s.last_reason = SLIPLEDGER_REASON_NONE;
+}
+
+static int32_t slipledger_round_cycles_to_ticks(int32_t cycles) {
+  const uint32_t cps = interrupt_vclock_cycles_per_second();
+  if (cps == 0 || cycles == 0) return 0;
+
+  const int64_t numerator = (int64_t)cycles *
+      (int64_t)OCXO_WITNESS_ONE_SECOND_COUNTS;
+  const int64_t denom = (int64_t)cps;
+  if (numerator >= 0) {
+    return (int32_t)((numerator + denom / 2) / denom);
+  }
+  return (int32_t)(-(((-numerator) + denom / 2) / denom));
+}
+
+static int32_t slipledger_clamp_ticks(int64_t value, bool* out_clamped) {
+  bool clamped = false;
+  if (value > (int64_t)SLIPLEDGER_MAX_ABS_TICKS) {
+    value = (int64_t)SLIPLEDGER_MAX_ABS_TICKS;
+    clamped = true;
+  } else if (value < -(int64_t)SLIPLEDGER_MAX_ABS_TICKS) {
+    value = -(int64_t)SLIPLEDGER_MAX_ABS_TICKS;
+    clamped = true;
+  }
+  if (out_clamped) *out_clamped = clamped;
+  return (int32_t)value;
+}
+
+static uint16_t slipledger_hardware_low16_from_semantic(uint32_t semantic_counter32,
+                                                        int32_t ledger_ticks) {
+  return (uint16_t)((int64_t)semantic_counter32 - (int64_t)ledger_ticks);
+}
+
+static slipledger_decision_t slipledger_record_1khz(
+    slipledger_lane_t& s,
+    bool active,
+    uint32_t target_counter32,
+    uint16_t hardware_target_low16,
+    uint16_t ambient_low16,
+    uint32_t tick_mod,
+    bool one_second_due,
+    bool smartzero,
+    uint32_t observed_dwt_at_event) {
+  slipledger_decision_t out{};
+  out.authored_dwt_at_event = observed_dwt_at_event;
+  s.last_active = active;
+
+  if (!s.previous_valid) {
+    s.previous_valid = true;
+    s.previous_target_counter32 = target_counter32;
+    s.previous_authored_dwt_at_event = observed_dwt_at_event;
+    s.first_sample_count++;
+    s.last_reason = SLIPLEDGER_REASON_FIRST_SAMPLE;
+    s.last_event_ticks = 0;
+    s.last_ledger_ticks = s.ledger_ticks;
+    s.last_target_counter32 = target_counter32;
+    s.last_hardware_target_low16 = hardware_target_low16;
+    s.last_ambient_low16 = ambient_low16;
+    s.last_tick_mod = tick_mod;
+    s.last_one_second_due = one_second_due;
+    s.last_smartzero = smartzero;
+    s.last_expected_dwt_at_event = observed_dwt_at_event;
+    s.last_observed_dwt_at_event = observed_dwt_at_event;
+    s.last_authored_dwt_at_event = observed_dwt_at_event;
+    s.last_expected_interval_cycles = 0;
+    s.last_observed_interval_cycles = 0;
+    s.last_dwt_error_cycles = 0;
+    out.reason = SLIPLEDGER_REASON_FIRST_SAMPLE;
+    return out;
+  }
+
+  const uint32_t target_delta_ticks = target_counter32 - s.previous_target_counter32;
+  const uint32_t expected_interval = vclock_cycles_for_ticks(target_delta_ticks);
+  const uint32_t expected_dwt = s.previous_authored_dwt_at_event + expected_interval;
+  const uint32_t observed_interval = observed_dwt_at_event - s.previous_authored_dwt_at_event;
+  const int32_t dwt_error = (int32_t)((int64_t)observed_dwt_at_event -
+                                      (int64_t)expected_dwt);
+  const uint32_t abs_error = (uint32_t)(dwt_error < 0
+      ? -(int64_t)dwt_error
+      :  (int64_t)dwt_error);
+  const bool violation = abs_error > SLIPLEDGER_1KHZ_GATE_CYCLES;
+  int32_t correction_ticks = violation ? slipledger_round_cycles_to_ticks(dwt_error) : 0;
+
+  uint32_t reason = SLIPLEDGER_REASON_OK;
+  bool corrected = false;
+  bool clamped = false;
+
+  s.observe_count++;
+  if (one_second_due) s.one_second_observe_count++;
+
+  if (!violation) {
+    s.ok_count++;
+    if (one_second_due) s.one_second_ok_count++;
+    out.authored_dwt_at_event = observed_dwt_at_event;
+    reason = SLIPLEDGER_REASON_OK;
+  } else {
+    s.violation_count++;
+    if (one_second_due) s.one_second_violation_count++;
+    out.authored_dwt_at_event = expected_dwt;
+    if (dwt_error < 0) s.early_count++;
+    else s.late_count++;
+
+    if (active && correction_ticks != 0) {
+      const int64_t requested = (int64_t)s.ledger_ticks +
+                                (int64_t)correction_ticks;
+      const int32_t next = slipledger_clamp_ticks(requested, &clamped);
+      const int32_t applied = next - s.ledger_ticks;
+      s.ledger_ticks = next;
+      correction_ticks = applied;
+      s.generation++;
+      s.correction_count++;
+      if (one_second_due) s.one_second_correction_count++;
+      corrected = applied != 0;
+      reason = clamped ? SLIPLEDGER_REASON_CLAMPED
+                       : (dwt_error < 0
+                            ? SLIPLEDGER_REASON_EARLY_CORRECTED
+                            : SLIPLEDGER_REASON_LATE_CORRECTED);
+      if (corrected) {
+        s.last_correction_reason = reason;
+        s.last_correction_ticks = applied;
+        s.last_correction_dwt_error_cycles = dwt_error;
+      }
+    } else {
+      s.noop_violation_count++;
+      correction_ticks = 0;
+      reason = SLIPLEDGER_REASON_VIOLATION_NO_TICK_CORRECTION;
+    }
+  }
+
+  s.previous_target_counter32 = target_counter32;
+  s.previous_authored_dwt_at_event = out.authored_dwt_at_event;
+
+  s.last_event_corrected = corrected;
+  s.last_event_violation = violation;
+  s.last_reason = reason;
+  s.last_event_ticks = correction_ticks;
+  s.last_ledger_ticks = s.ledger_ticks;
+  s.last_target_counter32 = target_counter32;
+  s.last_hardware_target_low16 = hardware_target_low16;
+  s.last_ambient_low16 = ambient_low16;
+  s.last_tick_mod = tick_mod;
+  s.last_one_second_due = one_second_due;
+  s.last_smartzero = smartzero;
+  s.last_expected_dwt_at_event = expected_dwt;
+  s.last_observed_dwt_at_event = observed_dwt_at_event;
+  s.last_authored_dwt_at_event = out.authored_dwt_at_event;
+  s.last_expected_interval_cycles = expected_interval;
+  s.last_observed_interval_cycles = observed_interval;
+  s.last_dwt_error_cycles = dwt_error;
+
+  out.correction_ticks = correction_ticks;
+  out.corrected = corrected;
+  out.violation = violation;
+  out.reason = reason;
+  return out;
+}
+
+
+static void slipledger_copy_to_repair_diag(dwt_repair_diag_t& out,
+                                           const slipledger_lane_t& s) {
+  out.slipledger_active = s.last_active;
+  out.slipledger_event_corrected = s.last_event_corrected;
+  out.slipledger_event_violation = s.last_event_violation;
+  out.slipledger_ticks = s.ledger_ticks;
+  out.slipledger_event_ticks = s.last_event_ticks;
+  out.slipledger_generation = s.generation;
+  out.slipledger_observe_count = s.observe_count;
+  out.slipledger_ok_count = s.ok_count;
+  out.slipledger_violation_count = s.violation_count;
+  out.slipledger_correction_count = s.correction_count;
+  out.slipledger_noop_violation_count = s.noop_violation_count;
+  out.slipledger_early_count = s.early_count;
+  out.slipledger_late_count = s.late_count;
+  out.slipledger_one_second_observe_count = s.one_second_observe_count;
+  out.slipledger_one_second_ok_count = s.one_second_ok_count;
+  out.slipledger_one_second_violation_count = s.one_second_violation_count;
+  out.slipledger_one_second_correction_count = s.one_second_correction_count;
+  out.slipledger_last_expected_dwt = s.last_expected_dwt_at_event;
+  out.slipledger_last_observed_dwt = s.last_observed_dwt_at_event;
+  out.slipledger_last_authored_dwt = s.last_authored_dwt_at_event;
+  out.slipledger_last_expected_interval_cycles = s.last_expected_interval_cycles;
+  out.slipledger_last_observed_interval_cycles = s.last_observed_interval_cycles;
+  out.slipledger_last_dwt_error_cycles = s.last_dwt_error_cycles;
+  out.slipledger_last_target_counter32 = s.last_target_counter32;
+  out.slipledger_last_hardware_target_low16 = s.last_hardware_target_low16;
+  out.slipledger_last_ambient_low16 = s.last_ambient_low16;
+  out.slipledger_last_tick_mod = s.last_tick_mod;
+  out.slipledger_reason_code = s.last_reason;
+  out.slipledger_last_correction_reason_code = s.last_correction_reason;
+  out.slipledger_last_correction_ticks = s.last_correction_ticks;
+  out.slipledger_last_correction_dwt_error_cycles = s.last_correction_dwt_error_cycles;
+  out.slipledger_reason = slipledger_reason_name(s.last_reason);
+}
+
 
 struct vclock_lane_t {
   bool     initialized = false;
@@ -1927,6 +2251,8 @@ struct vclock_lane_t {
   uint32_t miss_count = 0;
   uint32_t bootstrap_count = 0;
   uint32_t cadence_hits_total = 0;
+
+  slipledger_lane_t slip{};
 
   // VCLOCK EMA DWT authority.  This does not smooth VCLOCK counter32 or GNSS
   // identity; it only dequantizes the DWT coordinate assigned to the exact
@@ -1977,6 +2303,8 @@ static vclock_lane_t g_vclock_lane;
 static constexpr uint32_t DWT_CAPTURE_EXPECTED_CNTR_INTERVAL_TICKS =
     OCXO_CADENCE_INTERVAL_TICKS;
 static constexpr uint32_t DWT_CAPTURE_DWT_INTERVAL_GATE_CYCLES = 500U;
+
+
 
 struct dwt_capture_lane_t {
   bool     previous_valid = false;
@@ -2410,6 +2738,7 @@ static int32_t dwt_ema_round_shift(int32_t value, uint32_t shift) {
 }
 
 static void vclock_lane_ema_reset(vclock_lane_t& lane) {
+  slipledger_reset(lane.slip);
   lane.ema_initialized = false;
   lane.ema_interval_valid = false;
   lane.ema_last_observed_dwt = 0;
@@ -2680,6 +3009,8 @@ struct ocxo_lane_t {
   uint32_t miss_count = 0;
   uint32_t bootstrap_count = 0;
   uint32_t cadence_hits_total = 0;
+
+  slipledger_lane_t slip{};
 
   // Lane-local compare custody.  In steady state this is a one-second edge
   // target; during SmartZero it temporarily becomes a +10,000-tick acquisition
@@ -4383,6 +4714,38 @@ static void emit_one_second_event(interrupt_subscriber_runtime_t& rt,
     diag.dwt_synthetic_error_cycles = repair->error_cycles;
     diag.dwt_synthetic_threshold_cycles = repair->threshold_cycles;
     diag.dwt_synthetic_reason = repair->reason;
+    diag.slipledger_active = repair->slipledger_active;
+    diag.slipledger_event_corrected = repair->slipledger_event_corrected;
+    diag.slipledger_event_violation = repair->slipledger_event_violation;
+    diag.slipledger_ticks = repair->slipledger_ticks;
+    diag.slipledger_event_ticks = repair->slipledger_event_ticks;
+    diag.slipledger_generation = repair->slipledger_generation;
+    diag.slipledger_observe_count = repair->slipledger_observe_count;
+    diag.slipledger_ok_count = repair->slipledger_ok_count;
+    diag.slipledger_violation_count = repair->slipledger_violation_count;
+    diag.slipledger_correction_count = repair->slipledger_correction_count;
+    diag.slipledger_noop_violation_count = repair->slipledger_noop_violation_count;
+    diag.slipledger_early_count = repair->slipledger_early_count;
+    diag.slipledger_late_count = repair->slipledger_late_count;
+    diag.slipledger_one_second_observe_count = repair->slipledger_one_second_observe_count;
+    diag.slipledger_one_second_ok_count = repair->slipledger_one_second_ok_count;
+    diag.slipledger_one_second_violation_count = repair->slipledger_one_second_violation_count;
+    diag.slipledger_one_second_correction_count = repair->slipledger_one_second_correction_count;
+    diag.slipledger_last_expected_dwt = repair->slipledger_last_expected_dwt;
+    diag.slipledger_last_observed_dwt = repair->slipledger_last_observed_dwt;
+    diag.slipledger_last_authored_dwt = repair->slipledger_last_authored_dwt;
+    diag.slipledger_last_expected_interval_cycles = repair->slipledger_last_expected_interval_cycles;
+    diag.slipledger_last_observed_interval_cycles = repair->slipledger_last_observed_interval_cycles;
+    diag.slipledger_last_dwt_error_cycles = repair->slipledger_last_dwt_error_cycles;
+    diag.slipledger_last_target_counter32 = repair->slipledger_last_target_counter32;
+    diag.slipledger_last_hardware_target_low16 = repair->slipledger_last_hardware_target_low16;
+    diag.slipledger_last_ambient_low16 = repair->slipledger_last_ambient_low16;
+    diag.slipledger_last_tick_mod = repair->slipledger_last_tick_mod;
+    diag.slipledger_reason_code = repair->slipledger_reason_code;
+    diag.slipledger_last_correction_reason_code = repair->slipledger_last_correction_reason_code;
+    diag.slipledger_last_correction_ticks = repair->slipledger_last_correction_ticks;
+    diag.slipledger_last_correction_dwt_error_cycles = repair->slipledger_last_correction_dwt_error_cycles;
+    diag.slipledger_reason = repair->slipledger_reason;
     diag.dwt_interval_gate_valid = repair->interval_gate_valid;
     diag.dwt_interval_sample_accepted = repair->interval_sample_accepted;
     diag.dwt_interval_sample_rejected = repair->interval_sample_rejected;
@@ -4895,6 +5258,7 @@ static void vclock_apply_perishable_fact_deferred(
   ema_diag.reason = ema_diag.interval_sample_rejected
       ? "vclock_ema_gate_reject"
       : (ema_synthetic ? "vclock_ema" : "vclock_ema_init");
+  slipledger_copy_to_repair_diag(ema_diag, g_vclock_lane.slip);
 
   const pps_t witness_pps = fact.witness_pps_valid ? fact.witness_pps : pps_t{};
   publish_vclock_domain_pps_vclock(witness_pps,
@@ -4993,7 +5357,9 @@ static bool ocxo_lane_program_local_cadence_compare(ocxo_lane_t& lane,
   const uint16_t cmp16 = clock32.hardware16;
   const uint32_t current_counter32 = clock32.current_counter32;
   const uint32_t remaining = target_counter32 - current_counter32;
-  const uint16_t target_low16 = (uint16_t)(target_counter32 & 0xFFFFU);
+  const uint16_t target_low16 =
+      slipledger_hardware_low16_from_semantic(target_counter32,
+                                              lane.slip.ledger_ticks);
 
   lane.witness_schedule_last_current_counter32 = current_counter32;
   lane.witness_schedule_last_target_counter32 = target_counter32;
@@ -5214,6 +5580,7 @@ static bool ocxo_lane_start_local_cadence(interrupt_subscriber_kind_t kind,
 
 
 static void ocxo_lane_ema_reset(ocxo_lane_t& lane) {
+  slipledger_reset(lane.slip);
   lane.ema_initialized = false;
   lane.ema_interval_valid = false;
   lane.ema_last_observed_dwt = 0;
@@ -5467,6 +5834,7 @@ static void vclock_heartbeat_native_service(uint32_t isr_entry_dwt_raw,
         ema_diag.reason = ema_diag.interval_sample_rejected
             ? "vclock_ema_gate_reject_fallback"
             : (ema_synthetic ? "vclock_ema_fallback" : "vclock_ema_init_fallback");
+        slipledger_copy_to_repair_diag(ema_diag, g_vclock_lane.slip);
         publish_vclock_domain_pps_vclock(witness_pps,
                                           (witness_pps.sequence != 0)
                                               ? witness_pps.sequence
@@ -5565,6 +5933,8 @@ struct interrupt_perishable_fact_t {
   // published event DWT remains latency-adjusted service_dwt_at_event.
   uint32_t isr_entry_dwt_raw = 0;
   uint32_t service_dwt_at_event = 0;
+  uint32_t slipledger_authored_dwt_at_event = 0;
+  bool     slipledger_authored_dwt_valid = false;
   spinidle_isr_capture_t spinidle{};
 
   // Authored target identity.  This is the event identity, not an ambient read.
@@ -6556,9 +6926,10 @@ static void ocxo_apply_perishable_fact_deferred(
 
   const int32_t correction_cycles =
       dwt_cycles_for_ocxo_ticks_signed((int32_t)fact.service_offset_ticks);
-  const uint32_t corrected_dwt =
-      (uint32_t)((int64_t)fact.service_dwt_at_event -
-                 (int64_t)correction_cycles);
+  const uint32_t corrected_dwt = fact.slipledger_authored_dwt_valid
+      ? fact.slipledger_authored_dwt_at_event
+      : (uint32_t)((int64_t)fact.service_dwt_at_event -
+                   (int64_t)correction_cycles);
 
   lane->witness_last_fact_sequence = fact.sequence;
   lane->witness_last_fact_one_second_due = fact.one_second_due;
@@ -6735,6 +7106,8 @@ static void ocxo_apply_perishable_fact_deferred(
               : (ema_synthetic ? "ocxo_ema" : "ocxo_ema_init"));
   }
 
+  slipledger_copy_to_repair_diag(ema_diag, lane->slip);
+
   // We are already in TimePop ASAP/foreground context. Dispatch the authored
   // rollover OCXO edge directly from the fact drain.
   emit_one_second_event(*rt,
@@ -6774,6 +7147,7 @@ struct ocxo_cadence_isr_sample_t {
   spinidle_isr_capture_t spinidle{};
   uint32_t isr_csctrl_entry = 0;
   uint32_t isr_csctrl_after_program = 0;
+  uint32_t raw_event_dwt = 0;
   uint32_t event_dwt = 0;
 
   bool had_armed = false;
@@ -6916,6 +7290,7 @@ struct ocxo_1khz_tend_capture_t {
   // subscriber-facing OCXO one-second capture contract.
   uint32_t isr_entry_dwt_raw = 0;
   uint32_t capture_exit_dwt = 0;
+  uint32_t authored_dwt_at_event = 0;
   spinidle_isr_capture_t spinidle{};
 
   uint32_t csctrl_entry = 0;
@@ -6941,6 +7316,7 @@ struct ocxo_1khz_sample_capture_packet_t {
   uint32_t sequence = 0;
   uint32_t isr_entry_dwt_raw = 0;
   uint32_t capture_exit_dwt = 0;
+  uint32_t authored_dwt_at_event = 0;
   spinidle_isr_capture_t spinidle{};
 
   uint32_t csctrl_entry = 0;
@@ -6964,6 +7340,7 @@ struct ocxo_one_second_capture_packet_t {
   uint32_t sequence = 0;
   uint32_t isr_entry_dwt_raw = 0;
   uint32_t capture_exit_dwt = 0;
+  uint32_t authored_dwt_at_event = 0;
   spinidle_isr_capture_t spinidle{};
 
   uint32_t csctrl_entry = 0;
@@ -7492,7 +7869,9 @@ static interrupt_perishable_fact_t ocxo_cadence_build_perishable_fact(
   fact.lane = ctx.lane_id;
   fact.sequence = ++ring.sequence;
   fact.isr_entry_dwt_raw = sample.isr_entry_dwt_raw;
-  fact.service_dwt_at_event = sample.event_dwt;
+  fact.service_dwt_at_event = sample.raw_event_dwt;
+  fact.slipledger_authored_dwt_at_event = sample.event_dwt;
+  fact.slipledger_authored_dwt_valid = (sample.event_dwt != 0);
   fact.spinidle = sample.spinidle;
   fact.target_counter32 = sample.target_counter32;
   fact.target_low16 = sample.target_low16;
@@ -7570,6 +7949,7 @@ static void ocxo_1khz_packet_from_tend_capture(
     const ocxo_1khz_tend_capture_t& tick) {
   packet.isr_entry_dwt_raw = tick.isr_entry_dwt_raw;
   packet.capture_exit_dwt = tick.capture_exit_dwt;
+  packet.authored_dwt_at_event = tick.authored_dwt_at_event;
   packet.spinidle = tick.spinidle;
   packet.csctrl_entry = tick.csctrl_entry;
   packet.service_counter_low16 = tick.service_counter_low16;
@@ -7590,6 +7970,7 @@ static void ocxo_one_second_packet_from_tend_capture(
     const ocxo_1khz_tend_capture_t& tick) {
   packet.isr_entry_dwt_raw = tick.isr_entry_dwt_raw;
   packet.capture_exit_dwt = tick.capture_exit_dwt;
+  packet.authored_dwt_at_event = tick.authored_dwt_at_event;
   packet.spinidle = tick.spinidle;
   packet.csctrl_entry = tick.csctrl_entry;
   packet.service_counter_low16 = tick.service_counter_low16;
@@ -7661,7 +8042,10 @@ static void ocxo_fill_common_handoff_sample(
       (uint32_t)((uint16_t)(sample.service_counter_low16 - packet.arm_low16));
   sample.arm_to_isr_dwt_cycles =
       sample.isr_entry_dwt_raw - packet.arm_dwt_raw;
-  sample.event_dwt = qtimer_event_dwt_from_isr_entry_raw(sample.isr_entry_dwt_raw);
+  sample.raw_event_dwt = qtimer_event_dwt_from_isr_entry_raw(sample.isr_entry_dwt_raw);
+  sample.event_dwt = packet.authored_dwt_at_event
+      ? packet.authored_dwt_at_event
+      : sample.raw_event_dwt;
   sample.isr_csctrl_after_program = packet.csctrl_after_program;
 }
 
@@ -7719,7 +8103,9 @@ static void ocxo_cadence_capture_priority0(ocxo_runtime_context_t& ctx,
   }
 
   const uint32_t target_counter32 = lane.cadence_next_counter32;
-  const uint16_t target_low16 = (uint16_t)(target_counter32 & 0xFFFFU);
+  const uint16_t target_low16 =
+      slipledger_hardware_low16_from_semantic(target_counter32,
+                                              lane.slip.ledger_ticks);
   // The counter witness captured immediately after the sacred DWT read is now
   // the compare-generation witness.  A later ambient read may already be in a
   // different 10 MHz cell, so do not use it to decide whether the 16-bit match
@@ -7793,8 +8179,30 @@ static void ocxo_cadence_capture_priority0(ocxo_runtime_context_t& ctx,
                           csctrl_entry,
                           0U);
 
+  const uint32_t raw_qtimer_event_dwt =
+      qtimer_event_dwt_from_isr_entry_raw(isr_entry_dwt_raw);
+  const int32_t service_offset_correction_cycles =
+      dwt_cycles_for_ocxo_ticks_signed((int32_t)service_offset_ticks);
+  const uint32_t observed_dwt_at_target =
+      (uint32_t)((int64_t)raw_qtimer_event_dwt -
+                 (int64_t)service_offset_correction_cycles);
+  const slipledger_decision_t slip_decision = slipledger_record_1khz(
+      lane.slip,
+      SLIPLEDGER_OCXO_ACTIVE,
+      target_counter32,
+      target_low16,
+      service_counter_low16,
+      event_tick_mod,
+      one_second_due,
+      was_smartzero_current,
+      observed_dwt_at_target);
+  const uint16_t accepted_hardware_low16 =
+      slipledger_hardware_low16_from_semantic(target_counter32,
+                                              lane.slip.ledger_ticks);
+
   ocxo_1khz_tend_capture_t tick{};
   tick.isr_entry_dwt_raw = isr_entry_dwt_raw;
+  tick.authored_dwt_at_event = slip_decision.authored_dwt_at_event;
   tick.csctrl_entry = csctrl_entry;
   tick.service_counter_low16 = service_counter_low16;
   tick.service_compare_low16 = service_compare_low16;
@@ -7818,7 +8226,7 @@ static void ocxo_cadence_capture_priority0(ocxo_runtime_context_t& ctx,
   if (ctx.clock32) {
     ctx.clock32->current_counter32 = target_counter32;
     ctx.clock32->current_ns = (uint64_t)target_counter32 * 100ULL;
-    ctx.clock32->hardware16 = target_low16;
+    ctx.clock32->hardware16 = accepted_hardware_low16;
     ctx.clock32->minder_update_count++;
   }
 
@@ -7829,7 +8237,7 @@ static void ocxo_cadence_capture_priority0(ocxo_runtime_context_t& ctx,
   lane.cadence_last_target_counter32 = target_counter32;
   lane.cadence_last_target_low16 = target_low16;
   lane.cadence_last_service_low16 = service_counter_low16;
-  lane.cadence_last_fire_dwt = qtimer_event_dwt_from_isr_entry_raw(isr_entry_dwt_raw);
+  lane.cadence_last_fire_dwt = slip_decision.authored_dwt_at_event;
   lane.cadence_last_isr_entry_dwt_raw = isr_entry_dwt_raw;
   lane.cadence_last_service_offset_signed_ticks = (int32_t)service_offset_ticks;
   lane.cadence_last_service_offset_abs_ticks = service_offset_abs_ticks;
@@ -7851,11 +8259,16 @@ static void ocxo_cadence_capture_priority0(ocxo_runtime_context_t& ctx,
 
   if (keep_running) {
     const uint32_t next_target = target_counter32 + OCXO_CADENCE_INTERVAL_TICKS;
-    const uint16_t next_low16 = (uint16_t)(next_target & 0xFFFFU);
-    const uint32_t arm_current_counter32 = service_was_early
-        ? (target_counter32 - early_ticks)
-        : (target_counter32 + interpreted_late_ticks);
-    const uint32_t next_remaining = next_target - arm_current_counter32;
+    const uint16_t next_low16 =
+        slipledger_hardware_low16_from_semantic(next_target,
+                                                lane.slip.ledger_ticks);
+    const int16_t service_offset_after_slip =
+        (int16_t)((uint16_t)(service_counter_low16 - accepted_hardware_low16));
+    const uint32_t arm_current_counter32 =
+        (uint32_t)((int64_t)target_counter32 +
+                   (int64_t)service_offset_after_slip);
+    const uint32_t next_remaining =
+        (uint32_t)((uint16_t)(next_low16 - service_counter_low16));
 
     lane.cadence_next_counter32 = next_target;
     lane.cadence_next_low16 = next_low16;
@@ -7872,12 +8285,12 @@ static void ocxo_cadence_capture_priority0(ocxo_runtime_context_t& ctx,
         ? (target_counter32 - lane.cadence_epoch_counter32)
         : 0U;
 
-    const bool target_is_behind =
-        (next_remaining == 0 || next_remaining > 0x7FFFFFFFUL);
+    const bool target_is_behind = (next_remaining == 0);
     const bool too_close = !target_is_behind &&
         next_remaining < OCXO_WITNESS_MIN_ARM_LEAD_TICKS;
     const bool too_far = !target_is_behind &&
-        next_remaining > OCXO_WITNESS_ARM_WINDOW_TICKS;
+        next_remaining > (OCXO_WITNESS_LOWWORD_RANGE_TICKS -
+                          OCXO_WITNESS_MIN_ARM_LEAD_TICKS);
 
     if (target_is_behind || too_close || too_far) {
       lane.witness_generation_guard_block_count++;
@@ -8304,6 +8717,22 @@ static void qtimer1_vclock_capture_priority0(uint32_t isr_entry_dwt_raw,
                           isr_entry_dwt_raw,
                           csctrl_entry,
                           0U);
+
+  uint32_t vclock_observed_dwt_at_target =
+      qtimer_event_dwt_from_isr_entry_raw(isr_entry_dwt_raw);
+  const uint32_t vclock_late_ticks = service_counter32 - target_counter32;
+  if (vclock_late_ticks != 0 && vclock_late_ticks < VCLOCK_INTERVAL_COUNTS) {
+    vclock_observed_dwt_at_target -= vclock_cycles_for_ticks(vclock_late_ticks);
+  }
+  (void)slipledger_record_1khz(g_vclock_lane.slip,
+                               SLIPLEDGER_VCLOCK_ACTIVE,
+                               target_counter32,
+                               target_low16,
+                               service_low16,
+                               g_vclock_lane.tick_mod_1000,
+                               false,
+                               false,
+                               vclock_observed_dwt_at_target);
 
   qtimer1_vclock_clear_compare_flag();
 
@@ -9601,6 +10030,23 @@ static FLASHMEM void add_ocxo_lean_lane(Payload& p,
   add_i32("yardstick_imo", lane.yardstick_last_inferred_minus_observed_cycles);
   add_i32("yardstick_auth_error", lane.yardstick_auth_last_error_cycles);
   add_bool("zero_worthy", lane.zw_worthy);
+
+  add_bool("slipledger_active", SLIPLEDGER_OCXO_ACTIVE);
+  add_i32("slipledger_ticks", lane.slip.ledger_ticks);
+  add_i32("slipledger_last_event_ticks", lane.slip.last_event_ticks);
+  add_u32("slipledger_generation", lane.slip.generation);
+  add_u32("slipledger_observe_count", lane.slip.observe_count);
+  add_u32("slipledger_violation_count", lane.slip.violation_count);
+  add_u32("slipledger_correction_count", lane.slip.correction_count);
+  add_u32("slipledger_one_second_violation_count", lane.slip.one_second_violation_count);
+  add_u32("slipledger_one_second_correction_count", lane.slip.one_second_correction_count);
+  add_i32("slipledger_last_dwt_error_cycles", lane.slip.last_dwt_error_cycles);
+  add_u32("slipledger_last_observed_dwt", lane.slip.last_observed_dwt_at_event);
+  add_u32("slipledger_last_authored_dwt", lane.slip.last_authored_dwt_at_event);
+  add_u32("slipledger_last_correction_reason_code", lane.slip.last_correction_reason);
+  add_i32("slipledger_last_correction_ticks", lane.slip.last_correction_ticks);
+  add_i32("slipledger_last_correction_dwt_error_cycles", lane.slip.last_correction_dwt_error_cycles);
+  add_str("slipledger_last_reason", slipledger_reason_name(lane.slip.last_reason));
 }
 
 static FLASHMEM Payload cmd_report(const Payload&) {
@@ -9805,20 +10251,73 @@ static FLASHMEM void add_dwt_capture_lane(Payload& p,
            s.generation_gate_last_reject_one_second_due);
 }
 
+
+
+static FLASHMEM void add_slipledger_lane(Payload& p,
+                                         const char* prefix,
+                                         const slipledger_lane_t& s,
+                                         bool active) {
+  char key[96];
+  auto add_bool = [&](const char* suffix, bool value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value);
+  };
+  auto add_u32 = [&](const char* suffix, uint32_t value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value);
+  };
+  auto add_i32 = [&](const char* suffix, int32_t value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value);
+  };
+  auto add_str = [&](const char* suffix, const char* value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value ? value : "");
+  };
+
+  add_bool("slipledger_active", active);
+  add_i32("slipledger_ticks", s.ledger_ticks);
+  add_i32("slipledger_last_event_ticks", s.last_event_ticks);
+  add_u32("slipledger_generation", s.generation);
+  add_u32("slipledger_observe_count", s.observe_count);
+  add_u32("slipledger_violation_count", s.violation_count);
+  add_u32("slipledger_correction_count", s.correction_count);
+  add_u32("slipledger_one_second_violation_count", s.one_second_violation_count);
+  add_u32("slipledger_one_second_correction_count", s.one_second_correction_count);
+  add_bool("slipledger_last_corrected", s.last_event_corrected);
+  add_bool("slipledger_last_violation", s.last_event_violation);
+  add_i32("slipledger_last_dwt_error_cycles", s.last_dwt_error_cycles);
+  add_u32("slipledger_last_observed_dwt", s.last_observed_dwt_at_event);
+  add_u32("slipledger_last_authored_dwt", s.last_authored_dwt_at_event);
+  add_u32("slipledger_last_target_counter32", s.last_target_counter32);
+  add_u32("slipledger_last_hardware_target_low16", (uint32_t)s.last_hardware_target_low16);
+  add_u32("slipledger_last_ambient_low16", (uint32_t)s.last_ambient_low16);
+  add_u32("slipledger_last_correction_reason_code", s.last_correction_reason);
+  add_i32("slipledger_last_correction_ticks", s.last_correction_ticks);
+  add_i32("slipledger_last_correction_dwt_error_cycles", s.last_correction_dwt_error_cycles);
+  add_str("slipledger_last_reason", slipledger_reason_name(s.last_reason));
+}
+
 static FLASHMEM Payload cmd_report_dwt_capture(const Payload&) {
   Payload p;
   p.add("report", "DWT_CAPTURE");
-  p.add("schema", "DWT_CAPTURE_V3_COMPACT");
-  p.add("doctrine", "GENERATION_GATE_ACTIVE_FALSE_MATCHES_IGNORED");
-  p.add("hypothesis", "FALSE_16BIT_EARLY_MATCH_ADVANCES_1KHZ_LADDER");
+  p.add("schema", "DWT_CAPTURE_V4_SLIPLEDGER");
+  p.add("doctrine", "GENERATION_GATE_PLUS_SLIPLEDGER_DWT_LAWFUL_ARMING");
+  p.add("hypothesis", "HARDWARE_COUNTER_PHASE_SLIP_CORRECTED_BY_SIGNED_LEDGER");
   p.add("payload_policy", "COMPACT_ALWAYS_RETURNS");
   p.add("expected_cntr_interval_ticks", DWT_CAPTURE_EXPECTED_CNTR_INTERVAL_TICKS);
   p.add("dwt_gate_cycles", DWT_CAPTURE_DWT_INTERVAL_GATE_CYCLES);
   p.add("generation_late_accept_warn_ticks",
         DWT_CAPTURE_GENERATION_LATE_ACCEPT_WARN_TICKS);
+  p.add("slipledger_1khz_gate_cycles", SLIPLEDGER_1KHZ_GATE_CYCLES);
+  p.add("slipledger_ocxo_active", SLIPLEDGER_OCXO_ACTIVE);
+  p.add("slipledger_vclock_active", SLIPLEDGER_VCLOCK_ACTIVE);
   add_dwt_capture_lane(p, "vclock", g_dwt_capture_vclock);
+  add_slipledger_lane(p, "vclock", g_vclock_lane.slip, SLIPLEDGER_VCLOCK_ACTIVE);
   add_dwt_capture_lane(p, "ocxo1", g_dwt_capture_ocxo1);
+  add_slipledger_lane(p, "ocxo1", g_ocxo1_lane.slip, SLIPLEDGER_OCXO_ACTIVE);
   add_dwt_capture_lane(p, "ocxo2", g_dwt_capture_ocxo2);
+  add_slipledger_lane(p, "ocxo2", g_ocxo2_lane.slip, SLIPLEDGER_OCXO_ACTIVE);
   return p;
 }
 
@@ -9876,6 +10375,17 @@ static FLASHMEM Payload cmd_report_lane(const Payload& args) {
     p.add("tick_mod_1000", g_vclock_lane.tick_mod_1000);
     p.add("ch2_one_second_enabled", (bool)g_vclock_ch2_one_second_enabled);
     p.add("ch2_next_counter32", (uint32_t)g_vclock_ch2_one_second_next_counter32);
+    p.add("slipledger_active", SLIPLEDGER_VCLOCK_ACTIVE);
+    p.add("slipledger_ticks", g_vclock_lane.slip.ledger_ticks);
+    p.add("slipledger_generation", g_vclock_lane.slip.generation);
+    p.add("slipledger_observe_count", g_vclock_lane.slip.observe_count);
+    p.add("slipledger_violation_count", g_vclock_lane.slip.violation_count);
+    p.add("slipledger_correction_count", g_vclock_lane.slip.correction_count);
+    p.add("slipledger_last_dwt_error_cycles", g_vclock_lane.slip.last_dwt_error_cycles);
+    p.add("slipledger_last_correction_reason_code", g_vclock_lane.slip.last_correction_reason);
+    p.add("slipledger_last_correction_ticks", g_vclock_lane.slip.last_correction_ticks);
+    p.add("slipledger_last_correction_dwt_error_cycles", g_vclock_lane.slip.last_correction_dwt_error_cycles);
+    p.add("slipledger_last_reason", slipledger_reason_name(g_vclock_lane.slip.last_reason));
     return p;
   }
   if (!strcasecmp(lane, "OCXO1") || !strcasecmp(lane, "O1")) { add_ocxo_lean_lane(p, "ocxo1", g_ocxo1_ctx); return p; }

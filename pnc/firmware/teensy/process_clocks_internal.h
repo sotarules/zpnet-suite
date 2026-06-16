@@ -400,6 +400,41 @@ struct clocks_alpha_lane_forensics_t {
   int32_t  dwt_yardstick_auth_error_cycles;
   bool     dwt_yardstick_auth_anchor_applied;
 
+  // SlipLedger correction summary from process_interrupt.  The subscriber
+  // DWT value is already purified; these fields are the compact forensic
+  // trail for any signed hardware-counter phase correction applied at 1 kHz.
+  bool     slipledger_active;
+  bool     slipledger_event_corrected;
+  bool     slipledger_event_violation;
+  int32_t  slipledger_ticks;
+  int32_t  slipledger_event_ticks;
+  uint32_t slipledger_generation;
+  uint32_t slipledger_observe_count;
+  uint32_t slipledger_ok_count;
+  uint32_t slipledger_violation_count;
+  uint32_t slipledger_correction_count;
+  uint32_t slipledger_noop_violation_count;
+  uint32_t slipledger_early_count;
+  uint32_t slipledger_late_count;
+  uint32_t slipledger_one_second_observe_count;
+  uint32_t slipledger_one_second_ok_count;
+  uint32_t slipledger_one_second_violation_count;
+  uint32_t slipledger_one_second_correction_count;
+  uint32_t slipledger_last_expected_dwt;
+  uint32_t slipledger_last_observed_dwt;
+  uint32_t slipledger_last_authored_dwt;
+  uint32_t slipledger_last_expected_interval_cycles;
+  uint32_t slipledger_last_observed_interval_cycles;
+  int32_t  slipledger_last_dwt_error_cycles;
+  uint32_t slipledger_last_target_counter32;
+  uint16_t slipledger_last_hardware_target_low16;
+  uint16_t slipledger_last_ambient_low16;
+  uint32_t slipledger_last_tick_mod;
+  uint32_t slipledger_reason_code;
+  uint32_t slipledger_last_correction_reason_code;
+  int32_t  slipledger_last_correction_ticks;
+  int32_t  slipledger_last_correction_dwt_error_cycles;
+
   int64_t  second_residual_ns;
   int64_t  window_error_ns;
   uint32_t window_checks;

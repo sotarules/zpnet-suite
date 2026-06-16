@@ -1231,6 +1231,29 @@ static void payload_add_lane_forensics_object(Payload& parent,
                 valid && f.dwt_yardstick_auth_anchor_applied);
   forensics.add_object("dwt_yardstick", yardstick);
 
+
+  // Keep the paired TIMEBASE_FORENSICS row lean enough to arrive before the
+  // next fragment.  REPORT_DWT_CAPTURE carries the full SlipLedger dossier;
+  // TIMEBASE carries only the durable campaign-row summary.
+  if (valid && f.slipledger_active) {
+    Payload slip;
+    slip.add("active", true);
+    slip.add("ticks", f.slipledger_ticks);
+    slip.add("generation", f.slipledger_generation);
+    slip.add("violation_count", f.slipledger_violation_count);
+    slip.add("correction_count", f.slipledger_correction_count);
+    slip.add("event_violation", f.slipledger_event_violation);
+    slip.add("event_corrected", f.slipledger_event_corrected);
+    slip.add("last_dwt_error_cycles", f.slipledger_last_dwt_error_cycles);
+    slip.add("last_correction_ticks", f.slipledger_last_correction_ticks);
+    slip.add("last_correction_dwt_error_cycles",
+             f.slipledger_last_correction_dwt_error_cycles);
+    slip.add("reason_code", f.slipledger_reason_code);
+    slip.add("last_correction_reason_code",
+             f.slipledger_last_correction_reason_code);
+    forensics.add_object("slipledger", slip);
+  }
+
   parent.add_object("forensics", forensics);
 }
 
@@ -3030,6 +3053,28 @@ static void add_alpha_event_payload(Payload& p,
   dwt_authority.add("synthetic_error_cycles",
                     f.dwt_synthetic_error_cycles);
   p.add_object("dwt_authority", dwt_authority);
+
+
+  Payload slipledger;
+  slipledger.add("active", f.slipledger_active);
+  slipledger.add("event_corrected", f.slipledger_event_corrected);
+  slipledger.add("event_violation", f.slipledger_event_violation);
+  slipledger.add("ticks", f.slipledger_ticks);
+  slipledger.add("event_ticks", f.slipledger_event_ticks);
+  slipledger.add("generation", f.slipledger_generation);
+  slipledger.add("observe_count", f.slipledger_observe_count);
+  slipledger.add("violation_count", f.slipledger_violation_count);
+  slipledger.add("correction_count", f.slipledger_correction_count);
+  slipledger.add("one_second_violation_count", f.slipledger_one_second_violation_count);
+  slipledger.add("one_second_correction_count", f.slipledger_one_second_correction_count);
+  slipledger.add("last_dwt_error_cycles", f.slipledger_last_dwt_error_cycles);
+  slipledger.add("last_observed_dwt", f.slipledger_last_observed_dwt);
+  slipledger.add("last_authored_dwt", f.slipledger_last_authored_dwt);
+  slipledger.add("reason_code", f.slipledger_reason_code);
+  slipledger.add("last_correction_reason_code", f.slipledger_last_correction_reason_code);
+  slipledger.add("last_correction_ticks", f.slipledger_last_correction_ticks);
+  slipledger.add("last_correction_dwt_error_cycles", f.slipledger_last_correction_dwt_error_cycles);
+  p.add_object("slipledger", slipledger);
 
   p.add("ns_between_edges", f.ns_between_edges);
   p.add("dwt_cycles_between_edges", f.dwt_cycles_between_edges);

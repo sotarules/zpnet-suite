@@ -239,6 +239,42 @@ struct interrupt_capture_diag_t {
   uint32_t ocxo_boundary_counter32_at_event = 0;
   int32_t  ocxo_boundary_correction_cycles = 0;
 
+  // SlipLedger correction/forensics.  process_interrupt mutates only the
+  // lane-local signed compare-arm displacement; subscribers receive the
+  // purified DWT edge while TIMEBASE carries these counters/summaries.
+  bool     slipledger_active = false;
+  bool     slipledger_event_corrected = false;
+  bool     slipledger_event_violation = false;
+  int32_t  slipledger_ticks = 0;
+  int32_t  slipledger_event_ticks = 0;
+  uint32_t slipledger_generation = 0;
+  uint32_t slipledger_observe_count = 0;
+  uint32_t slipledger_ok_count = 0;
+  uint32_t slipledger_violation_count = 0;
+  uint32_t slipledger_correction_count = 0;
+  uint32_t slipledger_noop_violation_count = 0;
+  uint32_t slipledger_early_count = 0;
+  uint32_t slipledger_late_count = 0;
+  uint32_t slipledger_one_second_observe_count = 0;
+  uint32_t slipledger_one_second_ok_count = 0;
+  uint32_t slipledger_one_second_violation_count = 0;
+  uint32_t slipledger_one_second_correction_count = 0;
+  uint32_t slipledger_last_expected_dwt = 0;
+  uint32_t slipledger_last_observed_dwt = 0;
+  uint32_t slipledger_last_authored_dwt = 0;
+  uint32_t slipledger_last_expected_interval_cycles = 0;
+  uint32_t slipledger_last_observed_interval_cycles = 0;
+  int32_t  slipledger_last_dwt_error_cycles = 0;
+  uint32_t slipledger_last_target_counter32 = 0;
+  uint16_t slipledger_last_hardware_target_low16 = 0;
+  uint16_t slipledger_last_ambient_low16 = 0;
+  uint32_t slipledger_last_tick_mod = 0;
+  uint32_t slipledger_reason_code = 0;
+  uint32_t slipledger_last_correction_reason_code = 0;
+  int32_t  slipledger_last_correction_ticks = 0;
+  int32_t  slipledger_last_correction_dwt_error_cycles = 0;
+  const char* slipledger_reason = nullptr;
+
   uint32_t anomaly_count = 0;
 };
 
