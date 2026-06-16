@@ -1949,21 +1949,25 @@ static volatile interrupt_pps_entry_latency_handler_fn
 // Per-lane state
 // ============================================================================
 // ============================================================================
-// SlipLedger — signed hardware-counter phase correction
+// SlipLedger — DWT/counter consistency witness
 // ============================================================================
 //
-// QTimer compare hardware is retained as the wakeup mechanism, but the
-// semantic +10,000 tick ladder is DWT-lawful.  If a lane reaches the authored
-// compare target too early/late in DWT time, the hardware counter phase has
-// slipped relative to the semantic schedule.  Do not mutate clock truth; mutate
-// only this signed mapping:
+// QTimer compare hardware is retained as the wakeup mechanism, and the
+// semantic +10,000 tick ladder remains the counter32 authority.  A standalone
+// QTimer sketch has exonerated the OCXO hardware counter paths, so SlipLedger
+// is deliberately witness-only in this build: it records expected/observed
+// DWT interval disagreement, early/late classification, and proposed tick
+// correction magnitude, but it must not mutate compare targets, counter32
+// anchors, or published DWT endpoints.
 //
-//   semantic_counter32 = hardware_counter32 + slip_ledger_ticks
-//   hardware_compare_low16 = semantic_target32 - slip_ledger_ticks
-//
-// OCXO lanes apply the correction immediately.  VCLOCK carries the same audit
-// surface, but its sovereign rail remains observational in this checkpoint.
-static constexpr bool     SLIPLEDGER_OCXO_ACTIVE = true;
+// Invariants for witness-only mode:
+//   target_low16              == (uint16_t)target_counter32
+//   accepted_hardware_low16   == (uint16_t)target_counter32
+//   ctx.clock32->hardware16   == (uint16_t)target_counter32
+//   slipledger_ticks          == 0
+//   slipledger_generation     == 0
+//   slipledger_correction_*   == 0
+static constexpr bool     SLIPLEDGER_OCXO_ACTIVE = false;
 static constexpr bool     SLIPLEDGER_VCLOCK_ACTIVE = false;
 static constexpr uint32_t SLIPLEDGER_1KHZ_GATE_CYCLES = 16U;
 // SlipLedger is a small, local 1 kHz phase-correction mechanism.  If the
@@ -2102,7 +2106,8 @@ static int32_t slipledger_clamp_ticks(int64_t value, bool* out_clamped) {
 
 static uint16_t slipledger_hardware_low16_from_semantic(uint32_t semantic_counter32,
                                                         int32_t ledger_ticks) {
-  return (uint16_t)((int64_t)semantic_counter32 - (int64_t)ledger_ticks);
+  (void)ledger_ticks;
+  return (uint16_t)(semantic_counter32 & 0xFFFFU);
 }
 
 static slipledger_decision_t slipledger_record_1khz(
@@ -2157,8 +2162,6 @@ static slipledger_decision_t slipledger_record_1khz(
 
   uint32_t reason = SLIPLEDGER_REASON_OK;
   bool corrected = false;
-  bool clamped = false;
-
   s.observe_count++;
   if (one_second_due) s.one_second_observe_count++;
 
@@ -2195,35 +2198,17 @@ static slipledger_decision_t slipledger_record_1khz(
   } else {
     s.violation_count++;
     if (one_second_due) s.one_second_violation_count++;
-    out.authored_dwt_at_event = expected_dwt;
+
+    // Witness-only mode: do not replace the event DWT with expected_dwt and
+    // do not move the signed hardware mapping.  Keep the proposed tick
+    // correction visible through slipledger_event_ticks / last_dwt_error, but
+    // leave all correction counters and ledger state neutral.
+    out.authored_dwt_at_event = observed_dwt_at_event;
     if (dwt_error < 0) s.early_count++;
     else s.late_count++;
 
-    if (active && correction_ticks != 0) {
-      const int64_t requested = (int64_t)s.ledger_ticks +
-                                (int64_t)correction_ticks;
-      const int32_t next = slipledger_clamp_ticks(requested, &clamped);
-      const int32_t applied = next - s.ledger_ticks;
-      s.ledger_ticks = next;
-      correction_ticks = applied;
-      s.generation++;
-      s.correction_count++;
-      if (one_second_due) s.one_second_correction_count++;
-      corrected = applied != 0;
-      reason = clamped ? SLIPLEDGER_REASON_CLAMPED
-                       : (dwt_error < 0
-                            ? SLIPLEDGER_REASON_EARLY_CORRECTED
-                            : SLIPLEDGER_REASON_LATE_CORRECTED);
-      if (corrected) {
-        s.last_correction_reason = reason;
-        s.last_correction_ticks = applied;
-        s.last_correction_dwt_error_cycles = dwt_error;
-      }
-    } else {
-      s.noop_violation_count++;
-      correction_ticks = 0;
-      reason = SLIPLEDGER_REASON_VIOLATION_NO_TICK_CORRECTION;
-    }
+    s.noop_violation_count++;
+    reason = SLIPLEDGER_REASON_VIOLATION_NO_TICK_CORRECTION;
   }
 
   s.previous_target_counter32 = target_counter32;
