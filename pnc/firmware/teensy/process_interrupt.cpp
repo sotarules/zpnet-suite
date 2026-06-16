@@ -65,6 +65,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <strings.h>
+#include <string.h>
 #include <climits>
 
 
@@ -2371,9 +2372,11 @@ struct dwt_capture_lane_t {
   uint32_t generation_gate_early_reject_count = 0;
   uint32_t generation_gate_late_accept_count = 0;
   uint32_t generation_gate_far_late_accept_count = 0;
+  uint32_t generation_gate_far_late_reject_count = 0;
   uint32_t generation_gate_max_far_late_delta_ticks = 0;
 
   bool     generation_gate_last_far_late_valid = false;
+  bool     generation_gate_last_far_late_accepted = false;
   uint32_t generation_gate_last_far_late_resolved_counter32 = 0;
   uint32_t generation_gate_last_far_late_target_counter32 = 0;
   int32_t  generation_gate_last_far_late_delta_ticks = 0;
@@ -2505,10 +2508,24 @@ static inline uint32_t dwt_capture_expected_dwt_cycles(void) {
 }
 
 static constexpr uint32_t DWT_CAPTURE_GENERATION_LATE_ACCEPT_WARN_TICKS = 8U;
+// Far-late compare-tooth policy.
+//
+// Far-late accepts are currently witness-only.  The previous experimental
+// reject/rearm behavior proved too aggressive during OCXO2 startup: a harmless
+// late service tooth could be converted into a run of wrong-generation rejects.
+// Keep the threshold and full black-box snapshot fields, but do not let a
+// far-late positive delta reject or reauthor the OCXO compare ladder.
+static constexpr bool     DWT_CAPTURE_GENERATION_REJECT_FAR_LATE_ENABLED = false;
+static constexpr uint32_t DWT_CAPTURE_GENERATION_FAR_LATE_REJECT_TICKS =
+    DWT_CAPTURE_GENERATION_LATE_ACCEPT_WARN_TICKS;
 
-static const char* dwt_capture_generation_reason(int32_t resolved_minus_target_ticks) {
+static const char* dwt_capture_generation_reason(int32_t resolved_minus_target_ticks,
+                                                 bool far_late_rejected) {
   if (resolved_minus_target_ticks < 0) {
     return "reject_resolved_counter32_before_target32";
+  }
+  if (far_late_rejected) {
+    return "reject_resolved_counter32_far_late";
   }
   if (resolved_minus_target_ticks == 0) {
     return "accept_resolved_counter32_equals_target32";
@@ -2529,6 +2546,7 @@ static bool dwt_capture_record_generation_gate(
     uint32_t clock32_current_counter32,
     uint16_t clock32_hardware16,
     int32_t slipledger_ticks,
+    bool reject_far_late_accepts,
     uint32_t tick_mod,
     bool one_second_due,
     bool smartzero,
@@ -2541,41 +2559,55 @@ static bool dwt_capture_record_generation_gate(
   const int32_t domain_skew_ticks =
       (int32_t)((int64_t)target_hardware_delta_ticks -
                 (int64_t)target_semantic_delta_ticks);
-  const bool accepted = delta >= 0;
-  const char* reason = dwt_capture_generation_reason(delta);
+  const bool far_late = delta > (int32_t)DWT_CAPTURE_GENERATION_LATE_ACCEPT_WARN_TICKS;
+  const bool far_late_rejected =
+      far_late &&
+      reject_far_late_accepts &&
+      DWT_CAPTURE_GENERATION_REJECT_FAR_LATE_ENABLED &&
+      (uint32_t)delta > DWT_CAPTURE_GENERATION_FAR_LATE_REJECT_TICKS;
+  const bool accepted = delta >= 0 && !far_late_rejected;
+  const char* reason = dwt_capture_generation_reason(delta, far_late_rejected);
 
   s.generation_gate_observe_count++;
+  if (far_late) {
+    if ((uint32_t)delta > s.generation_gate_max_far_late_delta_ticks) {
+      s.generation_gate_max_far_late_delta_ticks = (uint32_t)delta;
+    }
+    s.generation_gate_last_far_late_valid = true;
+    s.generation_gate_last_far_late_accepted = accepted;
+    s.generation_gate_last_far_late_resolved_counter32 = resolved_counter32;
+    s.generation_gate_last_far_late_target_counter32 = target_counter32;
+    s.generation_gate_last_far_late_delta_ticks = delta;
+    s.generation_gate_last_far_late_ambient_low16 = ambient_low16;
+    s.generation_gate_last_far_late_target_low16 = target_low16;
+    s.generation_gate_last_far_late_clock32_current_counter32 = clock32_current_counter32;
+    s.generation_gate_last_far_late_clock32_hardware16 = clock32_hardware16;
+    s.generation_gate_last_far_late_slipledger_ticks = slipledger_ticks;
+    s.generation_gate_last_far_late_target_semantic_delta_ticks = target_semantic_delta_ticks;
+    s.generation_gate_last_far_late_target_hardware_delta_ticks = target_hardware_delta_ticks;
+    s.generation_gate_last_far_late_domain_skew_ticks = domain_skew_ticks;
+    s.generation_gate_last_far_late_isr_entry_dwt_raw = isr_entry_dwt_raw;
+    s.generation_gate_last_far_late_tick_mod = tick_mod;
+    s.generation_gate_last_far_late_one_second_due = one_second_due;
+    s.generation_gate_last_far_late_smartzero = smartzero;
+    s.generation_gate_last_far_late_reason = reason;
+  }
+
   if (accepted) {
     s.generation_gate_accept_count++;
     if (delta > 0) {
       s.generation_gate_late_accept_count++;
-      if ((uint32_t)delta > DWT_CAPTURE_GENERATION_LATE_ACCEPT_WARN_TICKS) {
+      if (far_late) {
         s.generation_gate_far_late_accept_count++;
-        if ((uint32_t)delta > s.generation_gate_max_far_late_delta_ticks) {
-          s.generation_gate_max_far_late_delta_ticks = (uint32_t)delta;
-        }
-        s.generation_gate_last_far_late_valid = true;
-        s.generation_gate_last_far_late_resolved_counter32 = resolved_counter32;
-        s.generation_gate_last_far_late_target_counter32 = target_counter32;
-        s.generation_gate_last_far_late_delta_ticks = delta;
-        s.generation_gate_last_far_late_ambient_low16 = ambient_low16;
-        s.generation_gate_last_far_late_target_low16 = target_low16;
-        s.generation_gate_last_far_late_clock32_current_counter32 = clock32_current_counter32;
-        s.generation_gate_last_far_late_clock32_hardware16 = clock32_hardware16;
-        s.generation_gate_last_far_late_slipledger_ticks = slipledger_ticks;
-        s.generation_gate_last_far_late_target_semantic_delta_ticks = target_semantic_delta_ticks;
-        s.generation_gate_last_far_late_target_hardware_delta_ticks = target_hardware_delta_ticks;
-        s.generation_gate_last_far_late_domain_skew_ticks = domain_skew_ticks;
-        s.generation_gate_last_far_late_isr_entry_dwt_raw = isr_entry_dwt_raw;
-        s.generation_gate_last_far_late_tick_mod = tick_mod;
-        s.generation_gate_last_far_late_one_second_due = one_second_due;
-        s.generation_gate_last_far_late_smartzero = smartzero;
-        s.generation_gate_last_far_late_reason = reason;
       }
     }
   } else {
     s.generation_gate_reject_count++;
-    s.generation_gate_early_reject_count++;
+    if (delta < 0) {
+      s.generation_gate_early_reject_count++;
+    } else if (far_late_rejected) {
+      s.generation_gate_far_late_reject_count++;
+    }
   }
 
   s.generation_gate_last_accepted = accepted;
@@ -3456,8 +3488,14 @@ static bool ocxo_lane_program_local_cadence_compare(
     uint32_t target_counter32,
     uint32_t reason);
 static void ocxo_lane_stop_local_cadence(ocxo_lane_t& lane, uint32_t reason);
+static void ocxo_lane_slipledger_witness_reset(ocxo_lane_t& lane);
 static void ocxo_lane_ema_reset(ocxo_lane_t& lane);
 static void ocxo_lane_yardstick_reset(ocxo_lane_t& lane);
+static void ocxo_lane_event_lineage_reset(ocxo_lane_t& lane);
+static void ocxo_lane_measurement_witness_reset(ocxo_lane_t& lane);
+static void ocxo_lane_install_hardware_synthetic_mapping(ocxo_lane_t& lane,
+                                                        synthetic_clock32_t& clock32,
+                                                        uint32_t epoch_counter32);
 static void ocxo_lane_install_logical_grid(interrupt_subscriber_kind_t kind,
                                            ocxo_lane_t& lane,
                                            synthetic_clock32_t& clock32,
@@ -5726,8 +5764,11 @@ static bool ocxo_lane_start_local_cadence(interrupt_subscriber_kind_t kind,
 }
 
 
-static void ocxo_lane_ema_reset(ocxo_lane_t& lane) {
+static void ocxo_lane_slipledger_witness_reset(ocxo_lane_t& lane) {
   slipledger_reset(lane.slip);
+}
+
+static void ocxo_lane_ema_reset(ocxo_lane_t& lane) {
   lane.ema_initialized = false;
   lane.ema_interval_valid = false;
   lane.ema_last_observed_dwt = 0;
@@ -5830,6 +5871,33 @@ static void ocxo_lane_yardstick_reset(ocxo_lane_t& lane) {
   lane.zw_disqualify_fast_lock_count = 0;
 }
 
+static void ocxo_lane_event_lineage_reset(ocxo_lane_t& lane) {
+  lane.witness_previous_event_counter32_valid = false;
+  lane.witness_previous_event_counter32 = 0;
+  lane.witness_last_counter_delta_ticks = 0;
+}
+
+static void ocxo_lane_measurement_witness_reset(ocxo_lane_t& lane) {
+  // Measurement/witness state only.  This deliberately does not touch
+  // clock32.current_counter32, clock32.hardware16, cadence_epoch_counter32,
+  // cadence_next_counter32, or any programmed hardware compare mapping.
+  ocxo_lane_ema_reset(lane);
+  ocxo_lane_yardstick_reset(lane);
+  ocxo_lane_slipledger_witness_reset(lane);
+}
+
+static void ocxo_lane_install_hardware_synthetic_mapping(
+    ocxo_lane_t& lane,
+    synthetic_clock32_t&,
+    uint32_t epoch_counter32) {
+  // Mapping/grid state only.  Do not reset EMA, yardstick, or SlipLedger here;
+  // callers choose measurement reset explicitly so mapping changes and witness
+  // resets cannot be conflated.
+  lane.cadence_epoch_valid = true;
+  lane.cadence_epoch_counter32 = epoch_counter32;
+  lane.tick_mod_1000 = 0;
+}
+
 static void ocxo_lane_stop_local_cadence(ocxo_lane_t& lane, uint32_t reason) {
   lane.cadence_enabled = false;
   lane.cadence_armed = false;
@@ -5843,14 +5911,9 @@ static void ocxo_lane_install_logical_grid(interrupt_subscriber_kind_t kind,
                                            synthetic_clock32_t& clock32,
                                            uint32_t epoch_counter32,
                                            uint32_t reason) {
-  lane.cadence_epoch_valid = true;
-  lane.cadence_epoch_counter32 = epoch_counter32;
-  lane.tick_mod_1000 = 0;
-  ocxo_lane_ema_reset(lane);
-  ocxo_lane_yardstick_reset(lane);
-  lane.witness_previous_event_counter32_valid = false;
-  lane.witness_previous_event_counter32 = 0;
-  lane.witness_last_counter_delta_ticks = 0;
+  ocxo_lane_install_hardware_synthetic_mapping(lane, clock32, epoch_counter32);
+  ocxo_lane_measurement_witness_reset(lane);
+  ocxo_lane_event_lineage_reset(lane);
   cadence_regression_reset_kind(kind);
 
   if (lane.active || smartzero_is_current_lane(kind)) {
@@ -8309,12 +8372,100 @@ static void ocxo_cadence_capture_priority0(ocxo_runtime_context_t& ctx,
       gate_clock32_current_counter32,
       gate_clock32_hardware16,
       gate_slipledger_ticks,
+      false,
       event_tick_mod,
       one_second_due,
       was_smartzero_current,
       isr_entry_dwt_raw);
   if (!generation_accepted) {
     ocxo_lane_clear_compare_flag(lane);
+
+    const bool far_late_rejected =
+        dwt_capture_lane.generation_gate_last_delta_ticks >
+            (int32_t)DWT_CAPTURE_GENERATION_FAR_LATE_REJECT_TICKS &&
+        dwt_capture_lane.generation_gate_last_reason &&
+        strcmp(dwt_capture_lane.generation_gate_last_reason,
+               "reject_resolved_counter32_far_late") == 0;
+
+    if (far_late_rejected && keep_running) {
+      // A far-late tooth is not accepted as a custody sample, but leaving the
+      // stale COMP1 target armed would strand the local ladder until the next
+      // 16-bit lap.  Skip exactly this tooth and arm the next semantic tooth
+      // from the live low-word witness.  The next accepted tooth will expose
+      // the skipped interval through DWT_CAPTURE/SlipLedger discontinuity
+      // diagnostics; this path does not publish a one-second fact.
+      const uint32_t next_target = target_counter32 + OCXO_CADENCE_INTERVAL_TICKS;
+      const uint16_t next_low16 =
+          slipledger_hardware_low16_from_semantic(next_target,
+                                                  lane.slip.ledger_ticks);
+      const uint32_t next_remaining =
+          (uint32_t)((uint16_t)(next_low16 - service_counter_low16));
+      const bool target_is_behind = (next_remaining == 0);
+      const bool too_close = !target_is_behind &&
+          next_remaining < OCXO_WITNESS_MIN_ARM_LEAD_TICKS;
+      const bool too_far = !target_is_behind &&
+          next_remaining > (OCXO_WITNESS_LOWWORD_RANGE_TICKS -
+                            OCXO_WITNESS_MIN_ARM_LEAD_TICKS);
+
+      lane.cadence_next_counter32 = next_target;
+      lane.cadence_next_low16 = next_low16;
+      lane.compare_target = next_low16;
+      lane.witness_target_initialized = true;
+      lane.witness_target_counter32 = next_target;
+      lane.witness_target_low16 = next_low16;
+      lane.witness_schedule_last_current_counter32 = resolved_counter32;
+      lane.witness_schedule_last_target_counter32 = next_target;
+      lane.witness_schedule_last_remaining_ticks = next_remaining;
+      lane.witness_schedule_last_current_low16 = service_counter_low16;
+      lane.witness_schedule_last_target_low16 = next_low16;
+      lane.witness_schedule_last_phase_ticks = lane.cadence_epoch_valid
+          ? (target_counter32 - lane.cadence_epoch_counter32)
+          : 0U;
+
+      if (lane.cadence_epoch_valid) {
+        lane.tick_mod_1000 = (event_tick_mod + 1U) % TICKS_PER_SECOND_EVENT;
+      }
+
+      if (target_is_behind || too_close || too_far) {
+        lane.witness_generation_guard_block_count++;
+        lane.witness_generation_guard_last_remaining_ticks = next_remaining;
+        lane.witness_generation_guard_last_current_counter32 = resolved_counter32;
+        lane.witness_generation_guard_last_target_counter32 = next_target;
+        lane.witness_generation_guard_last_reason = OCXO_CADENCE_REASON_REARM;
+        lane.witness_schedule_last_decision = too_close
+            ? OCXO_SCHEDULE_DECISION_TOO_CLOSE
+            : (too_far ? OCXO_SCHEDULE_DECISION_OUTSIDE_WINDOW
+                       : OCXO_SCHEDULE_DECISION_GENERATION_GUARD_BLOCKED);
+        lane.witness_schedule_last_ticks_until_arm_window =
+            too_far ? (next_remaining - OCXO_WITNESS_ARM_WINDOW_TICKS) : 0U;
+        if (too_close) lane.witness_late_arm_count++;
+        ocxo_lane_disable_compare(lane);
+        lane.cadence_armed = false;
+        lane.witness_armed = false;
+      } else {
+        lane.witness_last_arm_dwt_raw = ARM_DWT_CYCCNT;
+        lane.witness_last_arm_counter32 = resolved_counter32;
+        lane.witness_last_arm_low16 = service_counter_low16;
+        lane.witness_last_arm_compare_low16 = service_compare_low16;
+        lane.witness_last_arm_counter_minus_compare_ticks =
+            (uint32_t)((uint16_t)(service_counter_low16 - service_compare_low16));
+        lane.witness_last_arm_compare_remaining_ticks =
+            (uint32_t)((uint16_t)(next_low16 - service_compare_low16));
+        lane.witness_last_arm_target_counter32 = next_target;
+        lane.witness_last_arm_target_low16 = next_low16;
+        lane.witness_last_arm_remaining_ticks = next_remaining;
+        lane.witness_schedule_last_decision = OCXO_SCHEDULE_DECISION_ARMED;
+        lane.witness_schedule_last_ticks_until_arm_window = 0;
+
+        ocxo_lane_program_compare(lane, next_low16);
+        lane.cadence_armed = true;
+        lane.witness_armed = true;
+        lane.cadence_arm_count++;
+        lane.cadence_rearm_count++;
+        lane.cadence_last_reason = OCXO_CADENCE_REASON_REARM;
+      }
+    }
+
     dwt_capture_lane.last_csctrl_after =
         lane.module->CH[lane.compare_channel].CSCTRL;
     interrupt_handoff_note_priority0_body(diag, isr_entry_dwt_raw);
@@ -8850,6 +9001,7 @@ static void qtimer1_vclock_capture_priority0(uint32_t isr_entry_dwt_raw,
       g_vclock_clock32.current_counter32,
       g_vclock_clock32.hardware16,
       g_vclock_lane.slip.ledger_ticks,
+      false,
       g_vclock_lane.tick_mod_1000,
       false,
       false,
@@ -9447,8 +9599,7 @@ bool interrupt_start(interrupt_subscriber_kind_t kind) {
   lane->active = true;
   lane->phase_bootstrapped = true;
   lane->tick_mod_1000 = 0;
-  ocxo_lane_ema_reset(*lane);
-  ocxo_lane_yardstick_reset(*lane);
+  ocxo_lane_measurement_witness_reset(*lane);
 
   // OCXO lanes now own only their local one-second edge compare.  Start the
   // one-second edge compare from the installed logical grid when available;
@@ -10018,10 +10169,16 @@ static FLASHMEM void add_generation_gate_lane(Payload& p,
   add_u32("generation_gate_reject_count", s.generation_gate_reject_count);
   add_u32("generation_gate_early_reject_count", s.generation_gate_early_reject_count);
   add_u32("generation_gate_late_accept_count", s.generation_gate_late_accept_count);
+  add_bool("generation_gate_far_late_reject_enabled",
+           DWT_CAPTURE_GENERATION_REJECT_FAR_LATE_ENABLED);
+  add_u32("generation_gate_far_late_reject_threshold_ticks",
+          DWT_CAPTURE_GENERATION_FAR_LATE_REJECT_TICKS);
   add_u32("generation_gate_far_late_accept_count", s.generation_gate_far_late_accept_count);
+  add_u32("generation_gate_far_late_reject_count", s.generation_gate_far_late_reject_count);
   add_u32("generation_gate_max_far_late_delta_ticks", s.generation_gate_max_far_late_delta_ticks);
 
   add_bool("generation_gate_last_far_late_valid", s.generation_gate_last_far_late_valid);
+  add_bool("generation_gate_last_far_late_accepted", s.generation_gate_last_far_late_accepted);
   add_str("generation_gate_last_far_late_reason", s.generation_gate_last_far_late_reason);
   add_i32("generation_gate_last_far_late_delta_ticks", s.generation_gate_last_far_late_delta_ticks);
   add_u32("generation_gate_last_far_late_resolved_counter32", s.generation_gate_last_far_late_resolved_counter32);
@@ -10229,6 +10386,7 @@ static FLASHMEM void add_ocxo_lean_lane(Payload& p,
   add_u32("generation_gate_reject_count", gate.generation_gate_reject_count);
   add_u32("generation_gate_early_reject_count", gate.generation_gate_early_reject_count);
   add_u32("generation_gate_far_late_accept_count", gate.generation_gate_far_late_accept_count);
+  add_u32("generation_gate_far_late_reject_count", gate.generation_gate_far_late_reject_count);
   add_bool("generation_gate_last_accepted", gate.generation_gate_last_accepted);
   add_i32("generation_gate_last_delta_ticks", gate.generation_gate_last_delta_ticks);
   add_i32("generation_gate_last_domain_skew_ticks", gate.generation_gate_last_domain_skew_ticks);
@@ -10556,8 +10714,10 @@ static FLASHMEM void add_dwt_capture_lane(Payload& p,
   add_u32("generation_gate_reject_count", s.generation_gate_reject_count);
   add_u32("generation_gate_early_reject_count", s.generation_gate_early_reject_count);
   add_u32("generation_gate_far_late_accept_count", s.generation_gate_far_late_accept_count);
+  add_u32("generation_gate_far_late_reject_count", s.generation_gate_far_late_reject_count);
   add_u32("generation_gate_max_far_late_delta_ticks", s.generation_gate_max_far_late_delta_ticks);
   add_bool("generation_gate_last_far_late_valid", s.generation_gate_last_far_late_valid);
+  add_bool("generation_gate_last_far_late_accepted", s.generation_gate_last_far_late_accepted);
   add_i32("generation_gate_last_far_late_delta_ticks", s.generation_gate_last_far_late_delta_ticks);
   add_i32("generation_gate_last_far_late_domain_skew_ticks", s.generation_gate_last_far_late_domain_skew_ticks);
   add_bool("generation_gate_last_accepted", s.generation_gate_last_accepted);
@@ -10630,6 +10790,10 @@ static FLASHMEM Payload cmd_report_dwt_capture(const Payload&) {
   p.add("dwt_gate_cycles", DWT_CAPTURE_DWT_INTERVAL_GATE_CYCLES);
   p.add("generation_late_accept_warn_ticks",
         DWT_CAPTURE_GENERATION_LATE_ACCEPT_WARN_TICKS);
+  p.add("generation_far_late_reject_enabled",
+        DWT_CAPTURE_GENERATION_REJECT_FAR_LATE_ENABLED);
+  p.add("generation_far_late_reject_threshold_ticks",
+        DWT_CAPTURE_GENERATION_FAR_LATE_REJECT_TICKS);
   p.add("slipledger_ocxo_active", SLIPLEDGER_OCXO_ACTIVE);
   p.add("slipledger_vclock_active", SLIPLEDGER_VCLOCK_ACTIVE);
   add_dwt_capture_lane(p, "vclock", g_dwt_capture_vclock);
