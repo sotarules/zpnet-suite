@@ -3484,6 +3484,17 @@ static vclock_synthetic_clock32_t g_vclock_clock32;
 static synthetic_clock32_t        g_ocxo1_clock32;
 static synthetic_clock32_t        g_ocxo2_clock32;
 
+// OCXO pending-zero retirement audit.  OCXO timing identity is now authored
+// only by explicit zero/grid installation and by the priority-0 compare
+// ladder.  request_zero remains a VCLOCK/PPS asynchronous mechanism; OCXO
+// request_zero calls are acknowledged as retired no-ops and counted here.
+static uint32_t g_ocxo1_pending_zero_request_retired_count = 0;
+static uint32_t g_ocxo2_pending_zero_request_retired_count = 0;
+static uint32_t g_ocxo_pending_zero_request_retired_count = 0;
+static uint32_t g_ocxo_pending_zero_request_last_counter32 = 0;
+static interrupt_subscriber_kind_t g_ocxo_pending_zero_request_last_kind =
+    interrupt_subscriber_kind_t::NONE;
+
 static volatile uint32_t g_qtimer1_ch1_sequence = 0;
 static volatile uint32_t g_qtimer1_ch1_target_counter32 = 0;
 static volatile uint32_t g_qtimer1_ch1_next_compare_counter32 = 0;
@@ -3820,13 +3831,37 @@ bool interrupt_clock32_request_zero_from_ns(interrupt_subscriber_kind_t kind, ui
     return true;
   }
 
-  synthetic_clock32_t* c = synthetic_clock_for_kind(kind);
-  if (!c) return false;
-  c->pending_zero = true;
-  c->pending_zero_ns = ns;
-  c->pending_zero_counter32 = counter32;
-  c->pending_zero_count++;
-  return true;
+  if (kind == interrupt_subscriber_kind_t::OCXO1 ||
+      kind == interrupt_subscriber_kind_t::OCXO2) {
+    synthetic_clock32_t* c = synthetic_clock_for_kind(kind);
+    if (!c) return false;
+
+    // Retired by doctrine: OCXO request-zero is intentionally not deferred.
+    // A deferred zero would be consumed later by synthetic_clock advancement,
+    // outside the same coherent transaction that reauthors current_counter32,
+    // hardware16, cadence_epoch_counter32, cadence_next_counter32, and
+    // tick_mod_1000.  OCXO zero/epoch changes must use the explicit
+    // interrupt_clock32_zero_from_ns() / interrupt_ocxo_logical_grid_epoch()
+    // paths instead.  Clear any stale pending bit defensively, but do not
+    // increment c->pending_zero_count; that field should remain zero for OCXO.
+    c->pending_zero = false;
+    c->pending_zero_ns = 0;
+    c->pending_zero_counter32 = 0;
+
+    g_ocxo_pending_zero_request_retired_count++;
+    g_ocxo_pending_zero_request_last_kind = kind;
+    g_ocxo_pending_zero_request_last_counter32 = counter32;
+    if (kind == interrupt_subscriber_kind_t::OCXO1) {
+      g_ocxo1_pending_zero_request_retired_count++;
+    } else {
+      g_ocxo2_pending_zero_request_retired_count++;
+    }
+
+    // Acknowledge the command contract while doing no deferred mutation.
+    return true;
+  }
+
+  return false;
 }
 
 void interrupt_ocxo_logical_grid_epoch(uint32_t ocxo1_epoch_counter32,
@@ -9642,6 +9677,11 @@ static void runtime_reset_clock32_state(void) {
   g_vclock_clock32 = vclock_synthetic_clock32_t{};
   g_ocxo1_clock32 = synthetic_clock32_t{};
   g_ocxo2_clock32 = synthetic_clock32_t{};
+  g_ocxo1_pending_zero_request_retired_count = 0;
+  g_ocxo2_pending_zero_request_retired_count = 0;
+  g_ocxo_pending_zero_request_retired_count = 0;
+  g_ocxo_pending_zero_request_last_counter32 = 0;
+  g_ocxo_pending_zero_request_last_kind = interrupt_subscriber_kind_t::NONE;
 }
 
 static void runtime_bootstrap_synthetic_clocks_if_ready(void) {
@@ -10028,6 +10068,8 @@ static FLASHMEM void add_ocxo_lean_lane(Payload& p,
   bool     clock32_pending_zero = false;
   uint32_t clock32_pending_zero_counter32 = 0;
   uint32_t clock32_pending_zero_count = 0;
+  uint32_t clock32_pending_zero_retired_request_count = 0;
+  uint32_t clock32_pending_zero_retired_request_total = 0;
   uint32_t clock32_current = 0;
   uint32_t clock32_zero = 0;
   uint16_t clock32_hw_anchor = 0;
@@ -10052,6 +10094,15 @@ static FLASHMEM void add_ocxo_lean_lane(Payload& p,
     clock32_hw_anchor = clock32->hardware16;
     clock32_minder_update_count = clock32->minder_update_count;
   }
+  if (ctx.kind == interrupt_subscriber_kind_t::OCXO1) {
+    clock32_pending_zero_retired_request_count =
+        g_ocxo1_pending_zero_request_retired_count;
+  } else if (ctx.kind == interrupt_subscriber_kind_t::OCXO2) {
+    clock32_pending_zero_retired_request_count =
+        g_ocxo2_pending_zero_request_retired_count;
+  }
+  clock32_pending_zero_retired_request_total =
+      g_ocxo_pending_zero_request_retired_count;
   cadence_enabled = lane.cadence_enabled;
   cadence_armed = lane.cadence_armed;
   cadence_epoch_valid = lane.cadence_epoch_valid;
@@ -10112,6 +10163,8 @@ static FLASHMEM void add_ocxo_lean_lane(Payload& p,
   add_u32("clock32_hardware16_anchor", (uint32_t)clock32_hw_anchor);
   add_bool("clock32_pending_zero", clock32_pending_zero);
   add_u32("clock32_pending_zero_count", clock32_pending_zero_count);
+  add_u32("clock32_pending_zero_retired_request_count",
+          clock32_pending_zero_retired_request_count);
   add_u32("live_hw16", (uint32_t)live_hw16);
   add_u32("live_projected_counter32", live_projected_counter32);
   add_u32("live_low16_delta_from_clock32_ticks", live_low16_delta_from_clock32);
@@ -10145,6 +10198,9 @@ static FLASHMEM void add_ocxo_lean_lane(Payload& p,
     add_bool("clock32_zeroed", clock32_zeroed);
     add_u32("clock32_zero_counter32", clock32_zero);
     add_u32("clock32_pending_zero_counter32", clock32_pending_zero_counter32);
+    add_u32("clock32_pending_zero_retired_request_total",
+            clock32_pending_zero_retired_request_total);
+    add_str("clock32_pending_zero_policy", "OCXO_REQUEST_ZERO_RETIRED_NOOP");
     add_u32("clock32_minder_update_count", clock32_minder_update_count);
     add_u32("live_compare_hw16", (uint32_t)live_compare_hw16);
     add_u32("live_counter_minus_compare_ticks",
