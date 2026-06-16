@@ -840,6 +840,46 @@ static void payload_add_smartzero_install_transaction(Payload& p) {
         clocks_alpha_smartzero_install_last_reason());
 }
 
+static void payload_add_visible_origin_snapshot(Payload& parent,
+                                                const char* key,
+                                                time_clock_id_t clock) {
+  clocks_alpha_ocxo_visible_origin_snapshot_t s{};
+  const bool available =
+      clocks_alpha_ocxo_visible_origin_snapshot(clock, &s);
+
+  Payload obj;
+  obj.add("available", available);
+  obj.add("valid", available && s.valid);
+  obj.add("pending", available && s.pending);
+  obj.add("phase_offset_in_range",
+          available && s.phase_offset_in_range);
+  obj.add("clock_id", available ? s.clock_id : 0U);
+  obj.add("epoch_sequence", available ? s.epoch_sequence : 0U);
+  obj.add("smartzero_sequence", available ? s.smartzero_sequence : 0U);
+  obj.add("capture_count", available ? s.capture_count : 0U);
+  obj.add("pps_vclock_dwt", available ? s.pps_vclock_dwt : 0U);
+  obj.add("ocxo_anchor_dwt",
+          available ? s.ocxo_anchor_dwt : 0U);
+  obj.add("dwt_cycles_per_second",
+          available ? s.dwt_cycles_per_second : 0U);
+  obj.add("elapsed_cycles_since_pps_vclock",
+          available ? s.elapsed_cycles_since_pps_vclock : 0U);
+  obj.add("elapsed_ns_since_pps_vclock",
+          available ? s.elapsed_ns_since_pps_vclock : 0ULL);
+  obj.add("phase_offset_ns", available ? s.phase_offset_ns : 0U);
+
+  parent.add_object(key, obj);
+}
+
+static void payload_add_visible_origin_summary(Payload& p) {
+  Payload visible_origin;
+  payload_add_visible_origin_snapshot(visible_origin, "ocxo1",
+                                      time_clock_id_t::OCXO1);
+  payload_add_visible_origin_snapshot(visible_origin, "ocxo2",
+                                      time_clock_id_t::OCXO2);
+  p.add_object("visible_origin", visible_origin);
+}
+
 static void payload_add_smartzero_summary(Payload& p) {
   interrupt_smartzero_snapshot_t live{};
   (void)interrupt_smartzero_live_snapshot(&live);
@@ -871,6 +911,7 @@ static void payload_add_smartzero_summary(Payload& p) {
   p.add("smartzero_pending_active", clocks_alpha_smartzero_pending_active());
   p.add("smartzero_pending_reason", clocks_alpha_smartzero_pending_reason());
   payload_add_smartzero_install_transaction(p);
+  payload_add_visible_origin_summary(p);
   p.add("smartzero_begin_service_epoch_preserved",
         clocks_alpha_smartzero_last_begin_preserved_epoch());
   p.add("smartzero_begin_preserved_epoch_sequence",

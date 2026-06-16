@@ -656,6 +656,40 @@ bool clocks_alpha_event_flow_snapshot(time_clock_id_t clock,
                                       clocks_alpha_event_flow_snapshot_t* out);
 
 // ============================================================================
+// Alpha OCXO visible-origin phase capture
+// ============================================================================
+//
+// Introductory surface for the campaign-visible OCXO zero doctrine. Alpha
+// computes this directly at SmartZero epoch install from the selected
+// PPS/VCLOCK DWT anchor and each OCXO SmartZero anchor DWT. The full anchor
+// span may be milliseconds; the visible-origin phase is the nanosecond residue
+// of that span inside one 10 MHz cell. This is diagnostic only in this step;
+// no public clock coordinate is adjusted yet.
+
+struct clocks_alpha_ocxo_visible_origin_snapshot_t {
+  bool     valid = false;
+  // Retained for report compatibility; direct SmartZero-anchor computation
+  // should complete synchronously at epoch install, so this should be false.
+  bool     pending = false;
+  bool     phase_offset_in_range = false;
+  uint32_t clock_id = 0;
+  uint32_t epoch_sequence = 0;
+  uint32_t smartzero_sequence = 0;
+  uint32_t capture_count = 0;
+
+  uint32_t pps_vclock_dwt = 0;
+  uint32_t ocxo_anchor_dwt = 0;
+  uint32_t dwt_cycles_per_second = 0;
+  uint32_t elapsed_cycles_since_pps_vclock = 0;
+  uint64_t elapsed_ns_since_pps_vclock = 0;
+  uint32_t phase_offset_ns = 0;
+};
+
+bool clocks_alpha_ocxo_visible_origin_snapshot(
+    time_clock_id_t clock,
+    clocks_alpha_ocxo_visible_origin_snapshot_t* out);
+
+// ============================================================================
 // Alpha OCXO PPS-edge projection forensics
 // ============================================================================
 //

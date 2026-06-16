@@ -2361,6 +2361,139 @@ static uint64_t alpha_ocxo_seed_ns_at_first_edge(uint32_t raw_edge_dwt) {
   return alpha_dwt_cycles_to_gnss_ns(raw_edge_dwt - epoch_dwt);
 }
 
+struct alpha_ocxo_visible_origin_state_t {
+  volatile uint32_t seq = 0;
+  clocks_alpha_ocxo_visible_origin_snapshot_t v = {};
+};
+
+static alpha_ocxo_visible_origin_state_t g_ocxo1_visible_origin = {};
+static alpha_ocxo_visible_origin_state_t g_ocxo2_visible_origin = {};
+
+static alpha_ocxo_visible_origin_state_t* alpha_ocxo_visible_origin_store(
+    time_clock_id_t clock) {
+  switch (clock) {
+    case time_clock_id_t::OCXO1: return &g_ocxo1_visible_origin;
+    case time_clock_id_t::OCXO2: return &g_ocxo2_visible_origin;
+    default:                    return nullptr;
+  }
+}
+
+static uint32_t alpha_ocxo_visible_origin_clock_id(time_clock_id_t clock) {
+  return (uint32_t)((uint8_t)clock);
+}
+
+static void alpha_ocxo_visible_origin_publish(
+    alpha_ocxo_visible_origin_state_t& s,
+    const clocks_alpha_ocxo_visible_origin_snapshot_t& local) {
+  s.seq++;
+  clocks_alpha_dmb();
+  s.v = local;
+  clocks_alpha_dmb();
+  s.seq++;
+}
+
+static void alpha_ocxo_visible_origin_reset_store(
+    alpha_ocxo_visible_origin_state_t& s,
+    time_clock_id_t clock) {
+  clocks_alpha_ocxo_visible_origin_snapshot_t local{};
+  local.clock_id = alpha_ocxo_visible_origin_clock_id(clock);
+  alpha_ocxo_visible_origin_publish(s, local);
+}
+
+static void alpha_ocxo_visible_origin_reset_all(void) {
+  alpha_ocxo_visible_origin_reset_store(g_ocxo1_visible_origin,
+                                        time_clock_id_t::OCXO1);
+  alpha_ocxo_visible_origin_reset_store(g_ocxo2_visible_origin,
+                                        time_clock_id_t::OCXO2);
+}
+
+static uint32_t alpha_ocxo_visible_origin_select_cps(
+    const interrupt_smartzero_lane_snapshot_t& vclock,
+    const interrupt_smartzero_lane_snapshot_t& ocxo) {
+  if (ocxo.cps_used != 0U) return ocxo.cps_used;
+  if (vclock.cps_used != 0U) return vclock.cps_used;
+
+  const uint32_t live_cps = dwt_effective_cycles_per_pps_vclock_second();
+  return live_cps ? live_cps : (uint32_t)DWT_EXPECTED_PER_PPS;
+}
+
+static uint64_t alpha_ocxo_visible_origin_delta_ns(
+    uint32_t elapsed_cycles,
+    uint32_t dwt_cycles_per_second) {
+  if (dwt_cycles_per_second == 0U) return 0ULL;
+  return ((uint64_t)elapsed_cycles * NS_PER_SECOND_U64 +
+          (uint64_t)dwt_cycles_per_second / 2ULL) /
+         (uint64_t)dwt_cycles_per_second;
+}
+
+static void alpha_ocxo_visible_origin_capture_from_smartzero(
+    time_clock_id_t clock,
+    uint32_t epoch_sequence,
+    uint32_t smartzero_sequence,
+    uint32_t pps_vclock_dwt,
+    uint32_t ocxo_anchor_dwt,
+    uint32_t dwt_cycles_per_second) {
+  alpha_ocxo_visible_origin_state_t* s =
+      alpha_ocxo_visible_origin_store(clock);
+  if (!s) return;
+
+  const bool basis_valid =
+      pps_vclock_dwt != 0U &&
+      ocxo_anchor_dwt != 0U &&
+      dwt_cycles_per_second != 0U;
+  const uint32_t elapsed_cycles = basis_valid
+      ? (uint32_t)(ocxo_anchor_dwt - pps_vclock_dwt)
+      : 0U;
+  const uint64_t elapsed_ns = basis_valid
+      ? alpha_ocxo_visible_origin_delta_ns(elapsed_cycles,
+                                           dwt_cycles_per_second)
+      : 0ULL;
+  const uint32_t phase_ns = basis_valid
+      ? (uint32_t)(elapsed_ns % (uint64_t)NS_PER_10MHZ_TICK)
+      : 0U;
+
+  clocks_alpha_ocxo_visible_origin_snapshot_t local{};
+  local.valid = basis_valid;
+  local.pending = !basis_valid;
+  local.phase_offset_in_range =
+      basis_valid && phase_ns < (uint32_t)NS_PER_10MHZ_TICK;
+  local.clock_id = alpha_ocxo_visible_origin_clock_id(clock);
+  local.epoch_sequence = epoch_sequence;
+  local.smartzero_sequence = smartzero_sequence;
+  local.capture_count = s->v.capture_count + (basis_valid ? 1U : 0U);
+  local.pps_vclock_dwt = pps_vclock_dwt;
+  local.ocxo_anchor_dwt = ocxo_anchor_dwt;
+  local.dwt_cycles_per_second = dwt_cycles_per_second;
+  local.elapsed_cycles_since_pps_vclock = elapsed_cycles;
+  local.elapsed_ns_since_pps_vclock = elapsed_ns;
+  local.phase_offset_ns = phase_ns;
+  alpha_ocxo_visible_origin_publish(*s, local);
+}
+
+bool clocks_alpha_ocxo_visible_origin_snapshot(
+    time_clock_id_t clock,
+    clocks_alpha_ocxo_visible_origin_snapshot_t* out) {
+  if (!out) return false;
+  alpha_ocxo_visible_origin_state_t* s =
+      alpha_ocxo_visible_origin_store(clock);
+  if (!s) return false;
+
+  for (int attempt = 0; attempt < 4; attempt++) {
+    const uint32_t seq1 = s->seq;
+    clocks_alpha_dmb();
+    clocks_alpha_ocxo_visible_origin_snapshot_t local = s->v;
+    clocks_alpha_dmb();
+    const uint32_t seq2 = s->seq;
+    if (seq1 == seq2 && (seq1 & 1u) == 0u) {
+      *out = local;
+      return local.valid || local.pending;
+    }
+  }
+
+  *out = clocks_alpha_ocxo_visible_origin_snapshot_t{};
+  return false;
+}
+
 static uint64_t alpha_ocxo_apply_measured_second(time_clock_id_t clock,
                                                  uint32_t raw_edge_dwt,
                                                  uint32_t* out_dwt_cycles,
@@ -3767,6 +3900,7 @@ static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
   alpha_ticks64_reset_all();
   alpha_measured_ns_reset_all();
   alpha_ocxo_pps_projection_reset_all();
+  alpha_ocxo_visible_origin_reset_all();
   clocks_static_prediction_reset_all();
 
   dwt_cycle_count_total = 0;
@@ -3882,6 +4016,21 @@ bool clocks_alpha_zero_from_smartzero(const char* reason) {
   g_prev_dwt_at_vclock_event = vclock.anchor_dwt;
   g_prev_pps_vclock_dwt_at_edge = vclock.anchor_dwt;
   g_prev_pps_vclock_dwt_at_edge_valid = true;
+
+  alpha_ocxo_visible_origin_capture_from_smartzero(
+      time_clock_id_t::OCXO1,
+      next_epoch_sequence,
+      z.sequence,
+      vclock.anchor_dwt,
+      ocxo1.anchor_dwt,
+      alpha_ocxo_visible_origin_select_cps(vclock, ocxo1));
+  alpha_ocxo_visible_origin_capture_from_smartzero(
+      time_clock_id_t::OCXO2,
+      next_epoch_sequence,
+      z.sequence,
+      vclock.anchor_dwt,
+      ocxo2.anchor_dwt,
+      alpha_ocxo_visible_origin_select_cps(vclock, ocxo2));
 
   alpha_ticks64_install_zero(g_vclock_ticks64, vclock.anchor_counter32);
   alpha_ticks64_install_zero(g_ocxo1_ticks64, ocxo1.anchor_counter32);
