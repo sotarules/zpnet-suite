@@ -2516,6 +2516,64 @@ static uint64_t alpha_ocxo_project_measured_ns_to_dwt(time_clock_id_t clock,
   return m->ns_at_edge + (uint64_t)delta_ns;
 }
 
+// Project the OCXO measured ledger to target_dwt using the newest pending
+// OCXO edge when the current PPS bridge anchor has already bracketed it.
+// This is display/sample-side only: it does not consume the pending edge,
+// does not advance the measured ledger, and does not affect the OCXO callback
+// path.  The callback still resolves the pending edge as the authoritative
+// per-edge measurement when it runs.
+static uint64_t alpha_ocxo_project_measured_ns_to_dwt_live(time_clock_id_t clock,
+                                                           uint32_t target_dwt) {
+  const alpha_measured_ns_clock_t* m = alpha_measured_ns_store(clock);
+  if (!m || !m->pending_valid) {
+    return alpha_ocxo_project_measured_ns_to_dwt(clock, target_dwt);
+  }
+
+  uint64_t pending_gnss_ns = 0;
+  int32_t phi_cycles = 0;
+  uint32_t span_cycles = 0;
+  if (!alpha_bridge_interpolate_gnss_ns(m->pending_edge_dwt,
+                                        &pending_gnss_ns,
+                                        &phi_cycles,
+                                        &span_cycles)) {
+    return alpha_ocxo_project_measured_ns_to_dwt(clock, target_dwt);
+  }
+
+  const int32_t signed_delta_cycles =
+      alpha_dwt32_signed_delta_near(m->pending_edge_dwt, target_dwt);
+  const uint32_t legacy_unsigned_delta = target_dwt - m->pending_edge_dwt;
+
+  if (signed_delta_cycles < 0) {
+    alpha_projection_guard_note_measured_backward(clock,
+                                                  target_dwt,
+                                                  m->pending_edge_dwt,
+                                                  signed_delta_cycles,
+                                                  legacy_unsigned_delta);
+  }
+
+  if (alpha_abs_u64_from_i64((int64_t)signed_delta_cycles) >
+      (uint64_t)alpha_projection_signed_window_cycles()) {
+    alpha_ocxo_pps_projection_guard_t* g = alpha_ocxo_pps_projection_guard(clock);
+    if (g) g->measured_projection_reject_count++;
+    clocks_watchdog_anomaly("alpha_ocxo_live_project_dwt_window",
+                            (uint32_t)((uint8_t)clock),
+                            target_dwt,
+                            m->pending_edge_dwt,
+                            legacy_unsigned_delta);
+    return pending_gnss_ns;
+  }
+
+  const int64_t delta_ns =
+      alpha_dwt_cycles_to_gnss_ns_i64((int64_t)signed_delta_cycles);
+
+  if (delta_ns < 0) {
+    const uint64_t back_ns = (uint64_t)(-delta_ns);
+    return (back_ns > pending_gnss_ns) ? 0ULL : (pending_gnss_ns - back_ns);
+  }
+
+  return pending_gnss_ns + (uint64_t)delta_ns;
+}
+
 static void alpha_forensics_reset_store(alpha_lane_forensics_store_t& s) {
   s.seq++;
   clocks_alpha_dmb();
@@ -4317,12 +4375,29 @@ static bool alpha_sample_all_clocks_at_pps_vclock(const pps_edge_snapshot_t& sna
     g_alpha_runtime_epoch_capture_sequence_mismatch_count++;
   }
 
+  // Record this second's bridge anchor before sampling OCXO measured ledgers.
+  // The physical PPS witness DWT is paired with its GNSS nanosecond coordinate.
+  // vclock_ns is the canonical PPS/VCLOCK ledger value; physical PPS precedes
+  // the canonical edge by the measured phase.  Recording before projection lets
+  // the display/sample surface use the OCXO edge that this PPS anchor just
+  // bracketed, without consuming that edge from the OCXO callback path.
+  {
+    const int32_t phase_cycles = g_pps_vclock_phase_cycles;
+    const uint64_t phase_ns = phase_cycles > 0
+        ? alpha_dwt_cycles_to_gnss_ns((uint32_t)phase_cycles)
+        : 0ULL;
+    const uint64_t pps_gnss_ns =
+        vclock_ns > phase_ns ? vclock_ns - phase_ns : vclock_ns;
+    alpha_bridge_anchor_record(snap.physical_pps_dwt_normalized_at_edge,
+                               pps_gnss_ns);
+  }
+
   const uint64_t ocxo1_ns =
-      alpha_ocxo_project_measured_ns_to_dwt(time_clock_id_t::OCXO1,
-                                            snap.dwt_at_edge);
+      alpha_ocxo_project_measured_ns_to_dwt_live(time_clock_id_t::OCXO1,
+                                                 snap.dwt_at_edge);
   const uint64_t ocxo2_ns =
-      alpha_ocxo_project_measured_ns_to_dwt(time_clock_id_t::OCXO2,
-                                            snap.dwt_at_edge);
+      alpha_ocxo_project_measured_ns_to_dwt_live(time_clock_id_t::OCXO2,
+                                                 snap.dwt_at_edge);
 
   alpha_ocxo_pps_projection_compute(time_clock_id_t::OCXO1,
                                     snap.sequence,
@@ -4335,21 +4410,6 @@ static bool alpha_sample_all_clocks_at_pps_vclock(const pps_edge_snapshot_t& sna
                                     vclock_ns,
                                     ocxo2_ns);
 
-  // Record this second's bridge anchor: the physical PPS witness DWT
-  // (unquantized GPIO rail) paired with its GNSS nanosecond coordinate.
-  // vclock_ns is the canonical PPS/VCLOCK ledger value; the physical PPS
-  // precedes the canonical edge by the measured phase, so subtract it.
-  // Constant pairing offsets cancel in bookend differences by construction.
-  {
-    const int32_t phase_cycles = g_pps_vclock_phase_cycles;
-    const uint64_t phase_ns = phase_cycles > 0
-        ? alpha_dwt_cycles_to_gnss_ns((uint32_t)phase_cycles)
-        : 0ULL;
-    const uint64_t pps_gnss_ns =
-        vclock_ns > phase_ns ? vclock_ns - phase_ns : vclock_ns;
-    alpha_bridge_anchor_record(snap.physical_pps_dwt_normalized_at_edge,
-                               pps_gnss_ns);
-  }
 
   g_gnss_ns_at_pps_vclock = vclock_ns;
   g_ocxo1_measured_gnss_ns_at_pps_vclock = ocxo1_ns;
