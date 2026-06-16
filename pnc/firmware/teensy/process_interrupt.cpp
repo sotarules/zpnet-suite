@@ -2377,6 +2377,12 @@ struct dwt_capture_lane_t {
   int32_t  generation_gate_last_delta_ticks = 0;
   uint16_t generation_gate_last_ambient_low16 = 0;
   uint16_t generation_gate_last_target_low16 = 0;
+  uint32_t generation_gate_last_clock32_current_counter32 = 0;
+  uint16_t generation_gate_last_clock32_hardware16 = 0;
+  int32_t  generation_gate_last_slipledger_ticks = 0;
+  uint32_t generation_gate_last_target_semantic_delta_ticks = 0;
+  uint32_t generation_gate_last_target_hardware_delta_ticks = 0;
+  int32_t  generation_gate_last_domain_skew_ticks = 0;
   uint32_t generation_gate_last_isr_entry_dwt_raw = 0;
   uint32_t generation_gate_last_tick_mod = 0;
   bool     generation_gate_last_one_second_due = false;
@@ -2389,6 +2395,12 @@ struct dwt_capture_lane_t {
   int32_t  generation_gate_last_reject_delta_ticks = 0;
   uint16_t generation_gate_last_reject_ambient_low16 = 0;
   uint16_t generation_gate_last_reject_target_low16 = 0;
+  uint32_t generation_gate_last_reject_clock32_current_counter32 = 0;
+  uint16_t generation_gate_last_reject_clock32_hardware16 = 0;
+  int32_t  generation_gate_last_reject_slipledger_ticks = 0;
+  uint32_t generation_gate_last_reject_target_semantic_delta_ticks = 0;
+  uint32_t generation_gate_last_reject_target_hardware_delta_ticks = 0;
+  int32_t  generation_gate_last_reject_domain_skew_ticks = 0;
   uint32_t generation_gate_last_reject_isr_entry_dwt_raw = 0;
   uint32_t generation_gate_last_reject_tick_mod = 0;
   bool     generation_gate_last_reject_one_second_due = false;
@@ -2493,11 +2505,21 @@ static bool dwt_capture_record_generation_gate(
     uint32_t target_counter32,
     uint16_t ambient_low16,
     uint16_t target_low16,
+    uint32_t clock32_current_counter32,
+    uint16_t clock32_hardware16,
+    int32_t slipledger_ticks,
     uint32_t tick_mod,
     bool one_second_due,
     bool smartzero,
     uint32_t isr_entry_dwt_raw) {
   const int32_t delta = (int32_t)(resolved_counter32 - target_counter32);
+  const uint32_t target_semantic_delta_ticks =
+      target_counter32 - clock32_current_counter32;
+  const uint32_t target_hardware_delta_ticks =
+      (uint32_t)((uint16_t)(target_low16 - clock32_hardware16));
+  const int32_t domain_skew_ticks =
+      (int32_t)((int64_t)target_hardware_delta_ticks -
+                (int64_t)target_semantic_delta_ticks);
   const bool accepted = delta >= 0;
   const char* reason = dwt_capture_generation_reason(delta);
 
@@ -2521,6 +2543,12 @@ static bool dwt_capture_record_generation_gate(
   s.generation_gate_last_delta_ticks = delta;
   s.generation_gate_last_ambient_low16 = ambient_low16;
   s.generation_gate_last_target_low16 = target_low16;
+  s.generation_gate_last_clock32_current_counter32 = clock32_current_counter32;
+  s.generation_gate_last_clock32_hardware16 = clock32_hardware16;
+  s.generation_gate_last_slipledger_ticks = slipledger_ticks;
+  s.generation_gate_last_target_semantic_delta_ticks = target_semantic_delta_ticks;
+  s.generation_gate_last_target_hardware_delta_ticks = target_hardware_delta_ticks;
+  s.generation_gate_last_domain_skew_ticks = domain_skew_ticks;
   s.generation_gate_last_isr_entry_dwt_raw = isr_entry_dwt_raw;
   s.generation_gate_last_tick_mod = tick_mod;
   s.generation_gate_last_one_second_due = one_second_due;
@@ -2534,6 +2562,12 @@ static bool dwt_capture_record_generation_gate(
     s.generation_gate_last_reject_delta_ticks = delta;
     s.generation_gate_last_reject_ambient_low16 = ambient_low16;
     s.generation_gate_last_reject_target_low16 = target_low16;
+    s.generation_gate_last_reject_clock32_current_counter32 = clock32_current_counter32;
+    s.generation_gate_last_reject_clock32_hardware16 = clock32_hardware16;
+    s.generation_gate_last_reject_slipledger_ticks = slipledger_ticks;
+    s.generation_gate_last_reject_target_semantic_delta_ticks = target_semantic_delta_ticks;
+    s.generation_gate_last_reject_target_hardware_delta_ticks = target_hardware_delta_ticks;
+    s.generation_gate_last_reject_domain_skew_ticks = domain_skew_ticks;
     s.generation_gate_last_reject_isr_entry_dwt_raw = isr_entry_dwt_raw;
     s.generation_gate_last_reject_tick_mod = tick_mod;
     s.generation_gate_last_reject_one_second_due = one_second_due;
@@ -8180,6 +8214,13 @@ static void ocxo_cadence_capture_priority0(ocxo_runtime_context_t& ctx,
   // the authored target is a false/wrong-generation interrupt and must not
   // advance the +10,000 tick ladder.
   dwt_capture_lane_t& dwt_capture_lane = dwt_capture_for_ocxo_kind(ctx.kind);
+  const uint32_t gate_clock32_current_counter32 = ctx.clock32
+      ? ctx.clock32->current_counter32
+      : target_counter32;
+  const uint16_t gate_clock32_hardware16 = ctx.clock32
+      ? ctx.clock32->hardware16
+      : target_low16;
+  const int32_t gate_slipledger_ticks = lane.slip.ledger_ticks;
   const uint32_t resolved_counter32 = ctx.clock32
       ? project_counter32_from_hw16(*ctx.clock32, service_counter_low16)
       : target_counter32;
@@ -8189,6 +8230,9 @@ static void ocxo_cadence_capture_priority0(ocxo_runtime_context_t& ctx,
       target_counter32,
       service_counter_low16,
       target_low16,
+      gate_clock32_current_counter32,
+      gate_clock32_hardware16,
+      gate_slipledger_ticks,
       event_tick_mod,
       one_second_due,
       was_smartzero_current,
@@ -8727,6 +8771,9 @@ static void qtimer1_vclock_capture_priority0(uint32_t isr_entry_dwt_raw,
       target_counter32,
       service_low16,
       target_low16,
+      g_vclock_clock32.current_counter32,
+      g_vclock_clock32.hardware16,
+      g_vclock_lane.slip.ledger_ticks,
       g_vclock_lane.tick_mod_1000,
       false,
       false,
@@ -9881,7 +9928,10 @@ static FLASHMEM void add_ocxo_lean_lane(Payload& p,
       (lane.initialized && clock32)
           ? (uint32_t)((uint16_t)(live_hw16 - clock32_hw_anchor))
           : 0U;
-  const uint32_t live_projected_counter32 = clock32_current;
+  const uint32_t live_projected_counter32 =
+      (lane.initialized && clock32)
+          ? (clock32_current + live_low16_delta_from_clock32)
+          : clock32_current;
   const uint32_t live_delta_from_clock32 = live_low16_delta_from_clock32;
   const uint32_t next_minus_clock32 =
       lane.cadence_enabled ? (lane.cadence_next_counter32 - clock32_current) : 0U;
@@ -9940,6 +9990,10 @@ static FLASHMEM void add_ocxo_lean_lane(Payload& p,
   // foreground report reads only: they do not author event facts.
   add_bool("clock32_zeroed", clock32 ? clock32->zeroed : false);
   add_bool("clock32_pending_zero", clock32 ? clock32->pending_zero : false);
+  add_u32("clock32_pending_zero_counter32",
+          clock32 ? clock32->pending_zero_counter32 : 0U);
+  add_u32("clock32_pending_zero_count",
+          clock32 ? clock32->pending_zero_count : 0U);
   add_u32("clock32_zero_counter32", clock32_zero);
   add_u32("clock32_current_counter32", clock32_current);
   add_u32("clock32_hardware16_anchor", (uint32_t)clock32_hw_anchor);
@@ -10268,6 +10322,20 @@ static FLASHMEM void add_dwt_capture_lane(Payload& p,
           (uint32_t)s.generation_gate_last_ambient_low16);
   add_u32("generation_gate_last_target_low16",
           (uint32_t)s.generation_gate_last_target_low16);
+  add_u32("generation_gate_last_service_counter_low16",
+          (uint32_t)s.generation_gate_last_ambient_low16);
+  add_u32("generation_gate_last_clock32_current_counter32",
+          s.generation_gate_last_clock32_current_counter32);
+  add_u32("generation_gate_last_clock32_hardware16",
+          (uint32_t)s.generation_gate_last_clock32_hardware16);
+  add_i32("generation_gate_last_slipledger_ticks",
+          s.generation_gate_last_slipledger_ticks);
+  add_u32("generation_gate_last_target_semantic_delta_ticks",
+          s.generation_gate_last_target_semantic_delta_ticks);
+  add_u32("generation_gate_last_target_hardware_delta_ticks",
+          s.generation_gate_last_target_hardware_delta_ticks);
+  add_i32("generation_gate_last_domain_skew_ticks",
+          s.generation_gate_last_domain_skew_ticks);
   add_u32("generation_gate_last_tick_mod", s.generation_gate_last_tick_mod);
   add_bool("generation_gate_last_one_second_due",
            s.generation_gate_last_one_second_due);
@@ -10286,6 +10354,20 @@ static FLASHMEM void add_dwt_capture_lane(Payload& p,
           (uint32_t)s.generation_gate_last_reject_ambient_low16);
   add_u32("generation_gate_last_reject_target_low16",
           (uint32_t)s.generation_gate_last_reject_target_low16);
+  add_u32("generation_gate_last_reject_service_counter_low16",
+          (uint32_t)s.generation_gate_last_reject_ambient_low16);
+  add_u32("generation_gate_last_reject_clock32_current_counter32",
+          s.generation_gate_last_reject_clock32_current_counter32);
+  add_u32("generation_gate_last_reject_clock32_hardware16",
+          (uint32_t)s.generation_gate_last_reject_clock32_hardware16);
+  add_i32("generation_gate_last_reject_slipledger_ticks",
+          s.generation_gate_last_reject_slipledger_ticks);
+  add_u32("generation_gate_last_reject_target_semantic_delta_ticks",
+          s.generation_gate_last_reject_target_semantic_delta_ticks);
+  add_u32("generation_gate_last_reject_target_hardware_delta_ticks",
+          s.generation_gate_last_reject_target_hardware_delta_ticks);
+  add_i32("generation_gate_last_reject_domain_skew_ticks",
+          s.generation_gate_last_reject_domain_skew_ticks);
   add_u32("generation_gate_last_reject_tick_mod",
           s.generation_gate_last_reject_tick_mod);
   add_bool("generation_gate_last_reject_one_second_due",
