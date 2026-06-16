@@ -1966,6 +1966,12 @@ static volatile interrupt_pps_entry_latency_handler_fn
 static constexpr bool     SLIPLEDGER_OCXO_ACTIVE = true;
 static constexpr bool     SLIPLEDGER_VCLOCK_ACTIVE = false;
 static constexpr uint32_t SLIPLEDGER_1KHZ_GATE_CYCLES = 16U;
+// SlipLedger is a small, local 1 kHz phase-correction mechanism.  If the
+// measured DWT error is far larger than a plausible edge/counter slip, the
+// comparison baseline is broken (wrap, reauthorship, stale state, or a missed
+// custody epoch).  In that case do not mutate the signed ledger; reseed the
+// SlipLedger baseline and make the event explicit in forensics.
+static constexpr uint32_t SLIPLEDGER_ABSURD_DWT_ERROR_CYCLES = 100000U;
 static constexpr int32_t  SLIPLEDGER_MAX_ABS_TICKS = 1000000;
 
 static constexpr uint32_t SLIPLEDGER_REASON_NONE = 0;
@@ -1975,6 +1981,8 @@ static constexpr uint32_t SLIPLEDGER_REASON_EARLY_CORRECTED = 3;
 static constexpr uint32_t SLIPLEDGER_REASON_LATE_CORRECTED = 4;
 static constexpr uint32_t SLIPLEDGER_REASON_VIOLATION_NO_TICK_CORRECTION = 5;
 static constexpr uint32_t SLIPLEDGER_REASON_CLAMPED = 6;
+static constexpr uint32_t SLIPLEDGER_REASON_RESYNC_ABSURD_DWT_ERROR = 7;
+static constexpr uint32_t SLIPLEDGER_REASON_RESYNC_TARGET_DISCONTINUITY = 8;
 
 static const char* slipledger_reason_name(uint32_t reason) {
   switch (reason) {
@@ -1985,6 +1993,10 @@ static const char* slipledger_reason_name(uint32_t reason) {
     case SLIPLEDGER_REASON_VIOLATION_NO_TICK_CORRECTION:
       return "violation_no_tick_correction";
     case SLIPLEDGER_REASON_CLAMPED: return "correction_clamped";
+    case SLIPLEDGER_REASON_RESYNC_ABSURD_DWT_ERROR:
+      return "resync_absurd_dwt_error";
+    case SLIPLEDGER_REASON_RESYNC_TARGET_DISCONTINUITY:
+      return "resync_target_discontinuity";
     default: return "none";
   }
 }
@@ -2003,6 +2015,8 @@ struct slipledger_lane_t {
   uint32_t violation_count = 0;
   uint32_t correction_count = 0;
   uint32_t noop_violation_count = 0;
+  uint32_t resync_absurd_dwt_error_count = 0;
+  uint32_t resync_target_discontinuity_count = 0;
   uint32_t early_count = 0;
   uint32_t late_count = 0;
 
@@ -2045,6 +2059,19 @@ struct slipledger_decision_t {
 static inline void slipledger_reset(slipledger_lane_t& s) {
   s = slipledger_lane_t{};
   s.last_reason = SLIPLEDGER_REASON_NONE;
+}
+
+static int32_t slipledger_signed_delta_u32(uint32_t from_dwt,
+                                             uint32_t to_dwt) {
+  const uint32_t delta = to_dwt - from_dwt;
+  if (delta <= 0x7FFFFFFFUL) return (int32_t)delta;
+  const uint32_t magnitude = (uint32_t)((~delta) + 1U);
+  if (magnitude == 0x80000000UL) return (int32_t)(-2147483647 - 1);
+  return -(int32_t)magnitude;
+}
+
+static uint32_t slipledger_abs_i32(int32_t value) {
+  return (uint32_t)(value < 0 ? -(int64_t)value : (int64_t)value);
 }
 
 static int32_t slipledger_round_cycles_to_ticks(int32_t cycles) {
@@ -2117,15 +2144,15 @@ static slipledger_decision_t slipledger_record_1khz(
   }
 
   const uint32_t target_delta_ticks = target_counter32 - s.previous_target_counter32;
-  const uint32_t expected_interval = vclock_cycles_for_ticks(target_delta_ticks);
-  const uint32_t expected_dwt = s.previous_authored_dwt_at_event + expected_interval;
-  const uint32_t observed_interval = observed_dwt_at_event - s.previous_authored_dwt_at_event;
-  const int32_t dwt_error = (int32_t)((int64_t)observed_dwt_at_event -
-                                      (int64_t)expected_dwt);
-  const uint32_t abs_error = (uint32_t)(dwt_error < 0
-      ? -(int64_t)dwt_error
-      :  (int64_t)dwt_error);
-  const bool violation = abs_error > SLIPLEDGER_1KHZ_GATE_CYCLES;
+  const uint32_t observed_interval =
+      observed_dwt_at_event - s.previous_authored_dwt_at_event;
+
+  uint32_t expected_interval = vclock_cycles_for_ticks(target_delta_ticks);
+  uint32_t expected_dwt = s.previous_authored_dwt_at_event + expected_interval;
+  int32_t dwt_error = slipledger_signed_delta_u32(expected_dwt,
+                                                  observed_dwt_at_event);
+  uint32_t abs_error = slipledger_abs_i32(dwt_error);
+  bool violation = abs_error > SLIPLEDGER_1KHZ_GATE_CYCLES;
   int32_t correction_ticks = violation ? slipledger_round_cycles_to_ticks(dwt_error) : 0;
 
   uint32_t reason = SLIPLEDGER_REASON_OK;
@@ -2135,7 +2162,32 @@ static slipledger_decision_t slipledger_record_1khz(
   s.observe_count++;
   if (one_second_due) s.one_second_observe_count++;
 
-  if (!violation) {
+  if (target_delta_ticks != OCXO_CADENCE_INTERVAL_TICKS) {
+    // This is a new authored ladder segment, not a hardware slip.  Examples:
+    // SmartZero reauthorship, logical grid/zero installation, restart, or a
+    // recovery arm.  Do not convert the discontinuity into ledger motion.
+    violation = true;
+    correction_ticks = 0;
+    reason = SLIPLEDGER_REASON_RESYNC_TARGET_DISCONTINUITY;
+    s.violation_count++;
+    s.resync_target_discontinuity_count++;
+    if (one_second_due) s.one_second_violation_count++;
+    out.authored_dwt_at_event = observed_dwt_at_event;
+    expected_interval = 0;
+    expected_dwt = observed_dwt_at_event;
+    dwt_error = 0;
+    abs_error = 0;
+  } else if (violation && abs_error > SLIPLEDGER_ABSURD_DWT_ERROR_CYCLES) {
+    // A true edge/counter slip is local.  A huge DWT error means the
+    // SlipLedger baseline is stale/wrapped/broken, so re-anchor the ledger
+    // baseline without changing the signed counter-phase accumulator.
+    correction_ticks = 0;
+    reason = SLIPLEDGER_REASON_RESYNC_ABSURD_DWT_ERROR;
+    s.violation_count++;
+    s.resync_absurd_dwt_error_count++;
+    if (one_second_due) s.one_second_violation_count++;
+    out.authored_dwt_at_event = observed_dwt_at_event;
+  } else if (!violation) {
     s.ok_count++;
     if (one_second_due) s.one_second_ok_count++;
     out.authored_dwt_at_event = observed_dwt_at_event;
@@ -10038,6 +10090,10 @@ static FLASHMEM void add_ocxo_lean_lane(Payload& p,
   add_u32("slipledger_observe_count", lane.slip.observe_count);
   add_u32("slipledger_violation_count", lane.slip.violation_count);
   add_u32("slipledger_correction_count", lane.slip.correction_count);
+  add_u32("slipledger_resync_absurd_dwt_error_count",
+          lane.slip.resync_absurd_dwt_error_count);
+  add_u32("slipledger_resync_target_discontinuity_count",
+          lane.slip.resync_target_discontinuity_count);
   add_u32("slipledger_one_second_violation_count", lane.slip.one_second_violation_count);
   add_u32("slipledger_one_second_correction_count", lane.slip.one_second_correction_count);
   add_i32("slipledger_last_dwt_error_cycles", lane.slip.last_dwt_error_cycles);
@@ -10282,6 +10338,10 @@ static FLASHMEM void add_slipledger_lane(Payload& p,
   add_u32("slipledger_observe_count", s.observe_count);
   add_u32("slipledger_violation_count", s.violation_count);
   add_u32("slipledger_correction_count", s.correction_count);
+  add_u32("slipledger_resync_absurd_dwt_error_count",
+          s.resync_absurd_dwt_error_count);
+  add_u32("slipledger_resync_target_discontinuity_count",
+          s.resync_target_discontinuity_count);
   add_u32("slipledger_one_second_violation_count", s.one_second_violation_count);
   add_u32("slipledger_one_second_correction_count", s.one_second_correction_count);
   add_bool("slipledger_last_corrected", s.last_event_corrected);
@@ -10301,8 +10361,8 @@ static FLASHMEM void add_slipledger_lane(Payload& p,
 static FLASHMEM Payload cmd_report_dwt_capture(const Payload&) {
   Payload p;
   p.add("report", "DWT_CAPTURE");
-  p.add("schema", "DWT_CAPTURE_V4_SLIPLEDGER");
-  p.add("doctrine", "GENERATION_GATE_PLUS_SLIPLEDGER_DWT_LAWFUL_ARMING");
+  p.add("schema", "DWT_CAPTURE_V5_SLIPLEDGER_ABSURD_RESYNC");
+  p.add("doctrine", "GENERATION_GATE_PLUS_SLIPLEDGER_DWT_LAWFUL_ARMING_WITH_ABSURD_ERROR_RESEED");
   p.add("hypothesis", "HARDWARE_COUNTER_PHASE_SLIP_CORRECTED_BY_SIGNED_LEDGER");
   p.add("payload_policy", "COMPACT_ALWAYS_RETURNS");
   p.add("expected_cntr_interval_ticks", DWT_CAPTURE_EXPECTED_CNTR_INTERVAL_TICKS);
@@ -10310,6 +10370,8 @@ static FLASHMEM Payload cmd_report_dwt_capture(const Payload&) {
   p.add("generation_late_accept_warn_ticks",
         DWT_CAPTURE_GENERATION_LATE_ACCEPT_WARN_TICKS);
   p.add("slipledger_1khz_gate_cycles", SLIPLEDGER_1KHZ_GATE_CYCLES);
+  p.add("slipledger_absurd_dwt_error_cycles",
+        SLIPLEDGER_ABSURD_DWT_ERROR_CYCLES);
   p.add("slipledger_ocxo_active", SLIPLEDGER_OCXO_ACTIVE);
   p.add("slipledger_vclock_active", SLIPLEDGER_VCLOCK_ACTIVE);
   add_dwt_capture_lane(p, "vclock", g_dwt_capture_vclock);

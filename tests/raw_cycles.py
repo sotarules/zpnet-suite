@@ -14,6 +14,7 @@ Usage:
     python -m zpnet.tests.raw_cycles <campaign_name> [limit] [clock]
     python raw_cycles.py <campaign_name> [limit] [clock]
     python raw_cycles.py <campaign_name> --clock OCXO2 [limit]
+    python raw_cycles.py <campaign_name> --slip [limit] [clock]
 
 Clock filter:
     VCLOCK, OCXO1, OCXO2
@@ -44,6 +45,13 @@ Column doctrine:
                this row), or --- (rail not valid on this row).
 
     *_cΔ       is counter32 delta since the previous event (lineage proof).
+
+Slip-aware view:
+    --slip prints one OCXO lane row per second and adds SlipLedger deltas:
+    violΔ/corrΔ/earlyΔ/lateΔ, signed ledger ticks, event ticks, DWT error,
+    observed/authored DWT interval deltas, and reason codes.  This is the
+    hardware-pathology courtroom view: negative slip DWT error plus earlyΔ/corrΔ
+    is the signature of an early/fast edge stream.
 """
 
 from __future__ import annotations
@@ -661,6 +669,96 @@ def yardstick_tag(y: Dict[str, Any]) -> str:
     return "OK"
 
 
+SLIP_REASON_NAMES = {
+    0: "none",
+    1: "first",
+    2: "ok",
+    3: "early",
+    4: "late",
+    5: "noop",
+    6: "clamp",
+}
+
+
+def slip_reason_name(code: Optional[int]) -> str:
+    if code is None:
+        return "---"
+    return SLIP_REASON_NAMES.get(int(code), str(code))
+
+
+def slip_diag(root: Dict[str, Any],
+              frag: Dict[str, Any],
+              forensic: Dict[str, Any],
+              lane: str) -> Dict[str, Any]:
+    """Extract compact SlipLedger forensic state for one lane.
+
+    Preferred source is TIMEBASE_FORENSICS.<lane>.forensics.slipledger, with
+    fallbacks to direct lane-forensics fields and older flat surfaces.  The
+    paired TIMEBASE row may intentionally omit inactive/zero SlipLedger objects,
+    so absence means "not published", not a parser failure.
+    """
+    f = lane_forensics_obj(root, frag, forensic, lane)
+    slip = f.get("slipledger") if isinstance(f.get("slipledger"), dict) else {}
+    prefix = f"{lane}_forensics_slipledger_"
+
+    def si(name: str, direct: str = "") -> Optional[int]:
+        return _first_int(
+            slip.get(name),
+            f.get(direct or f"slipledger_{name}"),
+            frag.get(prefix + name),
+            root.get(prefix + name),
+        )
+
+    def sb(name: str, direct: str = "") -> Optional[bool]:
+        return _first_bool(
+            slip.get(name),
+            f.get(direct or f"slipledger_{name}"),
+            frag.get(prefix + name),
+            root.get(prefix + name),
+        )
+
+    return {
+        "active": sb("active"),
+        "event_corrected": sb("event_corrected"),
+        "event_violation": sb("event_violation"),
+        "ticks": si("ticks"),
+        "event_ticks": si("event_ticks"),
+        "generation": si("generation"),
+        "observe_count": si("observe_count"),
+        "ok_count": si("ok_count"),
+        "violation_count": si("violation_count"),
+        "correction_count": si("correction_count"),
+        "noop_violation_count": si("noop_violation_count"),
+        "early_count": si("early_count"),
+        "late_count": si("late_count"),
+        "one_second_observe_count": si("one_second_observe_count"),
+        "one_second_ok_count": si("one_second_ok_count"),
+        "one_second_violation_count": si("one_second_violation_count"),
+        "one_second_correction_count": si("one_second_correction_count"),
+        "last_expected_dwt": si("last_expected_dwt"),
+        "last_observed_dwt": si("last_observed_dwt"),
+        "last_authored_dwt": si("last_authored_dwt"),
+        "last_expected_interval_cycles": si("last_expected_interval_cycles"),
+        "last_observed_interval_cycles": si("last_observed_interval_cycles"),
+        "last_dwt_error_cycles": si("last_dwt_error_cycles"),
+        "last_target_counter32": si("last_target_counter32"),
+        "last_hardware_target_low16": si("last_hardware_target_low16"),
+        "last_ambient_low16": si("last_ambient_low16"),
+        "last_tick_mod": si("last_tick_mod"),
+        "reason_code": si("reason_code"),
+        "last_correction_reason_code": si("last_correction_reason_code"),
+        "last_correction_ticks": si("last_correction_ticks"),
+        "last_correction_dwt_error_cycles": si("last_correction_dwt_error_cycles"),
+    }
+
+
+def _count_delta(now: Optional[int], prev: Optional[int]) -> Optional[int]:
+    if now is None:
+        return None
+    if prev is None:
+        return None
+    return now - prev
+
 
 def service_diag(root: Dict[str, Any],
                  frag: Dict[str, Any],
@@ -893,16 +991,30 @@ def collect_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]
         "ocxo1": None,
         "ocxo2": None,
     }
+    prev_slip_counts: Dict[str, Dict[str, Optional[int]]] = {
+        "ocxo1": {},
+        "ocxo2": {},
+    }
+    prev_slip_dwt: Dict[str, Dict[str, Optional[int]]] = {
+        "ocxo1": {"observed": None, "authored": None},
+        "ocxo2": {"observed": None, "authored": None},
+    }
 
     def reset_deltas_after_gap() -> None:
         nonlocal prev_physical_pps_dwt, prev_vclock_dwt, prev_vclock_counter32
         nonlocal prev_pps_interval, prev_raw_interval, prev_ema_interval
+        nonlocal prev_slip_counts, prev_slip_dwt
         prev_physical_pps_dwt = None
         prev_vclock_dwt = None
         prev_vclock_counter32 = None
         prev_pps_interval = None
         prev_raw_interval = {"vclock": None, "ocxo1": None, "ocxo2": None}
         prev_ema_interval = {"vclock": None, "ocxo1": None, "ocxo2": None}
+        prev_slip_counts = {"ocxo1": {}, "ocxo2": {}}
+        prev_slip_dwt = {
+            "ocxo1": {"observed": None, "authored": None},
+            "ocxo2": {"observed": None, "authored": None},
+        }
 
     for rec in rows:
         root = _root(rec)
@@ -958,6 +1070,7 @@ def collect_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]
             adj = adjacency_diag(root, frag, forensic, lane_name)
             svc = service_diag(root, frag, forensic, lane_name)
             yard = yardstick_diag(root, frag, forensic, lane_name)
+            slip = slip_diag(root, frag, forensic, lane_name)
             cdelta = lane_counter_delta(root, frag, forensic, lane_name)
             if cdelta is None:
                 cdelta = svc.get("last_counter_delta")
@@ -977,6 +1090,34 @@ def collect_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]
             emo = (
                 surface["ema"] - surface["raw"]
                 if surface["ema"] is not None and surface["raw"] is not None
+                else None
+            )
+
+            prev_counts = prev_slip_counts.get(lane_name, {})
+            slip_violation_delta = _count_delta(slip.get("violation_count"),
+                                                prev_counts.get("violation_count"))
+            slip_correction_delta = _count_delta(slip.get("correction_count"),
+                                                 prev_counts.get("correction_count"))
+            slip_early_delta = _count_delta(slip.get("early_count"),
+                                            prev_counts.get("early_count"))
+            slip_late_delta = _count_delta(slip.get("late_count"),
+                                           prev_counts.get("late_count"))
+            slip_one_second_correction_delta = _count_delta(
+                slip.get("one_second_correction_count"),
+                prev_counts.get("one_second_correction_count"),
+            )
+            slip_generation_delta = _count_delta(slip.get("generation"),
+                                                 prev_counts.get("generation"))
+
+            prev_dwt = prev_slip_dwt.get(lane_name, {})
+            slip_observed_interval = _interval_delta(slip.get("last_observed_dwt"),
+                                                     prev_dwt.get("observed"))
+            slip_authored_interval = _interval_delta(slip.get("last_authored_dwt"),
+                                                     prev_dwt.get("authored"))
+            slip_auth_minus_obs = (
+                slip.get("last_authored_dwt") - slip.get("last_observed_dwt")
+                if slip.get("last_authored_dwt") is not None and
+                   slip.get("last_observed_dwt") is not None
                 else None
             )
 
@@ -1001,6 +1142,34 @@ def collect_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]
                 "y_excursion_count": yard.get("excursion_count"),
                 "y_threshold": yard.get("threshold"),
                 "y_pps_seq_delta": yard.get("pps_seq_delta"),
+                "slip": slip,
+                "slip_active": slip.get("active"),
+                "slip_event_corrected": slip.get("event_corrected"),
+                "slip_event_violation": slip.get("event_violation"),
+                "slip_ticks": slip.get("ticks"),
+                "slip_event_ticks": slip.get("event_ticks"),
+                "slip_generation": slip.get("generation"),
+                "slip_generation_delta": slip_generation_delta,
+                "slip_violation_count": slip.get("violation_count"),
+                "slip_violation_delta": slip_violation_delta,
+                "slip_correction_count": slip.get("correction_count"),
+                "slip_correction_delta": slip_correction_delta,
+                "slip_early_count": slip.get("early_count"),
+                "slip_early_delta": slip_early_delta,
+                "slip_late_count": slip.get("late_count"),
+                "slip_late_delta": slip_late_delta,
+                "slip_one_second_correction_delta": slip_one_second_correction_delta,
+                "slip_last_dwt_error_cycles": slip.get("last_dwt_error_cycles"),
+                "slip_last_correction_ticks": slip.get("last_correction_ticks"),
+                "slip_last_correction_dwt_error_cycles": slip.get("last_correction_dwt_error_cycles"),
+                "slip_reason_code": slip.get("reason_code"),
+                "slip_reason": slip_reason_name(slip.get("reason_code")),
+                "slip_last_correction_reason": slip_reason_name(
+                    slip.get("last_correction_reason_code")
+                ),
+                "slip_observed_interval": slip_observed_interval,
+                "slip_authored_interval": slip_authored_interval,
+                "slip_authored_minus_observed_dwt": slip_auth_minus_obs,
                 "gate_valid": surface["gate_valid"],
                 "gate_accepted": surface["gate_accepted"],
                 "gate_rejected": surface["gate_rejected"],
@@ -1057,6 +1226,20 @@ def collect_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]
                 prev_raw_interval[lane_name] = data["raw"]
             if data["ema"] is not None:
                 prev_ema_interval[lane_name] = data["ema"]
+
+            slip = data.get("slip", {})
+            prev_slip_counts[lane_name] = {
+                "violation_count": slip.get("violation_count"),
+                "correction_count": slip.get("correction_count"),
+                "early_count": slip.get("early_count"),
+                "late_count": slip.get("late_count"),
+                "one_second_correction_count": slip.get("one_second_correction_count"),
+                "generation": slip.get("generation"),
+            }
+            prev_slip_dwt[lane_name] = {
+                "observed": slip.get("last_observed_dwt"),
+                "authored": slip.get("last_authored_dwt"),
+            }
 
     return out, gaps
 
@@ -1131,7 +1314,134 @@ def _walk_slope_cycles_per_second(samples: List[Tuple[int, int]]) -> Optional[fl
     return sxy / sxx
 
 
-def analyze(campaign: str, limit: int = 0, clock_filter: Optional[str] = None) -> None:
+def _slip_hit(d: Dict[str, Any]) -> bool:
+    return any((d.get(k) or 0) != 0 for k in (
+        "slip_violation_delta",
+        "slip_correction_delta",
+        "slip_early_delta",
+        "slip_late_delta",
+        "slip_generation_delta",
+        "slip_one_second_correction_delta",
+    )) or bool(d.get("slip_event_corrected")) or bool(d.get("slip_event_violation"))
+
+
+def _print_slip_rows(collected: List[Dict[str, Any]],
+                     campaign: str,
+                     gaps: int,
+                     clock_filter: Optional[str]) -> None:
+    lanes = (("o1", "OCXO1"), ("o2", "OCXO2"))
+    if clock_filter == "OCXO1":
+        lanes = (("o1", "OCXO1"),)
+    elif clock_filter == "OCXO2":
+        lanes = (("o2", "OCXO2"),)
+
+    print(f"Campaign: {campaign}  ({len(collected):,} rows shown, view=SLIP)")
+    print()
+    print("Slip-aware raw cycles — hardware edge pathology courtroom")
+    print("══════════════════════════════════════════════════════════")
+    print("  corrΔ/violΔ/earlyΔ/lateΔ are per-row deltas of cumulative SlipLedger counters.")
+    print("  Negative err cycles + earlyΔ/corrΔ is the signature of a fast/early edge.")
+    print("  obs/auth intervals compare the observed DWT rail to the authored/purified rail.")
+    print("  y is the independent PPS-Yardstick tag; cΔ is one-second counter lineage.")
+    print()
+
+    h = (
+        f"{'pps':>6s} {'lane':>5s} {'raw':>13s} {'rawΔ':>8s} "
+        f"{'obsInt':>9s} {'authInt':>9s} {'auth-obs':>9s} "
+        f"{'err':>8s} {'corrΔ':>6s} {'violΔ':>6s} {'earlyΔ':>7s} {'lateΔ':>6s} "
+        f"{'1sCΔ':>6s} {'ticks':>8s} {'evtTk':>7s} {'reason':>7s} "
+        f"{'y':>5s} {'imo':>7s} {'cΔ':>11s} {'p_Δ':>8s} {'vrawΔ':>8s}"
+    )
+    print(h)
+    print("─" * len(h))
+
+    totals: Dict[str, Dict[str, int]] = {label: {
+        "corrections": 0, "violations": 0, "early": 0, "late": 0,
+        "one_second_corrections": 0, "rows_with_activity": 0,
+    } for _, label in lanes}
+
+    activity: List[Tuple[int, str, Dict[str, Any], Dict[str, Any]]] = []
+    for row in collected:
+        for key, label in lanes:
+            d = row[key]
+            if _slip_hit(d):
+                activity.append((row["pps_count"], label, row, d))
+                totals[label]["rows_with_activity"] += 1
+            totals[label]["corrections"] += d.get("slip_correction_delta") or 0
+            totals[label]["violations"] += d.get("slip_violation_delta") or 0
+            totals[label]["early"] += d.get("slip_early_delta") or 0
+            totals[label]["late"] += d.get("slip_late_delta") or 0
+            totals[label]["one_second_corrections"] += d.get("slip_one_second_correction_delta") or 0
+
+            print(
+                f"{row['pps_count']:>6d} {label:>5s} "
+                f"{_fmt_int(d['raw'], 13)} "
+                f"{_fmt_int(d['raw_delta'], 8, signed=True)} "
+                f"{_fmt_int(d.get('slip_observed_interval'), 9)} "
+                f"{_fmt_int(d.get('slip_authored_interval'), 9)} "
+                f"{_fmt_int(d.get('slip_authored_minus_observed_dwt'), 9, signed=True)} "
+                f"{_fmt_int(d.get('slip_last_dwt_error_cycles'), 8, signed=True)} "
+                f"{_fmt_int(d.get('slip_correction_delta'), 6, signed=True)} "
+                f"{_fmt_int(d.get('slip_violation_delta'), 6, signed=True)} "
+                f"{_fmt_int(d.get('slip_early_delta'), 7, signed=True)} "
+                f"{_fmt_int(d.get('slip_late_delta'), 6, signed=True)} "
+                f"{_fmt_int(d.get('slip_one_second_correction_delta'), 6, signed=True)} "
+                f"{_fmt_int(d.get('slip_ticks'), 8, signed=True)} "
+                f"{_fmt_int(d.get('slip_event_ticks'), 7, signed=True)} "
+                f"{_fmt_str(d.get('slip_reason'), 7)} "
+                f"{_fmt_str(d['y_tag'], 5)} "
+                f"{_fmt_int(d['imo'], 7, signed=True)} "
+                f"{_fmt_int(d['counter_delta'], 11)} "
+                f"{_fmt_int(row['pps_delta'], 8, signed=True)} "
+                f"{_fmt_int(row['v_raw_delta'], 8, signed=True)}"
+            )
+
+    print()
+    print(f"Rows shown: {len(collected):,}")
+    print(f"Gaps:       {gaps:,}")
+    print()
+    print("Slip summary")
+    print("════════════")
+    for label, t in totals.items():
+        print(
+            f"  {label}: corrections={t['corrections']:,}  "
+            f"violations={t['violations']:,}  early={t['early']:,}  "
+            f"late={t['late']:,}  1s_corrections={t['one_second_corrections']:,}  "
+            f"activity_rows={t['rows_with_activity']:,}"
+        )
+
+    print()
+    print("Slip activity rows")
+    print("══════════════════")
+    if not activity:
+        print("  none")
+    else:
+        for pps, label, row, d in activity[:80]:
+            direction = "early" if (d.get("slip_early_delta") or 0) else \
+                        "late" if (d.get("slip_late_delta") or 0) else \
+                        "other"
+            print(
+                f"  pps={pps:>6d} {label:<5s} {direction:<5s} "
+                f"err={_fmt_int(d.get('slip_last_dwt_error_cycles'), signed=True)} cycles  "
+                f"corrΔ={_fmt_int(d.get('slip_correction_delta'), signed=True)}  "
+                f"event_ticks={_fmt_int(d.get('slip_event_ticks'), signed=True)}  "
+                f"ledger={_fmt_int(d.get('slip_ticks'), signed=True)}  "
+                f"reason={d.get('slip_reason')}  y={d.get('y_tag')}"
+            )
+        if len(activity) > 80:
+            print(f"  ... {len(activity) - 80:,} more activity rows omitted")
+
+    print()
+    print("Verdict guide")
+    print("═════════════")
+    print("  • If earlyΔ/corrΔ increments with negative err cycles, the early-edge theory has direct evidence.")
+    print("  • If rawΔ moves but SlipLedger counters stay flat, the movement is ordinary yardstick/rail drift.")
+    print("  • If yardstick EXC appears without slip activity, that is inference disagreement, not necessarily hardware edge slip.")
+    print("  • If corrections appear on one lane and follow cabling/channel swaps, that is strong hardware-pathology evidence.")
+    print()
+
+
+def analyze(campaign: str, limit: int = 0, clock_filter: Optional[str] = None, slip_view: bool = False) -> None:
     rows = fetch_timebase(campaign)
     if not rows:
         print(f"No TIMEBASE rows for campaign '{campaign}'")
@@ -1141,6 +1451,12 @@ def analyze(campaign: str, limit: int = 0, clock_filter: Optional[str] = None) -
     collected, gaps = collect_rows(rows)
     if limit:
         collected = collected[:limit]
+
+    if slip_view:
+        if clock_filter == "VCLOCK":
+            raise SystemExit("--slip is currently OCXO-focused; use OCXO1, OCXO2, or no clock filter")
+        _print_slip_rows(collected, campaign, gaps, clock_filter)
+        return
 
     clock_label = "ALL" if clock_filter is None else clock_filter
     print(f"Campaign: {campaign}  ({len(rows):,} rows, view={clock_label})")
@@ -1499,19 +1815,25 @@ def analyze(campaign: str, limit: int = 0, clock_filter: Optional[str] = None) -
     print("  • Use a clock filter for narrower one-line rows, e.g. raw_cycles Plover1 OCXO2.")
     print()
 
-def parse_args(argv: List[str]) -> Tuple[str, int, Optional[str]]:
+def parse_args(argv: List[str]) -> Tuple[str, int, Optional[str], bool]:
     if len(argv) < 2:
         print("Usage: raw_cycles <campaign_name> [limit] [clock]")
         print("       raw_cycles <campaign_name> --clock OCXO2 [limit]")
+        print("       raw_cycles <campaign_name> --slip [limit] [clock]")
         raise SystemExit(1)
 
     campaign = argv[1]
     limit = 0
     clock: Optional[str] = None
+    slip_view = False
 
     i = 2
     while i < len(argv):
         arg = argv[i]
+        if arg == "--slip":
+            slip_view = True
+            i += 1
+            continue
         if arg == "--clock":
             if i + 1 >= len(argv):
                 raise SystemExit("--clock requires VCLOCK, OCXO1, or OCXO2")
@@ -1532,12 +1854,12 @@ def parse_args(argv: List[str]) -> Tuple[str, int, Optional[str]]:
             raise SystemExit(f"unknown argument '{arg}'") from exc
         i += 1
 
-    return campaign, limit, normalize_clock_filter(clock) if clock else None
+    return campaign, limit, normalize_clock_filter(clock) if clock else None, slip_view
 
 
 def main() -> None:
-    campaign, limit, clock = parse_args(sys.argv)
-    analyze(campaign, limit, clock)
+    campaign, limit, clock, slip_view = parse_args(sys.argv)
+    analyze(campaign, limit, clock, slip_view)
 
 
 if __name__ == "__main__":
