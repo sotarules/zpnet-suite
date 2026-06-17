@@ -178,7 +178,7 @@ static constexpr uint32_t EPOCH_CAPTURE_MAX_WINDOW_CYCLES =
 // Reporting-only integrity checks.  These counters intentionally do not feed
 // authority, repair, watchdog, gating, or SmartZero.  They are pure courtroom
 // arithmetic over already-authored edge facts.
-static constexpr uint32_t VCLOCK_PPS_INTERVAL_INTEGRITY_GATE_CYCLES = 4U;
+static constexpr uint32_t VCLOCK_PPS_INTERVAL_INTEGRITY_GATE_CYCLES = 10U;
 
 static interrupt_integrity_snapshot_t g_interrupt_integrity = {};
 

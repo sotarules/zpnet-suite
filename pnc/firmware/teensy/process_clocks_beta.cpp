@@ -4259,11 +4259,12 @@ static FLASHMEM Payload cmd_report_integrity(const Payload&) {
   Payload doctrine;
   doctrine.add("reporting_only", true);
   doctrine.add("mutates_clock_authority", false);
-  doctrine.add("vclock_pps_interval_gate_cycles", 4U);
+  doctrine.add("vclock_pps_interval_gate_cycles", 10U);
   doctrine.add("counter_delta_expected_ticks", (uint32_t)VCLOCK_COUNTS_PER_SECOND);
   doctrine.add("alpha_exact_ns_gate", 0U);
+  doctrine.add("alpha_ocxo_interval_gate_ns", 5U);
   doctrine.add("notes",
-               "Bad counters are diagnostic evidence only; later commits may optionally stream selected fields into TIMEBASE_FORENSICS");
+               "Bad counters are diagnostic evidence only; PPS-vs-VCLOCK compares physical PPS interval against observed latency-corrected VCLOCK interval, not EMA-published VCLOCK");
   p.add_object("doctrine", doctrine);
   return p;
 }

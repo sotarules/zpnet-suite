@@ -124,6 +124,8 @@ static volatile bool g_alpha_epoch_install_in_progress = false;
 static volatile uint32_t g_prev_dwt_at_vclock_event = 0;
 static volatile bool     g_prev_observed_dwt_at_vclock_event_valid = false;
 static volatile uint32_t g_prev_observed_dwt_at_vclock_event = 0;
+static volatile bool     g_observed_vclock_dwt_cycles_between_edges_valid = false;
+static volatile uint32_t g_observed_vclock_dwt_cycles_between_edges = 0;
 
 // ── Canonical one-second subtraction state for DWT cycles between PPS/VCLOCK anchors ──
 //
@@ -616,7 +618,12 @@ static inline uint64_t nominal_ns_from_counter32_epoch(uint32_t counter32,
 // Alpha integrity counters — reporting only
 // ============================================================================
 
+// VCLOCK self-map is a tautological public-coordinate math check and should
+// remain exact.  OCXO projected-GNSS interval equality is a physics/rounding
+// diagnostic, so give it a small gate to avoid counting normal integer-ns
+// projection fuzz as pathology.
 static constexpr uint32_t ALPHA_INTEGRITY_EXACT_NS_GATE = 0U;
+static constexpr uint32_t ALPHA_INTEGRITY_OCXO_INTERVAL_GATE_NS = 5U;
 
 static clocks_alpha_integrity_snapshot_t g_alpha_integrity = {};
 
@@ -723,7 +730,7 @@ static void alpha_integrity_note_ocxo_projected_gnss_second(
   if (!projected_ok) {
     alpha_integrity_record_ns_check(
         s->interval, sequence, false, 0ULL, 0ULL,
-        ALPHA_INTEGRITY_EXACT_NS_GATE);
+        ALPHA_INTEGRITY_OCXO_INTERVAL_GATE_NS);
     return;
   }
 
@@ -732,7 +739,7 @@ static void alpha_integrity_note_ocxo_projected_gnss_second(
     s->previous_edge_projected_gnss_ns = projected_ns;
     alpha_integrity_record_ns_check(
         s->interval, sequence, false, 0ULL, projected_ns,
-        ALPHA_INTEGRITY_EXACT_NS_GATE);
+        ALPHA_INTEGRITY_OCXO_INTERVAL_GATE_NS);
     return;
   }
 
@@ -746,14 +753,14 @@ static void alpha_integrity_note_ocxo_projected_gnss_second(
     s->previous_interval_ns = current_interval;
     alpha_integrity_record_ns_check(
         s->interval, sequence, false, current_interval, current_interval,
-        ALPHA_INTEGRITY_EXACT_NS_GATE);
+        ALPHA_INTEGRITY_OCXO_INTERVAL_GATE_NS);
     return;
   }
 
   const uint64_t expected_interval = s->previous_interval_ns;
   alpha_integrity_record_ns_check(
       s->interval, sequence, true, expected_interval, current_interval,
-      ALPHA_INTEGRITY_EXACT_NS_GATE);
+      ALPHA_INTEGRITY_OCXO_INTERVAL_GATE_NS);
   s->previous_interval_ns = current_interval;
 }
 
@@ -4752,10 +4759,26 @@ static void vclock_callback(const interrupt_event_t& event,
 
   g_vclock_event_count++;
   g_prev_dwt_at_vclock_event = event.dwt_at_event;
-  g_prev_observed_dwt_at_vclock_event =
+  const uint32_t observed_dwt_at_vclock_event =
       (diag && diag->dwt_original_at_event != 0)
           ? diag->dwt_original_at_event
           : event.dwt_at_event;
+
+  // Species-pure VCLOCK physical interval for PPS↔VCLOCK integrity reporting.
+  //
+  // event.dwt_at_event is the subscriber/public DWT species and may be
+  // EMA-published.  The PPS interval comparator must instead use the observed
+  // latency-corrected VCLOCK edge DWT on both endpoints, matching the raw_cycles
+  // v_raw surface rather than the v_ema surface.
+  if (g_prev_observed_dwt_at_vclock_event_valid) {
+    g_observed_vclock_dwt_cycles_between_edges =
+        observed_dwt_at_vclock_event - g_prev_observed_dwt_at_vclock_event;
+    g_observed_vclock_dwt_cycles_between_edges_valid = true;
+  } else {
+    g_observed_vclock_dwt_cycles_between_edges = 0;
+    g_observed_vclock_dwt_cycles_between_edges_valid = false;
+  }
+  g_prev_observed_dwt_at_vclock_event = observed_dwt_at_vclock_event;
   g_prev_observed_dwt_at_vclock_event_valid = true;
 
   clocks_apply_epoch_counter_edge(g_vclock_clock,
@@ -5031,8 +5054,9 @@ static void update_pps_vclock_bridge_anchor(const pps_edge_snapshot_t& snap) {
       snap.sequence,
       g_pps_dwt_cycles_between_edges_valid,
       (uint32_t)g_pps_dwt_cycles_between_edges,
-      g_vclock_measurement.dwt_cycles_between_edges != 0U,
-      g_vclock_measurement.dwt_cycles_between_edges);
+      g_observed_vclock_dwt_cycles_between_edges_valid &&
+          g_observed_vclock_dwt_cycles_between_edges != 0U,
+      (uint32_t)g_observed_vclock_dwt_cycles_between_edges);
 
   const bool gnss_self_map_valid =
       g_prev_pps_vclock_dwt_at_edge_valid &&
