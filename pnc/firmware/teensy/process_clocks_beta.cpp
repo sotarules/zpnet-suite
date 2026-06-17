@@ -138,6 +138,18 @@ extern uint32_t clocks_alpha_ocxo_projection_guard_sanity_reject_count(time_cloc
 static constexpr bool TIMEBASE_FORENSICS_PUBLISH_ENABLED = true;
 static constexpr bool TIMEBASE_FORENSICS_MINIMAL_PAYLOAD_ENABLED = true;
 
+// Ultra-slim raw-cycle companion fields for the 1 Hz TIMEBASE_FORENSICS row.
+// Deliberately flat: no nested lane objects, no service objects, and no deep
+// autopsy surfaces.  This is the next step above MINIMAL_PAIR_ONLY and is
+// intended to preserve the Pi pair contract while giving raw_cycles enough
+// cycle evidence to plot observed/EMA/FloorLine behavior.
+static constexpr bool TIMEBASE_FORENSICS_MICRO_RAW_CYCLES_ENABLED = true;
+
+// The richer slim/full forensics builders remain compiled for focused future
+// experiments, but they are not used by the 1 Hz campaign stream in this step.
+static constexpr bool TIMEBASE_FORENSICS_SLIM_RAW_CYCLES_PAYLOAD_ENABLED = false;
+static constexpr bool TIMEBASE_FORENSICS_FLOORLINE_PAYLOAD_ENABLED = false;
+
 static constexpr uint32_t TIMEBASE_BUILD_STAGE_NONE = 0;
 static constexpr uint32_t TIMEBASE_BUILD_STAGE_ENTRY = 1;
 static constexpr uint32_t TIMEBASE_BUILD_STAGE_STOP_GATE = 2;
@@ -192,6 +204,8 @@ static uint32_t g_timebase_forensics_publish_attempt_count = 0;
 static uint32_t g_timebase_forensics_publish_return_count = 0;
 static uint32_t g_timebase_forensics_disabled_count = 0;
 static uint32_t g_timebase_forensics_minimal_count = 0;
+static uint32_t g_timebase_forensics_micro_raw_count = 0;
+static uint32_t g_timebase_forensics_slim_count = 0;
 
 static uint32_t g_timebase_last_stage = TIMEBASE_BUILD_STAGE_NONE;
 static uint64_t g_timebase_last_entry_campaign_seconds = 0;
@@ -1567,6 +1581,352 @@ static void payload_add_ocxo_cycle_residual_diag_object(
   parent.add_object("cycle_residual_diagnostic", diag);
 }
 
+
+static int32_t beta_signed_delta_u32(uint32_t observed, uint32_t expected) {
+  return (observed >= expected)
+      ? (int32_t)(observed - expected)
+      : -(int32_t)(expected - observed);
+}
+
+static uint32_t floorline_inferred_interval_cycles(
+    bool valid,
+    const clocks_alpha_lane_forensics_t& f) {
+  if (!valid || !f.regression_valid ||
+      f.regression_slope_q16_cycles_per_sample == 0ULL) {
+    return 0U;
+  }
+
+  const uint64_t cycles =
+      (f.regression_slope_q16_cycles_per_sample * 1000ULL + 32768ULL) >> 16;
+  return (cycles > (uint64_t)UINT32_MAX) ? UINT32_MAX : (uint32_t)cycles;
+}
+
+static void payload_add_floorline_object(Payload& parent,
+                                         bool valid,
+                                         const clocks_alpha_lane_forensics_t& f) {
+  const bool floor_valid = valid && f.regression_valid;
+  const uint32_t observed_interval =
+      valid ? f.dwt_interval_observed_cycles : 0U;
+  const uint32_t inferred_interval =
+      floorline_inferred_interval_cycles(floor_valid, f);
+
+  Payload floor;
+  floor.add("valid", floor_valid);
+  floor.add("reporting_only", true);
+  floor.add("sequence", floor_valid ? f.regression_sequence : 0U);
+  floor.add("sample_count", floor_valid ? f.regression_sample_count : 0U);
+
+  floor.add("observed_edge_dwt",
+            floor_valid ? f.regression_observed_dwt_at_event : 0U);
+  floor.add("inferred_edge_dwt",
+            floor_valid ? f.regression_inferred_dwt_at_event : 0U);
+  floor.add("inferred_minus_observed_edge_cycles",
+            floor_valid ? f.regression_inferred_minus_observed_cycles : 0);
+
+  floor.add("observed_interval_cycles", observed_interval);
+  floor.add("inferred_interval_cycles", inferred_interval);
+  floor.add("inferred_minus_observed_interval_cycles",
+            floor_valid
+                ? beta_signed_delta_u32(inferred_interval, observed_interval)
+                : 0);
+
+  floor.add("target_counter32_at_edge",
+            floor_valid ? f.regression_target_counter32_at_event : 0U);
+  floor.add("target_hardware16_at_edge",
+            floor_valid ? (uint32_t)f.regression_target_hardware16_at_event : 0U);
+  floor.add("observed_hardware16_at_edge",
+            floor_valid ? (uint32_t)f.regression_observed_hardware16_at_event : 0U);
+
+  floor.add("slope_q16_cycles_per_sample",
+            floor_valid ? f.regression_slope_q16_cycles_per_sample : 0ULL);
+  floor.add("slope_delta_q16_cycles_per_sample",
+            floor_valid ? f.regression_slope_delta_q16_cycles_per_sample : 0LL);
+  floor.add("fit_error_mean_q16_cycles",
+            floor_valid ? f.regression_fit_error_mean_q16_cycles : 0);
+  floor.add("fit_error_stddev_q16_cycles",
+            floor_valid ? f.regression_fit_error_stddev_q16_cycles : 0U);
+  floor.add("fit_error_min_cycles",
+            floor_valid ? f.regression_fit_error_min_cycles : 0);
+  floor.add("fit_error_max_cycles",
+            floor_valid ? f.regression_fit_error_max_cycles : 0);
+  floor.add("fit_error_abs_gt4_count",
+            floor_valid ? f.regression_fit_error_abs_gt4_count : 0U);
+
+  parent.add_object("floorline", floor);
+}
+
+static void payload_add_slim_dwt_lane_forensics(
+    Payload& parent,
+    bool valid,
+    const clocks_alpha_lane_forensics_t& f) {
+  Payload dwt;
+  dwt.add("valid", valid);
+  dwt.add("update_count", valid ? f.update_count : 0U);
+  dwt.add("last_event_dwt", valid ? f.last_event_dwt : 0U);
+  dwt.add("last_event_counter32", valid ? f.last_event_counter32 : 0U);
+  dwt.add("counter32_delta_since_previous_event",
+          valid ? f.counter32_delta_since_previous_event : 0U);
+
+  dwt.add("cycles_between_edges", valid ? f.dwt_cycles_between_edges : 0U);
+  dwt.add("original_at_event", valid ? f.dwt_original_at_event : 0U);
+  dwt.add("predicted_at_event", valid ? f.dwt_predicted_at_event : 0U);
+  dwt.add("ema_dwt_at_event", valid ? f.dwt_ema_dwt_at_event : 0U);
+  dwt.add("used_at_event", valid ? f.dwt_used_at_event : 0U);
+  dwt.add("isr_entry_raw", valid ? f.dwt_isr_entry_raw : 0U);
+  dwt.add("event_from_isr_entry_raw",
+          valid ? f.dwt_event_from_isr_entry_raw : 0U);
+  dwt.add("isr_entry_to_event_correction_cycles",
+          valid ? f.dwt_isr_entry_to_event_correction_cycles : 0);
+  dwt.add("published_minus_event_cycles",
+          valid ? f.dwt_published_minus_event_cycles : 0);
+  dwt.add("used_minus_event_cycles",
+          valid ? f.dwt_used_minus_event_cycles : 0);
+  dwt.add("synthetic", valid && f.dwt_synthetic);
+  dwt.add("synthetic_error_cycles",
+          valid ? f.dwt_synthetic_error_cycles : 0);
+  dwt.add("synthetic_threshold_cycles",
+          valid ? f.dwt_synthetic_threshold_cycles : 0U);
+
+  Payload gate;
+  gate.add("valid", valid && f.dwt_interval_gate_valid);
+  gate.add("accepted", valid && f.dwt_interval_sample_accepted);
+  gate.add("rejected", valid && f.dwt_interval_sample_rejected);
+  gate.add("ema_updated", valid && f.dwt_interval_ema_updated);
+  gate.add("observed_cycles", valid ? f.dwt_interval_observed_cycles : 0U);
+  gate.add("prediction_cycles", valid ? f.dwt_interval_prediction_cycles : 0U);
+  gate.add("effective_cycles", valid ? f.dwt_interval_effective_cycles : 0U);
+  gate.add("residual_cycles", valid ? f.dwt_interval_residual_cycles : 0);
+  gate.add("threshold_cycles", valid ? f.dwt_interval_gate_threshold_cycles : 0U);
+  gate.add("accept_count", valid ? f.dwt_interval_accept_count : 0U);
+  gate.add("reject_count", valid ? f.dwt_interval_reject_count : 0U);
+  gate.add("reject_streak", valid ? f.dwt_interval_reject_streak : 0U);
+  dwt.add_object("interval_gate", gate);
+
+  Payload adjacency;
+  adjacency.add("valid", valid && f.dwt_interval_adjacency_gate_valid);
+  adjacency.add("ok", valid && f.dwt_interval_adjacency_ok);
+  adjacency.add("rejected", valid && f.dwt_interval_adjacency_rejected);
+  adjacency.add("counter_delta_ticks",
+                valid ? f.dwt_interval_counter_delta_ticks : 0U);
+  adjacency.add("expected_counter_delta_ticks",
+                valid ? f.dwt_interval_expected_counter_delta_ticks : 0U);
+  adjacency.add("reject_count",
+                valid ? f.dwt_interval_adjacency_reject_count : 0U);
+  dwt.add_object("adjacency", adjacency);
+
+  Payload yardstick;
+  yardstick.add("valid", valid && f.dwt_yardstick_valid);
+  yardstick.add("stale", valid && f.dwt_yardstick_stale);
+  yardstick.add("seeded", valid && f.dwt_yardstick_seeded);
+  yardstick.add("excursion", valid && f.dwt_yardstick_excursion);
+  yardstick.add("pps_sequence", valid ? f.dwt_yardstick_pps_sequence : 0U);
+  yardstick.add("pps_seq_delta", valid ? f.dwt_yardstick_pps_seq_delta : 0U);
+  yardstick.add("g_now_cycles", valid ? f.dwt_yardstick_g_now_cycles : 0U);
+  yardstick.add("g_prev_cycles", valid ? f.dwt_yardstick_g_prev_cycles : 0U);
+  yardstick.add("inferred_interval_cycles",
+                valid ? f.dwt_yardstick_inferred_interval_cycles : 0U);
+  yardstick.add("observed_interval_cycles",
+                valid ? f.dwt_yardstick_observed_interval_cycles : 0U);
+  yardstick.add("inferred_minus_observed_cycles",
+                valid ? f.dwt_yardstick_inferred_minus_observed_cycles : 0);
+  yardstick.add("endpoint_minus_observed_cycles",
+                valid ? f.dwt_yardstick_endpoint_minus_observed_cycles : 0);
+  yardstick.add("gate_threshold_cycles",
+                valid ? f.dwt_yardstick_gate_threshold_cycles : 0U);
+  yardstick.add("gate_agree_count",
+                valid ? f.dwt_yardstick_gate_agree_count : 0U);
+  yardstick.add("gate_excursion_count",
+                valid ? f.dwt_yardstick_gate_excursion_count : 0U);
+  yardstick.add("authority", valid && f.dwt_yardstick_authority);
+  yardstick.add("auth_error_cycles",
+                valid ? f.dwt_yardstick_auth_error_cycles : 0);
+  yardstick.add("auth_anchor_applied",
+                valid && f.dwt_yardstick_auth_anchor_applied);
+  dwt.add_object("yardstick", yardstick);
+
+  if (TIMEBASE_FORENSICS_FLOORLINE_PAYLOAD_ENABLED) {
+    payload_add_floorline_object(dwt, valid, f);
+  }
+
+  parent.add_object("dwt_forensics", dwt);
+}
+
+static void payload_add_slim_pps_vclock_edge_forensics(
+    Payload& parent,
+    bool available,
+    const clocks_pps_vclock_edge_forensics_t& e) {
+  Payload edge;
+  edge.add("available", available);
+  edge.add("valid", available && e.valid);
+  edge.add("sequence", available ? e.sequence : 0U);
+  edge.add("update_count", available ? e.update_count : 0U);
+  edge.add("reject_count", available ? e.reject_count : 0U);
+  edge.add("decision", pps_vclock_edge_decision_name(available ? e.decision : 0U));
+  edge.add("decision_id", available ? e.decision : 0U);
+  edge.add("invalid_mask", available ? e.invalid_mask : 0U);
+
+  edge.add("authority_dwt_at_edge", available ? e.authority_dwt_at_edge : 0U);
+  edge.add("pps_dwt_at_edge", available ? e.pps_dwt_at_edge : 0U);
+  edge.add("vclock_observed_dwt_at_edge",
+           available ? e.vclock_observed_dwt_at_edge : 0U);
+  edge.add("vclock_predicted_dwt_at_edge",
+           available ? e.vclock_predicted_dwt_at_edge : 0U);
+  edge.add("pps_projected_vclock_dwt_at_edge",
+           available ? e.pps_projected_vclock_dwt_at_edge : 0U);
+
+  edge.add("authority_minus_pps_cycles",
+           available ? e.authority_minus_pps_cycles : 0);
+  edge.add("authority_minus_vclock_observed_cycles",
+           available ? e.authority_minus_vclock_observed_cycles : 0);
+  edge.add("authority_minus_prediction_cycles",
+           available ? e.authority_minus_prediction_cycles : 0);
+  edge.add("prediction_minus_pps_projected_cycles",
+           available ? e.prediction_minus_pps_projected_cycles : 0);
+  edge.add("pps_projected_minus_observed_cycles",
+           available ? e.pps_projected_minus_observed_cycles : 0);
+  edge.add("observed_minus_prediction_cycles",
+           available ? e.observed_minus_prediction_cycles : 0);
+
+  edge.add("counter32_at_edge", available ? e.counter32_at_edge : 0U);
+  edge.add("ch3_at_edge", available ? (uint32_t)e.ch3_at_edge : 0U);
+  edge.add("dwt_cycles_between_edges",
+           available ? e.dwt_cycles_between_edges : 0U);
+  edge.add("effective_dwt_cycles_per_second",
+           available ? e.effective_dwt_cycles_per_second : 0U);
+
+  edge.add("gnss_self_map_valid", available && e.gnss_self_map_valid);
+  edge.add("gnss_self_error_ok", available && e.gnss_self_error_ok);
+  edge.add("gnss_self_error_ns", available ? e.gnss_self_error_ns : 0LL);
+
+  parent.add_object("pps_vclock_edge", edge);
+}
+
+static void payload_add_slim_compare_service(
+    Payload& parent,
+    interrupt_subscriber_kind_t kind,
+    bool valid,
+    const clocks_alpha_lane_forensics_t& f) {
+  Payload service;
+  service.add("class", valid ? f.diag_service_class : 0U);
+  service.add("offset_ticks", valid ? f.diag_service_offset_signed_ticks : 0);
+  service.add("offset_abs_ticks", valid ? f.diag_service_offset_abs_ticks : 0U);
+  service.add("interpreted_late_ticks",
+              valid ? f.diag_interpreted_late_ticks : 0U);
+  service.add("early_ticks", valid ? f.diag_early_ticks : 0U);
+  service.add("target_delta_mod65536_ticks",
+              valid ? f.diag_target_delta_mod65536_ticks : 0U);
+  service.add("arm_remaining_ticks",
+              valid ? f.diag_arm_remaining_ticks : 0U);
+  service.add("arm_to_isr_ticks",
+              valid ? f.diag_arm_to_isr_ticks : 0U);
+  service.add("arm_to_isr_dwt_cycles",
+              valid ? f.diag_arm_to_isr_dwt_cycles : 0U);
+  service.add("service_correction_cycles",
+              valid ? f.diag_service_correction_cycles : 0);
+  service.add("service_corrected_dwt_at_event",
+              valid ? f.diag_service_corrected_dwt_at_event : 0U);
+  service.add("perishable_fact_sequence",
+              valid ? f.diag_perishable_fact_sequence : 0U);
+  service.add("fact_ring_overflow_count",
+              valid ? f.diag_fact_ring_overflow_count : 0U);
+  service.add("counter_delta_violation_count",
+              valid ? f.diag_counter_delta_violation_count : 0U);
+  service.add("last_bad_counter_delta",
+              valid ? f.diag_last_bad_counter_delta : 0U);
+  service.add("last_counter_delta_ticks",
+              valid ? f.diag_last_counter_delta_ticks : 0U);
+
+  const interrupt_capture_diag_t* direct_diag =
+      valid ? interrupt_last_diag(kind) : nullptr;
+  const bool direct_valid = direct_diag && direct_diag->enabled &&
+                            direct_diag->kind == kind &&
+                            direct_diag->counter32_at_event == f.last_event_counter32;
+
+  Payload compare;
+  compare.add("direct_valid", direct_valid);
+  compare.add("arm_counter_low16",
+              direct_valid ? (uint32_t)direct_diag->ocxo_arm_counter_low16 : 0U);
+  compare.add("arm_compare_low16",
+              direct_valid ? (uint32_t)direct_diag->ocxo_arm_compare_low16 : 0U);
+  compare.add("arm_counter_minus_compare_ticks",
+              direct_valid ? direct_diag->ocxo_arm_counter_minus_compare_ticks : 0U);
+  compare.add("arm_compare_remaining_ticks",
+              direct_valid ? direct_diag->ocxo_arm_compare_remaining_ticks : 0U);
+  compare.add("isr_counter_low16",
+              direct_valid ? (uint32_t)direct_diag->ocxo_isr_counter_low16 : 0U);
+  compare.add("isr_compare_low16",
+              direct_valid ? (uint32_t)direct_diag->ocxo_isr_compare_low16 : 0U);
+  compare.add("isr_counter_minus_compare_ticks",
+              direct_valid ? direct_diag->ocxo_isr_counter_minus_compare_ticks : 0U);
+  compare.add("compare_delta_mod65536_ticks",
+              direct_valid ? direct_diag->ocxo_compare_delta_mod65536_ticks : 0U);
+  compare.add("compare_service_offset_signed_ticks",
+              direct_valid ? direct_diag->ocxo_compare_service_offset_signed_ticks : 0);
+  compare.add("compare_interpreted_late_ticks",
+              direct_valid ? direct_diag->ocxo_compare_interpreted_late_ticks : 0U);
+  compare.add("compare_early_ticks",
+              direct_valid ? direct_diag->ocxo_compare_early_ticks : 0U);
+  compare.add("compare_arm_to_isr_ticks",
+              direct_valid ? direct_diag->ocxo_compare_arm_to_isr_ticks : 0U);
+  service.add_object("compare", compare);
+
+  parent.add_object("compare_service", service);
+}
+
+static void payload_add_slim_vclock_forensics(Payload& parent,
+                                              uint64_t public_ns,
+                                              bool valid,
+                                              const clocks_alpha_lane_forensics_t& f) {
+  Payload lane;
+  lane.add("ns", public_ns);
+  lane.add("public_ns", public_ns);
+  payload_add_slim_dwt_lane_forensics(lane, valid, f);
+  parent.add_object("vclock", lane);
+}
+
+static void payload_add_slim_ocxo_forensics(
+    Payload& parent,
+    const char* key,
+    uint64_t public_ns,
+    uint64_t public_measured_ns,
+    bool forensics_valid,
+    const clocks_alpha_lane_forensics_t& f,
+    bool pps_projection_valid,
+    const clocks_alpha_ocxo_pps_projection_snapshot_t& pps_projection,
+    bool pps_residual_valid,
+    uint64_t pps_gnss_interval_ns,
+    uint64_t pps_clock_interval_ns,
+    int64_t pps_fast_residual_ns,
+    const ocxo_cycle_residual_diag_t& cycle_diag) {
+  Payload lane;
+  lane.add("ns", public_ns);
+  lane.add("public_ns", public_ns);
+  lane.add("measured_gnss_ns", public_measured_ns);
+  lane.add("pps_projected_valid", pps_projection_valid);
+  lane.add("pps_projected_raw_ns",
+           pps_projection_valid ? pps_projection.projected_ocxo_ns_at_pps : 0ULL);
+  lane.add("pps_projection_source",
+           pps_projection_valid ? pps_projection.source : 0U);
+
+  payload_add_ocxo_pps_residual_object(lane,
+                                       pps_residual_valid,
+                                       pps_gnss_interval_ns,
+                                       pps_clock_interval_ns,
+                                       pps_fast_residual_ns);
+
+  payload_add_ocxo_cycle_residual_diag_object(lane, cycle_diag);
+  payload_add_slim_dwt_lane_forensics(lane, forensics_valid, f);
+
+  const interrupt_subscriber_kind_t service_kind =
+      (key && key[4] == '1')
+          ? interrupt_subscriber_kind_t::OCXO1
+          : interrupt_subscriber_kind_t::OCXO2;
+  payload_add_slim_compare_service(lane, service_kind, forensics_valid, f);
+
+  parent.add_object(key, lane);
+}
+
+
 static void payload_add_timebase_pair_identity(Payload& p,
                                                const char* schema,
                                                const char* version_key,
@@ -2786,6 +3146,125 @@ void clocks_beta_pps(void) {
       f.add("ocxo2_pps_projected", ocxo2_pps_projected_valid);
       f.add("ocxo1_pps_residual_valid", pps_residuals.ocxo1_valid);
       f.add("ocxo2_pps_residual_valid", pps_residuals.ocxo2_valid);
+
+      if (TIMEBASE_FORENSICS_MICRO_RAW_CYCLES_ENABLED) {
+        // MICRO_RAW_CYCLES_V1
+        //
+        // Keep this branch brutally flat and bounded.  The previous
+        // slim-forensics attempt still used nested Payload objects and enough
+        // construction work to trip the Teensy's campaign-start memory edge.
+        // These fields are selected specifically for raw_cycles /
+        // raw_cycles_excursions:
+        //
+        //   *_obs     observed raw one-second DWT interval
+        //   *_eff     effective/published interval after EMA/Yardstick gate
+        //   *_res     observed-minus-prediction residual from the interval gate
+        //   *_orig    original observed DWT edge
+        //   *_used    DWT edge used/published by the current authority
+        //   *_fl_cyc  FloorLine inferred one-second interval
+        //   *_fl_err  FloorLine inferred edge minus observed edge
+        //
+        // No authority is changed here.  This is a compact telemetry tap only.
+        g_timebase_forensics_micro_raw_count++;
+        f.add("micro_raw_cycles", true);
+        f.add("micro_schema", "MICRO_RAW_CYCLES_V1");
+
+        f.add("pps_obs", g_pps_dwt_cycles_between_edges_valid
+                         ? g_pps_dwt_cycles_between_edges
+                         : 0U);
+
+        const bool v_ok = vclock_forensics_valid;
+        const bool v_fl = v_ok && vclock_forensics.regression_valid;
+        const uint32_t v_fl_cyc = v_fl
+            ? floorline_inferred_interval_cycles(true, vclock_forensics)
+            : 0U;
+        f.add("v_obs", v_ok ? vclock_forensics.dwt_interval_observed_cycles : 0U);
+        f.add("v_eff", v_ok ? vclock_forensics.dwt_interval_effective_cycles : 0U);
+        f.add("v_res", v_ok ? vclock_forensics.dwt_interval_residual_cycles : 0);
+        f.add("v_orig", v_ok ? vclock_forensics.dwt_original_at_event : 0U);
+        f.add("v_used", v_ok ? vclock_forensics.dwt_used_at_event : 0U);
+        f.add("v_fl_cyc", v_fl_cyc);
+        f.add("v_fl_err", v_fl ? vclock_forensics.regression_inferred_minus_observed_cycles : 0);
+
+        const bool o1_ok = ocxo1_forensics_valid;
+        const bool o1_fl = o1_ok && ocxo1_forensics.regression_valid;
+        const uint32_t o1_fl_cyc = o1_fl
+            ? floorline_inferred_interval_cycles(true, ocxo1_forensics)
+            : 0U;
+        f.add("o1_obs", o1_ok ? ocxo1_forensics.dwt_interval_observed_cycles : 0U);
+        f.add("o1_eff", o1_ok ? ocxo1_forensics.dwt_interval_effective_cycles : 0U);
+        f.add("o1_res", o1_ok ? ocxo1_forensics.dwt_interval_residual_cycles : 0);
+        f.add("o1_orig", o1_ok ? ocxo1_forensics.dwt_original_at_event : 0U);
+        f.add("o1_used", o1_ok ? ocxo1_forensics.dwt_used_at_event : 0U);
+        f.add("o1_fl_cyc", o1_fl_cyc);
+        f.add("o1_fl_err", o1_fl ? ocxo1_forensics.regression_inferred_minus_observed_cycles : 0);
+        f.add("o1_pps_res", pps_residuals.ocxo1_valid
+                            ? pps_residuals.ocxo1_fast_residual_ns
+                            : 0LL);
+
+        const bool o2_ok = ocxo2_forensics_valid;
+        const bool o2_fl = o2_ok && ocxo2_forensics.regression_valid;
+        const uint32_t o2_fl_cyc = o2_fl
+            ? floorline_inferred_interval_cycles(true, ocxo2_forensics)
+            : 0U;
+        f.add("o2_obs", o2_ok ? ocxo2_forensics.dwt_interval_observed_cycles : 0U);
+        f.add("o2_eff", o2_ok ? ocxo2_forensics.dwt_interval_effective_cycles : 0U);
+        f.add("o2_res", o2_ok ? ocxo2_forensics.dwt_interval_residual_cycles : 0);
+        f.add("o2_orig", o2_ok ? ocxo2_forensics.dwt_original_at_event : 0U);
+        f.add("o2_used", o2_ok ? ocxo2_forensics.dwt_used_at_event : 0U);
+        f.add("o2_fl_cyc", o2_fl_cyc);
+        f.add("o2_fl_err", o2_fl ? ocxo2_forensics.regression_inferred_minus_observed_cycles : 0);
+        f.add("o2_pps_res", pps_residuals.ocxo2_valid
+                            ? pps_residuals.ocxo2_fast_residual_ns
+                            : 0LL);
+      }
+    } else if (TIMEBASE_FORENSICS_SLIM_RAW_CYCLES_PAYLOAD_ENABLED) {
+      // Curated campaign-row forensics: enough for raw_cycles /
+      // raw_cycles_excursions, including EMA, Yardstick, and FloorLine cycle
+      // surfaces, while omitting bulky deep-autopsy objects.
+      g_timebase_forensics_slim_count++;
+      f.add("minimal", false);
+      f.add("slim_raw_cycles", true);
+      f.add("floorline_included", TIMEBASE_FORENSICS_FLOORLINE_PAYLOAD_ENABLED);
+
+      payload_add_slim_pps_vclock_edge_forensics(
+          f, pps_vclock_edge_forensics_valid, pps_vclock_edge_forensics);
+
+      timebase_build_stage(TIMEBASE_BUILD_STAGE_VCLOCK);
+      payload_add_slim_vclock_forensics(f,
+                                        public_gnss_ns,
+                                        vclock_forensics_valid,
+                                        vclock_forensics);
+
+      timebase_build_stage(TIMEBASE_BUILD_STAGE_OCXO1);
+      payload_add_slim_ocxo_forensics(f,
+                                      "ocxo1",
+                                      public_ocxo1_ns,
+                                      public_ocxo1_measured_ns,
+                                      ocxo1_forensics_valid,
+                                      ocxo1_forensics,
+                                      ocxo1_pps_projected_valid,
+                                      ocxo1_pps_projection,
+                                      pps_residuals.ocxo1_valid,
+                                      pps_residuals.gnss_interval_ns,
+                                      pps_residuals.ocxo1_interval_ns,
+                                      pps_residuals.ocxo1_fast_residual_ns,
+                                      ocxo1_cycle_residual_diag);
+
+      timebase_build_stage(TIMEBASE_BUILD_STAGE_OCXO2);
+      payload_add_slim_ocxo_forensics(f,
+                                      "ocxo2",
+                                      public_ocxo2_ns,
+                                      public_ocxo2_measured_ns,
+                                      ocxo2_forensics_valid,
+                                      ocxo2_forensics,
+                                      ocxo2_pps_projected_valid,
+                                      ocxo2_pps_projection,
+                                      pps_residuals.ocxo2_valid,
+                                      pps_residuals.gnss_interval_ns,
+                                      pps_residuals.ocxo2_interval_ns,
+                                      pps_residuals.ocxo2_fast_residual_ns,
+                                      ocxo2_cycle_residual_diag);
     } else {
       payload_add_pps_vclock_edge_forensics(f,
                                             pps_vclock_edge_forensics_valid,
@@ -4170,11 +4649,19 @@ static FLASHMEM Payload cmd_report_timebase_publish(const Payload&) {
   counters.add("forensics_publish_return_count", g_timebase_forensics_publish_return_count);
   counters.add("forensics_disabled_count", g_timebase_forensics_disabled_count);
   counters.add("forensics_minimal_count", g_timebase_forensics_minimal_count);
+  counters.add("forensics_micro_raw_count", g_timebase_forensics_micro_raw_count);
+  counters.add("forensics_slim_count", g_timebase_forensics_slim_count);
   p.add_object("counters", counters);
 
   Payload gates;
   gates.add("forensics_publish_enabled", TIMEBASE_FORENSICS_PUBLISH_ENABLED);
   gates.add("forensics_minimal_payload_enabled", TIMEBASE_FORENSICS_MINIMAL_PAYLOAD_ENABLED);
+  gates.add("forensics_micro_raw_cycles_enabled",
+            TIMEBASE_FORENSICS_MICRO_RAW_CYCLES_ENABLED);
+  gates.add("forensics_slim_raw_cycles_payload_enabled",
+            TIMEBASE_FORENSICS_SLIM_RAW_CYCLES_PAYLOAD_ENABLED);
+  gates.add("forensics_floorline_payload_enabled",
+            TIMEBASE_FORENSICS_FLOORLINE_PAYLOAD_ENABLED);
   gates.add("stop_gate_count", g_timebase_stop_gate_count);
   gates.add("start_zero_gate_count", g_timebase_start_zero_gate_count);
   gates.add("recover_gate_count", g_timebase_recover_gate_count);
@@ -4235,6 +4722,12 @@ static FLASHMEM Payload cmd_report_timebase_publish(const Payload&) {
            g_timebase_forensics_publish_return_count);
   gaps.add("forensics_disabled", !TIMEBASE_FORENSICS_PUBLISH_ENABLED);
   gaps.add("forensics_minimal_payload", TIMEBASE_FORENSICS_MINIMAL_PAYLOAD_ENABLED);
+  gaps.add("forensics_micro_raw_cycles",
+           TIMEBASE_FORENSICS_MICRO_RAW_CYCLES_ENABLED);
+  gaps.add("forensics_slim_raw_cycles_payload",
+           TIMEBASE_FORENSICS_SLIM_RAW_CYCLES_PAYLOAD_ENABLED);
+  gaps.add("forensics_floorline_payload",
+           TIMEBASE_FORENSICS_FLOORLINE_PAYLOAD_ENABLED);
   p.add_object("gaps", gaps);
 
   return p;
