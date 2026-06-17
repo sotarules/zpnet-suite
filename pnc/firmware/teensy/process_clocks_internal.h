@@ -1003,7 +1003,14 @@ void ocxo_dac_retry_reset(ocxo_dac_state_t& s);
 // seconds. The first emitted fragment therefore appears after a deliberate
 // canonical gap, preserving the recovered absolute PPS identity.
 
-static constexpr uint32_t CLOCKS_CAMPAIGN_WARMUP_SUPPRESS_PPS = 5;
+// START-path diagnostic: hold the public TIMEBASE campaign start longer so
+// Alpha has time to install both OCXO visible/public-origin offsets before
+// Beta captures campaign public bases.  This deliberately changes no authority
+// path, publishes no extra fields, allocates no payloads, and calls no new
+// code from the PPS/Beta path.  If this eliminates the explicit-START
+// +hundreds-of-ms OCXO offset, the bug is a START warmup/origin race rather
+// than FloorLine math or TIMEBASE_FORENSICS parsing.
+static constexpr uint32_t CLOCKS_CAMPAIGN_WARMUP_SUPPRESS_PPS = 20;
 
 // ============================================================================
 // Campaign state
