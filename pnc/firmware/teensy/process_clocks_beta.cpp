@@ -129,6 +129,15 @@ extern uint32_t clocks_alpha_ocxo_projection_guard_sanity_reject_count(time_cloc
 //
 // Focused report: CLOCKS.REPORT_TIMEBASE_PUBLISH
 
+// Temporary safety valve while the lower-envelope report-only rail is being
+// validated.  Pi-side clocks currently treats TIMEBASE_FRAGMENT and
+// TIMEBASE_FORENSICS as an atomic pair and faults if a new fragment identity
+// arrives while the prior identity has no forensics companion.  Therefore we
+// must keep publishing the TIMEBASE_FORENSICS companion row, but we can make it
+// deliberately tiny until the lower-envelope payload is sane.
+static constexpr bool TIMEBASE_FORENSICS_PUBLISH_ENABLED = true;
+static constexpr bool TIMEBASE_FORENSICS_MINIMAL_PAYLOAD_ENABLED = true;
+
 static constexpr uint32_t TIMEBASE_BUILD_STAGE_NONE = 0;
 static constexpr uint32_t TIMEBASE_BUILD_STAGE_ENTRY = 1;
 static constexpr uint32_t TIMEBASE_BUILD_STAGE_STOP_GATE = 2;
@@ -181,6 +190,8 @@ static uint32_t g_timebase_forensics_build_begin_count = 0;
 static uint32_t g_timebase_forensics_build_complete_count = 0;
 static uint32_t g_timebase_forensics_publish_attempt_count = 0;
 static uint32_t g_timebase_forensics_publish_return_count = 0;
+static uint32_t g_timebase_forensics_disabled_count = 0;
+static uint32_t g_timebase_forensics_minimal_count = 0;
 
 static uint32_t g_timebase_last_stage = TIMEBASE_BUILD_STAGE_NONE;
 static uint64_t g_timebase_last_entry_campaign_seconds = 0;
@@ -1271,6 +1282,64 @@ static void payload_add_lane_forensics_object(Payload& parent,
   yardstick.add("auth_anchor_applied",
                 valid && f.dwt_yardstick_auth_anchor_applied);
   forensics.add_object("dwt_yardstick", yardstick);
+
+  // 1 kHz lower-envelope inference rail.  process_interrupt reuses the
+  // regression_* transport fields for this report-only successor to the retired
+  // linear regression experiment.  The interval field below is the computed
+  // slope-derived one-second cycle count; dwt_interval_gate.observed_cycles is
+  // the raw observed one-second interval used for side-by-side analysis.
+  Payload lower_env;
+  const bool lower_valid = valid && f.regression_valid;
+  const uint32_t lower_inferred_interval_cycles = lower_valid
+      ? (uint32_t)(((uint64_t)f.regression_slope_q16_cycles_per_sample *
+                    1000ULL + 32768ULL) >> 16)
+      : 0U;
+  const uint32_t lower_observed_interval_cycles = valid
+      ? f.dwt_interval_observed_cycles
+      : 0U;
+  lower_env.add("valid", lower_valid);
+  lower_env.add("sequence", lower_valid ? f.regression_sequence : 0U);
+  lower_env.add("sample_count", lower_valid ? f.regression_sample_count : 0U);
+  lower_env.add("observed_edge_dwt",
+                lower_valid ? f.regression_observed_dwt_at_event : 0U);
+  lower_env.add("inferred_edge_dwt",
+                lower_valid ? f.regression_inferred_dwt_at_event : 0U);
+  lower_env.add("inferred_minus_observed_edge_cycles",
+                lower_valid ? f.regression_inferred_minus_observed_cycles : 0);
+  lower_env.add("observed_interval_cycles", lower_observed_interval_cycles);
+  lower_env.add("inferred_interval_cycles", lower_inferred_interval_cycles);
+  lower_env.add("inferred_minus_observed_interval_cycles",
+                lower_valid
+                    ? ((lower_inferred_interval_cycles >= lower_observed_interval_cycles)
+                           ? (int32_t)(lower_inferred_interval_cycles - lower_observed_interval_cycles)
+                           : -(int32_t)(lower_observed_interval_cycles - lower_inferred_interval_cycles))
+                    : 0);
+  lower_env.add("target_counter32_at_edge",
+                lower_valid ? f.regression_target_counter32_at_event : 0U);
+  lower_env.add("target_hardware16_at_edge",
+                lower_valid ? (uint32_t)f.regression_target_hardware16_at_event : 0U);
+  lower_env.add("observed_hardware16_at_edge",
+                lower_valid ? (uint32_t)f.regression_observed_hardware16_at_event : 0U);
+  lower_env.add("slope_q16_cycles_per_sample",
+                lower_valid ? f.regression_slope_q16_cycles_per_sample : 0ULL);
+  lower_env.add("slope_delta_q16_cycles_per_sample",
+                lower_valid ? f.regression_slope_delta_q16_cycles_per_sample : 0LL);
+  lower_env.add("fit_error_mean_q16_cycles",
+                lower_valid ? f.regression_fit_error_mean_q16_cycles : 0);
+  lower_env.add("fit_error_stddev_q16_cycles",
+                lower_valid ? f.regression_fit_error_stddev_q16_cycles : 0U);
+  lower_env.add("fit_error_min_cycles",
+                lower_valid ? f.regression_fit_error_min_cycles : 0);
+  lower_env.add("fit_error_max_cycles",
+                lower_valid ? f.regression_fit_error_max_cycles : 0);
+  lower_env.add("fit_error_gt_plus4_count",
+                lower_valid ? f.regression_fit_error_gt_plus4_count : 0U);
+  lower_env.add("fit_error_lt_minus4_count",
+                lower_valid ? f.regression_fit_error_lt_minus4_count : 0U);
+  lower_env.add("fit_error_abs_gt4_count",
+                lower_valid ? f.regression_fit_error_abs_gt4_count : 0U);
+  lower_env.add("reporting_only", true);
+  forensics.add_object("lower_envelope", lower_env);
 
 
   // Keep the paired TIMEBASE_FORENSICS row lean enough to arrive before the
@@ -2676,6 +2745,11 @@ void clocks_beta_pps(void) {
     timebase_build_stage(TIMEBASE_BUILD_STAGE_PUBLISH_RETURN);
   }
 
+  if (!TIMEBASE_FORENSICS_PUBLISH_ENABLED) {
+    g_timebase_forensics_disabled_count++;
+    return;
+  }
+
   {
     g_timebase_forensics_build_begin_count++;
     g_timebase_last_forensics_build_begin_campaign_seconds = campaign_seconds;
@@ -2693,51 +2767,72 @@ void clocks_beta_pps(void) {
     f.add("paired_fragment_schema", "TIMEBASE_FRAGMENT_V3");
     f.add("paired_fragment_version", 3U);
 
-    payload_add_pps_vclock_edge_forensics(f,
-                                          pps_vclock_edge_forensics_valid,
-                                          pps_vclock_edge_forensics);
+    if (TIMEBASE_FORENSICS_MINIMAL_PAYLOAD_ENABLED) {
+      // Minimal companion mode: publish just enough forensic identity and
+      // provenance to satisfy Pi-side pair assembly while the larger
+      // TIMEBASE_FORENSICS body is temporarily out of the blast radius.
+      //
+      // This is intentionally not a clock-authority surface.  The full deep
+      // forensics remain available through focused reports; this row exists so
+      // TIMEBASE_FRAGMENT identity N always has a matching forensics identity N.
+      g_timebase_forensics_minimal_count++;
+      f.add("minimal", true);
+      f.add("temporary_safety_mode", "MINIMAL_PAIR_ONLY");
+      f.add("pps_vclock_edge_available", pps_vclock_edge_forensics_valid);
+      f.add("vclock_forensics_available", vclock_forensics_valid);
+      f.add("ocxo1_forensics_available", ocxo1_forensics_valid);
+      f.add("ocxo2_forensics_available", ocxo2_forensics_valid);
+      f.add("ocxo1_pps_projected", ocxo1_pps_projected_valid);
+      f.add("ocxo2_pps_projected", ocxo2_pps_projected_valid);
+      f.add("ocxo1_pps_residual_valid", pps_residuals.ocxo1_valid);
+      f.add("ocxo2_pps_residual_valid", pps_residuals.ocxo2_valid);
+    } else {
+      payload_add_pps_vclock_edge_forensics(f,
+                                            pps_vclock_edge_forensics_valid,
+                                            pps_vclock_edge_forensics);
 
-    timebase_build_stage(TIMEBASE_BUILD_STAGE_VCLOCK);
-    payload_add_vclock_forensics(f,
-                                 public_gnss_ns,
-                                 vclock_forensics_valid,
-                                 vclock_forensics);
+      timebase_build_stage(TIMEBASE_BUILD_STAGE_VCLOCK);
+      payload_add_vclock_forensics(f,
+                                   public_gnss_ns,
+                                   vclock_forensics_valid,
+                                   vclock_forensics);
 
-    timebase_build_stage(TIMEBASE_BUILD_STAGE_OCXO1);
-    payload_add_ocxo_forensics(f,
-                               "ocxo1",
-                               public_ocxo1_ns,
-                               public_ocxo1_measured_ns,
-                               g_ocxo1_clock,
-                               g_ocxo1_measurement,
-                               ocxo1_forensics_valid,
-                               ocxo1_forensics,
-                               ocxo1_pps_projected_valid,
-                               ocxo1_pps_projection,
-                               0ULL,
-                               pps_residuals.ocxo1_valid,
-                               pps_residuals.gnss_interval_ns,
-                               pps_residuals.ocxo1_interval_ns,
-                               pps_residuals.ocxo1_fast_residual_ns,
-                               ocxo1_cycle_residual_diag);
+      timebase_build_stage(TIMEBASE_BUILD_STAGE_OCXO1);
+      payload_add_ocxo_forensics(f,
+                                 "ocxo1",
+                                 public_ocxo1_ns,
+                                 public_ocxo1_measured_ns,
+                                 g_ocxo1_clock,
+                                 g_ocxo1_measurement,
+                                 ocxo1_forensics_valid,
+                                 ocxo1_forensics,
+                                 ocxo1_pps_projected_valid,
+                                 ocxo1_pps_projection,
+                                 0ULL,
+                                 pps_residuals.ocxo1_valid,
+                                 pps_residuals.gnss_interval_ns,
+                                 pps_residuals.ocxo1_interval_ns,
+                                 pps_residuals.ocxo1_fast_residual_ns,
+                                 ocxo1_cycle_residual_diag);
 
-    timebase_build_stage(TIMEBASE_BUILD_STAGE_OCXO2);
-    payload_add_ocxo_forensics(f,
-                               "ocxo2",
-                               public_ocxo2_ns,
-                               public_ocxo2_measured_ns,
-                               g_ocxo2_clock,
-                               g_ocxo2_measurement,
-                               ocxo2_forensics_valid,
-                               ocxo2_forensics,
-                               ocxo2_pps_projected_valid,
-                               ocxo2_pps_projection,
-                               0ULL,
-                               pps_residuals.ocxo2_valid,
-                               pps_residuals.gnss_interval_ns,
-                               pps_residuals.ocxo2_interval_ns,
-                               pps_residuals.ocxo2_fast_residual_ns,
-                               ocxo2_cycle_residual_diag);
+      timebase_build_stage(TIMEBASE_BUILD_STAGE_OCXO2);
+      payload_add_ocxo_forensics(f,
+                                 "ocxo2",
+                                 public_ocxo2_ns,
+                                 public_ocxo2_measured_ns,
+                                 g_ocxo2_clock,
+                                 g_ocxo2_measurement,
+                                 ocxo2_forensics_valid,
+                                 ocxo2_forensics,
+                                 ocxo2_pps_projected_valid,
+                                 ocxo2_pps_projection,
+                                 0ULL,
+                                 pps_residuals.ocxo2_valid,
+                                 pps_residuals.gnss_interval_ns,
+                                 pps_residuals.ocxo2_interval_ns,
+                                 pps_residuals.ocxo2_fast_residual_ns,
+                                 ocxo2_cycle_residual_diag);
+    }
 
     g_timebase_forensics_build_complete_count++;
     g_timebase_last_forensics_build_complete_campaign_seconds = campaign_seconds;
@@ -4073,9 +4168,13 @@ static FLASHMEM Payload cmd_report_timebase_publish(const Payload&) {
   counters.add("forensics_build_complete_count", g_timebase_forensics_build_complete_count);
   counters.add("forensics_publish_attempt_count", g_timebase_forensics_publish_attempt_count);
   counters.add("forensics_publish_return_count", g_timebase_forensics_publish_return_count);
+  counters.add("forensics_disabled_count", g_timebase_forensics_disabled_count);
+  counters.add("forensics_minimal_count", g_timebase_forensics_minimal_count);
   p.add_object("counters", counters);
 
   Payload gates;
+  gates.add("forensics_publish_enabled", TIMEBASE_FORENSICS_PUBLISH_ENABLED);
+  gates.add("forensics_minimal_payload_enabled", TIMEBASE_FORENSICS_MINIMAL_PAYLOAD_ENABLED);
   gates.add("stop_gate_count", g_timebase_stop_gate_count);
   gates.add("start_zero_gate_count", g_timebase_start_zero_gate_count);
   gates.add("recover_gate_count", g_timebase_recover_gate_count);
@@ -4134,6 +4233,8 @@ static FLASHMEM Payload cmd_report_timebase_publish(const Payload&) {
   gaps.add("forensics_publish_tail_returning",
            g_timebase_forensics_publish_attempt_count ==
            g_timebase_forensics_publish_return_count);
+  gaps.add("forensics_disabled", !TIMEBASE_FORENSICS_PUBLISH_ENABLED);
+  gaps.add("forensics_minimal_payload", TIMEBASE_FORENSICS_MINIMAL_PAYLOAD_ENABLED);
   p.add_object("gaps", gaps);
 
   return p;

@@ -4838,16 +4838,457 @@ static const char* dispatch_timer_name(interrupt_subscriber_kind_t kind) {
 }
 
 // ============================================================================
-// 1 kHz linear regression — retired
+// Lower-envelope edge inference — report-only first pass
 // ============================================================================
-// Lower-envelope edge authority supersedes the disabled linear-regression
-// experiment.  The old regression state/window/report code is removed; these
-// no-op shims preserve call sites until the public diagnostic ABI is narrowed.
-struct cadence_regression_result_t {};
-static inline void cadence_regression_reset_kind(interrupt_subscriber_kind_t) {}
-static inline void cadence_regression_reset_all(void) {}
-static inline void copy_regression_diag(interrupt_capture_diag_t&,
-                                        const cadence_regression_result_t*) {}
+//
+// ISR/service latency is one-sided: it can make an observed QTimer edge late,
+// but it cannot make it early.  This rail keeps a tiny streaming lower-envelope
+// window for each 1 kHz lane.  Each second is divided into fixed buckets; each
+// bucket retains only the sample with the lowest residual against the prior
+// window's predicted line.  At the one-second edge, a line is fit through those
+// bucket winners and shifted to touch the lower selected point.
+//
+// This pass is strictly diagnostic.  It does not publish authority, repair
+// endpoints, change EMA/Yardstick behavior, gate SmartZero, or affect TimePop.
+// The old regression_* ABI fields are reused as a transport surface for the
+// lower-envelope result so TIMEBASE_FORENSICS can record the evidence without a
+// broad schema migration.
+
+static constexpr uint32_t LOWER_ENV_SAMPLE_RATE_HZ = 1000U;
+static constexpr uint32_t LOWER_ENV_BUCKET_COUNT = 64U;
+static constexpr uint32_t LOWER_ENV_FIT_MIN_BUCKETS = 8U;
+static constexpr uint32_t LOWER_ENV_ERROR_GATE_CYCLES = 4U;
+
+struct lower_env_bucket_t {
+  bool     valid = false;
+  uint16_t x = 0;
+  uint32_t dwt = 0;
+  uint32_t counter32 = 0;
+  uint16_t target_hw16 = 0;
+  uint16_t observed_hw16 = 0;
+  int32_t  residual_cycles = 0;
+};
+
+struct cadence_regression_result_t {
+  bool     valid = false;
+  uint32_t sequence = 0;
+  uint32_t sample_count = 0;
+  uint32_t observed_dwt_at_event = 0;
+  uint32_t inferred_dwt_at_event = 0;
+  int32_t  inferred_minus_observed_cycles = 0;
+  uint32_t target_counter32_at_event = 0;
+  uint16_t target_hardware16_at_event = 0;
+  uint16_t observed_hardware16_at_event = 0;
+  uint64_t slope_q16_cycles_per_sample = 0;
+  int64_t  slope_delta_q16_cycles_per_sample = 0;
+  int32_t  fit_error_mean_q16_cycles = 0;
+  uint32_t fit_error_stddev_q16_cycles = 0;
+  int32_t  fit_error_min_cycles = 0;
+  int32_t  fit_error_max_cycles = 0;
+  uint32_t fit_error_gt_plus4_count = 0;
+  uint32_t fit_error_lt_minus4_count = 0;
+  uint32_t fit_error_abs_gt4_count = 0;
+
+  bool     observed_interval_valid = false;
+  bool     inferred_interval_valid = false;
+  uint32_t observed_interval_cycles = 0;
+  uint32_t inferred_interval_cycles = 0;
+  int32_t  inferred_minus_observed_interval_cycles = 0;
+  uint32_t selected_bucket_count = 0;
+};
+
+struct lower_env_lane_t {
+  interrupt_subscriber_kind_t kind = interrupt_subscriber_kind_t::NONE;
+  const char* name = "";
+
+  lower_env_bucket_t buckets[LOWER_ENV_BUCKET_COUNT]{};
+  bool     active_valid = false;
+  uint32_t active_sample_count = 0;
+  uint32_t active_bucket_count = 0;
+  uint32_t active_base_dwt = 0;
+
+  bool     previous_observed_edge_valid = false;
+  uint32_t previous_observed_edge_dwt = 0;
+  bool     previous_inferred_edge_valid = false;
+  uint32_t previous_inferred_edge_dwt = 0;
+  bool     previous_slope_valid = false;
+  uint64_t previous_slope_q16_cycles_per_sample = 0;
+
+  cadence_regression_result_t last{};
+  uint32_t update_count = 0;
+  uint32_t reset_count = 0;
+  uint32_t invalid_window_count = 0;
+  uint32_t overflow_reset_count = 0;
+};
+
+static lower_env_lane_t g_lower_env_vclock;
+static lower_env_lane_t g_lower_env_ocxo1;
+static lower_env_lane_t g_lower_env_ocxo2;
+static uint32_t g_lower_env_snapshot_count = 0;
+
+static lower_env_lane_t* lower_env_lane_for(interrupt_subscriber_kind_t kind) {
+  switch (kind) {
+    case interrupt_subscriber_kind_t::VCLOCK: return &g_lower_env_vclock;
+    case interrupt_subscriber_kind_t::OCXO1:  return &g_lower_env_ocxo1;
+    case interrupt_subscriber_kind_t::OCXO2:  return &g_lower_env_ocxo2;
+    default: return nullptr;
+  }
+}
+
+static uint64_t lower_env_default_slope_q16(void) {
+  const uint32_t cps = interrupt_vclock_cycles_per_second();
+  return ((uint64_t)cps << 16) / (uint64_t)LOWER_ENV_SAMPLE_RATE_HZ;
+}
+
+static int32_t lower_env_signed_delta_u32(uint32_t from_dwt, uint32_t to_dwt) {
+  const uint32_t delta = to_dwt - from_dwt;
+  if (delta <= 0x7FFFFFFFUL) return (int32_t)delta;
+  const uint32_t magnitude = (uint32_t)((~delta) + 1U);
+  if (magnitude == 0x80000000UL) return (int32_t)(-2147483647 - 1);
+  return -(int32_t)magnitude;
+}
+
+static uint32_t lower_env_round_q16_u32(int64_t q16) {
+  if (q16 >= 0) return (uint32_t)((q16 + 32768LL) >> 16);
+  return (uint32_t)(-(((-q16) + 32768LL) >> 16));
+}
+
+static void lower_env_clear_active(lower_env_lane_t& lane) {
+  for (uint32_t i = 0; i < LOWER_ENV_BUCKET_COUNT; i++) {
+    lane.buckets[i] = lower_env_bucket_t{};
+  }
+  lane.active_valid = false;
+  lane.active_sample_count = 0;
+  lane.active_bucket_count = 0;
+  lane.active_base_dwt = 0;
+}
+
+static void lower_env_reset_lane(interrupt_subscriber_kind_t kind) {
+  lower_env_lane_t* lane = lower_env_lane_for(kind);
+  if (!lane) return;
+  const char* name = lane->name;
+  *lane = lower_env_lane_t{};
+  lane->kind = kind;
+  lane->name = name;
+  lane->reset_count++;
+}
+
+static void lower_env_reset_all(void) {
+  g_lower_env_vclock = lower_env_lane_t{};
+  g_lower_env_vclock.kind = interrupt_subscriber_kind_t::VCLOCK;
+  g_lower_env_vclock.name = "vclock";
+  g_lower_env_ocxo1 = lower_env_lane_t{};
+  g_lower_env_ocxo1.kind = interrupt_subscriber_kind_t::OCXO1;
+  g_lower_env_ocxo1.name = "ocxo1";
+  g_lower_env_ocxo2 = lower_env_lane_t{};
+  g_lower_env_ocxo2.kind = interrupt_subscriber_kind_t::OCXO2;
+  g_lower_env_ocxo2.name = "ocxo2";
+  g_lower_env_snapshot_count = 0;
+}
+
+static void lower_env_publish_invalid_window(lower_env_lane_t& lane,
+                                             uint32_t observed_dwt,
+                                             uint32_t target_counter32,
+                                             uint16_t target_hw16,
+                                             uint16_t observed_hw16) {
+  cadence_regression_result_t r{};
+  r.valid = false;
+  r.sequence = ++lane.update_count;
+  r.sample_count = lane.active_sample_count;
+  r.selected_bucket_count = lane.active_bucket_count;
+  r.observed_dwt_at_event = observed_dwt;
+  r.inferred_dwt_at_event = observed_dwt;
+  r.inferred_minus_observed_cycles = 0;
+  r.target_counter32_at_event = target_counter32;
+  r.target_hardware16_at_event = target_hw16;
+  r.observed_hardware16_at_event = observed_hw16;
+  r.slope_q16_cycles_per_sample = lane.previous_slope_valid
+      ? lane.previous_slope_q16_cycles_per_sample
+      : lower_env_default_slope_q16();
+  r.inferred_interval_valid = false;
+  r.observed_interval_valid = lane.previous_observed_edge_valid;
+  r.observed_interval_cycles = lane.previous_observed_edge_valid
+      ? (observed_dwt - lane.previous_observed_edge_dwt)
+      : 0U;
+  lane.previous_observed_edge_dwt = observed_dwt;
+  lane.previous_observed_edge_valid = true;
+  lane.last = r;
+  lane.invalid_window_count++;
+  lower_env_clear_active(lane);
+}
+
+static void lower_env_seal(lower_env_lane_t& lane,
+                           uint32_t observed_dwt,
+                           uint32_t target_counter32,
+                           uint16_t target_hw16,
+                           uint16_t observed_hw16) {
+  const uint32_t n = lane.active_bucket_count;
+  if (!lane.active_valid || n < LOWER_ENV_FIT_MIN_BUCKETS ||
+      lane.active_sample_count == 0) {
+    lower_env_publish_invalid_window(lane, observed_dwt, target_counter32,
+                                     target_hw16, observed_hw16);
+    return;
+  }
+
+  const int64_t prior_slope_q16 = lane.previous_slope_valid
+      ? (int64_t)lane.previous_slope_q16_cycles_per_sample
+      : (int64_t)lower_env_default_slope_q16();
+  if (prior_slope_q16 <= 0) {
+    lower_env_publish_invalid_window(lane, observed_dwt, target_counter32,
+                                     target_hw16, observed_hw16);
+    return;
+  }
+
+  // Fit the LOWER-ENVELOPE RESIDUALS against the prior-second line, not the
+  // absolute DWT deltas.  The previous first pass accidentally treated the
+  // selected residual surface as a fresh absolute line, which made the reported
+  // slope collapse to the residual slope class (~hundreds of MHz) and pushed
+  // inferred edges hundreds of millions of cycles below the observed edge.  The
+  // real model is:
+  //
+  //   observed = prior_line(x) + residual_line(x), residual >= true_lateness
+  //
+  // so the full inferred slope is prior_slope + residual_slope_delta.
+  int64_t sum_x = 0;
+  int64_t sum_y = 0;
+  int64_t sum_xx = 0;
+  int64_t sum_xy = 0;
+  for (uint32_t i = 0; i < LOWER_ENV_BUCKET_COUNT; i++) {
+    const lower_env_bucket_t& b = lane.buckets[i];
+    if (!b.valid) continue;
+    const int64_t x = (int64_t)b.x;
+    const int64_t y = (int64_t)b.residual_cycles;
+    sum_x += x;
+    sum_y += y;
+    sum_xx += x * x;
+    sum_xy += x * y;
+  }
+
+  const int64_t denom = (int64_t)n * sum_xx - sum_x * sum_x;
+  if (denom == 0) {
+    lower_env_publish_invalid_window(lane, observed_dwt, target_counter32,
+                                     target_hw16, observed_hw16);
+    return;
+  }
+
+  const int64_t slope_delta_num = ((int64_t)n * sum_xy - sum_x * sum_y) << 16;
+  const int64_t slope_delta_q16 = slope_delta_num / denom;
+  int64_t residual_intercept_q16 = (((int64_t)sum_y << 16) -
+                                    slope_delta_q16 * sum_x) /
+                                   (int64_t)n;
+  const int64_t full_slope_q16 = prior_slope_q16 + slope_delta_q16;
+  if (full_slope_q16 <= 0) {
+    lower_env_publish_invalid_window(lane, observed_dwt, target_counter32,
+                                     target_hw16, observed_hw16);
+    return;
+  }
+
+  int64_t min_residual_q16 = INT64_MAX;
+  int64_t residual_sum_q16 = 0;
+  uint64_t residual_sq_sum_q16 = 0;
+  int32_t min_residual_cycles = INT32_MAX;
+  int32_t max_residual_cycles = INT32_MIN;
+  uint32_t gt_plus4 = 0;
+  uint32_t lt_minus4 = 0;
+  uint32_t abs_gt4 = 0;
+
+  for (uint32_t pass = 0; pass < 2; pass++) {
+    min_residual_q16 = INT64_MAX;
+    residual_sum_q16 = 0;
+    residual_sq_sum_q16 = 0;
+    min_residual_cycles = INT32_MAX;
+    max_residual_cycles = INT32_MIN;
+    gt_plus4 = lt_minus4 = abs_gt4 = 0;
+
+    for (uint32_t i = 0; i < LOWER_ENV_BUCKET_COUNT; i++) {
+      const lower_env_bucket_t& b = lane.buckets[i];
+      if (!b.valid) continue;
+      const int64_t observed_residual_q16 =
+          (int64_t)b.residual_cycles << 16;
+      const int64_t fit_residual_q16 =
+          residual_intercept_q16 + slope_delta_q16 * (int64_t)b.x;
+      const int64_t fit_error_q16 = observed_residual_q16 - fit_residual_q16;
+      if (fit_error_q16 < min_residual_q16) min_residual_q16 = fit_error_q16;
+      if (pass == 1) {
+        residual_sum_q16 += fit_error_q16;
+        const int64_t abs_q16 = fit_error_q16 >= 0 ? fit_error_q16 : -fit_error_q16;
+        residual_sq_sum_q16 += (uint64_t)((abs_q16 * abs_q16) >> 16);
+        const int32_t residual_cycles = (int32_t)(fit_error_q16 >> 16);
+        if (residual_cycles < min_residual_cycles) min_residual_cycles = residual_cycles;
+        if (residual_cycles > max_residual_cycles) max_residual_cycles = residual_cycles;
+        if (residual_cycles > (int32_t)LOWER_ENV_ERROR_GATE_CYCLES) gt_plus4++;
+        if (residual_cycles < -(int32_t)LOWER_ENV_ERROR_GATE_CYCLES) lt_minus4++;
+        if (residual_cycles > (int32_t)LOWER_ENV_ERROR_GATE_CYCLES ||
+            residual_cycles < -(int32_t)LOWER_ENV_ERROR_GATE_CYCLES) {
+          abs_gt4++;
+        }
+      }
+    }
+
+    if (pass == 0 && min_residual_q16 != INT64_MAX) {
+      // Shift the residual line onto the lower envelope.  After this shift the
+      // lowest selected residual is exactly zero in Q16.
+      residual_intercept_q16 += min_residual_q16;
+    }
+  }
+
+  const uint32_t edge_x = lane.active_sample_count - 1U;
+  const int64_t prior_edge_delta_q16 = prior_slope_q16 * (int64_t)edge_x;
+  const int64_t residual_edge_delta_q16 =
+      residual_intercept_q16 + slope_delta_q16 * (int64_t)edge_x;
+  const int64_t inferred_delta_q16 = prior_edge_delta_q16 + residual_edge_delta_q16;
+  uint32_t inferred_edge_dwt =
+      lane.active_base_dwt + lower_env_round_q16_u32(inferred_delta_q16);
+  int32_t inferred_minus_observed =
+      lower_env_signed_delta_u32(observed_dwt, inferred_edge_dwt);
+  if (inferred_minus_observed > 0) {
+    // One-sided latency law: the inferred least-late edge must not be later
+    // than the actual observed edge.  Clamp report-only output rather than
+    // publishing a fantasy early/negative-latency result.
+    inferred_edge_dwt = observed_dwt;
+    inferred_minus_observed = 0;
+  }
+
+  cadence_regression_result_t r{};
+  r.valid = true;
+  r.sequence = ++lane.update_count;
+  r.sample_count = lane.active_sample_count;
+  r.selected_bucket_count = n;
+  r.observed_dwt_at_event = observed_dwt;
+  r.inferred_dwt_at_event = inferred_edge_dwt;
+  r.inferred_minus_observed_cycles = inferred_minus_observed;
+  r.target_counter32_at_event = target_counter32;
+  r.target_hardware16_at_event = target_hw16;
+  r.observed_hardware16_at_event = observed_hw16;
+  r.slope_q16_cycles_per_sample = (uint64_t)full_slope_q16;
+  r.slope_delta_q16_cycles_per_sample = slope_delta_q16;
+  r.fit_error_mean_q16_cycles = (int32_t)(residual_sum_q16 / (int64_t)n);
+  r.fit_error_stddev_q16_cycles = (uint32_t)sqrt(
+      ((double)residual_sq_sum_q16 * 65536.0) / (double)n);
+  r.fit_error_min_cycles = (min_residual_cycles == INT32_MAX) ? 0 : min_residual_cycles;
+  r.fit_error_max_cycles = (max_residual_cycles == INT32_MIN) ? 0 : max_residual_cycles;
+  r.fit_error_gt_plus4_count = gt_plus4;
+  r.fit_error_lt_minus4_count = lt_minus4;
+  r.fit_error_abs_gt4_count = abs_gt4;
+
+  r.observed_interval_valid = lane.previous_observed_edge_valid;
+  r.observed_interval_cycles = r.observed_interval_valid
+      ? (observed_dwt - lane.previous_observed_edge_dwt)
+      : 0U;
+  r.inferred_interval_valid = lane.previous_inferred_edge_valid;
+  r.inferred_interval_cycles = r.inferred_interval_valid
+      ? (inferred_edge_dwt - lane.previous_inferred_edge_dwt)
+      : 0U;
+  if (r.observed_interval_valid && r.inferred_interval_valid) {
+    r.inferred_minus_observed_interval_cycles =
+        (r.inferred_interval_cycles >= r.observed_interval_cycles)
+            ? (int32_t)(r.inferred_interval_cycles - r.observed_interval_cycles)
+            : -(int32_t)(r.observed_interval_cycles - r.inferred_interval_cycles);
+  }
+
+  lane.previous_observed_edge_dwt = observed_dwt;
+  lane.previous_observed_edge_valid = true;
+  lane.previous_inferred_edge_dwt = inferred_edge_dwt;
+  lane.previous_inferred_edge_valid = true;
+  lane.previous_slope_q16_cycles_per_sample = (uint64_t)full_slope_q16;
+  lane.previous_slope_valid = true;
+  lane.last = r;
+  lower_env_clear_active(lane);
+}
+
+static void cadence_regression_observe(interrupt_subscriber_kind_t kind,
+                                       uint32_t observed_dwt,
+                                       uint32_t target_counter32,
+                                       uint16_t target_hw16,
+                                       uint16_t observed_hw16,
+                                       bool closes_second) {
+  lower_env_lane_t* lane = lower_env_lane_for(kind);
+  if (!lane) return;
+
+  if (lane->active_sample_count >= LOWER_ENV_SAMPLE_RATE_HZ) {
+    lane->overflow_reset_count++;
+    lower_env_clear_active(*lane);
+  }
+
+  if (!lane->active_valid) {
+    lower_env_clear_active(*lane);
+    lane->active_valid = true;
+    lane->active_base_dwt = observed_dwt;
+  }
+
+  const uint32_t x = lane->active_sample_count++;
+  const uint64_t slope_q16 = lane->previous_slope_valid
+      ? lane->previous_slope_q16_cycles_per_sample
+      : lower_env_default_slope_q16();
+  const uint32_t predicted_dwt =
+      lane->active_base_dwt +
+      lower_env_round_q16_u32((int64_t)slope_q16 * (int64_t)x);
+  const int32_t residual = lower_env_signed_delta_u32(predicted_dwt, observed_dwt);
+  uint32_t bucket_index = (x * LOWER_ENV_BUCKET_COUNT) / LOWER_ENV_SAMPLE_RATE_HZ;
+  if (bucket_index >= LOWER_ENV_BUCKET_COUNT) bucket_index = LOWER_ENV_BUCKET_COUNT - 1U;
+
+  lower_env_bucket_t& b = lane->buckets[bucket_index];
+  if (!b.valid) {
+    lane->active_bucket_count++;
+  }
+  if (!b.valid || residual < b.residual_cycles) {
+    b.valid = true;
+    b.x = (uint16_t)x;
+    b.dwt = observed_dwt;
+    b.counter32 = target_counter32;
+    b.target_hw16 = target_hw16;
+    b.observed_hw16 = observed_hw16;
+    b.residual_cycles = residual;
+  }
+
+  if (closes_second) {
+    lower_env_seal(*lane, observed_dwt, target_counter32,
+                   target_hw16, observed_hw16);
+  }
+}
+
+static bool cadence_regression_latest_result(interrupt_subscriber_kind_t kind,
+                                             cadence_regression_result_t* out) {
+  if (!out) return false;
+  lower_env_lane_t* lane = lower_env_lane_for(kind);
+  if (!lane) {
+    *out = cadence_regression_result_t{};
+    return false;
+  }
+  *out = lane->last;
+  return out->valid;
+}
+
+static inline void cadence_regression_reset_kind(interrupt_subscriber_kind_t kind) {
+  lower_env_reset_lane(kind);
+}
+static inline void cadence_regression_reset_all(void) {
+  lower_env_reset_all();
+}
+static inline void copy_regression_diag(interrupt_capture_diag_t& diag,
+                                        const cadence_regression_result_t* r) {
+  if (!r) return;
+  diag.regression_valid = r->valid;
+  diag.regression_sequence = r->sequence;
+  diag.regression_sample_count = r->sample_count;
+  diag.regression_observed_dwt_at_event = r->observed_dwt_at_event;
+  diag.regression_inferred_dwt_at_event = r->inferred_dwt_at_event;
+  diag.regression_inferred_minus_observed_cycles =
+      r->inferred_minus_observed_cycles;
+  diag.regression_target_counter32_at_event = r->target_counter32_at_event;
+  diag.regression_target_hardware16_at_event = r->target_hardware16_at_event;
+  diag.regression_observed_hardware16_at_event = r->observed_hardware16_at_event;
+  diag.regression_slope_q16_cycles_per_sample = r->slope_q16_cycles_per_sample;
+  diag.regression_slope_delta_q16_cycles_per_sample =
+      r->slope_delta_q16_cycles_per_sample;
+  diag.regression_fit_error_mean_q16_cycles = r->fit_error_mean_q16_cycles;
+  diag.regression_fit_error_stddev_q16_cycles = r->fit_error_stddev_q16_cycles;
+  diag.regression_fit_error_min_cycles = r->fit_error_min_cycles;
+  diag.regression_fit_error_max_cycles = r->fit_error_max_cycles;
+  diag.regression_fit_error_gt_plus4_count = r->fit_error_gt_plus4_count;
+  diag.regression_fit_error_lt_minus4_count = r->fit_error_lt_minus4_count;
+  diag.regression_fit_error_abs_gt4_count = r->fit_error_abs_gt4_count;
+}
 
 
 // ============================================================================
@@ -5574,6 +6015,10 @@ static void vclock_apply_perishable_fact_deferred(
                                     fact.target_low16,
                                     observed_dwt);
 
+  cadence_regression_result_t lower_env{};
+  (void)cadence_regression_latest_result(interrupt_subscriber_kind_t::VCLOCK,
+                                         &lower_env);
+
   emit_one_second_event(*g_rt_vclock,
                         published_dwt,
                         fact.target_counter32,
@@ -5581,7 +6026,7 @@ static void vclock_apply_perishable_fact_deferred(
                         coincidence_valid,
                         &ema_diag,
                         true,
-                        nullptr,
+                        &lower_env,
                         &fact.spinidle);
 
   pps_edge_dispatch_arm_or_call_from_foreground("PPS_VCLOCK_DISPATCH");
@@ -6064,6 +6509,18 @@ static void vclock_heartbeat_native_service(uint32_t isr_entry_dwt_raw,
   g_vclock_heartbeat_last_vclock_hw16 = fired_low16;
   g_vclock_heartbeat_last_vclock_counter32 = cadence_counter32;
 
+  if (g_vclock_lane.active && g_rt_vclock && g_rt_vclock->active) {
+    const bool lower_env_vclock_closes_second =
+        g_vclock_lane.phase_bootstrapped &&
+        ((g_vclock_lane.tick_mod_1000 + 1U) >= TICKS_PER_SECOND_EVENT);
+    cadence_regression_observe(interrupt_subscriber_kind_t::VCLOCK,
+                               qtimer_event_dwt,
+                               cadence_counter32,
+                               fired_low16,
+                               fired_low16,
+                               lower_env_vclock_closes_second);
+  }
+
   // CH0 has already run the native custody services below before the legacy
   // heartbeat bookkeeping block decides whether a fallback publication is
   // required.
@@ -6173,9 +6630,13 @@ static void vclock_heartbeat_native_service(uint32_t isr_entry_dwt_raw,
                                           fired_low16,
                                           qtimer_event_dwt);
 
+        cadence_regression_result_t lower_env{};
+        (void)cadence_regression_latest_result(interrupt_subscriber_kind_t::VCLOCK,
+                                               &lower_env);
         emit_one_second_event(*g_rt_vclock, published_dwt,
                               cadence_counter32,
-                              coincidence_cycles, coincidence_valid, &ema_diag);
+                              coincidence_cycles, coincidence_valid, &ema_diag,
+                              false, &lower_env);
 
         pps_edge_dispatch_arm_or_call_from_foreground("PPS_VCLOCK_DISPATCH");
 
@@ -7437,6 +7898,9 @@ static void ocxo_apply_perishable_fact_deferred(
 
   slipledger_copy_to_repair_diag(ema_diag, lane->slip);
 
+  cadence_regression_result_t lower_env{};
+  (void)cadence_regression_latest_result(ctx.kind, &lower_env);
+
   // We are already in TimePop ASAP/foreground context. Dispatch the authored
   // rollover OCXO edge directly from the fact drain.
   emit_one_second_event(*rt,
@@ -7446,7 +7910,7 @@ static void ocxo_apply_perishable_fact_deferred(
                         false,
                         &ema_diag,
                         true,
-                        nullptr,
+                        &lower_env,
                         &fact.spinidle);
 
   // Schedule at most one low-duty landing-only callback for the next
@@ -8623,6 +9087,16 @@ static void ocxo_cadence_capture_priority0(ocxo_runtime_context_t& ctx,
       one_second_due,
       was_smartzero_current,
       observed_dwt_at_target);
+
+  if (!was_smartzero_current && lane.active) {
+    cadence_regression_observe(ctx.kind,
+                               observed_dwt_at_target,
+                               target_counter32,
+                               target_low16,
+                               service_counter_low16,
+                               one_second_due);
+  }
+
   const uint16_t accepted_hardware_low16 =
       slipledger_hardware_low16_from_semantic(target_counter32,
                                               lane.slip.ledger_ticks);
@@ -10684,7 +11158,7 @@ static FLASHMEM Payload cmd_report(const Payload&) {
   Payload p;
   p.add("report", "INTERRUPT_LEAN");
   p.add("schema", "INTERRUPT_LEAN_V1");
-  p.add("available_reports", "REPORT_STATUS REPORT_PPS REPORT_CADENCE REPORT_SMARTZERO REPORT_BRIDGE REPORT_HANDOFF REPORT_DWT_CAPTURE REPORT_LANES REPORT_LANE");
+  p.add("available_reports", "REPORT_STATUS REPORT_PPS REPORT_CADENCE REPORT_SMARTZERO REPORT_BRIDGE REPORT_HANDOFF REPORT_DWT_CAPTURE REPORT_LOWER_ENVELOPE REPORT_LANES REPORT_LANE");
   p.add("report_lane_sections", "summary clock gate service yardstick slipledger");
   p.add("hw_ready", g_interrupt_hw_ready);
   p.add("runtime_ready", g_interrupt_runtime_ready);
@@ -10899,6 +11373,123 @@ static FLASHMEM void add_slipledger_lane(Payload& p,
   add_str("slipledger_last_reason", slipledger_reason_name(s.last_reason));
 }
 
+static uint32_t lower_env_slope_cycles_per_second(const cadence_regression_result_t& r) {
+  return r.slope_q16_cycles_per_sample
+      ? (uint32_t)(((uint64_t)r.slope_q16_cycles_per_sample *
+                    (uint64_t)LOWER_ENV_SAMPLE_RATE_HZ + 32768ULL) >> 16)
+      : 0U;
+}
+
+static FLASHMEM void add_lower_env_lane_payload(Payload& parent,
+                                                const char* key,
+                                                const lower_env_lane_t& lane,
+                                                bool pps_valid,
+                                                uint32_t pps_interval_cycles,
+                                                bool include_pps_compare) {
+  const cadence_regression_result_t& r = lane.last;
+  Payload obj;
+  obj.add("valid", r.valid);
+  obj.add("kind", interrupt_subscriber_kind_str(lane.kind));
+  obj.add("sequence", r.sequence);
+  obj.add("update_count", lane.update_count);
+  obj.add("reset_count", lane.reset_count);
+  obj.add("invalid_window_count", lane.invalid_window_count);
+  obj.add("overflow_reset_count", lane.overflow_reset_count);
+  obj.add("active_sample_count", lane.active_sample_count);
+  obj.add("window_sample_count", r.sample_count);
+  obj.add("bucket_count", LOWER_ENV_BUCKET_COUNT);
+  obj.add("selected_bucket_count", r.selected_bucket_count);
+  obj.add("fit_min_buckets", LOWER_ENV_FIT_MIN_BUCKETS);
+  obj.add("sample_rate_hz", LOWER_ENV_SAMPLE_RATE_HZ);
+
+  obj.add("observed_edge_dwt", r.observed_dwt_at_event);
+  obj.add("inferred_edge_dwt", r.inferred_dwt_at_event);
+  obj.add("inferred_minus_observed_edge_cycles",
+          r.inferred_minus_observed_cycles);
+  obj.add("target_counter32_at_edge", r.target_counter32_at_event);
+  obj.add("target_hardware16_at_edge", (uint32_t)r.target_hardware16_at_event);
+  obj.add("observed_hardware16_at_edge", (uint32_t)r.observed_hardware16_at_event);
+
+  obj.add("observed_interval_valid", r.observed_interval_valid);
+  obj.add("inferred_interval_valid", r.inferred_interval_valid);
+  obj.add("observed_interval_cycles", r.observed_interval_cycles);
+  obj.add("inferred_interval_cycles", r.inferred_interval_cycles);
+  obj.add("inferred_minus_observed_interval_cycles",
+          r.inferred_minus_observed_interval_cycles);
+
+  const uint32_t slope_cps = lower_env_slope_cycles_per_second(r);
+  obj.add("slope_q16_cycles_per_sample", r.slope_q16_cycles_per_sample);
+  obj.add("slope_cycles_per_second", slope_cps);
+  obj.add("slope_delta_q16_cycles_per_sample",
+          r.slope_delta_q16_cycles_per_sample);
+  obj.add("fit_error_mean_q16_cycles", r.fit_error_mean_q16_cycles);
+  obj.add("fit_error_stddev_q16_cycles", r.fit_error_stddev_q16_cycles);
+  obj.add("fit_error_min_cycles", r.fit_error_min_cycles);
+  obj.add("fit_error_max_cycles", r.fit_error_max_cycles);
+  obj.add("fit_error_gt_plus4_count", r.fit_error_gt_plus4_count);
+  obj.add("fit_error_lt_minus4_count", r.fit_error_lt_minus4_count);
+  obj.add("fit_error_abs_gt4_count", r.fit_error_abs_gt4_count);
+
+  if (include_pps_compare) {
+    obj.add("pps_observed_interval_valid", pps_valid);
+    obj.add("pps_observed_interval_cycles", pps_valid ? pps_interval_cycles : 0U);
+    if (pps_valid && r.observed_interval_valid) {
+      obj.add("observed_minus_pps_cycles",
+              (r.observed_interval_cycles >= pps_interval_cycles)
+                  ? (int32_t)(r.observed_interval_cycles - pps_interval_cycles)
+                  : -(int32_t)(pps_interval_cycles - r.observed_interval_cycles));
+    } else {
+      obj.add("observed_minus_pps_cycles", 0);
+    }
+    if (pps_valid && r.inferred_interval_valid) {
+      obj.add("inferred_minus_pps_cycles",
+              (r.inferred_interval_cycles >= pps_interval_cycles)
+                  ? (int32_t)(r.inferred_interval_cycles - pps_interval_cycles)
+                  : -(int32_t)(pps_interval_cycles - r.inferred_interval_cycles));
+    } else {
+      obj.add("inferred_minus_pps_cycles", 0);
+    }
+  }
+
+  parent.add_object(key, obj);
+}
+
+static FLASHMEM Payload cmd_report_lower_envelope(const Payload&) {
+  Payload p;
+  p.add("report", "INTERRUPT_LOWER_ENVELOPE");
+  p.add("description",
+        "Report-only 1 kHz lower-envelope edge inference; no authority mutation");
+  p.add("sample_rate_hz", LOWER_ENV_SAMPLE_RATE_HZ);
+  p.add("bucket_count", LOWER_ENV_BUCKET_COUNT);
+  p.add("fit_min_buckets", LOWER_ENV_FIT_MIN_BUCKETS);
+  p.add("error_gate_cycles", LOWER_ENV_ERROR_GATE_CYCLES);
+  p.add("snapshot_count", ++g_lower_env_snapshot_count);
+
+  pps_yardstick_snapshot_t y{};
+  const bool pps_loaded = pps_yardstick_load(y);
+  Payload pps;
+  pps.add("loaded", pps_loaded);
+  pps.add("valid", pps_loaded && y.valid);
+  pps.add("sequence", pps_loaded ? y.sequence : 0U);
+  pps.add("observed_interval_cycles", (pps_loaded && y.valid) ? y.interval_now_cycles : 0U);
+  pps.add("previous_interval_cycles", (pps_loaded && y.valid) ? y.interval_prev_cycles : 0U);
+  pps.add("accept_count", pps_loaded ? y.accept_count : 0U);
+  pps.add("reject_count", pps_loaded ? y.reject_count : 0U);
+  pps.add("reset_count", pps_loaded ? y.reset_count : 0U);
+  p.add_object("pps", pps);
+
+  Payload lanes;
+  const bool pps_valid = pps_loaded && y.valid && y.interval_now_cycles != 0U;
+  add_lower_env_lane_payload(lanes, "vclock", g_lower_env_vclock,
+                             pps_valid, y.interval_now_cycles, true);
+  add_lower_env_lane_payload(lanes, "ocxo1", g_lower_env_ocxo1,
+                             false, 0U, false);
+  add_lower_env_lane_payload(lanes, "ocxo2", g_lower_env_ocxo2,
+                             false, 0U, false);
+  p.add_object("lanes", lanes);
+  return p;
+}
+
 static FLASHMEM Payload cmd_report_dwt_capture(const Payload&) {
   Payload p;
   p.add("report", "DWT_CAPTURE");
@@ -11013,6 +11604,7 @@ static const process_command_entry_t INTERRUPT_COMMANDS[] = {
   { "REPORT_BRIDGE",   cmd_report_bridge   },
   { "REPORT_HANDOFF", cmd_report_handoff },
   { "REPORT_DWT_CAPTURE", cmd_report_dwt_capture },
+  { "REPORT_LOWER_ENVELOPE", cmd_report_lower_envelope },
   { "REPORT_LANES",    cmd_report_lanes    },
   { "REPORT_LANE",     cmd_report_lane     },
   { "REPORT_QTIMER_REGS", cmd_report_qtimer_regs },
