@@ -401,19 +401,6 @@ static uint64_t current_raw_gnss_ns(void) {
   return g_gnss_ns_at_pps_vclock;
 }
 
-static bool current_raw_ocxo_pps_projected_ns(time_clock_id_t clock,
-                                              uint64_t* out_raw_ns) {
-  if (!out_raw_ns) return false;
-  *out_raw_ns = 0;
-
-  clocks_alpha_ocxo_pps_projection_snapshot_t s{};
-  if (!clocks_alpha_ocxo_pps_projection_snapshot(clock, &s)) return false;
-  if (!s.valid || s.projected_ocxo_ns_at_pps == 0) return false;
-
-  *out_raw_ns = s.projected_ocxo_ns_at_pps;
-  return true;
-}
-
 static uint64_t current_raw_ocxo1_measured_ns(void) {
   // Legacy measured GNSS-elapsed ledger retained as a diagnostic surface.
   return clocks_ocxo1_measured_gnss_ns_now();
@@ -2438,48 +2425,26 @@ void clocks_beta_pps(void) {
 
   // ── Public PPS-edge clock tuple ──
   //
-  // Step C made public_ocxoN_ns the canonical PPS-projected OCXO clock value.
-  // Step D computes OCXO residuals/Welfords from consecutive values in this
-  // same public tuple.  No normalization happens here; if these values are
-  // not already PPS-founded, that is an upstream architecture problem.
+  // Beta must not re-author OCXO public time.  Alpha owns the PPS-row public
+  // clock tuple and has already applied the visible/public origin transform
+  // before publishing g_ocxo*_measured_gnss_ns_at_pps_vclock.  The OCXO PPS
+  // projection snapshot below is retained only as courtroom collateral: it is
+  // the pre-public-origin candidate and must never replace Alpha's final public
+  // value in TIMEBASE_FRAGMENT.
   const uint64_t public_gnss_ns   = campaign_public_gnss_ns();
   const uint64_t public_dwt_total = campaign_public_dwt_total();
   const uint64_t public_ocxo1_measured_ns = campaign_public_ocxo1_measured_ns();
   const uint64_t public_ocxo2_measured_ns = campaign_public_ocxo2_measured_ns();
 
-  const bool ocxo1_pps_projected_raw_valid =
+  const bool ocxo1_pps_projected_valid =
       ocxo1_pps_projection_ok && ocxo1_pps_projection.valid &&
       ocxo1_pps_projection.projected_ocxo_ns_at_pps != 0;
-  const bool ocxo2_pps_projected_raw_valid =
+  const bool ocxo2_pps_projected_valid =
       ocxo2_pps_projection_ok && ocxo2_pps_projection.valid &&
       ocxo2_pps_projection.projected_ocxo_ns_at_pps != 0;
-  const bool ocxo1_pps_projected_valid =
-      ocxo1_pps_projected_raw_valid &&
-      ocxo1_pps_projection.projected_ocxo_ns_at_pps >=
-          g_campaign_public_ocxo1_base;
-  const bool ocxo2_pps_projected_valid =
-      ocxo2_pps_projected_raw_valid &&
-      ocxo2_pps_projection.projected_ocxo_ns_at_pps >=
-          g_campaign_public_ocxo2_base;
-  const uint64_t public_ocxo1_pps_projected_ns =
-      ocxo1_pps_projected_valid
-          ? campaign_public_from_base(
-                ocxo1_pps_projection.projected_ocxo_ns_at_pps,
-                g_campaign_public_ocxo1_base)
-          : 0ULL;
-  const uint64_t public_ocxo2_pps_projected_ns =
-      ocxo2_pps_projected_valid
-          ? campaign_public_from_base(
-                ocxo2_pps_projection.projected_ocxo_ns_at_pps,
-                g_campaign_public_ocxo2_base)
-          : 0ULL;
 
-  const uint64_t public_ocxo1_ns = ocxo1_pps_projected_valid
-      ? public_ocxo1_pps_projected_ns
-      : public_ocxo1_measured_ns;
-  const uint64_t public_ocxo2_ns = ocxo2_pps_projected_valid
-      ? public_ocxo2_pps_projected_ns
-      : public_ocxo2_measured_ns;
+  const uint64_t public_ocxo1_ns = public_ocxo1_measured_ns;
+  const uint64_t public_ocxo2_ns = public_ocxo2_measured_ns;
 
   const uint32_t public_count = (uint32_t)campaign_seconds;
 
@@ -2749,7 +2714,7 @@ void clocks_beta_pps(void) {
                                ocxo1_forensics,
                                ocxo1_pps_projected_valid,
                                ocxo1_pps_projection,
-                               public_ocxo1_pps_projected_ns,
+                               0ULL,
                                pps_residuals.ocxo1_valid,
                                pps_residuals.gnss_interval_ns,
                                pps_residuals.ocxo1_interval_ns,
@@ -2767,7 +2732,7 @@ void clocks_beta_pps(void) {
                                ocxo2_forensics,
                                ocxo2_pps_projected_valid,
                                ocxo2_pps_projection,
-                               public_ocxo2_pps_projected_ns,
+                               0ULL,
                                pps_residuals.ocxo2_valid,
                                pps_residuals.gnss_interval_ns,
                                pps_residuals.ocxo2_interval_ns,
