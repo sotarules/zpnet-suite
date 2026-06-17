@@ -583,6 +583,56 @@ bool clocks_alpha_pps_vclock_edge_forensics(
     clocks_pps_vclock_edge_forensics_t* out);
 
 // ============================================================================
+// Alpha reporting-only integrity counters
+// ============================================================================
+//
+// Alpha owns checks that require the public time/projection species.  These
+// counters are strictly diagnostic: no repair, no gating, no watchdog mutation.
+
+struct clocks_alpha_integrity_ns_check_t {
+  bool     valid = false;
+  bool     last_ok = false;
+  uint32_t test_count = 0;
+  uint32_t ok_count = 0;
+  uint32_t bad_count = 0;
+  uint32_t skipped_count = 0;
+
+  uint32_t sequence = 0;
+  uint32_t gate_ns = 0;
+  uint64_t expected_ns = 0;
+  uint64_t observed_ns = 0;
+  int64_t  observed_minus_expected_ns = 0;
+};
+
+struct clocks_alpha_integrity_ocxo_check_t {
+  clocks_alpha_integrity_ns_check_t interval;
+
+  bool     previous_edge_valid = false;
+  uint64_t previous_edge_projected_gnss_ns = 0;
+  bool     previous_interval_valid = false;
+  uint64_t previous_interval_ns = 0;
+  uint64_t current_interval_ns = 0;
+};
+
+struct clocks_alpha_integrity_snapshot_t {
+  bool     valid = false;
+  uint32_t snapshot_count = 0;
+
+  // At the canonical PPS/VCLOCK edge, public time projection must map the
+  // authored edge DWT back to the exact GNSS second Alpha assigned.
+  clocks_alpha_integrity_ns_check_t vclock_gnss_self_map;
+
+  // Consecutive OCXO one-second edges are projected into public GNSS ns through
+  // time.h.  The interval between projections should remain identical
+  // second-to-second while the oscillator/servo state is unchanged.  Servo may
+  // make this diagnostic count bad samples; it still never mutates authority.
+  clocks_alpha_integrity_ocxo_check_t ocxo1_projected_gnss_interval;
+  clocks_alpha_integrity_ocxo_check_t ocxo2_projected_gnss_interval;
+};
+
+bool clocks_alpha_integrity_snapshot(clocks_alpha_integrity_snapshot_t* out);
+
+// ============================================================================
 // Alpha event-flow forensic snapshots
 // ============================================================================
 //

@@ -4139,10 +4139,139 @@ static FLASHMEM Payload cmd_report_timebase_publish(const Payload&) {
   return p;
 }
 
+static void payload_add_interrupt_interval_check(
+    Payload& parent,
+    const char* key,
+    const interrupt_integrity_interval_check_t& s) {
+  Payload p;
+  p.add("valid", s.valid);
+  p.add("last_ok", s.last_ok);
+  p.add("test_count", s.test_count);
+  p.add("ok_count", s.ok_count);
+  p.add("bad_count", s.bad_count);
+  p.add("skipped_count", s.skipped_count);
+  p.add("sequence", s.sequence);
+  p.add("gate_cycles", s.gate_cycles);
+  p.add("pps_interval_valid", s.pps_interval_valid);
+  p.add("vclock_interval_valid", s.vclock_interval_valid);
+  p.add("pps_interval_cycles", s.pps_interval_cycles);
+  p.add("vclock_interval_cycles", s.vclock_interval_cycles);
+  p.add("vclock_minus_pps_cycles", s.vclock_minus_pps_cycles);
+  parent.add_object(key, p);
+}
+
+static void payload_add_interrupt_counter_check(
+    Payload& parent,
+    const char* key,
+    const interrupt_integrity_counter_check_t& s) {
+  Payload p;
+  p.add("valid", s.valid);
+  p.add("last_ok", s.last_ok);
+  p.add("test_count", s.test_count);
+  p.add("ok_count", s.ok_count);
+  p.add("bad_count", s.bad_count);
+  p.add("skipped_count", s.skipped_count);
+  p.add("sequence", s.sequence);
+  p.add("expected_delta_ticks", s.expected_delta_ticks);
+  p.add("observed_delta_ticks", s.observed_delta_ticks);
+  p.add("observed_minus_expected_ticks", s.observed_minus_expected_ticks);
+  p.add("previous_counter32", s.previous_counter32);
+  p.add("current_counter32", s.current_counter32);
+  parent.add_object(key, p);
+}
+
+static void payload_add_alpha_ns_check(Payload& parent,
+                                       const char* key,
+                                       const clocks_alpha_integrity_ns_check_t& s) {
+  Payload p;
+  p.add("valid", s.valid);
+  p.add("last_ok", s.last_ok);
+  p.add("test_count", s.test_count);
+  p.add("ok_count", s.ok_count);
+  p.add("bad_count", s.bad_count);
+  p.add("skipped_count", s.skipped_count);
+  p.add("sequence", s.sequence);
+  p.add("gate_ns", s.gate_ns);
+  p.add("expected_ns", s.expected_ns);
+  p.add("observed_ns", s.observed_ns);
+  p.add("observed_minus_expected_ns", s.observed_minus_expected_ns);
+  parent.add_object(key, p);
+}
+
+static void payload_add_alpha_ocxo_integrity(
+    Payload& parent,
+    const char* key,
+    const clocks_alpha_integrity_ocxo_check_t& s) {
+  Payload p;
+  payload_add_alpha_ns_check(p, "interval_equality", s.interval);
+  p.add("previous_edge_valid", s.previous_edge_valid);
+  p.add("previous_edge_projected_gnss_ns",
+        s.previous_edge_projected_gnss_ns);
+  p.add("previous_interval_valid", s.previous_interval_valid);
+  p.add("previous_interval_ns", s.previous_interval_ns);
+  p.add("current_interval_ns", s.current_interval_ns);
+  parent.add_object(key, p);
+}
+
+static FLASHMEM Payload cmd_report_integrity(const Payload&) {
+  Payload p;
+  p.add("report", "CLOCKS_INTEGRITY");
+  p.add("description",
+        "Reporting-only draconian integrity counters; no repair, no mutation, no authority changes");
+
+  interrupt_integrity_snapshot_t is{};
+  const bool interrupt_ok = interrupt_integrity_snapshot(&is);
+  Payload interrupt;
+  interrupt.add("available", interrupt_ok);
+  interrupt.add("valid", is.valid);
+  interrupt.add("snapshot_count", is.snapshot_count);
+  payload_add_interrupt_interval_check(interrupt,
+                                       "vclock_pps_interval",
+                                       is.vclock_pps_interval);
+  payload_add_interrupt_counter_check(interrupt,
+                                      "vclock_counter",
+                                      is.vclock_counter);
+  payload_add_interrupt_counter_check(interrupt,
+                                      "ocxo1_counter",
+                                      is.ocxo1_counter);
+  payload_add_interrupt_counter_check(interrupt,
+                                      "ocxo2_counter",
+                                      is.ocxo2_counter);
+  p.add_object("interrupt", interrupt);
+
+  clocks_alpha_integrity_snapshot_t as{};
+  const bool alpha_ok = clocks_alpha_integrity_snapshot(&as);
+  Payload alpha;
+  alpha.add("available", alpha_ok);
+  alpha.add("valid", as.valid);
+  alpha.add("snapshot_count", as.snapshot_count);
+  payload_add_alpha_ns_check(alpha,
+                             "vclock_gnss_self_map",
+                             as.vclock_gnss_self_map);
+  payload_add_alpha_ocxo_integrity(alpha,
+                                   "ocxo1_projected_gnss_interval",
+                                   as.ocxo1_projected_gnss_interval);
+  payload_add_alpha_ocxo_integrity(alpha,
+                                   "ocxo2_projected_gnss_interval",
+                                   as.ocxo2_projected_gnss_interval);
+  p.add_object("alpha", alpha);
+
+  Payload doctrine;
+  doctrine.add("reporting_only", true);
+  doctrine.add("mutates_clock_authority", false);
+  doctrine.add("vclock_pps_interval_gate_cycles", 4U);
+  doctrine.add("counter_delta_expected_ticks", (uint32_t)VCLOCK_COUNTS_PER_SECOND);
+  doctrine.add("alpha_exact_ns_gate", 0U);
+  doctrine.add("notes",
+               "Bad counters are diagnostic evidence only; later commits may optionally stream selected fields into TIMEBASE_FORENSICS");
+  p.add_object("doctrine", doctrine);
+  return p;
+}
+
 static FLASHMEM Payload cmd_report(const Payload&) {
   Payload p;
   p.add("report", "CLOCKS_COMPACT");
-  p.add("subreports", "REPORT_STATUS REPORT_SUMMARY REPORT_EPOCH REPORT_SMARTZERO REPORT_INSTALLED_SMARTZERO REPORT_LIVE_SMARTZERO REPORT_FORENSICS REPORT_FORENSICS_VCLOCK REPORT_FORENSICS_OCXO1 REPORT_FORENSICS_OCXO2 REPORT_OCXO_PPS_PROJECTION REPORT_OCXO_PROJECTION_GUARD REPORT_TIMEBASE_PUBLISH REPORT_ALPHA_FLOW REPORT_ALPHA_FLOW_VCLOCK REPORT_ALPHA_FLOW_OCXO1 REPORT_ALPHA_FLOW_OCXO2 REPORT_PREDICTION REPORT_STATS REPORT_DAC");
+  p.add("subreports", "REPORT_STATUS REPORT_SUMMARY REPORT_EPOCH REPORT_SMARTZERO REPORT_INSTALLED_SMARTZERO REPORT_LIVE_SMARTZERO REPORT_FORENSICS REPORT_FORENSICS_VCLOCK REPORT_FORENSICS_OCXO1 REPORT_FORENSICS_OCXO2 REPORT_OCXO_PPS_PROJECTION REPORT_OCXO_PROJECTION_GUARD REPORT_TIMEBASE_PUBLISH REPORT_INTEGRITY REPORT_ALPHA_FLOW REPORT_ALPHA_FLOW_VCLOCK REPORT_ALPHA_FLOW_OCXO1 REPORT_ALPHA_FLOW_OCXO2 REPORT_PREDICTION REPORT_STATS REPORT_DAC");
   add_summary_payload(p);
   add_campaign_payload(p);
 
@@ -4403,6 +4532,7 @@ static const process_command_entry_t CLOCKS_COMMANDS[] = {
   { "REPORT_OCXO_PPS_PROJECTION", cmd_report_ocxo_pps_projection },
   { "REPORT_OCXO_PROJECTION_GUARD", cmd_report_ocxo_projection_guard },
   { "REPORT_TIMEBASE_PUBLISH", cmd_report_timebase_publish },
+  { "REPORT_INTEGRITY",        cmd_report_integrity        },
   { "REPORT_ALPHA_FLOW",       cmd_report_alpha_flow       },
   { "REPORT_ALPHA_FLOW_VCLOCK", cmd_report_alpha_flow_vclock },
   { "REPORT_ALPHA_FLOW_OCXO1",  cmd_report_alpha_flow_ocxo1  },

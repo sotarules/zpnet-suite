@@ -613,6 +613,162 @@ static inline uint64_t nominal_ns_from_counter32_epoch(uint32_t counter32,
 }
 
 // ============================================================================
+// Alpha integrity counters — reporting only
+// ============================================================================
+
+static constexpr uint32_t ALPHA_INTEGRITY_EXACT_NS_GATE = 0U;
+
+static clocks_alpha_integrity_snapshot_t g_alpha_integrity = {};
+
+static int64_t alpha_integrity_signed_delta_ns(uint64_t observed,
+                                               uint64_t expected) {
+  return observed >= expected
+      ? (int64_t)(observed - expected)
+      : -(int64_t)(expected - observed);
+}
+
+static uint64_t alpha_integrity_abs_i64(int64_t value) {
+  return value >= 0 ? (uint64_t)value : (uint64_t)(-value);
+}
+
+static interrupt_subscriber_kind_t alpha_integrity_interrupt_kind(
+    time_clock_id_t clock) {
+  switch (clock) {
+    case time_clock_id_t::VCLOCK:
+      return interrupt_subscriber_kind_t::VCLOCK;
+    case time_clock_id_t::OCXO1:
+      return interrupt_subscriber_kind_t::OCXO1;
+    case time_clock_id_t::OCXO2:
+      return interrupt_subscriber_kind_t::OCXO2;
+    default:
+      return interrupt_subscriber_kind_t::NONE;
+  }
+}
+
+static void alpha_integrity_record_ns_check(
+    clocks_alpha_integrity_ns_check_t& s,
+    uint32_t sequence,
+    bool input_valid,
+    uint64_t expected_ns,
+    uint64_t observed_ns,
+    uint32_t gate_ns) {
+  s.valid = true;
+  s.sequence = sequence;
+  s.gate_ns = gate_ns;
+
+  if (!input_valid) {
+    s.skipped_count++;
+    s.last_ok = false;
+    s.expected_ns = expected_ns;
+    s.observed_ns = observed_ns;
+    s.observed_minus_expected_ns = 0;
+    return;
+  }
+
+  const int64_t error_ns =
+      alpha_integrity_signed_delta_ns(observed_ns, expected_ns);
+  s.expected_ns = expected_ns;
+  s.observed_ns = observed_ns;
+  s.observed_minus_expected_ns = error_ns;
+  s.test_count++;
+
+  if (alpha_integrity_abs_i64(error_ns) <= (uint64_t)gate_ns) {
+    s.ok_count++;
+    s.last_ok = true;
+  } else {
+    s.bad_count++;
+    s.last_ok = false;
+  }
+}
+
+static clocks_alpha_integrity_ocxo_check_t*
+alpha_integrity_ocxo_store(time_clock_id_t clock) {
+  switch (clock) {
+    case time_clock_id_t::OCXO1:
+      return &g_alpha_integrity.ocxo1_projected_gnss_interval;
+    case time_clock_id_t::OCXO2:
+      return &g_alpha_integrity.ocxo2_projected_gnss_interval;
+    default:
+      return nullptr;
+  }
+}
+
+static void alpha_integrity_note_vclock_gnss_self_map(uint32_t sequence,
+                                                       uint32_t dwt_at_edge,
+                                                       uint64_t expected_ns) {
+  uint64_t mapped_ns = 0;
+  const bool mapped_ok =
+      time_clock_ns_at_dwt(time_clock_id_t::VCLOCK, dwt_at_edge, &mapped_ns);
+  alpha_integrity_record_ns_check(
+      g_alpha_integrity.vclock_gnss_self_map,
+      sequence,
+      mapped_ok,
+      expected_ns,
+      mapped_ok ? mapped_ns : 0ULL,
+      ALPHA_INTEGRITY_EXACT_NS_GATE);
+}
+
+static void alpha_integrity_note_ocxo_projected_gnss_second(
+    time_clock_id_t clock,
+    uint32_t sequence,
+    uint32_t dwt_at_edge) {
+  clocks_alpha_integrity_ocxo_check_t* s =
+      alpha_integrity_ocxo_store(clock);
+  if (!s) return;
+
+  uint64_t projected_ns = 0;
+  const bool projected_ok =
+      time_clock_ns_at_dwt(time_clock_id_t::VCLOCK, dwt_at_edge,
+                           &projected_ns);
+  if (!projected_ok) {
+    alpha_integrity_record_ns_check(
+        s->interval, sequence, false, 0ULL, 0ULL,
+        ALPHA_INTEGRITY_EXACT_NS_GATE);
+    return;
+  }
+
+  if (!s->previous_edge_valid || projected_ns < s->previous_edge_projected_gnss_ns) {
+    s->previous_edge_valid = true;
+    s->previous_edge_projected_gnss_ns = projected_ns;
+    alpha_integrity_record_ns_check(
+        s->interval, sequence, false, 0ULL, projected_ns,
+        ALPHA_INTEGRITY_EXACT_NS_GATE);
+    return;
+  }
+
+  const uint64_t current_interval =
+      projected_ns - s->previous_edge_projected_gnss_ns;
+  s->current_interval_ns = current_interval;
+  s->previous_edge_projected_gnss_ns = projected_ns;
+
+  if (!s->previous_interval_valid) {
+    s->previous_interval_valid = true;
+    s->previous_interval_ns = current_interval;
+    alpha_integrity_record_ns_check(
+        s->interval, sequence, false, current_interval, current_interval,
+        ALPHA_INTEGRITY_EXACT_NS_GATE);
+    return;
+  }
+
+  const uint64_t expected_interval = s->previous_interval_ns;
+  alpha_integrity_record_ns_check(
+      s->interval, sequence, true, expected_interval, current_interval,
+      ALPHA_INTEGRITY_EXACT_NS_GATE);
+  s->previous_interval_ns = current_interval;
+}
+
+bool clocks_alpha_integrity_snapshot(clocks_alpha_integrity_snapshot_t* out) {
+  if (!out) return false;
+  g_alpha_integrity.snapshot_count++;
+  g_alpha_integrity.valid =
+      g_alpha_integrity.vclock_gnss_self_map.valid ||
+      g_alpha_integrity.ocxo1_projected_gnss_interval.interval.valid ||
+      g_alpha_integrity.ocxo2_projected_gnss_interval.interval.valid;
+  *out = g_alpha_integrity;
+  return out->valid;
+}
+
+// ============================================================================
 // Alpha clock forensics
 // ============================================================================
 //
@@ -4374,6 +4530,14 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
     return;
   }
 
+  interrupt_integrity_note_counter32(
+      alpha_integrity_interrupt_kind(time_clock),
+      (uint32_t)(logical_ticks64 / (uint64_t)VCLOCK_COUNTS_PER_SECOND),
+      had_previous,
+      counter32_delta_since_previous_event,
+      (uint32_t)VCLOCK_COUNTS_PER_SECOND,
+      applied_event.counter32_at_event);
+
   uint64_t ns_now = counter_ns_now;
   uint32_t dwt_cycles_between_edges = had_previous
       ? (applied_event.dwt_at_event - meas.prev_dwt_at_edge)
@@ -4429,6 +4593,10 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
     //     exactly the one-second public branch leak.
     const uint64_t public_edge_ns_for_history = counter_ns_now;
     visible_ns_at_edge = public_edge_ns_for_history;
+    alpha_integrity_note_ocxo_projected_gnss_second(
+        time_clock,
+        (uint32_t)(logical_ticks64 / (uint64_t)VCLOCK_COUNTS_PER_SECOND),
+        applied_event.dwt_at_event);
     alpha_event_flow_note_measured(time_clock, measured_dwt_cycles,
                                    real_interval_ns, residual_fast_ns,
                                    measured_visible_ns);
@@ -4811,6 +4979,9 @@ static bool alpha_sample_all_clocks_at_pps_vclock(const pps_edge_snapshot_t& sna
   // use the same PPS-row coordinate species as the OCXO public projections.
   (void)time_clock_update(time_clock_id_t::VCLOCK, snap.dwt_at_edge, vclock_ns);
   alpha_event_flow_note_time_update(time_clock_id_t::VCLOCK, vclock_ns);
+  alpha_integrity_note_vclock_gnss_self_map(snap.sequence,
+                                            snap.dwt_at_edge,
+                                            vclock_ns);
 
   // Public OCXO time-domain authority lives here too, not in the OCXO callback.
   // The callback's measured-edge resolver intentionally returns the previous
@@ -4855,6 +5026,13 @@ static void update_pps_vclock_bridge_anchor(const pps_edge_snapshot_t& snap) {
       g_pps_dwt_cycles_between_edges_valid
           ? (uint32_t)g_pps_dwt_cycles_between_edges
           : dwt_between_pps;
+
+  interrupt_integrity_note_vclock_pps_interval(
+      snap.sequence,
+      g_pps_dwt_cycles_between_edges_valid,
+      (uint32_t)g_pps_dwt_cycles_between_edges,
+      g_vclock_measurement.dwt_cycles_between_edges != 0U,
+      g_vclock_measurement.dwt_cycles_between_edges);
 
   const bool gnss_self_map_valid =
       g_prev_pps_vclock_dwt_at_edge_valid &&

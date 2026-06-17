@@ -175,6 +175,125 @@ static constexpr uint32_t EPOCH_CAPTURE_MAX_WINDOW_CYCLES =
     (DWT_EXPECTED_PER_PPS + (VCLOCK_COUNTS_PER_SECOND - 1U)) /
     VCLOCK_COUNTS_PER_SECOND;
 
+// Reporting-only integrity checks.  These counters intentionally do not feed
+// authority, repair, watchdog, gating, or SmartZero.  They are pure courtroom
+// arithmetic over already-authored edge facts.
+static constexpr uint32_t VCLOCK_PPS_INTERVAL_INTEGRITY_GATE_CYCLES = 4U;
+
+static interrupt_integrity_snapshot_t g_interrupt_integrity = {};
+
+static uint32_t interrupt_integrity_abs_i32(int32_t value) {
+  return value < 0 ? (uint32_t)(-(int64_t)value) : (uint32_t)value;
+}
+
+static interrupt_integrity_counter_check_t*
+interrupt_integrity_counter_store(interrupt_subscriber_kind_t kind) {
+  switch (kind) {
+    case interrupt_subscriber_kind_t::VCLOCK:
+      return &g_interrupt_integrity.vclock_counter;
+    case interrupt_subscriber_kind_t::OCXO1:
+      return &g_interrupt_integrity.ocxo1_counter;
+    case interrupt_subscriber_kind_t::OCXO2:
+      return &g_interrupt_integrity.ocxo2_counter;
+    default:
+      return nullptr;
+  }
+}
+
+bool interrupt_integrity_snapshot(interrupt_integrity_snapshot_t* out) {
+  if (!out) return false;
+  g_interrupt_integrity.snapshot_count++;
+  g_interrupt_integrity.valid =
+      g_interrupt_integrity.vclock_pps_interval.valid ||
+      g_interrupt_integrity.vclock_counter.valid ||
+      g_interrupt_integrity.ocxo1_counter.valid ||
+      g_interrupt_integrity.ocxo2_counter.valid;
+  *out = g_interrupt_integrity;
+  return out->valid;
+}
+
+void interrupt_integrity_note_vclock_pps_interval(uint32_t sequence,
+                                                  bool pps_interval_valid,
+                                                  uint32_t pps_interval_cycles,
+                                                  bool vclock_interval_valid,
+                                                  uint32_t vclock_interval_cycles) {
+  interrupt_integrity_interval_check_t& s =
+      g_interrupt_integrity.vclock_pps_interval;
+  s.valid = true;
+  s.sequence = sequence;
+  s.gate_cycles = VCLOCK_PPS_INTERVAL_INTEGRITY_GATE_CYCLES;
+  s.pps_interval_valid = pps_interval_valid;
+  s.vclock_interval_valid = vclock_interval_valid;
+  s.pps_interval_cycles = pps_interval_valid ? pps_interval_cycles : 0U;
+  s.vclock_interval_cycles = vclock_interval_valid ? vclock_interval_cycles : 0U;
+
+  if (!pps_interval_valid || !vclock_interval_valid ||
+      pps_interval_cycles == 0U || vclock_interval_cycles == 0U) {
+    s.skipped_count++;
+    s.last_ok = false;
+    s.vclock_minus_pps_cycles = 0;
+    return;
+  }
+
+  const int32_t delta =
+      (vclock_interval_cycles >= pps_interval_cycles)
+          ? (int32_t)(vclock_interval_cycles - pps_interval_cycles)
+          : -(int32_t)(pps_interval_cycles - vclock_interval_cycles);
+  s.vclock_minus_pps_cycles = delta;
+  s.test_count++;
+
+  if (interrupt_integrity_abs_i32(delta) <=
+      VCLOCK_PPS_INTERVAL_INTEGRITY_GATE_CYCLES) {
+    s.ok_count++;
+    s.last_ok = true;
+  } else {
+    s.bad_count++;
+    s.last_ok = false;
+  }
+}
+
+void interrupt_integrity_note_counter32(interrupt_subscriber_kind_t kind,
+                                        uint32_t sequence,
+                                        bool interval_valid,
+                                        uint32_t observed_delta_ticks,
+                                        uint32_t expected_delta_ticks,
+                                        uint32_t current_counter32) {
+  interrupt_integrity_counter_check_t* s =
+      interrupt_integrity_counter_store(kind);
+  if (!s) return;
+
+  s->valid = true;
+  s->sequence = sequence;
+  s->expected_delta_ticks = expected_delta_ticks;
+  s->observed_delta_ticks = interval_valid ? observed_delta_ticks : 0U;
+  s->current_counter32 = current_counter32;
+  s->previous_counter32 = interval_valid
+      ? (current_counter32 - observed_delta_ticks)
+      : 0U;
+
+  if (!interval_valid || expected_delta_ticks == 0U) {
+    s->skipped_count++;
+    s->last_ok = false;
+    s->observed_minus_expected_ticks = 0;
+    return;
+  }
+
+  const int32_t error =
+      (observed_delta_ticks >= expected_delta_ticks)
+          ? (int32_t)(observed_delta_ticks - expected_delta_ticks)
+          : -(int32_t)(expected_delta_ticks - observed_delta_ticks);
+  s->observed_minus_expected_ticks = error;
+  s->test_count++;
+
+  if (error == 0) {
+    s->ok_count++;
+    s->last_ok = true;
+  } else {
+    s->bad_count++;
+    s->last_ok = false;
+  }
+}
+
 // VCLOCK/relay TimePop heartbeat.
 //
 // VCLOCK_HEARTBEAT remains a critical recurring TimePop ISR client on the

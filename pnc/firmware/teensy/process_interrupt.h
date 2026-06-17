@@ -373,6 +373,78 @@ bool interrupt_smartzero_live_snapshot(interrupt_smartzero_snapshot_t* out);
 
 bool interrupt_smartzero_snapshot(interrupt_smartzero_snapshot_t* out);
 
+// ============================================================================
+// Reporting-only integrity counters
+// ============================================================================
+//
+// These counters are deliberately passive.  They never repair, re-author,
+// reject, delay, or otherwise mutate the clock rails.  They count whether the
+// edge facts already authored by the system satisfy draconian invariants made
+// reasonable by the stability of the GF-8802/AOCJY1A-derived timing rails.
+
+struct interrupt_integrity_interval_check_t {
+  bool     valid = false;
+  bool     last_ok = false;
+  uint32_t test_count = 0;
+  uint32_t ok_count = 0;
+  uint32_t bad_count = 0;
+  uint32_t skipped_count = 0;
+
+  uint32_t sequence = 0;
+  uint32_t gate_cycles = 0;
+  bool     pps_interval_valid = false;
+  bool     vclock_interval_valid = false;
+  uint32_t pps_interval_cycles = 0;
+  uint32_t vclock_interval_cycles = 0;
+  int32_t  vclock_minus_pps_cycles = 0;
+};
+
+struct interrupt_integrity_counter_check_t {
+  bool     valid = false;
+  bool     last_ok = false;
+  uint32_t test_count = 0;
+  uint32_t ok_count = 0;
+  uint32_t bad_count = 0;
+  uint32_t skipped_count = 0;
+
+  uint32_t sequence = 0;
+  uint32_t expected_delta_ticks = 0;
+  uint32_t observed_delta_ticks = 0;
+  int32_t  observed_minus_expected_ticks = 0;
+  uint32_t current_counter32 = 0;
+  uint32_t previous_counter32 = 0;
+};
+
+struct interrupt_integrity_snapshot_t {
+  bool     valid = false;
+  uint32_t snapshot_count = 0;
+
+  // VCLOCK selected-edge DWT interval must agree with the physical PPS DWT
+  // interval within the configured diagnostic gate.
+  interrupt_integrity_interval_check_t vclock_pps_interval;
+
+  // Counter32 lineage: each one-second authored edge must advance by exactly
+  // the lane's expected 10 MHz tick count.
+  interrupt_integrity_counter_check_t vclock_counter;
+  interrupt_integrity_counter_check_t ocxo1_counter;
+  interrupt_integrity_counter_check_t ocxo2_counter;
+};
+
+bool interrupt_integrity_snapshot(interrupt_integrity_snapshot_t* out);
+
+void interrupt_integrity_note_vclock_pps_interval(uint32_t sequence,
+                                                  bool pps_interval_valid,
+                                                  uint32_t pps_interval_cycles,
+                                                  bool vclock_interval_valid,
+                                                  uint32_t vclock_interval_cycles);
+
+void interrupt_integrity_note_counter32(interrupt_subscriber_kind_t kind,
+                                        uint32_t sequence,
+                                        bool interval_valid,
+                                        uint32_t observed_delta_ticks,
+                                        uint32_t expected_delta_ticks,
+                                        uint32_t current_counter32);
+
 static constexpr int32_t VCLOCK_EPOCH_TICK_OFFSET = -2;
 
 struct pps_t {
