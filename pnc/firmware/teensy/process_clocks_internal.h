@@ -135,8 +135,15 @@ static inline uint64_t dwt_ns_to_cycles(uint64_t ns) {
 // selected PPS/VCLOCK edge. Alpha authors these; Beta publishes them;
 // stateless time.h projection uses them as interpolation bases.
 extern volatile uint64_t g_gnss_ns_at_pps_vclock;
+
+// Public, visible-origin-normalized OCXO nanosecond ledgers.  These are the
+// values clients should use for OCXO clock-domain time after SmartZero install.
 extern volatile uint64_t g_ocxo1_measured_gnss_ns_at_pps_vclock;
 extern volatile uint64_t g_ocxo2_measured_gnss_ns_at_pps_vclock;
+
+// Physical bridge-measured ledgers retained as forensic/raw evidence.
+extern volatile uint64_t g_ocxo1_physical_measured_gnss_ns_at_pps_vclock;
+extern volatile uint64_t g_ocxo2_physical_measured_gnss_ns_at_pps_vclock;
 
 // Canonical DWT_CYCCNT coordinate of the most recent selected PPS/VCLOCK epoch
 // (snap.dwt_at_edge).  Under the VCLOCK-domain architecture this is the
@@ -314,6 +321,11 @@ struct clocks_alpha_lane_forensics_t {
   uint64_t previous_sample_gnss_ns_at_event;
 
   int64_t  phase_offset_ns;
+
+  uint64_t physical_measured_ns_at_edge;
+  uint64_t visible_ns_at_edge;
+  bool     visible_origin_phase_valid;
+  uint32_t visible_origin_phase_offset_ns;
 
   uint64_t counter_nominal_ns_between_edges;
   uint64_t bridge_gnss_ns_between_edges;

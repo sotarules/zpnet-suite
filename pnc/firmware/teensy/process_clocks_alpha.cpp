@@ -63,6 +63,12 @@ volatile uint64_t g_gnss_ns_at_pps_vclock = 0;
 volatile uint64_t g_ocxo1_measured_gnss_ns_at_pps_vclock = 0;
 volatile uint64_t g_ocxo2_measured_gnss_ns_at_pps_vclock = 0;
 
+// Physical/raw bridge-measured OCXO ledgers at the PPS/VCLOCK row.  The public
+// g_ocxo*_measured_gnss_ns_at_pps_vclock values above are now visible-origin
+// normalized; these retain the unnormalized evidence for forensics.
+volatile uint64_t g_ocxo1_physical_measured_gnss_ns_at_pps_vclock = 0;
+volatile uint64_t g_ocxo2_physical_measured_gnss_ns_at_pps_vclock = 0;
+
 volatile uint32_t g_dwt_at_pps_vclock = 0;
 volatile uint64_t g_dwt_cycle_count_total = 0;
 volatile uint32_t g_dwt_cycles_between_pps_vclock = DWT_EXPECTED_PER_PPS;
@@ -651,6 +657,11 @@ struct alpha_lane_forensics_store_t {
   uint64_t previous_sample_gnss_ns_at_event = 0;
 
   int64_t  phase_offset_ns = 0;
+
+  uint64_t physical_measured_ns_at_edge = 0;
+  uint64_t visible_ns_at_edge = 0;
+  bool     visible_origin_phase_valid = false;
+  uint32_t visible_origin_phase_offset_ns = 0;
 
   uint64_t counter_nominal_ns_between_edges = 0;
   uint64_t bridge_gnss_ns_between_edges = 0;
@@ -2494,6 +2505,37 @@ bool clocks_alpha_ocxo_visible_origin_snapshot(
   return false;
 }
 
+static bool alpha_ocxo_visible_origin_phase_offset_ns(time_clock_id_t clock,
+                                                      uint32_t* out_phase_ns) {
+  alpha_ocxo_visible_origin_state_t* s =
+      alpha_ocxo_visible_origin_store(clock);
+  if (!s) return false;
+
+  const clocks_alpha_ocxo_visible_origin_snapshot_t local = s->v;
+  const bool ok =
+      local.valid &&
+      local.phase_offset_in_range &&
+      local.phase_offset_ns < (uint32_t)NS_PER_10MHZ_TICK;
+  if (ok && out_phase_ns) {
+    *out_phase_ns = local.phase_offset_ns;
+  }
+  return ok;
+}
+
+static uint64_t alpha_ocxo_visible_ns_from_physical(time_clock_id_t clock,
+                                                    uint64_t physical_ns) {
+  uint32_t phase_ns = 0;
+  if (!alpha_ocxo_visible_origin_phase_offset_ns(clock, &phase_ns)) {
+    return physical_ns;
+  }
+
+  // phase_offset_ns is the OCXO edge displacement after the selected
+  // PPS/VCLOCK origin inside one 10 MHz cell.  Adding it makes the OCXO
+  // coordinate project back to the visible VCLOCK/PPS origin instead of
+  // exposing the arbitrary starting phase.
+  return physical_ns + (uint64_t)phase_ns;
+}
+
 static uint64_t alpha_ocxo_apply_measured_second(time_clock_id_t clock,
                                                  uint32_t raw_edge_dwt,
                                                  uint32_t* out_dwt_cycles,
@@ -2731,6 +2773,10 @@ static void alpha_forensics_reset_store(alpha_lane_forensics_store_t& s) {
   s.sample_gnss_ns_at_event = 0;
   s.previous_sample_gnss_ns_at_event = 0;
   s.phase_offset_ns = 0;
+  s.physical_measured_ns_at_edge = 0;
+  s.visible_ns_at_edge = 0;
+  s.visible_origin_phase_valid = false;
+  s.visible_origin_phase_offset_ns = 0;
   s.counter_nominal_ns_between_edges = 0;
   s.bridge_gnss_ns_between_edges = 0;
   s.bridge_residual_ns = 0;
@@ -2913,7 +2959,11 @@ static void alpha_forensics_publish(time_clock_id_t clock_id,
                                     uint32_t counter32_delta_since_previous_event,
                                     uint64_t logical_ticks64_since_zero,
                                     uint64_t counter_ns_now,
-                                    uint64_t ns_now) {
+                                    uint64_t ns_now,
+                                    uint64_t physical_measured_ns_at_edge,
+                                    uint64_t visible_ns_at_edge,
+                                    bool visible_origin_phase_valid,
+                                    uint32_t visible_origin_phase_offset_ns) {
   alpha_lane_forensics_store_t* s = alpha_forensics_store(clock_id);
   if (!s) {
     alpha_event_flow_note_forensics_missing_store(clock_id);
@@ -2981,6 +3031,10 @@ static void alpha_forensics_publish(time_clock_id_t clock_id,
   s->sample_gnss_ns_at_event = sample_gnss_ns_at_event;
   s->previous_sample_gnss_ns_at_event = previous_sample_gnss_ns_at_event;
   s->phase_offset_ns = clock.phase_offset_ns;
+  s->physical_measured_ns_at_edge = physical_measured_ns_at_edge;
+  s->visible_ns_at_edge = visible_ns_at_edge;
+  s->visible_origin_phase_valid = visible_origin_phase_valid;
+  s->visible_origin_phase_offset_ns = visible_origin_phase_offset_ns;
   s->counter_nominal_ns_between_edges = counter_nominal_ns_between_edges;
   s->bridge_gnss_ns_between_edges = bridge_gnss_ns_between_edges;
   s->bridge_residual_ns = bridge_residual_ns;
@@ -3360,6 +3414,10 @@ bool clocks_alpha_lane_forensics(time_clock_id_t clock,
     out->previous_sample_gnss_ns_at_event =
         s->previous_sample_gnss_ns_at_event;
     out->phase_offset_ns = s->phase_offset_ns;
+    out->physical_measured_ns_at_edge = s->physical_measured_ns_at_edge;
+    out->visible_ns_at_edge = s->visible_ns_at_edge;
+    out->visible_origin_phase_valid = s->visible_origin_phase_valid;
+    out->visible_origin_phase_offset_ns = s->visible_origin_phase_offset_ns;
     out->counter_nominal_ns_between_edges = s->counter_nominal_ns_between_edges;
     out->bridge_gnss_ns_between_edges = s->bridge_gnss_ns_between_edges;
     out->bridge_residual_ns = s->bridge_residual_ns;
@@ -3854,6 +3912,8 @@ static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
   g_gnss_ns_at_pps_vclock = 0;
   g_ocxo1_measured_gnss_ns_at_pps_vclock = 0;
   g_ocxo2_measured_gnss_ns_at_pps_vclock = 0;
+  g_ocxo1_physical_measured_gnss_ns_at_pps_vclock = 0;
+  g_ocxo2_physical_measured_gnss_ns_at_pps_vclock = 0;
   g_dwt_at_pps_vclock = 0;
   g_dwt_cycle_count_total = 0;
   g_dwt_cycles_between_pps_vclock = saved_dwt_calibration_valid
@@ -4032,6 +4092,11 @@ bool clocks_alpha_zero_from_smartzero(const char* reason) {
       ocxo2.anchor_dwt,
       alpha_ocxo_visible_origin_select_cps(vclock, ocxo2));
 
+  const uint64_t ocxo1_visible_epoch_ns =
+      alpha_ocxo_visible_ns_from_physical(time_clock_id_t::OCXO1, 0ULL);
+  const uint64_t ocxo2_visible_epoch_ns =
+      alpha_ocxo_visible_ns_from_physical(time_clock_id_t::OCXO2, 0ULL);
+
   alpha_ticks64_install_zero(g_vclock_ticks64, vclock.anchor_counter32);
   alpha_ticks64_install_zero(g_ocxo1_ticks64, ocxo1.anchor_counter32);
   alpha_ticks64_install_zero(g_ocxo2_ticks64, ocxo2.anchor_counter32);
@@ -4066,8 +4131,8 @@ bool clocks_alpha_zero_from_smartzero(const char* reason) {
   alpha_smartzero_install_mark_stage(SMARTZERO_INSTALL_STAGE_TIME_ANCHORS);
   time_pps_vclock_epoch_reset(vclock.anchor_dwt, vclock.anchor_counter32);
   time_clock_epoch_reset(time_clock_id_t::VCLOCK, vclock.anchor_dwt, 0);
-  time_clock_epoch_reset(time_clock_id_t::OCXO1,  ocxo1.anchor_dwt, 0);
-  time_clock_epoch_reset(time_clock_id_t::OCXO2,  ocxo2.anchor_dwt, 0);
+  time_clock_epoch_reset(time_clock_id_t::OCXO1,  ocxo1.anchor_dwt, ocxo1_visible_epoch_ns);
+  time_clock_epoch_reset(time_clock_id_t::OCXO2,  ocxo2.anchor_dwt, ocxo2_visible_epoch_ns);
 
   alpha_smartzero_install_mark_stage(SMARTZERO_INSTALL_STAGE_TIMEPOP_REAUTHOR);
   // CLOCKS has now selected and installed the OCXO logical zero-offset
@@ -4235,6 +4300,10 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
   uint64_t gnss_ns_between_edges = 0;
   int64_t second_residual_ns = 0;
   int64_t window_error_ns = 0;
+  uint64_t physical_measured_ns_at_edge = 0;
+  uint64_t visible_ns_at_edge = ns_now;
+  bool visible_origin_phase_valid = false;
+  uint32_t visible_origin_phase_offset_ns = 0;
 
   if (is_ocxo) {
     uint32_t measured_dwt_cycles = 0;
@@ -4250,14 +4319,22 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
         (applied_diag != nullptr && applied_diag->dwt_original_at_event != 0U)
             ? applied_diag->dwt_original_at_event
             : applied_event.dwt_at_event;
-    ns_now = alpha_ocxo_apply_measured_second(time_clock,
-                                              science_edge_dwt,
-                                              &measured_dwt_cycles,
-                                              &real_interval_ns,
-                                              &residual_fast_ns);
+    const uint64_t physical_ns_now =
+        alpha_ocxo_apply_measured_second(time_clock,
+                                         science_edge_dwt,
+                                         &measured_dwt_cycles,
+                                         &real_interval_ns,
+                                         &residual_fast_ns);
+    physical_measured_ns_at_edge = physical_ns_now;
+    visible_origin_phase_valid =
+        alpha_ocxo_visible_origin_phase_offset_ns(time_clock,
+                                                  &visible_origin_phase_offset_ns);
+    ns_now = alpha_ocxo_visible_ns_from_physical(time_clock, physical_ns_now);
+    visible_ns_at_edge = ns_now;
     // The PPS projection and its sanity guard both speak the bridge-resolved
-    // absolute GNSS ledger; feed the edge history that same species so the
-    // guard compares like with like.  (ns_now is that ledger.)
+    // visible-origin-normalized ledger; feed the edge history that same
+    // species so the guard compares like with like.  physical_ns_now is kept
+    // separately as forensic/raw evidence.
     const uint64_t ocxo_ledger_ns_for_history = ns_now;
     alpha_event_flow_note_measured(time_clock, measured_dwt_cycles,
                                    real_interval_ns, residual_fast_ns, ns_now);
@@ -4357,7 +4434,11 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
                           counter32_delta_since_previous_event,
                           logical_ticks64,
                           counter_ns_now,
-                          ns_now);
+                          ns_now,
+                          physical_measured_ns_at_edge,
+                          visible_ns_at_edge,
+                          visible_origin_phase_valid,
+                          visible_origin_phase_offset_ns);
   alpha_event_flow_note_complete(time_clock);
 }
 
@@ -4541,12 +4622,18 @@ static bool alpha_sample_all_clocks_at_pps_vclock(const pps_edge_snapshot_t& sna
                                pps_gnss_ns);
   }
 
-  const uint64_t ocxo1_ns =
+  const uint64_t ocxo1_physical_ns =
       alpha_ocxo_project_measured_ns_to_dwt_live(time_clock_id_t::OCXO1,
                                                  snap.dwt_at_edge);
-  const uint64_t ocxo2_ns =
+  const uint64_t ocxo2_physical_ns =
       alpha_ocxo_project_measured_ns_to_dwt_live(time_clock_id_t::OCXO2,
                                                  snap.dwt_at_edge);
+  const uint64_t ocxo1_ns =
+      alpha_ocxo_visible_ns_from_physical(time_clock_id_t::OCXO1,
+                                          ocxo1_physical_ns);
+  const uint64_t ocxo2_ns =
+      alpha_ocxo_visible_ns_from_physical(time_clock_id_t::OCXO2,
+                                          ocxo2_physical_ns);
 
   alpha_ocxo_pps_projection_compute(time_clock_id_t::OCXO1,
                                     snap.sequence,
@@ -4561,6 +4648,8 @@ static bool alpha_sample_all_clocks_at_pps_vclock(const pps_edge_snapshot_t& sna
 
 
   g_gnss_ns_at_pps_vclock = vclock_ns;
+  g_ocxo1_physical_measured_gnss_ns_at_pps_vclock = ocxo1_physical_ns;
+  g_ocxo2_physical_measured_gnss_ns_at_pps_vclock = ocxo2_physical_ns;
   g_ocxo1_measured_gnss_ns_at_pps_vclock = ocxo1_ns;
   g_ocxo2_measured_gnss_ns_at_pps_vclock = ocxo2_ns;
 

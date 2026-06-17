@@ -1187,6 +1187,13 @@ static void payload_add_lane_forensics_object(Payload& parent,
   forensics.add("last_event_dwt", valid ? f.last_event_dwt : 0U);
   forensics.add("last_event_counter32", valid ? f.last_event_counter32 : 0U);
   forensics.add("dwt_cycles_between_edges", valid ? f.dwt_cycles_between_edges : 0U);
+  forensics.add("physical_measured_ns_at_edge",
+                valid ? f.physical_measured_ns_at_edge : 0ULL);
+  forensics.add("visible_ns_at_edge", valid ? f.visible_ns_at_edge : 0ULL);
+  forensics.add("visible_origin_phase_valid",
+                valid && f.visible_origin_phase_valid);
+  forensics.add("visible_origin_phase_offset_ns",
+                valid ? f.visible_origin_phase_offset_ns : 0U);
   forensics.add("counter32_delta_since_previous_event",
                 valid ? f.counter32_delta_since_previous_event : 0U);
 
@@ -1622,6 +1629,17 @@ static void payload_add_ocxo_forensics(Payload& p,
            pps_projection_valid ? pps_projection.projected_ocxo_ns_at_pps : 0ULL);
   lane.add("pps_projection_source", pps_projection_valid ? pps_projection.source : 0U);
   lane.add("measured_gnss_ns", public_measured_ns);
+  if (key && key[4] == '1') {
+    lane.add("physical_measured_gnss_ns_at_pps_vclock",
+             (uint64_t)g_ocxo1_physical_measured_gnss_ns_at_pps_vclock);
+    lane.add("visible_measured_gnss_ns_at_pps_vclock",
+             (uint64_t)g_ocxo1_measured_gnss_ns_at_pps_vclock);
+  } else {
+    lane.add("physical_measured_gnss_ns_at_pps_vclock",
+             (uint64_t)g_ocxo2_physical_measured_gnss_ns_at_pps_vclock);
+    lane.add("visible_measured_gnss_ns_at_pps_vclock",
+             (uint64_t)g_ocxo2_measured_gnss_ns_at_pps_vclock);
+  }
 
   payload_add_ocxo_pps_residual_object(lane,
                                        pps_residual_valid,
@@ -3046,6 +3064,10 @@ static void add_alpha_event_payload(Payload& p,
   p.add("previous_sample_gnss_ns_at_event_available",
         f.previous_sample_gnss_ns_at_event_available);
   p.add("phase_offset_ns", f.phase_offset_ns);
+  p.add("physical_measured_ns_at_edge", f.physical_measured_ns_at_edge);
+  p.add("visible_ns_at_edge", f.visible_ns_at_edge);
+  p.add("visible_origin_phase_valid", f.visible_origin_phase_valid);
+  p.add("visible_origin_phase_offset_ns", f.visible_origin_phase_offset_ns);
   p.add("counter_nominal_ns_between_edges", f.counter_nominal_ns_between_edges);
   p.add("bridge_interval_valid", f.bridge_interval_valid);
   p.add("bridge_gnss_ns_between_edges", f.bridge_gnss_ns_between_edges);
