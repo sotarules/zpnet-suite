@@ -425,24 +425,16 @@ static uint64_t current_raw_ocxo2_measured_ns(void) {
 }
 
 static uint64_t current_raw_ocxo1_ns(void) {
-  // Step C authority: prefer Alpha's PPS/VCLOCK-edge OCXO clock projection.
-  // Fall back to the legacy measured ledger only until the projection surface
-  // has enough edge history to become valid.
-  uint64_t projected = 0;
-  if (current_raw_ocxo_pps_projected_ns(time_clock_id_t::OCXO1, &projected)) {
-    return projected;
-  }
+  // Alpha's PPS-row public OCXO global is the authority here.  The projection
+  // snapshot remains a forensic surface showing the pre-public-origin candidate;
+  // using it directly bypasses Alpha's fixed public-origin transform.
   return current_raw_ocxo1_measured_ns();
 }
 
 static uint64_t current_raw_ocxo2_ns(void) {
-  // Step C authority: prefer Alpha's PPS/VCLOCK-edge OCXO clock projection.
-  // Fall back to the legacy measured ledger only until the projection surface
-  // has enough edge history to become valid.
-  uint64_t projected = 0;
-  if (current_raw_ocxo_pps_projected_ns(time_clock_id_t::OCXO2, &projected)) {
-    return projected;
-  }
+  // Alpha's PPS-row public OCXO global is the authority here.  The projection
+  // snapshot remains a forensic surface showing the pre-public-origin candidate;
+  // using it directly bypasses Alpha's fixed public-origin transform.
   return current_raw_ocxo2_measured_ns();
 }
 
@@ -3432,6 +3424,15 @@ static void add_summary_payload(Payload& p) {
   summary.add("ocxo2_measured_gnss_ns", ocxo2_ok ? ocxo2_ns : 0ULL);
   summary.add("ocxo1_ns", ocxo1_ok ? ocxo1_ns : 0ULL);  // legacy alias
   summary.add("ocxo2_ns", ocxo2_ok ? ocxo2_ns : 0ULL);  // legacy alias
+  if (vclock_ok && ocxo1_ok) {
+    summary.add("ocxo1_minus_vclock_ns", signed_delta_u64(ocxo1_ns, vclock_ns));
+  }
+  if (vclock_ok && ocxo2_ok) {
+    summary.add("ocxo2_minus_vclock_ns", signed_delta_u64(ocxo2_ns, vclock_ns));
+  }
+  if (ocxo1_ok && ocxo2_ok) {
+    summary.add("ocxo2_minus_ocxo1_ns", signed_delta_u64(ocxo2_ns, ocxo1_ns));
+  }
   summary.add("vclock_valid", vclock_ok);
   summary.add("ocxo1_valid", ocxo1_ok);
   summary.add("ocxo2_valid", ocxo2_ok);

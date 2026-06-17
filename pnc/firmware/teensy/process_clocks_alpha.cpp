@@ -2267,6 +2267,19 @@ bool clocks_alpha_ocxo_pps_projection_snapshot(
   return false;
 }
 
+static bool alpha_ocxo_pps_projection_visible_ns(time_clock_id_t clock,
+                                                 uint64_t* out_ns) {
+  if (!out_ns) return false;
+  *out_ns = 0ULL;
+
+  clocks_alpha_ocxo_pps_projection_snapshot_t s{};
+  if (!clocks_alpha_ocxo_pps_projection_snapshot(clock, &s)) return false;
+  if (!s.valid || s.projected_ocxo_ns_at_pps == 0ULL) return false;
+
+  *out_ns = s.projected_ocxo_ns_at_pps;
+  return true;
+}
+
 static alpha_lane_forensics_store_t* alpha_forensics_store(time_clock_id_t clock) {
   switch (clock) {
     case time_clock_id_t::VCLOCK: return &g_vclock_forensics;
@@ -4397,15 +4410,28 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
     visible_origin_phase_valid =
         alpha_ocxo_visible_origin_phase_offset_ns(time_clock,
                                                   &visible_origin_phase_offset_ns);
-    ns_now = alpha_ocxo_visible_ns_from_physical(time_clock, physical_ns_now);
-    visible_ns_at_edge = ns_now;
-    // The PPS projection and its sanity guard both speak the bridge-resolved
-    // visible-origin-normalized ledger; feed the edge history that same
-    // species so the guard compares like with like.  physical_ns_now is kept
-    // separately as forensic/raw evidence.
-    const uint64_t ocxo_ledger_ns_for_history = ns_now;
+    const uint64_t measured_visible_ns =
+        alpha_ocxo_visible_ns_from_physical(time_clock, physical_ns_now);
+    ns_now = measured_visible_ns;
+
+    // Split the two OCXO edge species explicitly:
+    //
+    //   measured_visible_ns
+    //     Conservative bridge-resolved science ledger.  It intentionally has a
+    //     one-edge lag because the closing PPS/GNSS anchor arrives after the
+    //     OCXO edge.  Welfords/servo/forensics may consume this.
+    //
+    //   public_edge_ns_for_history
+    //     The OCXO clock-domain edge ledger: synthetic 10 MHz ticks since the
+    //     installed SmartZero zero-offset.  This is NOT bridge-lagged.  The
+    //     PPS-row public projection must consume this species, then apply the
+    //     fixed visible/public origin offset.  Feeding it measured_visible_ns is
+    //     exactly the one-second public branch leak.
+    const uint64_t public_edge_ns_for_history = counter_ns_now;
+    visible_ns_at_edge = public_edge_ns_for_history;
     alpha_event_flow_note_measured(time_clock, measured_dwt_cycles,
-                                   real_interval_ns, residual_fast_ns, ns_now);
+                                   real_interval_ns, residual_fast_ns,
+                                   measured_visible_ns);
 
     const bool sample_gnss_available = (event.gnss_ns_at_event != 0);
     const uint64_t sample_gnss_ns_at_event = sample_gnss_available
@@ -4417,8 +4443,8 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
     alpha_ocxo_edge_history_record(time_clock,
                                    applied_event.dwt_at_event,
                                    applied_event.counter32_at_event,
-                                   ocxo_ledger_ns_for_history,
-                                   ns_now,
+                                   public_edge_ns_for_history,
+                                   measured_visible_ns,
                                    sample_gnss_available,
                                    sample_gnss_ns_at_event,
                                    boundary_gnss_available,
@@ -4454,13 +4480,16 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
     }
   }
 
-  // Public process_time/time.h OCXO coordinates are now authored only at the
-  // canonical PPS/VCLOCK row, where Alpha has the closing bridge anchor needed
-  // to project the OCXO ledger to the public DWT coordinate.  The OCXO callback
-  // path still updates the conservative measured-edge science ledger and
-  // forensics, but its one-edge-lag value must not become the public time.h
-  // basis.
-  if (!is_ocxo) {
+  // Public process_time/time.h coordinates for PPS-founded clocks are authored
+  // at the canonical PPS/VCLOCK row.  OCXO callbacks already stay out of
+  // time.h because their science ledger intentionally has a one-edge lag.
+  // VCLOCK subscriber callbacks are now treated the same way for public time:
+  // they remain measurement/forensic peers, but the user-visible VCLOCK/GNSS
+  // basis is the exact PPS/VCLOCK ledger authored in
+  // alpha_sample_all_clocks_at_pps_vclock().  This keeps REPORT_SUMMARY from
+  // comparing OCXO public PPS-row values against a VCLOCK basis from a different
+  // rail/phase.
+  if (!is_ocxo && time_clock != time_clock_id_t::VCLOCK) {
     (void)time_clock_update(time_clock, applied_event.dwt_at_event, ns_now);
     alpha_event_flow_note_time_update(time_clock, ns_now);
   }
@@ -4704,37 +4733,63 @@ static bool alpha_sample_all_clocks_at_pps_vclock(const pps_edge_snapshot_t& sna
   const uint64_t ocxo2_physical_ns =
       alpha_ocxo_project_measured_ns_to_dwt_live(time_clock_id_t::OCXO2,
                                                  snap.dwt_at_edge);
-  uint64_t ocxo1_ns =
+  const uint64_t ocxo1_measured_visible_ns =
       alpha_ocxo_visible_ns_from_physical(time_clock_id_t::OCXO1,
                                           ocxo1_physical_ns);
-  uint64_t ocxo2_ns =
+  const uint64_t ocxo2_measured_visible_ns =
       alpha_ocxo_visible_ns_from_physical(time_clock_id_t::OCXO2,
                                           ocxo2_physical_ns);
 
+  uint64_t ocxo1_visible_ns = ocxo1_measured_visible_ns;
+  uint64_t ocxo2_visible_ns = ocxo2_measured_visible_ns;
+
+  // The projection guard compares the clock-domain PPS projection against the
+  // conservative measured-visible surface.  That comparison is forensic only;
+  // the public surface below is authored from the projection when available.
   alpha_ocxo_pps_projection_compute(time_clock_id_t::OCXO1,
                                     snap.sequence,
                                     snap.dwt_at_edge,
                                     vclock_ns,
-                                    ocxo1_ns);
+                                    ocxo1_measured_visible_ns);
   alpha_ocxo_pps_projection_compute(time_clock_id_t::OCXO2,
                                     snap.sequence,
                                     snap.dwt_at_edge,
                                     vclock_ns,
-                                    ocxo2_ns);
+                                    ocxo2_measured_visible_ns);
 
-  // Capture the large campaign public-origin correction once, after the PPS row
-  // has a live OCXO projection but before publishing the public OCXO surfaces.
-  // This is a constant epoch transform; future OCXO-vs-VCLOCK drift remains
-  // visible because the offset is not re-fit after capture.
-  alpha_ocxo_visible_origin_maybe_capture_public_origin(
-      time_clock_id_t::OCXO1, snap.sequence, vclock_ns, ocxo1_ns);
-  alpha_ocxo_visible_origin_maybe_capture_public_origin(
-      time_clock_id_t::OCXO2, snap.sequence, vclock_ns, ocxo2_ns);
+  uint64_t ocxo1_projected_visible_ns = 0;
+  uint64_t ocxo2_projected_visible_ns = 0;
+  const bool ocxo1_projected_visible_valid =
+      alpha_ocxo_pps_projection_visible_ns(time_clock_id_t::OCXO1,
+                                           &ocxo1_projected_visible_ns);
+  const bool ocxo2_projected_visible_valid =
+      alpha_ocxo_pps_projection_visible_ns(time_clock_id_t::OCXO2,
+                                           &ocxo2_projected_visible_ns);
 
-  ocxo1_ns = alpha_ocxo_public_ns_from_visible_origin(time_clock_id_t::OCXO1,
-                                                      ocxo1_ns);
-  ocxo2_ns = alpha_ocxo_public_ns_from_visible_origin(time_clock_id_t::OCXO2,
-                                                      ocxo2_ns);
+  if (ocxo1_projected_visible_valid) {
+    ocxo1_visible_ns = ocxo1_projected_visible_ns;
+  }
+  if (ocxo2_projected_visible_valid) {
+    ocxo2_visible_ns = ocxo2_projected_visible_ns;
+  }
+
+  // Capture the large campaign public-origin correction only from PPS-row
+  // clock-domain projections, never from the conservative measured-edge
+  // fallback.  The fallback is allowed to preserve display continuity while the
+  // projection warms up, but it must not install the epoch's public branch.
+  if (ocxo1_projected_visible_valid && ocxo2_projected_visible_valid) {
+    alpha_ocxo_visible_origin_maybe_capture_public_origin(
+        time_clock_id_t::OCXO1, snap.sequence, vclock_ns, ocxo1_visible_ns);
+    alpha_ocxo_visible_origin_maybe_capture_public_origin(
+        time_clock_id_t::OCXO2, snap.sequence, vclock_ns, ocxo2_visible_ns);
+  }
+
+  const uint64_t ocxo1_ns =
+      alpha_ocxo_public_ns_from_visible_origin(time_clock_id_t::OCXO1,
+                                               ocxo1_visible_ns);
+  const uint64_t ocxo2_ns =
+      alpha_ocxo_public_ns_from_visible_origin(time_clock_id_t::OCXO2,
+                                               ocxo2_visible_ns);
 
 
   g_gnss_ns_at_pps_vclock = vclock_ns;
@@ -4749,12 +4804,20 @@ static bool alpha_sample_all_clocks_at_pps_vclock(const pps_edge_snapshot_t& sna
   g_ocxo1_clock.ledger_ns_count_at_pps_vclock = ocxo1_ns;
   g_ocxo2_clock.ledger_ns_count_at_pps_vclock = ocxo2_ns;
 
-  // Public OCXO time-domain authority lives here, not in the OCXO callback.
+  // Public VCLOCK/GNSS time-domain authority also lives here.  The selected
+  // PPS/VCLOCK edge is the exact canonical public row: vclock_ns is authored by
+  // Alpha as the tautological +1e9 ledger, not discovered from subscriber-event
+  // DWT projection.  Updating process_time here makes report-time VCLOCK/GNSS
+  // use the same PPS-row coordinate species as the OCXO public projections.
+  (void)time_clock_update(time_clock_id_t::VCLOCK, snap.dwt_at_edge, vclock_ns);
+  alpha_event_flow_note_time_update(time_clock_id_t::VCLOCK, vclock_ns);
+
+  // Public OCXO time-domain authority lives here too, not in the OCXO callback.
   // The callback's measured-edge resolver intentionally returns the previous
   // bridge-resolved OCXO edge, because the current edge remains pending until
   // the next PPS/GNSS anchor brackets it.  At the PPS/VCLOCK row, however, the
-  // bridge anchor has just been recorded and alpha_ocxo_project_*_live() can
-  // project the newest available OCXO evidence to this canonical public DWT.
+  // bridge anchor has just been recorded and Alpha can project the OCXO public
+  // clock-domain evidence to this canonical public DWT.
   // Feed process_time with that PPS-row visible coordinate so time.h clients
   // no longer inherit the one-edge/one-second measured-ledger lag.
   (void)time_clock_update(time_clock_id_t::OCXO1, snap.dwt_at_edge, ocxo1_ns);
