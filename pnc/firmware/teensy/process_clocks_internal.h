@@ -695,6 +695,19 @@ struct clocks_alpha_ocxo_visible_origin_snapshot_t {
   uint32_t elapsed_cycles_since_pps_vclock = 0;
   uint64_t elapsed_ns_since_pps_vclock = 0;
   uint32_t phase_offset_ns = 0;
+
+  // Campaign public-origin normalization, captured once from the first
+  // PPS/VCLOCK row that has a valid OCXO projection.  phase_offset_ns hides the
+  // sub-100 ns waveform residue; public_origin_offset_ns hides the much larger
+  // arbitrary OCXO island displacement so public OCXO time starts at the same
+  // visible origin as VCLOCK/GNSS for this epoch.
+  bool     public_origin_valid = false;
+  uint32_t public_origin_capture_count = 0;
+  uint32_t public_origin_pps_sequence = 0;
+  uint64_t public_origin_vclock_ns = 0;
+  uint64_t public_origin_ocxo_ns_before_offset = 0;
+  int64_t  public_origin_offset_ns = 0;
+  uint64_t public_origin_ocxo_ns_after_offset = 0;
 };
 
 bool clocks_alpha_ocxo_visible_origin_snapshot(

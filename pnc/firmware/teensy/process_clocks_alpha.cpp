@@ -2536,6 +2536,74 @@ static uint64_t alpha_ocxo_visible_ns_from_physical(time_clock_id_t clock,
   return physical_ns + (uint64_t)phase_ns;
 }
 
+static int64_t alpha_ocxo_signed_delta_ns(uint64_t target_ns,
+                                          uint64_t source_ns) {
+  return (target_ns >= source_ns)
+      ? (int64_t)(target_ns - source_ns)
+      : -(int64_t)(source_ns - target_ns);
+}
+
+static uint64_t alpha_ocxo_apply_signed_offset_ns(uint64_t ns,
+                                                  int64_t offset_ns) {
+  if (offset_ns >= 0) {
+    return ns + (uint64_t)offset_ns;
+  }
+
+  const uint64_t magnitude = (uint64_t)(-offset_ns);
+  return (ns >= magnitude) ? (ns - magnitude) : 0ULL;
+}
+
+static bool alpha_ocxo_visible_origin_public_offset_ns(time_clock_id_t clock,
+                                                       int64_t* out_offset_ns) {
+  alpha_ocxo_visible_origin_state_t* s =
+      alpha_ocxo_visible_origin_store(clock);
+  if (!s) return false;
+
+  const clocks_alpha_ocxo_visible_origin_snapshot_t local = s->v;
+  if (!local.public_origin_valid) return false;
+  if (out_offset_ns) *out_offset_ns = local.public_origin_offset_ns;
+  return true;
+}
+
+static uint64_t alpha_ocxo_public_ns_from_visible_origin(time_clock_id_t clock,
+                                                         uint64_t visible_ns) {
+  int64_t offset_ns = 0;
+  if (!alpha_ocxo_visible_origin_public_offset_ns(clock, &offset_ns)) {
+    return visible_ns;
+  }
+  return alpha_ocxo_apply_signed_offset_ns(visible_ns, offset_ns);
+}
+
+static void alpha_ocxo_visible_origin_maybe_capture_public_origin(
+    time_clock_id_t clock,
+    uint32_t pps_sequence,
+    uint64_t vclock_ns,
+    uint64_t ocxo_visible_ns_before_offset) {
+  alpha_ocxo_visible_origin_state_t* s =
+      alpha_ocxo_visible_origin_store(clock);
+  if (!s) return;
+
+  clocks_alpha_ocxo_visible_origin_snapshot_t local = s->v;
+  if (!local.valid || local.pending || local.public_origin_valid) return;
+  if (vclock_ns == 0ULL || ocxo_visible_ns_before_offset == 0ULL) return;
+
+  const int64_t offset_ns =
+      alpha_ocxo_signed_delta_ns(vclock_ns, ocxo_visible_ns_before_offset);
+  const uint64_t after_offset =
+      alpha_ocxo_apply_signed_offset_ns(ocxo_visible_ns_before_offset,
+                                        offset_ns);
+
+  local.public_origin_valid = true;
+  local.public_origin_capture_count++;
+  local.public_origin_pps_sequence = pps_sequence;
+  local.public_origin_vclock_ns = vclock_ns;
+  local.public_origin_ocxo_ns_before_offset = ocxo_visible_ns_before_offset;
+  local.public_origin_offset_ns = offset_ns;
+  local.public_origin_ocxo_ns_after_offset = after_offset;
+
+  alpha_ocxo_visible_origin_publish(*s, local);
+}
+
 static uint64_t alpha_ocxo_apply_measured_second(time_clock_id_t clock,
                                                  uint32_t raw_edge_dwt,
                                                  uint32_t* out_dwt_cycles,
@@ -4386,8 +4454,16 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
     }
   }
 
-  (void)time_clock_update(time_clock, applied_event.dwt_at_event, ns_now);
-  alpha_event_flow_note_time_update(time_clock, ns_now);
+  // Public process_time/time.h OCXO coordinates are now authored only at the
+  // canonical PPS/VCLOCK row, where Alpha has the closing bridge anchor needed
+  // to project the OCXO ledger to the public DWT coordinate.  The OCXO callback
+  // path still updates the conservative measured-edge science ledger and
+  // forensics, but its one-edge-lag value must not become the public time.h
+  // basis.
+  if (!is_ocxo) {
+    (void)time_clock_update(time_clock, applied_event.dwt_at_event, ns_now);
+    alpha_event_flow_note_time_update(time_clock, ns_now);
+  }
 
   clock.ledger_ns_count_at_edge = ns_now;
   clock.ledger_ns_count_at_pps_vclock = ns_now;
@@ -4628,10 +4704,10 @@ static bool alpha_sample_all_clocks_at_pps_vclock(const pps_edge_snapshot_t& sna
   const uint64_t ocxo2_physical_ns =
       alpha_ocxo_project_measured_ns_to_dwt_live(time_clock_id_t::OCXO2,
                                                  snap.dwt_at_edge);
-  const uint64_t ocxo1_ns =
+  uint64_t ocxo1_ns =
       alpha_ocxo_visible_ns_from_physical(time_clock_id_t::OCXO1,
                                           ocxo1_physical_ns);
-  const uint64_t ocxo2_ns =
+  uint64_t ocxo2_ns =
       alpha_ocxo_visible_ns_from_physical(time_clock_id_t::OCXO2,
                                           ocxo2_physical_ns);
 
@@ -4646,6 +4722,20 @@ static bool alpha_sample_all_clocks_at_pps_vclock(const pps_edge_snapshot_t& sna
                                     vclock_ns,
                                     ocxo2_ns);
 
+  // Capture the large campaign public-origin correction once, after the PPS row
+  // has a live OCXO projection but before publishing the public OCXO surfaces.
+  // This is a constant epoch transform; future OCXO-vs-VCLOCK drift remains
+  // visible because the offset is not re-fit after capture.
+  alpha_ocxo_visible_origin_maybe_capture_public_origin(
+      time_clock_id_t::OCXO1, snap.sequence, vclock_ns, ocxo1_ns);
+  alpha_ocxo_visible_origin_maybe_capture_public_origin(
+      time_clock_id_t::OCXO2, snap.sequence, vclock_ns, ocxo2_ns);
+
+  ocxo1_ns = alpha_ocxo_public_ns_from_visible_origin(time_clock_id_t::OCXO1,
+                                                      ocxo1_ns);
+  ocxo2_ns = alpha_ocxo_public_ns_from_visible_origin(time_clock_id_t::OCXO2,
+                                                      ocxo2_ns);
+
 
   g_gnss_ns_at_pps_vclock = vclock_ns;
   g_ocxo1_physical_measured_gnss_ns_at_pps_vclock = ocxo1_physical_ns;
@@ -4658,6 +4748,17 @@ static bool alpha_sample_all_clocks_at_pps_vclock(const pps_edge_snapshot_t& sna
   g_vclock_clock.ledger_ns_count_at_pps_vclock = vclock_ns;
   g_ocxo1_clock.ledger_ns_count_at_pps_vclock = ocxo1_ns;
   g_ocxo2_clock.ledger_ns_count_at_pps_vclock = ocxo2_ns;
+
+  // Public OCXO time-domain authority lives here, not in the OCXO callback.
+  // The callback's measured-edge resolver intentionally returns the previous
+  // bridge-resolved OCXO edge, because the current edge remains pending until
+  // the next PPS/GNSS anchor brackets it.  At the PPS/VCLOCK row, however, the
+  // bridge anchor has just been recorded and alpha_ocxo_project_*_live() can
+  // project the newest available OCXO evidence to this canonical public DWT.
+  // Feed process_time with that PPS-row visible coordinate so time.h clients
+  // no longer inherit the one-edge/one-second measured-ledger lag.
+  (void)time_clock_update(time_clock_id_t::OCXO1, snap.dwt_at_edge, ocxo1_ns);
+  (void)time_clock_update(time_clock_id_t::OCXO2, snap.dwt_at_edge, ocxo2_ns);
 
   g_vclock_clock.phase_offset_ns = 0;
   g_ocxo1_clock.phase_offset_ns = (int64_t)vclock_ns - (int64_t)ocxo1_ns;

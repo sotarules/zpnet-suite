@@ -867,6 +867,20 @@ static void payload_add_visible_origin_snapshot(Payload& parent,
   obj.add("elapsed_ns_since_pps_vclock",
           available ? s.elapsed_ns_since_pps_vclock : 0ULL);
   obj.add("phase_offset_ns", available ? s.phase_offset_ns : 0U);
+  obj.add("public_origin_valid",
+          available && s.public_origin_valid);
+  obj.add("public_origin_capture_count",
+          available ? s.public_origin_capture_count : 0U);
+  obj.add("public_origin_pps_sequence",
+          available ? s.public_origin_pps_sequence : 0U);
+  obj.add("public_origin_vclock_ns",
+          available ? s.public_origin_vclock_ns : 0ULL);
+  obj.add("public_origin_ocxo_ns_before_offset",
+          available ? s.public_origin_ocxo_ns_before_offset : 0ULL);
+  obj.add("public_origin_offset_ns",
+          available ? s.public_origin_offset_ns : 0LL);
+  obj.add("public_origin_ocxo_ns_after_offset",
+          available ? s.public_origin_ocxo_ns_after_offset : 0ULL);
 
   parent.add_object(key, obj);
 }
