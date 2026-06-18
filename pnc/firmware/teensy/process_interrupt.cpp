@@ -4860,35 +4860,10 @@ static constexpr uint32_t LOWER_ENV_BUCKET_COUNT = 64U;
 static constexpr uint32_t LOWER_ENV_FIT_MIN_BUCKETS = 8U;
 static constexpr uint32_t LOWER_ENV_ERROR_GATE_CYCLES = 4U;
 
-// FloorLine DWT authority experiment.
-//
-// These flags deliberately make the authority flip reversible without changing
-// the rest of the architecture.  The current EMA/Yardstick rails are still
-// computed every second and remain the fallback path.  FloorLine can publish as
-// the subscriber-facing DWT coordinate only when the latest lower-envelope row
-// is valid, belongs to the same target edge, has a clean fit, and obeys the
-// one-sided latency law.
-// RAM1-safe default: compile the authority experiment dark unless explicitly
-// enabled.  On Teensy 4.1 most non-FLASHMEM process_interrupt code lives in
-// RAM1/ITCM; the first authority patch consumed enough headroom to make the
-// command/transport path fragile at boot.  Keep FloorLine report-only by
-// default while preserving a single compile-time gear for the next trial.
-#ifndef FLOORLINE_DWT_AUTHORITY_COMPILED
-#define FLOORLINE_DWT_AUTHORITY_COMPILED 0
-#endif
-
-static constexpr bool FLOORLINE_DWT_AUTHORITY_ENABLED =
-    FLOORLINE_DWT_AUTHORITY_COMPILED != 0;
-static constexpr bool FLOORLINE_VCLOCK_DWT_AUTHORITY_ENABLED =
-    FLOORLINE_DWT_AUTHORITY_ENABLED && true;
-static constexpr bool FLOORLINE_OCXO1_DWT_AUTHORITY_ENABLED =
-    FLOORLINE_DWT_AUTHORITY_ENABLED && true;
-static constexpr bool FLOORLINE_OCXO2_DWT_AUTHORITY_ENABLED =
-    FLOORLINE_DWT_AUTHORITY_ENABLED && true;
-static constexpr bool FLOORLINE_AUTHORITY_REQUIRE_INFERRED_INTERVAL = true;
-static constexpr bool FLOORLINE_AUTHORITY_REQUIRE_CLEAN_FIT = true;
-static constexpr bool FLOORLINE_AUTHORITY_REQUIRE_ONE_SIDED = true;
-static constexpr uint32_t FLOORLINE_AUTHORITY_MAX_EDGE_BACKDATE_CYCLES = 16U;
+// FloorLine lower-envelope inference remains always compiled as an ordinary
+// diagnostic rail.  Publication is intentionally selected at the call site
+// through tiny helper functions below; there is no conditional-assembly
+// authority mode and no per-lane authority statistics.
 
 struct lower_env_bucket_t {
   bool     valid = false;
@@ -4956,41 +4931,6 @@ static lower_env_lane_t g_lower_env_vclock;
 static lower_env_lane_t g_lower_env_ocxo1;
 static lower_env_lane_t g_lower_env_ocxo2;
 static uint32_t g_lower_env_snapshot_count = 0;
-
-static constexpr uint32_t FLOORLINE_AUTHORITY_REASON_NONE = 0;
-static constexpr uint32_t FLOORLINE_AUTHORITY_REASON_APPLIED = 1;
-static constexpr uint32_t FLOORLINE_AUTHORITY_REASON_DISABLED = 2;
-static constexpr uint32_t FLOORLINE_AUTHORITY_REASON_INVALID = 3;
-static constexpr uint32_t FLOORLINE_AUTHORITY_REASON_TARGET_MISMATCH = 4;
-static constexpr uint32_t FLOORLINE_AUTHORITY_REASON_NOT_READY = 5;
-static constexpr uint32_t FLOORLINE_AUTHORITY_REASON_QUALITY_REJECT = 6;
-static constexpr uint32_t FLOORLINE_AUTHORITY_REASON_ONE_SIDED_REJECT = 7;
-
-struct floorline_authority_lane_stats_t {
-  uint32_t apply_count = 0;
-  uint32_t fallback_disabled_count = 0;
-  uint32_t fallback_invalid_count = 0;
-  uint32_t fallback_target_mismatch_count = 0;
-  uint32_t fallback_not_ready_count = 0;
-  uint32_t fallback_quality_reject_count = 0;
-  uint32_t fallback_one_sided_reject_count = 0;
-
-  bool     last_applied = false;
-  uint32_t last_reason = FLOORLINE_AUTHORITY_REASON_NONE;
-  uint32_t last_sequence = 0;
-  uint32_t last_observed_dwt = 0;
-  uint32_t last_candidate_dwt = 0;
-  uint32_t last_fallback_dwt = 0;
-  uint32_t last_published_dwt = 0;
-  uint32_t last_target_counter32 = 0;
-  int32_t  last_candidate_minus_observed_cycles = 0;
-  uint32_t last_selected_bucket_count = 0;
-  uint32_t last_fit_error_abs_gt4_count = 0;
-};
-
-static floorline_authority_lane_stats_t g_floorline_authority_vclock = {};
-static floorline_authority_lane_stats_t g_floorline_authority_ocxo1 = {};
-static floorline_authority_lane_stats_t g_floorline_authority_ocxo2 = {};
 
 static lower_env_lane_t* lower_env_lane_for(interrupt_subscriber_kind_t kind) {
   switch (kind) {
@@ -5356,157 +5296,18 @@ static inline void copy_regression_diag(interrupt_capture_diag_t& diag,
   diag.regression_fit_error_abs_gt4_count = r->fit_error_abs_gt4_count;
 }
 
-static bool floorline_authority_enabled_for(interrupt_subscriber_kind_t kind) {
-  switch (kind) {
-    case interrupt_subscriber_kind_t::VCLOCK:
-      return FLOORLINE_VCLOCK_DWT_AUTHORITY_ENABLED;
-    case interrupt_subscriber_kind_t::OCXO1:
-      return FLOORLINE_OCXO1_DWT_AUTHORITY_ENABLED;
-    case interrupt_subscriber_kind_t::OCXO2:
-      return FLOORLINE_OCXO2_DWT_AUTHORITY_ENABLED;
-    default:
-      return false;
-  }
+static inline uint32_t vclock_published_dwt_at_edge(
+    uint32_t ema_dwt_at_edge,
+    const cadence_regression_result_t& floorline) {
+  (void)floorline;
+  return ema_dwt_at_edge;
 }
 
-static floorline_authority_lane_stats_t*
-floorline_authority_stats_for(interrupt_subscriber_kind_t kind) {
-  switch (kind) {
-    case interrupt_subscriber_kind_t::VCLOCK: return &g_floorline_authority_vclock;
-    case interrupt_subscriber_kind_t::OCXO1:  return &g_floorline_authority_ocxo1;
-    case interrupt_subscriber_kind_t::OCXO2:  return &g_floorline_authority_ocxo2;
-    default: return nullptr;
-  }
-}
-
-static uint32_t floorline_abs_i32(int32_t value) {
-  return (uint32_t)(value < 0 ? -(int64_t)value : (int64_t)value);
-}
-
-static const char* floorline_authority_reason_name(uint32_t reason) {
-  switch (reason) {
-    case FLOORLINE_AUTHORITY_REASON_APPLIED: return "APPLIED";
-    case FLOORLINE_AUTHORITY_REASON_DISABLED: return "DISABLED";
-    case FLOORLINE_AUTHORITY_REASON_INVALID: return "INVALID";
-    case FLOORLINE_AUTHORITY_REASON_TARGET_MISMATCH: return "TARGET_MISMATCH";
-    case FLOORLINE_AUTHORITY_REASON_NOT_READY: return "NOT_READY";
-    case FLOORLINE_AUTHORITY_REASON_QUALITY_REJECT: return "QUALITY_REJECT";
-    case FLOORLINE_AUTHORITY_REASON_ONE_SIDED_REJECT: return "ONE_SIDED_REJECT";
-    default: return "NONE";
-  }
-}
-
-static void floorline_authority_note(floorline_authority_lane_stats_t& s,
-                                     uint32_t reason,
-                                     bool applied,
-                                     uint32_t observed_dwt,
-                                     uint32_t target_counter32,
-                                     const cadence_regression_result_t& r,
-                                     uint32_t fallback_dwt,
-                                     uint32_t published_dwt) {
-  s.last_applied = applied;
-  s.last_reason = reason;
-  s.last_sequence = r.sequence;
-  s.last_observed_dwt = observed_dwt;
-  s.last_candidate_dwt = r.inferred_dwt_at_event;
-  s.last_fallback_dwt = fallback_dwt;
-  s.last_published_dwt = published_dwt;
-  s.last_target_counter32 = target_counter32;
-  s.last_candidate_minus_observed_cycles = r.inferred_minus_observed_cycles;
-  s.last_selected_bucket_count = r.selected_bucket_count;
-  s.last_fit_error_abs_gt4_count = r.fit_error_abs_gt4_count;
-
-  if (applied) {
-    s.apply_count++;
-    return;
-  }
-
-  switch (reason) {
-    case FLOORLINE_AUTHORITY_REASON_DISABLED:
-      s.fallback_disabled_count++;
-      break;
-    case FLOORLINE_AUTHORITY_REASON_INVALID:
-      s.fallback_invalid_count++;
-      break;
-    case FLOORLINE_AUTHORITY_REASON_TARGET_MISMATCH:
-      s.fallback_target_mismatch_count++;
-      break;
-    case FLOORLINE_AUTHORITY_REASON_NOT_READY:
-      s.fallback_not_ready_count++;
-      break;
-    case FLOORLINE_AUTHORITY_REASON_QUALITY_REJECT:
-      s.fallback_quality_reject_count++;
-      break;
-    case FLOORLINE_AUTHORITY_REASON_ONE_SIDED_REJECT:
-      s.fallback_one_sided_reject_count++;
-      break;
-    default:
-      s.fallback_invalid_count++;
-      break;
-  }
-}
-
-static bool floorline_authority_select(interrupt_subscriber_kind_t kind,
-                                       uint32_t observed_dwt,
-                                       uint32_t target_counter32,
-                                       const cadence_regression_result_t& r,
-                                       uint32_t fallback_dwt,
-                                       uint32_t* out_published_dwt) {
-  if (out_published_dwt) *out_published_dwt = fallback_dwt;
-
-  floorline_authority_lane_stats_t* stats =
-      floorline_authority_stats_for(kind);
-  if (!stats) return false;
-
-  auto reject = [&](uint32_t reason) -> bool {
-    floorline_authority_note(*stats, reason, false, observed_dwt,
-                             target_counter32, r, fallback_dwt, fallback_dwt);
-    return false;
-  };
-
-  if (!floorline_authority_enabled_for(kind)) {
-    return reject(FLOORLINE_AUTHORITY_REASON_DISABLED);
-  }
-
-  if (!r.valid || r.inferred_dwt_at_event == 0U) {
-    return reject(FLOORLINE_AUTHORITY_REASON_INVALID);
-  }
-
-  if (r.target_counter32_at_event != target_counter32 ||
-      r.observed_dwt_at_event != observed_dwt) {
-    return reject(FLOORLINE_AUTHORITY_REASON_TARGET_MISMATCH);
-  }
-
-  if (FLOORLINE_AUTHORITY_REQUIRE_INFERRED_INTERVAL &&
-      !r.inferred_interval_valid) {
-    return reject(FLOORLINE_AUTHORITY_REASON_NOT_READY);
-  }
-
-  if (FLOORLINE_AUTHORITY_REQUIRE_ONE_SIDED &&
-      r.inferred_minus_observed_cycles > 0) {
-    return reject(FLOORLINE_AUTHORITY_REASON_ONE_SIDED_REJECT);
-  }
-
-  if (FLOORLINE_AUTHORITY_REQUIRE_CLEAN_FIT &&
-      r.fit_error_abs_gt4_count != 0U) {
-    return reject(FLOORLINE_AUTHORITY_REASON_QUALITY_REJECT);
-  }
-
-  if (floorline_abs_i32(r.inferred_minus_observed_cycles) >
-      FLOORLINE_AUTHORITY_MAX_EDGE_BACKDATE_CYCLES) {
-    return reject(FLOORLINE_AUTHORITY_REASON_QUALITY_REJECT);
-  }
-
-  if (out_published_dwt) *out_published_dwt = r.inferred_dwt_at_event;
-  floorline_authority_note(*stats,
-                           FLOORLINE_AUTHORITY_REASON_APPLIED,
-                           true,
-                           observed_dwt,
-                           target_counter32,
-                           r,
-                           fallback_dwt,
-                           r.inferred_dwt_at_event);
-  return true;
+static inline uint32_t ocxo_published_dwt_at_edge(
+    uint32_t legacy_dwt_at_edge,
+    const cadence_regression_result_t& floorline) {
+  (void)floorline;
+  return legacy_dwt_at_edge;
 }
 
 
@@ -6203,17 +6004,8 @@ static void vclock_apply_perishable_fact_deferred(
   cadence_regression_result_t lower_env{};
   (void)cadence_regression_latest_result(interrupt_subscriber_kind_t::VCLOCK,
                                          &lower_env);
-  uint32_t published_dwt = ema_published_dwt;
-  bool floorline_published = false;
-#if FLOORLINE_DWT_AUTHORITY_COMPILED
-  floorline_published = floorline_authority_select(
-      interrupt_subscriber_kind_t::VCLOCK,
-      observed_dwt,
-      fact.target_counter32,
-      lower_env,
-      ema_published_dwt,
-      &published_dwt);
-#endif
+  const uint32_t published_dwt =
+      vclock_published_dwt_at_edge(ema_published_dwt, lower_env);
 
   uint32_t coincidence_cycles = 0;
   bool coincidence_valid = false;
@@ -6233,16 +6025,10 @@ static void vclock_apply_perishable_fact_deferred(
   ema_diag.synthetic = (published_dwt != observed_dwt);
   ema_diag.predicted_dwt = published_dwt;
   ema_diag.used_dwt = published_dwt;
-  if (floorline_published) {
-    ema_diag.error_cycles = lower_env.inferred_minus_observed_cycles;
-    ema_diag.threshold_cycles = FLOORLINE_AUTHORITY_MAX_EDGE_BACKDATE_CYCLES;
-    ema_diag.reason = "vclock_floorline";
-  } else {
-    ema_diag.error_cycles = ema_error_cycles;
-    ema_diag.reason = ema_diag.interval_sample_rejected
-        ? "vclock_ema_gate_reject"
-        : (ema_synthetic ? "vclock_ema" : "vclock_ema_init");
-  }
+  ema_diag.error_cycles = ema_error_cycles;
+  ema_diag.reason = ema_diag.interval_sample_rejected
+      ? "vclock_ema_gate_reject"
+      : (ema_synthetic ? "vclock_ema" : "vclock_ema_init");
   slipledger_copy_to_repair_diag(ema_diag, g_vclock_lane.slip);
 
   const pps_t witness_pps = fact.witness_pps_valid ? fact.witness_pps : pps_t{};
@@ -6851,31 +6637,16 @@ static void vclock_heartbeat_native_service(uint32_t isr_entry_dwt_raw,
         cadence_regression_result_t lower_env{};
         (void)cadence_regression_latest_result(interrupt_subscriber_kind_t::VCLOCK,
                                                &lower_env);
-        uint32_t published_dwt = ema_published_dwt;
-        bool floorline_published = false;
-#if FLOORLINE_DWT_AUTHORITY_COMPILED
-        floorline_published = floorline_authority_select(
-            interrupt_subscriber_kind_t::VCLOCK,
-            qtimer_event_dwt,
-            cadence_counter32,
-            lower_env,
-            ema_published_dwt,
-            &published_dwt);
-#endif
+        const uint32_t published_dwt =
+            vclock_published_dwt_at_edge(ema_published_dwt, lower_env);
         ema_diag.candidate = (published_dwt != qtimer_event_dwt);
         ema_diag.synthetic = (published_dwt != qtimer_event_dwt);
         ema_diag.predicted_dwt = published_dwt;
         ema_diag.used_dwt = published_dwt;
-        if (floorline_published) {
-          ema_diag.error_cycles = lower_env.inferred_minus_observed_cycles;
-          ema_diag.threshold_cycles = FLOORLINE_AUTHORITY_MAX_EDGE_BACKDATE_CYCLES;
-          ema_diag.reason = "vclock_floorline_fallback";
-        } else {
-          ema_diag.error_cycles = ema_error_cycles;
-          ema_diag.reason = ema_diag.interval_sample_rejected
-              ? "vclock_ema_gate_reject_fallback"
-              : (ema_synthetic ? "vclock_ema_fallback" : "vclock_ema_init_fallback");
-        }
+        ema_diag.error_cycles = ema_error_cycles;
+        ema_diag.reason = ema_diag.interval_sample_rejected
+            ? "vclock_ema_gate_reject_fallback"
+            : (ema_synthetic ? "vclock_ema_fallback" : "vclock_ema_init_fallback");
         slipledger_copy_to_repair_diag(ema_diag, g_vclock_lane.slip);
         publish_vclock_domain_pps_vclock(witness_pps,
                                           (witness_pps.sequence != 0)
@@ -8086,25 +7857,15 @@ static void ocxo_apply_perishable_fact_deferred(
 
   cadence_regression_result_t lower_env{};
   (void)cadence_regression_latest_result(ctx.kind, &lower_env);
-  uint32_t published_dwt = base_published_dwt;
-  bool floorline_published = false;
-#if FLOORLINE_DWT_AUTHORITY_COMPILED
-  floorline_published = floorline_authority_select(
-      ctx.kind,
-      observed_dwt,
-      fact.target_counter32,
-      lower_env,
-      base_published_dwt,
-      &published_dwt);
-#endif
+  const uint32_t published_dwt =
+      ocxo_published_dwt_at_edge(base_published_dwt, lower_env);
 
   const bool published_synthetic = (published_dwt != observed_dwt);
   ema_diag.ema_dwt_at_event = ema_published_dwt;
 
-  const uint32_t dwt_coordinate_source = floorline_published
-      ? OCXO_DWT_SOURCE_FLOORLINE
-      : (published_synthetic ? OCXO_DWT_SOURCE_EMA_PREDICTED
-                             : OCXO_DWT_SOURCE_ISR_ENTRY);
+  const uint32_t dwt_coordinate_source = published_synthetic
+      ? OCXO_DWT_SOURCE_EMA_PREDICTED
+      : OCXO_DWT_SOURCE_ISR_ENTRY;
 
   ocxo_qtimer_diag_record(ctx,
                           fact.isr_entry_dwt_raw,
@@ -8153,14 +7914,7 @@ static void ocxo_apply_perishable_fact_deferred(
   ema_diag.synthetic = published_synthetic;
   ema_diag.predicted_dwt = published_dwt;
   ema_diag.used_dwt = published_dwt;
-  if (floorline_published) {
-    ema_diag.error_cycles = lower_env.inferred_minus_observed_cycles;
-    ema_diag.threshold_cycles = FLOORLINE_AUTHORITY_MAX_EDGE_BACKDATE_CYCLES;
-    ema_diag.reason = (ctx.kind == interrupt_subscriber_kind_t::OCXO1)
-        ? "ocxo1_floorline"
-        : "ocxo2_floorline";
-    ema_diag.yardstick_authority = false;
-  } else if (OCXO_YARDSTICK_DWT_AUTHORITY_ENABLED) {
+  if (OCXO_YARDSTICK_DWT_AUTHORITY_ENABLED) {
     ema_diag.error_cycles = (int32_t)(published_dwt - observed_dwt);
     ema_diag.threshold_cycles = OCXO_YARDSTICK_GATE_THRESHOLD_CYCLES;
     ema_diag.reason = yardstick_reason;
@@ -11731,67 +11485,17 @@ static FLASHMEM void add_lower_env_lane_payload(Payload& parent,
   parent.add_object(key, obj);
 }
 
-static FLASHMEM void add_floorline_authority_lane_payload(
-    Payload& parent,
-    const char* key,
-    const floorline_authority_lane_stats_t& s) {
-  Payload obj;
-  obj.add("apply_count", s.apply_count);
-  obj.add("fallback_disabled_count", s.fallback_disabled_count);
-  obj.add("fallback_invalid_count", s.fallback_invalid_count);
-  obj.add("fallback_target_mismatch_count", s.fallback_target_mismatch_count);
-  obj.add("fallback_not_ready_count", s.fallback_not_ready_count);
-  obj.add("fallback_quality_reject_count", s.fallback_quality_reject_count);
-  obj.add("fallback_one_sided_reject_count", s.fallback_one_sided_reject_count);
-  obj.add("last_applied", s.last_applied);
-  obj.add("last_reason", s.last_reason);
-  obj.add("last_reason_name", floorline_authority_reason_name(s.last_reason));
-  obj.add("last_sequence", s.last_sequence);
-  obj.add("last_observed_dwt", s.last_observed_dwt);
-  obj.add("last_candidate_dwt", s.last_candidate_dwt);
-  obj.add("last_fallback_dwt", s.last_fallback_dwt);
-  obj.add("last_published_dwt", s.last_published_dwt);
-  obj.add("last_target_counter32", s.last_target_counter32);
-  obj.add("last_candidate_minus_observed_cycles",
-          s.last_candidate_minus_observed_cycles);
-  obj.add("last_selected_bucket_count", s.last_selected_bucket_count);
-  obj.add("last_fit_error_abs_gt4_count", s.last_fit_error_abs_gt4_count);
-  parent.add_object(key, obj);
-}
-
 static FLASHMEM Payload cmd_report_lower_envelope(const Payload&) {
   Payload p;
   p.add("report", "INTERRUPT_LOWER_ENVELOPE");
   p.add("description",
-        "1 kHz FloorLine lower-envelope edge inference with optional DWT authority");
+        "1 kHz FloorLine lower-envelope edge inference diagnostic rail");
   p.add("sample_rate_hz", LOWER_ENV_SAMPLE_RATE_HZ);
   p.add("bucket_count", LOWER_ENV_BUCKET_COUNT);
   p.add("fit_min_buckets", LOWER_ENV_FIT_MIN_BUCKETS);
   p.add("error_gate_cycles", LOWER_ENV_ERROR_GATE_CYCLES);
   p.add("snapshot_count", ++g_lower_env_snapshot_count);
 
-  p.add("authority_compiled",
-        (bool)(FLOORLINE_DWT_AUTHORITY_COMPILED != 0));
-#if FLOORLINE_DWT_AUTHORITY_COMPILED
-  Payload authority;
-  authority.add("global_enabled", FLOORLINE_DWT_AUTHORITY_ENABLED);
-  authority.add("vclock_enabled", FLOORLINE_VCLOCK_DWT_AUTHORITY_ENABLED);
-  authority.add("ocxo1_enabled", FLOORLINE_OCXO1_DWT_AUTHORITY_ENABLED);
-  authority.add("ocxo2_enabled", FLOORLINE_OCXO2_DWT_AUTHORITY_ENABLED);
-  authority.add("require_inferred_interval",
-                FLOORLINE_AUTHORITY_REQUIRE_INFERRED_INTERVAL);
-  authority.add("require_clean_fit", FLOORLINE_AUTHORITY_REQUIRE_CLEAN_FIT);
-  authority.add("require_one_sided", FLOORLINE_AUTHORITY_REQUIRE_ONE_SIDED);
-  authority.add("max_edge_backdate_cycles",
-                FLOORLINE_AUTHORITY_MAX_EDGE_BACKDATE_CYCLES);
-  add_floorline_authority_lane_payload(authority, "vclock",
-                                       g_floorline_authority_vclock);
-  add_floorline_authority_lane_payload(authority, "ocxo1",
-                                       g_floorline_authority_ocxo1);
-  add_floorline_authority_lane_payload(authority, "ocxo2",
-                                       g_floorline_authority_ocxo2);
-  p.add_object("authority", authority);
-#endif
 
   pps_yardstick_snapshot_t y{};
   const bool pps_loaded = pps_yardstick_load(y);
