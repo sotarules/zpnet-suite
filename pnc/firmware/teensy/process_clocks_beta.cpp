@@ -520,6 +520,16 @@ static bool campaign_warmup_active(void) {
 static void campaign_warmup_finish_after_this_suppressed_record(void) {
   const campaign_warmup_mode_t finishing_mode = g_campaign_warmup_mode;
 
+  if (finishing_mode == campaign_warmup_mode_t::START &&
+      campaign_state == clocks_campaign_state_t::STARTED &&
+      !clocks_alpha_ocxo_public_origin_ready()) {
+    // Gear, not rubber band: START may not capture public campaign bases until
+    // Alpha says both OCXO public-origin offsets are installed.  Suppress one
+    // more row and check the precomputed flag again on the next PPS.
+    g_campaign_warmup_remaining = 1;
+    return;
+  }
+
   g_campaign_warmup_mode = campaign_warmup_mode_t::NONE;
   g_campaign_warmup_remaining = 0;
 

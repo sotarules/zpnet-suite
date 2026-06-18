@@ -764,6 +764,12 @@ bool clocks_alpha_ocxo_visible_origin_snapshot(
     time_clock_id_t clock,
     clocks_alpha_ocxo_visible_origin_snapshot_t* out);
 
+// Precomputed START handoff flag.  True only after Alpha has captured both
+// OCXO public-origin offsets for the current epoch.  This is intentionally a
+// tiny boolean read for Beta's campaign warmup path; detailed origin state
+// remains available through clocks_alpha_ocxo_visible_origin_snapshot().
+bool clocks_alpha_ocxo_public_origin_ready(void);
+
 // ============================================================================
 // Alpha OCXO PPS-edge projection forensics
 // ============================================================================
@@ -1003,14 +1009,10 @@ void ocxo_dac_retry_reset(ocxo_dac_state_t& s);
 // seconds. The first emitted fragment therefore appears after a deliberate
 // canonical gap, preserving the recovered absolute PPS identity.
 
-// START-path diagnostic: hold the public TIMEBASE campaign start longer so
-// Alpha has time to install both OCXO visible/public-origin offsets before
-// Beta captures campaign public bases.  This deliberately changes no authority
-// path, publishes no extra fields, allocates no payloads, and calls no new
-// code from the PPS/Beta path.  If this eliminates the explicit-START
-// +hundreds-of-ms OCXO offset, the bug is a START warmup/origin race rather
-// than FloorLine math or TIMEBASE_FORENSICS parsing.
-static constexpr uint32_t CLOCKS_CAMPAIGN_WARMUP_SUPPRESS_PPS = 20;
+// Minimum START warmup.  This is no longer the public-origin safety mechanism:
+// Beta also waits for Alpha's precomputed OCXO public-origin-ready flag before
+// it captures campaign public bases.
+static constexpr uint32_t CLOCKS_CAMPAIGN_WARMUP_SUPPRESS_PPS = 5;
 
 // ============================================================================
 // Campaign state

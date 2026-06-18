@@ -2556,6 +2556,32 @@ struct alpha_ocxo_visible_origin_state_t {
 static alpha_ocxo_visible_origin_state_t g_ocxo1_visible_origin = {};
 static alpha_ocxo_visible_origin_state_t g_ocxo2_visible_origin = {};
 
+// START handoff gear: Beta must not capture campaign OCXO public bases until
+// Alpha has installed both public-origin offsets.  Keep this as a precomputed
+// volatile flag so the 1 Hz campaign path reads one boolean instead of taking
+// snapshots or constructing diagnostic payloads.
+static volatile bool g_alpha_ocxo_public_origin_ready = false;
+
+bool clocks_alpha_ocxo_public_origin_ready(void) {
+  return g_alpha_ocxo_public_origin_ready;
+}
+
+static void alpha_ocxo_visible_origin_refresh_public_ready(void) {
+  const clocks_alpha_ocxo_visible_origin_snapshot_t& o1 =
+      g_ocxo1_visible_origin.v;
+  const clocks_alpha_ocxo_visible_origin_snapshot_t& o2 =
+      g_ocxo2_visible_origin.v;
+
+  const bool ready =
+      o1.valid && o2.valid &&
+      !o1.pending && !o2.pending &&
+      o1.public_origin_valid &&
+      o2.public_origin_valid;
+
+  clocks_alpha_dmb();
+  g_alpha_ocxo_public_origin_ready = ready;
+}
+
 static alpha_ocxo_visible_origin_state_t* alpha_ocxo_visible_origin_store(
     time_clock_id_t clock) {
   switch (clock) {
@@ -2588,10 +2614,12 @@ static void alpha_ocxo_visible_origin_reset_store(
 }
 
 static void alpha_ocxo_visible_origin_reset_all(void) {
+  g_alpha_ocxo_public_origin_ready = false;
   alpha_ocxo_visible_origin_reset_store(g_ocxo1_visible_origin,
                                         time_clock_id_t::OCXO1);
   alpha_ocxo_visible_origin_reset_store(g_ocxo2_visible_origin,
                                         time_clock_id_t::OCXO2);
+  alpha_ocxo_visible_origin_refresh_public_ready();
 }
 
 static uint32_t alpha_ocxo_visible_origin_select_cps(
@@ -2778,6 +2806,7 @@ static void alpha_ocxo_visible_origin_maybe_capture_public_origin(
   local.public_origin_ocxo_ns_after_offset = after_offset;
 
   alpha_ocxo_visible_origin_publish(*s, local);
+  alpha_ocxo_visible_origin_refresh_public_ready();
 }
 
 static uint64_t alpha_ocxo_apply_measured_second(time_clock_id_t clock,
