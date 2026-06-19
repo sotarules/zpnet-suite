@@ -545,18 +545,6 @@ static constexpr uint32_t OCXO_SERVICE_CLASS_ON_OR_AFTER_TARGET     = 3;
 // No regression constants/state/windows remain in process_interrupt.
 
 // ============================================================================
-// Raw ISR-entry DWT interval probe — retired
-// ============================================================================
-// The raw first-instruction DWT value is still carried on the event diagnostic
-// surface as dwt_isr_entry_raw.  The retained rolling interval recorder and
-// CSV report were transitional diagnostics and are no longer part of the
-// operational custody path.
-static inline void isr_raw_dwt_probe_reset_all(void) {}
-static inline void isr_raw_dwt_probe_record(interrupt_subscriber_kind_t,
-                                            uint32_t) {}
-
-
-// ============================================================================
 // Symmetric OCXO disable matrix (temporary A/B experiment surface)
 // ============================================================================
 //
@@ -658,64 +646,6 @@ static constexpr uint8_t QTIMER_CLOCK_PCS        = QTIMER2_OCXO1_PCS;
 
 static constexpr const char* QTIMER_UNIFORM_DOCTRINE =
     "PIN_BOUND_SAME_CHANNEL_COUNT_COMPARE_TIMEPOP_CH2_SCHEDULER_ONLY";
-
-// ============================================================================
-// SpinCatch landing-only witness — retired
-// ============================================================================
-static inline void spincatch_note_isr_entry(interrupt_subscriber_kind_t,
-                                            uint32_t,
-                                            uint16_t,
-                                            uint32_t) {}
-static inline void spincatch_report_reset_all(void) {}
-static void spincatch_maybe_schedule_ocxo_landing(struct ocxo_runtime_context_t&,
-                                                  const struct interrupt_perishable_fact_t&);
-
-
-// ============================================================================
-// SpinIdle ISR-entry witness — retired
-// ============================================================================
-struct spinidle_isr_capture_t {
-  bool shadow_valid = false;
-  uint32_t shadow_dwt = 0;
-  uint32_t shadow_to_isr_entry_cycles = 0;
-  uint32_t threshold_cycles = 0;
-};
-static inline spinidle_isr_capture_t spinidle_capture_at_isr_entry(uint32_t) {
-  return spinidle_isr_capture_t{};
-}
-static inline void spinidle_copy_to_diag(interrupt_capture_diag_t& diag,
-                                         const spinidle_isr_capture_t& c) {
-  diag.spinidle_shadow_valid = c.shadow_valid;
-  diag.spinidle_shadow_dwt = c.shadow_dwt;
-  diag.spinidle_shadow_to_isr_entry_cycles = c.shadow_to_isr_entry_cycles;
-  diag.spinidle_shadow_valid_threshold_cycles = c.threshold_cycles;
-}
-static spinidle_isr_capture_t g_spinidle_pps_last_capture = {};
-static spinidle_isr_capture_t g_spinidle_timepop_last_capture = {};
-
-
-// ============================================================================
-// Passive ISR sanity witness — retired
-// ============================================================================
-struct isr_sanity_diag_t {};
-static isr_sanity_diag_t g_isr_sanity_vclock_ch2 = {};
-static isr_sanity_diag_t g_isr_sanity_ocxo1 = {};
-static isr_sanity_diag_t g_isr_sanity_ocxo2 = {};
-static isr_sanity_diag_t g_isr_sanity_pps = {};
-static inline void isr_sanity_reset(isr_sanity_diag_t&) {}
-static inline void isr_sanity_record_cntr(isr_sanity_diag_t&, bool, uint32_t, uint32_t) {}
-static inline void isr_sanity_record_cntr_latency_band(isr_sanity_diag_t&, bool,
-                                                       uint16_t, uint16_t,
-                                                       uint32_t, uint32_t,
-                                                       uint32_t) {}
-static inline void isr_sanity_record_dwt(isr_sanity_diag_t&, bool, uint32_t, uint32_t) {}
-static inline isr_sanity_diag_t* isr_sanity_for_kind(interrupt_subscriber_kind_t kind) {
-  if (kind == interrupt_subscriber_kind_t::VCLOCK) return &g_isr_sanity_vclock_ch2;
-  if (kind == interrupt_subscriber_kind_t::OCXO1)  return &g_isr_sanity_ocxo1;
-  if (kind == interrupt_subscriber_kind_t::OCXO2)  return &g_isr_sanity_ocxo2;
-  return nullptr;
-}
-
 
 // ============================================================================
 // PPS / PPS_VCLOCK doctrine
@@ -3325,7 +3255,6 @@ struct ocxo_lane_t {
   bool     cadence_last_program_enabled_before = false;
   bool     cadence_last_program_enabled_after = false;
   uint32_t cadence_last_reason = OCXO_CADENCE_REASON_NONE;
-  uint32_t cadence_user_callback_count = 0;
 
   // Once-per-second OCXO witness surface.  In steady state this is the local
   // one-second compare target itself.  During SmartZero this surface remains
@@ -3957,8 +3886,7 @@ static void vclock_ch2_one_second_enable_from_epoch_legacy_grid(
 static bool vclock_ch2_one_second_already_served_for(uint32_t counter32);
 static void vclock_ch2_one_second_service(uint32_t isr_entry_dwt_raw,
                                           uint32_t qtimer_event_dwt,
-                                          uint32_t service_counter32,
-                                          const spinidle_isr_capture_t& spinidle);
+                                          uint32_t service_counter32);
 static void vclock_ch2_smartzero_reset_attempt_state(void);
 static void vclock_ch2_smartzero_deactivate(void);
 static void vclock_ch2_smartzero_service(uint32_t qtimer_event_dwt,
@@ -5424,8 +5352,7 @@ static void emit_one_second_event(interrupt_subscriber_runtime_t& rt,
                                   bool     pps_coincidence_valid  = false,
                                   const dwt_repair_diag_t* repair = nullptr,
                                   bool dispatch_immediately = false,
-                                  const cadence_regression_result_t* regression = nullptr,
-                                  const spinidle_isr_capture_t* spinidle = nullptr) {
+                                  const cadence_regression_result_t* regression = nullptr) {
   if (!rt.active) return;
 
   interrupt_event_t event {};
@@ -5459,9 +5386,6 @@ static void emit_one_second_event(interrupt_subscriber_runtime_t& rt,
   interrupt_capture_diag_t diag {};
   fill_diag(diag, rt, event);
   copy_regression_diag(diag, regression);
-  if (spinidle) {
-    spinidle_copy_to_diag(diag, *spinidle);
-  }
   if (repair) {
     diag.dwt_synthetic = repair->synthetic;
     diag.dwt_repair_candidate = repair->candidate;
@@ -5603,7 +5527,6 @@ struct vclock_perishable_fact_t {
   bool witness_pps_valid = false;
   pps_t witness_pps{};
   uint32_t fallback_sequence = 0;
-  spinidle_isr_capture_t spinidle{};
 };
 
 struct vclock_perishable_ring_t {
@@ -5764,23 +5687,14 @@ static bool vclock_ch2_one_second_already_served_for(uint32_t counter32) {
 
 static void vclock_ch2_one_second_service(uint32_t isr_entry_dwt_raw,
                                           uint32_t qtimer_event_dwt,
-                                          uint32_t service_counter32,
-                                          const spinidle_isr_capture_t& spinidle) {
+                                          uint32_t service_counter32) {
   if (!g_vclock_ch2_one_second_enabled) return;
   if (!g_vclock_lane.active || !g_rt_vclock || !g_rt_vclock->active) return;
 
   const uint32_t target_counter32 = g_vclock_ch2_one_second_next_counter32;
   if ((int32_t)(service_counter32 - target_counter32) < 0) return;
 
-  isr_raw_dwt_probe_record(interrupt_subscriber_kind_t::VCLOCK,
-                           isr_entry_dwt_raw);
-
   const uint16_t target_low16 = vclock_hardware_low16_from_synthetic(target_counter32);
-  spincatch_note_isr_entry(interrupt_subscriber_kind_t::VCLOCK,
-                           target_counter32,
-                           target_low16,
-                           isr_entry_dwt_raw);
-
   const uint32_t late_ticks = service_counter32 - target_counter32;
   uint32_t authored_dwt = qtimer_event_dwt;
   if (late_ticks != 0) {
@@ -5803,7 +5717,6 @@ static void vclock_ch2_one_second_service(uint32_t isr_entry_dwt_raw,
   fact.witness_pps_valid = g_last_pps_witness_valid;
   fact.witness_pps = witness_pps;
   fact.fallback_sequence = g_pps_gpio_heartbeat.edge_count + 1U;
-  fact.spinidle = spinidle;
 
   g_vclock_ch2_one_second_service_count++;
   g_vclock_ch2_one_second_last_target_counter32 = target_counter32;
@@ -6049,8 +5962,7 @@ static void vclock_apply_perishable_fact_deferred(
                         coincidence_valid,
                         &ema_diag,
                         true,
-                        &lower_env,
-                        &fact.spinidle);
+                        &lower_env);
 
   pps_edge_dispatch_arm_or_call_from_foreground("PPS_VCLOCK_DISPATCH");
 }
@@ -6515,8 +6427,7 @@ static void ocxo_lane_install_logical_grid(interrupt_subscriber_kind_t kind,
 
 static void vclock_heartbeat_native_service(uint32_t isr_entry_dwt_raw,
                                            uint32_t qtimer_event_dwt,
-                                           uint32_t cadence_counter32,
-                                           const spinidle_isr_capture_t& spinidle) {
+                                           uint32_t cadence_counter32) {
   if (!g_interrupt_hw_ready) return;
 
   const uint16_t fired_low16 = (uint16_t)(cadence_counter32 & 0xFFFFU);
@@ -6553,8 +6464,7 @@ static void vclock_heartbeat_native_service(uint32_t isr_entry_dwt_raw,
   pps_relay_ch2_tick(cadence_counter32);
   vclock_ch2_one_second_service(isr_entry_dwt_raw,
                                 qtimer_event_dwt,
-                                cadence_counter32,
-                                spinidle);
+                                cadence_counter32);
   vclock_ch2_smartzero_service(qtimer_event_dwt,
                                cadence_counter32);
   vclock_ch2_epoch_native_service(qtimer_event_dwt,
@@ -6751,7 +6661,6 @@ struct interrupt_perishable_fact_t {
   uint32_t service_dwt_at_event = 0;
   uint32_t slipledger_authored_dwt_at_event = 0;
   bool     slipledger_authored_dwt_valid = false;
-  spinidle_isr_capture_t spinidle{};
 
   // Authored target identity.  This is the event identity, not an ambient read.
   uint32_t target_counter32 = 0;
@@ -7716,9 +7625,6 @@ static uint32_t ocxo_lane_yardstick_observe(ocxo_lane_t& lane,
   return published_dwt;
 }
 
-static void spincatch_maybe_schedule_ocxo_landing(
-    ocxo_runtime_context_t&, const interrupt_perishable_fact_t&) {}
-
 static void ocxo_apply_perishable_fact_deferred(
     ocxo_runtime_context_t& ctx,
     const interrupt_perishable_fact_t& fact) {
@@ -7726,10 +7632,6 @@ static void ocxo_apply_perishable_fact_deferred(
   if (!lane) return;
 
   interrupt_subscriber_runtime_t* rt = ocxo_runtime_for(ctx);
-
-  // First-pass lane-local cadence user callback hook.  Linear regression is
-  // disabled for this checkpoint, so this remains a visible no-op count.
-  lane->cadence_user_callback_count++;
 
   const ocxo_perishable_ring_t& ring = ocxo_fact_ring_for(ctx);
   lane->witness_fact_drain_count = ring.drain_count;
@@ -7943,14 +7845,8 @@ static void ocxo_apply_perishable_fact_deferred(
                         false,
                         &ema_diag,
                         true,
-                        &lower_env,
-                        &fact.spinidle);
+                        &lower_env);
 
-  // Schedule at most one low-duty landing-only callback for the next
-  // already-authored OCXO target.  OCXO1 and OCXO2 use identical scheduling,
-  // attempt-ring, and reporting rules.  This records the TimePop landing facts
-  // only; it never touches the OCXO compare hardware.
-  spincatch_maybe_schedule_ocxo_landing(ctx, fact);
 }
 
 static void ocxo_fact_drain_callback(timepop_ctx_t*,
@@ -7970,7 +7866,6 @@ struct ocxo_cadence_isr_sample_t {
   interrupt_subscriber_runtime_t* rt = nullptr;
 
   uint32_t isr_entry_dwt_raw = 0;
-  spinidle_isr_capture_t spinidle{};
   uint32_t isr_csctrl_entry = 0;
   uint32_t isr_csctrl_after_program = 0;
   uint32_t raw_event_dwt = 0;
@@ -8087,7 +7982,6 @@ struct qtimer1_ch1_capture_packet_t {
   bool active_at_capture = false;
   uint32_t target_counter32 = 0;
   uint32_t next_compare_counter32 = 0;
-  spinidle_isr_capture_t spinidle{};
 };
 
 struct qtimer1_ch2_capture_packet_t {
@@ -8096,7 +7990,6 @@ struct qtimer1_ch2_capture_packet_t {
   uint32_t ch2_event_counter32 = 0;
   uint32_t capture_exit_dwt = 0;
   uint32_t csctrl_entry = 0;
-  spinidle_isr_capture_t spinidle{};
 };
 
 struct qtimer1_vclock_capture_packet_t {
@@ -8107,7 +8000,6 @@ struct qtimer1_vclock_capture_packet_t {
   uint16_t service_low16 = 0;
   uint32_t capture_exit_dwt = 0;
   uint32_t csctrl_entry = 0;
-  spinidle_isr_capture_t spinidle{};
 };
 
 struct ocxo_1khz_tend_capture_t {
@@ -8117,7 +8009,6 @@ struct ocxo_1khz_tend_capture_t {
   uint32_t isr_entry_dwt_raw = 0;
   uint32_t capture_exit_dwt = 0;
   uint32_t authored_dwt_at_event = 0;
-  spinidle_isr_capture_t spinidle{};
 
   uint32_t csctrl_entry = 0;
   uint16_t service_counter_low16 = 0;
@@ -8143,7 +8034,6 @@ struct ocxo_1khz_sample_capture_packet_t {
   uint32_t isr_entry_dwt_raw = 0;
   uint32_t capture_exit_dwt = 0;
   uint32_t authored_dwt_at_event = 0;
-  spinidle_isr_capture_t spinidle{};
 
   uint32_t csctrl_entry = 0;
   uint16_t service_counter_low16 = 0;
@@ -8167,7 +8057,6 @@ struct ocxo_one_second_capture_packet_t {
   uint32_t isr_entry_dwt_raw = 0;
   uint32_t capture_exit_dwt = 0;
   uint32_t authored_dwt_at_event = 0;
-  spinidle_isr_capture_t spinidle{};
 
   uint32_t csctrl_entry = 0;
   uint16_t service_counter_low16 = 0;
@@ -8197,7 +8086,6 @@ struct pps_capture_packet_t {
   bool ocxo2_capture_hw_ready = false;
   bool ocxo_capture_hw_ready = false;
   bool rebootstrap_pending_at_capture = false;
-  spinidle_isr_capture_t spinidle{};
 };
 
 template <typename T, uint32_t N>
@@ -8698,7 +8586,6 @@ static interrupt_perishable_fact_t ocxo_cadence_build_perishable_fact(
   fact.service_dwt_at_event = sample.raw_event_dwt;
   fact.slipledger_authored_dwt_at_event = sample.event_dwt;
   fact.slipledger_authored_dwt_valid = (sample.event_dwt != 0);
-  fact.spinidle = sample.spinidle;
   fact.target_counter32 = sample.target_counter32;
   fact.target_low16 = sample.target_low16;
   fact.arm_counter_low16 = sample.arm_counter_low16;
@@ -8776,7 +8663,6 @@ static void ocxo_1khz_packet_from_tend_capture(
   packet.isr_entry_dwt_raw = tick.isr_entry_dwt_raw;
   packet.capture_exit_dwt = tick.capture_exit_dwt;
   packet.authored_dwt_at_event = tick.authored_dwt_at_event;
-  packet.spinidle = tick.spinidle;
   packet.csctrl_entry = tick.csctrl_entry;
   packet.service_counter_low16 = tick.service_counter_low16;
   packet.service_compare_low16 = tick.service_compare_low16;
@@ -8797,7 +8683,6 @@ static void ocxo_one_second_packet_from_tend_capture(
   packet.isr_entry_dwt_raw = tick.isr_entry_dwt_raw;
   packet.capture_exit_dwt = tick.capture_exit_dwt;
   packet.authored_dwt_at_event = tick.authored_dwt_at_event;
-  packet.spinidle = tick.spinidle;
   packet.csctrl_entry = tick.csctrl_entry;
   packet.service_counter_low16 = tick.service_counter_low16;
   packet.service_compare_low16 = tick.service_compare_low16;
@@ -8820,7 +8705,6 @@ static void ocxo_fill_common_handoff_sample(
     ocxo_cadence_isr_sample_t& sample) {
   sample.rt = ocxo_runtime_for(ctx);
   sample.isr_entry_dwt_raw = packet.isr_entry_dwt_raw;
-  sample.spinidle = packet.spinidle;
   sample.isr_csctrl_entry = packet.csctrl_entry;
   sample.had_armed = packet.cadence_armed;
   sample.target_counter32 = packet.target_counter32;
@@ -9287,10 +9171,6 @@ static void ocxo_cadence_capture_priority0(ocxo_runtime_context_t& ctx,
     dwt_capture_lane.last_failure_csctrl_after = tick.csctrl_after_program;
   }
 
-  // SpinIdle is an ISR-entry witness; capture it only after the truly
-  // perishable hardware facts are already snapshotted and the next gear tooth
-  // is either armed or deliberately stopped.
-  tick.spinidle = spinidle_capture_at_isr_entry(isr_entry_dwt_raw);
   tick.capture_exit_dwt = ARM_DWT_CYCCNT;
 
   const bool needs_1khz_sample_handoff = was_smartzero_current;
@@ -9350,10 +9230,6 @@ static void interrupt_handoff_process_ocxo_1khz_sample(
   if (sample.rt) {
     sample.rt->irq_count++;
   }
-  spincatch_note_isr_entry(ctx.kind,
-                           sample.target_counter32,
-                           sample.target_low16,
-                           sample.isr_entry_dwt_raw);
 
   // This path is intentionally 1 kHz/acquisition only.  It can advance
   // SmartZero state, but it cannot enqueue an OCXO one-second publication.
@@ -9374,16 +9250,11 @@ static void interrupt_handoff_process_ocxo_one_second(
   if (sample.rt) {
     sample.rt->irq_count++;
   }
-  spincatch_note_isr_entry(ctx.kind,
-                           sample.target_counter32,
-                           sample.target_low16,
-                           sample.isr_entry_dwt_raw);
 
   // This is the only OCXO handoff path allowed to create a one-second fact.
   lane.cadence_last_one_second_due = true;
 
   if (sample.had_active_rt) {
-    isr_raw_dwt_probe_record(ctx.kind, sample.isr_entry_dwt_raw);
     interrupt_perishable_fact_t fact =
         ocxo_cadence_build_perishable_fact(ctx, sample);
     ocxo_cadence_enqueue_fact(ctx, fact);
@@ -9541,8 +9412,7 @@ static void interrupt_handoff_process_qtimer1_ch1(
 
 static void vclock_heartbeat_native_service(uint32_t isr_entry_dwt_raw,
                                            uint32_t qtimer_event_dwt,
-                                           uint32_t cadence_counter32,
-                                           const spinidle_isr_capture_t& spinidle);
+                                           uint32_t cadence_counter32);
 
 static void interrupt_handoff_process_qtimer1_vclock(
     const qtimer1_vclock_capture_packet_t& packet) {
@@ -9557,8 +9427,7 @@ static void interrupt_handoff_process_qtimer1_vclock(
 
   vclock_heartbeat_native_service(packet.isr_entry_dwt_raw,
                                   qtimer_event_dwt,
-                                  target_counter32,
-                                  packet.spinidle);
+                                  target_counter32);
 }
 
 static void interrupt_handoff_process_qtimer1_ch2(
@@ -9566,7 +9435,6 @@ static void interrupt_handoff_process_qtimer1_ch2(
   const uint32_t isr_entry_dwt_raw = packet.isr_entry_dwt_raw;
   const uint32_t qtimer_event_dwt = qtimer_event_dwt_from_isr_entry_raw(isr_entry_dwt_raw);
   const uint32_t ch2_event_counter32 = packet.ch2_event_counter32;
-  const spinidle_isr_capture_t& spinidle = packet.spinidle;
 
   // QTimer1 CH2 is TimePop scheduler-only.  VCLOCK custody services run on
   // the native CH0 heartbeat; do not author VCLOCK facts from this sibling rail.
@@ -9598,9 +9466,7 @@ static void interrupt_handoff_process_qtimer1_ch2(
         (int32_t)(qtimer_event_dwt - isr_entry_dwt_raw);
     diag.dwt_published_minus_event_cycles = 0;
     diag.dwt_used_minus_event_cycles = 0;
-    spinidle_copy_to_diag(diag, spinidle);
-    g_spinidle_timepop_last_capture = spinidle;
-    bridge_projection_copy_to_diag(diag, bridge);
+      bridge_projection_copy_to_diag(diag, bridge);
 
     g_qtimer1_ch2_handler(event, diag);
   }
@@ -9699,7 +9565,6 @@ static void qtimer1_vclock_capture_priority0(uint32_t isr_entry_dwt_raw,
         g_dwt_capture_vclock.last_csctrl_after;
   }
 
-  packet.spinidle = spinidle_capture_at_isr_entry(isr_entry_dwt_raw);
   packet.capture_exit_dwt = ARM_DWT_CYCCNT;
 
   if (capture_ring_push_from_priority0(g_qtimer1_vclock_capture_ring,
@@ -9720,9 +9585,6 @@ static void qtimer1_ch2_capture_priority0(uint32_t isr_entry_dwt_raw,
   packet.ch2_event_counter32 = g_qtimer1_ch2_last_target_counter32;
   packet.csctrl_entry = csctrl_entry;
 
-  // SpinIdle is diagnostic evidence. Capture it only after the indispensable
-  // CH2 flag/target facts have been snapshotted and the source defused.
-  packet.spinidle = spinidle_capture_at_isr_entry(isr_entry_dwt_raw);
   packet.capture_exit_dwt = ARM_DWT_CYCCNT;
 
   if (capture_ring_push_from_priority0(g_qtimer1_ch2_capture_ring,
@@ -9924,8 +9786,6 @@ static void pps_post_isr_defer(const interrupt_epoch_capture_t& cap,
 
 static void interrupt_handoff_process_pps(const pps_capture_packet_t& packet) {
   const uint32_t isr_entry_dwt_raw = packet.isr_entry_dwt_raw;
-  const spinidle_isr_capture_t& spinidle = packet.spinidle;
-  g_spinidle_pps_last_capture = spinidle;
 
   const uint32_t epoch_capture_start_raw = isr_entry_dwt_raw;
   const uint16_t hardware_low16 = packet.vclock_hardware16_observed;
@@ -10055,7 +9915,6 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
   packet.ocxo1_hardware16 = packet.ocxo1_capture_hw_ready ? IMXRT_TMR2.CH[QTIMER_CLOCK_COUNTER_CH].CNTR : 0;
   packet.ocxo2_hardware16 = packet.ocxo2_capture_hw_ready ? IMXRT_TMR3.CH[g_ocxo2_lane.counter_channel].CNTR : 0;
   packet.capture_end_raw = ARM_DWT_CYCCNT;
-  packet.spinidle = spinidle_capture_at_isr_entry(isr_entry_dwt_raw);
   packet.capture_exit_dwt = ARM_DWT_CYCCNT;
   packet.rebootstrap_pending_at_capture = g_pps_rebootstrap_pending;
 
@@ -10146,13 +10005,6 @@ pps_edge_snapshot_t interrupt_last_pps_edge(void) {
   out.physical_pps_dwt_normalized_at_edge = pps.dwt_at_edge;
   out.physical_pps_counter32_at_read      = pps.counter32_at_edge;
   out.physical_pps_ch3_at_read            = pps.ch3_at_edge;
-  out.spinidle_shadow_valid = g_spinidle_pps_last_capture.shadow_valid;
-  out.spinidle_shadow_dwt = g_spinidle_pps_last_capture.shadow_dwt;
-  out.spinidle_shadow_to_isr_entry_cycles =
-      g_spinidle_pps_last_capture.shadow_to_isr_entry_cycles;
-  out.spinidle_shadow_valid_threshold_cycles =
-      g_spinidle_pps_last_capture.threshold_cycles;
-
   out.vclock_epoch_counter32              = pvc.counter32_at_edge;
   out.vclock_epoch_ch3                    = pvc.ch3_at_edge;
   out.vclock_epoch_ticks_after_pps        = VCLOCK_EPOCH_TICKS_AFTER_PHYSICAL_PPS;
@@ -10634,17 +10486,10 @@ static void runtime_reset_vclock_heartbeat_state(void) {
   g_vclock_heartbeat_epoch_authority_retired_count = 0;
   g_vclock_heartbeat_epoch_pending_skip_count = 0;
 
-  isr_sanity_reset(g_isr_sanity_vclock_ch2);
-  isr_sanity_reset(g_isr_sanity_ocxo1);
-  isr_sanity_reset(g_isr_sanity_ocxo2);
-  isr_sanity_reset(g_isr_sanity_pps);
   pps_yardstick_reset();
   g_pps_yardstick_prev_valid = false;
   g_pps_yardstick_prev_counter32 = 0;
   g_pps_yardstick_prev_dwt = 0;
-  g_spinidle_pps_last_capture = spinidle_isr_capture_t{};
-  g_spinidle_timepop_last_capture = spinidle_isr_capture_t{};
-  isr_raw_dwt_probe_reset_all();
 
   g_interrupt_handoff = interrupt_handoff_diag_t{};
   g_handoff_qtimer1_ch1 = interrupt_handoff_source_diag_t{};
@@ -10680,7 +10525,6 @@ static void runtime_reset_for_init(void) {
   runtime_bootstrap_synthetic_clocks_if_ready();
   runtime_reset_qtimer_host_state();
   runtime_reset_vclock_heartbeat_state();
-  spincatch_report_reset_all();
   vclock_fact_ring_reset();
   runtime_reset_ocxo_fact_rings();
   cadence_regression_reset_all();
@@ -11197,7 +11041,7 @@ static FLASHMEM Payload cmd_report(const Payload&) {
   p.add("runtime_ready", g_interrupt_runtime_ready);
   p.add("irqs_enabled", g_interrupt_irqs_enabled);
   p.add("diagnostic_policy", "OPERATIONAL_CUSTODY_ONLY");
-  p.add("retired", "linear_regression spincatch spinidle isr_sanity raw_dwt_csv qtimer_register_museum");
+  p.add("retired", "linear_regression raw_dwt_csv qtimer_register_museum");
   return p;
 }
 
