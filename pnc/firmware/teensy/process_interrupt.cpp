@@ -165,11 +165,21 @@ static constexpr uint32_t EPOCH_CAPTURE_MAX_WINDOW_CYCLES =
 // authority, repair, watchdog, gating, or SmartZero.  They are pure courtroom
 // arithmetic over already-authored edge facts.
 static constexpr uint32_t VCLOCK_PPS_INTERVAL_INTEGRITY_GATE_CYCLES = 10U;
+static constexpr int64_t  VCLOCK_GNSS_NS_INTEGRITY_GATE_NS = 16LL;
 
 static interrupt_integrity_snapshot_t g_interrupt_integrity = {};
 
+static void interrupt_integrity_note_vclock_gnss_ns(uint32_t sequence,
+                                                    uint32_t dwt_at_edge,
+                                                    uint32_t counter32_at_edge);
+
 static uint32_t interrupt_integrity_abs_i32(int32_t value) {
   return value < 0 ? (uint32_t)(-(int64_t)value) : (uint32_t)value;
+}
+
+static uint64_t interrupt_integrity_abs_i64(int64_t value) {
+  if (value >= 0) return (uint64_t)value;
+  return (uint64_t)(-(value + 1LL)) + 1ULL;
 }
 
 static interrupt_integrity_counter_check_t*
@@ -190,6 +200,7 @@ bool interrupt_integrity_snapshot(interrupt_integrity_snapshot_t* out) {
   if (!out) return false;
   g_interrupt_integrity.snapshot_count++;
   g_interrupt_integrity.valid =
+      g_interrupt_integrity.vclock_gnss_ns.valid ||
       g_interrupt_integrity.vclock_pps_interval.valid ||
       g_interrupt_integrity.vclock_counter.valid ||
       g_interrupt_integrity.ocxo1_counter.valid ||
@@ -1694,6 +1705,10 @@ static void publish_vclock_domain_pps_vclock(const pps_t& pps,
   pvc.ch3_at_edge = ch3_at_edge;
   pvc.gnss_ns_at_edge = -1;  // GNSS labels are CLOCKS-owned.
 
+  interrupt_integrity_note_vclock_gnss_ns(sequence,
+                                          pvc.dwt_at_edge,
+                                          pvc.counter32_at_edge);
+
   g_pps_gpio_heartbeat.last_dwt = pvc.dwt_at_edge;
   g_pps_gpio_heartbeat.last_gnss_ns = -1;
 
@@ -1850,6 +1865,82 @@ static bridge_projection_t interrupt_dwt_to_vclock_gnss_projection(uint32_t dwt_
 
   out.anchor_failure_mask |= ANCHOR_FAIL_NO_PLAUSIBLE;
   return out;
+}
+
+static void interrupt_integrity_note_vclock_gnss_ns(uint32_t sequence,
+                                                    uint32_t dwt_at_edge,
+                                                    uint32_t counter32_at_edge) {
+  interrupt_integrity_gnss_ns_check_t& s =
+      g_interrupt_integrity.vclock_gnss_ns;
+
+  s.valid = true;
+  s.sequence = sequence;
+  s.dwt_at_edge = dwt_at_edge;
+  s.counter32_at_edge = counter32_at_edge;
+  s.expected_gnss_ns = -1;
+  s.gate_ns = VCLOCK_GNSS_NS_INTEGRITY_GATE_NS;
+  s.anchor_sequence_delta = 0;
+  s.computed_valid = false;
+  s.computed_gnss_ns = -1;
+  s.error_ns = 0;
+  s.anchor_sequence_used = 0;
+  s.anchor_age_slots = 0;
+  s.anchor_selection_kind = ANCHOR_SELECT_FAILED;
+  s.anchor_dwt_at_edge = 0;
+  s.anchor_gnss_ns_at_edge = -1;
+  s.anchor_cps = 0;
+  s.anchor_ns_delta = 0;
+  s.anchor_failure_mask = 0;
+
+  if (sequence == 0 || dwt_at_edge == 0) {
+    s.skipped_count++;
+    s.last_ok = false;
+    return;
+  }
+
+  const bridge_projection_t proj =
+      interrupt_dwt_to_vclock_gnss_projection(dwt_at_edge);
+  s.anchor_sequence_used = proj.anchor_sequence_used;
+  s.anchor_age_slots = proj.anchor_age_slots;
+  s.anchor_selection_kind = proj.anchor_selection_kind;
+  s.anchor_dwt_at_edge = proj.anchor_dwt_at_edge;
+  s.anchor_gnss_ns_at_edge = proj.anchor_gnss_ns_at_edge;
+  s.anchor_cps = proj.anchor_cps;
+  s.anchor_ns_delta = proj.anchor_ns_delta;
+  s.anchor_failure_mask = proj.anchor_failure_mask;
+
+  if (proj.gnss_ns < 0 ||
+      proj.anchor_sequence_used == 0 ||
+      proj.anchor_gnss_ns_at_edge < 0) {
+    s.skipped_count++;
+    s.last_ok = false;
+    return;
+  }
+
+  const int64_t sequence_delta =
+      (int64_t)sequence - (int64_t)proj.anchor_sequence_used;
+  s.anchor_sequence_delta = sequence_delta;
+  s.expected_gnss_ns =
+      proj.anchor_gnss_ns_at_edge +
+      sequence_delta * (int64_t)GNSS_NS_PER_SECOND;
+
+  s.computed_valid = true;
+  s.computed_gnss_ns = proj.gnss_ns;
+  s.error_ns = proj.gnss_ns - s.expected_gnss_ns;
+  s.test_count++;
+
+  if (s.error_ns == 0) {
+    s.exact_match_count++;
+  }
+
+  if (interrupt_integrity_abs_i64(s.error_ns) <=
+      (uint64_t)VCLOCK_GNSS_NS_INTEGRITY_GATE_NS) {
+    s.match_count++;
+    s.last_ok = true;
+  } else {
+    s.mismatch_count++;
+    s.last_ok = false;
+  }
 }
 
 // ============================================================================
@@ -9175,6 +9266,7 @@ static void runtime_reset_ocxo_fact_rings(void) {
 }
 
 static void runtime_reset_for_init(void) {
+  g_interrupt_integrity = interrupt_integrity_snapshot_t{};
   runtime_init_subscribers();
   runtime_reset_pps_state();
   runtime_reset_snapshot_and_bridge_state();
@@ -9651,11 +9743,74 @@ static FLASHMEM void add_ocxo_lean_lane(Payload& p,
 
 }
 
+static FLASHMEM void add_payload_i64_string(Payload& p,
+                                             const char* key,
+                                             int64_t value) {
+  char buf[32];
+  snprintf(buf, sizeof(buf), "%lld", (long long)value);
+  p.add(key, buf);
+}
+
+static FLASHMEM void add_payload_u64_string(Payload& p,
+                                             const char* key,
+                                             uint64_t value) {
+  char buf[32];
+  snprintf(buf, sizeof(buf), "%llu", (unsigned long long)value);
+  p.add(key, buf);
+}
+
+static FLASHMEM Payload cmd_report_integrity(const Payload&) {
+  interrupt_integrity_snapshot_t s{};
+  const bool snapshot_valid = interrupt_integrity_snapshot(&s);
+
+  Payload p;
+  p.add("report", "INTERRUPT_INTEGRITY");
+  p.add("schema", "INTERRUPT_INTEGRITY_V1");
+  p.add("description",
+        "Passive VCLOCK DWT-to-GNSS nanosecond integrity checks");
+  p.add("valid", snapshot_valid);
+  p.add("snapshot_count", s.snapshot_count);
+  p.add("active_checks", "vclock_gnss_ns");
+  p.add("inactive_checks", "vclock_pps_interval vclock_counter ocxo1_counter ocxo2_counter");
+
+  const interrupt_integrity_gnss_ns_check_t& g = s.vclock_gnss_ns;
+  Payload v;
+  v.add("valid", g.valid);
+  v.add("computed_valid", g.computed_valid);
+  v.add("last_ok", g.last_ok);
+  v.add("test_count", g.test_count);
+  v.add("match_count", g.match_count);
+  v.add("exact_match_count", g.exact_match_count);
+  v.add("mismatch_count", g.mismatch_count);
+  v.add("skipped_count", g.skipped_count);
+  add_payload_i64_string(v, "gate_ns", g.gate_ns);
+  v.add("sequence", g.sequence);
+  v.add("dwt_at_edge", g.dwt_at_edge);
+  v.add("counter32_at_edge", g.counter32_at_edge);
+  add_payload_i64_string(v, "computed_gnss_ns", g.computed_gnss_ns);
+  add_payload_i64_string(v, "expected_gnss_ns", g.expected_gnss_ns);
+  add_payload_i64_string(v, "error_ns", g.error_ns);
+  add_payload_i64_string(v, "anchor_sequence_delta",
+                         g.anchor_sequence_delta);
+  v.add("anchor_sequence_used", g.anchor_sequence_used);
+  v.add("anchor_age_slots", g.anchor_age_slots);
+  v.add("anchor_selection_kind", g.anchor_selection_kind);
+  v.add("anchor_dwt_at_edge", g.anchor_dwt_at_edge);
+  add_payload_i64_string(v, "anchor_gnss_ns_at_edge",
+                         g.anchor_gnss_ns_at_edge);
+  v.add("anchor_cps", g.anchor_cps);
+  add_payload_u64_string(v, "anchor_ns_delta", g.anchor_ns_delta);
+  v.add("anchor_failure_mask", g.anchor_failure_mask);
+  p.add_object("vclock_gnss_ns", v);
+
+  return p;
+}
+
 static FLASHMEM Payload cmd_report(const Payload&) {
   Payload p;
   p.add("report", "INTERRUPT_LEAN");
   p.add("schema", "INTERRUPT_LEAN_V1");
-  p.add("available_reports", "REPORT_STATUS REPORT_PPS REPORT_CADENCE REPORT_SMARTZERO REPORT_BRIDGE REPORT_HANDOFF REPORT_LOWER_ENVELOPE REPORT_LANES REPORT_LANE");
+  p.add("available_reports", "REPORT_STATUS REPORT_PPS REPORT_CADENCE REPORT_SMARTZERO REPORT_BRIDGE REPORT_HANDOFF REPORT_LOWER_ENVELOPE REPORT_INTEGRITY REPORT_LANES REPORT_LANE");
   p.add("report_lane_sections", "summary clock gate service yardstick");
   p.add("hw_ready", g_interrupt_hw_ready);
   p.add("runtime_ready", g_interrupt_runtime_ready);
@@ -9971,6 +10126,7 @@ static const process_command_entry_t INTERRUPT_COMMANDS[] = {
   { "REPORT_BRIDGE",   cmd_report_bridge   },
   { "REPORT_HANDOFF", cmd_report_handoff },
   { "REPORT_LOWER_ENVELOPE", cmd_report_lower_envelope },
+  { "REPORT_INTEGRITY", cmd_report_integrity },
   { "REPORT_LANES",    cmd_report_lanes    },
   { "REPORT_LANE",     cmd_report_lane     },
   { "REPORT_QTIMER_REGS", cmd_report_qtimer_regs },

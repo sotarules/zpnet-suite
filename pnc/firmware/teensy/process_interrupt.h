@@ -416,9 +416,44 @@ struct interrupt_integrity_counter_check_t {
   uint32_t previous_counter32 = 0;
 };
 
+struct interrupt_integrity_gnss_ns_check_t {
+  bool     valid = false;
+  bool     computed_valid = false;
+  bool     last_ok = false;
+  uint32_t test_count = 0;
+  uint32_t match_count = 0;       // within gate_ns
+  uint32_t exact_match_count = 0; // exactly 0 ns error
+  uint32_t mismatch_count = 0;
+  uint32_t skipped_count = 0;
+
+  int64_t  gate_ns = 0;
+  uint32_t sequence = 0;
+  uint32_t dwt_at_edge = 0;
+  uint32_t counter32_at_edge = 0;
+  int64_t  computed_gnss_ns = -1;
+  int64_t  expected_gnss_ns = -1;
+  int64_t  error_ns = 0;
+  int64_t  anchor_sequence_delta = 0;
+
+  uint32_t anchor_sequence_used = 0;
+  uint32_t anchor_age_slots = 0;
+  uint32_t anchor_selection_kind = 0;
+  uint32_t anchor_dwt_at_edge = 0;
+  int64_t  anchor_gnss_ns_at_edge = -1;
+  uint32_t anchor_cps = 0;
+  uint64_t anchor_ns_delta = 0;
+  uint32_t anchor_failure_mask = 0;
+};
+
 struct interrupt_integrity_snapshot_t {
   bool     valid = false;
   uint32_t snapshot_count = 0;
+
+  // VCLOCK selected-edge DWT -> GNSS ns projection must reconstruct the
+  // CLOCKS-labeled PPS/VCLOCK GNSS timeline.  The expected value is anchored
+  // to the labeled anchor sequence, not to process_interrupt's local sequence
+  // zero, because CLOCKS owns the campaign GNSS label epoch.
+  interrupt_integrity_gnss_ns_check_t vclock_gnss_ns;
 
   // VCLOCK selected-edge DWT interval must agree with the physical PPS DWT
   // interval within the configured diagnostic gate.
