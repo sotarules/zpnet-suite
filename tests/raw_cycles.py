@@ -1,57 +1,46 @@
 """
-ZPNet Raw Cycles — EMA vs PPS-Yardstick side-by-side cycle audit.
+ZPNet Raw Cycles — raw / EMA / FloorLine / published cycle audit.
 
 Reads TIMEBASE rows for a campaign and prints a compact one-second DWT-cycle
-audit. The report stays deliberately one-line-per-second.
-
-Default view:
-    PPS + VCLOCK + OCXO1 + OCXO2
-
-Focused view:
-    PPS + one selected clock
+audit.  PPS is always shown as the base rail.  By default the report shows
+VCLOCK, OCXO1, and OCXO2.  A clock filter narrows the view to PPS + one lane.
 
 Usage:
     python -m zpnet.tests.raw_cycles <campaign_name> [limit] [clock]
     python raw_cycles.py <campaign_name> [limit] [clock]
     python raw_cycles.py <campaign_name> --clock OCXO2 [limit]
-    python raw_cycles.py <campaign_name> --slip [limit] [clock]
+    python raw_cycles.py <campaign_name> --limit 300 --clock VCLOCK
 
 Clock filter:
     VCLOCK, OCXO1, OCXO2
 
 Column doctrine:
-    p_pred is the PPS static cycle-count prediction interval.
-    p_act  is the physical PPS actual interval.
-    p_Δ    is physical PPS actual[n] - physical PPS actual[n-1].
+    p_act     physical PPS actual interval, in DWT cycles.
+    p_Δ       physical PPS first-difference residual.
 
-    *_raw      is the raw/evidence interval from TIMEBASE_FORENSICS
-               dwt_interval_gate.observed_cycles when available.
-    *_rawΔ     is the raw first-difference residual: raw[n] - raw[n-1].
-    *_ema      is the subscriber-facing published interval.  Today this is
-               EMA-authored (formerly printed as *_pub); the rename tells
-               the truth about its provenance.
-    *_emaΔ     is ema[n] - ema[n-1].
+    *_raw     raw/evidence interval from dwt_interval_gate.observed_cycles
+              when present, otherwise from original/observed DWT endpoints.
+    *_rawΔ    raw interval first-difference residual:
+              raw_interval[n] - raw_interval[n-1].
+    *_ema     EMA-authored interval from dwt_interval_gate.effective_cycles
+              when present, otherwise from the EMA endpoint if present.
+    *_emaΔ    EMA interval first-difference residual:
+              ema_interval[n] - ema_interval[n-1].
+    *_fl      FloorLine inferred interval from regression/FloorLine inferred
+              DWT endpoints.
+    *_flΔ     FloorLine interval first-difference residual:
+              fl_interval[n] - fl_interval[n-1].
+    *_pub     the subscriber-facing published interval, regardless of which
+              algorithm authored it.
+    *_pubΔ    published interval first-difference residual:
+              pub_interval[n] - pub_interval[n-1].
+    *_f-r     FloorLine interval minus raw/evidence interval.
+    *_p-r     published interval minus raw/evidence interval.
+    *_cΔ      counter32 delta since the previous subscriber event.
 
-    *_inferred is the PPS-Yardstick inferred interval (heir apparent to the
-               EMA): prior chain interval scaled by the physical PPS-to-PPS
-               yardstick ratio, carried in Q16, validated by raw.
-    *_imo      is inferred - observed for this second: the yardstick
-               scorecard.  Sub-lattice |imo| means the inference is tracking
-               truth tighter than the 4-cycle QTimer quantization floor.
-    *_walk     is the free-running yardstick chain endpoint minus the
-               observed endpoint: cumulative chain-walk audit.
-    *_y        is the yardstick row tag: OK, EXC (gate excursion), STAL
-               (stale PPS yardstick, interval held), SEED (chain reseeded
-               this row), or --- (rail not valid on this row).
-
-    *_cΔ       is counter32 delta since the previous event (lineage proof).
-
-Slip-aware view:
-    --slip prints one OCXO lane row per second and adds SlipLedger deltas:
-    violΔ/corrΔ/earlyΔ/lateΔ, signed ledger ticks, event ticks, DWT error,
-    observed/authored DWT interval deltas, and reason codes.  This is the
-    hardware-pathology courtroom view: negative slip DWT error plus earlyΔ/corrΔ
-    is the signature of an early/fast edge stream.
+Core rail columns are always shown for each selected lane so the report shape
+stays stable across EMA and FloorLine firmware builds.  Truly auxiliary columns
+(such as counter32 lineage) are still omitted when absent.
 """
 
 from __future__ import annotations
@@ -64,9 +53,10 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from zpnet.shared.db import open_db
 
 
-EXPECTED_OCXO_CDELTA = 10_000_000
-EXCURSION_THRESHOLD_CYCLES = 100
 CLOCKS = ("VCLOCK", "OCXO1", "OCXO2")
+LANE_KEYS = {"VCLOCK": "vclock", "OCXO1": "ocxo1", "OCXO2": "ocxo2"}
+PREFIXES = {"VCLOCK": "v", "OCXO1": "o1", "OCXO2": "o2"}
+LANE_MICRO_PREFIXES = {"vclock": "v", "ocxo1": "o1", "ocxo2": "o2"}
 
 
 class Welford:
@@ -189,10 +179,10 @@ def _as_bool(v: Any) -> Optional[bool]:
     if isinstance(v, (int, float)):
         return bool(v)
     if isinstance(v, str):
-        text = v.strip().lower()
-        if text in ("true", "t", "yes", "y", "1"):
+        t = v.strip().lower()
+        if t in ("true", "t", "yes", "y", "1"):
             return True
-        if text in ("false", "f", "no", "n", "0"):
+        if t in ("false", "f", "no", "n", "0"):
             return False
     return None
 
@@ -216,22 +206,6 @@ def _first_float(*values: Any) -> Optional[float]:
 def _first_bool(*values: Any) -> Optional[bool]:
     for v in values:
         out = _as_bool(v)
-        if out is not None:
-            return out
-    return None
-
-
-def _first_path_int(*paths: Tuple[Dict[str, Any], Tuple[str, ...]]) -> Optional[int]:
-    for obj, path in paths:
-        out = _as_int(_nested_get(obj, *path))
-        if out is not None:
-            return out
-    return None
-
-
-def _first_path_bool(*paths: Tuple[Dict[str, Any], Tuple[str, ...]]) -> Optional[bool]:
-    for obj, path in paths:
-        out = _as_bool(_nested_get(obj, *path))
         if out is not None:
             return out
     return None
@@ -270,19 +244,70 @@ def _signed_delta_u32(now: int, prev: int) -> int:
     return delta - 0x100000000 if delta > 0x7FFFFFFF else delta
 
 
+def _interval_delta(current: Optional[int], previous: Optional[int]) -> Optional[int]:
+    if current is None or previous is None:
+        return None
+    return current - previous
+
+
+def _interval_from_endpoints(now: Optional[int],
+                             prev: Optional[int]) -> Optional[int]:
+    if now is None or prev is None:
+        return None
+    return _delta_u32(now, prev)
+
+
 def _print_welford(name: str, w: Welford, unit: str = "cycles",
                    decimals: int = 3) -> None:
     if w.n == 0:
-        print(f"  {name:<46s} no samples")
+        print(f"  {name:<42s} no samples")
         return
     print(
-        f"  {name:<46s} "
+        f"  {name:<42s} "
         f"n={w.n:>7,d}  "
         f"mean={w.mean:+12,.{decimals}f} {unit:<6s}  "
         f"sd={w.stddev:10,.{decimals}f}  "
         f"se={w.stderr:9,.{decimals}f}  "
         f"min={w.min_val:+12,.{decimals}f}  "
         f"max={w.max_val:+12,.{decimals}f}"
+    )
+
+
+def add_optional(w: Welford, v: Optional[int]) -> None:
+    if v is not None:
+        w.update(float(v))
+
+
+def normalize_clock_filter(clock: Optional[str]) -> Optional[str]:
+    if clock is None:
+        return None
+    c = clock.strip().upper()
+    if c in ("V", "VC", "VCLOCK"):
+        return "VCLOCK"
+    if c in ("O1", "OCXO1"):
+        return "OCXO1"
+    if c in ("O2", "OCXO2"):
+        return "OCXO2"
+    raise ValueError(f"unknown clock '{clock}', expected VCLOCK, OCXO1, or OCXO2")
+
+
+def selected_clocks(clock_filter: Optional[str]) -> Tuple[str, ...]:
+    return CLOCKS if clock_filter is None else (clock_filter,)
+
+
+def physical_pps_dwt_from_schema(root: Dict[str, Any],
+                                 frag: Dict[str, Any],
+                                 forensic: Dict[str, Any]) -> Optional[int]:
+    return _first_int(
+        _nested_get(frag, "pps", "dwt_at_edge"),
+        frag.get("pps_dwt_at_edge"),
+        forensic.get("pps_dwt_at_edge"),
+        root.get("pps_dwt_at_edge"),
+        frag.get("physical_pps_dwt_at_edge"),
+        frag.get("pps_diag_physical_pps_dwt_normalized_at_edge"),
+        frag.get("pps_diag_physical_pps_dwt_raw_at_edge"),
+        frag.get("pps_diag_pps_edge_dwt_isr_entry_raw"),
+        frag.get("pps_edge_dwt_at_edge"),
     )
 
 
@@ -317,86 +342,25 @@ def lane_prediction(frag: Dict[str, Any],
     return actual, static, residual
 
 
-def physical_pps_dwt_from_schema(root: Dict[str, Any],
-                                 frag: Dict[str, Any],
-                                 forensic: Dict[str, Any]) -> Optional[int]:
-    return _first_int(
-        _nested_get(frag, "pps", "dwt_at_edge"),
-        frag.get("pps_dwt_at_edge"),
-        forensic.get("pps_dwt_at_edge"),
-        root.get("pps_dwt_at_edge"),
-        frag.get("physical_pps_dwt_at_edge"),
-        frag.get("pps_diag_physical_pps_dwt_normalized_at_edge"),
-        frag.get("pps_diag_physical_pps_dwt_raw_at_edge"),
-        frag.get("pps_diag_pps_edge_dwt_isr_entry_raw"),
-        frag.get("pps_edge_dwt_at_edge"),
-    )
-
-
-def vclock_preferred_dwt_from_schema(root: Dict[str, Any],
-                                     frag: Dict[str, Any],
-                                     forensic: Dict[str, Any]) -> Tuple[Optional[int], str]:
-    lattice_dwt = _first_int(
-        _nested_get(frag, "dwt", "at_pps_vclock"),
-        frag.get("dwt_at_pps_vclock"),
-        forensic.get("dwt_at_pps_vclock"),
-        root.get("dwt_at_pps_vclock"),
-    )
-    if lattice_dwt is not None:
-        return lattice_dwt, "lattice"
-
-    forensic_dwt = _first_int(
-        _nested_get(forensic, "vclock", "forensics", "last_event_dwt"),
-        _nested_get(frag, "vclock", "forensics", "last_event_dwt"),
-        _nested_get(root, "vclock", "forensics", "last_event_dwt"),
-        _nested_get(root, "vclock", "alpha_event", "last_event_dwt"),
-    )
-    if forensic_dwt is not None:
-        return forensic_dwt, "forensics"
-
-    return None, "---"
-
-
-def pps_vclock_phase_cycles_from_schema(root: Dict[str, Any],
-                                        frag: Dict[str, Any],
-                                        forensic: Dict[str, Any]) -> Optional[int]:
-    return _first_int(
-        _nested_get(frag, "pps", "vclock_phase_cycles"),
-        frag.get("pps_vclock_phase_cycles"),
-        forensic.get("pps_vclock_phase_cycles"),
-        root.get("pps_vclock_phase_cycles"),
-    )
-
-
-def lane_forensics_obj(root: Dict[str, Any],
-                       frag: Dict[str, Any],
-                       forensic: Dict[str, Any],
-                       lane: str) -> Dict[str, Any]:
-    candidates = (
-        _nested_get(forensic, lane, "forensics"),
-        _nested_get(frag, lane, "forensics"),
-        _nested_get(root, lane, "forensics"),
-        _nested_get(root, "fragment", lane, "forensics"),
-        _nested_get(root, "clock_forensics", lane, "alpha_event"),
-        _nested_get(frag, "clock_forensics", lane, "alpha_event"),
-    )
-    for c in candidates:
-        if isinstance(c, dict):
-            return c
-    return {}
-
-
-def lane_service_obj(root: Dict[str, Any],
+def lane_alpha_event(root: Dict[str, Any],
                      frag: Dict[str, Any],
                      forensic: Dict[str, Any],
                      lane: str) -> Dict[str, Any]:
+    """Best-effort TIMEBASE Alpha-event object for one lane.
+
+    The firmware has gone through several schemas.  This function deliberately
+    searches both current nested clock_forensics objects and older flattened
+    lane-forensics locations.
+    """
     candidates = (
-        _nested_get(forensic, lane, "service"),
-        _nested_get(frag, lane, "service"),
-        _nested_get(root, lane, "service"),
-        _nested_get(root, "fragment", lane, "service"),
-        _nested_get(root, "clock_forensics", lane, "alpha_event", "ocxo_service"),
-        _nested_get(frag, "clock_forensics", lane, "alpha_event", "ocxo_service"),
+        _nested_get(root, "clock_forensics", lane, "alpha_event"),
+        _nested_get(frag, "clock_forensics", lane, "alpha_event"),
+        _nested_get(forensic, lane, "alpha_event"),
+        _nested_get(frag, lane, "alpha_event"),
+        _nested_get(root, lane, "alpha_event"),
+        _nested_get(forensic, lane, "forensics"),
+        _nested_get(frag, lane, "forensics"),
+        _nested_get(root, lane, "forensics"),
     )
     for c in candidates:
         if isinstance(c, dict):
@@ -404,392 +368,251 @@ def lane_service_obj(root: Dict[str, Any],
     return {}
 
 
-def lane_last_event_dwt(root: Dict[str, Any],
-                        frag: Dict[str, Any],
-                        forensic: Dict[str, Any],
-                        lane: str) -> Optional[int]:
-    prefix = f"{lane}_forensics_"
-    f = lane_forensics_obj(root, frag, forensic, lane)
-    return _first_int(
-        f.get("last_event_dwt"),
-        f.get("alpha_event_last_event_dwt"),
-        frag.get(prefix + "last_event_dwt"),
-        root.get(prefix + "last_event_dwt"),
-        frag.get(f"{lane}_alpha_event_last_event_dwt"),
-        root.get(f"{lane}_alpha_event_last_event_dwt"),
+def _flat_prefixes(lane: str) -> Tuple[str, ...]:
+    return (
+        f"{lane}_forensics_",
+        f"{lane}_alpha_event_",
+        f"{lane}_",
     )
 
 
-def lane_counter_delta(root: Dict[str, Any],
+def _micro_values(root: Dict[str, Any],
+                  frag: Dict[str, Any],
+                  forensic: Dict[str, Any],
+                  lane: str,
+                  *suffixes: str) -> List[Any]:
+    """Values from the compact TIMEBASE_FORENSICS micro raw-cycle schema.
+
+    Newer firmware emits flat fields directly under payload.forensics, e.g.
+    v_raw/v_ema/v_fl/v_pub, o1_fl_cyc, o2_fl_err.  The older parser only knew
+    how to look inside nested Alpha forensics, so these fields were present in
+    TIMEBASE but invisible to raw_cycles.
+    """
+    prefix = LANE_MICRO_PREFIXES.get(lane)
+    if not prefix:
+        return []
+
+    values: List[Any] = []
+    sources = (forensic, frag, root)
+    for suffix in suffixes:
+        key = f"{prefix}_{suffix}"
+        for source in sources:
+            if isinstance(source, dict):
+                values.append(source.get(key))
+    return values
+
+
+def _micro_first_int(root: Dict[str, Any],
+                     frag: Dict[str, Any],
+                     forensic: Dict[str, Any],
+                     lane: str,
+                     *suffixes: str) -> Optional[int]:
+    return _first_int(*_micro_values(root, frag, forensic, lane, *suffixes))
+
+
+def _micro_first_bool(root: Dict[str, Any],
+                      frag: Dict[str, Any],
+                      forensic: Dict[str, Any],
+                      lane: str,
+                      *suffixes: str) -> Optional[bool]:
+    return _first_bool(*_micro_values(root, frag, forensic, lane, *suffixes))
+
+
+def dwt_authority_diag(root: Dict[str, Any],
                        frag: Dict[str, Any],
                        forensic: Dict[str, Any],
-                       lane: str) -> Optional[int]:
-    f = lane_forensics_obj(root, frag, forensic, lane)
-    prefix = f"{lane}_forensics_"
-    return _first_int(
-        f.get("counter32_delta_since_previous_event"),
-        frag.get(prefix + "counter32_delta_since_previous_event"),
-        root.get(prefix + "counter32_delta_since_previous_event"),
-        frag.get(f"{lane}_counter32_delta_since_previous_event"),
-        root.get(f"{lane}_counter32_delta_since_previous_event"),
-    )
+                       lane: str) -> Dict[str, Any]:
+    f = lane_alpha_event(root, frag, forensic, lane)
+    a = f.get("dwt_authority") if isinstance(f.get("dwt_authority"), dict) else {}
 
+    def fi(name: str, *legacy: str) -> Optional[int]:
+        vals: List[Any] = [a.get(name), f.get(f"dwt_{name}")]
+        vals.extend(f.get(k) for k in legacy)
+        for prefix in _flat_prefixes(lane):
+            vals.append(frag.get(prefix + "dwt_" + name))
+            vals.append(root.get(prefix + "dwt_" + name))
+        return _first_int(*vals)
 
-def vclock_counter32_at_event(root: Dict[str, Any],
-                              frag: Dict[str, Any],
-                              forensic: Dict[str, Any]) -> Optional[int]:
-    f = lane_forensics_obj(root, frag, forensic, "vclock")
-    return _first_int(
-        f.get("last_event_counter32"),
-        _nested_get(frag, "vclock", "counter32_at_pps_vclock"),
-        frag.get("counter32_at_pps_vclock"),
-        forensic.get("counter32_at_pps_vclock"),
-        root.get("counter32_at_pps_vclock"),
-    )
+    def fb(name: str, *legacy: str) -> Optional[bool]:
+        vals: List[Any] = [a.get(name), f.get(f"dwt_{name}")]
+        vals.extend(f.get(k) for k in legacy)
+        for prefix in _flat_prefixes(lane):
+            vals.append(frag.get(prefix + "dwt_" + name))
+            vals.append(root.get(prefix + "dwt_" + name))
+        return _first_bool(*vals)
+
+    return {
+        "original_dwt": _first_int(
+            _micro_first_int(root, frag, forensic, lane, "raw", "orig"),
+            a.get("original_at_event"),
+            f.get("dwt_original_at_event"),
+            *[frag.get(prefix + "dwt_original_at_event") for prefix in _flat_prefixes(lane)],
+            *[root.get(prefix + "dwt_original_at_event") for prefix in _flat_prefixes(lane)],
+        ),
+        "used_dwt": _first_int(
+            _micro_first_int(root, frag, forensic, lane, "pub", "used"),
+            a.get("used_at_event"),
+            f.get("dwt_used_at_event"),
+            f.get("last_event_dwt"),
+            *[frag.get(prefix + "dwt_used_at_event") for prefix in _flat_prefixes(lane)],
+            *[root.get(prefix + "dwt_used_at_event") for prefix in _flat_prefixes(lane)],
+        ),
+        "predicted_dwt": _first_int(
+            _micro_first_int(root, frag, forensic, lane, "ema"),
+            a.get("predicted_at_event"),
+            f.get("dwt_predicted_at_event"),
+            *[frag.get(prefix + "dwt_predicted_at_event") for prefix in _flat_prefixes(lane)],
+            *[root.get(prefix + "dwt_predicted_at_event") for prefix in _flat_prefixes(lane)],
+        ),
+        "event_from_isr_entry_raw": _first_int(
+            a.get("event_from_isr_entry_raw"),
+            f.get("dwt_event_from_isr_entry_raw"),
+        ),
+        "synthetic": _first_bool(a.get("synthetic"), f.get("dwt_synthetic")),
+        "synthetic_error": _first_int(
+            a.get("synthetic_error_cycles"),
+            f.get("dwt_synthetic_error_cycles"),
+        ),
+        "published_minus_event_cycles": _first_int(
+            a.get("published_minus_event_cycles"),
+            f.get("dwt_published_minus_event_cycles"),
+        ),
+        "used_minus_event_cycles": _first_int(
+            a.get("used_minus_event_cycles"),
+            f.get("dwt_used_minus_event_cycles"),
+        ),
+    }
 
 
 def dwt_gate_diag(root: Dict[str, Any],
                   frag: Dict[str, Any],
                   forensic: Dict[str, Any],
                   lane: str) -> Dict[str, Any]:
-    f = lane_forensics_obj(root, frag, forensic, lane)
+    f = lane_alpha_event(root, frag, forensic, lane)
     gate = f.get("dwt_interval_gate") if isinstance(f.get("dwt_interval_gate"), dict) else {}
-    prefix = f"{lane}_forensics_"
 
-    return {
-        "valid": _first_bool(gate.get("valid"), f.get("dwt_interval_gate_valid"),
-                             frag.get(prefix + "dwt_interval_gate_valid"),
-                             root.get(prefix + "dwt_interval_gate_valid")),
-        "accepted": _first_bool(gate.get("accepted"), f.get("dwt_interval_sample_accepted"),
-                                frag.get(prefix + "dwt_interval_sample_accepted"),
-                                root.get(prefix + "dwt_interval_sample_accepted")),
-        "rejected": _first_bool(gate.get("rejected"), f.get("dwt_interval_sample_rejected"),
-                                frag.get(prefix + "dwt_interval_sample_rejected"),
-                                root.get(prefix + "dwt_interval_sample_rejected")),
-        "ema_updated": _first_bool(gate.get("ema_updated"), f.get("dwt_interval_ema_updated"),
-                                   frag.get(prefix + "dwt_interval_ema_updated"),
-                                   root.get(prefix + "dwt_interval_ema_updated")),
-        "observed_cycles": _first_int(gate.get("observed_cycles"), f.get("dwt_interval_observed_cycles"),
-                                      frag.get(prefix + "dwt_interval_observed_cycles"),
-                                      root.get(prefix + "dwt_interval_observed_cycles")),
-        "prediction_cycles": _first_int(gate.get("prediction_cycles"), f.get("dwt_interval_prediction_cycles"),
-                                        frag.get(prefix + "dwt_interval_prediction_cycles"),
-                                        root.get(prefix + "dwt_interval_prediction_cycles")),
-        "effective_cycles": _first_int(gate.get("effective_cycles"), f.get("dwt_interval_effective_cycles"),
-                                       frag.get(prefix + "dwt_interval_effective_cycles"),
-                                       root.get(prefix + "dwt_interval_effective_cycles")),
-        "residual_cycles": _first_int(gate.get("residual_cycles"), f.get("dwt_interval_residual_cycles"),
-                                      frag.get(prefix + "dwt_interval_residual_cycles"),
-                                      root.get(prefix + "dwt_interval_residual_cycles")),
-        "threshold_cycles": _first_int(gate.get("threshold_cycles"), f.get("dwt_interval_gate_threshold_cycles"),
-                                       frag.get(prefix + "dwt_interval_gate_threshold_cycles"),
-                                       root.get(prefix + "dwt_interval_gate_threshold_cycles")),
-        "accept_count": _first_int(gate.get("accept_count"), f.get("dwt_interval_accept_count"),
-                                   frag.get(prefix + "dwt_interval_accept_count"),
-                                   root.get(prefix + "dwt_interval_accept_count")),
-        "reject_count": _first_int(gate.get("reject_count"), f.get("dwt_interval_reject_count"),
-                                   frag.get(prefix + "dwt_interval_reject_count"),
-                                   root.get(prefix + "dwt_interval_reject_count")),
-        "resync_applied": _first_bool(gate.get("resync_applied"), f.get("dwt_interval_resync_applied"),
-                                      frag.get(prefix + "dwt_interval_resync_applied"),
-                                      root.get(prefix + "dwt_interval_resync_applied")),
-        "resync_count": _first_int(gate.get("resync_count"), f.get("dwt_interval_resync_count"),
-                                   frag.get(prefix + "dwt_interval_resync_count"),
-                                   root.get(prefix + "dwt_interval_resync_count")),
-        "reject_streak": _first_int(gate.get("reject_streak"), f.get("dwt_interval_reject_streak"),
-                                    frag.get(prefix + "dwt_interval_reject_streak"),
-                                    root.get(prefix + "dwt_interval_reject_streak")),
-        "synthetic": _first_bool(f.get("dwt_synthetic"),
-                                 frag.get(prefix + "dwt_synthetic"),
-                                 root.get(prefix + "dwt_synthetic")),
-        "synthetic_error": _first_int(f.get("dwt_synthetic_error_cycles"),
-                                      frag.get(prefix + "dwt_synthetic_error_cycles"),
-                                      root.get(prefix + "dwt_synthetic_error_cycles")),
-        "original_dwt": _first_int(f.get("dwt_original_at_event"),
-                                   frag.get(prefix + "dwt_original_at_event"),
-                                   root.get(prefix + "dwt_original_at_event")),
-        "used_dwt": _first_int(f.get("dwt_used_at_event"),
-                               frag.get(prefix + "dwt_used_at_event"),
-                               root.get(prefix + "dwt_used_at_event")),
-    }
+    values = {}
+    for name, direct in (
+        ("valid", "dwt_interval_gate_valid"),
+        ("accepted", "dwt_interval_sample_accepted"),
+        ("rejected", "dwt_interval_sample_rejected"),
+        ("ema_updated", "dwt_interval_ema_updated"),
+        ("resync_applied", "dwt_interval_resync_applied"),
+    ):
+        values[name] = _first_bool(gate.get(name), f.get(direct))
 
+    for name, direct in (
+        ("observed_cycles", "dwt_interval_observed_cycles"),
+        ("prediction_cycles", "dwt_interval_prediction_cycles"),
+        ("effective_cycles", "dwt_interval_effective_cycles"),
+        ("residual_cycles", "dwt_interval_residual_cycles"),
+        ("threshold_cycles", "dwt_interval_gate_threshold_cycles"),
+        ("accept_count", "dwt_interval_accept_count"),
+        ("reject_count", "dwt_interval_reject_count"),
+        ("resync_count", "dwt_interval_resync_count"),
+        ("reject_streak", "dwt_interval_reject_streak"),
+    ):
+        values[name] = _first_int(gate.get(name), f.get(direct))
 
-def adjacency_diag(root: Dict[str, Any],
-                   frag: Dict[str, Any],
-                   forensic: Dict[str, Any],
-                   lane: str) -> Dict[str, Any]:
-    f = lane_forensics_obj(root, frag, forensic, lane)
-    adj = f.get("dwt_interval_adjacency") if isinstance(f.get("dwt_interval_adjacency"), dict) else {}
-    prefix = f"{lane}_forensics_"
-
-    valid = _first_bool(
-        adj.get("valid"),
-        f.get("dwt_interval_adjacency_gate_valid"),
-        frag.get(prefix + "dwt_interval_adjacency_gate_valid"),
-        root.get(prefix + "dwt_interval_adjacency_gate_valid"),
+    values["observed_cycles"] = _first_int(
+        _micro_first_int(root, frag, forensic, lane, "obs", "raw_cyc"),
+        values.get("observed_cycles"),
     )
-    ok = _first_bool(
-        adj.get("ok"),
-        f.get("dwt_interval_adjacency_ok"),
-        frag.get(prefix + "dwt_interval_adjacency_ok"),
-        root.get(prefix + "dwt_interval_adjacency_ok"),
+    values["effective_cycles"] = _first_int(
+        _micro_first_int(root, frag, forensic, lane, "eff", "ema_cyc"),
+        values.get("effective_cycles"),
     )
-    rejected = _first_bool(
-        adj.get("rejected"),
-        f.get("dwt_interval_adjacency_rejected"),
-        frag.get(prefix + "dwt_interval_adjacency_rejected"),
-        root.get(prefix + "dwt_interval_adjacency_rejected"),
-    )
-    counter_delta = _first_int(
-        adj.get("counter_delta_ticks"),
-        f.get("dwt_interval_counter_delta_ticks"),
-        frag.get(prefix + "dwt_interval_counter_delta_ticks"),
-        root.get(prefix + "dwt_interval_counter_delta_ticks"),
-    )
-    expected = _first_int(
-        adj.get("expected_counter_delta_ticks"),
-        f.get("dwt_interval_expected_counter_delta_ticks"),
-        frag.get(prefix + "dwt_interval_expected_counter_delta_ticks"),
-        root.get(prefix + "dwt_interval_expected_counter_delta_ticks"),
-    )
-    reject_count = _first_int(
-        adj.get("reject_count"),
-        f.get("dwt_interval_adjacency_reject_count"),
-        frag.get(prefix + "dwt_interval_adjacency_reject_count"),
-        root.get(prefix + "dwt_interval_adjacency_reject_count"),
+    values["residual_cycles"] = _first_int(
+        _micro_first_int(root, frag, forensic, lane, "res"),
+        values.get("residual_cycles"),
     )
 
-    delta_error = (
-        counter_delta - expected
-        if counter_delta is not None and expected is not None
-        else None
-    )
-
-    return {
-        "valid": valid,
-        "ok": ok,
-        "rejected": rejected,
-        "counter_delta": counter_delta,
-        "expected": expected,
-        "delta_error": delta_error,
-        "reject_count": reject_count,
-    }
+    return values
 
 
-def adjacency_tag(adj: Dict[str, Any]) -> str:
-    if not adj.get("valid"):
-        return "---"
-    if adj.get("rejected"):
-        return "REJ"
-    if adj.get("ok"):
-        return "OK"
-    return "BAD"
+def regression_diag(root: Dict[str, Any],
+                    frag: Dict[str, Any],
+                    forensic: Dict[str, Any],
+                    lane: str) -> Dict[str, Any]:
+    """Extract FloorLine / lower-envelope diagnostics.
 
-
-def yardstick_diag(root: Dict[str, Any],
-                   frag: Dict[str, Any],
-                   forensic: Dict[str, Any],
-                   lane: str) -> Dict[str, Any]:
-    """Extract the PPS-Yardstick inference object for one OCXO lane.
-
-    Source of truth is TIMEBASE_FORENSICS lane forensics dwt_yardstick.
-    Flat-key fallbacks follow the house extraction convention so older or
-    transitional rows still render with --- rather than crashing.
+    The firmware still transports the lower-envelope result through historical
+    regression_* fields.  This function names it FloorLine at the report layer.
     """
-    f = lane_forensics_obj(root, frag, forensic, lane)
-    y = f.get("dwt_yardstick") if isinstance(f.get("dwt_yardstick"), dict) else {}
-    prefix = f"{lane}_forensics_dwt_yardstick_"
+    f = lane_alpha_event(root, frag, forensic, lane)
+    r = f.get("regression") if isinstance(f.get("regression"), dict) else {}
+
+    def ri(name: str, flat_name: str = "") -> Optional[int]:
+        key = flat_name or f"regression_{name}"
+        vals: List[Any] = [r.get(name), f.get(key)]
+        for prefix in _flat_prefixes(lane):
+            vals.append(frag.get(prefix + key))
+            vals.append(root.get(prefix + key))
+        return _first_int(*vals)
+
+    def rb(name: str, flat_name: str = "") -> Optional[bool]:
+        key = flat_name or f"regression_{name}"
+        vals: List[Any] = [r.get(name), f.get(key)]
+        for prefix in _flat_prefixes(lane):
+            vals.append(frag.get(prefix + key))
+            vals.append(root.get(prefix + key))
+        return _first_bool(*vals)
+
+    micro_fl_dwt = _micro_first_int(root, frag, forensic, lane, "fl")
+    micro_observed_dwt = _micro_first_int(root, frag, forensic, lane, "raw", "orig")
+    micro_fl_interval = _micro_first_int(root, frag, forensic, lane, "fl_cyc")
+    micro_observed_interval = _micro_first_int(root, frag, forensic, lane, "obs")
+    micro_fl_err = _micro_first_int(root, frag, forensic, lane, "fl_err")
+    micro_present = (
+        micro_fl_dwt is not None or
+        micro_fl_interval is not None or
+        micro_fl_err is not None
+    )
 
     return {
-        "valid": _first_bool(y.get("valid"), f.get("dwt_yardstick_valid"),
-                             frag.get(prefix + "valid"),
-                             root.get(prefix + "valid")),
-        "stale": _first_bool(y.get("stale"), f.get("dwt_yardstick_stale"),
-                             frag.get(prefix + "stale"),
-                             root.get(prefix + "stale")),
-        "seeded": _first_bool(y.get("seeded"), f.get("dwt_yardstick_seeded"),
-                              frag.get(prefix + "seeded"),
-                              root.get(prefix + "seeded")),
-        "excursion": _first_bool(y.get("excursion"), f.get("dwt_yardstick_excursion"),
-                                 frag.get(prefix + "excursion"),
-                                 root.get(prefix + "excursion")),
-        "pps_sequence": _first_int(y.get("pps_sequence"),
-                                   f.get("dwt_yardstick_pps_sequence")),
-        "pps_seq_delta": _first_int(y.get("pps_seq_delta"),
-                                    f.get("dwt_yardstick_pps_seq_delta")),
-        "g_now": _first_int(y.get("g_now_cycles"),
-                            f.get("dwt_yardstick_g_now_cycles")),
-        "g_prev": _first_int(y.get("g_prev_cycles"),
-                             f.get("dwt_yardstick_g_prev_cycles")),
-        "inferred": _first_int(y.get("inferred_interval_cycles"),
-                               f.get("dwt_yardstick_inferred_interval_cycles"),
-                               frag.get(prefix + "inferred_interval_cycles"),
-                               root.get(prefix + "inferred_interval_cycles")),
-        "observed": _first_int(y.get("observed_interval_cycles"),
-                               f.get("dwt_yardstick_observed_interval_cycles")),
-        "imo": _first_int(y.get("inferred_minus_observed_cycles"),
-                          f.get("dwt_yardstick_inferred_minus_observed_cycles"),
-                          frag.get(prefix + "inferred_minus_observed_cycles"),
-                          root.get(prefix + "inferred_minus_observed_cycles")),
-        "endpoint_dwt": _first_int(y.get("inferred_endpoint_dwt"),
-                                   f.get("dwt_yardstick_inferred_endpoint_dwt")),
-        "endpoint_frac_q16": _first_int(y.get("inferred_endpoint_frac_q16"),
-                                        f.get("dwt_yardstick_inferred_endpoint_frac_q16")),
-        "walk": _first_int(y.get("endpoint_minus_observed_cycles"),
-                           f.get("dwt_yardstick_endpoint_minus_observed_cycles"),
-                           frag.get(prefix + "endpoint_minus_observed_cycles"),
-                           root.get(prefix + "endpoint_minus_observed_cycles")),
-        "threshold": _first_int(y.get("gate_threshold_cycles"),
-                                f.get("dwt_yardstick_gate_threshold_cycles")),
-        "agree_count": _first_int(y.get("gate_agree_count"),
-                                  f.get("dwt_yardstick_gate_agree_count")),
-        "excursion_count": _first_int(y.get("gate_excursion_count"),
-                                      f.get("dwt_yardstick_gate_excursion_count")),
-        # Stage 2 anchored authority audit.
-        "authority": _first_bool(y.get("authority"),
-                                 f.get("dwt_yardstick_authority")),
-        "auth_endpoint_dwt": _first_int(y.get("auth_endpoint_dwt"),
-                                        f.get("dwt_yardstick_auth_endpoint_dwt")),
-        "auth_error": _first_int(y.get("auth_error_cycles"),
-                                 f.get("dwt_yardstick_auth_error_cycles")),
-        "anchor_applied": _first_bool(y.get("auth_anchor_applied"),
-                                      f.get("dwt_yardstick_auth_anchor_applied")),
+        "valid": _first_bool(rb("valid"), True if micro_present else None),
+        "sequence": ri("sequence"),
+        "sample_count": _first_int(ri("sample_count"), 1 if micro_present else None),
+        "observed_dwt": _first_int(micro_observed_dwt, ri("observed_dwt_at_event")),
+        "inferred_dwt": _first_int(micro_fl_dwt, ri("inferred_dwt_at_event")),
+        "inferred_interval_cycles": _first_int(micro_fl_interval),
+        "observed_interval_cycles": _first_int(micro_observed_interval),
+        "inferred_minus_observed": _first_int(micro_fl_err, ri("inferred_minus_observed_cycles")),
+        "target_counter32": ri("target_counter32_at_event"),
+        "target_hardware16": ri("target_hardware16_at_event"),
+        "observed_hardware16": ri("observed_hardware16_at_event"),
+        "fit_error_abs_gt4_count": ri("fit_error_abs_gt4_count"),
+        "fit_error_max_cycles": ri("fit_error_max_cycles"),
+        "fit_error_min_cycles": ri("fit_error_min_cycles"),
     }
 
 
-def yardstick_tag(y: Dict[str, Any]) -> str:
-    if not y.get("valid"):
-        return "---"
-    if y.get("seeded"):
-        return "SEED"
-    if y.get("excursion"):
-        return "EXC"
-    if y.get("stale"):
-        return "STAL"
-    return "OK"
+def lane_counter_delta(root: Dict[str, Any],
+                       frag: Dict[str, Any],
+                       forensic: Dict[str, Any],
+                       lane: str) -> Optional[int]:
+    f = lane_alpha_event(root, frag, forensic, lane)
+    return _first_int(
+        f.get("counter32_delta_since_previous_event"),
+        _nested_get(f, "dwt_interval_adjacency", "counter_delta_ticks"),
+        _nested_get(f, "ocxo_service", "last_counter_delta_ticks"),
+        frag.get(f"{lane}_forensics_counter32_delta_since_previous_event"),
+        root.get(f"{lane}_forensics_counter32_delta_since_previous_event"),
+        frag.get(f"{lane}_counter32_delta_since_previous_event"),
+        root.get(f"{lane}_counter32_delta_since_previous_event"),
+    )
 
 
-SLIP_REASON_NAMES = {
-    0: "none",
-    1: "first",
-    2: "ok",
-    3: "early",
-    4: "late",
-    5: "noop",
-    6: "clamp",
-}
-
-
-def slip_reason_name(code: Optional[int]) -> str:
-    if code is None:
-        return "---"
-    return SLIP_REASON_NAMES.get(int(code), str(code))
-
-
-def slip_diag(root: Dict[str, Any],
-              frag: Dict[str, Any],
-              forensic: Dict[str, Any],
-              lane: str) -> Dict[str, Any]:
-    """Extract compact SlipLedger forensic state for one lane.
-
-    Preferred source is TIMEBASE_FORENSICS.<lane>.forensics.slipledger, with
-    fallbacks to direct lane-forensics fields and older flat surfaces.  The
-    paired TIMEBASE row may intentionally omit inactive/zero SlipLedger objects,
-    so absence means "not published", not a parser failure.
-    """
-    f = lane_forensics_obj(root, frag, forensic, lane)
-    slip = f.get("slipledger") if isinstance(f.get("slipledger"), dict) else {}
-    prefix = f"{lane}_forensics_slipledger_"
-
-    def si(name: str, direct: str = "") -> Optional[int]:
-        return _first_int(
-            slip.get(name),
-            f.get(direct or f"slipledger_{name}"),
-            frag.get(prefix + name),
-            root.get(prefix + name),
-        )
-
-    def sb(name: str, direct: str = "") -> Optional[bool]:
-        return _first_bool(
-            slip.get(name),
-            f.get(direct or f"slipledger_{name}"),
-            frag.get(prefix + name),
-            root.get(prefix + name),
-        )
-
-    return {
-        "active": sb("active"),
-        "event_corrected": sb("event_corrected"),
-        "event_violation": sb("event_violation"),
-        "ticks": si("ticks"),
-        "event_ticks": si("event_ticks"),
-        "generation": si("generation"),
-        "observe_count": si("observe_count"),
-        "ok_count": si("ok_count"),
-        "violation_count": si("violation_count"),
-        "correction_count": si("correction_count"),
-        "noop_violation_count": si("noop_violation_count"),
-        "early_count": si("early_count"),
-        "late_count": si("late_count"),
-        "one_second_observe_count": si("one_second_observe_count"),
-        "one_second_ok_count": si("one_second_ok_count"),
-        "one_second_violation_count": si("one_second_violation_count"),
-        "one_second_correction_count": si("one_second_correction_count"),
-        "last_expected_dwt": si("last_expected_dwt"),
-        "last_observed_dwt": si("last_observed_dwt"),
-        "last_authored_dwt": si("last_authored_dwt"),
-        "last_expected_interval_cycles": si("last_expected_interval_cycles"),
-        "last_observed_interval_cycles": si("last_observed_interval_cycles"),
-        "last_dwt_error_cycles": si("last_dwt_error_cycles"),
-        "last_target_counter32": si("last_target_counter32"),
-        "last_hardware_target_low16": si("last_hardware_target_low16"),
-        "last_ambient_low16": si("last_ambient_low16"),
-        "last_tick_mod": si("last_tick_mod"),
-        "reason_code": si("reason_code"),
-        "last_correction_reason_code": si("last_correction_reason_code"),
-        "last_correction_ticks": si("last_correction_ticks"),
-        "last_correction_dwt_error_cycles": si("last_correction_dwt_error_cycles"),
-    }
-
-
-def _count_delta(now: Optional[int], prev: Optional[int]) -> Optional[int]:
-    if now is None:
-        return None
-    if prev is None:
-        return None
-    return now - prev
-
-
-def service_diag(root: Dict[str, Any],
-                 frag: Dict[str, Any],
-                 forensic: Dict[str, Any],
-                 lane: str) -> Dict[str, Optional[int]]:
-    service = lane_service_obj(root, frag, forensic, lane)
-    prefix = f"{lane}_forensics_"
-    return {
-        "service_class": _first_int(
-            service.get("class"),
-            service.get("service_class"),
-            frag.get(prefix + "service_class"),
-            root.get(prefix + "service_class"),
-        ),
-        "service_offset": _first_int(
-            service.get("offset_ticks"),
-            service.get("offset_signed_ticks"),
-            frag.get(prefix + "service_offset_ticks"),
-            root.get(prefix + "service_offset_ticks"),
-        ),
-        "arm_to_isr": _first_int(
-            service.get("arm_to_isr_ticks"),
-            frag.get(prefix + "arm_to_isr_ticks"),
-            root.get(prefix + "arm_to_isr_ticks"),
-        ),
-        "last_counter_delta": _first_int(
-            service.get("last_counter_delta_ticks"),
-            frag.get(prefix + "last_counter_delta_ticks"),
-            root.get(prefix + "last_counter_delta_ticks"),
-        ),
-    }
+def pps_count_from_schema(root: Dict[str, Any],
+                          frag: Dict[str, Any],
+                          forensic: Dict[str, Any]) -> Optional[int]:
+    return _first_int(
+        root.get("pps_count"),
+        frag.get("pps_count"),
+        forensic.get("pps_count"),
+        frag.get("teensy_pps_vclock_count"),
+        frag.get("teensy_pps_count"),
+    )
 
 
 def dwt_ppb_from_schema(root: Dict[str, Any], frag: Dict[str, Any]) -> Optional[float]:
@@ -801,219 +624,33 @@ def dwt_ppb_from_schema(root: Dict[str, Any], frag: Dict[str, Any]) -> Optional[
     )
 
 
-def service_class_short(service_class: Optional[int]) -> str:
-    if service_class == 1:
-        return "FIRQ"
-    if service_class == 2:
-        return "ERLY"
-    if service_class == 3:
-        return "OK"
-    if service_class == 0:
-        return "NONE"
-    return "---"
-
-
-def add_optional(w: Welford, v: Optional[int]) -> None:
-    if v is not None:
-        w.update(float(v))
-
-
-def add_optional_float(w: Welford, v: Optional[float]) -> None:
-    if v is not None:
-        w.update(float(v))
-
-
-def normalize_clock_filter(clock: Optional[str]) -> Optional[str]:
-    if clock is None:
-        return None
-    c = clock.strip().upper()
-    if c in ("V", "VC", "VCLOCK"):
-        return "VCLOCK"
-    if c in ("O1", "OCXO1"):
-        return "OCXO1"
-    if c in ("O2", "OCXO2"):
-        return "OCXO2"
-    raise ValueError(f"unknown clock '{clock}', expected VCLOCK, OCXO1, or OCXO2")
-
-
-def selected_clocks(clock_filter: Optional[str]) -> Tuple[str, ...]:
-    return CLOCKS if clock_filter is None else (clock_filter,)
-
-
-
-def _interval_delta(current: Optional[int], previous: Optional[int]) -> Optional[int]:
-    if current is None or previous is None:
-        return None
-    return current - previous
-
-
-def _lane_cycle_surfaces(gate: Dict[str, Any],
-                         pub_actual: Optional[int],
-                         pub_pred: Optional[int],
-                         pub_res: Optional[int]) -> Dict[str, Any]:
-    """Return the raw and EMA-published interval surfaces for one lane.
-
-    The key doctrine is that these are two different questions:
-
-      rawΔ : did the raw evidence interval change from the prior raw interval?
-      emaΔ : did the EMA-published interval change from the prior one?
-
-    (The yardstick surface is extracted separately by yardstick_diag; its
-    scorecard *_imo is firmware-computed, not derived here.)
-
-    Older rows may not expose dwt_interval_gate. In that case raw falls back
-    to the published/static surface so legacy reports still render.
-    """
-    gate_valid = bool(gate.get("valid"))
-
-    raw = gate.get("observed_cycles") if gate_valid else None
-    if raw is None:
-        raw = pub_actual
-
-    # Stage 2 authority note: the firmware static prediction surface
-    # (pub_actual) now carries the yardstick-published interval, so the EMA
-    # column must source from the EMA rail itself: dwt_interval_gate
-    # effective_cycles remains EMA-authored in every firmware version.
-    ema = gate.get("effective_cycles") if gate_valid else None
-    if ema is None:
-        ema = pub_actual
-    if ema is None and pub_pred is not None and pub_res is not None:
-        ema = pub_pred + pub_res
-
-    return {
-        "raw": raw,
-        "ema": ema,
-        "gate_valid": gate_valid,
-        "gate_accepted": gate.get("accepted"),
-        "gate_rejected": gate.get("rejected"),
-        "gate_reject_count": gate.get("reject_count"),
-        "gate_resync_applied": gate.get("resync_applied"),
-        "synthetic": gate.get("synthetic"),
-        "synthetic_error": gate.get("synthetic_error"),
-    }
-
-def _headers_for(clock_filter: Optional[str]) -> Tuple[str, str]:
-    parts = [
-        f"{'pps':>6s}",
-        f"{'p_pred':>13s}",
-        f"{'p_act':>13s}",
-        f"{'p_Δ':>8s}",
-    ]
-
-    if clock_filter is None or clock_filter == "VCLOCK":
-        parts.extend([
-            f"{'v_raw':>13s}",
-            f"{'v_rawΔ':>8s}",
-            f"{'v_ema':>13s}",
-            f"{'v_emaΔ':>8s}",
-            f"{'phase':>5s}",
-            f"{'v_cΔ':>11s}",
-        ])
-
-    for lane in ("OCXO1", "OCXO2"):
-        if clock_filter is not None and clock_filter != lane:
-            continue
-        prefix = "o1" if lane == "OCXO1" else "o2"
-        parts.extend([
-            f"{prefix + '_raw':>13s}",
-            f"{prefix + '_rawΔ':>8s}",
-            f"{prefix + '_ema':>13s}",
-            f"{prefix + '_emaΔ':>8s}",
-            f"{prefix + '_inferred':>13s}",
-            f"{prefix + '_imo':>7s}",
-            f"{prefix + '_aerr':>7s}",
-            f"{prefix + '_walk':>8s}",
-            f"{prefix + '_y':>5s}",
-            f"{prefix + '_cΔ':>11s}",
-        ])
-
-    parts.append(f"{'dwt_ppb':>10s}")
-    header = "  ".join(parts)
-    sep = "  ".join("─" * len(p) for p in parts)
-    return header, sep
-
-def _row_line(row: Dict[str, Any], clock_filter: Optional[str]) -> str:
-    parts = [
-        f"{row['pps_count']:>6d}",
-        _fmt_int(row["pps_pred"], 13),
-        _fmt_int(row["pps_actual"], 13),
-        _fmt_int(row["pps_delta"], 8, signed=True),
-    ]
-
-    if clock_filter is None or clock_filter == "VCLOCK":
-        parts.extend([
-            _fmt_int(row["v_raw"], 13),
-            _fmt_int(row["v_raw_delta"], 8, signed=True),
-            _fmt_int(row["v_ema"], 13),
-            _fmt_int(row["v_ema_delta"], 8, signed=True),
-            _fmt_int(row["phase"], 5),
-            _fmt_int(row["v_cdelta"], 11),
-        ])
-
-    for lane in ("OCXO1", "OCXO2"):
-        if clock_filter is not None and clock_filter != lane:
-            continue
-        key = "o1" if lane == "OCXO1" else "o2"
-        data = row[key]
-        parts.extend([
-            _fmt_int(data["raw"], 13),
-            _fmt_int(data["raw_delta"], 8, signed=True),
-            _fmt_int(data["ema"], 13),
-            _fmt_int(data["ema_delta"], 8, signed=True),
-            _fmt_int(data["inferred"], 13),
-            _fmt_int(data["imo"], 7, signed=True),
-            _fmt_int(data["aerr"], 7, signed=True),
-            _fmt_int(data["walk"], 8, signed=True),
-            _fmt_str(data["y_tag"], 5),
-            _fmt_int(data["counter_delta"], 11),
-        ])
-
-    parts.append(_fmt_float(row["dwt_ppb"], 10, 3, signed=True))
-    return "  ".join(parts)
-
 def collect_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]:
     out: List[Dict[str, Any]] = []
     gaps = 0
 
     prev_pps_count: Optional[int] = None
-    prev_physical_pps_dwt: Optional[int] = None
-    prev_vclock_dwt: Optional[int] = None
-    prev_vclock_counter32: Optional[int] = None
-
+    prev_pps_dwt: Optional[int] = None
     prev_pps_interval: Optional[int] = None
-    prev_raw_interval: Dict[str, Optional[int]] = {
-        "vclock": None,
-        "ocxo1": None,
-        "ocxo2": None,
+    prev_lane_dwt: Dict[str, Dict[str, Optional[int]]] = {
+        lane: {"raw": None, "ema": None, "fl": None, "pub": None}
+        for lane in CLOCKS
     }
-    prev_ema_interval: Dict[str, Optional[int]] = {
-        "vclock": None,
-        "ocxo1": None,
-        "ocxo2": None,
-    }
-    prev_slip_counts: Dict[str, Dict[str, Optional[int]]] = {
-        "ocxo1": {},
-        "ocxo2": {},
-    }
-    prev_slip_dwt: Dict[str, Dict[str, Optional[int]]] = {
-        "ocxo1": {"observed": None, "authored": None},
-        "ocxo2": {"observed": None, "authored": None},
+    prev_lane_interval: Dict[str, Dict[str, Optional[int]]] = {
+        lane: {"raw": None, "ema": None, "fl": None, "pub": None}
+        for lane in CLOCKS
     }
 
     def reset_deltas_after_gap() -> None:
-        nonlocal prev_physical_pps_dwt, prev_vclock_dwt, prev_vclock_counter32
-        nonlocal prev_pps_interval, prev_raw_interval, prev_ema_interval
-        nonlocal prev_slip_counts, prev_slip_dwt
-        prev_physical_pps_dwt = None
-        prev_vclock_dwt = None
-        prev_vclock_counter32 = None
+        nonlocal prev_pps_dwt, prev_pps_interval, prev_lane_dwt, prev_lane_interval
+        prev_pps_dwt = None
         prev_pps_interval = None
-        prev_raw_interval = {"vclock": None, "ocxo1": None, "ocxo2": None}
-        prev_ema_interval = {"vclock": None, "ocxo1": None, "ocxo2": None}
-        prev_slip_counts = {"ocxo1": {}, "ocxo2": {}}
-        prev_slip_dwt = {
-            "ocxo1": {"observed": None, "authored": None},
-            "ocxo2": {"observed": None, "authored": None},
+        prev_lane_dwt = {
+            lane: {"raw": None, "ema": None, "fl": None, "pub": None}
+            for lane in CLOCKS
+        }
+        prev_lane_interval = {
+            lane: {"raw": None, "ema": None, "fl": None, "pub": None}
+            for lane in CLOCKS
         }
 
     for rec in rows:
@@ -1022,13 +659,7 @@ def collect_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]
         forensic = _forensics_root(rec)
         pred = _prediction(frag)
 
-        pps_count = _first_int(
-            root.get("pps_count"),
-            frag.get("pps_count"),
-            forensic.get("pps_count"),
-            frag.get("teensy_pps_vclock_count"),
-            frag.get("teensy_pps_count"),
-        )
+        pps_count = pps_count_from_schema(root, frag, forensic)
         if pps_count is None:
             continue
 
@@ -1036,452 +667,296 @@ def collect_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]
             gaps += 1
             reset_deltas_after_gap()
 
-        physical_pps_dwt = physical_pps_dwt_from_schema(root, frag, forensic)
-        vclock_dwt, _ = vclock_preferred_dwt_from_schema(root, frag, forensic)
-
-        phase = pps_vclock_phase_cycles_from_schema(root, frag, forensic)
-        if phase is None and physical_pps_dwt is not None and vclock_dwt is not None:
-            phase = abs(_signed_delta_u32(vclock_dwt, physical_pps_dwt))
-
-        pps_actual, pps_pred, pps_static_res = lane_prediction(frag, pred, "pps")
-        v_pub_actual, v_pub_pred, _v_pub_res = lane_prediction(frag, pred, "vclock")
-        o1_pub_actual, o1_pub_pred, _o1_pub_res = lane_prediction(frag, pred, "ocxo1")
-        o2_pub_actual, o2_pub_pred, _o2_pub_res = lane_prediction(frag, pred, "ocxo2")
-
-        if pps_actual is None and physical_pps_dwt is not None and prev_physical_pps_dwt is not None:
-            pps_actual = _delta_u32(physical_pps_dwt, prev_physical_pps_dwt)
+        pps_dwt = physical_pps_dwt_from_schema(root, frag, forensic)
+        pps_actual, pps_pred, _pps_residual = lane_prediction(frag, pred, "pps")
+        if pps_actual is None:
+            pps_actual = _interval_from_endpoints(pps_dwt, prev_pps_dwt)
         pps_delta = _interval_delta(pps_actual, prev_pps_interval)
 
-        v_gate = dwt_gate_diag(root, frag, forensic, "vclock")
-        v_surface = _lane_cycle_surfaces(v_gate, v_pub_actual, v_pub_pred, _v_pub_res)
-        v_raw_delta = _interval_delta(v_surface["raw"], prev_raw_interval["vclock"])
-        v_ema_delta = _interval_delta(v_surface["ema"], prev_ema_interval["vclock"])
-
-        vclock_event_counter32 = vclock_counter32_at_event(root, frag, forensic)
-        v_cdelta = lane_counter_delta(root, frag, forensic, "vclock")
-        if v_cdelta is None and vclock_event_counter32 is not None and prev_vclock_counter32 is not None:
-            v_cdelta = _delta_u32(vclock_event_counter32, prev_vclock_counter32)
-
-        def lane_data(lane_name: str,
-                      pub_actual: Optional[int],
-                      pub_pred: Optional[int],
-                      pub_res: Optional[int]) -> Dict[str, Any]:
-            gate = dwt_gate_diag(root, frag, forensic, lane_name)
-            adj = adjacency_diag(root, frag, forensic, lane_name)
-            svc = service_diag(root, frag, forensic, lane_name)
-            yard = yardstick_diag(root, frag, forensic, lane_name)
-            slip = slip_diag(root, frag, forensic, lane_name)
-            cdelta = lane_counter_delta(root, frag, forensic, lane_name)
-            if cdelta is None:
-                cdelta = svc.get("last_counter_delta")
-
-            surface = _lane_cycle_surfaces(gate, pub_actual, pub_pred, pub_res)
-            raw_delta = _interval_delta(surface["raw"], prev_raw_interval[lane_name])
-            ema_delta = _interval_delta(surface["ema"], prev_ema_interval[lane_name])
-
-            # Firmware-computed scorecards; fall back to local arithmetic only
-            # when the firmware surface is present but a field is missing.
-            imo = yard.get("imo")
-            if imo is None and yard.get("inferred") is not None and surface["raw"] is not None:
-                imo = yard["inferred"] - surface["raw"]
-
-            # Derived side-by-side error: EMA published interval minus raw
-            # evidence interval, the direct competitor of imo.
-            emo = (
-                surface["ema"] - surface["raw"]
-                if surface["ema"] is not None and surface["raw"] is not None
-                else None
-            )
-
-            prev_counts = prev_slip_counts.get(lane_name, {})
-            slip_violation_delta = _count_delta(slip.get("violation_count"),
-                                                prev_counts.get("violation_count"))
-            slip_correction_delta = _count_delta(slip.get("correction_count"),
-                                                 prev_counts.get("correction_count"))
-            slip_early_delta = _count_delta(slip.get("early_count"),
-                                            prev_counts.get("early_count"))
-            slip_late_delta = _count_delta(slip.get("late_count"),
-                                           prev_counts.get("late_count"))
-            slip_one_second_correction_delta = _count_delta(
-                slip.get("one_second_correction_count"),
-                prev_counts.get("one_second_correction_count"),
-            )
-            slip_generation_delta = _count_delta(slip.get("generation"),
-                                                 prev_counts.get("generation"))
-
-            prev_dwt = prev_slip_dwt.get(lane_name, {})
-            slip_observed_interval = _interval_delta(slip.get("last_observed_dwt"),
-                                                     prev_dwt.get("observed"))
-            slip_authored_interval = _interval_delta(slip.get("last_authored_dwt"),
-                                                     prev_dwt.get("authored"))
-            slip_auth_minus_obs = (
-                slip.get("last_authored_dwt") - slip.get("last_observed_dwt")
-                if slip.get("last_authored_dwt") is not None and
-                   slip.get("last_observed_dwt") is not None
-                else None
-            )
-
-            return {
-                "raw": surface["raw"],
-                "raw_delta": raw_delta,
-                "ema": surface["ema"],
-                "ema_delta": ema_delta,
-                "emo": emo,
-                "inferred": yard.get("inferred"),
-                "imo": imo,
-                "aerr": yard.get("auth_error"),
-                "authority": yard.get("authority"),
-                "anchor_applied": yard.get("anchor_applied"),
-                "walk": yard.get("walk"),
-                "y_tag": yardstick_tag(yard),
-                "y_valid": yard.get("valid"),
-                "y_stale": yard.get("stale"),
-                "y_seeded": yard.get("seeded"),
-                "y_excursion": yard.get("excursion"),
-                "y_agree_count": yard.get("agree_count"),
-                "y_excursion_count": yard.get("excursion_count"),
-                "y_threshold": yard.get("threshold"),
-                "y_pps_seq_delta": yard.get("pps_seq_delta"),
-                "slip": slip,
-                "slip_active": slip.get("active"),
-                "slip_event_corrected": slip.get("event_corrected"),
-                "slip_event_violation": slip.get("event_violation"),
-                "slip_ticks": slip.get("ticks"),
-                "slip_event_ticks": slip.get("event_ticks"),
-                "slip_generation": slip.get("generation"),
-                "slip_generation_delta": slip_generation_delta,
-                "slip_violation_count": slip.get("violation_count"),
-                "slip_violation_delta": slip_violation_delta,
-                "slip_correction_count": slip.get("correction_count"),
-                "slip_correction_delta": slip_correction_delta,
-                "slip_early_count": slip.get("early_count"),
-                "slip_early_delta": slip_early_delta,
-                "slip_late_count": slip.get("late_count"),
-                "slip_late_delta": slip_late_delta,
-                "slip_one_second_correction_delta": slip_one_second_correction_delta,
-                "slip_last_dwt_error_cycles": slip.get("last_dwt_error_cycles"),
-                "slip_last_correction_ticks": slip.get("last_correction_ticks"),
-                "slip_last_correction_dwt_error_cycles": slip.get("last_correction_dwt_error_cycles"),
-                "slip_reason_code": slip.get("reason_code"),
-                "slip_reason": slip_reason_name(slip.get("reason_code")),
-                "slip_last_correction_reason": slip_reason_name(
-                    slip.get("last_correction_reason_code")
-                ),
-                "slip_observed_interval": slip_observed_interval,
-                "slip_authored_interval": slip_authored_interval,
-                "slip_authored_minus_observed_dwt": slip_auth_minus_obs,
-                "gate_valid": surface["gate_valid"],
-                "gate_accepted": surface["gate_accepted"],
-                "gate_rejected": surface["gate_rejected"],
-                "gate_reject_count": surface["gate_reject_count"],
-                "gate_resync_applied": surface["gate_resync_applied"],
-                "synthetic": surface["synthetic"],
-                "synthetic_error": surface["synthetic_error"],
-                "adj_valid": adj["valid"],
-                "adj_rejected": adj["rejected"],
-                "adj_reject_count": adj["reject_count"],
-                "service_class": svc["service_class"],
-                "counter_delta": cdelta,
-            }
-
-        o1 = lane_data("ocxo1", o1_pub_actual, o1_pub_pred, _o1_pub_res)
-        o2 = lane_data("ocxo2", o2_pub_actual, o2_pub_pred, _o2_pub_res)
-
-        out.append({
+        row: Dict[str, Any] = {
             "pps_count": pps_count,
             "pps_actual": pps_actual,
-            "pps_pred": pps_pred,
             "pps_delta": pps_delta,
-            "phase": phase,
-            "v_raw": v_surface["raw"],
-            "v_raw_delta": v_raw_delta,
-            "v_ema": v_surface["ema"],
-            "v_ema_delta": v_ema_delta,
-            "v_gate_valid": v_surface["gate_valid"],
-            "v_gate_accepted": v_surface["gate_accepted"],
-            "v_gate_rejected": v_surface["gate_rejected"],
-            "v_gate_reject_count": v_surface["gate_reject_count"],
-            "v_cdelta": v_cdelta,
-            "o1": o1,
-            "o2": o2,
             "dwt_ppb": dwt_ppb_from_schema(root, frag),
-        })
+            "lanes": {},
+        }
+
+        for lane in CLOCKS:
+            lane_key = LANE_KEYS[lane]
+            pub_actual, _pub_pred, _pub_res = lane_prediction(frag, pred, lane_key)
+            f = lane_alpha_event(root, frag, forensic, lane_key)
+            auth = dwt_authority_diag(root, frag, forensic, lane_key)
+            gate = dwt_gate_diag(root, frag, forensic, lane_key)
+            fl = regression_diag(root, frag, forensic, lane_key)
+
+            original_dwt = auth["original_dwt"]
+            used_dwt = auth["used_dwt"]
+            predicted_dwt = auth["predicted_dwt"]
+            fl_observed_dwt = fl["observed_dwt"]
+            fl_inferred_dwt = fl["inferred_dwt"]
+
+            raw_interval = gate.get("observed_cycles")
+            if raw_interval is None:
+                raw_interval = _interval_from_endpoints(original_dwt, prev_lane_dwt[lane]["raw"])
+            if raw_interval is None:
+                raw_interval = _interval_from_endpoints(fl_observed_dwt, prev_lane_dwt[lane]["raw"])
+            if raw_interval is None:
+                raw_interval = pub_actual
+
+            ema_interval = gate.get("effective_cycles")
+            if ema_interval is None:
+                # In many builds predicted_dwt is the EMA/predictor endpoint.
+                ema_interval = _interval_from_endpoints(predicted_dwt, prev_lane_dwt[lane]["ema"])
+            if ema_interval is None and pub_actual is not None and fl_inferred_dwt is None:
+                # Old baselines were EMA-published, so the published interval
+                # is the best EMA surface available.
+                ema_interval = pub_actual
+
+            fl_interval = fl.get("inferred_interval_cycles")
+            if fl_interval is None:
+                fl_interval = _interval_from_endpoints(fl_inferred_dwt, prev_lane_dwt[lane]["fl"])
+
+            pub_interval = _interval_from_endpoints(used_dwt, prev_lane_dwt[lane]["pub"])
+            if pub_interval is None and used_dwt is not None:
+                # The micro schema gives endpoint candidates plus per-algorithm
+                # intervals.  When the published endpoint equals one candidate,
+                # use that candidate's interval even on the first printed row.
+                if (
+                    fl_inferred_dwt is not None and
+                    used_dwt == fl_inferred_dwt and
+                    fl_interval is not None
+                ):
+                    pub_interval = fl_interval
+                elif (
+                    predicted_dwt is not None and
+                    used_dwt == predicted_dwt and
+                    ema_interval is not None
+                ):
+                    pub_interval = ema_interval
+                elif (
+                    original_dwt is not None and
+                    used_dwt == original_dwt and
+                    raw_interval is not None
+                ):
+                    pub_interval = raw_interval
+            if pub_interval is None:
+                pub_interval = _first_int(
+                    f.get("dwt_cycles_between_edges"),
+                    pub_actual,
+                )
+
+            data = {
+                "raw": raw_interval,
+                "raw_delta": _interval_delta(raw_interval, prev_lane_interval[lane]["raw"]),
+                "ema": ema_interval,
+                "ema_delta": _interval_delta(ema_interval, prev_lane_interval[lane]["ema"]),
+                "fl": fl_interval,
+                "fl_delta": _interval_delta(fl_interval, prev_lane_interval[lane]["fl"]),
+                "pub": pub_interval,
+                "pub_delta": _interval_delta(pub_interval, prev_lane_interval[lane]["pub"]),
+                "fl_minus_raw": (
+                    fl_interval - raw_interval
+                    if fl_interval is not None and raw_interval is not None
+                    else None
+                ),
+                "pub_minus_raw": (
+                    pub_interval - raw_interval
+                    if pub_interval is not None and raw_interval is not None
+                    else None
+                ),
+                "ema_minus_raw": (
+                    ema_interval - raw_interval
+                    if ema_interval is not None and raw_interval is not None
+                    else None
+                ),
+                "counter_delta": lane_counter_delta(root, frag, forensic, lane_key),
+                "fl_edge_minus_observed": fl.get("inferred_minus_observed"),
+                "fl_sample_count": fl.get("sample_count"),
+                "fl_valid": fl.get("valid"),
+                "pub_synthetic": auth.get("synthetic"),
+                "pub_used_dwt": used_dwt,
+                "raw_dwt": _first_int(original_dwt, fl_observed_dwt),
+                "ema_dwt": predicted_dwt,
+                "fl_dwt": fl_inferred_dwt,
+            }
+            row["lanes"][lane] = data
+
+            for algo in ("raw", "ema", "fl", "pub"):
+                if data[algo] is not None:
+                    prev_lane_interval[lane][algo] = data[algo]
+
+            if original_dwt is not None:
+                prev_lane_dwt[lane]["raw"] = original_dwt
+            elif fl_observed_dwt is not None:
+                prev_lane_dwt[lane]["raw"] = fl_observed_dwt
+
+            if predicted_dwt is not None:
+                prev_lane_dwt[lane]["ema"] = predicted_dwt
+            elif ema_interval is not None and prev_lane_dwt[lane]["ema"] is None:
+                # Keep the key initialized for older baselines without
+                # endpoint-level EMA data; no endpoint delta will be derived.
+                prev_lane_dwt[lane]["ema"] = None
+
+            if fl_inferred_dwt is not None:
+                prev_lane_dwt[lane]["fl"] = fl_inferred_dwt
+            if used_dwt is not None:
+                prev_lane_dwt[lane]["pub"] = used_dwt
+
+        out.append(row)
 
         prev_pps_count = pps_count
-        if physical_pps_dwt is not None:
-            prev_physical_pps_dwt = physical_pps_dwt
-        if vclock_dwt is not None:
-            prev_vclock_dwt = vclock_dwt
-        if vclock_event_counter32 is not None:
-            prev_vclock_counter32 = vclock_event_counter32
+        if pps_dwt is not None:
+            prev_pps_dwt = pps_dwt
         if pps_actual is not None:
             prev_pps_interval = pps_actual
 
-        if v_surface["raw"] is not None:
-            prev_raw_interval["vclock"] = v_surface["raw"]
-        if v_surface["ema"] is not None:
-            prev_ema_interval["vclock"] = v_surface["ema"]
-        for lane_name, data in (("ocxo1", o1), ("ocxo2", o2)):
-            if data["raw"] is not None:
-                prev_raw_interval[lane_name] = data["raw"]
-            if data["ema"] is not None:
-                prev_ema_interval[lane_name] = data["ema"]
-
-            slip = data.get("slip", {})
-            prev_slip_counts[lane_name] = {
-                "violation_count": slip.get("violation_count"),
-                "correction_count": slip.get("correction_count"),
-                "early_count": slip.get("early_count"),
-                "late_count": slip.get("late_count"),
-                "one_second_correction_count": slip.get("one_second_correction_count"),
-                "generation": slip.get("generation"),
-            }
-            prev_slip_dwt[lane_name] = {
-                "observed": slip.get("last_observed_dwt"),
-                "authored": slip.get("last_authored_dwt"),
-            }
-
     return out, gaps
 
-def _residual_hit(*values: Optional[int]) -> bool:
-    return any(v is not None and abs(v) >= EXCURSION_THRESHOLD_CYCLES for v in values)
+
+def available_columns(collected: List[Dict[str, Any]],
+                      clocks: Tuple[str, ...]) -> Dict[str, List[str]]:
+    # The four algorithm rails are the purpose of this report.  Keep them
+    # visible even when the current campaign/build does not expose one of the
+    # rails yet; otherwise a missing FloorLine extraction looks like a report
+    # formatting decision instead of useful evidence.
+    always = [
+        "raw", "raw_delta",
+        "ema", "ema_delta",
+        "fl", "fl_delta",
+        "pub", "pub_delta",
+        "fl_minus_raw", "pub_minus_raw",
+    ]
+    optional = ["counter_delta"]
+
+    out: Dict[str, List[str]] = {}
+    for lane in clocks:
+        cols = list(always)
+        for col in optional:
+            if any(row["lanes"][lane].get(col) is not None for row in collected):
+                cols.append(col)
+        out[lane] = cols
+    return out
 
 
-# Zero-worthiness policy candidates: (max |aerr| per second, max |window sum|).
-# The firmware window length is fixed at 8 seconds; the firmware additionally
-# excludes anchor fast-lock (acquisition gain) seconds, which TIMEBASE rows
-# cannot see, so simulated readiness is slightly OPTIMISTIC near restarts.
-ZW_POLICY_CANDIDATES: List[Tuple[int, int]] = [
-    (6, 24), (8, 32), (10, 40), (12, 48), (16, 64),
-]
-ZW_POLICY_WINDOW_SECONDS = 8
+def _col_label(lane: str, col: str) -> str:
+    p = PREFIXES[lane]
+    return {
+        "raw": f"{p}_raw",
+        "raw_delta": f"{p}_rawΔ",
+        "ema": f"{p}_ema",
+        "ema_delta": f"{p}_emaΔ",
+        "fl": f"{p}_fl",
+        "fl_delta": f"{p}_flΔ",
+        "pub": f"{p}_pub",
+        "pub_delta": f"{p}_pubΔ",
+        "fl_minus_raw": f"{p}_f-r",
+        "pub_minus_raw": f"{p}_p-r",
+        "counter_delta": f"{p}_cΔ",
+    }[col]
 
 
-def _simulate_zero_worthy(seq: List[Tuple[str, Optional[int]]],
-                          max_abs_err: int,
-                          max_abs_sum: int) -> Tuple[int, int, Optional[int]]:
-    """Replay the firmware zero-worthiness verdict over (y_tag, aerr) rows.
-
-    A second is clean when the yardstick tag is OK and |aerr| is within the
-    magnitude bound; any other second empties the window.  Worthy requires a
-    full window with |sum| within the sum bound.  Returns (worthy_seconds,
-    max_worthy_streak, first_worthy_row_index_1_based).
-    """
-    ring: List[int] = []
-    worthy_seconds = 0
-    streak = 0
-    max_streak = 0
-    first: Optional[int] = None
-    for i, (tag, aerr) in enumerate(seq, start=1):
-        clean = tag == "OK" and aerr is not None and abs(int(aerr)) <= max_abs_err
-        if not clean:
-            ring.clear()
-            streak = 0
-            continue
-        ring.append(int(aerr))
-        if len(ring) > ZW_POLICY_WINDOW_SECONDS:
-            ring.pop(0)
-        worthy = (len(ring) == ZW_POLICY_WINDOW_SECONDS and
-                  abs(sum(ring)) <= max_abs_sum)
-        if worthy:
-            worthy_seconds += 1
-            streak += 1
-            if streak > max_streak:
-                max_streak = streak
-            if first is None:
-                first = i
-        else:
-            streak = 0
-    return worthy_seconds, max_streak, first
+def _col_width(col: str) -> int:
+    return {
+        "raw": 13,
+        "raw_delta": 8,
+        "ema": 13,
+        "ema_delta": 8,
+        "fl": 13,
+        "fl_delta": 8,
+        "pub": 13,
+        "pub_delta": 8,
+        "fl_minus_raw": 7,
+        "pub_minus_raw": 7,
+        "counter_delta": 11,
+    }[col]
 
 
-def _walk_slope_cycles_per_second(samples: List[Tuple[int, int]]) -> Optional[float]:
-    """Least-squares slope of chain walk vs pps_count, in cycles/second.
-
-    samples are (pps_count, walk_cycles) pairs from rows where the yardstick
-    rail was valid.  The slope is the campaign-scale chain-walk rate: the
-    decisive Stage 2/3 anchor-policy datum.
-    """
-    n = len(samples)
-    if n < 2:
-        return None
-    mean_x = sum(x for x, _ in samples) / n
-    mean_y = sum(y for _, y in samples) / n
-    sxx = sum((x - mean_x) ** 2 for x, _ in samples)
-    if sxx == 0:
-        return None
-    sxy = sum((x - mean_x) * (y - mean_y) for x, y in samples)
-    return sxy / sxx
+def _col_signed(col: str) -> bool:
+    return col in ("raw_delta", "ema_delta", "fl_delta", "pub_delta",
+                   "fl_minus_raw", "pub_minus_raw")
 
 
-def _slip_hit(d: Dict[str, Any]) -> bool:
-    return any((d.get(k) or 0) != 0 for k in (
-        "slip_violation_delta",
-        "slip_correction_delta",
-        "slip_early_delta",
-        "slip_late_delta",
-        "slip_generation_delta",
-        "slip_one_second_correction_delta",
-    )) or bool(d.get("slip_event_corrected")) or bool(d.get("slip_event_violation"))
+def _headers_for(clocks: Tuple[str, ...],
+                 cols: Dict[str, List[str]],
+                 include_dwt_ppb: bool) -> Tuple[str, str]:
+    parts = [
+        f"{'pps':>6s}",
+        f"{'p_act':>13s}",
+        f"{'p_Δ':>8s}",
+    ]
+    for lane in clocks:
+        for col in cols[lane]:
+            label = _col_label(lane, col)
+            parts.append(f"{label:>{_col_width(col)}s}")
+    if include_dwt_ppb:
+        parts.append(f"{'dwt_ppb':>10s}")
+    return "  ".join(parts), "  ".join("─" * len(p) for p in parts)
 
 
-def _print_slip_rows(collected: List[Dict[str, Any]],
-                     campaign: str,
-                     gaps: int,
-                     clock_filter: Optional[str]) -> None:
-    lanes = (("o1", "OCXO1"), ("o2", "OCXO2"))
-    if clock_filter == "OCXO1":
-        lanes = (("o1", "OCXO1"),)
-    elif clock_filter == "OCXO2":
-        lanes = (("o2", "OCXO2"),)
-
-    print(f"Campaign: {campaign}  ({len(collected):,} rows shown, view=SLIP)")
-    print()
-    print("Slip-aware raw cycles — hardware edge pathology courtroom")
-    print("══════════════════════════════════════════════════════════")
-    print("  corrΔ/violΔ/earlyΔ/lateΔ are per-row deltas of cumulative SlipLedger counters.")
-    print("  Negative err cycles + earlyΔ/corrΔ is the signature of a fast/early edge.")
-    print("  obs/auth intervals compare the observed DWT rail to the authored/purified rail.")
-    print("  y is the independent PPS-Yardstick tag; cΔ is one-second counter lineage.")
-    print()
-
-    h = (
-        f"{'pps':>6s} {'lane':>5s} {'raw':>13s} {'rawΔ':>8s} "
-        f"{'obsInt':>9s} {'authInt':>9s} {'auth-obs':>9s} "
-        f"{'err':>8s} {'corrΔ':>6s} {'violΔ':>6s} {'earlyΔ':>7s} {'lateΔ':>6s} "
-        f"{'1sCΔ':>6s} {'ticks':>8s} {'evtTk':>7s} {'reason':>7s} "
-        f"{'y':>5s} {'imo':>7s} {'cΔ':>11s} {'p_Δ':>8s} {'vrawΔ':>8s}"
-    )
-    print(h)
-    print("─" * len(h))
-
-    totals: Dict[str, Dict[str, int]] = {label: {
-        "corrections": 0, "violations": 0, "early": 0, "late": 0,
-        "one_second_corrections": 0, "rows_with_activity": 0,
-    } for _, label in lanes}
-
-    activity: List[Tuple[int, str, Dict[str, Any], Dict[str, Any]]] = []
-    for row in collected:
-        for key, label in lanes:
-            d = row[key]
-            if _slip_hit(d):
-                activity.append((row["pps_count"], label, row, d))
-                totals[label]["rows_with_activity"] += 1
-            totals[label]["corrections"] += d.get("slip_correction_delta") or 0
-            totals[label]["violations"] += d.get("slip_violation_delta") or 0
-            totals[label]["early"] += d.get("slip_early_delta") or 0
-            totals[label]["late"] += d.get("slip_late_delta") or 0
-            totals[label]["one_second_corrections"] += d.get("slip_one_second_correction_delta") or 0
-
-            print(
-                f"{row['pps_count']:>6d} {label:>5s} "
-                f"{_fmt_int(d['raw'], 13)} "
-                f"{_fmt_int(d['raw_delta'], 8, signed=True)} "
-                f"{_fmt_int(d.get('slip_observed_interval'), 9)} "
-                f"{_fmt_int(d.get('slip_authored_interval'), 9)} "
-                f"{_fmt_int(d.get('slip_authored_minus_observed_dwt'), 9, signed=True)} "
-                f"{_fmt_int(d.get('slip_last_dwt_error_cycles'), 8, signed=True)} "
-                f"{_fmt_int(d.get('slip_correction_delta'), 6, signed=True)} "
-                f"{_fmt_int(d.get('slip_violation_delta'), 6, signed=True)} "
-                f"{_fmt_int(d.get('slip_early_delta'), 7, signed=True)} "
-                f"{_fmt_int(d.get('slip_late_delta'), 6, signed=True)} "
-                f"{_fmt_int(d.get('slip_one_second_correction_delta'), 6, signed=True)} "
-                f"{_fmt_int(d.get('slip_ticks'), 8, signed=True)} "
-                f"{_fmt_int(d.get('slip_event_ticks'), 7, signed=True)} "
-                f"{_fmt_str(d.get('slip_reason'), 7)} "
-                f"{_fmt_str(d['y_tag'], 5)} "
-                f"{_fmt_int(d['imo'], 7, signed=True)} "
-                f"{_fmt_int(d['counter_delta'], 11)} "
-                f"{_fmt_int(row['pps_delta'], 8, signed=True)} "
-                f"{_fmt_int(row['v_raw_delta'], 8, signed=True)}"
+def _row_line(row: Dict[str, Any],
+              clocks: Tuple[str, ...],
+              cols: Dict[str, List[str]],
+              include_dwt_ppb: bool) -> str:
+    parts = [
+        f"{row['pps_count']:>6d}",
+        _fmt_int(row["pps_actual"], 13),
+        _fmt_int(row["pps_delta"], 8, signed=True),
+    ]
+    for lane in clocks:
+        data = row["lanes"][lane]
+        for col in cols[lane]:
+            parts.append(
+                _fmt_int(data[col], _col_width(col), signed=_col_signed(col))
             )
-
-    print()
-    print(f"Rows shown: {len(collected):,}")
-    print(f"Gaps:       {gaps:,}")
-    print()
-    print("Slip summary")
-    print("════════════")
-    for label, t in totals.items():
-        print(
-            f"  {label}: corrections={t['corrections']:,}  "
-            f"violations={t['violations']:,}  early={t['early']:,}  "
-            f"late={t['late']:,}  1s_corrections={t['one_second_corrections']:,}  "
-            f"activity_rows={t['rows_with_activity']:,}"
-        )
-
-    print()
-    print("Slip activity rows")
-    print("══════════════════")
-    if not activity:
-        print("  none")
-    else:
-        for pps, label, row, d in activity[:80]:
-            direction = "early" if (d.get("slip_early_delta") or 0) else \
-                        "late" if (d.get("slip_late_delta") or 0) else \
-                        "other"
-            print(
-                f"  pps={pps:>6d} {label:<5s} {direction:<5s} "
-                f"err={_fmt_int(d.get('slip_last_dwt_error_cycles'), signed=True)} cycles  "
-                f"corrΔ={_fmt_int(d.get('slip_correction_delta'), signed=True)}  "
-                f"event_ticks={_fmt_int(d.get('slip_event_ticks'), signed=True)}  "
-                f"ledger={_fmt_int(d.get('slip_ticks'), signed=True)}  "
-                f"reason={d.get('slip_reason')}  y={d.get('y_tag')}"
-            )
-        if len(activity) > 80:
-            print(f"  ... {len(activity) - 80:,} more activity rows omitted")
-
-    print()
-    print("Verdict guide")
-    print("═════════════")
-    print("  • If earlyΔ/corrΔ increments with negative err cycles, the early-edge theory has direct evidence.")
-    print("  • If rawΔ moves but SlipLedger counters stay flat, the movement is ordinary yardstick/rail drift.")
-    print("  • If yardstick EXC appears without slip activity, that is inference disagreement, not necessarily hardware edge slip.")
-    print("  • If corrections appear on one lane and follow cabling/channel swaps, that is strong hardware-pathology evidence.")
-    print()
+    if include_dwt_ppb:
+        parts.append(_fmt_float(row["dwt_ppb"], 10, 3, signed=True))
+    return "  ".join(parts)
 
 
-def analyze(campaign: str, limit: int = 0, clock_filter: Optional[str] = None, slip_view: bool = False) -> None:
+def _has_any(collected: List[Dict[str, Any]], lane: str, key: str) -> bool:
+    return any(row["lanes"][lane].get(key) is not None for row in collected)
+
+
+def analyze(campaign: str,
+            limit: int = 0,
+            clock_filter: Optional[str] = None,
+            slip_view: bool = False) -> None:
+    if slip_view:
+        raise SystemExit("--slip was retired from this compact FloorLine report; use an older raw_cycles if SlipLedger courtroom output is needed")
+
     rows = fetch_timebase(campaign)
     if not rows:
         print(f"No TIMEBASE rows for campaign '{campaign}'")
         return
 
     clock_filter = normalize_clock_filter(clock_filter) if clock_filter else None
+    clocks = selected_clocks(clock_filter)
+
     collected, gaps = collect_rows(rows)
     if limit:
         collected = collected[:limit]
 
-    if slip_view:
-        if clock_filter == "VCLOCK":
-            raise SystemExit("--slip is currently OCXO-focused; use OCXO1, OCXO2, or no clock filter")
-        _print_slip_rows(collected, campaign, gaps, clock_filter)
-        return
+    cols = available_columns(collected, clocks)
+    include_dwt_ppb = any(row.get("dwt_ppb") is not None for row in collected)
 
     clock_label = "ALL" if clock_filter is None else clock_filter
     print(f"Campaign: {campaign}  ({len(rows):,} rows, view={clock_label})")
     print()
-    print("EMA vs PPS-Yardstick side-by-side cycle audit")
-    print("═════════════════════════════════════════════")
-    print("  *_rawΔ     = raw interval[n] - raw interval[n-1].")
-    print("  *_ema      = subscriber-facing published interval (EMA-authored today).")
-    print("  *_emaΔ     = ema[n] - ema[n-1].")
-    print("  *_inferred = PPS-Yardstick inferred interval (heir apparent).")
-    print("  *_imo      = inferred - observed: the yardstick per-second scorecard.")
-    print("  *_aerr     = anchored authority PI loop error: observed - anchored")
-    print("               endpoint, pre-correction.  The published-rail health signal")
-    print("               and the SmartZero Gen-2 zero-worthiness input.")
-    print("  *_walk     = free-running yardstick chain endpoint - observed endpoint.")
-    print("  *_y        = yardstick tag: OK / EXC / STAL / SEED / ---.")
-    print("  *_cΔ       = counter32 delta since previous event (lineage proof).")
+    print("Raw / EMA / FloorLine / published cycle audit")
+    print("══════════════════════════════════════════════")
+    print("  PPS is always the base rail.")
+    print("  *_raw = evidence interval, *_ema = EMA interval, *_fl = FloorLine interval,")
+    print("  *_pub = subscriber-facing published interval.")
+    print("  *Δ columns are per-algorithm cycle-count residuals: interval[n] - interval[n-1].")
+    print("  *_f-r = FL-raw, *_p-r = pub-raw.")
+    print("  Core rail columns are always shown; missing FL data is shown as --- on purpose.")
     print()
 
-    header, sep = _headers_for(clock_filter)
+    header, sep = _headers_for(clocks, cols, include_dwt_ppb)
     print(header)
     print(sep)
-
     for row in collected:
-        print(_row_line(row, clock_filter))
+        print(_row_line(row, clocks, cols, include_dwt_ppb))
 
     print()
     print(f"Rows shown: {len(collected):,}")
@@ -1491,335 +966,86 @@ def analyze(campaign: str, limit: int = 0, clock_filter: Optional[str] = None, s
     stats: Dict[str, Welford] = {
         "pps_actual": Welford(),
         "pps_delta": Welford(),
-        "phase": Welford(),
-        "vclock_raw_interval": Welford(),
-        "vclock_raw_delta": Welford(),
-        "vclock_ema_interval": Welford(),
-        "vclock_ema_delta": Welford(),
-        "vclock_counter32_delta": Welford(),
     }
-    for lane_name in ("ocxo1", "ocxo2"):
-        stats[f"{lane_name}_raw_interval"] = Welford()
-        stats[f"{lane_name}_raw_delta"] = Welford()
-        stats[f"{lane_name}_ema_interval"] = Welford()
-        stats[f"{lane_name}_ema_delta"] = Welford()
-        stats[f"{lane_name}_inferred_interval"] = Welford()
-        stats[f"{lane_name}_imo"] = Welford()
-        stats[f"{lane_name}_emo"] = Welford()
-        stats[f"{lane_name}_abs_imo"] = Welford()
-        stats[f"{lane_name}_abs_emo"] = Welford()
-        stats[f"{lane_name}_walk"] = Welford()
-        stats[f"{lane_name}_aerr"] = Welford()
-        stats[f"{lane_name}_abs_aerr"] = Welford()
-        stats[f"{lane_name}_counter32_delta"] = Welford()
+    for lane in clocks:
+        for key in ("raw", "raw_delta", "ema", "ema_delta",
+                    "fl", "fl_delta", "pub", "pub_delta",
+                    "fl_minus_raw", "pub_minus_raw", "ema_minus_raw",
+                    "counter_delta", "fl_edge_minus_observed"):
+            stats[f"{lane}.{key}"] = Welford()
 
-    coverage = {
-        "rows": 0,
-        "vclock_gate": 0,
-        "ocxo1_gate": 0,
-        "ocxo2_gate": 0,
-        "ocxo1_yardstick": 0,
-        "ocxo2_yardstick": 0,
-        "ocxo1_yardstick_stale": 0,
-        "ocxo2_yardstick_stale": 0,
-        "ocxo1_yardstick_seeded": 0,
-        "ocxo2_yardstick_seeded": 0,
-        "ocxo1_yardstick_excursions": 0,
-        "ocxo2_yardstick_excursions": 0,
-        "ocxo1_adjacency_rejected": 0,
-        "ocxo2_adjacency_rejected": 0,
+    coverage: Dict[str, Dict[str, int]] = {
+        lane: {key: 0 for key in ("raw", "ema", "fl", "pub", "counter_delta")}
+        for lane in clocks
     }
-    last_counts = {
-        "ocxo1": {"agree": None, "excursion": None, "threshold": None},
-        "ocxo2": {"agree": None, "excursion": None, "threshold": None},
-    }
-
-    service_class_counts = {"ocxo1": {}, "ocxo2": {}}
-    excursions: List[Dict[str, Any]] = []
-    vclock_excursions: List[Dict[str, Any]] = []
-    walk_samples = {"ocxo1": [], "ocxo2": []}
-    # Anchor-loop error sequences (in row order) feed the zero-worthiness
-    # policy simulation; histogram counts |aerr| on agree seconds.
-    aerr_seq = {"ocxo1": [], "ocxo2": []}
-    aerr_hist_bins = [(0, 2), (3, 4), (5, 6), (7, 8), (9, 10),
-                      (11, 12), (13, 16), (17, None)]
-    aerr_hist = {"ocxo1": [0] * len(aerr_hist_bins),
-                 "ocxo2": [0] * len(aerr_hist_bins)}
 
     for row in collected:
-        coverage["rows"] += 1
         add_optional(stats["pps_actual"], row["pps_actual"])
         add_optional(stats["pps_delta"], row["pps_delta"])
-        add_optional(stats["phase"], row["phase"])
-        add_optional(stats["vclock_raw_interval"], row["v_raw"])
-        add_optional(stats["vclock_raw_delta"], row["v_raw_delta"])
-        add_optional(stats["vclock_ema_interval"], row["v_ema"])
-        add_optional(stats["vclock_ema_delta"], row["v_ema_delta"])
-        add_optional(stats["vclock_counter32_delta"], row["v_cdelta"])
-        if row["v_gate_valid"]:
-            coverage["vclock_gate"] += 1
-
-        for key, lane_name in (("o1", "ocxo1"), ("o2", "ocxo2")):
-            d = row[key]
-            add_optional(stats[f"{lane_name}_raw_interval"], d["raw"])
-            add_optional(stats[f"{lane_name}_raw_delta"], d["raw_delta"])
-            add_optional(stats[f"{lane_name}_ema_interval"], d["ema"])
-            add_optional(stats[f"{lane_name}_ema_delta"], d["ema_delta"])
-            add_optional(stats[f"{lane_name}_counter32_delta"], d["counter_delta"])
-
-            if d["gate_valid"]:
-                coverage[f"{lane_name}_gate"] += 1
-            if d["adj_rejected"]:
-                coverage[f"{lane_name}_adjacency_rejected"] += 1
-            cls = service_class_short(d["service_class"])
-            service_class_counts[lane_name][cls] = service_class_counts[lane_name].get(cls, 0) + 1
-
-            aerr_seq[lane_name].append((d["y_tag"], d["aerr"]))
-
-            if d["y_valid"]:
-                coverage[f"{lane_name}_yardstick"] += 1
-                add_optional(stats[f"{lane_name}_inferred_interval"], d["inferred"])
-                add_optional(stats[f"{lane_name}_walk"], d["walk"])
-                if d["walk"] is not None:
-                    walk_samples[lane_name].append((row["pps_count"], d["walk"]))
-                if d["y_stale"]:
-                    coverage[f"{lane_name}_yardstick_stale"] += 1
-                if d["y_seeded"]:
-                    coverage[f"{lane_name}_yardstick_seeded"] += 1
-                if d["y_excursion"]:
-                    coverage[f"{lane_name}_yardstick_excursions"] += 1
-                else:
-                    # Head-to-head scorecards on agree seconds only: excursion
-                    # seconds are observed-side corruption by definition, and
-                    # both rails are judged against the same clean evidence.
-                    if not d["y_seeded"]:
-                        add_optional(stats[f"{lane_name}_imo"], d["imo"])
-                        add_optional(stats[f"{lane_name}_emo"], d["emo"])
-                        add_optional(stats[f"{lane_name}_aerr"], d["aerr"])
-                        if d["aerr"] is not None:
-                            a = abs(int(d["aerr"]))
-                            stats[f"{lane_name}_abs_aerr"].update(float(a))
-                            for bi, (lo, hi) in enumerate(aerr_hist_bins):
-                                if a >= lo and (hi is None or a <= hi):
-                                    aerr_hist[lane_name][bi] += 1
-                                    break
-                        if d["imo"] is not None:
-                            stats[f"{lane_name}_abs_imo"].update(abs(float(d["imo"])))
-                        if d["emo"] is not None:
-                            stats[f"{lane_name}_abs_emo"].update(abs(float(d["emo"])))
-                if d["y_agree_count"] is not None:
-                    last_counts[lane_name]["agree"] = d["y_agree_count"]
-                if d["y_excursion_count"] is not None:
-                    last_counts[lane_name]["excursion"] = d["y_excursion_count"]
-                if d["y_threshold"] is not None:
-                    last_counts[lane_name]["threshold"] = d["y_threshold"]
-
-        if _residual_hit(row["v_raw_delta"], row["v_ema_delta"]):
-            vclock_excursions.append(row)
-
-        for key in ("o1", "o2"):
-            d = row[key]
-            if _residual_hit(d["raw_delta"], d["ema_delta"]) or d["y_excursion"]:
-                excursions.append({"row": row, "lane": key, "data": d})
+        for lane in clocks:
+            data = row["lanes"][lane]
+            for key in ("raw", "raw_delta", "ema", "ema_delta",
+                        "fl", "fl_delta", "pub", "pub_delta",
+                        "fl_minus_raw", "pub_minus_raw", "ema_minus_raw",
+                        "counter_delta", "fl_edge_minus_observed"):
+                add_optional(stats[f"{lane}.{key}"], data.get(key))
+            for key in coverage[lane]:
+                if data.get(key) is not None:
+                    coverage[lane][key] += 1
 
     print("Schema coverage")
     print("═══════════════")
-    print(f"  rows                          = {coverage['rows']:,}")
-    print(f"  VCLOCK gate rows              = {coverage['vclock_gate']:,}")
-    print(f"  OCXO1 gate rows               = {coverage['ocxo1_gate']:,}")
-    print(f"  OCXO2 gate rows               = {coverage['ocxo2_gate']:,}")
-    print(f"  OCXO1 yardstick rows          = {coverage['ocxo1_yardstick']:,}")
-    print(f"  OCXO2 yardstick rows          = {coverage['ocxo2_yardstick']:,}")
-    print(f"  OCXO1 yardstick stale/seeded  = {coverage['ocxo1_yardstick_stale']:,} / {coverage['ocxo1_yardstick_seeded']:,}")
-    print(f"  OCXO2 yardstick stale/seeded  = {coverage['ocxo2_yardstick_stale']:,} / {coverage['ocxo2_yardstick_seeded']:,}")
-    print(f"  OCXO1 yardstick excursions    = {coverage['ocxo1_yardstick_excursions']:,}")
-    print(f"  OCXO2 yardstick excursions    = {coverage['ocxo2_yardstick_excursions']:,}")
-    print(f"  OCXO1 adjacency rejects       = {coverage['ocxo1_adjacency_rejected']:,}")
-    print(f"  OCXO2 adjacency rejects       = {coverage['ocxo2_adjacency_rejected']:,}")
-    print(f"  OCXO1 service classes         = {service_class_counts['ocxo1']}")
-    print(f"  OCXO2 service classes         = {service_class_counts['ocxo2']}")
+    print(f"  rows = {len(collected):,}")
+    for lane in clocks:
+        c = coverage[lane]
+        print(
+            f"  {lane:<6s} raw={c['raw']:,}  ema={c['ema']:,}  "
+            f"fl={c['fl']:,}  pub={c['pub']:,}  cΔ={c['counter_delta']:,}"
+        )
     print()
 
     print("Summary")
     print("═══════")
     _print_welford("PPS actual cycles", stats["pps_actual"])
     _print_welford("PPS first-difference residual", stats["pps_delta"])
-    _print_welford("PPS→VCLOCK phase offset", stats["phase"])
 
-    if clock_filter is None or clock_filter == "VCLOCK":
-        _print_welford("VCLOCK raw interval", stats["vclock_raw_interval"])
-        _print_welford("VCLOCK raw first-difference residual", stats["vclock_raw_delta"])
-        _print_welford("VCLOCK EMA published interval", stats["vclock_ema_interval"])
-        _print_welford("VCLOCK EMA published first-difference", stats["vclock_ema_delta"])
-        _print_welford("VCLOCK counter32 delta", stats["vclock_counter32_delta"], unit="ticks")
+    for lane in clocks:
+        print()
+        _print_welford(f"{lane} raw interval", stats[f"{lane}.raw"])
+        _print_welford(f"{lane} raw cycle-count residual", stats[f"{lane}.raw_delta"])
+        _print_welford(f"{lane} EMA interval", stats[f"{lane}.ema"])
+        _print_welford(f"{lane} EMA cycle-count residual", stats[f"{lane}.ema_delta"])
+        _print_welford(f"{lane} FloorLine interval", stats[f"{lane}.fl"])
+        _print_welford(f"{lane} FloorLine cycle-count residual", stats[f"{lane}.fl_delta"])
+        _print_welford(f"{lane} published interval", stats[f"{lane}.pub"])
+        _print_welford(f"{lane} published cycle-count residual", stats[f"{lane}.pub_delta"])
+        _print_welford(f"{lane} EMA - raw", stats[f"{lane}.ema_minus_raw"])
+        _print_welford(f"{lane} FloorLine - raw", stats[f"{lane}.fl_minus_raw"])
+        _print_welford(f"{lane} published - raw", stats[f"{lane}.pub_minus_raw"])
+        _print_welford(f"{lane} FL edge - observed edge", stats[f"{lane}.fl_edge_minus_observed"])
+        _print_welford(f"{lane} counter32 delta", stats[f"{lane}.counter_delta"], unit="ticks")
 
-    for lane_name, label in (("ocxo1", "OCXO1"), ("ocxo2", "OCXO2")):
-        if clock_filter is not None and clock_filter != label:
-            continue
-        _print_welford(f"{label} raw interval", stats[f"{lane_name}_raw_interval"])
-        _print_welford(f"{label} raw first-difference residual", stats[f"{lane_name}_raw_delta"])
-        _print_welford(f"{label} EMA published interval", stats[f"{lane_name}_ema_interval"])
-        _print_welford(f"{label} EMA published first-difference", stats[f"{lane_name}_ema_delta"])
-        _print_welford(f"{label} yardstick inferred interval", stats[f"{lane_name}_inferred_interval"])
-        _print_welford(f"{label} counter32 delta", stats[f"{lane_name}_counter32_delta"], unit="ticks")
     print()
-
-    if clock_filter is None or clock_filter in ("OCXO1", "OCXO2"):
-        print("Head-to-head: EMA vs PPS-Yardstick (agree seconds, same raw evidence)")
-        print("══════════════════════════════════════════════════════════════════════")
-        print("  emo = ema published - raw observed   (EMA per-second error)")
-        print("  imo = inferred - raw observed        (yardstick per-second error)")
-        print()
-        for lane_name, label in (("ocxo1", "OCXO1"), ("ocxo2", "OCXO2")):
-            if clock_filter is not None and clock_filter != label:
-                continue
-            _print_welford(f"{label} EMA error (emo)", stats[f"{lane_name}_emo"])
-            _print_welford(f"{label} EMA |error|", stats[f"{lane_name}_abs_emo"])
-            _print_welford(f"{label} yardstick error (imo)", stats[f"{lane_name}_imo"])
-            _print_welford(f"{label} yardstick |error|", stats[f"{lane_name}_abs_imo"])
-            _print_welford(f"{label} anchor loop error (aerr)", stats[f"{lane_name}_aerr"])
-            _print_welford(f"{label} anchor loop |error|", stats[f"{lane_name}_abs_aerr"])
-            if stats[f"{lane_name}_abs_aerr"].n > 0:
-                cells = []
-                for (lo, hi), ct in zip(aerr_hist_bins, aerr_hist[lane_name]):
-                    rng = f"{lo}-{hi}" if hi is not None else f"{lo}+"
-                    cells.append(f"{rng}:{ct}")
-                print(f"  {label} |aerr| histogram (agree seconds)          "
-                      + "  ".join(cells))
-            _print_welford(f"{label} chain walk (endpoint - observed)", stats[f"{lane_name}_walk"])
-            slope = _walk_slope_cycles_per_second(walk_samples[lane_name])
-            counts = last_counts[lane_name]
-            slope_text = "---" if slope is None else f"{slope:+.4f} cycles/s"
-            print(f"  {label} chain walk slope (least squares)        {slope_text}")
-            print(
-                f"  {label} cumulative gate counts                   "
-                f"agree={counts['agree']}  excursion={counts['excursion']}  "
-                f"threshold={counts['threshold']}"
-            )
-            print()
-
-        print("Zero-worthiness policy simulation (SmartZero Gen-2 tuning)")
-        print("══════════════════════════════════════════════════════════")
-        print("  Firmware verdict replayed over this campaign's per-second anchor loop")
-        print("  errors for candidate (|aerr| bound / |window sum| bound) policies,")
-        print(f"  window = {ZW_POLICY_WINDOW_SECONDS} s.  Fast-lock (acquisition) exclusion is not")
-        print("  visible in TIMEBASE, so readiness near restarts reads optimistic.")
-        print()
-        for lane_name, label in (("ocxo1", "OCXO1"), ("ocxo2", "OCXO2")):
-            if clock_filter is not None and clock_filter != label:
-                continue
-            seq = aerr_seq[lane_name]
-            evaluated = len(seq)
-            print(f"  {label}  ({evaluated} rows)")
-            print(f"    {'policy':>12s}  {'worthy_s':>8s}  {'worthy_%':>8s}  "
-                  f"{'max_streak':>10s}  {'first_worthy_row':>16s}")
-            for mag, sumb in ZW_POLICY_CANDIDATES:
-                ws, mstreak, first = _simulate_zero_worthy(seq, mag, sumb)
-                pct = (100.0 * ws / evaluated) if evaluated else 0.0
-                first_text = "never" if first is None else str(first)
-                print(f"    {f'{mag}/{sumb}':>12s}  {ws:>8d}  {pct:>7.1f}%  "
-                      f"{mstreak:>10d}  {first_text:>16s}")
-            print()
-
-    if clock_filter is None or clock_filter == "VCLOCK":
-        print(f"VCLOCK residual excursions (|rawΔ| or |emaΔ| ≥ {EXCURSION_THRESHOLD_CYCLES} cycles)")
-        print("════════════════════════════════════════════════════════════")
-        if not vclock_excursions:
-            print("  none")
-        else:
-            h = (
-                f"{'pps':>6s} {'rawΔ':>8s} {'emaΔ':>8s} "
-                f"{'raw':>13s} {'ema':>13s} "
-                f"{'v_cΔ':>11s} {'phase':>5s} {'p_Δ':>8s}"
-            )
-            print(h)
-            print(f"{'─'*6} {'─'*8} {'─'*8} {'─'*13} {'─'*13} {'─'*11} {'─'*5} {'─'*8}")
-            for row in vclock_excursions[:60]:
-                print(
-                    f"{row['pps_count']:>6d} "
-                    f"{_fmt_int(row['v_raw_delta'], 8, signed=True)} "
-                    f"{_fmt_int(row['v_ema_delta'], 8, signed=True)} "
-                    f"{_fmt_int(row['v_raw'], 13)} "
-                    f"{_fmt_int(row['v_ema'], 13)} "
-                    f"{_fmt_int(row['v_cdelta'], 11)} "
-                    f"{_fmt_int(row['phase'], 5)} "
-                    f"{_fmt_int(row['pps_delta'], 8, signed=True)}"
-                )
-            if len(vclock_excursions) > 60:
-                print(f"  ... {len(vclock_excursions) - 60:,} more VCLOCK excursion rows omitted")
-        print()
-
-    if clock_filter is None or clock_filter in ("OCXO1", "OCXO2"):
-        print(f"OCXO residual excursions (|rawΔ| or |emaΔ| ≥ {EXCURSION_THRESHOLD_CYCLES} cycles, or yardstick EXC)")
-        print("══════════════════════════════════════════════════════════════════════════════")
-        filtered = [
-            ex for ex in excursions
-            if clock_filter is None or
-               (clock_filter == "OCXO1" and ex["lane"] == "o1") or
-               (clock_filter == "OCXO2" and ex["lane"] == "o2")
-        ]
-        if not filtered:
-            print("  none")
-        else:
-            h = (
-                f"{'pps':>6s} {'lane':>5s} {'rawΔ':>8s} {'emaΔ':>8s} {'imo':>7s} {'walk':>8s} "
-                f"{'raw':>13s} {'ema':>13s} {'inferred':>13s} {'y':>5s} "
-                f"{'cΔ':>11s} {'p_Δ':>8s} {'v_rawΔ':>8s}"
-            )
-            print(h)
-            print(f"{'─'*6} {'─'*5} {'─'*8} {'─'*8} {'─'*7} {'─'*8} {'─'*13} {'─'*13} {'─'*13} {'─'*5} {'─'*11} {'─'*8} {'─'*8}")
-            for ex in filtered[:60]:
-                row = ex["row"]
-                d = ex["data"]
-                print(
-                    f"{row['pps_count']:>6d} {ex['lane']:>5s} "
-                    f"{_fmt_int(d['raw_delta'], 8, signed=True)} "
-                    f"{_fmt_int(d['ema_delta'], 8, signed=True)} "
-                    f"{_fmt_int(d['imo'], 7, signed=True)} "
-                    f"{_fmt_int(d['walk'], 8, signed=True)} "
-                    f"{_fmt_int(d['raw'], 13)} "
-                    f"{_fmt_int(d['ema'], 13)} "
-                    f"{_fmt_int(d['inferred'], 13)} "
-                    f"{_fmt_str(d['y_tag'], 5)} "
-                    f"{_fmt_int(d['counter_delta'], 11)} "
-                    f"{_fmt_int(row['pps_delta'], 8, signed=True)} "
-                    f"{_fmt_int(row['v_raw_delta'], 8, signed=True)}"
-                )
-            if len(filtered) > 60:
-                print(f"  ... {len(filtered) - 60:,} more excursion rows omitted")
-        print()
-
     print("Notes")
     print("═════")
-    print("  • *_raw is the raw/evidence interval from dwt_interval_gate.observed_cycles when present.")
-    print("  • *_rawΔ = raw[n] - raw[n-1]. This is the old-style raw first-difference residual.")
-    print("  • *_ema is the subscriber-facing published interval; today it is EMA-authored")
-    print("    (this column was previously printed as *_pub).")
-    print("  • *_emaΔ = ema[n] - ema[n-1].")
-    print("  • *_inferred is the PPS-Yardstick inferred interval: prior chain interval scaled")
-    print("    by the physical PPS-to-PPS yardstick ratio, carried in Q16 fixed point.")
-    print("  • *_imo = inferred - observed (firmware-computed). Sub-lattice |imo| means the")
-    print("    inference tracks truth tighter than the 4-cycle QTimer quantization floor.")
-    print("  • *_aerr is the Stage 2 anchored authority loop error (observed minus")
-    print("    anchored endpoint, pre-correction).  Its Welford/histogram and the")
-    print("    zero-worthiness policy table are the SmartZero Gen-2 tuning instruments.")
-    print("  • *_walk is the free-running chain endpoint minus observed endpoint: the")
-    print("    cumulative chain-walk audit that decides the Stage 2/3 anchor policy.")
-    print("  • *_y tags: OK, EXC (gate excursion: observed disagreed with inference beyond")
-    print("    threshold), STAL (no fresh PPS yardstick; interval held), SEED (chain")
-    print("    reseeded this row), --- (rail not valid).")
-    print("  • Head-to-head emo/imo are computed over agree seconds only: both rails judged")
-    print("    against the same clean raw evidence.")
-    print("  • p_* columns are the physical PPS rail; PPS has no separate gate/published rail here.")
-    print("  • *_cΔ is Alpha/process_interrupt counter32 delta since the previous event.")
-    print("  • Use a clock filter for narrower one-line rows, e.g. raw_cycles Plover1 OCXO2.")
+    print("  • The old report's PPS-Yardstick columns were removed from the normal view;")
+    print("    this report is now focused on the publication decision: EMA vs FloorLine vs pub.")
+    print("  • *_pub is the ground-truth subscriber-facing interval.  If firmware is EMA-authored,")
+    print("    *_pub should match *_ema.  If firmware is FloorLine-authored, *_pub should match *_fl.")
+    print("  • *Δ columns are cycle-count residuals computed separately per rail:")
+    print("    interval[n] - interval[n-1].")
+    print("  • FloorLine columns are intentionally always visible.  If *_fl stays ---,")
+    print("    the TIMEBASE row stream did not expose a FloorLine endpoint that this parser found.")
+    print("  • *_f-r and *_p-r are computed only when both surfaces exist in the TIMEBASE row stream.")
+    print("  • Use --clock VCLOCK, --clock OCXO1, or --clock OCXO2 to keep the row narrow.")
     print()
+
 
 def parse_args(argv: List[str]) -> Tuple[str, int, Optional[str], bool]:
     if len(argv) < 2:
         print("Usage: raw_cycles <campaign_name> [limit] [clock]")
         print("       raw_cycles <campaign_name> --clock OCXO2 [limit]")
-        print("       raw_cycles <campaign_name> --slip [limit] [clock]")
+        print("       raw_cycles <campaign_name> --limit 300 --clock VCLOCK")
         raise SystemExit(1)
 
     campaign = argv[1]
@@ -1842,6 +1068,22 @@ def parse_args(argv: List[str]) -> Tuple[str, int, Optional[str], bool]:
             continue
         if arg.startswith("--clock="):
             clock = arg.split("=", 1)[1]
+            i += 1
+            continue
+        if arg == "--limit":
+            if i + 1 >= len(argv):
+                raise SystemExit("--limit requires an integer")
+            try:
+                limit = int(argv[i + 1])
+            except ValueError as exc:
+                raise SystemExit("--limit requires an integer") from exc
+            i += 2
+            continue
+        if arg.startswith("--limit="):
+            try:
+                limit = int(arg.split("=", 1)[1])
+            except ValueError as exc:
+                raise SystemExit("--limit requires an integer") from exc
             i += 1
             continue
         if arg.upper() in CLOCKS or arg.upper() in ("V", "VC", "O1", "O2"):

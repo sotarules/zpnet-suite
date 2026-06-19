@@ -5299,15 +5299,15 @@ static inline void copy_regression_diag(interrupt_capture_diag_t& diag,
 static inline uint32_t vclock_published_dwt_at_edge(
     uint32_t ema_dwt_at_edge,
     const cadence_regression_result_t& floorline) {
-  (void)floorline;
-  return ema_dwt_at_edge;
+  (void)ema_dwt_at_edge;
+  return floorline.inferred_dwt_at_event;
 }
 
 static inline uint32_t ocxo_published_dwt_at_edge(
     uint32_t legacy_dwt_at_edge,
     const cadence_regression_result_t& floorline) {
-  (void)floorline;
-  return legacy_dwt_at_edge;
+  (void)legacy_dwt_at_edge;
+  return floorline.inferred_dwt_at_event;
 }
 
 
@@ -6000,6 +6000,7 @@ static void vclock_apply_perishable_fact_deferred(
   ema_diag.threshold_cycles = VCLOCK_EMA_AUDIT_THRESHOLD_CYCLES;
   const uint32_t ema_published_dwt = vclock_lane_ema_predict_dwt(
       g_vclock_lane, observed_dwt, &ema_synthetic, &ema_error_cycles, &ema_diag);
+  ema_diag.ema_dwt_at_event = ema_published_dwt;
 
   cadence_regression_result_t lower_env{};
   (void)cadence_regression_latest_result(interrupt_subscriber_kind_t::VCLOCK,
@@ -6634,6 +6635,7 @@ static void vclock_heartbeat_native_service(uint32_t isr_entry_dwt_raw,
         ema_diag.threshold_cycles = VCLOCK_EMA_AUDIT_THRESHOLD_CYCLES;
         const uint32_t ema_published_dwt = vclock_lane_ema_predict_dwt(
             g_vclock_lane, qtimer_event_dwt, &ema_synthetic, &ema_error_cycles, &ema_diag);
+        ema_diag.ema_dwt_at_event = ema_published_dwt;
         cadence_regression_result_t lower_env{};
         (void)cadence_regression_latest_result(interrupt_subscriber_kind_t::VCLOCK,
                                                &lower_env);

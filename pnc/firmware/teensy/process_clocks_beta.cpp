@@ -1169,6 +1169,21 @@ static const char* pps_vclock_edge_decision_name(uint32_t decision) {
   }
 }
 
+
+static bool floorline_candidate_present(
+    bool lane_valid,
+    const clocks_alpha_lane_forensics_t& f) {
+  // FloorLine is the lower-envelope successor to the retired regression
+  // experiment.  Some live report paths still expose the stale
+  // regression_valid bit as false even when the lower-envelope candidate
+  // fields are fully populated and already used as the published DWT edge.
+  // Gate TIMEBASE visibility on candidate presence, not that legacy flag.
+  return lane_valid &&
+         f.regression_inferred_dwt_at_event != 0U &&
+         f.regression_observed_dwt_at_event != 0U &&
+         f.regression_sample_count != 0U;
+}
+
 static void payload_add_pps_vclock_edge_forensics(
     Payload& parent,
     bool available,
@@ -1313,7 +1328,7 @@ static void payload_add_lane_forensics_object(Payload& parent,
   // slope-derived one-second cycle count; dwt_interval_gate.observed_cycles is
   // the raw observed one-second interval used for side-by-side analysis.
   Payload lower_env;
-  const bool lower_valid = valid && f.regression_valid;
+  const bool lower_valid = floorline_candidate_present(valid, f);
   const uint32_t lower_inferred_interval_cycles = lower_valid
       ? (uint32_t)(((uint64_t)f.regression_slope_q16_cycles_per_sample *
                     1000ULL + 32768ULL) >> 16)
@@ -1599,10 +1614,9 @@ static int32_t beta_signed_delta_u32(uint32_t observed, uint32_t expected) {
 }
 
 static uint32_t floorline_inferred_interval_cycles(
-    bool valid,
+    bool present,
     const clocks_alpha_lane_forensics_t& f) {
-  if (!valid || !f.regression_valid ||
-      f.regression_slope_q16_cycles_per_sample == 0ULL) {
+  if (!present || f.regression_slope_q16_cycles_per_sample == 0ULL) {
     return 0U;
   }
 
@@ -1614,7 +1628,7 @@ static uint32_t floorline_inferred_interval_cycles(
 static void payload_add_floorline_object(Payload& parent,
                                          bool valid,
                                          const clocks_alpha_lane_forensics_t& f) {
-  const bool floor_valid = valid && f.regression_valid;
+  const bool floor_valid = floorline_candidate_present(valid, f);
   const uint32_t observed_interval =
       valid ? f.dwt_interval_observed_cycles : 0U;
   const uint32_t inferred_interval =
@@ -3169,8 +3183,12 @@ void clocks_beta_pps(void) {
         //   *_obs     observed raw one-second DWT interval
         //   *_eff     effective/published interval after EMA/Yardstick gate
         //   *_res     observed-minus-prediction residual from the interval gate
-        //   *_orig    original observed DWT edge
-        //   *_used    DWT edge used/published by the current authority
+        //   *_raw     original observed DWT edge candidate
+        //   *_ema     EMA DWT edge candidate
+        //   *_fl      FloorLine DWT edge candidate
+        //   *_pub     published/canonical DWT edge
+        //   *_orig    legacy alias for *_raw
+        //   *_used    legacy alias for *_pub
         //   *_fl_cyc  FloorLine inferred one-second interval
         //   *_fl_err  FloorLine inferred edge minus observed edge
         //
@@ -3184,28 +3202,52 @@ void clocks_beta_pps(void) {
                          : 0U);
 
         const bool v_ok = vclock_forensics_valid;
-        const bool v_fl = v_ok && vclock_forensics.regression_valid;
+        const bool v_fl = floorline_candidate_present(v_ok, vclock_forensics);
         const uint32_t v_fl_cyc = v_fl
-            ? floorline_inferred_interval_cycles(true, vclock_forensics)
+            ? floorline_inferred_interval_cycles(v_fl, vclock_forensics)
             : 0U;
+        const uint32_t v_raw_dwt =
+            v_ok ? vclock_forensics.dwt_original_at_event : 0U;
+        const uint32_t v_ema_dwt =
+            v_ok ? vclock_forensics.dwt_ema_dwt_at_event : 0U;
+        const uint32_t v_fl_dwt =
+            v_fl ? vclock_forensics.regression_inferred_dwt_at_event : 0U;
+        const uint32_t v_pub_dwt =
+            v_ok ? vclock_forensics.dwt_used_at_event : 0U;
         f.add("v_obs", v_ok ? vclock_forensics.dwt_interval_observed_cycles : 0U);
         f.add("v_eff", v_ok ? vclock_forensics.dwt_interval_effective_cycles : 0U);
         f.add("v_res", v_ok ? vclock_forensics.dwt_interval_residual_cycles : 0);
-        f.add("v_orig", v_ok ? vclock_forensics.dwt_original_at_event : 0U);
-        f.add("v_used", v_ok ? vclock_forensics.dwt_used_at_event : 0U);
+        f.add("v_raw", v_raw_dwt);
+        f.add("v_ema", v_ema_dwt);
+        f.add("v_fl", v_fl_dwt);
+        f.add("v_pub", v_pub_dwt);
+        f.add("v_orig", v_raw_dwt);
+        f.add("v_used", v_pub_dwt);
         f.add("v_fl_cyc", v_fl_cyc);
         f.add("v_fl_err", v_fl ? vclock_forensics.regression_inferred_minus_observed_cycles : 0);
 
         const bool o1_ok = ocxo1_forensics_valid;
-        const bool o1_fl = o1_ok && ocxo1_forensics.regression_valid;
+        const bool o1_fl = floorline_candidate_present(o1_ok, ocxo1_forensics);
         const uint32_t o1_fl_cyc = o1_fl
-            ? floorline_inferred_interval_cycles(true, ocxo1_forensics)
+            ? floorline_inferred_interval_cycles(o1_fl, ocxo1_forensics)
             : 0U;
+        const uint32_t o1_raw_dwt =
+            o1_ok ? ocxo1_forensics.dwt_original_at_event : 0U;
+        const uint32_t o1_ema_dwt =
+            o1_ok ? ocxo1_forensics.dwt_ema_dwt_at_event : 0U;
+        const uint32_t o1_fl_dwt =
+            o1_fl ? ocxo1_forensics.regression_inferred_dwt_at_event : 0U;
+        const uint32_t o1_pub_dwt =
+            o1_ok ? ocxo1_forensics.dwt_used_at_event : 0U;
         f.add("o1_obs", o1_ok ? ocxo1_forensics.dwt_interval_observed_cycles : 0U);
         f.add("o1_eff", o1_ok ? ocxo1_forensics.dwt_interval_effective_cycles : 0U);
         f.add("o1_res", o1_ok ? ocxo1_forensics.dwt_interval_residual_cycles : 0);
-        f.add("o1_orig", o1_ok ? ocxo1_forensics.dwt_original_at_event : 0U);
-        f.add("o1_used", o1_ok ? ocxo1_forensics.dwt_used_at_event : 0U);
+        f.add("o1_raw", o1_raw_dwt);
+        f.add("o1_ema", o1_ema_dwt);
+        f.add("o1_fl", o1_fl_dwt);
+        f.add("o1_pub", o1_pub_dwt);
+        f.add("o1_orig", o1_raw_dwt);
+        f.add("o1_used", o1_pub_dwt);
         f.add("o1_fl_cyc", o1_fl_cyc);
         f.add("o1_fl_err", o1_fl ? ocxo1_forensics.regression_inferred_minus_observed_cycles : 0);
         f.add("o1_pps_res", pps_residuals.ocxo1_valid
@@ -3213,15 +3255,27 @@ void clocks_beta_pps(void) {
                             : 0LL);
 
         const bool o2_ok = ocxo2_forensics_valid;
-        const bool o2_fl = o2_ok && ocxo2_forensics.regression_valid;
+        const bool o2_fl = floorline_candidate_present(o2_ok, ocxo2_forensics);
         const uint32_t o2_fl_cyc = o2_fl
-            ? floorline_inferred_interval_cycles(true, ocxo2_forensics)
+            ? floorline_inferred_interval_cycles(o2_fl, ocxo2_forensics)
             : 0U;
+        const uint32_t o2_raw_dwt =
+            o2_ok ? ocxo2_forensics.dwt_original_at_event : 0U;
+        const uint32_t o2_ema_dwt =
+            o2_ok ? ocxo2_forensics.dwt_ema_dwt_at_event : 0U;
+        const uint32_t o2_fl_dwt =
+            o2_fl ? ocxo2_forensics.regression_inferred_dwt_at_event : 0U;
+        const uint32_t o2_pub_dwt =
+            o2_ok ? ocxo2_forensics.dwt_used_at_event : 0U;
         f.add("o2_obs", o2_ok ? ocxo2_forensics.dwt_interval_observed_cycles : 0U);
         f.add("o2_eff", o2_ok ? ocxo2_forensics.dwt_interval_effective_cycles : 0U);
         f.add("o2_res", o2_ok ? ocxo2_forensics.dwt_interval_residual_cycles : 0);
-        f.add("o2_orig", o2_ok ? ocxo2_forensics.dwt_original_at_event : 0U);
-        f.add("o2_used", o2_ok ? ocxo2_forensics.dwt_used_at_event : 0U);
+        f.add("o2_raw", o2_raw_dwt);
+        f.add("o2_ema", o2_ema_dwt);
+        f.add("o2_fl", o2_fl_dwt);
+        f.add("o2_pub", o2_pub_dwt);
+        f.add("o2_orig", o2_raw_dwt);
+        f.add("o2_used", o2_pub_dwt);
         f.add("o2_fl_cyc", o2_fl_cyc);
         f.add("o2_fl_err", o2_fl ? ocxo2_forensics.regression_inferred_minus_observed_cycles : 0);
         f.add("o2_pps_res", pps_residuals.ocxo2_valid
