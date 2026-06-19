@@ -481,6 +481,71 @@ struct interrupt_integrity_qtimer_cntr_match_check_t {
   uint32_t isr_entry_dwt_raw = 0;
 };
 
+
+struct interrupt_integrity_qtimer_dwt_interval_check_t {
+  bool     valid = false;
+  bool     previous_valid = false;
+  bool     ruler_qualified = false;
+  uint32_t ruler_wait_count = 0;
+  uint32_t first_qualified_sequence = 0;
+  uint32_t ruler_qualification_count = 0;
+  bool     last_ok = false;
+  uint32_t test_count = 0;
+  uint32_t match_count = 0;       // |error_cycles| <= gate_cycles
+  uint32_t mismatch_count = 0;
+  uint32_t skipped_count = 0;
+  uint32_t too_short_count = 0;   // observed_cycles < expected_cycles - gate
+  uint32_t too_long_count = 0;    // observed_cycles > expected_cycles + gate
+
+  bool     locked = false;
+  uint32_t lock_sequence = 0;
+  uint32_t lock_count = 0;
+  uint32_t lock_streak_required = 0;
+  uint32_t consecutive_ok_count = 0;
+  uint32_t prelock_match_count = 0;
+  uint32_t prelock_mismatch_count = 0;
+  uint32_t post_lock_match_count = 0;
+  uint32_t post_lock_mismatch_count = 0;
+
+  uint32_t first_mismatch_sequence = 0;
+  uint32_t last_mismatch_sequence = 0;
+  int32_t  last_mismatch_error_cycles = 0;
+  uint32_t last_mismatch_observed_cycles = 0;
+  uint32_t last_mismatch_expected_cycles = 0;
+
+  uint32_t sequence = 0;
+  uint32_t target_counter32 = 0;
+  uint32_t dwt_at_match = 0;
+
+  // Previous accepted match used to form the most recent interval.
+  uint32_t previous_sequence = 0;
+  uint32_t previous_target_counter32 = 0;
+  uint32_t previous_dwt_at_match = 0;
+
+  // Report copy of the previous endpoint used for the most recent interval.
+  uint32_t interval_previous_sequence = 0;
+  uint32_t interval_previous_target_counter32 = 0;
+  uint32_t interval_previous_dwt_at_match = 0;
+
+  uint32_t target_delta_ticks = 0;
+  uint32_t observed_cycles = 0;
+  uint32_t expected_cycles = 0;
+  int32_t  error_cycles = 0;      // observed_cycles - expected_cycles
+  uint32_t abs_error_cycles = 0;
+  uint32_t gate_cycles = 0;
+};
+
+struct interrupt_integrity_qtimer_dwt_match_check_t {
+  bool     valid = false;
+  uint32_t sequence = 0;
+  uint32_t target_counter32 = 0;
+  uint32_t dwt_at_match = 0;
+  bool     one_second_boundary = false;
+
+  interrupt_integrity_qtimer_dwt_interval_check_t hz1k;
+  interrupt_integrity_qtimer_dwt_interval_check_t one_second;
+};
+
 struct interrupt_integrity_snapshot_t {
   bool     valid = false;
   uint32_t snapshot_count = 0;
@@ -498,6 +563,13 @@ struct interrupt_integrity_snapshot_t {
   interrupt_integrity_qtimer_cntr_match_check_t vclock_qtimer_cntr;
   interrupt_integrity_qtimer_cntr_match_check_t ocxo1_qtimer_cntr;
   interrupt_integrity_qtimer_cntr_match_check_t ocxo2_qtimer_cntr;
+
+  // Raw first-instruction DWT intervals between accepted compare teeth must
+  // match the target-counter interval converted to DWT cycles.  The 1 kHz
+  // rail checks every match; the one-second rail checks boundary-to-boundary.
+  interrupt_integrity_qtimer_dwt_match_check_t vclock_qtimer_dwt;
+  interrupt_integrity_qtimer_dwt_match_check_t ocxo1_qtimer_dwt;
+  interrupt_integrity_qtimer_dwt_match_check_t ocxo2_qtimer_dwt;
 
   // VCLOCK selected-edge DWT interval must agree with the physical PPS DWT
   // interval within the configured diagnostic gate.

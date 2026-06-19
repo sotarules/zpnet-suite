@@ -174,6 +174,18 @@ static constexpr int32_t QTIMER_CNTR_MATCH_EXPECTED_OFFSET_TICKS = 1;
 // A lane is considered locked after this many consecutive +1 observations.
 // This separates startup/pre-grid transients from steady-state integrity.
 static constexpr uint32_t QTIMER_CNTR_MATCH_LOCK_STREAK = 1000U;
+// Immediate DWT interval check for the same QuadTimer match stream.
+// The raw first-instruction DWT interval between accepted compare teeth must
+// agree with the target-counter interval converted through the live DWT/GNSS
+// cycles-per-second ruler.  This is report-only; recovery policy comes later.
+static constexpr uint32_t QTIMER_DWT_MATCH_GATE_CYCLES = 20U;
+static constexpr uint32_t QTIMER_DWT_1KHZ_LOCK_STREAK = 1000U;
+static constexpr uint32_t QTIMER_DWT_1S_LOCK_STREAK = 8U;
+// The 1 kHz DWT check depends on the live DWT/GNSS cycles-per-second
+// ruler.  Do not let it enter the operational courtroom until the slower
+// one-second DWT surface has locked; otherwise startup CPS/ruler movement can
+// create false-negative mismatch blocks that look like real post-lock faults.
+static constexpr bool QTIMER_DWT_1KHZ_REQUIRES_ONE_SECOND_LOCK = true;
 
 static interrupt_integrity_snapshot_t g_interrupt_integrity = {};
 
@@ -187,6 +199,12 @@ static void interrupt_integrity_note_qtimer_cntr_match(
     uint16_t expected_low16,
     uint16_t ambient_low16,
     uint32_t isr_entry_dwt_raw);
+static void interrupt_integrity_note_qtimer_dwt_match(
+    interrupt_subscriber_kind_t kind,
+    uint32_t sequence,
+    uint32_t target_counter32,
+    uint32_t isr_entry_dwt_raw,
+    bool one_second_boundary);
 
 static uint32_t interrupt_integrity_abs_i32(int32_t value) {
   return value < 0 ? (uint32_t)(-(int64_t)value) : (uint32_t)value;
@@ -225,6 +243,20 @@ interrupt_integrity_qtimer_cntr_store(interrupt_subscriber_kind_t kind) {
   }
 }
 
+static interrupt_integrity_qtimer_dwt_match_check_t*
+interrupt_integrity_qtimer_dwt_store(interrupt_subscriber_kind_t kind) {
+  switch (kind) {
+    case interrupt_subscriber_kind_t::VCLOCK:
+      return &g_interrupt_integrity.vclock_qtimer_dwt;
+    case interrupt_subscriber_kind_t::OCXO1:
+      return &g_interrupt_integrity.ocxo1_qtimer_dwt;
+    case interrupt_subscriber_kind_t::OCXO2:
+      return &g_interrupt_integrity.ocxo2_qtimer_dwt;
+    default:
+      return nullptr;
+  }
+}
+
 bool interrupt_integrity_snapshot(interrupt_integrity_snapshot_t* out) {
   if (!out) return false;
   g_interrupt_integrity.snapshot_count++;
@@ -233,6 +265,9 @@ bool interrupt_integrity_snapshot(interrupt_integrity_snapshot_t* out) {
       g_interrupt_integrity.vclock_qtimer_cntr.valid ||
       g_interrupt_integrity.ocxo1_qtimer_cntr.valid ||
       g_interrupt_integrity.ocxo2_qtimer_cntr.valid ||
+      g_interrupt_integrity.vclock_qtimer_dwt.valid ||
+      g_interrupt_integrity.ocxo1_qtimer_dwt.valid ||
+      g_interrupt_integrity.ocxo2_qtimer_dwt.valid ||
       g_interrupt_integrity.vclock_pps_interval.valid ||
       g_interrupt_integrity.vclock_counter.valid ||
       g_interrupt_integrity.ocxo1_counter.valid ||
@@ -2047,6 +2082,186 @@ static void interrupt_integrity_note_qtimer_cntr_match(
     }
   }
 }
+
+static void interrupt_integrity_note_qtimer_dwt_interval(
+    interrupt_integrity_qtimer_dwt_interval_check_t& s,
+    uint32_t sequence,
+    uint32_t target_counter32,
+    uint32_t isr_entry_dwt_raw,
+    uint32_t lock_streak_required,
+    bool ruler_qualified) {
+  s.valid = true;
+  s.sequence = sequence;
+  s.target_counter32 = target_counter32;
+  s.dwt_at_match = isr_entry_dwt_raw;
+  s.gate_cycles = QTIMER_DWT_MATCH_GATE_CYCLES;
+  s.lock_streak_required = lock_streak_required;
+
+  if (!s.previous_valid) {
+    s.previous_valid = true;
+    s.previous_sequence = sequence;
+    s.previous_target_counter32 = target_counter32;
+    s.previous_dwt_at_match = isr_entry_dwt_raw;
+    s.skipped_count++;
+    s.last_ok = false;
+    return;
+  }
+
+  if (!ruler_qualified) {
+    // The interval can be physically fine while the expected-cycle ruler is
+    // still settling.  Keep the latest endpoint as the next baseline, but do
+    // not count this as a match or mismatch.  The integrity question is
+    // whether failures happen after the ruler-qualified lock boundary, not
+    // whether startup CPS movement can fool an over-eager checker.
+    s.ruler_qualified = false;
+    s.ruler_wait_count++;
+    s.skipped_count++;
+    s.last_ok = false;
+    s.previous_sequence = sequence;
+    s.previous_target_counter32 = target_counter32;
+    s.previous_dwt_at_match = isr_entry_dwt_raw;
+    return;
+  }
+
+  if (!s.ruler_qualified) {
+    // First sample after the slower ruler has qualified.  Establish a fresh
+    // baseline so the first counted interval cannot straddle the warmup/lock
+    // transition.
+    s.ruler_qualified = true;
+    s.first_qualified_sequence = sequence;
+    s.ruler_qualification_count++;
+    s.skipped_count++;
+    s.last_ok = false;
+    s.previous_sequence = sequence;
+    s.previous_target_counter32 = target_counter32;
+    s.previous_dwt_at_match = isr_entry_dwt_raw;
+    return;
+  }
+
+  const uint32_t previous_sequence = s.previous_sequence;
+  const uint32_t previous_target_counter32 = s.previous_target_counter32;
+  const uint32_t previous_dwt_at_match = s.previous_dwt_at_match;
+
+  const uint32_t target_delta_ticks =
+      target_counter32 - previous_target_counter32;
+  const uint32_t observed_cycles =
+      isr_entry_dwt_raw - previous_dwt_at_match;
+  const uint32_t expected_cycles = vclock_cycles_for_ticks(target_delta_ticks);
+
+  s.previous_sequence = sequence;
+  s.previous_target_counter32 = target_counter32;
+  s.previous_dwt_at_match = isr_entry_dwt_raw;
+
+  s.interval_previous_sequence = previous_sequence;
+  s.interval_previous_target_counter32 = previous_target_counter32;
+  s.interval_previous_dwt_at_match = previous_dwt_at_match;
+  s.target_delta_ticks = target_delta_ticks;
+  s.observed_cycles = observed_cycles;
+  s.expected_cycles = expected_cycles;
+
+  if (target_delta_ticks == 0 || expected_cycles == 0) {
+    s.skipped_count++;
+    s.last_ok = false;
+    s.error_cycles = 0;
+    s.abs_error_cycles = 0;
+    return;
+  }
+
+  const int64_t error64 =
+      (int64_t)(uint64_t)observed_cycles - (int64_t)(uint64_t)expected_cycles;
+  const int32_t error = (error64 > INT32_MAX)
+      ? INT32_MAX
+      : ((error64 < INT32_MIN) ? INT32_MIN : (int32_t)error64);
+  const uint32_t abs_error = interrupt_integrity_abs_i32(error);
+  const bool ok = abs_error <= QTIMER_DWT_MATCH_GATE_CYCLES;
+  const bool was_locked = s.locked;
+
+  s.error_cycles = error;
+  s.abs_error_cycles = abs_error;
+  s.test_count++;
+
+  if (ok) {
+    s.match_count++;
+    s.last_ok = true;
+    if (s.consecutive_ok_count != UINT32_MAX) {
+      s.consecutive_ok_count++;
+    }
+  } else {
+    s.mismatch_count++;
+    s.last_ok = false;
+    s.consecutive_ok_count = 0;
+    if (error < -(int32_t)QTIMER_DWT_MATCH_GATE_CYCLES) {
+      s.too_short_count++;
+    } else if (error > (int32_t)QTIMER_DWT_MATCH_GATE_CYCLES) {
+      s.too_long_count++;
+    }
+    if (s.first_mismatch_sequence == 0) {
+      s.first_mismatch_sequence = sequence;
+    }
+    s.last_mismatch_sequence = sequence;
+    s.last_mismatch_error_cycles = error;
+    s.last_mismatch_observed_cycles = observed_cycles;
+    s.last_mismatch_expected_cycles = expected_cycles;
+  }
+
+  if (was_locked) {
+    if (ok) {
+      s.post_lock_match_count++;
+    } else {
+      s.post_lock_mismatch_count++;
+    }
+  } else {
+    if (ok) {
+      s.prelock_match_count++;
+    } else {
+      s.prelock_mismatch_count++;
+    }
+
+    if (ok && s.consecutive_ok_count >= lock_streak_required) {
+      s.locked = true;
+      s.lock_sequence = sequence;
+      s.lock_count++;
+    }
+  }
+}
+
+static void interrupt_integrity_note_qtimer_dwt_match(
+    interrupt_subscriber_kind_t kind,
+    uint32_t sequence,
+    uint32_t target_counter32,
+    uint32_t isr_entry_dwt_raw,
+    bool one_second_boundary) {
+  interrupt_integrity_qtimer_dwt_match_check_t* s =
+      interrupt_integrity_qtimer_dwt_store(kind);
+  if (!s) return;
+
+  s->valid = true;
+  s->sequence = sequence;
+  s->target_counter32 = target_counter32;
+  s->dwt_at_match = isr_entry_dwt_raw;
+  s->one_second_boundary = one_second_boundary;
+
+  if (one_second_boundary) {
+    interrupt_integrity_note_qtimer_dwt_interval(
+        s->one_second,
+        sequence,
+        target_counter32,
+        isr_entry_dwt_raw,
+        QTIMER_DWT_1S_LOCK_STREAK,
+        true);
+  }
+
+  const bool hz1k_ruler_qualified =
+      !QTIMER_DWT_1KHZ_REQUIRES_ONE_SECOND_LOCK || s->one_second.locked;
+  interrupt_integrity_note_qtimer_dwt_interval(
+      s->hz1k,
+      sequence,
+      target_counter32,
+      isr_entry_dwt_raw,
+      QTIMER_DWT_1KHZ_LOCK_STREAK,
+      hz1k_ruler_qualified);
+}
+
 
 // ============================================================================
 // Subscriber runtime
@@ -7778,9 +7993,11 @@ static void ocxo_cadence_capture_priority0(ocxo_runtime_context_t& ctx,
   // the authored target is a false/wrong-generation interrupt and must not
   // advance the +10,000 tick ladder.
   generation_gate_lane_t& generation_gate_lane = generation_gate_for_ocxo_kind(ctx.kind);
+  const uint32_t integrity_sequence =
+      generation_gate_lane.generation_gate_observe_count + 1U;
   interrupt_integrity_note_qtimer_cntr_match(
       ctx.kind,
-      generation_gate_lane.generation_gate_observe_count + 1U,
+      integrity_sequence,
       target_counter32,
       target_low16,
       service_counter_low16,
@@ -7900,6 +8117,12 @@ static void ocxo_cadence_capture_priority0(ocxo_runtime_context_t& ctx,
     return;
   }
 
+
+  interrupt_integrity_note_qtimer_dwt_match(ctx.kind,
+                                            integrity_sequence,
+                                            target_counter32,
+                                            isr_entry_dwt_raw,
+                                            one_second_due);
 
   const uint32_t raw_qtimer_event_dwt =
       qtimer_event_dwt_from_isr_entry_raw(isr_entry_dwt_raw);
@@ -8382,9 +8605,14 @@ static void qtimer1_vclock_capture_priority0(uint32_t isr_entry_dwt_raw,
   const uint16_t service_low16 = generation_gate_ambient_low16;
   const uint32_t service_counter32 =
       vclock_synthetic_from_hardware_low16(service_low16);
+  const uint32_t integrity_sequence =
+      g_generation_gate_vclock.generation_gate_observe_count + 1U;
+  const bool one_second_boundary =
+      g_vclock_lane.phase_bootstrapped &&
+      ((g_vclock_lane.tick_mod_1000 + 1U) >= TICKS_PER_SECOND_EVENT);
   interrupt_integrity_note_qtimer_cntr_match(
       interrupt_subscriber_kind_t::VCLOCK,
-      g_generation_gate_vclock.generation_gate_observe_count + 1U,
+      integrity_sequence,
       target_counter32,
       target_low16,
       service_low16,
@@ -8410,6 +8638,11 @@ static void qtimer1_vclock_capture_priority0(uint32_t isr_entry_dwt_raw,
     return;
   }
 
+  interrupt_integrity_note_qtimer_dwt_match(interrupt_subscriber_kind_t::VCLOCK,
+                                            integrity_sequence,
+                                            target_counter32,
+                                            isr_entry_dwt_raw,
+                                            one_second_boundary);
 
   uint32_t vclock_observed_dwt_at_target =
       qtimer_event_dwt_from_isr_entry_raw(isr_entry_dwt_raw);
@@ -9917,6 +10150,69 @@ static FLASHMEM void add_qtimer_cntr_integrity_object(
   parent.add_object(name, v);
 }
 
+
+static FLASHMEM void add_qtimer_dwt_interval_object(
+    Payload& parent,
+    const char* name,
+    const interrupt_integrity_qtimer_dwt_interval_check_t& q) {
+  Payload v;
+  v.add("valid", q.valid);
+  v.add("previous_valid", q.previous_valid);
+  v.add("ruler_qualified", q.ruler_qualified);
+  v.add("ruler_wait_count", q.ruler_wait_count);
+  v.add("first_qualified_sequence", q.first_qualified_sequence);
+  v.add("ruler_qualification_count", q.ruler_qualification_count);
+  v.add("last_ok", q.last_ok);
+  v.add("test_count", q.test_count);
+  v.add("match_count", q.match_count);
+  v.add("mismatch_count", q.mismatch_count);
+  v.add("skipped_count", q.skipped_count);
+  v.add("too_short_count", q.too_short_count);
+  v.add("too_long_count", q.too_long_count);
+  v.add("locked", q.locked);
+  v.add("lock_sequence", q.lock_sequence);
+  v.add("lock_count", q.lock_count);
+  v.add("lock_streak_required", q.lock_streak_required);
+  v.add("consecutive_ok_count", q.consecutive_ok_count);
+  v.add("prelock_match_count", q.prelock_match_count);
+  v.add("prelock_mismatch_count", q.prelock_mismatch_count);
+  v.add("post_lock_match_count", q.post_lock_match_count);
+  v.add("post_lock_mismatch_count", q.post_lock_mismatch_count);
+  v.add("first_mismatch_sequence", q.first_mismatch_sequence);
+  v.add("last_mismatch_sequence", q.last_mismatch_sequence);
+  v.add("last_mismatch_error_cycles", q.last_mismatch_error_cycles);
+  v.add("last_mismatch_observed_cycles", q.last_mismatch_observed_cycles);
+  v.add("last_mismatch_expected_cycles", q.last_mismatch_expected_cycles);
+  v.add("sequence", q.sequence);
+  v.add("target_counter32", q.target_counter32);
+  v.add("dwt_at_match", q.dwt_at_match);
+  v.add("interval_previous_sequence", q.interval_previous_sequence);
+  v.add("interval_previous_target_counter32", q.interval_previous_target_counter32);
+  v.add("interval_previous_dwt_at_match", q.interval_previous_dwt_at_match);
+  v.add("target_delta_ticks", q.target_delta_ticks);
+  v.add("observed_cycles", q.observed_cycles);
+  v.add("expected_cycles", q.expected_cycles);
+  v.add("error_cycles", q.error_cycles);
+  v.add("abs_error_cycles", q.abs_error_cycles);
+  v.add("gate_cycles", q.gate_cycles);
+  parent.add_object(name, v);
+}
+
+static FLASHMEM void add_qtimer_dwt_integrity_object(
+    Payload& parent,
+    const char* name,
+    const interrupt_integrity_qtimer_dwt_match_check_t& q) {
+  Payload v;
+  v.add("valid", q.valid);
+  v.add("sequence", q.sequence);
+  v.add("target_counter32", q.target_counter32);
+  v.add("dwt_at_match", q.dwt_at_match);
+  v.add("one_second_boundary", q.one_second_boundary);
+  add_qtimer_dwt_interval_object(v, "hz1k", q.hz1k);
+  add_qtimer_dwt_interval_object(v, "one_second", q.one_second);
+  parent.add_object(name, v);
+}
+
 static FLASHMEM Payload cmd_report_integrity(const Payload&) {
   interrupt_integrity_snapshot_t s{};
   const bool snapshot_valid = interrupt_integrity_snapshot(&s);
@@ -9925,10 +10221,10 @@ static FLASHMEM Payload cmd_report_integrity(const Payload&) {
   p.add("report", "INTERRUPT_INTEGRITY");
   p.add("schema", "INTERRUPT_INTEGRITY_V1");
   p.add("description",
-        "Passive VCLOCK GNSS and QuadTimer CNTR/compare integrity checks");
+        "Passive VCLOCK GNSS, QuadTimer CNTR, and QuadTimer DWT integrity checks");
   p.add("valid", snapshot_valid);
   p.add("snapshot_count", s.snapshot_count);
-  p.add("active_checks", "vclock_gnss_ns qtimer_cntr_match");
+  p.add("active_checks", "vclock_gnss_ns qtimer_cntr_match qtimer_dwt_match");
   p.add("inactive_checks", "vclock_pps_interval vclock_counter ocxo1_counter ocxo2_counter");
 
   const interrupt_integrity_gnss_ns_check_t& g = s.vclock_gnss_ns;
@@ -9974,6 +10270,22 @@ static FLASHMEM Payload cmd_report_integrity(const Payload&) {
   add_qtimer_cntr_integrity_object(qtimer, "ocxo2",
                                    s.ocxo2_qtimer_cntr);
   p.add_object("qtimer_cntr_match", qtimer);
+
+  Payload qdwt;
+  qdwt.add("description",
+           "First-instruction DWT interval must match target interval within gate");
+  qdwt.add("gate_cycles", QTIMER_DWT_MATCH_GATE_CYCLES);
+  qdwt.add("hz1k_lock_streak_required", QTIMER_DWT_1KHZ_LOCK_STREAK);
+  qdwt.add("one_second_lock_streak_required", QTIMER_DWT_1S_LOCK_STREAK);
+  qdwt.add("hz1k_requires_one_second_lock",
+           QTIMER_DWT_1KHZ_REQUIRES_ONE_SECOND_LOCK);
+  add_qtimer_dwt_integrity_object(qdwt, "vclock",
+                                  s.vclock_qtimer_dwt);
+  add_qtimer_dwt_integrity_object(qdwt, "ocxo1",
+                                  s.ocxo1_qtimer_dwt);
+  add_qtimer_dwt_integrity_object(qdwt, "ocxo2",
+                                  s.ocxo2_qtimer_dwt);
+  p.add_object("qtimer_dwt_match", qdwt);
 
   return p;
 }
