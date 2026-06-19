@@ -445,6 +445,42 @@ struct interrupt_integrity_gnss_ns_check_t {
   uint32_t anchor_failure_mask = 0;
 };
 
+struct interrupt_integrity_qtimer_cntr_match_check_t {
+  bool     valid = false;
+  bool     last_ok = false;
+  uint32_t test_count = 0;
+  uint32_t match_count = 0;       // delta_signed_ticks == expected_offset_ticks
+  uint32_t mismatch_count = 0;
+
+  // Lock boundary: startup/pre-grid transients remain in lifetime/prelock
+  // accounting, while post_lock_* answers whether the invariant has ever
+  // failed after a lane produced a sustained run of clean observations.
+  bool     locked = false;
+  uint32_t lock_sequence = 0;
+  uint32_t lock_count = 0;
+  uint32_t lock_streak_required = 0;
+  uint32_t consecutive_ok_count = 0;
+  uint32_t prelock_match_count = 0;
+  uint32_t prelock_mismatch_count = 0;
+  uint32_t post_lock_match_count = 0;
+  uint32_t post_lock_mismatch_count = 0;
+  uint32_t first_mismatch_sequence = 0;
+  uint32_t last_mismatch_sequence = 0;
+  int32_t  last_mismatch_delta_signed_ticks = 0;
+  int32_t  last_mismatch_observed_minus_expected_offset_ticks = 0;
+
+  uint32_t sequence = 0;
+  uint32_t target_counter32 = 0;
+  uint16_t expected_low16 = 0;
+  uint16_t ambient_low16 = 0;
+  int32_t  expected_offset_ticks = 0;
+  uint32_t delta_mod65536_ticks = 0;
+  int32_t  delta_signed_ticks = 0;
+  int32_t  observed_minus_expected_offset_ticks = 0;
+  uint32_t abs_delta_ticks = 0;
+  uint32_t isr_entry_dwt_raw = 0;
+};
+
 struct interrupt_integrity_snapshot_t {
   bool     valid = false;
   uint32_t snapshot_count = 0;
@@ -454,6 +490,14 @@ struct interrupt_integrity_snapshot_t {
   // to the labeled anchor sequence, not to process_interrupt's local sequence
   // zero, because CLOCKS owns the campaign GNSS label epoch.
   interrupt_integrity_gnss_ns_check_t vclock_gnss_ns;
+
+  // Immediate QuadTimer CNTR read after ISR-entry DWT must observe the
+  // compare target plus the deterministic hardware/CPU read offset.  This
+  // checks compare-service timing/custody without changing the compare-
+  // generation gate or publishing policy.
+  interrupt_integrity_qtimer_cntr_match_check_t vclock_qtimer_cntr;
+  interrupt_integrity_qtimer_cntr_match_check_t ocxo1_qtimer_cntr;
+  interrupt_integrity_qtimer_cntr_match_check_t ocxo2_qtimer_cntr;
 
   // VCLOCK selected-edge DWT interval must agree with the physical PPS DWT
   // interval within the configured diagnostic gate.

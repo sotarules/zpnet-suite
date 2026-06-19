@@ -166,12 +166,27 @@ static constexpr uint32_t EPOCH_CAPTURE_MAX_WINDOW_CYCLES =
 // arithmetic over already-authored edge facts.
 static constexpr uint32_t VCLOCK_PPS_INTERVAL_INTEGRITY_GATE_CYCLES = 10U;
 static constexpr int64_t  VCLOCK_GNSS_NS_INTEGRITY_GATE_NS = 16LL;
+// Immediate CNTR-vs-COMP low-word check.  Live evidence shows the first
+// priority-0 CNTR read after the sacred DWT capture is deterministically one
+// 10 MHz tick after the compare target on all active QuadTimer lanes.
+// Treat +1 as the invariant; exact target equality is not expected here.
+static constexpr int32_t QTIMER_CNTR_MATCH_EXPECTED_OFFSET_TICKS = 1;
+// A lane is considered locked after this many consecutive +1 observations.
+// This separates startup/pre-grid transients from steady-state integrity.
+static constexpr uint32_t QTIMER_CNTR_MATCH_LOCK_STREAK = 1000U;
 
 static interrupt_integrity_snapshot_t g_interrupt_integrity = {};
 
 static void interrupt_integrity_note_vclock_gnss_ns(uint32_t sequence,
                                                     uint32_t dwt_at_edge,
                                                     uint32_t counter32_at_edge);
+static void interrupt_integrity_note_qtimer_cntr_match(
+    interrupt_subscriber_kind_t kind,
+    uint32_t sequence,
+    uint32_t target_counter32,
+    uint16_t expected_low16,
+    uint16_t ambient_low16,
+    uint32_t isr_entry_dwt_raw);
 
 static uint32_t interrupt_integrity_abs_i32(int32_t value) {
   return value < 0 ? (uint32_t)(-(int64_t)value) : (uint32_t)value;
@@ -196,11 +211,28 @@ interrupt_integrity_counter_store(interrupt_subscriber_kind_t kind) {
   }
 }
 
+static interrupt_integrity_qtimer_cntr_match_check_t*
+interrupt_integrity_qtimer_cntr_store(interrupt_subscriber_kind_t kind) {
+  switch (kind) {
+    case interrupt_subscriber_kind_t::VCLOCK:
+      return &g_interrupt_integrity.vclock_qtimer_cntr;
+    case interrupt_subscriber_kind_t::OCXO1:
+      return &g_interrupt_integrity.ocxo1_qtimer_cntr;
+    case interrupt_subscriber_kind_t::OCXO2:
+      return &g_interrupt_integrity.ocxo2_qtimer_cntr;
+    default:
+      return nullptr;
+  }
+}
+
 bool interrupt_integrity_snapshot(interrupt_integrity_snapshot_t* out) {
   if (!out) return false;
   g_interrupt_integrity.snapshot_count++;
   g_interrupt_integrity.valid =
       g_interrupt_integrity.vclock_gnss_ns.valid ||
+      g_interrupt_integrity.vclock_qtimer_cntr.valid ||
+      g_interrupt_integrity.ocxo1_qtimer_cntr.valid ||
+      g_interrupt_integrity.ocxo2_qtimer_cntr.valid ||
       g_interrupt_integrity.vclock_pps_interval.valid ||
       g_interrupt_integrity.vclock_counter.valid ||
       g_interrupt_integrity.ocxo1_counter.valid ||
@@ -1940,6 +1972,79 @@ static void interrupt_integrity_note_vclock_gnss_ns(uint32_t sequence,
   } else {
     s.mismatch_count++;
     s.last_ok = false;
+  }
+}
+
+static void interrupt_integrity_note_qtimer_cntr_match(
+    interrupt_subscriber_kind_t kind,
+    uint32_t sequence,
+    uint32_t target_counter32,
+    uint16_t expected_low16,
+    uint16_t ambient_low16,
+    uint32_t isr_entry_dwt_raw) {
+  interrupt_integrity_qtimer_cntr_match_check_t* s =
+      interrupt_integrity_qtimer_cntr_store(kind);
+  if (!s) return;
+
+  const uint16_t delta_mod = (uint16_t)(ambient_low16 - expected_low16);
+  const int32_t delta_signed = (int32_t)((int16_t)delta_mod);
+  const uint32_t abs_delta = interrupt_integrity_abs_i32(delta_signed);
+
+  s->valid = true;
+  s->sequence = sequence;
+  s->target_counter32 = target_counter32;
+  s->expected_low16 = expected_low16;
+  s->ambient_low16 = ambient_low16;
+  s->delta_mod65536_ticks = (uint32_t)delta_mod;
+  s->delta_signed_ticks = delta_signed;
+  s->abs_delta_ticks = abs_delta;
+  s->expected_offset_ticks = QTIMER_CNTR_MATCH_EXPECTED_OFFSET_TICKS;
+  s->lock_streak_required = QTIMER_CNTR_MATCH_LOCK_STREAK;
+  s->observed_minus_expected_offset_ticks =
+      delta_signed - QTIMER_CNTR_MATCH_EXPECTED_OFFSET_TICKS;
+  s->isr_entry_dwt_raw = isr_entry_dwt_raw;
+  s->test_count++;
+
+  const bool was_locked = s->locked;
+  const bool ok = (delta_signed == QTIMER_CNTR_MATCH_EXPECTED_OFFSET_TICKS);
+
+  if (ok) {
+    s->match_count++;
+    s->last_ok = true;
+    if (s->consecutive_ok_count != UINT32_MAX) {
+      s->consecutive_ok_count++;
+    }
+  } else {
+    s->mismatch_count++;
+    s->last_ok = false;
+    s->consecutive_ok_count = 0;
+    if (s->first_mismatch_sequence == 0) {
+      s->first_mismatch_sequence = sequence;
+    }
+    s->last_mismatch_sequence = sequence;
+    s->last_mismatch_delta_signed_ticks = delta_signed;
+    s->last_mismatch_observed_minus_expected_offset_ticks =
+        s->observed_minus_expected_offset_ticks;
+  }
+
+  if (was_locked) {
+    if (ok) {
+      s->post_lock_match_count++;
+    } else {
+      s->post_lock_mismatch_count++;
+    }
+  } else {
+    if (ok) {
+      s->prelock_match_count++;
+    } else {
+      s->prelock_mismatch_count++;
+    }
+
+    if (ok && s->consecutive_ok_count >= QTIMER_CNTR_MATCH_LOCK_STREAK) {
+      s->locked = true;
+      s->lock_sequence = sequence;
+      s->lock_count++;
+    }
   }
 }
 
@@ -7673,6 +7778,13 @@ static void ocxo_cadence_capture_priority0(ocxo_runtime_context_t& ctx,
   // the authored target is a false/wrong-generation interrupt and must not
   // advance the +10,000 tick ladder.
   generation_gate_lane_t& generation_gate_lane = generation_gate_for_ocxo_kind(ctx.kind);
+  interrupt_integrity_note_qtimer_cntr_match(
+      ctx.kind,
+      generation_gate_lane.generation_gate_observe_count + 1U,
+      target_counter32,
+      target_low16,
+      service_counter_low16,
+      isr_entry_dwt_raw);
   const uint32_t gate_clock32_current_counter32 = ctx.clock32
       ? ctx.clock32->current_counter32
       : target_counter32;
@@ -8270,6 +8382,13 @@ static void qtimer1_vclock_capture_priority0(uint32_t isr_entry_dwt_raw,
   const uint16_t service_low16 = generation_gate_ambient_low16;
   const uint32_t service_counter32 =
       vclock_synthetic_from_hardware_low16(service_low16);
+  interrupt_integrity_note_qtimer_cntr_match(
+      interrupt_subscriber_kind_t::VCLOCK,
+      g_generation_gate_vclock.generation_gate_observe_count + 1U,
+      target_counter32,
+      target_low16,
+      service_low16,
+      isr_entry_dwt_raw);
   const bool generation_accepted = generation_gate_record(
       g_generation_gate_vclock,
       service_counter32,
@@ -9759,6 +9878,45 @@ static FLASHMEM void add_payload_u64_string(Payload& p,
   p.add(key, buf);
 }
 
+static FLASHMEM void add_qtimer_cntr_integrity_object(
+    Payload& parent,
+    const char* name,
+    const interrupt_integrity_qtimer_cntr_match_check_t& q) {
+  Payload v;
+  v.add("valid", q.valid);
+  v.add("last_ok", q.last_ok);
+  v.add("test_count", q.test_count);
+  v.add("match_count", q.match_count);
+  v.add("mismatch_count", q.mismatch_count);
+  v.add("locked", q.locked);
+  v.add("lock_sequence", q.lock_sequence);
+  v.add("lock_count", q.lock_count);
+  v.add("lock_streak_required", q.lock_streak_required);
+  v.add("consecutive_ok_count", q.consecutive_ok_count);
+  v.add("prelock_match_count", q.prelock_match_count);
+  v.add("prelock_mismatch_count", q.prelock_mismatch_count);
+  v.add("post_lock_match_count", q.post_lock_match_count);
+  v.add("post_lock_mismatch_count", q.post_lock_mismatch_count);
+  v.add("first_mismatch_sequence", q.first_mismatch_sequence);
+  v.add("last_mismatch_sequence", q.last_mismatch_sequence);
+  v.add("last_mismatch_delta_signed_ticks",
+        q.last_mismatch_delta_signed_ticks);
+  v.add("last_mismatch_observed_minus_expected_offset_ticks",
+        q.last_mismatch_observed_minus_expected_offset_ticks);
+  v.add("sequence", q.sequence);
+  v.add("target_counter32", q.target_counter32);
+  v.add("expected_low16", (uint32_t)q.expected_low16);
+  v.add("ambient_low16", (uint32_t)q.ambient_low16);
+  v.add("expected_offset_ticks", q.expected_offset_ticks);
+  v.add("delta_mod65536_ticks", q.delta_mod65536_ticks);
+  v.add("delta_signed_ticks", q.delta_signed_ticks);
+  v.add("observed_minus_expected_offset_ticks",
+        q.observed_minus_expected_offset_ticks);
+  v.add("abs_delta_ticks", q.abs_delta_ticks);
+  v.add("isr_entry_dwt_raw", q.isr_entry_dwt_raw);
+  parent.add_object(name, v);
+}
+
 static FLASHMEM Payload cmd_report_integrity(const Payload&) {
   interrupt_integrity_snapshot_t s{};
   const bool snapshot_valid = interrupt_integrity_snapshot(&s);
@@ -9767,10 +9925,10 @@ static FLASHMEM Payload cmd_report_integrity(const Payload&) {
   p.add("report", "INTERRUPT_INTEGRITY");
   p.add("schema", "INTERRUPT_INTEGRITY_V1");
   p.add("description",
-        "Passive VCLOCK DWT-to-GNSS nanosecond integrity checks");
+        "Passive VCLOCK GNSS and QuadTimer CNTR/compare integrity checks");
   p.add("valid", snapshot_valid);
   p.add("snapshot_count", s.snapshot_count);
-  p.add("active_checks", "vclock_gnss_ns");
+  p.add("active_checks", "vclock_gnss_ns qtimer_cntr_match");
   p.add("inactive_checks", "vclock_pps_interval vclock_counter ocxo1_counter ocxo2_counter");
 
   const interrupt_integrity_gnss_ns_check_t& g = s.vclock_gnss_ns;
@@ -9802,6 +9960,20 @@ static FLASHMEM Payload cmd_report_integrity(const Payload&) {
   add_payload_u64_string(v, "anchor_ns_delta", g.anchor_ns_delta);
   v.add("anchor_failure_mask", g.anchor_failure_mask);
   p.add_object("vclock_gnss_ns", v);
+
+  Payload qtimer;
+  qtimer.add("description",
+             "Immediate priority-0 CNTR read must be exactly target+1 tick");
+  qtimer.add("expected_offset_ticks",
+             QTIMER_CNTR_MATCH_EXPECTED_OFFSET_TICKS);
+  qtimer.add("lock_streak_required", QTIMER_CNTR_MATCH_LOCK_STREAK);
+  add_qtimer_cntr_integrity_object(qtimer, "vclock",
+                                   s.vclock_qtimer_cntr);
+  add_qtimer_cntr_integrity_object(qtimer, "ocxo1",
+                                   s.ocxo1_qtimer_cntr);
+  add_qtimer_cntr_integrity_object(qtimer, "ocxo2",
+                                   s.ocxo2_qtimer_cntr);
+  p.add_object("qtimer_cntr_match", qtimer);
 
   return p;
 }
