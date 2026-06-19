@@ -239,9 +239,10 @@ struct interrupt_capture_diag_t {
   uint32_t ocxo_boundary_counter32_at_event = 0;
   int32_t  ocxo_boundary_correction_cycles = 0;
 
-  // SlipLedger correction/forensics.  process_interrupt mutates only the
-  // lane-local signed compare-arm displacement; subscribers receive the
-  // purified DWT edge while TIMEBASE carries these counters/summaries.
+  // Retired SlipLedger compatibility fields.  process_interrupt no longer
+  // owns or updates a SlipLedger state machine; these fields remain in the
+  // public diagnostic ABI so existing CLOCKS/TIMEBASE/raw_cycles consumers
+  // compile unchanged and observe default zero/null values.
   bool     slipledger_active = false;
   bool     slipledger_event_corrected = false;
   bool     slipledger_event_violation = false;
