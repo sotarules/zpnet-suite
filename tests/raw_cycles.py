@@ -1,5 +1,5 @@
 """
-ZPNet Raw Cycles — raw / EMA / FloorLine / published cycle audit.
+ZPNet Raw Cycles — raw / FloorLine / published cycle audit.
 
 Reads TIMEBASE rows for a campaign and prints a compact one-second DWT-cycle
 audit.  PPS is always shown as the base rail.  By default the report shows
@@ -22,24 +22,17 @@ Column doctrine:
               when present, otherwise from original/observed DWT endpoints.
     *_rawΔ    raw interval first-difference residual:
               raw_interval[n] - raw_interval[n-1].
-    *_ema     EMA-authored interval from dwt_interval_gate.effective_cycles
-              when present, otherwise from the EMA endpoint if present.
-    *_emaΔ    EMA interval first-difference residual:
-              ema_interval[n] - ema_interval[n-1].
     *_fl      FloorLine inferred interval from regression/FloorLine inferred
               DWT endpoints.
     *_flΔ     FloorLine interval first-difference residual:
               fl_interval[n] - fl_interval[n-1].
-    *_pub     the subscriber-facing published interval, regardless of which
-              algorithm authored it.
+    *_pub     the subscriber-facing published interval.
     *_pubΔ    published interval first-difference residual:
               pub_interval[n] - pub_interval[n-1].
-    *_f-r     FloorLine interval minus raw/evidence interval.
-    *_p-r     published interval minus raw/evidence interval.
     *_cΔ      counter32 delta since the previous subscriber event.
 
 Core rail columns are always shown for each selected lane so the report shape
-stays stable across EMA and FloorLine firmware builds.  Truly auxiliary columns
+stays stable across current FloorLine firmware builds.  Truly auxiliary columns
 (such as counter32 lineage) are still omitted when absent.
 """
 
@@ -632,11 +625,11 @@ def collect_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]
     prev_pps_dwt: Optional[int] = None
     prev_pps_interval: Optional[int] = None
     prev_lane_dwt: Dict[str, Dict[str, Optional[int]]] = {
-        lane: {"raw": None, "ema": None, "fl": None, "pub": None}
+        lane: {"raw": None, "fl": None, "pub": None}
         for lane in CLOCKS
     }
     prev_lane_interval: Dict[str, Dict[str, Optional[int]]] = {
-        lane: {"raw": None, "ema": None, "fl": None, "pub": None}
+        lane: {"raw": None, "fl": None, "pub": None}
         for lane in CLOCKS
     }
 
@@ -645,11 +638,11 @@ def collect_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]
         prev_pps_dwt = None
         prev_pps_interval = None
         prev_lane_dwt = {
-            lane: {"raw": None, "ema": None, "fl": None, "pub": None}
+            lane: {"raw": None, "fl": None, "pub": None}
             for lane in CLOCKS
         }
         prev_lane_interval = {
-            lane: {"raw": None, "ema": None, "fl": None, "pub": None}
+            lane: {"raw": None, "fl": None, "pub": None}
             for lane in CLOCKS
         }
 
@@ -703,14 +696,14 @@ def collect_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]
             if raw_interval is None:
                 raw_interval = pub_actual
 
-            ema_interval = gate.get("effective_cycles")
-            if ema_interval is None:
-                # In many builds predicted_dwt is the EMA/predictor endpoint.
-                ema_interval = _interval_from_endpoints(predicted_dwt, prev_lane_dwt[lane]["ema"])
-            if ema_interval is None and pub_actual is not None and fl_inferred_dwt is None:
-                # Old baselines were EMA-published, so the published interval
-                # is the best EMA surface available.
-                ema_interval = pub_actual
+            # Legacy firmware used dwt_interval_gate.effective_cycles as an
+            # EMA-authored interval.  Current EMA-retired firmware still emits
+            # *_eff as a compatibility/effective interval, but it is no longer
+            # a report rail.  Keep it only as a hidden fallback for old rows
+            # whose published endpoint equals a predicted/effective endpoint.
+            effective_interval = gate.get("effective_cycles")
+            if effective_interval is None:
+                effective_interval = _interval_from_endpoints(predicted_dwt, prev_lane_dwt[lane]["pub"])
 
             fl_interval = fl.get("inferred_interval_cycles")
             if fl_interval is None:
@@ -730,9 +723,9 @@ def collect_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]
                 elif (
                     predicted_dwt is not None and
                     used_dwt == predicted_dwt and
-                    ema_interval is not None
+                    effective_interval is not None
                 ):
-                    pub_interval = ema_interval
+                    pub_interval = effective_interval
                 elif (
                     original_dwt is not None and
                     used_dwt == original_dwt and
@@ -748,27 +741,10 @@ def collect_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]
             data = {
                 "raw": raw_interval,
                 "raw_delta": _interval_delta(raw_interval, prev_lane_interval[lane]["raw"]),
-                "ema": ema_interval,
-                "ema_delta": _interval_delta(ema_interval, prev_lane_interval[lane]["ema"]),
                 "fl": fl_interval,
                 "fl_delta": _interval_delta(fl_interval, prev_lane_interval[lane]["fl"]),
                 "pub": pub_interval,
                 "pub_delta": _interval_delta(pub_interval, prev_lane_interval[lane]["pub"]),
-                "fl_minus_raw": (
-                    fl_interval - raw_interval
-                    if fl_interval is not None and raw_interval is not None
-                    else None
-                ),
-                "pub_minus_raw": (
-                    pub_interval - raw_interval
-                    if pub_interval is not None and raw_interval is not None
-                    else None
-                ),
-                "ema_minus_raw": (
-                    ema_interval - raw_interval
-                    if ema_interval is not None and raw_interval is not None
-                    else None
-                ),
                 "counter_delta": lane_counter_delta(root, frag, forensic, lane_key),
                 "fl_edge_minus_observed": fl.get("inferred_minus_observed"),
                 "fl_sample_count": fl.get("sample_count"),
@@ -776,12 +752,11 @@ def collect_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]
                 "pub_synthetic": auth.get("synthetic"),
                 "pub_used_dwt": used_dwt,
                 "raw_dwt": _first_int(original_dwt, fl_observed_dwt),
-                "ema_dwt": predicted_dwt,
                 "fl_dwt": fl_inferred_dwt,
             }
             row["lanes"][lane] = data
 
-            for algo in ("raw", "ema", "fl", "pub"):
+            for algo in ("raw", "fl", "pub"):
                 if data[algo] is not None:
                     prev_lane_interval[lane][algo] = data[algo]
 
@@ -790,12 +765,6 @@ def collect_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]
             elif fl_observed_dwt is not None:
                 prev_lane_dwt[lane]["raw"] = fl_observed_dwt
 
-            if predicted_dwt is not None:
-                prev_lane_dwt[lane]["ema"] = predicted_dwt
-            elif ema_interval is not None and prev_lane_dwt[lane]["ema"] is None:
-                # Keep the key initialized for older baselines without
-                # endpoint-level EMA data; no endpoint delta will be derived.
-                prev_lane_dwt[lane]["ema"] = None
 
             if fl_inferred_dwt is not None:
                 prev_lane_dwt[lane]["fl"] = fl_inferred_dwt
@@ -821,10 +790,8 @@ def available_columns(collected: List[Dict[str, Any]],
     # formatting decision instead of useful evidence.
     always = [
         "raw", "raw_delta",
-        "ema", "ema_delta",
         "fl", "fl_delta",
         "pub", "pub_delta",
-        "fl_minus_raw", "pub_minus_raw",
     ]
     optional = ["counter_delta"]
 
@@ -843,14 +810,10 @@ def _col_label(lane: str, col: str) -> str:
     return {
         "raw": f"{p}_raw",
         "raw_delta": f"{p}_rawΔ",
-        "ema": f"{p}_ema",
-        "ema_delta": f"{p}_emaΔ",
         "fl": f"{p}_fl",
         "fl_delta": f"{p}_flΔ",
         "pub": f"{p}_pub",
         "pub_delta": f"{p}_pubΔ",
-        "fl_minus_raw": f"{p}_f-r",
-        "pub_minus_raw": f"{p}_p-r",
         "counter_delta": f"{p}_cΔ",
     }[col]
 
@@ -859,21 +822,16 @@ def _col_width(col: str) -> int:
     return {
         "raw": 13,
         "raw_delta": 8,
-        "ema": 13,
-        "ema_delta": 8,
         "fl": 13,
         "fl_delta": 8,
         "pub": 13,
         "pub_delta": 8,
-        "fl_minus_raw": 7,
-        "pub_minus_raw": 7,
         "counter_delta": 11,
     }[col]
 
 
 def _col_signed(col: str) -> bool:
-    return col in ("raw_delta", "ema_delta", "fl_delta", "pub_delta",
-                   "fl_minus_raw", "pub_minus_raw")
+    return col in ("raw_delta", "fl_delta", "pub_delta")
 
 
 def _headers_for(clocks: Tuple[str, ...],
@@ -942,13 +900,12 @@ def analyze(campaign: str,
     clock_label = "ALL" if clock_filter is None else clock_filter
     print(f"Campaign: {campaign}  ({len(rows):,} rows, view={clock_label})")
     print()
-    print("Raw / EMA / FloorLine / published cycle audit")
-    print("══════════════════════════════════════════════")
+    print("Raw / FloorLine / published cycle audit")
+    print("══════════════════════════════════════")
     print("  PPS is always the base rail.")
-    print("  *_raw = evidence interval, *_ema = EMA interval, *_fl = FloorLine interval,")
+    print("  *_raw = evidence interval, *_fl = FloorLine interval,")
     print("  *_pub = subscriber-facing published interval.")
-    print("  *Δ columns are per-algorithm cycle-count residuals: interval[n] - interval[n-1].")
-    print("  *_f-r = FL-raw, *_p-r = pub-raw.")
+    print("  *Δ columns are per-rail cycle-count residuals: interval[n] - interval[n-1].")
     print("  Core rail columns are always shown; missing FL data is shown as --- on purpose.")
     print()
 
@@ -968,14 +925,13 @@ def analyze(campaign: str,
         "pps_delta": Welford(),
     }
     for lane in clocks:
-        for key in ("raw", "raw_delta", "ema", "ema_delta",
+        for key in ("raw", "raw_delta",
                     "fl", "fl_delta", "pub", "pub_delta",
-                    "fl_minus_raw", "pub_minus_raw", "ema_minus_raw",
                     "counter_delta", "fl_edge_minus_observed"):
             stats[f"{lane}.{key}"] = Welford()
 
     coverage: Dict[str, Dict[str, int]] = {
-        lane: {key: 0 for key in ("raw", "ema", "fl", "pub", "counter_delta")}
+        lane: {key: 0 for key in ("raw", "fl", "pub", "counter_delta")}
         for lane in clocks
     }
 
@@ -984,9 +940,8 @@ def analyze(campaign: str,
         add_optional(stats["pps_delta"], row["pps_delta"])
         for lane in clocks:
             data = row["lanes"][lane]
-            for key in ("raw", "raw_delta", "ema", "ema_delta",
+            for key in ("raw", "raw_delta",
                         "fl", "fl_delta", "pub", "pub_delta",
-                        "fl_minus_raw", "pub_minus_raw", "ema_minus_raw",
                         "counter_delta", "fl_edge_minus_observed"):
                 add_optional(stats[f"{lane}.{key}"], data.get(key))
             for key in coverage[lane]:
@@ -999,7 +954,7 @@ def analyze(campaign: str,
     for lane in clocks:
         c = coverage[lane]
         print(
-            f"  {lane:<6s} raw={c['raw']:,}  ema={c['ema']:,}  "
+            f"  {lane:<6s} raw={c['raw']:,}  "
             f"fl={c['fl']:,}  pub={c['pub']:,}  cΔ={c['counter_delta']:,}"
         )
     print()
@@ -1013,30 +968,24 @@ def analyze(campaign: str,
         print()
         _print_welford(f"{lane} raw interval", stats[f"{lane}.raw"])
         _print_welford(f"{lane} raw cycle-count residual", stats[f"{lane}.raw_delta"])
-        _print_welford(f"{lane} EMA interval", stats[f"{lane}.ema"])
-        _print_welford(f"{lane} EMA cycle-count residual", stats[f"{lane}.ema_delta"])
         _print_welford(f"{lane} FloorLine interval", stats[f"{lane}.fl"])
         _print_welford(f"{lane} FloorLine cycle-count residual", stats[f"{lane}.fl_delta"])
         _print_welford(f"{lane} published interval", stats[f"{lane}.pub"])
         _print_welford(f"{lane} published cycle-count residual", stats[f"{lane}.pub_delta"])
-        _print_welford(f"{lane} EMA - raw", stats[f"{lane}.ema_minus_raw"])
-        _print_welford(f"{lane} FloorLine - raw", stats[f"{lane}.fl_minus_raw"])
-        _print_welford(f"{lane} published - raw", stats[f"{lane}.pub_minus_raw"])
         _print_welford(f"{lane} FL edge - observed edge", stats[f"{lane}.fl_edge_minus_observed"])
         _print_welford(f"{lane} counter32 delta", stats[f"{lane}.counter_delta"], unit="ticks")
 
     print()
     print("Notes")
     print("═════")
-    print("  • The old report's PPS-Yardstick columns were removed from the normal view;")
-    print("    this report is now focused on the publication decision: EMA vs FloorLine vs pub.")
-    print("  • *_pub is the ground-truth subscriber-facing interval.  If firmware is EMA-authored,")
-    print("    *_pub should match *_ema.  If firmware is FloorLine-authored, *_pub should match *_fl.")
+    print("  • The old EMA/effective columns were removed from the normal view;")
+    print("    this report is now focused on the publication decision: raw vs FloorLine vs pub.")
+    print("  • *_pub is the ground-truth subscriber-facing interval.  In the current")
+    print("    FloorLine-authored firmware, *_pub should match *_fl.")
     print("  • *Δ columns are cycle-count residuals computed separately per rail:")
     print("    interval[n] - interval[n-1].")
     print("  • FloorLine columns are intentionally always visible.  If *_fl stays ---,")
     print("    the TIMEBASE row stream did not expose a FloorLine endpoint that this parser found.")
-    print("  • *_f-r and *_p-r are computed only when both surfaces exist in the TIMEBASE row stream.")
     print("  • Use --clock VCLOCK, --clock OCXO1, or --clock OCXO2 to keep the row narrow.")
     print()
 
