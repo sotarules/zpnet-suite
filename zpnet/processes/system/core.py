@@ -28,7 +28,7 @@ import threading
 import time
 from pathlib import Path
 from statistics import mean
-from typing import Dict, Tuple, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import psutil
 import requests
@@ -45,7 +45,14 @@ from zpnet.shared.db import open_db
 from zpnet.shared.events import create_event
 from zpnet.shared.http import gzip_text
 from zpnet.shared.logger import setup_logging
-from zpnet.shared.util import normalize_payload, normalize_ts
+from zpnet.shared.util import (
+    feature_get,
+    feature_summary,
+    feature_status,
+    normalize_feature_status,
+    normalize_payload,
+    normalize_ts,
+)
 
 # ------------------------------------------------------------------
 # Configuration
@@ -218,6 +225,135 @@ POWER_SAMPLE_STEP = 5                # same semantics as before
 #     "pi":     { ... Raspberry Pi host metrics ... }
 #   }
 SYSTEM: Dict[str, object] = {}
+
+_SYSTEM_LOCK = threading.Lock()
+
+# ------------------------------------------------------------------
+# Feature status clearing house
+# ------------------------------------------------------------------
+
+FEATURE_STATUSES = {"INITIALIZING", "NOMINAL", "HOLD", "ANOMALY"}
+
+_FEATURE_LOCK = threading.Lock()
+_FEATURE_SEQUENCE = 0
+_PI_FEATURES: Dict[str, Dict[str, Dict[str, Dict[str, Any]]]] = {"PI": {}}
+
+
+def _utc_now_z() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _health_to_feature_status(health_state: Any) -> str:
+    return normalize_feature_status(health_state, default="INITIALIZING")
+
+
+def set_pi_feature(subsystem: str,
+                   feature: str,
+                   status: Any,
+                   detail: str = "",
+                   **extra: Any) -> Dict[str, Any]:
+    """Set one Pi-authored feature state in the local SYSTEM registry."""
+    global _FEATURE_SEQUENCE
+
+    subsystem_key = str(subsystem or "").strip().upper()
+    feature_key = str(feature or "").strip().upper()
+    if not subsystem_key or not feature_key:
+        raise ValueError("subsystem and feature are required")
+
+    entry: Dict[str, Any] = {
+        "machine": "PI",
+        "subsystem": subsystem_key,
+        "feature": feature_key,
+        "name": f"PI.{subsystem_key}.{feature_key}",
+        "status": normalize_feature_status(status),
+        "detail": str(detail or ""),
+        "updated_utc": _utc_now_z(),
+        "updated_monotonic_s": round(time.monotonic(), 3),
+    }
+    entry.update({k: v for k, v in extra.items() if v is not None})
+
+    with _FEATURE_LOCK:
+        _FEATURE_SEQUENCE += 1
+        entry["sequence"] = _FEATURE_SEQUENCE
+        _PI_FEATURES.setdefault("PI", {}).setdefault(subsystem_key, {})[feature_key] = dict(entry)
+
+    return dict(entry)
+
+
+def _copy_feature_tree(tree: Any) -> Dict[str, Dict[str, Dict[str, Dict[str, Any]]]]:
+    if not isinstance(tree, dict):
+        return {}
+
+    out: Dict[str, Dict[str, Dict[str, Dict[str, Any]]]] = {}
+    for machine, subsystems in tree.items():
+        if not isinstance(subsystems, dict):
+            continue
+        machine_key = str(machine).strip().upper()
+        machine_out: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        for subsystem, features in subsystems.items():
+            if not isinstance(features, dict):
+                continue
+            subsystem_key = str(subsystem).strip().upper()
+            subsystem_out: Dict[str, Dict[str, Any]] = {}
+            for feature, entry in features.items():
+                if isinstance(entry, dict):
+                    subsystem_out[str(feature).strip().upper()] = dict(entry)
+            if subsystem_out:
+                machine_out[subsystem_key] = subsystem_out
+        if machine_out:
+            out[machine_key] = machine_out
+    return out
+
+
+def _pi_feature_tree_snapshot() -> Dict[str, Dict[str, Dict[str, Dict[str, Any]]]]:
+    with _FEATURE_LOCK:
+        return _copy_feature_tree(_PI_FEATURES)
+
+
+def _teensy_feature_tree_from_report(teensy_payload: Dict[str, Any]) -> Dict[str, Dict[str, Dict[str, Dict[str, Any]]]]:
+    features = teensy_payload.get("features") if isinstance(teensy_payload, dict) else None
+    tree = _copy_feature_tree(features)
+    return {"TEENSY": tree["TEENSY"]} if "TEENSY" in tree else {}
+
+
+def _combine_feature_trees(*trees: Any) -> Dict[str, Dict[str, Dict[str, Dict[str, Any]]]]:
+    combined: Dict[str, Dict[str, Dict[str, Dict[str, Any]]]] = {}
+    for tree in trees:
+        for machine, subsystems in _copy_feature_tree(tree).items():
+            machine_out = combined.setdefault(machine, {})
+            for subsystem, features in subsystems.items():
+                subsystem_out = machine_out.setdefault(subsystem, {})
+                for feature, entry in features.items():
+                    subsystem_out[feature] = dict(entry)
+    return combined
+
+
+def _update_builtin_pi_features(*,
+                                pi_payload: Dict[str, Any],
+                                network_payload: Dict[str, Any],
+                                sensor_payload: Dict[str, Any],
+                                environment_payload: Dict[str, Any],
+                                gnss_payload: Dict[str, Any],
+                                power_payload: Dict[str, Any],
+                                battery_payload: Dict[str, Any],
+                                teensy_features_available: bool) -> None:
+    set_pi_feature("SYSTEM", "FEATURE_STATUS", "NOMINAL", "Pi SYSTEM feature registry online")
+    set_pi_feature("SYSTEM", "HOST", _health_to_feature_status(pi_payload.get("health_state")), "Pi host telemetry")
+    set_pi_feature("SYSTEM", "NETWORK", _health_to_feature_status(network_payload.get("network_status")), "Network definitive-test surface")
+    set_pi_feature("SYSTEM", "SENSORS", _health_to_feature_status(sensor_payload.get("health_state")), "I2C sensor inventory")
+    set_pi_feature("SYSTEM", "ENVIRONMENT", _health_to_feature_status(environment_payload.get("health_state")), "BME280 environment telemetry")
+    set_pi_feature("GNSS", "REPORT", _health_to_feature_status(gnss_payload.get("health_state")), "Pi GNSS process report reachable")
+    set_pi_feature("SYSTEM", "POWER", _health_to_feature_status(power_payload.get("health_state")), "INA260 power telemetry")
+    set_pi_feature("SYSTEM", "BATTERY", _health_to_feature_status(battery_payload.get("health_state")), "Battery estimate surface")
+    set_pi_feature(
+        "SYSTEM",
+        "TEENSY_FEATURE_IMPORT",
+        "NOMINAL" if teensy_features_available else "INITIALIZING",
+        "Teensy SYSTEM feature tree imported" if teensy_features_available else "Teensy feature tree not present yet",
+    )
+
+
+set_pi_feature("SYSTEM", "FEATURE_STATUS", "NOMINAL", "Pi SYSTEM feature registry online")
 
 # ------------------------------------------------------------------
 # ZPNet Server reachability state (speed tests only)
@@ -1320,7 +1456,18 @@ def system_poller() -> None:
             memory_payload = build_memory_status()
             process_payload = build_process_status()
 
-            SYSTEM = {
+            teensy_features = _teensy_feature_tree_from_report(teensy_payload)
+            _update_builtin_pi_features(
+                pi_payload=pi_payload, network_payload=network_payload,
+                sensor_payload=sensor_payload, environment_payload=environment_payload,
+                gnss_payload=gnss_payload, power_payload=power_payload,
+                battery_payload=battery_payload,
+                teensy_features_available=bool(teensy_features),
+            )
+            features = _combine_feature_trees(_pi_feature_tree_snapshot(), teensy_features)
+            feature_rollup = feature_summary(features)
+
+            snapshot = {
                 "pi": dict(pi_payload),
                 "teensy": dict(teensy_payload),
                 "network": dict(network_payload),
@@ -1335,7 +1482,12 @@ def system_poller() -> None:
                 "payload": dict(payload_payload),
                 "memory": dict(memory_payload),
                 "process": dict(process_payload),
+                "features": features,
+                "feature_summary": feature_rollup,
             }
+
+            with _SYSTEM_LOCK:
+                SYSTEM = snapshot
 
             # ----------------------------------------------------------
             # Emit consolidated system event
@@ -1354,12 +1506,110 @@ def system_poller() -> None:
 
 def cmd_report(_: Optional[dict]) -> Dict:
     """Return the most recent SYSTEM snapshot."""
-    snapshot = dict(SYSTEM)
+    with _SYSTEM_LOCK:
+        snapshot = dict(SYSTEM)
     return {
         "success": True,
         "message": "OK",
         "payload": snapshot,
     }
+
+
+def _current_feature_payload() -> tuple[dict, dict]:
+    with _SYSTEM_LOCK:
+        features = SYSTEM.get("features")
+        summary = SYSTEM.get("feature_summary")
+    if isinstance(features, dict):
+        feature_tree = _copy_feature_tree(features)
+        feature_rollup = dict(summary) if isinstance(summary, dict) else feature_summary(feature_tree)
+        return feature_tree, feature_rollup
+
+    feature_tree = _combine_feature_trees(_pi_feature_tree_snapshot())
+    return feature_tree, feature_summary(feature_tree)
+
+
+def _refresh_feature_payload_preserving_teensy() -> None:
+    global SYSTEM
+    with _SYSTEM_LOCK:
+        current = dict(SYSTEM)
+        current_features = current.get("features")
+
+    current_tree = _copy_feature_tree(current_features)
+    teensy_tree = {"TEENSY": current_tree.get("TEENSY", {})} if current_tree.get("TEENSY") else {}
+    features = _combine_feature_trees(_pi_feature_tree_snapshot(), teensy_tree)
+    rollup = feature_summary(features)
+
+    with _SYSTEM_LOCK:
+        current = dict(SYSTEM)
+        current["features"] = features
+        current["feature_summary"] = rollup
+        SYSTEM = current
+
+
+def cmd_features(_: Optional[dict]) -> Dict:
+    features, summary = _current_feature_payload()
+    return {
+        "success": True,
+        "message": "OK",
+        "payload": {"features": features, "feature_summary": summary},
+    }
+
+
+def cmd_get_feature(args: Optional[dict]) -> Dict:
+    args = args or {}
+    name = str(args.get("name") or "").strip().upper()
+    if not name:
+        machine = str(args.get("machine") or "PI").strip().upper()
+        subsystem = str(args.get("subsystem") or "").strip().upper()
+        feature = str(args.get("feature") or "").strip().upper()
+        name = f"{machine}.{subsystem}.{feature}" if subsystem and feature else ""
+    if not name:
+        return {"success": False, "message": "GET_FEATURE requires name or subsystem+feature"}
+
+    features, _ = _current_feature_payload()
+    try:
+        entry = feature_get(features, name, default=None)
+        status = feature_status(features, name)
+    except ValueError as e:
+        return {"success": False, "message": str(e)}
+
+    return {
+        "success": True,
+        "message": "OK",
+        "payload": {
+            "name": name,
+            "known": isinstance(entry, dict),
+            "status": status,
+            "feature": dict(entry) if isinstance(entry, dict) else {},
+        },
+    }
+
+
+def cmd_set_feature(args: Optional[dict]) -> Dict:
+    args = args or {}
+    machine = str(args.get("machine") or "PI").strip().upper()
+    if machine != "PI":
+        return {"success": False, "message": "Pi SYSTEM may only set PI.* feature state"}
+
+    raw_status = str(args.get("status") or "").strip().upper()
+    if raw_status not in FEATURE_STATUSES and raw_status != "DOWN":
+        return {
+            "success": False,
+            "message": "SET_FEATURE status must be INITIALIZING, NOMINAL, HOLD, or ANOMALY",
+        }
+
+    try:
+        entry = set_pi_feature(
+            str(args.get("subsystem") or ""),
+            str(args.get("feature") or ""),
+            raw_status,
+            str(args.get("detail") or ""),
+        )
+    except ValueError as e:
+        return {"success": False, "message": str(e)}
+
+    _refresh_feature_payload_preserving_teensy()
+    return {"success": True, "message": "OK", "payload": {"feature": entry}}
 
 def cmd_swap_battery(_: Optional[dict]) -> Dict:
     create_event("SWAP_BATTERY", None)
@@ -1370,7 +1620,11 @@ def cmd_swap_battery(_: Optional[dict]) -> Dict:
 
 COMMANDS = {
     "REPORT": cmd_report,
-    "SWAP_BATTERY": cmd_swap_battery
+    "FEATURES": cmd_features,
+    "REPORT_FEATURES": cmd_features,
+    "GET_FEATURE": cmd_get_feature,
+    "SET_FEATURE": cmd_set_feature,
+    "SWAP_BATTERY": cmd_swap_battery,
 }
 
 # ---------------------------------------------------------------------

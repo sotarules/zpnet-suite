@@ -66,3 +66,47 @@
 
 // Register SYSTEM command surface
 void process_system_register(void);
+
+// ============================================================================
+// Feature status substrate
+// ============================================================================
+//
+// Teensy SYSTEM owns only Teensy-local feature state.  Pi SYSTEM asks for this
+// tree and unions it with Pi-local feature state into the global dashboard /
+// campaign-readiness surface.
+//
+// Feature paths are reported as:
+//
+//   TEENSY.<SUBSYSTEM>.<FEATURE>
+//
+// with status values from this closed vocabulary.
+
+enum class system_feature_status_t : uint8_t {
+  INITIALIZING = 0,
+  NOMINAL      = 1,
+  HOLD         = 2,
+  ANOMALY      = 3,
+};
+
+const char* system_feature_status_str(system_feature_status_t status);
+bool system_feature_status_parse(const char* status,
+                                 system_feature_status_t* out);
+
+bool system_feature_set(const char* subsystem,
+                        const char* feature,
+                        system_feature_status_t status,
+                        const char* detail = nullptr);
+
+bool system_feature_set_str(const char* subsystem,
+                            const char* feature,
+                            const char* status,
+                            const char* detail = nullptr);
+
+bool system_feature_has(const char* subsystem,
+                        const char* feature);
+
+const char* system_feature_get_status(const char* subsystem,
+                                      const char* feature);
+
+bool system_feature_is_nominal(const char* subsystem,
+                               const char* feature);

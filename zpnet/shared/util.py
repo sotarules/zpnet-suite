@@ -1,8 +1,21 @@
 import json
 from datetime import datetime
-from typing import Any
+from typing import Any, Iterable, Mapping
 
 from zpnet.shared.constants import Payload
+
+
+FEATURE_STATUS_INITIALIZING = "INITIALIZING"
+FEATURE_STATUS_NOMINAL = "NOMINAL"
+FEATURE_STATUS_HOLD = "HOLD"
+FEATURE_STATUS_ANOMALY = "ANOMALY"
+
+FEATURE_STATUSES = {
+    FEATURE_STATUS_INITIALIZING,
+    FEATURE_STATUS_NOMINAL,
+    FEATURE_STATUS_HOLD,
+    FEATURE_STATUS_ANOMALY,
+}
 
 
 def normalize_payload(payload: Any) -> dict:
@@ -25,8 +38,8 @@ def normalize_payload(payload: Any) -> dict:
         return json.loads(payload)
     raise TypeError(f"Unsupported payload type: {type(payload)}")
 
-def normalize_ts(ts: Any) -> datetime:
 
+def normalize_ts(ts: Any) -> datetime:
     """
     Ensure timestamp is a timezone-aware datetime.
     """
@@ -36,11 +49,14 @@ def normalize_ts(ts: Any) -> datetime:
         return datetime.fromisoformat(ts.replace("Z", "+00:00"))
     raise TypeError(f"Unsupported ts type: {type(ts)}")
 
+
 def payload_to_json_str(payload: Payload) -> str:
     return json.dumps(payload, separators=(",", ":"), sort_keys=True)
 
+
 def payload_to_json_bytes(payload: Payload) -> bytes:
     return payload_to_json_str(payload).encode("utf-8")
+
 
 def system_time_z() -> str:
     """
@@ -59,3 +75,152 @@ def system_time_z() -> str:
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc)
     return now.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# -----------------------------------------------------------------------------
+# Feature-state helpers
+# -----------------------------------------------------------------------------
+
+def normalize_feature_status(status: Any, *, default: str = FEATURE_STATUS_INITIALIZING) -> str:
+    """Normalize a feature status into the shared closed vocabulary."""
+    s = str(status or default).strip().upper()
+    if s == "DOWN":
+        return FEATURE_STATUS_ANOMALY
+    return s if s in FEATURE_STATUSES else default
+
+
+def feature_path_parts(name: str) -> tuple[str, str, str]:
+    """Split MACHINE.SUBSYSTEM.FEATURE into normalized path parts."""
+    parts = [p.strip().upper() for p in str(name or "").split(".") if p.strip()]
+    if len(parts) != 3:
+        raise ValueError(f"feature name must be MACHINE.SUBSYSTEM.FEATURE, got {name!r}")
+    return parts[0], parts[1], parts[2]
+
+
+def feature_tree(payload_or_tree: Any) -> dict:
+    """
+    Return the hierarchical feature tree from either SYSTEM.REPORT or a raw
+    features payload.
+    """
+    payload = normalize_payload(payload_or_tree)
+    features = payload.get("features")
+    return features if isinstance(features, dict) else payload
+
+
+def feature_get(payload_or_tree: Any, name: str, default: Any = None) -> Any:
+    """Return a feature entry by MACHINE.SUBSYSTEM.FEATURE path."""
+    machine, subsystem, feature = feature_path_parts(name)
+    tree = feature_tree(payload_or_tree)
+
+    node = tree.get(machine)
+    if not isinstance(node, Mapping):
+        return default
+
+    node = node.get(subsystem)
+    if not isinstance(node, Mapping):
+        return default
+
+    entry = node.get(feature)
+    return entry if isinstance(entry, Mapping) else default
+
+
+def feature_status(
+    payload_or_tree: Any,
+    name: str,
+    default: str = FEATURE_STATUS_HOLD,
+) -> str:
+    """Return a feature's status; missing features are HOLD by default."""
+    entry = feature_get(payload_or_tree, name)
+    if not isinstance(entry, Mapping):
+        return normalize_feature_status(default, default=FEATURE_STATUS_HOLD)
+    return normalize_feature_status(entry.get("status"), default=default)
+
+
+def feature_detail(payload_or_tree: Any, name: str, default: str = "") -> str:
+    """Return a feature's detail string, if present."""
+    entry = feature_get(payload_or_tree, name)
+    if not isinstance(entry, Mapping):
+        return default
+
+    detail = entry.get("detail")
+    return str(detail) if detail is not None else default
+
+
+def feature_is_nominal(payload_or_tree: Any, name: str) -> bool:
+    """Return True when the named feature is present and NOMINAL."""
+    return feature_status(payload_or_tree, name) == FEATURE_STATUS_NOMINAL
+
+
+def blocking_features(
+    payload_or_tree: Any,
+    names: Iterable[str],
+) -> list[dict[str, str]]:
+    """Return the subset of required features that are not NOMINAL."""
+    blocked: list[dict[str, str]] = []
+
+    for name in names:
+        status = feature_status(payload_or_tree, name)
+        if status == FEATURE_STATUS_NOMINAL:
+            continue
+
+        blocked.append({
+            "name": name,
+            "status": status,
+            "detail": feature_detail(payload_or_tree, name),
+        })
+
+    return blocked
+
+
+def features_all_nominal(
+    payload_or_tree: Any,
+    names: Iterable[str],
+) -> bool:
+    """Return True when every named feature is NOMINAL."""
+    return not blocking_features(payload_or_tree, names)
+
+
+def feature_summary(payload_or_tree: Any) -> dict:
+    """Return a compact rollup over a MACHINE.SUBSYSTEM.FEATURE tree."""
+    tree = feature_tree(payload_or_tree)
+
+    counts = {
+        FEATURE_STATUS_NOMINAL: 0,
+        FEATURE_STATUS_INITIALIZING: 0,
+        FEATURE_STATUS_HOLD: 0,
+        FEATURE_STATUS_ANOMALY: 0,
+    }
+    blockers: list[str] = []
+
+    for machine, subsystems in tree.items():
+        if not isinstance(subsystems, Mapping):
+            continue
+
+        for subsystem, features in subsystems.items():
+            if not isinstance(features, Mapping):
+                continue
+
+            for feature, entry in features.items():
+                if not isinstance(entry, Mapping):
+                    continue
+
+                status = normalize_feature_status(entry.get("status"))
+                counts[status] += 1
+
+                if status != FEATURE_STATUS_NOMINAL:
+                    blockers.append(f"{machine}.{subsystem}.{feature}")
+
+    if counts[FEATURE_STATUS_ANOMALY]:
+        rollup = FEATURE_STATUS_ANOMALY
+    elif counts[FEATURE_STATUS_HOLD]:
+        rollup = FEATURE_STATUS_HOLD
+    elif counts[FEATURE_STATUS_INITIALIZING]:
+        rollup = FEATURE_STATUS_INITIALIZING
+    else:
+        rollup = FEATURE_STATUS_NOMINAL
+
+    return {
+        "status": rollup,
+        "counts": counts,
+        "blocking_features": blockers,
+    }
