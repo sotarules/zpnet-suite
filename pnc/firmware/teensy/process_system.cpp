@@ -56,43 +56,27 @@ static uint64_t system_cpu_window_last_idle_cycles = 0;
 // Shape reported by SYSTEM.FEATURES and embedded in SYSTEM.REPORT:
 //
 //   {
-//     "features": {
-//       "TEENSY": {
-//         "CLOCKS": {
-//           "FLOORLINE": {
-//             "status": "INITIALIZING|NOMINAL|HOLD|ANOMALY",
-//             "detail": "...",
-//             "updated_ms": 12345,
-//             "sequence": 7
-//           }
-//         }
-//       }
-//     },
-//     "feature_summary": { ... }
+//     "TEENSY": {
+//       "CLOCKS": { "SMARTZERO": "NOMINAL" }
+//     }
 //   }
 //
-// SYSTEM is the local clearing house only.  It does not infer CLOCKS or
-// INTERRUPT state; those subsystems author their own features through the
-// helpers below.
+// SYSTEM is the local clearing house only. It stores feature state as the
+// compact scalar status for each MACHINE.SUBSYSTEM.FEATURE path. Focused
+// subsystem reports remain the place for detailed diagnostics.
 
 static constexpr size_t SYSTEM_FEATURE_MAX_FEATURES   = 64;
 static constexpr size_t SYSTEM_FEATURE_SUBSYSTEM_MAX  = 24;
 static constexpr size_t SYSTEM_FEATURE_NAME_MAX       = 48;
-static constexpr size_t SYSTEM_FEATURE_STATUS_MAX     = 16;
-static constexpr size_t SYSTEM_FEATURE_DETAIL_MAX     = 128;
 
 struct system_feature_slot_t {
   bool used = false;
   char subsystem[SYSTEM_FEATURE_SUBSYSTEM_MAX] = {0};
   char feature[SYSTEM_FEATURE_NAME_MAX] = {0};
-  char status[SYSTEM_FEATURE_STATUS_MAX] = {0};
-  char detail[SYSTEM_FEATURE_DETAIL_MAX] = {0};
-  uint32_t updated_ms = 0;
-  uint32_t sequence = 0;
+  system_feature_status_t status = system_feature_status_t::INITIALIZING;
 };
 
 static system_feature_slot_t g_system_features[SYSTEM_FEATURE_MAX_FEATURES] = {};
-static uint32_t g_system_feature_sequence = 0;
 
 const char* system_feature_status_str(system_feature_status_t status) {
   switch (status) {
@@ -172,10 +156,8 @@ bool system_feature_set(const char* subsystem,
   if (idx < 0) return false;
 
   system_feature_slot_t& slot = g_system_features[idx];
-  safeCopy(slot.status, sizeof(slot.status), system_feature_status_str(status));
-  safeCopy(slot.detail, sizeof(slot.detail), detail ? detail : "");
-  slot.updated_ms = millis();
-  slot.sequence = ++g_system_feature_sequence;
+  slot.status = status;
+  (void)detail;
   return true;
 }
 
@@ -197,67 +179,12 @@ const char* system_feature_get_status(const char* subsystem,
                                       const char* feature) {
   const int idx = system_feature_find(subsystem, feature);
   if (idx < 0) return system_feature_status_str(system_feature_status_t::INITIALIZING);
-  return g_system_features[idx].status;
+  return system_feature_status_str(g_system_features[idx].status);
 }
 
 bool system_feature_is_nominal(const char* subsystem,
                                const char* feature) {
   return strcmp(system_feature_get_status(subsystem, feature), "NOMINAL") == 0;
-}
-
-static Payload system_feature_payload(const system_feature_slot_t& slot) {
-  Payload p;
-  p.add("machine", "TEENSY");
-  p.add("subsystem", slot.subsystem);
-  p.add("feature", slot.feature);
-  p.add_fmt("name", "TEENSY.%s.%s", slot.subsystem, slot.feature);
-  p.add("status", slot.status);
-  p.add("detail", slot.detail);
-  p.add("updated_ms", slot.updated_ms);
-  p.add("sequence", slot.sequence);
-  return p;
-}
-
-static Payload system_feature_summary_payload(void) {
-  uint32_t count = 0;
-  uint32_t nominal = 0;
-  uint32_t initializing = 0;
-  uint32_t hold = 0;
-  uint32_t anomaly = 0;
-
-  for (size_t i = 0; i < SYSTEM_FEATURE_MAX_FEATURES; i++) {
-    if (!g_system_features[i].used) continue;
-    count++;
-
-    const char* s = g_system_features[i].status;
-    if (strcmp(s, "NOMINAL") == 0) {
-      nominal++;
-    } else if (strcmp(s, "HOLD") == 0) {
-      hold++;
-    } else if (strcmp(s, "ANOMALY") == 0) {
-      anomaly++;
-    } else {
-      initializing++;
-    }
-  }
-
-  const char* rollup = "NOMINAL";
-  if (anomaly > 0) {
-    rollup = "ANOMALY";
-  } else if (hold > 0) {
-    rollup = "HOLD";
-  } else if (initializing > 0) {
-    rollup = "INITIALIZING";
-  }
-
-  Payload p;
-  p.add("status", rollup);
-  p.add("feature_count", count);
-  p.add("nominal_count", nominal);
-  p.add("initializing_count", initializing);
-  p.add("hold_count", hold);
-  p.add("anomaly_count", anomaly);
-  return p;
 }
 
 static Payload system_features_tree_payload(void) {
@@ -283,9 +210,9 @@ static Payload system_features_tree_payload(void) {
       if (!g_system_features[k].used) continue;
       if (strcmp(g_system_features[k].subsystem, subsystem) != 0) continue;
 
-      subsystem_payload.add_object(
+      subsystem_payload.add(
         g_system_features[k].feature,
-        system_feature_payload(g_system_features[k])
+        system_feature_status_str(g_system_features[k].status)
       );
     }
 
@@ -295,13 +222,6 @@ static Payload system_features_tree_payload(void) {
   Payload root;
   root.add_object("TEENSY", teensy);
   return root;
-}
-
-static Payload system_features_report_payload(void) {
-  Payload p;
-  p.add_object("features", system_features_tree_payload());
-  p.add_object("feature_summary", system_feature_summary_payload());
-  return p;
 }
 
 // ================================================================
@@ -452,7 +372,6 @@ static Payload cmd_report(const Payload& /*args*/) {
   p.add("cpu_sample_window_ms", cpu_usage_get_sample_window_ms());
 
   p.add_object("features", system_features_tree_payload());
-  p.add_object("feature_summary", system_feature_summary_payload());
 
   return p;
 }
@@ -786,7 +705,7 @@ static Payload cmd_process_list(const Payload&) {
 // FEATURES / REPORT_FEATURES — local Teensy feature-state tree
 // ------------------------------------------------------------
 static Payload cmd_features(const Payload&) {
-  return system_features_report_payload();
+  return system_features_tree_payload();
 }
 
 // ------------------------------------------------------------
@@ -811,16 +730,11 @@ static Payload cmd_set_feature(const Payload& args) {
     return err;
   }
 
-  const int idx = system_feature_find(subsystem, feature);
-  if (idx < 0) {
-    Payload err;
-    err.add("error", "feature set succeeded but lookup failed");
-    return err;
-  }
-
   Payload resp;
   resp.add("status", "OK");
-  resp.add_object("feature", system_feature_payload(g_system_features[idx]));
+  resp.add("subsystem", subsystem);
+  resp.add("feature", feature);
+  resp.add("value", system_feature_get_status(subsystem, feature));
   return resp;
 }
 
@@ -839,19 +753,10 @@ static Payload cmd_get_feature(const Payload& args) {
 
   const int idx = system_feature_find(subsystem, feature);
   Payload resp;
-  if (idx < 0) {
-    resp.add("known", false);
-    resp.add("machine", "TEENSY");
-    resp.add("subsystem", subsystem);
-    resp.add("feature", feature);
-    resp.add_fmt("name", "TEENSY.%s.%s", subsystem, feature);
-    resp.add("status", "INITIALIZING");
-    resp.add("detail", "feature has not published local state yet");
-    return resp;
-  }
-
-  resp.add("known", true);
-  resp.add_object("feature", system_feature_payload(g_system_features[idx]));
+  resp.add("known", idx >= 0);
+  resp.add("subsystem", subsystem);
+  resp.add("feature", feature);
+  resp.add("status", system_feature_get_status(subsystem, feature));
   return resp;
 }
 

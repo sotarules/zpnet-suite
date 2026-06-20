@@ -23,6 +23,7 @@
 #include "process_clocks_internal.h"
 #include "process_clocks.h"
 #include "process_interrupt.h"
+#include "process_system.h"
 
 #include "debug.h"
 #include "timebase.h"
@@ -41,6 +42,7 @@
 
 #include <math.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <strings.h>
 
 // process_time.cpp defines this reset hook; time.h may not expose it on older
@@ -113,6 +115,79 @@ static volatile bool g_epoch_initialized = false;
 // new science epoch.  Event consumers treat the epoch as not ready during this
 // short transaction so they cannot observe half-rebased Alpha state.
 static volatile bool g_alpha_epoch_install_in_progress = false;
+
+// ============================================================================
+// SYSTEM feature status — CLOCKS/Alpha-owned readiness surfaces
+// ============================================================================
+//
+// These updates are reporting-only in this migration step.  They publish the
+// state Alpha already knows; no timing/campaign path branches on feature state.
+
+static system_feature_status_t g_clocks_feature_dwt_calibration =
+    system_feature_status_t::ANOMALY;
+static system_feature_status_t g_clocks_feature_static_prediction =
+    system_feature_status_t::ANOMALY;
+static system_feature_status_t g_clocks_feature_smartzero =
+    system_feature_status_t::ANOMALY;
+static system_feature_status_t g_clocks_feature_alpha_epoch =
+    system_feature_status_t::ANOMALY;
+static system_feature_status_t g_clocks_feature_ocxo_public_origin =
+    system_feature_status_t::ANOMALY;
+
+static void clocks_feature_set_cached(const char* feature,
+                                      system_feature_status_t& cached,
+                                      system_feature_status_t status,
+                                      bool force = false) {
+  if (force || cached != status || !system_feature_has("CLOCKS", feature)) {
+    (void)system_feature_set("CLOCKS", feature, status, nullptr);
+    cached = status;
+  }
+}
+
+static void clocks_feature_update_dwt_calibration(void) {
+  clocks_feature_set_cached(
+      "DWT_CALIBRATION",
+      g_clocks_feature_dwt_calibration,
+      g_dwt_calibration_valid
+          ? system_feature_status_t::NOMINAL
+          : system_feature_status_t::INITIALIZING);
+}
+
+static void clocks_feature_update_alpha_epoch(void) {
+  clocks_feature_set_cached(
+      "ALPHA_EPOCH",
+      g_clocks_feature_alpha_epoch,
+      (g_epoch_initialized && !g_alpha_epoch_install_in_progress)
+          ? system_feature_status_t::NOMINAL
+          : system_feature_status_t::INITIALIZING);
+}
+
+static void clocks_features_mark_alpha_initializing(void) {
+  clocks_feature_set_cached("DWT_CALIBRATION",
+                            g_clocks_feature_dwt_calibration,
+                            system_feature_status_t::INITIALIZING,
+                            true);
+  clocks_feature_set_cached("STATIC_PREDICTION",
+                            g_clocks_feature_static_prediction,
+                            system_feature_status_t::INITIALIZING,
+                            true);
+  clocks_feature_set_cached("SMARTZERO",
+                            g_clocks_feature_smartzero,
+                            system_feature_status_t::INITIALIZING,
+                            true);
+  clocks_feature_set_cached("ALPHA_EPOCH",
+                            g_clocks_feature_alpha_epoch,
+                            system_feature_status_t::INITIALIZING,
+                            true);
+  clocks_feature_set_cached("OCXO_PUBLIC_ORIGIN",
+                            g_clocks_feature_ocxo_public_origin,
+                            system_feature_status_t::INITIALIZING,
+                            true);
+}
+
+static void clocks_feature_update_static_prediction(void);
+static void clocks_feature_update_ocxo_public_origin(void);
+
 
 // Last VCLOCK event DWT, retained only for PPS-vs-VCLOCK diagnostics.
 //
@@ -596,6 +671,7 @@ static inline void dwt_enable(void) {
   g_dwt64_epoch_reset_count = 0;
   g_dwt64_epoch_reset_failures = 0;
   g_dwt_calibration_valid = false;
+  clocks_features_mark_alpha_initializing();
 }
 
 bool clocks_epoch_pending(void) {
@@ -1526,6 +1602,10 @@ void clocks_static_prediction_reset_all(void) {
   alpha_static_prediction_reset_store(g_static_prediction_vclock);
   alpha_static_prediction_reset_store(g_static_prediction_ocxo1);
   alpha_static_prediction_reset_store(g_static_prediction_ocxo2);
+  clocks_feature_set_cached("STATIC_PREDICTION",
+                            g_clocks_feature_static_prediction,
+                            system_feature_status_t::INITIALIZING,
+                            true);
 }
 
 static void alpha_static_prediction_record(time_clock_id_t clock,
@@ -1551,6 +1631,7 @@ static void alpha_static_prediction_record(time_clock_id_t clock,
 
   clocks_alpha_dmb();
   s->seq++;
+  clocks_feature_update_static_prediction();
 }
 
 static void alpha_static_prediction_record_pps(uint32_t actual_cycles) {
@@ -1574,6 +1655,7 @@ static void alpha_static_prediction_record_pps(uint32_t actual_cycles) {
 
   clocks_alpha_dmb();
   s.seq++;
+  clocks_feature_update_static_prediction();
 }
 
 static uint32_t alpha_static_prediction_clock_id(time_clock_id_t clock) {
@@ -1641,6 +1723,24 @@ static bool alpha_static_prediction_snapshot_store(const alpha_static_prediction
 
 bool clocks_static_prediction_pps_snapshot(clocks_static_prediction_snapshot_t* out) {
   return alpha_static_prediction_snapshot_store(g_static_prediction_pps, 0U, out);
+}
+
+static void clocks_feature_update_static_prediction(void) {
+  clocks_static_prediction_snapshot_t pps{};
+  clocks_static_prediction_snapshot_t vclock{};
+  clocks_static_prediction_snapshot_t ocxo1{};
+  clocks_static_prediction_snapshot_t ocxo2{};
+  const bool pps_ok = clocks_static_prediction_pps_snapshot(&pps);
+  const bool vclock_ok = clocks_static_prediction_snapshot(time_clock_id_t::VCLOCK, &vclock);
+  const bool ocxo1_ok = clocks_static_prediction_snapshot(time_clock_id_t::OCXO1, &ocxo1);
+  const bool ocxo2_ok = clocks_static_prediction_snapshot(time_clock_id_t::OCXO2, &ocxo2);
+
+  clocks_feature_set_cached(
+      "STATIC_PREDICTION",
+      g_clocks_feature_static_prediction,
+      (pps_ok && vclock_ok && ocxo1_ok && ocxo2_ok)
+          ? system_feature_status_t::NOMINAL
+          : system_feature_status_t::INITIALIZING);
 }
 
 // ============================================================================
@@ -2580,6 +2680,16 @@ static void alpha_ocxo_visible_origin_refresh_public_ready(void) {
 
   clocks_alpha_dmb();
   g_alpha_ocxo_public_origin_ready = ready;
+  clocks_feature_update_ocxo_public_origin();
+}
+
+static void clocks_feature_update_ocxo_public_origin(void) {
+  clocks_feature_set_cached(
+      "OCXO_PUBLIC_ORIGIN",
+      g_clocks_feature_ocxo_public_origin,
+      g_alpha_ocxo_public_origin_ready
+          ? system_feature_status_t::NOMINAL
+          : system_feature_status_t::INITIALIZING);
 }
 
 static alpha_ocxo_visible_origin_state_t* alpha_ocxo_visible_origin_store(
@@ -4102,6 +4212,11 @@ static void alpha_smartzero_install_mark_stage(uint32_t stage) {
 }
 
 static void alpha_smartzero_install_begin_transaction(const char* reason) {
+  clocks_feature_set_cached(
+      "ALPHA_EPOCH",
+      g_clocks_feature_alpha_epoch,
+      system_feature_status_t::INITIALIZING,
+      "SmartZero install transaction in progress");
   safeCopy(g_alpha_smartzero_install_last_reason,
            sizeof(g_alpha_smartzero_install_last_reason),
            (reason && *reason) ? reason : "smartzero");
@@ -4126,6 +4241,12 @@ static void alpha_smartzero_install_fail(uint32_t stage,
   g_alpha_epoch_install_failures++;
   alpha_smartzero_install_mark_stage(SMARTZERO_INSTALL_STAGE_FAIL);
   g_alpha_epoch_install_in_progress = false;
+  clocks_feature_set_cached("SMARTZERO",
+                            g_clocks_feature_smartzero,
+                            system_feature_status_t::ANOMALY);
+  clocks_feature_set_cached("ALPHA_EPOCH",
+                            g_clocks_feature_alpha_epoch,
+                            system_feature_status_t::ANOMALY);
   clocks_alpha_smartzero_pending_clear();
 }
 
@@ -4138,6 +4259,7 @@ static void alpha_smartzero_install_commit(uint32_t committed_epoch_sequence,
   g_alpha_smartzero_install_commit_count++;
   alpha_smartzero_install_mark_stage(SMARTZERO_INSTALL_STAGE_COMMIT);
   g_alpha_epoch_install_in_progress = false;
+  clocks_feature_update_alpha_epoch();
 }
 
 static bool smartzero_completed_proof_valid(const interrupt_smartzero_snapshot_t& z) {
@@ -4251,6 +4373,28 @@ bool clocks_alpha_begin_smartzero_epoch(const char* reason) {
   const char* begin_reason = (reason && *reason) ? reason : "smartzero";
   const bool preserved_epoch = g_epoch_initialized;
 
+  clocks_feature_set_cached("SMARTZERO",
+                            g_clocks_feature_smartzero,
+                            system_feature_status_t::INITIALIZING,
+                            true);
+
+  if (!preserved_epoch) {
+    clocks_feature_set_cached("ALPHA_EPOCH",
+                              g_clocks_feature_alpha_epoch,
+                              system_feature_status_t::INITIALIZING,
+                              true);
+    clocks_feature_set_cached("OCXO_PUBLIC_ORIGIN",
+                              g_clocks_feature_ocxo_public_origin,
+                              system_feature_status_t::INITIALIZING,
+                              true);
+  } else {
+    // SmartZero acquisition is non-destructive when a service epoch already
+    // exists; keep the currently installed epoch/origin truth intact until the
+    // atomic replacement commit window begins.
+    clocks_feature_update_alpha_epoch();
+    clocks_feature_update_ocxo_public_origin();
+  }
+
   // Beginning SmartZero is not an epoch event. If a service/science epoch is
   // already installed, keep it alive while the replacement proof is acquired.
   // The destructive rebase remains in clocks_alpha_zero_from_smartzero(), where
@@ -4288,8 +4432,14 @@ bool clocks_alpha_begin_smartzero_epoch(const char* reason) {
     g_alpha_smartzero_pending_active = false;
     g_alpha_smartzero_pending_reason[0] = '\0';
     g_alpha_smartzero_begin_failures++;
+    clocks_feature_set_cached("SMARTZERO",
+                              g_clocks_feature_smartzero,
+                              system_feature_status_t::ANOMALY);
     if (!preserved_epoch) {
       g_alpha_epoch_install_failures++;
+      clocks_feature_set_cached("ALPHA_EPOCH",
+                                g_clocks_feature_alpha_epoch,
+                                system_feature_status_t::ANOMALY);
     }
   }
   return ok;
@@ -4310,6 +4460,12 @@ bool clocks_alpha_zero_from_smartzero(const char* reason) {
     g_alpha_smartzero_install_failure_count++;
     g_alpha_epoch_install_failures++;
     g_alpha_smartzero_install_last_stage = SMARTZERO_INSTALL_STAGE_FAIL;
+    clocks_feature_set_cached("SMARTZERO",
+                              g_clocks_feature_smartzero,
+                              system_feature_status_t::ANOMALY);
+    clocks_feature_set_cached("ALPHA_EPOCH",
+                              g_clocks_feature_alpha_epoch,
+                              system_feature_status_t::ANOMALY);
     return false;
   }
 
@@ -4448,6 +4604,12 @@ bool clocks_alpha_zero_from_smartzero(const char* reason) {
   clocks_alpha_smartzero_pending_clear();
 
   alpha_smartzero_install_commit(next_epoch_sequence, z.sequence);
+  clocks_feature_set_cached("SMARTZERO",
+                            g_clocks_feature_smartzero,
+                            system_feature_status_t::NOMINAL,
+                            true);
+  clocks_feature_update_alpha_epoch();
+  clocks_feature_update_ocxo_public_origin();
   return true;
 }
 
@@ -5132,6 +5294,7 @@ static void update_pps_vclock_bridge_anchor(const pps_edge_snapshot_t& snap) {
   // witness interval here; PPS now owns its own first-class prediction lane.
   dwt64_anchor_advance_to_dwt32(snap.dwt_at_edge);
   g_dwt_calibration_valid = true;
+  clocks_feature_update_dwt_calibration();
   g_prev_pps_vclock_dwt_at_edge = snap.dwt_at_edge;
 
   g_dwt_at_pps_vclock = snap.dwt_at_edge;
@@ -5177,6 +5340,7 @@ static void pps_selector_callback(const pps_edge_snapshot_t& snap) {
 
 void process_clocks_init_hardware(void) {
   dwt_enable();
+  clocks_features_mark_alpha_initializing();
 }
 
 static void subscribe_clock(interrupt_subscriber_kind_t kind,
@@ -5191,6 +5355,7 @@ static void subscribe_clock(interrupt_subscriber_kind_t kind,
 
 void process_clocks_init(void) {
   timebase_init();
+  clocks_beta_features_init();
 
   // Startup epoch is installed locally by alpha from the first valid
   // process_interrupt PPS/VCLOCK epoch capture packet.  Request a PPS

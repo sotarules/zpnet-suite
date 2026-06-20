@@ -1106,6 +1106,7 @@ extern volatile uint32_t watchdog_anomaly_trigger_dwt;
 // ============================================================================
 
 void clocks_beta_pps(void);
+void clocks_beta_features_init(void);
 void clocks_watchdog_anomaly(const char* reason,
                              uint32_t detail0 = 0,
                              uint32_t detail1 = 0,

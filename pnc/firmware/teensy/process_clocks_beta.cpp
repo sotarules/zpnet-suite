@@ -58,6 +58,7 @@
 #include "process_clocks_internal.h"
 #include "process_clocks.h"
 #include "process_interrupt.h"
+#include "process_system.h"
 
 #include "debug.h"
 #include "timebase.h"
@@ -75,6 +76,7 @@
 
 #include <math.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <climits>
 #include <strings.h>
 
@@ -230,6 +232,43 @@ static bool     g_timebase_last_ocxo2_pps_projected = false;
 static bool     g_timebase_last_ocxo1_pps_residual_valid = false;
 static bool     g_timebase_last_ocxo2_pps_residual_valid = false;
 
+// ============================================================================
+// SYSTEM feature status — CLOCKS/Beta-owned readiness surfaces
+// ============================================================================
+//
+// These are publication/science-pipeline facts.  They remain observational in
+// this migration step; START/ZERO/RECOVER do not branch on them yet.
+
+static system_feature_status_t g_clocks_feature_science_residuals =
+    system_feature_status_t::ANOMALY;
+static system_feature_status_t g_clocks_feature_timebase_publication =
+    system_feature_status_t::ANOMALY;
+
+static void clocks_beta_feature_set_cached(const char* feature,
+                                           system_feature_status_t& cached,
+                                           system_feature_status_t status,
+                                           bool force = false) {
+  if (force || cached != status || !system_feature_has("CLOCKS", feature)) {
+    (void)system_feature_set("CLOCKS", feature, status, nullptr);
+    cached = status;
+  }
+}
+
+static void clocks_beta_features_mark_initializing(void) {
+  clocks_beta_feature_set_cached("SCIENCE_RESIDUALS",
+                                 g_clocks_feature_science_residuals,
+                                 system_feature_status_t::INITIALIZING,
+                                 true);
+  clocks_beta_feature_set_cached("TIMEBASE_PUBLICATION",
+                                 g_clocks_feature_timebase_publication,
+                                 system_feature_status_t::INITIALIZING,
+                                 true);
+}
+
+void clocks_beta_features_init(void) {
+  clocks_beta_features_mark_initializing();
+}
+
 static const char* timebase_build_stage_name(uint32_t stage) {
   switch (stage) {
     case TIMEBASE_BUILD_STAGE_ENTRY: return "ENTRY";
@@ -356,6 +395,10 @@ static void pps_interval_residuals_reset(void) {
   g_science_total_ocxo1_clock_interval_ns = 0;
   g_science_total_ocxo2_gnss_interval_ns = 0;
   g_science_total_ocxo2_clock_interval_ns = 0;
+  clocks_beta_feature_set_cached("SCIENCE_RESIDUALS",
+                                 g_clocks_feature_science_residuals,
+                                 system_feature_status_t::INITIALIZING,
+                                 true);
 }
 
 static pps_interval_residuals_t measured_edge_interval_residuals_update(
@@ -409,6 +452,17 @@ static pps_interval_residuals_t measured_edge_interval_residuals_update(
   g_science_residual_prev_gnss_ns = public_gnss_ns;
   g_science_residual_prev_ocxo1_measured_ns = public_ocxo1_measured_ns;
   g_science_residual_prev_ocxo2_measured_ns = public_ocxo2_measured_ns;
+
+  const bool both_valid = r.ocxo1_valid && r.ocxo2_valid;
+  clocks_beta_feature_set_cached(
+      "SCIENCE_RESIDUALS",
+      g_clocks_feature_science_residuals,
+      both_valid
+          ? system_feature_status_t::NOMINAL
+          : ((g_clocks_feature_science_residuals == system_feature_status_t::NOMINAL)
+                ? system_feature_status_t::HOLD
+                : system_feature_status_t::INITIALIZING),
+      both_valid);
   return r;
 }
 
@@ -2459,6 +2513,10 @@ void clocks_zero_all(void) {
   welford_reset(welford_ocxo2_dac);
 
   pps_interval_residuals_reset();
+  clocks_beta_feature_set_cached("TIMEBASE_PUBLICATION",
+                                 g_clocks_feature_timebase_publication,
+                                 system_feature_status_t::INITIALIZING,
+                                 true);
 
   ocxo_dac_predictor_reset(ocxo1_dac);
   ocxo_dac_predictor_reset(ocxo2_dac);
@@ -3389,6 +3447,10 @@ void clocks_beta_pps(void) {
     g_timebase_forensics_publish_return_count++;
     g_timebase_last_forensics_publish_return_campaign_seconds = campaign_seconds;
     timebase_build_stage(TIMEBASE_BUILD_STAGE_FORENSICS_PUBLISH_RETURN);
+    clocks_beta_feature_set_cached("TIMEBASE_PUBLICATION",
+                                   g_clocks_feature_timebase_publication,
+                                   system_feature_status_t::NOMINAL,
+                                   true);
   }
 }
 

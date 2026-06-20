@@ -53,6 +53,7 @@
 
 #include "process_interrupt.h"
 #include "process_clocks.h"
+#include "process_system.h"
 
 #include "config.h"
 #include "debug.h"
@@ -206,6 +207,16 @@ static void interrupt_integrity_note_qtimer_dwt_match(
     uint32_t isr_entry_dwt_raw,
     bool one_second_boundary);
 
+// Teensy SYSTEM feature-state publication.  These helpers only publish local
+// INTERRUPT-owned truth; they do not gate or repair the timing rails.
+static void interrupt_features_mark_initializing(void);
+static void interrupt_feature_note_pps_vclock_authority(
+    const pps_vclock_edge_authority_t& authority);
+static void interrupt_feature_update_qtimer_counter_custody(void);
+static void interrupt_feature_update_qtimer_dwt_ruler(void);
+static void interrupt_feature_update_counter32_lineage(void);
+static void interrupt_feature_update_floorline(void);
+
 static uint32_t interrupt_integrity_abs_i32(int32_t value) {
   return value < 0 ? (uint32_t)(-(int64_t)value) : (uint32_t)value;
 }
@@ -356,6 +367,8 @@ void interrupt_integrity_note_counter32(interrupt_subscriber_kind_t kind,
     s->bad_count++;
     s->last_ok = false;
   }
+
+  interrupt_feature_update_counter32_lineage();
 }
 
 // VCLOCK/relay TimePop heartbeat.
@@ -613,6 +626,164 @@ static constexpr bool OCXO2_DISABLED = false;
 static constexpr bool OCXO_DISABLE_EXPERIMENT = OCXO1_DISABLED || OCXO2_DISABLED;
 static constexpr uint32_t OCXO_DISABLED_COUNT =
     (OCXO1_DISABLED ? 1U : 0U) + (OCXO2_DISABLED ? 1U : 0U);
+
+// ============================================================================
+// SYSTEM feature status — INTERRUPT-owned readiness surfaces
+// ============================================================================
+//
+// process_interrupt owns only local custody facts.  SYSTEM is the registry; it
+// does not infer these states.  The updates below are reporting-only in this
+// migration step: no timing path branches on feature status.
+
+static system_feature_status_t g_interrupt_feature_pps_vclock_authority =
+    system_feature_status_t::ANOMALY;
+static system_feature_status_t g_interrupt_feature_floorline =
+    system_feature_status_t::ANOMALY;
+static system_feature_status_t g_interrupt_feature_qtimer_counter_custody =
+    system_feature_status_t::ANOMALY;
+static system_feature_status_t g_interrupt_feature_qtimer_dwt_ruler =
+    system_feature_status_t::ANOMALY;
+static system_feature_status_t g_interrupt_feature_counter32_lineage =
+    system_feature_status_t::ANOMALY;
+
+static void interrupt_feature_set_cached(const char* feature,
+                                         system_feature_status_t& cached,
+                                         system_feature_status_t status,
+                                         bool force = false) {
+  if (force || cached != status || !system_feature_has("INTERRUPT", feature)) {
+    (void)system_feature_set("INTERRUPT", feature, status, nullptr);
+    cached = status;
+  }
+}
+
+static bool interrupt_feature_lane_required(interrupt_subscriber_kind_t kind) {
+  if (kind == interrupt_subscriber_kind_t::VCLOCK) return true;
+  if (kind == interrupt_subscriber_kind_t::OCXO1) return !OCXO1_DISABLED;
+  if (kind == interrupt_subscriber_kind_t::OCXO2) return !OCXO2_DISABLED;
+  return false;
+}
+
+static void interrupt_features_mark_initializing(void) {
+  interrupt_feature_set_cached("PPS_VCLOCK_AUTHORITY",
+                               g_interrupt_feature_pps_vclock_authority,
+                               system_feature_status_t::INITIALIZING,
+                               true);
+  interrupt_feature_set_cached("FLOORLINE",
+                               g_interrupt_feature_floorline,
+                               system_feature_status_t::INITIALIZING,
+                               true);
+  interrupt_feature_set_cached("QTIMER_COUNTER_CUSTODY",
+                               g_interrupt_feature_qtimer_counter_custody,
+                               system_feature_status_t::INITIALIZING,
+                               true);
+  interrupt_feature_set_cached("QTIMER_DWT_RULER",
+                               g_interrupt_feature_qtimer_dwt_ruler,
+                               system_feature_status_t::INITIALIZING,
+                               true);
+  interrupt_feature_set_cached("COUNTER32_LINEAGE",
+                               g_interrupt_feature_counter32_lineage,
+                               system_feature_status_t::INITIALIZING,
+                               true);
+}
+
+static void interrupt_feature_note_pps_vclock_authority(
+    const pps_vclock_edge_authority_t& authority) {
+  if (authority.valid) {
+    interrupt_feature_set_cached("PPS_VCLOCK_AUTHORITY",
+                                 g_interrupt_feature_pps_vclock_authority,
+                                 system_feature_status_t::NOMINAL);
+  }
+  // Startup rows can fail the agreement court before the prediction/phase
+  // surfaces are mature.  Leave the feature INITIALIZING until a valid proof
+  // arrives; focused reports carry the reject counters and masks.
+}
+
+static bool interrupt_feature_cntr_locked(
+    const interrupt_integrity_qtimer_cntr_match_check_t& s) {
+  return s.locked && s.post_lock_mismatch_count == 0U;
+}
+
+static bool interrupt_feature_cntr_anomaly(
+    const interrupt_integrity_qtimer_cntr_match_check_t& s) {
+  return s.locked && s.post_lock_mismatch_count != 0U;
+}
+
+static void interrupt_feature_update_qtimer_counter_custody(void) {
+  const bool v_ok = interrupt_feature_cntr_locked(g_interrupt_integrity.vclock_qtimer_cntr);
+  const bool o1_ok = !interrupt_feature_lane_required(interrupt_subscriber_kind_t::OCXO1) ||
+      interrupt_feature_cntr_locked(g_interrupt_integrity.ocxo1_qtimer_cntr);
+  const bool o2_ok = !interrupt_feature_lane_required(interrupt_subscriber_kind_t::OCXO2) ||
+      interrupt_feature_cntr_locked(g_interrupt_integrity.ocxo2_qtimer_cntr);
+
+  const bool anomaly =
+      interrupt_feature_cntr_anomaly(g_interrupt_integrity.vclock_qtimer_cntr) ||
+      (interrupt_feature_lane_required(interrupt_subscriber_kind_t::OCXO1) &&
+       interrupt_feature_cntr_anomaly(g_interrupt_integrity.ocxo1_qtimer_cntr)) ||
+      (interrupt_feature_lane_required(interrupt_subscriber_kind_t::OCXO2) &&
+       interrupt_feature_cntr_anomaly(g_interrupt_integrity.ocxo2_qtimer_cntr));
+
+  interrupt_feature_set_cached(
+      "QTIMER_COUNTER_CUSTODY",
+      g_interrupt_feature_qtimer_counter_custody,
+      anomaly ? system_feature_status_t::ANOMALY
+              : ((v_ok && o1_ok && o2_ok)
+                    ? system_feature_status_t::NOMINAL
+                    : system_feature_status_t::INITIALIZING));
+}
+
+static bool interrupt_feature_dwt_locked(
+    const interrupt_integrity_qtimer_dwt_match_check_t& s) {
+  return s.one_second.locked && s.hz1k.locked &&
+         s.one_second.post_lock_mismatch_count == 0U &&
+         s.hz1k.post_lock_mismatch_count == 0U;
+}
+
+static bool interrupt_feature_dwt_anomaly(
+    const interrupt_integrity_qtimer_dwt_match_check_t& s) {
+  return (s.one_second.locked && s.one_second.post_lock_mismatch_count != 0U) ||
+         (s.hz1k.locked && s.hz1k.post_lock_mismatch_count != 0U);
+}
+
+static void interrupt_feature_update_qtimer_dwt_ruler(void) {
+  // Readiness uses the sovereign VCLOCK DWT ruler only. OCXO DWT interval
+  // checks remain diagnostic physics surfaces and are not global readiness.
+  const bool v_ok = interrupt_feature_dwt_locked(g_interrupt_integrity.vclock_qtimer_dwt);
+  const bool anomaly = interrupt_feature_dwt_anomaly(g_interrupt_integrity.vclock_qtimer_dwt);
+
+  interrupt_feature_set_cached(
+      "QTIMER_DWT_RULER",
+      g_interrupt_feature_qtimer_dwt_ruler,
+      anomaly ? system_feature_status_t::ANOMALY
+              : (v_ok ? system_feature_status_t::NOMINAL
+                      : system_feature_status_t::INITIALIZING));
+}
+
+static bool interrupt_feature_counter_lineage_ok(
+    const interrupt_integrity_counter_check_t& s) {
+  return s.valid && s.ok_count != 0U && s.bad_count == 0U;
+}
+
+static void interrupt_feature_update_counter32_lineage(void) {
+  const bool v_ok = interrupt_feature_counter_lineage_ok(g_interrupt_integrity.vclock_counter);
+  const bool o1_ok = !interrupt_feature_lane_required(interrupt_subscriber_kind_t::OCXO1) ||
+      interrupt_feature_counter_lineage_ok(g_interrupt_integrity.ocxo1_counter);
+  const bool o2_ok = !interrupt_feature_lane_required(interrupt_subscriber_kind_t::OCXO2) ||
+      interrupt_feature_counter_lineage_ok(g_interrupt_integrity.ocxo2_counter);
+  const bool anomaly =
+      g_interrupt_integrity.vclock_counter.bad_count != 0U ||
+      (interrupt_feature_lane_required(interrupt_subscriber_kind_t::OCXO1) &&
+       g_interrupt_integrity.ocxo1_counter.bad_count != 0U) ||
+      (interrupt_feature_lane_required(interrupt_subscriber_kind_t::OCXO2) &&
+       g_interrupt_integrity.ocxo2_counter.bad_count != 0U);
+
+  interrupt_feature_set_cached(
+      "COUNTER32_LINEAGE",
+      g_interrupt_feature_counter32_lineage,
+      anomaly ? system_feature_status_t::ANOMALY
+              : ((v_ok && o1_ok && o2_ok)
+                    ? system_feature_status_t::NOMINAL
+                    : system_feature_status_t::INITIALIZING));
+}
 
 // ============================================================================
 // Priority handoff migration baseline — safety rails
@@ -1747,6 +1918,7 @@ static pps_vclock_edge_authority_t pps_vclock_edge_authority_build(
           : 0;
 
   g_pps_vclock_edge_authority = a;
+  interrupt_feature_note_pps_vclock_authority(a);
   return a;
 }
 
@@ -2081,6 +2253,8 @@ static void interrupt_integrity_note_qtimer_cntr_match(
       s->lock_count++;
     }
   }
+
+  interrupt_feature_update_qtimer_counter_custody();
 }
 
 static void interrupt_integrity_note_qtimer_dwt_interval(
@@ -2260,6 +2434,8 @@ static void interrupt_integrity_note_qtimer_dwt_match(
       isr_entry_dwt_raw,
       QTIMER_DWT_1KHZ_LOCK_STREAK,
       hz1k_ruler_qualified);
+
+  interrupt_feature_update_qtimer_dwt_ruler();
 }
 
 
@@ -4316,6 +4492,7 @@ static void lower_env_reset_lane(interrupt_subscriber_kind_t kind) {
   lane->kind = kind;
   lane->name = name;
   lane->reset_count++;
+  interrupt_feature_update_floorline();
 }
 
 static void lower_env_reset_all(void) {
@@ -4329,6 +4506,32 @@ static void lower_env_reset_all(void) {
   g_lower_env_ocxo2.kind = interrupt_subscriber_kind_t::OCXO2;
   g_lower_env_ocxo2.name = "ocxo2";
   g_lower_env_snapshot_count = 0;
+  interrupt_feature_update_floorline();
+}
+
+static bool interrupt_feature_floorline_lane_nominal(
+    interrupt_subscriber_kind_t kind) {
+  const lower_env_lane_t* lane = lower_env_lane_for(kind);
+  return lane && lane->last.valid &&
+         lane->last.sample_count >= LOWER_ENV_FIT_MIN_BUCKETS &&
+         lane->last.inferred_dwt_at_event != 0U &&
+         lane->last.observed_dwt_at_event != 0U;
+}
+
+static void interrupt_feature_update_floorline(void) {
+  const bool v_ok = interrupt_feature_floorline_lane_nominal(
+      interrupt_subscriber_kind_t::VCLOCK);
+  const bool o1_ok = !interrupt_feature_lane_required(interrupt_subscriber_kind_t::OCXO1) ||
+      interrupt_feature_floorline_lane_nominal(interrupt_subscriber_kind_t::OCXO1);
+  const bool o2_ok = !interrupt_feature_lane_required(interrupt_subscriber_kind_t::OCXO2) ||
+      interrupt_feature_floorline_lane_nominal(interrupt_subscriber_kind_t::OCXO2);
+
+  interrupt_feature_set_cached(
+      "FLOORLINE",
+      g_interrupt_feature_floorline,
+      (v_ok && o1_ok && o2_ok)
+          ? system_feature_status_t::NOMINAL
+          : system_feature_status_t::INITIALIZING);
 }
 
 static void lower_env_publish_invalid_window(lower_env_lane_t& lane,
@@ -4360,6 +4563,7 @@ static void lower_env_publish_invalid_window(lower_env_lane_t& lane,
   lane.last = r;
   lane.invalid_window_count++;
   lower_env_clear_active(lane);
+  interrupt_feature_update_floorline();
 }
 
 static void lower_env_seal(lower_env_lane_t& lane,
@@ -4539,6 +4743,7 @@ static void lower_env_seal(lower_env_lane_t& lane,
   lane.previous_slope_valid = true;
   lane.last = r;
   lower_env_clear_active(lane);
+  interrupt_feature_update_floorline();
 }
 
 static void cadence_regression_observe(interrupt_subscriber_kind_t kind,
@@ -9300,6 +9505,8 @@ static void qtimer1_init_ch2_scheduler(void) {
 void process_interrupt_init_hardware(void) {
   if (g_interrupt_hw_ready) return;
 
+  interrupt_features_mark_initializing();
+
   g_ocxo1_lane.name = "OCXO1";
   g_ocxo1_lane.module = &IMXRT_TMR2;
   g_ocxo1_lane.channel = QTIMER_CLOCK_COMPARE_CH;
@@ -9630,6 +9837,7 @@ static void runtime_reset_for_init(void) {
   vclock_fact_ring_reset();
   runtime_reset_ocxo_fact_rings();
   cadence_regression_reset_all();
+  interrupt_features_mark_initializing();
 }
 
 void process_interrupt_init(void) {
