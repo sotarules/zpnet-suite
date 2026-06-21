@@ -1,5 +1,5 @@
 """
-ZPNet CLOCKS Process — TIMEBASE Authority (Pi-side) — v10 PPS/VCLOCK
+ZPNet CLOCKS Process — TIMEBASE Authority (Pi-side) — v10 PPS/VCLOCK - Revised
 
 Core contract (v2026-03+):
 
