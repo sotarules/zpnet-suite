@@ -132,7 +132,7 @@ from zpnet.processes.processes import (
 from zpnet.shared.constants import Payload
 from zpnet.shared.db import open_db
 from zpnet.shared.logger import setup_logging
-from zpnet.shared.util import system_time_z
+from zpnet.shared.util import blocking_features, system_time_z
 from zpnet.shared.events import create_event
 
 # ---------------------------------------------------------------------
@@ -168,6 +168,34 @@ TIMEBASE_PAIR_TIMEOUT_S = 5.0
 
 PREFLIGHT_POLL_INTERVAL_S = 30
 PREFLIGHT_LOG_PREFIX = "🛡️ [preflight]"
+
+# Feature-status campaign preflight.
+#
+# This first-pass gate deliberately uses the global PI SYSTEM feature tree,
+# because Pi SYSTEM has the broadest horizon: Pi-local GNSS/host/power state
+# plus imported Teensy-local timing readiness.  Runtime TIMEBASE pair
+# integrity, database command-contract checks, GNSS mode reconciliation, and
+# recovery projection remain local CLOCKS logic.
+FEATURE_PREFLIGHT_PROFILE = "CAMPAIGN_PREFLIGHT"
+FEATURE_PREFLIGHT_REQUIRED = (
+    "PI.SYSTEM.FEATURE_STATUS",
+    "PI.SYSTEM.HOST",
+    "PI.SYSTEM.POWER",
+    "PI.SYSTEM.BATTERY",
+    "PI.SYSTEM.TEENSY_FEATURE_IMPORT",
+    "PI.GNSS.REPORT",
+    "TEENSY.SYSTEM.FEATURE_STATUS",
+    "TEENSY.INTERRUPT.FLOORLINE",
+    "TEENSY.INTERRUPT.PPS_VCLOCK_AUTHORITY",
+    "TEENSY.INTERRUPT.QTIMER_COUNTER_CUSTODY",
+    "TEENSY.INTERRUPT.QTIMER_DWT_RULER",
+    "TEENSY.INTERRUPT.COUNTER32_LINEAGE",
+    "TEENSY.CLOCKS.DWT_CALIBRATION",
+    "TEENSY.CLOCKS.STATIC_PREDICTION",
+    "TEENSY.CLOCKS.SMARTZERO",
+    "TEENSY.CLOCKS.ALPHA_EPOCH",
+    "TEENSY.CLOCKS.OCXO_PUBLIC_ORIGIN",
+)
 
 # ---------------------------------------------------------------------
 # TIMEBASE ingress queue + exact-pair state
@@ -266,6 +294,12 @@ _diag: Dict[str, Any] = {
     "gnss_wait_seconds_total": 0.0,
     "gnss_wait_seconds_last": 0.0,
     "last_gnss_wait": {},
+
+    # Feature-status campaign preflight
+    "preflight_feature_checks": 0,
+    "preflight_feature_blocked": 0,
+    "preflight_feature_unavailable": 0,
+    "last_preflight_feature_gate": {},
 
     # GNSS discipline info fetch
     "gnss_info_requests": 0,
@@ -3058,15 +3092,100 @@ def cmd_set_baseline(args: Optional[dict]) -> Dict[str, Any]:
     return {"success": True, "message": "OK", "payload": baseline_blob}
 
 # ---------------------------------------------------------------------
+# Feature-status preflight gate
+# ---------------------------------------------------------------------
+
+
+def _fetch_system_features() -> Dict[str, Any]:
+    """Fetch the global feature tree from Pi SYSTEM.  Command/response only."""
+    resp = send_command(machine="PI", subsystem="SYSTEM", command="FEATURES")
+    if not resp.get("success"):
+        raise RuntimeError(f"PI SYSTEM FEATURES failed: {resp.get('message', '?')}")
+
+    payload = resp.get("payload", {})
+    if not isinstance(payload, dict):
+        raise RuntimeError("PI SYSTEM FEATURES returned non-dict payload")
+
+    return payload
+
+
+def _feature_gate_reason(blocker: Dict[str, Any]) -> str:
+    name = str(blocker.get("name") or "?")
+    status = str(blocker.get("status") or "HOLD")
+    detail = str(blocker.get("detail") or "").strip()
+    if detail:
+        return f"{name} is {status} ({detail})"
+    return f"{name} is {status}"
+
+
+def _check_feature_preflight(context: str) -> tuple[bool, list[str]]:
+    """Check the standardized feature-status campaign preflight profile."""
+    _diag["preflight_feature_checks"] += 1
+
+    try:
+        features = _fetch_system_features()
+    except Exception as e:
+        _diag["preflight_feature_unavailable"] += 1
+        _diag["last_preflight_feature_gate"] = {
+            "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "context": context,
+            "profile": FEATURE_PREFLIGHT_PROFILE,
+            "status": "UNAVAILABLE",
+            "error": str(e),
+        }
+        return False, [f"{FEATURE_PREFLIGHT_PROFILE}: feature tree unavailable ({e})"]
+
+    blockers = blocking_features(features, FEATURE_PREFLIGHT_REQUIRED)
+    if blockers:
+        _diag["preflight_feature_blocked"] += 1
+        compact_blockers = [
+            {
+                "name": str(b.get("name") or "?"),
+                "status": str(b.get("status") or "HOLD"),
+                "detail": str(b.get("detail") or ""),
+            }
+            for b in blockers
+        ]
+        _diag["last_preflight_feature_gate"] = {
+            "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "context": context,
+            "profile": FEATURE_PREFLIGHT_PROFILE,
+            "status": "BLOCKED",
+            "required_count": len(FEATURE_PREFLIGHT_REQUIRED),
+            "blockers": compact_blockers,
+        }
+        return False, [
+            f"{FEATURE_PREFLIGHT_PROFILE}: {_feature_gate_reason(blocker)}"
+            for blocker in compact_blockers
+        ]
+
+    _diag["last_preflight_feature_gate"] = {
+        "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "context": context,
+        "profile": FEATURE_PREFLIGHT_PROFILE,
+        "status": "NOMINAL",
+        "required_count": len(FEATURE_PREFLIGHT_REQUIRED),
+    }
+    return True, []
+
+
+# ---------------------------------------------------------------------
 # Preflight gate — prerequisites for campaign start/recovery
 # ---------------------------------------------------------------------
 
 
-def _check_preflight() -> tuple[bool, list[str]]:
+def _check_preflight(context: str = "campaign") -> tuple[bool, list[str]]:
     """
     Check whether the system is ready to start or recover a campaign.
     """
     reasons: list[str] = []
+
+    # -----------------------------------------------------------------
+    # 0. Standardized feature-status readiness profile
+    # -----------------------------------------------------------------
+    feature_ready, feature_reasons = _check_feature_preflight(context)
+    if not feature_ready:
+        reasons.extend(feature_reasons)
 
     # -----------------------------------------------------------------
     # 1. GNSS time valid
@@ -3159,7 +3278,7 @@ def _wait_for_preflight(context: str = "recovery") -> None:
     GRACE_POLL_S = 2.0    # poll interval during grace period
 
     while True:
-        ready, reasons = _check_preflight()
+        ready, reasons = _check_preflight(context)
 
         if ready:
             elapsed = time.monotonic() - t0
@@ -3361,6 +3480,10 @@ def cmd_clocks_info(_: Optional[dict]) -> Dict[str, Any]:
         "sync_expected_pps_vclock": _sync_expected_pps_vclock,
         "sync_expected_pps": _sync_expected_pps_vclock,
         "startup": _start_status_payload(),
+        "feature_preflight": {
+            "profile": FEATURE_PREFLIGHT_PROFILE,
+            "required_features": list(FEATURE_PREFLIGHT_REQUIRED),
+        },
         "diag": _diag,
     }
     return {"success": True, "message": "OK", "payload": payload}

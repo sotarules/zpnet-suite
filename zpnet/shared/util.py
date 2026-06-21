@@ -108,7 +108,17 @@ def feature_tree(payload_or_tree: Any) -> dict:
 
 
 def feature_get(payload_or_tree: Any, name: str, default: Any = None) -> Any:
-    """Return a feature entry by MACHINE.SUBSYSTEM.FEATURE path."""
+    """Return a feature leaf by MACHINE.SUBSYSTEM.FEATURE path.
+
+    Feature state is intentionally scalar-first:
+
+      {"TEENSY": {"CLOCKS": {"SMARTZERO": "NOMINAL"}}}
+
+    Older/richer payloads may still use a mapping leaf such as
+    {"status": "NOMINAL", "detail": "..."}.  Return either shape
+    unchanged so callers can normalize the status while preserving backward
+    compatibility.
+    """
     machine, subsystem, feature = feature_path_parts(name)
     tree = feature_tree(payload_or_tree)
 
@@ -120,8 +130,7 @@ def feature_get(payload_or_tree: Any, name: str, default: Any = None) -> Any:
     if not isinstance(node, Mapping):
         return default
 
-    entry = node.get(feature)
-    return entry if isinstance(entry, Mapping) else default
+    return node.get(feature, default)
 
 
 def feature_status(
@@ -129,15 +138,30 @@ def feature_status(
     name: str,
     default: str = FEATURE_STATUS_HOLD,
 ) -> str:
-    """Return a feature's status; missing features are HOLD by default."""
+    """Return a feature's status; missing features are HOLD by default.
+
+    Accept both the current scalar leaf form:
+
+      "FLOORLINE": "NOMINAL"
+
+    and the legacy/detail-capable mapping form:
+
+      "FLOORLINE": {"status": "NOMINAL", "detail": "..."}
+    """
     entry = feature_get(payload_or_tree, name)
-    if not isinstance(entry, Mapping):
+    if isinstance(entry, Mapping):
+        return normalize_feature_status(entry.get("status"), default=default)
+    if entry is None:
         return normalize_feature_status(default, default=FEATURE_STATUS_HOLD)
-    return normalize_feature_status(entry.get("status"), default=default)
+    return normalize_feature_status(entry, default=default)
 
 
 def feature_detail(payload_or_tree: Any, name: str, default: str = "") -> str:
-    """Return a feature's detail string, if present."""
+    """Return a feature's detail string, if present.
+
+    Scalar feature leaves intentionally carry no detail; focused subsystem
+    reports remain the place for diagnostics.
+    """
     entry = feature_get(payload_or_tree, name)
     if not isinstance(entry, Mapping):
         return default
@@ -201,10 +225,10 @@ def feature_summary(payload_or_tree: Any) -> dict:
                 continue
 
             for feature, entry in features.items():
-                if not isinstance(entry, Mapping):
-                    continue
-
-                status = normalize_feature_status(entry.get("status"))
+                if isinstance(entry, Mapping):
+                    status = normalize_feature_status(entry.get("status"))
+                else:
+                    status = normalize_feature_status(entry)
                 counts[status] += 1
 
                 if status != FEATURE_STATUS_NOMINAL:
