@@ -38,6 +38,8 @@ Column layout (INT rows):
   NAME   END_GNSS_NS   DELTA_NS
 """
 
+import time
+
 from zpnet.processes.processes import send_command
 
 VREF = 3.003
@@ -47,6 +49,41 @@ DAC_COARSE_STEP = 10.0
 DAC_MIN_CODE = 0.0
 DAC_MAX_CODE = 65535.0
 
+FEATURE_POLL_INTERVAL_S = 5.0
+FEATURE_GRID_COLUMNS = 3
+FEATURE_GRID_CELL_WIDTH = 39
+
+# Mission-control readiness board.  The feature payload remains scalar-only;
+# this table is just the operator-facing projection of the global PI SYSTEM
+# feature tree into the CLOCKS panel's empty space.
+FEATURE_STATUS_GRID = (
+    ("NET", "PI.SYSTEM.NETWORK"),
+    ("BATTERY", "PI.SYSTEM.BATTERY"),
+    ("GNSS", "PI.GNSS.REPORT"),
+    ("PI_HOST", "PI.SYSTEM.HOST"),
+    ("POWER", "PI.SYSTEM.POWER"),
+    ("T_IMPORT", "PI.SYSTEM.TEENSY_FEATURE_IMPORT"),
+    ("T_FEATURE", "TEENSY.SYSTEM.FEATURE_STATUS"),
+    ("PPS/V_AUTH", "TEENSY.INTERRUPT.PPS_VCLOCK_AUTHORITY"),
+    ("FLOORLINE", "TEENSY.INTERRUPT.FLOORLINE"),
+    ("QTIMER_CNT", "TEENSY.INTERRUPT.QTIMER_COUNTER_CUSTODY"),
+    ("QTIMER_DWT", "TEENSY.INTERRUPT.QTIMER_DWT_RULER"),
+    ("CTR32_LINE", "TEENSY.INTERRUPT.COUNTER32_LINEAGE"),
+    ("DWT_CAL", "TEENSY.CLOCKS.DWT_CALIBRATION"),
+    ("STATIC_PRED", "TEENSY.CLOCKS.STATIC_PREDICTION"),
+    ("SMARTZERO", "TEENSY.CLOCKS.SMARTZERO"),
+    ("ALPHA_EPOCH", "TEENSY.CLOCKS.ALPHA_EPOCH"),
+    ("OCXO_ORIGIN", "TEENSY.CLOCKS.OCXO_PUBLIC_ORIGIN"),
+    ("SCI_RES", "TEENSY.CLOCKS.SCIENCE_RESIDUALS"),
+    ("TB_PUB", "TEENSY.CLOCKS.TIMEBASE_PUBLICATION"),
+    ("ENV", "PI.SYSTEM.ENVIRONMENT"),
+    ("SENSORS", "PI.SYSTEM.SENSORS"),
+)
+
+_FEATURE_STATUS_CACHE: dict | None = None
+_FEATURE_STATUS_CACHE_TS = 0.0
+_FEATURE_STATUS_CACHE_ERROR: str | None = None
+
 
 # ---------------------------------------------------------------------
 # Data fetchers
@@ -54,6 +91,45 @@ DAC_MAX_CODE = 65535.0
 
 def _get_system_snapshot() -> dict:
     return send_command(machine="PI", subsystem="SYSTEM", command="REPORT")["payload"]
+
+
+def _get_feature_status_payload(force: bool = False) -> tuple[dict, str | None]:
+    """Return the global PI SYSTEM feature tree using command/response.
+
+    Metrics repaints once per second, but feature readiness is human-facing
+    state.  Poll the command path at a slower cadence so SYSTEM.FEATURES stays
+    explicit, current, and cheap.  If a poll fails after a good read, keep the
+    last good tree visible and mark the board stale.
+    """
+    global _FEATURE_STATUS_CACHE, _FEATURE_STATUS_CACHE_TS, _FEATURE_STATUS_CACHE_ERROR
+
+    now = time.monotonic()
+    if (
+        not force
+        and _FEATURE_STATUS_CACHE is not None
+        and (now - _FEATURE_STATUS_CACHE_TS) < FEATURE_POLL_INTERVAL_S
+    ):
+        return _FEATURE_STATUS_CACHE, _FEATURE_STATUS_CACHE_ERROR
+
+    try:
+        resp = send_command(machine="PI", subsystem="SYSTEM", command="FEATURES")
+        if not resp.get("success", True):
+            raise RuntimeError(resp.get("message") or "PI SYSTEM FEATURES failed")
+        payload = resp.get("payload", {})
+        if not isinstance(payload, dict):
+            raise RuntimeError("PI SYSTEM FEATURES returned a non-object payload")
+
+        _FEATURE_STATUS_CACHE = payload
+        _FEATURE_STATUS_CACHE_TS = now
+        _FEATURE_STATUS_CACHE_ERROR = None
+        return payload, None
+
+    except Exception as e:
+        _FEATURE_STATUS_CACHE_TS = now
+        _FEATURE_STATUS_CACHE_ERROR = str(e)
+        if _FEATURE_STATUS_CACHE is not None:
+            return _FEATURE_STATUS_CACHE, _FEATURE_STATUS_CACHE_ERROR
+        return {}, _FEATURE_STATUS_CACHE_ERROR
 
 
 def _get_pi_clocks_report() -> dict:
@@ -836,6 +912,64 @@ def _dac_detail_lines(r: dict, baseline: dict | None, report_dac: dict | None,
 
 
 # ---------------------------------------------------------------------
+# Mission-control feature grid
+# ---------------------------------------------------------------------
+
+def _feature_status_at(tree: dict, name: str, default: str = "---") -> str:
+    cur = tree if isinstance(tree, dict) else {}
+    for part in name.split("."):
+        if not isinstance(cur, dict):
+            return default
+        cur = cur.get(part.upper())
+        if cur is None:
+            return default
+
+    return _feature_status_label(cur)
+
+
+def _feature_status_label(value) -> str:
+    s = str(value or "---").strip().upper()
+    if s == "DOWN":
+        return "ANOMALY"
+    if s in ("INITIALIZING", "NOMINAL", "HOLD", "ANOMALY"):
+        return s
+    return s or "---"
+
+
+def feature_status_grid_lines() -> list[str]:
+    features, error = _get_feature_status_payload()
+
+    title = f"FEATURES  MISSION CONTROL  poll={FEATURE_POLL_INTERVAL_S:.0f}s"
+    if error and features:
+        title += "  STALE"
+
+    lines = [title]
+
+    if error and not features:
+        lines.append(f"  UNAVAILABLE: {error}")
+        lines.append("")
+        return lines
+
+    cells = []
+    for label, path in FEATURE_STATUS_GRID:
+        cells.append(f"{label}: {_feature_status_at(features, path)}")
+
+    for row in range(0, len(cells), FEATURE_GRID_COLUMNS):
+        chunk = cells[row:row + FEATURE_GRID_COLUMNS]
+        lines.append(
+            "  " + "".join(
+                f"{cell:<{FEATURE_GRID_CELL_WIDTH}}" for cell in chunk
+            ).rstrip()
+        )
+
+    if error:
+        lines.append(f"  LAST POLL ERROR: {error[:120]}")
+
+    lines.append("")
+    return lines
+
+
+# ---------------------------------------------------------------------
 # Status header
 # ---------------------------------------------------------------------
 
@@ -1015,6 +1149,7 @@ def clocks_combined_readout() -> list[str]:
             W_MEAN, W_SD, W_SE, W_N, W_BASE, W_NOW, W_DELTA,
         ))
         lines.append("")
+        lines.extend(feature_status_grid_lines())
         return lines
 
     r = report
@@ -1360,6 +1495,8 @@ def clocks_combined_readout() -> list[str]:
         env_parts.append(f"TEENSY: {teensy_temp:.1f}°C")
     lines.append("ENV   " + "  ".join(env_parts))
     lines.append("")
+
+    lines.extend(feature_status_grid_lines())
 
     return lines
 
