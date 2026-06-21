@@ -3472,10 +3472,9 @@ static void vclock_ch2_one_second_enable_from_epoch_legacy_grid(
     uint32_t selected_counter32,
     uint32_t service_counter32,
     uint32_t tick_mod_seed);
-static bool vclock_ch2_one_second_already_served_for(uint32_t counter32);
-static void vclock_ch2_one_second_service(uint32_t isr_entry_dwt_raw,
-                                          uint32_t qtimer_event_dwt,
-                                          uint32_t service_counter32);
+struct vclock_one_second_bookend_t;
+static bool vclock_ch2_one_second_service(
+    const vclock_one_second_bookend_t& bookend);
 static void vclock_ch2_smartzero_reset_attempt_state(void);
 static void vclock_ch2_smartzero_deactivate(void);
 static void vclock_ch2_smartzero_service(uint32_t qtimer_event_dwt,
@@ -4374,6 +4373,35 @@ static constexpr uint32_t LOWER_ENV_SAMPLE_RATE_HZ = 1000U;
 static constexpr uint32_t LOWER_ENV_BUCKET_COUNT = 64U;
 static constexpr uint32_t LOWER_ENV_FIT_MIN_BUCKETS = 8U;
 static constexpr uint32_t LOWER_ENV_ERROR_GATE_CYCLES = 4U;
+static constexpr uint32_t LOWER_ENV_PUBLISH_MIN_SAMPLES = 128U;
+static constexpr uint32_t LOWER_ENV_PUBLISH_MIN_BUCKETS = 32U;
+// Publication uses a two-tier court: the 4-cycle gate is evidence
+// quality, not disqualification.  A valid FloorLine candidate may be
+// low-confidence and still be the better estimator than observed.  Only
+// gross candidate/output excursions demote publication back to observed.
+static constexpr uint32_t LOWER_ENV_PUBLISH_HARD_EDGE_GATE_CYCLES = 16U;
+static constexpr uint32_t LOWER_ENV_PUBLISH_HARD_INTERVAL_GATE_CYCLES = 16U;
+
+static constexpr uint32_t FLOORLINE_PUBLISH_SOURCE_OBSERVED  = 0U;
+static constexpr uint32_t FLOORLINE_PUBLISH_SOURCE_FLOORLINE = 1U;
+
+static constexpr uint32_t FLOORLINE_REASON_ACCEPTED          = 0U;
+static constexpr uint32_t FLOORLINE_REASON_INIT              = 1U;
+static constexpr uint32_t FLOORLINE_REASON_SAMPLE_STARVED    = 2U;
+static constexpr uint32_t FLOORLINE_REASON_BUCKET_STARVED    = 3U;
+static constexpr uint32_t FLOORLINE_REASON_FIT_INVALID       = 4U;
+static constexpr uint32_t FLOORLINE_REASON_FIT_OUTLIER       = 5U;
+static constexpr uint32_t FLOORLINE_REASON_INTERVAL_GATE     = 6U;
+static constexpr uint32_t FLOORLINE_REASON_EDGE_GATE         = 7U;
+
+static uint32_t lower_env_abs_i32(int32_t value) {
+  return value < 0 ? (uint32_t)(-(int64_t)value) : (uint32_t)value;
+}
+
+static bool lower_env_within_gate(int32_t residual_cycles) {
+  return residual_cycles >= -(int32_t)LOWER_ENV_ERROR_GATE_CYCLES &&
+         residual_cycles <=  (int32_t)LOWER_ENV_ERROR_GATE_CYCLES;
+}
 
 // FloorLine lower-envelope inference remains always compiled as an ordinary
 // diagnostic rail.  Publication is intentionally selected at the call site
@@ -4416,6 +4444,17 @@ struct cadence_regression_result_t {
   uint32_t inferred_interval_cycles = 0;
   int32_t  inferred_minus_observed_interval_cycles = 0;
   uint32_t selected_bucket_count = 0;
+
+  bool     candidate_present = false;
+  bool     publish_floorline = false;
+  uint32_t publish_source = FLOORLINE_PUBLISH_SOURCE_OBSERVED;
+  uint32_t publish_reason = FLOORLINE_REASON_INIT;
+  uint32_t sample_accepted_count = 0;
+  uint32_t sample_rejected_count = 0;
+  uint32_t bucket_required_count = LOWER_ENV_PUBLISH_MIN_BUCKETS;
+  uint32_t sample_required_count = LOWER_ENV_PUBLISH_MIN_SAMPLES;
+  uint32_t gate_cycles = LOWER_ENV_ERROR_GATE_CYCLES;
+  int32_t  candidate_interval_error_cycles = 0;
 };
 
 struct lower_env_lane_t {
@@ -4426,6 +4465,8 @@ struct lower_env_lane_t {
   bool     active_valid = false;
   uint32_t active_sample_count = 0;
   uint32_t active_bucket_count = 0;
+  uint32_t active_sample_accepted_count = 0;
+  uint32_t active_sample_rejected_count = 0;
   uint32_t active_base_dwt = 0;
 
   bool     previous_observed_edge_valid = false;
@@ -4461,6 +4502,13 @@ static uint64_t lower_env_default_slope_q16(void) {
   return ((uint64_t)cps << 16) / (uint64_t)LOWER_ENV_SAMPLE_RATE_HZ;
 }
 
+static uint64_t lower_env_slope_from_observed_interval_q16(
+    uint32_t observed_interval_cycles) {
+  return observed_interval_cycles
+      ? (((uint64_t)observed_interval_cycles << 16) / LOWER_ENV_SAMPLE_RATE_HZ)
+      : lower_env_default_slope_q16();
+}
+
 static int32_t lower_env_signed_delta_u32(uint32_t from_dwt, uint32_t to_dwt) {
   const uint32_t delta = to_dwt - from_dwt;
   if (delta <= 0x7FFFFFFFUL) return (int32_t)delta;
@@ -4481,6 +4529,8 @@ static void lower_env_clear_active(lower_env_lane_t& lane) {
   lane.active_valid = false;
   lane.active_sample_count = 0;
   lane.active_bucket_count = 0;
+  lane.active_sample_accepted_count = 0;
+  lane.active_sample_rejected_count = 0;
   lane.active_base_dwt = 0;
 }
 
@@ -4534,6 +4584,84 @@ static void interrupt_feature_update_floorline(void) {
           : system_feature_status_t::INITIALIZING);
 }
 
+static const char* lower_env_publish_source_name(uint32_t source) {
+  switch (source) {
+    case FLOORLINE_PUBLISH_SOURCE_FLOORLINE: return "floorline";
+    case FLOORLINE_PUBLISH_SOURCE_OBSERVED:  return "observed";
+    default: return "unknown";
+  }
+}
+
+static const char* lower_env_publish_reason_name(uint32_t reason) {
+  switch (reason) {
+    case FLOORLINE_REASON_ACCEPTED:       return "accepted";
+    case FLOORLINE_REASON_INIT:           return "init";
+    case FLOORLINE_REASON_SAMPLE_STARVED: return "sample_starved";
+    case FLOORLINE_REASON_BUCKET_STARVED: return "bucket_starved";
+    case FLOORLINE_REASON_FIT_INVALID:    return "fit_invalid";
+    case FLOORLINE_REASON_FIT_OUTLIER:    return "fit_outlier";
+    case FLOORLINE_REASON_INTERVAL_GATE:  return "interval_gate";
+    case FLOORLINE_REASON_EDGE_GATE:      return "edge_gate";
+    default: return "unknown";
+  }
+}
+
+static void lower_env_decide_publication(cadence_regression_result_t& r) {
+  r.publish_source = FLOORLINE_PUBLISH_SOURCE_OBSERVED;
+  r.publish_reason = FLOORLINE_REASON_INIT;
+  r.publish_floorline = false;
+  r.candidate_interval_error_cycles =
+      (r.observed_interval_valid && r.inferred_interval_valid)
+          ? r.inferred_minus_observed_interval_cycles
+          : 0;
+
+  // Do not let the perfect be the enemy of the good.
+  //
+  // The original gate treated every imperfect evidence condition as a reason
+  // to publish observed/raw.  Live Species1 evidence showed that this makes the
+  // subscriber rail noisier: observed is evidence, not truth.  Therefore only
+  // genuinely absent/invalid or grossly displaced candidates are hard rejects.
+  // Soft failures keep their reason code for TIMEBASE/reporting, but still
+  // publish FloorLine because it is normally the lower-variance estimator.
+  if (!r.valid || !r.candidate_present || r.inferred_dwt_at_event == 0U) {
+    r.publish_reason = FLOORLINE_REASON_FIT_INVALID;
+    return;
+  }
+
+  uint32_t soft_reason = FLOORLINE_REASON_ACCEPTED;
+  if (r.sample_accepted_count < LOWER_ENV_PUBLISH_MIN_SAMPLES) {
+    soft_reason = FLOORLINE_REASON_SAMPLE_STARVED;
+  } else if (r.selected_bucket_count < LOWER_ENV_PUBLISH_MIN_BUCKETS) {
+    soft_reason = FLOORLINE_REASON_BUCKET_STARVED;
+  } else if (r.fit_error_abs_gt4_count != 0U) {
+    soft_reason = FLOORLINE_REASON_FIT_OUTLIER;
+  } else if ((r.observed_interval_valid && r.inferred_interval_valid) &&
+             lower_env_abs_i32(r.inferred_minus_observed_interval_cycles) >
+                 LOWER_ENV_ERROR_GATE_CYCLES) {
+    soft_reason = FLOORLINE_REASON_INTERVAL_GATE;
+  } else if (lower_env_abs_i32(r.inferred_minus_observed_cycles) >
+             LOWER_ENV_ERROR_GATE_CYCLES) {
+    soft_reason = FLOORLINE_REASON_EDGE_GATE;
+  }
+
+  if ((r.observed_interval_valid && r.inferred_interval_valid) &&
+      lower_env_abs_i32(r.inferred_minus_observed_interval_cycles) >
+          LOWER_ENV_PUBLISH_HARD_INTERVAL_GATE_CYCLES) {
+    r.publish_reason = FLOORLINE_REASON_INTERVAL_GATE;
+    return;
+  }
+
+  if (lower_env_abs_i32(r.inferred_minus_observed_cycles) >
+      LOWER_ENV_PUBLISH_HARD_EDGE_GATE_CYCLES) {
+    r.publish_reason = FLOORLINE_REASON_EDGE_GATE;
+    return;
+  }
+
+  r.publish_source = FLOORLINE_PUBLISH_SOURCE_FLOORLINE;
+  r.publish_reason = soft_reason;
+  r.publish_floorline = true;
+}
+
 static void lower_env_publish_invalid_window(lower_env_lane_t& lane,
                                              uint32_t observed_dwt,
                                              uint32_t target_counter32,
@@ -4546,6 +4674,15 @@ static void lower_env_publish_invalid_window(lower_env_lane_t& lane,
   r.selected_bucket_count = lane.active_bucket_count;
   r.observed_dwt_at_event = observed_dwt;
   r.inferred_dwt_at_event = observed_dwt;
+  r.candidate_present = false;
+  r.publish_source = FLOORLINE_PUBLISH_SOURCE_OBSERVED;
+  r.publish_reason =
+      (lane.active_sample_accepted_count < LOWER_ENV_PUBLISH_MIN_SAMPLES)
+          ? FLOORLINE_REASON_SAMPLE_STARVED
+          : FLOORLINE_REASON_BUCKET_STARVED;
+  r.sample_accepted_count = lane.active_sample_accepted_count;
+  r.sample_rejected_count = lane.active_sample_rejected_count;
+  r.gate_cycles = LOWER_ENV_ERROR_GATE_CYCLES;
   r.inferred_minus_observed_cycles = 0;
   r.target_counter32_at_event = target_counter32;
   r.target_hardware16_at_event = target_hw16;
@@ -4560,6 +4697,13 @@ static void lower_env_publish_invalid_window(lower_env_lane_t& lane,
       : 0U;
   lane.previous_observed_edge_dwt = observed_dwt;
   lane.previous_observed_edge_valid = true;
+  lane.previous_inferred_edge_dwt = observed_dwt;
+  lane.previous_inferred_edge_valid = true;
+  lane.previous_slope_q16_cycles_per_sample =
+      r.observed_interval_valid
+          ? lower_env_slope_from_observed_interval_q16(r.observed_interval_cycles)
+          : lower_env_default_slope_q16();
+  lane.previous_slope_valid = true;
   lane.last = r;
   lane.invalid_window_count++;
   lower_env_clear_active(lane);
@@ -4700,8 +4844,11 @@ static void lower_env_seal(lower_env_lane_t& lane,
 
   cadence_regression_result_t r{};
   r.valid = true;
+  r.candidate_present = true;
   r.sequence = ++lane.update_count;
   r.sample_count = lane.active_sample_count;
+  r.sample_accepted_count = lane.active_sample_accepted_count;
+  r.sample_rejected_count = lane.active_sample_rejected_count;
   r.selected_bucket_count = n;
   r.observed_dwt_at_event = observed_dwt;
   r.inferred_dwt_at_event = inferred_edge_dwt;
@@ -4735,11 +4882,21 @@ static void lower_env_seal(lower_env_lane_t& lane,
             : -(int32_t)(r.observed_interval_cycles - r.inferred_interval_cycles);
   }
 
+  r.gate_cycles = LOWER_ENV_ERROR_GATE_CYCLES;
+  r.bucket_required_count = LOWER_ENV_PUBLISH_MIN_BUCKETS;
+  r.sample_required_count = LOWER_ENV_PUBLISH_MIN_SAMPLES;
+  lower_env_decide_publication(r);
+
   lane.previous_observed_edge_dwt = observed_dwt;
   lane.previous_observed_edge_valid = true;
-  lane.previous_inferred_edge_dwt = inferred_edge_dwt;
+  lane.previous_inferred_edge_dwt =
+      r.publish_floorline ? inferred_edge_dwt : observed_dwt;
   lane.previous_inferred_edge_valid = true;
-  lane.previous_slope_q16_cycles_per_sample = (uint64_t)full_slope_q16;
+  lane.previous_slope_q16_cycles_per_sample = r.publish_floorline
+      ? (uint64_t)full_slope_q16
+      : (r.observed_interval_valid
+            ? lower_env_slope_from_observed_interval_q16(r.observed_interval_cycles)
+            : lower_env_default_slope_q16());
   lane.previous_slope_valid = true;
   lane.last = r;
   lower_env_clear_active(lane);
@@ -4774,6 +4931,18 @@ static void cadence_regression_observe(interrupt_subscriber_kind_t kind,
       lane->active_base_dwt +
       lower_env_round_q16_u32((int64_t)slope_q16 * (int64_t)x);
   const int32_t residual = lower_env_signed_delta_u32(predicted_dwt, observed_dwt);
+
+  if (!lower_env_within_gate(residual)) {
+    lane->active_sample_rejected_count++;
+    if (closes_second) {
+      lower_env_seal(*lane, observed_dwt, target_counter32,
+                     target_hw16, observed_hw16);
+    }
+    return;
+  }
+
+  lane->active_sample_accepted_count++;
+
   uint32_t bucket_index = (x * LOWER_ENV_BUCKET_COUNT) / LOWER_ENV_SAMPLE_RATE_HZ;
   if (bucket_index >= LOWER_ENV_BUCKET_COUNT) bucket_index = LOWER_ENV_BUCKET_COUNT - 1U;
 
@@ -4845,28 +5014,33 @@ static inline void copy_floorline_interval_to_diag(
     dwt_repair_diag_t& diag,
     const cadence_regression_result_t& r) {
   diag.interval_gate_valid = r.observed_interval_valid || r.inferred_interval_valid;
-  diag.interval_sample_accepted = r.valid;
-  diag.interval_sample_rejected = false;
+  diag.interval_sample_accepted = r.publish_floorline;
+  diag.interval_sample_rejected = !r.publish_floorline;
   diag.interval_observed_cycles = r.observed_interval_valid
       ? r.observed_interval_cycles
       : 0U;
   diag.interval_prediction_cycles = r.inferred_interval_valid
       ? r.inferred_interval_cycles
       : 0U;
-  diag.interval_effective_cycles = r.inferred_interval_valid
-      ? r.inferred_interval_cycles
+  diag.interval_effective_cycles = r.observed_interval_valid || r.inferred_interval_valid
+      ? (r.publish_floorline ? r.inferred_interval_cycles : r.observed_interval_cycles)
       : 0U;
   diag.interval_residual_cycles =
       (r.observed_interval_valid && r.inferred_interval_valid)
-          ? r.inferred_minus_observed_interval_cycles
+          ? r.candidate_interval_error_cycles
           : 0;
   diag.interval_gate_threshold_cycles = LOWER_ENV_ERROR_GATE_CYCLES;
+  diag.interval_accept_count = r.sample_accepted_count;
+  diag.interval_reject_count = r.sample_rejected_count;
+  // Retired predictor fields reused as compact FloorLine publication forensics.
+  diag.interval_resync_count = r.selected_bucket_count;
+  diag.interval_reject_streak = r.publish_reason;
 }
 
 static inline uint32_t vclock_published_dwt_at_edge(
     uint32_t observed_dwt_at_edge,
     const cadence_regression_result_t& floorline) {
-  return floorline.inferred_dwt_at_event
+  return (floorline.publish_floorline && floorline.inferred_dwt_at_event)
       ? floorline.inferred_dwt_at_event
       : observed_dwt_at_edge;
 }
@@ -4874,7 +5048,7 @@ static inline uint32_t vclock_published_dwt_at_edge(
 static inline uint32_t ocxo_published_dwt_at_edge(
     uint32_t observed_dwt_at_edge,
     const cadence_regression_result_t& floorline) {
-  return floorline.inferred_dwt_at_event
+  return (floorline.publish_floorline && floorline.inferred_dwt_at_event)
       ? floorline.inferred_dwt_at_event
       : observed_dwt_at_edge;
 }
@@ -5123,6 +5297,30 @@ static void emit_one_second_event(interrupt_subscriber_runtime_t& rt,
 static constexpr uint32_t VCLOCK_PERISHABLE_FACT_RING_SIZE = 8;
 static constexpr const char* VCLOCK_FACT_DRAIN_NAME = "VCLOCK_FACT_DRAIN";
 
+// One authored VCLOCK cadence tooth can be an ordinary 1 kHz sample, or it can
+// be the one-second bookend.  Build this packet once per CH0 handoff and feed
+// the same event identity to FloorLine and to publication.  That prevents the
+// publication source decision (FloorLine vs observed) from silently switching
+// between adjacent 1 ms teeth.
+struct vclock_one_second_bookend_t {
+  bool     due = false;
+  bool     ch2_owned = false;
+  bool     legacy_owned = false;
+
+  uint32_t isr_entry_dwt_raw = 0;
+  uint32_t observed_dwt_at_event = 0;
+  uint32_t target_counter32 = 0;
+  uint16_t target_low16 = 0;
+  uint16_t observed_low16 = 0;
+
+  uint32_t service_counter32 = 0;
+  uint32_t late_ticks = 0;
+
+  bool     witness_pps_valid = false;
+  pps_t    witness_pps{};
+  uint32_t fallback_sequence = 0;
+};
+
 struct vclock_perishable_fact_t {
   uint32_t sequence = 0;
   uint32_t isr_entry_dwt_raw = 0;
@@ -5227,6 +5425,65 @@ static bool vclock_fact_ring_arm_drain_from_timepop(void) {
   return true;
 }
 
+static void vclock_ch2_one_second_advance_after_bookend(
+    uint32_t target_counter32,
+    uint32_t service_counter32) {
+  uint32_t next = target_counter32 + (uint32_t)VCLOCK_COUNTS_PER_SECOND;
+  while ((int32_t)(service_counter32 - next) >= 0) {
+    next += (uint32_t)VCLOCK_COUNTS_PER_SECOND;
+    g_vclock_ch2_one_second_catchup_count++;
+    g_vclock_ch2_one_second_drop_count++;
+  }
+  g_vclock_ch2_one_second_next_counter32 = next;
+}
+
+static vclock_one_second_bookend_t vclock_one_second_bookend_build(
+    uint32_t isr_entry_dwt_raw,
+    uint32_t qtimer_event_dwt,
+    uint32_t cadence_counter32,
+    uint16_t fired_low16) {
+  vclock_one_second_bookend_t out{};
+  out.isr_entry_dwt_raw = isr_entry_dwt_raw;
+  out.service_counter32 = cadence_counter32;
+  out.observed_low16 = fired_low16;
+  out.witness_pps_valid = g_last_pps_witness_valid;
+  out.witness_pps = g_last_pps_witness_valid ? g_last_pps_witness : pps_t{};
+  out.fallback_sequence = g_pps_gpio_heartbeat.edge_count + 1U;
+
+  if (!g_vclock_lane.active || !g_rt_vclock || !g_rt_vclock->active) {
+    return out;
+  }
+
+  uint32_t target_counter32 = 0;
+  bool ch2_due = false;
+  if (g_vclock_ch2_one_second_enabled) {
+    target_counter32 = g_vclock_ch2_one_second_next_counter32;
+    ch2_due = ((int32_t)(cadence_counter32 - target_counter32) >= 0);
+  }
+
+  const bool legacy_due =
+      !g_vclock_ch2_one_second_enabled &&
+      g_vclock_lane.phase_bootstrapped &&
+      ((g_vclock_lane.tick_mod_1000 + 1U) >= TICKS_PER_SECOND_EVENT);
+
+  if (!ch2_due && !legacy_due) {
+    return out;
+  }
+
+  out.due = true;
+  out.ch2_owned = ch2_due;
+  out.legacy_owned = legacy_due && !ch2_due;
+  out.target_counter32 = ch2_due ? target_counter32 : cadence_counter32;
+  out.target_low16 = vclock_hardware_low16_from_synthetic(out.target_counter32);
+  out.late_ticks = cadence_counter32 - out.target_counter32;
+  out.observed_dwt_at_event = qtimer_event_dwt;
+  if (out.late_ticks != 0) {
+    out.observed_dwt_at_event -= vclock_cycles_for_ticks(out.late_ticks);
+  }
+
+  return out;
+}
+
 static void vclock_ch2_fact_drain_arm_after_timepop(void) {
   if (!g_interrupt_runtime_ready) return;
 
@@ -5284,51 +5541,34 @@ static void vclock_ch2_one_second_enable_after_heartbeat(uint32_t last_counter32
   g_vclock_ch2_one_second_heartbeat_enable_count++;
 }
 
-static bool vclock_ch2_one_second_already_served_for(uint32_t counter32) {
+static bool vclock_ch2_one_second_service(
+    const vclock_one_second_bookend_t& bookend) {
+  if (!bookend.due || !bookend.ch2_owned) return false;
   if (!g_vclock_ch2_one_second_enabled) return false;
+  if (!g_vclock_lane.active || !g_rt_vclock || !g_rt_vclock->active) return false;
 
-  // Normal CH2 ownership means the ISR has already advanced the next gear tooth
-  // beyond this heartbeat's counter identity before TimePop invokes the callback.
-  return (int32_t)(g_vclock_ch2_one_second_next_counter32 - counter32) > 0;
-}
-
-static void vclock_ch2_one_second_service(uint32_t isr_entry_dwt_raw,
-                                          uint32_t qtimer_event_dwt,
-                                          uint32_t service_counter32) {
-  if (!g_vclock_ch2_one_second_enabled) return;
-  if (!g_vclock_lane.active || !g_rt_vclock || !g_rt_vclock->active) return;
-
-  const uint32_t target_counter32 = g_vclock_ch2_one_second_next_counter32;
-  if ((int32_t)(service_counter32 - target_counter32) < 0) return;
-
-  const uint16_t target_low16 = vclock_hardware_low16_from_synthetic(target_counter32);
-  const uint32_t late_ticks = service_counter32 - target_counter32;
-  uint32_t authored_dwt = qtimer_event_dwt;
-  if (late_ticks != 0) {
+  if (bookend.late_ticks != 0) {
     g_vclock_ch2_one_second_late_count++;
-    if (late_ticks > g_vclock_ch2_one_second_late_max_ticks) {
-      g_vclock_ch2_one_second_late_max_ticks = late_ticks;
+    if (bookend.late_ticks > g_vclock_ch2_one_second_late_max_ticks) {
+      g_vclock_ch2_one_second_late_max_ticks = bookend.late_ticks;
     }
-    authored_dwt -= vclock_cycles_for_ticks(late_ticks);
   }
 
-  const pps_t witness_pps = g_last_pps_witness_valid ? g_last_pps_witness : pps_t{};
-
   vclock_perishable_fact_t fact{};
-  fact.isr_entry_dwt_raw = isr_entry_dwt_raw;
-  fact.observed_dwt_at_event = authored_dwt;
-  fact.target_counter32 = target_counter32;
-  fact.target_low16 = target_low16;
-  fact.observed_low16 = (uint16_t)(service_counter32 & 0xFFFFU);
+  fact.isr_entry_dwt_raw = bookend.isr_entry_dwt_raw;
+  fact.observed_dwt_at_event = bookend.observed_dwt_at_event;
+  fact.target_counter32 = bookend.target_counter32;
+  fact.target_low16 = bookend.target_low16;
+  fact.observed_low16 = bookend.observed_low16;
   fact.one_second_due = true;
-  fact.witness_pps_valid = g_last_pps_witness_valid;
-  fact.witness_pps = witness_pps;
-  fact.fallback_sequence = g_pps_gpio_heartbeat.edge_count + 1U;
+  fact.witness_pps_valid = bookend.witness_pps_valid;
+  fact.witness_pps = bookend.witness_pps;
+  fact.fallback_sequence = bookend.fallback_sequence;
 
   g_vclock_ch2_one_second_service_count++;
-  g_vclock_ch2_one_second_last_target_counter32 = target_counter32;
-  g_vclock_ch2_one_second_last_service_counter32 = service_counter32;
-  g_vclock_ch2_one_second_last_dwt = authored_dwt;
+  g_vclock_ch2_one_second_last_target_counter32 = bookend.target_counter32;
+  g_vclock_ch2_one_second_last_service_counter32 = bookend.service_counter32;
+  g_vclock_ch2_one_second_last_dwt = bookend.observed_dwt_at_event;
 
   // Passive ISR sanity witness retired.
 
@@ -5336,21 +5576,17 @@ static void vclock_ch2_one_second_service(uint32_t isr_entry_dwt_raw,
     g_vclock_ch2_one_second_enqueue_count++;
   } else {
     // Leave the target armed so the heartbeat fallback path can still publish
-    // the one-second event rather than silently losing a public bookend.
+    // the same authored bookend rather than silently losing a public edge.
     g_vclock_ch2_one_second_drop_count++;
-    return;
+    return false;
   }
 
   // Advance as a gear, not as a service-time rubber band.  If service is ever
   // more than one second late, skip stale teeth diagnostically instead of
   // trying to flood the drain with catch-up publications.
-  uint32_t next = target_counter32 + (uint32_t)VCLOCK_COUNTS_PER_SECOND;
-  while ((int32_t)(service_counter32 - next) >= 0) {
-    next += (uint32_t)VCLOCK_COUNTS_PER_SECOND;
-    g_vclock_ch2_one_second_catchup_count++;
-    g_vclock_ch2_one_second_drop_count++;
-  }
-  g_vclock_ch2_one_second_next_counter32 = next;
+  vclock_ch2_one_second_advance_after_bookend(bookend.target_counter32,
+                                              bookend.service_counter32);
+  return true;
 }
 
 static void vclock_ch2_smartzero_reset_attempt_state(void) {
@@ -5539,7 +5775,7 @@ static void vclock_apply_perishable_fact_deferred(
   dwt_publication_diag_choose(dwt_diag,
                               published_dwt,
                               observed_dwt,
-                              LOWER_ENV_ERROR_GATE_CYCLES,
+                              LOWER_ENV_PUBLISH_HARD_EDGE_GATE_CYCLES,
                               lower_env.valid
                                   ? "vclock_floorline"
                                   : "vclock_floorline_init");
@@ -6014,16 +6250,31 @@ static void vclock_heartbeat_native_service(uint32_t isr_entry_dwt_raw,
   g_vclock_heartbeat_last_vclock_hw16 = fired_low16;
   g_vclock_heartbeat_last_vclock_counter32 = cadence_counter32;
 
+  const vclock_one_second_bookend_t bookend =
+      vclock_one_second_bookend_build(isr_entry_dwt_raw,
+                                      qtimer_event_dwt,
+                                      cadence_counter32,
+                                      fired_low16);
+
   if (g_vclock_lane.active && g_rt_vclock && g_rt_vclock->active) {
-    const bool lower_env_vclock_closes_second =
-        g_vclock_lane.phase_bootstrapped &&
-        ((g_vclock_lane.tick_mod_1000 + 1U) >= TICKS_PER_SECOND_EVENT);
+    const uint32_t floorline_observed_dwt = bookend.due
+        ? bookend.observed_dwt_at_event
+        : qtimer_event_dwt;
+    const uint32_t floorline_counter32 = bookend.due
+        ? bookend.target_counter32
+        : cadence_counter32;
+    const uint16_t floorline_target_low16 = bookend.due
+        ? bookend.target_low16
+        : fired_low16;
+    const uint16_t floorline_observed_low16 = bookend.due
+        ? bookend.observed_low16
+        : fired_low16;
     cadence_regression_observe(interrupt_subscriber_kind_t::VCLOCK,
-                               qtimer_event_dwt,
-                               cadence_counter32,
-                               fired_low16,
-                               fired_low16,
-                               lower_env_vclock_closes_second);
+                               floorline_observed_dwt,
+                               floorline_counter32,
+                               floorline_target_low16,
+                               floorline_observed_low16,
+                               bookend.due);
   }
 
   // CH0 has already run the native custody services below before the legacy
@@ -6033,9 +6284,8 @@ static void vclock_heartbeat_native_service(uint32_t isr_entry_dwt_raw,
 
   interrupt_ch2_implicit_rollover_tend();
   pps_relay_ch2_tick(cadence_counter32);
-  vclock_ch2_one_second_service(isr_entry_dwt_raw,
-                                qtimer_event_dwt,
-                                cadence_counter32);
+  const bool vclock_one_second_served =
+      vclock_ch2_one_second_service(bookend);
   vclock_ch2_smartzero_service(qtimer_event_dwt,
                                cadence_counter32);
   vclock_ch2_epoch_native_service(qtimer_event_dwt,
@@ -6067,79 +6317,107 @@ static void vclock_heartbeat_native_service(uint32_t isr_entry_dwt_raw,
       return;
     }
 
-    if (++g_vclock_lane.tick_mod_1000 >= TICKS_PER_SECOND_EVENT) {
+    const bool tick_mod_wrapped =
+        (++g_vclock_lane.tick_mod_1000 >= TICKS_PER_SECOND_EVENT);
+    if (tick_mod_wrapped) {
       g_vclock_lane.tick_mod_1000 = 0;
+    }
 
-      if (vclock_ch2_one_second_already_served_for(cadence_counter32)) {
-        // Normal path: native CH0 authored and enqueued the one-second fact
-        // before this bookkeeping block reached the fallback branch.
-        g_vclock_heartbeat_one_second_handoff_skip_count++;
+    const bool normal_bookend_served =
+        bookend.due && bookend.ch2_owned && vclock_one_second_served;
+    const bool same_event_fallback_due =
+        (bookend.due && bookend.ch2_owned && !vclock_one_second_served) ||
+        (tick_mod_wrapped && !g_vclock_ch2_one_second_enabled);
+
+    if (normal_bookend_served) {
+      // Normal path: native CH0 authored and enqueued this exact one-second
+      // bookend before this bookkeeping block reached the fallback branch.
+      g_vclock_heartbeat_one_second_handoff_skip_count++;
+    } else if (same_event_fallback_due) {
+      // Bootstrap/failsafe path.  Publish the same cadence event that FloorLine
+      // just observed/sealed.  Do not switch to the adjacent tick_mod tooth.
+      if (bookend.due && bookend.ch2_owned) {
+        g_vclock_heartbeat_one_second_fallback_count++;
       } else {
-        // Bootstrap/failsafe path.  The first one-second bookend after startup,
-        // or any unexpected CH2 handoff miss, uses the exact legacy heartbeat
-        // publication path.  That preserves campaign-start and ZERO behavior.
-        if (g_vclock_ch2_one_second_enabled) {
-          g_vclock_heartbeat_one_second_fallback_count++;
-        } else {
-          g_vclock_heartbeat_one_second_legacy_count++;
-        }
+        g_vclock_heartbeat_one_second_legacy_count++;
+      }
 
-        // PPS_VCLOCK / PPS coincidence diagnostic.
-        uint32_t coincidence_cycles = 0;
-        bool     coincidence_valid  = false;
-        {
-          const pps_vclock_t pvc = store_load_pvc();
-          if (pvc.sequence > 0) {
-            const int32_t cycles_since_pvc =
-                (int32_t)(qtimer_event_dwt - pvc.dwt_at_edge);
-            if (llabs((long long)cycles_since_pvc) <
-                DWT_PPS_COINCIDENCE_THRESHOLD_CYCLES) {
-              coincidence_cycles =
-                  (uint32_t)(cycles_since_pvc >= 0 ? cycles_since_pvc
-                                                   : -cycles_since_pvc);
-              coincidence_valid = true;
-            }
+      const uint32_t observed_dwt = bookend.due
+          ? bookend.observed_dwt_at_event
+          : qtimer_event_dwt;
+      const uint32_t target_counter32 = bookend.due
+          ? bookend.target_counter32
+          : cadence_counter32;
+      const uint16_t target_low16 = bookend.due
+          ? bookend.target_low16
+          : fired_low16;
+      const pps_t witness_pps = bookend.due
+          ? bookend.witness_pps
+          : (g_last_pps_witness_valid ? g_last_pps_witness : pps_t{});
+      const bool witness_pps_valid = bookend.due
+          ? bookend.witness_pps_valid
+          : g_last_pps_witness_valid;
+      const uint32_t fallback_sequence = bookend.due
+          ? bookend.fallback_sequence
+          : (g_pps_gpio_heartbeat.edge_count + 1U);
+
+      // PPS_VCLOCK / PPS coincidence diagnostic.
+      uint32_t coincidence_cycles = 0;
+      bool     coincidence_valid  = false;
+      {
+        const pps_vclock_t pvc = store_load_pvc();
+        if (pvc.sequence > 0) {
+          const int32_t cycles_since_pvc =
+              (int32_t)(observed_dwt - pvc.dwt_at_edge);
+          if (llabs((long long)cycles_since_pvc) <
+              DWT_PPS_COINCIDENCE_THRESHOLD_CYCLES) {
+            coincidence_cycles =
+                (uint32_t)(cycles_since_pvc >= 0 ? cycles_since_pvc
+                                                 : -cycles_since_pvc);
+            coincidence_valid = true;
           }
         }
+      }
 
-        const pps_t witness_pps = g_last_pps_witness_valid
-            ? g_last_pps_witness
-            : pps_t{};
-        dwt_repair_diag_t dwt_diag{};
-        dwt_publication_diag_begin(dwt_diag,
-                                   qtimer_event_dwt,
-                                   0,
-                                   "vclock_floorline_fallback");
-        cadence_regression_result_t lower_env{};
-        (void)cadence_regression_latest_result(interrupt_subscriber_kind_t::VCLOCK,
-                                               &lower_env);
-        copy_floorline_interval_to_diag(dwt_diag, lower_env);
-        const uint32_t published_dwt =
-            vclock_published_dwt_at_edge(qtimer_event_dwt, lower_env);
-        dwt_publication_diag_choose(dwt_diag,
-                                    published_dwt,
-                                    qtimer_event_dwt,
-                                    LOWER_ENV_ERROR_GATE_CYCLES,
-                                    lower_env.valid
-                                        ? "vclock_floorline_fallback"
-                                        : "vclock_floorline_init_fallback");
-        publish_vclock_domain_pps_vclock(witness_pps,
-                                          (witness_pps.sequence != 0)
-                                              ? witness_pps.sequence
-                                              : (g_pps_gpio_heartbeat.edge_count + 1),
-                                          published_dwt,
-                                          cadence_counter32,
-                                          fired_low16,
-                                          qtimer_event_dwt);
+      dwt_repair_diag_t dwt_diag{};
+      dwt_publication_diag_begin(dwt_diag,
+                                 observed_dwt,
+                                 bookend.due ? bookend.isr_entry_dwt_raw : 0U,
+                                 "vclock_floorline_fallback");
+      cadence_regression_result_t lower_env{};
+      (void)cadence_regression_latest_result(interrupt_subscriber_kind_t::VCLOCK,
+                                             &lower_env);
+      copy_floorline_interval_to_diag(dwt_diag, lower_env);
+      const uint32_t published_dwt =
+          vclock_published_dwt_at_edge(observed_dwt, lower_env);
+      dwt_publication_diag_choose(dwt_diag,
+                                  published_dwt,
+                                  observed_dwt,
+                                  LOWER_ENV_PUBLISH_HARD_EDGE_GATE_CYCLES,
+                                  lower_env.valid
+                                      ? "vclock_floorline_fallback"
+                                      : "vclock_floorline_init_fallback");
+      publish_vclock_domain_pps_vclock(witness_pps_valid ? witness_pps : pps_t{},
+                                        (witness_pps_valid && witness_pps.sequence != 0)
+                                            ? witness_pps.sequence
+                                            : fallback_sequence,
+                                        published_dwt,
+                                        target_counter32,
+                                        target_low16,
+                                        observed_dwt);
 
-        emit_one_second_event(*g_rt_vclock, published_dwt,
-                              cadence_counter32,
-                              coincidence_cycles, coincidence_valid, &dwt_diag,
-                              false, &lower_env);
+      emit_one_second_event(*g_rt_vclock, published_dwt,
+                            target_counter32,
+                            coincidence_cycles, coincidence_valid, &dwt_diag,
+                            false, &lower_env);
 
-        pps_edge_dispatch_arm_or_call_from_foreground("PPS_VCLOCK_DISPATCH");
+      pps_edge_dispatch_arm_or_call_from_foreground("PPS_VCLOCK_DISPATCH");
 
-        vclock_ch2_one_second_enable_after_heartbeat(cadence_counter32);
+      if (bookend.due && bookend.ch2_owned) {
+        vclock_ch2_one_second_advance_after_bookend(bookend.target_counter32,
+                                                    bookend.service_counter32);
+      } else {
+        vclock_ch2_one_second_enable_after_heartbeat(target_counter32);
       }
     }
   } else {
@@ -7177,7 +7455,7 @@ static void ocxo_apply_perishable_fact_deferred(
   dwt_publication_diag_choose(dwt_diag,
                               published_dwt,
                               observed_dwt,
-                              LOWER_ENV_ERROR_GATE_CYCLES,
+                              LOWER_ENV_PUBLISH_HARD_EDGE_GATE_CYCLES,
                               lower_env.valid
                                   ? "ocxo_floorline"
                                   : (yardstick_reason ? yardstick_reason
@@ -8813,8 +9091,11 @@ static void qtimer1_vclock_capture_priority0(uint32_t isr_entry_dwt_raw,
   const uint32_t integrity_sequence =
       g_generation_gate_vclock.generation_gate_observe_count + 1U;
   const bool one_second_boundary =
-      g_vclock_lane.phase_bootstrapped &&
-      ((g_vclock_lane.tick_mod_1000 + 1U) >= TICKS_PER_SECOND_EVENT);
+      g_vclock_ch2_one_second_enabled
+          ? ((int32_t)(target_counter32 -
+                       g_vclock_ch2_one_second_next_counter32) >= 0)
+          : (g_vclock_lane.phase_bootstrapped &&
+             ((g_vclock_lane.tick_mod_1000 + 1U) >= TICKS_PER_SECOND_EVENT));
   interrupt_integrity_note_qtimer_cntr_match(
       interrupt_subscriber_kind_t::VCLOCK,
       integrity_sequence,
@@ -8832,7 +9113,7 @@ static void qtimer1_vclock_capture_priority0(uint32_t isr_entry_dwt_raw,
       g_vclock_clock32.hardware16,
       false,
       g_vclock_lane.tick_mod_1000,
-      false,
+      one_second_boundary,
       false,
       isr_entry_dwt_raw);
   if (!generation_accepted) {
@@ -10641,60 +10922,56 @@ static FLASHMEM void add_lower_env_lane_payload(Payload& parent,
   obj.add("reset_count", lane.reset_count);
   obj.add("invalid_window_count", lane.invalid_window_count);
   obj.add("overflow_reset_count", lane.overflow_reset_count);
-  obj.add("active_sample_count", lane.active_sample_count);
   obj.add("window_sample_count", r.sample_count);
+
+  obj.add("publish_source", r.publish_source);
+  obj.add("publish_source_name", lower_env_publish_source_name(r.publish_source));
+  obj.add("publish_reason", r.publish_reason);
+  obj.add("publish_reason_name", lower_env_publish_reason_name(r.publish_reason));
+  obj.add("floorline_published", r.publish_floorline);
+  obj.add("candidate_present", r.candidate_present);
+
+  obj.add("gate_cycles", LOWER_ENV_ERROR_GATE_CYCLES);
+  obj.add("hard_edge_gate_cycles", LOWER_ENV_PUBLISH_HARD_EDGE_GATE_CYCLES);
+  obj.add("hard_interval_gate_cycles",
+          LOWER_ENV_PUBLISH_HARD_INTERVAL_GATE_CYCLES);
+  obj.add("sample_accepted_count", r.sample_accepted_count);
+  obj.add("sample_rejected_count", r.sample_rejected_count);
+  obj.add("sample_required_count", LOWER_ENV_PUBLISH_MIN_SAMPLES);
   obj.add("bucket_count", LOWER_ENV_BUCKET_COUNT);
   obj.add("selected_bucket_count", r.selected_bucket_count);
-  obj.add("fit_min_buckets", LOWER_ENV_FIT_MIN_BUCKETS);
+  obj.add("bucket_required_count", LOWER_ENV_PUBLISH_MIN_BUCKETS);
   obj.add("sample_rate_hz", LOWER_ENV_SAMPLE_RATE_HZ);
 
   obj.add("observed_edge_dwt", r.observed_dwt_at_event);
   obj.add("inferred_edge_dwt", r.inferred_dwt_at_event);
   obj.add("inferred_minus_observed_edge_cycles",
           r.inferred_minus_observed_cycles);
-  obj.add("target_counter32_at_edge", r.target_counter32_at_event);
-  obj.add("target_hardware16_at_edge", (uint32_t)r.target_hardware16_at_event);
-  obj.add("observed_hardware16_at_edge", (uint32_t)r.observed_hardware16_at_event);
 
-  obj.add("observed_interval_valid", r.observed_interval_valid);
-  obj.add("inferred_interval_valid", r.inferred_interval_valid);
   obj.add("observed_interval_cycles", r.observed_interval_cycles);
   obj.add("inferred_interval_cycles", r.inferred_interval_cycles);
   obj.add("inferred_minus_observed_interval_cycles",
           r.inferred_minus_observed_interval_cycles);
+  const uint32_t pub_interval =
+      r.publish_floorline ? r.inferred_interval_cycles
+                          : r.observed_interval_cycles;
+  obj.add("published_interval_cycles", pub_interval);
 
-  const uint32_t slope_cps = lower_env_slope_cycles_per_second(r);
-  obj.add("slope_q16_cycles_per_sample", r.slope_q16_cycles_per_sample);
-  obj.add("slope_cycles_per_second", slope_cps);
-  obj.add("slope_delta_q16_cycles_per_sample",
-          r.slope_delta_q16_cycles_per_sample);
+  obj.add("slope_cycles_per_second", lower_env_slope_cycles_per_second(r));
   obj.add("fit_error_mean_q16_cycles", r.fit_error_mean_q16_cycles);
   obj.add("fit_error_stddev_q16_cycles", r.fit_error_stddev_q16_cycles);
-  obj.add("fit_error_min_cycles", r.fit_error_min_cycles);
   obj.add("fit_error_max_cycles", r.fit_error_max_cycles);
-  obj.add("fit_error_gt_plus4_count", r.fit_error_gt_plus4_count);
-  obj.add("fit_error_lt_minus4_count", r.fit_error_lt_minus4_count);
   obj.add("fit_error_abs_gt4_count", r.fit_error_abs_gt4_count);
 
   if (include_pps_compare) {
     obj.add("pps_observed_interval_valid", pps_valid);
     obj.add("pps_observed_interval_cycles", pps_valid ? pps_interval_cycles : 0U);
-    if (pps_valid && r.observed_interval_valid) {
-      obj.add("observed_minus_pps_cycles",
-              (r.observed_interval_cycles >= pps_interval_cycles)
-                  ? (int32_t)(r.observed_interval_cycles - pps_interval_cycles)
-                  : -(int32_t)(pps_interval_cycles - r.observed_interval_cycles));
-    } else {
-      obj.add("observed_minus_pps_cycles", 0);
-    }
-    if (pps_valid && r.inferred_interval_valid) {
-      obj.add("inferred_minus_pps_cycles",
-              (r.inferred_interval_cycles >= pps_interval_cycles)
-                  ? (int32_t)(r.inferred_interval_cycles - pps_interval_cycles)
-                  : -(int32_t)(pps_interval_cycles - r.inferred_interval_cycles));
-    } else {
-      obj.add("inferred_minus_pps_cycles", 0);
-    }
+    obj.add("published_minus_pps_cycles",
+            (pps_valid && pub_interval != 0U)
+                ? ((pub_interval >= pps_interval_cycles)
+                       ? (int32_t)(pub_interval - pps_interval_cycles)
+                       : -(int32_t)(pps_interval_cycles - pub_interval))
+                : 0);
   }
 
   parent.add_object(key, obj);
@@ -10707,9 +10984,14 @@ static FLASHMEM Payload cmd_report_lower_envelope(const Payload&) {
         "1 kHz FloorLine lower-envelope edge inference diagnostic rail");
   p.add("sample_rate_hz", LOWER_ENV_SAMPLE_RATE_HZ);
   p.add("bucket_count", LOWER_ENV_BUCKET_COUNT);
-  p.add("fit_min_buckets", LOWER_ENV_FIT_MIN_BUCKETS);
   p.add("error_gate_cycles", LOWER_ENV_ERROR_GATE_CYCLES);
+  p.add("publish_hard_edge_gate_cycles", LOWER_ENV_PUBLISH_HARD_EDGE_GATE_CYCLES);
+  p.add("publish_hard_interval_gate_cycles",
+        LOWER_ENV_PUBLISH_HARD_INTERVAL_GATE_CYCLES);
+  p.add("publish_min_samples", LOWER_ENV_PUBLISH_MIN_SAMPLES);
+  p.add("publish_min_buckets", LOWER_ENV_PUBLISH_MIN_BUCKETS);
   p.add("snapshot_count", ++g_lower_env_snapshot_count);
+  p.add("policy", "soft_gate_floorline_hard_invalid_observed");
 
 
   pps_yardstick_snapshot_t y{};

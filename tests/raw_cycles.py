@@ -22,9 +22,10 @@ Column doctrine:
               when present, otherwise from original/observed DWT endpoints.
     *_rawΔ    raw interval first-difference residual:
               raw_interval[n] - raw_interval[n-1].
-    *_fl      FloorLine inferred interval from regression/FloorLine inferred
-              DWT endpoints.
-    *_flΔ     FloorLine interval first-difference residual:
+    *_fl      FloorLine inferred interval from consecutive FloorLine DWT
+              endpoints when available.  The fitted/slope interval remains
+              a fallback/audit surface only.
+    *_flΔ     FloorLine endpoint interval first-difference residual:
               fl_interval[n] - fl_interval[n-1].
     *_pub     the subscriber-facing published interval.
     *_pubΔ    published interval first-difference residual:
@@ -705,9 +706,23 @@ def collect_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]
             if effective_interval is None:
                 effective_interval = _interval_from_endpoints(predicted_dwt, prev_lane_dwt[lane]["pub"])
 
-            fl_interval = fl.get("inferred_interval_cycles")
+            # FloorLine has two related cycle-count surfaces:
+            #
+            #   1. endpoint interval: fl_dwt[n] - fl_dwt[n-1]
+            #   2. fitted/slope interval: the lower-envelope fit's current
+            #      one-second interval estimate, emitted as *_fl_cyc
+            #
+            # The visible *_fl column must use the endpoint interval first,
+            # because *_pub is also endpoint-derived.  Otherwise raw_cycles
+            # compares a fitted interval against a published endpoint interval
+            # and falsely suggests that FloorLine is not the publication source.
+            fl_reported_interval = fl.get("inferred_interval_cycles")
+            fl_endpoint_interval = _interval_from_endpoints(
+                fl_inferred_dwt, prev_lane_dwt[lane]["fl"]
+            )
+            fl_interval = fl_endpoint_interval
             if fl_interval is None:
-                fl_interval = _interval_from_endpoints(fl_inferred_dwt, prev_lane_dwt[lane]["fl"])
+                fl_interval = fl_reported_interval
 
             pub_interval = _interval_from_endpoints(used_dwt, prev_lane_dwt[lane]["pub"])
             if pub_interval is None and used_dwt is not None:
@@ -747,6 +762,15 @@ def collect_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]
                 "pub_delta": _interval_delta(pub_interval, prev_lane_interval[lane]["pub"]),
                 "counter_delta": lane_counter_delta(root, frag, forensic, lane_key),
                 "fl_edge_minus_observed": fl.get("inferred_minus_observed"),
+                "pub_minus_fl": _interval_delta(pub_interval, fl_interval),
+                "pub_edge_minus_fl_edge": (
+                    _signed_delta_u32(used_dwt, fl_inferred_dwt)
+                    if used_dwt is not None and fl_inferred_dwt is not None
+                    else None
+                ),
+                "fl_fit_minus_endpoint_interval": _interval_delta(
+                    fl_reported_interval, fl_endpoint_interval
+                ),
                 "fl_sample_count": fl.get("sample_count"),
                 "fl_valid": fl.get("valid"),
                 "pub_synthetic": auth.get("synthetic"),
@@ -927,7 +951,9 @@ def analyze(campaign: str,
     for lane in clocks:
         for key in ("raw", "raw_delta",
                     "fl", "fl_delta", "pub", "pub_delta",
-                    "counter_delta", "fl_edge_minus_observed"):
+                    "counter_delta", "fl_edge_minus_observed",
+                    "pub_minus_fl", "pub_edge_minus_fl_edge",
+                    "fl_fit_minus_endpoint_interval"):
             stats[f"{lane}.{key}"] = Welford()
 
     coverage: Dict[str, Dict[str, int]] = {
@@ -942,7 +968,9 @@ def analyze(campaign: str,
             data = row["lanes"][lane]
             for key in ("raw", "raw_delta",
                         "fl", "fl_delta", "pub", "pub_delta",
-                        "counter_delta", "fl_edge_minus_observed"):
+                        "counter_delta", "fl_edge_minus_observed",
+                        "pub_minus_fl", "pub_edge_minus_fl_edge",
+                        "fl_fit_minus_endpoint_interval"):
                 add_optional(stats[f"{lane}.{key}"], data.get(key))
             for key in coverage[lane]:
                 if data.get(key) is not None:
@@ -972,6 +1000,9 @@ def analyze(campaign: str,
         _print_welford(f"{lane} FloorLine cycle-count residual", stats[f"{lane}.fl_delta"])
         _print_welford(f"{lane} published interval", stats[f"{lane}.pub"])
         _print_welford(f"{lane} published cycle-count residual", stats[f"{lane}.pub_delta"])
+        _print_welford(f"{lane} published interval - FloorLine interval", stats[f"{lane}.pub_minus_fl"])
+        _print_welford(f"{lane} published edge - FloorLine edge", stats[f"{lane}.pub_edge_minus_fl_edge"])
+        _print_welford(f"{lane} reported FL fit interval - endpoint FL interval", stats[f"{lane}.fl_fit_minus_endpoint_interval"])
         _print_welford(f"{lane} FL edge - observed edge", stats[f"{lane}.fl_edge_minus_observed"])
         _print_welford(f"{lane} counter32 delta", stats[f"{lane}.counter_delta"], unit="ticks")
 
@@ -980,8 +1011,12 @@ def analyze(campaign: str,
     print("═════")
     print("  • The old EMA/effective columns were removed from the normal view;")
     print("    this report is now focused on the publication decision: raw vs FloorLine vs pub.")
-    print("  • *_pub is the ground-truth subscriber-facing interval.  In the current")
-    print("    FloorLine-authored firmware, *_pub should match *_fl.")
+    print("  • *_pub is the ground-truth subscriber-facing interval.")
+    print("  • *_fl is now endpoint-derived first: fl_dwt[n] - fl_dwt[n-1].")
+    print("    The fitted/slope FloorLine interval is used only as a fallback and")
+    print("    audited as 'reported FL fit interval - endpoint FL interval'.")
+    print("  • In FloorLine-authored firmware, 'published edge - FloorLine edge'")
+    print("    and 'published interval - FloorLine interval' should be zero.")
     print("  • *Δ columns are cycle-count residuals computed separately per rail:")
     print("    interval[n] - interval[n-1].")
     print("  • FloorLine columns are intentionally always visible.  If *_fl stays ---,")

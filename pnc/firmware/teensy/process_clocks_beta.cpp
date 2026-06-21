@@ -1391,6 +1391,14 @@ static void payload_add_lane_forensics_object(Payload& parent,
       ? f.dwt_interval_observed_cycles
       : 0U;
   lower_env.add("valid", lower_valid);
+  lower_env.add("source", valid && f.dwt_interval_sample_accepted ? 1U : 0U);
+  lower_env.add("reason", valid ? f.dwt_interval_reject_streak : 0U);
+  lower_env.add("published", valid && f.dwt_interval_sample_accepted);
+  lower_env.add("sample_total_count", lower_valid ? f.regression_sample_count : 0U);
+  lower_env.add("sample_accepted_count", valid ? f.dwt_interval_accept_count : 0U);
+  lower_env.add("sample_rejected_count", valid ? f.dwt_interval_reject_count : 0U);
+  lower_env.add("bucket_accepted_count", valid ? f.dwt_interval_resync_count : 0U);
+  lower_env.add("gate_cycles", valid ? f.dwt_interval_gate_threshold_cycles : 0U);
   lower_env.add("sequence", lower_valid ? f.regression_sequence : 0U);
   lower_env.add("sample_count", lower_valid ? f.regression_sample_count : 0U);
   lower_env.add("observed_edge_dwt",
@@ -1431,7 +1439,7 @@ static void payload_add_lane_forensics_object(Payload& parent,
                 lower_valid ? f.regression_fit_error_lt_minus4_count : 0U);
   lower_env.add("fit_error_abs_gt4_count",
                 lower_valid ? f.regression_fit_error_abs_gt4_count : 0U);
-  lower_env.add("reporting_only", true);
+  lower_env.add("reporting_only", false);
   forensics.add_object("lower_envelope", lower_env);
 
 
@@ -1690,7 +1698,14 @@ static void payload_add_floorline_object(Payload& parent,
 
   Payload floor;
   floor.add("valid", floor_valid);
-  floor.add("reporting_only", true);
+  floor.add("reporting_only", false);
+  floor.add("source", valid && f.dwt_interval_sample_accepted ? 1U : 0U);
+  floor.add("reason", valid ? f.dwt_interval_reject_streak : 0U);
+  floor.add("published", valid && f.dwt_interval_sample_accepted);
+  floor.add("sample_accepted_count", valid ? f.dwt_interval_accept_count : 0U);
+  floor.add("sample_rejected_count", valid ? f.dwt_interval_reject_count : 0U);
+  floor.add("bucket_accepted_count", valid ? f.dwt_interval_resync_count : 0U);
+  floor.add("gate_cycles", valid ? f.dwt_interval_gate_threshold_cycles : 0U);
   floor.add("sequence", floor_valid ? f.regression_sequence : 0U);
   floor.add("sample_count", floor_valid ? f.regression_sample_count : 0U);
 
@@ -3283,6 +3298,12 @@ void clocks_beta_pps(void) {
         f.add("v_used", v_pub_dwt);
         f.add("v_fl_cyc", v_fl_cyc);
         f.add("v_fl_err", v_fl ? vclock_forensics.regression_inferred_minus_observed_cycles : 0);
+        f.add("v_fl_src", v_ok && vclock_forensics.dwt_interval_sample_accepted ? 1U : 0U);
+        f.add("v_fl_reason", v_ok ? vclock_forensics.dwt_interval_reject_streak : 0U);
+        f.add("v_fl_acc", v_ok ? vclock_forensics.dwt_interval_accept_count : 0U);
+        f.add("v_fl_rej", v_ok ? vclock_forensics.dwt_interval_reject_count : 0U);
+        f.add("v_fl_bkt", v_ok ? vclock_forensics.dwt_interval_resync_count : 0U);
+        f.add("v_fl_ierr", v_ok ? vclock_forensics.dwt_interval_residual_cycles : 0);
 
         const bool o1_ok = ocxo1_forensics_valid;
         const bool o1_fl = floorline_candidate_present(o1_ok, ocxo1_forensics);
@@ -3308,6 +3329,12 @@ void clocks_beta_pps(void) {
         f.add("o1_used", o1_pub_dwt);
         f.add("o1_fl_cyc", o1_fl_cyc);
         f.add("o1_fl_err", o1_fl ? ocxo1_forensics.regression_inferred_minus_observed_cycles : 0);
+        f.add("o1_fl_src", o1_ok && ocxo1_forensics.dwt_interval_sample_accepted ? 1U : 0U);
+        f.add("o1_fl_reason", o1_ok ? ocxo1_forensics.dwt_interval_reject_streak : 0U);
+        f.add("o1_fl_acc", o1_ok ? ocxo1_forensics.dwt_interval_accept_count : 0U);
+        f.add("o1_fl_rej", o1_ok ? ocxo1_forensics.dwt_interval_reject_count : 0U);
+        f.add("o1_fl_bkt", o1_ok ? ocxo1_forensics.dwt_interval_resync_count : 0U);
+        f.add("o1_fl_ierr", o1_ok ? ocxo1_forensics.dwt_interval_residual_cycles : 0);
         f.add("o1_pps_res", pps_residuals.ocxo1_valid
                             ? pps_residuals.ocxo1_fast_residual_ns
                             : 0LL);
@@ -3336,6 +3363,12 @@ void clocks_beta_pps(void) {
         f.add("o2_used", o2_pub_dwt);
         f.add("o2_fl_cyc", o2_fl_cyc);
         f.add("o2_fl_err", o2_fl ? ocxo2_forensics.regression_inferred_minus_observed_cycles : 0);
+        f.add("o2_fl_src", o2_ok && ocxo2_forensics.dwt_interval_sample_accepted ? 1U : 0U);
+        f.add("o2_fl_reason", o2_ok ? ocxo2_forensics.dwt_interval_reject_streak : 0U);
+        f.add("o2_fl_acc", o2_ok ? ocxo2_forensics.dwt_interval_accept_count : 0U);
+        f.add("o2_fl_rej", o2_ok ? ocxo2_forensics.dwt_interval_reject_count : 0U);
+        f.add("o2_fl_bkt", o2_ok ? ocxo2_forensics.dwt_interval_resync_count : 0U);
+        f.add("o2_fl_ierr", o2_ok ? ocxo2_forensics.dwt_interval_residual_cycles : 0);
         f.add("o2_pps_res", pps_residuals.ocxo2_valid
                             ? pps_residuals.ocxo2_fast_residual_ns
                             : 0LL);
