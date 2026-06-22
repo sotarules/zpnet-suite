@@ -212,6 +212,10 @@ static void interrupt_integrity_note_qtimer_dwt_match(
 static void interrupt_features_mark_initializing(void);
 static void interrupt_feature_note_pps_vclock_authority(
     const pps_vclock_edge_authority_t& authority);
+static bool interrupt_feature_pps_vclock_authority_service_ready(
+    const pps_vclock_edge_authority_t& authority);
+static bool interrupt_feature_qtimer_counter_custody_generation_locked(void);
+static bool interrupt_feature_qtimer_counter_custody_generation_anomaly(void);
 static void interrupt_feature_update_qtimer_counter_custody(void);
 static void interrupt_feature_update_qtimer_dwt_ruler(void);
 static void interrupt_feature_update_counter32_lineage(void);
@@ -686,16 +690,64 @@ static void interrupt_features_mark_initializing(void) {
                                true);
 }
 
+static bool interrupt_feature_pps_vclock_authority_service_ready(
+    const pps_vclock_edge_authority_t& authority) {
+  // Launch-pad readiness is deliberately about the authored PPS/VCLOCK edge,
+  // not about whether every courtroom witness agrees on the same row yet.
+  // FloorLine may correctly demote the raw observed VCLOCK endpoint, and the
+  // predictor may still be maturing.  The pre-campaign feature should become
+  // NOMINAL once INTERRUPT has authored a plausible first-after-PPS VCLOCK
+  // identity and DWT coordinate from live PPS + VCLOCK evidence.
+  const uint32_t essential_invalid_mask =
+      PPS_VCLOCK_EDGE_INVALID_NO_PPS |
+      PPS_VCLOCK_EDGE_INVALID_NO_OBSERVED;
+
+  const bool identity_available =
+      authority.sequence != 0U &&
+      authority.pps_dwt_at_edge != 0U &&
+      authority.authority_dwt_at_edge != 0U &&
+      authority.counter32_at_edge != 0U;
+  if (!identity_available) return false;
+
+  if ((authority.invalid_mask & essential_invalid_mask) != 0U) return false;
+
+  const uint32_t cps = authority.dwt_cycles_per_second != 0U
+      ? authority.dwt_cycles_per_second
+      : (uint32_t)DWT_EXPECTED_PER_PPS;
+  const uint32_t cycles_per_vclock_tick =
+      (uint32_t)(((uint64_t)cps + (uint64_t)VCLOCK_COUNTS_PER_SECOND - 1ULL) /
+                 (uint64_t)VCLOCK_COUNTS_PER_SECOND);
+  const uint32_t gate = authority.gate_cycles != 0U
+      ? authority.gate_cycles
+      : PPS_VCLOCK_EDGE_AGREEMENT_GATE_CYCLES;
+
+  // The selected canonical edge is the first VCLOCK edge after physical PPS,
+  // so its authored DWT coordinate must land in the next 10 MHz cell.  Use
+  // modulo-DWT subtraction: a wrap between PPS and the selected edge is still
+  // a small positive delta.
+  const uint32_t selected_delta_cycles =
+      authority.authority_dwt_at_edge - authority.pps_dwt_at_edge;
+  const bool selected_delta_positive =
+      selected_delta_cycles != 0U && selected_delta_cycles <= 0x7FFFFFFFUL;
+  const bool selected_edge_plausible =
+      selected_delta_positive &&
+      selected_delta_cycles <= (cycles_per_vclock_tick + gate);
+
+  return selected_edge_plausible;
+}
+
 static void interrupt_feature_note_pps_vclock_authority(
     const pps_vclock_edge_authority_t& authority) {
-  if (authority.valid) {
+  if (authority.valid ||
+      interrupt_feature_pps_vclock_authority_service_ready(authority)) {
     interrupt_feature_set_cached("PPS_VCLOCK_AUTHORITY",
                                  g_interrupt_feature_pps_vclock_authority,
                                  system_feature_status_t::NOMINAL);
   }
-  // Startup rows can fail the agreement court before the prediction/phase
-  // surfaces are mature.  Leave the feature INITIALIZING until a valid proof
-  // arrives; focused reports carry the reject counters and masks.
+  // Startup rows can fail the full agreement court before the prediction/phase
+  // surfaces are mature.  Leave the feature INITIALIZING until either the full
+  // courtroom proof or the reduced service proof arrives; focused reports carry
+  // reject counters and invalid masks.
 }
 
 static bool interrupt_feature_cntr_locked(
@@ -709,26 +761,35 @@ static bool interrupt_feature_cntr_anomaly(
 }
 
 static void interrupt_feature_update_qtimer_counter_custody(void) {
-  const bool v_ok = interrupt_feature_cntr_locked(g_interrupt_integrity.vclock_qtimer_cntr);
-  const bool o1_ok = !interrupt_feature_lane_required(interrupt_subscriber_kind_t::OCXO1) ||
-      interrupt_feature_cntr_locked(g_interrupt_integrity.ocxo1_qtimer_cntr);
-  const bool o2_ok = !interrupt_feature_lane_required(interrupt_subscriber_kind_t::OCXO2) ||
-      interrupt_feature_cntr_locked(g_interrupt_integrity.ocxo2_qtimer_cntr);
+  // QTIMER_COUNTER_CUSTODY is a readiness statement about the active
+  // count/compare generation gate, not about the passive +1 CNTR-read
+  // forensic.  The +1 check remains in REPORT_INTEGRITY, but launch-pad
+  // readiness should follow the custody gate that actually decides whether
+  // a compare tooth belongs to the authored synthetic 32-bit target.
+  const bool generation_nominal =
+      interrupt_feature_qtimer_counter_custody_generation_locked();
+  const bool generation_anomaly =
+      interrupt_feature_qtimer_counter_custody_generation_anomaly();
 
-  const bool anomaly =
-      interrupt_feature_cntr_anomaly(g_interrupt_integrity.vclock_qtimer_cntr) ||
-      (interrupt_feature_lane_required(interrupt_subscriber_kind_t::OCXO1) &&
-       interrupt_feature_cntr_anomaly(g_interrupt_integrity.ocxo1_qtimer_cntr)) ||
-      (interrupt_feature_lane_required(interrupt_subscriber_kind_t::OCXO2) &&
-       interrupt_feature_cntr_anomaly(g_interrupt_integrity.ocxo2_qtimer_cntr));
+  // Compatibility fallback: if the older exact-offset forensic has already
+  // locked cleanly on every required lane, that is also sufficient evidence.
+  // It is deliberately not allowed to demote the feature on its own; exact
+  // first-read offset is report-only witness material, while generation-gate
+  // rejects are the active custody failure.
+  const bool v_diag_ok = interrupt_feature_cntr_locked(g_interrupt_integrity.vclock_qtimer_cntr);
+  const bool o1_diag_ok = !interrupt_feature_lane_required(interrupt_subscriber_kind_t::OCXO1) ||
+      interrupt_feature_cntr_locked(g_interrupt_integrity.ocxo1_qtimer_cntr);
+  const bool o2_diag_ok = !interrupt_feature_lane_required(interrupt_subscriber_kind_t::OCXO2) ||
+      interrupt_feature_cntr_locked(g_interrupt_integrity.ocxo2_qtimer_cntr);
+  const bool diagnostic_nominal = v_diag_ok && o1_diag_ok && o2_diag_ok;
 
   interrupt_feature_set_cached(
       "QTIMER_COUNTER_CUSTODY",
       g_interrupt_feature_qtimer_counter_custody,
-      anomaly ? system_feature_status_t::ANOMALY
-              : ((v_ok && o1_ok && o2_ok)
-                    ? system_feature_status_t::NOMINAL
-                    : system_feature_status_t::INITIALIZING));
+      generation_anomaly ? system_feature_status_t::ANOMALY
+                         : ((generation_nominal || diagnostic_nominal)
+                               ? system_feature_status_t::NOMINAL
+                               : system_feature_status_t::INITIALIZING));
 }
 
 static bool interrupt_feature_dwt_locked(
@@ -2618,11 +2679,48 @@ struct generation_gate_lane_t {
   bool     generation_gate_last_reject_one_second_due = false;
   bool     generation_gate_last_reject_smartzero = false;
   const char* generation_gate_last_reject_reason = "none";
+
+  // Feature-readiness custody lock.  Startup/pre-grid rejects are allowed to
+  // remain prelock evidence.  Once a lane has produced a sustained streak of
+  // accepted generation-gate observations, any later reject is a real custody
+  // anomaly for QTIMER_COUNTER_CUSTODY.
+  bool     feature_custody_locked = false;
+  uint32_t feature_custody_lock_sequence = 0;
+  uint32_t feature_custody_lock_count = 0;
+  uint32_t feature_custody_consecutive_accept_count = 0;
+  uint32_t feature_custody_post_lock_reject_count = 0;
 };
 
 static generation_gate_lane_t g_generation_gate_vclock = {};
 static generation_gate_lane_t g_generation_gate_ocxo1 = {};
 static generation_gate_lane_t g_generation_gate_ocxo2 = {};
+
+static bool generation_gate_feature_locked(const generation_gate_lane_t& s) {
+  return s.feature_custody_locked &&
+         s.feature_custody_post_lock_reject_count == 0U;
+}
+
+static bool generation_gate_feature_anomaly(const generation_gate_lane_t& s) {
+  return s.feature_custody_locked &&
+         s.feature_custody_post_lock_reject_count != 0U;
+}
+
+static bool interrupt_feature_qtimer_counter_custody_generation_locked(void) {
+  const bool v_ok = generation_gate_feature_locked(g_generation_gate_vclock);
+  const bool o1_ok = !interrupt_feature_lane_required(interrupt_subscriber_kind_t::OCXO1) ||
+      generation_gate_feature_locked(g_generation_gate_ocxo1);
+  const bool o2_ok = !interrupt_feature_lane_required(interrupt_subscriber_kind_t::OCXO2) ||
+      generation_gate_feature_locked(g_generation_gate_ocxo2);
+  return v_ok && o1_ok && o2_ok;
+}
+
+static bool interrupt_feature_qtimer_counter_custody_generation_anomaly(void) {
+  return generation_gate_feature_anomaly(g_generation_gate_vclock) ||
+      (interrupt_feature_lane_required(interrupt_subscriber_kind_t::OCXO1) &&
+       generation_gate_feature_anomaly(g_generation_gate_ocxo1)) ||
+      (interrupt_feature_lane_required(interrupt_subscriber_kind_t::OCXO2) &&
+       generation_gate_feature_anomaly(g_generation_gate_ocxo2));
+}
 
 static void generation_gate_reset_lane(generation_gate_lane_t& s) {
   s = generation_gate_lane_t{};
@@ -2709,8 +2807,12 @@ static bool generation_gate_record(
     s.generation_gate_last_far_late_reason = reason;
   }
 
+  const bool feature_was_locked = s.feature_custody_locked;
   if (accepted) {
     s.generation_gate_accept_count++;
+    if (s.feature_custody_consecutive_accept_count != UINT32_MAX) {
+      s.feature_custody_consecutive_accept_count++;
+    }
     if (delta > 0) {
       s.generation_gate_late_accept_count++;
       if (far_late) {
@@ -2719,11 +2821,23 @@ static bool generation_gate_record(
     }
   } else {
     s.generation_gate_reject_count++;
+    s.feature_custody_consecutive_accept_count = 0;
+    if (feature_was_locked) {
+      s.feature_custody_post_lock_reject_count++;
+    }
     if (delta < 0) {
       s.generation_gate_early_reject_count++;
     } else if (far_late_rejected) {
       s.generation_gate_far_late_reject_count++;
     }
+  }
+
+  if (!feature_was_locked &&
+      accepted &&
+      s.feature_custody_consecutive_accept_count >= QTIMER_CNTR_MATCH_LOCK_STREAK) {
+    s.feature_custody_locked = true;
+    s.feature_custody_lock_sequence = s.generation_gate_observe_count;
+    s.feature_custody_lock_count++;
   }
 
   s.generation_gate_last_accepted = accepted;
@@ -2762,6 +2876,7 @@ static bool generation_gate_record(
     s.generation_gate_last_reject_reason = reason;
   }
 
+  interrupt_feature_update_qtimer_counter_custody();
   return accepted;
 }
 
