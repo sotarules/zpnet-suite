@@ -342,16 +342,26 @@ static volatile campaign_warmup_mode_t g_campaign_warmup_mode =
 static volatile uint32_t g_campaign_warmup_remaining = 0;
 static volatile uint32_t g_campaign_warmup_suppressed_total = 0;
 
-static uint64_t g_campaign_public_dwt_base = 0;
-static uint64_t g_campaign_public_gnss_base = 0;
-static uint64_t g_campaign_public_ocxo1_base = 0;
-static uint64_t g_campaign_public_ocxo2_base = 0;
+// Campaign-public continuity transform.
+//
+// Alpha owns the live service/epoch ledgers.  Beta owns campaign presentation:
+//   public = raw_alpha_service_value + signed_campaign_offset
+//
+// START uses a negative offset to make the first public campaign row begin at
+// zero.  RECOVER uses a positive/negative offset to make the current Alpha
+// service ledger appear as the Pi-projected campaign ledger at the recovery PPS.
+// This is deliberately signed; the old unsigned base model could not represent
+// current_raw < recovered_public after a system restart/SmartZero epoch.
+static int64_t g_campaign_public_dwt_offset = 0;
+static int64_t g_campaign_public_gnss_offset = 0;
+static int64_t g_campaign_public_ocxo1_offset = 0;
+static int64_t g_campaign_public_ocxo2_offset = 0;
 
-// Step C: OCXO public/canonical bases now track the PPS-edge projected
-// OCXO clock values. Keep separate bases for the legacy measured-GNSS
+// Step C: OCXO public/canonical offsets now track the PPS-edge projected
+// OCXO clock values. Keep separate offsets for the legacy measured-GNSS
 // ledgers so measured_gnss_ns remains useful as a diagnostic side surface.
-static uint64_t g_campaign_public_ocxo1_measured_base = 0;
-static uint64_t g_campaign_public_ocxo2_measured_base = 0;
+static int64_t g_campaign_public_ocxo1_measured_offset = 0;
+static int64_t g_campaign_public_ocxo2_measured_offset = 0;
 
 // Step 2: OCXO science residuals/Welfords are measured-edge founded.
 // The public TIMEBASE OCXO ns tuple remains PPS-projected for dashboards and
@@ -504,54 +514,75 @@ static uint64_t current_raw_ocxo2_ns(void) {
   return current_raw_ocxo2_measured_ns();
 }
 
-static uint64_t campaign_public_from_base(uint64_t raw_ns,
-                                          uint64_t base_ns) {
-  return (raw_ns >= base_ns) ? (raw_ns - base_ns) : 0;
+static int64_t campaign_public_offset_for_recovered_value(uint64_t current,
+                                                           uint64_t recovered) {
+  if (recovered >= current) {
+    const uint64_t delta = recovered - current;
+    return (delta > (uint64_t)INT64_MAX) ? INT64_MAX : (int64_t)delta;
+  }
+
+  const uint64_t delta = current - recovered;
+  return (delta > (uint64_t)INT64_MAX) ? -INT64_MAX : -(int64_t)delta;
+}
+
+static int64_t campaign_public_offset_to_zero(uint64_t current) {
+  return (current > (uint64_t)INT64_MAX) ? -INT64_MAX : -(int64_t)current;
+}
+
+static uint64_t campaign_public_from_offset(uint64_t raw, int64_t offset) {
+  if (offset >= 0) {
+    const uint64_t add = (uint64_t)offset;
+    return (UINT64_MAX - raw < add) ? UINT64_MAX : raw + add;
+  }
+
+  const uint64_t sub = (uint64_t)(-offset);
+  return (raw >= sub) ? (raw - sub) : 0ULL;
 }
 
 static uint64_t campaign_public_ocxo1_measured_ns(void) {
-  return campaign_public_from_base(current_raw_ocxo1_measured_ns(),
-                                   g_campaign_public_ocxo1_measured_base);
+  return campaign_public_from_offset(current_raw_ocxo1_measured_ns(),
+                                     g_campaign_public_ocxo1_measured_offset);
 }
 
 static uint64_t campaign_public_ocxo2_measured_ns(void) {
-  return campaign_public_from_base(current_raw_ocxo2_measured_ns(),
-                                   g_campaign_public_ocxo2_measured_base);
+  return campaign_public_from_offset(current_raw_ocxo2_measured_ns(),
+                                     g_campaign_public_ocxo2_measured_offset);
 }
 
-static void campaign_public_bases_reset_to_current(void) {
-  g_campaign_public_dwt_base   = g_dwt_cycle_count_total;
-  g_campaign_public_gnss_base  = current_raw_gnss_ns();
-  g_campaign_public_ocxo1_base = current_raw_ocxo1_ns();
-  g_campaign_public_ocxo2_base = current_raw_ocxo2_ns();
-  g_campaign_public_ocxo1_measured_base = current_raw_ocxo1_measured_ns();
-  g_campaign_public_ocxo2_measured_base = current_raw_ocxo2_measured_ns();
+static void campaign_public_offsets_reset_to_current(void) {
+  g_campaign_public_dwt_offset =
+      campaign_public_offset_to_zero(g_dwt_cycle_count_total);
+  g_campaign_public_gnss_offset =
+      campaign_public_offset_to_zero(current_raw_gnss_ns());
+  g_campaign_public_ocxo1_offset =
+      campaign_public_offset_to_zero(current_raw_ocxo1_ns());
+  g_campaign_public_ocxo2_offset =
+      campaign_public_offset_to_zero(current_raw_ocxo2_ns());
+  g_campaign_public_ocxo1_measured_offset =
+      campaign_public_offset_to_zero(current_raw_ocxo1_measured_ns());
+  g_campaign_public_ocxo2_measured_offset =
+      campaign_public_offset_to_zero(current_raw_ocxo2_measured_ns());
 }
 
-static uint64_t saturated_base_for_recovered_value(uint64_t current,
-                                                   uint64_t recovered) {
-  return (current >= recovered) ? (current - recovered) : 0;
-}
-
-static void campaign_public_bases_reset_for_recover(void) {
-  g_campaign_public_dwt_base =
-      saturated_base_for_recovered_value(g_dwt_cycle_count_total,
-                                          dwt_ns_to_cycles(recover_dwt_ns));
-  g_campaign_public_gnss_base =
-      saturated_base_for_recovered_value(current_raw_gnss_ns(),
-                                          recover_gnss_ns);
-  g_campaign_public_ocxo1_base =
-      saturated_base_for_recovered_value(current_raw_ocxo1_ns(),
-                                          recover_ocxo1_ns);
-  g_campaign_public_ocxo2_base =
-      saturated_base_for_recovered_value(current_raw_ocxo2_ns(),
-                                          recover_ocxo2_ns);
-  g_campaign_public_ocxo1_measured_base =
-      saturated_base_for_recovered_value(current_raw_ocxo1_measured_ns(),
-                                          recover_ocxo1_ns);
-  g_campaign_public_ocxo2_measured_base =
-      saturated_base_for_recovered_value(current_raw_ocxo2_measured_ns(),
-                                          recover_ocxo2_ns);
+static void campaign_public_offsets_reset_for_recover(void) {
+  g_campaign_public_dwt_offset =
+      campaign_public_offset_for_recovered_value(g_dwt_cycle_count_total,
+                                                 dwt_ns_to_cycles(recover_dwt_ns));
+  g_campaign_public_gnss_offset =
+      campaign_public_offset_for_recovered_value(current_raw_gnss_ns(),
+                                                 recover_gnss_ns);
+  g_campaign_public_ocxo1_offset =
+      campaign_public_offset_for_recovered_value(current_raw_ocxo1_ns(),
+                                                 recover_ocxo1_ns);
+  g_campaign_public_ocxo2_offset =
+      campaign_public_offset_for_recovered_value(current_raw_ocxo2_ns(),
+                                                 recover_ocxo2_ns);
+  g_campaign_public_ocxo1_measured_offset =
+      campaign_public_offset_for_recovered_value(current_raw_ocxo1_measured_ns(),
+                                                 recover_ocxo1_ns);
+  g_campaign_public_ocxo2_measured_offset =
+      campaign_public_offset_for_recovered_value(current_raw_ocxo2_measured_ns(),
+                                                 recover_ocxo2_ns);
 }
 
 static void campaign_warmup_begin(campaign_warmup_mode_t mode) {
@@ -560,9 +591,9 @@ static void campaign_warmup_begin(campaign_warmup_mode_t mode) {
   g_campaign_warmup_suppressed_total = 0;
 
   if (mode == campaign_warmup_mode_t::RECOVER) {
-    campaign_public_bases_reset_for_recover();
+    campaign_public_offsets_reset_for_recover();
   } else {
-    campaign_public_bases_reset_to_current();
+    campaign_public_offsets_reset_to_current();
   }
 }
 
@@ -588,7 +619,7 @@ static void campaign_warmup_finish_after_this_suppressed_record(void) {
   g_campaign_warmup_remaining = 0;
 
   if (campaign_state != clocks_campaign_state_t::STARTED) {
-    campaign_public_bases_reset_to_current();
+    campaign_public_offsets_reset_to_current();
     return;
   }
 
@@ -596,7 +627,7 @@ static void campaign_warmup_finish_after_this_suppressed_record(void) {
     // START: warmup records are private.  Public identity begins on the
     // next selected PPS/VCLOCK edge after this one, so use the current alpha totals as the base.
     // The next published record will add exactly one public second.
-    campaign_public_bases_reset_to_current();
+    campaign_public_offsets_reset_to_current();
   }
 
   // RECOVER: leave the recovery bases intact.  Because campaign_seconds
@@ -631,34 +662,27 @@ static void campaign_warmup_reset(void) {
   g_campaign_warmup_mode = campaign_warmup_mode_t::NONE;
   g_campaign_warmup_remaining = 0;
   g_campaign_warmup_suppressed_total = 0;
-  campaign_public_bases_reset_to_current();
+  campaign_public_offsets_reset_to_current();
 }
 
 static uint64_t campaign_public_dwt_total(void) {
-  return (g_dwt_cycle_count_total >= g_campaign_public_dwt_base)
-           ? (g_dwt_cycle_count_total - g_campaign_public_dwt_base)
-           : 0;
+  return campaign_public_from_offset(g_dwt_cycle_count_total,
+                                     g_campaign_public_dwt_offset);
 }
 
 static uint64_t campaign_public_gnss_ns(void) {
-  const uint64_t now = current_raw_gnss_ns();
-  return (now >= g_campaign_public_gnss_base)
-           ? (now - g_campaign_public_gnss_base)
-           : 0;
+  return campaign_public_from_offset(current_raw_gnss_ns(),
+                                     g_campaign_public_gnss_offset);
 }
 
 static uint64_t campaign_public_ocxo1_ns(void) {
-  const uint64_t now = current_raw_ocxo1_ns();
-  return (now >= g_campaign_public_ocxo1_base)
-           ? (now - g_campaign_public_ocxo1_base)
-           : 0;
+  return campaign_public_from_offset(current_raw_ocxo1_ns(),
+                                     g_campaign_public_ocxo1_offset);
 }
 
 static uint64_t campaign_public_ocxo2_ns(void) {
-  const uint64_t now = current_raw_ocxo2_ns();
-  return (now >= g_campaign_public_ocxo2_base)
-           ? (now - g_campaign_public_ocxo2_base)
-           : 0;
+  return campaign_public_from_offset(current_raw_ocxo2_ns(),
+                                     g_campaign_public_ocxo2_offset);
 }
 
 // ============================================================================
@@ -2517,7 +2541,7 @@ void clocks_zero_all(void) {
   ocxo1_measured_gnss_ticks_64        = 0;
   ocxo2_measured_gnss_ticks_64        = 0;
 
-  campaign_public_bases_reset_to_current();
+  campaign_public_offsets_reset_to_current();
 
   welford_reset(welford_dwt);
   welford_reset(welford_vclock);

@@ -1,23 +1,31 @@
 """
-ZPNet Campaign Analyzer — v11 (fragment-as-subdict schema)
+ZPNet Campaign Analyzer — v12 (TIMEBASE_V3 / TIMEBASE_FRAGMENT_V3)
 
-Rewritten for the current TIMEBASE architecture where the Teensy's raw
-TIMEBASE_FRAGMENT is embedded verbatim as payload.fragment.
+Rewritten for the current paired TIMEBASE architecture:
 
-v11 changes:
-  - Prespin correlation: for each OCXO alarm second, captures the prespin
-    diagnostic state (timed_out, fired, approach_cycles, shadow_to_isr)
-    and correlates alarm seconds with prespin timeouts.
-  - Full forensic snapshot at each alarm second: DWT values, prespin state,
-    counter32, correction cycles — everything needed to diagnose root cause.
-  - Directionality analysis: are deviations consistently short, long, or mixed?
-    A consistent bias is a strong fingerprint for a specific failure mode.
-  - Deviation magnitude histogram: bins alarm deviations to show distribution.
-  - Temporal clustering: are alarm seconds randomly distributed or bunched?
+  payload.fragment   — compact Teensy-authored science spine
+  payload.forensics  — paired diagnostic companion for the same PPS identity
+
+The analyzer accepts both the newer nested TIMEBASE_FRAGMENT_V3 shape and the
+older flat fragment aliases where practical, but all primary checks now read the
+current fields:
+
+  fragment.gnss.ns
+  fragment.vclock.ns
+  fragment.ocxo1.ns / fragment.ocxo2.ns
+  fragment.ocxoN.pps_residual.*
+  fragment.dwt.cycle_count_total
+  fragment.stats.<lane>.welford.* / .tau / .ppb
+
+Recovery doctrine:
+  PPS-count gaps are canonical when they represent recovery.  The analyzer does
+  not treat missing rows as corruption, but it does certify that the first row
+  after each gap is consistent with the prior public campaign ledgers projected
+  to the new GNSS/PPS identity.
 
 Usage:
     python -m zpnet.tests.campaign_analyzer <campaign_name>
-    .zt campaign_analyzer Calibrate1
+    .zt campaign_analyzer Gate4
 """
 
 from __future__ import annotations
@@ -25,18 +33,25 @@ from __future__ import annotations
 import json
 import math
 import sys
-from collections import Counter
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from zpnet.shared.db import open_db
 
 NS_PER_SECOND = 1_000_000_000
+DWT_EXPECTED_PER_PPS = 1_008_000_000
+
 OCXO_SECOND_ALARM_NS = 10_000
 OCXO_SECOND_WARN_NS  = 500
 PHASE_STEP_ALARM_NS = 100_000
 PPB_STEP_ALARM = 100.0
 PPB_ABSOLUTE_THRESHOLD = 10_000
 WELFORD_STDDEV_ALARM = 500.0
+
+# Recovery projection tolerances.  These are deliberately small enough to catch
+# a broken continuation transform, but large enough to tolerate a few suppressed
+# warmup seconds after RECOVER.
+RECOVERY_OCXO_PROJECTION_ALARM_NS = 5_000
+RECOVERY_DWT_PROJECTION_ALARM_CYCLES = 100_000
 
 
 class WelfordStats:
@@ -55,8 +70,10 @@ class WelfordStats:
         self.mean += d1 / self.n
         d2 = x - self.mean
         self.m2 += d1 * d2
-        if x < self.min_val: self.min_val = x
-        if x > self.max_val: self.max_val = x
+        if x < self.min_val:
+            self.min_val = x
+        if x > self.max_val:
+            self.max_val = x
 
     @property
     def stddev(self) -> float:
@@ -70,52 +87,360 @@ class WelfordStats:
                 f"min={self.min_val:{fmt}}  max={self.max_val:{fmt}}")
 
 
-def _frag(row, key, default=None):
-    frag = row.get("fragment")
-    if not frag: return default
-    return frag.get(key, default)
-
-def _frag_int(row, key):
-    v = _frag(row, key)
-    return int(v) if v is not None else None
-
-def _frag_float(row, key):
-    v = _frag(row, key)
-    return float(v) if v is not None else None
+# -----------------------------------------------------------------------------
+# Schema helpers
+# -----------------------------------------------------------------------------
 
 
-def fetch_timebase(campaign):
+def _as_dict(v: Any) -> Dict[str, Any]:
+    return v if isinstance(v, dict) else {}
+
+
+def _fragment(row: Dict[str, Any]) -> Dict[str, Any]:
+    return _as_dict(row.get("fragment"))
+
+
+def _forensics(row: Dict[str, Any]) -> Dict[str, Any]:
+    return _as_dict(row.get("forensics"))
+
+
+def _extra(row: Dict[str, Any]) -> Dict[str, Any]:
+    return _as_dict(row.get("extra_clocks"))
+
+
+def _path_get(obj: Dict[str, Any], path: str, default: Any = None) -> Any:
+    cur: Any = obj
+    for part in path.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            return default
+        cur = cur.get(part)
+    return default if cur is None else cur
+
+
+def _first_value(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def _to_int(v: Any) -> Optional[int]:
+    if v is None:
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_float(v: Any) -> Optional[float]:
+    if v is None:
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return None if math.isnan(f) else f
+
+
+def _to_bool(v: Any) -> Optional[bool]:
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return None
+    s = str(v).strip().lower()
+    if s in ("true", "1", "yes", "on"):
+        return True
+    if s in ("false", "0", "no", "off"):
+        return False
+    return None
+
+
+def _first_int(*values: Any) -> Optional[int]:
+    for value in values:
+        parsed = _to_int(value)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _first_float(*values: Any) -> Optional[float]:
+    for value in values:
+        parsed = _to_float(value)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _row_pps_count(row: Dict[str, Any]) -> int:
+    frag = _fragment(row)
+    value = _first_int(
+        row.get("teensy_pps_vclock_count"),
+        row.get("pps_count"),
+        frag.get("teensy_pps_vclock_count"),
+        frag.get("pps_count"),
+    )
+    if value is None:
+        raise ValueError(f"TIMEBASE row missing PPS/VCLOCK identity: db_id={row.get('_db_id')}")
+    return value
+
+
+def _gnss_ns(row: Dict[str, Any]) -> Optional[int]:
+    frag = _fragment(row)
+    return _first_int(
+        _path_get(frag, "gnss.ns"),
+        frag.get("gnss_ns"),
+        row.get("teensy_gnss_ns"),
+        row.get("gnss_ns"),
+    )
+
+
+def _vclock_ns(row: Dict[str, Any]) -> Optional[int]:
+    frag = _fragment(row)
+    return _first_int(
+        _path_get(frag, "vclock.ns"),
+        _path_get(frag, "gnss.ns"),
+        frag.get("vclock_ns"),
+        row.get("vclock_ns"),
+    )
+
+
+def _ocxo_ns(row: Dict[str, Any], prefix: str) -> Optional[int]:
+    frag = _fragment(row)
+    return _first_int(
+        _path_get(frag, f"{prefix}.ns"),
+        _path_get(frag, f"gnss.{prefix}_ns"),
+        frag.get(f"{prefix}_ns"),
+        frag.get(f"{prefix}_ns_at_pps_vclock"),
+        row.get(f"teensy_{prefix}_ns"),
+        row.get(f"{prefix}_ns"),
+    )
+
+
+def _dwt_cycles(row: Dict[str, Any]) -> Optional[int]:
+    frag = _fragment(row)
+    return _first_int(
+        _path_get(frag, "dwt.cycle_count_total"),
+        _path_get(frag, "dwt.cycles"),
+        _path_get(frag, "dwt.value"),
+        frag.get("dwt_cycle_count_total"),
+        row.get("teensy_dwt_cycles"),
+        row.get("dwt_cycle_count_total"),
+        row.get("dwt_cycles"),
+        # Legacy compatibility only.  Current TIMEBASE uses cycles, not dwt.ns.
+        _path_get(frag, "dwt.ns"),
+        frag.get("dwt_ns"),
+        row.get("teensy_dwt_ns"),
+    )
+
+
+def _dwt_interval_cycles(row: Dict[str, Any]) -> Optional[int]:
+    frag = _fragment(row)
+    return _first_int(
+        _path_get(frag, "dwt.cycles_between_pps_vclock"),
+        frag.get("dwt_cycles_between_pps_vclock"),
+        row.get("dwt_cycles_between_pps_vclock"),
+    )
+
+
+def _dwt_residual_cycles(row: Dict[str, Any]) -> Optional[int]:
+    frag = _fragment(row)
+    return _first_int(
+        _path_get(frag, "dwt.second_residual_cycles"),
+        frag.get("dwt_second_residual_cycles"),
+        row.get("dwt_second_residual_cycles"),
+    )
+
+
+def _stat(row: Dict[str, Any], prefix: str, field: str) -> Optional[float]:
+    frag = _fragment(row)
+    return _first_float(
+        _path_get(frag, f"stats.{prefix}.{field}"),
+        frag.get(f"{prefix}_{field}"),
+        row.get(f"{prefix}_{field}"),
+    )
+
+
+def _welford(row: Dict[str, Any], prefix: str, field: str) -> Optional[float]:
+    frag = _fragment(row)
+    return _first_float(
+        _path_get(frag, f"stats.{prefix}.welford.{field}"),
+        _path_get(frag, f"stats.{prefix}.{field}"),
+        frag.get(f"{prefix}_welford_{field}"),
+        row.get(f"{prefix}_welford_{field}"),
+    )
+
+
+def _welford_int(row: Dict[str, Any], prefix: str, field: str) -> Optional[int]:
+    frag = _fragment(row)
+    return _first_int(
+        _path_get(frag, f"stats.{prefix}.welford.{field}"),
+        _path_get(frag, f"stats.{prefix}.{field}"),
+        frag.get(f"{prefix}_welford_{field}"),
+        row.get(f"{prefix}_welford_{field}"),
+    )
+
+
+def _dac_welford(row: Dict[str, Any], prefix: str, field: str) -> Optional[float]:
+    frag = _fragment(row)
+    return _first_float(
+        _path_get(frag, f"stats.dac.{prefix}.{field}"),
+        frag.get(f"{prefix}_dac_welford_{field}"),
+        row.get(f"{prefix}_dac_welford_{field}"),
+    )
+
+
+def _dac_welford_int(row: Dict[str, Any], prefix: str, field: str) -> Optional[int]:
+    frag = _fragment(row)
+    return _first_int(
+        _path_get(frag, f"stats.dac.{prefix}.{field}"),
+        frag.get(f"{prefix}_dac_welford_{field}"),
+        row.get(f"{prefix}_dac_welford_{field}"),
+    )
+
+
+def _ocxo_residual(row: Dict[str, Any], prefix: str) -> Optional[int]:
+    frag = _fragment(row)
+    return _first_int(
+        _path_get(frag, f"{prefix}.pps_residual.fast_residual_ns"),
+        _path_get(frag, f"{prefix}.measurement.second_residual_ns"),
+        frag.get(f"{prefix}_second_residual_ns"),
+        row.get(f"{prefix}_second_residual_ns"),
+    )
+
+
+def _ocxo_clock_interval(row: Dict[str, Any], prefix: str) -> Optional[int]:
+    frag = _fragment(row)
+    return _first_int(
+        _path_get(frag, f"{prefix}.pps_residual.clock_interval_ns"),
+        _path_get(frag, f"{prefix}.measurement.clock_interval_ns"),
+        _path_get(frag, f"{prefix}.interval.clock_interval_ns"),
+        frag.get(f"{prefix}_clock_interval_ns"),
+    )
+
+
+def _ocxo_gnss_interval(row: Dict[str, Any], prefix: str) -> Optional[int]:
+    frag = _fragment(row)
+    return _first_int(
+        _path_get(frag, f"{prefix}.pps_residual.gnss_interval_ns"),
+        _path_get(frag, f"{prefix}.measurement.gnss_ns_between_edges"),
+        _path_get(frag, f"{prefix}.interval.gnss_ns_between_edges"),
+        frag.get(f"{prefix}_gnss_ns_between_edges"),
+    )
+
+
+def _ocxo_valid(row: Dict[str, Any], prefix: str) -> bool:
+    frag = _fragment(row)
+    return bool(_to_bool(_path_get(frag, f"{prefix}.pps_residual.valid")) or
+                _to_bool(_path_get(frag, f"{prefix}.pps_projected_valid")) or
+                _ocxo_clock_interval(row, prefix))
+
+
+def _ocxo_phase_offset(row: Dict[str, Any], prefix: str) -> Optional[int]:
+    frag = _fragment(row)
+    explicit = _first_int(
+        _path_get(frag, f"{prefix}.phase_offset_ns"),
+        frag.get(f"{prefix}_phase_offset_ns"),
+        row.get(f"{prefix}_phase_offset_ns"),
+    )
+    if explicit is not None:
+        return explicit
+    v = _vclock_ns(row)
+    o = _ocxo_ns(row, prefix)
+    return (v - o) if v is not None and o is not None else None
+
+
+def _servo_mode(row: Dict[str, Any]) -> str:
+    frag = _fragment(row)
+    return str(_first_value(
+        _path_get(frag, "dac.servo_mode"),
+        frag.get("servo_mode"),
+        row.get("servo_mode"),
+        row.get("calibrate_ocxo"),
+        "?",
+    ))
+
+
+def _forensic_int(row: Dict[str, Any], key: str) -> Optional[int]:
+    return _first_int(_forensics(row).get(key), _fragment(row).get(key), row.get(key))
+
+
+def _forensic_bool(row: Dict[str, Any], key: str) -> Optional[bool]:
+    return _to_bool(_first_value(_forensics(row).get(key), _fragment(row).get(key), row.get(key)))
+
+
+def _campaign_total_ppb(row: Dict[str, Any], prefix: str) -> Optional[float]:
+    gnss = _gnss_ns(row)
+    if gnss is None or gnss <= 0:
+        return None
+    if prefix == "dwt":
+        cycles = _dwt_cycles(row)
+        if cycles is None:
+            return None
+        expected_cycles = (float(gnss) / NS_PER_SECOND) * DWT_EXPECTED_PER_PPS
+        if expected_cycles == 0.0:
+            return None
+        return ((float(cycles) / expected_cycles) - 1.0) * 1e9
+    clock_ns = _vclock_ns(row) if prefix == "vclock" else _ocxo_ns(row, prefix)
+    if clock_ns is None:
+        return None
+    return ((float(clock_ns) / float(gnss)) - 1.0) * 1e9
+
+
+# -----------------------------------------------------------------------------
+# Data fetch
+# -----------------------------------------------------------------------------
+
+
+def fetch_timebase(campaign: str) -> List[Dict[str, Any]]:
     with open_db(row_dict=True) as conn:
         cur = conn.cursor()
         cur.execute(
-            """SELECT id, ts, payload FROM timebase
-               WHERE campaign = %s
-               ORDER BY (payload->>'pps_count')::int ASC""",
+            """
+            SELECT id, ts, payload
+            FROM timebase
+            WHERE campaign = %s
+            ORDER BY COALESCE(
+                       NULLIF(payload->>'teensy_pps_vclock_count', '')::bigint,
+                       NULLIF(payload->>'pps_count', '')::bigint,
+                       NULLIF(payload->'fragment'->>'teensy_pps_vclock_count', '')::bigint,
+                       NULLIF(payload->'fragment'->>'pps_count', '')::bigint,
+                       id::bigint
+                     ) ASC,
+                     id ASC
+            """,
             (campaign,),
         )
         rows = cur.fetchall()
-    result = []
+    result: List[Dict[str, Any]] = []
     for row in rows:
         p = row["payload"]
-        if isinstance(p, str): p = json.loads(p)
+        if isinstance(p, str):
+            p = json.loads(p)
         p["_db_id"] = row["id"]
         p["_db_ts"] = str(row["ts"])
         result.append(p)
     return result
 
 
-def find_recovery_boundaries(rows):
-    boundaries = set()
+def find_recovery_boundaries(rows: List[Dict[str, Any]]) -> Set[int]:
+    boundaries: Set[int] = set()
     for i in range(1, len(rows)):
-        prev = int(rows[i - 1]["pps_count"])
-        curr = int(rows[i]["pps_count"])
-        if curr > prev + 1: boundaries.add(curr)
+        prev = _row_pps_count(rows[i - 1])
+        curr = _row_pps_count(rows[i])
+        if curr > prev + 1:
+            boundaries.add(curr)
     return boundaries
 
 
-def print_campaign_overview(rows, recovery_boundaries):
+# -----------------------------------------------------------------------------
+# Overview / continuity
+# -----------------------------------------------------------------------------
+
+
+def print_campaign_overview(rows: List[Dict[str, Any]], recovery_boundaries: Set[int]) -> int:
     total = len(rows)
-    pps_counts = [int(r["pps_count"]) for r in rows]
+    pps_counts = [_row_pps_count(r) for r in rows]
     pps_min, pps_max = min(pps_counts), max(pps_counts)
     expected_count = pps_max - pps_min + 1
     campaign_seconds = pps_max - pps_min
@@ -126,7 +451,7 @@ def print_campaign_overview(rows, recovery_boundaries):
     secs = campaign_seconds % 60
 
     print("=" * 78)
-    print(f"CAMPAIGN ANALYSIS: {rows[0].get('campaign', '?')}  (v11 fragment schema)")
+    print(f"CAMPAIGN ANALYSIS: {rows[0].get('campaign', '?')}  (v12 TIMEBASE_V3)")
     print("=" * 78)
     print()
     print(f"  Time range:        {first_ts}")
@@ -141,137 +466,280 @@ def print_campaign_overview(rows, recovery_boundaries):
     print(f"  Missing records:   {expected_count - total:,}")
     if recovery_boundaries:
         print(f"  Recovery events:   {len(recovery_boundaries)}")
-    servo = _frag(rows[-1], "calibrate_ocxo", "?")
-    print(f"  Servo mode:        {servo}")
+    print(f"  Servo mode:        {_servo_mode(rows[-1])}")
     return campaign_seconds
 
 
-def analyze_pps_continuity(rows, recovery_boundaries):
-    anomalies = []
+def analyze_pps_continuity(rows: List[Dict[str, Any]], recovery_boundaries: Set[int]) -> List[str]:
+    anomalies: List[str] = []
     print()
     print("-" * 78)
-    print("PPS_COUNT CONTINUITY")
+    print("PPS/VCLOCK COUNT CONTINUITY")
     print("-" * 78)
     jumps = recovery_jumps = regressions = repeats = 0
     for i in range(1, len(rows)):
-        prev = int(rows[i - 1]["pps_count"])
-        curr = int(rows[i]["pps_count"])
+        prev = _row_pps_count(rows[i - 1])
+        curr = _row_pps_count(rows[i])
         delta = curr - prev
         if delta == 0:
             repeats += 1
-            if repeats <= 5: print(f"  WARN REPEAT at pps_count={curr}")
+            if repeats <= 5:
+                print(f"  WARN REPEAT at pps_count={curr}")
         elif delta < 0:
             regressions += 1
-            if regressions <= 5: print(f"  WARN REGRESSION: {prev} -> {curr} (delta={delta})")
+            if regressions <= 5:
+                print(f"  WARN REGRESSION: {prev} -> {curr} (delta={delta})")
         elif delta > 1:
             if curr in recovery_boundaries:
                 recovery_jumps += 1
                 print(f"  INFO RECOVERY GAP: {prev} -> {curr} (skipped {delta - 1})")
             else:
                 jumps += 1
-                if jumps <= 10: print(f"  WARN GAP: {prev} -> {curr} (skipped {delta - 1})")
+                if jumps <= 10:
+                    print(f"  WARN GAP: {prev} -> {curr} (skipped {delta - 1})")
     print(f"\n  Unexpected gaps:   {jumps}")
     print(f"  Recovery gaps:     {recovery_jumps}")
     print(f"  Repeats:           {repeats}")
     print(f"  Regressions:       {regressions}")
-    if jumps:       anomalies.append(f"{jumps} unexpected pps_count gaps")
-    if repeats:     anomalies.append(f"{repeats} pps_count repeats")
-    if regressions: anomalies.append(f"{regressions} pps_count regressions")
+    if jumps:
+        anomalies.append(f"{jumps} unexpected pps_count gaps")
+    if repeats:
+        anomalies.append(f"{repeats} pps_count repeats")
+    if regressions:
+        anomalies.append(f"{regressions} pps_count regressions")
     return anomalies
 
 
-def analyze_ocxo_integrity(rows, recovery_boundaries):
-    anomalies = []
+def analyze_recovery_projection(rows: List[Dict[str, Any]], recovery_boundaries: Set[int]) -> List[str]:
+    anomalies: List[str] = []
+    print()
+    print("-" * 78)
+    print("RECOVERY PROJECTION CERTIFICATION")
+    print("-" * 78)
+
+    if not recovery_boundaries:
+        print("\n  No recovery gaps detected.")
+        return anomalies
+
+    for i in range(1, len(rows)):
+        prev = rows[i - 1]
+        curr = rows[i]
+        prev_pps = _row_pps_count(prev)
+        curr_pps = _row_pps_count(curr)
+        if curr_pps <= prev_pps + 1:
+            continue
+
+        delta = curr_pps - prev_pps
+        print(f"\n  Recovery boundary: {prev_pps} -> {curr_pps}  (delta={delta}, skipped={delta - 1})")
+
+        prev_gnss = _gnss_ns(prev)
+        curr_gnss = _gnss_ns(curr)
+        if prev_gnss is None or curr_gnss is None:
+            msg = f"recovery {curr_pps}: missing GNSS ledger"
+            anomalies.append(msg)
+            print(f"    GNSS: missing ledger — ALARM")
+            continue
+
+        expected_gnss = prev_gnss + delta * NS_PER_SECOND
+        gnss_error = curr_gnss - expected_gnss
+        identity_error = curr_gnss - curr_pps * NS_PER_SECOND
+        print(f"    GNSS: expected={expected_gnss:,}  actual={curr_gnss:,}  "
+              f"error={gnss_error:+,d}  identity_error={identity_error:+,d}")
+        if gnss_error != 0 or identity_error != 0:
+            anomalies.append(f"recovery {curr_pps}: GNSS projection error {gnss_error:+d}, identity {identity_error:+d}")
+
+        for label, getter, tol, unit in [
+            ("DWT", _dwt_cycles, RECOVERY_DWT_PROJECTION_ALARM_CYCLES, "cycles"),
+            ("OCXO1", lambda r: _ocxo_ns(r, "ocxo1"), RECOVERY_OCXO_PROJECTION_ALARM_NS, "ns"),
+            ("OCXO2", lambda r: _ocxo_ns(r, "ocxo2"), RECOVERY_OCXO_PROJECTION_ALARM_NS, "ns"),
+        ]:
+            prev_v = getter(prev)
+            curr_v = getter(curr)
+            if prev_v is None or curr_v is None or prev_gnss <= 0:
+                print(f"    {label}: missing ledger")
+                continue
+            projected = (curr_gnss * prev_v) // prev_gnss
+            error = curr_v - projected
+            print(f"    {label}: projected={projected:,}  actual={curr_v:,}  error={error:+,d} {unit}")
+            if abs(error) > tol:
+                anomalies.append(f"recovery {curr_pps}: {label} projection error {error:+d} {unit}")
+
+    if not anomalies:
+        print("\n  Verdict: OK — recovery gaps project cleanly from prior TIMEBASE ledgers")
+    return anomalies
+
+
+# -----------------------------------------------------------------------------
+# Clock-domain integrity
+# -----------------------------------------------------------------------------
+
+
+def analyze_clock_domains(rows: List[Dict[str, Any]], recovery_boundaries: Set[int]) -> List[str]:
+    anomalies: List[str] = []
+    print()
+    print("-" * 78)
+    print("CLOCK DOMAIN MONOTONICITY")
+    print("-" * 78)
+
+    clocks = [
+        ("GNSS", _gnss_ns, "ns"),
+        ("VCLOCK", _vclock_ns, "ns"),
+        ("OCXO1", lambda r: _ocxo_ns(r, "ocxo1"), "ns"),
+        ("OCXO2", lambda r: _ocxo_ns(r, "ocxo2"), "ns"),
+        ("DWT", _dwt_cycles, "cycles"),
+    ]
+
+    for label, getter, unit in clocks:
+        values: List[Tuple[int, int]] = []
+        for row in rows:
+            pps = _row_pps_count(row)
+            v = getter(row)
+            if v is not None:
+                values.append((pps, v))
+        if not values:
+            print(f"\n  [{label}] No data")
+            continue
+
+        delta_stats = WelfordStats()
+        non_monotonic = zero_deltas = bad_adjacent = 0
+        for i in range(1, len(values)):
+            pp, pv = values[i - 1]
+            cp, cv = values[i]
+            if cp in recovery_boundaries:
+                continue
+            delta = cv - pv
+            if delta == 0:
+                zero_deltas += 1
+            elif delta < 0:
+                non_monotonic += 1
+            if cp == pp + 1:
+                delta_stats.update(float(delta))
+                if label in ("GNSS", "VCLOCK") and delta != NS_PER_SECOND:
+                    bad_adjacent += 1
+                elif label.startswith("OCXO") and abs(delta - NS_PER_SECOND) > OCXO_SECOND_ALARM_NS:
+                    bad_adjacent += 1
+                elif label == "DWT":
+                    # DWT is a cycle-domain clock; compare only against sanity.
+                    if delta <= 0:
+                        bad_adjacent += 1
+
+        print(f"\n  [{label}]")
+        print(f"    Range: {values[0][1]:,} -> {values[-1][1]:,} {unit}")
+        print(f"    Per-second delta: {delta_stats.summary()}")
+        issues = []
+        if zero_deltas:
+            issues.append(f"{zero_deltas} zero")
+        if non_monotonic:
+            issues.append(f"{non_monotonic} non-monotonic")
+        if bad_adjacent:
+            issues.append(f"{bad_adjacent} bad adjacent delta")
+        if issues:
+            print(f"    Verdict: WARN — {', '.join(issues)}")
+            anomalies.append(f"{label}: {', '.join(issues)} deltas")
+        else:
+            print("    Verdict: OK")
+    return anomalies
+
+
+def _micro_prefix(prefix: str) -> str:
+    return "o1" if prefix == "ocxo1" else "o2"
+
+
+def analyze_ocxo_integrity(rows: List[Dict[str, Any]], recovery_boundaries: Set[int]) -> List[str]:
+    anomalies: List[str] = []
     for ocxo_label, prefix in [("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")]:
+        micro = _micro_prefix(prefix)
         print()
         print("-" * 78)
         print(f"{ocxo_label} PER-SECOND INTEGRITY")
         print("-" * 78)
 
-        gnss_between_stats = WelfordStats()
+        clock_interval_stats = WelfordStats()
         residual_stats = WelfordStats()
-        window_error_stats = WelfordStats()
         phase_step_stats = WelfordStats()
+        ns_delta_error_stats = WelfordStats()
 
-        alarm_records = []
-        second_warns = []
-        ns_count_alarms = []
-        phase_step_alarms = []
-        ppb_step_alarms = []
-        window_alarms = []
+        alarm_records: List[Dict[str, Any]] = []
+        second_warns: List[str] = []
+        ns_delta_alarms: List[str] = []
+        phase_step_alarms: List[str] = []
+        ppb_step_alarms: List[str] = []
 
-        prev_phase_offset = None
-        prev_ppb = None
-        prev_ns_count = None
+        prev_phase_offset: Optional[int] = None
+        prev_ppb: Optional[float] = None
+        prev_ns_count: Optional[int] = None
         valid_seconds = 0
         null_count = 0
 
-        for i, row in enumerate(rows):
-            pps = int(row["pps_count"])
+        for row in rows:
+            pps = _row_pps_count(row)
             if pps in recovery_boundaries:
-                prev_phase_offset = prev_ppb = prev_ns_count = None
+                prev_phase_offset = None
+                prev_ppb = None
+                prev_ns_count = None
                 continue
 
-            gnss_between = _frag_int(row, f"{prefix}_gnss_ns_between_edges")
-            residual = _frag_int(row, f"{prefix}_second_residual_ns")
-            phase_offset = _frag_int(row, f"{prefix}_phase_offset_ns")
-            ppb = _frag_float(row, f"{prefix}_ppb")
-            ns_count = _frag_int(row, f"{prefix}_ns_count_at_edge")
-            window_err = _frag_int(row, f"{prefix}_window_error_ns")
-            zero_est = _frag(row, f"{prefix}_zero_established")
+            clock_interval = _ocxo_clock_interval(row, prefix)
+            gnss_interval = _ocxo_gnss_interval(row, prefix)
+            residual = _ocxo_residual(row, prefix)
+            phase_offset = _ocxo_phase_offset(row, prefix)
+            ppb = _stat(row, prefix, "ppb")
+            ns_count = _ocxo_ns(row, prefix)
+            valid = _ocxo_valid(row, prefix)
 
-            if not zero_est:
-                prev_phase_offset = prev_ppb = prev_ns_count = None
+            if not valid:
+                prev_phase_offset = None
+                prev_ppb = None
+                prev_ns_count = None
+                null_count += 1
                 continue
 
-            if gnss_between is not None and gnss_between > 0:
+            if clock_interval is not None and gnss_interval is not None and gnss_interval > 0:
                 valid_seconds += 1
-                gnss_between_stats.update(float(gnss_between))
-                deviation = gnss_between - NS_PER_SECOND
+                clock_interval_stats.update(float(clock_interval))
+                deviation = clock_interval - gnss_interval
+                if residual is None:
+                    residual = deviation
 
                 if abs(deviation) > OCXO_SECOND_ALARM_NS:
-                    isr_raw = _frag_int(row, f"{prefix}_diag_dwt_isr_entry_raw")
-                    shadow = _frag_int(row, f"{prefix}_diag_shadow_dwt")
-                    s2i = (isr_raw - shadow) if (isr_raw is not None and shadow is not None) else None
-
                     alarm_records.append({
                         "pps": pps,
                         "deviation_ns": deviation,
-                        "gnss_between": gnss_between,
+                        "clock_interval": clock_interval,
+                        "gnss_interval": gnss_interval,
                         "residual": residual,
-                        "window_err": window_err,
                         "phase_offset": phase_offset,
                         "ppb": ppb,
-                        "prespin_fired": _frag(row, f"{prefix}_diag_prespin_fired"),
-                        "prespin_timed_out": _frag(row, f"{prefix}_diag_prespin_timed_out"),
-                        "prespin_active": _frag(row, f"{prefix}_diag_prespin_active"),
-                        "approach_cycles": _frag_int(row, f"{prefix}_diag_approach_cycles"),
-                        "shadow_to_isr": s2i,
-                        "correction_cycles": _frag_int(row, f"{prefix}_diag_dwt_event_correction_cycles"),
-                        "anomaly_count": _frag_int(row, f"{prefix}_diag_anomaly_count"),
-                        "timeout_count": _frag_int(row, f"{prefix}_diag_prespin_timeout_count"),
-                        "dwt_at_event": _frag_int(row, f"{prefix}_diag_dwt_at_event_adjusted"),
-                        "gnss_ns_at_event": _frag_int(row, f"{prefix}_diag_gnss_ns_at_event"),
-                        "counter32": _frag_int(row, f"{prefix}_diag_counter32_at_event"),
+                        "obs": _forensic_int(row, f"{micro}_obs"),
+                        "eff": _forensic_int(row, f"{micro}_eff"),
+                        "res_cycles": _forensic_int(row, f"{micro}_res"),
+                        "pps_res": _forensic_int(row, f"{micro}_pps_res"),
+                        "fl_err": _forensic_int(row, f"{micro}_fl_err"),
+                        "fl_rej": _forensic_int(row, f"{micro}_fl_rej"),
+                        "fl_acc": _forensic_int(row, f"{micro}_fl_acc"),
                     })
                 elif abs(deviation) > OCXO_SECOND_WARN_NS:
                     second_warns.append(f"pps={pps:>7d}  deviation={deviation:+,d} ns")
-            elif gnss_between is None:
+            elif clock_interval is None:
                 null_count += 1
 
             if residual is not None:
                 residual_stats.update(float(residual))
 
-            if window_err is not None:
-                window_error_stats.update(float(abs(window_err)))
-                if abs(window_err) > OCXO_SECOND_WARN_NS:
-                    window_alarms.append(f"pps={pps:>7d}  window_error={window_err:+,d} ns")
-
             if ns_count is not None and prev_ns_count is not None:
                 ns_delta = ns_count - prev_ns_count
-                if ns_delta != NS_PER_SECOND:
-                    ns_count_alarms.append(
-                        f"pps={pps:>7d}  ns_count_delta={ns_delta:,}  (expected {NS_PER_SECOND:,})")
+                expected_delta = clock_interval if clock_interval is not None else (
+                    NS_PER_SECOND + residual if residual is not None else None
+                )
+                if expected_delta is not None:
+                    ns_delta_error = ns_delta - expected_delta
+                    ns_delta_error_stats.update(float(ns_delta_error))
+                    if abs(ns_delta_error) > OCXO_SECOND_WARN_NS:
+                        ns_delta_alarms.append(
+                            f"pps={pps:>7d}  ns_delta={ns_delta:,}  expected={expected_delta:,}  "
+                            f"error={ns_delta_error:+,d}")
+                elif ns_delta <= 0:
+                    ns_delta_alarms.append(f"pps={pps:>7d}  non-monotonic ns_delta={ns_delta:,}")
 
             if phase_offset is not None and prev_phase_offset is not None:
                 step = phase_offset - prev_phase_offset
@@ -290,163 +758,78 @@ def analyze_ocxo_integrity(rows, recovery_boundaries):
             prev_ppb = ppb
             prev_ns_count = ns_count
 
-        # ── Report ──
-
         print(f"\n  Valid seconds:     {valid_seconds:,}")
-        print(f"  Null records:      {null_count}")
+        print(f"  Null/invalid rows: {null_count}")
 
-        print(f"\n  GNSS-measured OCXO second (gnss_ns_between_edges):")
-        print(f"    {gnss_between_stats.summary()}")
+        print("\n  OCXO clock interval (fragment.ocxoN.pps_residual.clock_interval_ns):")
+        print(f"    {clock_interval_stats.summary()}")
 
         if alarm_records:
-            print(f"\n    ALARM: {len(alarm_records)} seconds with "
-                  f"|deviation| > {OCXO_SECOND_ALARM_NS:,} ns")
-            anomalies.append(f"{ocxo_label}: {len(alarm_records)} ALARM seconds "
-                             f"(|deviation| > {OCXO_SECOND_ALARM_NS:,} ns)")
+            print(f"\n    ALARM: {len(alarm_records)} seconds with |deviation| > {OCXO_SECOND_ALARM_NS:,} ns")
+            anomalies.append(f"{ocxo_label}: {len(alarm_records)} ALARM seconds (|deviation| > {OCXO_SECOND_ALARM_NS:,} ns)")
 
-            # ── Directionality ──
             deviations = [r["deviation_ns"] for r in alarm_records]
             short_count = sum(1 for d in deviations if d < 0)
             long_count = sum(1 for d in deviations if d > 0)
-
-            print(f"\n    Directionality:")
-            print(f"      Short (measured second < 1e9):  {short_count}")
-            print(f"      Long  (measured second > 1e9):  {long_count}")
-            if short_count > 0 and long_count == 0:
-                print(f"      ** ALL deviations are SHORT — consistent bias fingerprint **")
-            elif long_count > 0 and short_count == 0:
-                print(f"      ** ALL deviations are LONG — consistent bias fingerprint **")
+            print("\n    Directionality:")
+            print(f"      Short (measured second < GNSS): {short_count}")
+            print(f"      Long  (measured second > GNSS): {long_count}")
             print(f"      Min deviation:  {min(deviations):+,d} ns")
             print(f"      Max deviation:  {max(deviations):+,d} ns")
-            mean_dev = sum(deviations) / len(deviations)
-            print(f"      Mean deviation: {mean_dev:+,.0f} ns")
+            print(f"      Mean deviation: {sum(deviations) / len(deviations):+,.0f} ns")
 
-            # ── Deviation magnitude histogram ──
-            bins = [0, 0, 0, 0, 0]
-            for d in deviations:
-                ad = abs(d)
-                if   ad < 20000: bins[0] += 1
-                elif ad < 30000: bins[1] += 1
-                elif ad < 40000: bins[2] += 1
-                elif ad < 50000: bins[3] += 1
-                else:            bins[4] += 1
-
-            print(f"\n    Deviation magnitude distribution:")
-            print(f"      10-20 \u00b5s:  {bins[0]:>4d}  {'#' * min(40, bins[0])}")
-            print(f"      20-30 \u00b5s:  {bins[1]:>4d}  {'#' * min(40, bins[1])}")
-            print(f"      30-40 \u00b5s:  {bins[2]:>4d}  {'#' * min(40, bins[2])}")
-            print(f"      40-50 \u00b5s:  {bins[3]:>4d}  {'#' * min(40, bins[3])}")
-            print(f"      > 50 \u00b5s:   {bins[4]:>4d}  {'#' * min(40, bins[4])}")
-
-            # ── Prespin correlation ──
-            prespin_timed_out_count = sum(1 for r in alarm_records if r.get("prespin_timed_out") is True)
-            prespin_fired_count = sum(1 for r in alarm_records if r.get("prespin_fired") is True)
-            prespin_not_fired = sum(1 for r in alarm_records
-                                    if r.get("prespin_fired") is False and r.get("prespin_timed_out") is False)
-
-            print(f"\n    Prespin correlation (at alarm seconds):")
-            print(f"      Prespin fired (normal):     {prespin_fired_count}")
-            print(f"      Prespin timed out:           {prespin_timed_out_count}")
-            print(f"      Prespin neither fired/TO:    {prespin_not_fired}")
-
-            if prespin_timed_out_count == len(alarm_records):
-                print(f"      ** PERFECT CORRELATION: every alarm second had a prespin timeout **")
-                print(f"      ** Root cause is almost certainly the TDC fallback path **")
-            elif prespin_timed_out_count > 0:
-                pct = prespin_timed_out_count / len(alarm_records) * 100
-                print(f"      Timeout rate at alarms: {pct:.0f}%  (vs campaign-wide rate below)")
-            else:
-                print(f"      No timeouts at alarm seconds — prespin is NOT the cause")
-
-            total_timeouts = _frag_int(rows[-1], f"{prefix}_diag_prespin_timeout_count") or 0
-            total_arms = _frag_int(rows[-1], f"{prefix}_diag_prespin_arm_count") or 0
-            if total_arms > 0:
-                campaign_to_rate = total_timeouts / total_arms * 100
-                alarm_to_rate = prespin_timed_out_count / len(alarm_records) * 100
-                print(f"\n      Campaign-wide timeout rate:  {campaign_to_rate:.1f}%  "
-                      f"({total_timeouts}/{total_arms})")
-                print(f"      Alarm-second timeout rate:   {alarm_to_rate:.1f}%  "
-                      f"({prespin_timed_out_count}/{len(alarm_records)})")
-                if alarm_to_rate > campaign_to_rate * 3 and prespin_timed_out_count > 2:
-                    print(f"      ** ENRICHED: alarms are {alarm_to_rate/campaign_to_rate:.1f}x more likely "
-                          f"to have prespin timeouts **")
-
-            # ── Temporal clustering ──
-            alarm_pps_list = sorted(r["pps"] for r in alarm_records)
-            if len(alarm_pps_list) >= 2:
-                gaps = [alarm_pps_list[i+1] - alarm_pps_list[i] for i in range(len(alarm_pps_list) - 1)]
-                mean_gap = sum(gaps) / len(gaps)
-                min_gap = min(gaps)
-                max_gap = max(gaps)
-
-                print(f"\n    Temporal distribution:")
-                print(f"      Alarm seconds span:    pps {alarm_pps_list[0]} -> {alarm_pps_list[-1]}")
-                print(f"      Mean gap between:      {mean_gap:.0f} seconds")
-                print(f"      Min gap:               {min_gap} seconds")
-                print(f"      Max gap:               {max_gap} seconds")
-                close_pairs = sum(1 for g in gaps if g < 30)
-                if close_pairs > 0:
-                    print(f"      Close pairs (<30s):    {close_pairs}  — suggests bursty pathology")
-
-            # ── Forensic table ──
             show_n = min(15, len(alarm_records))
-            print(f"\n    Forensic detail (first {show_n}):")
-            print(f"    {'PPS':>7s}  {'DEV_NS':>10s}  {'FIRED':>5s}  {'T/O':>3s}  "
-                  f"{'APPR':>6s}  {'S->ISR':>6s}  {'CORR':>4s}  {'TO_CNT':>6s}")
-            print(f"    {'---':>7s}  {'---':>10s}  {'---':>5s}  {'---':>3s}  "
-                  f"{'---':>6s}  {'---':>6s}  {'---':>4s}  {'---':>6s}")
+            print(f"\n    Micro-raw forensic detail (first {show_n}):")
+            print(f"    {'PPS':>7s}  {'DEV_NS':>10s}  {'OBS':>10s}  {'EFF':>10s}  {'RES':>6s}  {'PPS_RES':>7s}  {'FL_ERR':>7s}  {'FL_REJ':>6s}")
+            print(f"    {'---':>7s}  {'---':>10s}  {'---':>10s}  {'---':>10s}  {'---':>6s}  {'---':>7s}  {'---':>7s}  {'---':>6s}")
             for r in alarm_records[:show_n]:
-                fired = "Y" if r.get("prespin_fired") else "N"
-                to = "Y" if r.get("prespin_timed_out") else "N"
-                appr = r.get("approach_cycles")
-                s2i = r.get("shadow_to_isr")
-                corr = r.get("correction_cycles")
-                to_cnt = r.get("timeout_count")
                 print(f"    {r['pps']:>7d}  {r['deviation_ns']:>+10,d}  "
-                      f"{fired:>5s}  {to:>3s}  "
-                      f"{str(appr) if appr is not None else '---':>6s}  "
-                      f"{str(s2i) if s2i is not None else '---':>6s}  "
-                      f"{str(corr) if corr is not None else '---':>4s}  "
-                      f"{str(to_cnt) if to_cnt is not None else '---':>6s}")
+                      f"{str(r.get('obs')) if r.get('obs') is not None else '---':>10s}  "
+                      f"{str(r.get('eff')) if r.get('eff') is not None else '---':>10s}  "
+                      f"{str(r.get('res_cycles')) if r.get('res_cycles') is not None else '---':>6s}  "
+                      f"{str(r.get('pps_res')) if r.get('pps_res') is not None else '---':>7s}  "
+                      f"{str(r.get('fl_err')) if r.get('fl_err') is not None else '---':>7s}  "
+                      f"{str(r.get('fl_rej')) if r.get('fl_rej') is not None else '---':>6s}")
             if len(alarm_records) > show_n:
                 print(f"    ... and {len(alarm_records) - show_n} more")
 
         if second_warns:
-            print(f"\n    WARN: {len(second_warns)} seconds with "
-                  f"|deviation| > {OCXO_SECOND_WARN_NS} ns (of {valid_seconds:,} total)")
+            print(f"\n    WARN: {len(second_warns)} seconds with |deviation| > {OCXO_SECOND_WARN_NS} ns")
+            for msg in second_warns[:10]:
+                print(f"      {msg}")
+            if len(second_warns) > 10:
+                print(f"      ... and {len(second_warns) - 10} more")
 
-        print(f"\n  Per-second residual (1e9 - gnss_ns_between_edges):")
+        print("\n  Per-second residual (clock_interval_ns - gnss_interval_ns):")
         print(f"    {residual_stats.summary()}")
 
-        print(f"\n  Window error (firmware viability check):")
-        print(f"    {window_error_stats.summary()}")
-        if window_alarms:
-            print(f"    WARN: {len(window_alarms)} seconds with |window_error| > {OCXO_SECOND_WARN_NS} ns")
-            for msg in window_alarms[:10]: print(f"      {msg}")
-            if len(window_alarms) > 10: print(f"      ... and {len(window_alarms) - 10} more")
-
-        if ns_count_alarms:
-            print(f"\n    ALARM: {len(ns_count_alarms)} seconds where "
-                  f"ns_count_at_edge did NOT advance by exactly 1e9:")
-            for msg in ns_count_alarms[:20]: print(f"      {msg}")
-            if len(ns_count_alarms) > 20: print(f"      ... and {len(ns_count_alarms) - 20} more")
-            anomalies.append(f"{ocxo_label}: {len(ns_count_alarms)} ns_count_at_edge anomalies")
+        print("\n  Public ledger delta error (delta(ns) - clock_interval_ns):")
+        print(f"    {ns_delta_error_stats.summary()}")
+        if ns_delta_alarms:
+            print(f"\n    ALARM/WARN: {len(ns_delta_alarms)} public ledger delta mismatches:")
+            for msg in ns_delta_alarms[:20]:
+                print(f"      {msg}")
+            if len(ns_delta_alarms) > 20:
+                print(f"      ... and {len(ns_delta_alarms) - 20} more")
+            anomalies.append(f"{ocxo_label}: {len(ns_delta_alarms)} public ledger delta mismatches")
         else:
-            print(f"\n    ns_count_at_edge: OK — every delta is exactly 1,000,000,000")
+            print("    Verdict: OK")
 
-        print(f"\n  Phase offset per-second step:")
+        print("\n  Phase offset per-second step (vclock_ns - ocxo_ns):")
         print(f"    {phase_step_stats.summary()}")
         if phase_step_alarms:
             print(f"\n    ALARM: {len(phase_step_alarms)} phase steps > {PHASE_STEP_ALARM_NS:,} ns:")
-            for msg in phase_step_alarms[:20]: print(f"      {msg}")
+            for msg in phase_step_alarms[:20]:
+                print(f"      {msg}")
             anomalies.append(f"{ocxo_label}: {len(phase_step_alarms)} phase offset step alarms")
 
         if ppb_step_alarms:
-            print(f"\n    ALARM: {len(ppb_step_alarms)} ppb steps > {PPB_STEP_ALARM} ppb:")
-            for msg in ppb_step_alarms[:20]: print(f"      {msg}")
+            print(f"\n    ALARM: {len(ppb_step_alarms)} published-ppb steps > {PPB_STEP_ALARM} ppb:")
+            for msg in ppb_step_alarms[:20]:
+                print(f"      {msg}")
             anomalies.append(f"{ocxo_label}: {len(ppb_step_alarms)} ppb step alarms")
         else:
-            print(f"\n    PPB trajectory: OK — no steps > {PPB_STEP_ALARM} ppb")
+            print(f"\n    Published PPB trajectory: OK — no steps > {PPB_STEP_ALARM} ppb")
 
         ocxo_issues = [a for a in anomalies if a.startswith(ocxo_label)]
         print(f"\n  {ocxo_label} VERDICT: {'PATHOLOGY DETECTED' if ocxo_issues else 'CLEAN'}")
@@ -454,256 +837,269 @@ def analyze_ocxo_integrity(rows, recovery_boundaries):
     return anomalies
 
 
-def analyze_ocxo_comparison(rows, recovery_boundaries):
-    anomalies = []
+def analyze_ocxo_comparison(rows: List[Dict[str, Any]], recovery_boundaries: Set[int]) -> List[str]:
+    anomalies: List[str] = []
     print()
     print("-" * 78)
     print("OCXO1 vs OCXO2 COMPARATIVE")
     print("-" * 78)
 
     divergence_stats = WelfordStats()
-    large_divergences = []
+    large_divergences: List[str] = []
 
     for row in rows:
-        pps = int(row["pps_count"])
-        if pps in recovery_boundaries: continue
-        r1 = _frag_int(row, "ocxo1_second_residual_ns")
-        r2 = _frag_int(row, "ocxo2_second_residual_ns")
-        if r1 is None or r2 is None: continue
+        pps = _row_pps_count(row)
+        if pps in recovery_boundaries:
+            continue
+        r1 = _ocxo_residual(row, "ocxo1")
+        r2 = _ocxo_residual(row, "ocxo2")
+        if r1 is None or r2 is None:
+            continue
         diff = r1 - r2
         divergence_stats.update(float(diff))
         if abs(diff) > OCXO_SECOND_ALARM_NS:
             large_divergences.append(
                 f"pps={pps:>7d}  ocxo1_res={r1:+,d}  ocxo2_res={r2:+,d}  diff={diff:+,d}")
 
-    print(f"\n  Per-second residual difference (OCXO1 - OCXO2):")
+    print("\n  Per-second residual difference (OCXO1 - OCXO2):")
     print(f"    {divergence_stats.summary()}")
     if large_divergences:
-        print(f"\n    ALARM: {len(large_divergences)} seconds with "
-              f"|OCXO1 - OCXO2| > {OCXO_SECOND_ALARM_NS:,} ns:")
-        for msg in large_divergences[:10]: print(f"      {msg}")
-        if len(large_divergences) > 10: print(f"      ... and {len(large_divergences) - 10} more")
-        anomalies.append(f"OCXO divergence: {len(large_divergences)} seconds with "
-                         f"|OCXO1 - OCXO2| > {OCXO_SECOND_ALARM_NS:,} ns")
+        print(f"\n    ALARM: {len(large_divergences)} seconds with |OCXO1 - OCXO2| > {OCXO_SECOND_ALARM_NS:,} ns:")
+        for msg in large_divergences[:10]:
+            print(f"      {msg}")
+        if len(large_divergences) > 10:
+            print(f"      ... and {len(large_divergences) - 10} more")
+        anomalies.append(f"OCXO divergence: {len(large_divergences)} seconds with |OCXO1 - OCXO2| > {OCXO_SECOND_ALARM_NS:,} ns")
     else:
         print(f"\n    Verdict: OK — both OCXOs track within {OCXO_SECOND_ALARM_NS:,} ns")
     return anomalies
 
 
-def analyze_welford_contamination(rows, recovery_boundaries):
-    anomalies = []
+def analyze_welford_contamination(rows: List[Dict[str, Any]], recovery_boundaries: Set[int]) -> List[str]:
+    anomalies: List[str] = []
     print()
     print("-" * 78)
     print("WELFORD CONTAMINATION CHECK")
     print("-" * 78)
 
     for label, prefix in [("DWT", "dwt"), ("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")]:
-        stddev_values = []
+        stddev_values: List[Tuple[int, float]] = []
         for row in rows:
-            pps = int(row["pps_count"])
-            sd = _frag_float(row, f"{prefix}_welford_stddev")
-            if sd is not None: stddev_values.append((pps, sd))
+            pps = _row_pps_count(row)
+            sd = _welford(row, prefix, "stddev")
+            if sd is not None:
+                stddev_values.append((pps, sd))
         if not stddev_values:
             print(f"\n  [{label}] No Welford data")
             continue
         first_pps, first_sd = stddev_values[0]
         final_pps, final_sd = stddev_values[-1]
         max_pps, max_sd = max(stddev_values, key=lambda x: x[1])
-        unit = "cycles" if label == "DWT" else "ns"
+        unit = "cycles/ppb" if label == "DWT" else "ns"
         print(f"\n  [{label}] Welford stddev trajectory ({unit}):")
         print(f"    First (pps={first_pps}):  {first_sd:.3f}")
         print(f"    Final (pps={final_pps}):  {final_sd:.3f}")
         print(f"    Peak  (pps={max_pps}):  {max_sd:.3f}")
 
-        jumps = []
+        jumps: List[str] = []
         for i in range(1, len(stddev_values)):
             pp, ps = stddev_values[i - 1]
             cp, cs = stddev_values[i]
-            if cp in recovery_boundaries: continue
-            if cs > ps * 2.0 and cs > 10.0:
+            if cp in recovery_boundaries:
+                continue
+            if ps > 0.0 and cs > ps * 2.0 and cs > 10.0:
                 jumps.append(f"pps={cp:>7d}  stddev {ps:.3f} -> {cs:.3f}  (x{cs/ps:.1f})")
         if jumps:
             print(f"    WARN: {len(jumps)} sudden stddev jumps (>2x):")
-            for msg in jumps[:10]: print(f"      {msg}")
-            if len(jumps) > 10: print(f"      ... and {len(jumps) - 10} more")
+            for msg in jumps[:10]:
+                print(f"      {msg}")
+            if len(jumps) > 10:
+                print(f"      ... and {len(jumps) - 10} more")
 
         threshold = 200.0 if label == "DWT" else WELFORD_STDDEV_ALARM
         if final_sd > threshold:
             print(f"    ALARM: final stddev {final_sd:.3f} > {threshold} — Welford is contaminated")
             anomalies.append(f"{label}: Welford stddev contaminated ({final_sd:.3f} {unit})")
         else:
-            print(f"    Verdict: OK")
+            print("    Verdict: OK")
     return anomalies
 
 
-def analyze_ppb_sanity(rows, recovery_boundaries):
-    anomalies = []
+def analyze_ppb_sanity(rows: List[Dict[str, Any]], recovery_boundaries: Set[int]) -> List[str]:
+    anomalies: List[str] = []
     print()
     print("-" * 78)
-    print(f"PPB SANITY CHECK (threshold: \u00b1{PPB_ABSOLUTE_THRESHOLD:,} ppb)")
+    print(f"PPB SANITY CHECK (threshold: ±{PPB_ABSOLUTE_THRESHOLD:,} ppb)")
     print("-" * 78)
 
-    for label, prefix in [("DWT", "dwt"), ("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")]:
-        ppb_stats = WelfordStats()
-        violations = []
+    for label, prefix in [("DWT", "dwt"), ("VCLOCK", "vclock"), ("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")]:
+        published_stats = WelfordStats()
+        total_stats = WelfordStats()
+        mismatch_stats = WelfordStats()
+        violations: List[str] = []
+
         for row in rows:
-            pps = int(row["pps_count"])
-            ppb = _frag_float(row, f"{prefix}_ppb")
-            if ppb is None: continue
-            ppb_stats.update(ppb)
-            if abs(ppb) > PPB_ABSOLUTE_THRESHOLD:
-                violations.append(f"pps={pps:>7d}  ppb={ppb:+,.1f}")
-        print(f"\n  [{label}] Cumulative PPB:")
-        print(f"    {ppb_stats.summary()}")
+            pps = _row_pps_count(row)
+            published_ppb = 0.0 if prefix == "vclock" else _stat(row, prefix, "ppb")
+            total_ppb = _campaign_total_ppb(row, prefix)
+            if published_ppb is not None:
+                published_stats.update(float(published_ppb))
+                if abs(float(published_ppb)) > PPB_ABSOLUTE_THRESHOLD:
+                    violations.append(f"pps={pps:>7d}  published_ppb={published_ppb:+,.1f}")
+            if total_ppb is not None:
+                total_stats.update(float(total_ppb))
+                if abs(float(total_ppb)) > PPB_ABSOLUTE_THRESHOLD:
+                    violations.append(f"pps={pps:>7d}  total_ppb={total_ppb:+,.1f}")
+            if published_ppb is not None and total_ppb is not None:
+                mismatch_stats.update(float(published_ppb) - float(total_ppb))
+
+        print(f"\n  [{label}] Published PPB:")
+        print(f"    {published_stats.summary()}")
+        print(f"  [{label}] Campaign-total PPB computed from public ledgers:")
+        print(f"    {total_stats.summary()}")
+        if mismatch_stats.n:
+            print(f"  [{label}] Published minus campaign-total PPB:")
+            print(f"    {mismatch_stats.summary()}")
+
         if violations:
-            print(f"    WARN: {len(violations)} records exceed \u00b1{PPB_ABSOLUTE_THRESHOLD:,} ppb")
-            for msg in violations[:5]: print(f"      {msg}")
-            if len(violations) > 5: print(f"      ... and {len(violations) - 5} more")
+            print(f"    WARN: {len(violations)} records exceed ±{PPB_ABSOLUTE_THRESHOLD:,} ppb")
+            for msg in violations[:5]:
+                print(f"      {msg}")
+            if len(violations) > 5:
+                print(f"      ... and {len(violations) - 5} more")
             anomalies.append(f"{label}: {len(violations)} records with |ppb| > {PPB_ABSOLUTE_THRESHOLD:,}")
         else:
-            print(f"    Verdict: OK")
+            print("    Verdict: OK")
     return anomalies
 
 
-def analyze_servo(rows):
+# -----------------------------------------------------------------------------
+# Operator/debug summaries
+# -----------------------------------------------------------------------------
+
+
+def analyze_servo(rows: List[Dict[str, Any]]) -> None:
     print()
     print("-" * 78)
     print("OCXO SERVO & DAC STATE")
     print("-" * 78)
-    servo = _frag(rows[-1], "calibrate_ocxo", "?")
-    print(f"\n  Servo mode: {servo}")
+    print(f"\n  Servo mode: {_servo_mode(rows[-1])}")
     for label, prefix in [("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")]:
-        dac = _frag_float(rows[-1], f"{prefix}_dac")
-        dac_mean = _frag_float(rows[-1], f"{prefix}_dac_welford_mean")
-        dac_sd = _frag_float(rows[-1], f"{prefix}_dac_welford_stddev")
-        dac_n = _frag_int(rows[-1], f"{prefix}_dac_welford_n")
-        dac_se = _frag_float(rows[-1], f"{prefix}_dac_welford_stderr")
+        frag = _fragment(rows[-1])
+        dac = _first_float(
+            _path_get(frag, f"dac.{prefix}_dac"),
+            _path_get(frag, f"dac.{prefix}.value"),
+            _path_get(frag, f"dac.{prefix}.dac"),
+            frag.get(f"{prefix}_dac"),
+        )
+        dac_mean = _dac_welford(rows[-1], prefix, "mean")
+        dac_sd = _dac_welford(rows[-1], prefix, "stddev")
+        dac_n = _dac_welford_int(rows[-1], prefix, "n")
+        dac_se = _dac_welford(rows[-1], prefix, "stderr")
         print(f"\n  [{label}]")
-        if dac is not None: print(f"    Current DAC:     {dac:.6f}")
+        if dac is not None:
+            print(f"    Current DAC:     {dac:.6f}")
         if dac_mean is not None:
-            print(f"    DAC Welford:     mean={dac_mean:.6f}  sd={dac_sd:.6f}  n={dac_n}  se={dac_se:.6f}")
-        first_dac = _frag_float(rows[0], f"{prefix}_dac")
-        if first_dac is not None and dac is not None:
-            print(f"    DAC drift:       {first_dac:.6f} -> {dac:.6f}  (\u0394={dac - first_dac:+.6f})")
+            print(f"    DAC Welford:     mean={dac_mean:.6f}  sd={(dac_sd or 0.0):.6f}  n={dac_n}  se={(dac_se or 0.0):.6f}")
 
 
-def analyze_prespin(rows):
+def analyze_micro_raw_cycles(rows: List[Dict[str, Any]]) -> None:
     print()
     print("-" * 78)
-    print("PRESPIN DIAGNOSTICS")
+    print("TIMEBASE_FORENSICS MICRO RAW CYCLES (final record)")
     print("-" * 78)
-    for label, prefix in [("PPS", "pps"), ("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")]:
-        arm = _frag_int(rows[-1], f"{prefix}_diag_prespin_arm_count")
-        complete = _frag_int(rows[-1], f"{prefix}_diag_prespin_complete_count")
-        timeout = _frag_int(rows[-1], f"{prefix}_diag_prespin_timeout_count")
-        anomaly = _frag_int(rows[-1], f"{prefix}_diag_anomaly_count")
-        if arm is None:
-            print(f"\n  [{label}] No prespin data")
-            continue
-        hit_rate = (complete / arm * 100) if arm > 0 else 0
-        print(f"\n  [{label}]")
-        print(f"    Armed:     {arm:,}")
-        print(f"    Complete:  {complete:,}  ({hit_rate:.1f}%)")
-        print(f"    Timeouts:  {timeout:,}")
-        print(f"    Anomalies: {anomaly:,}")
+    f = _forensics(rows[-1])
+    if not f:
+        print("  No forensics payload")
+        return
+    if not f.get("micro_raw_cycles"):
+        print("  No MICRO_RAW_CYCLES_V1 payload in final forensics")
+        return
+
+    print(f"\n  Schema: {f.get('micro_schema', '?')}  temporary={f.get('temporary_safety_mode', '?')}")
+    print(f"  PPS/V edge available: {f.get('pps_vclock_edge_available')}")
+    print()
+    print(f"  {'LANE':<7s} {'OBS':>12s} {'EFF':>12s} {'RES':>8s} {'RAW':>12s} {'PUB':>12s} {'FL_ERR':>8s} {'PPS_RES':>8s}")
+    print(f"  {'-'*7} {'-'*12} {'-'*12} {'-'*8} {'-'*12} {'-'*12} {'-'*8} {'-'*8}")
+    for label, prefix in [("VCLOCK", "v"), ("OCXO1", "o1"), ("OCXO2", "o2")]:
+        print(f"  {label:<7s} "
+              f"{str(f.get(prefix + '_obs', '---')):>12s} "
+              f"{str(f.get(prefix + '_eff', '---')):>12s} "
+              f"{str(f.get(prefix + '_res', '---')):>8s} "
+              f"{str(f.get(prefix + '_raw', '---')):>12s} "
+              f"{str(f.get(prefix + '_pub', '---')):>12s} "
+              f"{str(f.get(prefix + '_fl_err', '---')):>8s} "
+              f"{str(f.get(prefix + '_pps_res', '---')):>8s}")
 
 
-def print_environment(rows):
+def print_environment(rows: List[Dict[str, Any]]) -> None:
     print()
     print("-" * 78)
     print("ENVIRONMENT (final record)")
     print("-" * 78)
-    env = rows[-1].get("environment", {})
+    env = _as_dict(rows[-1].get("environment"))
     if not env:
         print("  No environment data")
         return
     for key, label, unit in [
-        ("ambient_temp_c", "Ambient", "\u00b0C"), ("teensy_temp_c", "Teensy", "\u00b0C"),
-        ("gnss_temp_c", "GNSS", "\u00b0C"), ("pressure_hpa", "Pressure", "hPa"),
+        ("ambient_temp_c", "Ambient", "°C"),
+        ("teensy_temp_c", "Teensy", "°C"),
+        ("gnss_temp_c", "GNSS", "°C"),
+        ("pressure_hpa", "Pressure", "hPa"),
         ("humidity_pct", "Humidity", "%"),
     ]:
         v = env.get(key)
-        if v is not None: print(f"  {label + ':':13s} {v:.1f} {unit}")
-    batt = env.get("battery", {})
+        if v is not None:
+            print(f"  {label + ':':13s} {float(v):.1f} {unit}")
+    batt = _as_dict(env.get("battery"))
     if batt:
         pct = batt.get("remaining_pct")
         tte = batt.get("tte_minutes")
         health = batt.get("health_state")
-        if pct is not None: print(f"  {'Battery:':13s} {pct:.0f}%  TTE={tte:.0f}m  {health}")
+        if pct is not None:
+            print(f"  {'Battery:':13s} {float(pct):.0f}%  TTE={float(tte or 0):.0f}m  {health}")
 
 
-def analyze_clock_domains(rows, recovery_boundaries):
-    anomalies = []
-    print()
-    print("-" * 78)
-    print("CLOCK DOMAIN MONOTONICITY")
-    print("-" * 78)
-    for label, key in [("GNSS", "gnss_ns"), ("OCXO1", "ocxo1_ns"), ("OCXO2", "ocxo2_ns")]:
-        values = []
-        for row in rows:
-            pps = int(row["pps_count"])
-            v = _frag_int(row, key)
-            if v is not None: values.append((pps, v))
-        if not values:
-            print(f"\n  [{label}] No data")
-            continue
-        delta_stats = WelfordStats()
-        non_monotonic = zero_deltas = 0
-        for i in range(1, len(values)):
-            pp, pv = values[i - 1]
-            cp, cv = values[i]
-            if cp in recovery_boundaries: continue
-            if cp == pp + 1:
-                delta = cv - pv
-                delta_stats.update(float(delta))
-                if delta == 0: zero_deltas += 1
-                elif delta < 0: non_monotonic += 1
-            elif cv <= pv and cp not in recovery_boundaries:
-                non_monotonic += 1
-        print(f"\n  [{label}]")
-        print(f"    Range: {values[0][1]:,} -> {values[-1][1]:,}")
-        print(f"    Per-second delta: {delta_stats.summary()}")
-        issues = []
-        if zero_deltas: issues.append(f"{zero_deltas} zero")
-        if non_monotonic: issues.append(f"{non_monotonic} non-monotonic")
-        if issues:
-            print(f"    Verdict: WARN — {', '.join(issues)}")
-            anomalies.append(f"{label}: {', '.join(issues)} deltas")
-        else:
-            print(f"    Verdict: OK")
-    return anomalies
+# -----------------------------------------------------------------------------
+# Top-level driver
+# -----------------------------------------------------------------------------
 
 
-def analyze(campaign):
+def analyze(campaign: str) -> None:
     rows = fetch_timebase(campaign)
     if not rows:
         print(f"No TIMEBASE rows found for campaign '{campaign}'")
         return
+
     recovery_boundaries = find_recovery_boundaries(rows)
-    anomalies = []
-    campaign_seconds = print_campaign_overview(rows, recovery_boundaries)
+    anomalies: List[str] = []
+
+    print_campaign_overview(rows, recovery_boundaries)
     anomalies.extend(analyze_pps_continuity(rows, recovery_boundaries))
+    anomalies.extend(analyze_recovery_projection(rows, recovery_boundaries))
     anomalies.extend(analyze_clock_domains(rows, recovery_boundaries))
     anomalies.extend(analyze_ocxo_integrity(rows, recovery_boundaries))
     anomalies.extend(analyze_ocxo_comparison(rows, recovery_boundaries))
     anomalies.extend(analyze_welford_contamination(rows, recovery_boundaries))
     anomalies.extend(analyze_ppb_sanity(rows, recovery_boundaries))
     analyze_servo(rows)
-    analyze_prespin(rows)
+    analyze_micro_raw_cycles(rows)
     print_environment(rows)
+
     print()
     print("=" * 78)
     if anomalies:
         print(f"VERDICT: ANOMALIES FOUND ({len(anomalies)})")
-        for a in anomalies: print(f"  * {a}")
+        for a in anomalies:
+            print(f"  * {a}")
     elif recovery_boundaries:
-        print(f"VERDICT: CLEAN (with {len(recovery_boundaries)} recovery events)")
+        print(f"VERDICT: CLEAN (with {len(recovery_boundaries)} certified recovery events)")
     else:
         print("VERDICT: CLEAN — all checks passed")
     print("=" * 78)
 
 
-def main():
+def main() -> None:
     if len(sys.argv) < 2:
         print("Usage: campaign_analyzer <campaign_name>")
         print()
@@ -711,12 +1107,28 @@ def main():
             with open_db(row_dict=True) as conn:
                 cur = conn.cursor()
                 cur.execute("""
-                    SELECT campaign, active, count(*) as tb_count,
-                           min((payload->>'pps_count')::int) as pps_min,
-                           max((payload->>'pps_count')::int) as pps_max
-                    FROM timebase t JOIN campaigns c USING (campaign)
-                    GROUP BY campaign, active
-                    ORDER BY max(t.ts) DESC LIMIT 20""")
+                    SELECT t.campaign,
+                           bool_or(c.active) AS active,
+                           count(*) AS tb_count,
+                           min(COALESCE(
+                               NULLIF(t.payload->>'teensy_pps_vclock_count', '')::bigint,
+                               NULLIF(t.payload->>'pps_count', '')::bigint,
+                               NULLIF(t.payload->'fragment'->>'teensy_pps_vclock_count', '')::bigint,
+                               NULLIF(t.payload->'fragment'->>'pps_count', '')::bigint
+                           )) AS pps_min,
+                           max(COALESCE(
+                               NULLIF(t.payload->>'teensy_pps_vclock_count', '')::bigint,
+                               NULLIF(t.payload->>'pps_count', '')::bigint,
+                               NULLIF(t.payload->'fragment'->>'teensy_pps_vclock_count', '')::bigint,
+                               NULLIF(t.payload->'fragment'->>'pps_count', '')::bigint
+                           )) AS pps_max,
+                           max(t.ts) AS last_ts
+                    FROM timebase t
+                    LEFT JOIN campaigns c USING (campaign)
+                    GROUP BY t.campaign
+                    ORDER BY max(t.ts) DESC
+                    LIMIT 20
+                """)
                 rows = cur.fetchall()
             if rows:
                 print("Available campaigns:")

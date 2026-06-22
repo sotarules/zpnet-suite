@@ -141,6 +141,13 @@ from zpnet.shared.events import create_event
 
 NS_PER_SECOND = 1_000_000_000
 
+# Teensy DWT conversion constants mirror pnc/firmware/teensy/config.h.
+# RECOVER still accepts a dwt_ns command argument, but current
+# TIMEBASE_FRAGMENT_V3 publishes the DWT ledger in native cycles.
+DWT_NS_NUM = 125
+DWT_NS_DEN = 126
+DWT_EXPECTED_PER_PPS = 1_008_000_000
+
 GNSS_POLL_INTERVAL = 5
 GNSS_WAIT_LOG_INTERVAL = 60
 
@@ -1174,10 +1181,37 @@ def _first_present_int_path(mapping: Dict[str, Any], *keys: str) -> Optional[int
     return None
 
 
-def _fragment_ns(fragment: Dict[str, Any], *keys: str, default: int = 0) -> int:
-    """Extract an integer nanosecond ledger from a TIMEBASE_FRAGMENT, including V3 nested paths."""
+def _fragment_int(fragment: Dict[str, Any], *keys: str, default: int = 0) -> int:
+    """Extract an integer field from a TIMEBASE_FRAGMENT, including V3 nested paths."""
     value = _first_present_int_path(fragment, *keys)
     return int(value) if value is not None else int(default)
+
+
+def _fragment_ns(fragment: Dict[str, Any], *keys: str, default: int = 0) -> int:
+    """Extract an integer nanosecond ledger from a TIMEBASE_FRAGMENT, including V3 nested paths."""
+    return _fragment_int(fragment, *keys, default=default)
+
+
+def _dwt_cycles_to_recover_ns(cycles: int) -> int:
+    """Convert a DWT cycle ledger to the current Teensy RECOVER dwt_ns argument.
+
+    TIMEBASE_FRAGMENT_V3 publishes DWT as native cycles.  The current firmware
+    RECOVER command still accepts dwt_ns and immediately converts it back to
+    cycles.  Use a ceiling conversion so the round trip does not restore a
+    cycle ledger that is one cycle below the projected value.
+    """
+    c = int(cycles)
+    if c <= 0:
+        return 0
+    return (c * DWT_NS_NUM + DWT_NS_DEN - 1) // DWT_NS_DEN
+
+
+def _dwt_recover_ns_to_cycles(ns: int) -> int:
+    """Compatibility conversion for legacy persisted dwt_ns recovery rows."""
+    n = int(ns)
+    if n <= 0:
+        return 0
+    return (n * DWT_NS_DEN) // DWT_NS_NUM
 
 
 def _report_fragment(report: Dict[str, Any]) -> Dict[str, Any]:
@@ -2720,11 +2754,31 @@ def _recover_campaign() -> None:
         "gnss_ns",
         default=int(last_tb.get("teensy_gnss_ns") or 0),
     )
-    last_dwt_ns = _fragment_ns(
+    # DWT is cycle-native in TIMEBASE_FRAGMENT_V3.  Recover from the native
+    # cycle ledger first, then convert to the current Teensy RECOVER dwt_ns
+    # command shape as a compatibility shim.  Older rows that carried dwt_ns
+    # remain supported as a fallback.
+    legacy_last_dwt_ns = _fragment_ns(
         last_frag,
         "dwt.ns",
         "dwt_ns",
-        default=int(last_tb.get("teensy_dwt_ns") or 0),
+        default=int(last_tb.get("teensy_dwt_ns") or last_tb.get("dwt_ns") or 0),
+    )
+    last_dwt_cycles = _fragment_int(
+        last_frag,
+        "dwt.cycle_count_total",
+        "dwt.cycles",
+        "dwt.value",
+        "dwt_cycle_count_total",
+        "dwt_cycles",
+        default=0,
+    )
+    if last_dwt_cycles == 0 and legacy_last_dwt_ns > 0:
+        last_dwt_cycles = _dwt_recover_ns_to_cycles(legacy_last_dwt_ns)
+    last_dwt_ns = (
+        _dwt_cycles_to_recover_ns(last_dwt_cycles)
+        if last_dwt_cycles > 0
+        else legacy_last_dwt_ns
     )
     last_ocxo1_ns = _fragment_ns(
         last_frag,
@@ -2758,12 +2812,13 @@ def _recover_campaign() -> None:
         "📐 [recovery] LAST TIMEBASE:\n"
         "    pps_vclock_count = %d\n"
         "    gnss_ns    = %d\n"
-        "    dwt_ns     = %d\n"
+        "    dwt_cycles = %d\n"
+        "    dwt_ns_arg = %d\n"
         "    ocxo1_ns   = %d\n"
         "    ocxo2_ns   = %d\n"
         "    gnss_time  = %s",
-        last_pps_vclock_count, last_gnss_ns, last_dwt_ns, last_ocxo1_ns, last_ocxo2_ns,
-        last_gnss_time_str,
+        last_pps_vclock_count, last_gnss_ns, last_dwt_cycles, last_dwt_ns,
+        last_ocxo1_ns, last_ocxo2_ns, last_gnss_time_str,
     )
 
     recover_ocxo1_dac = campaign_payload.get("ocxo1_dac")
@@ -2851,12 +2906,25 @@ def _recover_campaign() -> None:
     )
 
     projected_gnss_ns = next_pps_vclock_count * NS_PER_SECOND
-    projected_dwt_ns = projected_gnss_ns * last_dwt_ns // last_gnss_ns if last_gnss_ns > 0 else projected_gnss_ns
+    projected_dwt_cycles = (
+        projected_gnss_ns * last_dwt_cycles // last_gnss_ns
+        if (last_gnss_ns > 0 and last_dwt_cycles > 0)
+        else 0
+    )
+    projected_dwt_ns = (
+        _dwt_cycles_to_recover_ns(projected_dwt_cycles)
+        if projected_dwt_cycles > 0
+        else (projected_gnss_ns * last_dwt_ns // last_gnss_ns if last_gnss_ns > 0 else projected_gnss_ns)
+    )
     projected_ocxo1_ns = projected_gnss_ns * last_ocxo1_ns // last_gnss_ns if (last_gnss_ns > 0 and last_ocxo1_ns > 0) else 0
     projected_ocxo2_ns = projected_gnss_ns * last_ocxo2_ns // last_gnss_ns if (last_gnss_ns > 0 and last_ocxo2_ns > 0) else 0
     projected_gnss_raw_ns = projected_gnss_ns * last_gnss_raw_ns // last_gnss_ns if (last_gnss_ns > 0 and last_gnss_raw_ns > 0) else 0
 
-    tau_dwt = last_dwt_ns / last_gnss_ns if last_gnss_ns > 0 else 1.0
+    tau_dwt = (
+        last_dwt_cycles / ((last_gnss_ns * DWT_EXPECTED_PER_PPS) / NS_PER_SECOND)
+        if last_gnss_ns > 0 and last_dwt_cycles > 0
+        else 1.0
+    )
     tau_ocxo1 = last_ocxo1_ns / last_gnss_ns if (last_gnss_ns > 0 and last_ocxo1_ns > 0) else 1.0
     tau_ocxo2 = last_ocxo2_ns / last_gnss_ns if (last_gnss_ns > 0 and last_ocxo2_ns > 0) else 1.0
 
@@ -2867,11 +2935,11 @@ def _recover_campaign() -> None:
         "    last_gnss_ns      = %d\n"
         "    ---\n"
         "    GNSS:  projected = %d  (tau = 1.000000000000)\n"
-        "    DWT:   projected = %d  (tau = %.12f, last_dwt_ns = %d)\n"
+        "    DWT:   projected_cycles = %d  dwt_ns_arg = %d  (tau = %.12f, last_dwt_cycles = %d)\n"
         "    OCXO1: projected = %d  (tau = %.12f, last_ocxo1_ns = %d)",
         next_pps_vclock_count, projected_gnss_ns, last_gnss_ns,
         projected_gnss_ns,
-        projected_dwt_ns, tau_dwt, last_dwt_ns,
+        projected_dwt_cycles, projected_dwt_ns, tau_dwt, last_dwt_cycles,
         projected_ocxo1_ns, tau_ocxo1, last_ocxo1_ns,
     )
 
@@ -2885,6 +2953,8 @@ def _recover_campaign() -> None:
         "next_pps_second": int(next_pps_second),
         "next_pps_vclock_count": int(next_pps_vclock_count),
         "projected_gnss_ns": int(projected_gnss_ns),
+        "last_dwt_cycles": int(last_dwt_cycles),
+        "projected_dwt_cycles": int(projected_dwt_cycles),
         "projected_dwt_ns": int(projected_dwt_ns),
         "projected_ocxo1_ns": int(projected_ocxo1_ns),
         "projected_ocxo2_ns": int(projected_ocxo2_ns),
@@ -2901,12 +2971,14 @@ def _recover_campaign() -> None:
     logging.info(
         "📡 [recovery] @%s arming TEENSY RECOVER:\n"
         "    pps_vclock_count = %d\n"
-        "    dwt_ns    = %d\n"
-        "    gnss_ns   = %d\n"
-        "    ocxo1_ns  = %d\n"
-        "    ocxo2_ns  = %d",
+        "    dwt_cycles = %d\n"
+        "    dwt_ns_arg = %d\n"
+        "    gnss_ns    = %d\n"
+        "    ocxo1_ns   = %d\n"
+        "    ocxo2_ns   = %d",
         system_time_z(), next_pps_vclock_count,
-        projected_dwt_ns, projected_gnss_ns, projected_ocxo1_ns, projected_ocxo2_ns,
+        projected_dwt_cycles, projected_dwt_ns, projected_gnss_ns,
+        projected_ocxo1_ns, projected_ocxo2_ns,
     )
 
     teensy_recover_args: Dict[str, Any] = {
