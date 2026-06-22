@@ -227,6 +227,28 @@ static uint64_t g_timebase_last_public_gnss_ns = 0;
 static uint64_t g_timebase_last_public_dwt_total = 0;
 static uint64_t g_timebase_last_public_ocxo1_ns = 0;
 static uint64_t g_timebase_last_public_ocxo2_ns = 0;
+
+// START handoff diagnostics.  These counters prove whether Beta captured the
+// campaign-public zero offset from a row whose Alpha OCXO PPS projection was
+// valid for the current PPS/VCLOCK identity.  A public-origin flag alone is
+// not enough: the current row must also be authored from the PPS-row OCXO
+// projection species, not from a fallback measured-edge surface.
+static uint32_t g_start_handoff_check_count = 0;
+static uint32_t g_start_handoff_wait_origin_count = 0;
+static uint32_t g_start_handoff_wait_projection_count = 0;
+static uint32_t g_start_handoff_commit_count = 0;
+static bool     g_start_handoff_last_ready = false;
+static bool     g_start_handoff_last_origin_ready = false;
+static bool     g_start_handoff_last_ocxo1_projection_ready = false;
+static bool     g_start_handoff_last_ocxo2_projection_ready = false;
+static uint64_t g_start_handoff_last_raw_gnss_ns = 0;
+static uint64_t g_start_handoff_last_raw_ocxo1_ns = 0;
+static uint64_t g_start_handoff_last_raw_ocxo2_ns = 0;
+static uint64_t g_start_handoff_last_ocxo1_projected_ns = 0;
+static uint64_t g_start_handoff_last_ocxo2_projected_ns = 0;
+static uint64_t g_start_handoff_last_ocxo1_projection_vclock_ns = 0;
+static uint64_t g_start_handoff_last_ocxo2_projection_vclock_ns = 0;
+
 static bool     g_timebase_last_ocxo1_pps_projected = false;
 static bool     g_timebase_last_ocxo2_pps_projected = false;
 static bool     g_timebase_last_ocxo1_pps_residual_valid = false;
@@ -585,6 +607,61 @@ static void campaign_public_offsets_reset_for_recover(void) {
                                                  recover_ocxo2_ns);
 }
 
+static bool campaign_start_handoff_ready(void) {
+  g_start_handoff_check_count++;
+
+  clocks_alpha_ocxo_pps_projection_snapshot_t ocxo1_projection{};
+  clocks_alpha_ocxo_pps_projection_snapshot_t ocxo2_projection{};
+  const bool ocxo1_projection_ok =
+      clocks_alpha_ocxo_pps_projection_snapshot(time_clock_id_t::OCXO1,
+                                                &ocxo1_projection);
+  const bool ocxo2_projection_ok =
+      clocks_alpha_ocxo_pps_projection_snapshot(time_clock_id_t::OCXO2,
+                                                &ocxo2_projection);
+
+  const uint64_t raw_gnss_ns = current_raw_gnss_ns();
+  const bool origin_ready = clocks_alpha_ocxo_public_origin_ready();
+  const bool ocxo1_projection_ready =
+      ocxo1_projection_ok && ocxo1_projection.valid &&
+      ocxo1_projection.projected_ocxo_ns_at_pps != 0ULL &&
+      ocxo1_projection.pps_vclock_ns == raw_gnss_ns;
+  const bool ocxo2_projection_ready =
+      ocxo2_projection_ok && ocxo2_projection.valid &&
+      ocxo2_projection.projected_ocxo_ns_at_pps != 0ULL &&
+      ocxo2_projection.pps_vclock_ns == raw_gnss_ns;
+
+  g_start_handoff_last_origin_ready = origin_ready;
+  g_start_handoff_last_ocxo1_projection_ready = ocxo1_projection_ready;
+  g_start_handoff_last_ocxo2_projection_ready = ocxo2_projection_ready;
+  g_start_handoff_last_raw_gnss_ns = raw_gnss_ns;
+  g_start_handoff_last_raw_ocxo1_ns = current_raw_ocxo1_ns();
+  g_start_handoff_last_raw_ocxo2_ns = current_raw_ocxo2_ns();
+  g_start_handoff_last_ocxo1_projected_ns =
+      (ocxo1_projection_ok && ocxo1_projection.valid)
+          ? ocxo1_projection.projected_ocxo_ns_at_pps
+          : 0ULL;
+  g_start_handoff_last_ocxo2_projected_ns =
+      (ocxo2_projection_ok && ocxo2_projection.valid)
+          ? ocxo2_projection.projected_ocxo_ns_at_pps
+          : 0ULL;
+  g_start_handoff_last_ocxo1_projection_vclock_ns =
+      ocxo1_projection_ok ? ocxo1_projection.pps_vclock_ns : 0ULL;
+  g_start_handoff_last_ocxo2_projection_vclock_ns =
+      ocxo2_projection_ok ? ocxo2_projection.pps_vclock_ns : 0ULL;
+
+  g_start_handoff_last_ready =
+      origin_ready && ocxo1_projection_ready && ocxo2_projection_ready;
+
+  if (!origin_ready) {
+    g_start_handoff_wait_origin_count++;
+  }
+  if (!ocxo1_projection_ready || !ocxo2_projection_ready) {
+    g_start_handoff_wait_projection_count++;
+  }
+
+  return g_start_handoff_last_ready;
+}
+
 static void campaign_warmup_begin(campaign_warmup_mode_t mode) {
   g_campaign_warmup_mode = mode;
   g_campaign_warmup_remaining = CLOCKS_CAMPAIGN_WARMUP_SUPPRESS_PPS;
@@ -607,10 +684,12 @@ static void campaign_warmup_finish_after_this_suppressed_record(void) {
 
   if (finishing_mode == campaign_warmup_mode_t::START &&
       campaign_state == clocks_campaign_state_t::STARTED &&
-      !clocks_alpha_ocxo_public_origin_ready()) {
+      !campaign_start_handoff_ready()) {
     // Gear, not rubber band: START may not capture public campaign bases until
-    // Alpha says both OCXO public-origin offsets are installed.  Suppress one
-    // more row and check the precomputed flag again on the next PPS.
+    // Alpha says both OCXO public-origin offsets are installed AND the current
+    // PPS row has a valid OCXO PPS-projection for the same VCLOCK/GNSS identity.
+    // OCXO_PUBLIC_ORIGIN alone is a historical readiness fact; the campaign
+    // zero capture must be taken from a live PPS-row projection species.
     g_campaign_warmup_remaining = 1;
     return;
   }
@@ -628,6 +707,7 @@ static void campaign_warmup_finish_after_this_suppressed_record(void) {
     // next selected PPS/VCLOCK edge after this one, so use the current alpha totals as the base.
     // The next published record will add exactly one public second.
     campaign_public_offsets_reset_to_current();
+    g_start_handoff_commit_count++;
   }
 
   // RECOVER: leave the recovery bases intact.  Because campaign_seconds
@@ -4851,6 +4931,10 @@ static FLASHMEM Payload cmd_report_timebase_publish(const Payload&) {
   gates.add("watchdog_gate_count", g_timebase_watchdog_gate_count);
   gates.add("not_started_gate_count", g_timebase_not_started_gate_count);
   gates.add("warmup_suppressed_count", g_timebase_warmup_suppressed_count);
+  gates.add("start_handoff_check_count", g_start_handoff_check_count);
+  gates.add("start_handoff_wait_origin_count", g_start_handoff_wait_origin_count);
+  gates.add("start_handoff_wait_projection_count", g_start_handoff_wait_projection_count);
+  gates.add("start_handoff_commit_count", g_start_handoff_commit_count);
   gates.add("campaign_state", campaign_state == clocks_campaign_state_t::STARTED ? "STARTED" : "STOPPED");
   gates.add("warmup_active", campaign_warmup_active());
   gates.add("watchdog_anomaly_active", watchdog_anomaly_active);
@@ -4885,6 +4969,20 @@ static FLASHMEM Payload cmd_report_timebase_publish(const Payload&) {
   last.add("ocxo1_pps_residual_valid", g_timebase_last_ocxo1_pps_residual_valid);
   last.add("ocxo2_pps_residual_valid", g_timebase_last_ocxo2_pps_residual_valid);
   p.add_object("last", last);
+
+  Payload start_handoff;
+  start_handoff.add("ready", g_start_handoff_last_ready);
+  start_handoff.add("origin_ready", g_start_handoff_last_origin_ready);
+  start_handoff.add("ocxo1_projection_ready", g_start_handoff_last_ocxo1_projection_ready);
+  start_handoff.add("ocxo2_projection_ready", g_start_handoff_last_ocxo2_projection_ready);
+  start_handoff.add("raw_gnss_ns", g_start_handoff_last_raw_gnss_ns);
+  start_handoff.add("raw_ocxo1_ns", g_start_handoff_last_raw_ocxo1_ns);
+  start_handoff.add("raw_ocxo2_ns", g_start_handoff_last_raw_ocxo2_ns);
+  start_handoff.add("ocxo1_projected_ns", g_start_handoff_last_ocxo1_projected_ns);
+  start_handoff.add("ocxo2_projected_ns", g_start_handoff_last_ocxo2_projected_ns);
+  start_handoff.add("ocxo1_projection_vclock_ns", g_start_handoff_last_ocxo1_projection_vclock_ns);
+  start_handoff.add("ocxo2_projection_vclock_ns", g_start_handoff_last_ocxo2_projection_vclock_ns);
+  p.add_object("start_handoff", start_handoff);
 
   Payload gaps;
   gaps.add("candidate_minus_build_begin", (int64_t)g_timebase_candidate_count - (int64_t)g_timebase_build_begin_count);
