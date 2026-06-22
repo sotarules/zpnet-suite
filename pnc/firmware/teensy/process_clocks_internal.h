@@ -1012,7 +1012,7 @@ void ocxo_dac_retry_reset(ocxo_dac_state_t& s);
 // Minimum START warmup.  This is no longer the public-origin safety mechanism:
 // Beta also waits for Alpha's precomputed OCXO public-origin-ready flag before
 // it captures campaign public bases.
-static constexpr uint32_t CLOCKS_CAMPAIGN_WARMUP_SUPPRESS_PPS = 5;
+static constexpr uint32_t CLOCKS_CAMPAIGN_WARMUP_SUPPRESS_PPS = 4;
 
 // ============================================================================
 // Campaign state

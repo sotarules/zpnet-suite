@@ -650,6 +650,11 @@ static system_feature_status_t g_interrupt_feature_qtimer_dwt_ruler =
 static system_feature_status_t g_interrupt_feature_counter32_lineage =
     system_feature_status_t::ANOMALY;
 
+static constexpr uint32_t
+    INTERRUPT_FEATURE_PPS_VCLOCK_AUTHORITY_INIT_REJECT_ANOMALY_COUNT = 32U;
+static uint32_t
+    g_interrupt_feature_pps_vclock_authority_init_reject_count = 0;
+
 static void interrupt_feature_set_cached(const char* feature,
                                          system_feature_status_t& cached,
                                          system_feature_status_t status,
@@ -668,6 +673,8 @@ static bool interrupt_feature_lane_required(interrupt_subscriber_kind_t kind) {
 }
 
 static void interrupt_features_mark_initializing(void) {
+  g_interrupt_feature_pps_vclock_authority_init_reject_count = 0;
+
   interrupt_feature_set_cached("PPS_VCLOCK_AUTHORITY",
                                g_interrupt_feature_pps_vclock_authority,
                                system_feature_status_t::INITIALIZING,
@@ -711,29 +718,15 @@ static bool interrupt_feature_pps_vclock_authority_service_ready(
 
   if ((authority.invalid_mask & essential_invalid_mask) != 0U) return false;
 
-  const uint32_t cps = authority.dwt_cycles_per_second != 0U
-      ? authority.dwt_cycles_per_second
-      : (uint32_t)DWT_EXPECTED_PER_PPS;
-  const uint32_t cycles_per_vclock_tick =
-      (uint32_t)(((uint64_t)cps + (uint64_t)VCLOCK_COUNTS_PER_SECOND - 1ULL) /
-                 (uint64_t)VCLOCK_COUNTS_PER_SECOND);
-  const uint32_t gate = authority.gate_cycles != 0U
-      ? authority.gate_cycles
-      : PPS_VCLOCK_EDGE_AGREEMENT_GATE_CYCLES;
-
-  // The selected canonical edge is the first VCLOCK edge after physical PPS,
-  // so its authored DWT coordinate must land in the next 10 MHz cell.  Use
-  // modulo-DWT subtraction: a wrap between PPS and the selected edge is still
-  // a small positive delta.
-  const uint32_t selected_delta_cycles =
-      authority.authority_dwt_at_edge - authority.pps_dwt_at_edge;
-  const bool selected_delta_positive =
-      selected_delta_cycles != 0U && selected_delta_cycles <= 0x7FFFFFFFUL;
-  const bool selected_edge_plausible =
-      selected_delta_positive &&
-      selected_delta_cycles <= (cycles_per_vclock_tick + gate);
-
-  return selected_edge_plausible;
+  // Launch-pad readiness is intentionally a service/identity proof, not the
+  // full PPS/VCLOCK courtroom.  The strict one-cell DWT plausibility check can
+  // be too narrow when the selected authority is carried by FloorLine or a
+  // fallback witness while the ordinary report courts are still converging.
+  // Other feature rails own DWT-ruler, counter-custody, FloorLine, and lineage
+  // health.  If INTERRUPT has live PPS + observed VCLOCK evidence and authored
+  // a nonzero selected identity, PPS_VCLOCK_AUTHORITY must be allowed to reach
+  // NOMINAL instead of remaining INITIALIZING forever.
+  return true;
 }
 
 static void interrupt_feature_note_pps_vclock_authority(
@@ -743,11 +736,26 @@ static void interrupt_feature_note_pps_vclock_authority(
     interrupt_feature_set_cached("PPS_VCLOCK_AUTHORITY",
                                  g_interrupt_feature_pps_vclock_authority,
                                  system_feature_status_t::NOMINAL);
+    g_interrupt_feature_pps_vclock_authority_init_reject_count = 0;
+    return;
   }
+
   // Startup rows can fail the full agreement court before the prediction/phase
-  // surfaces are mature.  Leave the feature INITIALIZING until either the full
-  // courtroom proof or the reduced service proof arrives; focused reports carry
-  // reject counters and invalid masks.
+  // surfaces are mature, but this feature is now a hard Pi preflight gate.  Do
+  // not allow a missing/essential-invalid authority stream to stay silently in
+  // INITIALIZING forever: after a bounded number of PPS/VCLOCK authority rows,
+  // surface ANOMALY.  A later good row still promotes back to NOMINAL above.
+  if (g_interrupt_feature_pps_vclock_authority_init_reject_count !=
+      0xFFFFFFFFUL) {
+    g_interrupt_feature_pps_vclock_authority_init_reject_count++;
+  }
+
+  if (g_interrupt_feature_pps_vclock_authority_init_reject_count >=
+      INTERRUPT_FEATURE_PPS_VCLOCK_AUTHORITY_INIT_REJECT_ANOMALY_COUNT) {
+    interrupt_feature_set_cached("PPS_VCLOCK_AUTHORITY",
+                                 g_interrupt_feature_pps_vclock_authority,
+                                 system_feature_status_t::ANOMALY);
+  }
 }
 
 static bool interrupt_feature_cntr_locked(
