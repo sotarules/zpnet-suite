@@ -792,17 +792,34 @@ static void interrupt_feature_update_qtimer_counter_custody(void) {
                                : system_feature_status_t::INITIALIZING));
 }
 
+static bool interrupt_feature_dwt_interval_recovered(
+    const interrupt_integrity_qtimer_dwt_interval_check_t& s) {
+  // QTIMER_DWT_RULER is a launch-readiness scalar, not an eternal sin ledger.
+  // Historical post-lock excursions remain visible in REPORT_INTEGRITY, but a
+  // known catch-up/rebootstrap discontinuity should not hold preflight forever
+  // after the ruler has rebuilt its clean streak.
+  return s.locked && s.last_ok &&
+         s.consecutive_ok_count >= s.lock_streak_required;
+}
+
+static bool interrupt_feature_dwt_interval_active_anomaly(
+    const interrupt_integrity_qtimer_dwt_interval_check_t& s) {
+  // A locked rail is anomalous only while its most recent counted sample is
+  // bad.  Once clean samples resume, the feature returns to INITIALIZING until
+  // the same lock streak is rebuilt, then NOMINAL.
+  return s.locked && s.test_count != 0U && !s.last_ok;
+}
+
 static bool interrupt_feature_dwt_locked(
     const interrupt_integrity_qtimer_dwt_match_check_t& s) {
-  return s.one_second.locked && s.hz1k.locked &&
-         s.one_second.post_lock_mismatch_count == 0U &&
-         s.hz1k.post_lock_mismatch_count == 0U;
+  return interrupt_feature_dwt_interval_recovered(s.one_second) &&
+         interrupt_feature_dwt_interval_recovered(s.hz1k);
 }
 
 static bool interrupt_feature_dwt_anomaly(
     const interrupt_integrity_qtimer_dwt_match_check_t& s) {
-  return (s.one_second.locked && s.one_second.post_lock_mismatch_count != 0U) ||
-         (s.hz1k.locked && s.hz1k.post_lock_mismatch_count != 0U);
+  return interrupt_feature_dwt_interval_active_anomaly(s.one_second) ||
+         interrupt_feature_dwt_interval_active_anomaly(s.hz1k);
 }
 
 static void interrupt_feature_update_qtimer_dwt_ruler(void) {
@@ -10699,197 +10716,82 @@ static FLASHMEM void add_ocxo_lean_lane(Payload& p,
 
 }
 
-static FLASHMEM void add_payload_i64_string(Payload& p,
-                                             const char* key,
-                                             int64_t value) {
-  char buf[32];
-  snprintf(buf, sizeof(buf), "%lld", (long long)value);
-  p.add(key, buf);
-}
-
-static FLASHMEM void add_payload_u64_string(Payload& p,
-                                             const char* key,
-                                             uint64_t value) {
-  char buf[32];
-  snprintf(buf, sizeof(buf), "%llu", (unsigned long long)value);
-  p.add(key, buf);
-}
-
-static FLASHMEM void add_qtimer_cntr_integrity_object(
-    Payload& parent,
-    const char* name,
-    const interrupt_integrity_qtimer_cntr_match_check_t& q) {
-  Payload v;
-  v.add("valid", q.valid);
-  v.add("last_ok", q.last_ok);
-  v.add("test_count", q.test_count);
-  v.add("match_count", q.match_count);
-  v.add("mismatch_count", q.mismatch_count);
-  v.add("locked", q.locked);
-  v.add("lock_sequence", q.lock_sequence);
-  v.add("lock_count", q.lock_count);
-  v.add("lock_streak_required", q.lock_streak_required);
-  v.add("consecutive_ok_count", q.consecutive_ok_count);
-  v.add("prelock_match_count", q.prelock_match_count);
-  v.add("prelock_mismatch_count", q.prelock_mismatch_count);
-  v.add("post_lock_match_count", q.post_lock_match_count);
-  v.add("post_lock_mismatch_count", q.post_lock_mismatch_count);
-  v.add("first_mismatch_sequence", q.first_mismatch_sequence);
-  v.add("last_mismatch_sequence", q.last_mismatch_sequence);
-  v.add("last_mismatch_delta_signed_ticks",
-        q.last_mismatch_delta_signed_ticks);
-  v.add("last_mismatch_observed_minus_expected_offset_ticks",
-        q.last_mismatch_observed_minus_expected_offset_ticks);
-  v.add("sequence", q.sequence);
-  v.add("target_counter32", q.target_counter32);
-  v.add("expected_low16", (uint32_t)q.expected_low16);
-  v.add("ambient_low16", (uint32_t)q.ambient_low16);
-  v.add("expected_offset_ticks", q.expected_offset_ticks);
-  v.add("delta_mod65536_ticks", q.delta_mod65536_ticks);
-  v.add("delta_signed_ticks", q.delta_signed_ticks);
-  v.add("observed_minus_expected_offset_ticks",
-        q.observed_minus_expected_offset_ticks);
-  v.add("abs_delta_ticks", q.abs_delta_ticks);
-  v.add("isr_entry_dwt_raw", q.isr_entry_dwt_raw);
-  parent.add_object(name, v);
-}
-
-
-static FLASHMEM void add_qtimer_dwt_interval_object(
-    Payload& parent,
-    const char* name,
-    const interrupt_integrity_qtimer_dwt_interval_check_t& q) {
-  Payload v;
-  v.add("valid", q.valid);
-  v.add("previous_valid", q.previous_valid);
-  v.add("ruler_qualified", q.ruler_qualified);
-  v.add("ruler_wait_count", q.ruler_wait_count);
-  v.add("first_qualified_sequence", q.first_qualified_sequence);
-  v.add("ruler_qualification_count", q.ruler_qualification_count);
-  v.add("last_ok", q.last_ok);
-  v.add("test_count", q.test_count);
-  v.add("match_count", q.match_count);
-  v.add("mismatch_count", q.mismatch_count);
-  v.add("skipped_count", q.skipped_count);
-  v.add("too_short_count", q.too_short_count);
-  v.add("too_long_count", q.too_long_count);
-  v.add("locked", q.locked);
-  v.add("lock_sequence", q.lock_sequence);
-  v.add("lock_count", q.lock_count);
-  v.add("lock_streak_required", q.lock_streak_required);
-  v.add("consecutive_ok_count", q.consecutive_ok_count);
-  v.add("prelock_match_count", q.prelock_match_count);
-  v.add("prelock_mismatch_count", q.prelock_mismatch_count);
-  v.add("post_lock_match_count", q.post_lock_match_count);
-  v.add("post_lock_mismatch_count", q.post_lock_mismatch_count);
-  v.add("first_mismatch_sequence", q.first_mismatch_sequence);
-  v.add("last_mismatch_sequence", q.last_mismatch_sequence);
-  v.add("last_mismatch_error_cycles", q.last_mismatch_error_cycles);
-  v.add("last_mismatch_observed_cycles", q.last_mismatch_observed_cycles);
-  v.add("last_mismatch_expected_cycles", q.last_mismatch_expected_cycles);
-  v.add("sequence", q.sequence);
-  v.add("target_counter32", q.target_counter32);
-  v.add("dwt_at_match", q.dwt_at_match);
-  v.add("interval_previous_sequence", q.interval_previous_sequence);
-  v.add("interval_previous_target_counter32", q.interval_previous_target_counter32);
-  v.add("interval_previous_dwt_at_match", q.interval_previous_dwt_at_match);
-  v.add("target_delta_ticks", q.target_delta_ticks);
-  v.add("observed_cycles", q.observed_cycles);
-  v.add("expected_cycles", q.expected_cycles);
-  v.add("error_cycles", q.error_cycles);
-  v.add("abs_error_cycles", q.abs_error_cycles);
-  v.add("gate_cycles", q.gate_cycles);
-  parent.add_object(name, v);
-}
-
-static FLASHMEM void add_qtimer_dwt_integrity_object(
-    Payload& parent,
-    const char* name,
-    const interrupt_integrity_qtimer_dwt_match_check_t& q) {
-  Payload v;
-  v.add("valid", q.valid);
-  v.add("sequence", q.sequence);
-  v.add("target_counter32", q.target_counter32);
-  v.add("dwt_at_match", q.dwt_at_match);
-  v.add("one_second_boundary", q.one_second_boundary);
-  add_qtimer_dwt_interval_object(v, "hz1k", q.hz1k);
-  add_qtimer_dwt_interval_object(v, "one_second", q.one_second);
-  parent.add_object(name, v);
-}
-
 static FLASHMEM Payload cmd_report_integrity(const Payload&) {
+  // Ultra-lean integrity report.
+  // The old monolithic integrity report was too large for the command path.
+  // This surface reports only the launch-annunciator facts needed to diagnose
+  // QTIMER_DWT_RULER and related custody gates.
   interrupt_integrity_snapshot_t s{};
   const bool snapshot_valid = interrupt_integrity_snapshot(&s);
 
+  const interrupt_integrity_qtimer_dwt_interval_check_t& d1 =
+      s.vclock_qtimer_dwt.one_second;
+  const interrupt_integrity_qtimer_dwt_interval_check_t& dk =
+      s.vclock_qtimer_dwt.hz1k;
+  const interrupt_integrity_gnss_ns_check_t& g = s.vclock_gnss_ns;
+
   Payload p;
-  p.add("report", "INTERRUPT_INTEGRITY");
-  p.add("schema", "INTERRUPT_INTEGRITY_V1");
-  p.add("description",
-        "Passive VCLOCK GNSS, QuadTimer CNTR, and QuadTimer DWT integrity checks");
+  p.add("report", "INTERRUPT_INTEGRITY_MIN");
+  p.add("schema", "INTERRUPT_INTEGRITY_MIN_V1");
   p.add("valid", snapshot_valid);
   p.add("snapshot_count", s.snapshot_count);
-  p.add("active_checks", "vclock_gnss_ns qtimer_cntr_match qtimer_dwt_match");
-  p.add("inactive_checks", "vclock_pps_interval vclock_counter ocxo1_counter ocxo2_counter");
 
-  const interrupt_integrity_gnss_ns_check_t& g = s.vclock_gnss_ns;
-  Payload v;
-  v.add("valid", g.valid);
-  v.add("computed_valid", g.computed_valid);
-  v.add("last_ok", g.last_ok);
-  v.add("test_count", g.test_count);
-  v.add("match_count", g.match_count);
-  v.add("exact_match_count", g.exact_match_count);
-  v.add("mismatch_count", g.mismatch_count);
-  v.add("skipped_count", g.skipped_count);
-  add_payload_i64_string(v, "gate_ns", g.gate_ns);
-  v.add("sequence", g.sequence);
-  v.add("dwt_at_edge", g.dwt_at_edge);
-  v.add("counter32_at_edge", g.counter32_at_edge);
-  add_payload_i64_string(v, "computed_gnss_ns", g.computed_gnss_ns);
-  add_payload_i64_string(v, "expected_gnss_ns", g.expected_gnss_ns);
-  add_payload_i64_string(v, "error_ns", g.error_ns);
-  add_payload_i64_string(v, "anchor_sequence_delta",
-                         g.anchor_sequence_delta);
-  v.add("anchor_sequence_used", g.anchor_sequence_used);
-  v.add("anchor_age_slots", g.anchor_age_slots);
-  v.add("anchor_selection_kind", g.anchor_selection_kind);
-  v.add("anchor_dwt_at_edge", g.anchor_dwt_at_edge);
-  add_payload_i64_string(v, "anchor_gnss_ns_at_edge",
-                         g.anchor_gnss_ns_at_edge);
-  v.add("anchor_cps", g.anchor_cps);
-  add_payload_u64_string(v, "anchor_ns_delta", g.anchor_ns_delta);
-  v.add("anchor_failure_mask", g.anchor_failure_mask);
-  p.add_object("vclock_gnss_ns", v);
+  p.add("qtimer_dwt_feature_nominal",
+        g_interrupt_feature_qtimer_dwt_ruler == system_feature_status_t::NOMINAL);
+  p.add("qtimer_dwt_feature_initializing",
+        g_interrupt_feature_qtimer_dwt_ruler == system_feature_status_t::INITIALIZING);
+  p.add("qtimer_dwt_feature_anomaly",
+        g_interrupt_feature_qtimer_dwt_ruler == system_feature_status_t::ANOMALY);
+  p.add("qtimer_dwt_gate_cycles", QTIMER_DWT_MATCH_GATE_CYCLES);
 
-  Payload qtimer;
-  qtimer.add("description",
-             "Immediate priority-0 CNTR read must be exactly target+1 tick");
-  qtimer.add("expected_offset_ticks",
-             QTIMER_CNTR_MATCH_EXPECTED_OFFSET_TICKS);
-  qtimer.add("lock_streak_required", QTIMER_CNTR_MATCH_LOCK_STREAK);
-  add_qtimer_cntr_integrity_object(qtimer, "vclock",
-                                   s.vclock_qtimer_cntr);
-  add_qtimer_cntr_integrity_object(qtimer, "ocxo1",
-                                   s.ocxo1_qtimer_cntr);
-  add_qtimer_cntr_integrity_object(qtimer, "ocxo2",
-                                   s.ocxo2_qtimer_cntr);
-  p.add_object("qtimer_cntr_match", qtimer);
+  p.add("dwt_1s_locked", d1.locked);
+  p.add("dwt_1s_clean_streak", d1.consecutive_ok_count);
+  p.add("dwt_1s_recovery_required", d1.lock_streak_required);
+  p.add("dwt_1s_post_lock_mismatch", d1.post_lock_mismatch_count);
+  p.add("dwt_1s_last_mismatch_seq", d1.last_mismatch_sequence);
+  p.add("dwt_1s_last_mismatch_error", d1.last_mismatch_error_cycles);
+  p.add("dwt_1s_observed", d1.observed_cycles);
+  p.add("dwt_1s_expected", d1.expected_cycles);
+  p.add("dwt_1s_error", d1.error_cycles);
+  p.add("dwt_1s_test_count", d1.test_count);
+  p.add("dwt_1s_mismatch_count", d1.mismatch_count);
+  p.add("dwt_1s_too_short", d1.too_short_count);
+  p.add("dwt_1s_too_long", d1.too_long_count);
 
-  Payload qdwt;
-  qdwt.add("description",
-           "First-instruction DWT interval must match target interval within gate");
-  qdwt.add("gate_cycles", QTIMER_DWT_MATCH_GATE_CYCLES);
-  qdwt.add("hz1k_lock_streak_required", QTIMER_DWT_1KHZ_LOCK_STREAK);
-  qdwt.add("one_second_lock_streak_required", QTIMER_DWT_1S_LOCK_STREAK);
-  qdwt.add("hz1k_requires_one_second_lock",
-           QTIMER_DWT_1KHZ_REQUIRES_ONE_SECOND_LOCK);
-  add_qtimer_dwt_integrity_object(qdwt, "vclock",
-                                  s.vclock_qtimer_dwt);
-  add_qtimer_dwt_integrity_object(qdwt, "ocxo1",
-                                  s.ocxo1_qtimer_dwt);
-  add_qtimer_dwt_integrity_object(qdwt, "ocxo2",
-                                  s.ocxo2_qtimer_dwt);
-  p.add_object("qtimer_dwt_match", qdwt);
+  p.add("dwt_1k_locked", dk.locked);
+  p.add("dwt_1k_clean_streak", dk.consecutive_ok_count);
+  p.add("dwt_1k_recovery_required", dk.lock_streak_required);
+  p.add("dwt_1k_post_lock_mismatch", dk.post_lock_mismatch_count);
+  p.add("dwt_1k_last_mismatch_seq", dk.last_mismatch_sequence);
+  p.add("dwt_1k_last_mismatch_error", dk.last_mismatch_error_cycles);
+  p.add("dwt_1k_observed", dk.observed_cycles);
+  p.add("dwt_1k_expected", dk.expected_cycles);
+  p.add("dwt_1k_error", dk.error_cycles);
+  p.add("dwt_1k_test_count", dk.test_count);
+  p.add("dwt_1k_mismatch_count", dk.mismatch_count);
+  p.add("dwt_1k_too_short", dk.too_short_count);
+  p.add("dwt_1k_too_long", dk.too_long_count);
+
+  p.add("qtimer_counter_feature_nominal",
+        g_interrupt_feature_qtimer_counter_custody == system_feature_status_t::NOMINAL);
+  p.add("qtimer_counter_feature_anomaly",
+        g_interrupt_feature_qtimer_counter_custody == system_feature_status_t::ANOMALY);
+  p.add("cntr_vclock_locked", g_generation_gate_vclock.feature_custody_locked);
+  p.add("cntr_vclock_post_lock_reject",
+        g_generation_gate_vclock.feature_custody_post_lock_reject_count);
+  p.add("cntr_ocxo1_locked", g_generation_gate_ocxo1.feature_custody_locked);
+  p.add("cntr_ocxo1_post_lock_reject",
+        g_generation_gate_ocxo1.feature_custody_post_lock_reject_count);
+  p.add("cntr_ocxo2_locked", g_generation_gate_ocxo2.feature_custody_locked);
+  p.add("cntr_ocxo2_post_lock_reject",
+        g_generation_gate_ocxo2.feature_custody_post_lock_reject_count);
+
+  p.add("vclock_gnss_valid", g.valid);
+  p.add("vclock_gnss_computed", g.computed_valid);
+  p.add("vclock_gnss_last_ok", g.last_ok);
+  p.add("vclock_gnss_test_count", g.test_count);
+  p.add("vclock_gnss_mismatch_count", g.mismatch_count);
+  p.add("vclock_gnss_error_ns_i32", (int32_t)g.error_ns);
 
   return p;
 }

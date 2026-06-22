@@ -50,7 +50,7 @@ DAC_MIN_CODE = 0.0
 DAC_MAX_CODE = 65535.0
 
 FEATURE_POLL_INTERVAL_S = 5.0
-FEATURE_GRID_COLUMNS = 3
+FEATURE_GRID_COLUMNS = 4
 FEATURE_GRID_CELL_WIDTH = 39
 
 # Mission-control readiness board.  The feature payload remains scalar-only;
