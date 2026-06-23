@@ -939,14 +939,10 @@ def _feature_status_label(value) -> str:
 def feature_status_grid_lines() -> list[str]:
     features, error = _get_feature_status_payload()
 
-    title = f"FEATURES  MISSION CONTROL  poll={FEATURE_POLL_INTERVAL_S:.0f}s"
-    if error and features:
-        title += "  STALE"
-
-    lines = [title]
+    lines = []
 
     if error and not features:
-        lines.append(f"  UNAVAILABLE: {error}")
+        lines.append(f"UNAVAILABLE: {error}")
         lines.append("")
         return lines
 
@@ -957,13 +953,13 @@ def feature_status_grid_lines() -> list[str]:
     for row in range(0, len(cells), FEATURE_GRID_COLUMNS):
         chunk = cells[row:row + FEATURE_GRID_COLUMNS]
         lines.append(
-            "  " + "".join(
+            "".join(
                 f"{cell:<{FEATURE_GRID_CELL_WIDTH}}" for cell in chunk
             ).rstrip()
         )
 
     if error:
-        lines.append(f"  LAST POLL ERROR: {error[:120]}")
+        lines.append(f"LAST POLL ERROR: {error[:120]}")
 
     lines.append("")
     return lines
@@ -1405,26 +1401,21 @@ def clocks_combined_readout() -> list[str]:
         "dwt_at_pps_vclock",
         "dwt_cycle_count_at_pps",
     )
-    dwt_cycles_64 = _field(
-        r,
-        "dwt.cycle_count_total",
-        "dwt_cycle_count_total",
-    )
-    if any(v is not None for v in [dwt_actual, dwt_expected, dwt_at_anchor, dwt_cycles_64]):
+    counter32 = _field(r, "counter32_at_pps_vclock", "qtimer_at_pps")
+    if any(v is not None for v in [dwt_actual, dwt_expected, dwt_at_anchor, counter32]):
         dwt_label_w = 12
         dwt_num_w = 20
         edge_label_w = 11
         edge_num_w = 14
-        counter32 = _field(r, "counter32_at_pps_vclock", "qtimer_at_pps")
         lines.append(
             f"DWT   "
             f"{'EXPECTED:':>{dwt_label_w}} {_comma_int(dwt_expected, dwt_num_w)}"
-            f"    {'ACTUAL:':<{dwt_label_w}} {_comma_int(dwt_actual, dwt_num_w)}"
+            f"    {'':<{dwt_label_w}} {'':>{dwt_num_w}}"
             f"    {'DWT@PPS/V:':<{edge_label_w}} {_comma_int(dwt_at_anchor, edge_num_w)}"
         )
         lines.append(
             f"      "
-            f"{'DWT_CYCLES:':>{dwt_label_w}} {_comma_int(dwt_cycles_64, dwt_num_w)}"
+            f"{'ACTUAL:':>{dwt_label_w}} {_comma_int(dwt_actual, dwt_num_w)}"
             f"    {'':<{dwt_label_w}} {'':>{dwt_num_w}}"
             f"    {'CTR32:':<{edge_label_w}} {_comma_int(counter32, edge_num_w)}"
         )

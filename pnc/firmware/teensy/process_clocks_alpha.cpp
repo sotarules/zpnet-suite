@@ -415,12 +415,266 @@ servo_mode_t servo_mode_parse(const char* s) {
   return servo_mode_t::OFF;
 }
 
+// ============================================================================
+// OCXO DAC one-second fractional realization
+// ============================================================================
+//
+// The servo owns a real-valued DAC target.  The AD5693R hardware receives a
+// sparse adjacent-code realization of that target: at the start of each
+// one-second frame CLOCKS writes the high adjacent code for N milliseconds, then
+// writes the low adjacent code for the remainder of the frame.  Integer targets
+// collapse to one code and therefore do not toggle.
+//
+// This is intentionally TimePop/scheduled-context code, not process_interrupt
+// hot-path code.  It also never writes a code already present in dac_hw_code;
+// avoiding redundant I2C transactions is a hard reliability rule for this bus.
+
+static constexpr bool     OCXO_DAC_DITHER_ENABLED = true;
+static constexpr uint64_t OCXO_DAC_DITHER_FRAME_NS = 1000000000ULL;
+static constexpr uint64_t OCXO_DAC_DITHER_SLOT_NS = 1000000ULL;
+static constexpr uint16_t OCXO_DAC_DITHER_SLOTS_PER_FRAME = 1000U;
+static constexpr const char* OCXO_DAC_DITHER_FRAME_TIMER_NAME =
+    "clocks-dac-dither-frame";
+static constexpr const char* OCXO_DAC_DITHER_TRANSITION_TIMER_NAME =
+    "clocks-dac-dither-transition";
+
+static bool             g_ocxo_dac_dither_started = false;
+static timepop_handle_t g_ocxo_dac_dither_frame_handle = TIMEPOP_INVALID_HANDLE;
+static timepop_handle_t g_ocxo_dac_dither_transition_handle = TIMEPOP_INVALID_HANDLE;
+static uint16_t         g_ocxo_dac_dither_transition_ms = 0;
+static uint32_t         g_ocxo_dac_dither_global_frame_count = 0;
+static uint32_t         g_ocxo_dac_dither_global_schedule_failures = 0;
+
+static void ocxo_dac_dither_begin_frame(void);
+static void ocxo_dac_dither_schedule_next_transition(uint16_t after_ms);
+
+static bool ocxo_dac_dither_write_if_needed(ocxo_dac_state_t& s,
+                                            uint16_t hw_code,
+                                            bool latch_fault) {
+  if (hw_code == s.dac_hw_code) {
+    s.dither_skip_same_code_count++;
+    s.io_last_write_ok = true;
+    s.io_last_failure_stage = 0;
+    return true;
+  }
+
+  const bool ok = ocxo_dac_write_hw_code(s, hw_code, latch_fault);
+  if (ok) {
+    s.dither_write_count++;
+  } else {
+    s.dither_write_failure_count++;
+  }
+  return ok;
+}
+
+static void ocxo_dac_dither_program_lane(ocxo_dac_state_t& s) {
+  double target = s.dac_fractional;
+  if (target != target) {  // NaN guard; infinities are clamped below.
+    target = (double)AD5693R_DAC_DEFAULT;
+  }
+
+  const double clamped = ocxo_dac_clamp_real_value(target);
+  uint32_t low = (uint32_t)floor(clamped);
+  if (low > (uint32_t)OCXO_DAC_SAFE_MAX_HW_CODE) {
+    low = (uint32_t)OCXO_DAC_SAFE_MAX_HW_CODE;
+  }
+  if (low > s.dac_max) low = s.dac_max;
+  if (low < s.dac_min) low = s.dac_min;
+
+  uint32_t high = low;
+  if (high < (uint32_t)OCXO_DAC_SAFE_MAX_HW_CODE && high < s.dac_max) {
+    high++;
+  }
+
+  double frac = clamped - (double)low;
+  if (frac < 0.0) frac = 0.0;
+  if (frac > 1.0) frac = 1.0;
+
+  uint32_t high_ms = (uint32_t)(frac * (double)OCXO_DAC_DITHER_SLOTS_PER_FRAME + 0.5);
+
+  // If rounding says "high for the full second", promote the low/static code
+  // instead of scheduling a 1000 ms transition that can race the next frame.
+  if (high_ms >= (uint32_t)OCXO_DAC_DITHER_SLOTS_PER_FRAME) {
+    low = high;
+    high_ms = 0;
+  }
+
+  if (high == low || high_ms == 0U) {
+    high = low;
+    high_ms = 0;
+  }
+
+  s.dither_enabled = OCXO_DAC_DITHER_ENABLED;
+  s.dither_low_code = (uint16_t)low;
+  s.dither_high_code = (uint16_t)high;
+  s.dither_high_ms = (uint16_t)high_ms;
+  s.dither_last_frame_high_ms = (uint16_t)high_ms;
+  s.dither_active_this_frame = (high_ms > 0U && high != low);
+  s.dither_current_phase_high = s.dither_active_this_frame;
+  s.dither_program_dirty = false;
+  s.dither_frame_count++;
+}
+
+static void ocxo_dac_dither_start_lane_frame(ocxo_dac_state_t& s) {
+  ocxo_dac_dither_program_lane(s);
+
+  const uint16_t start_code =
+      s.dither_active_this_frame ? s.dither_high_code : s.dither_low_code;
+
+  (void)ocxo_dac_dither_write_if_needed(s, start_code, false);
+}
+
+static bool ocxo_dac_dither_lane_due(const ocxo_dac_state_t& s,
+                                     uint16_t due_ms) {
+  return s.dither_active_this_frame &&
+         s.dither_current_phase_high &&
+         s.dither_high_ms == due_ms;
+}
+
+static uint16_t ocxo_dac_dither_next_due_after(uint16_t after_ms) {
+  uint16_t due = OCXO_DAC_DITHER_SLOTS_PER_FRAME;
+
+  if (ocxo1_dac.dither_active_this_frame &&
+      ocxo1_dac.dither_current_phase_high &&
+      ocxo1_dac.dither_high_ms > after_ms &&
+      ocxo1_dac.dither_high_ms < due) {
+    due = ocxo1_dac.dither_high_ms;
+  }
+
+  if (ocxo2_dac.dither_active_this_frame &&
+      ocxo2_dac.dither_current_phase_high &&
+      ocxo2_dac.dither_high_ms > after_ms &&
+      ocxo2_dac.dither_high_ms < due) {
+    due = ocxo2_dac.dither_high_ms;
+  }
+
+  return due;
+}
+
+static void ocxo_dac_dither_cancel_transition(void) {
+  if (g_ocxo_dac_dither_transition_handle != TIMEPOP_INVALID_HANDLE) {
+    (void)timepop_cancel(g_ocxo_dac_dither_transition_handle);
+    g_ocxo_dac_dither_transition_handle = TIMEPOP_INVALID_HANDLE;
+  }
+  g_ocxo_dac_dither_transition_ms = 0;
+}
+
+static void ocxo_dac_dither_transition_callback(timepop_ctx_t*,
+                                                timepop_diag_t*,
+                                                void*) {
+  const uint16_t due_ms = g_ocxo_dac_dither_transition_ms;
+  g_ocxo_dac_dither_transition_handle = TIMEPOP_INVALID_HANDLE;
+  g_ocxo_dac_dither_transition_ms = 0;
+
+  if (!g_ocxo_dac_dither_started || !OCXO_DAC_DITHER_ENABLED) return;
+
+  if (ocxo_dac_dither_lane_due(ocxo1_dac, due_ms)) {
+    (void)ocxo_dac_dither_write_if_needed(ocxo1_dac,
+                                          ocxo1_dac.dither_low_code,
+                                          false);
+    ocxo1_dac.dither_current_phase_high = false;
+    ocxo1_dac.dither_transition_count++;
+  }
+
+  if (ocxo_dac_dither_lane_due(ocxo2_dac, due_ms)) {
+    (void)ocxo_dac_dither_write_if_needed(ocxo2_dac,
+                                          ocxo2_dac.dither_low_code,
+                                          false);
+    ocxo2_dac.dither_current_phase_high = false;
+    ocxo2_dac.dither_transition_count++;
+  }
+
+  ocxo_dac_dither_schedule_next_transition(due_ms);
+}
+
+static void ocxo_dac_dither_schedule_next_transition(uint16_t after_ms) {
+  ocxo_dac_dither_cancel_transition();
+
+  const uint16_t due = ocxo_dac_dither_next_due_after(after_ms);
+  if (due >= OCXO_DAC_DITHER_SLOTS_PER_FRAME) {
+    return;
+  }
+
+  const uint16_t delta_ms = (due > after_ms) ? (uint16_t)(due - after_ms) : 1U;
+  g_ocxo_dac_dither_transition_ms = due;
+  g_ocxo_dac_dither_transition_handle =
+      timepop_arm((uint64_t)delta_ms * OCXO_DAC_DITHER_SLOT_NS,
+                  false,
+                  ocxo_dac_dither_transition_callback,
+                  nullptr,
+                  OCXO_DAC_DITHER_TRANSITION_TIMER_NAME);
+
+  if (g_ocxo_dac_dither_transition_handle == TIMEPOP_INVALID_HANDLE) {
+    g_ocxo_dac_dither_transition_ms = 0;
+    g_ocxo_dac_dither_global_schedule_failures++;
+    ocxo1_dac.dither_schedule_failure_count++;
+    ocxo2_dac.dither_schedule_failure_count++;
+  }
+}
+
+static void ocxo_dac_dither_begin_frame(void) {
+  if (!g_ocxo_dac_dither_started || !OCXO_DAC_DITHER_ENABLED) return;
+
+  g_ocxo_dac_dither_global_frame_count++;
+  ocxo_dac_dither_cancel_transition();
+
+  ocxo_dac_dither_start_lane_frame(ocxo1_dac);
+  ocxo_dac_dither_start_lane_frame(ocxo2_dac);
+  ocxo_dac_dither_schedule_next_transition(0);
+}
+
+static void ocxo_dac_dither_frame_callback(timepop_ctx_t*,
+                                           timepop_diag_t*,
+                                           void*) {
+  ocxo_dac_dither_begin_frame();
+}
+
+static void ocxo_dac_dither_begin(void) {
+  if (!OCXO_DAC_DITHER_ENABLED || g_ocxo_dac_dither_started) return;
+
+  g_ocxo_dac_dither_started = true;
+  ocxo1_dac.dither_enabled = true;
+  ocxo2_dac.dither_enabled = true;
+
+  // Realize the current startup/default target immediately, then let the
+  // recurring TimePop frame maintain the one-second fractional duty cycle.
+  ocxo_dac_dither_begin_frame();
+
+  g_ocxo_dac_dither_frame_handle =
+      timepop_arm(OCXO_DAC_DITHER_FRAME_NS,
+                  true,
+                  ocxo_dac_dither_frame_callback,
+                  nullptr,
+                  OCXO_DAC_DITHER_FRAME_TIMER_NAME);
+
+  if (g_ocxo_dac_dither_frame_handle == TIMEPOP_INVALID_HANDLE) {
+    ocxo_dac_dither_cancel_transition();
+    g_ocxo_dac_dither_started = false;
+    g_ocxo_dac_dither_global_schedule_failures++;
+    ocxo1_dac.dither_schedule_failure_count++;
+    ocxo2_dac.dither_schedule_failure_count++;
+  }
+}
+
 bool ocxo_dac_set_desired(ocxo_dac_state_t& s, double value) {
   const double target = ocxo_dac_clamp_real_value(value);
   const uint16_t hw_code = ocxo_dac_rounded_hw_code_from_value(target);
 
   s.dac_fractional = target;
-  return ocxo_dac_write_hw_code(s, hw_code, true);
+  s.dither_program_dirty = true;
+
+  // Before TimePop starts the always-on realization engine, preserve the old
+  // static write semantics so boot/default DAC authoring remains immediate.
+  if (!g_ocxo_dac_dither_started || !OCXO_DAC_DITHER_ENABLED) {
+    return ocxo_dac_write_hw_code(s, hw_code, true);
+  }
+
+  // Once dithering is running, the next one-second frame will realize the new
+  // fractional target.  Do not issue an extra I2C write here; sparse hardware
+  // traffic is the entire point of this realization layer.
+  s.io_last_write_ok = true;
+  s.io_last_failure_stage = 0;
+  return true;
 }
 
 bool ocxo_dac_set(ocxo_dac_state_t& s, double value) {
@@ -5386,6 +5640,11 @@ void process_clocks_init(void) {
     ocxo1_dac.io_last_failure_stage = 0;
     ocxo2_dac.io_last_failure_stage = 0;
   }
+
+  // TimePop is initialized before process_clocks_init(); keep fractional DAC
+  // realization in scheduled context and out of process_interrupt.
+  ocxo_dac_dither_begin();
+
   pinMode(GNSS_LOCK_PIN, INPUT);
 
   subscribe_clock(interrupt_subscriber_kind_t::VCLOCK, vclock_callback);

@@ -2416,22 +2416,22 @@ static void payload_add_servo_input_diag(Payload& lane,
 }
 
 // ============================================================================
-// Static rounded OCXO DAC realization
+// One-second fractional OCXO DAC realization
 // ============================================================================
 //
-// The DAC control surface may retain a real-valued target because the servo and
+// The DAC control surface retains a real-valued target because the servo and
 // Pi persistence model work naturally in fractional LSBs.  Hardware realization
-// is deliberately simpler and stricter: every target is rounded to the nearest
-// AD5693R integer code and written as a single static value.  There is no
-// fractional-code modulation engine, no recurring TimePop callback, and no
-// adjacent-code streaming path.
+// is deliberately sparse: CLOCKS uses an always-on TimePop frame to write the
+// high adjacent integer code for N milliseconds, then the low adjacent code for
+// the rest of the second.  Integer targets collapse to a single code and never
+// toggle.
 //
 // The AD5693R is now configured for internal 2.5 V reference with 2× gain.
 // External VREF is not part of the OCXO DAC authority path.  Because that
 // yields an approximate 0..5 V span, CLOCKS hard-clamps all DAC intent to the
 // 3.3 V equivalent code before any hardware write can occur.
 
-static constexpr const char* OCXO_DAC_REALIZATION_MODE = "STATIC_ROUNDED";
+static constexpr const char* OCXO_DAC_REALIZATION_MODE = "ONE_SECOND_FRACTIONAL_DITHER";
 static constexpr const char* OCXO_DAC_REFERENCE_MODE = "INTERNAL_VREF_2X";
 
 static void payload_add_dac_realization_object(Payload& parent,
@@ -2449,13 +2449,26 @@ static void payload_add_dac_realization_object(Payload& parent,
   r.add("fractional_target", s.dac_fractional, 6);
   r.add("fractional_target_voltage",
         ocxo_dac_voltage_from_code(s.dac_fractional), 6);
-  r.add("rounded_hw_code", (uint32_t)s.dac_hw_code);
-  r.add("rounded_hw_voltage",
+  r.add("current_hw_code", (uint32_t)s.dac_hw_code);
+  r.add("current_hw_voltage",
         ocxo_dac_voltage_from_code((double)s.dac_hw_code), 6);
+  r.add("low_code", (uint32_t)s.dither_low_code);
+  r.add("high_code", (uint32_t)s.dither_high_code);
+  r.add("high_ms", (uint32_t)s.dither_high_ms);
+  r.add("low_ms", (uint32_t)(1000U - s.dither_high_ms));
+  r.add("active_this_frame", s.dither_active_this_frame);
+  r.add("current_phase_high", s.dither_current_phase_high);
+  r.add("program_dirty", s.dither_program_dirty);
+  r.add("frame_count", s.dither_frame_count);
+  r.add("transition_count", s.dither_transition_count);
+  r.add("write_count", s.dither_write_count);
+  r.add("write_failure_count", s.dither_write_failure_count);
+  r.add("skip_same_code_count", s.dither_skip_same_code_count);
+  r.add("schedule_failure_count", s.dither_schedule_failure_count);
   r.add("safe_ceiling_active", true);
-  r.add("static_rounded_only", true);
-  r.add("fractional_stream_possible", false);
-  r.add("recurring_timer_possible", false);
+  r.add("static_rounded_only", false);
+  r.add("fractional_stream_possible", true);
+  r.add("recurring_timer_possible", true);
   parent.add_object(key, r);
 }
 
@@ -2957,9 +2970,9 @@ static void payload_add_servo_dac_values(Payload& parent) {
   dac.add("external_vref_used", false);
   dac.add("safe_max_output_voltage", OCXO_DAC_SAFE_MAX_OUTPUT_VOLTAGE, 6);
   dac.add("safe_max_hw_code", (uint32_t)OCXO_DAC_SAFE_MAX_HW_CODE);
-  dac.add("static_rounded_only", true);
-  dac.add("fractional_stream_possible", false);
-  dac.add("recurring_timer_possible", false);
+  dac.add("static_rounded_only", false);
+  dac.add("fractional_stream_possible", true);
+  dac.add("recurring_timer_possible", true);
 
   Payload realization;
   payload_add_dac_realization_object(realization, "ocxo1", ocxo1_dac);
@@ -4433,6 +4446,10 @@ static void add_dac_payload(Payload& p) {
          ocxo_dac_voltage_from_code((double)ocxo1_dac.dac_hw_code), 6);
   o1.add("dac_fractional_voltage",
          ocxo_dac_voltage_from_code(ocxo1_dac.dac_fractional), 6);
+  o1.add("dither_low_code", (uint32_t)ocxo1_dac.dither_low_code);
+  o1.add("dither_high_code", (uint32_t)ocxo1_dac.dither_high_code);
+  o1.add("dither_high_ms", (uint32_t)ocxo1_dac.dither_high_ms);
+  o1.add("dither_active_this_frame", ocxo1_dac.dither_active_this_frame);
   o1.add("dac_min", ocxo1_dac.dac_min);
   o1.add("dac_max", ocxo1_dac.dac_max);
   o1.add("servo_last_step", ocxo1_dac.servo_last_step, 6);
@@ -4474,6 +4491,10 @@ static void add_dac_payload(Payload& p) {
          ocxo_dac_voltage_from_code((double)ocxo2_dac.dac_hw_code), 6);
   o2.add("dac_fractional_voltage",
          ocxo_dac_voltage_from_code(ocxo2_dac.dac_fractional), 6);
+  o2.add("dither_low_code", (uint32_t)ocxo2_dac.dither_low_code);
+  o2.add("dither_high_code", (uint32_t)ocxo2_dac.dither_high_code);
+  o2.add("dither_high_ms", (uint32_t)ocxo2_dac.dither_high_ms);
+  o2.add("dither_active_this_frame", ocxo2_dac.dither_active_this_frame);
   o2.add("dac_min", ocxo2_dac.dac_min);
   o2.add("dac_max", ocxo2_dac.dac_max);
   o2.add("servo_last_step", ocxo2_dac.servo_last_step, 6);
