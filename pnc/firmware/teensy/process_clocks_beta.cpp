@@ -1403,24 +1403,63 @@ static void payload_add_frequency_fields(Payload& obj, double ppb_value) {
   obj.add("ppb", ppb_value, 3);
 }
 
+static double campaign_total_tau_from_ratio(uint64_t reference_value,
+                                            uint64_t clock_value) {
+  if (reference_value == 0ULL) return 1.0;
+  return (double)clock_value / (double)reference_value;
+}
+
+static double campaign_total_ppb_from_tau(double tau) {
+  return (tau - 1.0) * 1.0e9;
+}
+
+static double campaign_total_ppb_from_ratio(uint64_t reference_value,
+                                            uint64_t clock_value) {
+  return campaign_total_ppb_from_tau(
+      campaign_total_tau_from_ratio(reference_value, clock_value));
+}
+
+static double campaign_total_dwt_ppb(uint64_t public_gnss_ns,
+                                     uint64_t public_dwt_total_cycles) {
+  const uint64_t expected_cycles = dwt_ns_to_cycles(public_gnss_ns);
+  if (expected_cycles == 0ULL) return 0.0;
+  return campaign_total_ppb_from_ratio(expected_cycles,
+                                       public_dwt_total_cycles);
+}
+
 static void payload_add_stats_clock(Payload& parent,
                                     const char* key,
                                     const welford_t& w,
-                                    bool include_frequency) {
+                                    bool include_frequency,
+                                    double campaign_ppb = 0.0) {
   Payload obj;
   payload_add_welford_object(obj, "welford", w);
   if (include_frequency) {
-    payload_add_frequency_fields(obj, w.mean);
+    // Frequency fields are campaign-total ratios.  The Welford object remains
+    // the per-second residual statistics surface.  Do not publish w.mean as
+    // tau/ppb: that makes TAU/PPB indistinguishable from MEAN and hides the
+    // accumulated campaign clock/GNSS ratio.
+    payload_add_frequency_fields(obj, campaign_ppb);
   }
   parent.add_object(key, obj);
 }
 
-static void payload_add_stats_summary_hierarchical(Payload& p) {
+static void payload_add_stats_summary_hierarchical(Payload& p,
+                                                   uint64_t public_gnss_ns,
+                                                   uint64_t public_dwt_total,
+                                                   uint64_t public_ocxo1_ns,
+                                                   uint64_t public_ocxo2_ns) {
   Payload stats;
-  payload_add_stats_clock(stats, "dwt", welford_dwt, true);
-  payload_add_stats_clock(stats, "vclock", welford_vclock, true);
-  payload_add_stats_clock(stats, "ocxo1", welford_ocxo1, true);
-  payload_add_stats_clock(stats, "ocxo2", welford_ocxo2, true);
+  payload_add_stats_clock(stats, "dwt", welford_dwt, true,
+                          campaign_total_dwt_ppb(public_gnss_ns,
+                                                 public_dwt_total));
+  payload_add_stats_clock(stats, "vclock", welford_vclock, true, 0.0);
+  payload_add_stats_clock(stats, "ocxo1", welford_ocxo1, true,
+                          campaign_total_ppb_from_ratio(public_gnss_ns,
+                                                        public_ocxo1_ns));
+  payload_add_stats_clock(stats, "ocxo2", welford_ocxo2, true,
+                          campaign_total_ppb_from_ratio(public_gnss_ns,
+                                                        public_ocxo2_ns));
   payload_add_stats_clock(stats, "pps_witness", welford_pps_witness, false);
 
   Payload dac;
@@ -3540,7 +3579,11 @@ void clocks_beta_pps(void) {
                               pps_residuals.ocxo2_fast_residual_ns);
 
     timebase_build_stage(TIMEBASE_BUILD_STAGE_STATS);
-    payload_add_stats_summary_hierarchical(p);
+    payload_add_stats_summary_hierarchical(p,
+                                           public_gnss_ns,
+                                           public_dwt_total,
+                                           public_ocxo1_ns,
+                                           public_ocxo2_ns);
 
     // System DAC persistence feed.  The Pi should update the simplified
     // system config only while the servo is actively tuning; manual/static DAC
@@ -5628,10 +5671,19 @@ static FLASHMEM Payload cmd_report_stats(const Payload&) {
   publish_welford(p, "pps_witness",  welford_pps_witness);
   publish_welford(p, "ocxo1_dac",    welford_ocxo1_dac);
   publish_welford(p, "ocxo2_dac",    welford_ocxo2_dac);
-  publish_freq(p, "dwt",    welford_dwt.mean);
-  publish_freq(p, "vclock", welford_vclock.mean);
-  publish_freq(p, "ocxo1",  welford_ocxo1.mean);
-  publish_freq(p, "ocxo2",  welford_ocxo2.mean);
+
+  const uint64_t public_gnss_ns = campaign_public_gnss_ns();
+  publish_freq(p, "dwt",
+               campaign_total_dwt_ppb(public_gnss_ns,
+                                      campaign_public_dwt_total()));
+  publish_freq(p, "vclock", 0.0);
+  publish_freq(p, "ocxo1",
+               campaign_total_ppb_from_ratio(public_gnss_ns,
+                                             campaign_public_ocxo1_ns()));
+  publish_freq(p, "ocxo2",
+               campaign_total_ppb_from_ratio(public_gnss_ns,
+                                             campaign_public_ocxo2_ns()));
+  p.add("frequency_source", "CAMPAIGN_TOTAL_RATIO");
   return p;
 }
 
