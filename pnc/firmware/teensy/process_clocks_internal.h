@@ -878,9 +878,38 @@ struct ocxo_dac_state_t {
   uint32_t dac_min;
   uint32_t dac_max;
 
-  // Fractional DAC authority.  The servo and Pi control plane retain a
-  // real-valued target; CLOCKS realizes that target as a once-per-second
-  // adjacent-code duty cycle so the AD5693R sees only sparse, bounded writes.
+  // DAC authority.  The servo and Pi control plane keep a real-valued target.
+  // When dither is disabled, the AD5693R receives one static rounded integer
+  // code.  When dither is enabled, a foreground-serviced one-second realization
+  // alternates adjacent integer codes without performing I2C from TimePop's
+  // timed callback path.
+  bool     dither_enabled;
+  bool     dither_active_this_frame;
+  bool     dither_current_phase_high;
+  bool     dither_program_dirty;
+
+  uint16_t dither_low_code;
+  uint16_t dither_high_code;
+  uint16_t dither_high_ms;
+  uint16_t dither_last_frame_high_ms;
+
+  bool     dither_pending_hw_write;
+  uint16_t dither_pending_hw_code;
+  uint32_t dither_pending_request_count;
+  uint32_t dither_pending_overwrite_count;
+
+  uint32_t dither_frame_count;
+  uint32_t dither_transition_count;
+  uint32_t dither_write_count;
+  uint32_t dither_write_failure_count;
+  uint32_t dither_skip_same_code_count;
+  uint32_t dither_schedule_failure_count;
+
+  uint32_t dither_service_count;
+  uint32_t dither_service_write_count;
+  uint32_t dither_service_skip_same_count;
+  uint32_t dither_service_defer_count;
+
   double   servo_last_step;
   double   servo_last_residual;
   uint32_t servo_settle_count;
@@ -904,25 +933,6 @@ struct ocxo_dac_state_t {
   uint32_t pacing_deferred_count;
   uint32_t pacing_commit_count;
   uint32_t pacing_skip_small_delta_count;
-
-  // One-second fractional realization.  The target DAC value is represented
-  // as high_code for high_ms milliseconds, then low_code for the rest of the
-  // one-second frame.  Integer targets collapse to low_code == high_code and
-  // produce no mid-frame transition.
-  bool     dither_enabled;
-  bool     dither_active_this_frame;
-  bool     dither_current_phase_high;
-  bool     dither_program_dirty;
-  uint16_t dither_low_code;
-  uint16_t dither_high_code;
-  uint16_t dither_high_ms;
-  uint16_t dither_last_frame_high_ms;
-  uint32_t dither_frame_count;
-  uint32_t dither_transition_count;
-  uint32_t dither_write_count;
-  uint32_t dither_write_failure_count;
-  uint32_t dither_skip_same_code_count;
-  uint32_t dither_schedule_failure_count;
 
   bool     io_last_write_ok;
   bool     io_fault_latched;
@@ -1012,6 +1022,17 @@ void ocxo_dac_predictor_reset(ocxo_dac_state_t& s);
 void ocxo_dac_io_reset(ocxo_dac_state_t& s);
 void ocxo_dac_retry_reset(ocxo_dac_state_t& s);
 
+bool clocks_ocxo_dac_dither_enable(void);
+bool clocks_ocxo_dac_dither_disable(void);
+bool clocks_ocxo_dac_dither_operator_enabled(void);
+bool clocks_ocxo_dac_dither_started(void);
+bool clocks_ocxo_dac_dither_service_pending(void);
+uint32_t clocks_ocxo_dac_dither_global_frame_count(void);
+uint32_t clocks_ocxo_dac_dither_global_schedule_failures(void);
+uint32_t clocks_ocxo_dac_dither_service_arm_count(void);
+uint32_t clocks_ocxo_dac_dither_service_arm_failures(void);
+const char* clocks_ocxo_dac_dither_context(void);
+
 // ============================================================================
 // Campaign warmup suppression
 // ============================================================================
@@ -1031,7 +1052,7 @@ void ocxo_dac_retry_reset(ocxo_dac_state_t& s);
 // Minimum START warmup.  This is no longer the public-origin safety mechanism:
 // Beta also waits for Alpha's precomputed OCXO public-origin-ready flag before
 // it captures campaign public bases.
-static constexpr uint32_t CLOCKS_CAMPAIGN_WARMUP_SUPPRESS_PPS = 4;
+static constexpr uint32_t CLOCKS_CAMPAIGN_WARMUP_SUPPRESS_PPS = 5;
 
 // ============================================================================
 // Campaign state

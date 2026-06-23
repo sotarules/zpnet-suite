@@ -35,11 +35,6 @@
 //     ocxo2_tau,  ocxo2_ppb
 //
 //   Sign convention is uniform:  positive ppb → clock RUNNING FAST.
-//   The published tau/ppb pairs are campaign-total ratios, not Welford
-//   means.  Welford mean/SD/SE remain the residual-statistical surface;
-//   tau/ppb report the cumulative public clock ledger divided by the GNSS
-//   campaign ledger (DWT uses total cycles divided by nominal campaign
-//   cycles).
 //
 // Unified Welford:
 //
@@ -1262,31 +1257,8 @@ static void payload_add_welford_object(Payload& parent,
   parent.add_object(key, obj);
 }
 
-static double campaign_total_ppb_from_tau(double tau_value) {
-  return (tau_value - 1.0) * 1.0e9;
-}
-
-static double campaign_total_tau_from_ns(uint64_t reference_ns,
-                                         uint64_t clock_ns) {
-  if (reference_ns == 0ULL) return 1.0;
-  return (double)clock_ns / (double)reference_ns;
-}
-
-static double campaign_total_tau_from_dwt(uint64_t reference_ns,
-                                          uint64_t dwt_cycles) {
-  if (reference_ns == 0ULL) return 1.0;
-
-  const double reference_seconds =
-      (double)reference_ns / 1000000000.0;
-  const double expected_cycles =
-      reference_seconds * (double)DWT_EXPECTED_PER_PPS;
-  if (expected_cycles <= 0.0) return 1.0;
-
-  return (double)dwt_cycles / expected_cycles;
-}
-
-static void payload_add_frequency_fields(Payload& obj, double tau_value) {
-  const double ppb_value = campaign_total_ppb_from_tau(tau_value);
+static void payload_add_frequency_fields(Payload& obj, double ppb_value) {
+  const double tau_value = 1.0 + ppb_value / 1e9;
   obj.add("tau", tau_value, 12);
   obj.add("ppb", ppb_value, 3);
 }
@@ -1294,36 +1266,22 @@ static void payload_add_frequency_fields(Payload& obj, double tau_value) {
 static void payload_add_stats_clock(Payload& parent,
                                     const char* key,
                                     const welford_t& w,
-                                    bool include_frequency,
-                                    double tau_value) {
+                                    bool include_frequency) {
   Payload obj;
   payload_add_welford_object(obj, "welford", w);
   if (include_frequency) {
-    payload_add_frequency_fields(obj, tau_value);
+    payload_add_frequency_fields(obj, w.mean);
   }
   parent.add_object(key, obj);
 }
 
-static void payload_add_stats_summary_hierarchical(Payload& p,
-                                                   uint64_t public_gnss_ns,
-                                                   uint64_t public_dwt_total,
-                                                   uint64_t public_ocxo1_ns,
-                                                   uint64_t public_ocxo2_ns) {
+static void payload_add_stats_summary_hierarchical(Payload& p) {
   Payload stats;
-  payload_add_stats_clock(stats, "dwt", welford_dwt, true,
-                          campaign_total_tau_from_dwt(public_gnss_ns,
-                                                      public_dwt_total));
-  payload_add_stats_clock(stats, "vclock", welford_vclock, true,
-                          campaign_total_tau_from_ns(public_gnss_ns,
-                                                     public_gnss_ns));
-  payload_add_stats_clock(stats, "ocxo1", welford_ocxo1, true,
-                          campaign_total_tau_from_ns(public_gnss_ns,
-                                                     public_ocxo1_ns));
-  payload_add_stats_clock(stats, "ocxo2", welford_ocxo2, true,
-                          campaign_total_tau_from_ns(public_gnss_ns,
-                                                     public_ocxo2_ns));
-  payload_add_stats_clock(stats, "pps_witness", welford_pps_witness, false,
-                          1.0);
+  payload_add_stats_clock(stats, "dwt", welford_dwt, true);
+  payload_add_stats_clock(stats, "vclock", welford_vclock, true);
+  payload_add_stats_clock(stats, "ocxo1", welford_ocxo1, true);
+  payload_add_stats_clock(stats, "ocxo2", welford_ocxo2, true);
+  payload_add_stats_clock(stats, "pps_witness", welford_pps_witness, false);
 
   Payload dac;
   payload_add_welford_object(dac, "ocxo1", welford_ocxo1_dac);
@@ -2416,29 +2374,35 @@ static void payload_add_servo_input_diag(Payload& lane,
 }
 
 // ============================================================================
-// One-second fractional OCXO DAC realization
+// Operator-gated OCXO DAC realization report
 // ============================================================================
 //
-// The DAC control surface retains a real-valued target because the servo and
-// Pi persistence model work naturally in fractional LSBs.  Hardware realization
-// is deliberately sparse: CLOCKS uses an always-on TimePop frame to write the
-// high adjacent integer code for N milliseconds, then the low adjacent code for
-// the rest of the second.  Integer targets collapse to a single code and never
-// toggle.
-//
-// The AD5693R is now configured for internal 2.5 V reference with 2× gain.
-// External VREF is not part of the OCXO DAC authority path.  Because that
-// yields an approximate 0..5 V span, CLOCKS hard-clamps all DAC intent to the
-// 3.3 V equivalent code before any hardware write can occur.
+// Disabled/boot default: static rounded integer DAC authority.
+// Enabled by command: one-second fractional dither, with TimePop timed
+// callbacks only latching desired phase/code and foreground ALAP service doing
+// any hardware writes.
 
-static constexpr const char* OCXO_DAC_REALIZATION_MODE = "ONE_SECOND_FRACTIONAL_DITHER";
 static constexpr const char* OCXO_DAC_REFERENCE_MODE = "INTERNAL_VREF_2X";
+
+static const char* ocxo_dac_realization_mode_runtime(void) {
+  return clocks_ocxo_dac_dither_operator_enabled()
+      ? "ONE_SECOND_FRACTIONAL_DITHER"
+      : "STATIC_ROUNDED";
+}
+
+static bool ocxo_dac_fractional_stream_possible_runtime(void) {
+  return clocks_ocxo_dac_dither_operator_enabled();
+}
+
+static bool ocxo_dac_static_rounded_only_runtime(void) {
+  return !clocks_ocxo_dac_dither_operator_enabled();
+}
 
 static void payload_add_dac_realization_object(Payload& parent,
                                                const char* key,
                                                const ocxo_dac_state_t& s) {
   Payload r;
-  r.add("mode", OCXO_DAC_REALIZATION_MODE);
+  r.add("mode", ocxo_dac_realization_mode_runtime());
   r.add("reference_mode", OCXO_DAC_REFERENCE_MODE);
   r.add("external_vref_used", false);
   r.add("internal_ref_voltage", OCXO_DAC_INTERNAL_REF_VOLTAGE, 6);
@@ -2452,6 +2416,23 @@ static void payload_add_dac_realization_object(Payload& parent,
   r.add("current_hw_code", (uint32_t)s.dac_hw_code);
   r.add("current_hw_voltage",
         ocxo_dac_voltage_from_code((double)s.dac_hw_code), 6);
+  r.add("rounded_hw_code",
+        (uint32_t)ocxo_dac_rounded_hw_code_from_value(s.dac_fractional));
+  r.add("rounded_hw_voltage",
+        ocxo_dac_voltage_from_code(
+            (double)ocxo_dac_rounded_hw_code_from_value(s.dac_fractional)),
+        6);
+
+  r.add("safe_ceiling_active", true);
+  r.add("static_rounded_only", ocxo_dac_static_rounded_only_runtime());
+  r.add("fractional_stream_possible",
+        ocxo_dac_fractional_stream_possible_runtime());
+  r.add("recurring_timer_possible", clocks_ocxo_dac_dither_started());
+  r.add("operator_enabled", clocks_ocxo_dac_dither_operator_enabled());
+  r.add("started", clocks_ocxo_dac_dither_started());
+  r.add("service_pending", clocks_ocxo_dac_dither_service_pending());
+  r.add("write_context", clocks_ocxo_dac_dither_context());
+
   r.add("low_code", (uint32_t)s.dither_low_code);
   r.add("high_code", (uint32_t)s.dither_high_code);
   r.add("high_ms", (uint32_t)s.dither_high_ms);
@@ -2459,16 +2440,24 @@ static void payload_add_dac_realization_object(Payload& parent,
   r.add("active_this_frame", s.dither_active_this_frame);
   r.add("current_phase_high", s.dither_current_phase_high);
   r.add("program_dirty", s.dither_program_dirty);
+
+  r.add("pending_hw_write", s.dither_pending_hw_write);
+  r.add("pending_hw_code", (uint32_t)s.dither_pending_hw_code);
+  r.add("pending_request_count", s.dither_pending_request_count);
+  r.add("pending_overwrite_count", s.dither_pending_overwrite_count);
+
   r.add("frame_count", s.dither_frame_count);
   r.add("transition_count", s.dither_transition_count);
   r.add("write_count", s.dither_write_count);
   r.add("write_failure_count", s.dither_write_failure_count);
   r.add("skip_same_code_count", s.dither_skip_same_code_count);
   r.add("schedule_failure_count", s.dither_schedule_failure_count);
-  r.add("safe_ceiling_active", true);
-  r.add("static_rounded_only", false);
-  r.add("fractional_stream_possible", true);
-  r.add("recurring_timer_possible", true);
+
+  r.add("service_count", s.dither_service_count);
+  r.add("service_write_count", s.dither_service_write_count);
+  r.add("service_skip_same_count", s.dither_service_skip_same_count);
+  r.add("service_defer_count", s.dither_service_defer_count);
+
   parent.add_object(key, r);
 }
 
@@ -2965,20 +2954,90 @@ static void payload_add_servo_dac_values(Payload& parent) {
           ocxo_dac_voltage_from_code((double)ocxo1_dac.dac_hw_code), 6);
   dac.add("ocxo2_voltage",
           ocxo_dac_voltage_from_code((double)ocxo2_dac.dac_hw_code), 6);
-  dac.add("realization_mode", OCXO_DAC_REALIZATION_MODE);
+  dac.add("realization_mode", ocxo_dac_realization_mode_runtime());
   dac.add("reference_mode", OCXO_DAC_REFERENCE_MODE);
   dac.add("external_vref_used", false);
   dac.add("safe_max_output_voltage", OCXO_DAC_SAFE_MAX_OUTPUT_VOLTAGE, 6);
   dac.add("safe_max_hw_code", (uint32_t)OCXO_DAC_SAFE_MAX_HW_CODE);
-  dac.add("static_rounded_only", false);
-  dac.add("fractional_stream_possible", true);
-  dac.add("recurring_timer_possible", true);
+  dac.add("static_rounded_only", ocxo_dac_static_rounded_only_runtime());
+  dac.add("fractional_stream_possible", ocxo_dac_fractional_stream_possible_runtime());
+  dac.add("recurring_timer_possible", clocks_ocxo_dac_dither_started());
+  dac.add("dither_operator_enabled", clocks_ocxo_dac_dither_operator_enabled());
+  dac.add("dither_service_pending", clocks_ocxo_dac_dither_service_pending());
 
   Payload realization;
   payload_add_dac_realization_object(realization, "ocxo1", ocxo1_dac);
   payload_add_dac_realization_object(realization, "ocxo2", ocxo2_dac);
   dac.add_object("realization", realization);
   parent.add_object("dac", dac);
+}
+
+// ----------------------------------------------------------------------------
+// CLOCKS_DAC_TICK — minimal 1 Hz DAC/servo dashboard feed
+// ----------------------------------------------------------------------------
+//
+// REPORT_DAC is the courtroom report.  This publication is intentionally tiny:
+// just enough for dashboard rows, manual DAC controls, and servo/dither status.
+
+static void payload_add_dac_tick_lane(Payload& parent,
+                                      const char* key,
+                                      const ocxo_dac_state_t& dac,
+                                      const servo_input_diag_t& input) {
+  Payload lane;
+
+  // Dashboard/manual-control essentials.
+  lane.add("dac", dac.dac_fractional, 6);
+  lane.add("hw", (uint32_t)dac.dac_hw_code);
+  lane.add("v", ocxo_dac_voltage_from_code((double)dac.dac_hw_code), 6);
+  lane.add("ok", dac.io_last_write_ok &&
+                 !dac.io_fault_latched &&
+                 dac.io_last_failure_stage == 0);
+
+  // Dither display essentials: adjacent codes, high dwell, and current phase.
+  lane.add("lo", (uint32_t)dac.dither_low_code);
+  lane.add("hi", (uint32_t)dac.dither_high_code);
+  lane.add("hi_ms", (uint32_t)dac.dither_high_ms);
+  lane.add("ph", dac.dither_current_phase_high);
+
+  // Servo essentials.  The selected/control fields explain what the servo
+  // would do when engaged; now/mean/total let the panel show the live inputs
+  // without pulling the verbose REPORT_DAC courtroom surface.
+  lane.add("step", dac.servo_last_step, 6);
+  lane.add("ctl", dac.servo_predicted_residual, 6);
+  lane.add("src", servo_input_source_name(input.selected_source));
+  lane.add("sel", input.selected_input_ppb, 6);
+  lane.add("now", input.now_ppb, 6);
+  lane.add("mean", input.mean_welford_ppb, 6);
+  lane.add("total", input.total_ppb, 6);
+
+  parent.add_object(key, lane);
+}
+
+static void publish_dac_tick(const char* phase) {
+  Payload p;
+  p.add("schema", "CLOCKS_DAC_TICK_V2");
+  p.add("c", campaign_name);
+  p.add("state",
+        campaign_state == clocks_campaign_state_t::STARTED ? "STARTED" : "STOPPED");
+  p.add("phase", phase ? phase : "");
+  p.add("sec", campaign_seconds);
+
+  p.add("servo", servo_mode_str(calibrate_ocxo_mode));
+  p.add("dither", clocks_ocxo_dac_dither_operator_enabled());
+  p.add("mode", ocxo_dac_realization_mode_runtime());
+  p.add("safe_max", (uint32_t)OCXO_DAC_SAFE_MAX_HW_CODE);
+  p.add("ok", g_ad5693r_init_ok &&
+              ocxo1_dac.io_last_write_ok &&
+              ocxo2_dac.io_last_write_ok &&
+              !ocxo1_dac.io_fault_latched &&
+              !ocxo2_dac.io_fault_latched &&
+              clocks_ocxo_dac_dither_global_schedule_failures() == 0 &&
+              clocks_ocxo_dac_dither_service_arm_failures() == 0);
+
+  payload_add_dac_tick_lane(p, "ocxo1", ocxo1_dac, g_servo_input_ocxo1);
+  payload_add_dac_tick_lane(p, "ocxo2", ocxo2_dac, g_servo_input_ocxo2);
+
+  publish("CLOCKS_DAC_TICK", p);
 }
 
 // ============================================================================
@@ -3004,6 +3063,7 @@ void clocks_beta_pps(void) {
     if (was_started) {
       timebase_invalidate();
     }
+    publish_dac_tick("STOP_GATE");
     return;
   }
 
@@ -3011,6 +3071,7 @@ void clocks_beta_pps(void) {
     g_timebase_start_zero_gate_count++;
     timebase_build_stage(TIMEBASE_BUILD_STAGE_START_ZERO_GATE);
     (void)clocks_try_finish_pending_smartzero();
+    publish_dac_tick("START_ZERO_GATE");
     return;
   }
 
@@ -3032,17 +3093,20 @@ void clocks_beta_pps(void) {
     request_recover = false;
     campaign_state = clocks_campaign_state_t::STARTED;
     campaign_warmup_begin(campaign_warmup_mode_t::RECOVER);
+    publish_dac_tick("RECOVER_GATE");
     return;
   }
 
   if (watchdog_anomaly_active) {
     g_timebase_watchdog_gate_count++;
     timebase_build_stage(TIMEBASE_BUILD_STAGE_WATCHDOG_GATE);
+    publish_dac_tick("WATCHDOG_GATE");
     return;
   }
   if (campaign_state != clocks_campaign_state_t::STARTED) {
     g_timebase_not_started_gate_count++;
     timebase_build_stage(TIMEBASE_BUILD_STAGE_NOT_STARTED_GATE);
+    publish_dac_tick("NOT_STARTED_GATE");
     return;
   }
 
@@ -3055,6 +3119,7 @@ void clocks_beta_pps(void) {
   if (campaign_warmup_consume_one_candidate_record()) {
     g_timebase_warmup_suppressed_count++;
     timebase_build_stage(TIMEBASE_BUILD_STAGE_WARMUP_GATE);
+    publish_dac_tick("WARMUP_GATE");
     return;
   }
 
@@ -3231,6 +3296,8 @@ void clocks_beta_pps(void) {
   welford_update(welford_ocxo2_dac, ocxo2_dac.dac_fractional);
   timebase_build_stage(TIMEBASE_BUILD_STAGE_DAC_WELFORD);
 
+  publish_dac_tick("STARTED");
+
   // ── Build TIMEBASE_FRAGMENT ──
   g_timebase_build_begin_count++;
   g_timebase_last_build_begin_campaign_seconds = campaign_seconds;
@@ -3333,11 +3400,7 @@ void clocks_beta_pps(void) {
                               pps_residuals.ocxo2_fast_residual_ns);
 
     timebase_build_stage(TIMEBASE_BUILD_STAGE_STATS);
-    payload_add_stats_summary_hierarchical(p,
-                                           public_gnss_ns,
-                                           public_dwt_total,
-                                           public_ocxo1_ns,
-                                           public_ocxo2_ns);
+    payload_add_stats_summary_hierarchical(p);
 
     // System DAC persistence feed.  The Pi should update the simplified
     // system config only while the servo is actively tuning; manual/static DAC
@@ -4446,10 +4509,6 @@ static void add_dac_payload(Payload& p) {
          ocxo_dac_voltage_from_code((double)ocxo1_dac.dac_hw_code), 6);
   o1.add("dac_fractional_voltage",
          ocxo_dac_voltage_from_code(ocxo1_dac.dac_fractional), 6);
-  o1.add("dither_low_code", (uint32_t)ocxo1_dac.dither_low_code);
-  o1.add("dither_high_code", (uint32_t)ocxo1_dac.dither_high_code);
-  o1.add("dither_high_ms", (uint32_t)ocxo1_dac.dither_high_ms);
-  o1.add("dither_active_this_frame", ocxo1_dac.dither_active_this_frame);
   o1.add("dac_min", ocxo1_dac.dac_min);
   o1.add("dac_max", ocxo1_dac.dac_max);
   o1.add("servo_last_step", ocxo1_dac.servo_last_step, 6);
@@ -4467,6 +4526,12 @@ static void add_dac_payload(Payload& p) {
   o1.add("servo_predictor_updates", ocxo1_dac.servo_predictor_updates);
   payload_add_servo_input_diag(o1, g_servo_input_ocxo1);
   payload_add_dac_realization_object(o1, "realization", ocxo1_dac);
+  o1.add("dither_active_this_frame", ocxo1_dac.dither_active_this_frame);
+  o1.add("dither_low_code", (uint32_t)ocxo1_dac.dither_low_code);
+  o1.add("dither_high_code", (uint32_t)ocxo1_dac.dither_high_code);
+  o1.add("dither_high_ms", (uint32_t)ocxo1_dac.dither_high_ms);
+  o1.add("dither_pending_hw_write", ocxo1_dac.dither_pending_hw_write);
+  o1.add("dither_pending_hw_code", (uint32_t)ocxo1_dac.dither_pending_hw_code);
   o1.add("pacing_pending", ocxo1_dac.pacing_pending);
   o1.add("pacing_pending_target", ocxo1_dac.pacing_pending_target, 6);
   o1.add("pacing_pending_step", ocxo1_dac.pacing_pending_step, 6);
@@ -4491,10 +4556,6 @@ static void add_dac_payload(Payload& p) {
          ocxo_dac_voltage_from_code((double)ocxo2_dac.dac_hw_code), 6);
   o2.add("dac_fractional_voltage",
          ocxo_dac_voltage_from_code(ocxo2_dac.dac_fractional), 6);
-  o2.add("dither_low_code", (uint32_t)ocxo2_dac.dither_low_code);
-  o2.add("dither_high_code", (uint32_t)ocxo2_dac.dither_high_code);
-  o2.add("dither_high_ms", (uint32_t)ocxo2_dac.dither_high_ms);
-  o2.add("dither_active_this_frame", ocxo2_dac.dither_active_this_frame);
   o2.add("dac_min", ocxo2_dac.dac_min);
   o2.add("dac_max", ocxo2_dac.dac_max);
   o2.add("servo_last_step", ocxo2_dac.servo_last_step, 6);
@@ -4512,6 +4573,12 @@ static void add_dac_payload(Payload& p) {
   o2.add("servo_predictor_updates", ocxo2_dac.servo_predictor_updates);
   payload_add_servo_input_diag(o2, g_servo_input_ocxo2);
   payload_add_dac_realization_object(o2, "realization", ocxo2_dac);
+  o2.add("dither_active_this_frame", ocxo2_dac.dither_active_this_frame);
+  o2.add("dither_low_code", (uint32_t)ocxo2_dac.dither_low_code);
+  o2.add("dither_high_code", (uint32_t)ocxo2_dac.dither_high_code);
+  o2.add("dither_high_ms", (uint32_t)ocxo2_dac.dither_high_ms);
+  o2.add("dither_pending_hw_write", ocxo2_dac.dither_pending_hw_write);
+  o2.add("dither_pending_hw_code", (uint32_t)ocxo2_dac.dither_pending_hw_code);
   o2.add("pacing_pending", ocxo2_dac.pacing_pending);
   o2.add("pacing_pending_target", ocxo2_dac.pacing_pending_target, 6);
   o2.add("pacing_pending_step", ocxo2_dac.pacing_pending_step, 6);
@@ -4531,7 +4598,7 @@ static void add_dac_payload(Payload& p) {
 
   p.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
   p.add("ad5693r_init_ok", g_ad5693r_init_ok);
-  p.add("realization_mode", OCXO_DAC_REALIZATION_MODE);
+  p.add("realization_mode", ocxo_dac_realization_mode_runtime());
   p.add("reference_mode", OCXO_DAC_REFERENCE_MODE);
   p.add("external_vref_used", false);
   p.add("internal_ref_voltage", OCXO_DAC_INTERNAL_REF_VOLTAGE, 6);
@@ -4539,9 +4606,16 @@ static void add_dac_payload(Payload& p) {
   p.add("output_full_scale_voltage", OCXO_DAC_OUTPUT_FULL_SCALE_VOLTAGE, 6);
   p.add("safe_max_output_voltage", OCXO_DAC_SAFE_MAX_OUTPUT_VOLTAGE, 6);
   p.add("safe_max_hw_code", (uint32_t)OCXO_DAC_SAFE_MAX_HW_CODE);
-  p.add("static_rounded_only", true);
-  p.add("fractional_stream_possible", false);
-  p.add("recurring_timer_possible", false);
+  p.add("static_rounded_only", ocxo_dac_static_rounded_only_runtime());
+  p.add("fractional_stream_possible", ocxo_dac_fractional_stream_possible_runtime());
+  p.add("recurring_timer_possible", clocks_ocxo_dac_dither_started());
+  p.add("dither_operator_enabled", clocks_ocxo_dac_dither_operator_enabled());
+  p.add("dither_service_pending", clocks_ocxo_dac_dither_service_pending());
+  p.add("dither_context", clocks_ocxo_dac_dither_context());
+  p.add("dither_global_frame_count", clocks_ocxo_dac_dither_global_frame_count());
+  p.add("dither_global_schedule_failures", clocks_ocxo_dac_dither_global_schedule_failures());
+  p.add("dither_service_arm_count", clocks_ocxo_dac_dither_service_arm_count());
+  p.add("dither_service_arm_failures", clocks_ocxo_dac_dither_service_arm_failures());
   p.add("commit_scheduled", g_ocxo_dac_commit_scheduled);
   p.add("last_schedule_second", g_ocxo_dac_last_schedule_second);
   p.add("last_commit_second", g_ocxo_dac_last_commit_second);
@@ -5214,7 +5288,7 @@ static FLASHMEM Payload cmd_report_integrity(const Payload&) {
 static FLASHMEM Payload cmd_report(const Payload&) {
   Payload p;
   p.add("report", "CLOCKS_COMPACT");
-  p.add("subreports", "REPORT_STATUS REPORT_SUMMARY REPORT_EPOCH REPORT_SMARTZERO REPORT_INSTALLED_SMARTZERO REPORT_LIVE_SMARTZERO REPORT_FORENSICS REPORT_FORENSICS_VCLOCK REPORT_FORENSICS_OCXO1 REPORT_FORENSICS_OCXO2 REPORT_OCXO_PPS_PROJECTION REPORT_OCXO_PROJECTION_GUARD REPORT_TIMEBASE_PUBLISH REPORT_INTEGRITY REPORT_ALPHA_FLOW REPORT_ALPHA_FLOW_VCLOCK REPORT_ALPHA_FLOW_OCXO1 REPORT_ALPHA_FLOW_OCXO2 REPORT_PREDICTION REPORT_STATS REPORT_DAC");
+  p.add("subreports", "REPORT_STATUS REPORT_SUMMARY REPORT_EPOCH REPORT_SMARTZERO REPORT_INSTALLED_SMARTZERO REPORT_LIVE_SMARTZERO REPORT_FORENSICS REPORT_FORENSICS_VCLOCK REPORT_FORENSICS_OCXO1 REPORT_FORENSICS_OCXO2 REPORT_OCXO_PPS_PROJECTION REPORT_OCXO_PROJECTION_GUARD REPORT_TIMEBASE_PUBLISH REPORT_INTEGRITY REPORT_ALPHA_FLOW REPORT_ALPHA_FLOW_VCLOCK REPORT_ALPHA_FLOW_OCXO1 REPORT_ALPHA_FLOW_OCXO2 REPORT_PREDICTION REPORT_STATS REPORT_DAC DITHER_STATUS DITHER_ENABLE DITHER_DISABLE");
   add_summary_payload(p);
   add_campaign_payload(p);
 
@@ -5404,6 +5478,53 @@ static FLASHMEM Payload cmd_report_stats(const Payload&) {
   return p;
 }
 
+
+static FLASHMEM Payload cmd_dither_status(const Payload&) {
+  Payload p;
+  p.add("status", "ok");
+  p.add("report", "CLOCKS_DITHER_STATUS");
+  add_dac_payload(p);
+  return p;
+}
+
+static FLASHMEM Payload cmd_dither_enable(const Payload&) {
+  const bool ok = clocks_ocxo_dac_dither_enable();
+
+  Payload p;
+  p.add("status", ok ? "dither_enabled" : "dither_enable_failed");
+  p.add("enabled", clocks_ocxo_dac_dither_operator_enabled());
+  p.add("started", clocks_ocxo_dac_dither_started());
+  p.add("service_pending", clocks_ocxo_dac_dither_service_pending());
+  p.add("write_context", clocks_ocxo_dac_dither_context());
+  p.add("ocxo1_dac", ocxo1_dac.dac_fractional);
+  p.add("ocxo2_dac", ocxo2_dac.dac_fractional);
+  p.add("ocxo1_dac_hw_code", (uint32_t)ocxo1_dac.dac_hw_code);
+  p.add("ocxo2_dac_hw_code", (uint32_t)ocxo2_dac.dac_hw_code);
+  payload_add_dac_realization_object(p, "ocxo1_realization", ocxo1_dac);
+  payload_add_dac_realization_object(p, "ocxo2_realization", ocxo2_dac);
+  return p;
+}
+
+static FLASHMEM Payload cmd_dither_disable(const Payload&) {
+  const bool ok = clocks_ocxo_dac_dither_disable();
+
+  Payload p;
+  p.add("status", ok ? "dither_disabled_static_rounded" : "dither_disabled_dac_write_fault");
+  p.add("enabled", clocks_ocxo_dac_dither_operator_enabled());
+  p.add("started", clocks_ocxo_dac_dither_started());
+  p.add("service_pending", clocks_ocxo_dac_dither_service_pending());
+  p.add("write_context", clocks_ocxo_dac_dither_context());
+  p.add("ocxo1_dac", ocxo1_dac.dac_fractional);
+  p.add("ocxo2_dac", ocxo2_dac.dac_fractional);
+  p.add("ocxo1_dac_hw_code", (uint32_t)ocxo1_dac.dac_hw_code);
+  p.add("ocxo2_dac_hw_code", (uint32_t)ocxo2_dac.dac_hw_code);
+  p.add("ocxo1_dac_last_write_ok", ocxo1_dac.io_last_write_ok);
+  p.add("ocxo2_dac_last_write_ok", ocxo2_dac.io_last_write_ok);
+  payload_add_dac_realization_object(p, "ocxo1_realization", ocxo1_dac);
+  payload_add_dac_realization_object(p, "ocxo2_realization", ocxo2_dac);
+  return p;
+}
+
 static FLASHMEM Payload cmd_report_dac(const Payload&) {
   Payload p;
   p.add("report", "CLOCKS_DAC");
@@ -5437,7 +5558,7 @@ static FLASHMEM Payload cmd_set_dac(const Payload& args) {
         ocxo_dac_voltage_from_code((double)ocxo1_dac.dac_hw_code), 6);
   p.add("ocxo2_dac_voltage",
         ocxo_dac_voltage_from_code((double)ocxo2_dac.dac_hw_code), 6);
-  p.add("realization_mode", OCXO_DAC_REALIZATION_MODE);
+  p.add("realization_mode", ocxo_dac_realization_mode_runtime());
   p.add("reference_mode", OCXO_DAC_REFERENCE_MODE);
   p.add("external_vref_used", false);
   p.add("internal_ref_voltage", OCXO_DAC_INTERNAL_REF_VOLTAGE, 6);
@@ -5445,9 +5566,11 @@ static FLASHMEM Payload cmd_set_dac(const Payload& args) {
   p.add("output_full_scale_voltage", OCXO_DAC_OUTPUT_FULL_SCALE_VOLTAGE, 6);
   p.add("safe_max_output_voltage", OCXO_DAC_SAFE_MAX_OUTPUT_VOLTAGE, 6);
   p.add("safe_max_hw_code", (uint32_t)OCXO_DAC_SAFE_MAX_HW_CODE);
-  p.add("static_rounded_only", true);
-  p.add("fractional_stream_possible", false);
-  p.add("recurring_timer_possible", false);
+  p.add("static_rounded_only", ocxo_dac_static_rounded_only_runtime());
+  p.add("fractional_stream_possible", ocxo_dac_fractional_stream_possible_runtime());
+  p.add("recurring_timer_possible", clocks_ocxo_dac_dither_started());
+  p.add("dither_operator_enabled", clocks_ocxo_dac_dither_operator_enabled());
+  p.add("dither_service_pending", clocks_ocxo_dac_dither_service_pending());
   p.add("status", (dac1_ok && dac2_ok) ? "ok" : "dac_write_fault");
   return p;
 }
@@ -5483,6 +5606,9 @@ static const process_command_entry_t CLOCKS_COMMANDS[] = {
   { "REPORT_PREDICTION",       cmd_report_prediction       },
   { "REPORT_STATS",      cmd_report_stats      },
   { "REPORT_DAC",        cmd_report_dac        },
+  { "DITHER_STATUS",     cmd_dither_status     },
+  { "DITHER_ENABLE",     cmd_dither_enable     },
+  { "DITHER_DISABLE",    cmd_dither_disable    },
   { "WATCHDOG_TEST",     cmd_watchdog_test     },
   { "SET_DAC",           cmd_set_dac           },
   { nullptr,              nullptr               }

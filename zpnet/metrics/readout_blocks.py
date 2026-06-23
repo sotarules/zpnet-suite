@@ -38,6 +38,9 @@ Column layout (INT rows):
   NAME   END_GNSS_NS   DELTA_NS
 """
 
+import json
+import socket
+import threading
 import time
 
 from zpnet.processes.processes import send_command
@@ -52,6 +55,11 @@ DAC_MAX_CODE = 65535.0
 FEATURE_POLL_INTERVAL_S = 5.0
 FEATURE_GRID_COLUMNS = 4
 FEATURE_GRID_CELL_WIDTH = 39
+
+PUBSUB_TAP_SOCKET = "/tmp/zpnet_pubsub_tap.sock"
+DAC_TICK_TOPIC = "CLOCKS_DAC_TICK"
+DAC_TICK_STALE_S = 5.0
+DAC_TICK_RECONNECT_S = 1.0
 
 # Mission-control readiness board.  The feature payload remains scalar-only;
 # this table is just the operator-facing projection of the global PI SYSTEM
@@ -83,6 +91,12 @@ FEATURE_STATUS_GRID = (
 _FEATURE_STATUS_CACHE: dict | None = None
 _FEATURE_STATUS_CACHE_TS = 0.0
 _FEATURE_STATUS_CACHE_ERROR: str | None = None
+
+_DAC_TICK_CACHE: dict | None = None
+_DAC_TICK_CACHE_TS = 0.0
+_DAC_TICK_CACHE_ERROR: str | None = None
+_DAC_TICK_THREAD: threading.Thread | None = None
+_DAC_TICK_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------------
@@ -136,8 +150,100 @@ def _get_pi_clocks_report() -> dict:
     return send_command(machine="PI", subsystem="CLOCKS", command="REPORT")["payload"]
 
 
+def _dac_tick_listener_loop() -> None:
+    """Background tap listener for the compact CLOCKS_DAC_TICK feed.
+
+    This is intentionally best-effort and cache-only.  The readout path never
+    blocks on the socket and never polls TEENSY CLOCKS REPORT_DAC.  If the tap is
+    temporarily unavailable, callers simply fall back to the most recent CLOCKS
+    report/TIMEBASE fields until a fresh tick arrives.
+    """
+    global _DAC_TICK_CACHE, _DAC_TICK_CACHE_TS, _DAC_TICK_CACHE_ERROR
+
+    subscribe = json.dumps(
+        {"type": "set_topics", "topics": [DAC_TICK_TOPIC]},
+        separators=(",", ":"),
+    ).encode("utf-8") + b"\n"
+
+    while True:
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.settimeout(2.0)
+                sock.connect(PUBSUB_TAP_SOCKET)
+                sock.settimeout(None)
+
+                with sock.makefile("rwb") as stream:
+                    stream.write(subscribe)
+                    stream.flush()
+
+                    with _DAC_TICK_LOCK:
+                        _DAC_TICK_CACHE_ERROR = None
+
+                    for raw in stream:
+                        try:
+                            msg = json.loads(raw.decode("utf-8"))
+                        except Exception:
+                            continue
+
+                        if not isinstance(msg, dict):
+                            continue
+                        if msg.get("type") != "publish":
+                            continue
+                        if msg.get("topic") != DAC_TICK_TOPIC:
+                            continue
+
+                        payload = msg.get("payload")
+                        if not isinstance(payload, dict):
+                            continue
+                        if payload.get("schema") != "CLOCKS_DAC_TICK_V2":
+                            continue
+
+                        with _DAC_TICK_LOCK:
+                            _DAC_TICK_CACHE = payload
+                            _DAC_TICK_CACHE_TS = time.monotonic()
+                            _DAC_TICK_CACHE_ERROR = None
+
+        except Exception as e:
+            with _DAC_TICK_LOCK:
+                _DAC_TICK_CACHE_ERROR = str(e)
+            time.sleep(DAC_TICK_RECONNECT_S)
+
+
+def _ensure_dac_tick_listener() -> None:
+    global _DAC_TICK_THREAD
+
+    if _DAC_TICK_THREAD is not None and _DAC_TICK_THREAD.is_alive():
+        return
+
+    with _DAC_TICK_LOCK:
+        if _DAC_TICK_THREAD is not None and _DAC_TICK_THREAD.is_alive():
+            return
+        _DAC_TICK_THREAD = threading.Thread(
+            target=_dac_tick_listener_loop,
+            name="zpnet-dac-tick-listener",
+            daemon=True,
+        )
+        _DAC_TICK_THREAD.start()
+
+
+def _get_dac_tick_payload(max_age_s: float = DAC_TICK_STALE_S) -> dict | None:
+    _ensure_dac_tick_listener()
+
+    with _DAC_TICK_LOCK:
+        payload = _DAC_TICK_CACHE
+        age = time.monotonic() - _DAC_TICK_CACHE_TS if _DAC_TICK_CACHE_TS else 1.0e9
+
+    if not isinstance(payload, dict):
+        return None
+    if age > max_age_s:
+        return None
+    return payload
+
+
 def _get_pi_clocks_report_dac() -> dict:
-    return send_command(machine="TEENSY", subsystem="CLOCKS", command="REPORT_DAC")["payload"]
+    # Compatibility name: the metrics panel now consumes the compact pub/sub
+    # CLOCKS_DAC_TICK feed instead of polling TEENSY CLOCKS REPORT_DAC.
+    return _get_dac_tick_payload() or {}
 
 
 def _get_pi_gnss_report() -> dict:
@@ -724,16 +830,26 @@ def _dac_voltage(dac_code):
     code = _to_float(dac_code)
     if code is None:
         return None
-    # AD5693R ideal unipolar transfer: VOUT = VREF * D / 2^16.
+    # Fallback only.  Prefer firmware-authored voltage from CLOCKS_DAC_TICK
+    # when available because the active DAC reference/gain doctrine lives in
+    # firmware, not in this panel.
     return code * VREF / DAC_CODE_SCALE
 
 
-def _dac_label(dac_code):
+def _dac_label(dac_code, dac_voltage=None):
     code = _to_float(dac_code)
-    volts = _dac_voltage(code)
+    volts = _to_float(dac_voltage)
+    if volts is None:
+        volts = _dac_voltage(code)
     if code is None or volts is None:
         return "---"
     return f"{code:>.3f} {volts:.6f}V"
+
+
+def _dac_tick_payload(report_dac: dict | None) -> dict:
+    if isinstance(report_dac, dict) and report_dac.get("schema") == "CLOCKS_DAC_TICK_V2":
+        return report_dac
+    return {}
 
 
 def _dac_report_lane(report_dac: dict | None, lane: str) -> dict:
@@ -749,9 +865,27 @@ def _dac_report_value(report_dac: dict | None, lane: str):
     return _to_float(obj.get("dac") if obj.get("dac") is not None else dither.get("desired"))
 
 
+def _dac_report_voltage(report_dac: dict | None, lane: str):
+    obj = _dac_report_lane(report_dac, lane)
+    return _to_float(
+        obj.get("v")
+        if obj.get("v") is not None
+        else obj.get("dac_voltage")
+    )
+
+
 def _dac_current_value(r: dict, report_dac: dict | None, lane: str):
-    val = _dac_value(r, lane)
-    return val if val is not None else _dac_report_value(report_dac, lane)
+    tick_val = _dac_report_value(report_dac, lane)
+    if tick_val is not None:
+        return tick_val
+    return _dac_value(r, lane)
+
+
+def _dac_current_voltage(r: dict, report_dac: dict | None, lane: str):
+    tick_volts = _dac_report_voltage(report_dac, lane)
+    if tick_volts is not None:
+        return tick_volts
+    return _dac_voltage(_dac_current_value(r, report_dac, lane))
 
 
 def _clamp_dac_code(value: float) -> float:
@@ -765,9 +899,9 @@ def _clamp_dac_code(value: float) -> float:
 def _manual_dac_current_value(lane: str) -> float:
     """Fetch the live DAC value for keyboard nudging.
 
-    Prefer the current CLOCKS report/TIMEBASE value and fall back to the
-    Teensy REPORT_DAC surface so manual control still works before a campaign
-    has emitted a fresh TIMEBASE row.
+    Prefer the compact CLOCKS_DAC_TICK pub/sub cache and fall back to the
+    current CLOCKS report/TIMEBASE value.  This avoids polling the verbose
+    Teensy REPORT_DAC command path while the operator is nudging DAC values.
     """
     report = {}
     try:
@@ -840,6 +974,20 @@ def adjust_ocxo_dac(*, lane: str, direction: int, step_kind: str) -> dict:
 
 
 def _dac_report_dither_summary(report_dac: dict | None, lane: str) -> str:
+    tick = _dac_tick_payload(report_dac)
+    obj = _dac_report_lane(report_dac, lane)
+
+    if tick:
+        if _to_bool(tick.get("dither")) is not True:
+            return "OFF"
+        low_code = _to_int(obj.get("lo"))
+        high_code = _to_int(obj.get("hi"))
+        high_ms = _to_int(obj.get("hi_ms"))
+        if low_code is None or high_code is None or high_ms is None:
+            return "ON"
+        low_ms = max(0, 1000 - high_ms)
+        return f"{low_code}:{low_ms:03d} {high_code}:{high_ms:03d}"
+
     obj = _dac_report_lane(report_dac, lane)
     d = obj.get("dither") if isinstance(obj.get("dither"), dict) else {}
     if not d:
@@ -859,9 +1007,6 @@ def _dac_report_dither_summary(report_dac: dict | None, lane: str) -> str:
     if low is None or high is None:
         return f"{rate}Hz"
 
-    # SyncDAC reports one-second dwell targets/counts on a 1 ms grid.  Pad
-    # the millisecond buckets to three digits so 1/2-digit dwell values do not
-    # shift the DAC row horizontally beside larger values.
     low_s = f"{low:03d}"
     high_s = f"{high:03d}"
 
@@ -893,7 +1038,7 @@ def _dac_detail_lines(r: dict, baseline: dict | None, report_dac: dict | None,
     )
     for name, key in [("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")]:
         dac_now = _dac_current_value(r, report_dac, key)
-        dac_label = _dac_label(dac_now)
+        dac_label = _dac_label(dac_now, _dac_current_voltage(r, report_dac, key))
         dither_summary = _dac_report_dither_summary(report_dac, key)
 
         base_dac = None
@@ -1153,7 +1298,7 @@ def clocks_combined_readout() -> list[str]:
     elapsed = r.get("campaign_elapsed", "00:00:00")
     n = _to_int(_field(r, "teensy_pps_vclock_count", "teensy_pps_count", "pps_count")) or 0
 
-    servo_state = _servo_state(r)
+    servo_state = str(report_dac.get("servo") or _servo_state(r)).upper() if isinstance(report_dac, dict) else _servo_state(r)
 
     baseline = _get_clocks_baseline()
     baseline_ppb = baseline.get("baseline_ppb", {}) if baseline else {}
