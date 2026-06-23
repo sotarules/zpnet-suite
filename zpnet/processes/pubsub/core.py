@@ -34,7 +34,7 @@ import os
 import socket
 import threading
 import time
-from queue import Queue, Empty
+from queue import Queue, Empty, Full
 from typing import Dict, Any, Optional, TextIO, Set, List, Tuple
 
 from zpnet.processes.processes import server_setup, send_command, list_subsystems
@@ -83,6 +83,20 @@ SERVER_TCP_BACKLOG = 1            # one connection at a time
 SERVER_CMD_SOCKET_PATH = "/tmp/zpnet_server_cmd.sock"
 SERVER_CMD_BACKLOG = 4
 SERVER_CMD_TIMEOUT_S = 30.0       # max wait for SERVER to respond
+
+# Ad-hoc diagnostic tap.
+#
+# This is an observer-only local Unix stream socket for temporary tools such
+# as metrics panels, terminal listeners, and debugging probes.  Clients declare
+# ephemeral topic interest over a persistent newline-delimited JSON connection.
+# They are never written into the formal subscription union and are never
+# forwarded to TEENSY.  Delivery is best-effort with a tiny bounded queue so a
+# slow ad-hoc client cannot apply backpressure to the core bus.
+ADHOC_TAP_SOCKET_PATH = "/tmp/zpnet_pubsub_tap.sock"
+ADHOC_TAP_BACKLOG = 8
+ADHOC_QUEUE_SIZE = 2
+ADHOC_SEND_TIMEOUT_S = 2.0
+ADHOC_RECV_TIMEOUT_S = 1.0
 
 # ---------------------------------------------------------------------
 # Global state
@@ -160,6 +174,30 @@ server_conn: Optional[socket.socket] = None
 server_conn_lock = threading.Lock()
 server_subscriptions: List[Dict[str, Any]] = []
 server_pending_commands: Dict[int, Queue] = {}
+
+# ---------------------------------------------------------------------
+# Ad-hoc diagnostic tap state
+# ---------------------------------------------------------------------
+
+class _AdhocClient:
+    def __init__(self, client_id: int, conn: socket.socket) -> None:
+        self.client_id = client_id
+        self.conn = conn
+        self.topics: Set[str] = set()
+        self.queue = Queue(maxsize=ADHOC_QUEUE_SIZE)
+        self.connected_at = time.monotonic()
+        self.sent_count = 0
+        self.drop_count = 0
+        self.closed = False
+
+
+adhoc_client_id_counter = itertools.count(1)
+adhoc_clients: Dict[int, _AdhocClient] = {}
+adhoc_by_topic: Dict[str, Set[int]] = {}
+adhoc_connect_count = 0
+adhoc_disconnect_count = 0
+adhoc_publish_enqueue_count = 0
+adhoc_publish_drop_count = 0
 
 # ------------------------------------------------------------------
 # Logging
@@ -284,6 +322,317 @@ def handle_client(conn: socket.socket) -> None:
 
 
 # ---------------------------------------------------------------------
+# Ad-hoc diagnostic tap
+# ---------------------------------------------------------------------
+
+def _adhoc_parse_topics(msg: Dict[str, Any]) -> List[str]:
+    topics = msg.get("topics")
+    if topics is None and msg.get("topic") is not None:
+        topics = [msg.get("topic")]
+    if isinstance(topics, str):
+        topics = [topics]
+    if not isinstance(topics, list):
+        return []
+
+    out: List[str] = []
+    for topic in topics:
+        name = str(topic).strip()
+        if name:
+            out.append(name)
+    return out
+
+
+def _adhoc_queue_wire(client: _AdhocClient, wire: Optional[bytes]) -> None:
+    if client.closed:
+        return
+
+    try:
+        client.queue.put_nowait(wire)
+        return
+    except Full:
+        pass
+
+    # Keep newest telemetry, never build an unbounded queue.  This applies to
+    # ad-hoc observers only; formal route delivery is unchanged.
+    try:
+        client.queue.get_nowait()
+    except Empty:
+        pass
+
+    client.drop_count += 1
+    try:
+        client.queue.put_nowait(wire)
+    except Full:
+        client.drop_count += 1
+
+
+def _adhoc_queue_json(client: _AdhocClient, msg: Dict[str, Any]) -> None:
+    wire = (json.dumps(msg, separators=(",", ":"), ensure_ascii=False) + "\n").encode("utf-8")
+    _adhoc_queue_wire(client, wire)
+
+
+def _adhoc_register(conn: socket.socket) -> _AdhocClient:
+    global adhoc_connect_count
+
+    client = _AdhocClient(next(adhoc_client_id_counter), conn)
+    with state_lock:
+        adhoc_clients[client.client_id] = client
+        adhoc_connect_count += 1
+
+    logging.info("🔎 [pubsub tap] client connected id=%d", client.client_id)
+    return client
+
+
+def _adhoc_wake_writer(client: _AdhocClient) -> None:
+    try:
+        client.queue.put_nowait(None)
+        return
+    except Full:
+        pass
+
+    try:
+        client.queue.get_nowait()
+    except Empty:
+        pass
+
+    try:
+        client.queue.put_nowait(None)
+    except Full:
+        pass
+
+
+def _adhoc_unregister(client_id: int, reason: str) -> None:
+    global adhoc_disconnect_count
+
+    with state_lock:
+        client = adhoc_clients.pop(client_id, None)
+        if client is None:
+            return
+
+        client.closed = True
+        for topic in list(client.topics):
+            ids = adhoc_by_topic.get(topic)
+            if ids is not None:
+                ids.discard(client_id)
+                if not ids:
+                    adhoc_by_topic.pop(topic, None)
+        client.topics.clear()
+        adhoc_disconnect_count += 1
+
+    try:
+        client.conn.shutdown(socket.SHUT_RDWR)
+    except Exception:
+        pass
+    try:
+        client.conn.close()
+    except Exception:
+        pass
+
+    _adhoc_wake_writer(client)
+    logging.info("🔎 [pubsub tap] client disconnected id=%d (%s)", client_id, reason)
+
+
+def _adhoc_set_topics(client: _AdhocClient, topics: List[str], *, replace: bool) -> List[str]:
+    clean = set(topics)
+
+    with state_lock:
+        if replace:
+            new_topics = clean
+        else:
+            new_topics = set(client.topics) | clean
+
+        for topic in list(client.topics):
+            if topic not in new_topics:
+                ids = adhoc_by_topic.get(topic)
+                if ids is not None:
+                    ids.discard(client.client_id)
+                    if not ids:
+                        adhoc_by_topic.pop(topic, None)
+
+        for topic in new_topics:
+            adhoc_by_topic.setdefault(topic, set()).add(client.client_id)
+
+        client.topics = new_topics
+        return sorted(client.topics)
+
+
+def _adhoc_remove_topics(client: _AdhocClient, topics: List[str]) -> List[str]:
+    remove = set(topics)
+
+    with state_lock:
+        for topic in remove:
+            ids = adhoc_by_topic.get(topic)
+            if ids is not None:
+                ids.discard(client.client_id)
+                if not ids:
+                    adhoc_by_topic.pop(topic, None)
+            client.topics.discard(topic)
+        return sorted(client.topics)
+
+
+def _adhoc_handle_client_msg(client: _AdhocClient, msg: Dict[str, Any]) -> None:
+    msg_type = msg.get("type")
+
+    if msg_type == "set_topics":
+        topics = _adhoc_set_topics(client, _adhoc_parse_topics(msg), replace=True)
+        _adhoc_queue_json(client, {
+            "type": "subscribed",
+            "client_id": client.client_id,
+            "topics": topics,
+        })
+        return
+
+    if msg_type == "subscribe":
+        topics = _adhoc_set_topics(client, _adhoc_parse_topics(msg), replace=False)
+        _adhoc_queue_json(client, {
+            "type": "subscribed",
+            "client_id": client.client_id,
+            "topics": topics,
+        })
+        return
+
+    if msg_type == "unsubscribe":
+        topics = _adhoc_remove_topics(client, _adhoc_parse_topics(msg))
+        _adhoc_queue_json(client, {
+            "type": "subscribed",
+            "client_id": client.client_id,
+            "topics": topics,
+        })
+        return
+
+    if msg_type == "ping":
+        _adhoc_queue_json(client, {
+            "type": "pong",
+            "client_id": client.client_id,
+            "topics": sorted(client.topics),
+            "sent_count": client.sent_count,
+            "drop_count": client.drop_count,
+        })
+        return
+
+    _adhoc_queue_json(client, {
+        "type": "error",
+        "client_id": client.client_id,
+        "message": f"unknown tap message type: {msg_type!r}",
+    })
+
+
+def _adhoc_writer(client: _AdhocClient) -> None:
+    try:
+        client.conn.settimeout(ADHOC_SEND_TIMEOUT_S)
+        while True:
+            wire = client.queue.get()
+            if wire is None:
+                return
+            client.conn.sendall(wire)
+            client.sent_count += 1
+    except Exception:
+        logging.info("🔎 [pubsub tap] writer exiting id=%d", client.client_id)
+    finally:
+        _adhoc_unregister(client.client_id, "writer exited")
+
+
+def _adhoc_client_session(conn: socket.socket) -> None:
+    client = _adhoc_register(conn)
+
+    threading.Thread(
+        target=_adhoc_writer,
+        args=(client,),
+        daemon=True,
+        name=f"pubsub-tap-writer-{client.client_id}",
+    ).start()
+
+    _adhoc_queue_json(client, {
+        "type": "hello",
+        "client_id": client.client_id,
+        "protocol": "ZPNET_PUBSUB_TAP_V1",
+        "commands": ["set_topics", "subscribe", "unsubscribe", "ping"],
+    })
+
+    buf = b""
+    try:
+        conn.settimeout(ADHOC_RECV_TIMEOUT_S)
+        while True:
+            try:
+                chunk = conn.recv(65536)
+            except socket.timeout:
+                continue
+
+            if not chunk:
+                return
+
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                if not line.strip():
+                    continue
+                try:
+                    msg = json.loads(line.decode("utf-8"))
+                except Exception:
+                    _adhoc_queue_json(client, {
+                        "type": "error",
+                        "client_id": client.client_id,
+                        "message": "bad JSON",
+                    })
+                    continue
+                _adhoc_handle_client_msg(client, msg)
+    except Exception:
+        logging.info("🔎 [pubsub tap] reader exiting id=%d", client.client_id)
+    finally:
+        _adhoc_unregister(client.client_id, "reader exited")
+
+
+def _route_publish_to_adhoc(topic: str, msg: Dict[str, Any]) -> None:
+    global adhoc_publish_enqueue_count, adhoc_publish_drop_count
+
+    with state_lock:
+        ids = set(adhoc_by_topic.get(topic, set()))
+        # A wildcard tap is useful for bench debugging, but remains explicitly
+        # opt-in.  Slow wildcard clients still cannot backpressure the bus.
+        ids.update(adhoc_by_topic.get("*", set()))
+        clients = [adhoc_clients.get(client_id) for client_id in ids]
+
+    if not clients:
+        return
+
+    wire_msg = {
+        "type": "publish",
+        "topic": topic,
+        "payload": msg.get("payload"),
+    }
+    wire = (json.dumps(wire_msg, separators=(",", ":"), ensure_ascii=False) + "\n").encode("utf-8")
+
+    for client in clients:
+        if client is None:
+            continue
+        before = client.drop_count
+        _adhoc_queue_wire(client, wire)
+        adhoc_publish_enqueue_count += 1
+        if client.drop_count != before:
+            adhoc_publish_drop_count += (client.drop_count - before)
+
+
+def adhoc_tap_server() -> None:
+    if os.path.exists(ADHOC_TAP_SOCKET_PATH):
+        os.unlink(ADHOC_TAP_SOCKET_PATH)
+
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(ADHOC_TAP_SOCKET_PATH)
+    srv.listen(ADHOC_TAP_BACKLOG)
+
+    logging.info("🔎 [pubsub tap] listener on %s", ADHOC_TAP_SOCKET_PATH)
+
+    while True:
+        conn, _ = srv.accept()
+        threading.Thread(
+            target=_adhoc_client_session,
+            args=(conn,),
+            daemon=True,
+            name="pubsub-tap-client",
+        ).start()
+
+
+# ---------------------------------------------------------------------
 # Pub/Sub routing core
 # ---------------------------------------------------------------------
 
@@ -317,6 +666,8 @@ def route_publish(msg: Dict[str, Any], *, forward_to_teensy: bool) -> None:
     targets = set(topic_routes)
 
     raw = payload_to_json_bytes(msg)
+
+    _route_publish_to_adhoc(topic, msg)
 
     teensy_needed = False
     server_needed = False
@@ -669,6 +1020,7 @@ def _server_handle_publish(msg: Dict[str, Any]) -> None:
         return
 
     log_pubsub(pub_msg)
+    _route_publish_to_adhoc(topic, pub_msg)
 
     with state_lock:
         topic_routes = routes_by_topic.get(topic, set())
@@ -902,6 +1254,17 @@ def cmd_diagnostics(_: Optional[dict]) -> Dict[str, Any]:
         pending_count = len(pending_replies)
         pending_ids = list(pending_replies.keys())
         server_cmd_pending = len(server_pending_commands)
+        adhoc_client_count = len(adhoc_clients)
+        adhoc_topic_count = len(adhoc_by_topic)
+        adhoc_routes = [
+            {
+                "client_id": client.client_id,
+                "topics": sorted(client.topics),
+                "sent_count": client.sent_count,
+                "drop_count": client.drop_count,
+            }
+            for client in adhoc_clients.values()
+        ]
 
     with server_conn_lock:
         server_connected = server_conn is not None
@@ -918,6 +1281,14 @@ def cmd_diagnostics(_: Optional[dict]) -> Dict[str, Any]:
             "server_connected": server_connected,
             "server_subscription_count": len(server_subscriptions),
             "server_cmd_pending": server_cmd_pending,
+            "adhoc_socket_path": ADHOC_TAP_SOCKET_PATH,
+            "adhoc_client_count": adhoc_client_count,
+            "adhoc_topic_count": adhoc_topic_count,
+            "adhoc_connect_count": adhoc_connect_count,
+            "adhoc_disconnect_count": adhoc_disconnect_count,
+            "adhoc_publish_enqueue_count": adhoc_publish_enqueue_count,
+            "adhoc_publish_drop_count": adhoc_publish_drop_count,
+            "adhoc_routes": adhoc_routes,
         },
     }
 
@@ -1232,6 +1603,14 @@ def run() -> None:
 
     threading.Thread(target=rpc_server, daemon=True).start()
     threading.Thread(target=pubsub_server, daemon=True).start()
+
+    # Ad-hoc observer tap for metrics panels and debugging tools.
+    # This is intentionally outside the formal subscription union.
+    threading.Thread(
+        target=adhoc_tap_server,
+        daemon=True,
+        name="pubsub-adhoc-tap",
+    ).start()
 
     # SERVER TCP listener — accepts connections from the Meteor server
     threading.Thread(
