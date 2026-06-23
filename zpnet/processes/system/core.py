@@ -7,11 +7,13 @@ Responsibilities:
   • Maintain last-known-good SYSTEM snapshot
   • Expose SYSTEM.REPORT
   • Emit SYSTEM_STATUS events on fixed cadence
+  • Publish FEATURE_STATUS whenever readiness state changes
 
 Process model:
   • One systemd service
   • One polling thread
   • One blocking command socket
+  • One FEATURE_STATUS_FRAGMENT subscription from Teensy SYSTEM
 """
 
 from __future__ import annotations
@@ -34,7 +36,7 @@ import psutil
 import requests
 from smbus2 import SMBus
 
-from zpnet.processes.processes import send_command, server_setup
+from zpnet.processes.processes import publish, send_command, server_setup
 from zpnet.shared.constants import (
     ZPNET_REMOTE_HOST,
     HTTP_TIMEOUT,
@@ -235,6 +237,9 @@ FEATURE_STATUSES = {"INITIALIZING", "NOMINAL", "HOLD", "ANOMALY"}
 
 _FEATURE_LOCK = threading.Lock()
 _PI_FEATURES: Dict[str, Dict[str, Dict[str, str]]] = {"PI": {}}
+_TEENSY_FEATURES: Dict[str, Dict[str, Dict[str, str]]] = {"TEENSY": {}}
+_FEATURE_PUBLISH_LOCK = threading.Lock()
+_LAST_PUBLISHED_FEATURE_STATUS: Dict[str, Dict[str, Dict[str, str]]] = {}
 
 
 def _health_to_feature_status(health_state: Any) -> str:
@@ -254,7 +259,10 @@ def set_pi_feature(subsystem: str,
 
     value = normalize_feature_status(status)
     with _FEATURE_LOCK:
-        _PI_FEATURES.setdefault("PI", {}).setdefault(subsystem_key, {})[feature_key] = value
+        subsystem_map = _PI_FEATURES.setdefault("PI", {}).setdefault(subsystem_key, {})
+        if subsystem_map.get(feature_key) == value:
+            return value
+        subsystem_map[feature_key] = value
 
     # detail/extra are accepted for compatibility with earlier callers, but
     # the feature-state substrate is deliberately scalar-only.
@@ -298,6 +306,11 @@ def _pi_feature_tree_snapshot() -> Dict[str, Dict[str, Dict[str, str]]]:
         return _copy_feature_tree(_PI_FEATURES)
 
 
+def _teensy_feature_tree_snapshot() -> Dict[str, Dict[str, Dict[str, str]]]:
+    with _FEATURE_LOCK:
+        return _copy_feature_tree(_TEENSY_FEATURES)
+
+
 def _teensy_feature_tree_from_report(teensy_payload: Dict[str, Any]) -> Dict[str, Dict[str, Dict[str, str]]]:
     features = teensy_payload.get("features") if isinstance(teensy_payload, dict) else None
     tree = _copy_feature_tree(features)
@@ -314,6 +327,46 @@ def _combine_feature_trees(*trees: Any) -> Dict[str, Dict[str, Dict[str, str]]]:
                 for feature, status in features.items():
                     subsystem_out[feature] = normalize_feature_status(status)
     return combined
+
+
+def _replace_teensy_feature_tree(tree: Any) -> bool:
+    """Install a Teensy-authored feature tree.  Returns True on real change."""
+    incoming = _copy_feature_tree(tree)
+    normalized = {"TEENSY": incoming["TEENSY"]} if incoming.get("TEENSY") else {"TEENSY": {}}
+
+    with _FEATURE_LOCK:
+        global _TEENSY_FEATURES
+        if normalized == _TEENSY_FEATURES:
+            return False
+        _TEENSY_FEATURES = normalized
+        return True
+
+
+def _feature_tree_snapshot() -> Dict[str, Dict[str, Dict[str, str]]]:
+    with _FEATURE_LOCK:
+        return _combine_feature_trees(_PI_FEATURES, _TEENSY_FEATURES)
+
+
+def _publish_feature_status_if_changed(features: Any = None) -> bool:
+    """
+    Publish FEATURE_STATUS only when the scalar feature tree actually changed.
+
+    Wire shape:
+      {"topic":"FEATURE_STATUS","payload":{"TEENSY":{...},"PI":{...}}}
+    """
+    global _LAST_PUBLISHED_FEATURE_STATUS
+
+    snapshot = _copy_feature_tree(features if features is not None else _feature_tree_snapshot())
+    if not snapshot:
+        return False
+
+    with _FEATURE_PUBLISH_LOCK:
+        if snapshot == _LAST_PUBLISHED_FEATURE_STATUS:
+            return False
+        _LAST_PUBLISHED_FEATURE_STATUS = _copy_feature_tree(snapshot)
+
+    publish("FEATURE_STATUS", snapshot)
+    return True
 
 
 def _update_builtin_pi_features(*,
@@ -1440,14 +1493,17 @@ def system_poller() -> None:
             process_payload = build_process_status()
 
             teensy_features = _teensy_feature_tree_from_report(teensy_payload)
+            if teensy_features:
+                _replace_teensy_feature_tree(teensy_features)
+
             _update_builtin_pi_features(
                 pi_payload=pi_payload, network_payload=network_payload,
                 sensor_payload=sensor_payload, environment_payload=environment_payload,
                 gnss_payload=gnss_payload, power_payload=power_payload,
                 battery_payload=battery_payload,
-                teensy_features_available=bool(teensy_features),
+                teensy_features_available=bool(_teensy_feature_tree_snapshot()),
             )
-            features = _combine_feature_trees(_pi_feature_tree_snapshot(), teensy_features)
+            features = _feature_tree_snapshot()
             snapshot = {
                 "pi": dict(pi_payload),
                 "teensy": dict(teensy_payload),
@@ -1469,6 +1525,7 @@ def system_poller() -> None:
             with _SYSTEM_LOCK:
                 SYSTEM = snapshot
 
+            _publish_feature_status_if_changed(features)
             # ----------------------------------------------------------
             # Emit consolidated system event
             # ----------------------------------------------------------
@@ -1478,6 +1535,23 @@ def system_poller() -> None:
 
     except Exception:
         logging.exception("[system_poller] unhandled exception - poller thread terminating")
+
+
+# ------------------------------------------------------------------
+# Pub/Sub handlers
+# ------------------------------------------------------------------
+
+def on_feature_status_fragment(payload: Optional[dict]) -> None:
+    """Consume Teensy FEATURE_STATUS_FRAGMENT and relay the unified tree."""
+    if not isinstance(payload, dict):
+        logging.warning("[system] ignoring malformed FEATURE_STATUS_FRAGMENT: %r", payload)
+        return
+
+    if not _replace_teensy_feature_tree(payload):
+        return
+
+    features = _refresh_feature_payload_from_registry()
+    _publish_feature_status_if_changed(features)
 
 
 # ------------------------------------------------------------------
@@ -1496,23 +1570,15 @@ def cmd_report(_: Optional[dict]) -> Dict:
 
 
 def _current_feature_payload() -> dict:
-    with _SYSTEM_LOCK:
-        features = SYSTEM.get("features")
-    if isinstance(features, dict):
-        return _copy_feature_tree(features)
-
-    return _combine_feature_trees(_pi_feature_tree_snapshot())
+    features = _feature_tree_snapshot()
+    if features:
+        return features
 
 
-def _refresh_feature_payload_preserving_teensy() -> None:
+
+def _refresh_feature_payload_from_registry() -> dict:
     global SYSTEM
-    with _SYSTEM_LOCK:
-        current = dict(SYSTEM)
-        current_features = current.get("features")
-
-    current_tree = _copy_feature_tree(current_features)
-    teensy_tree = {"TEENSY": current_tree.get("TEENSY", {})} if current_tree.get("TEENSY") else {}
-    features = _combine_feature_trees(_pi_feature_tree_snapshot(), teensy_tree)
+    features = _feature_tree_snapshot()
 
     with _SYSTEM_LOCK:
         current = dict(SYSTEM)
@@ -1520,6 +1586,10 @@ def _refresh_feature_payload_preserving_teensy() -> None:
         current.pop("feature_summary", None)
         SYSTEM = current
 
+
+    with _SYSTEM_LOCK:
+        system_features = SYSTEM.get("features")
+    return _copy_feature_tree(system_features)
 
 def cmd_features(_: Optional[dict]) -> Dict:
     return {
@@ -1578,7 +1648,8 @@ def cmd_set_feature(args: Optional[dict]) -> Dict:
     except ValueError as e:
         return {"success": False, "message": str(e)}
 
-    _refresh_feature_payload_preserving_teensy()
+    features = _refresh_feature_payload_from_registry()
+    _publish_feature_status_if_changed(features)
     return {
         "success": True,
         "message": "OK",
@@ -1620,7 +1691,10 @@ def run() -> None:
 
         server_setup(
             subsystem="SYSTEM",
-            commands=COMMANDS
+            commands=COMMANDS,
+            subscriptions={
+                "FEATURE_STATUS_FRAGMENT": on_feature_status_fragment,
+            },
         )
 
     except Exception:

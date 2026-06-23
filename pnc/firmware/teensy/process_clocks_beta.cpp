@@ -78,6 +78,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <climits>
+#include <string.h>
 #include <strings.h>
 
 // ============================================================================
@@ -289,6 +290,145 @@ static void clocks_beta_features_mark_initializing(void) {
 
 void clocks_beta_features_init(void) {
   clocks_beta_features_mark_initializing();
+}
+
+// ============================================================================
+// FEATURE_STATUS-driven campaign gate
+// ============================================================================
+//
+// Pi SYSTEM now republishes the unified system readiness tree as FEATURE_STATUS.
+// Beta consumes that stream directly and turns campaign admission into a cached
+// pub/sub fact instead of a stack of command-time feature queries.
+//
+// Intentional non-requirements:
+//   SCIENCE_RESIDUALS and TIMEBASE_PUBLICATION are not START-gate inputs here.
+//   They are campaign products.  Requiring them before the first campaign row
+//   would create a cold-boot deadlock.  They remain published feature-health
+//   surfaces, but not admission prerequisites.
+
+struct campaign_feature_gate_requirement_t {
+  const char* label;
+  const char* host;
+  const char* subsystem;
+  const char* feature;
+};
+
+static constexpr campaign_feature_gate_requirement_t
+    CAMPAIGN_FEATURE_GATE_REQUIREMENTS[] = {
+  { "NET",         "PI",     "SYSTEM",    "NETWORK" },
+  { "BATTERY",     "PI",     "SYSTEM",    "BATTERY" },
+  { "GNSS",        "PI",     "GNSS",      "REPORT" },
+  { "PI_HOST",     "PI",     "SYSTEM",    "HOST" },
+  { "POWER",       "PI",     "SYSTEM",    "POWER" },
+  { "T_IMPORT",    "PI",     "SYSTEM",    "TEENSY_FEATURE_IMPORT" },
+  { "T_FEATURE",   "TEENSY", "SYSTEM",    "FEATURE_STATUS" },
+  { "PPS/V_AUTH",  "TEENSY", "INTERRUPT", "PPS_VCLOCK_AUTHORITY" },
+  { "FLOORLINE",   "TEENSY", "INTERRUPT", "FLOORLINE" },
+  { "QTIMER_CNT",  "TEENSY", "INTERRUPT", "QTIMER_COUNTER_CUSTODY" },
+  { "QTIMER_DWT",  "TEENSY", "INTERRUPT", "QTIMER_DWT_RULER" },
+  { "CTR32_LINE",  "TEENSY", "INTERRUPT", "COUNTER32_LINEAGE" },
+  { "DWT_CAL",     "TEENSY", "CLOCKS",    "DWT_CALIBRATION" },
+  { "STATIC_PRED", "TEENSY", "CLOCKS",    "STATIC_PREDICTION" },
+  { "SMARTZERO",   "TEENSY", "CLOCKS",    "SMARTZERO" },
+  { "ALPHA_EPOCH", "TEENSY", "CLOCKS",    "ALPHA_EPOCH" },
+  { "OCXO_ORIGIN", "TEENSY", "CLOCKS",    "OCXO_PUBLIC_ORIGIN" },
+  { "ENV",         "PI",     "SYSTEM",    "ENVIRONMENT" },
+  { "SENSORS",     "PI",     "SYSTEM",    "SENSORS" },
+};
+
+static volatile bool     g_campaign_feature_gate_seen = false;
+static volatile bool     g_campaign_feature_gate_open = false;
+static volatile uint32_t g_campaign_feature_gate_update_count = 0;
+static volatile uint32_t g_campaign_feature_gate_transition_count = 0;
+static volatile uint32_t g_campaign_feature_gate_required_count =
+    (uint32_t)(sizeof(CAMPAIGN_FEATURE_GATE_REQUIREMENTS) /
+               sizeof(CAMPAIGN_FEATURE_GATE_REQUIREMENTS[0]));
+static char g_campaign_feature_gate_reason[128] =
+    "FEATURE_STATUS not yet received";
+static char g_campaign_feature_gate_first_problem[32] = "";
+
+static const char* feature_status_lookup(const Payload& root,
+                                         const char* host,
+                                         const char* subsystem,
+                                         const char* feature) {
+  const Payload host_payload = root.getPayload(host);
+  if (host_payload.empty()) return nullptr;
+
+  const Payload subsystem_payload = host_payload.getPayload(subsystem);
+  if (subsystem_payload.empty()) return nullptr;
+
+  return subsystem_payload.getString(feature);
+}
+
+static bool feature_status_is_nominal(const char* status) {
+  return status && strcasecmp(status, "NOMINAL") == 0;
+}
+
+static void campaign_feature_gate_set_reason(const char* reason,
+                                             const char* first_problem = nullptr) {
+  safeCopy(g_campaign_feature_gate_reason,
+           sizeof(g_campaign_feature_gate_reason),
+           reason ? reason : "");
+  safeCopy(g_campaign_feature_gate_first_problem,
+           sizeof(g_campaign_feature_gate_first_problem),
+           first_problem ? first_problem : "");
+}
+
+static void campaign_feature_gate_recompute(const Payload& root) {
+  bool ready = true;
+  const campaign_feature_gate_requirement_t* failed = nullptr;
+
+  for (const auto& req : CAMPAIGN_FEATURE_GATE_REQUIREMENTS) {
+    const char* status =
+        feature_status_lookup(root, req.host, req.subsystem, req.feature);
+    if (!feature_status_is_nominal(status)) {
+      ready = false;
+      failed = &req;
+      break;
+    }
+  }
+
+  if (g_campaign_feature_gate_open != ready) {
+    g_campaign_feature_gate_transition_count++;
+  }
+
+  g_campaign_feature_gate_open = ready;
+
+  if (ready) {
+    campaign_feature_gate_set_reason("NOMINAL");
+  } else if (failed) {
+    char reason[96];
+    snprintf(reason, sizeof(reason), "%s not NOMINAL", failed->label);
+    campaign_feature_gate_set_reason(reason, failed->label);
+  } else {
+    campaign_feature_gate_set_reason("campaign feature gate closed");
+  }
+}
+
+static void on_feature_status(const Payload& payload) {
+  g_campaign_feature_gate_seen = true;
+  g_campaign_feature_gate_update_count++;
+  campaign_feature_gate_recompute(payload);
+}
+
+static bool campaign_feature_gate_open(void) {
+  return g_campaign_feature_gate_seen && g_campaign_feature_gate_open;
+}
+
+static void payload_add_campaign_feature_gate(Payload& p) {
+  p.add("campaign_gate_source", "FEATURE_STATUS");
+  p.add("campaign_gate_open", campaign_feature_gate_open());
+  p.add("campaign_gate_seen", (bool)g_campaign_feature_gate_seen);
+  p.add("campaign_gate_reason", g_campaign_feature_gate_reason);
+  p.add("campaign_gate_first_problem", g_campaign_feature_gate_first_problem);
+  p.add("campaign_gate_update_count",
+        (uint32_t)g_campaign_feature_gate_update_count);
+  p.add("campaign_gate_transition_count",
+        (uint32_t)g_campaign_feature_gate_transition_count);
+  p.add("campaign_gate_required_count",
+        (uint32_t)g_campaign_feature_gate_required_count);
+  p.add("campaign_gate_requires_science_residuals", false);
+  p.add("campaign_gate_requires_timebase_publication", false);
 }
 
 static const char* timebase_build_stage_name(uint32_t stage) {
@@ -3752,6 +3892,14 @@ static FLASHMEM Payload cmd_start(const Payload& args) {
     return err;
   }
 
+  if (!campaign_feature_gate_open()) {
+    Payload err;
+    err.add("error", "campaign feature gate closed");
+    err.add("status", "start_rejected_feature_gate");
+    payload_add_campaign_feature_gate(err);
+    return err;
+  }
+
   safeCopy(campaign_name, sizeof(campaign_name), name);
 
   ocxo_dac_pacing_abort_all();
@@ -4383,6 +4531,8 @@ static void add_campaign_payload(Payload& p) {
   p.add("campaign_warmup_remaining", (uint32_t)g_campaign_warmup_remaining);
   p.add("campaign_warmup_suppressed_total",
         (uint32_t)g_campaign_warmup_suppressed_total);
+
+  payload_add_campaign_feature_gate(p);
 }
 
 static void add_epoch_payload(Payload& p) {
@@ -5315,6 +5465,13 @@ static FLASHMEM Payload cmd_report_status(const Payload&) {
   return p;
 }
 
+static FLASHMEM Payload cmd_report_gate(const Payload&) {
+  Payload p;
+  p.add("report", "CLOCKS_CAMPAIGN_GATE");
+  payload_add_campaign_feature_gate(p);
+  return p;
+}
+
 static FLASHMEM Payload cmd_report_summary(const Payload&) {
   Payload p;
   p.add("report", "CLOCKS_SUMMARY");
@@ -5586,6 +5743,7 @@ static const process_command_entry_t CLOCKS_COMMANDS[] = {
   { "RECOVER",           cmd_recover           },
   { "REPORT",            cmd_report            },
   { "REPORT_STATUS",     cmd_report_status     },
+  { "REPORT_GATE",       cmd_report_gate       },
   { "REPORT_SUMMARY",    cmd_report_summary    },
   { "REPORT_EPOCH",      cmd_report_epoch      },
   { "REPORT_SMARTZERO",  cmd_report_smartzero  },
@@ -5616,6 +5774,7 @@ static const process_command_entry_t CLOCKS_COMMANDS[] = {
 
 static const process_subscription_entry_t CLOCKS_SUBSCRIPTIONS[] = {
   { "TIMEBASE_FRAGMENT", on_timebase_fragment },
+  { "FEATURE_STATUS",    on_feature_status    },
   { nullptr, nullptr },
 };
 

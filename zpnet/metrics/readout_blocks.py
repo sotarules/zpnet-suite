@@ -52,11 +52,12 @@ DAC_COARSE_STEP = 10.0
 DAC_MIN_CODE = 0.0
 DAC_MAX_CODE = 65535.0
 
-FEATURE_POLL_INTERVAL_S = 5.0
 FEATURE_GRID_COLUMNS = 4
 FEATURE_GRID_CELL_WIDTH = 39
 
 PUBSUB_TAP_SOCKET = "/tmp/zpnet_pubsub_tap.sock"
+FEATURE_STATUS_TOPIC = "FEATURE_STATUS"
+FEATURE_STATUS_RECONNECT_S = 1.0
 DAC_TICK_TOPIC = "CLOCKS_DAC_TICK"
 DAC_TICK_STALE_S = 5.0
 DAC_TICK_RECONNECT_S = 1.0
@@ -91,6 +92,8 @@ FEATURE_STATUS_GRID = (
 _FEATURE_STATUS_CACHE: dict | None = None
 _FEATURE_STATUS_CACHE_TS = 0.0
 _FEATURE_STATUS_CACHE_ERROR: str | None = None
+_FEATURE_STATUS_THREAD: threading.Thread | None = None
+_FEATURE_STATUS_LOCK = threading.Lock()
 
 _DAC_TICK_CACHE: dict | None = None
 _DAC_TICK_CACHE_TS = 0.0
@@ -107,23 +110,96 @@ def _get_system_snapshot() -> dict:
     return send_command(machine="PI", subsystem="SYSTEM", command="REPORT")["payload"]
 
 
-def _get_feature_status_payload(force: bool = False) -> tuple[dict, str | None]:
-    """Return the global PI SYSTEM feature tree using command/response.
+def _feature_status_listener_loop() -> None:
+    """Background tap listener for the unified FEATURE_STATUS feed.
 
-    Metrics repaints once per second, but feature readiness is human-facing
-    state.  Poll the command path at a slower cadence so SYSTEM.FEATURES stays
-    explicit, current, and cheap.  If a poll fails after a good read, keep the
-    last good tree visible and mark the board stale.
+    FEATURE_STATUS is a change-driven pub/sub snapshot authored by PI SYSTEM.
+    Metrics keeps the latest tree in memory and never polls SYSTEM.FEATURES once
+    the feed is alive.  A one-shot command fallback remains for cold start and
+    for direct tests when pubsub is not running yet.
     """
     global _FEATURE_STATUS_CACHE, _FEATURE_STATUS_CACHE_TS, _FEATURE_STATUS_CACHE_ERROR
 
+    subscribe = json.dumps(
+        {"type": "set_topics", "topics": [FEATURE_STATUS_TOPIC]},
+        separators=(",", ":"),
+    ).encode("utf-8") + b"\n"
+
+    while True:
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.settimeout(2.0)
+                sock.connect(PUBSUB_TAP_SOCKET)
+                sock.settimeout(None)
+
+                with sock.makefile("rwb") as stream:
+                    stream.write(subscribe)
+                    stream.flush()
+
+                    with _FEATURE_STATUS_LOCK:
+                        _FEATURE_STATUS_CACHE_ERROR = None
+
+                    for raw in stream:
+                        try:
+                            msg = json.loads(raw.decode("utf-8"))
+                        except Exception:
+                            continue
+
+                        if not isinstance(msg, dict):
+                            continue
+                        if msg.get("type") != "publish":
+                            continue
+                        if msg.get("topic") != FEATURE_STATUS_TOPIC:
+                            continue
+
+                        payload = msg.get("payload")
+                        if not isinstance(payload, dict):
+                            continue
+
+                        with _FEATURE_STATUS_LOCK:
+                            _FEATURE_STATUS_CACHE = payload
+                            _FEATURE_STATUS_CACHE_TS = time.monotonic()
+                            _FEATURE_STATUS_CACHE_ERROR = None
+
+        except Exception as e:
+            with _FEATURE_STATUS_LOCK:
+                _FEATURE_STATUS_CACHE_ERROR = str(e)
+            time.sleep(FEATURE_STATUS_RECONNECT_S)
+
+
+def _ensure_feature_status_listener() -> None:
+    global _FEATURE_STATUS_THREAD
+
+    if _FEATURE_STATUS_THREAD is not None and _FEATURE_STATUS_THREAD.is_alive():
+        return
+
+    with _FEATURE_STATUS_LOCK:
+        if _FEATURE_STATUS_THREAD is not None and _FEATURE_STATUS_THREAD.is_alive():
+            return
+        _FEATURE_STATUS_THREAD = threading.Thread(
+            target=_feature_status_listener_loop,
+            name="zpnet-feature-status-listener",
+            daemon=True,
+        )
+        _FEATURE_STATUS_THREAD.start()
+
+
+def _get_feature_status_payload(force: bool = False) -> tuple[dict, str | None]:
+    """Return the global PI SYSTEM feature tree from FEATURE_STATUS.
+
+    The normal path is the pubsub tap.  Command/response is retained only as a
+    cold-start seed or explicit force-refresh; it is not used as a repaint-time
+    polling loop.
+    """
+    global _FEATURE_STATUS_CACHE, _FEATURE_STATUS_CACHE_TS, _FEATURE_STATUS_CACHE_ERROR
+
+    _ensure_feature_status_listener()
+
     now = time.monotonic()
-    if (
-        not force
-        and _FEATURE_STATUS_CACHE is not None
-        and (now - _FEATURE_STATUS_CACHE_TS) < FEATURE_POLL_INTERVAL_S
-    ):
-        return _FEATURE_STATUS_CACHE, _FEATURE_STATUS_CACHE_ERROR
+    with _FEATURE_STATUS_LOCK:
+        cached = _FEATURE_STATUS_CACHE
+        error = _FEATURE_STATUS_CACHE_ERROR
+
 
     try:
         resp = send_command(machine="PI", subsystem="SYSTEM", command="FEATURES")
@@ -133,17 +209,22 @@ def _get_feature_status_payload(force: bool = False) -> tuple[dict, str | None]:
         if not isinstance(payload, dict):
             raise RuntimeError("PI SYSTEM FEATURES returned a non-object payload")
 
-        _FEATURE_STATUS_CACHE = payload
-        _FEATURE_STATUS_CACHE_TS = now
-        _FEATURE_STATUS_CACHE_ERROR = None
+        with _FEATURE_STATUS_LOCK:
+            _FEATURE_STATUS_CACHE = payload
+            _FEATURE_STATUS_CACHE_TS = now
+            _FEATURE_STATUS_CACHE_ERROR = None
         return payload, None
 
     except Exception as e:
-        _FEATURE_STATUS_CACHE_TS = now
-        _FEATURE_STATUS_CACHE_ERROR = str(e)
-        if _FEATURE_STATUS_CACHE is not None:
-            return _FEATURE_STATUS_CACHE, _FEATURE_STATUS_CACHE_ERROR
-        return {}, _FEATURE_STATUS_CACHE_ERROR
+        with _FEATURE_STATUS_LOCK:
+            _FEATURE_STATUS_CACHE_TS = now
+            _FEATURE_STATUS_CACHE_ERROR = str(e)
+            cached = _FEATURE_STATUS_CACHE
+            error = _FEATURE_STATUS_CACHE_ERROR
+
+        if cached is not None:
+            return cached, error
+        return {}, error
 
 
 def _get_pi_clocks_report() -> dict:
@@ -1104,7 +1185,7 @@ def feature_status_grid_lines() -> list[str]:
         )
 
     if error:
-        lines.append(f"LAST POLL ERROR: {error[:120]}")
+        lines.append(f"FEATURE_STATUS TAP ERROR: {error[:120]}")
 
     lines.append("")
     return lines
