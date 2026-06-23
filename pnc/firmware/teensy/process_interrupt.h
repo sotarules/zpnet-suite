@@ -403,10 +403,28 @@ struct interrupt_integrity_interval_check_t {
 struct interrupt_integrity_counter_check_t {
   bool     valid = false;
   bool     last_ok = false;
+  bool     last_sample_counted = false;
   uint32_t test_count = 0;
   uint32_t ok_count = 0;
   uint32_t bad_count = 0;
   uint32_t skipped_count = 0;
+
+  // Recovery boundary.  Lifetime bad_count is diagnostic evidence; launch
+  // readiness is based on a current clean streak after the lane has locked.
+  bool     locked = false;
+  uint32_t lock_sequence = 0;
+  uint32_t lock_count = 0;
+  uint32_t lock_streak_required = 0;
+  uint32_t consecutive_ok_count = 0;
+  uint32_t prelock_ok_count = 0;
+  uint32_t prelock_bad_count = 0;
+  uint32_t post_lock_ok_count = 0;
+  uint32_t post_lock_bad_count = 0;
+  uint32_t first_bad_sequence = 0;
+  uint32_t last_bad_sequence = 0;
+  uint32_t last_bad_observed_delta_ticks = 0;
+  uint32_t last_bad_expected_delta_ticks = 0;
+  int32_t  last_bad_observed_minus_expected_ticks = 0;
 
   uint32_t sequence = 0;
   uint32_t expected_delta_ticks = 0;

@@ -182,6 +182,10 @@ static constexpr uint32_t QTIMER_CNTR_MATCH_LOCK_STREAK = 1000U;
 static constexpr uint32_t QTIMER_DWT_MATCH_GATE_CYCLES = 20U;
 static constexpr uint32_t QTIMER_DWT_1KHZ_LOCK_STREAK = 1000U;
 static constexpr uint32_t QTIMER_DWT_1S_LOCK_STREAK = 8U;
+// Counter32 lineage is a one-second edge-adjacency readiness rail.  It should
+// recover like the DWT ruler after a historical bad sample instead of using
+// lifetime bad_count as a permanent launch-pad veto.
+static constexpr uint32_t COUNTER32_LINEAGE_LOCK_STREAK = 8U;
 // The 1 kHz DWT check depends on the live DWT/GNSS cycles-per-second
 // ruler.  Do not let it enter the operational courtroom until the slower
 // one-second DWT surface has locked; otherwise startup CPS/ruler movement can
@@ -349,11 +353,16 @@ void interrupt_integrity_note_counter32(interrupt_subscriber_kind_t kind,
   s->previous_counter32 = interval_valid
       ? (current_counter32 - observed_delta_ticks)
       : 0U;
+  s->lock_streak_required = COUNTER32_LINEAGE_LOCK_STREAK;
 
   if (!interval_valid || expected_delta_ticks == 0U) {
+    // Missing first/prior edge evidence is not a lineage failure.  Preserve
+    // lifetime skipped accounting, but do not poison the feature gate or reset
+    // an already-earned clean streak.
     s->skipped_count++;
-    s->last_ok = false;
+    s->last_sample_counted = false;
     s->observed_minus_expected_ticks = 0;
+    interrupt_feature_update_counter32_lineage();
     return;
   }
 
@@ -363,13 +372,48 @@ void interrupt_integrity_note_counter32(interrupt_subscriber_kind_t kind,
           : -(int32_t)(expected_delta_ticks - observed_delta_ticks);
   s->observed_minus_expected_ticks = error;
   s->test_count++;
+  s->last_sample_counted = true;
 
-  if (error == 0) {
+  const bool was_locked = s->locked;
+  const bool ok = (error == 0);
+
+  if (ok) {
     s->ok_count++;
     s->last_ok = true;
+    if (s->consecutive_ok_count != UINT32_MAX) {
+      s->consecutive_ok_count++;
+    }
   } else {
     s->bad_count++;
     s->last_ok = false;
+    s->consecutive_ok_count = 0;
+    if (s->first_bad_sequence == 0U) {
+      s->first_bad_sequence = sequence;
+    }
+    s->last_bad_sequence = sequence;
+    s->last_bad_observed_delta_ticks = observed_delta_ticks;
+    s->last_bad_expected_delta_ticks = expected_delta_ticks;
+    s->last_bad_observed_minus_expected_ticks = error;
+  }
+
+  if (was_locked) {
+    if (ok) {
+      s->post_lock_ok_count++;
+    } else {
+      s->post_lock_bad_count++;
+    }
+  } else {
+    if (ok) {
+      s->prelock_ok_count++;
+    } else {
+      s->prelock_bad_count++;
+    }
+
+    if (ok && s->consecutive_ok_count >= COUNTER32_LINEAGE_LOCK_STREAK) {
+      s->locked = true;
+      s->lock_sequence = sequence;
+      s->lock_count++;
+    }
   }
 
   interrupt_feature_update_counter32_lineage();
@@ -844,23 +888,40 @@ static void interrupt_feature_update_qtimer_dwt_ruler(void) {
                       : system_feature_status_t::INITIALIZING));
 }
 
-static bool interrupt_feature_counter_lineage_ok(
+static bool interrupt_feature_counter_lineage_recovered(
     const interrupt_integrity_counter_check_t& s) {
-  return s.valid && s.ok_count != 0U && s.bad_count == 0U;
+  // Launch readiness is a current/recovered-state predicate.  Lifetime
+  // bad_count remains courtroom evidence, but one stale violation must not
+  // veto every future campaign once exact one-second lineage has rebuilt a
+  // clean streak.
+  return s.valid && s.locked && s.last_sample_counted && s.last_ok &&
+         s.consecutive_ok_count >= s.lock_streak_required;
+}
+
+static bool interrupt_feature_counter_lineage_active_anomaly(
+    const interrupt_integrity_counter_check_t& s) {
+  // A locked lineage rail is anomalous only while its most recent counted
+  // sample is bad.  Clean samples move the feature back through INITIALIZING
+  // until the recovery streak is rebuilt, then NOMINAL.
+  return s.valid && s.locked && s.last_sample_counted && !s.last_ok;
 }
 
 static void interrupt_feature_update_counter32_lineage(void) {
-  const bool v_ok = interrupt_feature_counter_lineage_ok(g_interrupt_integrity.vclock_counter);
+  const bool v_ok = interrupt_feature_counter_lineage_recovered(
+      g_interrupt_integrity.vclock_counter);
   const bool o1_ok = !interrupt_feature_lane_required(interrupt_subscriber_kind_t::OCXO1) ||
-      interrupt_feature_counter_lineage_ok(g_interrupt_integrity.ocxo1_counter);
+      interrupt_feature_counter_lineage_recovered(g_interrupt_integrity.ocxo1_counter);
   const bool o2_ok = !interrupt_feature_lane_required(interrupt_subscriber_kind_t::OCXO2) ||
-      interrupt_feature_counter_lineage_ok(g_interrupt_integrity.ocxo2_counter);
+      interrupt_feature_counter_lineage_recovered(g_interrupt_integrity.ocxo2_counter);
   const bool anomaly =
-      g_interrupt_integrity.vclock_counter.bad_count != 0U ||
+      interrupt_feature_counter_lineage_active_anomaly(
+          g_interrupt_integrity.vclock_counter) ||
       (interrupt_feature_lane_required(interrupt_subscriber_kind_t::OCXO1) &&
-       g_interrupt_integrity.ocxo1_counter.bad_count != 0U) ||
+       interrupt_feature_counter_lineage_active_anomaly(
+           g_interrupt_integrity.ocxo1_counter)) ||
       (interrupt_feature_lane_required(interrupt_subscriber_kind_t::OCXO2) &&
-       g_interrupt_integrity.ocxo2_counter.bad_count != 0U);
+       interrupt_feature_counter_lineage_active_anomaly(
+           g_interrupt_integrity.ocxo2_counter));
 
   interrupt_feature_set_cached(
       "COUNTER32_LINEAGE",
@@ -10793,6 +10854,51 @@ static FLASHMEM Payload cmd_report_integrity(const Payload&) {
   p.add("cntr_ocxo2_locked", g_generation_gate_ocxo2.feature_custody_locked);
   p.add("cntr_ocxo2_post_lock_reject",
         g_generation_gate_ocxo2.feature_custody_post_lock_reject_count);
+
+  p.add("counter32_lineage_feature_nominal",
+        g_interrupt_feature_counter32_lineage == system_feature_status_t::NOMINAL);
+  p.add("counter32_lineage_feature_initializing",
+        g_interrupt_feature_counter32_lineage == system_feature_status_t::INITIALIZING);
+  p.add("counter32_lineage_feature_anomaly",
+        g_interrupt_feature_counter32_lineage == system_feature_status_t::ANOMALY);
+
+  auto add_lineage = [&](const char* prefix,
+                         const interrupt_integrity_counter_check_t& c) {
+    char key[96];
+
+    auto add_bool = [&](const char* suffix, bool value) {
+      snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+      p.add(key, value);
+    };
+    auto add_u32 = [&](const char* suffix, uint32_t value) {
+      snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+      p.add(key, value);
+    };
+    auto add_i32 = [&](const char* suffix, int32_t value) {
+      snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+      p.add(key, value);
+    };
+
+    add_bool("valid", c.valid);
+    add_bool("locked", c.locked);
+    add_bool("last_counted", c.last_sample_counted);
+    add_bool("last_ok", c.last_ok);
+    add_u32("clean_streak", c.consecutive_ok_count);
+    add_u32("recovery_required", c.lock_streak_required);
+    add_u32("test_count", c.test_count);
+    add_u32("bad_count", c.bad_count);
+    add_u32("prelock_bad", c.prelock_bad_count);
+    add_u32("post_lock_bad", c.post_lock_bad_count);
+    add_u32("last_bad_seq", c.last_bad_sequence);
+    add_u32("observed_delta", c.observed_delta_ticks);
+    add_u32("expected_delta", c.expected_delta_ticks);
+    add_i32("error", c.observed_minus_expected_ticks);
+    add_i32("last_bad_error", c.last_bad_observed_minus_expected_ticks);
+  };
+
+  add_lineage("c32_vclock", s.vclock_counter);
+  add_lineage("c32_ocxo1", s.ocxo1_counter);
+  add_lineage("c32_ocxo2", s.ocxo2_counter);
 
   p.add("vclock_gnss_valid", g.valid);
   p.add("vclock_gnss_computed", g.computed_valid);
