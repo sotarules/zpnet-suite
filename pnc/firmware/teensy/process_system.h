@@ -68,6 +68,16 @@
 void process_system_register(void);
 
 // ============================================================================
+// Boot diagnostics
+// ============================================================================
+//
+// Capture raw MCU reset cause once during boot and expose it through
+// SYSTEM.REPORT.  This deliberately avoids a new subsystem, event type,
+// retained ledger, or command surface.
+void system_bootdiag_capture_reset_cause(void);
+uint32_t system_bootdiag_reset_cause_raw(void);
+
+// ============================================================================
 // Feature status substrate
 // ============================================================================
 //

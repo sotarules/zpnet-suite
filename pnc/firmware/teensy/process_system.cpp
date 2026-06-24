@@ -44,6 +44,33 @@ static Payload system_features_tree_payload(void);
 static void system_feature_schedule_fragment_publish(void);
 
 // --------------------------------------------------------------
+// Boot diagnostics
+// --------------------------------------------------------------
+//
+// Reset cause is captured once and reported as raw silicon truth.  Decoding can
+// happen Pi-side or in later tooling.  Keeping this raw avoids policy, string
+// payload growth, and any new subsystem footprint.
+
+static uint32_t g_system_boot_reset_cause_raw = 0;
+static bool     g_system_boot_reset_cause_captured = false;
+
+void system_bootdiag_capture_reset_cause(void) {
+  if (g_system_boot_reset_cause_captured) return;
+
+#if defined(SRC_SRSR)
+  g_system_boot_reset_cause_raw = SRC_SRSR;
+#else
+  g_system_boot_reset_cause_raw = 0;
+#endif
+
+  g_system_boot_reset_cause_captured = true;
+}
+
+uint32_t system_bootdiag_reset_cause_raw(void) {
+  return g_system_boot_reset_cause_raw;
+}
+
+// --------------------------------------------------------------
 // Internal terminal state
 // --------------------------------------------------------------
 static bool system_shutdown   = false;
@@ -381,6 +408,10 @@ static Payload cmd_report(const Payload& /*args*/) {
 
   // Internal reference voltage (best-effort)
   p.add("vref_v", readVrefVolts());
+
+  // Boot diagnostics — raw reset-cause register captured once at boot.
+  p.add("boot_reset_cause_raw", g_system_boot_reset_cause_raw);
+  p.add("boot_reset_cause_captured", g_system_boot_reset_cause_captured);
 
   // Heap availability
   p.add("free_heap_bytes", freeHeapBytes());

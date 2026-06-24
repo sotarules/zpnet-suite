@@ -254,6 +254,10 @@ void setup() {
   // DWT determinism first.
   maximize_dwt_determinism();
 
+  // Capture raw MCU reset cause through SYSTEM's existing truth surface.
+  // No event, no retained ledger, no new subsystem.
+  system_bootdiag_capture_reset_cause();
+
   debug_blink("911");    // unconditional startup indicator (LED-only)
 
   pinMode(LED_BUILTIN, OUTPUT);
