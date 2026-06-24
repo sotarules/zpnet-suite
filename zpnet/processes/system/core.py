@@ -8,6 +8,7 @@ Responsibilities:
   • Expose SYSTEM.REPORT
   • Emit SYSTEM_STATUS events on fixed cadence
   • Publish FEATURE_STATUS whenever readiness state changes
+  • Republish FEATURE_STATUS periodically even when quiescent
 
 Process model:
   • One systemd service
@@ -60,6 +61,7 @@ from zpnet.shared.util import (
 # ------------------------------------------------------------------
 
 POLL_INTERVAL_SEC = 30
+FEATURE_STATUS_PUBLISH_INTERVAL_SEC = 10
 
 # ------------------------------------------------------------------
 # Raspberry Pi status configuration
@@ -347,9 +349,13 @@ def _feature_tree_snapshot() -> Dict[str, Dict[str, Dict[str, str]]]:
         return _combine_feature_trees(_PI_FEATURES, _TEENSY_FEATURES)
 
 
-def _publish_feature_status_if_changed(features: Any = None) -> bool:
+def _publish_feature_status_if_changed(features: Any = None, *, force: bool = False) -> bool:
     """
-    Publish FEATURE_STATUS only when the scalar feature tree actually changed.
+    Publish FEATURE_STATUS when the scalar feature tree changed, or when forced.
+
+    The forced path is the quiescent-system heartbeat: subscribers that start
+    after the last feature transition must still receive the current readiness
+    tree without waiting for a real state change.
 
     Wire shape:
       {"topic":"FEATURE_STATUS","payload":{"TEENSY":{...},"PI":{...}}}
@@ -361,12 +367,28 @@ def _publish_feature_status_if_changed(features: Any = None) -> bool:
         return False
 
     with _FEATURE_PUBLISH_LOCK:
-        if snapshot == _LAST_PUBLISHED_FEATURE_STATUS:
+        if not force and snapshot == _LAST_PUBLISHED_FEATURE_STATUS:
             return False
         _LAST_PUBLISHED_FEATURE_STATUS = _copy_feature_tree(snapshot)
 
     publish("FEATURE_STATUS", snapshot)
     return True
+
+
+def feature_status_periodic_publisher() -> None:
+    """
+    Publish FEATURE_STATUS on a fixed cadence even when no feature changes.
+
+    Change-triggered publication remains the fast path.  This heartbeat keeps
+    late subscribers, campaign preflight, and metrics taps from hanging behind
+    a quiescent feature tree after the system is already nominal.
+    """
+    while True:
+        try:
+            time.sleep(FEATURE_STATUS_PUBLISH_INTERVAL_SEC)
+            _publish_feature_status_if_changed(force=True)
+        except Exception:
+            logging.exception("[feature_status_periodic_publisher] publish failed")
 
 
 def _update_builtin_pi_features(*,
@@ -1686,6 +1708,11 @@ def run() -> None:
     try:
         threading.Thread(
             target=system_poller,
+            daemon=True,
+        ).start()
+
+        threading.Thread(
+            target=feature_status_periodic_publisher,
             daemon=True,
         ).start()
 

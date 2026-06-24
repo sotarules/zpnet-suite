@@ -101,10 +101,9 @@ uint64_t recover_gnss_ns  = 0;
 uint64_t recover_ocxo1_ns = 0;
 uint64_t recover_ocxo2_ns = 0;
 
-// Most recently published compact TIMEBASE_FRAGMENT, retained for cmd_report.
-// TIMEBASE_FORENSICS is deliberately not retained; it is the larger companion
-// payload that this split keeps out of steady heap.
-static Payload g_last_fragment;
+// Do not retain a copy of the most recent TIMEBASE_FRAGMENT here.
+// The Pi persists the authoritative row, and keeping a second heap-backed
+// Payload alive on Teensy made campaign publication unnecessarily fragile.
 
 // Alpha-authored physical PPS witness DWT audit surface.  These are published
 // into the TIMEBASE publication pair so Pi-side reports can compare physical PPS-to-PPS
@@ -146,7 +145,8 @@ static constexpr bool TIMEBASE_FORENSICS_MINIMAL_PAYLOAD_ENABLED = true;
 // autopsy surfaces.  This is the next step above MINIMAL_PAIR_ONLY and is
 // intended to preserve the Pi pair contract while giving raw_cycles enough
 // cycle evidence to plot observed/EMA/FloorLine behavior.
-static constexpr bool TIMEBASE_FORENSICS_MICRO_RAW_CYCLES_ENABLED = true;
+static constexpr bool TIMEBASE_FORENSICS_MICRO_RAW_CYCLES_ENABLED = false;
+static constexpr bool TIMEBASE_FORENSICS_MINIMAL_HEALTH_FIELDS_ENABLED = false;
 
 // The richer slim/full forensics builders remain compiled for focused future
 // experiments, but they are not used by the 1 Hz campaign stream in this step.
@@ -931,6 +931,33 @@ welford_t welford_pps_witness  = {};
 welford_t welford_ocxo1_dac    = {};
 welford_t welford_ocxo2_dac    = {};
 
+
+struct recover_welford_state_t {
+  bool has_dwt = false;
+  bool has_vclock = false;
+  bool has_ocxo1 = false;
+  bool has_ocxo2 = false;
+  bool has_pps_witness = false;
+  bool has_ocxo1_dac = false;
+  bool has_ocxo2_dac = false;
+  uint32_t restored_lane_count = 0;
+  welford_t dwt = {};
+  welford_t vclock = {};
+  welford_t ocxo1 = {};
+  welford_t ocxo2 = {};
+  welford_t pps_witness = {};
+  welford_t ocxo1_dac = {};
+  welford_t ocxo2_dac = {};
+};
+
+static recover_welford_state_t g_recover_welfords_pending = {};
+static uint32_t g_recover_welford_capture_count = 0;
+static uint32_t g_recover_welford_restore_count = 0;
+static uint32_t g_recover_welford_last_restored_lane_count = 0;
+static uint32_t g_welford_gap_advance_count = 0;
+static uint32_t g_welford_gap_advance_last_public_count = 0;
+static uint32_t g_welford_gap_advance_last_lane_count = 0;
+
 void welford_reset(welford_t& w) {
   w.n       = 0;
   w.mean    = 0.0;
@@ -957,6 +984,299 @@ double welford_stderr(const welford_t& w) {
   if (w.n < 2) return 0.0;
   const double sd = sqrt(w.m2 / (double)(w.n - 1));
   return sd / sqrt((double)w.n);
+}
+
+static bool welford_advance_missing_to_n(welford_t& w, uint64_t target_n) {
+  if (target_n <= w.n) return false;
+
+  const double sd = welford_stddev(w);
+  if (w.n == 0ULL) {
+    w.mean = 0.0;
+    w.min_val = 0.0;
+    w.max_val = 0.0;
+  }
+
+  w.n = target_n;
+  w.m2 = (target_n >= 2ULL)
+      ? (sd * sd * (double)(target_n - 1ULL))
+      : 0.0;
+  return true;
+}
+
+static uint32_t welfords_advance_missing_gap_before_row(uint32_t public_count) {
+  // TIMEBASE gaps are canonical campaign seconds.  When RECOVER projects the
+  // ledgers across a down-time gap, those missing one-second rows must be
+  // represented in N before the next observed sample is folded in.  Preserve
+  // the recovered mean/stddev shape and advance only the campaign sample
+  // cardinality; the live observed row will then perform the ordinary
+  // Welford update.
+  //
+  // Per-row clocks update once per published TIMEBASE row:
+  //   DWT, VCLOCK, DAC -> N == public_count after this row.
+  // OCXO residuals need two bookends, so they lag by one:
+  //   OCXO1/2 -> N == public_count - 1 after this row.
+  const uint64_t before_row_n =
+      (public_count > 0U) ? (uint64_t)(public_count - 1U) : 0ULL;
+  const uint64_t before_row_ocxo_n =
+      (public_count > 1U) ? (uint64_t)(public_count - 2U) : 0ULL;
+
+  uint32_t advanced = 0;
+  if (welford_advance_missing_to_n(welford_dwt, before_row_n)) advanced++;
+  if (welford_advance_missing_to_n(welford_vclock, before_row_n)) advanced++;
+  if (welford_advance_missing_to_n(welford_ocxo1, before_row_ocxo_n)) advanced++;
+  if (welford_advance_missing_to_n(welford_ocxo2, before_row_ocxo_n)) advanced++;
+  if (welford_advance_missing_to_n(welford_ocxo1_dac, before_row_n)) advanced++;
+  if (welford_advance_missing_to_n(welford_ocxo2_dac, before_row_n)) advanced++;
+
+  if (advanced != 0U) {
+    g_welford_gap_advance_count++;
+    g_welford_gap_advance_last_public_count = public_count;
+    g_welford_gap_advance_last_lane_count = advanced;
+  }
+  return advanced;
+}
+
+
+static FLASHMEM void welford_restore_from_summary(welford_t& w,
+                                         uint64_t n,
+                                         double mean,
+                                         double stddev,
+                                         double min_val,
+                                         double max_val) {
+  if (n == 0ULL) {
+    welford_reset(w);
+    return;
+  }
+
+  const double sd = (stddev >= 0.0) ? stddev : -stddev;
+  w.n = n;
+  w.mean = mean;
+  w.m2 = (n >= 2ULL) ? (sd * sd * (double)(n - 1ULL)) : 0.0;
+  w.min_val = min_val;
+  w.max_val = max_val;
+}
+
+static FLASHMEM bool payload_try_get_welford_object(const Payload& obj,
+                                           welford_t& out) {
+  uint64_t n = 0;
+  double mean = 0.0;
+  if (!obj.tryGetUInt64("n", n) || !obj.tryGetDouble("mean", mean)) {
+    return false;
+  }
+
+  double stddev = 0.0;
+  if (!obj.tryGetDouble("stddev", stddev)) {
+    double stderr_value = 0.0;
+    if (obj.tryGetDouble("stderr", stderr_value) && n > 0ULL) {
+      stddev = stderr_value * sqrt((double)n);
+    }
+  }
+
+  double min_val = mean;
+  double max_val = mean;
+  (void)obj.tryGetDouble("min", min_val);
+  (void)obj.tryGetDouble("max", max_val);
+  welford_restore_from_summary(out, n, mean, stddev, min_val, max_val);
+  return true;
+}
+
+static FLASHMEM bool payload_try_get_welford_flat(const Payload& args,
+                                         const char* prefix,
+                                         welford_t& out) {
+  char key[96];
+
+  uint64_t n = 0;
+  snprintf(key, sizeof(key), "%s_welford_n", prefix);
+  if (!args.tryGetUInt64(key, n)) return false;
+
+  double mean = 0.0;
+  snprintf(key, sizeof(key), "%s_welford_mean", prefix);
+  if (!args.tryGetDouble(key, mean)) return false;
+
+  double stddev = 0.0;
+  snprintf(key, sizeof(key), "%s_welford_stddev", prefix);
+  if (!args.tryGetDouble(key, stddev)) {
+    double stderr_value = 0.0;
+    snprintf(key, sizeof(key), "%s_welford_stderr", prefix);
+    if (args.tryGetDouble(key, stderr_value) && n > 0ULL) {
+      stddev = stderr_value * sqrt((double)n);
+    }
+  }
+
+  double min_val = mean;
+  double max_val = mean;
+  snprintf(key, sizeof(key), "%s_welford_min", prefix);
+  (void)args.tryGetDouble(key, min_val);
+  snprintf(key, sizeof(key), "%s_welford_max", prefix);
+  (void)args.tryGetDouble(key, max_val);
+
+  welford_restore_from_summary(out, n, mean, stddev, min_val, max_val);
+  return true;
+}
+
+static FLASHMEM bool payload_try_get_stats_welford(const Payload& root,
+                                          const char* stats_key,
+                                          welford_t& out) {
+  const Payload stats = root.getPayload("stats");
+  if (stats.empty()) return false;
+
+  const Payload lane = stats.getPayload(stats_key);
+  if (lane.empty()) return false;
+
+  const Payload nested = lane.getPayload("welford");
+  if (!nested.empty() && payload_try_get_welford_object(nested, out)) {
+    return true;
+  }
+
+  return payload_try_get_welford_object(lane, out);
+}
+
+static FLASHMEM bool payload_try_get_stats_dac_welford(const Payload& root,
+                                              const char* dac_key,
+                                              welford_t& out) {
+  const Payload stats = root.getPayload("stats");
+  if (stats.empty()) return false;
+
+  const Payload dac = stats.getPayload("dac");
+  if (dac.empty()) return false;
+
+  const Payload lane = dac.getPayload(dac_key);
+  if (lane.empty()) return false;
+
+  return payload_try_get_welford_object(lane, out);
+}
+
+static FLASHMEM bool payload_try_get_recovery_welford(const Payload& args,
+                                             const char* flat_prefix,
+                                             const char* stats_key,
+                                             bool dac_stats,
+                                             welford_t& out) {
+  if (payload_try_get_welford_flat(args, flat_prefix, out)) return true;
+  if (dac_stats) {
+    if (payload_try_get_stats_dac_welford(args, stats_key, out)) return true;
+  } else if (payload_try_get_stats_welford(args, stats_key, out)) {
+    return true;
+  }
+
+  const Payload fragment = args.getPayload("fragment");
+  if (!fragment.empty()) {
+    if (payload_try_get_welford_flat(fragment, flat_prefix, out)) return true;
+    if (dac_stats) {
+      if (payload_try_get_stats_dac_welford(fragment, stats_key, out)) return true;
+    } else if (payload_try_get_stats_welford(fragment, stats_key, out)) {
+      return true;
+    }
+  }
+
+  const Payload payload = args.getPayload("payload");
+  if (!payload.empty()) {
+    if (payload_try_get_welford_flat(payload, flat_prefix, out)) return true;
+    if (dac_stats) {
+      if (payload_try_get_stats_dac_welford(payload, stats_key, out)) return true;
+    } else if (payload_try_get_stats_welford(payload, stats_key, out)) {
+      return true;
+    }
+
+    const Payload payload_fragment = payload.getPayload("fragment");
+    if (!payload_fragment.empty()) {
+      if (payload_try_get_welford_flat(payload_fragment, flat_prefix, out)) return true;
+      if (dac_stats) {
+        return payload_try_get_stats_dac_welford(payload_fragment, stats_key, out);
+      }
+      return payload_try_get_stats_welford(payload_fragment, stats_key, out);
+    }
+  }
+
+  return false;
+}
+
+static FLASHMEM bool recover_welford_capture_lane(const Payload& args,
+                                         const char* flat_prefix,
+                                         const char* stats_key,
+                                         bool dac_stats,
+                                         bool& has_lane,
+                                         welford_t& dst,
+                                         uint32_t& count) {
+  has_lane = payload_try_get_recovery_welford(args,
+                                             flat_prefix,
+                                             stats_key,
+                                             dac_stats,
+                                             dst);
+  if (has_lane) count++;
+  return has_lane;
+}
+
+static FLASHMEM void recover_welfords_capture(const Payload& args) {
+  g_recover_welfords_pending = recover_welford_state_t{};
+
+  uint32_t count = 0;
+  (void)recover_welford_capture_lane(args, "dwt", "dwt", false,
+                                     g_recover_welfords_pending.has_dwt,
+                                     g_recover_welfords_pending.dwt,
+                                     count);
+  (void)recover_welford_capture_lane(args, "vclock", "vclock", false,
+                                     g_recover_welfords_pending.has_vclock,
+                                     g_recover_welfords_pending.vclock,
+                                     count);
+  (void)recover_welford_capture_lane(args, "ocxo1", "ocxo1", false,
+                                     g_recover_welfords_pending.has_ocxo1,
+                                     g_recover_welfords_pending.ocxo1,
+                                     count);
+  (void)recover_welford_capture_lane(args, "ocxo2", "ocxo2", false,
+                                     g_recover_welfords_pending.has_ocxo2,
+                                     g_recover_welfords_pending.ocxo2,
+                                     count);
+  (void)recover_welford_capture_lane(args, "pps_witness", "pps_witness", false,
+                                     g_recover_welfords_pending.has_pps_witness,
+                                     g_recover_welfords_pending.pps_witness,
+                                     count);
+  (void)recover_welford_capture_lane(args, "ocxo1_dac", "ocxo1", true,
+                                     g_recover_welfords_pending.has_ocxo1_dac,
+                                     g_recover_welfords_pending.ocxo1_dac,
+                                     count);
+  (void)recover_welford_capture_lane(args, "ocxo2_dac", "ocxo2", true,
+                                     g_recover_welfords_pending.has_ocxo2_dac,
+                                     g_recover_welfords_pending.ocxo2_dac,
+                                     count);
+
+  g_recover_welfords_pending.restored_lane_count = count;
+  if (count != 0U) {
+    g_recover_welford_capture_count++;
+  }
+}
+
+static void recover_welfords_apply_pending(void) {
+  if (g_recover_welfords_pending.restored_lane_count == 0U) {
+    g_recover_welford_last_restored_lane_count = 0U;
+    return;
+  }
+
+  if (g_recover_welfords_pending.has_dwt) {
+    welford_dwt = g_recover_welfords_pending.dwt;
+  }
+  if (g_recover_welfords_pending.has_vclock) {
+    welford_vclock = g_recover_welfords_pending.vclock;
+  }
+  if (g_recover_welfords_pending.has_ocxo1) {
+    welford_ocxo1 = g_recover_welfords_pending.ocxo1;
+  }
+  if (g_recover_welfords_pending.has_ocxo2) {
+    welford_ocxo2 = g_recover_welfords_pending.ocxo2;
+  }
+  if (g_recover_welfords_pending.has_pps_witness) {
+    welford_pps_witness = g_recover_welfords_pending.pps_witness;
+  }
+  if (g_recover_welfords_pending.has_ocxo1_dac) {
+    welford_ocxo1_dac = g_recover_welfords_pending.ocxo1_dac;
+  }
+  if (g_recover_welfords_pending.has_ocxo2_dac) {
+    welford_ocxo2_dac = g_recover_welfords_pending.ocxo2_dac;
+  }
+
+  g_recover_welford_last_restored_lane_count =
+      g_recover_welfords_pending.restored_lane_count;
+  g_recover_welford_restore_count++;
+  g_recover_welfords_pending = recover_welford_state_t{};
 }
 
 // ============================================================================
@@ -1021,7 +1341,7 @@ static const char* smartzero_decision_name_beta(interrupt_smartzero_decision_t d
   }
 }
 
-static void payload_add_smartzero_lane(Payload& parent,
+static FLASHMEM void payload_add_smartzero_lane(Payload& parent,
                                        const char* key,
                                        const interrupt_smartzero_lane_snapshot_t& z) {
   Payload lane;
@@ -1051,7 +1371,7 @@ static void payload_add_smartzero_lane(Payload& parent,
   parent.add_object(key, lane);
 }
 
-static void payload_add_smartzero_snapshot_object(
+static FLASHMEM void payload_add_smartzero_snapshot_object(
   Payload& parent,
   const char* key,
   const interrupt_smartzero_snapshot_t& z,
@@ -1085,7 +1405,7 @@ static void payload_add_smartzero_snapshot_object(
   parent.add_object(key, obj);
 }
 
-static void payload_add_prefixed_smartzero_compact(
+static FLASHMEM void payload_add_prefixed_smartzero_compact(
   Payload& p,
   const char* prefix,
   const interrupt_smartzero_snapshot_t& z,
@@ -1118,7 +1438,7 @@ static void payload_add_prefixed_smartzero_compact(
   add_u32("current_lane_index", z.current_lane_index);
 }
 
-static void payload_add_smartzero_install_transaction(Payload& p) {
+static FLASHMEM void payload_add_smartzero_install_transaction(Payload& p) {
   p.add("smartzero_install_in_progress", clocks_alpha_epoch_install_in_progress());
   p.add("smartzero_install_attempt_count",
         clocks_alpha_smartzero_install_attempt_count());
@@ -1152,7 +1472,7 @@ static void payload_add_smartzero_install_transaction(Payload& p) {
         clocks_alpha_smartzero_install_last_reason());
 }
 
-static void payload_add_visible_origin_snapshot(Payload& parent,
+static FLASHMEM void payload_add_visible_origin_snapshot(Payload& parent,
                                                 const char* key,
                                                 time_clock_id_t clock) {
   clocks_alpha_ocxo_visible_origin_snapshot_t s{};
@@ -1197,7 +1517,7 @@ static void payload_add_visible_origin_snapshot(Payload& parent,
   parent.add_object(key, obj);
 }
 
-static void payload_add_visible_origin_summary(Payload& p) {
+static FLASHMEM void payload_add_visible_origin_summary(Payload& p) {
   Payload visible_origin;
   payload_add_visible_origin_snapshot(visible_origin, "ocxo1",
                                       time_clock_id_t::OCXO1);
@@ -1206,7 +1526,7 @@ static void payload_add_visible_origin_summary(Payload& p) {
   p.add_object("visible_origin", visible_origin);
 }
 
-static void payload_add_smartzero_summary(Payload& p) {
+static FLASHMEM void payload_add_smartzero_summary(Payload& p) {
   interrupt_smartzero_snapshot_t live{};
   (void)interrupt_smartzero_live_snapshot(&live);
 
@@ -1299,7 +1619,7 @@ static clocks_static_prediction_snapshot_t prediction_snapshot_for_clock(time_cl
   return s;
 }
 
-static void prediction_add_legacy_lane_summary(Payload& prediction,
+static FLASHMEM void prediction_add_legacy_lane_summary(Payload& prediction,
                                                const char* prefix,
                                                const clocks_static_prediction_snapshot_t& s) {
   char key[96];
@@ -1323,7 +1643,7 @@ static void prediction_add_legacy_lane_summary(Payload& prediction,
   add_i32("static_residual_cycles", s.static_residual_cycles);
 }
 
-static void payload_add_flat_prediction_lane(Payload& p,
+static FLASHMEM void payload_add_flat_prediction_lane(Payload& p,
                                              const char* prefix,
                                              const clocks_static_prediction_snapshot_t& s) {
   char key[96];
@@ -1347,7 +1667,7 @@ static void payload_add_flat_prediction_lane(Payload& p,
   add_i32("residual_cycles", s.static_residual_cycles);
 }
 
-static void payload_add_prediction_summary(Payload& p) {
+static FLASHMEM void payload_add_prediction_summary(Payload& p) {
   const clocks_static_prediction_snapshot_t pps = prediction_snapshot_for_pps();
   const clocks_static_prediction_snapshot_t vclock = prediction_snapshot_for_clock(time_clock_id_t::VCLOCK);
   const clocks_static_prediction_snapshot_t ocxo1 = prediction_snapshot_for_clock(time_clock_id_t::OCXO1);
@@ -1558,7 +1878,7 @@ static void payload_add_pps_vclock_edge_forensics(
   parent.add_object("pps_vclock_edge", edge);
 }
 
-static void payload_add_lane_forensics_object(Payload& parent,
+static FLASHMEM void payload_add_lane_forensics_object(Payload& parent,
                                               bool valid,
                                               const clocks_alpha_lane_forensics_t& f) {
   Payload forensics;
@@ -1751,7 +2071,7 @@ static void payload_add_lane_forensics_object(Payload& parent,
   parent.add_object("forensics", forensics);
 }
 
-static void payload_add_ocxo_service_object(Payload& parent,
+static FLASHMEM void payload_add_ocxo_service_object(Payload& parent,
                                             interrupt_subscriber_kind_t kind,
                                             bool valid,
                                             const clocks_alpha_lane_forensics_t& f) {
@@ -1916,7 +2236,7 @@ static void payload_add_ocxo_pps_residual_object(Payload& parent,
   parent.add_object("pps_residual", residual);
 }
 
-static void payload_add_ocxo_cycle_residual_diag_object(
+static FLASHMEM void payload_add_ocxo_cycle_residual_diag_object(
     Payload& parent,
     const ocxo_cycle_residual_diag_t& d) {
   Payload diag;
@@ -1970,7 +2290,7 @@ static uint32_t floorline_inferred_interval_cycles(
   return (cycles > (uint64_t)UINT32_MAX) ? UINT32_MAX : (uint32_t)cycles;
 }
 
-static void payload_add_floorline_object(Payload& parent,
+static FLASHMEM void payload_add_floorline_object(Payload& parent,
                                          bool valid,
                                          const clocks_alpha_lane_forensics_t& f) {
   const bool floor_valid = floorline_candidate_present(valid, f);
@@ -2031,7 +2351,7 @@ static void payload_add_floorline_object(Payload& parent,
   parent.add_object("floorline", floor);
 }
 
-static void payload_add_slim_dwt_lane_forensics(
+static FLASHMEM void payload_add_slim_dwt_lane_forensics(
     Payload& parent,
     bool valid,
     const clocks_alpha_lane_forensics_t& f) {
@@ -2127,7 +2447,7 @@ static void payload_add_slim_dwt_lane_forensics(
   parent.add_object("dwt_forensics", dwt);
 }
 
-static void payload_add_slim_pps_vclock_edge_forensics(
+static FLASHMEM void payload_add_slim_pps_vclock_edge_forensics(
     Payload& parent,
     bool available,
     const clocks_pps_vclock_edge_forensics_t& e) {
@@ -2177,7 +2497,7 @@ static void payload_add_slim_pps_vclock_edge_forensics(
   parent.add_object("pps_vclock_edge", edge);
 }
 
-static void payload_add_slim_compare_service(
+static FLASHMEM void payload_add_slim_compare_service(
     Payload& parent,
     interrupt_subscriber_kind_t kind,
     bool valid,
@@ -2249,7 +2569,7 @@ static void payload_add_slim_compare_service(
   parent.add_object("compare_service", service);
 }
 
-static void payload_add_slim_vclock_forensics(Payload& parent,
+static FLASHMEM void payload_add_slim_vclock_forensics(Payload& parent,
                                               uint64_t public_ns,
                                               bool valid,
                                               const clocks_alpha_lane_forensics_t& f) {
@@ -2260,7 +2580,7 @@ static void payload_add_slim_vclock_forensics(Payload& parent,
   parent.add_object("vclock", lane);
 }
 
-static void payload_add_slim_ocxo_forensics(
+static FLASHMEM void payload_add_slim_ocxo_forensics(
     Payload& parent,
     const char* key,
     uint64_t public_ns,
@@ -2341,7 +2661,7 @@ static void payload_add_vclock_fragment(Payload& p, uint64_t public_gnss_ns) {
   p.add_object("vclock", lane);
 }
 
-static void payload_add_vclock_forensics(Payload& p,
+static FLASHMEM void payload_add_vclock_forensics(Payload& p,
                                          uint64_t public_gnss_ns,
                                          bool forensics_valid,
                                          const clocks_alpha_lane_forensics_t& f) {
@@ -2393,7 +2713,7 @@ static void payload_add_ocxo_fragment(Payload& p,
   p.add_object(key, lane);
 }
 
-static void payload_add_ocxo_forensics(Payload& p,
+static FLASHMEM void payload_add_ocxo_forensics(Payload& p,
                                        const char* key,
                                        uint64_t public_ns,
                                        uint64_t public_measured_ns,
@@ -2520,7 +2840,7 @@ static void servo_input_diag_reset(servo_input_diag_t& d) {
   d = servo_input_diag_t{};
 }
 
-static void payload_add_servo_input_diag(Payload& lane,
+static FLASHMEM void payload_add_servo_input_diag(Payload& lane,
                                          const servo_input_diag_t& d) {
   Payload input;
   input.add("control_doctrine", "SLOPE_NEUTRALIZATION");
@@ -2577,7 +2897,7 @@ static bool ocxo_dac_static_rounded_only_runtime(void) {
   return !clocks_ocxo_dac_dither_operator_enabled();
 }
 
-static void payload_add_dac_realization_object(Payload& parent,
+static FLASHMEM void payload_add_dac_realization_object(Payload& parent,
                                                const char* key,
                                                const ocxo_dac_state_t& s) {
   Payload r;
@@ -3268,6 +3588,7 @@ void clocks_beta_pps(void) {
 
     campaign_seconds = recover_gnss_ns / 1000000000ull;
     pps_interval_residuals_reset();
+    recover_welfords_apply_pending();
 
     request_recover = false;
     campaign_state = clocks_campaign_state_t::STARTED;
@@ -3376,6 +3697,7 @@ void clocks_beta_pps(void) {
   const uint64_t public_ocxo2_ns = public_ocxo2_measured_ns;
 
   const uint32_t public_count = (uint32_t)campaign_seconds;
+  (void)welfords_advance_missing_gap_before_row(public_count);
 
   // Public PPS-projected tuple residuals are intentionally not computed on
   // Teensy anymore. Pi-side authority_map reconstructs that witness from the
@@ -3597,7 +3919,7 @@ void clocks_beta_pps(void) {
     timebase_build_stage(TIMEBASE_BUILD_STAGE_BUILD_COMPLETE);
 
     timebase_build_stage(TIMEBASE_BUILD_STAGE_ASSIGN_LAST_FRAGMENT);
-    g_last_fragment = p;
+    // Heap discipline: do not retain/copy the just-built fragment on Teensy.
     g_timebase_assign_last_fragment_count++;
     g_timebase_last_assign_campaign_seconds = campaign_seconds;
 
@@ -3644,14 +3966,17 @@ void clocks_beta_pps(void) {
       g_timebase_forensics_minimal_count++;
       f.add("minimal", true);
       f.add("temporary_safety_mode", "MINIMAL_PAIR_ONLY");
-      f.add("pps_vclock_edge_available", pps_vclock_edge_forensics_valid);
-      f.add("vclock_forensics_available", vclock_forensics_valid);
-      f.add("ocxo1_forensics_available", ocxo1_forensics_valid);
-      f.add("ocxo2_forensics_available", ocxo2_forensics_valid);
-      f.add("ocxo1_pps_projected", ocxo1_pps_projected_valid);
-      f.add("ocxo2_pps_projected", ocxo2_pps_projected_valid);
-      f.add("ocxo1_pps_residual_valid", pps_residuals.ocxo1_valid);
-      f.add("ocxo2_pps_residual_valid", pps_residuals.ocxo2_valid);
+
+      if (TIMEBASE_FORENSICS_MINIMAL_HEALTH_FIELDS_ENABLED) {
+        f.add("pps_vclock_edge_available", pps_vclock_edge_forensics_valid);
+        f.add("vclock_forensics_available", vclock_forensics_valid);
+        f.add("ocxo1_forensics_available", ocxo1_forensics_valid);
+        f.add("ocxo2_forensics_available", ocxo2_forensics_valid);
+        f.add("ocxo1_pps_projected", ocxo1_pps_projected_valid);
+        f.add("ocxo2_pps_projected", ocxo2_pps_projected_valid);
+        f.add("ocxo1_pps_residual_valid", pps_residuals.ocxo1_valid);
+        f.add("ocxo2_pps_residual_valid", pps_residuals.ocxo2_valid);
+      }
 
       if (TIMEBASE_FORENSICS_MICRO_RAW_CYCLES_ENABLED) {
         // MICRO_RAW_CYCLES_V1
@@ -4113,6 +4438,7 @@ static FLASHMEM Payload cmd_recover(const Payload& args) {
   recover_gnss_ns  = strtoull(s_gnss,   nullptr, 10);
   recover_ocxo1_ns = strtoull(s_ocxo1,  nullptr, 10);
   recover_ocxo2_ns = strtoull(s_ocxo2,  nullptr, 10);
+  recover_welfords_capture(args);
 
   interrupt_smartzero_abort();
   request_recover = true;
@@ -4122,6 +4448,10 @@ static FLASHMEM Payload cmd_recover(const Payload& args) {
 
   Payload p;
   p.add("status", "recover_requested");
+  p.add("welford_recovery_lane_count",
+        g_recover_welfords_pending.restored_lane_count);
+  p.add("welford_recovery_supplied",
+        g_recover_welfords_pending.restored_lane_count != 0U);
   return p;
 }
 
@@ -4157,7 +4487,7 @@ static double ppb_fast_vs_vclock(uint32_t vclock_cycles,
           (double)vclock_cycles) * 1.0e9;
 }
 
-static void add_alpha_event_payload(Payload& p,
+static FLASHMEM void add_alpha_event_payload(Payload& p,
                                     const clocks_alpha_lane_forensics_t& f,
                                     const clocks_alpha_lane_forensics_t* vclock_ref) {
   p.add("valid", f.valid);
@@ -4373,7 +4703,7 @@ static void add_alpha_event_payload(Payload& p,
   p.add_object("regression", regression);
 }
 
-static void add_projection_payload(Payload& p,
+static FLASHMEM void add_projection_payload(Payload& p,
                                    time_clock_id_t clock_id,
                                    uint32_t report_dwt,
                                    uint64_t report_ns,
@@ -4409,7 +4739,7 @@ static void add_projection_payload(Payload& p,
   (void)clock_id;
 }
 
-static void add_clock_forensics_payload(Payload& p,
+static FLASHMEM void add_clock_forensics_payload(Payload& p,
                                         uint32_t report_dwt,
                                         uint64_t vclock_ns,
                                         bool vclock_ok,
@@ -4477,7 +4807,7 @@ static void add_clock_forensics_payload(Payload& p,
 }
 
 
-static void add_single_clock_forensics_payload(Payload& p,
+static FLASHMEM void add_single_clock_forensics_payload(Payload& p,
                                                const char* key,
                                                time_clock_id_t clock_id,
                                                uint32_t report_dwt,
@@ -4519,7 +4849,7 @@ static void add_single_clock_forensics_payload(Payload& p,
 // for the Teensy transport/heap budget.  Keep CLOCKS.REPORT small and make each
 // heavy surface explicitly opt-in through a focused command.
 
-static void add_summary_payload(Payload& p) {
+static FLASHMEM void add_summary_payload(Payload& p) {
   Payload summary;
   const uint32_t report_dwt = DWT_CYCCNT;
   const uint64_t dwt64_cycles_at_report = clocks_dwt_cycles_at_dwt(report_dwt);
@@ -4554,7 +4884,7 @@ static void add_summary_payload(Payload& p) {
   p.add_object("summary", summary);
 }
 
-static void add_campaign_payload(Payload& p) {
+static FLASHMEM void add_campaign_payload(Payload& p) {
   p.add("campaign_state",
         campaign_state == clocks_campaign_state_t::STARTED ? "STARTED" : "STOPPED");
   p.add("campaign", campaign_name);
@@ -4578,7 +4908,7 @@ static void add_campaign_payload(Payload& p) {
   payload_add_campaign_feature_gate(p);
 }
 
-static void add_epoch_payload(Payload& p) {
+static FLASHMEM void add_epoch_payload(Payload& p) {
   p.add("epoch_pending", clocks_epoch_pending());
   p.add("epoch_owner", "CLOCKS_SMARTZERO");
   p.add("epoch_source", "SMARTZERO");
@@ -4641,7 +4971,7 @@ static void add_epoch_payload(Payload& p) {
   p.add("interrupt_pps_rebootstrap_pending", interrupt_pps_rebootstrap_pending());
 }
 
-static void add_compact_smartzero_status(Payload& p) {
+static FLASHMEM void add_compact_smartzero_status(Payload& p) {
   interrupt_smartzero_snapshot_t installed{};
   const bool installed_valid = clocks_alpha_epoch_last_smartzero(&installed);
   const bool installed_backing_epoch = clocks_alpha_installed_smartzero_backing_epoch();
@@ -4694,7 +5024,7 @@ static void add_compact_smartzero_status(Payload& p) {
   p.add("smartzero_abort_count", live.abort_count);
 }
 
-static void add_dac_payload(Payload& p) {
+static FLASHMEM void add_dac_payload(Payload& p) {
   Payload o1;
   o1.add("dac", ocxo1_dac.dac_fractional);
   o1.add("dac_hw_code", (uint32_t)ocxo1_dac.dac_hw_code);
@@ -4841,7 +5171,7 @@ static const char* alpha_flow_stage_name_beta(uint32_t stage) {
   }
 }
 
-static void payload_add_alpha_flow_lane(Payload& parent,
+static FLASHMEM void payload_add_alpha_flow_lane(Payload& parent,
                                         const char* key,
                                         time_clock_id_t clock,
                                         bool detailed) {
@@ -4986,7 +5316,7 @@ static const char* ocxo_pps_projection_invalid_reason_name(uint32_t reason) {
   }
 }
 
-static void payload_add_ocxo_pps_projection_lane(Payload& parent,
+static FLASHMEM void payload_add_ocxo_pps_projection_lane(Payload& parent,
                                                  const char* key,
                                                  time_clock_id_t clock) {
   clocks_alpha_ocxo_pps_projection_snapshot_t s{};
@@ -5108,7 +5438,7 @@ static const char* ocxo_projection_guard_lane_verdict(bool snapshot_ok,
   return "CLEAN";
 }
 
-static void payload_add_ocxo_projection_guard_lane(Payload& parent,
+static FLASHMEM void payload_add_ocxo_projection_guard_lane(Payload& parent,
                                                    const char* key,
                                                    time_clock_id_t clock) {
   clocks_alpha_ocxo_pps_projection_snapshot_t s{};
@@ -5248,6 +5578,15 @@ static FLASHMEM Payload cmd_report_timebase_publish(const Payload&) {
   counters.add("forensics_minimal_count", g_timebase_forensics_minimal_count);
   counters.add("forensics_micro_raw_count", g_timebase_forensics_micro_raw_count);
   counters.add("forensics_slim_count", g_timebase_forensics_slim_count);
+  counters.add("recover_welford_capture_count", g_recover_welford_capture_count);
+  counters.add("recover_welford_restore_count", g_recover_welford_restore_count);
+  counters.add("recover_welford_last_restored_lane_count",
+               g_recover_welford_last_restored_lane_count);
+  counters.add("welford_gap_advance_count", g_welford_gap_advance_count);
+  counters.add("welford_gap_advance_last_public_count",
+               g_welford_gap_advance_last_public_count);
+  counters.add("welford_gap_advance_last_lane_count",
+               g_welford_gap_advance_last_lane_count);
   p.add_object("counters", counters);
 
   Payload gates;
@@ -5348,7 +5687,7 @@ static FLASHMEM Payload cmd_report_timebase_publish(const Payload&) {
   return p;
 }
 
-static void payload_add_interrupt_interval_check(
+static FLASHMEM void payload_add_interrupt_interval_check(
     Payload& parent,
     const char* key,
     const interrupt_integrity_interval_check_t& s) {
@@ -5369,7 +5708,7 @@ static void payload_add_interrupt_interval_check(
   parent.add_object(key, p);
 }
 
-static void payload_add_interrupt_counter_check(
+static FLASHMEM void payload_add_interrupt_counter_check(
     Payload& parent,
     const char* key,
     const interrupt_integrity_counter_check_t& s) {
@@ -5389,7 +5728,7 @@ static void payload_add_interrupt_counter_check(
   parent.add_object(key, p);
 }
 
-static void payload_add_alpha_ns_check(Payload& parent,
+static FLASHMEM void payload_add_alpha_ns_check(Payload& parent,
                                        const char* key,
                                        const clocks_alpha_integrity_ns_check_t& s) {
   Payload p;
@@ -5407,7 +5746,7 @@ static void payload_add_alpha_ns_check(Payload& parent,
   parent.add_object(key, p);
 }
 
-static void payload_add_alpha_ocxo_integrity(
+static FLASHMEM void payload_add_alpha_ocxo_integrity(
     Payload& parent,
     const char* key,
     const clocks_alpha_integrity_ocxo_check_t& s) {
@@ -5684,6 +6023,15 @@ static FLASHMEM Payload cmd_report_stats(const Payload&) {
                campaign_total_ppb_from_ratio(public_gnss_ns,
                                              campaign_public_ocxo2_ns()));
   p.add("frequency_source", "CAMPAIGN_TOTAL_RATIO");
+  p.add("recover_welford_capture_count", g_recover_welford_capture_count);
+  p.add("recover_welford_restore_count", g_recover_welford_restore_count);
+  p.add("recover_welford_last_restored_lane_count",
+        g_recover_welford_last_restored_lane_count);
+  p.add("welford_gap_advance_count", g_welford_gap_advance_count);
+  p.add("welford_gap_advance_last_public_count",
+        g_welford_gap_advance_last_public_count);
+  p.add("welford_gap_advance_last_lane_count",
+        g_welford_gap_advance_last_lane_count);
   return p;
 }
 

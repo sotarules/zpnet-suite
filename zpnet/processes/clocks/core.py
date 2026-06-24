@@ -1093,6 +1093,133 @@ def _compute_ppb(clock_ns: int, gnss_ns: int) -> float:
     return (((clock_ns - gnss_ns) / gnss_ns) * 1e9) if gnss_ns else 0.0
 
 
+WELFORD_RECOVERY_LANES = (
+    ("dwt",         "dwt_welford",         ("stats.dwt.welford",)),
+    ("vclock",      "vclock_welford",      ("stats.vclock.welford",)),
+    ("ocxo1",       "ocxo1_welford",       ("stats.ocxo1.welford",)),
+    ("ocxo2",       "ocxo2_welford",       ("stats.ocxo2.welford",)),
+    ("pps_witness", "pps_witness_welford", ("stats.pps_witness.welford",)),
+    ("ocxo1_dac",   "ocxo1_dac_welford",   ("stats.dac.ocxo1", "stats.ocxo1_dac.welford")),
+    ("ocxo2_dac",   "ocxo2_dac_welford",   ("stats.dac.ocxo2", "stats.ocxo2_dac.welford")),
+)
+
+
+def _recover_welford_value(
+    *,
+    last_tb: Dict[str, Any],
+    last_frag: Dict[str, Any],
+    flat_prefix: str,
+    nested_paths: Tuple[str, ...],
+    field: str,
+) -> Any:
+    """Find one saved Teensy Welford field in the latest TIMEBASE row."""
+    for path in nested_paths:
+        obj = _path_get(last_frag, path)
+        if isinstance(obj, dict) and obj.get(field) is not None:
+            return obj.get(field)
+
+    flat_key = f"{flat_prefix}_{field}"
+    for source in (last_frag, last_tb):
+        if isinstance(source, dict) and source.get(flat_key) is not None:
+            return source.get(flat_key)
+
+    return None
+
+
+def _add_welford_recovery_args(
+    teensy_args: Dict[str, Any],
+    *,
+    last_tb: Dict[str, Any],
+    last_frag: Dict[str, Any],
+) -> int:
+    """Append recoverable Teensy Welford accumulators to CLOCKS.RECOVER args."""
+    restored = 0
+
+    for _lane, flat_prefix, nested_paths in WELFORD_RECOVERY_LANES:
+        n_raw = _recover_welford_value(
+            last_tb=last_tb,
+            last_frag=last_frag,
+            flat_prefix=flat_prefix,
+            nested_paths=nested_paths,
+            field="n",
+        )
+        n = _as_int(n_raw)
+        if n is None:
+            continue
+
+        teensy_args[f"{flat_prefix}_n"] = str(int(n))
+        for field in ("mean", "stddev", "stderr", "min", "max"):
+            value = _recover_welford_value(
+                last_tb=last_tb,
+                last_frag=last_frag,
+                flat_prefix=flat_prefix,
+                nested_paths=nested_paths,
+                field=field,
+            )
+            if value is not None:
+                teensy_args[f"{flat_prefix}_{field}"] = str(value)
+        restored += 1
+
+    return restored
+
+
+def _restore_gnss_raw_from_last_timebase(
+    *,
+    last_tb: Dict[str, Any],
+    projected_gnss_ns: int,
+    projected_gnss_raw_ns: int,
+) -> bool:
+    """Restore the Pi-owned GNSS_RAW synthetic clock and Welford accumulator.
+
+    GNSS_RAW is deliberately Pi-only and is not sent to Teensy RECOVER.  The
+    raw synthetic clock is projected to the same campaign GNSS identity as the
+    Teensy clocks, while its Welford accumulator is restored from the last
+    persisted TIMEBASE extra_clocks block.
+    """
+    global _gnss_raw_ns, _gnss_raw_n, _gnss_raw_valid
+    global _gnss_raw_welford_n, _gnss_raw_welford_mean, _gnss_raw_welford_m2
+    global _gnss_raw_welford_min, _gnss_raw_welford_max
+
+    extra = _report_extra_clocks(last_tb)
+
+    raw_ns = _first_float(
+        projected_gnss_raw_ns if projected_gnss_raw_ns > 0 else None,
+        extra.get("gnss_raw_ns"),
+        last_tb.get("gnss_raw_ns"),
+    )
+    if raw_ns is not None:
+        _gnss_raw_ns = float(raw_ns)
+
+    projected_n = int(projected_gnss_ns // NS_PER_SECOND) if projected_gnss_ns > 0 else 0
+    ref_ns = _as_int(extra.get("gnss_raw_ref_ns") or last_tb.get("gnss_raw_ref_ns"))
+    if projected_n > 0:
+        _gnss_raw_n = projected_n
+    elif ref_ns is not None and ref_ns > 0:
+        _gnss_raw_n = int(ref_ns // NS_PER_SECOND)
+
+    _gnss_raw_valid = _gnss_raw_ns > 0.0 and _gnss_raw_n > 0
+
+    n = _as_int(extra.get("gnss_raw_welford_n") or last_tb.get("gnss_raw_welford_n"))
+    if n is None:
+        return False
+
+    mean = _first_float(extra.get("gnss_raw_welford_mean"), last_tb.get("gnss_raw_welford_mean")) or 0.0
+    stddev = _first_float(extra.get("gnss_raw_welford_stddev"), last_tb.get("gnss_raw_welford_stddev"))
+    stderr_value = _first_float(extra.get("gnss_raw_welford_stderr"), last_tb.get("gnss_raw_welford_stderr"))
+    min_val = _first_float(extra.get("gnss_raw_welford_min"), last_tb.get("gnss_raw_welford_min"))
+    max_val = _first_float(extra.get("gnss_raw_welford_max"), last_tb.get("gnss_raw_welford_max"))
+
+    if stddev is None:
+        stddev = (stderr_value * math.sqrt(float(n))) if stderr_value is not None and n > 0 else 0.0
+
+    _gnss_raw_welford_n = int(n)
+    _gnss_raw_welford_mean = float(mean)
+    _gnss_raw_welford_m2 = (float(stddev) * float(stddev) * float(n - 1)) if n >= 2 else 0.0
+    _gnss_raw_welford_min = float(min_val) if min_val is not None else float(mean)
+    _gnss_raw_welford_max = float(max_val) if max_val is not None else float(mean)
+    return True
+
+
 # ---------------------------------------------------------------------
 # TIMEBASE_FRAGMENT schema helpers — PPS/VCLOCK canonical surface
 # ---------------------------------------------------------------------
@@ -2988,6 +3115,17 @@ def _recover_campaign() -> None:
         "ocxo1_ns": str(int(projected_ocxo1_ns)),
         "ocxo2_ns": str(int(projected_ocxo2_ns)),
     }
+
+    recovered_welford_count = _add_welford_recovery_args(
+        teensy_recover_args,
+        last_tb=last_tb,
+        last_frag=last_frag,
+    )
+    logging.info(
+        "📊 [recovery] restored %d Teensy Welford accumulator payload(s) into RECOVER args",
+        recovered_welford_count,
+    )
+
     if recover_ocxo1_dac is not None:
         teensy_recover_args["set_dac1"] = str(float(recover_ocxo1_dac))
     if recover_ocxo2_dac is not None:
@@ -3023,9 +3161,16 @@ def _recover_campaign() -> None:
 
     _reset_trackers()
 
-    # Seed GNSS_RAW accumulator from projected value
-    _gnss_raw_ns = float(projected_gnss_raw_ns)
-    _gnss_raw_valid = last_gnss_raw_ns > 0
+    gnss_raw_restored = _restore_gnss_raw_from_last_timebase(
+        last_tb=last_tb,
+        projected_gnss_ns=int(projected_gnss_ns),
+        projected_gnss_raw_ns=int(projected_gnss_raw_ns),
+    )
+    logging.info(
+        "📊 [recovery] GNSS_RAW restore: restored=%s projected_ns=%d",
+        str(gnss_raw_restored),
+        int(projected_gnss_raw_ns),
+    )
 
     _campaign_active = True
 
