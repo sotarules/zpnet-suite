@@ -414,8 +414,15 @@ static Payload cmd_report(const Payload& /*args*/) {
   p.add("boot_reset_cause_captured", g_system_boot_reset_cause_captured);
 
   // Heap availability
+  //
+  // Do not call maxAllocBytes() from SYSTEM.REPORT.  SYSTEM.REPORT is part of
+  // the recurring telemetry surface, and maxAllocBytes() actively probes the
+  // heap by repeatedly malloc/free testing large blocks.  That makes the report
+  // an observer that perturbs the heap during campaigns.  Keep the recurring
+  // report non-invasive; use focused MEMORY_INFO / future explicit diagnostics
+  // for deeper heap probes.
   p.add("free_heap_bytes", freeHeapBytes());
-  p.add("max_alloc_bytes", maxAllocBytes());
+  p.add("max_alloc_probe_disabled", true);
 
   timepop_idle_witness_snapshot_t idle{};
   timepop_idle_witness_snapshot(&idle);
