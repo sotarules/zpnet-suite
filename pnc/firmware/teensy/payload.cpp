@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <new>
 
 // ============================================================================
 // Global Payload Instrumentation (monotonic, centralized)
@@ -872,12 +873,99 @@ Payload PayloadArrayView::get(size_t index) const {
 PayloadArray::PayloadArray()
     : _buf("")
     , _first(true)
+    , _items(nullptr)
     , _item_count(0) {}
+
+PayloadArray::~PayloadArray() {
+    _release_items();
+}
+
+PayloadArray::PayloadArray(const PayloadArray& other)
+    : _buf(other._buf)
+    , _first(other._first)
+    , _items(nullptr)
+    , _item_count(0) {
+    _copy_items_from(other);
+}
+
+PayloadArray& PayloadArray::operator=(const PayloadArray& other) {
+    if (this == &other) return *this;
+
+    _buf = other._buf;
+    _first = other._first;
+    _release_items();
+    _copy_items_from(other);
+
+    return *this;
+}
+
+PayloadArray::PayloadArray(PayloadArray&& other) noexcept
+    : _buf(other._buf)
+    , _first(other._first)
+    , _items(other._items)
+    , _item_count(other._item_count) {
+    other._items = nullptr;
+    other._item_count = 0;
+    other._buf = "";
+    other._first = true;
+}
+
+PayloadArray& PayloadArray::operator=(PayloadArray&& other) noexcept {
+    if (this == &other) return *this;
+
+    _release_items();
+
+    _buf = other._buf;
+    _first = other._first;
+    _items = other._items;
+    _item_count = other._item_count;
+
+    other._items = nullptr;
+    other._item_count = 0;
+    other._buf = "";
+    other._first = true;
+
+    return *this;
+}
+
+bool PayloadArray::_ensure_items() {
+    if (_items) return true;
+
+    _items = new (std::nothrow) Payload[MAX_ITEMS];
+    if (!_items) {
+        _item_count = 0;
+        return false;
+    }
+
+    return true;
+}
+
+void PayloadArray::_release_items() {
+    delete[] _items;
+    _items = nullptr;
+    _item_count = 0;
+}
+
+void PayloadArray::_copy_items_from(const PayloadArray& other) {
+    if (!other._items || other._item_count == 0) {
+        _item_count = 0;
+        return;
+    }
+
+    if (!_ensure_items()) {
+        return;
+    }
+
+    _item_count = other._item_count;
+    for (size_t i = 0; i < _item_count; i++) {
+        _items[i] = other._items[i];
+    }
+}
 
 void PayloadArray::clear() {
     _buf = "";
     _first = true;
-    _item_count = 0;
+    _release_items();
 }
 
 bool PayloadArray::empty() const {
@@ -889,7 +977,7 @@ String PayloadArray::to_json() const {
         String out = "[";
         for (size_t i = 0; i < _item_count; i++) {
             if (i) out += ",";
-            out += _items[i].to_json();
+            out += _items ? _items[i].to_json() : "{}";
         }
         out += "]";
         return out;
@@ -905,8 +993,9 @@ void PayloadArray::add(const Payload& obj) {
 }
 
 bool PayloadArray::parseJSON(const char* json) {
-    _item_count = 0;
+    clear();
     if (!json || json[0] != '[') return false;
+    if (!_ensure_items()) return false;
 
     int i = 1;
     while (json[i] && _item_count < MAX_ITEMS) {
@@ -938,7 +1027,7 @@ size_t PayloadArray::size() const {
 }
 
 Payload PayloadArray::get(size_t idx) const {
-    if (idx >= _item_count) return Payload();
+    if (!_items || idx >= _item_count) return Payload();
     return _items[idx];
 }
 

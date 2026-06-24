@@ -289,6 +289,13 @@ class PayloadArray {
 public:
     PayloadArray();
 
+    ~PayloadArray();
+
+    PayloadArray(const PayloadArray& other);
+    PayloadArray& operator=(const PayloadArray& other);
+    PayloadArray(PayloadArray&& other) noexcept;
+    PayloadArray& operator=(PayloadArray&& other) noexcept;
+
     void clear();
     bool empty() const;
 
@@ -304,8 +311,12 @@ public:
 private:
     String _buf;
     bool   _first;
+    Payload* _items;
+    size_t  _item_count;
 
     static constexpr size_t MAX_ITEMS = 16;
-    Payload _items[MAX_ITEMS];
-    size_t  _item_count;
+
+    bool _ensure_items();
+    void _release_items();
+    void _copy_items_from(const PayloadArray& other);
 };
