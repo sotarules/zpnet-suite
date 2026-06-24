@@ -297,8 +297,14 @@ void clocks_beta_features_init(void) {
 // ============================================================================
 //
 // Pi SYSTEM now republishes the unified system readiness tree as FEATURE_STATUS.
-// Beta consumes that stream directly and turns campaign admission into a cached
-// pub/sub fact instead of a stack of command-time feature queries.
+// Beta consumes that stream directly, but the Teensy-side START gate must only
+// depend on Teensy-owned readiness surfaces.
+//
+// Pi SYSTEM/CLOCKS remains responsible for PI/GNSS/environment/battery/network
+// preflight before it sends CLOCKS.START or CLOCKS.RECOVER.  Duplicating those
+// PI-owned gates inside Teensy CLOCKS creates a split-brain failure mode: Pi can
+// observe all prerequisites as open while the Teensy rejects START because its
+// cached FEATURE_STATUS snapshot lacks, or has stale status for, PI.GNSS.REPORT.
 //
 // Intentional non-requirements:
 //   SCIENCE_RESIDUALS and TIMEBASE_PUBLICATION are not START-gate inputs here.
@@ -315,12 +321,6 @@ struct campaign_feature_gate_requirement_t {
 
 static constexpr campaign_feature_gate_requirement_t
     CAMPAIGN_FEATURE_GATE_REQUIREMENTS[] = {
-  { "NET",         "PI",     "SYSTEM",    "NETWORK" },
-  { "BATTERY",     "PI",     "SYSTEM",    "BATTERY" },
-  { "GNSS",        "PI",     "GNSS",      "REPORT" },
-  { "PI_HOST",     "PI",     "SYSTEM",    "HOST" },
-  { "POWER",       "PI",     "SYSTEM",    "POWER" },
-  { "T_IMPORT",    "PI",     "SYSTEM",    "TEENSY_FEATURE_IMPORT" },
   { "T_FEATURE",   "TEENSY", "SYSTEM",    "FEATURE_STATUS" },
   { "PPS/V_AUTH",  "TEENSY", "INTERRUPT", "PPS_VCLOCK_AUTHORITY" },
   { "FLOORLINE",   "TEENSY", "INTERRUPT", "FLOORLINE" },
@@ -332,8 +332,6 @@ static constexpr campaign_feature_gate_requirement_t
   { "SMARTZERO",   "TEENSY", "CLOCKS",    "SMARTZERO" },
   { "ALPHA_EPOCH", "TEENSY", "CLOCKS",    "ALPHA_EPOCH" },
   { "OCXO_ORIGIN", "TEENSY", "CLOCKS",    "OCXO_PUBLIC_ORIGIN" },
-  { "ENV",         "PI",     "SYSTEM",    "ENVIRONMENT" },
-  { "SENSORS",     "PI",     "SYSTEM",    "SENSORS" },
 };
 
 static volatile bool     g_campaign_feature_gate_seen = false;

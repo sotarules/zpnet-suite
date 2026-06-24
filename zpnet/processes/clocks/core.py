@@ -1373,6 +1373,32 @@ def _rounded(value: Optional[float], digits: int) -> Optional[float]:
     return None if value is None else round(float(value), digits)
 
 
+def _gnss_raw_baseline_ppb_from_report(report: Dict[str, Any]) -> Optional[float]:
+    """Return the baseline PPB value for the Pi-owned GNSS_RAW pseudo-clock.
+
+    GNSS_RAW's accumulated tau/ppb can be invalid in older baseline rows when
+    the synthetic ledger and reference ledger were restored with different
+    cardinalities.  The Welford mean is the stable baseline statistic for the
+    receiver-reported drift stream, and it is what the metrics panel already
+    exposes as GN_RAW MEAN.
+    """
+    extra = _report_extra_clocks(report)
+    return _first_float(
+        extra.get("gnss_raw_welford_mean"),
+        report.get("gnss_raw_welford_mean"),
+        extra.get("gnss_raw_drift_ppb"),
+        report.get("gnss_raw_drift_ppb"),
+        extra.get("gnss_raw_ppb"),
+        report.get("gnss_raw_ppb"),
+    )
+
+
+def _tau_from_ppb(ppb: Optional[float]) -> Optional[float]:
+    if ppb is None:
+        return None
+    return 1.0 + float(ppb) / 1.0e9
+
+
 def _baseline_ppb_from_report(report: Dict[str, Any]) -> Dict[str, float]:
     """Extract baseline PPB values from the current TIMEBASE-shaped report."""
     frag = _report_fragment(report)
@@ -1381,7 +1407,7 @@ def _baseline_ppb_from_report(report: Dict[str, Any]) -> Dict[str, float]:
     candidates = {
         "gnss": 0.0,
         "vclock": _first_float(_path_get(frag, "stats.vclock.ppb"), frag.get("vclock_ppb"), report.get("vclock_ppb")),
-        "gnss_raw": _first_float(extra.get("gnss_raw_ppb"), report.get("gnss_raw_ppb")),
+        "gnss_raw": _gnss_raw_baseline_ppb_from_report(report),
         "dwt": _first_float(_path_get(frag, "stats.dwt.ppb"), frag.get("dwt_ppb"), report.get("dwt_ppb")),
         "ocxo1": _first_float(_path_get(frag, "stats.ocxo1.ppb"), frag.get("ocxo1_ppb"), report.get("ocxo1_ppb")),
         "ocxo2": _first_float(_path_get(frag, "stats.ocxo2.ppb"), frag.get("ocxo2_ppb"), report.get("ocxo2_ppb")),
@@ -1394,6 +1420,7 @@ def _baseline_tau_from_report(report: Dict[str, Any]) -> Dict[str, float]:
     """Extract baseline tau values from the current TIMEBASE-shaped report."""
     frag = _report_fragment(report)
     extra = _report_extra_clocks(report)
+    gnss_raw_ppb = _gnss_raw_baseline_ppb_from_report(report)
 
     candidates = {
         "gnss": 1.0,
@@ -1403,6 +1430,7 @@ def _baseline_tau_from_report(report: Dict[str, Any]) -> Dict[str, float]:
         "ocxo1": _first_float(_path_get(frag, "stats.ocxo1.tau"), frag.get("ocxo1_tau"), report.get("ocxo1_tau")),
         "ocxo2": _first_float(_path_get(frag, "stats.ocxo2.tau"), frag.get("ocxo2_tau"), report.get("ocxo2_tau")),
     }
+    candidates["gnss_raw"] = _tau_from_ppb(gnss_raw_ppb) or candidates.get("gnss_raw")
 
     return {k: round(v, 12) for k, v in candidates.items() if v is not None}
 
