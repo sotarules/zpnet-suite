@@ -45,6 +45,13 @@
 #include <stdio.h>
 #include <strings.h>
 
+// Large CLOCKS diagnostic/reporting stores live in Teensy OCRAM instead of
+// DTCM.  DMAMEM is Teensyduino's OCRAM placement attribute; keeping a local
+// alias makes the placement doctrine obvious at the declaration site.
+#ifndef CLOCKS_OCRAM
+#define CLOCKS_OCRAM DMAMEM
+#endif
+
 // process_time.cpp defines this reset hook; time.h may not expose it on older
 // branches, so Alpha declares the narrow symbol it needs when SmartZero makes
 // the old projection bases invalid.
@@ -100,9 +107,9 @@ clock_state_t       g_ocxo2_clock = {};
 clock_measurement_t g_ocxo1_measurement = {};
 clock_measurement_t g_ocxo2_measurement = {};
 
-interrupt_capture_diag_t g_pps_witness_diag = {};
-interrupt_capture_diag_t g_ocxo1_interrupt_diag = {};
-interrupt_capture_diag_t g_ocxo2_interrupt_diag = {};
+CLOCKS_OCRAM interrupt_capture_diag_t g_pps_witness_diag = {};
+CLOCKS_OCRAM interrupt_capture_diag_t g_ocxo1_interrupt_diag = {};
+CLOCKS_OCRAM interrupt_capture_diag_t g_ocxo2_interrupt_diag = {};
 
 bool g_ad5693r_init_ok = false;
 
@@ -221,7 +228,7 @@ volatile bool     g_pps_dwt_cycles_between_edges_valid = false;
 volatile int32_t  g_pps_vclock_phase_cycles = 0;
 
 static volatile uint32_t g_pps_vclock_edge_forensics_seq = 0;
-static clocks_pps_vclock_edge_forensics_t g_pps_vclock_edge_forensics = {};
+static CLOCKS_OCRAM clocks_pps_vclock_edge_forensics_t g_pps_vclock_edge_forensics = {};
 
 static volatile uint32_t g_prev_pps_dwt_at_edge = 0;
 static volatile bool     g_prev_pps_dwt_at_edge_valid = false;
@@ -251,7 +258,7 @@ static uint64_t alpha_pps_vclock_abs_i64(int64_t value) {
   return (value >= 0) ? (uint64_t)value : (uint64_t)(-value);
 }
 
-static void alpha_pps_vclock_edge_forensics_reset(void) {
+static FLASHMEM void alpha_pps_vclock_edge_forensics_reset(void) {
   g_pps_vclock_edge_forensics_seq++;
   clocks_alpha_dmb();
   g_pps_vclock_edge_forensics = clocks_pps_vclock_edge_forensics_t{};
@@ -259,7 +266,7 @@ static void alpha_pps_vclock_edge_forensics_reset(void) {
   g_pps_vclock_edge_forensics_seq++;
 }
 
-static void alpha_pps_vclock_edge_forensics_publish(
+static FLASHMEM void alpha_pps_vclock_edge_forensics_publish(
     const pps_edge_snapshot_t& snap,
     bool gnss_self_map_valid,
     uint64_t expected_gnss_ns,
@@ -337,7 +344,7 @@ static void alpha_pps_vclock_edge_forensics_publish(
   g_pps_vclock_edge_forensics_seq++;
 }
 
-bool clocks_alpha_pps_vclock_edge_forensics(
+FLASHMEM bool clocks_alpha_pps_vclock_edge_forensics(
     clocks_pps_vclock_edge_forensics_t* out) {
   if (!out) return false;
 
@@ -1124,7 +1131,7 @@ static inline uint64_t nominal_ns_from_counter32_epoch(uint32_t counter32,
 static constexpr uint32_t ALPHA_INTEGRITY_EXACT_NS_GATE = 0U;
 static constexpr uint32_t ALPHA_INTEGRITY_OCXO_INTERVAL_GATE_NS = 5U;
 
-static clocks_alpha_integrity_snapshot_t g_alpha_integrity = {};
+static CLOCKS_OCRAM clocks_alpha_integrity_snapshot_t g_alpha_integrity = {};
 
 static int64_t alpha_integrity_signed_delta_ns(uint64_t observed,
                                                uint64_t expected) {
@@ -1263,7 +1270,7 @@ static void alpha_integrity_note_ocxo_projected_gnss_second(
   s->previous_interval_ns = current_interval;
 }
 
-bool clocks_alpha_integrity_snapshot(clocks_alpha_integrity_snapshot_t* out) {
+FLASHMEM bool clocks_alpha_integrity_snapshot(clocks_alpha_integrity_snapshot_t* out) {
   if (!out) return false;
   g_alpha_integrity.snapshot_count++;
   g_alpha_integrity.valid =
@@ -1500,9 +1507,9 @@ struct alpha_lane_forensics_store_t {
   uint32_t regression_fit_error_abs_gt4_count = 0;
 };
 
-static alpha_lane_forensics_store_t g_vclock_forensics = {};
-static alpha_lane_forensics_store_t g_ocxo1_forensics = {};
-static alpha_lane_forensics_store_t g_ocxo2_forensics = {};
+static CLOCKS_OCRAM alpha_lane_forensics_store_t g_vclock_forensics = {};
+static CLOCKS_OCRAM alpha_lane_forensics_store_t g_ocxo1_forensics = {};
+static CLOCKS_OCRAM alpha_lane_forensics_store_t g_ocxo2_forensics = {};
 
 
 // Report-only event-flow forensics.  These counters answer one narrow question:
@@ -1599,9 +1606,9 @@ struct alpha_event_flow_store_t {
   uint32_t last_snapshot_seq = 0;
 };
 
-static alpha_event_flow_store_t g_vclock_event_flow = {};
-static alpha_event_flow_store_t g_ocxo1_event_flow  = {};
-static alpha_event_flow_store_t g_ocxo2_event_flow  = {};
+static CLOCKS_OCRAM alpha_event_flow_store_t g_vclock_event_flow = {};
+static CLOCKS_OCRAM alpha_event_flow_store_t g_ocxo1_event_flow  = {};
+static CLOCKS_OCRAM alpha_event_flow_store_t g_ocxo2_event_flow  = {};
 
 static alpha_event_flow_store_t* alpha_event_flow_store(time_clock_id_t clock) {
   switch (clock) {
@@ -1808,7 +1815,7 @@ static void alpha_event_flow_note_snapshot_missing_store(time_clock_id_t clock) 
   f->last_failure_stage = ALPHA_FLOW_STAGE_FORENSICS_SNAPSHOT;
 }
 
-bool clocks_alpha_event_flow_snapshot(time_clock_id_t clock,
+FLASHMEM bool clocks_alpha_event_flow_snapshot(time_clock_id_t clock,
                                       clocks_alpha_event_flow_snapshot_t* out) {
   if (!out) return false;
   alpha_event_flow_store_t* f = alpha_event_flow_store(clock);
@@ -2252,12 +2259,12 @@ struct alpha_ocxo_pps_projection_guard_t {
   int64_t  last_projected_minus_measured_jump_ns = 0;
 };
 
-static alpha_ocxo_edge_history_t g_ocxo1_edge_history = {};
-static alpha_ocxo_edge_history_t g_ocxo2_edge_history = {};
-static alpha_ocxo_pps_projection_store_t g_ocxo1_pps_projection = {};
-static alpha_ocxo_pps_projection_store_t g_ocxo2_pps_projection = {};
-static alpha_ocxo_pps_projection_guard_t g_ocxo1_pps_projection_guard = {};
-static alpha_ocxo_pps_projection_guard_t g_ocxo2_pps_projection_guard = {};
+static CLOCKS_OCRAM alpha_ocxo_edge_history_t g_ocxo1_edge_history = {};
+static CLOCKS_OCRAM alpha_ocxo_edge_history_t g_ocxo2_edge_history = {};
+static CLOCKS_OCRAM alpha_ocxo_pps_projection_store_t g_ocxo1_pps_projection = {};
+static CLOCKS_OCRAM alpha_ocxo_pps_projection_store_t g_ocxo2_pps_projection = {};
+static CLOCKS_OCRAM alpha_ocxo_pps_projection_guard_t g_ocxo1_pps_projection_guard = {};
+static CLOCKS_OCRAM alpha_ocxo_pps_projection_guard_t g_ocxo2_pps_projection_guard = {};
 
 static alpha_ocxo_edge_history_t* alpha_ocxo_edge_history(time_clock_id_t clock) {
   switch (clock) {
@@ -2930,7 +2937,7 @@ static void alpha_ocxo_pps_projection_compute(time_clock_id_t clock,
   }
 }
 
-bool clocks_alpha_ocxo_pps_projection_snapshot(
+FLASHMEM bool clocks_alpha_ocxo_pps_projection_snapshot(
     time_clock_id_t clock,
     clocks_alpha_ocxo_pps_projection_snapshot_t* out) {
   if (!out) return false;
@@ -3076,8 +3083,8 @@ struct alpha_ocxo_visible_origin_state_t {
   clocks_alpha_ocxo_visible_origin_snapshot_t v = {};
 };
 
-static alpha_ocxo_visible_origin_state_t g_ocxo1_visible_origin = {};
-static alpha_ocxo_visible_origin_state_t g_ocxo2_visible_origin = {};
+static CLOCKS_OCRAM alpha_ocxo_visible_origin_state_t g_ocxo1_visible_origin = {};
+static CLOCKS_OCRAM alpha_ocxo_visible_origin_state_t g_ocxo2_visible_origin = {};
 
 // START handoff gear: Beta must not capture campaign OCXO public bases until
 // Alpha has installed both public-origin offsets.  Keep this as a precomputed
@@ -3218,7 +3225,7 @@ static void alpha_ocxo_visible_origin_capture_from_smartzero(
   alpha_ocxo_visible_origin_publish(*s, local);
 }
 
-bool clocks_alpha_ocxo_visible_origin_snapshot(
+FLASHMEM bool clocks_alpha_ocxo_visible_origin_snapshot(
     time_clock_id_t clock,
     clocks_alpha_ocxo_visible_origin_snapshot_t* out) {
   if (!out) return false;
@@ -3555,7 +3562,7 @@ static uint64_t alpha_ocxo_project_measured_ns_to_dwt_live(time_clock_id_t clock
   return pending_gnss_ns + (uint64_t)delta_ns;
 }
 
-static void alpha_forensics_reset_store(alpha_lane_forensics_store_t& s) {
+static FLASHMEM void alpha_forensics_reset_store(alpha_lane_forensics_store_t& s) {
   s.seq++;
   clocks_alpha_dmb();
 
@@ -3745,7 +3752,7 @@ static void alpha_forensics_reset_store(alpha_lane_forensics_store_t& s) {
   s.seq++;
 }
 
-static void alpha_forensics_reset_all(void) {
+static FLASHMEM void alpha_forensics_reset_all(void) {
   alpha_forensics_reset_store(g_vclock_forensics);
   alpha_event_flow_note_forensics_reset(time_clock_id_t::VCLOCK);
   alpha_forensics_reset_store(g_ocxo1_forensics);
@@ -4183,7 +4190,7 @@ static void alpha_forensics_publish(time_clock_id_t clock_id,
   alpha_event_flow_note_forensics_publish(clock_id, *s);
 }
 
-bool clocks_alpha_lane_forensics(time_clock_id_t clock,
+FLASHMEM bool clocks_alpha_lane_forensics(time_clock_id_t clock,
                                  clocks_alpha_lane_forensics_t* out) {
   if (!out) return false;
   alpha_event_flow_note_snapshot_request(clock);
@@ -4467,7 +4474,7 @@ static volatile uint16_t g_alpha_epoch_last_ocxo2_hardware16 = 0;
 static volatile uint32_t g_alpha_epoch_sequence = 0;
 static char              g_alpha_epoch_last_reason[32] = {0};
 
-static interrupt_smartzero_snapshot_t g_alpha_epoch_last_smartzero = {};
+static CLOCKS_OCRAM interrupt_smartzero_snapshot_t g_alpha_epoch_last_smartzero = {};
 static volatile uint32_t g_alpha_smartzero_begin_count = 0;
 static volatile uint32_t g_alpha_smartzero_begin_failures = 0;
 
@@ -4514,6 +4521,29 @@ static volatile uint32_t g_alpha_smartzero_install_last_committed_smartzero_sequ
 static volatile bool     g_alpha_smartzero_install_last_success = false;
 static volatile bool     g_alpha_smartzero_install_last_atomic = false;
 static char              g_alpha_smartzero_install_last_reason[32] = {0};
+
+static FLASHMEM void clocks_alpha_ocram_reset(void) {
+  g_pps_witness_diag = interrupt_capture_diag_t{};
+  g_ocxo1_interrupt_diag = interrupt_capture_diag_t{};
+  g_ocxo2_interrupt_diag = interrupt_capture_diag_t{};
+  g_pps_vclock_edge_forensics = clocks_pps_vclock_edge_forensics_t{};
+  g_alpha_integrity = clocks_alpha_integrity_snapshot_t{};
+  g_vclock_forensics = alpha_lane_forensics_store_t{};
+  g_ocxo1_forensics = alpha_lane_forensics_store_t{};
+  g_ocxo2_forensics = alpha_lane_forensics_store_t{};
+  g_vclock_event_flow = alpha_event_flow_store_t{};
+  g_ocxo1_event_flow = alpha_event_flow_store_t{};
+  g_ocxo2_event_flow = alpha_event_flow_store_t{};
+  g_ocxo1_edge_history = alpha_ocxo_edge_history_t{};
+  g_ocxo2_edge_history = alpha_ocxo_edge_history_t{};
+  g_ocxo1_pps_projection = alpha_ocxo_pps_projection_store_t{};
+  g_ocxo2_pps_projection = alpha_ocxo_pps_projection_store_t{};
+  g_ocxo1_pps_projection_guard = alpha_ocxo_pps_projection_guard_t{};
+  g_ocxo2_pps_projection_guard = alpha_ocxo_pps_projection_guard_t{};
+  g_ocxo1_visible_origin = alpha_ocxo_visible_origin_state_t{};
+  g_ocxo2_visible_origin = alpha_ocxo_visible_origin_state_t{};
+  g_alpha_epoch_last_smartzero = interrupt_smartzero_snapshot_t{};
+}
 
 static const char* smartzero_install_stage_name(uint32_t stage) {
   switch (stage) {
@@ -5762,6 +5792,7 @@ static void pps_selector_callback(const pps_edge_snapshot_t& snap) {
 // ============================================================================
 
 void process_clocks_init_hardware(void) {
+  clocks_alpha_ocram_reset();
   dwt_enable();
   clocks_features_mark_alpha_initializing();
 }
