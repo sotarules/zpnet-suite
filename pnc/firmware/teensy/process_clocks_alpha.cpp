@@ -430,7 +430,7 @@ servo_mode_t servo_mode_parse(const char* s) {
 // This preserves the fractional-authority experiment while making DAC bus
 // traffic an explicit operator choice with a live kill switch.
 
-static constexpr bool     OCXO_DAC_DITHER_DEFAULT_ENABLED = true;
+static constexpr bool     OCXO_DAC_DITHER_DEFAULT_ENABLED = false;
 static constexpr bool     OCXO_DAC_DITHER_ALLOW_HARDWARE_WRITES = true;
 static constexpr uint64_t OCXO_DAC_DITHER_FRAME_NS = 1000000000ULL;
 static constexpr uint64_t OCXO_DAC_DITHER_SLOT_NS = 1000000ULL;
@@ -5808,11 +5808,6 @@ void process_clocks_init(void) {
     ocxo2_dac.io_last_write_ok = true;
     ocxo1_dac.io_last_failure_stage = 0;
     ocxo2_dac.io_last_failure_stage = 0;
-  }
-
-  // MULE CHANGE:
-  if (OCXO_DAC_DITHER_DEFAULT_ENABLED) {
-    (void)clocks_ocxo_dac_dither_enable();
   }
 
   pinMode(GNSS_LOCK_PIN, INPUT);
