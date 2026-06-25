@@ -81,13 +81,13 @@ uint32_t system_bootdiag_reset_cause_raw(void);
 // Feature status substrate
 // ============================================================================
 //
-// Teensy SYSTEM owns only Teensy-local feature state.  Pi SYSTEM asks for this
-// tree and unions it with Pi-local feature state into the global dashboard /
-// campaign-readiness surface.
+// Teensy SYSTEM owns only Teensy-local feature state.  Pi SYSTEM owns Pi-local
+// feature state separately.  Campaign admission polls each owning authority
+// directly instead of depending on a unified pushed feature bus.
 //
-// Teensy also publishes FEATURE_STATUS_FRAGMENT whenever any local feature
-// scalar changes.  The fragment contains only Teensy-owned feature paths; the
-// Pi-side SYSTEM service relays the unified FEATURE_STATUS tree.
+// Teensy does not dynamically publish feature changes.  Feature state is
+// maintained locally and exposed through the command/report surface so campaign
+// admission can poll the owning authority directly.
 //
 // Feature paths are reported as:
 //

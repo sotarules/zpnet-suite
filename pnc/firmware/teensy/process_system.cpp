@@ -80,12 +80,18 @@ static uint64_t system_cpu_window_last_idle_cycles = 0;
 // --------------------------------------------------------------
 // FEATURE_STATUS_FRAGMENT publication custody
 // --------------------------------------------------------------
-// system_feature_set() may be reached by timing subsystems, so it only marks the
-// scalar feature tree dirty and requests an ALAP foreground service.  The service
-// publishes one compact FEATURE_STATUS_FRAGMENT containing Teensy-owned feature
-// state.  zpnet-system on the Pi relays the unified FEATURE_STATUS tree.
+// system_feature_set() may be reached by timing subsystems.  Feature state must
+// therefore remain a scalar registry update only: no TimePop arming, no Payload
+// construction, and no pub/sub publication as a side effect of feature changes.
+//
+// The old FEATURE_STATUS_FRAGMENT machinery is intentionally left visible as
+// counters/report fields, but dynamic publication is disabled.  Campaign
+// admission polls SYSTEM.FEATURES / REPORT_FEATURES through the command path.
 
-static volatile bool g_system_feature_fragment_publish_enabled = false;
+static constexpr bool SYSTEM_FEATURE_FRAGMENT_DYNAMIC_PUBLISH_ENABLED = false;
+
+static volatile bool g_system_feature_fragment_publish_enabled =
+    SYSTEM_FEATURE_FRAGMENT_DYNAMIC_PUBLISH_ENABLED;
 static volatile bool g_system_feature_fragment_dirty = false;
 static volatile bool g_system_feature_fragment_service_armed = false;
 static uint32_t g_system_feature_fragment_publish_count = 0;
@@ -200,8 +206,16 @@ static void system_feature_schedule_fragment_publish(void) {
 }
 
 static void system_feature_note_changed(void) {
-  g_system_feature_fragment_dirty = true;
-  system_feature_schedule_fragment_publish();
+  if (SYSTEM_FEATURE_FRAGMENT_DYNAMIC_PUBLISH_ENABLED) {
+    g_system_feature_fragment_dirty = true;
+    system_feature_schedule_fragment_publish();
+    return;
+  }
+
+  // Command-polled feature mode: the registry is already updated.  Do not arm
+  // TimePop or build/publish a FEATURE_STATUS_FRAGMENT from this call path.
+  g_system_feature_fragment_dirty = false;
+  g_system_feature_fragment_service_armed = false;
 }
 
 static int system_feature_find(const char* subsystem,
@@ -481,6 +495,7 @@ static Payload cmd_report(const Payload& /*args*/) {
   p.add("feature_status_fragment_publish_count", g_system_feature_fragment_publish_count);
   p.add("feature_status_fragment_dirty", (bool)g_system_feature_fragment_dirty);
   p.add("feature_status_fragment_service_armed", (bool)g_system_feature_fragment_service_armed);
+  p.add("feature_status_fragment_dynamic_publish_enabled", SYSTEM_FEATURE_FRAGMENT_DYNAMIC_PUBLISH_ENABLED);
   p.add("feature_status_fragment_service_arm_count", g_system_feature_fragment_service_arm_count);
   p.add("feature_status_fragment_service_dispatch_count", g_system_feature_fragment_service_dispatch_count);
   p.add("feature_status_fragment_service_arm_failures", g_system_feature_fragment_service_arm_failures);
@@ -961,6 +976,8 @@ void process_system_register(void) {
                      system_feature_status_t::NOMINAL,
                      "Teensy SYSTEM feature registry online");
   process_register("SYSTEM", &SYSTEM_PROCESS);
-  g_system_feature_fragment_publish_enabled = true;
-  system_feature_schedule_fragment_publish();
+  g_system_feature_fragment_publish_enabled =
+      SYSTEM_FEATURE_FRAGMENT_DYNAMIC_PUBLISH_ENABLED;
+  g_system_feature_fragment_dirty = false;
+  g_system_feature_fragment_service_armed = false;
 }

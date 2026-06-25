@@ -730,7 +730,11 @@ static void interrupt_feature_set_cached(const char* feature,
                                          system_feature_status_t& cached,
                                          system_feature_status_t status,
                                          bool force = false) {
-  if (force || cached != status || !system_feature_has("INTERRUPT", feature)) {
+  // process_interrupt may evaluate feature readiness from timing/handoff
+  // paths.  Keep the hot path to "real transition only"; the forced
+  // initialization pass registers the feature slots.  Do not repeatedly walk
+  // the SYSTEM registry via system_feature_has() on every unchanged sample.
+  if (force || cached != status) {
     (void)system_feature_set("INTERRUPT", feature, status, nullptr);
     cached = status;
   }

@@ -278,7 +278,11 @@ static void clocks_beta_feature_set_cached(const char* feature,
                                            system_feature_status_t& cached,
                                            system_feature_status_t status,
                                            bool force = false) {
-  if (force || cached != status || !system_feature_has("CLOCKS", feature)) {
+  // CLOCKS feature state is command-polled by campaign admission.  Register
+  // the slots during forced initialization, then touch SYSTEM only when the
+  // scalar value really changes.  This keeps the timing/campaign path from
+  // repeatedly scanning the SYSTEM feature registry for unchanged values.
+  if (force || cached != status) {
     (void)system_feature_set("CLOCKS", feature, status, nullptr);
     cached = status;
   }
@@ -303,18 +307,17 @@ void clocks_beta_features_init(void) {
 }
 
 // ============================================================================
-// FEATURE_STATUS-driven campaign gate
+// Command-polled campaign gate
 // ============================================================================
 //
-// Pi SYSTEM now republishes the unified system readiness tree as FEATURE_STATUS.
-// Beta consumes that stream directly, but the Teensy-side START gate must only
-// depend on Teensy-owned readiness surfaces.
+// Campaign admission now uses direct command/poll ownership rather than the
+// pushed FEATURE_STATUS bus.  The Pi-side CLOCKS process polls PI.SYSTEM
+// features and TEENSY.SYSTEM.FEATURES separately before sending START/RECOVER.
+// The Teensy-side START gate is a final local guard over TEENSY-owned feature
+// slots already maintained by process_interrupt, process_clocks_alpha, and
+// process_clocks_beta.
 //
-// Pi SYSTEM/CLOCKS remains responsible for PI/GNSS/environment/battery/network
-// preflight before it sends CLOCKS.START or CLOCKS.RECOVER.  Duplicating those
-// PI-owned gates inside Teensy CLOCKS creates a split-brain failure mode: Pi can
-// observe all prerequisites as open while the Teensy rejects START because its
-// cached FEATURE_STATUS snapshot lacks, or has stale status for, PI.GNSS.REPORT.
+// No Teensy code consumes FEATURE_STATUS publications for campaign gating.
 //
 // Intentional non-requirements:
 //   SCIENCE_RESIDUALS and TIMEBASE_PUBLICATION are not START-gate inputs here.
@@ -355,19 +358,6 @@ static char g_campaign_feature_gate_reason[128] =
     "FEATURE_STATUS not yet received";
 static char g_campaign_feature_gate_first_problem[32] = "";
 
-static FLASHMEM const char* feature_status_lookup(const Payload& root,
-                                         const char* host,
-                                         const char* subsystem,
-                                         const char* feature) {
-  const Payload host_payload = root.getPayload(host);
-  if (host_payload.empty()) return nullptr;
-
-  const Payload subsystem_payload = host_payload.getPayload(subsystem);
-  if (subsystem_payload.empty()) return nullptr;
-
-  return subsystem_payload.getString(feature);
-}
-
 static FLASHMEM bool feature_status_is_nominal(const char* status) {
   return status && strcasecmp(status, "NOMINAL") == 0;
 }
@@ -382,13 +372,23 @@ static FLASHMEM void campaign_feature_gate_set_reason(const char* reason,
            first_problem ? first_problem : "");
 }
 
-static FLASHMEM void campaign_feature_gate_recompute(const Payload& root) {
+static FLASHMEM const char* campaign_feature_gate_requirement_status(
+    const campaign_feature_gate_requirement_t& req) {
+  if (!req.host || strcasecmp(req.host, "TEENSY") != 0) {
+    return "NOMINAL";
+  }
+  return system_feature_get_status(req.subsystem, req.feature);
+}
+
+static FLASHMEM void campaign_feature_gate_recompute_local(void) {
   bool ready = true;
   const campaign_feature_gate_requirement_t* failed = nullptr;
 
+  g_campaign_feature_gate_seen = true;
+  g_campaign_feature_gate_update_count++;
+
   for (const auto& req : CAMPAIGN_FEATURE_GATE_REQUIREMENTS) {
-    const char* status =
-        feature_status_lookup(root, req.host, req.subsystem, req.feature);
+    const char* status = campaign_feature_gate_requirement_status(req);
     if (!feature_status_is_nominal(status)) {
       ready = false;
       failed = &req;
@@ -413,19 +413,15 @@ static FLASHMEM void campaign_feature_gate_recompute(const Payload& root) {
   }
 }
 
-static FLASHMEM void on_feature_status(const Payload& payload) {
-  g_campaign_feature_gate_seen = true;
-  g_campaign_feature_gate_update_count++;
-  campaign_feature_gate_recompute(payload);
-}
-
 static bool campaign_feature_gate_open(void) {
+  campaign_feature_gate_recompute_local();
   return g_campaign_feature_gate_seen && g_campaign_feature_gate_open;
 }
 
 static FLASHMEM void payload_add_campaign_feature_gate(Payload& p) {
-  p.add("campaign_gate_source", "FEATURE_STATUS");
-  p.add("campaign_gate_open", campaign_feature_gate_open());
+  campaign_feature_gate_recompute_local();
+  p.add("campaign_gate_source", "LOCAL_SYSTEM_FEATURES_POLL");
+  p.add("campaign_gate_open", g_campaign_feature_gate_open);
   p.add("campaign_gate_seen", (bool)g_campaign_feature_gate_seen);
   p.add("campaign_gate_reason", g_campaign_feature_gate_reason);
   p.add("campaign_gate_first_problem", g_campaign_feature_gate_first_problem);
@@ -3560,11 +3556,14 @@ static FLASHMEM void payload_add_servo_dac_values(Payload& parent) {
 }
 
 // ----------------------------------------------------------------------------
-// CLOCKS_DAC_TICK — minimal 1 Hz DAC/servo dashboard feed
+// CLOCKS_DAC_TICK — retired dashboard feed
 // ----------------------------------------------------------------------------
 //
-// REPORT_DAC is the courtroom report.  This publication is intentionally tiny:
-// just enough for dashboard rows, manual DAC controls, and servo/dither status.
+// REPORT_DAC is the command-polled DAC/servo dashboard surface.  Keep the old
+// scheduler call sites as cheap suppression counters so campaign hot paths no
+// longer arm TimePop, build Payloads, or publish CLOCKS_DAC_TICK.
+
+static constexpr bool CLOCKS_DAC_TICK_PUBLISH_ENABLED = false;
 
 static FLASHMEM void payload_add_dac_tick_lane(Payload& parent,
                                       const char* key,
@@ -3607,11 +3606,18 @@ static uint32_t          g_clocks_dac_tick_service_dispatch_count = 0;
 static uint32_t          g_clocks_dac_tick_service_arm_failures = 0;
 static uint32_t          g_clocks_dac_tick_coalesce_count = 0;
 static uint32_t          g_clocks_dac_tick_publish_count = 0;
+static uint32_t          g_clocks_dac_tick_suppressed_count = 0;
 static char              g_clocks_dac_tick_phase[32] = {0};
 
 static void schedule_dac_tick_publish(const char* phase);
 
 static FLASHMEM void publish_dac_tick_now(const char* phase) {
+  if (!CLOCKS_DAC_TICK_PUBLISH_ENABLED) {
+    (void)phase;
+    g_clocks_dac_tick_suppressed_count++;
+    return;
+  }
+
   Payload p;
   p.add("schema", "CLOCKS_DAC_TICK_V2");
   p.add("context", "ALAP");
@@ -3669,6 +3675,11 @@ static void schedule_dac_tick_publish(const char* phase) {
   safeCopy(g_clocks_dac_tick_phase,
            sizeof(g_clocks_dac_tick_phase),
            phase ? phase : "");
+
+  if (!CLOCKS_DAC_TICK_PUBLISH_ENABLED) {
+    g_clocks_dac_tick_suppressed_count++;
+    return;
+  }
 
   if (g_clocks_dac_tick_dirty) {
     g_clocks_dac_tick_coalesce_count++;
@@ -5339,6 +5350,14 @@ static FLASHMEM void add_dac_payload(Payload& p) {
   p.add("no_candidate_passes", g_ocxo_dac_no_candidate_passes);
   p.add("deferred_candidates", g_ocxo_dac_deferred_candidates);
   p.add("schedule_failures", g_ocxo_dac_schedule_failures);
+
+  p.add("dac_tick_publish_enabled", CLOCKS_DAC_TICK_PUBLISH_ENABLED);
+  p.add("dac_tick_suppressed_count", g_clocks_dac_tick_suppressed_count);
+  p.add("dac_tick_publish_count", g_clocks_dac_tick_publish_count);
+  p.add("dac_tick_service_arm_count", g_clocks_dac_tick_service_arm_count);
+  p.add("dac_tick_service_dispatch_count", g_clocks_dac_tick_service_dispatch_count);
+  p.add("dac_tick_service_arm_failures", g_clocks_dac_tick_service_arm_failures);
+  p.add("dac_tick_coalesce_count", g_clocks_dac_tick_coalesce_count);
 }
 
 
@@ -6376,7 +6395,6 @@ static const process_command_entry_t CLOCKS_COMMANDS[] = {
 
 static const process_subscription_entry_t CLOCKS_SUBSCRIPTIONS[] = {
   { "TIMEBASE_FRAGMENT", on_timebase_fragment },
-  { "FEATURE_STATUS",    on_feature_status    },
   { nullptr, nullptr },
 };
 

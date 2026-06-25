@@ -3,18 +3,14 @@
   <component name="PublishConfigData" autoUpload="Always" serverName="ZPNet Tunnel (mule)" confirmBeforeUploading="false" autoUploadExternalChanges="true">
     <option name="confirmBeforeUploading" value="false" />
     <serverData>
-      <paths name="Remote Host (a5cfe2a7-4f26-41c4-88a1-7110059ca353)">
-        <serverdata>
-          <mappings>
-            <mapping deploy="/tmp/tmp.wfqj3GAqrr/teensy" local="$PROJECT_DIR$" />
-          </mappings>
-        </serverdata>
-      </paths>
       <paths name="ZPNet Tunnel (mule)">
         <serverdata>
           <mappings>
             <mapping deploy="/home/mule/zpnet/pnc/firmware/teensy" local="$PROJECT_DIR$" web="/" />
           </mappings>
+          <excludedPaths>
+            <excludedPath local="true" path="$PROJECT_DIR$/cmake-build-debug-remote-host" />
+          </excludedPaths>
         </serverdata>
       </paths>
     </serverData>
