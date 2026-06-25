@@ -634,15 +634,23 @@ static pps_interval_residuals_t measured_edge_interval_residuals_update(
   g_science_residual_prev_ocxo2_measured_ns = public_ocxo2_measured_ns;
 
   const bool both_valid = r.ocxo1_valid && r.ocxo2_valid;
-  clocks_beta_feature_set_cached(
-      "SCIENCE_RESIDUALS",
-      g_clocks_feature_science_residuals,
-      both_valid
-          ? system_feature_status_t::NOMINAL
-          : ((g_clocks_feature_science_residuals == system_feature_status_t::NOMINAL)
-                ? system_feature_status_t::HOLD
-                : system_feature_status_t::INITIALIZING),
-      both_valid);
+  // SCIENCE_RESIDUALS is a feature-health/readiness scalar, not a per-row
+  // validity bit.  The TIMEBASE row already carries the per-row residual
+  // validity facts.  Downgrading this feature from NOMINAL to HOLD on a single
+  // invalid candidate row causes FEATURE_STATUS_FRAGMENT to strobe
+  // NOMINAL/HOLD/NOMINAL/HOLD during otherwise healthy campaigns, adding a
+  // third 1 Hz publication stream beside TIMEBASE_FRAGMENT and
+  // TIMEBASE_FORENSICS.
+  //
+  // Publish the feature transition to NOMINAL when the science residual surface
+  // first proves live.  Do not use transient row invalidity to bounce the global
+  // feature scalar; persistent/diagnostic residual quality belongs in focused
+  // CLOCKS/TIMEBASE reports, not the feature-health bus.
+  if (both_valid) {
+    clocks_beta_feature_set_cached("SCIENCE_RESIDUALS",
+                                   g_clocks_feature_science_residuals,
+                                   system_feature_status_t::NOMINAL);
+  }
   return r;
 }
 
