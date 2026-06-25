@@ -57,11 +57,8 @@ static bool     g_system_boot_reset_cause_captured = false;
 void system_bootdiag_capture_reset_cause(void) {
   if (g_system_boot_reset_cause_captured) return;
 
-#if defined(SRC_SRSR)
   g_system_boot_reset_cause_raw = SRC_SRSR;
-#else
-  g_system_boot_reset_cause_raw = 0;
-#endif
+  SRC_SRSR = g_system_boot_reset_cause_raw;  // clear captured sticky bits
 
   g_system_boot_reset_cause_captured = true;
 }
