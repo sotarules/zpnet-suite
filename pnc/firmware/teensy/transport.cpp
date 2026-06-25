@@ -1,24 +1,26 @@
-// transport.cpp — ZPNet USB CDC Serial Transport (Teensy)
-// -------------------------------------------------------
-//
-// Serial-only doctrine:
-//   • HID / RawHID support has been retired from Teensy firmware.
-//   • There is one physical transport: USB CDC Serial.
-//   • The first byte of each serial frame is the traffic class.
-//   • The payload frame remains length-authoritative:
-//       <STX=n> JSON <ETX>
+// transport.cpp — ZPNet Transport (Teensy)
+// -----------------------------------------
 //
 // TX Architecture:
-//   • transport_send() serializes directly into the queued wire buffer.
-//   • A single TIMEPOP-driven pump performs physical Serial writes.
-//   • Callers enqueue complete semantic messages; only transport touches Serial.
-//   • Each job owns one heap allocation and frees it on completion.
+//   • transport_send() serializes, heap-allocates, and enqueues.
+//   • A single TIMEPOP-driven pump performs physical transmission.
+//   • Only the pump ever touches RawHID / Serial.
+//   • Interleave is structurally impossible.
+//   • Each job owns its own heap allocation — no ring, no gap.
+//
+// RX Architecture (UNCHANGED):
+//   • Length-authoritative framing
+//   • <STX=n> JSON <ETX>
+//   • Hard reset on corruption
 //
 // Memory model:
-//   • No HID 64-byte block/deblock path exists.
-//   • No Arduino String is constructed in transport_send().
-//   • TX memory is bounded by TX_BUDGET_MAX.
-//   • Failure mode is explicit: serialization, budget, queue, or malloc failure.
+//   • TX memory is bounded by TX_BUDGET_MAX (soft cap).
+//   • Each message is exactly the size it needs to be.
+//   • No geometric fragmentation. No dead space. No wrap logic.
+//   • Failure mode is simple: malloc succeeds or it doesn't.
+//
+// This file is intentionally verbose and explicit.
+// Determinism > cleverness.
 //
 
 #include "transport.h"
@@ -29,28 +31,25 @@
 
 #include <Arduino.h>
 #include <string.h>
-#include <stdio.h>
-#include <stdlib.h>
+#include <ctype.h>
 
 // =============================================================
 // Constants
 // =============================================================
 
-static constexpr uint64_t TRANSPORT_RX_POLL_NS = 2000000ULL;  // 2 ms
-static constexpr uint64_t TRANSPORT_TX_POLL_NS = 2000000ULL;  // 2 ms
+static constexpr uint64_t TRANSPORT_RX_POLL_NS = 2000000ULL;  // 1 millisecond
+static constexpr uint64_t TRANSPORT_TX_POLL_NS = 2000000ULL;  // 1 millisecond
 
-static constexpr size_t RX_BUF_MAX = TRANSPORT_MAX_MESSAGE + 64;
+static constexpr size_t TRANSPORT_BLOCK_SIZE = 64;
+static constexpr size_t RX_BUF_MAX           = TRANSPORT_MAX_MESSAGE + 64;
 
-// TX job queue depth.  Keep this unchanged: recent campaign telemetry has
-// legitimately reached the low 50s without queue failure.
+// TX job queue depth
 static constexpr size_t TX_JOB_MAX = 64;
 
-// TX memory budget (soft cap, bytes).  Counts outstanding heap allocations,
-// not just bytes remaining to send.
+// TX memory budget (soft cap, bytes)
+// Replaces the fixed arena. Enforces bounded memory usage
+// without imposing geometric constraints.
 static constexpr size_t TX_BUDGET_MAX = 48 * 1024;
-
-static constexpr uint8_t TX_TRAFFIC_BYTES = 1;
-static constexpr size_t  TX_HEADER_RESERVE = 32;
 
 static constexpr char   STX_SEQ[] = "<STX=";
 static constexpr size_t STX_LEN   = 5;
@@ -58,26 +57,24 @@ static constexpr size_t STX_LEN   = 5;
 static constexpr char   ETX_SEQ[] = "<ETX>";
 static constexpr size_t ETX_LEN   = 5;
 
-static const char* BUILD_FINGERPRINT = "__FP__ZPNET_SERIAL_ONLY__";
-
 // =============================================================
 // TX Job Queue
 // =============================================================
 //
-// data[] contains the complete wire image:
+// Each job owns a heap-allocated buffer containing a fully
+// framed message (STX + JSON + ETX). The pump sends from
+// this buffer and frees it on completion.
 //
-//   traffic-byte <STX=n> JSON <ETX>
+// The job descriptors form a simple ring for FIFO ordering.
+// The memory management is trivial: malloc on enqueue,
+// free on completion.
 //
-// length is the number of wire bytes to send.  alloc_length is the actual heap
-// allocation size and is used for budget accounting because transport_send()
-// intentionally allocates a conservative serialization bound and then sends the
-// actual serialized length.
 
 struct tx_job_t {
-  uint8_t* data = nullptr;
-  size_t   length = 0;
-  size_t   alloc_length = 0;
-  size_t   sent = 0;
+  uint8_t  traffic;
+  uint8_t* data;       // heap-allocated, owned by this job
+  size_t   length;     // total bytes in data[]
+  size_t   sent;       // bytes already transmitted
 };
 
 static tx_job_t tx_jobs[TX_JOB_MAX];
@@ -90,20 +87,24 @@ static size_t tx_job_count = 0;
 // TX Counters & Budget Tracking
 // =============================================================
 
+// Memory budget (current outstanding bytes across all jobs)
 static size_t tx_budget_used = 0;
 
+// High-water marks
 static size_t tx_budget_high_water = 0;
 static size_t tx_job_high_water    = 0;
 
+// Lifetime counters (monotonic)
 static volatile uint32_t tx_jobs_enqueued  = 0;
 static volatile uint32_t tx_jobs_sent      = 0;
 static volatile uint32_t tx_bytes_enqueued = 0;
 static volatile uint32_t tx_bytes_sent     = 0;
 
-static volatile uint32_t tx_alloc_fail     = 0;
-static volatile uint32_t tx_budget_fail    = 0;
-static volatile uint32_t tx_queue_full     = 0;
-static volatile uint32_t tx_rr_drop_count  = 0;
+// Failure counters
+static volatile uint32_t tx_alloc_fail     = 0;  // malloc returned null
+static volatile uint32_t tx_budget_fail    = 0;  // budget cap exceeded / size exceeded
+static volatile uint32_t tx_queue_full     = 0;  // job ring full
+static volatile uint32_t tx_rr_drop_count  = 0;  // RR messages dropped (any reason)
 
 // =============================================================
 // RX State
@@ -117,7 +118,8 @@ static size_t  rx_len = 0;
 static bool    rx_have_traffic = false;
 static uint8_t rx_traffic      = 0;
 
-static volatile uint32_t rx_blocks_total             = 0;  // retained for schema compatibility; serial-only leaves it at 0
+// RX counters
+static volatile uint32_t rx_blocks_total             = 0;
 static volatile uint32_t rx_bytes_total              = 0;
 static volatile uint32_t rx_frames_complete          = 0;
 static volatile uint32_t rx_frames_dispatched        = 0;
@@ -129,7 +131,7 @@ static volatile uint32_t rx_overlap_count            = 0;
 static volatile uint32_t rx_expected_traffic_missing = 0;
 
 // =============================================================
-// Helpers
+// Traffic Validation
 // =============================================================
 
 static inline bool is_valid_traffic(uint8_t b) {
@@ -139,25 +141,35 @@ static inline bool is_valid_traffic(uint8_t b) {
     b == TRAFFIC_PUBLISH_SUBSCRIBE;
 }
 
-static inline void note_rr_drop(uint8_t traffic) {
-  if (traffic == TRAFFIC_REQUEST_RESPONSE) {
-    tx_rr_drop_count++;
-  }
+// =============================================================
+// Transport fingerprint
+// =============================================================
+
+#if defined(ZPNET_TRANSPORT_SELECTED_HID)
+static const char* BUILD_FINGERPRINT = "__FP__ZPNET_HID__";
+#elif defined(ZPNET_TRANSPORT_SELECTED_SERIAL)
+static const char* BUILD_FINGERPRINT = "__FP__ZPNET_SERIAL__";
+#endif
+
+// =============================================================
+// Physical Send
+// =============================================================
+
+#if defined(ZPNET_TRANSPORT_SELECTED_HID)
+
+static inline bool hid_send_block(const uint8_t block[TRANSPORT_BLOCK_SIZE]) {
+  return RawHID.send(block, 50) > 0;
 }
 
-static size_t payload_serialization_bound(const Payload& payload) {
-  size_t bound = (payload.arena_used() * 2) + (payload.count() * 32) + 64;
-  if (bound < 256) bound = 256;
-  if (bound > Payload::ARENA_MAX) bound = Payload::ARENA_MAX;
-  return bound;
-}
+#elif defined(ZPNET_TRANSPORT_SELECTED_SERIAL)
 
-static size_t serial_write_bytes(const uint8_t* buf, size_t len) {
-  if (!buf || len == 0) return 0;
-  const size_t n = Serial.write(buf, len);
+static inline bool serial_send_bytes(const uint8_t* buf, size_t len) {
+  size_t n = Serial.write(buf, len);
   Serial.flush();
-  return n;
+  return n == len;
 }
+
+#endif
 
 // =============================================================
 // Registration
@@ -176,122 +188,183 @@ void transport_register_receive_callback(
 
 static void transport_tx_pump(timepop_ctx_t*, timepop_diag_t*, void*) {
 
-  if (tx_job_count == 0) return;
+  if (tx_job_count == 0)
+    return;
 
   tx_job_t& job = tx_jobs[tx_job_tail];
-  const size_t remaining = job.length - job.sent;
-  const size_t written = serial_write_bytes(job.data + job.sent, remaining);
 
-  if (written == 0) return;
+#if defined(ZPNET_TRANSPORT_SELECTED_HID)
 
-  const size_t accepted = (written > remaining) ? remaining : written;
-  job.sent += accepted;
-  tx_bytes_sent += accepted;
+  uint8_t block[TRANSPORT_BLOCK_SIZE];
+  size_t remaining = job.length - job.sent;
 
-  if (job.sent < job.length) return;
+  if (job.sent == 0) {
+    // First block carries traffic byte
+    block[0] = job.traffic;
+    size_t chunk = min(remaining, TRANSPORT_BLOCK_SIZE - 1);
+    memcpy(block + 1, job.data, chunk);
+    memset(block + 1 + chunk, 0, TRANSPORT_BLOCK_SIZE - (1 + chunk));
+    hid_send_block(block);
+    job.sent += chunk;
+    tx_bytes_sent += chunk;
+  } else {
+    size_t chunk = min(remaining, TRANSPORT_BLOCK_SIZE);
+    memcpy(block, job.data + job.sent, chunk);
+    memset(block + chunk, 0, TRANSPORT_BLOCK_SIZE - chunk);
+    hid_send_block(block);
+    job.sent += chunk;
+    tx_bytes_sent += chunk;
+  }
 
-  const size_t alloc_length = job.alloc_length;
-  free(job.data);
-  job = tx_job_t{};
+#elif defined(ZPNET_TRANSPORT_SELECTED_SERIAL)
 
-  tx_budget_used -= alloc_length;
+  if (job.sent == 0) {
+    uint8_t header = job.traffic;
+    serial_send_bytes(&header, 1);
+  }
 
-  tx_job_tail = (tx_job_tail + 1) % TX_JOB_MAX;
-  tx_job_count--;
-  tx_jobs_sent++;
+  size_t remaining = job.length - job.sent;
+  size_t chunk = remaining;
+  serial_send_bytes(job.data + job.sent, chunk);
+  job.sent += chunk;
+  tx_bytes_sent += chunk;
+
+#endif
+
+  // Job complete?
+  if (job.sent >= job.length) {
+
+    // Release heap allocation
+    free(job.data);
+    job.data = nullptr;
+
+    // Release budget
+    tx_budget_used -= job.length;
+
+    // Advance queue
+    tx_job_tail = (tx_job_tail + 1) % TX_JOB_MAX;
+    tx_job_count--;
+    tx_jobs_sent++;
+  }
 }
 
 // =============================================================
-// transport_send() — serialize directly into queued wire buffer
+// transport_send() — serialize, allocate, enqueue
 // =============================================================
 
 void transport_send(uint8_t traffic, const Payload& payload) {
 
-  if (!is_valid_traffic(traffic)) return;
+  // --------------------------------------------------------
+  // 1. Serialize dynamically
+  // --------------------------------------------------------
+
+  String json = payload.to_json();
+  if (json.length() == 0) {
+    return;
+  }
+
+  if (!payload.empty() && json == "{}") {
+    return;
+  }
+
+  const size_t json_len = json.length();
+  if (json_len > TRANSPORT_MAX_MESSAGE) {
+    tx_budget_fail++;
+    if (traffic == TRAFFIC_REQUEST_RESPONSE) {
+      tx_rr_drop_count++;
+    }
+    return;
+  }
+
+  // --------------------------------------------------------
+  // 2. Compute framed message size
+  // --------------------------------------------------------
+
+  char header[32];
+  int header_len = snprintf(header, sizeof(header),
+                            "<STX=%u>", (unsigned)json_len);
+  if (header_len <= 0)
+    return;
+
+  size_t total_len = (size_t)header_len + json_len + ETX_LEN;
+
+  // --------------------------------------------------------
+  // 3. Budget check (soft cap)
+  // --------------------------------------------------------
+
+  if (tx_budget_used + total_len > TX_BUDGET_MAX) {
+    tx_budget_fail++;
+    if (traffic == TRAFFIC_REQUEST_RESPONSE) {
+      tx_rr_drop_count++;
+    }
+    return;
+  }
+
+  // --------------------------------------------------------
+  // 4. Job queue check
+  // --------------------------------------------------------
 
   if (tx_job_count >= TX_JOB_MAX) {
     tx_queue_full++;
-    note_rr_drop(traffic);
+    if (traffic == TRAFFIC_REQUEST_RESPONSE) {
+      tx_rr_drop_count++;
+    }
     return;
   }
 
-  const size_t json_buf_size = payload_serialization_bound(payload);
-  const size_t alloc_len =
-      TX_TRAFFIC_BYTES + TX_HEADER_RESERVE + json_buf_size + ETX_LEN;
+  // --------------------------------------------------------
+  // 5. Heap allocate
+  // --------------------------------------------------------
 
-  if (tx_budget_used + alloc_len > TX_BUDGET_MAX) {
-    tx_budget_fail++;
-    note_rr_drop(traffic);
-    return;
-  }
+  uint8_t* data = (uint8_t*)malloc(total_len);
 
-  uint8_t* data = (uint8_t*)malloc(alloc_len);
   if (!data) {
     tx_alloc_fail++;
-    note_rr_drop(traffic);
+    if (traffic == TRAFFIC_REQUEST_RESPONSE) {
+      tx_rr_drop_count++;
+    }
     return;
   }
 
-  char* json_buf = reinterpret_cast<char*>(data + TX_TRAFFIC_BYTES + TX_HEADER_RESERVE);
-  const size_t json_len = payload.write_json(json_buf, json_buf_size);
+  // --------------------------------------------------------
+  // 6. Assemble framed message
+  // --------------------------------------------------------
 
-  if (json_len == 0 || json_len > TRANSPORT_MAX_MESSAGE) {
-    free(data);
-    tx_budget_fail++;
-    note_rr_drop(traffic);
-    return;
-  }
+  memcpy(data, header, header_len);
+  memcpy(data + header_len, json.c_str(), json_len);
+  memcpy(data + header_len + json_len, ETX_SEQ, ETX_LEN);
 
-  if (!payload.empty() && json_len == 2 && json_buf[0] == '{' && json_buf[1] == '}') {
-    free(data);
-    tx_budget_fail++;
-    note_rr_drop(traffic);
-    return;
-  }
-
-  char header[TX_HEADER_RESERVE];
-  const int header_len = snprintf(header, sizeof(header),
-                                  "<STX=%u>", (unsigned)json_len);
-  if (header_len <= 0 || (size_t)header_len >= sizeof(header)) {
-    free(data);
-    tx_budget_fail++;
-    note_rr_drop(traffic);
-    return;
-  }
-
-  const size_t wire_len =
-      TX_TRAFFIC_BYTES + (size_t)header_len + json_len + ETX_LEN;
-  if (wire_len > alloc_len) {
-    free(data);
-    tx_budget_fail++;
-    note_rr_drop(traffic);
-    return;
-  }
-
-  data[0] = traffic;
-  memcpy(data + TX_TRAFFIC_BYTES, header, (size_t)header_len);
-  memmove(data + TX_TRAFFIC_BYTES + (size_t)header_len, json_buf, json_len);
-  memcpy(data + TX_TRAFFIC_BYTES + (size_t)header_len + json_len, ETX_SEQ, ETX_LEN);
+  // --------------------------------------------------------
+  // 7. Enqueue
+  // --------------------------------------------------------
 
   tx_jobs[tx_job_head] = {
+    traffic,
     data,
-    wire_len,
-    alloc_len,
+    total_len,
     0
   };
 
   tx_job_head = (tx_job_head + 1) % TX_JOB_MAX;
   tx_job_count++;
   tx_jobs_enqueued++;
-  tx_bytes_enqueued += wire_len;
+  tx_bytes_enqueued += total_len;
 
-  tx_budget_used += alloc_len;
-  if (tx_budget_used > tx_budget_high_water) tx_budget_high_water = tx_budget_used;
-  if (tx_job_count > tx_job_high_water) tx_job_high_water = tx_job_count;
+  // --------------------------------------------------------
+  // 8. Budget + high-water tracking
+  // --------------------------------------------------------
+
+  tx_budget_used += total_len;
+
+  if (tx_budget_used > tx_budget_high_water)
+    tx_budget_high_water = tx_budget_used;
+
+  if (tx_job_count > tx_job_high_water)
+    tx_job_high_water = tx_job_count;
 }
 
 // =============================================================
-// RX — Serial stream framing
+// RX — unchanged
 // =============================================================
 
 static void rx_reset_hard() {
@@ -307,7 +380,8 @@ static void dispatch_if_complete() {
     return;
   }
 
-  if (rx_len < (STX_LEN + 2)) return;
+  if (rx_len < (STX_LEN + 2))
+    return;
 
   if (memcmp(rx_buf, STX_SEQ, STX_LEN) != 0) {
     rx_bad_stx_count++;
@@ -331,11 +405,12 @@ static void dispatch_if_complete() {
     ++i;
   }
 
-  if (!saw_digit || i >= rx_len) return;
+  if (!saw_digit || i >= rx_len)
+    return;
 
-  const size_t header_end = i;
-  const size_t json_start = header_end + 1;
-  const size_t required_total = json_start + declared_len + ETX_LEN;
+  size_t header_end = i;
+  size_t json_start = header_end + 1;
+  size_t required_total = json_start + declared_len + ETX_LEN;
 
   if (required_total > RX_BUF_MAX) {
     rx_len_overflow_count++;
@@ -343,9 +418,10 @@ static void dispatch_if_complete() {
     return;
   }
 
-  if (rx_len < required_total) return;
+  if (rx_len < required_total)
+    return;
 
-  const size_t etx_pos = json_start + declared_len;
+  size_t etx_pos = json_start + declared_len;
   if (memcmp(rx_buf + etx_pos, ETX_SEQ, ETX_LEN) != 0) {
     rx_bad_etx_count++;
     rx_reset_hard();
@@ -365,6 +441,55 @@ static void dispatch_if_complete() {
   rx_reset_hard();
 }
 
+// =============================================================
+// RECEIVE: HID RX (record-based)
+// =============================================================
+
+#if defined(ZPNET_TRANSPORT_SELECTED_HID)
+static void rx_hid_tick() {
+
+  transport_rx_entered();
+
+  uint8_t block[TRANSPORT_BLOCK_SIZE];
+  if (RawHID.recv(block, 0) <= 0)
+    return;
+
+  rx_blocks_total++;
+
+  size_t offset = 0;
+
+  if (!rx_have_traffic) {
+    if (!is_valid_traffic(block[0])) {
+      rx_expected_traffic_missing++;
+      rx_reset_hard();
+      return;
+    }
+    rx_traffic = block[0];
+    rx_have_traffic = true;
+    offset = 1;
+  }
+
+  size_t copy = TRANSPORT_BLOCK_SIZE - offset;
+  rx_bytes_total += copy;
+
+  if (rx_len + copy > RX_BUF_MAX) {
+    rx_reset_hard();
+    return;
+  }
+
+  memcpy(rx_buf + rx_len, block + offset, copy);
+  rx_len += copy;
+
+  dispatch_if_complete();
+}
+#endif
+
+// =============================================================
+// RECEIVE: SERIAL RX (stream-based)
+// =============================================================
+
+#if defined(ZPNET_TRANSPORT_SELECTED_SERIAL)
+
 static void rx_serial_tick() {
 
   transport_rx_entered();
@@ -372,6 +497,7 @@ static void rx_serial_tick() {
   while (Serial.available()) {
     uint8_t b = (uint8_t)Serial.read();
 
+    // Await traffic byte
     if (!rx_have_traffic) {
       if (!is_valid_traffic(b)) {
         rx_expected_traffic_missing++;
@@ -383,12 +509,13 @@ static void rx_serial_tick() {
       continue;
     }
 
+    // Overlap signal
     if (is_valid_traffic(b)) {
       rx_overlap_count++;
     }
 
+    // Accumulate payload bytes
     if (rx_len >= RX_BUF_MAX) {
-      rx_len_overflow_count++;
       rx_reset_hard();
       return;
     }
@@ -400,8 +527,20 @@ static void rx_serial_tick() {
   }
 }
 
+#endif
+
+// =============================================================
+// RX Poll (timepop)
+// =============================================================
+
 static void transport_rx_tick(timepop_ctx_t*, timepop_diag_t*, void*) {
+
+#if defined(ZPNET_TRANSPORT_SELECTED_HID)
+  rx_hid_tick();
+#elif defined(ZPNET_TRANSPORT_SELECTED_SERIAL)
   rx_serial_tick();
+#endif
+
 }
 
 // =============================================================
@@ -412,6 +551,7 @@ void transport_get_info(transport_info_t* out) {
 
   if (!out) return;
 
+  // TX — Budget / Queue health
   out->tx_budget_max        = TX_BUDGET_MAX;
   out->tx_budget_used       = tx_budget_used;
   out->tx_budget_high_water = tx_budget_high_water;
@@ -425,11 +565,13 @@ void transport_get_info(transport_info_t* out) {
   out->tx_bytes_enqueued    = tx_bytes_enqueued;
   out->tx_bytes_sent        = tx_bytes_sent;
 
+  // TX — Failure counters
   out->tx_alloc_fail        = tx_alloc_fail;
   out->tx_budget_fail       = tx_budget_fail;
   out->tx_queue_full        = tx_queue_full;
   out->tx_rr_drop_count     = tx_rr_drop_count;
 
+  // RX
   out->rx_blocks_total              = rx_blocks_total;
   out->rx_bytes_total               = rx_bytes_total;
   out->rx_frames_complete           = rx_frames_complete;
@@ -448,7 +590,9 @@ void transport_get_info(transport_info_t* out) {
 
 void transport_init(void) {
 
-  Serial.begin(USB_SERIAL_BAUD);
+#if defined(ZPNET_TRANSPORT_SELECTED_SERIAL)
+  Serial.begin(115200);
+#endif
 
   debug_log("transport", BUILD_FINGERPRINT);
 

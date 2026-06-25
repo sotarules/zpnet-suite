@@ -68,26 +68,16 @@
 void process_system_register(void);
 
 // ============================================================================
-// Boot diagnostics
-// ============================================================================
-//
-// Capture raw MCU reset cause once during boot and expose it through
-// SYSTEM.REPORT.  This deliberately avoids a new subsystem, event type,
-// retained ledger, or command surface.
-void system_bootdiag_capture_reset_cause(void);
-uint32_t system_bootdiag_reset_cause_raw(void);
-
-// ============================================================================
 // Feature status substrate
 // ============================================================================
 //
-// Teensy SYSTEM owns only Teensy-local feature state.  Pi SYSTEM owns Pi-local
-// feature state separately.  Campaign admission polls each owning authority
-// directly instead of depending on a unified pushed feature bus.
+// Teensy SYSTEM owns only Teensy-local feature state.  Pi SYSTEM asks for this
+// tree and unions it with Pi-local feature state into the global dashboard /
+// campaign-readiness surface.
 //
-// Teensy does not dynamically publish feature changes.  Feature state is
-// maintained locally and exposed through the command/report surface so campaign
-// admission can poll the owning authority directly.
+// Teensy also publishes FEATURE_STATUS_FRAGMENT whenever any local feature
+// scalar changes.  The fragment contains only Teensy-owned feature paths; the
+// Pi-side SYSTEM service relays the unified FEATURE_STATUS tree.
 //
 // Feature paths are reported as:
 //

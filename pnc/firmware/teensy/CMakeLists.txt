@@ -139,6 +139,7 @@ set_source_files_properties(teensy.ino PROPERTIES LANGUAGE CXX)
 # -------------------------------------------------------------
 
 target_compile_definitions(zpnet_teensy_index PRIVATE
+    ZPNET_TRANSPORT_SERIAL
     ARDUINO=10819
     TEENSYDUINO=160
     ARDUINO_TEENSY41

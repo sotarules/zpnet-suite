@@ -699,42 +699,11 @@ static constexpr uint32_t
 static uint32_t
     g_interrupt_feature_pps_vclock_authority_init_reject_count = 0;
 
-// QTIMER_DWT_RULER feature status is also a launch-readiness scalar.
-// REPORT_INTEGRITY keeps the brutal per-sample truth; the annunciator should
-// not strobe merely because a rail is rebuilding its clean streak after a
-// transient.  Once each VCLOCK DWT ruler rail proves itself, keep NOMINAL
-// latched across isolated bad/skipped rows.  Escalate only after a sustained
-// consecutive bad/absent run matching that rail's own recovery horizon.
-static constexpr uint32_t QTIMER_DWT_FEATURE_BAD_STREAK_FALLBACK_COUNT = 8U;
-
-struct qtimer_dwt_feature_interval_latch_t {
-  bool     nominal_latched = false;
-  bool     anomaly_latched = false;
-  uint32_t last_evaluated_sequence = 0;
-  uint32_t last_test_count = 0;
-  uint32_t consecutive_good_count = 0;
-  uint32_t consecutive_bad_or_absent_count = 0;
-  uint32_t nominal_latch_count = 0;
-  uint32_t anomaly_latch_count = 0;
-};
-
-static qtimer_dwt_feature_interval_latch_t g_qtimer_dwt_feature_vclock_1s = {};
-static qtimer_dwt_feature_interval_latch_t g_qtimer_dwt_feature_vclock_1khz = {};
-
-static void interrupt_feature_qtimer_dwt_latch_reset(void) {
-  g_qtimer_dwt_feature_vclock_1s = qtimer_dwt_feature_interval_latch_t{};
-  g_qtimer_dwt_feature_vclock_1khz = qtimer_dwt_feature_interval_latch_t{};
-}
-
 static void interrupt_feature_set_cached(const char* feature,
                                          system_feature_status_t& cached,
                                          system_feature_status_t status,
                                          bool force = false) {
-  // process_interrupt may evaluate feature readiness from timing/handoff
-  // paths.  Keep the hot path to "real transition only"; the forced
-  // initialization pass registers the feature slots.  Do not repeatedly walk
-  // the SYSTEM registry via system_feature_has() on every unchanged sample.
-  if (force || cached != status) {
+  if (force || cached != status || !system_feature_has("INTERRUPT", feature)) {
     (void)system_feature_set("INTERRUPT", feature, status, nullptr);
     cached = status;
   }
@@ -749,7 +718,6 @@ static bool interrupt_feature_lane_required(interrupt_subscriber_kind_t kind) {
 
 static void interrupt_features_mark_initializing(void) {
   g_interrupt_feature_pps_vclock_authority_init_reject_count = 0;
-  interrupt_feature_qtimer_dwt_latch_reset();
 
   interrupt_feature_set_cached("PPS_VCLOCK_AUTHORITY",
                                g_interrupt_feature_pps_vclock_authority,
@@ -876,106 +844,41 @@ static void interrupt_feature_update_qtimer_counter_custody(void) {
                                : system_feature_status_t::INITIALIZING));
 }
 
-static bool interrupt_feature_dwt_interval_sample_good(
+static bool interrupt_feature_dwt_interval_recovered(
     const interrupt_integrity_qtimer_dwt_interval_check_t& s) {
   // QTIMER_DWT_RULER is a launch-readiness scalar, not an eternal sin ledger.
-  // Historical post-lock excursions remain visible in REPORT_INTEGRITY.  The
-  // annunciator latches once the current rail has rebuilt its clean streak.
-  return s.valid && s.locked && s.last_ok &&
+  // Historical post-lock excursions remain visible in REPORT_INTEGRITY, but a
+  // known catch-up/rebootstrap discontinuity should not hold preflight forever
+  // after the ruler has rebuilt its clean streak.
+  return s.locked && s.last_ok &&
          s.consecutive_ok_count >= s.lock_streak_required;
 }
 
-static uint32_t interrupt_feature_dwt_interval_bad_streak_required(
+static bool interrupt_feature_dwt_interval_active_anomaly(
     const interrupt_integrity_qtimer_dwt_interval_check_t& s) {
-  return s.lock_streak_required != 0U
-      ? s.lock_streak_required
-      : QTIMER_DWT_FEATURE_BAD_STREAK_FALLBACK_COUNT;
+  // A locked rail is anomalous only while its most recent counted sample is
+  // bad.  Once clean samples resume, the feature returns to INITIALIZING until
+  // the same lock streak is rebuilt, then NOMINAL.
+  return s.locked && s.test_count != 0U && !s.last_ok;
 }
 
-static void interrupt_feature_dwt_interval_latch_evaluate(
-    qtimer_dwt_feature_interval_latch_t& latch,
-    const interrupt_integrity_qtimer_dwt_interval_check_t& s) {
-  if (!s.valid || s.sequence == 0U ||
-      s.sequence == latch.last_evaluated_sequence) {
-    return;
-  }
-  latch.last_evaluated_sequence = s.sequence;
-
-  const bool counted_sample = (s.test_count != latch.last_test_count);
-  latch.last_test_count = s.test_count;
-
-  if (interrupt_feature_dwt_interval_sample_good(s)) {
-    if (latch.consecutive_good_count != UINT32_MAX) {
-      latch.consecutive_good_count++;
-    }
-    latch.consecutive_bad_or_absent_count = 0;
-
-    if (!latch.nominal_latched) {
-      latch.nominal_latched = true;
-      latch.nominal_latch_count++;
-    }
-    latch.anomaly_latched = false;
-    return;
-  }
-
-  // Before a rail has ever locked/latched, not-good rows are just startup.
-  // After proof, tolerate isolated misses/skips.  Count only consecutive
-  // actually-bad counted samples or consecutive rows with no counted sample;
-  // counted good samples reset the bad/absent streak even while the clean
-  // recovery streak is still rebuilding.
-  if (!latch.nominal_latched && !s.locked) {
-    return;
-  }
-
-  if (counted_sample && s.last_ok) {
-    if (latch.consecutive_good_count != UINT32_MAX) {
-      latch.consecutive_good_count++;
-    }
-    latch.consecutive_bad_or_absent_count = 0;
-    return;
-  }
-
-  latch.consecutive_good_count = 0;
-  if (latch.consecutive_bad_or_absent_count != UINT32_MAX) {
-    latch.consecutive_bad_or_absent_count++;
-  }
-
-  if (latch.consecutive_bad_or_absent_count >=
-      interrupt_feature_dwt_interval_bad_streak_required(s)) {
-    if (!latch.anomaly_latched) {
-      latch.anomaly_latched = true;
-      latch.anomaly_latch_count++;
-    }
-  }
+static bool interrupt_feature_dwt_locked(
+    const interrupt_integrity_qtimer_dwt_match_check_t& s) {
+  return interrupt_feature_dwt_interval_recovered(s.one_second) &&
+         interrupt_feature_dwt_interval_recovered(s.hz1k);
 }
 
-static bool interrupt_feature_dwt_interval_nominal(
-    const qtimer_dwt_feature_interval_latch_t& latch) {
-  return latch.nominal_latched && !latch.anomaly_latched;
-}
-
-static bool interrupt_feature_dwt_interval_anomaly(
-    const qtimer_dwt_feature_interval_latch_t& latch) {
-  return latch.anomaly_latched;
+static bool interrupt_feature_dwt_anomaly(
+    const interrupt_integrity_qtimer_dwt_match_check_t& s) {
+  return interrupt_feature_dwt_interval_active_anomaly(s.one_second) ||
+         interrupt_feature_dwt_interval_active_anomaly(s.hz1k);
 }
 
 static void interrupt_feature_update_qtimer_dwt_ruler(void) {
   // Readiness uses the sovereign VCLOCK DWT ruler only. OCXO DWT interval
   // checks remain diagnostic physics surfaces and are not global readiness.
-  const interrupt_integrity_qtimer_dwt_match_check_t& v =
-      g_interrupt_integrity.vclock_qtimer_dwt;
-
-  interrupt_feature_dwt_interval_latch_evaluate(
-      g_qtimer_dwt_feature_vclock_1s, v.one_second);
-  interrupt_feature_dwt_interval_latch_evaluate(
-      g_qtimer_dwt_feature_vclock_1khz, v.hz1k);
-
-  const bool v_ok =
-      interrupt_feature_dwt_interval_nominal(g_qtimer_dwt_feature_vclock_1s) &&
-      interrupt_feature_dwt_interval_nominal(g_qtimer_dwt_feature_vclock_1khz);
-  const bool anomaly =
-      interrupt_feature_dwt_interval_anomaly(g_qtimer_dwt_feature_vclock_1s) ||
-      interrupt_feature_dwt_interval_anomaly(g_qtimer_dwt_feature_vclock_1khz);
+  const bool v_ok = interrupt_feature_dwt_locked(g_interrupt_integrity.vclock_qtimer_dwt);
+  const bool anomaly = interrupt_feature_dwt_anomaly(g_interrupt_integrity.vclock_qtimer_dwt);
 
   interrupt_feature_set_cached(
       "QTIMER_DWT_RULER",
@@ -4680,13 +4583,6 @@ static constexpr uint32_t LOWER_ENV_PUBLISH_MIN_BUCKETS = 32U;
 static constexpr uint32_t LOWER_ENV_PUBLISH_HARD_EDGE_GATE_CYCLES = 16U;
 static constexpr uint32_t LOWER_ENV_PUBLISH_HARD_INTERVAL_GATE_CYCLES = 16U;
 
-// FLOORLINE feature status is a launch-readiness scalar, not a one-row
-// candidate-valid light.  A single missing/invalid lower-envelope window can
-// happen during ordinary startup, handoff pressure, or local reseeding.  Keep
-// NOMINAL latched across short absences, but surface ANOMALY when a required
-// lane loses candidate production for a sustained run of one-second windows.
-static constexpr uint32_t FLOORLINE_FEATURE_BAD_STREAK_ANOMALY_COUNT = 8U;
-
 static constexpr uint32_t FLOORLINE_PUBLISH_SOURCE_OBSERVED  = 0U;
 static constexpr uint32_t FLOORLINE_PUBLISH_SOURCE_FLOORLINE = 1U;
 
@@ -4786,16 +4682,6 @@ struct lower_env_lane_t {
   uint32_t reset_count = 0;
   uint32_t invalid_window_count = 0;
   uint32_t overflow_reset_count = 0;
-
-  // Feature-readiness latch.  last.valid is the latest window's evidence;
-  // these fields are the launch-annunciator policy over that evidence.
-  bool     feature_nominal_latched = false;
-  bool     feature_anomaly_latched = false;
-  uint32_t feature_last_evaluated_sequence = 0;
-  uint32_t feature_consecutive_good_count = 0;
-  uint32_t feature_consecutive_bad_count = 0;
-  uint32_t feature_nominal_latch_count = 0;
-  uint32_t feature_anomaly_latch_count = 0;
 };
 
 static lower_env_lane_t g_lower_env_vclock;
@@ -4874,95 +4760,29 @@ static void lower_env_reset_all(void) {
   interrupt_feature_update_floorline();
 }
 
-static bool interrupt_feature_floorline_lane_sample_good(
-    const lower_env_lane_t& lane) {
-  return lane.last.valid &&
-         lane.last.sample_count >= LOWER_ENV_FIT_MIN_BUCKETS &&
-         lane.last.inferred_dwt_at_event != 0U &&
-         lane.last.observed_dwt_at_event != 0U;
-}
-
-static void interrupt_feature_floorline_lane_evaluate(
-    lower_env_lane_t* lane) {
-  if (!lane) return;
-
-  const uint32_t seq = lane->last.sequence;
-  if (seq == 0U || seq == lane->feature_last_evaluated_sequence) {
-    return;
-  }
-  lane->feature_last_evaluated_sequence = seq;
-
-  if (interrupt_feature_floorline_lane_sample_good(*lane)) {
-    lane->feature_consecutive_good_count++;
-    lane->feature_consecutive_bad_count = 0;
-
-    if (!lane->feature_nominal_latched) {
-      lane->feature_nominal_latched = true;
-      lane->feature_nominal_latch_count++;
-    }
-    if (lane->feature_anomaly_latched) {
-      lane->feature_anomaly_latched = false;
-    }
-    return;
-  }
-
-  lane->feature_consecutive_good_count = 0;
-  if (lane->feature_consecutive_bad_count != UINT32_MAX) {
-    lane->feature_consecutive_bad_count++;
-  }
-
-  if (lane->feature_consecutive_bad_count >=
-      FLOORLINE_FEATURE_BAD_STREAK_ANOMALY_COUNT) {
-    if (!lane->feature_anomaly_latched) {
-      lane->feature_anomaly_latched = true;
-      lane->feature_anomaly_latch_count++;
-    }
-  }
-}
-
 static bool interrupt_feature_floorline_lane_nominal(
     interrupt_subscriber_kind_t kind) {
   const lower_env_lane_t* lane = lower_env_lane_for(kind);
-  return lane && lane->feature_nominal_latched &&
-         !lane->feature_anomaly_latched;
-}
-
-static bool interrupt_feature_floorline_lane_anomaly(
-    interrupt_subscriber_kind_t kind) {
-  const lower_env_lane_t* lane = lower_env_lane_for(kind);
-  return lane && lane->feature_anomaly_latched;
+  return lane && lane->last.valid &&
+         lane->last.sample_count >= LOWER_ENV_FIT_MIN_BUCKETS &&
+         lane->last.inferred_dwt_at_event != 0U &&
+         lane->last.observed_dwt_at_event != 0U;
 }
 
 static void interrupt_feature_update_floorline(void) {
-  interrupt_feature_floorline_lane_evaluate(&g_lower_env_vclock);
-  interrupt_feature_floorline_lane_evaluate(&g_lower_env_ocxo1);
-  interrupt_feature_floorline_lane_evaluate(&g_lower_env_ocxo2);
-
   const bool v_ok = interrupt_feature_floorline_lane_nominal(
       interrupt_subscriber_kind_t::VCLOCK);
-  const bool o1_required = interrupt_feature_lane_required(
-      interrupt_subscriber_kind_t::OCXO1);
-  const bool o2_required = interrupt_feature_lane_required(
-      interrupt_subscriber_kind_t::OCXO2);
-  const bool o1_ok = !o1_required ||
+  const bool o1_ok = !interrupt_feature_lane_required(interrupt_subscriber_kind_t::OCXO1) ||
       interrupt_feature_floorline_lane_nominal(interrupt_subscriber_kind_t::OCXO1);
-  const bool o2_ok = !o2_required ||
+  const bool o2_ok = !interrupt_feature_lane_required(interrupt_subscriber_kind_t::OCXO2) ||
       interrupt_feature_floorline_lane_nominal(interrupt_subscriber_kind_t::OCXO2);
-
-  const bool anomaly =
-      interrupt_feature_floorline_lane_anomaly(interrupt_subscriber_kind_t::VCLOCK) ||
-      (o1_required &&
-       interrupt_feature_floorline_lane_anomaly(interrupt_subscriber_kind_t::OCXO1)) ||
-      (o2_required &&
-       interrupt_feature_floorline_lane_anomaly(interrupt_subscriber_kind_t::OCXO2));
 
   interrupt_feature_set_cached(
       "FLOORLINE",
       g_interrupt_feature_floorline,
-      anomaly ? system_feature_status_t::ANOMALY
-              : ((v_ok && o1_ok && o2_ok)
-                    ? system_feature_status_t::NOMINAL
-                    : system_feature_status_t::INITIALIZING));
+      (v_ok && o1_ok && o2_ok)
+          ? system_feature_status_t::NOMINAL
+          : system_feature_status_t::INITIALIZING);
 }
 
 static const char* lower_env_publish_source_name(uint32_t source) {
@@ -10993,23 +10813,6 @@ static FLASHMEM Payload cmd_report_integrity(const Payload&) {
         g_interrupt_feature_qtimer_dwt_ruler == system_feature_status_t::ANOMALY);
   p.add("qtimer_dwt_gate_cycles", QTIMER_DWT_MATCH_GATE_CYCLES);
 
-  p.add("dwt_1s_feature_nominal_latched",
-        g_qtimer_dwt_feature_vclock_1s.nominal_latched);
-  p.add("dwt_1s_feature_anomaly_latched",
-        g_qtimer_dwt_feature_vclock_1s.anomaly_latched);
-  p.add("dwt_1s_feature_bad_or_absent_streak",
-        g_qtimer_dwt_feature_vclock_1s.consecutive_bad_or_absent_count);
-  p.add("dwt_1s_feature_bad_streak_required",
-        interrupt_feature_dwt_interval_bad_streak_required(d1));
-  p.add("dwt_1k_feature_nominal_latched",
-        g_qtimer_dwt_feature_vclock_1khz.nominal_latched);
-  p.add("dwt_1k_feature_anomaly_latched",
-        g_qtimer_dwt_feature_vclock_1khz.anomaly_latched);
-  p.add("dwt_1k_feature_bad_or_absent_streak",
-        g_qtimer_dwt_feature_vclock_1khz.consecutive_bad_or_absent_count);
-  p.add("dwt_1k_feature_bad_streak_required",
-        interrupt_feature_dwt_interval_bad_streak_required(dk));
-
   p.add("dwt_1s_locked", d1.locked);
   p.add("dwt_1s_clean_streak", d1.consecutive_ok_count);
   p.add("dwt_1s_recovery_required", d1.lock_streak_required);
@@ -11250,12 +11053,6 @@ static FLASHMEM void add_lower_env_lane_payload(Payload& parent,
   obj.add("reset_count", lane.reset_count);
   obj.add("invalid_window_count", lane.invalid_window_count);
   obj.add("overflow_reset_count", lane.overflow_reset_count);
-  obj.add("feature_nominal_latched", lane.feature_nominal_latched);
-  obj.add("feature_anomaly_latched", lane.feature_anomaly_latched);
-  obj.add("feature_consecutive_good_count", lane.feature_consecutive_good_count);
-  obj.add("feature_consecutive_bad_count", lane.feature_consecutive_bad_count);
-  obj.add("feature_bad_streak_anomaly_count",
-          FLOORLINE_FEATURE_BAD_STREAK_ANOMALY_COUNT);
   obj.add("window_sample_count", r.sample_count);
 
   obj.add("publish_source", r.publish_source);

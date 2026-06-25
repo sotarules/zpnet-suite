@@ -173,24 +173,24 @@ TIMEBASE_FRAGMENT_TOPIC = "TIMEBASE_FRAGMENT"
 TIMEBASE_FORENSICS_TOPIC = "TIMEBASE_FORENSICS"
 TIMEBASE_PAIR_TIMEOUT_S = 5.0
 
-PREFLIGHT_POLL_INTERVAL_S = 2
+PREFLIGHT_POLL_INTERVAL_S = 30
 PREFLIGHT_LOG_PREFIX = "🛡️ [preflight]"
 
-# Command-polled feature-status campaign preflight.
+# Feature-status campaign preflight.
 #
-# Pi and Teensy feature ownership is deliberately separate.  CLOCKS polls
-# PI.SYSTEM.FEATURES for Pi-owned environmental/host/GNSS readiness and polls
-# TEENSY.SYSTEM.FEATURES directly for timing readiness.  There is no unified
-# FEATURE_STATUS propagation hop in the campaign admission path.
+# This first-pass gate deliberately uses the global PI SYSTEM feature tree,
+# because Pi SYSTEM has the broadest horizon: Pi-local GNSS/host/power state
+# plus imported Teensy-local timing readiness.  Runtime TIMEBASE pair
+# integrity, database command-contract checks, GNSS mode reconciliation, and
+# recovery projection remain local CLOCKS logic.
 FEATURE_PREFLIGHT_PROFILE = "CAMPAIGN_PREFLIGHT"
-PI_FEATURE_PREFLIGHT_REQUIRED = (
+FEATURE_PREFLIGHT_REQUIRED = (
     "PI.SYSTEM.FEATURE_STATUS",
     "PI.SYSTEM.HOST",
     "PI.SYSTEM.POWER",
     "PI.SYSTEM.BATTERY",
+    "PI.SYSTEM.TEENSY_FEATURE_IMPORT",
     "PI.GNSS.REPORT",
-)
-TEENSY_FEATURE_PREFLIGHT_REQUIRED = (
     "TEENSY.SYSTEM.FEATURE_STATUS",
     "TEENSY.INTERRUPT.FLOORLINE",
     "TEENSY.INTERRUPT.PPS_VCLOCK_AUTHORITY",
@@ -3341,8 +3341,8 @@ def cmd_set_baseline(args: Optional[dict]) -> Dict[str, Any]:
 # ---------------------------------------------------------------------
 
 
-def _fetch_pi_features() -> Dict[str, Any]:
-    """Fetch the Pi-owned feature tree from Pi SYSTEM.  Command/response only."""
+def _fetch_system_features() -> Dict[str, Any]:
+    """Fetch the global feature tree from Pi SYSTEM.  Command/response only."""
     resp = send_command(machine="PI", subsystem="SYSTEM", command="FEATURES")
     if not resp.get("success"):
         raise RuntimeError(f"PI SYSTEM FEATURES failed: {resp.get('message', '?')}")
@@ -3350,19 +3350,6 @@ def _fetch_pi_features() -> Dict[str, Any]:
     payload = resp.get("payload", {})
     if not isinstance(payload, dict):
         raise RuntimeError("PI SYSTEM FEATURES returned non-dict payload")
-
-    return payload
-
-
-def _fetch_teensy_features() -> Dict[str, Any]:
-    """Fetch the Teensy-owned feature tree directly from Teensy SYSTEM."""
-    resp = send_command(machine="TEENSY", subsystem="SYSTEM", command="FEATURES")
-    if not resp.get("success"):
-        raise RuntimeError(f"TEENSY SYSTEM FEATURES failed: {resp.get('message', '?')}")
-
-    payload = resp.get("payload", {})
-    if not isinstance(payload, dict):
-        raise RuntimeError("TEENSY SYSTEM FEATURES returned non-dict payload")
 
     return payload
 
@@ -3377,29 +3364,23 @@ def _feature_gate_reason(blocker: Dict[str, Any]) -> str:
 
 
 def _check_feature_preflight(context: str) -> tuple[bool, list[str]]:
-    """Check the command-polled feature-status campaign preflight profile."""
+    """Check the standardized feature-status campaign preflight profile."""
     _diag["preflight_feature_checks"] += 1
 
     try:
-        pi_features = _fetch_pi_features()
-        teensy_features = _fetch_teensy_features()
+        features = _fetch_system_features()
     except Exception as e:
         _diag["preflight_feature_unavailable"] += 1
         _diag["last_preflight_feature_gate"] = {
             "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "context": context,
             "profile": FEATURE_PREFLIGHT_PROFILE,
-            "source": "DIRECT_COMMAND_PI_AND_TEENSY",
             "status": "UNAVAILABLE",
             "error": str(e),
         }
         return False, [f"{FEATURE_PREFLIGHT_PROFILE}: feature tree unavailable ({e})"]
 
-    pi_blockers = blocking_features(pi_features, PI_FEATURE_PREFLIGHT_REQUIRED)
-    teensy_blockers = blocking_features(teensy_features, TEENSY_FEATURE_PREFLIGHT_REQUIRED)
-    blockers = pi_blockers + teensy_blockers
-    required_count = len(PI_FEATURE_PREFLIGHT_REQUIRED) + len(TEENSY_FEATURE_PREFLIGHT_REQUIRED)
-
+    blockers = blocking_features(features, FEATURE_PREFLIGHT_REQUIRED)
     if blockers:
         _diag["preflight_feature_blocked"] += 1
         compact_blockers = [
@@ -3414,11 +3395,8 @@ def _check_feature_preflight(context: str) -> tuple[bool, list[str]]:
             "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "context": context,
             "profile": FEATURE_PREFLIGHT_PROFILE,
-            "source": "DIRECT_COMMAND_PI_AND_TEENSY",
             "status": "BLOCKED",
-            "required_count": required_count,
-            "pi_required_count": len(PI_FEATURE_PREFLIGHT_REQUIRED),
-            "teensy_required_count": len(TEENSY_FEATURE_PREFLIGHT_REQUIRED),
+            "required_count": len(FEATURE_PREFLIGHT_REQUIRED),
             "blockers": compact_blockers,
         }
         return False, [
@@ -3430,11 +3408,8 @@ def _check_feature_preflight(context: str) -> tuple[bool, list[str]]:
         "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "context": context,
         "profile": FEATURE_PREFLIGHT_PROFILE,
-        "source": "DIRECT_COMMAND_PI_AND_TEENSY",
         "status": "NOMINAL",
-        "required_count": required_count,
-        "pi_required_count": len(PI_FEATURE_PREFLIGHT_REQUIRED),
-        "teensy_required_count": len(TEENSY_FEATURE_PREFLIGHT_REQUIRED),
+        "required_count": len(FEATURE_PREFLIGHT_REQUIRED),
     }
     return True, []
 
@@ -3752,9 +3727,7 @@ def cmd_clocks_info(_: Optional[dict]) -> Dict[str, Any]:
         "startup": _start_status_payload(),
         "feature_preflight": {
             "profile": FEATURE_PREFLIGHT_PROFILE,
-            "source": "DIRECT_COMMAND_PI_AND_TEENSY",
-            "pi_required_features": list(PI_FEATURE_PREFLIGHT_REQUIRED),
-            "teensy_required_features": list(TEENSY_FEATURE_PREFLIGHT_REQUIRED),
+            "required_features": list(FEATURE_PREFLIGHT_REQUIRED),
         },
         "diag": _diag,
     }

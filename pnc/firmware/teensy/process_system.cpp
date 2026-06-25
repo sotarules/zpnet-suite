@@ -44,30 +44,6 @@ static Payload system_features_tree_payload(void);
 static void system_feature_schedule_fragment_publish(void);
 
 // --------------------------------------------------------------
-// Boot diagnostics
-// --------------------------------------------------------------
-//
-// Reset cause is captured once and reported as raw silicon truth.  Decoding can
-// happen Pi-side or in later tooling.  Keeping this raw avoids policy, string
-// payload growth, and any new subsystem footprint.
-
-static uint32_t g_system_boot_reset_cause_raw = 0;
-static bool     g_system_boot_reset_cause_captured = false;
-
-void system_bootdiag_capture_reset_cause(void) {
-  if (g_system_boot_reset_cause_captured) return;
-
-  g_system_boot_reset_cause_raw = SRC_SRSR;
-  SRC_SRSR = g_system_boot_reset_cause_raw;  // clear captured sticky bits
-
-  g_system_boot_reset_cause_captured = true;
-}
-
-uint32_t system_bootdiag_reset_cause_raw(void) {
-  return g_system_boot_reset_cause_raw;
-}
-
-// --------------------------------------------------------------
 // Internal terminal state
 // --------------------------------------------------------------
 static bool system_shutdown   = false;
@@ -80,23 +56,16 @@ static uint64_t system_cpu_window_last_idle_cycles = 0;
 // --------------------------------------------------------------
 // FEATURE_STATUS_FRAGMENT publication custody
 // --------------------------------------------------------------
-// system_feature_set() may be reached by timing subsystems.  Feature state must
-// therefore remain a scalar registry update only: no TimePop arming, no Payload
-// construction, and no pub/sub publication as a side effect of feature changes.
-//
-// The old FEATURE_STATUS_FRAGMENT machinery is intentionally left visible as
-// counters/report fields, but dynamic publication is disabled.  Campaign
-// admission polls SYSTEM.FEATURES / REPORT_FEATURES through the command path.
+// system_feature_set() may be reached by timing subsystems, so it only marks the
+// scalar feature tree dirty and requests an ALAP foreground service.  The service
+// publishes one compact FEATURE_STATUS_FRAGMENT containing Teensy-owned feature
+// state.  zpnet-system on the Pi relays the unified FEATURE_STATUS tree.
 
-static constexpr bool SYSTEM_FEATURE_FRAGMENT_DYNAMIC_PUBLISH_ENABLED = false;
-
-static volatile bool g_system_feature_fragment_publish_enabled =
-    SYSTEM_FEATURE_FRAGMENT_DYNAMIC_PUBLISH_ENABLED;
+static volatile bool g_system_feature_fragment_publish_enabled = false;
 static volatile bool g_system_feature_fragment_dirty = false;
 static volatile bool g_system_feature_fragment_service_armed = false;
 static uint32_t g_system_feature_fragment_publish_count = 0;
 static uint32_t g_system_feature_fragment_service_arm_count = 0;
-static uint32_t g_system_feature_fragment_service_dispatch_count = 0;
 static uint32_t g_system_feature_fragment_service_arm_failures = 0;
 
 // ================================================================
@@ -166,7 +135,6 @@ static void system_feature_fragment_publish_service(timepop_ctx_t*,
                                                     timepop_diag_t*,
                                                     void*) {
   g_system_feature_fragment_service_armed = false;
-  g_system_feature_fragment_service_dispatch_count++;
 
   if (!g_system_feature_fragment_publish_enabled ||
       !g_system_feature_fragment_dirty) {
@@ -206,16 +174,8 @@ static void system_feature_schedule_fragment_publish(void) {
 }
 
 static void system_feature_note_changed(void) {
-  if (SYSTEM_FEATURE_FRAGMENT_DYNAMIC_PUBLISH_ENABLED) {
-    g_system_feature_fragment_dirty = true;
-    system_feature_schedule_fragment_publish();
-    return;
-  }
-
-  // Command-polled feature mode: the registry is already updated.  Do not arm
-  // TimePop or build/publish a FEATURE_STATUS_FRAGMENT from this call path.
-  g_system_feature_fragment_dirty = false;
-  g_system_feature_fragment_service_armed = false;
+  g_system_feature_fragment_dirty = true;
+  system_feature_schedule_fragment_publish();
 }
 
 static int system_feature_find(const char* subsystem,
@@ -422,20 +382,9 @@ static Payload cmd_report(const Payload& /*args*/) {
   // Internal reference voltage (best-effort)
   p.add("vref_v", readVrefVolts());
 
-  // Boot diagnostics — raw reset-cause register captured once at boot.
-  p.add("boot_reset_cause_raw", g_system_boot_reset_cause_raw);
-  p.add("boot_reset_cause_captured", g_system_boot_reset_cause_captured);
-
   // Heap availability
-  //
-  // Do not call maxAllocBytes() from SYSTEM.REPORT.  SYSTEM.REPORT is part of
-  // the recurring telemetry surface, and maxAllocBytes() actively probes the
-  // heap by repeatedly malloc/free testing large blocks.  That makes the report
-  // an observer that perturbs the heap during campaigns.  Keep the recurring
-  // report non-invasive; use focused MEMORY_INFO / future explicit diagnostics
-  // for deeper heap probes.
   p.add("free_heap_bytes", freeHeapBytes());
-  p.add("max_alloc_probe_disabled", true);
+  p.add("max_alloc_bytes", maxAllocBytes());
 
   timepop_idle_witness_snapshot_t idle{};
   timepop_idle_witness_snapshot(&idle);
@@ -495,23 +444,8 @@ static Payload cmd_report(const Payload& /*args*/) {
   p.add("feature_status_fragment_publish_count", g_system_feature_fragment_publish_count);
   p.add("feature_status_fragment_dirty", (bool)g_system_feature_fragment_dirty);
   p.add("feature_status_fragment_service_armed", (bool)g_system_feature_fragment_service_armed);
-  p.add("feature_status_fragment_dynamic_publish_enabled", SYSTEM_FEATURE_FRAGMENT_DYNAMIC_PUBLISH_ENABLED);
   p.add("feature_status_fragment_service_arm_count", g_system_feature_fragment_service_arm_count);
-  p.add("feature_status_fragment_service_dispatch_count", g_system_feature_fragment_service_dispatch_count);
   p.add("feature_status_fragment_service_arm_failures", g_system_feature_fragment_service_arm_failures);
-
-  publish_info_t pub{};
-  publish_get_info(&pub);
-  p.add("publish_calls", pub.publish_calls);
-  p.add("publish_invalid_topic", pub.publish_invalid_topic);
-  p.add("publish_unsafe_context_drop", pub.publish_unsafe_context_drop);
-  p.add("publish_reentrant_drop", pub.publish_reentrant_drop);
-  p.add("publish_depth_high_water", pub.publish_depth_high_water);
-  p.add("publish_active", pub.publish_active);
-  p.add("publish_local_dispatch", pub.publish_local_dispatch);
-  p.add("publish_forward_attempt", pub.publish_forward_attempt);
-  p.add("publish_envelope_build", pub.publish_envelope_build);
-  p.add("publish_transport_send", pub.publish_transport_send);
 
   // Legacy accounted callback-busy diagnostics.
   p.add("cpu_accounted_busy_pct", cpu_usage_get_percent());
@@ -976,8 +910,6 @@ void process_system_register(void) {
                      system_feature_status_t::NOMINAL,
                      "Teensy SYSTEM feature registry online");
   process_register("SYSTEM", &SYSTEM_PROCESS);
-  g_system_feature_fragment_publish_enabled =
-      SYSTEM_FEATURE_FRAGMENT_DYNAMIC_PUBLISH_ENABLED;
-  g_system_feature_fragment_dirty = false;
-  g_system_feature_fragment_service_armed = false;
+  g_system_feature_fragment_publish_enabled = true;
+  system_feature_schedule_fragment_publish();
 }

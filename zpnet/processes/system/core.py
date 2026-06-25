@@ -7,12 +7,14 @@ Responsibilities:
   • Maintain last-known-good SYSTEM snapshot
   • Expose SYSTEM.REPORT
   • Emit SYSTEM_STATUS events on fixed cadence
-  • Maintain Pi-local feature state for command-polled campaign preflight
+  • Publish FEATURE_STATUS whenever readiness state changes
+  • Republish FEATURE_STATUS periodically even when quiescent
 
 Process model:
   • One systemd service
   • One polling thread
   • One blocking command socket
+  • One FEATURE_STATUS_FRAGMENT subscription from Teensy SYSTEM
 """
 
 from __future__ import annotations
@@ -343,15 +345,35 @@ def _replace_teensy_feature_tree(tree: Any) -> bool:
 
 
 def _feature_tree_snapshot() -> Dict[str, Dict[str, Dict[str, str]]]:
-    # Pi SYSTEM.FEATURES is now Pi-local only.  Campaign CLOCKS polls the
-    # Teensy feature tree directly via TEENSY.SYSTEM.FEATURES.
-    return _pi_feature_tree_snapshot()
+    with _FEATURE_LOCK:
+        return _combine_feature_trees(_PI_FEATURES, _TEENSY_FEATURES)
 
 
 def _publish_feature_status_if_changed(features: Any = None, *, force: bool = False) -> bool:
-    """Dynamic FEATURE_STATUS publication is retired; readiness is command-polled."""
-    _ = features, force
-    return False
+    """
+    Publish FEATURE_STATUS when the scalar feature tree changed, or when forced.
+
+    The forced path is the quiescent-system heartbeat: subscribers that start
+    after the last feature transition must still receive the current readiness
+    tree without waiting for a real state change.
+
+    Wire shape:
+      {"topic":"FEATURE_STATUS","payload":{"TEENSY":{...},"PI":{...}}}
+    """
+    global _LAST_PUBLISHED_FEATURE_STATUS
+
+    snapshot = _copy_feature_tree(features if features is not None else _feature_tree_snapshot())
+    if not snapshot:
+        return False
+
+    with _FEATURE_PUBLISH_LOCK:
+        if not force and snapshot == _LAST_PUBLISHED_FEATURE_STATUS:
+            return False
+        _LAST_PUBLISHED_FEATURE_STATUS = _copy_feature_tree(snapshot)
+
+    publish("FEATURE_STATUS", snapshot)
+    return True
+
 
 def feature_status_periodic_publisher() -> None:
     """
@@ -378,7 +400,6 @@ def _update_builtin_pi_features(*,
                                 power_payload: Dict[str, Any],
                                 battery_payload: Dict[str, Any],
                                 teensy_features_available: bool) -> None:
-    _ = teensy_features_available
     set_pi_feature("SYSTEM", "FEATURE_STATUS", "NOMINAL")
     set_pi_feature("SYSTEM", "HOST", _health_to_feature_status(pi_payload.get("health_state")))
     set_pi_feature("SYSTEM", "NETWORK", _health_to_feature_status(network_payload.get("network_status")))
@@ -387,6 +408,7 @@ def _update_builtin_pi_features(*,
     set_pi_feature("GNSS", "REPORT", _health_to_feature_status(gnss_payload.get("health_state")))
     set_pi_feature("SYSTEM", "POWER", _health_to_feature_status(power_payload.get("health_state")))
     set_pi_feature("SYSTEM", "BATTERY", _health_to_feature_status(battery_payload.get("health_state")))
+    set_pi_feature("SYSTEM", "TEENSY_FEATURE_IMPORT", "NOMINAL" if teensy_features_available else "INITIALIZING")
 
 
 set_pi_feature("SYSTEM", "FEATURE_STATUS", "NOMINAL")
@@ -1520,12 +1542,12 @@ def system_poller() -> None:
                 "memory": dict(memory_payload),
                 "process": dict(process_payload),
                 "features": features,
-                "teensy_features": teensy_features,
             }
 
             with _SYSTEM_LOCK:
                 SYSTEM = snapshot
 
+            _publish_feature_status_if_changed(features)
             # ----------------------------------------------------------
             # Emit consolidated system event
             # ----------------------------------------------------------
@@ -1542,11 +1564,16 @@ def system_poller() -> None:
 # ------------------------------------------------------------------
 
 def on_feature_status_fragment(payload: Optional[dict]) -> None:
-    """Retired dynamic feature bus ingress; retained as a harmless compatibility sink."""
+    """Consume Teensy FEATURE_STATUS_FRAGMENT and relay the unified tree."""
     if not isinstance(payload, dict):
         logging.warning("[system] ignoring malformed FEATURE_STATUS_FRAGMENT: %r", payload)
         return
-    _replace_teensy_feature_tree(payload)
+
+    if not _replace_teensy_feature_tree(payload):
+        return
+
+    features = _refresh_feature_payload_from_registry()
+    _publish_feature_status_if_changed(features)
 
 
 # ------------------------------------------------------------------
@@ -1643,6 +1670,8 @@ def cmd_set_feature(args: Optional[dict]) -> Dict:
     except ValueError as e:
         return {"success": False, "message": str(e)}
 
+    features = _refresh_feature_payload_from_registry()
+    _publish_feature_status_if_changed(features)
     return {
         "success": True,
         "message": "OK",
@@ -1682,10 +1711,17 @@ def run() -> None:
             daemon=True,
         ).start()
 
+        threading.Thread(
+            target=feature_status_periodic_publisher,
+            daemon=True,
+        ).start()
+
         server_setup(
             subsystem="SYSTEM",
             commands=COMMANDS,
-            subscriptions={},
+            subscriptions={
+                "FEATURE_STATUS_FRAGMENT": on_feature_status_fragment,
+            },
         )
 
     except Exception:

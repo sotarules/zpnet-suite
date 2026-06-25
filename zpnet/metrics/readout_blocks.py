@@ -38,6 +38,8 @@ Column layout (INT rows):
   NAME   END_GNSS_NS   DELTA_NS
 """
 
+import json
+import socket
 import threading
 import time
 
@@ -53,21 +55,23 @@ DAC_MAX_CODE = 65535.0
 FEATURE_GRID_COLUMNS = 4
 FEATURE_GRID_CELL_WIDTH = 39
 
-FEATURE_STATUS_POLL_INTERVAL_S = 5.0
-DAC_REPORT_POLL_INTERVAL_S = 5.0
+PUBSUB_TAP_SOCKET = "/tmp/zpnet_pubsub_tap.sock"
+FEATURE_STATUS_TOPIC = "FEATURE_STATUS"
+FEATURE_STATUS_RECONNECT_S = 1.0
+DAC_TICK_TOPIC = "CLOCKS_DAC_TICK"
+DAC_TICK_STALE_S = 5.0
+DAC_TICK_RECONNECT_S = 1.0
 
-# Mission-control readiness board.  Feature state is command-polled from each
-# owning authority: PI.SYSTEM.FEATURES for Pi-owned readiness and
-# TEENSY.SYSTEM.FEATURES for Teensy-owned timing readiness.  This table is just
-# the operator-facing projection of the consolidated local cache into the CLOCKS
-# panel's empty space.
+# Mission-control readiness board.  The feature payload remains scalar-only;
+# this table is just the operator-facing projection of the global PI SYSTEM
+# feature tree into the CLOCKS panel's empty space.
 FEATURE_STATUS_GRID = (
     ("NET", "PI.SYSTEM.NETWORK"),
     ("BATTERY", "PI.SYSTEM.BATTERY"),
     ("GNSS", "PI.GNSS.REPORT"),
     ("PI_HOST", "PI.SYSTEM.HOST"),
     ("POWER", "PI.SYSTEM.POWER"),
-    ("PI_FEATURE", "PI.SYSTEM.FEATURE_STATUS"),
+    ("T_IMPORT", "PI.SYSTEM.TEENSY_FEATURE_IMPORT"),
     ("T_FEATURE", "TEENSY.SYSTEM.FEATURE_STATUS"),
     ("PPS/V_AUTH", "TEENSY.INTERRUPT.PPS_VCLOCK_AUTHORITY"),
     ("FLOORLINE", "TEENSY.INTERRUPT.FLOORLINE"),
@@ -91,11 +95,11 @@ _FEATURE_STATUS_CACHE_ERROR: str | None = None
 _FEATURE_STATUS_THREAD: threading.Thread | None = None
 _FEATURE_STATUS_LOCK = threading.Lock()
 
-_DAC_REPORT_CACHE: dict | None = None
-_DAC_REPORT_CACHE_TS = 0.0
-_DAC_REPORT_CACHE_ERROR: str | None = None
-_DAC_REPORT_THREAD: threading.Thread | None = None
-_DAC_REPORT_LOCK = threading.Lock()
+_DAC_TICK_CACHE: dict | None = None
+_DAC_TICK_CACHE_TS = 0.0
+_DAC_TICK_CACHE_ERROR: str | None = None
+_DAC_TICK_THREAD: threading.Thread | None = None
+_DAC_TICK_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------------
@@ -106,117 +110,64 @@ def _get_system_snapshot() -> dict:
     return send_command(machine="PI", subsystem="SYSTEM", command="REPORT")["payload"]
 
 
-def _normalize_feature_tree_status(value) -> str:
-    """Normalize one scalar feature status for dashboard display/cache use."""
-    if isinstance(value, dict):
-        value = value.get("status")
-    s = str(value or "INITIALIZING").strip().upper()
-    if s == "DOWN":
-        return "ANOMALY"
-    if s in ("INITIALIZING", "NOMINAL", "HOLD", "ANOMALY"):
-        return s
-    return s or "INITIALIZING"
+def _feature_status_listener_loop() -> None:
+    """Background tap listener for the unified FEATURE_STATUS feed.
 
-
-def _copy_feature_tree(tree) -> dict:
-    """Return a normalized MACHINE.SUBSYSTEM.FEATURE scalar tree."""
-    if not isinstance(tree, dict):
-        return {}
-
-    out: dict = {}
-    for machine, subsystems in tree.items():
-        if not isinstance(subsystems, dict):
-            continue
-        machine_key = str(machine or "").strip().upper()
-        if not machine_key:
-            continue
-
-        machine_out: dict = {}
-        for subsystem, features in subsystems.items():
-            if not isinstance(features, dict):
-                continue
-            subsystem_key = str(subsystem or "").strip().upper()
-            if not subsystem_key:
-                continue
-
-            subsystem_out: dict = {}
-            for feature, value in features.items():
-                feature_key = str(feature or "").strip().upper()
-                if not feature_key:
-                    continue
-                subsystem_out[feature_key] = _normalize_feature_tree_status(value)
-
-            if subsystem_out:
-                machine_out[subsystem_key] = subsystem_out
-
-        if machine_out:
-            out[machine_key] = machine_out
-
-    return out
-
-
-def _merge_feature_trees(*trees) -> dict:
-    """Combine normalized feature trees without requiring Pi-side unification."""
-    merged: dict = {}
-    for tree in trees:
-        for machine, subsystems in _copy_feature_tree(tree).items():
-            machine_out = merged.setdefault(machine, {})
-            for subsystem, features in subsystems.items():
-                subsystem_out = machine_out.setdefault(subsystem, {})
-                subsystem_out.update(features)
-    return merged
-
-
-def _fetch_feature_tree(machine: str) -> dict:
-    resp = send_command(machine=machine, subsystem="SYSTEM", command="FEATURES")
-    if not resp.get("success", True):
-        raise RuntimeError(resp.get("message") or f"{machine}.SYSTEM.FEATURES failed")
-
-    payload = resp.get("payload", {})
-    if not isinstance(payload, dict):
-        raise RuntimeError(f"{machine}.SYSTEM.FEATURES returned a non-object payload")
-
-    return _copy_feature_tree(payload)
-
-
-def _poll_feature_status_once() -> tuple[dict, str | None]:
-    """Poll PI and TEENSY feature trees separately and return one dashboard tree."""
-    trees = []
-    errors = []
-
-    for machine in ("PI", "TEENSY"):
-        try:
-            trees.append(_fetch_feature_tree(machine))
-        except Exception as e:
-            errors.append(f"{machine}: {e}")
-
-    merged = _merge_feature_trees(*trees)
-    error = "; ".join(errors) if errors else None
-    return merged, error
-
-
-def _feature_status_poll_loop() -> None:
-    """Background command poller for PI.SYSTEM.FEATURES + TEENSY.SYSTEM.FEATURES."""
+    FEATURE_STATUS is a change-driven pub/sub snapshot authored by PI SYSTEM.
+    Metrics keeps the latest tree in memory and never polls SYSTEM.FEATURES once
+    the feed is alive.  A one-shot command fallback remains for cold start and
+    for direct tests when pubsub is not running yet.
+    """
     global _FEATURE_STATUS_CACHE, _FEATURE_STATUS_CACHE_TS, _FEATURE_STATUS_CACHE_ERROR
 
+    subscribe = json.dumps(
+        {"type": "set_topics", "topics": [FEATURE_STATUS_TOPIC]},
+        separators=(",", ":"),
+    ).encode("utf-8") + b"\n"
+
     while True:
-        now = time.monotonic()
         try:
-            payload, error = _poll_feature_status_once()
-            with _FEATURE_STATUS_LOCK:
-                if payload:
-                    _FEATURE_STATUS_CACHE = payload
-                _FEATURE_STATUS_CACHE_TS = now
-                _FEATURE_STATUS_CACHE_ERROR = error
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.settimeout(2.0)
+                sock.connect(PUBSUB_TAP_SOCKET)
+                sock.settimeout(None)
+
+                with sock.makefile("rwb") as stream:
+                    stream.write(subscribe)
+                    stream.flush()
+
+                    with _FEATURE_STATUS_LOCK:
+                        _FEATURE_STATUS_CACHE_ERROR = None
+
+                    for raw in stream:
+                        try:
+                            msg = json.loads(raw.decode("utf-8"))
+                        except Exception:
+                            continue
+
+                        if not isinstance(msg, dict):
+                            continue
+                        if msg.get("type") != "publish":
+                            continue
+                        if msg.get("topic") != FEATURE_STATUS_TOPIC:
+                            continue
+
+                        payload = msg.get("payload")
+                        if not isinstance(payload, dict):
+                            continue
+
+                        with _FEATURE_STATUS_LOCK:
+                            _FEATURE_STATUS_CACHE = payload
+                            _FEATURE_STATUS_CACHE_TS = time.monotonic()
+                            _FEATURE_STATUS_CACHE_ERROR = None
+
         except Exception as e:
             with _FEATURE_STATUS_LOCK:
-                _FEATURE_STATUS_CACHE_TS = now
                 _FEATURE_STATUS_CACHE_ERROR = str(e)
+            time.sleep(FEATURE_STATUS_RECONNECT_S)
 
-        time.sleep(FEATURE_STATUS_POLL_INTERVAL_S)
 
-
-def _ensure_feature_status_poller() -> None:
+def _ensure_feature_status_listener() -> None:
     global _FEATURE_STATUS_THREAD
 
     if _FEATURE_STATUS_THREAD is not None and _FEATURE_STATUS_THREAD.is_alive():
@@ -226,45 +177,44 @@ def _ensure_feature_status_poller() -> None:
         if _FEATURE_STATUS_THREAD is not None and _FEATURE_STATUS_THREAD.is_alive():
             return
         _FEATURE_STATUS_THREAD = threading.Thread(
-            target=_feature_status_poll_loop,
-            name="zpnet-feature-status-poller",
+            target=_feature_status_listener_loop,
+            name="zpnet-feature-status-listener",
             daemon=True,
         )
         _FEATURE_STATUS_THREAD.start()
 
 
 def _get_feature_status_payload(force: bool = False) -> tuple[dict, str | None]:
-    """Return the command-polled consolidated PI + TEENSY feature tree.
+    """Return the global PI SYSTEM feature tree from FEATURE_STATUS.
 
-    The normal path is a 5-second background poll.  On cold start, or when
-    force=True, perform one synchronous command poll so the panel can populate
-    immediately without waiting for the first background interval.
+    The normal path is the pubsub tap.  Command/response is retained only as a
+    cold-start seed or explicit force-refresh; it is not used as a repaint-time
+    polling loop.
     """
     global _FEATURE_STATUS_CACHE, _FEATURE_STATUS_CACHE_TS, _FEATURE_STATUS_CACHE_ERROR
 
-    _ensure_feature_status_poller()
+    _ensure_feature_status_listener()
 
     now = time.monotonic()
     with _FEATURE_STATUS_LOCK:
         cached = _FEATURE_STATUS_CACHE
         error = _FEATURE_STATUS_CACHE_ERROR
-        age = now - _FEATURE_STATUS_CACHE_TS if _FEATURE_STATUS_CACHE_TS else 1.0e9
 
-    if not force and cached is not None and age <= (FEATURE_STATUS_POLL_INTERVAL_S * 1.5):
-        return cached, error
 
-    # Cold start / stale fallback: command poll once on the caller path.  This is
-    # not the normal repaint loop; once the background poller has a live cache,
-    # repaint reads are cache-only between 5-second polls.
     try:
-        payload, error = _poll_feature_status_once()
+        resp = send_command(machine="PI", subsystem="SYSTEM", command="FEATURES")
+        if not resp.get("success", True):
+            raise RuntimeError(resp.get("message") or "PI SYSTEM FEATURES failed")
+        payload = resp.get("payload", {})
+        if not isinstance(payload, dict):
+            raise RuntimeError("PI SYSTEM FEATURES returned a non-object payload")
+
         with _FEATURE_STATUS_LOCK:
-            if payload:
-                _FEATURE_STATUS_CACHE = payload
+            _FEATURE_STATUS_CACHE = payload
             _FEATURE_STATUS_CACHE_TS = now
-            _FEATURE_STATUS_CACHE_ERROR = error
-            cached = _FEATURE_STATUS_CACHE
-        return cached or {}, error
+            _FEATURE_STATUS_CACHE_ERROR = None
+        return payload, None
+
     except Exception as e:
         with _FEATURE_STATUS_LOCK:
             _FEATURE_STATUS_CACHE_TS = now
@@ -277,96 +227,105 @@ def _get_feature_status_payload(force: bool = False) -> tuple[dict, str | None]:
         return {}, error
 
 
-
 def _get_pi_clocks_report() -> dict:
     return send_command(machine="PI", subsystem="CLOCKS", command="REPORT")["payload"]
 
 
-def _poll_dac_report_once() -> dict:
-    """Fetch the Teensy CLOCKS.REPORT_DAC command surface."""
-    resp = send_command(machine="TEENSY", subsystem="CLOCKS", command="REPORT_DAC")
-    if not resp.get("success", True):
-        raise RuntimeError(resp.get("message") or "TEENSY CLOCKS REPORT_DAC failed")
+def _dac_tick_listener_loop() -> None:
+    """Background tap listener for the compact CLOCKS_DAC_TICK feed.
 
-    payload = resp.get("payload", {})
+    This is intentionally best-effort and cache-only.  The readout path never
+    blocks on the socket and never polls TEENSY CLOCKS REPORT_DAC.  If the tap is
+    temporarily unavailable, callers simply fall back to the most recent CLOCKS
+    report/TIMEBASE fields until a fresh tick arrives.
+    """
+    global _DAC_TICK_CACHE, _DAC_TICK_CACHE_TS, _DAC_TICK_CACHE_ERROR
+
+    subscribe = json.dumps(
+        {"type": "set_topics", "topics": [DAC_TICK_TOPIC]},
+        separators=(",", ":"),
+    ).encode("utf-8") + b"\n"
+
+    while True:
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.settimeout(2.0)
+                sock.connect(PUBSUB_TAP_SOCKET)
+                sock.settimeout(None)
+
+                with sock.makefile("rwb") as stream:
+                    stream.write(subscribe)
+                    stream.flush()
+
+                    with _DAC_TICK_LOCK:
+                        _DAC_TICK_CACHE_ERROR = None
+
+                    for raw in stream:
+                        try:
+                            msg = json.loads(raw.decode("utf-8"))
+                        except Exception:
+                            continue
+
+                        if not isinstance(msg, dict):
+                            continue
+                        if msg.get("type") != "publish":
+                            continue
+                        if msg.get("topic") != DAC_TICK_TOPIC:
+                            continue
+
+                        payload = msg.get("payload")
+                        if not isinstance(payload, dict):
+                            continue
+                        if payload.get("schema") != "CLOCKS_DAC_TICK_V2":
+                            continue
+
+                        with _DAC_TICK_LOCK:
+                            _DAC_TICK_CACHE = payload
+                            _DAC_TICK_CACHE_TS = time.monotonic()
+                            _DAC_TICK_CACHE_ERROR = None
+
+        except Exception as e:
+            with _DAC_TICK_LOCK:
+                _DAC_TICK_CACHE_ERROR = str(e)
+            time.sleep(DAC_TICK_RECONNECT_S)
+
+
+def _ensure_dac_tick_listener() -> None:
+    global _DAC_TICK_THREAD
+
+    if _DAC_TICK_THREAD is not None and _DAC_TICK_THREAD.is_alive():
+        return
+
+    with _DAC_TICK_LOCK:
+        if _DAC_TICK_THREAD is not None and _DAC_TICK_THREAD.is_alive():
+            return
+        _DAC_TICK_THREAD = threading.Thread(
+            target=_dac_tick_listener_loop,
+            name="zpnet-dac-tick-listener",
+            daemon=True,
+        )
+        _DAC_TICK_THREAD.start()
+
+
+def _get_dac_tick_payload(max_age_s: float = DAC_TICK_STALE_S) -> dict | None:
+    _ensure_dac_tick_listener()
+
+    with _DAC_TICK_LOCK:
+        payload = _DAC_TICK_CACHE
+        age = time.monotonic() - _DAC_TICK_CACHE_TS if _DAC_TICK_CACHE_TS else 1.0e9
+
     if not isinstance(payload, dict):
-        raise RuntimeError("TEENSY CLOCKS REPORT_DAC returned a non-object payload")
-
+        return None
+    if age > max_age_s:
+        return None
     return payload
 
 
-def _dac_report_poll_loop() -> None:
-    """Background command poller for TEENSY.CLOCKS.REPORT_DAC."""
-    global _DAC_REPORT_CACHE, _DAC_REPORT_CACHE_TS, _DAC_REPORT_CACHE_ERROR
-
-    while True:
-        now = time.monotonic()
-        try:
-            payload = _poll_dac_report_once()
-            with _DAC_REPORT_LOCK:
-                _DAC_REPORT_CACHE = payload
-                _DAC_REPORT_CACHE_TS = now
-                _DAC_REPORT_CACHE_ERROR = None
-        except Exception as e:
-            with _DAC_REPORT_LOCK:
-                _DAC_REPORT_CACHE_TS = now
-                _DAC_REPORT_CACHE_ERROR = str(e)
-
-        time.sleep(DAC_REPORT_POLL_INTERVAL_S)
-
-
-def _ensure_dac_report_poller() -> None:
-    global _DAC_REPORT_THREAD
-
-    if _DAC_REPORT_THREAD is not None and _DAC_REPORT_THREAD.is_alive():
-        return
-
-    with _DAC_REPORT_LOCK:
-        if _DAC_REPORT_THREAD is not None and _DAC_REPORT_THREAD.is_alive():
-            return
-        _DAC_REPORT_THREAD = threading.Thread(
-            target=_dac_report_poll_loop,
-            name="zpnet-dac-report-poller",
-            daemon=True,
-        )
-        _DAC_REPORT_THREAD.start()
-
-
-def _get_dac_report_payload(force: bool = False) -> dict | None:
-    """Return TEENSY.CLOCKS.REPORT_DAC from a 5-second command-polled cache."""
-    global _DAC_REPORT_CACHE, _DAC_REPORT_CACHE_TS, _DAC_REPORT_CACHE_ERROR
-
-    _ensure_dac_report_poller()
-
-    now = time.monotonic()
-    with _DAC_REPORT_LOCK:
-        cached = _DAC_REPORT_CACHE
-        age = now - _DAC_REPORT_CACHE_TS if _DAC_REPORT_CACHE_TS else 1.0e9
-
-    if not force and cached is not None and age <= (DAC_REPORT_POLL_INTERVAL_S * 1.5):
-        return cached
-
-    # Cold start / stale fallback.  Once the background poller is warm, normal
-    # repaint reads are cache-only between 5-second polls.
-    try:
-        payload = _poll_dac_report_once()
-        with _DAC_REPORT_LOCK:
-            _DAC_REPORT_CACHE = payload
-            _DAC_REPORT_CACHE_TS = now
-            _DAC_REPORT_CACHE_ERROR = None
-        return payload
-    except Exception as e:
-        with _DAC_REPORT_LOCK:
-            _DAC_REPORT_CACHE_TS = now
-            _DAC_REPORT_CACHE_ERROR = str(e)
-            cached = _DAC_REPORT_CACHE
-        return cached if isinstance(cached, dict) else None
-
-
 def _get_pi_clocks_report_dac() -> dict:
-    # Compatibility name: the metrics panel now consumes the command-polled
-    # TEENSY CLOCKS REPORT_DAC surface instead of CLOCKS_DAC_TICK pub/sub.
-    return _get_dac_report_payload() or {}
+    # Compatibility name: the metrics panel now consumes the compact pub/sub
+    # CLOCKS_DAC_TICK feed instead of polling TEENSY CLOCKS REPORT_DAC.
+    return _get_dac_tick_payload() or {}
+
 
 def _get_pi_gnss_report() -> dict:
     return send_command(machine="PI", subsystem="GNSS", command="REPORT")["payload"]
@@ -952,9 +911,9 @@ def _dac_voltage(dac_code):
     code = _to_float(dac_code)
     if code is None:
         return None
-    # Fallback only.  Prefer firmware-authored voltage from REPORT_DAC when
-    # available because the active DAC reference/gain doctrine lives in firmware,
-    # not in this panel.
+    # Fallback only.  Prefer firmware-authored voltage from CLOCKS_DAC_TICK
+    # when available because the active DAC reference/gain doctrine lives in
+    # firmware, not in this panel.
     return code * VREF / DAC_CODE_SCALE
 
 
@@ -1021,8 +980,9 @@ def _clamp_dac_code(value: float) -> float:
 def _manual_dac_current_value(lane: str) -> float:
     """Fetch the live DAC value for keyboard nudging.
 
-    Prefer the 5-second command-polled TEENSY CLOCKS REPORT_DAC cache and fall
-    back to the current CLOCKS report/TIMEBASE value.
+    Prefer the compact CLOCKS_DAC_TICK pub/sub cache and fall back to the
+    current CLOCKS report/TIMEBASE value.  This avoids polling the verbose
+    Teensy REPORT_DAC command path while the operator is nudging DAC values.
     """
     report = {}
     try:
@@ -1109,49 +1069,32 @@ def _dac_report_dither_summary(report_dac: dict | None, lane: str) -> str:
         low_ms = max(0, 1000 - high_ms)
         return f"{low_code}:{low_ms:03d} {high_code}:{high_ms:03d}"
 
-    realization = obj.get("realization") if isinstance(obj.get("realization"), dict) else {}
-    enabled = _to_bool(
-        realization.get("operator_enabled")
-        if realization
-        else obj.get("dither_operator_enabled")
-    )
-    if enabled is False:
-        return "OFF"
-
+    obj = _dac_report_lane(report_dac, lane)
     d = obj.get("dither") if isinstance(obj.get("dither"), dict) else {}
-    if d:
-        enabled = _to_bool(d.get("enabled"))
-        rate = _to_int(d.get("rate_hz"))
-        low = _to_int(d.get("last_window_low_count"))
-        high = _to_int(d.get("last_window_high_count"))
-        low_code = _to_int(d.get("last_window_low_code"))
-        high_code = _to_int(d.get("last_window_high_code"))
+    if not d:
+        return ""
 
-        if enabled is not True:
-            return "OFF"
-        if rate is None:
-            return "ON"
-        if low is None or high is None:
-            return f"{rate}Hz"
+    enabled = _to_bool(d.get("enabled"))
+    rate = _to_int(d.get("rate_hz"))
+    low = _to_int(d.get("last_window_low_count"))
+    high = _to_int(d.get("last_window_high_count"))
+    low_code = _to_int(d.get("last_window_low_code"))
+    high_code = _to_int(d.get("last_window_high_code"))
 
-        low_s = f"{low:03d}"
-        high_s = f"{high:03d}"
+    if enabled is not True:
+        return "OFF"
+    if rate is None:
+        return "ON"
+    if low is None or high is None:
+        return f"{rate}Hz"
 
-        if low_code is None or high_code is None:
-            return f"{rate}Hz {low_s}/{high_s}"
-        return f"{rate}Hz {low_code}:{low_s} {high_code}:{high_s}"
+    low_s = f"{low:03d}"
+    high_s = f"{high:03d}"
 
-    low_code = _to_int(obj.get("dither_low_code") if obj.get("dither_low_code") is not None else realization.get("low_code"))
-    high_code = _to_int(obj.get("dither_high_code") if obj.get("dither_high_code") is not None else realization.get("high_code"))
-    high_ms = _to_int(obj.get("dither_high_ms") if obj.get("dither_high_ms") is not None else realization.get("high_ms"))
+    if low_code is None or high_code is None:
+        return f"{rate}Hz {low_s}/{high_s}"
+    return f"{rate}Hz {low_code}:{low_s} {high_code}:{high_s}"
 
-    if enabled is True:
-        if low_code is None or high_code is None or high_ms is None:
-            return "ON"
-        low_ms = max(0, 1000 - high_ms)
-        return f"{low_code}:{low_ms:03d} {high_code}:{high_ms:03d}"
-
-    return ""
 
 def _dac_detail_lines(r: dict, baseline: dict | None, report_dac: dict | None,
                       W_NAME: int, W_VALUE: int, W_TAU: int, W_PPB: int,
@@ -1242,7 +1185,7 @@ def feature_status_grid_lines() -> list[str]:
         )
 
     if error:
-        lines.append(f"FEATURE POLL ERROR: {error[:120]}")
+        lines.append(f"FEATURE_STATUS TAP ERROR: {error[:120]}")
 
     lines.append("")
     return lines

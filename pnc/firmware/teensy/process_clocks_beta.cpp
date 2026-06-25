@@ -81,13 +81,6 @@
 #include <string.h>
 #include <strings.h>
 
-// Large CLOCKS diagnostic/reporting stores live in Teensy OCRAM instead of
-// DTCM.  DMAMEM is Teensyduino's OCRAM placement attribute; keeping a local
-// alias makes the placement doctrine obvious at the declaration site.
-#ifndef CLOCKS_OCRAM
-#define CLOCKS_OCRAM DMAMEM
-#endif
-
 // ============================================================================
 // Campaign state — definitions
 // ============================================================================
@@ -278,11 +271,7 @@ static void clocks_beta_feature_set_cached(const char* feature,
                                            system_feature_status_t& cached,
                                            system_feature_status_t status,
                                            bool force = false) {
-  // CLOCKS feature state is command-polled by campaign admission.  Register
-  // the slots during forced initialization, then touch SYSTEM only when the
-  // scalar value really changes.  This keeps the timing/campaign path from
-  // repeatedly scanning the SYSTEM feature registry for unchanged values.
-  if (force || cached != status) {
+  if (force || cached != status || !system_feature_has("CLOCKS", feature)) {
     (void)system_feature_set("CLOCKS", feature, status, nullptr);
     cached = status;
   }
@@ -299,25 +288,23 @@ static void clocks_beta_features_mark_initializing(void) {
                                  true);
 }
 
-static FLASHMEM void clocks_beta_ocram_reset(void);
-
 void clocks_beta_features_init(void) {
-  clocks_beta_ocram_reset();
   clocks_beta_features_mark_initializing();
 }
 
 // ============================================================================
-// Command-polled campaign gate
+// FEATURE_STATUS-driven campaign gate
 // ============================================================================
 //
-// Campaign admission now uses direct command/poll ownership rather than the
-// pushed FEATURE_STATUS bus.  The Pi-side CLOCKS process polls PI.SYSTEM
-// features and TEENSY.SYSTEM.FEATURES separately before sending START/RECOVER.
-// The Teensy-side START gate is a final local guard over TEENSY-owned feature
-// slots already maintained by process_interrupt, process_clocks_alpha, and
-// process_clocks_beta.
+// Pi SYSTEM now republishes the unified system readiness tree as FEATURE_STATUS.
+// Beta consumes that stream directly, but the Teensy-side START gate must only
+// depend on Teensy-owned readiness surfaces.
 //
-// No Teensy code consumes FEATURE_STATUS publications for campaign gating.
+// Pi SYSTEM/CLOCKS remains responsible for PI/GNSS/environment/battery/network
+// preflight before it sends CLOCKS.START or CLOCKS.RECOVER.  Duplicating those
+// PI-owned gates inside Teensy CLOCKS creates a split-brain failure mode: Pi can
+// observe all prerequisites as open while the Teensy rejects START because its
+// cached FEATURE_STATUS snapshot lacks, or has stale status for, PI.GNSS.REPORT.
 //
 // Intentional non-requirements:
 //   SCIENCE_RESIDUALS and TIMEBASE_PUBLICATION are not START-gate inputs here.
@@ -358,11 +345,24 @@ static char g_campaign_feature_gate_reason[128] =
     "FEATURE_STATUS not yet received";
 static char g_campaign_feature_gate_first_problem[32] = "";
 
-static FLASHMEM bool feature_status_is_nominal(const char* status) {
+static const char* feature_status_lookup(const Payload& root,
+                                         const char* host,
+                                         const char* subsystem,
+                                         const char* feature) {
+  const Payload host_payload = root.getPayload(host);
+  if (host_payload.empty()) return nullptr;
+
+  const Payload subsystem_payload = host_payload.getPayload(subsystem);
+  if (subsystem_payload.empty()) return nullptr;
+
+  return subsystem_payload.getString(feature);
+}
+
+static bool feature_status_is_nominal(const char* status) {
   return status && strcasecmp(status, "NOMINAL") == 0;
 }
 
-static FLASHMEM void campaign_feature_gate_set_reason(const char* reason,
+static void campaign_feature_gate_set_reason(const char* reason,
                                              const char* first_problem = nullptr) {
   safeCopy(g_campaign_feature_gate_reason,
            sizeof(g_campaign_feature_gate_reason),
@@ -372,23 +372,13 @@ static FLASHMEM void campaign_feature_gate_set_reason(const char* reason,
            first_problem ? first_problem : "");
 }
 
-static FLASHMEM const char* campaign_feature_gate_requirement_status(
-    const campaign_feature_gate_requirement_t& req) {
-  if (!req.host || strcasecmp(req.host, "TEENSY") != 0) {
-    return "NOMINAL";
-  }
-  return system_feature_get_status(req.subsystem, req.feature);
-}
-
-static FLASHMEM void campaign_feature_gate_recompute_local(void) {
+static void campaign_feature_gate_recompute(const Payload& root) {
   bool ready = true;
   const campaign_feature_gate_requirement_t* failed = nullptr;
 
-  g_campaign_feature_gate_seen = true;
-  g_campaign_feature_gate_update_count++;
-
   for (const auto& req : CAMPAIGN_FEATURE_GATE_REQUIREMENTS) {
-    const char* status = campaign_feature_gate_requirement_status(req);
+    const char* status =
+        feature_status_lookup(root, req.host, req.subsystem, req.feature);
     if (!feature_status_is_nominal(status)) {
       ready = false;
       failed = &req;
@@ -413,15 +403,19 @@ static FLASHMEM void campaign_feature_gate_recompute_local(void) {
   }
 }
 
+static void on_feature_status(const Payload& payload) {
+  g_campaign_feature_gate_seen = true;
+  g_campaign_feature_gate_update_count++;
+  campaign_feature_gate_recompute(payload);
+}
+
 static bool campaign_feature_gate_open(void) {
-  campaign_feature_gate_recompute_local();
   return g_campaign_feature_gate_seen && g_campaign_feature_gate_open;
 }
 
-static FLASHMEM void payload_add_campaign_feature_gate(Payload& p) {
-  campaign_feature_gate_recompute_local();
-  p.add("campaign_gate_source", "LOCAL_SYSTEM_FEATURES_POLL");
-  p.add("campaign_gate_open", g_campaign_feature_gate_open);
+static void payload_add_campaign_feature_gate(Payload& p) {
+  p.add("campaign_gate_source", "FEATURE_STATUS");
+  p.add("campaign_gate_open", campaign_feature_gate_open());
   p.add("campaign_gate_seen", (bool)g_campaign_feature_gate_seen);
   p.add("campaign_gate_reason", g_campaign_feature_gate_reason);
   p.add("campaign_gate_first_problem", g_campaign_feature_gate_first_problem);
@@ -435,7 +429,7 @@ static FLASHMEM void payload_add_campaign_feature_gate(Payload& p) {
   p.add("campaign_gate_requires_timebase_publication", false);
 }
 
-static FLASHMEM const char* timebase_build_stage_name(uint32_t stage) {
+static const char* timebase_build_stage_name(uint32_t stage) {
   switch (stage) {
     case TIMEBASE_BUILD_STAGE_ENTRY: return "ENTRY";
     case TIMEBASE_BUILD_STAGE_STOP_GATE: return "STOP_GATE";
@@ -562,29 +556,6 @@ static uint64_t g_science_total_ocxo1_gnss_interval_ns = 0;
 static uint64_t g_science_total_ocxo1_clock_interval_ns = 0;
 static uint64_t g_science_total_ocxo2_gnss_interval_ns = 0;
 static uint64_t g_science_total_ocxo2_clock_interval_ns = 0;
-
-// RECOVER deliberately cuts the campaign publication stream while preserving
-// the installed service epoch.  Alpha re-primes OCXO edge state at the RECOVER
-// gate; Beta additionally quarantines the first published science rows so no
-// residual/Welford sample can be formed from a pre-recovery previous edge or a
-// one-edge bridge warm-up artifact.  Warmup suppression hides private rows;
-// this quarantine protects the public residual population.
-static constexpr uint32_t CLOCKS_RECOVER_SCIENCE_QUARANTINE_ROWS = 2U;
-static uint32_t g_science_residual_quarantine_remaining = 0;
-static uint32_t g_science_residual_quarantine_begin_count = 0;
-static uint32_t g_science_residual_quarantine_consumed_count = 0;
-static uint32_t g_science_residual_quarantine_last_public_count = 0;
-
-static void pps_interval_residuals_seed_previous_row(uint32_t public_count,
-                                                     uint64_t public_gnss_ns,
-                                                     uint64_t public_ocxo1_measured_ns,
-                                                     uint64_t public_ocxo2_measured_ns) {
-  g_science_residual_prev_public_count = public_count;
-  g_science_residual_prev_gnss_ns = public_gnss_ns;
-  g_science_residual_prev_ocxo1_measured_ns = public_ocxo1_measured_ns;
-  g_science_residual_prev_ocxo2_measured_ns = public_ocxo2_measured_ns;
-}
-
 static void pps_interval_residuals_reset(void) {
   g_science_residual_prev_public_count = 0;
   g_science_residual_prev_gnss_ns = 0;
@@ -594,17 +565,10 @@ static void pps_interval_residuals_reset(void) {
   g_science_total_ocxo1_clock_interval_ns = 0;
   g_science_total_ocxo2_gnss_interval_ns = 0;
   g_science_total_ocxo2_clock_interval_ns = 0;
-  g_science_residual_quarantine_remaining = 0;
   clocks_beta_feature_set_cached("SCIENCE_RESIDUALS",
                                  g_clocks_feature_science_residuals,
                                  system_feature_status_t::INITIALIZING,
                                  true);
-}
-
-static void pps_interval_residuals_begin_recover_quarantine(uint32_t rows) {
-  pps_interval_residuals_reset();
-  g_science_residual_quarantine_remaining = rows;
-  g_science_residual_quarantine_begin_count++;
 }
 
 static pps_interval_residuals_t measured_edge_interval_residuals_update(
@@ -614,21 +578,6 @@ static pps_interval_residuals_t measured_edge_interval_residuals_update(
     uint64_t public_ocxo2_measured_ns) {
   pps_interval_residuals_t r{};
   r.public_count = public_count;
-
-  if (g_science_residual_quarantine_remaining != 0U) {
-    g_science_residual_quarantine_remaining--;
-    g_science_residual_quarantine_consumed_count++;
-    g_science_residual_quarantine_last_public_count = public_count;
-    pps_interval_residuals_seed_previous_row(public_count,
-                                             public_gnss_ns,
-                                             public_ocxo1_measured_ns,
-                                             public_ocxo2_measured_ns);
-    clocks_beta_feature_set_cached("SCIENCE_RESIDUALS",
-                                   g_clocks_feature_science_residuals,
-                                   system_feature_status_t::INITIALIZING,
-                                   true);
-    return r;
-  }
 
   const bool have_previous = (g_science_residual_prev_public_count != 0);
   const bool consecutive = have_previous &&
@@ -669,29 +618,21 @@ static pps_interval_residuals_t measured_edge_interval_residuals_update(
     }
   }
 
-  pps_interval_residuals_seed_previous_row(public_count,
-                                           public_gnss_ns,
-                                           public_ocxo1_measured_ns,
-                                           public_ocxo2_measured_ns);
+  g_science_residual_prev_public_count = public_count;
+  g_science_residual_prev_gnss_ns = public_gnss_ns;
+  g_science_residual_prev_ocxo1_measured_ns = public_ocxo1_measured_ns;
+  g_science_residual_prev_ocxo2_measured_ns = public_ocxo2_measured_ns;
 
   const bool both_valid = r.ocxo1_valid && r.ocxo2_valid;
-  // SCIENCE_RESIDUALS is a feature-health/readiness scalar, not a per-row
-  // validity bit.  The TIMEBASE row already carries the per-row residual
-  // validity facts.  Downgrading this feature from NOMINAL to HOLD on a single
-  // invalid candidate row causes FEATURE_STATUS_FRAGMENT to strobe
-  // NOMINAL/HOLD/NOMINAL/HOLD during otherwise healthy campaigns, adding a
-  // third 1 Hz publication stream beside TIMEBASE_FRAGMENT and
-  // TIMEBASE_FORENSICS.
-  //
-  // Publish the feature transition to NOMINAL when the science residual surface
-  // first proves live.  Do not use transient row invalidity to bounce the global
-  // feature scalar; persistent/diagnostic residual quality belongs in focused
-  // CLOCKS/TIMEBASE reports, not the feature-health bus.
-  if (both_valid) {
-    clocks_beta_feature_set_cached("SCIENCE_RESIDUALS",
-                                   g_clocks_feature_science_residuals,
-                                   system_feature_status_t::NOMINAL);
-  }
+  clocks_beta_feature_set_cached(
+      "SCIENCE_RESIDUALS",
+      g_clocks_feature_science_residuals,
+      both_valid
+          ? system_feature_status_t::NOMINAL
+          : ((g_clocks_feature_science_residuals == system_feature_status_t::NOMINAL)
+                ? system_feature_status_t::HOLD
+                : system_feature_status_t::INITIALIZING),
+      both_valid);
   return r;
 }
 
@@ -1007,7 +948,7 @@ struct recover_welford_state_t {
   welford_t ocxo2_dac = {};
 };
 
-static CLOCKS_OCRAM recover_welford_state_t g_recover_welfords_pending = {};
+static recover_welford_state_t g_recover_welfords_pending = {};
 static uint32_t g_recover_welford_capture_count = 0;
 static uint32_t g_recover_welford_restore_count = 0;
 static uint32_t g_recover_welford_last_restored_lane_count = 0;
@@ -1302,7 +1243,7 @@ static FLASHMEM void recover_welfords_capture(const Payload& args) {
   }
 }
 
-static FLASHMEM void recover_welfords_apply_pending(void) {
+static void recover_welfords_apply_pending(void) {
   if (g_recover_welfords_pending.restored_lane_count == 0U) {
     g_recover_welford_last_restored_lane_count = 0U;
     return;
@@ -1344,7 +1285,7 @@ static FLASHMEM void recover_welfords_apply_pending(void) {
 // All six fields are always emitted, regardless of n.  Downstream
 // consumers can rely on the complete set being present in every
 // fragment after campaign start.
-static FLASHMEM void publish_welford(Payload& p, const char* prefix, const welford_t& w) {
+static void publish_welford(Payload& p, const char* prefix, const welford_t& w) {
   char key[80];
 
   snprintf(key, sizeof(key), "%s_welford_n", prefix);
@@ -1761,7 +1702,7 @@ static FLASHMEM void payload_add_prediction_summary(Payload& p) {
 // Keep the legacy flat helpers above for focused reports and transition tools;
 // the publication pair itself uses the helpers below.
 
-static FLASHMEM void payload_add_welford_object(Payload& parent,
+static void payload_add_welford_object(Payload& parent,
                                        const char* key,
                                        const welford_t& w) {
   Payload obj;
@@ -1774,29 +1715,29 @@ static FLASHMEM void payload_add_welford_object(Payload& parent,
   parent.add_object(key, obj);
 }
 
-static FLASHMEM void payload_add_frequency_fields(Payload& obj, double ppb_value) {
+static void payload_add_frequency_fields(Payload& obj, double ppb_value) {
   const double tau_value = 1.0 + ppb_value / 1e9;
   obj.add("tau", tau_value, 12);
   obj.add("ppb", ppb_value, 3);
 }
 
-static FLASHMEM double campaign_total_tau_from_ratio(uint64_t reference_value,
+static double campaign_total_tau_from_ratio(uint64_t reference_value,
                                             uint64_t clock_value) {
   if (reference_value == 0ULL) return 1.0;
   return (double)clock_value / (double)reference_value;
 }
 
-static FLASHMEM double campaign_total_ppb_from_tau(double tau) {
+static double campaign_total_ppb_from_tau(double tau) {
   return (tau - 1.0) * 1.0e9;
 }
 
-static FLASHMEM double campaign_total_ppb_from_ratio(uint64_t reference_value,
+static double campaign_total_ppb_from_ratio(uint64_t reference_value,
                                             uint64_t clock_value) {
   return campaign_total_ppb_from_tau(
       campaign_total_tau_from_ratio(reference_value, clock_value));
 }
 
-static FLASHMEM double campaign_total_dwt_ppb(uint64_t public_gnss_ns,
+static double campaign_total_dwt_ppb(uint64_t public_gnss_ns,
                                      uint64_t public_dwt_total_cycles) {
   const uint64_t expected_cycles = dwt_ns_to_cycles(public_gnss_ns);
   if (expected_cycles == 0ULL) return 0.0;
@@ -1804,7 +1745,7 @@ static FLASHMEM double campaign_total_dwt_ppb(uint64_t public_gnss_ns,
                                        public_dwt_total_cycles);
 }
 
-static FLASHMEM void payload_add_stats_clock(Payload& parent,
+static void payload_add_stats_clock(Payload& parent,
                                     const char* key,
                                     const welford_t& w,
                                     bool include_frequency,
@@ -1821,7 +1762,7 @@ static FLASHMEM void payload_add_stats_clock(Payload& parent,
   parent.add_object(key, obj);
 }
 
-static FLASHMEM void payload_add_stats_summary_hierarchical(Payload& p,
+static void payload_add_stats_summary_hierarchical(Payload& p,
                                                    uint64_t public_gnss_ns,
                                                    uint64_t public_dwt_total,
                                                    uint64_t public_ocxo1_ns,
@@ -1847,7 +1788,7 @@ static FLASHMEM void payload_add_stats_summary_hierarchical(Payload& p,
   p.add_object("stats", stats);
 }
 
-static FLASHMEM void payload_add_prediction_lane_object(Payload& parent,
+static void payload_add_prediction_lane_object(Payload& parent,
                                                const char* key,
                                                const clocks_static_prediction_snapshot_t& s) {
   Payload lane;
@@ -1859,7 +1800,7 @@ static FLASHMEM void payload_add_prediction_lane_object(Payload& parent,
   parent.add_object(key, lane);
 }
 
-static FLASHMEM void payload_add_prediction_summary_hierarchical(Payload& p) {
+static void payload_add_prediction_summary_hierarchical(Payload& p) {
   Payload prediction;
   payload_add_prediction_lane_object(prediction, "pps", prediction_snapshot_for_pps());
   payload_add_prediction_lane_object(prediction, "vclock", prediction_snapshot_for_clock(time_clock_id_t::VCLOCK));
@@ -1868,7 +1809,7 @@ static FLASHMEM void payload_add_prediction_summary_hierarchical(Payload& p) {
   p.add_object("prediction", prediction);
 }
 
-static FLASHMEM const char* pps_vclock_edge_decision_name(uint32_t decision) {
+static const char* pps_vclock_edge_decision_name(uint32_t decision) {
   switch (decision) {
     case PPS_VCLOCK_EDGE_DECISION_LOWER_LAWFUL:
       return "LOWER_LAWFUL";
@@ -1884,7 +1825,7 @@ static FLASHMEM const char* pps_vclock_edge_decision_name(uint32_t decision) {
 }
 
 
-static FLASHMEM bool floorline_candidate_present(
+static bool floorline_candidate_present(
     bool lane_valid,
     const clocks_alpha_lane_forensics_t& f) {
   // FloorLine is the lower-envelope successor to the retired regression
@@ -1898,7 +1839,7 @@ static FLASHMEM bool floorline_candidate_present(
          f.regression_sample_count != 0U;
 }
 
-static FLASHMEM void payload_add_pps_vclock_edge_forensics(
+static void payload_add_pps_vclock_edge_forensics(
     Payload& parent,
     bool available,
     const clocks_pps_vclock_edge_forensics_t& e) {
@@ -2243,26 +2184,6 @@ struct ocxo_cycle_residual_diag_t {
   int64_t  traditional_fast_residual_ns = 0;
   int64_t  diagnostic_minus_traditional = 0;
 };
-
-// Per-row TIMEBASE scratch lives in OCRAM, not on the DTCM stack.
-// clocks_beta_pps() snapshots several large Alpha forensic structs once per
-// campaign row.  Keeping this scratch global/OCRAM avoids a multi-kilobyte
-// stack frame while preserving the same publication semantics.
-struct timebase_publication_scratch_t {
-  clocks_alpha_lane_forensics_t vclock_forensics{};
-  clocks_alpha_lane_forensics_t ocxo1_forensics{};
-  clocks_alpha_lane_forensics_t ocxo2_forensics{};
-  clocks_pps_vclock_edge_forensics_t pps_vclock_edge_forensics{};
-  clocks_alpha_ocxo_pps_projection_snapshot_t ocxo1_pps_projection{};
-  clocks_alpha_ocxo_pps_projection_snapshot_t ocxo2_pps_projection{};
-  clocks_static_prediction_snapshot_t pps_cycle_prediction{};
-  clocks_static_prediction_snapshot_t ocxo1_cycle_prediction{};
-  clocks_static_prediction_snapshot_t ocxo2_cycle_prediction{};
-  ocxo_cycle_residual_diag_t ocxo1_cycle_residual_diag{};
-  ocxo_cycle_residual_diag_t ocxo2_cycle_residual_diag{};
-};
-
-static CLOCKS_OCRAM timebase_publication_scratch_t g_timebase_scratch = {};
 
 static ocxo_cycle_residual_diag_t ocxo_cycle_residual_diag_build(
     const clocks_static_prediction_snapshot_t& gnss,
@@ -2700,7 +2621,7 @@ static FLASHMEM void payload_add_slim_ocxo_forensics(
 }
 
 
-static FLASHMEM void payload_add_timebase_pair_identity(Payload& p,
+static void payload_add_timebase_pair_identity(Payload& p,
                                                const char* schema,
                                                const char* version_key,
                                                uint32_t version,
@@ -2731,7 +2652,7 @@ static FLASHMEM void payload_add_timebase_pair_identity(Payload& p,
   p.add("servo_active", calibrate_ocxo_mode != servo_mode_t::OFF);
 }
 
-static FLASHMEM void payload_add_vclock_fragment(Payload& p, uint64_t public_gnss_ns) {
+static void payload_add_vclock_fragment(Payload& p, uint64_t public_gnss_ns) {
   Payload lane;
   lane.add("ns", public_gnss_ns);
   lane.add("counter32_at_pps_vclock", (uint32_t)g_counter32_at_pps_vclock);
@@ -2754,7 +2675,7 @@ static FLASHMEM void payload_add_vclock_forensics(Payload& p,
   p.add_object("vclock", lane);
 }
 
-static FLASHMEM void payload_add_ocxo_fragment(Payload& p,
+static void payload_add_ocxo_fragment(Payload& p,
                                       const char* key,
                                       uint64_t public_ns,
                                       uint64_t public_measured_ns,
@@ -2910,15 +2831,8 @@ struct servo_input_diag_t {
   int64_t  selected_residual_ns = 0;
 };
 
-static CLOCKS_OCRAM servo_input_diag_t g_servo_input_ocxo1 = {};
-static CLOCKS_OCRAM servo_input_diag_t g_servo_input_ocxo2 = {};
-
-static FLASHMEM void clocks_beta_ocram_reset(void) {
-  g_recover_welfords_pending = recover_welford_state_t{};
-  g_timebase_scratch = timebase_publication_scratch_t{};
-  g_servo_input_ocxo1 = servo_input_diag_t{};
-  g_servo_input_ocxo2 = servo_input_diag_t{};
-}
+static servo_input_diag_t g_servo_input_ocxo1 = {};
+static servo_input_diag_t g_servo_input_ocxo2 = {};
 
 static void servo_input_diag_reset(servo_input_diag_t& d) {
   d = servo_input_diag_t{};
@@ -3521,7 +3435,7 @@ static bool clocks_servo_active(void) {
   return calibrate_ocxo_mode != servo_mode_t::OFF;
 }
 
-static FLASHMEM void payload_add_servo_dac_values(Payload& parent) {
+static void payload_add_servo_dac_values(Payload& parent) {
   // Minimal durable DAC payload.  This is intentionally only the values the Pi
   // should persist as the current system DAC configuration, plus the explicit
   // servo mode that explains why this object is present in the TIMEBASE row.
@@ -3556,16 +3470,13 @@ static FLASHMEM void payload_add_servo_dac_values(Payload& parent) {
 }
 
 // ----------------------------------------------------------------------------
-// CLOCKS_DAC_TICK — retired dashboard feed
+// CLOCKS_DAC_TICK — minimal 1 Hz DAC/servo dashboard feed
 // ----------------------------------------------------------------------------
 //
-// REPORT_DAC is the command-polled DAC/servo dashboard surface.  Keep the old
-// scheduler call sites as cheap suppression counters so campaign hot paths no
-// longer arm TimePop, build Payloads, or publish CLOCKS_DAC_TICK.
+// REPORT_DAC is the courtroom report.  This publication is intentionally tiny:
+// just enough for dashboard rows, manual DAC controls, and servo/dither status.
 
-static constexpr bool CLOCKS_DAC_TICK_PUBLISH_ENABLED = false;
-
-static FLASHMEM void payload_add_dac_tick_lane(Payload& parent,
+static void payload_add_dac_tick_lane(Payload& parent,
                                       const char* key,
                                       const ocxo_dac_state_t& dac,
                                       const servo_input_diag_t& input) {
@@ -3599,32 +3510,9 @@ static FLASHMEM void payload_add_dac_tick_lane(Payload& parent,
   parent.add_object(key, lane);
 }
 
-static volatile bool     g_clocks_dac_tick_dirty = false;
-static volatile bool     g_clocks_dac_tick_service_armed = false;
-static uint32_t          g_clocks_dac_tick_service_arm_count = 0;
-static uint32_t          g_clocks_dac_tick_service_dispatch_count = 0;
-static uint32_t          g_clocks_dac_tick_service_arm_failures = 0;
-static uint32_t          g_clocks_dac_tick_coalesce_count = 0;
-static uint32_t          g_clocks_dac_tick_publish_count = 0;
-static uint32_t          g_clocks_dac_tick_suppressed_count = 0;
-static char              g_clocks_dac_tick_phase[32] = {0};
-
-static void schedule_dac_tick_publish(const char* phase);
-
-static FLASHMEM void publish_dac_tick_now(const char* phase) {
-  if (!CLOCKS_DAC_TICK_PUBLISH_ENABLED) {
-    (void)phase;
-    g_clocks_dac_tick_suppressed_count++;
-    return;
-  }
-
+static void publish_dac_tick(const char* phase) {
   Payload p;
   p.add("schema", "CLOCKS_DAC_TICK_V2");
-  p.add("context", "ALAP");
-  p.add("publish_count", g_clocks_dac_tick_publish_count + 1U);
-  p.add("service_arm_count", g_clocks_dac_tick_service_arm_count);
-  p.add("service_dispatch_count", g_clocks_dac_tick_service_dispatch_count);
-  p.add("coalesce_count", g_clocks_dac_tick_coalesce_count);
   p.add("c", campaign_name);
   p.add("state",
         campaign_state == clocks_campaign_state_t::STARTED ? "STARTED" : "STOPPED");
@@ -3647,61 +3535,6 @@ static FLASHMEM void publish_dac_tick_now(const char* phase) {
   payload_add_dac_tick_lane(p, "ocxo2", ocxo2_dac, g_servo_input_ocxo2);
 
   publish("CLOCKS_DAC_TICK", p);
-  g_clocks_dac_tick_publish_count++;
-}
-
-static void dac_tick_publish_service(timepop_ctx_t*,
-                                     timepop_diag_t*,
-                                     void*) {
-  g_clocks_dac_tick_service_armed = false;
-  g_clocks_dac_tick_service_dispatch_count++;
-
-  if (!g_clocks_dac_tick_dirty) {
-    return;
-  }
-
-  char phase[sizeof(g_clocks_dac_tick_phase)];
-  safeCopy(phase, sizeof(phase), g_clocks_dac_tick_phase);
-  g_clocks_dac_tick_dirty = false;
-
-  publish_dac_tick_now(phase);
-
-  if (g_clocks_dac_tick_dirty) {
-    schedule_dac_tick_publish(g_clocks_dac_tick_phase);
-  }
-}
-
-static void schedule_dac_tick_publish(const char* phase) {
-  safeCopy(g_clocks_dac_tick_phase,
-           sizeof(g_clocks_dac_tick_phase),
-           phase ? phase : "");
-
-  if (!CLOCKS_DAC_TICK_PUBLISH_ENABLED) {
-    g_clocks_dac_tick_suppressed_count++;
-    return;
-  }
-
-  if (g_clocks_dac_tick_dirty) {
-    g_clocks_dac_tick_coalesce_count++;
-  }
-  g_clocks_dac_tick_dirty = true;
-
-  if (g_clocks_dac_tick_service_armed) {
-    return;
-  }
-
-  const timepop_handle_t handle =
-      timepop_arm_alap(dac_tick_publish_service,
-                       nullptr,
-                       "CLOCKS_DAC_TICK");
-
-  if (handle == TIMEPOP_INVALID_HANDLE) {
-    g_clocks_dac_tick_service_arm_failures++;
-    return;
-  }
-
-  g_clocks_dac_tick_service_armed = true;
-  g_clocks_dac_tick_service_arm_count++;
 }
 
 // ============================================================================
@@ -3727,7 +3560,7 @@ void clocks_beta_pps(void) {
     if (was_started) {
       timebase_invalidate();
     }
-    schedule_dac_tick_publish("STOP_GATE");
+    publish_dac_tick("STOP_GATE");
     return;
   }
 
@@ -3735,7 +3568,7 @@ void clocks_beta_pps(void) {
     g_timebase_start_zero_gate_count++;
     timebase_build_stage(TIMEBASE_BUILD_STAGE_START_ZERO_GATE);
     (void)clocks_try_finish_pending_smartzero();
-    schedule_dac_tick_publish("START_ZERO_GATE");
+    publish_dac_tick("START_ZERO_GATE");
     return;
   }
 
@@ -3752,33 +3585,26 @@ void clocks_beta_pps(void) {
     ocxo2_measured_gnss_ticks_64        = recover_ocxo2_ns / 100ull;
 
     campaign_seconds = recover_gnss_ns / 1000000000ull;
-
-    // Alpha owns the OCXO previous/pending edge machinery.  RECOVER must not
-    // allow those surfaces to bridge the outage.  Beta then restores the
-    // campaign statistics and quarantines the first public residual rows so
-    // Welford receives only post-recovery, post-warmup intervals.
-    clocks_alpha_recover_reprime_ocxo_state();
-    pps_interval_residuals_begin_recover_quarantine(
-        CLOCKS_RECOVER_SCIENCE_QUARANTINE_ROWS);
+    pps_interval_residuals_reset();
     recover_welfords_apply_pending();
 
     request_recover = false;
     campaign_state = clocks_campaign_state_t::STARTED;
     campaign_warmup_begin(campaign_warmup_mode_t::RECOVER);
-    schedule_dac_tick_publish("RECOVER_GATE");
+    publish_dac_tick("RECOVER_GATE");
     return;
   }
 
   if (watchdog_anomaly_active) {
     g_timebase_watchdog_gate_count++;
     timebase_build_stage(TIMEBASE_BUILD_STAGE_WATCHDOG_GATE);
-    schedule_dac_tick_publish("WATCHDOG_GATE");
+    publish_dac_tick("WATCHDOG_GATE");
     return;
   }
   if (campaign_state != clocks_campaign_state_t::STARTED) {
     g_timebase_not_started_gate_count++;
     timebase_build_stage(TIMEBASE_BUILD_STAGE_NOT_STARTED_GATE);
-    schedule_dac_tick_publish("NOT_STARTED_GATE");
+    publish_dac_tick("NOT_STARTED_GATE");
     return;
   }
 
@@ -3791,7 +3617,7 @@ void clocks_beta_pps(void) {
   if (campaign_warmup_consume_one_candidate_record()) {
     g_timebase_warmup_suppressed_count++;
     timebase_build_stage(TIMEBASE_BUILD_STAGE_WARMUP_GATE);
-    schedule_dac_tick_publish("WARMUP_GATE");
+    publish_dac_tick("WARMUP_GATE");
     return;
   }
 
@@ -3821,25 +3647,9 @@ void clocks_beta_pps(void) {
     welford_update(welford_dwt, dwt_ppb_sample);
   }
 
-  clocks_alpha_lane_forensics_t& vclock_forensics =
-      g_timebase_scratch.vclock_forensics;
-  clocks_alpha_lane_forensics_t& ocxo1_forensics =
-      g_timebase_scratch.ocxo1_forensics;
-  clocks_alpha_lane_forensics_t& ocxo2_forensics =
-      g_timebase_scratch.ocxo2_forensics;
-  clocks_pps_vclock_edge_forensics_t& pps_vclock_edge_forensics =
-      g_timebase_scratch.pps_vclock_edge_forensics;
-  clocks_alpha_ocxo_pps_projection_snapshot_t& ocxo1_pps_projection =
-      g_timebase_scratch.ocxo1_pps_projection;
-  clocks_alpha_ocxo_pps_projection_snapshot_t& ocxo2_pps_projection =
-      g_timebase_scratch.ocxo2_pps_projection;
-
-  vclock_forensics = clocks_alpha_lane_forensics_t{};
-  ocxo1_forensics = clocks_alpha_lane_forensics_t{};
-  ocxo2_forensics = clocks_alpha_lane_forensics_t{};
-  pps_vclock_edge_forensics = clocks_pps_vclock_edge_forensics_t{};
-  ocxo1_pps_projection = clocks_alpha_ocxo_pps_projection_snapshot_t{};
-  ocxo2_pps_projection = clocks_alpha_ocxo_pps_projection_snapshot_t{};
+  clocks_alpha_lane_forensics_t vclock_forensics{};
+  clocks_alpha_lane_forensics_t ocxo1_forensics{};
+  clocks_alpha_lane_forensics_t ocxo2_forensics{};
 
   const bool vclock_forensics_valid =
       clocks_alpha_lane_forensics(time_clock_id_t::VCLOCK, &vclock_forensics);
@@ -3848,9 +3658,12 @@ void clocks_beta_pps(void) {
   const bool ocxo2_forensics_valid =
       clocks_alpha_lane_forensics(time_clock_id_t::OCXO2, &ocxo2_forensics);
 
+  clocks_pps_vclock_edge_forensics_t pps_vclock_edge_forensics{};
   const bool pps_vclock_edge_forensics_valid =
       clocks_alpha_pps_vclock_edge_forensics(&pps_vclock_edge_forensics);
 
+  clocks_alpha_ocxo_pps_projection_snapshot_t ocxo1_pps_projection{};
+  clocks_alpha_ocxo_pps_projection_snapshot_t ocxo2_pps_projection{};
   const bool ocxo1_pps_projection_ok =
       clocks_alpha_ocxo_pps_projection_snapshot(time_clock_id_t::OCXO1,
                                                 &ocxo1_pps_projection);
@@ -3898,25 +3711,17 @@ void clocks_beta_pps(void) {
   // These are forensic-only.  They deliberately do not feed Welford, tau, or
   // servo control.  They compare each OCXO one-second DWT interval against the
   // GNSS/PPS one-second DWT interval using the same moving Teensy yardstick.
-  clocks_static_prediction_snapshot_t& pps_cycle_prediction =
-      g_timebase_scratch.pps_cycle_prediction;
-  clocks_static_prediction_snapshot_t& ocxo1_cycle_prediction =
-      g_timebase_scratch.ocxo1_cycle_prediction;
-  clocks_static_prediction_snapshot_t& ocxo2_cycle_prediction =
-      g_timebase_scratch.ocxo2_cycle_prediction;
-  ocxo_cycle_residual_diag_t& ocxo1_cycle_residual_diag =
-      g_timebase_scratch.ocxo1_cycle_residual_diag;
-  ocxo_cycle_residual_diag_t& ocxo2_cycle_residual_diag =
-      g_timebase_scratch.ocxo2_cycle_residual_diag;
-
-  pps_cycle_prediction = prediction_snapshot_for_pps();
-  ocxo1_cycle_prediction = prediction_snapshot_for_clock(time_clock_id_t::OCXO1);
-  ocxo2_cycle_prediction = prediction_snapshot_for_clock(time_clock_id_t::OCXO2);
-  ocxo1_cycle_residual_diag =
+  const clocks_static_prediction_snapshot_t pps_cycle_prediction =
+      prediction_snapshot_for_pps();
+  const clocks_static_prediction_snapshot_t ocxo1_cycle_prediction =
+      prediction_snapshot_for_clock(time_clock_id_t::OCXO1);
+  const clocks_static_prediction_snapshot_t ocxo2_cycle_prediction =
+      prediction_snapshot_for_clock(time_clock_id_t::OCXO2);
+  const ocxo_cycle_residual_diag_t ocxo1_cycle_residual_diag =
       ocxo_cycle_residual_diag_build(pps_cycle_prediction, ocxo1_cycle_prediction,
                                      pps_residuals.ocxo1_valid,
                                      pps_residuals.ocxo1_fast_residual_ns);
-  ocxo2_cycle_residual_diag =
+  const ocxo_cycle_residual_diag_t ocxo2_cycle_residual_diag =
       ocxo_cycle_residual_diag_build(pps_cycle_prediction, ocxo2_cycle_prediction,
                                      pps_residuals.ocxo2_valid,
                                      pps_residuals.ocxo2_fast_residual_ns);
@@ -3990,7 +3795,7 @@ void clocks_beta_pps(void) {
   welford_update(welford_ocxo2_dac, ocxo2_dac.dac_fractional);
   timebase_build_stage(TIMEBASE_BUILD_STAGE_DAC_WELFORD);
 
-  schedule_dac_tick_publish("STARTED");
+  publish_dac_tick("STARTED");
 
   // ── Build TIMEBASE_FRAGMENT ──
   g_timebase_build_begin_count++;
@@ -4419,7 +4224,7 @@ void clocks_beta_pps(void) {
 // ============================================================================
 
 
-static FLASHMEM bool payload_try_get_double_alias(const Payload& args,
+static bool payload_try_get_double_alias(const Payload& args,
                                          double& out,
                                          const char* k1,
                                          const char* k2,
@@ -4429,7 +4234,7 @@ static FLASHMEM bool payload_try_get_double_alias(const Payload& args,
          (k3 && args.tryGetDouble(k3, out));
 }
 
-static FLASHMEM bool payload_try_get_ocxo1_dac(const Payload& args, double& out) {
+static bool payload_try_get_ocxo1_dac(const Payload& args, double& out) {
   // New system-config contract: { "ocxo1_dac": <code>, "ocxo2_dac": <code> }.
   // Retain the old command aliases so existing Pi-side callers do not break.
   return payload_try_get_double_alias(args, out,
@@ -4438,7 +4243,7 @@ static FLASHMEM bool payload_try_get_ocxo1_dac(const Payload& args, double& out)
                                       "set_dac1");
 }
 
-static FLASHMEM bool payload_try_get_ocxo2_dac(const Payload& args, double& out) {
+static bool payload_try_get_ocxo2_dac(const Payload& args, double& out) {
   return payload_try_get_double_alias(args, out,
                                       "ocxo2_dac",
                                       "dac2",
@@ -5097,16 +4902,6 @@ static FLASHMEM void add_campaign_payload(Payload& p) {
   p.add("campaign_warmup_remaining", (uint32_t)g_campaign_warmup_remaining);
   p.add("campaign_warmup_suppressed_total",
         (uint32_t)g_campaign_warmup_suppressed_total);
-  p.add("recover_science_quarantine_remaining",
-        g_science_residual_quarantine_remaining);
-  p.add("recover_science_quarantine_begin_count",
-        g_science_residual_quarantine_begin_count);
-  p.add("recover_science_quarantine_consumed_count",
-        g_science_residual_quarantine_consumed_count);
-  p.add("recover_science_quarantine_last_public_count",
-        g_science_residual_quarantine_last_public_count);
-  p.add("alpha_recover_reprime_count",
-        clocks_alpha_recover_reprime_count());
 
   payload_add_campaign_feature_gate(p);
 }
@@ -5350,14 +5145,6 @@ static FLASHMEM void add_dac_payload(Payload& p) {
   p.add("no_candidate_passes", g_ocxo_dac_no_candidate_passes);
   p.add("deferred_candidates", g_ocxo_dac_deferred_candidates);
   p.add("schedule_failures", g_ocxo_dac_schedule_failures);
-
-  p.add("dac_tick_publish_enabled", CLOCKS_DAC_TICK_PUBLISH_ENABLED);
-  p.add("dac_tick_suppressed_count", g_clocks_dac_tick_suppressed_count);
-  p.add("dac_tick_publish_count", g_clocks_dac_tick_publish_count);
-  p.add("dac_tick_service_arm_count", g_clocks_dac_tick_service_arm_count);
-  p.add("dac_tick_service_dispatch_count", g_clocks_dac_tick_service_dispatch_count);
-  p.add("dac_tick_service_arm_failures", g_clocks_dac_tick_service_arm_failures);
-  p.add("dac_tick_coalesce_count", g_clocks_dac_tick_coalesce_count);
 }
 
 
@@ -5793,16 +5580,6 @@ static FLASHMEM Payload cmd_report_timebase_publish(const Payload&) {
   counters.add("recover_welford_restore_count", g_recover_welford_restore_count);
   counters.add("recover_welford_last_restored_lane_count",
                g_recover_welford_last_restored_lane_count);
-  counters.add("alpha_recover_reprime_count",
-               clocks_alpha_recover_reprime_count());
-  counters.add("recover_science_quarantine_begin_count",
-               g_science_residual_quarantine_begin_count);
-  counters.add("recover_science_quarantine_consumed_count",
-               g_science_residual_quarantine_consumed_count);
-  counters.add("recover_science_quarantine_remaining",
-               g_science_residual_quarantine_remaining);
-  counters.add("recover_science_quarantine_last_public_count",
-               g_science_residual_quarantine_last_public_count);
   counters.add("welford_gap_advance_count", g_welford_gap_advance_count);
   counters.add("welford_gap_advance_last_public_count",
                g_welford_gap_advance_last_public_count);
@@ -6395,6 +6172,7 @@ static const process_command_entry_t CLOCKS_COMMANDS[] = {
 
 static const process_subscription_entry_t CLOCKS_SUBSCRIPTIONS[] = {
   { "TIMEBASE_FRAGMENT", on_timebase_fragment },
+  { "FEATURE_STATUS",    on_feature_status    },
   { nullptr, nullptr },
 };
 
