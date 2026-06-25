@@ -1,16 +1,11 @@
 """
 transport.py — ZPNet Host-Side Transport Layer (Pi)
 
-This module is the single authoritative byte ↔ meaning boundary
-on the host side. It is intentionally symmetric with
-`transport.cpp` on the Teensy.
+This module is the single authoritative byte ↔ meaning boundary on the host
+side. It is intentionally symmetric with the Teensy serial-only transport.
 
-NEW ARCHITECTURE (TRUTHFUL SPLIT):
-  • Four explicit physical paths:
-      - HID   TX
-      - HID   RX
-      - SERIAL TX
-      - SERIAL RX
+Architecture:
+  • USB CDC Serial is the only physical path.
   • Public API remains invariant:
       - transport_send(...)
       - transport_register_receive_callback(...)
@@ -18,7 +13,7 @@ NEW ARCHITECTURE (TRUTHFUL SPLIT):
       - transport_close()
 
 Responsibilities:
-  • Own physical I/O (hidraw OR USB CDC serial)
+  • Own physical serial I/O
   • Delimit / undelimit semantic messages
   • Demultiplex by traffic byte
   • Deliver decoded messages via registered callbacks
@@ -34,11 +29,9 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import signal
 import threading
 import time
-import hid
 from typing import Callable, Dict, Optional
 
 import serial
@@ -56,22 +49,17 @@ import faulthandler
 faulthandler.register(signal.SIGUSR1)
 
 # ---------------------------------------------------------------------
-# Environment-selected transport (authoritative)
+# Physical device path
 # ---------------------------------------------------------------------
 
-ENV_TRANSPORT = "ZPNET_TRANSPORT"
-TRANSPORT_HID = "HID"
-TRANSPORT_SERIAL = "SERIAL"
-
-TEENSY_HIDRAW_PATH = getattr(constants, "TEENSY_HIDRAW_PATH", "/dev/zpnet-teensy-hid")
 TEENSY_SERIAL_PATH = getattr(constants, "TEENSY_SERIAL_PATH", "/dev/zpnet-teensy-serial")
 
 # ---------------------------------------------------------------------
 # Constants (must match Teensy)
 # ---------------------------------------------------------------------
 
-TRANSPORT_BLOCK_SIZE = 64
-TRANSPORT_MAX_MESSAGE = 10 * 1024
+TRANSPORT_MAX_MESSAGE = 16 * 1024
+RX_BUF_MAX = TRANSPORT_MAX_MESSAGE + 64
 
 STX_PREFIX = b"<STX="
 ETX_SEQ = b"<ETX>"
@@ -96,19 +84,13 @@ _RETRY_MAX_SLEEP_S = 0.50
 # Physical transport state (authoritative)
 # ---------------------------------------------------------------------
 
-# _hid_dev is the single source of truth for HID physical state.
-# None => device not open / unavailable
-# not None => valid, open hid.device()
-_hid_dev: Optional[hid.device] = None
-
 # _ser is the single source of truth for SERIAL physical state.
 # None => device not open / unavailable
 # not None => open serial.Serial instance
-_ser: Optional["serial.Serial"] = None
+_ser: Optional[serial.Serial] = None
 
-_transport_mode: Optional[str] = None
-
-# TX serialization (RawHID exclusivity)
+# TX serialization. Serial write is physically single-path, but keeping the
+# lock preserves the old public concurrency contract.
 _tx_lock = threading.Lock()
 
 # Supervisor control
@@ -121,39 +103,11 @@ _transport_supervisor_started = False
 
 rx_buf = bytearray()
 rx_have_traffic = False
-rx_traffic = None
+rx_traffic: Optional[int] = None
 
 # ---------------------------------------------------------------------
 # Open / close primitives (IMMORTAL)
 # ---------------------------------------------------------------------
-
-def _open_hid(_: str = None) -> None:
-    global _hid_dev
-
-    if _hid_dev is not None:
-        return  # already open
-
-    dev = hid.device()
-    dev.open_path(b'1-1.1:1.0')
-    dev.set_nonblocking(False)
-
-    _hid_dev = dev
-    logging.info("[transport] HID device opened")
-
-
-def _close_hid() -> None:
-    global _hid_dev
-
-    dev = _hid_dev
-    if dev is not None:
-        try:
-            dev.close()
-        except Exception:
-            pass
-
-    _hid_dev = None
-    logging.info("[transport] HID device closed")
-
 
 def _open_serial(path: str) -> None:
     global _ser
@@ -161,10 +115,9 @@ def _open_serial(path: str) -> None:
     if _ser is not None:
         return  # idempotent
 
-    import serial
     _ser = serial.Serial(port=path, baudrate=115200, timeout=None)
-
     logging.info("[transport] SERIAL device opened")
+
 
 def _close_serial() -> None:
     global _ser
@@ -179,7 +132,6 @@ def _close_serial() -> None:
     _ser = None
     logging.info("[transport] SERIAL device closed")
 
-
 # ---------------------------------------------------------------------
 # Forensic logging
 # ---------------------------------------------------------------------
@@ -192,6 +144,7 @@ def render_bytes_lossless(data: bytes) -> str:
         else:
             out.append(f"\\x{b:02X}")
     return ''.join(out)
+
 
 def _log_raw_transport(traffic: int, message: bytes, direction: str) -> None:
     with open(RAW_TRANSPORT_LOG_PATH, "a") as f:
@@ -206,16 +159,9 @@ def _log_raw_transport(traffic: int, message: bytes, direction: str) -> None:
 
 _transport_recv_cb: Dict[int, Callable[[Payload], None]] = {}
 
+
 def transport_register_receive_callback(traffic: int, cb: Callable[[Payload], None]) -> None:
     _transport_recv_cb[traffic] = cb
-
-# ---------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------
-
-def _sleep_backoff(s: float) -> float:
-    time.sleep(s)
-    return min(s * 2.0, _RETRY_MAX_SLEEP_S)
 
 # ---------------------------------------------------------------------
 # Framing helpers
@@ -228,30 +174,29 @@ def _delimit_for_send(payload: bytes) -> bytes:
 
 def _undelimit_on_receive(msg: bytes) -> bytes:
     header_end = msg.index(b">")
-
     declared_len = int(msg[len(STX_PREFIX):header_end])
-
     json_start = header_end + 1
     etx_pos = json_start + declared_len
-
     return msg[json_start:etx_pos]
 
+
 def _validate_frame(framed: bytes) -> bool:
+    header_end = framed.find(b">")
     ok = (
         framed.startswith(STX_PREFIX)
         and framed.endswith(ETX_SEQ)
-        and framed.find(b">") != -1
-        and framed[len(STX_PREFIX):framed.find(b">")].isdigit()
+        and header_end != -1
+        and framed[len(STX_PREFIX):header_end].isdigit()
         and (
             len(framed)
-            - (framed.find(b">") + 1)
+            - (header_end + 1)
             - ETX_LEN
-            == int(framed[len(STX_PREFIX):framed.find(b">")])
+            == int(framed[len(STX_PREFIX):header_end])
         )
     )
 
     if not ok:
-        logging.info("🧩 transport detected incorrectly formatted frame: %r",framed)
+        logging.info("🧩 transport detected incorrectly formatted frame: %r", framed)
 
     return ok
 
@@ -260,24 +205,20 @@ def _validate_frame(framed: bytes) -> bool:
 # ---------------------------------------------------------------------
 
 def _dispatch_complete_message(traffic: int, framed: bytes) -> None:
-    _validate_frame(framed)
+    if not _validate_frame(framed):
+        return
+
     raw = _undelimit_on_receive(framed)
     payload = json.loads(raw.decode("utf-8"))
-    cb = _transport_recv_cb[traffic]
+    cb = _transport_recv_cb.get(traffic)
+    if cb is None:
+        logging.info("🧩 transport received unregistered traffic byte: 0x%02X", traffic)
+        return
     cb(payload)
 
 # ---------------------------------------------------------------------
 # Physical primitives
 # ---------------------------------------------------------------------
-
-def _hid_send_block(block: bytes) -> None:
-    _hid_dev.write(block)
-
-
-def _hid_recv_block(timeout_ms: int = 1000) -> bytes:
-    data = _hid_dev.read(TRANSPORT_BLOCK_SIZE, timeout_ms)
-    return bytes(data)
-
 
 def _serial_write(data: bytes) -> None:
     ser = _ser
@@ -296,20 +237,8 @@ def _serial_read_some() -> bytes:
     return ser.read(waiting if waiting else 1)
 
 # ---------------------------------------------------------------------
-# TX paths
+# TX path
 # ---------------------------------------------------------------------
-
-def _hid_tx_send(traffic: int, framed: bytes) -> None:
-    msg = bytes([traffic]) + framed
-    _log_raw_transport(traffic, msg, "Pi -> Teensy")
-
-    offset = 0
-    while offset < len(msg):
-        chunk = msg[offset:offset + TRANSPORT_BLOCK_SIZE]
-        chunk += b"\x00" * (TRANSPORT_BLOCK_SIZE - len(chunk))
-        _hid_send_block(chunk)
-        offset += TRANSPORT_BLOCK_SIZE
-
 
 def _serial_tx_send(traffic: int, framed: bytes) -> None:
     msg = bytes([traffic]) + framed
@@ -317,70 +246,87 @@ def _serial_tx_send(traffic: int, framed: bytes) -> None:
     _serial_write(msg)
 
 # ---------------------------------------------------------------------
-# RX loops (RETURN on physical failure)
+# RX loop (RETURN on physical failure)
 # ---------------------------------------------------------------------
 
-def _hid_rx_loop() -> None:
+def _rx_reset() -> None:
+    global rx_have_traffic, rx_traffic
 
-    global rx_buf, rx_have_traffic, rx_traffic
+    rx_buf.clear()
+    rx_have_traffic = False
+    rx_traffic = None
 
-    rx_buf = bytearray()
-    traffic: Optional[int] = None
 
-    while True:
-        block = _hid_recv_block()
-        if block is None:
-            continue  # idle wait
+def _dispatch_if_complete() -> None:
+    global rx_have_traffic, rx_traffic
 
-        # Mule defense 1
-        if len(block)  == 0:
-            continue  # idle wait
+    if not rx_have_traffic or rx_traffic is None:
+        rx_buf.clear()
+        return
 
-        if traffic is None:
-            traffic = block[0]
-            rx_buf.clear()
-            rx_buf.extend(block[1:])
-        else:
-            rx_buf.extend(block)
+    if len(rx_buf) < len(STX_PREFIX) + 2:
+        return
 
-        etx_pos = rx_buf.find(ETX_SEQ)
-        if etx_pos != -1 and rx_buf.startswith(STX_PREFIX):
-            framed = bytes(rx_buf[:etx_pos + ETX_LEN])
-            _log_raw_transport(traffic, framed, "Teensy -> Pi")
-            _dispatch_complete_message(traffic, framed)
-            traffic = None
-            rx_buf.clear()
+    if not rx_buf.startswith(STX_PREFIX):
+        logging.info("🧩 transport RX reset: missing STX prefix")
+        _rx_reset()
+        return
+
+    header_end = rx_buf.find(b">")
+    if header_end < 0:
+        return
+
+    declared = rx_buf[len(STX_PREFIX):header_end]
+    if not declared.isdigit():
+        logging.info("🧩 transport RX reset: invalid length header")
+        _rx_reset()
+        return
+
+    declared_len = int(declared)
+    required_total = header_end + 1 + declared_len + ETX_LEN
+    if required_total > RX_BUF_MAX:
+        logging.info("🧩 transport RX reset: declared length overflow")
+        _rx_reset()
+        return
+
+    if len(rx_buf) < required_total:
+        return
+
+    etx_pos = header_end + 1 + declared_len
+    if bytes(rx_buf[etx_pos:etx_pos + ETX_LEN]) != ETX_SEQ:
+        logging.info("🧩 transport RX reset: missing ETX")
+        _rx_reset()
+        return
+
+    framed = bytes(rx_buf[:required_total])
+    traffic = rx_traffic
+    _log_raw_transport(traffic, framed, "Teensy -> Pi")
+    _dispatch_complete_message(traffic, framed)
+    _rx_reset()
 
 
 def _serial_rx_loop() -> None:
+    global rx_have_traffic, rx_traffic
 
-    global rx_buf, rx_have_traffic, rx_traffic
-
-    rx_buf = bytearray()
-    traffic: Optional[int] = None
+    _rx_reset()
 
     while True:
         data = _serial_read_some()
         for b in data:
-            if traffic is None:
+            if not rx_have_traffic:
                 if b in _VALID_TRAFFIC:
-                    traffic = b
+                    rx_traffic = b
+                    rx_have_traffic = True
                     rx_buf.clear()
                 continue
 
             rx_buf.append(b)
-            if len(rx_buf) > TRANSPORT_MAX_MESSAGE:
-                traffic = None
-                rx_buf.clear()
+            if len(rx_buf) > RX_BUF_MAX:
+                logging.info("🧩 transport RX reset: buffer overflow")
+                _rx_reset()
                 continue
 
-            etx_pos = rx_buf.find(ETX_SEQ)
-            if etx_pos != -1 and rx_buf.startswith(STX_PREFIX):
-                framed = bytes(rx_buf[:etx_pos + ETX_LEN])
-                _log_raw_transport(traffic, framed, "Teensy -> Pi")
-                _dispatch_complete_message(traffic, framed)
-                traffic = None
-                rx_buf.clear()
+            _dispatch_if_complete()
 
 # ---------------------------------------------------------------------
 # Supervisor (IMMORTAL CAMPER)
@@ -388,7 +334,7 @@ def _serial_rx_loop() -> None:
 
 def _supervisor_loop() -> None:
     """
-    Immortal supervisor — keeps the RX path alive across device
+    Immortal supervisor — keeps the serial RX path alive across device
     unavailability, flash cycles, and transient I/O errors.
 
     Behaviour:
@@ -397,45 +343,23 @@ def _supervisor_loop() -> None:
       • Closes stale handles before each retry
       • Polls with capped exponential backoff (20 ms → 500 ms)
       • Logs once on successful (re)connect
-      • RuntimeError (mode not set) still propagates — that's a bug
     """
     announced = False
     backoff = _RETRY_MIN_SLEEP_S
 
     while not _transport_stop.is_set():
         try:
-            mode = _transport_mode
-
-            if mode == TRANSPORT_SERIAL:
-                _open_serial(TEENSY_SERIAL_PATH)
-                if announced:
-                    logging.info("✅ [transport] SERIAL device available — RX loop starting")
-                    announced = False
-                backoff = _RETRY_MIN_SLEEP_S
-                _serial_rx_loop()
-
-            elif mode == TRANSPORT_HID:
-                _open_hid()
-                if announced:
-                    logging.info("✅ [transport] HID device available — RX loop starting")
-                    announced = False
-                backoff = _RETRY_MIN_SLEEP_S
-                _hid_rx_loop()
-
-            else:
-                raise RuntimeError("transport mode not set")
-
-        except RuntimeError:
-            # Programming error (mode not set) — let it crash
-            raise
+            _open_serial(TEENSY_SERIAL_PATH)
+            if announced:
+                logging.info("✅ [transport] SERIAL device available — RX loop starting")
+                announced = False
+            backoff = _RETRY_MIN_SLEEP_S
+            _serial_rx_loop()
 
         except Exception:
             # Device not ready, I/O error, stale handle, etc.
             # Close whatever is open so the next iteration re-opens cleanly.
-            if mode == TRANSPORT_SERIAL:
-                _close_serial()
-            elif mode == TRANSPORT_HID:
-                _close_hid()
+            _close_serial()
 
             if not announced:
                 logging.info("⏳ [transport] device not ready — supervisor retrying silently")
@@ -450,25 +374,23 @@ def _supervisor_loop() -> None:
 
 def transport_send(traffic: int, payload: Payload) -> None:
     raw = payload_to_json_bytes(payload)
+    if len(raw) > TRANSPORT_MAX_MESSAGE:
+        logging.info(
+            "[transport] refusing oversized outbound payload traffic=0x%02X len=%d max=%d",
+            traffic,
+            len(raw),
+            TRANSPORT_MAX_MESSAGE,
+        )
+        return
+
     framed = _delimit_for_send(raw)
 
     with _tx_lock:
-        if _transport_mode == TRANSPORT_HID:
-            _hid_tx_send(traffic, framed)
-        elif _transport_mode == TRANSPORT_SERIAL:
-            _serial_tx_send(traffic, framed)
-        else:
-            raise RuntimeError("transport not initialized")
+        _serial_tx_send(traffic, framed)
 
 
 def transport_init() -> None:
-    global _transport_mode, _transport_supervisor_started
-
-    mode = os.environ.get(ENV_TRANSPORT, "").strip().upper()
-    if mode not in (TRANSPORT_HID, TRANSPORT_SERIAL):
-        raise RuntimeError(f"{ENV_TRANSPORT} must be HID or SERIAL")
-
-    _transport_mode = mode
+    global _transport_supervisor_started
 
     if not _transport_supervisor_started:
         threading.Thread(
@@ -482,7 +404,7 @@ def transport_init() -> None:
 def transport_close() -> None:
     _transport_stop.set()
     _close_serial()
-    _close_hid()
+
 
 def transport_rx_snapshot() -> dict:
     """

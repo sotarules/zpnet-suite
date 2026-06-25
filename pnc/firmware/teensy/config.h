@@ -8,16 +8,11 @@
 static constexpr const char* FW_VERSION = FW_VERSION_STR;
 
 // -------------------------------------------------------------
-// Transport backend selection (runtime)
+// Transport doctrine
 // -------------------------------------------------------------
-
-typedef enum {
-  TRANSPORT_NONE = 0,
-  TRANSPORT_HID,
-  TRANSPORT_SERIAL
-} transport_backend_t;
-
-static constexpr transport_backend_t ZPNET_TRANSPORT = TRANSPORT_HID;
+//
+// Teensy firmware is USB CDC Serial only.  RawHID/HID transport selection
+// has been retired; transport.cpp owns the single physical transport.
 
 // --------------------------------------------------------------
 // Base units

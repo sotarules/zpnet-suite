@@ -6,10 +6,9 @@
 #   • Makefile does NOT attempt to enter bootloader
 #   • Flashing assumes HalfKay is already active
 #
-# Flashing is correct ONLY after:
-#   • physical reset
-#   • external RESET_B control
-#   • button press
+# Transport doctrine:
+#   • Teensy firmware is USB CDC Serial only
+#   • RawHID/HID transport selection has been retired
 #
 # =============================================================
 
@@ -21,19 +20,7 @@ NAME          = teensy
 ARDUINO_CLI   = ../../bin/arduino-cli
 TEENSY_LOADER = teensy_loader_cli
 
-# USB mode affects runtime only, not flashing
-# Choose one and stick to it (serial or rawhid)
-USB_MODE = serial
-BOARD    = teensy:avr:teensy41:usb=$(USB_MODE)
-
-# -------------------------------------------------------------
-# Compile-time defines (runtime only)
-# -------------------------------------------------------------
-
-CPP_DEFS =
-
-# Explicit transport selection (runtime routing)
-CPP_DEFS += -DZPNET_TRANSPORT_SERIAL
+BOARD = teensy:avr:teensy41:usb=serial
 
 # -------------------------------------------------------------
 # Targets
@@ -46,11 +33,9 @@ all: build
 # -------------------------------------------------------------
 
 build:
-	@echo "🔧 Building Teensy 4.1 (cold-boot compatible)..."
+	@echo "🔧 Building Teensy 4.1 serial-only firmware..."
 	$(ARDUINO_CLI) compile \
 	  --fqbn $(BOARD) \
-	  --build-property compiler.c.extra_flags="$(CPP_DEFS)" \
-	  --build-property compiler.cpp.extra_flags="$(CPP_DEFS)" \
 	  . \
 	  --output-dir ./build
 
