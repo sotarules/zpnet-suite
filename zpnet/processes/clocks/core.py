@@ -175,6 +175,7 @@ TIMEBASE_PAIR_TIMEOUT_S = 5.0
 
 PREFLIGHT_POLL_INTERVAL_S = 30
 PREFLIGHT_LOG_PREFIX = "🛡️ [preflight]"
+STARTUP_TEENSY_QUIET_DELAY_S = 10.0
 
 # Feature-status campaign preflight.
 #
@@ -4040,6 +4041,21 @@ COMMANDS = {
 # Entrypoint
 # ---------------------------------------------------------------------
 
+def startup_teensy_quiet_delay() -> None:
+    """
+    Let pubsub discover CLOCKS routes before boot pushes or campaign recovery.
+    """
+    logging.info(
+        "⏳ [clocks] waiting %.1fs for pubsub routing and Teensy initialization "
+        "before boot control-state push or campaign recovery",
+        STARTUP_TEENSY_QUIET_DELAY_S,
+    )
+    time.sleep(STARTUP_TEENSY_QUIET_DELAY_S)
+    logging.info(
+        "✅ [clocks] startup quiet delay complete — boot control-state push "
+        "and recovery may begin"
+    )
+
 
 def run() -> None:
     setup_logging()
@@ -4055,6 +4071,24 @@ def run() -> None:
         "SET_BASELINE, BASELINE_INFO, LIST_CAMPAIGNS, CLOCKS_INFO. "
         "Subscriptions: TIMEBASE_FRAGMENT, TIMEBASE_FORENSICS, WATCHDOG_ANOMALY."
     )
+
+    # Start command + pubsub servers first, but hold off on active work.
+    #
+    # Pubsub can now query CLOCKS.SUBSCRIPTIONS and build routing while CLOCKS
+    # avoids the dangerous post-flash behavior: boot DAC/DITHER pushes and
+    # active campaign recovery colliding with other startup traffic.
+    server_setup(
+        subsystem="CLOCKS",
+        commands=COMMANDS,
+        subscriptions={
+            "TIMEBASE_FRAGMENT": on_timebase_fragment,
+            "TIMEBASE_FORENSICS": on_timebase_forensics,
+            "WATCHDOG_ANOMALY": on_watchdog_anomaly,
+        },
+        blocking=False,
+    )
+
+    startup_teensy_quiet_delay()
 
     # Foist global OCXO control configuration onto Teensy at boot.
     # Dither is a system-level setting, not campaign state, so apply it
@@ -4127,18 +4161,6 @@ def run() -> None:
         daemon=True,
         name="clocks-processor",
     ).start()
-
-    # Start command + pubsub servers (non-blocking)
-    server_setup(
-        subsystem="CLOCKS",
-        commands=COMMANDS,
-        subscriptions={
-            "TIMEBASE_FRAGMENT": on_timebase_fragment,
-            "TIMEBASE_FORENSICS": on_timebase_forensics,
-            "WATCHDOG_ANOMALY": on_watchdog_anomaly,
-        },
-        blocking=False,
-    )
 
     # Recover or stop stray Teensy
     row = _get_active_campaign()

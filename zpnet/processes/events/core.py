@@ -66,6 +66,7 @@ from zpnet.shared.logger import setup_logging
 DESPOOL_BATCH_SIZE = 50          # records per HTTP POST
 DESPOOL_INTERVAL_S = 5.0         # polling interval when server is reachable
 DESPOOL_BACKOFF_S = 60.0         # polling interval when server is unreachable
+STARTUP_TEENSY_QUIET_DELAY_S = 10.0
 
 
 # ---------------------------------------------------------------------
@@ -355,6 +356,23 @@ def timebase_despooler_loop() -> None:
 
 
 # ---------------------------------------------------------------------
+# Startup quiet barrier
+# ---------------------------------------------------------------------
+
+def startup_teensy_quiet_delay() -> None:
+    """
+    Let pubsub discover this process' subscription surface before active work.
+    """
+    logging.info(
+        "⏳ [events] waiting %.1fs for pubsub routing and Teensy initialization "
+        "before active work",
+        STARTUP_TEENSY_QUIET_DELAY_S,
+    )
+    time.sleep(STARTUP_TEENSY_QUIET_DELAY_S)
+    logging.info("✅ [events] startup quiet delay complete — active work may begin")
+
+
+# ---------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------
 
@@ -369,32 +387,44 @@ def run() -> None:
     """
     setup_logging()
 
-    # --------------------------------------------------------------
-    # Start events despooler thread (independent fault barrier)
-    # --------------------------------------------------------------
-    threading.Thread(
-        target=events_despooler_loop,
-        daemon=True,
-        name="events-despooler",
-    ).start()
-
-    # --------------------------------------------------------------
-    # Start timebase despooler thread (independent fault barrier)
-    # --------------------------------------------------------------
-    threading.Thread(
-        target=timebase_despooler_loop,
-        daemon=True,
-        name="timebase-despooler",
-    ).start()
-
-    # --------------------------------------------------------------
-    # Start pub/sub server (blocks forever)
-    # --------------------------------------------------------------
     try:
+        # --------------------------------------------------------------
+        # Advertise command/subscription surface first.
+        #
+        # Pubsub needs these sockets alive so it can query SUBSCRIPTIONS and
+        # build routing, but active service work is intentionally delayed so
+        # cluster restart does not create a post-flash command storm.
+        # --------------------------------------------------------------
         server_setup(
             subsystem="EVENTS",
             subscriptions=SUBSCRIPTIONS,
+            blocking=False,
         )
+
+        startup_teensy_quiet_delay()
+
+        # --------------------------------------------------------------
+        # Start events despooler thread (independent fault barrier)
+        # --------------------------------------------------------------
+        threading.Thread(
+            target=events_despooler_loop,
+            daemon=True,
+            name="events-despooler",
+        ).start()
+
+        # --------------------------------------------------------------
+        # Start timebase despooler thread (independent fault barrier)
+        # --------------------------------------------------------------
+        threading.Thread(
+            target=timebase_despooler_loop,
+            daemon=True,
+            name="timebase-despooler",
+        ).start()
+
+        logging.info("🏁 [events] entering main loop")
+        while True:
+            time.sleep(3600)
+
     except Exception:
         logging.exception("💥 [events] unhandled exception in main thread")
 

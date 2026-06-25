@@ -71,6 +71,8 @@ GNSS_DEVICE = os.environ.get("ZPNET_GNSS_PORT", "/dev/zpnet-gnss-serial")
 GNSS_BAUD   = int(os.environ.get("ZPNET_GNSS_BAUD", "38400"))
 
 STREAM_SOCKET_PATH = "/tmp/zpnet-gnss-stream.sock"
+STARTUP_TEENSY_QUIET_DELAY_S = 10.0
+
 
 # ------------------------------------------------------------------
 # Logging
@@ -1392,6 +1394,23 @@ COMMANDS = {
 }
 
 # ------------------------------------------------------------------
+# Startup quiet barrier
+# ------------------------------------------------------------------
+
+def startup_teensy_quiet_delay() -> None:
+    """
+    Let pubsub discover this process' command/subscription surface first.
+    """
+    logging.info(
+        "⏳ [gnss] waiting %.1fs for pubsub routing and Teensy initialization "
+        "before active work",
+        STARTUP_TEENSY_QUIET_DELAY_S,
+    )
+    time.sleep(STARTUP_TEENSY_QUIET_DELAY_S)
+    logging.info("✅ [gnss] startup quiet delay complete — active work may begin")
+
+
+# ------------------------------------------------------------------
 # Entrypoint
 # ------------------------------------------------------------------
 
@@ -1399,11 +1418,20 @@ def run() -> None:
     setup_logging()
     open_gnss_log()
     try:
+        server_setup(subsystem="GNSS", commands=COMMANDS, blocking=False)
+
+        startup_teensy_quiet_delay()
+
         threading.Thread(target=gnss_reader, daemon=True).start()
         threading.Thread(target=stream_server, daemon=True).start()
-        server_setup(subsystem="GNSS", commands=COMMANDS)
+
+        logging.info("🏁 [gnss] entering main loop")
+        while True:
+            time.sleep(3600)
+
     except Exception:
         logging.exception("💥 [gnss] unhandled exception in main thread")
+
 
 if __name__ == "__main__":
     run()

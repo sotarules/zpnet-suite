@@ -62,6 +62,7 @@ from zpnet.shared.util import (
 
 POLL_INTERVAL_SEC = 30
 FEATURE_STATUS_PUBLISH_INTERVAL_SEC = 10
+STARTUP_TEENSY_QUIET_DELAY_S = 10.0
 
 # ------------------------------------------------------------------
 # Raspberry Pi status configuration
@@ -1699,6 +1700,23 @@ COMMANDS = {
 }
 
 # ---------------------------------------------------------------------
+# Startup quiet barrier
+# ---------------------------------------------------------------------
+
+def startup_teensy_quiet_delay() -> None:
+    """
+    Let pubsub discover this process before SYSTEM begins polling the cluster.
+    """
+    logging.info(
+        "⏳ [system] waiting %.1fs for pubsub routing and Teensy initialization "
+        "before active polling",
+        STARTUP_TEENSY_QUIET_DELAY_S,
+    )
+    time.sleep(STARTUP_TEENSY_QUIET_DELAY_S)
+    logging.info("✅ [system] startup quiet delay complete — polling may begin")
+
+
+# ---------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------
 
@@ -1706,6 +1724,17 @@ def run() -> None:
     setup_logging()
 
     try:
+        server_setup(
+            subsystem="SYSTEM",
+            commands=COMMANDS,
+            subscriptions={
+                "FEATURE_STATUS_FRAGMENT": on_feature_status_fragment,
+            },
+            blocking=False,
+        )
+
+        startup_teensy_quiet_delay()
+
         threading.Thread(
             target=system_poller,
             daemon=True,
@@ -1716,13 +1745,9 @@ def run() -> None:
             daemon=True,
         ).start()
 
-        server_setup(
-            subsystem="SYSTEM",
-            commands=COMMANDS,
-            subscriptions={
-                "FEATURE_STATUS_FRAGMENT": on_feature_status_fragment,
-            },
-        )
+        logging.info("🏁 [system] entering main loop")
+        while True:
+            time.sleep(3600)
 
     except Exception:
         logging.exception("💥 [system] unhandled exception in main thread")
