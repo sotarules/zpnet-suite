@@ -93,6 +93,7 @@ static volatile bool g_system_feature_fragment_dirty = false;
 static volatile bool g_system_feature_fragment_service_armed = false;
 static uint32_t g_system_feature_fragment_publish_count = 0;
 static uint32_t g_system_feature_fragment_service_arm_count = 0;
+static uint32_t g_system_feature_fragment_service_dispatch_count = 0;
 static uint32_t g_system_feature_fragment_service_arm_failures = 0;
 
 // ================================================================
@@ -162,6 +163,7 @@ static void system_feature_fragment_publish_service(timepop_ctx_t*,
                                                     timepop_diag_t*,
                                                     void*) {
   g_system_feature_fragment_service_armed = false;
+  g_system_feature_fragment_service_dispatch_count++;
 
   if (!g_system_feature_fragment_publish_enabled ||
       !g_system_feature_fragment_dirty) {
@@ -483,7 +485,21 @@ static Payload cmd_report(const Payload& /*args*/) {
   p.add("feature_status_fragment_dirty", (bool)g_system_feature_fragment_dirty);
   p.add("feature_status_fragment_service_armed", (bool)g_system_feature_fragment_service_armed);
   p.add("feature_status_fragment_service_arm_count", g_system_feature_fragment_service_arm_count);
+  p.add("feature_status_fragment_service_dispatch_count", g_system_feature_fragment_service_dispatch_count);
   p.add("feature_status_fragment_service_arm_failures", g_system_feature_fragment_service_arm_failures);
+
+  publish_info_t pub{};
+  publish_get_info(&pub);
+  p.add("publish_calls", pub.publish_calls);
+  p.add("publish_invalid_topic", pub.publish_invalid_topic);
+  p.add("publish_unsafe_context_drop", pub.publish_unsafe_context_drop);
+  p.add("publish_reentrant_drop", pub.publish_reentrant_drop);
+  p.add("publish_depth_high_water", pub.publish_depth_high_water);
+  p.add("publish_active", pub.publish_active);
+  p.add("publish_local_dispatch", pub.publish_local_dispatch);
+  p.add("publish_forward_attempt", pub.publish_forward_attempt);
+  p.add("publish_envelope_build", pub.publish_envelope_build);
+  p.add("publish_transport_send", pub.publish_transport_send);
 
   // Legacy accounted callback-busy diagnostics.
   p.add("cpu_accounted_busy_pct", cpu_usage_get_percent());

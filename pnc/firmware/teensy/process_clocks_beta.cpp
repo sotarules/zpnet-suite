@@ -3600,9 +3600,25 @@ static FLASHMEM void payload_add_dac_tick_lane(Payload& parent,
   parent.add_object(key, lane);
 }
 
-static FLASHMEM void publish_dac_tick(const char* phase) {
+static volatile bool     g_clocks_dac_tick_dirty = false;
+static volatile bool     g_clocks_dac_tick_service_armed = false;
+static uint32_t          g_clocks_dac_tick_service_arm_count = 0;
+static uint32_t          g_clocks_dac_tick_service_dispatch_count = 0;
+static uint32_t          g_clocks_dac_tick_service_arm_failures = 0;
+static uint32_t          g_clocks_dac_tick_coalesce_count = 0;
+static uint32_t          g_clocks_dac_tick_publish_count = 0;
+static char              g_clocks_dac_tick_phase[32] = {0};
+
+static void schedule_dac_tick_publish(const char* phase);
+
+static FLASHMEM void publish_dac_tick_now(const char* phase) {
   Payload p;
   p.add("schema", "CLOCKS_DAC_TICK_V2");
+  p.add("context", "ALAP");
+  p.add("publish_count", g_clocks_dac_tick_publish_count + 1U);
+  p.add("service_arm_count", g_clocks_dac_tick_service_arm_count);
+  p.add("service_dispatch_count", g_clocks_dac_tick_service_dispatch_count);
+  p.add("coalesce_count", g_clocks_dac_tick_coalesce_count);
   p.add("c", campaign_name);
   p.add("state",
         campaign_state == clocks_campaign_state_t::STARTED ? "STARTED" : "STOPPED");
@@ -3625,6 +3641,56 @@ static FLASHMEM void publish_dac_tick(const char* phase) {
   payload_add_dac_tick_lane(p, "ocxo2", ocxo2_dac, g_servo_input_ocxo2);
 
   publish("CLOCKS_DAC_TICK", p);
+  g_clocks_dac_tick_publish_count++;
+}
+
+static void dac_tick_publish_service(timepop_ctx_t*,
+                                     timepop_diag_t*,
+                                     void*) {
+  g_clocks_dac_tick_service_armed = false;
+  g_clocks_dac_tick_service_dispatch_count++;
+
+  if (!g_clocks_dac_tick_dirty) {
+    return;
+  }
+
+  char phase[sizeof(g_clocks_dac_tick_phase)];
+  safeCopy(phase, sizeof(phase), g_clocks_dac_tick_phase);
+  g_clocks_dac_tick_dirty = false;
+
+  publish_dac_tick_now(phase);
+
+  if (g_clocks_dac_tick_dirty) {
+    schedule_dac_tick_publish(g_clocks_dac_tick_phase);
+  }
+}
+
+static void schedule_dac_tick_publish(const char* phase) {
+  safeCopy(g_clocks_dac_tick_phase,
+           sizeof(g_clocks_dac_tick_phase),
+           phase ? phase : "");
+
+  if (g_clocks_dac_tick_dirty) {
+    g_clocks_dac_tick_coalesce_count++;
+  }
+  g_clocks_dac_tick_dirty = true;
+
+  if (g_clocks_dac_tick_service_armed) {
+    return;
+  }
+
+  const timepop_handle_t handle =
+      timepop_arm_alap(dac_tick_publish_service,
+                       nullptr,
+                       "CLOCKS_DAC_TICK");
+
+  if (handle == TIMEPOP_INVALID_HANDLE) {
+    g_clocks_dac_tick_service_arm_failures++;
+    return;
+  }
+
+  g_clocks_dac_tick_service_armed = true;
+  g_clocks_dac_tick_service_arm_count++;
 }
 
 // ============================================================================
@@ -3650,7 +3716,7 @@ void clocks_beta_pps(void) {
     if (was_started) {
       timebase_invalidate();
     }
-    publish_dac_tick("STOP_GATE");
+    schedule_dac_tick_publish("STOP_GATE");
     return;
   }
 
@@ -3658,7 +3724,7 @@ void clocks_beta_pps(void) {
     g_timebase_start_zero_gate_count++;
     timebase_build_stage(TIMEBASE_BUILD_STAGE_START_ZERO_GATE);
     (void)clocks_try_finish_pending_smartzero();
-    publish_dac_tick("START_ZERO_GATE");
+    schedule_dac_tick_publish("START_ZERO_GATE");
     return;
   }
 
@@ -3688,20 +3754,20 @@ void clocks_beta_pps(void) {
     request_recover = false;
     campaign_state = clocks_campaign_state_t::STARTED;
     campaign_warmup_begin(campaign_warmup_mode_t::RECOVER);
-    publish_dac_tick("RECOVER_GATE");
+    schedule_dac_tick_publish("RECOVER_GATE");
     return;
   }
 
   if (watchdog_anomaly_active) {
     g_timebase_watchdog_gate_count++;
     timebase_build_stage(TIMEBASE_BUILD_STAGE_WATCHDOG_GATE);
-    publish_dac_tick("WATCHDOG_GATE");
+    schedule_dac_tick_publish("WATCHDOG_GATE");
     return;
   }
   if (campaign_state != clocks_campaign_state_t::STARTED) {
     g_timebase_not_started_gate_count++;
     timebase_build_stage(TIMEBASE_BUILD_STAGE_NOT_STARTED_GATE);
-    publish_dac_tick("NOT_STARTED_GATE");
+    schedule_dac_tick_publish("NOT_STARTED_GATE");
     return;
   }
 
@@ -3714,7 +3780,7 @@ void clocks_beta_pps(void) {
   if (campaign_warmup_consume_one_candidate_record()) {
     g_timebase_warmup_suppressed_count++;
     timebase_build_stage(TIMEBASE_BUILD_STAGE_WARMUP_GATE);
-    publish_dac_tick("WARMUP_GATE");
+    schedule_dac_tick_publish("WARMUP_GATE");
     return;
   }
 
@@ -3913,7 +3979,7 @@ void clocks_beta_pps(void) {
   welford_update(welford_ocxo2_dac, ocxo2_dac.dac_fractional);
   timebase_build_stage(TIMEBASE_BUILD_STAGE_DAC_WELFORD);
 
-  publish_dac_tick("STARTED");
+  schedule_dac_tick_publish("STARTED");
 
   // ── Build TIMEBASE_FRAGMENT ──
   g_timebase_build_begin_count++;
