@@ -98,6 +98,12 @@ ADHOC_QUEUE_SIZE = 2
 ADHOC_SEND_TIMEOUT_S = 2.0
 ADHOC_RECV_TIMEOUT_S = 1.0
 
+# Teensy route-table custody monitor.
+#
+# If Teensy reboots, its in-firmware PUBSUB route table is empty even though
+# the Pi-side union remains valid.  Reapply the cached union when that happens.
+TEENSY_ROUTE_MONITOR_INTERVAL_S = 30.0
+
 # ---------------------------------------------------------------------
 # Global state
 # ---------------------------------------------------------------------
@@ -174,6 +180,24 @@ server_conn: Optional[socket.socket] = None
 server_conn_lock = threading.Lock()
 server_subscriptions: List[Dict[str, Any]] = []
 server_pending_commands: Dict[int, Queue] = {}
+
+# ---------------------------------------------------------------------
+# Teensy route-table custody monitor state
+# ---------------------------------------------------------------------
+
+teensy_route_monitor_probe_count = 0
+teensy_route_monitor_probe_fail_count = 0
+teensy_route_monitor_report_ok_count = 0
+teensy_route_monitor_empty_count = 0
+teensy_route_monitor_reapply_count = 0
+teensy_route_monitor_reapply_fail_count = 0
+teensy_route_monitor_last_route_count: Optional[int] = None
+teensy_route_monitor_last_probe_ts: Optional[float] = None
+teensy_route_monitor_last_empty_ts: Optional[float] = None
+teensy_route_monitor_last_reapply_ts: Optional[float] = None
+teensy_route_monitor_last_reapply_topic_count = 0
+teensy_route_monitor_last_reapply_subscription_count = 0
+teensy_route_monitor_last_status = "INIT"
 
 # ---------------------------------------------------------------------
 # Ad-hoc diagnostic tap state
@@ -1256,6 +1280,8 @@ def cmd_diagnostics(_: Optional[dict]) -> Dict[str, Any]:
         server_cmd_pending = len(server_pending_commands)
         adhoc_client_count = len(adhoc_clients)
         adhoc_topic_count = len(adhoc_by_topic)
+        applied_subscription_count = len(applied_union.get("subscriptions", []))
+        applied_topic_count = len(routes_by_topic)
         adhoc_routes = [
             {
                 "client_id": client.client_id,
@@ -1265,6 +1291,22 @@ def cmd_diagnostics(_: Optional[dict]) -> Dict[str, Any]:
             }
             for client in adhoc_clients.values()
         ]
+        route_monitor = {
+            "interval_s": TEENSY_ROUTE_MONITOR_INTERVAL_S,
+            "probe_count": teensy_route_monitor_probe_count,
+            "probe_fail_count": teensy_route_monitor_probe_fail_count,
+            "report_ok_count": teensy_route_monitor_report_ok_count,
+            "empty_count": teensy_route_monitor_empty_count,
+            "reapply_count": teensy_route_monitor_reapply_count,
+            "reapply_fail_count": teensy_route_monitor_reapply_fail_count,
+            "last_route_count": teensy_route_monitor_last_route_count,
+            "last_probe_ts": teensy_route_monitor_last_probe_ts,
+            "last_empty_ts": teensy_route_monitor_last_empty_ts,
+            "last_reapply_ts": teensy_route_monitor_last_reapply_ts,
+            "last_reapply_topic_count": teensy_route_monitor_last_reapply_topic_count,
+            "last_reapply_subscription_count": teensy_route_monitor_last_reapply_subscription_count,
+            "last_status": teensy_route_monitor_last_status,
+        }
 
     with server_conn_lock:
         server_connected = server_conn is not None
@@ -1277,6 +1319,8 @@ def cmd_diagnostics(_: Optional[dict]) -> Dict[str, Any]:
             "pending_req_ids": pending_ids[:50],  # cap for sanity
             "req_id_current": next(req_id_counter),
             "routes_topic_count": len(routes_by_topic),
+            "applied_topic_count": applied_topic_count,
+            "applied_subscription_count": applied_subscription_count,
             "active_threads": threading.active_count(),
             "server_connected": server_connected,
             "server_subscription_count": len(server_subscriptions),
@@ -1289,6 +1333,7 @@ def cmd_diagnostics(_: Optional[dict]) -> Dict[str, Any]:
             "adhoc_publish_enqueue_count": adhoc_publish_enqueue_count,
             "adhoc_publish_drop_count": adhoc_publish_drop_count,
             "adhoc_routes": adhoc_routes,
+            "teensy_route_monitor": route_monitor,
         },
     }
 
@@ -1516,6 +1561,136 @@ def cmd_refresh(_: Optional[dict]) -> Dict[str, Any]:
         "payload": union_payload,
     }
 
+
+# ---------------------------------------------------------------------
+# Teensy route-table custody monitor
+# ---------------------------------------------------------------------
+
+def _copy_applied_union_for_teensy_route_reapply() -> Dict[str, Any]:
+    """
+    Return a stable copy of the last locally committed subscription union.
+
+    Do not rediscover subscriptions here.  If Teensy rebooted, the Pi-side
+    process sockets and the last committed union remain the authority we want
+    to foist back onto the fresh Teensy runtime.
+    """
+    with state_lock:
+        return json.loads(json.dumps(applied_union))
+
+
+def _teensy_route_report() -> Optional[Dict[str, Any]]:
+    """
+    Ask Teensy PUBSUB for its current route table.
+
+    Returns the response payload on success, or None when Teensy is not
+    reachable / not ready.  Failures are intentionally quiet because this
+    thread is a background custody probe.
+    """
+    resp = _server_command_to_teensy("PUBSUB", "REPORT", None)
+    if not resp.get("success"):
+        return None
+    payload = resp.get("payload")
+    return payload if isinstance(payload, dict) else {}
+
+
+def _teensy_route_count(payload: Dict[str, Any]) -> int:
+    routes = payload.get("routes")
+    return len(routes) if isinstance(routes, list) else 0
+
+
+def _teensy_route_reapply_cached_union(union_payload: Dict[str, Any]) -> bool:
+    """
+    Reapply the cached Pi-side union to Teensy with SETSUBSCRIPTIONS.
+    """
+    resp = _server_command_to_teensy("PUBSUB", "SETSUBSCRIPTIONS", union_payload)
+    return bool(resp.get("success"))
+
+
+def teensy_route_monitor_loop() -> None:
+    """
+    Periodically verify that Teensy's PUBSUB route table still exists.
+
+    The monitor is specifically for Teensy reboot recovery.  A reboot clears
+    process_pubsub's in-firmware routing state, while the Pi-side PUBSUB process
+    still has the authoritative last committed union in applied_union.  When
+    Teensy reports an empty route table and the Pi has a non-empty cached union,
+    foist that cached union back onto Teensy without repolling every service.
+    """
+    global teensy_route_monitor_probe_count
+    global teensy_route_monitor_probe_fail_count
+    global teensy_route_monitor_report_ok_count
+    global teensy_route_monitor_empty_count
+    global teensy_route_monitor_reapply_count
+    global teensy_route_monitor_reapply_fail_count
+    global teensy_route_monitor_last_route_count
+    global teensy_route_monitor_last_probe_ts
+    global teensy_route_monitor_last_empty_ts
+    global teensy_route_monitor_last_reapply_ts
+    global teensy_route_monitor_last_reapply_topic_count
+    global teensy_route_monitor_last_reapply_subscription_count
+    global teensy_route_monitor_last_status
+
+    logging.info(
+        "🧭 [pubsub] Teensy route monitor armed (interval=%.1fs)",
+        TEENSY_ROUTE_MONITOR_INTERVAL_S,
+    )
+
+    while True:
+        time.sleep(TEENSY_ROUTE_MONITOR_INTERVAL_S)
+
+        teensy_route_monitor_probe_count += 1
+        teensy_route_monitor_last_probe_ts = time.time()
+
+        payload = _teensy_route_report()
+        if payload is None:
+            teensy_route_monitor_probe_fail_count += 1
+            teensy_route_monitor_last_status = "TEENSY_UNREACHABLE"
+            continue
+
+        teensy_route_monitor_report_ok_count += 1
+        route_count = _teensy_route_count(payload)
+        teensy_route_monitor_last_route_count = route_count
+
+        if route_count != 0:
+            teensy_route_monitor_last_status = "NOMINAL"
+            continue
+
+        union_payload = _copy_applied_union_for_teensy_route_reapply()
+        subscriptions = union_payload.get("subscriptions")
+        if not isinstance(subscriptions, list) or len(subscriptions) == 0:
+            teensy_route_monitor_last_status = "EMPTY_NO_CACHED_UNION"
+            continue
+
+        topic_names = set()
+        for row in subscriptions:
+            if not isinstance(row, dict):
+                continue
+            for sub in row.get("subscriptions", []):
+                if isinstance(sub, dict) and sub.get("name"):
+                    topic_names.add(str(sub.get("name")))
+
+        teensy_route_monitor_empty_count += 1
+        teensy_route_monitor_last_empty_ts = time.time()
+
+        logging.info(
+            "🔄 [pubsub] Teensy route table empty; reapplying cached union "
+            "(%d subscriptions, %d topics)",
+            len(subscriptions),
+            len(topic_names),
+        )
+
+        if _teensy_route_reapply_cached_union(union_payload):
+            teensy_route_monitor_reapply_count += 1
+            teensy_route_monitor_last_reapply_ts = time.time()
+            teensy_route_monitor_last_reapply_topic_count = len(topic_names)
+            teensy_route_monitor_last_reapply_subscription_count = len(subscriptions)
+            teensy_route_monitor_last_status = "REAPPLIED_CACHED_UNION"
+            logging.info("✅ [pubsub] Teensy route table restored from cached union")
+        else:
+            teensy_route_monitor_reapply_fail_count += 1
+            teensy_route_monitor_last_status = "REAPPLY_FAILED"
+
+
 # ---------------------------------------------------------------------
 # Declarations
 # ---------------------------------------------------------------------
@@ -1631,6 +1806,15 @@ def run() -> None:
         target=_delayed_refresh,
         daemon=True,
         name="pubsub-auto-refresh",
+    ).start()
+
+    # Teensy route-table custody monitor.  If Teensy reboots and loses its
+    # in-firmware PUBSUB routes, reapply the cached Pi-side union without
+    # repolling every service.
+    threading.Thread(
+        target=teensy_route_monitor_loop,
+        daemon=True,
+        name="teensy-route-monitor",
     ).start()
 
     # Process lifetime (never returns)

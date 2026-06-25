@@ -175,7 +175,10 @@ TIMEBASE_PAIR_TIMEOUT_S = 5.0
 
 PREFLIGHT_POLL_INTERVAL_S = 30
 PREFLIGHT_LOG_PREFIX = "🛡️ [preflight]"
-STARTUP_TEENSY_QUIET_DELAY_S = 10.0
+STARTUP_TEENSY_QUIET_DELAY_S = 20.0
+TIMEBASE_SILENCE_TIMEOUT_S = 30.0
+TIMEBASE_SILENCE_MONITOR_POLL_S = 1.0
+TEENSY_HEALTH_RETRY_S = 60.0
 
 # Feature-status campaign preflight.
 #
@@ -323,6 +326,17 @@ _diag: Dict[str, Any] = {
     "watchdog_anomaly_recovery_started": 0,
     "watchdog_anomaly_event_enqueue_failures": 0,
     "last_watchdog_anomaly": {},
+
+    # TIMEBASE silence / Teensy restart detection
+    "timebase_silence_monitor_started": False,
+    "timebase_silence_checks": 0,
+    "timebase_silence_detected": 0,
+    "timebase_silence_recovery_started": 0,
+    "teensy_health_probe_attempts": 0,
+    "teensy_health_probe_failures": 0,
+    "teensy_health_probe_success": 0,
+    "last_timebase_activity": {},
+    "last_timebase_silence": {},
 }
 
 # ---------------------------------------------------------------------
@@ -439,6 +453,16 @@ _last_pps_vclock_count_seen: Optional[int] = None
 # This is observational only; it is never used to reject a fragment.
 _accepted_pps_vclock_count: Optional[int] = None
 
+# TIMEBASE silence monitor.  This is intentionally process-local: if a
+# campaign is active and the Teensy stops publishing both TIMEBASE_FRAGMENT
+# and TIMEBASE_FORENSICS, CLOCKS treats the silence as a recoverable Teensy
+# lifecycle event once communication returns.
+_timebase_last_activity_monotonic: Optional[float] = None
+_timebase_last_activity_utc: Optional[str] = None
+_timebase_last_activity_topic: Optional[str] = None
+_timebase_last_activity_pps_vclock_count: Optional[int] = None
+_timebase_silence_recovery_active: bool = False
+
 # Asynchronous START observation.  START no longer blocks waiting for the
 # first TIMEBASE_FRAGMENT; this records the pending first-fragment wait so
 # reports can show whether the Teensy has begun publishing.
@@ -461,6 +485,226 @@ _sync_fragment: Optional[Dict[str, Any]] = None
 # ---------------------------------------------------------------------
 
 _auto_recovery_in_progress: bool = False
+
+
+def _note_timebase_activity(topic: str, pps_vclock_count: int) -> None:
+    """
+    Record that a Teensy TIMEBASE publication half was received.
+
+    The silence monitor uses this as the campaign heartbeat.  Either half of
+    the exact pair is enough to prove that the Teensy/pubsub data plane is not
+    silent; exact-pair integrity remains the processor thread's job.
+    """
+    global _timebase_last_activity_monotonic
+    global _timebase_last_activity_utc
+    global _timebase_last_activity_topic
+    global _timebase_last_activity_pps_vclock_count
+
+    now_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    _timebase_last_activity_monotonic = time.monotonic()
+    _timebase_last_activity_utc = now_utc
+    _timebase_last_activity_topic = topic
+    _timebase_last_activity_pps_vclock_count = int(pps_vclock_count)
+    _diag["last_timebase_activity"] = {
+        "ts_utc": now_utc,
+        "topic": topic,
+        "teensy_pps_vclock_count": int(pps_vclock_count),
+        "pps_count": int(pps_vclock_count),
+    }
+
+
+def _arm_timebase_silence_watch(context: str) -> None:
+    """
+    Start or restart the silence timer when CLOCKS begins expecting TIMEBASE.
+
+    This covers the interval before the first post-START/post-RECOVER fragment.
+    Actual TIMEBASE publications replace this synthetic watch-arm marker through
+    _note_timebase_activity().
+    """
+    global _timebase_last_activity_monotonic
+    global _timebase_last_activity_utc
+    global _timebase_last_activity_topic
+    global _timebase_last_activity_pps_vclock_count
+
+    now_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    count = _accepted_pps_vclock_count
+    _timebase_last_activity_monotonic = time.monotonic()
+    _timebase_last_activity_utc = now_utc
+    _timebase_last_activity_topic = f"{context}_WATCH_ARMED"
+    _timebase_last_activity_pps_vclock_count = count
+    _diag["last_timebase_activity"] = {
+        "ts_utc": now_utc,
+        "topic": _timebase_last_activity_topic,
+        "teensy_pps_vclock_count": count,
+        "pps_count": count,
+        "synthetic_watch_arm": True,
+    }
+
+
+def _teensy_clocks_health_ok() -> bool:
+    """
+    True when the Teensy CLOCKS command path responds to REPORT.
+
+    Failed probes are deliberately silent in the log.  During a real Teensy
+    reboot or USB/RawHID loss, this loop may run for minutes; the operator only
+    needs the initial silence detection and the eventual recovery transition.
+    """
+    _diag["teensy_health_probe_attempts"] += 1
+    try:
+        resp = send_command(
+            machine="TEENSY",
+            subsystem="CLOCKS",
+            command="REPORT",
+            retries=1,
+            retry_delay_s=0.0,
+        )
+        if resp.get("success"):
+            _diag["teensy_health_probe_success"] += 1
+            return True
+    except Exception:
+        pass
+
+    _diag["teensy_health_probe_failures"] += 1
+    return False
+
+
+def _timebase_silence_recovery(reason: str, details: Dict[str, Any]) -> None:
+    """
+    Wait quietly for Teensy communication to return, then invoke campaign recovery.
+
+    This extends boot-time campaign recovery to the live-Pi / rebooted-Teensy
+    case.  The database active-campaign row remains the durable intent; the
+    process-local campaign gate is lowered so stale or partial TIMEBASE pieces
+    cannot be persisted while the Teensy is being recovered.
+    """
+    global _campaign_active, _auto_recovery_in_progress
+    global _timebase_silence_recovery_active
+
+    try:
+        while True:
+            if _teensy_clocks_health_ok():
+                logging.info(
+                    "✅ [clocks] @%s Teensy CLOCKS REPORT responded after TIMEBASE silence — "
+                    "invoking campaign recovery",
+                    system_time_z(),
+                )
+                _diag["timebase_silence_recovery_started"] += 1
+                try:
+                    _recover_campaign()
+                    logging.info(
+                        "✅ [clocks] @%s TIMEBASE silence recovery complete",
+                        system_time_z(),
+                    )
+                    return
+                except Exception:
+                    _diag["auto_recovery_failures"] = _diag.get("auto_recovery_failures", 0) + 1
+                    logging.exception(
+                        "💥 [clocks] TIMEBASE silence recovery failed — "
+                        "will retry after %.0fs",
+                        TEENSY_HEALTH_RETRY_S,
+                    )
+                    time.sleep(TEENSY_HEALTH_RETRY_S)
+                    continue
+
+            time.sleep(TEENSY_HEALTH_RETRY_S)
+    finally:
+        _timebase_silence_recovery_active = False
+        _auto_recovery_in_progress = False
+
+
+def _begin_timebase_silence_recovery(age_s: float) -> bool:
+    """
+    Start the live-Teensy-reboot recovery path if no other recovery is active.
+    """
+    global _campaign_active, _auto_recovery_in_progress
+    global _timebase_silence_recovery_active
+
+    if _auto_recovery_in_progress or _timebase_silence_recovery_active:
+        return False
+
+    now_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    details = {
+        "age_s": round(float(age_s), 3),
+        "timeout_s": float(TIMEBASE_SILENCE_TIMEOUT_S),
+        "last_timebase_activity_utc": _timebase_last_activity_utc,
+        "last_timebase_activity_topic": _timebase_last_activity_topic,
+        "last_timebase_activity_pps_vclock_count": _timebase_last_activity_pps_vclock_count,
+        "last_accepted_pps_vclock_count": _accepted_pps_vclock_count,
+    }
+
+    _diag["hard_faults_total"] = _diag.get("hard_faults_total", 0) + 1
+    _diag["timebase_silence_detected"] += 1
+    _diag["last_hard_fault"] = {
+        "ts_utc": now_utc,
+        "reason": "timebase_silence",
+        "source": "TIMEBASE_SILENCE_MONITOR",
+        "details": details,
+    }
+    _diag["last_timebase_silence"] = {
+        "ts_utc": now_utc,
+        **details,
+    }
+
+    logging.error(
+        "💥 [clocks] TIMEBASE silence detected during active campaign "
+        "(age=%.3fs timeout=%.3fs, last_topic=%s, last_pps_vclock_count=%s) — "
+        "waiting for Teensy health check before recovery",
+        float(age_s),
+        float(TIMEBASE_SILENCE_TIMEOUT_S),
+        _timebase_last_activity_topic,
+        str(_timebase_last_activity_pps_vclock_count),
+    )
+
+    _campaign_active = False
+    _auto_recovery_in_progress = True
+    _timebase_silence_recovery_active = True
+
+    t = threading.Thread(
+        target=_timebase_silence_recovery,
+        args=("timebase_silence", details),
+        name="clocks-timebase-silence-recover",
+        daemon=True,
+    )
+    t.start()
+    return True
+
+
+def _timebase_silence_monitor_loop() -> None:
+    """
+    Detect a live Teensy reboot/loss by absence of TIMEBASE publications.
+
+    The monitor is intentionally quiet unless it detects the first silence
+    threshold crossing.  Health-check failures after that point are silent and
+    retried once per TEENSY_HEALTH_RETRY_S.
+    """
+    _diag["timebase_silence_monitor_started"] = True
+    logging.info(
+        "🚀 [clocks] TIMEBASE silence monitor started "
+        "(timeout=%.1fs, health_retry=%.1fs)",
+        TIMEBASE_SILENCE_TIMEOUT_S,
+        TEENSY_HEALTH_RETRY_S,
+    )
+
+    while True:
+        time.sleep(TIMEBASE_SILENCE_MONITOR_POLL_S)
+        _diag["timebase_silence_checks"] += 1
+
+        if not _campaign_active:
+            continue
+        if _auto_recovery_in_progress or _timebase_silence_recovery_active:
+            continue
+        if _sync_expected_pps_vclock is not None:
+            continue
+        if _timebase_last_activity_monotonic is None:
+            # Avoid treating initial async START or cold boot warmup as a
+            # reboot.  This monitor is for loss after the TIMEBASE stream has
+            # once been observed.
+            continue
+
+        age_s = time.monotonic() - _timebase_last_activity_monotonic
+        if age_s >= TIMEBASE_SILENCE_TIMEOUT_S:
+            _begin_timebase_silence_recovery(age_s)
+
 
 def _begin_auto_recovery(reason: str, details: Dict[str, Any], *, source: str) -> bool:
     """
@@ -1979,6 +2223,7 @@ def on_timebase_fragment(payload: Payload) -> None:
         return
 
     _normalize_fragment_count_aliases(frag, pps_vclock_count)
+    _note_timebase_activity(TIMEBASE_FRAGMENT_TOPIC, pps_vclock_count)
 
     # Sync waits are satisfied only by the processor thread after the exact
     # TIMEBASE_FRAGMENT/TIMEBASE_FORENSICS pair is complete.
@@ -2010,6 +2255,7 @@ def on_timebase_forensics(payload: Payload) -> None:
         return
 
     _normalize_fragment_count_aliases(forensic, pps_vclock_count)
+    _note_timebase_activity(TIMEBASE_FORENSICS_TOPIC, pps_vclock_count)
     _enqueue_timebase_piece(TIMEBASE_FORENSICS_TOPIC, forensic)
     _diag["forensics_queued"] += 1
 
@@ -2271,7 +2517,17 @@ def _process_loop() -> None:
 
 def _reset_trackers() -> None:
     global _last_pps_vclock_count_seen
+    global _timebase_last_activity_monotonic
+    global _timebase_last_activity_utc
+    global _timebase_last_activity_topic
+    global _timebase_last_activity_pps_vclock_count
+
     _last_pps_vclock_count_seen = None
+    _timebase_last_activity_monotonic = None
+    _timebase_last_activity_utc = None
+    _timebase_last_activity_topic = None
+    _timebase_last_activity_pps_vclock_count = None
+    _diag["last_timebase_activity"] = {}
     _gnss_canary_reset()
     _gnss_raw_reset()
     _drain_timebase_ingress_and_pending()
@@ -2448,6 +2704,7 @@ def cmd_start(args: Optional[dict]) -> dict:
     # Mark the campaign active before the Teensy START command returns so the
     # processor thread cannot discard an early fragment as "no campaign".
     _campaign_active = True
+    _arm_timebase_silence_watch("START")
 
     # Arm TEENSY
     logging.info(
@@ -2857,6 +3114,7 @@ def _recover_campaign() -> None:
         # The normal processor thread will accept the first complete
         # TIMEBASE_FRAGMENT/TIMEBASE_FORENSICS pair whenever it arrives.
         _campaign_active = True
+        _arm_timebase_silence_watch("RECOVERY_COLD_START")
 
         logging.info(
             "📡 [recovery/cold] @%s arming TEENSY START asynchronously: "
@@ -3202,6 +3460,7 @@ def _recover_campaign() -> None:
     )
 
     _campaign_active = True
+    _arm_timebase_silence_watch("RECOVERY_RESUME")
 
     logging.info(
         "✅ [recovery] @%s campaign '%s' recovered — TIMEBASE resumes\n"
@@ -3730,6 +3989,15 @@ def cmd_clocks_info(_: Optional[dict]) -> Dict[str, Any]:
             "profile": FEATURE_PREFLIGHT_PROFILE,
             "required_features": list(FEATURE_PREFLIGHT_REQUIRED),
         },
+        "timebase_silence_monitor": {
+            "timeout_s": TIMEBASE_SILENCE_TIMEOUT_S,
+            "poll_s": TIMEBASE_SILENCE_MONITOR_POLL_S,
+            "health_retry_s": TEENSY_HEALTH_RETRY_S,
+            "last_activity_utc": _timebase_last_activity_utc,
+            "last_activity_topic": _timebase_last_activity_topic,
+            "last_activity_pps_vclock_count": _timebase_last_activity_pps_vclock_count,
+            "recovery_active": _timebase_silence_recovery_active,
+        },
         "diag": _diag,
     }
     return {"success": True, "message": "OK", "payload": payload}
@@ -4160,6 +4428,13 @@ def run() -> None:
         target=_process_loop,
         daemon=True,
         name="clocks-processor",
+    ).start()
+
+    # Start live Teensy reboot / TIMEBASE silence monitor.
+    threading.Thread(
+        target=_timebase_silence_monitor_loop,
+        daemon=True,
+        name="clocks-timebase-silence-monitor",
     ).start()
 
     # Recover or stop stray Teensy
