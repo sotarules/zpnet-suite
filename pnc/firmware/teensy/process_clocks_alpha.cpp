@@ -4522,7 +4522,10 @@ static volatile bool     g_alpha_smartzero_install_last_success = false;
 static volatile bool     g_alpha_smartzero_install_last_atomic = false;
 static char              g_alpha_smartzero_install_last_reason[32] = {0};
 
+static volatile uint32_t g_alpha_recover_reprime_count = 0;
+
 static FLASHMEM void clocks_alpha_ocram_reset(void) {
+  g_alpha_recover_reprime_count = 0;
   g_pps_witness_diag = interrupt_capture_diag_t{};
   g_ocxo1_interrupt_diag = interrupt_capture_diag_t{};
   g_ocxo2_interrupt_diag = interrupt_capture_diag_t{};
@@ -4752,6 +4755,54 @@ volatile uint32_t g_alpha_runtime_epoch_capture_last_cap_dwt = 0;
 volatile bool     g_alpha_runtime_epoch_capture_last_cap_valid = false;
 volatile bool     g_alpha_runtime_epoch_capture_last_cap_vclock_valid = false;
 volatile bool     g_alpha_runtime_epoch_capture_last_cap_all_lanes_valid = false;
+
+
+FLASHMEM void clocks_alpha_recover_reprime_ocxo_state(void) {
+  // RECOVER is not a new SmartZero epoch.  Keep the installed epoch, visible
+  // origin, public-origin offsets, and per-lane counter64 ledgers alive.  What
+  // must not survive is any OCXO previous/pending edge state that would let the
+  // first post-recovery measurement form an interval across the downtime gap.
+  //
+  // Memory8 failure signature: the first recovered public row had a correct
+  // OCXO campaign ledger, but the OCXO pps_residual interval resolved from a
+  // stale pending edge and injected a multi-second sample into Welford.  This
+  // re-prime makes the first post-recovery OCXO edges seed a new local interval
+  // chain instead of bridging through pre-recovery custody.
+  g_alpha_recover_reprime_count++;
+
+  alpha_measured_ns_reset_all();          // bridge anchors + pending OCXO edges
+  alpha_ocxo_pps_projection_reset_all();  // edge history + projection guards
+
+  g_ocxo1_measurement = clock_measurement_t{};
+  g_ocxo2_measurement = clock_measurement_t{};
+  g_ocxo1_clock.window_error_ns = 0;
+  g_ocxo2_clock.window_error_ns = 0;
+  g_ocxo1_clock.window_checks = 0;
+  g_ocxo2_clock.window_checks = 0;
+  g_ocxo1_clock.window_mismatches = 0;
+  g_ocxo2_clock.window_mismatches = 0;
+
+  g_ocxo1_interrupt_diag = interrupt_capture_diag_t{};
+  g_ocxo2_interrupt_diag = interrupt_capture_diag_t{};
+
+  alpha_forensics_reset_store(g_ocxo1_forensics);
+  alpha_event_flow_note_forensics_reset(time_clock_id_t::OCXO1);
+  alpha_forensics_reset_store(g_ocxo2_forensics);
+  alpha_event_flow_note_forensics_reset(time_clock_id_t::OCXO2);
+
+  alpha_static_prediction_reset_store(g_static_prediction_ocxo1);
+  alpha_static_prediction_reset_store(g_static_prediction_ocxo2);
+  clocks_feature_update_static_prediction();
+
+  g_alpha_integrity.ocxo1_projected_gnss_interval =
+      clocks_alpha_integrity_ocxo_check_t{};
+  g_alpha_integrity.ocxo2_projected_gnss_interval =
+      clocks_alpha_integrity_ocxo_check_t{};
+}
+
+uint32_t clocks_alpha_recover_reprime_count(void) {
+  return g_alpha_recover_reprime_count;
+}
 
 static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
   const bool saved_dwt_calibration_valid = g_dwt_calibration_valid;
