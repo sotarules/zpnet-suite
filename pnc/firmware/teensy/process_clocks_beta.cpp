@@ -323,7 +323,6 @@ static constexpr campaign_feature_gate_requirement_t
     CAMPAIGN_FEATURE_GATE_REQUIREMENTS[] = {
   { "T_FEATURE",   "TEENSY", "SYSTEM",    "FEATURE_STATUS" },
   { "PPS/V_AUTH",  "TEENSY", "INTERRUPT", "PPS_VCLOCK_AUTHORITY" },
-  { "FLOORLINE",   "TEENSY", "INTERRUPT", "FLOORLINE" },
   { "QTIMER_CNT",  "TEENSY", "INTERRUPT", "QTIMER_COUNTER_CUSTODY" },
   { "QTIMER_DWT",  "TEENSY", "INTERRUPT", "QTIMER_DWT_RULER" },
   { "CTR32_LINE",  "TEENSY", "INTERRUPT", "COUNTER32_LINEAGE" },
@@ -4167,7 +4166,7 @@ void clocks_beta_pps(void) {
       }
     } else if (TIMEBASE_FORENSICS_SLIM_RAW_CYCLES_PAYLOAD_ENABLED) {
       // Curated campaign-row forensics: enough for raw_cycles /
-      // raw_cycles_excursions, including EMA, Yardstick, and FloorLine cycle
+      // raw_cycles_excursions, including EMA and Yardstick cycle
       // surfaces, while omitting bulky deep-autopsy objects.
       g_timebase_forensics_slim_count++;
       f.add("minimal", false);

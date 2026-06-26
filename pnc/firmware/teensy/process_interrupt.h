@@ -103,7 +103,7 @@ struct interrupt_capture_diag_t {
   bool     dwt_interval_gate_valid = false;
   bool     dwt_interval_sample_accepted = false;
   bool     dwt_interval_sample_rejected = false;
-  bool     dwt_interval_ema_updated = false;  // retired predictor compatibility
+  bool     dwt_interval_ema_updated = false;  // retired predictor/lower-envelope compatibility
   uint32_t dwt_interval_observed_cycles = 0;
   uint32_t dwt_interval_prediction_cycles = 0;
   uint32_t dwt_interval_effective_cycles = 0;
@@ -141,7 +141,7 @@ struct interrupt_capture_diag_t {
   uint32_t dwt_yardstick_gate_excursion_count = 0;
 
   bool     dwt_yardstick_authority = false;
-  uint32_t dwt_ema_dwt_at_event = 0;  // retired predictor compatibility
+  uint32_t dwt_ema_dwt_at_event = 0;  // retired predictor/lower-envelope compatibility
   uint32_t dwt_yardstick_auth_endpoint_dwt = 0;
   uint32_t dwt_yardstick_auth_endpoint_frac_q16 = 0;
   int32_t  dwt_yardstick_auth_error_cycles = 0;
@@ -638,9 +638,9 @@ struct pps_vclock_t {
 };
 
 // PPS/VCLOCK edge authority courtroom.  process_interrupt publishes the
-// selected VCLOCK edge's DWT coordinate as a lawful inference from three
-// witnesses: the physical PPS GPIO edge plus learned phase, the VCLOCK/QTimer
-// observed edge, and the predictor/lower-envelope candidate.
+// selected VCLOCK edge's DWT coordinate from physical PPS plus the observed
+// VCLOCK/QTimer edge.  The retired lower-envelope transport fields remain in
+// the diagnostic ABI but are no longer authored.
 static constexpr uint32_t PPS_VCLOCK_EDGE_DECISION_NONE = 0;
 static constexpr uint32_t PPS_VCLOCK_EDGE_DECISION_LOWER_LAWFUL = 1;
 static constexpr uint32_t PPS_VCLOCK_EDGE_DECISION_PREDICTION_FALLBACK = 2;
