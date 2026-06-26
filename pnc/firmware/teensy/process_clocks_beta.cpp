@@ -556,29 +556,6 @@ static uint64_t g_science_total_ocxo1_gnss_interval_ns = 0;
 static uint64_t g_science_total_ocxo1_clock_interval_ns = 0;
 static uint64_t g_science_total_ocxo2_gnss_interval_ns = 0;
 static uint64_t g_science_total_ocxo2_clock_interval_ns = 0;
-
-// RECOVER deliberately cuts the campaign publication stream while preserving
-// the installed service epoch.  Alpha re-primes OCXO edge state at the RECOVER
-// gate; Beta additionally quarantines the first published science rows so no
-// residual/Welford sample can be formed from a pre-recovery previous edge or a
-// one-edge bridge warm-up artifact.  Warmup suppression hides private rows;
-// this quarantine protects the public residual population.
-static constexpr uint32_t CLOCKS_RECOVER_SCIENCE_QUARANTINE_ROWS = 2U;
-static uint32_t g_science_residual_quarantine_remaining = 0;
-static uint32_t g_science_residual_quarantine_begin_count = 0;
-static uint32_t g_science_residual_quarantine_consumed_count = 0;
-static uint32_t g_science_residual_quarantine_last_public_count = 0;
-
-static void pps_interval_residuals_seed_previous_row(uint32_t public_count,
-                                                     uint64_t public_gnss_ns,
-                                                     uint64_t public_ocxo1_measured_ns,
-                                                     uint64_t public_ocxo2_measured_ns) {
-  g_science_residual_prev_public_count = public_count;
-  g_science_residual_prev_gnss_ns = public_gnss_ns;
-  g_science_residual_prev_ocxo1_measured_ns = public_ocxo1_measured_ns;
-  g_science_residual_prev_ocxo2_measured_ns = public_ocxo2_measured_ns;
-}
-
 static void pps_interval_residuals_reset(void) {
   g_science_residual_prev_public_count = 0;
   g_science_residual_prev_gnss_ns = 0;
@@ -588,17 +565,10 @@ static void pps_interval_residuals_reset(void) {
   g_science_total_ocxo1_clock_interval_ns = 0;
   g_science_total_ocxo2_gnss_interval_ns = 0;
   g_science_total_ocxo2_clock_interval_ns = 0;
-  g_science_residual_quarantine_remaining = 0;
   clocks_beta_feature_set_cached("SCIENCE_RESIDUALS",
                                  g_clocks_feature_science_residuals,
                                  system_feature_status_t::INITIALIZING,
                                  true);
-}
-
-static void pps_interval_residuals_begin_recover_quarantine(uint32_t rows) {
-  pps_interval_residuals_reset();
-  g_science_residual_quarantine_remaining = rows;
-  g_science_residual_quarantine_begin_count++;
 }
 
 static pps_interval_residuals_t measured_edge_interval_residuals_update(
@@ -608,21 +578,6 @@ static pps_interval_residuals_t measured_edge_interval_residuals_update(
     uint64_t public_ocxo2_measured_ns) {
   pps_interval_residuals_t r{};
   r.public_count = public_count;
-
-  if (g_science_residual_quarantine_remaining != 0U) {
-    g_science_residual_quarantine_remaining--;
-    g_science_residual_quarantine_consumed_count++;
-    g_science_residual_quarantine_last_public_count = public_count;
-    pps_interval_residuals_seed_previous_row(public_count,
-                                             public_gnss_ns,
-                                             public_ocxo1_measured_ns,
-                                             public_ocxo2_measured_ns);
-    clocks_beta_feature_set_cached("SCIENCE_RESIDUALS",
-                                   g_clocks_feature_science_residuals,
-                                   system_feature_status_t::INITIALIZING,
-                                   true);
-    return r;
-  }
 
   const bool have_previous = (g_science_residual_prev_public_count != 0);
   const bool consecutive = have_previous &&
@@ -663,29 +618,21 @@ static pps_interval_residuals_t measured_edge_interval_residuals_update(
     }
   }
 
-  pps_interval_residuals_seed_previous_row(public_count,
-                                           public_gnss_ns,
-                                           public_ocxo1_measured_ns,
-                                           public_ocxo2_measured_ns);
+  g_science_residual_prev_public_count = public_count;
+  g_science_residual_prev_gnss_ns = public_gnss_ns;
+  g_science_residual_prev_ocxo1_measured_ns = public_ocxo1_measured_ns;
+  g_science_residual_prev_ocxo2_measured_ns = public_ocxo2_measured_ns;
 
   const bool both_valid = r.ocxo1_valid && r.ocxo2_valid;
-  // SCIENCE_RESIDUALS is a feature-health/readiness scalar, not a per-row
-  // validity bit.  The TIMEBASE row already carries the per-row residual
-  // validity facts.  Downgrading this feature from NOMINAL to HOLD on a single
-  // invalid candidate row causes FEATURE_STATUS_FRAGMENT to strobe
-  // NOMINAL/HOLD/NOMINAL/HOLD during otherwise healthy campaigns, adding a
-  // third 1 Hz publication stream beside TIMEBASE_FRAGMENT and
-  // TIMEBASE_FORENSICS.
-  //
-  // Publish the feature transition to NOMINAL when the science residual surface
-  // first proves live.  Do not use transient row invalidity to bounce the global
-  // feature scalar; persistent/diagnostic residual quality belongs in focused
-  // CLOCKS/TIMEBASE reports, not the feature-health bus.
-  if (both_valid) {
-    clocks_beta_feature_set_cached("SCIENCE_RESIDUALS",
-                                   g_clocks_feature_science_residuals,
-                                   system_feature_status_t::NOMINAL);
-  }
+  clocks_beta_feature_set_cached(
+      "SCIENCE_RESIDUALS",
+      g_clocks_feature_science_residuals,
+      both_valid
+          ? system_feature_status_t::NOMINAL
+          : ((g_clocks_feature_science_residuals == system_feature_status_t::NOMINAL)
+                ? system_feature_status_t::HOLD
+                : system_feature_status_t::INITIALIZING),
+      both_valid);
   return r;
 }
 
@@ -3638,14 +3585,7 @@ void clocks_beta_pps(void) {
     ocxo2_measured_gnss_ticks_64        = recover_ocxo2_ns / 100ull;
 
     campaign_seconds = recover_gnss_ns / 1000000000ull;
-
-    // Alpha owns the OCXO previous/pending edge machinery.  RECOVER must not
-    // allow those surfaces to bridge the outage.  Beta then restores the
-    // campaign statistics and quarantines the first public residual rows so
-    // Welford receives only post-recovery, post-warmup intervals.
-    clocks_alpha_recover_reprime_ocxo_state();
-    pps_interval_residuals_begin_recover_quarantine(
-        CLOCKS_RECOVER_SCIENCE_QUARANTINE_ROWS);
+    pps_interval_residuals_reset();
     recover_welfords_apply_pending();
 
     request_recover = false;
@@ -4962,16 +4902,6 @@ static FLASHMEM void add_campaign_payload(Payload& p) {
   p.add("campaign_warmup_remaining", (uint32_t)g_campaign_warmup_remaining);
   p.add("campaign_warmup_suppressed_total",
         (uint32_t)g_campaign_warmup_suppressed_total);
-  p.add("recover_science_quarantine_remaining",
-        g_science_residual_quarantine_remaining);
-  p.add("recover_science_quarantine_begin_count",
-        g_science_residual_quarantine_begin_count);
-  p.add("recover_science_quarantine_consumed_count",
-        g_science_residual_quarantine_consumed_count);
-  p.add("recover_science_quarantine_last_public_count",
-        g_science_residual_quarantine_last_public_count);
-  p.add("alpha_recover_reprime_count",
-        clocks_alpha_recover_reprime_count());
 
   payload_add_campaign_feature_gate(p);
 }
@@ -5650,16 +5580,6 @@ static FLASHMEM Payload cmd_report_timebase_publish(const Payload&) {
   counters.add("recover_welford_restore_count", g_recover_welford_restore_count);
   counters.add("recover_welford_last_restored_lane_count",
                g_recover_welford_last_restored_lane_count);
-  counters.add("alpha_recover_reprime_count",
-               clocks_alpha_recover_reprime_count());
-  counters.add("recover_science_quarantine_begin_count",
-               g_science_residual_quarantine_begin_count);
-  counters.add("recover_science_quarantine_consumed_count",
-               g_science_residual_quarantine_consumed_count);
-  counters.add("recover_science_quarantine_remaining",
-               g_science_residual_quarantine_remaining);
-  counters.add("recover_science_quarantine_last_public_count",
-               g_science_residual_quarantine_last_public_count);
   counters.add("welford_gap_advance_count", g_welford_gap_advance_count);
   counters.add("welford_gap_advance_last_public_count",
                g_welford_gap_advance_last_public_count);

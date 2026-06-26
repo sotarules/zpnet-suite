@@ -771,22 +771,6 @@ bool clocks_alpha_ocxo_visible_origin_snapshot(
 bool clocks_alpha_ocxo_public_origin_ready(void);
 
 // ============================================================================
-// Alpha RECOVER re-prime
-// ============================================================================
-//
-// RECOVER preserves the installed SmartZero/service epoch, but it creates a
-// deliberate discontinuity in campaign publication.  Alpha owns several OCXO
-// edge-to-edge surfaces whose previous/pending state must not bridge that
-// discontinuity: bridge-resolved measured edges, PPS-row OCXO projection
-// history, OCXO static prediction, and OCXO forensic previous-edge state.
-//
-// Beta calls this from the RECOVER gate after the recovery request has been
-// observed on a PPS/VCLOCK row and before recovered campaign publication
-// resumes.  Public-origin offsets and zero-offset counter ledgers are retained.
-void clocks_alpha_recover_reprime_ocxo_state(void);
-uint32_t clocks_alpha_recover_reprime_count(void);
-
-// ============================================================================
 // Alpha OCXO PPS-edge projection forensics
 // ============================================================================
 //
