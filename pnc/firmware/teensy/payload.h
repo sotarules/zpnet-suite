@@ -8,42 +8,44 @@
 
 /*
   ============================================================================
-  Payload v2 — Arena-Backed, Stack-Safe JSON Carrier
+  Payload v3 — Stack-Safe JSON Carrier with Small-Entry Optimization
   ============================================================================
 
-  HARD CONTRACT (DO NOT VIOLATE):
+  HARD CONTRACT:
 
-    • Payload has exactly ONE authoritative internal state: entries[] + arena
-    • JSON is a DERIVED REPRESENTATION, never state
-    • All strings (keys and values) live in a single contiguous arena
-    • Entries store offsets into the arena, not pointers
-    • Payload object itself is cheap to put on the stack (~300 bytes)
-    • Serialization writes to caller-provided or shared scratch buffer
-    • No Arduino String used for storage (only as convenience in add() sigs)
+    • Payload has one authoritative semantic state: entry table + string arena.
+    • JSON text is a derived representation, never authoritative state.
+    • Keys and values live in one contiguous arena owned by the Payload.
+    • Entries store offsets into that arena, not raw string pointers.
+    • The object itself must remain cheap to place on the stack.
+    • Large capacity is obtained through explicit, bounded heap growth.
+    • All allocation failures are observable through PAYLOAD_INFO.
 
-  STACK COST:
-    Entry:  8 bytes × 32  = 256 bytes
-    Fields:                ≈  24 bytes
-    Total:                 ≈ 280 bytes per Payload on stack
-    (vs ~10,400+ bytes in v1 due to inline 10KB JsonBuf)
+  v3 root fix:
 
-  HEAP COST:
-    One allocation per Payload (arena), starting at 512 bytes.
-    Grows by realloc up to ARENA_MAX (8 KiB).
-    Freed in destructor.
+    v2 accidentally made Payload a ~2 KiB stack object when MAX_ENTRIES grew to
+    256 because the full entry table lived inline.  That created stack-boundary
+    faults in ordinary command/report paths.  v3 keeps only a small inline entry
+    cache in the object and spills to a bounded heap entry table only when a
+    Payload grows beyond ordinary command size.
 
-  MOVE SEMANTICS:
-    Payload supports move construction and move assignment.
-    Returning a Payload from a function transfers arena ownership
-    with zero copying — just pointer swap.
+  Storage model:
 
-  SERIALIZATION CONTRACT:
+    • Entry table:
+        - first INLINE_ENTRIES entries live inside the object
+        - grows by realloc up to MAX_ENTRIES
+        - POD entries, safe to memcpy/realloc
 
-    • write_json() returns bytes written (excluding NUL) on success
-    • write_json() returns 0 on overflow or failure
-    • write_json() does NOT synthesize fallback JSON
-    • callers that care about overflow semantics must handle write_json()==0
-      at the appropriate architectural layer
+    • Arena:
+        - starts empty
+        - grows by realloc from ARENA_INITIAL up to ARENA_MAX
+        - clear() reuses capacity; destructor releases it
+
+  Serialization contract:
+
+    • write_json() returns bytes written, excluding NUL, on success.
+    • write_json() returns 0 on overflow or invalid state.
+    • to_json() is a legacy/debug convenience and may allocate.
 
   ============================================================================
 */
@@ -54,6 +56,15 @@
 
 typedef struct {
 
+  // ABI / geometry
+  uint32_t payload_object_size;
+  uint32_t payload_entry_size;
+  uint32_t payload_array_object_size;
+  uint32_t payload_inline_entries;
+  uint32_t payload_max_entries;
+  uint32_t payload_arena_initial;
+  uint32_t payload_arena_max;
+
   // Lifetime totals
   uint32_t instances_constructed;
   uint32_t instances_destroyed;
@@ -62,17 +73,41 @@ typedef struct {
   uint32_t alive_now;
   uint32_t alive_high_water;
 
-  // Arena behavior
-  uint32_t arena_alloc_fail;
-  uint32_t arena_high_water;
-
-  // Entry behavior
+  // Entry table behavior
+  uint32_t entry_alloc_fail;
+  uint32_t entry_realloc_count;
+  uint32_t entry_heap_bytes_alive;
+  uint32_t entry_heap_bytes_high_water;
   uint32_t entry_overflow;
   uint32_t entry_high_water;
+  uint32_t max_entry_capacity_seen;
+
+  // Arena behavior
+  uint32_t arena_alloc_fail;
+  uint32_t arena_realloc_count;
+  uint32_t arena_heap_bytes_alive;
+  uint32_t arena_heap_bytes_high_water;
+  uint32_t arena_high_water;
+  uint32_t max_arena_capacity_seen;
+
+  // Serialization / parsing / integrity
+  uint32_t serialize_overflow;
+  uint32_t to_json_fail;
+  uint32_t string_truncation;
+  uint32_t parse_error;
+  uint32_t integrity_fail;
+  uint32_t invalid_kind;
+
+  // Last internal error breadcrumb
+  uint32_t last_error_code;
+  uint32_t last_error_count;
+  uint32_t last_error_this;
+  char     last_error_op[32];
 
 } payload_info_t;
 
 void payload_get_info(payload_info_t* out);
+const char* payload_error_code_name(uint32_t code);
 
 class Payload;
 class PayloadArray;
@@ -107,7 +142,7 @@ public:
     Payload();
     ~Payload();
 
-    // Move semantics (arena ownership transfer, zero-copy)
+    // Move semantics (arena/entry ownership transfer when heap-backed)
     Payload(Payload&& other) noexcept;
     Payload& operator=(Payload&& other) noexcept;
 
@@ -132,25 +167,7 @@ public:
     // Serialization
     // --------------------------------------------------
 
-    /*
-      Primary serialization API.
-      Write JSON into caller-provided buffer.
-
-      Returns:
-        > 0 : bytes written (excluding NUL)
-          0 : overflow or serialization failure
-
-      The buffer is NUL-terminated on success.
-      On failure, callers must not assume any particular JSON fallback shape.
-    */
     size_t write_json(char* buf, size_t buf_size) const;
-
-    /*
-      Legacy convenience wrapper.
-      Heap-allocates a String. Use for debug/logging only.
-
-      On serialization failure, returns "{}".
-    */
     String to_json() const;
 
     // --------------------------------------------------
@@ -238,6 +255,8 @@ public:
     size_t count() const { return _count; }
     size_t arena_used() const { return _arena_used; }
     size_t arena_capacity() const { return _arena_cap; }
+    size_t entry_capacity() const { return _entry_cap; }
+    bool heap_entries() const { return _entries != _inline_entries; }
 
     void debug_dump(const char* tag) const;
 
@@ -245,9 +264,10 @@ public:
     // Limits
     // --------------------------------------------------
 
-    static constexpr size_t MAX_ENTRIES   = 256;
-    static constexpr size_t ARENA_INITIAL = 512;
-    static constexpr size_t ARENA_MAX     = 12288;
+    static constexpr size_t INLINE_ENTRIES = 8;
+    static constexpr size_t MAX_ENTRIES    = 256;
+    static constexpr size_t ARENA_INITIAL  = 512;
+    static constexpr size_t ARENA_MAX      = 12288;
 
     static_assert(
         ARENA_MAX <= UINT16_MAX,
@@ -255,6 +275,8 @@ public:
     );
 
 private:
+    friend void payload_get_info(payload_info_t* out);
+
     struct Entry {
         uint16_t key_off;
         uint16_t val_off;
@@ -263,17 +285,30 @@ private:
         uint8_t  _pad;
     };
 
-    Entry  _entries[MAX_ENTRIES];
-    size_t _count;
+    static constexpr uint32_t MAGIC_LIVE = 0x5041594Cu; // "PAYL"
+    static constexpr uint32_t MAGIC_DEAD = 0x44454144u; // "DEAD"
 
-    char*  _arena;
-    size_t _arena_used;
-    size_t _arena_cap;
+    uint32_t _magic;
+    Entry*   _entries;
+    size_t   _count;
+    size_t   _entry_cap;
+
+    char*    _arena;
+    size_t   _arena_used;
+    size_t   _arena_cap;
+
+    Entry    _inline_entries[INLINE_ENTRIES];
+
+    bool _ensure_entries(size_t needed_count);
+    bool _ensure_arena(size_t additional);
+    bool _self_ok(const char* op) const;
+
+    void _release_storage();
+    void _move_from(Payload& other);
+    bool _copy_from(const Payload& other);
 
     uint16_t _put(const char* str, size_t len);
     uint16_t _put(const char* str);
-
-    bool _ensure(size_t additional);
 
     const char* _at(uint16_t offset) const;
     const Entry* _find(const char* key) const;

@@ -745,6 +745,18 @@ static Payload cmd_payload_info(const Payload& /*args*/) {
   Payload p;
 
   // ==========================================================
+  // ABI / geometry — proves stack footprint and hard limits
+  // ==========================================================
+
+  p.add("payload_object_size",       info.payload_object_size);
+  p.add("payload_entry_size",        info.payload_entry_size);
+  p.add("payload_array_object_size", info.payload_array_object_size);
+  p.add("payload_inline_entries",    info.payload_inline_entries);
+  p.add("payload_max_entries",       info.payload_max_entries);
+  p.add("payload_arena_initial",     info.payload_arena_initial);
+  p.add("payload_arena_max",         info.payload_arena_max);
+
+  // ==========================================================
   // Lifetime totals
   // ==========================================================
 
@@ -759,18 +771,54 @@ static Payload cmd_payload_info(const Payload& /*args*/) {
   p.add("payload_alive_high_water", info.alive_high_water);
 
   // ==========================================================
+  // Entry table behavior
+  // ==========================================================
+
+  p.add("payload_entry_alloc_fail",            info.entry_alloc_fail);
+  p.add("payload_entry_realloc_count",         info.entry_realloc_count);
+  p.add("payload_entry_heap_bytes_alive",      info.entry_heap_bytes_alive);
+  p.add("payload_entry_heap_bytes_high_water", info.entry_heap_bytes_high_water);
+  p.add("payload_entry_overflow",              info.entry_overflow);
+  p.add("payload_entry_high_water",            info.entry_high_water);
+  p.add("payload_max_entry_capacity_seen",     info.max_entry_capacity_seen);
+
+  // ==========================================================
   // Arena behavior
   // ==========================================================
 
-  p.add("payload_arena_alloc_fail", info.arena_alloc_fail);
-  p.add("payload_arena_high_water", info.arena_high_water);
+  p.add("payload_arena_alloc_fail",            info.arena_alloc_fail);
+  p.add("payload_arena_realloc_count",         info.arena_realloc_count);
+  p.add("payload_arena_heap_bytes_alive",      info.arena_heap_bytes_alive);
+  p.add("payload_arena_heap_bytes_high_water", info.arena_heap_bytes_high_water);
+  p.add("payload_arena_high_water",            info.arena_high_water);
+  p.add("payload_max_arena_capacity_seen",     info.max_arena_capacity_seen);
+
+  // Combined heap custody for the Payload subsystem.
+  p.add("payload_heap_bytes_alive",
+        info.entry_heap_bytes_alive + info.arena_heap_bytes_alive);
+  p.add("payload_heap_bytes_high_water",
+        info.entry_heap_bytes_high_water + info.arena_heap_bytes_high_water);
 
   // ==========================================================
-  // Entry behavior
+  // Serialization / parsing / integrity
   // ==========================================================
 
-  p.add("payload_entry_overflow",   info.entry_overflow);
-  p.add("payload_entry_high_water", info.entry_high_water);
+  p.add("payload_serialize_overflow", info.serialize_overflow);
+  p.add("payload_to_json_fail",       info.to_json_fail);
+  p.add("payload_string_truncation",  info.string_truncation);
+  p.add("payload_parse_error",        info.parse_error);
+  p.add("payload_integrity_fail",     info.integrity_fail);
+  p.add("payload_invalid_kind",       info.invalid_kind);
+
+  // ==========================================================
+  // Last error breadcrumb
+  // ==========================================================
+
+  p.add("payload_last_error_code",  info.last_error_code);
+  p.add("payload_last_error_name",  payload_error_code_name(info.last_error_code));
+  p.add("payload_last_error_count", info.last_error_count);
+  p.add("payload_last_error_op",    info.last_error_op);
+  p.add_fmt("payload_last_error_this", "0x%08lX", (unsigned long)info.last_error_this);
 
   return p;
 }

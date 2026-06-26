@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <math.h>
 
 // ============================================================================
 // Global Payload Instrumentation (monotonic, centralized)
@@ -17,15 +18,85 @@ static volatile uint32_t g_payload_instances_destroyed   = 0;
 static volatile uint32_t g_payload_alive_now             = 0;
 static volatile uint32_t g_payload_alive_high_water      = 0;
 
-static volatile uint32_t g_payload_arena_alloc_fail      = 0;
+static volatile uint32_t g_payload_entry_alloc_fail      = 0;
+static volatile uint32_t g_payload_entry_realloc_count   = 0;
+static volatile uint32_t g_payload_entry_heap_bytes_alive = 0;
+static volatile uint32_t g_payload_entry_heap_bytes_high_water = 0;
 static volatile uint32_t g_payload_entry_overflow        = 0;
-
-static volatile uint32_t g_payload_arena_high_water_global = 0;
 static volatile uint32_t g_payload_entry_high_water_global = 0;
+static volatile uint32_t g_payload_max_entry_capacity_seen = 0;
 
-// ----------------------------------------------------------------------------
-// Internal helper — mark construction
-// ----------------------------------------------------------------------------
+static volatile uint32_t g_payload_arena_alloc_fail      = 0;
+static volatile uint32_t g_payload_arena_realloc_count   = 0;
+static volatile uint32_t g_payload_arena_heap_bytes_alive = 0;
+static volatile uint32_t g_payload_arena_heap_bytes_high_water = 0;
+static volatile uint32_t g_payload_arena_high_water_global = 0;
+static volatile uint32_t g_payload_max_arena_capacity_seen = 0;
+
+static volatile uint32_t g_payload_serialize_overflow    = 0;
+static volatile uint32_t g_payload_to_json_fail          = 0;
+static volatile uint32_t g_payload_string_truncation     = 0;
+static volatile uint32_t g_payload_parse_error           = 0;
+static volatile uint32_t g_payload_integrity_fail        = 0;
+static volatile uint32_t g_payload_invalid_kind          = 0;
+
+static volatile uint32_t g_payload_last_error_code       = 0;
+static volatile uint32_t g_payload_last_error_count      = 0;
+static volatile uint32_t g_payload_last_error_this       = 0;
+static char g_payload_last_error_op[32] = {0};
+
+// ============================================================================
+// Error codes
+// ============================================================================
+
+enum payload_error_code_t : uint32_t {
+    PAYLOAD_ERR_NONE = 0,
+    PAYLOAD_ERR_ENTRY_OVERFLOW = 1,
+    PAYLOAD_ERR_ENTRY_ALLOC_FAIL = 2,
+    PAYLOAD_ERR_ARENA_ALLOC_FAIL = 3,
+    PAYLOAD_ERR_ARENA_LIMIT = 4,
+    PAYLOAD_ERR_STRING_TOO_LONG = 5,
+    PAYLOAD_ERR_SERIALIZE_OVERFLOW = 6,
+    PAYLOAD_ERR_TO_JSON_FAIL = 7,
+    PAYLOAD_ERR_STRING_TRUNCATION = 8,
+    PAYLOAD_ERR_PARSE_ERROR = 9,
+    PAYLOAD_ERR_INTEGRITY = 10,
+    PAYLOAD_ERR_INVALID_KIND = 11,
+    PAYLOAD_ERR_COPY_ALLOC_FAIL = 12,
+};
+
+const char* payload_error_code_name(uint32_t code) {
+    switch (code) {
+        case PAYLOAD_ERR_NONE:               return "NONE";
+        case PAYLOAD_ERR_ENTRY_OVERFLOW:     return "ENTRY_OVERFLOW";
+        case PAYLOAD_ERR_ENTRY_ALLOC_FAIL:   return "ENTRY_ALLOC_FAIL";
+        case PAYLOAD_ERR_ARENA_ALLOC_FAIL:   return "ARENA_ALLOC_FAIL";
+        case PAYLOAD_ERR_ARENA_LIMIT:        return "ARENA_LIMIT";
+        case PAYLOAD_ERR_STRING_TOO_LONG:    return "STRING_TOO_LONG";
+        case PAYLOAD_ERR_SERIALIZE_OVERFLOW: return "SERIALIZE_OVERFLOW";
+        case PAYLOAD_ERR_TO_JSON_FAIL:       return "TO_JSON_FAIL";
+        case PAYLOAD_ERR_STRING_TRUNCATION:  return "STRING_TRUNCATION";
+        case PAYLOAD_ERR_PARSE_ERROR:        return "PARSE_ERROR";
+        case PAYLOAD_ERR_INTEGRITY:          return "INTEGRITY";
+        case PAYLOAD_ERR_INVALID_KIND:       return "INVALID_KIND";
+        case PAYLOAD_ERR_COPY_ALLOC_FAIL:    return "COPY_ALLOC_FAIL";
+        default:                             return "UNKNOWN";
+    }
+}
+
+static void payload_note_error(uint32_t code, const char* op, const void* self) {
+    g_payload_last_error_code = code;
+    g_payload_last_error_count++;
+    g_payload_last_error_this = (uint32_t)(uintptr_t)self;
+
+    if (!op) op = "?";
+    size_t n = strlen(op);
+    if (n >= sizeof(g_payload_last_error_op)) {
+        n = sizeof(g_payload_last_error_op) - 1;
+    }
+    memcpy(g_payload_last_error_op, op, n);
+    g_payload_last_error_op[n] = '\0';
+}
 
 static inline void payload_mark_constructed() {
     g_payload_instances_constructed++;
@@ -36,10 +107,6 @@ static inline void payload_mark_constructed() {
     }
 }
 
-// ----------------------------------------------------------------------------
-// Internal helper — mark destruction
-// ----------------------------------------------------------------------------
-
 static inline void payload_mark_destroyed() {
     g_payload_instances_destroyed++;
 
@@ -48,114 +115,200 @@ static inline void payload_mark_destroyed() {
     }
 }
 
+static inline void payload_note_entry_heap_delta(int32_t delta) {
+    if (delta >= 0) {
+        g_payload_entry_heap_bytes_alive += (uint32_t)delta;
+    } else {
+        const uint32_t dec = (uint32_t)(-delta);
+        g_payload_entry_heap_bytes_alive =
+            (g_payload_entry_heap_bytes_alive >= dec)
+                ? (g_payload_entry_heap_bytes_alive - dec)
+                : 0;
+    }
+
+    if (g_payload_entry_heap_bytes_alive > g_payload_entry_heap_bytes_high_water) {
+        g_payload_entry_heap_bytes_high_water = g_payload_entry_heap_bytes_alive;
+    }
+}
+
+static inline void payload_note_arena_heap_delta(int32_t delta) {
+    if (delta >= 0) {
+        g_payload_arena_heap_bytes_alive += (uint32_t)delta;
+    } else {
+        const uint32_t dec = (uint32_t)(-delta);
+        g_payload_arena_heap_bytes_alive =
+            (g_payload_arena_heap_bytes_alive >= dec)
+                ? (g_payload_arena_heap_bytes_alive - dec)
+                : 0;
+    }
+
+    if (g_payload_arena_heap_bytes_alive > g_payload_arena_heap_bytes_high_water) {
+        g_payload_arena_heap_bytes_high_water = g_payload_arena_heap_bytes_alive;
+    }
+}
+
+static size_t grow_power_of_two(size_t current, size_t minimum, size_t maximum) {
+    size_t cap = current ? current : 1;
+    while (cap < minimum && cap < maximum) {
+        cap *= 2;
+    }
+    if (cap > maximum) cap = maximum;
+    return cap;
+}
+
 // ============================================================================
 // Construction / Destruction
 // ============================================================================
 
 Payload::Payload()
-    : _count(0)
+    : _magic(MAGIC_LIVE)
+    , _entries(_inline_entries)
+    , _count(0)
+    , _entry_cap(INLINE_ENTRIES)
     , _arena(nullptr)
     , _arena_used(0)
     , _arena_cap(0)
 {
     payload_mark_constructed();
+    if (INLINE_ENTRIES > g_payload_max_entry_capacity_seen) {
+        g_payload_max_entry_capacity_seen = INLINE_ENTRIES;
+    }
 }
 
 Payload::~Payload() {
-    free(_arena);
+    _release_storage();
+    _magic = MAGIC_DEAD;
     payload_mark_destroyed();
 }
 
+void Payload::_release_storage() {
+    if (_entries && _entries != _inline_entries) {
+        payload_note_entry_heap_delta(-(int32_t)(_entry_cap * sizeof(Entry)));
+        free(_entries);
+    }
+
+    if (_arena) {
+        payload_note_arena_heap_delta(-(int32_t)_arena_cap);
+        free(_arena);
+    }
+
+    _entries = _inline_entries;
+    _count = 0;
+    _entry_cap = INLINE_ENTRIES;
+    _arena = nullptr;
+    _arena_used = 0;
+    _arena_cap = 0;
+}
+
 // ============================================================================
-// Move semantics (zero-copy arena transfer)
+// Move semantics
 // ============================================================================
 
 Payload::Payload(Payload&& other) noexcept
-    : _count(other._count)
-    , _arena(other._arena)
-    , _arena_used(other._arena_used)
-    , _arena_cap(other._arena_cap)
+    : _magic(MAGIC_LIVE)
+    , _entries(_inline_entries)
+    , _count(0)
+    , _entry_cap(INLINE_ENTRIES)
+    , _arena(nullptr)
+    , _arena_used(0)
+    , _arena_cap(0)
 {
     payload_mark_constructed();
-
-    memcpy(_entries, other._entries, _count * sizeof(Entry));
-
-    other._arena      = nullptr;
-    other._arena_used = 0;
-    other._arena_cap  = 0;
-    other._count      = 0;
+    _move_from(other);
 }
 
 Payload& Payload::operator=(Payload&& other) noexcept {
     if (this == &other) return *this;
 
-    free(_arena);
-
-    _count      = other._count;
-    _arena      = other._arena;
-    _arena_used = other._arena_used;
-    _arena_cap  = other._arena_cap;
-
-    memcpy(_entries, other._entries, _count * sizeof(Entry));
-
-    other._arena      = nullptr;
-    other._arena_used = 0;
-    other._arena_cap  = 0;
-    other._count      = 0;
-
+    _release_storage();
+    _magic = MAGIC_LIVE;
+    _move_from(other);
     return *this;
 }
 
+void Payload::_move_from(Payload& other) {
+    if (!other._self_ok("move_from")) {
+        return;
+    }
+
+    _count = other._count;
+
+    if (other._entries == other._inline_entries) {
+        _entries = _inline_entries;
+        _entry_cap = INLINE_ENTRIES;
+        if (_count > 0) {
+            memcpy(_inline_entries, other._inline_entries, _count * sizeof(Entry));
+        }
+    } else {
+        _entries = other._entries;
+        _entry_cap = other._entry_cap;
+        other._entries = other._inline_entries;
+        other._entry_cap = INLINE_ENTRIES;
+    }
+
+    _arena = other._arena;
+    _arena_used = other._arena_used;
+    _arena_cap = other._arena_cap;
+
+    other._count = 0;
+    other._arena = nullptr;
+    other._arena_used = 0;
+    other._arena_cap = 0;
+}
+
 // ============================================================================
-// Copy semantics (deep copy of arena)
+// Copy semantics
 // ============================================================================
 
 Payload::Payload(const Payload& other)
-    : _count(other._count)
+    : _magic(MAGIC_LIVE)
+    , _entries(_inline_entries)
+    , _count(0)
+    , _entry_cap(INLINE_ENTRIES)
     , _arena(nullptr)
-    , _arena_used(other._arena_used)
-    , _arena_cap(other._arena_used)
+    , _arena_used(0)
+    , _arena_cap(0)
 {
     payload_mark_constructed();
-
-    memcpy(_entries, other._entries, _count * sizeof(Entry));
-
-    if (_arena_used > 0) {
-        _arena = (char*)malloc(_arena_cap);
-        if (_arena) {
-            memcpy(_arena, other._arena, _arena_used);
-        } else {
-            _count      = 0;
-            _arena_used = 0;
-            _arena_cap  = 0;
-        }
-    }
+    _copy_from(other);
 }
 
 Payload& Payload::operator=(const Payload& other) {
     if (this == &other) return *this;
 
-    free(_arena);
-    _arena = nullptr;
+    _release_storage();
+    _magic = MAGIC_LIVE;
+    _copy_from(other);
+    return *this;
+}
 
-    _count      = other._count;
-    _arena_used = other._arena_used;
-    _arena_cap  = other._arena_used;
-
-    memcpy(_entries, other._entries, _count * sizeof(Entry));
-
-    if (_arena_used > 0) {
-        _arena = (char*)malloc(_arena_cap);
-        if (_arena) {
-            memcpy(_arena, other._arena, _arena_used);
-        } else {
-            _count      = 0;
-            _arena_used = 0;
-            _arena_cap  = 0;
-        }
+bool Payload::_copy_from(const Payload& other) {
+    if (!other._self_ok("copy_from")) {
+        return false;
     }
 
-    return *this;
+    if (other._count > 0) {
+        if (!_ensure_entries(other._count)) {
+            g_payload_entry_alloc_fail++;
+            payload_note_error(PAYLOAD_ERR_COPY_ALLOC_FAIL, "copy_entries", this);
+            return false;
+        }
+        memcpy(_entries, other._entries, other._count * sizeof(Entry));
+        _count = other._count;
+    }
+
+    if (other._arena_used > 0) {
+        if (!_ensure_arena(other._arena_used)) {
+            payload_note_error(PAYLOAD_ERR_COPY_ALLOC_FAIL, "copy_arena", this);
+            _count = 0;
+            _arena_used = 0;
+            return false;
+        }
+        memcpy(_arena, other._arena, other._arena_used);
+        _arena_used = other._arena_used;
+    }
+
+    return true;
 }
 
 // ============================================================================
@@ -163,12 +316,13 @@ Payload& Payload::operator=(const Payload& other) {
 // ============================================================================
 
 void Payload::clear() {
-    _count      = 0;
+    if (!_self_ok("clear")) return;
+    _count = 0;
     _arena_used = 0;
 }
 
 bool Payload::empty() const {
-    return _count == 0;
+    return !_self_ok("empty") || _count == 0;
 }
 
 Payload Payload::clone() const {
@@ -176,48 +330,183 @@ Payload Payload::clone() const {
 }
 
 // ============================================================================
-// Arena internals
+// Internal integrity guard
 // ============================================================================
 
-bool Payload::_ensure(size_t additional) {
-    size_t needed = _arena_used + additional;
-
-    if (needed <= _arena_cap) return true;
-
-    if (needed > ARENA_MAX) {
-        g_payload_arena_alloc_fail++;
+bool Payload::_self_ok(const char* op) const {
+    if (_magic != MAGIC_LIVE) {
+        g_payload_integrity_fail++;
+        payload_note_error(PAYLOAD_ERR_INTEGRITY, op, this);
         return false;
     }
 
-    size_t new_cap = _arena_cap == 0 ? ARENA_INITIAL : _arena_cap;
-    while (new_cap < needed) {
-        new_cap *= 2;
+    if (!_entries || _entry_cap < INLINE_ENTRIES || _entry_cap > MAX_ENTRIES) {
+        g_payload_integrity_fail++;
+        payload_note_error(PAYLOAD_ERR_INTEGRITY, op, this);
+        return false;
     }
-    if (new_cap > ARENA_MAX) new_cap = ARENA_MAX;
 
+    if (_count > _entry_cap || _count > MAX_ENTRIES) {
+        g_payload_integrity_fail++;
+        payload_note_error(PAYLOAD_ERR_INTEGRITY, op, this);
+        return false;
+    }
+
+    if (_arena_used > _arena_cap || _arena_cap > ARENA_MAX) {
+        g_payload_integrity_fail++;
+        payload_note_error(PAYLOAD_ERR_INTEGRITY, op, this);
+        return false;
+    }
+
+    if (_arena_used > 0 && !_arena) {
+        g_payload_integrity_fail++;
+        payload_note_error(PAYLOAD_ERR_INTEGRITY, op, this);
+        return false;
+    }
+
+    return true;
+}
+
+// ============================================================================
+// Entry + arena internals
+// ============================================================================
+
+bool Payload::_ensure_entries(size_t needed_count) {
+    if (!_self_ok("ensure_entries")) return false;
+
+    if (needed_count <= _entry_cap) return true;
+
+    if (needed_count > MAX_ENTRIES) {
+        g_payload_entry_overflow++;
+        payload_note_error(PAYLOAD_ERR_ENTRY_OVERFLOW, "ensure_entries", this);
+        return false;
+    }
+
+    size_t new_cap = grow_power_of_two(_entry_cap, needed_count, MAX_ENTRIES);
+    if (new_cap <= _entry_cap) {
+        g_payload_entry_overflow++;
+        payload_note_error(PAYLOAD_ERR_ENTRY_OVERFLOW, "ensure_entries_cap", this);
+        return false;
+    }
+
+    Entry* new_entries = nullptr;
+    if (_entries == _inline_entries) {
+        new_entries = (Entry*)malloc(new_cap * sizeof(Entry));
+        if (new_entries) {
+            if (_count > 0) {
+                memcpy(new_entries, _inline_entries, _count * sizeof(Entry));
+            }
+            memset(new_entries + _count, 0, (new_cap - _count) * sizeof(Entry));
+            payload_note_entry_heap_delta((int32_t)(new_cap * sizeof(Entry)));
+        }
+    } else {
+        const size_t old_bytes = _entry_cap * sizeof(Entry);
+        new_entries = (Entry*)realloc(_entries, new_cap * sizeof(Entry));
+        if (new_entries) {
+            memset(new_entries + _entry_cap, 0, (new_cap - _entry_cap) * sizeof(Entry));
+            payload_note_entry_heap_delta((int32_t)(new_cap * sizeof(Entry) - old_bytes));
+        }
+    }
+
+    if (!new_entries) {
+        g_payload_entry_alloc_fail++;
+        payload_note_error(PAYLOAD_ERR_ENTRY_ALLOC_FAIL, "ensure_entries_alloc", this);
+        return false;
+    }
+
+    _entries = new_entries;
+    _entry_cap = new_cap;
+    g_payload_entry_realloc_count++;
+
+    if (_entry_cap > g_payload_max_entry_capacity_seen) {
+        g_payload_max_entry_capacity_seen = _entry_cap;
+    }
+    return true;
+}
+
+bool Payload::_ensure_arena(size_t additional) {
+    if (!_self_ok("ensure_arena")) return false;
+
+    if (additional > ARENA_MAX) {
+        g_payload_arena_alloc_fail++;
+        payload_note_error(PAYLOAD_ERR_ARENA_LIMIT, "ensure_arena_add", this);
+        return false;
+    }
+
+    if (_arena_used > ARENA_MAX || additional > (ARENA_MAX - _arena_used)) {
+        g_payload_arena_alloc_fail++;
+        payload_note_error(PAYLOAD_ERR_ARENA_LIMIT, "ensure_arena_limit", this);
+        return false;
+    }
+
+    const size_t needed = _arena_used + additional;
+    if (needed <= _arena_cap) return true;
+
+    size_t new_cap = _arena_cap == 0 ? ARENA_INITIAL : _arena_cap;
+    new_cap = grow_power_of_two(new_cap, needed, ARENA_MAX);
+
+    if (new_cap < needed || new_cap > ARENA_MAX) {
+        g_payload_arena_alloc_fail++;
+        payload_note_error(PAYLOAD_ERR_ARENA_LIMIT, "ensure_arena_cap", this);
+        return false;
+    }
+
+    const size_t old_cap = _arena_cap;
     char* new_arena = (char*)realloc(_arena, new_cap);
     if (!new_arena) {
         g_payload_arena_alloc_fail++;
+        payload_note_error(PAYLOAD_ERR_ARENA_ALLOC_FAIL, "ensure_arena_alloc", this);
         return false;
     }
 
-    _arena     = new_arena;
+    _arena = new_arena;
     _arena_cap = new_cap;
+    g_payload_arena_realloc_count++;
+    payload_note_arena_heap_delta((int32_t)(new_cap - old_cap));
+
+    if (_arena_cap > g_payload_max_arena_capacity_seen) {
+        g_payload_max_arena_capacity_seen = _arena_cap;
+    }
     return true;
 }
 
 uint16_t Payload::_put(const char* str, size_t len) {
-    if (!_ensure(len + 1)) return UINT16_MAX;
+    if (!_self_ok("put")) return UINT16_MAX;
 
-    if (_arena_used + len + 1 > UINT16_MAX) {
+    if (!str) {
+        if (len != 0) {
+            payload_note_error(PAYLOAD_ERR_STRING_TOO_LONG, "put_null", this);
+            return UINT16_MAX;
+        }
+        str = "";
+    }
+
+    if (len > UINT16_MAX) {
         g_payload_arena_alloc_fail++;
+        payload_note_error(PAYLOAD_ERR_STRING_TOO_LONG, "put_len", this);
         return UINT16_MAX;
     }
 
-    uint16_t offset = (uint16_t)_arena_used;
-    memcpy(_arena + _arena_used, str, len);
+    if (len + 1U > ARENA_MAX) {
+        g_payload_arena_alloc_fail++;
+        payload_note_error(PAYLOAD_ERR_ARENA_LIMIT, "put_arena_limit", this);
+        return UINT16_MAX;
+    }
+
+    if (!_ensure_arena(len + 1U)) return UINT16_MAX;
+
+    if (_arena_used + len + 1U > UINT16_MAX) {
+        g_payload_arena_alloc_fail++;
+        payload_note_error(PAYLOAD_ERR_ARENA_LIMIT, "put_offset_limit", this);
+        return UINT16_MAX;
+    }
+
+    const uint16_t offset = (uint16_t)_arena_used;
+    if (len > 0) {
+        memcpy(_arena + _arena_used, str, len);
+    }
     _arena[_arena_used + len] = '\0';
-    _arena_used += len + 1;
+    _arena_used += len + 1U;
 
     if (_arena_used > g_payload_arena_high_water_global) {
         g_payload_arena_high_water_global = _arena_used;
@@ -232,11 +521,13 @@ uint16_t Payload::_put(const char* str) {
 }
 
 const char* Payload::_at(uint16_t offset) const {
+    if (!_self_ok("at")) return "";
     if (!_arena || offset >= _arena_used) return "";
     return _arena + offset;
 }
 
 const Payload::Entry* Payload::_find(const char* key) const {
+    if (!_self_ok("find") || !key) return nullptr;
     for (size_t i = 0; i < _count; i++) {
         if (strcmp(_at(_entries[i].key_off), key) == 0) {
             return &_entries[i];
@@ -250,16 +541,49 @@ const Payload::Entry* Payload::_find(const char* key) const {
 // ============================================================================
 
 void Payload::_add_entry(const char* key, const char* value, size_t value_len, char kind) {
+    if (!_self_ok("add_entry")) return;
+
+    if (!key) key = "";
+    if (!value) {
+        value = "";
+        value_len = 0;
+    }
+
+    if (kind != 'p' && kind != 'o' && kind != 'a') {
+        g_payload_invalid_kind++;
+        payload_note_error(PAYLOAD_ERR_INVALID_KIND, "add_entry_kind", this);
+        kind = 'p';
+    }
+
     if (_count >= MAX_ENTRIES) {
         g_payload_entry_overflow++;
+        payload_note_error(PAYLOAD_ERR_ENTRY_OVERFLOW, "add_entry_count", this);
         return;
     }
 
-    uint16_t k_off = _put(key);
-    if (k_off == UINT16_MAX) return;
+    if (value_len > UINT16_MAX) {
+        g_payload_arena_alloc_fail++;
+        payload_note_error(PAYLOAD_ERR_STRING_TOO_LONG, "add_entry_value_len", this);
+        return;
+    }
 
-    uint16_t v_off = _put(value, value_len);
-    if (v_off == UINT16_MAX) return;
+    if (!_ensure_entries(_count + 1U)) {
+        return;
+    }
+
+    const size_t arena_mark = _arena_used;
+
+    const uint16_t k_off = _put(key);
+    if (k_off == UINT16_MAX) {
+        _arena_used = arena_mark;
+        return;
+    }
+
+    const uint16_t v_off = _put(value, value_len);
+    if (v_off == UINT16_MAX) {
+        _arena_used = arena_mark;
+        return;
+    }
 
     _entries[_count++] = {
         k_off,
@@ -281,24 +605,28 @@ void Payload::_add_entry(const char* key, const char* value, size_t value_len, c
 void Payload::add(const char* key, int32_t value) {
     char tmp[16];
     int n = snprintf(tmp, sizeof(tmp), "%ld", (long)value);
+    if (n < 0) n = 0;
     _add_entry(key, tmp, (size_t)n, 'p');
 }
 
 void Payload::add(const char* key, uint32_t value) {
     char tmp[16];
     int n = snprintf(tmp, sizeof(tmp), "%lu", (unsigned long)value);
+    if (n < 0) n = 0;
     _add_entry(key, tmp, (size_t)n, 'p');
 }
 
 void Payload::add(const char* key, int64_t value) {
     char tmp[24];
     int n = snprintf(tmp, sizeof(tmp), "%lld", (long long)value);
+    if (n < 0) n = 0;
     _add_entry(key, tmp, (size_t)n, 'p');
 }
 
 void Payload::add(const char* key, uint64_t value) {
     char tmp[24];
     int n = snprintf(tmp, sizeof(tmp), "%llu", (unsigned long long)value);
+    if (n < 0) n = 0;
     _add_entry(key, tmp, (size_t)n, 'p');
 }
 
@@ -319,71 +647,125 @@ void Payload::add(const char* key, bool value) {
 void Payload::add(const char* key, float value) {
     char tmp[32];
     int n = snprintf(tmp, sizeof(tmp), "%.6f", (double)value);
+    if (n < 0) n = 0;
+    if ((size_t)n >= sizeof(tmp)) {
+        n = (int)sizeof(tmp) - 1;
+        g_payload_string_truncation++;
+        payload_note_error(PAYLOAD_ERR_STRING_TRUNCATION, "add_float", this);
+    }
     _add_entry(key, tmp, (size_t)n, 'p');
 }
 
 void Payload::add(const char* key, double value) {
     char tmp[32];
     int n = snprintf(tmp, sizeof(tmp), "%.6f", value);
+    if (n < 0) n = 0;
+    if ((size_t)n >= sizeof(tmp)) {
+        n = (int)sizeof(tmp) - 1;
+        g_payload_string_truncation++;
+        payload_note_error(PAYLOAD_ERR_STRING_TRUNCATION, "add_double", this);
+    }
     _add_entry(key, tmp, (size_t)n, 'p');
 }
 
 void Payload::add(const char* key, double value, int precision) {
+    if (precision < 0) precision = 0;
+    if (precision > 12) precision = 12;
+
     char fmt[16];
     snprintf(fmt, sizeof(fmt), "%%.%df", precision);
     char tmp[48];
     int n = snprintf(tmp, sizeof(tmp), fmt, value);
+    if (n < 0) n = 0;
+    if ((size_t)n >= sizeof(tmp)) {
+        n = (int)sizeof(tmp) - 1;
+        g_payload_string_truncation++;
+        payload_note_error(PAYLOAD_ERR_STRING_TRUNCATION, "add_double_prec", this);
+    }
     _add_entry(key, tmp, (size_t)n, 'p');
 }
 
 void Payload::add_fmt(const char* key, const char* fmt, ...) {
-    if (_count >= MAX_ENTRIES) return;
+    if (!_self_ok("add_fmt")) return;
+    if (!fmt) fmt = "";
 
-    char tmp[96];
+    char tmp[128];
     va_list args;
     va_start(args, fmt);
     int n = vsnprintf(tmp, sizeof(tmp), fmt, args);
     va_end(args);
 
     if (n < 0) n = 0;
-    if ((size_t)n >= sizeof(tmp)) n = (int)(sizeof(tmp) - 1);
+    if ((size_t)n >= sizeof(tmp)) {
+        n = (int)(sizeof(tmp) - 1);
+        g_payload_string_truncation++;
+        payload_note_error(PAYLOAD_ERR_STRING_TRUNCATION, "add_fmt", this);
+    }
 
     _add_entry(key, tmp, (size_t)n, 'p');
 }
 
+// Estimate a bounded starting buffer for serializing a nested Payload.  The
+// exact size depends on escaping, so callers retry upward when needed.
+static size_t payload_initial_json_buffer_size(const Payload& obj) {
+    size_t buf_size = (obj.arena_used() * 2U) + (obj.count() * 32U) + 64U;
+    if (buf_size < 256U) buf_size = 256U;
+    if (buf_size > Payload::ARENA_MAX) buf_size = Payload::ARENA_MAX;
+    return buf_size;
+}
+
 void Payload::add_object(const char* key, const Payload& obj) {
-    if (_count >= MAX_ENTRIES) return;
-
-    size_t buf_size = (obj._arena_used * 2) + (obj._count * 32) + 64;
-    if (buf_size < 256) buf_size = 256;
-    if (buf_size > ARENA_MAX) buf_size = ARENA_MAX;
-
-    char* json_buf = (char*)malloc(buf_size);
-    if (!json_buf) {
-        _add_entry(key, "{}", 2, 'o');
+    if (!_self_ok("add_object")) return;
+    if (_count >= MAX_ENTRIES) {
+        g_payload_entry_overflow++;
+        payload_note_error(PAYLOAD_ERR_ENTRY_OVERFLOW, "add_object", this);
         return;
     }
 
-    size_t json_len = obj.write_json(json_buf, buf_size);
+    size_t buf_size = payload_initial_json_buffer_size(obj);
+    bool added = false;
 
-    if (json_len == 0) {
-        _add_entry(key, "{}", 2, 'o');
-    } else {
-        _add_entry(key, json_buf, json_len, 'o');
+    while (buf_size <= ARENA_MAX) {
+        char* json_buf = (char*)malloc(buf_size);
+        if (!json_buf) {
+            g_payload_arena_alloc_fail++;
+            payload_note_error(PAYLOAD_ERR_ARENA_ALLOC_FAIL, "add_object_tmp", this);
+            break;
+        }
+
+        size_t json_len = obj.write_json(json_buf, buf_size);
+        if (json_len != 0) {
+            _add_entry(key, json_buf, json_len, 'o');
+            added = true;
+            free(json_buf);
+            break;
+        }
+
+        free(json_buf);
+        if (buf_size == ARENA_MAX) break;
+        buf_size *= 2U;
+        if (buf_size > ARENA_MAX) buf_size = ARENA_MAX;
     }
 
-    free(json_buf);
+    if (!added) {
+        g_payload_serialize_overflow++;
+        payload_note_error(PAYLOAD_ERR_SERIALIZE_OVERFLOW, "add_object_json", this);
+        _add_entry(key, "{}", 2, 'o');
+    }
 }
 
 void Payload::add_array(const char* key, const PayloadArray& arr) {
-    if (_count >= MAX_ENTRIES) return;
-
+    if (!_self_ok("add_array")) return;
     String json = arr.to_json();
     _add_entry(key, json.c_str(), json.length(), 'a');
 }
 
 void Payload::add_raw_object(const char* key, const char* raw_json_object) {
-    if (!raw_json_object) raw_json_object = "{}";
+    if (!raw_json_object || raw_json_object[0] != '{') {
+        g_payload_parse_error++;
+        payload_note_error(PAYLOAD_ERR_PARSE_ERROR, "add_raw_object", this);
+        raw_json_object = "{}";
+    }
     _add_entry(key, raw_json_object, strlen(raw_json_object), 'o');
 }
 
@@ -391,9 +773,46 @@ void Payload::add_raw_object(const char* key, const char* raw_json_object) {
 // JSON Serialization
 // ============================================================================
 
+static bool is_json_number_literal(const char* s) {
+    if (!s || !*s) return false;
+
+    const char* p = s;
+    if (*p == '-') p++;
+
+    if (*p == '0') {
+        p++;
+    } else if (*p >= '1' && *p <= '9') {
+        while (isdigit((unsigned char)*p)) p++;
+    } else {
+        return false;
+    }
+
+    if (*p == '.') {
+        p++;
+        if (!isdigit((unsigned char)*p)) return false;
+        while (isdigit((unsigned char)*p)) p++;
+    }
+
+    if (*p == 'e' || *p == 'E') {
+        p++;
+        if (*p == '+' || *p == '-') p++;
+        if (!isdigit((unsigned char)*p)) return false;
+        while (isdigit((unsigned char)*p)) p++;
+    }
+
+    return *p == '\0';
+}
+
 size_t Payload::write_json(char* buf, size_t buf_size) const {
     if (!buf || buf_size < 3) {
         if (buf && buf_size > 0) buf[0] = '\0';
+        g_payload_serialize_overflow++;
+        payload_note_error(PAYLOAD_ERR_SERIALIZE_OVERFLOW, "write_json_buf", this);
+        return 0;
+    }
+
+    if (!_self_ok("write_json")) {
+        buf[0] = '\0';
         return 0;
     }
 
@@ -401,12 +820,12 @@ size_t Payload::write_json(char* buf, size_t buf_size) const {
     bool overflow = false;
 
     auto remaining = [&]() -> size_t {
-        return buf_size - pos - 1;
+        return buf_size - pos - 1U;
     };
 
     auto append_char = [&](char c) {
         if (overflow) return;
-        if (remaining() < 1) { overflow = true; return; }
+        if (remaining() < 1U) { overflow = true; return; }
         buf[pos++] = c;
     };
 
@@ -424,14 +843,22 @@ size_t Payload::write_json(char* buf, size_t buf_size) const {
     auto append_escaped = [&](const char* s) {
         if (overflow || !s) return;
         while (*s) {
-            char c = *s++;
+            const unsigned char c = (unsigned char)*s++;
             switch (c) {
-                case '\"': append_str("\\\"", 2); break;
+                case '"': append_str("\\\"", 2); break;
                 case '\\': append_str("\\\\", 2); break;
                 case '\n': append_str("\\n", 2);  break;
                 case '\r': append_str("\\r", 2);  break;
                 case '\t': append_str("\\t", 2);  break;
-                default:   append_char(c);        break;
+                default:
+                    if (c < 0x20U) {
+                        char esc[7];
+                        snprintf(esc, sizeof(esc), "\\u%04X", (unsigned)c);
+                        append_str(esc, 6);
+                    } else {
+                        append_char((char)c);
+                    }
+                    break;
             }
             if (overflow) return;
         }
@@ -446,7 +873,7 @@ size_t Payload::write_json(char* buf, size_t buf_size) const {
         const char* key = _at(e.key_off);
         const char* val = _at(e.val_off);
 
-        append_char('\"');
+        append_char('"');
         append_escaped(key);
         append_str("\":", 2);
 
@@ -454,18 +881,15 @@ size_t Payload::write_json(char* buf, size_t buf_size) const {
 
         switch (e.kind) {
             case 'p': {
-                if (strcmp(val, "true") == 0 || strcmp(val, "false") == 0) {
+                if (strcmp(val, "true") == 0 ||
+                    strcmp(val, "false") == 0 ||
+                    strcmp(val, "null") == 0 ||
+                    is_json_number_literal(val)) {
                     append(val);
                 } else {
-                    char* end = nullptr;
-                    strtod(val, &end);
-                    if (val[0] != '\0' && end && *end == '\0') {
-                        append(val);
-                    } else {
-                        append_char('\"');
-                        append_escaped(val);
-                        append_char('\"');
-                    }
+                    append_char('"');
+                    append_escaped(val);
+                    append_char('"');
                 }
                 break;
             }
@@ -476,6 +900,8 @@ size_t Payload::write_json(char* buf, size_t buf_size) const {
                 break;
 
             default:
+                g_payload_invalid_kind++;
+                payload_note_error(PAYLOAD_ERR_INVALID_KIND, "write_json_kind", this);
                 append_str("null", 4);
                 break;
         }
@@ -485,6 +911,8 @@ size_t Payload::write_json(char* buf, size_t buf_size) const {
 
     if (overflow) {
         buf[0] = '\0';
+        g_payload_serialize_overflow++;
+        payload_note_error(PAYLOAD_ERR_SERIALIZE_OVERFLOW, "write_json_overflow", this);
         return 0;
     }
 
@@ -493,116 +921,277 @@ size_t Payload::write_json(char* buf, size_t buf_size) const {
 }
 
 String Payload::to_json() const {
-    size_t buf_size = (_arena_used * 2) + (_count * 32) + 64;
-    if (buf_size < 256) buf_size = 256;
-    if (buf_size > ARENA_MAX) buf_size = ARENA_MAX;
-
-    char* json_buf = (char*)malloc(buf_size);
-    if (!json_buf) {
+    if (!_self_ok("to_json")) {
+        g_payload_to_json_fail++;
         return String("{}");
     }
 
-    size_t json_len = write_json(json_buf, buf_size);
-    if (json_len == 0) {
+    size_t buf_size = payload_initial_json_buffer_size(*this);
+
+    while (buf_size <= ARENA_MAX) {
+        char* json_buf = (char*)malloc(buf_size);
+        if (!json_buf) {
+            g_payload_arena_alloc_fail++;
+            payload_note_error(PAYLOAD_ERR_ARENA_ALLOC_FAIL, "to_json_alloc", this);
+            break;
+        }
+
+        const size_t json_len = write_json(json_buf, buf_size);
+        if (json_len != 0) {
+            String out(json_buf);
+            free(json_buf);
+            return out;
+        }
+
         free(json_buf);
-        return String("{}");
+        if (buf_size == ARENA_MAX) break;
+        buf_size *= 2U;
+        if (buf_size > ARENA_MAX) buf_size = ARENA_MAX;
     }
 
-    String out(json_buf);
-    free(json_buf);
-    return out;
+    g_payload_to_json_fail++;
+    payload_note_error(PAYLOAD_ERR_TO_JSON_FAIL, "to_json", this);
+    return String("{}");
 }
 
 // ============================================================================
 // Parsing — canonicalizes JSON into entries[] + arena
 // ============================================================================
 
+static void skip_ws(const uint8_t* data, size_t len, size_t& i) {
+    while (i < len && (data[i] == ' ' || data[i] == '\t' ||
+                       data[i] == '\n' || data[i] == '\r')) {
+        i++;
+    }
+}
+
+static bool scan_json_string(const uint8_t* data, size_t len, size_t& i,
+                             size_t& content_start, size_t& content_len) {
+    if (i >= len || data[i] != '"') return false;
+    content_start = ++i;
+
+    bool escape = false;
+    while (i < len) {
+        const uint8_t c = data[i];
+        if (escape) {
+            escape = false;
+            i++;
+            continue;
+        }
+        if (c == '\\') {
+            escape = true;
+            i++;
+            continue;
+        }
+        if (c == '"') {
+            content_len = i - content_start;
+            i++;
+            return true;
+        }
+        i++;
+    }
+    return false;
+}
+
+static bool scan_json_balanced(const uint8_t* data, size_t len, size_t& i,
+                               uint8_t open_c, uint8_t close_c,
+                               size_t& value_start, size_t& value_len) {
+    (void)open_c;
+    (void)close_c;
+    if (i >= len || (data[i] != '{' && data[i] != '[')) return false;
+    value_start = i;
+
+    int brace_depth = 0;
+    int bracket_depth = 0;
+    bool in_string = false;
+    bool escape = false;
+
+    while (i < len) {
+        const uint8_t c = data[i++];
+
+        if (in_string) {
+            if (escape) {
+                escape = false;
+            } else if (c == '\\') {
+                escape = true;
+            } else if (c == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+
+        if (c == '"') {
+            in_string = true;
+            continue;
+        }
+        if (c == '{') brace_depth++;
+        else if (c == '}') brace_depth--;
+        else if (c == '[') bracket_depth++;
+        else if (c == ']') bracket_depth--;
+
+        if (brace_depth < 0 || bracket_depth < 0) {
+            return false;
+        }
+        if (brace_depth == 0 && bracket_depth == 0) {
+            value_len = i - value_start;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool scan_json_primitive(const uint8_t* data, size_t len, size_t& i,
+                                size_t& value_start, size_t& value_len) {
+    value_start = i;
+    while (i < len && data[i] != ',' && data[i] != '}') {
+        i++;
+    }
+    value_len = i - value_start;
+    while (value_len > 0) {
+        const uint8_t c = data[value_start + value_len - 1U];
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+            value_len--;
+        } else {
+            break;
+        }
+    }
+    return value_len > 0;
+}
+
 bool Payload::parseJSON(const uint8_t* data, size_t len) {
     clear();
 
-    if (!data || len < 2 || data[0] != '{') {
+    if (!data || len < 2) {
+        g_payload_parse_error++;
+        payload_note_error(PAYLOAD_ERR_PARSE_ERROR, "parse_null", this);
         return false;
     }
 
-    size_t i = 1;
+    size_t i = 0;
+    skip_ws(data, len, i);
+    if (i >= len || data[i] != '{') {
+        g_payload_parse_error++;
+        payload_note_error(PAYLOAD_ERR_PARSE_ERROR, "parse_open", this);
+        return false;
+    }
+    i++;
 
-    while (i < len && _count < MAX_ENTRIES) {
+    skip_ws(data, len, i);
+    if (i < len && data[i] == '}') {
+        return true;
+    }
 
-        while (i < len && data[i] != '\"') i++;
-        if (i >= len) break;
+    while (i < len) {
+        skip_ws(data, len, i);
 
-        size_t key_start = ++i;
-        while (i < len && data[i] != '\"') i++;
-        if (i >= len) break;
+        size_t key_start = 0;
+        size_t key_len = 0;
+        if (!scan_json_string(data, len, i, key_start, key_len)) {
+            g_payload_parse_error++;
+            payload_note_error(PAYLOAD_ERR_PARSE_ERROR, "parse_key", this);
+            return false;
+        }
 
-        size_t key_len = i - key_start;
+        skip_ws(data, len, i);
+        if (i >= len || data[i] != ':') {
+            g_payload_parse_error++;
+            payload_note_error(PAYLOAD_ERR_PARSE_ERROR, "parse_colon", this);
+            return false;
+        }
         i++;
+        skip_ws(data, len, i);
+        if (i >= len) {
+            g_payload_parse_error++;
+            payload_note_error(PAYLOAD_ERR_PARSE_ERROR, "parse_value_missing", this);
+            return false;
+        }
 
-        while (i < len && data[i] != ':') i++;
-        if (i >= len) break;
-        i++;
-
-        while (i < len && (data[i] == ' ' || data[i] == '\t' ||
-                           data[i] == '\n' || data[i] == '\r')) i++;
-        if (i >= len) break;
-
-        char kind =
-            data[i] == '{' ? 'o' :
-            data[i] == '[' ? 'a' :
-            'p';
-
+        char kind = 'p';
         size_t value_start = i;
+        size_t value_len = 0;
 
-        if (kind == 'p') {
-            while (i < len && data[i] != ',' && data[i] != '}') i++;
-        } else {
-            int depth = 0;
-            do {
-                if (data[i] == '{' || data[i] == '[') depth++;
-                if (data[i] == '}' || data[i] == ']') depth--;
-                i++;
-            } while (i < len && depth > 0);
-        }
-
-        size_t value_len = i - value_start;
-
-        if (kind == 'p') {
-            while (value_len > 0 &&
-                   (data[value_start + value_len - 1] == ' ' ||
-                    data[value_start + value_len - 1] == '\t' ||
-                    data[value_start + value_len - 1] == '\n' ||
-                    data[value_start + value_len - 1] == '\r')) {
-                value_len--;
+        if (data[i] == '"') {
+            if (!scan_json_string(data, len, i, value_start, value_len)) {
+                g_payload_parse_error++;
+                payload_note_error(PAYLOAD_ERR_PARSE_ERROR, "parse_string", this);
+                return false;
             }
+            kind = 'p';
+        } else if (data[i] == '{') {
+            if (!scan_json_balanced(data, len, i, '{', '}', value_start, value_len)) {
+                g_payload_parse_error++;
+                payload_note_error(PAYLOAD_ERR_PARSE_ERROR, "parse_object", this);
+                return false;
+            }
+            kind = 'o';
+        } else if (data[i] == '[') {
+            if (!scan_json_balanced(data, len, i, '[', ']', value_start, value_len)) {
+                g_payload_parse_error++;
+                payload_note_error(PAYLOAD_ERR_PARSE_ERROR, "parse_array", this);
+                return false;
+            }
+            kind = 'a';
+        } else {
+            if (!scan_json_primitive(data, len, i, value_start, value_len)) {
+                g_payload_parse_error++;
+                payload_note_error(PAYLOAD_ERR_PARSE_ERROR, "parse_primitive", this);
+                return false;
+            }
+            kind = 'p';
         }
 
-        uint16_t k_off = _put((const char*)(data + key_start), key_len);
-        if (k_off == UINT16_MAX) break;
-
-        const char* val_ptr = (const char*)(data + value_start);
-        size_t      val_len = value_len;
-
-        if (kind == 'p' && val_len >= 2 &&
-            val_ptr[0] == '\"' && val_ptr[val_len - 1] == '\"') {
-            val_ptr++;
-            val_len -= 2;
+        if (_count >= MAX_ENTRIES) {
+            g_payload_entry_overflow++;
+            payload_note_error(PAYLOAD_ERR_ENTRY_OVERFLOW, "parse_entries", this);
+            return false;
         }
 
-        uint16_t v_off = _put(val_ptr, val_len);
-        if (v_off == UINT16_MAX) break;
+        if (!_ensure_entries(_count + 1U)) return false;
+
+        const size_t arena_mark = _arena_used;
+        const uint16_t k_off = _put((const char*)(data + key_start), key_len);
+        if (k_off == UINT16_MAX) {
+            _arena_used = arena_mark;
+            return false;
+        }
+
+        const uint16_t v_off = _put((const char*)(data + value_start), value_len);
+        if (v_off == UINT16_MAX) {
+            _arena_used = arena_mark;
+            return false;
+        }
 
         _entries[_count++] = {
             k_off,
             v_off,
-            (uint16_t)val_len,
+            (uint16_t)value_len,
             kind,
             0
         };
 
-        if (i < len && data[i] == ',') i++;
+        if (_count > g_payload_entry_high_water_global) {
+            g_payload_entry_high_water_global = _count;
+        }
+
+        skip_ws(data, len, i);
+        if (i < len && data[i] == ',') {
+            i++;
+            continue;
+        }
+        if (i < len && data[i] == '}') {
+            return true;
+        }
+
+        // Permit trailing whitespace after the closing object only.
+        if (i >= len) break;
+        g_payload_parse_error++;
+        payload_note_error(PAYLOAD_ERR_PARSE_ERROR, "parse_separator", this);
+        return false;
     }
 
-    return true;
+    g_payload_parse_error++;
+    payload_note_error(PAYLOAD_ERR_PARSE_ERROR, "parse_eof", this);
+    return false;
 }
 
 // ============================================================================
@@ -754,17 +1343,22 @@ PayloadArrayView Payload::getArrayView(const char* key) const {
 // ============================================================================
 
 void Payload::debug_dump(const char* tag) const {
-    char line[128];
+    char line[160];
 
     snprintf(
         line, sizeof(line),
-        "Payload dump (%s): %u entries, arena %u/%u bytes",
+        "Payload dump (%s): %u entries cap=%u arena %u/%u bytes heap_entries=%u sizeof=%u",
         tag ? tag : "",
         (unsigned)_count,
+        (unsigned)_entry_cap,
         (unsigned)_arena_used,
-        (unsigned)_arena_cap
+        (unsigned)_arena_cap,
+        (unsigned)(_entries != _inline_entries),
+        (unsigned)sizeof(Payload)
     );
     debug_log("payload", line);
+
+    if (!_self_ok("debug_dump")) return;
 
     for (size_t i = 0; i < _count; i++) {
         const Entry& e = _entries[i];
@@ -806,24 +1400,44 @@ bool PayloadArrayView::valid() const {
 size_t PayloadArrayView::size() const {
     if (!valid()) return 0;
 
+    size_t first = 1;
+    while (first < _len && (_json[first] == ' ' || _json[first] == '\t' ||
+                            _json[first] == '\n' || _json[first] == '\r')) {
+        first++;
+    }
+    if (first < _len && _json[first] == ']') {
+        return 0;
+    }
+
     size_t count = 0;
     int depth = 0;
     bool in_string = false;
+    bool escape = false;
 
     for (size_t i = 0; i < _len; i++) {
-        char c = _json[i];
+        const char c = _json[i];
 
-        if (c == '\"' && (i == 0 || _json[i - 1] != '\\')) {
-            in_string = !in_string;
+        if (in_string) {
+            if (escape) {
+                escape = false;
+            } else if (c == '\\') {
+                escape = true;
+            } else if (c == '"') {
+                in_string = false;
+            }
+            continue;
         }
-        if (in_string) continue;
 
+        if (c == '"') {
+            in_string = true;
+            continue;
+        }
         if (c == '{' || c == '[') depth++;
         if (c == '}' || c == ']') depth--;
         if (c == ',' && depth == 1) count++;
     }
 
-    return count + 1;
+    return count + 1U;
 }
 
 Payload PayloadArrayView::get(size_t index) const {
@@ -833,33 +1447,43 @@ Payload PayloadArrayView::get(size_t index) const {
     size_t current = 0;
     int depth = 0;
     bool in_string = false;
+    bool escape = false;
     size_t start = 0;
 
     for (size_t i = 1; i < _len; i++) {
-        char c = _json[i];
+        const char c = _json[i];
 
-        if (c == '\"' && _json[i - 1] != '\\') {
-            in_string = !in_string;
+        if (in_string) {
+            if (escape) {
+                escape = false;
+            } else if (c == '\\') {
+                escape = true;
+            } else if (c == '"') {
+                in_string = false;
+            }
+            continue;
         }
-        if (in_string) continue;
 
-        if (c == '{' || c == '[') {
+        if (c == '"') {
+            in_string = true;
+            continue;
+        }
+
+        if (c == '{') {
             if (depth == 0 && current == index) start = i;
             depth++;
-        }
-
-        if (c == '}' || c == ']') {
+        } else if (c == '}') {
             depth--;
             if (depth == 0 && current == index) {
                 out.parseJSON(
                     (const uint8_t*)(_json + start),
-                    i - start + 1
+                    i - start + 1U
                 );
                 return out;
             }
+        } else if (c == ',' && depth == 0) {
+            current++;
         }
-
-        if (c == ',' && depth == 0) current++;
     }
 
     return Payload();
@@ -915,11 +1539,28 @@ bool PayloadArray::parseJSON(const char* json) {
 
         int v0 = i;
         int depth = 0;
+        bool in_string = false;
+        bool escape = false;
 
         do {
-            if (json[i] == '{') depth++;
-            if (json[i] == '}') depth--;
-            i++;
+            const char c = json[i++];
+            if (in_string) {
+                if (escape) {
+                    escape = false;
+                } else if (c == '\\') {
+                    escape = true;
+                } else if (c == '"') {
+                    in_string = false;
+                }
+                continue;
+            }
+            if (c == '"') {
+                in_string = true;
+            } else if (c == '{') {
+                depth++;
+            } else if (c == '}') {
+                depth--;
+            }
         } while (depth > 0 && json[i]);
 
         _items[_item_count].parseJSON(
@@ -950,15 +1591,51 @@ void payload_get_info(payload_info_t* out)
 {
     if (!out) return;
 
+    memset(out, 0, sizeof(*out));
+
+    out->payload_object_size       = (uint32_t)sizeof(Payload);
+    out->payload_entry_size        = (uint32_t)sizeof(Payload::Entry);
+    out->payload_array_object_size = (uint32_t)sizeof(PayloadArray);
+    out->payload_inline_entries    = (uint32_t)Payload::INLINE_ENTRIES;
+    out->payload_max_entries       = (uint32_t)Payload::MAX_ENTRIES;
+    out->payload_arena_initial     = (uint32_t)Payload::ARENA_INITIAL;
+    out->payload_arena_max         = (uint32_t)Payload::ARENA_MAX;
+
     out->instances_constructed = g_payload_instances_constructed;
     out->instances_destroyed   = g_payload_instances_destroyed;
 
     out->alive_now             = g_payload_alive_now;
     out->alive_high_water      = g_payload_alive_high_water;
 
-    out->arena_alloc_fail      = g_payload_arena_alloc_fail;
-    out->arena_high_water      = g_payload_arena_high_water_global;
-
+    out->entry_alloc_fail      = g_payload_entry_alloc_fail;
+    out->entry_realloc_count   = g_payload_entry_realloc_count;
+    out->entry_heap_bytes_alive = g_payload_entry_heap_bytes_alive;
+    out->entry_heap_bytes_high_water = g_payload_entry_heap_bytes_high_water;
     out->entry_overflow        = g_payload_entry_overflow;
     out->entry_high_water      = g_payload_entry_high_water_global;
+    out->max_entry_capacity_seen = g_payload_max_entry_capacity_seen;
+
+    out->arena_alloc_fail      = g_payload_arena_alloc_fail;
+    out->arena_realloc_count   = g_payload_arena_realloc_count;
+    out->arena_heap_bytes_alive = g_payload_arena_heap_bytes_alive;
+    out->arena_heap_bytes_high_water = g_payload_arena_heap_bytes_high_water;
+    out->arena_high_water      = g_payload_arena_high_water_global;
+    out->max_arena_capacity_seen = g_payload_max_arena_capacity_seen;
+
+    out->serialize_overflow    = g_payload_serialize_overflow;
+    out->to_json_fail          = g_payload_to_json_fail;
+    out->string_truncation     = g_payload_string_truncation;
+    out->parse_error           = g_payload_parse_error;
+    out->integrity_fail        = g_payload_integrity_fail;
+    out->invalid_kind          = g_payload_invalid_kind;
+
+    out->last_error_code       = g_payload_last_error_code;
+    out->last_error_count      = g_payload_last_error_count;
+    out->last_error_this       = g_payload_last_error_this;
+    do {
+        size_t n = strlen(g_payload_last_error_op);
+        if (n >= sizeof(out->last_error_op)) n = sizeof(out->last_error_op) - 1;
+        memcpy(out->last_error_op, g_payload_last_error_op, n);
+        out->last_error_op[n] = '\0';
+    } while (0);
 }
