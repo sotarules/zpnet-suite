@@ -19,7 +19,6 @@
 #include "process.h"
 #include "events.h"
 #include "payload.h"
-#include "publish.h"
 #include "cpu_usage.h"
 #include "util.h"
 #include "timepop.h"
@@ -41,7 +40,6 @@ void system_enter_quiescence(void);
 extern "C" void enter_bootloader_cleanly(void);
 
 static Payload system_features_tree_payload(void);
-static void system_feature_schedule_fragment_publish(void);
 
 // --------------------------------------------------------------
 // Internal terminal state
@@ -53,20 +51,6 @@ static bool system_cpu_window_initialized = false;
 static uint64_t system_cpu_window_last_wall_cycles = 0;
 static uint64_t system_cpu_window_last_idle_cycles = 0;
 
-// --------------------------------------------------------------
-// FEATURE_STATUS_FRAGMENT publication custody
-// --------------------------------------------------------------
-// system_feature_set() may be reached by timing subsystems, so it only marks the
-// scalar feature tree dirty and requests an ALAP foreground service.  The service
-// publishes one compact FEATURE_STATUS_FRAGMENT containing Teensy-owned feature
-// state.  zpnet-system on the Pi relays the unified FEATURE_STATUS tree.
-
-static volatile bool g_system_feature_fragment_publish_enabled = false;
-static volatile bool g_system_feature_fragment_dirty = false;
-static volatile bool g_system_feature_fragment_service_armed = false;
-static uint32_t g_system_feature_fragment_publish_count = 0;
-static uint32_t g_system_feature_fragment_service_arm_count = 0;
-static uint32_t g_system_feature_fragment_service_arm_failures = 0;
 
 // ================================================================
 // Feature status substrate
@@ -131,52 +115,6 @@ bool system_feature_status_parse(const char* status,
   return false;
 }
 
-static void system_feature_fragment_publish_service(timepop_ctx_t*,
-                                                    timepop_diag_t*,
-                                                    void*) {
-  g_system_feature_fragment_service_armed = false;
-
-  if (!g_system_feature_fragment_publish_enabled ||
-      !g_system_feature_fragment_dirty) {
-    return;
-  }
-
-  g_system_feature_fragment_dirty = false;
-
-  Payload fragment = system_features_tree_payload();
-  publish("FEATURE_STATUS_FRAGMENT", fragment);
-  g_system_feature_fragment_publish_count++;
-
-  if (g_system_feature_fragment_dirty) {
-    system_feature_schedule_fragment_publish();
-  }
-}
-
-static void system_feature_schedule_fragment_publish(void) {
-  if (!g_system_feature_fragment_publish_enabled ||
-      !g_system_feature_fragment_dirty ||
-      g_system_feature_fragment_service_armed) {
-    return;
-  }
-
-  const timepop_handle_t handle =
-      timepop_arm_alap(system_feature_fragment_publish_service,
-                       nullptr,
-                       "SYSTEM_FEATURE_STATUS_FRAGMENT");
-
-  if (handle == TIMEPOP_INVALID_HANDLE) {
-    g_system_feature_fragment_service_arm_failures++;
-    return;
-  }
-
-  g_system_feature_fragment_service_armed = true;
-  g_system_feature_fragment_service_arm_count++;
-}
-
-static void system_feature_note_changed(void) {
-  g_system_feature_fragment_dirty = true;
-  system_feature_schedule_fragment_publish();
-}
 
 static int system_feature_find(const char* subsystem,
                                const char* feature) {
@@ -233,7 +171,6 @@ bool system_feature_set(const char* subsystem,
 
   slot.status = status;
   (void)detail;
-  system_feature_note_changed();
   return true;
 }
 
@@ -441,19 +378,11 @@ static Payload cmd_report(const Payload& /*args*/) {
   p.add("cpu_idle_witness_exit_count", idle.exit_count);
   p.add("cpu_idle_witness_last_residency_cycles", idle.last_residency_cycles);
 
-  p.add("feature_status_fragment_publish_count", g_system_feature_fragment_publish_count);
-  p.add("feature_status_fragment_dirty", (bool)g_system_feature_fragment_dirty);
-  p.add("feature_status_fragment_service_armed", (bool)g_system_feature_fragment_service_armed);
-  p.add("feature_status_fragment_service_arm_count", g_system_feature_fragment_service_arm_count);
-  p.add("feature_status_fragment_service_arm_failures", g_system_feature_fragment_service_arm_failures);
-
   // Legacy accounted callback-busy diagnostics.
   p.add("cpu_accounted_busy_pct", cpu_usage_get_percent());
   p.add("cpu_busy_cycles", cpu_usage_get_busy_cycles());
   p.add("cpu_total_cycles", cpu_usage_get_total_cycles());
   p.add("cpu_sample_window_ms", cpu_usage_get_sample_window_ms());
-
-  p.add_object("features", system_features_tree_payload());
 
   return p;
 }
@@ -906,10 +835,5 @@ static const process_vtable_t SYSTEM_PROCESS = {
 };
 
 void process_system_register(void) {
-  system_feature_set("SYSTEM", "FEATURE_STATUS",
-                     system_feature_status_t::NOMINAL,
-                     "Teensy SYSTEM feature registry online");
   process_register("SYSTEM", &SYSTEM_PROCESS);
-  g_system_feature_fragment_publish_enabled = true;
-  system_feature_schedule_fragment_publish();
 }

@@ -132,7 +132,7 @@ from zpnet.processes.processes import (
 from zpnet.shared.constants import Payload
 from zpnet.shared.db import open_db
 from zpnet.shared.logger import setup_logging
-from zpnet.shared.util import blocking_features, system_time_z
+from zpnet.shared.util import normalize_feature_status, system_time_z
 from zpnet.shared.events import create_event
 
 # ---------------------------------------------------------------------
@@ -173,30 +173,27 @@ TIMEBASE_FRAGMENT_TOPIC = "TIMEBASE_FRAGMENT"
 TIMEBASE_FORENSICS_TOPIC = "TIMEBASE_FORENSICS"
 TIMEBASE_PAIR_TIMEOUT_S = 5.0
 
-PREFLIGHT_POLL_INTERVAL_S = 30
+PREFLIGHT_POLL_INTERVAL_S = 10
 PREFLIGHT_LOG_PREFIX = "🛡️ [preflight]"
 STARTUP_TEENSY_QUIET_DELAY_S = 20.0
 TIMEBASE_SILENCE_TIMEOUT_S = 30.0
 TIMEBASE_SILENCE_MONITOR_POLL_S = 1.0
 TEENSY_HEALTH_RETRY_S = 60.0
 
-# Feature-status campaign preflight.
+# Pull-only feature preflight.
 #
-# This first-pass gate deliberately uses the global PI SYSTEM feature tree,
-# because Pi SYSTEM has the broadest horizon: Pi-local GNSS/host/power state
-# plus imported Teensy-local timing readiness.  Runtime TIMEBASE pair
-# integrity, database command-contract checks, GNSS mode reconciliation, and
-# recovery projection remain local CLOCKS logic.
-FEATURE_PREFLIGHT_PROFILE = "CAMPAIGN_PREFLIGHT"
-FEATURE_PREFLIGHT_REQUIRED = (
-    "PI.SYSTEM.FEATURE_STATUS",
+# Feature state is no longer a pushed or merged FEATURE_STATUS stream.
+# CLOCKS acts as a client: it asks each authority for its own state and
+# evaluates the campaign profile locally.  Pi SYSTEM supplies only PI.* feature
+# state.  Teensy SYSTEM supplies only TEENSY.* feature state.  Service-specific
+# Pi readiness such as GNSS is checked by that service's command surface.
+FEATURE_PREFLIGHT_PROFILE = "COMMAND_PULL_CAMPAIGN_PREFLIGHT"
+PI_SYSTEM_FEATURE_PREFLIGHT_REQUIRED = (
     "PI.SYSTEM.HOST",
     "PI.SYSTEM.POWER",
     "PI.SYSTEM.BATTERY",
-    "PI.SYSTEM.TEENSY_FEATURE_IMPORT",
-    "PI.GNSS.REPORT",
-    "TEENSY.SYSTEM.FEATURE_STATUS",
-    "TEENSY.INTERRUPT.FLOORLINE",
+)
+TEENSY_SYSTEM_FEATURE_PREFLIGHT_REQUIRED = (
     "TEENSY.INTERRUPT.PPS_VCLOCK_AUTHORITY",
     "TEENSY.INTERRUPT.QTIMER_COUNTER_CUSTODY",
     "TEENSY.INTERRUPT.QTIMER_DWT_RULER",
@@ -206,6 +203,9 @@ FEATURE_PREFLIGHT_REQUIRED = (
     "TEENSY.CLOCKS.SMARTZERO",
     "TEENSY.CLOCKS.ALPHA_EPOCH",
     "TEENSY.CLOCKS.OCXO_PUBLIC_ORIGIN",
+)
+PI_SERVICE_FEATURE_PREFLIGHT_REQUIRED = (
+    "PI.GNSS.REPORT",
 )
 
 # ---------------------------------------------------------------------
@@ -3597,12 +3597,12 @@ def cmd_set_baseline(args: Optional[dict]) -> Dict[str, Any]:
     return {"success": True, "message": "OK", "payload": baseline_blob}
 
 # ---------------------------------------------------------------------
-# Feature-status preflight gate
+# Pull-only feature preflight gate
 # ---------------------------------------------------------------------
 
 
-def _fetch_system_features() -> Dict[str, Any]:
-    """Fetch the global feature tree from Pi SYSTEM.  Command/response only."""
+def _fetch_pi_system_features() -> Dict[str, Any]:
+    """Fetch Pi-local feature state from Pi SYSTEM.  Command/response only."""
     resp = send_command(machine="PI", subsystem="SYSTEM", command="FEATURES")
     if not resp.get("success"):
         raise RuntimeError(f"PI SYSTEM FEATURES failed: {resp.get('message', '?')}")
@@ -3612,6 +3612,78 @@ def _fetch_system_features() -> Dict[str, Any]:
         raise RuntimeError("PI SYSTEM FEATURES returned non-dict payload")
 
     return payload
+
+
+def _fetch_teensy_system_features() -> Dict[str, Any]:
+    """Fetch Teensy-local feature state from Teensy SYSTEM.  Command/response only."""
+    resp = send_command(machine="TEENSY", subsystem="SYSTEM", command="FEATURES")
+    if not resp.get("success"):
+        raise RuntimeError(f"TEENSY SYSTEM FEATURES failed: {resp.get('message', '?')}")
+
+    payload = resp.get("payload", {})
+    if not isinstance(payload, dict):
+        raise RuntimeError("TEENSY SYSTEM FEATURES returned non-dict payload")
+
+    return payload
+
+
+def _feature_status_from_tree(features: Dict[str, Any], name: str) -> str:
+    """Return a normalized status from a MACHINE.SUBSYSTEM.FEATURE path."""
+    parts = str(name or "").strip().upper().split(".")
+    if len(parts) != 3:
+        return "ANOMALY"
+
+    machine, subsystem, feature = parts
+    try:
+        status = features.get(machine, {}).get(subsystem, {}).get(feature)
+    except AttributeError:
+        status = None
+
+    return normalize_feature_status(status, default="INITIALIZING")
+
+
+def _feature_requirement_blockers(
+    features: Dict[str, Any],
+    required: tuple[str, ...],
+) -> list[Dict[str, str]]:
+    blockers: list[Dict[str, str]] = []
+    for name in required:
+        status = _feature_status_from_tree(features, name)
+        if status != "NOMINAL":
+            blockers.append({"name": name, "status": status, "detail": ""})
+    return blockers
+
+
+def _gnss_service_feature_blockers() -> list[Dict[str, str]]:
+    """Check Pi GNSS directly instead of consuming a relayed feature tree."""
+    blockers: list[Dict[str, str]] = []
+    try:
+        resp = send_command(machine="PI", subsystem="GNSS", command="REPORT")
+        if not resp.get("success"):
+            return [{
+                "name": "PI.GNSS.REPORT",
+                "status": "ANOMALY",
+                "detail": str(resp.get("message") or "command failed"),
+            }]
+
+        payload = resp.get("payload", {})
+        status = normalize_feature_status(
+            payload.get("health_state") if isinstance(payload, dict) else None,
+            default="NOMINAL",
+        )
+        if status != "NOMINAL":
+            blockers.append({
+                "name": "PI.GNSS.REPORT",
+                "status": status,
+                "detail": "GNSS REPORT health_state",
+            })
+    except Exception as e:
+        blockers.append({
+            "name": "PI.GNSS.REPORT",
+            "status": "ANOMALY",
+            "detail": str(e),
+        })
+    return blockers
 
 
 def _feature_gate_reason(blocker: Dict[str, Any]) -> str:
@@ -3624,23 +3696,41 @@ def _feature_gate_reason(blocker: Dict[str, Any]) -> str:
 
 
 def _check_feature_preflight(context: str) -> tuple[bool, list[str]]:
-    """Check the standardized feature-status campaign preflight profile."""
+    """Check campaign readiness by pulling each authority's feature state."""
     _diag["preflight_feature_checks"] += 1
 
     try:
-        features = _fetch_system_features()
+        pi_features = _fetch_pi_system_features()
+        teensy_features = _fetch_teensy_system_features()
     except Exception as e:
         _diag["preflight_feature_unavailable"] += 1
         _diag["last_preflight_feature_gate"] = {
             "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "context": context,
             "profile": FEATURE_PREFLIGHT_PROFILE,
+            "source": "COMMAND_PULL",
             "status": "UNAVAILABLE",
             "error": str(e),
         }
-        return False, [f"{FEATURE_PREFLIGHT_PROFILE}: feature tree unavailable ({e})"]
+        return False, [f"{FEATURE_PREFLIGHT_PROFILE}: feature command unavailable ({e})"]
 
-    blockers = blocking_features(features, FEATURE_PREFLIGHT_REQUIRED)
+    blockers: list[Dict[str, str]] = []
+    blockers.extend(_feature_requirement_blockers(
+        pi_features,
+        PI_SYSTEM_FEATURE_PREFLIGHT_REQUIRED,
+    ))
+    blockers.extend(_feature_requirement_blockers(
+        teensy_features,
+        TEENSY_SYSTEM_FEATURE_PREFLIGHT_REQUIRED,
+    ))
+    blockers.extend(_gnss_service_feature_blockers())
+
+    required_count = (
+        len(PI_SYSTEM_FEATURE_PREFLIGHT_REQUIRED)
+        + len(TEENSY_SYSTEM_FEATURE_PREFLIGHT_REQUIRED)
+        + len(PI_SERVICE_FEATURE_PREFLIGHT_REQUIRED)
+    )
+
     if blockers:
         _diag["preflight_feature_blocked"] += 1
         compact_blockers = [
@@ -3655,8 +3745,12 @@ def _check_feature_preflight(context: str) -> tuple[bool, list[str]]:
             "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "context": context,
             "profile": FEATURE_PREFLIGHT_PROFILE,
+            "source": "COMMAND_PULL",
             "status": "BLOCKED",
-            "required_count": len(FEATURE_PREFLIGHT_REQUIRED),
+            "required_count": required_count,
+            "pi_system_required": list(PI_SYSTEM_FEATURE_PREFLIGHT_REQUIRED),
+            "teensy_system_required": list(TEENSY_SYSTEM_FEATURE_PREFLIGHT_REQUIRED),
+            "pi_service_required": list(PI_SERVICE_FEATURE_PREFLIGHT_REQUIRED),
             "blockers": compact_blockers,
         }
         return False, [
@@ -3668,8 +3762,12 @@ def _check_feature_preflight(context: str) -> tuple[bool, list[str]]:
         "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "context": context,
         "profile": FEATURE_PREFLIGHT_PROFILE,
+        "source": "COMMAND_PULL",
         "status": "NOMINAL",
-        "required_count": len(FEATURE_PREFLIGHT_REQUIRED),
+        "required_count": required_count,
+        "pi_system_required": list(PI_SYSTEM_FEATURE_PREFLIGHT_REQUIRED),
+        "teensy_system_required": list(TEENSY_SYSTEM_FEATURE_PREFLIGHT_REQUIRED),
+        "pi_service_required": list(PI_SERVICE_FEATURE_PREFLIGHT_REQUIRED),
     }
     return True, []
 
@@ -3771,16 +3869,12 @@ def _wait_for_preflight(context: str = "recovery") -> None:
     """
     Block until all preflight prerequisites are met.
 
-    On cluster restart, the GNSS process needs a few seconds to parse
-    its first NMEA sentences.  We poll silently at 2-second intervals
-    for the first PREFLIGHT_GRACE_S seconds before switching to the
-    normal 30-second polling with logged warnings.
+    Feature status is pull-only, so startup/recovery checks are intentionally
+    conservative: one command-poll cycle every PREFLIGHT_POLL_INTERVAL_S
+    seconds until all requirements are open.
     """
     attempt = 0
     t0 = time.monotonic()
-
-    GRACE_S = 15.0        # silent fast-poll window
-    GRACE_POLL_S = 2.0    # poll interval during grace period
 
     while True:
         ready, reasons = _check_preflight(context)
@@ -3803,19 +3897,13 @@ def _wait_for_preflight(context: str = "recovery") -> None:
 
         attempt += 1
         elapsed = time.monotonic() - t0
-
-        if elapsed >= GRACE_S:
-            # Past grace period — log warnings at normal interval
-            reason_block = "\n".join(f"    • {r}" for r in reasons)
-            logging.info(
-                "%s @%s not ready for %s (check #%d, %.0fs elapsed):\n%s",
-                PREFLIGHT_LOG_PREFIX, system_time_z(),
-                context, attempt, elapsed, reason_block,
-            )
-            time.sleep(PREFLIGHT_POLL_INTERVAL_S)
-        else:
-            # Grace period — poll silently and quickly
-            time.sleep(GRACE_POLL_S)
+        reason_block = "\n".join(f"    • {r}" for r in reasons)
+        logging.info(
+            "%s @%s not ready for %s (check #%d, %.0fs elapsed; next check in %.0fs):\n%s",
+            PREFLIGHT_LOG_PREFIX, system_time_z(),
+            context, attempt, elapsed, PREFLIGHT_POLL_INTERVAL_S, reason_block,
+        )
+        time.sleep(PREFLIGHT_POLL_INTERVAL_S)
 
 
 def cmd_baseline_info(_: Optional[dict]) -> Dict[str, Any]:
@@ -3987,7 +4075,17 @@ def cmd_clocks_info(_: Optional[dict]) -> Dict[str, Any]:
         "startup": _start_status_payload(),
         "feature_preflight": {
             "profile": FEATURE_PREFLIGHT_PROFILE,
-            "required_features": list(FEATURE_PREFLIGHT_REQUIRED),
+            "source": "COMMAND_PULL",
+            "poll_interval_s": PREFLIGHT_POLL_INTERVAL_S,
+            "required_count": (
+                len(PI_SYSTEM_FEATURE_PREFLIGHT_REQUIRED)
+                + len(TEENSY_SYSTEM_FEATURE_PREFLIGHT_REQUIRED)
+                + len(PI_SERVICE_FEATURE_PREFLIGHT_REQUIRED)
+            ),
+            "pi_system_required": list(PI_SYSTEM_FEATURE_PREFLIGHT_REQUIRED),
+            "teensy_system_required": list(TEENSY_SYSTEM_FEATURE_PREFLIGHT_REQUIRED),
+            "pi_service_required": list(PI_SERVICE_FEATURE_PREFLIGHT_REQUIRED),
+            "last_gate": _diag.get("last_preflight_feature_gate", {}),
         },
         "timebase_silence_monitor": {
             "timeout_s": TIMEBASE_SILENCE_TIMEOUT_S,
