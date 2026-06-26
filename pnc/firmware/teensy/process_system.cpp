@@ -29,6 +29,7 @@
 
 #include <string.h>
 #include <strings.h>
+#include <CrashReport.h>
 
 static constexpr uint64_t FLASH_DELAY_NS = 5000000000ULL;  // 5 seconds
 
@@ -301,6 +302,108 @@ static Payload system_features_tree_payload(void) {
 }
 
 // ================================================================
+// Teensy core CrashReport bridge
+// ================================================================
+//
+// Safe first-pass crash forensics:
+//
+//   • Do not replace ARM fault handlers.
+//   • Do not add retained memory of our own.
+//   • Do not touch CrashReport from normal SYSTEM.REPORT except for the cheap
+//     non-destructive operator-bool presence check.
+//   • Capture the printable CrashReport text only on explicit CRASH_INFO.
+//
+// Important Teensyduino behavior: CrashReport.printTo() clears the underlying
+// core crash/reset record after printing.  We therefore cache the first printed
+// text in a static buffer so repeated CRASH_INFO calls during this boot do not
+// destroy the operator's view of the evidence.
+//
+
+static constexpr size_t SYSTEM_CRASH_REPORT_TEXT_MAX = 2048;
+
+static bool g_system_crash_report_captured = false;
+static bool g_system_crash_report_core_fault_present = false;
+static bool g_system_crash_report_truncated = false;
+static uint32_t g_system_crash_report_bytes = 0;
+static char g_system_crash_report_text[SYSTEM_CRASH_REPORT_TEXT_MAX] = {0};
+
+class system_crash_buffer_print_t : public Print {
+ public:
+  system_crash_buffer_print_t(char* buffer, size_t capacity)
+      : _buffer(buffer),
+        _capacity(capacity),
+        _length(0),
+        _truncated(false) {
+    if (_capacity > 0 && _buffer) {
+      _buffer[0] = '\0';
+    }
+  }
+
+  size_t write(uint8_t b) override {
+    if (!_buffer || _capacity == 0) {
+      _truncated = true;
+      return 1;
+    }
+
+    if (_length + 1U < _capacity) {
+      _buffer[_length++] = static_cast<char>(b);
+      _buffer[_length] = '\0';
+    } else {
+      _truncated = true;
+    }
+    return 1;
+  }
+
+  size_t write(const uint8_t* buffer, size_t size) override {
+    if (!buffer) return 0;
+    for (size_t i = 0; i < size; i++) {
+      write(buffer[i]);
+    }
+    return size;
+  }
+
+  size_t length() const { return _length; }
+  bool truncated() const { return _truncated; }
+
+ private:
+  char* _buffer;
+  size_t _capacity;
+  size_t _length;
+  bool _truncated;
+};
+
+static void system_crash_report_capture_once(void) {
+  if (g_system_crash_report_captured) {
+    return;
+  }
+
+  g_system_crash_report_captured = true;
+  g_system_crash_report_core_fault_present = (bool)CrashReport;
+
+  system_crash_buffer_print_t out(
+      g_system_crash_report_text,
+      sizeof(g_system_crash_report_text));
+
+  CrashReport.printTo(out);
+
+  g_system_crash_report_bytes = (uint32_t)out.length();
+  g_system_crash_report_truncated = out.truncated();
+}
+
+static Payload system_crash_report_payload(bool include_text) {
+  Payload p;
+  p.add("core_fault_present_now", (bool)CrashReport);
+  p.add("captured", g_system_crash_report_captured);
+  p.add("captured_core_fault_present", g_system_crash_report_core_fault_present);
+  p.add("bytes", g_system_crash_report_bytes);
+  p.add("truncated", g_system_crash_report_truncated);
+  if (include_text) {
+    p.add("text", g_system_crash_report_text);
+  }
+  return p;
+}
+
+// ================================================================
 // Terminal helpers
 // ================================================================
 
@@ -370,6 +473,13 @@ static Payload cmd_report(const Payload& /*args*/) {
 
   // Firmware identity
   p.add("fw_version", FW_VERSION);
+
+  // CrashReport presence only.  This is intentionally non-destructive: the
+  // full printable CrashReport is captured by explicit SYSTEM.CRASH_INFO.
+  p.add("crash_report_present", (bool)CrashReport);
+  p.add("crash_report_captured", g_system_crash_report_captured);
+  p.add("crash_report_bytes", g_system_crash_report_bytes);
+  p.add("crash_report_truncated", g_system_crash_report_truncated);
 
   // CPU clock frequency — authoritative runtime value.
   // F_CPU_ACTUAL is updated by set_arm_clock() at boot.
@@ -843,6 +953,30 @@ static Payload cmd_get_feature(const Payload& args) {
 }
 
 // ------------------------------------------------------------
+// CRASH_INFO — explicit printable Teensy core CrashReport capture
+// ------------------------------------------------------------
+static Payload cmd_crash_info(const Payload& /*args*/) {
+  system_crash_report_capture_once();
+  return system_crash_report_payload(true);
+}
+
+// ------------------------------------------------------------
+// CRASH_CLEAR — explicitly clear cached and core CrashReport state
+// ------------------------------------------------------------
+static Payload cmd_crash_clear(const Payload& /*args*/) {
+  CrashReport.clear();
+  g_system_crash_report_captured = false;
+  g_system_crash_report_core_fault_present = false;
+  g_system_crash_report_truncated = false;
+  g_system_crash_report_bytes = 0;
+  g_system_crash_report_text[0] = '\0';
+
+  Payload resp = ok_payload();
+  resp.add("crash_report_cleared", true);
+  return resp;
+}
+
+// ------------------------------------------------------------
 // DEBUG — raw debug channel test
 // ------------------------------------------------------------
 static Payload cmd_debug(const Payload& args) {
@@ -894,6 +1028,8 @@ static const process_command_entry_t SYSTEM_COMMANDS[] = {
   { "REPORT_FEATURES",  cmd_features         },
   { "SET_FEATURE",      cmd_set_feature      },
   { "GET_FEATURE",      cmd_get_feature      },
+  { "CRASH_INFO",       cmd_crash_info       },
+  { "CRASH_CLEAR",      cmd_crash_clear      },
   { "DEBUG",            cmd_debug            },
   { "STATUS",           cmd_status           },
   { nullptr,            nullptr }
