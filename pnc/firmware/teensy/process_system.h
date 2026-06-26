@@ -71,10 +71,13 @@ void process_system_register(void);
 // Feature status substrate
 // ============================================================================
 //
-// Teensy SYSTEM owns only Teensy-local feature state.  Feature status is a
-// pull-only command surface: clients ask SYSTEM.FEATURES or SYSTEM.GET_FEATURE
-// when they need the current tree.  Teensy never publishes, relays, or imports
-// feature state from any other machine.
+// Teensy SYSTEM owns only Teensy-local feature state.  Pi SYSTEM asks for this
+// tree and unions it with Pi-local feature state into the global dashboard /
+// campaign-readiness surface.
+//
+// Teensy also publishes FEATURE_STATUS_FRAGMENT whenever any local feature
+// scalar changes.  The fragment contains only Teensy-owned feature paths; the
+// Pi-side SYSTEM service relays the unified FEATURE_STATUS tree.
 //
 // Feature paths are reported as:
 //

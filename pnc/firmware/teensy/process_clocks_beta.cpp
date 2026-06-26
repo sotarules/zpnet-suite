@@ -293,45 +293,73 @@ void clocks_beta_features_init(void) {
 }
 
 // ============================================================================
-// Local Teensy feature campaign gate
+// FEATURE_STATUS-driven campaign gate
 // ============================================================================
 //
-// Feature status is now pull-only and machine-local.  Teensy CLOCKS does not
-// subscribe to, import, or cache any Pi-authored feature tree.  The Pi-side
-// CLOCKS process is responsible for polling Pi services and Teensy SYSTEM
-// through their command interfaces before it sends START/RECOVER.
+// Pi SYSTEM now republishes the unified system readiness tree as FEATURE_STATUS.
+// Beta consumes that stream directly, but the Teensy-side START gate must only
+// depend on Teensy-owned readiness surfaces.
 //
-// This START gate protects only Teensy-owned timing prerequisites by reading
-// the local SYSTEM feature registry directly.
+// Pi SYSTEM/CLOCKS remains responsible for PI/GNSS/environment/battery/network
+// preflight before it sends CLOCKS.START or CLOCKS.RECOVER.  Duplicating those
+// PI-owned gates inside Teensy CLOCKS creates a split-brain failure mode: Pi can
+// observe all prerequisites as open while the Teensy rejects START because its
+// cached FEATURE_STATUS snapshot lacks, or has stale status for, PI.GNSS.REPORT.
+//
+// Intentional non-requirements:
+//   SCIENCE_RESIDUALS and TIMEBASE_PUBLICATION are not START-gate inputs here.
+//   They are campaign products.  Requiring them before the first campaign row
+//   would create a cold-boot deadlock.  They remain published feature-health
+//   surfaces, but not admission prerequisites.
 
 struct campaign_feature_gate_requirement_t {
   const char* label;
+  const char* host;
   const char* subsystem;
   const char* feature;
 };
 
 static constexpr campaign_feature_gate_requirement_t
     CAMPAIGN_FEATURE_GATE_REQUIREMENTS[] = {
-  { "PPS/V_AUTH",  "INTERRUPT", "PPS_VCLOCK_AUTHORITY" },
-  { "QTIMER_CNT",  "INTERRUPT", "QTIMER_COUNTER_CUSTODY" },
-  { "QTIMER_DWT",  "INTERRUPT", "QTIMER_DWT_RULER" },
-  { "CTR32_LINE",  "INTERRUPT", "COUNTER32_LINEAGE" },
-  { "DWT_CAL",     "CLOCKS",    "DWT_CALIBRATION" },
-  { "STATIC_PRED", "CLOCKS",    "STATIC_PREDICTION" },
-  { "SMARTZERO",   "CLOCKS",    "SMARTZERO" },
-  { "ALPHA_EPOCH", "CLOCKS",    "ALPHA_EPOCH" },
-  { "OCXO_ORIGIN", "CLOCKS",    "OCXO_PUBLIC_ORIGIN" },
+  { "T_FEATURE",   "TEENSY", "SYSTEM",    "FEATURE_STATUS" },
+  { "PPS/V_AUTH",  "TEENSY", "INTERRUPT", "PPS_VCLOCK_AUTHORITY" },
+  { "QTIMER_CNT",  "TEENSY", "INTERRUPT", "QTIMER_COUNTER_CUSTODY" },
+  { "QTIMER_DWT",  "TEENSY", "INTERRUPT", "QTIMER_DWT_RULER" },
+  { "CTR32_LINE",  "TEENSY", "INTERRUPT", "COUNTER32_LINEAGE" },
+  { "DWT_CAL",     "TEENSY", "CLOCKS",    "DWT_CALIBRATION" },
+  { "STATIC_PRED", "TEENSY", "CLOCKS",    "STATIC_PREDICTION" },
+  { "SMARTZERO",   "TEENSY", "CLOCKS",    "SMARTZERO" },
+  { "ALPHA_EPOCH", "TEENSY", "CLOCKS",    "ALPHA_EPOCH" },
+  { "OCXO_ORIGIN", "TEENSY", "CLOCKS",    "OCXO_PUBLIC_ORIGIN" },
 };
 
+static volatile bool     g_campaign_feature_gate_seen = false;
 static volatile bool     g_campaign_feature_gate_open = false;
-static volatile uint32_t g_campaign_feature_gate_check_count = 0;
+static volatile uint32_t g_campaign_feature_gate_update_count = 0;
 static volatile uint32_t g_campaign_feature_gate_transition_count = 0;
 static volatile uint32_t g_campaign_feature_gate_required_count =
     (uint32_t)(sizeof(CAMPAIGN_FEATURE_GATE_REQUIREMENTS) /
                sizeof(CAMPAIGN_FEATURE_GATE_REQUIREMENTS[0]));
 static char g_campaign_feature_gate_reason[128] =
-    "not yet checked";
+    "FEATURE_STATUS not yet received";
 static char g_campaign_feature_gate_first_problem[32] = "";
+
+static const char* feature_status_lookup(const Payload& root,
+                                         const char* host,
+                                         const char* subsystem,
+                                         const char* feature) {
+  const Payload host_payload = root.getPayload(host);
+  if (host_payload.empty()) return nullptr;
+
+  const Payload subsystem_payload = host_payload.getPayload(subsystem);
+  if (subsystem_payload.empty()) return nullptr;
+
+  return subsystem_payload.getString(feature);
+}
+
+static bool feature_status_is_nominal(const char* status) {
+  return status && strcasecmp(status, "NOMINAL") == 0;
+}
 
 static void campaign_feature_gate_set_reason(const char* reason,
                                              const char* first_problem = nullptr) {
@@ -343,16 +371,14 @@ static void campaign_feature_gate_set_reason(const char* reason,
            first_problem ? first_problem : "");
 }
 
-static bool campaign_feature_gate_evaluate(bool count_check) {
-  if (count_check) {
-    g_campaign_feature_gate_check_count++;
-  }
-
+static void campaign_feature_gate_recompute(const Payload& root) {
   bool ready = true;
   const campaign_feature_gate_requirement_t* failed = nullptr;
 
   for (const auto& req : CAMPAIGN_FEATURE_GATE_REQUIREMENTS) {
-    if (!system_feature_is_nominal(req.subsystem, req.feature)) {
+    const char* status =
+        feature_status_lookup(root, req.host, req.subsystem, req.feature);
+    if (!feature_status_is_nominal(status)) {
       ready = false;
       failed = &req;
       break;
@@ -374,25 +400,26 @@ static bool campaign_feature_gate_evaluate(bool count_check) {
   } else {
     campaign_feature_gate_set_reason("campaign feature gate closed");
   }
+}
 
-  return ready;
+static void on_feature_status(const Payload& payload) {
+  g_campaign_feature_gate_seen = true;
+  g_campaign_feature_gate_update_count++;
+  campaign_feature_gate_recompute(payload);
 }
 
 static bool campaign_feature_gate_open(void) {
-  return campaign_feature_gate_evaluate(true);
+  return g_campaign_feature_gate_seen && g_campaign_feature_gate_open;
 }
 
 static void payload_add_campaign_feature_gate(Payload& p) {
-  const bool open = campaign_feature_gate_evaluate(false);
-  p.add("campaign_gate_source", "LOCAL_TEENSY_SYSTEM_FEATURES");
-  p.add("campaign_gate_open", open);
-  p.add("campaign_gate_seen", true);
+  p.add("campaign_gate_source", "FEATURE_STATUS");
+  p.add("campaign_gate_open", campaign_feature_gate_open());
+  p.add("campaign_gate_seen", (bool)g_campaign_feature_gate_seen);
   p.add("campaign_gate_reason", g_campaign_feature_gate_reason);
   p.add("campaign_gate_first_problem", g_campaign_feature_gate_first_problem);
   p.add("campaign_gate_update_count",
-        (uint32_t)g_campaign_feature_gate_check_count);
-  p.add("campaign_gate_check_count",
-        (uint32_t)g_campaign_feature_gate_check_count);
+        (uint32_t)g_campaign_feature_gate_update_count);
   p.add("campaign_gate_transition_count",
         (uint32_t)g_campaign_feature_gate_transition_count);
   p.add("campaign_gate_required_count",
@@ -644,13 +671,15 @@ static pps_interval_residuals_t measured_edge_interval_residuals_update(
   // SCIENCE_RESIDUALS is a feature-health/readiness scalar, not a per-row
   // validity bit.  The TIMEBASE row already carries the per-row residual
   // validity facts.  Downgrading this feature from NOMINAL to HOLD on a single
-  // invalid candidate row causes the readiness scalar to strobe during otherwise
-  // healthy campaigns.  Keep that detail in row-level TIMEBASE diagnostics.
+  // invalid candidate row causes FEATURE_STATUS_FRAGMENT to strobe
+  // NOMINAL/HOLD/NOMINAL/HOLD during otherwise healthy campaigns, adding a
+  // third 1 Hz publication stream beside TIMEBASE_FRAGMENT and
+  // TIMEBASE_FORENSICS.
   //
   // Publish the feature transition to NOMINAL when the science residual surface
   // first proves live.  Do not use transient row invalidity to bounce the global
   // feature scalar; persistent/diagnostic residual quality belongs in focused
-  // CLOCKS/TIMEBASE reports, not an asynchronous feature bus.
+  // CLOCKS/TIMEBASE reports, not the feature-health bus.
   if (both_valid) {
     clocks_beta_feature_set_cached("SCIENCE_RESIDUALS",
                                    g_clocks_feature_science_residuals,
@@ -6222,6 +6251,7 @@ static const process_command_entry_t CLOCKS_COMMANDS[] = {
 
 static const process_subscription_entry_t CLOCKS_SUBSCRIPTIONS[] = {
   { "TIMEBASE_FRAGMENT", on_timebase_fragment },
+  { "FEATURE_STATUS",    on_feature_status    },
   { nullptr, nullptr },
 };
 
