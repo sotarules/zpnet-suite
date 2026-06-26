@@ -1417,9 +1417,12 @@ def _restore_gnss_raw_from_last_timebase(
     """Restore the Pi-owned GNSS_RAW synthetic clock and Welford accumulator.
 
     GNSS_RAW is deliberately Pi-only and is not sent to Teensy RECOVER.  The
-    raw synthetic clock is projected to the same campaign GNSS identity as the
-    Teensy clocks, while its Welford accumulator is restored from the last
-    persisted TIMEBASE extra_clocks block.
+    raw synthetic clock must be restored to the same accepted PPS/VCLOCK
+    campaign identity that TIMEBASE resumes on.  Recovery can legally overshoot
+    the pre-armed target by several PPS rows, so callers must pass the
+    post-sync/accepted GNSS identity here, not the pre-sync projection.  The
+    Welford accumulator is restored from the last persisted TIMEBASE
+    extra_clocks block; missing downtime samples are not invented.
     """
     global _gnss_raw_ns, _gnss_raw_n, _gnss_raw_valid
     global _gnss_raw_welford_n, _gnss_raw_welford_mean, _gnss_raw_welford_m2
@@ -3446,17 +3449,42 @@ def _recover_campaign() -> None:
     if _drained_post > 0:
         logging.info("🧹 [recovery] drained %d TIMEBASE pieces/pending halves accumulated during sync wait", _drained_post)
 
+    # GNSS_RAW is Pi-owned, so it must be restored after the actual recovered
+    # TIMEBASE identity is known.  The Teensy may overshoot the pre-armed
+    # projection by a few PPS rows during RECOVER; using the earlier projected
+    # count here leaves GNSS_RAW's accumulated numerator/denominator behind the
+    # accepted campaign count and corrupts campaign-level TAU/PPB.
+    accepted_gnss_ns = int(teensy_pps_vclock_count) * NS_PER_SECOND
+    accepted_gnss_raw_ns = (
+        accepted_gnss_ns * last_gnss_raw_ns // last_gnss_ns
+        if (last_gnss_ns > 0 and last_gnss_raw_ns > 0)
+        else 0
+    )
+
+    _diag["last_recovery"].update({
+        "accepted_pps_vclock_count": int(teensy_pps_vclock_count),
+        "accepted_gnss_ns": int(accepted_gnss_ns),
+        "projected_gnss_raw_ns": int(projected_gnss_raw_ns),
+        "accepted_gnss_raw_ns": int(accepted_gnss_raw_ns),
+        "gnss_raw_recovery_uses_accepted_count": True,
+    })
+
     _reset_trackers()
 
     gnss_raw_restored = _restore_gnss_raw_from_last_timebase(
         last_tb=last_tb,
-        projected_gnss_ns=int(projected_gnss_ns),
-        projected_gnss_raw_ns=int(projected_gnss_raw_ns),
+        projected_gnss_ns=int(accepted_gnss_ns),
+        projected_gnss_raw_ns=int(accepted_gnss_raw_ns),
     )
     logging.info(
-        "📊 [recovery] GNSS_RAW restore: restored=%s projected_ns=%d",
+        "📊 [recovery] GNSS_RAW restore: restored=%s projected_ns=%d accepted_ns=%d "
+        "target_count=%d accepted_count=%d overshoot=%+d",
         str(gnss_raw_restored),
         int(projected_gnss_raw_ns),
+        int(accepted_gnss_raw_ns),
+        int(next_pps_vclock_count),
+        int(teensy_pps_vclock_count),
+        int(overshoot),
     )
 
     _campaign_active = True
