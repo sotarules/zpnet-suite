@@ -573,16 +573,17 @@ static int64_t g_campaign_public_ocxo2_offset = 0;
 static int64_t g_campaign_public_ocxo1_measured_offset = 0;
 static int64_t g_campaign_public_ocxo2_measured_offset = 0;
 
-// Step 2: OCXO science residuals/Welfords are measured-edge founded.
-// The public TIMEBASE OCXO ns tuple remains PPS-projected for dashboards and
-// projection forensics, but Beta's science residual is computed from the
-// compact measured_gnss_ns side channel:
+// Canonical OCXO residual rendering.  FloorLine science is now the authority:
+// each OCXO one-second FloorLine DWT interval is converted through the
+// PPS/VCLOCK DWT/GNSS ruler into the number of GNSS nanoseconds consumed by
+// that OCXO second.  The legacy pps_residual object is preserved as a
+// compatibility rendering of the same fact:
 //
-//   residual_ns = (current_measured_ocxo_ns - previous_measured_ocxo_ns)
-//               - (current_gnss_ns - previous_gnss_ns)
+//   science:       clock_interval = 1e9, gnss_interval = measured GNSS ns
+//   pps_residual:  gnss_interval  = 1e9, clock_interval = 1e9 + residual
 //
-// Positive residual means the OCXO measured-edge ledger advanced too far
-// during the GNSS interval: clock running fast.
+// In both surfaces, fast_residual_ns is identical and positive means the OCXO
+// is running fast.
 struct pps_interval_residuals_t {
   bool     ocxo1_valid = false;
   bool     ocxo2_valid = false;
@@ -594,25 +595,10 @@ struct pps_interval_residuals_t {
   int64_t  ocxo2_fast_residual_ns = 0;
 };
 
-// Step 2 science residual state.  Public OCXO ns remains the PPS-projected
-// clock tuple, but Welford/servo science consumes the Alpha measured-edge
-// GNSS ledger exposed as measured_gnss_ns.  Keep separate row-to-row memory so
-// public projection validity cannot gate measured-edge science.
-static uint32_t g_science_residual_prev_public_count = 0;
-static uint64_t g_science_residual_prev_gnss_ns = 0;
-static uint64_t g_science_residual_prev_ocxo1_measured_ns = 0;
-static uint64_t g_science_residual_prev_ocxo2_measured_ns = 0;
-static uint64_t g_science_total_ocxo1_gnss_interval_ns = 0;
-static uint64_t g_science_total_ocxo1_clock_interval_ns = 0;
-static uint64_t g_science_total_ocxo2_gnss_interval_ns = 0;
-static uint64_t g_science_total_ocxo2_clock_interval_ns = 0;
-
-// FloorLine science audit totals.  These do not yet replace the legacy
-// measured-edge residual surface above; they publish the exact antecedent math
-// raw_nanoseconds needs to adjudicate the coming authority flip.  The clock
-// total is the OCXO nominal one-second ledger (1e9 ns per accepted FloorLine
-// interval).  The GNSS total is the DWT/FloorLine-derived GNSS duration of
-// those OCXO seconds.  Positive fast residual => OCXO running fast.
+// FloorLine science totals.  The clock total is the OCXO nominal one-second
+// ledger (1e9 ns per accepted FloorLine interval).  The GNSS total is the
+// DWT/FloorLine-derived GNSS duration of those OCXO seconds.  Positive fast
+// residual => OCXO running fast.
 static constexpr uint64_t CLOCKS_BETA_NS_PER_SECOND = 1000000000ULL;
 
 struct floorline_science_totals_t {
@@ -693,25 +679,7 @@ static uint32_t g_science_residual_quarantine_begin_count = 0;
 static uint32_t g_science_residual_quarantine_consumed_count = 0;
 static uint32_t g_science_residual_quarantine_last_public_count = 0;
 
-static void pps_interval_residuals_seed_previous_row(uint32_t public_count,
-                                                     uint64_t public_gnss_ns,
-                                                     uint64_t public_ocxo1_measured_ns,
-                                                     uint64_t public_ocxo2_measured_ns) {
-  g_science_residual_prev_public_count = public_count;
-  g_science_residual_prev_gnss_ns = public_gnss_ns;
-  g_science_residual_prev_ocxo1_measured_ns = public_ocxo1_measured_ns;
-  g_science_residual_prev_ocxo2_measured_ns = public_ocxo2_measured_ns;
-}
-
 static void pps_interval_residuals_reset(void) {
-  g_science_residual_prev_public_count = 0;
-  g_science_residual_prev_gnss_ns = 0;
-  g_science_residual_prev_ocxo1_measured_ns = 0;
-  g_science_residual_prev_ocxo2_measured_ns = 0;
-  g_science_total_ocxo1_gnss_interval_ns = 0;
-  g_science_total_ocxo1_clock_interval_ns = 0;
-  g_science_total_ocxo2_gnss_interval_ns = 0;
-  g_science_total_ocxo2_clock_interval_ns = 0;
   floorline_science_totals_reset();
   g_science_residual_quarantine_remaining = 0;
   clocks_beta_feature_set_cached("SCIENCE_RESIDUALS",
@@ -726,11 +694,36 @@ static void pps_interval_residuals_begin_recover_quarantine(uint32_t rows) {
   g_science_residual_quarantine_begin_count++;
 }
 
-static pps_interval_residuals_t measured_edge_interval_residuals_update(
-    uint32_t public_count,
+static uint64_t floorline_render_legacy_clock_interval_ns(
+    const clock_science_row_t& row) {
+  if (!row.valid) return 0ULL;
+
+  const int64_t rendered =
+      (int64_t)CLOCKS_BETA_NS_PER_SECOND + row.fast_residual_ns;
+  return (rendered > 0) ? (uint64_t)rendered : 0ULL;
+}
+
+static uint64_t floorline_render_public_clock_ns(
     uint64_t public_gnss_ns,
-    uint64_t public_ocxo1_measured_ns,
-    uint64_t public_ocxo2_measured_ns) {
+    const clock_science_row_t& row,
+    uint64_t fallback_public_ns) {
+  if (!row.total_valid) return fallback_public_ns;
+
+  if (row.total_fast_residual_ns >= 0) {
+    const uint64_t add = (uint64_t)row.total_fast_residual_ns;
+    return (UINT64_MAX - public_gnss_ns < add)
+        ? UINT64_MAX
+        : public_gnss_ns + add;
+  }
+
+  const uint64_t sub = (uint64_t)(-row.total_fast_residual_ns);
+  return (public_gnss_ns >= sub) ? (public_gnss_ns - sub) : 0ULL;
+}
+
+static pps_interval_residuals_t floorline_interval_residuals_update(
+    uint32_t public_count,
+    const clock_science_row_t& ocxo1_science,
+    const clock_science_row_t& ocxo2_science) {
   pps_interval_residuals_t r{};
   r.public_count = public_count;
 
@@ -738,10 +731,6 @@ static pps_interval_residuals_t measured_edge_interval_residuals_update(
     g_science_residual_quarantine_remaining--;
     g_science_residual_quarantine_consumed_count++;
     g_science_residual_quarantine_last_public_count = public_count;
-    pps_interval_residuals_seed_previous_row(public_count,
-                                             public_gnss_ns,
-                                             public_ocxo1_measured_ns,
-                                             public_ocxo2_measured_ns);
     clocks_beta_feature_set_cached("SCIENCE_RESIDUALS",
                                    g_clocks_feature_science_residuals,
                                    system_feature_status_t::INITIALIZING,
@@ -749,57 +738,23 @@ static pps_interval_residuals_t measured_edge_interval_residuals_update(
     return r;
   }
 
-  const bool have_previous = (g_science_residual_prev_public_count != 0);
-  const bool consecutive = have_previous &&
-      (public_count == (g_science_residual_prev_public_count + 1U));
-  const bool gnss_monotonic = public_gnss_ns >= g_science_residual_prev_gnss_ns;
-  const bool ocxo1_seeded =
-      public_ocxo1_measured_ns != 0ULL &&
-      g_science_residual_prev_ocxo1_measured_ns != 0ULL;
-  const bool ocxo2_seeded =
-      public_ocxo2_measured_ns != 0ULL &&
-      g_science_residual_prev_ocxo2_measured_ns != 0ULL;
-  const bool ocxo1_monotonic =
-      public_ocxo1_measured_ns >= g_science_residual_prev_ocxo1_measured_ns;
-  const bool ocxo2_monotonic =
-      public_ocxo2_measured_ns >= g_science_residual_prev_ocxo2_measured_ns;
+  r.gnss_interval_ns = CLOCKS_BETA_NS_PER_SECOND;
 
-  if (consecutive && gnss_monotonic) {
-    r.gnss_interval_ns = public_gnss_ns - g_science_residual_prev_gnss_ns;
-
-    if (r.gnss_interval_ns != 0ULL && ocxo1_seeded && ocxo1_monotonic) {
-      r.ocxo1_interval_ns =
-          public_ocxo1_measured_ns - g_science_residual_prev_ocxo1_measured_ns;
-      r.ocxo1_fast_residual_ns =
-          (int64_t)r.ocxo1_interval_ns - (int64_t)r.gnss_interval_ns;
-      r.ocxo1_valid = true;
-      g_science_total_ocxo1_gnss_interval_ns += r.gnss_interval_ns;
-      g_science_total_ocxo1_clock_interval_ns += r.ocxo1_interval_ns;
-    }
-
-    if (r.gnss_interval_ns != 0ULL && ocxo2_seeded && ocxo2_monotonic) {
-      r.ocxo2_interval_ns =
-          public_ocxo2_measured_ns - g_science_residual_prev_ocxo2_measured_ns;
-      r.ocxo2_fast_residual_ns =
-          (int64_t)r.ocxo2_interval_ns - (int64_t)r.gnss_interval_ns;
-      r.ocxo2_valid = true;
-      g_science_total_ocxo2_gnss_interval_ns += r.gnss_interval_ns;
-      g_science_total_ocxo2_clock_interval_ns += r.ocxo2_interval_ns;
-    }
+  if (ocxo1_science.valid) {
+    r.ocxo1_valid = true;
+    r.ocxo1_interval_ns =
+        floorline_render_legacy_clock_interval_ns(ocxo1_science);
+    r.ocxo1_fast_residual_ns = ocxo1_science.fast_residual_ns;
   }
 
-  pps_interval_residuals_seed_previous_row(public_count,
-                                           public_gnss_ns,
-                                           public_ocxo1_measured_ns,
-                                           public_ocxo2_measured_ns);
+  if (ocxo2_science.valid) {
+    r.ocxo2_valid = true;
+    r.ocxo2_interval_ns =
+        floorline_render_legacy_clock_interval_ns(ocxo2_science);
+    r.ocxo2_fast_residual_ns = ocxo2_science.fast_residual_ns;
+  }
 
-  const bool both_valid = r.ocxo1_valid && r.ocxo2_valid;
-  // SCIENCE_RESIDUALS is a feature-health/readiness scalar, not a per-row
-  // validity bit.  The TIMEBASE row already carries the per-row residual
-  // validity facts.  Publish the feature transition to NOMINAL when the
-  // measured-edge residual surface first proves live; do not use transient
-  // post-recovery or warm-up invalidity to bounce the global feature scalar.
-  if (both_valid) {
+  if (r.ocxo1_valid && r.ocxo2_valid) {
     clocks_beta_feature_set_cached("SCIENCE_RESIDUALS",
                                    g_clocks_feature_science_residuals,
                                    system_feature_status_t::NOMINAL);
@@ -1181,13 +1136,13 @@ static uint32_t welfords_advance_missing_gap_before_row(uint32_t public_count) {
   // Welford update.
   //
   // Per-row clocks update once per published TIMEBASE row:
-  //   DWT, VCLOCK, DAC -> N == public_count after this row.
-  // OCXO residuals need two bookends, so they lag by one:
-  //   OCXO1/2 -> N == public_count - 1 after this row.
+  //   DWT, VCLOCK, OCXO, DAC -> N == public_count after this row.
+  // FloorLine science publishes a valid row-1 OCXO residual, so OCXO Welford
+  // cardinality no longer lags by one.
   const uint64_t before_row_n =
       (public_count > 0U) ? (uint64_t)(public_count - 1U) : 0ULL;
   const uint64_t before_row_ocxo_n =
-      (public_count > 1U) ? (uint64_t)(public_count - 2U) : 0ULL;
+      (public_count > 0U) ? (uint64_t)(public_count - 1U) : 0ULL;
 
   uint32_t advanced = 0;
   if (welford_advance_missing_to_n(welford_dwt, before_row_n)) advanced++;
@@ -1933,22 +1888,37 @@ static void payload_add_stats_clock(Payload& parent,
   parent.add_object(key, obj);
 }
 
+static void payload_add_stats_ocxo_clock(Payload& parent,
+                                         const char* key,
+                                         const welford_t& w,
+                                         const clock_science_row_t& science) {
+  Payload obj;
+  payload_add_welford_object(obj, "welford", w);
+
+  // Keep the public stats object compact.  The canonical OCXO frequency value
+  // is still FloorLine science total_ppb/total_tau, but the complete proof and
+  // exact totals already live under fragment.ocxoN.science.  Duplicating those
+  // long exact-total fields here pushes TIMEBASE_FRAGMENT toward the transport
+  // payload ceiling and can make the Pi receive the smaller FORENSICS half
+  // without the fragment half.
+  const double ppb = science.total_valid ? science.total_ppb : 0.0;
+  payload_add_frequency_fields(obj, ppb);
+
+  parent.add_object(key, obj);
+}
+
 static void payload_add_stats_summary_hierarchical(Payload& p,
                                                    uint64_t public_gnss_ns,
                                                    uint64_t public_dwt_total,
-                                                   uint64_t public_ocxo1_ns,
-                                                   uint64_t public_ocxo2_ns) {
+                                                   const clock_science_row_t& ocxo1_science,
+                                                   const clock_science_row_t& ocxo2_science) {
   Payload stats;
   payload_add_stats_clock(stats, "dwt", welford_dwt, true,
                           campaign_total_dwt_ppb(public_gnss_ns,
                                                  public_dwt_total));
   payload_add_stats_clock(stats, "vclock", welford_vclock, true, 0.0);
-  payload_add_stats_clock(stats, "ocxo1", welford_ocxo1, true,
-                          campaign_total_ppb_from_ratio(public_gnss_ns,
-                                                        public_ocxo1_ns));
-  payload_add_stats_clock(stats, "ocxo2", welford_ocxo2, true,
-                          campaign_total_ppb_from_ratio(public_gnss_ns,
-                                                        public_ocxo2_ns));
+  payload_add_stats_ocxo_clock(stats, "ocxo1", welford_ocxo1, ocxo1_science);
+  payload_add_stats_ocxo_clock(stats, "ocxo2", welford_ocxo2, ocxo2_science);
   payload_add_stats_clock(stats, "pps_witness", welford_pps_witness, false);
 
   Payload dac;
@@ -2319,9 +2289,9 @@ static FLASHMEM void payload_add_ocxo_service_object(Payload& parent,
 // OCXO cycle-domain residual diagnostic
 // ============================================================================
 //
-// Courtroom-only diagnostic for the current OCXO normalization investigation.
-// The authoritative OCXO residual is now the measured-edge nanosecond
-// residual.  Welfords, tau, and servo input consume only that science surface.
+// Courtroom-only diagnostic for the OCXO residual authority chain.
+// The authoritative OCXO residual is now the FloorLine nanosecond residual.
+// Welfords, tau, pps_residual, and servo input consume that same surface.
 //
 // This object compares the GNSS/PPS one-second DWT interval and each OCXO
 // one-second DWT interval in the same Teensy DWT coordinate species.  If the
@@ -3286,11 +3256,10 @@ static FLASHMEM void payload_add_ocxo_forensics(Payload& p,
   p.add_object(key, lane);
 }
 
-// Step E servo source doctrine. Servo input is explicitly the measured-edge
-// OCXO science residual surface introduced in Step 2. MEAN consumes the Welford
-// mean of measured-edge residuals (ns/sec == ppb). TOTAL consumes the accumulated
-// measured-edge OCXO/GNSS ratio over the campaign. NOW consumes the most recent
-// measured-edge one-second residual directly.
+// Servo source doctrine. Servo input is explicitly the FloorLine OCXO science
+// residual surface. MEAN consumes the Welford mean of exact FloorLine residuals
+// (ns/sec == ppb). TOTAL consumes the accumulated FloorLine OCXO/GNSS ratio
+// over the campaign. NOW consumes the current FloorLine one-second residual.
 static constexpr uint32_t SERVO_INPUT_SOURCE_NONE = 0;
 static constexpr uint32_t SERVO_INPUT_SOURCE_MEAN_PPS_RESIDUAL_WELFORD = 1;
 static constexpr uint32_t SERVO_INPUT_SOURCE_TOTAL_PUBLIC_TAU = 2;
@@ -3301,7 +3270,7 @@ static const char* servo_input_source_name(uint32_t source) {
     case SERVO_INPUT_SOURCE_MEAN_PPS_RESIDUAL_WELFORD:
       return "PPS_RESIDUAL_WELFORD_MEAN_PPB";
     case SERVO_INPUT_SOURCE_TOTAL_PUBLIC_TAU:
-      return "PUBLIC_OCXO_TOTAL_TAU";
+      return "FLOORLINE_SCIENCE_TOTAL_TAU";
     case SERVO_INPUT_SOURCE_NOW_PPS_RESIDUAL:
       return "PPS_RESIDUAL_NOW_PPB";
     default:
@@ -3508,12 +3477,6 @@ static constexpr double SERVO_NOW_FILTER_ALPHA = 1.00;
 static constexpr double SERVO_NOW_GAIN = 1.00;
 static constexpr double SERVO_NOW_DEADBAND_PPB = 0.5;
 
-static double servo_total_tau_from_public(uint64_t public_gnss_ns,
-                                          uint64_t public_clock_ns) {
-  if (public_gnss_ns == 0) return 1.0;
-  return (double)public_clock_ns / (double)public_gnss_ns;
-}
-
 static double servo_total_ppb_from_tau(double tau) {
   return (tau - 1.0) * 1.0e9;
 }
@@ -3539,6 +3502,7 @@ static void servo_input_diag_update(servo_input_diag_t& d,
                                     uint64_t pps_gnss_interval_ns,
                                     uint64_t pps_clock_interval_ns,
                                     int64_t pps_fast_residual_ns,
+                                    double pps_fast_residual_ppb,
                                     const welford_t& w,
                                     bool total_input_valid,
                                     double total_tau) {
@@ -3557,9 +3521,9 @@ static void servo_input_diag_update(servo_input_diag_t& d,
                         (campaign_seconds >= SERVO_MIN_SAMPLES);
 
   // A one-second residual in ns is numerically ppb over a one-second gate.
-  // NOW intentionally consumes this value directly rather than averaging it
+  // NOW consumes the exact FloorLine value directly rather than averaging it
   // into MEAN or folding it into campaign-total tau.
-  d.now_ppb = pps_residual_valid ? (double)pps_fast_residual_ns : 0.0;
+  d.now_ppb = pps_residual_valid ? pps_fast_residual_ppb : 0.0;
   d.now_input_valid = pps_residual_valid;
 
   d.total_catchup_elapsed_seconds = (double)campaign_seconds;
@@ -4260,12 +4224,11 @@ void clocks_beta_pps(void) {
 
   // ── Public PPS-edge clock tuple ──
   //
-  // Beta must not re-author OCXO public time.  Alpha owns the PPS-row public
-  // clock tuple and has already applied the visible/public origin transform
-  // before publishing g_ocxo*_measured_gnss_ns_at_pps_vclock.  The OCXO PPS
-  // projection snapshot below is retained only as courtroom collateral: it is
-  // the pre-public-origin candidate and must never replace Alpha's final public
-  // value in TIMEBASE_FRAGMENT.
+  // Alpha still exposes the legacy measured-GNSS OCXO row values as a
+  // diagnostic side-channel.  Beta now renders the published OCXO ns tuple
+  // from the same FloorLine science totals that feed pps_residual, Welford,
+  // servo, and stats, so fields that look authoritative tell one story.
+  // The Alpha PPS-projection snapshots remain courtroom collateral.
   const uint64_t public_gnss_ns   = campaign_public_gnss_ns();
   const uint64_t public_dwt_total = campaign_public_dwt_total();
   const uint64_t public_ocxo1_measured_ns = campaign_public_ocxo1_measured_ns();
@@ -4278,27 +4241,16 @@ void clocks_beta_pps(void) {
       ocxo2_pps_projection_ok && ocxo2_pps_projection.valid &&
       ocxo2_pps_projection.projected_ocxo_ns_at_pps != 0;
 
-  const uint64_t public_ocxo1_ns = public_ocxo1_measured_ns;
-  const uint64_t public_ocxo2_ns = public_ocxo2_measured_ns;
-
   const uint32_t public_count = (uint32_t)campaign_seconds;
   (void)welfords_advance_missing_gap_before_row(public_count);
 
-  // Public PPS-projected tuple residuals are intentionally not computed on
-  // Teensy anymore. Pi-side authority_map reconstructs that witness from the
-  // published ns tuple when needed. Keep the firmware residual path lean.
-  const pps_interval_residuals_t pps_residuals =
-      measured_edge_interval_residuals_update(public_count,
-                                              public_gnss_ns,
-                                              public_ocxo1_measured_ns,
-                                              public_ocxo2_measured_ns);
-
-  // ── FloorLine science audit ──
+  // ── FloorLine canonical science ──
   //
-  // This is the row-local antecedent chain for raw_nanoseconds.  It is kept
-  // separate from the legacy measured-edge pps_residual path while we validate
-  // the authority flip: FloorLine DWT interval -> GNSS ns inside one OCXO
-  // second -> fast residual -> one-second and running tau/ppb.
+  // This is now the authoritative OCXO science path.  The row-local
+  // antecedent chain is still published under fragment.ocxoN.science for
+  // raw_nanoseconds/courtroom replay, but the legacy public surfaces below
+  // (pps_residual, Welford, servo input, stats, and micro forensics aliases)
+  // are now renderings of this same FloorLine result.
   const clock_science_row_t ocxo1_floorline_science =
       floorline_science_build_ocxo(time_clock_id_t::OCXO1,
                                    public_count,
@@ -4317,6 +4269,19 @@ void clocks_beta_pps(void) {
                                    ocxo2_forensics_valid,
                                    ocxo2_forensics,
                                    g_floorline_science_ocxo2);
+
+  const uint64_t public_ocxo1_ns = floorline_render_public_clock_ns(
+      public_gnss_ns, ocxo1_floorline_science, public_ocxo1_measured_ns);
+  const uint64_t public_ocxo2_ns = floorline_render_public_clock_ns(
+      public_gnss_ns, ocxo2_floorline_science, public_ocxo2_measured_ns);
+
+  ocxo1_measured_gnss_ticks_64 = public_ocxo1_ns / 100ULL;
+  ocxo2_measured_gnss_ticks_64 = public_ocxo2_ns / 100ULL;
+
+  const pps_interval_residuals_t pps_residuals =
+      floorline_interval_residuals_update(public_count,
+                                          ocxo1_floorline_science,
+                                          ocxo2_floorline_science);
 
   // ── Cycle-domain residual diagnostics ──
   //
@@ -4344,45 +4309,39 @@ void clocks_beta_pps(void) {
     welford_update(welford_vclock, (double)g_vclock_measurement.second_residual_ns);
   }
 
-  // Step 2 OCXO Welfords and servo inputs use the bridge-resolved
-  // measured-edge science residual. The public PPS-projected OCXO tuple
-  // remains published, but it is no longer science residual authority.
-  //
-  //   (current_measured_ocxo_ns - previous_measured_ocxo_ns) -
-  //   (current_gnss_ns - previous_gnss_ns)
-  //
-  // Positive residual means the OCXO clock ledger advanced too far during
-  // the GNSS interval: OCXO running fast.
-  if (pps_residuals.ocxo1_valid) {
+  // OCXO Welfords consume the exact FloorLine residual.  The integer
+  // pps_residual.fast_residual_ns remains the legacy public rendering; Welford
+  // keeps the sub-ns FloorLine value so mean/stddev do not throw away the
+  // precision raw_nanoseconds just proved.
+  if (ocxo1_floorline_science.valid) {
     welford_update(welford_ocxo1,
-                   (double)pps_residuals.ocxo1_fast_residual_ns);
+                   ocxo1_floorline_science.fast_residual_ns_exact);
   }
-  if (pps_residuals.ocxo2_valid) {
+  if (ocxo2_floorline_science.valid) {
     welford_update(welford_ocxo2,
-                   (double)pps_residuals.ocxo2_fast_residual_ns);
+                   ocxo2_floorline_science.fast_residual_ns_exact);
   }
 
   // PPS witness statistics are owned by the witness/PPS_PHASE path.
   // Beta publishes the accumulator but does not update it here.
 
-  const bool ocxo1_total_slope_valid = pps_residuals.ocxo1_valid &&
-      g_science_total_ocxo1_gnss_interval_ns != 0ULL &&
-      g_science_total_ocxo1_clock_interval_ns != 0ULL;
-  const bool ocxo2_total_slope_valid = pps_residuals.ocxo2_valid &&
-      g_science_total_ocxo2_gnss_interval_ns != 0ULL &&
-      g_science_total_ocxo2_clock_interval_ns != 0ULL;
-  const double ocxo1_total_tau = servo_total_tau_from_public(
-      g_science_total_ocxo1_gnss_interval_ns,
-      g_science_total_ocxo1_clock_interval_ns);
-  const double ocxo2_total_tau = servo_total_tau_from_public(
-      g_science_total_ocxo2_gnss_interval_ns,
-      g_science_total_ocxo2_clock_interval_ns);
+  const bool ocxo1_total_slope_valid =
+      pps_residuals.ocxo1_valid && ocxo1_floorline_science.total_valid;
+  const bool ocxo2_total_slope_valid =
+      pps_residuals.ocxo2_valid && ocxo2_floorline_science.total_valid;
+  const double ocxo1_total_tau = ocxo1_floorline_science.total_valid
+      ? ocxo1_floorline_science.total_tau
+      : 1.0;
+  const double ocxo2_total_tau = ocxo2_floorline_science.total_valid
+      ? ocxo2_floorline_science.total_tau
+      : 1.0;
 
   servo_input_diag_update(g_servo_input_ocxo1,
                           pps_residuals.ocxo1_valid,
                           pps_residuals.gnss_interval_ns,
                           pps_residuals.ocxo1_interval_ns,
                           pps_residuals.ocxo1_fast_residual_ns,
+                          ocxo1_floorline_science.fast_residual_ns_exact,
                           welford_ocxo1,
                           ocxo1_total_slope_valid,
                           ocxo1_total_tau);
@@ -4391,14 +4350,15 @@ void clocks_beta_pps(void) {
                           pps_residuals.gnss_interval_ns,
                           pps_residuals.ocxo2_interval_ns,
                           pps_residuals.ocxo2_fast_residual_ns,
+                          ocxo2_floorline_science.fast_residual_ns_exact,
                           welford_ocxo2,
                           ocxo2_total_slope_valid,
                           ocxo2_total_tau);
 
   timebase_build_stage(TIMEBASE_BUILD_STAGE_WELFORD);
 
-  // Servo runs AFTER measured-edge residual/Welford updates so it sees this
-  // second's science residual sample.
+  // Servo runs AFTER FloorLine residual/Welford updates so it sees this
+  // second's canonical science residual sample.
   ocxo_calibration_servo();
   timebase_build_stage(TIMEBASE_BUILD_STAGE_SERVO);
 
@@ -4573,8 +4533,8 @@ void clocks_beta_pps(void) {
     payload_add_stats_summary_hierarchical(p,
                                            public_gnss_ns,
                                            public_dwt_total,
-                                           public_ocxo1_ns,
-                                           public_ocxo2_ns);
+                                           ocxo1_floorline_science,
+                                           ocxo2_floorline_science);
 
     // System DAC persistence feed.  The Pi should update the simplified
     // system config only while the servo is actively tuning; manual/static DAC
@@ -6869,13 +6829,27 @@ static FLASHMEM Payload cmd_report_stats(const Payload&) {
                campaign_total_dwt_ppb(public_gnss_ns,
                                       campaign_public_dwt_total()));
   publish_freq(p, "vclock", 0.0);
-  publish_freq(p, "ocxo1",
-               campaign_total_ppb_from_ratio(public_gnss_ns,
-                                             campaign_public_ocxo1_ns()));
-  publish_freq(p, "ocxo2",
-               campaign_total_ppb_from_ratio(public_gnss_ns,
-                                             campaign_public_ocxo2_ns()));
-  p.add("frequency_source", "CAMPAIGN_TOTAL_RATIO");
+
+  const bool ocxo1_floorline_total_valid =
+      g_floorline_science_ocxo1.clock_interval_total_ns_exact != 0.0 &&
+      g_floorline_science_ocxo1.gnss_interval_total_ns_exact != 0.0;
+  const bool ocxo2_floorline_total_valid =
+      g_floorline_science_ocxo2.clock_interval_total_ns_exact != 0.0 &&
+      g_floorline_science_ocxo2.gnss_interval_total_ns_exact != 0.0;
+  const double ocxo1_floorline_tau = ocxo1_floorline_total_valid
+      ? (g_floorline_science_ocxo1.clock_interval_total_ns_exact /
+         g_floorline_science_ocxo1.gnss_interval_total_ns_exact)
+      : 1.0;
+  const double ocxo2_floorline_tau = ocxo2_floorline_total_valid
+      ? (g_floorline_science_ocxo2.clock_interval_total_ns_exact /
+         g_floorline_science_ocxo2.gnss_interval_total_ns_exact)
+      : 1.0;
+
+  publish_freq(p, "ocxo1", campaign_total_ppb_from_tau(ocxo1_floorline_tau));
+  publish_freq(p, "ocxo2", campaign_total_ppb_from_tau(ocxo2_floorline_tau));
+  p.add("frequency_source", "FLOORLINE_SCIENCE_TOTALS");
+  p.add("ocxo1_frequency_valid", ocxo1_floorline_total_valid);
+  p.add("ocxo2_frequency_valid", ocxo2_floorline_total_valid);
   p.add("recover_welford_capture_count", g_recover_welford_capture_count);
   p.add("recover_welford_restore_count", g_recover_welford_restore_count);
   p.add("recover_welford_last_restored_lane_count",
