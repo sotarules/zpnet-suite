@@ -607,6 +607,80 @@ static uint64_t g_science_total_ocxo1_clock_interval_ns = 0;
 static uint64_t g_science_total_ocxo2_gnss_interval_ns = 0;
 static uint64_t g_science_total_ocxo2_clock_interval_ns = 0;
 
+// FloorLine science audit totals.  These do not yet replace the legacy
+// measured-edge residual surface above; they publish the exact antecedent math
+// raw_nanoseconds needs to adjudicate the coming authority flip.  The clock
+// total is the OCXO nominal one-second ledger (1e9 ns per accepted FloorLine
+// interval).  The GNSS total is the DWT/FloorLine-derived GNSS duration of
+// those OCXO seconds.  Positive fast residual => OCXO running fast.
+static constexpr uint64_t CLOCKS_BETA_NS_PER_SECOND = 1000000000ULL;
+
+struct floorline_science_totals_t {
+  uint32_t sample_count = 0;
+  uint64_t clock_interval_total_ns = 0;
+  uint64_t gnss_interval_total_ns = 0;
+  double   clock_interval_total_ns_exact = 0.0;
+  double   gnss_interval_total_ns_exact = 0.0;
+};
+
+static floorline_science_totals_t g_floorline_science_ocxo1 = {};
+static floorline_science_totals_t g_floorline_science_ocxo2 = {};
+
+struct clock_science_row_t {
+  bool     valid = false;
+  bool     antecedents_complete = false;
+  uint32_t clock_id = 0;
+  uint32_t public_count = 0;
+
+  uint32_t pps_vclock_dwt_at_edge = 0;
+  uint64_t pps_vclock_gnss_ns_at_edge = 0;
+  uint32_t projection_cps_cycles = 0;
+
+  bool     vclock_floorline_valid = false;
+  uint32_t vclock_floorline_dwt_at_edge = 0;
+  uint32_t vclock_floorline_interval_cycles = 0;
+
+  bool     clock_floorline_valid = false;
+  uint32_t clock_floorline_dwt_at_edge = 0;
+  uint32_t clock_floorline_interval_cycles = 0;
+  uint32_t clock_published_dwt_at_edge = 0;
+  uint32_t clock_raw_dwt_at_edge = 0;
+  uint32_t clock_observed_interval_cycles = 0;
+  uint32_t clock_effective_interval_cycles = 0;
+  int32_t  published_minus_floorline_cycles = 0;
+  int32_t  raw_minus_floorline_cycles = 0;
+  int32_t  floorline_minus_observed_interval_cycles = 0;
+
+  int64_t  prior_edge_gnss_ns = 0;
+  int64_t  current_edge_gnss_ns = 0;
+  double   prior_edge_gnss_ns_exact = 0.0;
+  double   current_edge_gnss_ns_exact = 0.0;
+  uint64_t gnss_interval_ns = 0;
+  uint64_t clock_interval_ns = 0;
+  int64_t  fast_residual_ns = 0;
+  double   gnss_interval_ns_exact = 0.0;
+  double   clock_interval_ns_exact = 0.0;
+  double   fast_residual_ns_exact = 0.0;
+  double   tau_1s = 1.0;
+  double   ppb_1s = 0.0;
+
+  bool     total_valid = false;
+  uint32_t total_sample_count = 0;
+  uint64_t total_clock_interval_ns = 0;
+  uint64_t total_gnss_interval_ns = 0;
+  int64_t  total_fast_residual_ns = 0;
+  double   total_clock_interval_ns_exact = 0.0;
+  double   total_gnss_interval_ns_exact = 0.0;
+  double   total_fast_residual_ns_exact = 0.0;
+  double   total_tau = 1.0;
+  double   total_ppb = 0.0;
+};
+
+static void floorline_science_totals_reset(void) {
+  g_floorline_science_ocxo1 = floorline_science_totals_t{};
+  g_floorline_science_ocxo2 = floorline_science_totals_t{};
+}
+
 // RECOVER deliberately cuts the campaign publication stream while preserving
 // the installed service epoch.  Alpha re-primes OCXO edge state at the RECOVER
 // gate; Beta additionally quarantines the first published science rows so no
@@ -638,6 +712,7 @@ static void pps_interval_residuals_reset(void) {
   g_science_total_ocxo1_clock_interval_ns = 0;
   g_science_total_ocxo2_gnss_interval_ns = 0;
   g_science_total_ocxo2_clock_interval_ns = 0;
+  floorline_science_totals_reset();
   g_science_residual_quarantine_remaining = 0;
   clocks_beta_feature_set_cached("SCIENCE_RESIDUALS",
                                  g_clocks_feature_science_residuals,
@@ -2445,6 +2520,326 @@ static FLASHMEM void payload_add_floorline_object(Payload& parent,
   parent.add_object("floorline", floor);
 }
 
+
+static int32_t beta_dwt32_signed_delta_near(uint32_t from_dwt32,
+                                            uint32_t to_dwt32) {
+  const uint32_t u = (uint32_t)(to_dwt32 - from_dwt32);
+  if (u <= 0x7FFFFFFFUL) {
+    return (int32_t)u;
+  }
+  const uint32_t magnitude = (uint32_t)((~u) + 1U);
+  if (magnitude == 0x80000000UL) {
+    return (int32_t)(-2147483647 - 1);
+  }
+  return -(int32_t)magnitude;
+}
+
+static int64_t beta_i64_from_u64_saturating(uint64_t value) {
+  return (value > (uint64_t)INT64_MAX) ? INT64_MAX : (int64_t)value;
+}
+
+static uint64_t beta_abs_i64_to_u64(int64_t value) {
+  return (value >= 0) ? (uint64_t)value : (uint64_t)(-value);
+}
+
+static uint64_t beta_dwt_cycles_to_gnss_ns_rounded(uint64_t cycles,
+                                                   uint32_t cps) {
+  if (cps == 0U) return 0ULL;
+  return (cycles * CLOCKS_BETA_NS_PER_SECOND + (uint64_t)cps / 2ULL) /
+         (uint64_t)cps;
+}
+
+static int64_t beta_dwt_cycles_to_gnss_ns_signed(int64_t cycles,
+                                                 uint32_t cps) {
+  const uint64_t ns = beta_dwt_cycles_to_gnss_ns_rounded(
+      beta_abs_i64_to_u64(cycles), cps);
+  const int64_t signed_ns = beta_i64_from_u64_saturating(ns);
+  return (cycles >= 0) ? signed_ns : -signed_ns;
+}
+
+static int64_t beta_signed_delta_u64(uint64_t lhs, uint64_t rhs) {
+  return (lhs >= rhs)
+      ? beta_i64_from_u64_saturating(lhs - rhs)
+      : -beta_i64_from_u64_saturating(rhs - lhs);
+}
+
+static int64_t beta_round_double_to_i64(double value) {
+  return (value >= 0.0)
+      ? (int64_t)(value + 0.5)
+      : (int64_t)(value - 0.5);
+}
+
+static void floorline_science_attach_totals(clock_science_row_t& row,
+                                            const floorline_science_totals_t& totals) {
+  row.total_sample_count = totals.sample_count;
+  row.total_clock_interval_ns = totals.clock_interval_total_ns;
+  row.total_gnss_interval_ns = totals.gnss_interval_total_ns;
+  row.total_clock_interval_ns_exact = totals.clock_interval_total_ns_exact;
+  row.total_gnss_interval_ns_exact = totals.gnss_interval_total_ns_exact;
+  row.total_valid = totals.gnss_interval_total_ns_exact != 0.0 &&
+                    totals.clock_interval_total_ns_exact != 0.0;
+  row.total_tau = row.total_valid
+      ? (totals.clock_interval_total_ns_exact /
+         totals.gnss_interval_total_ns_exact)
+      : 1.0;
+  row.total_ppb = row.total_valid
+      ? campaign_total_ppb_from_tau(row.total_tau)
+      : 0.0;
+  row.total_fast_residual_ns_exact = row.total_valid
+      ? (totals.clock_interval_total_ns_exact -
+         totals.gnss_interval_total_ns_exact)
+      : 0.0;
+  row.total_fast_residual_ns = row.total_valid
+      ? beta_round_double_to_i64(row.total_fast_residual_ns_exact)
+      : 0LL;
+}
+
+static clock_science_row_t floorline_science_build_ocxo(
+    time_clock_id_t clock,
+    uint32_t public_count,
+    uint64_t public_gnss_ns,
+    bool vclock_valid,
+    const clocks_alpha_lane_forensics_t& vclock_f,
+    bool clock_valid,
+    const clocks_alpha_lane_forensics_t& clock_f,
+    floorline_science_totals_t& totals) {
+  clock_science_row_t row{};
+  row.clock_id = (uint32_t)((uint8_t)clock);
+  row.public_count = public_count;
+  row.pps_vclock_dwt_at_edge = (uint32_t)g_dwt_at_pps_vclock;
+  row.pps_vclock_gnss_ns_at_edge = public_gnss_ns;
+  row.projection_cps_cycles = (uint32_t)g_dwt_cycles_between_pps_vclock;
+
+  row.vclock_floorline_valid = floorline_candidate_present(vclock_valid, vclock_f);
+  row.vclock_floorline_dwt_at_edge = row.vclock_floorline_valid
+      ? vclock_f.regression_inferred_dwt_at_event
+      : 0U;
+  row.vclock_floorline_interval_cycles = row.vclock_floorline_valid
+      ? floorline_inferred_interval_cycles(row.vclock_floorline_valid, vclock_f)
+      : 0U;
+
+  row.clock_floorline_valid = floorline_candidate_present(clock_valid, clock_f);
+  row.clock_floorline_dwt_at_edge = row.clock_floorline_valid
+      ? clock_f.regression_inferred_dwt_at_event
+      : 0U;
+  row.clock_floorline_interval_cycles = row.clock_floorline_valid
+      ? floorline_inferred_interval_cycles(row.clock_floorline_valid, clock_f)
+      : 0U;
+  row.clock_published_dwt_at_edge = clock_valid ? clock_f.dwt_used_at_event : 0U;
+  row.clock_raw_dwt_at_edge = clock_valid ? clock_f.dwt_original_at_event : 0U;
+  row.clock_observed_interval_cycles = clock_valid ? clock_f.dwt_interval_observed_cycles : 0U;
+  row.clock_effective_interval_cycles = clock_valid ? clock_f.dwt_interval_effective_cycles : 0U;
+
+  if (row.clock_floorline_valid) {
+    row.published_minus_floorline_cycles =
+        beta_signed_delta_u32(row.clock_published_dwt_at_edge,
+                              row.clock_floorline_dwt_at_edge);
+    row.raw_minus_floorline_cycles =
+        beta_signed_delta_u32(row.clock_raw_dwt_at_edge,
+                              row.clock_floorline_dwt_at_edge);
+    row.floorline_minus_observed_interval_cycles =
+        beta_signed_delta_u32(row.clock_floorline_interval_cycles,
+                              row.clock_observed_interval_cycles);
+  }
+
+  row.valid = row.clock_floorline_valid &&
+              row.clock_floorline_interval_cycles != 0U &&
+              row.projection_cps_cycles != 0U;
+  row.antecedents_complete = row.valid;
+  if (!row.valid) {
+    floorline_science_attach_totals(row, totals);
+    return row;
+  }
+
+  const int32_t current_delta_cycles = beta_dwt32_signed_delta_near(
+      row.pps_vclock_dwt_at_edge, row.clock_floorline_dwt_at_edge);
+  const int64_t current_delta_ns = beta_dwt_cycles_to_gnss_ns_signed(
+      (int64_t)current_delta_cycles, row.projection_cps_cycles);
+
+  row.current_edge_gnss_ns =
+      beta_i64_from_u64_saturating(public_gnss_ns) + current_delta_ns;
+  row.current_edge_gnss_ns_exact =
+      (double)public_gnss_ns +
+      ((double)current_delta_cycles * (double)CLOCKS_BETA_NS_PER_SECOND) /
+          (double)row.projection_cps_cycles;
+  row.gnss_interval_ns_exact =
+      ((double)row.clock_floorline_interval_cycles *
+       (double)CLOCKS_BETA_NS_PER_SECOND) /
+      (double)row.projection_cps_cycles;
+  row.gnss_interval_ns = beta_dwt_cycles_to_gnss_ns_rounded(
+      (uint64_t)row.clock_floorline_interval_cycles,
+      row.projection_cps_cycles);
+  row.prior_edge_gnss_ns = row.current_edge_gnss_ns -
+                           beta_i64_from_u64_saturating(row.gnss_interval_ns);
+  row.prior_edge_gnss_ns_exact = row.current_edge_gnss_ns_exact -
+                                 row.gnss_interval_ns_exact;
+  row.clock_interval_ns = CLOCKS_BETA_NS_PER_SECOND;
+  row.clock_interval_ns_exact = (double)CLOCKS_BETA_NS_PER_SECOND;
+  row.fast_residual_ns_exact = row.clock_interval_ns_exact -
+                               row.gnss_interval_ns_exact;
+  row.fast_residual_ns = beta_round_double_to_i64(row.fast_residual_ns_exact);
+  row.tau_1s = (double)row.projection_cps_cycles /
+               (double)row.clock_floorline_interval_cycles;
+  row.ppb_1s = campaign_total_ppb_from_tau(row.tau_1s);
+
+  totals.sample_count++;
+  totals.clock_interval_total_ns += row.clock_interval_ns;
+  totals.gnss_interval_total_ns += row.gnss_interval_ns;
+  totals.clock_interval_total_ns_exact += row.clock_interval_ns_exact;
+  totals.gnss_interval_total_ns_exact += row.gnss_interval_ns_exact;
+  floorline_science_attach_totals(row, totals);
+  return row;
+}
+
+static void payload_add_clock_science_common(Payload& science,
+                                             const clock_science_row_t& row) {
+  science.add("schema", "TIMEBASE_CLOCK_SCIENCE_V1");
+  science.add("valid", row.valid);
+  science.add("antecedents_complete", row.antecedents_complete);
+  science.add("clock_id", row.clock_id);
+  science.add("public_count", row.public_count);
+  science.add("positive_means", "clock_fast");
+
+  science.add("pps_vclock_dwt_at_edge", row.pps_vclock_dwt_at_edge);
+  science.add("pps_vclock_gnss_ns_at_edge", row.pps_vclock_gnss_ns_at_edge);
+  science.add("projection_cps_cycles", row.projection_cps_cycles);
+
+  science.add("vclock_floorline_valid", row.vclock_floorline_valid);
+  science.add("vclock_floorline_dwt_at_edge", row.vclock_floorline_dwt_at_edge);
+  science.add("vclock_floorline_interval_cycles", row.vclock_floorline_interval_cycles);
+
+  science.add("clock_floorline_valid", row.clock_floorline_valid);
+  science.add("clock_floorline_dwt_at_edge", row.clock_floorline_dwt_at_edge);
+  science.add("clock_floorline_interval_cycles", row.clock_floorline_interval_cycles);
+  science.add("clock_published_dwt_at_edge", row.clock_published_dwt_at_edge);
+  science.add("clock_raw_dwt_at_edge", row.clock_raw_dwt_at_edge);
+  science.add("clock_observed_interval_cycles", row.clock_observed_interval_cycles);
+  science.add("clock_effective_interval_cycles", row.clock_effective_interval_cycles);
+  science.add("published_minus_floorline_cycles", row.published_minus_floorline_cycles);
+  science.add("raw_minus_floorline_cycles", row.raw_minus_floorline_cycles);
+  science.add("floorline_minus_observed_interval_cycles",
+              row.floorline_minus_observed_interval_cycles);
+
+  science.add("prior_edge_gnss_ns", row.prior_edge_gnss_ns);
+  science.add("current_edge_gnss_ns", row.current_edge_gnss_ns);
+  science.add("prior_edge_gnss_ns_exact", row.prior_edge_gnss_ns_exact, 6);
+  science.add("current_edge_gnss_ns_exact", row.current_edge_gnss_ns_exact, 6);
+  science.add("gnss_interval_ns", row.gnss_interval_ns);
+  science.add("clock_interval_ns", row.clock_interval_ns);
+  science.add("fast_residual_ns", row.fast_residual_ns);
+  science.add("gnss_interval_ns_exact", row.gnss_interval_ns_exact, 6);
+  science.add("clock_interval_ns_exact", row.clock_interval_ns_exact, 6);
+  science.add("fast_residual_ns_exact", row.fast_residual_ns_exact, 6);
+  science.add("tau_1s", row.tau_1s, 12);
+  science.add("ppb_1s", row.ppb_1s, 6);
+
+  science.add("total_valid", row.total_valid);
+  science.add("total_sample_count", row.total_sample_count);
+  science.add("total_clock_interval_ns", row.total_clock_interval_ns);
+  science.add("total_gnss_interval_ns", row.total_gnss_interval_ns);
+  science.add("total_fast_residual_ns", row.total_fast_residual_ns);
+  science.add("total_clock_interval_ns_exact", row.total_clock_interval_ns_exact, 6);
+  science.add("total_gnss_interval_ns_exact", row.total_gnss_interval_ns_exact, 6);
+  science.add("total_fast_residual_ns_exact", row.total_fast_residual_ns_exact, 6);
+  science.add("total_tau", row.total_tau, 12);
+  science.add("total_ppb", row.total_ppb, 6);
+}
+
+static void payload_add_vclock_science_object(Payload& lane,
+                                              uint32_t public_count,
+                                              uint64_t public_gnss_ns,
+                                              bool vclock_valid,
+                                              const clocks_alpha_lane_forensics_t& vclock_f) {
+  Payload science;
+  clock_science_row_t row{};
+  row.valid = true;
+  row.antecedents_complete = true;
+  row.clock_id = (uint32_t)((uint8_t)time_clock_id_t::VCLOCK);
+  row.public_count = public_count;
+  row.pps_vclock_dwt_at_edge = (uint32_t)g_dwt_at_pps_vclock;
+  row.pps_vclock_gnss_ns_at_edge = public_gnss_ns;
+  row.projection_cps_cycles = (uint32_t)g_dwt_cycles_between_pps_vclock;
+  row.vclock_floorline_valid = floorline_candidate_present(vclock_valid, vclock_f);
+  row.vclock_floorline_dwt_at_edge = row.vclock_floorline_valid
+      ? vclock_f.regression_inferred_dwt_at_event
+      : 0U;
+  row.vclock_floorline_interval_cycles = row.vclock_floorline_valid
+      ? floorline_inferred_interval_cycles(row.vclock_floorline_valid, vclock_f)
+      : 0U;
+  row.clock_floorline_valid = row.vclock_floorline_valid;
+  row.clock_floorline_dwt_at_edge = row.vclock_floorline_dwt_at_edge;
+  row.clock_floorline_interval_cycles = row.vclock_floorline_interval_cycles;
+  row.clock_published_dwt_at_edge = vclock_valid ? vclock_f.dwt_used_at_event : 0U;
+  row.clock_raw_dwt_at_edge = vclock_valid ? vclock_f.dwt_original_at_event : 0U;
+  row.clock_observed_interval_cycles = vclock_valid ? vclock_f.dwt_interval_observed_cycles : 0U;
+  row.clock_effective_interval_cycles = vclock_valid ? vclock_f.dwt_interval_effective_cycles : 0U;
+  if (row.clock_floorline_valid) {
+    row.published_minus_floorline_cycles =
+        beta_signed_delta_u32(row.clock_published_dwt_at_edge,
+                              row.clock_floorline_dwt_at_edge);
+    row.raw_minus_floorline_cycles =
+        beta_signed_delta_u32(row.clock_raw_dwt_at_edge,
+                              row.clock_floorline_dwt_at_edge);
+    row.floorline_minus_observed_interval_cycles =
+        beta_signed_delta_u32(row.clock_floorline_interval_cycles,
+                              row.clock_observed_interval_cycles);
+  }
+  row.prior_edge_gnss_ns = beta_i64_from_u64_saturating(public_gnss_ns) -
+                           beta_i64_from_u64_saturating(CLOCKS_BETA_NS_PER_SECOND);
+  row.current_edge_gnss_ns = beta_i64_from_u64_saturating(public_gnss_ns);
+  row.prior_edge_gnss_ns_exact = (double)row.prior_edge_gnss_ns;
+  row.current_edge_gnss_ns_exact = (double)public_gnss_ns;
+  row.gnss_interval_ns = CLOCKS_BETA_NS_PER_SECOND;
+  row.clock_interval_ns = CLOCKS_BETA_NS_PER_SECOND;
+  row.fast_residual_ns = 0;
+  row.gnss_interval_ns_exact = (double)CLOCKS_BETA_NS_PER_SECOND;
+  row.clock_interval_ns_exact = (double)CLOCKS_BETA_NS_PER_SECOND;
+  row.fast_residual_ns_exact = 0.0;
+  row.tau_1s = 1.0;
+  row.ppb_1s = 0.0;
+  row.total_valid = public_gnss_ns != 0ULL;
+  row.total_sample_count = public_count;
+  row.total_clock_interval_ns = public_gnss_ns;
+  row.total_gnss_interval_ns = public_gnss_ns;
+  row.total_fast_residual_ns = 0;
+  row.total_clock_interval_ns_exact = (double)public_gnss_ns;
+  row.total_gnss_interval_ns_exact = (double)public_gnss_ns;
+  row.total_fast_residual_ns_exact = 0.0;
+  row.total_tau = 1.0;
+  row.total_ppb = 0.0;
+
+  payload_add_clock_science_common(science, row);
+  science.add("edge_species", "PPS_VCLOCK_AUTHORITY");
+  science.add("frequency_source", "GNSS_IDENTITY");
+  lane.add_object("science", science);
+}
+
+static void payload_add_ocxo_science_object(Payload& lane,
+                                            const clock_science_row_t& row,
+                                            bool reported_valid,
+                                            uint64_t reported_gnss_interval_ns,
+                                            uint64_t reported_clock_interval_ns,
+                                            int64_t reported_fast_residual_ns) {
+  Payload science;
+  payload_add_clock_science_common(science, row);
+  science.add("edge_species", "FLOORLINE");
+  science.add("frequency_source", "FLOORLINE_DWT_INTERVAL_OVER_PPS_VCLOCK_CPS");
+  science.add("time_projection_formula",
+              "pps_vclock_gnss_ns + signed(clock_floorline_dwt - pps_vclock_dwt) * 1e9 / projection_cps");
+  science.add("reported_pps_residual_valid", reported_valid);
+  science.add("reported_pps_gnss_interval_ns",
+              reported_valid ? reported_gnss_interval_ns : 0ULL);
+  science.add("reported_pps_clock_interval_ns",
+              reported_valid ? reported_clock_interval_ns : 0ULL);
+  science.add("reported_pps_fast_residual_ns",
+              reported_valid ? reported_fast_residual_ns : 0LL);
+  science.add("reported_minus_floorline_residual_ns",
+              (reported_valid && row.valid)
+                  ? (reported_fast_residual_ns - row.fast_residual_ns)
+                  : 0LL);
+  lane.add_object("science", science);
+}
+
 static FLASHMEM void payload_add_slim_dwt_lane_forensics(
     Payload& parent,
     bool valid,
@@ -2748,10 +3143,19 @@ static void payload_add_timebase_pair_identity(Payload& p,
   p.add("servo_active", calibrate_ocxo_mode != servo_mode_t::OFF);
 }
 
-static void payload_add_vclock_fragment(Payload& p, uint64_t public_gnss_ns) {
+static void payload_add_vclock_fragment(Payload& p,
+                                          uint64_t public_gnss_ns,
+                                          uint32_t public_count,
+                                          bool vclock_forensics_valid,
+                                          const clocks_alpha_lane_forensics_t& vclock_forensics) {
   Payload lane;
   lane.add("ns", public_gnss_ns);
   lane.add("counter32_at_pps_vclock", (uint32_t)g_counter32_at_pps_vclock);
+  payload_add_vclock_science_object(lane,
+                                    public_count,
+                                    public_gnss_ns,
+                                    vclock_forensics_valid,
+                                    vclock_forensics);
   p.add_object("vclock", lane);
 }
 
@@ -2780,7 +3184,8 @@ static void payload_add_ocxo_fragment(Payload& p,
                                       bool pps_residual_valid,
                                       uint64_t pps_gnss_interval_ns,
                                       uint64_t pps_clock_interval_ns,
-                                      int64_t pps_fast_residual_ns) {
+                                      int64_t pps_fast_residual_ns,
+                                      const clock_science_row_t& science_row) {
   Payload lane;
 
   // Compact science surface.  The canonical OCXO value is the PPS-projected
@@ -2803,6 +3208,13 @@ static void payload_add_ocxo_fragment(Payload& p,
                                        pps_gnss_interval_ns,
                                        pps_clock_interval_ns,
                                        pps_fast_residual_ns);
+
+  payload_add_ocxo_science_object(lane,
+                                  science_row,
+                                  pps_residual_valid,
+                                  pps_gnss_interval_ns,
+                                  pps_clock_interval_ns,
+                                  pps_fast_residual_ns);
 
   p.add_object(key, lane);
 }
@@ -3881,6 +4293,31 @@ void clocks_beta_pps(void) {
                                               public_ocxo1_measured_ns,
                                               public_ocxo2_measured_ns);
 
+  // ── FloorLine science audit ──
+  //
+  // This is the row-local antecedent chain for raw_nanoseconds.  It is kept
+  // separate from the legacy measured-edge pps_residual path while we validate
+  // the authority flip: FloorLine DWT interval -> GNSS ns inside one OCXO
+  // second -> fast residual -> one-second and running tau/ppb.
+  const clock_science_row_t ocxo1_floorline_science =
+      floorline_science_build_ocxo(time_clock_id_t::OCXO1,
+                                   public_count,
+                                   public_gnss_ns,
+                                   vclock_forensics_valid,
+                                   vclock_forensics,
+                                   ocxo1_forensics_valid,
+                                   ocxo1_forensics,
+                                   g_floorline_science_ocxo1);
+  const clock_science_row_t ocxo2_floorline_science =
+      floorline_science_build_ocxo(time_clock_id_t::OCXO2,
+                                   public_count,
+                                   public_gnss_ns,
+                                   vclock_forensics_valid,
+                                   vclock_forensics,
+                                   ocxo2_forensics_valid,
+                                   ocxo2_forensics,
+                                   g_floorline_science_ocxo2);
+
   // ── Cycle-domain residual diagnostics ──
   //
   // These are forensic-only.  They deliberately do not feed Welford, tau, or
@@ -4026,6 +4463,33 @@ void clocks_beta_pps(void) {
       dwt.add("second_residual_cycles",
               (int32_t)((int64_t)g_dwt_cycles_between_pps_vclock -
                         (int64_t)DWT_EXPECTED_PER_PPS));
+      {
+        Payload science;
+        const double dwt_ppb_1s =
+            ((double)g_dwt_cycles_between_pps_vclock -
+             (double)DWT_EXPECTED_PER_PPS) /
+            (double)DWT_EXPECTED_PER_PPS * 1.0e9;
+        const uint64_t expected_total_cycles = dwt_ns_to_cycles(public_gnss_ns);
+        const double dwt_total_ppb = campaign_total_dwt_ppb(public_gnss_ns,
+                                                            public_dwt_total);
+        science.add("schema", "TIMEBASE_CLOCK_SCIENCE_V1");
+        science.add("valid", g_dwt_cycles_between_pps_vclock != 0U);
+        science.add("clock_id", 0U);
+        science.add("edge_species", "PPS_GNSS_DWT_RULER");
+        science.add("frequency_source", "DWT_CYCLES_OVER_IDEAL_CPU_CYCLES");
+        science.add("cycles_between_edges", (uint32_t)g_dwt_cycles_between_pps_vclock);
+        science.add("expected_cycles_between_edges", (uint32_t)DWT_EXPECTED_PER_PPS);
+        science.add("second_residual_cycles",
+                    (int32_t)((int64_t)g_dwt_cycles_between_pps_vclock -
+                              (int64_t)DWT_EXPECTED_PER_PPS));
+        science.add("tau_1s", 1.0 + dwt_ppb_1s / 1.0e9, 12);
+        science.add("ppb_1s", dwt_ppb_1s, 6);
+        science.add("total_cycles", public_dwt_total);
+        science.add("total_expected_cycles", expected_total_cycles);
+        science.add("total_tau", 1.0 + dwt_total_ppb / 1.0e9, 12);
+        science.add("total_ppb", dwt_total_ppb, 6);
+        dwt.add_object("science", science);
+      }
       p.add_object("dwt", dwt);
     }
 
@@ -4039,6 +4503,32 @@ void clocks_beta_pps(void) {
       pps.add("dwt_cycles_between_edges_valid",
               (bool)g_pps_dwt_cycles_between_edges_valid);
       pps.add("vclock_phase_cycles", (int32_t)g_pps_vclock_phase_cycles);
+      {
+        Payload science;
+        science.add("schema", "TIMEBASE_CLOCK_SCIENCE_V1");
+        science.add("valid", (bool)g_pps_dwt_cycles_between_edges_valid);
+        science.add("clock_id", 0U);
+        science.add("edge_species", "PHYSICAL_PPS_WITNESS");
+        science.add("frequency_source", "GNSS_IDENTITY_WITNESS");
+        science.add("positive_means", "clock_fast");
+        science.add("pps_dwt_at_edge", (uint32_t)g_pps_dwt_at_edge);
+        science.add("pps_vclock_dwt_at_edge", (uint32_t)g_dwt_at_pps_vclock);
+        science.add("pps_vclock_gnss_ns_at_edge", public_gnss_ns);
+        science.add("pps_vclock_phase_cycles", (int32_t)g_pps_vclock_phase_cycles);
+        science.add("dwt_cycles_between_edges",
+                    g_pps_dwt_cycles_between_edges_valid
+                        ? (uint32_t)g_pps_dwt_cycles_between_edges
+                        : 0U);
+        science.add("gnss_interval_ns", CLOCKS_BETA_NS_PER_SECOND);
+        science.add("clock_interval_ns", CLOCKS_BETA_NS_PER_SECOND);
+        science.add("fast_residual_ns", 0LL);
+        science.add("gnss_interval_ns_exact", (double)CLOCKS_BETA_NS_PER_SECOND, 6);
+        science.add("clock_interval_ns_exact", (double)CLOCKS_BETA_NS_PER_SECOND, 6);
+        science.add("fast_residual_ns_exact", 0.0, 6);
+        science.add("tau_1s", 1.0, 12);
+        science.add("ppb_1s", 0.0, 6);
+        pps.add_object("science", science);
+      }
       p.add_object("pps", pps);
     }
 
@@ -4047,7 +4537,11 @@ void clocks_beta_pps(void) {
     payload_add_prediction_summary_hierarchical(p);
 
     timebase_build_stage(TIMEBASE_BUILD_STAGE_VCLOCK);
-    payload_add_vclock_fragment(p, public_gnss_ns);
+    payload_add_vclock_fragment(p,
+                                public_gnss_ns,
+                                public_count,
+                                vclock_forensics_valid,
+                                vclock_forensics);
 
     timebase_build_stage(TIMEBASE_BUILD_STAGE_OCXO1);
     payload_add_ocxo_fragment(p,
@@ -4059,7 +4553,8 @@ void clocks_beta_pps(void) {
                               pps_residuals.ocxo1_valid,
                               pps_residuals.gnss_interval_ns,
                               pps_residuals.ocxo1_interval_ns,
-                              pps_residuals.ocxo1_fast_residual_ns);
+                              pps_residuals.ocxo1_fast_residual_ns,
+                              ocxo1_floorline_science);
 
     timebase_build_stage(TIMEBASE_BUILD_STAGE_OCXO2);
     payload_add_ocxo_fragment(p,
@@ -4071,7 +4566,8 @@ void clocks_beta_pps(void) {
                               pps_residuals.ocxo2_valid,
                               pps_residuals.gnss_interval_ns,
                               pps_residuals.ocxo2_interval_ns,
-                              pps_residuals.ocxo2_fast_residual_ns);
+                              pps_residuals.ocxo2_fast_residual_ns,
+                              ocxo2_floorline_science);
 
     timebase_build_stage(TIMEBASE_BUILD_STAGE_STATS);
     payload_add_stats_summary_hierarchical(p,
