@@ -4573,15 +4573,29 @@ static const char* dispatch_timer_name(interrupt_subscriber_kind_t kind) {
 static constexpr uint32_t LOWER_ENV_SAMPLE_RATE_HZ = 1000U;
 static constexpr uint32_t LOWER_ENV_BUCKET_COUNT = 64U;
 static constexpr uint32_t LOWER_ENV_FIT_MIN_BUCKETS = 8U;
+
+// FloorLine V2 doctrine:
+//   * the 4-cycle gate is a quality/forensics threshold, not a sample veto;
+//   * ordinary samples are retained and the estimator decides how to use them;
+//   * only grossly implausible per-sample residuals are excluded from the fit;
+//   * if a fit cannot be produced, publication falls back to the observed
+//     edge and reports the fallback instead of withdrawing the FLOORLINE rail.
 static constexpr uint32_t LOWER_ENV_ERROR_GATE_CYCLES = 4U;
+static constexpr uint32_t LOWER_ENV_SAMPLE_HARD_REJECT_CYCLES = 512U;
+static constexpr uint32_t LOWER_ENV_RESIDUAL_BIN16_CYCLES = 16U;
+static constexpr uint32_t LOWER_ENV_RESIDUAL_BIN32_CYCLES = 32U;
+static constexpr uint32_t LOWER_ENV_RESIDUAL_BIN64_CYCLES = 64U;
+static constexpr uint32_t LOWER_ENV_RESIDUAL_BIN128_CYCLES = 128U;
 static constexpr uint32_t LOWER_ENV_PUBLISH_MIN_SAMPLES = 128U;
 static constexpr uint32_t LOWER_ENV_PUBLISH_MIN_BUCKETS = 32U;
-// Publication uses a two-tier court: the 4-cycle gate is evidence
-// quality, not disqualification.  A valid FloorLine candidate may be
-// low-confidence and still be the better estimator than observed.  Only
-// gross candidate/output excursions demote publication back to observed.
-static constexpr uint32_t LOWER_ENV_PUBLISH_HARD_EDGE_GATE_CYCLES = 16U;
-static constexpr uint32_t LOWER_ENV_PUBLISH_HARD_INTERVAL_GATE_CYCLES = 16U;
+// Candidate-to-observed deltas of tens or even ~100 cycles are exactly the
+// ISR-delay class FloorLine exists to remove.  These hard gates are therefore
+// broad sanity rails, not quality thresholds.
+static constexpr uint32_t LOWER_ENV_PUBLISH_HARD_EDGE_GATE_CYCLES = 256U;
+static constexpr uint32_t LOWER_ENV_PUBLISH_HARD_INTERVAL_GATE_CYCLES = 256U;
+static constexpr uint32_t LOWER_ENV_WATCHDOG_SLOPE_NUMERATOR = 1U;
+static constexpr uint32_t LOWER_ENV_WATCHDOG_SLOPE_DENOMINATOR = 2U;
+static constexpr uint32_t LOWER_ENV_WATCHDOG_SLOPE_MULTIPLIER = 2U;
 
 static constexpr uint32_t FLOORLINE_PUBLISH_SOURCE_OBSERVED  = 0U;
 static constexpr uint32_t FLOORLINE_PUBLISH_SOURCE_FLOORLINE = 1U;
@@ -4594,6 +4608,8 @@ static constexpr uint32_t FLOORLINE_REASON_FIT_INVALID       = 4U;
 static constexpr uint32_t FLOORLINE_REASON_FIT_OUTLIER       = 5U;
 static constexpr uint32_t FLOORLINE_REASON_INTERVAL_GATE     = 6U;
 static constexpr uint32_t FLOORLINE_REASON_EDGE_GATE         = 7U;
+static constexpr uint32_t FLOORLINE_REASON_OBSERVED_FALLBACK = 8U;
+static constexpr uint32_t FLOORLINE_REASON_SLOPE_ANOMALY     = 9U;
 
 static uint32_t lower_env_abs_i32(int32_t value) {
   return value < 0 ? (uint32_t)(-(int64_t)value) : (uint32_t)value;
@@ -4648,14 +4664,29 @@ struct cadence_regression_result_t {
 
   bool     candidate_present = false;
   bool     publish_floorline = false;
+  bool     fallback_used = false;
   uint32_t publish_source = FLOORLINE_PUBLISH_SOURCE_OBSERVED;
   uint32_t publish_reason = FLOORLINE_REASON_INIT;
+  uint32_t confidence_ppm = 0;
   uint32_t sample_accepted_count = 0;
   uint32_t sample_rejected_count = 0;
+  uint32_t sample_hard_rejected_count = 0;
   uint32_t bucket_required_count = LOWER_ENV_PUBLISH_MIN_BUCKETS;
   uint32_t sample_required_count = LOWER_ENV_PUBLISH_MIN_SAMPLES;
   uint32_t gate_cycles = LOWER_ENV_ERROR_GATE_CYCLES;
+  uint32_t sample_hard_reject_gate_cycles = LOWER_ENV_SAMPLE_HARD_REJECT_CYCLES;
   int32_t  candidate_interval_error_cycles = 0;
+
+  uint32_t residual_sample_count = 0;
+  int32_t  residual_min_cycles = 0;
+  int32_t  residual_max_cycles = 0;
+  int32_t  residual_mean_q16_cycles = 0;
+  uint32_t residual_stddev_q16_cycles = 0;
+  uint32_t residual_abs_gt4_count = 0;
+  uint32_t residual_abs_gt16_count = 0;
+  uint32_t residual_abs_gt32_count = 0;
+  uint32_t residual_abs_gt64_count = 0;
+  uint32_t residual_abs_gt128_count = 0;
 };
 
 struct lower_env_lane_t {
@@ -4668,7 +4699,25 @@ struct lower_env_lane_t {
   uint32_t active_bucket_count = 0;
   uint32_t active_sample_accepted_count = 0;
   uint32_t active_sample_rejected_count = 0;
+  uint32_t active_sample_hard_rejected_count = 0;
   uint32_t active_base_dwt = 0;
+
+  uint32_t active_residual_sample_count = 0;
+  int32_t  active_residual_min_cycles = 0;
+  int32_t  active_residual_max_cycles = 0;
+  int64_t  active_residual_sum_cycles = 0;
+  uint64_t active_residual_square_sum_cycles = 0;
+  uint32_t active_residual_abs_gt4_count = 0;
+  uint32_t active_residual_abs_gt16_count = 0;
+  uint32_t active_residual_abs_gt32_count = 0;
+  uint32_t active_residual_abs_gt64_count = 0;
+  uint32_t active_residual_abs_gt128_count = 0;
+
+  bool     floorline_seen_valid_estimate = false;
+  uint32_t floorline_valid_estimate_count = 0;
+  uint32_t fallback_publish_count = 0;
+  uint32_t watchdog_anomaly_count = 0;
+  uint32_t last_watchdog_reason = 0;
 
   bool     previous_observed_edge_valid = false;
   uint32_t previous_observed_edge_dwt = 0;
@@ -4688,6 +4737,7 @@ static lower_env_lane_t g_lower_env_vclock;
 static lower_env_lane_t g_lower_env_ocxo1;
 static lower_env_lane_t g_lower_env_ocxo2;
 static uint32_t g_lower_env_snapshot_count = 0;
+static bool g_interrupt_feature_floorline_latched_nominal = false;
 
 static lower_env_lane_t* lower_env_lane_for(interrupt_subscriber_kind_t kind) {
   switch (kind) {
@@ -4732,7 +4782,149 @@ static void lower_env_clear_active(lower_env_lane_t& lane) {
   lane.active_bucket_count = 0;
   lane.active_sample_accepted_count = 0;
   lane.active_sample_rejected_count = 0;
+  lane.active_sample_hard_rejected_count = 0;
   lane.active_base_dwt = 0;
+  lane.active_residual_sample_count = 0;
+  lane.active_residual_min_cycles = 0;
+  lane.active_residual_max_cycles = 0;
+  lane.active_residual_sum_cycles = 0;
+  lane.active_residual_square_sum_cycles = 0;
+  lane.active_residual_abs_gt4_count = 0;
+  lane.active_residual_abs_gt16_count = 0;
+  lane.active_residual_abs_gt32_count = 0;
+  lane.active_residual_abs_gt64_count = 0;
+  lane.active_residual_abs_gt128_count = 0;
+}
+
+static void lower_env_note_residual(lower_env_lane_t& lane,
+                                    int32_t residual_cycles) {
+  const uint32_t abs_residual = lower_env_abs_i32(residual_cycles);
+  if (lane.active_residual_sample_count == 0) {
+    lane.active_residual_min_cycles = residual_cycles;
+    lane.active_residual_max_cycles = residual_cycles;
+  } else {
+    if (residual_cycles < lane.active_residual_min_cycles) {
+      lane.active_residual_min_cycles = residual_cycles;
+    }
+    if (residual_cycles > lane.active_residual_max_cycles) {
+      lane.active_residual_max_cycles = residual_cycles;
+    }
+  }
+
+  lane.active_residual_sample_count++;
+  lane.active_residual_sum_cycles += (int64_t)residual_cycles;
+  lane.active_residual_square_sum_cycles +=
+      (uint64_t)abs_residual * (uint64_t)abs_residual;
+
+  if (abs_residual > LOWER_ENV_ERROR_GATE_CYCLES) {
+    lane.active_residual_abs_gt4_count++;
+  }
+  if (abs_residual > LOWER_ENV_RESIDUAL_BIN16_CYCLES) {
+    lane.active_residual_abs_gt16_count++;
+  }
+  if (abs_residual > LOWER_ENV_RESIDUAL_BIN32_CYCLES) {
+    lane.active_residual_abs_gt32_count++;
+  }
+  if (abs_residual > LOWER_ENV_RESIDUAL_BIN64_CYCLES) {
+    lane.active_residual_abs_gt64_count++;
+  }
+  if (abs_residual > LOWER_ENV_RESIDUAL_BIN128_CYCLES) {
+    lane.active_residual_abs_gt128_count++;
+  }
+}
+
+static void lower_env_copy_residual_forensics(cadence_regression_result_t& r,
+                                              const lower_env_lane_t& lane) {
+  r.residual_sample_count = lane.active_residual_sample_count;
+  r.residual_min_cycles = lane.active_residual_sample_count
+      ? lane.active_residual_min_cycles
+      : 0;
+  r.residual_max_cycles = lane.active_residual_sample_count
+      ? lane.active_residual_max_cycles
+      : 0;
+  r.residual_abs_gt4_count = lane.active_residual_abs_gt4_count;
+  r.residual_abs_gt16_count = lane.active_residual_abs_gt16_count;
+  r.residual_abs_gt32_count = lane.active_residual_abs_gt32_count;
+  r.residual_abs_gt64_count = lane.active_residual_abs_gt64_count;
+  r.residual_abs_gt128_count = lane.active_residual_abs_gt128_count;
+
+  if (lane.active_residual_sample_count == 0) {
+    r.residual_mean_q16_cycles = 0;
+    r.residual_stddev_q16_cycles = 0;
+    return;
+  }
+
+  const double n = (double)lane.active_residual_sample_count;
+  const double mean = (double)lane.active_residual_sum_cycles / n;
+  double variance =
+      ((double)lane.active_residual_square_sum_cycles / n) - (mean * mean);
+  if (variance < 0.0) variance = 0.0;
+  r.residual_mean_q16_cycles = (int32_t)(mean * 65536.0);
+  r.residual_stddev_q16_cycles = (uint32_t)(sqrt(variance) * 65536.0);
+}
+
+static uint32_t lower_env_quality_confidence_ppm(
+    const cadence_regression_result_t& r) {
+  if (!r.valid) return 0U;
+  if (!r.candidate_present || r.fallback_used) return 250000U;
+
+  uint32_t score = 1000000U;
+
+  if (r.sample_accepted_count < LOWER_ENV_PUBLISH_MIN_SAMPLES) {
+    const uint32_t sample_score =
+        (r.sample_accepted_count * 1000000U) / LOWER_ENV_PUBLISH_MIN_SAMPLES;
+    if (sample_score < score) score = sample_score;
+  }
+
+  if (r.selected_bucket_count < LOWER_ENV_PUBLISH_MIN_BUCKETS) {
+    const uint32_t bucket_score =
+        (r.selected_bucket_count * 1000000U) / LOWER_ENV_PUBLISH_MIN_BUCKETS;
+    if (bucket_score < score) score = bucket_score;
+  }
+
+  if (r.residual_sample_count != 0U) {
+    const uint32_t noisy = r.residual_abs_gt64_count + r.sample_hard_rejected_count;
+    if (noisy != 0U) {
+      const uint32_t penalty =
+          (noisy >= r.residual_sample_count)
+              ? 700000U
+              : (uint32_t)(((uint64_t)noisy * 700000ULL) /
+                           (uint64_t)r.residual_sample_count);
+      score = (penalty >= score) ? 0U : (score - penalty);
+    }
+  }
+
+  return score;
+}
+
+static void lower_env_note_valid_estimate(lower_env_lane_t& lane) {
+  if (!lane.floorline_seen_valid_estimate) {
+    lane.floorline_seen_valid_estimate = true;
+  }
+  if (lane.floorline_valid_estimate_count != UINT32_MAX) {
+    lane.floorline_valid_estimate_count++;
+  }
+}
+
+static void lower_env_note_fallback(lower_env_lane_t& lane) {
+  if (lane.fallback_publish_count != UINT32_MAX) {
+    lane.fallback_publish_count++;
+  }
+}
+
+static void lower_env_watchdog_anomaly(lower_env_lane_t& lane,
+                                       uint32_t reason,
+                                       uint32_t detail0,
+                                       uint32_t detail1,
+                                       uint32_t detail2 = 0U) {
+  lane.watchdog_anomaly_count++;
+  lane.last_watchdog_reason = reason;
+  clocks_watchdog_anomaly("floorline_v2_anomaly",
+                          (uint32_t)lane.kind,
+                          reason,
+                          detail0,
+                          detail1);
+  (void)detail2;
 }
 
 static void lower_env_reset_lane(interrupt_subscriber_kind_t kind) {
@@ -4747,6 +4939,7 @@ static void lower_env_reset_lane(interrupt_subscriber_kind_t kind) {
 }
 
 static void lower_env_reset_all(void) {
+  g_interrupt_feature_floorline_latched_nominal = false;
   g_lower_env_vclock = lower_env_lane_t{};
   g_lower_env_vclock.kind = interrupt_subscriber_kind_t::VCLOCK;
   g_lower_env_vclock.name = "vclock";
@@ -4763,13 +4956,17 @@ static void lower_env_reset_all(void) {
 static bool interrupt_feature_floorline_lane_nominal(
     interrupt_subscriber_kind_t kind) {
   const lower_env_lane_t* lane = lower_env_lane_for(kind);
-  return lane && lane->last.valid &&
-         lane->last.sample_count >= LOWER_ENV_FIT_MIN_BUCKETS &&
-         lane->last.inferred_dwt_at_event != 0U &&
-         lane->last.observed_dwt_at_event != 0U;
+  return lane && lane->floorline_seen_valid_estimate;
 }
 
 static void interrupt_feature_update_floorline(void) {
+  if (g_interrupt_feature_floorline_latched_nominal) {
+    interrupt_feature_set_cached("FLOORLINE",
+                                 g_interrupt_feature_floorline,
+                                 system_feature_status_t::NOMINAL);
+    return;
+  }
+
   const bool v_ok = interrupt_feature_floorline_lane_nominal(
       interrupt_subscriber_kind_t::VCLOCK);
   const bool o1_ok = !interrupt_feature_lane_required(interrupt_subscriber_kind_t::OCXO1) ||
@@ -4777,12 +4974,17 @@ static void interrupt_feature_update_floorline(void) {
   const bool o2_ok = !interrupt_feature_lane_required(interrupt_subscriber_kind_t::OCXO2) ||
       interrupt_feature_floorline_lane_nominal(interrupt_subscriber_kind_t::OCXO2);
 
-  interrupt_feature_set_cached(
-      "FLOORLINE",
-      g_interrupt_feature_floorline,
-      (v_ok && o1_ok && o2_ok)
-          ? system_feature_status_t::NOMINAL
-          : system_feature_status_t::INITIALIZING);
+  if (v_ok && o1_ok && o2_ok) {
+    g_interrupt_feature_floorline_latched_nominal = true;
+    interrupt_feature_set_cached("FLOORLINE",
+                                 g_interrupt_feature_floorline,
+                                 system_feature_status_t::NOMINAL);
+    return;
+  }
+
+  interrupt_feature_set_cached("FLOORLINE",
+                               g_interrupt_feature_floorline,
+                               system_feature_status_t::INITIALIZING);
 }
 
 static const char* lower_env_publish_source_name(uint32_t source) {
@@ -4803,6 +5005,8 @@ static const char* lower_env_publish_reason_name(uint32_t reason) {
     case FLOORLINE_REASON_FIT_OUTLIER:    return "fit_outlier";
     case FLOORLINE_REASON_INTERVAL_GATE:  return "interval_gate";
     case FLOORLINE_REASON_EDGE_GATE:      return "edge_gate";
+    case FLOORLINE_REASON_OBSERVED_FALLBACK: return "observed_fallback";
+    case FLOORLINE_REASON_SLOPE_ANOMALY:  return "slope_anomaly";
     default: return "unknown";
   }
 }
@@ -4811,21 +5015,15 @@ static void lower_env_decide_publication(cadence_regression_result_t& r) {
   r.publish_source = FLOORLINE_PUBLISH_SOURCE_OBSERVED;
   r.publish_reason = FLOORLINE_REASON_INIT;
   r.publish_floorline = false;
+  r.fallback_used = true;
   r.candidate_interval_error_cycles =
       (r.observed_interval_valid && r.inferred_interval_valid)
           ? r.inferred_minus_observed_interval_cycles
           : 0;
 
-  // Do not let the perfect be the enemy of the good.
-  //
-  // The original gate treated every imperfect evidence condition as a reason
-  // to publish observed/raw.  Live Species1 evidence showed that this makes the
-  // subscriber rail noisier: observed is evidence, not truth.  Therefore only
-  // genuinely absent/invalid or grossly displaced candidates are hard rejects.
-  // Soft failures keep their reason code for TIMEBASE/reporting, but still
-  // publish FloorLine because it is normally the lower-variance estimator.
   if (!r.valid || !r.candidate_present || r.inferred_dwt_at_event == 0U) {
-    r.publish_reason = FLOORLINE_REASON_FIT_INVALID;
+    r.publish_reason = FLOORLINE_REASON_OBSERVED_FALLBACK;
+    r.confidence_ppm = lower_env_quality_confidence_ppm(r);
     return;
   }
 
@@ -4834,7 +5032,8 @@ static void lower_env_decide_publication(cadence_regression_result_t& r) {
     soft_reason = FLOORLINE_REASON_SAMPLE_STARVED;
   } else if (r.selected_bucket_count < LOWER_ENV_PUBLISH_MIN_BUCKETS) {
     soft_reason = FLOORLINE_REASON_BUCKET_STARVED;
-  } else if (r.fit_error_abs_gt4_count != 0U) {
+  } else if (r.fit_error_abs_gt4_count != 0U ||
+             r.residual_abs_gt4_count != 0U) {
     soft_reason = FLOORLINE_REASON_FIT_OUTLIER;
   } else if ((r.observed_interval_valid && r.inferred_interval_valid) &&
              lower_env_abs_i32(r.inferred_minus_observed_interval_cycles) >
@@ -4849,18 +5048,22 @@ static void lower_env_decide_publication(cadence_regression_result_t& r) {
       lower_env_abs_i32(r.inferred_minus_observed_interval_cycles) >
           LOWER_ENV_PUBLISH_HARD_INTERVAL_GATE_CYCLES) {
     r.publish_reason = FLOORLINE_REASON_INTERVAL_GATE;
+    r.confidence_ppm = lower_env_quality_confidence_ppm(r);
     return;
   }
 
   if (lower_env_abs_i32(r.inferred_minus_observed_cycles) >
       LOWER_ENV_PUBLISH_HARD_EDGE_GATE_CYCLES) {
     r.publish_reason = FLOORLINE_REASON_EDGE_GATE;
+    r.confidence_ppm = lower_env_quality_confidence_ppm(r);
     return;
   }
 
   r.publish_source = FLOORLINE_PUBLISH_SOURCE_FLOORLINE;
   r.publish_reason = soft_reason;
   r.publish_floorline = true;
+  r.fallback_used = false;
+  r.confidence_ppm = lower_env_quality_confidence_ppm(r);
 }
 
 static void lower_env_publish_invalid_window(lower_env_lane_t& lane,
@@ -4869,7 +5072,7 @@ static void lower_env_publish_invalid_window(lower_env_lane_t& lane,
                                              uint16_t target_hw16,
                                              uint16_t observed_hw16) {
   cadence_regression_result_t r{};
-  r.valid = false;
+  r.valid = true;
   r.sequence = ++lane.update_count;
   r.sample_count = lane.active_sample_count;
   r.selected_bucket_count = lane.active_bucket_count;
@@ -4881,9 +5084,14 @@ static void lower_env_publish_invalid_window(lower_env_lane_t& lane,
       (lane.active_sample_accepted_count < LOWER_ENV_PUBLISH_MIN_SAMPLES)
           ? FLOORLINE_REASON_SAMPLE_STARVED
           : FLOORLINE_REASON_BUCKET_STARVED;
+  r.publish_floorline = false;
+  r.fallback_used = true;
+  r.confidence_ppm = 250000U;
   r.sample_accepted_count = lane.active_sample_accepted_count;
   r.sample_rejected_count = lane.active_sample_rejected_count;
+  r.sample_hard_rejected_count = lane.active_sample_hard_rejected_count;
   r.gate_cycles = LOWER_ENV_ERROR_GATE_CYCLES;
+  r.sample_hard_reject_gate_cycles = LOWER_ENV_SAMPLE_HARD_REJECT_CYCLES;
   r.inferred_minus_observed_cycles = 0;
   r.target_counter32_at_event = target_counter32;
   r.target_hardware16_at_event = target_hw16;
@@ -4891,11 +5099,17 @@ static void lower_env_publish_invalid_window(lower_env_lane_t& lane,
   r.slope_q16_cycles_per_sample = lane.previous_slope_valid
       ? lane.previous_slope_q16_cycles_per_sample
       : lower_env_default_slope_q16();
-  r.inferred_interval_valid = false;
+  r.inferred_interval_valid = lane.previous_inferred_edge_valid;
   r.observed_interval_valid = lane.previous_observed_edge_valid;
   r.observed_interval_cycles = lane.previous_observed_edge_valid
       ? (observed_dwt - lane.previous_observed_edge_dwt)
       : 0U;
+  r.inferred_interval_cycles = r.observed_interval_valid
+      ? r.observed_interval_cycles
+      : 0U;
+  r.inferred_minus_observed_interval_cycles = 0;
+  lower_env_copy_residual_forensics(r, lane);
+
   lane.previous_observed_edge_dwt = observed_dwt;
   lane.previous_observed_edge_valid = true;
   lane.previous_inferred_edge_dwt = observed_dwt;
@@ -4907,6 +5121,7 @@ static void lower_env_publish_invalid_window(lower_env_lane_t& lane,
   lane.previous_slope_valid = true;
   lane.last = r;
   lane.invalid_window_count++;
+  lower_env_note_fallback(lane);
   lower_env_clear_active(lane);
   interrupt_feature_update_floorline();
 }
@@ -4972,6 +5187,28 @@ static void lower_env_seal(lower_env_lane_t& lane,
                                    (int64_t)n;
   const int64_t full_slope_q16 = prior_slope_q16 + slope_delta_q16;
   if (full_slope_q16 <= 0) {
+    lower_env_watchdog_anomaly(lane,
+                               FLOORLINE_REASON_SLOPE_ANOMALY,
+                               (uint32_t)n,
+                               (uint32_t)(prior_slope_q16 & 0xFFFFFFFFULL),
+                               0U);
+    lower_env_publish_invalid_window(lane, observed_dwt, target_counter32,
+                                     target_hw16, observed_hw16);
+    return;
+  }
+
+  const int64_t default_slope_q16 = (int64_t)lower_env_default_slope_q16();
+  if (default_slope_q16 > 0 &&
+      (full_slope_q16 < (default_slope_q16 *
+                         (int64_t)LOWER_ENV_WATCHDOG_SLOPE_NUMERATOR) /
+                            (int64_t)LOWER_ENV_WATCHDOG_SLOPE_DENOMINATOR ||
+       full_slope_q16 > default_slope_q16 *
+                            (int64_t)LOWER_ENV_WATCHDOG_SLOPE_MULTIPLIER)) {
+    lower_env_watchdog_anomaly(lane,
+                               FLOORLINE_REASON_SLOPE_ANOMALY,
+                               (uint32_t)n,
+                               (uint32_t)(full_slope_q16 & 0xFFFFFFFFULL),
+                               (uint32_t)(default_slope_q16 & 0xFFFFFFFFULL));
     lower_env_publish_invalid_window(lane, observed_dwt, target_counter32,
                                      target_hw16, observed_hw16);
     return;
@@ -5050,6 +5287,7 @@ static void lower_env_seal(lower_env_lane_t& lane,
   r.sample_count = lane.active_sample_count;
   r.sample_accepted_count = lane.active_sample_accepted_count;
   r.sample_rejected_count = lane.active_sample_rejected_count;
+  r.sample_hard_rejected_count = lane.active_sample_hard_rejected_count;
   r.selected_bucket_count = n;
   r.observed_dwt_at_event = observed_dwt;
   r.inferred_dwt_at_event = inferred_edge_dwt;
@@ -5084,8 +5322,10 @@ static void lower_env_seal(lower_env_lane_t& lane,
   }
 
   r.gate_cycles = LOWER_ENV_ERROR_GATE_CYCLES;
+  r.sample_hard_reject_gate_cycles = LOWER_ENV_SAMPLE_HARD_REJECT_CYCLES;
   r.bucket_required_count = LOWER_ENV_PUBLISH_MIN_BUCKETS;
   r.sample_required_count = LOWER_ENV_PUBLISH_MIN_SAMPLES;
+  lower_env_copy_residual_forensics(r, lane);
   lower_env_decide_publication(r);
 
   lane.previous_observed_edge_dwt = observed_dwt;
@@ -5100,6 +5340,11 @@ static void lower_env_seal(lower_env_lane_t& lane,
             : lower_env_default_slope_q16());
   lane.previous_slope_valid = true;
   lane.last = r;
+  if (r.publish_floorline) {
+    lower_env_note_valid_estimate(lane);
+  } else {
+    lower_env_note_fallback(lane);
+  }
   lower_env_clear_active(lane);
   interrupt_feature_update_floorline();
 }
@@ -5132,9 +5377,17 @@ static void cadence_regression_observe(interrupt_subscriber_kind_t kind,
       lane->active_base_dwt +
       lower_env_round_q16_u32((int64_t)slope_q16 * (int64_t)x);
   const int32_t residual = lower_env_signed_delta_u32(predicted_dwt, observed_dwt);
+  const uint32_t abs_residual = lower_env_abs_i32(residual);
+  lower_env_note_residual(*lane, residual);
 
-  if (!lower_env_within_gate(residual)) {
+  // FloorLine V2 treats the 4-cycle band as quality evidence.  Samples beyond
+  // that band are still useful for the robust lower-envelope population.  Only
+  // gross residuals are excluded from the fit, and even that only affects the
+  // current candidate: publication will fall back to observed rather than
+  // withdrawing the FLOORLINE rail.
+  if (abs_residual > LOWER_ENV_SAMPLE_HARD_REJECT_CYCLES) {
     lane->active_sample_rejected_count++;
+    lane->active_sample_hard_rejected_count++;
     if (closes_second) {
       lower_env_seal(*lane, observed_dwt, target_counter32,
                      target_hw16, observed_hw16);
@@ -5234,6 +5487,7 @@ static inline void copy_floorline_interval_to_diag(
   diag.interval_accept_count = r.sample_accepted_count;
   diag.interval_reject_count = r.sample_rejected_count;
   // Retired predictor fields reused as compact FloorLine publication forensics.
+  diag.interval_resync_applied = r.fallback_used;
   diag.interval_resync_count = r.selected_bucket_count;
   diag.interval_reject_streak = r.publish_reason;
 }
@@ -10486,6 +10740,10 @@ static FLASHMEM void add_generation_gate_lane(Payload& p,
   add_bool("generation_gate_last_reject_one_second_due", s.generation_gate_last_reject_one_second_due);
 }
 
+static FLASHMEM void add_floorline_flat(Payload& p,
+                                           const char* prefix,
+                                           const lower_env_lane_t& lane);
+
 static FLASHMEM void add_ocxo_lean_lane(Payload& p,
                                         const char* prefix,
                                         ocxo_runtime_context_t& ctx,
@@ -10505,6 +10763,8 @@ static FLASHMEM void add_ocxo_lean_lane(Payload& p,
   const bool want_service = !strcasecmp(requested_section, "service");
   const bool want_yardstick = !strcasecmp(requested_section, "yardstick") ||
                               !strcasecmp(requested_section, "zero");
+  const bool want_floorline = !strcasecmp(requested_section, "floorline") ||
+                              !strcasecmp(requested_section, "lower_envelope");
 
   char key[112];
   auto add_bool = [&](const char* suffix, bool value) {
@@ -10525,9 +10785,9 @@ static FLASHMEM void add_ocxo_lean_lane(Payload& p,
   };
 
   add_str("section", requested_section);
-  add_str("available_sections", "summary clock gate service yardstick");
+  add_str("available_sections", "summary clock gate service yardstick floorline");
   if (!(want_summary || want_clock || want_gate || want_service ||
-        want_yardstick)) {
+        want_yardstick || want_floorline)) {
     add_str("error", "unknown section");
     return;
   }
@@ -10653,8 +10913,13 @@ static FLASHMEM void add_ocxo_lean_lane(Payload& p,
   add_bool("yardstick_excursion", lane.yardstick_last_excursion);
   add_i32("yardstick_auth_error", lane.yardstick_auth_last_error_cycles);
   add_bool("zero_worthy", lane.zw_worthy);
-
-  if (want_summary) return;
+  if (want_summary) {
+    const lower_env_lane_t* fl = lower_env_lane_for(ctx.kind);
+    if (fl) {
+      add_floorline_flat(p, prefix, *fl);
+    }
+    return;
+  }
 
   if (want_gate) {
     add_generation_gate_lane(p, prefix, gate);
@@ -10757,6 +11022,14 @@ static FLASHMEM void add_ocxo_lean_lane(Payload& p,
     add_u32("fact_asap_arm_count", lane.witness_fact_asap_arm_count);
     add_u32("fact_asap_fail_count", lane.witness_fact_asap_fail_count);
     add_u32("fact_overflow", lane.witness_fact_overflow_count);
+    return;
+  }
+
+  if (want_floorline) {
+    const lower_env_lane_t* fl = lower_env_lane_for(ctx.kind);
+    if (fl) {
+      add_floorline_flat(p, prefix, *fl);
+    }
     return;
   }
 
@@ -10915,7 +11188,7 @@ static FLASHMEM Payload cmd_report(const Payload&) {
   p.add("report", "INTERRUPT_LEAN");
   p.add("schema", "INTERRUPT_LEAN_V1");
   p.add("available_reports", "REPORT_STATUS REPORT_PPS REPORT_CADENCE REPORT_SMARTZERO REPORT_BRIDGE REPORT_HANDOFF REPORT_LOWER_ENVELOPE REPORT_INTEGRITY REPORT_LANES REPORT_LANE");
-  p.add("report_lane_sections", "summary clock gate service yardstick");
+  p.add("report_lane_sections", "summary clock gate service yardstick floorline");
   p.add("hw_ready", g_interrupt_hw_ready);
   p.add("runtime_ready", g_interrupt_runtime_ready);
   p.add("irqs_enabled", g_interrupt_irqs_enabled);
@@ -11061,6 +11334,14 @@ static FLASHMEM void add_lower_env_lane_payload(Payload& parent,
   obj.add("publish_reason_name", lower_env_publish_reason_name(r.publish_reason));
   obj.add("floorline_published", r.publish_floorline);
   obj.add("candidate_present", r.candidate_present);
+  obj.add("fallback_used", r.fallback_used);
+  obj.add("confidence_ppm", r.confidence_ppm);
+  obj.add("feature_latched_nominal", g_interrupt_feature_floorline_latched_nominal);
+  obj.add("ever_valid_estimate", lane.floorline_seen_valid_estimate);
+  obj.add("valid_estimate_count", lane.floorline_valid_estimate_count);
+  obj.add("fallback_publish_count", lane.fallback_publish_count);
+  obj.add("watchdog_anomaly_count", lane.watchdog_anomaly_count);
+  obj.add("last_watchdog_reason", lane.last_watchdog_reason);
 
   obj.add("gate_cycles", LOWER_ENV_ERROR_GATE_CYCLES);
   obj.add("hard_edge_gate_cycles", LOWER_ENV_PUBLISH_HARD_EDGE_GATE_CYCLES);
@@ -11068,6 +11349,8 @@ static FLASHMEM void add_lower_env_lane_payload(Payload& parent,
           LOWER_ENV_PUBLISH_HARD_INTERVAL_GATE_CYCLES);
   obj.add("sample_accepted_count", r.sample_accepted_count);
   obj.add("sample_rejected_count", r.sample_rejected_count);
+  obj.add("sample_hard_rejected_count", r.sample_hard_rejected_count);
+  obj.add("sample_hard_reject_gate_cycles", r.sample_hard_reject_gate_cycles);
   obj.add("sample_required_count", LOWER_ENV_PUBLISH_MIN_SAMPLES);
   obj.add("bucket_count", LOWER_ENV_BUCKET_COUNT);
   obj.add("selected_bucket_count", r.selected_bucket_count);
@@ -11091,8 +11374,19 @@ static FLASHMEM void add_lower_env_lane_payload(Payload& parent,
   obj.add("slope_cycles_per_second", lower_env_slope_cycles_per_second(r));
   obj.add("fit_error_mean_q16_cycles", r.fit_error_mean_q16_cycles);
   obj.add("fit_error_stddev_q16_cycles", r.fit_error_stddev_q16_cycles);
+  obj.add("fit_error_min_cycles", r.fit_error_min_cycles);
   obj.add("fit_error_max_cycles", r.fit_error_max_cycles);
   obj.add("fit_error_abs_gt4_count", r.fit_error_abs_gt4_count);
+  obj.add("residual_sample_count", r.residual_sample_count);
+  obj.add("residual_min_cycles", r.residual_min_cycles);
+  obj.add("residual_max_cycles", r.residual_max_cycles);
+  obj.add("residual_mean_q16_cycles", r.residual_mean_q16_cycles);
+  obj.add("residual_stddev_q16_cycles", r.residual_stddev_q16_cycles);
+  obj.add("residual_abs_gt4_count", r.residual_abs_gt4_count);
+  obj.add("residual_abs_gt16_count", r.residual_abs_gt16_count);
+  obj.add("residual_abs_gt32_count", r.residual_abs_gt32_count);
+  obj.add("residual_abs_gt64_count", r.residual_abs_gt64_count);
+  obj.add("residual_abs_gt128_count", r.residual_abs_gt128_count);
 
   if (include_pps_compare) {
     obj.add("pps_observed_interval_valid", pps_valid);
@@ -11108,11 +11402,82 @@ static FLASHMEM void add_lower_env_lane_payload(Payload& parent,
   parent.add_object(key, obj);
 }
 
+static FLASHMEM void add_floorline_flat(Payload& p,
+                                           const char* prefix,
+                                           const lower_env_lane_t& lane) {
+  const cadence_regression_result_t& r = lane.last;
+  char key[96];
+  auto add_bool = [&](const char* suffix, bool value) {
+    snprintf(key, sizeof(key), "%s_floorline_%s", prefix, suffix);
+    p.add(key, value);
+  };
+  auto add_u32 = [&](const char* suffix, uint32_t value) {
+    snprintf(key, sizeof(key), "%s_floorline_%s", prefix, suffix);
+    p.add(key, value);
+  };
+  auto add_i32 = [&](const char* suffix, int32_t value) {
+    snprintf(key, sizeof(key), "%s_floorline_%s", prefix, suffix);
+    p.add(key, value);
+  };
+  auto add_str = [&](const char* suffix, const char* value) {
+    snprintf(key, sizeof(key), "%s_floorline_%s", prefix, suffix);
+    p.add(key, value ? value : "");
+  };
+
+  add_str("version", "v2");
+  add_bool("valid", r.valid);
+  add_bool("published", r.publish_floorline);
+  add_bool("fallback_used", r.fallback_used);
+  add_bool("candidate_present", r.candidate_present);
+  add_bool("ever_valid_estimate", lane.floorline_seen_valid_estimate);
+  add_bool("feature_latched_nominal", g_interrupt_feature_floorline_latched_nominal);
+  add_str("publish_source", lower_env_publish_source_name(r.publish_source));
+  add_str("publish_reason", lower_env_publish_reason_name(r.publish_reason));
+  add_u32("confidence_ppm", r.confidence_ppm);
+  add_u32("sequence", r.sequence);
+  add_u32("update_count", lane.update_count);
+  add_u32("valid_estimate_count", lane.floorline_valid_estimate_count);
+  add_u32("fallback_count", lane.fallback_publish_count);
+  add_u32("watchdog_anomaly_count", lane.watchdog_anomaly_count);
+  add_u32("sample_count", r.sample_count);
+  add_u32("sample_accepted", r.sample_accepted_count);
+  add_u32("sample_rejected", r.sample_rejected_count);
+  add_u32("sample_hard_rejected", r.sample_hard_rejected_count);
+  add_u32("selected_bucket_count", r.selected_bucket_count);
+  add_u32("bucket_count", LOWER_ENV_BUCKET_COUNT);
+  add_u32("sample_rate_hz", LOWER_ENV_SAMPLE_RATE_HZ);
+  add_u32("soft_gate_cycles", LOWER_ENV_ERROR_GATE_CYCLES);
+  add_u32("hard_sample_gate_cycles", LOWER_ENV_SAMPLE_HARD_REJECT_CYCLES);
+  add_u32("hard_edge_gate_cycles", LOWER_ENV_PUBLISH_HARD_EDGE_GATE_CYCLES);
+  add_u32("observed_edge_dwt", r.observed_dwt_at_event);
+  add_u32("inferred_edge_dwt", r.inferred_dwt_at_event);
+  add_i32("inferred_minus_observed_cycles", r.inferred_minus_observed_cycles);
+  add_u32("observed_interval_cycles", r.observed_interval_cycles);
+  add_u32("inferred_interval_cycles", r.inferred_interval_cycles);
+  add_i32("interval_error_cycles", r.inferred_minus_observed_interval_cycles);
+  add_u32("slope_cycles_per_second", lower_env_slope_cycles_per_second(r));
+  add_i32("fit_error_mean_q16", r.fit_error_mean_q16_cycles);
+  add_u32("fit_error_stddev_q16", r.fit_error_stddev_q16_cycles);
+  add_i32("fit_error_min", r.fit_error_min_cycles);
+  add_i32("fit_error_max", r.fit_error_max_cycles);
+  add_u32("fit_error_abs_gt4", r.fit_error_abs_gt4_count);
+  add_u32("residual_count", r.residual_sample_count);
+  add_i32("residual_min", r.residual_min_cycles);
+  add_i32("residual_max", r.residual_max_cycles);
+  add_i32("residual_mean_q16", r.residual_mean_q16_cycles);
+  add_u32("residual_stddev_q16", r.residual_stddev_q16_cycles);
+  add_u32("residual_abs_gt4", r.residual_abs_gt4_count);
+  add_u32("residual_abs_gt16", r.residual_abs_gt16_count);
+  add_u32("residual_abs_gt32", r.residual_abs_gt32_count);
+  add_u32("residual_abs_gt64", r.residual_abs_gt64_count);
+  add_u32("residual_abs_gt128", r.residual_abs_gt128_count);
+}
+
 static FLASHMEM Payload cmd_report_lower_envelope(const Payload&) {
   Payload p;
   p.add("report", "INTERRUPT_LOWER_ENVELOPE");
   p.add("description",
-        "1 kHz FloorLine lower-envelope edge inference diagnostic rail");
+        "1 kHz FloorLine V2 robust lower-envelope edge estimator");
   p.add("sample_rate_hz", LOWER_ENV_SAMPLE_RATE_HZ);
   p.add("bucket_count", LOWER_ENV_BUCKET_COUNT);
   p.add("error_gate_cycles", LOWER_ENV_ERROR_GATE_CYCLES);
@@ -11122,7 +11487,7 @@ static FLASHMEM Payload cmd_report_lower_envelope(const Payload&) {
   p.add("publish_min_samples", LOWER_ENV_PUBLISH_MIN_SAMPLES);
   p.add("publish_min_buckets", LOWER_ENV_PUBLISH_MIN_BUCKETS);
   p.add("snapshot_count", ++g_lower_env_snapshot_count);
-  p.add("policy", "soft_gate_floorline_hard_invalid_observed");
+  p.add("policy", "floorline_v2_continuous_best_estimate_latched_feature");
 
 
   pps_yardstick_snapshot_t y{};
@@ -11204,6 +11569,7 @@ static FLASHMEM Payload cmd_report_lane(const Payload& args) {
     p.add("tick_mod_1000", g_vclock_lane.tick_mod_1000);
     p.add("ch2_one_second_enabled", (bool)g_vclock_ch2_one_second_enabled);
     p.add("ch2_next_counter32", (uint32_t)g_vclock_ch2_one_second_next_counter32);
+    add_floorline_flat(p, "vclock", g_lower_env_vclock);
     return p;
   }
   const char* section = args.getString("section");

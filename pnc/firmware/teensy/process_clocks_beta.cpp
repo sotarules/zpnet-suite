@@ -145,7 +145,18 @@ static constexpr bool TIMEBASE_FORENSICS_MINIMAL_PAYLOAD_ENABLED = true;
 // autopsy surfaces.  This is the next step above MINIMAL_PAIR_ONLY and is
 // intended to preserve the Pi pair contract while giving raw_cycles enough
 // cycle evidence to plot observed/EMA/FloorLine behavior.
-static constexpr bool TIMEBASE_FORENSICS_MICRO_RAW_CYCLES_ENABLED = false;
+//
+// FloorLine V2 note:
+//   MINIMAL_PAIR_ONLY is still the right 1 Hz TIMEBASE companion policy while
+//   we keep the campaign row small.  But the raw_cycles report cannot see
+//   FloorLine unless the flat micro fields are present:
+//
+//     v_raw/v_fl/v_pub, o1_raw/o1_fl/o1_pub, o2_raw/o2_fl/o2_pub
+//
+//   With this enabled, raw_cycles can directly verify whether the subscriber
+//   published endpoint equals the FloorLine endpoint, without turning the full
+//   deep forensic payload back on.
+static constexpr bool TIMEBASE_FORENSICS_MICRO_RAW_CYCLES_ENABLED = true;
 static constexpr bool TIMEBASE_FORENSICS_MINIMAL_HEALTH_FIELDS_ENABLED = false;
 
 // The richer slim/full forensics builders remain compiled for focused future
