@@ -187,6 +187,13 @@ TEENSY_HEALTH_RETRY_S = 60.0
 # plus imported Teensy-local timing readiness.  Runtime TIMEBASE pair
 # integrity, database command-contract checks, GNSS mode reconciliation, and
 # recovery projection remain local CLOCKS logic.
+#
+# FLOORLINE and QTIMER_DWT_RULER are intentionally not campaign-admission
+# gates.  Both remain valuable imported Teensy INTERRUPT feature surfaces, but
+# they are diagnostic / quality witnesses whose current definitions can strobe
+# during startup, recovery, and report-pressure windows.  Campaign START/RECOVER
+# admission must depend on custody and identity rails, not on these witness
+# surfaces, while FloorLine2 / future DWT-ruler policy is being refined.
 FEATURE_PREFLIGHT_PROFILE = "CAMPAIGN_PREFLIGHT"
 FEATURE_PREFLIGHT_REQUIRED = (
     "PI.SYSTEM.FEATURE_STATUS",
@@ -196,10 +203,8 @@ FEATURE_PREFLIGHT_REQUIRED = (
     "PI.SYSTEM.TEENSY_FEATURE_IMPORT",
     "PI.GNSS.REPORT",
     "TEENSY.SYSTEM.FEATURE_STATUS",
-    "TEENSY.INTERRUPT.FLOORLINE",
     "TEENSY.INTERRUPT.PPS_VCLOCK_AUTHORITY",
     "TEENSY.INTERRUPT.QTIMER_COUNTER_CUSTODY",
-    "TEENSY.INTERRUPT.QTIMER_DWT_RULER",
     "TEENSY.INTERRUPT.COUNTER32_LINEAGE",
     "TEENSY.CLOCKS.DWT_CALIBRATION",
     "TEENSY.CLOCKS.STATIC_PREDICTION",
