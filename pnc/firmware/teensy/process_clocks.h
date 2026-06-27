@@ -14,6 +14,7 @@
 //   • Consumption of process_interrupt-authored clock captures
 //   • Nominal clock ledgers and bridge-derived measured residuals
 //   • Local CLOCKS-owned ZERO/START logical zero-offset installation
+//   • Campaign Flash Cut: hot campaign boundary without Alpha epoch rebase
 //   • PPS/VCLOCK-selected truth capture
 //   • 1 Hz publication of canonical clock tuple
 //   • Continuous DWT-to-GNSS calibration (campaign-independent)

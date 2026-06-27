@@ -96,6 +96,12 @@ volatile bool request_stop    = false;
 volatile bool request_recover = false;
 volatile bool request_zero    = false;
 
+// FLASH_CUT is a hot campaign boundary: preserve the installed Alpha/service
+// epoch and learned timing state, change the campaign identity, and rebase
+// Beta's campaign-public clocks/statistics at the next PPS/VCLOCK edge.
+static volatile bool request_flash_cut = false;
+static char flash_cut_campaign_name[64] = {0};
+
 uint64_t recover_dwt_ns   = 0;
 uint64_t recover_gnss_ns  = 0;
 uint64_t recover_ocxo1_ns = 0;
@@ -177,6 +183,7 @@ static constexpr uint32_t TIMEBASE_BUILD_STAGE_PER_SECOND = 9;
 static constexpr uint32_t TIMEBASE_BUILD_STAGE_WELFORD = 10;
 static constexpr uint32_t TIMEBASE_BUILD_STAGE_SERVO = 11;
 static constexpr uint32_t TIMEBASE_BUILD_STAGE_DAC_WELFORD = 12;
+static constexpr uint32_t TIMEBASE_BUILD_STAGE_FLASH_CUT_GATE = 13;
 static constexpr uint32_t TIMEBASE_BUILD_STAGE_BUILD_BEGIN = 20;
 static constexpr uint32_t TIMEBASE_BUILD_STAGE_SPINE = 21;
 static constexpr uint32_t TIMEBASE_BUILD_STAGE_GNSS = 22;
@@ -202,6 +209,7 @@ static uint32_t g_timebase_pps_entry_count = 0;
 static uint32_t g_timebase_stop_gate_count = 0;
 static uint32_t g_timebase_start_zero_gate_count = 0;
 static uint32_t g_timebase_recover_gate_count = 0;
+static uint32_t g_timebase_flash_cut_gate_count = 0;
 static uint32_t g_timebase_watchdog_gate_count = 0;
 static uint32_t g_timebase_not_started_gate_count = 0;
 static uint32_t g_timebase_warmup_suppressed_count = 0;
@@ -265,6 +273,27 @@ static bool     g_timebase_last_ocxo1_pps_projected = false;
 static bool     g_timebase_last_ocxo2_pps_projected = false;
 static bool     g_timebase_last_ocxo1_pps_residual_valid = false;
 static bool     g_timebase_last_ocxo2_pps_residual_valid = false;
+
+// FLASH_CUT flight recorder.  These counters are deliberately Beta-local:
+// Flash Cut does not install a new Alpha epoch and must not perturb the
+// timing/custody surfaces it is trying to preserve.
+static uint32_t g_flash_cut_request_count = 0;
+static uint32_t g_flash_cut_commit_count = 0;
+static uint32_t g_flash_cut_reject_count = 0;
+static uint32_t g_flash_cut_busy_reject_count = 0;
+static char     g_flash_cut_last_requested_campaign[64] = {0};
+static char     g_flash_cut_last_from_campaign[64] = {0};
+static char     g_flash_cut_last_to_campaign[64] = {0};
+static uint64_t g_flash_cut_last_raw_gnss_ns = 0;
+static uint64_t g_flash_cut_last_raw_dwt_cycles = 0;
+static uint64_t g_flash_cut_last_raw_ocxo1_ns = 0;
+static uint64_t g_flash_cut_last_raw_ocxo2_ns = 0;
+static uint32_t g_flash_cut_last_boundary_pps_count = 0;
+static bool     g_flash_cut_last_dac1_ok = true;
+static bool     g_flash_cut_last_dac2_ok = true;
+static bool     g_flash_cut_last_servo_mode_supplied = false;
+static servo_mode_t g_flash_cut_last_servo_mode = servo_mode_t::OFF;
+static char     g_flash_cut_last_status[48] = {0};
 
 // ============================================================================
 // SYSTEM feature status — CLOCKS/Beta-owned readiness surfaces
@@ -462,6 +491,7 @@ static const char* timebase_build_stage_name(uint32_t stage) {
     case TIMEBASE_BUILD_STAGE_WELFORD: return "WELFORD";
     case TIMEBASE_BUILD_STAGE_SERVO: return "SERVO";
     case TIMEBASE_BUILD_STAGE_DAC_WELFORD: return "DAC_WELFORD";
+    case TIMEBASE_BUILD_STAGE_FLASH_CUT_GATE: return "FLASH_CUT_GATE";
     case TIMEBASE_BUILD_STAGE_BUILD_BEGIN: return "BUILD_BEGIN";
     case TIMEBASE_BUILD_STAGE_SPINE: return "SPINE";
     case TIMEBASE_BUILD_STAGE_GNSS: return "GNSS";
@@ -526,11 +556,12 @@ static volatile uint32_t g_campaign_warmup_suppressed_total = 0;
 // Alpha owns the live service/epoch ledgers.  Beta owns campaign presentation:
 //   public = raw_alpha_service_value + signed_campaign_offset
 //
-// START uses a negative offset to make the first public campaign row begin at
-// zero.  RECOVER uses a positive/negative offset to make the current Alpha
-// service ledger appear as the Pi-projected campaign ledger at the recovery PPS.
-// This is deliberately signed; the old unsigned base model could not represent
-// current_raw < recovered_public after a system restart/SmartZero epoch.
+// START/FLASH_CUT use a negative offset to make the first public campaign
+// row begin at zero.  RECOVER uses a positive/negative offset to make the
+// current Alpha service ledger appear as the Pi-projected campaign ledger at
+// the recovery PPS.  This is deliberately signed; the old unsigned base model
+// could not represent current_raw < recovered_public after a system
+// restart/SmartZero epoch.
 static int64_t g_campaign_public_dwt_offset = 0;
 static int64_t g_campaign_public_gnss_offset = 0;
 static int64_t g_campaign_public_ocxo1_offset = 0;
@@ -3215,11 +3246,12 @@ static void ocxo_dac_apply_synthetic_servo_step(ocxo_dac_state_t& dac,
 // Zeroing
 // ============================================================================
 
-void clocks_zero_all(void) {
+static void campaign_accounting_reset_common(bool reset_servo_runtime) {
   // Beta-local accounting reset only.  Alpha owns the active time/epoch
   // projection. Do not invalidate it here: after SmartZero install the new
   // epoch has just been authored; during acquisition the old service epoch
-  // must remain alive.
+  // must remain alive.  FLASH_CUT also uses this path, but with servo runtime
+  // intentionally preserved so the hot control state survives the boundary.
   campaign_seconds = 0;
 
   dwt_cycle_count_total = 0;
@@ -3243,12 +3275,25 @@ void clocks_zero_all(void) {
                                  system_feature_status_t::INITIALIZING,
                                  true);
 
-  ocxo_dac_predictor_reset(ocxo1_dac);
-  ocxo_dac_predictor_reset(ocxo2_dac);
-  ocxo_dac_pacing_reset();
+  if (reset_servo_runtime) {
+    ocxo_dac_predictor_reset(ocxo1_dac);
+    ocxo_dac_predictor_reset(ocxo2_dac);
+    ocxo_dac_pacing_reset();
+  }
 
+  // Input diagnostics are campaign-row products, not plant state.  Clear them
+  // even for FLASH_CUT so DAC_TICK cannot leak stale residuals across the
+  // campaign name boundary.
   servo_input_diag_reset(g_servo_input_ocxo1);
   servo_input_diag_reset(g_servo_input_ocxo2);
+}
+
+void clocks_zero_all(void) {
+  campaign_accounting_reset_common(true);
+}
+
+static void campaign_flash_cut_accounting_reset(void) {
+  campaign_accounting_reset_common(false);
 }
 
 // ============================================================================
@@ -3389,6 +3434,53 @@ static void ocxo_calibration_servo(void) {
 }
 
 // ============================================================================
+// Flash Cut
+// ============================================================================
+
+static void flash_cut_clear_pending(void) {
+  request_flash_cut = false;
+  flash_cut_campaign_name[0] = '\0';
+}
+
+static bool flash_cut_busy(void) {
+  return request_flash_cut || request_start || request_stop ||
+         request_recover || request_zero || interrupt_smartzero_running() ||
+         clocks_alpha_epoch_install_in_progress();
+}
+
+static void campaign_flash_cut_commit_at_pps(void) {
+  safeCopy(g_flash_cut_last_from_campaign,
+           sizeof(g_flash_cut_last_from_campaign),
+           campaign_name);
+
+  g_flash_cut_last_raw_gnss_ns = current_raw_gnss_ns();
+  g_flash_cut_last_raw_dwt_cycles = g_dwt_cycle_count_total;
+  g_flash_cut_last_raw_ocxo1_ns = current_raw_ocxo1_ns();
+  g_flash_cut_last_raw_ocxo2_ns = current_raw_ocxo2_ns();
+  g_flash_cut_last_boundary_pps_count = (uint32_t)campaign_seconds;
+
+  safeCopy(campaign_name, sizeof(campaign_name), flash_cut_campaign_name);
+  safeCopy(g_flash_cut_last_to_campaign,
+           sizeof(g_flash_cut_last_to_campaign),
+           campaign_name);
+
+  // This is the cut itself: Beta rebases campaign-public clocks/statistics at
+  // the already-authored PPS/VCLOCK edge, then returns without emitting a
+  // TIMEBASE pair for the boundary row.  The next PPS publishes count=1 and
+  // public GNSS/DWT/OCXO ledgers approximately +1 second from this boundary.
+  campaign_flash_cut_accounting_reset();
+  g_campaign_warmup_mode = campaign_warmup_mode_t::NONE;
+  g_campaign_warmup_remaining = 0;
+  g_campaign_warmup_suppressed_total = 0;
+  campaign_state = clocks_campaign_state_t::STARTED;
+
+  flash_cut_clear_pending();
+  g_flash_cut_commit_count++;
+  safeCopy(g_flash_cut_last_status, sizeof(g_flash_cut_last_status),
+           "flash_cut_committed");
+}
+
+// ============================================================================
 // Watchdog
 // ============================================================================
 
@@ -3398,6 +3490,7 @@ static void clocks_force_stop_campaign(void) {
   request_stop = false;
   request_recover = false;
   request_zero = false;
+  flash_cut_clear_pending();
   calibrate_ocxo_mode = servo_mode_t::OFF;
   ocxo_dac_pacing_abort_all();
   campaign_warmup_reset();
@@ -3619,6 +3712,7 @@ void clocks_beta_pps(void) {
     campaign_state = clocks_campaign_state_t::STOPPED;
     request_stop = false;
     request_zero = false;
+    flash_cut_clear_pending();
     calibrate_ocxo_mode = servo_mode_t::OFF;
     ocxo_dac_pacing_abort_all();
     campaign_warmup_reset();
@@ -3634,6 +3728,14 @@ void clocks_beta_pps(void) {
     timebase_build_stage(TIMEBASE_BUILD_STAGE_START_ZERO_GATE);
     (void)clocks_try_finish_pending_smartzero();
     publish_dac_tick("START_ZERO_GATE");
+    return;
+  }
+
+  if (request_flash_cut) {
+    g_timebase_flash_cut_gate_count++;
+    timebase_build_stage(TIMEBASE_BUILD_STAGE_FLASH_CUT_GATE);
+    campaign_flash_cut_commit_at_pps();
+    publish_dac_tick("FLASH_CUT_GATE");
     return;
   }
 
@@ -3661,6 +3763,7 @@ void clocks_beta_pps(void) {
     recover_welfords_apply_pending();
 
     request_recover = false;
+    flash_cut_clear_pending();
     campaign_state = clocks_campaign_state_t::STARTED;
     campaign_warmup_begin(campaign_warmup_mode_t::RECOVER);
     publish_dac_tick("RECOVER_GATE");
@@ -4322,12 +4425,125 @@ static bool payload_try_get_ocxo2_dac(const Payload& args, double& out) {
                                       "set_dac2");
 }
 
+static bool payload_try_get_nonempty_string(const Payload& args,
+                                            const char* key,
+                                            const char*& out) {
+  const char* s = args.getString(key);
+  if (!s || !*s) return false;
+  out = s;
+  return true;
+}
+
+static FLASHMEM Payload cmd_flash_cut(const Payload& args) {
+  const char* name = args.getString("campaign");
+  if (!name || !*name) {
+    g_flash_cut_reject_count++;
+    Payload err;
+    err.add("error", "missing campaign");
+    err.add("status", "flash_cut_rejected_missing_campaign");
+    return err;
+  }
+
+  if (campaign_state != clocks_campaign_state_t::STARTED) {
+    g_flash_cut_reject_count++;
+    Payload err;
+    err.add("error", "flash cut requires an active campaign");
+    err.add("status", "flash_cut_rejected_not_started");
+    err.add("campaign_state", "STOPPED");
+    err.add("campaign", campaign_name);
+    return err;
+  }
+
+  if (watchdog_anomaly_active || flash_cut_busy()) {
+    g_flash_cut_reject_count++;
+    g_flash_cut_busy_reject_count++;
+    Payload err;
+    err.add("error", "campaign control busy");
+    err.add("status", "flash_cut_rejected_busy");
+    err.add("request_flash_cut", request_flash_cut);
+    err.add("request_start", request_start);
+    err.add("request_stop", request_stop);
+    err.add("request_recover", request_recover);
+    err.add("request_zero", request_zero);
+    err.add("smartzero_running", interrupt_smartzero_running());
+    err.add("epoch_install_in_progress", clocks_alpha_epoch_install_in_progress());
+    err.add("watchdog_anomaly_active", watchdog_anomaly_active);
+    return err;
+  }
+
+  const char* servo_arg = nullptr;
+  const bool servo_supplied =
+      payload_try_get_nonempty_string(args, "calibrate_ocxo", servo_arg);
+
+  double dac_val;
+  bool dac1_ok = true;
+  bool dac2_ok = true;
+  const bool dac1_supplied = payload_try_get_ocxo1_dac(args, dac_val);
+  if (dac1_supplied) {
+    ocxo_dac_pacing_abort_all();
+    dac1_ok = ocxo_dac_set(ocxo1_dac, dac_val);
+    if (dac1_ok) ocxo_dac_retry_reset(ocxo1_dac);
+  }
+  const bool dac2_supplied = payload_try_get_ocxo2_dac(args, dac_val);
+  if (dac2_supplied) {
+    ocxo_dac_pacing_abort_all();
+    dac2_ok = ocxo_dac_set(ocxo2_dac, dac_val);
+    if (dac2_ok) ocxo_dac_retry_reset(ocxo2_dac);
+  }
+
+  if (servo_supplied) {
+    calibrate_ocxo_mode = servo_mode_parse(servo_arg);
+  }
+  if (!dac1_ok || !dac2_ok) {
+    calibrate_ocxo_mode = servo_mode_t::OFF;
+  }
+
+  safeCopy(g_flash_cut_last_requested_campaign,
+           sizeof(g_flash_cut_last_requested_campaign),
+           name);
+  safeCopy(flash_cut_campaign_name, sizeof(flash_cut_campaign_name), name);
+  g_flash_cut_last_dac1_ok = dac1_ok;
+  g_flash_cut_last_dac2_ok = dac2_ok;
+  g_flash_cut_last_servo_mode_supplied = servo_supplied;
+  g_flash_cut_last_servo_mode = calibrate_ocxo_mode;
+  g_flash_cut_request_count++;
+  request_flash_cut = true;
+  safeCopy(g_flash_cut_last_status, sizeof(g_flash_cut_last_status),
+           (!dac1_ok || !dac2_ok)
+               ? "flash_cut_requested_dac_fault_servo_off"
+               : "flash_cut_requested");
+
+  Payload p;
+  p.add("status", g_flash_cut_last_status);
+  p.add("campaign", flash_cut_campaign_name);
+  p.add("current_campaign", campaign_name);
+  p.add("boundary", "next_pps_vclock_edge");
+  p.add("zero_installed", false);
+  p.add("smartzero_required", false);
+  p.add("service_epoch_preserved", true);
+  p.add("alpha_reprime", false);
+  p.add("warmup_suppression", false);
+  p.add("request_count", g_flash_cut_request_count);
+  p.add("commit_count", g_flash_cut_commit_count);
+  p.add("ocxo1_dac", ocxo1_dac.dac_fractional);
+  p.add("ocxo2_dac", ocxo2_dac.dac_fractional);
+  p.add("ocxo1_dac_last_write_ok", ocxo1_dac.io_last_write_ok);
+  p.add("ocxo2_dac_last_write_ok", ocxo2_dac.io_last_write_ok);
+  p.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
+  p.add("calibrate_ocxo_supplied", servo_supplied);
+  return p;
+}
+
 static FLASHMEM Payload cmd_start(const Payload& args) {
   const char* name = args.getString("campaign");
   if (!name || !*name) {
     Payload err;
     err.add("error", "missing campaign");
     return err;
+  }
+
+  if (campaign_state == clocks_campaign_state_t::STARTED) {
+    return cmd_flash_cut(args);
   }
 
   if (!campaign_feature_gate_open()) {
@@ -4365,6 +4581,7 @@ static FLASHMEM Payload cmd_start(const Payload& args) {
   request_zero = false;
   request_stop = false;
   request_recover = false;
+  flash_cut_clear_pending();
   watchdog_anomaly_active = false;
   campaign_state = clocks_campaign_state_t::STOPPED;
   campaign_warmup_reset();
@@ -4426,6 +4643,7 @@ static FLASHMEM Payload cmd_stop(const Payload&) {
   request_start = false;
   request_zero = false;
   request_recover = false;
+  flash_cut_clear_pending();
 
   Payload p;
 
@@ -4459,6 +4677,7 @@ static FLASHMEM Payload cmd_zero(const Payload&) {
   request_start = false;
   request_stop = false;
   request_recover = false;
+  flash_cut_clear_pending();
   request_zero = true;
   campaign_state = clocks_campaign_state_t::STOPPED;
   campaign_warmup_reset();
@@ -4515,6 +4734,7 @@ static FLASHMEM Payload cmd_recover(const Payload& args) {
   request_start   = false;
   request_stop    = false;
   request_zero    = false;
+  flash_cut_clear_pending();
 
   Payload p;
   p.add("status", "recover_requested");
@@ -4963,6 +5183,25 @@ static FLASHMEM void add_campaign_payload(Payload& p) {
   p.add("request_stop", request_stop);
   p.add("request_recover", request_recover);
   p.add("request_zero", request_zero);
+  p.add("request_flash_cut", request_flash_cut);
+  p.add("flash_cut_pending_campaign", flash_cut_campaign_name);
+  p.add("flash_cut_request_count", g_flash_cut_request_count);
+  p.add("flash_cut_commit_count", g_flash_cut_commit_count);
+  p.add("flash_cut_reject_count", g_flash_cut_reject_count);
+  p.add("flash_cut_busy_reject_count", g_flash_cut_busy_reject_count);
+  p.add("flash_cut_last_status", g_flash_cut_last_status);
+  p.add("flash_cut_last_requested_campaign", g_flash_cut_last_requested_campaign);
+  p.add("flash_cut_last_from_campaign", g_flash_cut_last_from_campaign);
+  p.add("flash_cut_last_to_campaign", g_flash_cut_last_to_campaign);
+  p.add("flash_cut_last_boundary_pps_count", g_flash_cut_last_boundary_pps_count);
+  p.add("flash_cut_last_raw_gnss_ns", g_flash_cut_last_raw_gnss_ns);
+  p.add("flash_cut_last_raw_dwt_cycles", g_flash_cut_last_raw_dwt_cycles);
+  p.add("flash_cut_last_raw_ocxo1_ns", g_flash_cut_last_raw_ocxo1_ns);
+  p.add("flash_cut_last_raw_ocxo2_ns", g_flash_cut_last_raw_ocxo2_ns);
+  p.add("flash_cut_last_dac1_ok", g_flash_cut_last_dac1_ok);
+  p.add("flash_cut_last_dac2_ok", g_flash_cut_last_dac2_ok);
+  p.add("flash_cut_last_servo_mode_supplied", g_flash_cut_last_servo_mode_supplied);
+  p.add("flash_cut_last_servo_mode", servo_mode_str(g_flash_cut_last_servo_mode));
   p.add("watchdog_anomaly_active", watchdog_anomaly_active);
   p.add("watchdog_anomaly_publish_pending", watchdog_anomaly_publish_pending);
   p.add("watchdog_anomaly_sequence", watchdog_anomaly_sequence);
@@ -5676,6 +5915,10 @@ static FLASHMEM Payload cmd_report_timebase_publish(const Payload&) {
                g_science_residual_quarantine_remaining);
   counters.add("recover_science_quarantine_last_public_count",
                g_science_residual_quarantine_last_public_count);
+  counters.add("flash_cut_request_count", g_flash_cut_request_count);
+  counters.add("flash_cut_commit_count", g_flash_cut_commit_count);
+  counters.add("flash_cut_reject_count", g_flash_cut_reject_count);
+  counters.add("flash_cut_busy_reject_count", g_flash_cut_busy_reject_count);
   counters.add("welford_gap_advance_count", g_welford_gap_advance_count);
   counters.add("welford_gap_advance_last_public_count",
                g_welford_gap_advance_last_public_count);
@@ -5695,6 +5938,7 @@ static FLASHMEM Payload cmd_report_timebase_publish(const Payload&) {
   gates.add("stop_gate_count", g_timebase_stop_gate_count);
   gates.add("start_zero_gate_count", g_timebase_start_zero_gate_count);
   gates.add("recover_gate_count", g_timebase_recover_gate_count);
+  gates.add("flash_cut_gate_count", g_timebase_flash_cut_gate_count);
   gates.add("watchdog_gate_count", g_timebase_watchdog_gate_count);
   gates.add("not_started_gate_count", g_timebase_not_started_gate_count);
   gates.add("warmup_suppressed_count", g_timebase_warmup_suppressed_count);
@@ -5709,6 +5953,7 @@ static FLASHMEM Payload cmd_report_timebase_publish(const Payload&) {
   gates.add("request_stop", request_stop);
   gates.add("request_recover", request_recover);
   gates.add("request_zero", request_zero);
+  gates.add("request_flash_cut", request_flash_cut);
   p.add_object("gates", gates);
 
   Payload last;
@@ -5750,6 +5995,24 @@ static FLASHMEM Payload cmd_report_timebase_publish(const Payload&) {
   start_handoff.add("ocxo1_projection_vclock_ns", g_start_handoff_last_ocxo1_projection_vclock_ns);
   start_handoff.add("ocxo2_projection_vclock_ns", g_start_handoff_last_ocxo2_projection_vclock_ns);
   p.add_object("start_handoff", start_handoff);
+
+  Payload flash_cut;
+  flash_cut.add("pending", request_flash_cut);
+  flash_cut.add("pending_campaign", flash_cut_campaign_name);
+  flash_cut.add("last_status", g_flash_cut_last_status);
+  flash_cut.add("last_requested_campaign", g_flash_cut_last_requested_campaign);
+  flash_cut.add("last_from_campaign", g_flash_cut_last_from_campaign);
+  flash_cut.add("last_to_campaign", g_flash_cut_last_to_campaign);
+  flash_cut.add("last_boundary_pps_count", g_flash_cut_last_boundary_pps_count);
+  flash_cut.add("last_raw_gnss_ns", g_flash_cut_last_raw_gnss_ns);
+  flash_cut.add("last_raw_dwt_cycles", g_flash_cut_last_raw_dwt_cycles);
+  flash_cut.add("last_raw_ocxo1_ns", g_flash_cut_last_raw_ocxo1_ns);
+  flash_cut.add("last_raw_ocxo2_ns", g_flash_cut_last_raw_ocxo2_ns);
+  flash_cut.add("last_dac1_ok", g_flash_cut_last_dac1_ok);
+  flash_cut.add("last_dac2_ok", g_flash_cut_last_dac2_ok);
+  flash_cut.add("last_servo_mode_supplied", g_flash_cut_last_servo_mode_supplied);
+  flash_cut.add("last_servo_mode", servo_mode_str(g_flash_cut_last_servo_mode));
+  p.add_object("flash_cut", flash_cut);
 
   Payload gaps;
   gaps.add("candidate_minus_build_begin", (int64_t)g_timebase_candidate_count - (int64_t)g_timebase_build_begin_count);
@@ -6244,6 +6507,8 @@ static FLASHMEM Payload cmd_set_dac(const Payload& args) {
 
 static const process_command_entry_t CLOCKS_COMMANDS[] = {
   { "START",             cmd_start             },
+  { "FLASH_CUT",         cmd_flash_cut         },
+  { "FLASHCUT",          cmd_flash_cut         },
   { "STOP",              cmd_stop              },
   { "ZERO",              cmd_zero              },
   { "RECOVER",           cmd_recover           },

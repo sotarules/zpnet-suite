@@ -180,6 +180,13 @@ TIMEBASE_SILENCE_TIMEOUT_S = 30.0
 TIMEBASE_SILENCE_MONITOR_POLL_S = 1.0
 TEENSY_HEALTH_RETRY_S = 60.0
 
+# Async START/Flash Cut silence is not the same thing as a live campaign
+# going dark.  Teensy intentionally suppresses public TIMEBASE pairs during
+# START/Flash Cut warmup and handoff; the Pi must remain patient while the
+# first canonical row is being earned.
+START_FIRST_FRAGMENT_TIMEOUT_S = 90.0
+FLASH_CUT_FIRST_FRAGMENT_TIMEOUT_S = 180.0
+
 # Feature-status campaign preflight.
 #
 # This first-pass gate deliberately uses the global PI SYSTEM feature tree,
@@ -342,6 +349,18 @@ _diag: Dict[str, Any] = {
     "teensy_health_probe_success": 0,
     "last_timebase_activity": {},
     "last_timebase_silence": {},
+
+    # Flash Cut lifecycle
+    "flash_cut_requests": 0,
+    "flash_cut_waiting": False,
+    "flash_cut_from": None,
+    "flash_cut_to": None,
+    "flash_cut_requested_at_utc": None,
+    "flash_cut_first_fragment_at_utc": None,
+    "flash_cut_first_fragment_wait_s": None,
+    "flash_cut_first_fragment_pps_vclock_count": None,
+    "flash_cut_cold_recovery_deferred": 0,
+    "last_flash_cut": {},
 }
 
 # ---------------------------------------------------------------------
@@ -479,6 +498,14 @@ _start_first_fragment_at_utc: Optional[str] = None
 _start_first_fragment_wait_s: Optional[float] = None
 _start_first_fragment_pps_vclock_count: Optional[int] = None
 
+# Flash Cut is a hot campaign namespace transition.  While this is pending,
+# an active campaign with zero rows is expected, not a cold-recovery trigger.
+_flash_cut_pending: bool = False
+_flash_cut_from_campaign: Optional[str] = None
+_flash_cut_to_campaign: Optional[str] = None
+_flash_cut_requested_at_utc: Optional[str] = None
+_flash_cut_requested_monotonic: Optional[float] = None
+
 # Draconian sync: control-plane waits for a specific fragment PPS/VCLOCK count
 _sync_lock = threading.Lock()
 _sync_expected_pps_vclock: Optional[int] = None
@@ -545,6 +572,182 @@ def _arm_timebase_silence_watch(context: str) -> None:
         "synthetic_watch_arm": True,
     }
 
+
+
+
+def _timebase_silence_timeout_for_current_state() -> float:
+    """Return the silence timeout appropriate for the current campaign phase."""
+    if _flash_cut_pending:
+        return FLASH_CUT_FIRST_FRAGMENT_TIMEOUT_S
+    if _start_waiting_for_first_fragment:
+        return START_FIRST_FRAGMENT_TIMEOUT_S
+    return TIMEBASE_SILENCE_TIMEOUT_S
+
+
+def _mark_flash_cut_waiting(previous_campaign: str, campaign: str) -> None:
+    """Record that the Pi has armed a hot campaign cut and is awaiting row #1."""
+    global _flash_cut_pending, _flash_cut_from_campaign, _flash_cut_to_campaign
+    global _flash_cut_requested_at_utc, _flash_cut_requested_monotonic
+
+    now_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    _flash_cut_pending = True
+    _flash_cut_from_campaign = previous_campaign
+    _flash_cut_to_campaign = campaign
+    _flash_cut_requested_at_utc = now_utc
+    _flash_cut_requested_monotonic = time.monotonic()
+
+    _diag["flash_cut_requests"] = _diag.get("flash_cut_requests", 0) + 1
+    _diag["flash_cut_waiting"] = True
+    _diag["flash_cut_from"] = previous_campaign
+    _diag["flash_cut_to"] = campaign
+    _diag["flash_cut_requested_at_utc"] = now_utc
+    _diag["flash_cut_first_fragment_at_utc"] = None
+    _diag["flash_cut_first_fragment_wait_s"] = None
+    _diag["flash_cut_first_fragment_pps_vclock_count"] = None
+    _diag["last_flash_cut"] = {
+        "from": previous_campaign,
+        "to": campaign,
+        "requested_at_utc": now_utc,
+        "state": "WAITING_FOR_FIRST_FRAGMENT",
+        "first_fragment_timeout_s": float(FLASH_CUT_FIRST_FRAGMENT_TIMEOUT_S),
+    }
+
+
+def _clear_flash_cut_wait_state() -> None:
+    """Clear process-local Flash Cut wait state without erasing diagnostics."""
+    global _flash_cut_pending, _flash_cut_from_campaign, _flash_cut_to_campaign
+    global _flash_cut_requested_at_utc, _flash_cut_requested_monotonic
+
+    _flash_cut_pending = False
+    _flash_cut_from_campaign = None
+    _flash_cut_to_campaign = None
+    _flash_cut_requested_at_utc = None
+    _flash_cut_requested_monotonic = None
+    _diag["flash_cut_waiting"] = False
+    _diag["flash_cut_from"] = None
+    _diag["flash_cut_to"] = None
+
+
+def _mark_flash_cut_committed_if_needed(*, campaign: str, pps_vclock_count: int) -> None:
+    """Clear durable/local Flash Cut pending state once the first row is accepted."""
+    global _flash_cut_pending
+    global _flash_cut_from_campaign, _flash_cut_to_campaign
+    global _flash_cut_requested_at_utc, _flash_cut_requested_monotonic
+
+    now_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    waited_s = (
+        time.monotonic() - _flash_cut_requested_monotonic
+        if _flash_cut_requested_monotonic is not None
+        else None
+    )
+
+    try:
+        with open_db() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                UPDATE campaigns
+                SET payload = (payload - 'flash_cut_pending')
+                    || jsonb_build_object(
+                        'flash_cut_committed_at', to_jsonb(%s::text),
+                        'flash_cut_first_pps_vclock_count', to_jsonb(%s::int),
+                        'flash_cut_first_pps_count', to_jsonb(%s::int)
+                    )
+                WHERE campaign = %s
+                  AND active = true
+                  AND payload ? 'flash_cut_pending'
+                """,
+                (now_utc, int(pps_vclock_count), int(pps_vclock_count), campaign),
+            )
+    except Exception:
+        logging.exception("⚠️ [clocks] failed to clear flash_cut_pending marker (ignored)")
+
+    if _flash_cut_pending and (_flash_cut_to_campaign is None or _flash_cut_to_campaign == campaign):
+        _diag["flash_cut_waiting"] = False
+        _diag["flash_cut_first_fragment_at_utc"] = now_utc
+        _diag["flash_cut_first_fragment_wait_s"] = (
+            None if waited_s is None else round(float(waited_s), 3)
+        )
+        _diag["flash_cut_first_fragment_pps_vclock_count"] = int(pps_vclock_count)
+        _diag["last_flash_cut"] = {
+            "from": _flash_cut_from_campaign,
+            "to": campaign,
+            "requested_at_utc": _flash_cut_requested_at_utc,
+            "first_fragment_at_utc": now_utc,
+            "waited_s": None if waited_s is None else round(float(waited_s), 3),
+            "teensy_pps_vclock_count": int(pps_vclock_count),
+            "state": "RUNNING",
+        }
+        _clear_flash_cut_wait_state()
+
+
+def _campaign_payload_is_pending_flash_cut(payload: Dict[str, Any]) -> bool:
+    return bool(payload.get("flash_cut_pending") and payload.get("flash_cut_from"))
+
+
+def _flash_cut_pending_age_s(payload: Dict[str, Any]) -> Optional[float]:
+    if _flash_cut_requested_monotonic is not None:
+        return time.monotonic() - _flash_cut_requested_monotonic
+
+    ts = payload.get("flash_cut_armed_at") or payload.get("started_at")
+    if not isinstance(ts, str) or not ts:
+        return None
+
+    try:
+        armed = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        return (datetime.now(timezone.utc) - armed).total_seconds()
+    except Exception:
+        return None
+
+
+def _reattach_pending_flash_cut_without_recovery(
+    *,
+    campaign_name: str,
+    campaign_payload: Dict[str, Any],
+) -> bool:
+    """Do not cold-restart a zero-row campaign that is merely awaiting Flash Cut row #1."""
+    global _campaign_active, _accepted_pps_vclock_count
+
+    if not _campaign_payload_is_pending_flash_cut(campaign_payload):
+        return False
+
+    pending_age_s = _flash_cut_pending_age_s(campaign_payload)
+    if pending_age_s is not None and pending_age_s >= FLASH_CUT_FIRST_FRAGMENT_TIMEOUT_S:
+        logging.error(
+            "💥 [recovery] pending Flash Cut campaign '%s' has no TIMEBASE rows after %.3fs "
+            "(timeout=%.3fs); allowing cold recovery",
+            campaign_name, float(pending_age_s), float(FLASH_CUT_FIRST_FRAGMENT_TIMEOUT_S),
+        )
+        return False
+
+    previous_campaign = str(campaign_payload.get("flash_cut_from") or "")
+    _diag["flash_cut_cold_recovery_deferred"] = _diag.get("flash_cut_cold_recovery_deferred", 0) + 1
+    _diag["last_flash_cut"] = {
+        "from": previous_campaign,
+        "to": campaign_name,
+        "state": "REATTACHED_ZERO_ROW_WAIT",
+        "reattached_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "first_fragment_timeout_s": float(FLASH_CUT_FIRST_FRAGMENT_TIMEOUT_S),
+        "pending_age_s": None if pending_age_s is None else round(float(pending_age_s), 3),
+    }
+
+    _reset_trackers()
+    _clear_sync_wait()
+    _accepted_pps_vclock_count = None
+    _diag["accepted_pps_count"] = None
+    _diag["accepted_pps_vclock_count"] = None
+    _mark_start_waiting(campaign_name)
+    _mark_flash_cut_waiting(previous_campaign, campaign_name)
+    _campaign_active = True
+    _arm_timebase_silence_watch("FLASH_CUT_REATTACH")
+
+    logging.info(
+        "⚡ [recovery] campaign '%s' has no TIMEBASE rows but is a pending Flash Cut child; "
+        "reattaching to the hot Teensy stream instead of issuing STOP/START",
+        campaign_name,
+    )
+    return True
 
 def _teensy_clocks_health_ok() -> bool:
     """
@@ -617,7 +820,7 @@ def _timebase_silence_recovery(reason: str, details: Dict[str, Any]) -> None:
         _auto_recovery_in_progress = False
 
 
-def _begin_timebase_silence_recovery(age_s: float) -> bool:
+def _begin_timebase_silence_recovery(age_s: float, *, timeout_s: float, phase: str) -> bool:
     """
     Start the live-Teensy-reboot recovery path if no other recovery is active.
     """
@@ -630,7 +833,10 @@ def _begin_timebase_silence_recovery(age_s: float) -> bool:
     now_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     details = {
         "age_s": round(float(age_s), 3),
-        "timeout_s": float(TIMEBASE_SILENCE_TIMEOUT_S),
+        "timeout_s": float(timeout_s),
+        "campaign_phase": phase,
+        "flash_cut_pending": bool(_flash_cut_pending),
+        "start_waiting_for_first_fragment": bool(_start_waiting_for_first_fragment),
         "last_timebase_activity_utc": _timebase_last_activity_utc,
         "last_timebase_activity_topic": _timebase_last_activity_topic,
         "last_timebase_activity_pps_vclock_count": _timebase_last_activity_pps_vclock_count,
@@ -655,7 +861,7 @@ def _begin_timebase_silence_recovery(age_s: float) -> bool:
         "(age=%.3fs timeout=%.3fs, last_topic=%s, last_pps_vclock_count=%s) — "
         "waiting for Teensy health check before recovery",
         float(age_s),
-        float(TIMEBASE_SILENCE_TIMEOUT_S),
+        float(timeout_s),
         _timebase_last_activity_topic,
         str(_timebase_last_activity_pps_vclock_count),
     )
@@ -707,8 +913,16 @@ def _timebase_silence_monitor_loop() -> None:
             continue
 
         age_s = time.monotonic() - _timebase_last_activity_monotonic
-        if age_s >= TIMEBASE_SILENCE_TIMEOUT_S:
-            _begin_timebase_silence_recovery(age_s)
+        timeout_s = _timebase_silence_timeout_for_current_state()
+        if _flash_cut_pending:
+            phase = "FLASH_CUT_ARMED"
+        elif _start_waiting_for_first_fragment:
+            phase = "START_WAITING_FOR_FIRST_FRAGMENT"
+        else:
+            phase = "RUNNING"
+
+        if age_s >= timeout_s:
+            _begin_timebase_silence_recovery(age_s, timeout_s=timeout_s, phase=phase)
 
 
 def _begin_auto_recovery(reason: str, details: Dict[str, Any], *, source: str) -> bool:
@@ -1893,7 +2107,13 @@ def _mark_start_first_fragment_if_needed(
         "waited_s": round(float(waited_s), 3),
         "teensy_pps_vclock_count": int(pps_vclock_count),
         "state": "RUNNING",
+        "flash_cut": bool(_flash_cut_pending),
     }
+
+    _mark_flash_cut_committed_if_needed(
+        campaign=campaign,
+        pps_vclock_count=int(pps_vclock_count),
+    )
 
     logging.info(
         "✅ [start] @%s first TIMEBASE_FRAGMENT accepted asynchronously "
@@ -1919,6 +2139,10 @@ def _start_status_payload() -> Dict[str, Any]:
             else round(float(_start_first_fragment_wait_s), 3)
         ),
         "first_fragment_pps_vclock_count": _start_first_fragment_pps_vclock_count,
+        "flash_cut_waiting": bool(_flash_cut_pending),
+        "flash_cut_from": _flash_cut_from_campaign,
+        "flash_cut_to": _flash_cut_to_campaign,
+        "flash_cut_requested_at_utc": _flash_cut_requested_at_utc,
     }
 
 
@@ -2569,7 +2793,14 @@ def _request_teensy_recover(pps_vclock_count: int, args: Dict[str, Any]) -> None
 
 def cmd_start(args: Optional[dict]) -> dict:
     """
-    START — v5 three-domain architecture with flash-cut support.
+    START — asynchronous cold START or hot Flash Cut.
+
+    Cold START is allowed to push boot DAC seeds and may ask Teensy to build a
+    new SmartZero service epoch.  Flash Cut is intentionally narrower: do not
+    STOP Teensy, do not push default DACs merely because SYSTEM has them, and
+    do not interpret the new campaign's initial lack of rows as a cold-restart
+    condition.  The Teensy remains hot; only the campaign namespace and
+    campaign-public origins change.
     """
     global _campaign_active, _accepted_pps_vclock_count
     global _sync_expected_pps_vclock, _sync_fragment
@@ -2582,6 +2813,8 @@ def cmd_start(args: Optional[dict]) -> dict:
     # --- Check for active campaign (determines cold start vs flash-cut) ---
     active_row = _get_active_campaign()
     flash_cut = active_row is not None
+    prev_campaign = active_row["campaign"] if flash_cut else None
+    prev_payload = active_row["payload"] if flash_cut and isinstance(active_row.get("payload"), dict) else {}
 
     current_location = _get_current_location()
 
@@ -2617,13 +2850,15 @@ def cmd_start(args: Optional[dict]) -> dict:
     set_dac1 = start_args.get("set_dac1")
     set_dac2 = start_args.get("set_dac2")
     calibrate_ocxo = start_args.get("calibrate_ocxo") or None
+    if isinstance(calibrate_ocxo, str):
+        calibrate_ocxo = calibrate_ocxo.strip().upper() or None
     if calibrate_ocxo and calibrate_ocxo not in ("MEAN", "TOTAL", "NOW", "OFF"):
         return {"success": False, "message": f"calibrate_ocxo must be 'MEAN' 'TOTAL' 'NOW' or 'OFF', got '{calibrate_ocxo}'"}
-    if calibrate_ocxo == "OFF":
-        calibrate_ocxo = None
 
-    # Read default DAC from config if not specified
-    if set_dac1 is None or set_dac2 is None:
+    # Cold START uses SYSTEM DAC boot seeds when the operator did not supply
+    # explicit values.  Flash Cut preserves the live Teensy/DAC state unless
+    # the operator explicitly supplies a DAC value for the cut.
+    if not flash_cut and (set_dac1 is None or set_dac2 is None):
         try:
             with open_db(row_dict=True) as conn:
                 cur = conn.cursor()
@@ -2638,40 +2873,56 @@ def cmd_start(args: Optional[dict]) -> dict:
                         logging.info("🔧 [clocks] using ocxo2_dac=%s from SYSTEM config", set_dac2)
         except Exception:
             logging.exception("⚠️ [clocks] failed to read SYSTEM config (ignored)")
-
-    campaign_payload = {
-        "location": location,
-        "started_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-    }
-    if set_dac1 is not None:
-        campaign_payload["ocxo1_dac"] = float(set_dac1)
-    if set_dac2 is not None:
-        campaign_payload["ocxo2_dac"] = float(set_dac2)
-    if calibrate_ocxo:
-        campaign_payload["calibrate_ocxo"] = calibrate_ocxo
+    elif flash_cut and (set_dac1 is None or set_dac2 is None):
+        logging.info(
+            "⚡ [start] FLASH CUT preserving live DAC state for omitted lane(s) "
+            "(no SYSTEM boot DAC push)"
+        )
 
     # --- Flash-cut preamble ---
     if flash_cut:
-        prev_campaign = active_row["campaign"]
-        prev_location = active_row["payload"].get("location")
+        prev_location = prev_payload.get("location")
 
         logging.info(
             "⚡ [start] FLASH CUT: '%s' → '%s' (seamless campaign switch, no stop)",
             prev_campaign, campaign,
         )
 
-        campaign_payload["flash_cut_from"] = prev_campaign
-
         if location is None and prev_location:
             location = prev_location
-            campaign_payload["location"] = location
             logging.info(
                 "📡 [start] inheriting location '%s' from previous campaign",
                 location,
             )
 
-    # Deactivate prior campaigns + create new one
     cutover_ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    campaign_payload = {
+        "location": location,
+        "started_at": cutover_ts,
+    }
+    if set_dac1 is not None:
+        campaign_payload["ocxo1_dac"] = float(set_dac1)
+    if set_dac2 is not None:
+        campaign_payload["ocxo2_dac"] = float(set_dac2)
+    if calibrate_ocxo is not None:
+        # OFF is an explicit command in Flash Cut: stop servo but preserve the
+        # current DAC/output state.  Omitted means "preserve current mode" on
+        # hot Teensy firmware and "default OFF" on cold firmware.
+        campaign_payload["calibrate_ocxo"] = calibrate_ocxo
+
+    if flash_cut:
+        campaign_payload.update({
+            "flash_cut_from": prev_campaign,
+            "flash_cut_pending": True,
+            "flash_cut_armed_at": cutover_ts,
+            "flash_cut_preserves_teensy_state": True,
+            "flash_cut_pi_mode": "HOT_START_NO_TEENSY_STOP",
+        })
+
+    # Deactivate prior campaigns + create new one.  The new campaign must be
+    # active before the first row can arrive, because the processor persists by
+    # active campaign.  If the Teensy command fails, restore the prior active
+    # row below.
     with open_db() as conn:
         cur = conn.cursor()
         cur.execute(
@@ -2691,12 +2942,12 @@ def cmd_start(args: Optional[dict]) -> dict:
             (campaign, json.dumps(campaign_payload)),
         )
 
-    _request_teensy_stop_best_effort()
+    if not flash_cut:
+        _request_teensy_stop_best_effort()
 
     # Drain stale TIMEBASE pieces before arming START. From this point forward
     # the Pi accepts exact TIMEBASE_FRAGMENT + TIMEBASE_FORENSICS pairs asynchronously.
     _drain_timebase_ingress_and_pending()
-
     _reset_trackers()
 
     # START is asynchronous, so no START-specific sync latch remains armed.
@@ -2708,23 +2959,25 @@ def cmd_start(args: Optional[dict]) -> dict:
     _diag["accepted_pps_vclock_count"] = None
 
     _mark_start_waiting(campaign)
+    if flash_cut:
+        _mark_flash_cut_waiting(str(prev_campaign), str(campaign))
 
     # Mark the campaign active before the Teensy START command returns so the
     # processor thread cannot discard an early fragment as "no campaign".
     _campaign_active = True
-    _arm_timebase_silence_watch("START")
+    _arm_timebase_silence_watch("FLASH_CUT" if flash_cut else "START")
 
     # Arm TEENSY
     logging.info(
-        "📡 [start] @%s arming TEENSY START asynchronously: pps_vclock_count=0",
-        system_time_z(),
+        "📡 [start] @%s arming TEENSY %s asynchronously: pps_vclock_count=0",
+        system_time_z(), "FLASH CUT" if flash_cut else "START",
     )
     teensy_args: Dict[str, Any] = {"campaign": campaign}
     if set_dac1 is not None:
         teensy_args["set_dac1"] = str(set_dac1)
     if set_dac2 is not None:
         teensy_args["set_dac2"] = str(set_dac2)
-    if calibrate_ocxo:
+    if calibrate_ocxo is not None:
         teensy_args["calibrate_ocxo"] = calibrate_ocxo
 
     try:
@@ -2733,6 +2986,35 @@ def cmd_start(args: Optional[dict]) -> dict:
         _campaign_active = False
         _accepted_pps_vclock_count = None
         _clear_start_wait_state()
+        _clear_flash_cut_wait_state()
+        if flash_cut and prev_campaign:
+            try:
+                failed_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+                with open_db() as conn:
+                    cur = conn.cursor()
+                    cur.execute(
+                        """
+                        UPDATE campaigns
+                        SET active = false,
+                            payload = payload || jsonb_build_object(
+                                'start_failed_at', to_jsonb(%s::text),
+                                'start_failed_reason', to_jsonb(%s::text)
+                            )
+                        WHERE campaign = %s AND active = true
+                        """,
+                        (failed_at, "teensy_start_command_failed", campaign),
+                    )
+                    cur.execute(
+                        """
+                        UPDATE campaigns
+                        SET active = true,
+                            payload = payload - 'stopped_at'
+                        WHERE campaign = %s
+                        """,
+                        (prev_campaign,),
+                    )
+            except Exception:
+                logging.exception("⚠️ [clocks] failed to roll back DB after Flash Cut START failure")
         raise
 
     logging.info(
@@ -2743,8 +3025,9 @@ def cmd_start(args: Optional[dict]) -> dict:
 
     if flash_cut:
         logging.info(
-            "⚡ [start] @%s FLASH CUT requested — '%s' → '%s' (no synchronous fragment wait)",
-            system_time_z(), prev_campaign, campaign,
+            "⚡ [start] @%s FLASH CUT requested — '%s' → '%s' "
+            "(no STOP, no synchronous fragment wait, first-row timeout=%.0fs)",
+            system_time_z(), prev_campaign, campaign, FLASH_CUT_FIRST_FRAGMENT_TIMEOUT_S,
         )
 
     return {
@@ -2759,8 +3042,13 @@ def cmd_start(args: Optional[dict]) -> dict:
             "waiting_for_first_fragment": True,
             "startup": _start_status_payload(),
             "flash_cut": flash_cut,
-            "previous_campaign": active_row["campaign"] if flash_cut else None,
+            "previous_campaign": prev_campaign,
             "sync_wait_removed": True,
+            "teensy_stop_sent": not flash_cut,
+            "default_dac_push_suppressed": bool(flash_cut),
+            "first_fragment_timeout_s": (
+                FLASH_CUT_FIRST_FRAGMENT_TIMEOUT_S if flash_cut else START_FIRST_FRAGMENT_TIMEOUT_S
+            ),
         },
     }
 
@@ -2800,6 +3088,7 @@ def cmd_stop(_: Optional[dict]) -> dict:
 
     _campaign_active = False
     _clear_start_wait_state()
+    _clear_flash_cut_wait_state()
     _drain_timebase_ingress_and_pending()
     _reset_trackers()
 
@@ -2852,6 +3141,7 @@ def cmd_clear(_: Optional[dict]) -> dict:
 
         _campaign_active = False
         _clear_start_wait_state()
+        _clear_flash_cut_wait_state()
         _drain_timebase_ingress_and_pending()
         _reset_trackers()
 
@@ -3072,6 +3362,20 @@ def _recover_campaign() -> None:
 
     if tb_row is None:
         _diag["recovery_missing_timebase"] += 1
+        if _reattach_pending_flash_cut_without_recovery(
+            campaign_name=campaign_name,
+            campaign_payload=campaign_payload,
+        ):
+            _diag["last_recovery"] = {
+                "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "campaign": campaign_name,
+                "mode": "flash_cut_zero_row_reattach",
+                "sync_wait_removed": True,
+                "waiting_for_first_fragment": True,
+                "teensy_stop_sent": False,
+            }
+            return
+
         logging.info(
             "ℹ️ [recovery] campaign '%s' has no TIMEBASE rows — "
             "treating as fresh start (cold restart)",
@@ -4024,12 +4328,22 @@ def cmd_clocks_info(_: Optional[dict]) -> Dict[str, Any]:
         },
         "timebase_silence_monitor": {
             "timeout_s": TIMEBASE_SILENCE_TIMEOUT_S,
+            "start_first_fragment_timeout_s": START_FIRST_FRAGMENT_TIMEOUT_S,
+            "flash_cut_first_fragment_timeout_s": FLASH_CUT_FIRST_FRAGMENT_TIMEOUT_S,
+            "current_effective_timeout_s": _timebase_silence_timeout_for_current_state(),
             "poll_s": TIMEBASE_SILENCE_MONITOR_POLL_S,
             "health_retry_s": TEENSY_HEALTH_RETRY_S,
             "last_activity_utc": _timebase_last_activity_utc,
             "last_activity_topic": _timebase_last_activity_topic,
             "last_activity_pps_vclock_count": _timebase_last_activity_pps_vclock_count,
             "recovery_active": _timebase_silence_recovery_active,
+        },
+        "flash_cut": {
+            "pending": bool(_flash_cut_pending),
+            "from": _flash_cut_from_campaign,
+            "to": _flash_cut_to_campaign,
+            "requested_at_utc": _flash_cut_requested_at_utc,
+            "first_fragment_timeout_s": FLASH_CUT_FIRST_FRAGMENT_TIMEOUT_S,
         },
         "diag": _diag,
     }
