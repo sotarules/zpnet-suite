@@ -10,6 +10,8 @@ Usage:
     python raw_cycles.py <campaign_name> [limit] [clock]
     python raw_cycles.py <campaign_name> --clock OCXO2 [limit]
     python raw_cycles.py <campaign_name> --limit 300 --clock VCLOCK
+    python raw_cycles.py <campaign_name> --align-ocxo
+    python raw_cycles.py <campaign_name> --delay-pps-vclock
 
 Clock filter:
     VCLOCK, OCXO1, OCXO2
@@ -35,6 +37,12 @@ Column doctrine:
 Core rail columns are always shown for each selected lane so the report shape
 stays stable across current FloorLine firmware builds.  Truly auxiliary columns
 (such as counter32 lineage) are still omitted when absent.
+
+Alignment view:
+    --align-ocxo / --delay-pps-vclock delays PPS and VCLOCK by one TIMEBASE
+    row so the late-published OCXO one-second interval appears beside the
+    PPS/VCLOCK interval it physically belongs with.  This intentionally
+    misrepresents the original publication row relationship.
 """
 
 from __future__ import annotations
@@ -806,6 +814,49 @@ def collect_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]
     return out, gaps
 
 
+def align_pps_vclock_to_ocxo_rows(collected: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]:
+    """Build an OCXO-aligned view by delaying PPS/VCLOCK one TIMEBASE row.
+
+    TIMEBASE rows are emitted at PPS/VCLOCK.  The OCXO one-second edge is
+    defined as the next OCXO edge after PPS/VCLOCK, so the corresponding OCXO
+    interval is normally only available in the following TIMEBASE row.  This
+    view keeps each current row's OCXO lanes but replaces PPS and VCLOCK with
+    the previous row's PPS/VCLOCK values.
+
+    The returned rows are presentation/statistics rows only; they are not
+    canonical TIMEBASE rows.  Rows that cannot be aligned, including the first
+    row and rows immediately after a PPS gap, are omitted.
+    """
+    aligned: List[Dict[str, Any]] = []
+    skipped = 0
+
+    for i in range(1, len(collected)):
+        ref = collected[i - 1]
+        cur = collected[i]
+
+        if cur.get("pps_count") != ref.get("pps_count") + 1:
+            skipped += 1
+            continue
+
+        lanes = {
+            lane: dict(cur["lanes"][lane])
+            for lane in CLOCKS
+        }
+        lanes["VCLOCK"] = dict(ref["lanes"]["VCLOCK"])
+
+        row = dict(cur)
+        row["pps_count"] = ref["pps_count"]
+        row["pps_actual"] = ref["pps_actual"]
+        row["pps_delta"] = ref["pps_delta"]
+        row["dwt_ppb"] = ref.get("dwt_ppb")
+        row["lanes"] = lanes
+        row["alignment_publication_pps_count"] = cur["pps_count"]
+        row["alignment_reference_pps_count"] = ref["pps_count"]
+        aligned.append(row)
+
+    return aligned, skipped + (1 if collected else 0)
+
+
 def available_columns(collected: List[Dict[str, Any]],
                       clocks: Tuple[str, ...]) -> Dict[str, List[str]]:
     # The four algorithm rails are the purpose of this report.  Keep them
@@ -902,7 +953,8 @@ def _has_any(collected: List[Dict[str, Any]], lane: str, key: str) -> bool:
 def analyze(campaign: str,
             limit: int = 0,
             clock_filter: Optional[str] = None,
-            slip_view: bool = False) -> None:
+            slip_view: bool = False,
+            align_ocxo: bool = False) -> None:
     if slip_view:
         raise SystemExit("--slip was retired from this compact FloorLine report; use an older raw_cycles if SlipLedger courtroom output is needed")
 
@@ -915,6 +967,9 @@ def analyze(campaign: str,
     clocks = selected_clocks(clock_filter)
 
     collected, gaps = collect_rows(rows)
+    alignment_skipped = 0
+    if align_ocxo:
+        collected, alignment_skipped = align_pps_vclock_to_ocxo_rows(collected)
     if limit:
         collected = collected[:limit]
 
@@ -922,7 +977,8 @@ def analyze(campaign: str,
     include_dwt_ppb = any(row.get("dwt_ppb") is not None for row in collected)
 
     clock_label = "ALL" if clock_filter is None else clock_filter
-    print(f"Campaign: {campaign}  ({len(rows):,} rows, view={clock_label})")
+    view_label = f"{clock_label}, ALIGN_OCXO" if align_ocxo else clock_label
+    print(f"Campaign: {campaign}  ({len(rows):,} rows, view={view_label})")
     print()
     print("Raw / FloorLine / published cycle audit")
     print("══════════════════════════════════════")
@@ -931,6 +987,9 @@ def analyze(campaign: str,
     print("  *_pub = subscriber-facing published interval.")
     print("  *Δ columns are per-rail cycle-count residuals: interval[n] - interval[n-1].")
     print("  Core rail columns are always shown; missing FL data is shown as --- on purpose.")
+    if align_ocxo:
+        print("  Alignment view: PPS and VCLOCK are delayed by one TIMEBASE row.")
+        print("  OCXO lanes remain on their original publication rows.")
     print()
 
     header, sep = _headers_for(clocks, cols, include_dwt_ppb)
@@ -942,6 +1001,8 @@ def analyze(campaign: str,
     print()
     print(f"Rows shown: {len(collected):,}")
     print(f"Gaps:       {gaps:,}")
+    if align_ocxo:
+        print(f"Align skip: {alignment_skipped:,}")
     print()
 
     stats: Dict[str, Welford] = {
@@ -1022,24 +1083,36 @@ def analyze(campaign: str,
     print("  • FloorLine columns are intentionally always visible.  If *_fl stays ---,")
     print("    the TIMEBASE row stream did not expose a FloorLine endpoint that this parser found.")
     print("  • Use --clock VCLOCK, --clock OCXO1, or --clock OCXO2 to keep the row narrow.")
+    if align_ocxo:
+        print("  • --align-ocxo / --delay-pps-vclock is an intentional view transform:")
+        print("    PPS and VCLOCK are shown from the previous TIMEBASE row so late OCXO")
+        print("    intervals appear beside the reference second they correspond to.")
+        print("    Do not read the aligned view as original TIMEBASE publication order.")
     print()
 
 
-def parse_args(argv: List[str]) -> Tuple[str, int, Optional[str], bool]:
+def parse_args(argv: List[str]) -> Tuple[str, int, Optional[str], bool, bool]:
     if len(argv) < 2:
         print("Usage: raw_cycles <campaign_name> [limit] [clock]")
         print("       raw_cycles <campaign_name> --clock OCXO2 [limit]")
         print("       raw_cycles <campaign_name> --limit 300 --clock VCLOCK")
+        print("       raw_cycles <campaign_name> --align-ocxo")
+        print("       raw_cycles <campaign_name> --delay-pps-vclock")
         raise SystemExit(1)
 
     campaign = argv[1]
     limit = 0
     clock: Optional[str] = None
     slip_view = False
+    align_ocxo = False
 
     i = 2
     while i < len(argv):
         arg = argv[i]
+        if arg in ("--align-ocxo", "--align-ocxos", "--delay-pps-vclock"):
+            align_ocxo = True
+            i += 1
+            continue
         if arg == "--slip":
             slip_view = True
             i += 1
@@ -1080,12 +1153,12 @@ def parse_args(argv: List[str]) -> Tuple[str, int, Optional[str], bool]:
             raise SystemExit(f"unknown argument '{arg}'") from exc
         i += 1
 
-    return campaign, limit, normalize_clock_filter(clock) if clock else None, slip_view
+    return campaign, limit, normalize_clock_filter(clock) if clock else None, slip_view, align_ocxo
 
 
 def main() -> None:
-    campaign, limit, clock, slip_view = parse_args(sys.argv)
-    analyze(campaign, limit, clock, slip_view)
+    campaign, limit, clock, slip_view, align_ocxo = parse_args(sys.argv)
+    analyze(campaign, limit, clock, slip_view, align_ocxo)
 
 
 if __name__ == "__main__":
