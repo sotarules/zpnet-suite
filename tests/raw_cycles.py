@@ -1,5 +1,5 @@
 """
-ZPNet Raw Cycles — raw / FloorLine / published cycle audit.
+ZPNet Raw Cycles — raw / FloorLine / SlopeFinder / published cycle audit.
 
 Reads TIMEBASE rows for a campaign and prints a compact one-second DWT-cycle
 audit.  PPS is always shown as the base rail.  By default the report shows
@@ -29,6 +29,11 @@ Column doctrine:
               a fallback/audit surface only.
     *_flΔ     FloorLine endpoint interval first-difference residual:
               fl_interval[n] - fl_interval[n-1].
+    *_sf      SlopeFinder projected interval from consecutive SlopeFinder DWT
+              endpoints when available.  The model/slope interval remains
+              a fallback/audit surface only.
+    *_sfΔ     SlopeFinder endpoint interval first-difference residual:
+              sf_interval[n] - sf_interval[n-1].
     *_pub     the subscriber-facing published interval.
     *_pubΔ    published interval first-difference residual:
               pub_interval[n] - pub_interval[n-1].
@@ -589,6 +594,67 @@ def regression_diag(root: Dict[str, Any],
     }
 
 
+def slopefinder_diag(root: Dict[str, Any],
+                     frag: Dict[str, Any],
+                     forensic: Dict[str, Any],
+                     lane: str) -> Dict[str, Any]:
+    """Extract SlopeFinder projection diagnostics from MICRO_RAW_CYCLES_V3.
+
+    SlopeFinder is a candidate rail, not publication authority.  The compact
+    schema currently emits flat fields directly under payload.forensics:
+
+        <prefix>_sf       projected DWT-at-edge candidate
+        <prefix>_sf_cyc   projected one-second interval from the model slope
+        <prefix>_sf_err   projected edge minus observed/published-edge witness
+        <prefix>_sf_res   residual with the estimator's sign convention
+        <prefix>_sf_ds    slope delta / diagnostic scalar
+        <prefix>_sf_*     rolling residual statistics and sample counts
+
+    Keep this parser intentionally tolerant so raw_cycles can read future
+    focused reports that nest the same facts under a slopefinder object.
+    """
+    f = lane_alpha_event(root, frag, forensic, lane)
+    sf_obj = (
+        f.get("slopefinder")
+        if isinstance(f.get("slopefinder"), dict)
+        else {}
+    )
+
+    endpoint_raw = _micro_first_int(root, frag, forensic, lane, "sf")
+    interval_raw = _micro_first_int(root, frag, forensic, lane, "sf_cyc")
+
+    # In the compact micro schema, zero means "candidate absent" for endpoint
+    # and interval.  Treat it as missing so the first OCXO row does not seed a
+    # fake DWT=0 endpoint and create a giant wrap interval on row two.
+    endpoint = endpoint_raw if endpoint_raw not in (None, 0) else None
+    interval = interval_raw if interval_raw not in (None, 0) else None
+
+    edge_error = _micro_first_int(root, frag, forensic, lane, "sf_err")
+    residual = _micro_first_int(root, frag, forensic, lane, "sf_res")
+    slope_delta = _micro_first_int(root, frag, forensic, lane, "sf_ds")
+    slope_q16 = _micro_first_int(root, frag, forensic, lane, "sf_slope")
+    window_n = _micro_first_int(root, frag, forensic, lane, "sf_n")
+    total_n = _micro_first_int(root, frag, forensic, lane, "sf_tot")
+
+    return {
+        "valid": _first_bool(
+            sf_obj.get("valid"),
+            True if endpoint is not None or interval is not None else None,
+        ),
+        "endpoint_dwt": _first_int(endpoint, sf_obj.get("dwt_at_event")),
+        "interval_cycles": _first_int(interval, sf_obj.get("interval_cycles")),
+        "edge_minus_observed": _first_int(edge_error, sf_obj.get("edge_minus_observed_cycles")),
+        "residual_cycles": _first_int(residual, sf_obj.get("residual_cycles")),
+        "slope_delta": _first_int(slope_delta, sf_obj.get("slope_delta")),
+        "slope_q16": _first_int(slope_q16, sf_obj.get("slope_q16_cycles_per_sample")),
+        "window_n": _first_int(window_n, sf_obj.get("window_sample_count")),
+        "total_n": _first_int(total_n, sf_obj.get("total_sample_count")),
+        "mean_q16": _micro_first_int(root, frag, forensic, lane, "sf_mean"),
+        "stddev_q16": _micro_first_int(root, frag, forensic, lane, "sf_sd"),
+        "stderr_q16": _micro_first_int(root, frag, forensic, lane, "sf_se"),
+    }
+
+
 def lane_counter_delta(root: Dict[str, Any],
                        frag: Dict[str, Any],
                        forensic: Dict[str, Any],
@@ -634,11 +700,11 @@ def collect_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]
     prev_pps_dwt: Optional[int] = None
     prev_pps_interval: Optional[int] = None
     prev_lane_dwt: Dict[str, Dict[str, Optional[int]]] = {
-        lane: {"raw": None, "fl": None, "pub": None}
+        lane: {"raw": None, "fl": None, "sf": None, "pub": None}
         for lane in CLOCKS
     }
     prev_lane_interval: Dict[str, Dict[str, Optional[int]]] = {
-        lane: {"raw": None, "fl": None, "pub": None}
+        lane: {"raw": None, "fl": None, "sf": None, "pub": None}
         for lane in CLOCKS
     }
 
@@ -647,11 +713,11 @@ def collect_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]
         prev_pps_dwt = None
         prev_pps_interval = None
         prev_lane_dwt = {
-            lane: {"raw": None, "fl": None, "pub": None}
+            lane: {"raw": None, "fl": None, "sf": None, "pub": None}
             for lane in CLOCKS
         }
         prev_lane_interval = {
-            lane: {"raw": None, "fl": None, "pub": None}
+            lane: {"raw": None, "fl": None, "sf": None, "pub": None}
             for lane in CLOCKS
         }
 
@@ -690,12 +756,14 @@ def collect_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]
             auth = dwt_authority_diag(root, frag, forensic, lane_key)
             gate = dwt_gate_diag(root, frag, forensic, lane_key)
             fl = regression_diag(root, frag, forensic, lane_key)
+            sf = slopefinder_diag(root, frag, forensic, lane_key)
 
             original_dwt = auth["original_dwt"]
             used_dwt = auth["used_dwt"]
             predicted_dwt = auth["predicted_dwt"]
             fl_observed_dwt = fl["observed_dwt"]
             fl_inferred_dwt = fl["inferred_dwt"]
+            sf_dwt = sf["endpoint_dwt"]
 
             raw_interval = gate.get("observed_cycles")
             if raw_interval is None:
@@ -732,6 +800,22 @@ def collect_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]
             if fl_interval is None:
                 fl_interval = fl_reported_interval
 
+            # SlopeFinder projection has the same two-surface shape:
+            #
+            #   1. endpoint interval: sf_dwt[n] - sf_dwt[n-1]
+            #   2. model/slope interval: the current SlopeFinder slope-derived
+            #      one-second interval estimate, emitted as *_sf_cyc
+            #
+            # Prefer endpoint intervals for direct comparison with publication
+            # endpoints; retain the model interval as fallback and audit.
+            sf_reported_interval = sf.get("interval_cycles")
+            sf_endpoint_interval = _interval_from_endpoints(
+                sf_dwt, prev_lane_dwt[lane]["sf"]
+            )
+            sf_interval = sf_endpoint_interval
+            if sf_interval is None:
+                sf_interval = sf_reported_interval
+
             pub_interval = _interval_from_endpoints(used_dwt, prev_lane_dwt[lane]["pub"])
             if pub_interval is None and used_dwt is not None:
                 # The micro schema gives endpoint candidates plus per-algorithm
@@ -743,6 +827,12 @@ def collect_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]
                     fl_interval is not None
                 ):
                     pub_interval = fl_interval
+                elif (
+                    sf_dwt is not None and
+                    used_dwt == sf_dwt and
+                    sf_interval is not None
+                ):
+                    pub_interval = sf_interval
                 elif (
                     predicted_dwt is not None and
                     used_dwt == predicted_dwt and
@@ -766,11 +856,31 @@ def collect_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]
                 "raw_delta": _interval_delta(raw_interval, prev_lane_interval[lane]["raw"]),
                 "fl": fl_interval,
                 "fl_delta": _interval_delta(fl_interval, prev_lane_interval[lane]["fl"]),
+                "sf": sf_interval,
+                "sf_delta": _interval_delta(sf_interval, prev_lane_interval[lane]["sf"]),
                 "pub": pub_interval,
                 "pub_delta": _interval_delta(pub_interval, prev_lane_interval[lane]["pub"]),
                 "counter_delta": lane_counter_delta(root, frag, forensic, lane_key),
                 "fl_edge_minus_observed": fl.get("inferred_minus_observed"),
                 "pub_minus_fl": _interval_delta(pub_interval, fl_interval),
+                "pub_minus_sf": _interval_delta(pub_interval, sf_interval),
+                "pub_edge_minus_sf_edge": (
+                    _signed_delta_u32(used_dwt, sf_dwt)
+                    if used_dwt is not None and sf_dwt is not None
+                    else None
+                ),
+                "sf_edge_minus_fl_edge": (
+                    _signed_delta_u32(sf_dwt, fl_inferred_dwt)
+                    if sf_dwt is not None and fl_inferred_dwt is not None
+                    else None
+                ),
+                "sf_edge_minus_observed": sf.get("edge_minus_observed"),
+                "sf_residual": sf.get("residual_cycles"),
+                "sf_window_n": sf.get("window_n"),
+                "sf_total_n": sf.get("total_n"),
+                "sf_fit_minus_endpoint_interval": _interval_delta(
+                    sf_reported_interval, sf_endpoint_interval
+                ),
                 "pub_edge_minus_fl_edge": (
                     _signed_delta_u32(used_dwt, fl_inferred_dwt)
                     if used_dwt is not None and fl_inferred_dwt is not None
@@ -785,10 +895,11 @@ def collect_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]
                 "pub_used_dwt": used_dwt,
                 "raw_dwt": _first_int(original_dwt, fl_observed_dwt),
                 "fl_dwt": fl_inferred_dwt,
+                "sf_dwt": sf_dwt,
             }
             row["lanes"][lane] = data
 
-            for algo in ("raw", "fl", "pub"):
+            for algo in ("raw", "fl", "sf", "pub"):
                 if data[algo] is not None:
                     prev_lane_interval[lane][algo] = data[algo]
 
@@ -800,6 +911,8 @@ def collect_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]
 
             if fl_inferred_dwt is not None:
                 prev_lane_dwt[lane]["fl"] = fl_inferred_dwt
+            if sf_dwt is not None:
+                prev_lane_dwt[lane]["sf"] = sf_dwt
             if used_dwt is not None:
                 prev_lane_dwt[lane]["pub"] = used_dwt
 
@@ -866,6 +979,7 @@ def available_columns(collected: List[Dict[str, Any]],
     always = [
         "raw", "raw_delta",
         "fl", "fl_delta",
+        "sf", "sf_delta",
         "pub", "pub_delta",
     ]
     optional = ["counter_delta"]
@@ -887,6 +1001,8 @@ def _col_label(lane: str, col: str) -> str:
         "raw_delta": f"{p}_rawΔ",
         "fl": f"{p}_fl",
         "fl_delta": f"{p}_flΔ",
+        "sf": f"{p}_sf",
+        "sf_delta": f"{p}_sfΔ",
         "pub": f"{p}_pub",
         "pub_delta": f"{p}_pubΔ",
         "counter_delta": f"{p}_cΔ",
@@ -899,6 +1015,8 @@ def _col_width(col: str) -> int:
         "raw_delta": 8,
         "fl": 13,
         "fl_delta": 8,
+        "sf": 13,
+        "sf_delta": 8,
         "pub": 13,
         "pub_delta": 8,
         "counter_delta": 11,
@@ -906,7 +1024,7 @@ def _col_width(col: str) -> int:
 
 
 def _col_signed(col: str) -> bool:
-    return col in ("raw_delta", "fl_delta", "pub_delta")
+    return col in ("raw_delta", "fl_delta", "sf_delta", "pub_delta")
 
 
 def _headers_for(clocks: Tuple[str, ...],
@@ -980,13 +1098,13 @@ def analyze(campaign: str,
     view_label = f"{clock_label}, ALIGN_OCXO" if align_ocxo else clock_label
     print(f"Campaign: {campaign}  ({len(rows):,} rows, view={view_label})")
     print()
-    print("Raw / FloorLine / published cycle audit")
+    print("Raw / FloorLine / SlopeFinder / published cycle audit")
     print("══════════════════════════════════════")
     print("  PPS is always the base rail.")
     print("  *_raw = evidence interval, *_fl = FloorLine interval,")
     print("  *_pub = subscriber-facing published interval.")
     print("  *Δ columns are per-rail cycle-count residuals: interval[n] - interval[n-1].")
-    print("  Core rail columns are always shown; missing FL data is shown as --- on purpose.")
+    print("  Core rail columns are always shown; missing FL/SF data is shown as --- on purpose.")
     if align_ocxo:
         print("  Alignment view: PPS and VCLOCK are delayed by one TIMEBASE row.")
         print("  OCXO lanes remain on their original publication rows.")
@@ -1011,14 +1129,18 @@ def analyze(campaign: str,
     }
     for lane in clocks:
         for key in ("raw", "raw_delta",
-                    "fl", "fl_delta", "pub", "pub_delta",
+                    "fl", "fl_delta", "sf", "sf_delta", "pub", "pub_delta",
                     "counter_delta", "fl_edge_minus_observed",
-                    "pub_minus_fl", "pub_edge_minus_fl_edge",
-                    "fl_fit_minus_endpoint_interval"):
+                    "sf_edge_minus_observed", "sf_residual",
+                    "pub_minus_fl", "pub_minus_sf",
+                    "pub_edge_minus_fl_edge", "pub_edge_minus_sf_edge",
+                    "sf_edge_minus_fl_edge",
+                    "fl_fit_minus_endpoint_interval",
+                    "sf_fit_minus_endpoint_interval"):
             stats[f"{lane}.{key}"] = Welford()
 
     coverage: Dict[str, Dict[str, int]] = {
-        lane: {key: 0 for key in ("raw", "fl", "pub", "counter_delta")}
+        lane: {key: 0 for key in ("raw", "fl", "sf", "pub", "counter_delta")}
         for lane in clocks
     }
 
@@ -1044,7 +1166,8 @@ def analyze(campaign: str,
         c = coverage[lane]
         print(
             f"  {lane:<6s} raw={c['raw']:,}  "
-            f"fl={c['fl']:,}  pub={c['pub']:,}  cΔ={c['counter_delta']:,}"
+            f"fl={c['fl']:,}  sf={c['sf']:,}  "
+            f"pub={c['pub']:,}  cΔ={c['counter_delta']:,}"
         )
     print()
 
@@ -1059,29 +1182,41 @@ def analyze(campaign: str,
         _print_welford(f"{lane} raw cycle-count residual", stats[f"{lane}.raw_delta"])
         _print_welford(f"{lane} FloorLine interval", stats[f"{lane}.fl"])
         _print_welford(f"{lane} FloorLine cycle-count residual", stats[f"{lane}.fl_delta"])
+        _print_welford(f"{lane} SlopeFinder interval", stats[f"{lane}.sf"])
+        _print_welford(f"{lane} SlopeFinder cycle-count residual", stats[f"{lane}.sf_delta"])
         _print_welford(f"{lane} published interval", stats[f"{lane}.pub"])
         _print_welford(f"{lane} published cycle-count residual", stats[f"{lane}.pub_delta"])
         _print_welford(f"{lane} published interval - FloorLine interval", stats[f"{lane}.pub_minus_fl"])
+        _print_welford(f"{lane} published interval - SlopeFinder interval", stats[f"{lane}.pub_minus_sf"])
         _print_welford(f"{lane} published edge - FloorLine edge", stats[f"{lane}.pub_edge_minus_fl_edge"])
+        _print_welford(f"{lane} published edge - SlopeFinder edge", stats[f"{lane}.pub_edge_minus_sf_edge"])
+        _print_welford(f"{lane} SlopeFinder edge - FloorLine edge", stats[f"{lane}.sf_edge_minus_fl_edge"])
         _print_welford(f"{lane} reported FL fit interval - endpoint FL interval", stats[f"{lane}.fl_fit_minus_endpoint_interval"])
+        _print_welford(f"{lane} reported SF model interval - endpoint SF interval", stats[f"{lane}.sf_fit_minus_endpoint_interval"])
         _print_welford(f"{lane} FL edge - observed edge", stats[f"{lane}.fl_edge_minus_observed"])
+        _print_welford(f"{lane} SF edge - observed edge", stats[f"{lane}.sf_edge_minus_observed"])
+        _print_welford(f"{lane} SF residual", stats[f"{lane}.sf_residual"])
         _print_welford(f"{lane} counter32 delta", stats[f"{lane}.counter_delta"], unit="ticks")
 
     print()
     print("Notes")
     print("═════")
     print("  • The old EMA/effective columns were removed from the normal view;")
-    print("    this report is now focused on the publication decision: raw vs FloorLine vs pub.")
+    print("    this report is now focused on the publication decision: raw vs FloorLine vs SlopeFinder vs pub.")
     print("  • *_pub is the ground-truth subscriber-facing interval.")
-    print("  • *_fl is now endpoint-derived first: fl_dwt[n] - fl_dwt[n-1].")
+    print("  • *_fl is endpoint-derived first: fl_dwt[n] - fl_dwt[n-1].")
     print("    The fitted/slope FloorLine interval is used only as a fallback and")
     print("    audited as 'reported FL fit interval - endpoint FL interval'.")
+    print("  • *_sf follows the same rule for SlopeFinder: sf_dwt[n] - sf_dwt[n-1].")
+    print("    The model/slope interval from *_sf_cyc is fallback/audit only and")
+    print("    is summarized as 'reported SF model interval - endpoint SF interval'.")
     print("  • In FloorLine-authored firmware, 'published edge - FloorLine edge'")
     print("    and 'published interval - FloorLine interval' should be zero.")
+    print("    SlopeFinder is diagnostic-only for now, so nonzero pub-SF differences are expected.")
     print("  • *Δ columns are cycle-count residuals computed separately per rail:")
     print("    interval[n] - interval[n-1].")
-    print("  • FloorLine columns are intentionally always visible.  If *_fl stays ---,")
-    print("    the TIMEBASE row stream did not expose a FloorLine endpoint that this parser found.")
+    print("  • FloorLine and SlopeFinder columns are intentionally always visible.  If *_fl or *_sf stays ---,")
+    print("    the TIMEBASE row stream did not expose an endpoint that this parser found.")
     print("  • Use --clock VCLOCK, --clock OCXO1, or --clock OCXO2 to keep the row narrow.")
     if align_ocxo:
         print("  • --align-ocxo / --delay-pps-vclock is an intentional view transform:")

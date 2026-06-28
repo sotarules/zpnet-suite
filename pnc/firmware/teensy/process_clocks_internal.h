@@ -517,6 +517,28 @@ struct clocks_alpha_lane_forensics_t {
   uint32_t regression_fit_error_gt_plus4_count;
   uint32_t regression_fit_error_lt_minus4_count;
   uint32_t regression_fit_error_abs_gt4_count;
+
+  bool     slopefinder_valid;
+  uint32_t slopefinder_sequence;
+  uint32_t slopefinder_window_seconds;
+  uint32_t slopefinder_window_sample_count;
+  uint32_t slopefinder_total_sample_count;
+  uint32_t slopefinder_observed_dwt_at_event;
+  uint32_t slopefinder_projected_dwt_at_event;
+  int32_t  slopefinder_projected_minus_observed_cycles;
+  uint32_t slopefinder_target_counter32_at_event;
+  uint16_t slopefinder_target_hardware16_at_event;
+  uint16_t slopefinder_observed_hardware16_at_event;
+  uint64_t slopefinder_slope_q16_cycles_per_sample;
+  int64_t  slopefinder_slope_delta_q16_cycles_per_sample;
+  uint32_t slopefinder_interval_cycles;
+  int32_t  slopefinder_residual_cycles;
+  uint32_t slopefinder_welford_n;
+  int32_t  slopefinder_welford_mean_q16_cycles;
+  uint32_t slopefinder_welford_stddev_q16_cycles;
+  uint32_t slopefinder_welford_stderr_q16_cycles;
+  int32_t  slopefinder_welford_min_cycles;
+  int32_t  slopefinder_welford_max_cycles;
 };
 
 bool clocks_alpha_lane_forensics(time_clock_id_t clock,

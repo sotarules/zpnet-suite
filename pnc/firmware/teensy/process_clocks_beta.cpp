@@ -163,6 +163,7 @@ static constexpr bool TIMEBASE_FORENSICS_MINIMAL_PAYLOAD_ENABLED = true;
 //   published endpoint equals the FloorLine endpoint, without turning the full
 //   deep forensic payload back on.
 static constexpr bool TIMEBASE_FORENSICS_MICRO_RAW_CYCLES_ENABLED = true;
+static constexpr bool TIMEBASE_FORENSICS_MICRO_SLOPEFINDER_ENABLED = true;
 static constexpr bool TIMEBASE_FORENSICS_MINIMAL_HEALTH_FIELDS_ENABLED = false;
 
 // The richer slim/full forensics builders remain compiled for focused future
@@ -481,6 +482,7 @@ static void payload_add_campaign_feature_gate(Payload& p) {
   p.add("campaign_gate_required_count",
         (uint32_t)g_campaign_feature_gate_required_count);
   p.add("campaign_gate_requires_floorline", false);
+  p.add("campaign_gate_requires_slopefinder", false);
   p.add("campaign_gate_requires_qtimer_dwt_ruler", false);
   p.add("campaign_gate_requires_science_residuals", false);
   p.add("campaign_gate_requires_timebase_publication", false);
@@ -2044,6 +2046,30 @@ static bool floorline_candidate_present(
          f.regression_sample_count != 0U;
 }
 
+static bool slopefinder_candidate_present(
+    bool lane_valid,
+    const clocks_alpha_lane_forensics_t& f) {
+  return lane_valid &&
+         f.slopefinder_valid &&
+         f.slopefinder_projected_dwt_at_event != 0U &&
+         f.slopefinder_window_sample_count != 0U;
+}
+
+static uint32_t slopefinder_interval_cycles(
+    bool present,
+    const clocks_alpha_lane_forensics_t& f) {
+  if (!present) return 0U;
+  if (f.slopefinder_interval_cycles != 0U) {
+    return f.slopefinder_interval_cycles;
+  }
+  if (f.slopefinder_slope_q16_cycles_per_sample == 0ULL) {
+    return 0U;
+  }
+  const uint64_t cycles =
+      (f.slopefinder_slope_q16_cycles_per_sample * 1000ULL + 32768ULL) >> 16;
+  return (cycles > (uint64_t)UINT32_MAX) ? UINT32_MAX : (uint32_t)cycles;
+}
+
 static void payload_add_pps_vclock_edge_forensics(
     Payload& parent,
     bool available,
@@ -2247,6 +2273,48 @@ static FLASHMEM void payload_add_lane_forensics_object(Payload& parent,
                 lower_valid ? f.regression_fit_error_abs_gt4_count : 0U);
   lower_env.add("reporting_only", false);
   forensics.add_object("lower_envelope", lower_env);
+
+  // Rolling residual-regression candidate rail.  This is intentionally
+  // separate from FloorLine: FloorLine remains the lower-envelope candidate,
+  // while SlopeFinder reports the model-projected edge and symmetric residual
+  // statistics used to nudge the slope state.
+  Payload slopefinder;
+  const bool sf_valid = slopefinder_candidate_present(valid, f);
+  slopefinder.add("valid", sf_valid);
+  slopefinder.add("published", false);
+  slopefinder.add("candidate", sf_valid);
+  slopefinder.add("window_seconds", sf_valid ? f.slopefinder_window_seconds : 0U);
+  slopefinder.add("window_sample_count", sf_valid ? f.slopefinder_window_sample_count : 0U);
+  slopefinder.add("total_sample_count", sf_valid ? f.slopefinder_total_sample_count : 0U);
+  slopefinder.add("sequence", sf_valid ? f.slopefinder_sequence : 0U);
+  slopefinder.add("observed_edge_dwt", sf_valid ? f.slopefinder_observed_dwt_at_event : 0U);
+  slopefinder.add("projected_edge_dwt", sf_valid ? f.slopefinder_projected_dwt_at_event : 0U);
+  slopefinder.add("projected_minus_observed_edge_cycles",
+                  sf_valid ? f.slopefinder_projected_minus_observed_cycles : 0);
+  slopefinder.add("interval_cycles", sf_valid ? slopefinder_interval_cycles(sf_valid, f) : 0U);
+  slopefinder.add("residual_cycles", sf_valid ? f.slopefinder_residual_cycles : 0);
+  slopefinder.add("slope_q16_cycles_per_sample",
+                  sf_valid ? f.slopefinder_slope_q16_cycles_per_sample : 0ULL);
+  slopefinder.add("slope_delta_q16_cycles_per_sample",
+                  sf_valid ? f.slopefinder_slope_delta_q16_cycles_per_sample : 0LL);
+  slopefinder.add("target_counter32_at_edge",
+                  sf_valid ? f.slopefinder_target_counter32_at_event : 0U);
+  slopefinder.add("target_hardware16_at_edge",
+                  sf_valid ? (uint32_t)f.slopefinder_target_hardware16_at_event : 0U);
+  slopefinder.add("observed_hardware16_at_edge",
+                  sf_valid ? (uint32_t)f.slopefinder_observed_hardware16_at_event : 0U);
+  slopefinder.add("welford_n", sf_valid ? f.slopefinder_welford_n : 0U);
+  slopefinder.add("welford_mean_q16_cycles",
+                  sf_valid ? f.slopefinder_welford_mean_q16_cycles : 0);
+  slopefinder.add("welford_stddev_q16_cycles",
+                  sf_valid ? f.slopefinder_welford_stddev_q16_cycles : 0U);
+  slopefinder.add("welford_stderr_q16_cycles",
+                  sf_valid ? f.slopefinder_welford_stderr_q16_cycles : 0U);
+  slopefinder.add("welford_min_cycles",
+                  sf_valid ? f.slopefinder_welford_min_cycles : 0);
+  slopefinder.add("welford_max_cycles",
+                  sf_valid ? f.slopefinder_welford_max_cycles : 0);
+  forensics.add_object("slopefinder", slopefinder);
 
 
   // Keep the paired TIMEBASE_FORENSICS row lean enough to arrive before the
@@ -4988,7 +5056,9 @@ void clocks_beta_pps(void) {
         // No authority is changed here.  This is a compact telemetry tap only.
         g_timebase_forensics_micro_raw_count++;
         f.add("micro_raw_cycles", true);
-        f.add("micro_schema", "MICRO_RAW_CYCLES_V1");
+        f.add("micro_schema", TIMEBASE_FORENSICS_MICRO_SLOPEFINDER_ENABLED
+              ? "MICRO_RAW_CYCLES_V3"
+              : "MICRO_RAW_CYCLES_V1");
 
         f.add("pps_obs", g_pps_dwt_cycles_between_edges_valid
                          ? g_pps_dwt_cycles_between_edges
@@ -5025,6 +5095,21 @@ void clocks_beta_pps(void) {
         f.add("v_fl_bkt", v_ok ? vclock_forensics.dwt_interval_resync_count : 0U);
         f.add("v_fl_ierr", v_ok ? vclock_forensics.dwt_interval_residual_cycles : 0);
 
+        if (TIMEBASE_FORENSICS_MICRO_SLOPEFINDER_ENABLED) {
+          const bool v_sf = slopefinder_candidate_present(v_ok, vclock_forensics);
+          f.add("v_sf", v_sf ? vclock_forensics.slopefinder_projected_dwt_at_event : 0U);
+          f.add("v_sf_cyc", v_sf ? slopefinder_interval_cycles(v_sf, vclock_forensics) : 0U);
+          f.add("v_sf_err", v_sf ? vclock_forensics.slopefinder_projected_minus_observed_cycles : 0);
+          f.add("v_sf_res", v_sf ? vclock_forensics.slopefinder_residual_cycles : 0);
+          f.add("v_sf_n", v_sf ? vclock_forensics.slopefinder_welford_n : 0U);
+          f.add("v_sf_tot", v_sf ? vclock_forensics.slopefinder_total_sample_count : 0U);
+          f.add("v_sf_mean", v_sf ? vclock_forensics.slopefinder_welford_mean_q16_cycles : 0);
+          f.add("v_sf_sd", v_sf ? vclock_forensics.slopefinder_welford_stddev_q16_cycles : 0U);
+          f.add("v_sf_se", v_sf ? vclock_forensics.slopefinder_welford_stderr_q16_cycles : 0U);
+          f.add("v_sf_slope", v_sf ? vclock_forensics.slopefinder_slope_q16_cycles_per_sample : 0ULL);
+          f.add("v_sf_ds", v_sf ? vclock_forensics.slopefinder_slope_delta_q16_cycles_per_sample : 0LL);
+        }
+
         const bool o1_ok = ocxo1_forensics_valid;
         const bool o1_fl = floorline_candidate_present(o1_ok, ocxo1_forensics);
         const uint32_t o1_fl_cyc = o1_fl
@@ -5055,6 +5140,20 @@ void clocks_beta_pps(void) {
         f.add("o1_fl_rej", o1_ok ? ocxo1_forensics.dwt_interval_reject_count : 0U);
         f.add("o1_fl_bkt", o1_ok ? ocxo1_forensics.dwt_interval_resync_count : 0U);
         f.add("o1_fl_ierr", o1_ok ? ocxo1_forensics.dwt_interval_residual_cycles : 0);
+        if (TIMEBASE_FORENSICS_MICRO_SLOPEFINDER_ENABLED) {
+          const bool o1_sf = slopefinder_candidate_present(o1_ok, ocxo1_forensics);
+          f.add("o1_sf", o1_sf ? ocxo1_forensics.slopefinder_projected_dwt_at_event : 0U);
+          f.add("o1_sf_cyc", o1_sf ? slopefinder_interval_cycles(o1_sf, ocxo1_forensics) : 0U);
+          f.add("o1_sf_err", o1_sf ? ocxo1_forensics.slopefinder_projected_minus_observed_cycles : 0);
+          f.add("o1_sf_res", o1_sf ? ocxo1_forensics.slopefinder_residual_cycles : 0);
+          f.add("o1_sf_n", o1_sf ? ocxo1_forensics.slopefinder_welford_n : 0U);
+          f.add("o1_sf_tot", o1_sf ? ocxo1_forensics.slopefinder_total_sample_count : 0U);
+          f.add("o1_sf_mean", o1_sf ? ocxo1_forensics.slopefinder_welford_mean_q16_cycles : 0);
+          f.add("o1_sf_sd", o1_sf ? ocxo1_forensics.slopefinder_welford_stddev_q16_cycles : 0U);
+          f.add("o1_sf_se", o1_sf ? ocxo1_forensics.slopefinder_welford_stderr_q16_cycles : 0U);
+          f.add("o1_sf_slope", o1_sf ? ocxo1_forensics.slopefinder_slope_q16_cycles_per_sample : 0ULL);
+          f.add("o1_sf_ds", o1_sf ? ocxo1_forensics.slopefinder_slope_delta_q16_cycles_per_sample : 0LL);
+        }
         f.add("o1_pps_res", pps_residuals.ocxo1_valid
                             ? pps_residuals.ocxo1_fast_residual_ns
                             : 0LL);
@@ -5089,6 +5188,20 @@ void clocks_beta_pps(void) {
         f.add("o2_fl_rej", o2_ok ? ocxo2_forensics.dwt_interval_reject_count : 0U);
         f.add("o2_fl_bkt", o2_ok ? ocxo2_forensics.dwt_interval_resync_count : 0U);
         f.add("o2_fl_ierr", o2_ok ? ocxo2_forensics.dwt_interval_residual_cycles : 0);
+        if (TIMEBASE_FORENSICS_MICRO_SLOPEFINDER_ENABLED) {
+          const bool o2_sf = slopefinder_candidate_present(o2_ok, ocxo2_forensics);
+          f.add("o2_sf", o2_sf ? ocxo2_forensics.slopefinder_projected_dwt_at_event : 0U);
+          f.add("o2_sf_cyc", o2_sf ? slopefinder_interval_cycles(o2_sf, ocxo2_forensics) : 0U);
+          f.add("o2_sf_err", o2_sf ? ocxo2_forensics.slopefinder_projected_minus_observed_cycles : 0);
+          f.add("o2_sf_res", o2_sf ? ocxo2_forensics.slopefinder_residual_cycles : 0);
+          f.add("o2_sf_n", o2_sf ? ocxo2_forensics.slopefinder_welford_n : 0U);
+          f.add("o2_sf_tot", o2_sf ? ocxo2_forensics.slopefinder_total_sample_count : 0U);
+          f.add("o2_sf_mean", o2_sf ? ocxo2_forensics.slopefinder_welford_mean_q16_cycles : 0);
+          f.add("o2_sf_sd", o2_sf ? ocxo2_forensics.slopefinder_welford_stddev_q16_cycles : 0U);
+          f.add("o2_sf_se", o2_sf ? ocxo2_forensics.slopefinder_welford_stderr_q16_cycles : 0U);
+          f.add("o2_sf_slope", o2_sf ? ocxo2_forensics.slopefinder_slope_q16_cycles_per_sample : 0ULL);
+          f.add("o2_sf_ds", o2_sf ? ocxo2_forensics.slopefinder_slope_delta_q16_cycles_per_sample : 0LL);
+        }
         f.add("o2_pps_res", pps_residuals.ocxo2_valid
                             ? pps_residuals.ocxo2_fast_residual_ns
                             : 0LL);
