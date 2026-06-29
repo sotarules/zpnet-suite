@@ -53,7 +53,7 @@ Core contract (v2026-03+):
 
   Recovery is symmetric across all four domains:
 
-    projected_gnss_ns = next_pps_vclock_count * NS_PER_SECOND
+    projected_gnss_ns = recover_base_pps_vclock_count * NS_PER_SECOND
     projected_ns = projected_gnss_ns * last_clock_ns // last_gnss_ns
 
   v11 start behavior:
@@ -72,8 +72,9 @@ Core contract (v2026-03+):
        eliminates stale-fragment poisoning of Welford accumulators.
     3. Pi-side PPS/VCLOCK count expectation matching was removed.
        Every valid TIMEBASE_FRAGMENT is accepted as Teensy-authored truth.
-    4. Welford reset moved to AFTER sync fragment arrives — zero chance
-       of stale data.
+    4. Pi-owned GNSS_RAW/Welford recovery state is restored before the
+       first recovered public pair is persisted, so recovery no longer drops
+       the sync row.
 
   Flash-cut campaign switching:
 
@@ -153,15 +154,15 @@ GNSS_WAIT_LOG_INTERVAL = 60
 
 # Sync waits
 #
-# Teensy CLOCKS now suppresses the first warmup fragments after START/RECOVER
-# so the first public TIMEBASE_FRAGMENT is already scientifically useful.
-# Pi-side sync must therefore be patient: intentional Teensy silence during
-# warmup is not a fault.
-TEENSY_CAMPAIGN_WARMUP_FRAGMENTS = 5
+# START/RECOVER are gated by readiness preflight. The Pi no longer expects
+# fixed row burial/warmup suppression as part of normal campaign admission:
+# the first public TIMEBASE pair is supposed to be useful, and if it is not,
+# the responsible readiness or handoff gate should be fixed.
+RECOVERY_FIRST_PUBLIC_OFFSET = 1
 SYNC_FRAGMENT_TIMEOUT_S = 35.0
 SYNC_RECOVER_TIMEOUT_S = 45.0
 SYNC_POLL_S = 0.005
-SYNC_LOG_INTERVAL_S = 2.0
+SYNC_LOG_INTERVAL_S = 5.0
 
 # TIMEBASE ingress queue: maxsize=0 means unbounded
 #
@@ -181,9 +182,9 @@ TIMEBASE_SILENCE_MONITOR_POLL_S = 1.0
 TEENSY_HEALTH_RETRY_S = 60.0
 
 # Async START/Flash Cut silence is not the same thing as a live campaign
-# going dark.  Teensy intentionally suppresses public TIMEBASE pairs during
-# START/Flash Cut warmup and handoff; the Pi must remain patient while the
-# first canonical row is being earned.
+# going dark. START/Flash Cut may still take several seconds while Teensy
+# earns the first canonical row; the Pi waits patiently but expects to accept
+# the first public pair once it appears.
 START_FIRST_FRAGMENT_TIMEOUT_S = 90.0
 FLASH_CUT_FIRST_FRAGMENT_TIMEOUT_S = 180.0
 
@@ -510,6 +511,7 @@ _flash_cut_requested_monotonic: Optional[float] = None
 _sync_lock = threading.Lock()
 _sync_expected_pps_vclock: Optional[int] = None
 _sync_event = threading.Event()
+_sync_resume_event = threading.Event()
 _sync_fragment: Optional[Dict[str, Any]] = None
 
 # ---------------------------------------------------------------------
@@ -907,9 +909,8 @@ def _timebase_silence_monitor_loop() -> None:
         if _sync_expected_pps_vclock is not None:
             continue
         if _timebase_last_activity_monotonic is None:
-            # Avoid treating initial async START or cold boot warmup as a
-            # reboot.  This monitor is for loss after the TIMEBASE stream has
-            # once been observed.
+            # Avoid treating initial async START/cold boot wait as a reboot.
+            # This monitor is for loss after the TIMEBASE stream has once been observed.
             continue
 
         age_s = time.monotonic() - _timebase_last_activity_monotonic
@@ -1276,6 +1277,41 @@ def _wait_for_pubsub_route(
         time.sleep(poll_s)
 
 
+def _wait_for_timebase_routes(
+    *,
+    context: str,
+    timeout_s: float = 30.0,
+    poll_s: float = 0.5,
+) -> None:
+    """Confirm both TIMEBASE pair routes before arming START/RECOVER."""
+    required = {TIMEBASE_FRAGMENT_TOPIC, TIMEBASE_FORENSICS_TOPIC}
+    logging.info("⏳ [%s] waiting for TIMEBASE routes...", context)
+    t0 = time.monotonic()
+    last_missing = sorted(required)
+
+    while True:
+        elapsed = time.monotonic() - t0
+        try:
+            resp = send_command(machine="TEENSY", subsystem="PUBSUB", command="REPORT")
+            if resp.get("success"):
+                routes = resp.get("payload", {}).get("routes", [])
+                routed = {str(r.get("topic")) for r in routes if r.get("topic")}
+                last_missing = sorted(required - routed)
+                if not last_missing:
+                    logging.info("✅ [%s] TIMEBASE routes ready (%.1fs)", context, elapsed)
+                    return
+        except RuntimeError:
+            raise
+        except Exception:
+            pass
+
+        if elapsed >= timeout_s:
+            raise RuntimeError(
+                f"{context} failed: missing PUBSUB route(s) {last_missing} after {timeout_s}s"
+            )
+        time.sleep(poll_s)
+
+
 def _wait_for_gnss_time() -> str:
     """Patiently wait for GNSS time to be available. Instrumented."""
     _diag["gnss_waits"] += 1
@@ -1449,13 +1485,14 @@ def _fetch_gnss_info() -> Optional[Dict[str, Any]]:
 
 
 def _begin_sync_wait(expected_pps: int) -> None:
-    """Prepare to wait for a TIMEBASE_FRAGMENT with a specific PPS/VCLOCK count."""
+    """Prepare to wait for the first public TIMEBASE pair at/after a count."""
     global _sync_expected_pps_vclock, _sync_fragment
 
     with _sync_lock:
         _sync_expected_pps_vclock = int(expected_pps)
         _sync_fragment = None
         _sync_event.clear()
+        _sync_resume_event.clear()
 
 
 def _clear_sync_wait() -> None:
@@ -1466,13 +1503,17 @@ def _clear_sync_wait() -> None:
         _sync_expected_pps_vclock = None
         _sync_fragment = None
         _sync_event.clear()
+        _sync_resume_event.set()
 
 
 def _end_sync_wait(timeout_s: float = SYNC_FRAGMENT_TIMEOUT_S) -> Tuple[Dict[str, Any], float]:
-    """Block until the sync fragment arrives or timeout.  Hard fault on timeout."""
+    """Block until the sync fragment arrives or timeout. Hard fault on timeout."""
     global _sync_expected_pps_vclock
 
-    logging.info("⏳ [_end_sync_wait] waiting for complete TIMEBASE pair PPS/VCLOCK count >= %s...", str(_sync_expected_pps_vclock))
+    logging.info(
+        "⏳ [recovery] waiting for first public TIMEBASE pair >= %s",
+        str(_sync_expected_pps_vclock),
+    )
 
     t0 = time.monotonic()
     last_log = t0
@@ -1490,11 +1531,10 @@ def _end_sync_wait(timeout_s: float = SYNC_FRAGMENT_TIMEOUT_S) -> Tuple[Dict[str
 
         if now - last_log >= SYNC_LOG_INTERVAL_S:
             logging.info(
-                "⏳ [_end_sync_wait] still waiting for complete TIMEBASE pair PPS/VCLOCK count >= %s "
-                "(%.3fs elapsed, %.3fs remaining)",
+                "⏳ [recovery] still waiting for first public pair >= %s (%.1fs/%.0fs)",
                 str(_sync_expected_pps_vclock),
                 now - t0,
-                remaining,
+                timeout_s,
             )
             last_log = now
 
@@ -1518,23 +1558,24 @@ def _end_sync_wait(timeout_s: float = SYNC_FRAGMENT_TIMEOUT_S) -> Tuple[Dict[str
         return frag, float(waited)
 
 
-def _signal_sync_pair_if_needed(fragment: Dict[str, Any], pps_vclock_count: int) -> None:
-    """Satisfy START/RECOVER sync only after the complete TIMEBASE pair is present."""
+def _signal_sync_pair_if_needed(fragment: Dict[str, Any], pps_vclock_count: int) -> bool:
+    """Satisfy RECOVER sync only after the complete TIMEBASE pair is present."""
     global _sync_fragment
 
     with _sync_lock:
         if _sync_expected_pps_vclock is None:
-            return
+            return False
 
         match = int(pps_vclock_count) >= int(_sync_expected_pps_vclock)
-        logging.info(
-            "🔎 [timebase_pair] @%s complete pair arrived: teensy_pps_vclock_count=%d "
-            "(waiting for >=%d) match=%s",
-            system_time_z(), int(pps_vclock_count), int(_sync_expected_pps_vclock), str(match),
-        )
         if match:
+            logging.info(
+                "✅ [recovery] first public TIMEBASE pair observed: count=%d expected>=%d",
+                int(pps_vclock_count), int(_sync_expected_pps_vclock),
+            )
             _sync_fragment = dict(fragment)
             _sync_event.set()
+            return True
+        return False
 
 
 # ---------------------------------------------------------------------
@@ -1635,12 +1676,10 @@ def _restore_gnss_raw_from_last_timebase(
 ) -> bool:
     """Restore the Pi-owned GNSS_RAW synthetic clock and Welford accumulator.
 
-    GNSS_RAW is deliberately Pi-only and is not sent to Teensy RECOVER.  The
-    raw synthetic clock must be restored to the same accepted PPS/VCLOCK
-    campaign identity that TIMEBASE resumes on.  Recovery can legally overshoot
-    the pre-armed target by several PPS rows, so callers must pass the
-    post-sync/accepted GNSS identity here, not the pre-sync projection.  The
-    Welford accumulator is restored from the last persisted TIMEBASE
+    GNSS_RAW is deliberately Pi-only and is not sent to Teensy RECOVER.
+    Restore it to the identity immediately BEFORE the first pair the processor
+    will persist; the processor then folds the first public row in exactly once.
+    The Welford accumulator is restored from the last persisted TIMEBASE
     extra_clocks block; missing downtime samples are not invented.
     """
     global _gnss_raw_ns, _gnss_raw_n, _gnss_raw_valid
@@ -2563,7 +2602,17 @@ def _process_loop() -> None:
         except RuntimeError:
             continue
 
-        _signal_sync_pair_if_needed(frag, pps_vclock_count)
+        sync_matched = _signal_sync_pair_if_needed(frag, pps_vclock_count)
+        if sync_matched and not _campaign_active:
+            # RECOVER uses this exact pair as the first public row. Pause here
+            # until the recovery thread has restored Pi-owned GNSS_RAW/state,
+            # then continue so the pair is persisted instead of discarded.
+            if not _sync_resume_event.wait(timeout=SYNC_RECOVER_TIMEOUT_S):
+                logging.error(
+                    "💥 [recovery] timed out reopening processor for first public pair count=%d",
+                    int(pps_vclock_count),
+                )
+                continue
 
         # --- No campaign => ignore only after the exact pair has completed ---
         # This keeps recovery/cold-start sync traffic from leaving one half of a
@@ -2747,7 +2796,7 @@ def _process_loop() -> None:
 # ---------------------------------------------------------------------
 
 
-def _reset_trackers() -> None:
+def _reset_trackers() -> int:
     global _last_pps_vclock_count_seen
     global _timebase_last_activity_monotonic
     global _timebase_last_activity_utc
@@ -2762,8 +2811,7 @@ def _reset_trackers() -> None:
     _diag["last_timebase_activity"] = {}
     _gnss_canary_reset()
     _gnss_raw_reset()
-    _drain_timebase_ingress_and_pending()
-
+    return _drain_timebase_ingress_and_pending()
 
 def _request_teensy_stop_best_effort() -> None:
     try:
@@ -2795,22 +2843,18 @@ def cmd_start(args: Optional[dict]) -> dict:
     """
     START — asynchronous cold START or hot Flash Cut.
 
-    Cold START is allowed to push boot DAC seeds and may ask Teensy to build a
-    new SmartZero service epoch.  Flash Cut is intentionally narrower: do not
-    STOP Teensy, do not push default DACs merely because SYSTEM has them, and
-    do not interpret the new campaign's initial lack of rows as a cold-restart
-    condition.  The Teensy remains hot; only the campaign namespace and
-    campaign-public origins change.
+    The Pi prepares DB state and exact-pair ingress before arming Teensy, then
+    accepts the very first complete TIMEBASE pair. There is no Pi-side warmup
+    or skipped-row model; if row #1 is unhealthy, the readiness gates or Teensy
+    handoff should be fixed.
     """
     global _campaign_active, _accepted_pps_vclock_count
-    global _sync_expected_pps_vclock, _sync_fragment
 
     start_args = _normalize_start_args(args)
     campaign = start_args.get("campaign")
     if not campaign:
         return {"success": False, "message": "START requires 'campaign' argument"}
 
-    # --- Check for active campaign (determines cold start vs flash-cut) ---
     active_row = _get_active_campaign()
     flash_cut = active_row is not None
     prev_campaign = active_row["campaign"] if flash_cut else None
@@ -2826,7 +2870,6 @@ def cmd_start(args: Optional[dict]) -> dict:
     if not flash_cut:
         _wait_for_preflight("start")
 
-    # --- Reject duplicate campaign name ---
     with open_db(row_dict=True) as conn:
         cur = conn.cursor()
         cur.execute(
@@ -2855,9 +2898,7 @@ def cmd_start(args: Optional[dict]) -> dict:
     if calibrate_ocxo and calibrate_ocxo not in ("MEAN", "TOTAL", "NOW", "OFF"):
         return {"success": False, "message": f"calibrate_ocxo must be 'MEAN' 'TOTAL' 'NOW' or 'OFF', got '{calibrate_ocxo}'"}
 
-    # Cold START uses SYSTEM DAC boot seeds when the operator did not supply
-    # explicit values.  Flash Cut preserves the live Teensy/DAC state unless
-    # the operator explicitly supplies a DAC value for the cut.
+    dac_source = "operator" if (set_dac1 is not None or set_dac2 is not None) else "none"
     if not flash_cut and (set_dac1 is None or set_dac2 is None):
         try:
             with open_db(row_dict=True) as conn:
@@ -2867,33 +2908,36 @@ def cmd_start(args: Optional[dict]) -> dict:
                 if row:
                     if set_dac1 is None and row["payload"].get("ocxo1_dac") is not None:
                         set_dac1 = float(row["payload"]["ocxo1_dac"])
-                        logging.info("🔧 [clocks] using ocxo1_dac=%s from SYSTEM config", set_dac1)
+                        dac_source = "SYSTEM"
                     if set_dac2 is None and row["payload"].get("ocxo2_dac") is not None:
                         set_dac2 = float(row["payload"]["ocxo2_dac"])
-                        logging.info("🔧 [clocks] using ocxo2_dac=%s from SYSTEM config", set_dac2)
+                        dac_source = "SYSTEM"
         except Exception:
             logging.exception("⚠️ [clocks] failed to read SYSTEM config (ignored)")
     elif flash_cut and (set_dac1 is None or set_dac2 is None):
-        logging.info(
-            "⚡ [start] FLASH CUT preserving live DAC state for omitted lane(s) "
-            "(no SYSTEM boot DAC push)"
-        )
+        dac_source = "operator+live" if (set_dac1 is not None or set_dac2 is not None) else "live"
 
-    # --- Flash-cut preamble ---
     if flash_cut:
         prev_location = prev_payload.get("location")
-
-        logging.info(
-            "⚡ [start] FLASH CUT: '%s' → '%s' (seamless campaign switch, no stop)",
-            prev_campaign, campaign,
-        )
-
         if location is None and prev_location:
             location = prev_location
-            logging.info(
-                "📡 [start] inheriting location '%s' from previous campaign",
-                location,
-            )
+
+    try:
+        _wait_for_timebase_routes(context="flash_cut" if flash_cut else "start")
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
+    logging.info(
+        "%s [start] campaign='%s' mode=%s location=%s servo=%s dac1=%s dac2=%s dac_source=%s",
+        "⚡" if flash_cut else "▶️",
+        campaign,
+        "FLASH_CUT" if flash_cut else "COLD_START",
+        location or "none",
+        calibrate_ocxo or "OFF",
+        str(set_dac1),
+        str(set_dac2),
+        dac_source,
+    )
 
     cutover_ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     campaign_payload = {
@@ -2906,8 +2950,8 @@ def cmd_start(args: Optional[dict]) -> dict:
         campaign_payload["ocxo2_dac"] = float(set_dac2)
     if calibrate_ocxo is not None:
         # OFF is an explicit command in Flash Cut: stop servo but preserve the
-        # current DAC/output state.  Omitted means "preserve current mode" on
-        # hot Teensy firmware and "default OFF" on cold firmware.
+        # current DAC/output state. Omitted means preserve current mode on hot
+        # Teensy firmware and default OFF on cold firmware.
         campaign_payload["calibrate_ocxo"] = calibrate_ocxo
 
     if flash_cut:
@@ -2919,10 +2963,6 @@ def cmd_start(args: Optional[dict]) -> dict:
             "flash_cut_pi_mode": "HOT_START_NO_TEENSY_STOP",
         })
 
-    # Deactivate prior campaigns + create new one.  The new campaign must be
-    # active before the first row can arrive, because the processor persists by
-    # active campaign.  If the Teensy command fails, restore the prior active
-    # row below.
     with open_db() as conn:
         cur = conn.cursor()
         cur.execute(
@@ -2945,13 +2985,9 @@ def cmd_start(args: Optional[dict]) -> dict:
     if not flash_cut:
         _request_teensy_stop_best_effort()
 
-    # Drain stale TIMEBASE pieces before arming START. From this point forward
-    # the Pi accepts exact TIMEBASE_FRAGMENT + TIMEBASE_FORENSICS pairs asynchronously.
-    _drain_timebase_ingress_and_pending()
-    _reset_trackers()
-
-    # START is asynchronous, so no START-specific sync latch remains armed.
-    # RECOVER still uses the sync wait machinery.
+    drained = _reset_trackers()
+    if drained:
+        logging.info("🧹 [start] drained %d stale TIMEBASE piece(s) before arm", drained)
     _clear_sync_wait()
 
     _accepted_pps_vclock_count = None
@@ -2962,16 +2998,9 @@ def cmd_start(args: Optional[dict]) -> dict:
     if flash_cut:
         _mark_flash_cut_waiting(str(prev_campaign), str(campaign))
 
-    # Mark the campaign active before the Teensy START command returns so the
-    # processor thread cannot discard an early fragment as "no campaign".
     _campaign_active = True
     _arm_timebase_silence_watch("FLASH_CUT" if flash_cut else "START")
 
-    # Arm TEENSY
-    logging.info(
-        "📡 [start] @%s arming TEENSY %s asynchronously: pps_vclock_count=0",
-        system_time_z(), "FLASH CUT" if flash_cut else "START",
-    )
     teensy_args: Dict[str, Any] = {"campaign": campaign}
     if set_dac1 is not None:
         teensy_args["set_dac1"] = str(set_dac1)
@@ -3018,17 +3047,11 @@ def cmd_start(args: Optional[dict]) -> dict:
         raise
 
     logging.info(
-        "▶️ [clocks] @%s START requested asynchronously — campaign '%s' active; "
-        "waiting for first TIMEBASE_FRAGMENT in processor thread",
-        system_time_z(), campaign,
+        "✅ [start] @%s %s requested — campaign='%s' active; awaiting first complete TIMEBASE pair",
+        system_time_z(),
+        "FLASH_CUT" if flash_cut else "START",
+        campaign,
     )
-
-    if flash_cut:
-        logging.info(
-            "⚡ [start] @%s FLASH CUT requested — '%s' → '%s' "
-            "(no STOP, no synchronous fragment wait, first-row timeout=%.0fs)",
-            system_time_z(), prev_campaign, campaign, FLASH_CUT_FIRST_FRAGMENT_TIMEOUT_S,
-        )
 
     return {
         "success": True,
@@ -3049,6 +3072,7 @@ def cmd_start(args: Optional[dict]) -> dict:
             "first_fragment_timeout_s": (
                 FLASH_CUT_FIRST_FRAGMENT_TIMEOUT_S if flash_cut else START_FIRST_FRAGMENT_TIMEOUT_S
             ),
+            "skipped_records_expected": False,
         },
     }
 
@@ -3312,9 +3336,10 @@ def cmd_resume(args: Optional[dict]) -> dict:
 
 def _recover_campaign() -> None:
     """
-    RECOVER — v6 four-domain architecture.
+    RECOVER — v7 exact-first-row architecture.
     """
     global _campaign_active, _accepted_pps_vclock_count
+    global _last_pps_vclock_count_seen
 
     # Immediately deactivate so the processor thread ignores all
     # fragments during recovery.
@@ -3394,20 +3419,19 @@ def _recover_campaign() -> None:
         except Exception as e:
             raise RuntimeError(f"recovery/cold failed: {e}")
 
-        _wait_for_pubsub_route(context="recovery/cold", topic="TIMEBASE_FRAGMENT")
-        _wait_for_pubsub_route(context="recovery/cold", topic="TIMEBASE_FORENSICS")
+        _wait_for_timebase_routes(context="recovery/cold")
 
         _request_teensy_stop_best_effort()
 
-        _drain_timebase_ingress_and_pending()
-
-        _reset_trackers()
+        drained = _reset_trackers()
+        if drained:
+            logging.info("🧹 [recovery/cold] drained %d stale TIMEBASE piece(s)", drained)
         _clear_sync_wait()
 
         teensy_args: Dict[str, Any] = {"campaign": campaign_name}
         recover_ocxo1_dac = campaign_payload.get("ocxo1_dac")
         recover_ocxo2_dac = campaign_payload.get("ocxo2_dac")
-        recover_calibrate = campaign_payload.get("calibrate_ocxo", "MEAN")
+        recover_calibrate = campaign_payload.get("calibrate_ocxo")
         if recover_ocxo1_dac is not None:
             teensy_args["set_dac1"] = str(float(recover_ocxo1_dac))
         if recover_ocxo2_dac is not None:
@@ -3429,9 +3453,8 @@ def _recover_campaign() -> None:
         _arm_timebase_silence_watch("RECOVERY_COLD_START")
 
         logging.info(
-            "📡 [recovery/cold] @%s arming TEENSY START asynchronously: "
-            "pps_vclock_count=0; waiting for first pair in processor thread",
-            system_time_z(),
+            "📡 [recovery/cold] @%s arming TEENSY START asynchronously: campaign='%s' servo=%s",
+            system_time_z(), campaign_name, recover_calibrate or "OFF",
         )
         try:
             _request_teensy_start(campaign=campaign_name, pps_vclock_count=0, args=teensy_args)
@@ -3442,8 +3465,8 @@ def _recover_campaign() -> None:
             raise
 
         logging.info(
-            "▶️ [recovery/cold] @%s START requested asynchronously — campaign '%s' active",
-            system_time_z(), campaign_name,
+            "✅ [recovery/cold] @%s START requested — awaiting first complete TIMEBASE pair",
+            system_time_z(),
         )
 
         _diag["last_recovery"] = {
@@ -3571,8 +3594,7 @@ def _recover_campaign() -> None:
 
     _wait_for_preflight("recovery")
 
-    _wait_for_pubsub_route(context="recovery", topic="TIMEBASE_FRAGMENT")
-    _wait_for_pubsub_route(context="recovery", topic="TIMEBASE_FORENSICS")
+    _wait_for_timebase_routes(context="recovery")
 
     # ------------------------------------------------------------------
     # Stop Teensy, quiesce, snap to second boundary
@@ -3620,18 +3642,18 @@ def _recover_campaign() -> None:
     # ------------------------------------------------------------------
     # Step 4-5: Symmetric projection
     # ------------------------------------------------------------------
-    next_pps_second = elapsed_seconds + 1
-    next_pps_vclock_count = last_pps_vclock_count + next_pps_second
-
-    logging.info(
-        "📐 [recovery] PPS/VCLOCK PROJECTION:\n"
-        "    next_pps_second = elapsed(%d) + 1 = %d\n"
-        "    next_pps_vclock_count  = last(%d) + next_pps_second(%d) = %d",
-        elapsed_seconds, next_pps_second,
-        last_pps_vclock_count, next_pps_second, next_pps_vclock_count,
+    # Seed RECOVER at the campaign base count for the current GNSS second.
+    # The first public row should then be the next PPS/VCLOCK identity. No
+    # fixed skipped-row policy is modeled Pi-side anymore.
+    recover_base_pps_vclock_count = last_pps_vclock_count + elapsed_seconds
+    expected_first_public_pps_vclock_count = (
+        recover_base_pps_vclock_count + RECOVERY_FIRST_PUBLIC_OFFSET
     )
 
-    projected_gnss_ns = next_pps_vclock_count * NS_PER_SECOND
+    projected_gnss_ns = recover_base_pps_vclock_count * NS_PER_SECOND
+    expected_first_public_gnss_ns = (
+        expected_first_public_pps_vclock_count * NS_PER_SECOND
+    )
     projected_dwt_cycles = (
         projected_gnss_ns * last_dwt_cycles // last_gnss_ns
         if (last_gnss_ns > 0 and last_dwt_cycles > 0)
@@ -3655,18 +3677,16 @@ def _recover_campaign() -> None:
     tau_ocxo2 = last_ocxo2_ns / last_gnss_ns if (last_gnss_ns > 0 and last_ocxo2_ns > 0) else 1.0
 
     logging.info(
-        "📐 [recovery] SYMMETRIC PROJECTION (all nanoseconds):\n"
-        "    formula: projected_ns = projected_gnss_ns × last_clock_ns ÷ last_gnss_ns\n"
-        "    projected_gnss_ns = next_pps_vclock_count(%d) × NS_PER_SECOND = %d\n"
-        "    last_gnss_ns      = %d\n"
-        "    ---\n"
-        "    GNSS:  projected = %d  (tau = 1.000000000000)\n"
-        "    DWT:   projected_cycles = %d  dwt_ns_arg = %d  (tau = %.12f, last_dwt_cycles = %d)\n"
-        "    OCXO1: projected = %d  (tau = %.12f, last_ocxo1_ns = %d)",
-        next_pps_vclock_count, projected_gnss_ns, last_gnss_ns,
+        "📐 [recovery] projection: last=%d elapsed=%d base=%d first_public=%d; "
+        "gnss_base=%d dwt_cycles=%d ocxo1=%d ocxo2=%d",
+        last_pps_vclock_count,
+        elapsed_seconds,
+        recover_base_pps_vclock_count,
+        expected_first_public_pps_vclock_count,
         projected_gnss_ns,
-        projected_dwt_cycles, projected_dwt_ns, tau_dwt, last_dwt_cycles,
-        projected_ocxo1_ns, tau_ocxo1, last_ocxo1_ns,
+        projected_dwt_cycles,
+        projected_ocxo1_ns,
+        projected_ocxo2_ns,
     )
 
     _diag["last_recovery"] = {
@@ -3676,8 +3696,11 @@ def _recover_campaign() -> None:
         "last_gnss_time": last_gnss_time_str,
         "current_gnss_time": current_gnss_time_str,
         "elapsed_seconds": int(elapsed_seconds),
-        "next_pps_second": int(next_pps_second),
-        "next_pps_vclock_count": int(next_pps_vclock_count),
+        "recover_base_pps_vclock_count": int(recover_base_pps_vclock_count),
+        "expected_first_public_pps_vclock_count": int(expected_first_public_pps_vclock_count),
+        "expected_first_public_gnss_ns": int(expected_first_public_gnss_ns),
+        # Legacy diagnostic alias: expected first public row, not the RECOVER seed.
+        "next_pps_vclock_count": int(expected_first_public_pps_vclock_count),
         "projected_gnss_ns": int(projected_gnss_ns),
         "last_dwt_cycles": int(last_dwt_cycles),
         "projected_dwt_cycles": int(projected_dwt_cycles),
@@ -3692,19 +3715,11 @@ def _recover_campaign() -> None:
     # ------------------------------------------------------------------
     # Step 6: Begin sync wait, arm Teensy RECOVER
     # ------------------------------------------------------------------
-    _begin_sync_wait(expected_pps=int(next_pps_vclock_count))
+    _begin_sync_wait(expected_pps=int(expected_first_public_pps_vclock_count))
 
     logging.info(
-        "📡 [recovery] @%s arming TEENSY RECOVER:\n"
-        "    pps_vclock_count = %d\n"
-        "    dwt_cycles = %d\n"
-        "    dwt_ns_arg = %d\n"
-        "    gnss_ns    = %d\n"
-        "    ocxo1_ns   = %d\n"
-        "    ocxo2_ns   = %d",
-        system_time_z(), next_pps_vclock_count,
-        projected_dwt_cycles, projected_dwt_ns, projected_gnss_ns,
-        projected_ocxo1_ns, projected_ocxo2_ns,
+        "📡 [recovery] arming Teensy RECOVER: base_count=%d expected_first_public=%d",
+        recover_base_pps_vclock_count, expected_first_public_pps_vclock_count,
     )
 
     teensy_recover_args: Dict[str, Any] = {
@@ -3732,80 +3747,74 @@ def _recover_campaign() -> None:
     if recover_calibrate:
         teensy_recover_args["calibrate_ocxo"] = recover_calibrate
 
-    _request_teensy_recover(int(next_pps_vclock_count), teensy_recover_args)
+    _request_teensy_recover(int(recover_base_pps_vclock_count), teensy_recover_args)
 
     try:
         frag, waited_s = _end_sync_wait(timeout_s=SYNC_RECOVER_TIMEOUT_S)
     except Exception:
         raise
 
-    logging.info("✅ [recovery] @%s sync fragment received (waited=%.3fs)", system_time_z(), waited_s)
-
     teensy_pps_vclock_count = _extract_teensy_pps_vclock_count(frag)
-    overshoot = teensy_pps_vclock_count - next_pps_vclock_count
+    first_public_offset = teensy_pps_vclock_count - expected_first_public_pps_vclock_count
+    logging.info(
+        "✅ [recovery] first public pair accepted: count=%d expected=%d offset=%+d waited=%.3fs",
+        teensy_pps_vclock_count,
+        expected_first_public_pps_vclock_count,
+        first_public_offset,
+        waited_s,
+    )
 
-    if overshoot != 0:
-        logging.info(
-            "📐 [recovery] PPS/VCLOCK count overshoot: teensy=%d projected=%d (overshoot=%+d)",
-            teensy_pps_vclock_count, next_pps_vclock_count, overshoot,
-        )
-
-    _accepted_pps_vclock_count = int(teensy_pps_vclock_count)
-    _diag["accepted_pps_count"] = _accepted_pps_vclock_count
-    _diag["accepted_pps_vclock_count"] = _accepted_pps_vclock_count
-
-    _drained_post = _drain_timebase_ingress_and_pending()
-    if _drained_post > 0:
-        logging.info("🧹 [recovery] drained %d TIMEBASE pieces/pending halves accumulated during sync wait", _drained_post)
-
-    # GNSS_RAW is Pi-owned, so it must be restored after the actual recovered
-    # TIMEBASE identity is known.  The Teensy may overshoot the pre-armed
-    # projection by a few PPS rows during RECOVER; using the earlier projected
-    # count here leaves GNSS_RAW's accumulated numerator/denominator behind the
-    # accepted campaign count and corrupts campaign-level TAU/PPB.
-    accepted_gnss_ns = int(teensy_pps_vclock_count) * NS_PER_SECOND
-    accepted_gnss_raw_ns = (
-        accepted_gnss_ns * last_gnss_raw_ns // last_gnss_ns
+    # The processor is paused on this exact pair. Restore Pi-owned state to
+    # the identity immediately before it, then reopen campaign processing so
+    # the sync pair is persisted as the first recovered public TIMEBASE row.
+    seed_pps_vclock_count = max(0, int(teensy_pps_vclock_count) - 1)
+    seed_gnss_ns = seed_pps_vclock_count * NS_PER_SECOND
+    seed_gnss_raw_ns = (
+        seed_gnss_ns * last_gnss_raw_ns // last_gnss_ns
         if (last_gnss_ns > 0 and last_gnss_raw_ns > 0)
         else 0
     )
 
-    _diag["last_recovery"].update({
-        "accepted_pps_vclock_count": int(teensy_pps_vclock_count),
-        "accepted_gnss_ns": int(accepted_gnss_ns),
-        "projected_gnss_raw_ns": int(projected_gnss_raw_ns),
-        "accepted_gnss_raw_ns": int(accepted_gnss_raw_ns),
-        "gnss_raw_recovery_uses_accepted_count": True,
-    })
-
-    _reset_trackers()
-
     gnss_raw_restored = _restore_gnss_raw_from_last_timebase(
         last_tb=last_tb,
-        projected_gnss_ns=int(accepted_gnss_ns),
-        projected_gnss_raw_ns=int(accepted_gnss_raw_ns),
+        projected_gnss_ns=int(seed_gnss_ns),
+        projected_gnss_raw_ns=int(seed_gnss_raw_ns),
     )
-    logging.info(
-        "📊 [recovery] GNSS_RAW restore: restored=%s projected_ns=%d accepted_ns=%d "
-        "target_count=%d accepted_count=%d overshoot=%+d",
-        str(gnss_raw_restored),
-        int(projected_gnss_raw_ns),
-        int(accepted_gnss_raw_ns),
-        int(next_pps_vclock_count),
-        int(teensy_pps_vclock_count),
-        int(overshoot),
-    )
+
+    _accepted_pps_vclock_count = seed_pps_vclock_count
+    _last_pps_vclock_count_seen = seed_pps_vclock_count
+    _diag["accepted_pps_count"] = _accepted_pps_vclock_count
+    _diag["accepted_pps_vclock_count"] = _accepted_pps_vclock_count
+
+    _gnss_canary_reset()
+
+    _diag["last_recovery"].update({
+        "accepted_pps_vclock_count": int(teensy_pps_vclock_count),
+        "seed_pps_vclock_count": int(seed_pps_vclock_count),
+        "seed_gnss_ns": int(seed_gnss_ns),
+        "seed_gnss_raw_ns": int(seed_gnss_raw_ns),
+        "first_public_offset": int(first_public_offset),
+        "skipped_records_expected": False,
+        "gnss_raw_recovery_uses_seed_before_first_public": True,
+        "gnss_raw_restored": bool(gnss_raw_restored),
+    })
 
     _campaign_active = True
     _arm_timebase_silence_watch("RECOVERY_RESUME")
+    _sync_resume_event.set()
 
     logging.info(
-        "✅ [recovery] @%s campaign '%s' recovered — TIMEBASE resumes\n"
-        "    teensy_pps_vclock_count = %d\n"
-        "    overshoot        = %+d",
-        system_time_z(), campaign_name,
-        teensy_pps_vclock_count, overshoot,
+        "📊 [recovery] GNSS_RAW restored=%s seed_count=%d first_public=%d offset=%+d",
+        str(gnss_raw_restored),
+        seed_pps_vclock_count,
+        teensy_pps_vclock_count,
+        first_public_offset,
     )
+    logging.info(
+        "✅ [recovery] campaign '%s' recovered — TIMEBASE resumes with first public count=%d",
+        campaign_name, teensy_pps_vclock_count,
+    )
+
 
 
 # ---------------------------------------------------------------------
@@ -4680,7 +4689,7 @@ def run() -> None:
         "Four clock domains: GNSS (reference), DWT, OCXO1, OCXO2. "
         "DWT/OCXO1/OCXO2 prediction stats from Teensy are authoritative. "
         "Pi-side Welford for DWT/OCXO1/OCXO2 removed. GNSS stream canary retained. "
-        "Recovery: campaign deactivated + queue drained + late reset; valid fragments are never rejected for count mismatch. START and cold recovery are asynchronous. "
+        "Recovery: campaign deactivated + queue drained + first sync pair preserved; valid fragments are never rejected for count mismatch. START and cold recovery are asynchronous; first public rows are expected to be authoritative. "
         "START while active performs seamless flash-cut to new campaign. "
         "Commands: START, STOP, RESUME, REPORT, CLEAR, DELETE, SET_DAC, DITHER, "
         "SET_BASELINE, BASELINE_INFO, LIST_CAMPAIGNS, CLOCKS_INFO. "

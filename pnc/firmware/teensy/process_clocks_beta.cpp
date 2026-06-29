@@ -4485,37 +4485,25 @@ static bool clocks_servo_active(void) {
   return calibrate_ocxo_mode != servo_mode_t::OFF;
 }
 
+
 static void payload_add_servo_dac_values(Payload& parent) {
-  // Minimal durable DAC payload.  This is intentionally only the values the Pi
-  // should persist as the current system DAC configuration, plus the explicit
-  // servo mode that explains why this object is present in the TIMEBASE row.
+  // Ultra-compact durable DAC persistence.  TIMEBASE_FRAGMENT is the 1 Hz
+  // science spine, so it must not carry DAC/dither courtroom detail.  Persist
+  // only the commanded fractional DAC intent, the realized hardware code, and
+  // the explicit servo/dither identity needed by the Pi config mirror.
   Payload dac;
+  dac.add("schema", "TIMEBASE_DAC_PERSISTENCE_V2");
   dac.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
   dac.add("servo_mode", servo_mode_str(calibrate_ocxo_mode));
   dac.add("servo_active", clocks_servo_active());
-  dac.add("ocxo1_dac", ocxo1_dac.dac_fractional);
-  dac.add("ocxo2_dac", ocxo2_dac.dac_fractional);
+  dac.add("realization_mode", ocxo_dac_realization_mode_runtime());
+  dac.add("dither_operator_enabled", clocks_ocxo_dac_dither_operator_enabled());
+
+  dac.add("ocxo1_dac", ocxo1_dac.dac_fractional, 6);
+  dac.add("ocxo2_dac", ocxo2_dac.dac_fractional, 6);
   dac.add("ocxo1_hw_code", (uint32_t)ocxo1_dac.dac_hw_code);
   dac.add("ocxo2_hw_code", (uint32_t)ocxo2_dac.dac_hw_code);
-  dac.add("ocxo1_voltage",
-          ocxo_dac_voltage_from_code((double)ocxo1_dac.dac_hw_code), 6);
-  dac.add("ocxo2_voltage",
-          ocxo_dac_voltage_from_code((double)ocxo2_dac.dac_hw_code), 6);
-  dac.add("realization_mode", ocxo_dac_realization_mode_runtime());
-  dac.add("reference_mode", OCXO_DAC_REFERENCE_MODE);
-  dac.add("external_vref_used", false);
-  dac.add("safe_max_output_voltage", OCXO_DAC_SAFE_MAX_OUTPUT_VOLTAGE, 6);
-  dac.add("safe_max_hw_code", (uint32_t)OCXO_DAC_SAFE_MAX_HW_CODE);
-  dac.add("static_rounded_only", ocxo_dac_static_rounded_only_runtime());
-  dac.add("fractional_stream_possible", ocxo_dac_fractional_stream_possible_runtime());
-  dac.add("recurring_timer_possible", clocks_ocxo_dac_dither_started());
-  dac.add("dither_operator_enabled", clocks_ocxo_dac_dither_operator_enabled());
-  dac.add("dither_service_pending", clocks_ocxo_dac_dither_service_pending());
 
-  Payload realization;
-  payload_add_dac_realization_object(realization, "ocxo1", ocxo1_dac);
-  payload_add_dac_realization_object(realization, "ocxo2", ocxo2_dac);
-  dac.add_object("realization", realization);
   parent.add_object("dac", dac);
 }
 
@@ -7410,13 +7398,77 @@ static FLASHMEM Payload cmd_report_stats(const Payload&) {
 }
 
 
+
+static FLASHMEM void payload_add_dither_status_lane_compact(
+    Payload& parent,
+    const char* key,
+    const ocxo_dac_state_t& dac) {
+  Payload lane;
+  lane.add("dac", dac.dac_fractional, 6);
+  lane.add("hw_code", (uint32_t)dac.dac_hw_code);
+  lane.add("voltage", ocxo_dac_voltage_from_code((double)dac.dac_hw_code), 6);
+
+  lane.add("active", dac.dither_active_this_frame);
+  lane.add("low_code", (uint32_t)dac.dither_low_code);
+  lane.add("high_code", (uint32_t)dac.dither_high_code);
+  lane.add("high_ms", (uint32_t)dac.dither_high_ms);
+  lane.add("phase_high", dac.dither_current_phase_high);
+  lane.add("pending_hw_write", dac.dither_pending_hw_write);
+  lane.add("pending_hw_code", (uint32_t)dac.dither_pending_hw_code);
+
+  lane.add("frame_count", dac.dither_frame_count);
+  lane.add("transition_count", dac.dither_transition_count);
+  lane.add("write_count", dac.dither_write_count);
+  lane.add("write_failures", dac.dither_write_failure_count);
+  lane.add("skip_same_code_count", dac.dither_skip_same_code_count);
+  lane.add("service_count", dac.dither_service_count);
+  lane.add("service_write_count", dac.dither_service_write_count);
+  lane.add("service_defer_count", dac.dither_service_defer_count);
+
+  lane.add("io_ok", dac.io_last_write_ok &&
+                    !dac.io_fault_latched &&
+                    dac.io_last_failure_stage == 0);
+  lane.add("io_write_attempts", dac.io_write_attempts);
+  lane.add("io_write_failures", dac.io_write_failures);
+  lane.add("servo_adjustments", dac.servo_adjustments);
+  lane.add("pacing_intents", dac.pacing_intents);
+  lane.add("pacing_commit_count", dac.pacing_commit_count);
+
+  parent.add_object(key, lane);
+}
+
+static FLASHMEM void payload_add_dither_status_compact(Payload& p) {
+  p.add("schema", "CLOCKS_DITHER_STATUS_V2");
+  p.add("report", "CLOCKS_DITHER_STATUS");
+  p.add("status", "ok");
+
+  p.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
+  p.add("servo_active", clocks_servo_active());
+  p.add("dither_operator_enabled", clocks_ocxo_dac_dither_operator_enabled());
+  p.add("realization_mode", ocxo_dac_realization_mode_runtime());
+  p.add("static_rounded_only", ocxo_dac_static_rounded_only_runtime());
+  p.add("fractional_stream_possible", ocxo_dac_fractional_stream_possible_runtime());
+  p.add("started", clocks_ocxo_dac_dither_started());
+  p.add("service_pending", clocks_ocxo_dac_dither_service_pending());
+  p.add("write_context", clocks_ocxo_dac_dither_context());
+
+  p.add("global_frame_count", clocks_ocxo_dac_dither_global_frame_count());
+  p.add("global_schedule_failures", clocks_ocxo_dac_dither_global_schedule_failures());
+  p.add("service_arm_count", clocks_ocxo_dac_dither_service_arm_count());
+  p.add("service_arm_failures", clocks_ocxo_dac_dither_service_arm_failures());
+  p.add("ad5693r_init_ok", g_ad5693r_init_ok);
+  p.add("safe_max_hw_code", (uint32_t)OCXO_DAC_SAFE_MAX_HW_CODE);
+
+  payload_add_dither_status_lane_compact(p, "ocxo1", ocxo1_dac);
+  payload_add_dither_status_lane_compact(p, "ocxo2", ocxo2_dac);
+}
+
 static FLASHMEM Payload cmd_dither_status(const Payload&) {
   Payload p;
-  p.add("status", "ok");
-  p.add("report", "CLOCKS_DITHER_STATUS");
-  add_dac_payload(p);
+  payload_add_dither_status_compact(p);
   return p;
 }
+
 
 static FLASHMEM Payload cmd_dither_enable(const Payload&) {
   const bool ok = clocks_ocxo_dac_dither_enable();
@@ -7427,14 +7479,12 @@ static FLASHMEM Payload cmd_dither_enable(const Payload&) {
   p.add("started", clocks_ocxo_dac_dither_started());
   p.add("service_pending", clocks_ocxo_dac_dither_service_pending());
   p.add("write_context", clocks_ocxo_dac_dither_context());
-  p.add("ocxo1_dac", ocxo1_dac.dac_fractional);
-  p.add("ocxo2_dac", ocxo2_dac.dac_fractional);
-  p.add("ocxo1_dac_hw_code", (uint32_t)ocxo1_dac.dac_hw_code);
-  p.add("ocxo2_dac_hw_code", (uint32_t)ocxo2_dac.dac_hw_code);
-  payload_add_dac_realization_object(p, "ocxo1_realization", ocxo1_dac);
-  payload_add_dac_realization_object(p, "ocxo2_realization", ocxo2_dac);
+  p.add("realization_mode", ocxo_dac_realization_mode_runtime());
+  payload_add_dither_status_lane_compact(p, "ocxo1", ocxo1_dac);
+  payload_add_dither_status_lane_compact(p, "ocxo2", ocxo2_dac);
   return p;
 }
+
 
 static FLASHMEM Payload cmd_dither_disable(const Payload&) {
   const bool ok = clocks_ocxo_dac_dither_disable();
@@ -7445,14 +7495,9 @@ static FLASHMEM Payload cmd_dither_disable(const Payload&) {
   p.add("started", clocks_ocxo_dac_dither_started());
   p.add("service_pending", clocks_ocxo_dac_dither_service_pending());
   p.add("write_context", clocks_ocxo_dac_dither_context());
-  p.add("ocxo1_dac", ocxo1_dac.dac_fractional);
-  p.add("ocxo2_dac", ocxo2_dac.dac_fractional);
-  p.add("ocxo1_dac_hw_code", (uint32_t)ocxo1_dac.dac_hw_code);
-  p.add("ocxo2_dac_hw_code", (uint32_t)ocxo2_dac.dac_hw_code);
-  p.add("ocxo1_dac_last_write_ok", ocxo1_dac.io_last_write_ok);
-  p.add("ocxo2_dac_last_write_ok", ocxo2_dac.io_last_write_ok);
-  payload_add_dac_realization_object(p, "ocxo1_realization", ocxo1_dac);
-  payload_add_dac_realization_object(p, "ocxo2_realization", ocxo2_dac);
+  p.add("realization_mode", ocxo_dac_realization_mode_runtime());
+  payload_add_dither_status_lane_compact(p, "ocxo1", ocxo1_dac);
+  payload_add_dither_status_lane_compact(p, "ocxo2", ocxo2_dac);
   return p;
 }
 
