@@ -166,32 +166,6 @@ struct interrupt_capture_diag_t {
   uint32_t regression_fit_error_lt_minus4_count = 0;
   uint32_t regression_fit_error_abs_gt4_count = 0;
 
-  // SlopeFinder candidate rail.  Unlike FloorLine/lower-envelope, this is a
-  // symmetric rolling residual regression over the current slope model.  It is
-  // diagnostic/candidate authority: projected_dwt_at_event is produced by the
-  // model slope state, never by copying the observed ISR DWT for this sample.
-  bool     slopefinder_valid = false;
-  uint32_t slopefinder_sequence = 0;
-  uint32_t slopefinder_window_seconds = 0;
-  uint32_t slopefinder_window_sample_count = 0;
-  uint32_t slopefinder_total_sample_count = 0;
-  uint32_t slopefinder_observed_dwt_at_event = 0;
-  uint32_t slopefinder_projected_dwt_at_event = 0;
-  int32_t  slopefinder_projected_minus_observed_cycles = 0;
-  uint32_t slopefinder_target_counter32_at_event = 0;
-  uint16_t slopefinder_target_hardware16_at_event = 0;
-  uint16_t slopefinder_observed_hardware16_at_event = 0;
-  uint64_t slopefinder_slope_q16_cycles_per_sample = 0;
-  int64_t  slopefinder_slope_delta_q16_cycles_per_sample = 0;
-  uint32_t slopefinder_interval_cycles = 0;
-  int32_t  slopefinder_residual_cycles = 0;
-  uint32_t slopefinder_welford_n = 0;
-  int32_t  slopefinder_welford_mean_q16_cycles = 0;
-  uint32_t slopefinder_welford_stddev_q16_cycles = 0;
-  uint32_t slopefinder_welford_stderr_q16_cycles = 0;
-  int32_t  slopefinder_welford_min_cycles = 0;
-  int32_t  slopefinder_welford_max_cycles = 0;
-
   uint32_t anchor_sequence_used = 0;
   uint32_t anchor_age_slots = 0;
   uint32_t anchor_selection_kind = 0;

@@ -1498,28 +1498,6 @@ struct alpha_lane_forensics_store_t {
   uint32_t regression_fit_error_gt_plus4_count = 0;
   uint32_t regression_fit_error_lt_minus4_count = 0;
   uint32_t regression_fit_error_abs_gt4_count = 0;
-
-  bool     slopefinder_valid = false;
-  uint32_t slopefinder_sequence = 0;
-  uint32_t slopefinder_window_seconds = 0;
-  uint32_t slopefinder_window_sample_count = 0;
-  uint32_t slopefinder_total_sample_count = 0;
-  uint32_t slopefinder_observed_dwt_at_event = 0;
-  uint32_t slopefinder_projected_dwt_at_event = 0;
-  int32_t  slopefinder_projected_minus_observed_cycles = 0;
-  uint32_t slopefinder_target_counter32_at_event = 0;
-  uint16_t slopefinder_target_hardware16_at_event = 0;
-  uint16_t slopefinder_observed_hardware16_at_event = 0;
-  uint64_t slopefinder_slope_q16_cycles_per_sample = 0;
-  int64_t  slopefinder_slope_delta_q16_cycles_per_sample = 0;
-  uint32_t slopefinder_interval_cycles = 0;
-  int32_t  slopefinder_residual_cycles = 0;
-  uint32_t slopefinder_welford_n = 0;
-  int32_t  slopefinder_welford_mean_q16_cycles = 0;
-  uint32_t slopefinder_welford_stddev_q16_cycles = 0;
-  uint32_t slopefinder_welford_stderr_q16_cycles = 0;
-  int32_t  slopefinder_welford_min_cycles = 0;
-  int32_t  slopefinder_welford_max_cycles = 0;
 };
 
 static alpha_lane_forensics_store_t g_vclock_forensics = {};
@@ -3762,27 +3740,6 @@ static void alpha_forensics_reset_store(alpha_lane_forensics_store_t& s) {
   s.regression_fit_error_gt_plus4_count = 0;
   s.regression_fit_error_lt_minus4_count = 0;
   s.regression_fit_error_abs_gt4_count = 0;
-  s.slopefinder_valid = false;
-  s.slopefinder_sequence = 0;
-  s.slopefinder_window_seconds = 0;
-  s.slopefinder_window_sample_count = 0;
-  s.slopefinder_total_sample_count = 0;
-  s.slopefinder_observed_dwt_at_event = 0;
-  s.slopefinder_projected_dwt_at_event = 0;
-  s.slopefinder_projected_minus_observed_cycles = 0;
-  s.slopefinder_target_counter32_at_event = 0;
-  s.slopefinder_target_hardware16_at_event = 0;
-  s.slopefinder_observed_hardware16_at_event = 0;
-  s.slopefinder_slope_q16_cycles_per_sample = 0;
-  s.slopefinder_slope_delta_q16_cycles_per_sample = 0;
-  s.slopefinder_interval_cycles = 0;
-  s.slopefinder_residual_cycles = 0;
-  s.slopefinder_welford_n = 0;
-  s.slopefinder_welford_mean_q16_cycles = 0;
-  s.slopefinder_welford_stddev_q16_cycles = 0;
-  s.slopefinder_welford_stderr_q16_cycles = 0;
-  s.slopefinder_welford_min_cycles = 0;
-  s.slopefinder_welford_max_cycles = 0;
 
   clocks_alpha_dmb();
   s.seq++;
@@ -4076,43 +4033,6 @@ static void alpha_forensics_publish(time_clock_id_t clock_id,
         diag->regression_fit_error_lt_minus4_count;
     s->regression_fit_error_abs_gt4_count =
         diag->regression_fit_error_abs_gt4_count;
-
-    s->slopefinder_valid = diag->slopefinder_valid;
-    s->slopefinder_sequence = diag->slopefinder_sequence;
-    s->slopefinder_window_seconds = diag->slopefinder_window_seconds;
-    s->slopefinder_window_sample_count =
-        diag->slopefinder_window_sample_count;
-    s->slopefinder_total_sample_count =
-        diag->slopefinder_total_sample_count;
-    s->slopefinder_observed_dwt_at_event =
-        diag->slopefinder_observed_dwt_at_event;
-    s->slopefinder_projected_dwt_at_event =
-        diag->slopefinder_projected_dwt_at_event;
-    s->slopefinder_projected_minus_observed_cycles =
-        diag->slopefinder_projected_minus_observed_cycles;
-    s->slopefinder_target_counter32_at_event =
-        diag->slopefinder_target_counter32_at_event;
-    s->slopefinder_target_hardware16_at_event =
-        diag->slopefinder_target_hardware16_at_event;
-    s->slopefinder_observed_hardware16_at_event =
-        diag->slopefinder_observed_hardware16_at_event;
-    s->slopefinder_slope_q16_cycles_per_sample =
-        diag->slopefinder_slope_q16_cycles_per_sample;
-    s->slopefinder_slope_delta_q16_cycles_per_sample =
-        diag->slopefinder_slope_delta_q16_cycles_per_sample;
-    s->slopefinder_interval_cycles = diag->slopefinder_interval_cycles;
-    s->slopefinder_residual_cycles = diag->slopefinder_residual_cycles;
-    s->slopefinder_welford_n = diag->slopefinder_welford_n;
-    s->slopefinder_welford_mean_q16_cycles =
-        diag->slopefinder_welford_mean_q16_cycles;
-    s->slopefinder_welford_stddev_q16_cycles =
-        diag->slopefinder_welford_stddev_q16_cycles;
-    s->slopefinder_welford_stderr_q16_cycles =
-        diag->slopefinder_welford_stderr_q16_cycles;
-    s->slopefinder_welford_min_cycles =
-        diag->slopefinder_welford_min_cycles;
-    s->slopefinder_welford_max_cycles =
-        diag->slopefinder_welford_max_cycles;
   } else {
     s->dwt_synthetic = false;
     s->dwt_repair_candidate = false;
@@ -4256,27 +4176,6 @@ static void alpha_forensics_publish(time_clock_id_t clock_id,
     s->regression_fit_error_gt_plus4_count = 0;
     s->regression_fit_error_lt_minus4_count = 0;
     s->regression_fit_error_abs_gt4_count = 0;
-    s->slopefinder_valid = false;
-    s->slopefinder_sequence = 0;
-    s->slopefinder_window_seconds = 0;
-    s->slopefinder_window_sample_count = 0;
-    s->slopefinder_total_sample_count = 0;
-    s->slopefinder_observed_dwt_at_event = 0;
-    s->slopefinder_projected_dwt_at_event = 0;
-    s->slopefinder_projected_minus_observed_cycles = 0;
-    s->slopefinder_target_counter32_at_event = 0;
-    s->slopefinder_target_hardware16_at_event = 0;
-    s->slopefinder_observed_hardware16_at_event = 0;
-    s->slopefinder_slope_q16_cycles_per_sample = 0;
-    s->slopefinder_slope_delta_q16_cycles_per_sample = 0;
-    s->slopefinder_interval_cycles = 0;
-    s->slopefinder_residual_cycles = 0;
-    s->slopefinder_welford_n = 0;
-    s->slopefinder_welford_mean_q16_cycles = 0;
-    s->slopefinder_welford_stddev_q16_cycles = 0;
-    s->slopefinder_welford_stderr_q16_cycles = 0;
-    s->slopefinder_welford_min_cycles = 0;
-    s->slopefinder_welford_max_cycles = 0;
   }
 
   clocks_alpha_dmb();
@@ -4511,43 +4410,6 @@ bool clocks_alpha_lane_forensics(time_clock_id_t clock,
         s->regression_fit_error_lt_minus4_count;
     out->regression_fit_error_abs_gt4_count =
         s->regression_fit_error_abs_gt4_count;
-
-    out->slopefinder_valid = s->slopefinder_valid;
-    out->slopefinder_sequence = s->slopefinder_sequence;
-    out->slopefinder_window_seconds = s->slopefinder_window_seconds;
-    out->slopefinder_window_sample_count =
-        s->slopefinder_window_sample_count;
-    out->slopefinder_total_sample_count =
-        s->slopefinder_total_sample_count;
-    out->slopefinder_observed_dwt_at_event =
-        s->slopefinder_observed_dwt_at_event;
-    out->slopefinder_projected_dwt_at_event =
-        s->slopefinder_projected_dwt_at_event;
-    out->slopefinder_projected_minus_observed_cycles =
-        s->slopefinder_projected_minus_observed_cycles;
-    out->slopefinder_target_counter32_at_event =
-        s->slopefinder_target_counter32_at_event;
-    out->slopefinder_target_hardware16_at_event =
-        s->slopefinder_target_hardware16_at_event;
-    out->slopefinder_observed_hardware16_at_event =
-        s->slopefinder_observed_hardware16_at_event;
-    out->slopefinder_slope_q16_cycles_per_sample =
-        s->slopefinder_slope_q16_cycles_per_sample;
-    out->slopefinder_slope_delta_q16_cycles_per_sample =
-        s->slopefinder_slope_delta_q16_cycles_per_sample;
-    out->slopefinder_interval_cycles = s->slopefinder_interval_cycles;
-    out->slopefinder_residual_cycles = s->slopefinder_residual_cycles;
-    out->slopefinder_welford_n = s->slopefinder_welford_n;
-    out->slopefinder_welford_mean_q16_cycles =
-        s->slopefinder_welford_mean_q16_cycles;
-    out->slopefinder_welford_stddev_q16_cycles =
-        s->slopefinder_welford_stddev_q16_cycles;
-    out->slopefinder_welford_stderr_q16_cycles =
-        s->slopefinder_welford_stderr_q16_cycles;
-    out->slopefinder_welford_min_cycles =
-        s->slopefinder_welford_min_cycles;
-    out->slopefinder_welford_max_cycles =
-        s->slopefinder_welford_max_cycles;
 
     clocks_alpha_dmb();
     const uint32_t seq2 = s->seq;

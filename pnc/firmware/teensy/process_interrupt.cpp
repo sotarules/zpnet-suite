@@ -224,7 +224,6 @@ static void interrupt_feature_update_qtimer_counter_custody(void);
 static void interrupt_feature_update_qtimer_dwt_ruler(void);
 static void interrupt_feature_update_counter32_lineage(void);
 static void interrupt_feature_update_floorline(void);
-static void interrupt_feature_update_slopefinder(void);
 
 static uint32_t interrupt_integrity_abs_i32(int32_t value) {
   return value < 0 ? (uint32_t)(-(int64_t)value) : (uint32_t)value;
@@ -688,8 +687,6 @@ static system_feature_status_t g_interrupt_feature_pps_vclock_authority =
     system_feature_status_t::ANOMALY;
 static system_feature_status_t g_interrupt_feature_floorline =
     system_feature_status_t::ANOMALY;
-static system_feature_status_t g_interrupt_feature_slopefinder =
-    system_feature_status_t::ANOMALY;
 static system_feature_status_t g_interrupt_feature_qtimer_counter_custody =
     system_feature_status_t::ANOMALY;
 static system_feature_status_t g_interrupt_feature_qtimer_dwt_ruler =
@@ -728,10 +725,6 @@ static void interrupt_features_mark_initializing(void) {
                                true);
   interrupt_feature_set_cached("FLOORLINE",
                                g_interrupt_feature_floorline,
-                               system_feature_status_t::INITIALIZING,
-                               true);
-  interrupt_feature_set_cached("SLOPEFINDER",
-                               g_interrupt_feature_slopefinder,
                                system_feature_status_t::INITIALIZING,
                                true);
   interrupt_feature_set_cached("QTIMER_COUNTER_CUSTODY",
@@ -4780,641 +4773,6 @@ static uint32_t lower_env_round_q16_u32(int64_t q16) {
   return (uint32_t)(-(((-q16) + 32768LL) >> 16));
 }
 
-// ============================================================================
-// SlopeFinder — rolling residual regression candidate rail
-// ============================================================================
-//
-// SlopeFinder is a separate candidate estimator from FloorLine.  FloorLine uses
-// the one-sided latency law to select a lower-envelope endpoint.  SlopeFinder
-// instead treats the current slope as the model state, projects each 1 kHz
-// sample from that model, records the signed residual (observed - projected),
-// and runs a fixed-window regression over those residuals.  The residual slope
-// nudges the model slope; the residual mean gently recenters the model phase.
-// The candidate DWT-at-edge reported for a one-second bookend is the model
-// projection made before consuming that observed bookend sample.
-
-static constexpr uint32_t SLOPEFINDER_SAMPLE_RATE_HZ = LOWER_ENV_SAMPLE_RATE_HZ;
-static constexpr uint32_t SLOPEFINDER_WINDOW_SECONDS = 16U;
-static constexpr uint32_t SLOPEFINDER_BOOTSTRAP_SECONDS = 5U;
-static constexpr uint32_t SLOPEFINDER_BOOTSTRAP_SAMPLES =
-    SLOPEFINDER_BOOTSTRAP_SECONDS * SLOPEFINDER_SAMPLE_RATE_HZ;
-static constexpr uint32_t SLOPEFINDER_MIN_WINDOW_SAMPLES =
-    2U * SLOPEFINDER_SAMPLE_RATE_HZ;
-
-// SlopeFinder updates at 1 kHz.  These gains are intentionally scaled for that
-// cadence; the first iteration used per-second-sized gains at per-millisecond
-// cadence, which made a live lane chase residual noise and a gated lane freeze.
-// Slope correction now has an approximately 16 s response constant, while
-// phase recenters more quickly so a good slope can still produce a useful
-// candidate during startup.
-static constexpr uint32_t SLOPEFINDER_SLOPE_GAIN_SHIFT = 14U;  // ~1/(16*1024)
-static constexpr uint32_t SLOPEFINDER_PHASE_GAIN_SHIFT = 12U;  // ~1/(4*1024)
-
-// Admission policy is diagnostic-first.  A few-thousand-cycle miss is often
-// evidence that the model slope is wrong, not evidence to stop learning.  Keep
-// a soft quality threshold for counters/reacquisition, but admit sane residuals
-// into the rolling regression so coherent drift can pull the model back.
-static constexpr uint32_t SLOPEFINDER_MODEL_SOFT_GATE_CYCLES = 4096U;
-static constexpr uint32_t SLOPEFINDER_MODEL_HARD_GATE_CYCLES = 131072U;
-static constexpr uint32_t SLOPEFINDER_REACQUIRE_GATE_CYCLES = 32768U;
-static constexpr uint32_t SLOPEFINDER_REACQUIRE_STREAK_SAMPLES =
-    SLOPEFINDER_SAMPLE_RATE_HZ;
-static constexpr uint32_t
-    SLOPEFINDER_BOOTSTRAP_DEFAULT_GATE_CYCLES_PER_SECOND = 256U;
-static constexpr uint64_t SLOPEFINDER_DWT_Q16_MASK = (1ULL << 48) - 1ULL;
-
-struct slopefinder_block_t {
-  bool     valid = false;
-  uint32_t sample_count = 0;
-  uint64_t sum_x = 0;
-  uint64_t sum_xx = 0;
-  int64_t  sum_residual_cycles = 0;
-  int64_t  sum_x_residual_cycles = 0;
-  uint64_t sum_residual_square_cycles = 0;
-  int32_t  residual_min_cycles = 0;
-  int32_t  residual_max_cycles = 0;
-};
-
-struct slopefinder_window_stats_t {
-  uint32_t n = 0;
-  int64_t  slope_delta_q16_cycles_per_sample = 0;
-  int32_t  mean_q16_cycles = 0;
-  uint32_t stddev_q16_cycles = 0;
-  uint32_t stderr_q16_cycles = 0;
-  int32_t  min_cycles = 0;
-  int32_t  max_cycles = 0;
-};
-
-struct slopefinder_result_t {
-  bool     valid = false;
-  uint32_t sequence = 0;
-  uint32_t window_seconds = SLOPEFINDER_WINDOW_SECONDS;
-  uint32_t window_sample_count = 0;
-  uint32_t total_sample_count = 0;
-  uint32_t observed_dwt_at_event = 0;
-  uint32_t projected_dwt_at_event = 0;
-  int32_t  projected_minus_observed_cycles = 0;
-  uint32_t target_counter32_at_event = 0;
-  uint16_t target_hardware16_at_event = 0;
-  uint16_t observed_hardware16_at_event = 0;
-  uint64_t slope_q16_cycles_per_sample = 0;
-  int64_t  slope_delta_q16_cycles_per_sample = 0;
-  uint32_t interval_cycles = 0;
-  int32_t  residual_cycles = 0;
-  uint32_t welford_n = 0;
-  int32_t  welford_mean_q16_cycles = 0;
-  uint32_t welford_stddev_q16_cycles = 0;
-  uint32_t welford_stderr_q16_cycles = 0;
-  int32_t  welford_min_cycles = 0;
-  int32_t  welford_max_cycles = 0;
-};
-
-struct slopefinder_lane_t {
-  interrupt_subscriber_kind_t kind = interrupt_subscriber_kind_t::NONE;
-  const char* name = "";
-
-  slopefinder_block_t blocks[SLOPEFINDER_WINDOW_SECONDS]{};
-  uint32_t current_block_index = 0;
-  uint32_t valid_block_count = 0;
-
-  bool     bootstrap_seed_valid = false;
-  uint32_t bootstrap_seed_dwt = 0;
-  uint32_t bootstrap_prev_dwt = 0;
-  uint32_t bootstrap_sample_count = 0;
-  uint64_t bootstrap_accumulated_cycles = 0;
-
-  bool     model_initialized = false;
-  uint64_t model_dwt_q16 = 0;
-  uint64_t slope_q16_cycles_per_sample = 0;
-  uint32_t total_sample_count = 0;
-  uint32_t update_count = 0;
-  uint32_t reset_count = 0;
-  uint32_t soft_residual_count = 0;
-  uint32_t gross_residual_count = 0;
-  uint32_t gross_residual_streak = 0;
-  uint32_t reacquire_count = 0;
-  uint32_t bootstrap_naive_count = 0;
-  uint32_t bootstrap_default_count = 0;
-  int32_t  bootstrap_naive_minus_default_cps = 0;
-
-  bool     slopefinder_seen_valid_estimate = false;
-  uint32_t slopefinder_valid_estimate_count = 0;
-
-  slopefinder_result_t last{};
-};
-
-static slopefinder_lane_t g_slopefinder_vclock;
-static slopefinder_lane_t g_slopefinder_ocxo1;
-static slopefinder_lane_t g_slopefinder_ocxo2;
-static bool g_interrupt_feature_slopefinder_latched_nominal = false;
-
-static slopefinder_lane_t* slopefinder_lane_for(
-    interrupt_subscriber_kind_t kind) {
-  switch (kind) {
-    case interrupt_subscriber_kind_t::VCLOCK: return &g_slopefinder_vclock;
-    case interrupt_subscriber_kind_t::OCXO1:  return &g_slopefinder_ocxo1;
-    case interrupt_subscriber_kind_t::OCXO2:  return &g_slopefinder_ocxo2;
-    default: return nullptr;
-  }
-}
-
-static uint32_t slopefinder_dwt_from_q16(uint64_t q16) {
-  return (uint32_t)(((q16 + 32768ULL) & SLOPEFINDER_DWT_Q16_MASK) >> 16);
-}
-
-static void slopefinder_add_signed_q16(uint64_t& q16, int64_t delta_q16) {
-  if (delta_q16 >= 0) {
-    q16 = (q16 + (uint64_t)delta_q16) & SLOPEFINDER_DWT_Q16_MASK;
-  } else {
-    q16 = (q16 - (uint64_t)(-delta_q16)) & SLOPEFINDER_DWT_Q16_MASK;
-  }
-}
-
-static uint32_t slopefinder_interval_cycles_from_slope(uint64_t slope_q16) {
-  const uint64_t cycles =
-      (slope_q16 * (uint64_t)SLOPEFINDER_SAMPLE_RATE_HZ + 32768ULL) >> 16;
-  return (cycles > (uint64_t)UINT32_MAX) ? UINT32_MAX : (uint32_t)cycles;
-}
-
-static uint64_t slopefinder_gcd_u64(uint64_t a, uint64_t b) {
-  while (b != 0ULL) {
-    const uint64_t r = a % b;
-    a = b;
-    b = r;
-  }
-  return a ? a : 1ULL;
-}
-
-static int64_t slopefinder_scaled_div_q16(int64_t numerator,
-                                          uint64_t denominator) {
-  if (denominator == 0ULL || numerator == 0LL) return 0LL;
-
-  const bool negative = numerator < 0;
-  uint64_t magnitude = negative
-      ? (uint64_t)(-(numerator + 1LL)) + 1ULL
-      : (uint64_t)numerator;
-  uint64_t scale = 65536ULL;
-
-  uint64_t g = slopefinder_gcd_u64(magnitude, denominator);
-  magnitude /= g;
-  denominator /= g;
-
-  g = slopefinder_gcd_u64(scale, denominator);
-  scale /= g;
-  denominator /= g;
-
-  if (magnitude > (uint64_t)INT64_MAX / scale) {
-    const double q16 =
-        ((double)magnitude * (double)scale) / (double)denominator;
-    if (q16 >= (double)INT64_MAX) {
-      return negative ? INT64_MIN : INT64_MAX;
-    }
-    const int64_t rounded = (int64_t)(q16 + 0.5);
-    return negative ? -rounded : rounded;
-  }
-
-  const uint64_t q = (magnitude * scale) / denominator;
-  if (q > (uint64_t)INT64_MAX) {
-    return negative ? INT64_MIN : INT64_MAX;
-  }
-  return negative ? -(int64_t)q : (int64_t)q;
-}
-
-static bool slopefinder_slope_sane(int64_t slope_q16) {
-  if (slope_q16 <= 0) return false;
-  const int64_t default_slope_q16 = (int64_t)lower_env_default_slope_q16();
-  if (default_slope_q16 <= 0) return true;
-  return slope_q16 >= default_slope_q16 / 2 &&
-         slope_q16 <= default_slope_q16 * 2;
-}
-
-static uint32_t slopefinder_abs_i32(int32_t value) {
-  return value < 0 ? (uint32_t)(-(int64_t)value) : (uint32_t)value;
-}
-
-static uint64_t slopefinder_choose_bootstrap_slope_q16(
-    slopefinder_lane_t& lane,
-    uint64_t naive_slope_q16) {
-  const uint64_t default_slope_q16 = lower_env_default_slope_q16();
-  if (default_slope_q16 == 0ULL) {
-    lane.bootstrap_naive_count++;
-    lane.bootstrap_naive_minus_default_cps = 0;
-    return naive_slope_q16 ? naive_slope_q16 : lower_env_default_slope_q16();
-  }
-
-  const uint32_t naive_cps =
-      slopefinder_interval_cycles_from_slope(naive_slope_q16);
-  const uint32_t default_cps =
-      slopefinder_interval_cycles_from_slope(default_slope_q16);
-  const int32_t diff = (naive_cps >= default_cps)
-      ? (int32_t)(naive_cps - default_cps)
-      : -(int32_t)(default_cps - naive_cps);
-  lane.bootstrap_naive_minus_default_cps = diff;
-
-  // The OCXO-vs-GNSS frequency difference should be ppb-scale.  A bootstrap
-  // slope hundreds of cycles/second away from the PPS/GPIO DWT ruler is almost
-  // certainly an endpoint/latency/cadence artifact, so start from the trusted
-  // ruler and let residual regression learn the small per-lane correction.
-  if (slopefinder_abs_i32(diff) >
-      SLOPEFINDER_BOOTSTRAP_DEFAULT_GATE_CYCLES_PER_SECOND) {
-    lane.bootstrap_default_count++;
-    return default_slope_q16;
-  }
-
-  lane.bootstrap_naive_count++;
-  return naive_slope_q16 ? naive_slope_q16 : default_slope_q16;
-}
-
-static void slopefinder_begin_blocks(slopefinder_lane_t& lane);
-
-static void slopefinder_reacquire_from_observation(slopefinder_lane_t& lane,
-                                                   uint32_t observed_dwt) {
-  lane.model_dwt_q16 = ((uint64_t)observed_dwt << 16) &
-                       SLOPEFINDER_DWT_Q16_MASK;
-  lane.slope_q16_cycles_per_sample = lower_env_default_slope_q16();
-  lane.gross_residual_streak = 0;
-  lane.reacquire_count++;
-  slopefinder_begin_blocks(lane);
-}
-
-static void slopefinder_clear_block(slopefinder_block_t& b) {
-  b = slopefinder_block_t{};
-  b.valid = true;
-}
-
-static void slopefinder_begin_blocks(slopefinder_lane_t& lane) {
-  for (uint32_t i = 0; i < SLOPEFINDER_WINDOW_SECONDS; i++) {
-    lane.blocks[i] = slopefinder_block_t{};
-  }
-  lane.current_block_index = 0;
-  lane.valid_block_count = 1;
-  slopefinder_clear_block(lane.blocks[lane.current_block_index]);
-}
-
-static void slopefinder_advance_block(slopefinder_lane_t& lane) {
-  lane.current_block_index =
-      (lane.current_block_index + 1U) % SLOPEFINDER_WINDOW_SECONDS;
-  if (lane.valid_block_count < SLOPEFINDER_WINDOW_SECONDS) {
-    lane.valid_block_count++;
-  }
-  slopefinder_clear_block(lane.blocks[lane.current_block_index]);
-}
-
-static void slopefinder_add_residual_sample(slopefinder_lane_t& lane,
-                                            int32_t residual_cycles) {
-  slopefinder_block_t& b = lane.blocks[lane.current_block_index];
-  const uint32_t x = b.sample_count;
-  const uint32_t abs_residual = lower_env_abs_i32(residual_cycles);
-
-  if (b.sample_count == 0) {
-    b.residual_min_cycles = residual_cycles;
-    b.residual_max_cycles = residual_cycles;
-  } else {
-    if (residual_cycles < b.residual_min_cycles) {
-      b.residual_min_cycles = residual_cycles;
-    }
-    if (residual_cycles > b.residual_max_cycles) {
-      b.residual_max_cycles = residual_cycles;
-    }
-  }
-
-  b.sample_count++;
-  b.sum_x += (uint64_t)x;
-  b.sum_xx += (uint64_t)x * (uint64_t)x;
-  b.sum_residual_cycles += (int64_t)residual_cycles;
-  b.sum_x_residual_cycles += (int64_t)x * (int64_t)residual_cycles;
-  b.sum_residual_square_cycles +=
-      (uint64_t)abs_residual * (uint64_t)abs_residual;
-}
-
-static bool slopefinder_compute_window(const slopefinder_lane_t& lane,
-                                       slopefinder_window_stats_t& out,
-                                       bool full_stats) {
-  out = slopefinder_window_stats_t{};
-
-  uint64_t n = 0;
-  uint64_t sum_x = 0;
-  uint64_t sum_xx = 0;
-  int64_t sum_y = 0;
-  int64_t sum_xy = 0;
-  uint64_t sum_y2 = 0;
-  int32_t min_y = INT32_MAX;
-  int32_t max_y = INT32_MIN;
-
-  uint64_t base_x = 0;
-  const uint32_t count = lane.valid_block_count;
-  for (uint32_t age = count; age > 0; age--) {
-    const uint32_t idx =
-        (lane.current_block_index + SLOPEFINDER_WINDOW_SECONDS - (age - 1U)) %
-        SLOPEFINDER_WINDOW_SECONDS;
-    const slopefinder_block_t& b = lane.blocks[idx];
-    if (!b.valid || b.sample_count == 0U) continue;
-
-    const uint64_t bn = b.sample_count;
-    n += bn;
-    sum_x += base_x * bn + b.sum_x;
-    sum_xx += base_x * base_x * bn + 2ULL * base_x * b.sum_x + b.sum_xx;
-    sum_y += b.sum_residual_cycles;
-    sum_xy += (int64_t)base_x * b.sum_residual_cycles +
-              b.sum_x_residual_cycles;
-    sum_y2 += b.sum_residual_square_cycles;
-    if (b.residual_min_cycles < min_y) min_y = b.residual_min_cycles;
-    if (b.residual_max_cycles > max_y) max_y = b.residual_max_cycles;
-    base_x += bn;
-  }
-
-  if (n == 0ULL || n > (uint64_t)UINT32_MAX) {
-    return false;
-  }
-
-  out.n = (uint32_t)n;
-  out.min_cycles = (min_y == INT32_MAX) ? 0 : min_y;
-  out.max_cycles = (max_y == INT32_MIN) ? 0 : max_y;
-  out.mean_q16_cycles = (int32_t)((sum_y * 65536LL) / (int64_t)n);
-
-  if (full_stats) {
-    const double nd = (double)n;
-    double variance = 0.0;
-    if (n >= 2ULL) {
-      const double sum = (double)sum_y;
-      variance = ((double)sum_y2 - (sum * sum) / nd) / (nd - 1.0);
-      if (variance < 0.0) variance = 0.0;
-    }
-    const double sd = sqrt(variance);
-    out.stddev_q16_cycles = (uint32_t)(sd * 65536.0 + 0.5);
-    out.stderr_q16_cycles = (uint32_t)((sd / sqrt(nd)) * 65536.0 + 0.5);
-  }
-
-  if (n >= 2ULL) {
-    const uint64_t denom = n * sum_xx - sum_x * sum_x;
-    if (denom != 0ULL) {
-      const int64_t numerator =
-          (int64_t)n * sum_xy - (int64_t)sum_x * sum_y;
-      out.slope_delta_q16_cycles_per_sample =
-          slopefinder_scaled_div_q16(numerator, denom);
-    }
-  }
-
-  return true;
-}
-
-static void slopefinder_note_valid_estimate(slopefinder_lane_t& lane) {
-  lane.slopefinder_seen_valid_estimate = true;
-  if (lane.slopefinder_valid_estimate_count != UINT32_MAX) {
-    lane.slopefinder_valid_estimate_count++;
-  }
-  interrupt_feature_update_slopefinder();
-}
-
-static bool interrupt_feature_slopefinder_lane_nominal(
-    interrupt_subscriber_kind_t kind) {
-  const slopefinder_lane_t* lane = slopefinder_lane_for(kind);
-  return lane && lane->slopefinder_seen_valid_estimate;
-}
-
-static void interrupt_feature_update_slopefinder(void) {
-  if (g_interrupt_feature_slopefinder_latched_nominal) {
-    interrupt_feature_set_cached("SLOPEFINDER",
-                                 g_interrupt_feature_slopefinder,
-                                 system_feature_status_t::NOMINAL);
-    return;
-  }
-
-  const bool v_ok = interrupt_feature_slopefinder_lane_nominal(
-      interrupt_subscriber_kind_t::VCLOCK);
-  const bool o1_ok = !interrupt_feature_lane_required(interrupt_subscriber_kind_t::OCXO1) ||
-      interrupt_feature_slopefinder_lane_nominal(interrupt_subscriber_kind_t::OCXO1);
-  const bool o2_ok = !interrupt_feature_lane_required(interrupt_subscriber_kind_t::OCXO2) ||
-      interrupt_feature_slopefinder_lane_nominal(interrupt_subscriber_kind_t::OCXO2);
-
-  if (v_ok && o1_ok && o2_ok) {
-    g_interrupt_feature_slopefinder_latched_nominal = true;
-    interrupt_feature_set_cached("SLOPEFINDER",
-                                 g_interrupt_feature_slopefinder,
-                                 system_feature_status_t::NOMINAL);
-    return;
-  }
-
-  interrupt_feature_set_cached("SLOPEFINDER",
-                               g_interrupt_feature_slopefinder,
-                               system_feature_status_t::INITIALIZING);
-}
-
-static void slopefinder_reset_lane(interrupt_subscriber_kind_t kind) {
-  slopefinder_lane_t* lane = slopefinder_lane_for(kind);
-  if (!lane) return;
-  const char* name = lane->name;
-  *lane = slopefinder_lane_t{};
-  lane->kind = kind;
-  lane->name = name;
-  lane->reset_count++;
-  interrupt_feature_update_slopefinder();
-}
-
-static void slopefinder_reset_all(void) {
-  g_interrupt_feature_slopefinder_latched_nominal = false;
-  g_slopefinder_vclock = slopefinder_lane_t{};
-  g_slopefinder_vclock.kind = interrupt_subscriber_kind_t::VCLOCK;
-  g_slopefinder_vclock.name = "vclock";
-  g_slopefinder_ocxo1 = slopefinder_lane_t{};
-  g_slopefinder_ocxo1.kind = interrupt_subscriber_kind_t::OCXO1;
-  g_slopefinder_ocxo1.name = "ocxo1";
-  g_slopefinder_ocxo2 = slopefinder_lane_t{};
-  g_slopefinder_ocxo2.kind = interrupt_subscriber_kind_t::OCXO2;
-  g_slopefinder_ocxo2.name = "ocxo2";
-  interrupt_feature_update_slopefinder();
-}
-
-static void slopefinder_bootstrap_sample(slopefinder_lane_t& lane,
-                                         uint32_t observed_dwt) {
-  if (!lane.bootstrap_seed_valid) {
-    lane.bootstrap_seed_valid = true;
-    lane.bootstrap_seed_dwt = observed_dwt;
-    lane.bootstrap_prev_dwt = observed_dwt;
-    lane.bootstrap_sample_count = 0;
-    lane.bootstrap_accumulated_cycles = 0;
-    return;
-  }
-
-  lane.bootstrap_accumulated_cycles +=
-      (uint64_t)((uint32_t)(observed_dwt - lane.bootstrap_prev_dwt));
-  lane.bootstrap_prev_dwt = observed_dwt;
-  if (lane.bootstrap_sample_count != UINT32_MAX) {
-    lane.bootstrap_sample_count++;
-  }
-
-  if (lane.bootstrap_sample_count < SLOPEFINDER_BOOTSTRAP_SAMPLES) {
-    return;
-  }
-
-  const uint64_t naive_slope_q16 =
-      (lane.bootstrap_accumulated_cycles << 16) /
-      (uint64_t)lane.bootstrap_sample_count;
-  lane.slope_q16_cycles_per_sample =
-      slopefinder_choose_bootstrap_slope_q16(lane, naive_slope_q16);
-  lane.model_dwt_q16 = ((uint64_t)observed_dwt << 16) &
-                       SLOPEFINDER_DWT_Q16_MASK;
-  lane.model_initialized = true;
-  lane.total_sample_count = 0;
-  slopefinder_begin_blocks(lane);
-}
-
-static void slopefinder_observe(interrupt_subscriber_kind_t kind,
-                                uint32_t observed_dwt,
-                                uint32_t target_counter32,
-                                uint16_t target_hw16,
-                                uint16_t observed_hw16,
-                                bool closes_second) {
-  slopefinder_lane_t* lane = slopefinder_lane_for(kind);
-  if (!lane) return;
-
-  if (!lane->model_initialized) {
-    slopefinder_bootstrap_sample(*lane, observed_dwt);
-    return;
-  }
-
-  slopefinder_add_signed_q16(lane->model_dwt_q16,
-                             (int64_t)lane->slope_q16_cycles_per_sample);
-  const uint32_t projected_dwt =
-      slopefinder_dwt_from_q16(lane->model_dwt_q16);
-  const int32_t residual_cycles =
-      lower_env_signed_delta_u32(projected_dwt, observed_dwt);
-  const uint32_t abs_residual = lower_env_abs_i32(residual_cycles);
-  const bool residual_soft =
-      abs_residual > SLOPEFINDER_MODEL_SOFT_GATE_CYCLES;
-  const bool residual_admitted =
-      abs_residual <= SLOPEFINDER_MODEL_HARD_GATE_CYCLES;
-
-  if (residual_soft && lane->soft_residual_count != UINT32_MAX) {
-    lane->soft_residual_count++;
-  }
-
-  if (!residual_admitted && lane->gross_residual_count != UINT32_MAX) {
-    lane->gross_residual_count++;
-  }
-
-  if (abs_residual > SLOPEFINDER_REACQUIRE_GATE_CYCLES) {
-    if (lane->gross_residual_streak != UINT32_MAX) {
-      lane->gross_residual_streak++;
-    }
-  } else {
-    lane->gross_residual_streak = 0;
-  }
-
-  lane->total_sample_count++;
-  if (residual_admitted) {
-    slopefinder_add_residual_sample(*lane, residual_cycles);
-  }
-
-  if (!residual_admitted &&
-      lane->gross_residual_streak >= SLOPEFINDER_REACQUIRE_STREAK_SAMPLES) {
-    // A sustained, same-model miss is no longer a random outlier.  It is proof
-    // that the diagnostic model has lost the rail.  Reacquire from the trusted
-    // PPS/GPIO DWT ruler instead of letting SlopeFinder go silent forever.
-    slopefinder_reacquire_from_observation(*lane, observed_dwt);
-  }
-
-  slopefinder_window_stats_t stats{};
-  const bool stats_ok = slopefinder_compute_window(*lane, stats, closes_second);
-  const bool window_ready = stats_ok &&
-      stats.n >= SLOPEFINDER_MIN_WINDOW_SAMPLES;
-
-  int64_t residual_slope_q16 = stats_ok
-      ? stats.slope_delta_q16_cycles_per_sample
-      : 0LL;
-  if (window_ready && residual_admitted) {
-    const int64_t applied_slope_update =
-        residual_slope_q16 >> SLOPEFINDER_SLOPE_GAIN_SHIFT;
-    const int64_t proposed_slope =
-        (int64_t)lane->slope_q16_cycles_per_sample + applied_slope_update;
-    if (slopefinder_slope_sane(proposed_slope)) {
-      lane->slope_q16_cycles_per_sample = (uint64_t)proposed_slope;
-    }
-
-    const int64_t phase_update_q16 =
-        ((int64_t)stats.mean_q16_cycles) >> SLOPEFINDER_PHASE_GAIN_SHIFT;
-    slopefinder_add_signed_q16(lane->model_dwt_q16, phase_update_q16);
-  }
-
-  slopefinder_result_t r{};
-  r.valid = window_ready;
-  r.sequence = ++lane->update_count;
-  r.window_seconds = SLOPEFINDER_WINDOW_SECONDS;
-  r.window_sample_count = stats_ok ? stats.n : 0U;
-  r.total_sample_count = lane->total_sample_count;
-  r.observed_dwt_at_event = observed_dwt;
-  r.projected_dwt_at_event = projected_dwt;
-  r.projected_minus_observed_cycles =
-      lower_env_signed_delta_u32(observed_dwt, projected_dwt);
-  r.target_counter32_at_event = target_counter32;
-  r.target_hardware16_at_event = target_hw16;
-  r.observed_hardware16_at_event = observed_hw16;
-  r.slope_q16_cycles_per_sample = lane->slope_q16_cycles_per_sample;
-  r.slope_delta_q16_cycles_per_sample = residual_slope_q16;
-  r.interval_cycles =
-      slopefinder_interval_cycles_from_slope(lane->slope_q16_cycles_per_sample);
-  r.residual_cycles = residual_cycles;
-  r.welford_n = stats_ok ? stats.n : 0U;
-  r.welford_mean_q16_cycles = stats_ok ? stats.mean_q16_cycles : 0;
-  r.welford_stddev_q16_cycles = stats_ok ? stats.stddev_q16_cycles : 0U;
-  r.welford_stderr_q16_cycles = stats_ok ? stats.stderr_q16_cycles : 0U;
-  r.welford_min_cycles = stats_ok ? stats.min_cycles : 0;
-  r.welford_max_cycles = stats_ok ? stats.max_cycles : 0;
-  lane->last = r;
-
-  if (r.valid) {
-    slopefinder_note_valid_estimate(*lane);
-  }
-
-  slopefinder_block_t& current = lane->blocks[lane->current_block_index];
-  if (closes_second || current.sample_count >= SLOPEFINDER_SAMPLE_RATE_HZ) {
-    slopefinder_advance_block(*lane);
-  }
-}
-
-static bool slopefinder_latest_result(interrupt_subscriber_kind_t kind,
-                                      slopefinder_result_t* out) {
-  if (!out) return false;
-  slopefinder_lane_t* lane = slopefinder_lane_for(kind);
-  if (!lane) {
-    *out = slopefinder_result_t{};
-    return false;
-  }
-  *out = lane->last;
-  return out->valid;
-}
-
-static void copy_slopefinder_diag(interrupt_capture_diag_t& diag,
-                                  const slopefinder_result_t* r) {
-  if (!r) return;
-  diag.slopefinder_valid = r->valid;
-  diag.slopefinder_sequence = r->sequence;
-  diag.slopefinder_window_seconds = r->window_seconds;
-  diag.slopefinder_window_sample_count = r->window_sample_count;
-  diag.slopefinder_total_sample_count = r->total_sample_count;
-  diag.slopefinder_observed_dwt_at_event = r->observed_dwt_at_event;
-  diag.slopefinder_projected_dwt_at_event = r->projected_dwt_at_event;
-  diag.slopefinder_projected_minus_observed_cycles =
-      r->projected_minus_observed_cycles;
-  diag.slopefinder_target_counter32_at_event = r->target_counter32_at_event;
-  diag.slopefinder_target_hardware16_at_event =
-      r->target_hardware16_at_event;
-  diag.slopefinder_observed_hardware16_at_event =
-      r->observed_hardware16_at_event;
-  diag.slopefinder_slope_q16_cycles_per_sample =
-      r->slope_q16_cycles_per_sample;
-  diag.slopefinder_slope_delta_q16_cycles_per_sample =
-      r->slope_delta_q16_cycles_per_sample;
-  diag.slopefinder_interval_cycles = r->interval_cycles;
-  diag.slopefinder_residual_cycles = r->residual_cycles;
-  diag.slopefinder_welford_n = r->welford_n;
-  diag.slopefinder_welford_mean_q16_cycles = r->welford_mean_q16_cycles;
-  diag.slopefinder_welford_stddev_q16_cycles = r->welford_stddev_q16_cycles;
-  diag.slopefinder_welford_stderr_q16_cycles = r->welford_stderr_q16_cycles;
-  diag.slopefinder_welford_min_cycles = r->welford_min_cycles;
-  diag.slopefinder_welford_max_cycles = r->welford_max_cycles;
-}
-
 static void lower_env_clear_active(lower_env_lane_t& lane) {
   for (uint32_t i = 0; i < LOWER_ENV_BUCKET_COUNT; i++) {
     lane.buckets[i] = lower_env_bucket_t{};
@@ -5997,13 +5355,6 @@ static void cadence_regression_observe(interrupt_subscriber_kind_t kind,
                                        uint16_t target_hw16,
                                        uint16_t observed_hw16,
                                        bool closes_second) {
-  slopefinder_observe(kind,
-                      observed_dwt,
-                      target_counter32,
-                      target_hw16,
-                      observed_hw16,
-                      closes_second);
-
   lower_env_lane_t* lane = lower_env_lane_for(kind);
   if (!lane) return;
 
@@ -6083,11 +5434,9 @@ static bool cadence_regression_latest_result(interrupt_subscriber_kind_t kind,
 
 static inline void cadence_regression_reset_kind(interrupt_subscriber_kind_t kind) {
   lower_env_reset_lane(kind);
-  slopefinder_reset_lane(kind);
 }
 static inline void cadence_regression_reset_all(void) {
   lower_env_reset_all();
-  slopefinder_reset_all();
 }
 static inline void copy_regression_diag(interrupt_capture_diag_t& diag,
                                         const cadence_regression_result_t* r) {
@@ -6273,8 +5622,7 @@ static void emit_one_second_event(interrupt_subscriber_runtime_t& rt,
                                   bool     pps_coincidence_valid  = false,
                                   const dwt_repair_diag_t* repair = nullptr,
                                   bool dispatch_immediately = false,
-                                  const cadence_regression_result_t* regression = nullptr,
-                                  const slopefinder_result_t* slopefinder = nullptr) {
+                                  const cadence_regression_result_t* regression = nullptr) {
   if (!rt.active) return;
 
   interrupt_event_t event {};
@@ -6308,7 +5656,6 @@ static void emit_one_second_event(interrupt_subscriber_runtime_t& rt,
   interrupt_capture_diag_t diag {};
   fill_diag(diag, rt, event);
   copy_regression_diag(diag, regression);
-  copy_slopefinder_diag(diag, slopefinder);
   if (repair) {
     diag.dwt_synthetic = repair->synthetic;
     diag.dwt_repair_candidate = repair->candidate;
@@ -6861,9 +6208,6 @@ static void vclock_apply_perishable_fact_deferred(
   cadence_regression_result_t lower_env{};
   (void)cadence_regression_latest_result(interrupt_subscriber_kind_t::VCLOCK,
                                          &lower_env);
-  slopefinder_result_t slopefinder{};
-  (void)slopefinder_latest_result(interrupt_subscriber_kind_t::VCLOCK,
-                                  &slopefinder);
   copy_floorline_interval_to_diag(dwt_diag, lower_env);
 
   const uint32_t published_dwt =
@@ -6908,8 +6252,7 @@ static void vclock_apply_perishable_fact_deferred(
                         coincidence_valid,
                         &dwt_diag,
                         true,
-                        &lower_env,
-                        &slopefinder);
+                        &lower_env);
 
   pps_edge_dispatch_arm_or_call_from_foreground("PPS_VCLOCK_DISPATCH");
 }
@@ -7499,9 +6842,6 @@ static void vclock_heartbeat_native_service(uint32_t isr_entry_dwt_raw,
       cadence_regression_result_t lower_env{};
       (void)cadence_regression_latest_result(interrupt_subscriber_kind_t::VCLOCK,
                                              &lower_env);
-      slopefinder_result_t slopefinder{};
-      (void)slopefinder_latest_result(interrupt_subscriber_kind_t::VCLOCK,
-                                      &slopefinder);
       copy_floorline_interval_to_diag(dwt_diag, lower_env);
       const uint32_t published_dwt =
           vclock_published_dwt_at_edge(observed_dwt, lower_env);
@@ -7524,7 +6864,7 @@ static void vclock_heartbeat_native_service(uint32_t isr_entry_dwt_raw,
       emit_one_second_event(*g_rt_vclock, published_dwt,
                             target_counter32,
                             coincidence_cycles, coincidence_valid, &dwt_diag,
-                            false, &lower_env, &slopefinder);
+                            false, &lower_env);
 
       pps_edge_dispatch_arm_or_call_from_foreground("PPS_VCLOCK_DISPATCH");
 
@@ -8516,8 +7856,6 @@ static void ocxo_apply_perishable_fact_deferred(
 
   cadence_regression_result_t lower_env{};
   (void)cadence_regression_latest_result(ctx.kind, &lower_env);
-  slopefinder_result_t slopefinder{};
-  (void)slopefinder_latest_result(ctx.kind, &slopefinder);
   copy_floorline_interval_to_diag(dwt_diag, lower_env);
   const uint32_t published_dwt =
       ocxo_published_dwt_at_edge(observed_dwt, lower_env);
@@ -8588,8 +7926,7 @@ static void ocxo_apply_perishable_fact_deferred(
                         false,
                         &dwt_diag,
                         true,
-                        &lower_env,
-                        &slopefinder);
+                        &lower_env);
 
 }
 
