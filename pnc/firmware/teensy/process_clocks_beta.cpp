@@ -557,6 +557,31 @@ static volatile campaign_warmup_mode_t g_campaign_warmup_mode =
 static volatile uint32_t g_campaign_warmup_remaining = 0;
 static volatile uint32_t g_campaign_warmup_suppressed_total = 0;
 
+// START science prologue.  These are internal PPS candidates after SmartZero
+// has installed the epoch but before public campaign time begins.  They are
+// not hidden TIMEBASE rows: campaign_seconds remains zero.  The prologue
+// establishes a valid conceptual PPS0/bookend, then probes the next candidate
+// so public PPS1 can carry a fully qualified Delta/FloorLine science sample
+// and enter Welford as n=1.
+static constexpr uint32_t CLOCKS_START_PROLOGUE_FIT_ENDPOINT_GATE_CYCLES = 16U;
+static constexpr uint32_t CLOCKS_START_PROLOGUE_MAX_PRIVATE_CANDIDATES = 0xFFFFFFFFUL;
+static volatile bool     g_start_prologue_seeded = false;
+static volatile bool     g_start_prologue_reference_ready = false;
+static volatile uint32_t g_start_prologue_private_candidate_count = 0;
+static volatile uint32_t g_start_prologue_release_count = 0;
+static volatile uint32_t g_start_prologue_last_private_count = 0;
+static volatile uint32_t g_start_prologue_last_release_public_count = 0;
+static volatile uint32_t g_start_prologue_private_limit_count = 0;
+static char              g_start_prologue_last_reason[64] = "reset";
+static volatile bool     g_start_prologue_pps0_interval_valid = false;
+static volatile uint32_t g_start_prologue_pps0_pps_obs = 0;
+static volatile uint32_t g_start_prologue_pps0_v_obs = 0;
+static volatile uint32_t g_start_prologue_pps0_v_fl = 0;
+static volatile uint32_t g_start_prologue_pps0_o1_obs = 0;
+static volatile uint32_t g_start_prologue_pps0_o1_fl = 0;
+static volatile uint32_t g_start_prologue_pps0_o2_obs = 0;
+static volatile uint32_t g_start_prologue_pps0_o2_fl = 0;
+
 // Campaign-public continuity transform.
 //
 // Alpha owns the live service/epoch ledgers.  Beta owns campaign presentation:
@@ -629,11 +654,14 @@ static floorline_science_totals_t g_floorline_science_ocxo1 = {};
 static floorline_science_totals_t g_floorline_science_ocxo2 = {};
 
 struct delta_residual_reference_t {
+  bool     captured = false;
   bool     raw_valid = false;
   bool     floorline_valid = false;
   uint32_t public_count = 0;
   uint32_t raw_interval_cycles = 0;
   uint32_t floorline_interval_cycles = 0;
+  uint32_t floorline_fit_interval_cycles = 0;
+  int32_t  floorline_fit_minus_endpoint_cycles = 0;
 };
 
 struct delta_residual_bookend_t {
@@ -663,6 +691,7 @@ struct clock_science_row_t {
   bool     clock_floorline_valid = false;
   uint32_t clock_floorline_dwt_at_edge = 0;
   uint32_t clock_floorline_interval_cycles = 0;
+  uint32_t clock_floorline_endpoint_interval_cycles = 0;
   uint32_t clock_published_dwt_at_edge = 0;
   uint32_t clock_raw_dwt_at_edge = 0;
   uint32_t clock_observed_interval_cycles = 0;
@@ -1020,6 +1049,29 @@ static bool campaign_start_handoff_ready(void) {
   return g_start_handoff_last_ready;
 }
 
+static void campaign_start_prologue_reset(const char* reason) {
+  g_start_prologue_seeded = false;
+  g_start_prologue_reference_ready = false;
+  g_start_prologue_private_candidate_count = 0;
+  g_start_prologue_last_private_count = 0;
+  g_start_prologue_last_release_public_count = 0;
+  g_start_prologue_release_count = 0;
+  g_start_prologue_private_limit_count = 0;
+  g_start_prologue_pps0_interval_valid = false;
+  g_start_prologue_pps0_pps_obs = 0;
+  g_start_prologue_pps0_v_obs = 0;
+  g_start_prologue_pps0_v_fl = 0;
+  g_start_prologue_pps0_o1_obs = 0;
+  g_start_prologue_pps0_o1_fl = 0;
+  g_start_prologue_pps0_o2_obs = 0;
+  g_start_prologue_pps0_o2_fl = 0;
+  safeCopy(g_start_prologue_last_reason,
+           sizeof(g_start_prologue_last_reason),
+           reason ? reason : "reset");
+}
+
+static bool campaign_start_prologue_should_hold(void);
+
 static void campaign_warmup_begin(campaign_warmup_mode_t mode) {
   g_campaign_warmup_suppressed_total = 0;
 
@@ -1028,27 +1080,25 @@ static void campaign_warmup_begin(campaign_warmup_mode_t mode) {
     // offsets now; the next selected PPS/VCLOCK edge publishes base+1.
     g_campaign_warmup_mode = campaign_warmup_mode_t::NONE;
     g_campaign_warmup_remaining = 0;
+    campaign_start_prologue_reset("recover_no_prologue");
     campaign_public_offsets_reset_for_recover();
     return;
   }
 
   if (mode == campaign_warmup_mode_t::START) {
-    // START does not suppress rows either.  If the current PPS row is not yet a
-    // safe live handoff species, hold publication before campaign time starts.
-    if (campaign_start_handoff_ready()) {
-      g_campaign_warmup_mode = campaign_warmup_mode_t::NONE;
-      g_campaign_warmup_remaining = 0;
-      campaign_public_offsets_reset_to_current();
-      g_start_handoff_commit_count++;
-    } else {
-      g_campaign_warmup_mode = campaign_warmup_mode_t::START;
-      g_campaign_warmup_remaining = 1;
-    }
+    // START now has a science prologue instead of fixed row burial.  The
+    // prologue consumes private candidate rows until it has established an
+    // internal PPS 0 and the next candidate can publish as science-complete
+    // public PPS 1.  campaign_seconds remains zero while this mode is active.
+    g_campaign_warmup_mode = campaign_warmup_mode_t::START;
+    g_campaign_warmup_remaining = 1;
+    campaign_start_prologue_reset("waiting_for_private_pps0");
     return;
   }
 
   g_campaign_warmup_mode = campaign_warmup_mode_t::NONE;
   g_campaign_warmup_remaining = 0;
+  campaign_start_prologue_reset("none");
   campaign_public_offsets_reset_to_current();
 }
 
@@ -1060,17 +1110,21 @@ static bool campaign_warmup_consume_one_candidate_record(void) {
   if (!campaign_warmup_active()) return false;
 
   if (g_campaign_warmup_mode == campaign_warmup_mode_t::START) {
-    if (!campaign_start_handoff_ready()) {
-      // Not a skipped TIMEBASE row: campaign_seconds is still zero and the
-      // public campaign has not begun.  Wait for the next PPS candidate.
+    if (campaign_start_prologue_should_hold()) {
+      // Private prologue, not a public skipped row.  The candidate was either
+      // used as internal PPS 0/bookend evidence or rejected before campaign
+      // time began.
       g_campaign_warmup_remaining = 1;
       return true;
     }
 
     g_campaign_warmup_mode = campaign_warmup_mode_t::NONE;
     g_campaign_warmup_remaining = 0;
-    campaign_public_offsets_reset_to_current();
-    g_start_handoff_commit_count++;
+    g_start_prologue_release_count++;
+    g_start_prologue_last_release_public_count = 1U;
+    safeCopy(g_start_prologue_last_reason,
+             sizeof(g_start_prologue_last_reason),
+             "release_public_pps1");
     return false;
   }
 
@@ -1084,6 +1138,7 @@ static void campaign_warmup_reset(void) {
   g_campaign_warmup_mode = campaign_warmup_mode_t::NONE;
   g_campaign_warmup_remaining = 0;
   g_campaign_warmup_suppressed_total = 0;
+  campaign_start_prologue_reset("reset");
   campaign_public_offsets_reset_to_current();
 }
 
@@ -2661,6 +2716,7 @@ static delta_residual_reference_t delta_residual_capture_vclock_reference(
     bool vclock_valid,
     const clocks_alpha_lane_forensics_t& vclock_f) {
   delta_residual_reference_t r{};
+  r.captured = true;
   r.public_count = public_count;
 
   if (vclock_valid && vclock_f.dwt_interval_observed_cycles != 0U) {
@@ -2670,12 +2726,20 @@ static delta_residual_reference_t delta_residual_capture_vclock_reference(
 
   const bool vclock_floorline_valid =
       floorline_candidate_present(vclock_valid, vclock_f);
+  r.floorline_fit_interval_cycles = vclock_floorline_valid
+      ? floorline_inferred_interval_cycles(vclock_floorline_valid, vclock_f)
+      : 0U;
   (void)delta_floorline_endpoint_interval(
       g_delta_vclock_bookends,
       vclock_floorline_valid,
       vclock_floorline_valid ? vclock_f.regression_inferred_dwt_at_event : 0U,
       &r.floorline_interval_cycles);
   r.floorline_valid = (r.floorline_interval_cycles != 0U);
+  if (r.floorline_valid && r.floorline_fit_interval_cycles != 0U) {
+    r.floorline_fit_minus_endpoint_cycles =
+        beta_signed_delta_u32(r.floorline_fit_interval_cycles,
+                              r.floorline_interval_cycles);
+  }
   return r;
 }
 
@@ -2687,7 +2751,7 @@ static void delta_residual_apply_one(clock_science_row_t& row,
   row.delta_publication_public_count = row.public_count;
 
   const bool ref_count_aligned =
-      ref.public_count != 0U && ref.public_count + 1U == row.public_count;
+      ref.captured && (ref.public_count + 1U == row.public_count);
 
   if (ref_count_aligned && ref.raw_valid && clock_valid &&
       clock_f.dwt_interval_observed_cycles != 0U) {
@@ -2720,6 +2784,8 @@ static void delta_residual_apply_one(clock_science_row_t& row,
         row.clock_floorline_dwt_at_edge,
         &clock_floorline_endpoint_interval);
   }
+  row.clock_floorline_endpoint_interval_cycles =
+      clock_floorline_endpoint_interval;
 
   if (ref_count_aligned && ref.floorline_valid &&
       clock_floorline_endpoint_interval != 0U) {
@@ -2764,6 +2830,8 @@ static void delta_residual_attach_comparisons(clock_science_row_t& row) {
         row.delta_raw_fast_residual_ns - row.delta_floorline_fast_residual_ns;
   }
 }
+
+
 
 static void floorline_science_attach_totals(clock_science_row_t& row,
                                             const floorline_science_totals_t& totals) {
@@ -2960,6 +3028,251 @@ static clock_science_row_t floorline_science_build_ocxo(
   totals.gnss_interval_total_ns_exact += row.gnss_interval_ns_exact;
   floorline_science_attach_totals(row, totals);
   return row;
+}
+
+
+static uint32_t beta_abs_i32_to_u32(int32_t value) {
+  return (value < 0) ? (uint32_t)(-(int64_t)value) : (uint32_t)value;
+}
+
+static bool beta_abs_i32_within_gate(int32_t value, uint32_t gate) {
+  return beta_abs_i32_to_u32(value) <= gate;
+}
+
+static void campaign_start_prologue_set_reason(const char* reason) {
+  safeCopy(g_start_prologue_last_reason,
+           sizeof(g_start_prologue_last_reason),
+           reason ? reason : "prologue");
+}
+
+static bool campaign_start_prologue_fetch_forensics(
+    clocks_alpha_lane_forensics_t& vclock_f,
+    clocks_alpha_lane_forensics_t& ocxo1_f,
+    clocks_alpha_lane_forensics_t& ocxo2_f,
+    bool& vclock_valid,
+    bool& ocxo1_valid,
+    bool& ocxo2_valid) {
+  vclock_valid = clocks_alpha_lane_forensics(time_clock_id_t::VCLOCK, &vclock_f);
+  ocxo1_valid = clocks_alpha_lane_forensics(time_clock_id_t::OCXO1, &ocxo1_f);
+  ocxo2_valid = clocks_alpha_lane_forensics(time_clock_id_t::OCXO2, &ocxo2_f);
+
+  if (!floorline_candidate_present(vclock_valid, vclock_f) ||
+      !floorline_candidate_present(ocxo1_valid, ocxo1_f) ||
+      !floorline_candidate_present(ocxo2_valid, ocxo2_f)) {
+    campaign_start_prologue_set_reason("waiting_for_floorline_bookends");
+    return false;
+  }
+  return true;
+}
+
+static bool campaign_start_prologue_consume_private_candidate(
+    bool vclock_valid,
+    const clocks_alpha_lane_forensics_t& vclock_f,
+    bool ocxo1_valid,
+    const clocks_alpha_lane_forensics_t& ocxo1_f,
+    bool ocxo2_valid,
+    const clocks_alpha_lane_forensics_t& ocxo2_f,
+    const char* reason) {
+  const bool v_fl = floorline_candidate_present(vclock_valid, vclock_f);
+  const bool o1_fl = floorline_candidate_present(ocxo1_valid, ocxo1_f);
+  const bool o2_fl = floorline_candidate_present(ocxo2_valid, ocxo2_f);
+  if (!v_fl || !o1_fl || !o2_fl) {
+    campaign_start_prologue_set_reason("private_candidate_missing_floorline");
+    return false;
+  }
+
+  // This candidate becomes the current private PPS 0 candidate.  Reset the
+  // public presentation offsets to this edge every time we consume a private
+  // candidate; if the following candidate qualifies, public PPS 1 will be the
+  // one-second interval from this hidden bookend.
+  campaign_public_offsets_reset_to_current();
+
+  const delta_residual_reference_t ref =
+      delta_residual_capture_vclock_reference(0U, vclock_valid, vclock_f);
+
+  uint32_t ocxo1_endpoint_interval = 0U;
+  (void)delta_floorline_endpoint_interval(
+      g_delta_ocxo1_bookends,
+      o1_fl,
+      ocxo1_f.regression_inferred_dwt_at_event,
+      &ocxo1_endpoint_interval);
+  uint32_t ocxo2_endpoint_interval = 0U;
+  (void)delta_floorline_endpoint_interval(
+      g_delta_ocxo2_bookends,
+      o2_fl,
+      ocxo2_f.regression_inferred_dwt_at_event,
+      &ocxo2_endpoint_interval);
+
+  g_start_prologue_pps0_pps_obs =
+      g_pps_dwt_cycles_between_edges_valid
+          ? (uint32_t)g_pps_dwt_cycles_between_edges
+          : 0U;
+  g_start_prologue_pps0_v_obs =
+      vclock_valid ? vclock_f.dwt_interval_observed_cycles : 0U;
+  g_start_prologue_pps0_v_fl = ref.floorline_interval_cycles;
+  g_start_prologue_pps0_o1_obs =
+      ocxo1_valid ? ocxo1_f.dwt_interval_observed_cycles : 0U;
+  g_start_prologue_pps0_o1_fl = ocxo1_endpoint_interval;
+  g_start_prologue_pps0_o2_obs =
+      ocxo2_valid ? ocxo2_f.dwt_interval_observed_cycles : 0U;
+  g_start_prologue_pps0_o2_fl = ocxo2_endpoint_interval;
+  g_start_prologue_pps0_interval_valid =
+      g_start_prologue_pps0_pps_obs != 0U &&
+      ref.floorline_valid &&
+      ocxo1_endpoint_interval != 0U &&
+      ocxo2_endpoint_interval != 0U;
+
+  g_delta_previous_vclock_reference = ref;
+  g_start_prologue_seeded = true;
+  g_start_prologue_reference_ready = ref.floorline_valid;
+  g_start_prologue_private_candidate_count++;
+  g_start_prologue_last_private_count = g_start_prologue_private_candidate_count;
+  campaign_start_prologue_set_reason(reason ? reason : "private_pps0_consumed");
+  return true;
+}
+
+static bool campaign_start_prologue_endpoint_fit_ok(
+    const clock_science_row_t& row) {
+  if (!row.valid || row.clock_floorline_interval_cycles == 0U ||
+      row.delta_floorline_clock_interval_cycles == 0U) {
+    return false;
+  }
+  const int32_t fit_minus_endpoint = beta_signed_delta_u32(
+      row.clock_floorline_interval_cycles,
+      row.delta_floorline_clock_interval_cycles);
+  return beta_abs_i32_within_gate(
+      fit_minus_endpoint,
+      CLOCKS_START_PROLOGUE_FIT_ENDPOINT_GATE_CYCLES);
+}
+
+static bool campaign_start_prologue_reference_fit_ok(
+    const delta_residual_reference_t& ref) {
+  if (!ref.captured || !ref.floorline_valid ||
+      ref.floorline_fit_interval_cycles == 0U ||
+      ref.floorline_interval_cycles == 0U) {
+    return false;
+  }
+  return beta_abs_i32_within_gate(
+      ref.floorline_fit_minus_endpoint_cycles,
+      CLOCKS_START_PROLOGUE_FIT_ENDPOINT_GATE_CYCLES);
+}
+
+static bool campaign_start_prologue_probe_public_pps1(
+    bool vclock_valid,
+    const clocks_alpha_lane_forensics_t& vclock_f,
+    bool ocxo1_valid,
+    const clocks_alpha_lane_forensics_t& ocxo1_f,
+    bool ocxo2_valid,
+    const clocks_alpha_lane_forensics_t& ocxo2_f) {
+  if (!g_start_prologue_seeded || !g_start_prologue_reference_ready) {
+    campaign_start_prologue_set_reason("waiting_for_private_pps0_reference");
+    return false;
+  }
+
+  if (!g_pps_dwt_cycles_between_edges_valid ||
+      g_pps_dwt_cycles_between_edges == 0U) {
+    campaign_start_prologue_set_reason("waiting_for_pps_interval");
+    return false;
+  }
+
+  if (!campaign_start_prologue_reference_fit_ok(g_delta_previous_vclock_reference)) {
+    campaign_start_prologue_set_reason("private_reference_fit_endpoint_mismatch");
+    return false;
+  }
+
+  delta_residual_bookend_t saved_o1 = g_delta_ocxo1_bookends;
+  delta_residual_bookend_t saved_o2 = g_delta_ocxo2_bookends;
+  floorline_science_totals_t scratch_o1{};
+  floorline_science_totals_t scratch_o2{};
+
+  const clock_science_row_t o1 = floorline_science_build_ocxo(
+      time_clock_id_t::OCXO1,
+      1U,
+      CLOCKS_BETA_NS_PER_SECOND,
+      g_delta_previous_vclock_reference,
+      vclock_valid,
+      vclock_f,
+      ocxo1_valid,
+      ocxo1_f,
+      scratch_o1);
+  const clock_science_row_t o2 = floorline_science_build_ocxo(
+      time_clock_id_t::OCXO2,
+      1U,
+      CLOCKS_BETA_NS_PER_SECOND,
+      g_delta_previous_vclock_reference,
+      vclock_valid,
+      vclock_f,
+      ocxo2_valid,
+      ocxo2_f,
+      scratch_o2);
+
+  // Probe only: restore the real bookends so the public path can consume this
+  // exact candidate once, with Welfords/totals still at n=0.
+  g_delta_ocxo1_bookends = saved_o1;
+  g_delta_ocxo2_bookends = saved_o2;
+
+  if (!o1.valid || !o2.valid) {
+    campaign_start_prologue_set_reason("waiting_for_delta_floorline_valid");
+    return false;
+  }
+  if (!campaign_start_prologue_endpoint_fit_ok(o1)) {
+    campaign_start_prologue_set_reason("ocxo1_fit_endpoint_mismatch");
+    return false;
+  }
+  if (!campaign_start_prologue_endpoint_fit_ok(o2)) {
+    campaign_start_prologue_set_reason("ocxo2_fit_endpoint_mismatch");
+    return false;
+  }
+
+  return true;
+}
+
+static bool campaign_start_prologue_should_hold(void) {
+  clocks_alpha_lane_forensics_t vclock_f{};
+  clocks_alpha_lane_forensics_t ocxo1_f{};
+  clocks_alpha_lane_forensics_t ocxo2_f{};
+  bool vclock_valid = false;
+  bool ocxo1_valid = false;
+  bool ocxo2_valid = false;
+
+  if (!campaign_start_handoff_ready()) {
+    campaign_start_prologue_set_reason("waiting_for_start_handoff");
+    return true;
+  }
+
+  if (!campaign_start_prologue_fetch_forensics(vclock_f, ocxo1_f, ocxo2_f,
+                                               vclock_valid, ocxo1_valid,
+                                               ocxo2_valid)) {
+    return true;
+  }
+
+  if (campaign_start_prologue_probe_public_pps1(vclock_valid, vclock_f,
+                                                ocxo1_valid, ocxo1_f,
+                                                ocxo2_valid, ocxo2_f)) {
+    g_start_handoff_commit_count++;
+    return false;
+  }
+
+  const bool private_limit_reached =
+      g_start_prologue_private_candidate_count >=
+      CLOCKS_START_PROLOGUE_MAX_PRIVATE_CANDIDATES;
+  if (private_limit_reached) {
+    g_start_prologue_private_limit_count++;
+  }
+
+  (void)campaign_start_prologue_consume_private_candidate(
+      vclock_valid,
+      vclock_f,
+      ocxo1_valid,
+      ocxo1_f,
+      ocxo2_valid,
+      ocxo2_f,
+      private_limit_reached
+          ? "private_limit_still_holding"
+          : (g_start_prologue_reference_ready
+                ? "private_pps0_refreshed_after_probe_reject"
+                : "private_pps0_seeded"));
+  return true;
 }
 
 static void payload_add_clock_science_common(Payload& science,
@@ -4645,10 +4958,11 @@ void clocks_beta_pps(void) {
 
   // ── Publication handoff wait ──
   //
-  // This is not row burial.  START may hold here only until the live PPS-row
-  // OCXO projection needed to capture public zero is available.  Campaign time
-  // has not advanced, and no public TIMEBASE identity is skipped.  RECOVER
-  // publishes immediately on the first PPS after the recovered base.
+  // This is not row burial.  START may hold here while it builds a private
+  // PPS0 and proves that the next candidate can become a science-complete
+  // public PPS1.  Campaign time has not advanced, Welfords are still empty,
+  // and no public TIMEBASE identity is skipped.  RECOVER publishes immediately
+  // on the first PPS after the recovered base.
   if (campaign_warmup_consume_one_candidate_record()) {
     timebase_build_stage(TIMEBASE_BUILD_STAGE_WARMUP_GATE);
     publish_dac_tick("HANDOFF_WAIT_GATE");
@@ -5138,6 +5452,18 @@ void clocks_beta_pps(void) {
         f.add("pps_obs", g_pps_dwt_cycles_between_edges_valid
                          ? g_pps_dwt_cycles_between_edges
                          : 0U);
+
+        if (g_start_prologue_last_release_public_count == public_count &&
+            g_start_prologue_pps0_interval_valid) {
+          f.add("start_pps0_valid", true);
+          f.add("pps_prev_obs", (uint32_t)g_start_prologue_pps0_pps_obs);
+          f.add("v_prev_obs", (uint32_t)g_start_prologue_pps0_v_obs);
+          f.add("v_prev_fl", (uint32_t)g_start_prologue_pps0_v_fl);
+          f.add("o1_prev_obs", (uint32_t)g_start_prologue_pps0_o1_obs);
+          f.add("o1_prev_fl", (uint32_t)g_start_prologue_pps0_o1_fl);
+          f.add("o2_prev_obs", (uint32_t)g_start_prologue_pps0_o2_obs);
+          f.add("o2_prev_fl", (uint32_t)g_start_prologue_pps0_o2_fl);
+        }
 
         const bool v_ok = vclock_forensics_valid;
         const bool v_fl = floorline_candidate_present(v_ok, vclock_forensics);
@@ -6172,6 +6498,31 @@ static FLASHMEM void add_campaign_payload(Payload& p) {
   p.add("campaign_warmup_remaining", (uint32_t)g_campaign_warmup_remaining);
   p.add("campaign_warmup_suppressed_total",
         (uint32_t)g_campaign_warmup_suppressed_total);
+  p.add("start_prologue_policy", "PRIVATE_PPS0_THEN_FIRST_SCIENCE_PPS1");
+  p.add("start_prologue_seeded", g_start_prologue_seeded);
+  p.add("start_prologue_reference_ready", g_start_prologue_reference_ready);
+  p.add("start_prologue_private_candidate_count",
+        g_start_prologue_private_candidate_count);
+  p.add("start_prologue_release_count", g_start_prologue_release_count);
+  p.add("start_prologue_private_limit_count",
+        g_start_prologue_private_limit_count);
+  p.add("start_prologue_last_private_count",
+        g_start_prologue_last_private_count);
+  p.add("start_prologue_last_release_public_count",
+        g_start_prologue_last_release_public_count);
+  p.add("start_prologue_fit_endpoint_gate_cycles",
+        (uint32_t)CLOCKS_START_PROLOGUE_FIT_ENDPOINT_GATE_CYCLES);
+  p.add("start_prologue_last_reason", g_start_prologue_last_reason);
+  p.add("start_prologue_pps0_interval_valid",
+        (bool)g_start_prologue_pps0_interval_valid);
+  p.add("start_prologue_pps0_pps_obs",
+        (uint32_t)g_start_prologue_pps0_pps_obs);
+  p.add("start_prologue_pps0_v_fl",
+        (uint32_t)g_start_prologue_pps0_v_fl);
+  p.add("start_prologue_pps0_o1_fl",
+        (uint32_t)g_start_prologue_pps0_o1_fl);
+  p.add("start_prologue_pps0_o2_fl",
+        (uint32_t)g_start_prologue_pps0_o2_fl);
   p.add("recover_science_quarantine_required",
         (uint32_t)CLOCKS_RECOVER_SCIENCE_QUARANTINE_ROWS);
   p.add("recover_science_quarantine_remaining",

@@ -34,6 +34,13 @@ Column doctrine:
               pub_interval[n] - pub_interval[n-1].
     *_cΔ      counter32 delta since the previous subscriber event.
 
+First-row PPS0 prologue:
+    Current firmware may publish private start_pps0_* interval evidence in
+    TIMEBASE_FORENSICS.  When present, raw_cycles uses that private PPS0
+    interval as the predecessor for public PPS 1, so p_act and *Δ columns are
+    populated on row 1 instead of showing --- merely because PPS0 was not a
+    public TIMEBASE row.
+
 Core rail columns are always shown for each selected lane so the report shape
 stays stable across current FloorLine firmware builds.  Truly auxiliary columns
 (such as counter32 lineage) are still omitted when absent.
@@ -617,6 +624,70 @@ def pps_count_from_schema(root: Dict[str, Any],
     )
 
 
+def start_pps0_from_schema(root: Dict[str, Any],
+                           frag: Dict[str, Any],
+                           forensic: Dict[str, Any]) -> Dict[str, Any]:
+    """Return private START-prologue PPS0 interval evidence, if present.
+
+    PPS0 is intentionally not a public TIMEBASE row.  It is the private
+    predecessor interval emitted by the firmware so public PPS 1 can be shown
+    as a complete first science interval instead of carrying presentation-only
+    dashes in the first-difference columns.
+    """
+    valid = _first_bool(
+        forensic.get("start_pps0_valid"),
+        frag.get("start_pps0_valid"),
+        root.get("start_pps0_valid"),
+    )
+    if not valid:
+        return {"valid": False, "pps": None, "lanes": {}}
+
+    lanes: Dict[str, Dict[str, Optional[int]]] = {}
+    for lane in CLOCKS:
+        key = LANE_KEYS[lane]
+        prefix = LANE_MICRO_PREFIXES[key]
+        raw_prev = _first_int(
+            forensic.get(f"{prefix}_prev_obs"),
+            frag.get(f"{prefix}_prev_obs"),
+            root.get(f"{prefix}_prev_obs"),
+        )
+        fl_prev = _first_int(
+            forensic.get(f"{prefix}_prev_fl"),
+            frag.get(f"{prefix}_prev_fl"),
+            root.get(f"{prefix}_prev_fl"),
+        )
+        lanes[lane] = {
+            "raw": raw_prev,
+            "fl": fl_prev,
+            # In the current FloorLine-authored firmware, published == FloorLine.
+            # Fall back to raw only for older/partial prologue evidence.
+            "pub": fl_prev if fl_prev is not None else raw_prev,
+        }
+
+    return {
+        "valid": True,
+        "pps": _first_int(
+            forensic.get("pps_prev_obs"),
+            frag.get("pps_prev_obs"),
+            root.get("pps_prev_obs"),
+        ),
+        "lanes": lanes,
+    }
+
+
+def _interval_delta_with_private_prev(current: Optional[int],
+                                      previous: Optional[int],
+                                      private_previous: Optional[int]) -> Optional[int]:
+    """First difference, using private PPS0 only when public predecessor is absent."""
+    if current is None:
+        return None
+    if previous is not None:
+        return current - previous
+    if private_previous is not None:
+        return current - private_previous
+    return None
+
+
 def dwt_ppb_from_schema(root: Dict[str, Any], frag: Dict[str, Any]) -> Optional[float]:
     return _first_float(
         _nested_get(frag, "stats", "dwt", "ppb"),
@@ -669,17 +740,34 @@ def collect_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]
             gaps += 1
             reset_deltas_after_gap()
 
+        private_pps0 = (
+            start_pps0_from_schema(root, frag, forensic)
+            if prev_pps_count is None
+            else {"valid": False, "pps": None, "lanes": {}}
+        )
+
         pps_dwt = physical_pps_dwt_from_schema(root, frag, forensic)
         pps_actual, pps_pred, _pps_residual = lane_prediction(frag, pred, "pps")
+        pps_actual = _first_int(
+            forensic.get("pps_obs"),
+            frag.get("pps_obs"),
+            root.get("pps_obs"),
+            pps_actual,
+        )
         if pps_actual is None:
             pps_actual = _interval_from_endpoints(pps_dwt, prev_pps_dwt)
-        pps_delta = _interval_delta(pps_actual, prev_pps_interval)
+        pps_delta = _interval_delta_with_private_prev(
+            pps_actual,
+            prev_pps_interval,
+            private_pps0.get("pps") if private_pps0.get("valid") else None,
+        )
 
         row: Dict[str, Any] = {
             "pps_count": pps_count,
             "pps_actual": pps_actual,
             "pps_delta": pps_delta,
             "dwt_ppb": dwt_ppb_from_schema(root, frag),
+            "start_pps0_valid": bool(private_pps0.get("valid")),
             "lanes": {},
         }
 
@@ -761,13 +849,31 @@ def collect_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]
                     pub_actual,
                 )
 
+            private_lane_prev = (
+                private_pps0.get("lanes", {}).get(lane, {})
+                if private_pps0.get("valid")
+                else {}
+            )
+
             data = {
                 "raw": raw_interval,
-                "raw_delta": _interval_delta(raw_interval, prev_lane_interval[lane]["raw"]),
+                "raw_delta": _interval_delta_with_private_prev(
+                    raw_interval,
+                    prev_lane_interval[lane]["raw"],
+                    private_lane_prev.get("raw"),
+                ),
                 "fl": fl_interval,
-                "fl_delta": _interval_delta(fl_interval, prev_lane_interval[lane]["fl"]),
+                "fl_delta": _interval_delta_with_private_prev(
+                    fl_interval,
+                    prev_lane_interval[lane]["fl"],
+                    private_lane_prev.get("fl"),
+                ),
                 "pub": pub_interval,
-                "pub_delta": _interval_delta(pub_interval, prev_lane_interval[lane]["pub"]),
+                "pub_delta": _interval_delta_with_private_prev(
+                    pub_interval,
+                    prev_lane_interval[lane]["pub"],
+                    private_lane_prev.get("pub"),
+                ),
                 "counter_delta": lane_counter_delta(root, frag, forensic, lane_key),
                 "fl_edge_minus_observed": fl.get("inferred_minus_observed"),
                 "pub_minus_fl": _interval_delta(pub_interval, fl_interval),
@@ -986,6 +1092,8 @@ def analyze(campaign: str,
     print("  *_raw = evidence interval, *_fl = FloorLine interval,")
     print("  *_pub = subscriber-facing published interval.")
     print("  *Δ columns are per-rail cycle-count residuals: interval[n] - interval[n-1].")
+    if any(row.get("start_pps0_valid") for row in collected):
+        print("  PPS 1 deltas use the private START PPS0 prologue interval when present.")
     print("  Core rail columns are always shown; missing FL data is shown as --- on purpose.")
     if align_ocxo:
         print("  Alignment view: PPS and VCLOCK are delayed by one TIMEBASE row.")
@@ -1080,6 +1188,7 @@ def analyze(campaign: str,
     print("    and 'published interval - FloorLine interval' should be zero.")
     print("  • *Δ columns are cycle-count residuals computed separately per rail:")
     print("    interval[n] - interval[n-1].")
+    print("    On PPS 1, a private START PPS0 prologue interval is used as interval[n-1] when present.")
     print("  • FloorLine columns are intentionally always visible.  If *_fl stays ---,")
     print("    the TIMEBASE row stream did not expose a FloorLine endpoint that this parser found.")
     print("  • Use --clock VCLOCK, --clock OCXO1, or --clock OCXO2 to keep the row narrow.")
