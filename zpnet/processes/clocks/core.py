@@ -3756,13 +3756,20 @@ def _recover_campaign() -> None:
 
     teensy_pps_vclock_count = _extract_teensy_pps_vclock_count(frag)
     first_public_offset = teensy_pps_vclock_count - expected_first_public_pps_vclock_count
-    logging.info(
-        "✅ [recovery] first public pair accepted: count=%d expected=%d offset=%+d waited=%.3fs",
-        teensy_pps_vclock_count,
-        expected_first_public_pps_vclock_count,
-        first_public_offset,
-        waited_s,
-    )
+    if first_public_offset == 0:
+        logging.info(
+            "✅ [recovery] first public pair accepted: count=%d waited=%.3fs",
+            teensy_pps_vclock_count,
+            waited_s,
+        )
+    else:
+        logging.warning(
+            "⚠️ [recovery] first public pair offset: count=%d expected=%d offset=%+d waited=%.3fs",
+            teensy_pps_vclock_count,
+            expected_first_public_pps_vclock_count,
+            first_public_offset,
+            waited_s,
+        )
 
     # The processor is paused on this exact pair. Restore Pi-owned state to
     # the identity immediately before it, then reopen campaign processing so

@@ -530,24 +530,21 @@ static void timebase_build_stage(uint32_t stage) {
 }
 
 // ============================================================================
-// Campaign warmup suppression
+// Campaign publication handoff
 // ============================================================================
 //
-// Alpha remains fully alive during warmup: PPS/VCLOCK/OCXO measurements,
-// bridge anchors, and predictor state continue to settle normally.  Beta,
-// however, suppresses the first CLOCKS_CAMPAIGN_WARMUP_SUPPRESS_PPS
-// candidate TIMEBASE_FRAGMENT records so the public campaign begins only
-// after the estimators have stopped stretching their legs.
+// Fixed TIMEBASE row burial is retired.  Campaign admission is now gated by
+// Pi/Teensy readiness surfaces; once START/RECOVER is armed, the first public
+// TIMEBASE pair is expected to be the first authoritative row.
 //
-// START semantics:
-//   Suppressed records are private warmup only.  The first emitted fragment
-//   is teensy_pps_vclock_count=1, gnss_ns=1e9, and public totals start from that
-//   first canonical record.
+// START may still wait before publishing if the live PPS-row OCXO projection
+// needed to capture campaign-public zero has not yet arrived.  That is a
+// pre-publication handoff wait, not skipped campaign time: campaign_seconds
+// does not advance and no canonical TIMEBASE identities are hidden.
 //
-// RECOVER semantics:
-//   Suppressed records are real elapsed campaign seconds.  The first emitted
-//   fragment therefore appears after a deliberate canonical gap, preserving
-//   the recovered absolute PPS identity.
+// RECOVER publishes the next PPS/VCLOCK row after the recovered base count.
+// Recovery science residuals may be quarantined for population hygiene, but
+// the TIMEBASE row itself is no longer suppressed.
 
 enum class campaign_warmup_mode_t : uint8_t {
   NONE    = 0,
@@ -767,10 +764,9 @@ static void floorline_science_totals_reset(void) {
 
 // RECOVER deliberately cuts the campaign publication stream while preserving
 // the installed service epoch.  Alpha re-primes OCXO edge state at the RECOVER
-// gate; Beta additionally quarantines the first published science rows so no
-// residual/Welford sample can be formed from a pre-recovery previous edge or a
-// one-edge bridge warm-up artifact.  Warmup suppression hides private rows;
-// this quarantine protects the public residual population.
+// gate; Beta additionally quarantines the first published science residual rows
+// so no Welford sample can be formed from a pre-recovery previous edge or a
+// one-edge bridge warm-up artifact.  TIMEBASE rows themselves are not hidden.
 static constexpr uint32_t CLOCKS_RECOVER_SCIENCE_QUARANTINE_ROWS = 2U;
 static uint32_t g_science_residual_quarantine_remaining = 0;
 static uint32_t g_science_residual_quarantine_begin_count = 0;
@@ -1025,79 +1021,63 @@ static bool campaign_start_handoff_ready(void) {
 }
 
 static void campaign_warmup_begin(campaign_warmup_mode_t mode) {
-  g_campaign_warmup_mode = mode;
-  g_campaign_warmup_remaining = CLOCKS_CAMPAIGN_WARMUP_SUPPRESS_PPS;
   g_campaign_warmup_suppressed_total = 0;
 
   if (mode == campaign_warmup_mode_t::RECOVER) {
+    // RECOVER no longer buries public rows.  Install the recovered campaign
+    // offsets now; the next selected PPS/VCLOCK edge publishes base+1.
+    g_campaign_warmup_mode = campaign_warmup_mode_t::NONE;
+    g_campaign_warmup_remaining = 0;
     campaign_public_offsets_reset_for_recover();
-  } else {
-    campaign_public_offsets_reset_to_current();
+    return;
   }
-}
 
-static bool campaign_warmup_active(void) {
-  return g_campaign_warmup_mode != campaign_warmup_mode_t::NONE &&
-         g_campaign_warmup_remaining > 0;
-}
-
-static void campaign_warmup_finish_after_this_suppressed_record(void) {
-  const campaign_warmup_mode_t finishing_mode = g_campaign_warmup_mode;
-
-  if (finishing_mode == campaign_warmup_mode_t::START &&
-      campaign_state == clocks_campaign_state_t::STARTED &&
-      !campaign_start_handoff_ready()) {
-    // Gear, not rubber band: START may not capture public campaign bases until
-    // Alpha says both OCXO public-origin offsets are installed AND the current
-    // PPS row has a valid OCXO PPS-projection for the same VCLOCK/GNSS identity.
-    // OCXO_PUBLIC_ORIGIN alone is a historical readiness fact; the campaign
-    // zero capture must be taken from a live PPS-row projection species.
-    g_campaign_warmup_remaining = 1;
+  if (mode == campaign_warmup_mode_t::START) {
+    // START does not suppress rows either.  If the current PPS row is not yet a
+    // safe live handoff species, hold publication before campaign time starts.
+    if (campaign_start_handoff_ready()) {
+      g_campaign_warmup_mode = campaign_warmup_mode_t::NONE;
+      g_campaign_warmup_remaining = 0;
+      campaign_public_offsets_reset_to_current();
+      g_start_handoff_commit_count++;
+    } else {
+      g_campaign_warmup_mode = campaign_warmup_mode_t::START;
+      g_campaign_warmup_remaining = 1;
+    }
     return;
   }
 
   g_campaign_warmup_mode = campaign_warmup_mode_t::NONE;
   g_campaign_warmup_remaining = 0;
+  campaign_public_offsets_reset_to_current();
+}
 
-  if (campaign_state != clocks_campaign_state_t::STARTED) {
-    campaign_public_offsets_reset_to_current();
-    return;
-  }
-
-  if (finishing_mode == campaign_warmup_mode_t::START) {
-    // START: warmup records are private.  Public identity begins on the
-    // next selected PPS/VCLOCK edge after this one, so use the current alpha totals as the base.
-    // The next published record will add exactly one public second.
-    campaign_public_offsets_reset_to_current();
-    g_start_handoff_commit_count++;
-  }
-
-  // RECOVER: leave the recovery bases intact.  Because campaign_seconds
-  // advanced during suppression, the next emitted fragment will preserve
-  // the canonical gap created by the buried records.
+static bool campaign_warmup_active(void) {
+  return g_campaign_warmup_mode != campaign_warmup_mode_t::NONE;
 }
 
 static bool campaign_warmup_consume_one_candidate_record(void) {
   if (!campaign_warmup_active()) return false;
 
-  g_campaign_warmup_suppressed_total++;
+  if (g_campaign_warmup_mode == campaign_warmup_mode_t::START) {
+    if (!campaign_start_handoff_ready()) {
+      // Not a skipped TIMEBASE row: campaign_seconds is still zero and the
+      // public campaign has not begun.  Wait for the next PPS candidate.
+      g_campaign_warmup_remaining = 1;
+      return true;
+    }
 
-  if (g_campaign_warmup_mode == campaign_warmup_mode_t::RECOVER) {
-    // Recovery gaps are canonical.  The suppressed records are real
-    // elapsed campaign seconds, so advance the public PPS identity even
-    // though we do not publish the fragments.
-    campaign_seconds++;
+    g_campaign_warmup_mode = campaign_warmup_mode_t::NONE;
+    g_campaign_warmup_remaining = 0;
+    campaign_public_offsets_reset_to_current();
+    g_start_handoff_commit_count++;
+    return false;
   }
 
-  if (g_campaign_warmup_remaining > 0) {
-    g_campaign_warmup_remaining--;
-  }
-
-  if (g_campaign_warmup_remaining == 0) {
-    campaign_warmup_finish_after_this_suppressed_record();
-  }
-
-  return true;
+  // RECOVER and NONE both publish immediately under the no-burial doctrine.
+  g_campaign_warmup_mode = campaign_warmup_mode_t::NONE;
+  g_campaign_warmup_remaining = 0;
+  return false;
 }
 
 static void campaign_warmup_reset(void) {
@@ -4663,16 +4643,15 @@ void clocks_beta_pps(void) {
     return;
   }
 
-  // ── Warmup suppression ──
+  // ── Publication handoff wait ──
   //
-  // Suppressed records still allow alpha's measurement/predictor state to
-  // settle, but they are not allowed to become canonical TIMEBASE_FRAGMENT
-  // rows.  START hides these seconds completely; RECOVER counts them as
-  // deliberate canonical gaps.
+  // This is not row burial.  START may hold here only until the live PPS-row
+  // OCXO projection needed to capture public zero is available.  Campaign time
+  // has not advanced, and no public TIMEBASE identity is skipped.  RECOVER
+  // publishes immediately on the first PPS after the recovered base.
   if (campaign_warmup_consume_one_candidate_record()) {
-    g_timebase_warmup_suppressed_count++;
     timebase_build_stage(TIMEBASE_BUILD_STAGE_WARMUP_GATE);
-    publish_dac_tick("WARMUP_GATE");
+    publish_dac_tick("HANDOFF_WAIT_GATE");
     return;
   }
 
@@ -6188,7 +6167,8 @@ static FLASHMEM void add_campaign_payload(Payload& p) {
   p.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
 
   p.add("campaign_warmup_active", campaign_warmup_active());
-  p.add("campaign_warmup_required", CLOCKS_CAMPAIGN_WARMUP_SUPPRESS_PPS);
+  p.add("campaign_warmup_policy", "NO_FIXED_ROW_BURIAL");
+  p.add("campaign_warmup_required", 0U);
   p.add("campaign_warmup_remaining", (uint32_t)g_campaign_warmup_remaining);
   p.add("campaign_warmup_suppressed_total",
         (uint32_t)g_campaign_warmup_suppressed_total);
