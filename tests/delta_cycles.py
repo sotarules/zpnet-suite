@@ -7,17 +7,17 @@ For each row it shows the one-second DWT cycle interval for PPS, VCLOCK,
 OCXO1, and OCXO2.  For each OCXO it also shows:
 
     traditional residual:
-        fragment.ocxoN.science.fast_residual_ns
-        (GNSS-nanosecond-at-edge projection path, positive = clock fast)
+        fragment.ocxoN.science.traditional_fast_residual_ns
+        (legacy GNSS-nanosecond-at-edge projection path, positive = clock fast)
 
     cycle residual:
         delayed VCLOCK interval - OCXO interval
         (same DWT bookend species, positive = clock fast)
 
-By default the report uses FloorLine DWT bookends because that is the closest
-apples-to-apples comparison against the current traditional FloorLine/GNSS
-projection residual.  Use --raw or --mode raw to switch to observed/raw DWT
-bookends.
+By default the report uses FloorLine DWT bookends because Delta Cycles is the
+canonical science residual and the traditional FloorLine/GNSS projection
+residual is now a preserved comparison surface.  Use --raw or --mode raw to
+switch to observed/raw DWT bookends.
 
 Usage:
     python delta_cycles.py <campaign>
@@ -347,13 +347,20 @@ def interval_hint(rec: Dict[str, Any], clock: str, mode: str) -> Optional[int]:
 
 
 def traditional_fast_residual_ns(rec: Dict[str, Any], clock: str) -> Optional[int]:
-    """Traditional projected-GNSS residual from fragment.ocxoN.science."""
+    """Legacy projected-GNSS residual from fragment.ocxoN.science.
+
+    New TIMEBASE rows promote Delta Cycles into science.fast_residual_ns, so
+    prefer the explicit traditional_* field.  Fall back to the old unprefixed
+    fields so the report can still read pre-Delta-promotion campaigns.
+    """
     if clock not in OCXOS:
         return None
     lane = LANE_KEYS[clock]
     frag = _frag(rec)
     sci = science_object(rec, clock)
     return _first_int(
+        sci.get("traditional_fast_residual_ns"),
+        sci.get("legacy_fast_residual_ns"),
         sci.get("fast_residual_ns"),
         sci.get("reported_pps_fast_residual_ns"),
         _nested_get(frag, lane, "pps_residual", "fast_residual_ns"),
@@ -621,7 +628,7 @@ def analyze(campaign: str,
     print("  Default mode is FloorLine, using FloorLine DWT bookends.")
     print("  Raw/observed mode uses observed raw DWT bookends.")
     print("  OCXO cycle residual uses delayed VCLOCK reference: fast_cycles = ref_vclock_cycles - ocxo_cycles.")
-    print("  Positive oN_fast means OCXO running fast, matching traditional fast_residual_ns.")
+    print("  Positive oN_fast means OCXO running fast; Delta Cycles is canonical in new rows.")
     print("  oN-td = cycle fast residual - traditional projected-GNSS residual.")
     if use_seed_hints:
         print("  First row cycle fields may be seeded from TIMEBASE interval fields when no prior bookend exists.")

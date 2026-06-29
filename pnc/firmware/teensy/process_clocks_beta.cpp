@@ -582,17 +582,17 @@ static int64_t g_campaign_public_ocxo2_offset = 0;
 static int64_t g_campaign_public_ocxo1_measured_offset = 0;
 static int64_t g_campaign_public_ocxo2_measured_offset = 0;
 
-// Canonical OCXO residual rendering.  FloorLine science is now the authority:
-// each OCXO one-second FloorLine DWT interval is converted through the
-// PPS/VCLOCK DWT/GNSS ruler into the number of GNSS nanoseconds consumed by
-// that OCXO second.  The legacy pps_residual object is preserved as a
-// compatibility rendering of the same fact:
+// Canonical OCXO residual rendering.  Delta Cycles is now the authority:
+// each OCXO one-second FloorLine DWT interval is compared against the delayed
+// PPS/VCLOCK FloorLine interval covering the same physical second.  The
+// public pps_residual object remains a compatibility rendering of the
+// canonical Delta result:
 //
-//   science:       clock_interval = 1e9, gnss_interval = measured GNSS ns
-//   pps_residual:  gnss_interval  = 1e9, clock_interval = 1e9 + residual
+//   delta:         fast = ref_vclock_cycles - ocxo_cycles
+//   pps_residual:  gnss_interval = 1e9, clock_interval = 1e9 + fast_ns
 //
-// In both surfaces, fast_residual_ns is identical and positive means the OCXO
-// is running fast.
+// The old projected-GNSS residual remains preserved under science.traditional_*
+// for delta_cycles/raw_nanoseconds comparison reports.
 struct pps_interval_residuals_t {
   bool     ocxo1_valid = false;
   bool     ocxo2_valid = false;
@@ -604,18 +604,28 @@ struct pps_interval_residuals_t {
   int64_t  ocxo2_fast_residual_ns = 0;
 };
 
-// FloorLine science totals.  The clock total is the OCXO nominal one-second
-// ledger (1e9 ns per accepted FloorLine interval).  The GNSS total is the
-// DWT/FloorLine-derived GNSS duration of those OCXO seconds.  Positive fast
-// residual => OCXO running fast.
+// Delta/FloorLine science totals.  The canonical clock total is rendered as
+// reference + Delta-fast residual for every accepted delayed-reference sample;
+// traditional projected-GNSS totals are kept beside it for audit only.
 static constexpr uint64_t CLOCKS_BETA_NS_PER_SECOND = 1000000000ULL;
 
 struct floorline_science_totals_t {
+  // Canonical Delta Cycles totals.  Reference is the delayed PPS/VCLOCK
+  // one-second interval; clock is rendered as reference + fast residual so
+  // tau/ppb preserve the project-wide positive-fast convention.
   uint32_t sample_count = 0;
   uint64_t clock_interval_total_ns = 0;
   uint64_t gnss_interval_total_ns = 0;
   double   clock_interval_total_ns_exact = 0.0;
   double   gnss_interval_total_ns_exact = 0.0;
+
+  // Preserved traditional projected-GNSS residual totals.  These remain
+  // courtroom/comparison evidence only after Delta Cycles becomes canonical.
+  uint32_t traditional_sample_count = 0;
+  uint64_t traditional_clock_interval_total_ns = 0;
+  uint64_t traditional_gnss_interval_total_ns = 0;
+  double   traditional_clock_interval_total_ns_exact = 0.0;
+  double   traditional_gnss_interval_total_ns_exact = 0.0;
 };
 
 static floorline_science_totals_t g_floorline_science_ocxo1 = {};
@@ -692,6 +702,30 @@ struct clock_science_row_t {
   int64_t  delta_raw_fast_minus_traditional_ns = 0;
   int64_t  delta_floorline_fast_minus_traditional_ns = 0;
   int64_t  delta_raw_fast_minus_floorline_fast_ns = 0;
+
+  // Traditional projected-GNSS residual surface preserved for reports.
+  // After the Delta Cycles promotion, the unprefixed residual fields below
+  // are canonical Delta renderings; these fields retain the old projection.
+  bool     traditional_valid = false;
+  uint64_t traditional_gnss_interval_ns = 0;
+  uint64_t traditional_clock_interval_ns = 0;
+  int64_t  traditional_fast_residual_ns = 0;
+  double   traditional_gnss_interval_ns_exact = 0.0;
+  double   traditional_clock_interval_ns_exact = 0.0;
+  double   traditional_fast_residual_ns_exact = 0.0;
+  double   traditional_tau_1s = 1.0;
+  double   traditional_ppb_1s = 0.0;
+
+  bool     traditional_total_valid = false;
+  uint32_t traditional_total_sample_count = 0;
+  uint64_t traditional_total_clock_interval_ns = 0;
+  uint64_t traditional_total_gnss_interval_ns = 0;
+  int64_t  traditional_total_fast_residual_ns = 0;
+  double   traditional_total_clock_interval_ns_exact = 0.0;
+  double   traditional_total_gnss_interval_ns_exact = 0.0;
+  double   traditional_total_fast_residual_ns_exact = 0.0;
+  double   traditional_total_tau = 1.0;
+  double   traditional_total_ppb = 0.0;
 
   int64_t  prior_edge_gnss_ns = 0;
   int64_t  current_edge_gnss_ns = 0;
@@ -1201,12 +1235,13 @@ static uint32_t welfords_advance_missing_gap_before_row(uint32_t public_count) {
   //
   // Per-row clocks update once per published TIMEBASE row:
   //   DWT, VCLOCK, OCXO, DAC -> N == public_count after this row.
-  // FloorLine science publishes a valid row-1 OCXO residual, so OCXO Welford
-  // cardinality no longer lags by one.
+  // Delta Cycles publishes the OCXO interval one TIMEBASE row after the
+  // reference interval it compares against, so OCXO Welford cardinality
+  // intentionally lags public_count by one.
   const uint64_t before_row_n =
       (public_count > 0U) ? (uint64_t)(public_count - 1U) : 0ULL;
   const uint64_t before_row_ocxo_n =
-      (public_count > 0U) ? (uint64_t)(public_count - 1U) : 0ULL;
+      (public_count > 1U) ? (uint64_t)(public_count - 2U) : 0ULL;
 
   uint32_t advanced = 0;
   if (welford_advance_missing_to_n(welford_dwt, before_row_n)) advanced++;
@@ -1960,11 +1995,8 @@ static void payload_add_stats_ocxo_clock(Payload& parent,
   payload_add_welford_object(obj, "welford", w);
 
   // Keep the public stats object compact.  The canonical OCXO frequency value
-  // is still FloorLine science total_ppb/total_tau, but the complete proof and
-  // exact totals already live under fragment.ocxoN.science.  Duplicating those
-  // long exact-total fields here pushes TIMEBASE_FRAGMENT toward the transport
-  // payload ceiling and can make the Pi receive the smaller FORENSICS half
-  // without the fragment half.
+  // is Delta Cycles total_ppb/total_tau; the traditional projected-GNSS total
+  // remains under fragment.ocxoN.science.traditional_* for reports.
   const double ppb = science.total_valid ? science.total_ppb : 0.0;
   payload_add_frequency_fields(obj, ppb);
 
@@ -2353,14 +2385,15 @@ static FLASHMEM void payload_add_ocxo_service_object(Payload& parent,
 // OCXO cycle-domain residual diagnostic
 // ============================================================================
 //
-// Courtroom-only diagnostic for the OCXO residual authority chain.
-// The authoritative OCXO residual is now the FloorLine nanosecond residual.
+// Courtroom-only legacy diagnostic for the OCXO residual authority chain.
+// The authoritative OCXO residual is now the delayed-reference FloorLine
+// Delta Cycles residual carried in clock_science_row_t::delta_floorline_*;
 // Welfords, tau, pps_residual, and servo input consume that same surface.
 //
-// This object compares the GNSS/PPS one-second DWT interval and each OCXO
-// one-second DWT interval in the same Teensy DWT coordinate species.  If the
-// nanosecond-domain residual and this same-yardstick cycle residual diverge in
-// common mode, the residual path is leaking DWT normalization error.
+// This older object compares the GNSS/PPS static-prediction DWT interval and
+// each OCXO static-prediction DWT interval in the same Teensy coordinate
+// species.  It remains useful as a rough audit, but it is not the canonical
+// delayed-VCLOCK-reference Delta residual.
 //
 // Sign convention is aligned with pps_residual.fast_residual_ns:
 //   positive diagnostic_fast_residual_cycles => OCXO running fast.
@@ -2436,6 +2469,8 @@ static void payload_add_ocxo_pps_residual_object(Payload& parent,
   residual.add("clock_interval_ns", valid ? clock_interval_ns : 0ULL);
   residual.add("fast_residual_ns", valid ? fast_residual_ns : 0LL);
   residual.add("positive_means", "clock_fast");
+  residual.add("source", "DELTA_FLOORLINE");
+  residual.add("traditional_preserved_under", "science.traditional_fast_residual_ns");
   parent.add_object("pps_residual", residual);
 }
 
@@ -2683,8 +2718,11 @@ static void delta_residual_apply_one(clock_science_row_t& row,
         (int64_t)row.delta_raw_clock_interval_cycles -
         (int64_t)row.delta_raw_reference_interval_cycles;
     row.delta_raw_fast_residual_cycles = -row.delta_raw_residual_cycles;
+    const uint32_t raw_delta_cps = row.delta_raw_reference_interval_cycles
+        ? row.delta_raw_reference_interval_cycles
+        : row.projection_cps_cycles;
     row.delta_raw_residual_ns_exact = beta_dwt_cycles_to_gnss_ns_exact_signed(
-        row.delta_raw_residual_cycles, row.projection_cps_cycles);
+        row.delta_raw_residual_cycles, raw_delta_cps);
     row.delta_raw_fast_residual_ns_exact = -row.delta_raw_residual_ns_exact;
     row.delta_raw_residual_ns =
         beta_round_double_to_i64(row.delta_raw_residual_ns_exact);
@@ -2715,10 +2753,14 @@ static void delta_residual_apply_one(clock_science_row_t& row,
         (int64_t)row.delta_floorline_reference_interval_cycles;
     row.delta_floorline_fast_residual_cycles =
         -row.delta_floorline_residual_cycles;
+    const uint32_t floorline_delta_cps =
+        row.delta_floorline_reference_interval_cycles
+            ? row.delta_floorline_reference_interval_cycles
+            : row.projection_cps_cycles;
     row.delta_floorline_residual_ns_exact =
         beta_dwt_cycles_to_gnss_ns_exact_signed(
             row.delta_floorline_residual_cycles,
-            row.projection_cps_cycles);
+            floorline_delta_cps);
     row.delta_floorline_fast_residual_ns_exact =
         -row.delta_floorline_residual_ns_exact;
     row.delta_floorline_residual_ns =
@@ -2729,13 +2771,13 @@ static void delta_residual_apply_one(clock_science_row_t& row,
 }
 
 static void delta_residual_attach_comparisons(clock_science_row_t& row) {
-  if (row.delta_raw_valid && row.valid) {
+  if (row.delta_raw_valid && row.traditional_valid) {
     row.delta_raw_fast_minus_traditional_ns =
-        row.delta_raw_fast_residual_ns - row.fast_residual_ns;
+        row.delta_raw_fast_residual_ns - row.traditional_fast_residual_ns;
   }
-  if (row.delta_floorline_valid && row.valid) {
+  if (row.delta_floorline_valid && row.traditional_valid) {
     row.delta_floorline_fast_minus_traditional_ns =
-        row.delta_floorline_fast_residual_ns - row.fast_residual_ns;
+        row.delta_floorline_fast_residual_ns - row.traditional_fast_residual_ns;
   }
   if (row.delta_raw_valid && row.delta_floorline_valid) {
     row.delta_raw_fast_minus_floorline_fast_ns =
@@ -2765,6 +2807,33 @@ static void floorline_science_attach_totals(clock_science_row_t& row,
       : 0.0;
   row.total_fast_residual_ns = row.total_valid
       ? beta_round_double_to_i64(row.total_fast_residual_ns_exact)
+      : 0LL;
+
+  row.traditional_total_sample_count = totals.traditional_sample_count;
+  row.traditional_total_clock_interval_ns =
+      totals.traditional_clock_interval_total_ns;
+  row.traditional_total_gnss_interval_ns =
+      totals.traditional_gnss_interval_total_ns;
+  row.traditional_total_clock_interval_ns_exact =
+      totals.traditional_clock_interval_total_ns_exact;
+  row.traditional_total_gnss_interval_ns_exact =
+      totals.traditional_gnss_interval_total_ns_exact;
+  row.traditional_total_valid =
+      totals.traditional_gnss_interval_total_ns_exact != 0.0 &&
+      totals.traditional_clock_interval_total_ns_exact != 0.0;
+  row.traditional_total_tau = row.traditional_total_valid
+      ? (totals.traditional_clock_interval_total_ns_exact /
+         totals.traditional_gnss_interval_total_ns_exact)
+      : 1.0;
+  row.traditional_total_ppb = row.traditional_total_valid
+      ? campaign_total_ppb_from_tau(row.traditional_total_tau)
+      : 0.0;
+  row.traditional_total_fast_residual_ns_exact = row.traditional_total_valid
+      ? (totals.traditional_clock_interval_total_ns_exact -
+         totals.traditional_gnss_interval_total_ns_exact)
+      : 0.0;
+  row.traditional_total_fast_residual_ns = row.traditional_total_valid
+      ? beta_round_double_to_i64(row.traditional_total_fast_residual_ns_exact)
       : 0LL;
 }
 
@@ -2819,47 +2888,90 @@ static clock_science_row_t floorline_science_build_ocxo(
 
   delta_residual_apply_one(row, delayed_reference, clock_valid, clock_f);
 
-  row.valid = row.clock_floorline_valid &&
-              row.clock_floorline_interval_cycles != 0U &&
-              row.projection_cps_cycles != 0U;
-  row.antecedents_complete = row.valid;
+  const bool traditional_antecedents_valid =
+      row.clock_floorline_valid &&
+      row.clock_floorline_interval_cycles != 0U &&
+      row.projection_cps_cycles != 0U;
+
+  if (traditional_antecedents_valid) {
+    const int32_t current_delta_cycles = beta_dwt32_signed_delta_near(
+        row.pps_vclock_dwt_at_edge, row.clock_floorline_dwt_at_edge);
+    const int64_t current_delta_ns = beta_dwt_cycles_to_gnss_ns_signed(
+        (int64_t)current_delta_cycles, row.projection_cps_cycles);
+
+    row.current_edge_gnss_ns =
+        beta_i64_from_u64_saturating(public_gnss_ns) + current_delta_ns;
+    row.current_edge_gnss_ns_exact =
+        (double)public_gnss_ns +
+        ((double)current_delta_cycles * (double)CLOCKS_BETA_NS_PER_SECOND) /
+            (double)row.projection_cps_cycles;
+
+    row.traditional_valid = true;
+    row.traditional_gnss_interval_ns_exact =
+        ((double)row.clock_floorline_interval_cycles *
+         (double)CLOCKS_BETA_NS_PER_SECOND) /
+        (double)row.projection_cps_cycles;
+    row.traditional_gnss_interval_ns = beta_dwt_cycles_to_gnss_ns_rounded(
+        (uint64_t)row.clock_floorline_interval_cycles,
+        row.projection_cps_cycles);
+    row.prior_edge_gnss_ns =
+        row.current_edge_gnss_ns -
+        beta_i64_from_u64_saturating(row.traditional_gnss_interval_ns);
+    row.prior_edge_gnss_ns_exact =
+        row.current_edge_gnss_ns_exact -
+        row.traditional_gnss_interval_ns_exact;
+
+    row.traditional_clock_interval_ns = CLOCKS_BETA_NS_PER_SECOND;
+    row.traditional_clock_interval_ns_exact =
+        (double)CLOCKS_BETA_NS_PER_SECOND;
+    row.traditional_fast_residual_ns_exact =
+        row.traditional_clock_interval_ns_exact -
+        row.traditional_gnss_interval_ns_exact;
+    row.traditional_fast_residual_ns =
+        beta_round_double_to_i64(row.traditional_fast_residual_ns_exact);
+    row.traditional_tau_1s = (double)row.projection_cps_cycles /
+                             (double)row.clock_floorline_interval_cycles;
+    row.traditional_ppb_1s =
+        campaign_total_ppb_from_tau(row.traditional_tau_1s);
+
+    totals.traditional_sample_count++;
+    totals.traditional_clock_interval_total_ns +=
+        row.traditional_clock_interval_ns;
+    totals.traditional_gnss_interval_total_ns +=
+        row.traditional_gnss_interval_ns;
+    totals.traditional_clock_interval_total_ns_exact +=
+        row.traditional_clock_interval_ns_exact;
+    totals.traditional_gnss_interval_total_ns_exact +=
+        row.traditional_gnss_interval_ns_exact;
+  }
+
+  // Delta Cycles is canonical.  A row is science-valid only when the OCXO
+  // FloorLine endpoint interval can be compared against the delayed
+  // PPS/VCLOCK FloorLine reference interval covering the same physical second.
+  row.valid = row.delta_floorline_valid;
+  row.antecedents_complete = row.delta_floorline_valid &&
+                             row.clock_floorline_valid &&
+                             row.delta_floorline_reference_interval_cycles != 0U &&
+                             row.delta_floorline_clock_interval_cycles != 0U;
+
+  delta_residual_attach_comparisons(row);
+
   if (!row.valid) {
-    delta_residual_attach_comparisons(row);
     floorline_science_attach_totals(row, totals);
     return row;
   }
 
-  const int32_t current_delta_cycles = beta_dwt32_signed_delta_near(
-      row.pps_vclock_dwt_at_edge, row.clock_floorline_dwt_at_edge);
-  const int64_t current_delta_ns = beta_dwt_cycles_to_gnss_ns_signed(
-      (int64_t)current_delta_cycles, row.projection_cps_cycles);
-
-  row.current_edge_gnss_ns =
-      beta_i64_from_u64_saturating(public_gnss_ns) + current_delta_ns;
-  row.current_edge_gnss_ns_exact =
-      (double)public_gnss_ns +
-      ((double)current_delta_cycles * (double)CLOCKS_BETA_NS_PER_SECOND) /
-          (double)row.projection_cps_cycles;
-  row.gnss_interval_ns_exact =
-      ((double)row.clock_floorline_interval_cycles *
-       (double)CLOCKS_BETA_NS_PER_SECOND) /
-      (double)row.projection_cps_cycles;
-  row.gnss_interval_ns = beta_dwt_cycles_to_gnss_ns_rounded(
-      (uint64_t)row.clock_floorline_interval_cycles,
-      row.projection_cps_cycles);
-  row.prior_edge_gnss_ns = row.current_edge_gnss_ns -
-                           beta_i64_from_u64_saturating(row.gnss_interval_ns);
-  row.prior_edge_gnss_ns_exact = row.current_edge_gnss_ns_exact -
-                                 row.gnss_interval_ns_exact;
-  row.clock_interval_ns = CLOCKS_BETA_NS_PER_SECOND;
-  row.clock_interval_ns_exact = (double)CLOCKS_BETA_NS_PER_SECOND;
-  row.fast_residual_ns_exact = row.clock_interval_ns_exact -
-                               row.gnss_interval_ns_exact;
-  row.fast_residual_ns = beta_round_double_to_i64(row.fast_residual_ns_exact);
-  row.tau_1s = (double)row.projection_cps_cycles /
-               (double)row.clock_floorline_interval_cycles;
+  row.gnss_interval_ns = CLOCKS_BETA_NS_PER_SECOND;
+  row.gnss_interval_ns_exact = (double)CLOCKS_BETA_NS_PER_SECOND;
+  row.fast_residual_ns_exact = row.delta_floorline_fast_residual_ns_exact;
+  row.fast_residual_ns = row.delta_floorline_fast_residual_ns;
+  row.clock_interval_ns_exact = row.gnss_interval_ns_exact +
+                                row.fast_residual_ns_exact;
+  row.clock_interval_ns = row.clock_interval_ns_exact > 0.0
+      ? (uint64_t)beta_round_double_to_i64(row.clock_interval_ns_exact)
+      : 0ULL;
+  row.tau_1s = row.clock_interval_ns_exact / row.gnss_interval_ns_exact;
   row.ppb_1s = campaign_total_ppb_from_tau(row.tau_1s);
-  delta_residual_attach_comparisons(row);
 
   totals.sample_count++;
   totals.clock_interval_total_ns += row.clock_interval_ns;
@@ -2872,8 +2984,12 @@ static clock_science_row_t floorline_science_build_ocxo(
 
 static void payload_add_clock_science_common(Payload& science,
                                              const clock_science_row_t& row) {
+  const bool ocxo_science_row =
+      row.clock_id == (uint32_t)((uint8_t)time_clock_id_t::OCXO1) ||
+      row.clock_id == (uint32_t)((uint8_t)time_clock_id_t::OCXO2);
+
   if (TIMEBASE_FRAGMENT_COMPACT_SCIENCE_ENABLED) {
-    science.add("schema", "TIMEBASE_CLOCK_SCIENCE_COMPACT_V1");
+    science.add("schema", "TIMEBASE_CLOCK_SCIENCE_COMPACT_V2");
     science.add("valid", row.valid);
     science.add("antecedents_complete", row.antecedents_complete);
     science.add("clock_id", row.clock_id);
@@ -2892,23 +3008,39 @@ static void payload_add_clock_science_common(Payload& science,
     science.add("clock_raw_dwt_at_edge", row.clock_raw_dwt_at_edge);
     science.add("clock_observed_interval_cycles", row.clock_observed_interval_cycles);
 
-    // Traditional projected residual surface.  Exact floating-point mirrors and
-    // absolute prior/current edge projections are intentionally omitted from the
-    // 1 Hz fragment; reports can recompute them from the antecedents above.
+    // Canonical residual surface.  Delta Cycles is the authority; these
+    // unprefixed fields are now the FloorLine Delta rendering.
+    science.add("residual_source",
+                ocxo_science_row ? "DELTA_FLOORLINE" : "GNSS_IDENTITY");
     science.add("gnss_interval_ns", row.gnss_interval_ns);
     science.add("clock_interval_ns", row.clock_interval_ns);
     science.add("fast_residual_ns", row.fast_residual_ns);
     science.add("tau_1s", row.tau_1s, 12);
     science.add("ppb_1s", row.ppb_1s, 6);
 
-    // Campaign-total frequency summary.  Keep the integer total residual and
-    // tau/ppb; omit exact total ledgers because stats.<clock> already repeats
-    // the campaign frequency and the raw totals are reconstructible.
+    // Traditional projected-GNSS residual preserved as comparison evidence.
+    science.add("traditional_residual_source",
+                ocxo_science_row ? "PROJECTED_GNSS_FLOORLINE_DWT_CPS" : "NONE");
+    science.add("traditional_valid", row.traditional_valid);
+    science.add("traditional_gnss_interval_ns", row.traditional_gnss_interval_ns);
+    science.add("traditional_clock_interval_ns", row.traditional_clock_interval_ns);
+    science.add("traditional_fast_residual_ns", row.traditional_fast_residual_ns);
+    science.add("traditional_tau_1s", row.traditional_tau_1s, 12);
+    science.add("traditional_ppb_1s", row.traditional_ppb_1s, 6);
+
+    // Campaign-total frequency summary.  Unprefixed totals are canonical
+    // Delta totals; traditional_* totals remain comparison evidence.
     science.add("total_valid", row.total_valid);
     science.add("total_sample_count", row.total_sample_count);
     science.add("total_fast_residual_ns", row.total_fast_residual_ns);
     science.add("total_tau", row.total_tau, 12);
     science.add("total_ppb", row.total_ppb, 6);
+    science.add("traditional_total_valid", row.traditional_total_valid);
+    science.add("traditional_total_sample_count", row.traditional_total_sample_count);
+    science.add("traditional_total_fast_residual_ns",
+                row.traditional_total_fast_residual_ns);
+    science.add("traditional_total_tau", row.traditional_total_tau, 12);
+    science.add("traditional_total_ppb", row.traditional_total_ppb, 6);
 
     // Delta-residual experiment: compact, report-friendly, and sign-explicit.
     // Only OCXO rows carry delayed-reference delta residuals; do not spend
@@ -2927,6 +3059,8 @@ static void payload_add_clock_science_common(Payload& science,
       science.add("delta_raw_clock_interval_cycles",
                   row.delta_raw_clock_interval_cycles);
       science.add("delta_raw_residual_cycles", row.delta_raw_residual_cycles);
+      science.add("delta_raw_fast_residual_cycles",
+                  row.delta_raw_fast_residual_cycles);
       science.add("delta_raw_fast_residual_ns",
                   row.delta_raw_fast_residual_ns);
       science.add("delta_floorline_valid", row.delta_floorline_valid);
@@ -2936,6 +3070,8 @@ static void payload_add_clock_science_common(Payload& science,
                   row.delta_floorline_clock_interval_cycles);
       science.add("delta_floorline_residual_cycles",
                   row.delta_floorline_residual_cycles);
+      science.add("delta_floorline_fast_residual_cycles",
+                  row.delta_floorline_fast_residual_cycles);
       science.add("delta_floorline_fast_residual_ns",
                   row.delta_floorline_fast_residual_ns);
       science.add("delta_raw_fast_minus_traditional_ns",
@@ -2948,12 +3084,16 @@ static void payload_add_clock_science_common(Payload& science,
     return;
   }
 
-  science.add("schema", "TIMEBASE_CLOCK_SCIENCE_V1");
+  science.add("schema", "TIMEBASE_CLOCK_SCIENCE_V2");
   science.add("valid", row.valid);
   science.add("antecedents_complete", row.antecedents_complete);
   science.add("clock_id", row.clock_id);
   science.add("public_count", row.public_count);
   science.add("positive_means", "clock_fast");
+  science.add("residual_source",
+              ocxo_science_row ? "DELTA_FLOORLINE" : "GNSS_IDENTITY");
+  science.add("traditional_residual_source",
+              ocxo_science_row ? "PROJECTED_GNSS_FLOORLINE_DWT_CPS" : "NONE");
 
   science.add("pps_vclock_dwt_at_edge", row.pps_vclock_dwt_at_edge);
   science.add("pps_vclock_gnss_ns_at_edge", row.pps_vclock_gnss_ns_at_edge);
@@ -3035,6 +3175,19 @@ static void payload_add_clock_science_common(Payload& science,
   science.add("tau_1s", row.tau_1s, 12);
   science.add("ppb_1s", row.ppb_1s, 6);
 
+  science.add("traditional_valid", row.traditional_valid);
+  science.add("traditional_gnss_interval_ns", row.traditional_gnss_interval_ns);
+  science.add("traditional_clock_interval_ns", row.traditional_clock_interval_ns);
+  science.add("traditional_fast_residual_ns", row.traditional_fast_residual_ns);
+  science.add("traditional_gnss_interval_ns_exact",
+              row.traditional_gnss_interval_ns_exact, 6);
+  science.add("traditional_clock_interval_ns_exact",
+              row.traditional_clock_interval_ns_exact, 6);
+  science.add("traditional_fast_residual_ns_exact",
+              row.traditional_fast_residual_ns_exact, 6);
+  science.add("traditional_tau_1s", row.traditional_tau_1s, 12);
+  science.add("traditional_ppb_1s", row.traditional_ppb_1s, 6);
+
   science.add("total_valid", row.total_valid);
   science.add("total_sample_count", row.total_sample_count);
   science.add("total_clock_interval_ns", row.total_clock_interval_ns);
@@ -3045,6 +3198,23 @@ static void payload_add_clock_science_common(Payload& science,
   science.add("total_fast_residual_ns_exact", row.total_fast_residual_ns_exact, 6);
   science.add("total_tau", row.total_tau, 12);
   science.add("total_ppb", row.total_ppb, 6);
+
+  science.add("traditional_total_valid", row.traditional_total_valid);
+  science.add("traditional_total_sample_count", row.traditional_total_sample_count);
+  science.add("traditional_total_clock_interval_ns",
+              row.traditional_total_clock_interval_ns);
+  science.add("traditional_total_gnss_interval_ns",
+              row.traditional_total_gnss_interval_ns);
+  science.add("traditional_total_fast_residual_ns",
+              row.traditional_total_fast_residual_ns);
+  science.add("traditional_total_clock_interval_ns_exact",
+              row.traditional_total_clock_interval_ns_exact, 6);
+  science.add("traditional_total_gnss_interval_ns_exact",
+              row.traditional_total_gnss_interval_ns_exact, 6);
+  science.add("traditional_total_fast_residual_ns_exact",
+              row.traditional_total_fast_residual_ns_exact, 6);
+  science.add("traditional_total_tau", row.traditional_total_tau, 12);
+  science.add("traditional_total_ppb", row.traditional_total_ppb, 6);
 }
 
 static void payload_add_vclock_science_object(Payload& lane,
@@ -3127,10 +3297,12 @@ static void payload_add_ocxo_science_object(Payload& lane,
   science.add("edge_species", TIMEBASE_FRAGMENT_COMPACT_SCIENCE_ENABLED ? "FL" : "FLOORLINE");
   science.add("frequency_source",
               TIMEBASE_FRAGMENT_COMPACT_SCIENCE_ENABLED
-                  ? "FL_DWT_CPS"
-                  : "FLOORLINE_DWT_INTERVAL_OVER_PPS_VCLOCK_CPS");
+                  ? "DELTA_FLOORLINE"
+                  : "DELTA_CYCLES_FLOORLINE_REFERENCE_DELAY_1");
   if (!TIMEBASE_FRAGMENT_COMPACT_SCIENCE_ENABLED) {
-    science.add("time_projection_formula",
+    science.add("delta_formula",
+                "fast = delayed_pps_vclock_floorline_cycles - ocxo_floorline_cycles");
+    science.add("traditional_projection_formula",
                 "pps_vclock_gnss_ns + signed(clock_floorline_dwt - pps_vclock_dwt) * 1e9 / projection_cps");
   }
   science.add("reported_pps_residual_valid", reported_valid);
@@ -3140,6 +3312,10 @@ static void payload_add_ocxo_science_object(Payload& lane,
               reported_valid ? reported_clock_interval_ns : 0ULL);
   science.add("reported_pps_fast_residual_ns",
               reported_valid ? reported_fast_residual_ns : 0LL);
+  science.add("reported_minus_canonical_residual_ns",
+              (reported_valid && row.valid)
+                  ? (reported_fast_residual_ns - row.fast_residual_ns)
+                  : 0LL);
   science.add("reported_minus_floorline_residual_ns",
               (reported_valid && row.valid)
                   ? (reported_fast_residual_ns - row.fast_residual_ns)
@@ -3495,12 +3671,13 @@ static void payload_add_ocxo_fragment(Payload& p,
                                       const clock_science_row_t& science_row) {
   Payload lane;
 
-  // Compact science surface.  The canonical OCXO value is the PPS-projected
-  // clock when available, with measured_gnss_ns retained as the single legacy
-  // side-channel for dashboards/report migration.  Duplicate string aliases
-  // and repeated *_at_pps_vclock names were removed from the durable row.
+  // Compact science surface.  The canonical OCXO value is now rendered from
+  // Delta Cycles campaign totals.  measured_gnss_ns and PPS projection flags
+  // remain as legacy/forensic side-channels for dashboards/report migration.
   lane.add("ns", public_ns);
-  lane.add("ns_source_id", pps_projection_valid ? 2U : 1U);
+  lane.add("ns_source_id", science_row.total_valid ? 3U : 1U);
+  lane.add("ns_source_name",
+           science_row.total_valid ? "DELTA_CYCLES_TOTAL" : "MEASURED_GNSS_FALLBACK");
   lane.add("pps_projected_valid", pps_projection_valid);
   lane.add("pps_projection_source", pps_projection_valid ? pps_projection_source : 0U);
   lane.add("measured_gnss_ns", public_measured_ns);
@@ -3549,12 +3726,14 @@ static FLASHMEM void payload_add_ocxo_forensics(Payload& p,
   Payload lane;
 
   // Compact forensic surface for the paired TIMEBASE row.  Keep the public
-  // clock value, source identity, the raw PPS-projection value, the PPS-founded
-  // residual, the DWT gate courtroom, and the tiny OCXO service/counter ladder
+  // clock value, source identity, the raw PPS-projection value, the Delta
+  // residual rendering, the DWT gate courtroom, and the tiny OCXO service/counter ladder
   // proof.  Retired quiet-phase sample fields, measurement/window counters,
   // SpinCatch/SpinIdle, regression, and verbose projection deltas are report-only.
   lane.add("ns", public_ns);
-  lane.add("ns_source_id", pps_projection_valid ? 2U : 1U);
+  lane.add("ns_source_id", pps_residual_valid ? 3U : 1U);
+  lane.add("ns_source_name",
+           pps_residual_valid ? "DELTA_CYCLES_TOTAL" : "MEASURED_GNSS_FALLBACK");
   lane.add("pps_projected_valid", pps_projection_valid);
   lane.add("pps_projected_raw_ns",
            pps_projection_valid ? pps_projection.projected_ocxo_ns_at_pps : 0ULL);
@@ -3593,10 +3772,10 @@ static FLASHMEM void payload_add_ocxo_forensics(Payload& p,
   p.add_object(key, lane);
 }
 
-// Servo source doctrine. Servo input is explicitly the FloorLine OCXO science
-// residual surface. MEAN consumes the Welford mean of exact FloorLine residuals
-// (ns/sec == ppb). TOTAL consumes the accumulated FloorLine OCXO/GNSS ratio
-// over the campaign. NOW consumes the current FloorLine one-second residual.
+// Servo source doctrine. Servo input is explicitly the canonical Delta Cycles
+// residual surface. MEAN consumes the Welford mean of exact Delta residuals
+// (ns/sec == ppb). TOTAL consumes the accumulated Delta-rendered OCXO/GNSS
+// ratio over the campaign. NOW consumes the current Delta one-second residual.
 static constexpr uint32_t SERVO_INPUT_SOURCE_NONE = 0;
 static constexpr uint32_t SERVO_INPUT_SOURCE_MEAN_PPS_RESIDUAL_WELFORD = 1;
 static constexpr uint32_t SERVO_INPUT_SOURCE_TOTAL_PUBLIC_TAU = 2;
@@ -3607,7 +3786,7 @@ static const char* servo_input_source_name(uint32_t source) {
     case SERVO_INPUT_SOURCE_MEAN_PPS_RESIDUAL_WELFORD:
       return "PPS_RESIDUAL_WELFORD_MEAN_PPB";
     case SERVO_INPUT_SOURCE_TOTAL_PUBLIC_TAU:
-      return "FLOORLINE_SCIENCE_TOTAL_TAU";
+      return "DELTA_SCIENCE_TOTAL_TAU";
     case SERVO_INPUT_SOURCE_NOW_PPS_RESIDUAL:
       return "PPS_RESIDUAL_NOW_PPB";
     default:
@@ -3655,7 +3834,7 @@ static void servo_input_diag_reset(servo_input_diag_t& d) {
 static FLASHMEM void payload_add_servo_input_diag(Payload& lane,
                                          const servo_input_diag_t& d) {
   Payload input;
-  input.add("control_doctrine", "SLOPE_NEUTRALIZATION");
+  input.add("control_doctrine", "DELTA_CYCLES_CANONICAL_RESIDUAL");
   input.add("positive_means", "clock_fast_lower_dac");
   input.add("dac_transfer", "higher_dac_higher_voltage_faster_ocxo");
   input.add("selected_source", servo_input_source_name(d.selected_source));
@@ -4563,8 +4742,8 @@ void clocks_beta_pps(void) {
   //
   // Alpha still exposes the legacy measured-GNSS OCXO row values as a
   // diagnostic side-channel.  Beta now renders the published OCXO ns tuple
-  // from the same FloorLine science totals that feed pps_residual, Welford,
-  // servo, and stats, so fields that look authoritative tell one story.
+  // from the same canonical Delta Cycles totals that feed pps_residual,
+  // Welford, servo, and stats, so authoritative fields tell one story.
   // The Alpha PPS-projection snapshots remain courtroom collateral.
   const uint64_t public_gnss_ns   = campaign_public_gnss_ns();
   const uint64_t public_dwt_total = campaign_public_dwt_total();
@@ -4593,13 +4772,12 @@ void clocks_beta_pps(void) {
                                               vclock_forensics_valid,
                                               vclock_forensics);
 
-  // ── FloorLine canonical science ──
+  // ── Delta Cycles canonical science ──
   //
-  // This is now the authoritative OCXO science path.  The row-local
-  // antecedent chain is still published under fragment.ocxoN.science for
-  // raw_nanoseconds/courtroom replay, but the legacy public surfaces below
-  // (pps_residual, Welford, servo input, stats, and micro forensics aliases)
-  // are now renderings of this same FloorLine result.
+  // FloorLine owns DWT-at-edge.  Delta Cycles owns the residual: each OCXO
+  // FloorLine interval is subtracted from the delayed PPS/VCLOCK FloorLine
+  // reference interval.  The traditional DWT->GNSS projection is preserved
+  // under science.traditional_* but no longer feeds Welford, stats, or servo.
   const clock_science_row_t ocxo1_floorline_science =
       floorline_science_build_ocxo(time_clock_id_t::OCXO1,
                                    public_count,
@@ -4636,11 +4814,11 @@ void clocks_beta_pps(void) {
                                           ocxo1_floorline_science,
                                           ocxo2_floorline_science);
 
-  // ── Cycle-domain residual diagnostics ──
+  // ── Legacy cycle-domain residual diagnostics ──
   //
-  // These are forensic-only.  They deliberately do not feed Welford, tau, or
-  // servo control.  They compare each OCXO one-second DWT interval against the
-  // GNSS/PPS one-second DWT interval using the same moving Teensy yardstick.
+  // This older static-prediction diagnostic remains forensic-only.  Canonical
+  // Delta residuals are carried in ocxoN.science.delta_floorline_* and feed
+  // Welford, tau, public pps_residual, and servo below.
   const clocks_static_prediction_snapshot_t pps_cycle_prediction =
       prediction_snapshot_for_pps();
   const clocks_static_prediction_snapshot_t ocxo1_cycle_prediction =
@@ -4649,12 +4827,12 @@ void clocks_beta_pps(void) {
       prediction_snapshot_for_clock(time_clock_id_t::OCXO2);
   const ocxo_cycle_residual_diag_t ocxo1_cycle_residual_diag =
       ocxo_cycle_residual_diag_build(pps_cycle_prediction, ocxo1_cycle_prediction,
-                                     pps_residuals.ocxo1_valid,
-                                     pps_residuals.ocxo1_fast_residual_ns);
+                                     ocxo1_floorline_science.traditional_valid,
+                                     ocxo1_floorline_science.traditional_fast_residual_ns);
   const ocxo_cycle_residual_diag_t ocxo2_cycle_residual_diag =
       ocxo_cycle_residual_diag_build(pps_cycle_prediction, ocxo2_cycle_prediction,
-                                     pps_residuals.ocxo2_valid,
-                                     pps_residuals.ocxo2_fast_residual_ns);
+                                     ocxo2_floorline_science.traditional_valid,
+                                     ocxo2_floorline_science.traditional_fast_residual_ns);
 
   // VCLOCK measurement Welford — bridge-interpolation self-test.
   // Sample in ns; mean == ppb under the "ns/sec == ppb" identity.
@@ -4662,10 +4840,10 @@ void clocks_beta_pps(void) {
     welford_update(welford_vclock, (double)g_vclock_measurement.second_residual_ns);
   }
 
-  // OCXO Welfords consume the exact FloorLine residual.  The integer
-  // pps_residual.fast_residual_ns remains the legacy public rendering; Welford
-  // keeps the sub-ns FloorLine value so mean/stddev do not throw away the
-  // precision raw_nanoseconds just proved.
+  // OCXO Welfords consume the exact canonical Delta residual.  The integer
+  // pps_residual.fast_residual_ns remains the public compatibility rendering;
+  // Welford keeps the sub-ns Delta value so mean/stddev do not throw away
+  // the same-yardstick cycle-domain precision.
   if (ocxo1_floorline_science.valid) {
     welford_update(welford_ocxo1,
                    ocxo1_floorline_science.fast_residual_ns_exact);
@@ -4710,7 +4888,7 @@ void clocks_beta_pps(void) {
 
   timebase_build_stage(TIMEBASE_BUILD_STAGE_WELFORD);
 
-  // Servo runs AFTER FloorLine residual/Welford updates so it sees this
+  // Servo runs AFTER Delta residual/Welford updates so it sees this
   // second's canonical science residual sample.
   ocxo_calibration_servo();
   timebase_build_stage(TIMEBASE_BUILD_STAGE_SERVO);
@@ -4739,9 +4917,9 @@ void clocks_beta_pps(void) {
   {
     Payload p;
     payload_add_timebase_pair_identity(p,
-                                       "TIMEBASE_FRAGMENT_V3",
+                                       "TIMEBASE_FRAGMENT_V4",
                                        "fragment_version",
-                                       3U,
+                                       4U,
                                        "fragment",
                                        public_count,
                                        public_gnss_ns);
@@ -4785,7 +4963,7 @@ void clocks_beta_pps(void) {
         const uint64_t expected_total_cycles = dwt_ns_to_cycles(public_gnss_ns);
         const double dwt_total_ppb = campaign_total_dwt_ppb(public_gnss_ns,
                                                             public_dwt_total);
-        science.add("schema", "TIMEBASE_CLOCK_SCIENCE_V1");
+        science.add("schema", "TIMEBASE_CLOCK_SCIENCE_V2");
         science.add("valid", g_dwt_cycles_between_pps_vclock != 0U);
         science.add("clock_id", 0U);
         science.add("edge_species", "PPS_GNSS_DWT_RULER");
@@ -4818,7 +4996,7 @@ void clocks_beta_pps(void) {
       pps.add("vclock_phase_cycles", (int32_t)g_pps_vclock_phase_cycles);
       if (!TIMEBASE_FRAGMENT_COMPACT_SCIENCE_ENABLED) {
         Payload science;
-        science.add("schema", "TIMEBASE_CLOCK_SCIENCE_V1");
+        science.add("schema", "TIMEBASE_CLOCK_SCIENCE_V2");
         science.add("valid", (bool)g_pps_dwt_cycles_between_edges_valid);
         science.add("clock_id", 0U);
         science.add("edge_species", "PHYSICAL_PPS_WITNESS");
@@ -4938,8 +5116,8 @@ void clocks_beta_pps(void) {
                                        public_count,
                                        public_gnss_ns);
     f.add("paired_fragment_topic", "TIMEBASE_FRAGMENT");
-    f.add("paired_fragment_schema", "TIMEBASE_FRAGMENT_V3");
-    f.add("paired_fragment_version", 3U);
+    f.add("paired_fragment_schema", "TIMEBASE_FRAGMENT_V4");
+    f.add("paired_fragment_version", 4U);
 
     if (TIMEBASE_FORENSICS_MINIMAL_PAYLOAD_ENABLED) {
       // Minimal companion mode: publish just enough forensic identity and
@@ -7204,7 +7382,7 @@ static FLASHMEM Payload cmd_report_stats(const Payload&) {
 
   publish_freq(p, "ocxo1", campaign_total_ppb_from_tau(ocxo1_floorline_tau));
   publish_freq(p, "ocxo2", campaign_total_ppb_from_tau(ocxo2_floorline_tau));
-  p.add("frequency_source", "FLOORLINE_SCIENCE_TOTALS");
+  p.add("frequency_source", "DELTA_CYCLES_TOTALS");
   p.add("ocxo1_frequency_valid", ocxo1_floorline_total_valid);
   p.add("ocxo2_frequency_valid", ocxo2_floorline_total_valid);
   p.add("recover_welford_capture_count", g_recover_welford_capture_count);
