@@ -1029,6 +1029,7 @@ static inline double ocxo_dac_voltage_from_code(double code) {
 
 bool ocxo_dac_set(ocxo_dac_state_t& s, double value);
 bool ocxo_dac_set_desired(ocxo_dac_state_t& s, double value);
+double ocxo_dac_fractional_snapshot(const ocxo_dac_state_t& s);
 bool ocxo_dac_write_hw_code(ocxo_dac_state_t& s,
                             uint16_t hw_code,
                             bool latch_fault = true);

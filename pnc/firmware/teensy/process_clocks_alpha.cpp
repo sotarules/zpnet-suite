@@ -442,10 +442,10 @@ static constexpr const char* OCXO_DAC_DITHER_TRANSITION_TIMER_NAME =
 static constexpr const char* OCXO_DAC_DITHER_SERVICE_TIMER_NAME =
     "clocks-dac-dither-service";
 
-static bool             g_ocxo_dac_dither_operator_enabled =
+static volatile bool    g_ocxo_dac_dither_operator_enabled =
     OCXO_DAC_DITHER_DEFAULT_ENABLED;
-static bool             g_ocxo_dac_dither_started = false;
-static bool             g_ocxo_dac_dither_service_pending = false;
+static volatile bool    g_ocxo_dac_dither_started = false;
+static volatile bool    g_ocxo_dac_dither_service_pending = false;
 static timepop_handle_t g_ocxo_dac_dither_frame_handle = TIMEPOP_INVALID_HANDLE;
 static timepop_handle_t g_ocxo_dac_dither_transition_handle = TIMEPOP_INVALID_HANDLE;
 static timepop_handle_t g_ocxo_dac_dither_service_handle = TIMEPOP_INVALID_HANDLE;
@@ -459,21 +459,60 @@ static void ocxo_dac_dither_begin_frame(void);
 static void ocxo_dac_dither_schedule_next_transition(uint16_t after_ms);
 static void ocxo_dac_dither_service_callback(timepop_ctx_t*, timepop_diag_t*, void*);
 
+// DAC control state is shared by the 1 Hz Beta servo and TimePop dither
+// callbacks.  Keep the critical section tiny: protect only the authored
+// control packet, never the physical I2C write.
+static inline uint32_t ocxo_dac_state_irq_save(void) {
+  uint32_t primask = 0;
+  __asm__ volatile ("mrs %0, primask" : "=r" (primask) :: "memory");
+  __disable_irq();
+  __asm__ volatile ("dmb" ::: "memory");
+  return primask;
+}
+
+static inline void ocxo_dac_state_irq_restore(uint32_t primask) {
+  __asm__ volatile ("dmb" ::: "memory");
+  if ((primask & 1u) == 0u) {
+    __enable_irq();
+  }
+}
+
+double ocxo_dac_fractional_snapshot(const ocxo_dac_state_t& s) {
+  const uint32_t primask = ocxo_dac_state_irq_save();
+  const double value = s.dac_fractional;
+  ocxo_dac_state_irq_restore(primask);
+  return value;
+}
+
+static void ocxo_dac_fractional_publish(ocxo_dac_state_t& s, double target) {
+  const uint32_t primask = ocxo_dac_state_irq_save();
+  s.dac_fractional = target;
+  s.dither_program_dirty = true;
+  ocxo_dac_state_irq_restore(primask);
+}
+
 static void ocxo_dac_dither_clear_pending(ocxo_dac_state_t& s) {
+  const uint32_t primask = ocxo_dac_state_irq_save();
   s.dither_pending_hw_write = false;
   s.dither_pending_hw_code = 0;
+  ocxo_dac_state_irq_restore(primask);
 }
 
 static void ocxo_dac_dither_mark_idle(ocxo_dac_state_t& s) {
+  const uint16_t rounded =
+      ocxo_dac_rounded_hw_code_from_value(ocxo_dac_fractional_snapshot(s));
+  const uint32_t primask = ocxo_dac_state_irq_save();
   s.dither_enabled = false;
   s.dither_active_this_frame = false;
   s.dither_current_phase_high = false;
   s.dither_program_dirty = false;
-  s.dither_low_code = ocxo_dac_rounded_hw_code_from_value(s.dac_fractional);
+  s.dither_low_code = rounded;
   s.dither_high_code = s.dither_low_code;
   s.dither_high_ms = 0;
   s.dither_last_frame_high_ms = 0;
-  ocxo_dac_dither_clear_pending(s);
+  s.dither_pending_hw_write = false;
+  s.dither_pending_hw_code = 0;
+  ocxo_dac_state_irq_restore(primask);
 }
 
 static void ocxo_dac_dither_cancel_transition(void) {
@@ -582,7 +621,18 @@ static void ocxo_dac_dither_service_callback(timepop_ctx_t*,
 }
 
 static void ocxo_dac_dither_program_lane(ocxo_dac_state_t& s) {
-  double target = s.dac_fractional;
+  double target = 0.0;
+  uint32_t dac_min = 0;
+  uint32_t dac_max = 0;
+
+  {
+    const uint32_t primask = ocxo_dac_state_irq_save();
+    target = s.dac_fractional;
+    dac_min = s.dac_min;
+    dac_max = s.dac_max;
+    ocxo_dac_state_irq_restore(primask);
+  }
+
   if (target != target) {  // NaN guard; infinities are clamped below.
     target = (double)AD5693R_DAC_DEFAULT;
   }
@@ -592,11 +642,11 @@ static void ocxo_dac_dither_program_lane(ocxo_dac_state_t& s) {
   if (low > (uint32_t)OCXO_DAC_SAFE_MAX_HW_CODE) {
     low = (uint32_t)OCXO_DAC_SAFE_MAX_HW_CODE;
   }
-  if (low > s.dac_max) low = s.dac_max;
-  if (low < s.dac_min) low = s.dac_min;
+  if (low > dac_max) low = dac_max;
+  if (low < dac_min) low = dac_min;
 
   uint32_t high = low;
-  if (high < (uint32_t)OCXO_DAC_SAFE_MAX_HW_CODE && high < s.dac_max) {
+  if (high < (uint32_t)OCXO_DAC_SAFE_MAX_HW_CODE && high < dac_max) {
     high++;
   }
 
@@ -617,6 +667,7 @@ static void ocxo_dac_dither_program_lane(ocxo_dac_state_t& s) {
     high_ms = 0;
   }
 
+  const uint32_t primask = ocxo_dac_state_irq_save();
   s.dither_enabled = g_ocxo_dac_dither_operator_enabled;
   s.dither_low_code = (uint16_t)low;
   s.dither_high_code = (uint16_t)high;
@@ -626,6 +677,7 @@ static void ocxo_dac_dither_program_lane(ocxo_dac_state_t& s) {
   s.dither_current_phase_high = s.dither_active_this_frame;
   s.dither_program_dirty = false;
   s.dither_frame_count++;
+  ocxo_dac_state_irq_restore(primask);
 }
 
 static void ocxo_dac_dither_start_lane_frame(ocxo_dac_state_t& s) {
@@ -637,16 +689,31 @@ static void ocxo_dac_dither_start_lane_frame(ocxo_dac_state_t& s) {
   ocxo_dac_dither_request_hw_code(s, start_code);
 }
 
-static bool ocxo_dac_dither_lane_due(const ocxo_dac_state_t& s,
-                                     uint16_t due_ms) {
-  return s.dither_active_this_frame &&
-         s.dither_current_phase_high &&
-         s.dither_high_ms == due_ms;
+static bool ocxo_dac_dither_claim_transition(ocxo_dac_state_t& s,
+                                             uint16_t due_ms,
+                                             uint16_t* out_low_code) {
+  bool claimed = false;
+  uint16_t low_code = 0;
+
+  const uint32_t primask = ocxo_dac_state_irq_save();
+  if (s.dither_active_this_frame &&
+      s.dither_current_phase_high &&
+      s.dither_high_ms == due_ms) {
+    low_code = s.dither_low_code;
+    s.dither_current_phase_high = false;
+    s.dither_transition_count++;
+    claimed = true;
+  }
+  ocxo_dac_state_irq_restore(primask);
+
+  if (claimed && out_low_code) *out_low_code = low_code;
+  return claimed;
 }
 
 static uint16_t ocxo_dac_dither_next_due_after(uint16_t after_ms) {
   uint16_t due = OCXO_DAC_DITHER_SLOTS_PER_FRAME;
 
+  const uint32_t primask = ocxo_dac_state_irq_save();
   if (ocxo1_dac.dither_active_this_frame &&
       ocxo1_dac.dither_current_phase_high &&
       ocxo1_dac.dither_high_ms > after_ms &&
@@ -660,6 +727,7 @@ static uint16_t ocxo_dac_dither_next_due_after(uint16_t after_ms) {
       ocxo2_dac.dither_high_ms < due) {
     due = ocxo2_dac.dither_high_ms;
   }
+  ocxo_dac_state_irq_restore(primask);
 
   return due;
 }
@@ -676,16 +744,14 @@ static void ocxo_dac_dither_transition_callback(timepop_ctx_t*,
     return;
   }
 
-  if (ocxo_dac_dither_lane_due(ocxo1_dac, due_ms)) {
-    ocxo_dac_dither_request_hw_code(ocxo1_dac, ocxo1_dac.dither_low_code);
-    ocxo1_dac.dither_current_phase_high = false;
-    ocxo1_dac.dither_transition_count++;
+  uint16_t low_code = 0;
+  if (ocxo_dac_dither_claim_transition(ocxo1_dac, due_ms, &low_code)) {
+    ocxo_dac_dither_request_hw_code(ocxo1_dac, low_code);
   }
 
-  if (ocxo_dac_dither_lane_due(ocxo2_dac, due_ms)) {
-    ocxo_dac_dither_request_hw_code(ocxo2_dac, ocxo2_dac.dither_low_code);
-    ocxo2_dac.dither_current_phase_high = false;
-    ocxo2_dac.dither_transition_count++;
+  low_code = 0;
+  if (ocxo_dac_dither_claim_transition(ocxo2_dac, due_ms, &low_code)) {
+    ocxo_dac_dither_request_hw_code(ocxo2_dac, low_code);
   }
 
   ocxo_dac_dither_schedule_next_transition(due_ms);
@@ -786,11 +852,11 @@ bool clocks_ocxo_dac_dither_disable(void) {
 
   const bool ok1 =
       ocxo_dac_write_hw_code(ocxo1_dac,
-                             ocxo_dac_rounded_hw_code_from_value(ocxo1_dac.dac_fractional),
+                             ocxo_dac_rounded_hw_code_from_value(ocxo_dac_fractional_snapshot(ocxo1_dac)),
                              true);
   const bool ok2 =
       ocxo_dac_write_hw_code(ocxo2_dac,
-                             ocxo_dac_rounded_hw_code_from_value(ocxo2_dac.dac_fractional),
+                             ocxo_dac_rounded_hw_code_from_value(ocxo_dac_fractional_snapshot(ocxo2_dac)),
                              true);
 
   return ok1 && ok2;
@@ -832,8 +898,7 @@ bool ocxo_dac_set_desired(ocxo_dac_state_t& s, double value) {
   const double target = ocxo_dac_clamp_real_value(value);
   const uint16_t hw_code = ocxo_dac_rounded_hw_code_from_value(target);
 
-  s.dac_fractional = target;
-  s.dither_program_dirty = true;
+  ocxo_dac_fractional_publish(s, target);
 
   if (!g_ocxo_dac_dither_operator_enabled) {
     return ocxo_dac_write_hw_code(s, hw_code, true);

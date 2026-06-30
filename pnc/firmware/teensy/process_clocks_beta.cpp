@@ -4418,9 +4418,9 @@ static void ocxo_dac_pacing_abort_all(void) {
 
 static void ocxo_dac_apply_synthetic_servo_step(ocxo_dac_state_t& dac,
                                                 double step) {
-  const double before = dac.dac_fractional;
+  const double before = ocxo_dac_fractional_snapshot(dac);
   (void)ocxo_dac_set_desired(dac, before + step);
-  const double applied = dac.dac_fractional - before;
+  const double applied = ocxo_dac_fractional_snapshot(dac) - before;
   dac.servo_last_step = applied;
   dac.servo_adjustments++;
   dac.pacing_intents++;
@@ -5175,8 +5175,8 @@ void clocks_beta_pps(void) {
   timebase_build_stage(TIMEBASE_BUILD_STAGE_SERVO);
 
   // DAC Welfords — track servo effort (the TEMPEST signal).
-  welford_update(welford_ocxo1_dac, ocxo1_dac.dac_fractional);
-  welford_update(welford_ocxo2_dac, ocxo2_dac.dac_fractional);
+  welford_update(welford_ocxo1_dac, ocxo_dac_fractional_snapshot(ocxo1_dac));
+  welford_update(welford_ocxo2_dac, ocxo_dac_fractional_snapshot(ocxo2_dac));
   timebase_build_stage(TIMEBASE_BUILD_STAGE_DAC_WELFORD);
 
   publish_dac_tick("STARTED");
