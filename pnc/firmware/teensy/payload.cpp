@@ -346,6 +346,25 @@ bool Payload::_self_ok(const char* op) const {
         return false;
     }
 
+    const uintptr_t entries_addr = (uintptr_t)_entries;
+    const uintptr_t arena_addr = (uintptr_t)_arena;
+    if (entries_addr == (uintptr_t)MAGIC_LIVE ||
+        entries_addr == (uintptr_t)MAGIC_DEAD ||
+        arena_addr == (uintptr_t)MAGIC_LIVE ||
+        arena_addr == (uintptr_t)MAGIC_DEAD) {
+        g_payload_integrity_fail++;
+        payload_note_error(PAYLOAD_ERR_INTEGRITY, op, this);
+        return false;
+    }
+
+    const bool entries_inline = (_entries == _inline_entries);
+    if ((entries_inline && _entry_cap != INLINE_ENTRIES) ||
+        (!entries_inline && _entry_cap <= INLINE_ENTRIES)) {
+        g_payload_integrity_fail++;
+        payload_note_error(PAYLOAD_ERR_INTEGRITY, op, this);
+        return false;
+    }
+
     if (_count > _entry_cap || _count > MAX_ENTRIES) {
         g_payload_integrity_fail++;
         payload_note_error(PAYLOAD_ERR_INTEGRITY, op, this);
@@ -358,7 +377,8 @@ bool Payload::_self_ok(const char* op) const {
         return false;
     }
 
-    if (_arena_used > 0 && !_arena) {
+    if ((_arena_cap == 0 && _arena != nullptr) ||
+        (_arena_cap != 0 && _arena == nullptr)) {
         g_payload_integrity_fail++;
         payload_note_error(PAYLOAD_ERR_INTEGRITY, op, this);
         return false;
@@ -389,34 +409,34 @@ bool Payload::_ensure_entries(size_t needed_count) {
         return false;
     }
 
-    Entry* new_entries = nullptr;
-    if (_entries == _inline_entries) {
-        new_entries = (Entry*)malloc(new_cap * sizeof(Entry));
-        if (new_entries) {
-            if (_count > 0) {
-                memcpy(new_entries, _inline_entries, _count * sizeof(Entry));
-            }
-            memset(new_entries + _count, 0, (new_cap - _count) * sizeof(Entry));
-            payload_note_entry_heap_delta((int32_t)(new_cap * sizeof(Entry)));
-        }
-    } else {
-        const size_t old_bytes = _entry_cap * sizeof(Entry);
-        new_entries = (Entry*)realloc(_entries, new_cap * sizeof(Entry));
-        if (new_entries) {
-            memset(new_entries + _entry_cap, 0, (new_cap - _entry_cap) * sizeof(Entry));
-            payload_note_entry_heap_delta((int32_t)(new_cap * sizeof(Entry) - old_bytes));
-        }
-    }
+    // Deliberately avoid realloc(): growth is an explicit allocate/copy/free
+    // transaction so allocator-side memmove never interprets Payload storage
+    // state while expanding the entry table.
+    const bool had_heap_entries = (_entries != _inline_entries);
+    Entry* const old_entries = had_heap_entries ? _entries : nullptr;
+    const size_t old_bytes = had_heap_entries ? (_entry_cap * sizeof(Entry)) : 0U;
+    const size_t new_bytes = new_cap * sizeof(Entry);
 
+    Entry* new_entries = (Entry*)malloc(new_bytes);
     if (!new_entries) {
         g_payload_entry_alloc_fail++;
         payload_note_error(PAYLOAD_ERR_ENTRY_ALLOC_FAIL, "ensure_entries_alloc", this);
         return false;
     }
 
+    if (_count > 0) {
+        memcpy(new_entries, _entries, _count * sizeof(Entry));
+    }
+    memset(new_entries + _count, 0, (new_cap - _count) * sizeof(Entry));
+
     _entries = new_entries;
     _entry_cap = new_cap;
     g_payload_entry_realloc_count++;
+    payload_note_entry_heap_delta((int32_t)(new_bytes - old_bytes));
+
+    if (old_entries) {
+        free(old_entries);
+    }
 
     if (_entry_cap > g_payload_max_entry_capacity_seen) {
         g_payload_max_entry_capacity_seen = _entry_cap;
@@ -451,18 +471,29 @@ bool Payload::_ensure_arena(size_t additional) {
         return false;
     }
 
+    // Deliberately avoid realloc(): growth is an explicit allocate/copy/free
+    // transaction so allocator-side memmove never receives Payload arena state.
+    char* const old_arena = _arena;
     const size_t old_cap = _arena_cap;
-    char* new_arena = (char*)realloc(_arena, new_cap);
+    char* new_arena = (char*)malloc(new_cap);
     if (!new_arena) {
         g_payload_arena_alloc_fail++;
         payload_note_error(PAYLOAD_ERR_ARENA_ALLOC_FAIL, "ensure_arena_alloc", this);
         return false;
     }
 
+    if (_arena_used > 0) {
+        memcpy(new_arena, _arena, _arena_used);
+    }
+
     _arena = new_arena;
     _arena_cap = new_cap;
     g_payload_arena_realloc_count++;
     payload_note_arena_heap_delta((int32_t)(new_cap - old_cap));
+
+    if (old_arena) {
+        free(old_arena);
+    }
 
     if (_arena_cap > g_payload_max_arena_capacity_seen) {
         g_payload_max_arena_capacity_seen = _arena_cap;
@@ -493,7 +524,21 @@ uint16_t Payload::_put(const char* str, size_t len) {
         return UINT16_MAX;
     }
 
+    uintptr_t arena_alias_offset = UINTPTR_MAX;
+    if (_arena) {
+        const uintptr_t arena_begin = (uintptr_t)_arena;
+        const uintptr_t arena_end = arena_begin + _arena_used;
+        const uintptr_t str_addr = (uintptr_t)str;
+        if (str_addr >= arena_begin && str_addr < arena_end) {
+            arena_alias_offset = str_addr - arena_begin;
+        }
+    }
+
     if (!_ensure_arena(len + 1U)) return UINT16_MAX;
+
+    if (arena_alias_offset != UINTPTR_MAX) {
+        str = _arena + arena_alias_offset;
+    }
 
     if (_arena_used + len + 1U > UINT16_MAX) {
         g_payload_arena_alloc_fail++;
