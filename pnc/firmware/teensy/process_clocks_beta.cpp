@@ -2603,6 +2603,76 @@ static uint32_t floorline_inferred_interval_cycles(
   return (cycles > (uint64_t)UINT32_MAX) ? UINT32_MAX : (uint32_t)cycles;
 }
 
+
+static FLASHMEM void payload_add_micro_court_fields(
+    Payload& parent,
+    const char* prefix,
+    bool valid,
+    const clocks_alpha_lane_forensics_t& f) {
+  char key[96];
+
+  auto add_bool = [&](const char* suffix, bool value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    parent.add(key, value);
+  };
+  auto add_u32 = [&](const char* suffix, uint32_t value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    parent.add(key, value);
+  };
+  auto add_i32 = [&](const char* suffix, int32_t value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    parent.add(key, value);
+  };
+  auto add_i64 = [&](const char* suffix, int64_t value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    parent.add(key, value);
+  };
+  auto add_str = [&](const char* suffix, const char* value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    parent.add(key, value ? value : "");
+  };
+
+  add_bool("court_valid", valid);
+  add_u32("court_mask", valid ? f.dwt_publication_verdict_mask : 0U);
+  add_str("court_reason",
+          valid && f.dwt_publication_verdict_reason
+              ? f.dwt_publication_verdict_reason
+              : "");
+  add_u32("court_wd", valid ? f.dwt_publication_watchdog_count : 0U);
+  add_u32("court_gate", valid ? f.dwt_publication_gate_cycles : 0U);
+  add_u32("court_xgate",
+          valid ? f.dwt_publication_cross_rail_gate_cycles : 0U);
+  add_u32("court_svc_gate",
+          valid ? f.dwt_publication_service_offset_gate_ticks : 0U);
+  add_u32("court_exp_cnt",
+          valid ? f.dwt_publication_expected_counter_delta_ticks : 0U);
+  add_u32("court_obs_cnt",
+          valid ? f.dwt_publication_observed_counter_delta_ticks : 0U);
+  add_u32("court_exp_int",
+          valid ? f.dwt_publication_expected_interval_cycles : 0U);
+  add_u32("court_pub_int",
+          valid ? f.dwt_publication_published_interval_cycles : 0U);
+  add_u32("court_obs_int",
+          valid ? f.dwt_publication_observed_interval_cycles : 0U);
+  add_u32("court_fl_int",
+          valid ? f.dwt_publication_floorline_interval_cycles : 0U);
+  add_i32("court_pub_err",
+          valid ? f.dwt_publication_published_interval_error_cycles : 0);
+  add_i32("court_obs_err",
+          valid ? f.dwt_publication_observed_interval_error_cycles : 0);
+  add_i32("court_fl_err",
+          valid ? f.dwt_publication_floorline_interval_error_cycles : 0);
+  add_i32("court_pub_obs",
+          valid ? f.dwt_publication_published_minus_observed_cycles : 0);
+  add_i32("court_fl_obs",
+          valid ? f.dwt_publication_floorline_minus_observed_cycles : 0);
+  add_i32("court_svc_off",
+          valid ? f.dwt_publication_service_offset_signed_ticks : 0);
+  add_i64("court_gnss_err",
+          valid ? f.dwt_publication_vclock_gnss_error_ns : 0LL);
+}
+
+
 static FLASHMEM void payload_add_floorline_object(Payload& parent,
                                          bool valid,
                                          const clocks_alpha_lane_forensics_t& f) {
@@ -5534,6 +5604,7 @@ void clocks_beta_pps(void) {
         g_timebase_forensics_micro_raw_count++;
         f.add("micro_raw_cycles", true);
         f.add("micro_schema", "MICRO_RAW_CYCLES_V1");
+        f.add("court_schema", "DWT_PUBLICATION_COURT_V1");
 
         f.add("pps_obs", g_pps_dwt_cycles_between_edges_valid
                          ? g_pps_dwt_cycles_between_edges
@@ -5581,6 +5652,7 @@ void clocks_beta_pps(void) {
         f.add("v_fl_rej", v_ok ? vclock_forensics.dwt_interval_reject_count : 0U);
         f.add("v_fl_bkt", v_ok ? vclock_forensics.dwt_interval_resync_count : 0U);
         f.add("v_fl_ierr", v_ok ? vclock_forensics.dwt_interval_residual_cycles : 0);
+        payload_add_micro_court_fields(f, "v", v_ok, vclock_forensics);
 
         const bool o1_ok = ocxo1_forensics_valid;
         const bool o1_fl = floorline_candidate_present(o1_ok, ocxo1_forensics);
@@ -5612,6 +5684,7 @@ void clocks_beta_pps(void) {
         f.add("o1_fl_rej", o1_ok ? ocxo1_forensics.dwt_interval_reject_count : 0U);
         f.add("o1_fl_bkt", o1_ok ? ocxo1_forensics.dwt_interval_resync_count : 0U);
         f.add("o1_fl_ierr", o1_ok ? ocxo1_forensics.dwt_interval_residual_cycles : 0);
+        payload_add_micro_court_fields(f, "o1", o1_ok, ocxo1_forensics);
         f.add("o1_pps_res", pps_residuals.ocxo1_valid
                             ? pps_residuals.ocxo1_fast_residual_ns
                             : 0LL);
@@ -5646,6 +5719,7 @@ void clocks_beta_pps(void) {
         f.add("o2_fl_rej", o2_ok ? ocxo2_forensics.dwt_interval_reject_count : 0U);
         f.add("o2_fl_bkt", o2_ok ? ocxo2_forensics.dwt_interval_resync_count : 0U);
         f.add("o2_fl_ierr", o2_ok ? ocxo2_forensics.dwt_interval_residual_cycles : 0);
+        payload_add_micro_court_fields(f, "o2", o2_ok, ocxo2_forensics);
         f.add("o2_pps_res", pps_residuals.ocxo2_valid
                             ? pps_residuals.ocxo2_fast_residual_ns
                             : 0LL);

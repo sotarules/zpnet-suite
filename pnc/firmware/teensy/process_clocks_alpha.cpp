@@ -1415,6 +1415,30 @@ struct alpha_lane_forensics_store_t {
   int32_t  dwt_used_minus_event_cycles = 0;
   int32_t  dwt_synthetic_error_cycles = 0;
   uint32_t dwt_synthetic_threshold_cycles = 0;
+  // Final DWT-at-edge publication tribunal transcript copied from
+  // process_interrupt.  These fields do not authorize or repair anything in
+  // Alpha/Beta; they preserve the court verdict beside the raw/used/FloorLine
+  // edge surfaces so TIMEBASE_FORENSICS can explain raw_cycles excursions.
+  uint32_t dwt_publication_verdict_mask = 0;
+  const char* dwt_publication_verdict_reason = nullptr;
+  uint32_t dwt_publication_watchdog_count = 0;
+  uint32_t dwt_publication_gate_cycles = 0;
+  uint32_t dwt_publication_cross_rail_gate_cycles = 0;
+  uint32_t dwt_publication_service_offset_gate_ticks = 0;
+  uint32_t dwt_publication_expected_counter_delta_ticks = 0;
+  uint32_t dwt_publication_observed_counter_delta_ticks = 0;
+  uint32_t dwt_publication_expected_interval_cycles = 0;
+  uint32_t dwt_publication_published_interval_cycles = 0;
+  uint32_t dwt_publication_observed_interval_cycles = 0;
+  uint32_t dwt_publication_floorline_interval_cycles = 0;
+  int32_t  dwt_publication_published_interval_error_cycles = 0;
+  int32_t  dwt_publication_observed_interval_error_cycles = 0;
+  int32_t  dwt_publication_floorline_interval_error_cycles = 0;
+  int32_t  dwt_publication_published_minus_observed_cycles = 0;
+  int32_t  dwt_publication_floorline_minus_observed_cycles = 0;
+  int32_t  dwt_publication_service_offset_signed_ticks = 0;
+  int64_t  dwt_publication_vclock_gnss_error_ns = 0;
+
   bool     dwt_interval_gate_valid = false;
   bool     dwt_interval_sample_accepted = false;
   bool     dwt_interval_sample_rejected = false;
@@ -3671,6 +3695,25 @@ static void alpha_forensics_reset_store(alpha_lane_forensics_store_t& s) {
   s.dwt_used_minus_event_cycles = 0;
   s.dwt_synthetic_error_cycles = 0;
   s.dwt_synthetic_threshold_cycles = 0;
+  s.dwt_publication_verdict_mask = 0;
+  s.dwt_publication_verdict_reason = nullptr;
+  s.dwt_publication_watchdog_count = 0;
+  s.dwt_publication_gate_cycles = 0;
+  s.dwt_publication_cross_rail_gate_cycles = 0;
+  s.dwt_publication_service_offset_gate_ticks = 0;
+  s.dwt_publication_expected_counter_delta_ticks = 0;
+  s.dwt_publication_observed_counter_delta_ticks = 0;
+  s.dwt_publication_expected_interval_cycles = 0;
+  s.dwt_publication_published_interval_cycles = 0;
+  s.dwt_publication_observed_interval_cycles = 0;
+  s.dwt_publication_floorline_interval_cycles = 0;
+  s.dwt_publication_published_interval_error_cycles = 0;
+  s.dwt_publication_observed_interval_error_cycles = 0;
+  s.dwt_publication_floorline_interval_error_cycles = 0;
+  s.dwt_publication_published_minus_observed_cycles = 0;
+  s.dwt_publication_floorline_minus_observed_cycles = 0;
+  s.dwt_publication_service_offset_signed_ticks = 0;
+  s.dwt_publication_vclock_gnss_error_ns = 0;
   s.dwt_interval_gate_valid = false;
   s.dwt_interval_sample_accepted = false;
   s.dwt_interval_sample_rejected = false;
@@ -3937,6 +3980,44 @@ static void alpha_forensics_publish(time_clock_id_t clock_id,
     s->dwt_used_minus_event_cycles = diag->dwt_used_minus_event_cycles;
     s->dwt_synthetic_error_cycles = diag->dwt_synthetic_error_cycles;
     s->dwt_synthetic_threshold_cycles = diag->dwt_synthetic_threshold_cycles;
+    s->dwt_publication_verdict_mask =
+        diag->dwt_publication_verdict_mask;
+    s->dwt_publication_verdict_reason =
+        diag->dwt_publication_verdict_reason;
+    s->dwt_publication_watchdog_count =
+        diag->dwt_publication_watchdog_count;
+    s->dwt_publication_gate_cycles =
+        diag->dwt_publication_gate_cycles;
+    s->dwt_publication_cross_rail_gate_cycles =
+        diag->dwt_publication_cross_rail_gate_cycles;
+    s->dwt_publication_service_offset_gate_ticks =
+        diag->dwt_publication_service_offset_gate_ticks;
+    s->dwt_publication_expected_counter_delta_ticks =
+        diag->dwt_publication_expected_counter_delta_ticks;
+    s->dwt_publication_observed_counter_delta_ticks =
+        diag->dwt_publication_observed_counter_delta_ticks;
+    s->dwt_publication_expected_interval_cycles =
+        diag->dwt_publication_expected_interval_cycles;
+    s->dwt_publication_published_interval_cycles =
+        diag->dwt_publication_published_interval_cycles;
+    s->dwt_publication_observed_interval_cycles =
+        diag->dwt_publication_observed_interval_cycles;
+    s->dwt_publication_floorline_interval_cycles =
+        diag->dwt_publication_floorline_interval_cycles;
+    s->dwt_publication_published_interval_error_cycles =
+        diag->dwt_publication_published_interval_error_cycles;
+    s->dwt_publication_observed_interval_error_cycles =
+        diag->dwt_publication_observed_interval_error_cycles;
+    s->dwt_publication_floorline_interval_error_cycles =
+        diag->dwt_publication_floorline_interval_error_cycles;
+    s->dwt_publication_published_minus_observed_cycles =
+        diag->dwt_publication_published_minus_observed_cycles;
+    s->dwt_publication_floorline_minus_observed_cycles =
+        diag->dwt_publication_floorline_minus_observed_cycles;
+    s->dwt_publication_service_offset_signed_ticks =
+        diag->dwt_publication_service_offset_signed_ticks;
+    s->dwt_publication_vclock_gnss_error_ns =
+        diag->dwt_publication_vclock_gnss_error_ns;
     s->dwt_interval_gate_valid = diag->dwt_interval_gate_valid;
     s->dwt_interval_sample_accepted = diag->dwt_interval_sample_accepted;
     s->dwt_interval_sample_rejected = diag->dwt_interval_sample_rejected;
@@ -4111,6 +4192,25 @@ static void alpha_forensics_publish(time_clock_id_t clock_id,
     s->dwt_used_minus_event_cycles = 0;
     s->dwt_synthetic_error_cycles = 0;
     s->dwt_synthetic_threshold_cycles = 0;
+    s->dwt_publication_verdict_mask = 0;
+    s->dwt_publication_verdict_reason = nullptr;
+    s->dwt_publication_watchdog_count = 0;
+    s->dwt_publication_gate_cycles = 0;
+    s->dwt_publication_cross_rail_gate_cycles = 0;
+    s->dwt_publication_service_offset_gate_ticks = 0;
+    s->dwt_publication_expected_counter_delta_ticks = 0;
+    s->dwt_publication_observed_counter_delta_ticks = 0;
+    s->dwt_publication_expected_interval_cycles = 0;
+    s->dwt_publication_published_interval_cycles = 0;
+    s->dwt_publication_observed_interval_cycles = 0;
+    s->dwt_publication_floorline_interval_cycles = 0;
+    s->dwt_publication_published_interval_error_cycles = 0;
+    s->dwt_publication_observed_interval_error_cycles = 0;
+    s->dwt_publication_floorline_interval_error_cycles = 0;
+    s->dwt_publication_published_minus_observed_cycles = 0;
+    s->dwt_publication_floorline_minus_observed_cycles = 0;
+    s->dwt_publication_service_offset_signed_ticks = 0;
+    s->dwt_publication_vclock_gnss_error_ns = 0;
     s->dwt_interval_gate_valid = false;
     s->dwt_interval_sample_accepted = false;
     s->dwt_interval_sample_rejected = false;
@@ -4314,6 +4414,44 @@ bool clocks_alpha_lane_forensics(time_clock_id_t clock,
     out->dwt_used_minus_event_cycles = s->dwt_used_minus_event_cycles;
     out->dwt_synthetic_error_cycles = s->dwt_synthetic_error_cycles;
     out->dwt_synthetic_threshold_cycles = s->dwt_synthetic_threshold_cycles;
+    out->dwt_publication_verdict_mask =
+        s->dwt_publication_verdict_mask;
+    out->dwt_publication_verdict_reason =
+        s->dwt_publication_verdict_reason;
+    out->dwt_publication_watchdog_count =
+        s->dwt_publication_watchdog_count;
+    out->dwt_publication_gate_cycles =
+        s->dwt_publication_gate_cycles;
+    out->dwt_publication_cross_rail_gate_cycles =
+        s->dwt_publication_cross_rail_gate_cycles;
+    out->dwt_publication_service_offset_gate_ticks =
+        s->dwt_publication_service_offset_gate_ticks;
+    out->dwt_publication_expected_counter_delta_ticks =
+        s->dwt_publication_expected_counter_delta_ticks;
+    out->dwt_publication_observed_counter_delta_ticks =
+        s->dwt_publication_observed_counter_delta_ticks;
+    out->dwt_publication_expected_interval_cycles =
+        s->dwt_publication_expected_interval_cycles;
+    out->dwt_publication_published_interval_cycles =
+        s->dwt_publication_published_interval_cycles;
+    out->dwt_publication_observed_interval_cycles =
+        s->dwt_publication_observed_interval_cycles;
+    out->dwt_publication_floorline_interval_cycles =
+        s->dwt_publication_floorline_interval_cycles;
+    out->dwt_publication_published_interval_error_cycles =
+        s->dwt_publication_published_interval_error_cycles;
+    out->dwt_publication_observed_interval_error_cycles =
+        s->dwt_publication_observed_interval_error_cycles;
+    out->dwt_publication_floorline_interval_error_cycles =
+        s->dwt_publication_floorline_interval_error_cycles;
+    out->dwt_publication_published_minus_observed_cycles =
+        s->dwt_publication_published_minus_observed_cycles;
+    out->dwt_publication_floorline_minus_observed_cycles =
+        s->dwt_publication_floorline_minus_observed_cycles;
+    out->dwt_publication_service_offset_signed_ticks =
+        s->dwt_publication_service_offset_signed_ticks;
+    out->dwt_publication_vclock_gnss_error_ns =
+        s->dwt_publication_vclock_gnss_error_ns;
     out->dwt_interval_gate_valid = s->dwt_interval_gate_valid;
     out->dwt_interval_sample_accepted = s->dwt_interval_sample_accepted;
     out->dwt_interval_sample_rejected = s->dwt_interval_sample_rejected;

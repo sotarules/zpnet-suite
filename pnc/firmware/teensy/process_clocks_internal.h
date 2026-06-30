@@ -357,6 +357,30 @@ struct clocks_alpha_lane_forensics_t {
   int32_t  dwt_used_minus_event_cycles;
   int32_t  dwt_synthetic_error_cycles;
   uint32_t dwt_synthetic_threshold_cycles;
+  // Final DWT-at-edge publication tribunal transcript copied from
+  // process_interrupt.  These fields do not authorize or repair anything in
+  // Alpha/Beta; they preserve the court verdict beside the raw/used/FloorLine
+  // edge surfaces so TIMEBASE_FORENSICS can explain raw_cycles excursions.
+  uint32_t dwt_publication_verdict_mask;
+  const char* dwt_publication_verdict_reason;
+  uint32_t dwt_publication_watchdog_count;
+  uint32_t dwt_publication_gate_cycles;
+  uint32_t dwt_publication_cross_rail_gate_cycles;
+  uint32_t dwt_publication_service_offset_gate_ticks;
+  uint32_t dwt_publication_expected_counter_delta_ticks;
+  uint32_t dwt_publication_observed_counter_delta_ticks;
+  uint32_t dwt_publication_expected_interval_cycles;
+  uint32_t dwt_publication_published_interval_cycles;
+  uint32_t dwt_publication_observed_interval_cycles;
+  uint32_t dwt_publication_floorline_interval_cycles;
+  int32_t  dwt_publication_published_interval_error_cycles;
+  int32_t  dwt_publication_observed_interval_error_cycles;
+  int32_t  dwt_publication_floorline_interval_error_cycles;
+  int32_t  dwt_publication_published_minus_observed_cycles;
+  int32_t  dwt_publication_floorline_minus_observed_cycles;
+  int32_t  dwt_publication_service_offset_signed_ticks;
+  int64_t  dwt_publication_vclock_gnss_error_ns;
+
   bool     dwt_interval_gate_valid;
   bool     dwt_interval_sample_accepted;
   bool     dwt_interval_sample_rejected;
