@@ -199,9 +199,14 @@ FLASH_CUT_FIRST_FRAGMENT_TIMEOUT_S = 180.0
 # FLOORLINE and QTIMER_DWT_RULER are intentionally not campaign-admission
 # gates.  Both remain valuable imported Teensy INTERRUPT feature surfaces, but
 # they are diagnostic / quality witnesses whose current definitions can strobe
-# during startup, recovery, and report-pressure windows.  Campaign START/RECOVER
-# admission must depend on custody and identity rails, not on these witness
-# surfaces, while FloorLine2 / future DWT-ruler policy is being refined.
+# during startup, recovery, and report-pressure windows.
+#
+# The same doctrine now applies to downstream publication-derived rails that
+# need the one-second event stream to prove themselves.  COUNTER32_LINEAGE,
+# STATIC_PREDICTION, and OCXO_PUBLIC_ORIGIN remain important post-start health
+# expectations, but they are not Pi admission gates: requiring them before
+# START/RECOVER can deadlock the system by waiting for facts that are only
+# produced after the campaign/publication path is allowed to run.
 FEATURE_PREFLIGHT_PROFILE = "CAMPAIGN_PREFLIGHT"
 FEATURE_PREFLIGHT_REQUIRED = (
     "PI.SYSTEM.FEATURE_STATUS",
@@ -213,11 +218,14 @@ FEATURE_PREFLIGHT_REQUIRED = (
     "TEENSY.SYSTEM.FEATURE_STATUS",
     "TEENSY.INTERRUPT.PPS_VCLOCK_AUTHORITY",
     "TEENSY.INTERRUPT.QTIMER_COUNTER_CUSTODY",
-    "TEENSY.INTERRUPT.COUNTER32_LINEAGE",
     "TEENSY.CLOCKS.DWT_CALIBRATION",
-    "TEENSY.CLOCKS.STATIC_PREDICTION",
     "TEENSY.CLOCKS.SMARTZERO",
     "TEENSY.CLOCKS.ALPHA_EPOCH",
+)
+
+FEATURE_PREFLIGHT_POST_START_EXPECTED = (
+    "TEENSY.INTERRUPT.COUNTER32_LINEAGE",
+    "TEENSY.CLOCKS.STATIC_PREDICTION",
     "TEENSY.CLOCKS.OCXO_PUBLIC_ORIGIN",
 )
 
@@ -4341,6 +4349,7 @@ def cmd_clocks_info(_: Optional[dict]) -> Dict[str, Any]:
         "feature_preflight": {
             "profile": FEATURE_PREFLIGHT_PROFILE,
             "required_features": list(FEATURE_PREFLIGHT_REQUIRED),
+            "post_start_expected_features": list(FEATURE_PREFLIGHT_POST_START_EXPECTED),
         },
         "timebase_silence_monitor": {
             "timeout_s": TIMEBASE_SILENCE_TIMEOUT_S,

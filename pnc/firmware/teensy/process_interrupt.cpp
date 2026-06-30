@@ -86,6 +86,12 @@ void clocks_watchdog_anomaly(const char* reason,
                              uint32_t detail2,
                              uint32_t detail3);
 
+// WATCHDOG_ANOMALY is a campaign-continuity surrender, not a boot/pre-campaign
+// diagnostic channel.  VCLOCK custody runs continuously before CLOCKS START, so
+// final-publication courts must remain diagnostic-only until CLOCKS says a
+// campaign ledger is actually armed.
+bool clocks_watchdog_campaign_armed(void);
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -558,10 +564,6 @@ static constexpr uint32_t ZERO_WORTHY_STREAK_SECONDS = 8;
 // instruments for refining these from campaign data.
 static constexpr int32_t  ZERO_WORTHY_MAX_ABS_AUTH_ERROR_CYCLES = 10;
 static constexpr int32_t  ZERO_WORTHY_MAX_ABS_ERROR_SUM_CYCLES = 40;
-// Coherent repeated excursions mean the OCXO genuinely moved (servo step /
-// retrace), not that the measurement glitched; reseed the chain after this
-// many coherent excursions instead of diverging forever.
-static constexpr uint32_t OCXO_YARDSTICK_COHERENT_RESEED_STREAK = 3;
 // Chain endpoint is carried modulo 2^48 in Q16, which is exactly modulo 2^32
 // DWT cycles -- wrap arithmetic stays consistent with the uint32 DWT domain.
 static constexpr uint64_t YARDSTICK_ENDPOINT_Q16_MASK = (1ULL << 48) - 1ULL;
@@ -1756,6 +1758,29 @@ struct dwt_repair_diag_t {
   int32_t  error_cycles = 0;
   uint32_t threshold_cycles = 0;
   const char* reason = "none";
+
+  // Final DWT-at-edge publication tribunal.  This is not a repair rail: any
+  // nonzero verdict mask is a hard custody/physics failure and must raise
+  // WATCHDOG_ANOMALY before subscriber publication.
+  uint32_t publication_verdict_mask = 0;
+  const char* publication_verdict_reason = "ok";
+  uint32_t publication_watchdog_count = 0;
+  uint32_t publication_gate_cycles = 0;
+  uint32_t publication_cross_rail_gate_cycles = 0;
+  uint32_t publication_service_offset_gate_ticks = 0;
+  uint32_t publication_expected_counter_delta_ticks = 0;
+  uint32_t publication_observed_counter_delta_ticks = 0;
+  uint32_t publication_expected_interval_cycles = 0;
+  uint32_t publication_published_interval_cycles = 0;
+  uint32_t publication_observed_interval_cycles = 0;
+  uint32_t publication_floorline_interval_cycles = 0;
+  int32_t  publication_published_interval_error_cycles = 0;
+  int32_t  publication_observed_interval_error_cycles = 0;
+  int32_t  publication_floorline_interval_error_cycles = 0;
+  int32_t  publication_published_minus_observed_cycles = 0;
+  int32_t  publication_floorline_minus_observed_cycles = 0;
+  int32_t  publication_service_offset_signed_ticks = 0;
+  int64_t  publication_vclock_gnss_error_ns = 0;
 
 
   // DWT interval evidence.  The retired predictor interval-gate producer has been
@@ -5508,6 +5533,432 @@ static inline uint32_t ocxo_published_dwt_at_edge(
       : observed_dwt_at_edge;
 }
 
+// ============================================================================
+// Final DWT-at-edge publication tribunal
+// ============================================================================
+//
+// This is the hard-fail courtroom immediately before subscriber publication.
+// It does not repair, resync, fall back, or choose a different endpoint.  The
+// publisher has already chosen observed vs FloorLine authority; this tribunal
+// asks whether that final fact is physically and semantically admissible.  A
+// nonzero verdict emits WATCHDOG_ANOMALY and the caller must not publish.
+
+static constexpr uint32_t DWT_PUBLICATION_EDGE_GATE_CYCLES =
+    LOWER_ENV_PUBLISH_HARD_EDGE_GATE_CYCLES;
+static constexpr uint32_t DWT_PUBLICATION_INTERVAL_GATE_CYCLES = 1024U;
+static constexpr uint32_t DWT_PUBLICATION_CROSS_RAIL_GATE_CYCLES = 4096U;
+static constexpr uint32_t DWT_PUBLICATION_SERVICE_OFFSET_GATE_TICKS = 1024U;
+static constexpr int64_t DWT_PUBLICATION_VCLOCK_GNSS_GATE_NS =
+    VCLOCK_GNSS_NS_INTEGRITY_GATE_NS;
+
+static constexpr uint32_t DWT_PUBLICATION_VERDICT_OK = 0U;
+static constexpr uint32_t DWT_PUBLICATION_VERDICT_ZERO_DWT = 1u << 0;
+static constexpr uint32_t DWT_PUBLICATION_VERDICT_SOURCE_MISMATCH = 1u << 1;
+static constexpr uint32_t DWT_PUBLICATION_VERDICT_FLOORLINE_EDGE = 1u << 2;
+static constexpr uint32_t DWT_PUBLICATION_VERDICT_FLOORLINE_INTERVAL = 1u << 3;
+static constexpr uint32_t DWT_PUBLICATION_VERDICT_FLOORLINE_LATE = 1u << 4;
+static constexpr uint32_t DWT_PUBLICATION_VERDICT_COUNTER_LOW16 = 1u << 5;
+static constexpr uint32_t DWT_PUBLICATION_VERDICT_SERVICE_OFFSET = 1u << 6;
+static constexpr uint32_t DWT_PUBLICATION_VERDICT_COUNTER_DELTA = 1u << 7;
+static constexpr uint32_t DWT_PUBLICATION_VERDICT_OBSERVED_INTERVAL = 1u << 8;
+static constexpr uint32_t DWT_PUBLICATION_VERDICT_PUBLISHED_INTERVAL = 1u << 9;
+static constexpr uint32_t DWT_PUBLICATION_VERDICT_CROSS_RAIL = 1u << 10;
+static constexpr uint32_t DWT_PUBLICATION_VERDICT_GNSS_PROJECTION = 1u << 11;
+static constexpr uint32_t DWT_PUBLICATION_VERDICT_COUNTER_ADJACENCY = 1u << 12;
+static constexpr uint32_t DWT_PUBLICATION_VERDICT_YARDSTICK_EXCURSION = 1u << 13;
+
+struct dwt_publication_lane_state_t {
+  bool     previous_valid = false;
+  uint32_t previous_published_dwt = 0;
+  uint32_t previous_observed_dwt = 0;
+  uint32_t previous_floorline_dwt = 0;
+  uint32_t previous_counter32 = 0;
+  bool     last_interval_valid = false;
+  uint32_t last_published_interval_cycles = 0;
+  uint32_t accept_count = 0;
+  uint32_t watchdog_count = 0;
+  uint32_t last_verdict_mask = DWT_PUBLICATION_VERDICT_OK;
+  uint32_t last_sequence = 0;
+  uint32_t last_published_dwt = 0;
+  uint32_t last_observed_dwt = 0;
+  uint32_t last_counter32 = 0;
+};
+
+struct dwt_publication_request_t {
+  interrupt_subscriber_kind_t kind = interrupt_subscriber_kind_t::NONE;
+  uint32_t sequence = 0;
+  uint32_t published_dwt = 0;
+  uint32_t observed_dwt = 0;
+  uint32_t target_counter32 = 0;
+  uint16_t target_low16 = 0;
+  bool     service_low16_valid = false;
+  uint16_t service_low16 = 0;
+  const cadence_regression_result_t* floorline = nullptr;
+  const dwt_repair_diag_t* repair = nullptr;
+};
+
+static dwt_publication_lane_state_t g_dwt_publication_vclock = {};
+static dwt_publication_lane_state_t g_dwt_publication_ocxo1 = {};
+static dwt_publication_lane_state_t g_dwt_publication_ocxo2 = {};
+
+static dwt_publication_lane_state_t* dwt_publication_lane_state_for(
+    interrupt_subscriber_kind_t kind) {
+  switch (kind) {
+    case interrupt_subscriber_kind_t::VCLOCK: return &g_dwt_publication_vclock;
+    case interrupt_subscriber_kind_t::OCXO1:  return &g_dwt_publication_ocxo1;
+    case interrupt_subscriber_kind_t::OCXO2:  return &g_dwt_publication_ocxo2;
+    default: return nullptr;
+  }
+}
+
+static void dwt_publication_reset_lane(interrupt_subscriber_kind_t kind) {
+  dwt_publication_lane_state_t* s = dwt_publication_lane_state_for(kind);
+  if (s) *s = dwt_publication_lane_state_t{};
+}
+
+static void dwt_publication_reset_all(void) {
+  dwt_publication_reset_lane(interrupt_subscriber_kind_t::VCLOCK);
+  dwt_publication_reset_lane(interrupt_subscriber_kind_t::OCXO1);
+  dwt_publication_reset_lane(interrupt_subscriber_kind_t::OCXO2);
+}
+
+static bool dwt_publication_vclock_gnss_projection_ready(uint32_t sequence) {
+  // The final publication tribunal can only hard-fail the VCLOCK DWT->GNSS
+  // projection after CLOCKS/Alpha has labeled at least one anchor in this
+  // freshly reset ring.  During START/RECOVER the first public VCLOCK edge is
+  // what creates the new anchor; before the label callback catches up, using
+  // an older/cross-campaign label would turn a correct bootstrap edge into a
+  // false WATCHDOG loop.  Skipping this court until a fresh nearby label exists
+  // is not a repair: the DWT fact is still judged by source, counter, interval,
+  // service-offset, and cross-rail courts.
+  if (sequence == 0U) return false;
+  if (g_pvc_anchor_label_update_count == 0U ||
+      !g_pvc_anchor_label_last_success ||
+      g_pvc_anchor_label_last_sequence == 0U) {
+    return false;
+  }
+
+  const int32_t label_age =
+      (int32_t)((uint32_t)sequence - g_pvc_anchor_label_last_sequence);
+  return label_age >= 0 &&
+         (uint32_t)label_age <= PVC_ANCHOR_RING_SIZE;
+}
+
+static uint32_t dwt_publication_expected_counter_delta_ticks(
+    interrupt_subscriber_kind_t kind) {
+  switch (kind) {
+    case interrupt_subscriber_kind_t::VCLOCK:
+      return (uint32_t)VCLOCK_COUNTS_PER_SECOND;
+    case interrupt_subscriber_kind_t::OCXO1:
+    case interrupt_subscriber_kind_t::OCXO2:
+      return OCXO_WITNESS_ONE_SECOND_COUNTS;
+    default:
+      return 0U;
+  }
+}
+
+static uint16_t dwt_publication_expected_low16(
+    interrupt_subscriber_kind_t kind,
+    uint32_t counter32) {
+  if (kind == interrupt_subscriber_kind_t::VCLOCK) {
+    return vclock_hardware_low16_from_synthetic(counter32);
+  }
+  return hardware_low16_from_semantic(counter32);
+}
+
+static int32_t dwt_publication_i32_from_i64(int64_t v) {
+  if (v > INT32_MAX) return INT32_MAX;
+  if (v < INT32_MIN) return INT32_MIN;
+  return (int32_t)v;
+}
+
+static uint32_t dwt_publication_abs_i32(int32_t v) {
+  return v < 0 ? (uint32_t)(-(int64_t)v) : (uint32_t)v;
+}
+
+static const char* dwt_publication_verdict_name(uint32_t verdict_mask) {
+  if (verdict_mask == DWT_PUBLICATION_VERDICT_OK) return "ok";
+  if (verdict_mask & DWT_PUBLICATION_VERDICT_ZERO_DWT) return "zero_dwt";
+  if (verdict_mask & DWT_PUBLICATION_VERDICT_SOURCE_MISMATCH) return "source_mismatch";
+  if (verdict_mask & DWT_PUBLICATION_VERDICT_FLOORLINE_EDGE) return "floorline_edge";
+  if (verdict_mask & DWT_PUBLICATION_VERDICT_FLOORLINE_INTERVAL) return "floorline_interval";
+  if (verdict_mask & DWT_PUBLICATION_VERDICT_FLOORLINE_LATE) return "floorline_late";
+  if (verdict_mask & DWT_PUBLICATION_VERDICT_COUNTER_LOW16) return "counter_low16";
+  if (verdict_mask & DWT_PUBLICATION_VERDICT_SERVICE_OFFSET) return "service_offset";
+  if (verdict_mask & DWT_PUBLICATION_VERDICT_COUNTER_DELTA) return "counter_delta";
+  if (verdict_mask & DWT_PUBLICATION_VERDICT_OBSERVED_INTERVAL) return "observed_interval";
+  if (verdict_mask & DWT_PUBLICATION_VERDICT_PUBLISHED_INTERVAL) return "published_interval";
+  if (verdict_mask & DWT_PUBLICATION_VERDICT_CROSS_RAIL) return "cross_rail";
+  if (verdict_mask & DWT_PUBLICATION_VERDICT_GNSS_PROJECTION) return "gnss_projection";
+  if (verdict_mask & DWT_PUBLICATION_VERDICT_COUNTER_ADJACENCY) return "counter_adjacency";
+  if (verdict_mask & DWT_PUBLICATION_VERDICT_YARDSTICK_EXCURSION) return "yardstick_excursion";
+  return "unknown";
+}
+
+static void dwt_publication_diag_seed(dwt_repair_diag_t& diag) {
+  diag.publication_verdict_mask = DWT_PUBLICATION_VERDICT_OK;
+  diag.publication_verdict_reason = "ok";
+  diag.publication_gate_cycles = DWT_PUBLICATION_INTERVAL_GATE_CYCLES;
+  diag.publication_cross_rail_gate_cycles = DWT_PUBLICATION_CROSS_RAIL_GATE_CYCLES;
+  diag.publication_service_offset_gate_ticks =
+      DWT_PUBLICATION_SERVICE_OFFSET_GATE_TICKS;
+}
+
+static void dwt_publication_note_cross_rail(
+    const dwt_publication_lane_state_t& other,
+    uint32_t published_interval_cycles,
+    uint32_t& verdict_mask) {
+  if (!other.last_interval_valid) return;
+  const int64_t delta =
+      (int64_t)(uint64_t)published_interval_cycles -
+      (int64_t)(uint64_t)other.last_published_interval_cycles;
+  if (interrupt_integrity_abs_i64(delta) >
+      (uint64_t)DWT_PUBLICATION_CROSS_RAIL_GATE_CYCLES) {
+    verdict_mask |= DWT_PUBLICATION_VERDICT_CROSS_RAIL;
+  }
+}
+
+static bool dwt_publication_adjudicate_or_watchdog(
+    const dwt_publication_request_t& req,
+    dwt_repair_diag_t& diag) {
+  dwt_publication_lane_state_t* s = dwt_publication_lane_state_for(req.kind);
+  if (!s) return false;
+
+  dwt_publication_diag_seed(diag);
+
+  const uint32_t expected_counter_delta =
+      dwt_publication_expected_counter_delta_ticks(req.kind);
+  const bool floorline_valid = req.floorline && req.floorline->valid;
+  const bool floorline_candidate =
+      floorline_valid && req.floorline->candidate_present &&
+      req.floorline->inferred_dwt_at_event != 0U;
+  const bool floorline_published =
+      floorline_valid && req.floorline->publish_floorline &&
+      req.floorline->inferred_dwt_at_event != 0U;
+  const uint32_t floorline_dwt = floorline_candidate
+      ? req.floorline->inferred_dwt_at_event
+      : 0U;
+  const uint32_t expected_published_dwt = floorline_published
+      ? floorline_dwt
+      : req.observed_dwt;
+
+  uint32_t verdict = DWT_PUBLICATION_VERDICT_OK;
+  diag.publication_expected_counter_delta_ticks = expected_counter_delta;
+
+  if (req.published_dwt == 0U || req.observed_dwt == 0U) {
+    verdict |= DWT_PUBLICATION_VERDICT_ZERO_DWT;
+  }
+
+  if (req.published_dwt != expected_published_dwt) {
+    verdict |= DWT_PUBLICATION_VERDICT_SOURCE_MISMATCH;
+  }
+
+  diag.publication_published_minus_observed_cycles =
+      lower_env_signed_delta_u32(req.observed_dwt, req.published_dwt);
+
+  if (floorline_candidate) {
+    const int32_t fl_minus_observed =
+        lower_env_signed_delta_u32(req.observed_dwt, floorline_dwt);
+    diag.publication_floorline_minus_observed_cycles = fl_minus_observed;
+
+    if (fl_minus_observed > (int32_t)LOWER_ENV_ERROR_GATE_CYCLES) {
+      verdict |= DWT_PUBLICATION_VERDICT_FLOORLINE_LATE;
+    }
+    if (dwt_publication_abs_i32(fl_minus_observed) >
+        DWT_PUBLICATION_EDGE_GATE_CYCLES) {
+      verdict |= DWT_PUBLICATION_VERDICT_FLOORLINE_EDGE;
+    }
+
+    if (req.floorline->observed_interval_valid &&
+        req.floorline->inferred_interval_valid) {
+      diag.publication_observed_interval_cycles =
+          req.floorline->observed_interval_cycles;
+      diag.publication_floorline_interval_cycles =
+          req.floorline->inferred_interval_cycles;
+      diag.publication_floorline_interval_error_cycles =
+          req.floorline->inferred_minus_observed_interval_cycles;
+      if (dwt_publication_abs_i32(
+              req.floorline->inferred_minus_observed_interval_cycles) >
+          LOWER_ENV_PUBLISH_HARD_INTERVAL_GATE_CYCLES) {
+        verdict |= DWT_PUBLICATION_VERDICT_FLOORLINE_INTERVAL;
+      }
+    }
+
+    if (!floorline_published &&
+        (req.floorline->publish_reason == FLOORLINE_REASON_EDGE_GATE ||
+         req.floorline->publish_reason == FLOORLINE_REASON_INTERVAL_GATE)) {
+      verdict |= DWT_PUBLICATION_VERDICT_FLOORLINE_EDGE;
+    }
+  }
+
+  const uint16_t expected_low16 =
+      dwt_publication_expected_low16(req.kind, req.target_counter32);
+  if (req.target_low16 != expected_low16) {
+    verdict |= DWT_PUBLICATION_VERDICT_COUNTER_LOW16;
+  }
+
+  if (req.service_low16_valid) {
+    const int32_t service_offset =
+        (int32_t)((int16_t)((uint16_t)(req.service_low16 - req.target_low16)));
+    diag.publication_service_offset_signed_ticks = service_offset;
+    if (dwt_publication_abs_i32(service_offset) >
+        DWT_PUBLICATION_SERVICE_OFFSET_GATE_TICKS) {
+      verdict |= DWT_PUBLICATION_VERDICT_SERVICE_OFFSET;
+    }
+  }
+
+  if (req.repair) {
+    if (req.repair->interval_adjacency_gate_valid &&
+        req.repair->interval_adjacency_rejected) {
+      verdict |= DWT_PUBLICATION_VERDICT_COUNTER_ADJACENCY;
+    }
+    if (req.repair->yardstick_valid && req.repair->yardstick_excursion) {
+      verdict |= DWT_PUBLICATION_VERDICT_YARDSTICK_EXCURSION;
+    }
+  }
+
+  uint32_t published_interval = 0U;
+  bool published_interval_valid = false;
+  if (s->previous_valid) {
+    const uint32_t observed_counter_delta =
+        req.target_counter32 - s->previous_counter32;
+    diag.publication_observed_counter_delta_ticks = observed_counter_delta;
+    if (observed_counter_delta != expected_counter_delta) {
+      verdict |= DWT_PUBLICATION_VERDICT_COUNTER_DELTA;
+    }
+
+    const uint32_t expected_interval =
+        vclock_cycles_for_ticks(expected_counter_delta);
+    diag.publication_expected_interval_cycles = expected_interval;
+
+    published_interval = req.published_dwt - s->previous_published_dwt;
+    const uint32_t observed_interval = req.observed_dwt - s->previous_observed_dwt;
+    diag.publication_published_interval_cycles = published_interval;
+    diag.publication_observed_interval_cycles = observed_interval;
+    published_interval_valid = (published_interval != 0U);
+
+    if (published_interval == 0U || observed_interval == 0U) {
+      verdict |= DWT_PUBLICATION_VERDICT_ZERO_DWT;
+    }
+
+    if (expected_interval != 0U) {
+      const int64_t pub_error64 =
+          (int64_t)(uint64_t)published_interval -
+          (int64_t)(uint64_t)expected_interval;
+      const int64_t obs_error64 =
+          (int64_t)(uint64_t)observed_interval -
+          (int64_t)(uint64_t)expected_interval;
+      diag.publication_published_interval_error_cycles =
+          dwt_publication_i32_from_i64(pub_error64);
+      diag.publication_observed_interval_error_cycles =
+          dwt_publication_i32_from_i64(obs_error64);
+
+      if (interrupt_integrity_abs_i64(pub_error64) >
+          (uint64_t)DWT_PUBLICATION_INTERVAL_GATE_CYCLES) {
+        verdict |= DWT_PUBLICATION_VERDICT_PUBLISHED_INTERVAL;
+      }
+      if (interrupt_integrity_abs_i64(obs_error64) >
+          (uint64_t)DWT_PUBLICATION_INTERVAL_GATE_CYCLES) {
+        verdict |= DWT_PUBLICATION_VERDICT_OBSERVED_INTERVAL;
+      }
+    }
+  }
+
+  if (published_interval_valid) {
+    if (req.kind != interrupt_subscriber_kind_t::VCLOCK) {
+      dwt_publication_note_cross_rail(g_dwt_publication_vclock,
+                                      published_interval,
+                                      verdict);
+    }
+    if (req.kind != interrupt_subscriber_kind_t::OCXO1) {
+      dwt_publication_note_cross_rail(g_dwt_publication_ocxo1,
+                                      published_interval,
+                                      verdict);
+    }
+    if (req.kind != interrupt_subscriber_kind_t::OCXO2) {
+      dwt_publication_note_cross_rail(g_dwt_publication_ocxo2,
+                                      published_interval,
+                                      verdict);
+    }
+  }
+
+  if (req.kind == interrupt_subscriber_kind_t::VCLOCK &&
+      req.sequence != 0U && req.published_dwt != 0U &&
+      dwt_publication_vclock_gnss_projection_ready(req.sequence)) {
+    const bridge_projection_t proj =
+        interrupt_dwt_to_vclock_gnss_projection(req.published_dwt);
+    if (proj.gnss_ns >= 0 && proj.anchor_sequence_used != 0U &&
+        proj.anchor_gnss_ns_at_edge >= 0) {
+      const int64_t sequence_delta =
+          (int64_t)req.sequence - (int64_t)proj.anchor_sequence_used;
+      const int64_t expected_gnss_ns =
+          proj.anchor_gnss_ns_at_edge +
+          sequence_delta * (int64_t)GNSS_NS_PER_SECOND;
+      const int64_t error_ns = proj.gnss_ns - expected_gnss_ns;
+      diag.publication_vclock_gnss_error_ns = error_ns;
+      if (interrupt_integrity_abs_i64(error_ns) >
+          (uint64_t)DWT_PUBLICATION_VCLOCK_GNSS_GATE_NS) {
+        verdict |= DWT_PUBLICATION_VERDICT_GNSS_PROJECTION;
+      }
+    }
+  }
+
+  diag.publication_verdict_mask = verdict;
+  diag.publication_verdict_reason = dwt_publication_verdict_name(verdict);
+  s->last_verdict_mask = verdict;
+  s->last_sequence = req.sequence;
+  s->last_published_dwt = req.published_dwt;
+  s->last_observed_dwt = req.observed_dwt;
+  s->last_counter32 = req.target_counter32;
+
+  if (verdict != DWT_PUBLICATION_VERDICT_OK) {
+    // The tribunal records both hard publication-law failures and side-rail
+    // audit failures in the same diagnostic mask.  Only the core publication
+    // law is campaign-fatal here.  The VCLOCK DWT->GNSS self-map and the OCXO
+    // PPS-yardstick rail are powerful courtroom witnesses, but they are not
+    // the final subscriber DWT-at-edge authority in this path.  Let them remain
+    // visible as diagnostics without creating a START/RECOVER watchdog loop.
+    const uint32_t fatal_verdict =
+        verdict & ~(DWT_PUBLICATION_VERDICT_GNSS_PROJECTION |
+                    DWT_PUBLICATION_VERDICT_YARDSTICK_EXCURSION);
+
+    if (fatal_verdict != DWT_PUBLICATION_VERDICT_OK) {
+      s->watchdog_count++;
+      diag.publication_watchdog_count = s->watchdog_count;
+
+      if (clocks_watchdog_campaign_armed()) {
+        clocks_watchdog_anomaly("dwt_publication_anomaly",
+                                (uint32_t)req.kind,
+                                verdict,
+                                req.published_dwt,
+                                req.target_counter32);
+        return false;
+      }
+
+      // Pre-campaign / boot diagnostic only.  VCLOCK heartbeat and PPS_VCLOCK
+      // anchor publication are allowed to run before a campaign exists; rejecting
+      // those facts here can prevent the START/RECOVER epoch from ever forming.
+      // Preserve the verdict in diagnostics, but do not emit WATCHDOG_ANOMALY
+      // and do not block publication until CLOCKS has armed campaign continuity.
+      diag.publication_verdict_reason = "pre_campaign_diagnostic";
+    } else {
+      diag.publication_verdict_reason = "side_rail_diagnostic";
+    }
+  }
+
+  s->previous_valid = true;
+  s->previous_published_dwt = req.published_dwt;
+  s->previous_observed_dwt = req.observed_dwt;
+  s->previous_floorline_dwt = floorline_published ? floorline_dwt : req.observed_dwt;
+  s->previous_counter32 = req.target_counter32;
+  if (published_interval_valid) {
+    s->last_interval_valid = true;
+    s->last_published_interval_cycles = published_interval;
+  }
+  s->accept_count++;
+  return true;
+}
+
 
 // ============================================================================
 // Diag fill + event dispatch
@@ -5673,6 +6124,40 @@ static void emit_one_second_event(interrupt_subscriber_runtime_t& rt,
     diag.dwt_synthetic_error_cycles = repair->error_cycles;
     diag.dwt_synthetic_threshold_cycles = repair->threshold_cycles;
     diag.dwt_synthetic_reason = repair->reason;
+    diag.dwt_publication_verdict_mask = repair->publication_verdict_mask;
+    diag.dwt_publication_verdict_reason = repair->publication_verdict_reason;
+    diag.dwt_publication_watchdog_count = repair->publication_watchdog_count;
+    diag.dwt_publication_gate_cycles = repair->publication_gate_cycles;
+    diag.dwt_publication_cross_rail_gate_cycles =
+        repair->publication_cross_rail_gate_cycles;
+    diag.dwt_publication_service_offset_gate_ticks =
+        repair->publication_service_offset_gate_ticks;
+    diag.dwt_publication_expected_counter_delta_ticks =
+        repair->publication_expected_counter_delta_ticks;
+    diag.dwt_publication_observed_counter_delta_ticks =
+        repair->publication_observed_counter_delta_ticks;
+    diag.dwt_publication_expected_interval_cycles =
+        repair->publication_expected_interval_cycles;
+    diag.dwt_publication_published_interval_cycles =
+        repair->publication_published_interval_cycles;
+    diag.dwt_publication_observed_interval_cycles =
+        repair->publication_observed_interval_cycles;
+    diag.dwt_publication_floorline_interval_cycles =
+        repair->publication_floorline_interval_cycles;
+    diag.dwt_publication_published_interval_error_cycles =
+        repair->publication_published_interval_error_cycles;
+    diag.dwt_publication_observed_interval_error_cycles =
+        repair->publication_observed_interval_error_cycles;
+    diag.dwt_publication_floorline_interval_error_cycles =
+        repair->publication_floorline_interval_error_cycles;
+    diag.dwt_publication_published_minus_observed_cycles =
+        repair->publication_published_minus_observed_cycles;
+    diag.dwt_publication_floorline_minus_observed_cycles =
+        repair->publication_floorline_minus_observed_cycles;
+    diag.dwt_publication_service_offset_signed_ticks =
+        repair->publication_service_offset_signed_ticks;
+    diag.dwt_publication_vclock_gnss_error_ns =
+        repair->publication_vclock_gnss_error_ns;
     diag.dwt_interval_gate_valid = repair->interval_gate_valid;
     diag.dwt_interval_sample_accepted = repair->interval_sample_accepted;
     diag.dwt_interval_sample_rejected = repair->interval_sample_rejected;
@@ -5808,6 +6293,7 @@ static vclock_perishable_ring_t g_vclock_fact_ring = {};
 static void vclock_fact_drain_callback(timepop_ctx_t*, timepop_diag_t*, void*);
 
 static void vclock_fact_ring_reset(void) {
+  dwt_publication_reset_lane(interrupt_subscriber_kind_t::VCLOCK);
   for (uint32_t i = 0; i < VCLOCK_PERISHABLE_FACT_RING_SIZE; i++) {
     g_vclock_fact_ring.facts[i] = vclock_perishable_fact_t{};
   }
@@ -6236,10 +6722,25 @@ static void vclock_apply_perishable_fact_deferred(
                                   : "vclock_floorline_init");
 
   const pps_t witness_pps = fact.witness_pps_valid ? fact.witness_pps : pps_t{};
+  const uint32_t publication_sequence =
+      (witness_pps.sequence != 0) ? witness_pps.sequence : fact.fallback_sequence;
+  dwt_publication_request_t publication{};
+  publication.kind = interrupt_subscriber_kind_t::VCLOCK;
+  publication.sequence = publication_sequence;
+  publication.published_dwt = published_dwt;
+  publication.observed_dwt = observed_dwt;
+  publication.target_counter32 = fact.target_counter32;
+  publication.target_low16 = fact.target_low16;
+  publication.service_low16_valid = true;
+  publication.service_low16 = fact.observed_low16;
+  publication.floorline = &lower_env;
+  publication.repair = &dwt_diag;
+  if (!dwt_publication_adjudicate_or_watchdog(publication, dwt_diag)) {
+    return;
+  }
+
   publish_vclock_domain_pps_vclock(witness_pps,
-                                    (witness_pps.sequence != 0)
-                                        ? witness_pps.sequence
-                                        : fact.fallback_sequence,
+                                    publication_sequence,
                                     published_dwt,
                                     fact.target_counter32,
                                     fact.target_low16,
@@ -6640,6 +7141,11 @@ static void ocxo_lane_event_lineage_reset(ocxo_lane_t& lane) {
 }
 
 static void ocxo_lane_measurement_witness_reset(ocxo_lane_t& lane) {
+  if (&lane == &g_ocxo1_lane) {
+    dwt_publication_reset_lane(interrupt_subscriber_kind_t::OCXO1);
+  } else if (&lane == &g_ocxo2_lane) {
+    dwt_publication_reset_lane(interrupt_subscriber_kind_t::OCXO2);
+  }
   // Measurement/witness state only.  This deliberately does not touch
   // clock32.current_counter32, clock32.hardware16, cadence_epoch_counter32,
   // cadence_next_counter32, or any programmed hardware compare mapping.
@@ -6852,10 +7358,27 @@ static void vclock_heartbeat_native_service(uint32_t isr_entry_dwt_raw,
                                   lower_env.valid
                                       ? "vclock_floorline_fallback"
                                       : "vclock_floorline_init_fallback");
+      const uint32_t publication_sequence =
+          (witness_pps_valid && witness_pps.sequence != 0)
+              ? witness_pps.sequence
+              : fallback_sequence;
+      dwt_publication_request_t publication{};
+      publication.kind = interrupt_subscriber_kind_t::VCLOCK;
+      publication.sequence = publication_sequence;
+      publication.published_dwt = published_dwt;
+      publication.observed_dwt = observed_dwt;
+      publication.target_counter32 = target_counter32;
+      publication.target_low16 = target_low16;
+      publication.service_low16_valid = true;
+      publication.service_low16 = bookend.due ? bookend.observed_low16 : fired_low16;
+      publication.floorline = &lower_env;
+      publication.repair = &dwt_diag;
+      if (!dwt_publication_adjudicate_or_watchdog(publication, dwt_diag)) {
+        return;
+      }
+
       publish_vclock_domain_pps_vclock(witness_pps_valid ? witness_pps : pps_t{},
-                                        (witness_pps_valid && witness_pps.sequence != 0)
-                                            ? witness_pps.sequence
-                                            : fallback_sequence,
+                                        publication_sequence,
                                         published_dwt,
                                         target_counter32,
                                         target_low16,
@@ -7573,36 +8096,19 @@ static uint32_t ocxo_lane_yardstick_observe(ocxo_lane_t& lane,
       if (excursion) {
         lane.yardstick_gate_excursion_count++;
 
-        const int32_t coherence = (int32_t)(observed_interval -
-            lane.yardstick_last_excursion_observed_interval_cycles);
-        const uint32_t abs_coherence = (uint32_t)(coherence < 0
-            ? -(int64_t)coherence
-            : (int64_t)coherence);
-        const bool coherent = lane.yardstick_excursion_streak > 0 &&
-            abs_coherence <= OCXO_YARDSTICK_GATE_THRESHOLD_CYCLES;
         lane.yardstick_excursion_streak++;
         lane.yardstick_last_excursion_observed_interval_cycles =
             observed_interval;
 
-        if (coherent &&
-            lane.yardstick_excursion_streak >=
-                OCXO_YARDSTICK_COHERENT_RESEED_STREAK) {
-          lane.yardstick_chain_interval_q16 =
-              ((uint64_t)observed_interval) << 16;
-          lane.yardstick_chain_endpoint_q16 =
-              (((uint64_t)observed_dwt) << 16) & YARDSTICK_ENDPOINT_Q16_MASK;
-          lane.yardstick_auth_interval_q16 =
-              ((uint64_t)observed_interval) << 16;
-          lane.yardstick_auth_endpoint_q16 =
-              (((uint64_t)observed_dwt) << 16) & YARDSTICK_ENDPOINT_Q16_MASK;
-          lane.yardstick_coherent_reseed_count++;
-          lane.yardstick_excursion_streak = 0;
-          lane.yardstick_auth_fast_lock_remaining_seconds =
-              OCXO_YARDSTICK_ANCHOR_FAST_LOCK_SECONDS;
-        }
+        // Hard-fail doctrine: a coherent run of excursions is not something
+        // the interrupt layer should quietly absorb.  The final publication
+        // tribunal below treats yardstick excursions as inadmissible and raises
+        // WATCHDOG_ANOMALY, so the previous self-reseed path is intentionally
+        // retired instead of masking the campaign-level failure evidence.
 
         // Excursion guard: the observed edge is quarantined evidence; the
-        // anchored rail coasts on pure inference and publishes it.
+        // anchored yardstick rail coasts as witness material only.  The final
+        // publication tribunal hard-fails before subscriber publication.
         lane.yardstick_auth_excursion_publish_count++;
         reason = "ocxo_yardstick_excursion_guard";
         zw_kind = zero_worthy_second_kind_t::EXCURSION;
@@ -7860,6 +8366,33 @@ static void ocxo_apply_perishable_fact_deferred(
   const uint32_t published_dwt =
       ocxo_published_dwt_at_edge(observed_dwt, lower_env);
 
+  // Truthful authority audit.  FloorLine is the canonical published
+  // endpoint; Yardstick and counter adjacency remain evidence only.
+  dwt_publication_diag_choose(dwt_diag,
+                              published_dwt,
+                              observed_dwt,
+                              LOWER_ENV_PUBLISH_HARD_EDGE_GATE_CYCLES,
+                              lower_env.valid
+                                  ? "ocxo_floorline"
+                                  : (yardstick_reason ? yardstick_reason
+                                                      : "ocxo_floorline_init"));
+  dwt_diag.yardstick_authority = OCXO_YARDSTICK_DWT_AUTHORITY_ENABLED;
+
+  dwt_publication_request_t publication{};
+  publication.kind = ctx.kind;
+  publication.sequence = fact.sequence;
+  publication.published_dwt = published_dwt;
+  publication.observed_dwt = observed_dwt;
+  publication.target_counter32 = fact.target_counter32;
+  publication.target_low16 = fact.target_low16;
+  publication.service_low16_valid = true;
+  publication.service_low16 = fact.service_counter_low16;
+  publication.floorline = &lower_env;
+  publication.repair = &dwt_diag;
+  if (!dwt_publication_adjudicate_or_watchdog(publication, dwt_diag)) {
+    return;
+  }
+
   const bool published_synthetic = (published_dwt != observed_dwt);
 
   const uint32_t dwt_coordinate_source = published_synthetic
@@ -7904,18 +8437,6 @@ static void ocxo_apply_perishable_fact_deferred(
   }
   lane->witness_previous_event_counter32 = fact.target_counter32;
   lane->witness_previous_event_counter32_valid = true;
-
-  // Truthful authority audit.  FloorLine is the canonical published
-  // endpoint; Yardstick and counter adjacency remain evidence only.
-  dwt_publication_diag_choose(dwt_diag,
-                              published_dwt,
-                              observed_dwt,
-                              LOWER_ENV_PUBLISH_HARD_EDGE_GATE_CYCLES,
-                              lower_env.valid
-                                  ? "ocxo_floorline"
-                                  : (yardstick_reason ? yardstick_reason
-                                                      : "ocxo_floorline_init"));
-  dwt_diag.yardstick_authority = OCXO_YARDSTICK_DWT_AUTHORITY_ENABLED;
 
   // We are already in TimePop ASAP/foreground context. Dispatch the authored
   // rollover OCXO edge directly from the fact drain.
@@ -10091,8 +10612,15 @@ bool interrupt_start(interrupt_subscriber_kind_t kind) {
   if (!rt || !rt->desc) return false;
   rt->start_count++;
   cadence_regression_reset_kind(kind);
+  dwt_publication_reset_lane(kind);
 
   if (kind == interrupt_subscriber_kind_t::VCLOCK) {
+    // START/RECOVER/Flash Cut begins a new publication epoch.  The previous
+    // always-on VCLOCK heartbeat and any prior labeled anchors are valid
+    // witnesses, but they are not valid baselines for the new subscriber
+    // campaign ledger.  Resetting here prevents the first campaign edge from
+    // being judged against pre-campaign state.
+    g_pvc_anchor_reset_pending = true;
     rt->active = true;
     g_vclock_lane.active = true;
     g_vclock_lane.phase_bootstrapped = true;
@@ -10138,6 +10666,7 @@ bool interrupt_stop(interrupt_subscriber_kind_t kind) {
   rt->active = false;
   rt->stop_count++;
   cadence_regression_reset_kind(kind);
+  dwt_publication_reset_lane(kind);
 
   if (kind == interrupt_subscriber_kind_t::VCLOCK) {
     g_vclock_lane.active = false;
@@ -10572,6 +11101,7 @@ static void runtime_reset_for_init(void) {
   runtime_reset_vclock_heartbeat_state();
   vclock_fact_ring_reset();
   runtime_reset_ocxo_fact_rings();
+  dwt_publication_reset_all();
   cadence_regression_reset_all();
   interrupt_features_mark_initializing();
 }

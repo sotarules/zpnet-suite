@@ -1176,6 +1176,33 @@ volatile uint32_t watchdog_anomaly_detail2         = 0;
 volatile uint32_t watchdog_anomaly_detail3         = 0;
 volatile uint32_t watchdog_anomaly_trigger_dwt     = 0;
 
+// WATCHDOG_ANOMALY is a campaign-continuity surrender, not an always-on
+// VCLOCK/PPS housekeeping alarm.  START/RECOVER briefly put Beta into
+// STARTED/name-owned state before the first public TIMEBASE row exists;
+// those pre-row tribunal verdicts must remain local diagnostics.
+static volatile bool watchdog_campaign_publication_armed = false;
+
+static void clocks_watchdog_disarm_campaign_publication(void) {
+  watchdog_campaign_publication_armed = false;
+}
+
+static void clocks_watchdog_arm_campaign_publication(void) {
+  watchdog_campaign_publication_armed = true;
+}
+
+bool clocks_watchdog_campaign_armed(void) {
+  return watchdog_campaign_publication_armed &&
+         campaign_state == clocks_campaign_state_t::STARTED &&
+         campaign_name[0] != '\0' &&
+         campaign_seconds != 0ULL &&
+         !request_start &&
+         !request_stop &&
+         !request_recover &&
+         !request_zero &&
+         !request_flash_cut &&
+         !campaign_warmup_active();
+}
+
 // ============================================================================
 // Welford — unified accumulator
 // ============================================================================
@@ -4432,6 +4459,8 @@ static void ocxo_dac_apply_synthetic_servo_step(ocxo_dac_state_t& dac,
 // ============================================================================
 
 static void campaign_accounting_reset_common(bool reset_servo_runtime) {
+  clocks_watchdog_disarm_campaign_publication();
+
   // Beta-local accounting reset only.  Alpha owns the active time/epoch
   // projection. Do not invalidate it here: after SmartZero install the new
   // epoch has just been authored; during acquisition the old service epoch
@@ -4670,6 +4699,7 @@ static void campaign_flash_cut_commit_at_pps(void) {
 // ============================================================================
 
 static void clocks_force_stop_campaign(void) {
+  clocks_watchdog_disarm_campaign_publication();
   campaign_state = clocks_campaign_state_t::STOPPED;
   request_start = false;
   request_stop = false;
@@ -4710,6 +4740,10 @@ void clocks_watchdog_anomaly(const char* reason,
                              uint32_t detail1,
                              uint32_t detail2,
                              uint32_t detail3) {
+  if (!clocks_watchdog_campaign_armed()) {
+    return;
+  }
+
   if (!watchdog_anomaly_active) {
     watchdog_anomaly_sequence++;
     safeCopy(watchdog_anomaly_reason, sizeof(watchdog_anomaly_reason),
@@ -4913,6 +4947,7 @@ void clocks_beta_pps(void) {
   }
 
   if (request_recover) {
+    clocks_watchdog_disarm_campaign_publication();
     g_timebase_recover_gate_count++;
     timebase_build_stage(TIMEBASE_BUILD_STAGE_RECOVER_GATE);
     watchdog_anomaly_active = false;
@@ -5380,6 +5415,7 @@ void clocks_beta_pps(void) {
 
   if (!TIMEBASE_FORENSICS_PUBLISH_ENABLED) {
     g_timebase_forensics_disabled_count++;
+    clocks_watchdog_arm_campaign_publication();
     return;
   }
 
@@ -5675,6 +5711,7 @@ void clocks_beta_pps(void) {
                                    g_clocks_feature_timebase_publication,
                                    system_feature_status_t::NOMINAL,
                                    true);
+    clocks_watchdog_arm_campaign_publication();
   }
 }
 
@@ -6013,6 +6050,7 @@ static FLASHMEM Payload cmd_recover(const Payload& args) {
   recover_ocxo2_ns = strtoull(s_ocxo2,  nullptr, 10);
   recover_welfords_capture(args);
 
+  clocks_watchdog_disarm_campaign_publication();
   interrupt_smartzero_abort();
   request_recover = true;
   request_start   = false;
@@ -6487,6 +6525,9 @@ static FLASHMEM void add_campaign_payload(Payload& p) {
   p.add("flash_cut_last_servo_mode_supplied", g_flash_cut_last_servo_mode_supplied);
   p.add("flash_cut_last_servo_mode", servo_mode_str(g_flash_cut_last_servo_mode));
   p.add("watchdog_anomaly_active", watchdog_anomaly_active);
+  p.add("watchdog_campaign_publication_armed",
+        (bool)watchdog_campaign_publication_armed);
+  p.add("watchdog_campaign_armed", clocks_watchdog_campaign_armed());
   p.add("watchdog_anomaly_publish_pending", watchdog_anomaly_publish_pending);
   p.add("watchdog_anomaly_sequence", watchdog_anomaly_sequence);
   p.add("watchdog_anomaly_reason", watchdog_anomaly_reason);
@@ -7258,6 +7299,9 @@ static FLASHMEM Payload cmd_report_timebase_publish(const Payload&) {
   gates.add("start_handoff_commit_count", g_start_handoff_commit_count);
   gates.add("campaign_state", campaign_state == clocks_campaign_state_t::STARTED ? "STARTED" : "STOPPED");
   gates.add("warmup_active", campaign_warmup_active());
+  gates.add("watchdog_campaign_publication_armed",
+            (bool)watchdog_campaign_publication_armed);
+  gates.add("watchdog_campaign_armed", clocks_watchdog_campaign_armed());
   gates.add("watchdog_anomaly_active", watchdog_anomaly_active);
   gates.add("request_start", request_start);
   gates.add("request_stop", request_stop);

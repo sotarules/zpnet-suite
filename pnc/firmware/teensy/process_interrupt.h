@@ -51,6 +51,25 @@ enum class interrupt_event_status_t : uint8_t {
   FAULT,
 };
 
+// Final DWT-at-edge publication tribunal verdict bits.  These are mirrored
+// from process_interrupt.cpp so TIMEBASE/raw_cycles tooling can decode a
+// WATCHDOG_ANOMALY mask without depending on private firmware internals.
+static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_VERDICT_OK = 0U;
+static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_VERDICT_ZERO_DWT = 1u << 0;
+static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_VERDICT_SOURCE_MISMATCH = 1u << 1;
+static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_VERDICT_FLOORLINE_EDGE = 1u << 2;
+static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_VERDICT_FLOORLINE_INTERVAL = 1u << 3;
+static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_VERDICT_FLOORLINE_LATE = 1u << 4;
+static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_VERDICT_COUNTER_LOW16 = 1u << 5;
+static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_VERDICT_SERVICE_OFFSET = 1u << 6;
+static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_VERDICT_COUNTER_DELTA = 1u << 7;
+static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_VERDICT_OBSERVED_INTERVAL = 1u << 8;
+static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_VERDICT_PUBLISHED_INTERVAL = 1u << 9;
+static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_VERDICT_CROSS_RAIL = 1u << 10;
+static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_VERDICT_GNSS_PROJECTION = 1u << 11;
+static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_VERDICT_COUNTER_ADJACENCY = 1u << 12;
+static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_VERDICT_YARDSTICK_EXCURSION = 1u << 13;
+
 struct interrupt_event_t {
   interrupt_subscriber_kind_t kind     = interrupt_subscriber_kind_t::NONE;
   interrupt_provider_kind_t   provider = interrupt_provider_kind_t::NONE;
@@ -99,6 +118,29 @@ struct interrupt_capture_diag_t {
   int32_t  dwt_synthetic_error_cycles = 0;
   uint32_t dwt_synthetic_threshold_cycles = 0;
   const char* dwt_synthetic_reason = nullptr;
+
+  // Final DWT-at-edge publication tribunal.  A nonzero verdict means the
+  // event was not admissible and should have raised WATCHDOG_ANOMALY before
+  // subscriber publication.  OK events carry zero here for audit continuity.
+  uint32_t dwt_publication_verdict_mask = 0;
+  const char* dwt_publication_verdict_reason = nullptr;
+  uint32_t dwt_publication_watchdog_count = 0;
+  uint32_t dwt_publication_gate_cycles = 0;
+  uint32_t dwt_publication_cross_rail_gate_cycles = 0;
+  uint32_t dwt_publication_service_offset_gate_ticks = 0;
+  uint32_t dwt_publication_expected_counter_delta_ticks = 0;
+  uint32_t dwt_publication_observed_counter_delta_ticks = 0;
+  uint32_t dwt_publication_expected_interval_cycles = 0;
+  uint32_t dwt_publication_published_interval_cycles = 0;
+  uint32_t dwt_publication_observed_interval_cycles = 0;
+  uint32_t dwt_publication_floorline_interval_cycles = 0;
+  int32_t  dwt_publication_published_interval_error_cycles = 0;
+  int32_t  dwt_publication_observed_interval_error_cycles = 0;
+  int32_t  dwt_publication_floorline_interval_error_cycles = 0;
+  int32_t  dwt_publication_published_minus_observed_cycles = 0;
+  int32_t  dwt_publication_floorline_minus_observed_cycles = 0;
+  int32_t  dwt_publication_service_offset_signed_ticks = 0;
+  int64_t  dwt_publication_vclock_gnss_error_ns = 0;
 
   bool     dwt_interval_gate_valid = false;
   bool     dwt_interval_sample_accepted = false;
