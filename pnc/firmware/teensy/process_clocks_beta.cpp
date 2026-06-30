@@ -1182,6 +1182,19 @@ volatile uint32_t watchdog_anomaly_trigger_dwt     = 0;
 // those pre-row tribunal verdicts must remain local diagnostics.
 static volatile bool watchdog_campaign_publication_armed = false;
 
+// Live servo-mode command handoff.
+//
+// CALIBRATE_OCXO remains the START/RECOVER campaign parameter.  SERVOS is the
+// live operator control surface: foreground command context records the desired
+// mode, and Beta applies it at the next safe PPS campaign boundary before the
+// servo input is selected for that row.
+static volatile bool          request_servo_mode_change = false;
+static volatile servo_mode_t  requested_servo_mode = servo_mode_t::OFF;
+static uint32_t               g_servo_mode_request_count = 0;
+static uint32_t               g_servo_mode_commit_count = 0;
+static servo_mode_t           g_servo_mode_last_requested = servo_mode_t::OFF;
+static servo_mode_t           g_servo_mode_last_committed = servo_mode_t::OFF;
+
 static void clocks_watchdog_disarm_campaign_publication(void) {
   watchdog_campaign_publication_armed = false;
 }
@@ -4443,6 +4456,37 @@ static void ocxo_dac_pacing_abort_all(void) {
   ocxo_dac_pacing_reset();
 }
 
+static void clocks_apply_servo_mode_now(servo_mode_t mode) {
+  const servo_mode_t previous = calibrate_ocxo_mode;
+  calibrate_ocxo_mode = mode;
+
+  // A mode boundary changes the meaning/filtering of selected_input_ppb.
+  // Reset predictor/settle state so a new live SERVOS mode never inherits stale
+  // slope memory from MEAN/TOTAL/NOW or from an OFF interval.
+  if (previous != mode) {
+    ocxo_dac_predictor_reset(ocxo1_dac);
+    ocxo_dac_predictor_reset(ocxo2_dac);
+    ocxo1_dac.servo_settle_count = 0;
+    ocxo2_dac.servo_settle_count = 0;
+  }
+
+  if (mode == servo_mode_t::OFF) {
+    ocxo_dac_pacing_abort_all();
+    ocxo1_dac.servo_last_step = 0.0;
+    ocxo2_dac.servo_last_step = 0.0;
+  }
+}
+
+static void clocks_commit_pending_servo_mode_change(void) {
+  if (!request_servo_mode_change) return;
+
+  const servo_mode_t mode = requested_servo_mode;
+  request_servo_mode_change = false;
+  clocks_apply_servo_mode_now(mode);
+  g_servo_mode_last_committed = mode;
+  g_servo_mode_commit_count++;
+}
+
 static void ocxo_dac_apply_synthetic_servo_step(ocxo_dac_state_t& dac,
                                                 double step) {
   const double before = ocxo_dac_fractional_snapshot(dac);
@@ -4706,6 +4750,8 @@ static void clocks_force_stop_campaign(void) {
   request_recover = false;
   request_zero = false;
   flash_cut_clear_pending();
+  request_servo_mode_change = false;
+  requested_servo_mode = servo_mode_t::OFF;
   calibrate_ocxo_mode = servo_mode_t::OFF;
   ocxo_dac_pacing_abort_all();
   campaign_warmup_reset();
@@ -5182,6 +5228,10 @@ void clocks_beta_pps(void) {
   const double ocxo2_total_tau = ocxo2_floorline_science.total_valid
       ? ocxo2_floorline_science.total_tau
       : 1.0;
+
+  // SERVOS live command handoff.  Apply here so this same campaign row's
+  // servo_input.selected_source and subsequent ocxo_calibration_servo() agree.
+  clocks_commit_pending_servo_mode_change();
 
   servo_input_diag_update(g_servo_input_ocxo1,
                           pps_residuals.ocxo1_valid,
@@ -5755,6 +5805,120 @@ static bool payload_try_get_nonempty_string(const Payload& args,
   return true;
 }
 
+static bool payload_try_get_string_alias(const Payload& args,
+                                         const char*& out,
+                                         const char* k1,
+                                         const char* k2,
+                                         const char* k3,
+                                         const char* k4,
+                                         const char* k5,
+                                         const char* k6,
+                                         const char* k7) {
+  return (k1 && payload_try_get_nonempty_string(args, k1, out)) ||
+         (k2 && payload_try_get_nonempty_string(args, k2, out)) ||
+         (k3 && payload_try_get_nonempty_string(args, k3, out)) ||
+         (k4 && payload_try_get_nonempty_string(args, k4, out)) ||
+         (k5 && payload_try_get_nonempty_string(args, k5, out)) ||
+         (k6 && payload_try_get_nonempty_string(args, k6, out)) ||
+         (k7 && payload_try_get_nonempty_string(args, k7, out));
+}
+
+static bool servo_mode_parse_strict(const char* s, servo_mode_t& out) {
+  if (!s || !*s) return false;
+  if (!strcasecmp(s, "OFF")) {
+    out = servo_mode_t::OFF;
+    return true;
+  }
+  if (!strcasecmp(s, "MEAN")) {
+    out = servo_mode_t::MEAN;
+    return true;
+  }
+  if (!strcasecmp(s, "TOTAL")) {
+    out = servo_mode_t::TOTAL;
+    return true;
+  }
+  if (!strcasecmp(s, "NOW")) {
+    out = servo_mode_t::NOW;
+    return true;
+  }
+  return false;
+}
+
+static bool payload_try_get_servo_mode(const Payload& args,
+                                       servo_mode_t& out,
+                                       const char*& raw) {
+  raw = nullptr;
+  if (!payload_try_get_string_alias(args, raw,
+                                    "servos",
+                                    "SERVOS",
+                                    "servo",
+                                    "SERVO",
+                                    "mode",
+                                    "MODE",
+                                    "calibrate_ocxo")) {
+    return false;
+  }
+  return servo_mode_parse_strict(raw, out);
+}
+
+static FLASHMEM Payload cmd_servos(const Payload& args) {
+  const servo_mode_t previous = calibrate_ocxo_mode;
+  const bool campaign_live =
+      campaign_state == clocks_campaign_state_t::STARTED &&
+      !campaign_warmup_active() &&
+      !request_start &&
+      !request_stop &&
+      !request_recover &&
+      !request_zero &&
+      !request_flash_cut;
+
+  const char* raw_mode = nullptr;
+  servo_mode_t requested = servo_mode_t::OFF;
+  if (!payload_try_get_servo_mode(args, requested, raw_mode)) {
+    Payload err;
+    err.add("error", raw_mode ? "invalid SERVOS mode" : "missing SERVOS mode");
+    err.add("status", "servos_rejected");
+    err.add("expected", "SERVOS=OFF|NOW|MEAN|TOTAL");
+    err.add("supplied", raw_mode ? raw_mode : "");
+    err.add("servo_mode", servo_mode_str(calibrate_ocxo_mode));
+    err.add("servo_active", calibrate_ocxo_mode != servo_mode_t::OFF);
+    return err;
+  }
+
+  g_servo_mode_request_count++;
+  g_servo_mode_last_requested = requested;
+
+  if (campaign_live) {
+    requested_servo_mode = requested;
+    request_servo_mode_change = true;
+  } else {
+    request_servo_mode_change = false;
+    requested_servo_mode = requested;
+    clocks_apply_servo_mode_now(requested);
+    g_servo_mode_last_committed = requested;
+    g_servo_mode_commit_count++;
+  }
+
+  Payload p;
+  p.add("status", campaign_live ? "servos_update_requested" : "servos_updated");
+  p.add("previous_mode", servo_mode_str(previous));
+  p.add("requested_mode", servo_mode_str(requested));
+  p.add("servo_mode", servo_mode_str(calibrate_ocxo_mode));
+  p.add("effective_mode", servo_mode_str(calibrate_ocxo_mode));
+  p.add("pending_mode", request_servo_mode_change
+                          ? servo_mode_str(requested_servo_mode)
+                          : servo_mode_str(calibrate_ocxo_mode));
+  p.add("request_pending", (bool)request_servo_mode_change);
+  p.add("active_campaign", campaign_live);
+  p.add("campaign", campaign_name);
+  p.add("campaign_seconds", campaign_seconds);
+  p.add("request_count", g_servo_mode_request_count);
+  p.add("commit_count", g_servo_mode_commit_count);
+  p.add("last_requested", servo_mode_str(g_servo_mode_last_requested));
+  p.add("last_committed", servo_mode_str(g_servo_mode_last_committed));
+  return p;
+}
+
 static FLASHMEM Payload cmd_flash_cut(const Payload& args) {
   const char* name = args.getString("campaign");
   if (!name || !*name) {
@@ -5979,6 +6143,8 @@ static FLASHMEM Payload cmd_stop(const Payload&) {
   // invalidate the installed epoch or defer a destructive stop branch to PPS.
   request_stop = false;
   watchdog_anomaly_active = false;
+  request_servo_mode_change = false;
+  requested_servo_mode = servo_mode_t::OFF;
   calibrate_ocxo_mode = servo_mode_t::OFF;
   ocxo_dac_pacing_abort_all();
 
@@ -7937,6 +8103,7 @@ static const process_command_entry_t CLOCKS_COMMANDS[] = {
   { "STOP",              cmd_stop              },
   { "ZERO",              cmd_zero              },
   { "RECOVER",           cmd_recover           },
+  { "SERVOS",            cmd_servos            },
   { "REPORT",            cmd_report            },
   { "REPORT_STATUS",     cmd_report_status     },
   { "REPORT_GATE",       cmd_report_gate       },
