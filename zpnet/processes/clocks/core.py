@@ -4476,28 +4476,230 @@ def _manual_dac_config_blob(
     return update_blob
 
 
+def _get_campaign_row_by_name(campaign_name: str) -> Optional[Dict[str, Any]]:
+    """Return the newest campaign row with decoded payload, or None."""
+    with open_db(row_dict=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, campaign, active, ts, payload
+            FROM campaigns
+            WHERE campaign = %s
+            ORDER BY ts DESC
+            LIMIT 1
+            """,
+            (campaign_name,),
+        )
+        row = cur.fetchone()
+
+    if row is None:
+        return None
+
+    payload = row["payload"]
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+
+    return {
+        "id": row["id"],
+        "campaign": row["campaign"],
+        "active": bool(row["active"]),
+        "ts": row.get("ts") if isinstance(row, dict) else None,
+        "payload": payload if isinstance(payload, dict) else {},
+    }
+
+
+def _first_float_with_source(*candidates: Tuple[str, Any]) -> Tuple[Optional[float], Optional[str]]:
+    """Return the first parseable float and its descriptive source path."""
+    for source, value in candidates:
+        parsed = _first_float(value)
+        if parsed is not None:
+            return parsed, source
+    return None, None
+
+
+def _campaign_report_dac_values(
+    campaign_payload: Dict[str, Any],
+) -> Tuple[Optional[float], Optional[float], Dict[str, Optional[str]]]:
+    """Extract OCXO DAC values from the campaign's last report fragment.
+
+    The intended authority is campaigns.payload.report.fragment.dac, which is
+    the last TIMEBASE_FRAGMENT denormalized into the CAMPAIGNS row.  Small
+    legacy fallbacks are retained so older campaign rows can still seed the
+    boot DAC defaults, but the returned source map makes the provenance visible.
+    """
+    report = campaign_payload.get("report")
+    report_obj = report if isinstance(report, dict) else {}
+    fragment = report_obj.get("fragment")
+    frag = fragment if isinstance(fragment, dict) else {}
+
+    dac1, dac1_source = _first_float_with_source(
+        ("campaign.report.fragment.dac.ocxo1_dac", _path_get(frag, "dac.ocxo1_dac")),
+        ("campaign.report.fragment.dac.ocxo1.value", _path_get(frag, "dac.ocxo1.value")),
+        ("campaign.report.fragment.ocxo1_dac", frag.get("ocxo1_dac")),
+        ("campaign.report.ocxo1_dac", report_obj.get("ocxo1_dac")),
+        ("campaign.payload.ocxo1_dac", campaign_payload.get("ocxo1_dac")),
+    )
+    dac2, dac2_source = _first_float_with_source(
+        ("campaign.report.fragment.dac.ocxo2_dac", _path_get(frag, "dac.ocxo2_dac")),
+        ("campaign.report.fragment.dac.ocxo2.value", _path_get(frag, "dac.ocxo2.value")),
+        ("campaign.report.fragment.ocxo2_dac", frag.get("ocxo2_dac")),
+        ("campaign.report.ocxo2_dac", report_obj.get("ocxo2_dac")),
+        ("campaign.payload.ocxo2_dac", campaign_payload.get("ocxo2_dac")),
+    )
+
+    return dac1, dac2, {"ocxo1": dac1_source, "ocxo2": dac2_source}
+
+
+def _campaign_dac_config_blob(
+    *,
+    campaign_name: str,
+    campaign_id: int,
+    dac1: float,
+    dac2: float,
+    source_paths: Dict[str, Optional[str]],
+    input_aliases: Dict[str, str],
+) -> Dict[str, Any]:
+    """Build a SYSTEM config payload from a historical campaign DAC snapshot."""
+    now_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    existing = _get_system_config()
+    baseline_dac_mean = dict(existing.get("baseline_dac_mean") or {})
+    baseline_dac = dict(existing.get("baseline_dac") or {})
+
+    dac1_rounded = round(float(dac1), 6)
+    dac2_rounded = round(float(dac2), 6)
+    baseline_dac_mean["ocxo1"] = dac1_rounded
+    baseline_dac_mean["ocxo2"] = dac2_rounded
+    baseline_dac["ocxo1"] = dac1_rounded
+    baseline_dac["ocxo2"] = dac2_rounded
+
+    return {
+        "ocxo1_dac": dac1_rounded,
+        "ocxo2_dac": dac2_rounded,
+        "baseline_dac_mean": baseline_dac_mean,
+        "baseline_dac": baseline_dac,
+        "manual_dac_override": True,
+        "manual_dac_override_at_utc": now_utc,
+        "manual_dac_override_source": "CLOCKS.SET_DAC_CAMPAIGN",
+        "manual_dac_override_campaign": campaign_name,
+        "manual_dac_override_campaign_id": int(campaign_id),
+        "manual_dac_override_args": {
+            "campaign": campaign_name,
+            "dac1": dac1_rounded,
+            "dac2": dac2_rounded,
+        },
+        "manual_dac_override_aliases": input_aliases,
+        "manual_dac_override_dac_source": source_paths,
+    }
+
+
+def _cmd_set_dac_from_campaign(
+    *,
+    campaign_name: str,
+    campaign_alias: Optional[str],
+) -> Dict[str, Any]:
+    """Set SYSTEM boot DAC defaults from a historical campaign's last fragment."""
+    campaign_name = str(campaign_name or "").strip()
+    if not campaign_name:
+        return {"success": False, "message": "SET_DAC campaign=... requires a non-empty campaign name"}
+
+    try:
+        row = _get_campaign_row_by_name(campaign_name)
+    except Exception as e:
+        logging.exception("❌ [clocks] SET_DAC campaign lookup failed")
+        return {"success": False, "message": str(e)}
+
+    if row is None:
+        return {"success": False, "message": f"No campaign named '{campaign_name}'"}
+
+    payload = row.get("payload") if isinstance(row, dict) else {}
+    payload = payload if isinstance(payload, dict) else {}
+    report = payload.get("report")
+    if not isinstance(report, dict) or not report:
+        return {
+            "success": False,
+            "message": f"Campaign '{campaign_name}' has no denormalized report / last TIMEBASE fragment",
+        }
+
+    dac1, dac2, source_paths = _campaign_report_dac_values(payload)
+    if dac1 is None or dac2 is None:
+        missing = []
+        if dac1 is None:
+            missing.append("ocxo1_dac")
+        if dac2 is None:
+            missing.append("ocxo2_dac")
+        return {
+            "success": False,
+            "message": (
+                f"Campaign '{campaign_name}' last TIMEBASE fragment does not contain "
+                f"required DAC value(s): {', '.join(missing)}"
+            ),
+            "payload": {"source_paths": source_paths},
+        }
+
+    update_blob = _campaign_dac_config_blob(
+        campaign_name=str(row["campaign"]),
+        campaign_id=int(row["id"]),
+        dac1=float(dac1),
+        dac2=float(dac2),
+        source_paths=source_paths,
+        input_aliases={"campaign": campaign_alias or "campaign"},
+    )
+
+    try:
+        _system_config_upsert(update_blob)
+    except Exception as e:
+        logging.exception("❌ [clocks] SET_DAC campaign SYSTEM config update failed")
+        return {"success": False, "message": str(e)}
+
+    result_payload = {
+        "source_campaign": str(row["campaign"]),
+        "source_campaign_id": int(row["id"]),
+        "source_campaign_active": bool(row.get("active")),
+        "ocxo1_dac": update_blob["ocxo1_dac"],
+        "ocxo2_dac": update_blob["ocxo2_dac"],
+        "source_paths": source_paths,
+        "baseline_dac": update_blob.get("baseline_dac", {}),
+        "baseline_dac_mean": update_blob.get("baseline_dac_mean", {}),
+        "manual_dac_override": True,
+        "manual_dac_override_source": update_blob["manual_dac_override_source"],
+        "manual_dac_override_at_utc": update_blob["manual_dac_override_at_utc"],
+        "applies_to": "next START/boot/recovery DAC seed only; running Teensy DAC is not changed",
+        "teensy_pushed_now": False,
+    }
+
+    logging.info("🔧 [clocks] SET_DAC campaign override: %s", result_payload)
+    return {"success": True, "message": "OK", "payload": result_payload}
+
+
 def cmd_set_dac(args: Optional[dict]) -> Dict[str, Any]:
     """
-    SET_DAC(DAC1=foo, DAC2=bar)
+    SET_DAC(DAC1=foo, DAC2=bar) or SET_DAC(campaign=Payload4)
 
     Persist explicit OCXO DAC boot seeds in the SYSTEM config record.
 
-    Accepted aliases:
+    Accepted direct aliases:
       DAC1, dac1, set_dac1, ocxo1_dac
       DAC2, dac2, set_dac2, ocxo2_dac
 
-    This command intentionally updates the baseline_dac_mean fallback too.
-    That prevents an older campaign mean from being used to seed the next run
-    after the operator has explicitly selected new DAC values.
+    Accepted campaign-source form:
+      campaign=<historical campaign name>
 
-    It also pushes the running Teensy best-effort so the always-on dither layer
-    begins honoring the new synthetic real value immediately.
+    Direct DAC arguments update SYSTEM config and push the running Teensy
+    best-effort.  The campaign-source form updates SYSTEM config only: it
+    copies the DAC values from the campaign row's last denormalized
+    TIMEBASE_FRAGMENT so the next START/boot/recovery uses those defaults.
+
+    Both forms intentionally update baseline_dac_mean / baseline_dac too, so
+    older fallback paths cannot resurrect an unwanted servo-derived value.
     """
     if not args:
         return {
             "success": False,
-            "message": "SET_DAC requires DAC1 and/or DAC2 argument",
+            "message": "SET_DAC requires DAC1/DAC2 or campaign argument",
         }
+
+    campaign_alias, campaign_value = _arg_first_present(args, "campaign")
 
     try:
         has_dac1, dac1, alias1 = _parse_dac_arg(
@@ -4509,10 +4711,21 @@ def cmd_set_dac(args: Optional[dict]) -> Dict[str, Any]:
     except ValueError as e:
         return {"success": False, "message": str(e)}
 
+    if campaign_alias is not None:
+        if has_dac1 or has_dac2:
+            return {
+                "success": False,
+                "message": "SET_DAC campaign=... cannot be combined with explicit DAC values",
+            }
+        return _cmd_set_dac_from_campaign(
+            campaign_name=str(campaign_value),
+            campaign_alias=campaign_alias,
+        )
+
     if not has_dac1 and not has_dac2:
         return {
             "success": False,
-            "message": "SET_DAC requires DAC1 and/or DAC2 argument",
+            "message": "SET_DAC requires DAC1/DAC2 or campaign argument",
         }
 
     input_aliases: Dict[str, str] = {}
