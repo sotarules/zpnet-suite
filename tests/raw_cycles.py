@@ -710,6 +710,94 @@ def regression_diag(root: Dict[str, Any],
     }
 
 
+def lane_micro_raw_cycles_diag(root: Dict[str, Any],
+                               frag: Dict[str, Any],
+                               forensic: Dict[str, Any],
+                               lane: str) -> Dict[str, Any]:
+    """Extract the flat MICRO_RAW_CYCLES_V1 lane fields verbatim.
+
+    The normal report deliberately resolves several aliases into the three
+    visible rails.  For pathology work we also want the raw ferry fields so we
+    can tell whether a suspicious endpoint came from TIMEBASE_FORENSICS itself
+    or from a parser fallback/provenance mistake.
+    """
+    return {
+        "raw_dwt": _micro_first_int(root, frag, forensic, lane, "raw"),
+        "orig_dwt": _micro_first_int(root, frag, forensic, lane, "orig"),
+        "fl_dwt": _micro_first_int(root, frag, forensic, lane, "fl"),
+        "pub_dwt": _micro_first_int(root, frag, forensic, lane, "pub"),
+        "used_dwt": _micro_first_int(root, frag, forensic, lane, "used"),
+        "ema_dwt": _micro_first_int(root, frag, forensic, lane, "ema"),
+        "observed_interval_cycles": _micro_first_int(root, frag, forensic, lane, "obs"),
+        "effective_interval_cycles": _micro_first_int(root, frag, forensic, lane, "eff"),
+        "floorline_interval_cycles": _micro_first_int(root, frag, forensic, lane, "fl_cyc"),
+        "residual_cycles": _micro_first_int(root, frag, forensic, lane, "res"),
+        "pps_residual_cycles": _micro_first_int(root, frag, forensic, lane, "pps_res"),
+        "floorline_error_cycles": _micro_first_int(root, frag, forensic, lane, "fl_err"),
+        "floorline_interval_error_cycles": _micro_first_int(root, frag, forensic, lane, "fl_ierr"),
+        "floorline_source": _micro_first_int(root, frag, forensic, lane, "fl_src"),
+        "floorline_reason": _micro_first_int(root, frag, forensic, lane, "fl_reason"),
+        "floorline_accept_count": _micro_first_int(root, frag, forensic, lane, "fl_acc"),
+        "floorline_bucket_count": _micro_first_int(root, frag, forensic, lane, "fl_bkt"),
+        "floorline_reject_count": _micro_first_int(root, frag, forensic, lane, "fl_rej"),
+    }
+
+
+def fragment_lane_science_diag(root: Dict[str, Any],
+                               frag: Dict[str, Any],
+                               lane: str) -> Dict[str, Any]:
+    """Extract the paired TIMEBASE_FRAGMENT science fields for a lane.
+
+    Pathology rows can be caused either by firmware publishing a bad endpoint or
+    by raw_cycles selecting the wrong schema fallback.  The fragment science
+    object is the independent subscriber-facing record, so printing it beside
+    MICRO_RAW_CYCLES exposes which side carried the suspicious value.
+    """
+    lane_obj = frag.get(lane) if isinstance(frag.get(lane), dict) else {}
+    if not lane_obj and isinstance(root.get("fragment"), dict):
+        root_frag = root.get("fragment")
+        lane_obj = root_frag.get(lane) if isinstance(root_frag.get(lane), dict) else {}
+    science = lane_obj.get("science") if isinstance(lane_obj.get("science"), dict) else {}
+
+    return {
+        "valid": _as_bool(science.get("valid")),
+        "schema": _as_str(science.get("schema")),
+        "edge_species": _as_str(science.get("edge_species")),
+        "frequency_source": _as_str(science.get("frequency_source")),
+        "residual_source": _as_str(science.get("residual_source")),
+        "public_count": _as_int(science.get("public_count")),
+        "delta_reference_public_count": _as_int(science.get("delta_reference_public_count")),
+        "delta_publication_public_count": _as_int(science.get("delta_publication_public_count")),
+        "raw_dwt": _as_int(science.get("clock_raw_dwt_at_edge")),
+        "floorline_dwt": _as_int(science.get("clock_floorline_dwt_at_edge")),
+        "published_dwt": _as_int(science.get("clock_published_dwt_at_edge")),
+        "pps_vclock_dwt": _as_int(science.get("pps_vclock_dwt_at_edge")),
+        "observed_interval_cycles": _as_int(science.get("clock_observed_interval_cycles")),
+        "floorline_interval_cycles": _as_int(science.get("clock_floorline_interval_cycles")),
+        "delta_raw_clock_interval_cycles": _as_int(science.get("delta_raw_clock_interval_cycles")),
+        "delta_raw_reference_interval_cycles": _as_int(science.get("delta_raw_reference_interval_cycles")),
+        "delta_raw_residual_cycles": _as_int(science.get("delta_raw_residual_cycles")),
+        "delta_floorline_clock_interval_cycles": _as_int(science.get("delta_floorline_clock_interval_cycles")),
+        "delta_floorline_reference_interval_cycles": _as_int(science.get("delta_floorline_reference_interval_cycles")),
+        "delta_floorline_residual_cycles": _as_int(science.get("delta_floorline_residual_cycles")),
+        "reported_minus_canonical_residual_ns": _as_int(science.get("reported_minus_canonical_residual_ns")),
+        "reported_minus_floorline_residual_ns": _as_int(science.get("reported_minus_floorline_residual_ns")),
+        "clock_interval_ns": _as_int(science.get("clock_interval_ns")),
+        "gnss_interval_ns": _as_int(science.get("gnss_interval_ns")),
+        "fast_residual_ns": _as_int(science.get("fast_residual_ns")),
+        "traditional_fast_residual_ns": _as_int(science.get("traditional_fast_residual_ns")),
+        "ppb_1s": _as_float(science.get("ppb_1s")),
+        "total_fast_residual_ns": _as_int(science.get("total_fast_residual_ns")),
+        "total_ppb": _as_float(science.get("total_ppb")),
+        "traditional_total_fast_residual_ns": _as_int(science.get("traditional_total_fast_residual_ns")),
+        "traditional_total_ppb": _as_float(science.get("traditional_total_ppb")),
+        "ns": _as_int(lane_obj.get("ns")),
+        "measured_gnss_ns": _as_int(lane_obj.get("measured_gnss_ns")),
+        "measured_minus_ns": _as_int(lane_obj.get("measured_minus_ns")),
+        "ns_source_name": _as_str(lane_obj.get("ns_source_name")),
+    }
+
+
 def lane_counter_delta(root: Dict[str, Any],
                        frag: Dict[str, Any],
                        forensic: Dict[str, Any],
@@ -970,6 +1058,9 @@ def collect_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]
                 else {}
             )
 
+            micro = lane_micro_raw_cycles_diag(root, frag, forensic, lane_key)
+            science = fragment_lane_science_diag(root, frag, lane_key)
+
             data = {
                 "raw": raw_interval,
                 "raw_delta": _interval_delta_with_private_prev(
@@ -1006,6 +1097,8 @@ def collect_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]
                 "pub_used_dwt": used_dwt,
                 "raw_dwt": _first_int(original_dwt, fl_observed_dwt),
                 "fl_dwt": fl_inferred_dwt,
+                "micro": micro,
+                "science": science,
                 "court": court,
             }
             row["lanes"][lane] = data
@@ -1333,6 +1426,134 @@ def _format_optional_delta(value: Optional[int]) -> str:
     return "---" if value is None else f"{value:+,d}"
 
 
+def _format_optional_float(value: Optional[float], decimals: int = 6) -> str:
+    return "---" if value is None else f"{value:+,.{decimals}f}"
+
+
+def _endpoint_agreement(selected: Optional[int], reference: Optional[int]) -> Optional[int]:
+    if selected is None or reference is None:
+        return None
+    return _signed_delta_u32(selected, reference)
+
+
+def _interesting_endpoint_notes(label: str, value: Optional[int]) -> List[str]:
+    if value is None:
+        return []
+    notes: List[str] = []
+    if value in (0, 1, 0xFFFFFFFF):
+        notes.append(f"{label}={_fmt_int(value)} looks sentinel/poisoned")
+    if value != 0 and value % 1_000_000_000 == 0:
+        notes.append(f"{label}={_fmt_int(value)} is a round 1e9-domain value, suspicious for DWT")
+    return notes
+
+
+def _append_endpoint_provenance_lines(lines: List[str], lane: str, data: Dict[str, Any]) -> None:
+    micro = data.get("micro") if isinstance(data.get("micro"), dict) else {}
+    science = data.get("science") if isinstance(data.get("science"), dict) else {}
+
+    raw_dwt = data.get("raw_dwt")
+    fl_dwt = data.get("fl_dwt")
+    pub_dwt = data.get("pub_used_dwt")
+
+    lines.append(
+        f"       {lane} selected endpoints: "
+        f"raw={_fmt_int(raw_dwt)} "
+        f"fl={_fmt_int(fl_dwt)} "
+        f"pub={_fmt_int(pub_dwt)}"
+    )
+    lines.append(
+        f"       {lane} micro endpoints: "
+        f"raw={_fmt_int(micro.get('raw_dwt'))} "
+        f"orig={_fmt_int(micro.get('orig_dwt'))} "
+        f"fl={_fmt_int(micro.get('fl_dwt'))} "
+        f"pub={_fmt_int(micro.get('pub_dwt'))} "
+        f"used={_fmt_int(micro.get('used_dwt'))} "
+        f"ema={_fmt_int(micro.get('ema_dwt'))}"
+    )
+    lines.append(
+        f"       {lane} micro intervals: "
+        f"obs={_fmt_int(micro.get('observed_interval_cycles'))} "
+        f"eff={_fmt_int(micro.get('effective_interval_cycles'))} "
+        f"fl_cyc={_fmt_int(micro.get('floorline_interval_cycles'))} "
+        f"res={_format_optional_delta(micro.get('residual_cycles'))} "
+        f"pps_res={_format_optional_delta(micro.get('pps_residual_cycles'))} "
+        f"fl_err={_format_optional_delta(micro.get('floorline_error_cycles'))} "
+        f"fl_ierr={_format_optional_delta(micro.get('floorline_interval_error_cycles'))}"
+    )
+    lines.append(
+        f"       {lane} micro FloorLine: "
+        f"src={_fmt_int(micro.get('floorline_source'))} "
+        f"reason={_fmt_int(micro.get('floorline_reason'))} "
+        f"acc={_fmt_int(micro.get('floorline_accept_count'))} "
+        f"bkt={_fmt_int(micro.get('floorline_bucket_count'))} "
+        f"rej={_fmt_int(micro.get('floorline_reject_count'))}"
+    )
+    lines.append(
+        f"       {lane} fragment science endpoints: "
+        f"raw={_fmt_int(science.get('raw_dwt'))} "
+        f"fl={_fmt_int(science.get('floorline_dwt'))} "
+        f"pub={_fmt_int(science.get('published_dwt'))} "
+        f"pps_vclock={_fmt_int(science.get('pps_vclock_dwt'))} "
+        f"edge={_fmt_str(science.get('edge_species'))} "
+        f"source={_fmt_str(science.get('frequency_source'))}"
+    )
+    lines.append(
+        f"       {lane} fragment science intervals: "
+        f"obs={_fmt_int(science.get('observed_interval_cycles'))} "
+        f"fl={_fmt_int(science.get('floorline_interval_cycles'))} "
+        f"rawΔ={_fmt_int(science.get('delta_raw_clock_interval_cycles'))} "
+        f"flΔ={_fmt_int(science.get('delta_floorline_clock_interval_cycles'))} "
+        f"raw_ref={_fmt_int(science.get('delta_raw_reference_interval_cycles'))} "
+        f"fl_ref={_fmt_int(science.get('delta_floorline_reference_interval_cycles'))} "
+        f"raw_res={_format_optional_delta(science.get('delta_raw_residual_cycles'))} "
+        f"fl_res={_format_optional_delta(science.get('delta_floorline_residual_cycles'))}"
+    )
+    lines.append(
+        f"       {lane} fragment science residuals: "
+        f"clock_ns={_fmt_int(science.get('clock_interval_ns'))} "
+        f"gnss_ns={_fmt_int(science.get('gnss_interval_ns'))} "
+        f"fast_ns={_format_optional_delta(science.get('fast_residual_ns'))} "
+        f"trad_fast_ns={_format_optional_delta(science.get('traditional_fast_residual_ns'))} "
+        f"reported-canon={_format_optional_delta(science.get('reported_minus_canonical_residual_ns'))} "
+        f"reported-fl={_format_optional_delta(science.get('reported_minus_floorline_residual_ns'))}"
+    )
+    lines.append(
+        f"       {lane} fragment science totals: "
+        f"ns={_fmt_int(science.get('ns'))} "
+        f"measured={_fmt_int(science.get('measured_gnss_ns'))} "
+        f"measured-minus={_format_optional_delta(science.get('measured_minus_ns'))} "
+        f"total_fast_ns={_format_optional_delta(science.get('total_fast_residual_ns'))} "
+        f"total_ppb={_format_optional_float(science.get('total_ppb'))} "
+        f"traditional_total_ppb={_format_optional_float(science.get('traditional_total_ppb'))}"
+    )
+    lines.append(
+        f"       {lane} endpoint agreement selected-vs-micro: "
+        f"raw={_format_optional_delta(_endpoint_agreement(raw_dwt, micro.get('raw_dwt')))} "
+        f"fl={_format_optional_delta(_endpoint_agreement(fl_dwt, micro.get('fl_dwt')))} "
+        f"pub={_format_optional_delta(_endpoint_agreement(pub_dwt, micro.get('pub_dwt')))} "
+        f"used={_format_optional_delta(_endpoint_agreement(pub_dwt, micro.get('used_dwt')))}"
+    )
+    lines.append(
+        f"       {lane} endpoint agreement selected-vs-fragment: "
+        f"raw={_format_optional_delta(_endpoint_agreement(raw_dwt, science.get('raw_dwt')))} "
+        f"fl={_format_optional_delta(_endpoint_agreement(fl_dwt, science.get('floorline_dwt')))} "
+        f"pub={_format_optional_delta(_endpoint_agreement(pub_dwt, science.get('published_dwt')))}"
+    )
+
+    notes: List[str] = []
+    for label, value in (
+        ("raw", raw_dwt),
+        ("fl", fl_dwt),
+        ("pub", pub_dwt),
+        ("micro_pub", micro.get("pub_dwt")),
+        ("micro_used", micro.get("used_dwt")),
+        ("science_pub", science.get("published_dwt")),
+    ):
+        notes.extend(_interesting_endpoint_notes(label, value))
+    if notes:
+        lines.append(f"       {lane} endpoint notes: " + "; ".join(notes))
+
+
 def _pathology_interpretation(lane: str,
                               data: Dict[str, Any],
                               court: Dict[str, Any],
@@ -1429,12 +1650,7 @@ def pathology_detail_lines(row: Dict[str, Any],
             f"pub-fl={_format_optional_delta(data.get('pub_minus_fl'))} "
             f"pub_edge-fl_edge={_format_optional_delta(data.get('pub_edge_minus_fl_edge'))}"
         )
-        lines.append(
-            f"       {lane} endpoints: "
-            f"raw_dwt={_fmt_int(data.get('raw_dwt'))} "
-            f"fl_dwt={_fmt_int(data.get('fl_dwt'))} "
-            f"pub_dwt={_fmt_int(data.get('pub_used_dwt'))}"
-        )
+        _append_endpoint_provenance_lines(lines, lane, data)
         lines.append(
             f"       {lane} court: {_court_summary(court)}"
         )
@@ -1630,6 +1846,9 @@ def analyze(campaign: str,
     print("  • Use --clock VCLOCK, --clock OCXO1, or --clock OCXO2 to keep the row narrow.")
     print("  • Pathology blocks decode the DWT publication court transcript when")
     print("    TIMEBASE_FORENSICS exposes <lane>_court_* fields.")
+    print("  • Pathology blocks also print MICRO_RAW_CYCLES and fragment science")
+    print("    endpoint provenance, so parser fallbacks can be separated from")
+    print("    firmware-published DWT custody faults.")
     print("  • side_rail_diagnostic court masks with wd=0 are court notices only;")
     print("    they do not make an otherwise clean row pathological.")
     print("  • Use --pathology-only to suppress normal rows while retaining the same")
