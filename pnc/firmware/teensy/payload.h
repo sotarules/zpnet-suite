@@ -320,13 +320,21 @@ public:
     // Limits
     // --------------------------------------------------
 
-    // Heap-backed ceilings.  Payload keeps only INLINE_ENTRIES in-object,
-    // so lifting these does not increase the stack footprint; it only gives
-    // large diagnostic/forensic reports more bounded heap headroom.
+    // Operational ceilings.  Payload keeps only INLINE_ENTRIES in-object,
+    // so these values bound heap-backed report growth without changing the
+    // stack footprint.  Keep enough room for compact TIMEBASE rows while
+    // preventing full diagnostic reports from becoming enormous heap/transport
+    // transactions during active campaigns.
     static constexpr size_t INLINE_ENTRIES = 8;
-    static constexpr size_t MAX_ENTRIES    = 512;
+    static constexpr size_t MAX_ENTRIES    = 256;
     static constexpr size_t ARENA_INITIAL  = 512;
-    static constexpr size_t ARENA_MAX      = 24576;
+    static constexpr size_t ARENA_MAX      = 16384;
+
+    // The crash-hunt Payload courtroom was useful, but it made every add(),
+    // find(), and write_json() repeatedly walk the entire entry table/arena.
+    // In normal operation keep only cheap structural checks.  Flip true only
+    // for a dedicated Payload autopsy build.
+    static constexpr bool HEAVY_FORENSICS = false;
 
     static_assert(
         ARENA_MAX <= UINT16_MAX,

@@ -438,9 +438,43 @@ static size_t payload_trusted_literal_len(const char* s) {
     return n;
 }
 
+static size_t payload_owned_strlen_bounded(const char* s, size_t cap) {
+    if (!s) return 0;
+    size_t n = 0;
+    while (n < cap && s[n] != '\0') n++;
+    return n;
+}
+
+static bool payload_owned_equals_literal(const char* s, const char* literal) {
+    if (!s || !literal) return false;
+    size_t i = 0;
+    while (i < Payload::ARENA_MAX && s[i] != '\0' && literal[i] != '\0') {
+        if (s[i] != literal[i]) return false;
+        i++;
+    }
+    return i < Payload::ARENA_MAX && s[i] == '\0' && literal[i] == '\0';
+}
+
+static bool payload_owned_equals_known_len(const char* s,
+                                           const char* key,
+                                           size_t key_len) {
+    if (!s || !key) return false;
+    for (size_t i = 0; i < key_len; i++) {
+        if (i >= Payload::ARENA_MAX || s[i] == '\0' || s[i] != key[i]) {
+            return false;
+        }
+    }
+    return key_len < Payload::ARENA_MAX && s[key_len] == '\0';
+}
+
 static bool payload_cstr_equals_literal(const char* s,
                                         const char* literal,
                                         const char* context) {
+    if (!Payload::HEAVY_FORENSICS) {
+        (void)context;
+        return payload_owned_equals_literal(s, literal);
+    }
+
     size_t n = 0;
     if (!payload_cstr_len_checked(s, Payload::ARENA_MAX, false, context, &n)) {
         return false;
@@ -465,6 +499,7 @@ static void payload_note_error(uint32_t code, const char* op, const void* self) 
         // fault is captured separately in the string-pointer fault counters.
     }
 }
+
 
 static void payload_note_self_ok_failure(uint32_t reason,
                                          const char* op,
@@ -775,12 +810,40 @@ Payload Payload::clone() const {
 // ============================================================================
 
 bool Payload::_self_ok(const char* op) const {
+    auto fail_basic = [&](uint32_t reason) -> bool {
+        g_payload_integrity_fail++;
+        g_payload_self_ok_fail++;
+        g_payload_last_self_ok_fail_reason = reason;
+        payload_copy_trusted_label(g_payload_last_self_ok_fail_op,
+                                   sizeof(g_payload_last_self_ok_fail_op),
+                                   op ? op : "?");
+        g_payload_last_self_ok_fail_this = (uint32_t)(uintptr_t)this;
+        g_payload_last_self_ok_fail_magic = _magic;
+        g_payload_last_self_ok_fail_entries = (uint32_t)(uintptr_t)_entries;
+        g_payload_last_self_ok_fail_arena = (uint32_t)(uintptr_t)_arena;
+        g_payload_last_self_ok_fail_count = (uint32_t)_count;
+        g_payload_last_self_ok_fail_entry_cap = (uint32_t)_entry_cap;
+        g_payload_last_self_ok_fail_arena_used = (uint32_t)_arena_used;
+        g_payload_last_self_ok_fail_arena_cap = (uint32_t)_arena_cap;
+        payload_note_error(PAYLOAD_ERR_INTEGRITY, op, this);
+        return false;
+    };
+
     auto fail = [&](uint32_t reason,
                     uint32_t entry_index = 0xFFFFFFFFUL,
                     uint32_t entry_key_off = 0,
                     uint32_t entry_val_off = 0,
                     uint32_t entry_val_len = 0,
                     uint32_t entry_kind = 0) -> bool {
+        if (!Payload::HEAVY_FORENSICS) {
+            (void)entry_index;
+            (void)entry_key_off;
+            (void)entry_val_off;
+            (void)entry_val_len;
+            (void)entry_kind;
+            return fail_basic(reason);
+        }
+
         payload_note_self_ok_failure(reason,
                                      op,
                                      this,
@@ -799,6 +862,12 @@ bool Payload::_self_ok(const char* op) const {
         return false;
     };
 
+    // Operational profile: keep _self_ok() O(1).  The former crash-hunt build
+    // walked every entry and scanned key/value terminators on almost every
+    // Payload operation.  Large reports therefore produced quadratic work and
+    // repeated pointer-range probes while the 1 Hz campaign stream was active.
+    // These cheap invariants are enough to protect normal Payload semantics;
+    // the full entry-table courtroom remains below for dedicated autopsy builds.
     if (_magic != MAGIC_LIVE) {
         return fail(PAYLOAD_SELF_OK_MAGIC_BAD);
     }
@@ -832,15 +901,6 @@ bool Payload::_self_ok(const char* op) const {
         return fail(PAYLOAD_SELF_OK_HEAP_CAP_MISMATCH);
     }
 
-    if (!entries_inline &&
-        !payload_memory_readable(_entries, _entry_cap * sizeof(Entry), "self.entries")) {
-        return fail(PAYLOAD_SELF_OK_ENTRIES_SPAN_UNREADABLE);
-    }
-
-    if (_arena && !payload_memory_readable(_arena, _arena_cap, "self.arena")) {
-        return fail(PAYLOAD_SELF_OK_ARENA_SPAN_UNREADABLE);
-    }
-
     if (_count > _entry_cap) {
         return fail(PAYLOAD_SELF_OK_COUNT_GT_ENTRY_CAP);
     }
@@ -861,14 +921,24 @@ bool Payload::_self_ok(const char* op) const {
     if (_arena_cap != 0 && _arena == nullptr) {
         return fail(PAYLOAD_SELF_OK_ARENA_CAP_NONZERO_WITH_NULL);
     }
-
-    // Entry-table court bailiff.  If the Payload object has been scribbled,
-    // do not let later write_json/debug paths interpret corrupted offsets or
-    // lengths as C strings or memcpy spans.  All strings in the arena are
-    // NUL-terminated by _put(); value_len is therefore required to point at
-    // the terminator for value strings/JSON fragments.
     if (_count != 0 && (!_arena || _arena_used == 0)) {
         return fail(PAYLOAD_SELF_OK_COUNT_WITHOUT_ARENA);
+    }
+
+    if (!Payload::HEAVY_FORENSICS) {
+        return true;
+    }
+
+    // Heavy autopsy profile.  Leave this compiled behind the constexpr switch
+    // so a dedicated crash-hunt build can still interrogate every entry and
+    // arena span without carrying that cost in normal campaign operation.
+    if (!entries_inline &&
+        !payload_memory_readable(_entries, _entry_cap * sizeof(Entry), "self.entries")) {
+        return fail(PAYLOAD_SELF_OK_ENTRIES_SPAN_UNREADABLE);
+    }
+
+    if (_arena && !payload_memory_readable(_arena, _arena_cap, "self.arena")) {
+        return fail(PAYLOAD_SELF_OK_ARENA_SPAN_UNREADABLE);
     }
 
     for (size_t i = 0; i < _count; i++) {
@@ -916,7 +986,6 @@ bool Payload::_self_ok(const char* op) const {
 
     return true;
 }
-
 // ============================================================================
 // Entry + arena internals
 // ============================================================================
@@ -1122,13 +1191,7 @@ const Payload::Entry* Payload::_find(const char* key) const {
 
     for (size_t i = 0; i < _count; i++) {
         const char* stored = _at(_entries[i].key_off);
-        size_t stored_len = 0;
-        if (!payload_cstr_len_checked(stored, ARENA_MAX, false,
-                                      "find.stored_key", &stored_len)) {
-            return nullptr;
-        }
-        if (stored_len == key_len &&
-            (key_len == 0 || memcmp(stored, key, key_len) == 0)) {
+        if (payload_owned_equals_known_len(stored, key, key_len)) {
             return &_entries[i];
         }
     }
@@ -1392,12 +1455,8 @@ void Payload::add_raw_object(const char* key, const char* raw_json_object) {
 // ============================================================================
 
 static bool is_json_number_literal(const char* s) {
-    size_t len = 0;
-    if (!payload_cstr_len_checked(s, Payload::ARENA_MAX, false,
-                                  "json_number", &len)) {
-        return false;
-    }
-    if (len == 0) return false;
+    const size_t len = payload_owned_strlen_bounded(s, Payload::ARENA_MAX);
+    if (len == 0 || len >= Payload::ARENA_MAX) return false;
 
     size_t i = 0;
     if (s[i] == '-') {
@@ -1464,27 +1523,15 @@ size_t Payload::write_json(char* buf, size_t buf_size) const {
 
     auto append = [&](const char* s) {
         if (overflow || !s) return;
-        size_t n = 0;
-        if (!payload_cstr_len_checked(s, ARENA_MAX, false,
-                                      "write_json.append", &n)) {
-            payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER,
-                               "write_json_append", this);
-            overflow = true;
-            return;
-        }
+        const size_t n = payload_owned_strlen_bounded(s, ARENA_MAX);
+        if (n >= ARENA_MAX) { overflow = true; return; }
         append_str(s, n);
     };
 
     auto append_escaped = [&](const char* s) {
         if (overflow || !s) return;
-        size_t n = 0;
-        if (!payload_cstr_len_checked(s, ARENA_MAX, false,
-                                      "write_json.escape", &n)) {
-            payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER,
-                               "write_json_escape", this);
-            overflow = true;
-            return;
-        }
+        const size_t n = payload_owned_strlen_bounded(s, ARENA_MAX);
+        if (n >= ARENA_MAX) { overflow = true; return; }
 
         for (size_t idx = 0; idx < n; idx++) {
             const unsigned char c = (unsigned char)s[idx];
