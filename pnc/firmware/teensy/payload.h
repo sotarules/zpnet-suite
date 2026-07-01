@@ -320,10 +320,13 @@ public:
     // Limits
     // --------------------------------------------------
 
+    // Heap-backed ceilings.  Payload keeps only INLINE_ENTRIES in-object,
+    // so lifting these does not increase the stack footprint; it only gives
+    // large diagnostic/forensic reports more bounded heap headroom.
     static constexpr size_t INLINE_ENTRIES = 8;
-    static constexpr size_t MAX_ENTRIES    = 256;
+    static constexpr size_t MAX_ENTRIES    = 512;
     static constexpr size_t ARENA_INITIAL  = 512;
-    static constexpr size_t ARENA_MAX      = 12288;
+    static constexpr size_t ARENA_MAX      = 24576;
 
     static_assert(
         ARENA_MAX <= UINT16_MAX,
