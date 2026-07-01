@@ -5593,6 +5593,27 @@ struct dwt_publication_request_t {
   uint16_t target_low16 = 0;
   bool     service_low16_valid = false;
   uint16_t service_low16 = 0;
+
+  // Last-step watchdog forensics.  These fields do not change publication
+  // authority; they let a blocked WATCHDOG_ANOMALY distinguish priority-0
+  // edge authorship from foreground re-derivation/copy mistakes.
+  uint32_t capture_authored_dwt = 0;
+  uint32_t capture_raw_event_dwt = 0;
+  uint32_t capture_isr_entry_dwt_raw = 0;
+  uint32_t capture_arm_dwt_raw = 0;
+  uint32_t capture_arm_to_isr_ticks = 0;
+  uint32_t capture_arm_to_isr_dwt_cycles = 0;
+  int32_t  capture_service_offset_ticks = 0;
+  int32_t  capture_service_correction_cycles = 0;
+  uint16_t capture_service_counter_low16 = 0;
+  uint16_t capture_service_compare_low16 = 0;
+  uint32_t capture_service_counter_minus_compare_ticks = 0;
+  uint32_t capture_compare_delta_mod65536_ticks = 0;
+  uint32_t capture_target_delta_mod65536_ticks = 0;
+  uint32_t capture_interpreted_late_ticks = 0;
+  uint32_t capture_early_ticks = 0;
+  uint32_t capture_service_offset_abs_ticks = 0;
+
   const cadence_regression_result_t* floorline = nullptr;
   const dwt_repair_diag_t* repair = nullptr;
 };
@@ -5600,6 +5621,98 @@ struct dwt_publication_request_t {
 static dwt_publication_lane_state_t g_dwt_publication_vclock = {};
 static dwt_publication_lane_state_t g_dwt_publication_ocxo1 = {};
 static dwt_publication_lane_state_t g_dwt_publication_ocxo2 = {};
+
+struct dwt_publication_forensics_t {
+  bool     valid = false;
+  uint32_t record_count = 0;
+  uint32_t kind = 0;
+  uint32_t sequence = 0;
+  uint32_t verdict_mask = DWT_PUBLICATION_VERDICT_OK;
+  uint32_t fatal_mask = DWT_PUBLICATION_VERDICT_OK;
+  const char* verdict_reason = "none";
+  bool     campaign_armed = false;
+  bool     blocked = false;
+
+  uint32_t published_dwt = 0;
+  uint32_t observed_dwt = 0;
+  uint32_t target_counter32 = 0;
+  uint16_t target_low16 = 0;
+  bool     service_low16_valid = false;
+  uint16_t service_low16 = 0;
+  int32_t  service_offset_ticks = 0;
+
+  bool     previous_valid = false;
+  uint32_t previous_published_dwt = 0;
+  uint32_t previous_observed_dwt = 0;
+  uint32_t previous_floorline_dwt = 0;
+  uint32_t previous_counter32 = 0;
+
+  uint32_t expected_counter_delta_ticks = 0;
+  uint32_t observed_counter_delta_ticks = 0;
+  uint32_t expected_interval_cycles = 0;
+  uint32_t published_interval_cycles = 0;
+  uint32_t observed_interval_cycles = 0;
+  uint32_t floorline_interval_cycles = 0;
+  int32_t  published_interval_error_cycles = 0;
+  int32_t  observed_interval_error_cycles = 0;
+  int32_t  floorline_interval_error_cycles = 0;
+  int32_t  published_minus_observed_cycles = 0;
+  int32_t  floorline_minus_observed_cycles = 0;
+
+  bool     floorline_valid = false;
+  bool     floorline_candidate = false;
+  bool     floorline_published = false;
+  bool     floorline_fallback_used = false;
+  uint32_t floorline_dwt = 0;
+  uint32_t floorline_sequence = 0;
+  uint32_t floorline_sample_count = 0;
+  uint32_t floorline_selected_bucket_count = 0;
+  uint32_t floorline_publish_source = FLOORLINE_PUBLISH_SOURCE_OBSERVED;
+  uint32_t floorline_publish_reason = FLOORLINE_REASON_INIT;
+  uint32_t floorline_confidence_ppm = 0;
+
+  uint32_t capture_authored_dwt = 0;
+  uint32_t capture_raw_event_dwt = 0;
+  uint32_t capture_isr_entry_dwt_raw = 0;
+  uint32_t capture_arm_dwt_raw = 0;
+  uint32_t capture_arm_to_isr_ticks = 0;
+  uint32_t capture_arm_to_isr_dwt_cycles = 0;
+  int32_t  capture_service_offset_ticks = 0;
+  int32_t  capture_service_correction_cycles = 0;
+  uint16_t capture_service_counter_low16 = 0;
+  uint16_t capture_service_compare_low16 = 0;
+  uint32_t capture_service_counter_minus_compare_ticks = 0;
+  uint32_t capture_compare_delta_mod65536_ticks = 0;
+  uint32_t capture_target_delta_mod65536_ticks = 0;
+  uint32_t capture_interpreted_late_ticks = 0;
+  uint32_t capture_early_ticks = 0;
+  uint32_t capture_service_offset_abs_ticks = 0;
+
+  uint32_t repair_original_dwt = 0;
+  uint32_t repair_predicted_dwt = 0;
+  uint32_t repair_used_dwt = 0;
+  uint32_t repair_event_from_isr_entry_raw = 0;
+  int32_t  repair_isr_entry_to_event_correction_cycles = 0;
+  int32_t  repair_error_cycles = 0;
+  const char* repair_reason = "none";
+
+  bool     yardstick_valid = false;
+  bool     yardstick_stale = false;
+  bool     yardstick_seeded = false;
+  bool     yardstick_excursion = false;
+  uint32_t yardstick_pps_sequence = 0;
+  uint32_t yardstick_pps_seq_delta = 0;
+  uint32_t yardstick_g_now_cycles = 0;
+  uint32_t yardstick_g_prev_cycles = 0;
+  uint32_t yardstick_inferred_interval_cycles = 0;
+  uint32_t yardstick_observed_interval_cycles = 0;
+  int32_t  yardstick_inferred_minus_observed_cycles = 0;
+  uint32_t yardstick_auth_endpoint_dwt = 0;
+  int32_t  yardstick_auth_error_cycles = 0;
+  bool     yardstick_auth_anchor_applied = false;
+};
+
+static dwt_publication_forensics_t g_dwt_publication_last_fatal = {};
 
 static dwt_publication_lane_state_t* dwt_publication_lane_state_for(
     interrupt_subscriber_kind_t kind) {
@@ -5716,6 +5829,129 @@ static void dwt_publication_note_cross_rail(
       (uint64_t)DWT_PUBLICATION_CROSS_RAIL_GATE_CYCLES) {
     verdict_mask |= DWT_PUBLICATION_VERDICT_CROSS_RAIL;
   }
+}
+
+static void dwt_publication_record_fatal_forensics(
+    const dwt_publication_request_t& req,
+    const dwt_repair_diag_t& diag,
+    const dwt_publication_lane_state_t& previous_state,
+    uint32_t verdict_mask,
+    uint32_t fatal_mask,
+    bool campaign_armed,
+    bool blocked,
+    bool floorline_valid,
+    bool floorline_candidate,
+    bool floorline_published,
+    uint32_t floorline_dwt) {
+  const uint32_t next_count = g_dwt_publication_last_fatal.record_count + 1U;
+  dwt_publication_forensics_t f{};
+  f.valid = true;
+  f.record_count = next_count;
+  f.kind = (uint32_t)req.kind;
+  f.sequence = req.sequence;
+  f.verdict_mask = verdict_mask;
+  f.fatal_mask = fatal_mask;
+  f.verdict_reason = dwt_publication_verdict_name(verdict_mask);
+  f.campaign_armed = campaign_armed;
+  f.blocked = blocked;
+
+  f.published_dwt = req.published_dwt;
+  f.observed_dwt = req.observed_dwt;
+  f.target_counter32 = req.target_counter32;
+  f.target_low16 = req.target_low16;
+  f.service_low16_valid = req.service_low16_valid;
+  f.service_low16 = req.service_low16;
+  f.service_offset_ticks = diag.publication_service_offset_signed_ticks;
+
+  f.previous_valid = previous_state.previous_valid;
+  f.previous_published_dwt = previous_state.previous_published_dwt;
+  f.previous_observed_dwt = previous_state.previous_observed_dwt;
+  f.previous_floorline_dwt = previous_state.previous_floorline_dwt;
+  f.previous_counter32 = previous_state.previous_counter32;
+
+  f.expected_counter_delta_ticks = diag.publication_expected_counter_delta_ticks;
+  f.observed_counter_delta_ticks = diag.publication_observed_counter_delta_ticks;
+  f.expected_interval_cycles = diag.publication_expected_interval_cycles;
+  f.published_interval_cycles = diag.publication_published_interval_cycles;
+  f.observed_interval_cycles = diag.publication_observed_interval_cycles;
+  f.floorline_interval_cycles = diag.publication_floorline_interval_cycles;
+  f.published_interval_error_cycles =
+      diag.publication_published_interval_error_cycles;
+  f.observed_interval_error_cycles =
+      diag.publication_observed_interval_error_cycles;
+  f.floorline_interval_error_cycles =
+      diag.publication_floorline_interval_error_cycles;
+  f.published_minus_observed_cycles =
+      diag.publication_published_minus_observed_cycles;
+  f.floorline_minus_observed_cycles =
+      diag.publication_floorline_minus_observed_cycles;
+
+  f.floorline_valid = floorline_valid;
+  f.floorline_candidate = floorline_candidate;
+  f.floorline_published = floorline_published;
+  f.floorline_dwt = floorline_dwt;
+  if (req.floorline) {
+    f.floorline_fallback_used = req.floorline->fallback_used;
+    f.floorline_sequence = req.floorline->sequence;
+    f.floorline_sample_count = req.floorline->sample_count;
+    f.floorline_selected_bucket_count = req.floorline->selected_bucket_count;
+    f.floorline_publish_source = req.floorline->publish_source;
+    f.floorline_publish_reason = req.floorline->publish_reason;
+    f.floorline_confidence_ppm = req.floorline->confidence_ppm;
+  }
+
+  f.capture_authored_dwt = req.capture_authored_dwt;
+  f.capture_raw_event_dwt = req.capture_raw_event_dwt;
+  f.capture_isr_entry_dwt_raw = req.capture_isr_entry_dwt_raw;
+  f.capture_arm_dwt_raw = req.capture_arm_dwt_raw;
+  f.capture_arm_to_isr_ticks = req.capture_arm_to_isr_ticks;
+  f.capture_arm_to_isr_dwt_cycles = req.capture_arm_to_isr_dwt_cycles;
+  f.capture_service_offset_ticks = req.capture_service_offset_ticks;
+  f.capture_service_correction_cycles = req.capture_service_correction_cycles;
+  f.capture_service_counter_low16 = req.capture_service_counter_low16;
+  f.capture_service_compare_low16 = req.capture_service_compare_low16;
+  f.capture_service_counter_minus_compare_ticks =
+      req.capture_service_counter_minus_compare_ticks;
+  f.capture_compare_delta_mod65536_ticks =
+      req.capture_compare_delta_mod65536_ticks;
+  f.capture_target_delta_mod65536_ticks =
+      req.capture_target_delta_mod65536_ticks;
+  f.capture_interpreted_late_ticks = req.capture_interpreted_late_ticks;
+  f.capture_early_ticks = req.capture_early_ticks;
+  f.capture_service_offset_abs_ticks = req.capture_service_offset_abs_ticks;
+
+  if (req.repair) {
+    f.repair_original_dwt = req.repair->original_dwt;
+    f.repair_predicted_dwt = req.repair->predicted_dwt;
+    f.repair_used_dwt = req.repair->used_dwt;
+    f.repair_event_from_isr_entry_raw =
+        req.repair->event_dwt_from_isr_entry_raw;
+    f.repair_isr_entry_to_event_correction_cycles =
+        req.repair->isr_entry_to_event_correction_cycles;
+    f.repair_error_cycles = req.repair->error_cycles;
+    f.repair_reason = req.repair->reason ? req.repair->reason : "none";
+
+    f.yardstick_valid = req.repair->yardstick_valid;
+    f.yardstick_stale = req.repair->yardstick_stale;
+    f.yardstick_seeded = req.repair->yardstick_seeded_this_event;
+    f.yardstick_excursion = req.repair->yardstick_excursion;
+    f.yardstick_pps_sequence = req.repair->yardstick_pps_sequence;
+    f.yardstick_pps_seq_delta = req.repair->yardstick_pps_seq_delta;
+    f.yardstick_g_now_cycles = req.repair->yardstick_g_now_cycles;
+    f.yardstick_g_prev_cycles = req.repair->yardstick_g_prev_cycles;
+    f.yardstick_inferred_interval_cycles =
+        req.repair->yardstick_inferred_interval_cycles;
+    f.yardstick_observed_interval_cycles =
+        req.repair->yardstick_observed_interval_cycles;
+    f.yardstick_inferred_minus_observed_cycles =
+        req.repair->yardstick_inferred_minus_observed_cycles;
+    f.yardstick_auth_endpoint_dwt = req.repair->yardstick_auth_endpoint_dwt;
+    f.yardstick_auth_error_cycles = req.repair->yardstick_auth_error_cycles;
+    f.yardstick_auth_anchor_applied =
+        req.repair->yardstick_auth_anchor_applied;
+  }
+
+  g_dwt_publication_last_fatal = f;
 }
 
 static bool dwt_publication_adjudicate_or_watchdog(
@@ -5926,7 +6162,20 @@ static bool dwt_publication_adjudicate_or_watchdog(
       s->watchdog_count++;
       diag.publication_watchdog_count = s->watchdog_count;
 
-      if (clocks_watchdog_campaign_armed()) {
+      const bool campaign_armed = clocks_watchdog_campaign_armed();
+      dwt_publication_record_fatal_forensics(req,
+                                             diag,
+                                             *s,
+                                             verdict,
+                                             fatal_verdict,
+                                             campaign_armed,
+                                             campaign_armed,
+                                             floorline_valid,
+                                             floorline_candidate,
+                                             floorline_published,
+                                             floorline_dwt);
+
+      if (campaign_armed) {
         clocks_watchdog_anomaly("dwt_publication_anomaly",
                                 (uint32_t)req.kind,
                                 verdict,
@@ -7479,6 +7728,12 @@ struct interrupt_perishable_fact_t {
   uint32_t isr_entry_dwt_raw = 0;
   uint32_t service_dwt_at_event = 0;
 
+  // Priority-0 authored edge coordinate.  The foreground path currently
+  // recomputes the same value from service_dwt_at_event + service_offset
+  // evidence; keep the original sealed coordinate so watchdog forensics can
+  // prove whether the copy/ferry or the original capture is at fault.
+  uint32_t authored_dwt_at_event = 0;
+
   // Authored target identity.  This is the event identity, not an ambient read.
   uint32_t target_counter32 = 0;
   uint16_t target_low16 = 0;
@@ -8387,6 +8642,25 @@ static void ocxo_apply_perishable_fact_deferred(
   publication.target_low16 = fact.target_low16;
   publication.service_low16_valid = true;
   publication.service_low16 = fact.service_counter_low16;
+  publication.capture_authored_dwt = fact.authored_dwt_at_event;
+  publication.capture_raw_event_dwt = fact.service_dwt_at_event;
+  publication.capture_isr_entry_dwt_raw = fact.isr_entry_dwt_raw;
+  publication.capture_arm_dwt_raw = fact.arm_dwt_raw;
+  publication.capture_arm_to_isr_ticks = fact.arm_to_isr_ticks;
+  publication.capture_arm_to_isr_dwt_cycles = fact.arm_to_isr_dwt_cycles;
+  publication.capture_service_offset_ticks = (int32_t)fact.service_offset_ticks;
+  publication.capture_service_correction_cycles = correction_cycles;
+  publication.capture_service_counter_low16 = fact.service_counter_low16;
+  publication.capture_service_compare_low16 = fact.service_compare_low16;
+  publication.capture_service_counter_minus_compare_ticks =
+      fact.service_counter_minus_compare_ticks;
+  publication.capture_compare_delta_mod65536_ticks =
+      fact.compare_delta_mod65536_ticks;
+  publication.capture_target_delta_mod65536_ticks =
+      fact.target_delta_mod65536_ticks;
+  publication.capture_interpreted_late_ticks = fact.interpreted_late_ticks;
+  publication.capture_early_ticks = fact.early_ticks;
+  publication.capture_service_offset_abs_ticks = fact.service_offset_abs_ticks;
   publication.floorline = &lower_env;
   publication.repair = &dwt_diag;
   if (!dwt_publication_adjudicate_or_watchdog(publication, dwt_diag)) {
@@ -9186,6 +9460,7 @@ static interrupt_perishable_fact_t ocxo_cadence_build_perishable_fact(
   fact.sequence = ++ring.sequence;
   fact.isr_entry_dwt_raw = sample.isr_entry_dwt_raw;
   fact.service_dwt_at_event = sample.raw_event_dwt;
+  fact.authored_dwt_at_event = sample.event_dwt;
   fact.target_counter32 = sample.target_counter32;
   fact.target_low16 = sample.target_low16;
   fact.arm_counter_low16 = sample.arm_counter_low16;
@@ -11588,6 +11863,138 @@ static FLASHMEM void add_ocxo_lean_lane(Payload& p,
 
 }
 
+static const char* dwt_publication_kind_name_u32(uint32_t kind) {
+  return interrupt_subscriber_kind_str((interrupt_subscriber_kind_t)kind);
+}
+
+static const char* dwt_publication_forensics_hint(
+    const dwt_publication_forensics_t& f) {
+  if (!f.valid) return "none";
+  if (f.capture_authored_dwt != 0U &&
+      f.observed_dwt != f.capture_authored_dwt) {
+    return "deferred_recomputed_dwt_differs_from_priority0_authored_dwt";
+  }
+  if (f.previous_valid &&
+      f.expected_counter_delta_ticks == f.observed_counter_delta_ticks &&
+      (f.verdict_mask & (DWT_PUBLICATION_VERDICT_OBSERVED_INTERVAL |
+                         DWT_PUBLICATION_VERDICT_PUBLISHED_INTERVAL)) != 0U) {
+    return "counter_lineage_ok_but_dwt_interval_bad";
+  }
+  if ((f.verdict_mask & DWT_PUBLICATION_VERDICT_COUNTER_DELTA) != 0U) {
+    return "counter_lineage_discontinuity";
+  }
+  if ((f.verdict_mask & DWT_PUBLICATION_VERDICT_SERVICE_OFFSET) != 0U) {
+    return "service_offset_outside_gate";
+  }
+  return "see_mask";
+}
+
+static FLASHMEM Payload cmd_report_publication(const Payload&) {
+  const dwt_publication_forensics_t& f = g_dwt_publication_last_fatal;
+  Payload p;
+  p.add("report", "INTERRUPT_DWT_PUBLICATION_FORENSICS");
+  p.add("schema", "INTERRUPT_DWT_PUBLICATION_FORENSICS_V1");
+  p.add("valid", f.valid);
+  p.add("record_count", f.record_count);
+  p.add("hint", dwt_publication_forensics_hint(f));
+
+  p.add("kind", f.kind);
+  p.add("kind_name", dwt_publication_kind_name_u32(f.kind));
+  p.add("sequence", f.sequence);
+  p.add("verdict_mask", f.verdict_mask);
+  p.add("fatal_mask", f.fatal_mask);
+  p.add("verdict_reason", f.verdict_reason ? f.verdict_reason : "");
+  p.add("campaign_armed", f.campaign_armed);
+  p.add("blocked", f.blocked);
+
+  p.add("published_dwt", f.published_dwt);
+  p.add("observed_dwt", f.observed_dwt);
+  p.add("target_counter32", f.target_counter32);
+  p.add("target_low16", (uint32_t)f.target_low16);
+  p.add("service_low16_valid", f.service_low16_valid);
+  p.add("service_low16", (uint32_t)f.service_low16);
+  p.add("service_offset_ticks", f.service_offset_ticks);
+
+  p.add("previous_valid", f.previous_valid);
+  p.add("previous_published_dwt", f.previous_published_dwt);
+  p.add("previous_observed_dwt", f.previous_observed_dwt);
+  p.add("previous_floorline_dwt", f.previous_floorline_dwt);
+  p.add("previous_counter32", f.previous_counter32);
+
+  p.add("expected_counter_delta_ticks", f.expected_counter_delta_ticks);
+  p.add("observed_counter_delta_ticks", f.observed_counter_delta_ticks);
+  p.add("expected_interval_cycles", f.expected_interval_cycles);
+  p.add("published_interval_cycles", f.published_interval_cycles);
+  p.add("observed_interval_cycles", f.observed_interval_cycles);
+  p.add("floorline_interval_cycles", f.floorline_interval_cycles);
+  p.add("published_interval_error_cycles", f.published_interval_error_cycles);
+  p.add("observed_interval_error_cycles", f.observed_interval_error_cycles);
+  p.add("floorline_interval_error_cycles", f.floorline_interval_error_cycles);
+  p.add("published_minus_observed_cycles", f.published_minus_observed_cycles);
+  p.add("floorline_minus_observed_cycles", f.floorline_minus_observed_cycles);
+
+  p.add("floorline_valid", f.floorline_valid);
+  p.add("floorline_candidate", f.floorline_candidate);
+  p.add("floorline_published", f.floorline_published);
+  p.add("floorline_fallback_used", f.floorline_fallback_used);
+  p.add("floorline_dwt", f.floorline_dwt);
+  p.add("floorline_sequence", f.floorline_sequence);
+  p.add("floorline_sample_count", f.floorline_sample_count);
+  p.add("floorline_selected_bucket_count", f.floorline_selected_bucket_count);
+  p.add("floorline_publish_source", lower_env_publish_source_name(f.floorline_publish_source));
+  p.add("floorline_publish_reason", lower_env_publish_reason_name(f.floorline_publish_reason));
+  p.add("floorline_confidence_ppm", f.floorline_confidence_ppm);
+
+  p.add("capture_authored_dwt", f.capture_authored_dwt);
+  p.add("capture_raw_event_dwt", f.capture_raw_event_dwt);
+  p.add("capture_isr_entry_dwt_raw", f.capture_isr_entry_dwt_raw);
+  p.add("capture_arm_dwt_raw", f.capture_arm_dwt_raw);
+  p.add("capture_arm_to_isr_ticks", f.capture_arm_to_isr_ticks);
+  p.add("capture_arm_to_isr_dwt_cycles", f.capture_arm_to_isr_dwt_cycles);
+  p.add("capture_service_offset_ticks", f.capture_service_offset_ticks);
+  p.add("capture_service_correction_cycles", f.capture_service_correction_cycles);
+  p.add("capture_service_counter_low16", (uint32_t)f.capture_service_counter_low16);
+  p.add("capture_service_compare_low16", (uint32_t)f.capture_service_compare_low16);
+  p.add("capture_service_counter_minus_compare_ticks", f.capture_service_counter_minus_compare_ticks);
+  p.add("capture_compare_delta_mod65536_ticks", f.capture_compare_delta_mod65536_ticks);
+  p.add("capture_target_delta_mod65536_ticks", f.capture_target_delta_mod65536_ticks);
+  p.add("capture_interpreted_late_ticks", f.capture_interpreted_late_ticks);
+  p.add("capture_early_ticks", f.capture_early_ticks);
+  p.add("capture_service_offset_abs_ticks", f.capture_service_offset_abs_ticks);
+  p.add("recomputed_minus_capture_authored_cycles",
+        (int32_t)(f.observed_dwt - f.capture_authored_dwt));
+  p.add("published_minus_capture_authored_cycles",
+        (int32_t)(f.published_dwt - f.capture_authored_dwt));
+  p.add("raw_minus_capture_authored_cycles",
+        (int32_t)(f.capture_raw_event_dwt - f.capture_authored_dwt));
+
+  p.add("repair_original_dwt", f.repair_original_dwt);
+  p.add("repair_predicted_dwt", f.repair_predicted_dwt);
+  p.add("repair_used_dwt", f.repair_used_dwt);
+  p.add("repair_event_from_isr_entry_raw", f.repair_event_from_isr_entry_raw);
+  p.add("repair_isr_entry_to_event_correction_cycles",
+        f.repair_isr_entry_to_event_correction_cycles);
+  p.add("repair_error_cycles", f.repair_error_cycles);
+  p.add("repair_reason", f.repair_reason ? f.repair_reason : "");
+
+  p.add("yardstick_valid", f.yardstick_valid);
+  p.add("yardstick_stale", f.yardstick_stale);
+  p.add("yardstick_seeded", f.yardstick_seeded);
+  p.add("yardstick_excursion", f.yardstick_excursion);
+  p.add("yardstick_pps_sequence", f.yardstick_pps_sequence);
+  p.add("yardstick_pps_seq_delta", f.yardstick_pps_seq_delta);
+  p.add("yardstick_g_now_cycles", f.yardstick_g_now_cycles);
+  p.add("yardstick_g_prev_cycles", f.yardstick_g_prev_cycles);
+  p.add("yardstick_inferred_interval_cycles", f.yardstick_inferred_interval_cycles);
+  p.add("yardstick_observed_interval_cycles", f.yardstick_observed_interval_cycles);
+  p.add("yardstick_inferred_minus_observed_cycles",
+        f.yardstick_inferred_minus_observed_cycles);
+  p.add("yardstick_auth_endpoint_dwt", f.yardstick_auth_endpoint_dwt);
+  p.add("yardstick_auth_error_cycles", f.yardstick_auth_error_cycles);
+  p.add("yardstick_auth_anchor_applied", f.yardstick_auth_anchor_applied);
+  return p;
+}
+
 static FLASHMEM Payload cmd_report_integrity(const Payload&) {
   // Ultra-lean integrity report.
   // The old monolithic integrity report was too large for the command path.
@@ -11717,7 +12124,7 @@ static FLASHMEM Payload cmd_report(const Payload&) {
   Payload p;
   p.add("report", "INTERRUPT_LEAN");
   p.add("schema", "INTERRUPT_LEAN_V1");
-  p.add("available_reports", "REPORT_STATUS REPORT_PPS REPORT_CADENCE REPORT_SMARTZERO REPORT_BRIDGE REPORT_HANDOFF REPORT_LOWER_ENVELOPE REPORT_INTEGRITY REPORT_LANES REPORT_LANE");
+  p.add("available_reports", "REPORT_STATUS REPORT_PPS REPORT_CADENCE REPORT_SMARTZERO REPORT_BRIDGE REPORT_HANDOFF REPORT_LOWER_ENVELOPE REPORT_PUBLICATION REPORT_INTEGRITY REPORT_LANES REPORT_LANE");
   p.add("report_lane_sections", "summary clock gate service yardstick floorline");
   p.add("hw_ready", g_interrupt_hw_ready);
   p.add("runtime_ready", g_interrupt_runtime_ready);
@@ -12127,6 +12534,7 @@ static const process_command_entry_t INTERRUPT_COMMANDS[] = {
   { "REPORT_BRIDGE",   cmd_report_bridge   },
   { "REPORT_HANDOFF", cmd_report_handoff },
   { "REPORT_LOWER_ENVELOPE", cmd_report_lower_envelope },
+  { "REPORT_PUBLICATION", cmd_report_publication },
   { "REPORT_INTEGRITY", cmd_report_integrity },
   { "REPORT_LANES",    cmd_report_lanes    },
   { "REPORT_LANE",     cmd_report_lane     },
