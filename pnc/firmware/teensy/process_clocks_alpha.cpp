@@ -420,7 +420,10 @@ servo_mode_t servo_mode_parse(const char* s) {
 // ============================================================================
 //
 // Conservative DAC doctrine:
-//   • Boot default is STATIC_ROUNDED.  Dither is opt-in by command.
+//   • Boot default requests ONE_SECOND_FRACTIONAL_DITHER.
+//   • Runtime starts idle until process_clocks_init() explicitly invokes the
+//     same enable path used by CLOCKS.DITHER_ENABLE, so default-on and
+//     command-on produce the same armed/timer-backed state.
 //   • TimePop timed callbacks never touch I2C / Wire / AD5693R.
 //   • Timed callbacks only compute phase and latch desired hardware codes.
 //   • Hardware writes are serviced by a deferred foreground callback.
@@ -428,9 +431,9 @@ servo_mode_t servo_mode_parse(const char* s) {
 //     performed for the dither path.
 //
 // This preserves the fractional-authority experiment while making DAC bus
-// traffic an explicit operator choice with a live kill switch.
+// traffic explicit and operator-disableable with a live kill switch.
 
-static constexpr bool     OCXO_DAC_DITHER_DEFAULT_ENABLED = false;
+static constexpr bool     OCXO_DAC_DITHER_DEFAULT_ENABLED = true;
 static constexpr bool     OCXO_DAC_DITHER_ALLOW_HARDWARE_WRITES = true;
 static constexpr uint64_t OCXO_DAC_DITHER_FRAME_NS = 1000000000ULL;
 static constexpr uint64_t OCXO_DAC_DITHER_SLOT_NS = 1000000ULL;
@@ -442,8 +445,10 @@ static constexpr const char* OCXO_DAC_DITHER_TRANSITION_TIMER_NAME =
 static constexpr const char* OCXO_DAC_DITHER_SERVICE_TIMER_NAME =
     "clocks-dac-dither-service";
 
-static volatile bool    g_ocxo_dac_dither_operator_enabled =
-    OCXO_DAC_DITHER_DEFAULT_ENABLED;
+// This is runtime state, not boot policy.  process_clocks_init() applies
+// OCXO_DAC_DITHER_DEFAULT_ENABLED through clocks_ocxo_dac_dither_enable() so
+// default-on follows the same path as the operator command.
+static volatile bool    g_ocxo_dac_dither_operator_enabled = false;
 static volatile bool    g_ocxo_dac_dither_started = false;
 static volatile bool    g_ocxo_dac_dither_service_pending = false;
 static timepop_handle_t g_ocxo_dac_dither_frame_handle = TIMEPOP_INVALID_HANDLE;
@@ -6064,6 +6069,11 @@ void process_clocks_init(void) {
     ocxo1_dac.io_last_failure_stage = 0;
     ocxo2_dac.io_last_failure_stage = 0;
   }
+
+  if (OCXO_DAC_DITHER_DEFAULT_ENABLED) {
+    (void)clocks_ocxo_dac_dither_enable();
+  }
+
   pinMode(GNSS_LOCK_PIN, INPUT);
 
   subscribe_clock(interrupt_subscriber_kind_t::VCLOCK, vclock_callback);

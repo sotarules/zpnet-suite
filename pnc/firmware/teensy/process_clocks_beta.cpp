@@ -4270,10 +4270,9 @@ static FLASHMEM void payload_add_servo_input_diag(Payload& lane,
 // Operator-gated OCXO DAC realization report
 // ============================================================================
 //
-// Disabled/boot default: static rounded integer DAC authority.
-// Enabled by command: one-second fractional dither, with TimePop timed
+// Enabled/boot default: one-second fractional dither, with TimePop timed
 // callbacks only latching desired phase/code and foreground ALAP service doing
-// any hardware writes.
+// any hardware writes.  Static rounded authority remains available by command.
 
 static constexpr const char* OCXO_DAC_REFERENCE_MODE = "INTERNAL_VREF_2X";
 
