@@ -266,6 +266,8 @@ static uint32_t g_start_handoff_check_count = 0;
 static uint32_t g_start_handoff_wait_origin_count = 0;
 static uint32_t g_start_handoff_wait_projection_count = 0;
 static uint32_t g_start_handoff_commit_count = 0;
+static uint32_t g_start_handoff_launch_wait_count = 0;
+static uint32_t g_start_handoff_timeout_count = 0;
 static bool     g_start_handoff_last_ready = false;
 static bool     g_start_handoff_last_origin_ready = false;
 static bool     g_start_handoff_last_ocxo1_projection_ready = false;
@@ -565,6 +567,10 @@ static volatile uint32_t g_campaign_warmup_suppressed_total = 0;
 // and enter Welford as n=1.
 static constexpr uint32_t CLOCKS_START_PROLOGUE_FIT_ENDPOINT_GATE_CYCLES = 16U;
 static constexpr uint32_t CLOCKS_START_PROLOGUE_MAX_PRIVATE_CANDIDATES = 0xFFFFFFFFUL;
+// Bound the purely-private START handoff.  This is not science-row burial; it
+// is a launch-acquisition watchdog so a failed OCXO public-origin/projection
+// proof becomes a local aborted START instead of 90 seconds of TIMEBASE silence.
+static constexpr uint32_t CLOCKS_START_HANDOFF_TIMEOUT_CANDIDATES = 32U;
 static volatile bool     g_start_prologue_seeded = false;
 static volatile bool     g_start_prologue_reference_ready = false;
 static volatile uint32_t g_start_prologue_private_candidate_count = 0;
@@ -1057,6 +1063,7 @@ static void campaign_start_prologue_reset(const char* reason) {
   g_start_prologue_last_release_public_count = 0;
   g_start_prologue_release_count = 0;
   g_start_prologue_private_limit_count = 0;
+  g_start_handoff_launch_wait_count = 0;
   g_start_prologue_pps0_interval_valid = false;
   g_start_prologue_pps0_pps_obs = 0;
   g_start_prologue_pps0_v_obs = 0;
@@ -1071,6 +1078,8 @@ static void campaign_start_prologue_reset(const char* reason) {
 }
 
 static bool campaign_start_prologue_should_hold(void);
+static void flash_cut_clear_pending(void);
+static void ocxo_dac_pacing_abort_all(void);
 
 static void campaign_warmup_begin(campaign_warmup_mode_t mode) {
   g_campaign_warmup_suppressed_total = 0;
@@ -1078,6 +1087,7 @@ static void campaign_warmup_begin(campaign_warmup_mode_t mode) {
   if (mode == campaign_warmup_mode_t::RECOVER) {
     // RECOVER no longer buries public rows.  Install the recovered campaign
     // offsets now; the next selected PPS/VCLOCK edge publishes base+1.
+    interrupt_dwt_publication_launch_acquisition_end();
     g_campaign_warmup_mode = campaign_warmup_mode_t::NONE;
     g_campaign_warmup_remaining = 0;
     campaign_start_prologue_reset("recover_no_prologue");
@@ -1090,12 +1100,16 @@ static void campaign_warmup_begin(campaign_warmup_mode_t mode) {
     // prologue consumes private candidate rows until it has established an
     // internal PPS 0 and the next candidate can publish as science-complete
     // public PPS 1.  campaign_seconds remains zero while this mode is active.
+    // While this private window is open, INTERRUPT relaxes non-poisonous
+    // publication courts so Alpha can build OCXO public-origin evidence.
+    interrupt_dwt_publication_launch_acquisition_begin();
     g_campaign_warmup_mode = campaign_warmup_mode_t::START;
     g_campaign_warmup_remaining = 1;
     campaign_start_prologue_reset("waiting_for_private_pps0");
     return;
   }
 
+  interrupt_dwt_publication_launch_acquisition_end();
   g_campaign_warmup_mode = campaign_warmup_mode_t::NONE;
   g_campaign_warmup_remaining = 0;
   campaign_start_prologue_reset("none");
@@ -1113,11 +1127,15 @@ static bool campaign_warmup_consume_one_candidate_record(void) {
     if (campaign_start_prologue_should_hold()) {
       // Private prologue, not a public skipped row.  The candidate was either
       // used as internal PPS 0/bookend evidence or rejected before campaign
-      // time began.
-      g_campaign_warmup_remaining = 1;
+      // time began.  If the prologue timed out and aborted START, leave the
+      // warmup mode cleared instead of re-arming the hold gate.
+      if (campaign_warmup_active()) {
+        g_campaign_warmup_remaining = 1;
+      }
       return true;
     }
 
+    interrupt_dwt_publication_launch_acquisition_end();
     g_campaign_warmup_mode = campaign_warmup_mode_t::NONE;
     g_campaign_warmup_remaining = 0;
     g_start_prologue_release_count++;
@@ -1135,6 +1153,7 @@ static bool campaign_warmup_consume_one_candidate_record(void) {
 }
 
 static void campaign_warmup_reset(void) {
+  interrupt_dwt_publication_launch_acquisition_end();
   g_campaign_warmup_mode = campaign_warmup_mode_t::NONE;
   g_campaign_warmup_remaining = 0;
   g_campaign_warmup_suppressed_total = 0;
@@ -1200,6 +1219,7 @@ static void clocks_watchdog_disarm_campaign_publication(void) {
 }
 
 static void clocks_watchdog_arm_campaign_publication(void) {
+  interrupt_dwt_publication_launch_acquisition_end();
   watchdog_campaign_publication_armed = true;
 }
 
@@ -3337,6 +3357,26 @@ static bool campaign_start_prologue_probe_public_pps1(
   return true;
 }
 
+static void campaign_start_prologue_abort_launch(const char* reason) {
+  campaign_start_prologue_set_reason(reason ? reason : "start_handoff_timeout");
+  g_start_handoff_timeout_count++;
+  interrupt_dwt_publication_launch_acquisition_end();
+  g_campaign_warmup_mode = campaign_warmup_mode_t::NONE;
+  g_campaign_warmup_remaining = 0;
+  campaign_state = clocks_campaign_state_t::STOPPED;
+  request_start = false;
+  request_stop = false;
+  request_recover = false;
+  request_zero = false;
+  flash_cut_clear_pending();
+  request_servo_mode_change = false;
+  requested_servo_mode = servo_mode_t::OFF;
+  calibrate_ocxo_mode = servo_mode_t::OFF;
+  watchdog_anomaly_active = false;
+  ocxo_dac_pacing_abort_all();
+  timebase_invalidate();
+}
+
 static bool campaign_start_prologue_should_hold(void) {
   clocks_alpha_lane_forensics_t vclock_f{};
   clocks_alpha_lane_forensics_t ocxo1_f{};
@@ -3346,9 +3386,18 @@ static bool campaign_start_prologue_should_hold(void) {
   bool ocxo2_valid = false;
 
   if (!campaign_start_handoff_ready()) {
+    if (g_start_handoff_launch_wait_count != UINT32_MAX) {
+      g_start_handoff_launch_wait_count++;
+    }
+    if (g_start_handoff_launch_wait_count >=
+        CLOCKS_START_HANDOFF_TIMEOUT_CANDIDATES) {
+      campaign_start_prologue_abort_launch("start_handoff_timeout");
+      return true;
+    }
     campaign_start_prologue_set_reason("waiting_for_start_handoff");
     return true;
   }
+  g_start_handoff_launch_wait_count = 0;
 
   if (!campaign_start_prologue_fetch_forensics(vclock_f, ocxo1_f, ocxo2_f,
                                                vclock_valid, ocxo1_valid,
@@ -6786,6 +6835,12 @@ static FLASHMEM void add_campaign_payload(Payload& p) {
   p.add("start_prologue_release_count", g_start_prologue_release_count);
   p.add("start_prologue_private_limit_count",
         g_start_prologue_private_limit_count);
+  p.add("start_handoff_launch_wait_count", g_start_handoff_launch_wait_count);
+  p.add("start_handoff_timeout_count", g_start_handoff_timeout_count);
+  p.add("start_handoff_timeout_candidates",
+        (uint32_t)CLOCKS_START_HANDOFF_TIMEOUT_CANDIDATES);
+  p.add("dwt_publication_launch_acquisition",
+        interrupt_dwt_publication_launch_acquisition_active());
   p.add("start_prologue_last_private_count",
         g_start_prologue_last_private_count);
   p.add("start_prologue_last_release_public_count",
@@ -7536,6 +7591,10 @@ static FLASHMEM Payload cmd_report_timebase_publish(const Payload&) {
   gates.add("start_handoff_wait_origin_count", g_start_handoff_wait_origin_count);
   gates.add("start_handoff_wait_projection_count", g_start_handoff_wait_projection_count);
   gates.add("start_handoff_commit_count", g_start_handoff_commit_count);
+  gates.add("start_handoff_launch_wait_count", g_start_handoff_launch_wait_count);
+  gates.add("start_handoff_timeout_count", g_start_handoff_timeout_count);
+  gates.add("dwt_publication_launch_acquisition",
+            interrupt_dwt_publication_launch_acquisition_active());
   gates.add("campaign_state", campaign_state == clocks_campaign_state_t::STARTED ? "STARTED" : "STOPPED");
   gates.add("warmup_active", campaign_warmup_active());
   gates.add("watchdog_campaign_publication_armed",
@@ -7577,6 +7636,12 @@ static FLASHMEM Payload cmd_report_timebase_publish(const Payload&) {
 
   Payload start_handoff;
   start_handoff.add("ready", g_start_handoff_last_ready);
+  start_handoff.add("launch_wait_count", g_start_handoff_launch_wait_count);
+  start_handoff.add("timeout_count", g_start_handoff_timeout_count);
+  start_handoff.add("timeout_candidates",
+                    (uint32_t)CLOCKS_START_HANDOFF_TIMEOUT_CANDIDATES);
+  start_handoff.add("dwt_publication_launch_acquisition",
+                    interrupt_dwt_publication_launch_acquisition_active());
   start_handoff.add("origin_ready", g_start_handoff_last_origin_ready);
   start_handoff.add("ocxo1_projection_ready", g_start_handoff_last_ocxo1_projection_ready);
   start_handoff.add("ocxo2_projection_ready", g_start_handoff_last_ocxo2_projection_ready);

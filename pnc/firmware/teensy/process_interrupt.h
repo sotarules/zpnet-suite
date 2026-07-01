@@ -69,6 +69,7 @@ static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_VERDICT_CROSS_RAIL = 1u << 1
 static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_VERDICT_GNSS_PROJECTION = 1u << 11;
 static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_VERDICT_COUNTER_ADJACENCY = 1u << 12;
 static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_VERDICT_YARDSTICK_EXCURSION = 1u << 13;
+static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_VERDICT_RULER_UNQUALIFIED = 1u << 14;
 
 struct interrupt_event_t {
   interrupt_subscriber_kind_t kind     = interrupt_subscriber_kind_t::NONE;
@@ -856,6 +857,16 @@ void interrupt_pps_vclock_label_anchor(uint32_t sequence,
                                        uint32_t counter32_at_edge,
                                        uint64_t gnss_ns_at_edge,
                                        uint32_t dwt_cycles_per_second);
+
+// CLOCKS/Beta brackets the private START prologue with this launch-acquisition
+// window. While active, process_interrupt may pass non-poisonous DWT
+// publication facts to Alpha so OCXO public-origin/projection evidence can
+// form, but it still quarantines impossible source/DWT facts. Once PPS1 is
+// released, Beta ends the window and the publication court returns to strict
+// campaign law.
+void interrupt_dwt_publication_launch_acquisition_begin(void);
+void interrupt_dwt_publication_launch_acquisition_end(void);
+bool interrupt_dwt_publication_launch_acquisition_active(void);
 
 bool interrupt_last_pps_vclock_phase_estimate(
     pps_vclock_phase_estimate_t* out);

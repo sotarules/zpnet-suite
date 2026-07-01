@@ -140,3 +140,5 @@ uint32_t clocks_dwt_cycles_per_gnss_second(void);
 
 /// Returns true if at least one PPS-to-PPS DWT delta has been measured.
 bool clocks_dwt_calibration_valid(void);
+
+

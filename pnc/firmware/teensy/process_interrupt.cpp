@@ -5541,7 +5541,10 @@ static inline uint32_t ocxo_published_dwt_at_edge(
 // It does not repair, resync, fall back, or choose a different endpoint.  The
 // publisher has already chosen observed vs FloorLine authority; this tribunal
 // asks whether that final fact is physically and semantically admissible.  A
-// nonzero verdict emits WATCHDOG_ANOMALY and the caller must not publish.
+// nonzero verdict normally emits WATCHDOG_ANOMALY and the caller must not
+// publish. START launch-acquisition is the bounded exception: non-poisonous
+// transient/ruler verdicts may pass only to build pre-publication Alpha
+// evidence, while impossible DWT/source facts remain quarantined.
 
 static constexpr uint32_t DWT_PUBLICATION_EDGE_GATE_CYCLES =
     LOWER_ENV_PUBLISH_HARD_EDGE_GATE_CYCLES;
@@ -5550,6 +5553,17 @@ static constexpr uint32_t DWT_PUBLICATION_CROSS_RAIL_GATE_CYCLES = 4096U;
 static constexpr uint32_t DWT_PUBLICATION_SERVICE_OFFSET_GATE_TICKS = 1024U;
 static constexpr int64_t DWT_PUBLICATION_VCLOCK_GNSS_GATE_NS =
     VCLOCK_GNSS_NS_INTEGRITY_GATE_NS;
+
+// Publication-court startup policy.  Source/custody impossibilities are never
+// admissible.  Interval/ruler courts get a short local warmup window so START
+// can form its first anchors without treating a settling ruler as edge poison.
+// After this many clean accepted publications on a lane, process_interrupt is
+// locally strict even if CLOCKS has not yet reported campaign watchdog arming.
+static constexpr uint32_t DWT_PUBLICATION_STRICT_ACCEPT_COUNT = 8U;
+// The expected-interval ruler itself must remain in the physical DWT
+// neighborhood before it can be used as law.  The live system moves by ppm; a
+// 1% gate is deliberately huge and only catches uninitialized/poisoned rulers.
+static constexpr uint32_t DWT_PUBLICATION_RULER_PLAUSIBILITY_PPM = 10000U;
 
 static constexpr uint32_t DWT_PUBLICATION_VERDICT_OK = 0U;
 static constexpr uint32_t DWT_PUBLICATION_VERDICT_ZERO_DWT = 1u << 0;
@@ -5566,6 +5580,32 @@ static constexpr uint32_t DWT_PUBLICATION_VERDICT_CROSS_RAIL = 1u << 10;
 static constexpr uint32_t DWT_PUBLICATION_VERDICT_GNSS_PROJECTION = 1u << 11;
 static constexpr uint32_t DWT_PUBLICATION_VERDICT_COUNTER_ADJACENCY = 1u << 12;
 static constexpr uint32_t DWT_PUBLICATION_VERDICT_YARDSTICK_EXCURSION = 1u << 13;
+static constexpr uint32_t DWT_PUBLICATION_VERDICT_RULER_UNQUALIFIED = 1u << 14;
+
+static constexpr uint32_t DWT_PUBLICATION_SIDE_RAIL_DIAGNOSTIC_MASK =
+    DWT_PUBLICATION_VERDICT_GNSS_PROJECTION |
+    DWT_PUBLICATION_VERDICT_YARDSTICK_EXCURSION;
+
+static constexpr uint32_t DWT_PUBLICATION_ALWAYS_BLOCK_MASK =
+    DWT_PUBLICATION_VERDICT_ZERO_DWT |
+    DWT_PUBLICATION_VERDICT_SOURCE_MISMATCH |
+    DWT_PUBLICATION_VERDICT_FLOORLINE_EDGE |
+    DWT_PUBLICATION_VERDICT_FLOORLINE_INTERVAL |
+    DWT_PUBLICATION_VERDICT_FLOORLINE_LATE |
+    DWT_PUBLICATION_VERDICT_COUNTER_LOW16 |
+    DWT_PUBLICATION_VERDICT_SERVICE_OFFSET |
+    DWT_PUBLICATION_VERDICT_COUNTER_DELTA |
+    DWT_PUBLICATION_VERDICT_COUNTER_ADJACENCY;
+
+// Private START launch-acquisition is deliberately narrower than ordinary
+// startup relaxation.  It exists so Alpha can receive sane edge facts long
+// enough to form OCXO public-origin / PPS projection evidence.  It must never
+// admit forged/poisoned coordinates: zero DWT, source-domain mismatch, or a
+// target low-word identity contradiction still stop at this courthouse door.
+static constexpr uint32_t DWT_PUBLICATION_LAUNCH_BLOCK_MASK =
+    DWT_PUBLICATION_VERDICT_ZERO_DWT |
+    DWT_PUBLICATION_VERDICT_SOURCE_MISMATCH |
+    DWT_PUBLICATION_VERDICT_COUNTER_LOW16;
 
 struct dwt_publication_lane_state_t {
   bool     previous_valid = false;
@@ -5632,6 +5672,9 @@ struct dwt_publication_forensics_t {
   const char* verdict_reason = "none";
   bool     campaign_armed = false;
   bool     blocked = false;
+  bool     launch_acquisition_active = false;
+  uint32_t launch_block_mask = DWT_PUBLICATION_VERDICT_OK;
+  uint32_t launch_relaxed_mask = DWT_PUBLICATION_VERDICT_OK;
 
   uint32_t published_dwt = 0;
   uint32_t observed_dwt = 0;
@@ -5714,6 +5757,30 @@ struct dwt_publication_forensics_t {
 
 static dwt_publication_forensics_t g_dwt_publication_last_fatal = {};
 
+static volatile bool     g_dwt_publication_launch_acquisition_active = false;
+static volatile uint32_t g_dwt_publication_launch_begin_count = 0;
+static volatile uint32_t g_dwt_publication_launch_end_count = 0;
+static volatile uint32_t g_dwt_publication_launch_relaxed_count = 0;
+static volatile uint32_t g_dwt_publication_launch_hard_block_count = 0;
+
+void interrupt_dwt_publication_launch_acquisition_begin(void) {
+  if (!g_dwt_publication_launch_acquisition_active) {
+    g_dwt_publication_launch_begin_count++;
+  }
+  g_dwt_publication_launch_acquisition_active = true;
+}
+
+void interrupt_dwt_publication_launch_acquisition_end(void) {
+  if (g_dwt_publication_launch_acquisition_active) {
+    g_dwt_publication_launch_end_count++;
+  }
+  g_dwt_publication_launch_acquisition_active = false;
+}
+
+bool interrupt_dwt_publication_launch_acquisition_active(void) {
+  return g_dwt_publication_launch_acquisition_active;
+}
+
 static dwt_publication_lane_state_t* dwt_publication_lane_state_for(
     interrupt_subscriber_kind_t kind) {
   switch (kind) {
@@ -5789,6 +5856,42 @@ static uint32_t dwt_publication_abs_i32(int32_t v) {
   return v < 0 ? (uint32_t)(-(int64_t)v) : (uint32_t)v;
 }
 
+static bool dwt_publication_strict_ready(
+    const dwt_publication_lane_state_t& s) {
+  return s.previous_valid &&
+         s.accept_count >= DWT_PUBLICATION_STRICT_ACCEPT_COUNT;
+}
+
+static uint32_t dwt_publication_nominal_interval_for_delta(
+    uint32_t expected_counter_delta_ticks) {
+  if (expected_counter_delta_ticks == 0U) return 0U;
+  return (uint32_t)(((uint64_t)DWT_EXPECTED_PER_PPS *
+                     (uint64_t)expected_counter_delta_ticks +
+                     (uint64_t)VCLOCK_COUNTS_PER_SECOND / 2ULL) /
+                    (uint64_t)VCLOCK_COUNTS_PER_SECOND);
+}
+
+static bool dwt_publication_expected_interval_ruler_qualified(
+    uint32_t expected_counter_delta_ticks,
+    uint32_t expected_interval_cycles) {
+  if (expected_counter_delta_ticks == 0U || expected_interval_cycles == 0U) {
+    return false;
+  }
+
+  const uint32_t nominal =
+      dwt_publication_nominal_interval_for_delta(expected_counter_delta_ticks);
+  if (nominal == 0U) return false;
+
+  const uint64_t gate =
+      ((uint64_t)nominal *
+       (uint64_t)DWT_PUBLICATION_RULER_PLAUSIBILITY_PPM) /
+      1000000ULL;
+  const uint64_t lower = (gate >= nominal) ? 0ULL : ((uint64_t)nominal - gate);
+  const uint64_t upper = (uint64_t)nominal + gate;
+  return (uint64_t)expected_interval_cycles >= lower &&
+         (uint64_t)expected_interval_cycles <= upper;
+}
+
 static const char* dwt_publication_verdict_name(uint32_t verdict_mask) {
   if (verdict_mask == DWT_PUBLICATION_VERDICT_OK) return "ok";
   if (verdict_mask & DWT_PUBLICATION_VERDICT_ZERO_DWT) return "zero_dwt";
@@ -5805,6 +5908,7 @@ static const char* dwt_publication_verdict_name(uint32_t verdict_mask) {
   if (verdict_mask & DWT_PUBLICATION_VERDICT_GNSS_PROJECTION) return "gnss_projection";
   if (verdict_mask & DWT_PUBLICATION_VERDICT_COUNTER_ADJACENCY) return "counter_adjacency";
   if (verdict_mask & DWT_PUBLICATION_VERDICT_YARDSTICK_EXCURSION) return "yardstick_excursion";
+  if (verdict_mask & DWT_PUBLICATION_VERDICT_RULER_UNQUALIFIED) return "ruler_unqualified";
   return "unknown";
 }
 
@@ -5839,6 +5943,9 @@ static void dwt_publication_record_fatal_forensics(
     uint32_t fatal_mask,
     bool campaign_armed,
     bool blocked,
+    bool launch_acquisition,
+    uint32_t launch_block_mask,
+    uint32_t launch_relaxed_mask,
     bool floorline_valid,
     bool floorline_candidate,
     bool floorline_published,
@@ -5854,6 +5961,9 @@ static void dwt_publication_record_fatal_forensics(
   f.verdict_reason = dwt_publication_verdict_name(verdict_mask);
   f.campaign_armed = campaign_armed;
   f.blocked = blocked;
+  f.launch_acquisition_active = launch_acquisition;
+  f.launch_block_mask = launch_block_mask;
+  f.launch_relaxed_mask = launch_relaxed_mask;
 
   f.published_dwt = req.published_dwt;
   f.observed_dwt = req.observed_dwt;
@@ -6077,7 +6187,12 @@ static bool dwt_publication_adjudicate_or_watchdog(
       verdict |= DWT_PUBLICATION_VERDICT_ZERO_DWT;
     }
 
-    if (expected_interval != 0U) {
+    const bool interval_ruler_qualified =
+        dwt_publication_expected_interval_ruler_qualified(
+            expected_counter_delta, expected_interval);
+    if (!interval_ruler_qualified) {
+      verdict |= DWT_PUBLICATION_VERDICT_RULER_UNQUALIFIED;
+    } else {
       const int64_t pub_error64 =
           (int64_t)(uint64_t)published_interval -
           (int64_t)(uint64_t)expected_interval;
@@ -6147,49 +6262,81 @@ static bool dwt_publication_adjudicate_or_watchdog(
   s->last_observed_dwt = req.observed_dwt;
   s->last_counter32 = req.target_counter32;
 
+  const uint32_t fatal_verdict =
+      verdict & ~DWT_PUBLICATION_SIDE_RAIL_DIAGNOSTIC_MASK;
+
   if (verdict != DWT_PUBLICATION_VERDICT_OK) {
     // The tribunal records both hard publication-law failures and side-rail
-    // audit failures in the same diagnostic mask.  Only the core publication
-    // law is campaign-fatal here.  The VCLOCK DWT->GNSS self-map and the OCXO
-    // PPS-yardstick rail are powerful courtroom witnesses, but they are not
-    // the final subscriber DWT-at-edge authority in this path.  Let them remain
-    // visible as diagnostics without creating a START/RECOVER watchdog loop.
-    const uint32_t fatal_verdict =
-        verdict & ~(DWT_PUBLICATION_VERDICT_GNSS_PROJECTION |
-                    DWT_PUBLICATION_VERDICT_YARDSTICK_EXCURSION);
-
+    // audit failures in the same diagnostic mask.  GNSS projection and
+    // yardstick disagreement remain diagnostic witnesses.  All other bits are
+    // publication law.  Startup may relax interval/ruler/cross-rail law briefly,
+    // but source/custody impossibilities are never admissible, and after a lane
+    // has produced a short clean streak process_interrupt becomes locally strict
+    // even if CLOCKS has not yet marked campaign watchdog continuity armed.
     if (fatal_verdict != DWT_PUBLICATION_VERDICT_OK) {
       s->watchdog_count++;
       diag.publication_watchdog_count = s->watchdog_count;
 
       const bool campaign_armed = clocks_watchdog_campaign_armed();
+      const bool launch_acquisition =
+          interrupt_dwt_publication_launch_acquisition_active();
+      const bool strict_ready =
+          !launch_acquisition && dwt_publication_strict_ready(*s);
+      const uint32_t always_blocking =
+          fatal_verdict & DWT_PUBLICATION_ALWAYS_BLOCK_MASK;
+      const uint32_t launch_blocking =
+          fatal_verdict & DWT_PUBLICATION_LAUNCH_BLOCK_MASK;
+      const uint32_t launch_relaxed =
+          launch_acquisition ? (fatal_verdict & ~DWT_PUBLICATION_LAUNCH_BLOCK_MASK)
+                             : DWT_PUBLICATION_VERDICT_OK;
+      const uint32_t blocking_mask = launch_acquisition
+          ? launch_blocking
+          : ((campaign_armed || strict_ready) ? fatal_verdict : always_blocking);
+      const bool blocked = blocking_mask != DWT_PUBLICATION_VERDICT_OK;
+
       dwt_publication_record_fatal_forensics(req,
                                              diag,
                                              *s,
                                              verdict,
                                              fatal_verdict,
                                              campaign_armed,
-                                             campaign_armed,
+                                             blocked,
+                                             launch_acquisition,
+                                             launch_blocking,
+                                             launch_relaxed,
                                              floorline_valid,
                                              floorline_candidate,
                                              floorline_published,
                                              floorline_dwt);
 
-      if (campaign_armed) {
-        clocks_watchdog_anomaly("dwt_publication_anomaly",
-                                (uint32_t)req.kind,
-                                verdict,
-                                req.published_dwt,
-                                req.target_counter32);
+      if (blocked) {
+        if (launch_acquisition) {
+          g_dwt_publication_launch_hard_block_count++;
+        } else if (campaign_armed || strict_ready) {
+          clocks_watchdog_anomaly("dwt_publication_anomaly",
+                                  (uint32_t)req.kind,
+                                  verdict,
+                                  req.published_dwt,
+                                  req.target_counter32);
+        }
+        diag.publication_verdict_reason = launch_acquisition
+            ? "launch_acquisition_hard_quarantine"
+            : (campaign_armed ? dwt_publication_verdict_name(verdict)
+                              : (strict_ready ? "strict_publication_quarantine"
+                                              : "startup_hard_quarantine"));
         return false;
       }
 
-      // Pre-campaign / boot diagnostic only.  VCLOCK heartbeat and PPS_VCLOCK
-      // anchor publication are allowed to run before a campaign exists; rejecting
-      // those facts here can prevent the START/RECOVER epoch from ever forming.
-      // Preserve the verdict in diagnostics, but do not emit WATCHDOG_ANOMALY
-      // and do not block publication until CLOCKS has armed campaign continuity.
-      diag.publication_verdict_reason = "pre_campaign_diagnostic";
+      // START launch-acquisition deliberately admits non-poisonous transient
+      // interval/ruler/FloorLine/adjacency evidence so Alpha can form the OCXO
+      // public-origin handoff.  The verdict remains visible and the window is
+      // explicitly ended by Beta before public PPS1 is released.
+      if (launch_acquisition) {
+        g_dwt_publication_launch_relaxed_count++;
+        diag.publication_verdict_reason = "launch_acquisition_relaxed_diagnostic";
+      } else {
+        diag.publication_verdict_reason = "startup_relaxed_diagnostic";
+      }
     } else {
       diag.publication_verdict_reason = "side_rail_diagnostic";
     }
@@ -6204,7 +6351,13 @@ static bool dwt_publication_adjudicate_or_watchdog(
     s->last_interval_valid = true;
     s->last_published_interval_cycles = published_interval;
   }
-  s->accept_count++;
+  if (fatal_verdict == DWT_PUBLICATION_VERDICT_OK) {
+    if (s->accept_count != UINT32_MAX) {
+      s->accept_count++;
+    }
+  } else {
+    s->accept_count = 0;
+  }
   return true;
 }
 
@@ -11906,6 +12059,16 @@ static FLASHMEM Payload cmd_report_publication(const Payload&) {
   p.add("verdict_reason", f.verdict_reason ? f.verdict_reason : "");
   p.add("campaign_armed", f.campaign_armed);
   p.add("blocked", f.blocked);
+  p.add("launch_acquisition_active_now",
+        interrupt_dwt_publication_launch_acquisition_active());
+  p.add("launch_acquisition_active_at_record", f.launch_acquisition_active);
+  p.add("launch_block_mask", f.launch_block_mask);
+  p.add("launch_relaxed_mask", f.launch_relaxed_mask);
+  p.add("launch_begin_count", (uint32_t)g_dwt_publication_launch_begin_count);
+  p.add("launch_end_count", (uint32_t)g_dwt_publication_launch_end_count);
+  p.add("launch_relaxed_count", (uint32_t)g_dwt_publication_launch_relaxed_count);
+  p.add("launch_hard_block_count",
+        (uint32_t)g_dwt_publication_launch_hard_block_count);
 
   p.add("published_dwt", f.published_dwt);
   p.add("observed_dwt", f.observed_dwt);
