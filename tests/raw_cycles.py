@@ -12,6 +12,8 @@ Usage:
     python raw_cycles.py <campaign_name> --limit 300 --clock VCLOCK
     python raw_cycles.py <campaign_name> --align-ocxo
     python raw_cycles.py <campaign_name> --delay-pps-vclock
+    python raw_cycles.py <campaign_name> --pathology-only
+    python raw_cycles.py <campaign_name> --pathology-gate 500
 
 Clock filter:
     VCLOCK, OCXO1, OCXO2
@@ -66,6 +68,29 @@ CLOCKS = ("VCLOCK", "OCXO1", "OCXO2")
 LANE_KEYS = {"VCLOCK": "vclock", "OCXO1": "ocxo1", "OCXO2": "ocxo2"}
 PREFIXES = {"VCLOCK": "v", "OCXO1": "o1", "OCXO2": "o2"}
 LANE_MICRO_PREFIXES = {"vclock": "v", "ocxo1": "o1", "ocxo2": "o2"}
+
+PATHOLOGY_DEFAULT_GATE_CYCLES = 500
+PATHOLOGY_EXPECTED_COUNTER_DELTA_TICKS = 10_000_000
+
+# Mirrors process_interrupt.h's DWT publication tribunal mask bits.  Keep the
+# report self-contained so a Pi-side raw_cycles run can decode the verdict
+# without importing Teensy firmware headers.
+DWT_PUBLICATION_VERDICT_BITS = (
+    (1 << 0, "ZERO_DWT"),
+    (1 << 1, "SOURCE_MISMATCH"),
+    (1 << 2, "FLOORLINE_EDGE"),
+    (1 << 3, "FLOORLINE_INTERVAL"),
+    (1 << 4, "FLOORLINE_LATE"),
+    (1 << 5, "COUNTER_LOW16"),
+    (1 << 6, "SERVICE_OFFSET"),
+    (1 << 7, "COUNTER_DELTA"),
+    (1 << 8, "OBSERVED_INTERVAL"),
+    (1 << 9, "PUBLISHED_INTERVAL"),
+    (1 << 10, "CROSS_RAIL"),
+    (1 << 11, "GNSS_PROJECTION"),
+    (1 << 12, "COUNTER_ADJACENCY"),
+    (1 << 13, "YARDSTICK_EXCURSION"),
+)
 
 
 class Welford:
@@ -196,6 +221,13 @@ def _as_bool(v: Any) -> Optional[bool]:
     return None
 
 
+def _as_str(v: Any) -> Optional[str]:
+    if v is None:
+        return None
+    s = str(v)
+    return s if s else None
+
+
 def _first_int(*values: Any) -> Optional[int]:
     for v in values:
         out = _as_int(v)
@@ -215,6 +247,14 @@ def _first_float(*values: Any) -> Optional[float]:
 def _first_bool(*values: Any) -> Optional[bool]:
     for v in values:
         out = _as_bool(v)
+        if out is not None:
+            return out
+    return None
+
+
+def _first_str(*values: Any) -> Optional[str]:
+    for v in values:
+        out = _as_str(v)
         if out is not None:
             return out
     return None
@@ -425,6 +465,80 @@ def _micro_first_bool(root: Dict[str, Any],
                       lane: str,
                       *suffixes: str) -> Optional[bool]:
     return _first_bool(*_micro_values(root, frag, forensic, lane, *suffixes))
+
+
+def _micro_first_str(root: Dict[str, Any],
+                     frag: Dict[str, Any],
+                     forensic: Dict[str, Any],
+                     lane: str,
+                     *suffixes: str) -> Optional[str]:
+    return _first_str(*_micro_values(root, frag, forensic, lane, *suffixes))
+
+
+def dwt_publication_court_diag(root: Dict[str, Any],
+                               frag: Dict[str, Any],
+                               forensic: Dict[str, Any],
+                               lane: str) -> Dict[str, Any]:
+    """Extract the final DWT-at-edge publication tribunal transcript.
+
+    Newer firmware ferries process_interrupt's publication verdict through
+    Alpha and into TIMEBASE_FORENSICS as compact flat micro fields:
+    v_court_*, o1_court_*, o2_court_*.  Keep a few nested/flat fallbacks so
+    focused report rows or transitional payloads can be decoded too.
+    """
+    f = lane_alpha_event(root, frag, forensic, lane)
+
+    def ci(short_name: str, diag_name: str) -> Optional[int]:
+        return _first_int(
+            _micro_first_int(root, frag, forensic, lane, f"court_{short_name}"),
+            f.get(f"dwt_publication_{diag_name}"),
+            frag.get(f"{lane}_forensics_dwt_publication_{diag_name}"),
+            root.get(f"{lane}_forensics_dwt_publication_{diag_name}"),
+        )
+
+    def cb(short_name: str, diag_name: str) -> Optional[bool]:
+        return _first_bool(
+            _micro_first_bool(root, frag, forensic, lane, f"court_{short_name}"),
+            f.get(f"dwt_publication_{diag_name}"),
+            frag.get(f"{lane}_forensics_dwt_publication_{diag_name}"),
+            root.get(f"{lane}_forensics_dwt_publication_{diag_name}"),
+        )
+
+    def cs(short_name: str, diag_name: str) -> Optional[str]:
+        return _first_str(
+            _micro_first_str(root, frag, forensic, lane, f"court_{short_name}"),
+            f.get(f"dwt_publication_{diag_name}"),
+            frag.get(f"{lane}_forensics_dwt_publication_{diag_name}"),
+            root.get(f"{lane}_forensics_dwt_publication_{diag_name}"),
+        )
+
+    return {
+        "schema": _first_str(
+            forensic.get("court_schema"),
+            frag.get("court_schema"),
+            root.get("court_schema"),
+        ),
+        "valid": cb("valid", "valid"),
+        "mask": ci("mask", "verdict_mask"),
+        "reason": cs("reason", "verdict_reason"),
+        "watchdog_count": ci("wd", "watchdog_count"),
+        "gate_cycles": ci("gate", "gate_cycles"),
+        "cross_rail_gate_cycles": ci("xgate", "cross_rail_gate_cycles"),
+        "service_offset_gate_ticks": ci("svc_gate", "service_offset_gate_ticks"),
+        "expected_counter_delta_ticks": ci("exp_cnt", "expected_counter_delta_ticks"),
+        "observed_counter_delta_ticks": ci("obs_cnt", "observed_counter_delta_ticks"),
+        "expected_interval_cycles": ci("exp_int", "expected_interval_cycles"),
+        "published_interval_cycles": ci("pub_int", "published_interval_cycles"),
+        "observed_interval_cycles": ci("obs_int", "observed_interval_cycles"),
+        "floorline_interval_cycles": ci("fl_int", "floorline_interval_cycles"),
+        "published_interval_error_cycles": ci("pub_err", "published_interval_error_cycles"),
+        "observed_interval_error_cycles": ci("obs_err", "observed_interval_error_cycles"),
+        "floorline_interval_error_cycles": ci("fl_err", "floorline_interval_error_cycles"),
+        "published_minus_observed_cycles": ci("pub_obs", "published_minus_observed_cycles"),
+        "floorline_minus_observed_cycles": ci("fl_obs", "floorline_minus_observed_cycles"),
+        "service_offset_signed_ticks": ci("svc_off", "service_offset_signed_ticks"),
+        "vclock_gnss_error_ns": ci("gnss_err", "vclock_gnss_error_ns"),
+    }
 
 
 def dwt_authority_diag(root: Dict[str, Any],
@@ -778,6 +892,7 @@ def collect_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]
             auth = dwt_authority_diag(root, frag, forensic, lane_key)
             gate = dwt_gate_diag(root, frag, forensic, lane_key)
             fl = regression_diag(root, frag, forensic, lane_key)
+            court = dwt_publication_court_diag(root, frag, forensic, lane_key)
 
             original_dwt = auth["original_dwt"]
             used_dwt = auth["used_dwt"]
@@ -891,6 +1006,7 @@ def collect_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]
                 "pub_used_dwt": used_dwt,
                 "raw_dwt": _first_int(original_dwt, fl_observed_dwt),
                 "fl_dwt": fl_inferred_dwt,
+                "court": court,
             }
             row["lanes"][lane] = data
 
@@ -1056,11 +1172,307 @@ def _has_any(collected: List[Dict[str, Any]], lane: str, key: str) -> bool:
     return any(row["lanes"][lane].get(key) is not None for row in collected)
 
 
+def _verdict_mask_names(mask: Optional[int]) -> List[str]:
+    if mask is None:
+        return []
+    return [name for bit, name in DWT_PUBLICATION_VERDICT_BITS if (mask & bit) != 0]
+
+
+def _abs_int(value: Optional[int]) -> Optional[int]:
+    if value is None:
+        return None
+    return abs(value)
+
+
+def _court_watchdog_count(court: Dict[str, Any]) -> int:
+    return _first_int(court.get("watchdog_count"), 0) or 0
+
+
+def _court_reason(court: Dict[str, Any]) -> str:
+    reason = court.get("reason")
+    return str(reason).strip().lower() if reason is not None else ""
+
+
+def _is_side_rail_court_notice(court: Dict[str, Any]) -> bool:
+    """True when a nonzero court mask is diagnostic chatter, not conviction.
+
+    process_interrupt can preserve side-rail diagnostics such as GNSS projection
+    or yardstick disagreement while still publishing a clean FloorLine endpoint.
+    Those rows should remain searchable in court collateral, but they should not
+    make --pathology-only explode into every row.
+    """
+    mask = court.get("mask")
+    return bool(mask) and _court_reason(court) == "side_rail_diagnostic" and _court_watchdog_count(court) == 0
+
+
+def classify_pathologies(row: Dict[str, Any],
+                          clocks: Tuple[str, ...],
+                          gate_cycles: int) -> List[Dict[str, Any]]:
+    """Return row-level custody/pathology issues.
+
+    This is intentionally conservative.  It does not flag normal lattice-scale
+    movement.  It flags impossible/implausible intervals, publication/FloorLine
+    divergence, bad counter lineage, and fatal/watchdog-bearing DWT
+    publication court verdicts.  Nonzero side_rail_diagnostic masks with no
+    watchdog count are treated as court notices, not row pathologies.
+    """
+    issues: List[Dict[str, Any]] = []
+
+    pps_actual = row.get("pps_actual")
+    if pps_actual is not None and pps_actual <= 0:
+        issues.append({
+            "lane": "PPS",
+            "kind": "zero_or_negative_interval",
+            "message": f"PPS actual interval is {pps_actual:,d} cycles",
+        })
+
+    for lane in clocks:
+        data = row["lanes"][lane]
+        court = data.get("court") if isinstance(data.get("court"), dict) else {}
+        expected = _first_int(court.get("expected_interval_cycles"), pps_actual)
+
+        mask = court.get("mask")
+        if mask and not _is_side_rail_court_notice(court):
+            names = ", ".join(_verdict_mask_names(mask)) or f"0x{mask:X}"
+            reason = court.get("reason") or "---"
+            wd = _court_watchdog_count(court)
+            issues.append({
+                "lane": lane,
+                "kind": "court_verdict",
+                "message": f"court verdict mask=0x{mask:X} ({names}), reason={reason}, wd={wd:,d}",
+            })
+
+        for rail in ("raw", "fl", "pub"):
+            value = data.get(rail)
+            if value is None:
+                continue
+            if value <= 0:
+                issues.append({
+                    "lane": lane,
+                    "rail": rail,
+                    "kind": "zero_or_negative_interval",
+                    "message": f"{rail} interval is {value:,d} cycles",
+                })
+                continue
+            if expected is not None:
+                error = value - expected
+                if abs(error) > gate_cycles:
+                    issues.append({
+                        "lane": lane,
+                        "rail": rail,
+                        "kind": "interval_excursion",
+                        "message": (
+                            f"{rail} interval {value:,d} differs from "
+                            f"expected {expected:,d} by {error:+,d} cycles"
+                        ),
+                    })
+
+        pub_minus_fl = data.get("pub_minus_fl")
+        if pub_minus_fl not in (None, 0):
+            issues.append({
+                "lane": lane,
+                "kind": "published_floorline_divergence",
+                "message": f"published interval - FloorLine interval = {pub_minus_fl:+,d} cycles",
+            })
+
+        pub_edge_minus_fl = data.get("pub_edge_minus_fl_edge")
+        if pub_edge_minus_fl not in (None, 0):
+            issues.append({
+                "lane": lane,
+                "kind": "published_floorline_edge_divergence",
+                "message": f"published edge - FloorLine edge = {pub_edge_minus_fl:+,d} cycles",
+            })
+
+        counter_delta = data.get("counter_delta")
+        if counter_delta is not None and counter_delta != PATHOLOGY_EXPECTED_COUNTER_DELTA_TICKS:
+            issues.append({
+                "lane": lane,
+                "kind": "counter_delta",
+                "message": (
+                    f"counter32 delta {counter_delta:,d} ticks, expected "
+                    f"{PATHOLOGY_EXPECTED_COUNTER_DELTA_TICKS:,d}"
+                ),
+            })
+
+        for key, label in (
+            ("published_interval_error_cycles", "court published interval error"),
+            ("observed_interval_error_cycles", "court observed interval error"),
+            ("floorline_interval_error_cycles", "court FloorLine interval error"),
+            ("published_minus_observed_cycles", "court published - observed"),
+            ("floorline_minus_observed_cycles", "court FloorLine - observed"),
+        ):
+            value = court.get(key)
+            if value is not None and abs(value) > gate_cycles:
+                issues.append({
+                    "lane": lane,
+                    "kind": "court_interval_collateral",
+                    "message": f"{label} = {value:+,d} cycles",
+                })
+
+    return issues
+
+
+def _court_summary(court: Dict[str, Any]) -> str:
+    if not court:
+        return "court transcript unavailable"
+    mask = court.get("mask")
+    names = ",".join(_verdict_mask_names(mask)) if mask else "OK"
+    valid = court.get("valid")
+    reason = court.get("reason") or ("ok" if not mask else "")
+    parts = [
+        f"valid={_fmt_str(str(valid) if valid is not None else None)}",
+        f"mask={('0x%X' % mask) if mask is not None else '---'}",
+        f"bits={names}",
+        f"reason={reason or '---'}",
+        f"wd={_fmt_int(court.get('watchdog_count'))}",
+    ]
+    return " ".join(parts)
+
+
+def _format_optional_delta(value: Optional[int]) -> str:
+    return "---" if value is None else f"{value:+,d}"
+
+
+def _pathology_interpretation(lane: str,
+                              data: Dict[str, Any],
+                              court: Dict[str, Any],
+                              gate_cycles: int) -> List[str]:
+    out: List[str] = []
+    raw = data.get("raw")
+    fl = data.get("fl")
+    pub = data.get("pub")
+    p_minus_fl = data.get("pub_minus_fl")
+    court_mask = court.get("mask")
+    court_pub_err = court.get("published_interval_error_cycles")
+    court_obs_err = court.get("observed_interval_error_cycles")
+
+    raw_bad = raw is not None and (
+        raw <= 0 or
+        (court.get("expected_interval_cycles") is not None and
+         abs(raw - court.get("expected_interval_cycles")) > gate_cycles)
+    )
+    pub_ok_vs_fl = (pub is not None and fl is not None and p_minus_fl == 0)
+    pub_ok_vs_court = (court_pub_err is None or abs(court_pub_err) <= gate_cycles)
+
+    if raw_bad and pub_ok_vs_fl and pub_ok_vs_court:
+        out.append(
+            "interpretation: raw/evidence rail is pathological, but published == FloorLine; "
+            "the bad witness does not appear to have become subscriber-facing truth."
+        )
+    elif pub is not None and fl is not None and p_minus_fl not in (None, 0):
+        out.append(
+            "interpretation: published and FloorLine diverge; this is a publication-boundary "
+            "custody issue, not just a raw witness excursion."
+        )
+    elif court_mask and _is_side_rail_court_notice(court):
+        out.append(
+            "court notice: side_rail_diagnostic only; watchdog count is zero and the "
+            "published edge should be judged by the publication/FloorLine custody fields."
+        )
+    elif court_mask:
+        out.append(
+            "interpretation: process_interrupt's DWT publication court recorded a nonzero "
+            "non-side-rail verdict for this row; decode the mask/reason before trusting the edge."
+        )
+    elif raw_bad and court_obs_err is not None and abs(court_obs_err) > gate_cycles:
+        out.append(
+            "interpretation: the court collateral also sees the observed/raw interval as "
+            "bad, while the published surface should be judged separately."
+        )
+    elif raw_bad:
+        out.append(
+            "interpretation: this looks like a raw evidence excursion.  The court transcript "
+            "does not show a published-edge failure in the compact fields available here."
+        )
+
+    if court and court.get("mask") in (None, 0) and raw_bad and pub_ok_vs_fl:
+        out.append(
+            "court note: mask is OK/zero, consistent with the court judging the published "
+            "edge rather than the raw witness interval."
+        )
+
+    return out
+
+
+def pathology_detail_lines(row: Dict[str, Any],
+                           clocks: Tuple[str, ...],
+                           gate_cycles: int) -> List[str]:
+    issues = row.get("pathologies") or []
+    if not issues:
+        return []
+
+    lines = [
+        f"    └─ PATHOLOGY @ PPS {row['pps_count']:,d} "
+        f"({len(issues)} issue{'s' if len(issues) != 1 else ''}, gate={gate_cycles:,d} cycles)"
+    ]
+
+    for issue in issues[:12]:
+        lane = issue.get("lane", "?")
+        lines.append(f"       • {lane}: {issue.get('message', '')}")
+    if len(issues) > 12:
+        lines.append(f"       • ... {len(issues) - 12} additional issue(s) suppressed in this block")
+
+    lanes_with_issues = []
+    for issue in issues:
+        lane = issue.get("lane")
+        if lane in clocks and lane not in lanes_with_issues:
+            lanes_with_issues.append(lane)
+
+    for lane in lanes_with_issues:
+        data = row["lanes"][lane]
+        court = data.get("court") if isinstance(data.get("court"), dict) else {}
+        lines.append(
+            f"       {lane} intervals: "
+            f"raw={_fmt_int(data.get('raw'))} "
+            f"fl={_fmt_int(data.get('fl'))} "
+            f"pub={_fmt_int(data.get('pub'))} "
+            f"pub-fl={_format_optional_delta(data.get('pub_minus_fl'))} "
+            f"pub_edge-fl_edge={_format_optional_delta(data.get('pub_edge_minus_fl_edge'))}"
+        )
+        lines.append(
+            f"       {lane} endpoints: "
+            f"raw_dwt={_fmt_int(data.get('raw_dwt'))} "
+            f"fl_dwt={_fmt_int(data.get('fl_dwt'))} "
+            f"pub_dwt={_fmt_int(data.get('pub_used_dwt'))}"
+        )
+        lines.append(
+            f"       {lane} court: {_court_summary(court)}"
+        )
+        lines.append(
+            f"       {lane} court intervals: "
+            f"exp={_fmt_int(court.get('expected_interval_cycles'))} "
+            f"obs={_fmt_int(court.get('observed_interval_cycles'))} "
+            f"fl={_fmt_int(court.get('floorline_interval_cycles'))} "
+            f"pub={_fmt_int(court.get('published_interval_cycles'))}"
+        )
+        lines.append(
+            f"       {lane} court errors: "
+            f"obs_err={_format_optional_delta(court.get('observed_interval_error_cycles'))} "
+            f"fl_err={_format_optional_delta(court.get('floorline_interval_error_cycles'))} "
+            f"pub_err={_format_optional_delta(court.get('published_interval_error_cycles'))} "
+            f"pub-obs={_format_optional_delta(court.get('published_minus_observed_cycles'))} "
+            f"fl-obs={_format_optional_delta(court.get('floorline_minus_observed_cycles'))}"
+        )
+        lines.append(
+            f"       {lane} court custody: "
+            f"exp_cnt={_fmt_int(court.get('expected_counter_delta_ticks'))} "
+            f"obs_cnt={_fmt_int(court.get('observed_counter_delta_ticks'))} "
+            f"svc_off={_format_optional_delta(court.get('service_offset_signed_ticks'))} ticks "
+            f"gnss_err={_format_optional_delta(court.get('vclock_gnss_error_ns'))} ns"
+        )
+        for statement in _pathology_interpretation(lane, data, court, gate_cycles):
+            lines.append(f"       {statement}")
+
+    return lines
+
+
 def analyze(campaign: str,
             limit: int = 0,
             clock_filter: Optional[str] = None,
             slip_view: bool = False,
-            align_ocxo: bool = False) -> None:
+            align_ocxo: bool = False,
+            pathology_only: bool = False,
+            pathology_gate: int = PATHOLOGY_DEFAULT_GATE_CYCLES) -> None:
     if slip_view:
         raise SystemExit("--slip was retired from this compact FloorLine report; use an older raw_cycles if SlipLedger courtroom output is needed")
 
@@ -1079,11 +1491,27 @@ def analyze(campaign: str,
     if limit:
         collected = collected[:limit]
 
+    if pathology_gate <= 0:
+        raise SystemExit("--pathology-gate must be a positive integer")
+
+    for row in collected:
+        row["pathologies"] = classify_pathologies(row, clocks, pathology_gate)
+
+    displayed_rows = [
+        row for row in collected
+        if (not pathology_only or row.get("pathologies"))
+    ]
+
     cols = available_columns(collected, clocks)
     include_dwt_ppb = any(row.get("dwt_ppb") is not None for row in collected)
 
     clock_label = "ALL" if clock_filter is None else clock_filter
-    view_label = f"{clock_label}, ALIGN_OCXO" if align_ocxo else clock_label
+    view_bits = [clock_label]
+    if align_ocxo:
+        view_bits.append("ALIGN_OCXO")
+    if pathology_only:
+        view_bits.append("PATHOLOGY_ONLY")
+    view_label = ", ".join(view_bits)
     print(f"Campaign: {campaign}  ({len(rows):,} rows, view={view_label})")
     print()
     print("Raw / FloorLine / published cycle audit")
@@ -1095,6 +1523,10 @@ def analyze(campaign: str,
     if any(row.get("start_pps0_valid") for row in collected):
         print("  PPS 1 deltas use the private START PPS0 prologue interval when present.")
     print("  Core rail columns are always shown; missing FL data is shown as --- on purpose.")
+    print(f"  Pathology gate: {pathology_gate:,d} cycles; pathological rows get a court-transcript block.")
+    print("  Nonzero side_rail_diagnostic court masks with wd=0 are treated as court notices, not pathologies.")
+    if pathology_only:
+        print("  Pathology-only mode: normal rows are suppressed, summary still covers analyzed rows.")
     if align_ocxo:
         print("  Alignment view: PPS and VCLOCK are delayed by one TIMEBASE row.")
         print("  OCXO lanes remain on their original publication rows.")
@@ -1103,11 +1535,15 @@ def analyze(campaign: str,
     header, sep = _headers_for(clocks, cols, include_dwt_ppb)
     print(header)
     print(sep)
-    for row in collected:
+    for row in displayed_rows:
         print(_row_line(row, clocks, cols, include_dwt_ppb))
+        for detail_line in pathology_detail_lines(row, clocks, pathology_gate):
+            print(detail_line)
 
     print()
-    print(f"Rows shown: {len(collected):,}")
+    print(f"Rows shown: {len(displayed_rows):,}")
+    if pathology_only:
+        print(f"Rows analyzed: {len(collected):,}")
     print(f"Gaps:       {gaps:,}")
     if align_ocxo:
         print(f"Align skip: {alignment_skipped:,}")
@@ -1192,6 +1628,13 @@ def analyze(campaign: str,
     print("  • FloorLine columns are intentionally always visible.  If *_fl stays ---,")
     print("    the TIMEBASE row stream did not expose a FloorLine endpoint that this parser found.")
     print("  • Use --clock VCLOCK, --clock OCXO1, or --clock OCXO2 to keep the row narrow.")
+    print("  • Pathology blocks decode the DWT publication court transcript when")
+    print("    TIMEBASE_FORENSICS exposes <lane>_court_* fields.")
+    print("  • side_rail_diagnostic court masks with wd=0 are court notices only;")
+    print("    they do not make an otherwise clean row pathological.")
+    print("  • Use --pathology-only to suppress normal rows while retaining the same")
+    print("    row format and per-pathology court collateral.")
+    print("  • Use --pathology-gate N to change the interval-excursion threshold.")
     if align_ocxo:
         print("  • --align-ocxo / --delay-pps-vclock is an intentional view transform:")
         print("    PPS and VCLOCK are shown from the previous TIMEBASE row so late OCXO")
@@ -1200,13 +1643,15 @@ def analyze(campaign: str,
     print()
 
 
-def parse_args(argv: List[str]) -> Tuple[str, int, Optional[str], bool, bool]:
+def parse_args(argv: List[str]) -> Tuple[str, int, Optional[str], bool, bool, bool, int]:
     if len(argv) < 2:
         print("Usage: raw_cycles <campaign_name> [limit] [clock]")
         print("       raw_cycles <campaign_name> --clock OCXO2 [limit]")
         print("       raw_cycles <campaign_name> --limit 300 --clock VCLOCK")
         print("       raw_cycles <campaign_name> --align-ocxo")
         print("       raw_cycles <campaign_name> --delay-pps-vclock")
+        print("       raw_cycles <campaign_name> --pathology-only")
+        print("       raw_cycles <campaign_name> --pathology-gate 500")
         raise SystemExit(1)
 
     campaign = argv[1]
@@ -1214,6 +1659,8 @@ def parse_args(argv: List[str]) -> Tuple[str, int, Optional[str], bool, bool]:
     clock: Optional[str] = None
     slip_view = False
     align_ocxo = False
+    pathology_only = False
+    pathology_gate = PATHOLOGY_DEFAULT_GATE_CYCLES
 
     i = 2
     while i < len(argv):
@@ -1224,6 +1671,26 @@ def parse_args(argv: List[str]) -> Tuple[str, int, Optional[str], bool, bool]:
             continue
         if arg == "--slip":
             slip_view = True
+            i += 1
+            continue
+        if arg == "--pathology-only":
+            pathology_only = True
+            i += 1
+            continue
+        if arg == "--pathology-gate":
+            if i + 1 >= len(argv):
+                raise SystemExit("--pathology-gate requires an integer")
+            try:
+                pathology_gate = int(argv[i + 1])
+            except ValueError as exc:
+                raise SystemExit("--pathology-gate requires an integer") from exc
+            i += 2
+            continue
+        if arg.startswith("--pathology-gate="):
+            try:
+                pathology_gate = int(arg.split("=", 1)[1])
+            except ValueError as exc:
+                raise SystemExit("--pathology-gate requires an integer") from exc
             i += 1
             continue
         if arg == "--clock":
@@ -1262,12 +1729,28 @@ def parse_args(argv: List[str]) -> Tuple[str, int, Optional[str], bool, bool]:
             raise SystemExit(f"unknown argument '{arg}'") from exc
         i += 1
 
-    return campaign, limit, normalize_clock_filter(clock) if clock else None, slip_view, align_ocxo
+    return (
+        campaign,
+        limit,
+        normalize_clock_filter(clock) if clock else None,
+        slip_view,
+        align_ocxo,
+        pathology_only,
+        pathology_gate,
+    )
 
 
 def main() -> None:
-    campaign, limit, clock, slip_view, align_ocxo = parse_args(sys.argv)
-    analyze(campaign, limit, clock, slip_view, align_ocxo)
+    (
+        campaign,
+        limit,
+        clock,
+        slip_view,
+        align_ocxo,
+        pathology_only,
+        pathology_gate,
+    ) = parse_args(sys.argv)
+    analyze(campaign, limit, clock, slip_view, align_ocxo, pathology_only, pathology_gate)
 
 
 if __name__ == "__main__":

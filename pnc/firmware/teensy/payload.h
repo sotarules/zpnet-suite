@@ -98,6 +98,60 @@ typedef struct {
   uint32_t integrity_fail;
   uint32_t invalid_kind;
 
+  // Defensive C-string pointer custody
+  uint32_t string_pointer_fault;
+  uint32_t string_pointer_null;
+  uint32_t string_pointer_low_address;
+  uint32_t string_pointer_magic_address;
+  uint32_t string_pointer_out_of_range;
+  uint32_t string_pointer_span_out_of_range;
+  uint32_t string_pointer_unterminated;
+  uint32_t string_pointer_too_long;
+  uint32_t last_string_pointer_fault_reason;
+  uint32_t last_string_pointer_fault_ptr;
+  char     last_string_pointer_fault_context[32];
+
+  // Payload object integrity courtroom
+  uint32_t self_ok_fail;
+  uint32_t self_ok_magic_bad;
+  uint32_t self_ok_entries_null;
+  uint32_t self_ok_entry_cap_low;
+  uint32_t self_ok_entry_cap_high;
+  uint32_t self_ok_entries_magic_address;
+  uint32_t self_ok_arena_magic_address;
+  uint32_t self_ok_entries_span_unreadable;
+  uint32_t self_ok_arena_span_unreadable;
+  uint32_t self_ok_inline_cap_mismatch;
+  uint32_t self_ok_heap_cap_mismatch;
+  uint32_t self_ok_count_gt_entry_cap;
+  uint32_t self_ok_count_gt_max;
+  uint32_t self_ok_arena_used_gt_cap;
+  uint32_t self_ok_arena_cap_gt_max;
+  uint32_t self_ok_arena_cap_zero_with_ptr;
+  uint32_t self_ok_arena_cap_nonzero_with_null;
+  uint32_t self_ok_count_without_arena;
+  uint32_t self_ok_entry_kind_bad;
+  uint32_t self_ok_entry_key_off_oob;
+  uint32_t self_ok_entry_val_off_oob;
+  uint32_t self_ok_entry_val_end_oob;
+  uint32_t self_ok_entry_val_unterminated;
+  uint32_t self_ok_entry_key_unterminated;
+  uint32_t last_self_ok_fail_reason;
+  char     last_self_ok_fail_op[32];
+  uint32_t last_self_ok_fail_this;
+  uint32_t last_self_ok_fail_magic;
+  uint32_t last_self_ok_fail_entries;
+  uint32_t last_self_ok_fail_arena;
+  uint32_t last_self_ok_fail_count;
+  uint32_t last_self_ok_fail_entry_cap;
+  uint32_t last_self_ok_fail_arena_used;
+  uint32_t last_self_ok_fail_arena_cap;
+  uint32_t last_self_ok_fail_entry_index;
+  uint32_t last_self_ok_fail_entry_key_off;
+  uint32_t last_self_ok_fail_entry_val_off;
+  uint32_t last_self_ok_fail_entry_val_len;
+  uint32_t last_self_ok_fail_entry_kind;
+
   // Last internal error breadcrumb
   uint32_t last_error_code;
   uint32_t last_error_count;
@@ -108,6 +162,8 @@ typedef struct {
 
 void payload_get_info(payload_info_t* out);
 const char* payload_error_code_name(uint32_t code);
+const char* payload_string_fault_reason_name(uint32_t reason);
+const char* payload_self_ok_fail_reason_name(uint32_t reason);
 
 class Payload;
 class PayloadArray;

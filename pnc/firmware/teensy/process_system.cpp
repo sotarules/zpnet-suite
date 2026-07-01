@@ -811,6 +811,76 @@ static Payload cmd_payload_info(const Payload& /*args*/) {
   p.add("payload_invalid_kind",       info.invalid_kind);
 
   // ==========================================================
+  // Defensive C-string pointer custody
+  // ==========================================================
+
+  p.add("payload_string_pointer_fault", info.string_pointer_fault);
+  p.add("payload_string_pointer_null", info.string_pointer_null);
+  p.add("payload_string_pointer_low_address", info.string_pointer_low_address);
+  p.add("payload_string_pointer_magic_address", info.string_pointer_magic_address);
+  p.add("payload_string_pointer_out_of_range", info.string_pointer_out_of_range);
+  p.add("payload_string_pointer_span_out_of_range", info.string_pointer_span_out_of_range);
+  p.add("payload_string_pointer_unterminated", info.string_pointer_unterminated);
+  p.add("payload_string_pointer_too_long", info.string_pointer_too_long);
+  p.add("payload_last_string_pointer_fault_reason", info.last_string_pointer_fault_reason);
+  p.add("payload_last_string_pointer_fault_reason_name",
+        payload_string_fault_reason_name(info.last_string_pointer_fault_reason));
+  p.add_fmt("payload_last_string_pointer_fault_ptr", "0x%08lX",
+            (unsigned long)info.last_string_pointer_fault_ptr);
+  p.add("payload_last_string_pointer_fault_context",
+        info.last_string_pointer_fault_context);
+
+  // ==========================================================
+  // Payload object integrity courtroom
+  // ==========================================================
+
+  p.add("payload_self_ok_fail", info.self_ok_fail);
+  p.add("payload_self_ok_magic_bad", info.self_ok_magic_bad);
+  p.add("payload_self_ok_entries_null", info.self_ok_entries_null);
+  p.add("payload_self_ok_entry_cap_low", info.self_ok_entry_cap_low);
+  p.add("payload_self_ok_entry_cap_high", info.self_ok_entry_cap_high);
+  p.add("payload_self_ok_entries_magic_address", info.self_ok_entries_magic_address);
+  p.add("payload_self_ok_arena_magic_address", info.self_ok_arena_magic_address);
+  p.add("payload_self_ok_entries_span_unreadable", info.self_ok_entries_span_unreadable);
+  p.add("payload_self_ok_arena_span_unreadable", info.self_ok_arena_span_unreadable);
+  p.add("payload_self_ok_inline_cap_mismatch", info.self_ok_inline_cap_mismatch);
+  p.add("payload_self_ok_heap_cap_mismatch", info.self_ok_heap_cap_mismatch);
+  p.add("payload_self_ok_count_gt_entry_cap", info.self_ok_count_gt_entry_cap);
+  p.add("payload_self_ok_count_gt_max", info.self_ok_count_gt_max);
+  p.add("payload_self_ok_arena_used_gt_cap", info.self_ok_arena_used_gt_cap);
+  p.add("payload_self_ok_arena_cap_gt_max", info.self_ok_arena_cap_gt_max);
+  p.add("payload_self_ok_arena_cap_zero_with_ptr", info.self_ok_arena_cap_zero_with_ptr);
+  p.add("payload_self_ok_arena_cap_nonzero_with_null", info.self_ok_arena_cap_nonzero_with_null);
+  p.add("payload_self_ok_count_without_arena", info.self_ok_count_without_arena);
+  p.add("payload_self_ok_entry_kind_bad", info.self_ok_entry_kind_bad);
+  p.add("payload_self_ok_entry_key_off_oob", info.self_ok_entry_key_off_oob);
+  p.add("payload_self_ok_entry_val_off_oob", info.self_ok_entry_val_off_oob);
+  p.add("payload_self_ok_entry_val_end_oob", info.self_ok_entry_val_end_oob);
+  p.add("payload_self_ok_entry_val_unterminated", info.self_ok_entry_val_unterminated);
+  p.add("payload_self_ok_entry_key_unterminated", info.self_ok_entry_key_unterminated);
+  p.add("payload_last_self_ok_fail_reason", info.last_self_ok_fail_reason);
+  p.add("payload_last_self_ok_fail_reason_name",
+        payload_self_ok_fail_reason_name(info.last_self_ok_fail_reason));
+  p.add("payload_last_self_ok_fail_op", info.last_self_ok_fail_op);
+  p.add_fmt("payload_last_self_ok_fail_this", "0x%08lX",
+            (unsigned long)info.last_self_ok_fail_this);
+  p.add_fmt("payload_last_self_ok_fail_magic", "0x%08lX",
+            (unsigned long)info.last_self_ok_fail_magic);
+  p.add_fmt("payload_last_self_ok_fail_entries", "0x%08lX",
+            (unsigned long)info.last_self_ok_fail_entries);
+  p.add_fmt("payload_last_self_ok_fail_arena", "0x%08lX",
+            (unsigned long)info.last_self_ok_fail_arena);
+  p.add("payload_last_self_ok_fail_count", info.last_self_ok_fail_count);
+  p.add("payload_last_self_ok_fail_entry_cap", info.last_self_ok_fail_entry_cap);
+  p.add("payload_last_self_ok_fail_arena_used", info.last_self_ok_fail_arena_used);
+  p.add("payload_last_self_ok_fail_arena_cap", info.last_self_ok_fail_arena_cap);
+  p.add("payload_last_self_ok_fail_entry_index", info.last_self_ok_fail_entry_index);
+  p.add("payload_last_self_ok_fail_entry_key_off", info.last_self_ok_fail_entry_key_off);
+  p.add("payload_last_self_ok_fail_entry_val_off", info.last_self_ok_fail_entry_val_off);
+  p.add("payload_last_self_ok_fail_entry_val_len", info.last_self_ok_fail_entry_val_len);
+  p.add("payload_last_self_ok_fail_entry_kind", info.last_self_ok_fail_entry_kind);
+
+  // ==========================================================
   // Last error breadcrumb
   // ==========================================================
 
