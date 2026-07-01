@@ -1022,15 +1022,17 @@ static constexpr double OCXO_DAC_OUTPUT_GAIN = 2.0;
 static constexpr double OCXO_DAC_OUTPUT_FULL_SCALE_VOLTAGE =
     OCXO_DAC_INTERNAL_REF_VOLTAGE * OCXO_DAC_OUTPUT_GAIN;
 static constexpr double OCXO_DAC_SAFE_MAX_OUTPUT_VOLTAGE = 3.3;
+static constexpr double OCXO_DAC_CODE_SCALE = 65536.0;
+static constexpr uint16_t OCXO_DAC_MAX_HW_CODE = 65535;
 static constexpr uint16_t OCXO_DAC_SAFE_MAX_HW_CODE =
     (uint16_t)((OCXO_DAC_SAFE_MAX_OUTPUT_VOLTAGE /
                 OCXO_DAC_OUTPUT_FULL_SCALE_VOLTAGE) *
-                   65535.0 + 0.5);
+               OCXO_DAC_CODE_SCALE);
 
 static_assert(OCXO_DAC_OUTPUT_FULL_SCALE_VOLTAGE >
               OCXO_DAC_SAFE_MAX_OUTPUT_VOLTAGE,
               "OCXO DAC safety ceiling must be below full scale");
-static_assert(OCXO_DAC_SAFE_MAX_HW_CODE < 65535,
+static_assert(OCXO_DAC_SAFE_MAX_HW_CODE < OCXO_DAC_MAX_HW_CODE,
               "OCXO DAC safety ceiling must clamp the 0..5 V span");
 
 static inline double ocxo_dac_clamp_real_value(double value) {
@@ -1047,7 +1049,7 @@ static inline uint16_t ocxo_dac_rounded_hw_code_from_value(double value) {
 }
 
 static inline double ocxo_dac_voltage_from_code(double code) {
-  return (ocxo_dac_clamp_real_value(code) / 65535.0) *
+  return (ocxo_dac_clamp_real_value(code) / OCXO_DAC_CODE_SCALE) *
          OCXO_DAC_OUTPUT_FULL_SCALE_VOLTAGE;
 }
 

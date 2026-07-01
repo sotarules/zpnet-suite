@@ -884,6 +884,8 @@ def _servo_state(r: dict) -> str:
 # ---------------------------------------------------------------------
 
 DAC_CODE_SCALE = 65536.0
+DAC_VOLTAGE_DECIMALS = 9
+DAC_VOLTAGE_EXTRA_DECIMALS = DAC_VOLTAGE_DECIMALS - 6
 
 
 def _dac_value(r: dict, lane: str):
@@ -924,7 +926,7 @@ def _dac_label(dac_code, dac_voltage=None):
         volts = _dac_voltage(code)
     if code is None or volts is None:
         return "---"
-    return f"{code:>.3f} {volts:.6f}V"
+    return f"{code:>.3f} {volts:.{DAC_VOLTAGE_DECIMALS}f}V"
 
 
 def _dac_tick_payload(report_dac: dict | None) -> dict:
@@ -948,11 +950,17 @@ def _dac_report_value(report_dac: dict | None, lane: str):
 
 def _dac_report_voltage(report_dac: dict | None, lane: str):
     obj = _dac_report_lane(report_dac, lane)
-    return _to_float(
-        obj.get("v")
-        if obj.get("v") is not None
-        else obj.get("dac_voltage")
-    )
+
+    # CLOCKS_DAC_TICK_V2 now distinguishes the effective fractional target
+    # voltage (v_eff/v) from the instantaneous cached hardware-code witness
+    # (v_hw).  The VALUE/VOUT column pairs the displayed real-valued DAC target
+    # with its effective output voltage, so prefer v_eff/v_target before the
+    # legacy v/dac_voltage aliases.
+    for key in ("v_eff", "v_target", "v", "dac_voltage"):
+        val = _to_float(obj.get(key))
+        if val is not None:
+            return val
+    return None
 
 
 def _dac_current_value(r: dict, report_dac: dict | None, lane: str):
@@ -1102,11 +1110,17 @@ def _dac_detail_lines(r: dict, baseline: dict | None, report_dac: dict | None,
                       W_SE: int, W_N: int, W_BASE: int, W_NOW: int,
                       W_DELTA: int) -> list[str]:
     lines: list[str] = []
-    dither_width = W_TAU + W_PPB + W_RAW + W_RES
+    # The DAC value column shows firmware/VREF voltage at nanovolt precision.
+    # That adds three printable characters versus the original microvolt
+    # display, so borrow those characters from the blank/dither field.  The
+    # Welford MEAN/SD/SE/N columns therefore start at exactly the same screen
+    # position as the clock rows.
+    dac_value_width = W_VALUE + DAC_VOLTAGE_EXTRA_DECIMALS
+    dither_width = max(0, W_TAU + W_PPB + W_RAW + W_RES - DAC_VOLTAGE_EXTRA_DECIMALS)
 
     lines.append(
         f"{'DAC':<{W_NAME}}"
-        f"{'VALUE/VOUT':>{W_VALUE}}"
+        f"{'VALUE/VOUT':>{dac_value_width}}"
         f"{'':>{dither_width}}"
         f"{'MEAN':>{W_MEAN}}"
         f"{'SD':>{W_SD}}"
@@ -1128,7 +1142,7 @@ def _dac_detail_lines(r: dict, baseline: dict | None, report_dac: dict | None,
 
         lines.append(
             f"{name:<{W_NAME}}"
-            f"{dac_label:>{W_VALUE}}"
+            f"{dac_label:>{dac_value_width}}"
             f"{dither_summary:>{dither_width}}"
             f"{_welford_cols_fragment(r, f'{key}_dac', W_MEAN, W_SD, W_SE, W_N)}"
             f"  {_baseline_comp(base_dac, dac_now)}"
@@ -1320,6 +1334,71 @@ def _welford_cols_fragment_or_zero(r, prefix, w_mean, w_sd, w_se, w_n, n=None, m
         f"{_fmt(se,   f'>{w_se}.3f',   w_se)}"
         f"{_fmt(wn,   f'>{w_n}d',      w_n)}"
     )
+
+
+
+def _dwt_expected_cycles(r: dict):
+    """Return the DWT EXPECTED interval for the DWT detail block.
+
+    EXPECTED is the GNSS/PPS FloorLine interval in DWT cycles: the cycle
+    distance between the current pair of VCLOCK/GNSS FloorLine edges.  Do not
+    use the static-prediction rail here and do not reconstruct from the DWT
+    residual, because those surfaces can legitimately resolve to the nominal
+    1.008 GHz constant.  If the FloorLine witness is not present, show ---.
+    """
+    return _to_int(_field(
+        r,
+        # Current compact science spine: fragment.vclock.science.*
+        "vclock.science.clock_floorline_interval_cycles",
+        "vclock.science.vclock_floorline_interval_cycles",
+        "vclock.science.floorline_interval_cycles",
+        "vclock.science.clock_floorline.endpoint_interval_cycles",
+        "vclock.science.floorline.endpoint_interval_cycles",
+        # Paired TIMEBASE_FORENSICS micro raw-cycle companion.
+        "forensics.v_fl_cyc",
+        "forensics.v_court_fl_int",
+        "forensics.v.floorline_interval_cycles",
+        "forensics.v.clock_floorline_interval_cycles",
+        "forensics.v.lower_envelope.inferred_interval_cycles",
+        "forensics.vclock.floorline.inferred_interval_cycles",
+        "forensics.vclock.forensics.lower_envelope.inferred_interval_cycles",
+        "forensics.vclock.forensics.floorline.inferred_interval_cycles",
+        "forensics.vclock.dwt_forensics.lower_envelope.inferred_interval_cycles",
+        # Direct/root compatibility aliases.
+        "v_fl_cyc",
+        "v_court_fl_int",
+        "vclock_floorline_interval_cycles",
+        "vclock_fl_cyc",
+        "gnss_floorline_interval_cycles",
+        "gnss_fl_cyc",
+        # Older explicit GNSS/FloorLine spellings, but only if they are truly
+        # named as FloorLine fields rather than static prediction fields.
+        "gnss.floorline.cycles_between_edges",
+        "gnss.floorline.cycles_between_floorline_edges",
+        "gnss.floorline.interval_cycles",
+        "gnss.floorline.dwt_interval_cycles",
+        "gnss.floor_line.cycles_between_edges",
+        "gnss.floor_line.interval_cycles",
+        "gnss.floor_line.dwt_interval_cycles",
+        "floorline.gnss.cycles_between_edges",
+        "floorline.gnss.cycles_between_floorline_edges",
+        "floorline.gnss.interval_cycles",
+        "floorline.gnss.dwt_interval_cycles",
+        "floor_line.gnss.cycles_between_edges",
+        "floor_line.gnss.interval_cycles",
+        "floor_line.gnss.dwt_interval_cycles",
+        "prediction.gnss.floorline_cycles",
+        "prediction.gnss.floorline_interval_cycles",
+        "prediction.gnss.floorline_prediction_cycles",
+        "prediction.gnss.floorline.prediction_cycles",
+        "prediction.gnss.floorline.interval_cycles",
+        "prediction.gnss_floorline.prediction_cycles",
+        "prediction.gnss_floorline.interval_cycles",
+        "prediction.floorline.gnss.prediction_cycles",
+        "prediction.floorline.gnss.interval_cycles",
+        "prediction.pps.floorline_prediction_cycles",
+        "prediction.pps.floorline_interval_cycles",
+    ))
 
 
 # ---------------------------------------------------------------------
@@ -1588,38 +1667,11 @@ def clocks_combined_readout() -> list[str]:
         "dwt_second_residual_cycles",
     ))
 
-    # EXPECTED is the firmware's next-second DWT-cycle prediction, not the
-    # nominal 1.008 GHz constant.  In the current paired TIMEBASE schema, the
-    # DWT row is driven by the PPS/GPIO witness interval, so its prediction
-    # lives on prediction.pps.* rather than prediction.dwt.*.  Older aliases
-    # remain as compatibility fallbacks.
-    dwt_expected = _to_int(_field(
-        r,
-        "prediction.pps.prediction_cycles",
-        "prediction.pps.static_prediction_cycles",
-        "pps_prediction_cycles",
-        "pps_static_prediction_cycles",
-        "prediction.dwt.prediction_cycles",
-        "prediction.dwt.static_prediction_cycles",
-        "dwt.prediction_cycles",
-        "dwt.static_prediction_cycles",
-    ))
-    # Only fall back to explicit expected fields if they are non-nominal; older
-    # firmware used these names for the fixed 1.008 GHz constant, which is no
-    # longer the desired display here.
-    if dwt_expected is None:
-        explicit_expected = _to_int(_field(
-            r,
-            "dwt.expected_per_pps_vclock",
-            "dwt_expected_per_pps_vclock",
-            "dwt_expected_per_pps",
-            "dwt.expected_cycles_per_second",
-            "dwt_expected_cycles_per_second",
-            "dwt.expected_cycles",
-            "dwt_expected_cycles",
-        ))
-        if explicit_expected is not None and explicit_expected != 1008000000:
-            dwt_expected = explicit_expected
+    # EXPECTED is the DWT-cycle interval predicted by the GNSS/PPS
+    # FloorLine surface between the current pair of FloorLine edges.
+    # If the paired TIMEBASE row does not carry that FloorLine witness, show
+    # --- rather than falling back to the nominal/static-prediction rail.
+    dwt_expected = _dwt_expected_cycles(r)
 
     dwt_at_anchor = _field(
         r,

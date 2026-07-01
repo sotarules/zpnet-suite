@@ -363,13 +363,17 @@ void clocks_beta_features_init(void) {
 //   would create a cold-boot deadlock.  They remain published feature-health
 //   surfaces, but not admission prerequisites.
 //
-//   FLOORLINE and QTIMER_DWT_RULER are also not admission prerequisites in this
-//   phase.  They are INTERRUPT-owned witness/quality surfaces, and their current
-//   definitions can strobe while FloorLine2 and DWT-ruler policy are being
-//   refined.  Campaign admission should remain attached to custody/identity
+//   FLOORLINE, QTIMER_DWT_RULER, STATIC_PREDICTION, SCIENCE_RESIDUALS,
+//   and TIMEBASE_PUBLICATION are also not admission prerequisites in this
+//   phase.  They are witness/product surfaces whose definitions can legitimately
+//   be INITIALIZING immediately after STOP/RECOVER or after a transport-induced
+//   campaign abort.  Requiring them before START creates a trap: the campaign
+//   cannot start because the start-prologue evidence is not yet mature, while
+//   the evidence cannot mature because the campaign cannot start.
+//
+//   Campaign admission therefore remains attached only to custody/identity
 //   rails: PPS/VCLOCK authority, QTimer counter custody, Counter32 lineage,
-//   DWT calibration, static prediction, SmartZero, Alpha epoch, and OCXO public
-//   origin.
+//   DWT calibration, SmartZero, Alpha epoch, and OCXO public origin.
 
 struct campaign_feature_gate_requirement_t {
   const char* label;
@@ -385,7 +389,6 @@ static constexpr campaign_feature_gate_requirement_t
   { "QTIMER_CNT",  "TEENSY", "INTERRUPT", "QTIMER_COUNTER_CUSTODY" },
   { "CTR32_LINE",  "TEENSY", "INTERRUPT", "COUNTER32_LINEAGE" },
   { "DWT_CAL",     "TEENSY", "CLOCKS",    "DWT_CALIBRATION" },
-  { "STATIC_PRED", "TEENSY", "CLOCKS",    "STATIC_PREDICTION" },
   { "SMARTZERO",   "TEENSY", "CLOCKS",    "SMARTZERO" },
   { "ALPHA_EPOCH", "TEENSY", "CLOCKS",    "ALPHA_EPOCH" },
   { "OCXO_ORIGIN", "TEENSY", "CLOCKS",    "OCXO_PUBLIC_ORIGIN" },
@@ -401,6 +404,7 @@ static volatile uint32_t g_campaign_feature_gate_required_count =
 static char g_campaign_feature_gate_reason[128] =
     "FEATURE_STATUS not yet received";
 static char g_campaign_feature_gate_first_problem[32] = "";
+static char g_campaign_feature_gate_static_prediction_status[24] = "---";
 
 static const char* feature_status_lookup(const Payload& root,
                                          const char* host,
@@ -430,6 +434,12 @@ static void campaign_feature_gate_set_reason(const char* reason,
 }
 
 static void campaign_feature_gate_recompute(const Payload& root) {
+  const char* static_pred_status =
+      feature_status_lookup(root, "TEENSY", "CLOCKS", "STATIC_PREDICTION");
+  safeCopy(g_campaign_feature_gate_static_prediction_status,
+           sizeof(g_campaign_feature_gate_static_prediction_status),
+           static_pred_status ? static_pred_status : "---");
+
   bool ready = true;
   const campaign_feature_gate_requirement_t* failed = nullptr;
 
@@ -484,6 +494,9 @@ static void payload_add_campaign_feature_gate(Payload& p) {
         (uint32_t)g_campaign_feature_gate_required_count);
   p.add("campaign_gate_requires_floorline", false);
   p.add("campaign_gate_requires_qtimer_dwt_ruler", false);
+  p.add("campaign_gate_requires_static_prediction", false);
+  p.add("campaign_gate_static_prediction_status",
+        g_campaign_feature_gate_static_prediction_status);
   p.add("campaign_gate_requires_science_residuals", false);
   p.add("campaign_gate_requires_timebase_publication", false);
 }
@@ -4346,23 +4359,24 @@ static FLASHMEM void payload_add_dac_realization_object(Payload& parent,
   r.add("mode", ocxo_dac_realization_mode_runtime());
   r.add("reference_mode", OCXO_DAC_REFERENCE_MODE);
   r.add("external_vref_used", false);
-  r.add("internal_ref_voltage", OCXO_DAC_INTERNAL_REF_VOLTAGE, 6);
+  r.add("internal_ref_voltage", OCXO_DAC_INTERNAL_REF_VOLTAGE, 9);
   r.add("output_gain", OCXO_DAC_OUTPUT_GAIN, 3);
-  r.add("output_full_scale_voltage", OCXO_DAC_OUTPUT_FULL_SCALE_VOLTAGE, 6);
-  r.add("safe_max_output_voltage", OCXO_DAC_SAFE_MAX_OUTPUT_VOLTAGE, 6);
+  r.add("output_full_scale_voltage", OCXO_DAC_OUTPUT_FULL_SCALE_VOLTAGE, 9);
+  r.add("dac_code_scale", OCXO_DAC_CODE_SCALE, 1);
+  r.add("safe_max_output_voltage", OCXO_DAC_SAFE_MAX_OUTPUT_VOLTAGE, 9);
   r.add("safe_max_hw_code", (uint32_t)OCXO_DAC_SAFE_MAX_HW_CODE);
   r.add("fractional_target", s.dac_fractional, 6);
   r.add("fractional_target_voltage",
-        ocxo_dac_voltage_from_code(s.dac_fractional), 6);
+        ocxo_dac_voltage_from_code(s.dac_fractional), 9);
   r.add("current_hw_code", (uint32_t)s.dac_hw_code);
   r.add("current_hw_voltage",
-        ocxo_dac_voltage_from_code((double)s.dac_hw_code), 6);
+        ocxo_dac_voltage_from_code((double)s.dac_hw_code), 9);
   r.add("rounded_hw_code",
         (uint32_t)ocxo_dac_rounded_hw_code_from_value(s.dac_fractional));
   r.add("rounded_hw_voltage",
         ocxo_dac_voltage_from_code(
             (double)ocxo_dac_rounded_hw_code_from_value(s.dac_fractional)),
-        6);
+        9);
 
   r.add("safe_ceiling_active", true);
   r.add("static_rounded_only", ocxo_dac_static_rounded_only_runtime());
@@ -5012,9 +5026,21 @@ static void payload_add_dac_tick_lane(Payload& parent,
   Payload lane;
 
   // Dashboard/manual-control essentials.
+  //
+  // dac is the real-valued commanded/effective code.  With fractional dither
+  // enabled, this is the value the operator cares about: the one-second
+  // effective DAC voltage moves with the fractional code even when the
+  // instantaneous AD5693R hardware code is merely alternating between adjacent
+  // integers.
+  //
+  // Keep hw/v_hw as the instantaneous/cached hardware-code witness, but make
+  // v follow dac so the compact dashboard does not appear stuck when the servo
+  // is moving only in fractional-LSB space.
   lane.add("dac", dac.dac_fractional, 6);
   lane.add("hw", (uint32_t)dac.dac_hw_code);
-  lane.add("v", ocxo_dac_voltage_from_code((double)dac.dac_hw_code), 6);
+  lane.add("v", ocxo_dac_voltage_from_code(dac.dac_fractional), 9);
+  lane.add("v_eff", ocxo_dac_voltage_from_code(dac.dac_fractional), 9);
+  lane.add("v_hw", ocxo_dac_voltage_from_code((double)dac.dac_hw_code), 9);
   lane.add("ok", dac.io_last_write_ok &&
                  !dac.io_fault_latched &&
                  dac.io_last_failure_stage == 0);
@@ -5022,6 +5048,8 @@ static void payload_add_dac_tick_lane(Payload& parent,
   // Dither display essentials: adjacent codes, high dwell, and current phase.
   lane.add("lo", (uint32_t)dac.dither_low_code);
   lane.add("hi", (uint32_t)dac.dither_high_code);
+  lane.add("lo_v", ocxo_dac_voltage_from_code((double)dac.dither_low_code), 9);
+  lane.add("hi_v", ocxo_dac_voltage_from_code((double)dac.dither_high_code), 9);
   lane.add("hi_ms", (uint32_t)dac.dither_high_ms);
   lane.add("ph", dac.dither_current_phase_high);
 
@@ -6224,11 +6252,11 @@ static FLASHMEM Payload cmd_start(const Payload& args) {
   p.add("ocxo1_dac_hw_code", (uint32_t)ocxo1_dac.dac_hw_code);
   p.add("ocxo2_dac_hw_code", (uint32_t)ocxo2_dac.dac_hw_code);
   p.add("ocxo1_dac_voltage",
-        ocxo_dac_voltage_from_code((double)ocxo1_dac.dac_hw_code), 6);
+        ocxo_dac_voltage_from_code((double)ocxo1_dac.dac_hw_code), 9);
   p.add("ocxo2_dac_voltage",
-        ocxo_dac_voltage_from_code((double)ocxo2_dac.dac_hw_code), 6);
+        ocxo_dac_voltage_from_code((double)ocxo2_dac.dac_hw_code), 9);
   p.add("dac_reference_mode", OCXO_DAC_REFERENCE_MODE);
-  p.add("dac_safe_max_output_voltage", OCXO_DAC_SAFE_MAX_OUTPUT_VOLTAGE, 6);
+  p.add("dac_safe_max_output_voltage", OCXO_DAC_SAFE_MAX_OUTPUT_VOLTAGE, 9);
   p.add("dac_safe_max_hw_code", (uint32_t)OCXO_DAC_SAFE_MAX_HW_CODE);
   p.add("ocxo1_dac_last_write_ok", ocxo1_dac.io_last_write_ok);
   p.add("ocxo2_dac_last_write_ok", ocxo2_dac.io_last_write_ok);
@@ -6995,9 +7023,9 @@ static FLASHMEM void add_dac_payload(Payload& p) {
   o1.add("dac", ocxo1_dac.dac_fractional);
   o1.add("dac_hw_code", (uint32_t)ocxo1_dac.dac_hw_code);
   o1.add("dac_voltage",
-         ocxo_dac_voltage_from_code((double)ocxo1_dac.dac_hw_code), 6);
+         ocxo_dac_voltage_from_code((double)ocxo1_dac.dac_hw_code), 9);
   o1.add("dac_fractional_voltage",
-         ocxo_dac_voltage_from_code(ocxo1_dac.dac_fractional), 6);
+         ocxo_dac_voltage_from_code(ocxo1_dac.dac_fractional), 9);
   o1.add("dac_min", ocxo1_dac.dac_min);
   o1.add("dac_max", ocxo1_dac.dac_max);
   o1.add("servo_last_step", ocxo1_dac.servo_last_step, 6);
@@ -7042,9 +7070,9 @@ static FLASHMEM void add_dac_payload(Payload& p) {
   o2.add("dac", ocxo2_dac.dac_fractional);
   o2.add("dac_hw_code", (uint32_t)ocxo2_dac.dac_hw_code);
   o2.add("dac_voltage",
-         ocxo_dac_voltage_from_code((double)ocxo2_dac.dac_hw_code), 6);
+         ocxo_dac_voltage_from_code((double)ocxo2_dac.dac_hw_code), 9);
   o2.add("dac_fractional_voltage",
-         ocxo_dac_voltage_from_code(ocxo2_dac.dac_fractional), 6);
+         ocxo_dac_voltage_from_code(ocxo2_dac.dac_fractional), 9);
   o2.add("dac_min", ocxo2_dac.dac_min);
   o2.add("dac_max", ocxo2_dac.dac_max);
   o2.add("servo_last_step", ocxo2_dac.servo_last_step, 6);
@@ -7090,10 +7118,11 @@ static FLASHMEM void add_dac_payload(Payload& p) {
   p.add("realization_mode", ocxo_dac_realization_mode_runtime());
   p.add("reference_mode", OCXO_DAC_REFERENCE_MODE);
   p.add("external_vref_used", false);
-  p.add("internal_ref_voltage", OCXO_DAC_INTERNAL_REF_VOLTAGE, 6);
+  p.add("internal_ref_voltage", OCXO_DAC_INTERNAL_REF_VOLTAGE, 9);
   p.add("output_gain", OCXO_DAC_OUTPUT_GAIN, 3);
-  p.add("output_full_scale_voltage", OCXO_DAC_OUTPUT_FULL_SCALE_VOLTAGE, 6);
-  p.add("safe_max_output_voltage", OCXO_DAC_SAFE_MAX_OUTPUT_VOLTAGE, 6);
+  p.add("output_full_scale_voltage", OCXO_DAC_OUTPUT_FULL_SCALE_VOLTAGE, 9);
+  p.add("dac_code_scale", OCXO_DAC_CODE_SCALE, 1);
+  p.add("safe_max_output_voltage", OCXO_DAC_SAFE_MAX_OUTPUT_VOLTAGE, 9);
   p.add("safe_max_hw_code", (uint32_t)OCXO_DAC_SAFE_MAX_HW_CODE);
   p.add("static_rounded_only", ocxo_dac_static_rounded_only_runtime());
   p.add("fractional_stream_possible", ocxo_dac_fractional_stream_possible_runtime());
@@ -8085,7 +8114,7 @@ static FLASHMEM void payload_add_dither_status_lane_compact(
   Payload lane;
   lane.add("dac", dac.dac_fractional, 6);
   lane.add("hw_code", (uint32_t)dac.dac_hw_code);
-  lane.add("voltage", ocxo_dac_voltage_from_code((double)dac.dac_hw_code), 6);
+  lane.add("voltage", ocxo_dac_voltage_from_code((double)dac.dac_hw_code), 9);
 
   lane.add("active", dac.dither_active_this_frame);
   lane.add("low_code", (uint32_t)dac.dither_low_code);
@@ -8210,16 +8239,17 @@ static FLASHMEM Payload cmd_set_dac(const Payload& args) {
   p.add("ocxo1_dac_hw_code", (uint32_t)ocxo1_dac.dac_hw_code);
   p.add("ocxo2_dac_hw_code", (uint32_t)ocxo2_dac.dac_hw_code);
   p.add("ocxo1_dac_voltage",
-        ocxo_dac_voltage_from_code((double)ocxo1_dac.dac_hw_code), 6);
+        ocxo_dac_voltage_from_code((double)ocxo1_dac.dac_hw_code), 9);
   p.add("ocxo2_dac_voltage",
-        ocxo_dac_voltage_from_code((double)ocxo2_dac.dac_hw_code), 6);
+        ocxo_dac_voltage_from_code((double)ocxo2_dac.dac_hw_code), 9);
   p.add("realization_mode", ocxo_dac_realization_mode_runtime());
   p.add("reference_mode", OCXO_DAC_REFERENCE_MODE);
   p.add("external_vref_used", false);
-  p.add("internal_ref_voltage", OCXO_DAC_INTERNAL_REF_VOLTAGE, 6);
+  p.add("internal_ref_voltage", OCXO_DAC_INTERNAL_REF_VOLTAGE, 9);
   p.add("output_gain", OCXO_DAC_OUTPUT_GAIN, 3);
-  p.add("output_full_scale_voltage", OCXO_DAC_OUTPUT_FULL_SCALE_VOLTAGE, 6);
-  p.add("safe_max_output_voltage", OCXO_DAC_SAFE_MAX_OUTPUT_VOLTAGE, 6);
+  p.add("output_full_scale_voltage", OCXO_DAC_OUTPUT_FULL_SCALE_VOLTAGE, 9);
+  p.add("dac_code_scale", OCXO_DAC_CODE_SCALE, 1);
+  p.add("safe_max_output_voltage", OCXO_DAC_SAFE_MAX_OUTPUT_VOLTAGE, 9);
   p.add("safe_max_hw_code", (uint32_t)OCXO_DAC_SAFE_MAX_HW_CODE);
   p.add("static_rounded_only", ocxo_dac_static_rounded_only_runtime());
   p.add("fractional_stream_possible", ocxo_dac_fractional_stream_possible_runtime());
