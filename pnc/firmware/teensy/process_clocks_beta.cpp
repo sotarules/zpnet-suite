@@ -4672,8 +4672,8 @@ static void campaign_accounting_reset_common(bool reset_servo_runtime) {
   }
 
   // Input diagnostics are campaign-row products, not plant state.  Clear them
-  // even for FLASH_CUT so DAC_TICK cannot leak stale residuals across the
-  // campaign name boundary.
+  // even for FLASH_CUT so TIMEBASE/REPORT_DAC cannot surface stale residuals
+  // across the campaign name boundary.
   servo_input_diag_reset(g_servo_input_ocxo1);
   servo_input_diag_reset(g_servo_input_ocxo2);
 }
@@ -5013,85 +5013,20 @@ static void payload_add_servo_dac_values(Payload& parent) {
 }
 
 // ----------------------------------------------------------------------------
-// CLOCKS_DAC_TICK — minimal 1 Hz DAC/servo dashboard feed
+// CLOCKS_DAC_TICK -- retired automatic DAC/servo telemetry
 // ----------------------------------------------------------------------------
 //
-// REPORT_DAC is the courtroom report.  This publication is intentionally tiny:
-// just enough for dashboard rows, manual DAC controls, and servo/dither status.
+// Servo/DAC state is now piggybacked on TIMEBASE while servos are active
+// through payload_add_servo_dac_values().  Focused command reports
+// (REPORT_DAC / DITHER_STATUS) remain available on demand, but CLOCKS no
+// longer emits an independent 1 Hz DAC_TICK publication from the PPS hot path.
+//
+// Keep this no-op helper so existing gate sites remain visually explicit:
+// those sites are acknowledging DAC/servo transition points, not publishing
+// a separate diagnostic stream.
 
-static void payload_add_dac_tick_lane(Payload& parent,
-                                      const char* key,
-                                      const ocxo_dac_state_t& dac,
-                                      const servo_input_diag_t& input) {
-  Payload lane;
-
-  // Dashboard/manual-control essentials.
-  //
-  // dac is the real-valued commanded/effective code.  With fractional dither
-  // enabled, this is the value the operator cares about: the one-second
-  // effective DAC voltage moves with the fractional code even when the
-  // instantaneous AD5693R hardware code is merely alternating between adjacent
-  // integers.
-  //
-  // Keep hw/v_hw as the instantaneous/cached hardware-code witness, but make
-  // v follow dac so the compact dashboard does not appear stuck when the servo
-  // is moving only in fractional-LSB space.
-  lane.add("dac", dac.dac_fractional, 6);
-  lane.add("hw", (uint32_t)dac.dac_hw_code);
-  lane.add("v", ocxo_dac_voltage_from_code(dac.dac_fractional), 9);
-  lane.add("v_eff", ocxo_dac_voltage_from_code(dac.dac_fractional), 9);
-  lane.add("v_hw", ocxo_dac_voltage_from_code((double)dac.dac_hw_code), 9);
-  lane.add("ok", dac.io_last_write_ok &&
-                 !dac.io_fault_latched &&
-                 dac.io_last_failure_stage == 0);
-
-  // Dither display essentials: adjacent codes, high dwell, and current phase.
-  lane.add("lo", (uint32_t)dac.dither_low_code);
-  lane.add("hi", (uint32_t)dac.dither_high_code);
-  lane.add("lo_v", ocxo_dac_voltage_from_code((double)dac.dither_low_code), 9);
-  lane.add("hi_v", ocxo_dac_voltage_from_code((double)dac.dither_high_code), 9);
-  lane.add("hi_ms", (uint32_t)dac.dither_high_ms);
-  lane.add("ph", dac.dither_current_phase_high);
-
-  // Servo essentials.  The selected/control fields explain what the servo
-  // would do when engaged; now/mean/total let the panel show the live inputs
-  // without pulling the verbose REPORT_DAC courtroom surface.
-  lane.add("step", dac.servo_last_step, 6);
-  lane.add("ctl", dac.servo_predicted_residual, 6);
-  lane.add("src", servo_input_source_name(input.selected_source));
-  lane.add("sel", input.selected_input_ppb, 6);
-  lane.add("now", input.now_ppb, 6);
-  lane.add("mean", input.mean_welford_ppb, 6);
-  lane.add("total", input.total_ppb, 6);
-
-  parent.add_object(key, lane);
-}
-
-static void publish_dac_tick(const char* phase) {
-  Payload p;
-  p.add("schema", "CLOCKS_DAC_TICK_V2");
-  p.add("c", campaign_name);
-  p.add("state",
-        campaign_state == clocks_campaign_state_t::STARTED ? "STARTED" : "STOPPED");
-  p.add("phase", phase ? phase : "");
-  p.add("sec", campaign_seconds);
-
-  p.add("servo", servo_mode_str(calibrate_ocxo_mode));
-  p.add("dither", clocks_ocxo_dac_dither_operator_enabled());
-  p.add("mode", ocxo_dac_realization_mode_runtime());
-  p.add("safe_max", (uint32_t)OCXO_DAC_SAFE_MAX_HW_CODE);
-  p.add("ok", g_ad5693r_init_ok &&
-              ocxo1_dac.io_last_write_ok &&
-              ocxo2_dac.io_last_write_ok &&
-              !ocxo1_dac.io_fault_latched &&
-              !ocxo2_dac.io_fault_latched &&
-              clocks_ocxo_dac_dither_global_schedule_failures() == 0 &&
-              clocks_ocxo_dac_dither_service_arm_failures() == 0);
-
-  payload_add_dac_tick_lane(p, "ocxo1", ocxo1_dac, g_servo_input_ocxo1);
-  payload_add_dac_tick_lane(p, "ocxo2", ocxo2_dac, g_servo_input_ocxo2);
-
-  publish("CLOCKS_DAC_TICK", p);
+static void publish_dac_tick(const char*) {
+  // Intentionally silent.
 }
 
 // ============================================================================

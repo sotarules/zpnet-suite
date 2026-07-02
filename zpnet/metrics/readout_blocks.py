@@ -45,7 +45,10 @@ import time
 
 from zpnet.processes.processes import send_command
 
-VREF = 3.003
+# AD5693R DAC doctrine mirrors firmware: internal 2.5 V reference with 2x
+# gain, yielding an effective 0..5 V code span.  This is presentation-only;
+# Teensy remains DAC authority.
+VREF = 5.0
 
 DAC_FINE_STEP = 1.0
 DAC_COARSE_STEP = 10.0
@@ -58,10 +61,6 @@ FEATURE_GRID_CELL_WIDTH = 39
 PUBSUB_TAP_SOCKET = "/tmp/zpnet_pubsub_tap.sock"
 FEATURE_STATUS_TOPIC = "FEATURE_STATUS"
 FEATURE_STATUS_RECONNECT_S = 1.0
-DAC_TICK_TOPIC = "CLOCKS_DAC_TICK"
-DAC_TICK_STALE_S = 5.0
-DAC_TICK_RECONNECT_S = 1.0
-
 # Mission-control readiness board.  The feature payload remains scalar-only;
 # this table is just the operator-facing projection of the global PI SYSTEM
 # feature tree into the CLOCKS panel's empty space.
@@ -95,11 +94,6 @@ _FEATURE_STATUS_CACHE_ERROR: str | None = None
 _FEATURE_STATUS_THREAD: threading.Thread | None = None
 _FEATURE_STATUS_LOCK = threading.Lock()
 
-_DAC_TICK_CACHE: dict | None = None
-_DAC_TICK_CACHE_TS = 0.0
-_DAC_TICK_CACHE_ERROR: str | None = None
-_DAC_TICK_THREAD: threading.Thread | None = None
-_DAC_TICK_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------------
@@ -231,100 +225,11 @@ def _get_pi_clocks_report() -> dict:
     return send_command(machine="PI", subsystem="CLOCKS", command="REPORT")["payload"]
 
 
-def _dac_tick_listener_loop() -> None:
-    """Background tap listener for the compact CLOCKS_DAC_TICK feed.
-
-    This is intentionally best-effort and cache-only.  The readout path never
-    blocks on the socket and never polls TEENSY CLOCKS REPORT_DAC.  If the tap is
-    temporarily unavailable, callers simply fall back to the most recent CLOCKS
-    report/TIMEBASE fields until a fresh tick arrives.
-    """
-    global _DAC_TICK_CACHE, _DAC_TICK_CACHE_TS, _DAC_TICK_CACHE_ERROR
-
-    subscribe = json.dumps(
-        {"type": "set_topics", "topics": [DAC_TICK_TOPIC]},
-        separators=(",", ":"),
-    ).encode("utf-8") + b"\n"
-
-    while True:
-        try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-                sock.settimeout(2.0)
-                sock.connect(PUBSUB_TAP_SOCKET)
-                sock.settimeout(None)
-
-                with sock.makefile("rwb") as stream:
-                    stream.write(subscribe)
-                    stream.flush()
-
-                    with _DAC_TICK_LOCK:
-                        _DAC_TICK_CACHE_ERROR = None
-
-                    for raw in stream:
-                        try:
-                            msg = json.loads(raw.decode("utf-8"))
-                        except Exception:
-                            continue
-
-                        if not isinstance(msg, dict):
-                            continue
-                        if msg.get("type") != "publish":
-                            continue
-                        if msg.get("topic") != DAC_TICK_TOPIC:
-                            continue
-
-                        payload = msg.get("payload")
-                        if not isinstance(payload, dict):
-                            continue
-                        if payload.get("schema") != "CLOCKS_DAC_TICK_V2":
-                            continue
-
-                        with _DAC_TICK_LOCK:
-                            _DAC_TICK_CACHE = payload
-                            _DAC_TICK_CACHE_TS = time.monotonic()
-                            _DAC_TICK_CACHE_ERROR = None
-
-        except Exception as e:
-            with _DAC_TICK_LOCK:
-                _DAC_TICK_CACHE_ERROR = str(e)
-            time.sleep(DAC_TICK_RECONNECT_S)
-
-
-def _ensure_dac_tick_listener() -> None:
-    global _DAC_TICK_THREAD
-
-    if _DAC_TICK_THREAD is not None and _DAC_TICK_THREAD.is_alive():
-        return
-
-    with _DAC_TICK_LOCK:
-        if _DAC_TICK_THREAD is not None and _DAC_TICK_THREAD.is_alive():
-            return
-        _DAC_TICK_THREAD = threading.Thread(
-            target=_dac_tick_listener_loop,
-            name="zpnet-dac-tick-listener",
-            daemon=True,
-        )
-        _DAC_TICK_THREAD.start()
-
-
-def _get_dac_tick_payload(max_age_s: float = DAC_TICK_STALE_S) -> dict | None:
-    _ensure_dac_tick_listener()
-
-    with _DAC_TICK_LOCK:
-        payload = _DAC_TICK_CACHE
-        age = time.monotonic() - _DAC_TICK_CACHE_TS if _DAC_TICK_CACHE_TS else 1.0e9
-
-    if not isinstance(payload, dict):
-        return None
-    if age > max_age_s:
-        return None
-    return payload
-
-
 def _get_pi_clocks_report_dac() -> dict:
-    # Compatibility name: the metrics panel now consumes the compact pub/sub
-    # CLOCKS_DAC_TICK feed instead of polling TEENSY CLOCKS REPORT_DAC.
-    return _get_dac_tick_payload() or {}
+    # Servo/DAC telemetry no longer has a separate pub/sub feed.  Metrics reads
+    # the compact DAC persistence object already present in TIMEBASE/CLOCKS
+    # reports, and focused REPORT_DAC remains an explicit operator command.
+    return {}
 
 
 def _get_pi_gnss_report() -> dict:
@@ -913,9 +818,8 @@ def _dac_voltage(dac_code):
     code = _to_float(dac_code)
     if code is None:
         return None
-    # Fallback only.  Prefer firmware-authored voltage from CLOCKS_DAC_TICK
-    # when available because the active DAC reference/gain doctrine lives in
-    # firmware, not in this panel.
+    # Presentation mirror of the firmware DAC doctrine: AD5693R internal 2.5 V
+    # reference with 2x gain, scaled by the 16-bit code span.
     return code * VREF / DAC_CODE_SCALE
 
 
@@ -951,11 +855,9 @@ def _dac_report_value(report_dac: dict | None, lane: str):
 def _dac_report_voltage(report_dac: dict | None, lane: str):
     obj = _dac_report_lane(report_dac, lane)
 
-    # CLOCKS_DAC_TICK_V2 now distinguishes the effective fractional target
-    # voltage (v_eff/v) from the instantaneous cached hardware-code witness
-    # (v_hw).  The VALUE/VOUT column pairs the displayed real-valued DAC target
-    # with its effective output voltage, so prefer v_eff/v_target before the
-    # legacy v/dac_voltage aliases.
+    # Retained only for explicit REPORT_DAC/back-compat payloads.  The normal
+    # metrics path now reads DAC code from TIMEBASE and computes presentation
+    # voltage locally from the firmware DAC doctrine above.
     for key in ("v_eff", "v_target", "v", "dac_voltage"):
         val = _to_float(obj.get(key))
         if val is not None:
@@ -988,9 +890,9 @@ def _clamp_dac_code(value: float) -> float:
 def _manual_dac_current_value(lane: str) -> float:
     """Fetch the live DAC value for keyboard nudging.
 
-    Prefer the compact CLOCKS_DAC_TICK pub/sub cache and fall back to the
-    current CLOCKS report/TIMEBASE value.  This avoids polling the verbose
-    Teensy REPORT_DAC command path while the operator is nudging DAC values.
+    Read the live DAC value from the current CLOCKS report/TIMEBASE value.
+    Metrics does not subscribe to CLOCKS_DAC_TICK and does not poll verbose
+    TEENSY REPORT_DAC during repaint or keyboard nudging.
     """
     report = {}
     try:
@@ -999,13 +901,7 @@ def _manual_dac_current_value(lane: str) -> float:
     except Exception:
         report = {}
 
-    report_dac = None
-    try:
-        report_dac = _get_pi_clocks_report_dac()
-    except Exception:
-        report_dac = None
-
-    current = _dac_current_value(report, report_dac, lane)
+    current = _dac_current_value(report, {}, lane)
     if current is None:
         raise RuntimeError(f"{lane.upper()} DAC value unavailable")
 
