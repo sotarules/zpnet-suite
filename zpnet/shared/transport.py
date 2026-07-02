@@ -77,7 +77,7 @@ _VALID_TRAFFIC = {
 }
 
 RAW_TRANSPORT_LOG_PATH = "/home/mule/zpnet/logs/zpnet-transport.log"
-RAW_TRANSPORT_LOG_ENABLED = False
+RAW_TRANSPORT_LOG_ENABLED = True
 
 # ---------------------------------------------------------------------
 # Retry policy (aggressive, silent)
