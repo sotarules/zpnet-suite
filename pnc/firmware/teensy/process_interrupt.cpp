@@ -3319,9 +3319,9 @@ static ocxo_lane_t g_ocxo2_lane;
 static ocxo_lane_t* ocxo_lane_for(interrupt_subscriber_kind_t kind);
 static inline uint16_t ocxo_lane_counter_now(const ocxo_lane_t& lane);
 static inline uint16_t ocxo_lane_compare_counter_now(const ocxo_lane_t& lane);
-static void ocxo_lane_program_compare(ocxo_lane_t& lane, uint16_t target_low16);
-static void ocxo_lane_disable_compare(ocxo_lane_t& lane);
-static void ocxo_lane_clear_compare_flag(ocxo_lane_t& lane);
+static bool ocxo_lane_program_compare(ocxo_lane_t& lane, uint16_t target_low16);
+static bool ocxo_lane_disable_compare(ocxo_lane_t& lane);
+static bool ocxo_lane_clear_compare_flag(ocxo_lane_t& lane);
 static inline bool ocxo_lane_compare_flag_pending(const ocxo_lane_t& lane);
 static void ocxo_qtimer_diag_record(ocxo_runtime_context_t& ctx,
                                     uint32_t isr_entry_dwt_raw,
@@ -4477,6 +4477,11 @@ bool interrupt_smartzero_snapshot(interrupt_smartzero_snapshot_t* out) {
   return interrupt_smartzero_live_snapshot(out);
 }
 
+// Forward declarations used by the OCXO-only MMIO guard below.  The concrete
+// helpers live in the priority-handoff section later in this file.
+static inline uint32_t interrupt_ipsr(void);
+static inline uint32_t interrupt_primask(void);
+
 // ============================================================================
 // Compare channel helpers
 // ============================================================================
@@ -4500,6 +4505,271 @@ static inline void qtimer_disable_compare(IMXRT_TMR_t& module, uint8_t ch) {
   module.CH[ch].CSCTRL &= ~TMR_CSCTRL_TCF1EN;
   qtimer_clear_compare_flag(module, ch);
   qtimer_clear_compare_flag(module, ch);
+}
+
+// OCXO-only MMIO guard.  This deliberately leaves the generic QTimer helpers
+// unchanged for VCLOCK/TimePop.  The guard exists to catch the specific crash
+// class where a corrupted OCXO lane/module/channel would form an impossible
+// QTimer register address before the CPU attempts the halfword access.  Success
+// is silent; only failures emit debug_log evidence and quarantine that OCXO
+// lane so a pending compare flag cannot become a reboot loop.
+static constexpr uint32_t QTIMER_MMIO_GUARD_LOG_LIMIT = 32U;
+static volatile uint32_t g_qtimer_mmio_guard_fail_count = 0;
+
+enum class qtimer_guard_reg_t : uint8_t {
+  CSCTRL = 0,
+  CNTR   = 1,
+};
+
+static const char* qtimer_guard_reg_name(qtimer_guard_reg_t reg) {
+  switch (reg) {
+    case qtimer_guard_reg_t::CNTR:   return "CNTR";
+    case qtimer_guard_reg_t::CSCTRL:
+    default:                         return "CSCTRL";
+  }
+}
+
+static uintptr_t qtimer_guard_reg_addr(IMXRT_TMR_t* module,
+                                       uint8_t ch,
+                                       qtimer_guard_reg_t reg) {
+  const uintptr_t base = (uintptr_t)module;
+  const uintptr_t tmr1 = (uintptr_t)&IMXRT_TMR1;
+
+  if (reg == qtimer_guard_reg_t::CNTR) {
+    const uintptr_t off0 =
+        (uintptr_t)&IMXRT_TMR1.CH[0].CNTR - tmr1;
+    const uintptr_t stride =
+        (uintptr_t)&IMXRT_TMR1.CH[1].CNTR -
+        (uintptr_t)&IMXRT_TMR1.CH[0].CNTR;
+    return base + off0 + ((uintptr_t)ch * stride);
+  }
+
+  const uintptr_t off0 =
+      (uintptr_t)&IMXRT_TMR1.CH[0].CSCTRL - tmr1;
+  const uintptr_t stride =
+      (uintptr_t)&IMXRT_TMR1.CH[1].CSCTRL -
+      (uintptr_t)&IMXRT_TMR1.CH[0].CSCTRL;
+  return base + off0 + ((uintptr_t)ch * stride);
+}
+
+static bool qtimer_guard_known_module(uintptr_t module_addr) {
+  return module_addr == (uintptr_t)&IMXRT_TMR1 ||
+         module_addr == (uintptr_t)&IMXRT_TMR2 ||
+         module_addr == (uintptr_t)&IMXRT_TMR3 ||
+         module_addr == (uintptr_t)&IMXRT_TMR4;
+}
+
+static uint32_t qtimer_guard_kind_for_lane(const ocxo_lane_t& lane) {
+  if (&lane == &g_ocxo1_lane) return (uint32_t)interrupt_subscriber_kind_t::OCXO1;
+  if (&lane == &g_ocxo2_lane) return (uint32_t)interrupt_subscriber_kind_t::OCXO2;
+  return (uint32_t)interrupt_subscriber_kind_t::NONE;
+}
+
+static IMXRT_TMR_t* qtimer_guard_expected_module_for_lane(const ocxo_lane_t& lane) {
+  if (&lane == &g_ocxo1_lane) return &IMXRT_TMR2;
+  if (&lane == &g_ocxo2_lane) return &IMXRT_TMR3;
+  return nullptr;
+}
+
+static uint8_t qtimer_guard_expected_channel_for_lane(const ocxo_lane_t& lane) {
+  if (&lane == &g_ocxo1_lane) return QTIMER2_OCXO1_CH;
+  if (&lane == &g_ocxo2_lane) return QTIMER3_OCXO2_CH;
+  return 0xFFU;
+}
+
+static void qtimer_guard_log_failure(const ocxo_lane_t& lane,
+                                     const char* op,
+                                     qtimer_guard_reg_t reg,
+                                     uint8_t ch,
+                                     uint16_t target_low16,
+                                     uintptr_t reg_addr,
+                                     bool module_known,
+                                     bool module_expected,
+                                     bool channel_ok,
+                                     bool channel_expected,
+                                     bool aligned) {
+  const uint32_t count = ++g_qtimer_mmio_guard_fail_count;
+  if (count > QTIMER_MMIO_GUARD_LOG_LIMIT &&
+      (count & 0x3FFU) != 0U) {
+    return;
+  }
+
+  const uintptr_t module_addr = (uintptr_t)lane.module;
+  const uintptr_t expected_module_addr =
+      (uintptr_t)qtimer_guard_expected_module_for_lane(lane);
+  const uint32_t kind = qtimer_guard_kind_for_lane(lane);
+  const uint8_t expected_ch = qtimer_guard_expected_channel_for_lane(lane);
+
+  char line[256];
+  snprintf(line, sizeof(line),
+           "QTIMER_MMIO_GUARD fail=%lu op=%s reg=%s kind=%lu lane=0x%08lX "
+           "module=0x%08lX exp_module=0x%08lX ch=%u exp_ch=%u "
+           "addr=0x%08lX target=0x%04X known=%u mod_ok=%u ch_ok=%u "
+           "ch_exp=%u aligned=%u ipsr=%lu primask=%lu dwt=%lu",
+           (unsigned long)count,
+           op ? op : "?",
+           qtimer_guard_reg_name(reg),
+           (unsigned long)kind,
+           (unsigned long)(uintptr_t)&lane,
+           (unsigned long)module_addr,
+           (unsigned long)expected_module_addr,
+           (unsigned)ch,
+           (unsigned)expected_ch,
+           (unsigned long)reg_addr,
+           (unsigned)target_low16,
+           module_known ? 1U : 0U,
+           module_expected ? 1U : 0U,
+           channel_ok ? 1U : 0U,
+           channel_expected ? 1U : 0U,
+           aligned ? 1U : 0U,
+           (unsigned long)interrupt_ipsr(),
+           (unsigned long)interrupt_primask(),
+           (unsigned long)ARM_DWT_CYCCNT);
+  debug_log("interrupt.qtimer_guard", line);
+}
+
+static bool qtimer_guard_ocxo_reg(const ocxo_lane_t& lane,
+                                  const char* op,
+                                  qtimer_guard_reg_t reg,
+                                  uint8_t ch,
+                                  uint16_t target_low16,
+                                  uintptr_t* out_addr = nullptr) {
+  IMXRT_TMR_t* const expected_module =
+      qtimer_guard_expected_module_for_lane(lane);
+  const uint8_t expected_ch = qtimer_guard_expected_channel_for_lane(lane);
+  IMXRT_TMR_t* const module = lane.module;
+  const uintptr_t module_addr = (uintptr_t)module;
+  const uintptr_t expected_module_addr = (uintptr_t)expected_module;
+  const uintptr_t reg_addr = qtimer_guard_reg_addr(module, ch, reg);
+
+  const bool module_known = qtimer_guard_known_module(module_addr);
+  const bool module_expected =
+      expected_module && module_addr == expected_module_addr;
+  const bool channel_ok = ch < 4U;
+  const bool channel_expected = ch == expected_ch;
+  const bool aligned = (reg_addr & 1U) == 0U;
+  if (out_addr) *out_addr = reg_addr;
+
+  if (module_known && module_expected &&
+      channel_ok && channel_expected && aligned) {
+    return true;
+  }
+
+  qtimer_guard_log_failure(lane, op, reg, ch, target_low16, reg_addr,
+                           module_known, module_expected, channel_ok,
+                           channel_expected, aligned);
+  return false;
+}
+
+static void qtimer_guard_quarantine_ocxo_lane(ocxo_lane_t& lane,
+                                              const char* op) {
+  lane.cadence_enabled = false;
+  lane.cadence_armed = false;
+  lane.witness_armed = false;
+  lane.cadence_last_reason = OCXO_CADENCE_REASON_STOP;
+
+  if (&lane == &g_ocxo1_lane) {
+    NVIC_DISABLE_IRQ(IRQ_QTIMER2);
+    g_step0_qtimer2_irq_enabled_by_interrupt = false;
+  } else if (&lane == &g_ocxo2_lane) {
+    NVIC_DISABLE_IRQ(IRQ_QTIMER3);
+    g_step0_qtimer3_irq_enabled_by_interrupt = false;
+  }
+
+  char line[160];
+  snprintf(line, sizeof(line),
+           "QTIMER_MMIO_GUARD quarantine op=%s kind=%lu lane=0x%08lX",
+           op ? op : "?",
+           (unsigned long)qtimer_guard_kind_for_lane(lane),
+           (unsigned long)(uintptr_t)&lane);
+  debug_log("interrupt.qtimer_guard", line);
+}
+
+static bool qtimer_guard_read_ocxo_u16(const ocxo_lane_t& lane,
+                                       const char* op,
+                                       qtimer_guard_reg_t reg,
+                                       uint8_t ch,
+                                       uint16_t target_low16,
+                                       uint16_t* out) {
+  if (!out) return false;
+  if (!qtimer_guard_ocxo_reg(lane, op, reg, ch, target_low16)) {
+    *out = 0U;
+    return false;
+  }
+
+  if (reg == qtimer_guard_reg_t::CNTR) {
+    *out = lane.module->CH[ch].CNTR;
+  } else {
+    *out = lane.module->CH[ch].CSCTRL;
+  }
+  return true;
+}
+
+static bool qtimer_guard_read_ocxo_csctrl(const ocxo_lane_t& lane,
+                                          const char* op,
+                                          uint16_t target_low16,
+                                          uint32_t* out) {
+  uint16_t value = 0;
+  const bool ok = qtimer_guard_read_ocxo_u16(lane, op,
+                                             qtimer_guard_reg_t::CSCTRL,
+                                             lane.compare_channel,
+                                             target_low16,
+                                             &value);
+  if (out) *out = ok ? (uint32_t)value : 0U;
+  return ok;
+}
+
+static bool qtimer_guard_clear_ocxo_compare_flag(ocxo_lane_t& lane,
+                                                 const char* op) {
+  if (!qtimer_guard_ocxo_reg(lane, op, qtimer_guard_reg_t::CSCTRL,
+                             lane.compare_channel, lane.compare_target)) {
+    qtimer_guard_quarantine_ocxo_lane(lane, op);
+    return false;
+  }
+
+  lane.module->CH[lane.compare_channel].CSCTRL &=
+      ~(TMR_CSCTRL_TCF1 | TMR_CSCTRL_TCF2);
+  (void)lane.module->CH[lane.compare_channel].CSCTRL;
+  return true;
+}
+
+static bool qtimer_guard_program_ocxo_compare(ocxo_lane_t& lane,
+                                              uint16_t target_low16,
+                                              const char* op) {
+  if (!qtimer_guard_clear_ocxo_compare_flag(lane, op)) return false;
+
+  if (!qtimer_guard_ocxo_reg(lane, op, qtimer_guard_reg_t::CSCTRL,
+                             lane.compare_channel, target_low16)) {
+    qtimer_guard_quarantine_ocxo_lane(lane, op);
+    return false;
+  }
+
+  lane.module->CH[lane.compare_channel].COMP1  = target_low16;
+  lane.module->CH[lane.compare_channel].CMPLD1 = target_low16;
+
+  if (!qtimer_guard_clear_ocxo_compare_flag(lane, op)) return false;
+
+  if (!qtimer_guard_ocxo_reg(lane, op, qtimer_guard_reg_t::CSCTRL,
+                             lane.compare_channel, target_low16)) {
+    qtimer_guard_quarantine_ocxo_lane(lane, op);
+    return false;
+  }
+  lane.module->CH[lane.compare_channel].CSCTRL |= TMR_CSCTRL_TCF1EN;
+  return true;
+}
+
+static bool qtimer_guard_disable_ocxo_compare(ocxo_lane_t& lane,
+                                              const char* op) {
+  if (!qtimer_guard_ocxo_reg(lane, op, qtimer_guard_reg_t::CSCTRL,
+                             lane.compare_channel, lane.compare_target)) {
+    qtimer_guard_quarantine_ocxo_lane(lane, op);
+    return false;
+  }
+
+  lane.module->CH[lane.compare_channel].CSCTRL &= ~TMR_CSCTRL_TCF1EN;
+  if (!qtimer_guard_clear_ocxo_compare_flag(lane, op)) return false;
+  if (!qtimer_guard_clear_ocxo_compare_flag(lane, op)) return false;
+  return true;
 }
 
 // Legacy QTimer1 CH1 hosted-rail API remains retired.  VCLOCK authority now
@@ -4538,17 +4808,18 @@ static inline void qtimer1_ch2_program_compare(uint16_t target_low16) {
   qtimer_program_compare(IMXRT_TMR1, QTIMER1_TIMEPOP_CH, target_low16);
 }
 
-static inline void ocxo_compare_clear_flag(const ocxo_lane_t& lane) {
-  qtimer_clear_compare_flag(*lane.module, lane.compare_channel);
+static inline bool ocxo_compare_clear_flag(ocxo_lane_t& lane) {
+  return qtimer_guard_clear_ocxo_compare_flag(lane, "ocxo_compare_clear_flag");
 }
 
-static inline void ocxo_compare_program(const ocxo_lane_t& lane,
+static inline bool ocxo_compare_program(ocxo_lane_t& lane,
                                         uint16_t target_low16) {
-  qtimer_program_compare(*lane.module, lane.compare_channel, target_low16);
+  return qtimer_guard_program_ocxo_compare(lane, target_low16,
+                                           "ocxo_compare_program");
 }
 
-static inline void ocxo_compare_disable(const ocxo_lane_t& lane) {
-  qtimer_disable_compare(*lane.module, lane.compare_channel);
+static inline bool ocxo_compare_disable(ocxo_lane_t& lane) {
+  return qtimer_guard_disable_ocxo_compare(lane, "ocxo_compare_disable");
 }
 
 // ============================================================================
@@ -7254,12 +7525,19 @@ static bool ocxo_lane_program_local_cadence_compare(ocxo_lane_t& lane,
                          (remaining < OCXO_WITNESS_MIN_ARM_LEAD_TICKS);
 
   if (target_is_behind || too_far || too_close) {
-    lane.cadence_last_program_csctrl_before =
-        lane.module->CH[lane.compare_channel].CSCTRL;
+    uint32_t csctrl_before = 0;
+    if (!qtimer_guard_read_ocxo_csctrl(lane,
+                                       "ocxo_local_guard_before",
+                                       target_low16,
+                                       &csctrl_before)) {
+      qtimer_guard_quarantine_ocxo_lane(lane, "ocxo_local_guard_before");
+      return false;
+    }
+    lane.cadence_last_program_csctrl_before = csctrl_before;
     lane.cadence_last_program_flag_before =
-        (lane.cadence_last_program_csctrl_before & TMR_CSCTRL_TCF1) != 0;
+        (csctrl_before & TMR_CSCTRL_TCF1) != 0;
     lane.cadence_last_program_enabled_before =
-        (lane.cadence_last_program_csctrl_before & TMR_CSCTRL_TCF1EN) != 0;
+        (csctrl_before & TMR_CSCTRL_TCF1EN) != 0;
 
     lane.cadence_next_counter32 = target_counter32;
     lane.cadence_next_low16 = target_low16;
@@ -7286,24 +7564,42 @@ static bool ocxo_lane_program_local_cadence_compare(ocxo_lane_t& lane,
     lane.witness_generation_guard_last_target_counter32 = target_counter32;
     lane.witness_generation_guard_last_reason = reason;
 
-    ocxo_lane_disable_compare(lane);
+    const bool disabled_ok = ocxo_lane_disable_compare(lane);
     lane.cadence_armed = false;
     lane.witness_armed = false;
-    lane.cadence_last_program_csctrl_after =
-        lane.module->CH[lane.compare_channel].CSCTRL;
-    lane.cadence_last_program_flag_after =
-        (lane.cadence_last_program_csctrl_after & TMR_CSCTRL_TCF1) != 0;
-    lane.cadence_last_program_enabled_after =
-        (lane.cadence_last_program_csctrl_after & TMR_CSCTRL_TCF1EN) != 0;
+    lane.cadence_last_program_csctrl_after = 0;
+    lane.cadence_last_program_flag_after = false;
+    lane.cadence_last_program_enabled_after = false;
+    if (disabled_ok) {
+      uint32_t csctrl_after = 0;
+      if (qtimer_guard_read_ocxo_csctrl(lane,
+                                        "ocxo_local_guard_after_disable",
+                                        target_low16,
+                                        &csctrl_after)) {
+        lane.cadence_last_program_csctrl_after = csctrl_after;
+        lane.cadence_last_program_flag_after =
+            (csctrl_after & TMR_CSCTRL_TCF1) != 0;
+        lane.cadence_last_program_enabled_after =
+            (csctrl_after & TMR_CSCTRL_TCF1EN) != 0;
+      }
+    }
     lane.cadence_last_reason = reason;
     return false;
   }
 
-  lane.cadence_last_program_csctrl_before = lane.module->CH[lane.compare_channel].CSCTRL;
+  uint32_t csctrl_before = 0;
+  if (!qtimer_guard_read_ocxo_csctrl(lane,
+                                     "ocxo_local_program_before",
+                                     target_low16,
+                                     &csctrl_before)) {
+    qtimer_guard_quarantine_ocxo_lane(lane, "ocxo_local_program_before");
+    return false;
+  }
+  lane.cadence_last_program_csctrl_before = csctrl_before;
   lane.cadence_last_program_flag_before =
-      (lane.cadence_last_program_csctrl_before & TMR_CSCTRL_TCF1) != 0;
+      (csctrl_before & TMR_CSCTRL_TCF1) != 0;
   lane.cadence_last_program_enabled_before =
-      (lane.cadence_last_program_csctrl_before & TMR_CSCTRL_TCF1EN) != 0;
+      (csctrl_before & TMR_CSCTRL_TCF1EN) != 0;
 
   lane.cadence_next_counter32 = target_counter32;
   lane.cadence_next_low16 = target_low16;
@@ -7327,13 +7623,26 @@ static bool ocxo_lane_program_local_cadence_compare(ocxo_lane_t& lane,
   lane.witness_schedule_last_decision = OCXO_SCHEDULE_DECISION_ARMED;
   lane.witness_schedule_last_ticks_until_arm_window = 0;
 
-  ocxo_lane_program_compare(lane, target_low16);
+  if (!ocxo_lane_program_compare(lane, target_low16)) {
+    lane.cadence_armed = false;
+    lane.witness_armed = false;
+    lane.cadence_last_reason = reason;
+    return false;
+  }
 
-  lane.cadence_last_program_csctrl_after = lane.module->CH[lane.compare_channel].CSCTRL;
+  uint32_t csctrl_after = 0;
+  if (!qtimer_guard_read_ocxo_csctrl(lane,
+                                     "ocxo_local_program_after",
+                                     target_low16,
+                                     &csctrl_after)) {
+    qtimer_guard_quarantine_ocxo_lane(lane, "ocxo_local_program_after");
+    return false;
+  }
+  lane.cadence_last_program_csctrl_after = csctrl_after;
   lane.cadence_last_program_flag_after =
-      (lane.cadence_last_program_csctrl_after & TMR_CSCTRL_TCF1) != 0;
+      (csctrl_after & TMR_CSCTRL_TCF1) != 0;
   lane.cadence_last_program_enabled_after =
-      (lane.cadence_last_program_csctrl_after & TMR_CSCTRL_TCF1EN) != 0;
+      (csctrl_after & TMR_CSCTRL_TCF1EN) != 0;
   lane.cadence_armed = true;
   lane.cadence_arm_count++;
   if (reason == OCXO_CADENCE_REASON_REARM) {
@@ -7834,12 +8143,12 @@ static bool vclock_heartbeat_arm_timepop(void) {
 // OCXO lanes — pin-bound same-channel count+compare custody
 // ============================================================================
 //
-static void ocxo_lane_program_compare(ocxo_lane_t& lane, uint16_t target_low16) {
-  ocxo_compare_program(lane, target_low16);
+static bool ocxo_lane_program_compare(ocxo_lane_t& lane, uint16_t target_low16) {
+  return ocxo_compare_program(lane, target_low16);
 }
 
-static void ocxo_lane_disable_compare(ocxo_lane_t& lane) {
-  ocxo_compare_disable(lane);
+static bool ocxo_lane_disable_compare(ocxo_lane_t& lane) {
+  return ocxo_compare_disable(lane);
 }
 
 // ISR discipline for OCXO lanes is reentry-safe capture only:
@@ -8076,19 +8385,40 @@ static bool ocxo_fact_ring_push_from_isr(ocxo_runtime_context_t& ctx,
 
 
 static inline bool ocxo_lane_compare_flag_pending(const ocxo_lane_t& lane) {
-  return (lane.module->CH[lane.compare_channel].CSCTRL & TMR_CSCTRL_TCF1) != 0;
+  uint32_t csctrl = 0;
+  if (!qtimer_guard_read_ocxo_csctrl(lane,
+                                     "ocxo_compare_flag_pending",
+                                     lane.compare_target,
+                                     &csctrl)) {
+    return false;
+  }
+  return (csctrl & TMR_CSCTRL_TCF1) != 0;
 }
 
 static inline uint16_t ocxo_lane_counter_now(const ocxo_lane_t& lane) {
-  return lane.module->CH[lane.counter_channel].CNTR;
+  uint16_t value = 0;
+  (void)qtimer_guard_read_ocxo_u16(lane,
+                                   "ocxo_counter_now",
+                                   qtimer_guard_reg_t::CNTR,
+                                   lane.counter_channel,
+                                   lane.compare_target,
+                                   &value);
+  return value;
 }
 
 static inline uint16_t ocxo_lane_compare_counter_now(const ocxo_lane_t& lane) {
-  return lane.module->CH[lane.compare_channel].CNTR;
+  uint16_t value = 0;
+  (void)qtimer_guard_read_ocxo_u16(lane,
+                                   "ocxo_compare_counter_now",
+                                   qtimer_guard_reg_t::CNTR,
+                                   lane.compare_channel,
+                                   lane.compare_target,
+                                   &value);
+  return value;
 }
 
-static void ocxo_lane_clear_compare_flag(ocxo_lane_t& lane) {
-  ocxo_compare_clear_flag(lane);
+static bool ocxo_lane_clear_compare_flag(ocxo_lane_t& lane) {
+  return ocxo_compare_clear_flag(lane);
 }
 
 static void ocxo_qtimer_diag_record(ocxo_runtime_context_t& ctx,
@@ -9818,7 +10148,15 @@ static void ocxo_cadence_capture_priority0(ocxo_runtime_context_t& ctx,
           ? g_handoff_ocxo1
           : g_handoff_ocxo2;
 
-  const uint32_t csctrl_entry = lane.module->CH[lane.compare_channel].CSCTRL;
+  uint32_t csctrl_entry = 0;
+  if (!qtimer_guard_read_ocxo_csctrl(lane,
+                                     "ocxo_priority0_entry",
+                                     lane.compare_target,
+                                     &csctrl_entry)) {
+    qtimer_guard_quarantine_ocxo_lane(lane, "ocxo_priority0_entry");
+    interrupt_handoff_note_priority0_body(diag, isr_entry_dwt_raw);
+    return;
+  }
 
   // False/unowned IRQs are defused in the capture tier; there is no meaningful
   // edge packet to hand off.
@@ -9832,8 +10170,11 @@ static void ocxo_cadence_capture_priority0(ocxo_runtime_context_t& ctx,
   if (!lane.cadence_enabled || !lane.cadence_armed) {
     lane.cadence_false_irq_count++;
     lane.witness_false_irq_count++;
-    ocxo_lane_clear_compare_flag(lane);
-    ocxo_lane_disable_compare(lane);
+    if (!ocxo_lane_clear_compare_flag(lane)) {
+      interrupt_handoff_note_priority0_body(diag, isr_entry_dwt_raw);
+      return;
+    }
+    (void)ocxo_lane_disable_compare(lane);
     lane.cadence_armed = false;
     lane.witness_armed = false;
     interrupt_handoff_note_priority0_body(diag, isr_entry_dwt_raw);
@@ -9912,7 +10253,10 @@ static void ocxo_cadence_capture_priority0(ocxo_runtime_context_t& ctx,
       was_smartzero_current,
       isr_entry_dwt_raw);
   if (!generation_accepted) {
-    ocxo_lane_clear_compare_flag(lane);
+    if (!ocxo_lane_clear_compare_flag(lane)) {
+      interrupt_handoff_note_priority0_body(diag, isr_entry_dwt_raw);
+      return;
+    }
 
     const bool far_late_rejected =
         generation_gate_lane.generation_gate_last_delta_ticks >
@@ -9972,7 +10316,7 @@ static void ocxo_cadence_capture_priority0(ocxo_runtime_context_t& ctx,
         lane.witness_schedule_last_ticks_until_arm_window =
             too_far ? (next_remaining - OCXO_WITNESS_ARM_WINDOW_TICKS) : 0U;
         if (too_close) lane.witness_late_arm_count++;
-        ocxo_lane_disable_compare(lane);
+        (void)ocxo_lane_disable_compare(lane);
         lane.cadence_armed = false;
         lane.witness_armed = false;
       } else {
@@ -9990,7 +10334,10 @@ static void ocxo_cadence_capture_priority0(ocxo_runtime_context_t& ctx,
         lane.witness_schedule_last_decision = OCXO_SCHEDULE_DECISION_ARMED;
         lane.witness_schedule_last_ticks_until_arm_window = 0;
 
-        ocxo_lane_program_compare(lane, next_low16);
+        if (!ocxo_lane_program_compare(lane, next_low16)) {
+          interrupt_handoff_note_priority0_body(diag, isr_entry_dwt_raw);
+          return;
+        }
         lane.cadence_armed = true;
         lane.witness_armed = true;
         lane.cadence_arm_count++;
@@ -10053,7 +10400,10 @@ static void ocxo_cadence_capture_priority0(ocxo_runtime_context_t& ctx,
   // Defuse the source and immediately advance the OCXO gear train in priority
   // 0.  Reaching this point means the immediate low16 witness resolved into a
   // lawful 32-bit generation for the authored target.
-  ocxo_lane_clear_compare_flag(lane);
+  if (!ocxo_lane_clear_compare_flag(lane)) {
+    interrupt_handoff_note_priority0_body(diag, isr_entry_dwt_raw);
+    return;
+  }
 
   if (ctx.clock32) {
     ctx.clock32->current_counter32 = target_counter32;
@@ -10136,7 +10486,7 @@ static void ocxo_cadence_capture_priority0(ocxo_runtime_context_t& ctx,
       lane.witness_schedule_last_ticks_until_arm_window =
           too_far ? (next_remaining - OCXO_WITNESS_ARM_WINDOW_TICKS) : 0U;
       if (too_close) lane.witness_late_arm_count++;
-      ocxo_lane_disable_compare(lane);
+      (void)ocxo_lane_disable_compare(lane);
       lane.cadence_armed = false;
       lane.witness_armed = false;
     } else {
@@ -10154,7 +10504,10 @@ static void ocxo_cadence_capture_priority0(ocxo_runtime_context_t& ctx,
       lane.witness_schedule_last_decision = OCXO_SCHEDULE_DECISION_ARMED;
       lane.witness_schedule_last_ticks_until_arm_window = 0;
 
-      ocxo_lane_program_compare(lane, next_low16);
+      if (!ocxo_lane_program_compare(lane, next_low16)) {
+        interrupt_handoff_note_priority0_body(diag, isr_entry_dwt_raw);
+        return;
+      }
       lane.cadence_armed = true;
       lane.witness_armed = true;
       lane.cadence_arm_count++;
@@ -10171,13 +10524,22 @@ static void ocxo_cadence_capture_priority0(ocxo_runtime_context_t& ctx,
       }
     }
   } else {
-    ocxo_lane_disable_compare(lane);
+    (void)ocxo_lane_disable_compare(lane);
     lane.cadence_enabled = false;
     lane.cadence_armed = false;
     lane.witness_armed = false;
     lane.cadence_last_reason = OCXO_CADENCE_REASON_STOP;
   }
-  tick.csctrl_after_program = lane.module->CH[lane.compare_channel].CSCTRL;
+  uint32_t csctrl_after_program = 0;
+  if (!qtimer_guard_read_ocxo_csctrl(lane,
+                                     "ocxo_priority0_after_program",
+                                     lane.compare_target,
+                                     &csctrl_after_program)) {
+    qtimer_guard_quarantine_ocxo_lane(lane, "ocxo_priority0_after_program");
+    interrupt_handoff_note_priority0_body(diag, isr_entry_dwt_raw);
+    return;
+  }
+  tick.csctrl_after_program = csctrl_after_program;
 
   tick.capture_exit_dwt = ARM_DWT_CYCCNT;
 
@@ -11823,10 +12185,15 @@ static FLASHMEM void add_ocxo_lean_lane(Payload& p,
       cadence_epoch_valid ? (clock32_current - cadence_epoch_counter32) : 0U;
   const uint32_t epoch_to_next =
       cadence_epoch_valid ? (cadence_next_counter32 - cadence_epoch_counter32) : 0U;
-  const uint32_t live_compare_csctrl =
-      lane.initialized ? lane.module->CH[lane.compare_channel].CSCTRL : 0U;
-  const uint16_t live_compare_comp1 =
-      lane.initialized ? lane.module->CH[lane.compare_channel].COMP1 : 0U;
+  uint32_t live_compare_csctrl = 0U;
+  uint16_t live_compare_comp1 = 0U;
+  if (lane.initialized &&
+      qtimer_guard_read_ocxo_csctrl(lane,
+                                    "ocxo_report_compare_csctrl",
+                                    lane.compare_target,
+                                    &live_compare_csctrl)) {
+    live_compare_comp1 = lane.module->CH[lane.compare_channel].COMP1;
+  }
 
   const generation_gate_lane_t& gate = generation_gate_for_ocxo_kind(ctx.kind);
 
