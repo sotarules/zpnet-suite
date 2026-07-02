@@ -1214,6 +1214,16 @@ volatile uint32_t watchdog_anomaly_trigger_dwt     = 0;
 // those pre-row tribunal verdicts must remain local diagnostics.
 static volatile bool watchdog_campaign_publication_armed = false;
 
+// Sticky local circuit breaker.  WATCHDOG_ANOMALY is not merely a message to
+// the Pi; it is a Teensy-side campaign-continuity surrender.  Once latched,
+// Beta refuses to publish any more TIMEBASE rows from the current campaign
+// until an explicit lifecycle boundary clears the latch.
+static volatile bool     watchdog_campaign_surrendered = false;
+static volatile uint32_t watchdog_campaign_surrender_count = 0;
+static volatile uint32_t watchdog_anomaly_suppressed_unarmed_count = 0;
+static volatile uint32_t watchdog_anomaly_verbose_publish_count = 0;
+static volatile uint32_t watchdog_anomaly_legacy_publish_count = 0;
+
 // Live servo-mode command handoff.
 //
 // CALIBRATE_OCXO remains the START/RECOVER campaign parameter.  SERVOS is the
@@ -1231,13 +1241,25 @@ static void clocks_watchdog_disarm_campaign_publication(void) {
   watchdog_campaign_publication_armed = false;
 }
 
+static void clocks_watchdog_clear_surrender_for_new_lifecycle(void) {
+  watchdog_campaign_surrendered = false;
+  watchdog_anomaly_active = false;
+  watchdog_anomaly_publish_pending = false;
+}
+
 static void clocks_watchdog_arm_campaign_publication(void) {
   interrupt_dwt_publication_launch_acquisition_end();
+  clocks_watchdog_clear_surrender_for_new_lifecycle();
   watchdog_campaign_publication_armed = true;
+}
+
+static bool clocks_watchdog_publication_blocked(void) {
+  return watchdog_campaign_surrendered || watchdog_anomaly_active;
 }
 
 bool clocks_watchdog_campaign_armed(void) {
   return watchdog_campaign_publication_armed &&
+         !clocks_watchdog_publication_blocked() &&
          campaign_state == clocks_campaign_state_t::STARTED &&
          campaign_name[0] != '\0' &&
          campaign_seconds != 0ULL &&
@@ -3385,7 +3407,7 @@ static void campaign_start_prologue_abort_launch(const char* reason) {
   request_servo_mode_change = false;
   requested_servo_mode = servo_mode_t::OFF;
   calibrate_ocxo_mode = servo_mode_t::OFF;
-  watchdog_anomaly_active = false;
+  clocks_watchdog_clear_surrender_for_new_lifecycle();
   ocxo_dac_pacing_abort_all();
   timebase_invalidate();
 }
@@ -4890,6 +4912,39 @@ static void clocks_force_stop_campaign(void) {
   timebase_invalidate();
 }
 
+static bool clocks_watchdog_surrender_now(const char* reason,
+                                        uint32_t detail0,
+                                        uint32_t detail1,
+                                        uint32_t detail2,
+                                        uint32_t detail3,
+                                        bool publish_pending) {
+  if (!clocks_watchdog_campaign_armed() && !watchdog_campaign_surrendered) {
+    watchdog_anomaly_suppressed_unarmed_count++;
+    return false;
+  }
+
+  const bool first = !watchdog_anomaly_active && !watchdog_campaign_surrendered;
+  if (first) {
+    watchdog_anomaly_sequence++;
+    safeCopy(watchdog_anomaly_reason, sizeof(watchdog_anomaly_reason),
+             (reason && *reason) ? reason : "watchdog_anomaly");
+    watchdog_anomaly_detail0 = detail0;
+    watchdog_anomaly_detail1 = detail1;
+    watchdog_anomaly_detail2 = detail2;
+    watchdog_anomaly_detail3 = detail3;
+    watchdog_anomaly_trigger_dwt = DWT_CYCCNT;
+    watchdog_campaign_surrender_count++;
+  }
+
+  watchdog_campaign_surrendered = true;
+  watchdog_campaign_publication_armed = false;
+  watchdog_anomaly_active = true;
+  watchdog_anomaly_publish_pending = publish_pending && first;
+  ocxo_dac_pacing_abort_all();
+
+  return first;
+}
+
 static void clocks_watchdog_anomaly_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
   if (!watchdog_anomaly_publish_pending) {
     clocks_force_stop_campaign();
@@ -4907,6 +4962,7 @@ static void clocks_watchdog_anomaly_callback(timepop_ctx_t*, timepop_diag_t*, vo
   p.add("detail2",          watchdog_anomaly_detail2);
   p.add("detail3",          watchdog_anomaly_detail3);
 
+  watchdog_anomaly_legacy_publish_count++;
   publish("WATCHDOG_ANOMALY", p);
 
   watchdog_anomaly_publish_pending = false;
@@ -4918,24 +4974,9 @@ void clocks_watchdog_anomaly(const char* reason,
                              uint32_t detail1,
                              uint32_t detail2,
                              uint32_t detail3) {
-  if (!clocks_watchdog_campaign_armed()) {
+  if (!clocks_watchdog_surrender_now(reason, detail0, detail1, detail2, detail3, true)) {
     return;
   }
-
-  if (!watchdog_anomaly_active) {
-    watchdog_anomaly_sequence++;
-    safeCopy(watchdog_anomaly_reason, sizeof(watchdog_anomaly_reason),
-             (reason && *reason) ? reason : "watchdog_anomaly");
-    watchdog_anomaly_detail0 = detail0;
-    watchdog_anomaly_detail1 = detail1;
-    watchdog_anomaly_detail2 = detail2;
-    watchdog_anomaly_detail3 = detail3;
-    watchdog_anomaly_trigger_dwt = DWT_CYCCNT;
-    watchdog_anomaly_publish_pending = true;
-  }
-
-  watchdog_anomaly_active = true;
-  ocxo_dac_pacing_abort_all();
 
   const timepop_handle_t h =
       timepop_arm_asap(clocks_watchdog_anomaly_callback, nullptr, "clocks-anomaly");
@@ -4944,6 +4985,21 @@ void clocks_watchdog_anomaly(const char* reason,
     watchdog_anomaly_publish_pending = false;
     clocks_force_stop_campaign();
   }
+}
+
+void clocks_watchdog_anomaly_payload(const char* reason,
+                                     const Payload& payload,
+                                     uint32_t detail0,
+                                     uint32_t detail1,
+                                     uint32_t detail2,
+                                     uint32_t detail3) {
+  if (!clocks_watchdog_surrender_now(reason, detail0, detail1, detail2, detail3, false)) {
+    return;
+  }
+
+  watchdog_anomaly_verbose_publish_count++;
+  publish("WATCHDOG_ANOMALY", payload);
+  clocks_force_stop_campaign();
 }
 
 // ============================================================================
@@ -4959,7 +5015,7 @@ static void clocks_finish_start_accounting(void) {
   clocks_zero_all();
   request_zero = false;
   request_start = false;
-  watchdog_anomaly_active = false;
+  clocks_watchdog_clear_surrender_for_new_lifecycle();
   campaign_state = clocks_campaign_state_t::STARTED;
   campaign_warmup_begin(campaign_warmup_mode_t::START);
 }
@@ -5042,7 +5098,7 @@ void clocks_beta_pps(void) {
     g_timebase_stop_gate_count++;
     timebase_build_stage(TIMEBASE_BUILD_STAGE_STOP_GATE);
     const bool was_started = (campaign_state == clocks_campaign_state_t::STARTED);
-    watchdog_anomaly_active = false;
+    clocks_watchdog_clear_surrender_for_new_lifecycle();
     campaign_state = clocks_campaign_state_t::STOPPED;
     request_stop = false;
     request_zero = false;
@@ -5077,7 +5133,7 @@ void clocks_beta_pps(void) {
     clocks_watchdog_disarm_campaign_publication();
     g_timebase_recover_gate_count++;
     timebase_build_stage(TIMEBASE_BUILD_STAGE_RECOVER_GATE);
-    watchdog_anomaly_active = false;
+    clocks_watchdog_clear_surrender_for_new_lifecycle();
     request_zero = false;
     ocxo_dac_pacing_abort_all();
 
@@ -5105,7 +5161,7 @@ void clocks_beta_pps(void) {
     return;
   }
 
-  if (watchdog_anomaly_active) {
+  if (clocks_watchdog_publication_blocked()) {
     g_timebase_watchdog_gate_count++;
     timebase_build_stage(TIMEBASE_BUILD_STAGE_WATCHDOG_GATE);
     publish_dac_tick("WATCHDOG_GATE");
@@ -5534,6 +5590,13 @@ void clocks_beta_pps(void) {
     g_timebase_assign_last_fragment_count++;
     g_timebase_last_assign_campaign_seconds = campaign_seconds;
 
+    if (clocks_watchdog_publication_blocked()) {
+      g_timebase_watchdog_gate_count++;
+      timebase_build_stage(TIMEBASE_BUILD_STAGE_WATCHDOG_GATE);
+      publish_dac_tick("WATCHDOG_GATE_PRE_FRAGMENT_PUBLISH");
+      return;
+    }
+
     g_timebase_publish_attempt_count++;
     g_timebase_last_publish_attempt_campaign_seconds = campaign_seconds;
     timebase_build_stage(TIMEBASE_BUILD_STAGE_PUBLISH_ATTEMPT);
@@ -5833,6 +5896,13 @@ void clocks_beta_pps(void) {
     g_timebase_forensics_build_complete_count++;
     g_timebase_last_forensics_build_complete_campaign_seconds = campaign_seconds;
     timebase_build_stage(TIMEBASE_BUILD_STAGE_FORENSICS_BUILD_COMPLETE);
+
+    if (clocks_watchdog_publication_blocked()) {
+      g_timebase_watchdog_gate_count++;
+      timebase_build_stage(TIMEBASE_BUILD_STAGE_WATCHDOG_GATE);
+      publish_dac_tick("WATCHDOG_GATE_PRE_FORENSICS_PUBLISH");
+      return;
+    }
 
     g_timebase_forensics_publish_attempt_count++;
     g_timebase_last_forensics_publish_attempt_campaign_seconds = campaign_seconds;
@@ -6152,7 +6222,7 @@ static FLASHMEM Payload cmd_start(const Payload& args) {
   request_stop = false;
   request_recover = false;
   flash_cut_clear_pending();
-  watchdog_anomaly_active = false;
+  clocks_watchdog_clear_surrender_for_new_lifecycle();
   campaign_state = clocks_campaign_state_t::STOPPED;
   campaign_warmup_reset();
 
@@ -6227,7 +6297,7 @@ static FLASHMEM Payload cmd_stop(const Payload&) {
   // STOP while no campaign is running is a control-plane abort. It must not
   // invalidate the installed epoch or defer a destructive stop branch to PPS.
   request_stop = false;
-  watchdog_anomaly_active = false;
+  clocks_watchdog_clear_surrender_for_new_lifecycle();
   request_servo_mode_change = false;
   requested_servo_mode = servo_mode_t::OFF;
   calibrate_ocxo_mode = servo_mode_t::OFF;
@@ -6778,6 +6848,16 @@ static FLASHMEM void add_campaign_payload(Payload& p) {
   p.add("watchdog_anomaly_active", watchdog_anomaly_active);
   p.add("watchdog_campaign_publication_armed",
         (bool)watchdog_campaign_publication_armed);
+  p.add("watchdog_campaign_surrendered",
+        (bool)watchdog_campaign_surrendered);
+  p.add("watchdog_campaign_surrender_count",
+        (uint32_t)watchdog_campaign_surrender_count);
+  p.add("watchdog_anomaly_suppressed_unarmed_count",
+        (uint32_t)watchdog_anomaly_suppressed_unarmed_count);
+  p.add("watchdog_anomaly_verbose_publish_count",
+        (uint32_t)watchdog_anomaly_verbose_publish_count);
+  p.add("watchdog_anomaly_legacy_publish_count",
+        (uint32_t)watchdog_anomaly_legacy_publish_count);
   p.add("watchdog_campaign_armed", clocks_watchdog_campaign_armed());
   p.add("watchdog_anomaly_publish_pending", watchdog_anomaly_publish_pending);
   p.add("watchdog_anomaly_sequence", watchdog_anomaly_sequence);
@@ -7563,6 +7643,10 @@ static FLASHMEM Payload cmd_report_timebase_publish(const Payload&) {
   gates.add("warmup_active", campaign_warmup_active());
   gates.add("watchdog_campaign_publication_armed",
             (bool)watchdog_campaign_publication_armed);
+  gates.add("watchdog_campaign_surrendered",
+            (bool)watchdog_campaign_surrendered);
+  gates.add("watchdog_publication_blocked",
+            clocks_watchdog_publication_blocked());
   gates.add("watchdog_campaign_armed", clocks_watchdog_campaign_armed());
   gates.add("watchdog_anomaly_active", watchdog_anomaly_active);
   gates.add("request_start", request_start);

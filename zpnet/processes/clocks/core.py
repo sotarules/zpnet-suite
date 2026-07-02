@@ -123,7 +123,7 @@ import threading
 import subprocess
 import time
 from datetime import datetime, timezone
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple
 
 from zpnet.processes.processes import (
     server_setup,
@@ -173,6 +173,26 @@ TIMEBASE_INGRESS_QUEUE_MAXSIZE = 0
 TIMEBASE_FRAGMENT_TOPIC = "TIMEBASE_FRAGMENT"
 TIMEBASE_FORENSICS_TOPIC = "TIMEBASE_FORENSICS"
 TIMEBASE_PAIR_TIMEOUT_S = 5.0
+
+# Final TIMEBASE courtroom.  This is the Pi-side last-mile acceptance gate:
+# it evaluates the fully assembled TIMEBASE dictionary immediately before the
+# row is published/persisted, so corruption introduced during final structure
+# formation is caught before it becomes durable campaign truth.
+TIMEBASE_FINAL_COURT_SOURCE = "PI_CLOCKS_FINAL_TIMEBASE_COURT"
+TIMEBASE_FINAL_COURT_REASON = "timebase_final_court_violation"
+
+# First final-court rule: if an OCXO Delta Raw interval is marked valid, then
+# the final JSON must contain physically plausible one-second DWT intervals.
+# Do not use a tight OCXO-vs-delayed-VCLOCK agreement gate as a fatal court:
+# a real OCXO can be hundreds of cycles away from VCLOCK during startup,
+# recovery, DAC settling, or servo correction.  Debug10 PPS 574 had
+# clock=1 against a ~1,007,995,428-cycle reference; the broad plausibility
+# band is the corruption trap that blocks that class before DB write.
+TIMEBASE_FINAL_COURT_DWT_INTERVAL_MIN_CYCLES = 900_000_000
+TIMEBASE_FINAL_COURT_DWT_INTERVAL_MAX_CYCLES = 1_100_000_000
+# Non-fatal witness threshold only: records notable OCXO-vs-reference raw
+# offsets for diagnostics, but never blocks TIMEBASE persistence by itself.
+TIMEBASE_FINAL_COURT_DELTA_RAW_INTERVAL_GATE_CYCLES = 500
 
 PREFLIGHT_POLL_INTERVAL_S = 30
 PREFLIGHT_LOG_PREFIX = "🛡️ [preflight]"
@@ -265,6 +285,16 @@ _diag: Dict[str, Any] = {
     "timebase_pair_version_mismatch": 0,
     "timebase_pair_timeout": 0,
     "last_timebase_pair_fault": {},
+
+    # TIMEBASE final acceptance court (processor thread — last gate)
+    "timebase_final_court_checks": 0,
+    "timebase_final_court_passed": 0,
+    "timebase_final_court_blocked": 0,
+    "timebase_final_court_event_enqueue_failures": 0,
+    "timebase_final_court_recovery_started": 0,
+    "last_timebase_final_court": {},
+    "timebase_final_court_delta_raw_offset_observed": 0,
+    "last_timebase_final_court_delta_raw_offset": {},
 
     # Fragment processing (processor thread — slow path)
     "fragments_processed": 0,
@@ -1833,6 +1863,206 @@ def _fragment_ns(fragment: Dict[str, Any], *keys: str, default: int = 0) -> int:
     return _fragment_int(fragment, *keys, default=default)
 
 
+# ---------------------------------------------------------------------
+# Final TIMEBASE courtroom — last-mile persistence gate
+# ---------------------------------------------------------------------
+
+
+def _timebase_final_court_bool(value: Any) -> bool:
+    """Interpret a final JSON boolean-ish field without trusting its type."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "y", "on")
+    return False
+
+
+def _timebase_final_court_add_violation(
+    violations: List[Dict[str, Any]],
+    *,
+    rule: str,
+    lane: str,
+    message: str,
+    fields: Dict[str, Any],
+) -> None:
+    violation: Dict[str, Any] = {
+        "rule": rule,
+        "lane": lane,
+        "message": message,
+        "severity": "fatal",
+    }
+    violation.update(fields)
+    violations.append(violation)
+
+
+def _timebase_final_court_check_delta_raw_interval(
+    timebase: Dict[str, Any],
+    violations: List[Dict[str, Any]],
+) -> None:
+    """
+    Validate the final OCXO Delta Raw interval fields exactly as published.
+
+    This deliberately fishes values out of the final TIMEBASE dictionary rather
+    than checking pre-assembly locals.  If Payload construction, JSON shaping,
+    pair merge, or later decoration corrupts the final structure, this gate sees
+    the same object that would otherwise be written to PostgreSQL.
+    """
+    for lane in ("ocxo1", "ocxo2"):
+        science_path = f"fragment.{lane}.science"
+        science = _path_get(timebase, science_path)
+        if not isinstance(science, dict):
+            continue
+
+        if not _timebase_final_court_bool(science.get("delta_raw_valid")):
+            continue
+
+        clock_interval = _as_int(science.get("delta_raw_clock_interval_cycles"))
+        reference_interval = _as_int(science.get("delta_raw_reference_interval_cycles"))
+        public_count = _as_int(science.get("public_count"))
+        delta_reference_public_count = _as_int(
+            science.get("delta_reference_public_count")
+        )
+        delta_publication_public_count = _as_int(
+            science.get("delta_publication_public_count")
+        )
+
+        common_fields: Dict[str, Any] = {
+            "path": science_path,
+            "public_count": public_count,
+            "delta_reference_public_count": delta_reference_public_count,
+            "delta_publication_public_count": delta_publication_public_count,
+            "clock_interval_cycles": clock_interval,
+            "reference_interval_cycles": reference_interval,
+            "gate_cycles": TIMEBASE_FINAL_COURT_DELTA_RAW_INTERVAL_GATE_CYCLES,
+            "min_plausible_cycles": TIMEBASE_FINAL_COURT_DWT_INTERVAL_MIN_CYCLES,
+            "max_plausible_cycles": TIMEBASE_FINAL_COURT_DWT_INTERVAL_MAX_CYCLES,
+        }
+
+        missing = [
+            name
+            for name, value in (
+                ("delta_raw_clock_interval_cycles", clock_interval),
+                ("delta_raw_reference_interval_cycles", reference_interval),
+            )
+            if value is None
+        ]
+        if missing:
+            fields = dict(common_fields)
+            fields["missing_fields"] = missing
+            _timebase_final_court_add_violation(
+                violations,
+                rule="delta_raw_interval_reasonable",
+                lane=lane,
+                message="delta_raw_valid is true but the final TIMEBASE JSON is missing required interval fields",
+                fields=fields,
+            )
+            continue
+
+        assert clock_interval is not None
+        assert reference_interval is not None
+
+        for name, value in (
+            ("delta_raw_clock_interval_cycles", clock_interval),
+            ("delta_raw_reference_interval_cycles", reference_interval),
+        ):
+            if (
+                value < TIMEBASE_FINAL_COURT_DWT_INTERVAL_MIN_CYCLES
+                or value > TIMEBASE_FINAL_COURT_DWT_INTERVAL_MAX_CYCLES
+            ):
+                fields = dict(common_fields)
+                fields["bad_field"] = name
+                fields["bad_value"] = value
+                _timebase_final_court_add_violation(
+                    violations,
+                    rule="delta_raw_interval_reasonable",
+                    lane=lane,
+                    message="valid Delta Raw interval is outside the broad one-second DWT plausibility band",
+                    fields=fields,
+                )
+
+        interval_error = int(clock_interval) - int(reference_interval)
+        if abs(interval_error) > TIMEBASE_FINAL_COURT_DELTA_RAW_INTERVAL_GATE_CYCLES:
+            # A large OCXO-vs-VCLOCK raw difference is diagnostic evidence, not
+            # final-court guilt.  The OCXO may truly be running off-frequency
+            # while still producing a perfectly sane one-second DWT interval.
+            # The final court's fatal job here is to reject impossible interval
+            # magnitudes such as 0/1/sentinel values in the final JSON.
+            _diag["timebase_final_court_delta_raw_offset_observed"] = (
+                _diag.get("timebase_final_court_delta_raw_offset_observed", 0) + 1
+            )
+            offset_fields = dict(common_fields)
+            offset_fields.update({
+                "rule": "delta_raw_interval_offset_observed",
+                "lane": lane,
+                "clock_minus_reference_cycles": interval_error,
+                "abs_clock_minus_reference_cycles": abs(interval_error),
+                "fatal": False,
+            })
+            _diag["last_timebase_final_court_delta_raw_offset"] = offset_fields
+
+
+def _timebase_final_court_evaluate(timebase: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
+    """Return (ok, verdict) for the final TIMEBASE dictionary."""
+    violations: List[Dict[str, Any]] = []
+    _timebase_final_court_check_delta_raw_interval(timebase, violations)
+
+    count = _first_present_int_path(
+        timebase,
+        "teensy_pps_vclock_count",
+        "fragment.teensy_pps_vclock_count",
+        "pps_count",
+    )
+
+    verdict: Dict[str, Any] = {
+        "schema": "WATCHDOG_ANOMALY_PI_TIMEBASE_FINAL_COURT_V1",
+        "reason": TIMEBASE_FINAL_COURT_REASON,
+        "source": TIMEBASE_FINAL_COURT_SOURCE,
+        "source_process": "CLOCKS",
+        "source_report": "TIMEBASE_FINAL_COURT",
+        "campaign": timebase.get("campaign"),
+        "teensy_pps_vclock_count": count,
+        "teensy_pps_count": count,
+        "pps_count": count,
+        "timebase_schema": timebase.get("schema"),
+        "fragment_schema": _path_get(timebase, "fragment.schema"),
+        "timebase_pair_version": timebase.get("timebase_pair_version"),
+        "rule_count": 1,
+        "violation_count": len(violations),
+        "violations": violations,
+    }
+
+    return len(violations) == 0, verdict
+
+
+def _timebase_final_court_block(verdict: Dict[str, Any]) -> None:
+    """Record a final-court conviction and start local recovery."""
+    _diag["timebase_final_court_blocked"] += 1
+    _diag["last_timebase_final_court"] = verdict
+
+    logging.error(
+        "💥 [clocks] TIMEBASE final court violation: campaign=%s pps=%s violations=%s",
+        verdict.get("campaign"),
+        verdict.get("teensy_pps_vclock_count"),
+        verdict.get("violations"),
+    )
+
+    try:
+        create_event("WATCHDOG_ANOMALY", verdict)
+    except Exception:
+        _diag["timebase_final_court_event_enqueue_failures"] += 1
+        logging.exception("⚠️ [clocks] failed to enqueue final-court WATCHDOG_ANOMALY event")
+
+    started = _begin_auto_recovery(
+        TIMEBASE_FINAL_COURT_REASON,
+        {"payload": verdict},
+        source=TIMEBASE_FINAL_COURT_SOURCE,
+    )
+    if started:
+        _diag["timebase_final_court_recovery_started"] += 1
+
+
 def _dwt_cycles_to_recover_ns(cycles: int) -> int:
     """Convert a DWT cycle ledger to the current Teensy RECOVER dwt_ns argument.
 
@@ -2750,6 +2980,15 @@ def _process_loop() -> None:
             },
         }
 
+        _diag["timebase_final_court_checks"] += 1
+        court_ok, court_verdict = _timebase_final_court_evaluate(timebase)
+        if not court_ok:
+            # The final object failed last-mile acceptance.  Do not publish and
+            # do not persist; recovery will use the last good canonical row.
+            _timebase_final_court_block(court_verdict)
+            continue
+
+        _diag["timebase_final_court_passed"] += 1
         publish("TIMEBASE", timebase)
         _persist_timebase(timebase)
 

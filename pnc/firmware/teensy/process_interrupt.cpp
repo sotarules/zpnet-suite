@@ -58,6 +58,7 @@
 #include "config.h"
 #include "debug.h"
 #include "process.h"
+#include "publish.h"
 #include "payload.h"
 #include "timepop.h"
 #include "process_timepop.h"
@@ -85,6 +86,33 @@ void clocks_watchdog_anomaly(const char* reason,
                              uint32_t detail1,
                              uint32_t detail2,
                              uint32_t detail3);
+
+// Optional verbose watchdog boundary.  process_clocks may provide this strong
+// symbol to own WATCHDOG_ANOMALY semantics and latch campaign-publication
+// surrender before the evidence is emitted.  The weak fallback publishes the
+// supplied Payload directly as the WATCHDOG_ANOMALY body so non-CLOCKS builds
+// still expose the first fatal publication-court record.
+void clocks_watchdog_anomaly_payload(const char* reason,
+                                     const Payload& payload,
+                                     uint32_t detail0,
+                                     uint32_t detail1,
+                                     uint32_t detail2,
+                                     uint32_t detail3)
+    __attribute__((weak));
+
+__attribute__((weak)) void clocks_watchdog_anomaly_payload(const char* reason,
+                                     const Payload& payload,
+                                     uint32_t detail0,
+                                     uint32_t detail1,
+                                     uint32_t detail2,
+                                     uint32_t detail3) {
+  (void)reason;
+  (void)detail0;
+  (void)detail1;
+  (void)detail2;
+  (void)detail3;
+  publish("WATCHDOG_ANOMALY", payload);
+}
 
 // WATCHDOG_ANOMALY is a campaign-continuity surrender, not a boot/pre-campaign
 // diagnostic channel.  VCLOCK custody runs continuously before CLOCKS START, so
@@ -6206,6 +6234,304 @@ static void dwt_publication_note_cross_rail(
   }
 }
 
+
+static void dwt_publication_append_keyword(char* out,
+                                           size_t out_size,
+                                           const char* keyword) {
+  if (!out || out_size == 0U || !keyword || !*keyword) return;
+  const size_t used = strlen(out);
+  if (used >= out_size - 1U) return;
+  snprintf(out + used, out_size - used, "%s%s", used ? "," : "", keyword);
+}
+
+static const char* dwt_publication_verdict_keywords(uint32_t mask,
+                                                    char* out,
+                                                    size_t out_size) {
+  if (!out || out_size == 0U) return "";
+  out[0] = '\0';
+  if (mask == DWT_PUBLICATION_VERDICT_OK) {
+    dwt_publication_append_keyword(out, out_size, "ok");
+    return out;
+  }
+  if (mask & DWT_PUBLICATION_VERDICT_ZERO_DWT) {
+    dwt_publication_append_keyword(out, out_size, "zero_dwt");
+  }
+  if (mask & DWT_PUBLICATION_VERDICT_SOURCE_MISMATCH) {
+    dwt_publication_append_keyword(out, out_size, "source_mismatch");
+  }
+  if (mask & DWT_PUBLICATION_VERDICT_FLOORLINE_EDGE) {
+    dwt_publication_append_keyword(out, out_size, "floorline_edge");
+  }
+  if (mask & DWT_PUBLICATION_VERDICT_FLOORLINE_INTERVAL) {
+    dwt_publication_append_keyword(out, out_size, "floorline_interval");
+  }
+  if (mask & DWT_PUBLICATION_VERDICT_FLOORLINE_LATE) {
+    dwt_publication_append_keyword(out, out_size, "floorline_late");
+  }
+  if (mask & DWT_PUBLICATION_VERDICT_COUNTER_LOW16) {
+    dwt_publication_append_keyword(out, out_size, "counter_low16");
+  }
+  if (mask & DWT_PUBLICATION_VERDICT_SERVICE_OFFSET) {
+    dwt_publication_append_keyword(out, out_size, "service_offset");
+  }
+  if (mask & DWT_PUBLICATION_VERDICT_COUNTER_DELTA) {
+    dwt_publication_append_keyword(out, out_size, "counter_delta");
+  }
+  if (mask & DWT_PUBLICATION_VERDICT_OBSERVED_INTERVAL) {
+    dwt_publication_append_keyword(out, out_size, "observed_interval");
+  }
+  if (mask & DWT_PUBLICATION_VERDICT_PUBLISHED_INTERVAL) {
+    dwt_publication_append_keyword(out, out_size, "published_interval");
+  }
+  if (mask & DWT_PUBLICATION_VERDICT_CROSS_RAIL) {
+    dwt_publication_append_keyword(out, out_size, "cross_rail");
+  }
+  if (mask & DWT_PUBLICATION_VERDICT_GNSS_PROJECTION) {
+    dwt_publication_append_keyword(out, out_size, "gnss_projection");
+  }
+  if (mask & DWT_PUBLICATION_VERDICT_COUNTER_ADJACENCY) {
+    dwt_publication_append_keyword(out, out_size, "counter_adjacency");
+  }
+  if (mask & DWT_PUBLICATION_VERDICT_YARDSTICK_EXCURSION) {
+    dwt_publication_append_keyword(out, out_size, "yardstick_excursion");
+  }
+  if (mask & DWT_PUBLICATION_VERDICT_RULER_UNQUALIFIED) {
+    dwt_publication_append_keyword(out, out_size, "ruler_unqualified");
+  }
+  return out;
+}
+
+static void dwt_publication_add_cross_rail_payload(
+    Payload& parent,
+    const char* key,
+    const dwt_publication_lane_state_t& other,
+    uint32_t published_interval_cycles) {
+  Payload p;
+  p.add("last_interval_valid", other.last_interval_valid);
+  p.add("last_sequence", other.last_sequence);
+  p.add("last_published_dwt", other.last_published_dwt);
+  p.add("last_observed_dwt", other.last_observed_dwt);
+  p.add("last_counter32", other.last_counter32);
+  p.add("last_interval_cycles", other.last_published_interval_cycles);
+  int32_t delta = 0;
+  bool outside_gate = false;
+  if (other.last_interval_valid && published_interval_cycles != 0U) {
+    const int64_t d = (int64_t)(uint64_t)published_interval_cycles -
+                      (int64_t)(uint64_t)other.last_published_interval_cycles;
+    delta = dwt_publication_i32_from_i64(d);
+    outside_gate = interrupt_integrity_abs_i64(d) >
+        (uint64_t)DWT_PUBLICATION_CROSS_RAIL_GATE_CYCLES;
+  }
+  p.add("published_minus_rail_cycles", delta);
+  p.add("outside_gate", outside_gate);
+  parent.add_object(key, p);
+}
+
+static void dwt_publication_raise_verbose_watchdog(
+    const dwt_publication_request_t& req,
+    const dwt_repair_diag_t& diag,
+    const dwt_publication_lane_state_t& lane_state,
+    const dwt_publication_forensics_t& f,
+    uint32_t blocking_mask,
+    uint32_t always_blocking,
+    uint32_t launch_blocking,
+    uint32_t launch_relaxed,
+    bool strict_ready) {
+  char verdict_keywords[320];
+  char fatal_keywords[320];
+  char blocking_keywords[320];
+  char always_keywords[320];
+  char launch_block_keywords[320];
+  char launch_relaxed_keywords[320];
+  char side_rail_keywords[320];
+
+  Payload root;
+  root.add("schema", "WATCHDOG_ANOMALY_DWT_PUBLICATION_VERBOSE_V1");
+  root.add("reason", "dwt_publication_anomaly");
+  root.add("source_process", "INTERRUPT");
+  root.add("source_report", "DWT_PUBLICATION_COURTROOM");
+  root.add("summary", "blocked before subscriber publication; payload is self-contained and does not depend on REPORT_PUBLICATION");
+  root.add("kind", interrupt_subscriber_kind_str(req.kind));
+  root.add("sequence", req.sequence);
+  root.add("blocked", f.blocked);
+  root.add("campaign_armed", f.campaign_armed);
+  root.add("strict_ready", strict_ready);
+  root.add("watchdog_dwt", (uint32_t)ARM_DWT_CYCCNT);
+  root.add("ipsr", interrupt_ipsr());
+  root.add("primask", interrupt_primask());
+
+  Payload court;
+  court.add("primary_verdict", dwt_publication_verdict_name(f.verdict_mask));
+  court.add("fatal_primary_verdict", dwt_publication_verdict_name(f.fatal_mask));
+  court.add("verdict_keywords",
+            dwt_publication_verdict_keywords(f.verdict_mask,
+                                             verdict_keywords,
+                                             sizeof(verdict_keywords)));
+  court.add("fatal_keywords",
+            dwt_publication_verdict_keywords(f.fatal_mask,
+                                             fatal_keywords,
+                                             sizeof(fatal_keywords)));
+  court.add("blocking_keywords",
+            dwt_publication_verdict_keywords(blocking_mask,
+                                             blocking_keywords,
+                                             sizeof(blocking_keywords)));
+  court.add("always_blocking_keywords",
+            dwt_publication_verdict_keywords(always_blocking,
+                                             always_keywords,
+                                             sizeof(always_keywords)));
+  court.add("launch_blocking_keywords",
+            dwt_publication_verdict_keywords(launch_blocking,
+                                             launch_block_keywords,
+                                             sizeof(launch_block_keywords)));
+  court.add("launch_relaxed_keywords",
+            dwt_publication_verdict_keywords(launch_relaxed,
+                                             launch_relaxed_keywords,
+                                             sizeof(launch_relaxed_keywords)));
+  court.add("side_rail_diagnostic_keywords",
+            dwt_publication_verdict_keywords(
+                f.verdict_mask & DWT_PUBLICATION_SIDE_RAIL_DIAGNOSTIC_MASK,
+                side_rail_keywords,
+                sizeof(side_rail_keywords)));
+  court.add("launch_acquisition_active_at_record", f.launch_acquisition_active);
+  court.add("launch_begin_count", (uint32_t)g_dwt_publication_launch_begin_count);
+  court.add("launch_end_count", (uint32_t)g_dwt_publication_launch_end_count);
+  court.add("launch_relaxed_count", (uint32_t)g_dwt_publication_launch_relaxed_count);
+  court.add("launch_hard_block_count", (uint32_t)g_dwt_publication_launch_hard_block_count);
+  court.add("lane_accept_count_before_event", lane_state.accept_count);
+  court.add("lane_watchdog_count", lane_state.watchdog_count);
+  court.add("forensic_record_count", f.record_count);
+  root.add_object("court", court);
+
+  Payload event;
+  event.add("kind", interrupt_subscriber_kind_str(req.kind));
+  event.add("sequence", f.sequence);
+  event.add("published_dwt", f.published_dwt);
+  event.add("observed_dwt", f.observed_dwt);
+  event.add("published_minus_observed_cycles", f.published_minus_observed_cycles);
+  event.add("target_counter32", f.target_counter32);
+  event.add("target_low16", (uint32_t)f.target_low16);
+  event.add("expected_low16",
+            (uint32_t)dwt_publication_expected_low16(req.kind,
+                                                     f.target_counter32));
+  event.add("service_low16_valid", f.service_low16_valid);
+  event.add("service_low16", (uint32_t)f.service_low16);
+  event.add("service_offset_ticks", f.service_offset_ticks);
+  root.add_object("event", event);
+
+  Payload previous;
+  previous.add("valid", f.previous_valid);
+  previous.add("published_dwt", f.previous_published_dwt);
+  previous.add("observed_dwt", f.previous_observed_dwt);
+  previous.add("floorline_dwt", f.previous_floorline_dwt);
+  previous.add("counter32", f.previous_counter32);
+  root.add_object("previous_publication", previous);
+
+  Payload lineage;
+  lineage.add("expected_counter_delta_ticks", f.expected_counter_delta_ticks);
+  lineage.add("observed_counter_delta_ticks", f.observed_counter_delta_ticks);
+  lineage.add("counter_delta_error_ticks",
+              dwt_publication_i32_from_i64(
+                  (int64_t)(uint64_t)f.observed_counter_delta_ticks -
+                  (int64_t)(uint64_t)f.expected_counter_delta_ticks));
+  lineage.add("expected_interval_cycles", f.expected_interval_cycles);
+  lineage.add("published_interval_cycles", f.published_interval_cycles);
+  lineage.add("observed_interval_cycles", f.observed_interval_cycles);
+  lineage.add("floorline_interval_cycles", f.floorline_interval_cycles);
+  lineage.add("published_interval_error_cycles", f.published_interval_error_cycles);
+  lineage.add("observed_interval_error_cycles", f.observed_interval_error_cycles);
+  lineage.add("floorline_interval_error_cycles", f.floorline_interval_error_cycles);
+  lineage.add("floorline_minus_observed_cycles", f.floorline_minus_observed_cycles);
+  lineage.add("ruler_gate_cycles", DWT_PUBLICATION_INTERVAL_GATE_CYCLES);
+  lineage.add("cross_rail_gate_cycles", DWT_PUBLICATION_CROSS_RAIL_GATE_CYCLES);
+  lineage.add("service_offset_gate_ticks", DWT_PUBLICATION_SERVICE_OFFSET_GATE_TICKS);
+  root.add_object("lineage", lineage);
+
+  Payload cross;
+  dwt_publication_add_cross_rail_payload(cross, "vclock", g_dwt_publication_vclock,
+                                         f.published_interval_cycles);
+  dwt_publication_add_cross_rail_payload(cross, "ocxo1", g_dwt_publication_ocxo1,
+                                         f.published_interval_cycles);
+  dwt_publication_add_cross_rail_payload(cross, "ocxo2", g_dwt_publication_ocxo2,
+                                         f.published_interval_cycles);
+  root.add_object("cross_rail", cross);
+
+  Payload floorline;
+  floorline.add("valid", f.floorline_valid);
+  floorline.add("candidate", f.floorline_candidate);
+  floorline.add("published", f.floorline_published);
+  floorline.add("fallback_used", f.floorline_fallback_used);
+  floorline.add("dwt", f.floorline_dwt);
+  floorline.add("sequence", f.floorline_sequence);
+  floorline.add("sample_count", f.floorline_sample_count);
+  floorline.add("selected_bucket_count", f.floorline_selected_bucket_count);
+  floorline.add("publish_source", lower_env_publish_source_name(f.floorline_publish_source));
+  floorline.add("publish_reason", lower_env_publish_reason_name(f.floorline_publish_reason));
+  floorline.add("confidence_ppm", f.floorline_confidence_ppm);
+  root.add_object("floorline", floorline);
+
+  Payload capture;
+  capture.add("authored_dwt", f.capture_authored_dwt);
+  capture.add("raw_event_dwt", f.capture_raw_event_dwt);
+  capture.add("isr_entry_dwt_raw", f.capture_isr_entry_dwt_raw);
+  capture.add("arm_dwt_raw", f.capture_arm_dwt_raw);
+  capture.add("arm_to_isr_ticks", f.capture_arm_to_isr_ticks);
+  capture.add("arm_to_isr_dwt_cycles", f.capture_arm_to_isr_dwt_cycles);
+  capture.add("service_offset_ticks", f.capture_service_offset_ticks);
+  capture.add("service_correction_cycles", f.capture_service_correction_cycles);
+  capture.add("service_counter_low16", (uint32_t)f.capture_service_counter_low16);
+  capture.add("service_compare_low16", (uint32_t)f.capture_service_compare_low16);
+  capture.add("service_counter_minus_compare_ticks", f.capture_service_counter_minus_compare_ticks);
+  capture.add("compare_delta_mod65536_ticks", f.capture_compare_delta_mod65536_ticks);
+  capture.add("target_delta_mod65536_ticks", f.capture_target_delta_mod65536_ticks);
+  capture.add("interpreted_late_ticks", f.capture_interpreted_late_ticks);
+  capture.add("early_ticks", f.capture_early_ticks);
+  capture.add("service_offset_abs_ticks", f.capture_service_offset_abs_ticks);
+  capture.add("recomputed_minus_capture_authored_cycles",
+              (int32_t)(f.observed_dwt - f.capture_authored_dwt));
+  capture.add("published_minus_capture_authored_cycles",
+              (int32_t)(f.published_dwt - f.capture_authored_dwt));
+  capture.add("raw_minus_capture_authored_cycles",
+              (int32_t)(f.capture_raw_event_dwt - f.capture_authored_dwt));
+  root.add_object("capture", capture);
+
+  Payload repair;
+  repair.add("original_dwt", f.repair_original_dwt);
+  repair.add("predicted_dwt", f.repair_predicted_dwt);
+  repair.add("used_dwt", f.repair_used_dwt);
+  repair.add("event_from_isr_entry_raw", f.repair_event_from_isr_entry_raw);
+  repair.add("isr_entry_to_event_correction_cycles",
+             f.repair_isr_entry_to_event_correction_cycles);
+  repair.add("error_cycles", f.repair_error_cycles);
+  repair.add("reason", f.repair_reason ? f.repair_reason : "none");
+  repair.add("vclock_gnss_error_ns_i32",
+             dwt_publication_i32_from_i64(diag.publication_vclock_gnss_error_ns));
+  root.add_object("repair", repair);
+
+  Payload yardstick;
+  yardstick.add("valid", f.yardstick_valid);
+  yardstick.add("stale", f.yardstick_stale);
+  yardstick.add("seeded", f.yardstick_seeded);
+  yardstick.add("excursion", f.yardstick_excursion);
+  yardstick.add("pps_sequence", f.yardstick_pps_sequence);
+  yardstick.add("pps_seq_delta", f.yardstick_pps_seq_delta);
+  yardstick.add("g_now_cycles", f.yardstick_g_now_cycles);
+  yardstick.add("g_prev_cycles", f.yardstick_g_prev_cycles);
+  yardstick.add("inferred_interval_cycles", f.yardstick_inferred_interval_cycles);
+  yardstick.add("observed_interval_cycles", f.yardstick_observed_interval_cycles);
+  yardstick.add("inferred_minus_observed_cycles", f.yardstick_inferred_minus_observed_cycles);
+  yardstick.add("auth_endpoint_dwt", f.yardstick_auth_endpoint_dwt);
+  yardstick.add("auth_error_cycles", f.yardstick_auth_error_cycles);
+  yardstick.add("auth_anchor_applied", f.yardstick_auth_anchor_applied);
+  root.add_object("yardstick", yardstick);
+
+  clocks_watchdog_anomaly_payload("dwt_publication_anomaly",
+                                  root,
+                                  (uint32_t)req.kind,
+                                  f.verdict_mask,
+                                  req.published_dwt,
+                                  req.target_counter32);
+}
+
 static void dwt_publication_record_fatal_forensics(
     const dwt_publication_request_t& req,
     const dwt_repair_diag_t& diag,
@@ -6584,11 +6910,15 @@ static bool dwt_publication_adjudicate_or_watchdog(
         if (launch_acquisition) {
           g_dwt_publication_launch_hard_block_count++;
         } else if (campaign_armed || strict_ready) {
-          clocks_watchdog_anomaly("dwt_publication_anomaly",
-                                  (uint32_t)req.kind,
-                                  verdict,
-                                  req.published_dwt,
-                                  req.target_counter32);
+          dwt_publication_raise_verbose_watchdog(req,
+                                                  diag,
+                                                  *s,
+                                                  g_dwt_publication_last_fatal,
+                                                  blocking_mask,
+                                                  always_blocking,
+                                                  launch_blocking,
+                                                  launch_relaxed,
+                                                  strict_ready);
         }
         diag.publication_verdict_reason = launch_acquisition
             ? "launch_acquisition_hard_quarantine"

@@ -1194,6 +1194,16 @@ void clocks_watchdog_anomaly(const char* reason,
                              uint32_t detail2 = 0,
                              uint32_t detail3 = 0);
 
+// Verbose WATCHDOG_ANOMALY boundary used by process_interrupt publication
+// courts.  process_clocks/Beta owns the strong implementation so it can latch
+// campaign surrender before publishing the evidence packet.
+void clocks_watchdog_anomaly_payload(const char* reason,
+                                     const Payload& payload,
+                                     uint32_t detail0 = 0,
+                                     uint32_t detail1 = 0,
+                                     uint32_t detail2 = 0,
+                                     uint32_t detail3 = 0);
+
 // ============================================================================
 // Local CLOCKS epoch integration
 // ============================================================================
