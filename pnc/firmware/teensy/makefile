@@ -21,19 +21,9 @@ NAME          = teensy
 ARDUINO_CLI   = ../../bin/arduino-cli
 TEENSY_LOADER = teensy_loader_cli
 
-# USB mode affects runtime only, not flashing
-# Choose one and stick to it (serial or rawhid)
+# USB CDC serial is the only supported runtime transport.
 USB_MODE = serial
 BOARD    = teensy:avr:teensy41:usb=$(USB_MODE)
-
-# -------------------------------------------------------------
-# Compile-time defines (runtime only)
-# -------------------------------------------------------------
-
-CPP_DEFS =
-
-# Explicit transport selection (runtime routing)
-CPP_DEFS += -DZPNET_TRANSPORT_SERIAL
 
 # -------------------------------------------------------------
 # Targets
@@ -49,8 +39,6 @@ build:
 	@echo "🔧 Building Teensy 4.1 (cold-boot compatible)..."
 	$(ARDUINO_CLI) compile \
 	  --fqbn $(BOARD) \
-	  --build-property compiler.c.extra_flags="$(CPP_DEFS)" \
-	  --build-property compiler.cpp.extra_flags="$(CPP_DEFS)" \
 	  . \
 	  --output-dir ./build
 

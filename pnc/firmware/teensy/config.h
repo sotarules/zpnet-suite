@@ -8,16 +8,13 @@
 static constexpr const char* FW_VERSION = FW_VERSION_STR;
 
 // -------------------------------------------------------------
-// Transport backend selection (runtime)
+// Transport
 // -------------------------------------------------------------
-
-typedef enum {
-  TRANSPORT_NONE = 0,
-  TRANSPORT_HID,
-  TRANSPORT_SERIAL
-} transport_backend_t;
-
-static constexpr transport_backend_t ZPNET_TRANSPORT = TRANSPORT_HID;
+//
+// USB CDC serial is the only supported Teensy transport.  HID and
+// runtime backend selection are retired; transport owns the physical
+// Serial boundary directly.
+//
 
 // --------------------------------------------------------------
 // Base units

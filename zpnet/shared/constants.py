@@ -7,7 +7,6 @@ retry policies, key paths, or version metadata).
 
 Author: The Mule
 """
-import os
 from pathlib import Path
 from typing import Any, Dict
 
@@ -65,13 +64,11 @@ EMOJI = {
     "heartbeat": "💓",
 }
 
-TEENSY_TRANSPORT = os.environ.get("ZPNET_TEENSY_TRANSPORT", "serial")  # "serial"|"hid"
-TEENSY_HIDRAW_PATH = os.environ.get("ZPNET_TEENSY_HIDRAW", "/dev/zpnet-teensy-hid")
-
 # ---------------------------------------------------------------------
 # Teensy Serial Configuration
 # ---------------------------------------------------------------------
-TEENSY_SERIAL_PORT = os.environ.get("ZPNET_TEENSY_PORT", "/dev/zpnet-teensy-usb")
+# USB CDC serial is the only supported host/Teensy transport.
+TEENSY_SERIAL_PORT = "/dev/zpnet-teensy-serial"
 TEENSY_BAUDRATE = 115200
 TEENSY_RECONNECT_DELAY_S = 5     # seconds between reconnection attempts
 TEENSY_READ_TIMEOUT_S = 1        # serial read timeout (seconds)
@@ -104,7 +101,7 @@ def http_endpoint(path: str) -> str:
     return f"http://{ZPNET_REMOTE_HOST}{path}"
 
 # ---------------------------------------------------------------------
-# HID traffic bytes
+# Transport traffic bytes
 # ---------------------------------------------------------------------
 TRAFFIC_DEBUG             = 0xD0
 TRAFFIC_REQUEST_RESPONSE  = 0xD1

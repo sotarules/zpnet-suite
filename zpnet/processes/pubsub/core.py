@@ -1723,25 +1723,16 @@ def _delayed_refresh(delay_s: float = 10.0) -> None:
 
 def _transport_init_with_retry() -> None:
     """
-    Attempt transport_init() in a tight silent loop until the HID
-    device is available.  This handles the race condition where PUBSUB
-    launches before the Teensy USB HID device has been enumerated by
-    the kernel (e.g. during flash/reboot).
-
-    Catches every transient failure mode observed during bring-up:
-      • OSError / IOError   — HID device present but not responding
-                               (errno 5: Input/output error)
-      • FileNotFoundError   — /dev/zpnet-teensy-serial symlink not yet
-                               created by udev
-      • serial.SerialException — pyserial wrapper around the above
-                               (e.g. "could not open port")
-      • Exception           — any other transient init failure
+    Start the serial transport supervisor, retrying if the transport
+    subsystem itself is not ready yet.  Device availability after startup is
+    owned by the serial transport supervisor, which survives flash/reboot and
+    late udev enumeration.
 
     Behaviour:
       • First failure logs a single INFO line so we know we're waiting
       • All subsequent failures are swallowed silently
       • Polls every TRANSPORT_RETRY_INTERVAL_S (250 ms)
-      • Runs indefinitely until success — the device WILL appear
+      • Runs indefinitely until transport_init succeeds
       • On success logs once and returns
     """
     announced = False
@@ -1768,13 +1759,17 @@ def run() -> None:
     open_debug_log()
     open_pubsub_log()
 
-    # Block here until the Teensy HID device is enumerable.
-    # Silent indefinite retry — survives flash, reboot, late enumeration.
-    _transport_init_with_retry()
-
+    # Register receive handlers before starting the serial RX supervisor.
+    # The Teensy emits DEBUG/PUBSUB frames immediately during boot; the
+    # transport must not observe a live serial stream before PUBSUB has
+    # installed its traffic callbacks.
     transport_register_receive_callback(TRAFFIC_DEBUG, on_receive_debug)
     transport_register_receive_callback(TRAFFIC_REQUEST_RESPONSE, on_receive_request_response)
     transport_register_receive_callback(TRAFFIC_PUBLISH_SUBSCRIBE, on_receive_publish_subscribe)
+
+    # Start the serial transport supervisor.  The supervisor handles flash,
+    # reboot, late enumeration, and transient device disappearance after this.
+    _transport_init_with_retry()
 
     threading.Thread(target=rpc_server, daemon=True).start()
     threading.Thread(target=pubsub_server, daemon=True).start()

@@ -1,17 +1,22 @@
-// transport.cpp — ZPNet Transport (Teensy)
-// -----------------------------------------
+// transport.cpp — ZPNet Transport (Teensy, USB CDC serial only)
+// ----------------------------------------------------------------
 //
 // TX Architecture:
 //   • transport_send() serializes, heap-allocates, and enqueues.
 //   • A single TIMEPOP-driven pump performs physical transmission.
-//   • Only the pump ever touches RawHID / Serial.
+//   • Only the pump ever touches Serial.
 //   • Interleave is structurally impossible.
 //   • Each job owns its own heap allocation — no ring, no gap.
 //
-// RX Architecture (UNCHANGED):
+// RX Architecture:
 //   • Length-authoritative framing
-//   • <STX=n> JSON <ETX>
+//   • traffic-byte + <STX=n> JSON <ETX>
 //   • Hard reset on corruption
+//
+// Serial-only doctrine:
+//   • HID is retired.
+//   • There is no compile-time or runtime backend selection.
+//   • No 64-byte HID blocking/deblocking layer remains.
 //
 // Memory model:
 //   • TX memory is bounded by TX_BUDGET_MAX (soft cap).
@@ -19,7 +24,7 @@
 //   • No geometric fragmentation. No dead space. No wrap logic.
 //   • Failure mode is simple: malloc succeeds or it doesn't.
 //
-// This file is intentionally verbose and explicit.
+// This file is intentionally boring.
 // Determinism > cleverness.
 //
 
@@ -31,17 +36,15 @@
 
 #include <Arduino.h>
 #include <string.h>
-#include <ctype.h>
 
 // =============================================================
 // Constants
 // =============================================================
 
-static constexpr uint64_t TRANSPORT_RX_POLL_NS = 2000000ULL;  // 1 millisecond
-static constexpr uint64_t TRANSPORT_TX_POLL_NS = 2000000ULL;  // 1 millisecond
+static constexpr uint64_t TRANSPORT_RX_POLL_NS = 2000000ULL;  // 2 ms
+static constexpr uint64_t TRANSPORT_TX_POLL_NS = 2000000ULL;  // 2 ms
 
-static constexpr size_t TRANSPORT_BLOCK_SIZE = 64;
-static constexpr size_t RX_BUF_MAX           = TRANSPORT_MAX_MESSAGE + 64;
+static constexpr size_t RX_BUF_MAX = TRANSPORT_MAX_MESSAGE + 64;
 
 // TX job queue depth
 static constexpr size_t TX_JOB_MAX = 64;
@@ -56,6 +59,8 @@ static constexpr size_t STX_LEN   = 5;
 
 static constexpr char   ETX_SEQ[] = "<ETX>";
 static constexpr size_t ETX_LEN   = 5;
+
+static const char* BUILD_FINGERPRINT = "__FP__ZPNET_SERIAL__";
 
 // =============================================================
 // TX Job Queue
@@ -142,34 +147,14 @@ static inline bool is_valid_traffic(uint8_t b) {
 }
 
 // =============================================================
-// Transport fingerprint
-// =============================================================
-
-#if defined(ZPNET_TRANSPORT_SELECTED_HID)
-static const char* BUILD_FINGERPRINT = "__FP__ZPNET_HID__";
-#elif defined(ZPNET_TRANSPORT_SELECTED_SERIAL)
-static const char* BUILD_FINGERPRINT = "__FP__ZPNET_SERIAL__";
-#endif
-
-// =============================================================
 // Physical Send
 // =============================================================
 
-#if defined(ZPNET_TRANSPORT_SELECTED_HID)
-
-static inline bool hid_send_block(const uint8_t block[TRANSPORT_BLOCK_SIZE]) {
-  return RawHID.send(block, 50) > 0;
-}
-
-#elif defined(ZPNET_TRANSPORT_SELECTED_SERIAL)
-
 static inline bool serial_send_bytes(const uint8_t* buf, size_t len) {
-  size_t n = Serial.write(buf, len);
-  Serial.flush();
+  size_t n = ZPNET_SERIAL.write(buf, len);
+  ZPNET_SERIAL.flush();
   return n == len;
 }
-
-#endif
 
 // =============================================================
 // Registration
@@ -193,31 +178,6 @@ static void transport_tx_pump(timepop_ctx_t*, timepop_diag_t*, void*) {
 
   tx_job_t& job = tx_jobs[tx_job_tail];
 
-#if defined(ZPNET_TRANSPORT_SELECTED_HID)
-
-  uint8_t block[TRANSPORT_BLOCK_SIZE];
-  size_t remaining = job.length - job.sent;
-
-  if (job.sent == 0) {
-    // First block carries traffic byte
-    block[0] = job.traffic;
-    size_t chunk = min(remaining, TRANSPORT_BLOCK_SIZE - 1);
-    memcpy(block + 1, job.data, chunk);
-    memset(block + 1 + chunk, 0, TRANSPORT_BLOCK_SIZE - (1 + chunk));
-    hid_send_block(block);
-    job.sent += chunk;
-    tx_bytes_sent += chunk;
-  } else {
-    size_t chunk = min(remaining, TRANSPORT_BLOCK_SIZE);
-    memcpy(block, job.data + job.sent, chunk);
-    memset(block + chunk, 0, TRANSPORT_BLOCK_SIZE - chunk);
-    hid_send_block(block);
-    job.sent += chunk;
-    tx_bytes_sent += chunk;
-  }
-
-#elif defined(ZPNET_TRANSPORT_SELECTED_SERIAL)
-
   if (job.sent == 0) {
     uint8_t header = job.traffic;
     serial_send_bytes(&header, 1);
@@ -228,8 +188,6 @@ static void transport_tx_pump(timepop_ctx_t*, timepop_diag_t*, void*) {
   serial_send_bytes(job.data + job.sent, chunk);
   job.sent += chunk;
   tx_bytes_sent += chunk;
-
-#endif
 
   // Job complete?
   if (job.sent >= job.length) {
@@ -364,7 +322,7 @@ void transport_send(uint8_t traffic, const Payload& payload) {
 }
 
 // =============================================================
-// RX — unchanged
+// RX
 // =============================================================
 
 static void rx_reset_hard() {
@@ -442,60 +400,17 @@ static void dispatch_if_complete() {
 }
 
 // =============================================================
-// RECEIVE: HID RX (record-based)
-// =============================================================
-
-#if defined(ZPNET_TRANSPORT_SELECTED_HID)
-static void rx_hid_tick() {
-
-  transport_rx_entered();
-
-  uint8_t block[TRANSPORT_BLOCK_SIZE];
-  if (RawHID.recv(block, 0) <= 0)
-    return;
-
-  rx_blocks_total++;
-
-  size_t offset = 0;
-
-  if (!rx_have_traffic) {
-    if (!is_valid_traffic(block[0])) {
-      rx_expected_traffic_missing++;
-      rx_reset_hard();
-      return;
-    }
-    rx_traffic = block[0];
-    rx_have_traffic = true;
-    offset = 1;
-  }
-
-  size_t copy = TRANSPORT_BLOCK_SIZE - offset;
-  rx_bytes_total += copy;
-
-  if (rx_len + copy > RX_BUF_MAX) {
-    rx_reset_hard();
-    return;
-  }
-
-  memcpy(rx_buf + rx_len, block + offset, copy);
-  rx_len += copy;
-
-  dispatch_if_complete();
-}
-#endif
-
-// =============================================================
 // RECEIVE: SERIAL RX (stream-based)
 // =============================================================
-
-#if defined(ZPNET_TRANSPORT_SELECTED_SERIAL)
 
 static void rx_serial_tick() {
 
   transport_rx_entered();
 
-  while (Serial.available()) {
-    uint8_t b = (uint8_t)Serial.read();
+  bool appended = false;
+
+  while (ZPNET_SERIAL.available()) {
+    uint8_t b = (uint8_t)ZPNET_SERIAL.read();
 
     // Await traffic byte
     if (!rx_have_traffic) {
@@ -522,25 +437,22 @@ static void rx_serial_tick() {
 
     rx_buf[rx_len++] = b;
     rx_bytes_total++;
+    appended = true;
 
     dispatch_if_complete();
   }
-}
 
-#endif
+  if (appended) {
+    rx_blocks_total++;
+  }
+}
 
 // =============================================================
 // RX Poll (timepop)
 // =============================================================
 
 static void transport_rx_tick(timepop_ctx_t*, timepop_diag_t*, void*) {
-
-#if defined(ZPNET_TRANSPORT_SELECTED_HID)
-  rx_hid_tick();
-#elif defined(ZPNET_TRANSPORT_SELECTED_SERIAL)
   rx_serial_tick();
-#endif
-
 }
 
 // =============================================================
@@ -590,9 +502,7 @@ void transport_get_info(transport_info_t* out) {
 
 void transport_init(void) {
 
-#if defined(ZPNET_TRANSPORT_SELECTED_SERIAL)
-  Serial.begin(115200);
-#endif
+  ZPNET_SERIAL.begin(USB_SERIAL_BAUD);
 
   debug_log("transport", BUILD_FINGERPRINT);
 

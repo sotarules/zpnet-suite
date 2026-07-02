@@ -3,11 +3,11 @@
 //
 // TRUTHFUL DESIGN:
 //
-//   • Transport owns all physical I/O.
+//   • Transport owns all USB CDC serial I/O.
 //   • Receive is asynchronous and callback-driven.
 //   • Send is semantic and message-oriented.
 //   • Callers enqueue; transport despools.
-//   • Only the transport subsystem may touch HID / Serial.
+//   • Only the transport subsystem may touch Serial.
 //   • Message framing and dispatch are transport responsibilities.
 //
 // TX Architecture:
@@ -17,6 +17,11 @@
 //   • Each job owns its heap allocation — freed on completion.
 //   • Memory is bounded via soft budget cap (TX_BUDGET_MAX).
 //   • No ring buffer. No geometric fragmentation. No gap logic.
+//
+// Serial-only doctrine:
+//
+//   HID is retired. There is no compile-time or runtime transport
+//   selection here; USB CDC serial is the only physical transcript path.
 //
 // ============================================================
 
@@ -29,23 +34,11 @@
 
 
 // =============================================================
-// Compile-time transport selection (authoritative)
+// USB mode guard
 // =============================================================
 
-#if defined(ZPNET_TRANSPORT_HID)
-  #define ZPNET_TRANSPORT_SELECTED_HID
-
-#elif defined(ZPNET_TRANSPORT_SERIAL)
-  #define ZPNET_TRANSPORT_SELECTED_SERIAL
-
-#elif defined(USB_RAWHID) || defined(USB_RAWHID_SERIAL)
-  #define ZPNET_TRANSPORT_SELECTED_HID
-
-#elif defined(USB_SERIAL) || defined(USB_SERIAL_HID)
-  #define ZPNET_TRANSPORT_SELECTED_SERIAL
-
-#else
-  #error "No transport backend defined (ZPNET_TRANSPORT_* or USB_*)"
+#ifndef USB_SERIAL
+  #error "ZPNet transport is serial-only; build Teensy with usb=serial / USB_SERIAL"
 #endif
 
 
@@ -130,8 +123,8 @@ typedef struct {
   uint32_t tx_jobs_enqueued;      // Total jobs enqueued
   uint32_t tx_jobs_sent;          // Total jobs fully sent
 
-  uint32_t tx_bytes_enqueued;     // Total bytes enqueued
-  uint32_t tx_bytes_sent;         // Total bytes sent
+  uint32_t tx_bytes_enqueued;     // Total framed bytes enqueued
+  uint32_t tx_bytes_sent;         // Total framed bytes sent
 
   // ===========================================================
   // TX — Failure counters
@@ -146,7 +139,7 @@ typedef struct {
   // RX — Raw ingress
   // ===========================================================
 
-  uint32_t rx_blocks_total;       // RawHID blocks or serial RX chunks
+  uint32_t rx_blocks_total;       // Serial receive polls that appended bytes
   uint32_t rx_bytes_total;        // Bytes appended to RX buffer
 
   // ===========================================================
