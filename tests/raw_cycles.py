@@ -21,6 +21,8 @@ Clock filter:
 Column doctrine:
     p_act     physical PPS actual interval, in DWT cycles.
     p_Δ       physical PPS first-difference residual.
+    p_voff    PPS→VCLOCK DWT-cycle phase offset:
+              pps_vclock_dwt_at_edge - physical_pps_dwt_at_edge.
 
     *_raw     raw/evidence interval from dwt_interval_gate.observed_cycles
               when present, otherwise from original/observed DWT endpoints.
@@ -358,6 +360,37 @@ def physical_pps_dwt_from_schema(root: Dict[str, Any],
         frag.get("pps_diag_pps_edge_dwt_isr_entry_raw"),
         frag.get("pps_edge_dwt_at_edge"),
     )
+
+
+def pps_vclock_phase_cycles_from_schema(root: Dict[str, Any],
+                                        frag: Dict[str, Any],
+                                        forensic: Dict[str, Any],
+                                        pps_dwt: Optional[int]) -> Optional[int]:
+    """Return the DWT-cycle offset from physical PPS to PPS/VCLOCK.
+
+    Current TIMEBASE exposes this directly as pps_vclock_phase_cycles.
+    Keep a computed fallback from DWT endpoints so older/transitional rows can
+    still show the phase column when both endpoints are present.
+    """
+    explicit = _first_int(
+        _nested_get(frag, "pps", "vclock_phase_cycles"),
+        frag.get("pps_vclock_phase_cycles"),
+        forensic.get("pps_vclock_phase_cycles"),
+        root.get("pps_vclock_phase_cycles"),
+    )
+    if explicit is not None:
+        return explicit
+
+    vclock_dwt = _first_int(
+        frag.get("dwt_at_pps_vclock"),
+        forensic.get("dwt_at_pps_vclock"),
+        root.get("dwt_at_pps_vclock"),
+        _nested_get(frag, "vclock", "science", "pps_vclock_dwt_at_edge"),
+    )
+    if vclock_dwt is None or pps_dwt is None:
+        return None
+
+    return _signed_delta_u32(vclock_dwt, pps_dwt)
 
 
 def lane_prediction(frag: Dict[str, Any],
@@ -949,6 +982,9 @@ def collect_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]
         )
 
         pps_dwt = physical_pps_dwt_from_schema(root, frag, forensic)
+        pps_vclock_phase_cycles = pps_vclock_phase_cycles_from_schema(
+            root, frag, forensic, pps_dwt
+        )
         pps_actual, pps_pred, _pps_residual = lane_prediction(frag, pred, "pps")
         pps_actual = _first_int(
             forensic.get("pps_obs"),
@@ -968,6 +1004,7 @@ def collect_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]
             "pps_count": pps_count,
             "pps_actual": pps_actual,
             "pps_delta": pps_delta,
+            "pps_vclock_phase_cycles": pps_vclock_phase_cycles,
             "dwt_ppb": dwt_ppb_from_schema(root, frag),
             "start_pps0_valid": bool(private_pps0.get("valid")),
             "lanes": {},
@@ -1163,6 +1200,7 @@ def align_pps_vclock_to_ocxo_rows(collected: List[Dict[str, Any]]) -> Tuple[List
         row["pps_count"] = ref["pps_count"]
         row["pps_actual"] = ref["pps_actual"]
         row["pps_delta"] = ref["pps_delta"]
+        row["pps_vclock_phase_cycles"] = ref.get("pps_vclock_phase_cycles")
         row["dwt_ppb"] = ref.get("dwt_ppb")
         row["lanes"] = lanes
         row["alignment_publication_pps_count"] = cur["pps_count"]
@@ -1231,6 +1269,7 @@ def _headers_for(clocks: Tuple[str, ...],
         f"{'pps':>6s}",
         f"{'p_act':>13s}",
         f"{'p_Δ':>8s}",
+        f"{'p_voff':>8s}",
     ]
     for lane in clocks:
         for col in cols[lane]:
@@ -1249,6 +1288,7 @@ def _row_line(row: Dict[str, Any],
         f"{row['pps_count']:>6d}",
         _fmt_int(row["pps_actual"], 13),
         _fmt_int(row["pps_delta"], 8, signed=True),
+        _fmt_int(row.get("pps_vclock_phase_cycles"), 8, signed=True),
     ]
     for lane in clocks:
         data = row["lanes"][lane]
@@ -1736,6 +1776,7 @@ def analyze(campaign: str,
     print("  *_raw = evidence interval, *_fl = FloorLine interval,")
     print("  *_pub = subscriber-facing published interval.")
     print("  *Δ columns are per-rail cycle-count residuals: interval[n] - interval[n-1].")
+    print("  p_voff is the PPS→VCLOCK DWT-cycle phase offset.")
     if any(row.get("start_pps0_valid") for row in collected):
         print("  PPS 1 deltas use the private START PPS0 prologue interval when present.")
     print("  Core rail columns are always shown; missing FL data is shown as --- on purpose.")
@@ -1768,6 +1809,7 @@ def analyze(campaign: str,
     stats: Dict[str, Welford] = {
         "pps_actual": Welford(),
         "pps_delta": Welford(),
+        "pps_vclock_phase": Welford(),
     }
     for lane in clocks:
         for key in ("raw", "raw_delta",
@@ -1785,6 +1827,7 @@ def analyze(campaign: str,
     for row in collected:
         add_optional(stats["pps_actual"], row["pps_actual"])
         add_optional(stats["pps_delta"], row["pps_delta"])
+        add_optional(stats["pps_vclock_phase"], row.get("pps_vclock_phase_cycles"))
         for lane in clocks:
             data = row["lanes"][lane]
             for key in ("raw", "raw_delta",
@@ -1812,6 +1855,7 @@ def analyze(campaign: str,
     print("═══════")
     _print_welford("PPS actual cycles", stats["pps_actual"])
     _print_welford("PPS first-difference residual", stats["pps_delta"])
+    _print_welford("PPS→VCLOCK phase offset", stats["pps_vclock_phase"])
 
     for lane in clocks:
         print()
@@ -1838,6 +1882,8 @@ def analyze(campaign: str,
     print("    audited as 'reported FL fit interval - endpoint FL interval'.")
     print("  • In FloorLine-authored firmware, 'published edge - FloorLine edge'")
     print("    and 'published interval - FloorLine interval' should be zero.")
+    print("  • p_voff is the DWT-cycle offset from the physical PPS edge to the")
+    print("    PPS/VCLOCK edge; positive means VCLOCK is later than PPS.")
     print("  • *Δ columns are cycle-count residuals computed separately per rail:")
     print("    interval[n] - interval[n-1].")
     print("    On PPS 1, a private START PPS0 prologue interval is used as interval[n-1] when present.")
