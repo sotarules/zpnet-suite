@@ -794,13 +794,14 @@ DAC_VOLTAGE_EXTRA_DECIMALS = DAC_VOLTAGE_DECIMALS - 6
 
 
 def _dac_value(r: dict, lane: str):
-    """Return the instantaneous firmware-published AD5693R DAC code.
+    """Return the firmware-published AD5693R DAC fractional code.
 
-    TIMEBASE_FRAGMENT_V3 currently publishes the live servo output as
-    fragment.dac.ocxo1_dac / fragment.dac.ocxo2_dac.  Older/detail reports may
-    carry dac.<lane>.value, dac.<lane>.dac, or a flat <lane>_dac key.  This
-    helper intentionally reads only already-published firmware fields; the Pi
-    does no servo reconstruction here.
+    Active-servo builds publish the live output under fragment.dac.*.  Current
+    always-dither builds also publish the campaign DAC fractional code through
+    the Teensy-owned DAC Welford surface even when servo_mode is OFF.  Metrics
+    treats that Welford mean as the campaign-public DAC value for display and
+    keyboard nudging; it is still firmware-authored TIMEBASE data, not a
+    Pi-side servo reconstruction.
     """
     return _to_float(_field(
         r,
@@ -809,8 +810,14 @@ def _dac_value(r: dict, lane: str):
         f"dac.{lane}.dac",
         f"dac.{lane}.code",
         f"dac.{lane}.dac_code",
+        f"stats.dac.{lane}.value",
+        f"stats.dac.{lane}.dac",
+        f"stats.dac.{lane}.code",
+        f"stats.dac.{lane}.mean",
+        f"stats.{lane}_dac.welford.mean",
         f"{lane}_dac",
         f"{lane}_dac_code",
+        f"{lane}_dac_welford_mean",
     ))
 
 
@@ -958,7 +965,94 @@ def adjust_ocxo_dac(*, lane: str, direction: int, step_kind: str) -> dict:
     }
 
 
-def _dac_report_dither_summary(report_dac: dict | None, lane: str) -> str:
+def _dac_dither_summary_from_fractional_code(dac_code) -> str:
+    """Format the two integer DAC codes used to realize a fractional code.
+
+    The firmware dither doctrine is a one-second fractional-code realization:
+    low=floor(code), high=ceil(code), and the fractional part determines the
+    high-code duty count over 1000 scheduler ticks.  This is presentation only;
+    the desired fractional code itself still comes from TIMEBASE.
+    """
+    code = _to_float(dac_code)
+    if code is None:
+        return ""
+
+    code = _clamp_dac_code(code)
+    low_code = int(code)
+    high_code = low_code if low_code >= int(DAC_MAX_CODE) else low_code + 1
+    high_ms = int(round((code - float(low_code)) * 1000.0))
+    if high_ms < 0:
+        high_ms = 0
+    if high_ms > 1000:
+        high_ms = 1000
+    low_ms = 1000 - high_ms
+
+    return f"{low_code}:{low_ms:03d} {high_code}:{high_ms:03d}"
+
+
+def _dac_timebase_dither_summary(r: dict, lane: str, dac_now=None) -> str:
+    """Read or derive the active TIMEBASE dither realization for a DAC lane."""
+    enabled = _to_bool(_field(
+        r,
+        f"dac.{lane}.dither.enabled",
+        f"dac.{lane}.dither_enabled",
+        f"dither.{lane}.enabled",
+        f"{lane}_dac_dither_enabled",
+        default=None,
+    ))
+    if enabled is False:
+        return "OFF"
+
+    low_code = _to_int(_field(
+        r,
+        f"dac.{lane}.dither.low_code",
+        f"dac.{lane}.dither.lo",
+        f"dac.{lane}.lo",
+        f"dither.{lane}.low_code",
+        f"{lane}_dac_dither_low_code",
+        default=None,
+    ))
+    high_code = _to_int(_field(
+        r,
+        f"dac.{lane}.dither.high_code",
+        f"dac.{lane}.dither.hi",
+        f"dac.{lane}.hi",
+        f"dither.{lane}.high_code",
+        f"{lane}_dac_dither_high_code",
+        default=None,
+    ))
+    high_ms = _to_int(_field(
+        r,
+        f"dac.{lane}.dither.high_ms",
+        f"dac.{lane}.hi_ms",
+        f"dither.{lane}.high_ms",
+        f"{lane}_dac_dither_high_ms",
+        default=None,
+    ))
+    low_ms = _to_int(_field(
+        r,
+        f"dac.{lane}.dither.low_ms",
+        f"dac.{lane}.lo_ms",
+        f"dither.{lane}.low_ms",
+        f"{lane}_dac_dither_low_ms",
+        default=None,
+    ))
+
+    if low_code is not None and high_code is not None:
+        if high_ms is not None:
+            low_ms = 1000 - high_ms if low_ms is None else low_ms
+        elif low_ms is not None:
+            high_ms = 1000 - low_ms
+        if low_ms is not None and high_ms is not None:
+            return f"{low_code}:{max(0, low_ms):03d} {high_code}:{max(0, high_ms):03d}"
+        return f"{low_code} {high_code}"
+
+    return _dac_dither_summary_from_fractional_code(
+        dac_now if dac_now is not None else _dac_value(r, lane)
+    )
+
+
+def _dac_report_dither_summary(r: dict, report_dac: dict | None, lane: str, dac_now=None) -> str:
     tick = _dac_tick_payload(report_dac)
     obj = _dac_report_lane(report_dac, lane)
 
@@ -969,14 +1063,14 @@ def _dac_report_dither_summary(report_dac: dict | None, lane: str) -> str:
         high_code = _to_int(obj.get("hi"))
         high_ms = _to_int(obj.get("hi_ms"))
         if low_code is None or high_code is None or high_ms is None:
-            return "ON"
+            return _dac_timebase_dither_summary(r, lane, dac_now) or "ON"
         low_ms = max(0, 1000 - high_ms)
         return f"{low_code}:{low_ms:03d} {high_code}:{high_ms:03d}"
 
     obj = _dac_report_lane(report_dac, lane)
     d = obj.get("dither") if isinstance(obj.get("dither"), dict) else {}
     if not d:
-        return ""
+        return _dac_timebase_dither_summary(r, lane, dac_now)
 
     enabled = _to_bool(d.get("enabled"))
     rate = _to_int(d.get("rate_hz"))
@@ -987,17 +1081,19 @@ def _dac_report_dither_summary(report_dac: dict | None, lane: str) -> str:
 
     if enabled is not True:
         return "OFF"
-    if rate is None:
-        return "ON"
+    if rate is None and (low is None or high is None):
+        return _dac_timebase_dither_summary(r, lane, dac_now) or "ON"
     if low is None or high is None:
-        return f"{rate}Hz"
+        tb = _dac_timebase_dither_summary(r, lane, dac_now)
+        return f"{rate}Hz {tb}" if tb else f"{rate}Hz"
 
     low_s = f"{low:03d}"
     high_s = f"{high:03d}"
 
     if low_code is None or high_code is None:
-        return f"{rate}Hz {low_s}/{high_s}"
-    return f"{rate}Hz {low_code}:{low_s} {high_code}:{high_s}"
+        return f"{rate}Hz {low_s}/{high_s}" if rate is not None else f"{low_s}/{high_s}"
+    prefix = f"{rate}Hz " if rate is not None else ""
+    return f"{prefix}{low_code}:{low_s} {high_code}:{high_s}"
 
 
 def _dac_detail_lines(r: dict, baseline: dict | None, report_dac: dict | None,
@@ -1017,7 +1113,7 @@ def _dac_detail_lines(r: dict, baseline: dict | None, report_dac: dict | None,
     lines.append(
         f"{'DAC':<{W_NAME}}"
         f"{'VALUE/VOUT':>{dac_value_width}}"
-        f"{'':>{dither_width}}"
+        f"{'DITHER':>{dither_width}}"
         f"{'MEAN':>{W_MEAN}}"
         f"{'SD':>{W_SD}}"
         f"{'SE':>{W_SE}}"
@@ -1030,7 +1126,7 @@ def _dac_detail_lines(r: dict, baseline: dict | None, report_dac: dict | None,
     for name, key in [("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")]:
         dac_now = _dac_current_value(r, report_dac, key)
         dac_label = _dac_label(dac_now, _dac_current_voltage(r, report_dac, key))
-        dither_summary = _dac_report_dither_summary(report_dac, key)
+        dither_summary = _dac_report_dither_summary(r, report_dac, key, dac_now)
 
         base_dac = None
         if baseline:
@@ -1322,29 +1418,11 @@ def clocks_combined_readout() -> list[str]:
         # wrapper did not include campaign_state.
         state = "STARTED" if _fragment_root(report) else "IDLE"
     if state != "STARTED":
+        # No campaign means no campaign-public TIMEBASE DAC spine.  Suppress the
+        # DAC block here; the operator-facing DAC display belongs to active
+        # campaign rows where the Teensy-authored TIMEBASE stats identify the
+        # current fractional code and dither realization.
         lines.append(f"CLOCKS: {state}")
-        lines.append("")
-
-        baseline = _get_clocks_baseline()
-        W_NAME  = 6
-        W_VALUE = 20
-        W_TAU   = 18
-        W_PPB   = 10
-        W_RAW   = 14
-        W_RES   = 8
-        W_MEAN  = 10
-        W_SD    = 8
-        W_SE    = 8
-        W_N     = 6
-        W_BASE  = 10
-        W_NOW   = 10
-        W_DELTA = 10
-
-        lines.extend(_dac_detail_lines(
-            report, baseline, report_dac,
-            W_NAME, W_VALUE, W_TAU, W_PPB, W_RAW, W_RES,
-            W_MEAN, W_SD, W_SE, W_N, W_BASE, W_NOW, W_DELTA,
-        ))
         lines.append("")
         lines.extend(feature_status_grid_lines())
         return lines
