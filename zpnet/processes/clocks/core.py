@@ -348,6 +348,10 @@ _diag: Dict[str, Any] = {
     "recovery_missing_last_pps_count": 0,        # legacy diagnostic alias
     "recovery_missing_last_pps_vclock_count": 0,
     "recovery_elapsed_seconds_nonpositive": 0,
+    "recovery_last_timebase_unrecoverable": 0,
+    "recovery_last_timebase_scan_count": 0,
+    "recovery_control_state_reassertions": 0,
+    "last_recovery_control_state": {},
     "last_recovery": {},
 
     # GNSS wait
@@ -2100,6 +2104,298 @@ def _report_forensics(report: Dict[str, Any]) -> Dict[str, Any]:
     return forensics if isinstance(forensics, dict) else {}
 
 
+def _recovery_timebase_snapshot(tb: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract the recovery-critical truth from one persisted TIMEBASE row."""
+    last_tb = dict(tb or {})
+    last_frag = _report_fragment(last_tb)
+
+    last_pps_vclock_count = int(_extract_last_timebase_count(last_tb, last_frag))
+
+    last_gnss_ns = _fragment_ns(
+        last_frag,
+        "gnss.ns",
+        "gnss.pps_vclock_ns",
+        "gnss.vclock_ns",
+        "pps_vclock_ns",
+        "vclock_ns",
+        "pps_ns",
+        "gnss_ns",
+        default=int(last_tb.get("teensy_gnss_ns") or 0),
+    )
+
+    legacy_last_dwt_ns = _fragment_ns(
+        last_frag,
+        "dwt.ns",
+        "dwt_ns",
+        default=int(last_tb.get("teensy_dwt_ns") or last_tb.get("dwt_ns") or 0),
+    )
+    last_dwt_cycles = _fragment_int(
+        last_frag,
+        "dwt.cycle_count_total",
+        "dwt.cycles",
+        "dwt.value",
+        "dwt_cycle_count_total",
+        "dwt_cycles",
+        default=0,
+    )
+    if last_dwt_cycles == 0 and legacy_last_dwt_ns > 0:
+        last_dwt_cycles = _dwt_recover_ns_to_cycles(legacy_last_dwt_ns)
+    last_dwt_ns = (
+        _dwt_cycles_to_recover_ns(last_dwt_cycles)
+        if last_dwt_cycles > 0
+        else legacy_last_dwt_ns
+    )
+
+    last_ocxo1_ns = _fragment_ns(
+        last_frag,
+        "ocxo1.ns",
+        "gnss.ocxo1_ns",
+        "ocxo1_ns",
+        "ocxo1_ns_at_pps_vclock",
+        default=int(last_tb.get("teensy_ocxo1_ns") or 0),
+    )
+    last_ocxo2_ns = _fragment_ns(
+        last_frag,
+        "ocxo2.ns",
+        "gnss.ocxo2_ns",
+        "ocxo2_ns",
+        "ocxo2_ns_at_pps_vclock",
+        default=int(last_tb.get("teensy_ocxo2_ns") or 0),
+    )
+    last_gnss_raw_ns = int(
+        (last_tb.get("extra_clocks") or {}).get("gnss_raw_ns")
+        or last_tb.get("gnss_raw_ns")
+        or 0
+    )
+    last_gnss_time_str = (
+        last_tb.get("gnss_time_utc")
+        or last_tb.get("system_time_utc")
+        or system_time_z()
+    )
+
+    recoverable = (
+        last_pps_vclock_count > 0
+        and last_gnss_ns > 0
+        and last_dwt_cycles > 0
+        and last_ocxo1_ns > 0
+        and last_ocxo2_ns > 0
+    )
+
+    return {
+        "last_tb": last_tb,
+        "last_frag": last_frag,
+        "last_pps_vclock_count": int(last_pps_vclock_count),
+        "last_gnss_ns": int(last_gnss_ns),
+        "legacy_last_dwt_ns": int(legacy_last_dwt_ns),
+        "last_dwt_cycles": int(last_dwt_cycles),
+        "last_dwt_ns": int(last_dwt_ns),
+        "last_ocxo1_ns": int(last_ocxo1_ns),
+        "last_ocxo2_ns": int(last_ocxo2_ns),
+        "last_gnss_raw_ns": int(last_gnss_raw_ns),
+        "last_gnss_time_str": str(last_gnss_time_str),
+        "recoverable": bool(recoverable),
+    }
+
+
+def _load_last_recoverable_timebase(
+    campaign_name: str,
+    *,
+    scan_limit: int = 64,
+) -> Tuple[Dict[str, Any], Dict[str, Any], int]:
+    """Return the newest TIMEBASE row usable as a warm-recovery base.
+
+    The final court protects future rows, but older campaigns may already
+    contain recovery-poison rows with zero OCXO ledgers.  Warm recovery must not
+    project from those zeros.  Scan backward to the newest row whose GNSS, DWT,
+    OCXO1, and OCXO2 ledgers are all nonzero; if none exists, return the newest
+    row so the caller can fail loudly with full diagnostics.
+    """
+    with open_db(row_dict=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT payload
+            FROM timebase
+            WHERE campaign = %s
+            ORDER BY ts DESC
+            LIMIT %s
+            """,
+            (campaign_name, int(scan_limit)),
+        )
+        rows = cur.fetchall()
+
+    if not rows:
+        raise LookupError("missing_timebase")
+
+    newest_tb: Optional[Dict[str, Any]] = None
+    newest_snapshot: Optional[Dict[str, Any]] = None
+    newest_error: Optional[str] = None
+
+    for skipped, row in enumerate(rows):
+        tb = row["payload"]
+        if isinstance(tb, str):
+            tb = json.loads(tb)
+        if not isinstance(tb, dict):
+            continue
+
+        try:
+            snapshot = _recovery_timebase_snapshot(tb)
+        except Exception as e:
+            if newest_error is None:
+                newest_error = str(e)
+            continue
+
+        if newest_tb is None:
+            newest_tb = tb
+            newest_snapshot = snapshot
+
+        if snapshot.get("recoverable"):
+            _diag["recovery_last_timebase_scan_count"] = (
+                _diag.get("recovery_last_timebase_scan_count", 0) + int(skipped)
+            )
+            if skipped:
+                _diag["recovery_last_timebase_unrecoverable"] = (
+                    _diag.get("recovery_last_timebase_unrecoverable", 0) + int(skipped)
+                )
+                logging.warning(
+                    "⚠️ [recovery] skipped %d latest TIMEBASE row(s) with unrecoverable ledgers; "
+                    "using recoverable row at pps_vclock_count=%s",
+                    skipped,
+                    snapshot.get("last_pps_vclock_count"),
+                )
+            return tb, snapshot, int(skipped)
+
+    if newest_tb is not None and newest_snapshot is not None:
+        return newest_tb, newest_snapshot, 0
+
+    raise RuntimeError(f"recovery failed: no parseable TIMEBASE payloads ({newest_error or 'unknown error'})")
+
+
+def _normalize_recovery_servo_mode(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    mode = str(value).strip().upper()
+    if not mode:
+        return None
+    return mode if mode in ("MEAN", "TOTAL", "NOW", "OFF") else None
+
+
+def _system_dither_args_from_config(cfg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    boot_dither = cfg.get("dither")
+    boot_dither_bool: Optional[bool] = None
+    if isinstance(boot_dither, bool):
+        boot_dither_bool = boot_dither
+    elif isinstance(boot_dither, str):
+        lowered = boot_dither.strip().lower()
+        if lowered in ("true", "1", "yes", "on"):
+            boot_dither_bool = True
+        elif lowered in ("false", "0", "no", "off"):
+            boot_dither_bool = False
+
+    boot_rate_hz = None
+    try:
+        if cfg.get("dither_rate_hz") is not None:
+            boot_rate_hz = int(cfg.get("dither_rate_hz"))
+    except (TypeError, ValueError):
+        boot_rate_hz = None
+
+    if boot_dither_bool is None and boot_rate_hz is None:
+        return None
+
+    args: Dict[str, Any] = {"dither": boot_dither_bool if boot_dither_bool is not None else True}
+    if boot_rate_hz is not None:
+        args["rate_hz"] = int(boot_rate_hz)
+    return args
+
+
+def _reassert_system_dither(context: str, cfg: Optional[Dict[str, Any]] = None) -> None:
+    """Best-effort reassertion of global dither state before START/RECOVER."""
+    cfg = cfg if isinstance(cfg, dict) else _get_system_config()
+    dither_args = _system_dither_args_from_config(cfg)
+    if not dither_args:
+        return
+
+    try:
+        resp = send_command(
+            machine="TEENSY",
+            subsystem="CLOCKS",
+            command="DITHER",
+            args=dither_args,
+        )
+        _diag["recovery_control_state_reassertions"] = (
+            _diag.get("recovery_control_state_reassertions", 0) + 1
+        )
+        logging.info(
+            "🔧 [%s] dither reassertion: %s resp=%s",
+            context,
+            dither_args,
+            resp.get("message", "?"),
+        )
+    except Exception:
+        logging.exception("⚠️ [%s] dither reassertion failed (ignored)", context)
+
+
+def _recovery_control_state(
+    *,
+    campaign_payload: Dict[str, Any],
+    last_tb: Optional[Dict[str, Any]] = None,
+    last_frag: Optional[Dict[str, Any]] = None,
+    system_cfg: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Choose START/RECOVER DAC and servo arguments from live truth first.
+
+    Cold START is allowed to use operator/SYSTEM seed values.  Warm recovery is
+    different: it should continue the last accepted campaign control state.
+    Prefer the last good TIMEBASE DAC/servo surfaces, then SYSTEM, then the
+    original campaign payload.
+    """
+    campaign_payload = campaign_payload if isinstance(campaign_payload, dict) else {}
+    last_tb = last_tb if isinstance(last_tb, dict) else {}
+    last_frag = last_frag if isinstance(last_frag, dict) else _report_fragment(last_tb)
+    system_cfg = system_cfg if isinstance(system_cfg, dict) else _get_system_config()
+
+    dac1, dac1_source = _first_float_with_source(
+        ("last.fragment.dac.ocxo1_dac", _path_get(last_frag, "dac.ocxo1_dac")),
+        ("last.fragment.dac.ocxo1.value", _path_get(last_frag, "dac.ocxo1.value")),
+        ("last.fragment.ocxo1_dac", last_frag.get("ocxo1_dac")),
+        ("last.forensics.dac.ocxo1.value", _path_get(last_tb, "forensics.dac.ocxo1.value")),
+        ("SYSTEM.ocxo1_dac", system_cfg.get("ocxo1_dac")),
+        ("campaign.payload.ocxo1_dac", campaign_payload.get("ocxo1_dac")),
+    )
+    dac2, dac2_source = _first_float_with_source(
+        ("last.fragment.dac.ocxo2_dac", _path_get(last_frag, "dac.ocxo2_dac")),
+        ("last.fragment.dac.ocxo2.value", _path_get(last_frag, "dac.ocxo2.value")),
+        ("last.fragment.ocxo2_dac", last_frag.get("ocxo2_dac")),
+        ("last.forensics.dac.ocxo2.value", _path_get(last_tb, "forensics.dac.ocxo2.value")),
+        ("SYSTEM.ocxo2_dac", system_cfg.get("ocxo2_dac")),
+        ("campaign.payload.ocxo2_dac", campaign_payload.get("ocxo2_dac")),
+    )
+
+    servo_mode = _normalize_recovery_servo_mode(
+        _path_get(last_frag, "dac.calibrate_ocxo")
+        or last_frag.get("servo_mode")
+        or _path_get(last_tb, "forensics.dac.calibrate_ocxo")
+        or campaign_payload.get("calibrate_ocxo")
+    )
+    if servo_mode is None:
+        servo_active_raw = last_frag.get("servo_active")
+        if servo_active_raw is not None and not _timebase_final_court_bool(servo_active_raw):
+            servo_mode = "OFF"
+
+    out: Dict[str, Any] = {
+        "ocxo1_dac": dac1,
+        "ocxo2_dac": dac2,
+        "ocxo1_dac_source": dac1_source,
+        "ocxo2_dac_source": dac2_source,
+        "calibrate_ocxo": servo_mode,
+        "calibrate_ocxo_source": (
+            "last_timebase_or_campaign" if servo_mode is not None else None
+        ),
+        "dither_args": _system_dither_args_from_config(system_cfg),
+    }
+    return out
+
+
 def _first_float(*values: Any) -> Optional[float]:
     for value in values:
         if value is None:
@@ -3675,16 +3971,27 @@ def _recover_campaign() -> None:
             logging.info("🧹 [recovery/cold] drained %d stale TIMEBASE piece(s)", drained)
         _clear_sync_wait()
 
+        system_cfg = _get_system_config()
+        control_state = _recovery_control_state(
+            campaign_payload=campaign_payload,
+            system_cfg=system_cfg,
+        )
+        _diag["last_recovery_control_state"] = {
+            "context": "recovery/cold",
+            **control_state,
+        }
+        _reassert_system_dither("recovery/cold", system_cfg)
+
         teensy_args: Dict[str, Any] = {"campaign": campaign_name}
-        recover_ocxo1_dac = campaign_payload.get("ocxo1_dac")
-        recover_ocxo2_dac = campaign_payload.get("ocxo2_dac")
-        recover_calibrate = campaign_payload.get("calibrate_ocxo")
+        recover_ocxo1_dac = control_state.get("ocxo1_dac")
+        recover_ocxo2_dac = control_state.get("ocxo2_dac")
+        recover_calibrate = control_state.get("calibrate_ocxo")
         if recover_ocxo1_dac is not None:
             teensy_args["set_dac1"] = str(float(recover_ocxo1_dac))
         if recover_ocxo2_dac is not None:
             teensy_args["set_dac2"] = str(float(recover_ocxo2_dac))
         if recover_calibrate:
-            teensy_args["calibrate_ocxo"] = recover_calibrate
+            teensy_args["calibrate_ocxo"] = str(recover_calibrate)
 
         _accepted_pps_vclock_count = None
         _diag["accepted_pps_count"] = None
@@ -3725,80 +4032,30 @@ def _recover_campaign() -> None:
         }
         return
 
-    last_tb = tb_row["payload"]
-    if isinstance(last_tb, str):
-        last_tb = json.loads(last_tb)
-
-    last_frag = last_tb.get("fragment") or {}
     try:
-        last_pps_vclock_count = int(_extract_last_timebase_count(last_tb, last_frag))
-    except ValueError as e:
-        _diag["recovery_missing_last_pps_count"] += 1
-        _diag["recovery_missing_last_pps_vclock_count"] += 1
-        raise RuntimeError(f"recovery failed: {e}") from e
+        last_tb, recovery_snapshot, skipped_unrecoverable_rows = _load_last_recoverable_timebase(campaign_name)
+    except LookupError:
+        # Preserve the existing cold-restart path above for genuinely zero-row campaigns.
+        raise RuntimeError(f"recovery failed: campaign '{campaign_name}' has no TIMEBASE rows")
 
-    # Read synthetic nanosecond ledgers from fragment, preferring the new
-    # PPS/VCLOCK-era names and falling back to legacy top-level fields.
-    last_gnss_ns = _fragment_ns(
-        last_frag,
-        "gnss.ns",
-        "gnss.pps_vclock_ns",
-        "gnss.vclock_ns",
-        "pps_vclock_ns",
-        "vclock_ns",
-        "pps_ns",
-        "gnss_ns",
-        default=int(last_tb.get("teensy_gnss_ns") or 0),
-    )
-    # DWT is cycle-native in TIMEBASE_FRAGMENT_V3.  Recover from the native
-    # cycle ledger first, then convert to the current Teensy RECOVER dwt_ns
-    # command shape as a compatibility shim.  Older rows that carried dwt_ns
-    # remain supported as a fallback.
-    legacy_last_dwt_ns = _fragment_ns(
-        last_frag,
-        "dwt.ns",
-        "dwt_ns",
-        default=int(last_tb.get("teensy_dwt_ns") or last_tb.get("dwt_ns") or 0),
-    )
-    last_dwt_cycles = _fragment_int(
-        last_frag,
-        "dwt.cycle_count_total",
-        "dwt.cycles",
-        "dwt.value",
-        "dwt_cycle_count_total",
-        "dwt_cycles",
-        default=0,
-    )
-    if last_dwt_cycles == 0 and legacy_last_dwt_ns > 0:
-        last_dwt_cycles = _dwt_recover_ns_to_cycles(legacy_last_dwt_ns)
-    last_dwt_ns = (
-        _dwt_cycles_to_recover_ns(last_dwt_cycles)
-        if last_dwt_cycles > 0
-        else legacy_last_dwt_ns
-    )
-    last_ocxo1_ns = _fragment_ns(
-        last_frag,
-        "ocxo1.ns",
-        "gnss.ocxo1_ns",
-        "ocxo1_ns",
-        "ocxo1_ns_at_pps_vclock",
-        default=int(last_tb.get("teensy_ocxo1_ns") or 0),
-    )
-    last_ocxo2_ns = _fragment_ns(
-        last_frag,
-        "ocxo2.ns",
-        "gnss.ocxo2_ns",
-        "ocxo2_ns",
-        "ocxo2_ns_at_pps_vclock",
-        default=int(last_tb.get("teensy_ocxo2_ns") or 0),
-    )
-    last_gnss_raw_ns = int(
-        (last_tb.get("extra_clocks") or {}).get("gnss_raw_ns")
-        or last_tb.get("gnss_raw_ns")
-        or 0
-    )
+    last_frag = recovery_snapshot["last_frag"]
+    last_pps_vclock_count = int(recovery_snapshot["last_pps_vclock_count"])
+    last_gnss_ns = int(recovery_snapshot["last_gnss_ns"])
+    legacy_last_dwt_ns = int(recovery_snapshot["legacy_last_dwt_ns"])
+    last_dwt_cycles = int(recovery_snapshot["last_dwt_cycles"])
+    last_dwt_ns = int(recovery_snapshot["last_dwt_ns"])
+    last_ocxo1_ns = int(recovery_snapshot["last_ocxo1_ns"])
+    last_ocxo2_ns = int(recovery_snapshot["last_ocxo2_ns"])
+    last_gnss_raw_ns = int(recovery_snapshot["last_gnss_raw_ns"])
+    last_gnss_time_str = str(recovery_snapshot["last_gnss_time_str"])
 
-    last_gnss_time_str = last_tb.get("gnss_time_utc") or last_tb.get("system_time_utc") or system_time_z()
+    if not recovery_snapshot.get("recoverable"):
+        raise RuntimeError(
+            "recovery failed: newest TIMEBASE row is not warm-recoverable "
+            f"(pps_vclock_count={last_pps_vclock_count}, gnss_ns={last_gnss_ns}, "
+            f"dwt_cycles={last_dwt_cycles}, ocxo1_ns={last_ocxo1_ns}, "
+            f"ocxo2_ns={last_ocxo2_ns})"
+        )
 
     if last_gnss_ns == 0:
         logging.warning("⚠️ [recovery] teensy_gnss_ns=0 — using dwt_ns as proxy")
@@ -3817,15 +4074,31 @@ def _recover_campaign() -> None:
         last_ocxo1_ns, last_ocxo2_ns, last_gnss_time_str,
     )
 
-    recover_ocxo1_dac = campaign_payload.get("ocxo1_dac")
-    recover_ocxo2_dac = campaign_payload.get("ocxo2_dac")
-    recover_calibrate = campaign_payload.get("calibrate_ocxo", False)
+    system_cfg = _get_system_config()
+    control_state = _recovery_control_state(
+        campaign_payload=campaign_payload,
+        last_tb=last_tb,
+        last_frag=last_frag,
+        system_cfg=system_cfg,
+    )
+    recover_ocxo1_dac = control_state.get("ocxo1_dac")
+    recover_ocxo2_dac = control_state.get("ocxo2_dac")
+    recover_calibrate = control_state.get("calibrate_ocxo")
+    _diag["last_recovery_control_state"] = {
+        "context": "recovery",
+        "skipped_unrecoverable_rows": int(skipped_unrecoverable_rows),
+        **control_state,
+    }
 
-    if recover_ocxo1_dac is not None:
-        logging.info(
-            "🔧 [recovery] OCXO1 DAC: %s (calibrate=%s)",
-            recover_ocxo1_dac, recover_calibrate
-        )
+    logging.info(
+        "🔧 [recovery] control state: ocxo1_dac=%s (%s) ocxo2_dac=%s (%s) servo=%s dither=%s",
+        recover_ocxo1_dac,
+        control_state.get("ocxo1_dac_source"),
+        recover_ocxo2_dac,
+        control_state.get("ocxo2_dac_source"),
+        recover_calibrate or "OFF",
+        control_state.get("dither_args"),
+    )
 
     # ------------------------------------------------------------------
     # Step 2: Wait for preflight
@@ -3853,6 +4126,8 @@ def _recover_campaign() -> None:
     _drained = _drain_timebase_ingress_and_pending()
     if _drained > 0:
         logging.info("🧹 [recovery] drained %d stale TIMEBASE pieces/pending halves", _drained)
+
+    _reassert_system_dither("recovery", system_cfg)
 
     now_frac = time.time() % 1.0
     sleep_to_boundary = (1.0 - now_frac) + 0.050
@@ -3954,6 +4229,10 @@ def _recover_campaign() -> None:
         "projected_dwt_ns": int(projected_dwt_ns),
         "projected_ocxo1_ns": int(projected_ocxo1_ns),
         "projected_ocxo2_ns": int(projected_ocxo2_ns),
+        "skipped_unrecoverable_rows": int(skipped_unrecoverable_rows),
+        "recover_ocxo1_dac": None if recover_ocxo1_dac is None else round(float(recover_ocxo1_dac), 6),
+        "recover_ocxo2_dac": None if recover_ocxo2_dac is None else round(float(recover_ocxo2_dac), 6),
+        "recover_calibrate_ocxo": recover_calibrate,
         "tau_dwt": round(tau_dwt, 12),
         "tau_ocxo1": round(tau_ocxo1, 12),
         "tau_ocxo2": round(tau_ocxo2, 12),
@@ -3992,7 +4271,7 @@ def _recover_campaign() -> None:
     if recover_ocxo2_dac is not None:
         teensy_recover_args["set_dac2"] = str(float(recover_ocxo2_dac))
     if recover_calibrate:
-        teensy_recover_args["calibrate_ocxo"] = recover_calibrate
+        teensy_recover_args["calibrate_ocxo"] = str(recover_calibrate)
 
     _request_teensy_recover(int(recover_base_pps_vclock_count), teensy_recover_args)
 
