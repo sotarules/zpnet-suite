@@ -1,33 +1,29 @@
 """
 transport.py — ZPNet Host-Side Transport Layer (Pi)
 
-This module is the single authoritative byte ↔ meaning boundary
-on the host side. It is intentionally symmetric with
-`transport.cpp` on the Teensy.
+This module is the host-side byte ↔ meaning boundary. It is intentionally
+symmetric with transport.cpp on the Teensy.
 
-NEW ARCHITECTURE (TRUTHFUL SPLIT):
-  • Four explicit physical paths:
-      - HID   TX
-      - HID   RX
-      - SERIAL TX
-      - SERIAL RX
-  • Public API remains invariant:
-      - transport_send(...)
-      - transport_register_receive_callback(...)
-      - transport_init()
-      - transport_close()
+Wire protocol:
+
+    [traffic byte] <STX=json_len> JSON <ETX>
+
+Serial-only doctrine:
+  • USB CDC serial is the only physical path.
+  • HID support is retired.
+  • The length is authoritative; ETX is retained as a redundant safety check.
 
 Responsibilities:
-  • Own physical I/O (hidraw OR USB CDC serial)
-  • Delimit / undelimit semantic messages
-  • Demultiplex by traffic byte
-  • Deliver decoded messages via registered callbacks
+  • Own physical serial I/O.
+  • Delimit / undelimit semantic messages.
+  • Demultiplex by traffic byte.
+  • Deliver decoded messages via registered callbacks.
 
 Design philosophy:
-  • Transport is boring and correct
-  • Meaning crosses this boundary exactly once
-  • Receive is adversarial and callback-driven
-  • Transport never dies because of data
+  • Transport is boring and correct.
+  • Meaning crosses this boundary exactly once.
+  • Receive is adversarial and callback-driven.
+  • Transport never dies because of data.
 """
 
 from __future__ import annotations
@@ -65,6 +61,8 @@ TEENSY_SERIAL_PATH = getattr(constants, "TEENSY_SERIAL_PORT", "/dev/zpnet-teensy
 # ---------------------------------------------------------------------
 
 TRANSPORT_MAX_MESSAGE = 32 * 1024
+FRAME_SLACK = 64
+RX_BUF_MAX = TRANSPORT_MAX_MESSAGE + FRAME_SLACK
 
 STX_PREFIX = b"<STX="
 ETX_SEQ = b"<ETX>"
@@ -80,30 +78,24 @@ RAW_TRANSPORT_LOG_PATH = "/home/mule/zpnet/logs/zpnet-transport.log"
 RAW_TRANSPORT_LOG_ENABLED = True
 
 # ---------------------------------------------------------------------
-# Retry policy (aggressive, silent)
+# Retry policy
 # ---------------------------------------------------------------------
 
 _RETRY_MIN_SLEEP_S = 0.02
 _RETRY_MAX_SLEEP_S = 0.50
 
 # ---------------------------------------------------------------------
-# Physical transport state (authoritative)
+# Physical transport state
 # ---------------------------------------------------------------------
 
-# _ser is the single source of truth for serial physical state.
-# None => device not open / unavailable
-# not None => open serial.Serial instance
 _ser: Optional["serial.Serial"] = None
-
-# TX serialization: one process-level serial writer at a time.
 _tx_lock = threading.Lock()
 
-# Supervisor control
 _transport_stop = threading.Event()
 _transport_supervisor_started = False
 
 # ---------------------------------------------------------------------
-# RX assembly state (observable, module-owned)
+# RX assembly state
 # ---------------------------------------------------------------------
 
 rx_buf = bytearray()
@@ -111,18 +103,22 @@ rx_have_traffic = False
 rx_traffic: Optional[int] = None
 
 # ---------------------------------------------------------------------
-# Open / close primitives (IMMORTAL)
+# Open / close primitives
 # ---------------------------------------------------------------------
 
 def _open_serial(path: str) -> None:
     global _ser
 
     if _ser is not None:
-        return  # idempotent
+        return
 
-    _ser = serial.Serial(port=path, baudrate=getattr(constants, "TEENSY_BAUDRATE", 115200), timeout=None)
+    _ser = serial.Serial(
+        port=path,
+        baudrate=getattr(constants, "TEENSY_BAUDRATE", 115200),
+        timeout=None,
+    )
 
-    logging.info("[transport] SERIAL device opened")
+    logging.info("[transport] SERIAL device opened: %s", path)
 
 
 def _close_serial() -> None:
@@ -141,33 +137,33 @@ def _close_serial() -> None:
     logging.info("[transport] SERIAL device closed")
 
 # ---------------------------------------------------------------------
-# Forensic logging
+# Raw wire logging
 # ---------------------------------------------------------------------
 
 def render_bytes_lossless(data: bytes) -> str:
     out = []
     for b in data:
-        if 32 <= b <= 126:   # printable ASCII
+        if 32 <= b <= 126:
             out.append(chr(b))
         else:
             out.append(f"\\x{b:02X}")
-    return ''.join(out)
+    return "".join(out)
 
 
-def _log_raw_transport(traffic: int, message: bytes, direction: str) -> None:
+def _log_wire(direction: str, wire: bytes) -> None:
     if not RAW_TRANSPORT_LOG_ENABLED:
         return
+
+    traffic = wire[0] if wire else 0
 
     try:
         os.makedirs(os.path.dirname(RAW_TRANSPORT_LOG_PATH), exist_ok=True)
         with open(RAW_TRANSPORT_LOG_PATH, "a") as f:
             f.write(
-                f"{direction} 0x{traffic:02X} len={len(message)} "
-                f"{render_bytes_lossless(message)}\n"
+                f"{direction} 0x{traffic:02X} len={len(wire)} "
+                f"{render_bytes_lossless(wire)}\n"
             )
     except Exception as e:
-        # Raw byte logging is forensic only.  It must never kill the
-        # live serial RX/TX path.
         logging.warning("⚠️ [transport] raw transport log failed: %r", e)
 
 # ---------------------------------------------------------------------
@@ -184,51 +180,53 @@ def transport_register_receive_callback(traffic: int, cb: Callable[[Payload], No
 # Framing helpers
 # ---------------------------------------------------------------------
 
-def _delimit_for_send(payload: bytes) -> bytes:
-    header = b"<STX=" + str(len(payload)).encode("ascii") + b">"
-    return header + payload + ETX_SEQ
+def _frame_payload(payload: bytes) -> bytes:
+    return b"<STX=" + str(len(payload)).encode("ascii") + b">" + payload + ETX_SEQ
 
 
-def _undelimit_on_receive(msg: bytes) -> bytes:
-    header_end = msg.index(b">")
+def _make_wire_message(traffic: int, payload: bytes) -> bytes:
+    return bytes([traffic]) + _frame_payload(payload)
 
-    declared_len = int(msg[len(STX_PREFIX):header_end])
 
+def _payload_from_frame(frame: bytes) -> bytes:
+    header_end = frame.index(b">")
+    declared_len = int(frame[len(STX_PREFIX):header_end])
     json_start = header_end + 1
-    etx_pos = json_start + declared_len
-
-    return msg[json_start:etx_pos]
+    return frame[json_start:json_start + declared_len]
 
 
-def _validate_frame(framed: bytes) -> bool:
-    header_end = framed.find(b">")
-    ok = (
-        framed.startswith(STX_PREFIX)
-        and framed.endswith(ETX_SEQ)
-        and header_end != -1
-        and framed[len(STX_PREFIX):header_end].isdigit()
-        and (
-            len(framed)
-            - (header_end + 1)
-            - ETX_LEN
-            == int(framed[len(STX_PREFIX):header_end])
-        )
-    )
+def _validate_frame(frame: bytes) -> bool:
+    header_end = frame.find(b">")
+    if (
+        not frame.startswith(STX_PREFIX)
+        or not frame.endswith(ETX_SEQ)
+        or header_end == -1
+    ):
+        logging.info("🧩 transport detected incorrectly formatted frame: %r", frame)
+        return False
 
-    if not ok:
-        logging.info("🧩 transport detected incorrectly formatted frame: %r", framed)
+    declared_raw = frame[len(STX_PREFIX):header_end]
+    if not declared_raw.isdigit():
+        logging.info("🧩 transport detected incorrectly formatted frame: %r", frame)
+        return False
 
-    return ok
+    declared_len = int(declared_raw)
+    actual_len = len(frame) - (header_end + 1) - ETX_LEN
+    if actual_len != declared_len:
+        logging.info("🧩 transport detected incorrectly formatted frame: %r", frame)
+        return False
+
+    return True
 
 # ---------------------------------------------------------------------
-# Dispatch (IMMORTAL)
+# Dispatch
 # ---------------------------------------------------------------------
 
-def _dispatch_complete_message(traffic: int, framed: bytes) -> None:
-    if not _validate_frame(framed):
+def _dispatch_frame(traffic: int, frame: bytes) -> None:
+    if not _validate_frame(frame):
         return
 
-    raw = _undelimit_on_receive(framed)
+    raw = _payload_from_frame(frame)
     payload = json.loads(raw.decode("utf-8"))
 
     cb = _transport_recv_cb.get(traffic)
@@ -245,12 +243,24 @@ def _dispatch_complete_message(traffic: int, framed: bytes) -> None:
 # Physical primitives
 # ---------------------------------------------------------------------
 
-def _serial_write(data: bytes) -> None:
-    ser = _ser
-    if ser is None:
-        return
-    ser.write(data)
-    ser.flush()
+def _serial_write_all(data: bytes) -> None:
+    offset = 0
+
+    while offset < len(data):
+        ser = _ser
+        if ser is None:
+            raise RuntimeError("SERIAL transport is not open")
+
+        n = ser.write(data[offset:])
+        ser.flush()
+
+        if n is None:
+            n = len(data) - offset
+
+        if n <= 0:
+            raise RuntimeError("SERIAL write made no progress")
+
+        offset += n
 
 
 def _serial_read_some() -> bytes:
@@ -265,14 +275,21 @@ def _serial_read_some() -> bytes:
 # TX path
 # ---------------------------------------------------------------------
 
-def _serial_tx_send(traffic: int, framed: bytes) -> None:
-    msg = bytes([traffic]) + framed
-    _log_raw_transport(traffic, msg, "Pi -> Teensy")
-    _serial_write(msg)
+def _serial_tx_send(wire: bytes) -> None:
+    _serial_write_all(wire)
+    _log_wire("Pi -> Teensy", wire)
 
 # ---------------------------------------------------------------------
-# RX loop (RETURN on physical failure)
+# RX path
 # ---------------------------------------------------------------------
+
+def _rx_begin(traffic: int) -> None:
+    global rx_have_traffic, rx_traffic
+
+    rx_traffic = traffic
+    rx_have_traffic = True
+    rx_buf.clear()
+
 
 def _rx_reset() -> None:
     global rx_have_traffic, rx_traffic
@@ -282,14 +299,40 @@ def _rx_reset() -> None:
     rx_traffic = None
 
 
-def _dispatch_if_complete() -> None:
-    global rx_have_traffic, rx_traffic
+def _rx_stx_accepts(b: int) -> bool:
+    if len(rx_buf) >= len(STX_PREFIX):
+        return True
+    return STX_PREFIX.startswith(bytes(rx_buf) + bytes([b]))
 
+
+def _rx_header_complete() -> bool:
+    return len(rx_buf) > len(STX_PREFIX) and b">" in rx_buf[len(STX_PREFIX):]
+
+
+def _rx_should_resync(b: int) -> bool:
+    if b not in _VALID_TRAFFIC:
+        return False
+
+    if len(rx_buf) == 0:
+        return True
+
+    if _rx_header_complete():
+        return False
+
+    if len(rx_buf) < len(STX_PREFIX):
+        return not _rx_stx_accepts(b)
+
+    # We have <STX= but not the closing '>' yet. A traffic byte cannot be a
+    # legal decimal length byte, so it is a fresh frame boundary.
+    return True
+
+
+def _dispatch_if_complete() -> None:
     if not rx_have_traffic or rx_traffic is None:
         rx_buf.clear()
         return
 
-    if len(rx_buf) < len(STX_PREFIX) + 2:
+    if len(rx_buf) < len(STX_PREFIX):
         return
 
     if not rx_buf.startswith(STX_PREFIX):
@@ -310,7 +353,7 @@ def _dispatch_if_complete() -> None:
     declared_len = int(declared_raw)
     required_total = header_end + 1 + declared_len + ETX_LEN
 
-    if required_total > TRANSPORT_MAX_MESSAGE + 64:
+    if required_total > RX_BUF_MAX:
         logging.info("🧩 transport declared oversized frame: %r", bytes(rx_buf))
         _rx_reset()
         return
@@ -318,21 +361,19 @@ def _dispatch_if_complete() -> None:
     if len(rx_buf) < required_total:
         return
 
-    framed = bytes(rx_buf[:required_total])
+    frame = bytes(rx_buf[:required_total])
     traffic = rx_traffic
 
-    if not _validate_frame(framed):
+    if not _validate_frame(frame):
         _rx_reset()
         return
 
-    _log_raw_transport(traffic, framed, "Teensy -> Pi")
-    _dispatch_complete_message(traffic, framed)
+    _log_wire("Teensy -> Pi", bytes([traffic]) + frame)
+    _dispatch_frame(traffic, frame)
     _rx_reset()
 
 
 def _serial_rx_loop() -> None:
-    global rx_have_traffic, rx_traffic
-
     _rx_reset()
 
     while True:
@@ -340,34 +381,40 @@ def _serial_rx_loop() -> None:
         for b in data:
             if not rx_have_traffic:
                 if b in _VALID_TRAFFIC:
-                    rx_traffic = b
-                    rx_have_traffic = True
-                    rx_buf.clear()
+                    _rx_begin(b)
+                continue
+
+            # Recover from orphan traffic bytes / partial prior frames.  Once
+            # STX is established, valid traffic-looking bytes are payload bytes;
+            # before STX is established, they are fresh frame boundaries.
+            if _rx_should_resync(b):
+                logging.debug(
+                    "[transport] RX resync on traffic=0x%02X discarded_prefix=%r",
+                    b,
+                    bytes(rx_buf),
+                )
+                _rx_begin(b)
                 continue
 
             rx_buf.append(b)
-            if len(rx_buf) > TRANSPORT_MAX_MESSAGE + 64:
+
+            if len(rx_buf) > RX_BUF_MAX:
+                logging.info("🧩 transport receive buffer overflow: len=%d", len(rx_buf))
+                _rx_reset()
+                continue
+
+            if len(rx_buf) <= len(STX_PREFIX) and not STX_PREFIX.startswith(bytes(rx_buf)):
+                logging.info("🧩 transport detected incorrectly formatted frame: %r", bytes(rx_buf))
                 _rx_reset()
                 continue
 
             _dispatch_if_complete()
 
 # ---------------------------------------------------------------------
-# Supervisor (IMMORTAL CAMPER)
+# Supervisor
 # ---------------------------------------------------------------------
 
 def _supervisor_loop() -> None:
-    """
-    Immortal supervisor — keeps the serial RX path alive across device
-    unavailability, flash cycles, and transient I/O errors.
-
-    Behaviour:
-      • First failure logs a single INFO line
-      • All subsequent failures are swallowed silently
-      • Closes stale handles before each retry
-      • Polls with capped exponential backoff (20 ms → 500 ms)
-      • Logs once on successful (re)connect
-    """
     announced = False
     backoff = _RETRY_MIN_SLEEP_S
 
@@ -381,8 +428,6 @@ def _supervisor_loop() -> None:
             _serial_rx_loop()
 
         except Exception as e:
-            # Device not ready, I/O error, stale handle, malformed RX, etc.
-            # Close whatever is open so the next iteration re-opens cleanly.
             _close_serial()
 
             if not announced:
@@ -406,10 +451,10 @@ def transport_send(traffic: int, payload: Payload) -> None:
         raise RuntimeError("transport not initialized")
 
     raw = payload_to_json_bytes(payload)
-    framed = _delimit_for_send(raw)
+    wire = _make_wire_message(traffic, raw)
 
     with _tx_lock:
-        _serial_tx_send(traffic, framed)
+        _serial_tx_send(wire)
 
 
 def transport_init() -> None:
@@ -430,17 +475,6 @@ def transport_close() -> None:
 
 
 def transport_rx_snapshot() -> dict:
-    """
-    Return a read-only snapshot of the current RX assembly state.
-
-    Semantics:
-      • Observational only
-      • No locking
-      • No mutation
-      • No interpretation
-      • Best-effort physical truth
-    """
-
     return {
         "rx_buf_len": len(rx_buf),
         "rx_buf_bytes": bytes(rx_buf),

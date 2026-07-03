@@ -10,13 +10,21 @@
 //   • Only the transport subsystem may touch Serial.
 //   • Message framing and dispatch are transport responsibilities.
 //
+// WIRE FORMAT:
+//
+//   [traffic byte] <STX=json_len> JSON <ETX>
+//
+//   The length is authoritative. <ETX> is retained as a redundant safety
+//   delimiter so malformed or misaligned frames are rejected cleanly.
+//
 // TX Architecture:
 //
-//   • transport_send() serializes, heap-allocates, and enqueues.
+//   • transport_send() serializes one payload into one complete wire image.
+//   • The wire image includes the traffic byte.
 //   • A TIMEPOP-driven pump performs physical transmission.
+//   • The pump advances only by bytes actually accepted by Serial.
 //   • Each job owns its heap allocation — freed on completion.
 //   • Memory is bounded via soft budget cap (TX_BUDGET_MAX).
-//   • No ring buffer. No geometric fragmentation. No gap logic.
 //
 // Serial-only doctrine:
 //
@@ -123,8 +131,8 @@ typedef struct {
   uint32_t tx_jobs_enqueued;      // Total jobs enqueued
   uint32_t tx_jobs_sent;          // Total jobs fully sent
 
-  uint32_t tx_bytes_enqueued;     // Total framed bytes enqueued
-  uint32_t tx_bytes_sent;         // Total framed bytes sent
+  uint32_t tx_bytes_enqueued;     // Total complete wire bytes enqueued
+  uint32_t tx_bytes_sent;         // Total complete wire bytes accepted by Serial
 
   // ===========================================================
   // TX — Failure counters
@@ -167,7 +175,7 @@ typedef struct {
   // RX — Concurrency / anomaly signals
   // ===========================================================
 
-  uint32_t rx_overlap;                  // New traffic while RX active
+  uint32_t rx_overlap;                  // New traffic while RX active / resync
   uint32_t rx_expected_traffic_missing; // Expected traffic byte absent
 
 } transport_info_t;
