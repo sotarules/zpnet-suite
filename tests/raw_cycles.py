@@ -34,6 +34,9 @@ Column doctrine:
     *_flΔ     FloorLine endpoint interval first-difference residual:
               fl_interval[n] - fl_interval[n-1].
     *_pub     the subscriber-facing published interval.
+              Current FloorLine-deprecated firmware publishes observation-
+              derived authority: OCXO *_pub should follow *_raw, while
+              VCLOCK *_pub follows physical PPS + p_voff.
     *_pubΔ    published interval first-difference residual:
               pub_interval[n] - pub_interval[n-1].
     *_cΔ      counter32 delta since the previous subscriber event.
@@ -362,15 +365,42 @@ def physical_pps_dwt_from_schema(root: Dict[str, Any],
     )
 
 
+def pps_vclock_dwt_from_schema(root: Dict[str, Any],
+                                frag: Dict[str, Any],
+                                forensic: Dict[str, Any]) -> Optional[int]:
+    """Return the authored PPS/VCLOCK endpoint DWT when TIMEBASE exposes it.
+
+    After FloorLine deprecation, this endpoint is the thing we need for the
+    VCLOCK publication doctrine: physical PPS plus the live PPS→VCLOCK phase.
+    Some transitional rows still expose a stale/zero phase scalar, while the
+    endpoint itself is present and correct in fragment science / micro fields.
+    """
+    return _first_int(
+        frag.get("dwt_at_pps_vclock"),
+        forensic.get("dwt_at_pps_vclock"),
+        root.get("dwt_at_pps_vclock"),
+        _nested_get(frag, "vclock", "science", "pps_vclock_dwt_at_edge"),
+        _nested_get(root, "fragment", "vclock", "science", "pps_vclock_dwt_at_edge"),
+        _nested_get(root, "vclock", "science", "pps_vclock_dwt_at_edge"),
+        forensic.get("v_pub"),
+        frag.get("v_pub"),
+        root.get("v_pub"),
+    )
+
+
 def pps_vclock_phase_cycles_from_schema(root: Dict[str, Any],
                                         frag: Dict[str, Any],
                                         forensic: Dict[str, Any],
                                         pps_dwt: Optional[int]) -> Optional[int]:
     """Return the DWT-cycle offset from physical PPS to PPS/VCLOCK.
 
-    Current TIMEBASE exposes this directly as pps_vclock_phase_cycles.
-    Keep a computed fallback from DWT endpoints so older/transitional rows can
-    still show the phase column when both endpoints are present.
+    Prefer endpoint-derived phase when it is available.  That is the direct
+    custody fact the report is auditing: pps_vclock_dwt_at_edge - pps_dwt_at_edge.
+    The explicit pps_vclock_phase_cycles scalar is retained as a fallback, but
+    transitional firmware can expose it as 0 while the endpoint itself clearly
+    carries the real +~50 cycle phase.  In that case, trusting the scalar makes
+    every row look pathological even though publication is doing the right
+    thing.
     """
     explicit = _first_int(
         _nested_get(frag, "pps", "vclock_phase_cycles"),
@@ -378,19 +408,33 @@ def pps_vclock_phase_cycles_from_schema(root: Dict[str, Any],
         forensic.get("pps_vclock_phase_cycles"),
         root.get("pps_vclock_phase_cycles"),
     )
-    if explicit is not None:
-        return explicit
 
-    vclock_dwt = _first_int(
-        frag.get("dwt_at_pps_vclock"),
-        forensic.get("dwt_at_pps_vclock"),
-        root.get("dwt_at_pps_vclock"),
-        _nested_get(frag, "vclock", "science", "pps_vclock_dwt_at_edge"),
+    vclock_dwt = pps_vclock_dwt_from_schema(root, frag, forensic)
+    endpoint_phase = None
+    if vclock_dwt is not None and pps_dwt is not None:
+        endpoint_phase = _signed_delta_u32(vclock_dwt, pps_dwt)
+
+    # A lawful PPS→VCLOCK phase is less than one 10 MHz tick.  Leave a broad
+    # guard so the parser is robust to CPS changes and rounding, but do not let
+    # an unrelated endpoint accidentally replace an explicit scalar.
+    endpoint_phase_plausible = (
+        endpoint_phase is not None and
+        0 <= endpoint_phase <= 512
     )
-    if vclock_dwt is None or pps_dwt is None:
-        return None
 
-    return _signed_delta_u32(vclock_dwt, pps_dwt)
+    if endpoint_phase_plausible:
+        if explicit is None:
+            return endpoint_phase
+        # Transitional deprecation rows can carry explicit 0 while the DWT
+        # endpoints show the real phase.  Prefer the direct endpoint fact.
+        if explicit == 0 and endpoint_phase != 0:
+            return endpoint_phase
+        # If both are present but disagree materially, the endpoint is the
+        # observable custody fact needed by raw_cycles.
+        if abs(endpoint_phase - explicit) > 8:
+            return endpoint_phase
+
+    return explicit
 
 
 def lane_prediction(frag: Dict[str, Any],
@@ -1004,6 +1048,7 @@ def collect_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]
             "pps_count": pps_count,
             "pps_actual": pps_actual,
             "pps_delta": pps_delta,
+            "pps_dwt": pps_dwt,
             "pps_vclock_phase_cycles": pps_vclock_phase_cycles,
             "dwt_ppb": dwt_ppb_from_schema(root, frag),
             "start_pps0_valid": bool(private_pps0.get("valid")),
@@ -1098,6 +1143,28 @@ def collect_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]
             micro = lane_micro_raw_cycles_diag(root, frag, forensic, lane_key)
             science = fragment_lane_science_diag(root, frag, lane_key)
 
+            raw_dwt = _first_int(original_dwt, fl_observed_dwt)
+
+            # Publication authority changed when FloorLine was deprecated:
+            #   VCLOCK publishes physical PPS + the live computed PPS→VCLOCK
+            #   phase; OCXO lanes publish the latency-adjusted observed edge.
+            # FloorLine remains a diagnostic/courtroom rail, not a publication
+            # invariant.  Keep both old and new deltas so old campaigns are
+            # still auditable while pathology classification follows the
+            # current authority doctrine.
+            expected_pub_dwt = None
+            expected_pub_authority = None
+            if lane == "VCLOCK":
+                if pps_dwt is not None and pps_vclock_phase_cycles is not None:
+                    expected_pub_dwt = (pps_dwt + pps_vclock_phase_cycles) & 0xFFFFFFFF
+                    expected_pub_authority = "PPS_PLUS_PHASE"
+                else:
+                    expected_pub_dwt = science.get("pps_vclock_dwt")
+                    expected_pub_authority = "PPS_VCLOCK_SCIENCE" if expected_pub_dwt is not None else None
+            else:
+                expected_pub_dwt = raw_dwt
+                expected_pub_authority = "OBSERVED" if expected_pub_dwt is not None else None
+
             data = {
                 "raw": raw_interval,
                 "raw_delta": _interval_delta_with_private_prev(
@@ -1119,6 +1186,19 @@ def collect_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]
                 ),
                 "counter_delta": lane_counter_delta(root, frag, forensic, lane_key),
                 "fl_edge_minus_observed": fl.get("inferred_minus_observed"),
+                "pub_minus_raw": _interval_delta(pub_interval, raw_interval),
+                "pub_edge_minus_raw_edge": (
+                    _signed_delta_u32(used_dwt, raw_dwt)
+                    if used_dwt is not None and raw_dwt is not None
+                    else None
+                ),
+                "pub_expected_authority": expected_pub_authority,
+                "pub_expected_dwt": expected_pub_dwt,
+                "pub_edge_minus_expected": (
+                    _signed_delta_u32(used_dwt, expected_pub_dwt)
+                    if used_dwt is not None and expected_pub_dwt is not None
+                    else None
+                ),
                 "pub_minus_fl": _interval_delta(pub_interval, fl_interval),
                 "pub_edge_minus_fl_edge": (
                     _signed_delta_u32(used_dwt, fl_inferred_dwt)
@@ -1132,7 +1212,7 @@ def collect_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]
                 "fl_valid": fl.get("valid"),
                 "pub_synthetic": auth.get("synthetic"),
                 "pub_used_dwt": used_dwt,
-                "raw_dwt": _first_int(original_dwt, fl_observed_dwt),
+                "raw_dwt": raw_dwt,
                 "fl_dwt": fl_inferred_dwt,
                 "micro": micro,
                 "science": science,
@@ -1200,6 +1280,7 @@ def align_pps_vclock_to_ocxo_rows(collected: List[Dict[str, Any]]) -> Tuple[List
         row["pps_count"] = ref["pps_count"]
         row["pps_actual"] = ref["pps_actual"]
         row["pps_delta"] = ref["pps_delta"]
+        row["pps_dwt"] = ref.get("pps_dwt")
         row["pps_vclock_phase_cycles"] = ref.get("pps_vclock_phase_cycles")
         row["dwt_ppb"] = ref.get("dwt_ppb")
         row["lanes"] = lanes
@@ -1344,10 +1425,14 @@ def classify_pathologies(row: Dict[str, Any],
     """Return row-level custody/pathology issues.
 
     This is intentionally conservative.  It does not flag normal lattice-scale
-    movement.  It flags impossible/implausible intervals, publication/FloorLine
-    divergence, bad counter lineage, and fatal/watchdog-bearing DWT
-    publication court verdicts.  Nonzero side_rail_diagnostic masks with no
-    watchdog count are treated as court notices, not row pathologies.
+    movement.  It flags impossible/implausible authority intervals, bad
+    counter lineage, fatal/watchdog-bearing DWT publication court verdicts,
+    and divergence from the current publication authority doctrine.
+
+    FloorLine is no longer publication authority.  A nonzero published-minus-
+    FloorLine delta is now expected diagnostic evidence, not a row pathology.
+    Nonzero side_rail_diagnostic masks with no watchdog count are treated as
+    court notices, not row pathologies.
     """
     issues: List[Dict[str, Any]] = []
 
@@ -1375,7 +1460,7 @@ def classify_pathologies(row: Dict[str, Any],
                 "message": f"court verdict mask=0x{mask:X} ({names}), reason={reason}, wd={wd:,d}",
             })
 
-        for rail in ("raw", "fl", "pub"):
+        for rail in ("raw", "pub"):
             value = data.get(rail)
             if value is None:
                 continue
@@ -1400,21 +1485,31 @@ def classify_pathologies(row: Dict[str, Any],
                         ),
                     })
 
-        pub_minus_fl = data.get("pub_minus_fl")
-        if pub_minus_fl not in (None, 0):
+        pub_edge_minus_expected = data.get("pub_edge_minus_expected")
+        if pub_edge_minus_expected not in (None, 0):
+            authority = data.get("pub_expected_authority") or "current_authority"
             issues.append({
                 "lane": lane,
-                "kind": "published_floorline_divergence",
-                "message": f"published interval - FloorLine interval = {pub_minus_fl:+,d} cycles",
+                "kind": "published_authority_edge_divergence",
+                "message": (
+                    f"published edge - {authority} expected edge = "
+                    f"{pub_edge_minus_expected:+,d} cycles"
+                ),
             })
 
-        pub_edge_minus_fl = data.get("pub_edge_minus_fl_edge")
-        if pub_edge_minus_fl not in (None, 0):
-            issues.append({
-                "lane": lane,
-                "kind": "published_floorline_edge_divergence",
-                "message": f"published edge - FloorLine edge = {pub_edge_minus_fl:+,d} cycles",
-            })
+        # For OCXO lanes, the current publication authority is the latency-
+        # adjusted observed edge.  The endpoint check above is primary; this
+        # interval check catches parser/schema inconsistencies where endpoints
+        # agree but the selected interval rail does not.  VCLOCK intentionally
+        # publishes PPS+phase, so its interval is not compared to raw VCLOCK.
+        if lane != "VCLOCK":
+            pub_minus_raw = data.get("pub_minus_raw")
+            if pub_minus_raw not in (None, 0):
+                issues.append({
+                    "lane": lane,
+                    "kind": "published_observed_interval_divergence",
+                    "message": f"published interval - observed interval = {pub_minus_raw:+,d} cycles",
+                })
 
         counter_delta = data.get("counter_delta")
         if counter_delta is not None and counter_delta != PATHOLOGY_EXPECTED_COUNTER_DELTA_TICKS:
@@ -1427,13 +1522,18 @@ def classify_pathologies(row: Dict[str, Any],
                 ),
             })
 
-        for key, label in (
+        court_checks = [
             ("published_interval_error_cycles", "court published interval error"),
             ("observed_interval_error_cycles", "court observed interval error"),
-            ("floorline_interval_error_cycles", "court FloorLine interval error"),
-            ("published_minus_observed_cycles", "court published - observed"),
-            ("floorline_minus_observed_cycles", "court FloorLine - observed"),
-        ):
+        ]
+        if lane != "VCLOCK":
+            # In the observed-authority OCXO doctrine, published-minus-observed
+            # should remain zero.  For VCLOCK, published is PPS+phase by design
+            # and may be far from the raw VCLOCK witness endpoint, so this
+            # collateral is diagnostic-only.
+            court_checks.append(("published_minus_observed_cycles", "court published - observed"))
+
+        for key, label in court_checks:
             value = court.get(key)
             if value is not None and abs(value) > gate_cycles:
                 issues.append({
@@ -1567,6 +1667,14 @@ def _append_endpoint_provenance_lines(lines: List[str], lane: str, data: Dict[st
         f"traditional_total_ppb={_format_optional_float(science.get('traditional_total_ppb'))}"
     )
     lines.append(
+        f"       {lane} publication authority: "
+        f"authority={_fmt_str(data.get('pub_expected_authority'))} "
+        f"expected={_fmt_int(data.get('pub_expected_dwt'))} "
+        f"pub-expected={_format_optional_delta(data.get('pub_edge_minus_expected'))} "
+        f"pub-raw={_format_optional_delta(data.get('pub_edge_minus_raw_edge'))} "
+        f"pub-fl={_format_optional_delta(data.get('pub_edge_minus_fl_edge'))}"
+    )
+    lines.append(
         f"       {lane} endpoint agreement selected-vs-micro: "
         f"raw={_format_optional_delta(_endpoint_agreement(raw_dwt, micro.get('raw_dwt')))} "
         f"fl={_format_optional_delta(_endpoint_agreement(fl_dwt, micro.get('fl_dwt')))} "
@@ -1603,6 +1711,7 @@ def _pathology_interpretation(lane: str,
     fl = data.get("fl")
     pub = data.get("pub")
     p_minus_fl = data.get("pub_minus_fl")
+    pub_edge_minus_expected = data.get("pub_edge_minus_expected")
     court_mask = court.get("mask")
     court_pub_err = court.get("published_interval_error_cycles")
     court_obs_err = court.get("observed_interval_error_cycles")
@@ -1612,23 +1721,25 @@ def _pathology_interpretation(lane: str,
         (court.get("expected_interval_cycles") is not None and
          abs(raw - court.get("expected_interval_cycles")) > gate_cycles)
     )
-    pub_ok_vs_fl = (pub is not None and fl is not None and p_minus_fl == 0)
+    pub_ok_vs_authority = pub_edge_minus_expected in (None, 0)
     pub_ok_vs_court = (court_pub_err is None or abs(court_pub_err) <= gate_cycles)
 
-    if raw_bad and pub_ok_vs_fl and pub_ok_vs_court:
+    if raw_bad and pub_ok_vs_authority and pub_ok_vs_court:
         out.append(
-            "interpretation: raw/evidence rail is pathological, but published == FloorLine; "
-            "the bad witness does not appear to have become subscriber-facing truth."
+            "interpretation: raw/evidence rail is pathological, but published matches "
+            "the current authority doctrine; the bad witness does not appear to "
+            "have become subscriber-facing truth."
         )
-    elif pub is not None and fl is not None and p_minus_fl not in (None, 0):
+    elif pub_edge_minus_expected not in (None, 0):
+        authority = data.get("pub_expected_authority") or "current authority"
         out.append(
-            "interpretation: published and FloorLine diverge; this is a publication-boundary "
-            "custody issue, not just a raw witness excursion."
+            f"interpretation: published edge diverges from {authority}; this is "
+            "a publication-boundary custody issue, not a FloorLine comparison."
         )
     elif court_mask and _is_side_rail_court_notice(court):
         out.append(
             "court notice: side_rail_diagnostic only; watchdog count is zero and the "
-            "published edge should be judged by the publication/FloorLine custody fields."
+            "published edge should be judged against the current authority doctrine."
         )
     elif court_mask:
         out.append(
@@ -1646,7 +1757,7 @@ def _pathology_interpretation(lane: str,
             "does not show a published-edge failure in the compact fields available here."
         )
 
-    if court and court.get("mask") in (None, 0) and raw_bad and pub_ok_vs_fl:
+    if court and court.get("mask") in (None, 0) and raw_bad and pub_ok_vs_authority:
         out.append(
             "court note: mask is OK/zero, consistent with the court judging the published "
             "edge rather than the raw witness interval."
@@ -1687,7 +1798,9 @@ def pathology_detail_lines(row: Dict[str, Any],
             f"raw={_fmt_int(data.get('raw'))} "
             f"fl={_fmt_int(data.get('fl'))} "
             f"pub={_fmt_int(data.get('pub'))} "
+            f"pub-raw={_format_optional_delta(data.get('pub_minus_raw'))} "
             f"pub-fl={_format_optional_delta(data.get('pub_minus_fl'))} "
+            f"pub_edge-expected={_format_optional_delta(data.get('pub_edge_minus_expected'))} "
             f"pub_edge-fl_edge={_format_optional_delta(data.get('pub_edge_minus_fl_edge'))}"
         )
         _append_endpoint_provenance_lines(lines, lane, data)
@@ -1777,6 +1890,7 @@ def analyze(campaign: str,
     print("  *_pub = subscriber-facing published interval.")
     print("  *Δ columns are per-rail cycle-count residuals: interval[n] - interval[n-1].")
     print("  p_voff is the PPS→VCLOCK DWT-cycle phase offset.")
+    print("  Endpoint-derived phase is preferred when the scalar is missing or stale.")
     if any(row.get("start_pps0_valid") for row in collected):
         print("  PPS 1 deltas use the private START PPS0 prologue interval when present.")
     print("  Core rail columns are always shown; missing FL data is shown as --- on purpose.")
@@ -1815,6 +1929,8 @@ def analyze(campaign: str,
         for key in ("raw", "raw_delta",
                     "fl", "fl_delta", "pub", "pub_delta",
                     "counter_delta", "fl_edge_minus_observed",
+                    "pub_minus_raw", "pub_edge_minus_raw_edge",
+                    "pub_edge_minus_expected",
                     "pub_minus_fl", "pub_edge_minus_fl_edge",
                     "fl_fit_minus_endpoint_interval"):
             stats[f"{lane}.{key}"] = Welford()
@@ -1833,6 +1949,8 @@ def analyze(campaign: str,
             for key in ("raw", "raw_delta",
                         "fl", "fl_delta", "pub", "pub_delta",
                         "counter_delta", "fl_edge_minus_observed",
+                        "pub_minus_raw", "pub_edge_minus_raw_edge",
+                        "pub_edge_minus_expected",
                         "pub_minus_fl", "pub_edge_minus_fl_edge",
                         "fl_fit_minus_endpoint_interval"):
                 add_optional(stats[f"{lane}.{key}"], data.get(key))
@@ -1865,6 +1983,9 @@ def analyze(campaign: str,
         _print_welford(f"{lane} FloorLine cycle-count residual", stats[f"{lane}.fl_delta"])
         _print_welford(f"{lane} published interval", stats[f"{lane}.pub"])
         _print_welford(f"{lane} published cycle-count residual", stats[f"{lane}.pub_delta"])
+        _print_welford(f"{lane} published interval - observed interval", stats[f"{lane}.pub_minus_raw"])
+        _print_welford(f"{lane} published edge - observed edge", stats[f"{lane}.pub_edge_minus_raw_edge"])
+        _print_welford(f"{lane} published edge - current authority edge", stats[f"{lane}.pub_edge_minus_expected"])
         _print_welford(f"{lane} published interval - FloorLine interval", stats[f"{lane}.pub_minus_fl"])
         _print_welford(f"{lane} published edge - FloorLine edge", stats[f"{lane}.pub_edge_minus_fl_edge"])
         _print_welford(f"{lane} reported FL fit interval - endpoint FL interval", stats[f"{lane}.fl_fit_minus_endpoint_interval"])
@@ -1880,10 +2001,14 @@ def analyze(campaign: str,
     print("  • *_fl is now endpoint-derived first: fl_dwt[n] - fl_dwt[n-1].")
     print("    The fitted/slope FloorLine interval is used only as a fallback and")
     print("    audited as 'reported FL fit interval - endpoint FL interval'.")
-    print("  • In FloorLine-authored firmware, 'published edge - FloorLine edge'")
-    print("    and 'published interval - FloorLine interval' should be zero.")
+    print("  • FloorLine is now diagnostic, not publication authority.")
+    print("    Current authority: VCLOCK = physical PPS DWT + p_voff;")
+    print("    OCXO = observed latency-adjusted DWT.  Published-vs-FloorLine")
+    print("    divergence is expected and is not a pathology by itself.")
     print("  • p_voff is the DWT-cycle offset from the physical PPS edge to the")
     print("    PPS/VCLOCK edge; positive means VCLOCK is later than PPS.")
+    print("  • Endpoint-derived p_voff is preferred over a stale/zero scalar when")
+    print("    TIMEBASE exposes the PPS/VCLOCK endpoint directly.")
     print("  • *Δ columns are cycle-count residuals computed separately per rail:")
     print("    interval[n] - interval[n-1].")
     print("    On PPS 1, a private START PPS0 prologue interval is used as interval[n-1] when present.")
@@ -1897,6 +2022,8 @@ def analyze(campaign: str,
     print("    firmware-published DWT custody faults.")
     print("  • side_rail_diagnostic court masks with wd=0 are court notices only;")
     print("    they do not make an otherwise clean row pathological.")
+    print("  • Pathology classification follows the current publication doctrine;")
+    print("    FloorLine deltas remain in the report as collateral only.")
     print("  • Use --pathology-only to suppress normal rows while retaining the same")
     print("    row format and per-pathology court collateral.")
     print("  • Use --pathology-gate N to change the interval-excursion threshold.")

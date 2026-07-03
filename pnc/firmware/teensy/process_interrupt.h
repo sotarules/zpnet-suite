@@ -122,7 +122,9 @@ struct interrupt_capture_diag_t {
 
   // Final DWT-at-edge publication tribunal.  A nonzero verdict means the
   // event was not admissible and should have raised WATCHDOG_ANOMALY before
-  // subscriber publication.  OK events carry zero here for audit continuity.
+  // subscriber publication.  FloorLine verdict bits are retained for ABI
+  // decoding but are diagnostic after FloorLine publication deprecation.
+  // OK events carry zero here for audit continuity.
   uint32_t dwt_publication_verdict_mask = 0;
   const char* dwt_publication_verdict_reason = nullptr;
   uint32_t dwt_publication_watchdog_count = 0;
@@ -190,6 +192,8 @@ struct interrupt_capture_diag_t {
   int32_t  dwt_yardstick_auth_error_cycles = 0;
   bool     dwt_yardstick_auth_anchor_applied = false;
 
+  // Legacy FloorLine/lower-envelope diagnostic surface.  These fields are no
+  // longer subscriber-facing DWT publication authority.
   bool     regression_valid = false;
   uint32_t regression_sequence = 0;
   uint32_t regression_sample_count = 0;
@@ -681,9 +685,9 @@ struct pps_vclock_t {
 };
 
 // PPS/VCLOCK edge authority courtroom.  process_interrupt publishes the
-// selected VCLOCK edge's DWT coordinate as a lawful inference from three
-// witnesses: the physical PPS GPIO edge plus learned phase, the VCLOCK/QTimer
-// observed edge, and the predictor/lower-envelope candidate.
+// selected VCLOCK edge's DWT coordinate from the physical PPS GPIO edge plus
+// the learned PPS->VCLOCK lower-phase estimate.  The VCLOCK/QTimer observed
+// edge and legacy predictor/FloorLine surfaces remain diagnostic witnesses.
 static constexpr uint32_t PPS_VCLOCK_EDGE_DECISION_NONE = 0;
 static constexpr uint32_t PPS_VCLOCK_EDGE_DECISION_LOWER_LAWFUL = 1;
 static constexpr uint32_t PPS_VCLOCK_EDGE_DECISION_PREDICTION_FALLBACK = 2;

@@ -26,11 +26,12 @@
 //                   dwt_isr_entry_raw; it is evidence, never event authority.
 //
 // TimePop is the principled exception to the "no DWT conversion in
-// PPS_VCLOCK" rule: it projects legacy-CH2-API / actual-CH1 fire facts onto the PPS_VCLOCK timeline
-// for scheduling diagnostics. VCLOCK and OCXO one-second subscribers receive
-// authored edge facts whose DWT coordinates are FloorLine/lower-envelope
-// projections from the observed event surface; counter32/GNSS identity remains
-// exact authority.
+// PPS_VCLOCK" rule: it projects legacy-CH2-API / actual-CH1 fire facts onto
+// the PPS_VCLOCK timeline for scheduling diagnostics. Subscriber-facing DWT
+// publication is now observation-derived: OCXO lanes publish the latency-adjusted
+// observed edge, and VCLOCK publishes the physical PPS GPIO edge plus the learned
+// PPS->VCLOCK lower-phase estimate. FloorLine/lower-envelope remains diagnostic
+// evidence only; counter32/GNSS identity remains exact authority.
 // CLOCKS/Alpha owns measured-GNSS interval construction from consecutive
 // authored edge DWTs.
 //
@@ -184,9 +185,10 @@ static constexpr uint32_t VCLOCK_DWT_REPAIR_THRESHOLD_CYCLES = 10;
 static constexpr uint32_t VCLOCK_DWT_REPAIR_MIN_HISTORY_COUNT = 8;
 static constexpr uint32_t VCLOCK_DWT_REPAIR_MAX_PREDICTION_RESIDUAL_CYCLES = 25;
 
-// The retired predictor rail has been removed.  FloorLine/lower-envelope is the
-// canonical DWT-at-edge rail; raw observed DWT and counter adjacency remain as
-// evidence only.
+// The retired predictor rail has been removed.  FloorLine/lower-envelope is now
+// diagnostic only.  Subscriber-facing DWT-at-edge publication is derived from
+// observed facts: PPS+learned lower-phase for VCLOCK, and latency-adjusted
+// observed edges for OCXO lanes.
 
 // Epoch-ready PPS capture packet.  The ISR captures the first-instruction DWT
 // and the three lane hardware counters in one tiny custody window.  DWT runs
@@ -476,8 +478,8 @@ static_assert(PPS_RELAY_OFF_CADENCE_TICKS == 500U,
 
 // OCXO DWT authorship.  OCXO1 and OCXO2 live on separate QuadTimer
 // modules/vectors.  Each OCXO ISR still captures ARM_DWT_CYCCNT as first
-// instruction for private evidence; subscriber-facing DWT is the FloorLine
-// canonical endpoint when available.  The raw ISR capture is diagnostic only.
+// instruction for private evidence; subscriber-facing DWT is the latency-
+// adjusted observed edge.  FloorLine and yardstick remain diagnostic evidence.
 static constexpr uint32_t OCXO_DWT_SOURCE_NONE = 0;
 static constexpr uint32_t OCXO_DWT_SOURCE_ISR_ENTRY = 1;
 static constexpr uint32_t OCXO_DWT_SOURCE_FLOORLINE = 3;
@@ -497,12 +499,12 @@ static constexpr uint32_t OCXO_DWT_SOURCE_FLOORLINE = 3;
 // inferred value; disagreement marks an excursion of the ISR/service
 // displacement class.
 //
-// The retired predictor rail has been removed.  The yardstick rail remains as an OCXO physics audit
-// and zero-worthiness input, while FloorLine remains the canonical published
-// DWT-at-edge rail.
-static constexpr bool     OCXO_YARDSTICK_DWT_AUTHORITY_ENABLED = true;  // Stage 2: yardstick is authority
+// The retired predictor rail has been removed.  The yardstick rail remains as
+// an OCXO physics audit and zero-worthiness input, while OCXO publication uses
+// the latency-adjusted observed DWT-at-edge.
+static constexpr bool     OCXO_YARDSTICK_DWT_AUTHORITY_ENABLED = false; // Yardstick is diagnostic only
 static constexpr uint32_t OCXO_YARDSTICK_GATE_THRESHOLD_CYCLES = 16;
-// Stage 2 anchored authority rail.  The published endpoint is a PI-anchored
+// Anchored yardstick witness rail.  This remains a PI-anchored
 // yardstick chain: each second the anchored interval is scaled by the same
 // PPS yardstick step as the free chain, the endpoint advances by it, and on
 // gate-agree seconds the observed endpoint corrects the loop:
@@ -517,7 +519,7 @@ static constexpr uint32_t OCXO_YARDSTICK_GATE_THRESHOLD_CYCLES = 16;
 // interval bias and slowly absorbs real per-lane oven drift -- it is what
 // makes the two lanes individual.  With P=1/8 and I=1/256 at 1 Hz the loop
 // is critically damped (zeta = 1) and the +/-2 cycle observed lattice noise
-// reaches the published endpoint attenuated to ~0.25 cycles.  On excursion
+// reaches the witness endpoint attenuated to ~0.25 cycles.  On excursion
 // seconds no correction is applied: the rail coasts on pure inference (the
 // excursion guard).  The yardstick feed-forward carries the thermal slope, so
 // the loop only ever fights zero-mean noise and bias -- there is no systematic
@@ -555,7 +557,7 @@ static constexpr uint32_t OCXO_YARDSTICK_ANCHOR_FAST_I_SHIFT = 4;  // 1/16
 // ~4 ppm stringency over its 1 ms baseline); it cannot see common-mode
 // displacement, lattice phase, or post-restart oven retrace -- all of which
 // it enshrines into the epoch.  Gen-2 instead maintains a continuous
-// per-lane ZERO-WORTHY verdict from the yardstick authority rail:
+// per-lane ZERO-WORTHY verdict from the yardstick witness rail:
 //
 //   A lane is zero-worthy when, for ZERO_WORTHY_STREAK_SECONDS consecutive
 //   seconds, every second was a clean gate-agree second (no excursion, no
@@ -1938,6 +1940,73 @@ static uint32_t g_pps_vclock_phase_lower_cycles = 0;
 static uint32_t g_pps_vclock_edge_authority_update_count = 0;
 static uint32_t g_pps_vclock_edge_authority_reject_count = 0;
 
+static bool pps_vclock_projection_inputs_valid(const pps_t& pps,
+                                               uint32_t observed_vclock_dwt) {
+  return pps.sequence != 0U && pps.dwt_at_edge != 0U && observed_vclock_dwt != 0U;
+}
+
+static bool pps_vclock_learn_phase_from_observation(
+    const pps_t& pps,
+    uint32_t observed_vclock_dwt,
+    uint32_t counter32_at_edge,
+    uint16_t ch3_at_edge,
+    uint32_t* out_observed_phase_cycles = nullptr) {
+  if (out_observed_phase_cycles) *out_observed_phase_cycles = 0U;
+  if (!pps_vclock_projection_inputs_valid(pps, observed_vclock_dwt)) {
+    return false;
+  }
+
+  pps_vclock_t observed{};
+  observed.sequence = pps.sequence;
+  observed.dwt_at_edge = observed_vclock_dwt;
+  observed.counter32_at_edge = counter32_at_edge;
+  observed.ch3_at_edge = ch3_at_edge;
+
+  const uint32_t observed_phase_cycles =
+      pps_vclock_phase_cycles_from_edges(pps, observed);
+  if (out_observed_phase_cycles) {
+    *out_observed_phase_cycles = observed_phase_cycles;
+  }
+
+  // The instantaneous observed phase contains the VCLOCK 4-cycle lattice we
+  // are trying to neutralize.  Learn a one-sided lower phase from observation,
+  // then publish PPS + learned_phase.  This keeps the rail observation-derived
+  // without simply reconstructing the quantized observed VCLOCK edge.
+  if (!g_pps_vclock_phase_lower_valid ||
+      observed_phase_cycles < g_pps_vclock_phase_lower_cycles) {
+    g_pps_vclock_phase_lower_cycles = observed_phase_cycles;
+    g_pps_vclock_phase_lower_valid = true;
+  }
+  return true;
+}
+
+static uint32_t pps_projected_vclock_dwt_from_learned_phase(
+    const pps_t& pps,
+    uint32_t observed_vclock_dwt,
+    uint32_t counter32_at_edge,
+    uint16_t ch3_at_edge,
+    bool* out_valid = nullptr,
+    uint32_t* out_phase_cycles = nullptr) {
+  if (out_valid) *out_valid = false;
+  if (out_phase_cycles) *out_phase_cycles = 0U;
+
+  uint32_t observed_phase_cycles = 0;
+  if (!pps_vclock_learn_phase_from_observation(pps,
+                                                observed_vclock_dwt,
+                                                counter32_at_edge,
+                                                ch3_at_edge,
+                                                &observed_phase_cycles)) {
+    return observed_vclock_dwt;
+  }
+
+  const uint32_t phase_cycles = g_pps_vclock_phase_lower_valid
+      ? g_pps_vclock_phase_lower_cycles
+      : observed_phase_cycles;
+  if (out_valid) *out_valid = true;
+  if (out_phase_cycles) *out_phase_cycles = phase_cycles;
+  return pps.dwt_at_edge + phase_cycles;
+}
+
 static int32_t pps_vclock_signed_delta_near(uint32_t from_dwt,
                                             uint32_t to_dwt) {
   const uint32_t u = (uint32_t)(to_dwt - from_dwt);
@@ -1983,18 +2052,14 @@ static pps_vclock_edge_authority_t pps_vclock_edge_authority_build(
   if (!prediction_valid) a.invalid_mask |= PPS_VCLOCK_EDGE_INVALID_NO_PREDICTION;
 
   if (pps_valid && observed_valid) {
-    pps_vclock_t observed_pvc{};
-    observed_pvc.sequence = sequence;
-    observed_pvc.dwt_at_edge = observed_dwt_at_edge;
-    observed_pvc.counter32_at_edge = counter32_at_edge;
-    observed_pvc.ch3_at_edge = ch3_at_edge;
-    a.observed_phase_cycles = pps_vclock_phase_cycles_from_edges(pps, observed_pvc);
-    a.observed_phase_valid = true;
-
-    if (!g_pps_vclock_phase_lower_valid ||
-        a.observed_phase_cycles < g_pps_vclock_phase_lower_cycles) {
-      g_pps_vclock_phase_lower_cycles = a.observed_phase_cycles;
-      g_pps_vclock_phase_lower_valid = true;
+    uint32_t observed_phase_cycles = 0;
+    if (pps_vclock_learn_phase_from_observation(pps,
+                                                 observed_dwt_at_edge,
+                                                 counter32_at_edge,
+                                                 ch3_at_edge,
+                                                 &observed_phase_cycles)) {
+      a.observed_phase_cycles = observed_phase_cycles;
+      a.observed_phase_valid = true;
     }
   }
 
@@ -2064,31 +2129,36 @@ static pps_vclock_edge_authority_t pps_vclock_edge_authority_build(
   }
 
   a.valid = (a.invalid_mask == PPS_VCLOCK_EDGE_INVALID_NONE);
-  const uint32_t least_late_candidate = candidate_count != 0
-      ? (uint32_t)(reference_dwt + min_delta)
-      : 0U;
 
-  if (a.valid) {
-    // Least-late lawful candidate wins.  This demotes observed lateness and
-    // QTimer lattice displacement to witness evidence while preserving a
-    // tight agreement gate against fantasy prediction.
-    a.authority_dwt_at_edge = least_late_candidate;
-    a.decision = PPS_VCLOCK_EDGE_DECISION_LOWER_LAWFUL;
-  } else {
-    g_pps_vclock_edge_authority_reject_count++;
-    // Even on an invalid row, keep the one-sided latency law visible in the
-    // coordinate: publish the least-late available candidate rather than
-    // blindly trusting a late observation or predictor.  The invalid_mask is
-    // the courtroom verdict that the row failed its proof.
-    a.authority_dwt_at_edge = least_late_candidate;
-    if (prediction_valid && a.authority_dwt_at_edge == predicted_dwt_at_edge) {
-      a.decision = PPS_VCLOCK_EDGE_DECISION_PREDICTION_FALLBACK;
-    } else if (pps_candidate_valid &&
-               a.authority_dwt_at_edge == a.pps_projected_vclock_dwt_at_edge) {
+  // Publication authority is now explicit: predicted_dwt_at_edge is the
+  // caller-selected publication coordinate.  In steady-state VCLOCK that is
+  // physical PPS GPIO DWT plus the learned PPS→VCLOCK lower-phase estimate.
+  // Observed VCLOCK and FloorLine/lower-envelope remain witnesses in the
+  // agreement court, but
+  // they no longer steal publication authority by being the least-late point.
+  if (prediction_valid) {
+    a.authority_dwt_at_edge = predicted_dwt_at_edge;
+    if (pps_candidate_valid &&
+        predicted_dwt_at_edge == a.pps_projected_vclock_dwt_at_edge) {
       a.decision = PPS_VCLOCK_EDGE_DECISION_PPS_PHASE_FALLBACK;
-    } else {
+    } else if (observed_valid && predicted_dwt_at_edge == observed_dwt_at_edge) {
       a.decision = PPS_VCLOCK_EDGE_DECISION_OBSERVED_FALLBACK;
+    } else {
+      a.decision = PPS_VCLOCK_EDGE_DECISION_PREDICTION_FALLBACK;
     }
+  } else if (pps_candidate_valid) {
+    a.authority_dwt_at_edge = a.pps_projected_vclock_dwt_at_edge;
+    a.decision = PPS_VCLOCK_EDGE_DECISION_PPS_PHASE_FALLBACK;
+  } else if (observed_valid) {
+    a.authority_dwt_at_edge = observed_dwt_at_edge;
+    a.decision = PPS_VCLOCK_EDGE_DECISION_OBSERVED_FALLBACK;
+  } else {
+    a.authority_dwt_at_edge = 0U;
+    a.decision = PPS_VCLOCK_EDGE_DECISION_NONE;
+  }
+
+  if (!a.valid) {
+    g_pps_vclock_edge_authority_reject_count++;
   }
   a.reject_count = g_pps_vclock_edge_authority_reject_count;
 
@@ -2129,10 +2199,28 @@ static void publish_vclock_domain_pps_vclock(const pps_t& pps,
                                              uint16_t ch3_at_edge,
                                              uint32_t observed_dwt_at_edge = 0) {
   const uint32_t observed_dwt = observed_dwt_at_edge ? observed_dwt_at_edge : dwt_at_edge;
+  bool phase_projection_valid = false;
+  uint32_t phase_cycles = 0;
+  const uint32_t pps_projected_dwt =
+      pps_projected_vclock_dwt_from_learned_phase(pps,
+                                                observed_dwt,
+                                                counter32_at_edge,
+                                                ch3_at_edge,
+                                                &phase_projection_valid,
+                                                &phase_cycles);
+  (void)phase_cycles;
+
+  // PPS_VCLOCK publication authority is now derived from the physical PPS
+  // witness plus the learned PPS->VCLOCK lower-phase estimate.  The observed
+  // VCLOCK edge remains courtroom evidence for phase/agreement diagnostics.
+  const uint32_t publication_dwt = phase_projection_valid
+      ? pps_projected_dwt
+      : dwt_at_edge;
+
   const pps_vclock_edge_authority_t authority =
       pps_vclock_edge_authority_build(pps,
                                       sequence,
-                                      dwt_at_edge,
+                                      publication_dwt,
                                       observed_dwt,
                                       counter32_at_edge,
                                       ch3_at_edge);
@@ -3296,10 +3384,9 @@ struct ocxo_lane_t {
   uint32_t yardstick_max_abs_inferred_minus_observed_cycles = 0;
   int64_t  yardstick_sum_inferred_minus_observed_cycles = 0;
 
-  // Stage 2 anchored authority rail (publishes dwt_at_event when
-  // OCXO_YARDSTICK_DWT_AUTHORITY_ENABLED).  Separate Q16 state from the free
+  // Anchored yardstick witness rail.  Separate Q16 state from the free
   // chain above: the free chain stays a pure physics audit; the anchored
-  // rail is the PI-corrected publication ledger.
+  // rail is the PI-corrected zero-worthiness / oven-drift witness.
   bool     yardstick_auth_valid = false;
   uint64_t yardstick_auth_endpoint_q16 = 0;
   uint64_t yardstick_auth_interval_q16 = 0;
@@ -3520,7 +3607,7 @@ static ocxo_runtime_context_t g_ocxo1_ctx = {
   "ocxo1",
   "QTIMER2_CH0_ISR_1KHZ_LADDER_PIN13",
   "QTIMER2_CH0_LOCAL_SYNTHETIC_COUNTER32",
-  "QTIMER2_CH0_YARDSTICK_AUTHORED_DWT",
+  "QTIMER2_CH0_LATENCY_ADJUSTED_OBSERVED_DWT",
   "OCXO1_FACT_DRAIN",
   &g_ocxo1_lane,
   &g_ocxo1_clock32,
@@ -3536,7 +3623,7 @@ static ocxo_runtime_context_t g_ocxo2_ctx = {
   "ocxo2",
   "QTIMER3_CH3_ISR_1KHZ_LADDER_PIN15",
   "QTIMER3_CH3_LOCAL_SYNTHETIC_COUNTER32_PIN15",
-  "QTIMER3_CH3_YARDSTICK_AUTHORED_DWT",
+  "QTIMER3_CH3_LATENCY_ADJUSTED_OBSERVED_DWT",
   "OCXO2_FACT_DRAIN",
   &g_ocxo2_lane,
   &g_ocxo2_clock32,
@@ -4924,6 +5011,11 @@ static constexpr uint32_t LOWER_ENV_WATCHDOG_SLOPE_MULTIPLIER = 2U;
 static constexpr uint32_t FLOORLINE_PUBLISH_SOURCE_OBSERVED  = 0U;
 static constexpr uint32_t FLOORLINE_PUBLISH_SOURCE_FLOORLINE = 1U;
 
+// FloorLine/lower-envelope remains a diagnostic rail only.  Keep the old
+// publication metadata populated for reports, but do not let it select or
+// block subscriber-facing DWT-at-edge publication.
+static constexpr bool DWT_PUBLICATION_FLOORLINE_AUTHORITY_ENABLED = false;
+
 static constexpr uint32_t FLOORLINE_REASON_ACCEPTED          = 0U;
 static constexpr uint32_t FLOORLINE_REASON_INIT              = 1U;
 static constexpr uint32_t FLOORLINE_REASON_SAMPLE_STARVED    = 2U;
@@ -4945,9 +5037,9 @@ static bool lower_env_within_gate(int32_t residual_cycles) {
 }
 
 // FloorLine lower-envelope inference remains always compiled as an ordinary
-// diagnostic rail.  Publication is intentionally selected at the call site
-// through tiny helper functions below; there is no conditional-assembly
-// authority mode and no per-lane authority statistics.
+// diagnostic rail.  Publication no longer selects FloorLine at the call site:
+// the rail stays available for comparison, reports, and possible future court
+// evidence, but not subscriber-facing DWT authority.
 
 struct lower_env_bucket_t {
   bool     valid = false;
@@ -5364,8 +5456,9 @@ static const char* lower_env_publish_reason_name(uint32_t reason) {
 
 
 // Raw observed bookend court.  This is deliberately separate from the final
-// DWT publication court: FloorLine/published may remain perfectly lawful while
-// the raw observed witness interval collapses to 0 or 1 cycles.  Capture the
+// DWT publication court: the diagnostic FloorLine candidate and published
+// observation-derived endpoint may remain perfectly lawful while the raw
+// observed witness interval collapses to 0 or 1 cycles.  Capture the
 // facts at the lower-envelope boundary, before previous_observed_edge_* is
 // overwritten, then publish the WATCHDOG_ANOMALY from the foreground one-second
 // handoff if the campaign continuity watchdog is armed.
@@ -6081,17 +6174,20 @@ static inline void copy_regression_diag(interrupt_capture_diag_t& diag,
 static inline void copy_floorline_interval_to_diag(
     dwt_repair_diag_t& diag,
     const cadence_regression_result_t& r) {
+  const bool floorline_authority =
+      DWT_PUBLICATION_FLOORLINE_AUTHORITY_ENABLED && r.publish_floorline;
+
   diag.interval_gate_valid = r.observed_interval_valid || r.inferred_interval_valid;
-  diag.interval_sample_accepted = r.publish_floorline;
-  diag.interval_sample_rejected = !r.publish_floorline;
+  diag.interval_sample_accepted = floorline_authority;
+  diag.interval_sample_rejected = !floorline_authority;
   diag.interval_observed_cycles = r.observed_interval_valid
       ? r.observed_interval_cycles
       : 0U;
   diag.interval_prediction_cycles = r.inferred_interval_valid
       ? r.inferred_interval_cycles
       : 0U;
-  diag.interval_effective_cycles = r.observed_interval_valid || r.inferred_interval_valid
-      ? (r.publish_floorline ? r.inferred_interval_cycles : r.observed_interval_cycles)
+  diag.interval_effective_cycles = r.observed_interval_valid
+      ? r.observed_interval_cycles
       : 0U;
   diag.interval_residual_cycles =
       (r.observed_interval_valid && r.inferred_interval_valid)
@@ -6100,26 +6196,33 @@ static inline void copy_floorline_interval_to_diag(
   diag.interval_gate_threshold_cycles = LOWER_ENV_ERROR_GATE_CYCLES;
   diag.interval_accept_count = r.sample_accepted_count;
   diag.interval_reject_count = r.sample_rejected_count;
-  // Retired predictor fields reused as compact FloorLine publication forensics.
+  // Retired predictor fields reused as compact FloorLine diagnostic forensics.
   diag.interval_resync_applied = r.fallback_used;
   diag.interval_resync_count = r.selected_bucket_count;
   diag.interval_reject_streak = r.publish_reason;
 }
 
 static inline uint32_t vclock_published_dwt_at_edge(
+    const pps_t& pps,
     uint32_t observed_dwt_at_edge,
-    const cadence_regression_result_t& floorline) {
-  return (floorline.publish_floorline && floorline.inferred_dwt_at_event)
-      ? floorline.inferred_dwt_at_event
-      : observed_dwt_at_edge;
+    uint32_t counter32_at_edge,
+    uint16_t ch3_at_edge,
+    bool* out_phase_valid = nullptr,
+    uint32_t* out_phase_cycles = nullptr) {
+  return pps_projected_vclock_dwt_from_learned_phase(pps,
+                                                   observed_dwt_at_edge,
+                                                   counter32_at_edge,
+                                                   ch3_at_edge,
+                                                   out_phase_valid,
+                                                   out_phase_cycles);
 }
 
 static inline uint32_t ocxo_published_dwt_at_edge(
     uint32_t observed_dwt_at_edge,
-    const cadence_regression_result_t& floorline) {
-  return (floorline.publish_floorline && floorline.inferred_dwt_at_event)
-      ? floorline.inferred_dwt_at_event
-      : observed_dwt_at_edge;
+    const cadence_regression_result_t&) {
+  // FloorLine remains populated for diagnostics, but OCXO publication is now
+  // the latency-adjusted observed edge.
+  return observed_dwt_at_edge;
 }
 
 // ============================================================================
@@ -6128,8 +6231,9 @@ static inline uint32_t ocxo_published_dwt_at_edge(
 //
 // This is the hard-fail courtroom immediately before subscriber publication.
 // It does not repair, resync, fall back, or choose a different endpoint.  The
-// publisher has already chosen observed vs FloorLine authority; this tribunal
-// asks whether that final fact is physically and semantically admissible.  A
+// publisher has already chosen its observation-derived endpoint; this tribunal
+// asks whether that final fact is physically and semantically admissible.
+// FloorLine fields remain diagnostic witnesses only.  A
 // nonzero verdict normally emits WATCHDOG_ANOMALY and the caller must not
 // publish. START launch-acquisition is the bounded exception: non-poisonous
 // transient/ruler verdicts may pass only to build pre-publication Alpha
@@ -6178,9 +6282,6 @@ static constexpr uint32_t DWT_PUBLICATION_SIDE_RAIL_DIAGNOSTIC_MASK =
 static constexpr uint32_t DWT_PUBLICATION_ALWAYS_BLOCK_MASK =
     DWT_PUBLICATION_VERDICT_ZERO_DWT |
     DWT_PUBLICATION_VERDICT_SOURCE_MISMATCH |
-    DWT_PUBLICATION_VERDICT_FLOORLINE_EDGE |
-    DWT_PUBLICATION_VERDICT_FLOORLINE_INTERVAL |
-    DWT_PUBLICATION_VERDICT_FLOORLINE_LATE |
     DWT_PUBLICATION_VERDICT_COUNTER_LOW16 |
     DWT_PUBLICATION_VERDICT_SERVICE_OFFSET |
     DWT_PUBLICATION_VERDICT_COUNTER_DELTA |
@@ -6218,6 +6319,7 @@ struct dwt_publication_request_t {
   uint32_t sequence = 0;
   uint32_t published_dwt = 0;
   uint32_t observed_dwt = 0;
+  uint32_t expected_published_dwt = 0;  // 0 => observed_dwt
   uint32_t target_counter32 = 0;
   uint16_t target_low16 = 0;
   bool     service_low16_valid = false;
@@ -6965,14 +7067,16 @@ static bool dwt_publication_adjudicate_or_watchdog(
   const bool floorline_candidate =
       floorline_valid && req.floorline->candidate_present &&
       req.floorline->inferred_dwt_at_event != 0U;
-  const bool floorline_published =
-      floorline_valid && req.floorline->publish_floorline &&
-      req.floorline->inferred_dwt_at_event != 0U;
+  // FloorLine is no longer a publication authority.  Keep its candidate
+  // geometry in the courtroom forensics, but the source-law expected endpoint
+  // comes from the caller's observation-derived authority: OCXO observed DWT,
+  // or VCLOCK physical PPS DWT plus learned PPS->VCLOCK lower-phase.
+  const bool floorline_published = false;
   const uint32_t floorline_dwt = floorline_candidate
       ? req.floorline->inferred_dwt_at_event
       : 0U;
-  const uint32_t expected_published_dwt = floorline_published
-      ? floorline_dwt
+  const uint32_t expected_published_dwt = req.expected_published_dwt
+      ? req.expected_published_dwt
       : req.observed_dwt;
 
   uint32_t verdict = DWT_PUBLICATION_VERDICT_OK;
@@ -6994,14 +7098,9 @@ static bool dwt_publication_adjudicate_or_watchdog(
         lower_env_signed_delta_u32(req.observed_dwt, floorline_dwt);
     diag.publication_floorline_minus_observed_cycles = fl_minus_observed;
 
-    if (fl_minus_observed > (int32_t)LOWER_ENV_ERROR_GATE_CYCLES) {
-      verdict |= DWT_PUBLICATION_VERDICT_FLOORLINE_LATE;
-    }
-    if (dwt_publication_abs_i32(fl_minus_observed) >
-        DWT_PUBLICATION_EDGE_GATE_CYCLES) {
-      verdict |= DWT_PUBLICATION_VERDICT_FLOORLINE_EDGE;
-    }
-
+    // FloorLine remains a diagnostic witness.  Its edge/interval deltas are
+    // copied into the publication diagnostics, but they no longer contribute
+    // verdict bits or block subscriber publication.
     if (req.floorline->observed_interval_valid &&
         req.floorline->inferred_interval_valid) {
       diag.publication_observed_interval_cycles =
@@ -7010,17 +7109,6 @@ static bool dwt_publication_adjudicate_or_watchdog(
           req.floorline->inferred_interval_cycles;
       diag.publication_floorline_interval_error_cycles =
           req.floorline->inferred_minus_observed_interval_cycles;
-      if (dwt_publication_abs_i32(
-              req.floorline->inferred_minus_observed_interval_cycles) >
-          LOWER_ENV_PUBLISH_HARD_INTERVAL_GATE_CYCLES) {
-        verdict |= DWT_PUBLICATION_VERDICT_FLOORLINE_INTERVAL;
-      }
-    }
-
-    if (!floorline_published &&
-        (req.floorline->publish_reason == FLOORLINE_REASON_EDGE_GATE ||
-         req.floorline->publish_reason == FLOORLINE_REASON_INTERVAL_GATE)) {
-      verdict |= DWT_PUBLICATION_VERDICT_FLOORLINE_EDGE;
     }
   }
 
@@ -7236,7 +7324,7 @@ static bool dwt_publication_adjudicate_or_watchdog(
   s->previous_valid = true;
   s->previous_published_dwt = req.published_dwt;
   s->previous_observed_dwt = req.observed_dwt;
-  s->previous_floorline_dwt = floorline_published ? floorline_dwt : req.observed_dwt;
+  s->previous_floorline_dwt = floorline_candidate ? floorline_dwt : req.observed_dwt;
   s->previous_counter32 = req.target_counter32;
   if (published_interval_valid) {
     s->last_interval_valid = true;
@@ -7532,9 +7620,9 @@ static constexpr const char* VCLOCK_FACT_DRAIN_NAME = "VCLOCK_FACT_DRAIN";
 
 // One authored VCLOCK cadence tooth can be an ordinary 1 kHz sample, or it can
 // be the one-second bookend.  Build this packet once per CH0 handoff and feed
-// the same event identity to FloorLine and to publication.  That prevents the
-// publication source decision (FloorLine vs observed) from silently switching
-// between adjacent 1 ms teeth.
+// the same event identity to FloorLine and to publication.  Publication is now
+// observation-derived, so FloorLine can be compared against the exact same
+// one-second tooth without silently switching between adjacent 1 ms teeth.
 struct vclock_one_second_bookend_t {
   bool     due = false;
   bool     ch2_owned = false;
@@ -7978,25 +8066,36 @@ static void vclock_apply_perishable_fact_deferred(
   }
 
   const uint32_t observed_dwt = fact.observed_dwt_at_event;
+  const pps_t witness_pps = fact.witness_pps_valid ? fact.witness_pps : pps_t{};
+  bool phase_projection_valid = false;
+  uint32_t phase_cycles = 0;
+  const uint32_t published_dwt =
+      vclock_published_dwt_at_edge(witness_pps,
+                                   observed_dwt,
+                                   fact.target_counter32,
+                                   fact.target_low16,
+                                   &phase_projection_valid,
+                                   &phase_cycles);
+  (void)phase_cycles;
+
   dwt_repair_diag_t dwt_diag{};
   dwt_publication_diag_begin(dwt_diag,
                              observed_dwt,
                              fact.isr_entry_dwt_raw,
-                             "vclock_floorline");
+                             phase_projection_valid
+                                 ? "vclock_pps_learned_phase"
+                                 : "vclock_observed_no_pps");
 
   cadence_regression_result_t lower_env{};
   (void)cadence_regression_latest_result(interrupt_subscriber_kind_t::VCLOCK,
                                          &lower_env);
   copy_floorline_interval_to_diag(dwt_diag, lower_env);
 
-  const uint32_t published_dwt =
-      vclock_published_dwt_at_edge(observed_dwt, lower_env);
-
   uint32_t coincidence_cycles = 0;
   bool coincidence_valid = false;
-  if (fact.witness_pps_valid && fact.witness_pps.sequence > 0) {
+  if (witness_pps.sequence > 0) {
     const int32_t cycles_since_pps =
-        (int32_t)(published_dwt - fact.witness_pps.dwt_at_edge);
+        (int32_t)(published_dwt - witness_pps.dwt_at_edge);
     if (llabs((long long)cycles_since_pps) <
         DWT_PPS_COINCIDENCE_THRESHOLD_CYCLES) {
       coincidence_cycles = (uint32_t)(cycles_since_pps >= 0
@@ -8010,9 +8109,9 @@ static void vclock_apply_perishable_fact_deferred(
                               published_dwt,
                               observed_dwt,
                               LOWER_ENV_PUBLISH_HARD_EDGE_GATE_CYCLES,
-                              lower_env.valid
-                                  ? "vclock_floorline"
-                                  : "vclock_floorline_init");
+                              phase_projection_valid
+                                  ? "vclock_pps_learned_phase"
+                                  : "vclock_observed_no_pps");
 
   if (!lower_env_raw_bookend_watchdog_if_pending(
           interrupt_subscriber_kind_t::VCLOCK,
@@ -8022,7 +8121,6 @@ static void vclock_apply_perishable_fact_deferred(
     return;
   }
 
-  const pps_t witness_pps = fact.witness_pps_valid ? fact.witness_pps : pps_t{};
   const uint32_t publication_sequence =
       (witness_pps.sequence != 0) ? witness_pps.sequence : fact.fallback_sequence;
   dwt_publication_request_t publication{};
@@ -8030,6 +8128,7 @@ static void vclock_apply_perishable_fact_deferred(
   publication.sequence = publication_sequence;
   publication.published_dwt = published_dwt;
   publication.observed_dwt = observed_dwt;
+  publication.expected_published_dwt = published_dwt;
   publication.target_counter32 = fact.target_counter32;
   publication.target_low16 = fact.target_low16;
   publication.service_low16_valid = true;
@@ -8661,42 +8760,51 @@ static void vclock_heartbeat_native_service(uint32_t isr_entry_dwt_raw,
           ? bookend.fallback_sequence
           : (g_pps_gpio_heartbeat.edge_count + 1U);
 
-      // PPS_VCLOCK / PPS coincidence diagnostic.
       uint32_t coincidence_cycles = 0;
       bool     coincidence_valid  = false;
-      {
-        const pps_vclock_t pvc = store_load_pvc();
-        if (pvc.sequence > 0) {
-          const int32_t cycles_since_pvc =
-              (int32_t)(observed_dwt - pvc.dwt_at_edge);
-          if (llabs((long long)cycles_since_pvc) <
-              DWT_PPS_COINCIDENCE_THRESHOLD_CYCLES) {
-            coincidence_cycles =
-                (uint32_t)(cycles_since_pvc >= 0 ? cycles_since_pvc
-                                                 : -cycles_since_pvc);
-            coincidence_valid = true;
-          }
-        }
-      }
-
       dwt_repair_diag_t dwt_diag{};
+      bool phase_projection_valid = false;
+      uint32_t phase_cycles = 0;
+      const uint32_t published_dwt =
+          vclock_published_dwt_at_edge(witness_pps_valid ? witness_pps : pps_t{},
+                                       observed_dwt,
+                                       target_counter32,
+                                       target_low16,
+                                       &phase_projection_valid,
+                                       &phase_cycles);
+      (void)phase_cycles;
+
       dwt_publication_diag_begin(dwt_diag,
                                  observed_dwt,
                                  bookend.due ? bookend.isr_entry_dwt_raw : 0U,
-                                 "vclock_floorline_fallback");
+                                 phase_projection_valid
+                                     ? "vclock_pps_learned_phase_fallback"
+                                     : "vclock_observed_no_pps_fallback");
       cadence_regression_result_t lower_env{};
       (void)cadence_regression_latest_result(interrupt_subscriber_kind_t::VCLOCK,
                                              &lower_env);
       copy_floorline_interval_to_diag(dwt_diag, lower_env);
-      const uint32_t published_dwt =
-          vclock_published_dwt_at_edge(observed_dwt, lower_env);
       dwt_publication_diag_choose(dwt_diag,
                                   published_dwt,
                                   observed_dwt,
                                   LOWER_ENV_PUBLISH_HARD_EDGE_GATE_CYCLES,
-                                  lower_env.valid
-                                      ? "vclock_floorline_fallback"
-                                      : "vclock_floorline_init_fallback");
+                                  phase_projection_valid
+                                      ? "vclock_pps_learned_phase_fallback"
+                                      : "vclock_observed_no_pps_fallback");
+
+      coincidence_cycles = 0;
+      coincidence_valid = false;
+      if (witness_pps_valid && witness_pps.sequence > 0) {
+        const int32_t cycles_since_pps =
+            (int32_t)(published_dwt - witness_pps.dwt_at_edge);
+        if (llabs((long long)cycles_since_pps) <
+            DWT_PPS_COINCIDENCE_THRESHOLD_CYCLES) {
+          coincidence_cycles = (uint32_t)(cycles_since_pps >= 0
+              ? cycles_since_pps
+              : -cycles_since_pps);
+          coincidence_valid = true;
+        }
+      }
       const uint32_t publication_sequence =
           (witness_pps_valid && witness_pps.sequence != 0)
               ? witness_pps.sequence
@@ -8706,6 +8814,7 @@ static void vclock_heartbeat_native_service(uint32_t isr_entry_dwt_raw,
       publication.sequence = publication_sequence;
       publication.published_dwt = published_dwt;
       publication.observed_dwt = observed_dwt;
+      publication.expected_published_dwt = published_dwt;
       publication.target_counter32 = target_counter32;
       publication.target_low16 = target_low16;
       publication.service_low16_valid = true;
@@ -9109,8 +9218,9 @@ static void ocxo_lane_counter_adjacency_note(ocxo_lane_t& lane,
 // ============================================================================
 //
 // PPS/Yardstick rail beside FloorLine.  This function no longer competes with
-// the retired predictor; it maintains the OCXO physics audit and zero-worthiness evidence while
-// FloorLine remains the published DWT-at-edge authority.
+// the retired predictor; it maintains the OCXO physics audit and zero-worthiness
+// evidence while the published OCXO DWT-at-edge remains the latency-adjusted
+// observed endpoint.
 //
 // Per event:
 //   1. Load the PPS yardstick pair (G_now, G_prev).  A non-advancing PPS
@@ -9703,7 +9813,7 @@ static void ocxo_apply_perishable_fact_deferred(
   dwt_publication_diag_begin(dwt_diag,
                              observed_dwt,
                              fact.isr_entry_dwt_raw,
-                             "ocxo_floorline");
+                             "ocxo_observed");
 
   // A skipped or duplicated one-second target is a custody discontinuity, not
   // an interval sample.  Preserve this useful lineage evidence outside the
@@ -9719,7 +9829,8 @@ static void ocxo_apply_perishable_fact_deferred(
                                    &dwt_diag);
 
   // PPS-Yardstick anchored rail remains as physics audit and zero-worthiness
-  // evidence.  FloorLine below is still the canonical published endpoint.
+  // evidence.  Publication below deliberately uses the latency-adjusted
+  // observed endpoint; FloorLine is diagnostic-only.
   const char* yardstick_reason = "ocxo_yardstick_init";
   const uint32_t yardstick_published_dwt = ocxo_lane_yardstick_observe(
       *lane, observed_dwt, counter_adjacency_valid, counter_delta_ticks,
@@ -9732,17 +9843,15 @@ static void ocxo_apply_perishable_fact_deferred(
   const uint32_t published_dwt =
       ocxo_published_dwt_at_edge(observed_dwt, lower_env);
 
-  // Truthful authority audit.  FloorLine is the canonical published
-  // endpoint; Yardstick and counter adjacency remain evidence only.
+  // Truthful authority audit.  OCXO publication is the latency-adjusted
+  // observed endpoint. FloorLine, yardstick, and counter adjacency remain
+  // evidence only.
   dwt_publication_diag_choose(dwt_diag,
                               published_dwt,
                               observed_dwt,
                               LOWER_ENV_PUBLISH_HARD_EDGE_GATE_CYCLES,
-                              lower_env.valid
-                                  ? "ocxo_floorline"
-                                  : (yardstick_reason ? yardstick_reason
-                                                      : "ocxo_floorline_init"));
-  dwt_diag.yardstick_authority = OCXO_YARDSTICK_DWT_AUTHORITY_ENABLED;
+                              "ocxo_observed");
+  dwt_diag.yardstick_authority = false;
 
   if (!lower_env_raw_bookend_watchdog_if_pending(
           ctx.kind,
@@ -9757,6 +9866,7 @@ static void ocxo_apply_perishable_fact_deferred(
   publication.sequence = fact.sequence;
   publication.published_dwt = published_dwt;
   publication.observed_dwt = observed_dwt;
+  publication.expected_published_dwt = observed_dwt;
   publication.target_counter32 = fact.target_counter32;
   publication.target_low16 = fact.target_low16;
   publication.service_low16_valid = true;
