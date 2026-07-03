@@ -55,6 +55,15 @@ static volatile uint32_t g_payload_last_string_pointer_fault_reason = 0;
 static volatile uint32_t g_payload_last_string_pointer_fault_ptr = 0;
 static char g_payload_last_string_pointer_fault_context[32] = {0};
 
+// Caller breadcrumb for BAD_STRING_POINTER.  The pointer court knows the bad
+// value pointer and context, but that is not enough to find the offending
+// report field when hundreds of p.add(key, value) calls are in flight.  Keep
+// a best-effort copy of the key that was being populated when the bad string
+// value was rejected.  This is diagnostic only; Payload still substitutes a
+// safe sentinel and keeps running.
+static volatile uint32_t g_payload_last_string_pointer_fault_key_ptr = 0;
+static char g_payload_last_string_pointer_fault_key[64] = {0};
+
 // Payload object integrity courtroom.  _self_ok() is deliberately the most
 // expensive guard in the class: when it rejects a Payload, record the exact
 // invariant that failed and a compact snapshot of the object/entry state.
@@ -271,6 +280,15 @@ static void payload_note_string_pointer_fault(uint32_t reason,
     payload_copy_trusted_label(g_payload_last_string_pointer_fault_context,
                                sizeof(g_payload_last_string_pointer_fault_context),
                                context ? context : "string");
+
+    // Most pointer faults occur below helpers that do not know the semantic
+    // Payload key.  Clear the key breadcrumb here so stale field names do not
+    // survive generic faults.  Callers that do know the key can fill it in
+    // immediately after the pointer court rejects the value.
+    g_payload_last_string_pointer_fault_key_ptr = 0;
+    payload_copy_trusted_label(g_payload_last_string_pointer_fault_key,
+                               sizeof(g_payload_last_string_pointer_fault_key),
+                               "");
 }
 
 struct payload_readable_range_t {
@@ -323,6 +341,45 @@ static bool payload_pointer_remaining(const void* ptr,
 
     if (out_reason) *out_reason = PAYLOAD_STRING_FAULT_OUT_OF_RANGE;
     return false;
+}
+
+static void payload_note_last_string_pointer_fault_key(const char* key) {
+    g_payload_last_string_pointer_fault_key_ptr = (uint32_t)(uintptr_t)key;
+
+    if (!key) {
+        payload_copy_trusted_label(g_payload_last_string_pointer_fault_key,
+                                   sizeof(g_payload_last_string_pointer_fault_key),
+                                   "");
+        return;
+    }
+
+    size_t remaining = 0;
+    uint32_t reason = PAYLOAD_STRING_FAULT_NONE;
+    if (!payload_pointer_remaining(key, &remaining, &reason)) {
+        (void)reason;
+        payload_copy_trusted_label(g_payload_last_string_pointer_fault_key,
+                                   sizeof(g_payload_last_string_pointer_fault_key),
+                                   "!bad_key_pointer");
+        return;
+    }
+
+    const size_t cap = sizeof(g_payload_last_string_pointer_fault_key);
+    size_t limit = remaining;
+    if (limit > cap - 1U) limit = cap - 1U;
+
+    size_t i = 0;
+    while (i < limit && key[i] != '\0') {
+        g_payload_last_string_pointer_fault_key[i] = key[i];
+        i++;
+    }
+
+    if (i < limit && key[i] == '\0') {
+        g_payload_last_string_pointer_fault_key[i] = '\0';
+    } else {
+        payload_copy_trusted_label(g_payload_last_string_pointer_fault_key,
+                                   sizeof(g_payload_last_string_pointer_fault_key),
+                                   "!bad_key_unterminated");
+    }
 }
 
 static bool payload_memory_readable(const void* ptr,
@@ -1297,6 +1354,7 @@ void Payload::add(const char* key, const char* value) {
     bool ok = true;
     value = payload_cstr_or_empty(value, ARENA_MAX, "add.value", &n, &ok);
     if (!ok) {
+        payload_note_last_string_pointer_fault_key(key);
         payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER, "add_value", this);
     }
     _add_entry(key, value, n, 'p');
@@ -1360,6 +1418,7 @@ void Payload::add_fmt(const char* key, const char* fmt, ...) {
     fmt = payload_cstr_or_empty(fmt, 96U, "add_fmt.fmt", &fmt_len, &fmt_ok);
     (void)fmt_len;
     if (!fmt_ok) {
+        payload_note_last_string_pointer_fault_key(key);
         payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER, "add_fmt_fmt", this);
     }
 
@@ -2350,6 +2409,11 @@ void payload_get_info(payload_info_t* out)
     payload_copy_trusted_label(out->last_string_pointer_fault_context,
                                sizeof(out->last_string_pointer_fault_context),
                                g_payload_last_string_pointer_fault_context);
+    out->last_string_pointer_fault_key_ptr =
+        g_payload_last_string_pointer_fault_key_ptr;
+    payload_copy_trusted_label(out->last_string_pointer_fault_key,
+                               sizeof(out->last_string_pointer_fault_key),
+                               g_payload_last_string_pointer_fault_key);
 
     out->self_ok_fail = g_payload_self_ok_fail;
     out->self_ok_magic_bad = g_payload_self_ok_magic_bad;

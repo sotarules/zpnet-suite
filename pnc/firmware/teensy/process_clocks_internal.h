@@ -808,6 +808,57 @@ bool clocks_alpha_ocxo_public_origin_ready(void);
 void clocks_alpha_recover_reprime_ocxo_state(void);
 uint32_t clocks_alpha_recover_reprime_count(void);
 
+// Compact recovery reattachment proof.  RECOVER deliberately cuts OCXO
+// measurement custody; Beta must not resume public TIMEBASE publication until
+// Alpha has observed fresh post-recovery OCXO edge/forensic/projection evidence
+// for both lanes.  This surface is report/control-plane evidence only.
+struct clocks_alpha_recover_reattach_snapshot_t {
+  bool     ready = false;
+  uint32_t clock_id = 0;
+  uint32_t reprime_count = 0;
+
+  bool     forensics_ready = false;
+  bool     forensics_valid = false;
+  uint32_t forensics_update_count = 0;
+  uint32_t forensics_last_event_dwt = 0;
+  uint32_t forensics_last_event_counter32 = 0;
+  uint32_t forensics_dwt_used_at_event = 0;
+  uint32_t forensics_floorline_dwt_at_event = 0;
+  uint32_t forensics_floorline_sample_count = 0;
+
+  bool     edge_history_ready = false;
+  bool     edge_history_current_valid = false;
+  bool     edge_history_previous_valid = false;
+  uint32_t edge_history_update_count = 0;
+
+  bool     projection_ready = false;
+  bool     projection_available = false;
+  bool     projection_valid = false;
+  uint32_t projection_update_count = 0;
+  uint32_t projection_compute_count = 0;
+  uint32_t projection_source = 0;
+  uint32_t projection_pps_sequence = 0;
+  uint64_t projection_pps_vclock_ns = 0;
+  uint64_t projection_projected_ocxo_ns_at_pps = 0;
+  uint32_t projection_interval_dwt_cycles = 0;
+
+  bool     pps_vclock_match = false;
+  uint64_t expected_pps_vclock_ns = 0;
+
+  bool     public_ns_nonzero = false;
+  bool     physical_ns_nonzero = false;
+  uint64_t current_public_ns = 0;
+  uint64_t current_physical_ns = 0;
+
+  uint32_t static_prediction_completed_interval_count = 0;
+  bool     static_prediction_valid = false;
+};
+
+bool clocks_alpha_ocxo_recover_reattach_snapshot(
+    time_clock_id_t clock,
+    clocks_alpha_recover_reattach_snapshot_t* out);
+bool clocks_alpha_recover_ocxo_reattach_ready(void);
+
 // ============================================================================
 // Alpha OCXO PPS-edge projection forensics
 // ============================================================================

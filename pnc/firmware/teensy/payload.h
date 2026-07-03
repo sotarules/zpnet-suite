@@ -110,6 +110,8 @@ typedef struct {
   uint32_t last_string_pointer_fault_reason;
   uint32_t last_string_pointer_fault_ptr;
   char     last_string_pointer_fault_context[32];
+  uint32_t last_string_pointer_fault_key_ptr;
+  char     last_string_pointer_fault_key[64];
 
   // Payload object integrity courtroom
   uint32_t self_ok_fail;

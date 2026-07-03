@@ -4983,6 +4983,108 @@ uint32_t clocks_alpha_recover_reprime_count(void) {
   return g_alpha_recover_reprime_count;
 }
 
+static bool alpha_recover_floorline_forensics_ready(
+    const alpha_lane_forensics_store_t* f) {
+  return f &&
+         f->valid &&
+         f->update_count != 0U &&
+         f->dwt_used_at_event != 0U &&
+         f->regression_inferred_dwt_at_event != 0U &&
+         f->regression_observed_dwt_at_event != 0U &&
+         f->regression_sample_count != 0U;
+}
+
+bool clocks_alpha_ocxo_recover_reattach_snapshot(
+    time_clock_id_t clock,
+    clocks_alpha_recover_reattach_snapshot_t* out) {
+  if (!out) return false;
+  *out = clocks_alpha_recover_reattach_snapshot_t{};
+
+  if (clock != time_clock_id_t::OCXO1 &&
+      clock != time_clock_id_t::OCXO2) {
+    return false;
+  }
+
+  clocks_alpha_recover_reattach_snapshot_t local{};
+  local.clock_id = (uint32_t)((uint8_t)clock);
+  local.reprime_count = g_alpha_recover_reprime_count;
+
+  const alpha_lane_forensics_store_t* f = alpha_forensics_store(clock);
+  local.forensics_valid = f && f->valid;
+  local.forensics_update_count = f ? f->update_count : 0U;
+  local.forensics_last_event_dwt = f ? f->last_event_dwt : 0U;
+  local.forensics_last_event_counter32 = f ? f->last_event_counter32 : 0U;
+  local.forensics_dwt_used_at_event = f ? f->dwt_used_at_event : 0U;
+  local.forensics_floorline_dwt_at_event =
+      f ? f->regression_inferred_dwt_at_event : 0U;
+  local.forensics_floorline_sample_count =
+      f ? f->regression_sample_count : 0U;
+  local.forensics_ready = alpha_recover_floorline_forensics_ready(f);
+
+  const alpha_ocxo_edge_history_t* h = alpha_ocxo_edge_history(clock);
+  local.edge_history_current_valid = h && h->current_valid;
+  local.edge_history_previous_valid = h && h->previous_valid;
+  local.edge_history_update_count = h ? h->update_count : 0U;
+  local.edge_history_ready = h && h->current_valid && h->update_count != 0U;
+
+  clocks_alpha_ocxo_pps_projection_snapshot_t proj{};
+  const bool projection_valid =
+      clocks_alpha_ocxo_pps_projection_snapshot(clock, &proj);
+  local.projection_valid = projection_valid;
+  local.projection_available = proj.update_count != 0U;
+  local.projection_update_count = proj.update_count;
+  local.projection_compute_count = proj.compute_count;
+  local.projection_source = proj.source;
+  local.projection_pps_sequence = proj.pps_sequence;
+  local.projection_pps_vclock_ns = proj.pps_vclock_ns;
+  local.projection_projected_ocxo_ns_at_pps =
+      proj.projected_ocxo_ns_at_pps;
+  local.projection_interval_dwt_cycles = proj.interval_dwt_cycles;
+
+  local.expected_pps_vclock_ns = g_gnss_ns_at_pps_vclock;
+  local.pps_vclock_match =
+      projection_valid &&
+      local.expected_pps_vclock_ns != 0ULL &&
+      proj.pps_vclock_ns == local.expected_pps_vclock_ns;
+  local.projection_ready =
+      projection_valid &&
+      local.pps_vclock_match &&
+      proj.projected_ocxo_ns_at_pps != 0ULL &&
+      proj.interval_dwt_cycles != 0U;
+
+  const alpha_static_prediction_store_t* sp = alpha_static_prediction_store(clock);
+  local.static_prediction_completed_interval_count =
+      sp ? sp->completed_interval_count : 0U;
+  local.static_prediction_valid = sp && sp->valid;
+
+  if (clock == time_clock_id_t::OCXO1) {
+    local.current_public_ns = g_ocxo1_measured_gnss_ns_at_pps_vclock;
+    local.current_physical_ns = g_ocxo1_physical_measured_gnss_ns_at_pps_vclock;
+  } else {
+    local.current_public_ns = g_ocxo2_measured_gnss_ns_at_pps_vclock;
+    local.current_physical_ns = g_ocxo2_physical_measured_gnss_ns_at_pps_vclock;
+  }
+  local.public_ns_nonzero = local.current_public_ns != 0ULL;
+  local.physical_ns_nonzero = local.current_physical_ns != 0ULL;
+
+  local.ready =
+      local.forensics_ready &&
+      local.edge_history_ready &&
+      local.projection_ready &&
+      local.public_ns_nonzero;
+
+  *out = local;
+  return true;
+}
+
+bool clocks_alpha_recover_ocxo_reattach_ready(void) {
+  clocks_alpha_recover_reattach_snapshot_t ocxo1{};
+  clocks_alpha_recover_reattach_snapshot_t ocxo2{};
+  return clocks_alpha_ocxo_recover_reattach_snapshot(time_clock_id_t::OCXO1, &ocxo1) &&
+         clocks_alpha_ocxo_recover_reattach_snapshot(time_clock_id_t::OCXO2, &ocxo2) &&
+         ocxo1.ready && ocxo2.ready;
+}
+
 static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
   const bool saved_dwt_calibration_valid = g_dwt_calibration_valid;
   const uint32_t saved_dwt_cycles_per_second = g_dwt_cycles_between_pps_vclock;

@@ -862,6 +862,10 @@ static Payload cmd_payload_info(const Payload& /*args*/) {
             (unsigned long)info.last_string_pointer_fault_ptr);
   p.add("payload_last_string_pointer_fault_context",
         info.last_string_pointer_fault_context);
+  p.add_fmt("payload_last_string_pointer_fault_key_ptr", "0x%08lX",
+            (unsigned long)info.last_string_pointer_fault_key_ptr);
+  p.add("payload_last_string_pointer_fault_key",
+        info.last_string_pointer_fault_key);
 
   // ==========================================================
   // Payload object integrity courtroom

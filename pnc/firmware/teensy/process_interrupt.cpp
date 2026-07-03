@@ -5045,6 +5045,33 @@ struct lower_env_lane_t {
 
   bool     previous_observed_edge_valid = false;
   uint32_t previous_observed_edge_dwt = 0;
+  uint32_t previous_observed_edge_target_counter32 = 0;
+  uint16_t previous_observed_edge_target_hw16 = 0;
+  uint16_t previous_observed_edge_observed_hw16 = 0;
+
+  // Raw observed bookend courtroom.  These fields capture the exact facts
+  // before previous_observed_edge_* is overwritten, then the foreground
+  // one-second handoff emits WATCHDOG_ANOMALY if the campaign ledger is armed.
+  bool     raw_bookend_anomaly_pending = false;
+  uint32_t raw_bookend_anomaly_count = 0;
+  uint32_t raw_bookend_anomaly_report_count = 0;
+  uint32_t raw_bookend_anomaly_sequence = 0;
+  uint32_t raw_bookend_anomaly_reason = 0;
+  uint32_t raw_bookend_anomaly_source = 0;
+  uint32_t raw_bookend_anomaly_observed_interval_cycles = 0;
+  uint32_t raw_bookend_anomaly_reference_cycles = 0;
+  uint32_t raw_bookend_anomaly_previous_observed_dwt = 0;
+  uint32_t raw_bookend_anomaly_current_observed_dwt = 0;
+  uint32_t raw_bookend_anomaly_previous_target_counter32 = 0;
+  uint32_t raw_bookend_anomaly_current_target_counter32 = 0;
+  uint16_t raw_bookend_anomaly_previous_target_hw16 = 0;
+  uint16_t raw_bookend_anomaly_previous_observed_hw16 = 0;
+  uint16_t raw_bookend_anomaly_current_target_hw16 = 0;
+  uint16_t raw_bookend_anomaly_current_observed_hw16 = 0;
+  uint32_t raw_bookend_anomaly_update_count = 0;
+  uint32_t raw_bookend_anomaly_invalid_window_count = 0;
+  uint32_t raw_bookend_anomaly_fallback_publish_count = 0;
+
   bool     previous_inferred_edge_valid = false;
   uint32_t previous_inferred_edge_dwt = 0;
   bool     previous_slope_valid = false;
@@ -5335,6 +5362,259 @@ static const char* lower_env_publish_reason_name(uint32_t reason) {
   }
 }
 
+
+// Raw observed bookend court.  This is deliberately separate from the final
+// DWT publication court: FloorLine/published may remain perfectly lawful while
+// the raw observed witness interval collapses to 0 or 1 cycles.  Capture the
+// facts at the lower-envelope boundary, before previous_observed_edge_* is
+// overwritten, then publish the WATCHDOG_ANOMALY from the foreground one-second
+// handoff if the campaign continuity watchdog is armed.
+static constexpr uint32_t LOWER_ENV_RAW_BOOKEND_REASON_NONE = 0;
+static constexpr uint32_t LOWER_ENV_RAW_BOOKEND_REASON_ZERO = 1;
+static constexpr uint32_t LOWER_ENV_RAW_BOOKEND_REASON_ONE_CYCLE = 2;
+static constexpr uint32_t LOWER_ENV_RAW_BOOKEND_SOURCE_UNKNOWN = 0;
+static constexpr uint32_t LOWER_ENV_RAW_BOOKEND_SOURCE_INVALID_WINDOW = 1;
+static constexpr uint32_t LOWER_ENV_RAW_BOOKEND_SOURCE_SEALED_WINDOW = 2;
+static constexpr uint32_t LOWER_ENV_RAW_BOOKEND_FATAL_MAX_CYCLES = 1U;
+
+static const char* lower_env_raw_bookend_reason_name(uint32_t reason) {
+  switch (reason) {
+    case LOWER_ENV_RAW_BOOKEND_REASON_ZERO:
+      return "raw_observed_interval_zero_cycles";
+    case LOWER_ENV_RAW_BOOKEND_REASON_ONE_CYCLE:
+      return "raw_observed_interval_one_cycle";
+    default:
+      return "raw_observed_interval_unknown";
+  }
+}
+
+static const char* lower_env_raw_bookend_source_name(uint32_t source) {
+  switch (source) {
+    case LOWER_ENV_RAW_BOOKEND_SOURCE_INVALID_WINDOW:
+      return "invalid_window";
+    case LOWER_ENV_RAW_BOOKEND_SOURCE_SEALED_WINDOW:
+      return "sealed_window";
+    default:
+      return "unknown";
+  }
+}
+
+static void lower_env_note_raw_bookend_anomaly(
+    lower_env_lane_t& lane,
+    const cadence_regression_result_t& r,
+    uint32_t source) {
+  if (!r.observed_interval_valid) return;
+  if (r.observed_interval_cycles > LOWER_ENV_RAW_BOOKEND_FATAL_MAX_CYCLES) {
+    return;
+  }
+
+  lane.raw_bookend_anomaly_pending = true;
+  if (lane.raw_bookend_anomaly_count != UINT32_MAX) {
+    lane.raw_bookend_anomaly_count++;
+  }
+  lane.raw_bookend_anomaly_sequence = r.sequence;
+  lane.raw_bookend_anomaly_reason = (r.observed_interval_cycles == 0U)
+      ? LOWER_ENV_RAW_BOOKEND_REASON_ZERO
+      : LOWER_ENV_RAW_BOOKEND_REASON_ONE_CYCLE;
+  lane.raw_bookend_anomaly_source = source;
+  lane.raw_bookend_anomaly_observed_interval_cycles = r.observed_interval_cycles;
+  lane.raw_bookend_anomaly_reference_cycles = interrupt_vclock_cycles_per_second();
+  if (lane.raw_bookend_anomaly_reference_cycles == 0U) {
+    lane.raw_bookend_anomaly_reference_cycles = (uint32_t)DWT_EXPECTED_PER_PPS;
+  }
+  lane.raw_bookend_anomaly_previous_observed_dwt =
+      lane.previous_observed_edge_dwt;
+  lane.raw_bookend_anomaly_current_observed_dwt = r.observed_dwt_at_event;
+  lane.raw_bookend_anomaly_previous_target_counter32 =
+      lane.previous_observed_edge_target_counter32;
+  lane.raw_bookend_anomaly_current_target_counter32 =
+      r.target_counter32_at_event;
+  lane.raw_bookend_anomaly_previous_target_hw16 =
+      lane.previous_observed_edge_target_hw16;
+  lane.raw_bookend_anomaly_previous_observed_hw16 =
+      lane.previous_observed_edge_observed_hw16;
+  lane.raw_bookend_anomaly_current_target_hw16 =
+      r.target_hardware16_at_event;
+  lane.raw_bookend_anomaly_current_observed_hw16 =
+      r.observed_hardware16_at_event;
+  lane.raw_bookend_anomaly_update_count = lane.update_count;
+  lane.raw_bookend_anomaly_invalid_window_count = lane.invalid_window_count;
+  lane.raw_bookend_anomaly_fallback_publish_count = lane.fallback_publish_count;
+}
+
+static bool lower_env_raw_bookend_watchdog_if_pending(
+    interrupt_subscriber_kind_t kind,
+    const cadence_regression_result_t& r,
+    const dwt_repair_diag_t& diag,
+    const char* handoff_phase) {
+  lower_env_lane_t* lane = lower_env_lane_for(kind);
+  if (!lane || !lane->raw_bookend_anomaly_pending) return true;
+  if (lane->raw_bookend_anomaly_sequence != r.sequence) return true;
+
+  if (!clocks_watchdog_campaign_armed()) {
+    // Pre-campaign/start-prologue raw witness discontinuities are diagnostics;
+    // do not let a stale pending record fire after the campaign later arms.
+    lane->raw_bookend_anomaly_pending = false;
+    return true;
+  }
+
+  if (lane->raw_bookend_anomaly_report_count != UINT32_MAX) {
+    lane->raw_bookend_anomaly_report_count++;
+  }
+  lane->raw_bookend_anomaly_pending = false;
+  lane->watchdog_anomaly_count++;
+  lane->last_watchdog_reason = lane->raw_bookend_anomaly_reason;
+
+  const char* reason =
+      lower_env_raw_bookend_reason_name(lane->raw_bookend_anomaly_reason);
+  const uint32_t observed_interval =
+      lane->raw_bookend_anomaly_observed_interval_cycles;
+  const uint32_t reference_cycles =
+      lane->raw_bookend_anomaly_reference_cycles;
+
+  Payload root;
+  root.add("schema", "WATCHDOG_ANOMALY_INTERRUPT_RAW_BOOKEND_V1");
+  root.add("reason", reason);
+  root.add("source_process", "INTERRUPT");
+  root.add("source_report", "LOWER_ENV_RAW_BOOKEND_COURT");
+  root.add("summary", "raw observed lower-envelope bookend interval collapsed before subscriber publication");
+  root.add("kind", interrupt_subscriber_kind_str(kind));
+  root.add("lane", lane->name ? lane->name : "");
+  root.add("handoff_phase", handoff_phase ? handoff_phase : "unknown");
+  root.add("lower_env_source", lower_env_raw_bookend_source_name(
+                                lane->raw_bookend_anomaly_source));
+  root.add("campaign_armed", true);
+  root.add("watchdog_dwt", (uint32_t)ARM_DWT_CYCCNT);
+  root.add("ipsr", interrupt_ipsr());
+  root.add("primask", interrupt_primask());
+
+  Payload interval;
+  interval.add("observed_interval_cycles", observed_interval);
+  interval.add("reference_cycles", reference_cycles);
+  interval.add("fatal_max_cycles", LOWER_ENV_RAW_BOOKEND_FATAL_MAX_CYCLES);
+  interval.add("observed_minus_reference_cycles",
+               (int32_t)((int64_t)(uint64_t)observed_interval -
+                         (int64_t)(uint64_t)reference_cycles));
+  interval.add("previous_observed_edge_dwt",
+               lane->raw_bookend_anomaly_previous_observed_dwt);
+  interval.add("current_observed_edge_dwt",
+               lane->raw_bookend_anomaly_current_observed_dwt);
+  interval.add("current_minus_previous_observed_cycles",
+               (int32_t)(lane->raw_bookend_anomaly_current_observed_dwt -
+                         lane->raw_bookend_anomaly_previous_observed_dwt));
+  root.add_object("raw_observed_interval", interval);
+
+  Payload counter;
+  counter.add("previous_target_counter32",
+              lane->raw_bookend_anomaly_previous_target_counter32);
+  counter.add("current_target_counter32",
+              lane->raw_bookend_anomaly_current_target_counter32);
+  counter.add("target_counter_delta_ticks",
+              lane->raw_bookend_anomaly_current_target_counter32 -
+              lane->raw_bookend_anomaly_previous_target_counter32);
+  counter.add("expected_one_second_delta_ticks",
+              (uint32_t)VCLOCK_COUNTS_PER_SECOND);
+  counter.add("previous_target_low16",
+              (uint32_t)lane->raw_bookend_anomaly_previous_target_hw16);
+  counter.add("previous_observed_low16",
+              (uint32_t)lane->raw_bookend_anomaly_previous_observed_hw16);
+  counter.add("current_target_low16",
+              (uint32_t)lane->raw_bookend_anomaly_current_target_hw16);
+  counter.add("current_observed_low16",
+              (uint32_t)lane->raw_bookend_anomaly_current_observed_hw16);
+  counter.add("previous_observed_minus_target_ticks",
+              (uint32_t)((uint16_t)(
+                  lane->raw_bookend_anomaly_previous_observed_hw16 -
+                  lane->raw_bookend_anomaly_previous_target_hw16)));
+  counter.add("current_observed_minus_target_ticks",
+              (uint32_t)((uint16_t)(
+                  lane->raw_bookend_anomaly_current_observed_hw16 -
+                  lane->raw_bookend_anomaly_current_target_hw16)));
+  root.add_object("counter_lineage", counter);
+
+  Payload floorline;
+  floorline.add("valid", r.valid);
+  floorline.add("sequence", r.sequence);
+  floorline.add("candidate_present", r.candidate_present);
+  floorline.add("publish_floorline", r.publish_floorline);
+  floorline.add("fallback_used", r.fallback_used);
+  floorline.add("publish_source", lower_env_publish_source_name(r.publish_source));
+  floorline.add("publish_reason", lower_env_publish_reason_name(r.publish_reason));
+  floorline.add("confidence_ppm", r.confidence_ppm);
+  floorline.add("sample_count", r.sample_count);
+  floorline.add("selected_bucket_count", r.selected_bucket_count);
+  floorline.add("sample_accepted_count", r.sample_accepted_count);
+  floorline.add("sample_rejected_count", r.sample_rejected_count);
+  floorline.add("sample_hard_rejected_count", r.sample_hard_rejected_count);
+  floorline.add("observed_edge_dwt", r.observed_dwt_at_event);
+  floorline.add("inferred_edge_dwt", r.inferred_dwt_at_event);
+  floorline.add("inferred_minus_observed_edge_cycles",
+                r.inferred_minus_observed_cycles);
+  floorline.add("inferred_interval_valid", r.inferred_interval_valid);
+  floorline.add("inferred_interval_cycles", r.inferred_interval_cycles);
+  floorline.add("inferred_minus_observed_interval_cycles",
+                r.inferred_minus_observed_interval_cycles);
+  floorline.add("slope_q16_cycles_per_sample", r.slope_q16_cycles_per_sample);
+  floorline.add("slope_delta_q16_cycles_per_sample",
+                r.slope_delta_q16_cycles_per_sample);
+  floorline.add("candidate_interval_error_cycles",
+                r.candidate_interval_error_cycles);
+  floorline.add("residual_min_cycles", r.residual_min_cycles);
+  floorline.add("residual_max_cycles", r.residual_max_cycles);
+  floorline.add("residual_abs_gt4_count", r.residual_abs_gt4_count);
+  floorline.add("residual_abs_gt16_count", r.residual_abs_gt16_count);
+  floorline.add("residual_abs_gt32_count", r.residual_abs_gt32_count);
+  floorline.add("residual_abs_gt64_count", r.residual_abs_gt64_count);
+  floorline.add("residual_abs_gt128_count", r.residual_abs_gt128_count);
+  root.add_object("floorline", floorline);
+
+  Payload published;
+  published.add("published_dwt", diag.used_dwt);
+  published.add("observed_dwt", diag.original_dwt);
+  published.add("published_minus_observed_cycles", diag.error_cycles);
+  published.add("synthetic", diag.synthetic);
+  published.add("repair_candidate", diag.candidate);
+  published.add("repair_reason", diag.reason ? diag.reason : "");
+  published.add("isr_entry_dwt_raw", diag.isr_entry_dwt_raw);
+  published.add("event_dwt_from_isr_entry_raw",
+                diag.event_dwt_from_isr_entry_raw);
+  published.add("isr_entry_to_event_correction_cycles",
+                diag.isr_entry_to_event_correction_cycles);
+  root.add_object("published_edge", published);
+
+  Payload state;
+  state.add("active_valid", lane->active_valid);
+  state.add("active_base_dwt", lane->active_base_dwt);
+  state.add("active_sample_count", lane->active_sample_count);
+  state.add("active_bucket_count", lane->active_bucket_count);
+  state.add("active_sample_accepted_count", lane->active_sample_accepted_count);
+  state.add("active_sample_rejected_count", lane->active_sample_rejected_count);
+  state.add("active_sample_hard_rejected_count", lane->active_sample_hard_rejected_count);
+  state.add("previous_inferred_edge_valid", lane->previous_inferred_edge_valid);
+  state.add("previous_inferred_edge_dwt", lane->previous_inferred_edge_dwt);
+  state.add("previous_slope_valid", lane->previous_slope_valid);
+  state.add("previous_slope_q16_cycles_per_sample",
+            lane->previous_slope_q16_cycles_per_sample);
+  state.add("raw_bookend_anomaly_count", lane->raw_bookend_anomaly_count);
+  state.add("raw_bookend_anomaly_report_count",
+            lane->raw_bookend_anomaly_report_count);
+  state.add("floorline_valid_estimate_count", lane->floorline_valid_estimate_count);
+  state.add("fallback_publish_count", lane->fallback_publish_count);
+  state.add("invalid_window_count", lane->invalid_window_count);
+  state.add("overflow_reset_count", lane->overflow_reset_count);
+  state.add("reset_count", lane->reset_count);
+  state.add("update_count", lane->update_count);
+  root.add_object("lane_state", state);
+
+  clocks_watchdog_anomaly_payload("lower_env_raw_bookend_anomaly",
+                                  root,
+                                  (uint32_t)kind,
+                                  observed_interval,
+                                  lane->raw_bookend_anomaly_current_observed_dwt,
+                                  lane->raw_bookend_anomaly_current_target_counter32);
+  return false;
+}
+
 static void lower_env_decide_publication(cadence_regression_result_t& r) {
   r.publish_source = FLOORLINE_PUBLISH_SOURCE_OBSERVED;
   r.publish_reason = FLOORLINE_REASON_INIT;
@@ -5433,9 +5713,14 @@ static void lower_env_publish_invalid_window(lower_env_lane_t& lane,
       : 0U;
   r.inferred_minus_observed_interval_cycles = 0;
   lower_env_copy_residual_forensics(r, lane);
+  lower_env_note_raw_bookend_anomaly(
+      lane, r, LOWER_ENV_RAW_BOOKEND_SOURCE_INVALID_WINDOW);
 
   lane.previous_observed_edge_dwt = observed_dwt;
   lane.previous_observed_edge_valid = true;
+  lane.previous_observed_edge_target_counter32 = target_counter32;
+  lane.previous_observed_edge_target_hw16 = target_hw16;
+  lane.previous_observed_edge_observed_hw16 = observed_hw16;
   lane.previous_inferred_edge_dwt = observed_dwt;
   lane.previous_inferred_edge_valid = true;
   lane.previous_slope_q16_cycles_per_sample =
@@ -5651,9 +5936,14 @@ static void lower_env_seal(lower_env_lane_t& lane,
   r.sample_required_count = LOWER_ENV_PUBLISH_MIN_SAMPLES;
   lower_env_copy_residual_forensics(r, lane);
   lower_env_decide_publication(r);
+  lower_env_note_raw_bookend_anomaly(
+      lane, r, LOWER_ENV_RAW_BOOKEND_SOURCE_SEALED_WINDOW);
 
   lane.previous_observed_edge_dwt = observed_dwt;
   lane.previous_observed_edge_valid = true;
+  lane.previous_observed_edge_target_counter32 = target_counter32;
+  lane.previous_observed_edge_target_hw16 = target_hw16;
+  lane.previous_observed_edge_observed_hw16 = observed_hw16;
   lane.previous_inferred_edge_dwt =
       r.publish_floorline ? inferred_edge_dwt : observed_dwt;
   lane.previous_inferred_edge_valid = true;
@@ -7724,6 +8014,14 @@ static void vclock_apply_perishable_fact_deferred(
                                   ? "vclock_floorline"
                                   : "vclock_floorline_init");
 
+  if (!lower_env_raw_bookend_watchdog_if_pending(
+          interrupt_subscriber_kind_t::VCLOCK,
+          lower_env,
+          dwt_diag,
+          "vclock_fact_drain")) {
+    return;
+  }
+
   const pps_t witness_pps = fact.witness_pps_valid ? fact.witness_pps : pps_t{};
   const uint32_t publication_sequence =
       (witness_pps.sequence != 0) ? witness_pps.sequence : fact.fallback_sequence;
@@ -9445,6 +9743,14 @@ static void ocxo_apply_perishable_fact_deferred(
                                   : (yardstick_reason ? yardstick_reason
                                                       : "ocxo_floorline_init"));
   dwt_diag.yardstick_authority = OCXO_YARDSTICK_DWT_AUTHORITY_ENABLED;
+
+  if (!lower_env_raw_bookend_watchdog_if_pending(
+          ctx.kind,
+          lower_env,
+          dwt_diag,
+          "ocxo_fact_drain")) {
+    return;
+  }
 
   dwt_publication_request_t publication{};
   publication.kind = ctx.kind;

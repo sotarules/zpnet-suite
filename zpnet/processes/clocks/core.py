@@ -194,6 +194,13 @@ TIMEBASE_FINAL_COURT_DWT_INTERVAL_MAX_CYCLES = 1_100_000_000
 # offsets for diagnostics, but never blocks TIMEBASE persistence by itself.
 TIMEBASE_FINAL_COURT_DELTA_RAW_INTERVAL_GATE_CYCLES = 500
 
+# Second final-court rule: after the first startup/recovery maturity rows, an
+# OCXO lane may not publish as an all-zero science/public ledger.  A warm
+# RECOVER can legitimately hide early private candidates while firmware
+# reattaches OCXO custody, but once a public TIMEBASE row reaches the Pi,
+# zero OCXO ns plus zero endpoints/intervals is lane absence, not science.
+TIMEBASE_FINAL_COURT_OCXO_ZERO_MATURE_PUBLIC_COUNT = 2
+
 PREFLIGHT_POLL_INTERVAL_S = 30
 PREFLIGHT_LOG_PREFIX = "🛡️ [preflight]"
 STARTUP_TEENSY_QUIET_DELAY_S = 20.0
@@ -2007,10 +2014,120 @@ def _timebase_final_court_check_delta_raw_interval(
             _diag["last_timebase_final_court_delta_raw_offset"] = offset_fields
 
 
+def _timebase_final_court_check_ocxo_lane_alive(
+    timebase: Dict[str, Any],
+    violations: List[Dict[str, Any]],
+) -> None:
+    """Block mature public rows whose OCXO lane is entirely zero/missing.
+
+    This is deliberately a final-object check.  Firmware may hold private
+    recovery candidates while OCXO custody is being reattached, but a public
+    TIMEBASE row with ocxoN.ns == 0 and no nonzero science endpoints/intervals
+    is not a valid campaign row.  It is recovered lane absence.
+    """
+    public_count = _first_present_int_path(
+        timebase,
+        "teensy_pps_vclock_count",
+        "fragment.teensy_pps_vclock_count",
+        "pps_count",
+    )
+    if public_count is None:
+        return
+    if int(public_count) <= TIMEBASE_FINAL_COURT_OCXO_ZERO_MATURE_PUBLIC_COUNT:
+        return
+
+    for lane in ("ocxo1", "ocxo2"):
+        science_path = f"fragment.{lane}.science"
+        science = _path_get(timebase, science_path)
+        if not isinstance(science, dict):
+            science = {}
+
+        lane_ns = _first_present_int_path(
+            timebase,
+            f"fragment.{lane}.ns",
+            f"fragment.gnss.{lane}_ns",
+            f"fragment.{lane}_ns",
+            f"teensy_{lane}_ns",
+        )
+
+        public_count_in_science = _as_int(science.get("public_count"))
+        clock_raw_dwt = _as_int(science.get("clock_raw_dwt_at_edge"))
+        clock_floorline_dwt = _as_int(science.get("clock_floorline_dwt_at_edge"))
+        clock_published_dwt = _as_int(science.get("clock_published_dwt_at_edge"))
+        clock_observed_interval = _as_int(science.get("clock_observed_interval_cycles"))
+        clock_floorline_interval = _as_int(science.get("clock_floorline_interval_cycles"))
+        clock_interval_ns = _as_int(science.get("clock_interval_ns"))
+        gnss_interval_ns = _as_int(science.get("gnss_interval_ns"))
+        delta_raw_clock_interval = _as_int(science.get("delta_raw_clock_interval_cycles"))
+        delta_floorline_clock_interval = _as_int(science.get("delta_floorline_clock_interval_cycles"))
+        total_sample_count = _as_int(science.get("total_sample_count"))
+        traditional_total_sample_count = _as_int(science.get("traditional_total_sample_count"))
+
+        science_flags = {
+            "science_valid": _timebase_final_court_bool(science.get("valid")),
+            "antecedents_complete": _timebase_final_court_bool(science.get("antecedents_complete")),
+            "clock_floorline_valid": _timebase_final_court_bool(science.get("clock_floorline_valid")),
+            "delta_raw_valid": _timebase_final_court_bool(science.get("delta_raw_valid")),
+            "delta_floorline_valid": _timebase_final_court_bool(science.get("delta_floorline_valid")),
+            "traditional_valid": _timebase_final_court_bool(science.get("traditional_valid")),
+            "total_valid": _timebase_final_court_bool(science.get("total_valid")),
+            "traditional_total_valid": _timebase_final_court_bool(science.get("traditional_total_valid")),
+        }
+
+        evidence_values = (
+            clock_raw_dwt,
+            clock_floorline_dwt,
+            clock_published_dwt,
+            clock_observed_interval,
+            clock_floorline_interval,
+            clock_interval_ns,
+            gnss_interval_ns,
+            delta_raw_clock_interval,
+            delta_floorline_clock_interval,
+            total_sample_count,
+            traditional_total_sample_count,
+        )
+        has_nonzero_science_evidence = any(
+            value is not None and int(value) != 0 for value in evidence_values
+        ) or any(science_flags.values())
+
+        lane_ns_zero = lane_ns is None or int(lane_ns) == 0
+        if lane_ns_zero and not has_nonzero_science_evidence:
+            _timebase_final_court_add_violation(
+                violations,
+                rule="ocxo_lane_alive",
+                lane=lane,
+                message="mature public TIMEBASE row contains an all-zero OCXO lane after recovery/start maturity",
+                fields={
+                    "path": f"fragment.{lane}",
+                    "science_path": science_path,
+                    "public_count": int(public_count),
+                    "science_public_count": public_count_in_science,
+                    "mature_after_public_count": TIMEBASE_FINAL_COURT_OCXO_ZERO_MATURE_PUBLIC_COUNT,
+                    "lane_ns": lane_ns,
+                    "clock_raw_dwt_at_edge": clock_raw_dwt,
+                    "clock_floorline_dwt_at_edge": clock_floorline_dwt,
+                    "clock_published_dwt_at_edge": clock_published_dwt,
+                    "clock_observed_interval_cycles": clock_observed_interval,
+                    "clock_floorline_interval_cycles": clock_floorline_interval,
+                    "clock_interval_ns": clock_interval_ns,
+                    "gnss_interval_ns": gnss_interval_ns,
+                    "delta_raw_clock_interval_cycles": delta_raw_clock_interval,
+                    "delta_floorline_clock_interval_cycles": delta_floorline_clock_interval,
+                    "total_sample_count": total_sample_count,
+                    "traditional_total_sample_count": traditional_total_sample_count,
+                    **science_flags,
+                    "bad_field": f"fragment.{lane}.ns",
+                    "bad_value": lane_ns,
+                },
+            )
+
+
 def _timebase_final_court_evaluate(timebase: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
     """Return (ok, verdict) for the final TIMEBASE dictionary."""
     violations: List[Dict[str, Any]] = []
     _timebase_final_court_check_delta_raw_interval(timebase, violations)
+    _timebase_final_court_check_ocxo_lane_alive(timebase, violations)
 
     count = _first_present_int_path(
         timebase,
@@ -2032,7 +2149,7 @@ def _timebase_final_court_evaluate(timebase: Dict[str, Any]) -> Tuple[bool, Dict
         "timebase_schema": timebase.get("schema"),
         "fragment_schema": _path_get(timebase, "fragment.schema"),
         "timebase_pair_version": timebase.get("timebase_pair_version"),
-        "rule_count": 1,
+        "rule_count": 2,
         "violation_count": len(violations),
         "violations": violations,
     }

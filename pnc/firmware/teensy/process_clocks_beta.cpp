@@ -193,6 +193,7 @@ static constexpr uint32_t TIMEBASE_BUILD_STAGE_WELFORD = 10;
 static constexpr uint32_t TIMEBASE_BUILD_STAGE_SERVO = 11;
 static constexpr uint32_t TIMEBASE_BUILD_STAGE_DAC_WELFORD = 12;
 static constexpr uint32_t TIMEBASE_BUILD_STAGE_FLASH_CUT_GATE = 13;
+static constexpr uint32_t TIMEBASE_BUILD_STAGE_RECOVER_REATTACH_GATE = 14;
 static constexpr uint32_t TIMEBASE_BUILD_STAGE_BUILD_BEGIN = 20;
 static constexpr uint32_t TIMEBASE_BUILD_STAGE_SPINE = 21;
 static constexpr uint32_t TIMEBASE_BUILD_STAGE_GNSS = 22;
@@ -516,6 +517,7 @@ static const char* timebase_build_stage_name(uint32_t stage) {
     case TIMEBASE_BUILD_STAGE_SERVO: return "SERVO";
     case TIMEBASE_BUILD_STAGE_DAC_WELFORD: return "DAC_WELFORD";
     case TIMEBASE_BUILD_STAGE_FLASH_CUT_GATE: return "FLASH_CUT_GATE";
+    case TIMEBASE_BUILD_STAGE_RECOVER_REATTACH_GATE: return "RECOVER_REATTACH_GATE";
     case TIMEBASE_BUILD_STAGE_BUILD_BEGIN: return "BUILD_BEGIN";
     case TIMEBASE_BUILD_STAGE_SPINE: return "SPINE";
     case TIMEBASE_BUILD_STAGE_GNSS: return "GNSS";
@@ -821,6 +823,29 @@ static uint32_t g_science_residual_quarantine_begin_count = 0;
 static uint32_t g_science_residual_quarantine_consumed_count = 0;
 static uint32_t g_science_residual_quarantine_last_public_count = 0;
 
+// RECOVER OCXO reattachment gate.  Alpha deliberately cuts OCXO measurement
+// custody during warm recovery.  Beta therefore treats recovered candidates as
+// private elapsed seconds until both OCXO lanes have current projection and
+// FloorLine evidence for the current PPS/VCLOCK row.
+static constexpr uint32_t CLOCKS_RECOVER_REATTACH_TIMEOUT_CANDIDATES = 32U;
+static volatile bool     g_recover_reattach_active = false;
+static uint32_t          g_recover_reattach_begin_count = 0;
+static uint32_t          g_recover_reattach_hold_count = 0;
+static uint32_t          g_recover_reattach_release_count = 0;
+static uint32_t          g_recover_reattach_timeout_count = 0;
+static uint32_t          g_recover_reattach_hidden_candidate_count = 0;
+static uint32_t          g_recover_reattach_last_hidden_public_count = 0;
+static uint32_t          g_recover_reattach_last_release_public_count = 0;
+static char              g_recover_reattach_last_reason[64] = "idle";
+static clocks_alpha_recover_reattach_snapshot_t
+    g_recover_reattach_last_ocxo1 = {};
+static clocks_alpha_recover_reattach_snapshot_t
+    g_recover_reattach_last_ocxo2 = {};
+
+static void recover_reattach_reset(const char* reason);
+static void recover_reattach_begin(void);
+static bool recover_reattach_should_hold(void);
+
 static void pps_interval_residuals_reset(void) {
   floorline_science_totals_reset();
   g_science_residual_quarantine_remaining = 0;
@@ -1093,22 +1118,28 @@ static void campaign_start_prologue_reset(const char* reason) {
 static bool campaign_start_prologue_should_hold(void);
 static void flash_cut_clear_pending(void);
 static void ocxo_dac_pacing_abort_all(void);
+static void recover_reattach_begin(void);
+static void recover_reattach_reset(const char* reason);
 
 static void campaign_warmup_begin(campaign_warmup_mode_t mode) {
   g_campaign_warmup_suppressed_total = 0;
 
   if (mode == campaign_warmup_mode_t::RECOVER) {
-    // RECOVER no longer buries public rows.  Install the recovered campaign
-    // offsets now; the next selected PPS/VCLOCK edge publishes base+1.
+    // RECOVER no longer buries fixed rows, but it must prove OCXO
+    // reattachment before public TIMEBASE resumes.  Install recovered offsets
+    // now; the reattach gate advances hidden candidate identity while waiting
+    // for fresh OCXO evidence.
     interrupt_dwt_publication_launch_acquisition_end();
     g_campaign_warmup_mode = campaign_warmup_mode_t::NONE;
     g_campaign_warmup_remaining = 0;
     campaign_start_prologue_reset("recover_no_prologue");
     campaign_public_offsets_reset_for_recover();
+    recover_reattach_begin();
     return;
   }
 
   if (mode == campaign_warmup_mode_t::START) {
+    recover_reattach_reset("start_lifecycle");
     // START now has a science prologue instead of fixed row burial.  The
     // prologue consumes private candidate rows until it has established an
     // internal PPS 0 and the next candidate can publish as science-complete
@@ -1126,11 +1157,36 @@ static void campaign_warmup_begin(campaign_warmup_mode_t mode) {
   g_campaign_warmup_mode = campaign_warmup_mode_t::NONE;
   g_campaign_warmup_remaining = 0;
   campaign_start_prologue_reset("none");
+  recover_reattach_reset("none_lifecycle");
   campaign_public_offsets_reset_to_current();
 }
 
 static bool campaign_warmup_active(void) {
-  return g_campaign_warmup_mode != campaign_warmup_mode_t::NONE;
+  return g_campaign_warmup_mode != campaign_warmup_mode_t::NONE ||
+         g_recover_reattach_active;
+}
+
+static void recover_reattach_set_reason(const char* reason) {
+  safeCopy(g_recover_reattach_last_reason,
+           sizeof(g_recover_reattach_last_reason),
+           reason ? reason : "recover_reattach");
+}
+
+static void recover_reattach_reset(const char* reason) {
+  g_recover_reattach_active = false;
+  g_recover_reattach_hidden_candidate_count = 0;
+  g_recover_reattach_last_ocxo1 = clocks_alpha_recover_reattach_snapshot_t{};
+  g_recover_reattach_last_ocxo2 = clocks_alpha_recover_reattach_snapshot_t{};
+  recover_reattach_set_reason(reason ? reason : "reset");
+}
+
+static void recover_reattach_begin(void) {
+  g_recover_reattach_active = true;
+  g_recover_reattach_hidden_candidate_count = 0;
+  g_recover_reattach_begin_count++;
+  g_recover_reattach_last_ocxo1 = clocks_alpha_recover_reattach_snapshot_t{};
+  g_recover_reattach_last_ocxo2 = clocks_alpha_recover_reattach_snapshot_t{};
+  recover_reattach_set_reason("waiting_for_ocxo_reattach");
 }
 
 static bool campaign_warmup_consume_one_candidate_record(void) {
@@ -1171,6 +1227,7 @@ static void campaign_warmup_reset(void) {
   g_campaign_warmup_remaining = 0;
   g_campaign_warmup_suppressed_total = 0;
   campaign_start_prologue_reset("reset");
+  recover_reattach_reset("warmup_reset");
   campaign_public_offsets_reset_to_current();
 }
 
@@ -1192,6 +1249,82 @@ static uint64_t campaign_public_ocxo1_ns(void) {
 static uint64_t campaign_public_ocxo2_ns(void) {
   return campaign_public_from_offset(current_raw_ocxo2_ns(),
                                      g_campaign_public_ocxo2_offset);
+}
+
+static void recover_reattach_advance_hidden_candidate(void) {
+  const uint64_t public_gnss_ns = campaign_public_gnss_ns();
+  const uint64_t public_dwt_total = campaign_public_dwt_total();
+  const uint64_t public_ocxo1_measured_ns = campaign_public_ocxo1_measured_ns();
+  const uint64_t public_ocxo2_measured_ns = campaign_public_ocxo2_measured_ns();
+
+  if (public_gnss_ns != 0ULL) {
+    campaign_seconds = public_gnss_ns / CLOCKS_BETA_NS_PER_SECOND;
+  } else {
+    campaign_seconds++;
+  }
+
+  dwt_cycle_count_total = public_dwt_total;
+  gnss_raw_64 = public_gnss_ns / 100ULL;
+  if (public_ocxo1_measured_ns != 0ULL) {
+    ocxo1_measured_gnss_ticks_64 = public_ocxo1_measured_ns / 100ULL;
+  }
+  if (public_ocxo2_measured_ns != 0ULL) {
+    ocxo2_measured_gnss_ticks_64 = public_ocxo2_measured_ns / 100ULL;
+  }
+
+  g_recover_reattach_hidden_candidate_count++;
+  g_recover_reattach_last_hidden_public_count =
+      (uint32_t)campaign_seconds;
+  g_campaign_warmup_suppressed_total++;
+  g_timebase_warmup_suppressed_count++;
+}
+
+static bool recover_reattach_should_hold(void) {
+  if (!g_recover_reattach_active) return false;
+
+  clocks_alpha_recover_reattach_snapshot_t ocxo1{};
+  clocks_alpha_recover_reattach_snapshot_t ocxo2{};
+  const bool ocxo1_snapshot_ok =
+      clocks_alpha_ocxo_recover_reattach_snapshot(time_clock_id_t::OCXO1,
+                                                  &ocxo1);
+  const bool ocxo2_snapshot_ok =
+      clocks_alpha_ocxo_recover_reattach_snapshot(time_clock_id_t::OCXO2,
+                                                  &ocxo2);
+  g_recover_reattach_last_ocxo1 = ocxo1;
+  g_recover_reattach_last_ocxo2 = ocxo2;
+
+  const bool ready = ocxo1_snapshot_ok && ocxo2_snapshot_ok &&
+                     ocxo1.ready && ocxo2.ready;
+
+  if (ready) {
+    g_recover_reattach_active = false;
+    g_recover_reattach_release_count++;
+    g_recover_reattach_last_release_public_count =
+        (uint32_t)((campaign_public_gnss_ns() / CLOCKS_BETA_NS_PER_SECOND) + 1ULL);
+    recover_reattach_set_reason("ocxo_reattach_ready");
+    return false;
+  }
+
+  g_recover_reattach_hold_count++;
+  recover_reattach_advance_hidden_candidate();
+
+  if (g_recover_reattach_hidden_candidate_count >=
+      CLOCKS_RECOVER_REATTACH_TIMEOUT_CANDIDATES) {
+    g_recover_reattach_timeout_count++;
+    recover_reattach_set_reason("ocxo_reattach_timeout_still_holding");
+  } else if (!ocxo1_snapshot_ok || !ocxo2_snapshot_ok) {
+    recover_reattach_set_reason("waiting_for_ocxo_reattach_snapshot");
+  } else if (!ocxo1.ready && !ocxo2.ready) {
+    recover_reattach_set_reason("waiting_for_both_ocxo_lanes");
+  } else if (!ocxo1.ready) {
+    recover_reattach_set_reason("waiting_for_ocxo1_lane");
+  } else if (!ocxo2.ready) {
+    recover_reattach_set_reason("waiting_for_ocxo2_lane");
+  } else {
+    recover_reattach_set_reason("waiting_for_ocxo_reattach");
+  }
+
+  return true;
 }
 
 // ============================================================================
@@ -5187,6 +5320,12 @@ void clocks_beta_pps(void) {
     return;
   }
 
+  if (recover_reattach_should_hold()) {
+    timebase_build_stage(TIMEBASE_BUILD_STAGE_RECOVER_REATTACH_GATE);
+    publish_dac_tick("RECOVER_REATTACH_GATE");
+    return;
+  }
+
   g_timebase_candidate_count++;
   g_timebase_last_candidate_campaign_seconds = campaign_seconds;
   timebase_build_stage(TIMEBASE_BUILD_STAGE_CANDIDATE);
@@ -6913,6 +7052,27 @@ static FLASHMEM void add_campaign_payload(Payload& p) {
         g_science_residual_quarantine_last_public_count);
   p.add("alpha_recover_reprime_count",
         clocks_alpha_recover_reprime_count());
+  p.add("recover_reattach_active", (bool)g_recover_reattach_active);
+  p.add("recover_reattach_timeout_candidates",
+        (uint32_t)CLOCKS_RECOVER_REATTACH_TIMEOUT_CANDIDATES);
+  p.add("recover_reattach_begin_count", g_recover_reattach_begin_count);
+  p.add("recover_reattach_hold_count", g_recover_reattach_hold_count);
+  p.add("recover_reattach_release_count", g_recover_reattach_release_count);
+  p.add("recover_reattach_timeout_count", g_recover_reattach_timeout_count);
+  p.add("recover_reattach_hidden_candidate_count",
+        g_recover_reattach_hidden_candidate_count);
+  p.add("recover_reattach_last_hidden_public_count",
+        g_recover_reattach_last_hidden_public_count);
+  p.add("recover_reattach_last_release_public_count",
+        g_recover_reattach_last_release_public_count);
+  p.add("recover_reattach_last_reason", g_recover_reattach_last_reason);
+  p.add("recover_reattach_last_ready", (g_recover_reattach_last_ocxo1.ready && g_recover_reattach_last_ocxo2.ready));
+  p.add("recover_reattach_last_origin_ready",
+        true);
+  p.add("recover_reattach_last_ocxo1_ready",
+        g_recover_reattach_last_ocxo1.ready);
+  p.add("recover_reattach_last_ocxo2_ready",
+        g_recover_reattach_last_ocxo2.ready);
 
   payload_add_campaign_feature_gate(p);
 }
@@ -7604,6 +7764,16 @@ static FLASHMEM Payload cmd_report_timebase_publish(const Payload&) {
                g_science_residual_quarantine_remaining);
   counters.add("recover_science_quarantine_last_public_count",
                g_science_residual_quarantine_last_public_count);
+  counters.add("recover_reattach_begin_count", g_recover_reattach_begin_count);
+  counters.add("recover_reattach_hold_count", g_recover_reattach_hold_count);
+  counters.add("recover_reattach_release_count", g_recover_reattach_release_count);
+  counters.add("recover_reattach_timeout_count", g_recover_reattach_timeout_count);
+  counters.add("recover_reattach_hidden_candidate_count",
+               g_recover_reattach_hidden_candidate_count);
+  counters.add("recover_reattach_last_hidden_public_count",
+               g_recover_reattach_last_hidden_public_count);
+  counters.add("recover_reattach_last_release_public_count",
+               g_recover_reattach_last_release_public_count);
   counters.add("flash_cut_request_count", g_flash_cut_request_count);
   counters.add("flash_cut_commit_count", g_flash_cut_commit_count);
   counters.add("flash_cut_reject_count", g_flash_cut_reject_count);
@@ -7641,6 +7811,10 @@ static FLASHMEM Payload cmd_report_timebase_publish(const Payload&) {
             interrupt_dwt_publication_launch_acquisition_active());
   gates.add("campaign_state", campaign_state == clocks_campaign_state_t::STARTED ? "STARTED" : "STOPPED");
   gates.add("warmup_active", campaign_warmup_active());
+  gates.add("recover_reattach_active", (bool)g_recover_reattach_active);
+  gates.add("recover_reattach_last_reason", g_recover_reattach_last_reason);
+  gates.add("recover_reattach_timeout_candidates",
+            (uint32_t)CLOCKS_RECOVER_REATTACH_TIMEOUT_CANDIDATES);
   gates.add("watchdog_campaign_publication_armed",
             (bool)watchdog_campaign_publication_armed);
   gates.add("watchdog_campaign_surrendered",
@@ -7655,6 +7829,28 @@ static FLASHMEM Payload cmd_report_timebase_publish(const Payload&) {
   gates.add("request_zero", request_zero);
   gates.add("request_flash_cut", request_flash_cut);
   p.add_object("gates", gates);
+
+  Payload recover_reattach;
+  recover_reattach.add("ready", (g_recover_reattach_last_ocxo1.ready && g_recover_reattach_last_ocxo2.ready));
+  recover_reattach.add("origin_ready", true);
+  recover_reattach.add("pps_vclock_ns", g_recover_reattach_last_ocxo1.expected_pps_vclock_ns);
+  recover_reattach.add("recover_reprime_count",
+                       g_recover_reattach_last_ocxo1.reprime_count);
+  recover_reattach.add("ocxo1_ready", g_recover_reattach_last_ocxo1.ready);
+  recover_reattach.add("ocxo1_projection_valid",
+                       g_recover_reattach_last_ocxo1.projection_valid);
+  recover_reattach.add("ocxo1_floorline_present",
+                       g_recover_reattach_last_ocxo1.forensics_ready);
+  recover_reattach.add("ocxo1_current_raw_ns",
+                       g_recover_reattach_last_ocxo1.current_public_ns);
+  recover_reattach.add("ocxo2_ready", g_recover_reattach_last_ocxo2.ready);
+  recover_reattach.add("ocxo2_projection_valid",
+                       g_recover_reattach_last_ocxo2.projection_valid);
+  recover_reattach.add("ocxo2_floorline_present",
+                       g_recover_reattach_last_ocxo2.forensics_ready);
+  recover_reattach.add("ocxo2_current_raw_ns",
+                       g_recover_reattach_last_ocxo2.current_public_ns);
+  p.add_object("recover_reattach", recover_reattach);
 
   Payload last;
   last.add("stage", g_timebase_last_stage);
