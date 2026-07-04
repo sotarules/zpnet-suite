@@ -439,7 +439,21 @@ servo_mode_t servo_mode_parse(const char* s) {
 // This preserves the fractional-authority experiment while making DAC bus
 // traffic explicit and operator-disableable with a live kill switch.
 
-static constexpr bool     OCXO_DAC_DITHER_DEFAULT_ENABLED = true;
+// Science no-dither build switches.
+//
+// The first three are intentionally false for the residual-isolation build:
+//   - no boot-time one-second fractional dither
+//   - no operator-command path that can re-arm dither
+//   - no servo/Beta request path that can mutate the DAC while dither is off
+//
+// OCXO_DAC_DITHER_DISABLE_STATIC_WRITE_ENABLED is also false so DITHER_DISABLE
+// is a pure stop/clear operation.  It cancels timers and pending work without
+// writing a final static-rounded code that could perturb the EFC voltage during
+// a science campaign.
+static constexpr bool     OCXO_DAC_DITHER_DEFAULT_ENABLED = false;
+static constexpr bool     OCXO_DAC_DITHER_COMPILED_ENABLED = false;
+static constexpr bool     OCXO_DAC_SERVO_REQUESTS_ENABLED = false;
+static constexpr bool     OCXO_DAC_DITHER_DISABLE_STATIC_WRITE_ENABLED = false;
 static constexpr bool     OCXO_DAC_DITHER_ALLOW_HARDWARE_WRITES = true;
 static constexpr uint64_t OCXO_DAC_DITHER_FRAME_NS = 1000000000ULL;
 static constexpr uint64_t OCXO_DAC_DITHER_SLOT_NS = 1000000ULL;
@@ -614,7 +628,19 @@ static void ocxo_dac_dither_cancel_frame(void) {
   }
 }
 
+static void ocxo_dac_dither_cancel_service(void) {
+  if (g_ocxo_dac_dither_service_handle != TIMEPOP_INVALID_HANDLE) {
+    (void)timepop_cancel(g_ocxo_dac_dither_service_handle);
+    g_ocxo_dac_dither_service_handle = TIMEPOP_INVALID_HANDLE;
+  }
+  g_ocxo_dac_dither_service_pending = false;
+}
+
 static void ocxo_dac_dither_request_service(void) {
+  if (!OCXO_DAC_DITHER_COMPILED_ENABLED &&
+      !OCXO_DAC_SERVO_REQUESTS_ENABLED) {
+    return;
+  }
   if (g_ocxo_dac_dither_service_pending) return;
 
   g_ocxo_dac_dither_service_handle =
@@ -637,6 +663,19 @@ void ocxo_dac_request_servo_target(ocxo_dac_state_t& s,
                                    double value,
                                    double planned_step,
                                    uint64_t request_second) {
+  if (!OCXO_DAC_SERVO_REQUESTS_ENABLED) {
+    (void)value;
+    (void)planned_step;
+    (void)request_second;
+    ocxo_dac_clear_servo_request(s);
+    ocxo_dac_dither_clear_pending(s);
+    const uint32_t primask = ocxo_dac_state_irq_save();
+    s.servo_last_step = 0.0;
+    s.servo_hold_reason = SERVO_HOLD_NONE;
+    ocxo_dac_state_irq_restore(primask);
+    return;
+  }
+
   const double target = ocxo_dac_clamp_real_value(value);
   const uint16_t hw_code = ocxo_dac_rounded_hw_code_from_value(target);
 
@@ -775,6 +814,14 @@ static void ocxo_dac_dither_service_callback(timepop_ctx_t*,
 
   if (!g_ocxo_dac_dither_operator_enabled ||
       !g_ocxo_dac_dither_started) {
+    if (!OCXO_DAC_SERVO_REQUESTS_ENABLED) {
+      ocxo_dac_clear_servo_request(ocxo1_dac);
+      ocxo_dac_clear_servo_request(ocxo2_dac);
+      ocxo_dac_dither_clear_pending(ocxo1_dac);
+      ocxo_dac_dither_clear_pending(ocxo2_dac);
+      return;
+    }
+
     ocxo_dac_static_owner_service_lane(ocxo1_dac);
     ocxo_dac_static_owner_service_lane(ocxo2_dac);
 
@@ -992,6 +1039,13 @@ static void ocxo_dac_dither_frame_callback(timepop_ctx_t*,
 }
 
 bool clocks_ocxo_dac_dither_enable(void) {
+  if (!OCXO_DAC_DITHER_COMPILED_ENABLED) {
+    (void)clocks_ocxo_dac_dither_disable();
+    ocxo1_dac.dither_service_defer_count++;
+    ocxo2_dac.dither_service_defer_count++;
+    return false;
+  }
+
   g_ocxo_dac_dither_operator_enabled = true;
   ocxo1_dac.dither_enabled = true;
   ocxo2_dac.dither_enabled = true;
@@ -1030,15 +1084,23 @@ bool clocks_ocxo_dac_dither_disable(void) {
 
   ocxo_dac_dither_cancel_transition();
   ocxo_dac_dither_cancel_frame();
+  ocxo_dac_dither_cancel_service();
 
-  // Preserve single-owner semantics across DITHER_DISABLE: any servo request
-  // already queued is installed by the dither owner before the static-rounded
-  // output is written.
-  (void)ocxo_dac_dither_install_servo_request(ocxo1_dac, true);
-  (void)ocxo_dac_dither_install_servo_request(ocxo2_dac, true);
+  // No-dither science doctrine: disabling dither must not install a pending
+  // servo target and must not perform a surprise final DAC write.  Clear all
+  // queued motion so the control voltage remains whatever the explicitly
+  // chosen static DAC state already is.
+  ocxo_dac_clear_servo_request(ocxo1_dac);
+  ocxo_dac_clear_servo_request(ocxo2_dac);
+  ocxo_dac_dither_clear_pending(ocxo1_dac);
+  ocxo_dac_dither_clear_pending(ocxo2_dac);
 
   ocxo_dac_dither_mark_idle(ocxo1_dac);
   ocxo_dac_dither_mark_idle(ocxo2_dac);
+
+  if (!OCXO_DAC_DITHER_DISABLE_STATIC_WRITE_ENABLED) {
+    return true;
+  }
 
   const bool ok1 =
       ocxo_dac_write_hw_code(ocxo1_dac,

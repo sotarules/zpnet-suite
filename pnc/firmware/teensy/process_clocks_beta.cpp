@@ -8704,7 +8704,7 @@ static FLASHMEM Payload cmd_dither_enable(const Payload&) {
   const bool ok = clocks_ocxo_dac_dither_enable();
 
   Payload p;
-  p.add("status", ok ? "dither_enabled" : "dither_enable_failed");
+  p.add("status", ok ? "dither_enabled" : "dither_enable_blocked_or_failed");
   p.add("enabled", clocks_ocxo_dac_dither_operator_enabled());
   p.add("started", clocks_ocxo_dac_dither_started());
   p.add("service_pending", clocks_ocxo_dac_dither_service_pending());
@@ -8720,7 +8720,7 @@ static FLASHMEM Payload cmd_dither_disable(const Payload&) {
   const bool ok = clocks_ocxo_dac_dither_disable();
 
   Payload p;
-  p.add("status", ok ? "dither_disabled_static_rounded" : "dither_disabled_dac_write_fault");
+  p.add("status", ok ? "dither_disabled_no_dac_write" : "dither_disable_failed");
   p.add("enabled", clocks_ocxo_dac_dither_operator_enabled());
   p.add("started", clocks_ocxo_dac_dither_started());
   p.add("service_pending", clocks_ocxo_dac_dither_service_pending());
