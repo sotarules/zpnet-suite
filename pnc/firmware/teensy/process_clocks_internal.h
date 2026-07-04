@@ -1026,6 +1026,23 @@ struct ocxo_dac_state_t {
   double   servo_predicted_residual;
   uint32_t servo_predictor_updates;
 
+  // Servo/DAC ownership.  Beta's 1 Hz TIMEBASE path may only request a
+  // real-valued DAC target.  The dither owner consumes the request at a frame
+  // boundary, installs the fractional target, and owns every hardware-facing
+  // low/high/static realization.
+  uint32_t servo_hold_count;
+  uint8_t  servo_hold_reason;
+  uint8_t  servo_quarantine_reason;
+  uint32_t servo_quarantine_remaining;
+  uint32_t servo_quarantine_begin_count;
+  uint32_t servo_quarantine_consumed_count;
+  uint32_t servo_commit_fault_hold_count;
+  uint32_t servo_request_overwrite_count;
+  uint32_t servo_request_install_count;
+  uint32_t servo_request_dither_frame_install_count;
+  uint32_t servo_request_static_install_count;
+  uint32_t servo_request_static_write_failure_count;
+
   bool     pacing_pending;
   double   pacing_pending_target;
   double   pacing_pending_step;
@@ -1071,6 +1088,15 @@ static constexpr int32_t  SERVO_MAX_STEP                = 64;
 static constexpr uint32_t SERVO_SETTLE_SECONDS          = 5;
 static constexpr uint32_t SERVO_MIN_SAMPLES             = 10;
 static constexpr uint16_t SERVO_MIN_DAC_CODE_DELTA_LSB  = 1;
+
+static constexpr uint8_t SERVO_HOLD_NONE                 = 0;
+static constexpr uint8_t SERVO_HOLD_PENDING_COMMIT       = 1;
+static constexpr uint8_t SERVO_HOLD_SETTLE_QUARANTINE    = 2;
+static constexpr uint8_t SERVO_HOLD_COMMIT_FAULT_BACKOFF = 3;
+static constexpr uint8_t SERVO_HOLD_SMALL_STATIC_DELTA   = 4;
+
+static constexpr uint32_t SERVO_DITHER_OWNER_SETTLE_QUARANTINE_ROWS = 2U;
+static constexpr uint32_t SERVO_DITHER_OWNER_FAILURE_BACKOFF_ROWS    = 3U;
 
 // Servo control doctrine:
 //   positive ppb/tau>1 -> OCXO running fast  -> lower DAC code
@@ -1121,6 +1147,11 @@ static inline double ocxo_dac_voltage_from_code(double code) {
 
 bool ocxo_dac_set(ocxo_dac_state_t& s, double value);
 bool ocxo_dac_set_desired(ocxo_dac_state_t& s, double value);
+void ocxo_dac_request_servo_target(ocxo_dac_state_t& s,
+                                   double target,
+                                   double planned_step,
+                                   uint64_t request_second);
+void ocxo_dac_clear_servo_request(ocxo_dac_state_t& s);
 double ocxo_dac_fractional_snapshot(const ocxo_dac_state_t& s);
 bool ocxo_dac_write_hw_code(ocxo_dac_state_t& s,
                             uint16_t hw_code,
@@ -1139,6 +1170,17 @@ uint32_t clocks_ocxo_dac_dither_global_schedule_failures(void);
 uint32_t clocks_ocxo_dac_dither_service_arm_count(void);
 uint32_t clocks_ocxo_dac_dither_service_arm_failures(void);
 const char* clocks_ocxo_dac_dither_context(void);
+
+// Dither-owned foreground DAC actuator service.
+// Servo/Beta queues intent only; this owner service owns dither-frame and
+// static hardware realization, including failure isolation.
+bool clocks_ocxo_dac_actuator_service_pending(void);
+uint32_t clocks_ocxo_dac_actuator_service_arm_count(void);
+uint32_t clocks_ocxo_dac_actuator_service_arm_failures(void);
+uint32_t clocks_ocxo_dac_actuator_commit_attempt_count(void);
+uint32_t clocks_ocxo_dac_actuator_commit_success_count(void);
+uint32_t clocks_ocxo_dac_actuator_commit_failure_count(void);
+const char* clocks_ocxo_dac_actuator_context(void);
 
 // ============================================================================
 // Campaign warmup suppression

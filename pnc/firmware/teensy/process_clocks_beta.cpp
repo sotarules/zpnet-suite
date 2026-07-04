@@ -44,9 +44,11 @@
 //   welford_dwt, welford_vclock, welford_ocxo1, welford_ocxo2,
 //   welford_pps_witness, welford_ocxo1_dac, welford_ocxo2_dac.
 //
-// Campaign lifecycle, DAC pacing, and watchdog behavior remain unchanged.
-// Servo inputs now consume the same PPS-founded OCXO residual surface that
-// feeds the OCXO Welfords, and DAC/TIMEBASE reports expose that provenance.
+// Campaign lifecycle and watchdog behavior remain unchanged. Servo DAC updates
+// are now planned from the 1 Hz science path but physically committed by a
+// low-priority actuator sandbox so I2C failures cannot poison TIMEBASE.
+// Servo inputs consume the same PPS-founded OCXO residual surface that feeds
+// the OCXO Welfords, and DAC/TIMEBASE reports expose that provenance.
 //
 // TIMEBASE publication is intentionally split:
 //   TIMEBASE_FRAGMENT   — compact canonical campaign row / science spine.
@@ -4621,6 +4623,8 @@ static bool ocxo_dac_static_rounded_only_runtime(void) {
   return !clocks_ocxo_dac_dither_operator_enabled();
 }
 
+static const char* servo_hold_reason_name(uint32_t reason);
+
 static FLASHMEM void payload_add_dac_realization_object(Payload& parent,
                                                const char* key,
                                                const ocxo_dac_state_t& s) {
@@ -4656,6 +4660,28 @@ static FLASHMEM void payload_add_dac_realization_object(Payload& parent,
   r.add("started", clocks_ocxo_dac_dither_started());
   r.add("service_pending", clocks_ocxo_dac_dither_service_pending());
   r.add("write_context", clocks_ocxo_dac_dither_context());
+  r.add("actuator_context", clocks_ocxo_dac_actuator_context());
+  r.add("actuator_service_pending", clocks_ocxo_dac_actuator_service_pending());
+  r.add("actuator_service_arm_count", clocks_ocxo_dac_actuator_service_arm_count());
+  r.add("actuator_service_arm_failures", clocks_ocxo_dac_actuator_service_arm_failures());
+  r.add("actuator_commit_attempt_count", clocks_ocxo_dac_actuator_commit_attempt_count());
+  r.add("actuator_commit_success_count", clocks_ocxo_dac_actuator_commit_success_count());
+  r.add("actuator_commit_failure_count", clocks_ocxo_dac_actuator_commit_failure_count());
+  r.add("servo_hold_reason", servo_hold_reason_name(s.servo_hold_reason));
+  r.add("servo_hold_reason_id", (uint32_t)s.servo_hold_reason);
+  r.add("servo_hold_count", s.servo_hold_count);
+  r.add("servo_quarantine_reason", servo_hold_reason_name(s.servo_quarantine_reason));
+  r.add("servo_quarantine_remaining", s.servo_quarantine_remaining);
+  r.add("servo_quarantine_begin_count", s.servo_quarantine_begin_count);
+  r.add("servo_quarantine_consumed_count", s.servo_quarantine_consumed_count);
+  r.add("servo_commit_fault_hold_count", s.servo_commit_fault_hold_count);
+  r.add("servo_request_overwrite_count", s.servo_request_overwrite_count);
+  r.add("servo_request_install_count", s.servo_request_install_count);
+  r.add("servo_request_dither_frame_install_count",
+        s.servo_request_dither_frame_install_count);
+  r.add("servo_request_static_install_count", s.servo_request_static_install_count);
+  r.add("servo_request_static_write_failure_count",
+        s.servo_request_static_write_failure_count);
 
   r.add("low_code", (uint32_t)s.dither_low_code);
   r.add("high_code", (uint32_t)s.dither_high_code);
@@ -4820,33 +4846,36 @@ static void servo_input_diag_update(servo_input_diag_t& d,
 }
 
 // ============================================================================
-// DAC pacing / deferred commit
+// Servo DAC requests — dither-owned realization
 // ============================================================================
+//
+// Beta/servo is now a pure intent producer.  It computes the real-valued DAC
+// target from the science residual and queues that request into the shared DAC
+// state.  Alpha's dither owner consumes the request at the one-second frame
+// boundary before programming the low/high waveform.  Beta never performs
+// Wire/AD5693R I/O and never schedules a competing hardware commit service.
 
-static volatile bool   g_ocxo_dac_commit_scheduled = false;
 static ocxo_dac_state_t* g_ocxo_dac_commit_selected = nullptr;
 static double          g_ocxo_dac_commit_target = 0.0;
 static uint16_t        g_ocxo_dac_commit_target_hw_code = 0;
 static uint64_t        g_ocxo_dac_last_schedule_second = 0;
-static uint64_t        g_ocxo_dac_last_commit_second = 0;
 static uint8_t         g_ocxo_dac_last_winner = 0;
 static uint32_t        g_ocxo_dac_arbitration_passes = 0;
 static uint32_t        g_ocxo_dac_no_candidate_passes = 0;
 static uint32_t        g_ocxo_dac_deferred_candidates = 0;
 static uint32_t        g_ocxo_dac_schedule_failures = 0;
 
+static uint8_t ocxo_dac_lane_id(const ocxo_dac_state_t& dac) {
+  return (&dac == &ocxo1_dac) ? 1U : 2U;
+}
+
 static void ocxo_dac_clear_pending(ocxo_dac_state_t& d) {
-  d.pacing_pending = false;
-  d.pacing_pending_target = 0.0;
-  d.pacing_pending_step = 0.0;
-  d.pacing_pending_hw_code = 0;
-  d.pacing_pending_since_second = 0;
+  ocxo_dac_clear_servo_request(d);
 }
 
 static void ocxo_dac_pacing_reset(void) {
   ocxo_dac_clear_pending(ocxo1_dac);
   ocxo_dac_clear_pending(ocxo2_dac);
-  g_ocxo_dac_commit_scheduled = false;
   g_ocxo_dac_commit_selected = nullptr;
   g_ocxo_dac_commit_target = 0.0;
   g_ocxo_dac_commit_target_hw_code = 0;
@@ -4857,6 +4886,45 @@ static void ocxo_dac_pacing_abort_all(void) {
   ocxo_dac_pacing_reset();
 }
 
+static const char* servo_hold_reason_name(uint32_t reason) {
+  switch (reason) {
+    case SERVO_HOLD_PENDING_COMMIT:
+      return "PENDING_DITHER_OWNER_INSTALL";
+    case SERVO_HOLD_SETTLE_QUARANTINE:
+      return "SETTLE_QUARANTINE";
+    case SERVO_HOLD_COMMIT_FAULT_BACKOFF:
+      return "COMMIT_FAULT_BACKOFF";
+    case SERVO_HOLD_SMALL_STATIC_DELTA:
+      return "SMALL_STATIC_DELTA";
+    default:
+      return "NONE";
+  }
+}
+
+static void ocxo_dac_note_servo_hold(ocxo_dac_state_t& dac, uint8_t reason) {
+  dac.servo_hold_reason = reason;
+  dac.servo_hold_count++;
+  if (reason == SERVO_HOLD_COMMIT_FAULT_BACKOFF) {
+    dac.servo_commit_fault_hold_count++;
+  }
+}
+
+static bool ocxo_dac_servo_hold_active(ocxo_dac_state_t& dac) {
+  if (dac.servo_quarantine_remaining != 0U) {
+    const uint8_t reason = dac.servo_quarantine_reason
+        ? dac.servo_quarantine_reason
+        : SERVO_HOLD_SETTLE_QUARANTINE;
+    dac.servo_quarantine_remaining--;
+    dac.servo_quarantine_consumed_count++;
+    ocxo_dac_note_servo_hold(dac, reason);
+    return true;
+  }
+
+  dac.servo_hold_reason = SERVO_HOLD_NONE;
+  dac.servo_quarantine_reason = SERVO_HOLD_NONE;
+  return false;
+}
+
 static void clocks_apply_servo_mode_now(servo_mode_t mode) {
   const servo_mode_t previous = calibrate_ocxo_mode;
   calibrate_ocxo_mode = mode;
@@ -4865,10 +4933,17 @@ static void clocks_apply_servo_mode_now(servo_mode_t mode) {
   // Reset predictor/settle state so a new live SERVOS mode never inherits stale
   // slope memory from MEAN/TOTAL/NOW or from an OFF interval.
   if (previous != mode) {
+    ocxo_dac_pacing_abort_all();
     ocxo_dac_predictor_reset(ocxo1_dac);
     ocxo_dac_predictor_reset(ocxo2_dac);
     ocxo1_dac.servo_settle_count = 0;
     ocxo2_dac.servo_settle_count = 0;
+    ocxo1_dac.servo_hold_reason = SERVO_HOLD_NONE;
+    ocxo2_dac.servo_hold_reason = SERVO_HOLD_NONE;
+    ocxo1_dac.servo_quarantine_reason = SERVO_HOLD_NONE;
+    ocxo2_dac.servo_quarantine_reason = SERVO_HOLD_NONE;
+    ocxo1_dac.servo_quarantine_remaining = 0;
+    ocxo2_dac.servo_quarantine_remaining = 0;
   }
 
   if (mode == servo_mode_t::OFF) {
@@ -4891,12 +4966,38 @@ static void clocks_commit_pending_servo_mode_change(void) {
 static void ocxo_dac_apply_synthetic_servo_step(ocxo_dac_state_t& dac,
                                                 double step) {
   const double before = ocxo_dac_fractional_snapshot(dac);
-  (void)ocxo_dac_set_desired(dac, before + step);
-  const double applied = ocxo_dac_fractional_snapshot(dac) - before;
-  dac.servo_last_step = applied;
-  dac.servo_adjustments++;
-  dac.pacing_intents++;
-  dac.pacing_last_request_second = campaign_seconds;
+  const double target = ocxo_dac_clamp_real_value(before + step);
+  const double planned_step = target - before;
+  const uint16_t target_hw_code =
+      ocxo_dac_rounded_hw_code_from_value(target);
+
+  if (fabs(planned_step) < 0.000001) {
+    dac.pacing_skip_small_delta_count++;
+    dac.servo_last_step = 0.0;
+    dac.servo_hold_reason = SERVO_HOLD_SMALL_STATIC_DELTA;
+    return;
+  }
+
+  if (!clocks_ocxo_dac_dither_operator_enabled() &&
+      target_hw_code == dac.dac_hw_code) {
+    dac.pacing_skip_small_delta_count++;
+    dac.servo_last_step = 0.0;
+    dac.servo_hold_reason = SERVO_HOLD_SMALL_STATIC_DELTA;
+    return;
+  }
+
+  if (dac.pacing_pending) {
+    g_ocxo_dac_deferred_candidates++;
+  }
+
+  g_ocxo_dac_arbitration_passes++;
+  g_ocxo_dac_commit_selected = &dac;
+  g_ocxo_dac_commit_target = target;
+  g_ocxo_dac_commit_target_hw_code = target_hw_code;
+  g_ocxo_dac_last_schedule_second = campaign_seconds;
+  g_ocxo_dac_last_winner = ocxo_dac_lane_id(dac);
+
+  ocxo_dac_request_servo_target(dac, target, planned_step, campaign_seconds);
 }
 
 // ============================================================================
@@ -4938,6 +5039,30 @@ static void campaign_accounting_reset_common(bool reset_servo_runtime) {
     ocxo_dac_predictor_reset(ocxo1_dac);
     ocxo_dac_predictor_reset(ocxo2_dac);
     ocxo_dac_pacing_reset();
+    ocxo1_dac.servo_hold_count = 0;
+    ocxo2_dac.servo_hold_count = 0;
+    ocxo1_dac.servo_hold_reason = SERVO_HOLD_NONE;
+    ocxo2_dac.servo_hold_reason = SERVO_HOLD_NONE;
+    ocxo1_dac.servo_quarantine_reason = SERVO_HOLD_NONE;
+    ocxo2_dac.servo_quarantine_reason = SERVO_HOLD_NONE;
+    ocxo1_dac.servo_quarantine_remaining = 0;
+    ocxo2_dac.servo_quarantine_remaining = 0;
+    ocxo1_dac.servo_quarantine_begin_count = 0;
+    ocxo2_dac.servo_quarantine_begin_count = 0;
+    ocxo1_dac.servo_quarantine_consumed_count = 0;
+    ocxo2_dac.servo_quarantine_consumed_count = 0;
+    ocxo1_dac.servo_commit_fault_hold_count = 0;
+    ocxo2_dac.servo_commit_fault_hold_count = 0;
+    ocxo1_dac.servo_request_overwrite_count = 0;
+    ocxo2_dac.servo_request_overwrite_count = 0;
+    ocxo1_dac.servo_request_install_count = 0;
+    ocxo2_dac.servo_request_install_count = 0;
+    ocxo1_dac.servo_request_dither_frame_install_count = 0;
+    ocxo2_dac.servo_request_dither_frame_install_count = 0;
+    ocxo1_dac.servo_request_static_install_count = 0;
+    ocxo2_dac.servo_request_static_install_count = 0;
+    ocxo1_dac.servo_request_static_write_failure_count = 0;
+    ocxo2_dac.servo_request_static_write_failure_count = 0;
   }
 
   // Input diagnostics are campaign-row products, not plant state.  Clear them
@@ -4974,6 +5099,7 @@ static void ocxo_servo_slope(ocxo_dac_state_t& dac,
                              double deadband_ppb = SERVO_CONTROL_DEADBAND_PPB,
                              bool use_soft_landing = true) {
   if (!input.selected_input_valid) return;
+  if (ocxo_dac_servo_hold_active(dac)) return;
 
   const double ppb = input.selected_input_ppb;
   dac.servo_last_residual = ppb;
@@ -7332,6 +7458,21 @@ static FLASHMEM void add_dac_payload(Payload& p) {
   o1.add("servo_predicted_residual", ocxo1_dac.servo_predicted_residual, 6);
   o1.add("servo_control_ppb", ocxo1_dac.servo_predicted_residual, 6);
   o1.add("servo_predictor_updates", ocxo1_dac.servo_predictor_updates);
+  o1.add("servo_hold_reason", servo_hold_reason_name(ocxo1_dac.servo_hold_reason));
+  o1.add("servo_hold_reason_id", (uint32_t)ocxo1_dac.servo_hold_reason);
+  o1.add("servo_hold_count", ocxo1_dac.servo_hold_count);
+  o1.add("servo_quarantine_reason", servo_hold_reason_name(ocxo1_dac.servo_quarantine_reason));
+  o1.add("servo_quarantine_remaining", ocxo1_dac.servo_quarantine_remaining);
+  o1.add("servo_quarantine_begin_count", ocxo1_dac.servo_quarantine_begin_count);
+  o1.add("servo_quarantine_consumed_count", ocxo1_dac.servo_quarantine_consumed_count);
+  o1.add("servo_commit_fault_hold_count", ocxo1_dac.servo_commit_fault_hold_count);
+  o1.add("servo_request_overwrite_count", ocxo1_dac.servo_request_overwrite_count);
+  o1.add("servo_request_install_count", ocxo1_dac.servo_request_install_count);
+  o1.add("servo_request_dither_frame_install_count",
+         ocxo1_dac.servo_request_dither_frame_install_count);
+  o1.add("servo_request_static_install_count", ocxo1_dac.servo_request_static_install_count);
+  o1.add("servo_request_static_write_failure_count",
+         ocxo1_dac.servo_request_static_write_failure_count);
   payload_add_servo_input_diag(o1, g_servo_input_ocxo1);
   payload_add_dac_realization_object(o1, "realization", ocxo1_dac);
   o1.add("dither_active_this_frame", ocxo1_dac.dither_active_this_frame);
@@ -7379,6 +7520,21 @@ static FLASHMEM void add_dac_payload(Payload& p) {
   o2.add("servo_predicted_residual", ocxo2_dac.servo_predicted_residual, 6);
   o2.add("servo_control_ppb", ocxo2_dac.servo_predicted_residual, 6);
   o2.add("servo_predictor_updates", ocxo2_dac.servo_predictor_updates);
+  o2.add("servo_hold_reason", servo_hold_reason_name(ocxo2_dac.servo_hold_reason));
+  o2.add("servo_hold_reason_id", (uint32_t)ocxo2_dac.servo_hold_reason);
+  o2.add("servo_hold_count", ocxo2_dac.servo_hold_count);
+  o2.add("servo_quarantine_reason", servo_hold_reason_name(ocxo2_dac.servo_quarantine_reason));
+  o2.add("servo_quarantine_remaining", ocxo2_dac.servo_quarantine_remaining);
+  o2.add("servo_quarantine_begin_count", ocxo2_dac.servo_quarantine_begin_count);
+  o2.add("servo_quarantine_consumed_count", ocxo2_dac.servo_quarantine_consumed_count);
+  o2.add("servo_commit_fault_hold_count", ocxo2_dac.servo_commit_fault_hold_count);
+  o2.add("servo_request_overwrite_count", ocxo2_dac.servo_request_overwrite_count);
+  o2.add("servo_request_install_count", ocxo2_dac.servo_request_install_count);
+  o2.add("servo_request_dither_frame_install_count",
+         ocxo2_dac.servo_request_dither_frame_install_count);
+  o2.add("servo_request_static_install_count", ocxo2_dac.servo_request_static_install_count);
+  o2.add("servo_request_static_write_failure_count",
+         ocxo2_dac.servo_request_static_write_failure_count);
   payload_add_servo_input_diag(o2, g_servo_input_ocxo2);
   payload_add_dac_realization_object(o2, "realization", ocxo2_dac);
   o2.add("dither_active_this_frame", ocxo2_dac.dither_active_this_frame);
@@ -7425,9 +7581,25 @@ static FLASHMEM void add_dac_payload(Payload& p) {
   p.add("dither_global_schedule_failures", clocks_ocxo_dac_dither_global_schedule_failures());
   p.add("dither_service_arm_count", clocks_ocxo_dac_dither_service_arm_count());
   p.add("dither_service_arm_failures", clocks_ocxo_dac_dither_service_arm_failures());
-  p.add("commit_scheduled", g_ocxo_dac_commit_scheduled);
+  p.add("actuator_context", clocks_ocxo_dac_actuator_context());
+  p.add("actuator_service_pending", clocks_ocxo_dac_actuator_service_pending());
+  p.add("actuator_service_arm_count", clocks_ocxo_dac_actuator_service_arm_count());
+  p.add("actuator_service_arm_failures", clocks_ocxo_dac_actuator_service_arm_failures());
+  p.add("actuator_commit_attempt_count", clocks_ocxo_dac_actuator_commit_attempt_count());
+  p.add("actuator_commit_success_count", clocks_ocxo_dac_actuator_commit_success_count());
+  p.add("actuator_commit_failure_count", clocks_ocxo_dac_actuator_commit_failure_count());
+  p.add("commit_scheduled", ocxo1_dac.pacing_pending || ocxo2_dac.pacing_pending);
+  p.add("commit_selected_lane",
+        (g_ocxo_dac_commit_selected == &ocxo1_dac)
+            ? 1U
+            : ((g_ocxo_dac_commit_selected == &ocxo2_dac) ? 2U : 0U));
+  p.add("commit_target", g_ocxo_dac_commit_target, 6);
+  p.add("commit_target_hw_code", (uint32_t)g_ocxo_dac_commit_target_hw_code);
   p.add("last_schedule_second", g_ocxo_dac_last_schedule_second);
-  p.add("last_commit_second", g_ocxo_dac_last_commit_second);
+  p.add("last_commit_second",
+        (ocxo1_dac.pacing_last_commit_second > ocxo2_dac.pacing_last_commit_second)
+            ? ocxo1_dac.pacing_last_commit_second
+            : ocxo2_dac.pacing_last_commit_second);
   p.add("last_winner", (uint32_t)g_ocxo_dac_last_winner);
   p.add("arbitration_passes", g_ocxo_dac_arbitration_passes);
   p.add("no_candidate_passes", g_ocxo_dac_no_candidate_passes);
@@ -8470,7 +8642,19 @@ static FLASHMEM void payload_add_dither_status_lane_compact(
   lane.add("io_write_attempts", dac.io_write_attempts);
   lane.add("io_write_failures", dac.io_write_failures);
   lane.add("servo_adjustments", dac.servo_adjustments);
+  lane.add("servo_hold_reason", servo_hold_reason_name(dac.servo_hold_reason));
+  lane.add("servo_hold_reason_id", (uint32_t)dac.servo_hold_reason);
+  lane.add("servo_hold_count", dac.servo_hold_count);
+  lane.add("servo_quarantine_remaining", dac.servo_quarantine_remaining);
+  lane.add("servo_commit_fault_hold_count", dac.servo_commit_fault_hold_count);
+  lane.add("servo_request_install_count", dac.servo_request_install_count);
+  lane.add("servo_request_overwrite_count", dac.servo_request_overwrite_count);
+  lane.add("servo_request_dither_frame_install_count",
+           dac.servo_request_dither_frame_install_count);
+  lane.add("servo_request_static_install_count", dac.servo_request_static_install_count);
   lane.add("pacing_intents", dac.pacing_intents);
+  lane.add("pacing_pending", dac.pacing_pending);
+  lane.add("pacing_pending_hw_code", (uint32_t)dac.pacing_pending_hw_code);
   lane.add("pacing_commit_count", dac.pacing_commit_count);
 
   parent.add_object(key, lane);
@@ -8490,6 +8674,13 @@ static FLASHMEM void payload_add_dither_status_compact(Payload& p) {
   p.add("started", clocks_ocxo_dac_dither_started());
   p.add("service_pending", clocks_ocxo_dac_dither_service_pending());
   p.add("write_context", clocks_ocxo_dac_dither_context());
+  p.add("actuator_context", clocks_ocxo_dac_actuator_context());
+  p.add("actuator_service_pending", clocks_ocxo_dac_actuator_service_pending());
+  p.add("actuator_service_arm_count", clocks_ocxo_dac_actuator_service_arm_count());
+  p.add("actuator_service_arm_failures", clocks_ocxo_dac_actuator_service_arm_failures());
+  p.add("actuator_commit_attempt_count", clocks_ocxo_dac_actuator_commit_attempt_count());
+  p.add("actuator_commit_success_count", clocks_ocxo_dac_actuator_commit_success_count());
+  p.add("actuator_commit_failure_count", clocks_ocxo_dac_actuator_commit_failure_count());
 
   p.add("global_frame_count", clocks_ocxo_dac_dither_global_frame_count());
   p.add("global_schedule_failures", clocks_ocxo_dac_dither_global_schedule_failures());

@@ -20,6 +20,8 @@
 //   • Continuous DWT-to-GNSS calibration (campaign-independent)
 //   • Static PPS/GPIO-based one-second prediction audit for VCLOCK and OCXO lanes
 //   • VCLOCK/OCXO rollover-only event consumption as observed DWT edge timing
+//   • Servo DAC intent planning with the dither owner performing all
+//     hardware-facing DAC realization
 //
 // Initialization is split into two phases:
 //

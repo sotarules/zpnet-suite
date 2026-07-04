@@ -432,6 +432,9 @@ servo_mode_t servo_mode_parse(const char* s) {
 //   • Hardware writes are serviced by a deferred foreground callback.
 //   • Same-code writes are skipped from the cached dac_hw_code; no DAC read is
 //     performed for the dither path.
+//   • The dither owner is the only servo-facing DAC realization authority:
+//     Beta/servo queues real-valued target requests, and the owner installs
+//     them at the next one-second frame boundary before low/high synthesis.
 //
 // This preserves the fractional-authority experiment while making DAC bus
 // traffic explicit and operator-disableable with a live kill switch.
@@ -462,14 +465,19 @@ static uint32_t         g_ocxo_dac_dither_global_frame_count = 0;
 static uint32_t         g_ocxo_dac_dither_global_schedule_failures = 0;
 static uint32_t         g_ocxo_dac_dither_service_arm_count = 0;
 static uint32_t         g_ocxo_dac_dither_service_arm_failures = 0;
+static uint32_t         g_ocxo_dac_actuator_commit_attempt_count = 0;
+static uint32_t         g_ocxo_dac_actuator_commit_success_count = 0;
+static uint32_t         g_ocxo_dac_actuator_commit_failure_count = 0;
 
 static void ocxo_dac_dither_begin_frame(void);
 static void ocxo_dac_dither_schedule_next_transition(uint16_t after_ms);
 static void ocxo_dac_dither_service_callback(timepop_ctx_t*, timepop_diag_t*, void*);
+static void ocxo_dac_dither_request_service(void);
 
-// DAC control state is shared by the 1 Hz Beta servo and TimePop dither
-// callbacks.  Keep the critical section tiny: protect only the authored
-// control packet, never the physical I2C write.
+// DAC control state has one hardware owner: the dither/actuator layer.
+// Servo/Beta may queue request packets, but only this owner installs targets
+// and schedules physical codes.  Keep critical sections tiny: protect authored
+// control packets, never the physical I2C write.
 static inline uint32_t ocxo_dac_state_irq_save(void) {
   uint32_t primask = 0;
   __asm__ volatile ("mrs %0, primask" : "=r" (primask) :: "memory");
@@ -497,6 +505,74 @@ static void ocxo_dac_fractional_publish(ocxo_dac_state_t& s, double target) {
   s.dac_fractional = target;
   s.dither_program_dirty = true;
   ocxo_dac_state_irq_restore(primask);
+}
+
+static void ocxo_dac_dither_begin_servo_quarantine(ocxo_dac_state_t& s,
+                                                    uint32_t rows,
+                                                    uint8_t reason) {
+  const uint32_t primask = ocxo_dac_state_irq_save();
+  s.servo_quarantine_remaining = rows;
+  s.servo_quarantine_reason = reason;
+  s.servo_hold_reason = reason;
+  s.servo_quarantine_begin_count++;
+  ocxo_dac_state_irq_restore(primask);
+}
+
+void ocxo_dac_clear_servo_request(ocxo_dac_state_t& s) {
+  const uint32_t primask = ocxo_dac_state_irq_save();
+  s.pacing_pending = false;
+  s.pacing_pending_target = 0.0;
+  s.pacing_pending_step = 0.0;
+  s.pacing_pending_hw_code = 0;
+  s.pacing_pending_since_second = 0;
+  ocxo_dac_state_irq_restore(primask);
+}
+
+static bool ocxo_dac_dither_install_servo_request(ocxo_dac_state_t& s,
+                                                  bool static_owner_path) {
+  double target = 0.0;
+  double planned_step = 0.0;
+  uint16_t planned_hw_code = 0;
+  uint64_t request_second = 0;
+
+  {
+    const uint32_t primask = ocxo_dac_state_irq_save();
+    if (!s.pacing_pending) {
+      ocxo_dac_state_irq_restore(primask);
+      return false;
+    }
+
+    target = s.pacing_pending_target;
+    planned_step = s.pacing_pending_step;
+    planned_hw_code = s.pacing_pending_hw_code;
+    request_second = s.pacing_pending_since_second;
+
+    s.pacing_pending = false;
+    s.pacing_pending_target = 0.0;
+    s.pacing_pending_step = 0.0;
+    s.pacing_pending_hw_code = 0;
+    s.pacing_pending_since_second = 0;
+
+    s.dac_fractional = target;
+    s.dither_program_dirty = true;
+    s.servo_last_step = planned_step;
+    s.pacing_last_commit_second = request_second;
+    s.pacing_commit_count++;
+    s.servo_request_install_count++;
+    if (static_owner_path) {
+      s.servo_request_static_install_count++;
+    } else {
+      s.servo_request_dither_frame_install_count++;
+    }
+    (void)planned_hw_code;
+    ocxo_dac_state_irq_restore(primask);
+  }
+
+  ocxo_dac_dither_begin_servo_quarantine(
+      s,
+      SERVO_DITHER_OWNER_SETTLE_QUARANTINE_ROWS,
+      SERVO_HOLD_SETTLE_QUARANTINE);
+  return true;
 }
 
 static void ocxo_dac_dither_clear_pending(ocxo_dac_state_t& s) {
@@ -557,6 +633,39 @@ static void ocxo_dac_dither_request_service(void) {
   g_ocxo_dac_dither_service_arm_count++;
 }
 
+void ocxo_dac_request_servo_target(ocxo_dac_state_t& s,
+                                   double value,
+                                   double planned_step,
+                                   uint64_t request_second) {
+  const double target = ocxo_dac_clamp_real_value(value);
+  const uint16_t hw_code = ocxo_dac_rounded_hw_code_from_value(target);
+
+  const uint32_t primask = ocxo_dac_state_irq_save();
+  if (s.pacing_pending) {
+    s.pacing_deferred_count++;
+    s.servo_request_overwrite_count++;
+  }
+  s.pacing_pending = true;
+  s.pacing_pending_target = target;
+  s.pacing_pending_step = planned_step;
+  s.pacing_pending_hw_code = hw_code;
+  s.pacing_pending_since_second = request_second;
+  s.pacing_last_request_second = request_second;
+  s.pacing_intents++;
+  s.servo_last_step = planned_step;
+  s.servo_adjustments++;
+  s.servo_hold_reason = SERVO_HOLD_PENDING_COMMIT;
+  ocxo_dac_state_irq_restore(primask);
+
+  // When fractional dither is running, the next frame boundary will consume
+  // the request before programming the low/high waveform.  If the operator has
+  // disabled recurring dither, the same owner service realizes a static rounded
+  // code from ALAP foreground context instead of letting Beta touch hardware.
+  if (!g_ocxo_dac_dither_operator_enabled || !g_ocxo_dac_dither_started) {
+    ocxo_dac_dither_request_service();
+  }
+}
+
 static void ocxo_dac_dither_request_hw_code(ocxo_dac_state_t& s,
                                             uint16_t hw_code) {
   if (!g_ocxo_dac_dither_operator_enabled ||
@@ -601,13 +710,60 @@ static void ocxo_dac_dither_service_lane(ocxo_dac_state_t& s) {
     return;
   }
 
+  g_ocxo_dac_actuator_commit_attempt_count++;
   const bool ok = ocxo_dac_write_hw_code(s, hw_code, false);
   if (ok) {
     s.dither_write_count++;
     s.dither_service_write_count++;
+    g_ocxo_dac_actuator_commit_success_count++;
   } else {
     s.dither_write_failure_count++;
     s.dither_service_defer_count++;
+    g_ocxo_dac_actuator_commit_failure_count++;
+    ocxo_dac_dither_begin_servo_quarantine(
+        s,
+        SERVO_DITHER_OWNER_FAILURE_BACKOFF_ROWS,
+        SERVO_HOLD_COMMIT_FAULT_BACKOFF);
+  }
+}
+
+static void ocxo_dac_static_owner_service_lane(ocxo_dac_state_t& s) {
+  s.dither_service_count++;
+
+  const bool installed = ocxo_dac_dither_install_servo_request(s, true);
+  if (!installed) return;
+
+  if (!OCXO_DAC_DITHER_ALLOW_HARDWARE_WRITES) {
+    s.dither_service_defer_count++;
+    return;
+  }
+
+  const uint16_t hw_code =
+      ocxo_dac_rounded_hw_code_from_value(ocxo_dac_fractional_snapshot(s));
+
+  if (hw_code == s.dac_hw_code) {
+    s.dither_skip_same_code_count++;
+    s.dither_service_skip_same_count++;
+    s.io_last_write_ok = true;
+    s.io_last_failure_stage = 0;
+    return;
+  }
+
+  g_ocxo_dac_actuator_commit_attempt_count++;
+  const bool ok = ocxo_dac_write_hw_code(s, hw_code, false);
+  if (ok) {
+    s.dither_write_count++;
+    s.dither_service_write_count++;
+    g_ocxo_dac_actuator_commit_success_count++;
+  } else {
+    s.dither_write_failure_count++;
+    s.dither_service_defer_count++;
+    s.servo_request_static_write_failure_count++;
+    g_ocxo_dac_actuator_commit_failure_count++;
+    ocxo_dac_dither_begin_servo_quarantine(
+        s,
+        SERVO_DITHER_OWNER_FAILURE_BACKOFF_ROWS,
+        SERVO_HOLD_COMMIT_FAULT_BACKOFF);
   }
 }
 
@@ -616,6 +772,17 @@ static void ocxo_dac_dither_service_callback(timepop_ctx_t*,
                                              void*) {
   g_ocxo_dac_dither_service_pending = false;
   g_ocxo_dac_dither_service_handle = TIMEPOP_INVALID_HANDLE;
+
+  if (!g_ocxo_dac_dither_operator_enabled ||
+      !g_ocxo_dac_dither_started) {
+    ocxo_dac_static_owner_service_lane(ocxo1_dac);
+    ocxo_dac_static_owner_service_lane(ocxo2_dac);
+
+    if (ocxo1_dac.pacing_pending || ocxo2_dac.pacing_pending) {
+      ocxo_dac_dither_request_service();
+    }
+    return;
+  }
 
   ocxo_dac_dither_service_lane(ocxo1_dac);
   ocxo_dac_dither_service_lane(ocxo2_dac);
@@ -682,39 +849,44 @@ static void ocxo_dac_dither_program_lane(ocxo_dac_state_t& s) {
   s.dither_high_ms = (uint16_t)high_ms;
   s.dither_last_frame_high_ms = (uint16_t)high_ms;
   s.dither_active_this_frame = (high_ms > 0U && high != low);
-  s.dither_current_phase_high = s.dither_active_this_frame;
+  // Low-first waveform: each frame begins at floor(target), then transitions
+  // once to floor(target)+1 for the fractional high dwell near frame tail.
+  s.dither_current_phase_high = false;
   s.dither_program_dirty = false;
   s.dither_frame_count++;
   ocxo_dac_state_irq_restore(primask);
 }
 
 static void ocxo_dac_dither_start_lane_frame(ocxo_dac_state_t& s) {
+  // Servo/Beta owns intent only.  The dither owner installs any pending real
+  // target at the one-second frame boundary, before low/high synthesis.
+  (void)ocxo_dac_dither_install_servo_request(s, false);
   ocxo_dac_dither_program_lane(s);
 
-  const uint16_t start_code =
-      s.dither_active_this_frame ? s.dither_high_code : s.dither_low_code;
-
-  ocxo_dac_dither_request_hw_code(s, start_code);
+  ocxo_dac_dither_request_hw_code(s, s.dither_low_code);
 }
 
 static bool ocxo_dac_dither_claim_transition(ocxo_dac_state_t& s,
                                              uint16_t due_ms,
-                                             uint16_t* out_low_code) {
+                                             uint16_t* out_hw_code) {
   bool claimed = false;
-  uint16_t low_code = 0;
+  uint16_t hw_code = 0;
 
   const uint32_t primask = ocxo_dac_state_irq_save();
+  const uint16_t high_begin_ms = s.dither_active_this_frame
+      ? (uint16_t)(OCXO_DAC_DITHER_SLOTS_PER_FRAME - s.dither_high_ms)
+      : OCXO_DAC_DITHER_SLOTS_PER_FRAME;
   if (s.dither_active_this_frame &&
-      s.dither_current_phase_high &&
-      s.dither_high_ms == due_ms) {
-    low_code = s.dither_low_code;
-    s.dither_current_phase_high = false;
+      !s.dither_current_phase_high &&
+      high_begin_ms == due_ms) {
+    hw_code = s.dither_high_code;
+    s.dither_current_phase_high = true;
     s.dither_transition_count++;
     claimed = true;
   }
   ocxo_dac_state_irq_restore(primask);
 
-  if (claimed && out_low_code) *out_low_code = low_code;
+  if (claimed && out_hw_code) *out_hw_code = hw_code;
   return claimed;
 }
 
@@ -723,17 +895,21 @@ static uint16_t ocxo_dac_dither_next_due_after(uint16_t after_ms) {
 
   const uint32_t primask = ocxo_dac_state_irq_save();
   if (ocxo1_dac.dither_active_this_frame &&
-      ocxo1_dac.dither_current_phase_high &&
-      ocxo1_dac.dither_high_ms > after_ms &&
-      ocxo1_dac.dither_high_ms < due) {
-    due = ocxo1_dac.dither_high_ms;
+      !ocxo1_dac.dither_current_phase_high) {
+    const uint16_t high_begin_ms =
+        (uint16_t)(OCXO_DAC_DITHER_SLOTS_PER_FRAME - ocxo1_dac.dither_high_ms);
+    if (high_begin_ms > after_ms && high_begin_ms < due) {
+      due = high_begin_ms;
+    }
   }
 
   if (ocxo2_dac.dither_active_this_frame &&
-      ocxo2_dac.dither_current_phase_high &&
-      ocxo2_dac.dither_high_ms > after_ms &&
-      ocxo2_dac.dither_high_ms < due) {
-    due = ocxo2_dac.dither_high_ms;
+      !ocxo2_dac.dither_current_phase_high) {
+    const uint16_t high_begin_ms =
+        (uint16_t)(OCXO_DAC_DITHER_SLOTS_PER_FRAME - ocxo2_dac.dither_high_ms);
+    if (high_begin_ms > after_ms && high_begin_ms < due) {
+      due = high_begin_ms;
+    }
   }
   ocxo_dac_state_irq_restore(primask);
 
@@ -752,14 +928,14 @@ static void ocxo_dac_dither_transition_callback(timepop_ctx_t*,
     return;
   }
 
-  uint16_t low_code = 0;
-  if (ocxo_dac_dither_claim_transition(ocxo1_dac, due_ms, &low_code)) {
-    ocxo_dac_dither_request_hw_code(ocxo1_dac, low_code);
+  uint16_t hw_code = 0;
+  if (ocxo_dac_dither_claim_transition(ocxo1_dac, due_ms, &hw_code)) {
+    ocxo_dac_dither_request_hw_code(ocxo1_dac, hw_code);
   }
 
-  low_code = 0;
-  if (ocxo_dac_dither_claim_transition(ocxo2_dac, due_ms, &low_code)) {
-    ocxo_dac_dither_request_hw_code(ocxo2_dac, low_code);
+  hw_code = 0;
+  if (ocxo_dac_dither_claim_transition(ocxo2_dac, due_ms, &hw_code)) {
+    ocxo_dac_dither_request_hw_code(ocxo2_dac, hw_code);
   }
 
   ocxo_dac_dither_schedule_next_transition(due_ms);
@@ -855,6 +1031,12 @@ bool clocks_ocxo_dac_dither_disable(void) {
   ocxo_dac_dither_cancel_transition();
   ocxo_dac_dither_cancel_frame();
 
+  // Preserve single-owner semantics across DITHER_DISABLE: any servo request
+  // already queued is installed by the dither owner before the static-rounded
+  // output is written.
+  (void)ocxo_dac_dither_install_servo_request(ocxo1_dac, true);
+  (void)ocxo_dac_dither_install_servo_request(ocxo2_dac, true);
+
   ocxo_dac_dither_mark_idle(ocxo1_dac);
   ocxo_dac_dither_mark_idle(ocxo2_dac);
 
@@ -899,21 +1081,58 @@ uint32_t clocks_ocxo_dac_dither_service_arm_failures(void) {
 }
 
 const char* clocks_ocxo_dac_dither_context(void) {
-  return "TIMEPOP_PHASE_LATCH_FOREGROUND_ALAP_I2C";
+  return "DITHER_OWNER_LOW_FIRST_FRAME_ALAP_I2C";
+}
+
+bool clocks_ocxo_dac_actuator_service_pending(void) {
+  return g_ocxo_dac_dither_service_pending;
+}
+
+uint32_t clocks_ocxo_dac_actuator_service_arm_count(void) {
+  return g_ocxo_dac_dither_service_arm_count;
+}
+
+uint32_t clocks_ocxo_dac_actuator_service_arm_failures(void) {
+  return g_ocxo_dac_dither_service_arm_failures;
+}
+
+uint32_t clocks_ocxo_dac_actuator_commit_attempt_count(void) {
+  return g_ocxo_dac_actuator_commit_attempt_count;
+}
+
+uint32_t clocks_ocxo_dac_actuator_commit_success_count(void) {
+  return g_ocxo_dac_actuator_commit_success_count;
+}
+
+uint32_t clocks_ocxo_dac_actuator_commit_failure_count(void) {
+  return g_ocxo_dac_actuator_commit_failure_count;
+}
+
+const char* clocks_ocxo_dac_actuator_context(void) {
+  return "DITHER_OWNS_DAC_SERVO_REQUESTS_ONLY";
 }
 
 bool ocxo_dac_set_desired(ocxo_dac_state_t& s, double value) {
   const double target = ocxo_dac_clamp_real_value(value);
   const uint16_t hw_code = ocxo_dac_rounded_hw_code_from_value(target);
 
-  ocxo_dac_fractional_publish(s, target);
-
   if (!g_ocxo_dac_dither_operator_enabled) {
-    return ocxo_dac_write_hw_code(s, hw_code, true);
+    // Static-rounded mode is a physical commit, not merely intent.  Write the
+    // hardware first and publish the new fractional authority only after the
+    // AD5693R path has accepted the rounded code.  This keeps desired DAC state
+    // from drifting away from the last confirmed hardware output after an I2C
+    // failure.  Callers that need non-blocking behavior must queue through the
+    // dither-owned servo request path instead of calling this from TIMEBASE.
+    if (!ocxo_dac_write_hw_code(s, hw_code, true)) {
+      return false;
+    }
+    ocxo_dac_fractional_publish(s, target);
+    return true;
   }
 
   // Dither is operator-enabled.  Retain fractional intent and let the next
   // one-second frame realize it.  Do not issue an extra DAC transaction here.
+  ocxo_dac_fractional_publish(s, target);
   s.io_last_write_ok = true;
   s.io_last_failure_stage = 0;
   return true;
