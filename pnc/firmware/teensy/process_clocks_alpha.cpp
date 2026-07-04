@@ -74,6 +74,8 @@ volatile uint64_t g_ocxo2_physical_measured_gnss_ns_at_pps_vclock = 0;
 volatile uint32_t g_dwt_at_pps_vclock = 0;
 volatile uint64_t g_dwt_cycle_count_total = 0;
 volatile uint32_t g_dwt_cycles_between_pps_vclock = DWT_EXPECTED_PER_PPS;
+volatile uint32_t g_pps_vclock_dwt_cycles_between_edges = 0;
+volatile bool     g_pps_vclock_dwt_cycles_between_edges_valid = false;
 
 // Alpha-owned DWT64 logical clock.  This is the one true DWT64 clock surface.
 // It is not physically writable; CLOCKS.ZERO installs a logical epoch origin
@@ -1164,6 +1166,8 @@ static inline void dwt_enable(void) {
   g_dwt64_epoch_reset_count = 0;
   g_dwt64_epoch_reset_failures = 0;
   g_dwt_calibration_valid = false;
+  g_pps_vclock_dwt_cycles_between_edges = 0;
+  g_pps_vclock_dwt_cycles_between_edges_valid = false;
   clocks_features_mark_alpha_initializing();
 }
 
@@ -6006,7 +6010,16 @@ static bool alpha_sample_all_clocks_at_pps_vclock(const pps_edge_snapshot_t& sna
 static void update_pps_vclock_bridge_anchor(const pps_edge_snapshot_t& snap) {
   if (!epoch_ready() || !g_prev_pps_vclock_dwt_at_edge_valid) return;
 
-  const uint32_t dwt_between_pps = snap.dwt_at_edge - g_prev_pps_vclock_dwt_at_edge;
+  const uint32_t dwt_between_pps =
+      snap.dwt_at_edge - g_prev_pps_vclock_dwt_at_edge;
+
+  // Exact selected PPS/VCLOCK edge-to-edge interval.  This is the
+  // species-pure Delta Cycles reference: it is formed only from the two
+  // canonical PPS/VCLOCK DWT-at-edge coordinates and deliberately stays
+  // separate from the smoother PPS/GPIO witness interval used for time
+  // projection and TimePop calibration.
+  g_pps_vclock_dwt_cycles_between_edges = dwt_between_pps;
+  g_pps_vclock_dwt_cycles_between_edges_valid = (dwt_between_pps != 0U);
 
   uint64_t counter_identity_ns = 0;
   const bool counter_identity_valid =

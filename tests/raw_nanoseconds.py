@@ -1,16 +1,17 @@
 """
-ZPNet Raw Nanoseconds — DWT-edge -> GNSS-ns projection audit.
+ZPNet Raw Nanoseconds — Delta Cycles / DWT-edge audit.
 
 Reads TIMEBASE rows for a campaign and prints a compact one-row-per-record
-report for one selected clock.  The report projects the selected clock's
-subscriber-facing DWT-at-edge into GNSS nanoseconds using the row's canonical
-PPS/VCLOCK anchor:
+report for one selected clock.
+
+For current OCXO science rows, the primary audit surface is Delta Cycles:
+subtract the delayed selected PPS/VCLOCK DWT edge interval from the OCXO
+observed DWT edge interval.  This keeps both operands in the same DWT
+coordinate species and lets common-mode Teensy/DWT thermal drift cancel.
+
+Legacy rows still fall back to the older edge projection audit:
 
     edge_ns = pps_vclock_ns + signed_dwt(edge_dwt - pps_vclock_dwt) * 1e9 / cps
-
-where cps is the row's effective DWT cycles per GNSS second.  The projected
-edge times are then differenced to produce the selected clock's one-second
-period in GNSS nanoseconds.
 
 Usage:
     python -m zpnet.tests.raw_nanoseconds <campaign_name> [clock] [limit]
@@ -18,6 +19,7 @@ Usage:
     python raw_nanoseconds.py <campaign_name> OCXO1 200
     python raw_nanoseconds.py <campaign_name> OCXO1 --no-cum
     python raw_nanoseconds.py <campaign_name> OCXO1 --delta
+    python raw_nanoseconds.py <campaign_name> OCXO1 --delta --floorline-forensics
     python raw_nanoseconds.py <campaign_name> OCXO1 --science-debug --mismatch-limit 40
 
 Clock filter:
@@ -36,21 +38,23 @@ Column doctrine:
     tau_1s    frequency-ratio tau for this one selected-clock second:
               1e9 / ns_Δ.  This is the reciprocal of the period ratio.
     ppb_1s    (tau_1s - 1) * 1e9.
-    tau_edge  running cumulative tau from summed selected-clock seconds over
-              summed projected GNSS nanoseconds in this report segment.
-    ppb_edge  (tau_edge - 1) * 1e9.
+    tau_calc  running cumulative frequency ratio from this report's selected
+              authority surface.
+    ppb_calc  (tau_calc - 1) * 1e9.
     tau_tb    Teensy/TIMEBASE campaign-total tau from fragment.stats.<clock>.tau.
     ppb_tb    Teensy/TIMEBASE campaign-total ppb from fragment.stats.<clock>.ppb.
-    ppb_Δ     ppb_edge - ppb_tb.  This intentionally compares edge-derived
-              report cumulative PPB against the firmware campaign-total PPB.
+    ppb_Δ     ppb_calc - ppb_tb.  This compares the report recompute against
+              the firmware campaign-total PPB.
 
 Delta residual view (--delta, OCXO only):
-    d_raw_cyc     OCXO raw observed interval - delayed VCLOCK raw interval.
+    raw_ref       delayed selected PPS/VCLOCK DWT edge-to-edge reference interval.
+    raw_clk       OCXO observed DWT edge-to-edge interval.
+    d_raw_cyc     raw_clk - raw_ref.
     d_raw_fast    sign-aligned ns residual derived from d_raw_cyc; positive=fast.
-    d_fl_cyc      OCXO FloorLine endpoint interval - delayed VCLOCK FloorLine interval.
-    d_fl_fast     sign-aligned ns residual derived from d_fl_cyc; positive=fast.
-    raw-trad      d_raw_fast - traditional fast_residual_ns.
-    fl-trad       d_fl_fast - traditional fast_residual_ns.
+    raw-trad      d_raw_fast - traditional projected-edge fast_residual_ns.
+
+FloorLine fields are intentionally hidden by default.  Use --floorline-forensics
+when investigating the retired FloorLine rail.
 
 This report intentionally does not compute Welfords.  It is a projection,
 residual, and TIMEBASE stats cross-check report.
@@ -496,11 +500,54 @@ def _science_edge_dwt(sci: Dict[str, Any]) -> Optional[int]:
     )
 
 
+def _science_is_delta_cycles(sci: Dict[str, Any], clock: str) -> bool:
+    if clock not in ("OCXO1", "OCXO2"):
+        return False
+    source = str(sci.get("residual_source") or sci.get("frequency_source") or "")
+    return bool(sci.get("delta_raw_valid", False)) or source.startswith("DELTA_")
+
+
+def _delta_cycles_external_calc(sci: Dict[str, Any]) -> Dict[str, Any]:
+    """Recompute canonical Delta Cycles science directly from cycle fields."""
+    out: Dict[str, Any] = {}
+    ref = _as_int(sci.get("delta_raw_reference_interval_cycles"))
+    clk = _as_int(sci.get("delta_raw_clock_interval_cycles"))
+    if ref is None or clk is None or ref <= 0 or clk <= 0:
+        return out
+
+    residual_cycles = int(clk) - int(ref)
+    fast_cycles = -residual_cycles
+    residual_exact = float(residual_cycles) * float(NS_PER_SECOND) / float(ref)
+    fast_exact = -residual_exact
+    clock_interval_exact = float(NS_PER_SECOND) - fast_exact
+    tau_1s = float(NS_PER_SECOND) / clock_interval_exact if clock_interval_exact > 0.0 else 1.0
+    ppb_1s = ppb_from_tau(tau_1s)
+
+    out.update({
+        "reference_cycles": ref,
+        "clock_cycles": clk,
+        "residual_cycles": residual_cycles,
+        "fast_cycles": fast_cycles,
+        "gnss_interval_ns_exact": float(NS_PER_SECOND),
+        "clock_interval_ns_exact": clock_interval_exact,
+        "ns_between_exact": clock_interval_exact,
+        "ns_between": _round_nearest_int(clock_interval_exact),
+        "residual_fast_exact": fast_exact,
+        "residual_fast": _round_nearest_int(fast_exact),
+        "tau_1s": tau_1s,
+        "ppb_1s": ppb_1s,
+    })
+    return out
+
+
 def science_external_calc(sci: Dict[str, Any], clock: str) -> Dict[str, Any]:
     """Independently recompute science values from fragment.<clock>.science antecedents."""
     out: Dict[str, Any] = {}
     if not science_usable(sci, clock):
         return out
+
+    if _science_is_delta_cycles(sci, clock):
+        return _delta_cycles_external_calc(sci)
 
     if clock == "PPS" or sci.get("frequency_source") in ("GNSS_IDENTITY", "GNSS_IDENTITY_WITNESS"):
         out["prior_ns_exact"] = _as_float(sci.get("prior_edge_gnss_ns_exact"))
@@ -556,9 +603,16 @@ def science_external_calc(sci: Dict[str, Any], clock: str) -> Dict[str, Any]:
 
 def science_total_calc_from_running(cum_clock_ns_exact: float,
                                     cum_gnss_ns_exact: float) -> Tuple[Optional[float], Optional[float]]:
-    if cum_gnss_ns_exact <= 0.0:
+    """Return positive-fast cumulative tau/ppb from physical interval totals.
+
+    cum_clock_ns_exact is the measured/derived duration of N selected-clock
+    seconds in GNSS nanoseconds.  cum_gnss_ns_exact is the corresponding GNSS
+    reference duration.  A fast clock has a shorter physical period, so the
+    frequency ratio is reference_duration / clock_duration.
+    """
+    if cum_clock_ns_exact <= 0.0:
         return None, None
-    tau = cum_clock_ns_exact / cum_gnss_ns_exact
+    tau = cum_gnss_ns_exact / cum_clock_ns_exact
     return tau, ppb_from_tau(tau)
 
 
@@ -633,7 +687,8 @@ def collect_rows(records: Iterable[Dict[str, Any]], clock: str) -> Tuple[List[Di
         "rows_collected": 0,
         "science_rows": 0,
         "science_missing": 0,
-        "science_math_int_mismatch_rows": 0,
+        "science_residual_int_mismatch_rows": 0,
+        "science_interval_rendering_diff_rows": 0,
         "science_abs_edge_int_mismatch_rows": 0,
         "science_float_mismatch_rows": 0,
         "delta_raw_rows": 0,
@@ -717,6 +772,8 @@ def collect_rows(records: Iterable[Dict[str, Any]], clock: str) -> Tuple[List[Di
         delta_raw_fast_ns: Optional[int] = None
         delta_raw_fast_ns_exact: Optional[float] = None
         delta_raw_fast_ppb: Optional[float] = None
+        delta_raw_reference_interval_cycles: Optional[int] = None
+        delta_raw_clock_interval_cycles: Optional[int] = None
         delta_raw_fast_minus_traditional: Optional[int] = None
         delta_raw_cum_ppb: Optional[float] = None
         delta_floorline_valid = False
@@ -732,10 +789,21 @@ def collect_rows(records: Iterable[Dict[str, Any]], clock: str) -> Tuple[List[Di
         if use_science:
             stats["science_rows"] += 1
             edge_dwt = _science_edge_dwt(sci)
-            cycles_between = _first_int(sci.get("clock_floorline_interval_cycles"), sci.get("dwt_cycles_between_edges"), sci.get("cycles_between_edges"))
+            delta_science = _science_is_delta_cycles(sci, clock)
+            cycles_between = _first_int(
+                sci.get("delta_raw_clock_interval_cycles") if delta_science else None,
+                sci.get("clock_observed_interval_cycles") if delta_science else None,
+                sci.get("clock_floorline_interval_cycles"),
+                sci.get("dwt_cycles_between_edges"),
+                sci.get("cycles_between_edges"),
+            )
             prior_ns_for_row = _first_int(sci.get("prior_edge_gnss_ns"), sci_calc.get("prior_ns"))
             edge_ns = _first_int(sci.get("current_edge_gnss_ns"), sci.get("pps_vclock_gnss_ns_at_edge") if clock == "PPS" else None, sci_calc.get("edge_ns"))
-            ns_between = _first_int(sci.get("gnss_interval_ns"), sci_calc.get("ns_between"))
+            ns_between = _first_int(
+                sci.get("clock_interval_ns") if delta_science else None,
+                sci_calc.get("ns_between"),
+                sci.get("gnss_interval_ns"),
+            )
             residual_fast = _first_int(sci.get("fast_residual_ns"), sci_calc.get("residual_fast"))
             tau_1s = _first_float(sci.get("tau_1s"), sci_calc.get("tau_1s"))
             ppb_1s = _first_float(sci.get("ppb_1s"), sci_calc.get("ppb_1s"))
@@ -743,6 +811,8 @@ def collect_rows(records: Iterable[Dict[str, Any]], clock: str) -> Tuple[List[Di
             delta_reference_public_count = _as_int(sci.get("delta_reference_public_count"))
             delta_publication_public_count = _as_int(sci.get("delta_publication_public_count"))
             delta_raw_valid = bool(sci.get("delta_raw_valid", False))
+            delta_raw_reference_interval_cycles = _as_int(sci.get("delta_raw_reference_interval_cycles")) if delta_raw_valid else None
+            delta_raw_clock_interval_cycles = _as_int(sci.get("delta_raw_clock_interval_cycles")) if delta_raw_valid else None
             delta_raw_cycles = _as_int(sci.get("delta_raw_residual_cycles")) if delta_raw_valid else None
             delta_raw_fast_cycles = _as_int(sci.get("delta_raw_fast_residual_cycles")) if delta_raw_valid else None
             delta_raw_fast_ns = _as_int(sci.get("delta_raw_fast_residual_ns")) if delta_raw_valid else None
@@ -775,7 +845,7 @@ def collect_rows(records: Iterable[Dict[str, Any]], clock: str) -> Tuple[List[Di
             calc_clock_interval_exact = _first_float(sci_calc.get("clock_interval_ns_exact"), sci.get("clock_interval_ns_exact"), sci.get("clock_interval_ns"))
             if calc_clock_interval_exact is None and ns_between is not None:
                 calc_clock_interval_exact = float(NS_PER_SECOND)
-            calc_gnss_interval_exact = _first_float(sci_calc.get("ns_between_exact"), sci.get("gnss_interval_ns_exact"), sci.get("gnss_interval_ns"))
+            calc_gnss_interval_exact = _first_float(sci_calc.get("gnss_interval_ns_exact"), sci.get("gnss_interval_ns_exact"), sci.get("gnss_interval_ns"))
             if calc_clock_interval_exact is not None and calc_gnss_interval_exact is not None:
                 science_cum_clock_ns_exact += calc_clock_interval_exact
                 science_cum_gnss_ns_exact += calc_gnss_interval_exact
@@ -799,14 +869,14 @@ def collect_rows(records: Iterable[Dict[str, Any]], clock: str) -> Tuple[List[Di
                 _diff_int(calc_prior_ns, tb_prior_ns),
                 _diff_int(calc_edge_ns, tb_edge_ns),
             ]
-            math_int_diffs = [
-                _diff_int(calc_ns_between, tb_ns_between),
-                _diff_int(calc_residual_fast, tb_residual_fast),
-            ]
+            interval_diff = _diff_int(calc_ns_between, tb_ns_between)
+            residual_diff = _diff_int(calc_residual_fast, tb_residual_fast)
             if any(d not in (None, 0) for d in abs_edge_int_diffs):
                 stats["science_abs_edge_int_mismatch_rows"] += 1
-            if any(d not in (None, 0) for d in math_int_diffs):
-                stats["science_math_int_mismatch_rows"] += 1
+            if interval_diff not in (None, 0):
+                stats["science_interval_rendering_diff_rows"] += 1
+            if residual_diff not in (None, 0):
+                stats["science_residual_int_mismatch_rows"] += 1
 
             float_diffs = [
                 _diff_float(sci_calc.get("edge_ns_exact"), _as_float(sci.get("current_edge_gnss_ns_exact"))),
@@ -913,12 +983,13 @@ def collect_rows(records: Iterable[Dict[str, Any]], clock: str) -> Tuple[List[Di
             "science_mismatch_flag": _fmt_delta_flag(
                 _diff_int(sci_calc.get("prior_ns"), _as_int(sci.get("prior_edge_gnss_ns"))) if use_science else None,
                 _diff_int(sci_calc.get("edge_ns"), _as_int(sci.get("current_edge_gnss_ns"))) if use_science else None,
-                _diff_int(sci_calc.get("ns_between"), _as_int(sci.get("gnss_interval_ns"))) if use_science else None,
                 _diff_int(sci_calc.get("residual_fast"), _as_int(sci.get("fast_residual_ns"))) if use_science else None,
             ) if use_science else ".",
             "delta_reference_public_count": delta_reference_public_count,
             "delta_publication_public_count": delta_publication_public_count,
             "delta_raw_valid": delta_raw_valid,
+            "delta_raw_reference_interval_cycles": delta_raw_reference_interval_cycles,
+            "delta_raw_clock_interval_cycles": delta_raw_clock_interval_cycles,
             "delta_raw_cycles": delta_raw_cycles,
             "delta_raw_fast_cycles": delta_raw_fast_cycles,
             "delta_raw_fast_ns": delta_raw_fast_ns,
@@ -952,7 +1023,7 @@ def collect_rows(records: Iterable[Dict[str, Any]], clock: str) -> Tuple[List[Di
     return rows, stats
 
 
-def _header(show_cumulative: bool, show_science_debug: bool, show_delta: bool) -> Tuple[str, str]:
+def _header(show_cumulative: bool, show_science_debug: bool, show_delta: bool, show_floorline_forensics: bool) -> Tuple[str, str]:
     parts = [
         f"{'pps':>6s}",
         f"{'src':>3s}",
@@ -969,23 +1040,28 @@ def _header(show_cumulative: bool, show_science_debug: bool, show_delta: bool) -
     if show_delta:
         parts.extend([
             f"{'dref':>6s}",
+            f"{'raw_ref':>10s}",
+            f"{'raw_clk':>10s}",
             f"{'d_raw_cyc':>10s}",
             f"{'d_raw_fast':>10s}",
-            f"{'raw-trad':>9s}",
             f"{'raw_ppb':>11s}",
-            f"{'d_fl_cyc':>9s}",
-            f"{'d_fl_fast':>9s}",
-            f"{'fl-trad':>8s}",
-            f"{'fl_ppb':>11s}",
-            f"{'raw-fl':>8s}",
+            f"{'raw-trad':>9s}",
         ])
+        if show_floorline_forensics:
+            parts.extend([
+                f"{'d_fl_cyc':>9s}",
+                f"{'d_fl_fast':>9s}",
+                f"{'fl-trad':>8s}",
+                f"{'fl_ppb':>11s}",
+                f"{'raw-fl':>8s}",
+            ])
     if show_cumulative:
         parts.extend([
-            f"{'tau_edge':>16s}",
+            f"{'tau_calc':>16s}",
             f"{'tau_tb':>16s}",
-            f"{'ppb_edge':>11s}",
+            f"{'ppb_calc':>11s}",
             f"{'ppb_tb':>11s}",
-            f"{'ppb_Δ':>11s}",
+            f"{'calc-tb':>11s}",
         ])
     if show_science_debug:
         parts.extend([
@@ -1008,7 +1084,7 @@ def _header(show_cumulative: bool, show_science_debug: bool, show_delta: bool) -
     return "  ".join(parts), "  ".join("─" * len(p) for p in parts)
 
 
-def _row_line(row: Dict[str, Any], show_cumulative: bool, show_science_debug: bool, show_delta: bool) -> str:
+def _row_line(row: Dict[str, Any], show_cumulative: bool, show_science_debug: bool, show_delta: bool, show_floorline_forensics: bool) -> str:
     parts = [
         f"{row['pps']:>6d}",
         f"{row.get('source', ''):>3s}",
@@ -1025,16 +1101,21 @@ def _row_line(row: Dict[str, Any], show_cumulative: bool, show_science_debug: bo
     if show_delta:
         parts.extend([
             _fmt_int(row.get("delta_reference_public_count"), 6),
+            _fmt_int(row.get("delta_raw_reference_interval_cycles"), 10),
+            _fmt_int(row.get("delta_raw_clock_interval_cycles"), 10),
             _fmt_int(row.get("delta_raw_cycles"), 10, signed=True),
             _fmt_int(row.get("delta_raw_fast_ns"), 10, signed=True),
-            _fmt_int(row.get("delta_raw_fast_minus_traditional"), 9, signed=True),
             _fmt_float(row.get("delta_raw_cum_ppb"), 11, 3, signed=True),
-            _fmt_int(row.get("delta_floorline_cycles"), 9, signed=True),
-            _fmt_int(row.get("delta_floorline_fast_ns"), 9, signed=True),
-            _fmt_int(row.get("delta_floorline_fast_minus_traditional"), 8, signed=True),
-            _fmt_float(row.get("delta_floorline_cum_ppb"), 11, 3, signed=True),
-            _fmt_int(row.get("delta_raw_fast_minus_floorline_fast"), 8, signed=True),
+            _fmt_int(row.get("delta_raw_fast_minus_traditional"), 9, signed=True),
         ])
+        if show_floorline_forensics:
+            parts.extend([
+                _fmt_int(row.get("delta_floorline_cycles"), 9, signed=True),
+                _fmt_int(row.get("delta_floorline_fast_ns"), 9, signed=True),
+                _fmt_int(row.get("delta_floorline_fast_minus_traditional"), 8, signed=True),
+                _fmt_float(row.get("delta_floorline_cum_ppb"), 11, 3, signed=True),
+                _fmt_int(row.get("delta_raw_fast_minus_floorline_fast"), 8, signed=True),
+            ])
     if show_cumulative:
         parts.extend([
             _fmt_float(row.get("tau_edge"), 16, 12),
@@ -1075,7 +1156,8 @@ def analyze(campaign: str,
             show_cumulative: bool = True,
             show_science_debug: bool = False,
             show_delta: bool = False,
-            mismatch_limit: int = 40) -> None:
+            mismatch_limit: int = 40,
+            show_floorline_forensics: bool = False) -> None:
     clock = normalize_clock(clock)
     records = fetch_timebase(campaign)
     if not records:
@@ -1085,42 +1167,49 @@ def analyze(campaign: str,
     rows_all, stats = collect_rows(records, clock)
     rows = rows_all[:limit] if limit else rows_all
     show_delta = show_delta and clock in ("OCXO1", "OCXO2")
+    show_floorline_forensics = show_delta and show_floorline_forensics
 
     print(f"Campaign: {campaign}  ({len(records):,} TIMEBASE rows, view={clock})")
     print()
     print("Raw nanosecond / TIMEBASE science audit")
     print("════════════════════════════════")
     print("  Primary path: fragment.<clock>.science when present; legacy projection otherwise.")
-    print("  External science calc: edge_ns = PPS/VCLOCK ns + signed(edge_dwt - pps_vclock_dwt) * 1e9 / cps")
-    print("  ns_Δ is GNSS nanoseconds between selected clock edges.")
+    print("  External science calc: Delta Cycles when delta_raw_* is present; legacy edge projection otherwise.")
+    print("  ns_Δ is the selected clock's rendered one-second interval in GNSS nanoseconds.")
     print("  res_fast = 1e9 - ns_Δ; positive means selected clock fast.")
     print("  tau_1s = 1e9 / ns_Δ, ppb_1s = (tau_1s - 1) * 1e9.")
     if show_cumulative:
-        print("  tau_edge/ppb_edge are running totals recomputed by this report from science antecedents.")
+        print("  tau_calc/ppb_calc are running totals recomputed by this report from science antecedents.")
         print("  tau_tb/ppb_tb are Teensy/TIMEBASE campaign-total values from fragment.stats.")
-        print("  ppb_Δ = ppb_edge - ppb_tb; nonzero means TIMEBASE stats still use a different authority.")
+        print("  calc-tb = ppb_calc - ppb_tb; nonzero means the recompute and TIMEBASE differ.")
     if show_delta:
-        print("  Delta columns compare new raw/FloorLine DWT-interval residuals against the traditional projected-ns residual.")
-        print("  d_raw_cyc/d_fl_cyc are clock-minus-delayed-reference cycles; *_fast columns are sign-aligned positive-fast ns.")
+        print("  Delta columns expose the exact cycle subtraction: raw_clk - raw_ref.")
+        print("  raw_ref is the delayed selected PPS/VCLOCK edge interval; raw_clk is the OCXO observed interval.")
+        print("  d_raw_cyc is clock-minus-reference cycles; d_raw_fast is sign-aligned positive-fast ns.")
+        if show_floorline_forensics:
+            print("  FloorLine columns are retired-rail forensics, not science authority.")
+        else:
+            print("  FloorLine forensics are hidden; use --floorline-forensics to inspect the retired rail.")
     if show_science_debug:
         print("  Debug columns compare TIMEBASE science integer fields to an independent recompute.")
         print("  Δprior/Δcur are absolute projected edge-coordinate differences.")
-        print("  Δint/Δres are interval/residual math differences; these should remain zero.")
+        print("  Δint is an interval-rendering difference; Δres is the residual mismatch and should remain zero.")
         print("  prior_half/cur_half show distance from the nearest half-ns rounding boundary.")
     print()
 
-    header, sep = _header(show_cumulative, show_science_debug, show_delta)
+    header, sep = _header(show_cumulative, show_science_debug, show_delta, show_floorline_forensics)
     print(header)
     print(sep)
     for row in rows:
-        print(_row_line(row, show_cumulative, show_science_debug, show_delta))
+        print(_row_line(row, show_cumulative, show_science_debug, show_delta, show_floorline_forensics))
 
     print()
     print(f"Rows shown:          {len(rows):,}")
     print(f"Rows collected:      {stats['rows_collected']:,}")
     print(f"Science rows:        {stats['science_rows']:,}")
     print(f"Science missing:     {stats['science_missing']:,}")
-    print(f"Science math int mismatch:    {stats['science_math_int_mismatch_rows']:,}")
+    print(f"Science residual int mismatch:{stats['science_residual_int_mismatch_rows']:,}")
+    print(f"Interval rendering diffs:     {stats['science_interval_rendering_diff_rows']:,}")
     print(f"Science abs-edge int mismatch:{stats['science_abs_edge_int_mismatch_rows']:,}")
     print(f"Science fp mismatch:          {stats['science_float_mismatch_rows']:,}")
     print(f"Delta raw rows:      {stats['delta_raw_rows']:,}")
@@ -1141,17 +1230,31 @@ def analyze(campaign: str,
         print("═══════════════════")
         print(f"  samples={len(valid_res):,}  mean={mean_res:+.3f} ns  min={min_res:+d} ns  max={max_res:+d} ns")
         last = next((r for r in reversed(rows) if r.get("ppb_edge") is not None), None)
+        last_raw = next((r for r in reversed(rows) if r.get("delta_raw_cum_ppb") is not None), None)
         if show_cumulative and last is not None:
-            print(
-                f"  final edge cumulative tau={last['tau_edge']:.12f}  "
-                f"ppb={last['ppb_edge']:+.3f}"
-            )
-            if last.get("tb_ppb") is not None:
+            if show_delta and last_raw is not None:
+                print(f"  final raw Delta cumulative ppb={last_raw['delta_raw_cum_ppb']:+.6f}")
+                if last.get("tb_ppb") is not None:
+                    print(
+                        f"  final TIMEBASE stats tau={last['tb_tau']:.12f}  "
+                        f"ppb={last['tb_ppb']:+.3f}  "
+                        f"raw_minus_tb={last_raw['delta_raw_cum_ppb'] - last['tb_ppb']:+.6f} ppb"
+                    )
                 print(
-                    f"  final TIMEBASE stats tau={last['tb_tau']:.12f}  "
-                    f"ppb={last['tb_ppb']:+.3f}  "
-                    f"edge_minus_tb={last['ppb_edge_minus_tb']:+.3f} ppb"
+                    f"  legacy/projection cumulative ppb_calc={last['ppb_edge']:+.3f} "
+                    f"(shown for migration only)"
                 )
+            else:
+                print(
+                    f"  final report cumulative tau={last['tau_edge']:.12f}  "
+                    f"ppb={last['ppb_edge']:+.3f}"
+                )
+                if last.get("tb_ppb") is not None:
+                    print(
+                        f"  final TIMEBASE stats tau={last['tb_tau']:.12f}  "
+                        f"ppb={last['tb_ppb']:+.3f}  "
+                        f"calc_minus_tb={last['ppb_edge_minus_tb']:+.3f} ppb"
+                    )
 
     if show_delta:
         delta_raw_rows = [r for r in rows if r.get("delta_raw_valid") and r.get("delta_raw_fast_ns") is not None]
@@ -1177,21 +1280,23 @@ def analyze(campaign: str,
                     )
                 if last is not None:
                     print(f"       raw cumulative ppb={last['delta_raw_cum_ppb']:+.6f}")
-            if delta_fl_rows:
+            if show_floorline_forensics and delta_fl_rows:
                 vals = [int(r["delta_floorline_fast_ns"]) for r in delta_fl_rows]
                 diffs = [int(r["delta_floorline_fast_minus_traditional"]) for r in delta_fl_rows if r.get("delta_floorline_fast_minus_traditional") is not None]
                 last = next((r for r in reversed(delta_fl_rows) if r.get("delta_floorline_cum_ppb") is not None), None)
                 print(
-                    f"  FloorLine: rows={len(vals):,}  mean={sum(vals)/len(vals):+.3f} ns  "
+                    f"  FloorLine retired rail: rows={len(vals):,}  mean={sum(vals)/len(vals):+.3f} ns  "
                     f"min={min(vals):+d} ns  max={max(vals):+d} ns"
                 )
                 if diffs:
                     print(
-                        f"             fl-trad mean={sum(diffs)/len(diffs):+.3f} ns  "
+                        f"                        fl-trad mean={sum(diffs)/len(diffs):+.3f} ns  "
                         f"min={min(diffs):+d} ns  max={max(diffs):+d} ns"
                     )
                 if last is not None:
-                    print(f"             FloorLine cumulative ppb={last['delta_floorline_cum_ppb']:+.6f}")
+                    print(f"                        FloorLine cumulative ppb={last['delta_floorline_cum_ppb']:+.6f}")
+            elif delta_fl_rows:
+                print("  FloorLine retired rail hidden by default; use --floorline-forensics to inspect it.")
 
     science_shown = [r for r in rows if r.get("source") == "SCI"]
     if science_shown:
@@ -1199,7 +1304,7 @@ def analyze(campaign: str,
         print("TIMEBASE science cross-check")
         print("════════════════════════════")
         print("  External recompute uses only fragment.<clock>.science antecedents.")
-        print("  Integer fields must match exactly; float fields are checked to published precision.")
+        print("  Residual fields must match exactly; interval fields may differ by rendering species.")
         print(f"  rows_with_science={len(science_shown):,}")
         max_residual_err = _max_abs(r.get("calc_residual_minus_science") for r in science_shown)
         max_ppb_1s_err = _max_abs(r.get("calc_ppb_1s_minus_science") for r in science_shown)
@@ -1210,13 +1315,23 @@ def analyze(campaign: str,
             print(f"  max |calc_ppb_1s - science_ppb_1s| = {max_ppb_1s_err:.9f} ppb")
         if max_total_ppb_err is not None:
             print(f"  max |calc_total_ppb - science_total_ppb| = {max_total_ppb_err:.9f} ppb")
+        interval_diff_rows = [
+            r for r in science_shown
+            if r.get("science_delta_ns_between") not in (None, 0)
+        ]
+        if interval_diff_rows:
+            max_interval = _max_abs(r.get("science_delta_ns_between") for r in interval_diff_rows)
+            print(
+                f"  interval rendering differences={len(interval_diff_rows):,} "
+                f"max |calc_interval - tb_interval| = {max_interval:.0f} ns"
+            )
+            print("  These are not residual failures when Δres remains zero.")
 
         mismatch_rows = [
             r for r in science_shown
             if any(r.get(k) not in (None, 0) for k in (
                 "science_delta_prior_ns",
                 "science_delta_edge_ns",
-                "science_delta_ns_between",
                 "science_delta_residual",
             ))
         ]
@@ -1226,7 +1341,7 @@ def analyze(campaign: str,
             print("═══════════════════════════════")
             print("  Δ fields are calc-minus-TIMEBASE.")
             print("  Δprior/Δcur are absolute projected edge-coordinate differences.")
-            print("  Δint/Δres are interval/residual math differences; these should remain zero.")
+            print("  Δint is an interval-rendering difference; Δres is the residual mismatch and should remain zero.")
             print("  prior_half/cur_half near 0 means the exact edge coordinate landed near")
             print("  a half-ns boundary, so ±1 ns edge-coordinate rounding differences are expected.")
 
@@ -1235,12 +1350,11 @@ def analyze(campaign: str,
             def _mismatch_kind(r: Dict[str, Any]) -> str:
                 edge_bad = any(r.get(k) not in (None, 0) for k in (
                     "science_delta_prior_ns", "science_delta_edge_ns"))
-                math_bad = any(r.get(k) not in (None, 0) for k in (
-                    "science_delta_ns_between", "science_delta_residual"))
-                if edge_bad and math_bad:
+                residual_bad = r.get("science_delta_residual") not in (None, 0)
+                if edge_bad and residual_bad:
                     return "both"
-                if math_bad:
-                    return "math"
+                if residual_bad:
+                    return "resid"
                 if edge_bad:
                     return "edge"
                 return "."
@@ -1284,10 +1398,10 @@ def analyze(campaign: str,
             max_tau_err = _max_abs(r.get("tb_tau_minus_calc") for r in shown_with_stats)
             max_ppb_err = _max_abs(r.get("tb_ppb_minus_calc") for r in shown_with_stats)
             print()
-            print("TIMEBASE stats cross-check")
+            print("Legacy public-ledger side check")
             print("══════════════════════════")
-            print("  Recomputed public-ledger tau/ppb = fragment.<clock>.ns / fragment.gnss.ns.")
-            print("  Compared against fragment.stats.<clock>.tau/ppb.")
+            print("  Recomputed ledger tau/ppb = fragment.<clock>.ns / fragment.gnss.ns.")
+            print("  This is a compatibility side surface, not the Delta Cycles authority.")
             print(f"  rows_with_stats={len(shown_with_stats):,}")
             if max_tau_err is not None:
                 print(f"  max |stats_tau - ledger_tau| = {max_tau_err:.12e}")
@@ -1306,24 +1420,22 @@ def analyze(campaign: str,
         print()
         print("Published residual side check")
         print("═════════════════════════════")
-        print("  diff = projected_res_fast - fragment.<clock>.pps_residual.fast_residual_ns")
+        print("  diff = report_res_fast - fragment.<clock>.pps_residual.fast_residual_ns")
         print(f"  rows={len(diffs):,}  mean={sum(diffs)/len(diffs):+.3f} ns  min={min(diffs):+d} ns  max={max(diffs):+d} ns")
 
     print()
     print("Notes")
     print("═════")
-    print("  • This report recomputes projected GNSS edge times from persisted TIMEBASE data;")
-    print("    it does not call live Teensy time functions.")
-    print("  • The DWT edge is the subscriber-facing published edge.  For current")
-    print("    FloorLine firmware this should be the FloorLine endpoint verified by raw_cycles.")
-    print("  • PPS rows use the physical PPS witness DWT projected against the canonical")
-    print("    PPS/VCLOCK anchor for the row.")
-    print("  • tau_edge/ppb_edge are edge-interval totals; tau_tb/ppb_tb are firmware")
-    print("    campaign-public totals from TIMEBASE stats.  They should converge, but they")
-    print("    are not identical definitions at campaign start or after gaps.")
-    print("  • First rows and rows after PPS-count gaps have no prior edge, so interval")
-    print("    columns intentionally show ---.  Firmware may have interval hints from before")
-    print("    the campaign boundary, but this report keeps campaign-local arithmetic clean.")
+    print("  • This report recomputes from persisted TIMEBASE data; it does not call")
+    print("    live Teensy time functions.")
+    print("  • For OCXO science rows, Delta Cycles is the primary authority: raw_clk - raw_ref.")
+    print("    The two intervals are same-species DWT edge-to-edge counts.")
+    print("  • FloorLine is a retired forensic rail and is hidden unless")
+    print("    --floorline-forensics is supplied.")
+    print("  • tau_calc/ppb_calc are report recomputes; tau_tb/ppb_tb are firmware")
+    print("    campaign-total values from TIMEBASE stats.")
+    print("  • First rows and rows after PPS-count gaps have no prior edge, so some")
+    print("    legacy projection columns intentionally show ---.")
     print()
 
 
@@ -1332,12 +1444,13 @@ def analyze(campaign: str,
 # -----------------------------------------------------------------------------
 
 
-def parse_args(argv: List[str]) -> Tuple[str, str, int, bool, bool, bool, int]:
+def parse_args(argv: List[str]) -> Tuple[str, str, int, bool, bool, bool, int, bool]:
     if len(argv) < 2:
         print("Usage: raw_nanoseconds <campaign_name> [clock] [limit]")
         print("       raw_nanoseconds <campaign_name> --clock OCXO2 --limit 300")
         print("       raw_nanoseconds <campaign_name> OCXO1 200")
         print("       raw_nanoseconds <campaign_name> OCXO1 --delta")
+        print("       raw_nanoseconds <campaign_name> OCXO1 --delta --floorline-forensics")
         print("       raw_nanoseconds <campaign_name> OCXO1 --science-debug --mismatch-limit 40")
         raise SystemExit(1)
 
@@ -1348,6 +1461,7 @@ def parse_args(argv: List[str]) -> Tuple[str, str, int, bool, bool, bool, int]:
     show_science_debug = False
     show_delta = False
     mismatch_limit = 40
+    show_floorline_forensics = False
 
     i = 2
     while i < len(argv):
@@ -1394,6 +1508,11 @@ def parse_args(argv: List[str]) -> Tuple[str, str, int, bool, bool, bool, int]:
             show_delta = False
             i += 1
             continue
+        if arg in ("--floorline-forensics", "--floorline", "--show-floorline"):
+            show_floorline_forensics = True
+            show_delta = True
+            i += 1
+            continue
         if arg == "--mismatch-limit":
             if i + 1 >= len(argv):
                 raise SystemExit("--mismatch-limit requires an integer")
@@ -1421,12 +1540,21 @@ def parse_args(argv: List[str]) -> Tuple[str, str, int, bool, bool, bool, int]:
             raise SystemExit(f"unknown argument '{arg}'") from exc
         i += 1
 
-    return campaign, normalize_clock(clock), limit, show_cumulative, show_science_debug, show_delta, mismatch_limit
+    return campaign, normalize_clock(clock), limit, show_cumulative, show_science_debug, show_delta, mismatch_limit, show_floorline_forensics
 
 
 def main() -> None:
-    campaign, clock, limit, show_cumulative, show_science_debug, show_delta, mismatch_limit = parse_args(sys.argv)
-    analyze(campaign, clock=clock, limit=limit, show_cumulative=show_cumulative, show_science_debug=show_science_debug, show_delta=show_delta, mismatch_limit=mismatch_limit)
+    campaign, clock, limit, show_cumulative, show_science_debug, show_delta, mismatch_limit, show_floorline_forensics = parse_args(sys.argv)
+    analyze(
+        campaign,
+        clock=clock,
+        limit=limit,
+        show_cumulative=show_cumulative,
+        show_science_debug=show_science_debug,
+        show_delta=show_delta,
+        mismatch_limit=mismatch_limit,
+        show_floorline_forensics=show_floorline_forensics,
+    )
 
 
 if __name__ == "__main__":

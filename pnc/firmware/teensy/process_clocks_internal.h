@@ -162,6 +162,13 @@ extern volatile uint64_t g_dwt_cycle_count_total;
 // second.
 extern volatile uint32_t g_dwt_cycles_between_pps_vclock;
 
+// Exact selected PPS/VCLOCK DWT edge-to-edge interval, authored directly from
+// consecutive snap.dwt_at_edge values.  Delta Cycles residuals use this
+// species-pure reference so the reference interval is formed by the same
+// DWT-at-edge subtraction doctrine as OCXO intervals.
+extern volatile uint32_t g_pps_vclock_dwt_cycles_between_edges;
+extern volatile bool     g_pps_vclock_dwt_cycles_between_edges_valid;
+
 // process_interrupt-authored synthetic 32-bit VCLOCK identity of the most
 // recent canonical PPS/VCLOCK epoch (snap.counter32_at_edge).  This is the compact
 // clock identity selected by the physical PPS pulse; it is not an ambient
@@ -186,6 +193,13 @@ extern volatile uint32_t g_last_vclock_event_counter32_at_event;
 // bridge in time.cpp is the primary consumer).
 static inline uint32_t dwt_effective_cycles_per_pps_vclock_second(void) {
   return g_dwt_cycles_between_pps_vclock;
+}
+
+// Species-pure selected PPS/VCLOCK edge interval for Delta Cycles.
+static inline uint32_t dwt_selected_pps_vclock_edge_cycles_per_second(void) {
+  return g_pps_vclock_dwt_cycles_between_edges_valid
+      ? g_pps_vclock_dwt_cycles_between_edges
+      : 0U;
 }
 
 uint64_t clocks_dwt_cycles_at_dwt(uint32_t dwt32);
