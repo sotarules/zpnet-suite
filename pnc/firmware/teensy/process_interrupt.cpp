@@ -10195,6 +10195,8 @@ struct pps_capture_packet_t {
   uint16_t vclock_hardware16_observed = 0;
   uint16_t ocxo1_hardware16 = 0;
   uint16_t ocxo2_hardware16 = 0;
+
+
   bool ocxo1_capture_hw_ready = false;
   bool ocxo2_capture_hw_ready = false;
   bool ocxo_capture_hw_ready = false;

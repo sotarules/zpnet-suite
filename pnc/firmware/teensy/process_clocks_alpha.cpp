@@ -2277,6 +2277,73 @@ static alpha_lane_logical_ticks_t g_vclock_ticks64 = {};
 static alpha_lane_logical_ticks_t g_ocxo1_ticks64 = {};
 static alpha_lane_logical_ticks_t g_ocxo2_ticks64 = {};
 
+// PPS CounterLedger state.  This is deliberately separate from the ordinary
+// OCXO event tick ledgers above.  The event ledgers advance on OCXO subscriber
+// one-second facts; CounterLedger advances only from process_interrupt's
+// PPS-authored epoch-capture packet.  The capture packet is produced by the
+// priority-0 PPS GPIO ISR, so these are PPS-synchronous samples, not foreground
+// ambient reads.
+struct alpha_pps_counterledger_lane_t {
+  bool     initialized = false;
+  uint32_t zero_counter32 = 0;
+  uint32_t last_counter32 = 0;
+  uint64_t ticks64 = 0;
+  uint64_t ns = 0;
+  uint32_t pps_sequence = 0;
+  uint32_t sample_count = 0;
+  uint32_t last_delta_ticks = 0;
+  uint64_t last_interval_ns = 0;
+  int64_t  last_fast_residual_ns = 0;
+};
+
+static alpha_pps_counterledger_lane_t g_ocxo1_pps_counterledger = {};
+static alpha_pps_counterledger_lane_t g_ocxo2_pps_counterledger = {};
+
+static void alpha_counterledger_reset_lane(alpha_pps_counterledger_lane_t& s) {
+  s = alpha_pps_counterledger_lane_t{};
+}
+
+static void alpha_counterledger_reset_all(void) {
+  alpha_counterledger_reset_lane(g_ocxo1_pps_counterledger);
+  alpha_counterledger_reset_lane(g_ocxo2_pps_counterledger);
+}
+
+static bool alpha_counterledger_epoch_ready(void) {
+  return g_ocxo1_pps_counterledger.initialized &&
+         g_ocxo2_pps_counterledger.initialized;
+}
+
+static void alpha_counterledger_install_zero(
+    alpha_pps_counterledger_lane_t& s, uint32_t zero_counter32) {
+  s = alpha_pps_counterledger_lane_t{};
+  s.initialized = true;
+  s.zero_counter32 = zero_counter32;
+  s.last_counter32 = zero_counter32;
+}
+
+static bool alpha_counterledger_apply_pps_sample(
+    alpha_pps_counterledger_lane_t& s,
+    uint32_t pps_sequence,
+    uint32_t sampled_counter32,
+    uint64_t* out_ns) {
+  if (out_ns) *out_ns = 0ULL;
+  if (!s.initialized) return false;
+
+  const uint32_t delta_ticks = sampled_counter32 - s.last_counter32;
+  s.ticks64 += (uint64_t)delta_ticks;
+  s.last_counter32 = sampled_counter32;
+  s.pps_sequence = pps_sequence;
+  s.sample_count++;
+  s.last_delta_ticks = delta_ticks;
+  s.last_interval_ns = (uint64_t)delta_ticks * (uint64_t)NS_PER_10MHZ_TICK;
+  s.last_fast_residual_ns =
+      (int64_t)s.last_interval_ns - (int64_t)NS_PER_SECOND_U64;
+  s.ns = s.ticks64 * (uint64_t)NS_PER_10MHZ_TICK;
+
+  if (out_ns) *out_ns = s.ns;
+  return true;
+}
+
 // OCXO public nanosecond ledgers are measured GNSS-elapsed clocks, not merely
 // counter-ticks × 100 ns and not ideal +1e9-per-edge nominal ledgers. The raw
 // tick ledger remains the identity surface. The measured ledger advances by
@@ -3406,6 +3473,46 @@ static bool alpha_ticks64_apply_event(time_clock_id_t clock,
 
   (void)fallback_zero_offset_counter32;
   return true;
+}
+
+static const alpha_pps_counterledger_lane_t* alpha_counterledger_lane(
+    time_clock_id_t clock) {
+  switch (clock) {
+    case time_clock_id_t::OCXO1: return &g_ocxo1_pps_counterledger;
+    case time_clock_id_t::OCXO2: return &g_ocxo2_pps_counterledger;
+    default:                    return nullptr;
+  }
+}
+
+bool clocks_alpha_ocxo_counterledger_snapshot(
+    time_clock_id_t clock,
+    clocks_alpha_ocxo_counterledger_snapshot_t* out) {
+  if (!out) return false;
+  *out = clocks_alpha_ocxo_counterledger_snapshot_t{};
+
+  const alpha_pps_counterledger_lane_t* s = alpha_counterledger_lane(clock);
+  if (!s) return false;
+
+  out->valid = s->initialized && s->sample_count != 0U;
+  out->clock_id = (uint32_t)((uint8_t)clock);
+  out->pps_sequence = s->pps_sequence;
+  out->sample_count = s->sample_count;
+  out->zero_counter32 = s->zero_counter32;
+  out->last_counter32 = s->last_counter32;
+  out->ticks64 = s->ticks64;
+  out->ns = s->ns;
+  out->last_delta_ticks = s->last_delta_ticks;
+  out->interval_ns = s->last_interval_ns;
+  out->fast_residual_ns = s->last_fast_residual_ns;
+  return out->valid;
+}
+
+bool clocks_alpha_ocxo_counterledger_ready(void) {
+  clocks_alpha_ocxo_counterledger_snapshot_t ocxo1{};
+  clocks_alpha_ocxo_counterledger_snapshot_t ocxo2{};
+  return clocks_alpha_ocxo_counterledger_snapshot(time_clock_id_t::OCXO1, &ocxo1) &&
+         clocks_alpha_ocxo_counterledger_snapshot(time_clock_id_t::OCXO2, &ocxo2) &&
+         ocxo1.valid && ocxo2.valid;
 }
 
 static bool alpha_zero_offset_valid(time_clock_id_t clock) {
@@ -5353,11 +5460,19 @@ bool clocks_alpha_ocxo_recover_reattach_snapshot(
   local.public_ns_nonzero = local.current_public_ns != 0ULL;
   local.physical_ns_nonzero = local.current_physical_ns != 0ULL;
 
-  local.ready =
-      local.forensics_ready &&
-      local.edge_history_ready &&
-      local.projection_ready &&
-      local.public_ns_nonzero;
+  if (clocks_ocxo_counterledger_mode()) {
+    // CounterLedger recovery reattachment is proved by the public PPS-sampled
+    // counter ledger itself.  It does not depend on OCXO edge projection or
+    // FloorLine evidence, which remain diagnostics in this mode.
+    local.projection_ready = local.public_ns_nonzero;
+    local.ready = local.public_ns_nonzero;
+  } else {
+    local.ready =
+        local.forensics_ready &&
+        local.edge_history_ready &&
+        local.projection_ready &&
+        local.public_ns_nonzero;
+  }
 
   *out = local;
   return true;
@@ -5424,6 +5539,7 @@ static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
   g_ocxo2_interrupt_diag = {};
   alpha_forensics_reset_all();
   alpha_ticks64_reset_all();
+  alpha_counterledger_reset_all();
   alpha_measured_ns_reset_all();
   alpha_ocxo_pps_projection_reset_all();
   alpha_ocxo_visible_origin_reset_all();
@@ -5600,6 +5716,10 @@ bool clocks_alpha_zero_from_smartzero(const char* reason) {
   alpha_ticks64_install_zero(g_vclock_ticks64, vclock.anchor_counter32);
   alpha_ticks64_install_zero(g_ocxo1_ticks64, ocxo1.anchor_counter32);
   alpha_ticks64_install_zero(g_ocxo2_ticks64, ocxo2.anchor_counter32);
+  alpha_counterledger_install_zero(g_ocxo1_pps_counterledger,
+                                   ocxo1.anchor_counter32);
+  alpha_counterledger_install_zero(g_ocxo2_pps_counterledger,
+                                   ocxo2.anchor_counter32);
 
   // OCXO measured ledgers have their own mathematically-qualified zero
   // anchors. The first post-zero OCXO edge measures from that OCXO anchor,
@@ -6164,6 +6284,34 @@ static bool alpha_sample_all_clocks_at_pps_vclock(const pps_edge_snapshot_t& sna
     g_alpha_runtime_epoch_capture_sequence_mismatch_count++;
   }
 
+  uint64_t ocxo1_counterledger_ns = 0ULL;
+  uint64_t ocxo2_counterledger_ns = 0ULL;
+  const bool counterledger_epoch_ready =
+      clocks_ocxo_counterledger_mode() && alpha_counterledger_epoch_ready();
+  if (counterledger_epoch_ready) {
+    const bool counterledger_capture_ready =
+        cap_available &&
+        cap.valid &&
+        cap.all_lanes_capture_valid &&
+        cap.sequence == snap.sequence;
+    if (!counterledger_capture_ready ||
+        !alpha_counterledger_apply_pps_sample(g_ocxo1_pps_counterledger,
+                                              snap.sequence,
+                                              cap.ocxo1_counter32,
+                                              &ocxo1_counterledger_ns) ||
+        !alpha_counterledger_apply_pps_sample(g_ocxo2_pps_counterledger,
+                                              snap.sequence,
+                                              cap.ocxo2_counter32,
+                                              &ocxo2_counterledger_ns)) {
+      clocks_watchdog_anomaly("alpha_counterledger_capture_invalid",
+                              snap.sequence,
+                              cap.sequence,
+                              cap.valid ? 1U : 0U,
+                              cap.all_lanes_capture_valid ? 1U : 0U);
+      return false;
+    }
+  }
+
   // Record this second's bridge anchor before sampling OCXO measured ledgers.
   // The physical PPS witness DWT is paired with its GNSS nanosecond coordinate.
   // vclock_ns is the canonical PPS/VCLOCK ledger value; physical PPS precedes
@@ -6181,10 +6329,10 @@ static bool alpha_sample_all_clocks_at_pps_vclock(const pps_edge_snapshot_t& sna
                                pps_gnss_ns);
   }
 
-  const uint64_t ocxo1_physical_ns =
+  uint64_t ocxo1_physical_ns =
       alpha_ocxo_project_measured_ns_to_dwt_live(time_clock_id_t::OCXO1,
                                                  snap.dwt_at_edge);
-  const uint64_t ocxo2_physical_ns =
+  uint64_t ocxo2_physical_ns =
       alpha_ocxo_project_measured_ns_to_dwt_live(time_clock_id_t::OCXO2,
                                                  snap.dwt_at_edge);
   const uint64_t ocxo1_measured_visible_ns =
@@ -6238,12 +6386,31 @@ static bool alpha_sample_all_clocks_at_pps_vclock(const pps_edge_snapshot_t& sna
         time_clock_id_t::OCXO2, snap.sequence, vclock_ns, ocxo2_visible_ns);
   }
 
-  const uint64_t ocxo1_ns =
+  uint64_t ocxo1_ns =
       alpha_ocxo_public_ns_from_visible_origin(time_clock_id_t::OCXO1,
                                                ocxo1_visible_ns);
-  const uint64_t ocxo2_ns =
+  uint64_t ocxo2_ns =
       alpha_ocxo_public_ns_from_visible_origin(time_clock_id_t::OCXO2,
                                                ocxo2_visible_ns);
+
+  if (counterledger_epoch_ready) {
+    // CounterLedger is the PPS-sampled clockface authority.  Capture the
+    // public-origin offset from the same PPS-authored samples, then publish the
+    // public OCXO value from the counter ledger rather than from any DWT
+    // projection surface.
+    alpha_ocxo_visible_origin_maybe_capture_public_origin(
+        time_clock_id_t::OCXO1, snap.sequence, vclock_ns, ocxo1_counterledger_ns);
+    alpha_ocxo_visible_origin_maybe_capture_public_origin(
+        time_clock_id_t::OCXO2, snap.sequence, vclock_ns, ocxo2_counterledger_ns);
+    ocxo1_physical_ns = ocxo1_counterledger_ns;
+    ocxo2_physical_ns = ocxo2_counterledger_ns;
+    ocxo1_ns =
+        alpha_ocxo_public_ns_from_visible_origin(time_clock_id_t::OCXO1,
+                                                 ocxo1_counterledger_ns);
+    ocxo2_ns =
+        alpha_ocxo_public_ns_from_visible_origin(time_clock_id_t::OCXO2,
+                                                 ocxo2_counterledger_ns);
+  }
 
 
   g_gnss_ns_at_pps_vclock = vclock_ns;

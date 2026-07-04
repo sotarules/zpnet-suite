@@ -206,6 +206,69 @@ static inline uint32_t dwt_selected_pps_vclock_edge_cycles_per_second(void) {
 uint64_t clocks_dwt_cycles_at_dwt(uint32_t dwt32);
 
 // ============================================================================
+// OCXO public nanosecond authority mode
+// ============================================================================
+//
+// TRADITIONAL_PPS_PROJECTION keeps the existing PPS-row OCXO public clock
+// value: Alpha projects measured OCXO edge evidence to the selected PPS/VCLOCK
+// DWT coordinate, then Beta may render the public clock from Delta Cycles
+// totals.
+//
+// PPS_COUNTERLEDGER makes the public OCXO nanosecond clocks integer hardware
+// tick ledgers sampled at the PPS ISR capture window. process_interrupt owns
+// the counter reads; Alpha consumes only the authored epoch-capture packet and
+// computes OCXO public ns as:
+//
+//   sampled_ticks_since_zero * 100 ns
+//
+// DWT/Delta/FloorLine remain diagnostics. Public OCXO TAU/PPB become simple
+// campaign clockface ratios, and OCXO Welfords consume the 100 ns-quantized
+// CounterLedger one-second residuals.
+
+enum class clocks_ocxo_public_ns_authority_t : uint8_t {
+  TRADITIONAL_PPS_PROJECTION = 0,
+  PPS_COUNTERLEDGER          = 1,
+};
+
+static constexpr clocks_ocxo_public_ns_authority_t
+    CLOCKS_OCXO_PUBLIC_NS_AUTHORITY =
+        clocks_ocxo_public_ns_authority_t::TRADITIONAL_PPS_PROJECTION;
+
+static inline constexpr bool clocks_ocxo_counterledger_mode(void) {
+  return CLOCKS_OCXO_PUBLIC_NS_AUTHORITY ==
+         clocks_ocxo_public_ns_authority_t::PPS_COUNTERLEDGER;
+}
+
+static inline constexpr bool clocks_ocxo_counterledger_mode_enabled(void) {
+  return clocks_ocxo_counterledger_mode();
+}
+
+static inline constexpr const char* clocks_ocxo_public_ns_authority_name(void) {
+  return clocks_ocxo_counterledger_mode()
+      ? "PPS_COUNTERLEDGER"
+      : "TRADITIONAL_PPS_PROJECTION";
+}
+
+struct clocks_alpha_ocxo_counterledger_snapshot_t {
+  bool     valid = false;
+  uint32_t clock_id = 0;
+  uint32_t pps_sequence = 0;
+  uint32_t sample_count = 0;
+  uint32_t zero_counter32 = 0;
+  uint32_t last_counter32 = 0;
+  uint64_t ticks64 = 0;
+  uint64_t ns = 0;
+  uint32_t last_delta_ticks = 0;
+  uint64_t interval_ns = 0;
+  int64_t  fast_residual_ns = 0;
+};
+
+bool clocks_alpha_ocxo_counterledger_snapshot(
+    time_clock_id_t clock,
+    clocks_alpha_ocxo_counterledger_snapshot_t* out);
+bool clocks_alpha_ocxo_counterledger_ready(void);
+
+// ============================================================================
 // Clock common tolerance
 // ============================================================================
 //

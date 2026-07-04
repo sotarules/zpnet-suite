@@ -886,8 +886,14 @@ static uint64_t floorline_render_legacy_clock_interval_ns(
     const clock_science_row_t& row) {
   if (!row.valid) return 0ULL;
 
-  // Physical interval rendering: positive fast means the clock period was
-  // shorter than the GNSS reference second.
+  if (clocks_ocxo_counterledger_mode_enabled()) {
+    // CounterLedger residuals are clockface elapsed time: positive fast means
+    // the OCXO ledger advanced more than the GNSS second.
+    return row.clock_interval_ns;
+  }
+
+  // Traditional Delta rendering: positive fast means the physical clock period
+  // was shorter than the GNSS reference second.
   const int64_t rendered =
       (int64_t)CLOCKS_BETA_NS_PER_SECOND - row.fast_residual_ns;
   return (rendered > 0) ? (uint64_t)rendered : 0ULL;
@@ -897,6 +903,14 @@ static uint64_t floorline_render_public_clock_ns(
     uint64_t public_gnss_ns,
     const clock_science_row_t& row,
     uint64_t fallback_public_ns) {
+  if (clocks_ocxo_counterledger_mode_enabled()) {
+    // CounterLedger public ns is already authored by Alpha from the
+    // PPS-captured OCXO counter.  Do not re-render it from Delta totals.
+    (void)public_gnss_ns;
+    (void)row;
+    return fallback_public_ns;
+  }
+
   if (!row.total_valid) return fallback_public_ns;
 
   if (row.total_fast_residual_ns >= 0) {
@@ -1102,6 +1116,19 @@ static bool campaign_start_handoff_ready(void) {
       ocxo1_projection_ok ? ocxo1_projection.pps_vclock_ns : 0ULL;
   g_start_handoff_last_ocxo2_projection_vclock_ns =
       ocxo2_projection_ok ? ocxo2_projection.pps_vclock_ns : 0ULL;
+
+  if (clocks_ocxo_counterledger_mode_enabled()) {
+    const bool counterledger_ready = clocks_alpha_ocxo_counterledger_ready();
+    g_start_handoff_last_ready = origin_ready && counterledger_ready;
+
+    if (!origin_ready) {
+      g_start_handoff_wait_origin_count++;
+    }
+    if (!counterledger_ready) {
+      g_start_handoff_wait_projection_count++;
+    }
+    return g_start_handoff_last_ready;
+  }
 
   g_start_handoff_last_ready =
       origin_ready && ocxo1_projection_ready && ocxo2_projection_ready;
@@ -2756,7 +2783,9 @@ static void payload_add_ocxo_pps_residual_object(Payload& parent,
   residual.add("clock_interval_ns", valid ? clock_interval_ns : 0ULL);
   residual.add("fast_residual_ns", valid ? fast_residual_ns : 0LL);
   residual.add("positive_means", "clock_fast");
-  residual.add("source", "DELTA_OBSERVED_DWT_EDGE");
+  residual.add("source", clocks_ocxo_counterledger_mode_enabled()
+      ? "COUNTERLEDGER_PPS_CAPTURE"
+      : "DELTA_OBSERVED_DWT_EDGE");
   residual.add("floorline_preserved_under", "science.delta_floorline_fast_residual_ns");
   residual.add("traditional_preserved_under", "science.traditional_fast_residual_ns");
   parent.add_object("pps_residual", residual);
@@ -3246,6 +3275,38 @@ static void clock_science_apply_campaign_public_ratio(clock_science_row_t& row,
       : 0LL;
 }
 
+static void clock_science_apply_counterledger_row(
+    clock_science_row_t& row,
+    const clocks_alpha_ocxo_counterledger_snapshot_t& ledger,
+    uint64_t public_gnss_ns) {
+  if (!clocks_ocxo_counterledger_mode_enabled()) return;
+
+  row.valid = ledger.valid;
+  row.antecedents_complete = ledger.valid && ledger.interval_ns != 0ULL;
+  row.prior_edge_gnss_ns = beta_i64_from_u64_saturating(public_gnss_ns) -
+                           beta_i64_from_u64_saturating(CLOCKS_BETA_NS_PER_SECOND);
+  row.current_edge_gnss_ns = beta_i64_from_u64_saturating(public_gnss_ns);
+  row.prior_edge_gnss_ns_exact = (double)row.prior_edge_gnss_ns;
+  row.current_edge_gnss_ns_exact = (double)public_gnss_ns;
+
+  row.gnss_interval_ns = CLOCKS_BETA_NS_PER_SECOND;
+  row.gnss_interval_ns_exact = (double)CLOCKS_BETA_NS_PER_SECOND;
+  row.clock_interval_ns = ledger.valid ? ledger.interval_ns : 0ULL;
+  row.clock_interval_ns_exact = ledger.valid
+      ? (double)ledger.interval_ns
+      : 0.0;
+  row.fast_residual_ns = ledger.valid ? ledger.fast_residual_ns : 0LL;
+  row.fast_residual_ns_exact = ledger.valid
+      ? (double)ledger.fast_residual_ns
+      : 0.0;
+  row.tau_1s = (ledger.valid && ledger.interval_ns != 0ULL)
+      ? ((double)ledger.interval_ns / (double)CLOCKS_BETA_NS_PER_SECOND)
+      : 1.0;
+  row.ppb_1s = ledger.valid
+      ? campaign_total_ppb_from_tau(row.tau_1s)
+      : 0.0;
+}
+
 static clock_science_row_t floorline_science_build_ocxo(
     time_clock_id_t clock,
     uint32_t public_count,
@@ -3681,6 +3742,43 @@ static bool campaign_start_prologue_should_hold(void) {
   bool ocxo1_valid = false;
   bool ocxo2_valid = false;
 
+  if (clocks_ocxo_counterledger_mode_enabled()) {
+    if (!campaign_start_handoff_ready()) {
+      if (g_start_handoff_launch_wait_count != UINT32_MAX) {
+        g_start_handoff_launch_wait_count++;
+      }
+      if (g_start_handoff_launch_wait_count >=
+          CLOCKS_START_HANDOFF_TIMEOUT_CANDIDATES) {
+        campaign_start_prologue_abort_launch("counterledger_start_handoff_timeout");
+        return true;
+      }
+      campaign_start_prologue_set_reason("waiting_for_counterledger_pps_capture");
+      return true;
+    }
+
+    g_start_handoff_launch_wait_count = 0;
+
+    if (!g_start_prologue_seeded) {
+      // CounterLedger still needs the same campaign-public PPS0 doctrine as
+      // Delta mode: consume one private PPS-synchronous counter sample, set
+      // the public offsets to that sample, then let the next candidate publish
+      // as public PPS1.  No DWT/FloorLine fit probe is needed.
+      campaign_public_offsets_reset_to_current();
+      g_start_prologue_seeded = true;
+      g_start_prologue_reference_ready = true;
+      g_start_prologue_pps0_interval_valid = true;
+      g_start_prologue_private_candidate_count++;
+      g_start_prologue_last_private_count =
+          g_start_prologue_private_candidate_count;
+      campaign_start_prologue_set_reason("counterledger_private_pps0_consumed");
+      return true;
+    }
+
+    g_start_handoff_commit_count++;
+    campaign_start_prologue_set_reason("counterledger_release_public_pps1");
+    return false;
+  }
+
   if (!campaign_start_handoff_ready()) {
     if (g_start_handoff_launch_wait_count != UINT32_MAX) {
       g_start_handoff_launch_wait_count++;
@@ -3743,6 +3841,7 @@ static void payload_add_clock_science_common(Payload& science,
     science.add("clock_id", row.clock_id);
     science.add("public_count", row.public_count);
     science.add("positive_means", "clock_fast");
+    science.add("public_ns_mode", clocks_ocxo_public_ns_authority_name());
 
     // Projection antecedents retained so raw_nanoseconds can independently
     // reconstruct the traditional FloorLine DWT->GNSS residual if desired.
@@ -3760,7 +3859,11 @@ static void payload_add_clock_science_common(Payload& science,
     // Canonical residual surface.  Delta Cycles is the authority; these
     // unprefixed fields are now the observed-DWT Delta rendering.
     science.add("residual_source",
-                ocxo_science_row ? "DELTA_OBSERVED_DWT_EDGE" : "GNSS_IDENTITY");
+                ocxo_science_row
+                    ? (clocks_ocxo_counterledger_mode_enabled()
+                           ? "COUNTERLEDGER_PPS_CAPTURE"
+                           : "DELTA_OBSERVED_DWT_EDGE")
+                    : "GNSS_IDENTITY");
     science.add("gnss_interval_ns", row.gnss_interval_ns);
     science.add("clock_interval_ns", row.clock_interval_ns);
     science.add("fast_residual_ns", row.fast_residual_ns);
@@ -3851,8 +3954,13 @@ static void payload_add_clock_science_common(Payload& science,
   science.add("clock_id", row.clock_id);
   science.add("public_count", row.public_count);
   science.add("positive_means", "clock_fast");
+  science.add("public_ns_mode", clocks_ocxo_public_ns_authority_name());
   science.add("residual_source",
-              ocxo_science_row ? "DELTA_OBSERVED_DWT_EDGE" : "GNSS_IDENTITY");
+              ocxo_science_row
+                  ? (clocks_ocxo_counterledger_mode_enabled()
+                         ? "COUNTERLEDGER_PPS_CAPTURE"
+                         : "DELTA_OBSERVED_DWT_EDGE")
+                  : "GNSS_IDENTITY");
   science.add("traditional_residual_source",
               ocxo_science_row ? "PROJECTED_GNSS_FLOORLINE_DWT_CPS" : "NONE");
 
@@ -4064,9 +4172,11 @@ static void payload_add_ocxo_science_object(Payload& lane,
                   ? "OBSERVED_DWT_EDGE"
                   : "OBSERVED_DWT_EDGE_AUTHORITY");
   science.add("frequency_source",
-              TIMEBASE_FRAGMENT_COMPACT_SCIENCE_ENABLED
-                  ? "DELTA_OBSERVED_DWT_EDGE"
-                  : "DELTA_CYCLES_OBSERVED_DWT_REFERENCE_DELAY_1");
+              clocks_ocxo_counterledger_mode_enabled()
+                  ? "COUNTERLEDGER_PPS_CAPTURE"
+                  : (TIMEBASE_FRAGMENT_COMPACT_SCIENCE_ENABLED
+                         ? "DELTA_OBSERVED_DWT_EDGE"
+                         : "DELTA_CYCLES_OBSERVED_DWT_REFERENCE_DELAY_1"));
   if (!TIMEBASE_FRAGMENT_COMPACT_SCIENCE_ENABLED) {
     science.add("delta_formula",
                 "fast = delayed_gnss_pps_cycles - ocxo_observed_dwt_cycles");
@@ -4448,9 +4558,13 @@ static void payload_add_ocxo_fragment(Payload& p,
   // projection flags remain as legacy/forensic side-channels for dashboards/
   // report migration.
   lane.add("ns", public_ns);
-  lane.add("ns_source_id", pps_residual_valid ? 3U : 1U);
+  lane.add("ns_source_id", clocks_ocxo_counterledger_mode_enabled()
+      ? 4U
+      : (pps_residual_valid ? 3U : 1U));
   lane.add("ns_source_name",
-           pps_residual_valid ? "DELTA_CYCLES_TOTAL" : "MEASURED_GNSS_FALLBACK");
+           clocks_ocxo_counterledger_mode_enabled()
+               ? "COUNTERLEDGER_PPS_CAPTURE"
+               : (pps_residual_valid ? "DELTA_CYCLES_TOTAL" : "MEASURED_GNSS_FALLBACK"));
   lane.add("pps_projected_valid", pps_projection_valid);
   lane.add("pps_projection_source", pps_projection_valid ? pps_projection_source : 0U);
   lane.add("measured_gnss_ns", public_measured_ns);
@@ -4504,9 +4618,13 @@ static FLASHMEM void payload_add_ocxo_forensics(Payload& p,
   // proof.  Retired quiet-phase sample fields, measurement/window counters,
   // SpinCatch/SpinIdle, regression, and verbose projection deltas are report-only.
   lane.add("ns", public_ns);
-  lane.add("ns_source_id", pps_residual_valid ? 3U : 1U);
+  lane.add("ns_source_id", clocks_ocxo_counterledger_mode_enabled()
+      ? 4U
+      : (pps_residual_valid ? 3U : 1U));
   lane.add("ns_source_name",
-           pps_residual_valid ? "DELTA_CYCLES_TOTAL" : "MEASURED_GNSS_FALLBACK");
+           clocks_ocxo_counterledger_mode_enabled()
+               ? "COUNTERLEDGER_PPS_CAPTURE"
+               : (pps_residual_valid ? "DELTA_CYCLES_TOTAL" : "MEASURED_GNSS_FALLBACK"));
   lane.add("pps_projected_valid", pps_projection_valid);
   lane.add("pps_projected_raw_ns",
            pps_projection_valid ? pps_projection.projected_ocxo_ns_at_pps : 0ULL);
@@ -4545,11 +4663,11 @@ static FLASHMEM void payload_add_ocxo_forensics(Payload& p,
   p.add_object(key, lane);
 }
 
-// Servo source doctrine. Servo input is explicitly the canonical Delta Cycles
-// residual surface for MEAN and NOW. MEAN consumes the Welford mean of exact
-// Delta residuals (ns/sec == ppb). TOTAL consumes the published campaign
-// clockface ratio (public_ocxo_ns / public_gnss_ns) and shapes it through the
-// catch-up controller. NOW consumes the current Delta one-second residual.
+// Servo source doctrine. MEAN and NOW consume whichever one-second residual
+// surface is canonical for this build: Delta Cycles in traditional mode,
+// CounterLedger PPS-capture residuals in CounterLedger mode. TOTAL consumes the
+// published campaign clockface ratio (public_ocxo_ns / public_gnss_ns) and
+// shapes it through the catch-up controller.
 static constexpr uint32_t SERVO_INPUT_SOURCE_NONE = 0;
 static constexpr uint32_t SERVO_INPUT_SOURCE_MEAN_PPS_RESIDUAL_WELFORD = 1;
 static constexpr uint32_t SERVO_INPUT_SOURCE_TOTAL_PUBLIC_TAU = 2;
@@ -5717,10 +5835,30 @@ void clocks_beta_pps(void) {
                                    ocxo2_forensics,
                                    g_floorline_science_ocxo2);
 
-  const uint64_t public_ocxo1_ns = floorline_render_public_clock_ns(
-      public_gnss_ns, ocxo1_floorline_science, public_ocxo1_measured_ns);
-  const uint64_t public_ocxo2_ns = floorline_render_public_clock_ns(
-      public_gnss_ns, ocxo2_floorline_science, public_ocxo2_measured_ns);
+  clocks_alpha_ocxo_counterledger_snapshot_t ocxo1_counterledger{};
+  clocks_alpha_ocxo_counterledger_snapshot_t ocxo2_counterledger{};
+  (void)clocks_alpha_ocxo_counterledger_snapshot(time_clock_id_t::OCXO1,
+                                                 &ocxo1_counterledger);
+  (void)clocks_alpha_ocxo_counterledger_snapshot(time_clock_id_t::OCXO2,
+                                                 &ocxo2_counterledger);
+
+  const uint64_t public_ocxo1_alpha_ns = campaign_public_ocxo1_ns();
+  const uint64_t public_ocxo2_alpha_ns = campaign_public_ocxo2_ns();
+  const uint64_t public_ocxo1_ns = clocks_ocxo_counterledger_mode_enabled()
+      ? public_ocxo1_alpha_ns
+      : floorline_render_public_clock_ns(
+            public_gnss_ns, ocxo1_floorline_science, public_ocxo1_measured_ns);
+  const uint64_t public_ocxo2_ns = clocks_ocxo_counterledger_mode_enabled()
+      ? public_ocxo2_alpha_ns
+      : floorline_render_public_clock_ns(
+            public_gnss_ns, ocxo2_floorline_science, public_ocxo2_measured_ns);
+
+  clock_science_apply_counterledger_row(ocxo1_floorline_science,
+                                        ocxo1_counterledger,
+                                        public_gnss_ns);
+  clock_science_apply_counterledger_row(ocxo2_floorline_science,
+                                        ocxo2_counterledger,
+                                        public_gnss_ns);
 
   // Published OCXO TAU/PPB are campaign clockface ratios, not physical-period
   // Delta ratios: public_ocxo_ns / public_gnss_ns.  The one-second residuals
@@ -8633,7 +8771,9 @@ static FLASHMEM Payload cmd_report_stats(const Payload&) {
 
   publish_freq(p, "ocxo1", campaign_total_ppb_from_tau(ocxo1_floorline_tau));
   publish_freq(p, "ocxo2", campaign_total_ppb_from_tau(ocxo2_floorline_tau));
-  p.add("frequency_source", "DELTA_CYCLES_TOTALS");
+  p.add("frequency_source", clocks_ocxo_counterledger_mode_enabled()
+      ? "COUNTERLEDGER_PPS_CAPTURE"
+      : "DELTA_CYCLES_TOTALS");
   p.add("ocxo1_frequency_valid", ocxo1_floorline_total_valid);
   p.add("ocxo2_frequency_valid", ocxo2_floorline_total_valid);
   p.add("recover_welford_capture_count", g_recover_welford_capture_count);
