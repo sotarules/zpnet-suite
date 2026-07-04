@@ -656,20 +656,25 @@ struct pps_interval_residuals_t {
   int64_t  ocxo2_fast_residual_ns = 0;
 };
 
-// Delta science totals.  Canonical clock totals are physical interval sums:
-// for a fast clock the one-second period is shorter, so
+// Delta science totals.  Canonical one-second residuals remain physical
+// interval sums: for a fast clock the one-second period is shorter, so
 //   clock_interval = reference_interval - fast_residual.
-// Tau/PPB are derived as reference_interval / clock_interval, preserving the
-// project-wide positive-fast convention without inverting nanosecond interval
-// meaning.  Traditional projected-GNSS totals are kept beside this for audit.
+//
+// Campaign TAU/PPB publication, however, is now a clockface ledger ratio:
+//   total_tau = public_clock_ns / public_gnss_ns
+//   total_ppb = (total_tau - 1) * 1e9
+//
+// That ratio is applied after the public OCXO nanosecond value is rendered.
+// The interval totals below are still accumulated so residual/Welford/servo
+// diagnostics keep their existing Delta Cycles evidence surface.
+// Traditional projected-GNSS totals are kept beside this for audit.
 static constexpr uint64_t CLOCKS_BETA_NS_PER_SECOND = 1000000000ULL;
 
 struct floorline_science_totals_t {
-  // Canonical Delta Cycles totals.  Reference is the delayed GNSS-second
-  // DWT interval; clock_interval_total_ns is the physical OCXO period sum
-  // rendered as reference - fast residual.  total_tau is therefore
-  // reference_total / clock_interval_total, so positive fast still yields
-  // tau > 1 while interval fields keep their literal nanosecond meaning.
+  // Delta Cycles residual accumulation.  These interval sums are used to
+  // render the public OCXO nanosecond ledger and to preserve the residual
+  // evidence, but published total_tau/total_ppb are overwritten later with the
+  // campaign clockface ratio public_ocxo_ns / public_gnss_ns.
   uint32_t sample_count = 0;
   uint64_t clock_interval_total_ns = 0;
   uint64_t gnss_interval_total_ns = 0;
@@ -2276,9 +2281,9 @@ static void payload_add_stats_ocxo_clock(Payload& parent,
   payload_add_welford_object(obj, "welford", w);
 
   // Keep the public stats object compact.  The canonical OCXO frequency value
-  // is observed-edge Delta Cycles total_ppb/total_tau; the traditional
-  // projected-GNSS total remains under fragment.ocxoN.science.traditional_*
-  // for reports.
+  // is the campaign clockface ratio published in science.total_ppb/total_tau:
+  // public_ocxo_ns / public_gnss_ns.  Welford continues to describe the
+  // per-second Delta residual distribution.
   const double ppb = science.total_valid ? science.total_ppb : 0.0;
   payload_add_frequency_fields(obj, ppb);
 
@@ -3216,6 +3221,31 @@ static void floorline_science_attach_totals(clock_science_row_t& row,
       : 0LL;
 }
 
+static void clock_science_apply_campaign_public_ratio(clock_science_row_t& row,
+                                                      uint64_t public_gnss_ns,
+                                                      uint64_t public_clock_ns,
+                                                      uint32_t public_count) {
+  row.total_sample_count = public_count;
+  row.total_clock_interval_ns = public_clock_ns;
+  row.total_gnss_interval_ns = public_gnss_ns;
+  row.total_clock_interval_ns_exact = (double)public_clock_ns;
+  row.total_gnss_interval_ns_exact = (double)public_gnss_ns;
+  row.total_valid = public_gnss_ns != 0ULL && public_clock_ns != 0ULL;
+
+  row.total_tau = row.total_valid
+      ? campaign_total_tau_from_ratio(public_gnss_ns, public_clock_ns)
+      : 1.0;
+  row.total_ppb = row.total_valid
+      ? campaign_total_ppb_from_tau(row.total_tau)
+      : 0.0;
+  row.total_fast_residual_ns_exact = row.total_valid
+      ? ((double)public_clock_ns - (double)public_gnss_ns)
+      : 0.0;
+  row.total_fast_residual_ns = row.total_valid
+      ? beta_signed_delta_u64(public_clock_ns, public_gnss_ns)
+      : 0LL;
+}
+
 static clock_science_row_t floorline_science_build_ocxo(
     time_clock_id_t clock,
     uint32_t public_count,
@@ -3748,8 +3778,13 @@ static void payload_add_clock_science_common(Payload& science,
     science.add("traditional_tau_1s", row.traditional_tau_1s, 12);
     science.add("traditional_ppb_1s", row.traditional_ppb_1s, 6);
 
-    // Campaign-total frequency summary.  Unprefixed totals are canonical
-    // Delta totals; traditional_* totals remain comparison evidence.
+    // Campaign-total frequency summary.  Unprefixed total_tau/total_ppb and
+    // total_fast_residual_ns are simple public-ledger clockface quantities:
+    // public_clock_ns / public_gnss_ns and public_clock_ns - public_gnss_ns.
+    // One-second Delta residuals remain in fast_residual_ns and delta_*;
+    // traditional_* totals remain comparison evidence.
+    science.add("total_ratio_source",
+                ocxo_science_row ? "PUBLIC_CLOCK_NS_OVER_GNSS_NS" : "GNSS_IDENTITY");
     science.add("total_valid", row.total_valid);
     science.add("total_sample_count", row.total_sample_count);
     science.add("total_fast_residual_ns", row.total_fast_residual_ns);
@@ -3916,6 +3951,8 @@ static void payload_add_clock_science_common(Payload& science,
   science.add("traditional_tau_1s", row.traditional_tau_1s, 12);
   science.add("traditional_ppb_1s", row.traditional_ppb_1s, 6);
 
+  science.add("total_ratio_source",
+              ocxo_science_row ? "PUBLIC_CLOCK_NS_OVER_GNSS_NS" : "GNSS_IDENTITY");
   science.add("total_valid", row.total_valid);
   science.add("total_sample_count", row.total_sample_count);
   science.add("total_clock_interval_ns", row.total_clock_interval_ns);
@@ -4411,9 +4448,9 @@ static void payload_add_ocxo_fragment(Payload& p,
   // projection flags remain as legacy/forensic side-channels for dashboards/
   // report migration.
   lane.add("ns", public_ns);
-  lane.add("ns_source_id", science_row.total_valid ? 3U : 1U);
+  lane.add("ns_source_id", pps_residual_valid ? 3U : 1U);
   lane.add("ns_source_name",
-           science_row.total_valid ? "DELTA_CYCLES_TOTAL" : "MEASURED_GNSS_FALLBACK");
+           pps_residual_valid ? "DELTA_CYCLES_TOTAL" : "MEASURED_GNSS_FALLBACK");
   lane.add("pps_projected_valid", pps_projection_valid);
   lane.add("pps_projection_source", pps_projection_valid ? pps_projection_source : 0U);
   lane.add("measured_gnss_ns", public_measured_ns);
@@ -4509,9 +4546,10 @@ static FLASHMEM void payload_add_ocxo_forensics(Payload& p,
 }
 
 // Servo source doctrine. Servo input is explicitly the canonical Delta Cycles
-// residual surface. MEAN consumes the Welford mean of exact Delta residuals
-// (ns/sec == ppb). TOTAL consumes the accumulated Delta-rendered OCXO/GNSS
-// ratio over the campaign. NOW consumes the current Delta one-second residual.
+// residual surface for MEAN and NOW. MEAN consumes the Welford mean of exact
+// Delta residuals (ns/sec == ppb). TOTAL consumes the published campaign
+// clockface ratio (public_ocxo_ns / public_gnss_ns) and shapes it through the
+// catch-up controller. NOW consumes the current Delta one-second residual.
 static constexpr uint32_t SERVO_INPUT_SOURCE_NONE = 0;
 static constexpr uint32_t SERVO_INPUT_SOURCE_MEAN_PPS_RESIDUAL_WELFORD = 1;
 static constexpr uint32_t SERVO_INPUT_SOURCE_TOTAL_PUBLIC_TAU = 2;
@@ -4522,7 +4560,7 @@ static const char* servo_input_source_name(uint32_t source) {
     case SERVO_INPUT_SOURCE_MEAN_PPS_RESIDUAL_WELFORD:
       return "PPS_RESIDUAL_WELFORD_MEAN_PPB";
     case SERVO_INPUT_SOURCE_TOTAL_PUBLIC_TAU:
-      return "DELTA_SCIENCE_TOTAL_TAU";
+      return "PUBLIC_CLOCK_NS_OVER_GNSS_NS_TOTAL_TAU";
     case SERVO_INPUT_SOURCE_NOW_PPS_RESIDUAL:
       return "PPS_RESIDUAL_NOW_PPB";
     default:
@@ -4570,7 +4608,7 @@ static void servo_input_diag_reset(servo_input_diag_t& d) {
 static FLASHMEM void payload_add_servo_input_diag(Payload& lane,
                                          const servo_input_diag_t& d) {
   Payload input;
-  input.add("control_doctrine", "DELTA_CYCLES_CANONICAL_RESIDUAL");
+  input.add("control_doctrine", "DELTA_RESIDUAL_MEAN_NOW_PUBLIC_RATIO_TOTAL");
   input.add("positive_means", "clock_fast_lower_dac");
   input.add("dac_transfer", "higher_dac_higher_voltage_faster_ocxo");
   input.add("selected_source", servo_input_source_name(d.selected_source));
@@ -5656,8 +5694,9 @@ void clocks_beta_pps(void) {
   // interval is subtracted from the delayed observed PPS/VCLOCK DWT-edge
   // interval. FloorLine and projected-GNSS surfaces are preserved under
   // science.delta_floorline_* and science.traditional_* only; neither feeds
-  // Welford, stats, or servo.
-  const clock_science_row_t ocxo1_floorline_science =
+  // Welford.  Published OCXO TAU/PPB are re-authored below as simple
+  // campaign public-ledger ratios.
+  clock_science_row_t ocxo1_floorline_science =
       floorline_science_build_ocxo(time_clock_id_t::OCXO1,
                                    public_count,
                                    public_gnss_ns,
@@ -5667,7 +5706,7 @@ void clocks_beta_pps(void) {
                                    ocxo1_forensics_valid,
                                    ocxo1_forensics,
                                    g_floorline_science_ocxo1);
-  const clock_science_row_t ocxo2_floorline_science =
+  clock_science_row_t ocxo2_floorline_science =
       floorline_science_build_ocxo(time_clock_id_t::OCXO2,
                                    public_count,
                                    public_gnss_ns,
@@ -5682,6 +5721,19 @@ void clocks_beta_pps(void) {
       public_gnss_ns, ocxo1_floorline_science, public_ocxo1_measured_ns);
   const uint64_t public_ocxo2_ns = floorline_render_public_clock_ns(
       public_gnss_ns, ocxo2_floorline_science, public_ocxo2_measured_ns);
+
+  // Published OCXO TAU/PPB are campaign clockface ratios, not physical-period
+  // Delta ratios: public_ocxo_ns / public_gnss_ns.  The one-second residuals
+  // and Welfords above remain Delta Cycles surfaces; only the cumulative
+  // frequency summary is re-authored here from the public ledgers.
+  clock_science_apply_campaign_public_ratio(ocxo1_floorline_science,
+                                            public_gnss_ns,
+                                            public_ocxo1_ns,
+                                            public_count);
+  clock_science_apply_campaign_public_ratio(ocxo2_floorline_science,
+                                            public_gnss_ns,
+                                            public_ocxo2_ns,
+                                            public_count);
 
   ocxo1_measured_gnss_ticks_64 = public_ocxo1_ns / 100ULL;
   ocxo2_measured_gnss_ticks_64 = public_ocxo2_ns / 100ULL;
