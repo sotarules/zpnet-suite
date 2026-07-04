@@ -698,12 +698,12 @@ def _derived_tau_ppb(actual_cycles, prediction_cycles):
 def _servo_state(r: dict) -> str:
     """Return the best available OCXO servo state for the header.
 
-    New TIMEBASE_FRAGMENT / TIMEBASE_FORENSICS rows carry explicit servo_mode
-    and servo_active fields at the pair-identity level; active rows also carry
-    dac.calibrate_ocxo / dac.servo_mode beside the persisted DAC values.
-    Prefer those explicit firmware-authored fields.  ACTIVE remains only as a
-    legacy fallback for older records whose DAC persistence object proves the
-    servo was running but does not name the selected mode.
+    Prefer explicit firmware-authored servo_mode / servo_active fields.  DAC
+    persistence is no longer proof that the servo is active: current TIMEBASE
+    rows publish DAC values and dither realization even when servo_mode is OFF.
+    ACTIVE is therefore reserved for explicit servo_active=true without a named
+    mode, or for truly old rows that have DAC persistence but no explicit servo
+    state at all.
     """
     keys = (
         "dac.calibrate_ocxo",
@@ -721,16 +721,35 @@ def _servo_state(r: dict) -> str:
         "environmental.calibrate_ocxo",
         "forensics.environmental.calibrate_ocxo",
     )
+    saw_explicit_state = False
     saw_explicit_off = False
     for key in keys:
         val = _field(r, key, default=None)
         if val is None:
             continue
         s = str(val).strip().upper()
-        if s and s not in ("OFF", "NONE", "IDLE"):
-            return s
+        if not s:
+            continue
+        saw_explicit_state = True
         if s in ("OFF", "NONE", "IDLE"):
             saw_explicit_off = True
+            continue
+        return s
+
+    # servo_active is the strongest boolean state.  If it is explicitly false,
+    # do not infer ACTIVE later from DAC persistence; DAC is now always visible
+    # campaign telemetry, not proof of servo ownership.
+    for key in ("servo_active", "dac.servo_active", "forensics.servo_active", "forensics.dac.servo_active"):
+        val = _field(r, key, default=None)
+        b = _to_bool(val)
+        if b is True:
+            return "ACTIVE"
+        if b is False:
+            saw_explicit_state = True
+            saw_explicit_off = True
+
+    if saw_explicit_off:
+        return "IDLE"
 
     # Last-ditch inference from any published servo-input source.  This covers
     # detailed CLOCKS.REPORT_DAC-style payloads and older TIMEBASE builds that
@@ -765,23 +784,16 @@ def _servo_state(r: dict) -> str:
             if "MEAN" in s or "WELFORD" in s:
                 return "MEAN"
 
-    # Explicit activity without explicit mode should be rare after the Beta
-    # fix, but preserve a clear fallback so the panel never lies and calls an
-    # active servo IDLE.
-    for key in ("servo_active", "dac.servo_active", "forensics.servo_active", "forensics.dac.servo_active"):
-        val = _field(r, key, default=None)
-        if val is True or str(val).strip().lower() == "true":
-            return "ACTIVE"
-
     # Legacy TIMEBASE_FRAGMENT_V3 only included fragment.dac while
-    # clocks_servo_active() was true.  That minimal persistence feed proved
-    # activity but not mode.
+    # clocks_servo_active() was true.  Treat that as ACTIVE only when the row
+    # has no explicit servo state at all.  Modern always-DAC rows with
+    # servo_mode=OFF or servo_active=false were already returned as IDLE above.
     dac_o1 = _dac_value(r, "ocxo1")
     dac_o2 = _dac_value(r, "ocxo2")
-    if dac_o1 is not None or dac_o2 is not None:
+    if not saw_explicit_state and (dac_o1 is not None or dac_o2 is not None):
         return "ACTIVE"
 
-    return "IDLE" if saw_explicit_off else "IDLE"
+    return "IDLE"
 
 
 # ---------------------------------------------------------------------
