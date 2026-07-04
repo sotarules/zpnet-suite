@@ -685,9 +685,10 @@ struct pps_vclock_t {
 };
 
 // PPS/VCLOCK edge authority courtroom.  process_interrupt publishes the
-// selected VCLOCK edge's DWT coordinate from the physical PPS GPIO edge plus
-// the learned PPS->VCLOCK lower-phase estimate.  The VCLOCK/QTimer observed
-// edge and legacy predictor/FloorLine surfaces remain diagnostic witnesses.
+// selected VCLOCK edge's observed QTimer DWT coordinate so VCLOCK and OCXO
+// subscriber intervals share one measured-edge species. The physical PPS GPIO
+// edge plus learned PPS->VCLOCK lower-phase estimate, along with legacy
+// predictor/FloorLine surfaces, remain diagnostic witnesses.
 static constexpr uint32_t PPS_VCLOCK_EDGE_DECISION_NONE = 0;
 static constexpr uint32_t PPS_VCLOCK_EDGE_DECISION_LOWER_LAWFUL = 1;
 static constexpr uint32_t PPS_VCLOCK_EDGE_DECISION_PREDICTION_FALLBACK = 2;
@@ -708,11 +709,11 @@ struct pps_vclock_edge_authority_t {
   uint32_t update_count = 0;
   uint32_t reject_count = 0;
 
-  uint32_t authority_dwt_at_edge = 0;
+  uint32_t authority_dwt_at_edge = 0;       // published observed VCLOCK DWT
   uint32_t pps_dwt_at_edge = 0;
-  uint32_t vclock_observed_dwt_at_edge = 0;
+  uint32_t vclock_observed_dwt_at_edge = 0; // raw observed witness / authority
   uint32_t vclock_predicted_dwt_at_edge = 0;
-  uint32_t pps_projected_vclock_dwt_at_edge = 0;
+  uint32_t pps_projected_vclock_dwt_at_edge = 0; // PPS+learned-phase witness
 
   bool     observed_phase_valid = false;
   bool     learned_phase_valid = false;

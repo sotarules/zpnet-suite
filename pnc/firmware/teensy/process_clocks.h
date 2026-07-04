@@ -19,7 +19,7 @@
 //   • 1 Hz publication of canonical clock tuple
 //   • Continuous DWT-to-GNSS calibration (campaign-independent)
 //   • Static PPS/GPIO-based one-second prediction audit for VCLOCK and OCXO lanes
-//   • OCXO rollover-only event consumption as direct DWT edge timing
+//   • VCLOCK/OCXO rollover-only event consumption as observed DWT edge timing
 //
 // Initialization is split into two phases:
 //
@@ -104,7 +104,7 @@ uint64_t clocks_ocxo2_measured_gnss_ns_now(void);
 //
 // Four symmetric static prediction surfaces are published:
 //   PPS    — physical GPIO PPS edge-to-edge DWT cycles
-//   VCLOCK — canonical PPS/VCLOCK lattice edge-to-edge DWT cycles
+//   VCLOCK — observed PPS/VCLOCK edge-to-edge DWT cycles
 //   OCXO1  — OCXO1 authored edge-to-edge DWT cycles
 //   OCXO2  — OCXO2 authored edge-to-edge DWT cycles
 // Each lane uses the prior completed interval as the next-second prediction.

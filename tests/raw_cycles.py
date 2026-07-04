@@ -35,8 +35,8 @@ Column doctrine:
               fl_interval[n] - fl_interval[n-1].
     *_pub     the subscriber-facing published interval.
               Current FloorLine-deprecated firmware publishes observation-
-              derived authority: OCXO *_pub should follow *_raw, while
-              VCLOCK *_pub follows physical PPS + p_voff.
+              derived authority for OCXO, while VCLOCK *_pub follows the
+              authored PPS/VCLOCK endpoint.
     *_pubΔ    published interval first-difference residual:
               pub_interval[n] - pub_interval[n-1].
     *_cΔ      counter32 delta since the previous subscriber event.
@@ -935,12 +935,19 @@ def start_pps0_from_schema(root: Dict[str, Any],
             frag.get(f"{prefix}_prev_fl"),
             root.get(f"{prefix}_prev_fl"),
         )
+        # Transitional START-prologue payloads may expose missing retired rails
+        # as literal zero.  Zero is not a lawful one-second DWT interval, and if
+        # it is allowed into the first-difference predecessor it makes PPS 1
+        # look like a +1,007,995,xxx cycle residual.  Treat zero/negative
+        # prologue rail values as absent, not as evidence.
+        raw_prev = raw_prev if raw_prev is not None and raw_prev > 0 else None
+        fl_prev = fl_prev if fl_prev is not None and fl_prev > 0 else None
+        pub_prev = fl_prev if fl_prev is not None else raw_prev
+
         lanes[lane] = {
             "raw": raw_prev,
             "fl": fl_prev,
-            # In the current FloorLine-authored firmware, published == FloorLine.
-            # Fall back to raw only for older/partial prologue evidence.
-            "pub": fl_prev if fl_prev is not None else raw_prev,
+            "pub": pub_prev,
         }
 
     return {
@@ -1155,12 +1162,21 @@ def collect_rows(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]
             expected_pub_dwt = None
             expected_pub_authority = None
             if lane == "VCLOCK":
-                if pps_dwt is not None and pps_vclock_phase_cycles is not None:
+                # The subscriber-facing VCLOCK endpoint is the authored
+                # PPS/VCLOCK endpoint.  Prefer that direct custody fact from
+                # fragment science / micro forensics.  Reconstructing it from
+                # physical PPS + p_voff is only a fallback, because transitional
+                # schemas can expose a physical PPS field from a different
+                # publication boundary and make every clean row appear to be
+                # offset by a constant hundreds-of-thousands of cycles.
+                expected_pub_dwt = _first_int(
+                    science.get("pps_vclock_dwt"),
+                    pps_vclock_dwt_from_schema(root, frag, forensic),
+                )
+                expected_pub_authority = "PPS_VCLOCK" if expected_pub_dwt is not None else None
+                if expected_pub_dwt is None and pps_dwt is not None and pps_vclock_phase_cycles is not None:
                     expected_pub_dwt = (pps_dwt + pps_vclock_phase_cycles) & 0xFFFFFFFF
-                    expected_pub_authority = "PPS_PLUS_PHASE"
-                else:
-                    expected_pub_dwt = science.get("pps_vclock_dwt")
-                    expected_pub_authority = "PPS_VCLOCK_SCIENCE" if expected_pub_dwt is not None else None
+                    expected_pub_authority = "PPS_PLUS_PHASE_FALLBACK"
             else:
                 expected_pub_dwt = raw_dwt
                 expected_pub_authority = "OBSERVED" if expected_pub_dwt is not None else None
@@ -2002,7 +2018,7 @@ def analyze(campaign: str,
     print("    The fitted/slope FloorLine interval is used only as a fallback and")
     print("    audited as 'reported FL fit interval - endpoint FL interval'.")
     print("  • FloorLine is now diagnostic, not publication authority.")
-    print("    Current authority: VCLOCK = physical PPS DWT + p_voff;")
+    print("    Current authority: VCLOCK = authored PPS/VCLOCK endpoint;")
     print("    OCXO = observed latency-adjusted DWT.  Published-vs-FloorLine")
     print("    divergence is expected and is not a pathology by itself.")
     print("  • p_voff is the DWT-cycle offset from the physical PPS edge to the")

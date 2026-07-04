@@ -118,9 +118,10 @@ extern volatile uint32_t g_pps_dwt_at_edge;
 extern volatile uint32_t g_pps_dwt_cycles_between_edges;
 extern volatile bool     g_pps_dwt_cycles_between_edges_valid;
 
-// Species-pure selected PPS/VCLOCK edge-to-edge interval.  Delta Cycles uses
+// Species-pure observed PPS/VCLOCK edge-to-edge interval. Delta Cycles uses
 // this rail, not the smoother PPS/GPIO DWT-GNSS calibration, so the reference
-// interval is formed by the same DWT-at-edge subtraction doctrine as OCXO.
+// interval is formed by the same observed DWT-at-edge subtraction doctrine as
+// OCXO.
 extern volatile uint32_t g_pps_vclock_dwt_cycles_between_edges;
 extern volatile bool     g_pps_vclock_dwt_cycles_between_edges_valid;
 
@@ -3043,9 +3044,10 @@ static delta_residual_reference_t delta_residual_capture_vclock_reference(
     r.gnss_interval_cycles = selected_pps_vclock_interval;
   }
 
-  // Keep the VCLOCK measured rail as side evidence only.  The canonical
-  // reference for Delta Cycles is the exact selected PPS/VCLOCK edge-to-edge
-  // interval: current snap.dwt_at_edge minus the previous snap.dwt_at_edge.
+  // Keep the VCLOCK measured rail as side evidence only. The canonical
+  // reference for Delta Cycles is the exact observed selected PPS/VCLOCK
+  // edge-to-edge interval: current snap.dwt_at_edge minus the previous
+  // snap.dwt_at_edge.
   if (vclock_valid && vclock_f.dwt_interval_observed_cycles != 0U) {
     r.raw_valid = true;
     r.raw_interval_cycles = vclock_f.dwt_interval_observed_cycles;
@@ -3476,6 +3478,65 @@ static bool campaign_start_prologue_reference_fit_ok(
   return ref.captured && ref.gnss_valid && ref.gnss_interval_cycles != 0U;
 }
 
+static bool campaign_start_prologue_interval_fit_ok(uint32_t current,
+                                                    uint32_t previous) {
+  if (current == 0U || previous == 0U) return false;
+  return beta_abs_i32_within_gate(
+      beta_signed_delta_u32(current, previous),
+      CLOCKS_START_PROLOGUE_FIT_ENDPOINT_GATE_CYCLES);
+}
+
+static bool campaign_start_prologue_private_pps0_continuity_ok(
+    bool vclock_valid,
+    const clocks_alpha_lane_forensics_t& vclock_f,
+    bool ocxo1_valid,
+    const clocks_alpha_lane_forensics_t& ocxo1_f,
+    bool ocxo2_valid,
+    const clocks_alpha_lane_forensics_t& ocxo2_f) {
+  if (!g_start_prologue_pps0_interval_valid) {
+    campaign_start_prologue_set_reason("private_pps0_interval_missing");
+    return false;
+  }
+
+  const uint32_t current_reference_interval =
+      g_pps_vclock_dwt_cycles_between_edges_valid
+          ? (uint32_t)g_pps_vclock_dwt_cycles_between_edges
+          : 0U;
+
+  if (!campaign_start_prologue_interval_fit_ok(
+          current_reference_interval,
+          g_start_prologue_pps0_pps_obs)) {
+    campaign_start_prologue_set_reason("private_pps0_reference_interval_unsettled");
+    return false;
+  }
+
+  if (!vclock_valid ||
+      !campaign_start_prologue_interval_fit_ok(
+          vclock_f.dwt_interval_observed_cycles,
+          g_start_prologue_pps0_v_obs)) {
+    campaign_start_prologue_set_reason("private_pps0_vclock_interval_unsettled");
+    return false;
+  }
+
+  if (!ocxo1_valid ||
+      !campaign_start_prologue_interval_fit_ok(
+          ocxo1_f.dwt_interval_observed_cycles,
+          g_start_prologue_pps0_o1_obs)) {
+    campaign_start_prologue_set_reason("private_pps0_ocxo1_interval_unsettled");
+    return false;
+  }
+
+  if (!ocxo2_valid ||
+      !campaign_start_prologue_interval_fit_ok(
+          ocxo2_f.dwt_interval_observed_cycles,
+          g_start_prologue_pps0_o2_obs)) {
+    campaign_start_prologue_set_reason("private_pps0_ocxo2_interval_unsettled");
+    return false;
+  }
+
+  return true;
+}
+
 static bool campaign_start_prologue_probe_public_pps1(
     bool vclock_valid,
     const clocks_alpha_lane_forensics_t& vclock_f,
@@ -3495,6 +3556,21 @@ static bool campaign_start_prologue_probe_public_pps1(
 
   if (!campaign_start_prologue_reference_fit_ok(g_delta_previous_vclock_reference)) {
     campaign_start_prologue_set_reason("private_gnss_reference_missing");
+    return false;
+  }
+
+  // Public PPS 1 must not be allowed to inherit a startup/transient private
+  // PPS 0 interval.  Delta Cycles intentionally compares the OCXO interval
+  // published on the current PPS/VCLOCK row against the previous private
+  // PPS/VCLOCK reference.  If that hidden predecessor was captured across
+  // SmartZero/launch acquisition turbulence, the first public residual can be
+  // poisoned even though all current-row antecedents are nonzero and lawful.
+  // Require the private PPS0 interval and the candidate PPS1 interval to be
+  // continuous on every observed rail; otherwise promote this candidate to the
+  // new private PPS0 and try again on the next row.
+  if (!campaign_start_prologue_private_pps0_continuity_ok(
+          vclock_valid, vclock_f, ocxo1_valid, ocxo1_f,
+          ocxo2_valid, ocxo2_f)) {
     return false;
   }
 
@@ -5451,8 +5527,8 @@ void clocks_beta_pps(void) {
   // ── Delta Cycles canonical science ──
   //
   // Observed DWT-at-edge owns the canonical residual: each OCXO observed
-  // interval is subtracted from the delayed selected PPS/VCLOCK DWT-edge
-  // interval.  FloorLine and projected-GNSS surfaces are preserved under
+  // interval is subtracted from the delayed observed PPS/VCLOCK DWT-edge
+  // interval. FloorLine and projected-GNSS surfaces are preserved under
   // science.delta_floorline_* and science.traditional_* only; neither feeds
   // Welford, stats, or servo.
   const clock_science_row_t ocxo1_floorline_science =

@@ -11,10 +11,11 @@
 //
 // Epoch authority:
 //
-//   PPS is a witness and selector.  process_interrupt observes the physical
+//   PPS is a witness and selector. process_interrupt observes the physical
 //   PPS edge, selects the corresponding VCLOCK edge identity, and publishes
-//   a PPS/VCLOCK snapshot whose DWT coordinate is authored by the VCLOCK/QTimer
-//   event path.  This keeps public DWT facts in one VCLOCK coordinate species.
+//   a PPS/VCLOCK snapshot whose DWT coordinate is the observed VCLOCK/QTimer
+//   edge. This keeps Delta Cycles in the same measured-edge DWT species as
+//   OCXO while the physical PPS witness remains the smooth projection ruler.
 //
 //   Alpha installs the selected PPS/VCLOCK snapshot as a logical-zero event.
 //   The captured synthetic counter32 values become per-lane zero-offset ticks:
@@ -56,7 +57,7 @@
 //   - g_ocxo2_measured_gnss_ns_at_pps_vclock
 //                                     CLOCKS-owned OCXO2 measured GNSS-elapsed
 //                                     ledger sampled at the same PPS/VCLOCK edge.
-//   - g_dwt_at_pps_vclock             DWT coordinate of the selected
+//   - g_dwt_at_pps_vclock             Observed DWT coordinate of the selected
 //                                     PPS/VCLOCK edge.
 //   - g_dwt_cycles_between_pps_vclock Effective PPS/GPIO-derived DWT
 //                                     cycles per GNSS second.  This remains
@@ -125,10 +126,10 @@ static inline uint64_t dwt_ns_to_cycles(uint64_t ns) {
 // Always-on DWT-GNSS anchor state (alpha-owned, beta-readable)
 //
 // All five of these globals are authored by alpha::pps_selector_callback
-// from process_interrupt's canonical PPS/VCLOCK snapshots.  PPS selects and
-// audits the relationship; the public DWT coordinate itself is authored by
-// the VCLOCK/QTimer event path so the bridge, 1 kHz cadence samples, and
-// one-second bookends share one coordinate species.
+// from process_interrupt's canonical PPS/VCLOCK snapshots. PPS selects and
+// audits the relationship; the public DWT coordinate itself is the observed
+// VCLOCK/QTimer event coordinate so the bridge, 1 kHz cadence samples, and
+// one-second bookends share one measured-edge species.
 // ============================================================================
 
 // Canonical VCLOCK/GNSS and measured OCXO 64-bit ledgers at the most recent
@@ -145,10 +146,10 @@ extern volatile uint64_t g_ocxo2_measured_gnss_ns_at_pps_vclock;
 extern volatile uint64_t g_ocxo1_physical_measured_gnss_ns_at_pps_vclock;
 extern volatile uint64_t g_ocxo2_physical_measured_gnss_ns_at_pps_vclock;
 
-// Canonical DWT_CYCCNT coordinate of the most recent selected PPS/VCLOCK epoch
-// (snap.dwt_at_edge).  Under the VCLOCK-domain architecture this is the
-// selected VCLOCK edge after the physical PPS pulse, not the raw GPIO ISR
-// capture.
+// Observed DWT_CYCCNT coordinate of the most recent selected PPS/VCLOCK epoch
+// (snap.dwt_at_edge). Under the VCLOCK-domain architecture this is the
+// selected VCLOCK QTimer edge after the physical PPS pulse, not the raw GPIO
+// ISR capture and not a PPS-derived enhanced estimate.
 extern volatile uint32_t g_dwt_at_pps_vclock;
 
 // Cumulative sum of dwt_cycles_between_pps across the campaign.
@@ -162,10 +163,10 @@ extern volatile uint64_t g_dwt_cycle_count_total;
 // second.
 extern volatile uint32_t g_dwt_cycles_between_pps_vclock;
 
-// Exact selected PPS/VCLOCK DWT edge-to-edge interval, authored directly from
-// consecutive snap.dwt_at_edge values.  Delta Cycles residuals use this
-// species-pure reference so the reference interval is formed by the same
-// DWT-at-edge subtraction doctrine as OCXO intervals.
+// Exact observed selected PPS/VCLOCK DWT edge-to-edge interval, authored
+// directly from consecutive snap.dwt_at_edge values. Delta Cycles residuals
+// use this species-pure reference so the reference interval is formed by the
+// same observed DWT-at-edge subtraction doctrine as OCXO intervals.
 extern volatile uint32_t g_pps_vclock_dwt_cycles_between_edges;
 extern volatile bool     g_pps_vclock_dwt_cycles_between_edges_valid;
 

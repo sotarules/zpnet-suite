@@ -15,7 +15,9 @@
 // subtracts the historical 250 us / 750 us offsets from DWT or counter identity.
 //
 // PPS is a selector/witness. process_interrupt authors the selected PPS/VCLOCK
-// edge identity, while the physical PPS/GPIO DWT witness supplies the smooth
+// identity, while the VCLOCK subscription publishes the observed QTimer DWT
+// edge so Delta Cycles can compare VCLOCK and OCXO in one measured-edge
+// species. The physical PPS/GPIO DWT witness still supplies the smooth
 // one-second DWT/GNSS slope. VCLOCK/OCXO callbacks own per-edge clock
 // measurements.
 // ============================================================================
@@ -191,13 +193,11 @@ static void clocks_feature_update_static_prediction(void);
 static void clocks_feature_update_ocxo_public_origin(void);
 
 
-// Last VCLOCK event DWT, retained only for PPS-vs-VCLOCK diagnostics.
-//
-// g_prev_dwt_at_vclock_event is the authored subscriber DWT.  After VCLOCK EMA
-// authority, that value is intentionally synthetic/smoothed and remains the
-// correct timing ruler.  PPS→VCLOCK physical phase, however, must be computed
-// from the observed/original VCLOCK DWT carried in interrupt diagnostics, not
-// from the authored EMA coordinate.
+// Last VCLOCK event DWT, retained for PPS-vs-VCLOCK diagnostics and Delta
+// reference cross-checks. The VCLOCK subscriber DWT is now the observed
+// latency-corrected QTimer edge, matching the OCXO subscriber species. The
+// diagnostic original field should therefore agree, but remains the explicit
+// witness if future experiments add an enhanced/estimated side rail.
 static volatile uint32_t g_prev_dwt_at_vclock_event = 0;
 static volatile bool     g_prev_observed_dwt_at_vclock_event_valid = false;
 static volatile uint32_t g_prev_observed_dwt_at_vclock_event = 0;
@@ -207,9 +207,10 @@ static volatile uint32_t g_observed_vclock_dwt_cycles_between_edges = 0;
 // ── Canonical one-second subtraction state for DWT cycles between PPS/VCLOCK anchors ──
 //
 // Authored by pps_selector_callback from process_interrupt's PPS/VCLOCK
-// snapshot.  PPS remains the selector/witness.  The operational DWT/GNSS
-// cycles-per-second slope now prefers the physical PPS/GPIO witness interval
-// because the VCLOCK/QTimer event rail is quantized to a 4-cycle lattice.
+// snapshot. PPS remains the selector/witness. The snapshot DWT is the observed
+// VCLOCK QTimer edge for apples-to-apples Delta Cycles; the operational
+// DWT/GNSS cycles-per-second slope still prefers the physical PPS/GPIO witness
+// interval because it is the smoother projection ruler.
 static volatile uint32_t g_prev_pps_vclock_dwt_at_edge = 0;
 static volatile bool     g_prev_pps_vclock_dwt_at_edge_valid = false;
 
@@ -5745,11 +5746,9 @@ static void vclock_callback(const interrupt_event_t& event,
           : event.dwt_at_event;
 
   // Species-pure VCLOCK physical interval for PPS↔VCLOCK integrity reporting.
-  //
-  // event.dwt_at_event is the subscriber/public DWT species and may be
-  // EMA-published.  The PPS interval comparator must instead use the observed
-  // latency-corrected VCLOCK edge DWT on both endpoints, matching the raw_cycles
-  // v_raw surface rather than the v_ema surface.
+  // event.dwt_at_event is now already the observed latency-corrected VCLOCK
+  // QTimer edge. Keep the explicit diagnostic witness path so any future
+  // enhanced/estimated side rail cannot silently perturb the observed interval.
   if (g_prev_observed_dwt_at_vclock_event_valid) {
     g_observed_vclock_dwt_cycles_between_edges =
         observed_dwt_at_vclock_event - g_prev_observed_dwt_at_vclock_event;
@@ -5813,16 +5812,19 @@ static void publish_pps_witness_diag(const pps_edge_snapshot_t& snap) {
     g_pps_dwt_cycles_between_edges_valid = false;
   }
 
-  // Phase is a physical diagnostic, not timing authority.  After VCLOCK
-  // EMA authority, snap.dwt_at_edge is the authored/smoothed PPS_VCLOCK DWT.
-  // Use the observed/original VCLOCK DWT from the interrupt diagnostic path
-  // when available so phase remains a real PPS↔VCLOCK hardware measurement.
+  // Phase is a physical diagnostic, not timing authority. snap.dwt_at_edge is
+  // now the observed VCLOCK DWT coordinate, so prefer process_interrupt's
+  // observed phase transcript.  The learned lower-phase estimate remains a
+  // fallback witness only.
   const uint32_t observed_vclock_dwt_for_phase =
       g_prev_observed_dwt_at_vclock_event_valid
           ? g_prev_observed_dwt_at_vclock_event
           : snap.dwt_at_edge;
 
-  if (snap.vclock_edge_authority.learned_phase_valid) {
+  if (snap.vclock_edge_authority.observed_phase_valid) {
+    g_pps_vclock_phase_cycles =
+        (int32_t)snap.vclock_edge_authority.observed_phase_cycles;
+  } else if (snap.vclock_edge_authority.learned_phase_valid) {
     g_pps_vclock_phase_cycles =
         (int32_t)snap.vclock_edge_authority.learned_phase_cycles;
   } else {
@@ -5978,8 +5980,8 @@ static bool alpha_sample_all_clocks_at_pps_vclock(const pps_edge_snapshot_t& sna
   // Public VCLOCK/GNSS time-domain authority also lives here.  The selected
   // PPS/VCLOCK edge is the exact canonical public row: vclock_ns is authored by
   // Alpha as the tautological +1e9 ledger, not discovered from subscriber-event
-  // DWT projection.  Updating process_time here makes report-time VCLOCK/GNSS
-  // use the same PPS-row coordinate species as the OCXO public projections.
+  // DWT projection. The DWT coordinate is now the observed VCLOCK edge, giving
+  // Delta Cycles the same measured-edge species used by OCXO.
   (void)time_clock_update(time_clock_id_t::VCLOCK, snap.dwt_at_edge, vclock_ns);
   alpha_event_flow_note_time_update(time_clock_id_t::VCLOCK, vclock_ns);
   alpha_integrity_note_vclock_gnss_self_map(snap.sequence,
@@ -6013,11 +6015,10 @@ static void update_pps_vclock_bridge_anchor(const pps_edge_snapshot_t& snap) {
   const uint32_t dwt_between_pps =
       snap.dwt_at_edge - g_prev_pps_vclock_dwt_at_edge;
 
-  // Exact selected PPS/VCLOCK edge-to-edge interval.  This is the
-  // species-pure Delta Cycles reference: it is formed only from the two
-  // canonical PPS/VCLOCK DWT-at-edge coordinates and deliberately stays
-  // separate from the smoother PPS/GPIO witness interval used for time
-  // projection and TimePop calibration.
+  // Exact observed selected PPS/VCLOCK edge-to-edge interval. This is the
+  // species-pure Delta Cycles reference: it is formed from the observed VCLOCK
+  // DWT-at-edge coordinates and deliberately stays separate from the smoother
+  // PPS/GPIO witness interval used for time projection and TimePop calibration.
   g_pps_vclock_dwt_cycles_between_edges = dwt_between_pps;
   g_pps_vclock_dwt_cycles_between_edges_valid = (dwt_between_pps != 0U);
 

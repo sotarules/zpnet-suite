@@ -28,10 +28,13 @@
 // TimePop is the principled exception to the "no DWT conversion in
 // PPS_VCLOCK" rule: it projects legacy-CH2-API / actual-CH1 fire facts onto
 // the PPS_VCLOCK timeline for scheduling diagnostics. Subscriber-facing DWT
-// publication is now observation-derived: OCXO lanes publish the latency-adjusted
-// observed edge, and VCLOCK publishes the physical PPS GPIO edge plus the learned
-// PPS->VCLOCK lower-phase estimate. FloorLine/lower-envelope remains diagnostic
-// evidence only; counter32/GNSS identity remains exact authority.
+// publication is now observation-derived for every measured lane: VCLOCK and
+// OCXO lanes publish the latency-adjusted observed edge from their own QTimer
+// event facts. The physical PPS GPIO edge remains the selector/witness for the
+// PPS_VCLOCK identity and for the smooth DWT/GNSS slope; PPS-derived/lower-
+// phase VCLOCK estimates are diagnostic witnesses only. FloorLine/lower-
+// envelope remains diagnostic evidence only; counter32/GNSS identity remains
+// exact authority.
 // CLOCKS/Alpha owns measured-GNSS interval construction from consecutive
 // authored edge DWTs.
 //
@@ -187,8 +190,10 @@ static constexpr uint32_t VCLOCK_DWT_REPAIR_MAX_PREDICTION_RESIDUAL_CYCLES = 25;
 
 // The retired predictor rail has been removed.  FloorLine/lower-envelope is now
 // diagnostic only.  Subscriber-facing DWT-at-edge publication is derived from
-// observed facts: PPS+learned lower-phase for VCLOCK, and latency-adjusted
-// observed edges for OCXO lanes.
+// observed facts for all measured lanes: VCLOCK publishes its latency-adjusted
+// observed QTimer edge, and OCXO lanes publish their latency-adjusted observed
+// QTimer edges. PPS+learned lower-phase remains a VCLOCK courtroom witness,
+// not subscriber publication authority.
 
 // Epoch-ready PPS capture packet.  The ISR captures the first-instruction DWT
 // and the three lane hardware counters in one tiny custody window.  DWT runs
@@ -2130,28 +2135,25 @@ static pps_vclock_edge_authority_t pps_vclock_edge_authority_build(
 
   a.valid = (a.invalid_mask == PPS_VCLOCK_EDGE_INVALID_NONE);
 
-  // Publication authority is now explicit: predicted_dwt_at_edge is the
-  // caller-selected publication coordinate.  In steady-state VCLOCK that is
-  // physical PPS GPIO DWT plus the learned PPS→VCLOCK lower-phase estimate.
-  // Observed VCLOCK and FloorLine/lower-envelope remain witnesses in the
-  // agreement court, but
-  // they no longer steal publication authority by being the least-late point.
-  if (prediction_valid) {
+  // Publication authority is now apples-to-apples observed edge truth:
+  // VCLOCK publishes the same latency-adjusted observed QTimer-edge species as
+  // the OCXO subscriber lanes. PPS+learned lower-phase and predictor/lower
+  // envelope candidates remain courtroom witnesses only; they do not replace
+  // the subscriber DWT coordinate.
+  if (observed_valid) {
+    a.authority_dwt_at_edge = observed_dwt_at_edge;
+    a.decision = PPS_VCLOCK_EDGE_DECISION_OBSERVED_FALLBACK;
+  } else if (prediction_valid) {
     a.authority_dwt_at_edge = predicted_dwt_at_edge;
     if (pps_candidate_valid &&
         predicted_dwt_at_edge == a.pps_projected_vclock_dwt_at_edge) {
       a.decision = PPS_VCLOCK_EDGE_DECISION_PPS_PHASE_FALLBACK;
-    } else if (observed_valid && predicted_dwt_at_edge == observed_dwt_at_edge) {
-      a.decision = PPS_VCLOCK_EDGE_DECISION_OBSERVED_FALLBACK;
     } else {
       a.decision = PPS_VCLOCK_EDGE_DECISION_PREDICTION_FALLBACK;
     }
   } else if (pps_candidate_valid) {
     a.authority_dwt_at_edge = a.pps_projected_vclock_dwt_at_edge;
     a.decision = PPS_VCLOCK_EDGE_DECISION_PPS_PHASE_FALLBACK;
-  } else if (observed_valid) {
-    a.authority_dwt_at_edge = observed_dwt_at_edge;
-    a.decision = PPS_VCLOCK_EDGE_DECISION_OBSERVED_FALLBACK;
   } else {
     a.authority_dwt_at_edge = 0U;
     a.decision = PPS_VCLOCK_EDGE_DECISION_NONE;
@@ -2210,18 +2212,20 @@ static void publish_vclock_domain_pps_vclock(const pps_t& pps,
                                                 &phase_cycles);
   (void)phase_cycles;
 
-  // PPS_VCLOCK publication authority is now derived from the physical PPS
-  // witness plus the learned PPS->VCLOCK lower-phase estimate.  The observed
-  // VCLOCK edge remains courtroom evidence for phase/agreement diagnostics.
-  const uint32_t publication_dwt = phase_projection_valid
+  // PPS_VCLOCK DWT publication uses the observed VCLOCK edge so the VCLOCK
+  // subscription and the OCXO subscriptions share the same DWT-at-edge species.
+  // The PPS-derived/lower-phase value remains available inside the authority
+  // transcript as pps_projected_vclock_dwt_at_edge.
+  const uint32_t publication_dwt = observed_dwt ? observed_dwt : dwt_at_edge;
+  const uint32_t prediction_witness_dwt = phase_projection_valid
       ? pps_projected_dwt
-      : dwt_at_edge;
+      : 0U;
 
   const pps_vclock_edge_authority_t authority =
       pps_vclock_edge_authority_build(pps,
                                       sequence,
+                                      prediction_witness_dwt,
                                       publication_dwt,
-                                      observed_dwt,
                                       counter32_at_edge,
                                       ch3_at_edge);
 
@@ -6209,12 +6213,16 @@ static inline uint32_t vclock_published_dwt_at_edge(
     uint16_t ch3_at_edge,
     bool* out_phase_valid = nullptr,
     uint32_t* out_phase_cycles = nullptr) {
-  return pps_projected_vclock_dwt_from_learned_phase(pps,
-                                                   observed_dwt_at_edge,
-                                                   counter32_at_edge,
-                                                   ch3_at_edge,
-                                                   out_phase_valid,
-                                                   out_phase_cycles);
+  // Keep learning/reporting the PPS-derived lower-phase witness, but do not
+  // publish it as the VCLOCK subscriber DWT. Delta Cycles needs VCLOCK and
+  // OCXO intervals measured in the same observed QTimer edge species.
+  (void)pps_projected_vclock_dwt_from_learned_phase(pps,
+                                                    observed_dwt_at_edge,
+                                                    counter32_at_edge,
+                                                    ch3_at_edge,
+                                                    out_phase_valid,
+                                                    out_phase_cycles);
+  return observed_dwt_at_edge;
 }
 
 static inline uint32_t ocxo_published_dwt_at_edge(
@@ -7069,8 +7077,8 @@ static bool dwt_publication_adjudicate_or_watchdog(
       req.floorline->inferred_dwt_at_event != 0U;
   // FloorLine is no longer a publication authority.  Keep its candidate
   // geometry in the courtroom forensics, but the source-law expected endpoint
-  // comes from the caller's observation-derived authority: OCXO observed DWT,
-  // or VCLOCK physical PPS DWT plus learned PPS->VCLOCK lower-phase.
+  // comes from the caller's observed edge authority: OCXO observed DWT or
+  // VCLOCK observed DWT. PPS+learned phase is a witness, not source law.
   const bool floorline_published = false;
   const uint32_t floorline_dwt = floorline_candidate
       ? req.floorline->inferred_dwt_at_event
@@ -8083,7 +8091,7 @@ static void vclock_apply_perishable_fact_deferred(
                              observed_dwt,
                              fact.isr_entry_dwt_raw,
                              phase_projection_valid
-                                 ? "vclock_pps_learned_phase"
+                                 ? "vclock_observed_pps_phase_witness"
                                  : "vclock_observed_no_pps");
 
   cadence_regression_result_t lower_env{};
@@ -8110,7 +8118,7 @@ static void vclock_apply_perishable_fact_deferred(
                               observed_dwt,
                               LOWER_ENV_PUBLISH_HARD_EDGE_GATE_CYCLES,
                               phase_projection_valid
-                                  ? "vclock_pps_learned_phase"
+                                  ? "vclock_observed_pps_phase_witness"
                                   : "vclock_observed_no_pps");
 
   if (!lower_env_raw_bookend_watchdog_if_pending(
@@ -8778,7 +8786,7 @@ static void vclock_heartbeat_native_service(uint32_t isr_entry_dwt_raw,
                                  observed_dwt,
                                  bookend.due ? bookend.isr_entry_dwt_raw : 0U,
                                  phase_projection_valid
-                                     ? "vclock_pps_learned_phase_fallback"
+                                     ? "vclock_observed_pps_phase_witness_fallback"
                                      : "vclock_observed_no_pps_fallback");
       cadence_regression_result_t lower_env{};
       (void)cadence_regression_latest_result(interrupt_subscriber_kind_t::VCLOCK,
@@ -8789,7 +8797,7 @@ static void vclock_heartbeat_native_service(uint32_t isr_entry_dwt_raw,
                                   observed_dwt,
                                   LOWER_ENV_PUBLISH_HARD_EDGE_GATE_CYCLES,
                                   phase_projection_valid
-                                      ? "vclock_pps_learned_phase_fallback"
+                                      ? "vclock_observed_pps_phase_witness_fallback"
                                       : "vclock_observed_no_pps_fallback");
 
       coincidence_cycles = 0;
@@ -12063,10 +12071,13 @@ bool interrupt_last_pps_vclock_phase_estimate(
   pps_vclock_phase_estimate_t e{};
   e.valid = a.learned_phase_valid || a.valid;
   e.lattice_dwt_at_edge = a.vclock_observed_dwt_at_edge;
-  e.estimated_dwt_at_edge = a.authority_dwt_at_edge;
+  const uint32_t estimated_dwt = a.pps_projected_vclock_dwt_at_edge
+      ? a.pps_projected_vclock_dwt_at_edge
+      : a.authority_dwt_at_edge;
+  e.estimated_dwt_at_edge = estimated_dwt;
   e.correction_cycles = a.vclock_observed_dwt_at_edge
       ? pps_vclock_signed_delta_near(a.vclock_observed_dwt_at_edge,
-                                     a.authority_dwt_at_edge)
+                                     estimated_dwt)
       : 0;
   e.phase_mod_scaled_cycles = a.learned_phase_cycles;
   e.tick_scaled_cycles = vclock_cycles_for_ticks(1U);
@@ -12082,13 +12093,13 @@ bool interrupt_last_pps_vclock_phase_estimate(
 }
 
 // Legacy projection.  Field map:
-//   snapshot.dwt_at_edge       <- pvc.dwt_at_edge       (PPS_VCLOCK)
+//   snapshot.dwt_at_edge       <- pvc.dwt_at_edge       (observed PPS_VCLOCK)
 //   snapshot.counter32_at_edge <- pvc.counter32_at_edge (PPS_VCLOCK)
 //   snapshot.ch3_at_edge       <- pvc.ch3_at_edge       (PPS_VCLOCK)
 //   snapshot.gnss_ns_at_edge   <- -1 (GNSS labels are CLOCKS-owned)
 //   snapshot.physical_pps_*    <- pps.*                 (physical facts)
 //   snapshot.dwt_raw_at_edge   <- pvc.dwt_at_edge       (legacy alias;
-//                                                        misnamed, held
+//                                                        observed, not raw, held
 //                                                        for API continuity)
 
 pps_edge_snapshot_t interrupt_last_pps_edge(void) {
