@@ -232,12 +232,12 @@ enum class clocks_ocxo_public_ns_authority_t : uint8_t {
 
 static constexpr clocks_ocxo_public_ns_authority_t
     CLOCKS_OCXO_PUBLIC_NS_AUTHORITY =
-        clocks_ocxo_public_ns_authority_t::TRADITIONAL_PPS_PROJECTION;
+        clocks_ocxo_public_ns_authority_t::PPS_COUNTERLEDGER;
 
-// CounterLedger can be advanced and reported without authoring public OCXO
-// nanoseconds.  This is the safe migration posture: prove the PPS-sampled
-// integer ledger beside the traditional projection path before promoting it
-// to authority.
+// CounterLedger can also be advanced and reported without authoring public OCXO
+// nanoseconds when the authority switch above is returned to traditional mode.
+// With PPS_COUNTERLEDGER selected, reporting remains enabled but the published
+// counterledger.report_only field is false.
 static constexpr bool CLOCKS_OCXO_COUNTERLEDGER_REPORT_ONLY_ENABLED = true;
 
 // CounterLedger frequency is fundamentally a long-baseline integer-tick
@@ -285,6 +285,38 @@ struct clocks_alpha_ocxo_counterledger_snapshot_t {
   uint64_t interval_ns = 0;
   int64_t  fast_residual_ns = 0;
 
+  // PhaseLedger suffix for CounterLedger.  The integer CounterLedger rail
+  // owns whole 100 ns OCXO ticks sampled at PPS.  PhaseLedger supplies only
+  // the bounded 0..99 ns low-order suffix by measuring where the PPS edge
+  // landed inside the adjacent observed OCXO tick lattice.
+  bool     phase_valid = false;
+  bool     phase_pending = false;
+  bool     phase_near_boundary = false;
+  uint32_t phase_source_id = 0;
+  uint32_t phase_pps_sequence = 0;
+  uint32_t phase_lag_pps = 0;
+  uint32_t phase_pps_dwt_at_edge = 0;
+  uint32_t phase_prev_ocxo_dwt_at_edge = 0;
+  uint32_t phase_next_ocxo_dwt_at_edge = 0;
+  uint32_t phase_ocxo_interval_cycles = 0;
+  uint32_t phase_pps_delta_cycles = 0;
+  uint32_t phase_after_last_00_ns = 0;
+  uint32_t phase_to_next_00_ns = 0;
+  int32_t  phase_raw_delta_ns = 0;
+  int32_t  phase_unwrapped_delta_ns = 0;
+  int64_t  phase_unwrapped_carry_ticks = 0;
+  bool     phase_wrap_event = false;
+  uint32_t phase_wrap_count = 0;
+  uint32_t phase_resolve_count = 0;
+  uint32_t phase_pending_overwrite_count = 0;
+  uint32_t phase_invalid_count = 0;
+
+  bool     refined_valid = false;
+  bool     refined_interval_valid = false;
+  uint64_t refined_ns = 0;
+  uint64_t refined_interval_ns = 0;
+  int64_t  refined_fast_residual_ns = 0;
+
   // Capture-custody counters.  These are report-only unless
   // CLOCKS_OCXO_PUBLIC_NS_AUTHORITY == PPS_COUNTERLEDGER.
   bool     last_capture_available = false;
@@ -314,6 +346,12 @@ struct clocks_alpha_ocxo_counterledger_snapshot_t {
   double   block_mean_fast_residual_ns = 0.0;
   double   block_tau = 1.0;
   double   block_ppb = 0.0;
+  bool     block_phase_valid = false;
+  uint64_t block_ns_with_phase = 0;
+  int64_t  block_fast_residual_sum_ns_with_phase = 0;
+  double   block_mean_fast_residual_ns_with_phase = 0.0;
+  double   block_tau_with_phase = 1.0;
+  double   block_ppb_with_phase = 0.0;
 
   bool     completed_block_valid = false;
   uint32_t completed_block_count = 0;
@@ -326,6 +364,12 @@ struct clocks_alpha_ocxo_counterledger_snapshot_t {
   double   completed_block_mean_fast_residual_ns = 0.0;
   double   completed_block_tau = 1.0;
   double   completed_block_ppb = 0.0;
+  bool     completed_block_phase_valid = false;
+  uint64_t completed_block_ns_with_phase = 0;
+  int64_t  completed_block_fast_residual_sum_ns_with_phase = 0;
+  double   completed_block_mean_fast_residual_ns_with_phase = 0.0;
+  double   completed_block_tau_with_phase = 1.0;
+  double   completed_block_ppb_with_phase = 0.0;
 
   uint32_t block_gap_reset_count = 0;
 };

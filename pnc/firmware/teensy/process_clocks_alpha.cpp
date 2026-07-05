@@ -2283,6 +2283,15 @@ static alpha_lane_logical_ticks_t g_ocxo2_ticks64 = {};
 // PPS-authored epoch-capture packet.  The capture packet is produced by the
 // priority-0 PPS GPIO ISR, so these are PPS-synchronous samples, not foreground
 // ambient reads.
+//
+// PhaseLedger is the bounded low-order companion to CounterLedger.  The
+// integer rail owns whole OCXO ticks.  PhaseLedger resolves only the 0..99 ns
+// suffix by bracketing a PPS DWT coordinate between two observed OCXO 00-edge
+// DWT facts and reducing that position modulo one 10 MHz tick.
+static constexpr uint32_t ALPHA_COUNTERLEDGER_PHASE_SOURCE_NONE = 0U;
+static constexpr uint32_t ALPHA_COUNTERLEDGER_PHASE_SOURCE_PHYSICAL_PPS_TO_OBSERVED_OCXO_EDGE = 1U;
+static constexpr uint32_t ALPHA_COUNTERLEDGER_PHASE_NEAR_BOUNDARY_NS = 8U;
+
 struct alpha_pps_counterledger_lane_t {
   bool     initialized = false;
   bool     interval_valid = false;
@@ -2297,6 +2306,44 @@ struct alpha_pps_counterledger_lane_t {
   int64_t  last_fast_residual_ns = 0;
   uint32_t update_count = 0;
   uint32_t interval_gap_count = 0;
+
+  bool     phase_pending = false;
+  uint32_t pending_phase_pps_sequence = 0;
+  uint32_t pending_phase_pps_dwt_at_edge = 0;
+  uint32_t phase_pending_overwrite_count = 0;
+
+  bool     phase_valid = false;
+  bool     phase_near_boundary = false;
+  uint32_t phase_source_id = ALPHA_COUNTERLEDGER_PHASE_SOURCE_NONE;
+  uint32_t phase_pps_sequence = 0;
+  uint32_t phase_pps_dwt_at_edge = 0;
+  uint32_t phase_prev_ocxo_dwt_at_edge = 0;
+  uint32_t phase_next_ocxo_dwt_at_edge = 0;
+  uint32_t phase_ocxo_interval_cycles = 0;
+  uint32_t phase_pps_delta_cycles = 0;
+  uint32_t phase_after_last_00_ns = 0;
+  uint32_t phase_to_next_00_ns = 0;
+
+  // PhaseLedger phase_after_last_00_ns is circular in the 0..99 ns OCXO
+  // tick cell.  The refined public clock must unwrap that residue across
+  // the 00 boundary; otherwise a true +3 ns phase walk can publish as -97 ns.
+  int32_t  phase_raw_delta_ns = 0;
+  int32_t  phase_unwrapped_delta_ns = 0;
+  int64_t  phase_unwrapped_carry_ticks = 0;
+  bool     phase_wrap_event = false;
+  uint32_t phase_wrap_count = 0;
+
+  uint32_t phase_resolve_count = 0;
+  uint32_t phase_invalid_count = 0;
+
+  bool     refined_valid = false;
+  bool     refined_interval_valid = false;
+  uint64_t refined_ns = 0;
+  uint64_t last_refined_ns = 0;
+  uint32_t refined_phase_pps_sequence = 0;
+  uint32_t last_refined_phase_pps_sequence = 0;
+  uint64_t refined_interval_ns = 0;
+  int64_t  refined_fast_residual_ns = 0;
 
   bool     last_capture_available = false;
   bool     last_capture_valid = false;
@@ -2316,6 +2363,9 @@ struct alpha_pps_counterledger_lane_t {
   uint64_t block_ticks = 0;
   uint64_t block_ns = 0;
   int64_t  block_fast_residual_sum_ns = 0;
+  bool     block_phase_valid = false;
+  uint64_t block_ns_with_phase = 0;
+  int64_t  block_fast_residual_sum_ns_with_phase = 0;
 
   bool     completed_block_valid = false;
   uint32_t completed_block_count = 0;
@@ -2325,6 +2375,9 @@ struct alpha_pps_counterledger_lane_t {
   uint64_t completed_block_ticks = 0;
   uint64_t completed_block_ns = 0;
   int64_t  completed_block_fast_residual_sum_ns = 0;
+  bool     completed_block_phase_valid = false;
+  uint64_t completed_block_ns_with_phase = 0;
+  int64_t  completed_block_fast_residual_sum_ns_with_phase = 0;
 
   uint32_t block_gap_reset_count = 0;
 };
@@ -2363,6 +2416,9 @@ static void alpha_counterledger_reset_current_block(
   s.block_ticks = 0;
   s.block_ns = 0;
   s.block_fast_residual_sum_ns = 0;
+  s.block_phase_valid = false;
+  s.block_ns_with_phase = 0;
+  s.block_fast_residual_sum_ns_with_phase = 0;
 }
 
 static void alpha_counterledger_complete_current_block(
@@ -2381,6 +2437,10 @@ static void alpha_counterledger_complete_current_block(
   s.completed_block_ns = s.block_ns;
   s.completed_block_fast_residual_sum_ns =
       s.block_fast_residual_sum_ns;
+  s.completed_block_phase_valid = s.block_phase_valid;
+  s.completed_block_ns_with_phase = s.block_ns_with_phase;
+  s.completed_block_fast_residual_sum_ns_with_phase =
+      s.block_fast_residual_sum_ns_with_phase;
 
   alpha_counterledger_reset_current_block(s);
 }
@@ -2399,7 +2459,10 @@ static void alpha_counterledger_add_block_interval(
     uint32_t current_pps_sequence,
     uint32_t delta_ticks,
     uint64_t interval_ns,
-    int64_t fast_residual_ns) {
+    int64_t fast_residual_ns,
+    bool interval_with_phase_valid,
+    uint64_t interval_ns_with_phase,
+    int64_t fast_residual_ns_with_phase) {
   if (!s.block_valid || s.block_interval_count == 0U) {
     s.block_valid = true;
     s.block_start_pps_sequence = previous_pps_sequence;
@@ -2408,6 +2471,9 @@ static void alpha_counterledger_add_block_interval(
     s.block_ticks = 0;
     s.block_ns = 0;
     s.block_fast_residual_sum_ns = 0;
+    s.block_phase_valid = true;
+    s.block_ns_with_phase = 0;
+    s.block_fast_residual_sum_ns_with_phase = 0;
   }
 
   s.block_end_pps_sequence = current_pps_sequence;
@@ -2415,6 +2481,13 @@ static void alpha_counterledger_add_block_interval(
   s.block_ticks += (uint64_t)delta_ticks;
   s.block_ns += interval_ns;
   s.block_fast_residual_sum_ns += fast_residual_ns;
+
+  if (interval_with_phase_valid) {
+    s.block_ns_with_phase += interval_ns_with_phase;
+    s.block_fast_residual_sum_ns_with_phase += fast_residual_ns_with_phase;
+  } else {
+    s.block_phase_valid = false;
+  }
 
   if (s.block_interval_count >= CLOCKS_OCXO_COUNTERLEDGER_BLOCK_SECONDS) {
     alpha_counterledger_complete_current_block(s);
@@ -2442,9 +2515,33 @@ static double alpha_counterledger_block_ppb(uint64_t block_ns,
   return (tau - 1.0) * 1.0e9;
 }
 
+static uint64_t alpha_phaseledger_refined_ns_with_carry(
+    uint64_t integer_ns,
+    int64_t carry_ticks,
+    uint32_t phase_after_last_00_ns) {
+  const uint64_t phase = (uint64_t)phase_after_last_00_ns;
+  if (carry_ticks >= 0) {
+    const uint64_t carry_ns = (uint64_t)carry_ticks *
+                              (uint64_t)NS_PER_10MHZ_TICK;
+    uint64_t out = integer_ns;
+    if (UINT64_MAX - out < carry_ns) return UINT64_MAX;
+    out += carry_ns;
+    if (UINT64_MAX - out < phase) return UINT64_MAX;
+    return out + phase;
+  }
+
+  const uint64_t carry_ns = (uint64_t)(-carry_ticks) *
+                            (uint64_t)NS_PER_10MHZ_TICK;
+  uint64_t out = integer_ns;
+  if (UINT64_MAX - out < phase) return UINT64_MAX;
+  out += phase;
+  return (out >= carry_ns) ? (out - carry_ns) : 0ULL;
+}
+
 static bool alpha_counterledger_apply_pps_sample(
     alpha_pps_counterledger_lane_t& s,
     uint32_t pps_sequence,
+    uint32_t pps_dwt_at_edge,
     uint32_t sampled_counter32,
     uint64_t* out_ns) {
   if (out_ns) *out_ns = 0ULL;
@@ -2456,12 +2553,61 @@ static bool alpha_counterledger_apply_pps_sample(
       pps_sequence == (uint32_t)(previous_pps_sequence + 1U);
   const uint32_t delta_ticks = sampled_counter32 - s.last_counter32;
 
+  const bool had_prior_refined = s.refined_valid;
+  const uint64_t previous_refined_ns = s.refined_ns;
+  const uint32_t previous_refined_phase_pps_sequence =
+      s.refined_phase_pps_sequence;
+
   s.ticks64 += (uint64_t)delta_ticks;
   s.last_counter32 = sampled_counter32;
   s.pps_sequence = pps_sequence;
   s.sample_count++;
   s.update_count++;
   s.ns = s.ticks64 * (uint64_t)NS_PER_10MHZ_TICK;
+
+  if (s.phase_pending) {
+    s.phase_pending_overwrite_count++;
+  }
+  s.phase_pending = true;
+  s.pending_phase_pps_sequence = pps_sequence;
+  s.pending_phase_pps_dwt_at_edge = pps_dwt_at_edge;
+
+  s.last_refined_ns = previous_refined_ns;
+  s.last_refined_phase_pps_sequence = previous_refined_phase_pps_sequence;
+  s.refined_valid = s.phase_valid;
+  s.refined_phase_pps_sequence = s.phase_valid ? s.phase_pps_sequence : 0U;
+  s.refined_ns = s.phase_valid
+      ? alpha_phaseledger_refined_ns_with_carry(
+            s.ns,
+            s.phase_unwrapped_carry_ticks,
+            s.phase_after_last_00_ns)
+      : s.ns;
+
+  // PhaseLedger is intentionally allowed to lag the current PPS row: the next
+  // OCXO 00-edge must arrive before the suffix for that PPS can be known.  The
+  // lag is published so reports can distinguish exact-row phase from a clean
+  // one-row delayed phase witness.
+  const bool phase_not_from_future =
+      s.phase_valid && s.phase_pps_sequence <= pps_sequence;
+  const uint32_t phase_lag = phase_not_from_future
+      ? (uint32_t)(pps_sequence - s.phase_pps_sequence)
+      : 0U;
+  (void)phase_lag;
+
+  s.refined_interval_valid = false;
+  s.refined_interval_ns = 0;
+  s.refined_fast_residual_ns = 0;
+  if (had_prior_refined && s.refined_valid &&
+      s.refined_ns >= previous_refined_ns &&
+      s.refined_phase_pps_sequence ==
+          (uint32_t)(previous_refined_phase_pps_sequence + 1U)) {
+    s.refined_interval_valid = contiguous;
+    if (s.refined_interval_valid) {
+      s.refined_interval_ns = s.refined_ns - previous_refined_ns;
+      s.refined_fast_residual_ns =
+          (int64_t)s.refined_interval_ns - (int64_t)NS_PER_SECOND_U64;
+    }
+  }
 
   // The first sample after SmartZero establishes the PPS-sampled bookend.
   // It is not a one-second interval.  Likewise, if a packet was missed, do
@@ -2475,6 +2621,9 @@ static bool alpha_counterledger_apply_pps_sample(
     s.last_delta_ticks = 0;
     s.last_interval_ns = 0;
     s.last_fast_residual_ns = 0;
+    s.refined_interval_valid = false;
+    s.refined_interval_ns = 0;
+    s.refined_fast_residual_ns = 0;
   } else {
     s.last_delta_ticks = delta_ticks;
     s.last_interval_ns = (uint64_t)delta_ticks * (uint64_t)NS_PER_10MHZ_TICK;
@@ -2485,10 +2634,13 @@ static bool alpha_counterledger_apply_pps_sample(
                                            pps_sequence,
                                            delta_ticks,
                                            s.last_interval_ns,
-                                           s.last_fast_residual_ns);
+                                           s.last_fast_residual_ns,
+                                           s.refined_interval_valid,
+                                           s.refined_interval_ns,
+                                           s.refined_fast_residual_ns);
   }
 
-  if (out_ns) *out_ns = s.ns;
+  if (out_ns) *out_ns = s.refined_valid ? s.refined_ns : s.ns;
   return true;
 }
 
@@ -2511,6 +2663,117 @@ static void alpha_counterledger_note_capture_status(
     if (cap.sequence != snap_sequence) s.sequence_mismatch_count++;
     if (!cap.all_lanes_capture_valid) s.all_lanes_invalid_count++;
   }
+}
+
+
+static alpha_pps_counterledger_lane_t* alpha_counterledger_lane_mut(
+    time_clock_id_t clock) {
+  switch (clock) {
+    case time_clock_id_t::OCXO1: return &g_ocxo1_pps_counterledger;
+    case time_clock_id_t::OCXO2: return &g_ocxo2_pps_counterledger;
+    default:                    return nullptr;
+  }
+}
+
+static bool alpha_counterledger_phase_ready_all(void) {
+  return g_ocxo1_pps_counterledger.phase_valid &&
+         g_ocxo2_pps_counterledger.phase_valid;
+}
+
+static void alpha_counterledger_resolve_phase_from_ocxo_edge(
+    time_clock_id_t clock,
+    uint32_t previous_ocxo_dwt_at_edge,
+    uint32_t next_ocxo_dwt_at_edge,
+    uint32_t counter_delta_ticks) {
+  alpha_pps_counterledger_lane_t* s = alpha_counterledger_lane_mut(clock);
+  if (!s || !s->initialized || !s->phase_pending) return;
+
+  const uint32_t interval_cycles =
+      next_ocxo_dwt_at_edge - previous_ocxo_dwt_at_edge;
+  if (interval_cycles == 0U) return;
+
+  const uint32_t pps_delta_cycles =
+      s->pending_phase_pps_dwt_at_edge - previous_ocxo_dwt_at_edge;
+  if (pps_delta_cycles > interval_cycles) {
+    // The pending PPS is not bracketed by this OCXO edge pair yet.  Leave the
+    // pending fact alive for the next OCXO edge rather than guessing.
+    return;
+  }
+
+  if (counter_delta_ticks != (uint32_t)VCLOCK_COUNTS_PER_SECOND) {
+    s->phase_invalid_count++;
+    s->phase_pending = false;
+    return;
+  }
+
+  const uint64_t scaled_ticks =
+      (uint64_t)pps_delta_cycles * (uint64_t)VCLOCK_COUNTS_PER_SECOND;
+  const uint64_t tick_remainder_cycles =
+      interval_cycles ? (scaled_ticks % (uint64_t)interval_cycles) : 0ULL;
+  uint32_t phase_after_last_00_ns = (uint32_t)(
+      (tick_remainder_cycles * (uint64_t)NS_PER_10MHZ_TICK) /
+      (uint64_t)interval_cycles);
+  if (phase_after_last_00_ns >= (uint32_t)NS_PER_10MHZ_TICK) {
+    phase_after_last_00_ns = (uint32_t)NS_PER_10MHZ_TICK - 1U;
+  }
+  const uint32_t phase_to_next_00_ns =
+      (phase_after_last_00_ns == 0U)
+          ? 0U
+          : ((uint32_t)NS_PER_10MHZ_TICK - phase_after_last_00_ns);
+
+  const bool previous_phase_valid = s->phase_valid;
+  const uint32_t previous_phase_pps_sequence = s->phase_pps_sequence;
+  const uint32_t previous_phase_after_last_00_ns =
+      s->phase_after_last_00_ns;
+  const bool phase_contiguous = previous_phase_valid &&
+      s->pending_phase_pps_sequence ==
+          (uint32_t)(previous_phase_pps_sequence + 1U);
+
+  int32_t raw_phase_delta_ns = 0;
+  int32_t unwrapped_phase_delta_ns = 0;
+  bool wrap_event = false;
+  if (phase_contiguous) {
+    raw_phase_delta_ns =
+        (int32_t)phase_after_last_00_ns -
+        (int32_t)previous_phase_after_last_00_ns;
+    unwrapped_phase_delta_ns = raw_phase_delta_ns;
+    if (raw_phase_delta_ns > (int32_t)NS_PER_10MHZ_TICK / 2) {
+      unwrapped_phase_delta_ns =
+          raw_phase_delta_ns - (int32_t)NS_PER_10MHZ_TICK;
+      s->phase_unwrapped_carry_ticks--;
+      wrap_event = true;
+    } else if (raw_phase_delta_ns < -((int32_t)NS_PER_10MHZ_TICK / 2)) {
+      unwrapped_phase_delta_ns =
+          raw_phase_delta_ns + (int32_t)NS_PER_10MHZ_TICK;
+      s->phase_unwrapped_carry_ticks++;
+      wrap_event = true;
+    }
+  }
+
+  s->phase_valid = true;
+  s->phase_pending = false;
+  s->phase_source_id =
+      ALPHA_COUNTERLEDGER_PHASE_SOURCE_PHYSICAL_PPS_TO_OBSERVED_OCXO_EDGE;
+  s->phase_pps_sequence = s->pending_phase_pps_sequence;
+  s->phase_pps_dwt_at_edge = s->pending_phase_pps_dwt_at_edge;
+  s->phase_prev_ocxo_dwt_at_edge = previous_ocxo_dwt_at_edge;
+  s->phase_next_ocxo_dwt_at_edge = next_ocxo_dwt_at_edge;
+  s->phase_ocxo_interval_cycles = interval_cycles;
+  s->phase_pps_delta_cycles = pps_delta_cycles;
+  s->phase_after_last_00_ns = phase_after_last_00_ns;
+  s->phase_to_next_00_ns = phase_to_next_00_ns;
+  s->phase_raw_delta_ns = raw_phase_delta_ns;
+  s->phase_unwrapped_delta_ns = unwrapped_phase_delta_ns;
+  s->phase_wrap_event = wrap_event;
+  if (wrap_event) {
+    s->phase_wrap_count++;
+  }
+  s->phase_near_boundary =
+      phase_after_last_00_ns <= ALPHA_COUNTERLEDGER_PHASE_NEAR_BOUNDARY_NS ||
+      phase_after_last_00_ns >=
+          ((uint32_t)NS_PER_10MHZ_TICK -
+           ALPHA_COUNTERLEDGER_PHASE_NEAR_BOUNDARY_NS);
+  s->phase_resolve_count++;
 }
 
 // OCXO public nanosecond ledgers are measured GNSS-elapsed clocks, not merely
@@ -3677,6 +3940,37 @@ bool clocks_alpha_ocxo_counterledger_snapshot(
   out->last_delta_ticks = s->last_delta_ticks;
   out->interval_ns = s->last_interval_ns;
   out->fast_residual_ns = s->last_fast_residual_ns;
+
+  out->phase_valid = s->phase_valid;
+  out->phase_pending = s->phase_pending;
+  out->phase_near_boundary = s->phase_near_boundary;
+  out->phase_source_id = s->phase_source_id;
+  out->phase_pps_sequence = s->phase_pps_sequence;
+  out->phase_lag_pps = (s->phase_valid && s->phase_pps_sequence <= s->pps_sequence)
+      ? (uint32_t)(s->pps_sequence - s->phase_pps_sequence)
+      : 0U;
+  out->phase_pps_dwt_at_edge = s->phase_pps_dwt_at_edge;
+  out->phase_prev_ocxo_dwt_at_edge = s->phase_prev_ocxo_dwt_at_edge;
+  out->phase_next_ocxo_dwt_at_edge = s->phase_next_ocxo_dwt_at_edge;
+  out->phase_ocxo_interval_cycles = s->phase_ocxo_interval_cycles;
+  out->phase_pps_delta_cycles = s->phase_pps_delta_cycles;
+  out->phase_after_last_00_ns = s->phase_after_last_00_ns;
+  out->phase_to_next_00_ns = s->phase_to_next_00_ns;
+  out->phase_raw_delta_ns = s->phase_raw_delta_ns;
+  out->phase_unwrapped_delta_ns = s->phase_unwrapped_delta_ns;
+  out->phase_unwrapped_carry_ticks = s->phase_unwrapped_carry_ticks;
+  out->phase_wrap_event = s->phase_wrap_event;
+  out->phase_wrap_count = s->phase_wrap_count;
+  out->phase_resolve_count = s->phase_resolve_count;
+  out->phase_pending_overwrite_count = s->phase_pending_overwrite_count;
+  out->phase_invalid_count = s->phase_invalid_count;
+
+  out->refined_valid = s->refined_valid;
+  out->refined_interval_valid = s->refined_interval_valid;
+  out->refined_ns = s->refined_ns;
+  out->refined_interval_ns = s->refined_interval_ns;
+  out->refined_fast_residual_ns = s->refined_fast_residual_ns;
+
   out->last_capture_available = s->last_capture_available;
   out->last_capture_valid = s->last_capture_valid;
   out->last_capture_all_lanes_valid = s->last_capture_all_lanes_valid;
@@ -3707,6 +4001,24 @@ bool clocks_alpha_ocxo_counterledger_snapshot(
   out->block_ppb =
       alpha_counterledger_block_ppb(s->block_ns,
                                     s->block_interval_count);
+  out->block_phase_valid =
+      out->block_valid && s->block_phase_valid;
+  out->block_ns_with_phase = s->block_ns_with_phase;
+  out->block_fast_residual_sum_ns_with_phase =
+      s->block_fast_residual_sum_ns_with_phase;
+  out->block_mean_fast_residual_ns_with_phase = out->block_phase_valid
+      ? alpha_counterledger_block_mean_ns(
+            s->block_fast_residual_sum_ns_with_phase,
+            s->block_interval_count)
+      : 0.0;
+  out->block_tau_with_phase = out->block_phase_valid
+      ? alpha_counterledger_block_tau(s->block_ns_with_phase,
+                                      s->block_interval_count)
+      : 1.0;
+  out->block_ppb_with_phase = out->block_phase_valid
+      ? alpha_counterledger_block_ppb(s->block_ns_with_phase,
+                                      s->block_interval_count)
+      : 0.0;
 
   out->completed_block_valid = s->completed_block_valid;
   out->completed_block_count = s->completed_block_count;
@@ -3730,6 +4042,25 @@ bool clocks_alpha_ocxo_counterledger_snapshot(
   out->completed_block_ppb =
       alpha_counterledger_block_ppb(s->completed_block_ns,
                                     s->completed_block_interval_count);
+  out->completed_block_phase_valid =
+      s->completed_block_valid && s->completed_block_phase_valid;
+  out->completed_block_ns_with_phase = s->completed_block_ns_with_phase;
+  out->completed_block_fast_residual_sum_ns_with_phase =
+      s->completed_block_fast_residual_sum_ns_with_phase;
+  out->completed_block_mean_fast_residual_ns_with_phase =
+      out->completed_block_phase_valid
+          ? alpha_counterledger_block_mean_ns(
+                s->completed_block_fast_residual_sum_ns_with_phase,
+                s->completed_block_interval_count)
+          : 0.0;
+  out->completed_block_tau_with_phase = out->completed_block_phase_valid
+      ? alpha_counterledger_block_tau(s->completed_block_ns_with_phase,
+                                      s->completed_block_interval_count)
+      : 1.0;
+  out->completed_block_ppb_with_phase = out->completed_block_phase_valid
+      ? alpha_counterledger_block_ppb(s->completed_block_ns_with_phase,
+                                      s->completed_block_interval_count)
+      : 0.0;
   out->block_gap_reset_count = s->block_gap_reset_count;
   return out->valid;
 }
@@ -3737,9 +4068,13 @@ bool clocks_alpha_ocxo_counterledger_snapshot(
 bool clocks_alpha_ocxo_counterledger_ready(void) {
   clocks_alpha_ocxo_counterledger_snapshot_t ocxo1{};
   clocks_alpha_ocxo_counterledger_snapshot_t ocxo2{};
-  return clocks_alpha_ocxo_counterledger_snapshot(time_clock_id_t::OCXO1, &ocxo1) &&
-         clocks_alpha_ocxo_counterledger_snapshot(time_clock_id_t::OCXO2, &ocxo2) &&
-         ocxo1.valid && ocxo2.valid;
+  const bool snapshots_valid =
+      clocks_alpha_ocxo_counterledger_snapshot(time_clock_id_t::OCXO1, &ocxo1) &&
+      clocks_alpha_ocxo_counterledger_snapshot(time_clock_id_t::OCXO2, &ocxo2) &&
+      ocxo1.valid && ocxo2.valid;
+  if (!snapshots_valid) return false;
+  return !clocks_ocxo_counterledger_mode() ||
+         (ocxo1.refined_valid && ocxo2.refined_valid);
 }
 
 static bool alpha_zero_offset_valid(time_clock_id_t clock) {
@@ -5688,11 +6023,16 @@ bool clocks_alpha_ocxo_recover_reattach_snapshot(
   local.physical_ns_nonzero = local.current_physical_ns != 0ULL;
 
   if (clocks_ocxo_counterledger_mode()) {
-    // CounterLedger recovery reattachment is proved by the public PPS-sampled
-    // counter ledger itself.  It does not depend on OCXO edge projection or
-    // FloorLine evidence, which remain diagnostics in this mode.
-    local.projection_ready = local.public_ns_nonzero;
-    local.ready = local.public_ns_nonzero;
+    // CounterLedger recovery reattachment is proved by the PPS-sampled
+    // counter ledger plus its PhaseLedger suffix.  It does not depend on OCXO
+    // edge projection or FloorLine evidence, which remain diagnostics in this
+    // mode.
+    clocks_alpha_ocxo_counterledger_snapshot_t ledger{};
+    const bool ledger_ready =
+        clocks_alpha_ocxo_counterledger_snapshot(clock, &ledger) &&
+        ledger.valid && ledger.refined_valid;
+    local.projection_ready = ledger_ready;
+    local.ready = ledger_ready;
   } else {
     local.ready =
         local.forensics_ready &&
@@ -6224,6 +6564,14 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
     const uint64_t boundary_gnss_ns_at_edge = sample_gnss_ns_at_event;
     const bool boundary_gnss_available = sample_gnss_available;
 
+    if (had_previous) {
+      alpha_counterledger_resolve_phase_from_ocxo_edge(
+          time_clock,
+          meas.prev_dwt_at_edge,
+          applied_event.dwt_at_event,
+          counter32_delta_since_previous_event);
+    }
+
     alpha_ocxo_edge_history_record(time_clock,
                                    applied_event.dwt_at_event,
                                    applied_event.counter32_at_event,
@@ -6517,7 +6865,8 @@ static bool alpha_sample_all_clocks_at_pps_vclock(const pps_edge_snapshot_t& sna
   const bool counterledger_report_ready =
       clocks_ocxo_counterledger_report_enabled() && counterledger_epoch_ready;
   const bool counterledger_authority_ready =
-      clocks_ocxo_counterledger_mode() && counterledger_epoch_ready;
+      clocks_ocxo_counterledger_mode() && counterledger_epoch_ready &&
+      alpha_counterledger_phase_ready_all();
   if (counterledger_report_ready) {
     alpha_counterledger_note_capture_status(g_ocxo1_pps_counterledger,
                                             cap_available,
@@ -6536,10 +6885,12 @@ static bool alpha_sample_all_clocks_at_pps_vclock(const pps_edge_snapshot_t& sna
     const bool applied = counterledger_capture_ready &&
         alpha_counterledger_apply_pps_sample(g_ocxo1_pps_counterledger,
                                              snap.sequence,
+                                             snap.physical_pps_dwt_normalized_at_edge,
                                              cap.ocxo1_counter32,
                                              &ocxo1_counterledger_ns) &&
         alpha_counterledger_apply_pps_sample(g_ocxo2_pps_counterledger,
                                              snap.sequence,
+                                             snap.physical_pps_dwt_normalized_at_edge,
                                              cap.ocxo2_counter32,
                                              &ocxo2_counterledger_ns);
 
@@ -6616,11 +6967,13 @@ static bool alpha_sample_all_clocks_at_pps_vclock(const pps_edge_snapshot_t& sna
     ocxo2_visible_ns = ocxo2_projected_visible_ns;
   }
 
-  // Capture the large campaign public-origin correction only from PPS-row
-  // clock-domain projections, never from the conservative measured-edge
-  // fallback.  The fallback is allowed to preserve display continuity while the
-  // projection warms up, but it must not install the epoch's public branch.
-  if (ocxo1_projected_visible_valid && ocxo2_projected_visible_valid) {
+  // In traditional mode, capture the large campaign public-origin correction
+  // only from PPS-row clock-domain projections, never from the conservative
+  // measured-edge fallback.  In CounterLedger mode, do not let the projection
+  // path install the public branch; the PPS-sampled integer ledger below owns
+  // that origin.
+  if (!clocks_ocxo_counterledger_mode() &&
+      ocxo1_projected_visible_valid && ocxo2_projected_visible_valid) {
     alpha_ocxo_visible_origin_maybe_capture_public_origin(
         time_clock_id_t::OCXO1, snap.sequence, vclock_ns, ocxo1_visible_ns);
     alpha_ocxo_visible_origin_maybe_capture_public_origin(
