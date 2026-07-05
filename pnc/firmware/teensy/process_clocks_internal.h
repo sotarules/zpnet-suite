@@ -234,6 +234,20 @@ static constexpr clocks_ocxo_public_ns_authority_t
     CLOCKS_OCXO_PUBLIC_NS_AUTHORITY =
         clocks_ocxo_public_ns_authority_t::TRADITIONAL_PPS_PROJECTION;
 
+// CounterLedger can be advanced and reported without authoring public OCXO
+// nanoseconds.  This is the safe migration posture: prove the PPS-sampled
+// integer ledger beside the traditional projection path before promoting it
+// to authority.
+static constexpr bool CLOCKS_OCXO_COUNTERLEDGER_REPORT_ONLY_ENABLED = true;
+
+// CounterLedger frequency is fundamentally a long-baseline integer-tick
+// witness. One OCXO tick is 100 ns, so sub-ppb behavior emerges over
+// hundreds or thousands of PPS samples rather than in a single one-second
+// row. Alpha therefore accumulates a non-authoritative rolling block so
+// Beta can publish an independent block-level PPB/TAU witness beside the
+// existing per-row residual and campaign candidate.
+static constexpr uint32_t CLOCKS_OCXO_COUNTERLEDGER_BLOCK_SECONDS = 600U;
+
 static inline constexpr bool clocks_ocxo_counterledger_mode(void) {
   return CLOCKS_OCXO_PUBLIC_NS_AUTHORITY ==
          clocks_ocxo_public_ns_authority_t::PPS_COUNTERLEDGER;
@@ -241,6 +255,11 @@ static inline constexpr bool clocks_ocxo_counterledger_mode(void) {
 
 static inline constexpr bool clocks_ocxo_counterledger_mode_enabled(void) {
   return clocks_ocxo_counterledger_mode();
+}
+
+static inline constexpr bool clocks_ocxo_counterledger_report_enabled(void) {
+  return CLOCKS_OCXO_COUNTERLEDGER_REPORT_ONLY_ENABLED ||
+         clocks_ocxo_counterledger_mode();
 }
 
 static inline constexpr const char* clocks_ocxo_public_ns_authority_name(void) {
@@ -251,6 +270,10 @@ static inline constexpr const char* clocks_ocxo_public_ns_authority_name(void) {
 
 struct clocks_alpha_ocxo_counterledger_snapshot_t {
   bool     valid = false;
+  bool     initialized = false;
+  bool     interval_valid = false;
+  bool     report_enabled = false;
+  bool     authority_enabled = false;
   uint32_t clock_id = 0;
   uint32_t pps_sequence = 0;
   uint32_t sample_count = 0;
@@ -261,6 +284,50 @@ struct clocks_alpha_ocxo_counterledger_snapshot_t {
   uint32_t last_delta_ticks = 0;
   uint64_t interval_ns = 0;
   int64_t  fast_residual_ns = 0;
+
+  // Capture-custody counters.  These are report-only unless
+  // CLOCKS_OCXO_PUBLIC_NS_AUTHORITY == PPS_COUNTERLEDGER.
+  bool     last_capture_available = false;
+  bool     last_capture_valid = false;
+  bool     last_capture_all_lanes_valid = false;
+  bool     last_capture_sequence_match = false;
+  uint32_t last_capture_sequence = 0;
+  uint32_t last_capture_window_cycles = 0;
+  uint32_t update_count = 0;
+  uint32_t capture_missing_count = 0;
+  uint32_t capture_invalid_count = 0;
+  uint32_t sequence_mismatch_count = 0;
+  uint32_t all_lanes_invalid_count = 0;
+  uint32_t interval_gap_count = 0;
+
+  // Rolling block witness. These fields are report-only unless/until the
+  // CounterLedger rail is promoted to public authority. block_* is the
+  // in-progress block; completed_block_* is the most recent full block.
+  bool     block_valid = false;
+  uint32_t block_window_seconds = 0;
+  uint32_t block_start_pps_sequence = 0;
+  uint32_t block_end_pps_sequence = 0;
+  uint32_t block_interval_count = 0;
+  uint64_t block_ticks = 0;
+  uint64_t block_ns = 0;
+  int64_t  block_fast_residual_sum_ns = 0;
+  double   block_mean_fast_residual_ns = 0.0;
+  double   block_tau = 1.0;
+  double   block_ppb = 0.0;
+
+  bool     completed_block_valid = false;
+  uint32_t completed_block_count = 0;
+  uint32_t completed_block_start_pps_sequence = 0;
+  uint32_t completed_block_end_pps_sequence = 0;
+  uint32_t completed_block_interval_count = 0;
+  uint64_t completed_block_ticks = 0;
+  uint64_t completed_block_ns = 0;
+  int64_t  completed_block_fast_residual_sum_ns = 0;
+  double   completed_block_mean_fast_residual_ns = 0.0;
+  double   completed_block_tau = 1.0;
+  double   completed_block_ppb = 0.0;
+
+  uint32_t block_gap_reset_count = 0;
 };
 
 bool clocks_alpha_ocxo_counterledger_snapshot(

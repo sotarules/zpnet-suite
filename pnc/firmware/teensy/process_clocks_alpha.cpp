@@ -2285,6 +2285,7 @@ static alpha_lane_logical_ticks_t g_ocxo2_ticks64 = {};
 // ambient reads.
 struct alpha_pps_counterledger_lane_t {
   bool     initialized = false;
+  bool     interval_valid = false;
   uint32_t zero_counter32 = 0;
   uint32_t last_counter32 = 0;
   uint64_t ticks64 = 0;
@@ -2294,6 +2295,38 @@ struct alpha_pps_counterledger_lane_t {
   uint32_t last_delta_ticks = 0;
   uint64_t last_interval_ns = 0;
   int64_t  last_fast_residual_ns = 0;
+  uint32_t update_count = 0;
+  uint32_t interval_gap_count = 0;
+
+  bool     last_capture_available = false;
+  bool     last_capture_valid = false;
+  bool     last_capture_all_lanes_valid = false;
+  bool     last_capture_sequence_match = false;
+  uint32_t last_capture_sequence = 0;
+  uint32_t last_capture_window_cycles = 0;
+  uint32_t capture_missing_count = 0;
+  uint32_t capture_invalid_count = 0;
+  uint32_t sequence_mismatch_count = 0;
+  uint32_t all_lanes_invalid_count = 0;
+
+  bool     block_valid = false;
+  uint32_t block_start_pps_sequence = 0;
+  uint32_t block_end_pps_sequence = 0;
+  uint32_t block_interval_count = 0;
+  uint64_t block_ticks = 0;
+  uint64_t block_ns = 0;
+  int64_t  block_fast_residual_sum_ns = 0;
+
+  bool     completed_block_valid = false;
+  uint32_t completed_block_count = 0;
+  uint32_t completed_block_start_pps_sequence = 0;
+  uint32_t completed_block_end_pps_sequence = 0;
+  uint32_t completed_block_interval_count = 0;
+  uint64_t completed_block_ticks = 0;
+  uint64_t completed_block_ns = 0;
+  int64_t  completed_block_fast_residual_sum_ns = 0;
+
+  uint32_t block_gap_reset_count = 0;
 };
 
 static alpha_pps_counterledger_lane_t g_ocxo1_pps_counterledger = {};
@@ -2321,6 +2354,94 @@ static void alpha_counterledger_install_zero(
   s.last_counter32 = zero_counter32;
 }
 
+static void alpha_counterledger_reset_current_block(
+    alpha_pps_counterledger_lane_t& s) {
+  s.block_valid = false;
+  s.block_start_pps_sequence = 0;
+  s.block_end_pps_sequence = 0;
+  s.block_interval_count = 0;
+  s.block_ticks = 0;
+  s.block_ns = 0;
+  s.block_fast_residual_sum_ns = 0;
+}
+
+static void alpha_counterledger_complete_current_block(
+    alpha_pps_counterledger_lane_t& s) {
+  if (!s.block_valid || s.block_interval_count == 0U) {
+    alpha_counterledger_reset_current_block(s);
+    return;
+  }
+
+  s.completed_block_valid = true;
+  s.completed_block_count++;
+  s.completed_block_start_pps_sequence = s.block_start_pps_sequence;
+  s.completed_block_end_pps_sequence = s.block_end_pps_sequence;
+  s.completed_block_interval_count = s.block_interval_count;
+  s.completed_block_ticks = s.block_ticks;
+  s.completed_block_ns = s.block_ns;
+  s.completed_block_fast_residual_sum_ns =
+      s.block_fast_residual_sum_ns;
+
+  alpha_counterledger_reset_current_block(s);
+}
+
+static void alpha_counterledger_reset_current_block_for_gap(
+    alpha_pps_counterledger_lane_t& s) {
+  if (s.block_valid && s.block_interval_count != 0U) {
+    s.block_gap_reset_count++;
+  }
+  alpha_counterledger_reset_current_block(s);
+}
+
+static void alpha_counterledger_add_block_interval(
+    alpha_pps_counterledger_lane_t& s,
+    uint32_t previous_pps_sequence,
+    uint32_t current_pps_sequence,
+    uint32_t delta_ticks,
+    uint64_t interval_ns,
+    int64_t fast_residual_ns) {
+  if (!s.block_valid || s.block_interval_count == 0U) {
+    s.block_valid = true;
+    s.block_start_pps_sequence = previous_pps_sequence;
+    s.block_end_pps_sequence = previous_pps_sequence;
+    s.block_interval_count = 0;
+    s.block_ticks = 0;
+    s.block_ns = 0;
+    s.block_fast_residual_sum_ns = 0;
+  }
+
+  s.block_end_pps_sequence = current_pps_sequence;
+  s.block_interval_count++;
+  s.block_ticks += (uint64_t)delta_ticks;
+  s.block_ns += interval_ns;
+  s.block_fast_residual_sum_ns += fast_residual_ns;
+
+  if (s.block_interval_count >= CLOCKS_OCXO_COUNTERLEDGER_BLOCK_SECONDS) {
+    alpha_counterledger_complete_current_block(s);
+  }
+}
+
+static double alpha_counterledger_block_mean_ns(int64_t residual_sum_ns,
+                                                uint32_t interval_count) {
+  return interval_count
+      ? ((double)residual_sum_ns / (double)interval_count)
+      : 0.0;
+}
+
+static double alpha_counterledger_block_tau(uint64_t block_ns,
+                                            uint32_t interval_count) {
+  if (interval_count == 0U) return 1.0;
+  const double reference_ns =
+      (double)interval_count * (double)NS_PER_SECOND_U64;
+  return reference_ns != 0.0 ? ((double)block_ns / reference_ns) : 1.0;
+}
+
+static double alpha_counterledger_block_ppb(uint64_t block_ns,
+                                            uint32_t interval_count) {
+  const double tau = alpha_counterledger_block_tau(block_ns, interval_count);
+  return (tau - 1.0) * 1.0e9;
+}
+
 static bool alpha_counterledger_apply_pps_sample(
     alpha_pps_counterledger_lane_t& s,
     uint32_t pps_sequence,
@@ -2329,19 +2450,67 @@ static bool alpha_counterledger_apply_pps_sample(
   if (out_ns) *out_ns = 0ULL;
   if (!s.initialized) return false;
 
+  const bool had_prior_sample = s.sample_count != 0U;
+  const uint32_t previous_pps_sequence = s.pps_sequence;
+  const bool contiguous = had_prior_sample &&
+      pps_sequence == (uint32_t)(previous_pps_sequence + 1U);
   const uint32_t delta_ticks = sampled_counter32 - s.last_counter32;
+
   s.ticks64 += (uint64_t)delta_ticks;
   s.last_counter32 = sampled_counter32;
   s.pps_sequence = pps_sequence;
   s.sample_count++;
-  s.last_delta_ticks = delta_ticks;
-  s.last_interval_ns = (uint64_t)delta_ticks * (uint64_t)NS_PER_10MHZ_TICK;
-  s.last_fast_residual_ns =
-      (int64_t)s.last_interval_ns - (int64_t)NS_PER_SECOND_U64;
+  s.update_count++;
   s.ns = s.ticks64 * (uint64_t)NS_PER_10MHZ_TICK;
+
+  // The first sample after SmartZero establishes the PPS-sampled bookend.
+  // It is not a one-second interval.  Likewise, if a packet was missed, do
+  // not turn the multi-second catch-up into a false +/-1e9 ns residual.
+  s.interval_valid = had_prior_sample && contiguous;
+  if (!s.interval_valid) {
+    if (had_prior_sample && !contiguous) {
+      s.interval_gap_count++;
+      alpha_counterledger_reset_current_block_for_gap(s);
+    }
+    s.last_delta_ticks = 0;
+    s.last_interval_ns = 0;
+    s.last_fast_residual_ns = 0;
+  } else {
+    s.last_delta_ticks = delta_ticks;
+    s.last_interval_ns = (uint64_t)delta_ticks * (uint64_t)NS_PER_10MHZ_TICK;
+    s.last_fast_residual_ns =
+        (int64_t)s.last_interval_ns - (int64_t)NS_PER_SECOND_U64;
+    alpha_counterledger_add_block_interval(s,
+                                           previous_pps_sequence,
+                                           pps_sequence,
+                                           delta_ticks,
+                                           s.last_interval_ns,
+                                           s.last_fast_residual_ns);
+  }
 
   if (out_ns) *out_ns = s.ns;
   return true;
+}
+
+static void alpha_counterledger_note_capture_status(
+    alpha_pps_counterledger_lane_t& s,
+    bool cap_available,
+    const interrupt_epoch_capture_t& cap,
+    uint32_t snap_sequence) {
+  s.last_capture_available = cap_available;
+  s.last_capture_valid = cap_available && cap.valid;
+  s.last_capture_all_lanes_valid = cap_available && cap.all_lanes_capture_valid;
+  s.last_capture_sequence_match = cap_available && cap.sequence == snap_sequence;
+  s.last_capture_sequence = cap_available ? cap.sequence : 0U;
+  s.last_capture_window_cycles = cap_available ? cap.capture_window_cycles : 0U;
+
+  if (!cap_available) {
+    s.capture_missing_count++;
+  } else {
+    if (!cap.valid) s.capture_invalid_count++;
+    if (cap.sequence != snap_sequence) s.sequence_mismatch_count++;
+    if (!cap.all_lanes_capture_valid) s.all_lanes_invalid_count++;
+  }
 }
 
 // OCXO public nanosecond ledgers are measured GNSS-elapsed clocks, not merely
@@ -3494,6 +3663,10 @@ bool clocks_alpha_ocxo_counterledger_snapshot(
   if (!s) return false;
 
   out->valid = s->initialized && s->sample_count != 0U;
+  out->initialized = s->initialized;
+  out->interval_valid = s->interval_valid;
+  out->report_enabled = clocks_ocxo_counterledger_report_enabled();
+  out->authority_enabled = clocks_ocxo_counterledger_mode();
   out->clock_id = (uint32_t)((uint8_t)clock);
   out->pps_sequence = s->pps_sequence;
   out->sample_count = s->sample_count;
@@ -3504,6 +3677,60 @@ bool clocks_alpha_ocxo_counterledger_snapshot(
   out->last_delta_ticks = s->last_delta_ticks;
   out->interval_ns = s->last_interval_ns;
   out->fast_residual_ns = s->last_fast_residual_ns;
+  out->last_capture_available = s->last_capture_available;
+  out->last_capture_valid = s->last_capture_valid;
+  out->last_capture_all_lanes_valid = s->last_capture_all_lanes_valid;
+  out->last_capture_sequence_match = s->last_capture_sequence_match;
+  out->last_capture_sequence = s->last_capture_sequence;
+  out->last_capture_window_cycles = s->last_capture_window_cycles;
+  out->update_count = s->update_count;
+  out->capture_missing_count = s->capture_missing_count;
+  out->capture_invalid_count = s->capture_invalid_count;
+  out->sequence_mismatch_count = s->sequence_mismatch_count;
+  out->all_lanes_invalid_count = s->all_lanes_invalid_count;
+  out->interval_gap_count = s->interval_gap_count;
+
+  out->block_valid = s->block_valid && s->block_interval_count != 0U;
+  out->block_window_seconds = CLOCKS_OCXO_COUNTERLEDGER_BLOCK_SECONDS;
+  out->block_start_pps_sequence = s->block_start_pps_sequence;
+  out->block_end_pps_sequence = s->block_end_pps_sequence;
+  out->block_interval_count = s->block_interval_count;
+  out->block_ticks = s->block_ticks;
+  out->block_ns = s->block_ns;
+  out->block_fast_residual_sum_ns = s->block_fast_residual_sum_ns;
+  out->block_mean_fast_residual_ns =
+      alpha_counterledger_block_mean_ns(s->block_fast_residual_sum_ns,
+                                        s->block_interval_count);
+  out->block_tau =
+      alpha_counterledger_block_tau(s->block_ns,
+                                    s->block_interval_count);
+  out->block_ppb =
+      alpha_counterledger_block_ppb(s->block_ns,
+                                    s->block_interval_count);
+
+  out->completed_block_valid = s->completed_block_valid;
+  out->completed_block_count = s->completed_block_count;
+  out->completed_block_start_pps_sequence =
+      s->completed_block_start_pps_sequence;
+  out->completed_block_end_pps_sequence =
+      s->completed_block_end_pps_sequence;
+  out->completed_block_interval_count =
+      s->completed_block_interval_count;
+  out->completed_block_ticks = s->completed_block_ticks;
+  out->completed_block_ns = s->completed_block_ns;
+  out->completed_block_fast_residual_sum_ns =
+      s->completed_block_fast_residual_sum_ns;
+  out->completed_block_mean_fast_residual_ns =
+      alpha_counterledger_block_mean_ns(
+          s->completed_block_fast_residual_sum_ns,
+          s->completed_block_interval_count);
+  out->completed_block_tau =
+      alpha_counterledger_block_tau(s->completed_block_ns,
+                                    s->completed_block_interval_count);
+  out->completed_block_ppb =
+      alpha_counterledger_block_ppb(s->completed_block_ns,
+                                    s->completed_block_interval_count);
+  out->block_gap_reset_count = s->block_gap_reset_count;
   return out->valid;
 }
 
@@ -6286,23 +6513,37 @@ static bool alpha_sample_all_clocks_at_pps_vclock(const pps_edge_snapshot_t& sna
 
   uint64_t ocxo1_counterledger_ns = 0ULL;
   uint64_t ocxo2_counterledger_ns = 0ULL;
-  const bool counterledger_epoch_ready =
-      clocks_ocxo_counterledger_mode() && alpha_counterledger_epoch_ready();
-  if (counterledger_epoch_ready) {
+  const bool counterledger_epoch_ready = alpha_counterledger_epoch_ready();
+  const bool counterledger_report_ready =
+      clocks_ocxo_counterledger_report_enabled() && counterledger_epoch_ready;
+  const bool counterledger_authority_ready =
+      clocks_ocxo_counterledger_mode() && counterledger_epoch_ready;
+  if (counterledger_report_ready) {
+    alpha_counterledger_note_capture_status(g_ocxo1_pps_counterledger,
+                                            cap_available,
+                                            cap,
+                                            snap.sequence);
+    alpha_counterledger_note_capture_status(g_ocxo2_pps_counterledger,
+                                            cap_available,
+                                            cap,
+                                            snap.sequence);
+
     const bool counterledger_capture_ready =
         cap_available &&
         cap.valid &&
         cap.all_lanes_capture_valid &&
         cap.sequence == snap.sequence;
-    if (!counterledger_capture_ready ||
-        !alpha_counterledger_apply_pps_sample(g_ocxo1_pps_counterledger,
-                                              snap.sequence,
-                                              cap.ocxo1_counter32,
-                                              &ocxo1_counterledger_ns) ||
-        !alpha_counterledger_apply_pps_sample(g_ocxo2_pps_counterledger,
-                                              snap.sequence,
-                                              cap.ocxo2_counter32,
-                                              &ocxo2_counterledger_ns)) {
+    const bool applied = counterledger_capture_ready &&
+        alpha_counterledger_apply_pps_sample(g_ocxo1_pps_counterledger,
+                                             snap.sequence,
+                                             cap.ocxo1_counter32,
+                                             &ocxo1_counterledger_ns) &&
+        alpha_counterledger_apply_pps_sample(g_ocxo2_pps_counterledger,
+                                             snap.sequence,
+                                             cap.ocxo2_counter32,
+                                             &ocxo2_counterledger_ns);
+
+    if (!applied && counterledger_authority_ready) {
       clocks_watchdog_anomaly("alpha_counterledger_capture_invalid",
                               snap.sequence,
                               cap.sequence,
@@ -6393,7 +6634,7 @@ static bool alpha_sample_all_clocks_at_pps_vclock(const pps_edge_snapshot_t& sna
       alpha_ocxo_public_ns_from_visible_origin(time_clock_id_t::OCXO2,
                                                ocxo2_visible_ns);
 
-  if (counterledger_epoch_ready) {
+  if (counterledger_authority_ready) {
     // CounterLedger is the PPS-sampled clockface authority.  Capture the
     // public-origin offset from the same PPS-authored samples, then publish the
     // public OCXO value from the counter ledger rather than from any DWT

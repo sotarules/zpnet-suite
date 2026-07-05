@@ -123,6 +123,23 @@ def _first_int(*values: Any) -> Optional[int]:
     return None
 
 
+def _as_float(v: Any) -> Optional[float]:
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _first_float(*values: Any) -> Optional[float]:
+    for value in values:
+        out = _as_float(value)
+        if out is not None:
+            return out
+    return None
+
+
 def _fmt_int(v: Optional[int], width: int = 0, signed: bool = False) -> str:
     if v is None:
         s = "---"
@@ -285,6 +302,23 @@ def pps_dwt_at_edge(root: Dict[str, Any],
     )
 
 
+def gnss_discipline_fields(root: Dict[str, Any],
+                           frag: Dict[str, Any]) -> Dict[str, Optional[float]]:
+    """Return GNSS receiver discipline fields for reference-movement checks."""
+    gnss = root.get("gnss") if isinstance(root.get("gnss"), dict) else {}
+    frag_gnss = frag.get("gnss") if isinstance(frag.get("gnss"), dict) else {}
+    extra = root.get("extra_clocks") if isinstance(root.get("extra_clocks"), dict) else {}
+
+    return {
+        "g_clk_ppb": _first_float(gnss.get("clock_drift_ppb"), frag_gnss.get("clock_drift_ppb")),
+        "g_freq_ppb": _first_float(gnss.get("freq_error_ppb"), frag_gnss.get("freq_error_ppb")),
+        "g_pps_err": _first_float(gnss.get("pps_timing_error_ns"), frag_gnss.get("pps_timing_error_ns")),
+        "g_acc_ns": _first_float(gnss.get("estimated_accuracy_ns"), frag_gnss.get("estimated_accuracy_ns")),
+        "g_raw_ppb": _first_float(extra.get("gnss_raw_drift_ppb")),
+        "g_raw_mean": _first_float(extra.get("gnss_raw_welford_mean")),
+    }
+
+
 def vclock_cycles(root: Dict[str, Any],
                   frag: Dict[str, Any],
                   forensic: Dict[str, Any],
@@ -381,6 +415,7 @@ def collect_rows(records: Iterable[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]
         v_cyc = vclock_cycles(root, frag, forensic, ref)
         o1_cyc, o1_res = ocxo_cycles_and_residual(root, frag, forensic, "OCXO1", ref)
         o2_cyc, o2_res = ocxo_cycles_and_residual(root, frag, forensic, "OCXO2", ref)
+        gnss_fields = gnss_discipline_fields(root, frag)
 
         row = {
             "pps": pps,
@@ -392,6 +427,7 @@ def collect_rows(records: Iterable[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]
             "o1_res": o1_res,
             "o2_cyc": o2_cyc,
             "o2_res": o2_res,
+            **gnss_fields,
         }
 
         # Running cumulative PPB is just the mean of one-second residuals.
@@ -436,6 +472,12 @@ def print_table(rows: List[Dict[str, Any]]) -> None:
         ("o2_cyc", lambda r: _fmt_int(r.get("o2_cyc"))),
         ("o2_res", lambda r: _fmt_int(r.get("o2_res"), signed=True)),
         ("o2_ppb", lambda r: _fmt_float(r.get("o2_ppb"), signed=True)),
+        ("g_clk_ppb", lambda r: _fmt_float(r.get("g_clk_ppb"), decimals=3, signed=True)),
+        ("g_freq_ppb", lambda r: _fmt_float(r.get("g_freq_ppb"), decimals=3, signed=True)),
+        ("g_pps_err", lambda r: _fmt_float(r.get("g_pps_err"), decimals=1, signed=True)),
+        ("g_acc_ns", lambda r: _fmt_float(r.get("g_acc_ns"), decimals=1, signed=False)),
+        ("g_raw_ppb", lambda r: _fmt_float(r.get("g_raw_ppb"), decimals=3, signed=True)),
+        ("g_raw_mean", lambda r: _fmt_float(r.get("g_raw_mean"), decimals=3, signed=True)),
     ]
 
     rendered = [[fn(row) for _, fn in columns] for row in rows]
@@ -475,6 +517,8 @@ def analyze(campaign: str) -> None:
     print("  • Because each residual is over a one-second GNSS gate, residual ns/sec is numerically ppb.")
     print("  • VCLOCK residual is normally zero because the selected PPS/VCLOCK interval is the GNSS reference.")
     print("  • OCXO residuals prefer fragment.<ocxo>.science.delta_raw_fast_residual_ns when present.")
+    print("  • g_clk_ppb/g_freq_ppb/g_pps_err/g_acc_ns come from TIMEBASE gnss.* discipline fields.")
+    print("  • g_raw_ppb/g_raw_mean come from extra_clocks.gnss_raw_* receiver-drift fields.")
 
 
 def main() -> None:

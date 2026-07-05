@@ -634,6 +634,15 @@ static int64_t g_campaign_public_ocxo2_offset = 0;
 static int64_t g_campaign_public_ocxo1_measured_offset = 0;
 static int64_t g_campaign_public_ocxo2_measured_offset = 0;
 
+// Report-only CounterLedger public transform.  These offsets never author the
+// canonical OCXO public clock unless CLOCKS_OCXO_PUBLIC_NS_AUTHORITY is later
+// promoted to PPS_COUNTERLEDGER.  In traditional mode they let TIMEBASE carry
+// a campaign-aligned CounterLedger candidate beside the existing projection/
+// Delta path so long runs can prove whether the integer PPS-sampled ledger is
+// stable.
+static int64_t g_campaign_public_counterledger_ocxo1_offset = 0;
+static int64_t g_campaign_public_counterledger_ocxo2_offset = 0;
+
 // Canonical OCXO residual rendering.  Delta Cycles is now the authority:
 // each OCXO observed one-second DWT interval is compared against the delayed
 // GNSS/PPS one-second DWT interval covering the same physical second.  The
@@ -1004,6 +1013,14 @@ static uint64_t current_raw_ocxo2_ns(void) {
   return current_raw_ocxo2_measured_ns();
 }
 
+static uint64_t current_raw_counterledger_ns(time_clock_id_t clock) {
+  clocks_alpha_ocxo_counterledger_snapshot_t s{};
+  if (!clocks_alpha_ocxo_counterledger_snapshot(clock, &s) || !s.valid) {
+    return 0ULL;
+  }
+  return s.ns;
+}
+
 static int64_t campaign_public_offset_for_recovered_value(uint64_t current,
                                                            uint64_t recovered) {
   if (recovered >= current) {
@@ -1029,6 +1046,46 @@ static uint64_t campaign_public_from_offset(uint64_t raw, int64_t offset) {
   return (raw >= sub) ? (raw - sub) : 0ULL;
 }
 
+static uint64_t campaign_public_counterledger_ns(time_clock_id_t clock,
+                                                 int64_t offset) {
+  const uint64_t raw = current_raw_counterledger_ns(clock);
+  return raw ? campaign_public_from_offset(raw, offset) : 0ULL;
+}
+
+static uint64_t campaign_public_counterledger_ocxo1_ns(void) {
+  return campaign_public_counterledger_ns(
+      time_clock_id_t::OCXO1,
+      g_campaign_public_counterledger_ocxo1_offset);
+}
+
+static uint64_t campaign_public_counterledger_ocxo2_ns(void) {
+  return campaign_public_counterledger_ns(
+      time_clock_id_t::OCXO2,
+      g_campaign_public_counterledger_ocxo2_offset);
+}
+
+static void campaign_public_counterledger_offsets_reset_to_current(void) {
+  const uint64_t o1 = current_raw_counterledger_ns(time_clock_id_t::OCXO1);
+  const uint64_t o2 = current_raw_counterledger_ns(time_clock_id_t::OCXO2);
+  g_campaign_public_counterledger_ocxo1_offset = o1
+      ? campaign_public_offset_to_zero(o1)
+      : 0;
+  g_campaign_public_counterledger_ocxo2_offset = o2
+      ? campaign_public_offset_to_zero(o2)
+      : 0;
+}
+
+static void campaign_public_counterledger_offsets_reset_for_recover(void) {
+  const uint64_t o1 = current_raw_counterledger_ns(time_clock_id_t::OCXO1);
+  const uint64_t o2 = current_raw_counterledger_ns(time_clock_id_t::OCXO2);
+  g_campaign_public_counterledger_ocxo1_offset = o1
+      ? campaign_public_offset_for_recovered_value(o1, recover_ocxo1_ns)
+      : 0;
+  g_campaign_public_counterledger_ocxo2_offset = o2
+      ? campaign_public_offset_for_recovered_value(o2, recover_ocxo2_ns)
+      : 0;
+}
+
 static uint64_t campaign_public_ocxo1_measured_ns(void) {
   return campaign_public_from_offset(current_raw_ocxo1_measured_ns(),
                                      g_campaign_public_ocxo1_measured_offset);
@@ -1052,6 +1109,7 @@ static void campaign_public_offsets_reset_to_current(void) {
       campaign_public_offset_to_zero(current_raw_ocxo1_measured_ns());
   g_campaign_public_ocxo2_measured_offset =
       campaign_public_offset_to_zero(current_raw_ocxo2_measured_ns());
+  campaign_public_counterledger_offsets_reset_to_current();
 }
 
 static void campaign_public_offsets_reset_for_recover(void) {
@@ -1073,6 +1131,7 @@ static void campaign_public_offsets_reset_for_recover(void) {
   g_campaign_public_ocxo2_measured_offset =
       campaign_public_offset_for_recovered_value(current_raw_ocxo2_measured_ns(),
                                                  recover_ocxo2_ns);
+  campaign_public_counterledger_offsets_reset_for_recover();
 }
 
 static bool campaign_start_handoff_ready(void) {
@@ -4540,6 +4599,81 @@ static FLASHMEM void payload_add_vclock_forensics(Payload& p,
   p.add_object("vclock", lane);
 }
 
+static FLASHMEM void payload_add_counterledger_candidate_object(
+    Payload& lane,
+    const clocks_alpha_ocxo_counterledger_snapshot_t& c,
+    uint64_t candidate_public_ns,
+    uint64_t canonical_public_ns,
+    uint64_t public_gnss_ns) {
+  Payload obj;
+  obj.add("enabled", clocks_ocxo_counterledger_report_enabled());
+  obj.add("authority", clocks_ocxo_counterledger_mode_enabled());
+  obj.add("report_only", !clocks_ocxo_counterledger_mode_enabled());
+  obj.add("sample_source", "EPOCH_CAPTURE_COUNTER32");
+  obj.add("pps_capture_exact", false);
+  obj.add("valid", c.valid);
+  obj.add("initialized", c.initialized);
+  obj.add("interval_valid", c.interval_valid);
+  obj.add("clock_id", c.clock_id);
+  obj.add("pps_sequence", c.pps_sequence);
+  obj.add("sample_count", c.sample_count);
+  obj.add("zero_counter32", c.zero_counter32);
+  obj.add("last_counter32", c.last_counter32);
+  obj.add("ticks64", c.ticks64);
+  obj.add("ns", c.ns);
+  obj.add("interval_ticks", c.last_delta_ticks);
+  obj.add("interval_ns", c.interval_ns);
+  obj.add("fast_residual_ns", c.interval_valid ? c.fast_residual_ns : 0LL);
+  obj.add("candidate_public_ns", candidate_public_ns);
+  obj.add("candidate_minus_public_ns",
+          (candidate_public_ns && canonical_public_ns)
+              ? beta_signed_delta_u64(candidate_public_ns, canonical_public_ns)
+              : 0LL);
+  obj.add("candidate_minus_gnss_ns",
+          (candidate_public_ns && public_gnss_ns)
+              ? beta_signed_delta_u64(candidate_public_ns, public_gnss_ns)
+              : 0LL);
+  obj.add("capture_available", c.last_capture_available);
+  obj.add("capture_valid", c.last_capture_valid);
+  obj.add("capture_all_lanes_valid", c.last_capture_all_lanes_valid);
+  obj.add("capture_sequence_match", c.last_capture_sequence_match);
+  obj.add("capture_sequence", c.last_capture_sequence);
+  obj.add("capture_window_cycles", c.last_capture_window_cycles);
+  obj.add("update_count", c.update_count);
+  obj.add("capture_missing_count", c.capture_missing_count);
+  obj.add("capture_invalid_count", c.capture_invalid_count);
+  obj.add("sequence_mismatch_count", c.sequence_mismatch_count);
+  obj.add("all_lanes_invalid_count", c.all_lanes_invalid_count);
+  obj.add("interval_gap_count", c.interval_gap_count);
+
+  obj.add("block_window_seconds", c.block_window_seconds);
+  obj.add("block_valid", c.block_valid);
+  obj.add("block_start_pps_sequence", c.block_start_pps_sequence);
+  obj.add("block_end_pps_sequence", c.block_end_pps_sequence);
+  obj.add("block_interval_count", c.block_interval_count);
+  obj.add("block_ticks", c.block_ticks);
+  obj.add("block_fast_residual_sum_ns", c.block_fast_residual_sum_ns);
+  obj.add("block_mean_fast_residual_ns", c.block_mean_fast_residual_ns, 6);
+  obj.add("block_tau", c.block_tau, 12);
+  obj.add("block_ppb", c.block_ppb, 6);
+  obj.add("completed_block_count", c.completed_block_count);
+  obj.add("completed_block_valid", c.completed_block_valid);
+  obj.add("completed_block_start_pps_sequence",
+          c.completed_block_start_pps_sequence);
+  obj.add("completed_block_end_pps_sequence",
+          c.completed_block_end_pps_sequence);
+  obj.add("completed_block_interval_count", c.completed_block_interval_count);
+  obj.add("completed_block_ticks", c.completed_block_ticks);
+  obj.add("completed_block_fast_residual_sum_ns",
+          c.completed_block_fast_residual_sum_ns);
+  obj.add("completed_block_mean_fast_residual_ns",
+          c.completed_block_mean_fast_residual_ns, 6);
+  obj.add("completed_block_tau", c.completed_block_tau, 12);
+  obj.add("completed_block_ppb", c.completed_block_ppb, 6);
+  obj.add("block_gap_reset_count", c.block_gap_reset_count);
+  lane.add_object("counterledger", obj);
+}
+
 static void payload_add_ocxo_fragment(Payload& p,
                                       const char* key,
                                       uint64_t public_ns,
@@ -4550,6 +4684,9 @@ static void payload_add_ocxo_fragment(Payload& p,
                                       uint64_t pps_gnss_interval_ns,
                                       uint64_t pps_clock_interval_ns,
                                       int64_t pps_fast_residual_ns,
+                                      const clocks_alpha_ocxo_counterledger_snapshot_t& counterledger,
+                                      uint64_t counterledger_public_ns,
+                                      uint64_t public_gnss_ns,
                                       const clock_science_row_t& science_row) {
   Payload lane;
 
@@ -4579,6 +4716,14 @@ static void payload_add_ocxo_fragment(Payload& p,
                                        pps_gnss_interval_ns,
                                        pps_clock_interval_ns,
                                        pps_fast_residual_ns);
+
+  if (clocks_ocxo_counterledger_report_enabled()) {
+    payload_add_counterledger_candidate_object(lane,
+                                               counterledger,
+                                               counterledger_public_ns,
+                                               public_ns,
+                                               public_gnss_ns);
+  }
 
   payload_add_ocxo_science_object(lane,
                                   science_row,
@@ -5844,6 +5989,10 @@ void clocks_beta_pps(void) {
 
   const uint64_t public_ocxo1_alpha_ns = campaign_public_ocxo1_ns();
   const uint64_t public_ocxo2_alpha_ns = campaign_public_ocxo2_ns();
+  const uint64_t public_ocxo1_counterledger_ns =
+      campaign_public_counterledger_ocxo1_ns();
+  const uint64_t public_ocxo2_counterledger_ns =
+      campaign_public_counterledger_ocxo2_ns();
   const uint64_t public_ocxo1_ns = clocks_ocxo_counterledger_mode_enabled()
       ? public_ocxo1_alpha_ns
       : floorline_render_public_clock_ns(
@@ -6123,6 +6272,9 @@ void clocks_beta_pps(void) {
                               pps_residuals.gnss_interval_ns,
                               pps_residuals.ocxo1_interval_ns,
                               pps_residuals.ocxo1_fast_residual_ns,
+                              ocxo1_counterledger,
+                              public_ocxo1_counterledger_ns,
+                              public_gnss_ns,
                               ocxo1_floorline_science);
 
     timebase_build_stage(TIMEBASE_BUILD_STAGE_OCXO2);
@@ -6136,6 +6288,9 @@ void clocks_beta_pps(void) {
                               pps_residuals.gnss_interval_ns,
                               pps_residuals.ocxo2_interval_ns,
                               pps_residuals.ocxo2_fast_residual_ns,
+                              ocxo2_counterledger,
+                              public_ocxo2_counterledger_ns,
+                              public_gnss_ns,
                               ocxo2_floorline_science);
 
     timebase_build_stage(TIMEBASE_BUILD_STAGE_STATS);
