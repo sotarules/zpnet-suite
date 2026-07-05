@@ -450,11 +450,12 @@ servo_mode_t servo_mode_parse(const char* s) {
 // is a pure stop/clear operation.  It cancels timers and pending work without
 // writing a final static-rounded code that could perturb the EFC voltage during
 // a science campaign.
-static constexpr bool     OCXO_DAC_DITHER_DEFAULT_ENABLED = false;
-static constexpr bool     OCXO_DAC_DITHER_COMPILED_ENABLED = false;
-static constexpr bool     OCXO_DAC_SERVO_REQUESTS_ENABLED = false;
+static constexpr bool     OCXO_DAC_DITHER_DEFAULT_ENABLED = true;
+static constexpr bool     OCXO_DAC_DITHER_COMPILED_ENABLED = true;
+static constexpr bool     OCXO_DAC_SERVO_REQUESTS_ENABLED = true;
 static constexpr bool     OCXO_DAC_DITHER_DISABLE_STATIC_WRITE_ENABLED = false;
 static constexpr bool     OCXO_DAC_DITHER_ALLOW_HARDWARE_WRITES = true;
+
 static constexpr uint64_t OCXO_DAC_DITHER_FRAME_NS = 1000000000ULL;
 static constexpr uint64_t OCXO_DAC_DITHER_SLOT_NS = 1000000ULL;
 static constexpr uint16_t OCXO_DAC_DITHER_SLOTS_PER_FRAME = 1000U;
