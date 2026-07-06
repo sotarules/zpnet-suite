@@ -1041,6 +1041,30 @@ struct clocks_alpha_recover_reattach_snapshot_t {
 
   uint32_t static_prediction_completed_interval_count = 0;
   bool     static_prediction_valid = false;
+
+  // CounterLedger/PhaseLedger recovery reattachment proof.  In
+  // PPS_COUNTERLEDGER mode, recover publication should not depend on legacy
+  // PPS projection readiness; the public OCXO rail is the PPS-captured
+  // counter ledger plus PhaseLedger suffix.
+  bool     counterledger_mode = false;
+  bool     counterledger_snapshot_ok = false;
+  bool     counterledger_valid = false;
+  bool     counterledger_initialized = false;
+  bool     counterledger_capture_ready = false;
+  bool     counterledger_interval_valid = false;
+  bool     counterledger_phase_valid = false;
+  bool     counterledger_phase_lag_ok = false;
+  bool     counterledger_refined_valid = false;
+  bool     counterledger_refined_interval_valid = false;
+  uint32_t counterledger_sample_count = 0;
+  uint32_t counterledger_pps_sequence = 0;
+  uint32_t counterledger_phase_pps_sequence = 0;
+  uint32_t counterledger_phase_lag_pps = 0;
+  uint32_t counterledger_last_delta_ticks = 0;
+  uint64_t counterledger_ns = 0;
+  uint64_t counterledger_interval_ns = 0;
+  uint64_t counterledger_refined_ns = 0;
+  uint64_t counterledger_refined_interval_ns = 0;
 };
 
 bool clocks_alpha_ocxo_recover_reattach_snapshot(

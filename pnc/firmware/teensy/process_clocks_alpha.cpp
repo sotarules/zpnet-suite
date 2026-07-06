@@ -340,7 +340,7 @@ static void alpha_pps_vclock_edge_forensics_publish(
   g_pps_vclock_edge_forensics_seq++;
 }
 
-bool clocks_alpha_pps_vclock_edge_forensics(
+FLASHMEM bool clocks_alpha_pps_vclock_edge_forensics(
     clocks_pps_vclock_edge_forensics_t* out) {
   if (!out) return false;
 
@@ -1481,7 +1481,7 @@ static inline uint64_t nominal_ns_from_counter32_epoch(uint32_t counter32,
 static constexpr uint32_t ALPHA_INTEGRITY_EXACT_NS_GATE = 0U;
 static constexpr uint32_t ALPHA_INTEGRITY_OCXO_INTERVAL_GATE_NS = 5U;
 
-static clocks_alpha_integrity_snapshot_t g_alpha_integrity = {};
+static clocks_alpha_integrity_snapshot_t g_alpha_integrity DMAMEM = {};
 
 static int64_t alpha_integrity_signed_delta_ns(uint64_t observed,
                                                uint64_t expected) {
@@ -1620,7 +1620,7 @@ static void alpha_integrity_note_ocxo_projected_gnss_second(
   s->previous_interval_ns = current_interval;
 }
 
-bool clocks_alpha_integrity_snapshot(clocks_alpha_integrity_snapshot_t* out) {
+FLASHMEM bool clocks_alpha_integrity_snapshot(clocks_alpha_integrity_snapshot_t* out) {
   if (!out) return false;
   g_alpha_integrity.snapshot_count++;
   g_alpha_integrity.valid =
@@ -1881,9 +1881,9 @@ struct alpha_lane_forensics_store_t {
   uint32_t regression_fit_error_abs_gt4_count = 0;
 };
 
-static alpha_lane_forensics_store_t g_vclock_forensics = {};
-static alpha_lane_forensics_store_t g_ocxo1_forensics = {};
-static alpha_lane_forensics_store_t g_ocxo2_forensics = {};
+static alpha_lane_forensics_store_t g_vclock_forensics DMAMEM = {};
+static alpha_lane_forensics_store_t g_ocxo1_forensics DMAMEM = {};
+static alpha_lane_forensics_store_t g_ocxo2_forensics DMAMEM = {};
 
 
 // Report-only event-flow forensics.  These counters answer one narrow question:
@@ -1980,9 +1980,9 @@ struct alpha_event_flow_store_t {
   uint32_t last_snapshot_seq = 0;
 };
 
-static alpha_event_flow_store_t g_vclock_event_flow = {};
-static alpha_event_flow_store_t g_ocxo1_event_flow  = {};
-static alpha_event_flow_store_t g_ocxo2_event_flow  = {};
+static alpha_event_flow_store_t g_vclock_event_flow DMAMEM = {};
+static alpha_event_flow_store_t g_ocxo1_event_flow DMAMEM = {};
+static alpha_event_flow_store_t g_ocxo2_event_flow DMAMEM = {};
 
 static alpha_event_flow_store_t* alpha_event_flow_store(time_clock_id_t clock) {
   switch (clock) {
@@ -2189,7 +2189,7 @@ static void alpha_event_flow_note_snapshot_missing_store(time_clock_id_t clock) 
   f->last_failure_stage = ALPHA_FLOW_STAGE_FORENSICS_SNAPSHOT;
 }
 
-bool clocks_alpha_event_flow_snapshot(time_clock_id_t clock,
+FLASHMEM bool clocks_alpha_event_flow_snapshot(time_clock_id_t clock,
                                       clocks_alpha_event_flow_snapshot_t* out) {
   if (!out) return false;
   alpha_event_flow_store_t* f = alpha_event_flow_store(clock);
@@ -3134,10 +3134,10 @@ struct alpha_ocxo_pps_projection_guard_t {
 
 static alpha_ocxo_edge_history_t g_ocxo1_edge_history = {};
 static alpha_ocxo_edge_history_t g_ocxo2_edge_history = {};
-static alpha_ocxo_pps_projection_store_t g_ocxo1_pps_projection = {};
-static alpha_ocxo_pps_projection_store_t g_ocxo2_pps_projection = {};
-static alpha_ocxo_pps_projection_guard_t g_ocxo1_pps_projection_guard = {};
-static alpha_ocxo_pps_projection_guard_t g_ocxo2_pps_projection_guard = {};
+static alpha_ocxo_pps_projection_store_t g_ocxo1_pps_projection DMAMEM = {};
+static alpha_ocxo_pps_projection_store_t g_ocxo2_pps_projection DMAMEM = {};
+static alpha_ocxo_pps_projection_guard_t g_ocxo1_pps_projection_guard DMAMEM = {};
+static alpha_ocxo_pps_projection_guard_t g_ocxo2_pps_projection_guard DMAMEM = {};
 
 static alpha_ocxo_edge_history_t* alpha_ocxo_edge_history(time_clock_id_t clock) {
   switch (clock) {
@@ -3325,13 +3325,13 @@ static void alpha_projection_guard_note_sanity_reject(time_clock_id_t clock,
   g->last_projected_minus_measured_ns = projected_minus_measured_ns;
 }
 
-uint32_t clocks_alpha_ocxo_projection_guard_legacy_wrap_count(time_clock_id_t clock) {
+FLASHMEM uint32_t clocks_alpha_ocxo_projection_guard_legacy_wrap_count(time_clock_id_t clock) {
   const alpha_ocxo_pps_projection_guard_t* g = alpha_ocxo_pps_projection_guard(clock);
   return g ? (g->measured_projection_legacy_unsigned_wrap_count +
               g->pps_projection_legacy_unsigned_wrap_count) : 0U;
 }
 
-uint32_t clocks_alpha_ocxo_projection_guard_sanity_reject_count(time_clock_id_t clock) {
+FLASHMEM uint32_t clocks_alpha_ocxo_projection_guard_sanity_reject_count(time_clock_id_t clock) {
   const alpha_ocxo_pps_projection_guard_t* g = alpha_ocxo_pps_projection_guard(clock);
   return g ? g->pps_projection_sanity_reject_count : 0U;
 }
@@ -3355,6 +3355,20 @@ static void alpha_ocxo_pps_projection_reset_all(void) {
       g_ocxo1_pps_projection, (uint32_t)((uint8_t)time_clock_id_t::OCXO1));
   alpha_ocxo_pps_projection_reset_store(
       g_ocxo2_pps_projection, (uint32_t)((uint8_t)time_clock_id_t::OCXO2));
+}
+
+static FLASHMEM void clocks_alpha_cold_diagnostics_init(void) {
+  g_alpha_integrity = clocks_alpha_integrity_snapshot_t{};
+  g_vclock_forensics = alpha_lane_forensics_store_t{};
+  g_ocxo1_forensics = alpha_lane_forensics_store_t{};
+  g_ocxo2_forensics = alpha_lane_forensics_store_t{};
+  g_vclock_event_flow = alpha_event_flow_store_t{};
+  g_ocxo1_event_flow = alpha_event_flow_store_t{};
+  g_ocxo2_event_flow = alpha_event_flow_store_t{};
+  g_ocxo1_pps_projection = alpha_ocxo_pps_projection_store_t{};
+  g_ocxo2_pps_projection = alpha_ocxo_pps_projection_store_t{};
+  g_ocxo1_pps_projection_guard = alpha_ocxo_pps_projection_guard_t{};
+  g_ocxo2_pps_projection_guard = alpha_ocxo_pps_projection_guard_t{};
 }
 
 static void alpha_ocxo_edge_history_install_zero(time_clock_id_t clock,
@@ -3810,7 +3824,7 @@ static void alpha_ocxo_pps_projection_compute(time_clock_id_t clock,
   }
 }
 
-bool clocks_alpha_ocxo_pps_projection_snapshot(
+FLASHMEM bool clocks_alpha_ocxo_pps_projection_snapshot(
     time_clock_id_t clock,
     clocks_alpha_ocxo_pps_projection_snapshot_t* out) {
   if (!out) return false;
@@ -4066,31 +4080,28 @@ bool clocks_alpha_ocxo_counterledger_snapshot(
   return out->valid;
 }
 
+static bool alpha_counterledger_lane_ready_light(
+    const alpha_pps_counterledger_lane_t& s) {
+  if (!s.initialized || s.sample_count == 0U) return false;
+  if (!clocks_ocxo_counterledger_mode()) return true;
+
+  const bool phase_ready =
+      s.phase_valid &&
+      s.phase_pps_sequence != 0U &&
+      s.phase_pps_sequence <= s.pps_sequence;
+  const uint32_t phase_lag = phase_ready
+      ? (uint32_t)(s.pps_sequence - s.phase_pps_sequence)
+      : 0U;
+
+  return s.interval_valid && s.last_interval_ns != 0ULL &&
+         phase_ready && phase_lag <= 1U &&
+         s.refined_valid &&
+         s.refined_interval_valid && s.refined_interval_ns != 0ULL;
+}
+
 bool clocks_alpha_ocxo_counterledger_ready(void) {
-  clocks_alpha_ocxo_counterledger_snapshot_t ocxo1{};
-  clocks_alpha_ocxo_counterledger_snapshot_t ocxo2{};
-  const bool snapshots_valid =
-      clocks_alpha_ocxo_counterledger_snapshot(time_clock_id_t::OCXO1, &ocxo1) &&
-      clocks_alpha_ocxo_counterledger_snapshot(time_clock_id_t::OCXO2, &ocxo2) &&
-      ocxo1.valid && ocxo2.valid;
-  if (!snapshots_valid) return false;
-  return !clocks_ocxo_counterledger_mode() ||
-         (ocxo1.interval_valid && ocxo1.interval_ns != 0ULL &&
-          ocxo1.phase_valid &&
-          ocxo1.phase_pps_sequence != 0U &&
-          ocxo1.phase_pps_sequence <= ocxo1.pps_sequence &&
-          ocxo1.phase_lag_pps <= 1U &&
-          ocxo1.refined_valid &&
-          ocxo1.refined_interval_valid &&
-          ocxo1.refined_interval_ns != 0ULL &&
-          ocxo2.interval_valid && ocxo2.interval_ns != 0ULL &&
-          ocxo2.phase_valid &&
-          ocxo2.phase_pps_sequence != 0U &&
-          ocxo2.phase_pps_sequence <= ocxo2.pps_sequence &&
-          ocxo2.phase_lag_pps <= 1U &&
-          ocxo2.refined_valid &&
-          ocxo2.refined_interval_valid &&
-          ocxo2.refined_interval_ns != 0ULL);
+  return alpha_counterledger_lane_ready_light(g_ocxo1_pps_counterledger) &&
+         alpha_counterledger_lane_ready_light(g_ocxo2_pps_counterledger);
 }
 
 static bool alpha_zero_offset_valid(time_clock_id_t clock) {
@@ -5976,105 +5987,170 @@ bool clocks_alpha_ocxo_recover_reattach_snapshot(
     return false;
   }
 
-  clocks_alpha_recover_reattach_snapshot_t local{};
-  local.clock_id = (uint32_t)((uint8_t)clock);
-  local.reprime_count = g_alpha_recover_reprime_count;
+  clocks_alpha_recover_reattach_snapshot_t& r = *out;
+  r.clock_id = (uint32_t)((uint8_t)clock);
+  r.reprime_count = g_alpha_recover_reprime_count;
 
   const alpha_lane_forensics_store_t* f = alpha_forensics_store(clock);
-  local.forensics_valid = f && f->valid;
-  local.forensics_update_count = f ? f->update_count : 0U;
-  local.forensics_last_event_dwt = f ? f->last_event_dwt : 0U;
-  local.forensics_last_event_counter32 = f ? f->last_event_counter32 : 0U;
-  local.forensics_dwt_used_at_event = f ? f->dwt_used_at_event : 0U;
-  local.forensics_floorline_dwt_at_event =
+  r.forensics_valid = f && f->valid;
+  r.forensics_update_count = f ? f->update_count : 0U;
+  r.forensics_last_event_dwt = f ? f->last_event_dwt : 0U;
+  r.forensics_last_event_counter32 = f ? f->last_event_counter32 : 0U;
+  r.forensics_dwt_used_at_event = f ? f->dwt_used_at_event : 0U;
+  r.forensics_floorline_dwt_at_event =
       f ? f->regression_inferred_dwt_at_event : 0U;
-  local.forensics_floorline_sample_count =
+  r.forensics_floorline_sample_count =
       f ? f->regression_sample_count : 0U;
-  local.forensics_ready = alpha_recover_floorline_forensics_ready(f);
+  r.forensics_ready = alpha_recover_floorline_forensics_ready(f);
 
   const alpha_ocxo_edge_history_t* h = alpha_ocxo_edge_history(clock);
-  local.edge_history_current_valid = h && h->current_valid;
-  local.edge_history_previous_valid = h && h->previous_valid;
-  local.edge_history_update_count = h ? h->update_count : 0U;
-  local.edge_history_ready = h && h->current_valid && h->update_count != 0U;
+  r.edge_history_current_valid = h && h->current_valid;
+  r.edge_history_previous_valid = h && h->previous_valid;
+  r.edge_history_update_count = h ? h->update_count : 0U;
+  r.edge_history_ready = h && h->current_valid && h->update_count != 0U;
 
-  clocks_alpha_ocxo_pps_projection_snapshot_t proj{};
-  const bool projection_valid =
-      clocks_alpha_ocxo_pps_projection_snapshot(clock, &proj);
-  local.projection_valid = projection_valid;
-  local.projection_available = proj.update_count != 0U;
-  local.projection_update_count = proj.update_count;
-  local.projection_compute_count = proj.compute_count;
-  local.projection_source = proj.source;
-  local.projection_pps_sequence = proj.pps_sequence;
-  local.projection_pps_vclock_ns = proj.pps_vclock_ns;
-  local.projection_projected_ocxo_ns_at_pps =
-      proj.projected_ocxo_ns_at_pps;
-  local.projection_interval_dwt_cycles = proj.interval_dwt_cycles;
+  // Stack-light projection read: copy only the scalar fields RECOVER needs.
+  // Do not instantiate the full projection snapshot on this stack.
+  const alpha_ocxo_pps_projection_store_t* ps =
+      alpha_ocxo_pps_projection_store(clock);
+  if (ps) {
+    for (int attempt = 0; attempt < 4; attempt++) {
+      const uint32_t seq1 = ps->seq;
+      clocks_alpha_dmb();
 
-  local.expected_pps_vclock_ns = g_gnss_ns_at_pps_vclock;
-  local.pps_vclock_match =
-      projection_valid &&
-      local.expected_pps_vclock_ns != 0ULL &&
-      proj.pps_vclock_ns == local.expected_pps_vclock_ns;
-  local.projection_ready =
-      projection_valid &&
-      local.pps_vclock_match &&
-      proj.projected_ocxo_ns_at_pps != 0ULL &&
-      proj.interval_dwt_cycles != 0U;
+      r.projection_valid = ps->v.valid;
+      r.projection_available = ps->v.update_count != 0U;
+      r.projection_update_count = ps->v.update_count;
+      r.projection_compute_count = ps->v.compute_count;
+      r.projection_source = ps->v.source;
+      r.projection_pps_sequence = ps->v.pps_sequence;
+      r.projection_pps_vclock_ns = ps->v.pps_vclock_ns;
+      r.projection_projected_ocxo_ns_at_pps =
+          ps->v.projected_ocxo_ns_at_pps;
+      r.projection_interval_dwt_cycles = ps->v.interval_dwt_cycles;
 
-  const alpha_static_prediction_store_t* sp = alpha_static_prediction_store(clock);
-  local.static_prediction_completed_interval_count =
+      clocks_alpha_dmb();
+      const uint32_t seq2 = ps->seq;
+      if (seq1 == seq2 && (seq1 & 1U) == 0U) {
+        break;
+      }
+
+      if (attempt == 3) {
+        r.projection_valid = false;
+      }
+    }
+  }
+
+  r.expected_pps_vclock_ns = g_gnss_ns_at_pps_vclock;
+  r.pps_vclock_match =
+      r.projection_valid &&
+      r.expected_pps_vclock_ns != 0ULL &&
+      r.projection_pps_vclock_ns == r.expected_pps_vclock_ns;
+  r.projection_ready =
+      r.projection_valid &&
+      r.pps_vclock_match &&
+      r.projection_projected_ocxo_ns_at_pps != 0ULL &&
+      r.projection_interval_dwt_cycles != 0U;
+
+  const alpha_static_prediction_store_t* sp =
+      alpha_static_prediction_store(clock);
+  r.static_prediction_completed_interval_count =
       sp ? sp->completed_interval_count : 0U;
-  local.static_prediction_valid = sp && sp->valid;
+  r.static_prediction_valid = sp && sp->valid;
 
   if (clock == time_clock_id_t::OCXO1) {
-    local.current_public_ns = g_ocxo1_measured_gnss_ns_at_pps_vclock;
-    local.current_physical_ns = g_ocxo1_physical_measured_gnss_ns_at_pps_vclock;
+    r.current_public_ns = g_ocxo1_measured_gnss_ns_at_pps_vclock;
+    r.current_physical_ns = g_ocxo1_physical_measured_gnss_ns_at_pps_vclock;
   } else {
-    local.current_public_ns = g_ocxo2_measured_gnss_ns_at_pps_vclock;
-    local.current_physical_ns = g_ocxo2_physical_measured_gnss_ns_at_pps_vclock;
+    r.current_public_ns = g_ocxo2_measured_gnss_ns_at_pps_vclock;
+    r.current_physical_ns = g_ocxo2_physical_measured_gnss_ns_at_pps_vclock;
   }
-  local.public_ns_nonzero = local.current_public_ns != 0ULL;
-  local.physical_ns_nonzero = local.current_physical_ns != 0ULL;
+  r.public_ns_nonzero = r.current_public_ns != 0ULL;
+  r.physical_ns_nonzero = r.current_physical_ns != 0ULL;
 
   if (clocks_ocxo_counterledger_mode()) {
-    // CounterLedger recovery reattachment is proved by the PPS-sampled
-    // counter ledger plus its PhaseLedger suffix.  It does not depend on OCXO
-    // edge projection or FloorLine evidence, which remain diagnostics in this
-    // mode.
-    clocks_alpha_ocxo_counterledger_snapshot_t ledger{};
+    // Stack-light CounterLedger proof: read the backing lane directly instead
+    // of constructing the full public snapshot in the RECOVER gate path.
+    const alpha_pps_counterledger_lane_t* ledger =
+        alpha_counterledger_lane_mut(clock);
+    const bool ledger_snapshot_ok = ledger != nullptr;
+    const bool ledger_valid =
+        ledger_snapshot_ok && ledger->initialized && ledger->sample_count != 0U;
+    const bool capture_ready =
+        ledger_valid &&
+        ledger->last_capture_available &&
+        ledger->last_capture_valid &&
+        ledger->last_capture_all_lanes_valid &&
+        ledger->last_capture_sequence_match &&
+        ledger->last_capture_sequence == ledger->pps_sequence;
+    const bool phase_ready =
+        ledger_valid &&
+        ledger->phase_valid &&
+        ledger->phase_pps_sequence != 0U &&
+        ledger->phase_pps_sequence <= ledger->pps_sequence;
+    const uint32_t phase_lag = phase_ready
+        ? (uint32_t)(ledger->pps_sequence - ledger->phase_pps_sequence)
+        : 0U;
+    const bool phase_lag_ok = phase_ready && phase_lag <= 1U;
+    const bool interval_valid =
+        ledger_valid && ledger->interval_valid && ledger->last_interval_ns != 0ULL;
+    const bool refined_valid =
+        ledger_valid && ledger->refined_valid && ledger->refined_ns != 0ULL;
+    const bool refined_interval_valid =
+        ledger_valid && ledger->refined_interval_valid &&
+        ledger->refined_interval_ns != 0ULL;
     const bool ledger_ready =
-        clocks_alpha_ocxo_counterledger_snapshot(clock, &ledger) &&
-        ledger.valid &&
-        ledger.interval_valid && ledger.interval_ns != 0ULL &&
-        ledger.phase_valid &&
-        ledger.phase_pps_sequence != 0U &&
-        ledger.phase_pps_sequence <= ledger.pps_sequence &&
-        ledger.phase_lag_pps <= 1U &&
-        ledger.refined_valid &&
-        ledger.refined_interval_valid &&
-        ledger.refined_interval_ns != 0ULL;
-    local.projection_ready = ledger_ready;
-    local.ready = ledger_ready;
+        ledger_valid && capture_ready && interval_valid && phase_ready &&
+        phase_lag_ok && refined_valid && refined_interval_valid;
+
+    r.counterledger_mode = true;
+    r.counterledger_snapshot_ok = ledger_snapshot_ok;
+    r.counterledger_valid = ledger_valid;
+    r.counterledger_initialized = ledger_snapshot_ok && ledger->initialized;
+    r.counterledger_capture_ready = capture_ready;
+    r.counterledger_interval_valid = interval_valid;
+    r.counterledger_phase_valid = phase_ready;
+    r.counterledger_phase_lag_ok = phase_lag_ok;
+    r.counterledger_refined_valid = refined_valid;
+    r.counterledger_refined_interval_valid = refined_interval_valid;
+    r.counterledger_sample_count = ledger ? ledger->sample_count : 0U;
+    r.counterledger_pps_sequence = ledger ? ledger->pps_sequence : 0U;
+    r.counterledger_phase_pps_sequence = ledger ? ledger->phase_pps_sequence : 0U;
+    r.counterledger_phase_lag_pps = phase_lag;
+    r.counterledger_last_delta_ticks = ledger ? ledger->last_delta_ticks : 0U;
+    r.counterledger_ns = ledger ? ledger->ns : 0ULL;
+    r.counterledger_interval_ns = ledger ? ledger->last_interval_ns : 0ULL;
+    r.counterledger_refined_ns = ledger ? ledger->refined_ns : 0ULL;
+    r.counterledger_refined_interval_ns =
+        ledger ? ledger->refined_interval_ns : 0ULL;
+
+    r.projection_ready = ledger_ready;
+    r.ready = ledger_ready;
   } else {
-    local.ready =
-        local.forensics_ready &&
-        local.edge_history_ready &&
-        local.projection_ready &&
-        local.public_ns_nonzero;
+    r.ready =
+        r.forensics_ready &&
+        r.edge_history_ready &&
+        r.projection_ready &&
+        r.public_ns_nonzero;
   }
 
-  *out = local;
   return true;
 }
 
+static clocks_alpha_recover_reattach_snapshot_t
+    g_alpha_recover_ready_probe_ocxo1 = {};
+static clocks_alpha_recover_reattach_snapshot_t
+    g_alpha_recover_ready_probe_ocxo2 = {};
+
 bool clocks_alpha_recover_ocxo_reattach_ready(void) {
-  clocks_alpha_recover_reattach_snapshot_t ocxo1{};
-  clocks_alpha_recover_reattach_snapshot_t ocxo2{};
-  return clocks_alpha_ocxo_recover_reattach_snapshot(time_clock_id_t::OCXO1, &ocxo1) &&
-         clocks_alpha_ocxo_recover_reattach_snapshot(time_clock_id_t::OCXO2, &ocxo2) &&
-         ocxo1.ready && ocxo2.ready;
+  return clocks_alpha_ocxo_recover_reattach_snapshot(
+             time_clock_id_t::OCXO1,
+             &g_alpha_recover_ready_probe_ocxo1) &&
+         clocks_alpha_ocxo_recover_reattach_snapshot(
+             time_clock_id_t::OCXO2,
+             &g_alpha_recover_ready_probe_ocxo2) &&
+         g_alpha_recover_ready_probe_ocxo1.ready &&
+         g_alpha_recover_ready_probe_ocxo2.ready;
 }
 
 static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
@@ -7204,6 +7280,7 @@ static void pps_selector_callback(const pps_edge_snapshot_t& snap) {
 // ============================================================================
 
 void process_clocks_init_hardware(void) {
+  clocks_alpha_cold_diagnostics_init();
   dwt_enable();
   clocks_features_mark_alpha_initializing();
 }
