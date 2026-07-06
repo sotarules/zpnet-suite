@@ -201,6 +201,34 @@ TIMEBASE_FINAL_COURT_DELTA_RAW_INTERVAL_GATE_CYCLES = 500
 # zero OCXO ns plus zero endpoints/intervals is lane absence, not science.
 TIMEBASE_FINAL_COURT_OCXO_ZERO_MATURE_PUBLIC_COUNT = 2
 
+# GNSS confession PPB candidates
+#
+# The GF-8802 reports pps_timing_error_ns in GET_GNSS_INFO.  The absolute
+# level is a placement offset, not a frequency error.  The per-row change is
+# the receiver's own confession that the PPS yardstick moved by that many ns
+# during this one-second interval.  We keep the raw Teensy-authored PPB as the
+# sacred default, but compute a PI-owned reference-normalized candidate beside
+# it:
+#
+#   corrected_residual(t) = raw_residual(t)
+#                           - [g_err(t) - g_err(t-1)]
+#
+# Large steps are treated as receiver solution redefinitions, not lawful
+# steering corrections.  Do not correct across gaps or segment boundaries.
+GNSS_CONFESSION_SEGMENT_STEP_GATE_NS = 50.0
+
+# Canonical publication switch for the new PI-owned PPB object only.  The
+# Teensy fragment and its stats.<lane>.ppb field are never rewritten here.
+# Legal values: "RAW", "GNSS_CONFESSION".
+GNSS_CONFESSION_PPB_PUBLISHED_SOURCE = "RAW"
+
+
+def _gnss_confession_published_source() -> str:
+    source = str(GNSS_CONFESSION_PPB_PUBLISHED_SOURCE or "RAW").upper()
+    if source not in {"RAW", "GNSS_CONFESSION"}:
+        return "RAW"
+    return source
+
 PREFLIGHT_POLL_INTERVAL_S = 30
 PREFLIGHT_LOG_PREFIX = "🛡️ [preflight]"
 STARTUP_TEENSY_QUIET_DELAY_S = 20.0
@@ -379,6 +407,21 @@ _diag: Dict[str, Any] = {
     "gnss_info_hits": 0,
     "gnss_info_misses": 0,
 
+    # GNSS confession PPB candidates.  This is PI-owned reference-normalization
+    # telemetry: raw Teensy fields remain untouched, but TIMEBASE carries a
+    # parallel candidate showing what the OCXO residual/PPB would be if the
+    # GF-8802's own PPS placement confession is subtracted.
+    "gnss_confession_checks": 0,
+    "gnss_confession_rows_corrected": 0,
+    "gnss_confession_rows_missing": 0,
+    "gnss_confession_segment_steps": 0,
+    "gnss_confession_gaps": 0,
+    "gnss_confession_total_abs_correction_ns": 0.0,
+    "gnss_confession_first_error_ns": None,
+    "gnss_confession_last_error_ns": None,
+    "gnss_confession_published_source": _gnss_confession_published_source(),
+    "last_gnss_confession": {},
+
     # GNSS stream health (Pi-side canary only)
     "gnss_residual_nonzero": 0,
     "last_gnss_residual_anomaly": {},
@@ -500,6 +543,198 @@ _gnss_raw_welford_mean: float = 0.0
 _gnss_raw_welford_m2: float = 0.0
 _gnss_raw_welford_min: float = 1e30
 _gnss_raw_welford_max: float = -1e30
+
+
+# PI-owned GNSS-confession-corrected PPB candidates.  These are running means
+# of one-second fast residuals, mirroring zpnet/tests/raw_ppb.py.  They do not
+# rewrite Teensy-authored fragment.stats or fragment.<lane>.science.
+_gnss_confession_prev_pps: Optional[int] = None
+_gnss_confession_prev_error_ns: Optional[float] = None
+_gnss_confession_first_error_ns: Optional[float] = None
+_gnss_confession_raw_total: Dict[str, float] = {"ocxo1": 0.0, "ocxo2": 0.0}
+_gnss_confession_corrected_total: Dict[str, float] = {"ocxo1": 0.0, "ocxo2": 0.0}
+_gnss_confession_n: Dict[str, int] = {"ocxo1": 0, "ocxo2": 0}
+
+
+def _gnss_confession_reset() -> None:
+    """Reset PI-owned GNSS confession PPB candidate state."""
+    global _gnss_confession_prev_pps, _gnss_confession_prev_error_ns
+    global _gnss_confession_first_error_ns
+
+    _gnss_confession_prev_pps = None
+    _gnss_confession_prev_error_ns = None
+    _gnss_confession_first_error_ns = None
+    for lane in ("ocxo1", "ocxo2"):
+        _gnss_confession_raw_total[lane] = 0.0
+        _gnss_confession_corrected_total[lane] = 0.0
+        _gnss_confession_n[lane] = 0
+
+
+def _gnss_confession_error_ns(gnss_info: Optional[Dict[str, Any]]) -> Optional[float]:
+    """Return GF-8802 pps_timing_error_ns as a finite float, if present."""
+    if not isinstance(gnss_info, dict):
+        return None
+
+    value = gnss_info.get("pps_timing_error_ns")
+    if value is None:
+        discipline = gnss_info.get("discipline")
+        if isinstance(discipline, dict):
+            value = discipline.get("pps_timing_error_ns")
+    if value is None:
+        return None
+
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if math.isfinite(out) else None
+
+
+def _ocxo_fast_residual_for_ppb_candidate(frag: Dict[str, Any], lane: str) -> Optional[float]:
+    """Extract the Teensy-authored raw one-second OCXO fast residual."""
+    science = _path_get(frag, f"{lane}.science")
+    if not isinstance(science, dict):
+        return None
+
+    # Prefer the public/canonical fast residual surface, then fall back through
+    # the explicitly raw Delta surface and older integer renderings.  This keeps
+    # the candidate framework aligned with raw_ppb.py while avoiding any
+    # recomputation in the CLOCKS traffic-cop layer.
+    for key in (
+        "fast_residual_ns_exact",
+        "fast_residual_ns",
+        "delta_raw_fast_residual_ns_exact",
+        "delta_raw_fast_residual_ns",
+    ):
+        value = science.get(key)
+        if value is None:
+            continue
+        try:
+            out = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(out):
+            return out
+    return None
+
+
+def _gnss_confession_update(
+    *,
+    pps_vclock_count: int,
+    frag: Dict[str, Any],
+    gnss_info: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Update and return PI-owned raw/corrected OCXO PPB candidates."""
+    global _gnss_confession_prev_pps, _gnss_confession_prev_error_ns
+    global _gnss_confession_first_error_ns
+
+    _diag["gnss_confession_checks"] += 1
+
+    public_count = int(pps_vclock_count)
+    g_err = _gnss_confession_error_ns(gnss_info)
+    gap = (
+        _gnss_confession_prev_pps is not None
+        and public_count != int(_gnss_confession_prev_pps) + 1
+    )
+
+    d_g: Optional[float] = None
+    segment_step = False
+    correction = 0.0
+    reason = "ok"
+
+    if g_err is None:
+        _diag["gnss_confession_rows_missing"] += 1
+        reason = "g_err_missing"
+        # Missing confession breaks continuity; do not delta across it.
+        _gnss_confession_prev_error_ns = None
+    else:
+        if _gnss_confession_first_error_ns is None:
+            _gnss_confession_first_error_ns = g_err
+            _diag["gnss_confession_first_error_ns"] = g_err
+        _diag["gnss_confession_last_error_ns"] = g_err
+
+        if gap:
+            _diag["gnss_confession_gaps"] += 1
+            reason = "pps_gap"
+            _gnss_confession_prev_error_ns = None
+
+        if _gnss_confession_prev_error_ns is not None:
+            d_g = g_err - _gnss_confession_prev_error_ns
+            if abs(d_g) >= GNSS_CONFESSION_SEGMENT_STEP_GATE_NS:
+                segment_step = True
+                d_g = None
+                reason = "segment_step"
+                _diag["gnss_confession_segment_steps"] += 1
+            elif d_g != 0.0:
+                correction = d_g
+                reason = "corrected"
+                _diag["gnss_confession_rows_corrected"] += 1
+                _diag["gnss_confession_total_abs_correction_ns"] += abs(d_g)
+
+    candidates: Dict[str, Any] = {
+        "schema": "GNSS_CONFESSION_PPB_CANDIDATES_V1",
+        "description": "PI-owned PPB candidates; raw Teensy PPB remains untouched",
+        "canonical_fragment_unchanged": True,
+        "published_source": _gnss_confession_published_source(),
+        "candidate_sources": ["RAW", "GNSS_CONFESSION"],
+        "segment_step_gate_ns": float(GNSS_CONFESSION_SEGMENT_STEP_GATE_NS),
+        "pps_count": public_count,
+        "gnss_confession": {
+            "valid": g_err is not None,
+            "pps_timing_error_ns": g_err,
+            "delta_ns": d_g,
+            "correction_ns": correction,
+            "segment_step": segment_step,
+            "gap": bool(gap),
+            "reason": reason,
+            "first_error_ns": _gnss_confession_first_error_ns,
+            "net_error_ns": (
+                None if g_err is None or _gnss_confession_first_error_ns is None
+                else g_err - _gnss_confession_first_error_ns
+            ),
+        },
+    }
+
+    for lane in ("ocxo1", "ocxo2"):
+        raw_residual = _ocxo_fast_residual_for_ppb_candidate(frag, lane)
+        lane_obj: Dict[str, Any] = {
+            "valid": raw_residual is not None,
+            "raw_residual_ns": raw_residual,
+            "gnss_confession_corrected_residual_ns": None,
+            "raw_running_ppb": None,
+            "gnss_confession_running_ppb": None,
+            "published_ppb": None,
+            "published_source": _gnss_confession_published_source(),
+        }
+        if raw_residual is not None:
+            corrected_residual = raw_residual - correction
+            _gnss_confession_n[lane] += 1
+            _gnss_confession_raw_total[lane] += raw_residual
+            _gnss_confession_corrected_total[lane] += corrected_residual
+            n = _gnss_confession_n[lane]
+            raw_ppb = _gnss_confession_raw_total[lane] / n
+            corrected_ppb = _gnss_confession_corrected_total[lane] / n
+            published_ppb = (
+                corrected_ppb
+                if _gnss_confession_published_source() == "GNSS_CONFESSION"
+                else raw_ppb
+            )
+            lane_obj.update({
+                "sample_count": n,
+                "gnss_confession_corrected_residual_ns": corrected_residual,
+                "raw_running_ppb": round(raw_ppb, 6),
+                "gnss_confession_running_ppb": round(corrected_ppb, 6),
+                "published_ppb": round(published_ppb, 6),
+            })
+        candidates[lane] = lane_obj
+
+    _gnss_confession_prev_pps = public_count
+    if g_err is not None:
+        _gnss_confession_prev_error_ns = g_err
+
+    _diag["gnss_confession_published_source"] = _gnss_confession_published_source()
+    _diag["last_gnss_confession"] = candidates
+    return candidates
 
 def _gnss_raw_reset() -> None:
     """Reset GNSS_RAW accumulator (on campaign start/stop/recover)."""
@@ -3352,6 +3587,16 @@ def _process_loop() -> None:
             pps_vclock_count=int(pps_vclock_count),
         )
 
+        # --- GNSS confession PPB candidates ---
+        # Computed here, after exact TIMEBASE pair assembly, because only Pi
+        # CLOCKS has both the Teensy-authored OCXO residuals and the correlated
+        # GF-8802 discipline confession in one object.
+        ppb_candidates = _gnss_confession_update(
+            pps_vclock_count=int(pps_vclock_count),
+            frag=frag,
+            gnss_info=gnss_info,
+        )
+
         # --- Build TIMEBASE record ---
         timebase = {
             "schema": "TIMEBASE_V3",
@@ -3391,6 +3636,10 @@ def _process_loop() -> None:
                 "gnss_raw_welford_min": round(_gnss_raw_welford_min, 3),
                 "gnss_raw_welford_max": round(_gnss_raw_welford_max, 3),
             },
+
+            # PI-owned candidate PPB surface.  This is the explicit "copy into
+            # sacred field later" seam; fragment.stats remains Teensy-authored.
+            "ppb_candidates": ppb_candidates,
         }
 
         _diag["timebase_final_court_checks"] += 1
@@ -3471,6 +3720,7 @@ def _reset_trackers() -> int:
     _diag["last_timebase_activity"] = {}
     _gnss_canary_reset()
     _gnss_raw_reset()
+    _gnss_confession_reset()
     return _drain_timebase_ingress_and_pending()
 
 def _request_teensy_stop_best_effort() -> None:

@@ -4075,7 +4075,22 @@ bool clocks_alpha_ocxo_counterledger_ready(void) {
       ocxo1.valid && ocxo2.valid;
   if (!snapshots_valid) return false;
   return !clocks_ocxo_counterledger_mode() ||
-         (ocxo1.refined_valid && ocxo2.refined_valid);
+         (ocxo1.interval_valid && ocxo1.interval_ns != 0ULL &&
+          ocxo1.phase_valid &&
+          ocxo1.phase_pps_sequence != 0U &&
+          ocxo1.phase_pps_sequence <= ocxo1.pps_sequence &&
+          ocxo1.phase_lag_pps <= 1U &&
+          ocxo1.refined_valid &&
+          ocxo1.refined_interval_valid &&
+          ocxo1.refined_interval_ns != 0ULL &&
+          ocxo2.interval_valid && ocxo2.interval_ns != 0ULL &&
+          ocxo2.phase_valid &&
+          ocxo2.phase_pps_sequence != 0U &&
+          ocxo2.phase_pps_sequence <= ocxo2.pps_sequence &&
+          ocxo2.phase_lag_pps <= 1U &&
+          ocxo2.refined_valid &&
+          ocxo2.refined_interval_valid &&
+          ocxo2.refined_interval_ns != 0ULL);
 }
 
 static bool alpha_zero_offset_valid(time_clock_id_t clock) {
@@ -6031,7 +6046,15 @@ bool clocks_alpha_ocxo_recover_reattach_snapshot(
     clocks_alpha_ocxo_counterledger_snapshot_t ledger{};
     const bool ledger_ready =
         clocks_alpha_ocxo_counterledger_snapshot(clock, &ledger) &&
-        ledger.valid && ledger.refined_valid;
+        ledger.valid &&
+        ledger.interval_valid && ledger.interval_ns != 0ULL &&
+        ledger.phase_valid &&
+        ledger.phase_pps_sequence != 0U &&
+        ledger.phase_pps_sequence <= ledger.pps_sequence &&
+        ledger.phase_lag_pps <= 1U &&
+        ledger.refined_valid &&
+        ledger.refined_interval_valid &&
+        ledger.refined_interval_ns != 0ULL;
     local.projection_ready = ledger_ready;
     local.ready = ledger_ready;
   } else {

@@ -290,6 +290,47 @@ static uint64_t g_start_handoff_last_ocxo2_projected_ns = 0;
 static uint64_t g_start_handoff_last_ocxo1_projection_vclock_ns = 0;
 static uint64_t g_start_handoff_last_ocxo2_projection_vclock_ns = 0;
 
+// CounterLedger/PhaseLedger START maturity witness.  The old
+// CounterLedger START branch proved only that a refined value existed, then
+// released public PPS1 after a single private PPS0 sample.  That was too weak:
+// public PPS1 is an interval statement, so both OCXO lanes must already have
+// contiguous integer CounterLedger intervals and contiguous refined
+// PhaseLedger intervals before the private PPS0 candidate is trusted.
+//
+// These counters are Beta-local forensics only.  They do not authorize clock
+// values; they explain why START was held or released.
+static constexpr uint32_t CLOCKS_START_PHASELEDGER_EXPECTED_LAG_PPS = 1U;
+// Once PhaseLedger is the standard authority, do not let the science row
+// silently fall back to integer CounterLedger quantization.  A missing
+// refined interval is a startup/maturity fact and should publish as missing
+// science rather than contaminating Welford/PPB with 100 ns stair-steps.
+static constexpr bool CLOCKS_PHASELEDGER_SCIENCE_REQUIRE_REFINED_INTERVAL = true;
+static uint32_t g_start_phaseledger_check_count = 0;
+static uint32_t g_start_phaseledger_ready_count = 0;
+static uint32_t g_start_phaseledger_wait_count = 0;
+static uint32_t g_start_phaseledger_wait_snapshot_count = 0;
+static uint32_t g_start_phaseledger_wait_capture_count = 0;
+static uint32_t g_start_phaseledger_wait_integer_interval_count = 0;
+static uint32_t g_start_phaseledger_wait_phase_count = 0;
+static uint32_t g_start_phaseledger_wait_phase_lag_count = 0;
+static uint32_t g_start_phaseledger_wait_refined_count = 0;
+static uint32_t g_start_phaseledger_wait_refined_interval_count = 0;
+static uint32_t g_start_phaseledger_wait_sequence_count = 0;
+static uint32_t g_phaseledger_science_missing_refined_interval_count = 0;
+static uint32_t g_phaseledger_science_missing_ocxo1_count = 0;
+static uint32_t g_phaseledger_science_missing_ocxo2_count = 0;
+static uint32_t g_phaseledger_science_last_missing_public_count = 0;
+static bool     g_start_phaseledger_last_ready = false;
+static bool     g_start_phaseledger_last_ocxo1_ready = false;
+static bool     g_start_phaseledger_last_ocxo2_ready = false;
+static bool     g_start_phaseledger_last_sequence_aligned = false;
+static char     g_start_phaseledger_last_reason[64] = "reset";
+static char     g_start_phaseledger_last_first_problem[32] = "";
+static clocks_alpha_ocxo_counterledger_snapshot_t
+    g_start_phaseledger_last_ocxo1 = {};
+static clocks_alpha_ocxo_counterledger_snapshot_t
+    g_start_phaseledger_last_ocxo2 = {};
+
 static bool     g_timebase_last_ocxo1_pps_projected = false;
 static bool     g_timebase_last_ocxo2_pps_projected = false;
 static bool     g_timebase_last_ocxo1_pps_residual_valid = false;
@@ -611,6 +652,24 @@ static volatile uint32_t g_start_prologue_pps0_o1_obs = 0;
 static volatile uint32_t g_start_prologue_pps0_o1_fl = 0;
 static volatile uint32_t g_start_prologue_pps0_o2_obs = 0;
 static volatile uint32_t g_start_prologue_pps0_o2_fl = 0;
+
+// START private-PPS0 continuity witness.  These are report-only counters and
+// last-decision fields for the observed-DWT rail gate that decides whether a
+// private PPS0 bookend is mature enough to let the next candidate become
+// public PPS1.  In PhaseLedger mode the DWT rail remains only a launch witness;
+// it does not author the public OCXO nanosecond clock.
+static uint32_t g_start_prologue_continuity_check_count = 0;
+static uint32_t g_start_prologue_continuity_pass_count = 0;
+static uint32_t g_start_prologue_continuity_reject_count = 0;
+static bool     g_start_prologue_last_continuity_ok = false;
+static uint32_t g_start_prologue_last_reference_interval = 0;
+static uint32_t g_start_prologue_last_vclock_interval = 0;
+static uint32_t g_start_prologue_last_ocxo1_interval = 0;
+static uint32_t g_start_prologue_last_ocxo2_interval = 0;
+static int32_t  g_start_prologue_last_reference_minus_pps0 = 0;
+static int32_t  g_start_prologue_last_vclock_minus_pps0 = 0;
+static int32_t  g_start_prologue_last_ocxo1_minus_pps0 = 0;
+static int32_t  g_start_prologue_last_ocxo2_minus_pps0 = 0;
 
 // Campaign-public continuity transform.
 //
@@ -1146,6 +1205,210 @@ static void campaign_public_offsets_reset_for_recover(void) {
   campaign_public_counterledger_offsets_reset_for_recover();
 }
 
+static void campaign_start_phaseledger_set_reason(const char* reason,
+                                                   const char* first_problem = nullptr) {
+  safeCopy(g_start_phaseledger_last_reason,
+           sizeof(g_start_phaseledger_last_reason),
+           reason ? reason : "phaseledger_start");
+  safeCopy(g_start_phaseledger_last_first_problem,
+           sizeof(g_start_phaseledger_last_first_problem),
+           first_problem ? first_problem : "");
+}
+
+static bool campaign_start_phaseledger_capture_ready(
+    const clocks_alpha_ocxo_counterledger_snapshot_t& s) {
+  return s.last_capture_available &&
+         s.last_capture_valid &&
+         s.last_capture_all_lanes_valid &&
+         s.last_capture_sequence_match &&
+         s.last_capture_sequence == s.pps_sequence;
+}
+
+static bool campaign_start_phaseledger_integer_interval_ready(
+    const clocks_alpha_ocxo_counterledger_snapshot_t& s) {
+  return s.interval_valid && s.interval_ns != 0ULL;
+}
+
+static bool campaign_start_phaseledger_phase_ready(
+    const clocks_alpha_ocxo_counterledger_snapshot_t& s) {
+  return s.phase_valid &&
+         s.phase_pps_sequence != 0U &&
+         s.phase_pps_sequence <= s.pps_sequence;
+}
+
+static bool campaign_start_phaseledger_lag_ready(
+    const clocks_alpha_ocxo_counterledger_snapshot_t& s) {
+  return campaign_start_phaseledger_phase_ready(s) &&
+         s.phase_lag_pps <= CLOCKS_START_PHASELEDGER_EXPECTED_LAG_PPS;
+}
+
+static bool campaign_start_phaseledger_refined_ready(
+    const clocks_alpha_ocxo_counterledger_snapshot_t& s) {
+  return s.refined_valid && s.refined_ns != 0ULL;
+}
+
+static bool campaign_start_phaseledger_refined_interval_ready(
+    const clocks_alpha_ocxo_counterledger_snapshot_t& s) {
+  return s.refined_interval_valid && s.refined_interval_ns != 0ULL;
+}
+
+static bool campaign_start_phaseledger_lane_ready(
+    bool snapshot_ok,
+    const clocks_alpha_ocxo_counterledger_snapshot_t& s) {
+  return snapshot_ok &&
+         s.valid &&
+         s.initialized &&
+         campaign_start_phaseledger_capture_ready(s) &&
+         campaign_start_phaseledger_integer_interval_ready(s) &&
+         campaign_start_phaseledger_phase_ready(s) &&
+         campaign_start_phaseledger_lag_ready(s) &&
+         campaign_start_phaseledger_refined_ready(s) &&
+         campaign_start_phaseledger_refined_interval_ready(s);
+}
+
+static const char* campaign_start_phaseledger_lane_problem(
+    bool snapshot_ok,
+    const clocks_alpha_ocxo_counterledger_snapshot_t& s,
+    const char* lane) {
+  static char reason[32];
+
+  if (!snapshot_ok || !s.valid || !s.initialized) {
+    snprintf(reason, sizeof(reason), "%s_snapshot", lane);
+    return reason;
+  }
+  if (!campaign_start_phaseledger_capture_ready(s)) {
+    snprintf(reason, sizeof(reason), "%s_capture", lane);
+    return reason;
+  }
+  if (!campaign_start_phaseledger_integer_interval_ready(s)) {
+    snprintf(reason, sizeof(reason), "%s_integer_interval", lane);
+    return reason;
+  }
+  if (!campaign_start_phaseledger_phase_ready(s)) {
+    snprintf(reason, sizeof(reason), "%s_phase", lane);
+    return reason;
+  }
+  if (!campaign_start_phaseledger_lag_ready(s)) {
+    snprintf(reason, sizeof(reason), "%s_phase_lag", lane);
+    return reason;
+  }
+  if (!campaign_start_phaseledger_refined_ready(s)) {
+    snprintf(reason, sizeof(reason), "%s_refined", lane);
+    return reason;
+  }
+  if (!campaign_start_phaseledger_refined_interval_ready(s)) {
+    snprintf(reason, sizeof(reason), "%s_refined_interval", lane);
+    return reason;
+  }
+
+  return nullptr;
+}
+
+static void campaign_start_phaseledger_count_wait_reason(
+    bool ocxo1_snapshot_ok,
+    const clocks_alpha_ocxo_counterledger_snapshot_t& ocxo1,
+    bool ocxo2_snapshot_ok,
+    const clocks_alpha_ocxo_counterledger_snapshot_t& ocxo2,
+    bool sequence_aligned) {
+  if (!ocxo1_snapshot_ok || !ocxo2_snapshot_ok ||
+      !ocxo1.valid || !ocxo2.valid ||
+      !ocxo1.initialized || !ocxo2.initialized) {
+    g_start_phaseledger_wait_snapshot_count++;
+    return;
+  }
+  if (!campaign_start_phaseledger_capture_ready(ocxo1) ||
+      !campaign_start_phaseledger_capture_ready(ocxo2)) {
+    g_start_phaseledger_wait_capture_count++;
+    return;
+  }
+  if (!campaign_start_phaseledger_integer_interval_ready(ocxo1) ||
+      !campaign_start_phaseledger_integer_interval_ready(ocxo2)) {
+    g_start_phaseledger_wait_integer_interval_count++;
+    return;
+  }
+  if (!campaign_start_phaseledger_phase_ready(ocxo1) ||
+      !campaign_start_phaseledger_phase_ready(ocxo2)) {
+    g_start_phaseledger_wait_phase_count++;
+    return;
+  }
+  if (!campaign_start_phaseledger_lag_ready(ocxo1) ||
+      !campaign_start_phaseledger_lag_ready(ocxo2)) {
+    g_start_phaseledger_wait_phase_lag_count++;
+    return;
+  }
+  if (!campaign_start_phaseledger_refined_ready(ocxo1) ||
+      !campaign_start_phaseledger_refined_ready(ocxo2)) {
+    g_start_phaseledger_wait_refined_count++;
+    return;
+  }
+  if (!campaign_start_phaseledger_refined_interval_ready(ocxo1) ||
+      !campaign_start_phaseledger_refined_interval_ready(ocxo2)) {
+    g_start_phaseledger_wait_refined_interval_count++;
+    return;
+  }
+  if (!sequence_aligned) {
+    g_start_phaseledger_wait_sequence_count++;
+    return;
+  }
+}
+
+static bool campaign_start_counterledger_maturity_ready(void) {
+  g_start_phaseledger_check_count++;
+
+  clocks_alpha_ocxo_counterledger_snapshot_t ocxo1{};
+  clocks_alpha_ocxo_counterledger_snapshot_t ocxo2{};
+  const bool ocxo1_snapshot_ok =
+      clocks_alpha_ocxo_counterledger_snapshot(time_clock_id_t::OCXO1, &ocxo1);
+  const bool ocxo2_snapshot_ok =
+      clocks_alpha_ocxo_counterledger_snapshot(time_clock_id_t::OCXO2, &ocxo2);
+
+  g_start_phaseledger_last_ocxo1 = ocxo1;
+  g_start_phaseledger_last_ocxo2 = ocxo2;
+
+  const bool ocxo1_ready =
+      campaign_start_phaseledger_lane_ready(ocxo1_snapshot_ok, ocxo1);
+  const bool ocxo2_ready =
+      campaign_start_phaseledger_lane_ready(ocxo2_snapshot_ok, ocxo2);
+  const bool sequence_aligned =
+      ocxo1_ready && ocxo2_ready &&
+      ocxo1.pps_sequence == ocxo2.pps_sequence &&
+      ocxo1.phase_pps_sequence == ocxo2.phase_pps_sequence;
+
+  g_start_phaseledger_last_ocxo1_ready = ocxo1_ready;
+  g_start_phaseledger_last_ocxo2_ready = ocxo2_ready;
+  g_start_phaseledger_last_sequence_aligned = sequence_aligned;
+
+  const bool ready = ocxo1_ready && ocxo2_ready && sequence_aligned;
+  g_start_phaseledger_last_ready = ready;
+
+  if (ready) {
+    g_start_phaseledger_ready_count++;
+    campaign_start_phaseledger_set_reason("phaseledger_mature");
+    return true;
+  }
+
+  g_start_phaseledger_wait_count++;
+  campaign_start_phaseledger_count_wait_reason(ocxo1_snapshot_ok, ocxo1,
+                                               ocxo2_snapshot_ok, ocxo2,
+                                               sequence_aligned);
+
+  const char* problem =
+      campaign_start_phaseledger_lane_problem(ocxo1_snapshot_ok,
+                                              ocxo1,
+                                              "o1");
+  if (!problem) {
+    problem = campaign_start_phaseledger_lane_problem(ocxo2_snapshot_ok,
+                                                      ocxo2,
+                                                      "o2");
+  }
+  if (!problem && !sequence_aligned) {
+    problem = "sequence_alignment";
+  }
+  campaign_start_phaseledger_set_reason("waiting_for_phaseledger_maturity",
+                                        problem ? problem : "unknown");
+  return false;
+}
+
 static bool campaign_start_handoff_ready(void) {
   g_start_handoff_check_count++;
 
@@ -1189,13 +1452,25 @@ static bool campaign_start_handoff_ready(void) {
       ocxo2_projection_ok ? ocxo2_projection.pps_vclock_ns : 0ULL;
 
   if (clocks_ocxo_counterledger_mode_enabled()) {
-    const bool counterledger_ready = clocks_alpha_ocxo_counterledger_ready();
+    const bool counterledger_ready =
+        campaign_start_counterledger_maturity_ready();
     g_start_handoff_last_ready = origin_ready && counterledger_ready;
+
+    // Preserve the historical report field names, but in
+    // PPS_COUNTERLEDGER mode these booleans now mean lane-level
+    // PhaseLedger launch maturity, not PPS-projection readiness.
+    g_start_handoff_last_ocxo1_projection_ready =
+        g_start_phaseledger_last_ocxo1_ready;
+    g_start_handoff_last_ocxo2_projection_ready =
+        g_start_phaseledger_last_ocxo2_ready;
 
     if (!origin_ready) {
       g_start_handoff_wait_origin_count++;
     }
     if (!counterledger_ready) {
+      // Historical counter name retained for report compatibility: in
+      // CounterLedger/PhaseLedger mode this means the PPS-sampled hardware
+      // ledger, capture custody, or refined PhaseLedger interval is not mature.
       g_start_handoff_wait_projection_count++;
     }
     return g_start_handoff_last_ready;
@@ -1231,6 +1506,24 @@ static void campaign_start_prologue_reset(const char* reason) {
   g_start_prologue_pps0_o1_fl = 0;
   g_start_prologue_pps0_o2_obs = 0;
   g_start_prologue_pps0_o2_fl = 0;
+  g_start_prologue_last_continuity_ok = false;
+  g_start_prologue_last_reference_interval = 0;
+  g_start_prologue_last_vclock_interval = 0;
+  g_start_prologue_last_ocxo1_interval = 0;
+  g_start_prologue_last_ocxo2_interval = 0;
+  g_start_prologue_last_reference_minus_pps0 = 0;
+  g_start_prologue_last_vclock_minus_pps0 = 0;
+  g_start_prologue_last_ocxo1_minus_pps0 = 0;
+  g_start_prologue_last_ocxo2_minus_pps0 = 0;
+  g_start_phaseledger_last_ready = false;
+  g_start_phaseledger_last_ocxo1_ready = false;
+  g_start_phaseledger_last_ocxo2_ready = false;
+  g_start_phaseledger_last_sequence_aligned = false;
+  g_start_phaseledger_last_ocxo1 =
+      clocks_alpha_ocxo_counterledger_snapshot_t{};
+  g_start_phaseledger_last_ocxo2 =
+      clocks_alpha_ocxo_counterledger_snapshot_t{};
+  campaign_start_phaseledger_set_reason(reason ? reason : "reset");
   safeCopy(g_start_prologue_last_reason,
            sizeof(g_start_prologue_last_reason),
            reason ? reason : "reset");
@@ -1332,7 +1625,9 @@ static bool campaign_warmup_consume_one_candidate_record(void) {
     g_start_prologue_last_release_public_count = 1U;
     safeCopy(g_start_prologue_last_reason,
              sizeof(g_start_prologue_last_reason),
-             "release_public_pps1");
+             clocks_ocxo_counterledger_mode_enabled()
+                 ? "phaseledger_release_public_pps1"
+                 : "release_public_pps1");
     return false;
   }
 
@@ -3354,6 +3649,30 @@ static void clock_science_apply_counterledger_row(
 
   const bool use_phase = ledger.refined_interval_valid &&
                          ledger.refined_interval_ns != 0ULL;
+
+  if (CLOCKS_PHASELEDGER_SCIENCE_REQUIRE_REFINED_INTERVAL && !use_phase) {
+    g_phaseledger_science_missing_refined_interval_count++;
+    g_phaseledger_science_last_missing_public_count = row.public_count;
+    if (ledger.clock_id == (uint32_t)((uint8_t)time_clock_id_t::OCXO1)) {
+      g_phaseledger_science_missing_ocxo1_count++;
+    } else if (ledger.clock_id ==
+               (uint32_t)((uint8_t)time_clock_id_t::OCXO2)) {
+      g_phaseledger_science_missing_ocxo2_count++;
+    }
+
+    row.valid = false;
+    row.antecedents_complete = false;
+    row.gnss_interval_ns = CLOCKS_BETA_NS_PER_SECOND;
+    row.gnss_interval_ns_exact = (double)CLOCKS_BETA_NS_PER_SECOND;
+    row.clock_interval_ns = 0ULL;
+    row.clock_interval_ns_exact = 0.0;
+    row.fast_residual_ns = 0LL;
+    row.fast_residual_ns_exact = 0.0;
+    row.tau_1s = 1.0;
+    row.ppb_1s = 0.0;
+    return;
+  }
+
   const bool interval_valid = use_phase ||
       (ledger.interval_valid && ledger.interval_ns != 0ULL);
   const uint64_t interval_ns = use_phase
@@ -3564,8 +3883,11 @@ static bool campaign_start_prologue_fetch_forensics(
   ocxo2_valid = clocks_alpha_lane_forensics(time_clock_id_t::OCXO2, &ocxo2_f);
 
   if (!vclock_valid || !ocxo1_valid || !ocxo2_valid ||
+      vclock_f.dwt_interval_observed_cycles == 0U ||
       ocxo1_f.dwt_interval_observed_cycles == 0U ||
       ocxo2_f.dwt_interval_observed_cycles == 0U ||
+      !g_pps_vclock_dwt_cycles_between_edges_valid ||
+      g_pps_vclock_dwt_cycles_between_edges == 0U ||
       g_dwt_cycles_between_pps_vclock == 0U) {
     campaign_start_prologue_set_reason("waiting_for_observed_delta_bookends");
     return false;
@@ -3585,9 +3907,12 @@ static bool campaign_start_prologue_consume_private_candidate(
   const bool o1_fl = floorline_candidate_present(ocxo1_valid, ocxo1_f);
   const bool o2_fl = floorline_candidate_present(ocxo2_valid, ocxo2_f);
 
-  if (!ocxo1_valid || !ocxo2_valid ||
+  if (!vclock_valid || !ocxo1_valid || !ocxo2_valid ||
+      vclock_f.dwt_interval_observed_cycles == 0U ||
       ocxo1_f.dwt_interval_observed_cycles == 0U ||
       ocxo2_f.dwt_interval_observed_cycles == 0U ||
+      !g_pps_vclock_dwt_cycles_between_edges_valid ||
+      g_pps_vclock_dwt_cycles_between_edges == 0U ||
       g_dwt_cycles_between_pps_vclock == 0U) {
     campaign_start_prologue_set_reason("private_candidate_missing_observed_delta");
     return false;
@@ -3629,6 +3954,7 @@ static bool campaign_start_prologue_consume_private_candidate(
   g_start_prologue_pps0_interval_valid =
       g_start_prologue_pps0_pps_obs != 0U &&
       ref.gnss_valid &&
+      vclock_f.dwt_interval_observed_cycles != 0U &&
       ocxo1_f.dwt_interval_observed_cycles != 0U &&
       ocxo2_f.dwt_interval_observed_cycles != 0U;
 
@@ -3668,47 +3994,76 @@ static bool campaign_start_prologue_private_pps0_continuity_ok(
     const clocks_alpha_lane_forensics_t& ocxo1_f,
     bool ocxo2_valid,
     const clocks_alpha_lane_forensics_t& ocxo2_f) {
-  if (!g_start_prologue_pps0_interval_valid) {
-    campaign_start_prologue_set_reason("private_pps0_interval_missing");
-    return false;
-  }
+  g_start_prologue_continuity_check_count++;
+  g_start_prologue_last_continuity_ok = false;
 
   const uint32_t current_reference_interval =
       g_pps_vclock_dwt_cycles_between_edges_valid
           ? (uint32_t)g_pps_vclock_dwt_cycles_between_edges
           : 0U;
+  const uint32_t current_vclock_interval =
+      vclock_valid ? vclock_f.dwt_interval_observed_cycles : 0U;
+  const uint32_t current_ocxo1_interval =
+      ocxo1_valid ? ocxo1_f.dwt_interval_observed_cycles : 0U;
+  const uint32_t current_ocxo2_interval =
+      ocxo2_valid ? ocxo2_f.dwt_interval_observed_cycles : 0U;
+
+  g_start_prologue_last_reference_interval = current_reference_interval;
+  g_start_prologue_last_vclock_interval = current_vclock_interval;
+  g_start_prologue_last_ocxo1_interval = current_ocxo1_interval;
+  g_start_prologue_last_ocxo2_interval = current_ocxo2_interval;
+  g_start_prologue_last_reference_minus_pps0 =
+      beta_signed_delta_u32(current_reference_interval,
+                            g_start_prologue_pps0_pps_obs);
+  g_start_prologue_last_vclock_minus_pps0 =
+      beta_signed_delta_u32(current_vclock_interval,
+                            g_start_prologue_pps0_v_obs);
+  g_start_prologue_last_ocxo1_minus_pps0 =
+      beta_signed_delta_u32(current_ocxo1_interval,
+                            g_start_prologue_pps0_o1_obs);
+  g_start_prologue_last_ocxo2_minus_pps0 =
+      beta_signed_delta_u32(current_ocxo2_interval,
+                            g_start_prologue_pps0_o2_obs);
+
+  const auto reject = [](const char* reason) -> bool {
+    g_start_prologue_continuity_reject_count++;
+    campaign_start_prologue_set_reason(reason);
+    return false;
+  };
+
+  if (!g_start_prologue_pps0_interval_valid) {
+    return reject("private_pps0_interval_missing");
+  }
 
   if (!campaign_start_prologue_interval_fit_ok(
           current_reference_interval,
           g_start_prologue_pps0_pps_obs)) {
-    campaign_start_prologue_set_reason("private_pps0_reference_interval_unsettled");
-    return false;
+    return reject("private_pps0_reference_interval_unsettled");
   }
 
   if (!vclock_valid ||
       !campaign_start_prologue_interval_fit_ok(
-          vclock_f.dwt_interval_observed_cycles,
+          current_vclock_interval,
           g_start_prologue_pps0_v_obs)) {
-    campaign_start_prologue_set_reason("private_pps0_vclock_interval_unsettled");
-    return false;
+    return reject("private_pps0_vclock_interval_unsettled");
   }
 
   if (!ocxo1_valid ||
       !campaign_start_prologue_interval_fit_ok(
-          ocxo1_f.dwt_interval_observed_cycles,
+          current_ocxo1_interval,
           g_start_prologue_pps0_o1_obs)) {
-    campaign_start_prologue_set_reason("private_pps0_ocxo1_interval_unsettled");
-    return false;
+    return reject("private_pps0_ocxo1_interval_unsettled");
   }
 
   if (!ocxo2_valid ||
       !campaign_start_prologue_interval_fit_ok(
-          ocxo2_f.dwt_interval_observed_cycles,
+          current_ocxo2_interval,
           g_start_prologue_pps0_o2_obs)) {
-    campaign_start_prologue_set_reason("private_pps0_ocxo2_interval_unsettled");
-    return false;
+    return reject("private_pps0_ocxo2_interval_unsettled");
   }
 
+  g_start_prologue_last_continuity_ok = true;
+  g_start_prologue_continuity_pass_count++;
   return true;
 }
 
@@ -3831,34 +4186,55 @@ static bool campaign_start_prologue_should_hold(void) {
       }
       if (g_start_handoff_launch_wait_count >=
           CLOCKS_START_HANDOFF_TIMEOUT_CANDIDATES) {
-        campaign_start_prologue_abort_launch("counterledger_start_handoff_timeout");
+        campaign_start_prologue_abort_launch("phaseledger_start_handoff_timeout");
         return true;
       }
-      campaign_start_prologue_set_reason("waiting_for_counterledger_pps_capture");
+      campaign_start_prologue_set_reason(g_start_phaseledger_last_reason);
       return true;
     }
 
     g_start_handoff_launch_wait_count = 0;
 
-    if (!g_start_prologue_seeded) {
-      // CounterLedger still needs the same campaign-public PPS0 doctrine as
-      // Delta mode: consume one private PPS-synchronous counter sample, set
-      // the public offsets to that sample, then let the next candidate publish
-      // as public PPS1.  No DWT/FloorLine fit probe is needed.
-      campaign_public_offsets_reset_to_current();
-      g_start_prologue_seeded = true;
-      g_start_prologue_reference_ready = true;
-      g_start_prologue_pps0_interval_valid = true;
-      g_start_prologue_private_candidate_count++;
-      g_start_prologue_last_private_count =
-          g_start_prologue_private_candidate_count;
-      campaign_start_prologue_set_reason("counterledger_private_pps0_consumed");
+    if (!campaign_start_prologue_fetch_forensics(vclock_f, ocxo1_f, ocxo2_f,
+                                                 vclock_valid, ocxo1_valid,
+                                                 ocxo2_valid)) {
       return true;
     }
 
-    g_start_handoff_commit_count++;
-    campaign_start_prologue_set_reason("counterledger_release_public_pps1");
-    return false;
+    // CounterLedger/PhaseLedger uses the hardware counter + phase suffix for
+    // public OCXO ns, but public PPS1 is still an interval population sample.
+    // Use the same private PPS0 -> candidate PPS1 observed-DWT continuity
+    // witness that protects Delta Cycles.  DWT is not authoring the public
+    // PhaseLedger value here; it is only deciding whether the launch bookend is
+    // clean enough to enter the public campaign population.
+    if (campaign_start_prologue_probe_public_pps1(vclock_valid, vclock_f,
+                                                  ocxo1_valid, ocxo1_f,
+                                                  ocxo2_valid, ocxo2_f)) {
+      g_start_handoff_commit_count++;
+      campaign_start_prologue_set_reason("phaseledger_release_public_pps1");
+      return false;
+    }
+
+    const bool private_limit_reached =
+        g_start_prologue_private_candidate_count >=
+        CLOCKS_START_PROLOGUE_MAX_PRIVATE_CANDIDATES;
+    if (private_limit_reached) {
+      g_start_prologue_private_limit_count++;
+    }
+
+    (void)campaign_start_prologue_consume_private_candidate(
+        vclock_valid,
+        vclock_f,
+        ocxo1_valid,
+        ocxo1_f,
+        ocxo2_valid,
+        ocxo2_f,
+        private_limit_reached
+            ? "phaseledger_private_limit_still_holding"
+            : (g_start_prologue_reference_ready
+                  ? "phaseledger_private_pps0_refreshed_after_probe_reject"
+                  : "phaseledger_private_pps0_seeded"));
+    return true;
   }
 
   if (!campaign_start_handoff_ready()) {
@@ -7698,16 +8074,66 @@ static FLASHMEM void add_campaign_payload(Payload& p) {
   p.add("start_prologue_fit_endpoint_gate_cycles",
         (uint32_t)CLOCKS_START_PROLOGUE_FIT_ENDPOINT_GATE_CYCLES);
   p.add("start_prologue_last_reason", g_start_prologue_last_reason);
+  p.add("start_phaseledger_ready", g_start_phaseledger_last_ready);
+  p.add("start_phaseledger_reason", g_start_phaseledger_last_reason);
+  p.add("start_phaseledger_first_problem",
+        g_start_phaseledger_last_first_problem);
+  p.add("start_phaseledger_ocxo1_ready",
+        g_start_phaseledger_last_ocxo1_ready);
+  p.add("start_phaseledger_ocxo2_ready",
+        g_start_phaseledger_last_ocxo2_ready);
+  p.add("start_phaseledger_sequence_aligned",
+        g_start_phaseledger_last_sequence_aligned);
+  p.add("phaseledger_science_require_refined_interval",
+        CLOCKS_PHASELEDGER_SCIENCE_REQUIRE_REFINED_INTERVAL);
+  p.add("phaseledger_science_missing_refined_interval_count",
+        g_phaseledger_science_missing_refined_interval_count);
+  p.add("phaseledger_science_missing_ocxo1_count",
+        g_phaseledger_science_missing_ocxo1_count);
+  p.add("phaseledger_science_missing_ocxo2_count",
+        g_phaseledger_science_missing_ocxo2_count);
+  p.add("phaseledger_science_last_missing_public_count",
+        g_phaseledger_science_last_missing_public_count);
   p.add("start_prologue_pps0_interval_valid",
         (bool)g_start_prologue_pps0_interval_valid);
   p.add("start_prologue_pps0_pps_obs",
         (uint32_t)g_start_prologue_pps0_pps_obs);
+  p.add("start_prologue_pps0_v_obs",
+        (uint32_t)g_start_prologue_pps0_v_obs);
   p.add("start_prologue_pps0_v_fl",
         (uint32_t)g_start_prologue_pps0_v_fl);
+  p.add("start_prologue_pps0_o1_obs",
+        (uint32_t)g_start_prologue_pps0_o1_obs);
   p.add("start_prologue_pps0_o1_fl",
         (uint32_t)g_start_prologue_pps0_o1_fl);
+  p.add("start_prologue_pps0_o2_obs",
+        (uint32_t)g_start_prologue_pps0_o2_obs);
   p.add("start_prologue_pps0_o2_fl",
         (uint32_t)g_start_prologue_pps0_o2_fl);
+  p.add("start_prologue_continuity_check_count",
+        g_start_prologue_continuity_check_count);
+  p.add("start_prologue_continuity_pass_count",
+        g_start_prologue_continuity_pass_count);
+  p.add("start_prologue_continuity_reject_count",
+        g_start_prologue_continuity_reject_count);
+  p.add("start_prologue_last_continuity_ok",
+        g_start_prologue_last_continuity_ok);
+  p.add("start_prologue_last_reference_interval",
+        g_start_prologue_last_reference_interval);
+  p.add("start_prologue_last_vclock_interval",
+        g_start_prologue_last_vclock_interval);
+  p.add("start_prologue_last_ocxo1_interval",
+        g_start_prologue_last_ocxo1_interval);
+  p.add("start_prologue_last_ocxo2_interval",
+        g_start_prologue_last_ocxo2_interval);
+  p.add("start_prologue_last_reference_minus_pps0",
+        g_start_prologue_last_reference_minus_pps0);
+  p.add("start_prologue_last_vclock_minus_pps0",
+        g_start_prologue_last_vclock_minus_pps0);
+  p.add("start_prologue_last_ocxo1_minus_pps0",
+        g_start_prologue_last_ocxo1_minus_pps0);
+  p.add("start_prologue_last_ocxo2_minus_pps0",
+        g_start_prologue_last_ocxo2_minus_pps0);
   p.add("recover_science_quarantine_required",
         (uint32_t)CLOCKS_RECOVER_SCIENCE_QUARANTINE_ROWS);
   p.add("recover_science_quarantine_remaining",
@@ -8440,6 +8866,8 @@ static FLASHMEM Payload cmd_report_ocxo_projection_guard(const Payload&) {
   return p;
 }
 
+static FLASHMEM void payload_add_startup_handoff_payload(Payload& p);
+
 static FLASHMEM Payload cmd_report_timebase_publish(const Payload&) {
   Payload p;
   p.add("report", "CLOCKS_TIMEBASE_PUBLISH");
@@ -8521,6 +8949,18 @@ static FLASHMEM Payload cmd_report_timebase_publish(const Payload&) {
   gates.add("start_handoff_commit_count", g_start_handoff_commit_count);
   gates.add("start_handoff_launch_wait_count", g_start_handoff_launch_wait_count);
   gates.add("start_handoff_timeout_count", g_start_handoff_timeout_count);
+  gates.add("start_prologue_continuity_check_count",
+            g_start_prologue_continuity_check_count);
+  gates.add("start_prologue_continuity_pass_count",
+            g_start_prologue_continuity_pass_count);
+  gates.add("start_prologue_continuity_reject_count",
+            g_start_prologue_continuity_reject_count);
+  gates.add("start_prologue_last_continuity_ok",
+            g_start_prologue_last_continuity_ok);
+  gates.add("start_phaseledger_ready", g_start_phaseledger_last_ready);
+  gates.add("start_phaseledger_reason", g_start_phaseledger_last_reason);
+  gates.add("start_phaseledger_first_problem",
+            g_start_phaseledger_last_first_problem);
   gates.add("dwt_publication_launch_acquisition",
             interrupt_dwt_publication_launch_acquisition_active());
   gates.add("campaign_state", campaign_state == clocks_campaign_state_t::STARTED ? "STARTED" : "STOPPED");
@@ -8611,6 +9051,10 @@ static FLASHMEM Payload cmd_report_timebase_publish(const Payload&) {
   start_handoff.add("ocxo1_projection_vclock_ns", g_start_handoff_last_ocxo1_projection_vclock_ns);
   start_handoff.add("ocxo2_projection_vclock_ns", g_start_handoff_last_ocxo2_projection_vclock_ns);
   p.add_object("start_handoff", start_handoff);
+
+  Payload startup;
+  payload_add_startup_handoff_payload(startup);
+  p.add_object("startup", startup);
 
   Payload flash_cut;
   flash_cut.add("pending", request_flash_cut);
@@ -8790,10 +9234,208 @@ static FLASHMEM Payload cmd_report_integrity(const Payload&) {
   return p;
 }
 
+
+static FLASHMEM void payload_add_phaseledger_start_lane(
+    Payload& parent,
+    const char* key,
+    const clocks_alpha_ocxo_counterledger_snapshot_t& s,
+    bool ready) {
+  Payload lane;
+  lane.add("ready", ready);
+  lane.add("valid", s.valid);
+  lane.add("initialized", s.initialized);
+  lane.add("sample_count", s.sample_count);
+  lane.add("pps_sequence", s.pps_sequence);
+
+  Payload capture;
+  capture.add("available", s.last_capture_available);
+  capture.add("valid", s.last_capture_valid);
+  capture.add("all_lanes_valid", s.last_capture_all_lanes_valid);
+  capture.add("sequence_match", s.last_capture_sequence_match);
+  capture.add("sequence", s.last_capture_sequence);
+  capture.add("window_cycles", s.last_capture_window_cycles);
+  lane.add_object("capture", capture);
+
+  Payload integer;
+  integer.add("interval_valid", s.interval_valid);
+  integer.add("interval_ns", s.interval_valid ? s.interval_ns : 0ULL);
+  integer.add("fast_residual_ns", s.interval_valid ? s.fast_residual_ns : 0LL);
+  integer.add("last_delta_ticks", s.last_delta_ticks);
+  integer.add("ticks64", s.ticks64);
+  integer.add("ns", s.ns);
+  integer.add("interval_gap_count", s.interval_gap_count);
+  lane.add_object("counterledger", integer);
+
+  Payload phase;
+  phase.add("valid", s.phase_valid);
+  phase.add("pending", s.phase_pending);
+  phase.add("source_id", s.phase_source_id);
+  phase.add("source", counterledger_phase_source_name(s.phase_source_id));
+  phase.add("pps_sequence", s.phase_pps_sequence);
+  phase.add("lag_pps", s.phase_lag_pps);
+  phase.add("expected_lag_pps",
+            (uint32_t)CLOCKS_START_PHASELEDGER_EXPECTED_LAG_PPS);
+  phase.add("lag_ok",
+            s.phase_lag_pps <= CLOCKS_START_PHASELEDGER_EXPECTED_LAG_PPS);
+  phase.add("near_boundary", s.phase_near_boundary);
+  phase.add("after_last_00_ns", s.phase_after_last_00_ns);
+  phase.add("to_next_00_ns", s.phase_to_next_00_ns);
+  phase.add("raw_delta_ns", s.phase_raw_delta_ns);
+  phase.add("unwrapped_delta_ns", s.phase_unwrapped_delta_ns);
+  phase.add("unwrapped_carry_ticks", s.phase_unwrapped_carry_ticks);
+  phase.add("wrap_event", s.phase_wrap_event);
+  phase.add("wrap_count", s.phase_wrap_count);
+  phase.add("resolve_count", s.phase_resolve_count);
+  phase.add("pending_overwrite_count", s.phase_pending_overwrite_count);
+  phase.add("invalid_count", s.phase_invalid_count);
+  phase.add("pps_dwt_at_edge", s.phase_pps_dwt_at_edge);
+  phase.add("prev_ocxo_dwt_at_edge", s.phase_prev_ocxo_dwt_at_edge);
+  phase.add("next_ocxo_dwt_at_edge", s.phase_next_ocxo_dwt_at_edge);
+  phase.add("ocxo_interval_cycles", s.phase_ocxo_interval_cycles);
+  phase.add("pps_delta_cycles", s.phase_pps_delta_cycles);
+  lane.add_object("phaseledger", phase);
+
+  Payload refined;
+  refined.add("valid", s.refined_valid);
+  refined.add("ns", s.refined_valid ? s.refined_ns : 0ULL);
+  refined.add("interval_valid", s.refined_interval_valid);
+  refined.add("interval_ns", s.refined_interval_valid ? s.refined_interval_ns : 0ULL);
+  refined.add("fast_residual_ns",
+              s.refined_interval_valid ? s.refined_fast_residual_ns : 0LL);
+  lane.add_object("refined", refined);
+
+  parent.add_object(key, lane);
+}
+
+static FLASHMEM void payload_add_startup_handoff_payload(Payload& p) {
+  p.add("report_scope", "START_HANDOFF_PHASELEDGER");
+  p.add("authority", clocks_ocxo_public_ns_authority_name());
+  p.add("phaseledger_standard_mode", clocks_ocxo_counterledger_mode_enabled());
+  p.add("policy",
+        "PRIVATE_PPS0_CONTINUITY_PLUS_COUNTERLEDGER_PHASELEDGER_MATURITY");
+  p.add("dwt_role",
+        "launch_witness_only_not_phaseledger_clock_authority");
+
+  Payload prologue;
+  prologue.add("seeded", g_start_prologue_seeded);
+  prologue.add("reference_ready", g_start_prologue_reference_ready);
+  prologue.add("last_reason", g_start_prologue_last_reason);
+  prologue.add("private_candidate_count",
+               g_start_prologue_private_candidate_count);
+  prologue.add("last_private_count", g_start_prologue_last_private_count);
+  prologue.add("release_count", g_start_prologue_release_count);
+  prologue.add("last_release_public_count",
+               g_start_prologue_last_release_public_count);
+  prologue.add("private_limit_count", g_start_prologue_private_limit_count);
+  prologue.add("fit_endpoint_gate_cycles",
+               (uint32_t)CLOCKS_START_PROLOGUE_FIT_ENDPOINT_GATE_CYCLES);
+  prologue.add("timeout_candidates",
+               (uint32_t)CLOCKS_START_HANDOFF_TIMEOUT_CANDIDATES);
+  prologue.add("launch_wait_count", g_start_handoff_launch_wait_count);
+  prologue.add("timeout_count", g_start_handoff_timeout_count);
+  prologue.add("dwt_publication_launch_acquisition",
+               interrupt_dwt_publication_launch_acquisition_active());
+  p.add_object("prologue", prologue);
+
+  Payload continuity;
+  continuity.add("pps0_interval_valid",
+                 (bool)g_start_prologue_pps0_interval_valid);
+  continuity.add("pps0_reference_interval",
+                 (uint32_t)g_start_prologue_pps0_pps_obs);
+  continuity.add("pps0_vclock_interval",
+                 (uint32_t)g_start_prologue_pps0_v_obs);
+  continuity.add("pps0_ocxo1_interval",
+                 (uint32_t)g_start_prologue_pps0_o1_obs);
+  continuity.add("pps0_ocxo2_interval",
+                 (uint32_t)g_start_prologue_pps0_o2_obs);
+  continuity.add("current_reference_interval",
+                 g_pps_vclock_dwt_cycles_between_edges_valid
+                     ? (uint32_t)g_pps_vclock_dwt_cycles_between_edges
+                     : 0U);
+  continuity.add("current_vclock_interval",
+                 g_start_prologue_last_vclock_interval);
+  continuity.add("current_ocxo1_interval",
+                 g_start_prologue_last_ocxo1_interval);
+  continuity.add("current_ocxo2_interval",
+                 g_start_prologue_last_ocxo2_interval);
+  continuity.add("selected_pps_vclock_interval_valid",
+                 (bool)g_pps_vclock_dwt_cycles_between_edges_valid);
+  continuity.add("check_count", g_start_prologue_continuity_check_count);
+  continuity.add("pass_count", g_start_prologue_continuity_pass_count);
+  continuity.add("reject_count", g_start_prologue_continuity_reject_count);
+  continuity.add("last_ok", g_start_prologue_last_continuity_ok);
+  continuity.add("reference_minus_pps0",
+                 g_start_prologue_last_reference_minus_pps0);
+  continuity.add("vclock_minus_pps0",
+                 g_start_prologue_last_vclock_minus_pps0);
+  continuity.add("ocxo1_minus_pps0",
+                 g_start_prologue_last_ocxo1_minus_pps0);
+  continuity.add("ocxo2_minus_pps0",
+                 g_start_prologue_last_ocxo2_minus_pps0);
+  p.add_object("private_pps0_continuity", continuity);
+
+  Payload phaseledger;
+  phaseledger.add("ready", g_start_phaseledger_last_ready);
+  phaseledger.add("reason", g_start_phaseledger_last_reason);
+  phaseledger.add("first_problem", g_start_phaseledger_last_first_problem);
+  phaseledger.add("check_count", g_start_phaseledger_check_count);
+  phaseledger.add("ready_count", g_start_phaseledger_ready_count);
+  phaseledger.add("wait_count", g_start_phaseledger_wait_count);
+  phaseledger.add("wait_snapshot_count",
+                  g_start_phaseledger_wait_snapshot_count);
+  phaseledger.add("wait_capture_count",
+                  g_start_phaseledger_wait_capture_count);
+  phaseledger.add("wait_integer_interval_count",
+                  g_start_phaseledger_wait_integer_interval_count);
+  phaseledger.add("wait_phase_count", g_start_phaseledger_wait_phase_count);
+  phaseledger.add("wait_phase_lag_count",
+                  g_start_phaseledger_wait_phase_lag_count);
+  phaseledger.add("wait_refined_count",
+                  g_start_phaseledger_wait_refined_count);
+  phaseledger.add("wait_refined_interval_count",
+                  g_start_phaseledger_wait_refined_interval_count);
+  phaseledger.add("wait_sequence_count",
+                  g_start_phaseledger_wait_sequence_count);
+  phaseledger.add("ocxo1_ready", g_start_phaseledger_last_ocxo1_ready);
+  phaseledger.add("ocxo2_ready", g_start_phaseledger_last_ocxo2_ready);
+  phaseledger.add("sequence_aligned",
+                  g_start_phaseledger_last_sequence_aligned);
+  phaseledger.add("expected_lag_pps",
+                  (uint32_t)CLOCKS_START_PHASELEDGER_EXPECTED_LAG_PPS);
+  phaseledger.add("science_require_refined_interval",
+                  CLOCKS_PHASELEDGER_SCIENCE_REQUIRE_REFINED_INTERVAL);
+  phaseledger.add("science_missing_refined_interval_count",
+                  g_phaseledger_science_missing_refined_interval_count);
+  phaseledger.add("science_missing_ocxo1_count",
+                  g_phaseledger_science_missing_ocxo1_count);
+  phaseledger.add("science_missing_ocxo2_count",
+                  g_phaseledger_science_missing_ocxo2_count);
+  phaseledger.add("science_last_missing_public_count",
+                  g_phaseledger_science_last_missing_public_count);
+  payload_add_phaseledger_start_lane(phaseledger,
+                                     "ocxo1",
+                                     g_start_phaseledger_last_ocxo1,
+                                     g_start_phaseledger_last_ocxo1_ready);
+  payload_add_phaseledger_start_lane(phaseledger,
+                                     "ocxo2",
+                                     g_start_phaseledger_last_ocxo2,
+                                     g_start_phaseledger_last_ocxo2_ready);
+  p.add_object("phaseledger", phaseledger);
+}
+
+static FLASHMEM Payload cmd_report_startup(const Payload&) {
+  Payload p;
+  p.add("report", "CLOCKS_STARTUP_HANDOFF");
+  p.add("description",
+        "START prologue / private PPS0 / PhaseLedger maturity flight recorder");
+  payload_add_startup_handoff_payload(p);
+  return p;
+}
+
 static FLASHMEM Payload cmd_report(const Payload&) {
   Payload p;
   p.add("report", "CLOCKS_COMPACT");
-  p.add("subreports", "REPORT_STATUS REPORT_SUMMARY REPORT_EPOCH REPORT_SMARTZERO REPORT_INSTALLED_SMARTZERO REPORT_LIVE_SMARTZERO REPORT_FORENSICS REPORT_FORENSICS_VCLOCK REPORT_FORENSICS_OCXO1 REPORT_FORENSICS_OCXO2 REPORT_OCXO_PPS_PROJECTION REPORT_OCXO_PROJECTION_GUARD REPORT_TIMEBASE_PUBLISH REPORT_INTEGRITY REPORT_ALPHA_FLOW REPORT_ALPHA_FLOW_VCLOCK REPORT_ALPHA_FLOW_OCXO1 REPORT_ALPHA_FLOW_OCXO2 REPORT_PREDICTION REPORT_STATS REPORT_DAC DITHER_STATUS DITHER_ENABLE DITHER_DISABLE");
+  p.add("subreports", "REPORT_STATUS REPORT_SUMMARY REPORT_EPOCH REPORT_SMARTZERO REPORT_INSTALLED_SMARTZERO REPORT_LIVE_SMARTZERO REPORT_FORENSICS REPORT_FORENSICS_VCLOCK REPORT_FORENSICS_OCXO1 REPORT_FORENSICS_OCXO2 REPORT_OCXO_PPS_PROJECTION REPORT_OCXO_PROJECTION_GUARD REPORT_TIMEBASE_PUBLISH REPORT_STARTUP REPORT_INTEGRITY REPORT_ALPHA_FLOW REPORT_ALPHA_FLOW_VCLOCK REPORT_ALPHA_FLOW_OCXO1 REPORT_ALPHA_FLOW_OCXO2 REPORT_PREDICTION REPORT_STATS REPORT_DAC DITHER_STATUS DITHER_ENABLE DITHER_DISABLE");
   add_summary_payload(p);
   add_campaign_payload(p);
 
@@ -9237,6 +9879,7 @@ static const process_command_entry_t CLOCKS_COMMANDS[] = {
   { "REPORT_OCXO_PPS_PROJECTION", cmd_report_ocxo_pps_projection },
   { "REPORT_OCXO_PROJECTION_GUARD", cmd_report_ocxo_projection_guard },
   { "REPORT_TIMEBASE_PUBLISH", cmd_report_timebase_publish },
+  { "REPORT_STARTUP",          cmd_report_startup          },
   { "REPORT_INTEGRITY",        cmd_report_integrity        },
   { "REPORT_ALPHA_FLOW",       cmd_report_alpha_flow       },
   { "REPORT_ALPHA_FLOW_VCLOCK", cmd_report_alpha_flow_vclock },
