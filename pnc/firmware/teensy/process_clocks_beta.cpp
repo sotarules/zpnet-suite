@@ -1185,6 +1185,22 @@ struct clock_science_row_t {
   double   total_fast_residual_ns_exact = 0.0;
   double   total_tau = 1.0;
   double   total_ppb = 0.0;
+
+  // Alpha-owned always-on PhaseLedger TAU snapshot. These fields are the
+  // frequency authority when valid; campaign clockface ratios remain only a
+  // fallback/diagnostic because they contain launch intercept.
+  bool     alpha_tau_valid = false;
+  uint32_t alpha_tau_sample_count = 0;
+  uint32_t alpha_tau_interval_count = 0;
+  uint32_t alpha_tau_last_pps_sequence = 0;
+  uint32_t alpha_tau_last_interval_pps_sequence = 0;
+  double   alpha_tau = 1.0;
+  double   alpha_tau_ppb = 0.0;
+  double   alpha_tau_stderr_ppb = 0.0;
+  double   alpha_tau_interval_mean_ppb = 0.0;
+  double   alpha_tau_interval_stderr_ppb = 0.0;
+  int64_t  alpha_tau_intercept_ns = 0;
+  int64_t  alpha_tau_detrended_fast_residual_ns = 0;
 };
 
 static void delta_residual_state_reset(void) {
@@ -3943,8 +3959,9 @@ static void delta_residual_apply_one(clock_science_row_t& row,
   row.delta_reference_public_count = ref.public_count;
   row.delta_publication_public_count = row.public_count;
 
-  const bool ref_count_aligned =
-      ref.captured && (ref.public_count + 1U == row.public_count);
+  const bool ref_count_aligned = ref.captured &&
+      (ref.public_count == row.public_count ||
+       (ref.public_count == 0U && row.public_count == 1U));
 
   if (ref_count_aligned && ref.gnss_valid && clock_valid &&
       clock_f.dwt_interval_observed_cycles != 0U) {
@@ -4101,6 +4118,43 @@ static void clock_science_apply_campaign_public_ratio(clock_science_row_t& row,
   row.total_fast_residual_ns = row.total_valid
       ? beta_signed_delta_u64(public_clock_ns, public_gnss_ns)
       : 0LL;
+}
+
+
+static void clock_science_apply_alpha_tau(clock_science_row_t& row,
+                                          bool tau_ok,
+                                          const clocks_alpha_tau_snapshot_t& tau) {
+  row.alpha_tau_valid = tau_ok && tau.valid;
+  row.alpha_tau_sample_count = tau.sample_count;
+  row.alpha_tau_interval_count = tau.interval_count;
+  row.alpha_tau_last_pps_sequence = tau.last_pps_sequence;
+  row.alpha_tau_last_interval_pps_sequence = tau.last_interval_pps_sequence;
+  row.alpha_tau = row.alpha_tau_valid ? tau.tau : 1.0;
+  row.alpha_tau_ppb = row.alpha_tau_valid ? tau.ppb : 0.0;
+  row.alpha_tau_stderr_ppb = row.alpha_tau_valid ? tau.stderr_ppb : 0.0;
+  row.alpha_tau_interval_mean_ppb = row.alpha_tau_valid
+      ? tau.interval_mean_ppb
+      : 0.0;
+  row.alpha_tau_interval_stderr_ppb = row.alpha_tau_valid
+      ? tau.interval_stderr_ppb
+      : 0.0;
+  row.alpha_tau_intercept_ns = row.alpha_tau_valid ? tau.intercept_ns : 0;
+
+  if (!row.alpha_tau_valid) return;
+
+  // AlphaTau is the frequency authority. Keep the accumulated public-ledger
+  // totals as clockface evidence, but overwrite the published TAU/PPB fields
+  // with the affine slope so campaign launch intercept cannot leak into
+  // frequency.
+  row.total_valid = true;
+  row.total_sample_count = tau.interval_count;
+  row.total_tau = tau.tau;
+  row.total_ppb = tau.ppb;
+
+  if (row.valid) {
+    row.alpha_tau_detrended_fast_residual_ns =
+        row.fast_residual_ns - beta_round_double_to_i64(tau.ppb);
+  }
 }
 
 static void clock_science_apply_counterledger_row(
@@ -4807,12 +4861,28 @@ static FLASHMEM void payload_add_clock_science_common(Payload& science,
     // One-second Delta residuals remain in fast_residual_ns and delta_*;
     // traditional_* totals remain comparison evidence.
     science.add("total_ratio_source",
-                ocxo_science_row ? "PUBLIC_CLOCK_NS_OVER_GNSS_NS" : "GNSS_IDENTITY");
+                ocxo_science_row
+                    ? (row.alpha_tau_valid
+                           ? "ALPHA_PHASELEDGER_AFFINE_TAU"
+                           : "PUBLIC_CLOCK_NS_OVER_GNSS_NS")
+                    : "GNSS_IDENTITY");
     science.add("total_valid", row.total_valid);
     science.add("total_sample_count", row.total_sample_count);
     science.add("total_fast_residual_ns", row.total_fast_residual_ns);
     science.add("total_tau", row.total_tau, 12);
     science.add("total_ppb", row.total_ppb, 6);
+    science.add("alpha_tau_valid", row.alpha_tau_valid);
+    science.add("alpha_tau_sample_count", row.alpha_tau_sample_count);
+    science.add("alpha_tau_interval_count", row.alpha_tau_interval_count);
+    science.add("alpha_tau_ppb", row.alpha_tau_ppb, 6);
+    science.add("alpha_tau_stderr_ppb", row.alpha_tau_stderr_ppb, 6);
+    science.add("alpha_tau_interval_mean_ppb",
+                row.alpha_tau_interval_mean_ppb, 6);
+    science.add("alpha_tau_interval_stderr_ppb",
+                row.alpha_tau_interval_stderr_ppb, 6);
+    science.add("alpha_tau_intercept_ns", row.alpha_tau_intercept_ns);
+    science.add("alpha_tau_detrended_fast_residual_ns",
+                row.alpha_tau_detrended_fast_residual_ns);
     science.add("traditional_total_valid", row.traditional_total_valid);
     science.add("traditional_total_sample_count", row.traditional_total_sample_count);
     science.add("traditional_total_fast_residual_ns",
@@ -4828,7 +4898,7 @@ static FLASHMEM void payload_add_clock_science_common(Payload& science,
                                row.delta_raw_valid ||
                                row.delta_floorline_valid;
     if (publish_delta) {
-      science.add("delta_alignment", "REF_DELAY_1");
+      science.add("delta_alignment", "REF_SAME_ROW");
       science.add("delta_reference_species", "SELECTED_PPS_VCLOCK_DWT_EDGE_INTERVAL");
       science.add("delta_clock_species", "OCXO_OBSERVED_DWT_EDGE_INTERVAL");
       science.add("delta_reference_public_count", row.delta_reference_public_count);
@@ -4904,7 +4974,7 @@ static FLASHMEM void payload_add_clock_science_common(Payload& science,
   science.add("floorline_minus_observed_interval_cycles",
               row.floorline_minus_observed_interval_cycles);
 
-  science.add("delta_alignment", "REFERENCE_DELAYED_ONE_TIMEBASE_ROW");
+  science.add("delta_alignment", "REFERENCE_SAME_TIMEBASE_ROW");
   science.add("delta_reference_species", "SELECTED_PPS_VCLOCK_DWT_EDGE_INTERVAL");
   science.add("delta_clock_species", "OCXO_OBSERVED_DWT_EDGE_INTERVAL");
   science.add("delta_positive_means", "clock_slow_for_residual_clock_minus_reference");
@@ -4980,7 +5050,11 @@ static FLASHMEM void payload_add_clock_science_common(Payload& science,
   science.add("traditional_ppb_1s", row.traditional_ppb_1s, 6);
 
   science.add("total_ratio_source",
-              ocxo_science_row ? "PUBLIC_CLOCK_NS_OVER_GNSS_NS" : "GNSS_IDENTITY");
+              ocxo_science_row
+                  ? (row.alpha_tau_valid
+                         ? "ALPHA_PHASELEDGER_AFFINE_TAU"
+                         : "PUBLIC_CLOCK_NS_OVER_GNSS_NS")
+                  : "GNSS_IDENTITY");
   science.add("total_valid", row.total_valid);
   science.add("total_sample_count", row.total_sample_count);
   science.add("total_clock_interval_ns", row.total_clock_interval_ns);
@@ -4991,6 +5065,22 @@ static FLASHMEM void payload_add_clock_science_common(Payload& science,
   science.add("total_fast_residual_ns_exact", row.total_fast_residual_ns_exact, 6);
   science.add("total_tau", row.total_tau, 12);
   science.add("total_ppb", row.total_ppb, 6);
+  science.add("alpha_tau_valid", row.alpha_tau_valid);
+  science.add("alpha_tau_sample_count", row.alpha_tau_sample_count);
+  science.add("alpha_tau_interval_count", row.alpha_tau_interval_count);
+  science.add("alpha_tau_last_pps_sequence", row.alpha_tau_last_pps_sequence);
+  science.add("alpha_tau_last_interval_pps_sequence",
+              row.alpha_tau_last_interval_pps_sequence);
+  science.add("alpha_tau", row.alpha_tau, 12);
+  science.add("alpha_tau_ppb", row.alpha_tau_ppb, 6);
+  science.add("alpha_tau_stderr_ppb", row.alpha_tau_stderr_ppb, 6);
+  science.add("alpha_tau_interval_mean_ppb",
+              row.alpha_tau_interval_mean_ppb, 6);
+  science.add("alpha_tau_interval_stderr_ppb",
+              row.alpha_tau_interval_stderr_ppb, 6);
+  science.add("alpha_tau_intercept_ns", row.alpha_tau_intercept_ns);
+  science.add("alpha_tau_detrended_fast_residual_ns",
+              row.alpha_tau_detrended_fast_residual_ns);
 
   science.add("traditional_total_valid", row.traditional_total_valid);
   science.add("traditional_total_sample_count", row.traditional_total_sample_count);
@@ -6875,17 +6965,16 @@ void clocks_beta_pps(void) {
   const uint32_t public_count = (uint32_t)campaign_seconds;
   (void)welfords_advance_non_ocxo_gap_before_row(public_count);
 
-  // OCXO subscriber events are late by definition: the OCXO interval for
-  // reference second N becomes available in the next PPS/VCLOCK publication
-  // opportunity.  Delta residuals therefore use the previous PPS/VCLOCK
-  // one-second interval as the co-temporal reference for the current OCXO
-  // interval, matching raw_cycles --align-ocxo.
-  const delta_residual_reference_t delta_reference_for_ocxo =
-      g_delta_previous_vclock_reference;
+  // Delta residuals are now same-row aligned. PhaseLedger may have its own
+  // lawful suffix lag internally, but Beta must not compare the previous
+  // PPS/VCLOCK interval against the current OCXO interval. Capture the
+  // reference for this public row and use that same identity for OCXO science.
   const delta_residual_reference_t delta_reference_this_row =
       delta_residual_capture_vclock_reference(public_count,
                                               vclock_forensics_valid,
                                               vclock_forensics);
+  const delta_residual_reference_t delta_reference_for_ocxo =
+      delta_reference_this_row;
 
   // ── Delta Cycles canonical science ──
   //
@@ -6927,6 +7016,13 @@ void clocks_beta_pps(void) {
   const clocks_alpha_ocxo_counterledger_snapshot_t& ocxo2_counterledger =
       g_beta_ocxo2_counterledger_row;
 
+  clocks_alpha_tau_snapshot_t ocxo1_alpha_tau{};
+  clocks_alpha_tau_snapshot_t ocxo2_alpha_tau{};
+  const bool ocxo1_alpha_tau_ok = clocks_alpha_ocxo_tau_snapshot(
+      time_clock_id_t::OCXO1, &ocxo1_alpha_tau);
+  const bool ocxo2_alpha_tau_ok = clocks_alpha_ocxo_tau_snapshot(
+      time_clock_id_t::OCXO2, &ocxo2_alpha_tau);
+
   // RECOVER degraded release keeps public GNSS/DWT/VCLOCK time moving after
   // the finite OCXO reattachment timeout.  OCXO science/Welford/servo input
   // stays inert until Alpha proves fresh post-recovery OCXO custody.
@@ -6965,6 +7061,13 @@ void clocks_beta_pps(void) {
                                             public_gnss_ns,
                                             public_ocxo2_ns,
                                             public_count);
+
+  clock_science_apply_alpha_tau(ocxo1_floorline_science,
+                                ocxo1_alpha_tau_ok,
+                                ocxo1_alpha_tau);
+  clock_science_apply_alpha_tau(ocxo2_floorline_science,
+                                ocxo2_alpha_tau_ok,
+                                ocxo2_alpha_tau);
 
   if (recover_degraded_science_hold) {
     recover_reattach_apply_degraded_science_hold(ocxo1_floorline_science);
@@ -10470,6 +10573,13 @@ static FLASHMEM Payload cmd_report_stats(const Payload&) {
                                       campaign_public_dwt_total()));
   publish_freq(p, "vclock", 0.0);
 
+  clocks_alpha_tau_snapshot_t ocxo1_tau{};
+  clocks_alpha_tau_snapshot_t ocxo2_tau{};
+  const bool ocxo1_tau_ok = clocks_alpha_ocxo_tau_snapshot(
+      time_clock_id_t::OCXO1, &ocxo1_tau);
+  const bool ocxo2_tau_ok = clocks_alpha_ocxo_tau_snapshot(
+      time_clock_id_t::OCXO2, &ocxo2_tau);
+
   const bool ocxo1_floorline_total_valid =
       g_floorline_science_ocxo1.clock_interval_total_ns_exact != 0.0 &&
       g_floorline_science_ocxo1.gnss_interval_total_ns_exact != 0.0;
@@ -10485,13 +10595,33 @@ static FLASHMEM Payload cmd_report_stats(const Payload&) {
          g_floorline_science_ocxo2.gnss_interval_total_ns_exact)
       : 1.0;
 
-  publish_freq(p, "ocxo1", campaign_total_ppb_from_tau(ocxo1_floorline_tau));
-  publish_freq(p, "ocxo2", campaign_total_ppb_from_tau(ocxo2_floorline_tau));
-  p.add("frequency_source", clocks_ocxo_counterledger_mode_enabled()
-      ? "COUNTERLEDGER_PPS_CAPTURE"
-      : "DELTA_CYCLES_TOTALS");
-  p.add("ocxo1_frequency_valid", ocxo1_floorline_total_valid);
-  p.add("ocxo2_frequency_valid", ocxo2_floorline_total_valid);
+  publish_freq(p, "ocxo1",
+               (ocxo1_tau_ok && ocxo1_tau.valid)
+                   ? ocxo1_tau.ppb
+                   : campaign_total_ppb_from_tau(ocxo1_floorline_tau));
+  publish_freq(p, "ocxo2",
+               (ocxo2_tau_ok && ocxo2_tau.valid)
+                   ? ocxo2_tau.ppb
+                   : campaign_total_ppb_from_tau(ocxo2_floorline_tau));
+  p.add("frequency_source",
+        ((ocxo1_tau_ok && ocxo1_tau.valid) ||
+         (ocxo2_tau_ok && ocxo2_tau.valid))
+            ? "ALPHA_PHASELEDGER_AFFINE_TAU"
+            : (clocks_ocxo_counterledger_mode_enabled()
+                   ? "COUNTERLEDGER_PPS_CAPTURE"
+                   : "DELTA_CYCLES_TOTALS"));
+  p.add("ocxo1_frequency_valid",
+        (ocxo1_tau_ok && ocxo1_tau.valid) || ocxo1_floorline_total_valid);
+  p.add("ocxo2_frequency_valid",
+        (ocxo2_tau_ok && ocxo2_tau.valid) || ocxo2_floorline_total_valid);
+  p.add("ocxo1_alpha_tau_valid", ocxo1_tau_ok && ocxo1_tau.valid);
+  p.add("ocxo2_alpha_tau_valid", ocxo2_tau_ok && ocxo2_tau.valid);
+  p.add("ocxo1_alpha_tau_samples", ocxo1_tau.sample_count);
+  p.add("ocxo2_alpha_tau_samples", ocxo2_tau.sample_count);
+  p.add("ocxo1_alpha_tau_intervals", ocxo1_tau.interval_count);
+  p.add("ocxo2_alpha_tau_intervals", ocxo2_tau.interval_count);
+  p.add("ocxo1_alpha_tau_stderr_ppb", ocxo1_tau.stderr_ppb, 6);
+  p.add("ocxo2_alpha_tau_stderr_ppb", ocxo2_tau.stderr_ppb, 6);
   p.add("recover_welford_capture_count", g_recover_welford_capture_count);
   p.add("recover_welford_restore_count", g_recover_welford_restore_count);
   p.add("recover_welford_last_restored_lane_count",

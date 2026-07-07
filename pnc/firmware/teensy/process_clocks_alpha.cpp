@@ -2401,6 +2401,242 @@ struct alpha_pps_counterledger_lane_t {
 static alpha_pps_counterledger_lane_t g_ocxo1_pps_counterledger = {};
 static alpha_pps_counterledger_lane_t g_ocxo2_pps_counterledger = {};
 
+
+// ============================================================================
+// Alpha always-on TAU estimator — PhaseLedger slope authority
+// ============================================================================
+// Public OCXO clockface values may have arbitrary launch intercepts. TAU is a
+// slope, so Alpha estimates it continuously from lawful contiguous PhaseLedger
+// refined endpoints and Beta snapshots that mature value at campaign START.
+// SmartZero/Alpha epoch replacement resets this surface; campaign START/STOP
+// deliberately does not.
+
+struct alpha_tau_estimator_t {
+  volatile uint32_t seq = 0;
+  bool     valid = false;
+  uint32_t clock_id = 0;
+  uint32_t reset_count = 0;
+  uint32_t sample_count = 0;
+  uint32_t interval_count = 0;
+  uint32_t reject_count = 0;
+  uint32_t gap_reset_count = 0;
+  uint32_t last_pps_sequence = 0;
+  uint32_t last_interval_pps_sequence = 0;
+  uint64_t first_refined_ns = 0;
+  uint64_t last_refined_ns = 0;
+  int64_t  last_fast_residual_ns = 0;
+
+  double   mean_x = 0.0;
+  double   mean_y = 0.0;
+  double   sxx = 0.0;
+  double   sxy = 0.0;
+  double   syy = 0.0;
+
+  double   interval_mean_ppb = 0.0;
+  double   interval_m2_ppb = 0.0;
+
+  double   tau = 1.0;
+  double   ppb = 0.0;
+  double   stderr_ppb = 0.0;
+  int64_t  intercept_ns = 0;
+};
+
+static alpha_tau_estimator_t g_ocxo1_tau = {};
+static alpha_tau_estimator_t g_ocxo2_tau = {};
+
+static alpha_tau_estimator_t* alpha_tau_store_mut(time_clock_id_t clock) {
+  switch (clock) {
+    case time_clock_id_t::OCXO1: return &g_ocxo1_tau;
+    case time_clock_id_t::OCXO2: return &g_ocxo2_tau;
+    default:                    return nullptr;
+  }
+}
+
+static const alpha_tau_estimator_t* alpha_tau_store(time_clock_id_t clock) {
+  switch (clock) {
+    case time_clock_id_t::OCXO1: return &g_ocxo1_tau;
+    case time_clock_id_t::OCXO2: return &g_ocxo2_tau;
+    default:                    return nullptr;
+  }
+}
+
+static void alpha_tau_reset_lane(alpha_tau_estimator_t& s,
+                                 time_clock_id_t clock) {
+  const uint32_t prior_reset_count = s.reset_count;
+  s.seq++;
+  clocks_alpha_dmb();
+  s = alpha_tau_estimator_t{};
+  s.clock_id = (uint32_t)((uint8_t)clock);
+  s.reset_count = prior_reset_count + 1U;
+  clocks_alpha_dmb();
+  s.seq++;
+}
+
+static void alpha_tau_reset_all(void) {
+  alpha_tau_reset_lane(g_ocxo1_tau, time_clock_id_t::OCXO1);
+  alpha_tau_reset_lane(g_ocxo2_tau, time_clock_id_t::OCXO2);
+}
+
+static void alpha_tau_recompute(alpha_tau_estimator_t& s) {
+  if (s.sample_count >= 2U && s.sxx > 0.0) {
+    const double slope_ns_per_s = s.sxy / s.sxx;
+    s.tau = slope_ns_per_s / (double)NS_PER_SECOND_U64;
+    s.ppb = slope_ns_per_s - (double)NS_PER_SECOND_U64;
+    const double intercept = s.mean_y - slope_ns_per_s * s.mean_x;
+    s.intercept_ns = (intercept >= 0.0)
+        ? (int64_t)(intercept + 0.5)
+        : (int64_t)(intercept - 0.5);
+
+    if (s.sample_count >= 3U) {
+      const double explained = (s.sxy * s.sxy) / s.sxx;
+      double sse = s.syy - explained;
+      if (sse < 0.0) sse = 0.0;
+      const double sigma2 = sse / (double)(s.sample_count - 2U);
+      s.stderr_ppb = sqrt(sigma2 / s.sxx);
+    } else {
+      s.stderr_ppb = 0.0;
+    }
+    s.valid = s.interval_count >= 1U;
+  } else {
+    s.valid = false;
+    s.tau = 1.0;
+    s.ppb = 0.0;
+    s.stderr_ppb = 0.0;
+    s.intercept_ns = 0;
+  }
+}
+
+static void alpha_tau_interval_update(alpha_tau_estimator_t& s,
+                                      double interval_ppb) {
+  s.interval_count++;
+  const double n = (double)s.interval_count;
+  const double d1 = interval_ppb - s.interval_mean_ppb;
+  s.interval_mean_ppb += d1 / n;
+  const double d2 = interval_ppb - s.interval_mean_ppb;
+  s.interval_m2_ppb += d1 * d2;
+}
+
+static void alpha_tau_note_refined_endpoint(time_clock_id_t clock,
+                                            uint32_t pps_sequence,
+                                            uint64_t refined_ns,
+                                            bool interval_valid,
+                                            uint64_t refined_interval_ns,
+                                            int64_t refined_fast_residual_ns) {
+  alpha_tau_estimator_t* s = alpha_tau_store_mut(clock);
+  if (!s || pps_sequence == 0U || refined_ns == 0ULL) return;
+
+  s->seq++;
+  clocks_alpha_dmb();
+
+  const bool had_prior = s->sample_count != 0U;
+  const bool contiguous = !had_prior ||
+      pps_sequence == (uint32_t)(s->last_pps_sequence + 1U);
+  const bool monotonic = !had_prior || refined_ns >= s->last_refined_ns;
+
+  if (had_prior && (!contiguous || !monotonic)) {
+    const uint32_t reset_count = s->reset_count;
+    const uint32_t gap_count = s->gap_reset_count + 1U;
+    const uint32_t reject_count = s->reject_count + 1U;
+    const uint32_t seq = s->seq;
+    *s = alpha_tau_estimator_t{};
+    s->seq = seq;
+    s->clock_id = (uint32_t)((uint8_t)clock);
+    s->reset_count = reset_count;
+    s->gap_reset_count = gap_count;
+    s->reject_count = reject_count;
+  }
+
+  if (s->sample_count == 0U) {
+    s->first_refined_ns = refined_ns;
+  } else if (interval_valid && refined_interval_ns != 0ULL) {
+    s->last_interval_pps_sequence = pps_sequence;
+    s->last_fast_residual_ns = refined_fast_residual_ns;
+    alpha_tau_interval_update(*s, (double)refined_fast_residual_ns);
+  } else {
+    s->reject_count++;
+  }
+
+  const double x = (double)pps_sequence;
+  const double y = (double)refined_ns;
+  s->sample_count++;
+  const double n = (double)s->sample_count;
+  const double dx = x - s->mean_x;
+  const double dy = y - s->mean_y;
+  s->mean_x += dx / n;
+  s->mean_y += dy / n;
+  s->sxx += dx * (x - s->mean_x);
+  s->sxy += dx * (y - s->mean_y);
+  s->syy += dy * (y - s->mean_y);
+  s->last_pps_sequence = pps_sequence;
+  s->last_refined_ns = refined_ns;
+  alpha_tau_recompute(*s);
+
+  clocks_alpha_dmb();
+  s->seq++;
+}
+
+static double alpha_tau_interval_stddev(const alpha_tau_estimator_t& s) {
+  return (s.interval_count >= 2U)
+      ? sqrt(s.interval_m2_ppb / (double)(s.interval_count - 1U))
+      : 0.0;
+}
+
+static double alpha_tau_interval_stderr(const alpha_tau_estimator_t& s) {
+  return (s.interval_count >= 2U)
+      ? alpha_tau_interval_stddev(s) / sqrt((double)s.interval_count)
+      : 0.0;
+}
+
+FLASHMEM bool clocks_alpha_ocxo_tau_snapshot(time_clock_id_t clock,
+                                             clocks_alpha_tau_snapshot_t* out) {
+  if (!out) return false;
+  *out = clocks_alpha_tau_snapshot_t{};
+
+  const alpha_tau_estimator_t* s = alpha_tau_store(clock);
+  if (!s) return false;
+
+  for (int attempt = 0; attempt < 4; attempt++) {
+    const uint32_t seq1 = s->seq;
+    clocks_alpha_dmb();
+
+    clocks_alpha_tau_snapshot_t local{};
+    local.valid = s->valid;
+    local.clock_id = s->clock_id;
+    local.epoch_sequence = clocks_alpha_epoch_sequence();
+    local.reset_count = s->reset_count;
+    local.sample_count = s->sample_count;
+    local.interval_count = s->interval_count;
+    local.reject_count = s->reject_count;
+    local.gap_reset_count = s->gap_reset_count;
+    local.last_pps_sequence = s->last_pps_sequence;
+    local.last_interval_pps_sequence = s->last_interval_pps_sequence;
+    local.first_refined_ns = s->first_refined_ns;
+    local.last_refined_ns = s->last_refined_ns;
+    local.last_fast_residual_ns = s->last_fast_residual_ns;
+    local.tau = s->tau;
+    local.ppb = s->ppb;
+    local.stderr_ppb = s->stderr_ppb;
+    local.interval_mean_ppb = s->interval_mean_ppb;
+    local.interval_stddev_ppb = alpha_tau_interval_stddev(*s);
+    local.interval_stderr_ppb = alpha_tau_interval_stderr(*s);
+    local.intercept_ns = s->intercept_ns;
+
+    clocks_alpha_dmb();
+    const uint32_t seq2 = s->seq;
+    if (seq1 == seq2 && (seq1 & 1u) == 0u) {
+      *out = local;
+      return local.valid;
+    }
+  }
+
+  return false;
+}
+
+FLASHMEM bool clocks_alpha_tau_snapshot(time_clock_id_t clock,
+                                        clocks_alpha_tau_snapshot_t* out) {
+  return clocks_alpha_ocxo_tau_snapshot(clock, out);
+}
+
 static void alpha_counterledger_reset_lane(alpha_pps_counterledger_lane_t& s) {
   s = alpha_pps_counterledger_lane_t{};
 }
@@ -2408,6 +2644,7 @@ static void alpha_counterledger_reset_lane(alpha_pps_counterledger_lane_t& s) {
 static void alpha_counterledger_reset_all(void) {
   alpha_counterledger_reset_lane(g_ocxo1_pps_counterledger);
   alpha_counterledger_reset_lane(g_ocxo2_pps_counterledger);
+  alpha_tau_reset_all();
 }
 
 static bool alpha_counterledger_epoch_ready(void) {
@@ -2621,6 +2858,7 @@ static void alpha_counterledger_reject_interval(
 }
 
 static bool alpha_counterledger_apply_pps_sample(
+    time_clock_id_t clock,
     alpha_pps_counterledger_lane_t& s,
     uint32_t pps_sequence,
     uint32_t pps_dwt_at_edge,
@@ -2737,6 +2975,15 @@ static bool alpha_counterledger_apply_pps_sample(
                                            s.refined_interval_valid,
                                            s.refined_interval_ns,
                                            s.refined_fast_residual_ns);
+  }
+
+  if (s.refined_valid) {
+    alpha_tau_note_refined_endpoint(clock,
+                                    s.refined_phase_pps_sequence,
+                                    s.refined_ns,
+                                    s.refined_interval_valid,
+                                    s.refined_interval_ns,
+                                    s.refined_fast_residual_ns);
   }
 
   if (out_ns) *out_ns = s.refined_valid ? s.refined_ns : s.ns;
@@ -3467,6 +3714,7 @@ static FLASHMEM void clocks_alpha_cold_diagnostics_init(void) {
   g_ocxo2_pps_projection = alpha_ocxo_pps_projection_store_t{};
   g_ocxo1_pps_projection_guard = alpha_ocxo_pps_projection_guard_t{};
   g_ocxo2_pps_projection_guard = alpha_ocxo_pps_projection_guard_t{};
+  alpha_tau_reset_all();
 }
 
 static void alpha_ocxo_edge_history_install_zero(time_clock_id_t clock,
@@ -7097,12 +7345,14 @@ static bool alpha_sample_all_clocks_at_pps_vclock(const pps_edge_snapshot_t& sna
         cap.all_lanes_capture_valid &&
         cap.sequence == snap.sequence;
     const bool applied = counterledger_capture_ready &&
-        alpha_counterledger_apply_pps_sample(g_ocxo1_pps_counterledger,
+        alpha_counterledger_apply_pps_sample(time_clock_id_t::OCXO1,
+                                             g_ocxo1_pps_counterledger,
                                              snap.sequence,
                                              snap.physical_pps_dwt_normalized_at_edge,
                                              cap.ocxo1_counter32,
                                              &ocxo1_counterledger_ns) &&
-        alpha_counterledger_apply_pps_sample(g_ocxo2_pps_counterledger,
+        alpha_counterledger_apply_pps_sample(time_clock_id_t::OCXO2,
+                                             g_ocxo2_pps_counterledger,
                                              snap.sequence,
                                              snap.physical_pps_dwt_normalized_at_edge,
                                              cap.ocxo2_counter32,

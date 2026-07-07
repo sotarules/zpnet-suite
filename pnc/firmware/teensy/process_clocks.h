@@ -144,3 +144,43 @@ uint32_t clocks_dwt_cycles_per_gnss_second(void);
 bool clocks_dwt_calibration_valid(void);
 
 
+// -----------------------------------------------------------------------------
+// Alpha always-on OCXO TAU estimator
+// -----------------------------------------------------------------------------
+// Alpha estimates OCXO frequency continuously from lawful PhaseLedger refined
+// endpoints. This surface is reset by SmartZero/Alpha epoch replacement, not by
+// campaign START/STOP, so Beta can publish a mature frequency estimate at the
+// first public campaign row instead of rediscovering TAU from a launch-origin
+// quotient.
+#ifndef CLOCKS_ALPHA_TAU_SNAPSHOT_T_DEFINED
+#define CLOCKS_ALPHA_TAU_SNAPSHOT_T_DEFINED
+struct clocks_alpha_tau_snapshot_t {
+  bool     valid = false;
+  uint32_t clock_id = 0;
+  uint32_t epoch_sequence = 0;
+  uint32_t reset_count = 0;
+  uint32_t sample_count = 0;
+  uint32_t interval_count = 0;
+  uint32_t reject_count = 0;
+  uint32_t gap_reset_count = 0;
+  uint32_t last_pps_sequence = 0;
+  uint32_t last_interval_pps_sequence = 0;
+  uint64_t first_refined_ns = 0;
+  uint64_t last_refined_ns = 0;
+  int64_t  last_fast_residual_ns = 0;
+  double   tau = 1.0;
+  double   ppb = 0.0;
+  double   stderr_ppb = 0.0;
+  double   interval_mean_ppb = 0.0;
+  double   interval_stddev_ppb = 0.0;
+  double   interval_stderr_ppb = 0.0;
+  int64_t  intercept_ns = 0;
+};
+#endif
+
+bool clocks_alpha_ocxo_tau_snapshot(time_clock_id_t clock,
+                                    clocks_alpha_tau_snapshot_t* out);
+
+// Compatibility alias; equivalent to clocks_alpha_ocxo_tau_snapshot().
+bool clocks_alpha_tau_snapshot(time_clock_id_t clock,
+                               clocks_alpha_tau_snapshot_t* out);
