@@ -1,5 +1,5 @@
 """
-ZPNet Campaign Analyzer — v14 (TIMEBASE_V3 / TIMEBASE_FRAGMENT_V4)
+ZPNet Campaign Analyzer — v16 (TIMEBASE_V3 / TIMEBASE_FRAGMENT_V4)
 
 Rewritten for the current paired TIMEBASE architecture:
 
@@ -30,8 +30,11 @@ Recovery doctrine:
     • Welford cardinality is segment-aware: START private PPS0 lets DWT/OCXO
       enter public PPS1 with n=1, while each RECOVER boundary consumes one
       non-sample bookend for DWT/OCXO before science resumes
-    • stats.<lane>.tau/.ppb must match the current campaign clockface ledger
-      ratio and the compact science total_* fields
+    • stats.<lane>.tau/.ppb must match the continuity-aligned campaign
+      clockface ledger ratio and the compact science total_* fields
+    • OCXO recovery must preserve the panel-facing total TAU/PPB experience:
+      a recovery boundary may skip rows, but it must not introduce a visible
+      OCXO clockface-ratio step
 
 Usage:
     python -m zpnet.tests.campaign_analyzer <campaign_name>
@@ -61,10 +64,12 @@ TAU_ABSOLUTE_DEVIATION_THRESHOLD = PPB_ABSOLUTE_THRESHOLD / 1.0e9
 WELFORD_STDDEV_ALARM = 500.0
 WELFORD_N_TOLERANCE = 0
 
-# Recovery projection tolerances.  These are deliberately small enough to catch
-# a broken continuation transform, but large enough to tolerate a few suppressed
-# warmup seconds after RECOVER.
+# Recovery projection tolerances.  The broad ns tolerance catches gross ledger
+# corruption; the ppb-continuity tolerance catches the subtler user-visible
+# problem where OCXO evidence reattaches cleanly but the panel-facing total
+# TAU/PPB appears to restart from a fresh intercept.
 RECOVERY_OCXO_PROJECTION_ALARM_NS = 5_000
+RECOVERY_OCXO_CONTINUITY_PPB_ALARM = 0.25
 RECOVERY_DWT_PROJECTION_ALARM_CYCLES = 100_000
 
 
@@ -419,6 +424,11 @@ def _science_int(row: Dict[str, Any], prefix: str, field: str) -> Optional[int]:
     return _first_int(_science(row, prefix).get(field))
 
 
+def _science_str(row: Dict[str, Any], prefix: str, field: str) -> Optional[str]:
+    value = _science(row, prefix).get(field)
+    return None if value is None else str(value)
+
+
 def _campaign_total_tau(row: Dict[str, Any], prefix: str) -> Optional[float]:
     gnss = _gnss_ns(row)
     if gnss is None or gnss <= 0:
@@ -463,6 +473,38 @@ def _row_recovery_status(row: Dict[str, Any]) -> Dict[str, Any]:
         "degraded_active": bool(_to_bool(frag.get("recover_degraded_active"))),
         "degraded_science_hold": bool(_to_bool(frag.get("recover_degraded_science_hold"))),
     }
+
+
+def _recovery_continuity_forensics(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Return RECOVER presentation-continuity proof from TIMEBASE_FORENSICS.
+
+    New firmware publishes this as flat rc_* fields to avoid Payload
+    add_object_json() pressure.  The nested object fallback is retained for the
+    short-lived v15 experiment.
+    """
+    f = _forensics(row)
+    rc = _path_get(f, "recovery_continuity")
+    if isinstance(rc, dict):
+        return rc
+    if f.get("rc_schema"):
+        return {
+            "schema": f.get("rc_schema"),
+            "aligned": f.get("rc_aligned"),
+            "public_count": f.get("rc_public_count"),
+            "align_count": f.get("rc_align_count"),
+            "requested_public_count": f.get("rc_requested_public_count"),
+            "reason": f.get("rc_reason"),
+            "ocxo1_correction_ns": f.get("rc_o1_correction_ns"),
+            "ocxo2_correction_ns": f.get("rc_o2_correction_ns"),
+        }
+    return {}
+
+
+def _recovery_continuity_lane_correction(row: Dict[str, Any], prefix: str) -> Optional[int]:
+    rc = _recovery_continuity_forensics(row)
+    if not rc:
+        return None
+    return _first_int(rc.get(f"{prefix}_correction_ns"))
 
 
 def _ocxo_science_clean(row: Dict[str, Any], prefix: str) -> bool:
@@ -583,7 +625,7 @@ def print_campaign_overview(rows: List[Dict[str, Any]], recovery_boundaries: Set
     secs = campaign_seconds % 60
 
     print("=" * 78)
-    print(f"CAMPAIGN ANALYSIS: {rows[0].get('campaign', '?')}  (v14 TIMEBASE_V3/FRAGMENT_V4)")
+    print(f"CAMPAIGN ANALYSIS: {rows[0].get('campaign', '?')}  (v16 TIMEBASE_V3/FRAGMENT_V4)")
     print("=" * 78)
     print()
     print(f"  Time range:        {first_ts}")
@@ -692,7 +734,17 @@ def analyze_recovery_projection(rows: List[Dict[str, Any]], recovery_boundaries:
                 continue
             projected = (curr_gnss * prev_v) // prev_gnss
             error = curr_v - projected
-            print(f"    {label}: projected={projected:,}  actual={curr_v:,}  error={error:+,d} {unit}")
+            if label.startswith("OCXO") and curr_gnss > 0:
+                implied_ppb_step = (float(error) / float(curr_gnss)) * 1.0e9
+                print(f"    {label}: projected={projected:,}  actual={curr_v:,}  "
+                      f"error={error:+,d} {unit}  implied_ppb_step={implied_ppb_step:+.3f}")
+                if abs(implied_ppb_step) > RECOVERY_OCXO_CONTINUITY_PPB_ALARM:
+                    anomalies.append(
+                        f"recovery {curr_pps}: {label} visible TAU/PPB continuity step "
+                        f"{implied_ppb_step:+.3f} ppb from {error:+d} ns projection error"
+                    )
+            else:
+                print(f"    {label}: projected={projected:,}  actual={curr_v:,}  error={error:+,d} {unit}")
             if abs(error) > tol:
                 anomalies.append(f"recovery {curr_pps}: {label} projection error {error:+d} {unit}")
 
@@ -736,10 +788,25 @@ def analyze_recovery_cleanliness(rows: List[Dict[str, Any]], recovery_boundaries
         if status.get("degraded_active") or status.get("degraded_science_hold"):
             anomalies.append(f"recovery {curr_pps}: degraded recovery row persisted")
 
+        rc = _recovery_continuity_forensics(curr)
+        if rc:
+            print(f"    recovery continuity proof:  present aligned={_to_bool(rc.get('aligned'))} reason={rc.get('reason')}")
+        else:
+            print("    recovery continuity proof:  not present in TIMEBASE_FORENSICS")
+
         for label, prefix in [("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")]:
             clean = _ocxo_science_clean(curr, prefix)
             science = _science(curr, prefix)
+            ratio_source = science.get("total_ratio_source") or "PUBLIC_CLOCK_NS_OVER_GNSS_NS"
+            continuity_correction = _recovery_continuity_lane_correction(curr, prefix)
             print(f"    {label} clean science:           {clean}")
+            print(f"    {label} total ratio source:      {ratio_source}")
+            if continuity_correction is not None:
+                print(f"    {label} recovery correction_ns:  {continuity_correction:+d}")
+            if ratio_source == "ALPHA_PHASELEDGER_AFFINE_TAU":
+                anomalies.append(
+                    f"recovery {curr_pps}: {label} panel TAU/PPB is AlphaTau, not public-ledger continuity"
+                )
             if not clean:
                 anomalies.append(
                     f"recovery {curr_pps}: {label} science not clean "
@@ -1213,7 +1280,7 @@ def analyze_ppb_sanity(rows: List[Dict[str, Any]], recovery_boundaries: Set[int]
     anomalies: List[str] = []
     print()
     print("-" * 78)
-    print(f"TAU / PPB SANITY CHECK (threshold: ±{PPB_ABSOLUTE_THRESHOLD:,} ppb)")
+    print(f"TAU / PPB SANITY CHECK (threshold: ±{PPB_ABSOLUTE_THRESHOLD:,} ppb; recovery continuity ±{RECOVERY_OCXO_CONTINUITY_PPB_ALARM:.2f} ppb)")
     print("-" * 78)
 
     for label, prefix in [("DWT", "dwt"), ("VCLOCK", "vclock"), ("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")]:
