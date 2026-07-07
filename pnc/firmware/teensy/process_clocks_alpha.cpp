@@ -2293,6 +2293,18 @@ static constexpr uint32_t ALPHA_COUNTERLEDGER_PHASE_SOURCE_NONE = 0U;
 static constexpr uint32_t ALPHA_COUNTERLEDGER_PHASE_SOURCE_PHYSICAL_PPS_TO_OBSERVED_OCXO_EDGE = 1U;
 static constexpr uint32_t ALPHA_COUNTERLEDGER_PHASE_NEAR_BOUNDARY_NS = 8U;
 
+// CounterLedger is a PPS-sampled 10 MHz integer rail.  One legal contiguous
+// PPS interval should be very close to 10,000,000 ticks; keep the admission
+// band deliberately broad so normal ppm/ppb physics passes while stale,
+// duplicated, or mis-associated captures such as 0, 1, or 36k ticks cannot
+// author interval science or poison recovery reattachment.
+static constexpr uint32_t ALPHA_COUNTERLEDGER_EXPECTED_INTERVAL_TICKS =
+    (uint32_t)VCLOCK_COUNTS_PER_SECOND;
+static constexpr uint32_t ALPHA_COUNTERLEDGER_MIN_PLAUSIBLE_INTERVAL_TICKS =
+    ALPHA_COUNTERLEDGER_EXPECTED_INTERVAL_TICKS - 1000000U;
+static constexpr uint32_t ALPHA_COUNTERLEDGER_MAX_PLAUSIBLE_INTERVAL_TICKS =
+    ALPHA_COUNTERLEDGER_EXPECTED_INTERVAL_TICKS + 1000000U;
+
 struct alpha_pps_counterledger_lane_t {
   bool     initialized = false;
   bool     interval_valid = false;
@@ -2307,6 +2319,9 @@ struct alpha_pps_counterledger_lane_t {
   int64_t  last_fast_residual_ns = 0;
   uint32_t update_count = 0;
   uint32_t interval_gap_count = 0;
+  uint32_t interval_implausible_count = 0;
+  uint32_t last_implausible_delta_ticks = 0;
+  uint32_t recover_reprime_count = 0;
 
   bool     phase_pending = false;
   uint32_t pending_phase_pps_sequence = 0;
@@ -2454,6 +2469,59 @@ static void alpha_counterledger_reset_current_block_for_gap(
   alpha_counterledger_reset_current_block(s);
 }
 
+static void alpha_counterledger_reprime_lane_for_recover(
+    alpha_pps_counterledger_lane_t& s) {
+  if (!s.initialized) return;
+
+  // Preserve the absolute tick ledger and zero-offset authority.  Cut only
+  // interval/phase custody so the first post-recovery PPS sample becomes a
+  // seed, and the next clean samples must prove fresh CounterLedger +
+  // PhaseLedger continuity before RECOVER reattachment can clear.
+  s.sample_count = 0;
+  s.pps_sequence = 0;
+  s.interval_valid = false;
+  s.last_delta_ticks = 0;
+  s.last_interval_ns = 0;
+  s.last_fast_residual_ns = 0;
+
+  s.phase_pending = false;
+  s.pending_phase_pps_sequence = 0;
+  s.pending_phase_pps_dwt_at_edge = 0;
+  s.phase_valid = false;
+  s.phase_near_boundary = false;
+  s.phase_source_id = ALPHA_COUNTERLEDGER_PHASE_SOURCE_NONE;
+  s.phase_pps_sequence = 0;
+  s.phase_pps_dwt_at_edge = 0;
+  s.phase_prev_ocxo_dwt_at_edge = 0;
+  s.phase_next_ocxo_dwt_at_edge = 0;
+  s.phase_ocxo_interval_cycles = 0;
+  s.phase_pps_delta_cycles = 0;
+  s.phase_after_last_00_ns = 0;
+  s.phase_to_next_00_ns = 0;
+  s.phase_raw_delta_ns = 0;
+  s.phase_unwrapped_delta_ns = 0;
+  s.phase_unwrapped_carry_ticks = 0;
+  s.phase_wrap_event = false;
+
+  // Keep refined_ns as a last-known public-adjacent coordinate for offset
+  // recovery, but force a new refined value/interval proof after fresh phase
+  // data.
+  s.refined_valid = false;
+  s.refined_phase_pps_sequence = 0;
+  s.last_refined_phase_pps_sequence = 0;
+  s.refined_interval_valid = false;
+  s.refined_interval_ns = 0;
+  s.refined_fast_residual_ns = 0;
+
+  alpha_counterledger_reset_current_block_for_gap(s);
+  s.recover_reprime_count++;
+}
+
+static void alpha_counterledger_reprime_all_for_recover(void) {
+  alpha_counterledger_reprime_lane_for_recover(g_ocxo1_pps_counterledger);
+  alpha_counterledger_reprime_lane_for_recover(g_ocxo2_pps_counterledger);
+}
+
 static void alpha_counterledger_add_block_interval(
     alpha_pps_counterledger_lane_t& s,
     uint32_t previous_pps_sequence,
@@ -2539,6 +2607,19 @@ static uint64_t alpha_phaseledger_refined_ns_with_carry(
   return (out >= carry_ns) ? (out - carry_ns) : 0ULL;
 }
 
+static bool alpha_counterledger_interval_plausible(uint32_t delta_ticks) {
+  return delta_ticks >= ALPHA_COUNTERLEDGER_MIN_PLAUSIBLE_INTERVAL_TICKS &&
+         delta_ticks <= ALPHA_COUNTERLEDGER_MAX_PLAUSIBLE_INTERVAL_TICKS;
+}
+
+static void alpha_counterledger_reject_interval(
+    alpha_pps_counterledger_lane_t& s,
+    uint32_t delta_ticks) {
+  s.interval_implausible_count++;
+  s.last_implausible_delta_ticks = delta_ticks;
+  alpha_counterledger_reset_current_block_for_gap(s);
+}
+
 static bool alpha_counterledger_apply_pps_sample(
     alpha_pps_counterledger_lane_t& s,
     uint32_t pps_sequence,
@@ -2553,13 +2634,29 @@ static bool alpha_counterledger_apply_pps_sample(
   const bool contiguous = had_prior_sample &&
       pps_sequence == (uint32_t)(previous_pps_sequence + 1U);
   const uint32_t delta_ticks = sampled_counter32 - s.last_counter32;
+  const bool plausible_interval =
+      !had_prior_sample || !contiguous ||
+      alpha_counterledger_interval_plausible(delta_ticks);
+  const bool admissible_interval =
+      had_prior_sample && contiguous && plausible_interval;
 
   const bool had_prior_refined = s.refined_valid;
   const uint64_t previous_refined_ns = s.refined_ns;
   const uint32_t previous_refined_phase_pps_sequence =
       s.refined_phase_pps_sequence;
 
-  s.ticks64 += (uint64_t)delta_ticks;
+  // Advance the long integer ledger on the first post-zero/post-recover seed,
+  // on lawful contiguous intervals, and across explicit sequence gaps where
+  // the hardware counter delta is the only absolute elapsed-time witness.
+  // Do not advance on a contiguous-but-impossible interval: that is a stale or
+  // mis-associated PPS capture and must become a re-seed, not a 0/1/36k tick
+  // science interval.
+  if (!had_prior_sample || admissible_interval || !contiguous) {
+    s.ticks64 += (uint64_t)delta_ticks;
+  } else {
+    alpha_counterledger_reject_interval(s, delta_ticks);
+  }
+
   s.last_counter32 = sampled_counter32;
   s.pps_sequence = pps_sequence;
   s.sample_count++;
@@ -2610,10 +2707,11 @@ static bool alpha_counterledger_apply_pps_sample(
     }
   }
 
-  // The first sample after SmartZero establishes the PPS-sampled bookend.
-  // It is not a one-second interval.  Likewise, if a packet was missed, do
-  // not turn the multi-second catch-up into a false +/-1e9 ns residual.
-  s.interval_valid = had_prior_sample && contiguous;
+  // The first sample after SmartZero/RECOVER establishes the PPS-sampled
+  // bookend.  Likewise, if a packet was missed or the contiguous interval is
+  // physically impossible, do not turn the catch-up/stale sample into a false
+  // +/-1e9 ns residual or a valid recovery reattachment proof.
+  s.interval_valid = admissible_interval;
   if (!s.interval_valid) {
     if (had_prior_sample && !contiguous) {
       s.interval_gap_count++;
@@ -3998,6 +4096,11 @@ bool clocks_alpha_ocxo_counterledger_snapshot(
   out->sequence_mismatch_count = s->sequence_mismatch_count;
   out->all_lanes_invalid_count = s->all_lanes_invalid_count;
   out->interval_gap_count = s->interval_gap_count;
+  out->interval_implausible_count = s->interval_implausible_count;
+  out->last_implausible_delta_ticks = s->last_implausible_delta_ticks;
+  out->recover_reprime_count = s->recover_reprime_count;
+  out->plausible_min_delta_ticks = ALPHA_COUNTERLEDGER_MIN_PLAUSIBLE_INTERVAL_TICKS;
+  out->plausible_max_delta_ticks = ALPHA_COUNTERLEDGER_MAX_PLAUSIBLE_INTERVAL_TICKS;
 
   out->block_valid = s->block_valid && s->block_interval_count != 0U;
   out->block_window_seconds = CLOCKS_OCXO_COUNTERLEDGER_BLOCK_SECONDS;
@@ -5930,6 +6033,7 @@ void clocks_alpha_recover_reprime_ocxo_state(void) {
 
   alpha_measured_ns_reset_all();          // bridge anchors + pending OCXO edges
   alpha_ocxo_pps_projection_reset_all();  // PPS-row OCXO projection history
+  alpha_counterledger_reprime_all_for_recover();
 
   g_ocxo1_measurement = clock_measurement_t{};
   g_ocxo2_measurement = clock_measurement_t{};
@@ -6118,6 +6222,16 @@ bool clocks_alpha_ocxo_recover_reattach_snapshot(
     r.counterledger_phase_pps_sequence = ledger ? ledger->phase_pps_sequence : 0U;
     r.counterledger_phase_lag_pps = phase_lag;
     r.counterledger_last_delta_ticks = ledger ? ledger->last_delta_ticks : 0U;
+    r.counterledger_interval_implausible_count =
+        ledger ? ledger->interval_implausible_count : 0U;
+    r.counterledger_last_implausible_delta_ticks =
+        ledger ? ledger->last_implausible_delta_ticks : 0U;
+    r.counterledger_recover_reprime_count =
+        ledger ? ledger->recover_reprime_count : 0U;
+    r.counterledger_plausible_min_delta_ticks =
+        ALPHA_COUNTERLEDGER_MIN_PLAUSIBLE_INTERVAL_TICKS;
+    r.counterledger_plausible_max_delta_ticks =
+        ALPHA_COUNTERLEDGER_MAX_PLAUSIBLE_INTERVAL_TICKS;
     r.counterledger_ns = ledger ? ledger->ns : 0ULL;
     r.counterledger_interval_ns = ledger ? ledger->last_interval_ns : 0ULL;
     r.counterledger_refined_ns = ledger ? ledger->refined_ns : 0ULL;

@@ -1320,17 +1320,6 @@ static pps_interval_residuals_t floorline_interval_residuals_update(
   pps_interval_residuals_t r{};
   r.public_count = public_count;
 
-  if (g_science_residual_quarantine_remaining != 0U) {
-    g_science_residual_quarantine_remaining--;
-    g_science_residual_quarantine_consumed_count++;
-    g_science_residual_quarantine_last_public_count = public_count;
-    clocks_beta_feature_set_cached("SCIENCE_RESIDUALS",
-                                   g_clocks_feature_science_residuals,
-                                   system_feature_status_t::INITIALIZING,
-                                   true);
-    return r;
-  }
-
   r.gnss_interval_ns = CLOCKS_BETA_NS_PER_SECOND;
 
   if (ocxo1_science.valid) {
@@ -1869,7 +1858,10 @@ static void campaign_warmup_begin(campaign_warmup_mode_t mode) {
     g_campaign_warmup_mode = campaign_warmup_mode_t::NONE;
     g_campaign_warmup_remaining = 0;
     campaign_start_prologue_reset("recover_no_prologue");
-    campaign_public_offsets_reset_for_recover();
+    // RECOVER offsets are installed in the RECOVER gate before Alpha re-primes
+    // OCXO/CounterLedger custody.  Do not recompute them here after the raw
+    // CounterLedger lanes have intentionally been converted back into seed
+    // state.
     recover_reattach_begin();
     return;
   }
@@ -2110,6 +2102,12 @@ static FLASHMEM bool recover_reattach_degraded_science_hold_active(void) {
   if (recover_reattach_refresh_ready()) {
     g_recover_reattach_degraded_active = false;
     g_recover_reattach_degraded_clear_count++;
+    // The row that proves reattachment is still a boundary row: it may carry
+    // PhaseLedger/CounterLedger state formed across the degraded window.
+    // Start a real science quarantine here so Welford/PPB/servo do not consume
+    // the first reattachment transient.
+    pps_interval_residuals_begin_recover_quarantine(
+        CLOCKS_RECOVER_SCIENCE_QUARANTINE_ROWS);
     recover_reattach_set_reason("ocxo_reattach_ready_after_degraded_release");
     return false;
   }
@@ -2125,7 +2123,7 @@ static FLASHMEM bool recover_reattach_degraded_science_hold_active(void) {
   return true;
 }
 
-static FLASHMEM void recover_reattach_apply_degraded_science_hold(clock_science_row_t& row) {
+static FLASHMEM void ocxo_science_row_suppress_for_recover_hold(clock_science_row_t& row) {
   row.valid = false;
   row.antecedents_complete = false;
 
@@ -2148,8 +2146,36 @@ static FLASHMEM void recover_reattach_apply_degraded_science_hold(clock_science_
   row.total_ppb = 0.0;
   row.total_fast_residual_ns = 0LL;
   row.total_fast_residual_ns_exact = 0.0;
+}
 
+static FLASHMEM void recover_reattach_apply_degraded_science_hold(clock_science_row_t& row) {
+  ocxo_science_row_suppress_for_recover_hold(row);
   g_recover_reattach_degraded_science_suppressed_count++;
+}
+
+static FLASHMEM bool science_residual_quarantine_apply(
+    uint32_t public_count,
+    clock_science_row_t& ocxo1_science,
+    clock_science_row_t& ocxo2_science) {
+  if (g_science_residual_quarantine_remaining == 0U) {
+    return false;
+  }
+
+  g_science_residual_quarantine_remaining--;
+  g_science_residual_quarantine_consumed_count++;
+  g_science_residual_quarantine_last_public_count = public_count;
+
+  // This quarantine is supposed to protect the actual OCXO science row, not
+  // merely the legacy pps_residual compatibility object.  Keep Welford, PPB,
+  // and servo input inert while recovery/reattach bookends settle.
+  ocxo_science_row_suppress_for_recover_hold(ocxo1_science);
+  ocxo_science_row_suppress_for_recover_hold(ocxo2_science);
+
+  clocks_beta_feature_set_cached("SCIENCE_RESIDUALS",
+                                 g_clocks_feature_science_residuals,
+                                 system_feature_status_t::INITIALIZING,
+                                 true);
+  return true;
 }
 
 // ============================================================================
@@ -2324,40 +2350,56 @@ static bool welford_advance_missing_to_n(welford_t& w, uint64_t target_n) {
   return true;
 }
 
-static uint32_t welfords_advance_missing_gap_before_row(uint32_t public_count) {
-  // TIMEBASE gaps are canonical campaign seconds.  When RECOVER projects the
-  // ledgers across a down-time gap, those missing one-second rows must be
-  // represented in N before the next observed sample is folded in.  Preserve
-  // the recovered mean/stddev shape and advance only the campaign sample
-  // cardinality; the live observed row will then perform the ordinary
-  // Welford update.
-  //
-  // Per-row clocks update once per published TIMEBASE row:
-  //   DWT, VCLOCK, OCXO, DAC -> N == public_count after this row.
-  // Delta Cycles publishes the OCXO interval one TIMEBASE row after the
-  // reference interval it compares against, so OCXO Welford cardinality
-  // intentionally lags public_count by one.
+static void welfords_note_gap_advance(uint32_t public_count,
+                                      uint32_t advanced) {
+  if (advanced == 0U) return;
+  g_welford_gap_advance_count++;
+  g_welford_gap_advance_last_public_count = public_count;
+  g_welford_gap_advance_last_lane_count = advanced;
+}
+
+static uint32_t welfords_advance_non_ocxo_gap_before_row(uint32_t public_count) {
+  // TIMEBASE gaps are canonical campaign seconds.  DWT/VCLOCK/DAC surfaces
+  // remain valid during recovery because public GNSS/DWT/VCLOCK time and DAC
+  // intent continue to advance.  OCXO Welfords are different: they must not be
+  // gap-advanced until the current row has valid OCXO science, otherwise a
+  // degraded/recovery hold can make N march while no OCXO sample exists.
   const uint64_t before_row_n =
       (public_count > 0U) ? (uint64_t)(public_count - 1U) : 0ULL;
-  const uint64_t before_row_ocxo_n =
-      (public_count > 1U) ? (uint64_t)(public_count - 2U) : 0ULL;
 
   uint32_t advanced = 0;
   if (welford_advance_missing_to_n(welford_dwt, before_row_n)) advanced++;
   if (welford_advance_missing_to_n(welford_vclock, before_row_n)) advanced++;
-  if (welford_advance_missing_to_n(welford_ocxo1, before_row_ocxo_n)) advanced++;
-  if (welford_advance_missing_to_n(welford_ocxo2, before_row_ocxo_n)) advanced++;
   if (welford_advance_missing_to_n(welford_ocxo1_dac, before_row_n)) advanced++;
   if (welford_advance_missing_to_n(welford_ocxo2_dac, before_row_n)) advanced++;
 
-  if (advanced != 0U) {
-    g_welford_gap_advance_count++;
-    g_welford_gap_advance_last_public_count = public_count;
-    g_welford_gap_advance_last_lane_count = advanced;
-  }
+  welfords_note_gap_advance(public_count, advanced);
   return advanced;
 }
 
+static uint32_t welfords_advance_ocxo_gap_before_valid_row(
+    uint32_t public_count,
+    bool ocxo1_valid,
+    bool ocxo2_valid) {
+  // Delta/CounterLedger OCXO science is a one-second interval surface and
+  // intentionally lags the public PPS identity by one row.  Advance its
+  // cardinality only when that lane is about to accept a real sample.
+  const uint64_t before_row_ocxo_n =
+      (public_count > 1U) ? (uint64_t)(public_count - 2U) : 0ULL;
+
+  uint32_t advanced = 0;
+  if (ocxo1_valid &&
+      welford_advance_missing_to_n(welford_ocxo1, before_row_ocxo_n)) {
+    advanced++;
+  }
+  if (ocxo2_valid &&
+      welford_advance_missing_to_n(welford_ocxo2, before_row_ocxo_n)) {
+    advanced++;
+  }
+
+  welfords_note_gap_advance(public_count, advanced);
+  return advanced;
+}
 
 static FLASHMEM void welford_restore_from_summary(welford_t& w,
                                          uint64_t n,
@@ -5506,6 +5548,11 @@ static FLASHMEM void payload_add_counterledger_candidate_object(
   obj.add("sequence_mismatch_count", c.sequence_mismatch_count);
   obj.add("all_lanes_invalid_count", c.all_lanes_invalid_count);
   obj.add("interval_gap_count", c.interval_gap_count);
+  obj.add("interval_implausible_count", c.interval_implausible_count);
+  obj.add("last_implausible_delta_ticks", c.last_implausible_delta_ticks);
+  obj.add("recover_reprime_count", c.recover_reprime_count);
+  obj.add("plausible_min_delta_ticks", c.plausible_min_delta_ticks);
+  obj.add("plausible_max_delta_ticks", c.plausible_max_delta_ticks);
 
   obj.add("block_window_seconds", c.block_window_seconds);
   obj.add("block_valid", c.block_valid);
@@ -6690,6 +6737,8 @@ void clocks_beta_pps(void) {
     clocks_watchdog_clear_surrender_for_new_lifecycle();
     request_zero = false;
     ocxo_dac_pacing_abort_all();
+    ocxo_dac_predictor_reset(ocxo1_dac);
+    ocxo_dac_predictor_reset(ocxo2_dac);
 
     dwt_cycle_count_total = dwt_ns_to_cycles(recover_dwt_ns);
     gnss_raw_64           = recover_gnss_ns / 100ull;
@@ -6697,6 +6746,13 @@ void clocks_beta_pps(void) {
     ocxo2_measured_gnss_ticks_64        = recover_ocxo2_ns / 100ull;
 
     campaign_seconds = recover_gnss_ns / 1000000000ull;
+
+    // Capture recovered public offsets before Alpha cuts OCXO/CounterLedger
+    // measurement custody.  After re-prime, the first PPS-sampled OCXO
+    // CounterLedger rows are deliberately bookend seeds rather than valid
+    // intervals, so offset recovery must use the last pre-cut raw clock
+    // coordinate.
+    campaign_public_offsets_reset_for_recover();
 
     // Alpha owns OCXO previous/pending edge machinery.  RECOVER must not allow
     // those surfaces to bridge the outage.  Beta then restores the campaign
@@ -6817,7 +6873,7 @@ void clocks_beta_pps(void) {
       ocxo2_pps_projection.projected_ocxo_ns_at_pps != 0;
 
   const uint32_t public_count = (uint32_t)campaign_seconds;
-  (void)welfords_advance_missing_gap_before_row(public_count);
+  (void)welfords_advance_non_ocxo_gap_before_row(public_count);
 
   // OCXO subscriber events are late by definition: the OCXO interval for
   // reference second N becomes available in the next PPS/VCLOCK publication
@@ -6915,6 +6971,10 @@ void clocks_beta_pps(void) {
     recover_reattach_apply_degraded_science_hold(ocxo2_floorline_science);
   }
 
+  (void)science_residual_quarantine_apply(public_count,
+                                          ocxo1_floorline_science,
+                                          ocxo2_floorline_science);
+
   ocxo1_measured_gnss_ticks_64 = public_ocxo1_ns / 100ULL;
   ocxo2_measured_gnss_ticks_64 = public_ocxo2_ns / 100ULL;
 
@@ -6951,6 +7011,11 @@ void clocks_beta_pps(void) {
   if (g_vclock_measurement.gnss_ns_between_edges != 0) {
     welford_update(welford_vclock, (double)g_vclock_measurement.second_residual_ns);
   }
+
+  (void)welfords_advance_ocxo_gap_before_valid_row(
+      public_count,
+      ocxo1_floorline_science.valid,
+      ocxo2_floorline_science.valid);
 
   // OCXO Welfords consume the exact canonical Delta residual.  The integer
   // pps_residual.fast_residual_ns remains the public compatibility rendering;
@@ -7994,6 +8059,18 @@ static FLASHMEM Payload cmd_recover(const Payload& args) {
   recover_ocxo1_ns = strtoull(s_ocxo1,  nullptr, 10);
   recover_ocxo2_ns = strtoull(s_ocxo2,  nullptr, 10);
 
+  const char* raw_servo_mode = nullptr;
+  servo_mode_t recovered_servo_mode = servo_mode_t::OFF;
+  const bool servo_supplied =
+      payload_try_get_servo_mode(args, recovered_servo_mode, raw_servo_mode);
+  calibrate_ocxo_mode = servo_supplied
+      ? recovered_servo_mode
+      : servo_mode_t::OFF;
+  request_servo_mode_change = false;
+  requested_servo_mode = calibrate_ocxo_mode;
+  g_servo_mode_last_requested = calibrate_ocxo_mode;
+  g_servo_mode_last_committed = calibrate_ocxo_mode;
+
   g_recover_request_count++;
   g_recover_last_base_count = recover_gnss_ns / CLOCKS_BETA_NS_PER_SECOND;
   g_recover_last_expected_first_public_count =
@@ -8022,6 +8099,8 @@ static FLASHMEM Payload cmd_recover(const Payload& args) {
   p.add("base_count", g_recover_last_base_count);
   p.add("expected_first_public_count",
         g_recover_last_expected_first_public_count);
+  p.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
+  p.add("calibrate_ocxo_supplied", servo_supplied);
   p.add("recover_status_report", "REPORT_RECOVERY");
   return p;
 }
@@ -9678,6 +9757,17 @@ static FLASHMEM void payload_add_recover_reattach_flat_fields(
   add_u32("counterledger_pps_sequence", s.counterledger_pps_sequence);
   add_u32("counterledger_phase_pps_sequence", s.counterledger_phase_pps_sequence);
   add_u32("counterledger_phase_lag_pps", s.counterledger_phase_lag_pps);
+  add_u32("counterledger_last_delta_ticks", s.counterledger_last_delta_ticks);
+  add_u32("counterledger_interval_implausible_count",
+          s.counterledger_interval_implausible_count);
+  add_u32("counterledger_last_implausible_delta_ticks",
+          s.counterledger_last_implausible_delta_ticks);
+  add_u32("counterledger_recover_reprime_count",
+          s.counterledger_recover_reprime_count);
+  add_u32("counterledger_plausible_min_delta_ticks",
+          s.counterledger_plausible_min_delta_ticks);
+  add_u32("counterledger_plausible_max_delta_ticks",
+          s.counterledger_plausible_max_delta_ticks);
   add_u64("counterledger_ns", s.counterledger_ns);
   add_u64("counterledger_interval_ns", s.counterledger_interval_ns);
   add_u64("counterledger_refined_ns", s.counterledger_refined_ns);
@@ -9966,6 +10056,11 @@ static FLASHMEM void payload_add_phaseledger_start_lane(
   integer.add("ticks64", s.ticks64);
   integer.add("ns", s.ns);
   integer.add("interval_gap_count", s.interval_gap_count);
+  integer.add("interval_implausible_count", s.interval_implausible_count);
+  integer.add("last_implausible_delta_ticks", s.last_implausible_delta_ticks);
+  integer.add("recover_reprime_count", s.recover_reprime_count);
+  integer.add("plausible_min_delta_ticks", s.plausible_min_delta_ticks);
+  integer.add("plausible_max_delta_ticks", s.plausible_max_delta_ticks);
   lane.add_object("counterledger", integer);
 
   Payload phase;

@@ -331,6 +331,11 @@ struct clocks_alpha_ocxo_counterledger_snapshot_t {
   uint32_t sequence_mismatch_count = 0;
   uint32_t all_lanes_invalid_count = 0;
   uint32_t interval_gap_count = 0;
+  uint32_t interval_implausible_count = 0;
+  uint32_t last_implausible_delta_ticks = 0;
+  uint32_t recover_reprime_count = 0;
+  uint32_t plausible_min_delta_ticks = 0;
+  uint32_t plausible_max_delta_ticks = 0;
 
   // Rolling block witness. These fields are report-only unless/until the
   // CounterLedger rail is promoted to public authority. block_* is the
@@ -1061,6 +1066,11 @@ struct clocks_alpha_recover_reattach_snapshot_t {
   uint32_t counterledger_phase_pps_sequence = 0;
   uint32_t counterledger_phase_lag_pps = 0;
   uint32_t counterledger_last_delta_ticks = 0;
+  uint32_t counterledger_interval_implausible_count = 0;
+  uint32_t counterledger_last_implausible_delta_ticks = 0;
+  uint32_t counterledger_recover_reprime_count = 0;
+  uint32_t counterledger_plausible_min_delta_ticks = 0;
+  uint32_t counterledger_plausible_max_delta_ticks = 0;
   uint64_t counterledger_ns = 0;
   uint64_t counterledger_interval_ns = 0;
   uint64_t counterledger_refined_ns = 0;
