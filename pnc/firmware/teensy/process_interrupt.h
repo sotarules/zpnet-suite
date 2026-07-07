@@ -421,6 +421,17 @@ bool interrupt_smartzero_live_snapshot(interrupt_smartzero_snapshot_t* out);
 
 bool interrupt_smartzero_snapshot(interrupt_smartzero_snapshot_t* out);
 
+// RECOVER publication-custody reset.
+//
+// CLOCKS/Alpha deliberately cuts OCXO measurement custody during RECOVER so no
+// previous/pending OCXO edge can bridge an outage.  process_interrupt owns an
+// independent DWT-publication courtroom with per-lane previous-publication and
+// cross-rail memory; that courtroom must be cut at the same boundary or the
+// first post-recovery OCXO event can be judged against stale pre-recovery
+// evidence and trip a false WATCHDOG_ANOMALY.
+void interrupt_recover_reset_publication_custody(void);
+uint32_t interrupt_recover_publication_custody_reset_count(void);
+
 // ============================================================================
 // Reporting-only integrity counters
 // ============================================================================

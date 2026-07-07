@@ -162,6 +162,12 @@ RECOVERY_FIRST_PUBLIC_OFFSET = 1
 SYNC_FRAGMENT_TIMEOUT_S = 35.0
 SYNC_RECOVER_TIMEOUT_S = 45.0
 SYNC_POLL_S = 0.005
+
+# Clean recovery may legitimately consume hidden firmware candidates while
+# Alpha/CounterLedger/PhaseLedger proves fresh OCXO custody.  This timeout is
+# for the whole clean-row wait, not just the first visible pair.
+SYNC_RECOVER_CLEAN_TIMEOUT_S = 90.0
+
 SYNC_LOG_INTERVAL_S = 5.0
 
 # TIMEBASE ingress queue: maxsize=0 means unbounded
@@ -2010,6 +2016,114 @@ def _restore_gnss_raw_from_last_timebase(
     return True
 
 
+def _recovery_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in ("1", "true", "yes", "on", "nominal", "ready")
+
+
+def _fetch_teensy_recovery_status() -> Dict[str, Any]:
+    """Return CLOCKS.REPORT_RECOVERY payload, or {} if temporarily unavailable."""
+    try:
+        resp = send_command(
+            machine="TEENSY",
+            subsystem="CLOCKS",
+            command="REPORT_RECOVERY",
+            retries=1,
+            retry_delay_s=0.0,
+        )
+        if resp.get("success"):
+            payload = resp.get("payload", {})
+            return payload if isinstance(payload, dict) else {}
+    except Exception:
+        logging.debug("⚠️ [recovery] REPORT_RECOVERY poll failed (ignored)")
+    return {}
+
+
+def _fragment_ocxo_science_clean(fragment: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
+    lanes: Dict[str, Any] = {}
+    clean = True
+    for lane in ("ocxo1", "ocxo2"):
+        science = _path_get(fragment, f"{lane}.science")
+        if not isinstance(science, dict):
+            science = {}
+
+        lane_status = {
+            "science_valid": _recovery_bool(science.get("valid")),
+            "antecedents_complete": _recovery_bool(science.get("antecedents_complete")),
+            "delta_raw_valid": _recovery_bool(science.get("delta_raw_valid")),
+            "residual_source": science.get("residual_source"),
+            "public_count": _as_int(science.get("public_count")),
+            "clock_interval_ns": _as_int(science.get("clock_interval_ns")),
+            "gnss_interval_ns": _as_int(science.get("gnss_interval_ns")),
+            "fast_residual_ns": _as_int(science.get("fast_residual_ns")),
+        }
+        lane_clean = bool(
+            lane_status["science_valid"]
+            and lane_status["antecedents_complete"]
+            and lane_status["clock_interval_ns"] not in (None, 0)
+            and lane_status["gnss_interval_ns"] not in (None, 0)
+        )
+        lane_status["clean"] = lane_clean
+        lanes[lane] = lane_status
+        clean = clean and lane_clean
+    return clean, lanes
+
+
+def _recovery_clean_verdict(
+    *,
+    fragment: Dict[str, Any],
+    status: Dict[str, Any],
+    pps_vclock_count: int,
+) -> Tuple[bool, Dict[str, Any]]:
+    """Decide whether the sync pair is safe to persist as recovered TIMEBASE."""
+    science_clean, lanes = _fragment_ocxo_science_clean(fragment)
+    report_available = bool(status)
+    active = _recovery_bool(status.get("recover_reattach_active"))
+    degraded = _recovery_bool(status.get("recover_reattach_degraded_active"))
+    ready = _recovery_bool(status.get("reattach_ready") or status.get("recover_clean_ready"))
+    watchdog_blocked = _recovery_bool(status.get("watchdog_publication_blocked"))
+    watchdog_active = _recovery_bool(status.get("watchdog_anomaly_active"))
+    quarantine_remaining = _as_int(status.get("science_quarantine_remaining"))
+    if quarantine_remaining is None:
+        quarantine_remaining = 0
+
+    reasons: List[str] = []
+    if not report_available:
+        reasons.append("missing_report_recovery")
+    if active:
+        reasons.append("reattach_active")
+    if degraded:
+        reasons.append("degraded_publication_active")
+    if not ready:
+        reasons.append("reattach_not_ready")
+    if watchdog_blocked or watchdog_active:
+        reasons.append("watchdog_blocked")
+    if quarantine_remaining != 0:
+        reasons.append("science_quarantine")
+    if not science_clean:
+        reasons.append("ocxo_science_not_clean")
+
+    clean = not reasons
+    return clean, {
+        "clean": clean,
+        "reasons": reasons,
+        "pps_vclock_count": int(pps_vclock_count),
+        "report_available": report_available,
+        "recover_reattach_active": active,
+        "recover_reattach_degraded_active": degraded,
+        "reattach_ready": ready,
+        "watchdog_blocked": watchdog_blocked or watchdog_active,
+        "science_quarantine_remaining": int(quarantine_remaining),
+        "lanes": lanes,
+        "report_reason": status.get("recover_reattach_reason"),
+        "hidden_candidate_count": _as_int(status.get("hidden_candidate_count")),
+        "last_release_public_count": _as_int(status.get("last_release_public_count")),
+    }
+
+
 # ---------------------------------------------------------------------
 # TIMEBASE_FRAGMENT schema helpers — PPS/VCLOCK canonical surface
 # ---------------------------------------------------------------------
@@ -2327,6 +2441,38 @@ def _timebase_final_court_check_ocxo_lane_alive(
         ) or any(science_flags.values())
 
         lane_ns_zero = lane_ns is None or int(lane_ns) == 0
+
+        if not science_flags["science_valid"] or not science_flags["antecedents_complete"]:
+            _timebase_final_court_add_violation(
+                violations,
+                rule="ocxo_science_valid",
+                lane=lane,
+                message="mature public TIMEBASE row contains an OCXO clockface without valid OCXO science custody",
+                fields={
+                    "path": f"fragment.{lane}",
+                    "science_path": science_path,
+                    "public_count": int(public_count),
+                    "science_public_count": public_count_in_science,
+                    "mature_after_public_count": TIMEBASE_FINAL_COURT_OCXO_ZERO_MATURE_PUBLIC_COUNT,
+                    "lane_ns": lane_ns,
+                    "lane_ns_zero": lane_ns_zero,
+                    "clock_raw_dwt_at_edge": clock_raw_dwt,
+                    "clock_floorline_dwt_at_edge": clock_floorline_dwt,
+                    "clock_published_dwt_at_edge": clock_published_dwt,
+                    "clock_observed_interval_cycles": clock_observed_interval,
+                    "clock_floorline_interval_cycles": clock_floorline_interval,
+                    "clock_interval_ns": clock_interval_ns,
+                    "gnss_interval_ns": gnss_interval_ns,
+                    "delta_raw_clock_interval_cycles": delta_raw_clock_interval,
+                    "delta_floorline_clock_interval_cycles": delta_floorline_clock_interval,
+                    "total_sample_count": total_sample_count,
+                    "traditional_total_sample_count": traditional_total_sample_count,
+                    **science_flags,
+                    "bad_field": f"fragment.{lane}.science.valid",
+                    "bad_value": science.get("valid"),
+                },
+            )
+
         if lane_ns_zero and not has_nonzero_science_evidence:
             _timebase_final_court_add_violation(
                 violations,
@@ -2384,7 +2530,7 @@ def _timebase_final_court_evaluate(timebase: Dict[str, Any]) -> Tuple[bool, Dict
         "timebase_schema": timebase.get("schema"),
         "fragment_schema": _path_get(timebase, "fragment.schema"),
         "timebase_pair_version": timebase.get("timebase_pair_version"),
-        "rule_count": 2,
+        "rule_count": 3,
         "violation_count": len(violations),
         "violations": violations,
     }
@@ -4642,27 +4788,59 @@ def _recover_campaign() -> None:
 
     _request_teensy_recover(int(recover_base_pps_vclock_count), teensy_recover_args)
 
-    try:
-        frag, waited_s = _end_sync_wait(timeout_s=SYNC_RECOVER_TIMEOUT_S)
-    except Exception:
-        raise
+    clean_wait_deadline = time.monotonic() + SYNC_RECOVER_CLEAN_TIMEOUT_S
+    discarded_transitional_pairs = 0
+    recovery_clean_verdict: Dict[str, Any] = {}
 
-    teensy_pps_vclock_count = _extract_teensy_pps_vclock_count(frag)
-    first_public_offset = teensy_pps_vclock_count - expected_first_public_pps_vclock_count
-    if first_public_offset == 0:
-        logging.info(
-            "✅ [recovery] first public pair accepted: count=%d waited=%.3fs",
-            teensy_pps_vclock_count,
-            waited_s,
+    while True:
+        remaining = clean_wait_deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(
+                "recovery failed: timed out waiting for clean OCXO reattachment "
+                f"after discarding {discarded_transitional_pairs} transitional pair(s); "
+                f"last_verdict={recovery_clean_verdict}"
+            )
+
+        frag, waited_s = _end_sync_wait(timeout_s=remaining)
+        teensy_pps_vclock_count = _extract_teensy_pps_vclock_count(frag)
+        first_public_offset = teensy_pps_vclock_count - expected_first_public_pps_vclock_count
+        recovery_status = _fetch_teensy_recovery_status()
+        clean, recovery_clean_verdict = _recovery_clean_verdict(
+            fragment=frag,
+            status=recovery_status,
+            pps_vclock_count=teensy_pps_vclock_count,
         )
-    else:
+
+        if clean:
+            logging.info(
+                "✅ [recovery] clean public pair accepted: count=%d expected=%d offset=%+d waited=%.3fs discarded=%d",
+                teensy_pps_vclock_count,
+                expected_first_public_pps_vclock_count,
+                first_public_offset,
+                waited_s,
+                discarded_transitional_pairs,
+            )
+            break
+
+        discarded_transitional_pairs += 1
+        _diag["recovery_transitional_pairs_discarded"] = (
+            _diag.get("recovery_transitional_pairs_discarded", 0) + 1
+        )
+        _diag["last_recovery_transitional_pair"] = recovery_clean_verdict
         logging.warning(
-            "⚠️ [recovery] first public pair offset: count=%d expected=%d offset=%+d waited=%.3fs",
+            "⚠️ [recovery] discarding transitional public pair count=%d expected=%d offset=%+d reasons=%s status_reason=%s",
             teensy_pps_vclock_count,
             expected_first_public_pps_vclock_count,
             first_public_offset,
-            waited_s,
+            recovery_clean_verdict.get("reasons"),
+            recovery_clean_verdict.get("report_reason"),
         )
+
+        # Release the processor thread to discard this pair while campaign
+        # ingestion is still closed, then arm the next exact-pair sync wait.
+        _sync_resume_event.set()
+        time.sleep(0.05)
+        _begin_sync_wait(expected_pps=int(teensy_pps_vclock_count) + 1)
 
     # The processor is paused on this exact pair. Restore Pi-owned state to
     # the identity immediately before it, then reopen campaign processing so
@@ -4696,6 +4874,8 @@ def _recover_campaign() -> None:
         "first_public_offset": int(first_public_offset),
         "skipped_records_expected": False,
         "gnss_raw_recovery_uses_seed_before_first_public": True,
+        "clean_recovery_verdict": recovery_clean_verdict,
+        "discarded_transitional_pairs": int(discarded_transitional_pairs),
         "gnss_raw_restored": bool(gnss_raw_restored),
     })
 
@@ -5155,6 +5335,97 @@ def cmd_delete(args: Optional[dict]) -> Dict[str, Any]:
             "campaign": campaign_name,
             "campaigns_deleted": camp_count,
             "timebase_deleted": tb_count,
+        },
+    }
+
+
+def cmd_truncate(args: Optional[dict]) -> Dict[str, Any]:
+    """
+    TRUNCATE
+
+    Drop all local campaign history: every row in Postgres campaigns and
+    timebase.  This is intentionally broader than DELETE(campaign).  It refuses
+    to run while a campaign is active; STOP first so CLOCKS, Teensy, Postgres,
+    and the server-side mirror all cross a clean lifecycle boundary.
+
+    After the local Postgres truncate succeeds, forward TRUNCATE to ZPNet Server
+    so its MongoDB timebase collection can be dropped too.
+    """
+    del args
+
+    global _campaign_active, _accepted_pps_vclock_count
+    global _start_waiting_for_first_fragment, _start_requested_campaign
+    global _start_requested_at_utc, _start_requested_monotonic
+    global _start_first_fragment_at_utc, _start_first_fragment_wait_s
+    global _start_first_fragment_pps_vclock_count
+
+    active_row = _get_active_campaign()
+    if active_row is not None:
+        return {
+            "success": False,
+            "message": f"Campaign '{active_row['campaign']}' is active — STOP it first",
+        }
+
+    # Ensure no process-local ingestion or recovery latch can persist a stale
+    # TIMEBASE row after the tables have been emptied.  This mirrors the
+    # recovery discipline: lower the campaign gate first, then drain custody.
+    _campaign_active = False
+    _clear_sync_wait()
+    _clear_flash_cut_wait_state()
+    drained = _reset_trackers()
+    _accepted_pps_vclock_count = None
+    _diag["accepted_pps_count"] = None
+    _diag["accepted_pps_vclock_count"] = None
+
+    _start_waiting_for_first_fragment = False
+    _start_requested_campaign = None
+    _start_requested_at_utc = None
+    _start_requested_monotonic = None
+    _start_first_fragment_at_utc = None
+    _start_first_fragment_wait_s = None
+    _start_first_fragment_pps_vclock_count = None
+    _diag["start_waiting_for_first_fragment"] = False
+
+    _request_teensy_stop_best_effort()
+
+    try:
+        with open_db() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM timebase")
+            tb_count = int(cur.fetchone()[0])
+            cur.execute("SELECT COUNT(*) FROM campaigns")
+            camp_count = int(cur.fetchone()[0])
+            cur.execute("TRUNCATE TABLE timebase, campaigns RESTART IDENTITY")
+    except Exception as e:
+        logging.exception("❌ [clocks] TRUNCATE failed")
+        return {"success": False, "message": str(e)}
+
+    logging.warning(
+        "🧨 [clocks] TRUNCATE: dropped all campaign history — %d campaign row(s), %d timebase row(s); drained=%d",
+        camp_count, tb_count, drained,
+    )
+
+    server_args = {
+        "source": "CLOCKS.TRUNCATE",
+        "postgres_campaigns_deleted": camp_count,
+        "postgres_timebase_deleted": tb_count,
+    }
+    try:
+        server_resp = send_command(machine="SERVER", subsystem="SYSTEM", command="TRUNCATE", args=server_args)
+    except Exception as e:
+        logging.exception("⚠️ [clocks] SERVER.SYSTEM.TRUNCATE failed after local truncate")
+        server_resp = {"success": False, "message": str(e)}
+
+    return {
+        "success": True,
+        "message": "OK",
+        "payload": {
+            "campaigns_deleted": camp_count,
+            "timebase_deleted": tb_count,
+            "local_ingress_drained": drained,
+            "server_truncate_success": bool(server_resp.get("success")) if isinstance(server_resp, dict) else False,
+            "server_truncate_message": server_resp.get("message") if isinstance(server_resp, dict) else None,
+            "server_truncate_payload": server_resp.get("payload") if isinstance(server_resp, dict) else None,
         },
     }
 
@@ -5767,6 +6038,7 @@ COMMANDS = {
     "REPORT": cmd_report,
     "CLEAR": cmd_clear,
     "DELETE": cmd_delete,
+    "TRUNCATE": cmd_truncate,
     "SET_DAC": cmd_set_dac,
     "DITHER": cmd_set_dither,
     "SET_BASELINE": cmd_set_baseline,
@@ -5805,7 +6077,7 @@ def run() -> None:
         "Pi-side Welford for DWT/OCXO1/OCXO2 removed. GNSS stream canary retained. "
         "Recovery: campaign deactivated + queue drained + first sync pair preserved; valid fragments are never rejected for count mismatch. START and cold recovery are asynchronous; first public rows are expected to be authoritative. "
         "START while active performs seamless flash-cut to new campaign. "
-        "Commands: START, STOP, RESUME, REPORT, CLEAR, DELETE, SET_DAC, DITHER, "
+        "Commands: START, STOP, RESUME, REPORT, CLEAR, DELETE, TRUNCATE, SET_DAC, DITHER, "
         "SET_BASELINE, BASELINE_INFO, LIST_CAMPAIGNS, CLOCKS_INFO. "
         "Subscriptions: TIMEBASE_FRAGMENT, TIMEBASE_FORENSICS, WATCHDOG_ANOMALY."
     )

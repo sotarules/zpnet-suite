@@ -6501,6 +6501,30 @@ static void dwt_publication_reset_all(void) {
   dwt_publication_reset_lane(interrupt_subscriber_kind_t::OCXO2);
 }
 
+static volatile uint32_t g_interrupt_recover_publication_custody_reset_count = 0;
+
+void interrupt_recover_reset_publication_custody(void) {
+  // RECOVER is a custody discontinuity.  Reset the final DWT publication
+  // court's previous-row memory so the first post-recovery OCXO/VCLOCK event
+  // becomes a seed, not an interval measured against stale pre-recovery
+  // evidence.  The lower-envelope/FloorLine rail is diagnostic, but it also
+  // carries previous endpoint state used by TIMEBASE forensics; cut it at the
+  // same boundary so reports do not splice the outage into one synthetic
+  // interval.
+  dwt_publication_reset_all();
+  g_dwt_publication_last_fatal = dwt_publication_forensics_t{};
+
+  cadence_regression_reset_kind(interrupt_subscriber_kind_t::VCLOCK);
+  cadence_regression_reset_kind(interrupt_subscriber_kind_t::OCXO1);
+  cadence_regression_reset_kind(interrupt_subscriber_kind_t::OCXO2);
+
+  g_interrupt_recover_publication_custody_reset_count++;
+}
+
+uint32_t interrupt_recover_publication_custody_reset_count(void) {
+  return g_interrupt_recover_publication_custody_reset_count;
+}
+
 static bool dwt_publication_vclock_gnss_projection_ready(uint32_t sequence) {
   // The final publication tribunal can only hard-fail the VCLOCK DWT->GNSS
   // projection after CLOCKS/Alpha has labeled at least one anchor in this

@@ -1,12 +1,12 @@
 """
-ZPNet Campaign Analyzer — v12 (TIMEBASE_V3 / TIMEBASE_FRAGMENT_V3)
+ZPNet Campaign Analyzer — v14 (TIMEBASE_V3 / TIMEBASE_FRAGMENT_V4)
 
 Rewritten for the current paired TIMEBASE architecture:
 
   payload.fragment   — compact Teensy-authored science spine
   payload.forensics  — paired diagnostic companion for the same PPS identity
 
-The analyzer accepts both the newer nested TIMEBASE_FRAGMENT_V3 shape and the
+The analyzer accepts both the newer nested TIMEBASE_FRAGMENT_V4 shape and the
 older flat fragment aliases where practical, but all primary checks now read the
 current fields:
 
@@ -14,6 +14,7 @@ current fields:
   fragment.vclock.ns
   fragment.ocxo1.ns / fragment.ocxo2.ns
   fragment.ocxoN.pps_residual.*
+  fragment.ocxoN.science.total_tau / .total_ppb
   fragment.dwt.cycle_count_total
   fragment.stats.<lane>.welford.* / .tau / .ppb
 
@@ -22,6 +23,15 @@ Recovery doctrine:
   not treat missing rows as corruption, but it does certify that the first row
   after each gap is consistent with the prior public campaign ledgers projected
   to the new GNSS/PPS identity.
+
+  Current clean-recovery doctrine:
+    • transitional RECOVER rows may be discarded Pi-side before persistence
+    • persisted post-recovery rows must have clean OCXO science
+    • Welford cardinality is segment-aware: START private PPS0 lets DWT/OCXO
+      enter public PPS1 with n=1, while each RECOVER boundary consumes one
+      non-sample bookend for DWT/OCXO before science resumes
+    • stats.<lane>.tau/.ppb must match the current campaign clockface ledger
+      ratio and the compact science total_* fields
 
 Usage:
     python -m zpnet.tests.campaign_analyzer <campaign_name>
@@ -45,7 +55,11 @@ OCXO_SECOND_WARN_NS  = 500
 PHASE_STEP_ALARM_NS = 100_000
 PPB_STEP_ALARM = 100.0
 PPB_ABSOLUTE_THRESHOLD = 10_000
+PPB_MISMATCH_ALARM = 0.01
+TAU_MISMATCH_ALARM = 5.0e-12
+TAU_ABSOLUTE_DEVIATION_THRESHOLD = PPB_ABSOLUTE_THRESHOLD / 1.0e9
 WELFORD_STDDEV_ALARM = 500.0
+WELFORD_N_TOLERANCE = 0
 
 # Recovery projection tolerances.  These are deliberately small enough to catch
 # a broken continuation transform, but large enough to tolerate a few suppressed
@@ -78,6 +92,26 @@ class WelfordStats:
     @property
     def stddev(self) -> float:
         return math.sqrt(self.m2 / (self.n - 1)) if self.n >= 2 else 0.0
+
+    def advance_missing_to_n(self, target_n: int) -> bool:
+        """Advance cardinality without inventing new samples.
+
+        This mirrors the firmware recovery-gap doctrine: a canonical TIMEBASE
+        gap advances N so the published population cardinality continues to
+        match campaign public identity, but the mean/stddev distribution is
+        preserved until a real post-gap sample is accepted.
+        """
+        target = int(target_n)
+        if target <= self.n:
+            return False
+        sd = self.stddev
+        if self.n == 0:
+            self.mean = 0.0
+            self.min_val = 0.0
+            self.max_val = 0.0
+        self.n = target
+        self.m2 = (sd * sd * float(target - 1)) if target >= 2 else 0.0
+        return True
 
     def summary(self, fmt: str = ".3f") -> str:
         if self.n == 0:
@@ -369,7 +403,23 @@ def _forensic_bool(row: Dict[str, Any], key: str) -> Optional[bool]:
     return _to_bool(_first_value(_forensics(row).get(key), _fragment(row).get(key), row.get(key)))
 
 
-def _campaign_total_ppb(row: Dict[str, Any], prefix: str) -> Optional[float]:
+def _science(row: Dict[str, Any], prefix: str) -> Dict[str, Any]:
+    return _as_dict(_path_get(_fragment(row), f"{prefix}.science"))
+
+
+def _science_bool(row: Dict[str, Any], prefix: str, field: str) -> Optional[bool]:
+    return _to_bool(_science(row, prefix).get(field))
+
+
+def _science_float(row: Dict[str, Any], prefix: str, field: str) -> Optional[float]:
+    return _first_float(_science(row, prefix).get(field))
+
+
+def _science_int(row: Dict[str, Any], prefix: str, field: str) -> Optional[int]:
+    return _first_int(_science(row, prefix).get(field))
+
+
+def _campaign_total_tau(row: Dict[str, Any], prefix: str) -> Optional[float]:
     gnss = _gnss_ns(row)
     if gnss is None or gnss <= 0:
         return None
@@ -378,13 +428,94 @@ def _campaign_total_ppb(row: Dict[str, Any], prefix: str) -> Optional[float]:
         if cycles is None:
             return None
         expected_cycles = (float(gnss) / NS_PER_SECOND) * DWT_EXPECTED_PER_PPS
-        if expected_cycles == 0.0:
-            return None
-        return ((float(cycles) / expected_cycles) - 1.0) * 1e9
+        return None if expected_cycles == 0.0 else float(cycles) / expected_cycles
     clock_ns = _vclock_ns(row) if prefix == "vclock" else _ocxo_ns(row, prefix)
     if clock_ns is None:
         return None
-    return ((float(clock_ns) / float(gnss)) - 1.0) * 1e9
+    return float(clock_ns) / float(gnss)
+
+
+def _campaign_total_ppb(row: Dict[str, Any], prefix: str) -> Optional[float]:
+    tau = _campaign_total_tau(row, prefix)
+    return None if tau is None else (tau - 1.0) * 1e9
+
+
+def _published_tau(row: Dict[str, Any], prefix: str) -> Optional[float]:
+    if prefix == "gnss":
+        return 1.0
+    return _stat(row, prefix, "tau")
+
+
+def _published_ppb(row: Dict[str, Any], prefix: str) -> Optional[float]:
+    if prefix == "gnss":
+        return 0.0
+    return _stat(row, prefix, "ppb")
+
+
+def _tau_from_ppb(ppb: Optional[float]) -> Optional[float]:
+    return None if ppb is None else 1.0 + float(ppb) / 1.0e9
+
+
+def _row_recovery_status(row: Dict[str, Any]) -> Dict[str, Any]:
+    frag = _fragment(row)
+    return {
+        "reason": frag.get("recover_reattach_reason"),
+        "degraded_active": bool(_to_bool(frag.get("recover_degraded_active"))),
+        "degraded_science_hold": bool(_to_bool(frag.get("recover_degraded_science_hold"))),
+    }
+
+
+def _ocxo_science_clean(row: Dict[str, Any], prefix: str) -> bool:
+    science = _science(row, prefix)
+    if not science:
+        return False
+    return bool(
+        _to_bool(science.get("valid")) and
+        _to_bool(science.get("antecedents_complete")) and
+        _to_bool(science.get("total_valid")) and
+        _to_bool(science.get("reported_pps_residual_valid")) and
+        _to_bool(_path_get(_fragment(row), f"{prefix}.pps_residual.valid")) and
+        _first_int(science.get("clock_interval_ns")) not in (None, 0) and
+        _first_int(science.get("gnss_interval_ns")) not in (None, 0)
+    )
+
+
+def _recovery_count_at_or_before(pps_count: int, recovery_boundaries: Set[int]) -> int:
+    """Return how many persisted recovery boundaries have occurred by this row."""
+    k = int(pps_count)
+    return sum(1 for boundary in recovery_boundaries if int(boundary) <= k)
+
+
+def _expected_welford_n(
+    pps_count: int,
+    prefix: str,
+    recovery_boundaries: Optional[Set[int]] = None,
+) -> Optional[int]:
+    """Expected published Welford cardinality for the current TIMEBASE model.
+
+    START and RECOVER have intentionally different bookend semantics.  START
+    has a private PPS0/prologue, so DWT and OCXO public PPS1 may already carry
+    n=1.  RECOVER cuts custody and the first persisted clean row after each
+    recovery boundary is a reattachment/bookend row, not an additional DWT/OCXO
+    science sample.  Therefore DWT/OCXO cardinality is public_count minus the
+    number of persisted recovery boundaries at or before this row.
+
+    VCLOCK remains an interval/self-test surface with no public PPS1 sample, so
+    it stays pps_count - 1 across START/RECOVER.  DAC Welfords are row/intent
+    surfaces and remain pps_count.
+    """
+    pps = int(pps_count)
+    recoveries = _recovery_count_at_or_before(pps, recovery_boundaries or set())
+
+    if prefix in ("dwt", "ocxo1", "ocxo2"):
+        return max(0, pps - recoveries)
+    if prefix == "vclock":
+        return max(0, pps - 1)
+    if prefix in ("ocxo1_dac", "ocxo2_dac"):
+        return max(0, pps)
+    if prefix == "gnss_raw":
+        return None
+    return None
 
 
 # -----------------------------------------------------------------------------
@@ -443,7 +574,8 @@ def print_campaign_overview(rows: List[Dict[str, Any]], recovery_boundaries: Set
     pps_counts = [_row_pps_count(r) for r in rows]
     pps_min, pps_max = min(pps_counts), max(pps_counts)
     expected_count = pps_max - pps_min + 1
-    campaign_seconds = pps_max - pps_min
+    final_gnss_ns = _gnss_ns(rows[-1])
+    campaign_seconds = (final_gnss_ns // NS_PER_SECOND) if final_gnss_ns is not None else pps_max
     first_ts = rows[0].get("gnss_time_utc") or rows[0].get("system_time_utc", "?")
     last_ts = rows[-1].get("gnss_time_utc") or rows[-1].get("system_time_utc", "?")
     hrs = campaign_seconds // 3600
@@ -451,7 +583,7 @@ def print_campaign_overview(rows: List[Dict[str, Any]], recovery_boundaries: Set
     secs = campaign_seconds % 60
 
     print("=" * 78)
-    print(f"CAMPAIGN ANALYSIS: {rows[0].get('campaign', '?')}  (v12 TIMEBASE_V3)")
+    print(f"CAMPAIGN ANALYSIS: {rows[0].get('campaign', '?')}  (v14 TIMEBASE_V3/FRAGMENT_V4)")
     print("=" * 78)
     print()
     print(f"  Time range:        {first_ts}")
@@ -566,6 +698,93 @@ def analyze_recovery_projection(rows: List[Dict[str, Any]], recovery_boundaries:
 
     if not anomalies:
         print("\n  Verdict: OK — recovery gaps project cleanly from prior TIMEBASE ledgers")
+    return anomalies
+
+
+def analyze_recovery_cleanliness(rows: List[Dict[str, Any]], recovery_boundaries: Set[int]) -> List[str]:
+    """Audit the first persisted row after each recovery gap.
+
+    core.py now discards transitional TIMEBASE pairs until OCXO science is clean.
+    This check proves that the rows that *did* make it into PostgreSQL have the
+    corresponding firmware evidence: no degraded hold, clean OCXO science, and
+    restored Welford cardinality.
+    """
+    anomalies: List[str] = []
+    print()
+    print("-" * 78)
+    print("RECOVERY CLEAN-ROW / CARRY-OVER AUDIT")
+    print("-" * 78)
+
+    if not recovery_boundaries:
+        print("\n  No recovery gaps detected.")
+        return anomalies
+
+    for i in range(1, len(rows)):
+        prev = rows[i - 1]
+        curr = rows[i]
+        prev_pps = _row_pps_count(prev)
+        curr_pps = _row_pps_count(curr)
+        if curr_pps <= prev_pps + 1:
+            continue
+
+        status = _row_recovery_status(curr)
+        print(f"\n  Recovery public row: {prev_pps} -> {curr_pps}")
+        print(f"    recover_reattach_reason:       {status.get('reason')}")
+        print(f"    recover_degraded_active:       {status.get('degraded_active')}")
+        print(f"    recover_degraded_science_hold: {status.get('degraded_science_hold')}")
+
+        if status.get("degraded_active") or status.get("degraded_science_hold"):
+            anomalies.append(f"recovery {curr_pps}: degraded recovery row persisted")
+
+        for label, prefix in [("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")]:
+            clean = _ocxo_science_clean(curr, prefix)
+            science = _science(curr, prefix)
+            print(f"    {label} clean science:           {clean}")
+            if not clean:
+                anomalies.append(
+                    f"recovery {curr_pps}: {label} science not clean "
+                    f"(valid={science.get('valid')} antecedents={science.get('antecedents_complete')} "
+                    f"total_valid={science.get('total_valid')})"
+                )
+
+        for label, prefix in [
+            ("DWT", "dwt"),
+            ("VCLOCK", "vclock"),
+            ("OCXO1", "ocxo1"),
+            ("OCXO2", "ocxo2"),
+            ("OCXO1_DAC", "ocxo1_dac"),
+            ("OCXO2_DAC", "ocxo2_dac"),
+        ]:
+            if prefix.endswith("_dac"):
+                actual_n = _dac_welford_int(curr, prefix.replace("_dac", ""), "n")
+            else:
+                actual_n = _welford_int(curr, prefix, "n")
+            expected_n = _expected_welford_n(curr_pps, prefix, recovery_boundaries)
+            if expected_n is None or actual_n is None:
+                continue
+            print(f"    {label:<9s} Welford N: actual={actual_n:,} expected={expected_n:,}")
+            if abs(int(actual_n) - int(expected_n)) > WELFORD_N_TOLERANCE:
+                anomalies.append(
+                    f"recovery {curr_pps}: {label} Welford N {actual_n} != expected {expected_n}"
+                )
+
+        for label, prefix in [("DWT", "dwt"), ("VCLOCK", "vclock"), ("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")]:
+            pub_ppb = _published_ppb(curr, prefix)
+            pub_tau = _published_tau(curr, prefix)
+            total_ppb = _campaign_total_ppb(curr, prefix)
+            total_tau = _campaign_total_tau(curr, prefix)
+            if pub_ppb is not None and total_ppb is not None:
+                d = float(pub_ppb) - float(total_ppb)
+                print(f"    {label:<6s} recovery PPB: published={pub_ppb:+.6f} total={total_ppb:+.6f} diff={d:+.6f}")
+                if abs(d) > PPB_MISMATCH_ALARM:
+                    anomalies.append(f"recovery {curr_pps}: {label} published PPB mismatch {d:+.6f}")
+            if pub_tau is not None and total_tau is not None:
+                d = float(pub_tau) - float(total_tau)
+                if abs(d) > TAU_MISMATCH_ALARM:
+                    anomalies.append(f"recovery {curr_pps}: {label} published TAU mismatch {d:+.12e}")
+
+    if not anomalies:
+        print("\n  Verdict: OK — persisted recovery rows are clean and Welford cardinality carried over")
     return anomalies
 
 
@@ -879,36 +1098,102 @@ def analyze_welford_contamination(rows: List[Dict[str, Any]], recovery_boundarie
     anomalies: List[str] = []
     print()
     print("-" * 78)
-    print("WELFORD CONTAMINATION CHECK")
+    print("WELFORD CONTAMINATION / CARDINALITY CHECK")
     print("-" * 78)
 
-    for label, prefix in [("DWT", "dwt"), ("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")]:
-        stddev_values: List[Tuple[int, float]] = []
-        for row in rows:
+    lane_specs = [
+        ("DWT", "dwt", "interval", 200.0, "cycles/ppb"),
+        ("VCLOCK", "vclock", "interval", WELFORD_STDDEV_ALARM, "ns"),
+        ("OCXO1", "ocxo1", "interval", WELFORD_STDDEV_ALARM, "ns"),
+        ("OCXO2", "ocxo2", "interval", WELFORD_STDDEV_ALARM, "ns"),
+        ("OCXO1_DAC", "ocxo1_dac", "dac", 1.0, "LSB"),
+        ("OCXO2_DAC", "ocxo2_dac", "dac", 1.0, "LSB"),
+        ("GNSS_RAW", "gnss_raw", "gnss_raw", 500.0, "ppb"),
+    ]
+
+    for label, prefix, kind, threshold, unit in lane_specs:
+        points: List[Tuple[int, int, float, float, float]] = []
+        n_alarms: List[str] = []
+
+        for row_index, row in enumerate(rows, start=1):
             pps = _row_pps_count(row)
-            sd = _welford(row, prefix, "stddev")
-            if sd is not None:
-                stddev_values.append((pps, sd))
-        if not stddev_values:
+            if kind == "dac":
+                lane = prefix.replace("_dac", "")
+                n = _dac_welford_int(row, lane, "n")
+                mean = _dac_welford(row, lane, "mean")
+                sd = _dac_welford(row, lane, "stddev")
+                se = _dac_welford(row, lane, "stderr")
+            elif kind == "gnss_raw":
+                extra = _extra(row)
+                n = _first_int(extra.get("gnss_raw_welford_n"), row.get("gnss_raw_welford_n"))
+                mean = _first_float(extra.get("gnss_raw_welford_mean"), row.get("gnss_raw_welford_mean"))
+                sd = _first_float(extra.get("gnss_raw_welford_stddev"), row.get("gnss_raw_welford_stddev"))
+                se = _first_float(extra.get("gnss_raw_welford_stderr"), row.get("gnss_raw_welford_stderr"))
+            else:
+                n = _welford_int(row, prefix, "n")
+                mean = _welford(row, prefix, "mean")
+                sd = _welford(row, prefix, "stddev")
+                se = _welford(row, prefix, "stderr")
+
+            if n is None or sd is None:
+                continue
+            points.append((pps, int(n), float(mean or 0.0), float(sd), float(se or 0.0)))
+
+            if kind == "interval":
+                expected = _expected_welford_n(pps, prefix, recovery_boundaries)
+                if expected is not None and abs(int(n) - int(expected)) > WELFORD_N_TOLERANCE:
+                    n_alarms.append(f"pps={pps:>7d}  n={n:,} expected={expected:,}")
+            elif kind == "dac":
+                expected = _expected_welford_n(pps, prefix, recovery_boundaries)
+                if expected is not None and abs(int(n) - int(expected)) > WELFORD_N_TOLERANCE:
+                    n_alarms.append(f"pps={pps:>7d}  n={n:,} expected={expected:,}")
+            elif kind == "gnss_raw":
+                # GNSS_RAW is Pi-owned and updates only when a TIMEBASE row is
+                # persisted; unlike Teensy interval Welfords, it is not gap-
+                # advanced across recovered missing PPS identities.
+                expected = row_index
+                if int(n) != expected:
+                    n_alarms.append(f"row={row_index:>7d} pps={pps:>7d}  n={n:,} expected_persisted_rows={expected:,}")
+
+        if not points:
             print(f"\n  [{label}] No Welford data")
             continue
-        first_pps, first_sd = stddev_values[0]
-        final_pps, final_sd = stddev_values[-1]
-        max_pps, max_sd = max(stddev_values, key=lambda x: x[1])
-        unit = "cycles/ppb" if label == "DWT" else "ns"
-        print(f"\n  [{label}] Welford stddev trajectory ({unit}):")
-        print(f"    First (pps={first_pps}):  {first_sd:.3f}")
-        print(f"    Final (pps={final_pps}):  {final_sd:.3f}")
-        print(f"    Peak  (pps={max_pps}):  {max_sd:.3f}")
+
+        first_pps, first_n, first_mean, first_sd, _ = points[0]
+        final_pps, final_n, final_mean, final_sd, final_se = points[-1]
+        max_pps, max_n, _, max_sd, _ = max(points, key=lambda x: x[3])
+
+        print(f"\n  [{label}] Welford trajectory ({unit}):")
+        print(f"    First: pps={first_pps} n={first_n:,} mean={first_mean:+.6f} sd={first_sd:.6f}")
+        print(f"    Final: pps={final_pps} n={final_n:,} mean={final_mean:+.6f} sd={final_sd:.6f} se={final_se:.6f}")
+        print(f"    Peak SD: pps={max_pps} n={max_n:,} sd={max_sd:.6f}")
 
         jumps: List[str] = []
-        for i in range(1, len(stddev_values)):
-            pp, ps = stddev_values[i - 1]
-            cp, cs = stddev_values[i]
+        n_regressions: List[str] = []
+        for i in range(1, len(points)):
+            pp, pn, _, ps, _ = points[i - 1]
+            cp, cn, _, cs, _ = points[i]
+            if cn < pn:
+                n_regressions.append(f"pps={cp:>7d}  n {pn:,} -> {cn:,}")
             if cp in recovery_boundaries:
                 continue
             if ps > 0.0 and cs > ps * 2.0 and cs > 10.0:
                 jumps.append(f"pps={cp:>7d}  stddev {ps:.3f} -> {cs:.3f}  (x{cs/ps:.1f})")
+
+        if n_alarms:
+            print(f"    ALARM: {len(n_alarms)} Welford cardinality mismatch(es)")
+            for msg in n_alarms[:10]:
+                print(f"      {msg}")
+            if len(n_alarms) > 10:
+                print(f"      ... and {len(n_alarms) - 10} more")
+            anomalies.append(f"{label}: {len(n_alarms)} Welford N mismatch(es)")
+
+        if n_regressions:
+            print(f"    ALARM: {len(n_regressions)} Welford N regression(s)")
+            for msg in n_regressions[:10]:
+                print(f"      {msg}")
+            anomalies.append(f"{label}: {len(n_regressions)} Welford N regression(s)")
+
         if jumps:
             print(f"    WARN: {len(jumps)} sudden stddev jumps (>2x):")
             for msg in jumps[:10]:
@@ -916,11 +1201,10 @@ def analyze_welford_contamination(rows: List[Dict[str, Any]], recovery_boundarie
             if len(jumps) > 10:
                 print(f"      ... and {len(jumps) - 10} more")
 
-        threshold = 200.0 if label == "DWT" else WELFORD_STDDEV_ALARM
         if final_sd > threshold:
-            print(f"    ALARM: final stddev {final_sd:.3f} > {threshold} — Welford is contaminated")
-            anomalies.append(f"{label}: Welford stddev contaminated ({final_sd:.3f} {unit})")
-        else:
+            print(f"    ALARM: final stddev {final_sd:.6f} > {threshold} — Welford is contaminated")
+            anomalies.append(f"{label}: Welford stddev contaminated ({final_sd:.6f} {unit})")
+        elif not n_alarms and not n_regressions:
             print("    Verdict: OK")
     return anomalies
 
@@ -929,46 +1213,100 @@ def analyze_ppb_sanity(rows: List[Dict[str, Any]], recovery_boundaries: Set[int]
     anomalies: List[str] = []
     print()
     print("-" * 78)
-    print(f"PPB SANITY CHECK (threshold: ±{PPB_ABSOLUTE_THRESHOLD:,} ppb)")
+    print(f"TAU / PPB SANITY CHECK (threshold: ±{PPB_ABSOLUTE_THRESHOLD:,} ppb)")
     print("-" * 78)
 
     for label, prefix in [("DWT", "dwt"), ("VCLOCK", "vclock"), ("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")]:
-        published_stats = WelfordStats()
-        total_stats = WelfordStats()
-        mismatch_stats = WelfordStats()
+        published_ppb_stats = WelfordStats()
+        total_ppb_stats = WelfordStats()
+        ppb_mismatch_stats = WelfordStats()
+        tau_mismatch_stats = WelfordStats()
+        science_ppb_mismatch_stats = WelfordStats()
         violations: List[str] = []
+        mismatches: List[str] = []
 
         for row in rows:
             pps = _row_pps_count(row)
-            published_ppb = 0.0 if prefix == "vclock" else _stat(row, prefix, "ppb")
+            published_ppb = _published_ppb(row, prefix)
+            published_tau = _published_tau(row, prefix)
             total_ppb = _campaign_total_ppb(row, prefix)
+            total_tau = _campaign_total_tau(row, prefix)
+            tau_from_ppb = _tau_from_ppb(published_ppb)
+
             if published_ppb is not None:
-                published_stats.update(float(published_ppb))
+                published_ppb_stats.update(float(published_ppb))
                 if abs(float(published_ppb)) > PPB_ABSOLUTE_THRESHOLD:
-                    violations.append(f"pps={pps:>7d}  published_ppb={published_ppb:+,.1f}")
+                    violations.append(f"pps={pps:>7d}  published_ppb={published_ppb:+,.3f}")
             if total_ppb is not None:
-                total_stats.update(float(total_ppb))
+                total_ppb_stats.update(float(total_ppb))
                 if abs(float(total_ppb)) > PPB_ABSOLUTE_THRESHOLD:
-                    violations.append(f"pps={pps:>7d}  total_ppb={total_ppb:+,.1f}")
+                    violations.append(f"pps={pps:>7d}  ledger_total_ppb={total_ppb:+,.3f}")
+            if published_tau is not None:
+                if abs(float(published_tau) - 1.0) > TAU_ABSOLUTE_DEVIATION_THRESHOLD:
+                    violations.append(f"pps={pps:>7d}  published_tau={published_tau:.12f}")
+            if total_tau is not None:
+                if abs(float(total_tau) - 1.0) > TAU_ABSOLUTE_DEVIATION_THRESHOLD:
+                    violations.append(f"pps={pps:>7d}  ledger_total_tau={total_tau:.12f}")
+
             if published_ppb is not None and total_ppb is not None:
-                mismatch_stats.update(float(published_ppb) - float(total_ppb))
+                d = float(published_ppb) - float(total_ppb)
+                ppb_mismatch_stats.update(d)
+                if abs(d) > PPB_MISMATCH_ALARM:
+                    mismatches.append(f"pps={pps:>7d}  published_ppb-total_ppb={d:+.6f}")
+            if published_tau is not None and total_tau is not None:
+                d = float(published_tau) - float(total_tau)
+                tau_mismatch_stats.update(d)
+                if abs(d) > TAU_MISMATCH_ALARM:
+                    mismatches.append(f"pps={pps:>7d}  published_tau-total_tau={d:+.12e}")
+            if published_tau is not None and tau_from_ppb is not None:
+                d = float(published_tau) - float(tau_from_ppb)
+                if abs(d) > TAU_MISMATCH_ALARM:
+                    mismatches.append(f"pps={pps:>7d}  published_tau-(1+ppb/1e9)={d:+.12e}")
+
+            if prefix in ("ocxo1", "ocxo2"):
+                science_ppb = _science_float(row, prefix, "total_ppb")
+                science_tau = _science_float(row, prefix, "total_tau")
+                if published_ppb is not None and science_ppb is not None:
+                    d = float(published_ppb) - float(science_ppb)
+                    science_ppb_mismatch_stats.update(d)
+                    if abs(d) > PPB_MISMATCH_ALARM:
+                        mismatches.append(f"pps={pps:>7d}  published_ppb-science_total_ppb={d:+.6f}")
+                if published_tau is not None and science_tau is not None:
+                    d = float(published_tau) - float(science_tau)
+                    if abs(d) > TAU_MISMATCH_ALARM:
+                        mismatches.append(f"pps={pps:>7d}  published_tau-science_total_tau={d:+.12e}")
 
         print(f"\n  [{label}] Published PPB:")
-        print(f"    {published_stats.summary()}")
+        print(f"    {published_ppb_stats.summary()}")
         print(f"  [{label}] Campaign-total PPB computed from public ledgers:")
-        print(f"    {total_stats.summary()}")
-        if mismatch_stats.n:
+        print(f"    {total_ppb_stats.summary()}")
+        if ppb_mismatch_stats.n:
             print(f"  [{label}] Published minus campaign-total PPB:")
-            print(f"    {mismatch_stats.summary()}")
+            print(f"    {ppb_mismatch_stats.summary(fmt='.6f')}")
+        if science_ppb_mismatch_stats.n:
+            print(f"  [{label}] Published minus science.total_ppb:")
+            print(f"    {science_ppb_mismatch_stats.summary(fmt='.6f')}")
+        if tau_mismatch_stats.n:
+            print(f"  [{label}] Published minus campaign-total TAU:")
+            print(f"    {tau_mismatch_stats.summary(fmt='.12e')}")
 
         if violations:
-            print(f"    WARN: {len(violations)} records exceed ±{PPB_ABSOLUTE_THRESHOLD:,} ppb")
-            for msg in violations[:5]:
+            print(f"    ALARM: {len(violations)} records exceed absolute TAU/PPB sanity bounds")
+            for msg in violations[:8]:
                 print(f"      {msg}")
-            if len(violations) > 5:
-                print(f"      ... and {len(violations) - 5} more")
-            anomalies.append(f"{label}: {len(violations)} records with |ppb| > {PPB_ABSOLUTE_THRESHOLD:,}")
-        else:
+            if len(violations) > 8:
+                print(f"      ... and {len(violations) - 8} more")
+            anomalies.append(f"{label}: {len(violations)} records outside TAU/PPB sanity bounds")
+
+        if mismatches:
+            print(f"    ALARM: {len(mismatches)} published TAU/PPB consistency mismatch(es)")
+            for msg in mismatches[:8]:
+                print(f"      {msg}")
+            if len(mismatches) > 8:
+                print(f"      ... and {len(mismatches) - 8} more")
+            anomalies.append(f"{label}: {len(mismatches)} TAU/PPB consistency mismatch(es)")
+
+        if not violations and not mismatches:
             print("    Verdict: OK")
     return anomalies
 
@@ -1077,6 +1415,7 @@ def analyze(campaign: str) -> None:
     print_campaign_overview(rows, recovery_boundaries)
     anomalies.extend(analyze_pps_continuity(rows, recovery_boundaries))
     anomalies.extend(analyze_recovery_projection(rows, recovery_boundaries))
+    anomalies.extend(analyze_recovery_cleanliness(rows, recovery_boundaries))
     anomalies.extend(analyze_clock_domains(rows, recovery_boundaries))
     anomalies.extend(analyze_ocxo_integrity(rows, recovery_boundaries))
     anomalies.extend(analyze_ocxo_comparison(rows, recovery_boundaries))

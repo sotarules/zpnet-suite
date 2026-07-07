@@ -1234,7 +1234,11 @@ static uint32_t g_science_residual_quarantine_last_public_count = 0;
 // publication resumes in degraded mode and OCXO science remains quarantined/
 // invalid until PhaseLedger/reattach evidence catches up.
 static constexpr uint32_t CLOCKS_RECOVER_REATTACH_TIMEOUT_CANDIDATES = 32U;
-static constexpr bool     CLOCKS_RECOVER_REATTACH_TIMEOUT_RELEASE_DEGRADED = true;
+// Clean-recovery doctrine: do not publish degraded public rows merely because
+// OCXO reattachment timed out.  A RECOVER either proves fresh OCXO custody and
+// publishes a science-valid row, or it keeps holding so Pi-side recovery can
+// fail/retry without persisting frozen OCXO clockfaces.
+static constexpr bool     CLOCKS_RECOVER_REATTACH_TIMEOUT_RELEASE_DEGRADED = false;
 static volatile bool     g_recover_reattach_active = false;
 static volatile bool     g_recover_reattach_degraded_active = false;
 static uint32_t          g_recover_reattach_begin_count = 0;
@@ -6849,6 +6853,7 @@ void clocks_beta_pps(void) {
     // statistics and quarantines the first public residual rows so Welford
     // receives only post-recovery, post-warmup intervals.
     clocks_alpha_recover_reprime_ocxo_state();
+    interrupt_recover_reset_publication_custody();
     pps_interval_residuals_begin_recover_quarantine(
         CLOCKS_RECOVER_SCIENCE_QUARANTINE_ROWS);
     recover_welfords_apply_pending();
@@ -9896,6 +9901,18 @@ static FLASHMEM Payload cmd_report_recovery(const Payload&) {
   p.add("recover_reattach_active", (bool)g_recover_reattach_active);
   p.add("recover_reattach_degraded_active", (bool)g_recover_reattach_degraded_active);
   p.add("recover_reattach_reason", g_recover_reattach_last_reason);
+  const bool recover_clean_ready =
+      !g_recover_reattach_active &&
+      !g_recover_reattach_degraded_active &&
+      g_recover_reattach_last_ocxo1.ready &&
+      g_recover_reattach_last_ocxo2.ready &&
+      g_science_residual_quarantine_remaining == 0U &&
+      !watchdog_anomaly_active &&
+      !clocks_watchdog_publication_blocked();
+  p.add("recover_clean_ready", recover_clean_ready);
+  p.add("recover_clean_blocked", !recover_clean_ready);
+  p.add("interrupt_recover_publication_reset_count",
+        interrupt_recover_publication_custody_reset_count());
   p.add("watchdog_anomaly_active", watchdog_anomaly_active);
   p.add("watchdog_campaign_surrendered", (bool)watchdog_campaign_surrendered);
   p.add("watchdog_publication_blocked", clocks_watchdog_publication_blocked());
