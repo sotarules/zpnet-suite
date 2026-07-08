@@ -757,6 +757,23 @@ static Payload cmd_transport_info(const Payload& /*args*/) {
   p.add("rx_overlap",                 info.rx_overlap);
   p.add("rx_expected_traffic_missing", info.rx_expected_traffic_missing);
 
+  // ==========================================================
+  // RX — Startup attach quarantine / first-corruption witness
+  // ==========================================================
+
+  p.add("rx_first_frame_seen", info.rx_first_frame_seen != 0U);
+  p.add("rx_startup_grace_active", info.rx_startup_grace_active != 0U);
+  p.add("rx_startup_grace_ms", info.rx_startup_grace_ms);
+  p.add("rx_ms_since_init", info.rx_ms_since_init);
+  p.add("rx_startup_expected_traffic_missing_suppressed",
+        info.rx_startup_expected_traffic_missing_suppressed);
+  p.add("rx_startup_bad_stx_suppressed", info.rx_startup_bad_stx_suppressed);
+  p.add("rx_startup_bad_etx_suppressed", info.rx_startup_bad_etx_suppressed);
+  p.add("rx_startup_len_overflow_suppressed",
+        info.rx_startup_len_overflow_suppressed);
+  p.add("rx_startup_first_missing_byte", info.rx_startup_first_missing_byte);
+  p.add("rx_startup_last_missing_byte", info.rx_startup_last_missing_byte);
+
   return p;
 }
 

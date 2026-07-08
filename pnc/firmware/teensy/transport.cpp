@@ -45,6 +45,11 @@
 static constexpr uint64_t TRANSPORT_RX_POLL_NS = 2000000ULL;  // 2 ms
 static constexpr uint64_t TRANSPORT_TX_POLL_NS = 2000000ULL;  // 2 ms
 
+// USB CDC attach/reboot can deliver a tail of a Pi frame after the traffic byte
+// was lost at the host/device boundary.  Until the first lawful incoming frame
+// proves alignment, quarantine startup artifacts into segregated counters.
+static constexpr uint32_t TRANSPORT_RX_STARTUP_GRACE_MS = 15000UL;
+
 static constexpr size_t FRAME_SLACK = 64;
 static constexpr size_t RX_BUF_MAX = TRANSPORT_MAX_MESSAGE + FRAME_SLACK;
 
@@ -136,6 +141,28 @@ static volatile uint32_t rx_bad_etx_count            = 0;
 static volatile uint32_t rx_len_overflow_count       = 0;
 static volatile uint32_t rx_overlap_count            = 0;
 static volatile uint32_t rx_expected_traffic_missing = 0;
+
+static uint32_t rx_init_ms = 0;
+static bool     rx_first_frame_seen = false;
+static volatile uint32_t rx_startup_expected_traffic_missing_suppressed = 0;
+static volatile uint32_t rx_startup_bad_stx_suppressed = 0;
+static volatile uint32_t rx_startup_bad_etx_suppressed = 0;
+static volatile uint32_t rx_startup_len_overflow_suppressed = 0;
+static volatile uint32_t rx_startup_first_missing_byte = 0xFFFFFFFFUL;
+static volatile uint32_t rx_startup_last_missing_byte = 0;
+
+static bool rx_startup_grace_active() {
+  if (rx_first_frame_seen) return false;
+  return (uint32_t)(millis() - rx_init_ms) < TRANSPORT_RX_STARTUP_GRACE_MS;
+}
+
+static void rx_startup_note_missing_byte(uint8_t b) {
+  rx_startup_expected_traffic_missing_suppressed++;
+  if (rx_startup_first_missing_byte == 0xFFFFFFFFUL) {
+    rx_startup_first_missing_byte = b;
+  }
+  rx_startup_last_missing_byte = b;
+}
 
 // =============================================================
 // Registration
@@ -368,7 +395,11 @@ static void dispatch_if_complete() {
     return;
 
   if (memcmp(rx_buf, STX_SEQ, STX_LEN) != 0) {
-    rx_bad_stx_count++;
+    if (rx_startup_grace_active()) {
+      rx_startup_bad_stx_suppressed++;
+    } else {
+      rx_bad_stx_count++;
+    }
     rx_reset_hard();
     return;
   }
@@ -380,7 +411,11 @@ static void dispatch_if_complete() {
   while (i < rx_len && rx_buf[i] != '>') {
     uint8_t c = rx_buf[i];
     if (c < '0' || c > '9') {
-      rx_len_overflow_count++;
+      if (rx_startup_grace_active()) {
+        rx_startup_len_overflow_suppressed++;
+      } else {
+        rx_len_overflow_count++;
+      }
       rx_reset_hard();
       return;
     }
@@ -397,7 +432,11 @@ static void dispatch_if_complete() {
   size_t required_total = json_start + declared_len + ETX_LEN;
 
   if (required_total > RX_BUF_MAX) {
-    rx_len_overflow_count++;
+    if (rx_startup_grace_active()) {
+      rx_startup_len_overflow_suppressed++;
+    } else {
+      rx_len_overflow_count++;
+    }
     rx_reset_hard();
     return;
   }
@@ -407,11 +446,16 @@ static void dispatch_if_complete() {
 
   size_t etx_pos = json_start + declared_len;
   if (memcmp(rx_buf + etx_pos, ETX_SEQ, ETX_LEN) != 0) {
-    rx_bad_etx_count++;
+    if (rx_startup_grace_active()) {
+      rx_startup_bad_etx_suppressed++;
+    } else {
+      rx_bad_etx_count++;
+    }
     rx_reset_hard();
     return;
   }
 
+  rx_first_frame_seen = true;
   rx_frames_complete++;
 
   Payload p;
@@ -440,7 +484,11 @@ static void rx_serial_tick() {
 
     if (!rx_have_traffic) {
       if (!is_valid_traffic(b)) {
-        rx_expected_traffic_missing++;
+        if (rx_startup_grace_active()) {
+          rx_startup_note_missing_byte(b);
+        } else {
+          rx_expected_traffic_missing++;
+        }
         continue;
       }
       rx_begin(b);
@@ -518,6 +566,22 @@ void transport_get_info(transport_info_t* out) {
   out->rx_len_overflow              = rx_len_overflow_count;
   out->rx_overlap                   = rx_overlap_count;
   out->rx_expected_traffic_missing  = rx_expected_traffic_missing;
+
+  out->rx_first_frame_seen = rx_first_frame_seen ? 1U : 0U;
+  out->rx_startup_grace_active = rx_startup_grace_active() ? 1U : 0U;
+  out->rx_startup_grace_ms = TRANSPORT_RX_STARTUP_GRACE_MS;
+  out->rx_ms_since_init = (uint32_t)(millis() - rx_init_ms);
+  out->rx_startup_expected_traffic_missing_suppressed =
+      rx_startup_expected_traffic_missing_suppressed;
+  out->rx_startup_bad_stx_suppressed = rx_startup_bad_stx_suppressed;
+  out->rx_startup_bad_etx_suppressed = rx_startup_bad_etx_suppressed;
+  out->rx_startup_len_overflow_suppressed =
+      rx_startup_len_overflow_suppressed;
+  out->rx_startup_first_missing_byte =
+      (rx_startup_first_missing_byte == 0xFFFFFFFFUL)
+          ? 0xFFFFFFFFUL
+          : rx_startup_first_missing_byte;
+  out->rx_startup_last_missing_byte = rx_startup_last_missing_byte;
 }
 
 // =============================================================
@@ -527,6 +591,11 @@ void transport_get_info(transport_info_t* out) {
 void transport_init(void) {
 
   ZPNET_SERIAL.begin(USB_SERIAL_BAUD);
+  rx_init_ms = millis();
+  rx_first_frame_seen = false;
+  rx_len = 0;
+  rx_have_traffic = false;
+  rx_traffic = 0;
 
   debug_log("transport", BUILD_FINGERPRINT);
 

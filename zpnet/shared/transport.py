@@ -78,11 +78,19 @@ RAW_TRANSPORT_LOG_PATH = "/home/mule/zpnet/logs/zpnet-transport.log"
 RAW_TRANSPORT_LOG_ENABLED = True
 
 # ---------------------------------------------------------------------
-# Retry policy
+# Retry / attach policy
 # ---------------------------------------------------------------------
 
 _RETRY_MIN_SLEEP_S = 0.02
 _RETRY_MAX_SLEEP_S = 0.50
+
+# USB CDC attach is not atomic from the application protocol's point of view:
+# opening the serial device can coincide with Teensy reboot/setup traffic and
+# with stale bytes buffered by the host driver.  Do not allow the first
+# application command to race that window.  Drain and settle before declaring
+# the transport ready for Pi->Teensy writes.
+_ATTACH_DRAIN_S = 1.00
+_READY_SEND_TIMEOUT_S = 10.0
 
 # ---------------------------------------------------------------------
 # Physical transport state
@@ -93,6 +101,12 @@ _tx_lock = threading.Lock()
 
 _transport_stop = threading.Event()
 _transport_supervisor_started = False
+_transport_ready = threading.Event()
+_transport_ready_lock = threading.Lock()
+_transport_ready_generation = 0
+_transport_attach_count = 0
+_transport_attach_drain_bytes = 0
+_transport_last_ready_ts: Optional[float] = None
 
 # ---------------------------------------------------------------------
 # RX assembly state
@@ -112,17 +126,39 @@ def _open_serial(path: str) -> None:
     if _ser is not None:
         return
 
-    _ser = serial.Serial(
-        port=path,
-        baudrate=getattr(constants, "TEENSY_BAUDRATE", 115200),
-        timeout=None,
-    )
+    kwargs = {
+        "port": path,
+        "baudrate": getattr(constants, "TEENSY_BAUDRATE", 115200),
+        "timeout": None,
+    }
+
+    # POSIX pyserial supports exclusive=True.  It gives us a cheap proof that
+    # zpnet-pubsub is the only process physically touching the serial device.
+    try:
+        _ser = serial.Serial(**kwargs, exclusive=True)
+    except TypeError:
+        _ser = serial.Serial(**kwargs)
 
     logging.info("[transport] SERIAL device opened: %s", path)
 
 
+def _transport_mark_not_ready() -> None:
+    _transport_ready.clear()
+
+
+def _transport_mark_ready() -> None:
+    global _transport_ready_generation, _transport_last_ready_ts
+
+    with _transport_ready_lock:
+        _transport_ready_generation += 1
+        _transport_last_ready_ts = time.time()
+        _transport_ready.set()
+
+
 def _close_serial() -> None:
     global _ser
+
+    _transport_mark_not_ready()
 
     ser = _ser
     if ser is None:
@@ -135,6 +171,65 @@ def _close_serial() -> None:
 
     _ser = None
     logging.info("[transport] SERIAL device closed")
+
+
+def _reset_host_rx_state() -> None:
+    _rx_reset()
+
+
+def _serial_reset_buffers() -> None:
+    ser = _ser
+    if ser is None:
+        return
+
+    for name in ("reset_input_buffer", "reset_output_buffer"):
+        fn = getattr(ser, name, None)
+        if fn is None:
+            continue
+        try:
+            fn()
+        except Exception:
+            logging.debug("[transport] %s failed during attach", name, exc_info=True)
+
+
+def _drain_attach_noise() -> int:
+    global _transport_attach_count, _transport_attach_drain_bytes
+
+    ser = _ser
+    if ser is None:
+        return 0
+
+    deadline = time.monotonic() + _ATTACH_DRAIN_S
+    drained = 0
+
+    while time.monotonic() < deadline:
+        try:
+            waiting = getattr(ser, "in_waiting", 0)
+        except Exception:
+            waiting = 0
+
+        if waiting:
+            chunk = ser.read(waiting)
+            drained += len(chunk)
+            continue
+
+        time.sleep(0.02)
+
+    try:
+        waiting = getattr(ser, "in_waiting", 0)
+        if waiting:
+            drained += len(ser.read(waiting))
+        reset_input = getattr(ser, "reset_input_buffer", None)
+        if reset_input is not None:
+            reset_input()
+    except Exception:
+        logging.debug("[transport] final attach drain failed", exc_info=True)
+
+    _transport_attach_count += 1
+    _transport_attach_drain_bytes += drained
+    if drained:
+        logging.info("[transport] drained %d startup attach bytes before ready", drained)
+    return drained
 
 # ---------------------------------------------------------------------
 # Raw wire logging
@@ -420,14 +515,21 @@ def _supervisor_loop() -> None:
 
     while not _transport_stop.is_set():
         try:
+            _transport_mark_not_ready()
             _open_serial(TEENSY_SERIAL_PATH)
+            _reset_host_rx_state()
+            _serial_reset_buffers()
+            _drain_attach_noise()
             if announced:
                 logging.info("✅ [transport] SERIAL device available — RX loop starting")
                 announced = False
+            logging.info("✅ [transport] SERIAL ready — RX loop starting")
+            _transport_mark_ready()
             backoff = _RETRY_MIN_SLEEP_S
             _serial_rx_loop()
 
         except Exception as e:
+            _transport_mark_not_ready()
             _close_serial()
 
             if not announced:
@@ -446,9 +548,29 @@ def _supervisor_loop() -> None:
 # Public API
 # ---------------------------------------------------------------------
 
+def transport_wait_ready(timeout_s: Optional[float] = _READY_SEND_TIMEOUT_S) -> bool:
+    if not _transport_supervisor_started:
+        return False
+    return _transport_ready.wait(timeout=timeout_s)
+
+
+def transport_diagnostics() -> dict:
+    with _transport_ready_lock:
+        return {
+            "ready": _transport_ready.is_set(),
+            "ready_generation": _transport_ready_generation,
+            "attach_count": _transport_attach_count,
+            "attach_drain_bytes": _transport_attach_drain_bytes,
+            "last_ready_ts": _transport_last_ready_ts,
+        }
+
+
 def transport_send(traffic: int, payload: Payload) -> None:
     if not _transport_supervisor_started:
         raise RuntimeError("transport not initialized")
+
+    if not transport_wait_ready(_READY_SEND_TIMEOUT_S):
+        raise RuntimeError("SERIAL transport is not ready")
 
     raw = payload_to_json_bytes(payload)
     wire = _make_wire_message(traffic, raw)
@@ -471,13 +593,16 @@ def transport_init() -> None:
 
 def transport_close() -> None:
     _transport_stop.set()
+    _transport_mark_not_ready()
     _close_serial()
 
 
 def transport_rx_snapshot() -> dict:
-    return {
+    snap = transport_diagnostics()
+    snap.update({
         "rx_buf_len": len(rx_buf),
         "rx_buf_bytes": bytes(rx_buf),
         "rx_traffic": rx_traffic if rx_have_traffic else None,
         "rx_have_traffic": rx_have_traffic,
-    }
+    })
+    return snap

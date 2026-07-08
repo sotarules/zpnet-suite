@@ -47,7 +47,9 @@ from zpnet.shared.logger import setup_logging
 from zpnet.shared.transport import (
     transport_send,
     transport_register_receive_callback,
-    transport_init, )
+    transport_init,
+    transport_wait_ready,
+)
 from zpnet.shared.util import payload_to_json_str, payload_to_json_bytes
 
 # ---------------------------------------------------------------------
@@ -1711,6 +1713,9 @@ def _delayed_refresh(delay_s: float = 10.0) -> None:
 
     time.sleep(delay_s)
     try:
+        if not transport_wait_ready(timeout_s=REPLY_TIMEOUT_S):
+            logging.warning("⚠️ [pubsub] auto REFRESH skipped — Teensy transport not ready")
+            return
         logging.info("🔄 [pubsub] auto REFRESH starting")
         cmd_refresh(None)
         logging.info("✅ [pubsub] auto REFRESH complete")
@@ -1737,18 +1742,21 @@ def _transport_init_with_retry() -> None:
     """
     announced = False
 
+    transport_init()
+
     while True:
-        try:
-            transport_init()
+        if transport_wait_ready(timeout_s=5.0):
             if announced:
                 logging.info("✅ [transport] device available — transport initialized")
+            else:
+                logging.info("✅ [transport] device available — transport initialized")
             return
-        except Exception:
-            if not announced:
-                logging.info("⏳ [transport] device not ready — polling every %.0f ms",
-                             TRANSPORT_RETRY_INTERVAL_S * 1000)
-                announced = True
-            time.sleep(TRANSPORT_RETRY_INTERVAL_S)
+
+        if not announced:
+            logging.info("⏳ [transport] waiting for serial readiness every %.0f ms",
+                         TRANSPORT_RETRY_INTERVAL_S * 1000)
+            announced = True
+        time.sleep(TRANSPORT_RETRY_INTERVAL_S)
 
 # ---------------------------------------------------------------------
 # Entrypoint

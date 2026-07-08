@@ -178,6 +178,21 @@ typedef struct {
   uint32_t rx_overlap;                  // New traffic while RX active / resync
   uint32_t rx_expected_traffic_missing; // Expected traffic byte absent
 
+  // ===========================================================
+  // RX — Startup attach quarantine / first-corruption witness
+  // ===========================================================
+
+  uint32_t rx_first_frame_seen;
+  uint32_t rx_startup_grace_active;
+  uint32_t rx_startup_grace_ms;
+  uint32_t rx_ms_since_init;
+  uint32_t rx_startup_expected_traffic_missing_suppressed;
+  uint32_t rx_startup_bad_stx_suppressed;
+  uint32_t rx_startup_bad_etx_suppressed;
+  uint32_t rx_startup_len_overflow_suppressed;
+  uint32_t rx_startup_first_missing_byte;
+  uint32_t rx_startup_last_missing_byte;
+
 } transport_info_t;
 
 
