@@ -708,6 +708,21 @@ Payload::~Payload() {
 }
 
 void Payload::_release_storage() {
+    // Destructors and assignment cleanup must never trust a damaged Payload
+    // header enough to hand arbitrary pointers to free().  If the cheap
+    // integrity court rejects the object, intentionally leak any questionable
+    // heap storage and reset the header back to the inline-empty shape.  A leak
+    // is recoverable and observable; freeing 0x1/0x81/stack/code is not.
+    if (_magic != MAGIC_LIVE || !_self_ok("release_storage")) {
+        _entries = _inline_entries;
+        _count = 0;
+        _entry_cap = INLINE_ENTRIES;
+        _arena = nullptr;
+        _arena_used = 0;
+        _arena_cap = 0;
+        return;
+    }
+
     if (_entries && _entries != _inline_entries) {
         payload_note_entry_heap_delta(-(int32_t)(_entry_cap * sizeof(Entry)));
         free(_entries);
@@ -849,7 +864,19 @@ bool Payload::_copy_from(const Payload& other) {
 // ============================================================================
 
 void Payload::clear() {
-    if (!_self_ok("clear")) return;
+    if (!_self_ok("clear")) {
+        // Re-establish a coherent empty object without freeing questionable
+        // pointers.  parseJSON() begins with clear(); continuing with corrupted
+        // arena/entry metadata would only manufacture more bad pointers.
+        _magic = MAGIC_LIVE;
+        _entries = _inline_entries;
+        _count = 0;
+        _entry_cap = INLINE_ENTRIES;
+        _arena = nullptr;
+        _arena_used = 0;
+        _arena_cap = 0;
+        return;
+    }
     _count = 0;
     _arena_used = 0;
 }
@@ -980,6 +1007,23 @@ bool Payload::_self_ok(const char* op) const {
     }
     if (_count != 0 && (!_arena || _arena_used == 0)) {
         return fail(PAYLOAD_SELF_OK_COUNT_WITHOUT_ARENA);
+    }
+
+    // Fast pointer-custody court.  This is still O(1): it validates only that
+    // heap-backed spans live in readable storage before later code dereferences
+    // _entries or _arena.  The old normal profile deferred these checks to
+    // HEAVY_FORENSICS, which let low or stack-neighborhood pointers reach libc
+    // numeric parsers as ordinary C strings.
+    if (!entries_inline &&
+        !payload_memory_readable(_entries,
+                                 _entry_cap * sizeof(Entry),
+                                 "self.entries.fast")) {
+        return fail(PAYLOAD_SELF_OK_ENTRIES_SPAN_UNREADABLE);
+    }
+
+    if (_arena && _arena_cap != 0 &&
+        !payload_memory_readable(_arena, _arena_cap, "self.arena.fast")) {
+        return fail(PAYLOAD_SELF_OK_ARENA_SPAN_UNREADABLE);
     }
 
     if (!Payload::HEAVY_FORENSICS) {
@@ -1231,9 +1275,174 @@ uint16_t Payload::_put(const char* str) {
     return _put(str, n);
 }
 
+bool Payload::_entry_key_ok(const Entry& e, const char* op, size_t* out_len) const {
+    if (out_len) *out_len = 0;
+
+    if (!_self_ok(op ? op : "entry_key")) return false;
+    if (!_arena || _arena_used == 0 || e.key_off >= _arena_used) {
+        payload_note_self_ok_failure(PAYLOAD_SELF_OK_ENTRY_KEY_OFF_OOB,
+                                     op ? op : "entry_key",
+                                     this,
+                                     _magic,
+                                     _entries,
+                                     _arena,
+                                     _count,
+                                     _entry_cap,
+                                     _arena_used,
+                                     _arena_cap,
+                                     0xFFFFFFFFUL,
+                                     (uint32_t)e.key_off,
+                                     (uint32_t)e.val_off,
+                                     (uint32_t)e.val_len,
+                                     (uint32_t)(uint8_t)e.kind);
+        return false;
+    }
+
+    const size_t remaining = _arena_used - (size_t)e.key_off;
+    const char* s = _arena + e.key_off;
+    const void* z = memchr(s, '\0', remaining);
+    if (!z) {
+        payload_note_self_ok_failure(PAYLOAD_SELF_OK_ENTRY_KEY_UNTERMINATED,
+                                     op ? op : "entry_key",
+                                     this,
+                                     _magic,
+                                     _entries,
+                                     _arena,
+                                     _count,
+                                     _entry_cap,
+                                     _arena_used,
+                                     _arena_cap,
+                                     0xFFFFFFFFUL,
+                                     (uint32_t)e.key_off,
+                                     (uint32_t)e.val_off,
+                                     (uint32_t)e.val_len,
+                                     (uint32_t)(uint8_t)e.kind);
+        return false;
+    }
+
+    if (out_len) {
+        *out_len = (size_t)((const char*)z - s);
+    }
+    return true;
+}
+
+bool Payload::_entry_value_ok(const Entry& e, const char* op, size_t* out_len) const {
+    if (out_len) *out_len = 0;
+
+    if (!_self_ok(op ? op : "entry_value")) return false;
+    if (e.kind != 'p' && e.kind != 'o' && e.kind != 'a') {
+        payload_note_self_ok_failure(PAYLOAD_SELF_OK_ENTRY_KIND_BAD,
+                                     op ? op : "entry_value",
+                                     this,
+                                     _magic,
+                                     _entries,
+                                     _arena,
+                                     _count,
+                                     _entry_cap,
+                                     _arena_used,
+                                     _arena_cap,
+                                     0xFFFFFFFFUL,
+                                     (uint32_t)e.key_off,
+                                     (uint32_t)e.val_off,
+                                     (uint32_t)e.val_len,
+                                     (uint32_t)(uint8_t)e.kind);
+        return false;
+    }
+
+    if (!_arena || _arena_used == 0 || e.val_off >= _arena_used) {
+        payload_note_self_ok_failure(PAYLOAD_SELF_OK_ENTRY_VAL_OFF_OOB,
+                                     op ? op : "entry_value",
+                                     this,
+                                     _magic,
+                                     _entries,
+                                     _arena,
+                                     _count,
+                                     _entry_cap,
+                                     _arena_used,
+                                     _arena_cap,
+                                     0xFFFFFFFFUL,
+                                     (uint32_t)e.key_off,
+                                     (uint32_t)e.val_off,
+                                     (uint32_t)e.val_len,
+                                     (uint32_t)(uint8_t)e.kind);
+        return false;
+    }
+
+    const size_t val_end = (size_t)e.val_off + (size_t)e.val_len;
+    if (val_end >= _arena_used) {
+        payload_note_self_ok_failure(PAYLOAD_SELF_OK_ENTRY_VAL_END_OOB,
+                                     op ? op : "entry_value",
+                                     this,
+                                     _magic,
+                                     _entries,
+                                     _arena,
+                                     _count,
+                                     _entry_cap,
+                                     _arena_used,
+                                     _arena_cap,
+                                     0xFFFFFFFFUL,
+                                     (uint32_t)e.key_off,
+                                     (uint32_t)e.val_off,
+                                     (uint32_t)e.val_len,
+                                     (uint32_t)(uint8_t)e.kind);
+        return false;
+    }
+
+    if (_arena[val_end] != '\0') {
+        payload_note_self_ok_failure(PAYLOAD_SELF_OK_ENTRY_VAL_UNTERMINATED,
+                                     op ? op : "entry_value",
+                                     this,
+                                     _magic,
+                                     _entries,
+                                     _arena,
+                                     _count,
+                                     _entry_cap,
+                                     _arena_used,
+                                     _arena_cap,
+                                     0xFFFFFFFFUL,
+                                     (uint32_t)e.key_off,
+                                     (uint32_t)e.val_off,
+                                     (uint32_t)e.val_len,
+                                     (uint32_t)(uint8_t)e.kind);
+        return false;
+    }
+
+    if (out_len) *out_len = (size_t)e.val_len;
+    return true;
+}
+
+const char* Payload::_primitive_value(const char* key,
+                                      const char* op,
+                                      size_t* out_len) const {
+    if (out_len) *out_len = 0;
+    const Entry* e = _find(key);
+    if (!e || e->kind != 'p') return nullptr;
+    size_t n = 0;
+    if (!_entry_value_ok(*e, op ? op : "primitive_value", &n)) return nullptr;
+    if (out_len) *out_len = n;
+    return _arena + e->val_off;
+}
+
 const char* Payload::_at(uint16_t offset) const {
     if (!_self_ok("at")) return "";
-    if (!_arena || offset >= _arena_used) return "";
+    if (!_arena || offset >= _arena_used) {
+        payload_note_self_ok_failure(PAYLOAD_SELF_OK_ENTRY_VAL_OFF_OOB,
+                                     "at",
+                                     this,
+                                     _magic,
+                                     _entries,
+                                     _arena,
+                                     _count,
+                                     _entry_cap,
+                                     _arena_used,
+                                     _arena_cap,
+                                     0xFFFFFFFFUL,
+                                     0,
+                                     (uint32_t)offset,
+                                     0,
+                                     0);
+        return "";
+    }
     return _arena + offset;
 }
 
@@ -1247,8 +1456,12 @@ const Payload::Entry* Payload::_find(const char* key) const {
     }
 
     for (size_t i = 0; i < _count; i++) {
-        const char* stored = _at(_entries[i].key_off);
-        if (payload_owned_equals_known_len(stored, key, key_len)) {
+        const Entry& e = _entries[i];
+        size_t stored_len = 0;
+        if (!_entry_key_ok(e, "find.entry_key", &stored_len)) {
+            return nullptr;
+        }
+        if (stored_len == key_len && memcmp(_arena + e.key_off, key, key_len) == 0) {
             return &_entries[i];
         }
     }
@@ -1292,10 +1505,29 @@ void Payload::_add_entry(const char* key, const char* value, size_t value_len, c
 
     const size_t arena_mark = _arena_used;
 
+    // If value points into this Payload's existing arena, _put(key) may grow
+    // the arena and free the old storage before _put(value) gets its own
+    // alias-protection chance.  Snapshot the offset before key insertion and
+    // remap the value pointer after key insertion.  This keeps
+    // p.add("new", p.getString("old")) from copying from a freed arena.
+    uintptr_t value_alias_offset = UINTPTR_MAX;
+    if (_arena && value) {
+        const uintptr_t arena_begin = (uintptr_t)_arena;
+        const uintptr_t arena_end = arena_begin + _arena_used;
+        const uintptr_t value_addr = (uintptr_t)value;
+        if (value_addr >= arena_begin && value_addr < arena_end) {
+            value_alias_offset = value_addr - arena_begin;
+        }
+    }
+
     const uint16_t k_off = _put(key);
     if (k_off == UINT16_MAX) {
         _arena_used = arena_mark;
         return;
+    }
+
+    if (value_alias_offset != UINTPTR_MAX) {
+        value = _arena + value_alias_offset;
     }
 
     const uint16_t v_off = _put(value, value_len);
@@ -1620,8 +1852,15 @@ size_t Payload::write_json(char* buf, size_t buf_size) const {
         if (i) append_char(',');
 
         const Entry& e = _entries[i];
-        const char* key = _at(e.key_off);
-        const char* val = _at(e.val_off);
+        size_t key_len = 0;
+        size_t val_len = 0;
+        if (!_entry_key_ok(e, "write_json.key", &key_len) ||
+            !_entry_value_ok(e, "write_json.value", &val_len)) {
+            overflow = true;
+            break;
+        }
+        const char* key = _arena + e.key_off;
+        const char* val = _arena + e.val_off;
 
         append_char('"');
         append_escaped(key);
@@ -1959,9 +2198,29 @@ bool Payload::has(const char* key) const {
 }
 
 const char* Payload::getString(const char* key) const {
-    const Entry* e = _find(key);
-    if (!e || e->kind != 'p') return nullptr;
-    return _at(e->val_off);
+    return _primitive_value(key, "getString", nullptr);
+}
+
+static bool payload_copy_numeric_token(const Payload* self,
+                                       const char* key,
+                                       const char* value,
+                                       size_t value_len,
+                                       const char* op,
+                                       char* out,
+                                       size_t out_cap) {
+    if (!out || out_cap == 0) return false;
+    out[0] = '\0';
+
+    if (!value) return false;
+    if (value_len == 0 || value_len >= out_cap) {
+        payload_note_last_string_pointer_fault_key(key);
+        payload_note_error(PAYLOAD_ERR_STRING_TOO_LONG, op ? op : "numeric_token", self);
+        return false;
+    }
+
+    memcpy(out, value, value_len);
+    out[value_len] = '\0';
+    return true;
 }
 
 // ============================================================================
@@ -1969,59 +2228,82 @@ const char* Payload::getString(const char* key) const {
 // ============================================================================
 
 bool Payload::tryGetBool(const char* key, bool& out) const {
-    const char* s = getString(key);
+    size_t n = 0;
+    const char* s = _primitive_value(key, "try_bool", &n);
     if (!s) return false;
-    if (payload_cstr_equals_literal(s, "true", "try_bool.true"))  { out = true;  return true; }
-    if (payload_cstr_equals_literal(s, "false", "try_bool.false")) { out = false; return true; }
+    if (n == 4U && memcmp(s, "true", 4U) == 0)  { out = true;  return true; }
+    if (n == 5U && memcmp(s, "false", 5U) == 0) { out = false; return true; }
     return false;
 }
 
 bool Payload::tryGetInt(const char* key, int32_t& out) const {
-    const char* s = getString(key);
-    if (!s) return false;
+    size_t n = 0;
+    const char* s = _primitive_value(key, "try_int", &n);
+    char tmp[48];
+    if (!payload_copy_numeric_token(this, key, s, n, "try_int_token", tmp, sizeof(tmp))) {
+        return false;
+    }
     char* end = nullptr;
-    long v = strtol(s, &end, 10);
+    long v = strtol(tmp, &end, 10);
     if (!end || *end != '\0') return false;
     out = (int32_t)v;
     return true;
 }
 
 bool Payload::tryGetUInt(const char* key, uint32_t& out) const {
-    const char* s = getString(key);
-    if (!s) return false;
+    size_t n = 0;
+    const char* s = _primitive_value(key, "try_uint", &n);
+    char tmp[48];
+    if (!payload_copy_numeric_token(this, key, s, n, "try_uint_token", tmp, sizeof(tmp))) {
+        return false;
+    }
     char* end = nullptr;
-    unsigned long v = strtoul(s, &end, 10);
+    unsigned long v = strtoul(tmp, &end, 10);
     if (!end || *end != '\0') return false;
     out = (uint32_t)v;
     return true;
 }
 
 bool Payload::tryGetUInt64(const char* key, uint64_t& out) const {
-    const char* s = getString(key);
-    if (!s) return false;
+    size_t n = 0;
+    const char* s = _primitive_value(key, "try_uint64", &n);
+    char tmp[48];
+    if (!payload_copy_numeric_token(this, key, s, n, "try_uint64_token", tmp, sizeof(tmp))) {
+        return false;
+    }
     char* end = nullptr;
-    unsigned long long v = strtoull(s, &end, 10);
+    unsigned long long v = strtoull(tmp, &end, 10);
     if (!end || *end != '\0') return false;
     out = (uint64_t)v;
     return true;
 }
 
 bool Payload::tryGetFloat(const char* key, float& out) const {
-    const char* s = getString(key);
-    if (!s) return false;
+    size_t n = 0;
+    const char* s = _primitive_value(key, "try_float", &n);
+    char tmp[96];
+    if (!payload_copy_numeric_token(this, key, s, n, "try_float_token", tmp, sizeof(tmp))) {
+        return false;
+    }
     char* end = nullptr;
-    float v = strtof(s, &end);
+    float v = strtof(tmp, &end);
     if (!end || *end != '\0') return false;
+    if (!isfinite((double)v)) return false;
     out = v;
     return true;
 }
 
 bool Payload::tryGetDouble(const char* key, double& out) const {
-    const char* s = getString(key);
-    if (!s) return false;
+    size_t n = 0;
+    const char* s = _primitive_value(key, "try_double", &n);
+    char tmp[96];
+    if (!payload_copy_numeric_token(this, key, s, n, "try_double_token", tmp, sizeof(tmp))) {
+        return false;
+    }
     char* end = nullptr;
-    double v = strtod(s, &end);
+    double v = strtod(tmp, &end);
     if (!end || *end != '\0') return false;
+    if (!isfinite(v)) return false;
     out = v;
     return true;
 }
@@ -2068,8 +2350,9 @@ Payload Payload::getPayload(const char* key) const {
     Payload p;
     const Entry* e = _find(key);
     if (!e || e->kind != 'o') return p;
-    const char* val = _at(e->val_off);
-    p.parseJSON((const uint8_t*)val, e->val_len);
+    size_t n = 0;
+    if (!_entry_value_ok(*e, "getPayload.value", &n)) return p;
+    p.parseJSON((const uint8_t*)(_arena + e->val_off), n);
     return p;
 }
 
@@ -2077,13 +2360,16 @@ PayloadArray Payload::getArray(const char* key) const {
     PayloadArray arr;
     const Entry* e = _find(key);
     if (!e || e->kind != 'a') return arr;
-    arr.parseJSON(_at(e->val_off));
+    size_t n = 0;
+    if (!_entry_value_ok(*e, "getArray.value", &n)) return arr;
+    (void)n;
+    arr.parseJSON(_arena + e->val_off);
     return arr;
 }
 
 bool Payload::hasArray(const char* key) const {
     const Entry* e = _find(key);
-    return e && e->kind == 'a';
+    return e && e->kind == 'a' && _entry_value_ok(*e, "hasArray.value", nullptr);
 }
 
 PayloadArrayView Payload::getArrayView(const char* key) const {
@@ -2091,7 +2377,11 @@ PayloadArrayView Payload::getArrayView(const char* key) const {
     if (!e || e->kind != 'a') {
         return PayloadArrayView();
     }
-    return PayloadArrayView(_at(e->val_off), e->val_len);
+    size_t n = 0;
+    if (!_entry_value_ok(*e, "getArrayView.value", &n)) {
+        return PayloadArrayView();
+    }
+    return PayloadArrayView(_arena + e->val_off, n);
 }
 
 // ============================================================================
@@ -2130,10 +2420,18 @@ void Payload::debug_dump(const char* tag) const {
             e.kind == 'a' ? "array" :
             "unknown";
 
-        debug_log("payload.key", _at(e.key_off));
+        if (!_entry_key_ok(e, "debug_dump.key", nullptr) ||
+            !_entry_value_ok(e, "debug_dump.value", nullptr)) {
+            debug_log("payload.key", "!invalid_entry");
+            debug_log("payload.kind", kind_str);
+            debug_log("payload.value", "!invalid_entry");
+            continue;
+        }
+
+        debug_log("payload.key", _arena + e.key_off);
         debug_log("payload.kind", kind_str);
 
-        const char* v = _at(e.val_off);
+        const char* v = _arena + e.val_off;
         char preview[96];
         size_t n = e.val_len;
         if (n > sizeof(preview) - 1) n = sizeof(preview) - 1;

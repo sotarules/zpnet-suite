@@ -95,18 +95,18 @@ static volatile bool     g_dwt_calibration_valid = false;
 volatile uint32_t g_counter32_at_pps_vclock = 0;
 volatile uint32_t g_last_vclock_event_counter32_at_event = 0;
 
-clock_state_t       g_vclock_clock = {};
-clock_measurement_t g_vclock_measurement = {};
+clock_state_t       g_vclock_clock DMAMEM = {};
+clock_measurement_t g_vclock_measurement DMAMEM = {};
 
-clock_state_t       g_ocxo1_clock = {};
-clock_state_t       g_ocxo2_clock = {};
+clock_state_t       g_ocxo1_clock DMAMEM = {};
+clock_state_t       g_ocxo2_clock DMAMEM = {};
 
-clock_measurement_t g_ocxo1_measurement = {};
-clock_measurement_t g_ocxo2_measurement = {};
+clock_measurement_t g_ocxo1_measurement DMAMEM = {};
+clock_measurement_t g_ocxo2_measurement DMAMEM = {};
 
-interrupt_capture_diag_t g_pps_witness_diag = {};
-interrupt_capture_diag_t g_ocxo1_interrupt_diag = {};
-interrupt_capture_diag_t g_ocxo2_interrupt_diag = {};
+interrupt_capture_diag_t g_pps_witness_diag DMAMEM = {};
+interrupt_capture_diag_t g_ocxo1_interrupt_diag DMAMEM = {};
+interrupt_capture_diag_t g_ocxo2_interrupt_diag DMAMEM = {};
 
 bool g_ad5693r_init_ok = false;
 
@@ -224,7 +224,7 @@ volatile bool     g_pps_dwt_cycles_between_edges_valid = false;
 volatile int32_t  g_pps_vclock_phase_cycles = 0;
 
 static volatile uint32_t g_pps_vclock_edge_forensics_seq = 0;
-static clocks_pps_vclock_edge_forensics_t g_pps_vclock_edge_forensics = {};
+static clocks_pps_vclock_edge_forensics_t g_pps_vclock_edge_forensics DMAMEM = {};
 
 static volatile uint32_t g_prev_pps_dwt_at_edge = 0;
 static volatile bool     g_prev_pps_dwt_at_edge_valid = false;

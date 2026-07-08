@@ -336,7 +336,7 @@ public:
     // find(), and write_json() repeatedly walk the entire entry table/arena.
     // In normal operation keep only cheap structural checks.  Flip true only
     // for a dedicated Payload autopsy build.
-    static constexpr bool HEAVY_FORENSICS = false;
+    static constexpr bool HEAVY_FORENSICS = true;
 
     static_assert(
         ARENA_MAX <= UINT16_MAX,
@@ -378,6 +378,10 @@ private:
 
     uint16_t _put(const char* str, size_t len);
     uint16_t _put(const char* str);
+
+    bool _entry_key_ok(const Entry& e, const char* op, size_t* out_len = nullptr) const;
+    bool _entry_value_ok(const Entry& e, const char* op, size_t* out_len = nullptr) const;
+    const char* _primitive_value(const char* key, const char* op, size_t* out_len = nullptr) const;
 
     const char* _at(uint16_t offset) const;
     const Entry* _find(const char* key) const;

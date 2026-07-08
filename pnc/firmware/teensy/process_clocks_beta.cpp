@@ -171,7 +171,7 @@ static constexpr bool TIMEBASE_FORENSICS_MINIMAL_PAYLOAD_ENABLED = true;
 //   With this enabled, raw_cycles can directly verify whether the subscriber
 //   published endpoint equals the FloorLine endpoint, without turning the full
 //   deep forensic payload back on.
-static constexpr bool TIMEBASE_FORENSICS_MICRO_RAW_CYCLES_ENABLED = true;
+static constexpr bool TIMEBASE_FORENSICS_MICRO_RAW_CYCLES_ENABLED = false;
 static constexpr bool TIMEBASE_FORENSICS_MINIMAL_HEALTH_FIELDS_ENABLED = false;
 
 // The richer slim/full forensics builders remain compiled for focused future
@@ -1057,8 +1057,8 @@ struct floorline_science_totals_t {
   double   traditional_gnss_interval_total_ns_exact = 0.0;
 };
 
-static floorline_science_totals_t g_floorline_science_ocxo1 = {};
-static floorline_science_totals_t g_floorline_science_ocxo2 = {};
+static floorline_science_totals_t g_floorline_science_ocxo1 DMAMEM = {};
+static floorline_science_totals_t g_floorline_science_ocxo2 DMAMEM = {};
 
 struct delta_residual_reference_t {
   bool     captured = false;
@@ -1078,10 +1078,38 @@ struct delta_residual_bookend_t {
   uint32_t floorline_prev_dwt = 0;
 };
 
-static delta_residual_reference_t g_delta_previous_vclock_reference = {};
-static delta_residual_bookend_t g_delta_vclock_bookends = {};
-static delta_residual_bookend_t g_delta_ocxo1_bookends = {};
-static delta_residual_bookend_t g_delta_ocxo2_bookends = {};
+static delta_residual_reference_t g_delta_previous_vclock_reference DMAMEM = {};
+static delta_residual_bookend_t g_delta_vclock_bookends DMAMEM = {};
+static delta_residual_bookend_t g_delta_ocxo1_bookends DMAMEM = {};
+static delta_residual_bookend_t g_delta_ocxo2_bookends DMAMEM = {};
+
+// RAM1 relief scratch.  These are per-Beta-cycle temporary witnesses that used
+// to be automatic locals in START/prologue and 1 Hz publication paths.  Keeping
+// them in RAM2 avoids compiler-generated stack memset in the same upper-DTCM
+// neighborhood reported by CrashReport.
+static clocks_alpha_lane_forensics_t g_beta_start_vclock_forensics DMAMEM = {};
+static clocks_alpha_lane_forensics_t g_beta_start_ocxo1_forensics DMAMEM = {};
+static clocks_alpha_lane_forensics_t g_beta_start_ocxo2_forensics DMAMEM = {};
+static clocks_alpha_lane_forensics_t g_beta_pps_vclock_forensics DMAMEM = {};
+static clocks_alpha_lane_forensics_t g_beta_pps_ocxo1_forensics DMAMEM = {};
+static clocks_alpha_lane_forensics_t g_beta_pps_ocxo2_forensics DMAMEM = {};
+
+static clocks_alpha_ocxo_pps_projection_snapshot_t
+    g_beta_start_ocxo1_projection DMAMEM = {};
+static clocks_alpha_ocxo_pps_projection_snapshot_t
+    g_beta_start_ocxo2_projection DMAMEM = {};
+static clocks_alpha_ocxo_pps_projection_snapshot_t
+    g_beta_pps_ocxo1_projection DMAMEM = {};
+static clocks_alpha_ocxo_pps_projection_snapshot_t
+    g_beta_pps_ocxo2_projection DMAMEM = {};
+
+static clocks_pps_vclock_edge_forensics_t
+    g_beta_pps_vclock_edge_forensics DMAMEM = {};
+static clocks_alpha_tau_snapshot_t g_beta_pps_ocxo1_alpha_tau DMAMEM = {};
+static clocks_alpha_tau_snapshot_t g_beta_pps_ocxo2_alpha_tau DMAMEM = {};
+static clocks_static_prediction_snapshot_t g_beta_pps_cycle_prediction DMAMEM = {};
+static clocks_static_prediction_snapshot_t g_beta_ocxo1_cycle_prediction DMAMEM = {};
+static clocks_static_prediction_snapshot_t g_beta_ocxo2_cycle_prediction DMAMEM = {};
 
 struct clock_science_row_t {
   bool     valid = false;
@@ -1203,6 +1231,14 @@ struct clock_science_row_t {
   int64_t  alpha_tau_intercept_ns = 0;
   int64_t  alpha_tau_detrended_fast_residual_ns = 0;
 };
+
+static clock_science_row_t g_beta_vclock_science_row DMAMEM = {};
+static clock_science_row_t g_beta_ocxo1_science_row DMAMEM = {};
+static clock_science_row_t g_beta_ocxo2_science_row DMAMEM = {};
+static clock_science_row_t g_beta_probe_ocxo1_science_row DMAMEM = {};
+static clock_science_row_t g_beta_probe_ocxo2_science_row DMAMEM = {};
+static floorline_science_totals_t g_beta_probe_floorline_o1 DMAMEM = {};
+static floorline_science_totals_t g_beta_probe_floorline_o2 DMAMEM = {};
 
 static void delta_residual_state_reset(void) {
   g_delta_previous_vclock_reference = delta_residual_reference_t{};
@@ -1899,8 +1935,12 @@ static bool campaign_start_counterledger_maturity_ready(void) {
 static bool campaign_start_handoff_ready(void) {
   g_start_handoff_check_count++;
 
-  clocks_alpha_ocxo_pps_projection_snapshot_t ocxo1_projection{};
-  clocks_alpha_ocxo_pps_projection_snapshot_t ocxo2_projection{};
+  clocks_alpha_ocxo_pps_projection_snapshot_t& ocxo1_projection =
+      g_beta_start_ocxo1_projection;
+  clocks_alpha_ocxo_pps_projection_snapshot_t& ocxo2_projection =
+      g_beta_start_ocxo2_projection;
+  ocxo1_projection = clocks_alpha_ocxo_pps_projection_snapshot_t{};
+  ocxo2_projection = clocks_alpha_ocxo_pps_projection_snapshot_t{};
   const bool ocxo1_projection_ok =
       clocks_alpha_ocxo_pps_projection_snapshot(time_clock_id_t::OCXO1,
                                                 &ocxo1_projection);
@@ -2601,49 +2641,679 @@ static FLASHMEM void welford_restore_from_summary(welford_t& w,
   w.max_val = max_val;
 }
 
+// ============================================================================
+// CLOCKS-local Payload numeric integrity court
+// ============================================================================
+//
+// Payload owns generic storage integrity.  Beta owns the recovery/control-plane
+// semantics: a present-but-bad recovery numeric is not an optional-missing
+// field; it is a campaign-continuity violation.  Keep the court local to
+// CLOCKS so Payload remains a generic carrier while the watchdog anomaly can
+// carry CLOCKS path/lane/field evidence.
+
+void clocks_watchdog_anomaly_payload(const char* reason,
+                                     const Payload& payload,
+                                     uint32_t detail0,
+                                     uint32_t detail1,
+                                     uint32_t detail2,
+                                     uint32_t detail3);
+
+static volatile bool g_clocks_payload_numeric_integrity_failed DMAMEM = false;
+static volatile uint32_t g_clocks_payload_numeric_integrity_fail_count DMAMEM = 0;
+static volatile uint32_t g_clocks_payload_numeric_last_reject_reason DMAMEM = 0;
+static char g_clocks_payload_numeric_last_path[64] DMAMEM = {0};
+static char g_clocks_payload_numeric_last_key[64] DMAMEM = {0};
+static char g_clocks_payload_numeric_last_token_preview[48] DMAMEM = {0};
+
+static constexpr size_t CLOCKS_PAYLOAD_NUMERIC_TOKEN_SCAN_LIMIT = 96U;
+static constexpr size_t CLOCKS_PAYLOAD_NUMERIC_TOKEN_PREVIEW_LIMIT = 40U;
+
+
+enum clocks_payload_numeric_reject_reason_t : uint32_t {
+  CLOCKS_PAYLOAD_NUMERIC_OK = 0,
+  CLOCKS_PAYLOAD_NUMERIC_NON_PRIMITIVE_OR_INVALID = 1,
+  CLOCKS_PAYLOAD_NUMERIC_EMPTY = 2,
+  CLOCKS_PAYLOAD_NUMERIC_TOO_LONG = 3,
+  CLOCKS_PAYLOAD_NUMERIC_NO_DIGITS = 4,
+  CLOCKS_PAYLOAD_NUMERIC_BAD_CHARACTER = 5,
+  CLOCKS_PAYLOAD_NUMERIC_BAD_DECIMAL_POINT = 6,
+  CLOCKS_PAYLOAD_NUMERIC_BAD_EXPONENT = 7,
+  CLOCKS_PAYLOAD_NUMERIC_EXPONENT_TOO_LARGE = 8,
+  CLOCKS_PAYLOAD_NUMERIC_DOUBLE_OVERFLOW_RISK = 9,
+  CLOCKS_PAYLOAD_NUMERIC_DOUBLE_UNDERFLOW_RISK = 10,
+  CLOCKS_PAYLOAD_NUMERIC_UINT64_OVERFLOW = 11,
+  CLOCKS_PAYLOAD_NUMERIC_LIBC_PARSE_FAILED = 12,
+  CLOCKS_PAYLOAD_NUMERIC_LIBC_NONFINITE = 13,
+};
+
+enum clocks_payload_checked_status_t : uint8_t {
+  CLOCKS_PAYLOAD_FIELD_MISSING = 0,
+  CLOCKS_PAYLOAD_FIELD_OK = 1,
+  CLOCKS_PAYLOAD_FIELD_INVALID = 2,
+};
+
+struct clocks_payload_numeric_court_t {
+  uint32_t reason = CLOCKS_PAYLOAD_NUMERIC_OK;
+  uint32_t token_len = 0;
+  bool negative = false;
+  bool exponent_present = false;
+  bool exponent_negative = false;
+  uint32_t exponent_abs = 0;
+  int32_t magnitude10 = 0;
+  uint32_t digit_count = 0;
+  uint32_t integer_digit_count = 0;
+  char token_preview[CLOCKS_PAYLOAD_NUMERIC_TOKEN_PREVIEW_LIMIT] = {0};
+};
+
+// Numeric court state used to live as automatic stack objects.  That is exactly
+// the wrong place during this crash hunt: aggregate zero-initialization becomes
+// a memset into the upper DTCM stack neighborhood and can fault before it tells
+// us anything useful.  Keep the scratch court in RAM2/DMAMEM and manually clear
+// only the fields we consume.
+static clocks_payload_numeric_court_t
+    g_clocks_payload_numeric_court_scratch DMAMEM = {};
+
+static FLASHMEM clocks_payload_numeric_court_t&
+clocks_payload_numeric_court_scratch(void) {
+  clocks_payload_numeric_court_t& c = g_clocks_payload_numeric_court_scratch;
+  c.reason = CLOCKS_PAYLOAD_NUMERIC_OK;
+  c.token_len = 0U;
+  c.negative = false;
+  c.exponent_present = false;
+  c.exponent_negative = false;
+  c.exponent_abs = 0U;
+  c.magnitude10 = 0;
+  c.digit_count = 0U;
+  c.integer_digit_count = 0U;
+  c.token_preview[0] = '\0';
+  return c;
+}
+
+static inline void clocks_payload_numeric_integrity_reset(void) {
+  g_clocks_payload_numeric_integrity_failed = false;
+}
+
+static FLASHMEM const char* clocks_payload_numeric_reject_reason_name(
+    uint32_t reason) {
+  switch (reason) {
+    case CLOCKS_PAYLOAD_NUMERIC_OK: return "OK";
+    case CLOCKS_PAYLOAD_NUMERIC_NON_PRIMITIVE_OR_INVALID:
+      return "NON_PRIMITIVE_OR_INVALID";
+    case CLOCKS_PAYLOAD_NUMERIC_EMPTY: return "EMPTY";
+    case CLOCKS_PAYLOAD_NUMERIC_TOO_LONG: return "TOO_LONG";
+    case CLOCKS_PAYLOAD_NUMERIC_NO_DIGITS: return "NO_DIGITS";
+    case CLOCKS_PAYLOAD_NUMERIC_BAD_CHARACTER: return "BAD_CHARACTER";
+    case CLOCKS_PAYLOAD_NUMERIC_BAD_DECIMAL_POINT: return "BAD_DECIMAL_POINT";
+    case CLOCKS_PAYLOAD_NUMERIC_BAD_EXPONENT: return "BAD_EXPONENT";
+    case CLOCKS_PAYLOAD_NUMERIC_EXPONENT_TOO_LARGE: return "EXPONENT_TOO_LARGE";
+    case CLOCKS_PAYLOAD_NUMERIC_DOUBLE_OVERFLOW_RISK:
+      return "DOUBLE_OVERFLOW_RISK";
+    case CLOCKS_PAYLOAD_NUMERIC_DOUBLE_UNDERFLOW_RISK:
+      return "DOUBLE_UNDERFLOW_RISK";
+    case CLOCKS_PAYLOAD_NUMERIC_UINT64_OVERFLOW: return "UINT64_OVERFLOW";
+    case CLOCKS_PAYLOAD_NUMERIC_LIBC_PARSE_FAILED: return "LIBC_PARSE_FAILED";
+    case CLOCKS_PAYLOAD_NUMERIC_LIBC_NONFINITE: return "LIBC_NONFINITE";
+    default: return "UNKNOWN";
+  }
+}
+
+static FLASHMEM size_t clocks_payload_bounded_strlen(const char* s,
+                                                     size_t cap) {
+  if (!s) return 0;
+  size_t n = 0;
+  while (n < cap && s[n] != '\0') n++;
+  return n;
+}
+
+static FLASHMEM void clocks_payload_copy_token_preview(
+    char* dst,
+    size_t dst_cap,
+    const char* token,
+    size_t token_len) {
+  if (!dst || dst_cap == 0U) return;
+  size_t n = token_len;
+  if (n > dst_cap - 1U) n = dst_cap - 1U;
+  if (token && n != 0U) memcpy(dst, token, n);
+  dst[n] = '\0';
+}
+
+static FLASHMEM void clocks_payload_numeric_note_failure(
+    const char* path,
+    const char* key,
+    const clocks_payload_numeric_court_t& court) {
+  g_clocks_payload_numeric_integrity_failed = true;
+  g_clocks_payload_numeric_integrity_fail_count++;
+  g_clocks_payload_numeric_last_reject_reason = court.reason;
+  safeCopy(g_clocks_payload_numeric_last_path,
+           sizeof(g_clocks_payload_numeric_last_path),
+           path ? path : "");
+  safeCopy(g_clocks_payload_numeric_last_key,
+           sizeof(g_clocks_payload_numeric_last_key),
+           key ? key : "");
+  safeCopy(g_clocks_payload_numeric_last_token_preview,
+           sizeof(g_clocks_payload_numeric_last_token_preview),
+           court.token_preview);
+}
+
+static FLASHMEM void clocks_payload_numeric_emit_watchdog(
+    const Payload& payload,
+    const char* context,
+    const char* path,
+    const char* lane,
+    const char* field,
+    const char* key,
+    const clocks_payload_numeric_court_t& court) {
+  clocks_payload_numeric_note_failure(path, key, court);
+
+  if (!clocks_watchdog_campaign_armed() && !watchdog_campaign_surrendered) {
+    return;
+  }
+
+  Payload p;
+  p.add("schema", "CLOCKS_PAYLOAD_NUMERIC_INTEGRITY_V1");
+  p.add("reason", "payload_numeric_integrity_failed");
+  p.add("context", context ? context : "payload_numeric");
+  p.add("path", path ? path : "");
+  p.add("lane", lane ? lane : "");
+  p.add("field", field ? field : "");
+  p.add("key", key ? key : "");
+  p.add("campaign", campaign_name);
+  p.add("campaign_seconds", campaign_seconds);
+  p.add("reject_reason_id", court.reason);
+  p.add("reject_reason", clocks_payload_numeric_reject_reason_name(court.reason));
+  p.add("token_len", court.token_len);
+  p.add("token_preview", court.token_preview);
+  p.add("negative", court.negative);
+  p.add("exponent_present", court.exponent_present);
+  p.add("exponent_negative", court.exponent_negative);
+  p.add("exponent_abs", court.exponent_abs);
+  p.add("magnitude10", court.magnitude10);
+  p.add("digit_count", court.digit_count);
+  p.add("integer_digit_count", court.integer_digit_count);
+  p.add("payload_count", (uint32_t)payload.count());
+  p.add("payload_arena_used", (uint32_t)payload.arena_used());
+  p.add("payload_arena_cap", (uint32_t)payload.arena_capacity());
+  p.add("payload_entry_cap", (uint32_t)payload.entry_capacity());
+  p.add("integrity_fail_count", (uint32_t)g_clocks_payload_numeric_integrity_fail_count);
+  p.add("watchdog_campaign_armed", clocks_watchdog_campaign_armed());
+
+  clocks_watchdog_anomaly_payload("payload_numeric_integrity_failed",
+                                  p,
+                                  court.reason,
+                                  court.token_len,
+                                  (uint32_t)payload.count(),
+                                  (uint32_t)payload.arena_used());
+}
+
+static FLASHMEM clocks_payload_checked_status_t clocks_payload_fetch_token(
+    const Payload& payload,
+    const char* key,
+    const char* context,
+    const char* path,
+    const char* lane,
+    const char* field,
+    const char*& token,
+    size_t& token_len) {
+  token = nullptr;
+  token_len = 0;
+  if (!key || !payload.has(key)) {
+    return CLOCKS_PAYLOAD_FIELD_MISSING;
+  }
+
+  token = payload.getString(key);
+  if (!token) {
+    clocks_payload_numeric_court_t& court = clocks_payload_numeric_court_scratch();
+    court.reason = CLOCKS_PAYLOAD_NUMERIC_NON_PRIMITIVE_OR_INVALID;
+    clocks_payload_numeric_emit_watchdog(payload, context, path, lane,
+                                         field, key, court);
+    return CLOCKS_PAYLOAD_FIELD_INVALID;
+  }
+
+  token_len = clocks_payload_bounded_strlen(
+      token, CLOCKS_PAYLOAD_NUMERIC_TOKEN_SCAN_LIMIT);
+  if (token_len >= CLOCKS_PAYLOAD_NUMERIC_TOKEN_SCAN_LIMIT) {
+    clocks_payload_numeric_court_t& court = clocks_payload_numeric_court_scratch();
+    court.reason = CLOCKS_PAYLOAD_NUMERIC_TOO_LONG;
+    court.token_len = (uint32_t)token_len;
+    clocks_payload_copy_token_preview(court.token_preview,
+                                      sizeof(court.token_preview),
+                                      token,
+                                      token_len);
+    clocks_payload_numeric_emit_watchdog(payload, context, path, lane,
+                                         field, key, court);
+    return CLOCKS_PAYLOAD_FIELD_INVALID;
+  }
+
+  return CLOCKS_PAYLOAD_FIELD_OK;
+}
+
+static FLASHMEM bool clocks_payload_numeric_char_is_digit(char c) {
+  return c >= '0' && c <= '9';
+}
+
+static FLASHMEM bool clocks_payload_validate_uint64_token(
+    const char* token,
+    size_t token_len,
+    clocks_payload_numeric_court_t& court,
+    uint64_t& out) {
+  out = 0ULL;
+  court.token_len = (uint32_t)token_len;
+  clocks_payload_copy_token_preview(court.token_preview,
+                                    sizeof(court.token_preview),
+                                    token,
+                                    token_len);
+
+  if (!token || token_len == 0U) {
+    court.reason = CLOCKS_PAYLOAD_NUMERIC_EMPTY;
+    return false;
+  }
+  if (token_len > 20U) {
+    court.reason = CLOCKS_PAYLOAD_NUMERIC_TOO_LONG;
+    return false;
+  }
+
+  uint64_t v = 0ULL;
+  for (size_t i = 0; i < token_len; i++) {
+    const char c = token[i];
+    if (!clocks_payload_numeric_char_is_digit(c)) {
+      court.reason = CLOCKS_PAYLOAD_NUMERIC_BAD_CHARACTER;
+      return false;
+    }
+    const uint32_t d = (uint32_t)(c - '0');
+    if (v > (UINT64_MAX - (uint64_t)d) / 10ULL) {
+      court.reason = CLOCKS_PAYLOAD_NUMERIC_UINT64_OVERFLOW;
+      return false;
+    }
+    v = v * 10ULL + (uint64_t)d;
+    court.digit_count++;
+    court.integer_digit_count++;
+  }
+
+  out = v;
+  court.reason = CLOCKS_PAYLOAD_NUMERIC_OK;
+  return true;
+}
+
+static FLASHMEM bool clocks_payload_validate_double_token(
+    const char* token,
+    size_t token_len,
+    clocks_payload_numeric_court_t& court) {
+  court.token_len = (uint32_t)token_len;
+  clocks_payload_copy_token_preview(court.token_preview,
+                                    sizeof(court.token_preview),
+                                    token,
+                                    token_len);
+
+  if (!token || token_len == 0U) {
+    court.reason = CLOCKS_PAYLOAD_NUMERIC_EMPTY;
+    return false;
+  }
+  if (token_len >= CLOCKS_PAYLOAD_NUMERIC_TOKEN_SCAN_LIMIT) {
+    court.reason = CLOCKS_PAYLOAD_NUMERIC_TOO_LONG;
+    return false;
+  }
+
+  size_t i = 0;
+  if (token[i] == '+' || token[i] == '-') {
+    court.negative = token[i] == '-';
+    i++;
+    if (i >= token_len) {
+      court.reason = CLOCKS_PAYLOAD_NUMERIC_NO_DIGITS;
+      return false;
+    }
+  }
+
+  bool seen_dot = false;
+  bool seen_digit = false;
+  bool seen_nonzero = false;
+  uint32_t integer_digit_count = 0;
+  uint32_t leading_integer_zero_count = 0;
+  uint32_t fractional_digit_index = 0;
+  uint32_t first_nonzero_fraction_index = 0;
+  bool first_nonzero_in_fraction = false;
+
+  while (i < token_len) {
+    const char c = token[i];
+    if (clocks_payload_numeric_char_is_digit(c)) {
+      seen_digit = true;
+      court.digit_count++;
+      if (!seen_dot) {
+        integer_digit_count++;
+        if (!seen_nonzero && c == '0') {
+          leading_integer_zero_count++;
+        }
+        if (c != '0' && !seen_nonzero) {
+          seen_nonzero = true;
+        }
+      } else {
+        if (c != '0' && !seen_nonzero) {
+          seen_nonzero = true;
+          first_nonzero_in_fraction = true;
+          first_nonzero_fraction_index = fractional_digit_index;
+        }
+        fractional_digit_index++;
+      }
+      i++;
+      continue;
+    }
+
+    if (c == '.') {
+      if (seen_dot) {
+        court.reason = CLOCKS_PAYLOAD_NUMERIC_BAD_DECIMAL_POINT;
+        return false;
+      }
+      seen_dot = true;
+      i++;
+      continue;
+    }
+
+    if (c == 'e' || c == 'E') {
+      court.exponent_present = true;
+      i++;
+      if (i >= token_len) {
+        court.reason = CLOCKS_PAYLOAD_NUMERIC_BAD_EXPONENT;
+        return false;
+      }
+      if (token[i] == '+' || token[i] == '-') {
+        court.exponent_negative = token[i] == '-';
+        i++;
+        if (i >= token_len) {
+          court.reason = CLOCKS_PAYLOAD_NUMERIC_BAD_EXPONENT;
+          return false;
+        }
+      }
+      bool exp_digit = false;
+      uint32_t exp_abs = 0;
+      while (i < token_len) {
+        const char e = token[i];
+        if (!clocks_payload_numeric_char_is_digit(e)) {
+          court.reason = CLOCKS_PAYLOAD_NUMERIC_BAD_CHARACTER;
+          return false;
+        }
+        exp_digit = true;
+        const uint32_t d = (uint32_t)(e - '0');
+        if (exp_abs > 1000000U) {
+          court.reason = CLOCKS_PAYLOAD_NUMERIC_EXPONENT_TOO_LARGE;
+          return false;
+        }
+        exp_abs = exp_abs * 10U + d;
+        i++;
+      }
+      if (!exp_digit) {
+        court.reason = CLOCKS_PAYLOAD_NUMERIC_BAD_EXPONENT;
+        return false;
+      }
+      court.exponent_abs = exp_abs;
+      break;
+    }
+
+    court.reason = CLOCKS_PAYLOAD_NUMERIC_BAD_CHARACTER;
+    return false;
+  }
+
+  if (!seen_digit || court.digit_count == 0U) {
+    court.reason = CLOCKS_PAYLOAD_NUMERIC_NO_DIGITS;
+    return false;
+  }
+
+  court.integer_digit_count = integer_digit_count;
+
+  // Even an all-zero mantissa with a wildly large exponent is not useful
+  // recovery evidence, and keeping it away from libc avoids implementation
+  // range/error side paths during this investigation.
+  if (court.exponent_present && court.exponent_abs > 400U) {
+    court.reason = CLOCKS_PAYLOAD_NUMERIC_EXPONENT_TOO_LARGE;
+    return false;
+  }
+
+  if (seen_nonzero) {
+    int32_t magnitude10 = 0;
+    if (first_nonzero_in_fraction) {
+      magnitude10 = -(int32_t)(first_nonzero_fraction_index + 1U);
+    } else {
+      const uint32_t significant_integer_digits =
+          integer_digit_count - leading_integer_zero_count;
+      magnitude10 = significant_integer_digits
+          ? (int32_t)(significant_integer_digits - 1U)
+          : 0;
+    }
+
+    if (court.exponent_present) {
+      if (court.exponent_abs > 10000U) {
+        court.reason = CLOCKS_PAYLOAD_NUMERIC_EXPONENT_TOO_LARGE;
+        return false;
+      }
+      const int32_t signed_exp = court.exponent_negative
+          ? -(int32_t)court.exponent_abs
+          : (int32_t)court.exponent_abs;
+      magnitude10 += signed_exp;
+    }
+
+    court.magnitude10 = magnitude10;
+
+    // Keep libc away from range-error paths.  These limits are deliberately
+    // conservative for recovery science fields: legitimate Welford/DAC values
+    // are nowhere near IEEE double overflow or subnormal-underflow territory.
+    if (magnitude10 > 307) {
+      court.reason = CLOCKS_PAYLOAD_NUMERIC_DOUBLE_OVERFLOW_RISK;
+      return false;
+    }
+    if (magnitude10 < -300) {
+      court.reason = CLOCKS_PAYLOAD_NUMERIC_DOUBLE_UNDERFLOW_RISK;
+      return false;
+    }
+  }
+
+  court.reason = CLOCKS_PAYLOAD_NUMERIC_OK;
+  return true;
+}
+
+static FLASHMEM clocks_payload_checked_status_t clocks_payload_try_get_u64_checked(
+    const Payload& payload,
+    const char* key,
+    const char* context,
+    const char* path,
+    const char* lane,
+    const char* field,
+    uint64_t& out) {
+  const char* token = nullptr;
+  size_t token_len = 0;
+  const clocks_payload_checked_status_t fetched =
+      clocks_payload_fetch_token(payload, key, context, path, lane, field,
+                                 token, token_len);
+  if (fetched != CLOCKS_PAYLOAD_FIELD_OK) return fetched;
+
+  clocks_payload_numeric_court_t& court = clocks_payload_numeric_court_scratch();
+  if (!clocks_payload_validate_uint64_token(token, token_len, court, out)) {
+    clocks_payload_numeric_emit_watchdog(payload, context, path, lane,
+                                         field, key, court);
+    return CLOCKS_PAYLOAD_FIELD_INVALID;
+  }
+  return CLOCKS_PAYLOAD_FIELD_OK;
+}
+
+static FLASHMEM clocks_payload_checked_status_t clocks_payload_try_get_double_checked(
+    const Payload& payload,
+    const char* key,
+    const char* context,
+    const char* path,
+    const char* lane,
+    const char* field,
+    double& out) {
+  const char* token = nullptr;
+  size_t token_len = 0;
+  const clocks_payload_checked_status_t fetched =
+      clocks_payload_fetch_token(payload, key, context, path, lane, field,
+                                 token, token_len);
+  if (fetched != CLOCKS_PAYLOAD_FIELD_OK) return fetched;
+
+  clocks_payload_numeric_court_t& court = clocks_payload_numeric_court_scratch();
+  if (!clocks_payload_validate_double_token(token, token_len, court)) {
+    clocks_payload_numeric_emit_watchdog(payload, context, path, lane,
+                                         field, key, court);
+    return CLOCKS_PAYLOAD_FIELD_INVALID;
+  }
+
+  if (!payload.tryGetDouble(key, out)) {
+    court.reason = CLOCKS_PAYLOAD_NUMERIC_LIBC_PARSE_FAILED;
+    clocks_payload_numeric_emit_watchdog(payload, context, path, lane,
+                                         field, key, court);
+    return CLOCKS_PAYLOAD_FIELD_INVALID;
+  }
+  if (!isfinite(out)) {
+    court.reason = CLOCKS_PAYLOAD_NUMERIC_LIBC_NONFINITE;
+    clocks_payload_numeric_emit_watchdog(payload, context, path, lane,
+                                         field, key, court);
+    return CLOCKS_PAYLOAD_FIELD_INVALID;
+  }
+  return CLOCKS_PAYLOAD_FIELD_OK;
+}
+
+static FLASHMEM Payload clocks_payload_numeric_reject_response(
+    const char* status) {
+  Payload err;
+  err.add("error", "payload numeric integrity failure");
+  err.add("status", status ? status : "rejected_numeric_integrity");
+  err.add("numeric_integrity_fail_count",
+          (uint32_t)g_clocks_payload_numeric_integrity_fail_count);
+  err.add("numeric_last_reject_reason_id",
+          (uint32_t)g_clocks_payload_numeric_last_reject_reason);
+  err.add("numeric_last_reject_reason",
+          clocks_payload_numeric_reject_reason_name(
+              g_clocks_payload_numeric_last_reject_reason));
+  err.add("numeric_last_path", g_clocks_payload_numeric_last_path);
+  err.add("numeric_last_key", g_clocks_payload_numeric_last_key);
+  err.add("numeric_last_token_preview",
+          g_clocks_payload_numeric_last_token_preview);
+  return err;
+}
+
 static FLASHMEM bool payload_try_get_welford_object(const Payload& obj,
+                                           const char* path,
+                                           const char* lane,
                                            welford_t& out) {
+  if (g_clocks_payload_numeric_integrity_failed) return false;
+
   uint64_t n = 0;
   double mean = 0.0;
-  if (!obj.tryGetUInt64("n", n) || !obj.tryGetDouble("mean", mean)) {
+  if (clocks_payload_try_get_u64_checked(obj, "n",
+                                         "recovery_welford",
+                                         path,
+                                         lane,
+                                         "n",
+                                         n) != CLOCKS_PAYLOAD_FIELD_OK ||
+      clocks_payload_try_get_double_checked(obj, "mean",
+                                            "recovery_welford",
+                                            path,
+                                            lane,
+                                            "mean",
+                                            mean) != CLOCKS_PAYLOAD_FIELD_OK) {
     return false;
   }
 
   double stddev = 0.0;
-  if (!obj.tryGetDouble("stddev", stddev)) {
+  const clocks_payload_checked_status_t stddev_status =
+      clocks_payload_try_get_double_checked(obj, "stddev",
+                                            "recovery_welford",
+                                            path,
+                                            lane,
+                                            "stddev",
+                                            stddev);
+  if (stddev_status == CLOCKS_PAYLOAD_FIELD_INVALID) {
+    return false;
+  }
+  if (stddev_status == CLOCKS_PAYLOAD_FIELD_MISSING) {
     double stderr_value = 0.0;
-    if (obj.tryGetDouble("stderr", stderr_value) && n > 0ULL) {
+    const clocks_payload_checked_status_t stderr_status =
+        clocks_payload_try_get_double_checked(obj, "stderr",
+                                              "recovery_welford",
+                                              path,
+                                              lane,
+                                              "stderr",
+                                              stderr_value);
+    if (stderr_status == CLOCKS_PAYLOAD_FIELD_INVALID) {
+      return false;
+    }
+    if (stderr_status == CLOCKS_PAYLOAD_FIELD_OK && n > 0ULL) {
       stddev = stderr_value * sqrt((double)n);
     }
   }
 
   double min_val = mean;
   double max_val = mean;
-  (void)obj.tryGetDouble("min", min_val);
-  (void)obj.tryGetDouble("max", max_val);
+  const clocks_payload_checked_status_t min_status =
+      clocks_payload_try_get_double_checked(obj, "min",
+                                            "recovery_welford",
+                                            path,
+                                            lane,
+                                            "min",
+                                            min_val);
+  if (min_status == CLOCKS_PAYLOAD_FIELD_INVALID) return false;
+  const clocks_payload_checked_status_t max_status =
+      clocks_payload_try_get_double_checked(obj, "max",
+                                            "recovery_welford",
+                                            path,
+                                            lane,
+                                            "max",
+                                            max_val);
+  if (max_status == CLOCKS_PAYLOAD_FIELD_INVALID) return false;
+
   welford_restore_from_summary(out, n, mean, stddev, min_val, max_val);
   return true;
 }
 
 static FLASHMEM bool payload_try_get_welford_flat(const Payload& args,
                                          const char* prefix,
+                                         const char* path,
                                          welford_t& out) {
-  char key[96];
+  if (g_clocks_payload_numeric_integrity_failed) return false;
+
+  char key[64];
 
   uint64_t n = 0;
   snprintf(key, sizeof(key), "%s_welford_n", prefix);
-  if (!args.tryGetUInt64(key, n)) return false;
+  if (clocks_payload_try_get_u64_checked(args, key,
+                                         "recovery_welford_flat",
+                                         path,
+                                         prefix,
+                                         "n",
+                                         n) != CLOCKS_PAYLOAD_FIELD_OK) {
+    return false;
+  }
 
   double mean = 0.0;
   snprintf(key, sizeof(key), "%s_welford_mean", prefix);
-  if (!args.tryGetDouble(key, mean)) return false;
+  if (clocks_payload_try_get_double_checked(args, key,
+                                            "recovery_welford_flat",
+                                            path,
+                                            prefix,
+                                            "mean",
+                                            mean) != CLOCKS_PAYLOAD_FIELD_OK) {
+    return false;
+  }
 
   double stddev = 0.0;
   snprintf(key, sizeof(key), "%s_welford_stddev", prefix);
-  if (!args.tryGetDouble(key, stddev)) {
+  const clocks_payload_checked_status_t stddev_status =
+      clocks_payload_try_get_double_checked(args, key,
+                                            "recovery_welford_flat",
+                                            path,
+                                            prefix,
+                                            "stddev",
+                                            stddev);
+  if (stddev_status == CLOCKS_PAYLOAD_FIELD_INVALID) return false;
+  if (stddev_status == CLOCKS_PAYLOAD_FIELD_MISSING) {
     double stderr_value = 0.0;
     snprintf(key, sizeof(key), "%s_welford_stderr", prefix);
-    if (args.tryGetDouble(key, stderr_value) && n > 0ULL) {
+    const clocks_payload_checked_status_t stderr_status =
+        clocks_payload_try_get_double_checked(args, key,
+                                              "recovery_welford_flat",
+                                              path,
+                                              prefix,
+                                              "stderr",
+                                              stderr_value);
+    if (stderr_status == CLOCKS_PAYLOAD_FIELD_INVALID) return false;
+    if (stderr_status == CLOCKS_PAYLOAD_FIELD_OK && n > 0ULL) {
       stddev = stderr_value * sqrt((double)n);
     }
   }
@@ -2651,34 +3321,59 @@ static FLASHMEM bool payload_try_get_welford_flat(const Payload& args,
   double min_val = mean;
   double max_val = mean;
   snprintf(key, sizeof(key), "%s_welford_min", prefix);
-  (void)args.tryGetDouble(key, min_val);
+  const clocks_payload_checked_status_t min_status =
+      clocks_payload_try_get_double_checked(args, key,
+                                            "recovery_welford_flat",
+                                            path,
+                                            prefix,
+                                            "min",
+                                            min_val);
+  if (min_status == CLOCKS_PAYLOAD_FIELD_INVALID) return false;
   snprintf(key, sizeof(key), "%s_welford_max", prefix);
-  (void)args.tryGetDouble(key, max_val);
+  const clocks_payload_checked_status_t max_status =
+      clocks_payload_try_get_double_checked(args, key,
+                                            "recovery_welford_flat",
+                                            path,
+                                            prefix,
+                                            "max",
+                                            max_val);
+  if (max_status == CLOCKS_PAYLOAD_FIELD_INVALID) return false;
 
   welford_restore_from_summary(out, n, mean, stddev, min_val, max_val);
   return true;
 }
 
 static FLASHMEM bool payload_try_get_stats_welford(const Payload& root,
+                                          const char* root_path,
                                           const char* stats_key,
                                           welford_t& out) {
+  if (g_clocks_payload_numeric_integrity_failed) return false;
+
   const Payload stats = root.getPayload("stats");
   if (stats.empty()) return false;
 
   const Payload lane = stats.getPayload(stats_key);
   if (lane.empty()) return false;
 
+  const char* path = root_path ? root_path : "root";
+
   const Payload nested = lane.getPayload("welford");
-  if (!nested.empty() && payload_try_get_welford_object(nested, out)) {
-    return true;
+  if (!nested.empty()) {
+    if (payload_try_get_welford_object(nested, path, stats_key, out)) {
+      return true;
+    }
+    if (g_clocks_payload_numeric_integrity_failed) return false;
   }
 
-  return payload_try_get_welford_object(lane, out);
+  return payload_try_get_welford_object(lane, path, stats_key, out);
 }
 
 static FLASHMEM bool payload_try_get_stats_dac_welford(const Payload& root,
+                                              const char* root_path,
                                               const char* dac_key,
                                               welford_t& out) {
+  if (g_clocks_payload_numeric_integrity_failed) return false;
+
   const Payload stats = root.getPayload("stats");
   if (stats.empty()) return false;
 
@@ -2688,7 +3383,8 @@ static FLASHMEM bool payload_try_get_stats_dac_welford(const Payload& root,
   const Payload lane = dac.getPayload(dac_key);
   if (lane.empty()) return false;
 
-  return payload_try_get_welford_object(lane, out);
+  const char* path = root_path ? root_path : "root";
+  return payload_try_get_welford_object(lane, path, dac_key, out);
 }
 
 static FLASHMEM bool payload_try_get_recovery_welford(const Payload& args,
@@ -2696,39 +3392,55 @@ static FLASHMEM bool payload_try_get_recovery_welford(const Payload& args,
                                              const char* stats_key,
                                              bool dac_stats,
                                              welford_t& out) {
-  if (payload_try_get_welford_flat(args, flat_prefix, out)) return true;
+  if (g_clocks_payload_numeric_integrity_failed) return false;
+
+  if (payload_try_get_welford_flat(args, flat_prefix, "args", out)) return true;
+  if (g_clocks_payload_numeric_integrity_failed) return false;
   if (dac_stats) {
-    if (payload_try_get_stats_dac_welford(args, stats_key, out)) return true;
-  } else if (payload_try_get_stats_welford(args, stats_key, out)) {
+    if (payload_try_get_stats_dac_welford(args, "args", stats_key, out)) return true;
+  } else if (payload_try_get_stats_welford(args, "args", stats_key, out)) {
     return true;
   }
+  if (g_clocks_payload_numeric_integrity_failed) return false;
 
   const Payload fragment = args.getPayload("fragment");
   if (!fragment.empty()) {
-    if (payload_try_get_welford_flat(fragment, flat_prefix, out)) return true;
+    if (payload_try_get_welford_flat(fragment, flat_prefix, "args.fragment", out)) return true;
+    if (g_clocks_payload_numeric_integrity_failed) return false;
     if (dac_stats) {
-      if (payload_try_get_stats_dac_welford(fragment, stats_key, out)) return true;
-    } else if (payload_try_get_stats_welford(fragment, stats_key, out)) {
+      if (payload_try_get_stats_dac_welford(fragment, "args.fragment", stats_key, out)) return true;
+    } else if (payload_try_get_stats_welford(fragment, "args.fragment", stats_key, out)) {
       return true;
     }
+    if (g_clocks_payload_numeric_integrity_failed) return false;
   }
 
   const Payload payload = args.getPayload("payload");
   if (!payload.empty()) {
-    if (payload_try_get_welford_flat(payload, flat_prefix, out)) return true;
+    if (payload_try_get_welford_flat(payload, flat_prefix, "args.payload", out)) return true;
+    if (g_clocks_payload_numeric_integrity_failed) return false;
     if (dac_stats) {
-      if (payload_try_get_stats_dac_welford(payload, stats_key, out)) return true;
-    } else if (payload_try_get_stats_welford(payload, stats_key, out)) {
+      if (payload_try_get_stats_dac_welford(payload, "args.payload", stats_key, out)) return true;
+    } else if (payload_try_get_stats_welford(payload, "args.payload", stats_key, out)) {
       return true;
     }
+    if (g_clocks_payload_numeric_integrity_failed) return false;
 
     const Payload payload_fragment = payload.getPayload("fragment");
     if (!payload_fragment.empty()) {
-      if (payload_try_get_welford_flat(payload_fragment, flat_prefix, out)) return true;
+      if (payload_try_get_welford_flat(payload_fragment, flat_prefix,
+                                       "args.payload.fragment", out)) return true;
+      if (g_clocks_payload_numeric_integrity_failed) return false;
       if (dac_stats) {
-        return payload_try_get_stats_dac_welford(payload_fragment, stats_key, out);
+        return payload_try_get_stats_dac_welford(payload_fragment,
+                                                "args.payload.fragment",
+                                                stats_key,
+                                                out);
       }
-      return payload_try_get_stats_welford(payload_fragment, stats_key, out);
+      return payload_try_get_stats_welford(payload_fragment,
+                                          "args.payload.fragment",
+                                          stats_key,
+                                          out);
     }
   }
 
@@ -2751,43 +3463,50 @@ static FLASHMEM bool recover_welford_capture_lane(const Payload& args,
   return has_lane;
 }
 
-static FLASHMEM void recover_welfords_capture(const Payload& args) {
+static FLASHMEM bool recover_welfords_capture(const Payload& args) {
   g_recover_welfords_pending = recover_welford_state_t{};
 
   uint32_t count = 0;
-  (void)recover_welford_capture_lane(args, "dwt", "dwt", false,
-                                     g_recover_welfords_pending.has_dwt,
-                                     g_recover_welfords_pending.dwt,
-                                     count);
-  (void)recover_welford_capture_lane(args, "vclock", "vclock", false,
-                                     g_recover_welfords_pending.has_vclock,
-                                     g_recover_welfords_pending.vclock,
-                                     count);
-  (void)recover_welford_capture_lane(args, "ocxo1", "ocxo1", false,
-                                     g_recover_welfords_pending.has_ocxo1,
-                                     g_recover_welfords_pending.ocxo1,
-                                     count);
-  (void)recover_welford_capture_lane(args, "ocxo2", "ocxo2", false,
-                                     g_recover_welfords_pending.has_ocxo2,
-                                     g_recover_welfords_pending.ocxo2,
-                                     count);
-  (void)recover_welford_capture_lane(args, "pps_witness", "pps_witness", false,
-                                     g_recover_welfords_pending.has_pps_witness,
-                                     g_recover_welfords_pending.pps_witness,
-                                     count);
-  (void)recover_welford_capture_lane(args, "ocxo1_dac", "ocxo1", true,
-                                     g_recover_welfords_pending.has_ocxo1_dac,
-                                     g_recover_welfords_pending.ocxo1_dac,
-                                     count);
-  (void)recover_welford_capture_lane(args, "ocxo2_dac", "ocxo2", true,
-                                     g_recover_welfords_pending.has_ocxo2_dac,
-                                     g_recover_welfords_pending.ocxo2_dac,
-                                     count);
+
+#define RECOVER_WELFORD_CAPTURE_ONE(flat_prefix, stats_key, dac_stats, has_flag, dst) \
+  do { \
+    (void)recover_welford_capture_lane(args, flat_prefix, stats_key, dac_stats, \
+                                       has_flag, dst, count); \
+    if (g_clocks_payload_numeric_integrity_failed) { \
+      g_recover_welfords_pending = recover_welford_state_t{}; \
+      return false; \
+    } \
+  } while (0)
+
+  RECOVER_WELFORD_CAPTURE_ONE("dwt", "dwt", false,
+                              g_recover_welfords_pending.has_dwt,
+                              g_recover_welfords_pending.dwt);
+  RECOVER_WELFORD_CAPTURE_ONE("vclock", "vclock", false,
+                              g_recover_welfords_pending.has_vclock,
+                              g_recover_welfords_pending.vclock);
+  RECOVER_WELFORD_CAPTURE_ONE("ocxo1", "ocxo1", false,
+                              g_recover_welfords_pending.has_ocxo1,
+                              g_recover_welfords_pending.ocxo1);
+  RECOVER_WELFORD_CAPTURE_ONE("ocxo2", "ocxo2", false,
+                              g_recover_welfords_pending.has_ocxo2,
+                              g_recover_welfords_pending.ocxo2);
+  RECOVER_WELFORD_CAPTURE_ONE("pps_witness", "pps_witness", false,
+                              g_recover_welfords_pending.has_pps_witness,
+                              g_recover_welfords_pending.pps_witness);
+  RECOVER_WELFORD_CAPTURE_ONE("ocxo1_dac", "ocxo1", true,
+                              g_recover_welfords_pending.has_ocxo1_dac,
+                              g_recover_welfords_pending.ocxo1_dac);
+  RECOVER_WELFORD_CAPTURE_ONE("ocxo2_dac", "ocxo2", true,
+                              g_recover_welfords_pending.has_ocxo2_dac,
+                              g_recover_welfords_pending.ocxo2_dac);
+
+#undef RECOVER_WELFORD_CAPTURE_ONE
 
   g_recover_welfords_pending.restored_lane_count = count;
   if (count != 0U) {
     g_recover_welford_capture_count++;
   }
+  return true;
 }
 
 static void recover_welfords_apply_pending(void) {
@@ -3747,12 +4466,16 @@ struct ocxo_cycle_residual_diag_t {
   int64_t  diagnostic_minus_traditional = 0;
 };
 
-static ocxo_cycle_residual_diag_t ocxo_cycle_residual_diag_build(
+static ocxo_cycle_residual_diag_t g_beta_ocxo1_cycle_residual_diag DMAMEM = {};
+static ocxo_cycle_residual_diag_t g_beta_ocxo2_cycle_residual_diag DMAMEM = {};
+
+static void ocxo_cycle_residual_diag_build(
+    ocxo_cycle_residual_diag_t& d,
     const clocks_static_prediction_snapshot_t& gnss,
     const clocks_static_prediction_snapshot_t& clock,
     bool traditional_valid,
     int64_t traditional_fast_residual_ns) {
-  ocxo_cycle_residual_diag_t d{};
+  d = ocxo_cycle_residual_diag_t{};
 
   d.valid = gnss.valid && clock.valid &&
       gnss.actual_cycles != 0U && clock.actual_cycles != 0U;
@@ -3779,7 +4502,6 @@ static ocxo_cycle_residual_diag_t ocxo_cycle_residual_diag_build(
   d.diagnostic_minus_traditional =
       traditional_valid ? (d.diagnostic_fast_residual_cycles -
                            traditional_fast_residual_ns) : 0LL;
-  return d;
 }
 
 static FLASHMEM void payload_add_ocxo_pps_residual_object(Payload& parent,
@@ -4386,7 +5108,8 @@ static void clock_science_apply_counterledger_row(
       : 0.0;
 }
 
-static clock_science_row_t floorline_science_build_ocxo(
+static void floorline_science_build_ocxo(
+    clock_science_row_t& row,
     time_clock_id_t clock,
     uint32_t public_count,
     uint64_t public_gnss_ns,
@@ -4396,7 +5119,7 @@ static clock_science_row_t floorline_science_build_ocxo(
     bool clock_valid,
     const clocks_alpha_lane_forensics_t& clock_f,
     floorline_science_totals_t& totals) {
-  clock_science_row_t row{};
+  row = clock_science_row_t{};
   row.clock_id = (uint32_t)((uint8_t)clock);
   row.public_count = public_count;
   row.pps_vclock_dwt_at_edge = (uint32_t)g_dwt_at_pps_vclock;
@@ -4508,7 +5231,7 @@ static clock_science_row_t floorline_science_build_ocxo(
 
   if (!row.valid) {
     floorline_science_attach_totals(row, totals);
-    return row;
+    return;
   }
 
   row.gnss_interval_ns = CLOCKS_BETA_NS_PER_SECOND;
@@ -4531,7 +5254,7 @@ static clock_science_row_t floorline_science_build_ocxo(
   totals.clock_interval_total_ns_exact += row.clock_interval_ns_exact;
   totals.gnss_interval_total_ns_exact += row.gnss_interval_ns_exact;
   floorline_science_attach_totals(row, totals);
-  return row;
+  return;
 }
 
 
@@ -4782,12 +5505,15 @@ static bool campaign_start_prologue_probe_public_pps1(
     return false;
   }
 
-  delta_residual_bookend_t saved_o1 = g_delta_ocxo1_bookends;
-  delta_residual_bookend_t saved_o2 = g_delta_ocxo2_bookends;
-  floorline_science_totals_t scratch_o1{};
-  floorline_science_totals_t scratch_o2{};
+  const delta_residual_bookend_t saved_o1 = g_delta_ocxo1_bookends;
+  const delta_residual_bookend_t saved_o2 = g_delta_ocxo2_bookends;
+  g_beta_probe_floorline_o1 = floorline_science_totals_t{};
+  g_beta_probe_floorline_o2 = floorline_science_totals_t{};
 
-  const clock_science_row_t o1 = floorline_science_build_ocxo(
+  clock_science_row_t& o1 = g_beta_probe_ocxo1_science_row;
+  clock_science_row_t& o2 = g_beta_probe_ocxo2_science_row;
+  floorline_science_build_ocxo(
+      o1,
       time_clock_id_t::OCXO1,
       1U,
       CLOCKS_BETA_NS_PER_SECOND,
@@ -4796,8 +5522,9 @@ static bool campaign_start_prologue_probe_public_pps1(
       vclock_f,
       ocxo1_valid,
       ocxo1_f,
-      scratch_o1);
-  const clock_science_row_t o2 = floorline_science_build_ocxo(
+      g_beta_probe_floorline_o1);
+  floorline_science_build_ocxo(
+      o2,
       time_clock_id_t::OCXO2,
       1U,
       CLOCKS_BETA_NS_PER_SECOND,
@@ -4806,7 +5533,7 @@ static bool campaign_start_prologue_probe_public_pps1(
       vclock_f,
       ocxo2_valid,
       ocxo2_f,
-      scratch_o2);
+      g_beta_probe_floorline_o2);
 
   // Probe only: restore the real bookends so the public path can consume this
   // exact candidate once, with Welfords/totals still at n=0.
@@ -4850,9 +5577,12 @@ static void campaign_start_prologue_abort_launch(const char* reason) {
 }
 
 static bool campaign_start_prologue_should_hold(void) {
-  clocks_alpha_lane_forensics_t vclock_f{};
-  clocks_alpha_lane_forensics_t ocxo1_f{};
-  clocks_alpha_lane_forensics_t ocxo2_f{};
+  clocks_alpha_lane_forensics_t& vclock_f = g_beta_start_vclock_forensics;
+  clocks_alpha_lane_forensics_t& ocxo1_f = g_beta_start_ocxo1_forensics;
+  clocks_alpha_lane_forensics_t& ocxo2_f = g_beta_start_ocxo2_forensics;
+  vclock_f = clocks_alpha_lane_forensics_t{};
+  ocxo1_f = clocks_alpha_lane_forensics_t{};
+  ocxo2_f = clocks_alpha_lane_forensics_t{};
   bool vclock_valid = false;
   bool ocxo1_valid = false;
   bool ocxo2_valid = false;
@@ -5204,7 +5934,8 @@ static FLASHMEM void payload_add_vclock_science_object(Payload& lane,
                                               bool vclock_valid,
                                               const clocks_alpha_lane_forensics_t& vclock_f) {
   Payload science;
-  clock_science_row_t row{};
+  clock_science_row_t& row = g_beta_vclock_science_row;
+  row = clock_science_row_t{};
   row.valid = true;
   row.antecedents_complete = true;
   row.clock_id = (uint32_t)((uint8_t)time_clock_id_t::VCLOCK);
@@ -7046,9 +7777,12 @@ void clocks_beta_pps(void) {
     welford_update(welford_dwt, dwt_ppb_sample);
   }
 
-  clocks_alpha_lane_forensics_t vclock_forensics{};
-  clocks_alpha_lane_forensics_t ocxo1_forensics{};
-  clocks_alpha_lane_forensics_t ocxo2_forensics{};
+  clocks_alpha_lane_forensics_t& vclock_forensics = g_beta_pps_vclock_forensics;
+  clocks_alpha_lane_forensics_t& ocxo1_forensics = g_beta_pps_ocxo1_forensics;
+  clocks_alpha_lane_forensics_t& ocxo2_forensics = g_beta_pps_ocxo2_forensics;
+  vclock_forensics = clocks_alpha_lane_forensics_t{};
+  ocxo1_forensics = clocks_alpha_lane_forensics_t{};
+  ocxo2_forensics = clocks_alpha_lane_forensics_t{};
 
   const bool vclock_forensics_valid =
       clocks_alpha_lane_forensics(time_clock_id_t::VCLOCK, &vclock_forensics);
@@ -7057,12 +7791,18 @@ void clocks_beta_pps(void) {
   const bool ocxo2_forensics_valid =
       clocks_alpha_lane_forensics(time_clock_id_t::OCXO2, &ocxo2_forensics);
 
-  clocks_pps_vclock_edge_forensics_t pps_vclock_edge_forensics{};
+  clocks_pps_vclock_edge_forensics_t& pps_vclock_edge_forensics =
+      g_beta_pps_vclock_edge_forensics;
+  pps_vclock_edge_forensics = clocks_pps_vclock_edge_forensics_t{};
   const bool pps_vclock_edge_forensics_valid =
       clocks_alpha_pps_vclock_edge_forensics(&pps_vclock_edge_forensics);
 
-  clocks_alpha_ocxo_pps_projection_snapshot_t ocxo1_pps_projection{};
-  clocks_alpha_ocxo_pps_projection_snapshot_t ocxo2_pps_projection{};
+  clocks_alpha_ocxo_pps_projection_snapshot_t& ocxo1_pps_projection =
+      g_beta_pps_ocxo1_projection;
+  clocks_alpha_ocxo_pps_projection_snapshot_t& ocxo2_pps_projection =
+      g_beta_pps_ocxo2_projection;
+  ocxo1_pps_projection = clocks_alpha_ocxo_pps_projection_snapshot_t{};
+  ocxo2_pps_projection = clocks_alpha_ocxo_pps_projection_snapshot_t{};
   const bool ocxo1_pps_projection_ok =
       clocks_alpha_ocxo_pps_projection_snapshot(time_clock_id_t::OCXO1,
                                                 &ocxo1_pps_projection);
@@ -7114,26 +7854,28 @@ void clocks_beta_pps(void) {
   // science.delta_floorline_* and science.traditional_* only; neither feeds
   // Welford.  Published OCXO TAU/PPB are re-authored below as simple
   // campaign public-ledger ratios.
-  clock_science_row_t ocxo1_floorline_science =
-      floorline_science_build_ocxo(time_clock_id_t::OCXO1,
-                                   public_count,
-                                   public_gnss_ns,
-                                   delta_reference_for_ocxo,
-                                   vclock_forensics_valid,
-                                   vclock_forensics,
-                                   ocxo1_forensics_valid,
-                                   ocxo1_forensics,
-                                   g_floorline_science_ocxo1);
-  clock_science_row_t ocxo2_floorline_science =
-      floorline_science_build_ocxo(time_clock_id_t::OCXO2,
-                                   public_count,
-                                   public_gnss_ns,
-                                   delta_reference_for_ocxo,
-                                   vclock_forensics_valid,
-                                   vclock_forensics,
-                                   ocxo2_forensics_valid,
-                                   ocxo2_forensics,
-                                   g_floorline_science_ocxo2);
+  clock_science_row_t& ocxo1_floorline_science = g_beta_ocxo1_science_row;
+  clock_science_row_t& ocxo2_floorline_science = g_beta_ocxo2_science_row;
+  floorline_science_build_ocxo(ocxo1_floorline_science,
+                               time_clock_id_t::OCXO1,
+                               public_count,
+                               public_gnss_ns,
+                               delta_reference_for_ocxo,
+                               vclock_forensics_valid,
+                               vclock_forensics,
+                               ocxo1_forensics_valid,
+                               ocxo1_forensics,
+                               g_floorline_science_ocxo1);
+  floorline_science_build_ocxo(ocxo2_floorline_science,
+                               time_clock_id_t::OCXO2,
+                               public_count,
+                               public_gnss_ns,
+                               delta_reference_for_ocxo,
+                               vclock_forensics_valid,
+                               vclock_forensics,
+                               ocxo2_forensics_valid,
+                               ocxo2_forensics,
+                               g_floorline_science_ocxo2);
 
   g_beta_ocxo1_counterledger_row = clocks_alpha_ocxo_counterledger_snapshot_t{};
   g_beta_ocxo2_counterledger_row = clocks_alpha_ocxo_counterledger_snapshot_t{};
@@ -7146,8 +7888,10 @@ void clocks_beta_pps(void) {
   const clocks_alpha_ocxo_counterledger_snapshot_t& ocxo2_counterledger =
       g_beta_ocxo2_counterledger_row;
 
-  clocks_alpha_tau_snapshot_t ocxo1_alpha_tau{};
-  clocks_alpha_tau_snapshot_t ocxo2_alpha_tau{};
+  clocks_alpha_tau_snapshot_t& ocxo1_alpha_tau = g_beta_pps_ocxo1_alpha_tau;
+  clocks_alpha_tau_snapshot_t& ocxo2_alpha_tau = g_beta_pps_ocxo2_alpha_tau;
+  ocxo1_alpha_tau = clocks_alpha_tau_snapshot_t{};
+  ocxo2_alpha_tau = clocks_alpha_tau_snapshot_t{};
   const bool ocxo1_alpha_tau_ok = clocks_alpha_ocxo_tau_snapshot(
       time_clock_id_t::OCXO1, &ocxo1_alpha_tau);
   const bool ocxo2_alpha_tau_ok = clocks_alpha_ocxo_tau_snapshot(
@@ -7226,20 +7970,29 @@ void clocks_beta_pps(void) {
   // Delta residuals are carried in ocxoN.science.delta_raw_* and feed
   // Welford, tau, public pps_residual, and servo below; FloorLine remains
   // a comparison side rail in ocxoN.science.delta_floorline_*.
-  const clocks_static_prediction_snapshot_t pps_cycle_prediction =
-      prediction_snapshot_for_pps();
-  const clocks_static_prediction_snapshot_t ocxo1_cycle_prediction =
+  g_beta_pps_cycle_prediction = prediction_snapshot_for_pps();
+  g_beta_ocxo1_cycle_prediction =
       prediction_snapshot_for_clock(time_clock_id_t::OCXO1);
-  const clocks_static_prediction_snapshot_t ocxo2_cycle_prediction =
+  g_beta_ocxo2_cycle_prediction =
       prediction_snapshot_for_clock(time_clock_id_t::OCXO2);
-  const ocxo_cycle_residual_diag_t ocxo1_cycle_residual_diag =
-      ocxo_cycle_residual_diag_build(pps_cycle_prediction, ocxo1_cycle_prediction,
-                                     ocxo1_floorline_science.traditional_valid,
-                                     ocxo1_floorline_science.traditional_fast_residual_ns);
-  const ocxo_cycle_residual_diag_t ocxo2_cycle_residual_diag =
-      ocxo_cycle_residual_diag_build(pps_cycle_prediction, ocxo2_cycle_prediction,
-                                     ocxo2_floorline_science.traditional_valid,
-                                     ocxo2_floorline_science.traditional_fast_residual_ns);
+  const clocks_static_prediction_snapshot_t& pps_cycle_prediction =
+      g_beta_pps_cycle_prediction;
+  const clocks_static_prediction_snapshot_t& ocxo1_cycle_prediction =
+      g_beta_ocxo1_cycle_prediction;
+  const clocks_static_prediction_snapshot_t& ocxo2_cycle_prediction =
+      g_beta_ocxo2_cycle_prediction;
+  ocxo_cycle_residual_diag_build(g_beta_ocxo1_cycle_residual_diag,
+                                 pps_cycle_prediction, ocxo1_cycle_prediction,
+                                 ocxo1_floorline_science.traditional_valid,
+                                 ocxo1_floorline_science.traditional_fast_residual_ns);
+  ocxo_cycle_residual_diag_build(g_beta_ocxo2_cycle_residual_diag,
+                                 pps_cycle_prediction, ocxo2_cycle_prediction,
+                                 ocxo2_floorline_science.traditional_valid,
+                                 ocxo2_floorline_science.traditional_fast_residual_ns);
+  const ocxo_cycle_residual_diag_t& ocxo1_cycle_residual_diag =
+      g_beta_ocxo1_cycle_residual_diag;
+  const ocxo_cycle_residual_diag_t& ocxo2_cycle_residual_diag =
+      g_beta_ocxo2_cycle_residual_diag;
 
   // VCLOCK measurement Welford — bridge-interpolation self-test.
   // Sample in ns; mean == ppb under the "ns/sec == ppb" identity.
@@ -7851,26 +8604,45 @@ void clocks_beta_pps(void) {
 
 
 static bool payload_try_get_double_alias(const Payload& args,
+                                         const char* path,
+                                         const char* lane,
                                          double& out,
                                          const char* k1,
                                          const char* k2,
                                          const char* k3) {
-  return (k1 && args.tryGetDouble(k1, out)) ||
-         (k2 && args.tryGetDouble(k2, out)) ||
-         (k3 && args.tryGetDouble(k3, out));
+  if (k1 && args.has(k1)) {
+    return clocks_payload_try_get_double_checked(args, k1, "command_double",
+                                                 path, lane, k1, out) ==
+           CLOCKS_PAYLOAD_FIELD_OK;
+  }
+  if (k2 && args.has(k2)) {
+    return clocks_payload_try_get_double_checked(args, k2, "command_double",
+                                                 path, lane, k2, out) ==
+           CLOCKS_PAYLOAD_FIELD_OK;
+  }
+  if (k3 && args.has(k3)) {
+    return clocks_payload_try_get_double_checked(args, k3, "command_double",
+                                                 path, lane, k3, out) ==
+           CLOCKS_PAYLOAD_FIELD_OK;
+  }
+  return false;
 }
 
-static bool payload_try_get_ocxo1_dac(const Payload& args, double& out) {
+static bool payload_try_get_ocxo1_dac(const Payload& args,
+                                      const char* path,
+                                      double& out) {
   // New system-config contract: { "ocxo1_dac": <code>, "ocxo2_dac": <code> }.
   // Retain the old command aliases so existing Pi-side callers do not break.
-  return payload_try_get_double_alias(args, out,
+  return payload_try_get_double_alias(args, path, "ocxo1_dac", out,
                                       "ocxo1_dac",
                                       "dac1",
                                       "set_dac1");
 }
 
-static bool payload_try_get_ocxo2_dac(const Payload& args, double& out) {
-  return payload_try_get_double_alias(args, out,
+static bool payload_try_get_ocxo2_dac(const Payload& args,
+                                      const char* path,
+                                      double& out) {
+  return payload_try_get_double_alias(args, path, "ocxo2_dac", out,
                                       "ocxo2_dac",
                                       "dac2",
                                       "set_dac2");
@@ -8000,6 +8772,8 @@ static FLASHMEM Payload cmd_servos(const Payload& args) {
 }
 
 static FLASHMEM Payload cmd_flash_cut(const Payload& args) {
+  clocks_payload_numeric_integrity_reset();
+
   const char* name = args.getString("campaign");
   if (!name || !*name) {
     g_flash_cut_reject_count++;
@@ -8043,17 +8817,22 @@ static FLASHMEM Payload cmd_flash_cut(const Payload& args) {
   double dac_val;
   bool dac1_ok = true;
   bool dac2_ok = true;
-  const bool dac1_supplied = payload_try_get_ocxo1_dac(args, dac_val);
+  const bool dac1_supplied = payload_try_get_ocxo1_dac(args, "command.flash_cut", dac_val);
   if (dac1_supplied) {
     ocxo_dac_pacing_abort_all();
     dac1_ok = ocxo_dac_set(ocxo1_dac, dac_val);
     if (dac1_ok) ocxo_dac_retry_reset(ocxo1_dac);
   }
-  const bool dac2_supplied = payload_try_get_ocxo2_dac(args, dac_val);
+  const bool dac2_supplied = payload_try_get_ocxo2_dac(args, "command.flash_cut", dac_val);
   if (dac2_supplied) {
     ocxo_dac_pacing_abort_all();
     dac2_ok = ocxo_dac_set(ocxo2_dac, dac_val);
     if (dac2_ok) ocxo_dac_retry_reset(ocxo2_dac);
+  }
+
+  if (g_clocks_payload_numeric_integrity_failed) {
+    g_flash_cut_reject_count++;
+    return clocks_payload_numeric_reject_response("flash_cut_rejected_numeric_integrity");
   }
 
   if (servo_supplied) {
@@ -8100,6 +8879,8 @@ static FLASHMEM Payload cmd_flash_cut(const Payload& args) {
 }
 
 static FLASHMEM Payload cmd_start(const Payload& args) {
+  clocks_payload_numeric_integrity_reset();
+
   const char* name = args.getString("campaign");
   if (!name || !*name) {
     Payload err;
@@ -8128,11 +8909,15 @@ static FLASHMEM Payload cmd_start(const Payload& args) {
   double dac_val;
   bool dac1_ok = true;
   bool dac2_ok = true;
-  if (payload_try_get_ocxo1_dac(args, dac_val)) {
+  if (payload_try_get_ocxo1_dac(args, "command.start", dac_val)) {
     dac1_ok = ocxo_dac_set(ocxo1_dac, dac_val);
   }
-  if (payload_try_get_ocxo2_dac(args, dac_val)) {
+  if (payload_try_get_ocxo2_dac(args, "command.start", dac_val)) {
     dac2_ok = ocxo_dac_set(ocxo2_dac, dac_val);
+  }
+
+  if (g_clocks_payload_numeric_integrity_failed) {
+    return clocks_payload_numeric_reject_response("start_rejected_numeric_integrity");
   }
 
   calibrate_ocxo_mode = servo_mode_parse(args.getString("calibrate_ocxo"));
@@ -8279,21 +9064,59 @@ static FLASHMEM Payload cmd_zero(const Payload&) {
 }
 
 static FLASHMEM Payload cmd_recover(const Payload& args) {
-  const char* s_dwt_ns = args.getString("dwt_ns");
-  const char* s_gnss   = args.getString("gnss_ns");
-  const char* s_ocxo1  = args.getString("ocxo1_ns");
-  const char* s_ocxo2  = args.getString("ocxo2_ns");
+  clocks_payload_numeric_integrity_reset();
 
-  if (!s_dwt_ns || !s_gnss || !s_ocxo1 || !s_ocxo2) {
+  uint64_t dwt_ns = 0ULL;
+  uint64_t gnss_ns = 0ULL;
+  uint64_t ocxo1_ns = 0ULL;
+  uint64_t ocxo2_ns = 0ULL;
+
+  const clocks_payload_checked_status_t dwt_status =
+      clocks_payload_try_get_u64_checked(args, "dwt_ns",
+                                         "command_recover_base",
+                                         "args",
+                                         "base",
+                                         "dwt_ns",
+                                         dwt_ns);
+  const clocks_payload_checked_status_t gnss_status =
+      clocks_payload_try_get_u64_checked(args, "gnss_ns",
+                                         "command_recover_base",
+                                         "args",
+                                         "base",
+                                         "gnss_ns",
+                                         gnss_ns);
+  const clocks_payload_checked_status_t ocxo1_status =
+      clocks_payload_try_get_u64_checked(args, "ocxo1_ns",
+                                         "command_recover_base",
+                                         "args",
+                                         "base",
+                                         "ocxo1_ns",
+                                         ocxo1_ns);
+  const clocks_payload_checked_status_t ocxo2_status =
+      clocks_payload_try_get_u64_checked(args, "ocxo2_ns",
+                                         "command_recover_base",
+                                         "args",
+                                         "base",
+                                         "ocxo2_ns",
+                                         ocxo2_ns);
+
+  if (g_clocks_payload_numeric_integrity_failed) {
+    return clocks_payload_numeric_reject_response("recover_rejected_numeric_integrity");
+  }
+
+  if (dwt_status != CLOCKS_PAYLOAD_FIELD_OK ||
+      gnss_status != CLOCKS_PAYLOAD_FIELD_OK ||
+      ocxo1_status != CLOCKS_PAYLOAD_FIELD_OK ||
+      ocxo2_status != CLOCKS_PAYLOAD_FIELD_OK) {
     Payload err;
     err.add("error", "missing recovery parameters (dwt_ns, gnss_ns, ocxo1_ns, ocxo2_ns)");
     return err;
   }
 
-  recover_dwt_ns   = strtoull(s_dwt_ns, nullptr, 10);
-  recover_gnss_ns  = strtoull(s_gnss,   nullptr, 10);
-  recover_ocxo1_ns = strtoull(s_ocxo1,  nullptr, 10);
-  recover_ocxo2_ns = strtoull(s_ocxo2,  nullptr, 10);
+  recover_dwt_ns   = dwt_ns;
+  recover_gnss_ns  = gnss_ns;
+  recover_ocxo1_ns = ocxo1_ns;
+  recover_ocxo2_ns = ocxo2_ns;
 
   const char* raw_servo_mode = nullptr;
   servo_mode_t recovered_servo_mode = servo_mode_t::OFF;
@@ -8316,7 +9139,10 @@ static FLASHMEM Payload cmd_recover(const Payload& args) {
   g_recover_last_base_ocxo1_ns = recover_ocxo1_ns;
   g_recover_last_base_ocxo2_ns = recover_ocxo2_ns;
 
-  recover_welfords_capture(args);
+  if (!recover_welfords_capture(args)) {
+    return clocks_payload_numeric_reject_response(
+        "recover_rejected_welford_numeric_integrity");
+  }
 
   clocks_watchdog_disarm_campaign_publication();
   interrupt_smartzero_abort();
@@ -8844,6 +9670,17 @@ static FLASHMEM void add_campaign_payload(Payload& p) {
   p.add("watchdog_anomaly_publish_pending", watchdog_anomaly_publish_pending);
   p.add("watchdog_anomaly_sequence", watchdog_anomaly_sequence);
   p.add("watchdog_anomaly_reason", watchdog_anomaly_reason);
+  p.add("payload_numeric_integrity_fail_count",
+        (uint32_t)g_clocks_payload_numeric_integrity_fail_count);
+  p.add("payload_numeric_last_reject_reason_id",
+        (uint32_t)g_clocks_payload_numeric_last_reject_reason);
+  p.add("payload_numeric_last_reject_reason",
+        clocks_payload_numeric_reject_reason_name(
+            g_clocks_payload_numeric_last_reject_reason));
+  p.add("payload_numeric_last_path", g_clocks_payload_numeric_last_path);
+  p.add("payload_numeric_last_key", g_clocks_payload_numeric_last_key);
+  p.add("payload_numeric_last_token_preview",
+        g_clocks_payload_numeric_last_token_preview);
   p.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
 
   p.add("campaign_warmup_active", campaign_warmup_active());
@@ -11035,18 +11872,23 @@ static FLASHMEM Payload cmd_report_dac(const Payload&) {
 }
 
 static FLASHMEM Payload cmd_set_dac(const Payload& args) {
+  clocks_payload_numeric_integrity_reset();
   ocxo_dac_pacing_abort_all();
 
   double dac_val;
   bool dac1_ok = true;
   bool dac2_ok = true;
-  if (payload_try_get_ocxo1_dac(args, dac_val)) {
+  if (payload_try_get_ocxo1_dac(args, "command.set_dac", dac_val)) {
     dac1_ok = ocxo_dac_set(ocxo1_dac, dac_val);
     if (dac1_ok) ocxo_dac_retry_reset(ocxo1_dac);
   }
-  if (payload_try_get_ocxo2_dac(args, dac_val)) {
+  if (payload_try_get_ocxo2_dac(args, "command.set_dac", dac_val)) {
     dac2_ok = ocxo_dac_set(ocxo2_dac, dac_val);
     if (dac2_ok) ocxo_dac_retry_reset(ocxo2_dac);
+  }
+
+  if (g_clocks_payload_numeric_integrity_failed) {
+    return clocks_payload_numeric_reject_response("set_dac_rejected_numeric_integrity");
   }
 
   Payload p;

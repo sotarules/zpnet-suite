@@ -81,7 +81,9 @@
 // ============================================================================
 //
 // Interrupt helpers and globals use normal compiler/linker placement so the
-// timing code remains easier to read and reason about.
+// timing code remains easier to read and reason about.  Exception: bulky
+// report/scratch/ring stores below are explicitly placed in DMAMEM/RAM2 in the
+// crash-hunt build so RAM1 leaves enough DTCM headroom for ISR/foreground stack.
 
 // process_clocks owns watchdog publication/stop semantics.  process_interrupt
 // only raises hard timing-identity faults through this narrow boundary.
@@ -239,7 +241,7 @@ static constexpr uint32_t COUNTER32_LINEAGE_LOCK_STREAK = 8U;
 // create false-negative mismatch blocks that look like real post-lock faults.
 static constexpr bool QTIMER_DWT_1KHZ_REQUIRES_ONE_SECOND_LOCK = true;
 
-static interrupt_integrity_snapshot_t g_interrupt_integrity = {};
+static interrupt_integrity_snapshot_t g_interrupt_integrity DMAMEM = {};
 
 static void interrupt_integrity_note_vclock_gnss_ns(uint32_t sequence,
                                                     uint32_t dwt_at_edge,
@@ -1083,7 +1085,7 @@ struct snapshot_store_t {
   volatile uint16_t pvc_ch3_at_edge           = 0;
 };
 
-static snapshot_store_t g_store;
+static snapshot_store_t g_store DMAMEM;
 
 static inline void dmb_barrier(void) {
   __asm__ volatile ("dmb" ::: "memory");
@@ -1154,7 +1156,7 @@ struct pps_yardstick_store_t {
   volatile uint32_t reset_count = 0;
 };
 
-static pps_yardstick_store_t g_pps_yardstick;
+static pps_yardstick_store_t g_pps_yardstick DMAMEM;
 static bool     g_pps_yardstick_prev_valid = false;
 static uint32_t g_pps_yardstick_prev_counter32 = 0;
 static uint32_t g_pps_yardstick_prev_dwt = 0;
@@ -1251,7 +1253,7 @@ struct smartzero2_system_t {
   uint32_t epoch_captures_qualified = 0;
   uint32_t epoch_captures_unqualified = 0;
 };
-static smartzero2_system_t g_smartzero2;
+static smartzero2_system_t g_smartzero2 DMAMEM;
 
 struct epoch_capture_store_t {
   volatile uint32_t seq = 0;
@@ -1286,7 +1288,7 @@ struct epoch_capture_store_t {
   volatile uint32_t ocxo2_counter32 = 0;
 };
 
-static epoch_capture_store_t g_epoch_capture_store;
+static epoch_capture_store_t g_epoch_capture_store DMAMEM;
 
 static void epoch_capture_publish(const interrupt_epoch_capture_t& cap) {
   g_epoch_capture_store.seq++;
@@ -1424,7 +1426,7 @@ static volatile uint32_t g_pvc_anchor_seq = 0;
 static volatile uint32_t g_pvc_anchor_head = 0;
 static volatile uint32_t g_pvc_anchor_count = 0;
 static volatile bool     g_pvc_anchor_reset_pending = false;
-static pvc_anchor_record_t g_pvc_anchor_ring[PVC_ANCHOR_RING_SIZE];
+static pvc_anchor_record_t g_pvc_anchor_ring[PVC_ANCHOR_RING_SIZE] DMAMEM;
 
 // Report-only accounting for CLOCKS/Alpha GNSS-label annotations.
 // The label API does not create anchors or change event custody; these counters
@@ -1440,9 +1442,9 @@ static uint32_t g_pvc_anchor_label_last_match_age_slots = 0xFFFFFFFFUL;
 static uint32_t g_pvc_anchor_label_last_match_index = 0xFFFFFFFFUL;
 static bool     g_pvc_anchor_label_last_success = false;
 
-static bridge_anchor_stats_t g_bridge_stats_timepop = {};
-static bridge_anchor_stats_t g_bridge_stats_ocxo1 = {};
-static bridge_anchor_stats_t g_bridge_stats_ocxo2 = {};
+static bridge_anchor_stats_t g_bridge_stats_timepop DMAMEM = {};
+static bridge_anchor_stats_t g_bridge_stats_ocxo1 DMAMEM = {};
+static bridge_anchor_stats_t g_bridge_stats_ocxo2 DMAMEM = {};
 
 static void pvc_anchor_ring_reset(void) {
   g_pvc_anchor_seq++;
@@ -1674,7 +1676,7 @@ struct pps_gpio_heartbeat_t {
   uint32_t last_dwt     = 0;     // pps_vclock.dwt_at_edge of most recent edge
   int64_t  last_gnss_ns = -1;    // GNSS labels are CLOCKS-owned; unavailable here.
 };
-static pps_gpio_heartbeat_t g_pps_gpio_heartbeat;
+static pps_gpio_heartbeat_t g_pps_gpio_heartbeat DMAMEM;
 
 static uint32_t g_gpio_irq_count = 0;
 static uint32_t g_gpio_miss_count = 0;
@@ -1696,7 +1698,7 @@ struct pps_post_isr_mailbox_t {
   uint32_t isr_entry_dwt_raw = 0;
 };
 
-static pps_post_isr_mailbox_t g_pps_post_isr = {};
+static pps_post_isr_mailbox_t g_pps_post_isr DMAMEM = {};
 static void pps_post_isr_asap_callback(timepop_ctx_t*, timepop_diag_t*, void*);
 
 static volatile bool     g_pps_relay_timer_active = false;
@@ -1753,9 +1755,9 @@ struct vclock_epoch_latch_t {
   uint32_t sacred_dwt = 0;
 };
 
-static pps_t g_last_pps_witness = {};
+static pps_t g_last_pps_witness DMAMEM = {};
 static bool  g_last_pps_witness_valid = false;
-static vclock_epoch_latch_t g_vclock_epoch_latch = {};
+static vclock_epoch_latch_t g_vclock_epoch_latch DMAMEM = {};
 
 // Intrinsic CH2 PPS/VCLOCK selected-epoch publication.
 //
@@ -1951,7 +1953,7 @@ static uint32_t pps_vclock_phase_cycles_from_edges(const pps_t& pps,
                     (uint64_t)VCLOCK_COUNTS_PER_SECOND);
 }
 
-static pps_vclock_edge_authority_t g_pps_vclock_edge_authority = {};
+static pps_vclock_edge_authority_t g_pps_vclock_edge_authority DMAMEM = {};
 static bool     g_pps_vclock_phase_lower_valid = false;
 static uint32_t g_pps_vclock_phase_lower_cycles = 0;
 static uint32_t g_pps_vclock_edge_authority_update_count = 0;
@@ -2775,7 +2777,7 @@ static const interrupt_subscriber_descriptor_t DESCRIPTORS[] = {
   { interrupt_subscriber_kind_t::OCXO2,  "OCXO2",  interrupt_provider_kind_t::QTIMER3, interrupt_lane_t::QTIMER3_CH3_COMP },
 };
 
-static interrupt_subscriber_runtime_t g_subscribers[MAX_INTERRUPT_SUBSCRIBERS] = {};
+static interrupt_subscriber_runtime_t g_subscribers[MAX_INTERRUPT_SUBSCRIBERS] DMAMEM = {};
 static uint32_t g_subscriber_count = 0;
 static bool g_interrupt_hw_ready = false;
 static bool g_interrupt_runtime_ready = false;
@@ -2830,7 +2832,7 @@ struct vclock_lane_t {
   uint32_t bootstrap_count = 0;
   uint32_t cadence_hits_total = 0;
 };
-static vclock_lane_t g_vclock_lane;
+static vclock_lane_t g_vclock_lane DMAMEM;
 
 
 // ============================================================================
@@ -2934,9 +2936,9 @@ struct generation_gate_lane_t {
   uint32_t feature_custody_post_lock_reject_count = 0;
 };
 
-static generation_gate_lane_t g_generation_gate_vclock = {};
-static generation_gate_lane_t g_generation_gate_ocxo1 = {};
-static generation_gate_lane_t g_generation_gate_ocxo2 = {};
+static generation_gate_lane_t g_generation_gate_vclock DMAMEM = {};
+static generation_gate_lane_t g_generation_gate_ocxo1 DMAMEM = {};
+static generation_gate_lane_t g_generation_gate_ocxo2 DMAMEM = {};
 
 static bool generation_gate_feature_locked(const generation_gate_lane_t& s) {
   return s.feature_custody_locked &&
@@ -3596,8 +3598,8 @@ struct ocxo_qtimer_diag_t {
   volatile uint32_t dwt_coordinate_source = OCXO_DWT_SOURCE_NONE;
 };
 
-static ocxo_qtimer_diag_t g_ocxo1_qtimer_diag = {};
-static ocxo_qtimer_diag_t g_ocxo2_qtimer_diag = {};
+static ocxo_qtimer_diag_t g_ocxo1_qtimer_diag DMAMEM = {};
+static ocxo_qtimer_diag_t g_ocxo2_qtimer_diag DMAMEM = {};
 
 struct ocxo_runtime_context_t {
   interrupt_subscriber_kind_t kind = interrupt_subscriber_kind_t::NONE;
@@ -4154,7 +4156,7 @@ struct smartzero_runtime_t {
   smartzero_lane_runtime_t lanes[SMARTZERO_LANE_COUNT];
 };
 
-static smartzero_runtime_t g_smartzero = {};
+static smartzero_runtime_t g_smartzero DMAMEM = {};
 
 static interrupt_subscriber_kind_t smartzero_kind_for_index(uint32_t index) {
   switch (index) {
@@ -6369,9 +6371,9 @@ struct dwt_publication_request_t {
   const dwt_repair_diag_t* repair = nullptr;
 };
 
-static dwt_publication_lane_state_t g_dwt_publication_vclock = {};
-static dwt_publication_lane_state_t g_dwt_publication_ocxo1 = {};
-static dwt_publication_lane_state_t g_dwt_publication_ocxo2 = {};
+static dwt_publication_lane_state_t g_dwt_publication_vclock DMAMEM = {};
+static dwt_publication_lane_state_t g_dwt_publication_ocxo1 DMAMEM = {};
+static dwt_publication_lane_state_t g_dwt_publication_ocxo2 DMAMEM = {};
 
 struct dwt_publication_forensics_t {
   bool     valid = false;
@@ -6466,7 +6468,7 @@ struct dwt_publication_forensics_t {
   bool     yardstick_auth_anchor_applied = false;
 };
 
-static dwt_publication_forensics_t g_dwt_publication_last_fatal = {};
+static dwt_publication_forensics_t g_dwt_publication_last_fatal DMAMEM = {};
 
 static volatile bool     g_dwt_publication_launch_acquisition_active = false;
 static volatile uint32_t g_dwt_publication_launch_begin_count = 0;
@@ -7713,7 +7715,7 @@ struct vclock_perishable_ring_t {
   volatile uint32_t asap_fail_count = 0;
 };
 
-static vclock_perishable_ring_t g_vclock_fact_ring = {};
+static vclock_perishable_ring_t g_vclock_fact_ring DMAMEM = {};
 static void vclock_fact_drain_callback(timepop_ctx_t*, timepop_diag_t*, void*);
 
 static void vclock_fact_ring_reset(void) {
@@ -9043,8 +9045,8 @@ struct ocxo_perishable_ring_t {
   volatile uint32_t asap_fail_count = 0;
 };
 
-static ocxo_perishable_ring_t g_ocxo1_fact_ring = {};
-static ocxo_perishable_ring_t g_ocxo2_fact_ring = {};
+static ocxo_perishable_ring_t g_ocxo1_fact_ring DMAMEM = {};
+static ocxo_perishable_ring_t g_ocxo2_fact_ring DMAMEM = {};
 
 static ocxo_perishable_ring_t&
 ocxo_fact_ring_for(ocxo_runtime_context_t& ctx) {
@@ -10113,12 +10115,12 @@ struct interrupt_handoff_diag_t {
   volatile const char* last_request_context = nullptr;
 };
 
-static interrupt_handoff_diag_t g_interrupt_handoff = {};
-static interrupt_handoff_source_diag_t g_handoff_qtimer1_ch1 = {};
-static interrupt_handoff_source_diag_t g_handoff_qtimer1_ch2 = {};
-static interrupt_handoff_source_diag_t g_handoff_ocxo1 = {};
-static interrupt_handoff_source_diag_t g_handoff_ocxo2 = {};
-static interrupt_handoff_source_diag_t g_handoff_pps = {};
+static interrupt_handoff_diag_t g_interrupt_handoff DMAMEM = {};
+static interrupt_handoff_source_diag_t g_handoff_qtimer1_ch1 DMAMEM = {};
+static interrupt_handoff_source_diag_t g_handoff_qtimer1_ch2 DMAMEM = {};
+static interrupt_handoff_source_diag_t g_handoff_ocxo1 DMAMEM = {};
+static interrupt_handoff_source_diag_t g_handoff_ocxo2 DMAMEM = {};
+static interrupt_handoff_source_diag_t g_handoff_pps DMAMEM = {};
 static volatile uint32_t g_interrupt_capture_sequence = 0;
 static volatile uint32_t g_pps_capture_sequence = 0;
 
