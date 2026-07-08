@@ -1235,11 +1235,16 @@ static uint32_t g_science_residual_quarantine_last_public_count = 0;
 // publication resumes in degraded mode and OCXO science remains quarantined/
 // invalid until PhaseLedger/reattach evidence catches up.
 static constexpr uint32_t CLOCKS_RECOVER_REATTACH_TIMEOUT_CANDIDATES = 32U;
-// Clean-recovery doctrine: do not publish degraded public rows merely because
-// OCXO reattachment timed out.  A RECOVER either proves fresh OCXO custody and
-// publishes a science-valid row, or it keeps holding so Pi-side recovery can
-// fail/retry without persisting frozen OCXO clockfaces.
-static constexpr bool     CLOCKS_RECOVER_REATTACH_TIMEOUT_RELEASE_DEGRADED = false;
+// Clean-recovery doctrine is now split across Teensy and Pi:
+//   * Teensy must not hold publication forever while waiting for OCXO
+//     reattachment; after the bounded private hold it releases degraded
+//     public rows so the Pi can observe liveness and keep polling recovery
+//     state.
+//   * Pi clean-recovery logic discards those transitional/degraded pairs
+//     until REPORT_RECOVERY and the fragment science rows prove clean.
+// This preserves the no-persist-frozen-OCXO rule without converting a slow
+// reattach into total TIMEBASE_FRAGMENT silence.
+static constexpr bool     CLOCKS_RECOVER_REATTACH_TIMEOUT_RELEASE_DEGRADED = true;
 static volatile bool     g_recover_reattach_active = false;
 static volatile bool     g_recover_reattach_degraded_active = false;
 static uint32_t          g_recover_reattach_begin_count = 0;
@@ -1699,7 +1704,7 @@ static bool campaign_start_phaseledger_capture_ready(
     const clocks_alpha_ocxo_counterledger_snapshot_t& s) {
   return s.last_capture_available &&
          s.last_capture_valid &&
-         s.last_capture_all_lanes_valid &&
+         s.last_capture_lane_valid &&
          s.last_capture_sequence_match &&
          s.last_capture_sequence == s.pps_sequence;
 }
@@ -3881,10 +3886,11 @@ static FLASHMEM void payload_add_micro_court_fields(
 
   add_bool("court_valid", valid);
   add_u32("court_mask", valid ? f.dwt_publication_verdict_mask : 0U);
-  add_str("court_reason",
-          valid && f.dwt_publication_verdict_reason
-              ? f.dwt_publication_verdict_reason
-              : "");
+  const uint32_t court_reason_id = valid
+      ? f.dwt_publication_verdict_reason_id
+      : INTERRUPT_DWT_PUBLICATION_REASON_OK;
+  add_u32("court_reason_id", court_reason_id);
+  add_str("court_reason", interrupt_dwt_publication_reason_name(court_reason_id));
   add_u32("court_wd", valid ? f.dwt_publication_watchdog_count : 0U);
   add_u32("court_gate", valid ? f.dwt_publication_gate_cycles : 0U);
   add_u32("court_xgate",
@@ -5746,6 +5752,7 @@ static FLASHMEM void payload_add_counterledger_candidate_object(
               : 0LL);
   obj.add("capture_available", c.last_capture_available);
   obj.add("capture_valid", c.last_capture_valid);
+  obj.add("capture_lane_valid", c.last_capture_lane_valid);
   obj.add("capture_all_lanes_valid", c.last_capture_all_lanes_valid);
   obj.add("capture_sequence_match", c.last_capture_sequence_match);
   obj.add("capture_sequence", c.last_capture_sequence);
@@ -5753,6 +5760,7 @@ static FLASHMEM void payload_add_counterledger_candidate_object(
   obj.add("update_count", c.update_count);
   obj.add("capture_missing_count", c.capture_missing_count);
   obj.add("capture_invalid_count", c.capture_invalid_count);
+  obj.add("lane_capture_invalid_count", c.lane_capture_invalid_count);
   obj.add("sequence_mismatch_count", c.sequence_mismatch_count);
   obj.add("all_lanes_invalid_count", c.all_lanes_invalid_count);
   obj.add("interval_gap_count", c.interval_gap_count);
@@ -9957,6 +9965,10 @@ static FLASHMEM void payload_add_recover_reattach_flat_fields(
     snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
     p.add(key, value);
   };
+  auto add_str = [&](const char* suffix, const char* value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value ? value : "");
+  };
 
   add_bool("ready", s.ready);
   add_u32("clock_id", s.clock_id);
@@ -9996,6 +10008,97 @@ static FLASHMEM void payload_add_recover_reattach_flat_fields(
           s.counterledger_plausible_min_delta_ticks);
   add_u32("counterledger_plausible_max_delta_ticks",
           s.counterledger_plausible_max_delta_ticks);
+
+  // CounterLedger RECOVER instrumentation.  This is REPORT_RECOVERY-only and
+  // intentionally stays out of the 1 Hz TIMEBASE_FRAGMENT spine.
+  add_bool("counterledger_last_capture_available",
+           s.counterledger_last_capture_available);
+  add_bool("counterledger_last_capture_valid",
+           s.counterledger_last_capture_valid);
+  add_bool("counterledger_last_capture_lane_valid",
+           s.counterledger_last_capture_lane_valid);
+  add_bool("counterledger_last_capture_all_lanes_valid",
+           s.counterledger_last_capture_all_lanes_valid);
+  add_bool("counterledger_last_capture_sequence_match",
+           s.counterledger_last_capture_sequence_match);
+  add_u32("counterledger_last_capture_sequence",
+          s.counterledger_last_capture_sequence);
+  add_u32("counterledger_last_capture_window_cycles",
+          s.counterledger_last_capture_window_cycles);
+  add_u32("counterledger_capture_missing_count",
+          s.counterledger_capture_missing_count);
+  add_u32("counterledger_capture_invalid_count",
+          s.counterledger_capture_invalid_count);
+  add_u32("counterledger_lane_capture_invalid_count",
+          s.counterledger_lane_capture_invalid_count);
+  add_u32("counterledger_sequence_mismatch_count",
+          s.counterledger_sequence_mismatch_count);
+  add_u32("counterledger_all_lanes_invalid_count",
+          s.counterledger_all_lanes_invalid_count);
+  add_u32("counterledger_capture_gate_attempt_count",
+          s.counterledger_capture_gate_attempt_count);
+  add_u32("counterledger_capture_gate_ready_count",
+          s.counterledger_capture_gate_ready_count);
+  add_u32("counterledger_capture_gate_reject_count",
+          s.counterledger_capture_gate_reject_count);
+  add_u32("counterledger_capture_gate_reason_id",
+          s.counterledger_capture_gate_reason_id);
+  add_str("counterledger_capture_gate_reason",
+          clocks_counterledger_capture_gate_reason_name(
+              s.counterledger_capture_gate_reason_id));
+  add_u32("counterledger_recover_capture_gate_count",
+          s.counterledger_recover_capture_gate_count);
+  add_u32("counterledger_recover_capture_ready_count",
+          s.counterledger_recover_capture_ready_count);
+  add_u32("counterledger_recover_capture_reject_count",
+          s.counterledger_recover_capture_reject_count);
+
+  add_u32("counterledger_recover_sample_attempt_count",
+          s.counterledger_recover_sample_attempt_count);
+  add_u32("counterledger_recover_sample_seed_count",
+          s.counterledger_recover_sample_seed_count);
+  add_u32("counterledger_recover_sample_interval_accept_count",
+          s.counterledger_recover_sample_interval_accept_count);
+  add_u32("counterledger_recover_sample_gap_reseed_count",
+          s.counterledger_recover_sample_gap_reseed_count);
+  add_u32("counterledger_recover_sample_implausible_reseed_count",
+          s.counterledger_recover_sample_implausible_reseed_count);
+  add_u32("counterledger_last_sample_decision_id",
+          s.counterledger_last_sample_decision_id);
+  add_str("counterledger_last_sample_decision",
+          clocks_counterledger_sample_decision_name(
+              s.counterledger_last_sample_decision_id));
+  add_u32("counterledger_last_sample_pps_sequence",
+          s.counterledger_last_sample_pps_sequence);
+  add_u32("counterledger_last_sample_previous_pps_sequence",
+          s.counterledger_last_sample_previous_pps_sequence);
+  add_u32("counterledger_last_sample_delta_ticks",
+          s.counterledger_last_sample_delta_ticks);
+
+  add_u32("counterledger_recover_phase_resolve_attempt_count",
+          s.counterledger_recover_phase_resolve_attempt_count);
+  add_u32("counterledger_recover_phase_resolve_success_count",
+          s.counterledger_recover_phase_resolve_success_count);
+  add_u32("counterledger_recover_phase_resolve_unbracketed_count",
+          s.counterledger_recover_phase_resolve_unbracketed_count);
+  add_u32("counterledger_last_phase_resolve_reason_id",
+          s.counterledger_last_phase_resolve_reason_id);
+  add_str("counterledger_last_phase_resolve_reason",
+          clocks_phaseledger_resolve_reason_name(
+              s.counterledger_last_phase_resolve_reason_id));
+  add_u32("counterledger_last_phase_resolve_pps_sequence",
+          s.counterledger_last_phase_resolve_pps_sequence);
+  add_u32("counterledger_last_phase_resolve_counter_delta_ticks",
+          s.counterledger_last_phase_resolve_counter_delta_ticks);
+  add_u32("counterledger_last_phase_resolve_interval_cycles",
+          s.counterledger_last_phase_resolve_interval_cycles);
+  add_u32("counterledger_last_phase_resolve_pps_delta_cycles",
+          s.counterledger_last_phase_resolve_pps_delta_cycles);
+  add_u32("counterledger_refined_interval_accept_count",
+          s.counterledger_refined_interval_accept_count);
+  add_u32("counterledger_recover_refined_interval_accept_count",
+          s.counterledger_recover_refined_interval_accept_count);
+
   add_u64("counterledger_ns", s.counterledger_ns);
   add_u64("counterledger_interval_ns", s.counterledger_interval_ns);
   add_u64("counterledger_refined_ns", s.counterledger_refined_ns);
@@ -10300,6 +10403,7 @@ static FLASHMEM void payload_add_phaseledger_start_lane(
   Payload capture;
   capture.add("available", s.last_capture_available);
   capture.add("valid", s.last_capture_valid);
+  capture.add("lane_valid", s.last_capture_lane_valid);
   capture.add("all_lanes_valid", s.last_capture_all_lanes_valid);
   capture.add("sequence_match", s.last_capture_sequence_match);
   capture.add("sequence", s.last_capture_sequence);

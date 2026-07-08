@@ -1712,7 +1712,7 @@ struct alpha_lane_forensics_store_t {
   // Alpha/Beta; they preserve the court verdict beside the raw/used/FloorLine
   // edge surfaces so TIMEBASE_FORENSICS can explain raw_cycles excursions.
   uint32_t dwt_publication_verdict_mask = 0;
-  const char* dwt_publication_verdict_reason = nullptr;
+  uint32_t dwt_publication_verdict_reason_id = INTERRUPT_DWT_PUBLICATION_REASON_OK;
   uint32_t dwt_publication_watchdog_count = 0;
   uint32_t dwt_publication_gate_cycles = 0;
   uint32_t dwt_publication_cross_rail_gate_cycles = 0;
@@ -2363,14 +2363,59 @@ struct alpha_pps_counterledger_lane_t {
 
   bool     last_capture_available = false;
   bool     last_capture_valid = false;
+  bool     last_capture_lane_valid = false;
   bool     last_capture_all_lanes_valid = false;
   bool     last_capture_sequence_match = false;
   uint32_t last_capture_sequence = 0;
   uint32_t last_capture_window_cycles = 0;
   uint32_t capture_missing_count = 0;
   uint32_t capture_invalid_count = 0;
+  uint32_t lane_capture_invalid_count = 0;
   uint32_t sequence_mismatch_count = 0;
   uint32_t all_lanes_invalid_count = 0;
+
+  uint32_t capture_gate_attempt_count = 0;
+  uint32_t capture_gate_ready_count = 0;
+  uint32_t capture_gate_reject_count = 0;
+  uint32_t capture_gate_reason_id = CLOCKS_COUNTERLEDGER_CAPTURE_GATE_OK;
+  uint32_t recover_capture_gate_count = 0;
+  uint32_t recover_capture_ready_count = 0;
+  uint32_t recover_capture_reject_count = 0;
+
+  uint32_t sample_attempt_count = 0;
+  uint32_t sample_not_initialized_count = 0;
+  uint32_t sample_seed_accept_count = 0;
+  uint32_t sample_interval_accept_count = 0;
+  uint32_t sample_gap_reseed_count = 0;
+  uint32_t sample_implausible_reseed_count = 0;
+  uint32_t recover_sample_attempt_count = 0;
+  uint32_t recover_sample_seed_count = 0;
+  uint32_t recover_sample_interval_accept_count = 0;
+  uint32_t recover_sample_gap_reseed_count = 0;
+  uint32_t recover_sample_implausible_reseed_count = 0;
+  uint32_t last_sample_decision_id = CLOCKS_COUNTERLEDGER_SAMPLE_DECISION_NONE;
+  uint32_t last_sample_pps_sequence = 0;
+  uint32_t last_sample_previous_pps_sequence = 0;
+  uint32_t last_sample_counter32 = 0;
+  uint32_t last_sample_previous_counter32 = 0;
+  uint32_t last_sample_delta_ticks = 0;
+
+  uint32_t phase_resolve_attempt_count = 0;
+  uint32_t phase_resolve_no_pending_count = 0;
+  uint32_t phase_resolve_zero_interval_count = 0;
+  uint32_t phase_resolve_unbracketed_count = 0;
+  uint32_t phase_resolve_counter_delta_bad_count = 0;
+  uint32_t recover_phase_resolve_attempt_count = 0;
+  uint32_t recover_phase_resolve_success_count = 0;
+  uint32_t recover_phase_resolve_unbracketed_count = 0;
+  uint32_t last_phase_resolve_reason_id = CLOCKS_PHASELEDGER_RESOLVE_REASON_NONE;
+  uint32_t last_phase_resolve_pps_sequence = 0;
+  uint32_t last_phase_resolve_counter_delta_ticks = 0;
+  uint32_t last_phase_resolve_interval_cycles = 0;
+  uint32_t last_phase_resolve_pps_delta_cycles = 0;
+
+  uint32_t refined_interval_accept_count = 0;
+  uint32_t recover_refined_interval_accept_count = 0;
 
   bool     block_valid = false;
   uint32_t block_start_pps_sequence = 0;
@@ -2750,6 +2795,44 @@ static void alpha_counterledger_reprime_lane_for_recover(
   s.refined_interval_ns = 0;
   s.refined_fast_residual_ns = 0;
 
+  // Clear post-recovery diagnostic transcript so REPORT_RECOVERY cannot carry
+  // a stale pre-recovery capture/sample/phase verdict while the new reattach
+  // window is still forming.
+  s.last_capture_available = false;
+  s.last_capture_valid = false;
+  s.last_capture_lane_valid = false;
+  s.last_capture_all_lanes_valid = false;
+  s.last_capture_sequence_match = false;
+  s.last_capture_sequence = 0;
+  s.last_capture_window_cycles = 0;
+  s.capture_gate_reason_id = CLOCKS_COUNTERLEDGER_CAPTURE_GATE_MISSING;
+  s.recover_capture_gate_count = 0;
+  s.recover_capture_ready_count = 0;
+  s.recover_capture_reject_count = 0;
+
+  s.recover_sample_attempt_count = 0;
+  s.recover_sample_seed_count = 0;
+  s.recover_sample_interval_accept_count = 0;
+  s.recover_sample_gap_reseed_count = 0;
+  s.recover_sample_implausible_reseed_count = 0;
+  s.last_sample_decision_id = CLOCKS_COUNTERLEDGER_SAMPLE_DECISION_NONE;
+  s.last_sample_pps_sequence = 0;
+  s.last_sample_previous_pps_sequence = 0;
+  s.last_sample_counter32 = 0;
+  s.last_sample_previous_counter32 = 0;
+  s.last_sample_delta_ticks = 0;
+
+  s.recover_phase_resolve_attempt_count = 0;
+  s.recover_phase_resolve_success_count = 0;
+  s.recover_phase_resolve_unbracketed_count = 0;
+  s.last_phase_resolve_reason_id = CLOCKS_PHASELEDGER_RESOLVE_REASON_NONE;
+  s.last_phase_resolve_pps_sequence = 0;
+  s.last_phase_resolve_counter_delta_ticks = 0;
+  s.last_phase_resolve_interval_cycles = 0;
+  s.last_phase_resolve_pps_delta_cycles = 0;
+
+  s.recover_refined_interval_accept_count = 0;
+
   alpha_counterledger_reset_current_block_for_gap(s);
   s.recover_reprime_count++;
 }
@@ -2857,6 +2940,62 @@ static void alpha_counterledger_reject_interval(
   alpha_counterledger_reset_current_block_for_gap(s);
 }
 
+static void alpha_counterledger_note_sample_decision(
+    alpha_pps_counterledger_lane_t& s,
+    uint32_t decision_id,
+    uint32_t pps_sequence,
+    uint32_t previous_pps_sequence,
+    uint32_t sampled_counter32,
+    uint32_t previous_counter32,
+    uint32_t delta_ticks) {
+  s.sample_attempt_count++;
+  s.last_sample_decision_id = decision_id;
+  s.last_sample_pps_sequence = pps_sequence;
+  s.last_sample_previous_pps_sequence = previous_pps_sequence;
+  s.last_sample_counter32 = sampled_counter32;
+  s.last_sample_previous_counter32 = previous_counter32;
+  s.last_sample_delta_ticks = delta_ticks;
+
+  switch (decision_id) {
+    case CLOCKS_COUNTERLEDGER_SAMPLE_DECISION_NOT_INITIALIZED:
+      s.sample_not_initialized_count++;
+      break;
+    case CLOCKS_COUNTERLEDGER_SAMPLE_DECISION_SEED_ACCEPTED:
+      s.sample_seed_accept_count++;
+      break;
+    case CLOCKS_COUNTERLEDGER_SAMPLE_DECISION_INTERVAL_ACCEPTED:
+      s.sample_interval_accept_count++;
+      break;
+    case CLOCKS_COUNTERLEDGER_SAMPLE_DECISION_GAP_RESEED:
+      s.sample_gap_reseed_count++;
+      break;
+    case CLOCKS_COUNTERLEDGER_SAMPLE_DECISION_IMPLAUSIBLE_RESEED:
+      s.sample_implausible_reseed_count++;
+      break;
+    default:
+      break;
+  }
+
+  if (s.recover_reprime_count == 0U) return;
+  s.recover_sample_attempt_count++;
+  switch (decision_id) {
+    case CLOCKS_COUNTERLEDGER_SAMPLE_DECISION_SEED_ACCEPTED:
+      s.recover_sample_seed_count++;
+      break;
+    case CLOCKS_COUNTERLEDGER_SAMPLE_DECISION_INTERVAL_ACCEPTED:
+      s.recover_sample_interval_accept_count++;
+      break;
+    case CLOCKS_COUNTERLEDGER_SAMPLE_DECISION_GAP_RESEED:
+      s.recover_sample_gap_reseed_count++;
+      break;
+    case CLOCKS_COUNTERLEDGER_SAMPLE_DECISION_IMPLAUSIBLE_RESEED:
+      s.recover_sample_implausible_reseed_count++;
+      break;
+    default:
+      break;
+  }
+}
+
 static bool alpha_counterledger_apply_pps_sample(
     time_clock_id_t clock,
     alpha_pps_counterledger_lane_t& s,
@@ -2865,18 +3004,45 @@ static bool alpha_counterledger_apply_pps_sample(
     uint32_t sampled_counter32,
     uint64_t* out_ns) {
   if (out_ns) *out_ns = 0ULL;
-  if (!s.initialized) return false;
+
+  const uint32_t previous_pps_sequence = s.pps_sequence;
+  const uint32_t previous_counter32 = s.last_counter32;
+  const uint32_t delta_ticks = sampled_counter32 - previous_counter32;
+
+  if (!s.initialized) {
+    alpha_counterledger_note_sample_decision(
+        s,
+        CLOCKS_COUNTERLEDGER_SAMPLE_DECISION_NOT_INITIALIZED,
+        pps_sequence,
+        previous_pps_sequence,
+        sampled_counter32,
+        previous_counter32,
+        delta_ticks);
+    return false;
+  }
 
   const bool had_prior_sample = s.sample_count != 0U;
-  const uint32_t previous_pps_sequence = s.pps_sequence;
   const bool contiguous = had_prior_sample &&
       pps_sequence == (uint32_t)(previous_pps_sequence + 1U);
-  const uint32_t delta_ticks = sampled_counter32 - s.last_counter32;
   const bool plausible_interval =
       !had_prior_sample || !contiguous ||
       alpha_counterledger_interval_plausible(delta_ticks);
   const bool admissible_interval =
       had_prior_sample && contiguous && plausible_interval;
+  const uint32_t sample_decision = !had_prior_sample
+      ? CLOCKS_COUNTERLEDGER_SAMPLE_DECISION_SEED_ACCEPTED
+      : (!contiguous
+            ? CLOCKS_COUNTERLEDGER_SAMPLE_DECISION_GAP_RESEED
+            : (plausible_interval
+                   ? CLOCKS_COUNTERLEDGER_SAMPLE_DECISION_INTERVAL_ACCEPTED
+                   : CLOCKS_COUNTERLEDGER_SAMPLE_DECISION_IMPLAUSIBLE_RESEED));
+  alpha_counterledger_note_sample_decision(s,
+                                           sample_decision,
+                                           pps_sequence,
+                                           previous_pps_sequence,
+                                           sampled_counter32,
+                                           previous_counter32,
+                                           delta_ticks);
 
   const bool had_prior_refined = s.refined_valid;
   const uint64_t previous_refined_ns = s.refined_ns;
@@ -2942,6 +3108,10 @@ static bool alpha_counterledger_apply_pps_sample(
       s.refined_interval_ns = s.refined_ns - previous_refined_ns;
       s.refined_fast_residual_ns =
           (int64_t)s.refined_interval_ns - (int64_t)NS_PER_SECOND_U64;
+      s.refined_interval_accept_count++;
+      if (s.recover_reprime_count != 0U) {
+        s.recover_refined_interval_accept_count++;
+      }
     }
   }
 
@@ -2990,13 +3160,46 @@ static bool alpha_counterledger_apply_pps_sample(
   return true;
 }
 
+static bool alpha_counterledger_capture_lane_valid(
+    time_clock_id_t clock,
+    const interrupt_epoch_capture_t& cap) {
+  switch (clock) {
+    case time_clock_id_t::OCXO1: return cap.ocxo1_capture_valid;
+    case time_clock_id_t::OCXO2: return cap.ocxo2_capture_valid;
+    default:                    return false;
+  }
+}
+
+static uint32_t alpha_counterledger_capture_gate_reason(
+    time_clock_id_t clock,
+    const alpha_pps_counterledger_lane_t& s,
+    bool cap_available,
+    const interrupt_epoch_capture_t& cap,
+    uint32_t snap_sequence) {
+  if (!s.initialized) return CLOCKS_COUNTERLEDGER_CAPTURE_GATE_NOT_INITIALIZED;
+  if (!cap_available) return CLOCKS_COUNTERLEDGER_CAPTURE_GATE_MISSING;
+  if (!cap.valid) return CLOCKS_COUNTERLEDGER_CAPTURE_GATE_INVALID;
+  if (cap.sequence != snap_sequence) {
+    return CLOCKS_COUNTERLEDGER_CAPTURE_GATE_SEQUENCE_MISMATCH;
+  }
+  if (!alpha_counterledger_capture_lane_valid(clock, cap)) {
+    return CLOCKS_COUNTERLEDGER_CAPTURE_GATE_LANE_INVALID;
+  }
+  return CLOCKS_COUNTERLEDGER_CAPTURE_GATE_OK;
+}
+
 static void alpha_counterledger_note_capture_status(
+    time_clock_id_t clock,
     alpha_pps_counterledger_lane_t& s,
     bool cap_available,
     const interrupt_epoch_capture_t& cap,
     uint32_t snap_sequence) {
+  const bool lane_valid = cap_available &&
+      alpha_counterledger_capture_lane_valid(clock, cap);
+
   s.last_capture_available = cap_available;
   s.last_capture_valid = cap_available && cap.valid;
+  s.last_capture_lane_valid = lane_valid;
   s.last_capture_all_lanes_valid = cap_available && cap.all_lanes_capture_valid;
   s.last_capture_sequence_match = cap_available && cap.sequence == snap_sequence;
   s.last_capture_sequence = cap_available ? cap.sequence : 0U;
@@ -3007,9 +3210,30 @@ static void alpha_counterledger_note_capture_status(
   } else {
     if (!cap.valid) s.capture_invalid_count++;
     if (cap.sequence != snap_sequence) s.sequence_mismatch_count++;
+    if (!lane_valid) s.lane_capture_invalid_count++;
     if (!cap.all_lanes_capture_valid) s.all_lanes_invalid_count++;
   }
+
+  const uint32_t reason = alpha_counterledger_capture_gate_reason(
+      clock, s, cap_available, cap, snap_sequence);
+  s.capture_gate_attempt_count++;
+  s.capture_gate_reason_id = reason;
+  if (reason == CLOCKS_COUNTERLEDGER_CAPTURE_GATE_OK) {
+    s.capture_gate_ready_count++;
+  } else {
+    s.capture_gate_reject_count++;
+  }
+
+  if (s.recover_reprime_count != 0U) {
+    s.recover_capture_gate_count++;
+    if (reason == CLOCKS_COUNTERLEDGER_CAPTURE_GATE_OK) {
+      s.recover_capture_ready_count++;
+    } else {
+      s.recover_capture_reject_count++;
+    }
+  }
 }
+
 
 
 static alpha_pps_counterledger_lane_t* alpha_counterledger_lane_mut(
@@ -3026,29 +3250,118 @@ static bool alpha_counterledger_phase_ready_all(void) {
          g_ocxo2_pps_counterledger.phase_valid;
 }
 
+static void alpha_counterledger_note_phase_resolve(
+    alpha_pps_counterledger_lane_t& s,
+    uint32_t reason_id,
+    uint32_t pps_sequence,
+    uint32_t counter_delta_ticks,
+    uint32_t interval_cycles,
+    uint32_t pps_delta_cycles) {
+  s.last_phase_resolve_reason_id = reason_id;
+  s.last_phase_resolve_pps_sequence = pps_sequence;
+  s.last_phase_resolve_counter_delta_ticks = counter_delta_ticks;
+  s.last_phase_resolve_interval_cycles = interval_cycles;
+  s.last_phase_resolve_pps_delta_cycles = pps_delta_cycles;
+
+  switch (reason_id) {
+    case CLOCKS_PHASELEDGER_RESOLVE_REASON_NO_PENDING_PPS:
+      s.phase_resolve_no_pending_count++;
+      break;
+    case CLOCKS_PHASELEDGER_RESOLVE_REASON_ZERO_INTERVAL:
+      s.phase_resolve_zero_interval_count++;
+      break;
+    case CLOCKS_PHASELEDGER_RESOLVE_REASON_UNBRACKETED:
+      s.phase_resolve_unbracketed_count++;
+      break;
+    case CLOCKS_PHASELEDGER_RESOLVE_REASON_BAD_COUNTER_DELTA:
+      s.phase_resolve_counter_delta_bad_count++;
+      break;
+    default:
+      break;
+  }
+
+  if (s.recover_reprime_count == 0U) return;
+  if (reason_id == CLOCKS_PHASELEDGER_RESOLVE_REASON_RESOLVED) {
+    s.recover_phase_resolve_success_count++;
+  } else if (reason_id == CLOCKS_PHASELEDGER_RESOLVE_REASON_UNBRACKETED) {
+    s.recover_phase_resolve_unbracketed_count++;
+  }
+}
+
 static void alpha_counterledger_resolve_phase_from_ocxo_edge(
     time_clock_id_t clock,
     uint32_t previous_ocxo_dwt_at_edge,
     uint32_t next_ocxo_dwt_at_edge,
     uint32_t counter_delta_ticks) {
   alpha_pps_counterledger_lane_t* s = alpha_counterledger_lane_mut(clock);
-  if (!s || !s->initialized || !s->phase_pending) return;
+  if (!s) return;
 
+  s->phase_resolve_attempt_count++;
+  if (s->recover_reprime_count != 0U) {
+    s->recover_phase_resolve_attempt_count++;
+  }
+
+  if (!s->initialized) {
+    alpha_counterledger_note_phase_resolve(
+        *s,
+        CLOCKS_PHASELEDGER_RESOLVE_REASON_NOT_INITIALIZED,
+        0U,
+        counter_delta_ticks,
+        0U,
+        0U);
+    return;
+  }
+
+  if (!s->phase_pending) {
+    alpha_counterledger_note_phase_resolve(
+        *s,
+        CLOCKS_PHASELEDGER_RESOLVE_REASON_NO_PENDING_PPS,
+        0U,
+        counter_delta_ticks,
+        0U,
+        0U);
+    return;
+  }
+
+  const uint32_t pending_pps_sequence = s->pending_phase_pps_sequence;
   const uint32_t interval_cycles =
       next_ocxo_dwt_at_edge - previous_ocxo_dwt_at_edge;
-  if (interval_cycles == 0U) return;
+  if (interval_cycles == 0U) {
+    alpha_counterledger_note_phase_resolve(
+        *s,
+        CLOCKS_PHASELEDGER_RESOLVE_REASON_ZERO_INTERVAL,
+        pending_pps_sequence,
+        counter_delta_ticks,
+        interval_cycles,
+        0U);
+    return;
+  }
 
   const uint32_t pps_delta_cycles =
       s->pending_phase_pps_dwt_at_edge - previous_ocxo_dwt_at_edge;
   if (pps_delta_cycles > interval_cycles) {
     // The pending PPS is not bracketed by this OCXO edge pair yet.  Leave the
     // pending fact alive for the next OCXO edge rather than guessing.
+    alpha_counterledger_note_phase_resolve(
+        *s,
+        CLOCKS_PHASELEDGER_RESOLVE_REASON_UNBRACKETED,
+        pending_pps_sequence,
+        counter_delta_ticks,
+        interval_cycles,
+        pps_delta_cycles);
     return;
   }
 
   if (counter_delta_ticks != (uint32_t)VCLOCK_COUNTS_PER_SECOND) {
     s->phase_invalid_count++;
     s->phase_pending = false;
+    alpha_counterledger_note_phase_resolve(
+        *s,
+        CLOCKS_PHASELEDGER_RESOLVE_REASON_BAD_COUNTER_DELTA,
+        pending_pps_sequence,
+        counter_delta_ticks,
+        interval_cycles,
+        pps_delta_cycles);
     return;
   }
 
@@ -3120,6 +3433,13 @@ static void alpha_counterledger_resolve_phase_from_ocxo_edge(
           ((uint32_t)NS_PER_10MHZ_TICK -
            ALPHA_COUNTERLEDGER_PHASE_NEAR_BOUNDARY_NS);
   s->phase_resolve_count++;
+  alpha_counterledger_note_phase_resolve(
+      *s,
+      CLOCKS_PHASELEDGER_RESOLVE_REASON_RESOLVED,
+      s->phase_pps_sequence,
+      counter_delta_ticks,
+      interval_cycles,
+      pps_delta_cycles);
 }
 
 // OCXO public nanosecond ledgers are measured GNSS-elapsed clocks, not merely
@@ -4334,6 +4654,7 @@ bool clocks_alpha_ocxo_counterledger_snapshot(
 
   out->last_capture_available = s->last_capture_available;
   out->last_capture_valid = s->last_capture_valid;
+  out->last_capture_lane_valid = s->last_capture_lane_valid;
   out->last_capture_all_lanes_valid = s->last_capture_all_lanes_valid;
   out->last_capture_sequence_match = s->last_capture_sequence_match;
   out->last_capture_sequence = s->last_capture_sequence;
@@ -4341,6 +4662,7 @@ bool clocks_alpha_ocxo_counterledger_snapshot(
   out->update_count = s->update_count;
   out->capture_missing_count = s->capture_missing_count;
   out->capture_invalid_count = s->capture_invalid_count;
+  out->lane_capture_invalid_count = s->lane_capture_invalid_count;
   out->sequence_mismatch_count = s->sequence_mismatch_count;
   out->all_lanes_invalid_count = s->all_lanes_invalid_count;
   out->interval_gap_count = s->interval_gap_count;
@@ -4349,6 +4671,48 @@ bool clocks_alpha_ocxo_counterledger_snapshot(
   out->recover_reprime_count = s->recover_reprime_count;
   out->plausible_min_delta_ticks = ALPHA_COUNTERLEDGER_MIN_PLAUSIBLE_INTERVAL_TICKS;
   out->plausible_max_delta_ticks = ALPHA_COUNTERLEDGER_MAX_PLAUSIBLE_INTERVAL_TICKS;
+
+  out->capture_gate_attempt_count = s->capture_gate_attempt_count;
+  out->capture_gate_ready_count = s->capture_gate_ready_count;
+  out->capture_gate_reject_count = s->capture_gate_reject_count;
+  out->capture_gate_reason_id = s->capture_gate_reason_id;
+  out->recover_capture_gate_count = s->recover_capture_gate_count;
+  out->recover_capture_ready_count = s->recover_capture_ready_count;
+  out->recover_capture_reject_count = s->recover_capture_reject_count;
+
+  out->sample_attempt_count = s->sample_attempt_count;
+  out->sample_not_initialized_count = s->sample_not_initialized_count;
+  out->sample_seed_accept_count = s->sample_seed_accept_count;
+  out->sample_interval_accept_count = s->sample_interval_accept_count;
+  out->sample_gap_reseed_count = s->sample_gap_reseed_count;
+  out->sample_implausible_reseed_count = s->sample_implausible_reseed_count;
+  out->recover_sample_attempt_count = s->recover_sample_attempt_count;
+  out->recover_sample_seed_count = s->recover_sample_seed_count;
+  out->recover_sample_interval_accept_count = s->recover_sample_interval_accept_count;
+  out->recover_sample_gap_reseed_count = s->recover_sample_gap_reseed_count;
+  out->recover_sample_implausible_reseed_count = s->recover_sample_implausible_reseed_count;
+  out->last_sample_decision_id = s->last_sample_decision_id;
+  out->last_sample_pps_sequence = s->last_sample_pps_sequence;
+  out->last_sample_previous_pps_sequence = s->last_sample_previous_pps_sequence;
+  out->last_sample_counter32 = s->last_sample_counter32;
+  out->last_sample_previous_counter32 = s->last_sample_previous_counter32;
+  out->last_sample_delta_ticks = s->last_sample_delta_ticks;
+
+  out->phase_resolve_attempt_count = s->phase_resolve_attempt_count;
+  out->phase_resolve_no_pending_count = s->phase_resolve_no_pending_count;
+  out->phase_resolve_zero_interval_count = s->phase_resolve_zero_interval_count;
+  out->phase_resolve_unbracketed_count = s->phase_resolve_unbracketed_count;
+  out->phase_resolve_counter_delta_bad_count = s->phase_resolve_counter_delta_bad_count;
+  out->recover_phase_resolve_attempt_count = s->recover_phase_resolve_attempt_count;
+  out->recover_phase_resolve_success_count = s->recover_phase_resolve_success_count;
+  out->recover_phase_resolve_unbracketed_count = s->recover_phase_resolve_unbracketed_count;
+  out->last_phase_resolve_reason_id = s->last_phase_resolve_reason_id;
+  out->last_phase_resolve_pps_sequence = s->last_phase_resolve_pps_sequence;
+  out->last_phase_resolve_counter_delta_ticks = s->last_phase_resolve_counter_delta_ticks;
+  out->last_phase_resolve_interval_cycles = s->last_phase_resolve_interval_cycles;
+  out->last_phase_resolve_pps_delta_cycles = s->last_phase_resolve_pps_delta_cycles;
+  out->refined_interval_accept_count = s->refined_interval_accept_count;
+  out->recover_refined_interval_accept_count = s->recover_refined_interval_accept_count;
 
   out->block_valid = s->block_valid && s->block_interval_count != 0U;
   out->block_window_seconds = CLOCKS_OCXO_COUNTERLEDGER_BLOCK_SECONDS;
@@ -5034,7 +5398,7 @@ static void alpha_forensics_reset_store(alpha_lane_forensics_store_t& s) {
   s.dwt_synthetic_error_cycles = 0;
   s.dwt_synthetic_threshold_cycles = 0;
   s.dwt_publication_verdict_mask = 0;
-  s.dwt_publication_verdict_reason = nullptr;
+  s.dwt_publication_verdict_reason_id = INTERRUPT_DWT_PUBLICATION_REASON_OK;
   s.dwt_publication_watchdog_count = 0;
   s.dwt_publication_gate_cycles = 0;
   s.dwt_publication_cross_rail_gate_cycles = 0;
@@ -5320,8 +5684,8 @@ static void alpha_forensics_publish(time_clock_id_t clock_id,
     s->dwt_synthetic_threshold_cycles = diag->dwt_synthetic_threshold_cycles;
     s->dwt_publication_verdict_mask =
         diag->dwt_publication_verdict_mask;
-    s->dwt_publication_verdict_reason =
-        diag->dwt_publication_verdict_reason;
+    s->dwt_publication_verdict_reason_id =
+        diag->dwt_publication_verdict_reason_id;
     s->dwt_publication_watchdog_count =
         diag->dwt_publication_watchdog_count;
     s->dwt_publication_gate_cycles =
@@ -5531,7 +5895,7 @@ static void alpha_forensics_publish(time_clock_id_t clock_id,
     s->dwt_synthetic_error_cycles = 0;
     s->dwt_synthetic_threshold_cycles = 0;
     s->dwt_publication_verdict_mask = 0;
-    s->dwt_publication_verdict_reason = nullptr;
+    s->dwt_publication_verdict_reason_id = INTERRUPT_DWT_PUBLICATION_REASON_OK;
     s->dwt_publication_watchdog_count = 0;
     s->dwt_publication_gate_cycles = 0;
     s->dwt_publication_cross_rail_gate_cycles = 0;
@@ -5754,8 +6118,8 @@ bool clocks_alpha_lane_forensics(time_clock_id_t clock,
     out->dwt_synthetic_threshold_cycles = s->dwt_synthetic_threshold_cycles;
     out->dwt_publication_verdict_mask =
         s->dwt_publication_verdict_mask;
-    out->dwt_publication_verdict_reason =
-        s->dwt_publication_verdict_reason;
+    out->dwt_publication_verdict_reason_id =
+        s->dwt_publication_verdict_reason_id;
     out->dwt_publication_watchdog_count =
         s->dwt_publication_watchdog_count;
     out->dwt_publication_gate_cycles =
@@ -6432,7 +6796,7 @@ bool clocks_alpha_ocxo_recover_reattach_snapshot(
         ledger_valid &&
         ledger->last_capture_available &&
         ledger->last_capture_valid &&
-        ledger->last_capture_all_lanes_valid &&
+        ledger->last_capture_lane_valid &&
         ledger->last_capture_sequence_match &&
         ledger->last_capture_sequence == ledger->pps_sequence;
     const bool phase_ready =
@@ -6480,6 +6844,111 @@ bool clocks_alpha_ocxo_recover_reattach_snapshot(
         ALPHA_COUNTERLEDGER_MIN_PLAUSIBLE_INTERVAL_TICKS;
     r.counterledger_plausible_max_delta_ticks =
         ALPHA_COUNTERLEDGER_MAX_PLAUSIBLE_INTERVAL_TICKS;
+
+    r.counterledger_last_capture_available =
+        ledger ? ledger->last_capture_available : false;
+    r.counterledger_last_capture_valid =
+        ledger ? ledger->last_capture_valid : false;
+    r.counterledger_last_capture_lane_valid =
+        ledger ? ledger->last_capture_lane_valid : false;
+    r.counterledger_last_capture_all_lanes_valid =
+        ledger ? ledger->last_capture_all_lanes_valid : false;
+    r.counterledger_last_capture_sequence_match =
+        ledger ? ledger->last_capture_sequence_match : false;
+    r.counterledger_last_capture_sequence =
+        ledger ? ledger->last_capture_sequence : 0U;
+    r.counterledger_last_capture_window_cycles =
+        ledger ? ledger->last_capture_window_cycles : 0U;
+    r.counterledger_capture_missing_count =
+        ledger ? ledger->capture_missing_count : 0U;
+    r.counterledger_capture_invalid_count =
+        ledger ? ledger->capture_invalid_count : 0U;
+    r.counterledger_lane_capture_invalid_count =
+        ledger ? ledger->lane_capture_invalid_count : 0U;
+    r.counterledger_sequence_mismatch_count =
+        ledger ? ledger->sequence_mismatch_count : 0U;
+    r.counterledger_all_lanes_invalid_count =
+        ledger ? ledger->all_lanes_invalid_count : 0U;
+    r.counterledger_capture_gate_attempt_count =
+        ledger ? ledger->capture_gate_attempt_count : 0U;
+    r.counterledger_capture_gate_ready_count =
+        ledger ? ledger->capture_gate_ready_count : 0U;
+    r.counterledger_capture_gate_reject_count =
+        ledger ? ledger->capture_gate_reject_count : 0U;
+    r.counterledger_capture_gate_reason_id =
+        ledger ? ledger->capture_gate_reason_id : CLOCKS_COUNTERLEDGER_CAPTURE_GATE_NOT_INITIALIZED;
+    r.counterledger_recover_capture_gate_count =
+        ledger ? ledger->recover_capture_gate_count : 0U;
+    r.counterledger_recover_capture_ready_count =
+        ledger ? ledger->recover_capture_ready_count : 0U;
+    r.counterledger_recover_capture_reject_count =
+        ledger ? ledger->recover_capture_reject_count : 0U;
+
+    r.counterledger_sample_attempt_count =
+        ledger ? ledger->sample_attempt_count : 0U;
+    r.counterledger_sample_not_initialized_count =
+        ledger ? ledger->sample_not_initialized_count : 0U;
+    r.counterledger_sample_seed_accept_count =
+        ledger ? ledger->sample_seed_accept_count : 0U;
+    r.counterledger_sample_interval_accept_count =
+        ledger ? ledger->sample_interval_accept_count : 0U;
+    r.counterledger_sample_gap_reseed_count =
+        ledger ? ledger->sample_gap_reseed_count : 0U;
+    r.counterledger_sample_implausible_reseed_count =
+        ledger ? ledger->sample_implausible_reseed_count : 0U;
+    r.counterledger_recover_sample_attempt_count =
+        ledger ? ledger->recover_sample_attempt_count : 0U;
+    r.counterledger_recover_sample_seed_count =
+        ledger ? ledger->recover_sample_seed_count : 0U;
+    r.counterledger_recover_sample_interval_accept_count =
+        ledger ? ledger->recover_sample_interval_accept_count : 0U;
+    r.counterledger_recover_sample_gap_reseed_count =
+        ledger ? ledger->recover_sample_gap_reseed_count : 0U;
+    r.counterledger_recover_sample_implausible_reseed_count =
+        ledger ? ledger->recover_sample_implausible_reseed_count : 0U;
+    r.counterledger_last_sample_decision_id =
+        ledger ? ledger->last_sample_decision_id : CLOCKS_COUNTERLEDGER_SAMPLE_DECISION_NONE;
+    r.counterledger_last_sample_pps_sequence =
+        ledger ? ledger->last_sample_pps_sequence : 0U;
+    r.counterledger_last_sample_previous_pps_sequence =
+        ledger ? ledger->last_sample_previous_pps_sequence : 0U;
+    r.counterledger_last_sample_counter32 =
+        ledger ? ledger->last_sample_counter32 : 0U;
+    r.counterledger_last_sample_previous_counter32 =
+        ledger ? ledger->last_sample_previous_counter32 : 0U;
+    r.counterledger_last_sample_delta_ticks =
+        ledger ? ledger->last_sample_delta_ticks : 0U;
+
+    r.counterledger_phase_resolve_attempt_count =
+        ledger ? ledger->phase_resolve_attempt_count : 0U;
+    r.counterledger_phase_resolve_no_pending_count =
+        ledger ? ledger->phase_resolve_no_pending_count : 0U;
+    r.counterledger_phase_resolve_zero_interval_count =
+        ledger ? ledger->phase_resolve_zero_interval_count : 0U;
+    r.counterledger_phase_resolve_unbracketed_count =
+        ledger ? ledger->phase_resolve_unbracketed_count : 0U;
+    r.counterledger_phase_resolve_counter_delta_bad_count =
+        ledger ? ledger->phase_resolve_counter_delta_bad_count : 0U;
+    r.counterledger_recover_phase_resolve_attempt_count =
+        ledger ? ledger->recover_phase_resolve_attempt_count : 0U;
+    r.counterledger_recover_phase_resolve_success_count =
+        ledger ? ledger->recover_phase_resolve_success_count : 0U;
+    r.counterledger_recover_phase_resolve_unbracketed_count =
+        ledger ? ledger->recover_phase_resolve_unbracketed_count : 0U;
+    r.counterledger_last_phase_resolve_reason_id =
+        ledger ? ledger->last_phase_resolve_reason_id : CLOCKS_PHASELEDGER_RESOLVE_REASON_NONE;
+    r.counterledger_last_phase_resolve_pps_sequence =
+        ledger ? ledger->last_phase_resolve_pps_sequence : 0U;
+    r.counterledger_last_phase_resolve_counter_delta_ticks =
+        ledger ? ledger->last_phase_resolve_counter_delta_ticks : 0U;
+    r.counterledger_last_phase_resolve_interval_cycles =
+        ledger ? ledger->last_phase_resolve_interval_cycles : 0U;
+    r.counterledger_last_phase_resolve_pps_delta_cycles =
+        ledger ? ledger->last_phase_resolve_pps_delta_cycles : 0U;
+    r.counterledger_refined_interval_accept_count =
+        ledger ? ledger->refined_interval_accept_count : 0U;
+    r.counterledger_recover_refined_interval_accept_count =
+        ledger ? ledger->recover_refined_interval_accept_count : 0U;
     r.counterledger_ns = ledger ? ledger->ns : 0ULL;
     r.counterledger_interval_ns = ledger ? ledger->last_interval_ns : 0ULL;
     r.counterledger_refined_ns = ledger ? ledger->refined_ns : 0ULL;
@@ -7330,27 +7799,35 @@ static bool alpha_sample_all_clocks_at_pps_vclock(const pps_edge_snapshot_t& sna
       clocks_ocxo_counterledger_mode() && counterledger_epoch_ready &&
       alpha_counterledger_phase_ready_all();
   if (counterledger_report_ready) {
-    alpha_counterledger_note_capture_status(g_ocxo1_pps_counterledger,
+    alpha_counterledger_note_capture_status(time_clock_id_t::OCXO1,
+                                            g_ocxo1_pps_counterledger,
                                             cap_available,
                                             cap,
                                             snap.sequence);
-    alpha_counterledger_note_capture_status(g_ocxo2_pps_counterledger,
+    alpha_counterledger_note_capture_status(time_clock_id_t::OCXO2,
+                                            g_ocxo2_pps_counterledger,
                                             cap_available,
                                             cap,
                                             snap.sequence);
 
-    const bool counterledger_capture_ready =
+    const bool counterledger_capture_ready_ocxo1 =
         cap_available &&
         cap.valid &&
-        cap.all_lanes_capture_valid &&
+        cap.ocxo1_capture_valid &&
         cap.sequence == snap.sequence;
-    const bool applied = counterledger_capture_ready &&
+    const bool counterledger_capture_ready_ocxo2 =
+        cap_available &&
+        cap.valid &&
+        cap.ocxo2_capture_valid &&
+        cap.sequence == snap.sequence;
+    const bool applied_ocxo1 = counterledger_capture_ready_ocxo1 &&
         alpha_counterledger_apply_pps_sample(time_clock_id_t::OCXO1,
                                              g_ocxo1_pps_counterledger,
                                              snap.sequence,
                                              snap.physical_pps_dwt_normalized_at_edge,
                                              cap.ocxo1_counter32,
-                                             &ocxo1_counterledger_ns) &&
+                                             &ocxo1_counterledger_ns);
+    const bool applied_ocxo2 = counterledger_capture_ready_ocxo2 &&
         alpha_counterledger_apply_pps_sample(time_clock_id_t::OCXO2,
                                              g_ocxo2_pps_counterledger,
                                              snap.sequence,
@@ -7358,12 +7835,16 @@ static bool alpha_sample_all_clocks_at_pps_vclock(const pps_edge_snapshot_t& sna
                                              cap.ocxo2_counter32,
                                              &ocxo2_counterledger_ns);
 
-    if (!applied && counterledger_authority_ready) {
+    if ((!applied_ocxo1 || !applied_ocxo2) && counterledger_authority_ready) {
+      const uint32_t lane_bits =
+          (cap.ocxo1_capture_valid ? 1U : 0U) |
+          (cap.ocxo2_capture_valid ? 2U : 0U) |
+          (cap.all_lanes_capture_valid ? 4U : 0U);
       clocks_watchdog_anomaly("alpha_counterledger_capture_invalid",
                               snap.sequence,
                               cap.sequence,
                               cap.valid ? 1U : 0U,
-                              cap.all_lanes_capture_valid ? 1U : 0U);
+                              lane_bits);
       return false;
     }
   }

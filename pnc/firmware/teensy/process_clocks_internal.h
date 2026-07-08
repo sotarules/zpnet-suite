@@ -268,6 +268,72 @@ static inline constexpr const char* clocks_ocxo_public_ns_authority_name(void) {
       : "TRADITIONAL_PPS_PROJECTION";
 }
 
+// CounterLedger RECOVER instrumentation reason IDs.
+//
+// Alpha stores numeric IDs only. Beta translates them to fixed string literals
+// at report emission so no borrowed diagnostic string pointer crosses Alpha ->
+// Beta -> Payload custody.
+static constexpr uint32_t CLOCKS_COUNTERLEDGER_CAPTURE_GATE_OK = 0U;
+static constexpr uint32_t CLOCKS_COUNTERLEDGER_CAPTURE_GATE_NOT_INITIALIZED = 1U;
+static constexpr uint32_t CLOCKS_COUNTERLEDGER_CAPTURE_GATE_MISSING = 2U;
+static constexpr uint32_t CLOCKS_COUNTERLEDGER_CAPTURE_GATE_INVALID = 3U;
+static constexpr uint32_t CLOCKS_COUNTERLEDGER_CAPTURE_GATE_ALL_LANES_INVALID = 4U;
+static constexpr uint32_t CLOCKS_COUNTERLEDGER_CAPTURE_GATE_SEQUENCE_MISMATCH = 5U;
+static constexpr uint32_t CLOCKS_COUNTERLEDGER_CAPTURE_GATE_LANE_INVALID = 6U;
+
+static inline const char* clocks_counterledger_capture_gate_reason_name(uint32_t id) {
+  switch (id) {
+    case CLOCKS_COUNTERLEDGER_CAPTURE_GATE_OK: return "OK";
+    case CLOCKS_COUNTERLEDGER_CAPTURE_GATE_NOT_INITIALIZED: return "NOT_INITIALIZED";
+    case CLOCKS_COUNTERLEDGER_CAPTURE_GATE_MISSING: return "MISSING";
+    case CLOCKS_COUNTERLEDGER_CAPTURE_GATE_INVALID: return "INVALID";
+    case CLOCKS_COUNTERLEDGER_CAPTURE_GATE_ALL_LANES_INVALID: return "ALL_LANES_INVALID";
+    case CLOCKS_COUNTERLEDGER_CAPTURE_GATE_SEQUENCE_MISMATCH: return "SEQUENCE_MISMATCH";
+    case CLOCKS_COUNTERLEDGER_CAPTURE_GATE_LANE_INVALID: return "LANE_INVALID";
+    default: return "UNKNOWN";
+  }
+}
+
+static constexpr uint32_t CLOCKS_COUNTERLEDGER_SAMPLE_DECISION_NONE = 0U;
+static constexpr uint32_t CLOCKS_COUNTERLEDGER_SAMPLE_DECISION_NOT_INITIALIZED = 1U;
+static constexpr uint32_t CLOCKS_COUNTERLEDGER_SAMPLE_DECISION_SEED_ACCEPTED = 2U;
+static constexpr uint32_t CLOCKS_COUNTERLEDGER_SAMPLE_DECISION_INTERVAL_ACCEPTED = 3U;
+static constexpr uint32_t CLOCKS_COUNTERLEDGER_SAMPLE_DECISION_GAP_RESEED = 4U;
+static constexpr uint32_t CLOCKS_COUNTERLEDGER_SAMPLE_DECISION_IMPLAUSIBLE_RESEED = 5U;
+
+static inline const char* clocks_counterledger_sample_decision_name(uint32_t id) {
+  switch (id) {
+    case CLOCKS_COUNTERLEDGER_SAMPLE_DECISION_NONE: return "NONE";
+    case CLOCKS_COUNTERLEDGER_SAMPLE_DECISION_NOT_INITIALIZED: return "NOT_INITIALIZED";
+    case CLOCKS_COUNTERLEDGER_SAMPLE_DECISION_SEED_ACCEPTED: return "SEED_ACCEPTED";
+    case CLOCKS_COUNTERLEDGER_SAMPLE_DECISION_INTERVAL_ACCEPTED: return "INTERVAL_ACCEPTED";
+    case CLOCKS_COUNTERLEDGER_SAMPLE_DECISION_GAP_RESEED: return "GAP_RESEED";
+    case CLOCKS_COUNTERLEDGER_SAMPLE_DECISION_IMPLAUSIBLE_RESEED: return "IMPLAUSIBLE_RESEED";
+    default: return "UNKNOWN";
+  }
+}
+
+static constexpr uint32_t CLOCKS_PHASELEDGER_RESOLVE_REASON_NONE = 0U;
+static constexpr uint32_t CLOCKS_PHASELEDGER_RESOLVE_REASON_NOT_INITIALIZED = 1U;
+static constexpr uint32_t CLOCKS_PHASELEDGER_RESOLVE_REASON_NO_PENDING_PPS = 2U;
+static constexpr uint32_t CLOCKS_PHASELEDGER_RESOLVE_REASON_ZERO_INTERVAL = 3U;
+static constexpr uint32_t CLOCKS_PHASELEDGER_RESOLVE_REASON_UNBRACKETED = 4U;
+static constexpr uint32_t CLOCKS_PHASELEDGER_RESOLVE_REASON_BAD_COUNTER_DELTA = 5U;
+static constexpr uint32_t CLOCKS_PHASELEDGER_RESOLVE_REASON_RESOLVED = 6U;
+
+static inline const char* clocks_phaseledger_resolve_reason_name(uint32_t id) {
+  switch (id) {
+    case CLOCKS_PHASELEDGER_RESOLVE_REASON_NONE: return "NONE";
+    case CLOCKS_PHASELEDGER_RESOLVE_REASON_NOT_INITIALIZED: return "NOT_INITIALIZED";
+    case CLOCKS_PHASELEDGER_RESOLVE_REASON_NO_PENDING_PPS: return "NO_PENDING_PPS";
+    case CLOCKS_PHASELEDGER_RESOLVE_REASON_ZERO_INTERVAL: return "ZERO_INTERVAL";
+    case CLOCKS_PHASELEDGER_RESOLVE_REASON_UNBRACKETED: return "UNBRACKETED";
+    case CLOCKS_PHASELEDGER_RESOLVE_REASON_BAD_COUNTER_DELTA: return "BAD_COUNTER_DELTA";
+    case CLOCKS_PHASELEDGER_RESOLVE_REASON_RESOLVED: return "RESOLVED";
+    default: return "UNKNOWN";
+  }
+}
+
 struct clocks_alpha_ocxo_counterledger_snapshot_t {
   bool     valid = false;
   bool     initialized = false;
@@ -321,6 +387,7 @@ struct clocks_alpha_ocxo_counterledger_snapshot_t {
   // CLOCKS_OCXO_PUBLIC_NS_AUTHORITY == PPS_COUNTERLEDGER.
   bool     last_capture_available = false;
   bool     last_capture_valid = false;
+  bool     last_capture_lane_valid = false;
   bool     last_capture_all_lanes_valid = false;
   bool     last_capture_sequence_match = false;
   uint32_t last_capture_sequence = 0;
@@ -328,6 +395,7 @@ struct clocks_alpha_ocxo_counterledger_snapshot_t {
   uint32_t update_count = 0;
   uint32_t capture_missing_count = 0;
   uint32_t capture_invalid_count = 0;
+  uint32_t lane_capture_invalid_count = 0;
   uint32_t sequence_mismatch_count = 0;
   uint32_t all_lanes_invalid_count = 0;
   uint32_t interval_gap_count = 0;
@@ -336,6 +404,54 @@ struct clocks_alpha_ocxo_counterledger_snapshot_t {
   uint32_t recover_reprime_count = 0;
   uint32_t plausible_min_delta_ticks = 0;
   uint32_t plausible_max_delta_ticks = 0;
+
+  // RECOVER/capture instrumentation. Lifetime counters describe the current
+  // SmartZero epoch. recover_* counters are reset at each RECOVER reprime and
+  // answer whether the post-recovery PPS capture path is missing, rejecting,
+  // seeding, accepting intervals, resolving PhaseLedger, and maturing refined
+  // intervals.
+  uint32_t capture_gate_attempt_count = 0;
+  uint32_t capture_gate_ready_count = 0;
+  uint32_t capture_gate_reject_count = 0;
+  uint32_t capture_gate_reason_id = CLOCKS_COUNTERLEDGER_CAPTURE_GATE_OK;
+  uint32_t recover_capture_gate_count = 0;
+  uint32_t recover_capture_ready_count = 0;
+  uint32_t recover_capture_reject_count = 0;
+
+  uint32_t sample_attempt_count = 0;
+  uint32_t sample_not_initialized_count = 0;
+  uint32_t sample_seed_accept_count = 0;
+  uint32_t sample_interval_accept_count = 0;
+  uint32_t sample_gap_reseed_count = 0;
+  uint32_t sample_implausible_reseed_count = 0;
+  uint32_t recover_sample_attempt_count = 0;
+  uint32_t recover_sample_seed_count = 0;
+  uint32_t recover_sample_interval_accept_count = 0;
+  uint32_t recover_sample_gap_reseed_count = 0;
+  uint32_t recover_sample_implausible_reseed_count = 0;
+  uint32_t last_sample_decision_id = CLOCKS_COUNTERLEDGER_SAMPLE_DECISION_NONE;
+  uint32_t last_sample_pps_sequence = 0;
+  uint32_t last_sample_previous_pps_sequence = 0;
+  uint32_t last_sample_counter32 = 0;
+  uint32_t last_sample_previous_counter32 = 0;
+  uint32_t last_sample_delta_ticks = 0;
+
+  uint32_t phase_resolve_attempt_count = 0;
+  uint32_t phase_resolve_no_pending_count = 0;
+  uint32_t phase_resolve_zero_interval_count = 0;
+  uint32_t phase_resolve_unbracketed_count = 0;
+  uint32_t phase_resolve_counter_delta_bad_count = 0;
+  uint32_t recover_phase_resolve_attempt_count = 0;
+  uint32_t recover_phase_resolve_success_count = 0;
+  uint32_t recover_phase_resolve_unbracketed_count = 0;
+  uint32_t last_phase_resolve_reason_id = CLOCKS_PHASELEDGER_RESOLVE_REASON_NONE;
+  uint32_t last_phase_resolve_pps_sequence = 0;
+  uint32_t last_phase_resolve_counter_delta_ticks = 0;
+  uint32_t last_phase_resolve_interval_cycles = 0;
+  uint32_t last_phase_resolve_pps_delta_cycles = 0;
+
+  uint32_t refined_interval_accept_count = 0;
+  uint32_t recover_refined_interval_accept_count = 0;
 
   // Rolling block witness. These fields are report-only unless/until the
   // CounterLedger rail is promoted to public authority. block_* is the
@@ -598,7 +714,7 @@ struct clocks_alpha_lane_forensics_t {
   // Alpha/Beta; they preserve the court verdict beside the raw/used/FloorLine
   // edge surfaces so TIMEBASE_FORENSICS can explain raw_cycles excursions.
   uint32_t dwt_publication_verdict_mask;
-  const char* dwt_publication_verdict_reason;
+  uint32_t dwt_publication_verdict_reason_id;
   uint32_t dwt_publication_watchdog_count;
   uint32_t dwt_publication_gate_cycles;
   uint32_t dwt_publication_cross_rail_gate_cycles;
@@ -1113,6 +1229,59 @@ struct clocks_alpha_recover_reattach_snapshot_t {
   uint32_t counterledger_recover_reprime_count = 0;
   uint32_t counterledger_plausible_min_delta_ticks = 0;
   uint32_t counterledger_plausible_max_delta_ticks = 0;
+  bool     counterledger_last_capture_available = false;
+  bool     counterledger_last_capture_valid = false;
+  bool     counterledger_last_capture_lane_valid = false;
+  bool     counterledger_last_capture_all_lanes_valid = false;
+  bool     counterledger_last_capture_sequence_match = false;
+  uint32_t counterledger_last_capture_sequence = 0;
+  uint32_t counterledger_last_capture_window_cycles = 0;
+  uint32_t counterledger_capture_missing_count = 0;
+  uint32_t counterledger_capture_invalid_count = 0;
+  uint32_t counterledger_lane_capture_invalid_count = 0;
+  uint32_t counterledger_sequence_mismatch_count = 0;
+  uint32_t counterledger_all_lanes_invalid_count = 0;
+  uint32_t counterledger_capture_gate_attempt_count = 0;
+  uint32_t counterledger_capture_gate_ready_count = 0;
+  uint32_t counterledger_capture_gate_reject_count = 0;
+  uint32_t counterledger_capture_gate_reason_id = CLOCKS_COUNTERLEDGER_CAPTURE_GATE_OK;
+  uint32_t counterledger_recover_capture_gate_count = 0;
+  uint32_t counterledger_recover_capture_ready_count = 0;
+  uint32_t counterledger_recover_capture_reject_count = 0;
+
+  uint32_t counterledger_sample_attempt_count = 0;
+  uint32_t counterledger_sample_not_initialized_count = 0;
+  uint32_t counterledger_sample_seed_accept_count = 0;
+  uint32_t counterledger_sample_interval_accept_count = 0;
+  uint32_t counterledger_sample_gap_reseed_count = 0;
+  uint32_t counterledger_sample_implausible_reseed_count = 0;
+  uint32_t counterledger_recover_sample_attempt_count = 0;
+  uint32_t counterledger_recover_sample_seed_count = 0;
+  uint32_t counterledger_recover_sample_interval_accept_count = 0;
+  uint32_t counterledger_recover_sample_gap_reseed_count = 0;
+  uint32_t counterledger_recover_sample_implausible_reseed_count = 0;
+  uint32_t counterledger_last_sample_decision_id = CLOCKS_COUNTERLEDGER_SAMPLE_DECISION_NONE;
+  uint32_t counterledger_last_sample_pps_sequence = 0;
+  uint32_t counterledger_last_sample_previous_pps_sequence = 0;
+  uint32_t counterledger_last_sample_counter32 = 0;
+  uint32_t counterledger_last_sample_previous_counter32 = 0;
+  uint32_t counterledger_last_sample_delta_ticks = 0;
+
+  uint32_t counterledger_phase_resolve_attempt_count = 0;
+  uint32_t counterledger_phase_resolve_no_pending_count = 0;
+  uint32_t counterledger_phase_resolve_zero_interval_count = 0;
+  uint32_t counterledger_phase_resolve_unbracketed_count = 0;
+  uint32_t counterledger_phase_resolve_counter_delta_bad_count = 0;
+  uint32_t counterledger_recover_phase_resolve_attempt_count = 0;
+  uint32_t counterledger_recover_phase_resolve_success_count = 0;
+  uint32_t counterledger_recover_phase_resolve_unbracketed_count = 0;
+  uint32_t counterledger_last_phase_resolve_reason_id = CLOCKS_PHASELEDGER_RESOLVE_REASON_NONE;
+  uint32_t counterledger_last_phase_resolve_pps_sequence = 0;
+  uint32_t counterledger_last_phase_resolve_counter_delta_ticks = 0;
+  uint32_t counterledger_last_phase_resolve_interval_cycles = 0;
+  uint32_t counterledger_last_phase_resolve_pps_delta_cycles = 0;
+  uint32_t counterledger_refined_interval_accept_count = 0;
+  uint32_t counterledger_recover_refined_interval_accept_count = 0;
   uint64_t counterledger_ns = 0;
   uint64_t counterledger_interval_ns = 0;
   uint64_t counterledger_refined_ns = 0;

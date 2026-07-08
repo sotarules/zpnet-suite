@@ -202,6 +202,12 @@ static constexpr uint32_t VCLOCK_DWT_REPAIR_MAX_PREDICTION_RESIDUAL_CYCLES = 25;
 static constexpr uint32_t EPOCH_CAPTURE_MAX_WINDOW_CYCLES =
     (DWT_EXPECTED_PER_PPS + (VCLOCK_COUNTS_PER_SECOND - 1U)) /
     VCLOCK_COUNTS_PER_SECOND;
+// CounterLedger lane admission is a bounded sample-quality gate, not the
+// stricter global all-lanes courtroom badge.  Allow a tiny two-tick custody
+// window so a 101/103-cycle measurement edge cannot starve both OCXO lanes,
+// while still rejecting genuinely long PPS capture windows.
+static constexpr uint32_t EPOCH_CAPTURE_COUNTERLEDGER_MAX_WINDOW_CYCLES =
+    EPOCH_CAPTURE_MAX_WINDOW_CYCLES * 2U;
 
 // Reporting-only integrity checks.  These counters intentionally do not feed
 // authority, repair, watchdog, gating, or SmartZero.  They are pure courtroom
@@ -1266,6 +1272,8 @@ struct epoch_capture_store_t {
   volatile uint32_t vclock_dwt_at_edge = 0;
 
   volatile bool     vclock_capture_valid = false;
+  volatile bool     ocxo1_capture_valid = false;
+  volatile bool     ocxo2_capture_valid = false;
   volatile bool     all_lanes_capture_valid = false;
 
   volatile uint16_t vclock_hardware16_observed = 0;
@@ -1299,6 +1307,8 @@ static void epoch_capture_publish(const interrupt_epoch_capture_t& cap) {
   g_epoch_capture_store.vclock_read_offset_cycles = cap.vclock_read_offset_cycles;
   g_epoch_capture_store.vclock_dwt_at_edge = cap.vclock_dwt_at_edge;
   g_epoch_capture_store.vclock_capture_valid = cap.vclock_capture_valid;
+  g_epoch_capture_store.ocxo1_capture_valid = cap.ocxo1_capture_valid;
+  g_epoch_capture_store.ocxo2_capture_valid = cap.ocxo2_capture_valid;
   g_epoch_capture_store.all_lanes_capture_valid = cap.all_lanes_capture_valid;
   g_epoch_capture_store.vclock_hardware16_observed = cap.vclock_hardware16_observed;
   g_epoch_capture_store.vclock_hardware16_selected = cap.vclock_hardware16_selected;
@@ -1328,6 +1338,8 @@ bool interrupt_last_epoch_capture(interrupt_epoch_capture_t* out) {
     out->vclock_read_offset_cycles = g_epoch_capture_store.vclock_read_offset_cycles;
     out->vclock_dwt_at_edge = g_epoch_capture_store.vclock_dwt_at_edge;
     out->vclock_capture_valid = g_epoch_capture_store.vclock_capture_valid;
+    out->ocxo1_capture_valid = g_epoch_capture_store.ocxo1_capture_valid;
+    out->ocxo2_capture_valid = g_epoch_capture_store.ocxo2_capture_valid;
     out->all_lanes_capture_valid = g_epoch_capture_store.all_lanes_capture_valid;
     out->vclock_hardware16_observed = g_epoch_capture_store.vclock_hardware16_observed;
     out->vclock_hardware16_selected = g_epoch_capture_store.vclock_hardware16_selected;
@@ -1798,7 +1810,7 @@ struct dwt_repair_diag_t {
   // nonzero verdict mask is a hard custody/physics failure and must raise
   // WATCHDOG_ANOMALY before subscriber publication.
   uint32_t publication_verdict_mask = 0;
-  const char* publication_verdict_reason = "ok";
+  uint32_t publication_verdict_reason_id = INTERRUPT_DWT_PUBLICATION_REASON_OK;
   uint32_t publication_watchdog_count = 0;
   uint32_t publication_gate_cycles = 0;
   uint32_t publication_cross_rail_gate_cycles = 0;
@@ -6368,7 +6380,7 @@ struct dwt_publication_forensics_t {
   uint32_t sequence = 0;
   uint32_t verdict_mask = DWT_PUBLICATION_VERDICT_OK;
   uint32_t fatal_mask = DWT_PUBLICATION_VERDICT_OK;
-  const char* verdict_reason = "none";
+  uint32_t verdict_reason_id = INTERRUPT_DWT_PUBLICATION_REASON_OK;
   bool     campaign_armed = false;
   bool     blocked = false;
   bool     launch_acquisition_active = false;
@@ -6616,28 +6628,14 @@ static bool dwt_publication_expected_interval_ruler_qualified(
 }
 
 static const char* dwt_publication_verdict_name(uint32_t verdict_mask) {
-  if (verdict_mask == DWT_PUBLICATION_VERDICT_OK) return "ok";
-  if (verdict_mask & DWT_PUBLICATION_VERDICT_ZERO_DWT) return "zero_dwt";
-  if (verdict_mask & DWT_PUBLICATION_VERDICT_SOURCE_MISMATCH) return "source_mismatch";
-  if (verdict_mask & DWT_PUBLICATION_VERDICT_FLOORLINE_EDGE) return "floorline_edge";
-  if (verdict_mask & DWT_PUBLICATION_VERDICT_FLOORLINE_INTERVAL) return "floorline_interval";
-  if (verdict_mask & DWT_PUBLICATION_VERDICT_FLOORLINE_LATE) return "floorline_late";
-  if (verdict_mask & DWT_PUBLICATION_VERDICT_COUNTER_LOW16) return "counter_low16";
-  if (verdict_mask & DWT_PUBLICATION_VERDICT_SERVICE_OFFSET) return "service_offset";
-  if (verdict_mask & DWT_PUBLICATION_VERDICT_COUNTER_DELTA) return "counter_delta";
-  if (verdict_mask & DWT_PUBLICATION_VERDICT_OBSERVED_INTERVAL) return "observed_interval";
-  if (verdict_mask & DWT_PUBLICATION_VERDICT_PUBLISHED_INTERVAL) return "published_interval";
-  if (verdict_mask & DWT_PUBLICATION_VERDICT_CROSS_RAIL) return "cross_rail";
-  if (verdict_mask & DWT_PUBLICATION_VERDICT_GNSS_PROJECTION) return "gnss_projection";
-  if (verdict_mask & DWT_PUBLICATION_VERDICT_COUNTER_ADJACENCY) return "counter_adjacency";
-  if (verdict_mask & DWT_PUBLICATION_VERDICT_YARDSTICK_EXCURSION) return "yardstick_excursion";
-  if (verdict_mask & DWT_PUBLICATION_VERDICT_RULER_UNQUALIFIED) return "ruler_unqualified";
-  return "unknown";
+  const uint32_t reason_id =
+      interrupt_dwt_publication_reason_id_from_verdict_mask(verdict_mask);
+  return interrupt_dwt_publication_reason_name(reason_id);
 }
 
 static void dwt_publication_diag_seed(dwt_repair_diag_t& diag) {
   diag.publication_verdict_mask = DWT_PUBLICATION_VERDICT_OK;
-  diag.publication_verdict_reason = "ok";
+  diag.publication_verdict_reason_id = INTERRUPT_DWT_PUBLICATION_REASON_OK;
   diag.publication_gate_cycles = DWT_PUBLICATION_INTERVAL_GATE_CYCLES;
   diag.publication_cross_rail_gate_cycles = DWT_PUBLICATION_CROSS_RAIL_GATE_CYCLES;
   diag.publication_service_offset_gate_ticks =
@@ -6785,8 +6783,14 @@ static void dwt_publication_raise_verbose_watchdog(
   root.add("primask", interrupt_primask());
 
   Payload court;
-  court.add("primary_verdict", dwt_publication_verdict_name(f.verdict_mask));
-  court.add("fatal_primary_verdict", dwt_publication_verdict_name(f.fatal_mask));
+  const uint32_t primary_reason_id =
+      interrupt_dwt_publication_reason_id_from_verdict_mask(f.verdict_mask);
+  const uint32_t fatal_reason_id =
+      interrupt_dwt_publication_reason_id_from_verdict_mask(f.fatal_mask);
+  court.add("primary_verdict_id", primary_reason_id);
+  court.add("primary_verdict", interrupt_dwt_publication_reason_name(primary_reason_id));
+  court.add("fatal_primary_verdict_id", fatal_reason_id);
+  court.add("fatal_primary_verdict", interrupt_dwt_publication_reason_name(fatal_reason_id));
   court.add("verdict_keywords",
             dwt_publication_verdict_keywords(f.verdict_mask,
                                              verdict_keywords,
@@ -6979,7 +6983,8 @@ static void dwt_publication_record_fatal_forensics(
   f.sequence = req.sequence;
   f.verdict_mask = verdict_mask;
   f.fatal_mask = fatal_mask;
-  f.verdict_reason = dwt_publication_verdict_name(verdict_mask);
+  f.verdict_reason_id =
+      interrupt_dwt_publication_reason_id_from_verdict_mask(verdict_mask);
   f.campaign_armed = campaign_armed;
   f.blocked = blocked;
   f.launch_acquisition_active = launch_acquisition;
@@ -7262,7 +7267,8 @@ static bool dwt_publication_adjudicate_or_watchdog(
   }
 
   diag.publication_verdict_mask = verdict;
-  diag.publication_verdict_reason = dwt_publication_verdict_name(verdict);
+  diag.publication_verdict_reason_id =
+      interrupt_dwt_publication_reason_id_from_verdict_mask(verdict);
   s->last_verdict_mask = verdict;
   s->last_sequence = req.sequence;
   s->last_published_dwt = req.published_dwt;
@@ -7330,11 +7336,13 @@ static bool dwt_publication_adjudicate_or_watchdog(
                                                   launch_relaxed,
                                                   strict_ready);
         }
-        diag.publication_verdict_reason = launch_acquisition
-            ? "launch_acquisition_hard_quarantine"
-            : (campaign_armed ? dwt_publication_verdict_name(verdict)
-                              : (strict_ready ? "strict_publication_quarantine"
-                                              : "startup_hard_quarantine"));
+        diag.publication_verdict_reason_id = launch_acquisition
+            ? INTERRUPT_DWT_PUBLICATION_REASON_LAUNCH_ACQUISITION_HARD_QUARANTINE
+            : (campaign_armed
+                   ? interrupt_dwt_publication_reason_id_from_verdict_mask(verdict)
+                   : (strict_ready
+                          ? INTERRUPT_DWT_PUBLICATION_REASON_STRICT_PUBLICATION_QUARANTINE
+                          : INTERRUPT_DWT_PUBLICATION_REASON_STARTUP_HARD_QUARANTINE));
         return false;
       }
 
@@ -7344,12 +7352,15 @@ static bool dwt_publication_adjudicate_or_watchdog(
       // explicitly ended by Beta before public PPS1 is released.
       if (launch_acquisition) {
         g_dwt_publication_launch_relaxed_count++;
-        diag.publication_verdict_reason = "launch_acquisition_relaxed_diagnostic";
+        diag.publication_verdict_reason_id =
+          INTERRUPT_DWT_PUBLICATION_REASON_LAUNCH_ACQUISITION_RELAXED_DIAGNOSTIC;
       } else {
-        diag.publication_verdict_reason = "startup_relaxed_diagnostic";
+        diag.publication_verdict_reason_id =
+          INTERRUPT_DWT_PUBLICATION_REASON_STARTUP_RELAXED_DIAGNOSTIC;
       }
     } else {
-      diag.publication_verdict_reason = "side_rail_diagnostic";
+      diag.publication_verdict_reason_id =
+        INTERRUPT_DWT_PUBLICATION_REASON_SIDE_RAIL_DIAGNOSTIC;
     }
   }
 
@@ -7538,7 +7549,7 @@ static void emit_one_second_event(interrupt_subscriber_runtime_t& rt,
     diag.dwt_synthetic_threshold_cycles = repair->threshold_cycles;
     diag.dwt_synthetic_reason = repair->reason;
     diag.dwt_publication_verdict_mask = repair->publication_verdict_mask;
-    diag.dwt_publication_verdict_reason = repair->publication_verdict_reason;
+    diag.dwt_publication_verdict_reason_id = repair->publication_verdict_reason_id;
     diag.dwt_publication_watchdog_count = repair->publication_watchdog_count;
     diag.dwt_publication_gate_cycles = repair->publication_gate_cycles;
     diag.dwt_publication_cross_rail_gate_cycles =
@@ -11972,6 +11983,17 @@ static void interrupt_handoff_process_pps(const pps_capture_packet_t& packet) {
       pps_vclock_dwt_from_pps_isr_entry_raw(isr_entry_dwt_raw);
   epoch_cap.vclock_capture_valid =
       epoch_cap.vclock_read_offset_cycles <= EPOCH_CAPTURE_MAX_WINDOW_CYCLES;
+  // Per-lane CounterLedger admission facts.  These deliberately describe
+  // whether each OCXO counter was captured in a bounded PPS packet; the
+  // stricter one-tick all_lanes_capture_valid flag remains a global courtroom
+  // quality witness, not the lane admission gate.
+  const bool counterledger_capture_window_valid =
+      epoch_cap.capture_window_cycles <=
+      EPOCH_CAPTURE_COUNTERLEDGER_MAX_WINDOW_CYCLES;
+  epoch_cap.ocxo1_capture_valid =
+      packet.ocxo1_capture_hw_ready && counterledger_capture_window_valid;
+  epoch_cap.ocxo2_capture_valid =
+      packet.ocxo2_capture_hw_ready && counterledger_capture_window_valid;
   epoch_cap.all_lanes_capture_valid =
       ocxo_capture_hw_ready &&
       epoch_cap.capture_window_cycles <= EPOCH_CAPTURE_MAX_WINDOW_CYCLES;
@@ -13206,7 +13228,8 @@ static FLASHMEM Payload cmd_report_publication(const Payload&) {
   p.add("sequence", f.sequence);
   p.add("verdict_mask", f.verdict_mask);
   p.add("fatal_mask", f.fatal_mask);
-  p.add("verdict_reason", f.verdict_reason ? f.verdict_reason : "");
+  p.add("verdict_reason_id", f.verdict_reason_id);
+  p.add("verdict_reason", interrupt_dwt_publication_reason_name(f.verdict_reason_id));
   p.add("campaign_armed", f.campaign_armed);
   p.add("blocked", f.blocked);
   p.add("launch_acquisition_active_now",

@@ -71,6 +71,140 @@ static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_VERDICT_COUNTER_ADJACENCY = 
 static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_VERDICT_YARDSTICK_EXCURSION = 1u << 13;
 static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_VERDICT_RULER_UNQUALIFIED = 1u << 14;
 
+// Final DWT publication court reason IDs.  These are stable scalar IDs carried
+// through diagnostic structs; reports translate them to strings at the final
+// Payload emission site so no borrowed const char* crosses interrupt/Alpha/Beta
+// custody boundaries.
+static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_REASON_OK = 0U;
+static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_REASON_ZERO_DWT = 1U;
+static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_REASON_SOURCE_MISMATCH = 2U;
+static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_REASON_FLOORLINE_EDGE = 3U;
+static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_REASON_FLOORLINE_INTERVAL = 4U;
+static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_REASON_FLOORLINE_LATE = 5U;
+static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_REASON_COUNTER_LOW16 = 6U;
+static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_REASON_SERVICE_OFFSET = 7U;
+static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_REASON_COUNTER_DELTA = 8U;
+static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_REASON_OBSERVED_INTERVAL = 9U;
+static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_REASON_PUBLISHED_INTERVAL = 10U;
+static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_REASON_CROSS_RAIL = 11U;
+static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_REASON_GNSS_PROJECTION = 12U;
+static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_REASON_COUNTER_ADJACENCY = 13U;
+static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_REASON_YARDSTICK_EXCURSION = 14U;
+static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_REASON_RULER_UNQUALIFIED = 15U;
+static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_REASON_LAUNCH_ACQUISITION_HARD_QUARANTINE = 16U;
+static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_REASON_STRICT_PUBLICATION_QUARANTINE = 17U;
+static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_REASON_STARTUP_HARD_QUARANTINE = 18U;
+static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_REASON_LAUNCH_ACQUISITION_RELAXED_DIAGNOSTIC = 19U;
+static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_REASON_STARTUP_RELAXED_DIAGNOSTIC = 20U;
+static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_REASON_SIDE_RAIL_DIAGNOSTIC = 21U;
+static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_REASON_UNKNOWN = 22U;
+
+static inline uint32_t interrupt_dwt_publication_reason_id_from_verdict_mask(
+    uint32_t verdict_mask) {
+  if (verdict_mask == INTERRUPT_DWT_PUBLICATION_VERDICT_OK) {
+    return INTERRUPT_DWT_PUBLICATION_REASON_OK;
+  }
+  if (verdict_mask & INTERRUPT_DWT_PUBLICATION_VERDICT_ZERO_DWT) {
+    return INTERRUPT_DWT_PUBLICATION_REASON_ZERO_DWT;
+  }
+  if (verdict_mask & INTERRUPT_DWT_PUBLICATION_VERDICT_SOURCE_MISMATCH) {
+    return INTERRUPT_DWT_PUBLICATION_REASON_SOURCE_MISMATCH;
+  }
+  if (verdict_mask & INTERRUPT_DWT_PUBLICATION_VERDICT_FLOORLINE_EDGE) {
+    return INTERRUPT_DWT_PUBLICATION_REASON_FLOORLINE_EDGE;
+  }
+  if (verdict_mask & INTERRUPT_DWT_PUBLICATION_VERDICT_FLOORLINE_INTERVAL) {
+    return INTERRUPT_DWT_PUBLICATION_REASON_FLOORLINE_INTERVAL;
+  }
+  if (verdict_mask & INTERRUPT_DWT_PUBLICATION_VERDICT_FLOORLINE_LATE) {
+    return INTERRUPT_DWT_PUBLICATION_REASON_FLOORLINE_LATE;
+  }
+  if (verdict_mask & INTERRUPT_DWT_PUBLICATION_VERDICT_COUNTER_LOW16) {
+    return INTERRUPT_DWT_PUBLICATION_REASON_COUNTER_LOW16;
+  }
+  if (verdict_mask & INTERRUPT_DWT_PUBLICATION_VERDICT_SERVICE_OFFSET) {
+    return INTERRUPT_DWT_PUBLICATION_REASON_SERVICE_OFFSET;
+  }
+  if (verdict_mask & INTERRUPT_DWT_PUBLICATION_VERDICT_COUNTER_DELTA) {
+    return INTERRUPT_DWT_PUBLICATION_REASON_COUNTER_DELTA;
+  }
+  if (verdict_mask & INTERRUPT_DWT_PUBLICATION_VERDICT_OBSERVED_INTERVAL) {
+    return INTERRUPT_DWT_PUBLICATION_REASON_OBSERVED_INTERVAL;
+  }
+  if (verdict_mask & INTERRUPT_DWT_PUBLICATION_VERDICT_PUBLISHED_INTERVAL) {
+    return INTERRUPT_DWT_PUBLICATION_REASON_PUBLISHED_INTERVAL;
+  }
+  if (verdict_mask & INTERRUPT_DWT_PUBLICATION_VERDICT_CROSS_RAIL) {
+    return INTERRUPT_DWT_PUBLICATION_REASON_CROSS_RAIL;
+  }
+  if (verdict_mask & INTERRUPT_DWT_PUBLICATION_VERDICT_GNSS_PROJECTION) {
+    return INTERRUPT_DWT_PUBLICATION_REASON_GNSS_PROJECTION;
+  }
+  if (verdict_mask & INTERRUPT_DWT_PUBLICATION_VERDICT_COUNTER_ADJACENCY) {
+    return INTERRUPT_DWT_PUBLICATION_REASON_COUNTER_ADJACENCY;
+  }
+  if (verdict_mask & INTERRUPT_DWT_PUBLICATION_VERDICT_YARDSTICK_EXCURSION) {
+    return INTERRUPT_DWT_PUBLICATION_REASON_YARDSTICK_EXCURSION;
+  }
+  if (verdict_mask & INTERRUPT_DWT_PUBLICATION_VERDICT_RULER_UNQUALIFIED) {
+    return INTERRUPT_DWT_PUBLICATION_REASON_RULER_UNQUALIFIED;
+  }
+  return INTERRUPT_DWT_PUBLICATION_REASON_UNKNOWN;
+}
+
+static inline const char* interrupt_dwt_publication_reason_name(
+    uint32_t reason_id) {
+  switch (reason_id) {
+    case INTERRUPT_DWT_PUBLICATION_REASON_OK:
+      return "ok";
+    case INTERRUPT_DWT_PUBLICATION_REASON_ZERO_DWT:
+      return "zero_dwt";
+    case INTERRUPT_DWT_PUBLICATION_REASON_SOURCE_MISMATCH:
+      return "source_mismatch";
+    case INTERRUPT_DWT_PUBLICATION_REASON_FLOORLINE_EDGE:
+      return "floorline_edge";
+    case INTERRUPT_DWT_PUBLICATION_REASON_FLOORLINE_INTERVAL:
+      return "floorline_interval";
+    case INTERRUPT_DWT_PUBLICATION_REASON_FLOORLINE_LATE:
+      return "floorline_late";
+    case INTERRUPT_DWT_PUBLICATION_REASON_COUNTER_LOW16:
+      return "counter_low16";
+    case INTERRUPT_DWT_PUBLICATION_REASON_SERVICE_OFFSET:
+      return "service_offset";
+    case INTERRUPT_DWT_PUBLICATION_REASON_COUNTER_DELTA:
+      return "counter_delta";
+    case INTERRUPT_DWT_PUBLICATION_REASON_OBSERVED_INTERVAL:
+      return "observed_interval";
+    case INTERRUPT_DWT_PUBLICATION_REASON_PUBLISHED_INTERVAL:
+      return "published_interval";
+    case INTERRUPT_DWT_PUBLICATION_REASON_CROSS_RAIL:
+      return "cross_rail";
+    case INTERRUPT_DWT_PUBLICATION_REASON_GNSS_PROJECTION:
+      return "gnss_projection";
+    case INTERRUPT_DWT_PUBLICATION_REASON_COUNTER_ADJACENCY:
+      return "counter_adjacency";
+    case INTERRUPT_DWT_PUBLICATION_REASON_YARDSTICK_EXCURSION:
+      return "yardstick_excursion";
+    case INTERRUPT_DWT_PUBLICATION_REASON_RULER_UNQUALIFIED:
+      return "ruler_unqualified";
+    case INTERRUPT_DWT_PUBLICATION_REASON_LAUNCH_ACQUISITION_HARD_QUARANTINE:
+      return "launch_acquisition_hard_quarantine";
+    case INTERRUPT_DWT_PUBLICATION_REASON_STRICT_PUBLICATION_QUARANTINE:
+      return "strict_publication_quarantine";
+    case INTERRUPT_DWT_PUBLICATION_REASON_STARTUP_HARD_QUARANTINE:
+      return "startup_hard_quarantine";
+    case INTERRUPT_DWT_PUBLICATION_REASON_LAUNCH_ACQUISITION_RELAXED_DIAGNOSTIC:
+      return "launch_acquisition_relaxed_diagnostic";
+    case INTERRUPT_DWT_PUBLICATION_REASON_STARTUP_RELAXED_DIAGNOSTIC:
+      return "startup_relaxed_diagnostic";
+    case INTERRUPT_DWT_PUBLICATION_REASON_SIDE_RAIL_DIAGNOSTIC:
+      return "side_rail_diagnostic";
+    default:
+      return "unknown";
+  }
+}
+
+
 struct interrupt_event_t {
   interrupt_subscriber_kind_t kind     = interrupt_subscriber_kind_t::NONE;
   interrupt_provider_kind_t   provider = interrupt_provider_kind_t::NONE;
@@ -126,7 +260,7 @@ struct interrupt_capture_diag_t {
   // decoding but are diagnostic after FloorLine publication deprecation.
   // OK events carry zero here for audit continuity.
   uint32_t dwt_publication_verdict_mask = 0;
-  const char* dwt_publication_verdict_reason = nullptr;
+  uint32_t dwt_publication_verdict_reason_id = INTERRUPT_DWT_PUBLICATION_REASON_OK;
   uint32_t dwt_publication_watchdog_count = 0;
   uint32_t dwt_publication_gate_cycles = 0;
   uint32_t dwt_publication_cross_rail_gate_cycles = 0;
@@ -810,6 +944,8 @@ struct interrupt_epoch_capture_t {
   uint32_t vclock_dwt_at_edge = 0;
 
   bool     vclock_capture_valid = false;
+  bool     ocxo1_capture_valid = false;
+  bool     ocxo2_capture_valid = false;
   bool     all_lanes_capture_valid = false;
 
   uint16_t vclock_hardware16_observed = 0;
