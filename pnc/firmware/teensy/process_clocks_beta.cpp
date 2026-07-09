@@ -4648,6 +4648,93 @@ static FLASHMEM void payload_add_micro_court_fields(
 }
 
 
+static FLASHMEM void payload_add_micro_counterledger_fields(
+    Payload& parent,
+    const char* prefix,
+    const clocks_alpha_ocxo_counterledger_snapshot_t& s) {
+  char key[96];
+
+  auto add_bool = [&](const char* suffix, bool value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    parent.add(key, value);
+  };
+  auto add_u32 = [&](const char* suffix, uint32_t value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    parent.add(key, value);
+  };
+  auto add_u64 = [&](const char* suffix, uint64_t value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    parent.add(key, value);
+  };
+  auto add_i64 = [&](const char* suffix, int64_t value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    parent.add(key, value);
+  };
+  auto add_str = [&](const char* suffix, const char* value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    parent.add(key, value ? value : "");
+  };
+
+  add_bool("cl_valid", s.valid);
+  add_bool("cl_init", s.initialized);
+  add_bool("cl_interval", s.interval_valid);
+  add_bool("cl_phase", s.phase_valid);
+  add_bool("cl_phase_pending", s.phase_pending);
+  add_bool("cl_refined", s.refined_valid);
+  add_bool("cl_refined_interval", s.refined_interval_valid);
+  add_u32("cl_pps", s.pps_sequence);
+  add_u32("cl_phase_pps", s.phase_pps_sequence);
+  add_u32("cl_phase_lag", s.phase_lag_pps);
+  add_u32("cl_last_delta_ticks", s.last_delta_ticks);
+  add_u64("cl_interval_ns", s.interval_ns);
+  add_i64("cl_fast_ns", s.fast_residual_ns);
+  add_u64("cl_refined_ns", s.refined_ns);
+  add_u64("cl_refined_int_ns", s.refined_interval_ns);
+  add_i64("cl_refined_fast_ns", s.refined_fast_residual_ns);
+
+  add_u32("cl_pend_cap", s.phase_pending_capacity);
+  add_u32("cl_pend_depth", s.phase_pending_depth);
+  add_u32("cl_pend_max", s.phase_pending_depth_max);
+  add_u32("cl_pend_enq", s.phase_pending_enqueue_count);
+  add_u32("cl_pend_ovf", s.phase_pending_overflow_count);
+  add_u32("cl_pend_drop", s.phase_pending_drop_count);
+  add_u32("cl_pend_res", s.phase_pending_resolve_count);
+  add_u32("cl_pend_unbr", s.phase_pending_unbracketed_count);
+  add_u32("cl_pend_old", s.phase_pending_oldest_pps_sequence);
+  add_u32("cl_pend_new", s.phase_pending_newest_pps_sequence);
+  add_u32("cl_pend_res_seq", s.phase_pending_last_resolved_pps_sequence);
+  add_u32("cl_pend_drop_seq", s.phase_pending_last_dropped_pps_sequence);
+  add_u32("cl_pend_idx", s.phase_pending_last_matched_index);
+  add_u32("cl_pend_legacy_ovw", s.phase_pending_overwrite_count);
+
+  add_u32("cl_res_attempt", s.phase_resolve_attempt_count);
+  add_u32("cl_res_no_pending", s.phase_resolve_no_pending_count);
+  add_u32("cl_res_zero", s.phase_resolve_zero_interval_count);
+  add_u32("cl_res_unbr", s.phase_resolve_unbracketed_count);
+  add_u32("cl_res_bad_ctr", s.phase_resolve_counter_delta_bad_count);
+  add_u32("cl_last_res_reason", s.last_phase_resolve_reason_id);
+  add_str("cl_last_res_reason_name",
+          clocks_phaseledger_resolve_reason_name(s.last_phase_resolve_reason_id));
+  add_u32("cl_last_res_pps", s.last_phase_resolve_pps_sequence);
+  add_u32("cl_last_res_ctr", s.last_phase_resolve_counter_delta_ticks);
+  add_u32("cl_last_res_int", s.last_phase_resolve_interval_cycles);
+  add_u32("cl_last_res_delta", s.last_phase_resolve_pps_delta_cycles);
+
+  add_u32("cl_sample_decision", s.last_sample_decision_id);
+  add_str("cl_sample_decision_name",
+          clocks_counterledger_sample_decision_name(s.last_sample_decision_id));
+  add_u32("cl_sample_pps", s.last_sample_pps_sequence);
+  add_u32("cl_sample_prev_pps", s.last_sample_previous_pps_sequence);
+  add_u32("cl_sample_delta", s.last_sample_delta_ticks);
+  add_u32("cl_cap_reason", s.capture_gate_reason_id);
+  add_str("cl_cap_reason_name",
+          clocks_counterledger_capture_gate_reason_name(s.capture_gate_reason_id));
+  add_bool("cl_cap_ready",
+           s.last_capture_available && s.last_capture_valid &&
+           s.last_capture_lane_valid && s.last_capture_sequence_match &&
+           s.last_capture_sequence == s.pps_sequence);
+}
+
 static FLASHMEM void payload_add_floorline_object(Payload& parent,
                                          bool valid,
                                          const clocks_alpha_lane_forensics_t& f) {
@@ -5106,6 +5193,140 @@ static void clock_science_apply_counterledger_row(
   row.ppb_1s = row.valid
       ? campaign_total_ppb_from_tau(row.tau_1s)
       : 0.0;
+}
+
+static bool clocks_beta_ocxo_science_custody_ok(
+    const clock_science_row_t& row,
+    uint64_t public_ocxo_ns) {
+  if (public_ocxo_ns == 0ULL) return true;
+  return row.valid && row.antecedents_complete;
+}
+
+static void clocks_beta_add_ocxo_science_custody_violation(
+    Payload& parent,
+    const char* lane,
+    const clock_science_row_t& row,
+    const clocks_alpha_ocxo_counterledger_snapshot_t& ledger,
+    uint64_t public_ocxo_ns) {
+  Payload v;
+  v.add("lane", lane ? lane : "");
+  v.add("public_ocxo_ns", public_ocxo_ns);
+  v.add("public_count", row.public_count);
+  v.add("science_valid", row.valid);
+  v.add("antecedents_complete", row.antecedents_complete);
+  v.add("delta_raw_valid", row.delta_raw_valid);
+  v.add("delta_raw_reference_interval_cycles",
+        row.delta_raw_reference_interval_cycles);
+  v.add("delta_raw_clock_interval_cycles",
+        row.delta_raw_clock_interval_cycles);
+  v.add("clock_interval_ns", row.clock_interval_ns);
+  v.add("total_valid", row.total_valid);
+  v.add("total_sample_count", row.total_sample_count);
+  v.add("counterledger_valid", ledger.valid);
+  v.add("counterledger_interval_valid", ledger.interval_valid);
+  v.add("counterledger_phase_valid", ledger.phase_valid);
+  v.add("counterledger_refined_valid", ledger.refined_valid);
+  v.add("counterledger_refined_interval_valid", ledger.refined_interval_valid);
+  v.add("counterledger_phase_lag_pps", ledger.phase_lag_pps);
+  v.add("counterledger_phase_pending", ledger.phase_pending);
+  v.add("counterledger_phase_pending_depth", ledger.phase_pending_depth);
+  v.add("counterledger_phase_pending_capacity", ledger.phase_pending_capacity);
+  v.add("counterledger_phase_pending_overflow_count",
+        ledger.phase_pending_overflow_count);
+  v.add("counterledger_phase_pending_drop_count",
+        ledger.phase_pending_drop_count);
+  v.add("counterledger_phase_pending_unbracketed_count",
+        ledger.phase_pending_unbracketed_count);
+  v.add("counterledger_phase_pending_oldest_pps_sequence",
+        ledger.phase_pending_oldest_pps_sequence);
+  v.add("counterledger_phase_pending_newest_pps_sequence",
+        ledger.phase_pending_newest_pps_sequence);
+  v.add("counterledger_phase_pending_last_resolved_pps_sequence",
+        ledger.phase_pending_last_resolved_pps_sequence);
+  v.add("counterledger_phase_pending_last_dropped_pps_sequence",
+        ledger.phase_pending_last_dropped_pps_sequence);
+  v.add("counterledger_last_phase_resolve_reason_id",
+        ledger.last_phase_resolve_reason_id);
+  v.add("counterledger_last_phase_resolve_reason",
+        clocks_phaseledger_resolve_reason_name(
+            ledger.last_phase_resolve_reason_id));
+  v.add("counterledger_last_phase_resolve_pps_sequence",
+        ledger.last_phase_resolve_pps_sequence);
+  v.add("counterledger_last_phase_resolve_interval_cycles",
+        ledger.last_phase_resolve_interval_cycles);
+  v.add("counterledger_last_phase_resolve_pps_delta_cycles",
+        ledger.last_phase_resolve_pps_delta_cycles);
+  v.add("counterledger_last_sample_decision_id",
+        ledger.last_sample_decision_id);
+  v.add("counterledger_last_sample_decision",
+        clocks_counterledger_sample_decision_name(
+            ledger.last_sample_decision_id));
+  parent.add_object(lane ? lane : "lane", v);
+}
+
+static bool clocks_beta_public_ocxo_science_court(
+    uint32_t public_count,
+    uint64_t public_gnss_ns,
+    uint64_t public_ocxo1_ns,
+    uint64_t public_ocxo2_ns,
+    const clock_science_row_t& ocxo1_science,
+    const clock_science_row_t& ocxo2_science,
+    const clocks_alpha_ocxo_counterledger_snapshot_t& ocxo1_counterledger,
+    const clocks_alpha_ocxo_counterledger_snapshot_t& ocxo2_counterledger) {
+  if (!clocks_ocxo_counterledger_mode_enabled()) return true;
+  if (public_count <= 2U) return true;
+  if (!clocks_watchdog_campaign_armed()) return true;
+  if (g_recover_reattach_degraded_active) return true;
+  if (g_science_residual_quarantine_last_public_count == public_count) return true;
+
+  const bool ocxo1_ok = clocks_beta_ocxo_science_custody_ok(
+      ocxo1_science, public_ocxo1_ns);
+  const bool ocxo2_ok = clocks_beta_ocxo_science_custody_ok(
+      ocxo2_science, public_ocxo2_ns);
+  if (ocxo1_ok && ocxo2_ok) return true;
+
+  Payload p;
+  p.add("schema", "CLOCKS_BETA_OCXO_SCIENCE_CUSTODY_V1");
+  p.add("reason", "beta_ocxo_science_custody_invalid");
+  p.add("source", "TEENSY_CLOCKS_BETA_PRE_PUBLISH_COURT");
+  p.add("campaign", campaign_name);
+  p.add("campaign_seconds", campaign_seconds);
+  p.add("public_count", public_count);
+  p.add("public_gnss_ns", public_gnss_ns);
+  p.add("ocxo1_public_ns", public_ocxo1_ns);
+  p.add("ocxo2_public_ns", public_ocxo2_ns);
+  p.add("ocxo1_ok", ocxo1_ok);
+  p.add("ocxo2_ok", ocxo2_ok);
+  p.add("counterledger_mode", true);
+  p.add("court", "public_ocxo_clockface_requires_valid_phaseledger_science");
+
+  Payload violations;
+  if (!ocxo1_ok) {
+    clocks_beta_add_ocxo_science_custody_violation(
+        violations,
+        "ocxo1",
+        ocxo1_science,
+        ocxo1_counterledger,
+        public_ocxo1_ns);
+  }
+  if (!ocxo2_ok) {
+    clocks_beta_add_ocxo_science_custody_violation(
+        violations,
+        "ocxo2",
+        ocxo2_science,
+        ocxo2_counterledger,
+        public_ocxo2_ns);
+  }
+  p.add_object("violations", violations);
+
+  clocks_watchdog_anomaly_payload("beta_ocxo_science_custody_invalid",
+                                  p,
+                                  public_count,
+                                  (!ocxo1_ok ? 1U : 0U) |
+                                      (!ocxo2_ok ? 2U : 0U),
+                                  ocxo1_counterledger.last_phase_resolve_reason_id,
+                                  ocxo2_counterledger.last_phase_resolve_reason_id);
+  return false;
 }
 
 static void floorline_science_build_ocxo(
@@ -7964,6 +8185,20 @@ void clocks_beta_pps(void) {
                                           ocxo1_floorline_science,
                                           ocxo2_floorline_science);
 
+  if (!clocks_beta_public_ocxo_science_court(public_count,
+                                             public_gnss_ns,
+                                             public_ocxo1_ns,
+                                             public_ocxo2_ns,
+                                             ocxo1_floorline_science,
+                                             ocxo2_floorline_science,
+                                             ocxo1_counterledger,
+                                             ocxo2_counterledger)) {
+    g_timebase_watchdog_gate_count++;
+    timebase_build_stage(TIMEBASE_BUILD_STAGE_WATCHDOG_GATE);
+    publish_dac_tick("OCXO_SCIENCE_CUSTODY_COURT");
+    return;
+  }
+
   // ── Legacy cycle-domain residual diagnostics ──
   //
   // This older static-prediction diagnostic remains forensic-only.  Canonical
@@ -8440,6 +8675,7 @@ void clocks_beta_pps(void) {
         f.add("o1_pps_res", pps_residuals.ocxo1_valid
                             ? pps_residuals.ocxo1_fast_residual_ns
                             : 0LL);
+        payload_add_micro_counterledger_fields(f, "o1", ocxo1_counterledger);
 
         const bool o2_ok = ocxo2_forensics_valid;
         const bool o2_fl = floorline_candidate_present(o2_ok, ocxo2_forensics);
@@ -8475,6 +8711,7 @@ void clocks_beta_pps(void) {
         f.add("o2_pps_res", pps_residuals.ocxo2_valid
                             ? pps_residuals.ocxo2_fast_residual_ns
                             : 0LL);
+        payload_add_micro_counterledger_fields(f, "o2", ocxo2_counterledger);
       }
     } else if (TIMEBASE_FORENSICS_SLIM_RAW_CYCLES_PAYLOAD_ENABLED) {
       // Curated campaign-row forensics: enough for raw_cycles /

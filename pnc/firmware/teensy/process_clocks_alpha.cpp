@@ -465,6 +465,8 @@ static constexpr const char* OCXO_DAC_DITHER_TRANSITION_TIMER_NAME =
     "clocks-dac-dither-transition";
 static constexpr const char* OCXO_DAC_DITHER_SERVICE_TIMER_NAME =
     "clocks-dac-dither-service";
+static constexpr uint64_t OCXO_DAC_STATIC_OWNER_QUIET_SERVICE_DELAY_NS =
+    250000000ULL;
 
 // This is runtime state, not boot policy.  process_clocks_init() applies
 // OCXO_DAC_DITHER_DEFAULT_ENABLED through clocks_ocxo_dac_dither_enable() so
@@ -652,10 +654,22 @@ static void ocxo_dac_dither_request_service(void) {
   }
   if (g_ocxo_dac_dither_service_pending) return;
 
-  g_ocxo_dac_dither_service_handle =
-      timepop_arm_alap(ocxo_dac_dither_service_callback,
-                       nullptr,
-                       OCXO_DAC_DITHER_SERVICE_TIMER_NAME);
+  if (g_ocxo_dac_dither_operator_enabled && g_ocxo_dac_dither_started) {
+    g_ocxo_dac_dither_service_handle =
+        timepop_arm_alap(ocxo_dac_dither_service_callback,
+                         nullptr,
+                         OCXO_DAC_DITHER_SERVICE_TIMER_NAME);
+  } else {
+    // Servo/static-owner DAC commits are not waveform edges.  Keep the actual
+    // AD5693R I2C/update transaction away from the PPS/OCXO custody window
+    // instead of running it ALAP after the 1 Hz science row queues intent.
+    g_ocxo_dac_dither_service_handle =
+        timepop_arm(OCXO_DAC_STATIC_OWNER_QUIET_SERVICE_DELAY_NS,
+                    false,
+                    ocxo_dac_dither_service_callback,
+                    nullptr,
+                    OCXO_DAC_DITHER_SERVICE_TIMER_NAME);
+  }
 
   if (g_ocxo_dac_dither_service_handle == TIMEPOP_INVALID_HANDLE) {
     g_ocxo_dac_dither_service_arm_failures++;
@@ -1152,7 +1166,7 @@ uint32_t clocks_ocxo_dac_dither_service_arm_failures(void) {
 }
 
 const char* clocks_ocxo_dac_dither_context(void) {
-  return "DITHER_OWNER_LOW_FIRST_FRAME_ALAP_I2C";
+  return "DITHER_OWNER_LOW_FIRST_FRAME_STATIC_QUIET_I2C";
 }
 
 bool clocks_ocxo_dac_actuator_service_pending(void) {
@@ -1180,7 +1194,7 @@ uint32_t clocks_ocxo_dac_actuator_commit_failure_count(void) {
 }
 
 const char* clocks_ocxo_dac_actuator_context(void) {
-  return "DITHER_OWNS_DAC_SERVO_REQUESTS_ONLY";
+  return "DITHER_OWNS_DAC_SERVO_REQUESTS_STATIC_QUIET_SLOT";
 }
 
 bool ocxo_dac_set_desired(ocxo_dac_state_t& s, double value) {
@@ -2301,6 +2315,14 @@ static constexpr uint32_t ALPHA_COUNTERLEDGER_PHASE_SOURCE_NONE = 0U;
 static constexpr uint32_t ALPHA_COUNTERLEDGER_PHASE_SOURCE_PHYSICAL_PPS_TO_OBSERVED_OCXO_EDGE = 1U;
 static constexpr uint32_t ALPHA_COUNTERLEDGER_PHASE_NEAR_BOUNDARY_NS = 8U;
 
+// PhaseLedger pending PPS custody.  A single pending slot is too fragile when
+// the OCXO edge pair that brackets a PPS arrives after the next PPS sample has
+// already been captured.  Preserve a bounded set of unresolved PPS facts and
+// resolve only the fact actually bracketed by the observed OCXO edge pair.
+// This adds custody memory; it does not relax bracketing, counter-delta, or
+// refined-interval gates.
+static constexpr uint32_t ALPHA_COUNTERLEDGER_PHASE_PENDING_RING_SIZE = 4U;
+
 // CounterLedger is a PPS-sampled 10 MHz integer rail.  One legal contiguous
 // PPS interval should be very close to 10,000,000 ticks; keep the admission
 // band deliberately broad so normal ppm/ppb physics passes while stale,
@@ -2312,6 +2334,12 @@ static constexpr uint32_t ALPHA_COUNTERLEDGER_MIN_PLAUSIBLE_INTERVAL_TICKS =
     ALPHA_COUNTERLEDGER_EXPECTED_INTERVAL_TICKS - 1000000U;
 static constexpr uint32_t ALPHA_COUNTERLEDGER_MAX_PLAUSIBLE_INTERVAL_TICKS =
     ALPHA_COUNTERLEDGER_EXPECTED_INTERVAL_TICKS + 1000000U;
+
+struct alpha_counterledger_phase_pending_t {
+  bool     valid = false;
+  uint32_t pps_sequence = 0;
+  uint32_t pps_dwt_at_edge = 0;
+};
 
 struct alpha_pps_counterledger_lane_t {
   bool     initialized = false;
@@ -2335,6 +2363,21 @@ struct alpha_pps_counterledger_lane_t {
   uint32_t pending_phase_pps_sequence = 0;
   uint32_t pending_phase_pps_dwt_at_edge = 0;
   uint32_t phase_pending_overwrite_count = 0;
+
+  alpha_counterledger_phase_pending_t
+      phase_pending_ring[ALPHA_COUNTERLEDGER_PHASE_PENDING_RING_SIZE] = {};
+  uint32_t phase_pending_depth = 0;
+  uint32_t phase_pending_depth_max = 0;
+  uint32_t phase_pending_enqueue_count = 0;
+  uint32_t phase_pending_overflow_count = 0;
+  uint32_t phase_pending_drop_count = 0;
+  uint32_t phase_pending_resolve_count = 0;
+  uint32_t phase_pending_unbracketed_count = 0;
+  uint32_t phase_pending_oldest_pps_sequence = 0;
+  uint32_t phase_pending_newest_pps_sequence = 0;
+  uint32_t phase_pending_last_resolved_pps_sequence = 0;
+  uint32_t phase_pending_last_dropped_pps_sequence = 0;
+  uint32_t phase_pending_last_matched_index = 0;
 
   bool     phase_valid = false;
   bool     phase_near_boundary = false;
@@ -2759,6 +2802,189 @@ static void alpha_counterledger_reset_current_block_for_gap(
   alpha_counterledger_reset_current_block(s);
 }
 
+static bool alpha_counterledger_dwt32_before(uint32_t lhs, uint32_t rhs) {
+  return lhs != rhs && ((uint32_t)(rhs - lhs) < 0x80000000UL);
+}
+
+static void alpha_counterledger_phase_pending_refresh(
+    alpha_pps_counterledger_lane_t& s) {
+  uint32_t depth = 0U;
+  uint32_t oldest_seq = 0U;
+  uint32_t newest_seq = 0U;
+  uint32_t newest_dwt = 0U;
+
+  for (uint32_t i = 0; i < ALPHA_COUNTERLEDGER_PHASE_PENDING_RING_SIZE; i++) {
+    const alpha_counterledger_phase_pending_t& p = s.phase_pending_ring[i];
+    if (!p.valid) continue;
+
+    depth++;
+    if (oldest_seq == 0U || p.pps_sequence < oldest_seq) {
+      oldest_seq = p.pps_sequence;
+    }
+    if (newest_seq == 0U || p.pps_sequence > newest_seq) {
+      newest_seq = p.pps_sequence;
+      newest_dwt = p.pps_dwt_at_edge;
+    }
+  }
+
+  s.phase_pending_depth = depth;
+  if (depth > s.phase_pending_depth_max) {
+    s.phase_pending_depth_max = depth;
+  }
+  s.phase_pending = depth != 0U;
+  s.phase_pending_oldest_pps_sequence = oldest_seq;
+  s.phase_pending_newest_pps_sequence = newest_seq;
+  s.pending_phase_pps_sequence = newest_seq;
+  s.pending_phase_pps_dwt_at_edge = newest_dwt;
+}
+
+static void alpha_counterledger_phase_pending_clear(
+    alpha_pps_counterledger_lane_t& s) {
+  for (uint32_t i = 0; i < ALPHA_COUNTERLEDGER_PHASE_PENDING_RING_SIZE; i++) {
+    s.phase_pending_ring[i] = alpha_counterledger_phase_pending_t{};
+  }
+  s.phase_pending = false;
+  s.pending_phase_pps_sequence = 0U;
+  s.pending_phase_pps_dwt_at_edge = 0U;
+  s.phase_pending_depth = 0U;
+  s.phase_pending_oldest_pps_sequence = 0U;
+  s.phase_pending_newest_pps_sequence = 0U;
+}
+
+static int alpha_counterledger_phase_pending_find_free(
+    const alpha_pps_counterledger_lane_t& s) {
+  for (uint32_t i = 0; i < ALPHA_COUNTERLEDGER_PHASE_PENDING_RING_SIZE; i++) {
+    if (!s.phase_pending_ring[i].valid) return (int)i;
+  }
+  return -1;
+}
+
+static int alpha_counterledger_phase_pending_find_sequence(
+    const alpha_pps_counterledger_lane_t& s,
+    uint32_t pps_sequence) {
+  for (uint32_t i = 0; i < ALPHA_COUNTERLEDGER_PHASE_PENDING_RING_SIZE; i++) {
+    if (s.phase_pending_ring[i].valid &&
+        s.phase_pending_ring[i].pps_sequence == pps_sequence) {
+      return (int)i;
+    }
+  }
+  return -1;
+}
+
+static int alpha_counterledger_phase_pending_oldest_index(
+    const alpha_pps_counterledger_lane_t& s) {
+  int index = -1;
+  uint32_t oldest_seq = 0U;
+  for (uint32_t i = 0; i < ALPHA_COUNTERLEDGER_PHASE_PENDING_RING_SIZE; i++) {
+    const alpha_counterledger_phase_pending_t& p = s.phase_pending_ring[i];
+    if (!p.valid) continue;
+    if (index < 0 || p.pps_sequence < oldest_seq) {
+      index = (int)i;
+      oldest_seq = p.pps_sequence;
+    }
+  }
+  return index;
+}
+
+static void alpha_counterledger_phase_pending_enqueue(
+    alpha_pps_counterledger_lane_t& s,
+    uint32_t pps_sequence,
+    uint32_t pps_dwt_at_edge) {
+  if (pps_sequence == 0U || pps_dwt_at_edge == 0U) return;
+
+  int slot = alpha_counterledger_phase_pending_find_sequence(s, pps_sequence);
+  if (slot >= 0) {
+    s.phase_pending_ring[(uint32_t)slot].pps_dwt_at_edge = pps_dwt_at_edge;
+    alpha_counterledger_phase_pending_refresh(s);
+    return;
+  }
+
+  slot = alpha_counterledger_phase_pending_find_free(s);
+  if (slot < 0) {
+    slot = alpha_counterledger_phase_pending_oldest_index(s);
+    if (slot < 0) return;
+    s.phase_pending_overflow_count++;
+    s.phase_pending_drop_count++;
+    s.phase_pending_overwrite_count++;
+    s.phase_pending_last_dropped_pps_sequence =
+        s.phase_pending_ring[(uint32_t)slot].pps_sequence;
+  }
+
+  s.phase_pending_ring[(uint32_t)slot].valid = true;
+  s.phase_pending_ring[(uint32_t)slot].pps_sequence = pps_sequence;
+  s.phase_pending_ring[(uint32_t)slot].pps_dwt_at_edge = pps_dwt_at_edge;
+  s.phase_pending_enqueue_count++;
+  alpha_counterledger_phase_pending_refresh(s);
+}
+
+static void alpha_counterledger_phase_pending_remove_at(
+    alpha_pps_counterledger_lane_t& s,
+    int index,
+    bool resolved) {
+  if (index < 0 ||
+      index >= (int)ALPHA_COUNTERLEDGER_PHASE_PENDING_RING_SIZE ||
+      !s.phase_pending_ring[(uint32_t)index].valid) {
+    return;
+  }
+
+  const uint32_t seq = s.phase_pending_ring[(uint32_t)index].pps_sequence;
+  s.phase_pending_ring[(uint32_t)index] = alpha_counterledger_phase_pending_t{};
+  if (resolved) {
+    s.phase_pending_resolve_count++;
+    s.phase_pending_last_resolved_pps_sequence = seq;
+    s.phase_pending_last_matched_index = (uint32_t)index;
+  } else {
+    s.phase_pending_drop_count++;
+    s.phase_pending_last_dropped_pps_sequence = seq;
+  }
+  alpha_counterledger_phase_pending_refresh(s);
+}
+
+static void alpha_counterledger_phase_pending_drop_stale_before(
+    alpha_pps_counterledger_lane_t& s,
+    uint32_t previous_ocxo_dwt_at_edge) {
+  for (uint32_t i = 0; i < ALPHA_COUNTERLEDGER_PHASE_PENDING_RING_SIZE; i++) {
+    const alpha_counterledger_phase_pending_t& p = s.phase_pending_ring[i];
+    if (!p.valid) continue;
+    if (alpha_counterledger_dwt32_before(p.pps_dwt_at_edge,
+                                         previous_ocxo_dwt_at_edge)) {
+      alpha_counterledger_phase_pending_remove_at(s, (int)i, false);
+    }
+  }
+}
+
+static bool alpha_counterledger_phase_pending_find_bracketed(
+    const alpha_pps_counterledger_lane_t& s,
+    uint32_t previous_ocxo_dwt_at_edge,
+    uint32_t interval_cycles,
+    int* out_index,
+    alpha_counterledger_phase_pending_t* out_pending,
+    uint32_t* out_pps_delta_cycles) {
+  int best = -1;
+  uint32_t best_seq = 0U;
+  uint32_t best_delta = 0U;
+
+  for (uint32_t i = 0; i < ALPHA_COUNTERLEDGER_PHASE_PENDING_RING_SIZE; i++) {
+    const alpha_counterledger_phase_pending_t& p = s.phase_pending_ring[i];
+    if (!p.valid) continue;
+
+    const uint32_t delta = p.pps_dwt_at_edge - previous_ocxo_dwt_at_edge;
+    if (delta > interval_cycles) continue;
+
+    if (best < 0 || p.pps_sequence < best_seq) {
+      best = (int)i;
+      best_seq = p.pps_sequence;
+      best_delta = delta;
+    }
+  }
+
+  if (best < 0) return false;
+  if (out_index) *out_index = best;
+  if (out_pending) *out_pending = s.phase_pending_ring[(uint32_t)best];
+  if (out_pps_delta_cycles) *out_pps_delta_cycles = best_delta;
+  return true;
+}
+
 static void alpha_counterledger_reprime_lane_for_recover(
     alpha_pps_counterledger_lane_t& s) {
   if (!s.initialized) return;
@@ -2774,9 +3000,16 @@ static void alpha_counterledger_reprime_lane_for_recover(
   s.last_interval_ns = 0;
   s.last_fast_residual_ns = 0;
 
-  s.phase_pending = false;
-  s.pending_phase_pps_sequence = 0;
-  s.pending_phase_pps_dwt_at_edge = 0;
+  alpha_counterledger_phase_pending_clear(s);
+  s.phase_pending_depth_max = 0;
+  s.phase_pending_enqueue_count = 0;
+  s.phase_pending_overflow_count = 0;
+  s.phase_pending_drop_count = 0;
+  s.phase_pending_resolve_count = 0;
+  s.phase_pending_unbracketed_count = 0;
+  s.phase_pending_last_resolved_pps_sequence = 0;
+  s.phase_pending_last_dropped_pps_sequence = 0;
+  s.phase_pending_last_matched_index = 0;
   s.phase_valid = false;
   s.phase_near_boundary = false;
   s.phase_source_id = ALPHA_COUNTERLEDGER_PHASE_SOURCE_NONE;
@@ -3075,12 +3308,7 @@ static bool alpha_counterledger_apply_pps_sample(
   s.update_count++;
   s.ns = s.ticks64 * (uint64_t)NS_PER_10MHZ_TICK;
 
-  if (s.phase_pending) {
-    s.phase_pending_overwrite_count++;
-  }
-  s.phase_pending = true;
-  s.pending_phase_pps_sequence = pps_sequence;
-  s.pending_phase_pps_dwt_at_edge = pps_dwt_at_edge;
+  alpha_counterledger_phase_pending_enqueue(s, pps_sequence, pps_dwt_at_edge);
 
   s.last_refined_ns = previous_refined_ns;
   s.last_refined_phase_pps_sequence = previous_refined_phase_pps_sequence;
@@ -3320,53 +3548,69 @@ static void alpha_counterledger_resolve_phase_from_ocxo_edge(
     return;
   }
 
-  if (!s->phase_pending) {
-    alpha_counterledger_note_phase_resolve(
-        *s,
-        CLOCKS_PHASELEDGER_RESOLVE_REASON_NO_PENDING_PPS,
-        0U,
-        counter_delta_ticks,
-        0U,
-        0U);
-    return;
-  }
-
-  const uint32_t pending_pps_sequence = s->pending_phase_pps_sequence;
   const uint32_t interval_cycles =
       next_ocxo_dwt_at_edge - previous_ocxo_dwt_at_edge;
   if (interval_cycles == 0U) {
     alpha_counterledger_note_phase_resolve(
         *s,
         CLOCKS_PHASELEDGER_RESOLVE_REASON_ZERO_INTERVAL,
-        pending_pps_sequence,
+        s->phase_pending_newest_pps_sequence,
         counter_delta_ticks,
         interval_cycles,
         0U);
     return;
   }
 
-  const uint32_t pps_delta_cycles =
-      s->pending_phase_pps_dwt_at_edge - previous_ocxo_dwt_at_edge;
-  if (pps_delta_cycles > interval_cycles) {
-    // The pending PPS is not bracketed by this OCXO edge pair yet.  Leave the
-    // pending fact alive for the next OCXO edge rather than guessing.
+  // Preserve custody of several unresolved PPS facts.  Facts that are already
+  // behind the lower OCXO edge can never be bracketed by this or any later
+  // adjacent edge pair, so drop them explicitly.  Future facts stay pending.
+  alpha_counterledger_phase_pending_drop_stale_before(
+      *s,
+      previous_ocxo_dwt_at_edge);
+
+  alpha_counterledger_phase_pending_t pending{};
+  int pending_index = -1;
+  uint32_t pps_delta_cycles = 0U;
+  if (!alpha_counterledger_phase_pending_find_bracketed(
+          *s,
+          previous_ocxo_dwt_at_edge,
+          interval_cycles,
+          &pending_index,
+          &pending,
+          &pps_delta_cycles)) {
+    if (!s->phase_pending) {
+      alpha_counterledger_note_phase_resolve(
+          *s,
+          CLOCKS_PHASELEDGER_RESOLVE_REASON_NO_PENDING_PPS,
+          0U,
+          counter_delta_ticks,
+          interval_cycles,
+          0U);
+      return;
+    }
+
+    // The remaining pending PPS fact(s) are ahead of this OCXO edge pair.
+    // Keep them for a later edge pair instead of overwriting or guessing.
+    s->phase_pending_unbracketed_count++;
+    const uint32_t pending_delta =
+        s->pending_phase_pps_dwt_at_edge - previous_ocxo_dwt_at_edge;
     alpha_counterledger_note_phase_resolve(
         *s,
         CLOCKS_PHASELEDGER_RESOLVE_REASON_UNBRACKETED,
-        pending_pps_sequence,
+        s->phase_pending_oldest_pps_sequence,
         counter_delta_ticks,
         interval_cycles,
-        pps_delta_cycles);
+        pending_delta);
     return;
   }
 
   if (counter_delta_ticks != (uint32_t)VCLOCK_COUNTS_PER_SECOND) {
     s->phase_invalid_count++;
-    s->phase_pending = false;
+    alpha_counterledger_phase_pending_remove_at(*s, pending_index, false);
     alpha_counterledger_note_phase_resolve(
         *s,
         CLOCKS_PHASELEDGER_RESOLVE_REASON_BAD_COUNTER_DELTA,
-        pending_pps_sequence,
+        pending.pps_sequence,
         counter_delta_ticks,
         interval_cycles,
         pps_delta_cycles);
@@ -3393,8 +3637,7 @@ static void alpha_counterledger_resolve_phase_from_ocxo_edge(
   const uint32_t previous_phase_after_last_00_ns =
       s->phase_after_last_00_ns;
   const bool phase_contiguous = previous_phase_valid &&
-      s->pending_phase_pps_sequence ==
-          (uint32_t)(previous_phase_pps_sequence + 1U);
+      pending.pps_sequence == (uint32_t)(previous_phase_pps_sequence + 1U);
 
   int32_t raw_phase_delta_ns = 0;
   int32_t unwrapped_phase_delta_ns = 0;
@@ -3418,11 +3661,10 @@ static void alpha_counterledger_resolve_phase_from_ocxo_edge(
   }
 
   s->phase_valid = true;
-  s->phase_pending = false;
   s->phase_source_id =
       ALPHA_COUNTERLEDGER_PHASE_SOURCE_PHYSICAL_PPS_TO_OBSERVED_OCXO_EDGE;
-  s->phase_pps_sequence = s->pending_phase_pps_sequence;
-  s->phase_pps_dwt_at_edge = s->pending_phase_pps_dwt_at_edge;
+  s->phase_pps_sequence = pending.pps_sequence;
+  s->phase_pps_dwt_at_edge = pending.pps_dwt_at_edge;
   s->phase_prev_ocxo_dwt_at_edge = previous_ocxo_dwt_at_edge;
   s->phase_next_ocxo_dwt_at_edge = next_ocxo_dwt_at_edge;
   s->phase_ocxo_interval_cycles = interval_cycles;
@@ -3441,6 +3683,7 @@ static void alpha_counterledger_resolve_phase_from_ocxo_edge(
           ((uint32_t)NS_PER_10MHZ_TICK -
            ALPHA_COUNTERLEDGER_PHASE_NEAR_BOUNDARY_NS);
   s->phase_resolve_count++;
+  alpha_counterledger_phase_pending_remove_at(*s, pending_index, true);
   alpha_counterledger_note_phase_resolve(
       *s,
       CLOCKS_PHASELEDGER_RESOLVE_REASON_RESOLVED,
@@ -4652,6 +4895,21 @@ bool clocks_alpha_ocxo_counterledger_snapshot(
   out->phase_wrap_count = s->phase_wrap_count;
   out->phase_resolve_count = s->phase_resolve_count;
   out->phase_pending_overwrite_count = s->phase_pending_overwrite_count;
+  out->phase_pending_capacity = ALPHA_COUNTERLEDGER_PHASE_PENDING_RING_SIZE;
+  out->phase_pending_depth = s->phase_pending_depth;
+  out->phase_pending_depth_max = s->phase_pending_depth_max;
+  out->phase_pending_enqueue_count = s->phase_pending_enqueue_count;
+  out->phase_pending_overflow_count = s->phase_pending_overflow_count;
+  out->phase_pending_drop_count = s->phase_pending_drop_count;
+  out->phase_pending_resolve_count = s->phase_pending_resolve_count;
+  out->phase_pending_unbracketed_count = s->phase_pending_unbracketed_count;
+  out->phase_pending_oldest_pps_sequence = s->phase_pending_oldest_pps_sequence;
+  out->phase_pending_newest_pps_sequence = s->phase_pending_newest_pps_sequence;
+  out->phase_pending_last_resolved_pps_sequence =
+      s->phase_pending_last_resolved_pps_sequence;
+  out->phase_pending_last_dropped_pps_sequence =
+      s->phase_pending_last_dropped_pps_sequence;
+  out->phase_pending_last_matched_index = s->phase_pending_last_matched_index;
   out->phase_invalid_count = s->phase_invalid_count;
 
   out->refined_valid = s->refined_valid;
@@ -6841,6 +7099,32 @@ bool clocks_alpha_ocxo_recover_reattach_snapshot(
     r.counterledger_pps_sequence = ledger ? ledger->pps_sequence : 0U;
     r.counterledger_phase_pps_sequence = ledger ? ledger->phase_pps_sequence : 0U;
     r.counterledger_phase_lag_pps = phase_lag;
+    r.counterledger_phase_pending_capacity =
+        ledger ? ALPHA_COUNTERLEDGER_PHASE_PENDING_RING_SIZE : 0U;
+    r.counterledger_phase_pending_depth =
+        ledger ? ledger->phase_pending_depth : 0U;
+    r.counterledger_phase_pending_depth_max =
+        ledger ? ledger->phase_pending_depth_max : 0U;
+    r.counterledger_phase_pending_enqueue_count =
+        ledger ? ledger->phase_pending_enqueue_count : 0U;
+    r.counterledger_phase_pending_overflow_count =
+        ledger ? ledger->phase_pending_overflow_count : 0U;
+    r.counterledger_phase_pending_drop_count =
+        ledger ? ledger->phase_pending_drop_count : 0U;
+    r.counterledger_phase_pending_resolve_count =
+        ledger ? ledger->phase_pending_resolve_count : 0U;
+    r.counterledger_phase_pending_unbracketed_count =
+        ledger ? ledger->phase_pending_unbracketed_count : 0U;
+    r.counterledger_phase_pending_oldest_pps_sequence =
+        ledger ? ledger->phase_pending_oldest_pps_sequence : 0U;
+    r.counterledger_phase_pending_newest_pps_sequence =
+        ledger ? ledger->phase_pending_newest_pps_sequence : 0U;
+    r.counterledger_phase_pending_last_resolved_pps_sequence =
+        ledger ? ledger->phase_pending_last_resolved_pps_sequence : 0U;
+    r.counterledger_phase_pending_last_dropped_pps_sequence =
+        ledger ? ledger->phase_pending_last_dropped_pps_sequence : 0U;
+    r.counterledger_phase_pending_last_matched_index =
+        ledger ? ledger->phase_pending_last_matched_index : 0U;
     r.counterledger_last_delta_ticks = ledger ? ledger->last_delta_ticks : 0U;
     r.counterledger_interval_implausible_count =
         ledger ? ledger->interval_implausible_count : 0U;

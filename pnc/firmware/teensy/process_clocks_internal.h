@@ -375,6 +375,26 @@ struct clocks_alpha_ocxo_counterledger_snapshot_t {
   uint32_t phase_wrap_count = 0;
   uint32_t phase_resolve_count = 0;
   uint32_t phase_pending_overwrite_count = 0;
+
+  // PhaseLedger pending-ring custody.  The legacy single pending slot could
+  // lose a PPS phase fact if the next PPS arrived before the correct OCXO
+  // edge pair bracketed it.  These fields expose the small per-lane ring that
+  // now preserves several unresolved PPS facts without relaxing any resolve
+  // gate.
+  uint32_t phase_pending_capacity = 0;
+  uint32_t phase_pending_depth = 0;
+  uint32_t phase_pending_depth_max = 0;
+  uint32_t phase_pending_enqueue_count = 0;
+  uint32_t phase_pending_overflow_count = 0;
+  uint32_t phase_pending_drop_count = 0;
+  uint32_t phase_pending_resolve_count = 0;
+  uint32_t phase_pending_unbracketed_count = 0;
+  uint32_t phase_pending_oldest_pps_sequence = 0;
+  uint32_t phase_pending_newest_pps_sequence = 0;
+  uint32_t phase_pending_last_resolved_pps_sequence = 0;
+  uint32_t phase_pending_last_dropped_pps_sequence = 0;
+  uint32_t phase_pending_last_matched_index = 0;
+
   uint32_t phase_invalid_count = 0;
 
   bool     refined_valid = false;
@@ -1223,6 +1243,19 @@ struct clocks_alpha_recover_reattach_snapshot_t {
   uint32_t counterledger_pps_sequence = 0;
   uint32_t counterledger_phase_pps_sequence = 0;
   uint32_t counterledger_phase_lag_pps = 0;
+  uint32_t counterledger_phase_pending_capacity = 0;
+  uint32_t counterledger_phase_pending_depth = 0;
+  uint32_t counterledger_phase_pending_depth_max = 0;
+  uint32_t counterledger_phase_pending_enqueue_count = 0;
+  uint32_t counterledger_phase_pending_overflow_count = 0;
+  uint32_t counterledger_phase_pending_drop_count = 0;
+  uint32_t counterledger_phase_pending_resolve_count = 0;
+  uint32_t counterledger_phase_pending_unbracketed_count = 0;
+  uint32_t counterledger_phase_pending_oldest_pps_sequence = 0;
+  uint32_t counterledger_phase_pending_newest_pps_sequence = 0;
+  uint32_t counterledger_phase_pending_last_resolved_pps_sequence = 0;
+  uint32_t counterledger_phase_pending_last_dropped_pps_sequence = 0;
+  uint32_t counterledger_phase_pending_last_matched_index = 0;
   uint32_t counterledger_last_delta_ticks = 0;
   uint32_t counterledger_interval_implausible_count = 0;
   uint32_t counterledger_last_implausible_delta_ticks = 0;
