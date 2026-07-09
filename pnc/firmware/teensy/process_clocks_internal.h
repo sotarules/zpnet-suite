@@ -1661,7 +1661,12 @@ static constexpr uint32_t CLOCKS_CAMPAIGN_WARMUP_SUPPRESS_PPS = 5;
 
 enum class clocks_campaign_state_t {
   STOPPED,
-  STARTED
+  STARTED,
+  // RECOVERING is a real lifecycle state, not just a pending boolean.
+  // Pi-side recovery may arm RECOVER after a watchdog has forced STOPPED;
+  // firmware must then remain visibly in recovery until the next PPS/VCLOCK
+  // row consumes request_recover and resumes STARTED publication.
+  RECOVERING
 };
 
 extern volatile clocks_campaign_state_t campaign_state;

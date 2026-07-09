@@ -168,6 +168,14 @@ SYNC_POLL_S = 0.005
 # for the whole clean-row wait, not just the first visible pair.
 SYNC_RECOVER_CLEAN_TIMEOUT_S = 90.0
 
+# A recovery that produces no public TIMEBASE pair inside this window is not
+# merely "not clean yet".  Teensy should either publish a clean pair or, after
+# its bounded private reattach window, publish degraded rows that let the Pi
+# observe liveness.  If the first pair never appears, abort the firmware
+# RECOVER lifecycle explicitly instead of recursively hard-faulting the Pi-side
+# recovery thread.
+RECOVERY_FIRST_PAIR_TIMEOUT_S = 45.0
+
 SYNC_LOG_INTERVAL_S = 5.0
 
 # TIMEBASE ingress queue: maxsize=0 means unbounded
@@ -350,6 +358,10 @@ _diag: Dict[str, Any] = {
     "last_hard_fault": {},
     "hard_faults_total": 0,
     "auto_recovery_failures": 0,
+    "recovery_abort_requests": 0,
+    "recovery_abort_success": 0,
+    "recovery_abort_failures": 0,
+    "last_recovery_abort": {},
 
     # Sync waits
     "sync_waits": 0,
@@ -811,6 +823,15 @@ _sync_fragment: Optional[Dict[str, Any]] = None
 _auto_recovery_in_progress: bool = False
 
 
+class RecoverySyncTimeout(RuntimeError):
+    """Raised when a RECOVER lifecycle does not produce a public TIMEBASE pair."""
+
+    def __init__(self, reason: str, details: Dict[str, Any]):
+        super().__init__(f"{reason}: {details}")
+        self.reason = reason
+        self.details = details
+
+
 def _note_timebase_activity(topic: str, pps_vclock_count: int) -> None:
     """
     Record that a Teensy TIMEBASE publication half was received.
@@ -1255,9 +1276,13 @@ def _begin_auto_recovery(reason: str, details: Dict[str, Any], *, source: str) -
             logging.info("🔄 [clocks] @%s auto-recovery starting...", system_time_z())
             _recover_campaign()
             logging.info("✅ [clocks] @%s auto-recovery complete", system_time_z())
-        except Exception:
+        except Exception as e:
             logging.exception("💥 [clocks] auto-recovery FAILED — campaign deactivated")
             _diag["auto_recovery_failures"] = _diag.get("auto_recovery_failures", 0) + 1
+            _cleanup_after_recovery_failure(
+                "auto_recovery_failed",
+                {"error": str(e), "source": source, "reason": reason},
+            )
         finally:
             _auto_recovery_in_progress = False
 
@@ -1814,10 +1839,22 @@ def _end_sync_wait(timeout_s: float = SYNC_FRAGMENT_TIMEOUT_S) -> Tuple[Dict[str
         remaining = timeout_s - (now - t0)
         if remaining <= 0:
             _diag["hard_fault_sync_timeout"] += 1
-            _hard_fault("sync_timeout_waiting_for_fragment", {
+            details = {
                 "expected_pps_vclock_count": _sync_expected_pps_vclock,
-                "timeout_s": timeout_s,
-            })
+                "timeout_s": float(timeout_s),
+                "waited_s": round(float(now - t0), 3),
+                "last_timebase_activity_utc": _timebase_last_activity_utc,
+                "last_timebase_activity_topic": _timebase_last_activity_topic,
+                "last_timebase_activity_pps_vclock_count": _timebase_last_activity_pps_vclock_count,
+                "last_accepted_pps_vclock_count": _accepted_pps_vclock_count,
+            }
+            _diag["last_sync_wait"] = {
+                "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "reason": "sync_timeout_waiting_for_fragment",
+                **details,
+            }
+            _clear_sync_wait()
+            raise RecoverySyncTimeout("sync_timeout_waiting_for_fragment", details)
 
         if now - last_log >= SYNC_LOG_INTERVAL_S:
             logging.info(
@@ -3895,6 +3932,80 @@ def _request_teensy_recover(pps_vclock_count: int, args: Dict[str, Any]) -> None
     send_command(machine="TEENSY", subsystem="CLOCKS", command="RECOVER", args=teensy_args)
 
 
+def _request_teensy_recover_abort_best_effort(
+    reason: str,
+    details: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Ask Teensy CLOCKS to clear any half-open RECOVER lifecycle state."""
+    _diag["recovery_abort_requests"] = _diag.get("recovery_abort_requests", 0) + 1
+    payload = {
+        "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "reason": reason,
+        "details": details or {},
+    }
+    try:
+        resp = send_command(
+            machine="TEENSY",
+            subsystem="CLOCKS",
+            command="RECOVER_ABORT",
+            args={"reason": reason},
+            retries=1,
+            retry_delay_s=0.0,
+        )
+        payload["success"] = bool(resp.get("success"))
+        payload["message"] = resp.get("message")
+        payload["teensy_payload"] = resp.get("payload")
+        if resp.get("success"):
+            _diag["recovery_abort_success"] = _diag.get("recovery_abort_success", 0) + 1
+            logging.info("🧯 [recovery] Teensy RECOVER_ABORT accepted: reason=%s", reason)
+        else:
+            _diag["recovery_abort_failures"] = _diag.get("recovery_abort_failures", 0) + 1
+            logging.warning(
+                "⚠️ [recovery] Teensy RECOVER_ABORT rejected/unsupported: reason=%s message=%s",
+                reason, resp.get("message"),
+            )
+    except Exception as e:
+        payload["success"] = False
+        payload["error"] = str(e)
+        _diag["recovery_abort_failures"] = _diag.get("recovery_abort_failures", 0) + 1
+        logging.warning("⚠️ [recovery] Teensy RECOVER_ABORT failed/unsupported: %s", e)
+    finally:
+        _diag["last_recovery_abort"] = payload
+
+
+def _cleanup_after_recovery_failure(reason: str, details: Dict[str, Any]) -> None:
+    """Return Pi and Teensy to a commandable non-recovering state after RECOVER fails."""
+    global _campaign_active
+
+    _campaign_active = False
+    _clear_sync_wait()
+    _clear_start_wait_state()
+    _clear_flash_cut_wait_state()
+    drained = _drain_timebase_ingress_and_pending()
+    _request_teensy_recover_abort_best_effort(reason, details)
+    _diag["last_recovery_abort"] = {
+        **(_diag.get("last_recovery_abort") or {}),
+        "pi_cleanup_reason": reason,
+        "drained_timebase_pieces": int(drained),
+    }
+
+
+def cmd_recover_abort(args: Optional[dict]) -> Dict[str, Any]:
+    """Manual operator escape hatch for a half-open RECOVER lifecycle."""
+    reason = str((args or {}).get("reason") or "operator_recover_abort")
+    details = {"operator_command": True}
+    _cleanup_after_recovery_failure(reason, details)
+    return {
+        "success": True,
+        "message": "OK",
+        "payload": {
+            "reason": reason,
+            "last_recovery_abort": _diag.get("last_recovery_abort"),
+            "campaign_active": bool(_campaign_active),
+        },
+    }
+
+
 def cmd_start(args: Optional[dict]) -> dict:
     """
     START — asynchronous cold START or hot Flash Cut.
@@ -4143,6 +4254,10 @@ def cmd_stop(_: Optional[dict]) -> dict:
     )
 
     _request_teensy_stop_best_effort()
+    # STOP should be enough on current firmware.  RECOVER_ABORT is harmless if
+    # supported and prevents old half-open RECOVER latches from surviving a Pi
+    # STOP issued after a failed recovery attempt.
+    _request_teensy_recover_abort_best_effort("pi_stop_cleanup")
 
     stopped_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     with open_db() as conn:
@@ -4210,6 +4325,7 @@ def cmd_clear(_: Optional[dict]) -> dict:
     global _campaign_active
 
     _request_teensy_stop_best_effort()
+    _request_teensy_recover_abort_best_effort("pi_clear_cleanup")
 
     try:
         with open_db() as conn:
@@ -4634,6 +4750,7 @@ def _recover_campaign() -> None:
     # ------------------------------------------------------------------
     logging.info("📡 [recovery] @%s stopping Teensy...", system_time_z())
     _request_teensy_stop_best_effort()
+    _request_teensy_recover_abort_best_effort("pre_recover_cleanup_after_stop")
     time.sleep(2.0)
 
     _drained = _drain_timebase_ingress_and_pending()
@@ -4795,13 +4912,39 @@ def _recover_campaign() -> None:
     while True:
         remaining = clean_wait_deadline - time.monotonic()
         if remaining <= 0:
+            details = {
+                "campaign": campaign_name,
+                "expected_first_public_pps_vclock_count": int(expected_first_public_pps_vclock_count),
+                "discarded_transitional_pairs": int(discarded_transitional_pairs),
+                "last_clean_verdict": recovery_clean_verdict,
+                "clean_timeout_s": float(SYNC_RECOVER_CLEAN_TIMEOUT_S),
+            }
+            _cleanup_after_recovery_failure("recover_clean_timeout", details)
             raise RuntimeError(
                 "recovery failed: timed out waiting for clean OCXO reattachment "
                 f"after discarding {discarded_transitional_pairs} transitional pair(s); "
                 f"last_verdict={recovery_clean_verdict}"
             )
 
-        frag, waited_s = _end_sync_wait(timeout_s=remaining)
+        try:
+            frag, waited_s = _end_sync_wait(
+                timeout_s=min(float(remaining), float(RECOVERY_FIRST_PAIR_TIMEOUT_S))
+            )
+        except RecoverySyncTimeout as e:
+            details = {
+                **e.details,
+                "campaign": campaign_name,
+                "recover_base_pps_vclock_count": int(recover_base_pps_vclock_count),
+                "expected_first_public_pps_vclock_count": int(expected_first_public_pps_vclock_count),
+                "discarded_transitional_pairs": int(discarded_transitional_pairs),
+                "last_clean_verdict": recovery_clean_verdict,
+            }
+            _cleanup_after_recovery_failure(e.reason, details)
+            raise RuntimeError(
+                "recovery failed: timed out waiting for first public TIMEBASE pair; "
+                f"cleanup sent to Teensy; details={details}"
+            ) from e
+
         teensy_pps_vclock_count = _extract_teensy_pps_vclock_count(frag)
         first_public_offset = teensy_pps_vclock_count - expected_first_public_pps_vclock_count
         recovery_status = _fetch_teensy_recovery_status()
@@ -6035,6 +6178,8 @@ COMMANDS = {
     "START": cmd_start,
     "STOP": cmd_stop,
     "RESUME": cmd_resume,
+    "RECOVER_ABORT": cmd_recover_abort,
+    "RECOVERY_ABORT": cmd_recover_abort,
     "REPORT": cmd_report,
     "CLEAR": cmd_clear,
     "DELETE": cmd_delete,
@@ -6077,7 +6222,7 @@ def run() -> None:
         "Pi-side Welford for DWT/OCXO1/OCXO2 removed. GNSS stream canary retained. "
         "Recovery: campaign deactivated + queue drained + first sync pair preserved; valid fragments are never rejected for count mismatch. START and cold recovery are asynchronous; first public rows are expected to be authoritative. "
         "START while active performs seamless flash-cut to new campaign. "
-        "Commands: START, STOP, RESUME, REPORT, CLEAR, DELETE, TRUNCATE, SET_DAC, DITHER, "
+        "Commands: START, STOP, RESUME, RECOVER_ABORT, REPORT, CLEAR, DELETE, TRUNCATE, SET_DAC, DITHER, "
         "SET_BASELINE, BASELINE_INFO, LIST_CAMPAIGNS, CLOCKS_INFO. "
         "Subscriptions: TIMEBASE_FRAGMENT, TIMEBASE_FORENSICS, WATCHDOG_ANOMALY."
     )
@@ -6194,13 +6339,12 @@ def run() -> None:
     else:
         try:
             _recover_campaign()
-        except Exception:
+        except Exception as e:
             # Boot must not die merely because campaign recovery/startup is
             # waiting or failed.  Keep the command interface alive so the
             # operator can REPORT, STOP, CLEAR, DELETE, or START explicitly.
             logging.exception("💥 [clocks] boot recovery failed; CLOCKS command interface remains available")
-            _campaign_active = False
-            _clear_sync_wait()
+            _cleanup_after_recovery_failure("boot_recovery_failed", {"error": str(e)})
 
     # Block forever
     logging.info("🏁 [clocks] entering main loop")

@@ -8385,6 +8385,7 @@ static void update_pps_vclock_bridge_anchor(const pps_edge_snapshot_t& snap) {
 
 static void maybe_publish_fragment(void) {
   if (campaign_state == clocks_campaign_state_t::STARTED ||
+      campaign_state == clocks_campaign_state_t::RECOVERING ||
       request_start || request_stop || request_recover || request_zero) {
     clocks_beta_pps();
   }

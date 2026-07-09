@@ -203,6 +203,7 @@ static constexpr uint32_t TIMEBASE_BUILD_STAGE_SERVO = 11;
 static constexpr uint32_t TIMEBASE_BUILD_STAGE_DAC_WELFORD = 12;
 static constexpr uint32_t TIMEBASE_BUILD_STAGE_FLASH_CUT_GATE = 13;
 static constexpr uint32_t TIMEBASE_BUILD_STAGE_RECOVER_REATTACH_GATE = 14;
+static constexpr uint32_t TIMEBASE_BUILD_STAGE_RECOVERING_NO_REQUEST_GATE = 15;
 static constexpr uint32_t TIMEBASE_BUILD_STAGE_BUILD_BEGIN = 20;
 static constexpr uint32_t TIMEBASE_BUILD_STAGE_SPINE = 21;
 static constexpr uint32_t TIMEBASE_BUILD_STAGE_GNSS = 22;
@@ -581,6 +582,7 @@ static FLASHMEM const char* timebase_build_stage_name(uint32_t stage) {
     case TIMEBASE_BUILD_STAGE_DAC_WELFORD: return "DAC_WELFORD";
     case TIMEBASE_BUILD_STAGE_FLASH_CUT_GATE: return "FLASH_CUT_GATE";
     case TIMEBASE_BUILD_STAGE_RECOVER_REATTACH_GATE: return "RECOVER_REATTACH_GATE";
+    case TIMEBASE_BUILD_STAGE_RECOVERING_NO_REQUEST_GATE: return "RECOVERING_NO_REQUEST_GATE";
     case TIMEBASE_BUILD_STAGE_BUILD_BEGIN: return "BUILD_BEGIN";
     case TIMEBASE_BUILD_STAGE_SPINE: return "SPINE";
     case TIMEBASE_BUILD_STAGE_GNSS: return "GNSS";
@@ -607,6 +609,18 @@ static FLASHMEM const char* timebase_build_stage_name(uint32_t stage) {
 
 static void timebase_build_stage(uint32_t stage) {
   g_timebase_last_stage = stage;
+}
+
+static const char* clocks_campaign_state_name(clocks_campaign_state_t state) {
+  switch (state) {
+    case clocks_campaign_state_t::STARTED:    return "STARTED";
+    case clocks_campaign_state_t::RECOVERING: return "RECOVERING";
+    default:                                  return "STOPPED";
+  }
+}
+
+static bool clocks_campaign_recovery_lifecycle_active(void) {
+  return campaign_state == clocks_campaign_state_t::RECOVERING;
 }
 
 // ============================================================================
@@ -1311,6 +1325,22 @@ static uint64_t          g_recover_last_base_gnss_ns = 0;
 static uint64_t          g_recover_last_base_dwt_ns = 0;
 static uint64_t          g_recover_last_base_ocxo1_ns = 0;
 static uint64_t          g_recover_last_base_ocxo2_ns = 0;
+
+// RECOVER lifecycle flight recorder.  RECOVER is intentionally promoted to a
+// visible campaign state at command time so watchdog recovery cannot leave the
+// firmware in STOPPED + request_recover limbo while Pi waits for TIMEBASE.
+static uint32_t          g_recover_lifecycle_begin_count = 0;
+static uint32_t          g_recover_lifecycle_pps_gate_count = 0;
+static uint32_t          g_recover_lifecycle_command_custody_reset_count = 0;
+static uint32_t          g_recover_lifecycle_gate_custody_reset_count = 0;
+static uint32_t          g_recover_lifecycle_complete_count = 0;
+static uint32_t          g_recover_lifecycle_abort_count = 0;
+static uint32_t          g_recover_lifecycle_stale_gate_count = 0;
+static uint32_t          g_recover_lifecycle_last_begin_campaign_seconds = 0;
+static uint32_t          g_recover_lifecycle_last_gate_campaign_seconds = 0;
+static uint32_t          g_recover_lifecycle_last_abort_campaign_seconds = 0;
+static char              g_recover_lifecycle_reason[64] = "idle";
+static char              g_recover_lifecycle_abort_reason[64] = "none";
 
 // RECOVER presentation continuity.  Reattachment proves fresh OCXO custody,
 // but the raw CounterLedger/PhaseLedger intercept can differ from the
@@ -2228,6 +2258,63 @@ static void campaign_warmup_reset(void) {
   campaign_start_prologue_reset("reset");
   recover_reattach_reset("warmup_reset");
   campaign_public_offsets_reset_to_current();
+}
+
+static void clocks_watchdog_clear_surrender_for_new_lifecycle(void);
+static void clocks_watchdog_disarm_campaign_publication(void);
+
+static void recover_lifecycle_set_reason(const char* reason) {
+  safeCopy(g_recover_lifecycle_reason,
+           sizeof(g_recover_lifecycle_reason),
+           reason ? reason : "recover_lifecycle");
+}
+
+static void recover_lifecycle_set_abort_reason(const char* reason) {
+  safeCopy(g_recover_lifecycle_abort_reason,
+           sizeof(g_recover_lifecycle_abort_reason),
+           reason ? reason : "recover_abort");
+}
+
+static void recover_lifecycle_enter_from_command(const char* reason) {
+  g_recover_lifecycle_begin_count++;
+  g_recover_lifecycle_last_begin_campaign_seconds = (uint32_t)campaign_seconds;
+  recover_lifecycle_set_reason(reason ? reason : "recover_command_armed");
+  recover_lifecycle_set_abort_reason("none");
+
+  // A watchdog may have stopped the campaign and left process_interrupt's
+  // publication court in a surrendered state. Clear that custody immediately
+  // at command acceptance so the next PPS/VCLOCK can reach Beta and consume
+  // request_recover. The PPS gate repeats the reset as an idempotent boundary
+  // proof before publication resumes.
+  interrupt_recover_reset_publication_custody();
+  g_recover_lifecycle_command_custody_reset_count++;
+
+  clocks_watchdog_clear_surrender_for_new_lifecycle();
+  clocks_watchdog_disarm_campaign_publication();
+  campaign_state = clocks_campaign_state_t::RECOVERING;
+}
+
+static void recover_lifecycle_complete_at_pps(void) {
+  g_recover_lifecycle_complete_count++;
+  recover_lifecycle_set_reason("recover_pps_gate_consumed");
+  campaign_state = clocks_campaign_state_t::STARTED;
+}
+
+static void recover_lifecycle_abort(const char* reason) {
+  g_recover_lifecycle_abort_count++;
+  g_recover_lifecycle_last_abort_campaign_seconds = (uint32_t)campaign_seconds;
+  recover_lifecycle_set_abort_reason(reason ? reason : "recover_aborted");
+  recover_lifecycle_set_reason("idle");
+
+  request_recover = false;
+  request_start = false;
+  request_stop = false;
+  request_zero = false;
+  flash_cut_clear_pending();
+  clocks_watchdog_clear_surrender_for_new_lifecycle();
+  campaign_state = clocks_campaign_state_t::STOPPED;
+  campaign_warmup_reset();
+  timebase_invalidate();
 }
 
 static uint64_t campaign_public_dwt_total(void) {
@@ -7667,6 +7754,9 @@ static void campaign_flash_cut_commit_at_pps(void) {
 static void clocks_force_stop_campaign(void) {
   clocks_watchdog_disarm_campaign_publication();
   campaign_state = clocks_campaign_state_t::STOPPED;
+  safeCopy(g_recover_lifecycle_abort_reason,
+           sizeof(g_recover_lifecycle_abort_reason),
+           "force_stop_campaign");
   request_start = false;
   request_stop = false;
   request_recover = false;
@@ -7901,6 +7991,8 @@ void clocks_beta_pps(void) {
   if (request_recover) {
     clocks_watchdog_disarm_campaign_publication();
     g_timebase_recover_gate_count++;
+    g_recover_lifecycle_pps_gate_count++;
+    g_recover_lifecycle_last_gate_campaign_seconds = (uint32_t)campaign_seconds;
     timebase_build_stage(TIMEBASE_BUILD_STAGE_RECOVER_GATE);
     clocks_watchdog_clear_surrender_for_new_lifecycle();
     request_zero = false;
@@ -7928,15 +8020,23 @@ void clocks_beta_pps(void) {
     // receives only post-recovery, post-warmup intervals.
     clocks_alpha_recover_reprime_ocxo_state();
     interrupt_recover_reset_publication_custody();
+    g_recover_lifecycle_gate_custody_reset_count++;
     pps_interval_residuals_begin_recover_quarantine(
         CLOCKS_RECOVER_SCIENCE_QUARANTINE_ROWS);
     recover_welfords_apply_pending();
 
     request_recover = false;
     flash_cut_clear_pending();
-    campaign_state = clocks_campaign_state_t::STARTED;
+    recover_lifecycle_complete_at_pps();
     campaign_warmup_begin(campaign_warmup_mode_t::RECOVER);
     publish_dac_tick("RECOVER_GATE");
+    return;
+  }
+
+  if (clocks_campaign_recovery_lifecycle_active()) {
+    g_recover_lifecycle_stale_gate_count++;
+    timebase_build_stage(TIMEBASE_BUILD_STAGE_RECOVERING_NO_REQUEST_GATE);
+    publish_dac_tick("RECOVERING_NO_REQUEST_GATE");
     return;
   }
 
@@ -9025,7 +9125,7 @@ static FLASHMEM Payload cmd_flash_cut(const Payload& args) {
     Payload err;
     err.add("error", "flash cut requires an active campaign");
     err.add("status", "flash_cut_rejected_not_started");
-    err.add("campaign_state", "STOPPED");
+    err.add("campaign_state", clocks_campaign_state_name(campaign_state));
     err.add("campaign", campaign_name);
     return err;
   }
@@ -9129,6 +9229,17 @@ static FLASHMEM Payload cmd_start(const Payload& args) {
     return cmd_flash_cut(args);
   }
 
+  if (clocks_campaign_recovery_lifecycle_active() || request_recover) {
+    Payload err;
+    err.add("error", "campaign recovery is active");
+    err.add("status", "start_rejected_recovering");
+    err.add("campaign_state", clocks_campaign_state_name(campaign_state));
+    err.add("request_recover", request_recover);
+    err.add("recover_reason", g_recover_lifecycle_reason);
+    err.add("recover_abort_command", "RECOVER_ABORT");
+    return err;
+  }
+
   if (!campaign_feature_gate_open()) {
     Payload err;
     err.add("error", "campaign feature gate closed");
@@ -9221,6 +9332,8 @@ static FLASHMEM Payload cmd_stop(const Payload&) {
   const bool had_live_smartzero = interrupt_smartzero_running();
   const bool had_pending_start = request_start;
   const bool had_pending_zero = request_zero;
+  const bool had_pending_recover = request_recover;
+  const bool had_recovering = clocks_campaign_recovery_lifecycle_active();
 
   interrupt_smartzero_abort();
   if (had_live_smartzero || had_pending_start || had_pending_zero) {
@@ -9234,10 +9347,19 @@ static FLASHMEM Payload cmd_stop(const Payload&) {
 
   Payload p;
 
-  if (campaign_state == clocks_campaign_state_t::STARTED) {
+  if (campaign_state == clocks_campaign_state_t::STARTED &&
+      !had_pending_recover && !had_recovering) {
     request_stop = true;
     p.add("status", "stop_requested");
     p.add("service_epoch_preserved", false);
+    return p;
+  }
+
+  if (had_recovering || had_pending_recover) {
+    recover_lifecycle_abort("stop_command_abort_recover");
+    p.add("status", "recover_aborted_by_stop");
+    p.add("service_epoch_preserved", true);
+    p.add("campaign_state", clocks_campaign_state_name(campaign_state));
     return p;
   }
 
@@ -9263,6 +9385,9 @@ static FLASHMEM Payload cmd_stop(const Payload&) {
 
 
 static FLASHMEM Payload cmd_zero(const Payload&) {
+  if (clocks_campaign_recovery_lifecycle_active() || request_recover) {
+    recover_lifecycle_abort("zero_command_abort_recover");
+  }
   request_start = false;
   request_stop = false;
   request_recover = false;
@@ -9388,6 +9513,7 @@ static FLASHMEM Payload cmd_recover(const Payload& args) {
   request_stop    = false;
   request_zero    = false;
   flash_cut_clear_pending();
+  recover_lifecycle_enter_from_command("recover_command_armed");
 
   Payload p;
   p.add("status", "recover_requested");
@@ -9401,6 +9527,28 @@ static FLASHMEM Payload cmd_recover(const Payload& args) {
   p.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
   p.add("calibrate_ocxo_supplied", servo_supplied);
   p.add("recover_status_report", "REPORT_RECOVERY");
+  p.add("campaign_state", clocks_campaign_state_name(campaign_state));
+  p.add("recover_lifecycle", clocks_campaign_recovery_lifecycle_active());
+  p.add("recover_lifecycle_reason", g_recover_lifecycle_reason);
+  p.add("recover_command_custody_reset_count",
+        g_recover_lifecycle_command_custody_reset_count);
+  p.add("interrupt_recover_publication_reset_count",
+        interrupt_recover_publication_custody_reset_count());
+  return p;
+}
+
+static FLASHMEM Payload cmd_recover_abort(const Payload& args) {
+  const char* reason = args.getString("reason");
+  recover_lifecycle_abort(reason && *reason
+                              ? reason
+                              : "recover_abort_command");
+  Payload p;
+  p.add("status", "recover_aborted");
+  p.add("campaign_state", clocks_campaign_state_name(campaign_state));
+  p.add("abort_count", g_recover_lifecycle_abort_count);
+  p.add("abort_reason", g_recover_lifecycle_abort_reason);
+  p.add("request_recover", request_recover);
+  p.add("watchdog_publication_blocked", clocks_watchdog_publication_blocked());
   return p;
 }
 
@@ -9864,12 +10012,15 @@ static FLASHMEM void add_summary_payload(Payload& p) {
 }
 static FLASHMEM void add_campaign_payload(Payload& p) {
   p.add("campaign_state",
-        campaign_state == clocks_campaign_state_t::STARTED ? "STARTED" : "STOPPED");
+        clocks_campaign_state_name(campaign_state));
   p.add("campaign", campaign_name);
   p.add("campaign_seconds", campaign_seconds);
   p.add("request_start", request_start);
   p.add("request_stop", request_stop);
   p.add("request_recover", request_recover);
+  p.add("recover_lifecycle_active", clocks_campaign_recovery_lifecycle_active());
+  p.add("recover_lifecycle_reason", g_recover_lifecycle_reason);
+  p.add("recover_lifecycle_abort_reason", g_recover_lifecycle_abort_reason);
   p.add("request_zero", request_zero);
   p.add("request_flash_cut", request_flash_cut);
   p.add("flash_cut_pending_campaign", flash_cut_campaign_name);
@@ -10785,6 +10936,20 @@ static FLASHMEM Payload cmd_report_timebase_publish(const Payload&) {
                g_recover_welford_last_restored_lane_count);
   counters.add("alpha_recover_reprime_count",
                clocks_alpha_recover_reprime_count());
+  counters.add("recover_lifecycle_begin_count",
+               (uint32_t)g_recover_lifecycle_begin_count);
+  counters.add("recover_lifecycle_pps_gate_count",
+               (uint32_t)g_recover_lifecycle_pps_gate_count);
+  counters.add("recover_lifecycle_command_custody_reset_count",
+               (uint32_t)g_recover_lifecycle_command_custody_reset_count);
+  counters.add("recover_lifecycle_gate_custody_reset_count",
+               (uint32_t)g_recover_lifecycle_gate_custody_reset_count);
+  counters.add("recover_lifecycle_complete_count",
+               (uint32_t)g_recover_lifecycle_complete_count);
+  counters.add("recover_lifecycle_abort_count",
+               (uint32_t)g_recover_lifecycle_abort_count);
+  counters.add("recover_lifecycle_stale_gate_count",
+               (uint32_t)g_recover_lifecycle_stale_gate_count);
   counters.add("recover_science_quarantine_required",
                (uint32_t)CLOCKS_RECOVER_SCIENCE_QUARANTINE_ROWS);
   counters.add("recover_science_quarantine_begin_count",
@@ -10864,7 +11029,10 @@ static FLASHMEM Payload cmd_report_timebase_publish(const Payload&) {
             g_start_phaseledger_last_first_problem);
   gates.add("dwt_publication_launch_acquisition",
             interrupt_dwt_publication_launch_acquisition_active());
-  gates.add("campaign_state", campaign_state == clocks_campaign_state_t::STARTED ? "STARTED" : "STOPPED");
+  gates.add("campaign_state", clocks_campaign_state_name(campaign_state));
+  gates.add("recover_lifecycle_active", clocks_campaign_recovery_lifecycle_active());
+  gates.add("recover_lifecycle_reason", g_recover_lifecycle_reason);
+  gates.add("recover_lifecycle_abort_reason", g_recover_lifecycle_abort_reason);
   gates.add("warmup_active", campaign_warmup_active());
   gates.add("recover_reattach_active", (bool)g_recover_reattach_active);
   gates.add("recover_reattach_degraded_active",
@@ -11190,7 +11358,25 @@ static FLASHMEM Payload cmd_report_recovery(const Payload&) {
   p.add("schema", "CLOCKS_RECOVERY_FLAT_V2");
   p.add("description", "cached flat RECOVER wait/release/degraded-publication state");
 
-  p.add("campaign_state", campaign_state == clocks_campaign_state_t::STARTED ? "STARTED" : "STOPPED");
+  p.add("campaign_state", clocks_campaign_state_name(campaign_state));
+  p.add("recover_lifecycle_active", clocks_campaign_recovery_lifecycle_active());
+  p.add("recover_lifecycle_reason", g_recover_lifecycle_reason);
+  p.add("recover_lifecycle_abort_reason", g_recover_lifecycle_abort_reason);
+  p.add("recover_lifecycle_begin_count", (uint32_t)g_recover_lifecycle_begin_count);
+  p.add("recover_lifecycle_pps_gate_count", (uint32_t)g_recover_lifecycle_pps_gate_count);
+  p.add("recover_lifecycle_command_custody_reset_count",
+        (uint32_t)g_recover_lifecycle_command_custody_reset_count);
+  p.add("recover_lifecycle_gate_custody_reset_count",
+        (uint32_t)g_recover_lifecycle_gate_custody_reset_count);
+  p.add("recover_lifecycle_complete_count", (uint32_t)g_recover_lifecycle_complete_count);
+  p.add("recover_lifecycle_abort_count", (uint32_t)g_recover_lifecycle_abort_count);
+  p.add("recover_lifecycle_stale_gate_count", (uint32_t)g_recover_lifecycle_stale_gate_count);
+  p.add("recover_lifecycle_last_begin_campaign_seconds",
+        (uint32_t)g_recover_lifecycle_last_begin_campaign_seconds);
+  p.add("recover_lifecycle_last_gate_campaign_seconds",
+        (uint32_t)g_recover_lifecycle_last_gate_campaign_seconds);
+  p.add("recover_lifecycle_last_abort_campaign_seconds",
+        (uint32_t)g_recover_lifecycle_last_abort_campaign_seconds);
   p.add("campaign", campaign_name);
   p.add("campaign_seconds", campaign_seconds);
   p.add("warmup_active", campaign_warmup_active());
@@ -12168,6 +12354,8 @@ static const process_command_entry_t CLOCKS_COMMANDS[] = {
   { "STOP",              cmd_stop              },
   { "ZERO",              cmd_zero              },
   { "RECOVER",           cmd_recover           },
+  { "RECOVER_ABORT",     cmd_recover_abort     },
+  { "RECOVERY_ABORT",    cmd_recover_abort     },
   { "SERVOS",            cmd_servos            },
   { "REPORT",            cmd_report            },
   { "REPORT_STATUS",     cmd_report_status     },
