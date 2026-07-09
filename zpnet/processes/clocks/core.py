@@ -191,6 +191,13 @@ AUTO_RECOVERY_RETRY_DELAY_S = 1.0
 # abort this RECOVER attempt and retry from the latest durable TIMEBASE.
 RECOVERY_DEGRADED_PUBLICATION_FAST_RETRY_ROWS = 10
 
+# RECOVER transaction watchdog.  A Teensy USB/firmware reboot after CLOCKS.RECOVER
+# has been accepted can erase the in-flight RECOVER lifecycle while the Pi is
+# still waiting for the first public pair.  Poll REPORT_RECOVERY during that
+# wait and retry promptly if the recovered base identity disappears.
+RECOVERY_SYNC_HEALTH_POLL_S = 2.0
+RECOVERY_SYNC_HEALTH_GRACE_S = 3.0
+
 SYNC_LOG_INTERVAL_S = 5.0
 
 # TIMEBASE ingress queue: maxsize=0 means unbounded
@@ -453,6 +460,11 @@ _diag: Dict[str, Any] = {
     "recovery_clean_stalls": 0,
     "recovery_degraded_fast_retry_count": 0,
     "recovery_degraded_fast_retry_rows": RECOVERY_DEGRADED_PUBLICATION_FAST_RETRY_ROWS,
+    "recovery_inflight_health_polls": 0,
+    "recovery_inflight_health_empty": 0,
+    "recovery_inflight_command_lost": 0,
+    "last_recovery_inflight_health": {},
+    "last_recovery_command_lost": {},
     "last_recovery_transitional_pair": {},
     "last_recovery_clean_timeout": {},
     "last_recovery_degraded_fast_retry": {},
@@ -909,6 +921,10 @@ class RecoveryInterrupted(RecoveryRetryableFailure):
     """Raised when a new WATCHDOG_ANOMALY invalidates an active recovery attempt."""
 
 
+class RecoveryCommandLost(RecoveryRetryableFailure):
+    """Raised when Teensy loses the in-flight RECOVER command/lifecycle."""
+
+
 def _note_recovery_interruption(reason: str, details: Dict[str, Any], *, source: str) -> None:
     """Mark the current recovery attempt invalidated by a new semantic fault."""
     global _recovery_interruption_pending, _recovery_interruption_details
@@ -1248,6 +1264,20 @@ def _timebase_silence_recovery(reason: str, details: Dict[str, Any]) -> None:
                         system_time_z(),
                     )
                     return
+                except RecoveryRetryableFailure as e:
+                    _diag["auto_recovery_failures"] = _diag.get("auto_recovery_failures", 0) + 1
+                    logging.warning(
+                        "⚠️ [clocks] TIMEBASE silence recovery retryable failure: %s details=%s — "
+                        "retrying after %.1fs",
+                        e.reason,
+                        e.details,
+                        float(AUTO_RECOVERY_RETRY_DELAY_S),
+                        exc_info=True,
+                    )
+                    if not getattr(e, "cleanup_sent", False):
+                        _cleanup_after_recovery_failure(e.reason, e.details)
+                    time.sleep(float(AUTO_RECOVERY_RETRY_DELAY_S))
+                    continue
                 except Exception:
                     _diag["auto_recovery_failures"] = _diag.get("auto_recovery_failures", 0) + 1
                     logging.exception(
@@ -1976,7 +2006,11 @@ def _clear_sync_wait() -> None:
         _sync_resume_event.set()
 
 
-def _end_sync_wait(timeout_s: float = SYNC_FRAGMENT_TIMEOUT_S) -> Tuple[Dict[str, Any], float]:
+def _end_sync_wait(
+    timeout_s: float = SYNC_FRAGMENT_TIMEOUT_S,
+    *,
+    recovery_monitor: Optional[Dict[str, Any]] = None,
+) -> Tuple[Dict[str, Any], float]:
     """Block until the sync fragment arrives or timeout. Hard fault on timeout."""
     global _sync_expected_pps_vclock
 
@@ -1987,12 +2021,22 @@ def _end_sync_wait(timeout_s: float = SYNC_FRAGMENT_TIMEOUT_S) -> Tuple[Dict[str
 
     t0 = time.monotonic()
     last_log = t0
+    last_health_poll = t0
     _diag["sync_waits"] += 1
 
     while True:
         _raise_if_recovery_interrupted("sync_wait")
 
         now = time.monotonic()
+        if recovery_monitor:
+            sent_at = float(recovery_monitor.get("sent_monotonic") or t0)
+            if (
+                now - sent_at >= float(RECOVERY_SYNC_HEALTH_GRACE_S)
+                and now - last_health_poll >= float(RECOVERY_SYNC_HEALTH_POLL_S)
+            ):
+                last_health_poll = now
+                _check_recovery_inflight_monitor(recovery_monitor, context="sync_wait")
+
         remaining = timeout_s - (now - t0)
         if remaining <= 0:
             _diag["hard_fault_sync_timeout"] += 1
@@ -2335,6 +2379,121 @@ def _fetch_teensy_recovery_status() -> Dict[str, Any]:
     except Exception:
         logging.debug("⚠️ [recovery] REPORT_RECOVERY poll failed (ignored)")
     return {}
+
+
+def _recovery_inflight_status_compact(status: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract the flat RECOVER identity/lifecycle fields used by Pi."""
+    return {
+        "report": status.get("report"),
+        "schema": status.get("schema"),
+        "campaign_state": status.get("campaign_state"),
+        "campaign": status.get("campaign"),
+        "campaign_seconds": _as_int(status.get("campaign_seconds")),
+        "recover_lifecycle_active": _recovery_bool(status.get("recover_lifecycle_active")),
+        "recover_lifecycle_reason": status.get("recover_lifecycle_reason"),
+        "recover_reattach_active": _recovery_bool(status.get("recover_reattach_active")),
+        "recover_reattach_degraded_active": _recovery_bool(status.get("recover_reattach_degraded_active")),
+        "recover_reattach_reason": status.get("recover_reattach_reason"),
+        "request_count": _as_int(status.get("request_count")),
+        "base_count": _as_int(status.get("base_count")),
+        "expected_first_public_count": _as_int(status.get("expected_first_public_count")),
+        "last_public_count": _as_int(status.get("last_public_count")),
+        "candidate_count": _as_int(status.get("candidate_count")),
+        "hidden_candidate_count": _as_int(status.get("hidden_candidate_count")),
+        "timebase_last_stage": _as_int(status.get("timebase_last_stage")),
+        "timebase_last_stage_name": status.get("timebase_last_stage_name"),
+    }
+
+
+def _recovery_inflight_lost_reason(
+    *,
+    monitor: Dict[str, Any],
+    status: Dict[str, Any],
+) -> Optional[str]:
+    """Return a retryable reason if Teensy no longer owns our RECOVER."""
+    expected_base = int(monitor.get("recover_base_pps_vclock_count") or -1)
+    expected_first = int(monitor.get("expected_first_public_pps_vclock_count") or -1)
+    base_count = _as_int(status.get("base_count"))
+    expected_first_reported = _as_int(status.get("expected_first_public_count"))
+    request_count = _as_int(status.get("request_count"))
+
+    lifecycle_active = _recovery_bool(status.get("recover_lifecycle_active"))
+    reattach_active = _recovery_bool(status.get("recover_reattach_active"))
+    degraded_active = _recovery_bool(status.get("recover_reattach_degraded_active"))
+    warmup_active = _recovery_bool(status.get("warmup_active"))
+    campaign_state = str(status.get("campaign_state") or "").upper()
+
+    if base_count == expected_base and expected_first_reported == expected_first:
+        return None
+
+    if (base_count is not None and base_count > 0) or (
+        expected_first_reported is not None and expected_first_reported > 0
+    ):
+        return "recover_identity_mismatch_after_teensy_reset"
+
+    # After a reboot, REPORT_RECOVERY is available again but all RECOVER identity
+    # fields fall back to zero/empty and the lifecycle is idle.  That means the
+    # Pi is waiting for a command the firmware can no longer complete.
+    if (
+        request_count in (None, 0)
+        and base_count in (None, 0)
+        and expected_first_reported in (None, 0)
+        and not lifecycle_active
+        and not reattach_active
+        and not degraded_active
+        and not warmup_active
+        and campaign_state in ("", "STOPPED", "IDLE")
+    ):
+        return "recover_command_lost_after_teensy_reset"
+
+    return None
+
+
+def _check_recovery_inflight_monitor(
+    monitor: Dict[str, Any],
+    *,
+    context: str,
+) -> None:
+    """Poll Teensy RECOVER identity during sync wait and fail fast if lost."""
+    _diag["recovery_inflight_health_polls"] = (
+        _diag.get("recovery_inflight_health_polls", 0) + 1
+    )
+
+    status = _fetch_teensy_recovery_status()
+    if not status:
+        _diag["recovery_inflight_health_empty"] = (
+            _diag.get("recovery_inflight_health_empty", 0) + 1
+        )
+        return
+
+    compact = _recovery_inflight_status_compact(status)
+    snapshot = {
+        "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "context": context,
+        "monitor": dict(monitor),
+        "status": compact,
+        "last_timebase_activity_utc": _timebase_last_activity_utc,
+        "last_timebase_activity_topic": _timebase_last_activity_topic,
+        "last_timebase_activity_pps_vclock_count": _timebase_last_activity_pps_vclock_count,
+        "last_accepted_pps_vclock_count": _accepted_pps_vclock_count,
+    }
+    _diag["last_recovery_inflight_health"] = snapshot
+
+    lost_reason = _recovery_inflight_lost_reason(monitor=monitor, status=status)
+    if not lost_reason:
+        return
+
+    details = {
+        **snapshot,
+        "reason": lost_reason,
+        "expected_pps_vclock_count": _sync_expected_pps_vclock,
+    }
+    _diag["recovery_inflight_command_lost"] = (
+        _diag.get("recovery_inflight_command_lost", 0) + 1
+    )
+    _diag["last_recovery_command_lost"] = details
+    _clear_sync_wait()
+    raise RecoveryCommandLost(lost_reason, details)
 
 
 def _fragment_ocxo_science_clean(fragment: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
@@ -5368,6 +5527,14 @@ def _recover_campaign() -> None:
 
     _request_teensy_recover(int(recover_base_pps_vclock_count), teensy_recover_args)
 
+    recovery_monitor = {
+        "campaign": campaign_name,
+        "recover_base_pps_vclock_count": int(recover_base_pps_vclock_count),
+        "expected_first_public_pps_vclock_count": int(expected_first_public_pps_vclock_count),
+        "sent_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "sent_monotonic": time.monotonic(),
+    }
+
     clean_wait_deadline = time.monotonic() + SYNC_RECOVER_CLEAN_TIMEOUT_S
     discarded_transitional_pairs = 0
     degraded_publication_fast_retry_pairs = 0
@@ -5391,7 +5558,8 @@ def _recover_campaign() -> None:
 
         try:
             frag, waited_s = _end_sync_wait(
-                timeout_s=min(float(remaining), float(RECOVERY_FIRST_PAIR_TIMEOUT_S))
+                timeout_s=min(float(remaining), float(RECOVERY_FIRST_PAIR_TIMEOUT_S)),
+                recovery_monitor=recovery_monitor,
             )
         except RecoverySyncTimeout as e:
             reason = (
