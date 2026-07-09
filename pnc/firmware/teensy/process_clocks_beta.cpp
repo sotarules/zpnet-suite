@@ -2136,8 +2136,16 @@ static void campaign_warmup_begin(campaign_warmup_mode_t mode) {
 }
 
 static bool campaign_warmup_active(void) {
+  // Treat the entire RECOVER transition as not-yet-campaign-continuous for
+  // watchdog arming.  The first degraded/quarantined rows exist only to prove
+  // liveness and reattach custody to the Pi; a DWT publication court verdict
+  // during that window must not fire a second campaign-surrender watchdog and
+  // stop the only rows the Pi can use to observe recovery progress.
   return g_campaign_warmup_mode != campaign_warmup_mode_t::NONE ||
-         g_recover_reattach_active;
+         g_recover_reattach_active ||
+         g_recover_reattach_degraded_active ||
+         g_science_residual_quarantine_remaining != 0U ||
+         clocks_campaign_recovery_lifecycle_active();
 }
 
 static void recover_reattach_set_reason(const char* reason) {

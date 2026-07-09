@@ -176,6 +176,14 @@ SYNC_RECOVER_CLEAN_TIMEOUT_S = 90.0
 # recovery thread.
 RECOVERY_FIRST_PAIR_TIMEOUT_S = 45.0
 
+# If a new WATCHDOG_ANOMALY arrives while an auto-recovery attempt is already
+# waiting for the first clean public row, the current attempt has been
+# invalidated.  Abort that wait immediately, clean the Teensy RECOVER
+# lifecycle, and retry from the latest durable TIMEBASE instead of sitting on a
+# stale exact-pair wait until timeout.
+AUTO_RECOVERY_MAX_ATTEMPTS = 3
+AUTO_RECOVERY_RETRY_DELAY_S = 1.0
+
 SYNC_LOG_INTERVAL_S = 5.0
 
 # TIMEBASE ingress queue: maxsize=0 means unbounded
@@ -358,6 +366,11 @@ _diag: Dict[str, Any] = {
     "last_hard_fault": {},
     "hard_faults_total": 0,
     "auto_recovery_failures": 0,
+    "auto_recovery_attempts": 0,
+    "auto_recovery_interrupted": 0,
+    "auto_recovery_retries": 0,
+    "recovery_interruption_requests": 0,
+    "last_recovery_interruption": {},
     "recovery_abort_requests": 0,
     "recovery_abort_success": 0,
     "recovery_abort_failures": 0,
@@ -821,6 +834,9 @@ _sync_fragment: Optional[Dict[str, Any]] = None
 # ---------------------------------------------------------------------
 
 _auto_recovery_in_progress: bool = False
+_recovery_interruption_lock = threading.Lock()
+_recovery_interruption_pending: bool = False
+_recovery_interruption_details: Dict[str, Any] = {}
 
 
 class RecoverySyncTimeout(RuntimeError):
@@ -830,6 +846,69 @@ class RecoverySyncTimeout(RuntimeError):
         super().__init__(f"{reason}: {details}")
         self.reason = reason
         self.details = details
+
+
+class RecoveryInterrupted(RuntimeError):
+    """Raised when a new WATCHDOG_ANOMALY invalidates an active recovery attempt."""
+
+    def __init__(self, reason: str, details: Dict[str, Any]):
+        super().__init__(f"{reason}: {details}")
+        self.reason = reason
+        self.details = details
+
+
+def _note_recovery_interruption(reason: str, details: Dict[str, Any], *, source: str) -> None:
+    """Mark the current recovery attempt invalidated by a new semantic fault."""
+    global _recovery_interruption_pending, _recovery_interruption_details
+
+    payload = {
+        "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "reason": reason,
+        "source": source,
+        "details": details,
+        "sync_expected_pps_vclock_count": _sync_expected_pps_vclock,
+        "last_timebase_activity_utc": _timebase_last_activity_utc,
+        "last_timebase_activity_topic": _timebase_last_activity_topic,
+        "last_timebase_activity_pps_vclock_count": _timebase_last_activity_pps_vclock_count,
+    }
+
+    with _recovery_interruption_lock:
+        _recovery_interruption_pending = True
+        _recovery_interruption_details = payload
+
+    _diag["recovery_interruption_requests"] = _diag.get("recovery_interruption_requests", 0) + 1
+    _diag["last_recovery_interruption"] = payload
+    logging.warning(
+        "⚠️ [recovery] active recovery invalidated by %s: %s",
+        source, reason,
+    )
+
+
+def _consume_recovery_interruption() -> Optional[Dict[str, Any]]:
+    """Return and clear a pending active-recovery interruption, if any."""
+    global _recovery_interruption_pending, _recovery_interruption_details
+
+    with _recovery_interruption_lock:
+        if not _recovery_interruption_pending:
+            return None
+        details = dict(_recovery_interruption_details)
+        _recovery_interruption_pending = False
+        _recovery_interruption_details = {}
+        return details
+
+
+def _raise_if_recovery_interrupted(context: str) -> None:
+    interrupt = _consume_recovery_interruption()
+    if interrupt is None:
+        return
+
+    details = {
+        **interrupt,
+        "context": context,
+        "last_accepted_pps_vclock_count": _accepted_pps_vclock_count,
+    }
+    _clear_sync_wait()
+    raise RecoveryInterrupted("recovery_interrupted_by_watchdog_anomaly", details)
 
 
 def _note_timebase_activity(topic: str, pps_vclock_count: int) -> None:
@@ -1257,8 +1336,9 @@ def _begin_auto_recovery(reason: str, details: Dict[str, Any], *, source: str) -
     _campaign_active = False
 
     if _auto_recovery_in_progress:
+        _note_recovery_interruption(reason, details, source=source)
         logging.error(
-            "💥 [clocks] %s: %s — auto-recovery already in progress, skipping",
+            "💥 [clocks] %s: %s — auto-recovery already in progress; current attempt will abort/retry",
             source, reason,
         )
         return False
@@ -1273,9 +1353,30 @@ def _begin_auto_recovery(reason: str, details: Dict[str, Any], *, source: str) -
     def _auto_recover():
         global _auto_recovery_in_progress
         try:
-            logging.info("🔄 [clocks] @%s auto-recovery starting...", system_time_z())
-            _recover_campaign()
-            logging.info("✅ [clocks] @%s auto-recovery complete", system_time_z())
+            for attempt in range(1, int(AUTO_RECOVERY_MAX_ATTEMPTS) + 1):
+                _diag["auto_recovery_attempts"] = _diag.get("auto_recovery_attempts", 0) + 1
+                try:
+                    logging.info(
+                        "🔄 [clocks] @%s auto-recovery starting (attempt %d/%d)...",
+                        system_time_z(), attempt, int(AUTO_RECOVERY_MAX_ATTEMPTS),
+                    )
+                    _recover_campaign()
+                    logging.info("✅ [clocks] @%s auto-recovery complete", system_time_z())
+                    return
+                except RecoveryInterrupted as e:
+                    _diag["auto_recovery_interrupted"] = _diag.get("auto_recovery_interrupted", 0) + 1
+                    logging.warning(
+                        "⚠️ [clocks] auto-recovery attempt %d/%d interrupted: %s details=%s",
+                        attempt, int(AUTO_RECOVERY_MAX_ATTEMPTS), e.reason, e.details,
+                    )
+                    _cleanup_after_recovery_failure(e.reason, e.details)
+                    if attempt >= int(AUTO_RECOVERY_MAX_ATTEMPTS):
+                        raise RuntimeError(
+                            f"auto-recovery interrupted {attempt} times; giving up"
+                        ) from e
+                    _diag["auto_recovery_retries"] = _diag.get("auto_recovery_retries", 0) + 1
+                    time.sleep(float(AUTO_RECOVERY_RETRY_DELAY_S))
+                    continue
         except Exception as e:
             logging.exception("💥 [clocks] auto-recovery FAILED — campaign deactivated")
             _diag["auto_recovery_failures"] = _diag.get("auto_recovery_failures", 0) + 1
@@ -1835,6 +1936,8 @@ def _end_sync_wait(timeout_s: float = SYNC_FRAGMENT_TIMEOUT_S) -> Tuple[Dict[str
     _diag["sync_waits"] += 1
 
     while True:
+        _raise_if_recovery_interrupted("sync_wait")
+
         now = time.monotonic()
         remaining = timeout_s - (now - t0)
         if remaining <= 0:
@@ -4944,6 +5047,8 @@ def _recover_campaign() -> None:
                 "recovery failed: timed out waiting for first public TIMEBASE pair; "
                 f"cleanup sent to Teensy; details={details}"
             ) from e
+
+        _raise_if_recovery_interrupted("post_sync_pair_before_clean_verdict")
 
         teensy_pps_vclock_count = _extract_teensy_pps_vclock_count(frag)
         first_public_offset = teensy_pps_vclock_count - expected_first_public_pps_vclock_count
