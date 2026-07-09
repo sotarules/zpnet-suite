@@ -1091,6 +1091,33 @@ static inline void dmb_barrier(void) {
   __asm__ volatile ("dmb" ::: "memory");
 }
 
+// Priority-0-preserving exclusion guard.
+//
+// ZPNet timing doctrine forbids foreground/handoff code from globally masking
+// the sacred capture tier.  PRIMASK/global IRQ masking blocks PPS/VCLOCK/OCXO
+// priority-0 capture and can turn a harmless bookkeeping critical section into
+// a poisoned timing witness.  Use BASEPRI instead: mask only priority 16 and
+// lower-priority work while leaving priority 0 able to preempt.
+static constexpr uint32_t INTERRUPT_PRIORITY0_PRESERVING_BASEPRI = 16U;
+
+static inline uint32_t interrupt_priority0_guard_enter(void) {
+  uint32_t prior_basepri = 0;
+  __asm__ volatile ("mrs %0, basepri" : "=r" (prior_basepri) :: "memory");
+  if (prior_basepri == 0U ||
+      prior_basepri > INTERRUPT_PRIORITY0_PRESERVING_BASEPRI) {
+    __asm__ volatile ("msr basepri, %0"
+                      :: "r" (INTERRUPT_PRIORITY0_PRESERVING_BASEPRI)
+                      : "memory");
+  }
+  dmb_barrier();
+  return prior_basepri;
+}
+
+static inline void interrupt_priority0_guard_exit(uint32_t prior_basepri) {
+  dmb_barrier();
+  __asm__ volatile ("msr basepri, %0" :: "r" (prior_basepri) : "memory");
+}
+
 static void store_publish(const pps_t& pps, const pps_vclock_t& pvc) {
   g_store.seq++;
   dmb_barrier();
@@ -1561,9 +1588,7 @@ void interrupt_pps_vclock_label_anchor(uint32_t sequence,
     return;
   }
 
-  uint32_t primask = 0;
-  __asm__ volatile ("mrs %0, primask" : "=r" (primask) :: "memory");
-  __disable_irq();
+  const uint32_t prior_basepri = interrupt_priority0_guard_enter();
 
   uint32_t match = PVC_ANCHOR_RING_SIZE;
   uint32_t match_age = 0xFFFFFFFFUL;
@@ -1608,9 +1633,7 @@ void interrupt_pps_vclock_label_anchor(uint32_t sequence,
     g_pvc_anchor_label_last_success = false;
   }
 
-  if ((primask & 1u) == 0) {
-    __enable_irq();
-  }
+  interrupt_priority0_guard_exit(prior_basepri);
 }
 
 static void bridge_projection_copy_to_diag(interrupt_capture_diag_t& diag,
@@ -7737,10 +7760,10 @@ static void vclock_fact_ring_reset(void) {
 }
 
 static bool vclock_fact_ring_pop(vclock_perishable_fact_t& out) {
-  __disable_irq();
+  const uint32_t prior_basepri = interrupt_priority0_guard_enter();
   if (g_vclock_fact_ring.count == 0) {
     g_vclock_fact_ring.drain_armed = false;
-    __enable_irq();
+    interrupt_priority0_guard_exit(prior_basepri);
     return false;
   }
 
@@ -7752,7 +7775,7 @@ static bool vclock_fact_ring_pop(vclock_perishable_fact_t& out) {
   if (g_vclock_fact_ring.count == 0) {
     g_vclock_fact_ring.drain_armed = false;
   }
-  __enable_irq();
+  interrupt_priority0_guard_exit(prior_basepri);
   return true;
 }
 
@@ -9104,10 +9127,10 @@ static bool ocxo_fact_ring_pop(ocxo_runtime_context_t& ctx,
                                interrupt_perishable_fact_t& out) {
   ocxo_perishable_ring_t& r = ocxo_fact_ring_for(ctx);
 
-  __disable_irq();
+  const uint32_t prior_basepri = interrupt_priority0_guard_enter();
   if (r.count == 0) {
     r.drain_armed = false;
-    __enable_irq();
+    interrupt_priority0_guard_exit(prior_basepri);
     return false;
   }
 
@@ -9118,7 +9141,7 @@ static bool ocxo_fact_ring_pop(ocxo_runtime_context_t& ctx,
   if (r.count == 0) {
     r.drain_armed = false;
   }
-  __enable_irq();
+  interrupt_priority0_guard_exit(prior_basepri);
   return true;
 }
 
@@ -10342,9 +10365,9 @@ static bool capture_ring_pop_for_handoff(
     interrupt_capture_ring_t<T, N>& ring,
     interrupt_handoff_source_diag_t& diag,
     T& out) {
-  __disable_irq();
+  const uint32_t prior_basepri = interrupt_priority0_guard_enter();
   if (ring.count == 0) {
-    __enable_irq();
+    interrupt_priority0_guard_exit(prior_basepri);
     return false;
   }
   out = ring.items[ring.tail];
@@ -10352,7 +10375,7 @@ static bool capture_ring_pop_for_handoff(
   ring.count--;
   diag.dequeue_count++;
   diag.pending_count = ring.count;
-  __enable_irq();
+  interrupt_priority0_guard_exit(prior_basepri);
   return true;
 }
 
@@ -10360,13 +10383,13 @@ template <typename T, uint32_t N>
 static bool capture_ring_peek_sequence(
     interrupt_capture_ring_t<T, N>& ring,
     uint32_t& seq) {
-  __disable_irq();
+  const uint32_t prior_basepri = interrupt_priority0_guard_enter();
   if (ring.count == 0) {
-    __enable_irq();
+    interrupt_priority0_guard_exit(prior_basepri);
     return false;
   }
   seq = ring.items[ring.tail].sequence;
-  __enable_irq();
+  interrupt_priority0_guard_exit(prior_basepri);
   return true;
 }
 
@@ -11877,14 +11900,14 @@ static void pps_post_isr_asap_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
   uint32_t isr_entry_dwt_raw = 0;
   bool had_sample = false;
 
-  __disable_irq();
+  const uint32_t prior_basepri = interrupt_priority0_guard_enter();
   had_sample = g_pps_post_isr.pending;
   if (had_sample) {
     cap = g_pps_post_isr.cap;
     isr_entry_dwt_raw = g_pps_post_isr.isr_entry_dwt_raw;
     g_pps_post_isr.pending = false;
   }
-  __enable_irq();
+  interrupt_priority0_guard_exit(prior_basepri);
 
   if (!had_sample) return;
 
@@ -11899,7 +11922,7 @@ static void pps_post_isr_defer(const interrupt_epoch_capture_t& cap,
     return;
   }
 
-  __disable_irq();
+  const uint32_t prior_basepri = interrupt_priority0_guard_enter();
   if (g_pps_post_isr.pending) {
     g_pps_post_isr.overwrite_count++;
   }
@@ -11909,7 +11932,7 @@ static void pps_post_isr_defer(const interrupt_epoch_capture_t& cap,
   g_pps_post_isr.arm_count++;
   g_pps_post_isr.last_sequence = cap.sequence;
   g_pps_post_isr.last_capture_window_cycles = cap.capture_window_cycles;
-  __enable_irq();
+  interrupt_priority0_guard_exit(prior_basepri);
 
   const timepop_handle_t h =
       timepop_arm_asap(pps_post_isr_asap_callback, nullptr, "PPS_POST_ISR");
@@ -11918,7 +11941,7 @@ static void pps_post_isr_defer(const interrupt_epoch_capture_t& cap,
     uint32_t fallback_raw = 0;
     bool had_sample = false;
 
-    __disable_irq();
+    const uint32_t prior_basepri = interrupt_priority0_guard_enter();
     had_sample = g_pps_post_isr.pending;
     if (had_sample) {
       fallback = g_pps_post_isr.cap;
@@ -11926,7 +11949,7 @@ static void pps_post_isr_defer(const interrupt_epoch_capture_t& cap,
       g_pps_post_isr.pending = false;
       g_pps_post_isr.asap_fail_count++;
     }
-    __enable_irq();
+    interrupt_priority0_guard_exit(prior_basepri);
 
     if (had_sample) {
       pps_post_isr_publish_inline(fallback, fallback_raw);
@@ -12940,9 +12963,7 @@ static FLASHMEM void add_ocxo_lean_lane(Payload& p,
   uint32_t cadence_next_counter32 = 0;
   uint16_t cadence_next_low16 = 0;
 
-  uint32_t primask = 0;
-  __asm__ volatile ("mrs %0, primask" : "=r" (primask) :: "memory");
-  __disable_irq();
+  const uint32_t prior_basepri = interrupt_priority0_guard_enter();
   if (clock32) {
     clock32_zeroed = clock32->zeroed;
     clock32_pending_zero = clock32->pending_zero;
@@ -12968,9 +12989,7 @@ static FLASHMEM void add_ocxo_lean_lane(Payload& p,
   cadence_epoch_counter32 = lane.cadence_epoch_counter32;
   cadence_next_counter32 = lane.cadence_next_counter32;
   cadence_next_low16 = lane.cadence_next_low16;
-  if ((primask & 1U) == 0U) {
-    __enable_irq();
-  }
+  interrupt_priority0_guard_exit(prior_basepri);
 
   const uint16_t live_hw16 = lane.initialized ? ocxo_lane_counter_now(lane) : 0U;
   const uint16_t live_compare_hw16 =

@@ -491,21 +491,29 @@ static void ocxo_dac_dither_request_service(void);
 
 // DAC control state has one hardware owner: the dither/actuator layer.
 // Servo/Beta may queue request packets, but only this owner installs targets
-// and schedules physical codes.  Keep critical sections tiny: protect authored
-// control packets, never the physical I2C write.
+// and schedules physical codes.
+//
+// Priority doctrine: these guards must never globally mask priority-0 clock
+// capture.  They raise BASEPRI only high enough to exclude the CLOCKS/TimePop/
+// handoff/background tiers while leaving the sacred capture tier preemptable.
+// This replaces the old PRIMASK/global-IRQ critical section; priority 0
+// remains live even while DAC intent packets are copied.
+static constexpr uint32_t OCXO_DAC_STATE_BASEPRI_GUARD = 16U;
+
 static inline uint32_t ocxo_dac_state_irq_save(void) {
-  uint32_t primask = 0;
-  __asm__ volatile ("mrs %0, primask" : "=r" (primask) :: "memory");
-  __disable_irq();
+  uint32_t prior_basepri = 0;
+  __asm__ volatile ("mrs %0, basepri" : "=r" (prior_basepri) :: "memory");
+  if (prior_basepri == 0U || prior_basepri > OCXO_DAC_STATE_BASEPRI_GUARD) {
+    __asm__ volatile ("msr basepri, %0" :: "r" (OCXO_DAC_STATE_BASEPRI_GUARD)
+                      : "memory");
+  }
   __asm__ volatile ("dmb" ::: "memory");
-  return primask;
+  return prior_basepri;
 }
 
-static inline void ocxo_dac_state_irq_restore(uint32_t primask) {
+static inline void ocxo_dac_state_irq_restore(uint32_t prior_basepri) {
   __asm__ volatile ("dmb" ::: "memory");
-  if ((primask & 1u) == 0u) {
-    __enable_irq();
-  }
+  __asm__ volatile ("msr basepri, %0" :: "r" (prior_basepri) : "memory");
 }
 
 double ocxo_dac_fractional_snapshot(const ocxo_dac_state_t& s) {
