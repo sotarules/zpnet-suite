@@ -1051,6 +1051,28 @@ struct pps_interval_residuals_t {
 // Traditional projected-GNSS totals are kept beside this for audit.
 static constexpr uint64_t CLOCKS_BETA_NS_PER_SECOND = 1000000000ULL;
 
+// Delta Raw sanity gate.  Delta Raw is only valid when both the delayed
+// PPS/VCLOCK reference interval and the OCXO observed interval are plausible
+// one-second DWT spans.  Sentinel / uninitialized values such as 0xFFFFFFFF
+// must remain evidence, but they must never publish with delta_raw_valid=true.
+// Keep the band deliberately broad: this is corruption/sentinel gating, not a
+// tight clock-quality gate.
+static constexpr uint32_t CLOCKS_DELTA_RAW_INTERVAL_MIN_CYCLES = 900000000UL;
+static constexpr uint32_t CLOCKS_DELTA_RAW_INTERVAL_MAX_CYCLES = 1100000000UL;
+static constexpr uint32_t CLOCKS_DELTA_RAW_INTERVAL_SENTINEL_U32 = 0xFFFFFFFFUL;
+
+static uint32_t g_delta_raw_interval_reject_count = 0;
+static uint32_t g_delta_raw_interval_reject_reference_count = 0;
+static uint32_t g_delta_raw_interval_reject_clock_count = 0;
+static uint32_t g_delta_raw_interval_sentinel_reject_count = 0;
+static uint32_t g_delta_raw_interval_plausibility_reject_count = 0;
+static uint32_t g_delta_raw_interval_last_public_count = 0;
+static uint32_t g_delta_raw_interval_last_clock_id = 0;
+static uint32_t g_delta_raw_interval_last_reference_cycles = 0;
+static uint32_t g_delta_raw_interval_last_clock_cycles = 0;
+static char     g_delta_raw_interval_last_reject_field[16] = "";
+static char     g_delta_raw_interval_last_reject_reason[64] = "OK";
+
 struct floorline_science_totals_t {
   // Delta Cycles residual accumulation.  These interval sums are used to
   // render the public OCXO nanosecond ledger and to preserve the residual
@@ -1253,6 +1275,54 @@ static clock_science_row_t g_beta_probe_ocxo1_science_row DMAMEM = {};
 static clock_science_row_t g_beta_probe_ocxo2_science_row DMAMEM = {};
 static floorline_science_totals_t g_beta_probe_floorline_o1 DMAMEM = {};
 static floorline_science_totals_t g_beta_probe_floorline_o2 DMAMEM = {};
+
+static const char* delta_raw_interval_reject_reason(uint32_t cycles) {
+  if (cycles == 0U) return "interval_zero";
+  if (cycles == CLOCKS_DELTA_RAW_INTERVAL_SENTINEL_U32) {
+    return "interval_sentinel_0xffffffff";
+  }
+  if (cycles < CLOCKS_DELTA_RAW_INTERVAL_MIN_CYCLES) {
+    return "interval_below_plausible_min";
+  }
+  if (cycles > CLOCKS_DELTA_RAW_INTERVAL_MAX_CYCLES) {
+    return "interval_above_plausible_max";
+  }
+  return "OK";
+}
+
+static bool delta_raw_interval_cycles_plausible(uint32_t cycles) {
+  return strcmp(delta_raw_interval_reject_reason(cycles), "OK") == 0;
+}
+
+static void delta_raw_interval_note_reject(const clock_science_row_t& row,
+                                           const char* field,
+                                           uint32_t reference_cycles,
+                                           uint32_t clock_cycles,
+                                           const char* reason) {
+  g_delta_raw_interval_reject_count++;
+  if (field && strcmp(field, "reference") == 0) {
+    g_delta_raw_interval_reject_reference_count++;
+  } else {
+    g_delta_raw_interval_reject_clock_count++;
+  }
+
+  if (reason && strstr(reason, "sentinel") != nullptr) {
+    g_delta_raw_interval_sentinel_reject_count++;
+  } else {
+    g_delta_raw_interval_plausibility_reject_count++;
+  }
+
+  g_delta_raw_interval_last_public_count = row.public_count;
+  g_delta_raw_interval_last_clock_id = row.clock_id;
+  g_delta_raw_interval_last_reference_cycles = reference_cycles;
+  g_delta_raw_interval_last_clock_cycles = clock_cycles;
+  safeCopy(g_delta_raw_interval_last_reject_field,
+           sizeof(g_delta_raw_interval_last_reject_field),
+           field ? field : "clock");
+  safeCopy(g_delta_raw_interval_last_reject_reason,
+           sizeof(g_delta_raw_interval_last_reject_reason),
+           reason ? reason : "interval_rejected");
+}
 
 static void delta_residual_state_reset(void) {
   g_delta_previous_vclock_reference = delta_residual_reference_t{};
@@ -5074,25 +5144,50 @@ static void delta_residual_apply_one(clock_science_row_t& row,
       (ref.public_count == row.public_count ||
        (ref.public_count == 0U && row.public_count == 1U));
 
-  if (ref_count_aligned && ref.gnss_valid && clock_valid &&
-      clock_f.dwt_interval_observed_cycles != 0U) {
-    row.delta_raw_valid = true;
+  if (ref_count_aligned && ref.gnss_valid && clock_valid) {
     row.delta_raw_reference_interval_cycles = ref.gnss_interval_cycles;
     row.delta_raw_clock_interval_cycles = clock_f.dwt_interval_observed_cycles;
-    row.delta_raw_residual_cycles =
-        (int64_t)row.delta_raw_clock_interval_cycles -
-        (int64_t)row.delta_raw_reference_interval_cycles;
-    row.delta_raw_fast_residual_cycles = -row.delta_raw_residual_cycles;
-    const uint32_t raw_delta_cps = row.delta_raw_reference_interval_cycles
-        ? row.delta_raw_reference_interval_cycles
-        : row.projection_cps_cycles;
-    row.delta_raw_residual_ns_exact = beta_dwt_cycles_to_gnss_ns_exact_signed(
-        row.delta_raw_residual_cycles, raw_delta_cps);
-    row.delta_raw_fast_residual_ns_exact = -row.delta_raw_residual_ns_exact;
-    row.delta_raw_residual_ns =
-        beta_round_double_to_i64(row.delta_raw_residual_ns_exact);
-    row.delta_raw_fast_residual_ns =
-        beta_round_double_to_i64(row.delta_raw_fast_residual_ns_exact);
+
+    const bool reference_plausible = delta_raw_interval_cycles_plausible(
+        row.delta_raw_reference_interval_cycles);
+    const bool clock_plausible = delta_raw_interval_cycles_plausible(
+        row.delta_raw_clock_interval_cycles);
+
+    if (reference_plausible && clock_plausible) {
+      row.delta_raw_valid = true;
+      row.delta_raw_residual_cycles =
+          (int64_t)row.delta_raw_clock_interval_cycles -
+          (int64_t)row.delta_raw_reference_interval_cycles;
+      row.delta_raw_fast_residual_cycles = -row.delta_raw_residual_cycles;
+      const uint32_t raw_delta_cps = row.delta_raw_reference_interval_cycles
+          ? row.delta_raw_reference_interval_cycles
+          : row.projection_cps_cycles;
+      row.delta_raw_residual_ns_exact = beta_dwt_cycles_to_gnss_ns_exact_signed(
+          row.delta_raw_residual_cycles, raw_delta_cps);
+      row.delta_raw_fast_residual_ns_exact = -row.delta_raw_residual_ns_exact;
+      row.delta_raw_residual_ns =
+          beta_round_double_to_i64(row.delta_raw_residual_ns_exact);
+      row.delta_raw_fast_residual_ns =
+          beta_round_double_to_i64(row.delta_raw_fast_residual_ns_exact);
+    } else {
+      row.delta_raw_valid = false;
+      if (!reference_plausible) {
+        delta_raw_interval_note_reject(
+            row,
+            "reference",
+            row.delta_raw_reference_interval_cycles,
+            row.delta_raw_clock_interval_cycles,
+            delta_raw_interval_reject_reason(row.delta_raw_reference_interval_cycles));
+      }
+      if (!clock_plausible) {
+        delta_raw_interval_note_reject(
+            row,
+            "clock",
+            row.delta_raw_reference_interval_cycles,
+            row.delta_raw_clock_interval_cycles,
+            delta_raw_interval_reject_reason(row.delta_raw_clock_interval_cycles));
+      }
+    }
   }
 
   delta_residual_bookend_t* clock_bookends =
@@ -10216,6 +10311,31 @@ static FLASHMEM void add_campaign_payload(Payload& p) {
         g_science_residual_quarantine_consumed_count);
   p.add("recover_science_quarantine_last_public_count",
         g_science_residual_quarantine_last_public_count);
+  p.add("delta_raw_interval_gate_min_cycles",
+        (uint32_t)CLOCKS_DELTA_RAW_INTERVAL_MIN_CYCLES);
+  p.add("delta_raw_interval_gate_max_cycles",
+        (uint32_t)CLOCKS_DELTA_RAW_INTERVAL_MAX_CYCLES);
+  p.add("delta_raw_interval_reject_count", g_delta_raw_interval_reject_count);
+  p.add("delta_raw_interval_reject_reference_count",
+        g_delta_raw_interval_reject_reference_count);
+  p.add("delta_raw_interval_reject_clock_count",
+        g_delta_raw_interval_reject_clock_count);
+  p.add("delta_raw_interval_sentinel_reject_count",
+        g_delta_raw_interval_sentinel_reject_count);
+  p.add("delta_raw_interval_plausibility_reject_count",
+        g_delta_raw_interval_plausibility_reject_count);
+  p.add("delta_raw_interval_last_public_count",
+        g_delta_raw_interval_last_public_count);
+  p.add("delta_raw_interval_last_clock_id",
+        g_delta_raw_interval_last_clock_id);
+  p.add("delta_raw_interval_last_reference_cycles",
+        g_delta_raw_interval_last_reference_cycles);
+  p.add("delta_raw_interval_last_clock_cycles",
+        g_delta_raw_interval_last_clock_cycles);
+  p.add("delta_raw_interval_last_reject_field",
+        g_delta_raw_interval_last_reject_field);
+  p.add("delta_raw_interval_last_reject_reason",
+        g_delta_raw_interval_last_reject_reason);
   p.add("alpha_recover_reprime_count",
         clocks_alpha_recover_reprime_count());
   p.add("recover_reattach_active", (bool)g_recover_reattach_active);
@@ -11017,6 +11137,15 @@ static FLASHMEM Payload cmd_report_timebase_publish(const Payload&) {
                g_science_residual_quarantine_remaining);
   counters.add("recover_science_quarantine_last_public_count",
                g_science_residual_quarantine_last_public_count);
+  counters.add("delta_raw_interval_reject_count", g_delta_raw_interval_reject_count);
+  counters.add("delta_raw_interval_reject_reference_count",
+               g_delta_raw_interval_reject_reference_count);
+  counters.add("delta_raw_interval_reject_clock_count",
+               g_delta_raw_interval_reject_clock_count);
+  counters.add("delta_raw_interval_sentinel_reject_count",
+               g_delta_raw_interval_sentinel_reject_count);
+  counters.add("delta_raw_interval_plausibility_reject_count",
+               g_delta_raw_interval_plausibility_reject_count);
   counters.add("recover_reattach_begin_count", g_recover_reattach_begin_count);
   counters.add("recover_reattach_hold_count", g_recover_reattach_hold_count);
   counters.add("recover_reattach_release_count", g_recover_reattach_release_count);
@@ -11539,6 +11668,31 @@ static FLASHMEM Payload cmd_report_recovery(const Payload&) {
   p.add("science_quarantine_begin_count", g_science_residual_quarantine_begin_count);
   p.add("science_quarantine_consumed_count", g_science_residual_quarantine_consumed_count);
   p.add("science_quarantine_last_public_count", g_science_residual_quarantine_last_public_count);
+  p.add("delta_raw_interval_gate_min_cycles",
+        (uint32_t)CLOCKS_DELTA_RAW_INTERVAL_MIN_CYCLES);
+  p.add("delta_raw_interval_gate_max_cycles",
+        (uint32_t)CLOCKS_DELTA_RAW_INTERVAL_MAX_CYCLES);
+  p.add("delta_raw_interval_reject_count", g_delta_raw_interval_reject_count);
+  p.add("delta_raw_interval_reject_reference_count",
+        g_delta_raw_interval_reject_reference_count);
+  p.add("delta_raw_interval_reject_clock_count",
+        g_delta_raw_interval_reject_clock_count);
+  p.add("delta_raw_interval_sentinel_reject_count",
+        g_delta_raw_interval_sentinel_reject_count);
+  p.add("delta_raw_interval_plausibility_reject_count",
+        g_delta_raw_interval_plausibility_reject_count);
+  p.add("delta_raw_interval_last_public_count",
+        g_delta_raw_interval_last_public_count);
+  p.add("delta_raw_interval_last_clock_id",
+        g_delta_raw_interval_last_clock_id);
+  p.add("delta_raw_interval_last_reference_cycles",
+        g_delta_raw_interval_last_reference_cycles);
+  p.add("delta_raw_interval_last_clock_cycles",
+        g_delta_raw_interval_last_clock_cycles);
+  p.add("delta_raw_interval_last_reject_field",
+        g_delta_raw_interval_last_reject_field);
+  p.add("delta_raw_interval_last_reject_reason",
+        g_delta_raw_interval_last_reject_reason);
 
   p.add("reattach_ready", g_recover_reattach_last_ocxo1.ready && g_recover_reattach_last_ocxo2.ready);
   p.add("reattach_ocxo1_ready", g_recover_reattach_last_ocxo1.ready);

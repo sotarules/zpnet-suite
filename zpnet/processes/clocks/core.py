@@ -184,6 +184,13 @@ RECOVERY_FIRST_PAIR_TIMEOUT_S = 45.0
 AUTO_RECOVERY_MAX_ATTEMPTS = 3
 AUTO_RECOVERY_RETRY_DELAY_S = 1.0
 
+# Pi-side fast retry for the specific degraded RECOVER shape seen in the
+# field: Teensy is publishing public rows, but each row remains degraded,
+# reattach is still not ready, and OCXO science is still not clean.  Do not
+# burn the entire clean-recovery timeout waiting for the firmware stall flag;
+# abort this RECOVER attempt and retry from the latest durable TIMEBASE.
+RECOVERY_DEGRADED_PUBLICATION_FAST_RETRY_ROWS = 10
+
 SYNC_LOG_INTERVAL_S = 5.0
 
 # TIMEBASE ingress queue: maxsize=0 means unbounded
@@ -437,8 +444,11 @@ _diag: Dict[str, Any] = {
     "recovery_transitional_pairs_discarded": 0,
     "recovery_clean_timeouts": 0,
     "recovery_clean_stalls": 0,
+    "recovery_degraded_fast_retry_count": 0,
+    "recovery_degraded_fast_retry_rows": RECOVERY_DEGRADED_PUBLICATION_FAST_RETRY_ROWS,
     "last_recovery_transitional_pair": {},
     "last_recovery_clean_timeout": {},
+    "last_recovery_degraded_fast_retry": {},
 
     # GNSS wait
     "gnss_waits": 0,
@@ -2242,6 +2252,19 @@ def _fragment_ocxo_science_clean(fragment: Dict[str, Any]) -> Tuple[bool, Dict[s
         lanes[lane] = lane_status
         clean = clean and lane_clean
     return clean, lanes
+
+
+def _recovery_degraded_fast_retry_match(verdict: Dict[str, Any]) -> bool:
+    """True for the degraded RECOVER stream that should trigger a fast retry."""
+    reasons_raw = verdict.get("reasons")
+    if not isinstance(reasons_raw, list):
+        return False
+    reasons = {str(r) for r in reasons_raw}
+    return {
+        "degraded_publication_active",
+        "reattach_not_ready",
+        "ocxo_science_not_clean",
+    }.issubset(reasons)
 
 
 def _recovery_clean_verdict(
@@ -5203,6 +5226,7 @@ def _recover_campaign() -> None:
 
     clean_wait_deadline = time.monotonic() + SYNC_RECOVER_CLEAN_TIMEOUT_S
     discarded_transitional_pairs = 0
+    degraded_publication_fast_retry_pairs = 0
     recovery_clean_verdict: Dict[str, Any] = {}
 
     while True:
@@ -5282,6 +5306,33 @@ def _recover_campaign() -> None:
                 "last_clean_verdict": recovery_clean_verdict,
             }
             _diag["recovery_clean_stalls"] = _diag.get("recovery_clean_stalls", 0) + 1
+            _diag["last_recovery_clean_timeout"] = {"reason": reason, **details}
+            _cleanup_after_recovery_failure(reason, details)
+            raise RecoveryCleanTimeout(reason, details, cleanup_sent=True)
+
+        if _recovery_degraded_fast_retry_match(recovery_clean_verdict):
+            degraded_publication_fast_retry_pairs += 1
+        else:
+            degraded_publication_fast_retry_pairs = 0
+
+        if degraded_publication_fast_retry_pairs >= int(RECOVERY_DEGRADED_PUBLICATION_FAST_RETRY_ROWS):
+            reason = "recovery_degraded_publication_fast_retry"
+            details = {
+                "campaign": campaign_name,
+                "recover_base_pps_vclock_count": int(recover_base_pps_vclock_count),
+                "expected_first_public_pps_vclock_count": int(expected_first_public_pps_vclock_count),
+                "teensy_pps_vclock_count": int(teensy_pps_vclock_count),
+                "first_public_offset": int(first_public_offset),
+                "discarded_transitional_pairs": int(discarded_transitional_pairs + 1),
+                "degraded_fast_retry_pairs": int(degraded_publication_fast_retry_pairs),
+                "degraded_fast_retry_threshold": int(RECOVERY_DEGRADED_PUBLICATION_FAST_RETRY_ROWS),
+                "last_clean_verdict": recovery_clean_verdict,
+            }
+            _diag["recovery_degraded_fast_retry_count"] = (
+                _diag.get("recovery_degraded_fast_retry_count", 0) + 1
+            )
+            _diag["recovery_clean_stalls"] = _diag.get("recovery_clean_stalls", 0) + 1
+            _diag["last_recovery_degraded_fast_retry"] = {"reason": reason, **details}
             _diag["last_recovery_clean_timeout"] = {"reason": reason, **details}
             _cleanup_after_recovery_failure(reason, details)
             raise RecoveryCleanTimeout(reason, details, cleanup_sent=True)
