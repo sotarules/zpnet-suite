@@ -1305,6 +1305,12 @@ static uint32_t          g_recover_reattach_degraded_release_count = 0;
 static uint32_t          g_recover_reattach_degraded_clear_count = 0;
 static uint32_t          g_recover_reattach_degraded_public_row_count = 0;
 static uint32_t          g_recover_reattach_degraded_science_suppressed_count = 0;
+static constexpr uint32_t CLOCKS_RECOVER_REATTACH_DEGRADED_STALL_CANDIDATES = 32U;
+static volatile bool     g_recover_reattach_stalled = false;
+static uint32_t          g_recover_reattach_stall_count = 0;
+static uint32_t          g_recover_reattach_degraded_window_row_count = 0;
+static uint32_t          g_recover_reattach_last_stall_public_count = 0;
+static char              g_recover_reattach_stall_reason[64] = "idle";
 static uint32_t          g_recover_reattach_hidden_candidate_count = 0;
 static uint32_t          g_recover_reattach_last_hidden_public_count = 0;
 static uint32_t          g_recover_reattach_last_release_public_count = 0;
@@ -2154,6 +2160,12 @@ static void recover_reattach_set_reason(const char* reason) {
            reason ? reason : "recover_reattach");
 }
 
+static void recover_reattach_set_stall_reason(const char* reason) {
+  safeCopy(g_recover_reattach_stall_reason,
+           sizeof(g_recover_reattach_stall_reason),
+           reason ? reason : "recover_reattach_stall");
+}
+
 static FLASHMEM bool recover_reattach_refresh_ready(void) {
   clocks_stack_witness_note_hot(CLOCKS_STACK_CONTEXT_RECOVER_REFRESH_READY);
 
@@ -2175,6 +2187,9 @@ static FLASHMEM void recover_reattach_reset(const char* reason) {
   recover_continuity_align_reset(reason ? reason : "reattach_reset");
   g_recover_reattach_active = false;
   g_recover_reattach_degraded_active = false;
+  g_recover_reattach_stalled = false;
+  g_recover_reattach_degraded_window_row_count = 0;
+  recover_reattach_set_stall_reason(reason ? reason : "reset");
   g_recover_reattach_hidden_candidate_count = 0;
   g_recover_reattach_last_hidden_public_count = 0;
   g_recover_reattach_last_degraded_public_count = 0;
@@ -2187,6 +2202,9 @@ static FLASHMEM void recover_reattach_begin(void) {
   recover_continuity_align_reset("waiting_for_ocxo_reattach");
   g_recover_reattach_active = true;
   g_recover_reattach_degraded_active = false;
+  g_recover_reattach_stalled = false;
+  g_recover_reattach_degraded_window_row_count = 0;
+  recover_reattach_set_stall_reason("not_stalled");
   g_recover_reattach_hidden_candidate_count = 0;
   g_recover_reattach_last_hidden_public_count = 0;
   g_recover_reattach_last_degraded_public_count = 0;
@@ -2204,6 +2222,9 @@ static FLASHMEM void recover_reattach_release(const char* reason, bool degraded)
 
   if (degraded) {
     g_recover_reattach_degraded_active = true;
+    g_recover_reattach_stalled = false;
+    g_recover_reattach_degraded_window_row_count = 0;
+    recover_reattach_set_stall_reason("not_stalled");
     g_recover_reattach_degraded_release_count++;
     g_recover_reattach_last_degraded_release_public_count =
         g_recover_reattach_last_release_public_count;
@@ -2417,6 +2438,9 @@ static FLASHMEM bool recover_reattach_degraded_science_hold_active(void) {
 
   if (recover_reattach_refresh_ready()) {
     g_recover_reattach_degraded_active = false;
+    g_recover_reattach_stalled = false;
+    g_recover_reattach_degraded_window_row_count = 0;
+    recover_reattach_set_stall_reason("cleared_by_reattach_ready");
     g_recover_reattach_degraded_clear_count++;
     // The row that proves reattachment is still a boundary row: it may carry
     // PhaseLedger/CounterLedger state formed across the degraded window.
@@ -2429,9 +2453,25 @@ static FLASHMEM bool recover_reattach_degraded_science_hold_active(void) {
   }
 
   g_recover_reattach_degraded_public_row_count++;
+  g_recover_reattach_degraded_window_row_count++;
   g_recover_reattach_last_degraded_public_count =
       (uint32_t)campaign_seconds;
-  recover_reattach_set_reason("degraded_publication_waiting_for_ocxo_reattach");
+
+  if (!g_recover_reattach_stalled &&
+      g_recover_reattach_degraded_window_row_count >=
+          CLOCKS_RECOVER_REATTACH_DEGRADED_STALL_CANDIDATES) {
+    g_recover_reattach_stalled = true;
+    g_recover_reattach_stall_count++;
+    g_recover_reattach_last_stall_public_count =
+        (uint32_t)campaign_seconds;
+    recover_reattach_set_stall_reason(
+        "degraded_publication_reattach_timeout");
+  }
+
+  recover_reattach_set_reason(
+      g_recover_reattach_stalled
+          ? "degraded_publication_reattach_stalled"
+          : "degraded_publication_waiting_for_ocxo_reattach");
   clocks_beta_feature_set_cached("SCIENCE_RESIDUALS",
                                  g_clocks_feature_science_residuals,
                                  system_feature_status_t::INITIALIZING,
@@ -10195,6 +10235,15 @@ static FLASHMEM void add_campaign_payload(Payload& p) {
         g_recover_reattach_degraded_clear_count);
   p.add("recover_reattach_degraded_public_row_count",
         g_recover_reattach_degraded_public_row_count);
+  p.add("recover_reattach_degraded_window_row_count",
+        g_recover_reattach_degraded_window_row_count);
+  p.add("recover_reattach_stalled", (bool)g_recover_reattach_stalled);
+  p.add("recover_reattach_stall_count", g_recover_reattach_stall_count);
+  p.add("recover_reattach_degraded_stall_threshold",
+        (uint32_t)CLOCKS_RECOVER_REATTACH_DEGRADED_STALL_CANDIDATES);
+  p.add("recover_reattach_last_stall_public_count",
+        g_recover_reattach_last_stall_public_count);
+  p.add("recover_reattach_stall_reason", g_recover_reattach_stall_reason);
   p.add("recover_reattach_degraded_science_suppressed_count",
         g_recover_reattach_degraded_science_suppressed_count);
   p.add("recover_reattach_hidden_candidate_count",
@@ -10978,6 +11027,12 @@ static FLASHMEM Payload cmd_report_timebase_publish(const Payload&) {
                g_recover_reattach_degraded_clear_count);
   counters.add("recover_reattach_degraded_public_row_count",
                g_recover_reattach_degraded_public_row_count);
+  counters.add("recover_reattach_degraded_window_row_count",
+               g_recover_reattach_degraded_window_row_count);
+  counters.add("recover_reattach_stalled", (bool)g_recover_reattach_stalled);
+  counters.add("recover_reattach_stall_count", g_recover_reattach_stall_count);
+  counters.add("recover_reattach_degraded_stall_threshold",
+               (uint32_t)CLOCKS_RECOVER_REATTACH_DEGRADED_STALL_CANDIDATES);
   counters.add("recover_reattach_degraded_science_suppressed_count",
                g_recover_reattach_degraded_science_suppressed_count);
   counters.add("recover_reattach_hidden_candidate_count",
@@ -11092,6 +11147,15 @@ static FLASHMEM Payload cmd_report_timebase_publish(const Payload&) {
                        g_recover_reattach_degraded_release_count);
   recover_reattach.add("degraded_public_row_count",
                        g_recover_reattach_degraded_public_row_count);
+  recover_reattach.add("degraded_window_row_count",
+                       g_recover_reattach_degraded_window_row_count);
+  recover_reattach.add("stalled", (bool)g_recover_reattach_stalled);
+  recover_reattach.add("stall_count", g_recover_reattach_stall_count);
+  recover_reattach.add("degraded_stall_threshold",
+                       (uint32_t)CLOCKS_RECOVER_REATTACH_DEGRADED_STALL_CANDIDATES);
+  recover_reattach.add("last_stall_public_count",
+                       g_recover_reattach_last_stall_public_count);
+  recover_reattach.add("stall_reason", g_recover_reattach_stall_reason);
   recover_reattach.add("degraded_science_suppressed_count",
                        g_recover_reattach_degraded_science_suppressed_count);
   recover_reattach.add("last_degraded_release_public_count",
@@ -11451,6 +11515,23 @@ static FLASHMEM Payload cmd_report_recovery(const Payload&) {
   p.add("degraded_release_count", g_recover_reattach_degraded_release_count);
   p.add("degraded_clear_count", g_recover_reattach_degraded_clear_count);
   p.add("degraded_public_row_count", g_recover_reattach_degraded_public_row_count);
+  p.add("degraded_window_row_count", g_recover_reattach_degraded_window_row_count);
+  p.add("degraded_publication_stalled", (bool)g_recover_reattach_stalled);
+  p.add("degraded_stall_count", g_recover_reattach_stall_count);
+  p.add("degraded_stall_threshold",
+        (uint32_t)CLOCKS_RECOVER_REATTACH_DEGRADED_STALL_CANDIDATES);
+  p.add("degraded_stall_reason", g_recover_reattach_stall_reason);
+  p.add("degraded_stall_last_public_count",
+        g_recover_reattach_last_stall_public_count);
+  p.add("recover_reattach_stalled", (bool)g_recover_reattach_stalled);
+  p.add("recover_reattach_stall_count", g_recover_reattach_stall_count);
+  p.add("recover_reattach_degraded_window_row_count",
+        g_recover_reattach_degraded_window_row_count);
+  p.add("recover_reattach_degraded_stall_threshold",
+        (uint32_t)CLOCKS_RECOVER_REATTACH_DEGRADED_STALL_CANDIDATES);
+  p.add("recover_reattach_stall_reason", g_recover_reattach_stall_reason);
+  p.add("recover_reattach_last_stall_public_count",
+        g_recover_reattach_last_stall_public_count);
   p.add("degraded_science_suppressed_count", g_recover_reattach_degraded_science_suppressed_count);
   p.add("last_degraded_release_public_count", g_recover_reattach_last_degraded_release_public_count);
   p.add("last_degraded_public_count", g_recover_reattach_last_degraded_public_count);

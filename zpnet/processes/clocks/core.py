@@ -223,6 +223,16 @@ TIMEBASE_FINAL_COURT_DELTA_RAW_INTERVAL_GATE_CYCLES = 500
 # zero OCXO ns plus zero endpoints/intervals is lane absence, not science.
 TIMEBASE_FINAL_COURT_OCXO_ZERO_MATURE_PUBLIC_COUNT = 2
 
+# Row-fatal final-court rules are bad TIMEBASE rows, not necessarily bad
+# campaigns.  They are still blocked from persistence, but the Pi allows the
+# next row to prove that the firmware recovered naturally before forcing a full
+# STOP/RECOVER lifecycle.  Campaign-fatal rules still trigger immediate
+# recovery.
+TIMEBASE_FINAL_COURT_ROW_FATAL_RULES = {
+    "ocxo_science_valid",
+}
+TIMEBASE_FINAL_COURT_ROW_FATAL_ESCALATE_CONSECUTIVE = 3
+
 # GNSS confession PPB candidates
 #
 # The GF-8802 reports pps_timing_error_ns in GET_GNSS_INFO.  The absolute
@@ -352,6 +362,11 @@ _diag: Dict[str, Any] = {
     "last_timebase_final_court": {},
     "timebase_final_court_delta_raw_offset_observed": 0,
     "last_timebase_final_court_delta_raw_offset": {},
+    "timebase_final_court_row_dropped": 0,
+    "timebase_final_court_row_fatal_escalated": 0,
+    "timebase_final_court_consecutive_row_fatal": 0,
+    "timebase_final_court_row_fatal_escalate_threshold": TIMEBASE_FINAL_COURT_ROW_FATAL_ESCALATE_CONSECUTIVE,
+    "last_timebase_final_court_row_drop": {},
 
     # Fragment processing (processor thread — slow path)
     "fragments_processed": 0,
@@ -419,6 +434,11 @@ _diag: Dict[str, Any] = {
     "recovery_control_state_reassertions": 0,
     "last_recovery_control_state": {},
     "last_recovery": {},
+    "recovery_transitional_pairs_discarded": 0,
+    "recovery_clean_timeouts": 0,
+    "recovery_clean_stalls": 0,
+    "last_recovery_transitional_pair": {},
+    "last_recovery_clean_timeout": {},
 
     # GNSS wait
     "gnss_waits": 0,
@@ -839,22 +859,32 @@ _recovery_interruption_pending: bool = False
 _recovery_interruption_details: Dict[str, Any] = {}
 
 
-class RecoverySyncTimeout(RuntimeError):
+class RecoveryRetryableFailure(RuntimeError):
+    """Base class for RECOVER failures that should be cleaned and retried."""
+
+    def __init__(
+        self,
+        reason: str,
+        details: Dict[str, Any],
+        *,
+        cleanup_sent: bool = False,
+    ):
+        super().__init__(f"{reason}: {details}")
+        self.reason = reason
+        self.details = details
+        self.cleanup_sent = cleanup_sent
+
+
+class RecoverySyncTimeout(RecoveryRetryableFailure):
     """Raised when a RECOVER lifecycle does not produce a public TIMEBASE pair."""
 
-    def __init__(self, reason: str, details: Dict[str, Any]):
-        super().__init__(f"{reason}: {details}")
-        self.reason = reason
-        self.details = details
+
+class RecoveryCleanTimeout(RecoveryRetryableFailure):
+    """Raised when RECOVER publishes rows but never reaches a clean row."""
 
 
-class RecoveryInterrupted(RuntimeError):
+class RecoveryInterrupted(RecoveryRetryableFailure):
     """Raised when a new WATCHDOG_ANOMALY invalidates an active recovery attempt."""
-
-    def __init__(self, reason: str, details: Dict[str, Any]):
-        super().__init__(f"{reason}: {details}")
-        self.reason = reason
-        self.details = details
 
 
 def _note_recovery_interruption(reason: str, details: Dict[str, Any], *, source: str) -> None:
@@ -1363,16 +1393,18 @@ def _begin_auto_recovery(reason: str, details: Dict[str, Any], *, source: str) -
                     _recover_campaign()
                     logging.info("✅ [clocks] @%s auto-recovery complete", system_time_z())
                     return
-                except RecoveryInterrupted as e:
-                    _diag["auto_recovery_interrupted"] = _diag.get("auto_recovery_interrupted", 0) + 1
+                except RecoveryRetryableFailure as e:
+                    if isinstance(e, RecoveryInterrupted):
+                        _diag["auto_recovery_interrupted"] = _diag.get("auto_recovery_interrupted", 0) + 1
                     logging.warning(
-                        "⚠️ [clocks] auto-recovery attempt %d/%d interrupted: %s details=%s",
+                        "⚠️ [clocks] auto-recovery attempt %d/%d retryable failure: %s details=%s",
                         attempt, int(AUTO_RECOVERY_MAX_ATTEMPTS), e.reason, e.details,
                     )
-                    _cleanup_after_recovery_failure(e.reason, e.details)
+                    if not getattr(e, "cleanup_sent", False):
+                        _cleanup_after_recovery_failure(e.reason, e.details)
                     if attempt >= int(AUTO_RECOVERY_MAX_ATTEMPTS):
                         raise RuntimeError(
-                            f"auto-recovery interrupted {attempt} times; giving up"
+                            f"auto-recovery retryable failure after {attempt} attempt(s): {e.reason}"
                         ) from e
                     _diag["auto_recovery_retries"] = _diag.get("auto_recovery_retries", 0) + 1
                     time.sleep(float(AUTO_RECOVERY_RETRY_DELAY_S))
@@ -2224,6 +2256,10 @@ def _recovery_clean_verdict(
     active = _recovery_bool(status.get("recover_reattach_active"))
     degraded = _recovery_bool(status.get("recover_reattach_degraded_active"))
     ready = _recovery_bool(status.get("reattach_ready") or status.get("recover_clean_ready"))
+    stalled = _recovery_bool(
+        status.get("recover_reattach_stalled")
+        or status.get("degraded_publication_stalled")
+    )
     watchdog_blocked = _recovery_bool(status.get("watchdog_publication_blocked"))
     watchdog_active = _recovery_bool(status.get("watchdog_anomaly_active"))
     quarantine_remaining = _as_int(status.get("science_quarantine_remaining"))
@@ -2239,6 +2275,8 @@ def _recovery_clean_verdict(
         reasons.append("degraded_publication_active")
     if not ready:
         reasons.append("reattach_not_ready")
+    if stalled:
+        reasons.append("degraded_publication_stalled")
     if watchdog_blocked or watchdog_active:
         reasons.append("watchdog_blocked")
     if quarantine_remaining != 0:
@@ -2255,10 +2293,14 @@ def _recovery_clean_verdict(
         "recover_reattach_active": active,
         "recover_reattach_degraded_active": degraded,
         "reattach_ready": ready,
+        "recover_reattach_stalled": stalled,
         "watchdog_blocked": watchdog_blocked or watchdog_active,
         "science_quarantine_remaining": int(quarantine_remaining),
         "lanes": lanes,
         "report_reason": status.get("recover_reattach_reason"),
+        "stall_reason": status.get("recover_reattach_stall_reason") or status.get("degraded_publication_stall_reason"),
+        "degraded_window_row_count": _as_int(status.get("recover_reattach_degraded_window_row_count") or status.get("degraded_window_row_count")),
+        "degraded_stall_threshold": _as_int(status.get("recover_reattach_degraded_stall_threshold") or status.get("degraded_stall_threshold")),
         "hidden_candidate_count": _as_int(status.get("hidden_candidate_count")),
         "last_release_public_count": _as_int(status.get("last_release_public_count")),
     }
@@ -2678,15 +2720,149 @@ def _timebase_final_court_evaluate(timebase: Dict[str, Any]) -> Tuple[bool, Dict
     return len(violations) == 0, verdict
 
 
+_final_court_row_fatal_consecutive: int = 0
+_final_court_row_fatal_signature: Optional[str] = None
+_final_court_row_fatal_first_pps: Optional[int] = None
+_final_court_row_fatal_last_pps: Optional[int] = None
+
+
+def _timebase_final_court_violation_rules(verdict: Dict[str, Any]) -> List[str]:
+    violations = verdict.get("violations")
+    if not isinstance(violations, list):
+        return []
+    return [str(v.get("rule") or "") for v in violations if isinstance(v, dict)]
+
+
+def _timebase_final_court_row_fatal(verdict: Dict[str, Any]) -> bool:
+    rules = _timebase_final_court_violation_rules(verdict)
+    return bool(rules) and all(rule in TIMEBASE_FINAL_COURT_ROW_FATAL_RULES for rule in rules)
+
+
+def _timebase_final_court_signature(verdict: Dict[str, Any]) -> str:
+    violations = verdict.get("violations")
+    if not isinstance(violations, list):
+        return ""
+    parts: List[str] = []
+    for v in violations:
+        if not isinstance(v, dict):
+            continue
+        parts.append(f"{v.get('rule', '')}:{v.get('lane', '')}")
+    return ",".join(sorted(parts))
+
+
+def _timebase_final_court_reset_row_fatal_streak(reason: str) -> None:
+    global _final_court_row_fatal_consecutive
+    global _final_court_row_fatal_signature
+    global _final_court_row_fatal_first_pps
+    global _final_court_row_fatal_last_pps
+
+    if _final_court_row_fatal_consecutive:
+        _diag["last_timebase_final_court_row_drop"] = {
+            **(_diag.get("last_timebase_final_court_row_drop") or {}),
+            "reset_reason": reason,
+            "reset_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        }
+
+    _final_court_row_fatal_consecutive = 0
+    _final_court_row_fatal_signature = None
+    _final_court_row_fatal_first_pps = None
+    _final_court_row_fatal_last_pps = None
+    _diag["timebase_final_court_consecutive_row_fatal"] = 0
+
+
+def _timebase_final_court_note_row_drop(verdict: Dict[str, Any]) -> bool:
+    """Record a row-fatal court block; return True when it should escalate."""
+    global _final_court_row_fatal_consecutive
+    global _final_court_row_fatal_signature
+    global _final_court_row_fatal_first_pps
+    global _final_court_row_fatal_last_pps
+
+    pps = _as_int(verdict.get("teensy_pps_vclock_count"))
+    signature = _timebase_final_court_signature(verdict)
+
+    if (
+        _final_court_row_fatal_signature == signature
+        and _final_court_row_fatal_last_pps is not None
+        and pps is not None
+        and int(pps) == int(_final_court_row_fatal_last_pps) + 1
+    ):
+        _final_court_row_fatal_consecutive += 1
+    else:
+        _final_court_row_fatal_consecutive = 1
+        _final_court_row_fatal_signature = signature
+        _final_court_row_fatal_first_pps = pps
+
+    _final_court_row_fatal_last_pps = pps
+    _diag["timebase_final_court_row_dropped"] = (
+        _diag.get("timebase_final_court_row_dropped", 0) + 1
+    )
+    _diag["timebase_final_court_consecutive_row_fatal"] = (
+        _final_court_row_fatal_consecutive
+    )
+    _diag["last_timebase_final_court_row_drop"] = {
+        "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "campaign": verdict.get("campaign"),
+        "teensy_pps_vclock_count": pps,
+        "pps_count": pps,
+        "signature": signature,
+        "first_pps_vclock_count": _final_court_row_fatal_first_pps,
+        "consecutive": _final_court_row_fatal_consecutive,
+        "threshold": TIMEBASE_FINAL_COURT_ROW_FATAL_ESCALATE_CONSECUTIVE,
+        "rules": _timebase_final_court_violation_rules(verdict),
+        "verdict": verdict,
+    }
+    return (
+        _final_court_row_fatal_consecutive
+        >= TIMEBASE_FINAL_COURT_ROW_FATAL_ESCALATE_CONSECUTIVE
+    )
+
+
 def _timebase_final_court_block(verdict: Dict[str, Any]) -> None:
-    """Record a final-court conviction and start local recovery."""
+    """Record a final-court conviction and start recovery only when needed."""
     _diag["timebase_final_court_blocked"] += 1
     _diag["last_timebase_final_court"] = verdict
 
+    row_fatal = _timebase_final_court_row_fatal(verdict)
+    verdict["court_classification"] = "ROW_FATAL" if row_fatal else "CAMPAIGN_FATAL"
+
+    if row_fatal:
+        should_escalate = _timebase_final_court_note_row_drop(verdict)
+        logging.warning(
+            "⚠️ [clocks] TIMEBASE final court row dropped: campaign=%s pps=%s consecutive=%d/%d violations=%s",
+            verdict.get("campaign"),
+            verdict.get("teensy_pps_vclock_count"),
+            _final_court_row_fatal_consecutive,
+            TIMEBASE_FINAL_COURT_ROW_FATAL_ESCALATE_CONSECUTIVE,
+            verdict.get("violations"),
+        )
+        if not should_escalate:
+            try:
+                create_event("TIMEBASE_ROW_DROPPED", verdict)
+            except Exception:
+                logging.debug("⚠️ [clocks] failed to enqueue TIMEBASE_ROW_DROPPED event", exc_info=True)
+            return
+
+        _diag["timebase_final_court_row_fatal_escalated"] = (
+            _diag.get("timebase_final_court_row_fatal_escalated", 0) + 1
+        )
+        reason = "timebase_final_court_row_fatal_repeated"
+        details = {
+            "payload": verdict,
+            "consecutive_row_fatal_count": _final_court_row_fatal_consecutive,
+            "first_pps_vclock_count": _final_court_row_fatal_first_pps,
+            "last_pps_vclock_count": _final_court_row_fatal_last_pps,
+            "signature": _final_court_row_fatal_signature,
+        }
+    else:
+        _timebase_final_court_reset_row_fatal_streak("campaign_fatal_final_court")
+        reason = TIMEBASE_FINAL_COURT_REASON
+        details = {"payload": verdict}
+
     logging.error(
-        "💥 [clocks] TIMEBASE final court violation: campaign=%s pps=%s violations=%s",
+        "💥 [clocks] TIMEBASE final court campaign recovery: campaign=%s pps=%s reason=%s violations=%s",
         verdict.get("campaign"),
         verdict.get("teensy_pps_vclock_count"),
+        reason,
         verdict.get("violations"),
     )
 
@@ -2697,8 +2873,8 @@ def _timebase_final_court_block(verdict: Dict[str, Any]) -> None:
         logging.exception("⚠️ [clocks] failed to enqueue final-court WATCHDOG_ANOMALY event")
 
     started = _begin_auto_recovery(
-        TIMEBASE_FINAL_COURT_REASON,
-        {"payload": verdict},
+        reason,
+        details,
         source=TIMEBASE_FINAL_COURT_SOURCE,
     )
     if started:
@@ -3794,6 +3970,46 @@ def _process_loop() -> None:
             _diag["forensics_ignored_no_campaign"] += 1
             continue
 
+        # --- Campaign lookup ---
+        row = _get_active_campaign()
+        if row is None:
+            _diag["hard_fault_no_active_campaign"] += 1
+            try:
+                _hard_fault("no_active_campaign", {"teensy_pps_vclock_count": int(pps_vclock_count), "pps_count": int(pps_vclock_count)})
+            except RuntimeError:
+                continue
+
+        campaign = row["campaign"]
+        campaign_payload = row["payload"]
+
+        # --- Final court preflight before mutating Pi-owned row state ---
+        # A row-fatal court drop must not advance GNSS_RAW, GNSS confession,
+        # accepted PPS identity, or the async START marker.  Build only the
+        # Teensy-authored shell needed by the court, then commit Pi-owned
+        # surfaces after the row is proven persistable.
+        system_time_utc = datetime.now(timezone.utc)
+        system_time_str = system_time_utc.isoformat(timespec="microseconds")
+        court_timebase = {
+            "schema": "TIMEBASE_V3",
+            "timebase_pair_version": frag.get("timebase_pair_version"),
+            "campaign": campaign,
+            "teensy_pps_vclock_count": int(pps_vclock_count),
+            "teensy_pps_count": int(pps_vclock_count),
+            "pps_count": int(pps_vclock_count),
+            "fragment": frag,
+            "forensics": forensics,
+        }
+        _diag["timebase_final_court_checks"] += 1
+        court_ok, court_verdict = _timebase_final_court_evaluate(court_timebase)
+        if not court_ok:
+            # The final object failed last-mile acceptance.  Do not publish,
+            # persist, or mutate Pi-owned campaign accumulators.  Row-fatal
+            # violations are simply dropped unless they repeat past threshold.
+            _timebase_final_court_block(court_verdict)
+            continue
+
+        _timebase_final_court_reset_row_fatal_streak("final_court_passed")
+        _diag["timebase_final_court_passed"] += 1
         _diag["fragments_processed"] += 1
         _note_pps_vclock_count(pps_vclock_count)
 
@@ -3805,10 +4021,12 @@ def _process_loop() -> None:
         _diag["accepted_pps_count"] = _accepted_pps_vclock_count
         _diag["accepted_pps_vclock_count"] = _accepted_pps_vclock_count
 
-        # --- Extract GNSS ns for stream health canary ---
-        system_time_utc = datetime.now(timezone.utc)
-        system_time_str = system_time_utc.isoformat(timespec="microseconds")
+        _mark_start_first_fragment_if_needed(
+            campaign=campaign,
+            pps_vclock_count=int(pps_vclock_count),
+        )
 
+        # --- Extract GNSS ns for stream health canary ---
         gnss_ns = int(frag.get("gnss_ns") or 0)
 
         # --- GNSS stream health canary (Pi-side diagnostic only) ---
@@ -3856,27 +4074,10 @@ def _process_loop() -> None:
         gnss_raw_welford_stderr = (
             gnss_raw_welford_stddev / math.sqrt(_gnss_raw_welford_n)) if _gnss_raw_welford_n >= 2 else 0.0
 
-        # --- Campaign lookup ---
-        row = _get_active_campaign()
-        if row is None:
-            _diag["hard_fault_no_active_campaign"] += 1
-            try:
-                _hard_fault("no_active_campaign", {"teensy_pps_vclock_count": int(pps_vclock_count), "pps_count": int(pps_vclock_count)})
-            except RuntimeError:
-                continue
-
-        campaign = row["campaign"]
-        campaign_payload = row["payload"]
-
-        _mark_start_first_fragment_if_needed(
-            campaign=campaign,
-            pps_vclock_count=int(pps_vclock_count),
-        )
-
         # --- GNSS confession PPB candidates ---
-        # Computed here, after exact TIMEBASE pair assembly, because only Pi
-        # CLOCKS has both the Teensy-authored OCXO residuals and the correlated
-        # GF-8802 discipline confession in one object.
+        # Computed here, after exact TIMEBASE pair assembly and final-court
+        # admission, because only admitted rows may advance Pi-owned candidate
+        # state.
         ppb_candidates = _gnss_confession_update(
             pps_vclock_count=int(pps_vclock_count),
             frag=frag,
@@ -3928,15 +4129,6 @@ def _process_loop() -> None:
             "ppb_candidates": ppb_candidates,
         }
 
-        _diag["timebase_final_court_checks"] += 1
-        court_ok, court_verdict = _timebase_final_court_evaluate(timebase)
-        if not court_ok:
-            # The final object failed last-mile acceptance.  Do not publish and
-            # do not persist; recovery will use the last good canonical row.
-            _timebase_final_court_block(court_verdict)
-            continue
-
-        _diag["timebase_final_court_passed"] += 1
         publish("TIMEBASE", timebase)
         _persist_timebase(timebase)
 
@@ -4007,6 +4199,7 @@ def _reset_trackers() -> int:
     _gnss_canary_reset()
     _gnss_raw_reset()
     _gnss_confession_reset()
+    _timebase_final_court_reset_row_fatal_streak("trackers_reset")
     return _drain_timebase_ingress_and_pending()
 
 def _request_teensy_stop_best_effort() -> None:
@@ -5015,6 +5208,7 @@ def _recover_campaign() -> None:
     while True:
         remaining = clean_wait_deadline - time.monotonic()
         if remaining <= 0:
+            reason = "recovery_clean_timeout_degraded_publication" if discarded_transitional_pairs else "recover_clean_timeout"
             details = {
                 "campaign": campaign_name,
                 "expected_first_public_pps_vclock_count": int(expected_first_public_pps_vclock_count),
@@ -5022,18 +5216,21 @@ def _recover_campaign() -> None:
                 "last_clean_verdict": recovery_clean_verdict,
                 "clean_timeout_s": float(SYNC_RECOVER_CLEAN_TIMEOUT_S),
             }
-            _cleanup_after_recovery_failure("recover_clean_timeout", details)
-            raise RuntimeError(
-                "recovery failed: timed out waiting for clean OCXO reattachment "
-                f"after discarding {discarded_transitional_pairs} transitional pair(s); "
-                f"last_verdict={recovery_clean_verdict}"
-            )
+            _diag["recovery_clean_timeouts"] = _diag.get("recovery_clean_timeouts", 0) + 1
+            _diag["last_recovery_clean_timeout"] = {"reason": reason, **details}
+            _cleanup_after_recovery_failure(reason, details)
+            raise RecoveryCleanTimeout(reason, details, cleanup_sent=True)
 
         try:
             frag, waited_s = _end_sync_wait(
                 timeout_s=min(float(remaining), float(RECOVERY_FIRST_PAIR_TIMEOUT_S))
             )
         except RecoverySyncTimeout as e:
+            reason = (
+                "recovery_clean_timeout_degraded_publication"
+                if discarded_transitional_pairs
+                else e.reason
+            )
             details = {
                 **e.details,
                 "campaign": campaign_name,
@@ -5042,11 +5239,14 @@ def _recover_campaign() -> None:
                 "discarded_transitional_pairs": int(discarded_transitional_pairs),
                 "last_clean_verdict": recovery_clean_verdict,
             }
-            _cleanup_after_recovery_failure(e.reason, details)
-            raise RuntimeError(
-                "recovery failed: timed out waiting for first public TIMEBASE pair; "
-                f"cleanup sent to Teensy; details={details}"
-            ) from e
+            if discarded_transitional_pairs:
+                _diag["recovery_clean_timeouts"] = _diag.get("recovery_clean_timeouts", 0) + 1
+                _diag["last_recovery_clean_timeout"] = {"reason": reason, **details}
+                _cleanup_after_recovery_failure(reason, details)
+                raise RecoveryCleanTimeout(reason, details, cleanup_sent=True) from e
+
+            _cleanup_after_recovery_failure(reason, details)
+            raise RecoverySyncTimeout(reason, details, cleanup_sent=True) from e
 
         _raise_if_recovery_interrupted("post_sync_pair_before_clean_verdict")
 
@@ -5069,6 +5269,22 @@ def _recover_campaign() -> None:
                 discarded_transitional_pairs,
             )
             break
+
+        if _recovery_bool(recovery_clean_verdict.get("recover_reattach_stalled")):
+            reason = "recovery_degraded_publication_stalled"
+            details = {
+                "campaign": campaign_name,
+                "recover_base_pps_vclock_count": int(recover_base_pps_vclock_count),
+                "expected_first_public_pps_vclock_count": int(expected_first_public_pps_vclock_count),
+                "teensy_pps_vclock_count": int(teensy_pps_vclock_count),
+                "first_public_offset": int(first_public_offset),
+                "discarded_transitional_pairs": int(discarded_transitional_pairs),
+                "last_clean_verdict": recovery_clean_verdict,
+            }
+            _diag["recovery_clean_stalls"] = _diag.get("recovery_clean_stalls", 0) + 1
+            _diag["last_recovery_clean_timeout"] = {"reason": reason, **details}
+            _cleanup_after_recovery_failure(reason, details)
+            raise RecoveryCleanTimeout(reason, details, cleanup_sent=True)
 
         discarded_transitional_pairs += 1
         _diag["recovery_transitional_pairs_discarded"] = (
