@@ -261,6 +261,13 @@ GNSS_CONFESSION_SEGMENT_STEP_GATE_NS = 50.0
 # Legal values: "RAW", "GNSS_CONFESSION".
 GNSS_CONFESSION_PPB_PUBLISHED_SOURCE = "RAW"
 
+# GNSS_RAW recovery sanity gate.  GNSS_RAW is a Pi-owned synthetic clockface
+# accumulated from receiver drift_ppb.  Its accumulated tau/ppb should stay in
+# the same order of magnitude as the restored drift Welford mean.  If an older
+# recovery poisoned the synthetic clockface/reference ratio, rebuild the seed
+# from the Welford mean instead of preserving the bad ratio.
+GNSS_RAW_RECOVERY_REBUILD_GATE_PPB = 1000.0
+
 
 def _gnss_confession_published_source() -> str:
     source = str(GNSS_CONFESSION_PPB_PUBLISHED_SOURCE or "RAW").upper()
@@ -482,6 +489,11 @@ _diag: Dict[str, Any] = {
     "gnss_confession_last_error_ns": None,
     "gnss_confession_published_source": _gnss_confession_published_source(),
     "last_gnss_confession": {},
+
+    # GNSS_RAW recovery projection / sanity rebuild
+    "gnss_raw_recovery_restore_count": 0,
+    "gnss_raw_recovery_rebuild_count": 0,
+    "last_gnss_raw_recovery": {},
 
     # GNSS stream health (Pi-side canary only)
     "gnss_residual_nonzero": 0,
@@ -2140,11 +2152,86 @@ def _add_welford_recovery_args(
     return restored
 
 
+def _gnss_raw_recovery_project_seed(
+    *,
+    last_tb: Dict[str, Any],
+    last_pps_vclock_count: int,
+    seed_pps_vclock_count: int,
+) -> Dict[str, Any]:
+    """Project Pi-owned GNSS_RAW across a recovery gap without ratio poison.
+
+    GNSS_RAW is not a Teensy clock.  It is a Pi synthetic clock accumulated as
+    one nominal GNSS second plus the GF-8802 drift_ppb confession.  Therefore a
+    warm recovery should project it from its own reference surface
+    (gnss_raw_ref_ns) and restored drift mean, not from the campaign GNSS ratio.
+    """
+    extra = _report_extra_clocks(last_tb)
+
+    last_ref_ns = _as_int(extra.get("gnss_raw_ref_ns") or last_tb.get("gnss_raw_ref_ns"))
+    if last_ref_ns is None or last_ref_ns <= 0:
+        last_ref_ns = int(last_pps_vclock_count) * NS_PER_SECOND
+
+    last_raw_ns_f = _first_float(
+        extra.get("gnss_raw_ns"),
+        last_tb.get("gnss_raw_ns"),
+    )
+    mean_ppb = _first_float(
+        extra.get("gnss_raw_welford_mean"),
+        last_tb.get("gnss_raw_welford_mean"),
+        extra.get("gnss_raw_drift_ppb"),
+        last_tb.get("gnss_raw_drift_ppb"),
+        0.0,
+    ) or 0.0
+
+    raw_source = "last_timebase_gnss_raw_ns"
+    rebuilt = False
+    last_raw_ppb = None
+
+    if last_raw_ns_f is None or last_raw_ns_f <= 0.0:
+        last_raw_ns_f = float(last_ref_ns) + mean_ppb * (float(last_ref_ns) / float(NS_PER_SECOND))
+        raw_source = "rebuilt_missing_raw_from_welford_mean"
+        rebuilt = True
+    else:
+        last_raw_ppb = _compute_ppb(int(round(last_raw_ns_f)), int(last_ref_ns)) if last_ref_ns > 0 else None
+        if (
+            last_raw_ppb is not None
+            and math.isfinite(last_raw_ppb)
+            and abs(float(last_raw_ppb) - float(mean_ppb)) > float(GNSS_RAW_RECOVERY_REBUILD_GATE_PPB)
+        ):
+            last_raw_ns_f = float(last_ref_ns) + mean_ppb * (float(last_ref_ns) / float(NS_PER_SECOND))
+            raw_source = "rebuilt_incoherent_ratio_from_welford_mean"
+            rebuilt = True
+
+    gap_seconds = max(0, int(seed_pps_vclock_count) - int(last_pps_vclock_count))
+    seed_ref_ns = int(last_ref_ns) + int(gap_seconds) * NS_PER_SECOND
+    seed_raw_ns = int(round(last_raw_ns_f + float(gap_seconds) * (float(NS_PER_SECOND) + float(mean_ppb))))
+
+    projected_ppb = _compute_ppb(seed_raw_ns, seed_ref_ns) if seed_ref_ns > 0 else 0.0
+    return {
+        "schema": "GNSS_RAW_RECOVERY_PROJECTION_V2",
+        "source": raw_source,
+        "rebuilt_from_welford_mean": bool(rebuilt),
+        "rebuild_gate_ppb": float(GNSS_RAW_RECOVERY_REBUILD_GATE_PPB),
+        "last_pps_vclock_count": int(last_pps_vclock_count),
+        "seed_pps_vclock_count": int(seed_pps_vclock_count),
+        "gap_seconds": int(gap_seconds),
+        "last_ref_ns": int(last_ref_ns),
+        "last_raw_ns": int(round(last_raw_ns_f)),
+        "last_raw_ppb": None if last_raw_ppb is None else round(float(last_raw_ppb), 6),
+        "welford_mean_ppb": round(float(mean_ppb), 6),
+        "seed_ref_ns": int(seed_ref_ns),
+        "seed_raw_ns": int(seed_raw_ns),
+        "seed_raw_ppb": round(float(projected_ppb), 6),
+    }
+
+
 def _restore_gnss_raw_from_last_timebase(
     *,
     last_tb: Dict[str, Any],
     projected_gnss_ns: int,
     projected_gnss_raw_ns: int,
+    projected_gnss_raw_ref_ns: int,
+    projection_details: Optional[Dict[str, Any]] = None,
 ) -> bool:
     """Restore the Pi-owned GNSS_RAW synthetic clock and Welford accumulator.
 
@@ -2168,34 +2255,60 @@ def _restore_gnss_raw_from_last_timebase(
     if raw_ns is not None:
         _gnss_raw_ns = float(raw_ns)
 
-    projected_n = int(projected_gnss_ns // NS_PER_SECOND) if projected_gnss_ns > 0 else 0
-    ref_ns = _as_int(extra.get("gnss_raw_ref_ns") or last_tb.get("gnss_raw_ref_ns"))
-    if projected_n > 0:
-        _gnss_raw_n = projected_n
-    elif ref_ns is not None and ref_ns > 0:
-        _gnss_raw_n = int(ref_ns // NS_PER_SECOND)
+    raw_ref_ns = _as_int(
+        projected_gnss_raw_ref_ns
+        if projected_gnss_raw_ref_ns > 0
+        else None
+    )
+    if raw_ref_ns is None:
+        raw_ref_ns = _as_int(extra.get("gnss_raw_ref_ns") or last_tb.get("gnss_raw_ref_ns"))
+    if raw_ref_ns is None or raw_ref_ns <= 0:
+        raw_ref_ns = int(projected_gnss_ns) if projected_gnss_ns > 0 else 0
+
+    if raw_ref_ns > 0:
+        _gnss_raw_n = int(raw_ref_ns // NS_PER_SECOND)
 
     _gnss_raw_valid = _gnss_raw_ns > 0.0 and _gnss_raw_n > 0
 
     n = _as_int(extra.get("gnss_raw_welford_n") or last_tb.get("gnss_raw_welford_n"))
-    if n is None:
-        return False
-
     mean = _first_float(extra.get("gnss_raw_welford_mean"), last_tb.get("gnss_raw_welford_mean")) or 0.0
     stddev = _first_float(extra.get("gnss_raw_welford_stddev"), last_tb.get("gnss_raw_welford_stddev"))
     stderr_value = _first_float(extra.get("gnss_raw_welford_stderr"), last_tb.get("gnss_raw_welford_stderr"))
     min_val = _first_float(extra.get("gnss_raw_welford_min"), last_tb.get("gnss_raw_welford_min"))
     max_val = _first_float(extra.get("gnss_raw_welford_max"), last_tb.get("gnss_raw_welford_max"))
 
-    if stddev is None:
-        stddev = (stderr_value * math.sqrt(float(n))) if stderr_value is not None and n > 0 else 0.0
+    welford_restored = n is not None
+    if n is not None:
+        if stddev is None:
+            stddev = (stderr_value * math.sqrt(float(n))) if stderr_value is not None and n > 0 else 0.0
 
-    _gnss_raw_welford_n = int(n)
-    _gnss_raw_welford_mean = float(mean)
-    _gnss_raw_welford_m2 = (float(stddev) * float(stddev) * float(n - 1)) if n >= 2 else 0.0
-    _gnss_raw_welford_min = float(min_val) if min_val is not None else float(mean)
-    _gnss_raw_welford_max = float(max_val) if max_val is not None else float(mean)
-    return True
+        _gnss_raw_welford_n = int(n)
+        _gnss_raw_welford_mean = float(mean)
+        _gnss_raw_welford_m2 = (float(stddev) * float(stddev) * float(n - 1)) if n >= 2 else 0.0
+        _gnss_raw_welford_min = float(min_val) if min_val is not None else float(mean)
+        _gnss_raw_welford_max = float(max_val) if max_val is not None else float(mean)
+
+    restored_ppb = _compute_ppb(int(round(_gnss_raw_ns)), int(raw_ref_ns)) if raw_ref_ns > 0 else 0.0
+    restore_diag = {
+        "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "projected_gnss_ns": int(projected_gnss_ns),
+        "projected_gnss_raw_ns": int(projected_gnss_raw_ns),
+        "projected_gnss_raw_ref_ns": int(projected_gnss_raw_ref_ns),
+        "restored_raw_ns": int(round(_gnss_raw_ns)),
+        "restored_ref_ns": int(raw_ref_ns),
+        "restored_n": int(_gnss_raw_n),
+        "restored_ppb": round(float(restored_ppb), 6),
+        "welford_restored": bool(welford_restored),
+        "welford_n": int(_gnss_raw_welford_n),
+        "welford_mean": round(float(_gnss_raw_welford_mean), 6),
+        "projection": projection_details or {},
+    }
+    _diag["gnss_raw_recovery_restore_count"] = _diag.get("gnss_raw_recovery_restore_count", 0) + 1
+    if projection_details and projection_details.get("rebuilt_from_welford_mean"):
+        _diag["gnss_raw_recovery_rebuild_count"] = _diag.get("gnss_raw_recovery_rebuild_count", 0) + 1
+    _diag["last_gnss_raw_recovery"] = restore_diag
+
+    return bool(_gnss_raw_valid)
 
 
 def _recovery_bool(value: Any) -> bool:
@@ -2945,6 +3058,7 @@ def _recovery_timebase_snapshot(tb: Dict[str, Any]) -> Dict[str, Any]:
     """Extract the recovery-critical truth from one persisted TIMEBASE row."""
     last_tb = dict(tb or {})
     last_frag = _report_fragment(last_tb)
+    last_extra = _report_extra_clocks(last_tb)
 
     last_pps_vclock_count = int(_extract_last_timebase_count(last_tb, last_frag))
 
@@ -3000,10 +3114,22 @@ def _recovery_timebase_snapshot(tb: Dict[str, Any]) -> Dict[str, Any]:
         default=int(last_tb.get("teensy_ocxo2_ns") or 0),
     )
     last_gnss_raw_ns = int(
-        (last_tb.get("extra_clocks") or {}).get("gnss_raw_ns")
+        last_extra.get("gnss_raw_ns")
         or last_tb.get("gnss_raw_ns")
         or 0
     )
+    last_gnss_raw_ref_ns = int(
+        last_extra.get("gnss_raw_ref_ns")
+        or last_tb.get("gnss_raw_ref_ns")
+        or (last_pps_vclock_count * NS_PER_SECOND)
+    )
+    last_gnss_raw_welford_mean = _first_float(
+        last_extra.get("gnss_raw_welford_mean"),
+        last_tb.get("gnss_raw_welford_mean"),
+        last_extra.get("gnss_raw_drift_ppb"),
+        last_tb.get("gnss_raw_drift_ppb"),
+        0.0,
+    ) or 0.0
     last_gnss_time_str = (
         last_tb.get("gnss_time_utc")
         or last_tb.get("system_time_utc")
@@ -3029,6 +3155,8 @@ def _recovery_timebase_snapshot(tb: Dict[str, Any]) -> Dict[str, Any]:
         "last_ocxo1_ns": int(last_ocxo1_ns),
         "last_ocxo2_ns": int(last_ocxo2_ns),
         "last_gnss_raw_ns": int(last_gnss_raw_ns),
+        "last_gnss_raw_ref_ns": int(last_gnss_raw_ref_ns),
+        "last_gnss_raw_welford_mean": float(last_gnss_raw_welford_mean),
         "last_gnss_time_str": str(last_gnss_time_str),
         "recoverable": bool(recoverable),
     }
@@ -4995,6 +5123,8 @@ def _recover_campaign() -> None:
     last_ocxo1_ns = int(recovery_snapshot["last_ocxo1_ns"])
     last_ocxo2_ns = int(recovery_snapshot["last_ocxo2_ns"])
     last_gnss_raw_ns = int(recovery_snapshot["last_gnss_raw_ns"])
+    last_gnss_raw_ref_ns = int(recovery_snapshot.get("last_gnss_raw_ref_ns") or (last_pps_vclock_count * NS_PER_SECOND))
+    last_gnss_raw_welford_mean = float(recovery_snapshot.get("last_gnss_raw_welford_mean") or 0.0)
     last_gnss_time_str = str(recovery_snapshot["last_gnss_time_str"])
 
     if not recovery_snapshot.get("recoverable"):
@@ -5017,9 +5147,13 @@ def _recover_campaign() -> None:
         "    dwt_ns_arg = %d\n"
         "    ocxo1_ns   = %d\n"
         "    ocxo2_ns   = %d\n"
+        "    gn_raw_ns  = %d\n"
+        "    gn_raw_ref = %d\n"
+        "    gn_raw_mean_ppb = %.6f\n"
         "    gnss_time  = %s",
         last_pps_vclock_count, last_gnss_ns, last_dwt_cycles, last_dwt_ns,
-        last_ocxo1_ns, last_ocxo2_ns, last_gnss_time_str,
+        last_ocxo1_ns, last_ocxo2_ns, last_gnss_raw_ns, last_gnss_raw_ref_ns,
+        last_gnss_raw_welford_mean, last_gnss_time_str,
     )
 
     system_cfg = _get_system_config()
@@ -5137,7 +5271,14 @@ def _recover_campaign() -> None:
     )
     projected_ocxo1_ns = projected_gnss_ns * last_ocxo1_ns // last_gnss_ns if (last_gnss_ns > 0 and last_ocxo1_ns > 0) else 0
     projected_ocxo2_ns = projected_gnss_ns * last_ocxo2_ns // last_gnss_ns if (last_gnss_ns > 0 and last_ocxo2_ns > 0) else 0
-    projected_gnss_raw_ns = projected_gnss_ns * last_gnss_raw_ns // last_gnss_ns if (last_gnss_ns > 0 and last_gnss_raw_ns > 0) else 0
+
+    # GNSS_RAW is Pi-owned and has its own reference ledger.  Do not project it
+    # as last_gnss_raw_ns / last_gnss_ns; that preserves any poisoned
+    # clockface/GNSS ratio across every recovery.  The actual seed immediately
+    # before the first accepted public pair is computed below after the clean
+    # row is known.
+    projected_gnss_raw_ns = 0
+    projected_gnss_raw_ref_ns = 0
 
     tau_dwt = (
         last_dwt_cycles / ((last_gnss_ns * DWT_EXPECTED_PER_PPS) / NS_PER_SECOND)
@@ -5178,6 +5319,9 @@ def _recover_campaign() -> None:
         "projected_dwt_ns": int(projected_dwt_ns),
         "projected_ocxo1_ns": int(projected_ocxo1_ns),
         "projected_ocxo2_ns": int(projected_ocxo2_ns),
+        "last_gnss_raw_ns": int(last_gnss_raw_ns),
+        "last_gnss_raw_ref_ns": int(last_gnss_raw_ref_ns),
+        "last_gnss_raw_welford_mean": round(float(last_gnss_raw_welford_mean), 6),
         "skipped_unrecoverable_rows": int(skipped_unrecoverable_rows),
         "recover_ocxo1_dac": None if recover_ocxo1_dac is None else round(float(recover_ocxo1_dac), 6),
         "recover_ocxo2_dac": None if recover_ocxo2_dac is None else round(float(recover_ocxo2_dac), 6),
@@ -5362,16 +5506,20 @@ def _recover_campaign() -> None:
     # the sync pair is persisted as the first recovered public TIMEBASE row.
     seed_pps_vclock_count = max(0, int(teensy_pps_vclock_count) - 1)
     seed_gnss_ns = seed_pps_vclock_count * NS_PER_SECOND
-    seed_gnss_raw_ns = (
-        seed_gnss_ns * last_gnss_raw_ns // last_gnss_ns
-        if (last_gnss_ns > 0 and last_gnss_raw_ns > 0)
-        else 0
+    gnss_raw_projection = _gnss_raw_recovery_project_seed(
+        last_tb=last_tb,
+        last_pps_vclock_count=int(last_pps_vclock_count),
+        seed_pps_vclock_count=int(seed_pps_vclock_count),
     )
+    seed_gnss_raw_ns = int(gnss_raw_projection.get("seed_raw_ns") or 0)
+    seed_gnss_raw_ref_ns = int(gnss_raw_projection.get("seed_ref_ns") or seed_gnss_ns)
 
     gnss_raw_restored = _restore_gnss_raw_from_last_timebase(
         last_tb=last_tb,
         projected_gnss_ns=int(seed_gnss_ns),
         projected_gnss_raw_ns=int(seed_gnss_raw_ns),
+        projected_gnss_raw_ref_ns=int(seed_gnss_raw_ref_ns),
+        projection_details=gnss_raw_projection,
     )
 
     _accepted_pps_vclock_count = seed_pps_vclock_count
@@ -5386,6 +5534,8 @@ def _recover_campaign() -> None:
         "seed_pps_vclock_count": int(seed_pps_vclock_count),
         "seed_gnss_ns": int(seed_gnss_ns),
         "seed_gnss_raw_ns": int(seed_gnss_raw_ns),
+        "seed_gnss_raw_ref_ns": int(seed_gnss_raw_ref_ns),
+        "gnss_raw_projection": gnss_raw_projection,
         "first_public_offset": int(first_public_offset),
         "skipped_records_expected": False,
         "gnss_raw_recovery_uses_seed_before_first_public": True,
@@ -5399,9 +5549,13 @@ def _recover_campaign() -> None:
     _sync_resume_event.set()
 
     logging.info(
-        "📊 [recovery] GNSS_RAW restored=%s seed_count=%d first_public=%d offset=%+d",
+        "📊 [recovery] GNSS_RAW restored=%s seed_count=%d ref_ns=%d raw_ns=%d raw_ppb=%.6f source=%s first_public=%d offset=%+d",
         str(gnss_raw_restored),
         seed_pps_vclock_count,
+        seed_gnss_raw_ref_ns,
+        seed_gnss_raw_ns,
+        float(gnss_raw_projection.get("seed_raw_ppb") or 0.0),
+        gnss_raw_projection.get("source"),
         teensy_pps_vclock_count,
         first_public_offset,
     )
