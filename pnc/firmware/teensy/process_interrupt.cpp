@@ -71,7 +71,6 @@
 #include "imxrt.h"
 #include <math.h>
 #include <stdio.h>
-#include <strings.h>
 #include <string.h>
 #include <climits>
 
@@ -125,6 +124,20 @@ __attribute__((weak)) void clocks_watchdog_anomaly_payload(const char* reason,
 // final-publication courts must remain diagnostic-only until CLOCKS says a
 // campaign ledger is actually armed.
 bool clocks_watchdog_campaign_armed(void);
+
+static char interrupt_ascii_fold(char c) {
+  return (c >= 'a' && c <= 'z') ? (char)(c - ('a' - 'A')) : c;
+}
+
+static bool interrupt_cstr_equal_ci(const char* a, const char* b) {
+  if (!a || !b) return false;
+  while (*a && *b) {
+    if (interrupt_ascii_fold(*a) != interrupt_ascii_fold(*b)) return false;
+    ++a;
+    ++b;
+  }
+  return *a == *b;
+}
 
 // ============================================================================
 // Constants
@@ -2886,6 +2899,15 @@ static constexpr bool     GENERATION_GATE_REJECT_FAR_LATE_ENABLED = false;
 static constexpr uint32_t GENERATION_GATE_FAR_LATE_REJECT_TICKS =
     GENERATION_GATE_LATE_ACCEPT_WARN_TICKS;
 
+static constexpr uint32_t GENERATION_GATE_REASON_NONE = 0U;
+static constexpr uint32_t GENERATION_GATE_REASON_NEVER = 1U;
+static constexpr uint32_t GENERATION_GATE_REASON_RESET = 2U;
+static constexpr uint32_t GENERATION_GATE_REASON_REJECT_BEFORE_TARGET = 3U;
+static constexpr uint32_t GENERATION_GATE_REASON_REJECT_FAR_LATE = 4U;
+static constexpr uint32_t GENERATION_GATE_REASON_ACCEPT_EQUALS_TARGET = 5U;
+static constexpr uint32_t GENERATION_GATE_REASON_ACCEPT_SLIGHTLY_LATE = 6U;
+static constexpr uint32_t GENERATION_GATE_REASON_ACCEPT_LATE_OR_MISSED_TOOTH = 7U;
+
 struct generation_gate_lane_t {
   uint32_t generation_gate_observe_count = 0;
   uint32_t generation_gate_accept_count = 0;
@@ -2912,7 +2934,8 @@ struct generation_gate_lane_t {
   uint32_t generation_gate_last_far_late_tick_mod = 0;
   bool     generation_gate_last_far_late_one_second_due = false;
   bool     generation_gate_last_far_late_smartzero = false;
-  const char* generation_gate_last_far_late_reason = "none";
+  bool     generation_gate_last_far_late_rejected = false;
+  uint32_t generation_gate_last_far_late_reason_id = GENERATION_GATE_REASON_NONE;
 
   bool     generation_gate_last_accepted = false;
   uint32_t generation_gate_last_resolved_counter32 = 0;
@@ -2929,7 +2952,7 @@ struct generation_gate_lane_t {
   uint32_t generation_gate_last_tick_mod = 0;
   bool     generation_gate_last_one_second_due = false;
   bool     generation_gate_last_smartzero = false;
-  const char* generation_gate_last_reason = "never";
+  uint32_t generation_gate_last_reason_id = GENERATION_GATE_REASON_NEVER;
 
   bool     generation_gate_last_reject_valid = false;
   uint32_t generation_gate_last_reject_resolved_counter32 = 0;
@@ -2946,7 +2969,7 @@ struct generation_gate_lane_t {
   uint32_t generation_gate_last_reject_tick_mod = 0;
   bool     generation_gate_last_reject_one_second_due = false;
   bool     generation_gate_last_reject_smartzero = false;
-  const char* generation_gate_last_reject_reason = "none";
+  uint32_t generation_gate_last_reject_reason_id = GENERATION_GATE_REASON_NONE;
 
   // Feature-readiness custody lock.  Startup/pre-grid rejects are allowed to
   // remain prelock evidence.  Once a lane has produced a sustained streak of
@@ -2992,9 +3015,9 @@ static bool interrupt_feature_qtimer_counter_custody_generation_anomaly(void) {
 
 static void generation_gate_reset_lane(generation_gate_lane_t& s) {
   s = generation_gate_lane_t{};
-  s.generation_gate_last_reason = "reset";
-  s.generation_gate_last_reject_reason = "none";
-  s.generation_gate_last_far_late_reason = "none";
+  s.generation_gate_last_reason_id = GENERATION_GATE_REASON_RESET;
+  s.generation_gate_last_reject_reason_id = GENERATION_GATE_REASON_NONE;
+  s.generation_gate_last_far_late_reason_id = GENERATION_GATE_REASON_NONE;
 }
 
 static void generation_gate_reset_all(void) {
@@ -3003,22 +3026,43 @@ static void generation_gate_reset_all(void) {
   generation_gate_reset_lane(g_generation_gate_ocxo2);
 }
 
-static const char* generation_gate_reason(int32_t resolved_minus_target_ticks,
+static uint32_t generation_gate_reason_id(int32_t resolved_minus_target_ticks,
                                           bool far_late_rejected) {
   if (resolved_minus_target_ticks < 0) {
-    return "reject_resolved_counter32_before_target32";
+    return GENERATION_GATE_REASON_REJECT_BEFORE_TARGET;
   }
   if (far_late_rejected) {
-    return "reject_resolved_counter32_far_late";
+    return GENERATION_GATE_REASON_REJECT_FAR_LATE;
   }
   if (resolved_minus_target_ticks == 0) {
-    return "accept_resolved_counter32_equals_target32";
+    return GENERATION_GATE_REASON_ACCEPT_EQUALS_TARGET;
   }
   if ((uint32_t)resolved_minus_target_ticks <=
       GENERATION_GATE_LATE_ACCEPT_WARN_TICKS) {
-    return "accept_resolved_counter32_slightly_late";
+    return GENERATION_GATE_REASON_ACCEPT_SLIGHTLY_LATE;
   }
-  return "accept_resolved_counter32_late_or_missed_tooth";
+  return GENERATION_GATE_REASON_ACCEPT_LATE_OR_MISSED_TOOTH;
+}
+
+static const char* generation_gate_reason_name(uint32_t reason) {
+  switch (reason) {
+    case GENERATION_GATE_REASON_NEVER:
+      return "never";
+    case GENERATION_GATE_REASON_RESET:
+      return "reset";
+    case GENERATION_GATE_REASON_REJECT_BEFORE_TARGET:
+      return "reject_resolved_counter32_before_target32";
+    case GENERATION_GATE_REASON_REJECT_FAR_LATE:
+      return "reject_resolved_counter32_far_late";
+    case GENERATION_GATE_REASON_ACCEPT_EQUALS_TARGET:
+      return "accept_resolved_counter32_equals_target32";
+    case GENERATION_GATE_REASON_ACCEPT_SLIGHTLY_LATE:
+      return "accept_resolved_counter32_slightly_late";
+    case GENERATION_GATE_REASON_ACCEPT_LATE_OR_MISSED_TOOTH:
+      return "accept_resolved_counter32_late_or_missed_tooth";
+    default:
+      return "none";
+  }
 }
 
 static bool generation_gate_record(
@@ -3049,7 +3093,7 @@ static bool generation_gate_record(
       GENERATION_GATE_REJECT_FAR_LATE_ENABLED &&
       (uint32_t)delta > GENERATION_GATE_FAR_LATE_REJECT_TICKS;
   const bool accepted = delta >= 0 && !far_late_rejected;
-  const char* reason = generation_gate_reason(delta, far_late_rejected);
+  const uint32_t reason_id = generation_gate_reason_id(delta, far_late_rejected);
 
   s.generation_gate_observe_count++;
   if (far_late) {
@@ -3072,7 +3116,8 @@ static bool generation_gate_record(
     s.generation_gate_last_far_late_tick_mod = tick_mod;
     s.generation_gate_last_far_late_one_second_due = one_second_due;
     s.generation_gate_last_far_late_smartzero = smartzero;
-    s.generation_gate_last_far_late_reason = reason;
+    s.generation_gate_last_far_late_rejected = far_late_rejected;
+    s.generation_gate_last_far_late_reason_id = reason_id;
   }
 
   const bool feature_was_locked = s.feature_custody_locked;
@@ -3123,7 +3168,7 @@ static bool generation_gate_record(
   s.generation_gate_last_tick_mod = tick_mod;
   s.generation_gate_last_one_second_due = one_second_due;
   s.generation_gate_last_smartzero = smartzero;
-  s.generation_gate_last_reason = reason;
+  s.generation_gate_last_reason_id = reason_id;
 
   if (!accepted) {
     s.generation_gate_last_reject_valid = true;
@@ -3141,7 +3186,7 @@ static bool generation_gate_record(
     s.generation_gate_last_reject_tick_mod = tick_mod;
     s.generation_gate_last_reject_one_second_due = one_second_due;
     s.generation_gate_last_reject_smartzero = smartzero;
-    s.generation_gate_last_reject_reason = reason;
+    s.generation_gate_last_reject_reason_id = reason_id;
   }
 
   interrupt_feature_update_qtimer_counter_custody();
@@ -11075,11 +11120,8 @@ static void ocxo_cadence_capture_priority0(ocxo_runtime_context_t& ctx,
     }
 
     const bool far_late_rejected =
-        generation_gate_lane.generation_gate_last_delta_ticks >
-            (int32_t)GENERATION_GATE_FAR_LATE_REJECT_TICKS &&
-        generation_gate_lane.generation_gate_last_reason &&
-        strcmp(generation_gate_lane.generation_gate_last_reason,
-               "reject_resolved_counter32_far_late") == 0;
+        generation_gate_lane.generation_gate_last_reason_id ==
+            GENERATION_GATE_REASON_REJECT_FAR_LATE;
 
     if (far_late_rejected && keep_running) {
       // A far-late tooth is not accepted as a custody sample, but leaving the
@@ -12845,7 +12887,10 @@ static FLASHMEM void add_generation_gate_lane(Payload& p,
 
   add_bool("generation_gate_last_far_late_valid", s.generation_gate_last_far_late_valid);
   add_bool("generation_gate_last_far_late_accepted", s.generation_gate_last_far_late_accepted);
-  add_str("generation_gate_last_far_late_reason", s.generation_gate_last_far_late_reason);
+  add_bool("generation_gate_last_far_late_rejected", s.generation_gate_last_far_late_rejected);
+  add_u32("generation_gate_last_far_late_reason_id", s.generation_gate_last_far_late_reason_id);
+  add_str("generation_gate_last_far_late_reason",
+          generation_gate_reason_name(s.generation_gate_last_far_late_reason_id));
   add_i32("generation_gate_last_far_late_delta_ticks", s.generation_gate_last_far_late_delta_ticks);
   add_u32("generation_gate_last_far_late_resolved_counter32", s.generation_gate_last_far_late_resolved_counter32);
   add_u32("generation_gate_last_far_late_target_counter32", s.generation_gate_last_far_late_target_counter32);
@@ -12860,7 +12905,9 @@ static FLASHMEM void add_generation_gate_lane(Payload& p,
   add_bool("generation_gate_last_far_late_one_second_due", s.generation_gate_last_far_late_one_second_due);
 
   add_bool("generation_gate_last_accepted", s.generation_gate_last_accepted);
-  add_str("generation_gate_last_reason", s.generation_gate_last_reason);
+  add_u32("generation_gate_last_reason_id", s.generation_gate_last_reason_id);
+  add_str("generation_gate_last_reason",
+          generation_gate_reason_name(s.generation_gate_last_reason_id));
   add_i32("generation_gate_last_delta_ticks", s.generation_gate_last_delta_ticks);
   add_u32("generation_gate_last_resolved_counter32", s.generation_gate_last_resolved_counter32);
   add_u32("generation_gate_last_target_counter32", s.generation_gate_last_target_counter32);
@@ -12875,7 +12922,9 @@ static FLASHMEM void add_generation_gate_lane(Payload& p,
   add_bool("generation_gate_last_one_second_due", s.generation_gate_last_one_second_due);
 
   add_bool("generation_gate_last_reject_valid", s.generation_gate_last_reject_valid);
-  add_str("generation_gate_last_reject_reason", s.generation_gate_last_reject_reason);
+  add_u32("generation_gate_last_reject_reason_id", s.generation_gate_last_reject_reason_id);
+  add_str("generation_gate_last_reject_reason",
+          generation_gate_reason_name(s.generation_gate_last_reject_reason_id));
   add_i32("generation_gate_last_reject_delta_ticks", s.generation_gate_last_reject_delta_ticks);
   add_u32("generation_gate_last_reject_resolved_counter32", s.generation_gate_last_reject_resolved_counter32);
   add_u32("generation_gate_last_reject_target_counter32", s.generation_gate_last_reject_target_counter32);
@@ -12904,17 +12953,17 @@ static FLASHMEM void add_ocxo_lean_lane(Payload& p,
       ctx.rt_slot ? *ctx.rt_slot : nullptr;
   const char* requested_section = (section && *section) ? section : "summary";
 
-  const bool want_summary = !strcasecmp(requested_section, "summary") ||
-                            !strcasecmp(requested_section, "lean");
-  const bool want_clock = !strcasecmp(requested_section, "clock");
-  const bool want_gate = !strcasecmp(requested_section, "gate") ||
-                         !strcasecmp(requested_section, "generation") ||
-                         !strcasecmp(requested_section, "generation_gate");
-  const bool want_service = !strcasecmp(requested_section, "service");
-  const bool want_yardstick = !strcasecmp(requested_section, "yardstick") ||
-                              !strcasecmp(requested_section, "zero");
-  const bool want_floorline = !strcasecmp(requested_section, "floorline") ||
-                              !strcasecmp(requested_section, "lower_envelope");
+  const bool want_summary = interrupt_cstr_equal_ci(requested_section, "summary") ||
+                            interrupt_cstr_equal_ci(requested_section, "lean");
+  const bool want_clock = interrupt_cstr_equal_ci(requested_section, "clock");
+  const bool want_gate = interrupt_cstr_equal_ci(requested_section, "gate") ||
+                         interrupt_cstr_equal_ci(requested_section, "generation") ||
+                         interrupt_cstr_equal_ci(requested_section, "generation_gate");
+  const bool want_service = interrupt_cstr_equal_ci(requested_section, "service");
+  const bool want_yardstick = interrupt_cstr_equal_ci(requested_section, "yardstick") ||
+                              interrupt_cstr_equal_ci(requested_section, "zero");
+  const bool want_floorline = interrupt_cstr_equal_ci(requested_section, "floorline") ||
+                              interrupt_cstr_equal_ci(requested_section, "lower_envelope");
 
   char key[112];
   auto add_bool = [&](const char* suffix, bool value) {
@@ -13857,7 +13906,7 @@ static FLASHMEM Payload cmd_report_lane(const Payload& args) {
   p.add("report", "INTERRUPT_LANE");
   p.add("lane", lane ? lane : "");
   if (!lane || !*lane) { p.add("error", "missing lane parameter"); return p; }
-  if (!strcasecmp(lane, "VCLOCK") || !strcasecmp(lane, "VCLK")) {
+  if (interrupt_cstr_equal_ci(lane, "VCLOCK") || interrupt_cstr_equal_ci(lane, "VCLK")) {
     add_runtime_summary(p, "vclock", g_rt_vclock, g_vclock_lane.irq_count, g_rt_vclock ? g_rt_vclock->event_count : 0U);
     p.add("logical_count32", g_vclock_lane.logical_count32_at_last_second);
     p.add("tick_mod_1000", g_vclock_lane.tick_mod_1000);
@@ -13868,8 +13917,8 @@ static FLASHMEM Payload cmd_report_lane(const Payload& args) {
   }
   const char* section = args.getString("section");
   if (!section || !*section) section = args.getString("detail");
-  if (!strcasecmp(lane, "OCXO1") || !strcasecmp(lane, "O1")) { add_ocxo_lean_lane(p, "ocxo1", g_ocxo1_ctx, section); return p; }
-  if (!strcasecmp(lane, "OCXO2") || !strcasecmp(lane, "O2")) { add_ocxo_lean_lane(p, "ocxo2", g_ocxo2_ctx, section); return p; }
+  if (interrupt_cstr_equal_ci(lane, "OCXO1") || interrupt_cstr_equal_ci(lane, "O1")) { add_ocxo_lean_lane(p, "ocxo1", g_ocxo1_ctx, section); return p; }
+  if (interrupt_cstr_equal_ci(lane, "OCXO2") || interrupt_cstr_equal_ci(lane, "O2")) { add_ocxo_lean_lane(p, "ocxo2", g_ocxo2_ctx, section); return p; }
   p.add("error", "unknown lane");
   return p;
 }

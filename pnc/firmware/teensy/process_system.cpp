@@ -28,7 +28,6 @@
 #include "transport.h"   // <-- NEW (for transport_get_info)
 
 #include <string.h>
-#include <strings.h>
 #include <CrashReport.h>
 
 static constexpr uint64_t FLASH_DELAY_NS = 5000000000ULL;  // 5 seconds
@@ -96,7 +95,37 @@ struct system_feature_slot_t {
   system_feature_status_t status = system_feature_status_t::INITIALIZING;
 };
 
-static system_feature_slot_t g_system_features[SYSTEM_FEATURE_MAX_FEATURES] = {};
+static system_feature_slot_t g_system_features[SYSTEM_FEATURE_MAX_FEATURES] DMAMEM = {};
+
+static void system_feature_registry_reset(void) {
+  for (size_t i = 0; i < SYSTEM_FEATURE_MAX_FEATURES; i++) {
+    g_system_features[i] = system_feature_slot_t{};
+  }
+}
+
+static char system_ascii_fold(char c) {
+  return (c >= 'a' && c <= 'z') ? (char)(c - ('a' - 'A')) : c;
+}
+
+static bool system_cstr_equal(const char* a, const char* b) {
+  if (!a || !b) return false;
+  while (*a && *b) {
+    if (*a != *b) return false;
+    ++a;
+    ++b;
+  }
+  return *a == *b;
+}
+
+static bool system_cstr_equal_ci(const char* a, const char* b) {
+  if (!a || !b) return false;
+  while (*a && *b) {
+    if (system_ascii_fold(*a) != system_ascii_fold(*b)) return false;
+    ++a;
+    ++b;
+  }
+  return *a == *b;
+}
 
 const char* system_feature_status_str(system_feature_status_t status) {
   switch (status) {
@@ -112,19 +141,19 @@ bool system_feature_status_parse(const char* status,
                                  system_feature_status_t* out) {
   if (!status || !*status || !out) return false;
 
-  if (strcasecmp(status, "NOMINAL") == 0) {
+  if (system_cstr_equal_ci(status, "NOMINAL")) {
     *out = system_feature_status_t::NOMINAL;
     return true;
   }
-  if (strcasecmp(status, "INITIALIZING") == 0) {
+  if (system_cstr_equal_ci(status, "INITIALIZING")) {
     *out = system_feature_status_t::INITIALIZING;
     return true;
   }
-  if (strcasecmp(status, "HOLD") == 0) {
+  if (system_cstr_equal_ci(status, "HOLD")) {
     *out = system_feature_status_t::HOLD;
     return true;
   }
-  if (strcasecmp(status, "ANOMALY") == 0 || strcasecmp(status, "DOWN") == 0) {
+  if (system_cstr_equal_ci(status, "ANOMALY") || system_cstr_equal_ci(status, "DOWN")) {
     *out = system_feature_status_t::ANOMALY;
     return true;
   }
@@ -185,8 +214,8 @@ static int system_feature_find(const char* subsystem,
 
   for (size_t i = 0; i < SYSTEM_FEATURE_MAX_FEATURES; i++) {
     if (!g_system_features[i].used) continue;
-    if (strcmp(g_system_features[i].subsystem, subsystem) != 0) continue;
-    if (strcmp(g_system_features[i].feature, feature) != 0) continue;
+    if (!system_cstr_equal(g_system_features[i].subsystem, subsystem)) continue;
+    if (!system_cstr_equal(g_system_features[i].feature, feature)) continue;
     return (int)i;
   }
   return -1;
@@ -261,7 +290,9 @@ const char* system_feature_get_status(const char* subsystem,
 
 bool system_feature_is_nominal(const char* subsystem,
                                const char* feature) {
-  return strcmp(system_feature_get_status(subsystem, feature), "NOMINAL") == 0;
+  const int idx = system_feature_find(subsystem, feature);
+  return idx >= 0 &&
+         g_system_features[idx].status == system_feature_status_t::NOMINAL;
 }
 
 static Payload system_features_tree_payload(void) {
@@ -275,7 +306,7 @@ static Payload system_features_tree_payload(void) {
     bool already_emitted = false;
     for (size_t j = 0; j < i; j++) {
       if (!g_system_features[j].used) continue;
-      if (strcmp(g_system_features[j].subsystem, subsystem) == 0) {
+      if (system_cstr_equal(g_system_features[j].subsystem, subsystem)) {
         already_emitted = true;
         break;
       }
@@ -285,7 +316,7 @@ static Payload system_features_tree_payload(void) {
     Payload subsystem_payload;
     for (size_t k = 0; k < SYSTEM_FEATURE_MAX_FEATURES; k++) {
       if (!g_system_features[k].used) continue;
-      if (strcmp(g_system_features[k].subsystem, subsystem) != 0) continue;
+      if (!system_cstr_equal(g_system_features[k].subsystem, subsystem)) continue;
 
       subsystem_payload.add(
         g_system_features[k].feature,
@@ -325,7 +356,8 @@ static bool g_system_crash_report_captured = false;
 static bool g_system_crash_report_core_fault_present = false;
 static bool g_system_crash_report_truncated = false;
 static uint32_t g_system_crash_report_bytes = 0;
-static char g_system_crash_report_text[SYSTEM_CRASH_REPORT_TEXT_MAX] = {0};
+static char g_system_crash_report_text[SYSTEM_CRASH_REPORT_TEXT_MAX] DMAMEM = {0};
+static char g_system_debug_buffer[1024] DMAMEM = {0};
 
 class system_crash_buffer_print_t : public Print {
  public:
@@ -1166,12 +1198,11 @@ static Payload cmd_debug(const Payload& args) {
     return resp;
   }
 
-  char buf[length];
-  memset(buf, 'A', sizeof(buf));
+  memset(g_system_debug_buffer, 'A', length);
   debug_log(
     "system.debug",
-    reinterpret_cast<const uint8_t*>(buf),
-    sizeof(buf)
+    reinterpret_cast<const uint8_t*>(g_system_debug_buffer),
+    length
   );
   return ok_payload();
 }
@@ -1214,6 +1245,8 @@ static const process_vtable_t SYSTEM_PROCESS = {
 };
 
 void process_system_register(void) {
+  system_feature_registry_reset();
+
   system_feature_set("SYSTEM", "FEATURE_STATUS",
                      system_feature_status_t::NOMINAL,
                      "Teensy SYSTEM feature registry online");
