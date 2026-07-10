@@ -38,14 +38,17 @@
  *
  * Semantics:
  *   • SYSTEM owns no hardware directly
- *   • SYSTEM performs no implicit control actions
- *   • SYSTEM aggregates nothing and infers nothing
- *   • SYSTEM reports facts only
+ *   • SYSTEM normally reports facts without implicit control actions
+ *   • SYSTEM owns bounded always-on integrity watchdog scheduling for
+ *     system-wide conditions that invalidate all subsystem evidence
+ *   • Low-level authorities render watchdog verdicts; SYSTEM emits the
+ *     resulting semantic anomaly event without reinterpreting their rules
  *
  * Observation:
- *   • REPORT returns a stateless, read-only snapshot of current system state
- *   • REPORT has no side effects
- *   • No timers, background polling, or aggregation logic exists here
+ *   • REPORT returns a read-only snapshot of current system state
+ *   • REPORT has no control side effects
+ *   • A bounded recurring TimePop audits Teensy memory/Payload integrity and
+ *     emits one WATCHDOG_ANOMALY per boot if the low-level court latches failure
  *
  * Commands:
  *   • REPORT — return authoritative system snapshot

@@ -107,6 +107,102 @@ struct memory_info_t {
     bool     heap_growing;            // true if heap_arena > previous snapshot (possible leak)
 };
 
+
+// ============================================================================
+// Memory health court — always-on rule-based verdict
+// ============================================================================
+//
+// memory_info_t is the raw observation surface.  memory_health_t is the compact
+// policy verdict consumed by SYSTEM's recurring watchdog.  The court also
+// incorporates Payload allocator/object-integrity instrumentation because those
+// failures are direct evidence that the memory-backed execution environment is
+// no longer trustworthy.
+//
+// The health verdict is sticky for the life of the boot.  Once a hard anomaly
+// is observed, later audits remain ANOMALY even if the immediate condition is no
+// longer visible.  SYSTEM separately owns the one-event-per-boot emission latch.
+
+enum class memory_health_status_t : uint8_t {
+    UNASSESSED = 0,
+    NOMINAL    = 1,
+    ANOMALY    = 2,
+};
+
+enum class memory_health_reason_t : uint8_t {
+    NONE                         = 0,
+    NOT_INITIALIZED              = 1,
+    DTCM_MAP_INVALID             = 2,
+    STACK_PAINT_UNAVAILABLE      = 3,
+    STACK_PAINT_OVERRUN          = 4,
+    STACK_RUNWAY_CRITICAL        = 5,
+    HEAP_MAP_INVALID             = 6,
+    HEAP_FREE_CRITICAL           = 7,
+    PAYLOAD_SELF_OK_FAIL         = 8,
+    PAYLOAD_INTEGRITY_FAIL       = 9,
+    PAYLOAD_STRING_POINTER_FAULT = 10,
+    PAYLOAD_INVALID_KIND         = 11,
+    PAYLOAD_ENTRY_ALLOC_FAIL     = 12,
+    PAYLOAD_ARENA_ALLOC_FAIL     = 13,
+    PAYLOAD_ENTRY_OVERFLOW       = 14,
+    PAYLOAD_SERIALIZE_OVERFLOW   = 15,
+    PAYLOAD_TO_JSON_FAIL         = 16,
+    PAYLOAD_LIFETIME_MISMATCH    = 17,
+};
+
+struct memory_health_t {
+    memory_health_status_t status;
+    memory_health_reason_t primary_reason;
+    uint32_t active_reason_mask;
+    uint32_t latched_reason_mask;
+    bool     latched;
+
+    uint32_t audit_count;
+    uint32_t anomaly_audit_count;
+    uint32_t first_anomaly_audit;
+    uint32_t last_anomaly_audit;
+    uint32_t heap_free_critical_bytes;
+
+    // Compact current evidence.  Full raw detail remains available through
+    // SYSTEM.MEMORY_INFO and SYSTEM.PAYLOAD_INFO.
+    bool     memory_initialized;
+    uint32_t dtcm_total;
+    uint32_t dtcm_static;
+    uint32_t dtcm_stack_avail;
+    uint32_t stack_high_water;
+    uint32_t stack_free_high_water;
+    bool     stack_paint_compiled_enabled;
+    bool     stack_paint_enabled;
+    bool     stack_paint_overrun;
+    bool     stack_collision_risk;
+
+    uint32_t heap_total;
+    uint32_t heap_arena;
+    uint32_t heap_used;
+    uint32_t heap_free_total;
+    uint32_t heap_arena_high_water;
+
+    uint32_t payload_instances_constructed;
+    uint32_t payload_instances_destroyed;
+    uint32_t payload_alive_now;
+    bool     payload_lifetime_mismatch;
+    uint32_t payload_entry_alloc_fail;
+    uint32_t payload_arena_alloc_fail;
+    uint32_t payload_entry_overflow;
+    uint32_t payload_serialize_overflow;
+    uint32_t payload_to_json_fail;
+    uint32_t payload_integrity_fail;
+    uint32_t payload_invalid_kind;
+    uint32_t payload_string_pointer_fault;
+    uint32_t payload_self_ok_fail;
+    uint32_t payload_entry_high_water;
+    uint32_t payload_max_entries;
+    uint32_t payload_arena_high_water;
+    uint32_t payload_arena_max;
+    uint32_t payload_last_error_code;
+    uint32_t payload_last_string_pointer_fault_reason;
+    uint32_t payload_last_self_ok_fail_reason;
+};
+
 // ============================================================================
 // API
 // ============================================================================
@@ -119,3 +215,13 @@ void memory_info_init();
 // Populate a snapshot. Safe to call from any context.
 // Does not allocate. Does not emit. Read-only.
 void memory_info_get(memory_info_t* out);
+
+// Run one complete memory/Payload health court.  Does not allocate or emit.
+// The returned ANOMALY verdict is sticky for the life of the boot.
+void memory_info_audit(memory_health_t* out);
+
+// Return the most recent court verdict without running a new audit.
+void memory_info_get_health(memory_health_t* out);
+
+const char* memory_health_status_name(memory_health_status_t status);
+const char* memory_health_reason_name(memory_health_reason_t reason);

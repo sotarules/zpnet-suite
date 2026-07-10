@@ -7,9 +7,9 @@
 // SYSTEM is not a lifecycle-managed process.
 // It cannot start or stop from within itself.
 //
-// It exposes authoritative, read-only system facts and
-// provides explicit terminal transitions (shutdown, bootloader)
-// that represent irreversible boundary crossings.
+// It exposes authoritative system facts, owns bounded always-on integrity
+// watchdog scheduling, and provides explicit terminal transitions (shutdown,
+// bootloader) that represent irreversible boundary crossings.
 //
 // =============================================================
 
@@ -31,6 +31,7 @@
 #include <CrashReport.h>
 
 static constexpr uint64_t FLASH_DELAY_NS = 5000000000ULL;  // 5 seconds
+static constexpr uint64_t SYSTEM_MEMORY_WATCHDOG_PERIOD_NS = 5000000000ULL;
 
 // --------------------------------------------------------------
 // Forward declarations (terminal paths)
@@ -42,6 +43,7 @@ extern "C" void enter_bootloader_cleanly(void);
 
 static FLASHMEM Payload system_features_tree_payload(void);
 static void system_feature_schedule_fragment_publish(void);
+static void system_memory_watchdog_arm(void);
 
 // --------------------------------------------------------------
 // Internal terminal state
@@ -52,6 +54,142 @@ static bool system_bootloader = false;
 static bool system_cpu_window_initialized = false;
 static uint64_t system_cpu_window_last_wall_cycles = 0;
 static uint64_t system_cpu_window_last_idle_cycles = 0;
+
+// --------------------------------------------------------------
+// Always-on memory integrity watchdog
+// --------------------------------------------------------------
+// memory_info owns observation, rule evaluation, and the sticky health verdict.
+// SYSTEM owns only TimePop scheduling and the one WATCHDOG_ANOMALY emission.
+
+static memory_health_t g_system_memory_watchdog_health DMAMEM = {};
+static timepop_handle_t g_system_memory_watchdog_handle = TIMEPOP_INVALID_HANDLE;
+static bool     g_system_memory_watchdog_armed = false;
+static bool     g_system_memory_watchdog_event_emitted = false;
+static uint32_t g_system_memory_watchdog_arm_attempts = 0;
+static uint32_t g_system_memory_watchdog_arm_failures = 0;
+static uint32_t g_system_memory_watchdog_callback_count = 0;
+static uint32_t g_system_memory_watchdog_event_count = 0;
+static int64_t  g_system_memory_watchdog_last_fire_gnss_ns = 0;
+static uint32_t g_system_memory_watchdog_last_fire_dwt = 0;
+
+// ============================================================================
+// Always-on memory integrity watchdog
+// ============================================================================
+
+static FLASHMEM void system_memory_watchdog_emit(void) {
+  // Stay inside Payload's eight inline entries.  If the anomaly itself is an
+  // allocator failure, the watchdog transcript must not require a heap-backed
+  // entry table merely to announce it.
+  Payload ev;
+  ev.add("schema", "SYSTEM_MEMORY_WATCHDOG_V1");
+  ev.add("source", "SYSTEM_MEMORY_WATCHDOG");
+  ev.add("reason", memory_health_reason_name(
+      g_system_memory_watchdog_health.primary_reason));
+  ev.add("reason_id", (uint32_t)g_system_memory_watchdog_health.primary_reason);
+  ev.add("audit_count", g_system_memory_watchdog_health.audit_count);
+  ev.add("reason_mask", g_system_memory_watchdog_health.latched_reason_mask);
+
+  // Two reason-specific evidence fields keep the event compact while making
+  // the first failure intelligible.  Full current state remains available
+  // through SYSTEM.MEMORY_INFO and SYSTEM.PAYLOAD_INFO.
+  switch (g_system_memory_watchdog_health.primary_reason) {
+    case memory_health_reason_t::STACK_PAINT_UNAVAILABLE:
+      ev.add("paint_compiled",
+             g_system_memory_watchdog_health.stack_paint_compiled_enabled);
+      ev.add("paint_enabled",
+             g_system_memory_watchdog_health.stack_paint_enabled);
+      break;
+
+    case memory_health_reason_t::STACK_PAINT_OVERRUN:
+    case memory_health_reason_t::STACK_RUNWAY_CRITICAL:
+      ev.add("stack_free_high_water",
+             g_system_memory_watchdog_health.stack_free_high_water);
+      ev.add("stack_paint_overrun",
+             g_system_memory_watchdog_health.stack_paint_overrun);
+      break;
+
+    case memory_health_reason_t::HEAP_MAP_INVALID:
+    case memory_health_reason_t::HEAP_FREE_CRITICAL:
+      ev.add("heap_free_total",
+             g_system_memory_watchdog_health.heap_free_total);
+      ev.add("heap_free_critical",
+             g_system_memory_watchdog_health.heap_free_critical_bytes);
+      break;
+
+    case memory_health_reason_t::PAYLOAD_SELF_OK_FAIL:
+      ev.add("payload_self_ok_fail",
+             g_system_memory_watchdog_health.payload_self_ok_fail);
+      ev.add("payload_self_reason",
+             g_system_memory_watchdog_health.payload_last_self_ok_fail_reason);
+      break;
+
+    case memory_health_reason_t::PAYLOAD_STRING_POINTER_FAULT:
+      ev.add("payload_pointer_fault",
+             g_system_memory_watchdog_health.payload_string_pointer_fault);
+      ev.add("payload_pointer_reason",
+             g_system_memory_watchdog_health.payload_last_string_pointer_fault_reason);
+      break;
+
+    case memory_health_reason_t::PAYLOAD_LIFETIME_MISMATCH:
+      ev.add("payload_constructed",
+             g_system_memory_watchdog_health.payload_instances_constructed);
+      ev.add("payload_destroyed",
+             g_system_memory_watchdog_health.payload_instances_destroyed);
+      break;
+
+    default:
+      ev.add("payload_last_error",
+             g_system_memory_watchdog_health.payload_last_error_code);
+      ev.add("heap_free_total",
+             g_system_memory_watchdog_health.heap_free_total);
+      break;
+  }
+
+  enqueueEvent("WATCHDOG_ANOMALY", ev);
+  g_system_memory_watchdog_event_count++;
+}
+
+static FLASHMEM void system_memory_watchdog_cb(timepop_ctx_t* ctx,
+                                               timepop_diag_t*,
+                                               void*) {
+  g_system_memory_watchdog_callback_count++;
+  if (ctx) {
+    g_system_memory_watchdog_last_fire_gnss_ns = ctx->fire_gnss_ns;
+    g_system_memory_watchdog_last_fire_dwt = ctx->fire_dwt_cyccnt;
+  }
+
+  memory_info_audit(&g_system_memory_watchdog_health);
+
+  if (g_system_memory_watchdog_health.status !=
+          memory_health_status_t::ANOMALY ||
+      g_system_memory_watchdog_event_emitted) {
+    return;
+  }
+
+  // Latch before constructing the event so a Payload failure during the
+  // best-effort anomaly transcript cannot create a recursive event storm.
+  g_system_memory_watchdog_event_emitted = true;
+  system_memory_watchdog_emit();
+}
+
+static void system_memory_watchdog_arm(void) {
+  if (g_system_memory_watchdog_armed) return;
+
+  g_system_memory_watchdog_arm_attempts++;
+  g_system_memory_watchdog_handle = timepop_arm(
+      SYSTEM_MEMORY_WATCHDOG_PERIOD_NS,
+      true,
+      system_memory_watchdog_cb,
+      nullptr,
+      "SYSTEM_MEMORY_WATCHDOG");
+
+  if (g_system_memory_watchdog_handle == TIMEPOP_INVALID_HANDLE) {
+    g_system_memory_watchdog_arm_failures++;
+    return;
+  }
+
+  g_system_memory_watchdog_armed = true;
+}
 
 // --------------------------------------------------------------
 // FEATURE_STATUS_FRAGMENT publication custody
@@ -589,6 +727,19 @@ static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
   p.add("feature_status_fragment_service_arm_count", g_system_feature_fragment_service_arm_count);
   p.add("feature_status_fragment_service_arm_failures", g_system_feature_fragment_service_arm_failures);
 
+  p.add("memory_watchdog_armed", g_system_memory_watchdog_armed);
+  p.add("memory_watchdog_handle", g_system_memory_watchdog_handle);
+  p.add("memory_watchdog_period_ns", SYSTEM_MEMORY_WATCHDOG_PERIOD_NS);
+  p.add("memory_watchdog_arm_attempts", g_system_memory_watchdog_arm_attempts);
+  p.add("memory_watchdog_arm_failures", g_system_memory_watchdog_arm_failures);
+  p.add("memory_watchdog_callback_count", g_system_memory_watchdog_callback_count);
+  p.add("memory_watchdog_event_emitted", g_system_memory_watchdog_event_emitted);
+  p.add("memory_watchdog_event_count", g_system_memory_watchdog_event_count);
+  p.add("memory_health_status",
+        memory_health_status_name(g_system_memory_watchdog_health.status));
+  p.add("memory_health_reason",
+        memory_health_reason_name(g_system_memory_watchdog_health.primary_reason));
+
   // Legacy accounted callback-busy diagnostics.
   p.add("cpu_accounted_busy_pct", cpu_usage_get_percent());
   p.add("cpu_busy_cycles", cpu_usage_get_busy_cycles());
@@ -1007,7 +1158,9 @@ static memory_info_t g_system_memory_info_scratch DMAMEM = {};
 static FLASHMEM Payload cmd_memory_info(const Payload& /*args*/) {
 
     memory_info_get(&g_system_memory_info_scratch);
+    memory_info_get_health(&g_system_memory_watchdog_health);
     const memory_info_t& info = g_system_memory_info_scratch;
+    const memory_health_t& health = g_system_memory_watchdog_health;
 
     Payload p;
 
@@ -1073,6 +1226,85 @@ static FLASHMEM Payload cmd_memory_info(const Payload& /*args*/) {
 
     p.add("heap_fragmentation_pct", info.heap_fragmentation_pct);
     p.add("heap_growing",           info.heap_growing);
+
+    // ==========================================================
+    // Always-on memory watchdog validation surface
+    // ==========================================================
+
+    p.add("memory_watchdog_armed", g_system_memory_watchdog_armed);
+    p.add("memory_watchdog_handle", g_system_memory_watchdog_handle);
+    p.add("memory_watchdog_period_ns", SYSTEM_MEMORY_WATCHDOG_PERIOD_NS);
+    p.add("memory_watchdog_arm_attempts", g_system_memory_watchdog_arm_attempts);
+    p.add("memory_watchdog_arm_failures", g_system_memory_watchdog_arm_failures);
+    p.add("memory_watchdog_callback_count", g_system_memory_watchdog_callback_count);
+    p.add("memory_watchdog_event_emitted", g_system_memory_watchdog_event_emitted);
+    p.add("memory_watchdog_event_count", g_system_memory_watchdog_event_count);
+    p.add("memory_watchdog_last_fire_gnss_ns",
+          g_system_memory_watchdog_last_fire_gnss_ns);
+    p.add_fmt("memory_watchdog_last_fire_dwt", "0x%08lX",
+              (unsigned long)g_system_memory_watchdog_last_fire_dwt);
+
+    p.add("memory_health_status", memory_health_status_name(health.status));
+    p.add("memory_health_anomaly",
+          health.status == memory_health_status_t::ANOMALY);
+    p.add("memory_health_latched", health.latched);
+    p.add("memory_health_primary_reason_id", (uint32_t)health.primary_reason);
+    p.add("memory_health_primary_reason",
+          memory_health_reason_name(health.primary_reason));
+    p.add("memory_health_active_reason_mask", health.active_reason_mask);
+    p.add("memory_health_latched_reason_mask", health.latched_reason_mask);
+    p.add("memory_health_audit_count", health.audit_count);
+    p.add("memory_health_anomaly_audit_count", health.anomaly_audit_count);
+    p.add("memory_health_first_anomaly_audit", health.first_anomaly_audit);
+    p.add("memory_health_last_anomaly_audit", health.last_anomaly_audit);
+    p.add("memory_health_heap_free_critical_bytes",
+          health.heap_free_critical_bytes);
+    p.add("memory_health_last_stack_free_high_water",
+          health.stack_free_high_water);
+    p.add("memory_health_last_stack_paint_overrun",
+          health.stack_paint_overrun);
+    p.add("memory_health_last_stack_collision_risk",
+          health.stack_collision_risk);
+    p.add("memory_health_last_heap_free_total",
+          health.heap_free_total);
+
+    p.add("memory_health_payload_lifetime_mismatch",
+          health.payload_lifetime_mismatch);
+    p.add("memory_health_payload_instances_constructed",
+          health.payload_instances_constructed);
+    p.add("memory_health_payload_instances_destroyed",
+          health.payload_instances_destroyed);
+    p.add("memory_health_payload_alive_now", health.payload_alive_now);
+    p.add("memory_health_payload_entry_alloc_fail",
+          health.payload_entry_alloc_fail);
+    p.add("memory_health_payload_arena_alloc_fail",
+          health.payload_arena_alloc_fail);
+    p.add("memory_health_payload_entry_overflow",
+          health.payload_entry_overflow);
+    p.add("memory_health_payload_serialize_overflow",
+          health.payload_serialize_overflow);
+    p.add("memory_health_payload_to_json_fail",
+          health.payload_to_json_fail);
+    p.add("memory_health_payload_integrity_fail",
+          health.payload_integrity_fail);
+    p.add("memory_health_payload_invalid_kind",
+          health.payload_invalid_kind);
+    p.add("memory_health_payload_string_pointer_fault",
+          health.payload_string_pointer_fault);
+    p.add("memory_health_payload_self_ok_fail",
+          health.payload_self_ok_fail);
+    p.add("memory_health_payload_entry_high_water",
+          health.payload_entry_high_water);
+    p.add("memory_health_payload_max_entries", health.payload_max_entries);
+    p.add("memory_health_payload_arena_high_water",
+          health.payload_arena_high_water);
+    p.add("memory_health_payload_arena_max", health.payload_arena_max);
+    p.add("memory_health_payload_last_error_code",
+          health.payload_last_error_code);
+    p.add("memory_health_payload_last_string_pointer_fault_reason",
+          health.payload_last_string_pointer_fault_reason);
+    p.add("memory_health_payload_last_self_ok_fail_reason",
+          health.payload_last_self_ok_fail_reason);
 
     return p;
 }
@@ -1288,4 +1520,5 @@ void process_system_register(void) {
   process_register("SYSTEM", &SYSTEM_PROCESS);
   g_system_feature_fragment_publish_enabled = true;
   system_feature_schedule_fragment_publish();
+  system_memory_watchdog_arm();
 }
