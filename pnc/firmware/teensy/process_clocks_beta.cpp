@@ -174,6 +174,17 @@ static constexpr bool TIMEBASE_FORENSICS_MINIMAL_PAYLOAD_ENABLED = true;
 static constexpr bool TIMEBASE_FORENSICS_MICRO_RAW_CYCLES_ENABLED = true;
 static constexpr bool TIMEBASE_FORENSICS_MINIMAL_HEALTH_FIELDS_ENABLED = false;
 
+// Draconian 1 Hz TIMEBASE_FORENSICS diet.
+//
+// The companion row is allowed to be tiny: it only has to satisfy Pi-side
+// fragment/forensics pairing and keep the raw_cycles / raw_nanoseconds family
+// supplied with the per-lane DWT endpoint and interval facts they actually use.
+// Bulky courtroom transcripts and CounterLedger/PhaseLedger liveness evidence
+// stay in focused reports and the canonical TIMEBASE_FRAGMENT science spine.
+static constexpr bool TIMEBASE_FORENSICS_MICRO_AUX_FLOORLINE_FIELDS_ENABLED = false;
+static constexpr bool TIMEBASE_FORENSICS_MICRO_COURT_FIELDS_ENABLED = false;
+static constexpr bool TIMEBASE_FORENSICS_MICRO_COUNTERLEDGER_FIELDS_ENABLED = false;
+
 // The richer slim/full forensics builders remain compiled for focused future
 // experiments, but they are not used by the 1 Hz campaign stream in this step.
 static constexpr bool TIMEBASE_FORENSICS_SLIM_RAW_CYCLES_PAYLOAD_ENABLED = false;
@@ -4826,6 +4837,14 @@ static FLASHMEM void payload_add_micro_court_fields(
     const char* prefix,
     bool valid,
     const clocks_alpha_lane_forensics_t& f) {
+  if (!TIMEBASE_FORENSICS_MICRO_COURT_FIELDS_ENABLED) {
+    (void)parent;
+    (void)prefix;
+    (void)valid;
+    (void)f;
+    return;
+  }
+
   char key[96];
 
   auto add_bool = [&](const char* suffix, bool value) {
@@ -4895,6 +4914,13 @@ static FLASHMEM void payload_add_micro_counterledger_fields(
     Payload& parent,
     const char* prefix,
     const clocks_alpha_ocxo_counterledger_snapshot_t& s) {
+  if (!TIMEBASE_FORENSICS_MICRO_COUNTERLEDGER_FIELDS_ENABLED) {
+    (void)parent;
+    (void)prefix;
+    (void)s;
+    return;
+  }
+
   char key[96];
 
   auto add_bool = [&](const char* suffix, bool value) {
@@ -8931,8 +8957,11 @@ void clocks_beta_pps(void) {
         // No authority is changed here.  This is a compact telemetry tap only.
         g_timebase_forensics_micro_raw_count++;
         f.add("micro_raw_cycles", true);
-        f.add("micro_schema", "MICRO_RAW_CYCLES_V1");
-        f.add("court_schema", "DWT_PUBLICATION_COURT_V1");
+        f.add("micro_schema", "MICRO_RAW_CYCLES_V2_LEAN");
+        f.add("micro_profile", "DWT_ENDPOINTS_ONLY");
+        if (TIMEBASE_FORENSICS_MICRO_COURT_FIELDS_ENABLED) {
+          f.add("court_schema", "DWT_PUBLICATION_COURT_V1");
+        }
 
         f.add("pps_obs", g_pps_dwt_cycles_between_edges_valid
                          ? g_pps_dwt_cycles_between_edges
@@ -8974,12 +9003,14 @@ void clocks_beta_pps(void) {
         f.add("v_used", v_pub_dwt);
         f.add("v_fl_cyc", v_fl_cyc);
         f.add("v_fl_err", v_fl ? vclock_forensics.regression_inferred_minus_observed_cycles : 0);
-        f.add("v_fl_src", v_ok && vclock_forensics.dwt_interval_sample_accepted ? 1U : 0U);
-        f.add("v_fl_reason", v_ok ? vclock_forensics.dwt_interval_reject_streak : 0U);
-        f.add("v_fl_acc", v_ok ? vclock_forensics.dwt_interval_accept_count : 0U);
-        f.add("v_fl_rej", v_ok ? vclock_forensics.dwt_interval_reject_count : 0U);
-        f.add("v_fl_bkt", v_ok ? vclock_forensics.dwt_interval_resync_count : 0U);
-        f.add("v_fl_ierr", v_ok ? vclock_forensics.dwt_interval_residual_cycles : 0);
+        if (TIMEBASE_FORENSICS_MICRO_AUX_FLOORLINE_FIELDS_ENABLED) {
+          f.add("v_fl_src", v_ok && vclock_forensics.dwt_interval_sample_accepted ? 1U : 0U);
+          f.add("v_fl_reason", v_ok ? vclock_forensics.dwt_interval_reject_streak : 0U);
+          f.add("v_fl_acc", v_ok ? vclock_forensics.dwt_interval_accept_count : 0U);
+          f.add("v_fl_rej", v_ok ? vclock_forensics.dwt_interval_reject_count : 0U);
+          f.add("v_fl_bkt", v_ok ? vclock_forensics.dwt_interval_resync_count : 0U);
+          f.add("v_fl_ierr", v_ok ? vclock_forensics.dwt_interval_residual_cycles : 0);
+        }
         payload_add_micro_court_fields(f, "v", v_ok, vclock_forensics);
 
         const bool o1_ok = ocxo1_forensics_valid;
@@ -9006,16 +9037,20 @@ void clocks_beta_pps(void) {
         f.add("o1_used", o1_pub_dwt);
         f.add("o1_fl_cyc", o1_fl_cyc);
         f.add("o1_fl_err", o1_fl ? ocxo1_forensics.regression_inferred_minus_observed_cycles : 0);
-        f.add("o1_fl_src", o1_ok && ocxo1_forensics.dwt_interval_sample_accepted ? 1U : 0U);
-        f.add("o1_fl_reason", o1_ok ? ocxo1_forensics.dwt_interval_reject_streak : 0U);
-        f.add("o1_fl_acc", o1_ok ? ocxo1_forensics.dwt_interval_accept_count : 0U);
-        f.add("o1_fl_rej", o1_ok ? ocxo1_forensics.dwt_interval_reject_count : 0U);
-        f.add("o1_fl_bkt", o1_ok ? ocxo1_forensics.dwt_interval_resync_count : 0U);
-        f.add("o1_fl_ierr", o1_ok ? ocxo1_forensics.dwt_interval_residual_cycles : 0);
+        if (TIMEBASE_FORENSICS_MICRO_AUX_FLOORLINE_FIELDS_ENABLED) {
+          f.add("o1_fl_src", o1_ok && ocxo1_forensics.dwt_interval_sample_accepted ? 1U : 0U);
+          f.add("o1_fl_reason", o1_ok ? ocxo1_forensics.dwt_interval_reject_streak : 0U);
+          f.add("o1_fl_acc", o1_ok ? ocxo1_forensics.dwt_interval_accept_count : 0U);
+          f.add("o1_fl_rej", o1_ok ? ocxo1_forensics.dwt_interval_reject_count : 0U);
+          f.add("o1_fl_bkt", o1_ok ? ocxo1_forensics.dwt_interval_resync_count : 0U);
+          f.add("o1_fl_ierr", o1_ok ? ocxo1_forensics.dwt_interval_residual_cycles : 0);
+        }
         payload_add_micro_court_fields(f, "o1", o1_ok, ocxo1_forensics);
-        f.add("o1_pps_res", pps_residuals.ocxo1_valid
-                            ? pps_residuals.ocxo1_fast_residual_ns
-                            : 0LL);
+        if (TIMEBASE_FORENSICS_MICRO_AUX_FLOORLINE_FIELDS_ENABLED) {
+          f.add("o1_pps_res", pps_residuals.ocxo1_valid
+                              ? pps_residuals.ocxo1_fast_residual_ns
+                              : 0LL);
+        }
         payload_add_micro_counterledger_fields(f, "o1", ocxo1_counterledger);
 
         const bool o2_ok = ocxo2_forensics_valid;
@@ -9042,16 +9077,20 @@ void clocks_beta_pps(void) {
         f.add("o2_used", o2_pub_dwt);
         f.add("o2_fl_cyc", o2_fl_cyc);
         f.add("o2_fl_err", o2_fl ? ocxo2_forensics.regression_inferred_minus_observed_cycles : 0);
-        f.add("o2_fl_src", o2_ok && ocxo2_forensics.dwt_interval_sample_accepted ? 1U : 0U);
-        f.add("o2_fl_reason", o2_ok ? ocxo2_forensics.dwt_interval_reject_streak : 0U);
-        f.add("o2_fl_acc", o2_ok ? ocxo2_forensics.dwt_interval_accept_count : 0U);
-        f.add("o2_fl_rej", o2_ok ? ocxo2_forensics.dwt_interval_reject_count : 0U);
-        f.add("o2_fl_bkt", o2_ok ? ocxo2_forensics.dwt_interval_resync_count : 0U);
-        f.add("o2_fl_ierr", o2_ok ? ocxo2_forensics.dwt_interval_residual_cycles : 0);
+        if (TIMEBASE_FORENSICS_MICRO_AUX_FLOORLINE_FIELDS_ENABLED) {
+          f.add("o2_fl_src", o2_ok && ocxo2_forensics.dwt_interval_sample_accepted ? 1U : 0U);
+          f.add("o2_fl_reason", o2_ok ? ocxo2_forensics.dwt_interval_reject_streak : 0U);
+          f.add("o2_fl_acc", o2_ok ? ocxo2_forensics.dwt_interval_accept_count : 0U);
+          f.add("o2_fl_rej", o2_ok ? ocxo2_forensics.dwt_interval_reject_count : 0U);
+          f.add("o2_fl_bkt", o2_ok ? ocxo2_forensics.dwt_interval_resync_count : 0U);
+          f.add("o2_fl_ierr", o2_ok ? ocxo2_forensics.dwt_interval_residual_cycles : 0);
+        }
         payload_add_micro_court_fields(f, "o2", o2_ok, ocxo2_forensics);
-        f.add("o2_pps_res", pps_residuals.ocxo2_valid
-                            ? pps_residuals.ocxo2_fast_residual_ns
-                            : 0LL);
+        if (TIMEBASE_FORENSICS_MICRO_AUX_FLOORLINE_FIELDS_ENABLED) {
+          f.add("o2_pps_res", pps_residuals.ocxo2_valid
+                              ? pps_residuals.ocxo2_fast_residual_ns
+                              : 0LL);
+        }
         payload_add_micro_counterledger_fields(f, "o2", ocxo2_counterledger);
       }
     } else if (TIMEBASE_FORENSICS_SLIM_RAW_CYCLES_PAYLOAD_ENABLED) {
@@ -11260,6 +11299,12 @@ static FLASHMEM Payload cmd_report_timebase_publish(const Payload&) {
         TIMEBASE_FORENSICS_MINIMAL_PAYLOAD_ENABLED);
   p.add("forensics_micro_raw_cycles_enabled",
         TIMEBASE_FORENSICS_MICRO_RAW_CYCLES_ENABLED);
+  p.add("forensics_micro_aux_floorline_enabled",
+        TIMEBASE_FORENSICS_MICRO_AUX_FLOORLINE_FIELDS_ENABLED);
+  p.add("forensics_micro_court_enabled",
+        TIMEBASE_FORENSICS_MICRO_COURT_FIELDS_ENABLED);
+  p.add("forensics_micro_counterledger_enabled",
+        TIMEBASE_FORENSICS_MICRO_COUNTERLEDGER_FIELDS_ENABLED);
   p.add("fragment_compact_science_enabled",
         TIMEBASE_FRAGMENT_COMPACT_SCIENCE_ENABLED);
 
@@ -11396,6 +11441,12 @@ static FLASHMEM Payload cmd_report_timebase_publish_deep(const Payload&) {
   gates.add("forensics_minimal_payload_enabled", TIMEBASE_FORENSICS_MINIMAL_PAYLOAD_ENABLED);
   gates.add("forensics_micro_raw_cycles_enabled",
             TIMEBASE_FORENSICS_MICRO_RAW_CYCLES_ENABLED);
+  gates.add("forensics_micro_aux_floorline_enabled",
+            TIMEBASE_FORENSICS_MICRO_AUX_FLOORLINE_FIELDS_ENABLED);
+  gates.add("forensics_micro_court_enabled",
+            TIMEBASE_FORENSICS_MICRO_COURT_FIELDS_ENABLED);
+  gates.add("forensics_micro_counterledger_enabled",
+            TIMEBASE_FORENSICS_MICRO_COUNTERLEDGER_FIELDS_ENABLED);
   gates.add("forensics_slim_raw_cycles_payload_enabled",
             TIMEBASE_FORENSICS_SLIM_RAW_CYCLES_PAYLOAD_ENABLED);
   gates.add("forensics_floorline_payload_enabled",
@@ -11588,6 +11639,12 @@ static FLASHMEM Payload cmd_report_timebase_publish_deep(const Payload&) {
   gaps.add("forensics_minimal_payload", TIMEBASE_FORENSICS_MINIMAL_PAYLOAD_ENABLED);
   gaps.add("forensics_micro_raw_cycles",
            TIMEBASE_FORENSICS_MICRO_RAW_CYCLES_ENABLED);
+  gaps.add("forensics_micro_aux_floorline",
+           TIMEBASE_FORENSICS_MICRO_AUX_FLOORLINE_FIELDS_ENABLED);
+  gaps.add("forensics_micro_court",
+           TIMEBASE_FORENSICS_MICRO_COURT_FIELDS_ENABLED);
+  gaps.add("forensics_micro_counterledger",
+           TIMEBASE_FORENSICS_MICRO_COUNTERLEDGER_FIELDS_ENABLED);
   gaps.add("forensics_slim_raw_cycles_payload",
            TIMEBASE_FORENSICS_SLIM_RAW_CYCLES_PAYLOAD_ENABLED);
   gaps.add("forensics_floorline_payload",
