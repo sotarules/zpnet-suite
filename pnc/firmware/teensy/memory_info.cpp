@@ -29,18 +29,44 @@ static bool     _initialized       = false;
 static uint32_t _stack_sp_min      = 0xFFFFFFFF;
 static uint32_t _stack_init_sp     = 0;
 
-// Empirical stack-paint runway.  Painted words live only in the unused DTCM
-// gap between static data/BSS and the early setup() stack pointer.  The stack
-// grows downward from _estack, so any non-sentinel word in this runway is
-// evidence that the stack touched that address at some point after init.
+// Empirical stack-paint runway.
+//
+// Safety doctrine after the first broad-paint experiment:
+//   * ordinary builds are map/read-only by default; no DTCM sentinel writes
+//   * diagnostic paint, when explicitly enabled, is bounded to a small window
+//     below the early setup() stack pointer rather than the entire _ebss..SP gap
+//   * a larger guard is left below the setup-time SP so early USB/SysTick/IRQ
+//     frames cannot race the paint loop
+//
+// This keeps the valuable fields/report shape while preventing memory_info_init()
+// from becoming an early-boot memory mutator in the science baseline.
+static constexpr bool     MEMORY_STACK_PAINT_COMPILED_ENABLED = true;
 static constexpr uint32_t MEMORY_STACK_PAINT_PATTERN = 0xA5A5A5A5UL;
-static constexpr uint32_t MEMORY_STACK_PAINT_GUARD_BYTES = 1024UL;
+
+// Keep the diagnostic paint well away from both ends of the stack runway.
+// The top guard protects the setup-time call chain plus any early interrupt
+// frames.  The static guard keeps the paint away from the linker-reported
+// BSS/static boundary, which faulted during the first broad-paint experiment.
+// The bounded window gives us a useful high-water tripwire without turning
+// memory_info_init() into a bulk DTCM scrubber.
+static constexpr uint32_t MEMORY_STACK_PAINT_GUARD_BYTES = 8192UL;
+static constexpr uint32_t MEMORY_STACK_PAINT_STATIC_GUARD_BYTES = 4096UL;
+static constexpr uint32_t MEMORY_STACK_PAINT_WINDOW_BYTES = 8192UL;
 static constexpr uint32_t MEMORY_STACK_COLLISION_WARN_BYTES = 4096UL;
+
+static constexpr uint32_t MEMORY_STACK_PAINT_SKIP_NONE = 0UL;
+static constexpr uint32_t MEMORY_STACK_PAINT_SKIP_COMPILED_DISABLED = 1UL;
+static constexpr uint32_t MEMORY_STACK_PAINT_SKIP_BAD_DTCM_MAP = 2UL;
+static constexpr uint32_t MEMORY_STACK_PAINT_SKIP_STACK_OUT_OF_RANGE = 3UL;
+static constexpr uint32_t MEMORY_STACK_PAINT_SKIP_NO_ROOM_AFTER_GUARD = 4UL;
+static constexpr uint32_t MEMORY_STACK_PAINT_SKIP_WINDOW_EMPTY = 5UL;
+static constexpr uint32_t MEMORY_STACK_PAINT_SKIP_NO_ROOM_AFTER_STATIC_GUARD = 6UL;
 
 static bool     _stack_paint_enabled = false;
 static uint32_t _stack_paint_start   = 0;
 static uint32_t _stack_paint_end     = 0;
 static uint32_t _stack_paint_bytes   = 0;
+static uint32_t _stack_paint_skip_reason = MEMORY_STACK_PAINT_SKIP_NONE;
 
 // Heap arena tracking
 static uint32_t _heap_arena_hwm    = 0;
@@ -67,6 +93,40 @@ static inline uint32_t memory_info_sub_or_zero(uint32_t high, uint32_t low) {
     return (high > low) ? (high - low) : 0UL;
 }
 
+static inline uint32_t memory_info_primask_save(void) {
+    uint32_t primask = 0;
+    __asm__ volatile ("mrs %0, primask" : "=r" (primask) :: "memory");
+    __asm__ volatile ("cpsid i" ::: "memory");
+    __asm__ volatile ("dmb" ::: "memory");
+    return primask;
+}
+
+static inline void memory_info_primask_restore(uint32_t primask) {
+    __asm__ volatile ("dmb" ::: "memory");
+    __asm__ volatile ("msr primask, %0" :: "r" (primask) : "memory");
+}
+
+static const char* memory_info_stack_paint_skip_reason_name(uint32_t reason) {
+    switch (reason) {
+        case MEMORY_STACK_PAINT_SKIP_NONE:
+            return "NONE";
+        case MEMORY_STACK_PAINT_SKIP_COMPILED_DISABLED:
+            return "COMPILED_DISABLED";
+        case MEMORY_STACK_PAINT_SKIP_BAD_DTCM_MAP:
+            return "BAD_DTCM_MAP";
+        case MEMORY_STACK_PAINT_SKIP_STACK_OUT_OF_RANGE:
+            return "STACK_OUT_OF_RANGE";
+        case MEMORY_STACK_PAINT_SKIP_NO_ROOM_AFTER_GUARD:
+            return "NO_ROOM_AFTER_GUARD";
+        case MEMORY_STACK_PAINT_SKIP_WINDOW_EMPTY:
+            return "WINDOW_EMPTY";
+        case MEMORY_STACK_PAINT_SKIP_NO_ROOM_AFTER_STATIC_GUARD:
+            return "NO_ROOM_AFTER_STATIC_GUARD";
+        default:
+            return "UNKNOWN";
+    }
+}
+
 // ============================================================================
 // Init — safe sentinel installation
 // ============================================================================
@@ -83,31 +143,62 @@ void memory_info_init() {
     const uint32_t dtcm_end   = (uint32_t)&_estack;
     const uint32_t static_end = (uint32_t)&_ebss;
 
-    const uint32_t paint_start = memory_info_align_up4(static_end);
-    uint32_t paint_end = 0;
-    if (sp > MEMORY_STACK_PAINT_GUARD_BYTES) {
-        paint_end = memory_info_align_down4(sp - MEMORY_STACK_PAINT_GUARD_BYTES);
-    }
-
     _stack_paint_enabled = false;
     _stack_paint_start = 0;
     _stack_paint_end = 0;
     _stack_paint_bytes = 0;
+    _stack_paint_skip_reason = MEMORY_STACK_PAINT_SKIP_NONE;
 
-    if (dtcm_end > dtcm_start &&
-        paint_start >= dtcm_start &&
-        paint_end > paint_start &&
-        paint_end <= dtcm_end) {
-        volatile uint32_t* word = (volatile uint32_t*)paint_start;
-        volatile uint32_t* end  = (volatile uint32_t*)paint_end;
-        while (word < end) {
-            *word++ = MEMORY_STACK_PAINT_PATTERN;
+    if (!MEMORY_STACK_PAINT_COMPILED_ENABLED) {
+        _stack_paint_skip_reason = MEMORY_STACK_PAINT_SKIP_COMPILED_DISABLED;
+    } else if (!(dtcm_end > dtcm_start &&
+                 static_end >= dtcm_start &&
+                 static_end < dtcm_end)) {
+        _stack_paint_skip_reason = MEMORY_STACK_PAINT_SKIP_BAD_DTCM_MAP;
+    } else if (!(sp > static_end && sp <= dtcm_end)) {
+        _stack_paint_skip_reason = MEMORY_STACK_PAINT_SKIP_STACK_OUT_OF_RANGE;
+    } else if (sp <= static_end + MEMORY_STACK_PAINT_GUARD_BYTES) {
+        _stack_paint_skip_reason = MEMORY_STACK_PAINT_SKIP_NO_ROOM_AFTER_GUARD;
+    } else {
+        const uint32_t static_guard_end = static_end + MEMORY_STACK_PAINT_STATIC_GUARD_BYTES;
+        if (static_guard_end <= static_end || static_guard_end >= dtcm_end) {
+            _stack_paint_skip_reason = MEMORY_STACK_PAINT_SKIP_NO_ROOM_AFTER_STATIC_GUARD;
+        } else {
+            // Bounded diagnostic window: paint only a small middle slice of the
+            // stack runway.  It is below setup-time SP by a generous guard and
+            // above static DTCM by a separate guard.  This gives a useful
+            // high-water tripwire without touching the risky _ebss boundary or
+            // the live setup()/interrupt stack neighborhood.
+            const uint32_t paint_end = memory_info_align_down4(
+                sp - MEMORY_STACK_PAINT_GUARD_BYTES);
+            const uint32_t min_start = memory_info_align_up4(static_guard_end);
+            uint32_t paint_start = paint_end;
+            if (paint_end > MEMORY_STACK_PAINT_WINDOW_BYTES) {
+                paint_start = paint_end - MEMORY_STACK_PAINT_WINDOW_BYTES;
+            }
+            if (paint_start < min_start) {
+                paint_start = min_start;
+            }
+            paint_start = memory_info_align_up4(paint_start);
+
+            if (paint_end > paint_start && paint_end <= dtcm_end) {
+                const uint32_t saved_primask = memory_info_primask_save();
+                volatile uint32_t* word = (volatile uint32_t*)paint_start;
+                volatile uint32_t* end  = (volatile uint32_t*)paint_end;
+                while (word < end) {
+                    *word++ = MEMORY_STACK_PAINT_PATTERN;
+                }
+                memory_info_primask_restore(saved_primask);
+
+                _stack_paint_enabled = true;
+                _stack_paint_start = paint_start;
+                _stack_paint_end = paint_end;
+                _stack_paint_bytes = paint_end - paint_start;
+                _stack_paint_skip_reason = MEMORY_STACK_PAINT_SKIP_NONE;
+            } else {
+                _stack_paint_skip_reason = MEMORY_STACK_PAINT_SKIP_WINDOW_EMPTY;
+            }
         }
-
-        _stack_paint_enabled = true;
-        _stack_paint_start = paint_start;
-        _stack_paint_end = paint_end;
-        _stack_paint_bytes = paint_end - paint_start;
     }
 
     // Initialize heap tracking
@@ -192,11 +283,17 @@ void memory_info_get(memory_info_t* out) {
     // High-water = deepest stack ever, measured from _estack down
     out->stack_high_water = memory_info_sub_or_zero(dtcm_end, deepest_stack_addr);
 
+    out->stack_paint_compiled_enabled = MEMORY_STACK_PAINT_COMPILED_ENABLED;
     out->stack_paint_enabled = _stack_paint_enabled;
     out->stack_paint_overrun =
         _stack_paint_enabled && painted_deepest_addr == _stack_paint_start;
     out->stack_paint_pattern = MEMORY_STACK_PAINT_PATTERN;
     out->stack_paint_guard_bytes = MEMORY_STACK_PAINT_GUARD_BYTES;
+    out->stack_paint_static_guard_bytes = MEMORY_STACK_PAINT_STATIC_GUARD_BYTES;
+    out->stack_paint_window_bytes = MEMORY_STACK_PAINT_WINDOW_BYTES;
+    out->stack_paint_skip_reason = _stack_paint_skip_reason;
+    out->stack_paint_skip_reason_name =
+        memory_info_stack_paint_skip_reason_name(_stack_paint_skip_reason);
     out->stack_paint_start = _stack_paint_start;
     out->stack_paint_end = _stack_paint_end;
     out->stack_paint_bytes = _stack_paint_bytes;
@@ -215,6 +312,7 @@ void memory_info_get(memory_info_t* out) {
         memory_info_sub_or_zero(deepest_stack_addr, static_end);
     out->stack_collision_warn_bytes = MEMORY_STACK_COLLISION_WARN_BYTES;
     out->stack_collision_risk =
+        out->stack_paint_overrun ||
         out->stack_free_high_water <= MEMORY_STACK_COLLISION_WARN_BYTES;
 
     // --------------------------------------------------------

@@ -979,6 +979,10 @@ static FLASHMEM Payload cmd_payload_info(const Payload& /*args*/) {
   return p;
 }
 
+// SYSTEM.MEMORY_INFO measures the stack, so its snapshot storage must not live
+// on the stack being measured.  Keep the memory_info_t output buffer in RAM2.
+static memory_info_t g_system_memory_info_scratch DMAMEM = {};
+
 // ============================================================================
 // cmd_memory_info — ZPNet SYSTEM command handler
 // ============================================================================
@@ -1002,8 +1006,8 @@ static FLASHMEM Payload cmd_payload_info(const Payload& /*args*/) {
 
 static FLASHMEM Payload cmd_memory_info(const Payload& /*args*/) {
 
-    memory_info_t info{};
-    memory_info_get(&info);
+    memory_info_get(&g_system_memory_info_scratch);
+    const memory_info_t& info = g_system_memory_info_scratch;
 
     Payload p;
 
@@ -1027,8 +1031,13 @@ static FLASHMEM Payload cmd_memory_info(const Payload& /*args*/) {
     p.add("stack_collision_warn_bytes", info.stack_collision_warn_bytes);
     p.add("stack_collision_risk", info.stack_collision_risk);
 
+    p.add("stack_paint_compiled_enabled", info.stack_paint_compiled_enabled);
     p.add("stack_paint_enabled",      info.stack_paint_enabled);
     p.add("stack_paint_overrun",      info.stack_paint_overrun);
+    p.add("stack_paint_skip_reason",  info.stack_paint_skip_reason);
+    p.add("stack_paint_skip_reason_name",
+          info.stack_paint_skip_reason_name ?
+              info.stack_paint_skip_reason_name : "UNKNOWN");
     p.add_fmt("stack_paint_pattern", "0x%08lX",
               (unsigned long)info.stack_paint_pattern);
     p.add_fmt("stack_paint_start", "0x%08lX",
@@ -1038,6 +1047,8 @@ static FLASHMEM Payload cmd_memory_info(const Payload& /*args*/) {
     p.add_fmt("stack_paint_deepest_addr", "0x%08lX",
               (unsigned long)info.stack_paint_deepest_addr);
     p.add("stack_paint_guard_bytes", info.stack_paint_guard_bytes);
+    p.add("stack_paint_static_guard_bytes", info.stack_paint_static_guard_bytes);
+    p.add("stack_paint_window_bytes", info.stack_paint_window_bytes);
     p.add("stack_paint_bytes",       info.stack_paint_bytes);
     p.add("stack_paint_used",        info.stack_paint_used);
     p.add("stack_paint_unused",      info.stack_paint_unused);

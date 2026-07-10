@@ -62,10 +62,15 @@ struct memory_info_t {
     // DTCM runway below the early setup() stack pointer. Later snapshots scan
     // that runway to discover the deepest address the descending stack has
     // actually touched, even if no report sampled SP at the deepest moment.
+    bool     stack_paint_compiled_enabled; // true when bounded diagnostic paint is compiled in
     bool     stack_paint_enabled;     // true if the DTCM sentinel was installed
     bool     stack_paint_overrun;     // true if the painted runway was fully consumed
     uint32_t stack_paint_pattern;     // sentinel word value
     uint32_t stack_paint_guard_bytes; // bytes intentionally left below init SP
+    uint32_t stack_paint_static_guard_bytes; // bytes left above static DTCM boundary
+    uint32_t stack_paint_window_bytes;// maximum bounded diagnostic paint window
+    uint32_t stack_paint_skip_reason; // scalar reason paint was not installed
+    const char* stack_paint_skip_reason_name; // stable literal reason string
     uint32_t stack_paint_start;       // first painted DTCM address
     uint32_t stack_paint_end;         // one-past-last painted DTCM address
     uint32_t stack_paint_bytes;       // paint_end - paint_start
