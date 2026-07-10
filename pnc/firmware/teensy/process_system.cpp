@@ -40,7 +40,7 @@ void system_enter_quiescence(void);
 // Bootloader entry symbol (ROM-provided, never returns)
 extern "C" void enter_bootloader_cleanly(void);
 
-static Payload system_features_tree_payload(void);
+static FLASHMEM Payload system_features_tree_payload(void);
 static void system_feature_schedule_fragment_publish(void);
 
 // --------------------------------------------------------------
@@ -161,7 +161,7 @@ bool system_feature_status_parse(const char* status,
   return false;
 }
 
-static void system_feature_fragment_publish_service(timepop_ctx_t*,
+static FLASHMEM void system_feature_fragment_publish_service(timepop_ctx_t*,
                                                     timepop_diag_t*,
                                                     void*) {
   g_system_feature_fragment_service_armed = false;
@@ -295,7 +295,7 @@ bool system_feature_is_nominal(const char* subsystem,
          g_system_features[idx].status == system_feature_status_t::NOMINAL;
 }
 
-static Payload system_features_tree_payload(void) {
+static FLASHMEM Payload system_features_tree_payload(void) {
   Payload teensy;
 
   for (size_t i = 0; i < SYSTEM_FEATURE_MAX_FEATURES; i++) {
@@ -404,7 +404,7 @@ class system_crash_buffer_print_t : public Print {
   bool _truncated;
 };
 
-static void system_crash_report_capture_once(void) {
+static FLASHMEM void system_crash_report_capture_once(void) {
   if (g_system_crash_report_captured) {
     return;
   }
@@ -422,7 +422,7 @@ static void system_crash_report_capture_once(void) {
   g_system_crash_report_truncated = out.truncated();
 }
 
-static Payload system_crash_report_payload(bool include_text) {
+static FLASHMEM Payload system_crash_report_payload(bool include_text) {
   Payload p;
   p.add("core_fault_present_now", (bool)CrashReport);
   p.add("captured", g_system_crash_report_captured);
@@ -439,7 +439,7 @@ static Payload system_crash_report_payload(bool include_text) {
 // Terminal helpers
 // ================================================================
 
-static void enter_bootloader_cb(timepop_ctx_t*, timepop_diag_t*, void*) {
+static FLASHMEM void enter_bootloader_cb(timepop_ctx_t*, timepop_diag_t*, void*) {
 
   // Idempotent, higher priority than shutdown
   if (system_bootloader) {
@@ -499,7 +499,7 @@ void system_enter_quiescence(void) {
 //   • No aggregation
 //   • No inference
 // ------------------------------------------------------------
-static Payload cmd_report(const Payload& /*args*/) {
+static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
 
   Payload p;
 
@@ -636,7 +636,7 @@ static Payload cmd_report(const Payload& /*args*/) {
 //   completed response that was not sent remains a smoking gun.
 // ============================================================================
 
-static Payload cmd_process_info(const Payload& /*args*/) {
+static FLASHMEM Payload cmd_process_info(const Payload& /*args*/) {
 
     process_rpc_info_t info{};
     process_get_rpc_info(&info);
@@ -721,7 +721,7 @@ static Payload cmd_process_info(const Payload& /*args*/) {
 //   • No allocation beyond Payload
 //   • No transport emission
 // ------------------------------------------------------------
-static Payload cmd_transport_info(const Payload& /*args*/) {
+static FLASHMEM Payload cmd_transport_info(const Payload& /*args*/) {
 
   transport_info_t info;
   transport_get_info(&info);
@@ -819,7 +819,7 @@ static Payload cmd_transport_info(const Payload& /*args*/) {
 //   • No allocation beyond Payload
 //   • No transport emission
 // ------------------------------------------------------------
-static Payload cmd_payload_info(const Payload& /*args*/) {
+static FLASHMEM Payload cmd_payload_info(const Payload& /*args*/) {
 
   payload_info_t info{};
   payload_get_info(&info);
@@ -1000,7 +1000,7 @@ static Payload cmd_payload_info(const Payload& /*args*/) {
 //   • No transport emission
 // ============================================================================
 
-static Payload cmd_memory_info(const Payload& /*args*/) {
+static FLASHMEM Payload cmd_memory_info(const Payload& /*args*/) {
 
     memory_info_t info{};
     memory_info_get(&info);
@@ -1045,7 +1045,7 @@ static Payload cmd_memory_info(const Payload& /*args*/) {
 // ------------------------------------------------------------
 // ENTER_BOOTLOADER — terminal, irreversible
 // ------------------------------------------------------------
-static Payload cmd_enter_bootloader(const Payload& /*args*/) {
+static FLASHMEM Payload cmd_enter_bootloader(const Payload& /*args*/) {
 
   timepop_arm(
     FLASH_DELAY_NS,
@@ -1067,7 +1067,7 @@ static Payload cmd_enter_bootloader(const Payload& /*args*/) {
 // ------------------------------------------------------------
 // SHUTDOWN — terminal, irreversible
 // ------------------------------------------------------------
-static Payload cmd_shutdown(const Payload& /*args*/) {
+static FLASHMEM Payload cmd_shutdown(const Payload& /*args*/) {
 
   {
     Payload ev;
@@ -1082,7 +1082,7 @@ static Payload cmd_shutdown(const Payload& /*args*/) {
 // ------------------------------------------------------------
 // PROCESS_LIST — registry introspection (diagnostic only)
 // ------------------------------------------------------------
-static Payload cmd_process_list(const Payload&) {
+static FLASHMEM Payload cmd_process_list(const Payload&) {
 
   Payload p;
   PayloadArray arr;
@@ -1100,14 +1100,14 @@ static Payload cmd_process_list(const Payload&) {
 // ------------------------------------------------------------
 // FEATURES / REPORT_FEATURES — local Teensy feature-state tree
 // ------------------------------------------------------------
-static Payload cmd_features(const Payload&) {
+static FLASHMEM Payload cmd_features(const Payload&) {
   return system_features_tree_payload();
 }
 
 // ------------------------------------------------------------
 // SET_FEATURE — manual/test ingress for local Teensy feature state
 // ------------------------------------------------------------
-static Payload cmd_set_feature(const Payload& args) {
+static FLASHMEM Payload cmd_set_feature(const Payload& args) {
   const char* subsystem = args.getString("subsystem");
   const char* feature   = args.getString("feature");
   const char* status    = args.getString("status");
@@ -1137,7 +1137,7 @@ static Payload cmd_set_feature(const Payload& args) {
 // ------------------------------------------------------------
 // GET_FEATURE — local Teensy feature-state lookup
 // ------------------------------------------------------------
-static Payload cmd_get_feature(const Payload& args) {
+static FLASHMEM Payload cmd_get_feature(const Payload& args) {
   const char* subsystem = args.getString("subsystem");
   const char* feature   = args.getString("feature");
 
@@ -1159,7 +1159,7 @@ static Payload cmd_get_feature(const Payload& args) {
 // ------------------------------------------------------------
 // CRASH_INFO — explicit printable Teensy core CrashReport capture
 // ------------------------------------------------------------
-static Payload cmd_crash_info(const Payload& /*args*/) {
+static FLASHMEM Payload cmd_crash_info(const Payload& /*args*/) {
   system_crash_report_capture_once();
   return system_crash_report_payload(true);
 }
@@ -1167,7 +1167,7 @@ static Payload cmd_crash_info(const Payload& /*args*/) {
 // ------------------------------------------------------------
 // CRASH_CLEAR — explicitly clear cached and core CrashReport state
 // ------------------------------------------------------------
-static Payload cmd_crash_clear(const Payload& /*args*/) {
+static FLASHMEM Payload cmd_crash_clear(const Payload& /*args*/) {
   CrashReport.clear();
   g_system_crash_report_captured = false;
   g_system_crash_report_core_fault_present = false;
@@ -1183,7 +1183,7 @@ static Payload cmd_crash_clear(const Payload& /*args*/) {
 // ------------------------------------------------------------
 // DEBUG — raw debug channel test
 // ------------------------------------------------------------
-static Payload cmd_debug(const Payload& args) {
+static FLASHMEM Payload cmd_debug(const Payload& args) {
 
   Payload resp;
 
@@ -1210,7 +1210,7 @@ static Payload cmd_debug(const Payload& args) {
 // ------------------------------------------------------------
 // STATUS — simple response of liveness
 // ------------------------------------------------------------
-static Payload cmd_status(const Payload& /*args*/) {
+static FLASHMEM Payload cmd_status(const Payload& /*args*/) {
   return ok_payload();
 }
 

@@ -1147,6 +1147,36 @@ static clocks_static_prediction_snapshot_t g_beta_pps_cycle_prediction DMAMEM = 
 static clocks_static_prediction_snapshot_t g_beta_ocxo1_cycle_prediction DMAMEM = {};
 static clocks_static_prediction_snapshot_t g_beta_ocxo2_cycle_prediction DMAMEM = {};
 
+// Report/recovery scratch objects.  These command-path snapshots used to be
+// automatic locals in large report builders.  Keep them in RAM2 so asking for
+// diagnostics cannot consume the scarce DTCM stack we are trying to measure.
+static interrupt_smartzero_snapshot_t
+    g_beta_report_live_smartzero_scratch DMAMEM = {};
+static interrupt_smartzero_snapshot_t
+    g_beta_report_installed_smartzero_scratch DMAMEM = {};
+static interrupt_integrity_snapshot_t
+    g_beta_report_interrupt_integrity_scratch DMAMEM = {};
+static clocks_alpha_integrity_snapshot_t
+    g_beta_report_alpha_integrity_scratch DMAMEM = {};
+static clocks_alpha_event_flow_snapshot_t
+    g_beta_report_alpha_flow_scratch DMAMEM = {};
+static clocks_alpha_lane_forensics_t
+    g_beta_report_vclock_forensics_scratch DMAMEM = {};
+static clocks_alpha_lane_forensics_t
+    g_beta_report_ocxo1_forensics_scratch DMAMEM = {};
+static clocks_alpha_lane_forensics_t
+    g_beta_report_ocxo2_forensics_scratch DMAMEM = {};
+static clocks_alpha_lane_forensics_t
+    g_beta_report_lane_forensics_scratch DMAMEM = {};
+static clocks_alpha_ocxo_visible_origin_snapshot_t
+    g_beta_report_visible_origin_scratch DMAMEM = {};
+static clocks_alpha_ocxo_pps_projection_snapshot_t
+    g_beta_report_projection_scratch DMAMEM = {};
+static clocks_alpha_tau_snapshot_t
+    g_beta_report_ocxo1_tau_scratch DMAMEM = {};
+static clocks_alpha_tau_snapshot_t
+    g_beta_report_ocxo2_tau_scratch DMAMEM = {};
+
 struct clock_science_row_t {
   bool     valid = false;
   bool     antecedents_complete = false;
@@ -1395,6 +1425,8 @@ static clocks_alpha_recover_reattach_snapshot_t
 // Recovery request flight recorder for Pi-side polling.  These values make
 // REPORT_RECOVERY useful while core.py waits for the first public pair.
 static uint32_t          g_recover_request_count = 0;
+static char              g_recover_last_campaign[64] = {0};
+static bool              g_recover_last_campaign_supplied = false;
 static uint64_t          g_recover_last_base_count = 0;
 static uint64_t          g_recover_last_expected_first_public_count = 0;
 static uint64_t          g_recover_last_base_gnss_ns = 0;
@@ -2668,10 +2700,13 @@ static bool clocks_watchdog_publication_blocked(void) {
 }
 
 bool clocks_watchdog_campaign_armed(void) {
+  // Campaign name is operator/persistence metadata, not timing custody.
+  // Warm RECOVER can resume a known public clock ledger before the Pi has
+  // supplied or restored a human campaign label; do not leave the campaign
+  // continuity watchdog disarmed merely because the label is empty.
   return watchdog_campaign_publication_armed &&
          !clocks_watchdog_publication_blocked() &&
          campaign_state == clocks_campaign_state_t::STARTED &&
-         campaign_name[0] != '\0' &&
          campaign_seconds != 0ULL &&
          !request_start &&
          !request_stop &&
@@ -3944,7 +3979,8 @@ static FLASHMEM void payload_add_smartzero_install_transaction(Payload& p) {
 static FLASHMEM void payload_add_visible_origin_snapshot(Payload& parent,
                                                 const char* key,
                                                 time_clock_id_t clock) {
-  clocks_alpha_ocxo_visible_origin_snapshot_t s{};
+  clocks_alpha_ocxo_visible_origin_snapshot_t& s = g_beta_report_visible_origin_scratch;
+  s = clocks_alpha_ocxo_visible_origin_snapshot_t{};
   const bool available =
       clocks_alpha_ocxo_visible_origin_snapshot(clock, &s);
 
@@ -3996,10 +4032,12 @@ static FLASHMEM void payload_add_visible_origin_summary(Payload& p) {
 }
 
 static FLASHMEM void payload_add_smartzero_summary(Payload& p) {
-  interrupt_smartzero_snapshot_t live{};
+  interrupt_smartzero_snapshot_t& live = g_beta_report_live_smartzero_scratch;
+  live = interrupt_smartzero_snapshot_t{};
   (void)interrupt_smartzero_live_snapshot(&live);
 
-  interrupt_smartzero_snapshot_t installed{};
+  interrupt_smartzero_snapshot_t& installed = g_beta_report_installed_smartzero_scratch;
+  installed = interrupt_smartzero_snapshot_t{};
   const bool installed_valid = clocks_alpha_epoch_last_smartzero(&installed);
   const bool installed_backing_epoch = clocks_alpha_installed_smartzero_backing_epoch();
 
@@ -8573,6 +8611,9 @@ void clocks_beta_pps(void) {
                                        public_gnss_ns);
     p.add("paired_forensics_topic", "TIMEBASE_FORENSICS");
     p.add("paired_forensics_schema", "TIMEBASE_FORENSICS_V1");
+    p.add("campaign", campaign_name);
+    p.add("campaign_state", clocks_campaign_state_name(campaign_state));
+    p.add("campaign_seconds", campaign_seconds);
     p.add("recover_degraded_active", (bool)g_recover_reattach_degraded_active);
     p.add("recover_degraded_science_hold", recover_degraded_science_hold);
     p.add("recover_reattach_reason", g_recover_reattach_last_reason);
@@ -9618,6 +9659,18 @@ static FLASHMEM Payload cmd_recover(const Payload& args) {
     return err;
   }
 
+  const char* recover_campaign = args.getString("campaign");
+  if (!recover_campaign || !*recover_campaign) {
+    recover_campaign = args.getString("name");
+  }
+  g_recover_last_campaign_supplied = recover_campaign && *recover_campaign;
+  if (g_recover_last_campaign_supplied) {
+    safeCopy(campaign_name, sizeof(campaign_name), recover_campaign);
+  }
+  safeCopy(g_recover_last_campaign,
+           sizeof(g_recover_last_campaign),
+           g_recover_last_campaign_supplied ? recover_campaign : campaign_name);
+
   recover_dwt_ns   = dwt_ns;
   recover_gnss_ns  = gnss_ns;
   recover_ocxo1_ns = ocxo1_ns;
@@ -9667,6 +9720,9 @@ static FLASHMEM Payload cmd_recover(const Payload& args) {
   p.add("base_count", g_recover_last_base_count);
   p.add("expected_first_public_count",
         g_recover_last_expected_first_public_count);
+  p.add("campaign", campaign_name);
+  p.add("campaign_supplied", g_recover_last_campaign_supplied);
+  p.add("recover_last_campaign", g_recover_last_campaign);
   p.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
   p.add("calibrate_ocxo_supplied", servo_supplied);
   p.add("recover_status_report", "REPORT_RECOVERY");
@@ -9990,9 +10046,12 @@ static FLASHMEM void add_clock_forensics_payload(Payload& p,
   Payload forensic;
   forensic.add("report_dwt", report_dwt);
 
-  clocks_alpha_lane_forensics_t vf{};
-  clocks_alpha_lane_forensics_t o1f{};
-  clocks_alpha_lane_forensics_t o2f{};
+  clocks_alpha_lane_forensics_t& vf = g_beta_report_vclock_forensics_scratch;
+  vf = clocks_alpha_lane_forensics_t{};
+  clocks_alpha_lane_forensics_t& o1f = g_beta_report_ocxo1_forensics_scratch;
+  o1f = clocks_alpha_lane_forensics_t{};
+  clocks_alpha_lane_forensics_t& o2f = g_beta_report_ocxo2_forensics_scratch;
+  o2f = clocks_alpha_lane_forensics_t{};
   const bool vf_ok = clocks_alpha_lane_forensics(time_clock_id_t::VCLOCK, &vf);
   const bool o1f_ok = clocks_alpha_lane_forensics(time_clock_id_t::OCXO1, &o1f);
   const bool o2f_ok = clocks_alpha_lane_forensics(time_clock_id_t::OCXO2, &o2f);
@@ -10059,8 +10118,10 @@ static FLASHMEM void add_single_clock_forensics_payload(Payload& p,
   lane.add("report_dwt", report_dwt);
   lane.add("clock", key ? key : "");
 
-  clocks_alpha_lane_forensics_t vf{};
-  clocks_alpha_lane_forensics_t lf{};
+  clocks_alpha_lane_forensics_t& vf = g_beta_report_vclock_forensics_scratch;
+  vf = clocks_alpha_lane_forensics_t{};
+  clocks_alpha_lane_forensics_t& lf = g_beta_report_lane_forensics_scratch;
+  lf = clocks_alpha_lane_forensics_t{};
   const bool vf_ok = clocks_alpha_lane_forensics(time_clock_id_t::VCLOCK, &vf);
   const bool lf_ok = clocks_alpha_lane_forensics(clock_id, &lf);
   lane.add("alpha_vclock_valid", vf_ok);
@@ -10435,7 +10496,8 @@ static FLASHMEM void add_epoch_payload(Payload& p) {
   p.add("smartzero_pending_reason", clocks_alpha_smartzero_pending_reason());
   payload_add_smartzero_install_transaction(p);
 
-  interrupt_smartzero_snapshot_t installed{};
+  interrupt_smartzero_snapshot_t& installed = g_beta_report_installed_smartzero_scratch;
+  installed = interrupt_smartzero_snapshot_t{};
   const bool installed_valid = clocks_alpha_epoch_last_smartzero(&installed);
   p.add("installed_smartzero_valid", installed_valid);
   p.add("installed_smartzero_backing_epoch",
@@ -10452,11 +10514,13 @@ static FLASHMEM void add_epoch_payload(Payload& p) {
 }
 
 static FLASHMEM void add_compact_smartzero_status(Payload& p) {
-  interrupt_smartzero_snapshot_t installed{};
+  interrupt_smartzero_snapshot_t& installed = g_beta_report_installed_smartzero_scratch;
+  installed = interrupt_smartzero_snapshot_t{};
   const bool installed_valid = clocks_alpha_epoch_last_smartzero(&installed);
   const bool installed_backing_epoch = clocks_alpha_installed_smartzero_backing_epoch();
 
-  interrupt_smartzero_snapshot_t live{};
+  interrupt_smartzero_snapshot_t& live = g_beta_report_live_smartzero_scratch;
+  live = interrupt_smartzero_snapshot_t{};
   (void)interrupt_smartzero_live_snapshot(&live);
 
   p.add("installed_smartzero_valid", installed_valid);
@@ -10702,10 +10766,12 @@ static FLASHMEM void payload_add_alpha_flow_lane(Payload& parent,
                                         const char* key,
                                         time_clock_id_t clock,
                                         bool detailed) {
-  clocks_alpha_event_flow_snapshot_t f{};
+  clocks_alpha_event_flow_snapshot_t& f = g_beta_report_alpha_flow_scratch;
+  f = clocks_alpha_event_flow_snapshot_t{};
   const bool ok = clocks_alpha_event_flow_snapshot(clock, &f);
 
-  clocks_alpha_lane_forensics_t lane{};
+  clocks_alpha_lane_forensics_t& lane = g_beta_report_lane_forensics_scratch;
+  lane = clocks_alpha_lane_forensics_t{};
   const bool lane_ok = clocks_alpha_lane_forensics(clock, &lane);
 
   Payload p;
@@ -10846,7 +10912,8 @@ static FLASHMEM const char* ocxo_pps_projection_invalid_reason_name(uint32_t rea
 static FLASHMEM void payload_add_ocxo_pps_projection_lane(Payload& parent,
                                                  const char* key,
                                                  time_clock_id_t clock) {
-  clocks_alpha_ocxo_pps_projection_snapshot_t s{};
+  clocks_alpha_ocxo_pps_projection_snapshot_t& s = g_beta_report_projection_scratch;
+  s = clocks_alpha_ocxo_pps_projection_snapshot_t{};
   const bool ok = clocks_alpha_ocxo_pps_projection_snapshot(clock, &s);
 
   Payload lane;
@@ -10968,7 +11035,8 @@ static const char* ocxo_projection_guard_lane_verdict(bool snapshot_ok,
 static FLASHMEM void payload_add_ocxo_projection_guard_lane(Payload& parent,
                                                    const char* key,
                                                    time_clock_id_t clock) {
-  clocks_alpha_ocxo_pps_projection_snapshot_t s{};
+  clocks_alpha_ocxo_pps_projection_snapshot_t& s = g_beta_report_projection_scratch;
+  s = clocks_alpha_ocxo_pps_projection_snapshot_t{};
   const bool snapshot_ok = clocks_alpha_ocxo_pps_projection_snapshot(clock, &s);
   const uint32_t legacy_wrap_count =
       clocks_alpha_ocxo_projection_guard_legacy_wrap_count(clock);
@@ -11085,10 +11153,91 @@ static FLASHMEM Payload cmd_report_ocxo_projection_guard(const Payload&) {
 
 static FLASHMEM void payload_add_startup_handoff_payload(Payload& p);
 
+
 static FLASHMEM Payload cmd_report_timebase_publish(const Payload&) {
   Payload p;
   p.add("report", "CLOCKS_TIMEBASE_PUBLISH");
-  p.add("description", "Report-only TIMEBASE_FRAGMENT / TIMEBASE_FORENSICS build/publish flight recorder");
+  p.add("schema", "CLOCKS_TIMEBASE_PUBLISH_COMPACT_V1");
+  p.add("description", "compact TIMEBASE build/publish liveness summary; use REPORT_TIMEBASE_PUBLISH_DEEP for courtroom detail");
+  p.add("deep_report", "REPORT_TIMEBASE_PUBLISH_DEEP");
+
+  p.add("stage", g_timebase_last_stage);
+  p.add("stage_name", timebase_build_stage_name(g_timebase_last_stage));
+  p.add("campaign_state", clocks_campaign_state_name(campaign_state));
+  p.add("campaign", campaign_name);
+  p.add("campaign_seconds", campaign_seconds);
+  p.add("last_public_count", g_timebase_last_public_count);
+  p.add("last_public_gnss_ns", g_timebase_last_public_gnss_ns);
+  p.add("last_publish_return_campaign_seconds",
+        g_timebase_last_publish_return_campaign_seconds);
+
+  p.add("pps_entry_count", g_timebase_pps_entry_count);
+  p.add("candidate_count", g_timebase_candidate_count);
+  p.add("per_second_count", g_timebase_per_second_count);
+  p.add("build_begin_count", g_timebase_build_begin_count);
+  p.add("build_complete_count", g_timebase_build_complete_count);
+  p.add("publish_attempt_count", g_timebase_publish_attempt_count);
+  p.add("publish_return_count", g_timebase_publish_return_count);
+  p.add("forensics_publish_attempt_count",
+        g_timebase_forensics_publish_attempt_count);
+  p.add("forensics_publish_return_count",
+        g_timebase_forensics_publish_return_count);
+
+  p.add("publish_tail_returning",
+        g_timebase_publish_attempt_count == g_timebase_publish_return_count);
+  p.add("forensics_publish_tail_returning",
+        g_timebase_forensics_publish_attempt_count ==
+        g_timebase_forensics_publish_return_count);
+  p.add("candidate_minus_build_begin",
+        (int64_t)g_timebase_candidate_count -
+        (int64_t)g_timebase_build_begin_count);
+  p.add("build_begin_minus_build_complete",
+        (int64_t)g_timebase_build_begin_count -
+        (int64_t)g_timebase_build_complete_count);
+  p.add("publish_attempt_minus_return",
+        (int64_t)g_timebase_publish_attempt_count -
+        (int64_t)g_timebase_publish_return_count);
+
+  p.add("forensics_publish_enabled", TIMEBASE_FORENSICS_PUBLISH_ENABLED);
+  p.add("forensics_minimal_payload_enabled",
+        TIMEBASE_FORENSICS_MINIMAL_PAYLOAD_ENABLED);
+  p.add("forensics_micro_raw_cycles_enabled",
+        TIMEBASE_FORENSICS_MICRO_RAW_CYCLES_ENABLED);
+  p.add("fragment_compact_science_enabled",
+        TIMEBASE_FRAGMENT_COMPACT_SCIENCE_ENABLED);
+
+  p.add("warmup_active", campaign_warmup_active());
+  p.add("recover_lifecycle_active", clocks_campaign_recovery_lifecycle_active());
+  p.add("recover_lifecycle_reason", g_recover_lifecycle_reason);
+  p.add("recover_reattach_active", (bool)g_recover_reattach_active);
+  p.add("recover_reattach_degraded_active",
+        (bool)g_recover_reattach_degraded_active);
+  p.add("recover_reattach_reason", g_recover_reattach_last_reason);
+  p.add("recover_reattach_ready",
+        g_recover_reattach_last_ocxo1.ready &&
+        g_recover_reattach_last_ocxo2.ready);
+  p.add("recover_reattach_ocxo1_ready", g_recover_reattach_last_ocxo1.ready);
+  p.add("recover_reattach_ocxo2_ready", g_recover_reattach_last_ocxo2.ready);
+  p.add("science_quarantine_remaining",
+        g_science_residual_quarantine_remaining);
+
+  p.add("watchdog_campaign_publication_armed",
+        (bool)watchdog_campaign_publication_armed);
+  p.add("watchdog_campaign_surrendered",
+        (bool)watchdog_campaign_surrendered);
+  p.add("watchdog_anomaly_active", watchdog_anomaly_active);
+  p.add("watchdog_publication_blocked",
+        clocks_watchdog_publication_blocked());
+  p.add("watchdog_campaign_armed", clocks_watchdog_campaign_armed());
+
+  return p;
+}
+
+static FLASHMEM Payload cmd_report_timebase_publish_deep(const Payload&) {
+  Payload p;
+  p.add("report", "CLOCKS_TIMEBASE_PUBLISH_DEEP");
+  p.add("schema", "CLOCKS_TIMEBASE_PUBLISH_DEEP_V1");
+  p.add("description", "deep TIMEBASE_FRAGMENT / TIMEBASE_FORENSICS build/publish flight recorder");
 
   Payload counters;
   counters.add("pps_entry_count", g_timebase_pps_entry_count);
@@ -11396,20 +11545,28 @@ static FLASHMEM void payload_add_recover_reattach_flat_fields(
     const char* prefix,
     const clocks_alpha_recover_reattach_snapshot_t& s) {
   char key[96];
+  const bool has_prefix = prefix && *prefix;
+  auto make_key = [&](const char* suffix) {
+    if (has_prefix) {
+      snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    } else {
+      snprintf(key, sizeof(key), "%s", suffix);
+    }
+  };
   auto add_bool = [&](const char* suffix, bool value) {
-    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    make_key(suffix);
     p.add(key, value);
   };
   auto add_u32 = [&](const char* suffix, uint32_t value) {
-    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    make_key(suffix);
     p.add(key, value);
   };
   auto add_u64 = [&](const char* suffix, uint64_t value) {
-    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    make_key(suffix);
     p.add(key, value);
   };
   auto add_str = [&](const char* suffix, const char* value) {
-    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    make_key(suffix);
     p.add(key, value ? value : "");
   };
 
@@ -11548,43 +11705,77 @@ static FLASHMEM void payload_add_recover_reattach_flat_fields(
   add_u64("counterledger_refined_interval_ns", s.counterledger_refined_interval_ns);
 }
 
+
 static FLASHMEM Payload cmd_report_recovery(const Payload&) {
   clocks_stack_witness_note_command(CLOCKS_STACK_CONTEXT_REPORT_RECOVERY);
 
-  // Cached and flat by design.  This report is called by Pi while recovery is
-  // already stressed; do not refresh Alpha snapshots, call process_time, or
-  // build nested diagnostic objects here.  The PPS path owns state refresh.
   Payload p;
   p.add("report", "CLOCKS_RECOVERY");
-  p.add("schema", "CLOCKS_RECOVERY_FLAT_V2");
-  p.add("description", "cached flat RECOVER wait/release/degraded-publication state");
+  p.add("schema", "CLOCKS_RECOVERY_COMPACT_V1");
+  p.add("description", "compact RECOVER liveness/polling report; use REPORT_RECOVERY_DEEP for CounterLedger/PhaseLedger detail");
+  p.add("deep_report", "REPORT_RECOVERY_DEEP");
 
   p.add("campaign_state", clocks_campaign_state_name(campaign_state));
+  p.add("campaign", campaign_name);
+  p.add("campaign_seconds", campaign_seconds);
   p.add("recover_lifecycle_active", clocks_campaign_recovery_lifecycle_active());
   p.add("recover_lifecycle_reason", g_recover_lifecycle_reason);
   p.add("recover_lifecycle_abort_reason", g_recover_lifecycle_abort_reason);
-  p.add("recover_lifecycle_begin_count", (uint32_t)g_recover_lifecycle_begin_count);
-  p.add("recover_lifecycle_pps_gate_count", (uint32_t)g_recover_lifecycle_pps_gate_count);
-  p.add("recover_lifecycle_command_custody_reset_count",
-        (uint32_t)g_recover_lifecycle_command_custody_reset_count);
-  p.add("recover_lifecycle_gate_custody_reset_count",
-        (uint32_t)g_recover_lifecycle_gate_custody_reset_count);
-  p.add("recover_lifecycle_complete_count", (uint32_t)g_recover_lifecycle_complete_count);
-  p.add("recover_lifecycle_abort_count", (uint32_t)g_recover_lifecycle_abort_count);
-  p.add("recover_lifecycle_stale_gate_count", (uint32_t)g_recover_lifecycle_stale_gate_count);
-  p.add("recover_lifecycle_last_begin_campaign_seconds",
-        (uint32_t)g_recover_lifecycle_last_begin_campaign_seconds);
-  p.add("recover_lifecycle_last_gate_campaign_seconds",
-        (uint32_t)g_recover_lifecycle_last_gate_campaign_seconds);
-  p.add("recover_lifecycle_last_abort_campaign_seconds",
-        (uint32_t)g_recover_lifecycle_last_abort_campaign_seconds);
-  p.add("campaign", campaign_name);
-  p.add("campaign_seconds", campaign_seconds);
-  p.add("warmup_active", campaign_warmup_active());
-  p.add("warmup_mode", (uint32_t)((uint8_t)g_campaign_warmup_mode));
+  p.add("recover_lifecycle_begin_count",
+        (uint32_t)g_recover_lifecycle_begin_count);
+  p.add("recover_lifecycle_pps_gate_count",
+        (uint32_t)g_recover_lifecycle_pps_gate_count);
+  p.add("recover_lifecycle_complete_count",
+        (uint32_t)g_recover_lifecycle_complete_count);
+  p.add("recover_lifecycle_abort_count",
+        (uint32_t)g_recover_lifecycle_abort_count);
+
+  p.add("request_count", g_recover_request_count);
+  p.add("base_count", g_recover_last_base_count);
+  p.add("expected_first_public_count",
+        g_recover_last_expected_first_public_count);
+  p.add("last_public_count", g_timebase_last_public_count);
+  p.add("last_public_gnss_ns", g_timebase_last_public_gnss_ns);
+  p.add("candidate_count", g_timebase_candidate_count);
+  p.add("timebase_last_stage", g_timebase_last_stage);
+  p.add("timebase_last_stage_name",
+        timebase_build_stage_name(g_timebase_last_stage));
+
   p.add("recover_reattach_active", (bool)g_recover_reattach_active);
-  p.add("recover_reattach_degraded_active", (bool)g_recover_reattach_degraded_active);
+  p.add("recover_reattach_degraded_active",
+        (bool)g_recover_reattach_degraded_active);
   p.add("recover_reattach_reason", g_recover_reattach_last_reason);
+  p.add("recover_reattach_ocxo1_ready", g_recover_reattach_last_ocxo1.ready);
+  p.add("recover_reattach_ocxo2_ready", g_recover_reattach_last_ocxo2.ready);
+  p.add("recover_reattach_ready",
+        g_recover_reattach_last_ocxo1.ready &&
+        g_recover_reattach_last_ocxo2.ready);
+  p.add("hidden_candidate_count", g_recover_reattach_hidden_candidate_count);
+  p.add("last_hidden_public_count",
+        g_recover_reattach_last_hidden_public_count);
+  p.add("last_release_public_count",
+        g_recover_reattach_last_release_public_count);
+  p.add("timeout_candidates",
+        (uint32_t)CLOCKS_RECOVER_REATTACH_TIMEOUT_CANDIDATES);
+  p.add("timeout_count", g_recover_reattach_timeout_count);
+  p.add("degraded_release_count", g_recover_reattach_degraded_release_count);
+  p.add("degraded_public_row_count",
+        g_recover_reattach_degraded_public_row_count);
+  p.add("degraded_publication_stalled", (bool)g_recover_reattach_stalled);
+  p.add("degraded_stall_reason", g_recover_reattach_stall_reason);
+
+  p.add("science_quarantine_remaining", g_science_residual_quarantine_remaining);
+  p.add("science_quarantine_begin_count",
+        g_science_residual_quarantine_begin_count);
+  p.add("science_quarantine_consumed_count",
+        g_science_residual_quarantine_consumed_count);
+
+  p.add("continuity_align_pending", (bool)g_recover_continuity_align_pending);
+  p.add("continuity_align_count", g_recover_continuity_align_count);
+  p.add("continuity_align_failure_count",
+        g_recover_continuity_align_failure_count);
+  p.add("continuity_align_reason", g_recover_continuity_last_reason);
+
   const bool recover_clean_ready =
       !g_recover_reattach_active &&
       !g_recover_reattach_degraded_active &&
@@ -11595,111 +11786,236 @@ static FLASHMEM Payload cmd_report_recovery(const Payload&) {
       !clocks_watchdog_publication_blocked();
   p.add("recover_clean_ready", recover_clean_ready);
   p.add("recover_clean_blocked", !recover_clean_ready);
+
+  p.add("watchdog_anomaly_active", watchdog_anomaly_active);
+  p.add("watchdog_campaign_surrendered",
+        (bool)watchdog_campaign_surrendered);
+  p.add("watchdog_publication_blocked",
+        clocks_watchdog_publication_blocked());
+  p.add("watchdog_campaign_armed", clocks_watchdog_campaign_armed());
   p.add("interrupt_recover_publication_reset_count",
         interrupt_recover_publication_custody_reset_count());
-  p.add("watchdog_anomaly_active", watchdog_anomaly_active);
-  p.add("watchdog_campaign_surrendered", (bool)watchdog_campaign_surrendered);
-  p.add("watchdog_publication_blocked", clocks_watchdog_publication_blocked());
+
+  const uint32_t current_sp = clocks_stack_witness_sp();
+  const uint32_t dtcm_top = clocks_stack_witness_current_dtcm_top();
+  p.add("stack_current_sp", current_sp);
+  p.add("stack_current_bytes_from_top",
+        clocks_stack_witness_bytes_below_dtcm_top(current_sp, dtcm_top));
+  p.add("stack_witness_count",
+        (uint32_t)g_clocks_stack_witness.record_count);
+  p.add("stack_witness_min_sp",
+        (uint32_t)g_clocks_stack_witness.min_sp);
+
+  return p;
+}
+
+static FLASHMEM Payload cmd_report_recovery_deep(const Payload&) {
+  clocks_stack_witness_note_command(CLOCKS_STACK_CONTEXT_REPORT_RECOVERY);
+
+  Payload p;
+  p.add("report", "CLOCKS_RECOVERY_DEEP");
+  p.add("schema", "CLOCKS_RECOVERY_DEEP_V2");
+  p.add("description", "nested RECOVER wait/release/degraded-publication and CounterLedger/PhaseLedger state; avoids flat Payload entry overflow");
+  p.add("flat_schema_retired", "CLOCKS_RECOVERY_DEEP_FLAT_V1");
+
+  const bool reattach_ready =
+      g_recover_reattach_last_ocxo1.ready &&
+      g_recover_reattach_last_ocxo2.ready;
+  const bool recover_clean_ready =
+      !g_recover_reattach_active &&
+      !g_recover_reattach_degraded_active &&
+      reattach_ready &&
+      g_science_residual_quarantine_remaining == 0U &&
+      !watchdog_anomaly_active &&
+      !clocks_watchdog_publication_blocked();
+
+  // Keep a tiny compatibility spine at the root.  Everything bulky lives below
+  // named objects so the root Payload does not hit the 256-entry ceiling.
+  p.add("campaign_state", clocks_campaign_state_name(campaign_state));
+  p.add("campaign", campaign_name);
+  p.add("campaign_seconds", campaign_seconds);
+  p.add("recover_clean_ready", recover_clean_ready);
+  p.add("recover_clean_blocked", !recover_clean_ready);
+  p.add("reattach_ready", reattach_ready);
   p.add("watchdog_campaign_armed", clocks_watchdog_campaign_armed());
   p.add("timebase_last_stage", g_timebase_last_stage);
   p.add("timebase_last_stage_name", timebase_build_stage_name(g_timebase_last_stage));
 
-  p.add("request_count", g_recover_request_count);
-  p.add("base_count", g_recover_last_base_count);
-  p.add("expected_first_public_count", g_recover_last_expected_first_public_count);
-  p.add("base_gnss_ns", g_recover_last_base_gnss_ns);
-  p.add("base_dwt_ns", g_recover_last_base_dwt_ns);
-  p.add("base_ocxo1_ns", g_recover_last_base_ocxo1_ns);
-  p.add("base_ocxo2_ns", g_recover_last_base_ocxo2_ns);
-  p.add("continuity_align_pending", (bool)g_recover_continuity_align_pending);
-  p.add("continuity_align_count", g_recover_continuity_align_count);
-  p.add("continuity_align_failure_count", g_recover_continuity_align_failure_count);
-  p.add("continuity_align_requested_public_count",
-        g_recover_continuity_align_requested_public_count);
-  p.add("continuity_align_last_public_count",
-        g_recover_continuity_align_last_public_count);
-  p.add("continuity_align_reason", g_recover_continuity_last_reason);
-  p.add("continuity_ocxo1_target_ns", g_recover_continuity_ocxo1_target_ns);
-  p.add("continuity_ocxo2_target_ns", g_recover_continuity_ocxo2_target_ns);
-  p.add("continuity_ocxo1_before_ns", g_recover_continuity_ocxo1_before_ns);
-  p.add("continuity_ocxo2_before_ns", g_recover_continuity_ocxo2_before_ns);
-  p.add("continuity_ocxo1_after_ns", g_recover_continuity_ocxo1_after_ns);
-  p.add("continuity_ocxo2_after_ns", g_recover_continuity_ocxo2_after_ns);
-  p.add("continuity_ocxo1_correction_ns",
-        g_recover_continuity_ocxo1_correction_ns);
-  p.add("continuity_ocxo2_correction_ns",
-        g_recover_continuity_ocxo2_correction_ns);
-  p.add("last_public_count", g_timebase_last_public_count);
-  p.add("last_public_gnss_ns", g_timebase_last_public_gnss_ns);
-  p.add("candidate_count", g_timebase_candidate_count);
-  p.add("hidden_candidate_count", g_recover_reattach_hidden_candidate_count);
-  p.add("last_hidden_public_count", g_recover_reattach_last_hidden_public_count);
-  p.add("last_release_public_count", g_recover_reattach_last_release_public_count);
-  p.add("timeout_candidates", (uint32_t)CLOCKS_RECOVER_REATTACH_TIMEOUT_CANDIDATES);
-  p.add("timeout_release_degraded", CLOCKS_RECOVER_REATTACH_TIMEOUT_RELEASE_DEGRADED);
-  p.add("begin_count", g_recover_reattach_begin_count);
-  p.add("hold_count", g_recover_reattach_hold_count);
-  p.add("release_count", g_recover_reattach_release_count);
-  p.add("timeout_count", g_recover_reattach_timeout_count);
-  p.add("degraded_release_count", g_recover_reattach_degraded_release_count);
-  p.add("degraded_clear_count", g_recover_reattach_degraded_clear_count);
-  p.add("degraded_public_row_count", g_recover_reattach_degraded_public_row_count);
-  p.add("degraded_window_row_count", g_recover_reattach_degraded_window_row_count);
-  p.add("degraded_publication_stalled", (bool)g_recover_reattach_stalled);
-  p.add("degraded_stall_count", g_recover_reattach_stall_count);
-  p.add("degraded_stall_threshold",
-        (uint32_t)CLOCKS_RECOVER_REATTACH_DEGRADED_STALL_CANDIDATES);
-  p.add("degraded_stall_reason", g_recover_reattach_stall_reason);
-  p.add("degraded_stall_last_public_count",
-        g_recover_reattach_last_stall_public_count);
-  p.add("recover_reattach_stalled", (bool)g_recover_reattach_stalled);
-  p.add("recover_reattach_stall_count", g_recover_reattach_stall_count);
-  p.add("recover_reattach_degraded_window_row_count",
-        g_recover_reattach_degraded_window_row_count);
-  p.add("recover_reattach_degraded_stall_threshold",
-        (uint32_t)CLOCKS_RECOVER_REATTACH_DEGRADED_STALL_CANDIDATES);
-  p.add("recover_reattach_stall_reason", g_recover_reattach_stall_reason);
-  p.add("recover_reattach_last_stall_public_count",
-        g_recover_reattach_last_stall_public_count);
-  p.add("degraded_science_suppressed_count", g_recover_reattach_degraded_science_suppressed_count);
-  p.add("last_degraded_release_public_count", g_recover_reattach_last_degraded_release_public_count);
-  p.add("last_degraded_public_count", g_recover_reattach_last_degraded_public_count);
-  p.add("science_quarantine_remaining", g_science_residual_quarantine_remaining);
-  p.add("science_quarantine_begin_count", g_science_residual_quarantine_begin_count);
-  p.add("science_quarantine_consumed_count", g_science_residual_quarantine_consumed_count);
-  p.add("science_quarantine_last_public_count", g_science_residual_quarantine_last_public_count);
-  p.add("delta_raw_interval_gate_min_cycles",
-        (uint32_t)CLOCKS_DELTA_RAW_INTERVAL_MIN_CYCLES);
-  p.add("delta_raw_interval_gate_max_cycles",
-        (uint32_t)CLOCKS_DELTA_RAW_INTERVAL_MAX_CYCLES);
-  p.add("delta_raw_interval_reject_count", g_delta_raw_interval_reject_count);
-  p.add("delta_raw_interval_reject_reference_count",
-        g_delta_raw_interval_reject_reference_count);
-  p.add("delta_raw_interval_reject_clock_count",
-        g_delta_raw_interval_reject_clock_count);
-  p.add("delta_raw_interval_sentinel_reject_count",
-        g_delta_raw_interval_sentinel_reject_count);
-  p.add("delta_raw_interval_plausibility_reject_count",
-        g_delta_raw_interval_plausibility_reject_count);
-  p.add("delta_raw_interval_last_public_count",
-        g_delta_raw_interval_last_public_count);
-  p.add("delta_raw_interval_last_clock_id",
-        g_delta_raw_interval_last_clock_id);
-  p.add("delta_raw_interval_last_reference_cycles",
-        g_delta_raw_interval_last_reference_cycles);
-  p.add("delta_raw_interval_last_clock_cycles",
-        g_delta_raw_interval_last_clock_cycles);
-  p.add("delta_raw_interval_last_reject_field",
-        g_delta_raw_interval_last_reject_field);
-  p.add("delta_raw_interval_last_reject_reason",
-        g_delta_raw_interval_last_reject_reason);
+  {
+    Payload lifecycle;
+    lifecycle.add("active", clocks_campaign_recovery_lifecycle_active());
+    lifecycle.add("reason", g_recover_lifecycle_reason);
+    lifecycle.add("abort_reason", g_recover_lifecycle_abort_reason);
+    lifecycle.add("begin_count", (uint32_t)g_recover_lifecycle_begin_count);
+    lifecycle.add("pps_gate_count", (uint32_t)g_recover_lifecycle_pps_gate_count);
+    lifecycle.add("command_custody_reset_count",
+                  (uint32_t)g_recover_lifecycle_command_custody_reset_count);
+    lifecycle.add("gate_custody_reset_count",
+                  (uint32_t)g_recover_lifecycle_gate_custody_reset_count);
+    lifecycle.add("complete_count", (uint32_t)g_recover_lifecycle_complete_count);
+    lifecycle.add("abort_count", (uint32_t)g_recover_lifecycle_abort_count);
+    lifecycle.add("stale_gate_count", (uint32_t)g_recover_lifecycle_stale_gate_count);
+    lifecycle.add("last_begin_campaign_seconds",
+                  (uint32_t)g_recover_lifecycle_last_begin_campaign_seconds);
+    lifecycle.add("last_gate_campaign_seconds",
+                  (uint32_t)g_recover_lifecycle_last_gate_campaign_seconds);
+    lifecycle.add("last_abort_campaign_seconds",
+                  (uint32_t)g_recover_lifecycle_last_abort_campaign_seconds);
+    p.add_object("lifecycle", lifecycle);
+  }
 
-  p.add("reattach_ready", g_recover_reattach_last_ocxo1.ready && g_recover_reattach_last_ocxo2.ready);
-  p.add("reattach_ocxo1_ready", g_recover_reattach_last_ocxo1.ready);
-  p.add("reattach_ocxo2_ready", g_recover_reattach_last_ocxo2.ready);
-  payload_add_recover_reattach_flat_fields(p, "o1", g_recover_reattach_last_ocxo1);
-  payload_add_recover_reattach_flat_fields(p, "o2", g_recover_reattach_last_ocxo2);
-  payload_add_stack_witness(p);
+  {
+    Payload request;
+    request.add("count", g_recover_request_count);
+    request.add("campaign", g_recover_last_campaign);
+    request.add("campaign_supplied", g_recover_last_campaign_supplied);
+    request.add("base_count", g_recover_last_base_count);
+    request.add("expected_first_public_count", g_recover_last_expected_first_public_count);
+    request.add("base_gnss_ns", g_recover_last_base_gnss_ns);
+    request.add("base_dwt_ns", g_recover_last_base_dwt_ns);
+    request.add("base_ocxo1_ns", g_recover_last_base_ocxo1_ns);
+    request.add("base_ocxo2_ns", g_recover_last_base_ocxo2_ns);
+    request.add("interrupt_publication_reset_count",
+                interrupt_recover_publication_custody_reset_count());
+    p.add_object("request", request);
+  }
+
+  {
+    Payload state;
+    state.add("campaign_state", clocks_campaign_state_name(campaign_state));
+    state.add("campaign", campaign_name);
+    state.add("campaign_label_present", campaign_name[0] != '\0');
+    state.add("campaign_seconds", campaign_seconds);
+    state.add("warmup_active", campaign_warmup_active());
+    state.add("warmup_mode", (uint32_t)((uint8_t)g_campaign_warmup_mode));
+    state.add("recover_clean_ready", recover_clean_ready);
+    state.add("recover_clean_blocked", !recover_clean_ready);
+    state.add("watchdog_anomaly_active", watchdog_anomaly_active);
+    state.add("watchdog_campaign_surrendered", (bool)watchdog_campaign_surrendered);
+    state.add("watchdog_publication_blocked", clocks_watchdog_publication_blocked());
+    state.add("watchdog_campaign_armed", clocks_watchdog_campaign_armed());
+    state.add("watchdog_campaign_name_required", false);
+    p.add_object("state", state);
+  }
+
+  {
+    Payload timebase;
+    timebase.add("last_public_count", g_timebase_last_public_count);
+    timebase.add("last_public_gnss_ns", g_timebase_last_public_gnss_ns);
+    timebase.add("candidate_count", g_timebase_candidate_count);
+    timebase.add("last_stage", g_timebase_last_stage);
+    timebase.add("last_stage_name", timebase_build_stage_name(g_timebase_last_stage));
+    p.add_object("timebase", timebase);
+  }
+
+  {
+    Payload continuity;
+    continuity.add("pending", (bool)g_recover_continuity_align_pending);
+    continuity.add("count", g_recover_continuity_align_count);
+    continuity.add("failure_count", g_recover_continuity_align_failure_count);
+    continuity.add("requested_public_count",
+                   g_recover_continuity_align_requested_public_count);
+    continuity.add("last_public_count", g_recover_continuity_align_last_public_count);
+    continuity.add("reason", g_recover_continuity_last_reason);
+    continuity.add("ocxo1_target_ns", g_recover_continuity_ocxo1_target_ns);
+    continuity.add("ocxo2_target_ns", g_recover_continuity_ocxo2_target_ns);
+    continuity.add("ocxo1_before_ns", g_recover_continuity_ocxo1_before_ns);
+    continuity.add("ocxo2_before_ns", g_recover_continuity_ocxo2_before_ns);
+    continuity.add("ocxo1_after_ns", g_recover_continuity_ocxo1_after_ns);
+    continuity.add("ocxo2_after_ns", g_recover_continuity_ocxo2_after_ns);
+    continuity.add("ocxo1_correction_ns", g_recover_continuity_ocxo1_correction_ns);
+    continuity.add("ocxo2_correction_ns", g_recover_continuity_ocxo2_correction_ns);
+    p.add_object("continuity_alignment", continuity);
+  }
+
+  {
+    Payload reattach;
+    reattach.add("active", (bool)g_recover_reattach_active);
+    reattach.add("degraded_active", (bool)g_recover_reattach_degraded_active);
+    reattach.add("ready", reattach_ready);
+    reattach.add("ocxo1_ready", g_recover_reattach_last_ocxo1.ready);
+    reattach.add("ocxo2_ready", g_recover_reattach_last_ocxo2.ready);
+    reattach.add("reason", g_recover_reattach_last_reason);
+    reattach.add("begin_count", g_recover_reattach_begin_count);
+    reattach.add("hold_count", g_recover_reattach_hold_count);
+    reattach.add("release_count", g_recover_reattach_release_count);
+    reattach.add("hidden_candidate_count", g_recover_reattach_hidden_candidate_count);
+    reattach.add("last_hidden_public_count", g_recover_reattach_last_hidden_public_count);
+    reattach.add("last_release_public_count", g_recover_reattach_last_release_public_count);
+
+    Payload timeout;
+    timeout.add("timeout_candidates", (uint32_t)CLOCKS_RECOVER_REATTACH_TIMEOUT_CANDIDATES);
+    timeout.add("timeout_release_degraded", CLOCKS_RECOVER_REATTACH_TIMEOUT_RELEASE_DEGRADED);
+    timeout.add("timeout_count", g_recover_reattach_timeout_count);
+    reattach.add_object("timeout", timeout);
+
+    Payload degraded;
+    degraded.add("release_count", g_recover_reattach_degraded_release_count);
+    degraded.add("clear_count", g_recover_reattach_degraded_clear_count);
+    degraded.add("public_row_count", g_recover_reattach_degraded_public_row_count);
+    degraded.add("window_row_count", g_recover_reattach_degraded_window_row_count);
+    degraded.add("publication_stalled", (bool)g_recover_reattach_stalled);
+    degraded.add("stall_count", g_recover_reattach_stall_count);
+    degraded.add("stall_threshold",
+                 (uint32_t)CLOCKS_RECOVER_REATTACH_DEGRADED_STALL_CANDIDATES);
+    degraded.add("stall_reason", g_recover_reattach_stall_reason);
+    degraded.add("stall_last_public_count", g_recover_reattach_last_stall_public_count);
+    degraded.add("science_suppressed_count",
+                 g_recover_reattach_degraded_science_suppressed_count);
+    degraded.add("last_release_public_count",
+                 g_recover_reattach_last_degraded_release_public_count);
+    degraded.add("last_public_count", g_recover_reattach_last_degraded_public_count);
+    reattach.add_object("degraded", degraded);
+
+    Payload lanes;
+    {
+      Payload lane;
+      payload_add_recover_reattach_flat_fields(lane, "", g_recover_reattach_last_ocxo1);
+      lanes.add_object("ocxo1", lane);
+    }
+    {
+      Payload lane;
+      payload_add_recover_reattach_flat_fields(lane, "", g_recover_reattach_last_ocxo2);
+      lanes.add_object("ocxo2", lane);
+    }
+    reattach.add_object("lanes", lanes);
+
+    p.add_object("reattach", reattach);
+  }
+
+  {
+    Payload science;
+    science.add("quarantine_remaining", g_science_residual_quarantine_remaining);
+    science.add("quarantine_begin_count", g_science_residual_quarantine_begin_count);
+    science.add("quarantine_consumed_count", g_science_residual_quarantine_consumed_count);
+    science.add("quarantine_last_public_count", g_science_residual_quarantine_last_public_count);
+    p.add_object("science", science);
+  }
+
+  {
+    Payload delta;
+    delta.add("gate_min_cycles", (uint32_t)CLOCKS_DELTA_RAW_INTERVAL_MIN_CYCLES);
+    delta.add("gate_max_cycles", (uint32_t)CLOCKS_DELTA_RAW_INTERVAL_MAX_CYCLES);
+    delta.add("reject_count", g_delta_raw_interval_reject_count);
+    delta.add("reject_reference_count", g_delta_raw_interval_reject_reference_count);
+    delta.add("reject_clock_count", g_delta_raw_interval_reject_clock_count);
+    delta.add("sentinel_reject_count", g_delta_raw_interval_sentinel_reject_count);
+    delta.add("plausibility_reject_count", g_delta_raw_interval_plausibility_reject_count);
+    delta.add("last_public_count", g_delta_raw_interval_last_public_count);
+    delta.add("last_clock_id", g_delta_raw_interval_last_clock_id);
+    delta.add("last_reference_cycles", g_delta_raw_interval_last_reference_cycles);
+    delta.add("last_clock_cycles", g_delta_raw_interval_last_clock_cycles);
+    delta.add("last_reject_field", g_delta_raw_interval_last_reject_field);
+    delta.add("last_reject_reason", g_delta_raw_interval_last_reject_reason);
+    p.add_object("delta_raw_interval_gate", delta);
+  }
+
+  {
+    Payload stack;
+    payload_add_stack_witness(stack);
+    p.add_object("stack", stack);
+  }
+
   clocks_stack_witness_note_command(CLOCKS_STACK_CONTEXT_REPORT_RECOVERY);
   return p;
 }
@@ -11840,7 +12156,8 @@ static FLASHMEM Payload cmd_report_integrity(const Payload&) {
   p.add("description",
         "Reporting-only draconian integrity counters; no repair, no mutation, no authority changes");
 
-  interrupt_integrity_snapshot_t is{};
+  interrupt_integrity_snapshot_t& is = g_beta_report_interrupt_integrity_scratch;
+  is = interrupt_integrity_snapshot_t{};
   const bool interrupt_ok = interrupt_integrity_snapshot(&is);
   Payload interrupt;
   interrupt.add("available", interrupt_ok);
@@ -11860,7 +12177,8 @@ static FLASHMEM Payload cmd_report_integrity(const Payload&) {
                                       is.ocxo2_counter);
   p.add_object("interrupt", interrupt);
 
-  clocks_alpha_integrity_snapshot_t as{};
+  clocks_alpha_integrity_snapshot_t& as = g_beta_report_alpha_integrity_scratch;
+  as = clocks_alpha_integrity_snapshot_t{};
   const bool alpha_ok = clocks_alpha_integrity_snapshot(&as);
   Payload alpha;
   alpha.add("available", alpha_ok);
@@ -12098,7 +12416,7 @@ static FLASHMEM Payload cmd_report(const Payload&) {
   clocks_stack_witness_note_command(CLOCKS_STACK_CONTEXT_REPORT_COMPACT);
   Payload p;
   p.add("report", "CLOCKS_COMPACT");
-  p.add("subreports", "REPORT_STATUS REPORT_SUMMARY REPORT_EPOCH REPORT_SMARTZERO REPORT_INSTALLED_SMARTZERO REPORT_LIVE_SMARTZERO REPORT_FORENSICS REPORT_FORENSICS_VCLOCK REPORT_FORENSICS_OCXO1 REPORT_FORENSICS_OCXO2 REPORT_OCXO_PPS_PROJECTION REPORT_OCXO_PROJECTION_GUARD REPORT_TIMEBASE_PUBLISH REPORT_RECOVERY REPORT_RECOVER_STATUS REPORT_RECOVER REPORT_STACK_TINY REPORT_STACK_WITNESS REPORT_STACK REPORT_STARTUP REPORT_INTEGRITY REPORT_ALPHA_FLOW REPORT_ALPHA_FLOW_VCLOCK REPORT_ALPHA_FLOW_OCXO1 REPORT_ALPHA_FLOW_OCXO2 REPORT_PREDICTION REPORT_STATS REPORT_DAC DITHER_STATUS DITHER_ENABLE DITHER_DISABLE");
+  p.add("subreports", "REPORT_STATUS REPORT_SUMMARY REPORT_EPOCH REPORT_SMARTZERO REPORT_INSTALLED_SMARTZERO REPORT_LIVE_SMARTZERO REPORT_FORENSICS REPORT_FORENSICS_VCLOCK REPORT_FORENSICS_OCXO1 REPORT_FORENSICS_OCXO2 REPORT_OCXO_PPS_PROJECTION REPORT_OCXO_PROJECTION_GUARD REPORT_TIMEBASE_PUBLISH REPORT_TIMEBASE_PUBLISH_DEEP REPORT_RECOVERY REPORT_RECOVERY_DEEP REPORT_RECOVER_STATUS REPORT_RECOVER REPORT_STACK_TINY REPORT_STACK_WITNESS REPORT_STACK REPORT_STARTUP REPORT_INTEGRITY REPORT_ALPHA_FLOW REPORT_ALPHA_FLOW_VCLOCK REPORT_ALPHA_FLOW_OCXO1 REPORT_ALPHA_FLOW_OCXO2 REPORT_PREDICTION REPORT_STATS REPORT_DAC DITHER_STATUS DITHER_ENABLE DITHER_DISABLE");
   add_summary_payload(p);
   add_campaign_payload(p);
 
@@ -12157,7 +12475,8 @@ static FLASHMEM Payload cmd_report_smartzero(const Payload&) {
 static FLASHMEM Payload cmd_report_installed_smartzero(const Payload&) {
   Payload p;
   p.add("report", "CLOCKS_INSTALLED_SMARTZERO");
-  interrupt_smartzero_snapshot_t installed{};
+  interrupt_smartzero_snapshot_t& installed = g_beta_report_installed_smartzero_scratch;
+  installed = interrupt_smartzero_snapshot_t{};
   const bool installed_valid = clocks_alpha_epoch_last_smartzero(&installed);
   payload_add_smartzero_snapshot_object(
       p,
@@ -12175,7 +12494,8 @@ static FLASHMEM Payload cmd_report_installed_smartzero(const Payload&) {
 static FLASHMEM Payload cmd_report_live_smartzero(const Payload&) {
   Payload p;
   p.add("report", "CLOCKS_LIVE_SMARTZERO");
-  interrupt_smartzero_snapshot_t live{};
+  interrupt_smartzero_snapshot_t& live = g_beta_report_live_smartzero_scratch;
+  live = interrupt_smartzero_snapshot_t{};
   (void)interrupt_smartzero_live_snapshot(&live);
   payload_add_smartzero_snapshot_object(p, "live_smartzero", live, true, true);
   return p;
@@ -12335,8 +12655,10 @@ static FLASHMEM Payload cmd_report_stats(const Payload&) {
                                       campaign_public_dwt_total()));
   publish_freq(p, "vclock", 0.0);
 
-  clocks_alpha_tau_snapshot_t ocxo1_tau{};
-  clocks_alpha_tau_snapshot_t ocxo2_tau{};
+  clocks_alpha_tau_snapshot_t& ocxo1_tau = g_beta_report_ocxo1_tau_scratch;
+  ocxo1_tau = clocks_alpha_tau_snapshot_t{};
+  clocks_alpha_tau_snapshot_t& ocxo2_tau = g_beta_report_ocxo2_tau_scratch;
+  ocxo2_tau = clocks_alpha_tau_snapshot_t{};
   const bool ocxo1_tau_ok = clocks_alpha_ocxo_tau_snapshot(
       time_clock_id_t::OCXO1, &ocxo1_tau);
   const bool ocxo2_tau_ok = clocks_alpha_ocxo_tau_snapshot(
@@ -12615,7 +12937,9 @@ static const process_command_entry_t CLOCKS_COMMANDS[] = {
   { "REPORT_OCXO_PPS_PROJECTION", cmd_report_ocxo_pps_projection },
   { "REPORT_OCXO_PROJECTION_GUARD", cmd_report_ocxo_projection_guard },
   { "REPORT_TIMEBASE_PUBLISH", cmd_report_timebase_publish },
+  { "REPORT_TIMEBASE_PUBLISH_DEEP", cmd_report_timebase_publish_deep },
   { "REPORT_RECOVERY",         cmd_report_recovery         },
+  { "REPORT_RECOVERY_DEEP",    cmd_report_recovery_deep    },
   { "REPORT_RECOVER_STATUS",   cmd_report_recovery         },
   { "REPORT_RECOVER",          cmd_report_recovery         },
   { "REPORT_STACK_TINY",       cmd_report_stack_tiny       },

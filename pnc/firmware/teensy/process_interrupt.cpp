@@ -255,6 +255,7 @@ static constexpr uint32_t COUNTER32_LINEAGE_LOCK_STREAK = 8U;
 static constexpr bool QTIMER_DWT_1KHZ_REQUIRES_ONE_SECOND_LOCK = true;
 
 static interrupt_integrity_snapshot_t g_interrupt_integrity DMAMEM = {};
+static interrupt_integrity_snapshot_t g_interrupt_integrity_report_scratch DMAMEM = {};
 
 static void interrupt_integrity_note_vclock_gnss_ns(uint32_t sequence,
                                                     uint32_t dwt_at_edge,
@@ -13406,7 +13407,8 @@ static FLASHMEM Payload cmd_report_integrity(const Payload&) {
   // The old monolithic integrity report was too large for the command path.
   // This surface reports only the launch-annunciator facts needed to diagnose
   // QTIMER_DWT_RULER and related custody gates.
-  interrupt_integrity_snapshot_t s{};
+  interrupt_integrity_snapshot_t& s = g_interrupt_integrity_report_scratch;
+  s = interrupt_integrity_snapshot_t{};
   const bool snapshot_valid = interrupt_integrity_snapshot(&s);
 
   const interrupt_integrity_qtimer_dwt_interval_check_t& d1 =
