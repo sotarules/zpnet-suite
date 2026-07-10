@@ -1014,10 +1014,34 @@ static FLASHMEM Payload cmd_memory_info(const Payload& /*args*/) {
     p.add("dtcm_total",          info.dtcm_total);
     p.add("dtcm_static",         info.dtcm_static);
     p.add("dtcm_stack_avail",    info.dtcm_stack_avail);
+    p.add("memory_info_initialized", info.initialized);
+    p.add_fmt("stack_init_sp", "0x%08lX",
+              (unsigned long)info.stack_init_sp);
 
     p.add("stack_current",       info.stack_current);
     p.add("stack_high_water",    info.stack_high_water);
     p.add("stack_usage_pct",     info.stack_usage_pct);
+    p.add("stack_free_pct",      info.stack_free_pct);
+    p.add("stack_free_current",  info.stack_free_current);
+    p.add("stack_free_high_water", info.stack_free_high_water);
+    p.add("stack_collision_warn_bytes", info.stack_collision_warn_bytes);
+    p.add("stack_collision_risk", info.stack_collision_risk);
+
+    p.add("stack_paint_enabled",      info.stack_paint_enabled);
+    p.add("stack_paint_overrun",      info.stack_paint_overrun);
+    p.add_fmt("stack_paint_pattern", "0x%08lX",
+              (unsigned long)info.stack_paint_pattern);
+    p.add_fmt("stack_paint_start", "0x%08lX",
+              (unsigned long)info.stack_paint_start);
+    p.add_fmt("stack_paint_end", "0x%08lX",
+              (unsigned long)info.stack_paint_end);
+    p.add_fmt("stack_paint_deepest_addr", "0x%08lX",
+              (unsigned long)info.stack_paint_deepest_addr);
+    p.add("stack_paint_guard_bytes", info.stack_paint_guard_bytes);
+    p.add("stack_paint_bytes",       info.stack_paint_bytes);
+    p.add("stack_paint_used",        info.stack_paint_used);
+    p.add("stack_paint_unused",      info.stack_paint_unused);
+    p.add("stack_paint_clobbered",   info.stack_paint_clobbered);
 
     // ==========================================================
     // Heap (RAM2)

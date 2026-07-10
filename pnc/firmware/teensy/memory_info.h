@@ -53,8 +53,31 @@ struct memory_info_t {
     uint32_t dtcm_static;             // bytes used by globals + bss
     uint32_t dtcm_stack_avail;        // total bytes available for stack (dtcm_total - dtcm_static)
 
-    uint32_t stack_current;           // current stack depth in bytes
-    uint32_t stack_high_water;        // deepest stack usage observed (via sentinel painting)
+    bool     initialized;             // true after memory_info_init() completed
+    uint32_t stack_init_sp;           // SP observed during memory_info_init()
+    uint32_t stack_current;           // current stack depth in bytes from _estack down
+    uint32_t stack_high_water;        // deepest stack usage observed (SP low-water + sentinel)
+
+    // Empirical DTCM stack sentinel. memory_info_init() paints the unused
+    // DTCM runway below the early setup() stack pointer. Later snapshots scan
+    // that runway to discover the deepest address the descending stack has
+    // actually touched, even if no report sampled SP at the deepest moment.
+    bool     stack_paint_enabled;     // true if the DTCM sentinel was installed
+    bool     stack_paint_overrun;     // true if the painted runway was fully consumed
+    uint32_t stack_paint_pattern;     // sentinel word value
+    uint32_t stack_paint_guard_bytes; // bytes intentionally left below init SP
+    uint32_t stack_paint_start;       // first painted DTCM address
+    uint32_t stack_paint_end;         // one-past-last painted DTCM address
+    uint32_t stack_paint_bytes;       // paint_end - paint_start
+    uint32_t stack_paint_used;        // conservative high-end consumption of painted runway
+    uint32_t stack_paint_unused;      // untouched low-end runway above static DTCM
+    uint32_t stack_paint_clobbered;   // exact number of non-sentinel bytes found
+    uint32_t stack_paint_deepest_addr;// lowest painted address observed non-sentinel, 0 if none
+
+    uint32_t stack_free_current;      // current SP - static_end, 0 if already overlapping
+    uint32_t stack_free_high_water;   // minimum observed free runway above static DTCM
+    uint32_t stack_collision_warn_bytes; // warning threshold for stack_free_high_water
+    bool     stack_collision_risk;    // high-water runway is at/below warning threshold
 
     // --------------------------------------------------------
     // Heap (RAM2 / OCRAM)
@@ -75,6 +98,7 @@ struct memory_info_t {
 
     uint32_t heap_fragmentation_pct;  // (free_internal * 100) / heap_arena, 0 if arena == 0
     uint32_t stack_usage_pct;         // (stack_high_water * 100) / dtcm_stack_avail
+    uint32_t stack_free_pct;          // (stack_free_high_water * 100) / dtcm_stack_avail
     bool     heap_growing;            // true if heap_arena > previous snapshot (possible leak)
 };
 
