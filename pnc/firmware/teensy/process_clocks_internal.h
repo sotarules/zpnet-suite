@@ -334,6 +334,18 @@ static inline const char* clocks_phaseledger_resolve_reason_name(uint32_t id) {
   }
 }
 
+static constexpr uint32_t CLOCKS_PHASELEDGER_RESOLVE_SOURCE_NONE = 0U;
+static constexpr uint32_t CLOCKS_PHASELEDGER_RESOLVE_SOURCE_OCXO_EDGE = 1U;
+static constexpr uint32_t CLOCKS_PHASELEDGER_RESOLVE_SOURCE_PPS_CATCHUP = 2U;
+
+static inline const char* clocks_phaseledger_resolve_source_name(uint32_t id) {
+  switch (id) {
+    case CLOCKS_PHASELEDGER_RESOLVE_SOURCE_OCXO_EDGE: return "OCXO_EDGE";
+    case CLOCKS_PHASELEDGER_RESOLVE_SOURCE_PPS_CATCHUP: return "PPS_CATCHUP";
+    default: return "NONE";
+  }
+}
+
 struct clocks_alpha_ocxo_counterledger_snapshot_t {
   bool     valid = false;
   bool     initialized = false;
@@ -394,6 +406,26 @@ struct clocks_alpha_ocxo_counterledger_snapshot_t {
   uint32_t phase_pending_last_resolved_pps_sequence = 0;
   uint32_t phase_pending_last_dropped_pps_sequence = 0;
   uint32_t phase_pending_last_matched_index = 0;
+
+  // PhaseLedger resolver liveness.  The pending ring is only custody memory;
+  // these fields prove whether Alpha had a recent OCXO edge pair available,
+  // whether PPS-sample-side catch-up attempted to use it, and which source
+  // produced the last resolver verdict.
+  bool     phase_last_edge_pair_valid = false;
+  uint32_t phase_last_edge_pair_previous_dwt = 0;
+  uint32_t phase_last_edge_pair_next_dwt = 0;
+  uint32_t phase_last_edge_pair_interval_cycles = 0;
+  uint32_t phase_last_edge_pair_counter_delta_ticks = 0;
+  uint32_t phase_last_edge_pair_update_count = 0;
+  uint32_t phase_catchup_attempt_count = 0;
+  uint32_t phase_catchup_success_count = 0;
+  uint32_t phase_catchup_no_edge_pair_count = 0;
+  uint32_t phase_catchup_no_pending_count = 0;
+  uint32_t phase_catchup_unbracketed_count = 0;
+  uint32_t phase_catchup_bad_counter_delta_count = 0;
+  uint32_t phase_last_catchup_pps_sequence = 0;
+  uint32_t phase_last_catchup_reason_id = CLOCKS_PHASELEDGER_RESOLVE_REASON_NONE;
+  uint32_t phase_last_resolve_source_id = CLOCKS_PHASELEDGER_RESOLVE_SOURCE_NONE;
 
   uint32_t phase_invalid_count = 0;
 
@@ -1256,6 +1288,21 @@ struct clocks_alpha_recover_reattach_snapshot_t {
   uint32_t counterledger_phase_pending_last_resolved_pps_sequence = 0;
   uint32_t counterledger_phase_pending_last_dropped_pps_sequence = 0;
   uint32_t counterledger_phase_pending_last_matched_index = 0;
+  bool     counterledger_phase_last_edge_pair_valid = false;
+  uint32_t counterledger_phase_last_edge_pair_previous_dwt = 0;
+  uint32_t counterledger_phase_last_edge_pair_next_dwt = 0;
+  uint32_t counterledger_phase_last_edge_pair_interval_cycles = 0;
+  uint32_t counterledger_phase_last_edge_pair_counter_delta_ticks = 0;
+  uint32_t counterledger_phase_last_edge_pair_update_count = 0;
+  uint32_t counterledger_phase_catchup_attempt_count = 0;
+  uint32_t counterledger_phase_catchup_success_count = 0;
+  uint32_t counterledger_phase_catchup_no_edge_pair_count = 0;
+  uint32_t counterledger_phase_catchup_no_pending_count = 0;
+  uint32_t counterledger_phase_catchup_unbracketed_count = 0;
+  uint32_t counterledger_phase_catchup_bad_counter_delta_count = 0;
+  uint32_t counterledger_phase_last_catchup_pps_sequence = 0;
+  uint32_t counterledger_phase_last_catchup_reason_id = CLOCKS_PHASELEDGER_RESOLVE_REASON_NONE;
+  uint32_t counterledger_last_phase_resolve_source_id = CLOCKS_PHASELEDGER_RESOLVE_SOURCE_NONE;
   uint32_t counterledger_last_delta_ticks = 0;
   uint32_t counterledger_interval_implausible_count = 0;
   uint32_t counterledger_last_implausible_delta_ticks = 0;

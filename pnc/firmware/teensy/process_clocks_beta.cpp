@@ -4949,6 +4949,25 @@ static FLASHMEM void payload_add_micro_counterledger_fields(
   add_u32("cl_pend_drop_seq", s.phase_pending_last_dropped_pps_sequence);
   add_u32("cl_pend_idx", s.phase_pending_last_matched_index);
   add_u32("cl_pend_legacy_ovw", s.phase_pending_overwrite_count);
+  add_bool("cl_edge_pair", s.phase_last_edge_pair_valid);
+  add_u32("cl_edge_pair_prev", s.phase_last_edge_pair_previous_dwt);
+  add_u32("cl_edge_pair_next", s.phase_last_edge_pair_next_dwt);
+  add_u32("cl_edge_pair_int", s.phase_last_edge_pair_interval_cycles);
+  add_u32("cl_edge_pair_ctr", s.phase_last_edge_pair_counter_delta_ticks);
+  add_u32("cl_edge_pair_upd", s.phase_last_edge_pair_update_count);
+  add_u32("cl_catch_attempt", s.phase_catchup_attempt_count);
+  add_u32("cl_catch_success", s.phase_catchup_success_count);
+  add_u32("cl_catch_no_pair", s.phase_catchup_no_edge_pair_count);
+  add_u32("cl_catch_no_pending", s.phase_catchup_no_pending_count);
+  add_u32("cl_catch_unbr", s.phase_catchup_unbracketed_count);
+  add_u32("cl_catch_bad_ctr", s.phase_catchup_bad_counter_delta_count);
+  add_u32("cl_catch_pps", s.phase_last_catchup_pps_sequence);
+  add_u32("cl_catch_reason", s.phase_last_catchup_reason_id);
+  add_str("cl_catch_reason_name",
+          clocks_phaseledger_resolve_reason_name(s.phase_last_catchup_reason_id));
+  add_u32("cl_last_res_source", s.phase_last_resolve_source_id);
+  add_str("cl_last_res_source_name",
+          clocks_phaseledger_resolve_source_name(s.phase_last_resolve_source_id));
 
   add_u32("cl_res_attempt", s.phase_resolve_attempt_count);
   add_u32("cl_res_no_pending", s.phase_resolve_no_pending_count);
@@ -5513,6 +5532,44 @@ static void clocks_beta_add_ocxo_science_custody_violation(
         ledger.phase_pending_last_resolved_pps_sequence);
   v.add("counterledger_phase_pending_last_dropped_pps_sequence",
         ledger.phase_pending_last_dropped_pps_sequence);
+  v.add("counterledger_phase_pending_last_matched_index",
+        ledger.phase_pending_last_matched_index);
+  v.add("counterledger_phase_last_edge_pair_valid",
+        ledger.phase_last_edge_pair_valid);
+  v.add("counterledger_phase_last_edge_pair_previous_dwt",
+        ledger.phase_last_edge_pair_previous_dwt);
+  v.add("counterledger_phase_last_edge_pair_next_dwt",
+        ledger.phase_last_edge_pair_next_dwt);
+  v.add("counterledger_phase_last_edge_pair_interval_cycles",
+        ledger.phase_last_edge_pair_interval_cycles);
+  v.add("counterledger_phase_last_edge_pair_counter_delta_ticks",
+        ledger.phase_last_edge_pair_counter_delta_ticks);
+  v.add("counterledger_phase_last_edge_pair_update_count",
+        ledger.phase_last_edge_pair_update_count);
+  v.add("counterledger_phase_catchup_attempt_count",
+        ledger.phase_catchup_attempt_count);
+  v.add("counterledger_phase_catchup_success_count",
+        ledger.phase_catchup_success_count);
+  v.add("counterledger_phase_catchup_no_edge_pair_count",
+        ledger.phase_catchup_no_edge_pair_count);
+  v.add("counterledger_phase_catchup_no_pending_count",
+        ledger.phase_catchup_no_pending_count);
+  v.add("counterledger_phase_catchup_unbracketed_count",
+        ledger.phase_catchup_unbracketed_count);
+  v.add("counterledger_phase_catchup_bad_counter_delta_count",
+        ledger.phase_catchup_bad_counter_delta_count);
+  v.add("counterledger_phase_last_catchup_pps_sequence",
+        ledger.phase_last_catchup_pps_sequence);
+  v.add("counterledger_phase_last_catchup_reason_id",
+        ledger.phase_last_catchup_reason_id);
+  v.add("counterledger_phase_last_catchup_reason",
+        clocks_phaseledger_resolve_reason_name(
+            ledger.phase_last_catchup_reason_id));
+  v.add("counterledger_last_phase_resolve_source_id",
+        ledger.phase_last_resolve_source_id);
+  v.add("counterledger_last_phase_resolve_source",
+        clocks_phaseledger_resolve_source_name(
+            ledger.phase_last_resolve_source_id));
   v.add("counterledger_last_phase_resolve_reason_id",
         ledger.last_phase_resolve_reason_id);
   v.add("counterledger_last_phase_resolve_reason",
@@ -11694,6 +11751,42 @@ static FLASHMEM void payload_add_recover_reattach_flat_fields(
           s.counterledger_last_phase_resolve_interval_cycles);
   add_u32("counterledger_last_phase_resolve_pps_delta_cycles",
           s.counterledger_last_phase_resolve_pps_delta_cycles);
+  add_u32("counterledger_phase_last_edge_pair_valid",
+          s.counterledger_phase_last_edge_pair_valid ? 1U : 0U);
+  add_u32("counterledger_phase_last_edge_pair_previous_dwt",
+          s.counterledger_phase_last_edge_pair_previous_dwt);
+  add_u32("counterledger_phase_last_edge_pair_next_dwt",
+          s.counterledger_phase_last_edge_pair_next_dwt);
+  add_u32("counterledger_phase_last_edge_pair_interval_cycles",
+          s.counterledger_phase_last_edge_pair_interval_cycles);
+  add_u32("counterledger_phase_last_edge_pair_counter_delta_ticks",
+          s.counterledger_phase_last_edge_pair_counter_delta_ticks);
+  add_u32("counterledger_phase_last_edge_pair_update_count",
+          s.counterledger_phase_last_edge_pair_update_count);
+  add_u32("counterledger_phase_catchup_attempt_count",
+          s.counterledger_phase_catchup_attempt_count);
+  add_u32("counterledger_phase_catchup_success_count",
+          s.counterledger_phase_catchup_success_count);
+  add_u32("counterledger_phase_catchup_no_edge_pair_count",
+          s.counterledger_phase_catchup_no_edge_pair_count);
+  add_u32("counterledger_phase_catchup_no_pending_count",
+          s.counterledger_phase_catchup_no_pending_count);
+  add_u32("counterledger_phase_catchup_unbracketed_count",
+          s.counterledger_phase_catchup_unbracketed_count);
+  add_u32("counterledger_phase_catchup_bad_counter_delta_count",
+          s.counterledger_phase_catchup_bad_counter_delta_count);
+  add_u32("counterledger_phase_last_catchup_pps_sequence",
+          s.counterledger_phase_last_catchup_pps_sequence);
+  add_u32("counterledger_phase_last_catchup_reason_id",
+          s.counterledger_phase_last_catchup_reason_id);
+  add_str("counterledger_phase_last_catchup_reason",
+          clocks_phaseledger_resolve_reason_name(
+              s.counterledger_phase_last_catchup_reason_id));
+  add_u32("counterledger_last_phase_resolve_source_id",
+          s.counterledger_last_phase_resolve_source_id);
+  add_str("counterledger_last_phase_resolve_source",
+          clocks_phaseledger_resolve_source_name(
+              s.counterledger_last_phase_resolve_source_id));
   add_u32("counterledger_refined_interval_accept_count",
           s.counterledger_refined_interval_accept_count);
   add_u32("counterledger_recover_refined_interval_accept_count",

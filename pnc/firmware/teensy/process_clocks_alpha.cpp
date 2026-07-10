@@ -2379,6 +2379,22 @@ struct alpha_pps_counterledger_lane_t {
   uint32_t phase_pending_last_dropped_pps_sequence = 0;
   uint32_t phase_pending_last_matched_index = 0;
 
+  bool     phase_last_edge_pair_valid = false;
+  uint32_t phase_last_edge_pair_previous_dwt = 0;
+  uint32_t phase_last_edge_pair_next_dwt = 0;
+  uint32_t phase_last_edge_pair_interval_cycles = 0;
+  uint32_t phase_last_edge_pair_counter_delta_ticks = 0;
+  uint32_t phase_last_edge_pair_update_count = 0;
+  uint32_t phase_catchup_attempt_count = 0;
+  uint32_t phase_catchup_success_count = 0;
+  uint32_t phase_catchup_no_edge_pair_count = 0;
+  uint32_t phase_catchup_no_pending_count = 0;
+  uint32_t phase_catchup_unbracketed_count = 0;
+  uint32_t phase_catchup_bad_counter_delta_count = 0;
+  uint32_t phase_last_catchup_pps_sequence = 0;
+  uint32_t phase_last_catchup_reason_id = CLOCKS_PHASELEDGER_RESOLVE_REASON_NONE;
+  uint32_t phase_last_resolve_source_id = CLOCKS_PHASELEDGER_RESOLVE_SOURCE_NONE;
+
   bool     phase_valid = false;
   bool     phase_near_boundary = false;
   uint32_t phase_source_id = ALPHA_COUNTERLEDGER_PHASE_SOURCE_NONE;
@@ -3010,6 +3026,21 @@ static void alpha_counterledger_reprime_lane_for_recover(
   s.phase_pending_last_resolved_pps_sequence = 0;
   s.phase_pending_last_dropped_pps_sequence = 0;
   s.phase_pending_last_matched_index = 0;
+  s.phase_last_edge_pair_valid = false;
+  s.phase_last_edge_pair_previous_dwt = 0;
+  s.phase_last_edge_pair_next_dwt = 0;
+  s.phase_last_edge_pair_interval_cycles = 0;
+  s.phase_last_edge_pair_counter_delta_ticks = 0;
+  s.phase_last_edge_pair_update_count = 0;
+  s.phase_catchup_attempt_count = 0;
+  s.phase_catchup_success_count = 0;
+  s.phase_catchup_no_edge_pair_count = 0;
+  s.phase_catchup_no_pending_count = 0;
+  s.phase_catchup_unbracketed_count = 0;
+  s.phase_catchup_bad_counter_delta_count = 0;
+  s.phase_last_catchup_pps_sequence = 0;
+  s.phase_last_catchup_reason_id = CLOCKS_PHASELEDGER_RESOLVE_REASON_NONE;
+  s.phase_last_resolve_source_id = CLOCKS_PHASELEDGER_RESOLVE_SOURCE_NONE;
   s.phase_valid = false;
   s.phase_near_boundary = false;
   s.phase_source_id = ALPHA_COUNTERLEDGER_PHASE_SOURCE_NONE;
@@ -3237,6 +3268,10 @@ static void alpha_counterledger_note_sample_decision(
   }
 }
 
+static bool alpha_counterledger_phase_catchup_from_last_edge_pair(
+    time_clock_id_t clock,
+    alpha_pps_counterledger_lane_t& s);
+
 static bool alpha_counterledger_apply_pps_sample(
     time_clock_id_t clock,
     alpha_pps_counterledger_lane_t& s,
@@ -3309,6 +3344,14 @@ static bool alpha_counterledger_apply_pps_sample(
   s.ns = s.ticks64 * (uint64_t)NS_PER_10MHZ_TICK;
 
   alpha_counterledger_phase_pending_enqueue(s, pps_sequence, pps_dwt_at_edge);
+
+  // PPS-sample-side catch-up: the OCXO edge resolver may have run moments
+  // before this PPS capture was enqueued and reported NO_PENDING_PPS even
+  // though its last edge pair already brackets the PPS fact.  Re-try against
+  // the cached lawful edge pair immediately, before deriving this row's
+  // refined interval.  This does not relax any PhaseLedger gate; it merely
+  // allows resolution from either event ordering.
+  (void)alpha_counterledger_phase_catchup_from_last_edge_pair(clock, s);
 
   s.last_refined_ns = previous_refined_ns;
   s.last_refined_phase_pps_sequence = previous_refined_phase_pps_sequence;
@@ -3524,13 +3567,25 @@ static void alpha_counterledger_note_phase_resolve(
   }
 }
 
-static void alpha_counterledger_resolve_phase_from_ocxo_edge(
+static bool alpha_counterledger_resolve_phase_from_ocxo_edge(
     time_clock_id_t clock,
     uint32_t previous_ocxo_dwt_at_edge,
     uint32_t next_ocxo_dwt_at_edge,
-    uint32_t counter_delta_ticks) {
+    uint32_t counter_delta_ticks,
+    uint32_t resolve_source_id) {
   alpha_pps_counterledger_lane_t* s = alpha_counterledger_lane_mut(clock);
-  if (!s) return;
+  if (!s) return false;
+
+  s->phase_last_resolve_source_id = resolve_source_id;
+  if (resolve_source_id == CLOCKS_PHASELEDGER_RESOLVE_SOURCE_OCXO_EDGE) {
+    s->phase_last_edge_pair_valid = true;
+    s->phase_last_edge_pair_previous_dwt = previous_ocxo_dwt_at_edge;
+    s->phase_last_edge_pair_next_dwt = next_ocxo_dwt_at_edge;
+    s->phase_last_edge_pair_interval_cycles =
+        next_ocxo_dwt_at_edge - previous_ocxo_dwt_at_edge;
+    s->phase_last_edge_pair_counter_delta_ticks = counter_delta_ticks;
+    s->phase_last_edge_pair_update_count++;
+  }
 
   s->phase_resolve_attempt_count++;
   if (s->recover_reprime_count != 0U) {
@@ -3545,7 +3600,7 @@ static void alpha_counterledger_resolve_phase_from_ocxo_edge(
         counter_delta_ticks,
         0U,
         0U);
-    return;
+    return false;
   }
 
   const uint32_t interval_cycles =
@@ -3558,7 +3613,7 @@ static void alpha_counterledger_resolve_phase_from_ocxo_edge(
         counter_delta_ticks,
         interval_cycles,
         0U);
-    return;
+    return false;
   }
 
   // Preserve custody of several unresolved PPS facts.  Facts that are already
@@ -3586,7 +3641,7 @@ static void alpha_counterledger_resolve_phase_from_ocxo_edge(
           counter_delta_ticks,
           interval_cycles,
           0U);
-      return;
+      return false;
     }
 
     // The remaining pending PPS fact(s) are ahead of this OCXO edge pair.
@@ -3601,7 +3656,7 @@ static void alpha_counterledger_resolve_phase_from_ocxo_edge(
         counter_delta_ticks,
         interval_cycles,
         pending_delta);
-    return;
+    return false;
   }
 
   if (counter_delta_ticks != (uint32_t)VCLOCK_COUNTS_PER_SECOND) {
@@ -3614,7 +3669,7 @@ static void alpha_counterledger_resolve_phase_from_ocxo_edge(
         counter_delta_ticks,
         interval_cycles,
         pps_delta_cycles);
-    return;
+    return false;
   }
 
   const uint64_t scaled_ticks =
@@ -3691,6 +3746,52 @@ static void alpha_counterledger_resolve_phase_from_ocxo_edge(
       counter_delta_ticks,
       interval_cycles,
       pps_delta_cycles);
+  return true;
+}
+
+static bool alpha_counterledger_phase_catchup_from_last_edge_pair(
+    time_clock_id_t clock,
+    alpha_pps_counterledger_lane_t& s) {
+  s.phase_catchup_attempt_count++;
+  s.phase_last_catchup_pps_sequence = s.phase_pending_oldest_pps_sequence;
+
+  if (!s.phase_pending) {
+    s.phase_catchup_no_pending_count++;
+    s.phase_last_catchup_reason_id =
+        CLOCKS_PHASELEDGER_RESOLVE_REASON_NO_PENDING_PPS;
+    return false;
+  }
+
+  if (!s.phase_last_edge_pair_valid ||
+      s.phase_last_edge_pair_interval_cycles == 0U) {
+    s.phase_catchup_no_edge_pair_count++;
+    s.phase_last_catchup_reason_id =
+        CLOCKS_PHASELEDGER_RESOLVE_REASON_NONE;
+    return false;
+  }
+
+  const bool ok = alpha_counterledger_resolve_phase_from_ocxo_edge(
+      clock,
+      s.phase_last_edge_pair_previous_dwt,
+      s.phase_last_edge_pair_next_dwt,
+      s.phase_last_edge_pair_counter_delta_ticks,
+      CLOCKS_PHASELEDGER_RESOLVE_SOURCE_PPS_CATCHUP);
+  s.phase_last_catchup_reason_id = s.last_phase_resolve_reason_id;
+
+  if (ok) {
+    s.phase_catchup_success_count++;
+  } else if (s.last_phase_resolve_reason_id ==
+             CLOCKS_PHASELEDGER_RESOLVE_REASON_NO_PENDING_PPS) {
+    s.phase_catchup_no_pending_count++;
+  } else if (s.last_phase_resolve_reason_id ==
+             CLOCKS_PHASELEDGER_RESOLVE_REASON_UNBRACKETED) {
+    s.phase_catchup_unbracketed_count++;
+  } else if (s.last_phase_resolve_reason_id ==
+             CLOCKS_PHASELEDGER_RESOLVE_REASON_BAD_COUNTER_DELTA) {
+    s.phase_catchup_bad_counter_delta_count++;
+  }
+
+  return ok;
 }
 
 // OCXO public nanosecond ledgers are measured GNSS-elapsed clocks, not merely
@@ -4910,6 +5011,28 @@ bool clocks_alpha_ocxo_counterledger_snapshot(
   out->phase_pending_last_dropped_pps_sequence =
       s->phase_pending_last_dropped_pps_sequence;
   out->phase_pending_last_matched_index = s->phase_pending_last_matched_index;
+  out->phase_last_edge_pair_valid = s->phase_last_edge_pair_valid;
+  out->phase_last_edge_pair_previous_dwt =
+      s->phase_last_edge_pair_previous_dwt;
+  out->phase_last_edge_pair_next_dwt = s->phase_last_edge_pair_next_dwt;
+  out->phase_last_edge_pair_interval_cycles =
+      s->phase_last_edge_pair_interval_cycles;
+  out->phase_last_edge_pair_counter_delta_ticks =
+      s->phase_last_edge_pair_counter_delta_ticks;
+  out->phase_last_edge_pair_update_count =
+      s->phase_last_edge_pair_update_count;
+  out->phase_catchup_attempt_count = s->phase_catchup_attempt_count;
+  out->phase_catchup_success_count = s->phase_catchup_success_count;
+  out->phase_catchup_no_edge_pair_count =
+      s->phase_catchup_no_edge_pair_count;
+  out->phase_catchup_no_pending_count = s->phase_catchup_no_pending_count;
+  out->phase_catchup_unbracketed_count =
+      s->phase_catchup_unbracketed_count;
+  out->phase_catchup_bad_counter_delta_count =
+      s->phase_catchup_bad_counter_delta_count;
+  out->phase_last_catchup_pps_sequence = s->phase_last_catchup_pps_sequence;
+  out->phase_last_catchup_reason_id = s->phase_last_catchup_reason_id;
+  out->phase_last_resolve_source_id = s->phase_last_resolve_source_id;
   out->phase_invalid_count = s->phase_invalid_count;
 
   out->refined_valid = s->refined_valid;
@@ -7125,6 +7248,36 @@ bool clocks_alpha_ocxo_recover_reattach_snapshot(
         ledger ? ledger->phase_pending_last_dropped_pps_sequence : 0U;
     r.counterledger_phase_pending_last_matched_index =
         ledger ? ledger->phase_pending_last_matched_index : 0U;
+    r.counterledger_phase_last_edge_pair_valid =
+        ledger ? ledger->phase_last_edge_pair_valid : false;
+    r.counterledger_phase_last_edge_pair_previous_dwt =
+        ledger ? ledger->phase_last_edge_pair_previous_dwt : 0U;
+    r.counterledger_phase_last_edge_pair_next_dwt =
+        ledger ? ledger->phase_last_edge_pair_next_dwt : 0U;
+    r.counterledger_phase_last_edge_pair_interval_cycles =
+        ledger ? ledger->phase_last_edge_pair_interval_cycles : 0U;
+    r.counterledger_phase_last_edge_pair_counter_delta_ticks =
+        ledger ? ledger->phase_last_edge_pair_counter_delta_ticks : 0U;
+    r.counterledger_phase_last_edge_pair_update_count =
+        ledger ? ledger->phase_last_edge_pair_update_count : 0U;
+    r.counterledger_phase_catchup_attempt_count =
+        ledger ? ledger->phase_catchup_attempt_count : 0U;
+    r.counterledger_phase_catchup_success_count =
+        ledger ? ledger->phase_catchup_success_count : 0U;
+    r.counterledger_phase_catchup_no_edge_pair_count =
+        ledger ? ledger->phase_catchup_no_edge_pair_count : 0U;
+    r.counterledger_phase_catchup_no_pending_count =
+        ledger ? ledger->phase_catchup_no_pending_count : 0U;
+    r.counterledger_phase_catchup_unbracketed_count =
+        ledger ? ledger->phase_catchup_unbracketed_count : 0U;
+    r.counterledger_phase_catchup_bad_counter_delta_count =
+        ledger ? ledger->phase_catchup_bad_counter_delta_count : 0U;
+    r.counterledger_phase_last_catchup_pps_sequence =
+        ledger ? ledger->phase_last_catchup_pps_sequence : 0U;
+    r.counterledger_phase_last_catchup_reason_id =
+        ledger ? ledger->phase_last_catchup_reason_id : CLOCKS_PHASELEDGER_RESOLVE_REASON_NONE;
+    r.counterledger_last_phase_resolve_source_id =
+        ledger ? ledger->phase_last_resolve_source_id : CLOCKS_PHASELEDGER_RESOLVE_SOURCE_NONE;
     r.counterledger_last_delta_ticks = ledger ? ledger->last_delta_ticks : 0U;
     r.counterledger_interval_implausible_count =
         ledger ? ledger->interval_implausible_count : 0U;
@@ -7788,11 +7941,12 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
     const bool boundary_gnss_available = sample_gnss_available;
 
     if (had_previous) {
-      alpha_counterledger_resolve_phase_from_ocxo_edge(
+      (void)alpha_counterledger_resolve_phase_from_ocxo_edge(
           time_clock,
           meas.prev_dwt_at_edge,
           applied_event.dwt_at_event,
-          counter32_delta_since_previous_event);
+          counter32_delta_since_previous_event,
+          CLOCKS_PHASELEDGER_RESOLVE_SOURCE_OCXO_EDGE);
     }
 
     alpha_ocxo_edge_history_record(time_clock,
