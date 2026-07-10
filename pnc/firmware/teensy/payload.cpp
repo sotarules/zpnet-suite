@@ -113,6 +113,57 @@ static volatile uint32_t g_payload_last_error_this       = 0;
 static char g_payload_last_error_op[32] = {0};
 
 // ============================================================================
+// Temporary bad-magic autopsy trace
+// ============================================================================
+//
+// This is intentionally a one-shot, rollback-friendly crash-hunt instrument.
+// The first Payload whose live magic is found damaged records:
+//   * discovery site and core stack registers
+//   * a best-effort r7 frame-pointer walk
+//   * plausible Thumb return addresses found in a bounded stack scan
+//
+// The trace is emitted directly through debug_log() so no Payload is required
+// to report corruption of Payload itself.  Feed the emitted addresses to
+// zpaddr against the exact ELF from the failing build.
+
+static constexpr uint32_t PAYLOAD_MAGIC_TRACE_FRAME_MAX = 8;
+static constexpr uint32_t PAYLOAD_MAGIC_TRACE_SCAN_MAX = 24;
+static constexpr uint32_t PAYLOAD_MAGIC_TRACE_SCAN_WORDS = 128;
+
+struct payload_magic_trace_t {
+    uint32_t captured;
+    uint32_t sequence;
+    uint32_t dwt;
+    uint32_t self;
+    uint32_t magic;
+    uint32_t magic_addr;
+    uint32_t discovery_pc;
+    uint32_t lr;
+    uint32_t r7;
+    uint32_t msp;
+    uint32_t psp;
+    uint32_t active_sp;
+    uint32_t control;
+    uint32_t ipsr;
+    uint32_t last_ctor_self;
+    uint32_t last_ctor_pc;
+    uint32_t last_ctor_sp;
+    uint32_t frame_count;
+    uint32_t frames[PAYLOAD_MAGIC_TRACE_FRAME_MAX];
+    uint32_t scan_count;
+    uint32_t scan_offsets[PAYLOAD_MAGIC_TRACE_SCAN_MAX];
+    uint32_t scan_values[PAYLOAD_MAGIC_TRACE_SCAN_MAX];
+    char op[32];
+};
+
+static payload_magic_trace_t g_payload_magic_trace DMAMEM = {};
+static volatile uint32_t g_payload_magic_trace_sequence = 0;
+static volatile uint32_t g_payload_magic_last_ctor_self = 0;
+static volatile uint32_t g_payload_magic_last_ctor_pc = 0;
+static volatile uint32_t g_payload_magic_last_ctor_sp = 0;
+static char g_payload_magic_trace_line[224] DMAMEM = {0};
+
+// ============================================================================
 // Error codes
 // ============================================================================
 
@@ -244,6 +295,202 @@ static void payload_copy_trusted_label(char* dst, size_t cap, const char* src) {
         i++;
     }
     dst[i] = '\0';
+}
+
+static inline uint32_t payload_trace_read_msp() {
+    uint32_t value;
+    __asm__ volatile ("mrs %0, msp" : "=r"(value));
+    return value;
+}
+
+static inline uint32_t payload_trace_read_psp() {
+    uint32_t value;
+    __asm__ volatile ("mrs %0, psp" : "=r"(value));
+    return value;
+}
+
+static inline uint32_t payload_trace_read_control() {
+    uint32_t value;
+    __asm__ volatile ("mrs %0, control" : "=r"(value));
+    return value;
+}
+
+static inline uint32_t payload_trace_read_ipsr() {
+    uint32_t value;
+    __asm__ volatile ("mrs %0, ipsr" : "=r"(value));
+    return value;
+}
+
+static inline uint32_t payload_trace_read_lr() {
+    uint32_t value;
+    __asm__ volatile ("mov %0, lr" : "=r"(value));
+    return value;
+}
+
+static inline uint32_t payload_trace_read_r7() {
+    uint32_t value;
+    __asm__ volatile ("mov %0, r7" : "=r"(value));
+    return value;
+}
+
+static bool payload_trace_dtcm_words_readable(uint32_t addr, uint32_t words) {
+    static constexpr uint32_t DTCM_BEGIN = 0x20000000UL;
+    static constexpr uint32_t DTCM_END = 0x20080000UL;
+
+    if ((addr & 3U) != 0U || addr < DTCM_BEGIN || addr >= DTCM_END) {
+        return false;
+    }
+
+    const uint64_t end = (uint64_t)addr + (uint64_t)words * sizeof(uint32_t);
+    return end <= DTCM_END;
+}
+
+static bool payload_trace_plausible_code_address(uint32_t addr) {
+    // Saved Cortex-M return addresses retain the Thumb bit.  Accept both the
+    // ITCM execution map and the QSPI FLASHMEM execution map used by Teensy 4.x.
+    if ((addr & 1U) == 0U) return false;
+    const uint32_t pc = addr & ~1UL;
+    return (pc >= 0x00000020UL && pc < 0x00100000UL) ||
+           (pc >= 0x60000000UL && pc < 0x61000000UL);
+}
+
+static __attribute__((noinline)) void payload_magic_trace_note_constructed(
+    const void* self, uint32_t caller_pc) {
+    const uint32_t control = payload_trace_read_control();
+    const uint32_t ipsr = payload_trace_read_ipsr();
+    const uint32_t msp = payload_trace_read_msp();
+    const uint32_t psp = payload_trace_read_psp();
+
+    g_payload_magic_last_ctor_self = (uint32_t)(uintptr_t)self;
+    g_payload_magic_last_ctor_pc = caller_pc;
+    g_payload_magic_last_ctor_sp =
+        (ipsr != 0U || (control & 2U) == 0U) ? msp : psp;
+}
+
+static __attribute__((noinline)) void payload_magic_trace_emit(
+    const payload_magic_trace_t& t) {
+    snprintf(g_payload_magic_trace_line, sizeof(g_payload_magic_trace_line),
+             "seq=%lu op=%s this=0x%08lX magic=0x%08lX magic_addr=0x%08lX dwt=0x%08lX",
+             (unsigned long)t.sequence,
+             t.op,
+             (unsigned long)t.self,
+             (unsigned long)t.magic,
+             (unsigned long)t.magic_addr,
+             (unsigned long)t.dwt);
+    debug_log("payload.magic.trace", g_payload_magic_trace_line);
+
+    snprintf(g_payload_magic_trace_line, sizeof(g_payload_magic_trace_line),
+             "pc=0x%08lX lr=0x%08lX r7=0x%08lX msp=0x%08lX psp=0x%08lX active_sp=0x%08lX control=0x%08lX ipsr=%lu",
+             (unsigned long)t.discovery_pc,
+             (unsigned long)t.lr,
+             (unsigned long)t.r7,
+             (unsigned long)t.msp,
+             (unsigned long)t.psp,
+             (unsigned long)t.active_sp,
+             (unsigned long)t.control,
+             (unsigned long)t.ipsr);
+    debug_log("payload.magic.regs", g_payload_magic_trace_line);
+
+    snprintf(g_payload_magic_trace_line, sizeof(g_payload_magic_trace_line),
+             "last_ctor_this=0x%08lX last_ctor_pc=0x%08lX last_ctor_sp=0x%08lX self_minus_sp=%ld",
+             (unsigned long)t.last_ctor_self,
+             (unsigned long)t.last_ctor_pc,
+             (unsigned long)t.last_ctor_sp,
+             (long)((int32_t)(t.self - t.active_sp)));
+    debug_log("payload.magic.ctor", g_payload_magic_trace_line);
+
+    for (uint32_t i = 0; i < t.frame_count; i++) {
+        snprintf(g_payload_magic_trace_line, sizeof(g_payload_magic_trace_line),
+                 "frame[%lu]=0x%08lX",
+                 (unsigned long)i,
+                 (unsigned long)t.frames[i]);
+        debug_log("payload.magic.frame", g_payload_magic_trace_line);
+    }
+
+    for (uint32_t i = 0; i < t.scan_count; i++) {
+        snprintf(g_payload_magic_trace_line, sizeof(g_payload_magic_trace_line),
+                 "stack[%lu] sp+0x%03lX=0x%08lX",
+                 (unsigned long)i,
+                 (unsigned long)t.scan_offsets[i],
+                 (unsigned long)t.scan_values[i]);
+        debug_log("payload.magic.stack", g_payload_magic_trace_line);
+    }
+}
+
+static __attribute__((noinline)) void payload_magic_trace_capture(
+    const void* self, uint32_t magic, const char* op, uint32_t discovery_pc) {
+    if (g_payload_magic_trace.captured != 0U) return;
+
+    // Latch immediately.  Payload is foreground-only by contract, so a simple
+    // one-shot latch is preferable to introducing interrupt masking here.
+    g_payload_magic_trace.captured = 1U;
+    g_payload_magic_trace.sequence = ++g_payload_magic_trace_sequence;
+    g_payload_magic_trace.dwt = ARM_DWT_CYCCNT;
+    g_payload_magic_trace.self = (uint32_t)(uintptr_t)self;
+    g_payload_magic_trace.magic = magic;
+    g_payload_magic_trace.magic_addr = (uint32_t)(uintptr_t)self;
+    g_payload_magic_trace.discovery_pc = discovery_pc;
+    g_payload_magic_trace.lr = payload_trace_read_lr();
+    g_payload_magic_trace.r7 = payload_trace_read_r7();
+    g_payload_magic_trace.msp = payload_trace_read_msp();
+    g_payload_magic_trace.psp = payload_trace_read_psp();
+    g_payload_magic_trace.control = payload_trace_read_control();
+    g_payload_magic_trace.ipsr = payload_trace_read_ipsr();
+    g_payload_magic_trace.active_sp =
+        (g_payload_magic_trace.ipsr != 0U ||
+         (g_payload_magic_trace.control & 2U) == 0U)
+            ? g_payload_magic_trace.msp
+            : g_payload_magic_trace.psp;
+    g_payload_magic_trace.last_ctor_self = g_payload_magic_last_ctor_self;
+    g_payload_magic_trace.last_ctor_pc = g_payload_magic_last_ctor_pc;
+    g_payload_magic_trace.last_ctor_sp = g_payload_magic_last_ctor_sp;
+    payload_copy_trusted_label(g_payload_magic_trace.op,
+                               sizeof(g_payload_magic_trace.op),
+                               op ? op : "?");
+
+    // Best-effort frame-pointer chain.  This becomes authoritative when the
+    // failing build uses -fno-omit-frame-pointer; otherwise it simply yields
+    // zero or a short conservative chain.
+    uint32_t fp_addr = g_payload_magic_trace.r7;
+    while (g_payload_magic_trace.frame_count < PAYLOAD_MAGIC_TRACE_FRAME_MAX &&
+           payload_trace_dtcm_words_readable(fp_addr, 2U)) {
+        const uint32_t* fp = reinterpret_cast<const uint32_t*>(fp_addr);
+        const uint32_t next_fp = fp[0];
+        const uint32_t return_pc = fp[1];
+
+        if (payload_trace_plausible_code_address(return_pc)) {
+            g_payload_magic_trace.frames[g_payload_magic_trace.frame_count++] =
+                return_pc;
+        }
+
+        if (next_fp <= fp_addr ||
+            !payload_trace_dtcm_words_readable(next_fp, 2U)) {
+            break;
+        }
+        fp_addr = next_fp;
+    }
+
+    // Frame pointers are not guaranteed in ordinary Teensy builds, so also
+    // scan a small active-stack window and retain words that look like Thumb
+    // return addresses.  zpaddr can cheaply reject false positives offline.
+    uint32_t scan_addr = g_payload_magic_trace.active_sp;
+    for (uint32_t word = 0;
+         word < PAYLOAD_MAGIC_TRACE_SCAN_WORDS &&
+         g_payload_magic_trace.scan_count < PAYLOAD_MAGIC_TRACE_SCAN_MAX;
+         word++) {
+        const uint32_t addr = scan_addr + word * sizeof(uint32_t);
+        if (!payload_trace_dtcm_words_readable(addr, 1U)) break;
+        const uint32_t value = *reinterpret_cast<const uint32_t*>(addr);
+        if (!payload_trace_plausible_code_address(value)) continue;
+
+        const uint32_t idx = g_payload_magic_trace.scan_count++;
+        g_payload_magic_trace.scan_offsets[idx] =
+            word * sizeof(uint32_t);
+        g_payload_magic_trace.scan_values[idx] = value;
+    }
+
+    __asm__ volatile ("dmb" ::: "memory");
+    payload_magic_trace_emit(g_payload_magic_trace);
 }
 
 static void payload_note_string_pointer_fault(uint32_t reason,
@@ -695,6 +942,8 @@ Payload::Payload()
     , _arena_used(0)
     , _arena_cap(0)
 {
+    payload_magic_trace_note_constructed(
+        this, (uint32_t)(uintptr_t)__builtin_return_address(0));
     payload_mark_constructed();
     if (INLINE_ENTRIES > g_payload_max_entry_capacity_seen) {
         g_payload_max_entry_capacity_seen = INLINE_ENTRIES;
@@ -754,6 +1003,8 @@ Payload::Payload(Payload&& other) noexcept
     , _arena_used(0)
     , _arena_cap(0)
 {
+    payload_magic_trace_note_constructed(
+        this, (uint32_t)(uintptr_t)__builtin_return_address(0));
     payload_mark_constructed();
     _move_from(other);
 }
@@ -810,6 +1061,8 @@ Payload::Payload(const Payload& other)
     , _arena_used(0)
     , _arena_cap(0)
 {
+    payload_magic_trace_note_constructed(
+        this, (uint32_t)(uintptr_t)__builtin_return_address(0));
     payload_mark_constructed();
     _copy_from(other);
 }
@@ -953,6 +1206,9 @@ bool Payload::_self_ok(const char* op) const {
     // These cheap invariants are enough to protect normal Payload semantics;
     // the full entry-table courtroom remains below for dedicated autopsy builds.
     if (_magic != MAGIC_LIVE) {
+        payload_magic_trace_capture(
+            this, _magic, op,
+            (uint32_t)(uintptr_t)__builtin_return_address(0));
         return fail(PAYLOAD_SELF_OK_MAGIC_BAD);
     }
 
@@ -1554,6 +1810,7 @@ void Payload::_add_entry(const char* key, const char* value, size_t value_len, c
 // ============================================================================
 
 void Payload::add(const char* key, int32_t value) {
+    if (!_self_ok("add_i32.enter")) return;
     char tmp[16];
     int n = snprintf(tmp, sizeof(tmp), "%ld", (long)value);
     if (n < 0) n = 0;
@@ -1561,6 +1818,7 @@ void Payload::add(const char* key, int32_t value) {
 }
 
 void Payload::add(const char* key, uint32_t value) {
+    if (!_self_ok("add_u32.enter")) return;
     char tmp[16];
     int n = snprintf(tmp, sizeof(tmp), "%lu", (unsigned long)value);
     if (n < 0) n = 0;
@@ -1568,6 +1826,7 @@ void Payload::add(const char* key, uint32_t value) {
 }
 
 void Payload::add(const char* key, int64_t value) {
+    if (!_self_ok("add_i64.enter")) return;
     char tmp[24];
     int n = snprintf(tmp, sizeof(tmp), "%lld", (long long)value);
     if (n < 0) n = 0;
@@ -1575,6 +1834,7 @@ void Payload::add(const char* key, int64_t value) {
 }
 
 void Payload::add(const char* key, uint64_t value) {
+    if (!_self_ok("add_u64.enter")) return;
     char tmp[24];
     int n = snprintf(tmp, sizeof(tmp), "%llu", (unsigned long long)value);
     if (n < 0) n = 0;
@@ -1582,6 +1842,7 @@ void Payload::add(const char* key, uint64_t value) {
 }
 
 void Payload::add(const char* key, const char* value) {
+    if (!_self_ok("add_cstr.enter")) return;
     size_t n = 0;
     bool ok = true;
     value = payload_cstr_or_empty(value, ARENA_MAX, "add.value", &n, &ok);
@@ -1597,11 +1858,13 @@ void Payload::add(const char* key, const String& value) {
 }
 
 void Payload::add(const char* key, bool value) {
+    if (!_self_ok("add_bool.enter")) return;
     const char* s = value ? "true" : "false";
     _add_entry(key, s, value ? 4U : 5U, 'p');
 }
 
 void Payload::add(const char* key, float value) {
+    if (!_self_ok("add_float.enter")) return;
     char tmp[32];
     int n = snprintf(tmp, sizeof(tmp), "%.6f", (double)value);
     if (n < 0) n = 0;
@@ -1614,6 +1877,7 @@ void Payload::add(const char* key, float value) {
 }
 
 void Payload::add(const char* key, double value) {
+    if (!_self_ok("add_double.enter")) return;
     char tmp[32];
     int n = snprintf(tmp, sizeof(tmp), "%.6f", value);
     if (n < 0) n = 0;
@@ -1626,6 +1890,7 @@ void Payload::add(const char* key, double value) {
 }
 
 void Payload::add(const char* key, double value, int precision) {
+    if (!_self_ok("add_double_prec.enter")) return;
     if (precision < 0) precision = 0;
     if (precision > 12) precision = 12;
 

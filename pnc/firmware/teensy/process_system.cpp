@@ -44,6 +44,7 @@ extern "C" void enter_bootloader_cleanly(void);
 static FLASHMEM Payload system_features_tree_payload(void);
 static void system_feature_schedule_fragment_publish(void);
 static void system_memory_watchdog_arm(void);
+static void system_memory_watchdog_schedule_alap(void);
 
 // --------------------------------------------------------------
 // Internal terminal state
@@ -71,6 +72,15 @@ static uint32_t g_system_memory_watchdog_callback_count = 0;
 static uint32_t g_system_memory_watchdog_event_count = 0;
 static int64_t  g_system_memory_watchdog_last_fire_gnss_ns = 0;
 static uint32_t g_system_memory_watchdog_last_fire_dwt = 0;
+
+// Timed callbacks may run in interrupt context.  Keep them allocator-free and
+// defer all substantive audit/serialization/publication work to one ALAP
+// foreground service.
+static volatile bool g_system_memory_watchdog_alap_pending = false;
+static volatile bool g_system_memory_watchdog_alap_armed = false;
+static uint32_t g_system_memory_watchdog_alap_arm_count = 0;
+static uint32_t g_system_memory_watchdog_alap_arm_failures = 0;
+static uint32_t g_system_memory_watchdog_alap_run_count = 0;
 
 // ============================================================================
 // Always-on memory integrity watchdog
@@ -149,27 +159,69 @@ static FLASHMEM void system_memory_watchdog_emit(void) {
   g_system_memory_watchdog_event_count++;
 }
 
+static FLASHMEM void system_memory_watchdog_alap_cb(timepop_ctx_t*,
+                                                    timepop_diag_t*,
+                                                    void*) {
+  g_system_memory_watchdog_alap_armed = false;
+
+  if (!g_system_memory_watchdog_alap_pending) {
+    return;
+  }
+
+  g_system_memory_watchdog_alap_pending = false;
+  g_system_memory_watchdog_alap_run_count++;
+
+  // All allocator-, Payload-, and publication-bearing work belongs here in
+  // serialized foreground context, never in the timed callback.
+  memory_info_audit(&g_system_memory_watchdog_health);
+
+  if (g_system_memory_watchdog_health.status ==
+          memory_health_status_t::ANOMALY &&
+      !g_system_memory_watchdog_event_emitted) {
+    // Latch before constructing the event so a Payload failure during the
+    // best-effort anomaly transcript cannot create a recursive event storm.
+    g_system_memory_watchdog_event_emitted = true;
+    system_memory_watchdog_emit();
+  }
+
+  // If another timed fire arrived while this ALAP service was running, arrange
+  // one more serialized pass rather than doing nested work here.
+  if (g_system_memory_watchdog_alap_pending) {
+    system_memory_watchdog_schedule_alap();
+  }
+}
+
+static void system_memory_watchdog_schedule_alap(void) {
+  if (g_system_memory_watchdog_alap_armed) {
+    return;
+  }
+
+  const timepop_handle_t handle =
+      timepop_arm_alap(system_memory_watchdog_alap_cb,
+                       nullptr,
+                       "SYSTEM_MEMORY_WATCHDOG_ALAP");
+  if (handle == TIMEPOP_INVALID_HANDLE) {
+    g_system_memory_watchdog_alap_arm_failures++;
+    return;
+  }
+
+  g_system_memory_watchdog_alap_armed = true;
+  g_system_memory_watchdog_alap_arm_count++;
+}
+
 static FLASHMEM void system_memory_watchdog_cb(timepop_ctx_t* ctx,
                                                timepop_diag_t*,
                                                void*) {
+  // Timed/ISR path: scalar bookkeeping only.  No mallinfo(), Payload,
+  // formatting, publish(), transport work, or heap interaction.
   g_system_memory_watchdog_callback_count++;
   if (ctx) {
     g_system_memory_watchdog_last_fire_gnss_ns = ctx->fire_gnss_ns;
     g_system_memory_watchdog_last_fire_dwt = ctx->fire_dwt_cyccnt;
   }
 
-  memory_info_audit(&g_system_memory_watchdog_health);
-
-  if (g_system_memory_watchdog_health.status !=
-          memory_health_status_t::ANOMALY ||
-      g_system_memory_watchdog_event_emitted) {
-    return;
-  }
-
-  // Latch before constructing the event so a Payload failure during the
-  // best-effort anomaly transcript cannot create a recursive event storm.
-  g_system_memory_watchdog_event_emitted = true;
-  system_memory_watchdog_emit();
+  g_system_memory_watchdog_alap_pending = true;
+  system_memory_watchdog_schedule_alap();
 }
 
 static void system_memory_watchdog_arm(void) {
@@ -735,6 +787,11 @@ static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
   p.add("memory_watchdog_callback_count", g_system_memory_watchdog_callback_count);
   p.add("memory_watchdog_event_emitted", g_system_memory_watchdog_event_emitted);
   p.add("memory_watchdog_event_count", g_system_memory_watchdog_event_count);
+  p.add("memory_watchdog_alap_pending", (bool)g_system_memory_watchdog_alap_pending);
+  p.add("memory_watchdog_alap_armed", (bool)g_system_memory_watchdog_alap_armed);
+  p.add("memory_watchdog_alap_arm_count", g_system_memory_watchdog_alap_arm_count);
+  p.add("memory_watchdog_alap_arm_failures", g_system_memory_watchdog_alap_arm_failures);
+  p.add("memory_watchdog_alap_run_count", g_system_memory_watchdog_alap_run_count);
   p.add("memory_health_status",
         memory_health_status_name(g_system_memory_watchdog_health.status));
   p.add("memory_health_reason",
@@ -1239,6 +1296,16 @@ static FLASHMEM Payload cmd_memory_info(const Payload& /*args*/) {
     p.add("memory_watchdog_callback_count", g_system_memory_watchdog_callback_count);
     p.add("memory_watchdog_event_emitted", g_system_memory_watchdog_event_emitted);
     p.add("memory_watchdog_event_count", g_system_memory_watchdog_event_count);
+    p.add("memory_watchdog_alap_pending",
+          (bool)g_system_memory_watchdog_alap_pending);
+    p.add("memory_watchdog_alap_armed",
+          (bool)g_system_memory_watchdog_alap_armed);
+    p.add("memory_watchdog_alap_arm_count",
+          g_system_memory_watchdog_alap_arm_count);
+    p.add("memory_watchdog_alap_arm_failures",
+          g_system_memory_watchdog_alap_arm_failures);
+    p.add("memory_watchdog_alap_run_count",
+          g_system_memory_watchdog_alap_run_count);
     p.add("memory_watchdog_last_fire_gnss_ns",
           g_system_memory_watchdog_last_fire_gnss_ns);
     p.add_fmt("memory_watchdog_last_fire_dwt", "0x%08lX",
