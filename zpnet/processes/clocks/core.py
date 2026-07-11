@@ -282,7 +282,12 @@ def _gnss_confession_published_source() -> str:
         return "RAW"
     return source
 
-PREFLIGHT_POLL_INTERVAL_S = 30
+# Preflight is polled quickly so START follows readiness promptly, but the log
+# remains quiet.  Pending prerequisites are summarized only after a short grace
+# period, when the pending set changes, or at the periodic status interval.
+PREFLIGHT_POLL_INTERVAL_S = 2.0
+PREFLIGHT_QUIET_GRACE_S = 15.0
+PREFLIGHT_STATUS_LOG_INTERVAL_S = 30.0
 PREFLIGHT_LOG_PREFIX = "🛡️ [preflight]"
 STARTUP_TEENSY_QUIET_DELAY_S = 20.0
 TIMEBASE_SILENCE_TIMEOUT_S = 30.0
@@ -309,12 +314,13 @@ FLASH_CUT_FIRST_FRAGMENT_TIMEOUT_S = 180.0
 # they are diagnostic / quality witnesses whose current definitions can strobe
 # during startup, recovery, and report-pressure windows.
 #
-# The same doctrine now applies to downstream publication-derived rails that
-# need the one-second event stream to prove themselves.  COUNTER32_LINEAGE,
-# STATIC_PREDICTION, and OCXO_PUBLIC_ORIGIN remain important post-start health
-# expectations, but they are not Pi admission gates: requiring them before
-# START/RECOVER can deadlock the system by waiting for facts that are only
-# produced after the campaign/publication path is allowed to run.
+# The Pi gate deliberately mirrors the Teensy CLOCKS campaign-custody gate.
+# COUNTER32_LINEAGE and OCXO_PUBLIC_ORIGIN are admission prerequisites because
+# Teensy START rejects while either is not NOMINAL.  STATIC_PREDICTION remains
+# post-start evidence because it is not part of the Teensy admission court.
+# CLOCKS also polls Teensy REPORT_GATE directly before START/RECOVER so a small
+# FEATURE_STATUS propagation delay cannot turn a lawful wait into a rejected
+# command.
 FEATURE_PREFLIGHT_PROFILE = "CAMPAIGN_PREFLIGHT"
 FEATURE_PREFLIGHT_REQUIRED = (
     "PI.SYSTEM.FEATURE_STATUS",
@@ -326,16 +332,27 @@ FEATURE_PREFLIGHT_REQUIRED = (
     "TEENSY.SYSTEM.FEATURE_STATUS",
     "TEENSY.INTERRUPT.PPS_VCLOCK_AUTHORITY",
     "TEENSY.INTERRUPT.QTIMER_COUNTER_CUSTODY",
+    "TEENSY.INTERRUPT.COUNTER32_LINEAGE",
     "TEENSY.CLOCKS.DWT_CALIBRATION",
     "TEENSY.CLOCKS.SMARTZERO",
     "TEENSY.CLOCKS.ALPHA_EPOCH",
+    "TEENSY.CLOCKS.OCXO_PUBLIC_ORIGIN",
 )
 
 FEATURE_PREFLIGHT_POST_START_EXPECTED = (
-    "TEENSY.INTERRUPT.COUNTER32_LINEAGE",
     "TEENSY.CLOCKS.STATIC_PREDICTION",
-    "TEENSY.CLOCKS.OCXO_PUBLIC_ORIGIN",
 )
+
+TEENSY_CAMPAIGN_GATE_LABEL_TO_FEATURE = {
+    "T_FEATURE": "TEENSY.SYSTEM.FEATURE_STATUS",
+    "PPS/V_AUTH": "TEENSY.INTERRUPT.PPS_VCLOCK_AUTHORITY",
+    "QTIMER_CNT": "TEENSY.INTERRUPT.QTIMER_COUNTER_CUSTODY",
+    "CTR32_LINE": "TEENSY.INTERRUPT.COUNTER32_LINEAGE",
+    "DWT_CAL": "TEENSY.CLOCKS.DWT_CALIBRATION",
+    "SMARTZERO": "TEENSY.CLOCKS.SMARTZERO",
+    "ALPHA_EPOCH": "TEENSY.CLOCKS.ALPHA_EPOCH",
+    "OCXO_ORIGIN": "TEENSY.CLOCKS.OCXO_PUBLIC_ORIGIN",
+}
 
 # ---------------------------------------------------------------------
 # TIMEBASE ingress queue + exact-pair state
@@ -486,6 +503,12 @@ _diag: Dict[str, Any] = {
     "preflight_feature_blocked": 0,
     "preflight_feature_unavailable": 0,
     "last_preflight_feature_gate": {},
+    "teensy_campaign_gate_checks": 0,
+    "teensy_campaign_gate_blocked": 0,
+    "teensy_campaign_gate_unavailable": 0,
+    "last_teensy_campaign_gate": {},
+    "preflight_wait_log_count": 0,
+    "last_preflight_wait": {},
 
     # GNSS discipline info fetch
     "gnss_info_requests": 0,
@@ -1788,14 +1811,16 @@ def _wait_for_timebase_routes(
     timeout_s: float = 30.0,
     poll_s: float = 0.5,
 ) -> None:
-    """Confirm both TIMEBASE pair routes before arming START/RECOVER."""
+    """Confirm both TIMEBASE pair routes without noisy normal-path logging."""
     required = {TIMEBASE_FRAGMENT_TOPIC, TIMEBASE_FORENSICS_TOPIC}
-    logging.info("⏳ [%s] waiting for TIMEBASE routes...", context)
     t0 = time.monotonic()
+    last_log = t0
     last_missing = sorted(required)
+    logged_wait = False
 
     while True:
-        elapsed = time.monotonic() - t0
+        now = time.monotonic()
+        elapsed = now - t0
         try:
             resp = send_command(machine="TEENSY", subsystem="PUBSUB", command="REPORT")
             if resp.get("success"):
@@ -1803,7 +1828,11 @@ def _wait_for_timebase_routes(
                 routed = {str(r.get("topic")) for r in routes if r.get("topic")}
                 last_missing = sorted(required - routed)
                 if not last_missing:
-                    logging.info("✅ [%s] TIMEBASE routes ready (%.1fs)", context, elapsed)
+                    if logged_wait:
+                        logging.info(
+                            "✅ [%s] TIMEBASE routes ready after %.1fs",
+                            context, elapsed,
+                        )
                     return
         except RuntimeError:
             raise
@@ -1814,6 +1843,14 @@ def _wait_for_timebase_routes(
             raise RuntimeError(
                 f"{context} failed: missing PUBSUB route(s) {last_missing} after {timeout_s}s"
             )
+
+        if elapsed >= 5.0 and (not logged_wait or now - last_log >= 30.0):
+            logging.info(
+                "⏳ [%s] waiting for TIMEBASE routes (%.0fs): %s",
+                context, elapsed, ", ".join(last_missing) or "route report unavailable",
+            )
+            logged_wait = True
+            last_log = now
         time.sleep(poll_s)
 
 
@@ -4619,12 +4656,6 @@ def _request_teensy_start(
         raise TeensyStartRejected(status, resp)
 
     _diag["teensy_start_accepted"] = _diag.get("teensy_start_accepted", 0) + 1
-    logging.info(
-        "✅ [start] Teensy CLOCKS.START accepted: campaign='%s' status='%s' payload=%s",
-        campaign,
-        status,
-        json.dumps(payload, sort_keys=True, default=str),
-    )
     return resp
 
 
@@ -4737,8 +4768,7 @@ def cmd_start(args: Optional[dict]) -> dict:
     except Exception as e:
         return {"success": False, "message": str(e)}
 
-    if not flash_cut:
-        _wait_for_preflight("start")
+    _wait_for_preflight("flash_cut" if flash_cut else "start")
 
     with open_db(row_dict=True) as conn:
         cur = conn.cursor()
@@ -4902,15 +4932,13 @@ def cmd_start(args: Optional[dict]) -> dict:
             else {}
         )
 
-        logging.error(
-            "💥 [start] campaign arm FAILED: campaign='%s' mode=%s status='%s' "
-            "error=%r response=%s",
-            campaign,
-            "FLASH_CUT" if flash_cut else "COLD_START",
-            failure_status,
-            failure_payload.get("error"),
-            json.dumps(failure_response, sort_keys=True, default=str),
-        )
+        if not isinstance(e, TeensyStartRejected):
+            logging.exception(
+                "💥 [start] CLOCKS.START command failed unexpectedly: "
+                "campaign='%s' mode=%s",
+                campaign,
+                "FLASH_CUT" if flash_cut else "COLD_START",
+            )
 
         try:
             with open_db() as conn:
@@ -5396,21 +5424,29 @@ def _recover_campaign() -> None:
         _campaign_active = True
         _arm_timebase_silence_watch("RECOVERY_COLD_START")
 
-        logging.info(
-            "📡 [recovery/cold] @%s arming TEENSY START asynchronously: campaign='%s' servo=%s",
-            system_time_z(), campaign_name, recover_calibrate or "OFF",
-        )
+        teensy_start_resp: Dict[str, Any] = {}
         try:
-            _request_teensy_start(campaign=campaign_name, pps_vclock_count=0, args=teensy_args)
+            teensy_start_resp = _request_teensy_start(
+                campaign=campaign_name,
+                pps_vclock_count=0,
+                args=teensy_args,
+            )
         except Exception:
             _campaign_active = False
             _accepted_pps_vclock_count = None
             _clear_start_wait_state()
             raise
 
+        teensy_start_payload = teensy_start_resp.get("payload", {})
+        teensy_start_status = (
+            str(teensy_start_payload.get("status") or "")
+            if isinstance(teensy_start_payload, dict)
+            else ""
+        )
         logging.info(
-            "✅ [recovery/cold] @%s START requested — awaiting first complete TIMEBASE pair",
-            system_time_z(),
+            "✅ [recovery/cold] START accepted: campaign='%s' status='%s'; "
+            "awaiting first complete TIMEBASE pair",
+            campaign_name, teensy_start_status,
         )
 
         _diag["last_recovery"] = {
@@ -6092,6 +6128,128 @@ def _check_feature_preflight(context: str) -> tuple[bool, list[str]]:
     return True, []
 
 
+def _check_teensy_campaign_gate(context: str) -> tuple[bool, list[str]]:
+    """Read the exact Teensy campaign gate that CLOCKS.START will enforce."""
+    _diag["teensy_campaign_gate_checks"] = (
+        _diag.get("teensy_campaign_gate_checks", 0) + 1
+    )
+    now_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    try:
+        resp = send_command(
+            machine="TEENSY",
+            subsystem="CLOCKS",
+            command="REPORT_GATE",
+            retries=1,
+            retry_delay_s=0.0,
+        )
+    except Exception as e:
+        _diag["teensy_campaign_gate_unavailable"] = (
+            _diag.get("teensy_campaign_gate_unavailable", 0) + 1
+        )
+        _diag["last_teensy_campaign_gate"] = {
+            "ts_utc": now_utc,
+            "context": context,
+            "status": "UNAVAILABLE",
+            "error": str(e),
+        }
+        return False, [f"TEENSY.CLOCKS.CAMPAIGN_GATE unavailable ({e})"]
+
+    payload = resp.get("payload") if isinstance(resp, dict) else None
+    if not isinstance(resp, dict) or not resp.get("success") or not isinstance(payload, dict):
+        _diag["teensy_campaign_gate_unavailable"] = (
+            _diag.get("teensy_campaign_gate_unavailable", 0) + 1
+        )
+        _diag["last_teensy_campaign_gate"] = {
+            "ts_utc": now_utc,
+            "context": context,
+            "status": "UNAVAILABLE",
+            "outer_message": resp.get("message") if isinstance(resp, dict) else None,
+        }
+        return False, ["TEENSY.CLOCKS.CAMPAIGN_GATE report unavailable"]
+
+    gate_open = _recovery_bool(payload.get("campaign_gate_open"))
+    gate_reason = str(payload.get("campaign_gate_reason") or "campaign gate closed")
+    first_problem = str(payload.get("campaign_gate_first_problem") or "")
+    first_problem_feature = TEENSY_CAMPAIGN_GATE_LABEL_TO_FEATURE.get(
+        first_problem,
+        f"TEENSY.CLOCKS.{first_problem or 'CAMPAIGN_GATE'}",
+    )
+    snapshot = {
+        "ts_utc": now_utc,
+        "context": context,
+        "status": "NOMINAL" if gate_open else "BLOCKED",
+        "campaign_gate_open": bool(gate_open),
+        "campaign_gate_seen": _recovery_bool(payload.get("campaign_gate_seen")),
+        "campaign_gate_reason": gate_reason,
+        "campaign_gate_first_problem": first_problem,
+        "campaign_gate_first_problem_feature": first_problem_feature,
+        "campaign_gate_update_count": _as_int(payload.get("campaign_gate_update_count")),
+        "campaign_gate_transition_count": _as_int(payload.get("campaign_gate_transition_count")),
+    }
+    _diag["last_teensy_campaign_gate"] = snapshot
+
+    if gate_open:
+        return True, []
+
+    _diag["teensy_campaign_gate_blocked"] = (
+        _diag.get("teensy_campaign_gate_blocked", 0) + 1
+    )
+    return False, [f"{first_problem_feature}: {gate_reason}"]
+
+
+def _preflight_wait_items(reasons: list[str]) -> list[str]:
+    """Return a compact, stable list of pending prerequisites for the log."""
+    items: list[str] = []
+
+    feature_gate = _diag.get("last_preflight_feature_gate") or {}
+    blockers = feature_gate.get("blockers")
+    blocker_names: set[str] = set()
+    if isinstance(blockers, list):
+        for blocker in blockers:
+            if not isinstance(blocker, dict):
+                continue
+            name = str(blocker.get("name") or "?")
+            blocker_names.add(name)
+            status = str(blocker.get("status") or "HOLD")
+            detail = str(blocker.get("detail") or "").strip()
+            item = f"{name}={status}"
+            if detail:
+                item += f" ({detail})"
+            items.append(item)
+
+    teensy_gate = _diag.get("last_teensy_campaign_gate") or {}
+    if teensy_gate.get("status") == "BLOCKED":
+        feature = str(
+            teensy_gate.get("campaign_gate_first_problem_feature")
+            or "TEENSY.CLOCKS.CAMPAIGN_GATE"
+        )
+        reason = str(
+            teensy_gate.get("campaign_gate_reason") or "campaign gate closed"
+        )
+        if feature not in blocker_names:
+            items.append(f"{feature}=BLOCKED ({reason})")
+    elif teensy_gate.get("status") == "UNAVAILABLE":
+        items.append("TEENSY.CLOCKS.CAMPAIGN_GATE=UNAVAILABLE")
+
+    for reason in reasons:
+        if reason.startswith(f"{FEATURE_PREFLIGHT_PROFILE}:"):
+            if not blockers:
+                items.append(reason)
+            continue
+        reason_feature = reason.split(":", 1)[0]
+        if reason_feature in blocker_names:
+            continue
+        if reason_feature == str(
+            teensy_gate.get("campaign_gate_first_problem_feature") or ""
+        ):
+            continue
+        items.append(reason)
+
+    # Preserve order while removing duplicates.
+    return list(dict.fromkeys(items))
+
+
 # ---------------------------------------------------------------------
 # Preflight gate — prerequisites for campaign start/recovery
 # ---------------------------------------------------------------------
@@ -6109,6 +6267,13 @@ def _check_preflight(context: str = "campaign") -> tuple[bool, list[str]]:
     feature_ready, feature_reasons = _check_feature_preflight(context)
     if not feature_ready:
         reasons.extend(feature_reasons)
+
+    # -----------------------------------------------------------------
+    # 0b. Exact Teensy CLOCKS admission gate
+    # -----------------------------------------------------------------
+    teensy_gate_ready, teensy_gate_reasons = _check_teensy_campaign_gate(context)
+    if not teensy_gate_ready:
+        reasons.extend(teensy_gate_reasons)
 
     # -----------------------------------------------------------------
     # 1. GNSS time valid
@@ -6186,54 +6351,73 @@ def _check_preflight(context: str = "campaign") -> tuple[bool, list[str]]:
 
 
 def _wait_for_preflight(context: str = "recovery") -> None:
-    """
-    Block until all preflight prerequisites are met.
+    """Wait quietly until every Pi and Teensy campaign gate is open.
 
-    On cluster restart, the GNSS process needs a few seconds to parse
-    its first NMEA sentences.  We poll silently at 2-second intervals
-    for the first PREFLIGHT_GRACE_S seconds before switching to the
-    normal 30-second polling with logged warnings.
+    Readiness is polled frequently so startup proceeds promptly.  The log is
+    intentionally sparse: no normal-path success line, and while blocked only
+    one compact pending summary after the grace period, when the pending set
+    changes, or once per status interval.
     """
     attempt = 0
     t0 = time.monotonic()
-
-    GRACE_S = 15.0        # silent fast-poll window
-    GRACE_POLL_S = 2.0    # poll interval during grace period
+    last_log_at = t0
+    last_signature: Optional[Tuple[str, ...]] = None
+    logged_wait = False
 
     while True:
         ready, reasons = _check_preflight(context)
+        now = time.monotonic()
+        elapsed = now - t0
 
         if ready:
-            elapsed = time.monotonic() - t0
-            if attempt > 0:
+            _diag["last_preflight_wait"] = {
+                "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "context": context,
+                "status": "NOMINAL",
+                "checks": int(attempt + 1),
+                "waited_s": round(float(elapsed), 3),
+            }
+            if logged_wait:
                 logging.info(
-                    "%s @%s all prerequisites met after %d checks (%.0fs) — "
-                    "proceeding with %s",
-                    PREFLIGHT_LOG_PREFIX, system_time_z(),
-                    attempt, elapsed, context,
-                )
-            else:
-                logging.info(
-                    "%s @%s all prerequisites met — proceeding with %s",
-                    PREFLIGHT_LOG_PREFIX, system_time_z(), context,
+                    "%s prerequisites ready for %s after %.1fs",
+                    PREFLIGHT_LOG_PREFIX, context, elapsed,
                 )
             return
 
         attempt += 1
-        elapsed = time.monotonic() - t0
+        pending = _preflight_wait_items(reasons)
+        signature = tuple(pending)
+        should_log = elapsed >= PREFLIGHT_QUIET_GRACE_S and (
+            not logged_wait
+            or signature != last_signature
+            or now - last_log_at >= PREFLIGHT_STATUS_LOG_INTERVAL_S
+        )
 
-        if elapsed >= GRACE_S:
-            # Past grace period — log warnings at normal interval
-            reason_block = "\n".join(f"    • {r}" for r in reasons)
-            logging.info(
-                "%s @%s not ready for %s (check #%d, %.0fs elapsed):\n%s",
-                PREFLIGHT_LOG_PREFIX, system_time_z(),
-                context, attempt, elapsed, reason_block,
+        _diag["last_preflight_wait"] = {
+            "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "context": context,
+            "status": "WAITING",
+            "checks": int(attempt),
+            "waited_s": round(float(elapsed), 3),
+            "pending": pending,
+        }
+
+        if should_log:
+            _diag["preflight_wait_log_count"] = (
+                _diag.get("preflight_wait_log_count", 0) + 1
             )
-            time.sleep(PREFLIGHT_POLL_INTERVAL_S)
-        else:
-            # Grace period — poll silently and quickly
-            time.sleep(GRACE_POLL_S)
+            logging.info(
+                "%s waiting for %s (%.0fs): %s",
+                PREFLIGHT_LOG_PREFIX,
+                context,
+                elapsed,
+                "; ".join(pending) if pending else "prerequisites pending",
+            )
+            logged_wait = True
+            last_log_at = now
+            last_signature = signature
+
+        time.sleep(PREFLIGHT_POLL_INTERVAL_S)
 
 
 def cmd_baseline_info(_: Optional[dict]) -> Dict[str, Any]:
@@ -7188,6 +7372,17 @@ def run() -> None:
     else:
         try:
             _recover_campaign()
+        except TeensyStartRejected as e:
+            # _request_teensy_start already emitted the full handler evidence.
+            # Avoid a second traceback-sized rendering of the same rejection.
+            logging.error(
+                "💥 [clocks] boot START rejected (%s); command interface remains available",
+                e.status,
+            )
+            _cleanup_after_recovery_failure(
+                "boot_start_rejected",
+                {"error": str(e), "status": e.status},
+            )
         except Exception as e:
             # Boot must not die merely because campaign recovery/startup is
             # waiting or failed.  Keep the command interface alive so the

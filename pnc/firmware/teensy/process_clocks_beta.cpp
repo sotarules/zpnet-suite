@@ -483,21 +483,43 @@ static char g_campaign_feature_gate_reason[128] =
 static char g_campaign_feature_gate_first_problem[32] = "";
 static char g_campaign_feature_gate_static_prediction_status[24] = "---";
 
-static const char* feature_status_lookup(const Payload& root,
-                                         const char* host,
-                                         const char* subsystem,
-                                         const char* feature) {
+static bool feature_status_lookup_copy(const Payload& root,
+                                       const char* host,
+                                       const char* subsystem,
+                                       const char* feature,
+                                       char* out,
+                                       size_t out_size) {
+  if (!out || out_size == 0U) return false;
+  out[0] = '\0';
+
   const Payload host_payload = root.getPayload(host);
-  if (host_payload.empty()) return nullptr;
+  if (host_payload.empty()) return false;
 
   const Payload subsystem_payload = host_payload.getPayload(subsystem);
-  if (subsystem_payload.empty()) return nullptr;
+  if (subsystem_payload.empty()) return false;
 
-  return subsystem_payload.getString(feature);
+  const char* status = subsystem_payload.getString(feature);
+  if (!status) return false;
+
+  // getString() returns storage owned by subsystem_payload.  Copy while that
+  // Payload is still alive; returning the pointer would leave a dangling
+  // reference as soon as this helper returns.
+  safeCopy(out, out_size, status);
+  return true;
 }
 
-static bool feature_status_is_nominal(const char* status) {
-  return status && strcasecmp(status, "NOMINAL") == 0;
+static bool feature_status_is_nominal(const Payload& root,
+                                      const char* host,
+                                      const char* subsystem,
+                                      const char* feature) {
+  char status[24] = {0};
+  return feature_status_lookup_copy(root,
+                                    host,
+                                    subsystem,
+                                    feature,
+                                    status,
+                                    sizeof(status)) &&
+         strcasecmp(status, "NOMINAL") == 0;
 }
 
 static void campaign_feature_gate_set_reason(const char* reason,
@@ -511,19 +533,26 @@ static void campaign_feature_gate_set_reason(const char* reason,
 }
 
 static void campaign_feature_gate_recompute(const Payload& root) {
-  const char* static_pred_status =
-      feature_status_lookup(root, "TEENSY", "CLOCKS", "STATIC_PREDICTION");
-  safeCopy(g_campaign_feature_gate_static_prediction_status,
-           sizeof(g_campaign_feature_gate_static_prediction_status),
-           static_pred_status ? static_pred_status : "---");
+  if (!feature_status_lookup_copy(
+          root,
+          "TEENSY",
+          "CLOCKS",
+          "STATIC_PREDICTION",
+          g_campaign_feature_gate_static_prediction_status,
+          sizeof(g_campaign_feature_gate_static_prediction_status))) {
+    safeCopy(g_campaign_feature_gate_static_prediction_status,
+             sizeof(g_campaign_feature_gate_static_prediction_status),
+             "---");
+  }
 
   bool ready = true;
   const campaign_feature_gate_requirement_t* failed = nullptr;
 
   for (const auto& req : CAMPAIGN_FEATURE_GATE_REQUIREMENTS) {
-    const char* status =
-        feature_status_lookup(root, req.host, req.subsystem, req.feature);
-    if (!feature_status_is_nominal(status)) {
+    if (!feature_status_is_nominal(root,
+                                   req.host,
+                                   req.subsystem,
+                                   req.feature)) {
       ready = false;
       failed = &req;
       break;
