@@ -402,6 +402,7 @@ static void clocks_beta_feature_set_cached(const char* feature,
 }
 
 static FLASHMEM void clocks_beta_cold_diagnostics_init(void);
+static bool g_clocks_beta_dmamem_initialized = false;
 
 static void clocks_beta_features_mark_initializing(void) {
   clocks_beta_feature_set_cached("SCIENCE_RESIDUALS",
@@ -2766,17 +2767,6 @@ static uint32_t g_welford_gap_advance_count = 0;
 static uint32_t g_welford_gap_advance_last_public_count = 0;
 static uint32_t g_welford_gap_advance_last_lane_count = 0;
 
-static FLASHMEM void clocks_beta_cold_diagnostics_init(void) {
-  g_start_phaseledger_last_ocxo1 = clocks_alpha_ocxo_counterledger_snapshot_t{};
-  g_start_phaseledger_last_ocxo2 = clocks_alpha_ocxo_counterledger_snapshot_t{};
-  g_beta_counterledger_raw_scratch = clocks_alpha_ocxo_counterledger_snapshot_t{};
-  g_beta_ocxo1_counterledger_row = clocks_alpha_ocxo_counterledger_snapshot_t{};
-  g_beta_ocxo2_counterledger_row = clocks_alpha_ocxo_counterledger_snapshot_t{};
-  g_recover_reattach_last_ocxo1 = clocks_alpha_recover_reattach_snapshot_t{};
-  g_recover_reattach_last_ocxo2 = clocks_alpha_recover_reattach_snapshot_t{};
-  g_recover_welfords_pending = recover_welford_state_t{};
-}
-
 void welford_reset(welford_t& w) {
   w.n       = 0;
   w.mean    = 0.0;
@@ -4722,6 +4712,119 @@ struct ocxo_cycle_residual_diag_t {
 
 static ocxo_cycle_residual_diag_t g_beta_ocxo1_cycle_residual_diag DMAMEM = {};
 static ocxo_cycle_residual_diag_t g_beta_ocxo2_cycle_residual_diag DMAMEM = {};
+
+static FLASHMEM void clocks_beta_cold_diagnostics_init(void) {
+  if (g_clocks_beta_dmamem_initialized) return;
+
+  // Teensy places DMAMEM in the NOLOAD .bss.dma section.  Startup clears
+  // ordinary BSS only, so explicitly initialize every Beta RAM2 object before
+  // campaign control, reporting, recovery, or the 1 Hz science path can run.
+  g_start_phaseledger_last_ocxo1 =
+      clocks_alpha_ocxo_counterledger_snapshot_t{};
+  g_start_phaseledger_last_ocxo2 =
+      clocks_alpha_ocxo_counterledger_snapshot_t{};
+  g_beta_counterledger_raw_scratch =
+      clocks_alpha_ocxo_counterledger_snapshot_t{};
+  g_beta_ocxo1_counterledger_row =
+      clocks_alpha_ocxo_counterledger_snapshot_t{};
+  g_beta_ocxo2_counterledger_row =
+      clocks_alpha_ocxo_counterledger_snapshot_t{};
+
+  clocks_stack_witness_t* stack_witness =
+      (clocks_stack_witness_t*)&g_clocks_stack_witness;
+  memset(stack_witness, 0, sizeof(*stack_witness));
+  stack_witness->magic = CLOCKS_STACK_WITNESS_MAGIC;
+  stack_witness->reset_count = 1U;
+  stack_witness->min_sp = UINT32_MAX;
+
+  g_floorline_science_ocxo1 = floorline_science_totals_t{};
+  g_floorline_science_ocxo2 = floorline_science_totals_t{};
+  g_delta_previous_vclock_reference = delta_residual_reference_t{};
+  g_delta_vclock_bookends = delta_residual_bookend_t{};
+  g_delta_ocxo1_bookends = delta_residual_bookend_t{};
+  g_delta_ocxo2_bookends = delta_residual_bookend_t{};
+
+  g_beta_start_vclock_forensics = clocks_alpha_lane_forensics_t{};
+  g_beta_start_ocxo1_forensics = clocks_alpha_lane_forensics_t{};
+  g_beta_start_ocxo2_forensics = clocks_alpha_lane_forensics_t{};
+  g_beta_pps_vclock_forensics = clocks_alpha_lane_forensics_t{};
+  g_beta_pps_ocxo1_forensics = clocks_alpha_lane_forensics_t{};
+  g_beta_pps_ocxo2_forensics = clocks_alpha_lane_forensics_t{};
+
+  g_beta_start_ocxo1_projection =
+      clocks_alpha_ocxo_pps_projection_snapshot_t{};
+  g_beta_start_ocxo2_projection =
+      clocks_alpha_ocxo_pps_projection_snapshot_t{};
+  g_beta_pps_ocxo1_projection =
+      clocks_alpha_ocxo_pps_projection_snapshot_t{};
+  g_beta_pps_ocxo2_projection =
+      clocks_alpha_ocxo_pps_projection_snapshot_t{};
+  g_beta_pps_vclock_edge_forensics =
+      clocks_pps_vclock_edge_forensics_t{};
+  g_beta_pps_ocxo1_alpha_tau = clocks_alpha_tau_snapshot_t{};
+  g_beta_pps_ocxo2_alpha_tau = clocks_alpha_tau_snapshot_t{};
+  g_beta_pps_cycle_prediction = clocks_static_prediction_snapshot_t{};
+  g_beta_ocxo1_cycle_prediction = clocks_static_prediction_snapshot_t{};
+  g_beta_ocxo2_cycle_prediction = clocks_static_prediction_snapshot_t{};
+
+  g_beta_report_live_smartzero_scratch = interrupt_smartzero_snapshot_t{};
+  g_beta_report_installed_smartzero_scratch =
+      interrupt_smartzero_snapshot_t{};
+  g_beta_report_interrupt_integrity_scratch =
+      interrupt_integrity_snapshot_t{};
+  g_beta_report_alpha_integrity_scratch =
+      clocks_alpha_integrity_snapshot_t{};
+  g_beta_report_alpha_flow_scratch = clocks_alpha_event_flow_snapshot_t{};
+  g_beta_report_vclock_forensics_scratch =
+      clocks_alpha_lane_forensics_t{};
+  g_beta_report_ocxo1_forensics_scratch =
+      clocks_alpha_lane_forensics_t{};
+  g_beta_report_ocxo2_forensics_scratch =
+      clocks_alpha_lane_forensics_t{};
+  g_beta_report_lane_forensics_scratch =
+      clocks_alpha_lane_forensics_t{};
+  g_beta_report_visible_origin_scratch =
+      clocks_alpha_ocxo_visible_origin_snapshot_t{};
+  g_beta_report_projection_scratch =
+      clocks_alpha_ocxo_pps_projection_snapshot_t{};
+  g_beta_report_ocxo1_tau_scratch = clocks_alpha_tau_snapshot_t{};
+  g_beta_report_ocxo2_tau_scratch = clocks_alpha_tau_snapshot_t{};
+
+  g_beta_vclock_science_row = clock_science_row_t{};
+  g_beta_ocxo1_science_row = clock_science_row_t{};
+  g_beta_ocxo2_science_row = clock_science_row_t{};
+  g_beta_probe_ocxo1_science_row = clock_science_row_t{};
+  g_beta_probe_ocxo2_science_row = clock_science_row_t{};
+  g_beta_probe_floorline_o1 = floorline_science_totals_t{};
+  g_beta_probe_floorline_o2 = floorline_science_totals_t{};
+
+  g_recover_reattach_last_ocxo1 =
+      clocks_alpha_recover_reattach_snapshot_t{};
+  g_recover_reattach_last_ocxo2 =
+      clocks_alpha_recover_reattach_snapshot_t{};
+  g_recover_welfords_pending = recover_welford_state_t{};
+
+  g_clocks_payload_numeric_integrity_failed = false;
+  g_clocks_payload_numeric_integrity_fail_count = 0U;
+  g_clocks_payload_numeric_last_reject_reason =
+      CLOCKS_PAYLOAD_NUMERIC_OK;
+  memset(g_clocks_payload_numeric_last_path,
+         0,
+         sizeof(g_clocks_payload_numeric_last_path));
+  memset(g_clocks_payload_numeric_last_key,
+         0,
+         sizeof(g_clocks_payload_numeric_last_key));
+  memset(g_clocks_payload_numeric_last_token_preview,
+         0,
+         sizeof(g_clocks_payload_numeric_last_token_preview));
+  g_clocks_payload_numeric_court_scratch =
+      clocks_payload_numeric_court_t{};
+
+  g_beta_ocxo1_cycle_residual_diag = ocxo_cycle_residual_diag_t{};
+  g_beta_ocxo2_cycle_residual_diag = ocxo_cycle_residual_diag_t{};
+
+  g_clocks_beta_dmamem_initialized = true;
+}
 
 static void ocxo_cycle_residual_diag_build(
     ocxo_cycle_residual_diag_t& d,
@@ -10358,17 +10461,28 @@ static FLASHMEM void add_campaign_payload(Payload& p) {
   p.add("watchdog_anomaly_publish_pending", watchdog_anomaly_publish_pending);
   p.add("watchdog_anomaly_sequence", watchdog_anomaly_sequence);
   p.add("watchdog_anomaly_reason", watchdog_anomaly_reason);
+  const bool payload_numeric_failure_seen =
+      g_clocks_payload_numeric_integrity_fail_count != 0U;
+  const uint32_t payload_numeric_reason = payload_numeric_failure_seen
+      ? (uint32_t)g_clocks_payload_numeric_last_reject_reason
+      : (uint32_t)CLOCKS_PAYLOAD_NUMERIC_OK;
   p.add("payload_numeric_integrity_fail_count",
         (uint32_t)g_clocks_payload_numeric_integrity_fail_count);
-  p.add("payload_numeric_last_reject_reason_id",
-        (uint32_t)g_clocks_payload_numeric_last_reject_reason);
+  p.add("payload_numeric_last_reject_reason_id", payload_numeric_reason);
   p.add("payload_numeric_last_reject_reason",
-        clocks_payload_numeric_reject_reason_name(
-            g_clocks_payload_numeric_last_reject_reason));
-  p.add("payload_numeric_last_path", g_clocks_payload_numeric_last_path);
-  p.add("payload_numeric_last_key", g_clocks_payload_numeric_last_key);
+        clocks_payload_numeric_reject_reason_name(payload_numeric_reason));
+  p.add("payload_numeric_last_path",
+        payload_numeric_failure_seen
+            ? g_clocks_payload_numeric_last_path
+            : "");
+  p.add("payload_numeric_last_key",
+        payload_numeric_failure_seen
+            ? g_clocks_payload_numeric_last_key
+            : "");
   p.add("payload_numeric_last_token_preview",
-        g_clocks_payload_numeric_last_token_preview);
+        payload_numeric_failure_seen
+            ? g_clocks_payload_numeric_last_token_preview
+            : "");
   p.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
 
   p.add("campaign_warmup_active", campaign_warmup_active());

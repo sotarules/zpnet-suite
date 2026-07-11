@@ -45,12 +45,17 @@ static FLASHMEM Payload system_features_tree_payload(void);
 static void system_feature_schedule_fragment_publish(void);
 static void system_memory_watchdog_arm(void);
 static void system_memory_watchdog_schedule_alap(void);
+static void system_dmamem_ensure_initialized(void);
 
 // --------------------------------------------------------------
 // Internal terminal state
 // --------------------------------------------------------------
 static bool system_shutdown   = false;
 static bool system_bootloader = false;
+
+// Ordinary BSS flag: unlike DMAMEM, this is guaranteed zeroed by startup and
+// can safely guard the first RAM2 cold initialization.
+static bool g_system_dmamem_initialized = false;
 
 static bool system_cpu_window_initialized = false;
 static uint64_t system_cpu_window_last_wall_cycles = 0;
@@ -225,6 +230,7 @@ static FLASHMEM void system_memory_watchdog_cb(timepop_ctx_t* ctx,
 }
 
 static void system_memory_watchdog_arm(void) {
+  system_dmamem_ensure_initialized();
   if (g_system_memory_watchdog_armed) return;
 
   g_system_memory_watchdog_arm_attempts++;
@@ -400,6 +406,7 @@ static void system_feature_note_changed(void) {
 
 static int system_feature_find(const char* subsystem,
                                const char* feature) {
+  system_dmamem_ensure_initialized();
   if (!subsystem || !*subsystem || !feature || !*feature) return -1;
 
   for (size_t i = 0; i < SYSTEM_FEATURE_MAX_FEATURES; i++) {
@@ -486,6 +493,8 @@ bool system_feature_is_nominal(const char* subsystem,
 }
 
 static FLASHMEM Payload system_features_tree_payload(void) {
+  system_dmamem_ensure_initialized();
+
   Payload teensy;
 
   for (size_t i = 0; i < SYSTEM_FEATURE_MAX_FEATURES; i++) {
@@ -595,6 +604,8 @@ class system_crash_buffer_print_t : public Print {
 };
 
 static FLASHMEM void system_crash_report_capture_once(void) {
+  system_dmamem_ensure_initialized();
+
   if (g_system_crash_report_captured) {
     return;
   }
@@ -1191,6 +1202,22 @@ static FLASHMEM Payload cmd_payload_info(const Payload& /*args*/) {
 // on the stack being measured.  Keep the memory_info_t output buffer in RAM2.
 static memory_info_t g_system_memory_info_scratch DMAMEM = {};
 
+static void system_dmamem_ensure_initialized(void) {
+  if (g_system_dmamem_initialized) return;
+
+  // Teensy places DMAMEM in the NOLOAD .bss.dma section.  Explicitly
+  // initialize every SYSTEM RAM2 object before early CLOCKS/INTERRUPT feature
+  // publishers inspect the registry.  This function is intentionally lazy
+  // because those publishers run before process_system_register().
+  g_system_memory_watchdog_health = memory_health_t{};
+  system_feature_registry_reset();
+  memset(g_system_crash_report_text, 0, sizeof(g_system_crash_report_text));
+  memset(g_system_debug_buffer, 0, sizeof(g_system_debug_buffer));
+  g_system_memory_info_scratch = memory_info_t{};
+
+  g_system_dmamem_initialized = true;
+}
+
 // ============================================================================
 // cmd_memory_info — ZPNet SYSTEM command handler
 // ============================================================================
@@ -1579,8 +1606,11 @@ static const process_vtable_t SYSTEM_PROCESS = {
 };
 
 void process_system_register(void) {
-  system_feature_registry_reset();
+  system_dmamem_ensure_initialized();
 
+  // Preserve feature states already published during early INTERRUPT/CLOCKS
+  // hardware initialization.  The old unconditional registry reset occurred
+  // after those publishers and erased their coherent boot evidence.
   system_feature_set("SYSTEM", "FEATURE_STATUS",
                      system_feature_status_t::NOMINAL,
                      "Teensy SYSTEM feature registry online");

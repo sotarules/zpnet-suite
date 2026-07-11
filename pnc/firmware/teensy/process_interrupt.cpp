@@ -12430,9 +12430,69 @@ static void qtimer1_init_ch2_scheduler(void) {
   IMXRT_TMR1.CH[QTIMER1_RETIRED_AUX_CH].CMPLD2 = 0;
 }
 
+static bool g_interrupt_dmamem_initialized = false;
+
+static void interrupt_dmamem_cold_init(void) {
+  if (g_interrupt_dmamem_initialized) return;
+
+  // Teensy places DMAMEM in the NOLOAD .bss.dma section.  Startup clears
+  // ordinary BSS only, so perform one complete RAM2 cold initialization before
+  // hardware setup can expose any of these stores to foreground code or an ISR.
+  g_interrupt_integrity = interrupt_integrity_snapshot_t{};
+  g_interrupt_integrity_report_scratch = interrupt_integrity_snapshot_t{};
+  g_store = snapshot_store_t{};
+  g_pps_yardstick = pps_yardstick_store_t{};
+  g_smartzero2 = smartzero2_system_t{};
+  g_epoch_capture_store = epoch_capture_store_t{};
+
+  for (auto& anchor : g_pvc_anchor_ring) {
+    anchor = pvc_anchor_record_t{};
+  }
+  g_bridge_stats_timepop = bridge_anchor_stats_t{};
+  g_bridge_stats_ocxo1 = bridge_anchor_stats_t{};
+  g_bridge_stats_ocxo2 = bridge_anchor_stats_t{};
+
+  g_pps_gpio_heartbeat = pps_gpio_heartbeat_t{};
+  g_pps_post_isr = pps_post_isr_mailbox_t{};
+  g_last_pps_witness = pps_t{};
+  g_vclock_epoch_latch = vclock_epoch_latch_t{};
+  g_pps_vclock_edge_authority = pps_vclock_edge_authority_t{};
+
+  for (auto& subscriber : g_subscribers) {
+    subscriber = interrupt_subscriber_runtime_t{};
+  }
+  g_vclock_lane = vclock_lane_t{};
+
+  g_generation_gate_vclock = generation_gate_lane_t{};
+  g_generation_gate_ocxo1 = generation_gate_lane_t{};
+  g_generation_gate_ocxo2 = generation_gate_lane_t{};
+  g_ocxo1_qtimer_diag = ocxo_qtimer_diag_t{};
+  g_ocxo2_qtimer_diag = ocxo_qtimer_diag_t{};
+  g_smartzero = smartzero_runtime_t{};
+
+  g_dwt_publication_vclock = dwt_publication_lane_state_t{};
+  g_dwt_publication_ocxo1 = dwt_publication_lane_state_t{};
+  g_dwt_publication_ocxo2 = dwt_publication_lane_state_t{};
+  g_dwt_publication_last_fatal = dwt_publication_forensics_t{};
+
+  g_vclock_fact_ring = vclock_perishable_ring_t{};
+  g_ocxo1_fact_ring = ocxo_perishable_ring_t{};
+  g_ocxo2_fact_ring = ocxo_perishable_ring_t{};
+
+  g_interrupt_handoff = interrupt_handoff_diag_t{};
+  g_handoff_qtimer1_ch1 = interrupt_handoff_source_diag_t{};
+  g_handoff_qtimer1_ch2 = interrupt_handoff_source_diag_t{};
+  g_handoff_ocxo1 = interrupt_handoff_source_diag_t{};
+  g_handoff_ocxo2 = interrupt_handoff_source_diag_t{};
+  g_handoff_pps = interrupt_handoff_source_diag_t{};
+
+  g_interrupt_dmamem_initialized = true;
+}
+
 void process_interrupt_init_hardware(void) {
   if (g_interrupt_hw_ready) return;
 
+  interrupt_dmamem_cold_init();
   interrupt_features_mark_initializing();
 
   g_ocxo1_lane.name = "OCXO1";
@@ -12575,6 +12635,7 @@ static void runtime_reset_snapshot_and_bridge_state(void) {
 
 static void runtime_reset_smartzero_state(void) {
   g_smartzero = smartzero_runtime_t{};
+  g_smartzero2 = smartzero2_system_t{};
   for (uint32_t i = 0; i < SMARTZERO_LANE_COUNT; i++) {
     smartzero_reset_lane(i);
   }

@@ -4374,19 +4374,43 @@ static void alpha_ocxo_pps_projection_reset_all(void) {
       g_ocxo2_pps_projection, (uint32_t)((uint8_t)time_clock_id_t::OCXO2));
 }
 
+static bool g_clocks_alpha_dmamem_initialized = false;
+
 static FLASHMEM void clocks_alpha_cold_diagnostics_init(void) {
+  if (g_clocks_alpha_dmamem_initialized) return;
+
+  // Teensy places DMAMEM in the NOLOAD .bss.dma section.  Startup clears
+  // ordinary BSS only, so explicitly initialize every Alpha RAM2 object before
+  // DWT, subscriptions, reports, or epoch work begin.
+  g_vclock_clock = clock_state_t{};
+  g_vclock_measurement = clock_measurement_t{};
+  g_ocxo1_clock = clock_state_t{};
+  g_ocxo2_clock = clock_state_t{};
+  g_ocxo1_measurement = clock_measurement_t{};
+  g_ocxo2_measurement = clock_measurement_t{};
+  g_pps_witness_diag = interrupt_capture_diag_t{};
+  g_ocxo1_interrupt_diag = interrupt_capture_diag_t{};
+  g_ocxo2_interrupt_diag = interrupt_capture_diag_t{};
+
+  g_pps_vclock_edge_forensics_seq = 0U;
+  g_pps_vclock_edge_forensics = clocks_pps_vclock_edge_forensics_t{};
   g_alpha_integrity = clocks_alpha_integrity_snapshot_t{};
+
   g_vclock_forensics = alpha_lane_forensics_store_t{};
   g_ocxo1_forensics = alpha_lane_forensics_store_t{};
   g_ocxo2_forensics = alpha_lane_forensics_store_t{};
   g_vclock_event_flow = alpha_event_flow_store_t{};
   g_ocxo1_event_flow = alpha_event_flow_store_t{};
   g_ocxo2_event_flow = alpha_event_flow_store_t{};
+
   g_ocxo1_pps_projection = alpha_ocxo_pps_projection_store_t{};
   g_ocxo2_pps_projection = alpha_ocxo_pps_projection_store_t{};
   g_ocxo1_pps_projection_guard = alpha_ocxo_pps_projection_guard_t{};
   g_ocxo2_pps_projection_guard = alpha_ocxo_pps_projection_guard_t{};
+  alpha_ocxo_pps_projection_reset_all();
+
   alpha_tau_reset_all();
+  g_clocks_alpha_dmamem_initialized = true;
 }
 
 static void alpha_ocxo_edge_history_install_zero(time_clock_id_t clock,

@@ -146,6 +146,13 @@ static const char* memory_info_stack_paint_skip_reason_name(uint32_t reason) {
 
 void memory_info_init() {
 
+    // Teensy places DMAMEM in the NOLOAD .bss.dma section.  Startup clears
+    // ordinary BSS only, so explicitly establish every RAM2 object's boot
+    // state before the first audit can read it.
+    _memory_health_memory_scratch = memory_info_t{};
+    _memory_health_payload_scratch = payload_info_t{};
+    _memory_health = memory_health_t{};
+
     // Record initial stack pointer as baseline.  This is a sampled witness; the
     // painted sentinel below provides the historical high-water witness.
     const uint32_t sp = memory_info_stack_pointer();
@@ -219,7 +226,6 @@ void memory_info_init() {
     _heap_arena_hwm  = mi.arena;
     _heap_arena_prev = mi.arena;
 
-    memset(&_memory_health, 0, sizeof(_memory_health));
     _memory_health.status = memory_health_status_t::UNASSESSED;
     _memory_health.primary_reason = memory_health_reason_t::NONE;
     _memory_health.heap_free_critical_bytes = MEMORY_HEAP_FREE_CRITICAL_BYTES;
