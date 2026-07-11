@@ -439,6 +439,11 @@ _diag: Dict[str, Any] = {
     "start_first_fragment_wait_s": None,
     "start_first_fragment_pps_vclock_count": None,
     "last_start_async": {},
+    "teensy_start_responses": 0,
+    "teensy_start_accepted": 0,
+    "teensy_start_rejected": 0,
+    "teensy_start_malformed": 0,
+    "last_teensy_start_response": {},
 
     "last_pps_count_anomaly": {},    # legacy diagnostic alias
     "last_pps_vclock_count_anomaly": {},
@@ -4519,7 +4524,36 @@ def _request_teensy_stop_best_effort() -> None:
         pass
 
 
-def _request_teensy_start(campaign: str, pps_vclock_count: int, args: Dict[str, Any]) -> None:
+class TeensyStartRejected(RuntimeError):
+    """Raised when CLOCKS.START routes successfully but firmware rejects it."""
+
+    def __init__(self, status: str, response: Dict[str, Any]):
+        self.status = status
+        self.response = response
+        payload = response.get("payload") if isinstance(response, dict) else None
+        error = payload.get("error") if isinstance(payload, dict) else None
+        super().__init__(f"Teensy CLOCKS.START rejected: status={status!r} error={error!r}")
+
+
+_TEENSY_START_ACCEPTED_STATUSES = {
+    "start_pending_smartzero",
+    "start_pending_smartzero_dac_fault",
+    "flash_cut_requested",
+    "flash_cut_requested_dac_fault_servo_off",
+}
+
+
+def _request_teensy_start(
+    campaign: str,
+    pps_vclock_count: int,
+    args: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Send CLOCKS.START and validate the firmware handler status.
+
+    The outer RPC success/message fields prove only that the Teensy command
+    router invoked the handler.  Campaign admission is expressed by the
+    handler payload's status field and must be checked explicitly.
+    """
     teensy_args = dict(args)
     # Teensy still accepts the legacy pps_count command argument.  Send the
     # explicit PPS/VCLOCK alias too; older firmware will ignore it.
@@ -4528,7 +4562,70 @@ def _request_teensy_start(campaign: str, pps_vclock_count: int, args: Dict[str, 
         "pps_count": str(int(pps_vclock_count)),
         "pps_vclock_count": str(int(pps_vclock_count)),
     })
-    send_command(machine="TEENSY", subsystem="CLOCKS", command="START", args=teensy_args)
+
+    resp = send_command(
+        machine="TEENSY",
+        subsystem="CLOCKS",
+        command="START",
+        args=teensy_args,
+    )
+    _diag["teensy_start_responses"] = _diag.get("teensy_start_responses", 0) + 1
+
+    payload = resp.get("payload") if isinstance(resp, dict) else None
+    status = str(payload.get("status") or "") if isinstance(payload, dict) else ""
+    evidence = {
+        "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "campaign": campaign,
+        "pps_vclock_count": int(pps_vclock_count),
+        "outer_success": bool(resp.get("success")) if isinstance(resp, dict) else False,
+        "outer_message": resp.get("message") if isinstance(resp, dict) else None,
+        "status": status or None,
+        "payload": payload,
+    }
+    _diag["last_teensy_start_response"] = evidence
+
+    if not isinstance(resp, dict) or not resp.get("success"):
+        _diag["teensy_start_rejected"] = _diag.get("teensy_start_rejected", 0) + 1
+        logging.error(
+            "💥 [start] Teensy CLOCKS.START transport/RPC failure: campaign='%s' response=%s",
+            campaign,
+            json.dumps(resp, sort_keys=True, default=str),
+        )
+        raise TeensyStartRejected(status or "outer_rpc_failure", resp if isinstance(resp, dict) else {})
+
+    if not isinstance(payload, dict) or not status:
+        _diag["teensy_start_malformed"] = _diag.get("teensy_start_malformed", 0) + 1
+        logging.error(
+            "💥 [start] Teensy CLOCKS.START returned no usable handler status: "
+            "campaign='%s' outer_message=%s response=%s",
+            campaign,
+            resp.get("message"),
+            json.dumps(resp, sort_keys=True, default=str),
+        )
+        raise TeensyStartRejected("missing_handler_status", resp)
+
+    if status not in _TEENSY_START_ACCEPTED_STATUSES:
+        _diag["teensy_start_rejected"] = _diag.get("teensy_start_rejected", 0) + 1
+        logging.error(
+            "💥 [start] Teensy CLOCKS.START REJECTED: campaign='%s' status='%s' "
+            "error=%r outer_success=%s outer_message=%r handler_payload=%s",
+            campaign,
+            status,
+            payload.get("error"),
+            resp.get("success"),
+            resp.get("message"),
+            json.dumps(payload, sort_keys=True, default=str),
+        )
+        raise TeensyStartRejected(status, resp)
+
+    _diag["teensy_start_accepted"] = _diag.get("teensy_start_accepted", 0) + 1
+    logging.info(
+        "✅ [start] Teensy CLOCKS.START accepted: campaign='%s' status='%s' payload=%s",
+        campaign,
+        status,
+        json.dumps(payload, sort_keys=True, default=str),
+    )
+    return resp
 
 
 def _request_teensy_recover(pps_vclock_count: int, args: Dict[str, Any]) -> None:
@@ -4782,30 +4879,63 @@ def cmd_start(args: Optional[dict]) -> dict:
     if calibrate_ocxo is not None:
         teensy_args["calibrate_ocxo"] = calibrate_ocxo
 
+    teensy_start_resp: Dict[str, Any] = {}
     try:
-        _request_teensy_start(campaign=campaign, pps_vclock_count=0, args=teensy_args)
-    except Exception:
+        teensy_start_resp = _request_teensy_start(
+            campaign=campaign,
+            pps_vclock_count=0,
+            args=teensy_args,
+        )
+    except Exception as e:
         _campaign_active = False
         _accepted_pps_vclock_count = None
         _clear_start_wait_state()
         _clear_flash_cut_wait_state()
-        if flash_cut and prev_campaign:
-            try:
-                failed_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-                with open_db() as conn:
-                    cur = conn.cursor()
-                    cur.execute(
-                        """
-                        UPDATE campaigns
-                        SET active = false,
-                            payload = payload || jsonb_build_object(
-                                'start_failed_at', to_jsonb(%s::text),
-                                'start_failed_reason', to_jsonb(%s::text)
-                            )
-                        WHERE campaign = %s AND active = true
-                        """,
-                        (failed_at, "teensy_start_command_failed", campaign),
-                    )
+
+        failed_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        failure_status = e.status if isinstance(e, TeensyStartRejected) else "teensy_start_command_failed"
+        failure_response = e.response if isinstance(e, TeensyStartRejected) else {}
+        failure_payload = (
+            failure_response.get("payload")
+            if isinstance(failure_response, dict)
+            and isinstance(failure_response.get("payload"), dict)
+            else {}
+        )
+
+        logging.error(
+            "💥 [start] campaign arm FAILED: campaign='%s' mode=%s status='%s' "
+            "error=%r response=%s",
+            campaign,
+            "FLASH_CUT" if flash_cut else "COLD_START",
+            failure_status,
+            failure_payload.get("error"),
+            json.dumps(failure_response, sort_keys=True, default=str),
+        )
+
+        try:
+            with open_db() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    UPDATE campaigns
+                    SET active = false,
+                        payload = payload || jsonb_build_object(
+                            'start_failed_at', to_jsonb(%s::text),
+                            'start_failed_reason', to_jsonb(%s::text),
+                            'start_failed_error', to_jsonb(%s::text),
+                            'start_failed_teensy_payload', %s::jsonb
+                        )
+                    WHERE campaign = %s AND active = true
+                    """,
+                    (
+                        failed_at,
+                        str(failure_status),
+                        str(failure_payload.get("error") or str(e)),
+                        json.dumps(failure_payload),
+                        campaign,
+                    ),
+                )
+                if flash_cut and prev_campaign:
                     cur.execute(
                         """
                         UPDATE campaigns
@@ -4815,15 +4945,38 @@ def cmd_start(args: Optional[dict]) -> dict:
                         """,
                         (prev_campaign,),
                     )
-            except Exception:
-                logging.exception("⚠️ [clocks] failed to roll back DB after Flash Cut START failure")
-        raise
+        except Exception:
+            logging.exception("⚠️ [clocks] failed to roll back DB after Teensy START rejection")
 
+        return {
+            "success": False,
+            "message": f"Teensy CLOCKS.START rejected: {failure_status}",
+            "payload": {
+                "campaign": campaign,
+                "flash_cut": flash_cut,
+                "previous_campaign": prev_campaign,
+                "teensy_status": failure_status,
+                "teensy_error": failure_payload.get("error"),
+                "teensy_payload": failure_payload,
+                "outer_response": failure_response,
+                "campaign_active": False,
+                "database_rolled_back": True,
+            },
+        }
+
+    teensy_start_payload = teensy_start_resp.get("payload", {})
+    teensy_start_status = (
+        str(teensy_start_payload.get("status") or "")
+        if isinstance(teensy_start_payload, dict)
+        else ""
+    )
     logging.info(
-        "✅ [start] @%s %s requested — campaign='%s' active; awaiting first complete TIMEBASE pair",
+        "✅ [start] @%s %s accepted by Teensy — campaign='%s' status='%s'; "
+        "awaiting first complete TIMEBASE pair",
         system_time_z(),
         "FLASH_CUT" if flash_cut else "START",
         campaign,
+        teensy_start_status,
     )
 
     return {
@@ -4836,6 +4989,8 @@ def cmd_start(args: Optional[dict]) -> dict:
             "set_dac2": set_dac2,
             "calibrate_ocxo": calibrate_ocxo,
             "waiting_for_first_fragment": True,
+            "teensy_start_status": teensy_start_status,
+            "teensy_start_payload": teensy_start_payload,
             "startup": _start_status_payload(),
             "flash_cut": flash_cut,
             "previous_campaign": prev_campaign,
