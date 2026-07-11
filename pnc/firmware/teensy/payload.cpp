@@ -7,42 +7,51 @@
 #include <string.h>
 #include <ctype.h>
 #include <math.h>
+#include <errno.h>
+#include <limits.h>
+#include <stddef.h>
 
 // ============================================================================
-// Global Payload Instrumentation (monotonic, centralized)
+// Payload v4 instrumentation
 // ============================================================================
 
 static volatile uint32_t g_payload_instances_constructed = 0;
-static volatile uint32_t g_payload_instances_destroyed   = 0;
+static volatile uint32_t g_payload_instances_destroyed = 0;
+static volatile uint32_t g_payload_alive_now = 0;
+static volatile uint32_t g_payload_alive_high_water = 0;
 
-static volatile uint32_t g_payload_alive_now             = 0;
-static volatile uint32_t g_payload_alive_high_water      = 0;
-
-static volatile uint32_t g_payload_entry_alloc_fail      = 0;
-static volatile uint32_t g_payload_entry_realloc_count   = 0;
+// V4 has no independently allocated entry table. These compatibility counters
+// remain zero except for overflow/high-water observations.
+static volatile uint32_t g_payload_entry_alloc_fail = 0;
+static volatile uint32_t g_payload_entry_realloc_count = 0;
 static volatile uint32_t g_payload_entry_heap_bytes_alive = 0;
 static volatile uint32_t g_payload_entry_heap_bytes_high_water = 0;
-static volatile uint32_t g_payload_entry_overflow        = 0;
+static volatile uint32_t g_payload_entry_overflow = 0;
 static volatile uint32_t g_payload_entry_high_water_global = 0;
 static volatile uint32_t g_payload_max_entry_capacity_seen = 0;
 
-static volatile uint32_t g_payload_arena_alloc_fail      = 0;
-static volatile uint32_t g_payload_arena_realloc_count   = 0;
+// The v3 "arena" telemetry now describes the one heap-backed storage block.
+static volatile uint32_t g_payload_arena_alloc_fail = 0;
+static volatile uint32_t g_payload_arena_realloc_count = 0;
 static volatile uint32_t g_payload_arena_heap_bytes_alive = 0;
 static volatile uint32_t g_payload_arena_heap_bytes_high_water = 0;
 static volatile uint32_t g_payload_arena_high_water_global = 0;
 static volatile uint32_t g_payload_max_arena_capacity_seen = 0;
 
-static volatile uint32_t g_payload_serialize_overflow    = 0;
-static volatile uint32_t g_payload_to_json_fail          = 0;
-static volatile uint32_t g_payload_string_truncation     = 0;
-static volatile uint32_t g_payload_parse_error           = 0;
-static volatile uint32_t g_payload_integrity_fail        = 0;
-static volatile uint32_t g_payload_invalid_kind          = 0;
+static volatile uint32_t g_payload_serialize_overflow = 0;
+static volatile uint32_t g_payload_to_json_fail = 0;
+static volatile uint32_t g_payload_string_truncation = 0;
+static volatile uint32_t g_payload_parse_error = 0;
+static volatile uint32_t g_payload_json_invalid_syntax = 0;
+static volatile uint32_t g_payload_json_invalid_depth = 0;
+static volatile uint32_t g_payload_json_invalid_utf8_key = 0;
+static volatile uint32_t g_payload_json_invalid_utf8_value = 0;
+static volatile uint32_t g_payload_json_invalid_raw_object = 0;
+static volatile uint32_t g_payload_json_invalid_raw_array = 0;
+static volatile uint32_t g_payload_json_decode_fail = 0;
+static volatile uint32_t g_payload_integrity_fail = 0;
+static volatile uint32_t g_payload_invalid_kind = 0;
 
-// Defensive C-string pointer custody.  These counters are separate from
-// semantic Payload errors so SYSTEM.PAYLOAD_INFO can show pointer corruption
-// even when Payload substitutes a safe sentinel and keeps the firmware alive.
 static volatile uint32_t g_payload_string_pointer_fault = 0;
 static volatile uint32_t g_payload_string_pointer_null = 0;
 static volatile uint32_t g_payload_string_pointer_low_address = 0;
@@ -53,20 +62,11 @@ static volatile uint32_t g_payload_string_pointer_unterminated = 0;
 static volatile uint32_t g_payload_string_pointer_too_long = 0;
 static volatile uint32_t g_payload_last_string_pointer_fault_reason = 0;
 static volatile uint32_t g_payload_last_string_pointer_fault_ptr = 0;
+static volatile uint32_t g_payload_last_string_pointer_fault_op_id = 0;
 static char g_payload_last_string_pointer_fault_context[32] = {0};
-
-// Caller breadcrumb for BAD_STRING_POINTER.  The pointer court knows the bad
-// value pointer and context, but that is not enough to find the offending
-// report field when hundreds of p.add(key, value) calls are in flight.  Keep
-// a best-effort copy of the key that was being populated when the bad string
-// value was rejected.  This is diagnostic only; Payload still substitutes a
-// safe sentinel and keeps running.
 static volatile uint32_t g_payload_last_string_pointer_fault_key_ptr = 0;
 static char g_payload_last_string_pointer_fault_key[64] = {0};
 
-// Payload object integrity courtroom.  _self_ok() is deliberately the most
-// expensive guard in the class: when it rejects a Payload, record the exact
-// invariant that failed and a compact snapshot of the object/entry state.
 static volatile uint32_t g_payload_self_ok_fail = 0;
 static volatile uint32_t g_payload_self_ok_magic_bad = 0;
 static volatile uint32_t g_payload_self_ok_entries_null = 0;
@@ -106,65 +106,22 @@ static volatile uint32_t g_payload_last_self_ok_fail_entry_key_off = 0;
 static volatile uint32_t g_payload_last_self_ok_fail_entry_val_off = 0;
 static volatile uint32_t g_payload_last_self_ok_fail_entry_val_len = 0;
 static volatile uint32_t g_payload_last_self_ok_fail_entry_kind = 0;
+static volatile uint32_t g_payload_last_self_ok_fail_op_id = 0;
+static volatile uint32_t g_payload_last_self_ok_fail_capacity = 0;
+static volatile uint32_t g_payload_last_self_ok_fail_data_begin = 0;
+static volatile uint32_t g_payload_last_self_ok_fail_expected_upper = 0;
+static volatile uint32_t g_payload_last_self_ok_fail_key_end = 0;
+static volatile uint32_t g_payload_last_self_ok_fail_val_end = 0;
+static volatile uint32_t g_payload_first_self_ok_fail_captured = 0;
 
-static volatile uint32_t g_payload_last_error_code       = 0;
-static volatile uint32_t g_payload_last_error_count      = 0;
-static volatile uint32_t g_payload_last_error_this       = 0;
+static volatile uint32_t g_payload_last_error_code = 0;
+static volatile uint32_t g_payload_last_error_count = 0;
+static volatile uint32_t g_payload_last_error_this = 0;
+static volatile uint32_t g_payload_last_error_op_id = 0;
 static char g_payload_last_error_op[32] = {0};
 
 // ============================================================================
-// Temporary bad-magic autopsy trace
-// ============================================================================
-//
-// This is intentionally a one-shot, rollback-friendly crash-hunt instrument.
-// The first Payload whose live magic is found damaged records:
-//   * discovery site and core stack registers
-//   * a best-effort r7 frame-pointer walk
-//   * plausible Thumb return addresses found in a bounded stack scan
-//
-// The trace is emitted directly through debug_log() so no Payload is required
-// to report corruption of Payload itself.  Feed the emitted addresses to
-// zpaddr against the exact ELF from the failing build.
-
-static constexpr uint32_t PAYLOAD_MAGIC_TRACE_FRAME_MAX = 8;
-static constexpr uint32_t PAYLOAD_MAGIC_TRACE_SCAN_MAX = 24;
-static constexpr uint32_t PAYLOAD_MAGIC_TRACE_SCAN_WORDS = 128;
-
-struct payload_magic_trace_t {
-    uint32_t captured;
-    uint32_t sequence;
-    uint32_t dwt;
-    uint32_t self;
-    uint32_t magic;
-    uint32_t magic_addr;
-    uint32_t discovery_pc;
-    uint32_t lr;
-    uint32_t r7;
-    uint32_t msp;
-    uint32_t psp;
-    uint32_t active_sp;
-    uint32_t control;
-    uint32_t ipsr;
-    uint32_t last_ctor_self;
-    uint32_t last_ctor_pc;
-    uint32_t last_ctor_sp;
-    uint32_t frame_count;
-    uint32_t frames[PAYLOAD_MAGIC_TRACE_FRAME_MAX];
-    uint32_t scan_count;
-    uint32_t scan_offsets[PAYLOAD_MAGIC_TRACE_SCAN_MAX];
-    uint32_t scan_values[PAYLOAD_MAGIC_TRACE_SCAN_MAX];
-    char op[32];
-};
-
-static payload_magic_trace_t g_payload_magic_trace DMAMEM = {};
-static volatile uint32_t g_payload_magic_trace_sequence = 0;
-static volatile uint32_t g_payload_magic_last_ctor_self = 0;
-static volatile uint32_t g_payload_magic_last_ctor_pc = 0;
-static volatile uint32_t g_payload_magic_last_ctor_sp = 0;
-static char g_payload_magic_trace_line[224] DMAMEM = {0};
-
-// ============================================================================
-// Error codes
+// Error and compatibility reason codes
 // ============================================================================
 
 enum payload_error_code_t : uint32_t {
@@ -182,6 +139,8 @@ enum payload_error_code_t : uint32_t {
     PAYLOAD_ERR_INVALID_KIND = 11,
     PAYLOAD_ERR_COPY_ALLOC_FAIL = 12,
     PAYLOAD_ERR_BAD_STRING_POINTER = 13,
+    PAYLOAD_ERR_STORAGE_CORRUPT = 14,
+    PAYLOAD_ERR_JSON_INVALID = 15,
 };
 
 const char* payload_error_code_name(uint32_t code) {
@@ -200,6 +159,8 @@ const char* payload_error_code_name(uint32_t code) {
         case PAYLOAD_ERR_INVALID_KIND:       return "INVALID_KIND";
         case PAYLOAD_ERR_COPY_ALLOC_FAIL:    return "COPY_ALLOC_FAIL";
         case PAYLOAD_ERR_BAD_STRING_POINTER: return "BAD_STRING_POINTER";
+        case PAYLOAD_ERR_STORAGE_CORRUPT:    return "STORAGE_CORRUPT";
+        case PAYLOAD_ERR_JSON_INVALID:       return "JSON_INVALID";
         default:                             return "UNKNOWN";
     }
 }
@@ -258,571 +219,307 @@ enum payload_self_ok_fail_reason_t : uint32_t {
 
 const char* payload_self_ok_fail_reason_name(uint32_t reason) {
     switch (reason) {
-        case PAYLOAD_SELF_OK_NONE:                       return "NONE";
-        case PAYLOAD_SELF_OK_MAGIC_BAD:                  return "MAGIC_BAD";
-        case PAYLOAD_SELF_OK_ENTRIES_NULL:               return "ENTRIES_NULL";
-        case PAYLOAD_SELF_OK_ENTRY_CAP_LOW:              return "ENTRY_CAP_LOW";
-        case PAYLOAD_SELF_OK_ENTRY_CAP_HIGH:             return "ENTRY_CAP_HIGH";
-        case PAYLOAD_SELF_OK_ENTRIES_MAGIC_ADDRESS:      return "ENTRIES_MAGIC_ADDRESS";
-        case PAYLOAD_SELF_OK_ARENA_MAGIC_ADDRESS:        return "ARENA_MAGIC_ADDRESS";
-        case PAYLOAD_SELF_OK_ENTRIES_SPAN_UNREADABLE:    return "ENTRIES_SPAN_UNREADABLE";
-        case PAYLOAD_SELF_OK_ARENA_SPAN_UNREADABLE:      return "ARENA_SPAN_UNREADABLE";
-        case PAYLOAD_SELF_OK_INLINE_CAP_MISMATCH:        return "INLINE_CAP_MISMATCH";
-        case PAYLOAD_SELF_OK_HEAP_CAP_MISMATCH:          return "HEAP_CAP_MISMATCH";
-        case PAYLOAD_SELF_OK_COUNT_GT_ENTRY_CAP:         return "COUNT_GT_ENTRY_CAP";
-        case PAYLOAD_SELF_OK_COUNT_GT_MAX:               return "COUNT_GT_MAX";
-        case PAYLOAD_SELF_OK_ARENA_USED_GT_CAP:          return "ARENA_USED_GT_CAP";
-        case PAYLOAD_SELF_OK_ARENA_CAP_GT_MAX:           return "ARENA_CAP_GT_MAX";
-        case PAYLOAD_SELF_OK_ARENA_CAP_ZERO_WITH_PTR:    return "ARENA_CAP_ZERO_WITH_PTR";
-        case PAYLOAD_SELF_OK_ARENA_CAP_NONZERO_WITH_NULL:return "ARENA_CAP_NONZERO_WITH_NULL";
-        case PAYLOAD_SELF_OK_COUNT_WITHOUT_ARENA:        return "COUNT_WITHOUT_ARENA";
-        case PAYLOAD_SELF_OK_ENTRY_KIND_BAD:             return "ENTRY_KIND_BAD";
-        case PAYLOAD_SELF_OK_ENTRY_KEY_OFF_OOB:          return "ENTRY_KEY_OFF_OOB";
-        case PAYLOAD_SELF_OK_ENTRY_VAL_OFF_OOB:          return "ENTRY_VAL_OFF_OOB";
-        case PAYLOAD_SELF_OK_ENTRY_VAL_END_OOB:          return "ENTRY_VAL_END_OOB";
-        case PAYLOAD_SELF_OK_ENTRY_VAL_UNTERMINATED:     return "ENTRY_VAL_UNTERMINATED";
-        case PAYLOAD_SELF_OK_ENTRY_KEY_UNTERMINATED:     return "ENTRY_KEY_UNTERMINATED";
-        default:                                        return "UNKNOWN";
+        case PAYLOAD_SELF_OK_NONE:                        return "NONE";
+        case PAYLOAD_SELF_OK_MAGIC_BAD:                   return "MAGIC_BAD_RETIRED_V4";
+        case PAYLOAD_SELF_OK_ENTRIES_NULL:                return "STORAGE_NULL";
+        case PAYLOAD_SELF_OK_ENTRY_CAP_LOW:               return "ENTRY_CAP_LOW";
+        case PAYLOAD_SELF_OK_ENTRY_CAP_HIGH:              return "ENTRY_CAP_HIGH";
+        case PAYLOAD_SELF_OK_ENTRIES_MAGIC_ADDRESS:       return "ENTRIES_MAGIC_ADDRESS_RETIRED_V4";
+        case PAYLOAD_SELF_OK_ARENA_MAGIC_ADDRESS:         return "ARENA_MAGIC_ADDRESS_RETIRED_V4";
+        case PAYLOAD_SELF_OK_ENTRIES_SPAN_UNREADABLE:     return "STORAGE_BLOCK_UNREADABLE";
+        case PAYLOAD_SELF_OK_ARENA_SPAN_UNREADABLE:       return "DATA_SPAN_UNREADABLE";
+        case PAYLOAD_SELF_OK_INLINE_CAP_MISMATCH:         return "INLINE_CAP_MISMATCH";
+        case PAYLOAD_SELF_OK_HEAP_CAP_MISMATCH:           return "HEAP_CAP_MISMATCH";
+        case PAYLOAD_SELF_OK_COUNT_GT_ENTRY_CAP:          return "COUNT_GT_ENTRY_CAP";
+        case PAYLOAD_SELF_OK_COUNT_GT_MAX:                return "COUNT_GT_MAX";
+        case PAYLOAD_SELF_OK_ARENA_USED_GT_CAP:           return "DATA_USED_GT_CAP";
+        case PAYLOAD_SELF_OK_ARENA_CAP_GT_MAX:            return "STORAGE_CAP_GT_MAX";
+        case PAYLOAD_SELF_OK_ARENA_CAP_ZERO_WITH_PTR:     return "CAP_ZERO_WITH_PTR";
+        case PAYLOAD_SELF_OK_ARENA_CAP_NONZERO_WITH_NULL: return "CAP_NONZERO_WITH_NULL";
+        case PAYLOAD_SELF_OK_COUNT_WITHOUT_ARENA:         return "COUNT_WITHOUT_DATA";
+        case PAYLOAD_SELF_OK_ENTRY_KIND_BAD:              return "ENTRY_KIND_BAD";
+        case PAYLOAD_SELF_OK_ENTRY_KEY_OFF_OOB:           return "ENTRY_KEY_OFF_OOB";
+        case PAYLOAD_SELF_OK_ENTRY_VAL_OFF_OOB:           return "ENTRY_VAL_OFF_OOB";
+        case PAYLOAD_SELF_OK_ENTRY_VAL_END_OOB:           return "ENTRY_VAL_END_OOB";
+        case PAYLOAD_SELF_OK_ENTRY_VAL_UNTERMINATED:      return "ENTRY_VAL_UNTERMINATED";
+        case PAYLOAD_SELF_OK_ENTRY_KEY_UNTERMINATED:      return "ENTRY_KEY_UNTERMINATED";
+        default:                                          return "UNKNOWN";
     }
 }
 
-static void payload_copy_trusted_label(char* dst, size_t cap, const char* src) {
+
+// ============================================================================
+// Stable numeric operation identity
+// ============================================================================
+//
+// These values preserve the FNV-1a numbers emitted by the previous diagnostic
+// build, but they are now compile-time constants. Failure bookkeeping never
+// receives or traverses an operation-label pointer.
+
+enum payload_operation_id_t : uint32_t {
+    PAYLOAD_OP_NONE = 0U,
+    PAYLOAD_OP_ADD_KEY = 0xD462A255UL,
+    PAYLOAD_OP_ADD_ARRAY_KEY = 0xFE1083ABUL,
+    PAYLOAD_OP_ADD_ARRAY_VALUE = 0xB11A9C75UL,
+    PAYLOAD_OP_ADD_BOOL_KEY = 0xAC115924UL,
+    PAYLOAD_OP_ADD_CSTR_KEY = 0x295273BCUL,
+    PAYLOAD_OP_ADD_CSTR_VALUE = 0xD6E6DC3AUL,
+    PAYLOAD_OP_ADD_DOUBLE = 0x72DB5A0CUL,
+    PAYLOAD_OP_ADD_DOUBLE_PRECISION = 0xB5BA038BUL,
+    PAYLOAD_OP_ADD_FLOAT = 0xF0CDAC89UL,
+    PAYLOAD_OP_ADD_FMT = 0x04FEDBF4UL,
+    PAYLOAD_OP_ADD_FMT_FORMAT = 0x0ADAD95DUL,
+    PAYLOAD_OP_ADD_FMT_KEY = 0x891B83D5UL,
+    PAYLOAD_OP_ADD_I32 = 0xA34A6729UL,
+    PAYLOAD_OP_ADD_I32_KEY = 0x1E7A71ACUL,
+    PAYLOAD_OP_ADD_I64 = 0x37520BEAUL,
+    PAYLOAD_OP_ADD_I64_KEY = 0x7A4C9DBBUL,
+    PAYLOAD_OP_ADD_OBJECT_KEY = 0x7DB29AFFUL,
+    PAYLOAD_OP_ADD_OBJECT_VALUE = 0xB4039D31UL,
+    PAYLOAD_OP_ADD_RAW_KEY = 0x1A1C9ED0UL,
+    PAYLOAD_OP_ADD_RAW_VALUE = 0xFC7A1C46UL,
+    PAYLOAD_OP_ADD_U32 = 0xB944654DUL,
+    PAYLOAD_OP_ADD_U32_KEY = 0x5FA4E370UL,
+    PAYLOAD_OP_ADD_U64 = 0x35385C8EUL,
+    PAYLOAD_OP_ADD_U64_KEY = 0xEB27CA3FUL,
+    PAYLOAD_OP_APPEND_KEY = 0x03CBF254UL,
+    PAYLOAD_OP_APPEND_INPUT_VALUE = 0x91FCC762UL,
+    PAYLOAD_OP_APPEND_VALUE = 0x60D27BE3UL,
+    PAYLOAD_OP_APPEND_VALUE_LENGTH = 0x80AAE437UL,
+    PAYLOAD_OP_APPEND_VALUE_UTF8 = 0x333B0378UL,
+    PAYLOAD_OP_APPEND_WRITER = 0xCF4278D5UL,
+    PAYLOAD_OP_APPEND_WRITER_KEY = 0x3151E968UL,
+    PAYLOAD_OP_APPEND_WRITER_LENGTH = 0x06E0EA19UL,
+    PAYLOAD_OP_APPEND_WRITER_UTF8 = 0xF44D5A06UL,
+    PAYLOAD_OP_APPEND_WRITER_WRITE = 0x92F18D08UL,
+    PAYLOAD_OP_ARENA_CAPACITY = 0xA6E32F79UL,
+    PAYLOAD_OP_ARENA_USED = 0x008915C0UL,
+    PAYLOAD_OP_ARRAY_ADD_WRITE = 0x0806A7A2UL,
+    PAYLOAD_OP_ARRAY_ALLOC = 0x5942F3EDUL,
+    PAYLOAD_OP_ARRAY_CAPACITY = 0x2398A2BCUL,
+    PAYLOAD_OP_ARRAY_PARSE = 0x59F15837UL,
+    PAYLOAD_OP_ARRAY_PARSE_INVALID = 0xE535F37AUL,
+    PAYLOAD_OP_ARRAY_RELEASE_STORAGE = 0xE6B1BDEBUL,
+    PAYLOAD_OP_ARRAY_RELEASE_STORAGE_GUARD = 0x78A75C2CUL,
+    PAYLOAD_OP_ARRAY_VIEW_GET = 0xEF3B8ABCUL,
+    PAYLOAD_OP_ARRAY_VIEW_SIZE = 0xB1DB2071UL,
+    PAYLOAD_OP_ARRAY_VIEW_VALID = 0x6CA62C42UL,
+    PAYLOAD_OP_CLEAR = 0x5C6E1222UL,
+    PAYLOAD_OP_COPY_ASSIGN = 0x0EF80038UL,
+    PAYLOAD_OP_COPY_ASSIGN_SOURCE = 0x0A7D13DFUL,
+    PAYLOAD_OP_COPY_CTOR = 0x39F7EA4BUL,
+    PAYLOAD_OP_COPY_FROM = 0x8FB0C939UL,
+    PAYLOAD_OP_COUNT = 0x39B1DDF4UL,
+    PAYLOAD_OP_DEBUG_DUMP = 0x68635107UL,
+    PAYLOAD_OP_DEBUG_DUMP_ENTRY = 0xBF4676B5UL,
+    PAYLOAD_OP_DEBUG_DUMP_TAG = 0xDB35BE39UL,
+    PAYLOAD_OP_EMPTY = 0x18A7BEEEUL,
+    PAYLOAD_OP_ENSURE_ROOM = 0xCDBCBCCBUL,
+    PAYLOAD_OP_ENSURE_ROOM_ALLOC = 0xD6807594UL,
+    PAYLOAD_OP_ENSURE_ROOM_CAPACITY = 0x74CBBAABUL,
+    PAYLOAD_OP_ENSURE_ROOM_DATA = 0xC65F5CE7UL,
+    PAYLOAD_OP_ENSURE_ROOM_ENTRIES = 0x9B2E5D25UL,
+    PAYLOAD_OP_ENSURE_ROOM_GROW = 0x16AF044CUL,
+    PAYLOAD_OP_ENTRY_CAPACITY = 0x8AA7EB40UL,
+    PAYLOAD_OP_FIND_KEY = 0x3466FF4BUL,
+    PAYLOAD_OP_FIND_LAYOUT = 0xD2714752UL,
+    PAYLOAD_OP_GETARRAY = 0xC97863F4UL,
+    PAYLOAD_OP_GETARRAYVIEW = 0x073EA9EDUL,
+    PAYLOAD_OP_GETPAYLOAD = 0x76B94E07UL,
+    PAYLOAD_OP_HASARRAY = 0x6AC7AE38UL,
+    PAYLOAD_OP_HEAP_BLOCK = 0x71CF741CUL,
+    PAYLOAD_OP_JSON_SIZE = 0xAE652ECDUL,
+    PAYLOAD_OP_JSON_SIZE_VALUE = 0xD8354B66UL,
+    PAYLOAD_OP_MOVE_ASSIGN_SOURCE = 0xECBE926FUL,
+    PAYLOAD_OP_MOVE_FROM = 0x376E8D29UL,
+    PAYLOAD_OP_PARSEJSON_COLON = 0x90CC8523UL,
+    PAYLOAD_OP_PARSEJSON_DATA = 0xB5EF7548UL,
+    PAYLOAD_OP_PARSEJSON_EOF = 0x9BC18F22UL,
+    PAYLOAD_OP_PARSEJSON_KEY = 0x2456FA1FUL,
+    PAYLOAD_OP_PARSEJSON_KEY_DECODE = 0x83298432UL,
+    PAYLOAD_OP_PARSEJSON_LENGTH = 0xCECF6BDCUL,
+    PAYLOAD_OP_PARSEJSON_OPEN = 0x0312FEA8UL,
+    PAYLOAD_OP_PARSEJSON_RESERVE = 0xA69D0D48UL,
+    PAYLOAD_OP_PARSEJSON_SEPARATOR = 0xAAB531E7UL,
+    PAYLOAD_OP_PARSEJSON_TRAILING = 0xF0F9BD2CUL,
+    PAYLOAD_OP_PARSEJSON_UNCLOSED = 0x8FED3DF7UL,
+    PAYLOAD_OP_PARSEJSON_VALUE = 0x4CA3F351UL,
+    PAYLOAD_OP_PARSEJSON_VALUE_DECODE = 0x956CAB1CUL,
+    PAYLOAD_OP_RELEASE_STORAGE = 0x6705E500UL,
+    PAYLOAD_OP_RELEASE_STORAGE_GUARD = 0x59BE62E3UL,
+    PAYLOAD_OP_TO_JSON_ALLOC = 0x81EEC028UL,
+    PAYLOAD_OP_TO_JSON_SIZE = 0xBF250482UL,
+    PAYLOAD_OP_TO_JSON_WRITE = 0xF163FED6UL,
+    PAYLOAD_OP_TRY_BOOL = 0xFA4E2B77UL,
+    PAYLOAD_OP_TRY_DOUBLE = 0x92DDD42EUL,
+    PAYLOAD_OP_TRY_DOUBLE_TOKEN = 0x920353D5UL,
+    PAYLOAD_OP_TRY_FLOAT = 0xD41F48A7UL,
+    PAYLOAD_OP_TRY_FLOAT_TOKEN = 0xEAAF4288UL,
+    PAYLOAD_OP_TRY_INT = 0x28A94CECUL,
+    PAYLOAD_OP_TRY_INT_TOKEN = 0x0E49D8B3UL,
+    PAYLOAD_OP_TRY_UINT = 0x1EF3A67BUL,
+    PAYLOAD_OP_TRY_UINT_TOKEN = 0xD004E164UL,
+    PAYLOAD_OP_TRY_UINT64 = 0x55C995B9UL,
+    PAYLOAD_OP_TRY_UINT64_TOKEN = 0x98721022UL,
+    PAYLOAD_OP_WRITE_JSON_BUFFER = 0xE0DEFD21UL,
+    PAYLOAD_OP_WRITE_JSON_SIZE = 0xA14EE86AUL,
+};
+
+const char* payload_operation_id_name(uint32_t operation_id) {
+    switch (operation_id) {
+        case PAYLOAD_OP_NONE: return "NONE";
+        case PAYLOAD_OP_ADD_KEY: return "add.key";
+        case PAYLOAD_OP_ADD_ARRAY_KEY: return "add_array.key";
+        case PAYLOAD_OP_ADD_ARRAY_VALUE: return "add_array.value";
+        case PAYLOAD_OP_ADD_BOOL_KEY: return "add_bool.key";
+        case PAYLOAD_OP_ADD_CSTR_KEY: return "add_cstr.key";
+        case PAYLOAD_OP_ADD_CSTR_VALUE: return "add_cstr.value";
+        case PAYLOAD_OP_ADD_DOUBLE: return "add_double";
+        case PAYLOAD_OP_ADD_DOUBLE_PRECISION: return "add_double_precision";
+        case PAYLOAD_OP_ADD_FLOAT: return "add_float";
+        case PAYLOAD_OP_ADD_FMT: return "add_fmt";
+        case PAYLOAD_OP_ADD_FMT_FORMAT: return "add_fmt.format";
+        case PAYLOAD_OP_ADD_FMT_KEY: return "add_fmt.key";
+        case PAYLOAD_OP_ADD_I32: return "add_i32";
+        case PAYLOAD_OP_ADD_I32_KEY: return "add_i32.key";
+        case PAYLOAD_OP_ADD_I64: return "add_i64";
+        case PAYLOAD_OP_ADD_I64_KEY: return "add_i64.key";
+        case PAYLOAD_OP_ADD_OBJECT_KEY: return "add_object.key";
+        case PAYLOAD_OP_ADD_OBJECT_VALUE: return "add_object.value";
+        case PAYLOAD_OP_ADD_RAW_KEY: return "add_raw.key";
+        case PAYLOAD_OP_ADD_RAW_VALUE: return "add_raw.value";
+        case PAYLOAD_OP_ADD_U32: return "add_u32";
+        case PAYLOAD_OP_ADD_U32_KEY: return "add_u32.key";
+        case PAYLOAD_OP_ADD_U64: return "add_u64";
+        case PAYLOAD_OP_ADD_U64_KEY: return "add_u64.key";
+        case PAYLOAD_OP_APPEND_KEY: return "append.key";
+        case PAYLOAD_OP_APPEND_INPUT_VALUE: return "append.value";
+        case PAYLOAD_OP_APPEND_VALUE: return "append_value";
+        case PAYLOAD_OP_APPEND_VALUE_LENGTH: return "append_value.length";
+        case PAYLOAD_OP_APPEND_VALUE_UTF8: return "append_value.utf8";
+        case PAYLOAD_OP_APPEND_WRITER: return "append_writer";
+        case PAYLOAD_OP_APPEND_WRITER_KEY: return "append_writer.key";
+        case PAYLOAD_OP_APPEND_WRITER_LENGTH: return "append_writer.length";
+        case PAYLOAD_OP_APPEND_WRITER_UTF8: return "append_writer.utf8";
+        case PAYLOAD_OP_APPEND_WRITER_WRITE: return "append_writer.write";
+        case PAYLOAD_OP_ARENA_CAPACITY: return "arena_capacity";
+        case PAYLOAD_OP_ARENA_USED: return "arena_used";
+        case PAYLOAD_OP_ARRAY_ADD_WRITE: return "array.add.write";
+        case PAYLOAD_OP_ARRAY_ALLOC: return "array.alloc";
+        case PAYLOAD_OP_ARRAY_CAPACITY: return "array.capacity";
+        case PAYLOAD_OP_ARRAY_PARSE: return "array.parse";
+        case PAYLOAD_OP_ARRAY_PARSE_INVALID: return "array.parse.invalid";
+        case PAYLOAD_OP_ARRAY_RELEASE_STORAGE: return "array.release_storage";
+        case PAYLOAD_OP_ARRAY_RELEASE_STORAGE_GUARD: return "array.release_storage.guard";
+        case PAYLOAD_OP_ARRAY_VIEW_GET: return "array_view.get";
+        case PAYLOAD_OP_ARRAY_VIEW_SIZE: return "array_view.size";
+        case PAYLOAD_OP_ARRAY_VIEW_VALID: return "array_view.valid";
+        case PAYLOAD_OP_CLEAR: return "clear";
+        case PAYLOAD_OP_COPY_ASSIGN: return "copy_assign";
+        case PAYLOAD_OP_COPY_ASSIGN_SOURCE: return "copy_assign.source";
+        case PAYLOAD_OP_COPY_CTOR: return "copy_ctor";
+        case PAYLOAD_OP_COPY_FROM: return "copy_from";
+        case PAYLOAD_OP_COUNT: return "count";
+        case PAYLOAD_OP_DEBUG_DUMP: return "debug_dump";
+        case PAYLOAD_OP_DEBUG_DUMP_ENTRY: return "debug_dump.entry";
+        case PAYLOAD_OP_DEBUG_DUMP_TAG: return "debug_dump.tag";
+        case PAYLOAD_OP_EMPTY: return "empty";
+        case PAYLOAD_OP_ENSURE_ROOM: return "ensure_room";
+        case PAYLOAD_OP_ENSURE_ROOM_ALLOC: return "ensure_room.alloc";
+        case PAYLOAD_OP_ENSURE_ROOM_CAPACITY: return "ensure_room.capacity";
+        case PAYLOAD_OP_ENSURE_ROOM_DATA: return "ensure_room.data";
+        case PAYLOAD_OP_ENSURE_ROOM_ENTRIES: return "ensure_room.entries";
+        case PAYLOAD_OP_ENSURE_ROOM_GROW: return "ensure_room.grow";
+        case PAYLOAD_OP_ENTRY_CAPACITY: return "entry_capacity";
+        case PAYLOAD_OP_FIND_KEY: return "find.key";
+        case PAYLOAD_OP_FIND_LAYOUT: return "find.layout";
+        case PAYLOAD_OP_GETARRAY: return "getArray";
+        case PAYLOAD_OP_GETARRAYVIEW: return "getArrayView";
+        case PAYLOAD_OP_GETPAYLOAD: return "getPayload";
+        case PAYLOAD_OP_HASARRAY: return "hasArray";
+        case PAYLOAD_OP_HEAP_BLOCK: return "heap.block";
+        case PAYLOAD_OP_JSON_SIZE: return "json_size";
+        case PAYLOAD_OP_JSON_SIZE_VALUE: return "json_size.value";
+        case PAYLOAD_OP_MOVE_ASSIGN_SOURCE: return "move_assign.source";
+        case PAYLOAD_OP_MOVE_FROM: return "move_from";
+        case PAYLOAD_OP_PARSEJSON_COLON: return "parseJSON.colon";
+        case PAYLOAD_OP_PARSEJSON_DATA: return "parseJSON.data";
+        case PAYLOAD_OP_PARSEJSON_EOF: return "parseJSON.eof";
+        case PAYLOAD_OP_PARSEJSON_KEY: return "parseJSON.key";
+        case PAYLOAD_OP_PARSEJSON_KEY_DECODE: return "parseJSON.key_decode";
+        case PAYLOAD_OP_PARSEJSON_LENGTH: return "parseJSON.length";
+        case PAYLOAD_OP_PARSEJSON_OPEN: return "parseJSON.open";
+        case PAYLOAD_OP_PARSEJSON_RESERVE: return "parseJSON.reserve";
+        case PAYLOAD_OP_PARSEJSON_SEPARATOR: return "parseJSON.separator";
+        case PAYLOAD_OP_PARSEJSON_TRAILING: return "parseJSON.trailing";
+        case PAYLOAD_OP_PARSEJSON_UNCLOSED: return "parseJSON.unclosed";
+        case PAYLOAD_OP_PARSEJSON_VALUE: return "parseJSON.value";
+        case PAYLOAD_OP_PARSEJSON_VALUE_DECODE: return "parseJSON.value_decode";
+        case PAYLOAD_OP_RELEASE_STORAGE: return "release_storage";
+        case PAYLOAD_OP_RELEASE_STORAGE_GUARD: return "release_storage.guard";
+        case PAYLOAD_OP_TO_JSON_ALLOC: return "to_json.alloc";
+        case PAYLOAD_OP_TO_JSON_SIZE: return "to_json.size";
+        case PAYLOAD_OP_TO_JSON_WRITE: return "to_json.write";
+        case PAYLOAD_OP_TRY_BOOL: return "try_bool";
+        case PAYLOAD_OP_TRY_DOUBLE: return "try_double";
+        case PAYLOAD_OP_TRY_DOUBLE_TOKEN: return "try_double.token";
+        case PAYLOAD_OP_TRY_FLOAT: return "try_float";
+        case PAYLOAD_OP_TRY_FLOAT_TOKEN: return "try_float.token";
+        case PAYLOAD_OP_TRY_INT: return "try_int";
+        case PAYLOAD_OP_TRY_INT_TOKEN: return "try_int.token";
+        case PAYLOAD_OP_TRY_UINT: return "try_uint";
+        case PAYLOAD_OP_TRY_UINT_TOKEN: return "try_uint.token";
+        case PAYLOAD_OP_TRY_UINT64: return "try_uint64";
+        case PAYLOAD_OP_TRY_UINT64_TOKEN: return "try_uint64.token";
+        case PAYLOAD_OP_WRITE_JSON_BUFFER: return "write_json.buffer";
+        case PAYLOAD_OP_WRITE_JSON_SIZE: return "write_json.size";
+        default: return "UNKNOWN";
+    }
+}
+
+struct payload_layout_evidence_t {
+    uint32_t entry_index;
+    uint32_t capacity;
+    uint32_t data_begin;
+    uint32_t entry_count;
+    uint32_t key_off;
+    uint32_t key_len;
+    uint32_t val_off;
+    uint32_t val_len;
+    uint32_t entry_kind;
+    uint32_t expected_upper;
+    uint32_t key_end;
+    uint32_t val_end;
+};
+
+// ============================================================================
+// Small, non-recursive diagnostics
+// ============================================================================
+
+static void payload_copy_label(char* dst, size_t cap, const char* src) {
     if (!dst || cap == 0) return;
     if (!src) src = "?";
     size_t i = 0;
     while (i + 1U < cap && src[i] != '\0') {
         dst[i] = src[i];
-        i++;
+        ++i;
     }
     dst[i] = '\0';
 }
 
-static inline uint32_t payload_trace_read_msp() {
-    uint32_t value;
-    __asm__ volatile ("mrs %0, msp" : "=r"(value));
-    return value;
-}
-
-static inline uint32_t payload_trace_read_psp() {
-    uint32_t value;
-    __asm__ volatile ("mrs %0, psp" : "=r"(value));
-    return value;
-}
-
-static inline uint32_t payload_trace_read_control() {
-    uint32_t value;
-    __asm__ volatile ("mrs %0, control" : "=r"(value));
-    return value;
-}
-
-static inline uint32_t payload_trace_read_ipsr() {
-    uint32_t value;
-    __asm__ volatile ("mrs %0, ipsr" : "=r"(value));
-    return value;
-}
-
-static inline uint32_t payload_trace_read_lr() {
-    uint32_t value;
-    __asm__ volatile ("mov %0, lr" : "=r"(value));
-    return value;
-}
-
-static inline uint32_t payload_trace_read_r7() {
-    uint32_t value;
-    __asm__ volatile ("mov %0, r7" : "=r"(value));
-    return value;
-}
-
-static bool payload_trace_dtcm_words_readable(uint32_t addr, uint32_t words) {
-    static constexpr uint32_t DTCM_BEGIN = 0x20000000UL;
-    static constexpr uint32_t DTCM_END = 0x20080000UL;
-
-    if ((addr & 3U) != 0U || addr < DTCM_BEGIN || addr >= DTCM_END) {
-        return false;
-    }
-
-    const uint64_t end = (uint64_t)addr + (uint64_t)words * sizeof(uint32_t);
-    return end <= DTCM_END;
-}
-
-static bool payload_trace_plausible_code_address(uint32_t addr) {
-    // Saved Cortex-M return addresses retain the Thumb bit.  Accept both the
-    // ITCM execution map and the QSPI FLASHMEM execution map used by Teensy 4.x.
-    if ((addr & 1U) == 0U) return false;
-    const uint32_t pc = addr & ~1UL;
-    return (pc >= 0x00000020UL && pc < 0x00100000UL) ||
-           (pc >= 0x60000000UL && pc < 0x61000000UL);
-}
-
-static __attribute__((noinline)) void payload_magic_trace_note_constructed(
-    const void* self, uint32_t caller_pc) {
-    const uint32_t control = payload_trace_read_control();
-    const uint32_t ipsr = payload_trace_read_ipsr();
-    const uint32_t msp = payload_trace_read_msp();
-    const uint32_t psp = payload_trace_read_psp();
-
-    g_payload_magic_last_ctor_self = (uint32_t)(uintptr_t)self;
-    g_payload_magic_last_ctor_pc = caller_pc;
-    g_payload_magic_last_ctor_sp =
-        (ipsr != 0U || (control & 2U) == 0U) ? msp : psp;
-}
-
-static __attribute__((noinline)) void payload_magic_trace_emit(
-    const payload_magic_trace_t& t) {
-    snprintf(g_payload_magic_trace_line, sizeof(g_payload_magic_trace_line),
-             "seq=%lu op=%s this=0x%08lX magic=0x%08lX magic_addr=0x%08lX dwt=0x%08lX",
-             (unsigned long)t.sequence,
-             t.op,
-             (unsigned long)t.self,
-             (unsigned long)t.magic,
-             (unsigned long)t.magic_addr,
-             (unsigned long)t.dwt);
-    debug_log("payload.magic.trace", g_payload_magic_trace_line);
-
-    snprintf(g_payload_magic_trace_line, sizeof(g_payload_magic_trace_line),
-             "pc=0x%08lX lr=0x%08lX r7=0x%08lX msp=0x%08lX psp=0x%08lX active_sp=0x%08lX control=0x%08lX ipsr=%lu",
-             (unsigned long)t.discovery_pc,
-             (unsigned long)t.lr,
-             (unsigned long)t.r7,
-             (unsigned long)t.msp,
-             (unsigned long)t.psp,
-             (unsigned long)t.active_sp,
-             (unsigned long)t.control,
-             (unsigned long)t.ipsr);
-    debug_log("payload.magic.regs", g_payload_magic_trace_line);
-
-    snprintf(g_payload_magic_trace_line, sizeof(g_payload_magic_trace_line),
-             "last_ctor_this=0x%08lX last_ctor_pc=0x%08lX last_ctor_sp=0x%08lX self_minus_sp=%ld",
-             (unsigned long)t.last_ctor_self,
-             (unsigned long)t.last_ctor_pc,
-             (unsigned long)t.last_ctor_sp,
-             (long)((int32_t)(t.self - t.active_sp)));
-    debug_log("payload.magic.ctor", g_payload_magic_trace_line);
-
-    for (uint32_t i = 0; i < t.frame_count; i++) {
-        snprintf(g_payload_magic_trace_line, sizeof(g_payload_magic_trace_line),
-                 "frame[%lu]=0x%08lX",
-                 (unsigned long)i,
-                 (unsigned long)t.frames[i]);
-        debug_log("payload.magic.frame", g_payload_magic_trace_line);
-    }
-
-    for (uint32_t i = 0; i < t.scan_count; i++) {
-        snprintf(g_payload_magic_trace_line, sizeof(g_payload_magic_trace_line),
-                 "stack[%lu] sp+0x%03lX=0x%08lX",
-                 (unsigned long)i,
-                 (unsigned long)t.scan_offsets[i],
-                 (unsigned long)t.scan_values[i]);
-        debug_log("payload.magic.stack", g_payload_magic_trace_line);
-    }
-}
-
-static __attribute__((noinline)) void payload_magic_trace_capture(
-    const void* self, uint32_t magic, const char* op, uint32_t discovery_pc) {
-    if (g_payload_magic_trace.captured != 0U) return;
-
-    // Latch immediately.  Payload is foreground-only by contract, so a simple
-    // one-shot latch is preferable to introducing interrupt masking here.
-    g_payload_magic_trace.captured = 1U;
-    g_payload_magic_trace.sequence = ++g_payload_magic_trace_sequence;
-    g_payload_magic_trace.dwt = ARM_DWT_CYCCNT;
-    g_payload_magic_trace.self = (uint32_t)(uintptr_t)self;
-    g_payload_magic_trace.magic = magic;
-    g_payload_magic_trace.magic_addr = (uint32_t)(uintptr_t)self;
-    g_payload_magic_trace.discovery_pc = discovery_pc;
-    g_payload_magic_trace.lr = payload_trace_read_lr();
-    g_payload_magic_trace.r7 = payload_trace_read_r7();
-    g_payload_magic_trace.msp = payload_trace_read_msp();
-    g_payload_magic_trace.psp = payload_trace_read_psp();
-    g_payload_magic_trace.control = payload_trace_read_control();
-    g_payload_magic_trace.ipsr = payload_trace_read_ipsr();
-    g_payload_magic_trace.active_sp =
-        (g_payload_magic_trace.ipsr != 0U ||
-         (g_payload_magic_trace.control & 2U) == 0U)
-            ? g_payload_magic_trace.msp
-            : g_payload_magic_trace.psp;
-    g_payload_magic_trace.last_ctor_self = g_payload_magic_last_ctor_self;
-    g_payload_magic_trace.last_ctor_pc = g_payload_magic_last_ctor_pc;
-    g_payload_magic_trace.last_ctor_sp = g_payload_magic_last_ctor_sp;
-    payload_copy_trusted_label(g_payload_magic_trace.op,
-                               sizeof(g_payload_magic_trace.op),
-                               op ? op : "?");
-
-    // Best-effort frame-pointer chain.  This becomes authoritative when the
-    // failing build uses -fno-omit-frame-pointer; otherwise it simply yields
-    // zero or a short conservative chain.
-    uint32_t fp_addr = g_payload_magic_trace.r7;
-    while (g_payload_magic_trace.frame_count < PAYLOAD_MAGIC_TRACE_FRAME_MAX &&
-           payload_trace_dtcm_words_readable(fp_addr, 2U)) {
-        const uint32_t* fp = reinterpret_cast<const uint32_t*>(fp_addr);
-        const uint32_t next_fp = fp[0];
-        const uint32_t return_pc = fp[1];
-
-        if (payload_trace_plausible_code_address(return_pc)) {
-            g_payload_magic_trace.frames[g_payload_magic_trace.frame_count++] =
-                return_pc;
-        }
-
-        if (next_fp <= fp_addr ||
-            !payload_trace_dtcm_words_readable(next_fp, 2U)) {
-            break;
-        }
-        fp_addr = next_fp;
-    }
-
-    // Frame pointers are not guaranteed in ordinary Teensy builds, so also
-    // scan a small active-stack window and retain words that look like Thumb
-    // return addresses.  zpaddr can cheaply reject false positives offline.
-    uint32_t scan_addr = g_payload_magic_trace.active_sp;
-    for (uint32_t word = 0;
-         word < PAYLOAD_MAGIC_TRACE_SCAN_WORDS &&
-         g_payload_magic_trace.scan_count < PAYLOAD_MAGIC_TRACE_SCAN_MAX;
-         word++) {
-        const uint32_t addr = scan_addr + word * sizeof(uint32_t);
-        if (!payload_trace_dtcm_words_readable(addr, 1U)) break;
-        const uint32_t value = *reinterpret_cast<const uint32_t*>(addr);
-        if (!payload_trace_plausible_code_address(value)) continue;
-
-        const uint32_t idx = g_payload_magic_trace.scan_count++;
-        g_payload_magic_trace.scan_offsets[idx] =
-            word * sizeof(uint32_t);
-        g_payload_magic_trace.scan_values[idx] = value;
-    }
-
-    __asm__ volatile ("dmb" ::: "memory");
-    payload_magic_trace_emit(g_payload_magic_trace);
-}
-
-static void payload_note_string_pointer_fault(uint32_t reason,
-                                              const void* ptr,
-                                              const char* context) {
-    g_payload_string_pointer_fault++;
-    switch (reason) {
-        case PAYLOAD_STRING_FAULT_NULL:
-            g_payload_string_pointer_null++;
-            break;
-        case PAYLOAD_STRING_FAULT_LOW_ADDRESS:
-            g_payload_string_pointer_low_address++;
-            break;
-        case PAYLOAD_STRING_FAULT_MAGIC_ADDRESS:
-            g_payload_string_pointer_magic_address++;
-            break;
-        case PAYLOAD_STRING_FAULT_OUT_OF_RANGE:
-            g_payload_string_pointer_out_of_range++;
-            break;
-        case PAYLOAD_STRING_FAULT_SPAN_OUT_OF_RANGE:
-            g_payload_string_pointer_span_out_of_range++;
-            break;
-        case PAYLOAD_STRING_FAULT_UNTERMINATED:
-            g_payload_string_pointer_unterminated++;
-            break;
-        case PAYLOAD_STRING_FAULT_TOO_LONG:
-            g_payload_string_pointer_too_long++;
-            break;
-        default:
-            break;
-    }
-    g_payload_last_string_pointer_fault_reason = reason;
-    g_payload_last_string_pointer_fault_ptr = (uint32_t)(uintptr_t)ptr;
-    payload_copy_trusted_label(g_payload_last_string_pointer_fault_context,
-                               sizeof(g_payload_last_string_pointer_fault_context),
-                               context ? context : "string");
-
-    // Most pointer faults occur below helpers that do not know the semantic
-    // Payload key.  Clear the key breadcrumb here so stale field names do not
-    // survive generic faults.  Callers that do know the key can fill it in
-    // immediately after the pointer court rejects the value.
-    g_payload_last_string_pointer_fault_key_ptr = 0;
-    payload_copy_trusted_label(g_payload_last_string_pointer_fault_key,
-                               sizeof(g_payload_last_string_pointer_fault_key),
-                               "");
-}
-
-struct payload_readable_range_t {
-    uintptr_t begin;
-    uintptr_t end;
-};
-
-// Teensy 4.x readable storage regions that may legitimately hold C strings:
-//   DTCM/RAM1:       stack, globals, most literals copied by the linker
-//   OCRAM/RAM2:      malloc heap used by Payload arenas and transport buffers
-//   QSPI flash map:  const storage in builds that leave literals in flash
-//
-// ITCM/code addresses below 0x20000000 are intentionally not accepted for
-// strings.  This catches poisoned small pointers and accidental code pointers
-// before optimized libc string code can align them down and fault at 0x0.
-static constexpr payload_readable_range_t PAYLOAD_STRING_READ_RANGES[] = {
-    { 0x20000000UL, 0x20080000UL },
-    { 0x20200000UL, 0x20280000UL },
-    { 0x60000000UL, 0x61000000UL },
-};
-
-static bool payload_pointer_remaining(const void* ptr,
-                                      size_t* out_remaining,
-                                      uint32_t* out_reason) {
-    if (out_remaining) *out_remaining = 0;
-    if (out_reason) *out_reason = PAYLOAD_STRING_FAULT_NONE;
-
-    if (!ptr) {
-        if (out_reason) *out_reason = PAYLOAD_STRING_FAULT_NULL;
-        return false;
-    }
-
-    const uintptr_t addr = (uintptr_t)ptr;
-    if (addr == 0x5041594CUL || addr == 0x44454144UL) {
-        if (out_reason) *out_reason = PAYLOAD_STRING_FAULT_MAGIC_ADDRESS;
-        return false;
-    }
-
-    if (addr < 0x1000UL) {
-        if (out_reason) *out_reason = PAYLOAD_STRING_FAULT_LOW_ADDRESS;
-        return false;
-    }
-
-    for (const auto& r : PAYLOAD_STRING_READ_RANGES) {
-        if (addr >= r.begin && addr < r.end) {
-            if (out_remaining) *out_remaining = (size_t)(r.end - addr);
-            return true;
-        }
-    }
-
-    if (out_reason) *out_reason = PAYLOAD_STRING_FAULT_OUT_OF_RANGE;
-    return false;
-}
-
-static void payload_note_last_string_pointer_fault_key(const char* key) {
-    g_payload_last_string_pointer_fault_key_ptr = (uint32_t)(uintptr_t)key;
-
-    if (!key) {
-        payload_copy_trusted_label(g_payload_last_string_pointer_fault_key,
-                                   sizeof(g_payload_last_string_pointer_fault_key),
-                                   "");
-        return;
-    }
-
-    size_t remaining = 0;
-    uint32_t reason = PAYLOAD_STRING_FAULT_NONE;
-    if (!payload_pointer_remaining(key, &remaining, &reason)) {
-        (void)reason;
-        payload_copy_trusted_label(g_payload_last_string_pointer_fault_key,
-                                   sizeof(g_payload_last_string_pointer_fault_key),
-                                   "!bad_key_pointer");
-        return;
-    }
-
-    const size_t cap = sizeof(g_payload_last_string_pointer_fault_key);
-    size_t limit = remaining;
-    if (limit > cap - 1U) limit = cap - 1U;
-
-    size_t i = 0;
-    while (i < limit && key[i] != '\0') {
-        g_payload_last_string_pointer_fault_key[i] = key[i];
-        i++;
-    }
-
-    if (i < limit && key[i] == '\0') {
-        g_payload_last_string_pointer_fault_key[i] = '\0';
-    } else {
-        payload_copy_trusted_label(g_payload_last_string_pointer_fault_key,
-                                   sizeof(g_payload_last_string_pointer_fault_key),
-                                   "!bad_key_unterminated");
-    }
-}
-
-static bool payload_memory_readable(const void* ptr,
-                                    size_t len,
-                                    const char* context) {
-    if (len == 0) return true;
-
-    size_t remaining = 0;
-    uint32_t reason = PAYLOAD_STRING_FAULT_NONE;
-    if (!payload_pointer_remaining(ptr, &remaining, &reason)) {
-        payload_note_string_pointer_fault(reason, ptr, context);
-        return false;
-    }
-
-    if (len > remaining) {
-        payload_note_string_pointer_fault(
-            PAYLOAD_STRING_FAULT_SPAN_OUT_OF_RANGE, ptr, context);
-        return false;
-    }
-
-    return true;
-}
-
-static bool payload_cstr_len_checked(const char* str,
-                                     size_t max_len,
-                                     bool allow_truncate,
-                                     const char* context,
-                                     size_t* out_len,
-                                     bool* out_truncated = nullptr) {
-    if (out_len) *out_len = 0;
-    if (out_truncated) *out_truncated = false;
-
-    size_t remaining = 0;
-    uint32_t reason = PAYLOAD_STRING_FAULT_NONE;
-    if (!payload_pointer_remaining(str, &remaining, &reason)) {
-        payload_note_string_pointer_fault(reason, str, context);
-        return false;
-    }
-
-    size_t limit = max_len;
-    if (limit > remaining) limit = remaining;
-
-    for (size_t i = 0; i < limit; i++) {
-        if (str[i] == '\0') {
-            if (out_len) *out_len = i;
-            return true;
-        }
-    }
-
-    if (allow_truncate && max_len <= remaining) {
-        if (out_len) *out_len = max_len;
-        if (out_truncated) *out_truncated = true;
-        return true;
-    }
-
-    const uint32_t fault = (limit < remaining)
-        ? PAYLOAD_STRING_FAULT_TOO_LONG
-        : PAYLOAD_STRING_FAULT_UNTERMINATED;
-    payload_note_string_pointer_fault(fault, str, context);
-    return false;
-}
-
-static bool payload_copy_cstr_checked(char* dst,
-                                      size_t dst_cap,
-                                      const char* src,
-                                      const char* context,
-                                      const char* fallback = "") {
-    if (!dst || dst_cap == 0) return false;
-
-    if (!src) {
-        src = fallback ? fallback : "";
-    }
-
-    size_t n = 0;
-    bool truncated = false;
-    if (!payload_cstr_len_checked(src, dst_cap - 1U, true, context, &n, &truncated)) {
-        payload_copy_trusted_label(dst, dst_cap, fallback ? fallback : "");
-        return false;
-    }
-
-    if (n > 0) memcpy(dst, src, n);
-    dst[n] = '\0';
-    if (truncated) {
-        g_payload_string_truncation++;
-    }
-    return true;
-}
-
-static const char* payload_cstr_or_empty(const char* src,
-                                         size_t max_len,
-                                         const char* context,
-                                         size_t* out_len,
-                                         bool* out_ok = nullptr) {
-    if (out_len) *out_len = 0;
-    if (out_ok) *out_ok = true;
-
-    if (!src) return "";
-
-    size_t n = 0;
-    if (!payload_cstr_len_checked(src, max_len, false, context, &n)) {
-        if (out_ok) *out_ok = false;
-        return "";
-    }
-
-    if (out_len) *out_len = n;
-    return src;
-}
-
-static size_t payload_trusted_literal_len(const char* s) {
-    size_t n = 0;
-    if (!s) return 0;
-    while (s[n] != '\0') n++;
-    return n;
-}
-
-static size_t payload_owned_strlen_bounded(const char* s, size_t cap) {
-    if (!s) return 0;
-    size_t n = 0;
-    while (n < cap && s[n] != '\0') n++;
-    return n;
-}
-
-static bool payload_owned_equals_literal(const char* s, const char* literal) {
-    if (!s || !literal) return false;
-    size_t i = 0;
-    while (i < Payload::ARENA_MAX && s[i] != '\0' && literal[i] != '\0') {
-        if (s[i] != literal[i]) return false;
-        i++;
-    }
-    return i < Payload::ARENA_MAX && s[i] == '\0' && literal[i] == '\0';
-}
-
-static bool payload_owned_equals_known_len(const char* s,
-                                           const char* key,
-                                           size_t key_len) {
-    if (!s || !key) return false;
-    for (size_t i = 0; i < key_len; i++) {
-        if (i >= Payload::ARENA_MAX || s[i] == '\0' || s[i] != key[i]) {
-            return false;
-        }
-    }
-    return key_len < Payload::ARENA_MAX && s[key_len] == '\0';
-}
-
-static bool payload_cstr_equals_literal(const char* s,
-                                        const char* literal,
-                                        const char* context) {
-    if (!Payload::HEAVY_FORENSICS) {
-        (void)context;
-        return payload_owned_equals_literal(s, literal);
-    }
-
-    size_t n = 0;
-    if (!payload_cstr_len_checked(s, Payload::ARENA_MAX, false, context, &n)) {
-        return false;
-    }
-
-    const size_t literal_len = payload_trusted_literal_len(literal);
-    return n == literal_len && memcmp(s, literal, n) == 0;
-}
-
-static void payload_note_error(uint32_t code, const char* op, const void* self) {
+static inline void payload_note_error(uint32_t code,
+                                      uint32_t operation_id,
+                                      const void* self) {
+    // Failure bookkeeping is scalar-only. operation_id is already numeric;
+    // this path performs no string traversal or pointer inspection.
     g_payload_last_error_code = code;
     g_payload_last_error_count++;
     g_payload_last_error_this = (uint32_t)(uintptr_t)self;
-
-    if (!op) op = "?";
-    if (!payload_copy_cstr_checked(g_payload_last_error_op,
-                                   sizeof(g_payload_last_error_op),
-                                   op,
-                                   "payload_note_error.op",
-                                   "!bad_op")) {
-        // Preserve the original semantic error code above; the string-pointer
-        // fault is captured separately in the string-pointer fault counters.
-    }
+    g_payload_last_error_op_id = operation_id;
+    g_payload_last_error_op[0] = '\0';
 }
 
-
-static void payload_note_self_ok_failure(uint32_t reason,
-                                         const char* op,
-                                         const void* self,
-                                         uint32_t magic,
-                                         const void* entries,
-                                         const void* arena,
-                                         size_t count,
-                                         size_t entry_cap,
-                                         size_t arena_used,
-                                         size_t arena_cap,
-                                         uint32_t entry_index = 0xFFFFFFFFUL,
-                                         uint32_t entry_key_off = 0,
-                                         uint32_t entry_val_off = 0,
-                                         uint32_t entry_val_len = 0,
-                                         uint32_t entry_kind = 0) {
-    g_payload_integrity_fail++;
-    g_payload_self_ok_fail++;
-
+static void payload_increment_integrity_reason(uint32_t reason) {
     switch (reason) {
         case PAYLOAD_SELF_OK_MAGIC_BAD: g_payload_self_ok_magic_bad++; break;
         case PAYLOAD_SELF_OK_ENTRIES_NULL: g_payload_self_ok_entries_null++; break;
@@ -849,960 +546,1761 @@ static void payload_note_self_ok_failure(uint32_t reason,
         case PAYLOAD_SELF_OK_ENTRY_KEY_UNTERMINATED: g_payload_self_ok_entry_key_unterminated++; break;
         default: break;
     }
-
-    g_payload_last_self_ok_fail_reason = reason;
-    payload_copy_trusted_label(g_payload_last_self_ok_fail_op,
-                               sizeof(g_payload_last_self_ok_fail_op),
-                               op ? op : "?");
-    g_payload_last_self_ok_fail_this = (uint32_t)(uintptr_t)self;
-    g_payload_last_self_ok_fail_magic = magic;
-    g_payload_last_self_ok_fail_entries = (uint32_t)(uintptr_t)entries;
-    g_payload_last_self_ok_fail_arena = (uint32_t)(uintptr_t)arena;
-    g_payload_last_self_ok_fail_count = (uint32_t)count;
-    g_payload_last_self_ok_fail_entry_cap = (uint32_t)entry_cap;
-    g_payload_last_self_ok_fail_arena_used = (uint32_t)arena_used;
-    g_payload_last_self_ok_fail_arena_cap = (uint32_t)arena_cap;
-    g_payload_last_self_ok_fail_entry_index = entry_index;
-    g_payload_last_self_ok_fail_entry_key_off = entry_key_off;
-    g_payload_last_self_ok_fail_entry_val_off = entry_val_off;
-    g_payload_last_self_ok_fail_entry_val_len = entry_val_len;
-    g_payload_last_self_ok_fail_entry_kind = entry_kind;
-
-    payload_note_error(PAYLOAD_ERR_INTEGRITY, op, self);
 }
 
-static inline void payload_mark_constructed() {
+static void payload_note_integrity(
+    uint32_t reason,
+    uint32_t operation_id,
+    const void* self,
+    const payload_layout_evidence_t* evidence = nullptr) {
+    // Integrity reporting must remain smaller than the failure it reports.
+    // Capture only scalar values already in hand.  Never traverse strings,
+    // allocate, emit logs, or dereference a questionable pointer here.
+    g_payload_integrity_fail++;
+    g_payload_self_ok_fail++;
+    payload_increment_integrity_reason(reason);
+    g_payload_last_self_ok_fail_reason = reason;
+    g_payload_last_self_ok_fail_this = (uint32_t)(uintptr_t)self;
+    g_payload_last_self_ok_fail_op_id = operation_id;
+    g_payload_last_error_code = PAYLOAD_ERR_INTEGRITY;
+    g_payload_last_error_count++;
+    g_payload_last_error_this = (uint32_t)(uintptr_t)self;
+    g_payload_last_error_op_id = g_payload_last_self_ok_fail_op_id;
+
+    if (g_payload_first_self_ok_fail_captured == 0U) {
+        g_payload_first_self_ok_fail_captured = 1U;
+        if (evidence) {
+            g_payload_last_self_ok_fail_count = evidence->entry_count;
+            g_payload_last_self_ok_fail_entry_cap = evidence->capacity;
+            g_payload_last_self_ok_fail_arena_used =
+                evidence->capacity >= evidence->data_begin
+                    ? evidence->capacity - evidence->data_begin
+                    : 0U;
+            g_payload_last_self_ok_fail_arena_cap = evidence->capacity;
+            g_payload_last_self_ok_fail_entry_index = evidence->entry_index;
+            g_payload_last_self_ok_fail_entry_key_off = evidence->key_off;
+            g_payload_last_self_ok_fail_entry_val_off = evidence->val_off;
+            g_payload_last_self_ok_fail_entry_val_len = evidence->val_len;
+            g_payload_last_self_ok_fail_entry_kind = evidence->entry_kind;
+            g_payload_last_self_ok_fail_capacity = evidence->capacity;
+            g_payload_last_self_ok_fail_data_begin = evidence->data_begin;
+            g_payload_last_self_ok_fail_expected_upper =
+                evidence->expected_upper;
+            g_payload_last_self_ok_fail_key_end = evidence->key_end;
+            g_payload_last_self_ok_fail_val_end = evidence->val_end;
+        }
+    }
+}
+
+
+static void payload_mark_constructed() {
     g_payload_instances_constructed++;
     g_payload_alive_now++;
-
     if (g_payload_alive_now > g_payload_alive_high_water) {
         g_payload_alive_high_water = g_payload_alive_now;
     }
 }
 
-static inline void payload_mark_destroyed() {
+static void payload_mark_destroyed() {
     g_payload_instances_destroyed++;
-
-    if (g_payload_alive_now > 0) {
-        g_payload_alive_now--;
-    }
+    if (g_payload_alive_now != 0U) g_payload_alive_now--;
 }
 
-static inline void payload_note_entry_heap_delta(int32_t delta) {
-    if (delta >= 0) {
-        g_payload_entry_heap_bytes_alive += (uint32_t)delta;
-    } else {
-        const uint32_t dec = (uint32_t)(-delta);
-        g_payload_entry_heap_bytes_alive =
-            (g_payload_entry_heap_bytes_alive >= dec)
-                ? (g_payload_entry_heap_bytes_alive - dec)
-                : 0;
-    }
-
-    if (g_payload_entry_heap_bytes_alive > g_payload_entry_heap_bytes_high_water) {
-        g_payload_entry_heap_bytes_high_water = g_payload_entry_heap_bytes_alive;
-    }
-}
-
-static inline void payload_note_arena_heap_delta(int32_t delta) {
+static void payload_note_heap_delta(int32_t delta) {
     if (delta >= 0) {
         g_payload_arena_heap_bytes_alive += (uint32_t)delta;
     } else {
-        const uint32_t dec = (uint32_t)(-delta);
+        const uint32_t amount = (uint32_t)(-delta);
         g_payload_arena_heap_bytes_alive =
-            (g_payload_arena_heap_bytes_alive >= dec)
-                ? (g_payload_arena_heap_bytes_alive - dec)
-                : 0;
+            g_payload_arena_heap_bytes_alive >= amount
+                ? g_payload_arena_heap_bytes_alive - amount
+                : 0U;
     }
-
-    if (g_payload_arena_heap_bytes_alive > g_payload_arena_heap_bytes_high_water) {
-        g_payload_arena_heap_bytes_high_water = g_payload_arena_heap_bytes_alive;
+    if (g_payload_arena_heap_bytes_alive >
+        g_payload_arena_heap_bytes_high_water) {
+        g_payload_arena_heap_bytes_high_water =
+            g_payload_arena_heap_bytes_alive;
     }
-}
-
-static size_t grow_power_of_two(size_t current, size_t minimum, size_t maximum) {
-    size_t cap = current ? current : 1;
-    while (cap < minimum && cap < maximum) {
-        cap *= 2;
-    }
-    if (cap > maximum) cap = maximum;
-    return cap;
 }
 
 // ============================================================================
-// Construction / Destruction
+// Pointer custody
+// ============================================================================
+
+#if defined(__IMXRT1062__)
+extern "C" unsigned long _estack;
+#endif
+
+struct payload_readable_range_t {
+    uintptr_t begin;
+    uintptr_t end;
+};
+
+static bool payload_pointer_remaining(const void* ptr,
+                                      size_t* out_remaining,
+                                      uint32_t* out_reason) {
+    if (out_remaining) *out_remaining = 0;
+    if (out_reason) *out_reason = PAYLOAD_STRING_FAULT_NONE;
+
+    if (!ptr) {
+        if (out_reason) *out_reason = PAYLOAD_STRING_FAULT_NULL;
+        return false;
+    }
+
+    const uintptr_t addr = (uintptr_t)ptr;
+    if (addr == 0x5041594CUL || addr == 0x44454144UL) {
+        if (out_reason) *out_reason = PAYLOAD_STRING_FAULT_MAGIC_ADDRESS;
+        return false;
+    }
+    if (addr < 0x1000UL) {
+        if (out_reason) *out_reason = PAYLOAD_STRING_FAULT_LOW_ADDRESS;
+        return false;
+    }
+
+#if defined(__IMXRT1062__)
+
+    const uintptr_t dtcm_end = (uintptr_t)&_estack;
+    const payload_readable_range_t ranges[] = {
+        // Deliberately reject ITCM/code pointers.  Normal string storage in the
+        // Teensy build lives in DTCM, OCRAM, or the QSPI flash map; accepting
+        // executable bytes would let a poisoned code address masquerade as a
+        // bounded C string.
+        {0x20000000UL, dtcm_end},      // actual DTCM ceiling for this image
+        {0x20200000UL, 0x20280000UL},  // OCRAM / malloc heap
+        {0x60000000UL, 0x61000000UL},  // QSPI flash execution map
+    };
+
+    for (const auto& r : ranges) {
+        if (r.end > r.begin && addr >= r.begin && addr < r.end) {
+            if (out_remaining) *out_remaining = (size_t)(r.end - addr);
+            return true;
+        }
+    }
+
+    if (out_reason) *out_reason =
+        addr < 0x1000UL ? PAYLOAD_STRING_FAULT_LOW_ADDRESS
+                        : PAYLOAD_STRING_FAULT_OUT_OF_RANGE;
+    return false;
+#else
+    // Host/unit-test builds cannot infer process memory maps portably. Low
+    // sentinel addresses are still rejected; all other scans remain bounded.
+    if (out_remaining) *out_remaining = SIZE_MAX;
+    return true;
+#endif
+}
+
+static void payload_note_string_pointer_fault(uint32_t reason,
+                                              const void* ptr,
+                                              uint32_t operation_id) {
+    g_payload_string_pointer_fault++;
+    switch (reason) {
+        case PAYLOAD_STRING_FAULT_NULL: g_payload_string_pointer_null++; break;
+        case PAYLOAD_STRING_FAULT_LOW_ADDRESS: g_payload_string_pointer_low_address++; break;
+        case PAYLOAD_STRING_FAULT_MAGIC_ADDRESS: g_payload_string_pointer_magic_address++; break;
+        case PAYLOAD_STRING_FAULT_OUT_OF_RANGE: g_payload_string_pointer_out_of_range++; break;
+        case PAYLOAD_STRING_FAULT_SPAN_OUT_OF_RANGE: g_payload_string_pointer_span_out_of_range++; break;
+        case PAYLOAD_STRING_FAULT_UNTERMINATED: g_payload_string_pointer_unterminated++; break;
+        case PAYLOAD_STRING_FAULT_TOO_LONG: g_payload_string_pointer_too_long++; break;
+        default: break;
+    }
+    g_payload_last_string_pointer_fault_reason = reason;
+    g_payload_last_string_pointer_fault_ptr = (uint32_t)(uintptr_t)ptr;
+    g_payload_last_string_pointer_fault_op_id = operation_id;
+    // Do not dereference or copy diagnostic labels from a pointer-fault path.
+    // The numeric reason and offending pointer are the durable evidence.
+    g_payload_last_string_pointer_fault_context[0] = '\0';
+    g_payload_last_string_pointer_fault_key_ptr = 0;
+    g_payload_last_string_pointer_fault_key[0] = '\0';
+}
+
+static bool payload_span_readable(const void* ptr,
+                                  size_t len,
+                                  uint32_t operation_id) {
+    if (len == 0) return true;
+
+    size_t remaining = 0;
+    uint32_t reason = PAYLOAD_STRING_FAULT_NONE;
+    if (!payload_pointer_remaining(ptr, &remaining, &reason)) {
+        payload_note_string_pointer_fault(reason, ptr, operation_id);
+        return false;
+    }
+    if (len > remaining) {
+        payload_note_string_pointer_fault(
+            PAYLOAD_STRING_FAULT_SPAN_OUT_OF_RANGE, ptr, operation_id);
+        return false;
+    }
+    return true;
+}
+
+static bool payload_cstr_len_checked(const char* str,
+                                     size_t max_len,
+                                     uint32_t operation_id,
+                                     size_t* out_len,
+                                     bool null_is_empty = false) {
+    if (out_len) *out_len = 0;
+    if (!str && null_is_empty) return true;
+
+    size_t remaining = 0;
+    uint32_t reason = PAYLOAD_STRING_FAULT_NONE;
+    if (!payload_pointer_remaining(str, &remaining, &reason)) {
+        payload_note_string_pointer_fault(reason, str, operation_id);
+        return false;
+    }
+
+    size_t limit = max_len;
+    if (limit > remaining) limit = remaining;
+    for (size_t i = 0; i < limit; ++i) {
+        if (str[i] == '\0') {
+            if (out_len) *out_len = i;
+            return true;
+        }
+    }
+
+    payload_note_string_pointer_fault(
+        limit < remaining ? PAYLOAD_STRING_FAULT_TOO_LONG
+                          : PAYLOAD_STRING_FAULT_UNTERMINATED,
+        str,
+        operation_id);
+    return false;
+}
+
+static void payload_note_bad_key(const char* key) {
+    // Preserve only the address.  A bad-key breadcrumb must never inspect the
+    // very pointer whose custody is in question.
+    g_payload_last_string_pointer_fault_key_ptr = (uint32_t)(uintptr_t)key;
+    g_payload_last_string_pointer_fault_key[0] = '\0';
+}
+
+// ============================================================================
+// One-block heap ownership
+// ============================================================================
+
+// The allocation begins with four 32-bit words followed by the usable bytes.
+// Capacity and owner cookies are stored with their complements.  The owner
+// cookie binds the block to the exact Payload/PayloadArray instance, preventing
+// a corrupted pointer from accidentally validating against some other live
+// Payload allocation.  Header access uses memcpy; no C++ object is fabricated
+// inside raw malloc storage.
+static constexpr size_t PAYLOAD_HEAP_HEADER_SIZE = 16U;
+static constexpr uintptr_t PAYLOAD_HEAP_ALIGNMENT = 8U;
+static constexpr uint32_t PAYLOAD_HEAP_OWNER_SALT = 0xA6F19D3BUL;
+
+static uint32_t payload_heap_owner_cookie(const void* owner) {
+    const uintptr_t address = (uintptr_t)owner;
+    uint32_t folded = (uint32_t)address;
+#if UINTPTR_MAX > UINT32_MAX
+    folded ^= (uint32_t)(address >> 32);
+#endif
+    return folded ^ PAYLOAD_HEAP_OWNER_SALT;
+}
+
+static uint8_t* payload_heap_bytes(void* raw) {
+    return raw
+        ? reinterpret_cast<uint8_t*>(raw) + PAYLOAD_HEAP_HEADER_SIZE
+        : nullptr;
+}
+
+static const uint8_t* payload_heap_bytes(const void* raw) {
+    return raw
+        ? reinterpret_cast<const uint8_t*>(raw) + PAYLOAD_HEAP_HEADER_SIZE
+        : nullptr;
+}
+
+static bool payload_heap_header_span_readable(const void* block) {
+    if (!block) return false;
+    const uintptr_t addr = (uintptr_t)block;
+    if ((addr % PAYLOAD_HEAP_ALIGNMENT) != 0U) return false;
+#if defined(__IMXRT1062__)
+    return addr >= 0x20200000UL &&
+           addr <= 0x20280000UL - PAYLOAD_HEAP_HEADER_SIZE;
+#else
+    return addr >= 0x1000UL;
+#endif
+}
+
+static bool payload_heap_read_capacity(const void* raw,
+                                       const void* expected_owner,
+                                       size_t minimum,
+                                       size_t maximum,
+                                       uint32_t* out_capacity) {
+    if (out_capacity) *out_capacity = 0U;
+    if (!raw || !expected_owner || !payload_heap_header_span_readable(raw)) {
+        return false;
+    }
+
+    uint32_t header[4] = {0U, 0U, 0U, 0U};
+    memcpy(header, raw, sizeof(header));
+    const uint32_t capacity = header[0];
+    const uint32_t owner_cookie = payload_heap_owner_cookie(expected_owner);
+    if ((capacity ^ header[1]) != 0xFFFFFFFFUL ||
+        (header[2] ^ header[3]) != 0xFFFFFFFFUL ||
+        header[2] != owner_cookie) {
+        return false;
+    }
+    if (capacity < minimum || capacity > maximum) return false;
+#if defined(__IMXRT1062__)
+    if (!payload_span_readable(payload_heap_bytes(raw), capacity, PAYLOAD_OP_HEAP_BLOCK)) {
+        return false;
+    }
+#endif
+    if (out_capacity) *out_capacity = capacity;
+    return true;
+}
+
+static void* payload_heap_allocate(size_t capacity, const void* owner) {
+    if (!owner || capacity > UINT32_MAX - PAYLOAD_HEAP_HEADER_SIZE) {
+        return nullptr;
+    }
+    const size_t total = PAYLOAD_HEAP_HEADER_SIZE + capacity;
+    void* raw = malloc(total);
+    if (!raw) return nullptr;
+    if (((uintptr_t)raw % PAYLOAD_HEAP_ALIGNMENT) != 0U) {
+        free(raw);
+        return nullptr;
+    }
+
+    const uint32_t cap32 = (uint32_t)capacity;
+    const uint32_t owner_cookie = payload_heap_owner_cookie(owner);
+    const uint32_t header[4] = {
+        cap32,
+        ~cap32,
+        owner_cookie,
+        ~owner_cookie,
+    };
+    memcpy(raw, header, sizeof(header));
+    return raw;
+}
+
+static size_t payload_heap_capacity(const void* raw,
+                                    const void* expected_owner,
+                                    size_t minimum,
+                                    size_t maximum) {
+    uint32_t capacity = 0U;
+    return payload_heap_read_capacity(raw,
+                                      expected_owner,
+                                      minimum,
+                                      maximum,
+                                      &capacity)
+        ? (size_t)capacity
+        : 0U;
+}
+
+static bool payload_heap_rebind_owner(void* raw,
+                                      const void* old_owner,
+                                      const void* new_owner,
+                                      size_t minimum,
+                                      size_t maximum) {
+    uint32_t capacity = 0U;
+    if (!payload_heap_read_capacity(raw,
+                                    old_owner,
+                                    minimum,
+                                    maximum,
+                                    &capacity)) {
+        return false;
+    }
+    (void)capacity;
+    const uint32_t owner_cookie = payload_heap_owner_cookie(new_owner);
+    const uint32_t owner_words[2] = {owner_cookie, ~owner_cookie};
+    memcpy(reinterpret_cast<uint8_t*>(raw) + 2U * sizeof(uint32_t),
+           owner_words,
+           sizeof(owner_words));
+    return true;
+}
+
+static size_t payload_growth_capacity(size_t current,
+                                      size_t required,
+                                      size_t maximum) {
+    size_t capacity = current;
+    if (capacity < Payload::ARENA_INITIAL) capacity = Payload::ARENA_INITIAL;
+    while (capacity < required && capacity < maximum) {
+        const size_t next = capacity <= maximum / 2U ? capacity * 2U : maximum;
+        if (next <= capacity) break;
+        capacity = next;
+    }
+    if (capacity < required) capacity = maximum;
+    return capacity >= required ? capacity : 0;
+}
+
+// ============================================================================
+// JSON scanner / validator
+// ============================================================================
+
+static constexpr uint32_t PAYLOAD_JSON_MAX_DEPTH = 32U;
+
+enum class json_value_type_t : uint8_t {
+    INVALID = 0,
+    STRING,
+    NUMBER,
+    BOOLEAN,
+    NIL,
+    OBJECT,
+    ARRAY,
+};
+
+struct json_value_span_t {
+    json_value_type_t type = json_value_type_t::INVALID;
+    size_t begin = 0;
+    size_t end = 0;             // one past final token byte, excluding whitespace
+    size_t decoded_length = 0;  // STRING only
+};
+
+struct json_cursor_t {
+    const uint8_t* data;
+    size_t len;
+    size_t pos;
+};
+
+static void json_skip_ws(json_cursor_t& c) {
+    while (c.pos < c.len) {
+        const uint8_t ch = c.data[c.pos];
+        if (ch != ' ' && ch != '\t' && ch != '\n' && ch != '\r') break;
+        ++c.pos;
+    }
+}
+
+static int json_hex_value(uint8_t c) {
+    if (c >= '0' && c <= '9') return (int)(c - '0');
+    if (c >= 'a' && c <= 'f') return (int)(c - 'a') + 10;
+    if (c >= 'A' && c <= 'F') return (int)(c - 'A') + 10;
+    return -1;
+}
+
+static bool json_read_hex4(const uint8_t* data,
+                           size_t len,
+                           size_t pos,
+                           uint32_t* out) {
+    if (!out || pos > len || len - pos < 4U) return false;
+    uint32_t value = 0;
+    for (size_t i = 0; i < 4U; ++i) {
+        const int h = json_hex_value(data[pos + i]);
+        if (h < 0) return false;
+        value = (value << 4) | (uint32_t)h;
+    }
+    *out = value;
+    return true;
+}
+
+static size_t json_utf8_encoded_length(uint32_t cp) {
+    if (cp == 0U || cp > 0x10FFFFU || (cp >= 0xD800U && cp <= 0xDFFFU)) {
+        return 0;
+    }
+    if (cp <= 0x7FU) return 1;
+    if (cp <= 0x7FFU) return 2;
+    if (cp <= 0xFFFFU) return 3;
+    return 4;
+}
+
+static bool json_write_utf8(uint32_t cp, char* out, size_t* pos) {
+    if (!out || !pos) return false;
+    const size_t n = json_utf8_encoded_length(cp);
+    if (n == 0) return false;
+    size_t p = *pos;
+    if (n == 1) {
+        out[p++] = (char)cp;
+    } else if (n == 2) {
+        out[p++] = (char)(0xC0U | (cp >> 6));
+        out[p++] = (char)(0x80U | (cp & 0x3FU));
+    } else if (n == 3) {
+        out[p++] = (char)(0xE0U | (cp >> 12));
+        out[p++] = (char)(0x80U | ((cp >> 6) & 0x3FU));
+        out[p++] = (char)(0x80U | (cp & 0x3FU));
+    } else {
+        out[p++] = (char)(0xF0U | (cp >> 18));
+        out[p++] = (char)(0x80U | ((cp >> 12) & 0x3FU));
+        out[p++] = (char)(0x80U | ((cp >> 6) & 0x3FU));
+        out[p++] = (char)(0x80U | (cp & 0x3FU));
+    }
+    *pos = p;
+    return true;
+}
+
+static bool json_validate_utf8_sequence(const uint8_t* data,
+                                        size_t len,
+                                        size_t pos,
+                                        size_t* sequence_len) {
+    if (!sequence_len || pos >= len) return false;
+    const uint8_t b0 = data[pos];
+    if (b0 < 0x80U) {
+        *sequence_len = 1;
+        return true;
+    }
+
+    size_t n = 0;
+    uint32_t cp = 0;
+    if (b0 >= 0xC2U && b0 <= 0xDFU) {
+        n = 2;
+        cp = b0 & 0x1FU;
+    } else if (b0 >= 0xE0U && b0 <= 0xEFU) {
+        n = 3;
+        cp = b0 & 0x0FU;
+    } else if (b0 >= 0xF0U && b0 <= 0xF4U) {
+        n = 4;
+        cp = b0 & 0x07U;
+    } else {
+        return false;
+    }
+    if (pos > len || len - pos < n) return false;
+
+    for (size_t i = 1; i < n; ++i) {
+        const uint8_t bx = data[pos + i];
+        if ((bx & 0xC0U) != 0x80U) return false;
+        cp = (cp << 6) | (uint32_t)(bx & 0x3FU);
+    }
+
+    if ((n == 3 && cp < 0x800U) ||
+        (n == 4 && cp < 0x10000U) ||
+        cp > 0x10FFFFU ||
+        (cp >= 0xD800U && cp <= 0xDFFFU)) {
+        return false;
+    }
+    *sequence_len = n;
+    return true;
+}
+
+static bool json_scan_string(json_cursor_t& c,
+                             size_t* out_begin,
+                             size_t* out_end,
+                             size_t* out_decoded_length) {
+    if (c.pos >= c.len || c.data[c.pos] != '"') return false;
+    const size_t begin = c.pos++;
+    size_t decoded = 0;
+
+    while (c.pos < c.len) {
+        const uint8_t ch = c.data[c.pos++];
+        if (ch == '"') {
+            if (out_begin) *out_begin = begin;
+            if (out_end) *out_end = c.pos;
+            if (out_decoded_length) *out_decoded_length = decoded;
+            return true;
+        }
+        if (ch < 0x20U) return false;
+        if (ch == '\\') {
+            if (c.pos >= c.len) return false;
+            const uint8_t esc = c.data[c.pos++];
+            switch (esc) {
+                case '"': case '\\': case '/':
+                case 'b': case 'f': case 'n': case 'r': case 't':
+                    decoded++;
+                    break;
+                case 'u': {
+                    uint32_t cp = 0;
+                    if (!json_read_hex4(c.data, c.len, c.pos, &cp)) return false;
+                    c.pos += 4U;
+                    if (cp >= 0xD800U && cp <= 0xDBFFU) {
+                        if (c.pos + 6U > c.len ||
+                            c.data[c.pos] != '\\' ||
+                            c.data[c.pos + 1U] != 'u') {
+                            return false;
+                        }
+                        uint32_t low = 0;
+                        if (!json_read_hex4(c.data, c.len, c.pos + 2U, &low) ||
+                            low < 0xDC00U || low > 0xDFFFU) {
+                            return false;
+                        }
+                        c.pos += 6U;
+                        cp = 0x10000U + (((cp - 0xD800U) << 10) |
+                                         (low - 0xDC00U));
+                    } else if (cp >= 0xDC00U && cp <= 0xDFFFU) {
+                        return false;
+                    }
+                    const size_t n = json_utf8_encoded_length(cp);
+                    if (n == 0) return false;  // Embedded NUL is not C-string compatible.
+                    decoded += n;
+                    break;
+                }
+                default:
+                    return false;
+            }
+            continue;
+        }
+
+        if (ch < 0x80U) {
+            decoded++;
+            continue;
+        }
+
+        size_t utf8_len = 0;
+        const size_t sequence_start = c.pos - 1U;
+        if (!json_validate_utf8_sequence(c.data, c.len,
+                                         sequence_start, &utf8_len)) {
+            return false;
+        }
+        c.pos = sequence_start + utf8_len;
+        decoded += utf8_len;
+    }
+    return false;
+}
+
+static bool json_decode_string(const uint8_t* data,
+                               size_t begin,
+                               size_t end,
+                               char* out,
+                               size_t expected_length) {
+    if (!data || !out || end <= begin + 1U || data[begin] != '"' ||
+        data[end - 1U] != '"') {
+        return false;
+    }
+
+    size_t i = begin + 1U;
+    size_t p = 0;
+    while (i < end - 1U) {
+        uint8_t ch = data[i++];
+        if (ch != '\\') {
+            if (ch < 0x80U) {
+                out[p++] = (char)ch;
+            } else {
+                size_t n = 0;
+                if (!json_validate_utf8_sequence(data, end - 1U, i - 1U, &n)) {
+                    return false;
+                }
+                memcpy(out + p, data + i - 1U, n);
+                p += n;
+                i = i - 1U + n;
+            }
+            continue;
+        }
+
+        if (i >= end - 1U) return false;
+        const uint8_t esc = data[i++];
+        switch (esc) {
+            case '"': out[p++] = '"'; break;
+            case '\\': out[p++] = '\\'; break;
+            case '/': out[p++] = '/'; break;
+            case 'b': out[p++] = '\b'; break;
+            case 'f': out[p++] = '\f'; break;
+            case 'n': out[p++] = '\n'; break;
+            case 'r': out[p++] = '\r'; break;
+            case 't': out[p++] = '\t'; break;
+            case 'u': {
+                uint32_t cp = 0;
+                if (!json_read_hex4(data, end - 1U, i, &cp)) return false;
+                i += 4U;
+                if (cp >= 0xD800U && cp <= 0xDBFFU) {
+                    if (i + 6U > end - 1U || data[i] != '\\' || data[i + 1U] != 'u') {
+                        return false;
+                    }
+                    uint32_t low = 0;
+                    if (!json_read_hex4(data, end - 1U, i + 2U, &low) ||
+                        low < 0xDC00U || low > 0xDFFFU) {
+                        return false;
+                    }
+                    i += 6U;
+                    cp = 0x10000U + (((cp - 0xD800U) << 10) |
+                                     (low - 0xDC00U));
+                }
+                if (!json_write_utf8(cp, out, &p)) return false;
+                break;
+            }
+            default:
+                return false;
+        }
+    }
+    if (p != expected_length) return false;
+    out[p] = '\0';
+    return true;
+}
+
+static bool json_scan_number(json_cursor_t& c) {
+    const size_t start = c.pos;
+    if (c.pos < c.len && c.data[c.pos] == '-') ++c.pos;
+    if (c.pos >= c.len) return false;
+
+    if (c.data[c.pos] == '0') {
+        ++c.pos;
+        if (c.pos < c.len && isdigit((unsigned char)c.data[c.pos])) return false;
+    } else if (c.data[c.pos] >= '1' && c.data[c.pos] <= '9') {
+        do { ++c.pos; }
+        while (c.pos < c.len && isdigit((unsigned char)c.data[c.pos]));
+    } else {
+        return false;
+    }
+
+    if (c.pos < c.len && c.data[c.pos] == '.') {
+        ++c.pos;
+        if (c.pos >= c.len || !isdigit((unsigned char)c.data[c.pos])) return false;
+        do { ++c.pos; }
+        while (c.pos < c.len && isdigit((unsigned char)c.data[c.pos]));
+    }
+
+    if (c.pos < c.len && (c.data[c.pos] == 'e' || c.data[c.pos] == 'E')) {
+        ++c.pos;
+        if (c.pos < c.len && (c.data[c.pos] == '+' || c.data[c.pos] == '-')) {
+            ++c.pos;
+        }
+        if (c.pos >= c.len || !isdigit((unsigned char)c.data[c.pos])) return false;
+        do { ++c.pos; }
+        while (c.pos < c.len && isdigit((unsigned char)c.data[c.pos]));
+    }
+    return c.pos > start;
+}
+
+static bool json_match_literal(json_cursor_t& c, const char* literal) {
+    size_t n = 0;
+    while (literal[n] != '\0') ++n;
+    if (c.pos > c.len || c.len - c.pos < n) return false;
+    if (memcmp(c.data + c.pos, literal, n) != 0) return false;
+    c.pos += n;
+    return true;
+}
+
+static bool json_scan_value(json_cursor_t& c,
+                            uint32_t depth,
+                            json_value_span_t* out);
+
+static bool json_scan_object(json_cursor_t& c, uint32_t depth) {
+    if (depth > PAYLOAD_JSON_MAX_DEPTH) {
+        g_payload_json_invalid_depth++;
+        return false;
+    }
+    if (c.pos >= c.len || c.data[c.pos] != '{') {
+        return false;
+    }
+    ++c.pos;
+    json_skip_ws(c);
+    if (c.pos < c.len && c.data[c.pos] == '}') {
+        ++c.pos;
+        return true;
+    }
+
+    while (c.pos < c.len) {
+        if (!json_scan_string(c, nullptr, nullptr, nullptr)) return false;
+        json_skip_ws(c);
+        if (c.pos >= c.len || c.data[c.pos] != ':') return false;
+        ++c.pos;
+        json_value_span_t ignored;
+        if (!json_scan_value(c, depth + 1U, &ignored)) return false;
+        json_skip_ws(c);
+        if (c.pos >= c.len) return false;
+        if (c.data[c.pos] == '}') {
+            ++c.pos;
+            return true;
+        }
+        if (c.data[c.pos] != ',') return false;
+        ++c.pos;
+        json_skip_ws(c);
+    }
+    return false;
+}
+
+static bool json_scan_array(json_cursor_t& c, uint32_t depth) {
+    if (depth > PAYLOAD_JSON_MAX_DEPTH) {
+        g_payload_json_invalid_depth++;
+        return false;
+    }
+    if (c.pos >= c.len || c.data[c.pos] != '[') {
+        return false;
+    }
+    ++c.pos;
+    json_skip_ws(c);
+    if (c.pos < c.len && c.data[c.pos] == ']') {
+        ++c.pos;
+        return true;
+    }
+
+    while (c.pos < c.len) {
+        json_value_span_t ignored;
+        if (!json_scan_value(c, depth + 1U, &ignored)) return false;
+        json_skip_ws(c);
+        if (c.pos >= c.len) return false;
+        if (c.data[c.pos] == ']') {
+            ++c.pos;
+            return true;
+        }
+        if (c.data[c.pos] != ',') return false;
+        ++c.pos;
+        json_skip_ws(c);
+    }
+    return false;
+}
+
+static bool json_scan_value(json_cursor_t& c,
+                            uint32_t depth,
+                            json_value_span_t* out) {
+    if (!out) return false;
+    if (depth > PAYLOAD_JSON_MAX_DEPTH) {
+        g_payload_json_invalid_depth++;
+        return false;
+    }
+    json_skip_ws(c);
+    if (c.pos >= c.len) return false;
+
+    json_value_span_t span;
+    span.begin = c.pos;
+    const uint8_t first = c.data[c.pos];
+    if (first == '"') {
+        span.type = json_value_type_t::STRING;
+        if (!json_scan_string(c, nullptr, nullptr, &span.decoded_length)) return false;
+    } else if (first == '{') {
+        span.type = json_value_type_t::OBJECT;
+        if (!json_scan_object(c, depth)) return false;
+    } else if (first == '[') {
+        span.type = json_value_type_t::ARRAY;
+        if (!json_scan_array(c, depth)) return false;
+    } else if (first == 't') {
+        span.type = json_value_type_t::BOOLEAN;
+        if (!json_match_literal(c, "true")) return false;
+    } else if (first == 'f') {
+        span.type = json_value_type_t::BOOLEAN;
+        if (!json_match_literal(c, "false")) return false;
+    } else if (first == 'n') {
+        span.type = json_value_type_t::NIL;
+        if (!json_match_literal(c, "null")) return false;
+    } else {
+        span.type = json_value_type_t::NUMBER;
+        if (!json_scan_number(c)) return false;
+    }
+    span.end = c.pos;
+    *out = span;
+    return true;
+}
+
+static bool json_validate_exact(const uint8_t* data,
+                                size_t len,
+                                json_value_type_t required,
+                                json_value_span_t* out = nullptr) {
+    if (!data || len == 0) return false;
+    json_cursor_t c{data, len, 0};
+    json_value_span_t span;
+    if (!json_scan_value(c, 0, &span)) return false;
+    json_skip_ws(c);
+    if (c.pos != len || (required != json_value_type_t::INVALID &&
+                         span.type != required)) {
+        return false;
+    }
+    if (out) *out = span;
+    return true;
+}
+
+static bool json_size_add(size_t* total, size_t addition) {
+    if (!total || addition > SIZE_MAX - *total) return false;
+    *total += addition;
+    return true;
+}
+
+static size_t json_escaped_size(const char* s, size_t len) {
+    if (!s && len != 0) return SIZE_MAX;
+    size_t total = 0;
+    for (size_t i = 0; i < len; ++i) {
+        const uint8_t ch = (uint8_t)s[i];
+        size_t add = 1;
+        if (ch == '"' || ch == '\\' || ch == '\b' || ch == '\f' ||
+            ch == '\n' || ch == '\r' || ch == '\t') {
+            add = 2;
+        } else if (ch < 0x20U) {
+            add = 6;
+        }
+        if (!json_size_add(&total, add)) return SIZE_MAX;
+    }
+    return total;
+}
+
+static char json_hex_digit(uint8_t v) {
+    return v < 10U ? (char)('0' + v) : (char)('A' + (v - 10U));
+}
+
+static size_t json_write_escaped(char* out, const char* s, size_t len) {
+    size_t p = 0;
+    for (size_t i = 0; i < len; ++i) {
+        const uint8_t ch = (uint8_t)s[i];
+        switch (ch) {
+            case '"': out[p++] = '\\'; out[p++] = '"'; break;
+            case '\\': out[p++] = '\\'; out[p++] = '\\'; break;
+            case '\b': out[p++] = '\\'; out[p++] = 'b'; break;
+            case '\f': out[p++] = '\\'; out[p++] = 'f'; break;
+            case '\n': out[p++] = '\\'; out[p++] = 'n'; break;
+            case '\r': out[p++] = '\\'; out[p++] = 'r'; break;
+            case '\t': out[p++] = '\\'; out[p++] = 't'; break;
+            default:
+                if (ch < 0x20U) {
+                    out[p++] = '\\';
+                    out[p++] = 'u';
+                    out[p++] = '0';
+                    out[p++] = '0';
+                    out[p++] = json_hex_digit((uint8_t)(ch >> 4));
+                    out[p++] = json_hex_digit((uint8_t)(ch & 0x0FU));
+                } else {
+                    out[p++] = (char)ch;
+                }
+                break;
+        }
+    }
+    return p;
+}
+
+static bool json_number_token_valid(const char* value, size_t len) {
+    if (!value || len == 0) return false;
+    json_cursor_t c{reinterpret_cast<const uint8_t*>(value), len, 0};
+    return json_scan_number(c) && c.pos == len;
+}
+
+static bool payload_utf8_valid(const char* value, size_t len) {
+    if (!value && len != 0U) return false;
+    const uint8_t* data = reinterpret_cast<const uint8_t*>(value);
+    size_t pos = 0U;
+    while (pos < len) {
+        if (data[pos] < 0x80U) {
+            ++pos;
+            continue;
+        }
+        size_t sequence_len = 0U;
+        if (!json_validate_utf8_sequence(data, len, pos, &sequence_len)) {
+            return false;
+        }
+        pos += sequence_len;
+    }
+    return true;
+}
+
+static bool json_array_locate(const char* json,
+                              size_t len,
+                              size_t wanted_index,
+                              size_t* out_count,
+                              json_value_span_t* out_value) {
+    if (out_count) *out_count = 0;
+    if (out_value) *out_value = json_value_span_t{};
+    if (!json || len < 2U) return false;
+
+    json_cursor_t c{reinterpret_cast<const uint8_t*>(json), len, 0};
+    json_skip_ws(c);
+    if (c.pos >= c.len || c.data[c.pos] != '[') return false;
+    ++c.pos;
+    json_skip_ws(c);
+
+    size_t count = 0;
+    if (c.pos < c.len && c.data[c.pos] == ']') {
+        ++c.pos;
+        json_skip_ws(c);
+        if (c.pos != c.len) return false;
+        if (out_count) *out_count = 0;
+        return true;
+    }
+
+    while (c.pos < c.len) {
+        json_value_span_t value;
+        if (!json_scan_value(c, 1U, &value)) return false;
+        if (count == wanted_index && out_value) *out_value = value;
+        ++count;
+        json_skip_ws(c);
+        if (c.pos >= c.len) return false;
+        if (c.data[c.pos] == ']') {
+            ++c.pos;
+            json_skip_ws(c);
+            if (c.pos != c.len) return false;
+            if (out_count) *out_count = count;
+            return true;
+        }
+        if (c.data[c.pos] != ',') return false;
+        ++c.pos;
+        json_skip_ws(c);
+    }
+    return false;
+}
+// ============================================================================
+// Payload storage and lifecycle
 // ============================================================================
 
 Payload::Payload()
-    : _magic(MAGIC_LIVE)
-    , _entries(_inline_entries)
-    , _count(0)
-    , _entry_cap(INLINE_ENTRIES)
-    , _arena(nullptr)
-    , _arena_used(0)
-    , _arena_cap(0)
-{
-    payload_magic_trace_note_constructed(
-        this, (uint32_t)(uintptr_t)__builtin_return_address(0));
+    : _heap_block(nullptr),
+      _heap_block_guard(UINTPTR_MAX),
+      _count(0),
+      _count_guard(UINT16_MAX),
+      _data_begin((uint16_t)INLINE_STORAGE),
+      _data_begin_guard((uint16_t)~(uint16_t)INLINE_STORAGE),
+      _inline_storage{} {
     payload_mark_constructed();
-    if (INLINE_ENTRIES > g_payload_max_entry_capacity_seen) {
-        g_payload_max_entry_capacity_seen = INLINE_ENTRIES;
-    }
 }
 
 Payload::~Payload() {
     _release_storage();
-    _magic = MAGIC_DEAD;
     payload_mark_destroyed();
 }
 
-void Payload::_release_storage() {
-    // Destructors and assignment cleanup must never trust a damaged Payload
-    // header enough to hand arbitrary pointers to free().  If the cheap
-    // integrity court rejects the object, intentionally leak any questionable
-    // heap storage and reset the header back to the inline-empty shape.  A leak
-    // is recoverable and observable; freeing 0x1/0x81/stack/code is not.
-    if (_magic != MAGIC_LIVE || !_self_ok("release_storage")) {
-        _entries = _inline_entries;
-        _count = 0;
-        _entry_cap = INLINE_ENTRIES;
-        _arena = nullptr;
-        _arena_used = 0;
-        _arena_cap = 0;
-        return;
-    }
-
-    if (_entries && _entries != _inline_entries) {
-        payload_note_entry_heap_delta(-(int32_t)(_entry_cap * sizeof(Entry)));
-        free(_entries);
-    }
-
-    if (_arena) {
-        payload_note_arena_heap_delta(-(int32_t)_arena_cap);
-        free(_arena);
-    }
-
-    _entries = _inline_entries;
-    _count = 0;
-    _entry_cap = INLINE_ENTRIES;
-    _arena = nullptr;
-    _arena_used = 0;
-    _arena_cap = 0;
-}
-
-// ============================================================================
-// Move semantics
-// ============================================================================
-
 Payload::Payload(Payload&& other) noexcept
-    : _magic(MAGIC_LIVE)
-    , _entries(_inline_entries)
-    , _count(0)
-    , _entry_cap(INLINE_ENTRIES)
-    , _arena(nullptr)
-    , _arena_used(0)
-    , _arena_cap(0)
-{
-    payload_magic_trace_note_constructed(
-        this, (uint32_t)(uintptr_t)__builtin_return_address(0));
+    : _heap_block(nullptr),
+      _heap_block_guard(UINTPTR_MAX),
+      _count(0),
+      _count_guard(UINT16_MAX),
+      _data_begin((uint16_t)INLINE_STORAGE),
+      _data_begin_guard((uint16_t)~(uint16_t)INLINE_STORAGE),
+      _inline_storage{} {
     payload_mark_constructed();
     _move_from(other);
 }
 
 Payload& Payload::operator=(Payload&& other) noexcept {
     if (this == &other) return *this;
-
+    if (!other._layout_ok(PAYLOAD_OP_MOVE_ASSIGN_SOURCE)) return *this;
     _release_storage();
-    _magic = MAGIC_LIVE;
     _move_from(other);
     return *this;
 }
 
-void Payload::_move_from(Payload& other) {
-    if (!other._self_ok("move_from")) {
-        return;
-    }
-
-    _count = other._count;
-
-    if (other._entries == other._inline_entries) {
-        _entries = _inline_entries;
-        _entry_cap = INLINE_ENTRIES;
-        if (_count > 0) {
-            memcpy(_inline_entries, other._inline_entries, _count * sizeof(Entry));
-        }
-    } else {
-        _entries = other._entries;
-        _entry_cap = other._entry_cap;
-        other._entries = other._inline_entries;
-        other._entry_cap = INLINE_ENTRIES;
-    }
-
-    _arena = other._arena;
-    _arena_used = other._arena_used;
-    _arena_cap = other._arena_cap;
-
-    other._count = 0;
-    other._arena = nullptr;
-    other._arena_used = 0;
-    other._arena_cap = 0;
-}
-
-// ============================================================================
-// Copy semantics
-// ============================================================================
-
 Payload::Payload(const Payload& other)
-    : _magic(MAGIC_LIVE)
-    , _entries(_inline_entries)
-    , _count(0)
-    , _entry_cap(INLINE_ENTRIES)
-    , _arena(nullptr)
-    , _arena_used(0)
-    , _arena_cap(0)
-{
-    payload_magic_trace_note_constructed(
-        this, (uint32_t)(uintptr_t)__builtin_return_address(0));
+    : _heap_block(nullptr),
+      _heap_block_guard(UINTPTR_MAX),
+      _count(0),
+      _count_guard(UINT16_MAX),
+      _data_begin((uint16_t)INLINE_STORAGE),
+      _data_begin_guard((uint16_t)~(uint16_t)INLINE_STORAGE),
+      _inline_storage{} {
     payload_mark_constructed();
-    _copy_from(other);
+    if (!_copy_from(other)) {
+        payload_note_error(PAYLOAD_ERR_COPY_ALLOC_FAIL, PAYLOAD_OP_COPY_CTOR, this);
+    }
 }
 
 Payload& Payload::operator=(const Payload& other) {
     if (this == &other) return *this;
+    if (!other._layout_ok(PAYLOAD_OP_COPY_ASSIGN_SOURCE)) return *this;
+
+    Payload temp;
+    if (!temp._copy_from(other)) {
+        payload_note_error(PAYLOAD_ERR_COPY_ALLOC_FAIL, PAYLOAD_OP_COPY_ASSIGN, this);
+        return *this;
+    }
 
     _release_storage();
-    _magic = MAGIC_LIVE;
-    _copy_from(other);
+    _move_from(temp);
     return *this;
 }
 
+bool Payload::_heap_guard_ok() const {
+    return (((uintptr_t)_heap_block) ^ _heap_block_guard) == UINTPTR_MAX;
+}
+
+bool Payload::_count_guard_ok() const {
+    return (uint16_t)(_count ^ _count_guard) == UINT16_MAX;
+}
+
+bool Payload::_data_begin_guard_ok() const {
+    return (uint16_t)(_data_begin ^ _data_begin_guard) == UINT16_MAX;
+}
+
+void Payload::_set_heap_block(void* block) {
+    _heap_block = block;
+    _heap_block_guard = ~((uintptr_t)block);
+}
+
+void Payload::_set_count(uint16_t count) {
+    _count = count;
+    _count_guard = (uint16_t)~count;
+}
+
+void Payload::_set_data_begin(uint16_t data_begin) {
+    _data_begin = data_begin;
+    _data_begin_guard = (uint16_t)~data_begin;
+}
+
+uint8_t* Payload::_storage() {
+    if (!_heap_guard_ok()) return nullptr;
+    return _heap_block ? payload_heap_bytes(_heap_block) : _inline_storage;
+}
+
+const uint8_t* Payload::_storage() const {
+    if (!_heap_guard_ok()) return nullptr;
+    return _heap_block ? payload_heap_bytes((const void*)_heap_block) : _inline_storage;
+}
+
+size_t Payload::_capacity() const {
+    if (!_heap_guard_ok()) return 0U;
+    if (!_heap_block) return INLINE_STORAGE;
+    return payload_heap_capacity(_heap_block, this, INLINE_STORAGE + 1U, STORAGE_MAX);
+}
+
+size_t Payload::_data_used() const {
+    if (!_data_begin_guard_ok()) return 0U;
+    const size_t capacity = _capacity();
+    if (capacity == 0U || _data_begin > capacity) return 0U;
+    return capacity - _data_begin;
+}
+
+Payload::Entry* Payload::_entries() {
+    return reinterpret_cast<Entry*>(_storage());
+}
+
+const Payload::Entry* Payload::_entries() const {
+    return reinterpret_cast<const Entry*>(_storage());
+}
+
+void Payload::_reset_empty() {
+    _set_heap_block(nullptr);
+    _set_count(0U);
+    _set_data_begin((uint16_t)INLINE_STORAGE);
+    memset(_inline_storage, 0, sizeof(_inline_storage));
+}
+
+void Payload::_release_storage() {
+    if (!_heap_guard_ok()) {
+        payload_note_integrity(PAYLOAD_SELF_OK_ENTRIES_SPAN_UNREADABLE,
+                               PAYLOAD_OP_RELEASE_STORAGE_GUARD,
+                               this);
+        _reset_empty();
+        return;
+    }
+    if (_heap_block) {
+        const size_t capacity =
+            payload_heap_capacity(_heap_block, this, INLINE_STORAGE + 1U, STORAGE_MAX);
+        if (capacity != 0) {
+            payload_note_heap_delta(-(int32_t)capacity);
+            free(_heap_block);
+        } else {
+            // Fail closed. A questionable pointer is leaked rather than passed
+            // to free(); this is the only safe destructor policy after header
+            // corruption.
+            payload_note_integrity(PAYLOAD_SELF_OK_ENTRIES_SPAN_UNREADABLE, PAYLOAD_OP_RELEASE_STORAGE, this);
+        }
+    }
+    _reset_empty();
+}
+
+void Payload::_move_from(Payload& other) {
+    if (!other._layout_ok(PAYLOAD_OP_MOVE_FROM)) {
+        _reset_empty();
+        return;
+    }
+
+    if (other._heap_block) {
+        if (!payload_heap_rebind_owner(other._heap_block,
+                                       &other,
+                                       this,
+                                       INLINE_STORAGE + 1U,
+                                       STORAGE_MAX)) {
+            _reset_empty();
+            return;
+        }
+        _set_heap_block(other._heap_block);
+        _set_count(other._count);
+        _set_data_begin(other._data_begin);
+        other._reset_empty();
+        return;
+    }
+
+    memcpy(_inline_storage, other._inline_storage, INLINE_STORAGE);
+    _set_heap_block(nullptr);
+    _set_count(other._count);
+    _set_data_begin(other._data_begin);
+    other._reset_empty();
+}
+
 bool Payload::_copy_from(const Payload& other) {
-    if (!other._self_ok("copy_from")) {
-        return false;
-    }
+    if (!other._layout_ok(PAYLOAD_OP_COPY_FROM)) return false;
 
-    // Two-phase copy.  Keep this object self-consistent while reserving
-    // storage: copied entries contain offsets into the arena, so publishing
-    // _count before the arena exists creates a transient state that _self_ok()
-    // quite correctly rejects.  Reserve/copy arena first, reserve/copy entries
-    // second, and publish _count only after both halves are present.
-    if (other._arena_used > 0) {
-        if (!_ensure_arena(other._arena_used)) {
-            payload_note_error(PAYLOAD_ERR_COPY_ALLOC_FAIL, "copy_arena", this);
-            _count = 0;
-            _arena_used = 0;
+    const size_t source_data_used = other._data_used();
+    const size_t required =
+        (size_t)other._count * sizeof(Entry) + source_data_used;
+
+    size_t target_capacity = INLINE_STORAGE;
+    if (required > INLINE_STORAGE) {
+        target_capacity = payload_growth_capacity(INLINE_STORAGE,
+                                                  required,
+                                                  STORAGE_MAX);
+        if (target_capacity == 0) return false;
+        void* block = payload_heap_allocate(target_capacity, this);
+        if (!block) {
+            g_payload_arena_alloc_fail++;
             return false;
         }
-        memcpy(_arena, other._arena, other._arena_used);
-        _arena_used = other._arena_used;
-    }
-
-    if (other._count > 0) {
-        if (!_ensure_entries(other._count)) {
-            g_payload_entry_alloc_fail++;
-            payload_note_error(PAYLOAD_ERR_COPY_ALLOC_FAIL, "copy_entries", this);
-            _count = 0;
-            _arena_used = 0;
-            return false;
+        _set_heap_block(block);
+        memset(payload_heap_bytes(block), 0, target_capacity);
+        payload_note_heap_delta((int32_t)target_capacity);
+        g_payload_arena_realloc_count++;
+        const size_t data_capacity =
+            target_capacity - (size_t)other._count * sizeof(Entry);
+        if (data_capacity > g_payload_max_arena_capacity_seen) {
+            g_payload_max_arena_capacity_seen = (uint32_t)data_capacity;
         }
-        memcpy(_entries, other._entries, other._count * sizeof(Entry));
     }
 
-    _count = other._count;
+    uint8_t* target = _storage();
+    const uint8_t* source = other._storage();
+    const uint16_t target_data_begin =
+        (uint16_t)(target_capacity - source_data_used);
+    const int32_t shift =
+        (int32_t)target_data_begin - (int32_t)other._data_begin;
+
+    if (other._count != 0) {
+        memcpy(target, source, (size_t)other._count * sizeof(Entry));
+        Entry* entries = reinterpret_cast<Entry*>(target);
+        for (size_t i = 0; i < other._count; ++i) {
+            entries[i].key_off = (uint16_t)((int32_t)entries[i].key_off + shift);
+            entries[i].val_off = (uint16_t)((int32_t)entries[i].val_off + shift);
+        }
+    }
+    if (source_data_used != 0) {
+        memcpy(target + target_data_begin,
+               source + other._data_begin,
+               source_data_used);
+    }
+
+    _set_count(other._count);
+    _set_data_begin(target_data_begin);
     return true;
 }
 
-// ============================================================================
-// Lifecycle
-// ============================================================================
-
 void Payload::clear() {
-    if (!_self_ok("clear")) {
-        // Re-establish a coherent empty object without freeing questionable
-        // pointers.  parseJSON() begins with clear(); continuing with corrupted
-        // arena/entry metadata would only manufacture more bad pointers.
-        _magic = MAGIC_LIVE;
-        _entries = _inline_entries;
-        _count = 0;
-        _entry_cap = INLINE_ENTRIES;
-        _arena = nullptr;
-        _arena_used = 0;
-        _arena_cap = 0;
+    if (!_self_ok(PAYLOAD_OP_CLEAR)) {
+        _release_storage();
         return;
     }
-    _count = 0;
-    _arena_used = 0;
+
+    uint8_t* storage = _storage();
+    const size_t entry_bytes = (size_t)_count * sizeof(Entry);
+    const size_t data_used = _data_used();
+    if (entry_bytes != 0U) memset(storage, 0, entry_bytes);
+    if (data_used != 0U) memset(storage + _data_begin, 0, data_used);
+
+    _set_count(0U);
+    _set_data_begin((uint16_t)_capacity());
 }
 
 bool Payload::empty() const {
-    return !_self_ok("empty") || _count == 0;
+    return !_self_ok(PAYLOAD_OP_EMPTY) || _count == 0;
 }
 
 Payload Payload::clone() const {
     return Payload(*this);
 }
 
+size_t Payload::count() const {
+    return _self_ok(PAYLOAD_OP_COUNT) ? _count : 0;
+}
+
+size_t Payload::arena_used() const {
+    return _self_ok(PAYLOAD_OP_ARENA_USED) ? _data_used() : 0;
+}
+
+size_t Payload::arena_capacity() const {
+    if (!_self_ok(PAYLOAD_OP_ARENA_CAPACITY)) return 0;
+    const size_t capacity = _capacity();
+    const size_t entry_bytes = (size_t)_count * sizeof(Entry);
+    return capacity >= entry_bytes ? capacity - entry_bytes : 0;
+}
+
+size_t Payload::entry_capacity() const {
+    if (!_self_ok(PAYLOAD_OP_ENTRY_CAPACITY)) return 0;
+    const size_t by_gap = _data_begin / sizeof(Entry);
+    return by_gap < MAX_ENTRIES ? by_gap : MAX_ENTRIES;
+}
+
+bool Payload::heap_entries() const {
+    return _heap_guard_ok() && _heap_block != nullptr && _capacity() != 0U;
+}
+
 // ============================================================================
-// Internal integrity guard
+// Payload integrity
 // ============================================================================
 
-bool Payload::_self_ok(const char* op) const {
-    auto fail_basic = [&](uint32_t reason) -> bool {
-        g_payload_integrity_fail++;
-        g_payload_self_ok_fail++;
-        g_payload_last_self_ok_fail_reason = reason;
-        payload_copy_trusted_label(g_payload_last_self_ok_fail_op,
-                                   sizeof(g_payload_last_self_ok_fail_op),
-                                   op ? op : "?");
-        g_payload_last_self_ok_fail_this = (uint32_t)(uintptr_t)this;
-        g_payload_last_self_ok_fail_magic = _magic;
-        g_payload_last_self_ok_fail_entries = (uint32_t)(uintptr_t)_entries;
-        g_payload_last_self_ok_fail_arena = (uint32_t)(uintptr_t)_arena;
-        g_payload_last_self_ok_fail_count = (uint32_t)_count;
-        g_payload_last_self_ok_fail_entry_cap = (uint32_t)_entry_cap;
-        g_payload_last_self_ok_fail_arena_used = (uint32_t)_arena_used;
-        g_payload_last_self_ok_fail_arena_cap = (uint32_t)_arena_cap;
-        payload_note_error(PAYLOAD_ERR_INTEGRITY, op, this);
+bool Payload::_self_ok(uint32_t operation_id) const {
+    if (!_heap_guard_ok() || !_count_guard_ok() || !_data_begin_guard_ok()) {
+        payload_note_integrity(PAYLOAD_SELF_OK_INLINE_CAP_MISMATCH, operation_id, this);
         return false;
-    };
+    }
+    const size_t capacity = _capacity();
+    const uint8_t* storage = capacity != 0 ? _storage() : nullptr;
 
-    auto fail = [&](uint32_t reason,
-                    uint32_t entry_index = 0xFFFFFFFFUL,
-                    uint32_t entry_key_off = 0,
-                    uint32_t entry_val_off = 0,
-                    uint32_t entry_val_len = 0,
-                    uint32_t entry_kind = 0) -> bool {
-        if (!Payload::HEAVY_FORENSICS) {
-            (void)entry_index;
-            (void)entry_key_off;
-            (void)entry_val_off;
-            (void)entry_val_len;
-            (void)entry_kind;
-            return fail_basic(reason);
-        }
-
-        payload_note_self_ok_failure(reason,
-                                     op,
-                                     this,
-                                     _magic,
-                                     _entries,
-                                     _arena,
-                                     _count,
-                                     _entry_cap,
-                                     _arena_used,
-                                     _arena_cap,
-                                     entry_index,
-                                     entry_key_off,
-                                     entry_val_off,
-                                     entry_val_len,
-                                     entry_kind);
+    if (!storage || capacity == 0) {
+        payload_note_integrity(PAYLOAD_SELF_OK_ENTRIES_SPAN_UNREADABLE, operation_id, this);
         return false;
-    };
-
-    // Operational profile: keep _self_ok() O(1).  The former crash-hunt build
-    // walked every entry and scanned key/value terminators on almost every
-    // Payload operation.  Large reports therefore produced quadratic work and
-    // repeated pointer-range probes while the 1 Hz campaign stream was active.
-    // These cheap invariants are enough to protect normal Payload semantics;
-    // the full entry-table courtroom remains below for dedicated autopsy builds.
-    if (_magic != MAGIC_LIVE) {
-        payload_magic_trace_capture(
-            this, _magic, op,
-            (uint32_t)(uintptr_t)__builtin_return_address(0));
-        return fail(PAYLOAD_SELF_OK_MAGIC_BAD);
     }
-
-    if (!_entries) {
-        return fail(PAYLOAD_SELF_OK_ENTRIES_NULL);
-    }
-    if (_entry_cap < INLINE_ENTRIES) {
-        return fail(PAYLOAD_SELF_OK_ENTRY_CAP_LOW);
-    }
-    if (_entry_cap > MAX_ENTRIES) {
-        return fail(PAYLOAD_SELF_OK_ENTRY_CAP_HIGH);
-    }
-
-    const uintptr_t entries_addr = (uintptr_t)_entries;
-    const uintptr_t arena_addr = (uintptr_t)_arena;
-    if (entries_addr == (uintptr_t)MAGIC_LIVE ||
-        entries_addr == (uintptr_t)MAGIC_DEAD) {
-        return fail(PAYLOAD_SELF_OK_ENTRIES_MAGIC_ADDRESS);
-    }
-    if (arena_addr == (uintptr_t)MAGIC_LIVE ||
-        arena_addr == (uintptr_t)MAGIC_DEAD) {
-        return fail(PAYLOAD_SELF_OK_ARENA_MAGIC_ADDRESS);
-    }
-
-    const bool entries_inline = (_entries == _inline_entries);
-    if (entries_inline && _entry_cap != INLINE_ENTRIES) {
-        return fail(PAYLOAD_SELF_OK_INLINE_CAP_MISMATCH);
-    }
-    if (!entries_inline && _entry_cap <= INLINE_ENTRIES) {
-        return fail(PAYLOAD_SELF_OK_HEAP_CAP_MISMATCH);
-    }
-
-    if (_count > _entry_cap) {
-        return fail(PAYLOAD_SELF_OK_COUNT_GT_ENTRY_CAP);
+    if (capacity > STORAGE_MAX) {
+        payload_note_integrity(PAYLOAD_SELF_OK_ARENA_CAP_GT_MAX, operation_id, this);
+        return false;
     }
     if (_count > MAX_ENTRIES) {
-        return fail(PAYLOAD_SELF_OK_COUNT_GT_MAX);
+        payload_note_integrity(PAYLOAD_SELF_OK_COUNT_GT_MAX, operation_id, this);
+        return false;
     }
-
-    if (_arena_used > _arena_cap) {
-        return fail(PAYLOAD_SELF_OK_ARENA_USED_GT_CAP);
-    }
-    if (_arena_cap > ARENA_MAX) {
-        return fail(PAYLOAD_SELF_OK_ARENA_CAP_GT_MAX);
-    }
-
-    if (_arena_cap == 0 && _arena != nullptr) {
-        return fail(PAYLOAD_SELF_OK_ARENA_CAP_ZERO_WITH_PTR);
-    }
-    if (_arena_cap != 0 && _arena == nullptr) {
-        return fail(PAYLOAD_SELF_OK_ARENA_CAP_NONZERO_WITH_NULL);
-    }
-    if (_count != 0 && (!_arena || _arena_used == 0)) {
-        return fail(PAYLOAD_SELF_OK_COUNT_WITHOUT_ARENA);
-    }
-
-    // Fast pointer-custody court.  This is still O(1): it validates only that
-    // heap-backed spans live in readable storage before later code dereferences
-    // _entries or _arena.  The old normal profile deferred these checks to
-    // HEAVY_FORENSICS, which let low or stack-neighborhood pointers reach libc
-    // numeric parsers as ordinary C strings.
-    if (!entries_inline &&
-        !payload_memory_readable(_entries,
-                                 _entry_cap * sizeof(Entry),
-                                 "self.entries.fast")) {
-        return fail(PAYLOAD_SELF_OK_ENTRIES_SPAN_UNREADABLE);
-    }
-
-    if (_arena && _arena_cap != 0 &&
-        !payload_memory_readable(_arena, _arena_cap, "self.arena.fast")) {
-        return fail(PAYLOAD_SELF_OK_ARENA_SPAN_UNREADABLE);
-    }
-
-    if (!Payload::HEAVY_FORENSICS) {
-        return true;
-    }
-
-    // Heavy autopsy profile.  Leave this compiled behind the constexpr switch
-    // so a dedicated crash-hunt build can still interrogate every entry and
-    // arena span without carrying that cost in normal campaign operation.
-    if (!entries_inline &&
-        !payload_memory_readable(_entries, _entry_cap * sizeof(Entry), "self.entries")) {
-        return fail(PAYLOAD_SELF_OK_ENTRIES_SPAN_UNREADABLE);
-    }
-
-    if (_arena && !payload_memory_readable(_arena, _arena_cap, "self.arena")) {
-        return fail(PAYLOAD_SELF_OK_ARENA_SPAN_UNREADABLE);
-    }
-
-    for (size_t i = 0; i < _count; i++) {
-        const Entry& e = _entries[i];
-        const uint32_t idx = (uint32_t)i;
-        const uint32_t key_off = (uint32_t)e.key_off;
-        const uint32_t val_off = (uint32_t)e.val_off;
-        const uint32_t val_len = (uint32_t)e.val_len;
-        const uint32_t kind = (uint32_t)(uint8_t)e.kind;
-
-        auto fail_entry = [&](uint32_t reason) -> bool {
-            return fail(reason, idx, key_off, val_off, val_len, kind);
-        };
-
-        if (e.kind != 'p' && e.kind != 'o' && e.kind != 'a') {
-            return fail_entry(PAYLOAD_SELF_OK_ENTRY_KIND_BAD);
-        }
-
-        if (e.key_off >= _arena_used) {
-            return fail_entry(PAYLOAD_SELF_OK_ENTRY_KEY_OFF_OOB);
-        }
-        if (e.val_off >= _arena_used) {
-            return fail_entry(PAYLOAD_SELF_OK_ENTRY_VAL_OFF_OOB);
-        }
-
-        const size_t val_end = (size_t)e.val_off + (size_t)e.val_len;
-        if (val_end >= _arena_used) {
-            return fail_entry(PAYLOAD_SELF_OK_ENTRY_VAL_END_OOB);
-        }
-        if (_arena[val_end] != '\0') {
-            return fail_entry(PAYLOAD_SELF_OK_ENTRY_VAL_UNTERMINATED);
-        }
-
-        bool key_terminated = false;
-        for (size_t k = e.key_off; k < _arena_used; k++) {
-            if (_arena[k] == '\0') {
-                key_terminated = true;
-                break;
-            }
-        }
-        if (!key_terminated) {
-            return fail_entry(PAYLOAD_SELF_OK_ENTRY_KEY_UNTERMINATED);
-        }
-    }
-
-    return true;
-}
-// ============================================================================
-// Entry + arena internals
-// ============================================================================
-
-bool Payload::_ensure_entries(size_t needed_count) {
-    if (!_self_ok("ensure_entries")) return false;
-
-    if (needed_count <= _entry_cap) return true;
-
-    if (needed_count > MAX_ENTRIES) {
-        g_payload_entry_overflow++;
-        payload_note_error(PAYLOAD_ERR_ENTRY_OVERFLOW, "ensure_entries", this);
+    if (_data_begin > capacity) {
+        payload_note_integrity(PAYLOAD_SELF_OK_ARENA_USED_GT_CAP, operation_id, this);
         return false;
     }
 
-    size_t new_cap = grow_power_of_two(_entry_cap, needed_count, MAX_ENTRIES);
-    if (new_cap <= _entry_cap) {
-        g_payload_entry_overflow++;
-        payload_note_error(PAYLOAD_ERR_ENTRY_OVERFLOW, "ensure_entries_cap", this);
+    const size_t entry_bytes = (size_t)_count * sizeof(Entry);
+    if (entry_bytes > _data_begin) {
+        payload_note_integrity(PAYLOAD_SELF_OK_COUNT_GT_ENTRY_CAP, operation_id, this);
         return false;
     }
-
-    // Deliberately avoid realloc(): growth is an explicit allocate/copy/free
-    // transaction so allocator-side memmove never interprets Payload storage
-    // state while expanding the entry table.
-    const bool had_heap_entries = (_entries != _inline_entries);
-    Entry* const old_entries = had_heap_entries ? _entries : nullptr;
-    const size_t old_bytes = had_heap_entries ? (_entry_cap * sizeof(Entry)) : 0U;
-    const size_t new_bytes = new_cap * sizeof(Entry);
-
-    Entry* new_entries = (Entry*)malloc(new_bytes);
-    if (!new_entries) {
-        g_payload_entry_alloc_fail++;
-        payload_note_error(PAYLOAD_ERR_ENTRY_ALLOC_FAIL, "ensure_entries_alloc", this);
+    if (capacity - _data_begin > ARENA_MAX) {
+        payload_note_integrity(PAYLOAD_SELF_OK_ARENA_USED_GT_CAP, operation_id, this);
         return false;
-    }
-
-    if (_count > 0) {
-        memcpy(new_entries, _entries, _count * sizeof(Entry));
-    }
-    memset(new_entries + _count, 0, (new_cap - _count) * sizeof(Entry));
-
-    _entries = new_entries;
-    _entry_cap = new_cap;
-    g_payload_entry_realloc_count++;
-    payload_note_entry_heap_delta((int32_t)(new_bytes - old_bytes));
-
-    if (old_entries) {
-        free(old_entries);
-    }
-
-    if (_entry_cap > g_payload_max_entry_capacity_seen) {
-        g_payload_max_entry_capacity_seen = _entry_cap;
     }
     return true;
 }
 
-bool Payload::_ensure_arena(size_t additional) {
-    if (!_self_ok("ensure_arena")) return false;
-
-    if (additional > ARENA_MAX) {
-        g_payload_arena_alloc_fail++;
-        payload_note_error(PAYLOAD_ERR_ARENA_LIMIT, "ensure_arena_add", this);
-        return false;
-    }
-
-    if (_arena_used > ARENA_MAX || additional > (ARENA_MAX - _arena_used)) {
-        g_payload_arena_alloc_fail++;
-        payload_note_error(PAYLOAD_ERR_ARENA_LIMIT, "ensure_arena_limit", this);
-        return false;
-    }
-
-    const size_t needed = _arena_used + additional;
-    if (needed <= _arena_cap) return true;
-
-    size_t new_cap = _arena_cap == 0 ? ARENA_INITIAL : _arena_cap;
-    new_cap = grow_power_of_two(new_cap, needed, ARENA_MAX);
-
-    if (new_cap < needed || new_cap > ARENA_MAX) {
-        g_payload_arena_alloc_fail++;
-        payload_note_error(PAYLOAD_ERR_ARENA_LIMIT, "ensure_arena_cap", this);
-        return false;
-    }
-
-    // Deliberately avoid realloc(): growth is an explicit allocate/copy/free
-    // transaction so allocator-side memmove never receives Payload arena state.
-    char* const old_arena = _arena;
-    const size_t old_cap = _arena_cap;
-    char* new_arena = (char*)malloc(new_cap);
-    if (!new_arena) {
-        g_payload_arena_alloc_fail++;
-        payload_note_error(PAYLOAD_ERR_ARENA_ALLOC_FAIL, "ensure_arena_alloc", this);
-        return false;
-    }
-
-    if (_arena_used > 0) {
-        memcpy(new_arena, _arena, _arena_used);
-    }
-
-    _arena = new_arena;
-    _arena_cap = new_cap;
-    g_payload_arena_realloc_count++;
-    payload_note_arena_heap_delta((int32_t)(new_cap - old_cap));
-
-    if (old_arena) {
-        free(old_arena);
-    }
-
-    if (_arena_cap > g_payload_max_arena_capacity_seen) {
-        g_payload_max_arena_capacity_seen = _arena_cap;
-    }
-    return true;
-}
-
-uint16_t Payload::_put(const char* str, size_t len) {
-    if (!_self_ok("put")) return UINT16_MAX;
-
-    if (!str) {
-        if (len != 0) {
-            payload_note_error(PAYLOAD_ERR_STRING_TOO_LONG, "put_null", this);
-            return UINT16_MAX;
-        }
-        str = "";
-    }
-
-    if (len > UINT16_MAX) {
-        g_payload_arena_alloc_fail++;
-        payload_note_error(PAYLOAD_ERR_STRING_TOO_LONG, "put_len", this);
-        return UINT16_MAX;
-    }
-
-    if (len > 0 && !payload_memory_readable(str, len, "put.span")) {
-        payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER, "put_span", this);
-        return UINT16_MAX;
-    }
-
-    if (len + 1U > ARENA_MAX) {
-        g_payload_arena_alloc_fail++;
-        payload_note_error(PAYLOAD_ERR_ARENA_LIMIT, "put_arena_limit", this);
-        return UINT16_MAX;
-    }
-
-    uintptr_t arena_alias_offset = UINTPTR_MAX;
-    if (_arena) {
-        const uintptr_t arena_begin = (uintptr_t)_arena;
-        const uintptr_t arena_end = arena_begin + _arena_used;
-        const uintptr_t str_addr = (uintptr_t)str;
-        if (str_addr >= arena_begin && str_addr < arena_end) {
-            arena_alias_offset = str_addr - arena_begin;
-        }
-    }
-
-    if (!_ensure_arena(len + 1U)) return UINT16_MAX;
-
-    if (arena_alias_offset != UINTPTR_MAX) {
-        str = _arena + arena_alias_offset;
-    }
-
-    if (_arena_used + len + 1U > UINT16_MAX) {
-        g_payload_arena_alloc_fail++;
-        payload_note_error(PAYLOAD_ERR_ARENA_LIMIT, "put_offset_limit", this);
-        return UINT16_MAX;
-    }
-
-    const uint16_t offset = (uint16_t)_arena_used;
-    if (len > 0) {
-        memcpy(_arena + _arena_used, str, len);
-    }
-    _arena[_arena_used + len] = '\0';
-    _arena_used += len + 1U;
-
-    if (_arena_used > g_payload_arena_high_water_global) {
-        g_payload_arena_high_water_global = _arena_used;
-    }
-
-    return offset;
-}
-
-uint16_t Payload::_put(const char* str) {
-    size_t n = 0;
-    bool ok = true;
-    str = payload_cstr_or_empty(str, ARENA_MAX, "put.cstr", &n, &ok);
-    if (!ok) {
-        payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER, "put_cstr", this);
-    }
-    return _put(str, n);
-}
-
-bool Payload::_entry_key_ok(const Entry& e, const char* op, size_t* out_len) const {
-    if (out_len) *out_len = 0;
-
-    if (!_self_ok(op ? op : "entry_key")) return false;
-    if (!_arena || _arena_used == 0 || e.key_off >= _arena_used) {
-        payload_note_self_ok_failure(PAYLOAD_SELF_OK_ENTRY_KEY_OFF_OOB,
-                                     op ? op : "entry_key",
-                                     this,
-                                     _magic,
-                                     _entries,
-                                     _arena,
-                                     _count,
-                                     _entry_cap,
-                                     _arena_used,
-                                     _arena_cap,
-                                     0xFFFFFFFFUL,
-                                     (uint32_t)e.key_off,
-                                     (uint32_t)e.val_off,
-                                     (uint32_t)e.val_len,
-                                     (uint32_t)(uint8_t)e.kind);
-        return false;
-    }
-
-    const size_t remaining = _arena_used - (size_t)e.key_off;
-    const char* s = _arena + e.key_off;
-    const void* z = memchr(s, '\0', remaining);
-    if (!z) {
-        payload_note_self_ok_failure(PAYLOAD_SELF_OK_ENTRY_KEY_UNTERMINATED,
-                                     op ? op : "entry_key",
-                                     this,
-                                     _magic,
-                                     _entries,
-                                     _arena,
-                                     _count,
-                                     _entry_cap,
-                                     _arena_used,
-                                     _arena_cap,
-                                     0xFFFFFFFFUL,
-                                     (uint32_t)e.key_off,
-                                     (uint32_t)e.val_off,
-                                     (uint32_t)e.val_len,
-                                     (uint32_t)(uint8_t)e.kind);
-        return false;
-    }
-
-    if (out_len) {
-        *out_len = (size_t)((const char*)z - s);
-    }
-    return true;
-}
-
-bool Payload::_entry_value_ok(const Entry& e, const char* op, size_t* out_len) const {
-    if (out_len) *out_len = 0;
-
-    if (!_self_ok(op ? op : "entry_value")) return false;
-    if (e.kind != 'p' && e.kind != 'o' && e.kind != 'a') {
-        payload_note_self_ok_failure(PAYLOAD_SELF_OK_ENTRY_KIND_BAD,
-                                     op ? op : "entry_value",
-                                     this,
-                                     _magic,
-                                     _entries,
-                                     _arena,
-                                     _count,
-                                     _entry_cap,
-                                     _arena_used,
-                                     _arena_cap,
-                                     0xFFFFFFFFUL,
-                                     (uint32_t)e.key_off,
-                                     (uint32_t)e.val_off,
-                                     (uint32_t)e.val_len,
-                                     (uint32_t)(uint8_t)e.kind);
-        return false;
-    }
-
-    if (!_arena || _arena_used == 0 || e.val_off >= _arena_used) {
-        payload_note_self_ok_failure(PAYLOAD_SELF_OK_ENTRY_VAL_OFF_OOB,
-                                     op ? op : "entry_value",
-                                     this,
-                                     _magic,
-                                     _entries,
-                                     _arena,
-                                     _count,
-                                     _entry_cap,
-                                     _arena_used,
-                                     _arena_cap,
-                                     0xFFFFFFFFUL,
-                                     (uint32_t)e.key_off,
-                                     (uint32_t)e.val_off,
-                                     (uint32_t)e.val_len,
-                                     (uint32_t)(uint8_t)e.kind);
-        return false;
-    }
-
+bool Payload::_entry_ok(const Entry& e,
+                        size_t index,
+                        uint32_t operation_id) const {
+    if (!_self_ok(operation_id)) return false;
+    const size_t capacity = _capacity();
+    const uint8_t* storage = _storage();
+    const size_t key_end = (size_t)e.key_off + (size_t)e.key_len;
     const size_t val_end = (size_t)e.val_off + (size_t)e.val_len;
-    if (val_end >= _arena_used) {
-        payload_note_self_ok_failure(PAYLOAD_SELF_OK_ENTRY_VAL_END_OOB,
-                                     op ? op : "entry_value",
-                                     this,
-                                     _magic,
-                                     _entries,
-                                     _arena,
-                                     _count,
-                                     _entry_cap,
-                                     _arena_used,
-                                     _arena_cap,
-                                     0xFFFFFFFFUL,
-                                     (uint32_t)e.key_off,
-                                     (uint32_t)e.val_off,
-                                     (uint32_t)e.val_len,
-                                     (uint32_t)(uint8_t)e.kind);
+    const payload_layout_evidence_t evidence = {
+        (uint32_t)index,
+        (uint32_t)capacity,
+        (uint32_t)_data_begin,
+        (uint32_t)_count,
+        (uint32_t)e.key_off,
+        (uint32_t)e.key_len,
+        (uint32_t)e.val_off,
+        (uint32_t)e.val_len,
+        (uint32_t)e.kind,
+        0U,
+        (uint32_t)key_end,
+        (uint32_t)val_end,
+    };
+
+    const uint8_t kind = e.kind;
+    if (e.reserved != 0U ||
+        kind < (uint8_t)ValueKind::STRING ||
+        kind > (uint8_t)ValueKind::ARRAY) {
+        payload_note_integrity(PAYLOAD_SELF_OK_ENTRY_KIND_BAD,
+                               operation_id, this, &evidence);
         return false;
     }
 
-    if (_arena[val_end] != '\0') {
-        payload_note_self_ok_failure(PAYLOAD_SELF_OK_ENTRY_VAL_UNTERMINATED,
-                                     op ? op : "entry_value",
-                                     this,
-                                     _magic,
-                                     _entries,
-                                     _arena,
-                                     _count,
-                                     _entry_cap,
-                                     _arena_used,
-                                     _arena_cap,
-                                     0xFFFFFFFFUL,
-                                     (uint32_t)e.key_off,
-                                     (uint32_t)e.val_off,
-                                     (uint32_t)e.val_len,
-                                     (uint32_t)(uint8_t)e.kind);
+    if (e.key_off < _data_begin || key_end >= capacity) {
+        payload_note_integrity(PAYLOAD_SELF_OK_ENTRY_KEY_OFF_OOB,
+                               operation_id, this, &evidence);
         return false;
     }
-
-    if (out_len) *out_len = (size_t)e.val_len;
+    if (e.val_off < _data_begin || val_end >= capacity) {
+        payload_note_integrity(PAYLOAD_SELF_OK_ENTRY_VAL_END_OOB,
+                               operation_id, this, &evidence);
+        return false;
+    }
+    if (storage[key_end] != '\0') {
+        payload_note_integrity(PAYLOAD_SELF_OK_ENTRY_KEY_UNTERMINATED,
+                               operation_id, this, &evidence);
+        return false;
+    }
+    if (storage[val_end] != '\0') {
+        payload_note_integrity(PAYLOAD_SELF_OK_ENTRY_VAL_UNTERMINATED,
+                               operation_id, this, &evidence);
+        return false;
+    }
     return true;
 }
 
-const char* Payload::_primitive_value(const char* key,
-                                      const char* op,
-                                      size_t* out_len) const {
-    if (out_len) *out_len = 0;
-    const Entry* e = _find(key);
-    if (!e || e->kind != 'p') return nullptr;
-    size_t n = 0;
-    if (!_entry_value_ok(*e, op ? op : "primitive_value", &n)) return nullptr;
-    if (out_len) *out_len = n;
-    return _arena + e->val_off;
-}
+bool Payload::_layout_ok(uint32_t operation_id) const {
+    if (!_self_ok(operation_id)) return false;
 
-const char* Payload::_at(uint16_t offset) const {
-    if (!_self_ok("at")) return "";
-    if (!_arena || offset >= _arena_used) {
-        payload_note_self_ok_failure(PAYLOAD_SELF_OK_ENTRY_VAL_OFF_OOB,
-                                     "at",
-                                     this,
-                                     _magic,
-                                     _entries,
-                                     _arena,
-                                     _count,
-                                     _entry_cap,
-                                     _arena_used,
-                                     _arena_cap,
-                                     0xFFFFFFFFUL,
-                                     0,
-                                     (uint32_t)offset,
-                                     0,
-                                     0);
-        return "";
-    }
-    return _arena + offset;
-}
+    const size_t capacity = _capacity();
+    const uint8_t* storage = _storage();
+    const Entry* entries = _entries();
+    size_t expected_upper = capacity;
 
-const Payload::Entry* Payload::_find(const char* key) const {
-    if (!_self_ok("find") || !key) return nullptr;
+    for (size_t i = 0; i < _count; ++i) {
+        const Entry& e = entries[i];
+        if (!_entry_ok(e, i, operation_id)) return false;
 
-    size_t key_len = 0;
-    if (!payload_cstr_len_checked(key, ARENA_MAX, false, "find.key", &key_len)) {
-        payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER, "find_key", this);
-        return nullptr;
-    }
-
-    for (size_t i = 0; i < _count; i++) {
-        const Entry& e = _entries[i];
-        size_t stored_len = 0;
-        if (!_entry_key_ok(e, "find.entry_key", &stored_len)) {
-            return nullptr;
+        const size_t key_end = (size_t)e.key_off + (size_t)e.key_len;
+        const size_t val_end = (size_t)e.val_off + (size_t)e.val_len;
+        const payload_layout_evidence_t evidence = {
+            (uint32_t)i,
+            (uint32_t)capacity,
+            (uint32_t)_data_begin,
+            (uint32_t)_count,
+            (uint32_t)e.key_off,
+            (uint32_t)e.key_len,
+            (uint32_t)e.val_off,
+            (uint32_t)e.val_len,
+            (uint32_t)e.kind,
+            (uint32_t)expected_upper,
+            (uint32_t)key_end,
+            (uint32_t)val_end,
+        };
+        if (key_end + 1U != (size_t)e.val_off ||
+            val_end + 1U != expected_upper) {
+            payload_note_integrity(PAYLOAD_SELF_OK_ENTRY_VAL_END_OOB,
+                                   operation_id, this, &evidence);
+            return false;
         }
-        if (stored_len == key_len && memcmp(_arena + e.key_off, key, key_len) == 0) {
-            return &_entries[i];
+        if (storage[key_end] != '\0' || storage[val_end] != '\0') {
+            payload_note_integrity(PAYLOAD_SELF_OK_ENTRY_VAL_UNTERMINATED,
+                                   operation_id, this, &evidence);
+            return false;
+        }
+        expected_upper = e.key_off;
+    }
+
+    if (expected_upper != _data_begin) {
+        const payload_layout_evidence_t evidence = {
+            0xFFFFFFFFUL,
+            (uint32_t)capacity,
+            (uint32_t)_data_begin,
+            (uint32_t)_count,
+            0U, 0U, 0U, 0U, 0U,
+            (uint32_t)expected_upper,
+            0U, 0U,
+        };
+        payload_note_integrity(PAYLOAD_SELF_OK_COUNT_WITHOUT_ARENA,
+                               operation_id, this, &evidence);
+        return false;
+    }
+    return true;
+}
+
+const Payload::Entry* Payload::_find(const char* key, size_t key_len) const {
+    if (!_layout_ok(PAYLOAD_OP_FIND_LAYOUT)) return nullptr;
+    const Entry* entries = _entries();
+    const uint8_t* storage = _storage();
+    for (size_t i = 0; i < _count; ++i) {
+        const Entry& e = entries[i];
+        if ((size_t)e.key_len == key_len &&
+            (key_len == 0U || memcmp(storage + e.key_off, key, key_len) == 0)) {
+            return &entries[i];
         }
     }
     return nullptr;
 }
 
-// ============================================================================
-// Internal: add an entry with pre-formatted value
-// ============================================================================
-
-void Payload::_add_entry(const char* key, const char* value, size_t value_len, char kind) {
-    if (!_self_ok("add_entry")) return;
-
-    if (!key) key = "";
-    if (!value) {
-        value = "";
-        value_len = 0;
+const Payload::Entry* Payload::_find(const char* key) const {
+    if (!key) return nullptr;
+    size_t key_len = 0;
+    if (!payload_cstr_len_checked(key, ARENA_MAX, PAYLOAD_OP_FIND_KEY, &key_len, false)) {
+        payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER, PAYLOAD_OP_FIND_KEY, this);
+        return nullptr;
     }
+    return _find(key, key_len);
+}
 
-    if (kind != 'p' && kind != 'o' && kind != 'a') {
-        g_payload_invalid_kind++;
-        payload_note_error(PAYLOAD_ERR_INVALID_KIND, "add_entry_kind", this);
-        kind = 'p';
-    }
+const char* Payload::_value_ptr(const Entry& e) const {
+    return reinterpret_cast<const char*>(_storage() + e.val_off);
+}
 
-    if (_count >= MAX_ENTRIES) {
+// ============================================================================
+// Single-store growth and transactional append
+// ============================================================================
+
+bool Payload::_ensure_room(size_t additional_entries,
+                           size_t additional_data,
+                           int32_t* data_shift) {
+    if (data_shift) *data_shift = 0;
+    if (!_self_ok(PAYLOAD_OP_ENSURE_ROOM)) return false;
+
+    if (additional_entries > MAX_ENTRIES - _count) {
         g_payload_entry_overflow++;
-        payload_note_error(PAYLOAD_ERR_ENTRY_OVERFLOW, "add_entry_count", this);
-        return;
+        payload_note_error(PAYLOAD_ERR_ENTRY_OVERFLOW, PAYLOAD_OP_ENSURE_ROOM_ENTRIES, this);
+        return false;
     }
 
-    if (value_len > UINT16_MAX) {
+    const size_t data_used = _data_used();
+    if (additional_data > ARENA_MAX - data_used) {
         g_payload_arena_alloc_fail++;
-        payload_note_error(PAYLOAD_ERR_STRING_TOO_LONG, "add_entry_value_len", this);
-        return;
+        payload_note_error(PAYLOAD_ERR_ARENA_LIMIT, PAYLOAD_OP_ENSURE_ROOM_DATA, this);
+        return false;
     }
 
-    if (!_ensure_entries(_count + 1U)) {
-        return;
+    const size_t new_count = (size_t)_count + additional_entries;
+    const size_t required =
+        new_count * sizeof(Entry) + data_used + additional_data;
+    const size_t old_capacity = _capacity();
+    if (required <= old_capacity) return true;
+    if (!_layout_ok(PAYLOAD_OP_ENSURE_ROOM_GROW)) return false;
+
+    const size_t new_capacity =
+        payload_growth_capacity(old_capacity, required, STORAGE_MAX);
+    if (new_capacity == 0 || new_capacity > UINT16_MAX) {
+        g_payload_arena_alloc_fail++;
+        payload_note_error(PAYLOAD_ERR_ARENA_LIMIT, PAYLOAD_OP_ENSURE_ROOM_CAPACITY, this);
+        return false;
     }
 
-    const size_t arena_mark = _arena_used;
+    void* new_block = payload_heap_allocate(new_capacity, this);
+    if (!new_block) {
+        g_payload_arena_alloc_fail++;
+        payload_note_error(PAYLOAD_ERR_ARENA_ALLOC_FAIL, PAYLOAD_OP_ENSURE_ROOM_ALLOC, this);
+        return false;
+    }
 
-    // If value points into this Payload's existing arena, _put(key) may grow
-    // the arena and free the old storage before _put(value) gets its own
-    // alias-protection chance.  Snapshot the offset before key insertion and
-    // remap the value pointer after key insertion.  This keeps
-    // p.add("new", p.getString("old")) from copying from a freed arena.
-    uintptr_t value_alias_offset = UINTPTR_MAX;
-    if (_arena && value) {
-        const uintptr_t arena_begin = (uintptr_t)_arena;
-        const uintptr_t arena_end = arena_begin + _arena_used;
-        const uintptr_t value_addr = (uintptr_t)value;
-        if (value_addr >= arena_begin && value_addr < arena_end) {
-            value_alias_offset = value_addr - arena_begin;
+    uint8_t* new_storage = payload_heap_bytes(new_block);
+    memset(new_storage, 0, new_capacity);
+    const uint8_t* old_storage = _storage();
+    const uint16_t new_data_begin =
+        (uint16_t)(new_capacity - data_used);
+    const int32_t shift =
+        (int32_t)new_data_begin - (int32_t)_data_begin;
+
+    if (_count != 0) {
+        memcpy(new_storage, old_storage, (size_t)_count * sizeof(Entry));
+        Entry* copied_entries = reinterpret_cast<Entry*>(new_storage);
+        for (size_t i = 0; i < _count; ++i) {
+            copied_entries[i].key_off =
+                (uint16_t)((int32_t)copied_entries[i].key_off + shift);
+            copied_entries[i].val_off =
+                (uint16_t)((int32_t)copied_entries[i].val_off + shift);
+        }
+    }
+    if (data_used != 0) {
+        memcpy(new_storage + new_data_begin,
+               old_storage + _data_begin,
+               data_used);
+    }
+
+    void* old_block = _heap_block;
+    const size_t old_heap_capacity = old_block ? old_capacity : 0U;
+    _set_heap_block(new_block);
+    _set_data_begin(new_data_begin);
+
+    payload_note_heap_delta((int32_t)new_capacity - (int32_t)old_heap_capacity);
+    g_payload_arena_realloc_count++;
+    const size_t data_capacity =
+        new_capacity - new_count * sizeof(Entry);
+    if (data_capacity > g_payload_max_arena_capacity_seen) {
+        g_payload_max_arena_capacity_seen = (uint32_t)data_capacity;
+    }
+
+    if (old_block) free(old_block);
+    if (data_shift) *data_shift = shift;
+    return true;
+}
+
+bool Payload::_append_value(const char* key,
+                            size_t key_len,
+                            const char* value,
+                            size_t value_len,
+                            ValueKind kind) {
+    if (!_self_ok(PAYLOAD_OP_APPEND_VALUE)) return false;
+    if ((!key && key_len != 0) || (!value && value_len != 0)) return false;
+    if (key_len > UINT16_MAX || value_len > UINT16_MAX) {
+        payload_note_error(PAYLOAD_ERR_STRING_TOO_LONG, PAYLOAD_OP_APPEND_VALUE_LENGTH, this);
+        return false;
+    }
+    if (key_len != 0 && !payload_span_readable(key, key_len, PAYLOAD_OP_APPEND_KEY)) {
+        payload_note_bad_key(key);
+        payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER, PAYLOAD_OP_APPEND_KEY, this);
+        return false;
+    }
+    if (value_len != 0 && !payload_span_readable(value, value_len, PAYLOAD_OP_APPEND_INPUT_VALUE)) {
+        payload_note_bad_key(key);
+        payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER, PAYLOAD_OP_APPEND_INPUT_VALUE, this);
+        return false;
+    }
+    if (!payload_utf8_valid(key, key_len)) {
+        g_payload_parse_error++;
+        g_payload_json_invalid_utf8_key++;
+        payload_note_error(PAYLOAD_ERR_JSON_INVALID, PAYLOAD_OP_APPEND_VALUE_UTF8, this);
+        return false;
+    }
+    if (kind == ValueKind::STRING && !payload_utf8_valid(value, value_len)) {
+        g_payload_parse_error++;
+        g_payload_json_invalid_utf8_value++;
+        payload_note_error(PAYLOAD_ERR_JSON_INVALID, PAYLOAD_OP_APPEND_VALUE_UTF8, this);
+        return false;
+    }
+
+    const uint8_t* old_storage = _storage();
+    const size_t old_capacity = _capacity();
+    const size_t old_data_begin = _data_begin;
+
+    bool key_alias = false;
+    bool value_alias = false;
+    size_t key_offset = 0;
+    size_t value_offset = 0;
+    if (key) {
+        const uintptr_t address = (uintptr_t)key;
+        const uintptr_t begin = (uintptr_t)old_storage;
+        const uintptr_t end = begin + old_capacity;
+        if (address >= begin && address < end) {
+            key_alias = true;
+            key_offset = (size_t)(address - (uintptr_t)old_storage);
+        }
+    }
+    if (value) {
+        const uintptr_t address = (uintptr_t)value;
+        const uintptr_t begin = (uintptr_t)old_storage;
+        const uintptr_t end = begin + old_capacity;
+        if (address >= begin && address < end) {
+            value_alias = true;
+            value_offset = (size_t)(address - (uintptr_t)old_storage);
         }
     }
 
-    const uint16_t k_off = _put(key);
-    if (k_off == UINT16_MAX) {
-        _arena_used = arena_mark;
-        return;
+    const size_t additional_data = key_len + 1U + value_len + 1U;
+    int32_t shift = 0;
+    if (!_ensure_room(1U, additional_data, &shift)) return false;
+
+    uint8_t* storage = _storage();
+    if (key_alias) {
+        const size_t remapped = key_offset >= old_data_begin
+            ? (size_t)((int32_t)key_offset + shift)
+            : key_offset;
+        key = reinterpret_cast<const char*>(storage + remapped);
+    }
+    if (value_alias) {
+        const size_t remapped = value_offset >= old_data_begin
+            ? (size_t)((int32_t)value_offset + shift)
+            : value_offset;
+        value = reinterpret_cast<const char*>(storage + remapped);
     }
 
-    if (value_alias_offset != UINTPTR_MAX) {
-        value = _arena + value_alias_offset;
-    }
+    const uint16_t val_off =
+        (uint16_t)(_data_begin - (uint16_t)(value_len + 1U));
+    const uint16_t key_off =
+        (uint16_t)(val_off - (uint16_t)(key_len + 1U));
 
-    const uint16_t v_off = _put(value, value_len);
-    if (v_off == UINT16_MAX) {
-        _arena_used = arena_mark;
-        return;
-    }
+    if (value_len != 0) memmove(storage + val_off, value, value_len);
+    storage[(size_t)val_off + value_len] = '\0';
+    if (key_len != 0) memmove(storage + key_off, key, key_len);
+    storage[(size_t)key_off + key_len] = '\0';
 
-    _entries[_count++] = {
-        k_off,
-        v_off,
-        (uint16_t)value_len,
-        kind,
-        0
-    };
+    Entry entry{};
+    entry.key_off = key_off;
+    entry.key_len = (uint16_t)key_len;
+    entry.val_off = val_off;
+    entry.val_len = (uint16_t)value_len;
+    entry.kind = (uint8_t)kind;
+    entry.reserved = 0;
+
+    _entries()[_count] = entry;
+    _set_data_begin(key_off);
+    _set_count((uint16_t)(_count + 1U));
 
     if (_count > g_payload_entry_high_water_global) {
         g_payload_entry_high_water_global = _count;
     }
+    if (_count > g_payload_max_entry_capacity_seen) {
+        g_payload_max_entry_capacity_seen = _count;
+    }
+    const size_t used = _data_used();
+    if (used > g_payload_arena_high_water_global) {
+        g_payload_arena_high_water_global = (uint32_t)used;
+    }
+    return true;
+}
+bool Payload::_append_value_writer(const char* key,
+                                   size_t key_len,
+                                   size_t value_len,
+                                   ValueKind kind,
+                                   const Payload* object_value,
+                                   const PayloadArray* array_value) {
+    if (!_self_ok(PAYLOAD_OP_APPEND_WRITER)) return false;
+    if ((!object_value && !array_value) || (object_value && array_value)) return false;
+    if (key_len > UINT16_MAX || value_len > UINT16_MAX) {
+        payload_note_error(PAYLOAD_ERR_STRING_TOO_LONG, PAYLOAD_OP_APPEND_WRITER_LENGTH, this);
+        return false;
+    }
+    if (key_len != 0 && !payload_span_readable(key, key_len, PAYLOAD_OP_APPEND_WRITER_KEY)) {
+        payload_note_bad_key(key);
+        payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER, PAYLOAD_OP_APPEND_WRITER_KEY, this);
+        return false;
+    }
+    if (!payload_utf8_valid(key, key_len)) {
+        g_payload_parse_error++;
+        g_payload_json_invalid_utf8_key++;
+        payload_note_error(PAYLOAD_ERR_JSON_INVALID, PAYLOAD_OP_APPEND_WRITER_UTF8, this);
+        return false;
+    }
+    const uint8_t* old_storage = _storage();
+    const size_t old_capacity = _capacity();
+    const size_t old_data_begin = _data_begin;
+    bool key_alias = false;
+    size_t key_offset = 0;
+    if (key) {
+        const uintptr_t address = (uintptr_t)key;
+        const uintptr_t begin = (uintptr_t)old_storage;
+        const uintptr_t end = begin + old_capacity;
+        if (address >= begin && address < end) {
+            key_alias = true;
+            key_offset = (size_t)(address - (uintptr_t)old_storage);
+        }
+    }
+
+    const size_t additional_data = key_len + 1U + value_len + 1U;
+    int32_t shift = 0;
+    if (!_ensure_room(1U, additional_data, &shift)) return false;
+
+    uint8_t* storage = _storage();
+    if (key_alias) {
+        const size_t remapped = key_offset >= old_data_begin
+            ? (size_t)((int32_t)key_offset + shift)
+            : key_offset;
+        key = reinterpret_cast<const char*>(storage + remapped);
+    }
+
+    const uint16_t val_off =
+        (uint16_t)(_data_begin - (uint16_t)(value_len + 1U));
+    const uint16_t key_off =
+        (uint16_t)(val_off - (uint16_t)(key_len + 1U));
+
+    size_t written = 0;
+    if (object_value) {
+        written = object_value->_write_json_unchecked(
+            reinterpret_cast<char*>(storage + val_off));
+    } else {
+        written = array_value->_write_json_unchecked(
+            reinterpret_cast<char*>(storage + val_off));
+    }
+    if (written != value_len) {
+        payload_note_error(PAYLOAD_ERR_SERIALIZE_OVERFLOW,
+                           PAYLOAD_OP_APPEND_WRITER_WRITE,
+                           this);
+        return false;
+    }
+    storage[(size_t)val_off + value_len] = '\0';
+
+    if (key_len != 0) memmove(storage + key_off, key, key_len);
+    storage[(size_t)key_off + key_len] = '\0';
+
+    Entry entry{};
+    entry.key_off = key_off;
+    entry.key_len = (uint16_t)key_len;
+    entry.val_off = val_off;
+    entry.val_len = (uint16_t)value_len;
+    entry.kind = (uint8_t)kind;
+    entry.reserved = 0;
+
+    _entries()[_count] = entry;
+    _set_data_begin(key_off);
+    _set_count((uint16_t)(_count + 1U));
+
+    if (_count > g_payload_entry_high_water_global) {
+        g_payload_entry_high_water_global = _count;
+    }
+    if (_count > g_payload_max_entry_capacity_seen) {
+        g_payload_max_entry_capacity_seen = _count;
+    }
+    const size_t used = _data_used();
+    if (used > g_payload_arena_high_water_global) {
+        g_payload_arena_high_water_global = (uint32_t)used;
+    }
+    return true;
+}
+
+static bool payload_key_length(const char* key, size_t* out_len) {
+    if (!key) {
+        if (out_len) *out_len = 0;
+        return true;
+    }
+    return payload_cstr_len_checked(key,
+                                    Payload::ARENA_MAX,
+                                    PAYLOAD_OP_ADD_KEY,
+                                    out_len,
+                                    false);
+}
+
+static bool payload_format_checked(char* out,
+                                   size_t out_size,
+                                   int written,
+                                   uint32_t operation_id,
+                                   const void* self,
+                                   size_t* out_len) {
+    if (out_len) *out_len = 0;
+    if (!out || out_size == 0) return false;
+    if (written < 0) {
+        out[0] = '\0';
+        payload_note_error(PAYLOAD_ERR_STRING_TRUNCATION, operation_id, self);
+        return false;
+    }
+    if ((size_t)written >= out_size) {
+        out[out_size - 1U] = '\0';
+        g_payload_string_truncation++;
+        payload_note_error(PAYLOAD_ERR_STRING_TRUNCATION, operation_id, self);
+        return false;
+    }
+    if (out_len) *out_len = (size_t)written;
+    return true;
 }
 
 // ============================================================================
@@ -1810,47 +2308,94 @@ void Payload::_add_entry(const char* key, const char* value, size_t value_len, c
 // ============================================================================
 
 void Payload::add(const char* key, int32_t value) {
-    if (!_self_ok("add_i32.enter")) return;
-    char tmp[16];
-    int n = snprintf(tmp, sizeof(tmp), "%ld", (long)value);
-    if (n < 0) n = 0;
-    _add_entry(key, tmp, (size_t)n, 'p');
+    size_t key_len = 0;
+    if (!payload_key_length(key, &key_len)) {
+        payload_note_bad_key(key);
+        payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER, PAYLOAD_OP_ADD_I32_KEY, this);
+        return;
+    }
+    char text[16];
+    size_t len = 0;
+    if (!payload_format_checked(text, sizeof(text),
+                                snprintf(text, sizeof(text), "%ld", (long)value),
+                                PAYLOAD_OP_ADD_I32, this, &len)) {
+        return;
+    }
+    _append_value(key ? key : "", key_len, text, len, ValueKind::NUMBER);
 }
 
 void Payload::add(const char* key, uint32_t value) {
-    if (!_self_ok("add_u32.enter")) return;
-    char tmp[16];
-    int n = snprintf(tmp, sizeof(tmp), "%lu", (unsigned long)value);
-    if (n < 0) n = 0;
-    _add_entry(key, tmp, (size_t)n, 'p');
+    size_t key_len = 0;
+    if (!payload_key_length(key, &key_len)) {
+        payload_note_bad_key(key);
+        payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER, PAYLOAD_OP_ADD_U32_KEY, this);
+        return;
+    }
+    char text[16];
+    size_t len = 0;
+    if (!payload_format_checked(text, sizeof(text),
+                                snprintf(text, sizeof(text), "%lu", (unsigned long)value),
+                                PAYLOAD_OP_ADD_U32, this, &len)) {
+        return;
+    }
+    _append_value(key ? key : "", key_len, text, len, ValueKind::NUMBER);
 }
 
 void Payload::add(const char* key, int64_t value) {
-    if (!_self_ok("add_i64.enter")) return;
-    char tmp[24];
-    int n = snprintf(tmp, sizeof(tmp), "%lld", (long long)value);
-    if (n < 0) n = 0;
-    _add_entry(key, tmp, (size_t)n, 'p');
+    size_t key_len = 0;
+    if (!payload_key_length(key, &key_len)) {
+        payload_note_bad_key(key);
+        payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER, PAYLOAD_OP_ADD_I64_KEY, this);
+        return;
+    }
+    char text[32];
+    size_t len = 0;
+    if (!payload_format_checked(text, sizeof(text),
+                                snprintf(text, sizeof(text), "%lld", (long long)value),
+                                PAYLOAD_OP_ADD_I64, this, &len)) {
+        return;
+    }
+    _append_value(key ? key : "", key_len, text, len, ValueKind::NUMBER);
 }
 
 void Payload::add(const char* key, uint64_t value) {
-    if (!_self_ok("add_u64.enter")) return;
-    char tmp[24];
-    int n = snprintf(tmp, sizeof(tmp), "%llu", (unsigned long long)value);
-    if (n < 0) n = 0;
-    _add_entry(key, tmp, (size_t)n, 'p');
+    size_t key_len = 0;
+    if (!payload_key_length(key, &key_len)) {
+        payload_note_bad_key(key);
+        payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER, PAYLOAD_OP_ADD_U64_KEY, this);
+        return;
+    }
+    char text[32];
+    size_t len = 0;
+    if (!payload_format_checked(text, sizeof(text),
+                                snprintf(text, sizeof(text), "%llu", (unsigned long long)value),
+                                PAYLOAD_OP_ADD_U64, this, &len)) {
+        return;
+    }
+    _append_value(key ? key : "", key_len, text, len, ValueKind::NUMBER);
 }
 
 void Payload::add(const char* key, const char* value) {
-    if (!_self_ok("add_cstr.enter")) return;
-    size_t n = 0;
-    bool ok = true;
-    value = payload_cstr_or_empty(value, ARENA_MAX, "add.value", &n, &ok);
-    if (!ok) {
-        payload_note_last_string_pointer_fault_key(key);
-        payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER, "add_value", this);
+    size_t key_len = 0;
+    if (!payload_key_length(key, &key_len)) {
+        payload_note_bad_key(key);
+        payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER, PAYLOAD_OP_ADD_CSTR_KEY, this);
+        return;
     }
-    _add_entry(key, value, n, 'p');
+
+    if (!value) value = "";
+    size_t value_len = 0;
+    if (!payload_cstr_len_checked(value,
+                                  ARENA_MAX,
+                                  PAYLOAD_OP_ADD_CSTR_VALUE,
+                                  &value_len,
+                                  false)) {
+        payload_note_bad_key(key);
+        payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER, PAYLOAD_OP_ADD_CSTR_VALUE, this);
+        return;
+    }
+    _append_value(key ? key : "", key_len,
+                  value, value_len, ValueKind::STRING);
 }
 
 void Payload::add(const char* key, const String& value) {
@@ -1858,604 +2403,525 @@ void Payload::add(const char* key, const String& value) {
 }
 
 void Payload::add(const char* key, bool value) {
-    if (!_self_ok("add_bool.enter")) return;
-    const char* s = value ? "true" : "false";
-    _add_entry(key, s, value ? 4U : 5U, 'p');
-}
-
-void Payload::add(const char* key, float value) {
-    if (!_self_ok("add_float.enter")) return;
-    char tmp[32];
-    int n = snprintf(tmp, sizeof(tmp), "%.6f", (double)value);
-    if (n < 0) n = 0;
-    if ((size_t)n >= sizeof(tmp)) {
-        n = (int)sizeof(tmp) - 1;
-        g_payload_string_truncation++;
-        payload_note_error(PAYLOAD_ERR_STRING_TRUNCATION, "add_float", this);
+    size_t key_len = 0;
+    if (!payload_key_length(key, &key_len)) {
+        payload_note_bad_key(key);
+        payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER, PAYLOAD_OP_ADD_BOOL_KEY, this);
+        return;
     }
-    _add_entry(key, tmp, (size_t)n, 'p');
+    const char* text = value ? "true" : "false";
+    _append_value(key ? key : "", key_len,
+                  text, value ? 4U : 5U, ValueKind::BOOLEAN);
 }
 
-void Payload::add(const char* key, double value) {
-    if (!_self_ok("add_double.enter")) return;
-    char tmp[32];
-    int n = snprintf(tmp, sizeof(tmp), "%.6f", value);
-    if (n < 0) n = 0;
-    if ((size_t)n >= sizeof(tmp)) {
-        n = (int)sizeof(tmp) - 1;
-        g_payload_string_truncation++;
-        payload_note_error(PAYLOAD_ERR_STRING_TRUNCATION, "add_double", this);
-    }
-    _add_entry(key, tmp, (size_t)n, 'p');
-}
-
-void Payload::add(const char* key, double value, int precision) {
-    if (!_self_ok("add_double_prec.enter")) return;
-    if (precision < 0) precision = 0;
-    if (precision > 12) precision = 12;
-
-    char fmt[16];
-    snprintf(fmt, sizeof(fmt), "%%.%df", precision);
-    char tmp[48];
-    int n = snprintf(tmp, sizeof(tmp), fmt, value);
-    if (n < 0) n = 0;
-    if ((size_t)n >= sizeof(tmp)) {
-        n = (int)sizeof(tmp) - 1;
-        g_payload_string_truncation++;
-        payload_note_error(PAYLOAD_ERR_STRING_TRUNCATION, "add_double_prec", this);
-    }
-    _add_entry(key, tmp, (size_t)n, 'p');
-}
-
-void Payload::add_fmt(const char* key, const char* fmt, ...) {
-    if (!_self_ok("add_fmt")) return;
-
-    size_t fmt_len = 0;
-    bool fmt_ok = true;
-    fmt = payload_cstr_or_empty(fmt, 96U, "add_fmt.fmt", &fmt_len, &fmt_ok);
-    (void)fmt_len;
-    if (!fmt_ok) {
-        payload_note_last_string_pointer_fault_key(key);
-        payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER, "add_fmt_fmt", this);
-    }
-
-    char tmp[128];
-    va_list args;
-    va_start(args, fmt);
-    int n = vsnprintf(tmp, sizeof(tmp), fmt, args);
-    va_end(args);
-
-    if (n < 0) n = 0;
-    if ((size_t)n >= sizeof(tmp)) {
-        n = (int)(sizeof(tmp) - 1);
-        g_payload_string_truncation++;
-        payload_note_error(PAYLOAD_ERR_STRING_TRUNCATION, "add_fmt", this);
-    }
-
-    _add_entry(key, tmp, (size_t)n, 'p');
-}
-
-// Estimate a bounded starting buffer for serializing a nested Payload.  The
-// exact size depends on escaping, so callers retry upward when needed.
-static size_t payload_initial_json_buffer_size(const Payload& obj) {
-    size_t buf_size = (obj.arena_used() * 2U) + (obj.count() * 32U) + 64U;
-    if (buf_size < 256U) buf_size = 256U;
-    if (buf_size > Payload::ARENA_MAX) buf_size = Payload::ARENA_MAX;
-    return buf_size;
-}
-
-void Payload::add_object(const char* key, const Payload& obj) {
-    if (!_self_ok("add_object")) return;
-    if (_count >= MAX_ENTRIES) {
-        g_payload_entry_overflow++;
-        payload_note_error(PAYLOAD_ERR_ENTRY_OVERFLOW, "add_object", this);
+void Payload::_add_floating(const char* key,
+                            double value,
+                            int precision,
+                            uint32_t operation_id) {
+    size_t key_len = 0;
+    if (!payload_key_length(key, &key_len)) {
+        payload_note_bad_key(key);
+        payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER, operation_id, this);
         return;
     }
 
-    size_t buf_size = payload_initial_json_buffer_size(obj);
-    bool added = false;
+    if (precision < 0) precision = 0;
+    if (precision > 12) precision = 12;
 
-    while (buf_size <= ARENA_MAX) {
-        char* json_buf = (char*)malloc(buf_size);
-        if (!json_buf) {
-            g_payload_arena_alloc_fail++;
-            payload_note_error(PAYLOAD_ERR_ARENA_ALLOC_FAIL, "add_object_tmp", this);
-            break;
-        }
-
-        size_t json_len = obj.write_json(json_buf, buf_size);
-        if (json_len != 0) {
-            _add_entry(key, json_buf, json_len, 'o');
-            added = true;
-            free(json_buf);
-            break;
-        }
-
-        free(json_buf);
-        if (buf_size == ARENA_MAX) break;
-        buf_size *= 2U;
-        if (buf_size > ARENA_MAX) buf_size = ARENA_MAX;
+    char format[16];
+    const int format_n = snprintf(format, sizeof(format), "%%.%df", precision);
+    if (format_n <= 0 || (size_t)format_n >= sizeof(format)) {
+        payload_note_error(PAYLOAD_ERR_STRING_TRUNCATION, operation_id, this);
+        return;
     }
 
-    if (!added) {
-        g_payload_serialize_overflow++;
-        payload_note_error(PAYLOAD_ERR_SERIALIZE_OVERFLOW, "add_object_json", this);
-        _add_entry(key, "{}", 2, 'o');
+    char text[64];
+    size_t len = 0;
+    if (!payload_format_checked(text, sizeof(text),
+                                snprintf(text, sizeof(text), format, value),
+                                operation_id, this, &len)) {
+        return;
     }
+
+    const ValueKind kind = isfinite(value)
+        ? ValueKind::NUMBER
+        : ValueKind::STRING;
+    _append_value(key ? key : "", key_len, text, len, kind);
+}
+
+void Payload::add(const char* key, float value) {
+    _add_floating(key, (double)value, 6, PAYLOAD_OP_ADD_FLOAT);
+}
+
+void Payload::add(const char* key, double value) {
+    _add_floating(key, value, 6, PAYLOAD_OP_ADD_DOUBLE);
+}
+
+void Payload::add(const char* key, double value, int precision) {
+    _add_floating(key, value, precision, PAYLOAD_OP_ADD_DOUBLE_PRECISION);
+}
+
+void Payload::add_fmt(const char* key, const char* fmt, ...) {
+    size_t key_len = 0;
+    if (!payload_key_length(key, &key_len)) {
+        payload_note_bad_key(key);
+        payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER, PAYLOAD_OP_ADD_FMT_KEY, this);
+        return;
+    }
+
+    if (!fmt) fmt = "";
+    size_t fmt_len = 0;
+    if (!payload_cstr_len_checked(fmt, 96U, PAYLOAD_OP_ADD_FMT_FORMAT, &fmt_len, false)) {
+        (void)fmt_len;
+        payload_note_bad_key(key);
+        payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER, PAYLOAD_OP_ADD_FMT_FORMAT, this);
+        return;
+    }
+
+    char text[128];
+    va_list args;
+    va_start(args, fmt);
+    const int n = vsnprintf(text, sizeof(text), fmt, args);
+    va_end(args);
+
+    size_t value_len = 0;
+    if (!payload_format_checked(text, sizeof(text), n,
+                                PAYLOAD_OP_ADD_FMT, this, &value_len)) {
+        return;
+    }
+    _append_value(key ? key : "", key_len,
+                  text, value_len, ValueKind::STRING);
+}
+
+void Payload::add_object(const char* key, const Payload& obj) {
+    size_t key_len = 0;
+    if (!payload_key_length(key, &key_len)) {
+        payload_note_bad_key(key);
+        payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER, PAYLOAD_OP_ADD_OBJECT_KEY, this);
+        return;
+    }
+    const size_t value_len = obj._json_size();
+    if (value_len == 0 || value_len > UINT16_MAX) {
+        payload_note_error(PAYLOAD_ERR_SERIALIZE_OVERFLOW, PAYLOAD_OP_ADD_OBJECT_VALUE, this);
+        return;
+    }
+    _append_value_writer(key ? key : "", key_len,
+                         value_len, ValueKind::OBJECT, &obj, nullptr);
 }
 
 void Payload::add_array(const char* key, const PayloadArray& arr) {
-    if (!_self_ok("add_array")) return;
-    String json = arr.to_json();
-    _add_entry(key, json.c_str(), json.length(), 'a');
+    size_t key_len = 0;
+    if (!payload_key_length(key, &key_len)) {
+        payload_note_bad_key(key);
+        payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER, PAYLOAD_OP_ADD_ARRAY_KEY, this);
+        return;
+    }
+    const size_t value_len = arr._json_size();
+    if (value_len == 0 || value_len > UINT16_MAX) {
+        payload_note_error(PAYLOAD_ERR_SERIALIZE_OVERFLOW, PAYLOAD_OP_ADD_ARRAY_VALUE, this);
+        return;
+    }
+    _append_value_writer(key ? key : "", key_len,
+                         value_len, ValueKind::ARRAY, nullptr, &arr);
 }
 
 void Payload::add_raw_object(const char* key, const char* raw_json_object) {
-    size_t n = 0;
-    bool ok = raw_json_object &&
-              payload_memory_readable(raw_json_object, 1U, "add_raw_object.head") &&
-              raw_json_object[0] == '{' &&
-              payload_cstr_len_checked(raw_json_object, ARENA_MAX, false,
-                                       "add_raw_object.value", &n);
-    if (!ok) {
-        g_payload_parse_error++;
-        payload_note_error(PAYLOAD_ERR_PARSE_ERROR, "add_raw_object", this);
-        raw_json_object = "{}";
-        n = 2U;
+    size_t key_len = 0;
+    if (!payload_key_length(key, &key_len)) {
+        payload_note_bad_key(key);
+        payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER, PAYLOAD_OP_ADD_RAW_KEY, this);
+        return;
     }
-    _add_entry(key, raw_json_object, n, 'o');
+
+    size_t value_len = 0;
+    json_value_span_t span;
+    if (!raw_json_object ||
+        !payload_cstr_len_checked(raw_json_object,
+                                  ARENA_MAX,
+                                  PAYLOAD_OP_ADD_RAW_VALUE,
+                                  &value_len,
+                                  false) ||
+        !json_validate_exact(reinterpret_cast<const uint8_t*>(raw_json_object),
+                             value_len,
+                             json_value_type_t::OBJECT,
+                             &span)) {
+        g_payload_parse_error++;
+        g_payload_json_invalid_raw_object++;
+        payload_note_error(PAYLOAD_ERR_JSON_INVALID, PAYLOAD_OP_ADD_RAW_VALUE, this);
+        return;
+    }
+    _append_value(key ? key : "", key_len,
+                  raw_json_object + span.begin,
+                  span.end - span.begin,
+                  ValueKind::OBJECT);
 }
 
 // ============================================================================
-// JSON Serialization
+// Serialization
 // ============================================================================
 
-static bool is_json_number_literal(const char* s) {
-    const size_t len = payload_owned_strlen_bounded(s, Payload::ARENA_MAX);
-    if (len == 0 || len >= Payload::ARENA_MAX) return false;
+size_t Payload::_json_size() const {
+    if (!_layout_ok(PAYLOAD_OP_JSON_SIZE)) return 0;
 
-    size_t i = 0;
-    if (s[i] == '-') {
-        i++;
-        if (i >= len) return false;
+    size_t total = 2U;  // {}
+    const Entry* entries = _entries();
+    const uint8_t* storage = _storage();
+
+    for (size_t i = 0; i < _count; ++i) {
+        const Entry& e = entries[i];
+        const char* value =
+            reinterpret_cast<const char*>(storage + e.val_off);
+        bool value_valid = true;
+        switch ((ValueKind)e.kind) {
+            case ValueKind::STRING:
+                value_valid = payload_utf8_valid(value, e.val_len);
+                break;
+            case ValueKind::NUMBER:
+                value_valid = json_number_token_valid(value, e.val_len);
+                break;
+            case ValueKind::BOOLEAN:
+                value_valid =
+                    (e.val_len == 4U && memcmp(value, "true", 4U) == 0) ||
+                    (e.val_len == 5U && memcmp(value, "false", 5U) == 0);
+                break;
+            case ValueKind::NIL:
+                value_valid = e.val_len == 4U && memcmp(value, "null", 4U) == 0;
+                break;
+            case ValueKind::OBJECT:
+                value_valid = json_validate_exact(
+                    reinterpret_cast<const uint8_t*>(value),
+                    e.val_len,
+                    json_value_type_t::OBJECT);
+                break;
+            case ValueKind::ARRAY:
+                value_valid = json_validate_exact(
+                    reinterpret_cast<const uint8_t*>(value),
+                    e.val_len,
+                    json_value_type_t::ARRAY);
+                break;
+            default:
+                value_valid = false;
+                break;
+        }
+        if (!value_valid ||
+            !payload_utf8_valid(
+                reinterpret_cast<const char*>(storage + e.key_off),
+                e.key_len)) {
+            g_payload_invalid_kind++;
+            payload_note_integrity(PAYLOAD_SELF_OK_ENTRY_KIND_BAD,
+                                   PAYLOAD_OP_JSON_SIZE_VALUE, this);
+            return 0;
+        }
+
+        const size_t key_size = json_escaped_size(
+            reinterpret_cast<const char*>(storage + e.key_off), e.key_len);
+        if (key_size == SIZE_MAX) return 0;
+
+        size_t value_size = e.val_len;
+        if ((ValueKind)e.kind == ValueKind::STRING) {
+            const size_t escaped = json_escaped_size(
+                reinterpret_cast<const char*>(storage + e.val_off), e.val_len);
+            if (escaped == SIZE_MAX || escaped > SIZE_MAX - 2U) return 0;
+            value_size = escaped + 2U;
+        }
+
+        // comma + quoted key + colon + value. The first entry has no comma.
+        if (i != 0 && !json_size_add(&total, 1U)) return 0;
+        if (!json_size_add(&total, 2U + key_size + 1U)) return 0;
+        if (!json_size_add(&total, value_size)) return 0;
     }
+    return total;
+}
 
-    if (s[i] == '0') {
-        i++;
-    } else if (s[i] >= '1' && s[i] <= '9') {
-        while (i < len && isdigit((unsigned char)s[i])) i++;
-    } else {
-        return false;
+size_t Payload::_write_json_unchecked(char* buf) const {
+    if (!buf) return 0;
+    char* out = buf;
+    *out++ = '{';
+
+    const Entry* entries = _entries();
+    const uint8_t* storage = _storage();
+    for (size_t i = 0; i < _count; ++i) {
+        const Entry& e = entries[i];
+        if (i != 0) *out++ = ',';
+        *out++ = '"';
+        out += json_write_escaped(out,
+                                  reinterpret_cast<const char*>(storage + e.key_off),
+                                  e.key_len);
+        *out++ = '"';
+        *out++ = ':';
+
+        const ValueKind kind = (ValueKind)e.kind;
+        if (kind == ValueKind::STRING) {
+            *out++ = '"';
+            out += json_write_escaped(out,
+                                      reinterpret_cast<const char*>(storage + e.val_off),
+                                      e.val_len);
+            *out++ = '"';
+        } else {
+            if (e.val_len != 0) {
+                memcpy(out, storage + e.val_off, e.val_len);
+                out += e.val_len;
+            }
+        }
     }
-
-    if (i < len && s[i] == '.') {
-        i++;
-        if (i >= len || !isdigit((unsigned char)s[i])) return false;
-        while (i < len && isdigit((unsigned char)s[i])) i++;
-    }
-
-    if (i < len && (s[i] == 'e' || s[i] == 'E')) {
-        i++;
-        if (i < len && (s[i] == '+' || s[i] == '-')) i++;
-        if (i >= len || !isdigit((unsigned char)s[i])) return false;
-        while (i < len && isdigit((unsigned char)s[i])) i++;
-    }
-
-    return i == len;
+    *out++ = '}';
+    *out = '\0';
+    return (size_t)(out - buf);
 }
 
 size_t Payload::write_json(char* buf, size_t buf_size) const {
-    if (!buf || buf_size < 3) {
-        if (buf && buf_size > 0) buf[0] = '\0';
+    if (!buf || buf_size == 0) {
         g_payload_serialize_overflow++;
-        payload_note_error(PAYLOAD_ERR_SERIALIZE_OVERFLOW, "write_json_buf", this);
+        payload_note_error(PAYLOAD_ERR_SERIALIZE_OVERFLOW, PAYLOAD_OP_WRITE_JSON_BUFFER, this);
         return 0;
     }
+    buf[0] = '\0';
 
-    if (!_self_ok("write_json")) {
-        buf[0] = '\0';
-        return 0;
-    }
-
-    size_t pos = 0;
-    bool overflow = false;
-
-    auto remaining = [&]() -> size_t {
-        return buf_size - pos - 1U;
-    };
-
-    auto append_char = [&](char c) {
-        if (overflow) return;
-        if (remaining() < 1U) { overflow = true; return; }
-        buf[pos++] = c;
-    };
-
-    auto append_str = [&](const char* s, size_t n) {
-        if (overflow || !s) return;
-        if (n > remaining()) { overflow = true; return; }
-        memcpy(buf + pos, s, n);
-        pos += n;
-    };
-
-    auto append = [&](const char* s) {
-        if (overflow || !s) return;
-        const size_t n = payload_owned_strlen_bounded(s, ARENA_MAX);
-        if (n >= ARENA_MAX) { overflow = true; return; }
-        append_str(s, n);
-    };
-
-    auto append_escaped = [&](const char* s) {
-        if (overflow || !s) return;
-        const size_t n = payload_owned_strlen_bounded(s, ARENA_MAX);
-        if (n >= ARENA_MAX) { overflow = true; return; }
-
-        for (size_t idx = 0; idx < n; idx++) {
-            const unsigned char c = (unsigned char)s[idx];
-            switch (c) {
-                case '"': append_str("\\\"", 2); break;
-                case '\\': append_str("\\\\", 2); break;
-                case '\n': append_str("\\n", 2);  break;
-                case '\r': append_str("\\r", 2);  break;
-                case '\t': append_str("\\t", 2);  break;
-                default:
-                    if (c < 0x20U) {
-                        char esc[7];
-                        snprintf(esc, sizeof(esc), "\\u%04X", (unsigned)c);
-                        append_str(esc, 6);
-                    } else {
-                        append_char((char)c);
-                    }
-                    break;
-            }
-            if (overflow) return;
-        }
-    };
-
-    append_char('{');
-
-    for (size_t i = 0; i < _count && !overflow; i++) {
-        if (i) append_char(',');
-
-        const Entry& e = _entries[i];
-        size_t key_len = 0;
-        size_t val_len = 0;
-        if (!_entry_key_ok(e, "write_json.key", &key_len) ||
-            !_entry_value_ok(e, "write_json.value", &val_len)) {
-            overflow = true;
-            break;
-        }
-        const char* key = _arena + e.key_off;
-        const char* val = _arena + e.val_off;
-
-        append_char('"');
-        append_escaped(key);
-        append_str("\":", 2);
-
-        if (overflow) break;
-
-        switch (e.kind) {
-            case 'p': {
-                if (payload_cstr_equals_literal(val, "true", "write_json.true") ||
-                    payload_cstr_equals_literal(val, "false", "write_json.false") ||
-                    payload_cstr_equals_literal(val, "null", "write_json.null") ||
-                    is_json_number_literal(val)) {
-                    append(val);
-                } else {
-                    append_char('"');
-                    append_escaped(val);
-                    append_char('"');
-                }
-                break;
-            }
-
-            case 'o':
-            case 'a':
-                append_str(val, e.val_len);
-                break;
-
-            default:
-                g_payload_invalid_kind++;
-                payload_note_error(PAYLOAD_ERR_INVALID_KIND, "write_json_kind", this);
-                append_str("null", 4);
-                break;
-        }
-    }
-
-    append_char('}');
-
-    if (overflow) {
-        buf[0] = '\0';
+    const size_t needed = _json_size();
+    if (needed == 0 || needed + 1U > buf_size) {
         g_payload_serialize_overflow++;
-        payload_note_error(PAYLOAD_ERR_SERIALIZE_OVERFLOW, "write_json_overflow", this);
+        payload_note_error(PAYLOAD_ERR_SERIALIZE_OVERFLOW, PAYLOAD_OP_WRITE_JSON_SIZE, this);
         return 0;
     }
-
-    buf[pos] = '\0';
-    return pos;
+    return _write_json_unchecked(buf);
 }
 
 String Payload::to_json() const {
-    if (!_self_ok("to_json")) {
+    const size_t needed = _json_size();
+    if (needed == 0 || needed > UINT16_MAX) {
         g_payload_to_json_fail++;
+        payload_note_error(PAYLOAD_ERR_TO_JSON_FAIL, PAYLOAD_OP_TO_JSON_SIZE, this);
         return String("{}");
     }
 
-    size_t buf_size = payload_initial_json_buffer_size(*this);
-
-    while (buf_size <= ARENA_MAX) {
-        char* json_buf = (char*)malloc(buf_size);
-        if (!json_buf) {
-            g_payload_arena_alloc_fail++;
-            payload_note_error(PAYLOAD_ERR_ARENA_ALLOC_FAIL, "to_json_alloc", this);
-            break;
-        }
-
-        const size_t json_len = write_json(json_buf, buf_size);
-        if (json_len != 0) {
-            String out(json_buf);
-            free(json_buf);
-            return out;
-        }
-
-        free(json_buf);
-        if (buf_size == ARENA_MAX) break;
-        buf_size *= 2U;
-        if (buf_size > ARENA_MAX) buf_size = ARENA_MAX;
+    char* buffer = static_cast<char*>(malloc(needed + 1U));
+    if (!buffer) {
+        g_payload_arena_alloc_fail++;
+        g_payload_to_json_fail++;
+        payload_note_error(PAYLOAD_ERR_ARENA_ALLOC_FAIL, PAYLOAD_OP_TO_JSON_ALLOC, this);
+        return String("{}");
     }
 
-    g_payload_to_json_fail++;
-    payload_note_error(PAYLOAD_ERR_TO_JSON_FAIL, "to_json", this);
-    return String("{}");
+    const size_t written = _write_json_unchecked(buffer);
+    if (written != needed) {
+        free(buffer);
+        g_payload_to_json_fail++;
+        payload_note_error(PAYLOAD_ERR_TO_JSON_FAIL, PAYLOAD_OP_TO_JSON_WRITE, this);
+        return String("{}");
+    }
+
+    String result(buffer);
+    free(buffer);
+    return result;
 }
 
 // ============================================================================
-// Parsing — canonicalizes JSON into entries[] + arena
+// Parsing
 // ============================================================================
 
-static void skip_ws(const uint8_t* data, size_t len, size_t& i) {
-    while (i < len && (data[i] == ' ' || data[i] == '\t' ||
-                       data[i] == '\n' || data[i] == '\r')) {
-        i++;
+static uint8_t payload_kind_code_from_json_type(json_value_type_t type) {
+    switch (type) {
+        case json_value_type_t::STRING: return 1U;
+        case json_value_type_t::NUMBER: return 2U;
+        case json_value_type_t::BOOLEAN: return 3U;
+        case json_value_type_t::NIL: return 4U;
+        case json_value_type_t::OBJECT: return 5U;
+        case json_value_type_t::ARRAY: return 6U;
+        default: return 0U;
     }
-}
-
-static bool scan_json_string(const uint8_t* data, size_t len, size_t& i,
-                             size_t& content_start, size_t& content_len) {
-    if (i >= len || data[i] != '"') return false;
-    content_start = ++i;
-
-    bool escape = false;
-    while (i < len) {
-        const uint8_t c = data[i];
-        if (escape) {
-            escape = false;
-            i++;
-            continue;
-        }
-        if (c == '\\') {
-            escape = true;
-            i++;
-            continue;
-        }
-        if (c == '"') {
-            content_len = i - content_start;
-            i++;
-            return true;
-        }
-        i++;
-    }
-    return false;
-}
-
-static bool scan_json_balanced(const uint8_t* data, size_t len, size_t& i,
-                               uint8_t open_c, uint8_t close_c,
-                               size_t& value_start, size_t& value_len) {
-    (void)open_c;
-    (void)close_c;
-    if (i >= len || (data[i] != '{' && data[i] != '[')) return false;
-    value_start = i;
-
-    int brace_depth = 0;
-    int bracket_depth = 0;
-    bool in_string = false;
-    bool escape = false;
-
-    while (i < len) {
-        const uint8_t c = data[i++];
-
-        if (in_string) {
-            if (escape) {
-                escape = false;
-            } else if (c == '\\') {
-                escape = true;
-            } else if (c == '"') {
-                in_string = false;
-            }
-            continue;
-        }
-
-        if (c == '"') {
-            in_string = true;
-            continue;
-        }
-        if (c == '{') brace_depth++;
-        else if (c == '}') brace_depth--;
-        else if (c == '[') bracket_depth++;
-        else if (c == ']') bracket_depth--;
-
-        if (brace_depth < 0 || bracket_depth < 0) {
-            return false;
-        }
-        if (brace_depth == 0 && bracket_depth == 0) {
-            value_len = i - value_start;
-            return true;
-        }
-    }
-    return false;
-}
-
-static bool scan_json_primitive(const uint8_t* data, size_t len, size_t& i,
-                                size_t& value_start, size_t& value_len) {
-    value_start = i;
-    while (i < len && data[i] != ',' && data[i] != '}') {
-        i++;
-    }
-    value_len = i - value_start;
-    while (value_len > 0) {
-        const uint8_t c = data[value_start + value_len - 1U];
-        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
-            value_len--;
-        } else {
-            break;
-        }
-    }
-    return value_len > 0;
 }
 
 bool Payload::parseJSON(const uint8_t* data, size_t len) {
-    clear();
-
-    if (!data || len < 2) {
+    if (!data || len < 2U || len > ARENA_MAX ||
+        !payload_span_readable(data, len, PAYLOAD_OP_PARSEJSON_DATA)) {
+        clear();
         g_payload_parse_error++;
-        payload_note_error(PAYLOAD_ERR_PARSE_ERROR, "parse_null", this);
+        g_payload_json_invalid_syntax++;
+            payload_note_error(PAYLOAD_ERR_PARSE_ERROR, PAYLOAD_OP_PARSEJSON_DATA, this);
         return false;
     }
 
-    if (!payload_memory_readable(data, len, "parseJSON.data")) {
+    json_cursor_t c{data, len, 0};
+    json_skip_ws(c);
+    if (c.pos >= c.len || c.data[c.pos] != '{') {
+        clear();
         g_payload_parse_error++;
-        payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER, "parse_data", this);
+        g_payload_json_invalid_syntax++;
+            payload_note_error(PAYLOAD_ERR_PARSE_ERROR, PAYLOAD_OP_PARSEJSON_OPEN, this);
         return false;
     }
+    ++c.pos;
+    json_skip_ws(c);
 
-    size_t i = 0;
-    skip_ws(data, len, i);
-    if (i >= len || data[i] != '{') {
-        g_payload_parse_error++;
-        payload_note_error(PAYLOAD_ERR_PARSE_ERROR, "parse_open", this);
-        return false;
-    }
-    i++;
-
-    skip_ws(data, len, i);
-    if (i < len && data[i] == '}') {
+    Payload parsed;
+    if (c.pos < c.len && c.data[c.pos] == '}') {
+        ++c.pos;
+        json_skip_ws(c);
+        if (c.pos != c.len) {
+            clear();
+            g_payload_parse_error++;
+            g_payload_json_invalid_syntax++;
+            payload_note_error(PAYLOAD_ERR_PARSE_ERROR, PAYLOAD_OP_PARSEJSON_TRAILING, this);
+            return false;
+        }
+        *this = static_cast<Payload&&>(parsed);
         return true;
     }
 
-    while (i < len) {
-        skip_ws(data, len, i);
-
-        size_t key_start = 0;
-        size_t key_len = 0;
-        if (!scan_json_string(data, len, i, key_start, key_len)) {
+    while (c.pos < c.len) {
+        size_t key_begin = 0;
+        size_t key_end = 0;
+        size_t key_decoded_len = 0;
+        if (!json_scan_string(c, &key_begin, &key_end, &key_decoded_len)) {
+            clear();
             g_payload_parse_error++;
-            payload_note_error(PAYLOAD_ERR_PARSE_ERROR, "parse_key", this);
+            g_payload_json_invalid_syntax++;
+            payload_note_error(PAYLOAD_ERR_PARSE_ERROR, PAYLOAD_OP_PARSEJSON_KEY, this);
             return false;
         }
 
-        skip_ws(data, len, i);
-        if (i >= len || data[i] != ':') {
+        json_skip_ws(c);
+        if (c.pos >= c.len || c.data[c.pos] != ':') {
+            clear();
             g_payload_parse_error++;
-            payload_note_error(PAYLOAD_ERR_PARSE_ERROR, "parse_colon", this);
+            g_payload_json_invalid_syntax++;
+            payload_note_error(PAYLOAD_ERR_PARSE_ERROR, PAYLOAD_OP_PARSEJSON_COLON, this);
             return false;
         }
-        i++;
-        skip_ws(data, len, i);
-        if (i >= len) {
+        ++c.pos;
+
+        json_value_span_t value;
+        if (!json_scan_value(c, 1U, &value)) {
+            clear();
             g_payload_parse_error++;
-            payload_note_error(PAYLOAD_ERR_PARSE_ERROR, "parse_value_missing", this);
+            g_payload_json_invalid_syntax++;
+            payload_note_error(PAYLOAD_ERR_PARSE_ERROR, PAYLOAD_OP_PARSEJSON_VALUE, this);
             return false;
         }
 
-        char kind = 'p';
-        size_t value_start = i;
-        size_t value_len = 0;
+        const size_t value_stored_len =
+            value.type == json_value_type_t::STRING
+                ? value.decoded_length
+                : value.end - value.begin;
+        if (key_decoded_len > UINT16_MAX || value_stored_len > UINT16_MAX) {
+            clear();
+            g_payload_parse_error++;
+            payload_note_error(PAYLOAD_ERR_ARENA_LIMIT, PAYLOAD_OP_PARSEJSON_LENGTH, this);
+            return false;
+        }
 
-        if (data[i] == '"') {
-            if (!scan_json_string(data, len, i, value_start, value_len)) {
+        const size_t additional_data =
+            key_decoded_len + 1U + value_stored_len + 1U;
+        if (!parsed._ensure_room(1U, additional_data, nullptr)) {
+            clear();
+            g_payload_parse_error++;
+            payload_note_error(PAYLOAD_ERR_ARENA_ALLOC_FAIL, PAYLOAD_OP_PARSEJSON_RESERVE, this);
+            return false;
+        }
+
+        uint8_t* storage = parsed._storage();
+        const uint16_t val_off =
+            (uint16_t)(parsed._data_begin - (uint16_t)(value_stored_len + 1U));
+        const uint16_t key_off =
+            (uint16_t)(val_off - (uint16_t)(key_decoded_len + 1U));
+
+        if (!json_decode_string(data,
+                                key_begin,
+                                key_end,
+                                reinterpret_cast<char*>(storage + key_off),
+                                key_decoded_len)) {
+            clear();
+            g_payload_parse_error++;
+            g_payload_json_decode_fail++;
+            payload_note_error(PAYLOAD_ERR_PARSE_ERROR, PAYLOAD_OP_PARSEJSON_KEY_DECODE, this);
+            return false;
+        }
+
+        if (value.type == json_value_type_t::STRING) {
+            if (!json_decode_string(data,
+                                    value.begin,
+                                    value.end,
+                                    reinterpret_cast<char*>(storage + val_off),
+                                    value.decoded_length)) {
+                clear();
                 g_payload_parse_error++;
-                payload_note_error(PAYLOAD_ERR_PARSE_ERROR, "parse_string", this);
+                g_payload_json_decode_fail++;
+            payload_note_error(PAYLOAD_ERR_PARSE_ERROR, PAYLOAD_OP_PARSEJSON_VALUE_DECODE, this);
                 return false;
             }
-            kind = 'p';
-        } else if (data[i] == '{') {
-            if (!scan_json_balanced(data, len, i, '{', '}', value_start, value_len)) {
-                g_payload_parse_error++;
-                payload_note_error(PAYLOAD_ERR_PARSE_ERROR, "parse_object", this);
-                return false;
-            }
-            kind = 'o';
-        } else if (data[i] == '[') {
-            if (!scan_json_balanced(data, len, i, '[', ']', value_start, value_len)) {
-                g_payload_parse_error++;
-                payload_note_error(PAYLOAD_ERR_PARSE_ERROR, "parse_array", this);
-                return false;
-            }
-            kind = 'a';
         } else {
-            if (!scan_json_primitive(data, len, i, value_start, value_len)) {
+            if (value_stored_len != 0) {
+                memcpy(storage + val_off,
+                       data + value.begin,
+                       value_stored_len);
+            }
+            storage[(size_t)val_off + value_stored_len] = '\0';
+        }
+
+        Entry entry{};
+        entry.key_off = key_off;
+        entry.key_len = (uint16_t)key_decoded_len;
+        entry.val_off = val_off;
+        entry.val_len = (uint16_t)value_stored_len;
+        entry.kind = payload_kind_code_from_json_type(value.type);
+        entry.reserved = 0;
+
+        parsed._entries()[parsed._count] = entry;
+        parsed._set_data_begin(key_off);
+        parsed._set_count((uint16_t)(parsed._count + 1U));
+
+        if (parsed._count > g_payload_entry_high_water_global) {
+            g_payload_entry_high_water_global = parsed._count;
+        }
+        if (parsed._count > g_payload_max_entry_capacity_seen) {
+            g_payload_max_entry_capacity_seen = parsed._count;
+        }
+        const size_t used = parsed._data_used();
+        if (used > g_payload_arena_high_water_global) {
+            g_payload_arena_high_water_global = (uint32_t)used;
+        }
+
+        json_skip_ws(c);
+        if (c.pos >= c.len) {
+            clear();
+            g_payload_parse_error++;
+            g_payload_json_invalid_syntax++;
+            payload_note_error(PAYLOAD_ERR_PARSE_ERROR, PAYLOAD_OP_PARSEJSON_EOF, this);
+            return false;
+        }
+        if (c.data[c.pos] == '}') {
+            ++c.pos;
+            json_skip_ws(c);
+            if (c.pos != c.len) {
+                clear();
                 g_payload_parse_error++;
-                payload_note_error(PAYLOAD_ERR_PARSE_ERROR, "parse_primitive", this);
+                g_payload_json_invalid_syntax++;
+            payload_note_error(PAYLOAD_ERR_PARSE_ERROR, PAYLOAD_OP_PARSEJSON_TRAILING, this);
                 return false;
             }
-            kind = 'p';
-        }
-
-        if (_count >= MAX_ENTRIES) {
-            g_payload_entry_overflow++;
-            payload_note_error(PAYLOAD_ERR_ENTRY_OVERFLOW, "parse_entries", this);
-            return false;
-        }
-
-        if (!_ensure_entries(_count + 1U)) return false;
-
-        const size_t arena_mark = _arena_used;
-        const uint16_t k_off = _put((const char*)(data + key_start), key_len);
-        if (k_off == UINT16_MAX) {
-            _arena_used = arena_mark;
-            return false;
-        }
-
-        const uint16_t v_off = _put((const char*)(data + value_start), value_len);
-        if (v_off == UINT16_MAX) {
-            _arena_used = arena_mark;
-            return false;
-        }
-
-        _entries[_count++] = {
-            k_off,
-            v_off,
-            (uint16_t)value_len,
-            kind,
-            0
-        };
-
-        if (_count > g_payload_entry_high_water_global) {
-            g_payload_entry_high_water_global = _count;
-        }
-
-        skip_ws(data, len, i);
-        if (i < len && data[i] == ',') {
-            i++;
-            continue;
-        }
-        if (i < len && data[i] == '}') {
+            *this = static_cast<Payload&&>(parsed);
             return true;
         }
-
-        // Permit trailing whitespace after the closing object only.
-        if (i >= len) break;
-        g_payload_parse_error++;
-        payload_note_error(PAYLOAD_ERR_PARSE_ERROR, "parse_separator", this);
-        return false;
+        if (c.data[c.pos] != ',') {
+            clear();
+            g_payload_parse_error++;
+            g_payload_json_invalid_syntax++;
+            payload_note_error(PAYLOAD_ERR_PARSE_ERROR, PAYLOAD_OP_PARSEJSON_SEPARATOR, this);
+            return false;
+        }
+        ++c.pos;
+        json_skip_ws(c);
     }
 
+    clear();
     g_payload_parse_error++;
-    payload_note_error(PAYLOAD_ERR_PARSE_ERROR, "parse_eof", this);
+    g_payload_json_invalid_syntax++;
+            payload_note_error(PAYLOAD_ERR_PARSE_ERROR, PAYLOAD_OP_PARSEJSON_UNCLOSED, this);
     return false;
 }
 
 // ============================================================================
-// Lookup / Accessors
+// Lookup and accessors
 // ============================================================================
 
 bool Payload::has(const char* key) const {
@@ -2463,250 +2929,298 @@ bool Payload::has(const char* key) const {
 }
 
 const char* Payload::getString(const char* key) const {
-    return _primitive_value(key, "getString", nullptr);
+    const Entry* e = _find(key);
+    if (!e) return nullptr;
+    const ValueKind kind = (ValueKind)e->kind;
+    if (kind == ValueKind::OBJECT || kind == ValueKind::ARRAY) return nullptr;
+    return _value_ptr(*e);
 }
 
-static bool payload_copy_numeric_token(const Payload* self,
-                                       const char* key,
-                                       const char* value,
-                                       size_t value_len,
-                                       const char* op,
-                                       char* out,
-                                       size_t out_cap) {
-    if (!out || out_cap == 0) return false;
+static bool payload_copy_token(const Payload* self,
+                               const char* key,
+                               const char* value,
+                               size_t value_len,
+                               uint32_t operation_id,
+                               char* out,
+                               size_t out_capacity) {
+    if (!out || out_capacity == 0) return false;
     out[0] = '\0';
-
-    if (!value) return false;
-    if (value_len == 0 || value_len >= out_cap) {
-        payload_note_last_string_pointer_fault_key(key);
-        payload_note_error(PAYLOAD_ERR_STRING_TOO_LONG, op ? op : "numeric_token", self);
+    if (!value || value_len == 0 || value_len >= out_capacity) {
+        payload_note_bad_key(key);
+        payload_note_error(PAYLOAD_ERR_STRING_TOO_LONG, operation_id, self);
         return false;
     }
-
     memcpy(out, value, value_len);
     out[value_len] = '\0';
     return true;
 }
 
-// ============================================================================
-// Strict accessors
-// ============================================================================
-
 bool Payload::tryGetBool(const char* key, bool& out) const {
-    size_t n = 0;
-    const char* s = _primitive_value(key, "try_bool", &n);
-    if (!s) return false;
-    if (n == 4U && memcmp(s, "true", 4U) == 0)  { out = true;  return true; }
-    if (n == 5U && memcmp(s, "false", 5U) == 0) { out = false; return true; }
+    const Entry* e = _find(key);
+    if (!e || !_entry_ok(*e, (size_t)(e - _entries()), PAYLOAD_OP_TRY_BOOL)) return false;
+    const ValueKind kind = (ValueKind)e->kind;
+    if (kind != ValueKind::BOOLEAN && kind != ValueKind::STRING) return false;
+    const char* value = _value_ptr(*e);
+    if (e->val_len == 4U && memcmp(value, "true", 4U) == 0) {
+        out = true;
+        return true;
+    }
+    if (e->val_len == 5U && memcmp(value, "false", 5U) == 0) {
+        out = false;
+        return true;
+    }
     return false;
 }
 
 bool Payload::tryGetInt(const char* key, int32_t& out) const {
-    size_t n = 0;
-    const char* s = _primitive_value(key, "try_int", &n);
-    char tmp[48];
-    if (!payload_copy_numeric_token(this, key, s, n, "try_int_token", tmp, sizeof(tmp))) {
+    const Entry* e = _find(key);
+    if (!e || !_entry_ok(*e, (size_t)(e - _entries()), PAYLOAD_OP_TRY_INT)) return false;
+    const ValueKind kind = (ValueKind)e->kind;
+    if (kind != ValueKind::NUMBER && kind != ValueKind::STRING) return false;
+
+    const char* value = _value_ptr(*e);
+    if (!json_number_token_valid(value, e->val_len)) return false;
+    char text[48];
+    if (!payload_copy_token(this, key, value, e->val_len,
+                            PAYLOAD_OP_TRY_INT_TOKEN, text, sizeof(text))) {
         return false;
     }
+
+    errno = 0;
     char* end = nullptr;
-    long v = strtol(tmp, &end, 10);
-    if (!end || *end != '\0') return false;
-    out = (int32_t)v;
+    const long long parsed = strtoll(text, &end, 10);
+    if (errno == ERANGE || !end || *end != '\0' ||
+        parsed < (long long)INT32_MIN || parsed > (long long)INT32_MAX) {
+        return false;
+    }
+    out = (int32_t)parsed;
     return true;
 }
 
 bool Payload::tryGetUInt(const char* key, uint32_t& out) const {
-    size_t n = 0;
-    const char* s = _primitive_value(key, "try_uint", &n);
-    char tmp[48];
-    if (!payload_copy_numeric_token(this, key, s, n, "try_uint_token", tmp, sizeof(tmp))) {
+    const Entry* e = _find(key);
+    if (!e || !_entry_ok(*e, (size_t)(e - _entries()), PAYLOAD_OP_TRY_UINT)) return false;
+    const ValueKind kind = (ValueKind)e->kind;
+    if (kind != ValueKind::NUMBER && kind != ValueKind::STRING) return false;
+
+    const char* value = _value_ptr(*e);
+    if (e->val_len == 0 || value[0] == '-' ||
+        !json_number_token_valid(value, e->val_len)) {
         return false;
     }
+    char text[48];
+    if (!payload_copy_token(this, key, value, e->val_len,
+                            PAYLOAD_OP_TRY_UINT_TOKEN, text, sizeof(text))) {
+        return false;
+    }
+
+    errno = 0;
     char* end = nullptr;
-    unsigned long v = strtoul(tmp, &end, 10);
-    if (!end || *end != '\0') return false;
-    out = (uint32_t)v;
+    const unsigned long long parsed = strtoull(text, &end, 10);
+    if (errno == ERANGE || !end || *end != '\0' || parsed > UINT32_MAX) {
+        return false;
+    }
+    out = (uint32_t)parsed;
     return true;
 }
 
 bool Payload::tryGetUInt64(const char* key, uint64_t& out) const {
-    size_t n = 0;
-    const char* s = _primitive_value(key, "try_uint64", &n);
-    char tmp[48];
-    if (!payload_copy_numeric_token(this, key, s, n, "try_uint64_token", tmp, sizeof(tmp))) {
+    const Entry* e = _find(key);
+    if (!e || !_entry_ok(*e, (size_t)(e - _entries()), PAYLOAD_OP_TRY_UINT64)) return false;
+    const ValueKind kind = (ValueKind)e->kind;
+    if (kind != ValueKind::NUMBER && kind != ValueKind::STRING) return false;
+
+    const char* value = _value_ptr(*e);
+    if (e->val_len == 0 || value[0] == '-' ||
+        !json_number_token_valid(value, e->val_len)) {
         return false;
     }
+    char text[48];
+    if (!payload_copy_token(this, key, value, e->val_len,
+                            PAYLOAD_OP_TRY_UINT64_TOKEN, text, sizeof(text))) {
+        return false;
+    }
+
+    errno = 0;
     char* end = nullptr;
-    unsigned long long v = strtoull(tmp, &end, 10);
-    if (!end || *end != '\0') return false;
-    out = (uint64_t)v;
+    const unsigned long long parsed = strtoull(text, &end, 10);
+    if (errno == ERANGE || !end || *end != '\0') return false;
+    out = (uint64_t)parsed;
     return true;
 }
 
 bool Payload::tryGetFloat(const char* key, float& out) const {
-    size_t n = 0;
-    const char* s = _primitive_value(key, "try_float", &n);
-    char tmp[96];
-    if (!payload_copy_numeric_token(this, key, s, n, "try_float_token", tmp, sizeof(tmp))) {
+    const Entry* e = _find(key);
+    if (!e || !_entry_ok(*e, (size_t)(e - _entries()), PAYLOAD_OP_TRY_FLOAT)) return false;
+    const ValueKind kind = (ValueKind)e->kind;
+    if (kind != ValueKind::NUMBER && kind != ValueKind::STRING) return false;
+
+    const char* value = _value_ptr(*e);
+    if (!json_number_token_valid(value, e->val_len)) return false;
+    char text[96];
+    if (!payload_copy_token(this, key, value, e->val_len,
+                            PAYLOAD_OP_TRY_FLOAT_TOKEN, text, sizeof(text))) {
         return false;
     }
+
+    errno = 0;
     char* end = nullptr;
-    float v = strtof(tmp, &end);
-    if (!end || *end != '\0') return false;
-    if (!isfinite((double)v)) return false;
-    out = v;
+    const float parsed = strtof(text, &end);
+    if (errno == ERANGE || !end || *end != '\0' || !isfinite((double)parsed)) {
+        return false;
+    }
+    out = parsed;
     return true;
 }
 
 bool Payload::tryGetDouble(const char* key, double& out) const {
-    size_t n = 0;
-    const char* s = _primitive_value(key, "try_double", &n);
-    char tmp[96];
-    if (!payload_copy_numeric_token(this, key, s, n, "try_double_token", tmp, sizeof(tmp))) {
+    const Entry* e = _find(key);
+    if (!e || !_entry_ok(*e, (size_t)(e - _entries()), PAYLOAD_OP_TRY_DOUBLE)) return false;
+    const ValueKind kind = (ValueKind)e->kind;
+    if (kind != ValueKind::NUMBER && kind != ValueKind::STRING) return false;
+
+    const char* value = _value_ptr(*e);
+    if (!json_number_token_valid(value, e->val_len)) return false;
+    char text[96];
+    if (!payload_copy_token(this, key, value, e->val_len,
+                            PAYLOAD_OP_TRY_DOUBLE_TOKEN, text, sizeof(text))) {
         return false;
     }
+
+    errno = 0;
     char* end = nullptr;
-    double v = strtod(tmp, &end);
-    if (!end || *end != '\0') return false;
-    if (!isfinite(v)) return false;
-    out = v;
+    const double parsed = strtod(text, &end);
+    if (errno == ERANGE || !end || *end != '\0' || !isfinite(parsed)) {
+        return false;
+    }
+    out = parsed;
     return true;
 }
 
-// ============================================================================
-// Convenience accessors (with defaults)
-// ============================================================================
-
 bool Payload::getBool(const char* key, bool default_value) const {
-    bool v;
-    return tryGetBool(key, v) ? v : default_value;
+    bool value = false;
+    return tryGetBool(key, value) ? value : default_value;
 }
 
 int32_t Payload::getInt(const char* key, int32_t default_value) const {
-    int32_t v;
-    return tryGetInt(key, v) ? v : default_value;
+    int32_t value = 0;
+    return tryGetInt(key, value) ? value : default_value;
 }
 
 uint32_t Payload::getUInt(const char* key, uint32_t default_value) const {
-    uint32_t v;
-    return tryGetUInt(key, v) ? v : default_value;
+    uint32_t value = 0;
+    return tryGetUInt(key, value) ? value : default_value;
 }
 
 uint64_t Payload::getUInt64(const char* key, uint64_t default_value) const {
-    uint64_t v;
-    return tryGetUInt64(key, v) ? v : default_value;
+    uint64_t value = 0;
+    return tryGetUInt64(key, value) ? value : default_value;
 }
 
 float Payload::getFloat(const char* key, float default_value) const {
-    float v;
-    return tryGetFloat(key, v) ? v : default_value;
+    float value = 0.0f;
+    return tryGetFloat(key, value) ? value : default_value;
 }
 
 double Payload::getDouble(const char* key, double default_value) const {
-    double v;
-    return tryGetDouble(key, v) ? v : default_value;
+    double value = 0.0;
+    return tryGetDouble(key, value) ? value : default_value;
 }
 
-// ============================================================================
-// Structured accessors
-// ============================================================================
-
 Payload Payload::getPayload(const char* key) const {
-    Payload p;
+    Payload result;
     const Entry* e = _find(key);
-    if (!e || e->kind != 'o') return p;
-    size_t n = 0;
-    if (!_entry_value_ok(*e, "getPayload.value", &n)) return p;
-    p.parseJSON((const uint8_t*)(_arena + e->val_off), n);
-    return p;
+    if (!e || (ValueKind)e->kind != ValueKind::OBJECT) return result;
+    if (!_entry_ok(*e, (size_t)(e - _entries()), PAYLOAD_OP_GETPAYLOAD)) return result;
+    result.parseJSON(reinterpret_cast<const uint8_t*>(_value_ptr(*e)), e->val_len);
+    return result;
 }
 
 PayloadArray Payload::getArray(const char* key) const {
-    PayloadArray arr;
+    PayloadArray result;
     const Entry* e = _find(key);
-    if (!e || e->kind != 'a') return arr;
-    size_t n = 0;
-    if (!_entry_value_ok(*e, "getArray.value", &n)) return arr;
-    (void)n;
-    arr.parseJSON(_arena + e->val_off);
-    return arr;
+    if (!e || (ValueKind)e->kind != ValueKind::ARRAY) return result;
+    if (!_entry_ok(*e, (size_t)(e - _entries()), PAYLOAD_OP_GETARRAY)) return result;
+    result.parseJSON(_value_ptr(*e));
+    return result;
 }
 
 bool Payload::hasArray(const char* key) const {
     const Entry* e = _find(key);
-    return e && e->kind == 'a' && _entry_value_ok(*e, "hasArray.value", nullptr);
+    return e && (ValueKind)e->kind == ValueKind::ARRAY &&
+           _entry_ok(*e, (size_t)(e - _entries()), PAYLOAD_OP_HASARRAY);
 }
 
 PayloadArrayView Payload::getArrayView(const char* key) const {
     const Entry* e = _find(key);
-    if (!e || e->kind != 'a') {
+    if (!e || (ValueKind)e->kind != ValueKind::ARRAY ||
+        !_entry_ok(*e, (size_t)(e - _entries()), PAYLOAD_OP_GETARRAYVIEW)) {
         return PayloadArrayView();
     }
-    size_t n = 0;
-    if (!_entry_value_ok(*e, "getArrayView.value", &n)) {
-        return PayloadArrayView();
-    }
-    return PayloadArrayView(_arena + e->val_off, n);
+    return PayloadArrayView(_value_ptr(*e), e->val_len);
 }
 
 // ============================================================================
-// Diagnostics
+// Explicit debug dump
 // ============================================================================
 
 void Payload::debug_dump(const char* tag) const {
-    char line[160];
-    char tag_buf[32];
-    (void)payload_copy_cstr_checked(tag_buf, sizeof(tag_buf),
-                                    tag ? tag : "",
-                                    "debug_dump.tag",
-                                    "");
+    char safe_tag[32];
+    size_t tag_len = 0;
+    if (!tag || !payload_cstr_len_checked(tag,
+                                          sizeof(safe_tag) - 1U,
+                                          PAYLOAD_OP_DEBUG_DUMP_TAG,
+                                          &tag_len,
+                                          false)) {
+        tag = "";
+        tag_len = 0;
+    }
+    if (tag_len != 0) memcpy(safe_tag, tag, tag_len);
+    safe_tag[tag_len] = '\0';
 
-    snprintf(
-        line, sizeof(line),
-        "Payload dump (%s): %u entries cap=%u arena %u/%u bytes heap_entries=%u sizeof=%u",
-        tag_buf,
-        (unsigned)_count,
-        (unsigned)_entry_cap,
-        (unsigned)_arena_used,
-        (unsigned)_arena_cap,
-        (unsigned)(_entries != _inline_entries),
-        (unsigned)sizeof(Payload)
-    );
+    char line[192];
+    snprintf(line, sizeof(line),
+             "Payload v4 (%s): entries=%u data=%u/%u heap=%u sizeof=%u",
+             safe_tag,
+             (unsigned)count(),
+             (unsigned)arena_used(),
+             (unsigned)arena_capacity(),
+             (unsigned)heap_entries(),
+             (unsigned)sizeof(Payload));
     debug_log("payload", line);
 
-    if (!_self_ok("debug_dump")) return;
+    if (!_self_ok(PAYLOAD_OP_DEBUG_DUMP)) return;
+    const Entry* entries = _entries();
+    const uint8_t* storage = _storage();
+    for (size_t i = 0; i < _count; ++i) {
+        const Entry& e = entries[i];
+        if (!_entry_ok(e, i, PAYLOAD_OP_DEBUG_DUMP_ENTRY)) break;
 
-    for (size_t i = 0; i < _count; i++) {
-        const Entry& e = _entries[i];
+        char key[80];
+        size_t key_len = e.key_len;
+        if (key_len >= sizeof(key)) key_len = sizeof(key) - 1U;
+        if (key_len != 0) memcpy(key, storage + e.key_off, key_len);
+        key[key_len] = '\0';
 
-        const char* kind_str =
-            e.kind == 'p' ? "primitive" :
-            e.kind == 'o' ? "object" :
-            e.kind == 'a' ? "array" :
-            "unknown";
-
-        if (!_entry_key_ok(e, "debug_dump.key", nullptr) ||
-            !_entry_value_ok(e, "debug_dump.value", nullptr)) {
-            debug_log("payload.key", "!invalid_entry");
-            debug_log("payload.kind", kind_str);
-            debug_log("payload.value", "!invalid_entry");
-            continue;
-        }
-
-        debug_log("payload.key", _arena + e.key_off);
-        debug_log("payload.kind", kind_str);
-
-        const char* v = _arena + e.val_off;
         char preview[96];
-        size_t n = e.val_len;
-        if (n > sizeof(preview) - 1) n = sizeof(preview) - 1;
-        if (n > 0) memcpy(preview, v, n);
-        preview[n] = '\0';
+        size_t value_len = e.val_len;
+        if (value_len >= sizeof(preview)) value_len = sizeof(preview) - 1U;
+        if (value_len != 0) memcpy(preview, storage + e.val_off, value_len);
+        preview[value_len] = '\0';
 
+        debug_log("payload.key", key);
+        switch ((ValueKind)e.kind) {
+            case ValueKind::STRING: debug_log("payload.kind", "string"); break;
+            case ValueKind::NUMBER: debug_log("payload.kind", "number"); break;
+            case ValueKind::BOOLEAN: debug_log("payload.kind", "boolean"); break;
+            case ValueKind::NIL: debug_log("payload.kind", "null"); break;
+            case ValueKind::OBJECT: debug_log("payload.kind", "object"); break;
+            case ValueKind::ARRAY: debug_log("payload.kind", "array"); break;
+            default: debug_log("payload.kind", "invalid"); break;
+        }
         debug_log("payload.value", preview);
     }
 }
-
 // ============================================================================
 // PayloadArrayView
 // ============================================================================
@@ -2718,99 +3232,39 @@ PayloadArrayView::PayloadArrayView(const char* json, size_t len)
     : _json(json), _len(len) {}
 
 bool PayloadArrayView::valid() const {
-    return _json && _len >= 2 && _json[0] == '[';
+    return _json && _len >= 2U &&
+           payload_span_readable(_json, _len, PAYLOAD_OP_ARRAY_VIEW_VALID) &&
+           json_validate_exact(reinterpret_cast<const uint8_t*>(_json),
+                               _len,
+                               json_value_type_t::ARRAY);
 }
 
 size_t PayloadArrayView::size() const {
-    if (!valid()) return 0;
-
-    size_t first = 1;
-    while (first < _len && (_json[first] == ' ' || _json[first] == '\t' ||
-                            _json[first] == '\n' || _json[first] == '\r')) {
-        first++;
-    }
-    if (first < _len && _json[first] == ']') {
+    if (!_json || _len < 2U ||
+        !payload_span_readable(_json, _len, PAYLOAD_OP_ARRAY_VIEW_SIZE)) {
         return 0;
     }
-
     size_t count = 0;
-    int depth = 0;
-    bool in_string = false;
-    bool escape = false;
-
-    for (size_t i = 0; i < _len; i++) {
-        const char c = _json[i];
-
-        if (in_string) {
-            if (escape) {
-                escape = false;
-            } else if (c == '\\') {
-                escape = true;
-            } else if (c == '"') {
-                in_string = false;
-            }
-            continue;
-        }
-
-        if (c == '"') {
-            in_string = true;
-            continue;
-        }
-        if (c == '{' || c == '[') depth++;
-        if (c == '}' || c == ']') depth--;
-        if (c == ',' && depth == 1) count++;
-    }
-
-    return count + 1U;
+    if (!json_array_locate(_json, _len, SIZE_MAX, &count, nullptr)) return 0;
+    return count;
 }
 
 Payload PayloadArrayView::get(size_t index) const {
-    Payload out;
-    if (!valid()) return out;
-
-    size_t current = 0;
-    int depth = 0;
-    bool in_string = false;
-    bool escape = false;
-    size_t start = 0;
-
-    for (size_t i = 1; i < _len; i++) {
-        const char c = _json[i];
-
-        if (in_string) {
-            if (escape) {
-                escape = false;
-            } else if (c == '\\') {
-                escape = true;
-            } else if (c == '"') {
-                in_string = false;
-            }
-            continue;
-        }
-
-        if (c == '"') {
-            in_string = true;
-            continue;
-        }
-
-        if (c == '{') {
-            if (depth == 0 && current == index) start = i;
-            depth++;
-        } else if (c == '}') {
-            depth--;
-            if (depth == 0 && current == index) {
-                out.parseJSON(
-                    (const uint8_t*)(_json + start),
-                    i - start + 1U
-                );
-                return out;
-            }
-        } else if (c == ',' && depth == 0) {
-            current++;
-        }
+    Payload result;
+    if (!_json || _len < 2U ||
+        !payload_span_readable(_json, _len, PAYLOAD_OP_ARRAY_VIEW_GET)) {
+        return result;
     }
 
-    return Payload();
+    size_t count = 0;
+    json_value_span_t value;
+    if (!json_array_locate(_json, _len, index, &count, &value) ||
+        index >= count || value.type != json_value_type_t::OBJECT) {
+        return result;
+    }
+    result.parseJSON(reinterpret_cast<const uint8_t*>(_json + value.begin),
+                     value.end - value.begin);
+    return result;
 }
 
 // ============================================================================
@@ -2818,165 +3272,410 @@ Payload PayloadArrayView::get(size_t index) const {
 // ============================================================================
 
 PayloadArray::PayloadArray()
-    : _buf("")
-    , _first(true)
-    , _item_count(0) {}
-
-void PayloadArray::clear() {
-    _buf = "";
-    _first = true;
-    _item_count = 0;
+    : _heap_block(nullptr),
+      _heap_block_guard(UINTPTR_MAX),
+      _length(2),
+      _length_guard((uint16_t)~(uint16_t)2U),
+      _inline_storage{} {
+    _inline_storage[0] = '[';
+    _inline_storage[1] = ']';
+    _inline_storage[2] = '\0';
 }
 
-bool PayloadArray::empty() const {
-    return _item_count == 0 && _buf.length() == 0;
+PayloadArray::~PayloadArray() {
+    _release_storage();
 }
 
-String PayloadArray::to_json() const {
-    if (_item_count > 0) {
-        String out = "[";
-        for (size_t i = 0; i < _item_count; i++) {
-            if (i) out += ",";
-            out += _items[i].to_json();
-        }
-        out += "]";
-        return out;
-    }
-
-    return String("[") + _buf + "]";
+PayloadArray::PayloadArray(const PayloadArray& other)
+    : _heap_block(nullptr),
+      _heap_block_guard(UINTPTR_MAX),
+      _length(2),
+      _length_guard((uint16_t)~(uint16_t)2U),
+      _inline_storage{} {
+    _inline_storage[0] = '[';
+    _inline_storage[1] = ']';
+    _inline_storage[2] = '\0';
+    (void)_copy_from(other);
 }
 
-void PayloadArray::add(const Payload& obj) {
-    if (!_first) _buf += ",";
-    _first = false;
-    _buf += obj.to_json();
+PayloadArray& PayloadArray::operator=(const PayloadArray& other) {
+    if (this == &other) return *this;
+    if (other._json_size() == 0U) return *this;
+    PayloadArray temp;
+    if (!temp._copy_from(other)) return *this;
+    _release_storage();
+    _move_from(temp);
+    return *this;
 }
 
-bool PayloadArray::parseJSON(const char* json) {
-    _item_count = 0;
+PayloadArray::PayloadArray(PayloadArray&& other) noexcept
+    : _heap_block(nullptr),
+      _heap_block_guard(UINTPTR_MAX),
+      _length(2),
+      _length_guard((uint16_t)~(uint16_t)2U),
+      _inline_storage{} {
+    _inline_storage[0] = '[';
+    _inline_storage[1] = ']';
+    _inline_storage[2] = '\0';
+    _move_from(other);
+}
 
-    size_t json_len = 0;
-    if (!payload_cstr_len_checked(json, Payload::ARENA_MAX, false,
-                                  "array.parse", &json_len) ||
-        json_len < 2U || json[0] != '[') {
+PayloadArray& PayloadArray::operator=(PayloadArray&& other) noexcept {
+    if (this == &other) return *this;
+    if (other._json_size() == 0U) return *this;
+    _release_storage();
+    _move_from(other);
+    return *this;
+}
+
+bool PayloadArray::_heap_guard_ok() const {
+    return (((uintptr_t)_heap_block) ^ _heap_block_guard) == UINTPTR_MAX;
+}
+
+bool PayloadArray::_length_guard_ok() const {
+    return (uint16_t)(_length ^ _length_guard) == UINT16_MAX;
+}
+
+void PayloadArray::_set_heap_block(void* block) {
+    _heap_block = block;
+    _heap_block_guard = ~((uintptr_t)block);
+}
+
+void PayloadArray::_set_length(uint16_t length) {
+    _length = length;
+    _length_guard = (uint16_t)~length;
+}
+
+char* PayloadArray::_data() {
+    if (!_heap_guard_ok()) return nullptr;
+    return reinterpret_cast<char*>(
+        _heap_block ? payload_heap_bytes(_heap_block)
+                    : reinterpret_cast<uint8_t*>(_inline_storage));
+}
+
+const char* PayloadArray::_data() const {
+    if (!_heap_guard_ok()) return nullptr;
+    return reinterpret_cast<const char*>(
+        _heap_block ? payload_heap_bytes(_heap_block)
+                    : reinterpret_cast<const uint8_t*>(_inline_storage));
+}
+
+size_t PayloadArray::_capacity() const {
+    if (!_heap_guard_ok()) return 0U;
+    if (!_heap_block) return INLINE_STORAGE;
+    return payload_heap_capacity(_heap_block, this, INLINE_STORAGE + 1U, STORAGE_MAX);
+}
+
+bool PayloadArray::_self_ok() const {
+    if (!_heap_guard_ok() || !_length_guard_ok()) return false;
+    const size_t capacity = _capacity();
+    const char* data = capacity != 0 ? _data() : nullptr;
+    return data && capacity >= 3U && _length >= 2U &&
+           (size_t)_length < capacity && data[0] == '[' &&
+           data[_length - 1U] == ']' && data[_length] == '\0';
+}
+
+bool PayloadArray::_ensure_capacity(size_t needed) {
+    if (!_self_ok()) return false;
+    const size_t old_capacity = _capacity();
+    if (needed <= old_capacity) return true;
+    if (needed > STORAGE_MAX) {
+        g_payload_arena_alloc_fail++;
+        payload_note_error(PAYLOAD_ERR_ARENA_LIMIT, PAYLOAD_OP_ARRAY_CAPACITY, this);
         return false;
     }
 
-    size_t i = 1;
-    while (i < json_len && _item_count < MAX_ITEMS) {
-        while (i < json_len && json[i] != '{') i++;
-        if (i >= json_len) break;
-
-        size_t v0 = i;
-        int depth = 0;
-        bool in_string = false;
-        bool escape = false;
-
-        do {
-            const char c = json[i++];
-            if (in_string) {
-                if (escape) {
-                    escape = false;
-                } else if (c == '\\') {
-                    escape = true;
-                } else if (c == '"') {
-                    in_string = false;
-                }
-                continue;
-            }
-            if (c == '"') {
-                in_string = true;
-            } else if (c == '{') {
-                depth++;
-            } else if (c == '}') {
-                depth--;
-            }
-        } while (depth > 0 && i < json_len);
-
-        _items[_item_count].parseJSON(
-            (const uint8_t*)(json + v0),
-            (size_t)(i - v0)
-        );
-
-        _item_count++;
+    const size_t new_capacity =
+        payload_growth_capacity(old_capacity, needed, STORAGE_MAX);
+    if (new_capacity == 0) return false;
+    void* block = payload_heap_allocate(new_capacity, this);
+    if (!block) {
+        g_payload_arena_alloc_fail++;
+        payload_note_error(PAYLOAD_ERR_ARENA_ALLOC_FAIL, PAYLOAD_OP_ARRAY_ALLOC, this);
+        return false;
     }
 
+    memset(payload_heap_bytes(block), 0, new_capacity);
+    memcpy(payload_heap_bytes(block), _data(), (size_t)_length + 1U);
+    void* old_block = _heap_block;
+    const size_t old_heap_capacity = old_block ? old_capacity : 0U;
+    _set_heap_block(block);
+    payload_note_heap_delta((int32_t)new_capacity - (int32_t)old_heap_capacity);
+    g_payload_arena_realloc_count++;
+    if (new_capacity > g_payload_max_arena_capacity_seen) {
+        g_payload_max_arena_capacity_seen = (uint32_t)new_capacity;
+    }
+    if (old_block) free(old_block);
+    return true;
+}
+
+void PayloadArray::_release_storage() {
+    if (!_heap_guard_ok()) {
+        payload_note_integrity(PAYLOAD_SELF_OK_ENTRIES_SPAN_UNREADABLE,
+                               PAYLOAD_OP_ARRAY_RELEASE_STORAGE_GUARD,
+                               this);
+        _set_heap_block(nullptr);
+        _set_length(2U);
+        memset(_inline_storage, 0, sizeof(_inline_storage));
+        _inline_storage[0] = '[';
+        _inline_storage[1] = ']';
+        return;
+    }
+    if (_heap_block) {
+        const size_t capacity =
+            payload_heap_capacity(_heap_block, this, INLINE_STORAGE + 1U, STORAGE_MAX);
+        if (capacity != 0) {
+            payload_note_heap_delta(-(int32_t)capacity);
+            free(_heap_block);
+        } else {
+            payload_note_integrity(PAYLOAD_SELF_OK_ENTRIES_SPAN_UNREADABLE,
+                                   PAYLOAD_OP_ARRAY_RELEASE_STORAGE,
+                                   this);
+        }
+    }
+    _set_heap_block(nullptr);
+    _set_length(2U);
+    memset(_inline_storage, 0, sizeof(_inline_storage));
+    _inline_storage[0] = '[';
+    _inline_storage[1] = ']';
+}
+
+void PayloadArray::_move_from(PayloadArray& other) {
+    if (other._json_size() == 0U) return;
+    if (other._heap_block) {
+        if (!payload_heap_rebind_owner(other._heap_block,
+                                       &other,
+                                       this,
+                                       INLINE_STORAGE + 1U,
+                                       STORAGE_MAX)) {
+            return;
+        }
+        _set_heap_block(other._heap_block);
+        _set_length(other._length);
+        other._set_heap_block(nullptr);
+        other._release_storage();
+        return;
+    }
+
+    memcpy(_inline_storage, other._inline_storage, INLINE_STORAGE);
+    _set_heap_block(nullptr);
+    _set_length(other._length);
+    other.clear();
+}
+
+bool PayloadArray::_copy_from(const PayloadArray& other) {
+    if (other._json_size() == 0U) return false;
+    if (!_ensure_capacity((size_t)other._length + 1U)) return false;
+    memcpy(_data(), other._data(), (size_t)other._length + 1U);
+    _set_length(other._length);
+    return true;
+}
+
+void PayloadArray::clear() {
+    if (!_self_ok()) {
+        _release_storage();
+        return;
+    }
+    char* data = _data();
+    memset(data, 0, _capacity());
+    data[0] = '[';
+    data[1] = ']';
+    _set_length(2U);
+}
+
+bool PayloadArray::empty() const {
+    return !_self_ok() || _length == 2U;
+}
+
+size_t PayloadArray::_json_size() const {
+    if (!_self_ok()) return 0;
+    return json_validate_exact(
+               reinterpret_cast<const uint8_t*>(_data()),
+               _length,
+               json_value_type_t::ARRAY)
+        ? _length
+        : 0U;
+}
+
+size_t PayloadArray::_write_json_unchecked(char* out) const {
+    if (!out || !_self_ok()) return 0;
+    memcpy(out, _data(), _length);
+    out[_length] = '\0';
+    return _length;
+}
+
+String PayloadArray::to_json() const {
+    return _json_size() != 0U ? String(_data()) : String("[]");
+}
+
+void PayloadArray::add(const Payload& obj) {
+    if (!_self_ok()) return;
+    const size_t object_size = obj._json_size();
+    if (object_size == 0) return;
+
+    const size_t comma = _length == 2U ? 0U : 1U;
+    const size_t new_length = (size_t)_length + comma + object_size;
+    if (new_length > UINT16_MAX || !_ensure_capacity(new_length + 1U)) return;
+
+    char* data = _data();
+    const size_t old_length = _length;
+    size_t pos = old_length - 1U;  // replace old closing bracket
+    if (comma != 0) data[pos++] = ',';
+    const size_t written = obj._write_json_unchecked(data + pos);
+    if (written != object_size) {
+        data[old_length - 1U] = ']';
+        data[old_length] = '\0';
+        payload_note_error(PAYLOAD_ERR_SERIALIZE_OVERFLOW,
+                           PAYLOAD_OP_ARRAY_ADD_WRITE,
+                           this);
+        return;
+    }
+    pos += written;
+    data[pos++] = ']';
+    data[pos] = '\0';
+    _set_length((uint16_t)pos);
+}
+
+bool PayloadArray::parseJSON(const char* json) {
+    size_t length = 0;
+    if (!json || !payload_cstr_len_checked(json,
+                                           STORAGE_MAX - 1U,
+                                           PAYLOAD_OP_ARRAY_PARSE,
+                                           &length,
+                                           false)) {
+        clear();
+        g_payload_parse_error++;
+        g_payload_json_invalid_raw_array++;
+        payload_note_error(PAYLOAD_ERR_JSON_INVALID, PAYLOAD_OP_ARRAY_PARSE, this);
+        return false;
+    }
+
+    json_value_span_t span;
+    if (!json_validate_exact(reinterpret_cast<const uint8_t*>(json),
+                             length,
+                             json_value_type_t::ARRAY,
+                             &span)) {
+        clear();
+        g_payload_parse_error++;
+        g_payload_json_invalid_raw_array++;
+        payload_note_error(PAYLOAD_ERR_JSON_INVALID, PAYLOAD_OP_ARRAY_PARSE_INVALID, this);
+        return false;
+    }
+
+    const size_t trimmed_length = span.end - span.begin;
+    if (trimmed_length > UINT16_MAX) {
+        clear();
+        return false;
+    }
+
+    PayloadArray parsed;
+    if (!parsed._ensure_capacity(trimmed_length + 1U)) {
+        clear();
+        return false;
+    }
+    memcpy(parsed._data(), json + span.begin, trimmed_length);
+    parsed._data()[trimmed_length] = '\0';
+    parsed._set_length((uint16_t)trimmed_length);
+    *this = static_cast<PayloadArray&&>(parsed);
     return true;
 }
 
 size_t PayloadArray::size() const {
-    return _item_count;
+    if (_json_size() == 0U) return 0U;
+    size_t count = 0;
+    return json_array_locate(_data(), _length, SIZE_MAX, &count, nullptr)
+        ? count
+        : 0U;
 }
 
 Payload PayloadArray::get(size_t idx) const {
-    if (idx >= _item_count) return Payload();
-    return _items[idx];
+    Payload result;
+    if (!_self_ok()) return result;
+
+    size_t count = 0;
+    json_value_span_t value;
+    if (!json_array_locate(_data(), _length, idx, &count, &value) ||
+        idx >= count || value.type != json_value_type_t::OBJECT) {
+        return result;
+    }
+    result.parseJSON(reinterpret_cast<const uint8_t*>(_data() + value.begin),
+                     value.end - value.begin);
+    return result;
 }
 
 // ============================================================================
-// Payload Instrumentation Access (snapshot-only, monotonic)
+// Instrumentation snapshot
 // ============================================================================
 
-void payload_get_info(payload_info_t* out)
-{
+void payload_get_info(payload_info_t* out) {
     if (!out) return;
-
     memset(out, 0, sizeof(*out));
 
-    out->payload_object_size       = (uint32_t)sizeof(Payload);
-    out->payload_entry_size        = (uint32_t)sizeof(Payload::Entry);
+    out->payload_object_size = (uint32_t)sizeof(Payload);
+    out->payload_entry_size = (uint32_t)sizeof(Payload::Entry);
     out->payload_array_object_size = (uint32_t)sizeof(PayloadArray);
-    out->payload_inline_entries    = (uint32_t)Payload::INLINE_ENTRIES;
-    out->payload_max_entries       = (uint32_t)Payload::MAX_ENTRIES;
-    out->payload_arena_initial     = (uint32_t)Payload::ARENA_INITIAL;
-    out->payload_arena_max         = (uint32_t)Payload::ARENA_MAX;
+    out->payload_inline_entries = (uint32_t)Payload::INLINE_ENTRIES;
+    out->payload_max_entries = (uint32_t)Payload::MAX_ENTRIES;
+    out->payload_arena_initial = (uint32_t)Payload::ARENA_INITIAL;
+    out->payload_arena_max = (uint32_t)Payload::ARENA_MAX;
 
     out->instances_constructed = g_payload_instances_constructed;
-    out->instances_destroyed   = g_payload_instances_destroyed;
+    out->instances_destroyed = g_payload_instances_destroyed;
+    out->alive_now = g_payload_alive_now;
+    out->alive_high_water = g_payload_alive_high_water;
 
-    out->alive_now             = g_payload_alive_now;
-    out->alive_high_water      = g_payload_alive_high_water;
-
-    out->entry_alloc_fail      = g_payload_entry_alloc_fail;
-    out->entry_realloc_count   = g_payload_entry_realloc_count;
+    out->entry_alloc_fail = g_payload_entry_alloc_fail;
+    out->entry_realloc_count = g_payload_entry_realloc_count;
     out->entry_heap_bytes_alive = g_payload_entry_heap_bytes_alive;
     out->entry_heap_bytes_high_water = g_payload_entry_heap_bytes_high_water;
-    out->entry_overflow        = g_payload_entry_overflow;
-    out->entry_high_water      = g_payload_entry_high_water_global;
+    out->entry_overflow = g_payload_entry_overflow;
+    out->entry_high_water = g_payload_entry_high_water_global;
     out->max_entry_capacity_seen = g_payload_max_entry_capacity_seen;
 
-    out->arena_alloc_fail      = g_payload_arena_alloc_fail;
-    out->arena_realloc_count   = g_payload_arena_realloc_count;
+    out->arena_alloc_fail = g_payload_arena_alloc_fail;
+    out->arena_realloc_count = g_payload_arena_realloc_count;
     out->arena_heap_bytes_alive = g_payload_arena_heap_bytes_alive;
     out->arena_heap_bytes_high_water = g_payload_arena_heap_bytes_high_water;
-    out->arena_high_water      = g_payload_arena_high_water_global;
+    out->arena_high_water = g_payload_arena_high_water_global;
     out->max_arena_capacity_seen = g_payload_max_arena_capacity_seen;
 
-    out->serialize_overflow    = g_payload_serialize_overflow;
-    out->to_json_fail          = g_payload_to_json_fail;
-    out->string_truncation     = g_payload_string_truncation;
-    out->parse_error           = g_payload_parse_error;
-    out->integrity_fail        = g_payload_integrity_fail;
-    out->invalid_kind          = g_payload_invalid_kind;
+    out->serialize_overflow = g_payload_serialize_overflow;
+    out->to_json_fail = g_payload_to_json_fail;
+    out->string_truncation = g_payload_string_truncation;
+    out->parse_error = g_payload_parse_error;
+    out->json_invalid_syntax = g_payload_json_invalid_syntax;
+    out->json_invalid_depth = g_payload_json_invalid_depth;
+    out->json_invalid_utf8_key = g_payload_json_invalid_utf8_key;
+    out->json_invalid_utf8_value = g_payload_json_invalid_utf8_value;
+    out->json_invalid_raw_object = g_payload_json_invalid_raw_object;
+    out->json_invalid_raw_array = g_payload_json_invalid_raw_array;
+    out->json_decode_fail = g_payload_json_decode_fail;
+    out->integrity_fail = g_payload_integrity_fail;
+    out->invalid_kind = g_payload_invalid_kind;
 
     out->string_pointer_fault = g_payload_string_pointer_fault;
     out->string_pointer_null = g_payload_string_pointer_null;
     out->string_pointer_low_address = g_payload_string_pointer_low_address;
     out->string_pointer_magic_address = g_payload_string_pointer_magic_address;
     out->string_pointer_out_of_range = g_payload_string_pointer_out_of_range;
-    out->string_pointer_span_out_of_range = g_payload_string_pointer_span_out_of_range;
+    out->string_pointer_span_out_of_range =
+        g_payload_string_pointer_span_out_of_range;
     out->string_pointer_unterminated = g_payload_string_pointer_unterminated;
     out->string_pointer_too_long = g_payload_string_pointer_too_long;
-    out->last_string_pointer_fault_reason = g_payload_last_string_pointer_fault_reason;
-    out->last_string_pointer_fault_ptr = g_payload_last_string_pointer_fault_ptr;
-    payload_copy_trusted_label(out->last_string_pointer_fault_context,
-                               sizeof(out->last_string_pointer_fault_context),
-                               g_payload_last_string_pointer_fault_context);
+    out->last_string_pointer_fault_reason =
+        g_payload_last_string_pointer_fault_reason;
+    out->last_string_pointer_fault_ptr =
+        g_payload_last_string_pointer_fault_ptr;
+    out->last_string_pointer_fault_op_id =
+        g_payload_last_string_pointer_fault_op_id;
+    payload_copy_label(out->last_string_pointer_fault_context,
+                       sizeof(out->last_string_pointer_fault_context),
+                       g_payload_last_string_pointer_fault_context);
     out->last_string_pointer_fault_key_ptr =
         g_payload_last_string_pointer_fault_key_ptr;
-    payload_copy_trusted_label(out->last_string_pointer_fault_key,
-                               sizeof(out->last_string_pointer_fault_key),
-                               g_payload_last_string_pointer_fault_key);
+    payload_copy_label(out->last_string_pointer_fault_key,
+                       sizeof(out->last_string_pointer_fault_key),
+                       g_payload_last_string_pointer_fault_key);
 
     out->self_ok_fail = g_payload_self_ok_fail;
     out->self_ok_magic_bad = g_payload_self_ok_magic_bad;
@@ -2985,27 +3684,33 @@ void payload_get_info(payload_info_t* out)
     out->self_ok_entry_cap_high = g_payload_self_ok_entry_cap_high;
     out->self_ok_entries_magic_address = g_payload_self_ok_entries_magic_address;
     out->self_ok_arena_magic_address = g_payload_self_ok_arena_magic_address;
-    out->self_ok_entries_span_unreadable = g_payload_self_ok_entries_span_unreadable;
-    out->self_ok_arena_span_unreadable = g_payload_self_ok_arena_span_unreadable;
+    out->self_ok_entries_span_unreadable =
+        g_payload_self_ok_entries_span_unreadable;
+    out->self_ok_arena_span_unreadable =
+        g_payload_self_ok_arena_span_unreadable;
     out->self_ok_inline_cap_mismatch = g_payload_self_ok_inline_cap_mismatch;
     out->self_ok_heap_cap_mismatch = g_payload_self_ok_heap_cap_mismatch;
     out->self_ok_count_gt_entry_cap = g_payload_self_ok_count_gt_entry_cap;
     out->self_ok_count_gt_max = g_payload_self_ok_count_gt_max;
     out->self_ok_arena_used_gt_cap = g_payload_self_ok_arena_used_gt_cap;
     out->self_ok_arena_cap_gt_max = g_payload_self_ok_arena_cap_gt_max;
-    out->self_ok_arena_cap_zero_with_ptr = g_payload_self_ok_arena_cap_zero_with_ptr;
-    out->self_ok_arena_cap_nonzero_with_null = g_payload_self_ok_arena_cap_nonzero_with_null;
+    out->self_ok_arena_cap_zero_with_ptr =
+        g_payload_self_ok_arena_cap_zero_with_ptr;
+    out->self_ok_arena_cap_nonzero_with_null =
+        g_payload_self_ok_arena_cap_nonzero_with_null;
     out->self_ok_count_without_arena = g_payload_self_ok_count_without_arena;
     out->self_ok_entry_kind_bad = g_payload_self_ok_entry_kind_bad;
     out->self_ok_entry_key_off_oob = g_payload_self_ok_entry_key_off_oob;
     out->self_ok_entry_val_off_oob = g_payload_self_ok_entry_val_off_oob;
     out->self_ok_entry_val_end_oob = g_payload_self_ok_entry_val_end_oob;
-    out->self_ok_entry_val_unterminated = g_payload_self_ok_entry_val_unterminated;
-    out->self_ok_entry_key_unterminated = g_payload_self_ok_entry_key_unterminated;
+    out->self_ok_entry_val_unterminated =
+        g_payload_self_ok_entry_val_unterminated;
+    out->self_ok_entry_key_unterminated =
+        g_payload_self_ok_entry_key_unterminated;
     out->last_self_ok_fail_reason = g_payload_last_self_ok_fail_reason;
-    payload_copy_trusted_label(out->last_self_ok_fail_op,
-                               sizeof(out->last_self_ok_fail_op),
-                               g_payload_last_self_ok_fail_op);
+    payload_copy_label(out->last_self_ok_fail_op,
+                       sizeof(out->last_self_ok_fail_op),
+                       g_payload_last_self_ok_fail_op);
     out->last_self_ok_fail_this = g_payload_last_self_ok_fail_this;
     out->last_self_ok_fail_magic = g_payload_last_self_ok_fail_magic;
     out->last_self_ok_fail_entries = g_payload_last_self_ok_fail_entries;
@@ -3015,15 +3720,27 @@ void payload_get_info(payload_info_t* out)
     out->last_self_ok_fail_arena_used = g_payload_last_self_ok_fail_arena_used;
     out->last_self_ok_fail_arena_cap = g_payload_last_self_ok_fail_arena_cap;
     out->last_self_ok_fail_entry_index = g_payload_last_self_ok_fail_entry_index;
-    out->last_self_ok_fail_entry_key_off = g_payload_last_self_ok_fail_entry_key_off;
-    out->last_self_ok_fail_entry_val_off = g_payload_last_self_ok_fail_entry_val_off;
-    out->last_self_ok_fail_entry_val_len = g_payload_last_self_ok_fail_entry_val_len;
+    out->last_self_ok_fail_entry_key_off =
+        g_payload_last_self_ok_fail_entry_key_off;
+    out->last_self_ok_fail_entry_val_off =
+        g_payload_last_self_ok_fail_entry_val_off;
+    out->last_self_ok_fail_entry_val_len =
+        g_payload_last_self_ok_fail_entry_val_len;
     out->last_self_ok_fail_entry_kind = g_payload_last_self_ok_fail_entry_kind;
+    out->last_self_ok_fail_op_id = g_payload_last_self_ok_fail_op_id;
+    out->last_self_ok_fail_capacity = g_payload_last_self_ok_fail_capacity;
+    out->last_self_ok_fail_data_begin = g_payload_last_self_ok_fail_data_begin;
+    out->last_self_ok_fail_expected_upper =
+        g_payload_last_self_ok_fail_expected_upper;
+    out->last_self_ok_fail_key_end = g_payload_last_self_ok_fail_key_end;
+    out->last_self_ok_fail_val_end = g_payload_last_self_ok_fail_val_end;
+    out->first_self_ok_fail_captured = g_payload_first_self_ok_fail_captured;
 
-    out->last_error_code       = g_payload_last_error_code;
-    out->last_error_count      = g_payload_last_error_count;
-    out->last_error_this       = g_payload_last_error_this;
-    payload_copy_trusted_label(out->last_error_op,
-                               sizeof(out->last_error_op),
-                               g_payload_last_error_op);
+    out->last_error_code = g_payload_last_error_code;
+    out->last_error_count = g_payload_last_error_count;
+    out->last_error_this = g_payload_last_error_this;
+    out->last_error_op_id = g_payload_last_error_op_id;
+    payload_copy_label(out->last_error_op,
+                       sizeof(out->last_error_op),
+                       g_payload_last_error_op);
 }

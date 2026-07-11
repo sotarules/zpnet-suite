@@ -8,44 +8,33 @@
 
 /*
   ============================================================================
-  Payload v3 — Stack-Safe JSON Carrier with Small-Entry Optimization
+  Payload v4 — Single-Store Typed JSON Carrier
   ============================================================================
 
   HARD CONTRACT:
 
-    • Payload has one authoritative semantic state: entry table + string arena.
-    • JSON text is a derived representation, never authoritative state.
-    • Keys and values live in one contiguous arena owned by the Payload.
-    • Entries store offsets into that arena, not raw string pointers.
-    • The object itself must remain cheap to place on the stack.
-    • Large capacity is obtained through explicit, bounded heap growth.
-    • All allocation failures are observable through PAYLOAD_INFO.
+    • Payload owns one contiguous storage region.
+    • The entry directory and all owned bytes live in that same region.
+    • Values retain their JSON type; strings are never reclassified by text.
+    • Add/attach operations are preflighted and committed transactionally.
+    • Failed add/copy operations leave the prior semantic document unchanged.
+    • parseJSON() is a replacement operation and clears on invalid input, matching
+      the established command-ingress contract.
+    • Nested objects and arrays are written directly; no temporary JSON heap
+      buffer is needed to attach a child.
+    • Empty and small Payloads use bounded inline storage. Larger Payloads use
+      one explicitly owned heap block, never independent entry/arena blocks.
+    • Object metadata is held with cheap redundant complements; heap blocks are
+      bound to their owning object by a pointer-derived cookie and complement.
+    • Corruption handling is fail-closed and quiet: no magic-number trap, stack
+      walk, logging recursion, or diagnostic Payload construction.
 
-  v3 root fix:
+  Compatibility:
 
-    v2 accidentally made Payload a ~2 KiB stack object when MAX_ENTRIES grew to
-    256 because the full entry table lived inline.  That created stack-boundary
-    faults in ordinary command/report paths.  v3 keeps only a small inline entry
-    cache in the object and spills to a bounded heap entry table only when a
-    Payload grows beyond ordinary command size.
-
-  Storage model:
-
-    • Entry table:
-        - first INLINE_ENTRIES entries live inside the object
-        - grows by realloc up to MAX_ENTRIES
-        - POD entries, safe to memcpy/realloc
-
-    • Arena:
-        - starts empty
-        - grows by realloc from ARENA_INITIAL up to ARENA_MAX
-        - clear() reuses capacity; destructor releases it
-
-  Serialization contract:
-
-    • write_json() returns bytes written, excluding NUL, on success.
-    • write_json() returns 0 on overflow or invalid state.
-    • to_json() is a legacy/debug convenience and may allocate.
+    The public API and payload_info_t telemetry shape remain source-compatible
+    with Payload v3. Legacy entry/arena telemetry fields are retained; in v4
+    they describe the single backing store where practical and remain zero when
+    a v3-only concept no longer exists.
 
   ============================================================================
 */
@@ -95,6 +84,13 @@ typedef struct {
   uint32_t to_json_fail;
   uint32_t string_truncation;
   uint32_t parse_error;
+  uint32_t json_invalid_syntax;
+  uint32_t json_invalid_depth;
+  uint32_t json_invalid_utf8_key;
+  uint32_t json_invalid_utf8_value;
+  uint32_t json_invalid_raw_object;
+  uint32_t json_invalid_raw_array;
+  uint32_t json_decode_fail;
   uint32_t integrity_fail;
   uint32_t invalid_kind;
 
@@ -109,6 +105,7 @@ typedef struct {
   uint32_t string_pointer_too_long;
   uint32_t last_string_pointer_fault_reason;
   uint32_t last_string_pointer_fault_ptr;
+  uint32_t last_string_pointer_fault_op_id;
   char     last_string_pointer_fault_context[32];
   uint32_t last_string_pointer_fault_key_ptr;
   char     last_string_pointer_fault_key[64];
@@ -153,11 +150,19 @@ typedef struct {
   uint32_t last_self_ok_fail_entry_val_off;
   uint32_t last_self_ok_fail_entry_val_len;
   uint32_t last_self_ok_fail_entry_kind;
+  uint32_t last_self_ok_fail_op_id;
+  uint32_t last_self_ok_fail_capacity;
+  uint32_t last_self_ok_fail_data_begin;
+  uint32_t last_self_ok_fail_expected_upper;
+  uint32_t last_self_ok_fail_key_end;
+  uint32_t last_self_ok_fail_val_end;
+  uint32_t first_self_ok_fail_captured;
 
   // Last internal error breadcrumb
   uint32_t last_error_code;
   uint32_t last_error_count;
   uint32_t last_error_this;
+  uint32_t last_error_op_id;
   char     last_error_op[32];
 
 } payload_info_t;
@@ -166,6 +171,7 @@ void payload_get_info(payload_info_t* out);
 const char* payload_error_code_name(uint32_t code);
 const char* payload_string_fault_reason_name(uint32_t reason);
 const char* payload_self_ok_fail_reason_name(uint32_t reason);
+const char* payload_operation_id_name(uint32_t operation_id);
 
 class Payload;
 class PayloadArray;
@@ -200,38 +206,22 @@ public:
     Payload();
     ~Payload();
 
-    // Move semantics (arena/entry ownership transfer when heap-backed)
     Payload(Payload&& other) noexcept;
     Payload& operator=(Payload&& other) noexcept;
 
-    // Copy (deep copy of arena + entries)
     Payload(const Payload& other);
     Payload& operator=(const Payload& other);
 
-    // --------------------------------------------------
     // Lifecycle
-    // --------------------------------------------------
-
     void clear();
     bool empty() const;
-
-    // --------------------------------------------------
-    // Cloning (explicit deep copy)
-    // --------------------------------------------------
-
     Payload clone() const;
 
-    // --------------------------------------------------
     // Serialization
-    // --------------------------------------------------
-
     size_t write_json(char* buf, size_t buf_size) const;
     String to_json() const;
 
-    // --------------------------------------------------
     // Semantic construction
-    // --------------------------------------------------
-
     void add(const char* key, int32_t value);
     void add(const char* key, uint32_t value);
     void add(const char* key, int64_t value);
@@ -268,18 +258,13 @@ public:
     void add_array(const char* key, const PayloadArray& arr);
     void add_raw_object(const char* key, const char* raw_json_object);
 
-    // --------------------------------------------------
     // Parsing
-    // --------------------------------------------------
-
     bool parseJSON(const uint8_t* data, size_t len);
 
-    // --------------------------------------------------
     // Access
-    // --------------------------------------------------
-
     bool has(const char* key) const;
-
+    // Returned storage remains owned by this Payload and is stable until the
+    // next mutation, assignment, clear(), or destruction.
     const char* getString(const char* key) const;
 
     bool tryGetBool(const char* key, bool& out) const;
@@ -296,97 +281,125 @@ public:
     float    getFloat(const char* key, float default_value = 0.0f) const;
     double   getDouble(const char* key, double default_value = 0.0) const;
 
-    // --------------------------------------------------
     // Structured accessors
-    // --------------------------------------------------
-
     Payload      getPayload(const char* key) const;
     PayloadArray getArray(const char* key) const;
 
     bool             hasArray(const char* key) const;
     PayloadArrayView getArrayView(const char* key) const;
 
-    // --------------------------------------------------
     // Diagnostics
-    // --------------------------------------------------
-
-    size_t count() const { return _count; }
-    size_t arena_used() const { return _arena_used; }
-    size_t arena_capacity() const { return _arena_cap; }
-    size_t entry_capacity() const { return _entry_cap; }
-    bool heap_entries() const { return _entries != _inline_entries; }
+    size_t count() const;
+    size_t arena_used() const;
+    size_t arena_capacity() const;
+    size_t entry_capacity() const;
+    bool heap_entries() const;
 
     void debug_dump(const char* tag) const;
 
-    // --------------------------------------------------
-    // Limits
-    // --------------------------------------------------
-
-    // Operational ceilings.  Payload keeps only INLINE_ENTRIES in-object,
-    // so these values bound heap-backed report growth without changing the
-    // stack footprint.  Keep enough room for compact TIMEBASE rows while
-    // preventing full diagnostic reports from becoming enormous heap/transport
-    // transactions during active campaigns.
+    // Bounded operational ceilings
     static constexpr size_t INLINE_ENTRIES = 8;
-    static constexpr size_t MAX_ENTRIES    = 256;
+    static constexpr size_t MAX_ENTRIES    = 512;
     static constexpr size_t ARENA_INITIAL  = 512;
-    static constexpr size_t ARENA_MAX      = 16384;
+    static constexpr size_t ARENA_MAX      = 49152;
 
-    // The crash-hunt Payload courtroom was useful, but it made every add(),
-    // find(), and write_json() repeatedly walk the entire entry table/arena.
-    // In normal operation keep only cheap structural checks.  Flip true only
-    // for a dedicated Payload autopsy build.
-    static constexpr bool HEAVY_FORENSICS = true;
-
-    static_assert(
-        ARENA_MAX <= UINT16_MAX,
-        "Payload ARENA_MAX exceeds uint16_t offset capacity"
-    );
+    // Retained only so existing build/report code continues to compile.
+    // Payload v4 has no heavy operational courtroom.
+    static constexpr bool HEAVY_FORENSICS = false;
 
 private:
     friend void payload_get_info(payload_info_t* out);
+    friend class PayloadArray;
+
+    enum class ValueKind : uint8_t {
+        STRING = 1,
+        NUMBER = 2,
+        BOOLEAN = 3,
+        NIL = 4,
+        OBJECT = 5,
+        ARRAY = 6,
+    };
 
     struct Entry {
         uint16_t key_off;
+        uint16_t key_len;
         uint16_t val_off;
         uint16_t val_len;
-        char     kind;       // 'p' = primitive, 'o' = object, 'a' = array
-        uint8_t  _pad;
+        uint8_t  kind;
+        uint8_t  reserved;
     };
 
-    static constexpr uint32_t MAGIC_LIVE = 0x5041594Cu; // "PAYL"
-    static constexpr uint32_t MAGIC_DEAD = 0x44454144u; // "DEAD"
+    static constexpr size_t INLINE_STORAGE = 256;
+    static constexpr size_t STORAGE_MAX =
+        ARENA_MAX + MAX_ENTRIES * sizeof(Entry);
 
-    uint32_t _magic;
-    Entry*   _entries;
-    size_t   _count;
-    size_t   _entry_cap;
+    static_assert(INLINE_STORAGE >= sizeof(Entry),
+                  "Payload inline store cannot hold one entry");
+    static_assert(ARENA_MAX <= UINT16_MAX,
+                  "Payload ARENA_MAX exceeds uint16_t storage offsets");
+    static_assert(STORAGE_MAX <= UINT16_MAX,
+                  "Payload STORAGE_MAX exceeds uint16_t storage offsets");
 
-    char*    _arena;
-    size_t   _arena_used;
-    size_t   _arena_cap;
+    void*     _heap_block;
+    uintptr_t _heap_block_guard;
+    uint16_t  _count;
+    uint16_t  _count_guard;
+    uint16_t  _data_begin;
+    uint16_t  _data_begin_guard;
+    alignas(uint32_t) uint8_t _inline_storage[INLINE_STORAGE];
 
-    Entry    _inline_entries[INLINE_ENTRIES];
+    bool _heap_guard_ok() const;
+    bool _count_guard_ok() const;
+    bool _data_begin_guard_ok() const;
+    void _set_heap_block(void* block);
+    void _set_count(uint16_t count);
+    void _set_data_begin(uint16_t data_begin);
 
-    bool _ensure_entries(size_t needed_count);
-    bool _ensure_arena(size_t additional);
-    bool _self_ok(const char* op) const;
+    uint8_t* _storage();
+    const uint8_t* _storage() const;
+    size_t _capacity() const;
+    size_t _data_used() const;
 
+    Entry* _entries();
+    const Entry* _entries() const;
+
+    void _reset_empty();
     void _release_storage();
     void _move_from(Payload& other);
     bool _copy_from(const Payload& other);
 
-    uint16_t _put(const char* str, size_t len);
-    uint16_t _put(const char* str);
-
-    bool _entry_key_ok(const Entry& e, const char* op, size_t* out_len = nullptr) const;
-    bool _entry_value_ok(const Entry& e, const char* op, size_t* out_len = nullptr) const;
-    const char* _primitive_value(const char* key, const char* op, size_t* out_len = nullptr) const;
-
-    const char* _at(uint16_t offset) const;
+    bool _self_ok(uint32_t operation_id) const;
+    bool _entry_ok(const Entry& e, size_t index, uint32_t operation_id) const;
+    bool _layout_ok(uint32_t operation_id) const;
+    const Entry* _find(const char* key, size_t key_len) const;
     const Entry* _find(const char* key) const;
 
-    void _add_entry(const char* key, const char* value, size_t value_len, char kind);
+    bool _ensure_room(size_t additional_entries,
+                      size_t additional_data,
+                      int32_t* data_shift = nullptr);
+
+    bool _append_value(const char* key,
+                       size_t key_len,
+                       const char* value,
+                       size_t value_len,
+                       ValueKind kind);
+
+    void _add_floating(const char* key,
+                       double value,
+                       int precision,
+                       uint32_t operation_id);
+
+    bool _append_value_writer(const char* key,
+                              size_t key_len,
+                              size_t value_len,
+                              ValueKind kind,
+                              const Payload* object_value,
+                              const PayloadArray* array_value);
+
+    size_t _json_size() const;
+    size_t _write_json_unchecked(char* buf) const;
+
+    const char* _value_ptr(const Entry& e) const;
 };
 
 // ============================================================================
@@ -396,24 +409,49 @@ private:
 class PayloadArray {
 public:
     PayloadArray();
+    ~PayloadArray();
+
+    PayloadArray(const PayloadArray& other);
+    PayloadArray& operator=(const PayloadArray& other);
+    PayloadArray(PayloadArray&& other) noexcept;
+    PayloadArray& operator=(PayloadArray&& other) noexcept;
 
     void clear();
     bool empty() const;
 
     String to_json() const;
-
     void add(const Payload& obj);
-
     bool parseJSON(const char* json);
 
     size_t  size() const;
     Payload get(size_t idx) const;
 
 private:
-    String _buf;
-    bool   _first;
+    friend class Payload;
 
-    static constexpr size_t MAX_ITEMS = 16;
-    Payload _items[MAX_ITEMS];
-    size_t  _item_count;
+    static constexpr size_t INLINE_STORAGE = 256;
+    static constexpr size_t STORAGE_MAX = Payload::ARENA_MAX;
+
+    void*     _heap_block;
+    uintptr_t _heap_block_guard;
+    uint16_t  _length;
+    uint16_t  _length_guard;
+    alignas(uint32_t) char _inline_storage[INLINE_STORAGE];
+
+    bool _heap_guard_ok() const;
+    bool _length_guard_ok() const;
+    void _set_heap_block(void* block);
+    void _set_length(uint16_t length);
+
+    char* _data();
+    const char* _data() const;
+    size_t _capacity() const;
+    bool _self_ok() const;
+    bool _ensure_capacity(size_t needed);
+    void _release_storage();
+    void _move_from(PayloadArray& other);
+    bool _copy_from(const PayloadArray& other);
+
+    size_t _json_size() const;
+    size_t _write_json_unchecked(char* out) const;
 };
