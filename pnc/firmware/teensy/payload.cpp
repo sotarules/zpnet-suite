@@ -52,6 +52,55 @@ static volatile uint32_t g_payload_json_decode_fail = 0;
 static volatile uint32_t g_payload_integrity_fail = 0;
 static volatile uint32_t g_payload_invalid_kind = 0;
 
+// Invalid programmatic numeric inputs are represented as JSON null.  These are
+// admission facts, not Payload corruption, and therefore do not increment the
+// integrity/self-ok courts.
+static volatile uint32_t g_payload_numeric_null_substitution = 0;
+static volatile uint32_t g_payload_numeric_nonfinite = 0;
+static volatile uint32_t g_payload_numeric_nan = 0;
+static volatile uint32_t g_payload_numeric_positive_infinity = 0;
+static volatile uint32_t g_payload_numeric_negative_infinity = 0;
+static volatile uint32_t g_payload_numeric_invalid_token = 0;
+static volatile uint32_t g_payload_numeric_format_failure = 0;
+static volatile uint32_t g_payload_numeric_null_insert_fail = 0;
+static volatile uint32_t g_payload_last_numeric_reject_reason = 0;
+static volatile uint32_t g_payload_last_numeric_reject_op_id = 0;
+static volatile uint32_t g_payload_last_numeric_reject_this = 0;
+static char g_payload_last_numeric_reject_key[64] = {0};
+static volatile uint64_t g_payload_last_numeric_reject_value_bits = 0;
+static volatile int32_t g_payload_last_numeric_reject_precision = 0;
+static volatile int32_t g_payload_last_numeric_reject_format_return = 0;
+static volatile int32_t g_payload_last_numeric_reject_snprintf_return = 0;
+static volatile uint32_t g_payload_last_numeric_reject_text_len = 0;
+static volatile uint32_t g_payload_last_numeric_reject_text_terminated = 0;
+static volatile uint32_t g_payload_last_numeric_reject_text_truncated = 0;
+static char g_payload_last_numeric_reject_format[16] = {0};
+static char g_payload_last_numeric_reject_text_printable[64] = {0};
+static char g_payload_last_numeric_reject_text_hex[129] = {0};
+
+// Serialization-time semantic evidence.  Admission should prevent these in
+// normal operation; a surviving failure is retained as first-failure evidence.
+static volatile uint32_t g_payload_semantic_validation_fail = 0;
+static volatile uint32_t g_payload_semantic_invalid_kind = 0;
+static volatile uint32_t g_payload_semantic_invalid_key_utf8 = 0;
+static volatile uint32_t g_payload_semantic_invalid_string_utf8 = 0;
+static volatile uint32_t g_payload_semantic_invalid_number_token = 0;
+static volatile uint32_t g_payload_semantic_invalid_boolean_token = 0;
+static volatile uint32_t g_payload_semantic_invalid_null_token = 0;
+static volatile uint32_t g_payload_semantic_invalid_object_json = 0;
+static volatile uint32_t g_payload_semantic_invalid_array_json = 0;
+static volatile uint32_t g_payload_first_semantic_fail_captured = 0;
+static volatile uint32_t g_payload_first_semantic_fail_reason = 0;
+static volatile uint32_t g_payload_first_semantic_fail_op_id = 0;
+static volatile uint32_t g_payload_first_semantic_fail_this = 0;
+static volatile uint32_t g_payload_first_semantic_fail_entry_index = 0xFFFFFFFFUL;
+static volatile uint32_t g_payload_first_semantic_fail_entry_kind = 0;
+static volatile uint32_t g_payload_first_semantic_fail_key_off = 0;
+static volatile uint32_t g_payload_first_semantic_fail_key_len = 0;
+static volatile uint32_t g_payload_first_semantic_fail_val_off = 0;
+static volatile uint32_t g_payload_first_semantic_fail_val_len = 0;
+static char g_payload_first_semantic_fail_key[64] = {0};
+
 static volatile uint32_t g_payload_string_pointer_fault = 0;
 static volatile uint32_t g_payload_string_pointer_null = 0;
 static volatile uint32_t g_payload_string_pointer_low_address = 0;
@@ -141,6 +190,9 @@ enum payload_error_code_t : uint32_t {
     PAYLOAD_ERR_BAD_STRING_POINTER = 13,
     PAYLOAD_ERR_STORAGE_CORRUPT = 14,
     PAYLOAD_ERR_JSON_INVALID = 15,
+    PAYLOAD_ERR_NONFINITE_NUMBER = 16,
+    PAYLOAD_ERR_INVALID_NUMERIC_TOKEN = 17,
+    PAYLOAD_ERR_INVALID_CHILD = 18,
 };
 
 const char* payload_error_code_name(uint32_t code) {
@@ -161,6 +213,9 @@ const char* payload_error_code_name(uint32_t code) {
         case PAYLOAD_ERR_BAD_STRING_POINTER: return "BAD_STRING_POINTER";
         case PAYLOAD_ERR_STORAGE_CORRUPT:    return "STORAGE_CORRUPT";
         case PAYLOAD_ERR_JSON_INVALID:       return "JSON_INVALID";
+        case PAYLOAD_ERR_NONFINITE_NUMBER:   return "NONFINITE_NUMBER";
+        case PAYLOAD_ERR_INVALID_NUMERIC_TOKEN: return "INVALID_NUMERIC_TOKEN";
+        case PAYLOAD_ERR_INVALID_CHILD:      return "INVALID_CHILD";
         default:                             return "UNKNOWN";
     }
 }
@@ -244,6 +299,55 @@ const char* payload_self_ok_fail_reason_name(uint32_t reason) {
         case PAYLOAD_SELF_OK_ENTRY_VAL_UNTERMINATED:      return "ENTRY_VAL_UNTERMINATED";
         case PAYLOAD_SELF_OK_ENTRY_KEY_UNTERMINATED:      return "ENTRY_KEY_UNTERMINATED";
         default:                                          return "UNKNOWN";
+    }
+}
+
+
+enum payload_numeric_reject_reason_t : uint32_t {
+    PAYLOAD_NUMERIC_REJECT_NONE = 0,
+    PAYLOAD_NUMERIC_REJECT_NAN = 1,
+    PAYLOAD_NUMERIC_REJECT_POSITIVE_INFINITY = 2,
+    PAYLOAD_NUMERIC_REJECT_NEGATIVE_INFINITY = 3,
+    PAYLOAD_NUMERIC_REJECT_INVALID_TOKEN = 4,
+    PAYLOAD_NUMERIC_REJECT_FORMAT_FAILURE = 5,
+};
+
+const char* payload_numeric_reject_reason_name(uint32_t reason) {
+    switch (reason) {
+        case PAYLOAD_NUMERIC_REJECT_NONE: return "NONE";
+        case PAYLOAD_NUMERIC_REJECT_NAN: return "NAN";
+        case PAYLOAD_NUMERIC_REJECT_POSITIVE_INFINITY: return "POSITIVE_INFINITY";
+        case PAYLOAD_NUMERIC_REJECT_NEGATIVE_INFINITY: return "NEGATIVE_INFINITY";
+        case PAYLOAD_NUMERIC_REJECT_INVALID_TOKEN: return "INVALID_TOKEN";
+        case PAYLOAD_NUMERIC_REJECT_FORMAT_FAILURE: return "FORMAT_FAILURE";
+        default: return "UNKNOWN";
+    }
+}
+
+enum payload_semantic_fail_reason_t : uint32_t {
+    PAYLOAD_SEMANTIC_FAIL_NONE = 0,
+    PAYLOAD_SEMANTIC_FAIL_INVALID_KIND = 1,
+    PAYLOAD_SEMANTIC_FAIL_KEY_UTF8 = 2,
+    PAYLOAD_SEMANTIC_FAIL_STRING_UTF8 = 3,
+    PAYLOAD_SEMANTIC_FAIL_NUMBER_TOKEN = 4,
+    PAYLOAD_SEMANTIC_FAIL_BOOLEAN_TOKEN = 5,
+    PAYLOAD_SEMANTIC_FAIL_NULL_TOKEN = 6,
+    PAYLOAD_SEMANTIC_FAIL_OBJECT_JSON = 7,
+    PAYLOAD_SEMANTIC_FAIL_ARRAY_JSON = 8,
+};
+
+const char* payload_semantic_fail_reason_name(uint32_t reason) {
+    switch (reason) {
+        case PAYLOAD_SEMANTIC_FAIL_NONE: return "NONE";
+        case PAYLOAD_SEMANTIC_FAIL_INVALID_KIND: return "INVALID_KIND";
+        case PAYLOAD_SEMANTIC_FAIL_KEY_UTF8: return "KEY_UTF8";
+        case PAYLOAD_SEMANTIC_FAIL_STRING_UTF8: return "STRING_UTF8";
+        case PAYLOAD_SEMANTIC_FAIL_NUMBER_TOKEN: return "NUMBER_TOKEN";
+        case PAYLOAD_SEMANTIC_FAIL_BOOLEAN_TOKEN: return "BOOLEAN_TOKEN";
+        case PAYLOAD_SEMANTIC_FAIL_NULL_TOKEN: return "NULL_TOKEN";
+        case PAYLOAD_SEMANTIC_FAIL_OBJECT_JSON: return "OBJECT_JSON";
+        case PAYLOAD_SEMANTIC_FAIL_ARRAY_JSON: return "ARRAY_JSON";
+        default: return "UNKNOWN";
     }
 }
 
@@ -505,6 +609,194 @@ static void payload_copy_label(char* dst, size_t cap, const char* src) {
         ++i;
     }
     dst[i] = '\0';
+}
+
+
+static void payload_copy_span_label(char* dst,
+                                    size_t cap,
+                                    const char* src,
+                                    size_t len) {
+    if (!dst || cap == 0) return;
+    if (!src) len = 0;
+    if (len >= cap) len = cap - 1U;
+    if (len != 0) memcpy(dst, src, len);
+    dst[len] = '\0';
+}
+
+static size_t payload_bounded_local_strlen(const char* text,
+                                           size_t capacity,
+                                           bool* terminated) {
+    if (terminated) *terminated = false;
+    if (!text || capacity == 0U) return 0U;
+    for (size_t i = 0; i < capacity; ++i) {
+        if (text[i] == '\0') {
+            if (terminated) *terminated = true;
+            return i;
+        }
+    }
+    return capacity;
+}
+
+static char payload_hex_digit(uint8_t value) {
+    return value < 10U ? (char)('0' + value)
+                       : (char)('A' + (value - 10U));
+}
+
+static void payload_capture_numeric_text(const char* text,
+                                         size_t capacity,
+                                         int formatter_return) {
+    bool terminated = false;
+    const size_t observed_len =
+        payload_bounded_local_strlen(text, capacity, &terminated);
+    const size_t retained_len = observed_len < 63U ? observed_len : 63U;
+
+    for (size_t i = 0; i < retained_len; ++i) {
+        const uint8_t byte = (uint8_t)text[i];
+        g_payload_last_numeric_reject_text_printable[i] =
+            (byte >= 0x20U && byte <= 0x7EU) ? (char)byte : '.';
+    }
+    g_payload_last_numeric_reject_text_printable[retained_len] = '\0';
+
+    const size_t hex_len = observed_len < 64U ? observed_len : 64U;
+    for (size_t i = 0; i < hex_len; ++i) {
+        const uint8_t byte = (uint8_t)text[i];
+        g_payload_last_numeric_reject_text_hex[i * 2U] =
+            payload_hex_digit((uint8_t)(byte >> 4));
+        g_payload_last_numeric_reject_text_hex[i * 2U + 1U] =
+            payload_hex_digit((uint8_t)(byte & 0x0FU));
+    }
+    g_payload_last_numeric_reject_text_hex[hex_len * 2U] = '\0';
+
+    g_payload_last_numeric_reject_text_len = (uint32_t)observed_len;
+    g_payload_last_numeric_reject_text_terminated = terminated ? 1U : 0U;
+    g_payload_last_numeric_reject_text_truncated =
+        (!terminated || formatter_return < 0 ||
+         (size_t)formatter_return >= capacity) ? 1U : 0U;
+}
+
+static void payload_note_numeric_reject(uint32_t reason,
+                                        uint32_t operation_id,
+                                        const void* self,
+                                        const char* key,
+                                        size_t key_len,
+                                        double value,
+                                        int precision,
+                                        const char* format,
+                                        size_t format_capacity,
+                                        int format_return,
+                                        const char* text,
+                                        size_t text_capacity,
+                                        int snprintf_return) {
+    g_payload_last_numeric_reject_reason = reason;
+    g_payload_last_numeric_reject_op_id = operation_id;
+    g_payload_last_numeric_reject_this = (uint32_t)(uintptr_t)self;
+    payload_copy_span_label(g_payload_last_numeric_reject_key,
+                            sizeof(g_payload_last_numeric_reject_key),
+                            key,
+                            key_len);
+
+    uint64_t value_bits = 0U;
+    static_assert(sizeof(value_bits) == sizeof(value),
+                  "double evidence size mismatch");
+    memcpy(&value_bits, &value, sizeof(value_bits));
+    g_payload_last_numeric_reject_value_bits = value_bits;
+    g_payload_last_numeric_reject_precision = precision;
+    g_payload_last_numeric_reject_format_return = format_return;
+    g_payload_last_numeric_reject_snprintf_return = snprintf_return;
+
+    bool format_terminated = false;
+    const size_t format_len =
+        payload_bounded_local_strlen(format, format_capacity, &format_terminated);
+    (void)format_terminated;
+    payload_copy_span_label(g_payload_last_numeric_reject_format,
+                            sizeof(g_payload_last_numeric_reject_format),
+                            format,
+                            format_len);
+    payload_capture_numeric_text(text, text_capacity, snprintf_return);
+
+    switch (reason) {
+        case PAYLOAD_NUMERIC_REJECT_NAN:
+            g_payload_numeric_nonfinite++;
+            g_payload_numeric_nan++;
+            break;
+        case PAYLOAD_NUMERIC_REJECT_POSITIVE_INFINITY:
+            g_payload_numeric_nonfinite++;
+            g_payload_numeric_positive_infinity++;
+            break;
+        case PAYLOAD_NUMERIC_REJECT_NEGATIVE_INFINITY:
+            g_payload_numeric_nonfinite++;
+            g_payload_numeric_negative_infinity++;
+            break;
+        case PAYLOAD_NUMERIC_REJECT_INVALID_TOKEN:
+            g_payload_numeric_invalid_token++;
+            break;
+        case PAYLOAD_NUMERIC_REJECT_FORMAT_FAILURE:
+            g_payload_numeric_format_failure++;
+            break;
+        default:
+            break;
+    }
+}
+
+static void payload_increment_semantic_reason(uint32_t reason) {
+    switch (reason) {
+        case PAYLOAD_SEMANTIC_FAIL_INVALID_KIND:
+            g_payload_semantic_invalid_kind++;
+            break;
+        case PAYLOAD_SEMANTIC_FAIL_KEY_UTF8:
+            g_payload_semantic_invalid_key_utf8++;
+            break;
+        case PAYLOAD_SEMANTIC_FAIL_STRING_UTF8:
+            g_payload_semantic_invalid_string_utf8++;
+            break;
+        case PAYLOAD_SEMANTIC_FAIL_NUMBER_TOKEN:
+            g_payload_semantic_invalid_number_token++;
+            break;
+        case PAYLOAD_SEMANTIC_FAIL_BOOLEAN_TOKEN:
+            g_payload_semantic_invalid_boolean_token++;
+            break;
+        case PAYLOAD_SEMANTIC_FAIL_NULL_TOKEN:
+            g_payload_semantic_invalid_null_token++;
+            break;
+        case PAYLOAD_SEMANTIC_FAIL_OBJECT_JSON:
+            g_payload_semantic_invalid_object_json++;
+            break;
+        case PAYLOAD_SEMANTIC_FAIL_ARRAY_JSON:
+            g_payload_semantic_invalid_array_json++;
+            break;
+        default:
+            break;
+    }
+}
+
+static void payload_note_semantic_failure(uint32_t reason,
+                                          uint32_t operation_id,
+                                          const void* self,
+                                          size_t entry_index,
+                                          uint8_t entry_kind,
+                                          uint16_t key_off,
+                                          uint16_t key_len,
+                                          uint16_t val_off,
+                                          uint16_t val_len,
+                                          const char* key) {
+    g_payload_semantic_validation_fail++;
+    payload_increment_semantic_reason(reason);
+
+    if (g_payload_first_semantic_fail_captured != 0U) return;
+    g_payload_first_semantic_fail_captured = 1U;
+    g_payload_first_semantic_fail_reason = reason;
+    g_payload_first_semantic_fail_op_id = operation_id;
+    g_payload_first_semantic_fail_this = (uint32_t)(uintptr_t)self;
+    g_payload_first_semantic_fail_entry_index = (uint32_t)entry_index;
+    g_payload_first_semantic_fail_entry_kind = entry_kind;
+    g_payload_first_semantic_fail_key_off = key_off;
+    g_payload_first_semantic_fail_key_len = key_len;
+    g_payload_first_semantic_fail_val_off = val_off;
+    g_payload_first_semantic_fail_val_len = val_len;
+    payload_copy_span_label(g_payload_first_semantic_fail_key,
+                            sizeof(g_payload_first_semantic_fail_key),
+                            key,
+                            key_len);
 }
 
 static inline void payload_note_error(uint32_t code,
@@ -1737,10 +2029,10 @@ bool Payload::_copy_from(const Payload& other) {
     return true;
 }
 
-void Payload::clear() {
+bool Payload::clear() {
     if (!_self_ok(PAYLOAD_OP_CLEAR)) {
         _release_storage();
-        return;
+        return false;
     }
 
     uint8_t* storage = _storage();
@@ -1751,6 +2043,7 @@ void Payload::clear() {
 
     _set_count(0U);
     _set_data_begin((uint16_t)_capacity());
+    return true;
 }
 
 bool Payload::empty() const {
@@ -2090,6 +2383,44 @@ bool Payload::_append_value(const char* key,
         return false;
     }
 
+    bool typed_value_valid = true;
+    switch (kind) {
+        case ValueKind::STRING:
+            break;
+        case ValueKind::NUMBER:
+            typed_value_valid = json_number_token_valid(value, value_len);
+            break;
+        case ValueKind::BOOLEAN:
+            typed_value_valid =
+                (value_len == 4U && memcmp(value, "true", 4U) == 0) ||
+                (value_len == 5U && memcmp(value, "false", 5U) == 0);
+            break;
+        case ValueKind::NIL:
+            typed_value_valid =
+                value_len == 4U && memcmp(value, "null", 4U) == 0;
+            break;
+        case ValueKind::OBJECT:
+            typed_value_valid = json_validate_exact(
+                reinterpret_cast<const uint8_t*>(value),
+                value_len,
+                json_value_type_t::OBJECT);
+            break;
+        case ValueKind::ARRAY:
+            typed_value_valid = json_validate_exact(
+                reinterpret_cast<const uint8_t*>(value),
+                value_len,
+                json_value_type_t::ARRAY);
+            break;
+        default:
+            typed_value_valid = false;
+            break;
+    }
+    if (!typed_value_valid) {
+        g_payload_invalid_kind++;
+        payload_note_error(PAYLOAD_ERR_JSON_INVALID, PAYLOAD_OP_APPEND_VALUE, this);
+        return false;
+    }
+
     const uint8_t* old_storage = _storage();
     const size_t old_capacity = _capacity();
     const size_t old_data_begin = _data_begin;
@@ -2307,80 +2638,80 @@ static bool payload_format_checked(char* out,
 // Semantic construction
 // ============================================================================
 
-void Payload::add(const char* key, int32_t value) {
+bool Payload::add(const char* key, int32_t value) {
     size_t key_len = 0;
     if (!payload_key_length(key, &key_len)) {
         payload_note_bad_key(key);
         payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER, PAYLOAD_OP_ADD_I32_KEY, this);
-        return;
+        return false;
     }
     char text[16];
     size_t len = 0;
     if (!payload_format_checked(text, sizeof(text),
                                 snprintf(text, sizeof(text), "%ld", (long)value),
                                 PAYLOAD_OP_ADD_I32, this, &len)) {
-        return;
+        return false;
     }
-    _append_value(key ? key : "", key_len, text, len, ValueKind::NUMBER);
+    return _append_value(key ? key : "", key_len, text, len, ValueKind::NUMBER);
 }
 
-void Payload::add(const char* key, uint32_t value) {
+bool Payload::add(const char* key, uint32_t value) {
     size_t key_len = 0;
     if (!payload_key_length(key, &key_len)) {
         payload_note_bad_key(key);
         payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER, PAYLOAD_OP_ADD_U32_KEY, this);
-        return;
+        return false;
     }
     char text[16];
     size_t len = 0;
     if (!payload_format_checked(text, sizeof(text),
                                 snprintf(text, sizeof(text), "%lu", (unsigned long)value),
                                 PAYLOAD_OP_ADD_U32, this, &len)) {
-        return;
+        return false;
     }
-    _append_value(key ? key : "", key_len, text, len, ValueKind::NUMBER);
+    return _append_value(key ? key : "", key_len, text, len, ValueKind::NUMBER);
 }
 
-void Payload::add(const char* key, int64_t value) {
+bool Payload::add(const char* key, int64_t value) {
     size_t key_len = 0;
     if (!payload_key_length(key, &key_len)) {
         payload_note_bad_key(key);
         payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER, PAYLOAD_OP_ADD_I64_KEY, this);
-        return;
+        return false;
     }
     char text[32];
     size_t len = 0;
     if (!payload_format_checked(text, sizeof(text),
                                 snprintf(text, sizeof(text), "%lld", (long long)value),
                                 PAYLOAD_OP_ADD_I64, this, &len)) {
-        return;
+        return false;
     }
-    _append_value(key ? key : "", key_len, text, len, ValueKind::NUMBER);
+    return _append_value(key ? key : "", key_len, text, len, ValueKind::NUMBER);
 }
 
-void Payload::add(const char* key, uint64_t value) {
+bool Payload::add(const char* key, uint64_t value) {
     size_t key_len = 0;
     if (!payload_key_length(key, &key_len)) {
         payload_note_bad_key(key);
         payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER, PAYLOAD_OP_ADD_U64_KEY, this);
-        return;
+        return false;
     }
     char text[32];
     size_t len = 0;
     if (!payload_format_checked(text, sizeof(text),
                                 snprintf(text, sizeof(text), "%llu", (unsigned long long)value),
                                 PAYLOAD_OP_ADD_U64, this, &len)) {
-        return;
+        return false;
     }
-    _append_value(key ? key : "", key_len, text, len, ValueKind::NUMBER);
+    return _append_value(key ? key : "", key_len, text, len, ValueKind::NUMBER);
 }
 
-void Payload::add(const char* key, const char* value) {
+bool Payload::add(const char* key, const char* value) {
     size_t key_len = 0;
     if (!payload_key_length(key, &key_len)) {
         payload_note_bad_key(key);
         payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER, PAYLOAD_OP_ADD_CSTR_KEY, this);
-        return;
+        return false;
     }
 
     if (!value) value = "";
@@ -2392,29 +2723,29 @@ void Payload::add(const char* key, const char* value) {
                                   false)) {
         payload_note_bad_key(key);
         payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER, PAYLOAD_OP_ADD_CSTR_VALUE, this);
-        return;
+        return false;
     }
-    _append_value(key ? key : "", key_len,
-                  value, value_len, ValueKind::STRING);
+    return _append_value(key ? key : "", key_len,
+                         value, value_len, ValueKind::STRING);
 }
 
-void Payload::add(const char* key, const String& value) {
-    add(key, value.c_str());
+bool Payload::add(const char* key, const String& value) {
+    return add(key, value.c_str());
 }
 
-void Payload::add(const char* key, bool value) {
+bool Payload::add(const char* key, bool value) {
     size_t key_len = 0;
     if (!payload_key_length(key, &key_len)) {
         payload_note_bad_key(key);
         payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER, PAYLOAD_OP_ADD_BOOL_KEY, this);
-        return;
+        return false;
     }
     const char* text = value ? "true" : "false";
-    _append_value(key ? key : "", key_len,
-                  text, value ? 4U : 5U, ValueKind::BOOLEAN);
+    return _append_value(key ? key : "", key_len,
+                         text, value ? 4U : 5U, ValueKind::BOOLEAN);
 }
 
-void Payload::_add_floating(const char* key,
+bool Payload::_add_floating(const char* key,
                             double value,
                             int precision,
                             uint32_t operation_id) {
@@ -2422,51 +2753,95 @@ void Payload::_add_floating(const char* key,
     if (!payload_key_length(key, &key_len)) {
         payload_note_bad_key(key);
         payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER, operation_id, this);
-        return;
+        return false;
     }
 
     if (precision < 0) precision = 0;
     if (precision > 12) precision = 12;
 
-    char format[16];
-    const int format_n = snprintf(format, sizeof(format), "%%.%df", precision);
+    char format[16] = {0};
+    char text[64] = {0};
+    int format_n = 0;
+    int value_n = 0;
+
+    auto substitute_null = [&](uint32_t reason) -> bool {
+        payload_note_numeric_reject(reason,
+                                    operation_id,
+                                    this,
+                                    key ? key : "",
+                                    key_len,
+                                    value,
+                                    precision,
+                                    format,
+                                    sizeof(format),
+                                    format_n,
+                                    text,
+                                    sizeof(text),
+                                    value_n);
+        const bool inserted = _append_value(key ? key : "",
+                                            key_len,
+                                            "null",
+                                            4U,
+                                            ValueKind::NIL);
+        if (inserted) {
+            g_payload_numeric_null_substitution++;
+        } else {
+            g_payload_numeric_null_insert_fail++;
+        }
+        return false;
+    };
+
+    if (!isfinite(value)) {
+        uint32_t reason = PAYLOAD_NUMERIC_REJECT_NAN;
+        if (isinf(value)) {
+            reason = signbit(value)
+                ? PAYLOAD_NUMERIC_REJECT_NEGATIVE_INFINITY
+                : PAYLOAD_NUMERIC_REJECT_POSITIVE_INFINITY;
+        }
+        payload_note_error(PAYLOAD_ERR_NONFINITE_NUMBER, operation_id, this);
+        return substitute_null(reason);
+    }
+
+    format_n = snprintf(format, sizeof(format), "%%.%df", precision);
     if (format_n <= 0 || (size_t)format_n >= sizeof(format)) {
         payload_note_error(PAYLOAD_ERR_STRING_TRUNCATION, operation_id, this);
-        return;
+        return substitute_null(PAYLOAD_NUMERIC_REJECT_FORMAT_FAILURE);
     }
 
-    char text[64];
     size_t len = 0;
+    value_n = snprintf(text, sizeof(text), format, value);
     if (!payload_format_checked(text, sizeof(text),
-                                snprintf(text, sizeof(text), format, value),
+                                value_n,
                                 operation_id, this, &len)) {
-        return;
+        return substitute_null(PAYLOAD_NUMERIC_REJECT_FORMAT_FAILURE);
     }
 
-    const ValueKind kind = isfinite(value)
-        ? ValueKind::NUMBER
-        : ValueKind::STRING;
-    _append_value(key ? key : "", key_len, text, len, kind);
+    if (!json_number_token_valid(text, len)) {
+        payload_note_error(PAYLOAD_ERR_INVALID_NUMERIC_TOKEN, operation_id, this);
+        return substitute_null(PAYLOAD_NUMERIC_REJECT_INVALID_TOKEN);
+    }
+
+    return _append_value(key ? key : "", key_len, text, len, ValueKind::NUMBER);
 }
 
-void Payload::add(const char* key, float value) {
-    _add_floating(key, (double)value, 6, PAYLOAD_OP_ADD_FLOAT);
+bool Payload::add(const char* key, float value) {
+    return _add_floating(key, (double)value, 6, PAYLOAD_OP_ADD_FLOAT);
 }
 
-void Payload::add(const char* key, double value) {
-    _add_floating(key, value, 6, PAYLOAD_OP_ADD_DOUBLE);
+bool Payload::add(const char* key, double value) {
+    return _add_floating(key, value, 6, PAYLOAD_OP_ADD_DOUBLE);
 }
 
-void Payload::add(const char* key, double value, int precision) {
-    _add_floating(key, value, precision, PAYLOAD_OP_ADD_DOUBLE_PRECISION);
+bool Payload::add(const char* key, double value, int precision) {
+    return _add_floating(key, value, precision, PAYLOAD_OP_ADD_DOUBLE_PRECISION);
 }
 
-void Payload::add_fmt(const char* key, const char* fmt, ...) {
+bool Payload::add_fmt(const char* key, const char* fmt, ...) {
     size_t key_len = 0;
     if (!payload_key_length(key, &key_len)) {
         payload_note_bad_key(key);
         payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER, PAYLOAD_OP_ADD_FMT_KEY, this);
-        return;
+        return false;
     }
 
     if (!fmt) fmt = "";
@@ -2475,7 +2850,7 @@ void Payload::add_fmt(const char* key, const char* fmt, ...) {
         (void)fmt_len;
         payload_note_bad_key(key);
         payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER, PAYLOAD_OP_ADD_FMT_FORMAT, this);
-        return;
+        return false;
     }
 
     char text[128];
@@ -2487,50 +2862,58 @@ void Payload::add_fmt(const char* key, const char* fmt, ...) {
     size_t value_len = 0;
     if (!payload_format_checked(text, sizeof(text), n,
                                 PAYLOAD_OP_ADD_FMT, this, &value_len)) {
-        return;
+        return false;
     }
-    _append_value(key ? key : "", key_len,
-                  text, value_len, ValueKind::STRING);
+    return _append_value(key ? key : "", key_len,
+                         text, value_len, ValueKind::STRING);
 }
 
-void Payload::add_object(const char* key, const Payload& obj) {
+bool Payload::add_object(const char* key, const Payload& obj) {
     size_t key_len = 0;
     if (!payload_key_length(key, &key_len)) {
         payload_note_bad_key(key);
         payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER, PAYLOAD_OP_ADD_OBJECT_KEY, this);
-        return;
+        return false;
     }
     const size_t value_len = obj._json_size();
-    if (value_len == 0 || value_len > UINT16_MAX) {
-        payload_note_error(PAYLOAD_ERR_SERIALIZE_OVERFLOW, PAYLOAD_OP_ADD_OBJECT_VALUE, this);
-        return;
+    if (value_len == 0) {
+        payload_note_error(PAYLOAD_ERR_INVALID_CHILD, PAYLOAD_OP_ADD_OBJECT_VALUE, this);
+        return false;
     }
-    _append_value_writer(key ? key : "", key_len,
-                         value_len, ValueKind::OBJECT, &obj, nullptr);
+    if (value_len > UINT16_MAX) {
+        payload_note_error(PAYLOAD_ERR_SERIALIZE_OVERFLOW, PAYLOAD_OP_ADD_OBJECT_VALUE, this);
+        return false;
+    }
+    return _append_value_writer(key ? key : "", key_len,
+                                value_len, ValueKind::OBJECT, &obj, nullptr);
 }
 
-void Payload::add_array(const char* key, const PayloadArray& arr) {
+bool Payload::add_array(const char* key, const PayloadArray& arr) {
     size_t key_len = 0;
     if (!payload_key_length(key, &key_len)) {
         payload_note_bad_key(key);
         payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER, PAYLOAD_OP_ADD_ARRAY_KEY, this);
-        return;
+        return false;
     }
     const size_t value_len = arr._json_size();
-    if (value_len == 0 || value_len > UINT16_MAX) {
-        payload_note_error(PAYLOAD_ERR_SERIALIZE_OVERFLOW, PAYLOAD_OP_ADD_ARRAY_VALUE, this);
-        return;
+    if (value_len == 0) {
+        payload_note_error(PAYLOAD_ERR_INVALID_CHILD, PAYLOAD_OP_ADD_ARRAY_VALUE, this);
+        return false;
     }
-    _append_value_writer(key ? key : "", key_len,
-                         value_len, ValueKind::ARRAY, nullptr, &arr);
+    if (value_len > UINT16_MAX) {
+        payload_note_error(PAYLOAD_ERR_SERIALIZE_OVERFLOW, PAYLOAD_OP_ADD_ARRAY_VALUE, this);
+        return false;
+    }
+    return _append_value_writer(key ? key : "", key_len,
+                                value_len, ValueKind::ARRAY, nullptr, &arr);
 }
 
-void Payload::add_raw_object(const char* key, const char* raw_json_object) {
+bool Payload::add_raw_object(const char* key, const char* raw_json_object) {
     size_t key_len = 0;
     if (!payload_key_length(key, &key_len)) {
         payload_note_bad_key(key);
         payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER, PAYLOAD_OP_ADD_RAW_KEY, this);
-        return;
+        return false;
     }
 
     size_t value_len = 0;
@@ -2548,12 +2931,12 @@ void Payload::add_raw_object(const char* key, const char* raw_json_object) {
         g_payload_parse_error++;
         g_payload_json_invalid_raw_object++;
         payload_note_error(PAYLOAD_ERR_JSON_INVALID, PAYLOAD_OP_ADD_RAW_VALUE, this);
-        return;
+        return false;
     }
-    _append_value(key ? key : "", key_len,
-                  raw_json_object + span.begin,
-                  span.end - span.begin,
-                  ValueKind::OBJECT);
+    return _append_value(key ? key : "", key_len,
+                         raw_json_object + span.begin,
+                         span.end - span.begin,
+                         ValueKind::OBJECT);
 }
 
 // ============================================================================
@@ -2571,45 +2954,86 @@ size_t Payload::_json_size() const {
         const Entry& e = entries[i];
         const char* value =
             reinterpret_cast<const char*>(storage + e.val_off);
-        bool value_valid = true;
+        uint32_t semantic_reason = PAYLOAD_SEMANTIC_FAIL_NONE;
         switch ((ValueKind)e.kind) {
             case ValueKind::STRING:
-                value_valid = payload_utf8_valid(value, e.val_len);
+                if (!payload_utf8_valid(value, e.val_len)) {
+                    semantic_reason = PAYLOAD_SEMANTIC_FAIL_STRING_UTF8;
+                }
                 break;
             case ValueKind::NUMBER:
-                value_valid = json_number_token_valid(value, e.val_len);
+                if (!json_number_token_valid(value, e.val_len)) {
+                    semantic_reason = PAYLOAD_SEMANTIC_FAIL_NUMBER_TOKEN;
+                }
                 break;
             case ValueKind::BOOLEAN:
-                value_valid =
-                    (e.val_len == 4U && memcmp(value, "true", 4U) == 0) ||
-                    (e.val_len == 5U && memcmp(value, "false", 5U) == 0);
+                if (!((e.val_len == 4U && memcmp(value, "true", 4U) == 0) ||
+                      (e.val_len == 5U && memcmp(value, "false", 5U) == 0))) {
+                    semantic_reason = PAYLOAD_SEMANTIC_FAIL_BOOLEAN_TOKEN;
+                }
                 break;
             case ValueKind::NIL:
-                value_valid = e.val_len == 4U && memcmp(value, "null", 4U) == 0;
+                if (!(e.val_len == 4U && memcmp(value, "null", 4U) == 0)) {
+                    semantic_reason = PAYLOAD_SEMANTIC_FAIL_NULL_TOKEN;
+                }
                 break;
             case ValueKind::OBJECT:
-                value_valid = json_validate_exact(
-                    reinterpret_cast<const uint8_t*>(value),
-                    e.val_len,
-                    json_value_type_t::OBJECT);
+                if (!json_validate_exact(
+                        reinterpret_cast<const uint8_t*>(value),
+                        e.val_len,
+                        json_value_type_t::OBJECT)) {
+                    semantic_reason = PAYLOAD_SEMANTIC_FAIL_OBJECT_JSON;
+                }
                 break;
             case ValueKind::ARRAY:
-                value_valid = json_validate_exact(
-                    reinterpret_cast<const uint8_t*>(value),
-                    e.val_len,
-                    json_value_type_t::ARRAY);
+                if (!json_validate_exact(
+                        reinterpret_cast<const uint8_t*>(value),
+                        e.val_len,
+                        json_value_type_t::ARRAY)) {
+                    semantic_reason = PAYLOAD_SEMANTIC_FAIL_ARRAY_JSON;
+                }
                 break;
             default:
-                value_valid = false;
+                semantic_reason = PAYLOAD_SEMANTIC_FAIL_INVALID_KIND;
                 break;
         }
-        if (!value_valid ||
-            !payload_utf8_valid(
-                reinterpret_cast<const char*>(storage + e.key_off),
-                e.key_len)) {
+        const char* entry_key =
+            reinterpret_cast<const char*>(storage + e.key_off);
+        if (semantic_reason == PAYLOAD_SEMANTIC_FAIL_NONE &&
+            !payload_utf8_valid(entry_key, e.key_len)) {
+            semantic_reason = PAYLOAD_SEMANTIC_FAIL_KEY_UTF8;
+        }
+        if (semantic_reason != PAYLOAD_SEMANTIC_FAIL_NONE) {
+            const size_t capacity = _capacity();
+            const payload_layout_evidence_t evidence = {
+                (uint32_t)i,
+                (uint32_t)capacity,
+                (uint32_t)_data_begin,
+                (uint32_t)_count,
+                (uint32_t)e.key_off,
+                (uint32_t)e.key_len,
+                (uint32_t)e.val_off,
+                (uint32_t)e.val_len,
+                (uint32_t)e.kind,
+                0U,
+                (uint32_t)((size_t)e.key_off + (size_t)e.key_len),
+                (uint32_t)((size_t)e.val_off + (size_t)e.val_len),
+            };
             g_payload_invalid_kind++;
+            payload_note_semantic_failure(semantic_reason,
+                                          PAYLOAD_OP_JSON_SIZE_VALUE,
+                                          this,
+                                          i,
+                                          e.kind,
+                                          e.key_off,
+                                          e.key_len,
+                                          e.val_off,
+                                          e.val_len,
+                                          entry_key);
             payload_note_integrity(PAYLOAD_SELF_OK_ENTRY_KIND_BAD,
-                                   PAYLOAD_OP_JSON_SIZE_VALUE, this);
+                                   PAYLOAD_OP_JSON_SIZE_VALUE,
+                                   this,
+                                   &evidence);
             return 0;
         }
 
@@ -3471,16 +3895,17 @@ bool PayloadArray::_copy_from(const PayloadArray& other) {
     return true;
 }
 
-void PayloadArray::clear() {
+bool PayloadArray::clear() {
     if (!_self_ok()) {
         _release_storage();
-        return;
+        return false;
     }
     char* data = _data();
     memset(data, 0, _capacity());
     data[0] = '[';
     data[1] = ']';
     _set_length(2U);
+    return true;
 }
 
 bool PayloadArray::empty() const {
@@ -3508,14 +3933,21 @@ String PayloadArray::to_json() const {
     return _json_size() != 0U ? String(_data()) : String("[]");
 }
 
-void PayloadArray::add(const Payload& obj) {
-    if (!_self_ok()) return;
+bool PayloadArray::add(const Payload& obj) {
+    if (!_self_ok()) return false;
     const size_t object_size = obj._json_size();
-    if (object_size == 0) return;
+    if (object_size == 0) {
+        payload_note_error(PAYLOAD_ERR_INVALID_CHILD,
+                           PAYLOAD_OP_ARRAY_ADD_WRITE,
+                           this);
+        return false;
+    }
 
     const size_t comma = _length == 2U ? 0U : 1U;
     const size_t new_length = (size_t)_length + comma + object_size;
-    if (new_length > UINT16_MAX || !_ensure_capacity(new_length + 1U)) return;
+    if (new_length > UINT16_MAX || !_ensure_capacity(new_length + 1U)) {
+        return false;
+    }
 
     char* data = _data();
     const size_t old_length = _length;
@@ -3528,12 +3960,13 @@ void PayloadArray::add(const Payload& obj) {
         payload_note_error(PAYLOAD_ERR_SERIALIZE_OVERFLOW,
                            PAYLOAD_OP_ARRAY_ADD_WRITE,
                            this);
-        return;
+        return false;
     }
     pos += written;
     data[pos++] = ']';
     data[pos] = '\0';
     _set_length((uint16_t)pos);
+    return true;
 }
 
 bool PayloadArray::parseJSON(const char* json) {
@@ -3652,6 +4085,67 @@ void payload_get_info(payload_info_t* out) {
     out->json_decode_fail = g_payload_json_decode_fail;
     out->integrity_fail = g_payload_integrity_fail;
     out->invalid_kind = g_payload_invalid_kind;
+
+    out->numeric_null_substitution = g_payload_numeric_null_substitution;
+    out->numeric_nonfinite = g_payload_numeric_nonfinite;
+    out->numeric_nan = g_payload_numeric_nan;
+    out->numeric_positive_infinity = g_payload_numeric_positive_infinity;
+    out->numeric_negative_infinity = g_payload_numeric_negative_infinity;
+    out->numeric_invalid_token = g_payload_numeric_invalid_token;
+    out->numeric_format_failure = g_payload_numeric_format_failure;
+    out->numeric_null_insert_fail = g_payload_numeric_null_insert_fail;
+    out->last_numeric_reject_reason = g_payload_last_numeric_reject_reason;
+    out->last_numeric_reject_op_id = g_payload_last_numeric_reject_op_id;
+    out->last_numeric_reject_this = g_payload_last_numeric_reject_this;
+    payload_copy_label(out->last_numeric_reject_key,
+                       sizeof(out->last_numeric_reject_key),
+                       g_payload_last_numeric_reject_key);
+    out->last_numeric_reject_value_bits =
+        g_payload_last_numeric_reject_value_bits;
+    out->last_numeric_reject_precision =
+        g_payload_last_numeric_reject_precision;
+    out->last_numeric_reject_format_return =
+        g_payload_last_numeric_reject_format_return;
+    out->last_numeric_reject_snprintf_return =
+        g_payload_last_numeric_reject_snprintf_return;
+    out->last_numeric_reject_text_len =
+        g_payload_last_numeric_reject_text_len;
+    out->last_numeric_reject_text_terminated =
+        g_payload_last_numeric_reject_text_terminated;
+    out->last_numeric_reject_text_truncated =
+        g_payload_last_numeric_reject_text_truncated;
+    payload_copy_label(out->last_numeric_reject_format,
+                       sizeof(out->last_numeric_reject_format),
+                       g_payload_last_numeric_reject_format);
+    payload_copy_label(out->last_numeric_reject_text_printable,
+                       sizeof(out->last_numeric_reject_text_printable),
+                       g_payload_last_numeric_reject_text_printable);
+    payload_copy_label(out->last_numeric_reject_text_hex,
+                       sizeof(out->last_numeric_reject_text_hex),
+                       g_payload_last_numeric_reject_text_hex);
+
+    out->semantic_validation_fail = g_payload_semantic_validation_fail;
+    out->semantic_invalid_kind = g_payload_semantic_invalid_kind;
+    out->semantic_invalid_key_utf8 = g_payload_semantic_invalid_key_utf8;
+    out->semantic_invalid_string_utf8 = g_payload_semantic_invalid_string_utf8;
+    out->semantic_invalid_number_token = g_payload_semantic_invalid_number_token;
+    out->semantic_invalid_boolean_token = g_payload_semantic_invalid_boolean_token;
+    out->semantic_invalid_null_token = g_payload_semantic_invalid_null_token;
+    out->semantic_invalid_object_json = g_payload_semantic_invalid_object_json;
+    out->semantic_invalid_array_json = g_payload_semantic_invalid_array_json;
+    out->first_semantic_fail_captured = g_payload_first_semantic_fail_captured;
+    out->first_semantic_fail_reason = g_payload_first_semantic_fail_reason;
+    out->first_semantic_fail_op_id = g_payload_first_semantic_fail_op_id;
+    out->first_semantic_fail_this = g_payload_first_semantic_fail_this;
+    out->first_semantic_fail_entry_index = g_payload_first_semantic_fail_entry_index;
+    out->first_semantic_fail_entry_kind = g_payload_first_semantic_fail_entry_kind;
+    out->first_semantic_fail_key_off = g_payload_first_semantic_fail_key_off;
+    out->first_semantic_fail_key_len = g_payload_first_semantic_fail_key_len;
+    out->first_semantic_fail_val_off = g_payload_first_semantic_fail_val_off;
+    out->first_semantic_fail_val_len = g_payload_first_semantic_fail_val_len;
+    payload_copy_label(out->first_semantic_fail_key,
+                       sizeof(out->first_semantic_fail_key),
+                       g_payload_first_semantic_fail_key);
 
     out->string_pointer_fault = g_payload_string_pointer_fault;
     out->string_pointer_null = g_payload_string_pointer_null;

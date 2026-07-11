@@ -1,10 +1,12 @@
-// teensy.cpp — ZPNet Runtime + Morse Fault Annunciator
+// teensy.cpp — ZPNet Runtime
 //
-// Fault reporting is LED-only, allocator-free, and unconditional.
-// No logging, no transport, no heap, no scheduler dependency.
+// Extended Cortex-M fault capture is installed before global constructors and
+// reasserted at setup entry.  The recorder is allocator-free and chains into
+// Teensyduino's proven CrashReport/USB-grace/automatic-reboot path.
 //
 
 #include "config.h"
+#include "crash_forensics.h"
 #include "memory_info.h"
 #include "timepop.h"
 #include "events.h"
@@ -79,108 +81,9 @@ static void maximize_dwt_determinism(void) {
   ARM_DWT_CTRL |= ARM_DWT_CTRL_CYCCNTENA;
 }
 
-// ============================================================================
-// LED MORSE PRIMITIVES (FAULT-SAFE, DWT-BASED)
-// ============================================================================
-//
-// These use DWT cycle-counting for timing, NOT delay()/millis().
-// This is critical because:
-//   • Hard fault handlers run with interrupts disabled
-//   • SysTick ISR cannot fire → millis() is frozen → delay() hangs
-//   • DWT cycle counter runs regardless of interrupt state
-//
-
-static constexpr uint32_t DOT_MS  = 150;
-static constexpr uint32_t DASH_MS = 450;
-static constexpr uint32_t GAP_MS  = 150;
-static constexpr uint32_t LETTER_GAP_MS = 600;
-static constexpr uint32_t REPEAT_GAP_MS = 1500;
-
-static inline void led_on()  { digitalWrite(LED_BUILTIN, HIGH); }
-static inline void led_off() { digitalWrite(LED_BUILTIN, LOW);  }
-
-// DWT busy-wait: works with interrupts disabled, at any clock speed
-static void dwt_spin_ms(uint32_t ms) {
-  if (ms == 0) return;
-
-  ARM_DEMCR |= ARM_DEMCR_TRCENA;
-  ARM_DWT_CTRL |= ARM_DWT_CTRL_CYCCNTENA;
-
-  uint32_t freq = F_CPU_ACTUAL;
-  if (freq == 0) freq = 600000000UL;
-
-  uint32_t cycles_per_ms = freq / 1000;
-
-  for (uint32_t i = 0; i < ms; i++) {
-    uint32_t start = ARM_DWT_CYCCNT;
-    while ((ARM_DWT_CYCCNT - start) < cycles_per_ms) {
-      // spin
-    }
-  }
-}
-
-static void dot() {
-  led_on();  dwt_spin_ms(DOT_MS);
-  led_off(); dwt_spin_ms(GAP_MS);
-}
-
-static void dash() {
-  led_on();  dwt_spin_ms(DASH_MS);
-  led_off(); dwt_spin_ms(GAP_MS);
-}
-
-// ============================================================================
-// MORSE FAULT PATTERNS
-// ============================================================================
-
-[[noreturn]]
-static void fault_morse_hardfault() {
-  pinMode(LED_BUILTIN, OUTPUT);
-  while (true) {
-    dot(); dot(); dot(); dot();          // H
-    dwt_spin_ms(REPEAT_GAP_MS);
-  }
-}
-
-[[noreturn]]
-static void fault_morse_memmanage() {
-  pinMode(LED_BUILTIN, OUTPUT);
-  while (true) {
-    dash(); dash();                      // M
-    dwt_spin_ms(REPEAT_GAP_MS);
-  }
-}
-
-[[noreturn]]
-static void fault_morse_busfault() {
-  pinMode(LED_BUILTIN, OUTPUT);
-  while (true) {
-    dash(); dot(); dot(); dot();         // B
-    dwt_spin_ms(REPEAT_GAP_MS);
-  }
-}
-
-[[noreturn]]
-static void fault_morse_usagefault() {
-  pinMode(LED_BUILTIN, OUTPUT);
-  while (true) {
-    dot(); dot(); dash();                // U
-    dwt_spin_ms(REPEAT_GAP_MS);
-  }
-}
-
-// ============================================================================
-// ARM CORTEX-M FAULT HANDLERS
-// ============================================================================
-
-extern "C" {
-
-void HardFault_Handler(void)  { fault_morse_hardfault(); }
-void MemManage_Handler(void)  { fault_morse_memmanage(); }
-void BusFault_Handler(void)   { fault_morse_busfault(); }
-void UsageFault_Handler(void) { fault_morse_usagefault(); }
-
-} // extern "C"
+// LED pin 13 is later repurposed as the QTimer2/OCXO1 input.  It is used only
+// for the existing early boot indication; crash handling never touches it.
+static inline void led_off() { digitalWrite(LED_BUILTIN, LOW); }
 
 // ============================================================================
 // ZPNet Runtime Initialization
@@ -188,6 +91,7 @@ void UsageFault_Handler(void) { fault_morse_usagefault(); }
 //
 // Boot order is critical. The dependency chain is:
 //
+//   0. crash_forensics_install()         — reassert retained fault vectors
 //   1. maximize_dwt_determinism()        — CPU clock, DWT counter
 //   2. memory_info_init()                — stack sentinel painting
 //   3. cpu_usage_init()                  — DWT accounting baseline
@@ -244,6 +148,10 @@ void UsageFault_Handler(void) { fault_morse_usagefault(); }
 // ============================================================================
 
 void setup() {
+
+  // startup_late_hook() installs before global constructors.  Reassert here
+  // before any setup work in case a constructor replaced a core fault vector.
+  crash_forensics_install();
 
   // ----------------------------------------------------------
   // Phase 0: Pre-transport boot (NO DEBUG LOGGING ALLOWED)

@@ -17,7 +17,11 @@
     • The entry directory and all owned bytes live in that same region.
     • Values retain their JSON type; strings are never reclassified by text.
     • Add/attach operations are preflighted and committed transactionally.
-    • Failed add/copy operations leave the prior semantic document unchanged.
+    • Public mutators return bool; existing callers may ignore the result.
+    • Invalid floating-point values are represented as JSON null, never omitted
+      and never serialized as non-standard NaN/Infinity tokens.
+    • Failed add/copy operations leave the prior semantic document unchanged,
+      except for the documented invalid-number-to-null compatibility fallback.
     • parseJSON() is a replacement operation and clears on invalid input, matching
       the established command-ingress contract.
     • Nested objects and arrays are written directly; no temporary JSON heap
@@ -93,6 +97,52 @@ typedef struct {
   uint32_t json_decode_fail;
   uint32_t integrity_fail;
   uint32_t invalid_kind;
+
+  // Numeric admission / null-substitution compatibility
+  uint32_t numeric_null_substitution;
+  uint32_t numeric_nonfinite;
+  uint32_t numeric_nan;
+  uint32_t numeric_positive_infinity;
+  uint32_t numeric_negative_infinity;
+  uint32_t numeric_invalid_token;
+  uint32_t numeric_format_failure;
+  uint32_t numeric_null_insert_fail;
+  uint32_t last_numeric_reject_reason;
+  uint32_t last_numeric_reject_op_id;
+  uint32_t last_numeric_reject_this;
+  char     last_numeric_reject_key[64];
+  uint64_t last_numeric_reject_value_bits;
+  int32_t  last_numeric_reject_precision;
+  int32_t  last_numeric_reject_format_return;
+  int32_t  last_numeric_reject_snprintf_return;
+  uint32_t last_numeric_reject_text_len;
+  uint32_t last_numeric_reject_text_terminated;
+  uint32_t last_numeric_reject_text_truncated;
+  char     last_numeric_reject_format[16];
+  char     last_numeric_reject_text_printable[64];
+  char     last_numeric_reject_text_hex[129];
+
+  // First semantic serialization failure evidence
+  uint32_t semantic_validation_fail;
+  uint32_t semantic_invalid_kind;
+  uint32_t semantic_invalid_key_utf8;
+  uint32_t semantic_invalid_string_utf8;
+  uint32_t semantic_invalid_number_token;
+  uint32_t semantic_invalid_boolean_token;
+  uint32_t semantic_invalid_null_token;
+  uint32_t semantic_invalid_object_json;
+  uint32_t semantic_invalid_array_json;
+  uint32_t first_semantic_fail_captured;
+  uint32_t first_semantic_fail_reason;
+  uint32_t first_semantic_fail_op_id;
+  uint32_t first_semantic_fail_this;
+  uint32_t first_semantic_fail_entry_index;
+  uint32_t first_semantic_fail_entry_kind;
+  uint32_t first_semantic_fail_key_off;
+  uint32_t first_semantic_fail_key_len;
+  uint32_t first_semantic_fail_val_off;
+  uint32_t first_semantic_fail_val_len;
+  char     first_semantic_fail_key[64];
 
   // Defensive C-string pointer custody
   uint32_t string_pointer_fault;
@@ -171,6 +221,8 @@ void payload_get_info(payload_info_t* out);
 const char* payload_error_code_name(uint32_t code);
 const char* payload_string_fault_reason_name(uint32_t reason);
 const char* payload_self_ok_fail_reason_name(uint32_t reason);
+const char* payload_numeric_reject_reason_name(uint32_t reason);
+const char* payload_semantic_fail_reason_name(uint32_t reason);
 const char* payload_operation_id_name(uint32_t operation_id);
 
 class Payload;
@@ -213,7 +265,7 @@ public:
     Payload& operator=(const Payload& other);
 
     // Lifecycle
-    void clear();
+    bool clear();
     bool empty() const;
     Payload clone() const;
 
@@ -222,41 +274,41 @@ public:
     String to_json() const;
 
     // Semantic construction
-    void add(const char* key, int32_t value);
-    void add(const char* key, uint32_t value);
-    void add(const char* key, int64_t value);
-    void add(const char* key, uint64_t value);
+    bool add(const char* key, int32_t value);
+    bool add(const char* key, uint32_t value);
+    bool add(const char* key, int64_t value);
+    bool add(const char* key, uint64_t value);
 
-    void add(const char* key, const char* value);
-    void add(const char* key, const String& value);
-    void add(const char* key, bool value);
-    void add(const char* key, float value);
-    void add(const char* key, double value);
-    void add(const char* key, double value, int precision);
+    bool add(const char* key, const char* value);
+    bool add(const char* key, const String& value);
+    bool add(const char* key, bool value);
+    bool add(const char* key, float value);
+    bool add(const char* key, double value);
+    bool add(const char* key, double value, int precision);
 
     template <typename T>
     typename std::enable_if<
         std::is_integral<T>::value &&
         std::is_signed<T>::value &&
-        !std::is_same<T, bool>::value>::type
+        !std::is_same<T, bool>::value, bool>::type
     add(const char* key, T value) {
-        add(key, (int64_t)value);
+        return add(key, (int64_t)value);
     }
 
     template <typename T>
     typename std::enable_if<
         std::is_integral<T>::value &&
         std::is_unsigned<T>::value &&
-        !std::is_same<T, bool>::value>::type
+        !std::is_same<T, bool>::value, bool>::type
     add(const char* key, T value) {
-        add(key, (uint64_t)value);
+        return add(key, (uint64_t)value);
     }
 
-    void add_fmt(const char* key, const char* fmt, ...);
+    bool add_fmt(const char* key, const char* fmt, ...);
 
-    void add_object(const char* key, const Payload& obj);
-    void add_array(const char* key, const PayloadArray& arr);
-    void add_raw_object(const char* key, const char* raw_json_object);
+    bool add_object(const char* key, const Payload& obj);
+    bool add_array(const char* key, const PayloadArray& arr);
+    bool add_raw_object(const char* key, const char* raw_json_object);
 
     // Parsing
     bool parseJSON(const uint8_t* data, size_t len);
@@ -384,7 +436,7 @@ private:
                        size_t value_len,
                        ValueKind kind);
 
-    void _add_floating(const char* key,
+    bool _add_floating(const char* key,
                        double value,
                        int precision,
                        uint32_t operation_id);
@@ -416,11 +468,11 @@ public:
     PayloadArray(PayloadArray&& other) noexcept;
     PayloadArray& operator=(PayloadArray&& other) noexcept;
 
-    void clear();
+    bool clear();
     bool empty() const;
 
     String to_json() const;
-    void add(const Payload& obj);
+    bool add(const Payload& obj);
     bool parseJSON(const char* json);
 
     size_t  size() const;
