@@ -5,10 +5,10 @@
 // PPS and PPS_VCLOCK doctrine (this file authors both):
 //
 //   • PPS         — physical GPIO edge facts. The ISR-entry DWT observation is
-//                   latency-adjusted and retained as raw evidence. When a strict
-//                   same-second FloorLine court proves additional ISR delay, a
-//                   separate normalized coordinate is published as the best
-//                   estimate of the actual electrical PPS moment.
+//                   latency-adjusted and retained as raw evidence. When the
+//                   same-second VCLOCK FloorLine projection differs by more
+//                   than the PPS arbitration threshold, that projection is
+//                   published as the best electrical PPS estimate.
 //
 //   • PPS_VCLOCK  — the VCLOCK edge selected by the physical PPS pulse.  This
 //                   is the canonical timing authority of the system.  Its
@@ -34,8 +34,8 @@
 // PPS_VCLOCK identity and for the smooth DWT/GNSS slope; PPS-derived/lower-
 // phase VCLOCK estimates are diagnostic witnesses only. FloorLine/lower-
 // envelope remains non-authoritative for VCLOCK/OCXO edge publication, but a
-// separate strict court may use it to normalize a physical PPS GPIO endpoint
-// proven late by ISR entry latency. Raw PPS evidence is always retained.
+// separate magnitude court may use it to replace a discrepant physical PPS
+// GPIO endpoint, regardless of sign. Raw PPS evidence is always retained.
 // Counter32/GNSS identity remains exact authority.
 // CLOCKS/Alpha owns measured-GNSS interval construction from consecutive
 // authored edge DWTs.
@@ -1176,10 +1176,11 @@ static pps_vclock_t store_load_pvc(void) {
 // ============================================================================
 //
 // The PPS handoff first authors the raw GPIO-to-GPIO interval so always-on
-// custody remains continuous before CLOCKS START.  The same-second VCLOCK
-// FloorLine court may replace only G_now when it proves that the GPIO endpoint
-// was displaced later by ISR entry latency.  G_prev remains the prior accepted
-// prediction.  Readers use the seqlock; writer operations are serialized with
+// custody remains continuous before CLOCKS START. The same-second VCLOCK
+// FloorLine arbitration may replace G_now whenever the raw physical PPS edge
+// differs from the projected edge beyond the magnitude threshold. G_prev
+// remains the prior accepted interval. Readers use the seqlock; writer
+// operations are serialized with
 // the priority-0-preserving guard so timing capture itself is never masked.
 
 struct pps_yardstick_store_t {
@@ -1198,9 +1199,9 @@ static pps_yardstick_store_t g_pps_yardstick DMAMEM;
 static bool     g_pps_yardstick_prev_valid = false;
 static uint32_t g_pps_yardstick_prev_sequence = 0;
 static uint32_t g_pps_yardstick_prev_counter32 = 0;
-// Previous PPS endpoint admitted to the yardstick.  This is ordinarily the
-// latency-adjusted GPIO observation, but it becomes the FloorLine-inferred
-// physical PPS coordinate when the same-second repair court proves ISR delay.
+// Previous PPS endpoint admitted to the yardstick. This is ordinarily the
+// latency-adjusted GPIO observation, but it becomes the VCLOCK FloorLine-
+// projected physical PPS coordinate when magnitude arbitration selects it.
 static uint32_t g_pps_yardstick_prev_dwt = 0;
 
 struct pps_yardstick_snapshot_t {
@@ -1263,9 +1264,9 @@ static void pps_yardstick_record_raw_edge(const pps_t& pps,
 }
 
 // Replace only the newest interval, preserving interval_prev as the prior
-// accepted prediction.  The GPIO handoff authors the raw interval first so
-// pre-campaign custody remains continuous; the same-second FloorLine court may
-// then normalize that one endpoint before any OCXO publication consumes it.
+// accepted interval. The GPIO handoff authors the raw interval first so
+// pre-campaign custody remains continuous; same-second FloorLine arbitration
+// may then replace that endpoint before any OCXO publication consumes it.
 static bool pps_yardstick_replace_latest_interval(uint32_t pps_sequence,
                                                    uint32_t interval_cycles,
                                                    uint32_t endpoint_dwt) {
@@ -5128,11 +5129,12 @@ static const char* dispatch_timer_name(interrupt_subscriber_kind_t kind) {
 // bucket winners and shifted to touch the lower selected point.
 //
 // VCLOCK and OCXO subscriber edges remain observation-derived: FloorLine does
-// not replace those measured QTimer coordinates.  The one exception is the
-// physical PPS GPIO witness, which has no dynamic service-offset correction. A
-// separate same-second court may use a qualified VCLOCK FloorLine endpoint to
-// normalize a demonstrably late PPS observation before that observation becomes
-// the DWT/GNSS yardstick. The old regression_* ABI fields remain the transport
+// not replace those measured QTimer coordinates. The one exception is the
+// physical PPS GPIO witness, which has no dynamic service-offset correction.
+// When raw PPS and the qualified same-second VCLOCK FloorLine projection differ
+// beyond the magnitude threshold, the projection becomes the published PPS
+// edge and the DWT/GNSS yardstick endpoint. The old regression_* ABI fields
+// remain the transport
 // surface for the evidence.
 
 static constexpr uint32_t LOWER_ENV_SAMPLE_RATE_HZ = 1000U;
@@ -5181,15 +5183,13 @@ static constexpr uint32_t FLOORLINE_REASON_EDGE_GATE         = 7U;
 static constexpr uint32_t FLOORLINE_REASON_OBSERVED_FALLBACK = 8U;
 static constexpr uint32_t FLOORLINE_REASON_SLOPE_ANOMALY     = 9U;
 
-// Physical-PPS FloorLine repair policy.  This is intentionally much stricter
-// than ordinary FloorLine candidacy: the raw PPS interval must make a large
-// one-sided (late) excursion, while a high-confidence VCLOCK FloorLine endpoint
-// restores continuity with the previously accepted PPS interval.
+// Physical-PPS FloorLine substitution policy.
+//
+// The GPIO PPS edge is normally retained.  When it disagrees with the same-
+// second VCLOCK FloorLine projection by at least this magnitude, publish the
+// projected physical PPS edge instead.  The sign is deliberately irrelevant:
+// this is edge arbitration, not a causal classification of ISR latency.
 static constexpr uint32_t PPS_FLOORLINE_REPAIR_TRIGGER_CYCLES = 1024U;
-static constexpr uint32_t PPS_FLOORLINE_REPAIR_MAX_CYCLES = 50000U;
-static constexpr uint32_t PPS_FLOORLINE_REPAIR_CONTINUITY_GATE_CYCLES = 256U;
-static constexpr uint32_t PPS_FLOORLINE_REPAIR_VCLOCK_GATE_CYCLES = 64U;
-static constexpr uint32_t PPS_FLOORLINE_REPAIR_MIN_CONFIDENCE_PPM = 750000U;
 
 static constexpr uint32_t PPS_FLOORLINE_REPAIR_REASON_NONE = 0U;
 static constexpr uint32_t PPS_FLOORLINE_REPAIR_REASON_APPLIED = 1U;
@@ -5197,21 +5197,16 @@ static constexpr uint32_t PPS_FLOORLINE_REPAIR_REASON_NO_HISTORY = 2U;
 static constexpr uint32_t PPS_FLOORLINE_REPAIR_REASON_SEQUENCE_MISMATCH = 3U;
 static constexpr uint32_t PPS_FLOORLINE_REPAIR_REASON_FLOORLINE_UNQUALIFIED = 4U;
 static constexpr uint32_t PPS_FLOORLINE_REPAIR_REASON_NO_PHASE = 5U;
-static constexpr uint32_t PPS_FLOORLINE_REPAIR_REASON_VCLOCK_DISAGREEMENT = 6U;
-static constexpr uint32_t PPS_FLOORLINE_REPAIR_REASON_NOT_ONE_SIDED_LATE = 7U;
-static constexpr uint32_t PPS_FLOORLINE_REPAIR_REASON_RAW_NOT_EXCURSION = 8U;
-static constexpr uint32_t PPS_FLOORLINE_REPAIR_REASON_CANDIDATE_DISCONTINUITY = 9U;
-static constexpr uint32_t PPS_FLOORLINE_REPAIR_REASON_REWRITE_FAILED = 10U;
+static constexpr uint32_t PPS_FLOORLINE_REPAIR_REASON_DELTA_BELOW_THRESHOLD = 6U;
+static constexpr uint32_t PPS_FLOORLINE_REPAIR_REASON_REWRITE_FAILED = 7U;
 
 struct pps_floorline_repair_state_t {
   bool     valid = false;
   bool     applied = false;
   bool     floorline_qualified = false;
   bool     phase_qualified = false;
-  bool     vclock_agreement_qualified = false;
-  bool     one_sided_late_qualified = false;
-  bool     raw_excursion_qualified = false;
-  bool     continuity_qualified = false;
+  bool     magnitude_qualified = false;
+  bool     yardstick_rewritten = false;
   uint32_t sequence = 0;
   uint32_t attempt_count = 0;
   uint32_t applied_count = 0;
@@ -6389,7 +6384,7 @@ static bool cadence_regression_latest_result(interrupt_subscriber_kind_t kind,
 static const char* pps_floorline_repair_reason_name(uint32_t reason) {
   switch (reason) {
     case PPS_FLOORLINE_REPAIR_REASON_APPLIED:
-      return "floorline_isr_latency_repair";
+      return "pps_vclock_floorline_projection";
     case PPS_FLOORLINE_REPAIR_REASON_NO_HISTORY:
       return "no_yardstick_history";
     case PPS_FLOORLINE_REPAIR_REASON_SEQUENCE_MISMATCH:
@@ -6398,14 +6393,8 @@ static const char* pps_floorline_repair_reason_name(uint32_t reason) {
       return "floorline_unqualified";
     case PPS_FLOORLINE_REPAIR_REASON_NO_PHASE:
       return "pps_vclock_phase_unavailable";
-    case PPS_FLOORLINE_REPAIR_REASON_VCLOCK_DISAGREEMENT:
-      return "floorline_vclock_disagreement";
-    case PPS_FLOORLINE_REPAIR_REASON_NOT_ONE_SIDED_LATE:
-      return "pps_not_one_sided_late";
-    case PPS_FLOORLINE_REPAIR_REASON_RAW_NOT_EXCURSION:
-      return "raw_pps_interval_not_excursion";
-    case PPS_FLOORLINE_REPAIR_REASON_CANDIDATE_DISCONTINUITY:
-      return "floorline_candidate_breaks_continuity";
+    case PPS_FLOORLINE_REPAIR_REASON_DELTA_BELOW_THRESHOLD:
+      return "pps_floorline_delta_below_threshold";
     case PPS_FLOORLINE_REPAIR_REASON_REWRITE_FAILED:
       return "yardstick_rewrite_failed";
     default:
@@ -6420,6 +6409,29 @@ static bool pps_floorline_repair_applied_for_sequence(uint32_t sequence) {
          snapshot.sequence == sequence;
 }
 
+static bool pps_floorline_repair_covers_interval_verdict(
+    const dwt_repair_diag_t* repair,
+    const cadence_regression_result_t* floorline) {
+  if (!repair || !floorline) return false;
+  if (!repair->yardstick_valid || repair->yardstick_pps_sequence == 0U) {
+    return false;
+  }
+  if (!pps_floorline_repair_applied_for_sequence(
+          repair->yardstick_pps_sequence)) {
+    return false;
+  }
+
+  // Do not hide a real measured-lane failure. The exemption is only for the
+  // same PPS row whose raw endpoint was replaced, and only while the measured
+  // lane's own FloorLine interval still agrees with its observed interval.
+  return floorline->valid &&
+         floorline->observed_interval_valid &&
+         floorline->inferred_interval_valid &&
+         lower_env_abs_i32(
+             floorline->inferred_minus_observed_interval_cycles) <=
+             LOWER_ENV_PUBLISH_HARD_INTERVAL_GATE_CYCLES;
+}
+
 static pps_t pps_floorline_repair_physical_edge(
     const pps_t& raw_pps,
     const cadence_regression_result_t& floorline,
@@ -6431,8 +6443,7 @@ static pps_t pps_floorline_repair_physical_edge(
   (void)pps_floorline_repair_load(previous);
 
   // Normal and fallback VCLOCK paths may converge on the same one-second
-  // bookend.  Reuse a successful prior adjudication; an earlier unqualified
-  // attempt may be retried if the later path carries the completed FloorLine.
+  // bookend. Reuse an already selected projection for this PPS sequence.
   if (previous.valid && previous.applied &&
       previous.sequence == raw_pps.sequence) {
     used_pps.dwt_at_edge = previous.used_pps_dwt;
@@ -6453,13 +6464,62 @@ static pps_t pps_floorline_repair_physical_edge(
   next.floorline_sample_count = floorline.sample_count;
   next.floorline_selected_bucket_count = floorline.selected_bucket_count;
 
+  next.floorline_qualified =
+      next.valid &&
+      floorline.valid &&
+      floorline.candidate_present &&
+      floorline.publish_floorline &&
+      !floorline.fallback_used &&
+      floorline.inferred_dwt_at_event != 0U &&
+      floorline.observed_dwt_at_event == observed_vclock_dwt &&
+      floorline.target_counter32_at_event == target_counter32;
+  if (!next.floorline_qualified) {
+    next.reason = PPS_FLOORLINE_REPAIR_REASON_FLOORLINE_UNQUALIFIED;
+    next.reject_count++;
+    pps_floorline_repair_store(next);
+    return used_pps;
+  }
+
+  next.phase_qualified = g_pps_vclock_phase_lower_valid;
+  if (!next.phase_qualified) {
+    next.reason = PPS_FLOORLINE_REPAIR_REASON_NO_PHASE;
+    next.reject_count++;
+    pps_floorline_repair_store(next);
+    return used_pps;
+  }
+
+  // Convert the VCLOCK FloorLine endpoint into the corresponding physical PPS
+  // endpoint using the continuously learned PPS->VCLOCK phase.
+  next.inferred_pps_dwt =
+      floorline.inferred_dwt_at_event - g_pps_vclock_phase_lower_cycles;
+  next.raw_minus_inferred_cycles =
+      lower_env_signed_delta_u32(next.inferred_pps_dwt,
+                                 raw_pps.dwt_at_edge);
+  next.observed_vclock_minus_floorline_cycles =
+      lower_env_signed_delta_u32(floorline.inferred_dwt_at_event,
+                                 observed_vclock_dwt);
+
+  // Symmetric arbitration: sign does not matter. If the observed physical PPS
+  // coordinate is materially separated from the qualified projection, use the
+  // projection. Ordinary few-cycle disagreement keeps the observed edge.
+  next.magnitude_qualified =
+      lower_env_abs_i32(next.raw_minus_inferred_cycles) >=
+          PPS_FLOORLINE_REPAIR_TRIGGER_CYCLES;
+  if (!next.magnitude_qualified) {
+    next.reason = PPS_FLOORLINE_REPAIR_REASON_DELTA_BELOW_THRESHOLD;
+    pps_floorline_repair_store(next);
+    return used_pps;
+  }
+
+  // The raw GPIO endpoint was already admitted to the PPS yardstick by the PPS
+  // handoff. Replace that same endpoint and interval before any OCXO court uses
+  // the ruler. This is bookkeeping, not an additional qualification gate.
   pps_yardstick_snapshot_t yardstick{};
   const bool yardstick_loaded = pps_yardstick_load(yardstick);
-  if (!next.valid || !yardstick_loaded ||
-      yardstick.interval_now_cycles == 0U ||
-      yardstick.interval_prev_cycles == 0U ||
-      !g_pps_yardstick_prev_valid) {
+  if (!yardstick_loaded || !g_pps_yardstick_prev_valid ||
+      yardstick.interval_now_cycles == 0U) {
     next.reason = PPS_FLOORLINE_REPAIR_REASON_NO_HISTORY;
+    next.reject_count++;
     pps_floorline_repair_store(next);
     return used_pps;
   }
@@ -6477,72 +6537,6 @@ static pps_t pps_floorline_repair_physical_edge(
   next.raw_interval_error_cycles = pps_floorline_i32_from_i64(
       (int64_t)(uint64_t)yardstick.interval_now_cycles -
       (int64_t)(uint64_t)yardstick.interval_prev_cycles);
-  next.raw_excursion_qualified =
-      next.raw_interval_error_cycles >=
-          (int32_t)PPS_FLOORLINE_REPAIR_TRIGGER_CYCLES;
-  if (!next.raw_excursion_qualified) {
-    // Ordinary seconds are not repair failures. They simply retain the raw
-    // latency-adjusted GPIO observation.
-    next.reason = PPS_FLOORLINE_REPAIR_REASON_RAW_NOT_EXCURSION;
-    pps_floorline_repair_store(next);
-    return used_pps;
-  }
-
-  next.floorline_qualified =
-      floorline.valid &&
-      floorline.candidate_present &&
-      floorline.publish_floorline &&
-      !floorline.fallback_used &&
-      floorline.inferred_dwt_at_event != 0U &&
-      floorline.observed_dwt_at_event == observed_vclock_dwt &&
-      floorline.target_counter32_at_event == target_counter32 &&
-      floorline.sample_accepted_count >= LOWER_ENV_PUBLISH_MIN_SAMPLES &&
-      floorline.selected_bucket_count >= LOWER_ENV_PUBLISH_MIN_BUCKETS &&
-      floorline.confidence_ppm >= PPS_FLOORLINE_REPAIR_MIN_CONFIDENCE_PPM;
-  if (!next.floorline_qualified) {
-    next.reason = PPS_FLOORLINE_REPAIR_REASON_FLOORLINE_UNQUALIFIED;
-    next.reject_count++;
-    pps_floorline_repair_store(next);
-    return used_pps;
-  }
-
-  next.phase_qualified = g_pps_vclock_phase_lower_valid;
-  if (!next.phase_qualified) {
-    next.reason = PPS_FLOORLINE_REPAIR_REASON_NO_PHASE;
-    next.reject_count++;
-    pps_floorline_repair_store(next);
-    return used_pps;
-  }
-
-  next.observed_vclock_minus_floorline_cycles =
-      lower_env_signed_delta_u32(floorline.inferred_dwt_at_event,
-                                 observed_vclock_dwt);
-  next.vclock_agreement_qualified =
-      next.observed_vclock_minus_floorline_cycles >= 0 &&
-      (uint32_t)next.observed_vclock_minus_floorline_cycles <=
-          PPS_FLOORLINE_REPAIR_VCLOCK_GATE_CYCLES;
-  if (!next.vclock_agreement_qualified) {
-    next.reason = PPS_FLOORLINE_REPAIR_REASON_VCLOCK_DISAGREEMENT;
-    next.reject_count++;
-    pps_floorline_repair_store(next);
-    return used_pps;
-  }
-
-  next.inferred_pps_dwt =
-      floorline.inferred_dwt_at_event - g_pps_vclock_phase_lower_cycles;
-  next.raw_minus_inferred_cycles =
-      lower_env_signed_delta_u32(next.inferred_pps_dwt, raw_pps.dwt_at_edge);
-  next.one_sided_late_qualified =
-      next.raw_minus_inferred_cycles >=
-          (int32_t)PPS_FLOORLINE_REPAIR_TRIGGER_CYCLES &&
-      next.raw_minus_inferred_cycles <=
-          (int32_t)PPS_FLOORLINE_REPAIR_MAX_CYCLES;
-  if (!next.one_sided_late_qualified) {
-    next.reason = PPS_FLOORLINE_REPAIR_REASON_NOT_ONE_SIDED_LATE;
-    next.reject_count++;
-    pps_floorline_repair_store(next);
-    return used_pps;
-  }
 
   const uint32_t previous_used_pps_dwt =
       raw_pps.dwt_at_edge - yardstick.interval_now_cycles;
@@ -6552,16 +6546,6 @@ static pps_t pps_floorline_repair_physical_edge(
       (int64_t)(uint64_t)next.inferred_interval_cycles -
       (int64_t)(uint64_t)yardstick.interval_prev_cycles);
 
-  next.continuity_qualified =
-      lower_env_abs_i32(next.inferred_interval_error_cycles) <=
-          PPS_FLOORLINE_REPAIR_CONTINUITY_GATE_CYCLES;
-  if (!next.continuity_qualified) {
-    next.reason = PPS_FLOORLINE_REPAIR_REASON_CANDIDATE_DISCONTINUITY;
-    next.reject_count++;
-    pps_floorline_repair_store(next);
-    return used_pps;
-  }
-
   if (!pps_yardstick_replace_latest_interval(raw_pps.sequence,
                                               next.inferred_interval_cycles,
                                               next.inferred_pps_dwt)) {
@@ -6570,6 +6554,7 @@ static pps_t pps_floorline_repair_physical_edge(
     pps_floorline_repair_store(next);
     return used_pps;
   }
+  next.yardstick_rewritten = true;
 
   used_pps.dwt_at_edge = next.inferred_pps_dwt;
   {
@@ -7667,6 +7652,18 @@ static bool dwt_publication_adjudicate_or_watchdog(
     }
   }
 
+  // A qualified physical-PPS substitution has already replaced the bad GPIO
+  // endpoint in the yardstick. If a same-row OCXO audit still sees the stale
+  // pre-substitution ruler, do not convert that known repaired ruler failure
+  // into OBSERVED_INTERVAL/PUBLISHED_INTERVAL WATCHDOG_ANOMALY. Other courts
+  // (counter lineage, service offset, source identity, cross-rail, etc.) remain
+  // fully active.
+  if (pps_floorline_repair_covers_interval_verdict(req.repair,
+                                                       req.floorline)) {
+    verdict &= ~(DWT_PUBLICATION_VERDICT_OBSERVED_INTERVAL |
+                 DWT_PUBLICATION_VERDICT_PUBLISHED_INTERVAL);
+  }
+
   if (published_interval_valid) {
     if (req.kind != interrupt_subscriber_kind_t::VCLOCK) {
       dwt_publication_note_cross_rail(g_dwt_publication_vclock,
@@ -8717,14 +8714,14 @@ static void vclock_apply_perishable_fact_deferred(
                              observed_dwt,
                              fact.isr_entry_dwt_raw,
                              pps_floorline_repaired
-                                 ? "pps_floorline_isr_latency_repair"
+                                 ? "pps_vclock_floorline_projection"
                                  : (phase_projection_valid
                                        ? "vclock_observed_pps_phase_witness"
                                        : "vclock_observed_no_pps"));
   copy_floorline_interval_to_diag(dwt_diag, lower_env);
   if (pps_floorline_repaired) {
     dwt_diag.interval_resync_applied = true;
-    dwt_diag.reason = "pps_floorline_isr_latency_repair";
+    dwt_diag.reason = "pps_vclock_floorline_projection";
   }
 
   uint32_t coincidence_cycles = 0;
@@ -8746,7 +8743,7 @@ static void vclock_apply_perishable_fact_deferred(
                               observed_dwt,
                               LOWER_ENV_PUBLISH_HARD_EDGE_GATE_CYCLES,
                               pps_floorline_repaired
-                                  ? "pps_floorline_isr_latency_repair"
+                                  ? "pps_vclock_floorline_projection"
                                   : (phase_projection_valid
                                         ? "vclock_observed_pps_phase_witness"
                                         : "vclock_observed_no_pps"));
@@ -9421,7 +9418,7 @@ static void vclock_heartbeat_native_service(uint32_t isr_entry_dwt_raw,
                                  observed_dwt,
                                  bookend.due ? bookend.isr_entry_dwt_raw : 0U,
                                  pps_floorline_repaired
-                                     ? "pps_floorline_isr_latency_repair_fallback"
+                                     ? "pps_vclock_floorline_projection_fallback"
                                      : (phase_projection_valid
                                            ? "vclock_observed_pps_phase_witness_fallback"
                                            : "vclock_observed_no_pps_fallback"));
@@ -9434,7 +9431,7 @@ static void vclock_heartbeat_native_service(uint32_t isr_entry_dwt_raw,
                                   observed_dwt,
                                   LOWER_ENV_PUBLISH_HARD_EDGE_GATE_CYCLES,
                                   pps_floorline_repaired
-                                      ? "pps_floorline_isr_latency_repair_fallback"
+                                      ? "pps_vclock_floorline_projection_fallback"
                                       : (phase_projection_valid
                                             ? "vclock_observed_pps_phase_witness_fallback"
                                             : "vclock_observed_no_pps_fallback"));
@@ -14232,24 +14229,12 @@ static FLASHMEM Payload cmd_report_pps(const Payload&) {
   p.add("pps_floorline_floorline_qualified",
         pps_repair.floorline_qualified);
   p.add("pps_floorline_phase_qualified", pps_repair.phase_qualified);
-  p.add("pps_floorline_vclock_agreement_qualified",
-        pps_repair.vclock_agreement_qualified);
-  p.add("pps_floorline_one_sided_late_qualified",
-        pps_repair.one_sided_late_qualified);
-  p.add("pps_floorline_raw_excursion_qualified",
-        pps_repair.raw_excursion_qualified);
-  p.add("pps_floorline_continuity_qualified",
-        pps_repair.continuity_qualified);
+  p.add("pps_floorline_magnitude_qualified",
+        pps_repair.magnitude_qualified);
+  p.add("pps_floorline_yardstick_rewritten",
+        pps_repair.yardstick_rewritten);
   p.add("pps_floorline_trigger_cycles",
         PPS_FLOORLINE_REPAIR_TRIGGER_CYCLES);
-  p.add("pps_floorline_max_repair_cycles",
-        PPS_FLOORLINE_REPAIR_MAX_CYCLES);
-  p.add("pps_floorline_continuity_gate_cycles",
-        PPS_FLOORLINE_REPAIR_CONTINUITY_GATE_CYCLES);
-  p.add("pps_floorline_vclock_gate_cycles",
-        PPS_FLOORLINE_REPAIR_VCLOCK_GATE_CYCLES);
-  p.add("pps_floorline_min_confidence_ppm",
-        PPS_FLOORLINE_REPAIR_MIN_CONFIDENCE_PPM);
   p.add("pps_floorline_raw_dwt", pps_repair.raw_pps_dwt);
   p.add("pps_floorline_inferred_dwt",
         pps_repair.inferred_pps_dwt);
