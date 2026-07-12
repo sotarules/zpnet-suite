@@ -9078,6 +9078,14 @@ void clocks_beta_pps(void) {
   timebase_build_stage(TIMEBASE_BUILD_STAGE_BUILD_BEGIN);
   clocks_stack_witness_note_hot(CLOCKS_STACK_CONTEXT_BETA_PPS_BUILD);
 
+  // Control point under suspicion (Crash1 dwell region).  This scope runs
+  // inside alpha's PPS handoff — handler mode — so the sentinel locates the
+  // preempted foreground's stacked frame (FPCAR anchor when the foreground
+  // was FP-active) and verifies its 8 basic words across the entire
+  // fragment build + publish.  A wild write from this region onto that
+  // frame latches with "TIMEBASE_FRAGMENT" attribution.
+  ZPNET_SENTINEL_ENTER(ZPNET_SENTINEL_SLOT_AUX3, "TIMEBASE_FRAGMENT");
+
   {
     Payload p;
     payload_add_timebase_pair_identity(p,
@@ -9298,6 +9306,7 @@ void clocks_beta_pps(void) {
       g_timebase_watchdog_gate_count++;
       timebase_build_stage(TIMEBASE_BUILD_STAGE_WATCHDOG_GATE);
       publish_dac_tick("WATCHDOG_GATE_PRE_FRAGMENT_PUBLISH");
+      ZPNET_SENTINEL_EXIT(ZPNET_SENTINEL_SLOT_AUX3);
       return;
     }
 
@@ -9312,11 +9321,18 @@ void clocks_beta_pps(void) {
     timebase_build_stage(TIMEBASE_BUILD_STAGE_PUBLISH_RETURN);
   }
 
+  ZPNET_SENTINEL_EXIT(ZPNET_SENTINEL_SLOT_AUX3);
+
   if (!TIMEBASE_FORENSICS_PUBLISH_ENABLED) {
     g_timebase_forensics_disabled_count++;
     clocks_watchdog_arm_campaign_publication();
     return;
   }
+
+  // Second control point under suspicion: the paired TIMEBASE_FORENSICS
+  // companion row, verified as its own sentinel scope so a violation names
+  // which of the two builds was on the CPU.
+  ZPNET_SENTINEL_ENTER(ZPNET_SENTINEL_SLOT_AUX4, "TIMEBASE_FORENSICS");
 
   {
     g_timebase_forensics_build_begin_count++;
@@ -9622,6 +9638,7 @@ void clocks_beta_pps(void) {
       g_timebase_watchdog_gate_count++;
       timebase_build_stage(TIMEBASE_BUILD_STAGE_WATCHDOG_GATE);
       publish_dac_tick("WATCHDOG_GATE_PRE_FORENSICS_PUBLISH");
+      ZPNET_SENTINEL_EXIT(ZPNET_SENTINEL_SLOT_AUX4);
       return;
     }
 
@@ -9639,6 +9656,8 @@ void clocks_beta_pps(void) {
                                    true);
     clocks_watchdog_arm_campaign_publication();
   }
+
+  ZPNET_SENTINEL_EXIT(ZPNET_SENTINEL_SLOT_AUX4);
 }
 
 // ============================================================================

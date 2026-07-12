@@ -414,9 +414,11 @@ enum payload_operation_id_t : uint32_t {
     PAYLOAD_OP_COPY_CTOR = 0x39F7EA4BUL,
     PAYLOAD_OP_COPY_FROM = 0x8FB0C939UL,
     PAYLOAD_OP_COUNT = 0x39B1DDF4UL,
+    PAYLOAD_OP_CTOR = 0x3D91C44FUL,
     PAYLOAD_OP_DEBUG_DUMP = 0x68635107UL,
     PAYLOAD_OP_DEBUG_DUMP_ENTRY = 0xBF4676B5UL,
     PAYLOAD_OP_DEBUG_DUMP_TAG = 0xDB35BE39UL,
+    PAYLOAD_OP_DTOR = 0x64A0BB17UL,
     PAYLOAD_OP_EMPTY = 0x18A7BEEEUL,
     PAYLOAD_OP_ENSURE_ROOM = 0xCDBCBCCBUL,
     PAYLOAD_OP_ENSURE_ROOM_ALLOC = 0xD6807594UL,
@@ -524,9 +526,11 @@ const char* payload_operation_id_name(uint32_t operation_id) {
         case PAYLOAD_OP_COPY_CTOR: return "copy_ctor";
         case PAYLOAD_OP_COPY_FROM: return "copy_from";
         case PAYLOAD_OP_COUNT: return "count";
+        case PAYLOAD_OP_CTOR: return "ctor";
         case PAYLOAD_OP_DEBUG_DUMP: return "debug_dump";
         case PAYLOAD_OP_DEBUG_DUMP_ENTRY: return "debug_dump.entry";
         case PAYLOAD_OP_DEBUG_DUMP_TAG: return "debug_dump.tag";
+        case PAYLOAD_OP_DTOR: return "dtor";
         case PAYLOAD_OP_EMPTY: return "empty";
         case PAYLOAD_OP_ENSURE_ROOM: return "ensure_room";
         case PAYLOAD_OP_ENSURE_ROOM_ALLOC: return "ensure_room.alloc";
@@ -799,6 +803,11 @@ static void payload_note_semantic_failure(uint32_t reason,
                             key_len);
 }
 
+// Flight recorder (defined with the execution-context census below).  The
+// note path is scalar-only and allocator-free, so failure bookkeeping may
+// call it directly.
+static void payload_flight_note(uint32_t op_id, const void* self, uint16_t flags);
+
 static inline void payload_note_error(uint32_t code,
                                       uint32_t operation_id,
                                       const void* self) {
@@ -809,6 +818,7 @@ static inline void payload_note_error(uint32_t code,
     g_payload_last_error_this = (uint32_t)(uintptr_t)self;
     g_payload_last_error_op_id = operation_id;
     g_payload_last_error_op[0] = '\0';
+    payload_flight_note(operation_id, self, PAYLOAD_FLIGHT_FLAG_ERROR);
 }
 
 static void payload_increment_integrity_reason(uint32_t reason) {
@@ -858,6 +868,8 @@ static void payload_note_integrity(
     g_payload_last_error_count++;
     g_payload_last_error_this = (uint32_t)(uintptr_t)self;
     g_payload_last_error_op_id = g_payload_last_self_ok_fail_op_id;
+    payload_flight_note(operation_id, self,
+                        PAYLOAD_FLIGHT_FLAG_ERROR | PAYLOAD_FLIGHT_FLAG_INTEGRITY);
 
     if (g_payload_first_self_ok_fail_captured == 0U) {
         g_payload_first_self_ok_fail_captured = 1U;
@@ -912,6 +924,256 @@ static void payload_note_heap_delta(int32_t delta) {
         g_payload_arena_heap_bytes_high_water) {
         g_payload_arena_heap_bytes_high_water =
             g_payload_arena_heap_bytes_alive;
+    }
+}
+
+// ============================================================================
+// Execution-context census + retained flight recorder
+// ============================================================================
+//
+// Crash1 evidence implicated Payload guard-code working state, written from
+// handler context, adjacent to (or over) a stacked exception frame.  The
+// facilities below exist to *attribute*, not to prevent:
+//
+//   • The context census counts lifecycle/mutation/allocator activity that
+//     executes while IPSR != 0 and latches the most recent handler-context
+//     actor (IPSR, op, this, MSP, DWT).
+//   • The allocator overlap tripwire detects a Payload allocator call that
+//     preempted another in-flight Payload allocator call — the one shared
+//     mutable resource (the newlib heap) that Payload's own arithmetic
+//     cannot defend.  Detection only; behavior is unchanged.
+//   • The flight recorder keeps a ring of recent lifecycle/mutation/failure
+//     records in RAM2 (NOLOAD) so the final Payload operations before a
+//     crash survive the reboot; each write is flushed through the data
+//     cache so the physical RAM2 image is current when a reset arrives.
+//
+// Everything on these paths is scalar, allocator-free, and safe in handler
+// context.  Counters are best-effort under preemption: forensics, never
+// authoritative state.
+
+static inline uint32_t payload_read_ipsr(void) {
+#if defined(__IMXRT1062__)
+    uint32_t ipsr;
+    __asm__ volatile("mrs %0, ipsr" : "=r"(ipsr));
+    return ipsr & 0x1FFU;
+#else
+    return 0U;
+#endif
+}
+
+static inline uint32_t payload_read_msp(void) {
+#if defined(__IMXRT1062__)
+    uint32_t msp;
+    __asm__ volatile("mrs %0, msp" : "=r"(msp));
+    return msp;
+#else
+    return 0U;
+#endif
+}
+
+static inline uint32_t payload_read_dwt(void) {
+#if defined(__IMXRT1062__)
+    return ARM_DWT_CYCCNT;
+#else
+    return 0U;
+#endif
+}
+
+static inline void payload_retained_flush(volatile void* addr, uint32_t size) {
+#if defined(__IMXRT1062__)
+    // RAM2 is write-back cached; a reset can discard dirty lines.  Flush so
+    // the retained image in physical OCRAM matches what was recorded.
+    arm_dcache_flush((void*)addr, size);
+#else
+    (void)addr;
+    (void)size;
+#endif
+}
+
+// ---- Execution-context census -------------------------------------------
+
+static volatile uint32_t g_payload_handler_ctx_ctor = 0;
+static volatile uint32_t g_payload_handler_ctx_mutate = 0;
+static volatile uint32_t g_payload_handler_ctx_alloc = 0;
+static volatile uint32_t g_payload_handler_ctx_free = 0;
+static volatile uint32_t g_payload_last_handler_ctx_ipsr = 0;
+static volatile uint32_t g_payload_last_handler_ctx_op_id = 0;
+static volatile uint32_t g_payload_last_handler_ctx_this = 0;
+static volatile uint32_t g_payload_last_handler_ctx_dwt = 0;
+static volatile uint32_t g_payload_last_handler_ctx_msp = 0;
+
+static void payload_note_handler_context(uint32_t op_id,
+                                         const void* self,
+                                         volatile uint32_t* counter) {
+    const uint32_t ipsr = payload_read_ipsr();
+    if (ipsr == 0U) return;
+    (*counter)++;
+    g_payload_last_handler_ctx_ipsr = ipsr;
+    g_payload_last_handler_ctx_op_id = op_id;
+    g_payload_last_handler_ctx_this = (uint32_t)(uintptr_t)self;
+    g_payload_last_handler_ctx_dwt = payload_read_dwt();
+    g_payload_last_handler_ctx_msp = payload_read_msp();
+}
+
+// ---- Allocator preemption-overlap tripwire --------------------------------
+
+static volatile uint32_t g_payload_alloc_depth = 0;
+static volatile uint32_t g_payload_alloc_overlap_detected = 0;
+static volatile uint32_t g_payload_alloc_overlap_ipsr = 0;
+static volatile uint32_t g_payload_alloc_overlap_op_id = 0;
+static volatile uint32_t g_payload_alloc_overlap_this = 0;
+static volatile uint32_t g_payload_alloc_overlap_dwt = 0;
+static volatile uint32_t g_payload_alloc_overlap_depth = 0;
+
+static void payload_note_alloc_overlap(uint32_t op_id, const void* self) {
+    const uint32_t depth = g_payload_alloc_depth;
+    if (depth == 0U) return;
+    // A Payload allocator call is already in flight on this single core, so
+    // this call preempted it mid-heap-operation.  Record and proceed: the
+    // heap may already be the victim, and the evidence must outlive it.
+    g_payload_alloc_overlap_detected++;
+    g_payload_alloc_overlap_ipsr = payload_read_ipsr();
+    g_payload_alloc_overlap_op_id = op_id;
+    g_payload_alloc_overlap_this = (uint32_t)(uintptr_t)self;
+    g_payload_alloc_overlap_dwt = payload_read_dwt();
+    g_payload_alloc_overlap_depth = depth;
+}
+
+static void* payload_guarded_malloc(size_t total,
+                                    uint32_t op_id,
+                                    const void* self) {
+    payload_note_handler_context(op_id, self, &g_payload_handler_ctx_alloc);
+    payload_note_alloc_overlap(op_id, self);
+    g_payload_alloc_depth++;
+    void* raw = malloc(total);
+    g_payload_alloc_depth--;
+    return raw;
+}
+
+static void payload_guarded_free(void* block,
+                                 uint32_t op_id,
+                                 const void* self) {
+    payload_note_handler_context(op_id, self, &g_payload_handler_ctx_free);
+    payload_note_alloc_overlap(op_id, self);
+    g_payload_alloc_depth++;
+    free(block);
+    g_payload_alloc_depth--;
+}
+
+// ---- Retained flight recorder ---------------------------------------------
+
+#if defined(__IMXRT1062__)
+#define PAYLOAD_RETAINED_MEM DMAMEM
+#else
+#define PAYLOAD_RETAINED_MEM
+#endif
+
+static constexpr uint32_t PAYLOAD_FLIGHT_MAGIC = 0x464C5952UL;  // 'FLYR'
+
+struct payload_flight_ring_t {
+    uint32_t magic;
+    uint32_t magic_inv;
+    uint32_t sequence;  // total records noted since ring initialization
+    payload_flight_entry_t entries[PAYLOAD_FLIGHT_ENTRIES];
+};
+
+// NOLOAD placement: startup does not zero these, and nothing else may.  The
+// live ring's survival across a reboot is the entire point.
+static payload_flight_ring_t g_payload_flight_live PAYLOAD_RETAINED_MEM;
+static payload_flight_ring_t g_payload_flight_retained PAYLOAD_RETAINED_MEM;
+
+// Ordinary BSS: guaranteed zero at every boot, so the latch below runs
+// exactly once per boot regardless of RAM2 contents.
+static bool g_payload_flight_boot_latched = false;
+
+static bool payload_flight_ring_valid(const payload_flight_ring_t* ring) {
+    return ring->magic == PAYLOAD_FLIGHT_MAGIC &&
+           (ring->magic ^ ring->magic_inv) == 0xFFFFFFFFUL;
+}
+
+static void payload_flight_boot_latch(void) {
+    if (g_payload_flight_boot_latched) return;
+    g_payload_flight_boot_latched = true;
+
+    // RAM2 is NOLOAD, so at this moment the live ring still holds the
+    // previous boot's final records.  Preserve them in the retained bank
+    // before this boot's first record overwrites the ring.  Magic+complement
+    // rejects power-on garbage.  Triggered lazily by the first Payload
+    // activity of the boot; a preemption race here can only repeat the same
+    // copy, never lose data.
+    if (payload_flight_ring_valid(&g_payload_flight_live)) {
+        g_payload_flight_retained = g_payload_flight_live;
+    } else {
+        memset((void*)&g_payload_flight_retained, 0,
+               sizeof(g_payload_flight_retained));
+    }
+    payload_retained_flush(&g_payload_flight_retained,
+                           sizeof(g_payload_flight_retained));
+
+    memset((void*)g_payload_flight_live.entries, 0,
+           sizeof(g_payload_flight_live.entries));
+    g_payload_flight_live.sequence = 0U;
+    g_payload_flight_live.magic_inv = ~PAYLOAD_FLIGHT_MAGIC;
+    g_payload_flight_live.magic = PAYLOAD_FLIGHT_MAGIC;
+    payload_retained_flush(&g_payload_flight_live,
+                           sizeof(g_payload_flight_live));
+}
+
+static void payload_flight_note(uint32_t op_id,
+                                const void* self,
+                                uint16_t flags) {
+    payload_flight_boot_latch();
+
+    // Lock-free best-effort: a preempting record may interleave with this
+    // one.  The recorder trades perfect ordering for zero blocking.
+    const uint32_t seq = g_payload_flight_live.sequence++;
+    payload_flight_entry_t* e =
+        &g_payload_flight_live.entries[seq % PAYLOAD_FLIGHT_ENTRIES];
+    e->op_id = op_id;
+    e->this_ptr = (uint32_t)(uintptr_t)self;
+    e->dwt_cyccnt = payload_read_dwt();
+    e->ipsr = (uint16_t)payload_read_ipsr();
+    e->flags = flags;
+
+    // Flush the entry and the header (sequence) lines so the physical RAM2
+    // image is current if a reset arrives before natural eviction.
+    payload_retained_flush(e, sizeof(*e));
+    payload_retained_flush(&g_payload_flight_live,
+                           3U * sizeof(uint32_t));
+}
+
+void payload_get_flight_info(payload_flight_info_t* out) {
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+
+    // Ensure the retained bank is populated even if this is queried before
+    // any Payload activity has occurred this boot.
+    payload_flight_boot_latch();
+
+    if (payload_flight_ring_valid(&g_payload_flight_live)) {
+        out->live_valid = 1U;
+        const uint32_t seq = g_payload_flight_live.sequence;
+        out->live_sequence = seq;
+        const uint32_t count =
+            seq < PAYLOAD_FLIGHT_ENTRIES ? seq : PAYLOAD_FLIGHT_ENTRIES;
+        out->live_count = count;
+        for (uint32_t i = 0; i < count; ++i) {
+            const uint32_t idx = (seq - count + i) % PAYLOAD_FLIGHT_ENTRIES;
+            out->live[i] = g_payload_flight_live.entries[idx];
+        }
+    }
+
+    if (payload_flight_ring_valid(&g_payload_flight_retained)) {
+        out->retained_valid = 1U;
+        const uint32_t seq = g_payload_flight_retained.sequence;
+        out->retained_sequence = seq;
+        const uint32_t count =
+            seq < PAYLOAD_FLIGHT_ENTRIES ? seq : PAYLOAD_FLIGHT_ENTRIES;
+        out->retained_count = count;
+        for (uint32_t i = 0; i < count; ++i) {
+            const uint32_t idx = (seq - count + i) % PAYLOAD_FLIGHT_ENTRIES;
+            out->retained[i] = g_payload_flight_retained.entries[idx];
+        }
     }
 }
 
@@ -1144,10 +1406,10 @@ static void* payload_heap_allocate(size_t capacity, const void* owner) {
         return nullptr;
     }
     const size_t total = PAYLOAD_HEAP_HEADER_SIZE + capacity;
-    void* raw = malloc(total);
+    void* raw = payload_guarded_malloc(total, PAYLOAD_OP_HEAP_BLOCK, owner);
     if (!raw) return nullptr;
     if (((uintptr_t)raw % PAYLOAD_HEAP_ALIGNMENT) != 0U) {
-        free(raw);
+        payload_guarded_free(raw, PAYLOAD_OP_HEAP_BLOCK, owner);
         return nullptr;
     }
 
@@ -1800,9 +2062,13 @@ Payload::Payload()
       _data_begin_guard((uint16_t)~(uint16_t)INLINE_STORAGE),
       _inline_storage{} {
     payload_mark_constructed();
+    payload_note_handler_context(PAYLOAD_OP_CTOR, this,
+                                 &g_payload_handler_ctx_ctor);
+    payload_flight_note(PAYLOAD_OP_CTOR, this, 0U);
 }
 
 Payload::~Payload() {
+    payload_flight_note(PAYLOAD_OP_DTOR, this, 0U);
     _release_storage();
     payload_mark_destroyed();
 }
@@ -1816,6 +2082,9 @@ Payload::Payload(Payload&& other) noexcept
       _data_begin_guard((uint16_t)~(uint16_t)INLINE_STORAGE),
       _inline_storage{} {
     payload_mark_constructed();
+    payload_note_handler_context(PAYLOAD_OP_CTOR, this,
+                                 &g_payload_handler_ctx_ctor);
+    payload_flight_note(PAYLOAD_OP_CTOR, this, 0U);
     _move_from(other);
 }
 
@@ -1836,6 +2105,9 @@ Payload::Payload(const Payload& other)
       _data_begin_guard((uint16_t)~(uint16_t)INLINE_STORAGE),
       _inline_storage{} {
     payload_mark_constructed();
+    payload_note_handler_context(PAYLOAD_OP_CTOR, this,
+                                 &g_payload_handler_ctx_ctor);
+    payload_flight_note(PAYLOAD_OP_CTOR, this, 0U);
     if (!_copy_from(other)) {
         payload_note_error(PAYLOAD_ERR_COPY_ALLOC_FAIL, PAYLOAD_OP_COPY_CTOR, this);
     }
@@ -1934,7 +2206,7 @@ void Payload::_release_storage() {
             payload_heap_capacity(_heap_block, this, INLINE_STORAGE + 1U, STORAGE_MAX);
         if (capacity != 0) {
             payload_note_heap_delta(-(int32_t)capacity);
-            free(_heap_block);
+            payload_guarded_free(_heap_block, PAYLOAD_OP_RELEASE_STORAGE, this);
         } else {
             // Fail closed. A questionable pointer is leaked rather than passed
             // to free(); this is the only safe destructor policy after header
@@ -2306,6 +2578,7 @@ bool Payload::_ensure_room(size_t additional_entries,
         payload_note_error(PAYLOAD_ERR_ARENA_ALLOC_FAIL, PAYLOAD_OP_ENSURE_ROOM_ALLOC, this);
         return false;
     }
+    payload_flight_note(PAYLOAD_OP_ENSURE_ROOM_ALLOC, this, 0U);
 
     uint8_t* new_storage = payload_heap_bytes(new_block);
     memset(new_storage, 0, new_capacity);
@@ -2344,7 +2617,9 @@ bool Payload::_ensure_room(size_t additional_entries,
         g_payload_max_arena_capacity_seen = (uint32_t)data_capacity;
     }
 
-    if (old_block) free(old_block);
+    if (old_block) {
+        payload_guarded_free(old_block, PAYLOAD_OP_ENSURE_ROOM_ALLOC, this);
+    }
     if (data_shift) *data_shift = shift;
     return true;
 }
@@ -2355,6 +2630,9 @@ bool Payload::_append_value(const char* key,
                             size_t value_len,
                             ValueKind kind) {
     if (!_self_ok(PAYLOAD_OP_APPEND_VALUE)) return false;
+    payload_note_handler_context(PAYLOAD_OP_APPEND_VALUE, this,
+                                 &g_payload_handler_ctx_mutate);
+    payload_flight_note(PAYLOAD_OP_APPEND_VALUE, this, 0U);
     if ((!key && key_len != 0) || (!value && value_len != 0)) return false;
     if (key_len > UINT16_MAX || value_len > UINT16_MAX) {
         payload_note_error(PAYLOAD_ERR_STRING_TOO_LONG, PAYLOAD_OP_APPEND_VALUE_LENGTH, this);
@@ -2507,6 +2785,9 @@ bool Payload::_append_value_writer(const char* key,
                                    const Payload* object_value,
                                    const PayloadArray* array_value) {
     if (!_self_ok(PAYLOAD_OP_APPEND_WRITER)) return false;
+    payload_note_handler_context(PAYLOAD_OP_APPEND_WRITER, this,
+                                 &g_payload_handler_ctx_mutate);
+    payload_flight_note(PAYLOAD_OP_APPEND_WRITER, this, 0U);
     if ((!object_value && !array_value) || (object_value && array_value)) return false;
     if (key_len > UINT16_MAX || value_len > UINT16_MAX) {
         payload_note_error(PAYLOAD_ERR_STRING_TOO_LONG, PAYLOAD_OP_APPEND_WRITER_LENGTH, this);
@@ -3224,7 +3505,8 @@ String Payload::to_json() const {
         return String("{}");
     }
 
-    char* buffer = static_cast<char*>(malloc(needed + 1U));
+    char* buffer = static_cast<char*>(
+        payload_guarded_malloc(needed + 1U, PAYLOAD_OP_TO_JSON_ALLOC, this));
     if (!buffer) {
         g_payload_arena_alloc_fail++;
         g_payload_to_json_fail++;
@@ -3234,14 +3516,14 @@ String Payload::to_json() const {
 
     const size_t written = _write_json_unchecked(buffer);
     if (written != needed) {
-        free(buffer);
+        payload_guarded_free(buffer, PAYLOAD_OP_TO_JSON_ALLOC, this);
         g_payload_to_json_fail++;
         payload_note_error(PAYLOAD_ERR_TO_JSON_FAIL, PAYLOAD_OP_TO_JSON_WRITE, this);
         return String("{}");
     }
 
     String result(buffer);
-    free(buffer);
+    payload_guarded_free(buffer, PAYLOAD_OP_TO_JSON_ALLOC, this);
     return result;
 }
 
@@ -3262,6 +3544,9 @@ static uint8_t payload_kind_code_from_json_type(json_value_type_t type) {
 }
 
 bool Payload::parseJSON(const uint8_t* data, size_t len) {
+    payload_note_handler_context(PAYLOAD_OP_PARSEJSON_DATA, this,
+                                 &g_payload_handler_ctx_mutate);
+    payload_flight_note(PAYLOAD_OP_PARSEJSON_DATA, this, 0U);
     if (!data || len < 2U || len > ARENA_MAX ||
         !payload_span_readable(data, len, PAYLOAD_OP_PARSEJSON_DATA)) {
         clear();
@@ -3935,7 +4220,9 @@ bool PayloadArray::_ensure_capacity(size_t needed) {
     if (new_capacity > g_payload_max_arena_capacity_seen) {
         g_payload_max_arena_capacity_seen = (uint32_t)new_capacity;
     }
-    if (old_block) free(old_block);
+    if (old_block) {
+        payload_guarded_free(old_block, PAYLOAD_OP_ARRAY_ALLOC, this);
+    }
     return true;
 }
 
@@ -3956,7 +4243,8 @@ void PayloadArray::_release_storage() {
             payload_heap_capacity(_heap_block, this, INLINE_STORAGE + 1U, STORAGE_MAX);
         if (capacity != 0) {
             payload_note_heap_delta(-(int32_t)capacity);
-            free(_heap_block);
+            payload_guarded_free(_heap_block,
+                                 PAYLOAD_OP_ARRAY_RELEASE_STORAGE, this);
         } else {
             payload_note_integrity(PAYLOAD_SELF_OK_ENTRIES_SPAN_UNREADABLE,
                                    PAYLOAD_OP_ARRAY_RELEASE_STORAGE,
@@ -4343,4 +4631,21 @@ void payload_get_info(payload_info_t* out) {
     payload_copy_label(out->last_error_op,
                        sizeof(out->last_error_op),
                        g_payload_last_error_op);
+
+    out->handler_ctx_ctor = g_payload_handler_ctx_ctor;
+    out->handler_ctx_mutate = g_payload_handler_ctx_mutate;
+    out->handler_ctx_alloc = g_payload_handler_ctx_alloc;
+    out->handler_ctx_free = g_payload_handler_ctx_free;
+    out->last_handler_ctx_ipsr = g_payload_last_handler_ctx_ipsr;
+    out->last_handler_ctx_op_id = g_payload_last_handler_ctx_op_id;
+    out->last_handler_ctx_this = g_payload_last_handler_ctx_this;
+    out->last_handler_ctx_dwt = g_payload_last_handler_ctx_dwt;
+    out->last_handler_ctx_msp = g_payload_last_handler_ctx_msp;
+
+    out->alloc_overlap_detected = g_payload_alloc_overlap_detected;
+    out->alloc_overlap_ipsr = g_payload_alloc_overlap_ipsr;
+    out->alloc_overlap_op_id = g_payload_alloc_overlap_op_id;
+    out->alloc_overlap_this = g_payload_alloc_overlap_this;
+    out->alloc_overlap_dwt = g_payload_alloc_overlap_dwt;
+    out->alloc_overlap_depth = g_payload_alloc_overlap_depth;
 }

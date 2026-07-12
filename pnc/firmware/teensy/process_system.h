@@ -71,6 +71,74 @@
 void process_system_register(void);
 
 // ============================================================================
+// Exception-frame sentinel
+// ============================================================================
+//
+// Purpose (Crash1 follow-up): catch corruption of a stacked exception frame
+// while the corrupting handler pass is still on the CPU, with attribution.
+//
+// Theory under test: a handler-tier pass corrupts the 8-word basic exception
+// frame stacked at exception entry; the subsequent exception return then
+// lawfully restores a poisoned register file into the foreground, which
+// statistically lands in FP-heavy report construction and trips over memset.
+//
+// Usage contract:
+//
+//   void my_handler(void) {
+//     ZPNET_SENTINEL_ENTER(ZPNET_SENTINEL_SLOT_HANDOFF, "HANDOFF");
+//     ... handler body ...
+//     ZPNET_SENTINEL_EXIT(ZPNET_SENTINEL_SLOT_HANDOFF);
+//   }
+//
+//   • ENTER must be the FIRST statement of the handler body: it captures
+//     EXC_RETURN from LR by inline assembly before the first BL can clobber
+//     it.  An implausible capture is counted and the sentinel falls back to
+//     its other frame-location strategies.
+//   • EXIT must be the LAST statement before every return, at the same brace
+//     level as ENTER, with no VLAs or alloca between them (the MSP
+//     entry/exit comparison assumes a fixed frame).
+//   • Each concurrent handler site needs its own slot.  A slot is never
+//     shared between handlers that can preempt one another.
+//   • Both calls are scalar-only, allocator-free, and bounded; they are safe
+//     at any interrupt priority.
+//
+// Verdicts are surfaced through SYSTEM.SENTINEL_INFO, folded into
+// SYSTEM.CRASH_INFO, retained across reboot in RAM2, and announced by one
+// SENTINEL_ANOMALY event per boot from serialized foreground context.
+
+enum {
+  ZPNET_SENTINEL_SLOT_HANDOFF   = 0,  // priority-16 handoff tier
+  ZPNET_SENTINEL_SLOT_PPS       = 1,  // PPS capture ISR (debug builds)
+  ZPNET_SENTINEL_SLOT_SMARTZERO = 2,  // SmartZero sampling ISR (debug builds)
+  ZPNET_SENTINEL_SLOT_AUX3      = 3,
+  ZPNET_SENTINEL_SLOT_AUX4      = 4,
+  ZPNET_SENTINEL_SLOT_AUX5      = 5,
+  ZPNET_SENTINEL_SLOT_AUX6      = 6,
+  ZPNET_SENTINEL_SLOT_AUX7      = 7,
+  ZPNET_SENTINEL_SLOT_COUNT     = 8,
+};
+
+// name must be a string literal or other immortal storage; only the pointer
+// is retained.
+void zpnet_sentinel_enter(uint32_t slot, const char* name, uint32_t exc_return);
+void zpnet_sentinel_exit(uint32_t slot);
+
+#if defined(__arm__)
+#define ZPNET_SENTINEL_ENTER(slot, name)                                     \
+  do {                                                                       \
+    uint32_t zpnet_sentinel_exc_return_;                                     \
+    __asm__ volatile("mov %0, lr"                                            \
+                     : "=r"(zpnet_sentinel_exc_return_));                    \
+    zpnet_sentinel_enter((slot), (name), zpnet_sentinel_exc_return_);        \
+  } while (0)
+#else
+#define ZPNET_SENTINEL_ENTER(slot, name)                                     \
+  zpnet_sentinel_enter((slot), (name), 0U)
+#endif
+
+#define ZPNET_SENTINEL_EXIT(slot) zpnet_sentinel_exit((slot))
+
+// ============================================================================
 // Feature status substrate
 // ============================================================================
 //

@@ -215,6 +215,31 @@ typedef struct {
   uint32_t last_error_op_id;
   char     last_error_op[32];
 
+  // Execution-context census — Payload activity performed while IPSR != 0.
+  // Crash1 evidence implicated handler-context Payload code writing adjacent
+  // to (or over) a stacked exception frame; these fields attribute that
+  // activity without changing behavior.
+  uint32_t handler_ctx_ctor;
+  uint32_t handler_ctx_mutate;
+  uint32_t handler_ctx_alloc;
+  uint32_t handler_ctx_free;
+  uint32_t last_handler_ctx_ipsr;
+  uint32_t last_handler_ctx_op_id;
+  uint32_t last_handler_ctx_this;
+  uint32_t last_handler_ctx_dwt;
+  uint32_t last_handler_ctx_msp;
+
+  // Allocator preemption-overlap tripwire — a Payload allocator call observed
+  // another Payload allocator call already in flight on this single core.
+  // This is the exact system-level invariant violation the Payload design
+  // documents as its one undefendable residual risk.
+  uint32_t alloc_overlap_detected;
+  uint32_t alloc_overlap_ipsr;
+  uint32_t alloc_overlap_op_id;
+  uint32_t alloc_overlap_this;
+  uint32_t alloc_overlap_dwt;
+  uint32_t alloc_overlap_depth;
+
 } payload_info_t;
 
 void payload_get_info(payload_info_t* out);
@@ -224,6 +249,49 @@ const char* payload_self_ok_fail_reason_name(uint32_t reason);
 const char* payload_numeric_reject_reason_name(uint32_t reason);
 const char* payload_semantic_fail_reason_name(uint32_t reason);
 const char* payload_operation_id_name(uint32_t operation_id);
+
+// ============================================================================
+// Payload flight recorder (retained, read-only)
+// ============================================================================
+//
+// A small ring of recent Payload lifecycle/mutation/failure records.  The
+// live ring resides in RAM2 (NOLOAD), so the final Payload operations before
+// a crash survive the reboot.  On the first Payload activity of each boot the
+// surviving ring is latched into a retained snapshot bank before this boot's
+// records overwrite it; both banks are validated by magic+complement so
+// power-on garbage is reported as invalid rather than as evidence.
+//
+// Each record is scalar-only and written allocator-free; recording is safe in
+// handler context.  The recorder is forensic best-effort, never authoritative.
+
+#define PAYLOAD_FLIGHT_ENTRIES 32U
+
+#define PAYLOAD_FLIGHT_FLAG_ERROR     0x0001U  // failure-path record
+#define PAYLOAD_FLIGHT_FLAG_INTEGRITY 0x0002U  // integrity-courtroom record
+
+typedef struct {
+  uint32_t op_id;       // PAYLOAD_OP_* identity of the recorded operation
+  uint32_t this_ptr;    // Payload/PayloadArray instance address
+  uint32_t dwt_cyccnt;  // ARM_DWT_CYCCNT at the moment of the record
+  uint16_t ipsr;        // 0 = thread mode, else active exception number
+  uint16_t flags;       // PAYLOAD_FLIGHT_FLAG_*
+} payload_flight_entry_t;
+
+typedef struct {
+  // This boot's ring, oldest first.
+  uint32_t live_valid;
+  uint32_t live_sequence;   // total records noted this boot
+  uint32_t live_count;      // populated entries in live[]
+  payload_flight_entry_t live[PAYLOAD_FLIGHT_ENTRIES];
+
+  // Previous boot's final ring (the crash flight recorder), oldest first.
+  uint32_t retained_valid;
+  uint32_t retained_sequence;
+  uint32_t retained_count;
+  payload_flight_entry_t retained[PAYLOAD_FLIGHT_ENTRIES];
+} payload_flight_info_t;
+
+void payload_get_flight_info(payload_flight_info_t* out);
 
 // Allocation-free, locale-free fixed-decimal formatter used by Payload and
 // available to other ZPNet reporting code. Precision must be in [0, 12].
