@@ -2793,6 +2793,15 @@ struct interrupt_subscriber_descriptor_t {
   interrupt_lane_t lane = interrupt_lane_t::NONE;
 };
 
+struct interrupt_deferred_dispatch_t {
+  bool pending = false;
+  uint32_t binding_generation = 0;
+  interrupt_subscriber_event_fn callback = nullptr;
+  void* user_data = nullptr;
+  interrupt_event_t event{};
+  interrupt_capture_diag_t diag{};
+};
+
 struct interrupt_subscriber_runtime_t {
   const interrupt_subscriber_descriptor_t* desc = nullptr;
   interrupt_subscription_t sub {};
@@ -2801,6 +2810,17 @@ struct interrupt_subscriber_runtime_t {
   interrupt_event_t last_event {};
   interrupt_capture_diag_t last_diag {};
   bool has_fired = false;
+
+  // Deferred delivery owns a frozen event/diagnostic/callback tuple.  It never
+  // asks the later TimePop callback to reinterpret mutable last_* or sub state.
+  uint32_t binding_generation = 1;
+  interrupt_deferred_dispatch_t deferred{};
+  bool dispatch_running = false;
+  uint32_t dispatch_busy_drop_count = 0;
+  uint32_t dispatch_stale_drop_count = 0;
+  uint32_t dispatch_invalid_callback_count = 0;
+  uint32_t dispatch_arm_fail_count = 0;
+
   uint32_t start_count = 0;
   uint32_t stop_count = 0;
   uint32_t irq_count = 0;
@@ -4359,8 +4379,25 @@ static void smartzero_reset_lane(uint32_t index) {
 }
 
 static bool smartzero_is_current_lane(interrupt_subscriber_kind_t kind) {
-  if (!g_smartzero.running || g_smartzero.complete) return false;
-  return smartzero_kind_for_index(g_smartzero.current_lane_index) == kind;
+  // This predicate is read from priority 0.  It must never observe the middle
+  // of a foreground/priority-16 SmartZero transaction.
+  for (uint32_t attempt = 0; attempt < 2U; attempt++) {
+    const uint32_t seq1 = g_smartzero.seq;
+    if (seq1 & 1U) continue;
+    dmb_barrier();
+
+    const bool running = g_smartzero.running;
+    const bool complete = g_smartzero.complete;
+    const uint32_t lane_index = g_smartzero.current_lane_index;
+
+    dmb_barrier();
+    const uint32_t seq2 = g_smartzero.seq;
+    if (seq1 == seq2 && (seq2 & 1U) == 0U) {
+      return running && !complete &&
+             smartzero_kind_for_index(lane_index) == kind;
+    }
+  }
+  return false;
 }
 
 static uint32_t smartzero_expected_interval_cycles(uint32_t* out_cps) {
@@ -4557,6 +4594,10 @@ static bool smartzero_feed_sample(interrupt_subscriber_kind_t kind,
 bool interrupt_smartzero_begin(void) {
   if (!g_interrupt_runtime_ready || !g_interrupt_hw_ready) return false;
 
+  // Foreground owns this lifecycle transition.  Mask priority 16 while the
+  // SmartZero SEQLOCK is odd; priority 0 remains unmasked and will simply
+  // decline the unstable snapshot for that one tooth.
+  const uint32_t prior_basepri = interrupt_priority0_guard_enter();
   smartzero_write_begin();
 
   g_smartzero.running = true;
@@ -4578,10 +4619,12 @@ bool interrupt_smartzero_begin(void) {
   if (!OCXO2_DISABLED) ocxo_lane_stop_local_cadence(g_ocxo2_lane, OCXO_CADENCE_REASON_SMARTZERO);
 
   smartzero_write_end();
+  interrupt_priority0_guard_exit(prior_basepri);
   return true;
 }
 
 void interrupt_smartzero_abort(void) {
+  const uint32_t prior_basepri = interrupt_priority0_guard_enter();
   smartzero_write_begin();
   g_smartzero.running = false;
   g_smartzero.complete = false;
@@ -4598,6 +4641,7 @@ void interrupt_smartzero_abort(void) {
   }
 
   smartzero_write_end();
+  interrupt_priority0_guard_exit(prior_basepri);
   vclock_ch2_smartzero_deactivate();
 
   // SmartZero may temporarily stop/re-author the OCXO local compare path
@@ -4636,11 +4680,12 @@ bool interrupt_smartzero_complete(void) {
   return g_smartzero.complete;
 }
 
-bool interrupt_smartzero_live_snapshot(interrupt_smartzero_snapshot_t* out) {
+static bool smartzero_snapshot_load(interrupt_smartzero_snapshot_t* out) {
   if (!out) return false;
 
   for (int attempt = 0; attempt < 4; attempt++) {
     const uint32_t seq1 = g_smartzero.seq;
+    if (seq1 & 1U) continue;
     dmb_barrier();
 
     interrupt_smartzero_snapshot_t local{};
@@ -4665,14 +4710,18 @@ bool interrupt_smartzero_live_snapshot(interrupt_smartzero_snapshot_t* out) {
 
     dmb_barrier();
     const uint32_t seq2 = g_smartzero.seq;
-    if (seq1 == seq2 && (seq1 & 1u) == 0u) {
+    if (seq1 == seq2 && (seq2 & 1U) == 0U) {
       *out = local;
-      return local.complete;
+      return true;
     }
   }
 
   *out = interrupt_smartzero_snapshot_t{};
   return false;
+}
+
+bool interrupt_smartzero_live_snapshot(interrupt_smartzero_snapshot_t* out) {
+  return smartzero_snapshot_load(out) && out->complete;
 }
 
 bool interrupt_smartzero_snapshot(interrupt_smartzero_snapshot_t* out) {
@@ -5263,9 +5312,11 @@ struct lower_env_lane_t {
   uint32_t overflow_reset_count = 0;
 };
 
-static lower_env_lane_t g_lower_env_vclock;
-static lower_env_lane_t g_lower_env_ocxo1;
-static lower_env_lane_t g_lower_env_ocxo2;
+// These are bulky priority-16/foreground diagnostic ledgers.  Keeping them in
+// RAM2 preserves scarce RAM1 for stack without slowing priority-0 capture.
+static lower_env_lane_t g_lower_env_vclock DMAMEM;
+static lower_env_lane_t g_lower_env_ocxo1 DMAMEM;
+static lower_env_lane_t g_lower_env_ocxo2 DMAMEM;
 static uint32_t g_lower_env_snapshot_count = 0;
 static bool g_interrupt_feature_floorline_latched_nominal = false;
 
@@ -5622,7 +5673,7 @@ static void lower_env_note_raw_bookend_anomaly(
   lane.raw_bookend_anomaly_fallback_publish_count = lane.fallback_publish_count;
 }
 
-static bool lower_env_raw_bookend_watchdog_if_pending(
+static FLASHMEM bool lower_env_raw_bookend_watchdog_if_pending(
     interrupt_subscriber_kind_t kind,
     const cadence_regression_result_t& r,
     const dwt_repair_diag_t& diag,
@@ -5668,6 +5719,7 @@ static bool lower_env_raw_bookend_watchdog_if_pending(
   root.add("ipsr", interrupt_ipsr());
   root.add("primask", interrupt_primask());
 
+  {
   Payload interval;
   interval.add("observed_interval_cycles", observed_interval);
   interval.add("reference_cycles", reference_cycles);
@@ -5682,8 +5734,10 @@ static bool lower_env_raw_bookend_watchdog_if_pending(
   interval.add("current_minus_previous_observed_cycles",
                (int32_t)(lane->raw_bookend_anomaly_current_observed_dwt -
                          lane->raw_bookend_anomaly_previous_observed_dwt));
-  root.add_object("raw_observed_interval", interval);
+  root.add_object("raw_observed_interval", interval);  }
 
+
+  {
   Payload counter;
   counter.add("previous_target_counter32",
               lane->raw_bookend_anomaly_previous_target_counter32);
@@ -5710,8 +5764,10 @@ static bool lower_env_raw_bookend_watchdog_if_pending(
               (uint32_t)((uint16_t)(
                   lane->raw_bookend_anomaly_current_observed_hw16 -
                   lane->raw_bookend_anomaly_current_target_hw16)));
-  root.add_object("counter_lineage", counter);
+  root.add_object("counter_lineage", counter);  }
 
+
+  {
   Payload floorline;
   floorline.add("valid", r.valid);
   floorline.add("sequence", r.sequence);
@@ -5746,8 +5802,10 @@ static bool lower_env_raw_bookend_watchdog_if_pending(
   floorline.add("residual_abs_gt32_count", r.residual_abs_gt32_count);
   floorline.add("residual_abs_gt64_count", r.residual_abs_gt64_count);
   floorline.add("residual_abs_gt128_count", r.residual_abs_gt128_count);
-  root.add_object("floorline", floorline);
+  root.add_object("floorline", floorline);  }
 
+
+  {
   Payload published;
   published.add("published_dwt", diag.used_dwt);
   published.add("observed_dwt", diag.original_dwt);
@@ -5760,8 +5818,10 @@ static bool lower_env_raw_bookend_watchdog_if_pending(
                 diag.event_dwt_from_isr_entry_raw);
   published.add("isr_entry_to_event_correction_cycles",
                 diag.isr_entry_to_event_correction_cycles);
-  root.add_object("published_edge", published);
+  root.add_object("published_edge", published);  }
 
+
+  {
   Payload state;
   state.add("active_valid", lane->active_valid);
   state.add("active_base_dwt", lane->active_base_dwt);
@@ -5784,7 +5844,8 @@ static bool lower_env_raw_bookend_watchdog_if_pending(
   state.add("overflow_reset_count", lane->overflow_reset_count);
   state.add("reset_count", lane->reset_count);
   state.add("update_count", lane->update_count);
-  root.add_object("lane_state", state);
+  root.add_object("lane_state", state);  }
+
 
   clocks_watchdog_anomaly_payload("lower_env_raw_bookend_anomaly",
                                   root,
@@ -6728,7 +6789,7 @@ static void dwt_publication_note_cross_rail(
 }
 
 
-static void dwt_publication_append_keyword(char* out,
+static FLASHMEM void dwt_publication_append_keyword(char* out,
                                            size_t out_size,
                                            const char* keyword) {
   if (!out || out_size == 0U || !keyword || !*keyword) return;
@@ -6737,7 +6798,7 @@ static void dwt_publication_append_keyword(char* out,
   snprintf(out + used, out_size - used, "%s%s", used ? "," : "", keyword);
 }
 
-static const char* dwt_publication_verdict_keywords(uint32_t mask,
+static FLASHMEM const char* dwt_publication_verdict_keywords(uint32_t mask,
                                                     char* out,
                                                     size_t out_size) {
   if (!out || out_size == 0U) return "";
@@ -6794,7 +6855,7 @@ static const char* dwt_publication_verdict_keywords(uint32_t mask,
   return out;
 }
 
-static void dwt_publication_add_cross_rail_payload(
+static FLASHMEM void dwt_publication_add_cross_rail_payload(
     Payload& parent,
     const char* key,
     const dwt_publication_lane_state_t& other,
@@ -6820,7 +6881,7 @@ static void dwt_publication_add_cross_rail_payload(
   parent.add_object(key, p);
 }
 
-static void dwt_publication_raise_verbose_watchdog(
+static FLASHMEM void dwt_publication_raise_verbose_watchdog(
     const dwt_publication_request_t& req,
     const dwt_repair_diag_t& diag,
     const dwt_publication_lane_state_t& lane_state,
@@ -6830,13 +6891,9 @@ static void dwt_publication_raise_verbose_watchdog(
     uint32_t launch_blocking,
     uint32_t launch_relaxed,
     bool strict_ready) {
-  char verdict_keywords[320];
-  char fatal_keywords[320];
-  char blocking_keywords[320];
-  char always_keywords[320];
-  char launch_block_keywords[320];
-  char launch_relaxed_keywords[320];
-  char side_rail_keywords[320];
+  // Payload copies strings at add-time, so one reusable buffer replaces seven
+  // simultaneously live 320-byte arrays on the fatal path.
+  char keywords[320];
 
   Payload root;
   root.add("schema", "WATCHDOG_ANOMALY_DWT_PUBLICATION_VERBOSE_V1");
@@ -6853,6 +6910,7 @@ static void dwt_publication_raise_verbose_watchdog(
   root.add("ipsr", interrupt_ipsr());
   root.add("primask", interrupt_primask());
 
+  {
   Payload court;
   const uint32_t primary_reason_id =
       interrupt_dwt_publication_reason_id_from_verdict_mask(f.verdict_mask);
@@ -6864,33 +6922,33 @@ static void dwt_publication_raise_verbose_watchdog(
   court.add("fatal_primary_verdict", interrupt_dwt_publication_reason_name(fatal_reason_id));
   court.add("verdict_keywords",
             dwt_publication_verdict_keywords(f.verdict_mask,
-                                             verdict_keywords,
-                                             sizeof(verdict_keywords)));
+                                             keywords,
+                                             sizeof(keywords)));
   court.add("fatal_keywords",
             dwt_publication_verdict_keywords(f.fatal_mask,
-                                             fatal_keywords,
-                                             sizeof(fatal_keywords)));
+                                             keywords,
+                                             sizeof(keywords)));
   court.add("blocking_keywords",
             dwt_publication_verdict_keywords(blocking_mask,
-                                             blocking_keywords,
-                                             sizeof(blocking_keywords)));
+                                             keywords,
+                                             sizeof(keywords)));
   court.add("always_blocking_keywords",
             dwt_publication_verdict_keywords(always_blocking,
-                                             always_keywords,
-                                             sizeof(always_keywords)));
+                                             keywords,
+                                             sizeof(keywords)));
   court.add("launch_blocking_keywords",
             dwt_publication_verdict_keywords(launch_blocking,
-                                             launch_block_keywords,
-                                             sizeof(launch_block_keywords)));
+                                             keywords,
+                                             sizeof(keywords)));
   court.add("launch_relaxed_keywords",
             dwt_publication_verdict_keywords(launch_relaxed,
-                                             launch_relaxed_keywords,
-                                             sizeof(launch_relaxed_keywords)));
+                                             keywords,
+                                             sizeof(keywords)));
   court.add("side_rail_diagnostic_keywords",
             dwt_publication_verdict_keywords(
                 f.verdict_mask & DWT_PUBLICATION_SIDE_RAIL_DIAGNOSTIC_MASK,
-                side_rail_keywords,
-                sizeof(side_rail_keywords)));
+                keywords,
+                sizeof(keywords)));
   court.add("launch_acquisition_active_at_record", f.launch_acquisition_active);
   court.add("launch_begin_count", (uint32_t)g_dwt_publication_launch_begin_count);
   court.add("launch_end_count", (uint32_t)g_dwt_publication_launch_end_count);
@@ -6899,8 +6957,10 @@ static void dwt_publication_raise_verbose_watchdog(
   court.add("lane_accept_count_before_event", lane_state.accept_count);
   court.add("lane_watchdog_count", lane_state.watchdog_count);
   court.add("forensic_record_count", f.record_count);
-  root.add_object("court", court);
+  root.add_object("court", court);  }
 
+
+  {
   Payload event;
   event.add("kind", interrupt_subscriber_kind_str(req.kind));
   event.add("sequence", f.sequence);
@@ -6915,16 +6975,20 @@ static void dwt_publication_raise_verbose_watchdog(
   event.add("service_low16_valid", f.service_low16_valid);
   event.add("service_low16", (uint32_t)f.service_low16);
   event.add("service_offset_ticks", f.service_offset_ticks);
-  root.add_object("event", event);
+  root.add_object("event", event);  }
 
+
+  {
   Payload previous;
   previous.add("valid", f.previous_valid);
   previous.add("published_dwt", f.previous_published_dwt);
   previous.add("observed_dwt", f.previous_observed_dwt);
   previous.add("floorline_dwt", f.previous_floorline_dwt);
   previous.add("counter32", f.previous_counter32);
-  root.add_object("previous_publication", previous);
+  root.add_object("previous_publication", previous);  }
 
+
+  {
   Payload lineage;
   lineage.add("expected_counter_delta_ticks", f.expected_counter_delta_ticks);
   lineage.add("observed_counter_delta_ticks", f.observed_counter_delta_ticks);
@@ -6943,8 +7007,10 @@ static void dwt_publication_raise_verbose_watchdog(
   lineage.add("ruler_gate_cycles", DWT_PUBLICATION_INTERVAL_GATE_CYCLES);
   lineage.add("cross_rail_gate_cycles", DWT_PUBLICATION_CROSS_RAIL_GATE_CYCLES);
   lineage.add("service_offset_gate_ticks", DWT_PUBLICATION_SERVICE_OFFSET_GATE_TICKS);
-  root.add_object("lineage", lineage);
+  root.add_object("lineage", lineage);  }
 
+
+  {
   Payload cross;
   dwt_publication_add_cross_rail_payload(cross, "vclock", g_dwt_publication_vclock,
                                          f.published_interval_cycles);
@@ -6952,8 +7018,10 @@ static void dwt_publication_raise_verbose_watchdog(
                                          f.published_interval_cycles);
   dwt_publication_add_cross_rail_payload(cross, "ocxo2", g_dwt_publication_ocxo2,
                                          f.published_interval_cycles);
-  root.add_object("cross_rail", cross);
+  root.add_object("cross_rail", cross);  }
 
+
+  {
   Payload floorline;
   floorline.add("valid", f.floorline_valid);
   floorline.add("candidate", f.floorline_candidate);
@@ -6966,8 +7034,10 @@ static void dwt_publication_raise_verbose_watchdog(
   floorline.add("publish_source", lower_env_publish_source_name(f.floorline_publish_source));
   floorline.add("publish_reason", lower_env_publish_reason_name(f.floorline_publish_reason));
   floorline.add("confidence_ppm", f.floorline_confidence_ppm);
-  root.add_object("floorline", floorline);
+  root.add_object("floorline", floorline);  }
 
+
+  {
   Payload capture;
   capture.add("authored_dwt", f.capture_authored_dwt);
   capture.add("raw_event_dwt", f.capture_raw_event_dwt);
@@ -6991,8 +7061,10 @@ static void dwt_publication_raise_verbose_watchdog(
               (int32_t)(f.published_dwt - f.capture_authored_dwt));
   capture.add("raw_minus_capture_authored_cycles",
               (int32_t)(f.capture_raw_event_dwt - f.capture_authored_dwt));
-  root.add_object("capture", capture);
+  root.add_object("capture", capture);  }
 
+
+  {
   Payload repair;
   repair.add("original_dwt", f.repair_original_dwt);
   repair.add("predicted_dwt", f.repair_predicted_dwt);
@@ -7004,8 +7076,10 @@ static void dwt_publication_raise_verbose_watchdog(
   repair.add("reason", f.repair_reason ? f.repair_reason : "none");
   repair.add("vclock_gnss_error_ns_i32",
              dwt_publication_i32_from_i64(diag.publication_vclock_gnss_error_ns));
-  root.add_object("repair", repair);
+  root.add_object("repair", repair);  }
 
+
+  {
   Payload yardstick;
   yardstick.add("valid", f.yardstick_valid);
   yardstick.add("stale", f.yardstick_stale);
@@ -7021,7 +7095,8 @@ static void dwt_publication_raise_verbose_watchdog(
   yardstick.add("auth_endpoint_dwt", f.yardstick_auth_endpoint_dwt);
   yardstick.add("auth_error_cycles", f.yardstick_auth_error_cycles);
   yardstick.add("auth_anchor_applied", f.yardstick_auth_anchor_applied);
-  root.add_object("yardstick", yardstick);
+  root.add_object("yardstick", yardstick);  }
+
 
   clocks_watchdog_anomaly_payload("dwt_publication_anomaly",
                                   root,
@@ -7459,6 +7534,8 @@ static bool dwt_publication_adjudicate_or_watchdog(
 // Diag fill + event dispatch
 // ============================================================================
 
+static void deferred_dispatch_callback(timepop_ctx_t*, timepop_diag_t*, void*);
+
 static void fill_diag(interrupt_capture_diag_t& diag,
                       const interrupt_subscriber_runtime_t& rt,
                       const interrupt_event_t& event) {
@@ -7549,16 +7626,142 @@ static void fill_diag(interrupt_capture_diag_t& diag,
   }
 }
 
-static void maybe_dispatch_event(interrupt_subscriber_runtime_t& rt) {
-  if (!rt.subscribed || !rt.sub.on_event) return;
-  rt.dispatch_count++;
-  rt.sub.on_event(rt.last_event, &rt.last_diag, rt.sub.user_data);
+static bool interrupt_subscriber_callback_executable(
+    interrupt_subscriber_event_fn callback) {
+  if (!callback) return false;
+  const uintptr_t bits = (uintptr_t)callback;
+  const uintptr_t address = bits & ~uintptr_t(1U);
+
+  // Teensy 4.1 code executes from ITCM or the QSPI XIP window.  In particular,
+  // OCRAM/DMAMEM subscriber-table addresses are data and must never become an
+  // indirect branch target.
+  return address < 0x00100000UL ||
+         (address >= 0x60000000UL && address < 0x61000000UL);
 }
 
-static void deferred_dispatch_callback(timepop_ctx_t*, timepop_diag_t*, void* user_data) {
+static void interrupt_dispatch_invalidate_locked(
+    interrupt_subscriber_runtime_t& rt) {
+  rt.binding_generation++;
+  if (rt.binding_generation == 0U) rt.binding_generation = 1U;
+
+  // A callback may synchronously stop or replace its own subscription.  Keep
+  // the active snapshot alive until that call returns; the generation change
+  // makes it stale for every later dispatch.
+  if (!rt.dispatch_running) {
+    rt.deferred = interrupt_deferred_dispatch_t{};
+  }
+}
+
+static bool interrupt_dispatch_begin(
+    interrupt_subscriber_runtime_t& rt,
+    const interrupt_event_t& event,
+    const interrupt_capture_diag_t& diag,
+    bool deferred) {
+  interrupt_subscriber_event_fn callback = nullptr;
+  void* callback_user_data = nullptr;
+  uint32_t binding_generation = 0;
+
+  const uint32_t prior_basepri = interrupt_priority0_guard_enter();
+  if (!rt.subscribed || !rt.active || !rt.sub.on_event ||
+      rt.dispatch_running || (deferred && rt.deferred.pending)) {
+    if (rt.dispatch_running || (deferred && rt.deferred.pending)) {
+      rt.dispatch_busy_drop_count++;
+    }
+    interrupt_priority0_guard_exit(prior_basepri);
+    return false;
+  }
+
+  callback = rt.sub.on_event;
+  callback_user_data = rt.sub.user_data;
+  binding_generation = rt.binding_generation;
+
+  if (!interrupt_subscriber_callback_executable(callback)) {
+    rt.dispatch_invalid_callback_count++;
+    interrupt_priority0_guard_exit(prior_basepri);
+    return false;
+  }
+
+  if (deferred) {
+    rt.deferred.pending = true;
+    rt.deferred.binding_generation = binding_generation;
+    rt.deferred.callback = callback;
+    rt.deferred.user_data = callback_user_data;
+    rt.deferred.event = event;
+    rt.deferred.diag = diag;
+    interrupt_priority0_guard_exit(prior_basepri);
+
+    const timepop_handle_t handle =
+        timepop_arm_asap(deferred_dispatch_callback,
+                         &rt,
+                         dispatch_timer_name(rt.desc->kind));
+    if (handle == TIMEPOP_INVALID_HANDLE) {
+      const uint32_t restore_basepri = interrupt_priority0_guard_enter();
+      if (!rt.dispatch_running &&
+          rt.deferred.pending &&
+          rt.deferred.binding_generation == binding_generation) {
+        rt.deferred = interrupt_deferred_dispatch_t{};
+      }
+      rt.dispatch_arm_fail_count++;
+      interrupt_priority0_guard_exit(restore_basepri);
+      return false;
+    }
+    return true;
+  }
+
+  rt.dispatch_running = true;
+  interrupt_priority0_guard_exit(prior_basepri);
+
+  rt.dispatch_count++;
+  callback(event, &diag, callback_user_data);
+
+  const uint32_t finish_basepri = interrupt_priority0_guard_enter();
+  rt.dispatch_running = false;
+  interrupt_priority0_guard_exit(finish_basepri);
+  return true;
+}
+
+static void deferred_dispatch_callback(timepop_ctx_t*,
+                                       timepop_diag_t*,
+                                       void* user_data) {
   auto* rt = static_cast<interrupt_subscriber_runtime_t*>(user_data);
   if (!rt || !rt->desc) return;
-  maybe_dispatch_event(*rt);
+
+  interrupt_subscriber_event_fn callback = nullptr;
+  void* callback_user_data = nullptr;
+
+  const uint32_t prior_basepri = interrupt_priority0_guard_enter();
+  if (!rt->deferred.pending || rt->dispatch_running) {
+    interrupt_priority0_guard_exit(prior_basepri);
+    return;
+  }
+
+  if (!rt->subscribed || !rt->active ||
+      rt->deferred.binding_generation != rt->binding_generation) {
+    rt->dispatch_stale_drop_count++;
+    rt->deferred = interrupt_deferred_dispatch_t{};
+    interrupt_priority0_guard_exit(prior_basepri);
+    return;
+  }
+
+  callback = rt->deferred.callback;
+  callback_user_data = rt->deferred.user_data;
+  if (!interrupt_subscriber_callback_executable(callback)) {
+    rt->dispatch_invalid_callback_count++;
+    rt->deferred = interrupt_deferred_dispatch_t{};
+    interrupt_priority0_guard_exit(prior_basepri);
+    return;
+  }
+
+  rt->dispatch_running = true;
+  interrupt_priority0_guard_exit(prior_basepri);
+
+  rt->dispatch_count++;
+  callback(rt->deferred.event, &rt->deferred.diag, callback_user_data);
+
+  const uint32_t finish_basepri = interrupt_priority0_guard_enter();
+  rt->dispatch_running = false;
+  rt->deferred = interrupt_deferred_dispatch_t{};
+  interrupt_priority0_guard_exit(finish_basepri);
 }
 
 static void emit_one_second_event(interrupt_subscriber_runtime_t& rt,
@@ -7718,11 +7921,10 @@ static void emit_one_second_event(interrupt_subscriber_runtime_t& rt,
   rt.has_fired  = true;
   rt.event_count++;
 
-  if (dispatch_immediately) {
-    maybe_dispatch_event(rt);
-  } else {
-    timepop_arm_asap(deferred_dispatch_callback, &rt, dispatch_timer_name(rt.desc->kind));
-  }
+  (void)interrupt_dispatch_begin(rt,
+                                 event,
+                                 diag,
+                                 !dispatch_immediately);
 }
 
 // ============================================================================
@@ -7771,9 +7973,8 @@ struct vclock_perishable_fact_t {
 
 struct vclock_perishable_ring_t {
   vclock_perishable_fact_t facts[VCLOCK_PERISHABLE_FACT_RING_SIZE]{};
-  volatile uint32_t head = 0;
-  volatile uint32_t tail = 0;
-  volatile uint32_t count = 0;
+  volatile uint32_t head = 0;  // producer-owned monotonic cursor
+  volatile uint32_t tail = 0;  // consumer-owned monotonic cursor
   volatile bool drain_armed = false;
   volatile uint32_t sequence = 0;
   volatile uint32_t enqueue_count = 0;
@@ -7794,7 +7995,6 @@ static void vclock_fact_ring_reset(void) {
   }
   g_vclock_fact_ring.head = 0;
   g_vclock_fact_ring.tail = 0;
-  g_vclock_fact_ring.count = 0;
   g_vclock_fact_ring.drain_armed = false;
   g_vclock_fact_ring.sequence = 0;
   g_vclock_fact_ring.enqueue_count = 0;
@@ -7805,20 +8005,28 @@ static void vclock_fact_ring_reset(void) {
   g_vclock_fact_ring.asap_fail_count = 0;
 }
 
+static uint32_t vclock_fact_ring_pending(void) {
+  const uint32_t tail = g_vclock_fact_ring.tail;
+  dmb_barrier();
+  return g_vclock_fact_ring.head - tail;
+}
+
 static bool vclock_fact_ring_pop(vclock_perishable_fact_t& out) {
   const uint32_t prior_basepri = interrupt_priority0_guard_enter();
-  if (g_vclock_fact_ring.count == 0) {
+  const uint32_t tail = g_vclock_fact_ring.tail;
+  const uint32_t head = g_vclock_fact_ring.head;
+  if (tail == head) {
     g_vclock_fact_ring.drain_armed = false;
     interrupt_priority0_guard_exit(prior_basepri);
     return false;
   }
 
-  out = g_vclock_fact_ring.facts[g_vclock_fact_ring.tail];
-  g_vclock_fact_ring.tail =
-      (g_vclock_fact_ring.tail + 1U) % VCLOCK_PERISHABLE_FACT_RING_SIZE;
-  g_vclock_fact_ring.count--;
+  dmb_barrier();
+  out = g_vclock_fact_ring.facts[tail % VCLOCK_PERISHABLE_FACT_RING_SIZE];
+  dmb_barrier();
+  g_vclock_fact_ring.tail = tail + 1U;
   g_vclock_fact_ring.drain_count++;
-  if (g_vclock_fact_ring.count == 0) {
+  if ((tail + 1U) == head) {
     g_vclock_fact_ring.drain_armed = false;
   }
   interrupt_priority0_guard_exit(prior_basepri);
@@ -7826,26 +8034,29 @@ static bool vclock_fact_ring_pop(vclock_perishable_fact_t& out) {
 }
 
 static bool vclock_fact_ring_push_no_arm_from_isr(vclock_perishable_fact_t fact) {
-  if (g_vclock_fact_ring.count >= VCLOCK_PERISHABLE_FACT_RING_SIZE) {
+  const uint32_t head = g_vclock_fact_ring.head;
+  dmb_barrier();
+  const uint32_t pending = head - g_vclock_fact_ring.tail;
+  if (pending >= VCLOCK_PERISHABLE_FACT_RING_SIZE) {
     g_vclock_fact_ring.overflow_count++;
     g_vclock_lane.miss_count++;
     return false;
   }
 
   fact.sequence = ++g_vclock_fact_ring.sequence;
-  g_vclock_fact_ring.facts[g_vclock_fact_ring.head] = fact;
-  g_vclock_fact_ring.head =
-      (g_vclock_fact_ring.head + 1U) % VCLOCK_PERISHABLE_FACT_RING_SIZE;
-  g_vclock_fact_ring.count++;
+  g_vclock_fact_ring.facts[head % VCLOCK_PERISHABLE_FACT_RING_SIZE] = fact;
+  dmb_barrier();
+  g_vclock_fact_ring.head = head + 1U;
   g_vclock_fact_ring.enqueue_count++;
-  if (g_vclock_fact_ring.count > g_vclock_fact_ring.high_water) {
-    g_vclock_fact_ring.high_water = g_vclock_fact_ring.count;
+  const uint32_t pending_after = pending + 1U;
+  if (pending_after > g_vclock_fact_ring.high_water) {
+    g_vclock_fact_ring.high_water = pending_after;
   }
   return true;
 }
 
 static bool vclock_fact_ring_arm_drain_from_timepop(void) {
-  if (g_vclock_fact_ring.count == 0 || g_vclock_fact_ring.drain_armed) return false;
+  if (vclock_fact_ring_pending() == 0 || g_vclock_fact_ring.drain_armed) return false;
 
   g_vclock_fact_ring.drain_armed = true;
   g_vclock_fact_ring.asap_arm_count++;
@@ -9101,9 +9312,8 @@ struct interrupt_perishable_fact_t {
 
 struct ocxo_perishable_ring_t {
   interrupt_perishable_fact_t facts[OCXO_PERISHABLE_FACT_RING_SIZE]{};
-  volatile uint32_t head = 0;
-  volatile uint32_t tail = 0;
-  volatile uint32_t count = 0;
+  volatile uint32_t head = 0;  // producer-owned monotonic cursor
+  volatile uint32_t tail = 0;  // consumer-owned monotonic cursor
   volatile bool drain_armed = false;
   volatile uint32_t sequence = 0;
   volatile uint32_t enqueue_count = 0;
@@ -9142,7 +9352,6 @@ static void ocxo_fact_ring_reset(ocxo_runtime_context_t& ctx) {
   }
   r.head = 0;
   r.tail = 0;
-  r.count = 0;
   r.drain_armed = false;
   r.sequence = 0;
   r.enqueue_count = 0;
@@ -9169,22 +9378,32 @@ static bool ocxo_fact_ring_push_from_isr(ocxo_runtime_context_t& ctx,
                                          const interrupt_perishable_fact_t& fact);
 static void ocxo_fact_drain_callback(timepop_ctx_t*, timepop_diag_t*, void* user_data);
 
+static uint32_t ocxo_fact_ring_pending(
+    const ocxo_perishable_ring_t& ring) {
+  const uint32_t tail = ring.tail;
+  dmb_barrier();
+  return ring.head - tail;
+}
+
 static bool ocxo_fact_ring_pop(ocxo_runtime_context_t& ctx,
                                interrupt_perishable_fact_t& out) {
   ocxo_perishable_ring_t& r = ocxo_fact_ring_for(ctx);
 
   const uint32_t prior_basepri = interrupt_priority0_guard_enter();
-  if (r.count == 0) {
+  const uint32_t tail = r.tail;
+  const uint32_t head = r.head;
+  if (tail == head) {
     r.drain_armed = false;
     interrupt_priority0_guard_exit(prior_basepri);
     return false;
   }
 
-  out = r.facts[r.tail];
-  r.tail = (r.tail + 1U) % OCXO_PERISHABLE_FACT_RING_SIZE;
-  r.count--;
+  dmb_barrier();
+  out = r.facts[tail % OCXO_PERISHABLE_FACT_RING_SIZE];
+  dmb_barrier();
+  r.tail = tail + 1U;
   r.drain_count++;
-  if (r.count == 0) {
+  if ((tail + 1U) == head) {
     r.drain_armed = false;
   }
   interrupt_priority0_guard_exit(prior_basepri);
@@ -9196,7 +9415,10 @@ static bool ocxo_fact_ring_push_from_isr(ocxo_runtime_context_t& ctx,
   ocxo_perishable_ring_t& r = ocxo_fact_ring_for(ctx);
   ocxo_lane_t* lane = ctx.lane;
 
-  if (r.count >= OCXO_PERISHABLE_FACT_RING_SIZE) {
+  const uint32_t head = r.head;
+  dmb_barrier();
+  const uint32_t pending = head - r.tail;
+  if (pending >= OCXO_PERISHABLE_FACT_RING_SIZE) {
     r.overflow_count++;
     if (lane) {
       lane->witness_fact_overflow_count = r.overflow_count;
@@ -9204,11 +9426,12 @@ static bool ocxo_fact_ring_push_from_isr(ocxo_runtime_context_t& ctx,
     return false;
   }
 
-  r.facts[r.head] = fact;
-  r.head = (r.head + 1U) % OCXO_PERISHABLE_FACT_RING_SIZE;
-  r.count++;
+  r.facts[head % OCXO_PERISHABLE_FACT_RING_SIZE] = fact;
+  dmb_barrier();
+  r.head = head + 1U;
   r.enqueue_count++;
-  if (r.count > r.high_water) r.high_water = r.count;
+  const uint32_t pending_after = pending + 1U;
+  if (pending_after > r.high_water) r.high_water = pending_after;
 
   if (lane) {
     lane->witness_fact_enqueue_count = r.enqueue_count;
@@ -10243,6 +10466,11 @@ struct ocxo_1khz_tend_capture_t {
   uint16_t arm_compare_low16 = 0;
   uint32_t arm_dwt_raw = 0;
   uint32_t csctrl_after_program = 0;
+
+  // Priority 0 may author the next hardware target, but it must not write the
+  // SmartZero SEQLOCK.  Ferry the rearm result to the priority-16 single writer.
+  bool smartzero_rearm_committed = false;
+  uint32_t smartzero_next_target_counter32 = 0;
 };
 
 struct ocxo_1khz_sample_capture_packet_t {
@@ -10266,6 +10494,8 @@ struct ocxo_1khz_sample_capture_packet_t {
   uint16_t arm_compare_low16 = 0;
   uint32_t arm_dwt_raw = 0;
   uint32_t csctrl_after_program = 0;
+  bool smartzero_rearm_committed = false;
+  uint32_t smartzero_next_target_counter32 = 0;
 };
 
 struct ocxo_one_second_capture_packet_t {
@@ -10311,10 +10541,11 @@ struct pps_capture_packet_t {
 
 template <typename T, uint32_t N>
 struct interrupt_capture_ring_t {
+  // Single-producer/single-consumer monotonic cursors.  Priority 0 owns head;
+  // priority 16 owns tail.  No field is read/modified/written by both sides.
   T items[N]{};
   volatile uint32_t head = 0;
   volatile uint32_t tail = 0;
-  volatile uint32_t count = 0;
 };
 
 static interrupt_capture_ring_t<qtimer1_ch1_capture_packet_t,
@@ -10383,26 +10614,39 @@ static inline uint32_t interrupt_primask(void) {
 }
 
 template <typename T, uint32_t N>
+static inline uint32_t capture_ring_pending(
+    const interrupt_capture_ring_t<T, N>& ring) {
+  const uint32_t tail = ring.tail;
+  dmb_barrier();
+  const uint32_t head = ring.head;
+  return head - tail;
+}
+
+template <typename T, uint32_t N>
 static bool capture_ring_push_from_priority0(
     interrupt_capture_ring_t<T, N>& ring,
     interrupt_handoff_source_diag_t& diag,
     T packet) {
-  if (ring.count >= N) {
+  const uint32_t head = ring.head;
+  dmb_barrier();
+  const uint32_t pending = head - ring.tail;
+  if (pending >= N) {
     diag.overrun_count++;
     return false;
   }
 
   packet.sequence = ++g_interrupt_capture_sequence;
-  ring.items[ring.head] = packet;
-  ring.head = (ring.head + 1U) % N;
-  ring.count++;
+  ring.items[head % N] = packet;
+  dmb_barrier();
+  ring.head = head + 1U;
 
+  const uint32_t pending_after = pending + 1U;
   diag.capture_count++;
   diag.enqueue_count++;
-  diag.pending_count = ring.count;
+  diag.pending_count = pending_after;
   diag.last_sequence = packet.sequence;
   diag.last_capture_dwt = packet.isr_entry_dwt_raw;
-  if (ring.count > diag.high_water) diag.high_water = ring.count;
+  if (pending_after > diag.high_water) diag.high_water = pending_after;
   return true;
 }
 
@@ -10411,17 +10655,17 @@ static bool capture_ring_pop_for_handoff(
     interrupt_capture_ring_t<T, N>& ring,
     interrupt_handoff_source_diag_t& diag,
     T& out) {
-  const uint32_t prior_basepri = interrupt_priority0_guard_enter();
-  if (ring.count == 0) {
-    interrupt_priority0_guard_exit(prior_basepri);
-    return false;
-  }
-  out = ring.items[ring.tail];
-  ring.tail = (ring.tail + 1U) % N;
-  ring.count--;
+  const uint32_t tail = ring.tail;
+  const uint32_t head = ring.head;
+  if (tail == head) return false;
+
+  dmb_barrier();
+  out = ring.items[tail % N];
+  dmb_barrier();
+  ring.tail = tail + 1U;
+
   diag.dequeue_count++;
-  diag.pending_count = ring.count;
-  interrupt_priority0_guard_exit(prior_basepri);
+  diag.pending_count = head - (tail + 1U);
   return true;
 }
 
@@ -10429,25 +10673,24 @@ template <typename T, uint32_t N>
 static bool capture_ring_peek_sequence(
     interrupt_capture_ring_t<T, N>& ring,
     uint32_t& seq) {
-  const uint32_t prior_basepri = interrupt_priority0_guard_enter();
-  if (ring.count == 0) {
-    interrupt_priority0_guard_exit(prior_basepri);
-    return false;
-  }
-  seq = ring.items[ring.tail].sequence;
-  interrupt_priority0_guard_exit(prior_basepri);
+  const uint32_t tail = ring.tail;
+  const uint32_t head = ring.head;
+  if (tail == head) return false;
+
+  dmb_barrier();
+  seq = ring.items[tail % N].sequence;
   return true;
 }
 
 static bool interrupt_handoff_any_pending(void) {
-  return g_qtimer1_ch1_capture_ring.count != 0 ||
-         g_qtimer1_vclock_capture_ring.count != 0 ||
-         g_qtimer1_ch2_capture_ring.count != 0 ||
-         g_ocxo1_1khz_sample_capture_ring.count != 0 ||
-         g_ocxo2_1khz_sample_capture_ring.count != 0 ||
-         g_ocxo1_one_second_capture_ring.count != 0 ||
-         g_ocxo2_one_second_capture_ring.count != 0 ||
-         g_pps_capture_ring.count != 0;
+  return capture_ring_pending(g_qtimer1_ch1_capture_ring) != 0 ||
+         capture_ring_pending(g_qtimer1_vclock_capture_ring) != 0 ||
+         capture_ring_pending(g_qtimer1_ch2_capture_ring) != 0 ||
+         capture_ring_pending(g_ocxo1_1khz_sample_capture_ring) != 0 ||
+         capture_ring_pending(g_ocxo2_1khz_sample_capture_ring) != 0 ||
+         capture_ring_pending(g_ocxo1_one_second_capture_ring) != 0 ||
+         capture_ring_pending(g_ocxo2_one_second_capture_ring) != 0 ||
+         capture_ring_pending(g_pps_capture_ring) != 0;
 }
 
 static void interrupt_handoff_note_priority0_body(
@@ -10895,6 +11138,9 @@ static void ocxo_1khz_packet_from_tend_capture(
   packet.arm_compare_low16 = tick.arm_compare_low16;
   packet.arm_dwt_raw = tick.arm_dwt_raw;
   packet.csctrl_after_program = tick.csctrl_after_program;
+  packet.smartzero_rearm_committed = tick.smartzero_rearm_committed;
+  packet.smartzero_next_target_counter32 =
+      tick.smartzero_next_target_counter32;
 }
 
 static void ocxo_one_second_packet_from_tend_capture(
@@ -11373,13 +11619,8 @@ static void ocxo_cadence_capture_priority0(ocxo_runtime_context_t& ctx,
       lane.cadence_rearm_count++;
       lane.cadence_last_reason = OCXO_CADENCE_REASON_REARM;
       if (was_smartzero_current) {
-        const int idx = smartzero_index_for_kind(ctx.kind);
-        if (idx >= 0) {
-          smartzero_write_begin();
-          g_smartzero.lanes[idx].pub.next_target_counter32 = next_target;
-          g_smartzero.lanes[idx].pub.arm_count++;
-          smartzero_write_end();
-        }
+        tick.smartzero_rearm_committed = true;
+        tick.smartzero_next_target_counter32 = next_target;
       }
     }
   } else {
@@ -11463,6 +11704,20 @@ static void interrupt_handoff_process_ocxo_1khz_sample(
   // This path is intentionally 1 kHz/acquisition only.  It can advance
   // SmartZero state, but it cannot enqueue an OCXO one-second publication.
   lane.cadence_last_one_second_due = false;
+
+  // Priority 16 is the sole SmartZero data writer.  Apply the hardware rearm
+  // result captured by priority 0 before feeding the corresponding sample.
+  if (packet.smartzero_rearm_committed) {
+    const int idx = smartzero_index_for_kind(ctx.kind);
+    if (idx >= 0) {
+      smartzero_write_begin();
+      g_smartzero.lanes[idx].pub.next_target_counter32 =
+          packet.smartzero_next_target_counter32;
+      g_smartzero.lanes[idx].pub.arm_count++;
+      smartzero_write_end();
+    }
+  }
+
   const bool cadence_reauthored_by_smartzero =
       ocxo_cadence_feed_smartzero(ctx, sample);
   (void)cadence_reauthored_by_smartzero;
@@ -12265,14 +12520,23 @@ bool interrupt_subscribe(const interrupt_subscription_t& sub) {
   if (sub.kind == interrupt_subscriber_kind_t::NONE || !sub.on_event) return false;
   interrupt_subscriber_runtime_t* rt = runtime_for(sub.kind);
   if (!rt || !rt->desc) return false;
+
+  const uint32_t prior_basepri = interrupt_priority0_guard_enter();
+  interrupt_dispatch_invalidate_locked(*rt);
   rt->sub = sub;
   rt->subscribed = true;
+  interrupt_priority0_guard_exit(prior_basepri);
   return true;
 }
 
 bool interrupt_start(interrupt_subscriber_kind_t kind) {
   interrupt_subscriber_runtime_t* rt = runtime_for(kind);
   if (!rt || !rt->desc) return false;
+  {
+    const uint32_t prior_basepri = interrupt_priority0_guard_enter();
+    interrupt_dispatch_invalidate_locked(*rt);
+    interrupt_priority0_guard_exit(prior_basepri);
+  }
   rt->start_count++;
   cadence_regression_reset_kind(kind);
   dwt_publication_reset_lane(kind);
@@ -12326,7 +12590,12 @@ bool interrupt_start(interrupt_subscriber_kind_t kind) {
 bool interrupt_stop(interrupt_subscriber_kind_t kind) {
   interrupt_subscriber_runtime_t* rt = runtime_for(kind);
   if (!rt || !rt->desc) return false;
-  rt->active = false;
+  {
+    const uint32_t prior_basepri = interrupt_priority0_guard_enter();
+    rt->active = false;
+    interrupt_dispatch_invalidate_locked(*rt);
+    interrupt_priority0_guard_exit(prior_basepri);
+  }
   rt->stop_count++;
   cadence_regression_reset_kind(kind);
   dwt_publication_reset_lane(kind);
@@ -12474,6 +12743,10 @@ static void interrupt_dmamem_cold_init(void) {
   g_dwt_publication_ocxo1 = dwt_publication_lane_state_t{};
   g_dwt_publication_ocxo2 = dwt_publication_lane_state_t{};
   g_dwt_publication_last_fatal = dwt_publication_forensics_t{};
+
+  g_lower_env_vclock = lower_env_lane_t{};
+  g_lower_env_ocxo1 = lower_env_lane_t{};
+  g_lower_env_ocxo2 = lower_env_lane_t{};
 
   g_vclock_fact_ring = vclock_perishable_ring_t{};
   g_ocxo1_fact_ring = ocxo_perishable_ring_t{};
@@ -12910,6 +13183,16 @@ static FLASHMEM void add_runtime_summary(Payload& p,
   snprintf(key, sizeof(key), "%s_stopped", prefix);    p.add(key, rt ? rt->stop_count : 0U);
   snprintf(key, sizeof(key), "%s_irq_count", prefix);  p.add(key, irq_count);
   snprintf(key, sizeof(key), "%s_event_count", prefix);p.add(key, event_count);
+  snprintf(key, sizeof(key), "%s_dispatch_count", prefix);
+  p.add(key, rt ? rt->dispatch_count : 0U);
+  snprintf(key, sizeof(key), "%s_dispatch_busy_drop_count", prefix);
+  p.add(key, rt ? rt->dispatch_busy_drop_count : 0U);
+  snprintf(key, sizeof(key), "%s_dispatch_stale_drop_count", prefix);
+  p.add(key, rt ? rt->dispatch_stale_drop_count : 0U);
+  snprintf(key, sizeof(key), "%s_dispatch_invalid_callback_count", prefix);
+  p.add(key, rt ? rt->dispatch_invalid_callback_count : 0U);
+  snprintf(key, sizeof(key), "%s_dispatch_arm_fail_count", prefix);
+  p.add(key, rt ? rt->dispatch_arm_fail_count : 0U);
 }
 
 
@@ -13668,20 +13951,24 @@ static FLASHMEM Payload cmd_report_cadence(const Payload&) {
 static FLASHMEM Payload cmd_report_smartzero(const Payload&) {
   Payload p;
   p.add("report", "INTERRUPT_SMARTZERO");
-  p.add("phase", smartzero_phase_name(g_smartzero.phase));
-  p.add("running", g_smartzero.running);
-  p.add("complete", g_smartzero.complete);
-  p.add("sequence", g_smartzero.sequence);
-  p.add("begin_count", g_smartzero.begin_count);
-  p.add("complete_count", g_smartzero.complete_count);
-  p.add("abort_count", g_smartzero.abort_count);
-  p.add("current_lane_index", g_smartzero.current_lane_index);
+
+  interrupt_smartzero_snapshot_t snapshot{};
+  const bool snapshot_ok = smartzero_snapshot_load(&snapshot);
+  p.add("snapshot_ok", snapshot_ok);
+  p.add("phase", smartzero_phase_name(snapshot.phase));
+  p.add("running", snapshot.running);
+  p.add("complete", snapshot.complete);
+  p.add("sequence", snapshot.sequence);
+  p.add("begin_count", snapshot.begin_count);
+  p.add("complete_count", snapshot.complete_count);
+  p.add("abort_count", snapshot.abort_count);
+  p.add("current_lane_index", snapshot.current_lane_index);
   p.add("all_lanes_worthy", (bool)g_smartzero2.all_lanes_worthy);
   p.add("all_worthy_second_count", g_smartzero2.all_worthy_second_count);
   for (uint32_t i = 0; i < SMARTZERO_LANE_COUNT; i++) {
     char prefix[24]; snprintf(prefix, sizeof(prefix), "lane%u_", (unsigned)i);
     char key[48];
-    const auto& lane = g_smartzero.lanes[i].pub;
+    const auto& lane = snapshot.lanes[i];
     snprintf(key, sizeof(key), "%skind", prefix); p.add(key, interrupt_subscriber_kind_str(lane.kind));
     snprintf(key, sizeof(key), "%sstate", prefix); p.add(key, smartzero_lane_state_name(lane.state));
     snprintf(key, sizeof(key), "%sdecision", prefix); p.add(key, smartzero_decision_name(lane.last_decision));
