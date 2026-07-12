@@ -2323,17 +2323,22 @@ static constexpr uint32_t ALPHA_COUNTERLEDGER_PHASE_NEAR_BOUNDARY_NS = 8U;
 // refined-interval gates.
 static constexpr uint32_t ALPHA_COUNTERLEDGER_PHASE_PENDING_RING_SIZE = 4U;
 
-// CounterLedger is a PPS-sampled 10 MHz integer rail.  One legal contiguous
-// PPS interval should be very close to 10,000,000 ticks; keep the admission
-// band deliberately broad so normal ppm/ppb physics passes while stale,
-// duplicated, or mis-associated captures such as 0, 1, or 36k ticks cannot
-// author interval science or poison recovery reattachment.
+// CounterLedger is a PPS-sampled 10 MHz integer rail.  A lawful contiguous
+// PPS interval must remain within 10,000 ticks of the nominal 10,000,000-tick
+// second.  A deviation of 10,000 ticks is exactly 1 ms / 1,000 ppm: far beyond
+// plausible OCXO physics, but exactly the discrete injury observed when one
+// cadence tooth was lost or mis-associated.  Treat the threshold as inclusive:
+// abs(delta - nominal) >= 10,000 is inadmissible and must re-seed rather than
+// advance the canonical clockface.
 static constexpr uint32_t ALPHA_COUNTERLEDGER_EXPECTED_INTERVAL_TICKS =
     (uint32_t)VCLOCK_COUNTS_PER_SECOND;
+static constexpr uint32_t ALPHA_COUNTERLEDGER_MAX_DEVIATION_TICKS = 10000U;
 static constexpr uint32_t ALPHA_COUNTERLEDGER_MIN_PLAUSIBLE_INTERVAL_TICKS =
-    ALPHA_COUNTERLEDGER_EXPECTED_INTERVAL_TICKS - 1000000U;
+    ALPHA_COUNTERLEDGER_EXPECTED_INTERVAL_TICKS -
+    (ALPHA_COUNTERLEDGER_MAX_DEVIATION_TICKS - 1U);
 static constexpr uint32_t ALPHA_COUNTERLEDGER_MAX_PLAUSIBLE_INTERVAL_TICKS =
-    ALPHA_COUNTERLEDGER_EXPECTED_INTERVAL_TICKS + 1000000U;
+    ALPHA_COUNTERLEDGER_EXPECTED_INTERVAL_TICKS +
+    (ALPHA_COUNTERLEDGER_MAX_DEVIATION_TICKS - 1U);
 
 struct alpha_counterledger_phase_pending_t {
   bool     valid = false;
@@ -3305,6 +3310,8 @@ static bool alpha_counterledger_apply_pps_sample(
       alpha_counterledger_interval_plausible(delta_ticks);
   const bool admissible_interval =
       had_prior_sample && contiguous && plausible_interval;
+  const bool implausible_reseed =
+      had_prior_sample && contiguous && !plausible_interval;
   const uint32_t sample_decision = !had_prior_sample
       ? CLOCKS_COUNTERLEDGER_SAMPLE_DECISION_SEED_ACCEPTED
       : (!contiguous
@@ -3436,6 +3443,21 @@ static bool alpha_counterledger_apply_pps_sample(
   }
 
   if (out_ns) *out_ns = s.refined_valid ? s.refined_ns : s.ns;
+
+  if (implausible_reseed) {
+    // The bad capture has been preserved in the CounterLedger transcript and
+    // the lane has been re-seeded without advancing ticks64.  During an armed
+    // campaign this is a continuity surrender: stopping is safer than silently
+    // carrying a frozen or inferred OCXO clockface into TIMEBASE/recovery.
+    clocks_watchdog_anomaly(
+        "alpha_counterledger_interval_implausible",
+        pps_sequence,
+        (uint32_t)((uint8_t)clock),
+        delta_ticks,
+        ALPHA_COUNTERLEDGER_EXPECTED_INTERVAL_TICKS);
+    return false;
+  }
+
   return true;
 }
 
