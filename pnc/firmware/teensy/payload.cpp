@@ -2634,6 +2634,115 @@ static bool payload_format_checked(char* out,
     return true;
 }
 
+
+// ============================================================================
+// ZPNet fixed-decimal formatter
+// ============================================================================
+//
+// Payload needs one narrow numeric language: finite fixed-point decimal with a
+// bounded precision.  Do not route this through printf/snprintf or locale-aware
+// libc formatting.  The implementation is allocation-free, writes only after
+// the complete output size is known, normalizes negative zero, and performs
+// half-away-from-zero rounding using one guard digit.
+//
+// The magnitude ceiling is deliberately below UINT64_MAX so conversion of the
+// integral part is always defined on every supported compiler.
+//
+bool zpnet_format_fixed(double value,
+                        uint32_t precision,
+                        char* out,
+                        size_t out_size,
+                        size_t* out_length) {
+    static constexpr uint32_t MAX_PRECISION = 12U;
+    static constexpr double MAX_MAGNITUDE = 9000000000000000000.0;
+
+    if (out_length) *out_length = 0U;
+    if (!out || out_size == 0U) return false;
+    out[0] = '\0';
+
+    if (precision > MAX_PRECISION || value != value) return false;
+
+    const bool negative = value < 0.0;
+    const double magnitude = negative ? -value : value;
+    if (magnitude > MAX_MAGNITUDE) return false;
+
+    uint64_t whole = (uint64_t)magnitude;
+    double fraction = magnitude - (double)whole;
+    if (fraction < 0.0) fraction = 0.0;
+    if (fraction >= 1.0) fraction = 0.9999999999999999;
+
+    uint8_t fractional_digits[MAX_PRECISION] = {0U};
+    uint8_t guard_digit = 0U;
+
+    for (uint32_t i = 0U; i <= precision; ++i) {
+        const double scaled = fraction * 10.0;
+        int digit = (int)scaled;
+        if (digit < 0) digit = 0;
+        if (digit > 9) digit = 9;
+
+        fraction = scaled - (double)digit;
+        if (fraction < 0.0) fraction = 0.0;
+        if (fraction > 1.0) fraction = 1.0;
+
+        if (i < precision) {
+            fractional_digits[i] = (uint8_t)digit;
+        } else {
+            guard_digit = (uint8_t)digit;
+        }
+    }
+
+    if (guard_digit >= 5U) {
+        bool carry = true;
+        for (uint32_t i = precision; i != 0U && carry; --i) {
+            uint8_t& digit = fractional_digits[i - 1U];
+            if (digit == 9U) {
+                digit = 0U;
+            } else {
+                ++digit;
+                carry = false;
+            }
+        }
+        if (carry) {
+            ++whole;
+        }
+    }
+
+    bool rounded_nonzero = whole != 0U;
+    for (uint32_t i = 0U; i < precision && !rounded_nonzero; ++i) {
+        rounded_nonzero = fractional_digits[i] != 0U;
+    }
+
+    char reversed_whole[20];
+    size_t whole_digits = 0U;
+    uint64_t remaining_whole = whole;
+    do {
+        reversed_whole[whole_digits++] =
+            (char)('0' + (uint8_t)(remaining_whole % 10U));
+        remaining_whole /= 10U;
+    } while (remaining_whole != 0U);
+
+    const size_t sign_chars = negative && rounded_nonzero ? 1U : 0U;
+    const size_t decimal_chars = precision != 0U ? 1U + precision : 0U;
+    const size_t required = sign_chars + whole_digits + decimal_chars;
+    if (required + 1U > out_size) return false;
+
+    size_t pos = 0U;
+    if (sign_chars != 0U) out[pos++] = '-';
+    while (whole_digits != 0U) {
+        out[pos++] = reversed_whole[--whole_digits];
+    }
+    if (precision != 0U) {
+        out[pos++] = '.';
+        for (uint32_t i = 0U; i < precision; ++i) {
+            out[pos++] = (char)('0' + fractional_digits[i]);
+        }
+    }
+
+    out[pos] = '\0';
+    if (out_length) *out_length = pos;
+    return true;
+}
+
 // ============================================================================
 // Semantic construction
 // ============================================================================
@@ -2759,10 +2868,9 @@ bool Payload::_add_floating(const char* key,
     if (precision < 0) precision = 0;
     if (precision > 12) precision = 12;
 
-    char format[16] = {0};
+    static constexpr char FORMATTER_NAME[] = "ZPNET_FIXED";
     char text[64] = {0};
-    int format_n = 0;
-    int value_n = 0;
+    int formatter_result = 0;
 
     auto substitute_null = [&](uint32_t reason) -> bool {
         payload_note_numeric_reject(reason,
@@ -2772,12 +2880,12 @@ bool Payload::_add_floating(const char* key,
                                     key_len,
                                     value,
                                     precision,
-                                    format,
-                                    sizeof(format),
-                                    format_n,
+                                    FORMATTER_NAME,
+                                    sizeof(FORMATTER_NAME),
+                                    (int)(sizeof(FORMATTER_NAME) - 1U),
                                     text,
                                     sizeof(text),
-                                    value_n);
+                                    formatter_result);
         const bool inserted = _append_value(key ? key : "",
                                             key_len,
                                             "null",
@@ -2802,19 +2910,17 @@ bool Payload::_add_floating(const char* key,
         return substitute_null(reason);
     }
 
-    format_n = snprintf(format, sizeof(format), "%%.%df", precision);
-    if (format_n <= 0 || (size_t)format_n >= sizeof(format)) {
+    size_t len = 0U;
+    if (!zpnet_format_fixed(value,
+                            (uint32_t)precision,
+                            text,
+                            sizeof(text),
+                            &len)) {
+        formatter_result = -1;
         payload_note_error(PAYLOAD_ERR_STRING_TRUNCATION, operation_id, this);
         return substitute_null(PAYLOAD_NUMERIC_REJECT_FORMAT_FAILURE);
     }
-
-    size_t len = 0;
-    value_n = snprintf(text, sizeof(text), format, value);
-    if (!payload_format_checked(text, sizeof(text),
-                                value_n,
-                                operation_id, this, &len)) {
-        return substitute_null(PAYLOAD_NUMERIC_REJECT_FORMAT_FAILURE);
-    }
+    formatter_result = (int)len;
 
     if (!json_number_token_valid(text, len)) {
         payload_note_error(PAYLOAD_ERR_INVALID_NUMERIC_TOKEN, operation_id, this);

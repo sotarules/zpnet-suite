@@ -225,6 +225,16 @@ const char* payload_numeric_reject_reason_name(uint32_t reason);
 const char* payload_semantic_fail_reason_name(uint32_t reason);
 const char* payload_operation_id_name(uint32_t operation_id);
 
+// Allocation-free, locale-free fixed-decimal formatter used by Payload and
+// available to other ZPNet reporting code. Precision must be in [0, 12].
+// Returns false for NaN, infinity, out-of-range magnitude, or insufficient
+// output space. On failure, out is an empty C string and out_length is zero.
+bool zpnet_format_fixed(double value,
+                        uint32_t precision,
+                        char* out,
+                        size_t out_size,
+                        size_t* out_length);
+
 class Payload;
 class PayloadArray;
 class PayloadArrayView;
