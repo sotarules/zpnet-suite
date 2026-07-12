@@ -68,8 +68,9 @@ Core contract (v2026-03+):
 
     1. Campaign deactivated immediately on recovery entry — processor
        thread ignores all fragments during the entire recovery window.
-    2. Fragment queue drained after Teensy STOP in warm recovery —
-       eliminates stale-fragment poisoning of Welford accumulators.
+    2. Fragment queue drained after lowering the Pi campaign gate in warm
+       recovery — eliminates stale-fragment poisoning without stopping the
+       Teensy's always-on VCLOCK/OCXO event service.
     3. Pi-side PPS/VCLOCK count expectation matching was removed.
        Every valid TIMEBASE_FRAGMENT is accepted as Teensy-authored truth.
     4. Pi-owned GNSS_RAW/Welford recovery state is restored before the
@@ -2454,6 +2455,15 @@ def _recovery_inflight_status_compact(status: Dict[str, Any]) -> Dict[str, Any]:
         "campaign_seconds": _as_int(status.get("campaign_seconds")),
         "recover_lifecycle_active": _recovery_bool(status.get("recover_lifecycle_active")),
         "recover_lifecycle_reason": status.get("recover_lifecycle_reason"),
+        "recover_interrupt_service_rearm_ok": _recovery_bool(
+            status.get("recover_interrupt_service_rearm_ok")
+        ),
+        "recover_interrupt_service_rearm_count": _as_int(
+            status.get("recover_interrupt_service_rearm_count")
+        ),
+        "recover_interrupt_service_rearm_failure_count": _as_int(
+            status.get("recover_interrupt_service_rearm_failure_count")
+        ),
         "recover_reattach_active": _recovery_bool(status.get("recover_reattach_active")),
         "recover_reattach_degraded_active": _recovery_bool(status.get("recover_reattach_degraded_active")),
         "recover_reattach_reason": status.get("recover_reattach_reason"),
@@ -5994,12 +6004,22 @@ def _recover_campaign() -> None:
     _wait_for_timebase_routes(context="recovery")
 
     # ------------------------------------------------------------------
-    # Stop Teensy, quiesce, snap to second boundary
+    # Quiesce Pi ingress without stopping the always-on Teensy clock lanes
     # ------------------------------------------------------------------
-    logging.info("📡 [recovery] @%s stopping Teensy...", system_time_z())
-    _request_teensy_stop_best_effort()
-    _request_teensy_recover_abort_best_effort("pre_recover_cleanup_after_stop")
-    time.sleep(2.0)
+    #
+    # A live TIMEBASE blackout is a publication/control-plane failure, not an
+    # operator STOP.  CLOCKS.RECOVER is itself the firmware lifecycle boundary:
+    # it enters RECOVERING at command acceptance and consumes the recovered
+    # bases at the next PPS/VCLOCK edge.  Sending STOP here can strand a
+    # still-running Teensy's OCXO subscriber/cadence service before RECOVER has
+    # a chance to reattach it.  Reserve STOP/RECOVER_ABORT for explicit failed
+    # recovery cleanup; warm recovery goes directly from the last durable row
+    # to RECOVER, matching the post-flash/power-cycle transaction.
+    logging.info(
+        "📡 [recovery] @%s preserving Teensy clock service; "
+        "quiescing Pi TIMEBASE ingress before direct RECOVER...",
+        system_time_z(),
+    )
 
     _drained = _drain_timebase_ingress_and_pending()
     if _drained > 0:
@@ -6121,6 +6141,9 @@ def _recover_campaign() -> None:
         "recover_ocxo1_dac": None if recover_ocxo1_dac is None else round(float(recover_ocxo1_dac), 6),
         "recover_ocxo2_dac": None if recover_ocxo2_dac is None else round(float(recover_ocxo2_dac), 6),
         "recover_calibrate_ocxo": recover_calibrate,
+        "teensy_stop_sent": False,
+        "teensy_recover_abort_sent": False,
+        "interrupt_service_preserved": True,
         "tau_dwt": round(tau_dwt, 12),
         "tau_ocxo1": round(tau_ocxo1, 12),
         "tau_ocxo2": round(tau_ocxo2, 12),

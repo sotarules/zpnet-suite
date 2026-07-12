@@ -1499,6 +1499,9 @@ static uint32_t          g_recover_lifecycle_begin_count = 0;
 static uint32_t          g_recover_lifecycle_pps_gate_count = 0;
 static uint32_t          g_recover_lifecycle_command_custody_reset_count = 0;
 static uint32_t          g_recover_lifecycle_gate_custody_reset_count = 0;
+static uint32_t          g_recover_lifecycle_interrupt_service_rearm_count = 0;
+static uint32_t          g_recover_lifecycle_interrupt_service_rearm_failure_count = 0;
+static bool              g_recover_lifecycle_last_interrupt_service_rearm_ok = false;
 static uint32_t          g_recover_lifecycle_complete_count = 0;
 static uint32_t          g_recover_lifecycle_abort_count = 0;
 static uint32_t          g_recover_lifecycle_stale_gate_count = 0;
@@ -2625,7 +2628,7 @@ static void recover_lifecycle_set_abort_reason(const char* reason) {
            reason ? reason : "recover_abort");
 }
 
-static void recover_lifecycle_enter_from_command(const char* reason) {
+static bool recover_lifecycle_enter_from_command(const char* reason) {
   g_recover_lifecycle_begin_count++;
   g_recover_lifecycle_last_begin_campaign_seconds = (uint32_t)campaign_seconds;
   recover_lifecycle_set_reason(reason ? reason : "recover_command_armed");
@@ -2639,9 +2642,24 @@ static void recover_lifecycle_enter_from_command(const char* reason) {
   interrupt_recover_reset_publication_custody();
   g_recover_lifecycle_command_custody_reset_count++;
 
+  // A post-flash/power-cycle recovery gets this service restoration from boot.
+  // A live TIMEBASE blackout does not reboot the Teensy, so explicitly reassert
+  // the same VCLOCK/OCXO runtime and compare-cadence service here.  Do this at
+  // command acceptance, before the reattachment timeout starts, and fail the
+  // RECOVER command rather than spending 32 hidden candidates on dead lanes.
+  g_recover_lifecycle_interrupt_service_rearm_count++;
+  g_recover_lifecycle_last_interrupt_service_rearm_ok =
+      clocks_alpha_recover_rearm_interrupt_service();
+  if (!g_recover_lifecycle_last_interrupt_service_rearm_ok) {
+    g_recover_lifecycle_interrupt_service_rearm_failure_count++;
+    recover_lifecycle_set_reason("recover_interrupt_service_rearm_failed");
+    return false;
+  }
+
   clocks_watchdog_clear_surrender_for_new_lifecycle();
   clocks_watchdog_disarm_campaign_publication();
   campaign_state = clocks_campaign_state_t::RECOVERING;
+  return true;
 }
 
 static void recover_lifecycle_complete_at_pps(void) {
@@ -10325,7 +10343,23 @@ static FLASHMEM Payload cmd_recover(const Payload& args) {
   request_stop    = false;
   request_zero    = false;
   flash_cut_clear_pending();
-  recover_lifecycle_enter_from_command("recover_command_armed");
+
+  if (!recover_lifecycle_enter_from_command("recover_command_armed")) {
+    recover_lifecycle_abort("recover_interrupt_service_rearm_failed");
+
+    Payload err;
+    err.add("error", "failed to rearm VCLOCK/OCXO interrupt service");
+    err.add("status", "recover_rejected_interrupt_service_rearm");
+    err.add("recovery_generation", g_recover_request_count);
+    err.add("recover_interrupt_service_rearm_count",
+            g_recover_lifecycle_interrupt_service_rearm_count);
+    err.add("recover_interrupt_service_rearm_failure_count",
+            g_recover_lifecycle_interrupt_service_rearm_failure_count);
+    err.add("recover_interrupt_service_rearm_ok",
+            g_recover_lifecycle_last_interrupt_service_rearm_ok);
+    err.add("campaign_state", clocks_campaign_state_name(campaign_state));
+    return err;
+  }
 
   Payload p;
   p.add("status", "recover_requested");
@@ -10349,6 +10383,12 @@ static FLASHMEM Payload cmd_recover(const Payload& args) {
   p.add("recover_lifecycle_reason", g_recover_lifecycle_reason);
   p.add("recover_command_custody_reset_count",
         g_recover_lifecycle_command_custody_reset_count);
+  p.add("recover_interrupt_service_rearm_count",
+        g_recover_lifecycle_interrupt_service_rearm_count);
+  p.add("recover_interrupt_service_rearm_failure_count",
+        g_recover_lifecycle_interrupt_service_rearm_failure_count);
+  p.add("recover_interrupt_service_rearm_ok",
+        g_recover_lifecycle_last_interrupt_service_rearm_ok);
   p.add("interrupt_recover_publication_reset_count",
         interrupt_recover_publication_custody_reset_count());
   return p;
@@ -11905,6 +11945,12 @@ static FLASHMEM Payload cmd_report_timebase_publish_deep(const Payload&) {
                (uint32_t)g_recover_lifecycle_command_custody_reset_count);
   counters.add("recover_lifecycle_gate_custody_reset_count",
                (uint32_t)g_recover_lifecycle_gate_custody_reset_count);
+  counters.add("recover_lifecycle_interrupt_service_rearm_count",
+               (uint32_t)g_recover_lifecycle_interrupt_service_rearm_count);
+  counters.add("recover_lifecycle_interrupt_service_rearm_failure_count",
+               (uint32_t)g_recover_lifecycle_interrupt_service_rearm_failure_count);
+  counters.add("recover_lifecycle_interrupt_service_rearm_ok",
+               g_recover_lifecycle_last_interrupt_service_rearm_ok);
   counters.add("recover_lifecycle_complete_count",
                (uint32_t)g_recover_lifecycle_complete_count);
   counters.add("recover_lifecycle_abort_count",
@@ -12414,6 +12460,12 @@ static FLASHMEM Payload cmd_report_recovery(const Payload&) {
         (uint32_t)g_recover_lifecycle_complete_count);
   p.add("recover_lifecycle_abort_count",
         (uint32_t)g_recover_lifecycle_abort_count);
+  p.add("recover_interrupt_service_rearm_count",
+        (uint32_t)g_recover_lifecycle_interrupt_service_rearm_count);
+  p.add("recover_interrupt_service_rearm_failure_count",
+        (uint32_t)g_recover_lifecycle_interrupt_service_rearm_failure_count);
+  p.add("recover_interrupt_service_rearm_ok",
+        g_recover_lifecycle_last_interrupt_service_rearm_ok);
 
   p.add("request_count", g_recover_request_count);
   p.add("base_count", g_recover_last_base_count);
@@ -12584,6 +12636,12 @@ static FLASHMEM Payload cmd_report_recovery_deep(const Payload&) {
                   (uint32_t)g_recover_lifecycle_command_custody_reset_count);
     lifecycle.add("gate_custody_reset_count",
                   (uint32_t)g_recover_lifecycle_gate_custody_reset_count);
+    lifecycle.add("interrupt_service_rearm_count",
+                  (uint32_t)g_recover_lifecycle_interrupt_service_rearm_count);
+    lifecycle.add("interrupt_service_rearm_failure_count",
+                  (uint32_t)g_recover_lifecycle_interrupt_service_rearm_failure_count);
+    lifecycle.add("interrupt_service_rearm_ok",
+                  g_recover_lifecycle_last_interrupt_service_rearm_ok);
     lifecycle.add("complete_count", (uint32_t)g_recover_lifecycle_complete_count);
     lifecycle.add("abort_count", (uint32_t)g_recover_lifecycle_abort_count);
     lifecycle.add("stale_gate_count", (uint32_t)g_recover_lifecycle_stale_gate_count);
