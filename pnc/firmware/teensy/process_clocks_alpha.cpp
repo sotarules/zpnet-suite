@@ -4312,22 +4312,6 @@ static void alpha_projection_guard_note_measured_backward(time_clock_id_t clock,
                                         signed_delta_cycles, legacy_unsigned_delta_cycles);
 }
 
-static void alpha_projection_guard_note_pps_backward(time_clock_id_t clock,
-                                                     uint32_t pps_sequence,
-                                                     uint32_t target_dwt32,
-                                                     uint32_t reference_dwt32,
-                                                     int32_t signed_delta_cycles,
-                                                     uint32_t legacy_unsigned_delta_cycles) {
-  alpha_ocxo_pps_projection_guard_t* g = alpha_ocxo_pps_projection_guard(clock);
-  if (!g) return;
-  g->pps_projection_signed_backward_count++;
-  if (legacy_unsigned_delta_cycles > alpha_projection_signed_window_cycles()) {
-    g->pps_projection_legacy_unsigned_wrap_count++;
-  }
-  alpha_projection_guard_remember_delta(clock, pps_sequence, target_dwt32, reference_dwt32,
-                                        signed_delta_cycles, legacy_unsigned_delta_cycles);
-}
-
 static void alpha_projection_guard_note_sanity_reject(time_clock_id_t clock,
                                                       uint32_t pps_sequence,
                                                       uint32_t target_dwt32,

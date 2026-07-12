@@ -831,12 +831,6 @@ static FLASHMEM uint32_t clocks_stack_witness_bytes_below_dtcm_top(
   return dtcm_top - sp;
 }
 
-static FLASHMEM uint32_t clocks_stack_witness_bytes_from_top(uint32_t sp) {
-  const uint32_t dtcm_top = clocks_stack_witness_observed_dtcm_top(
-      clocks_stack_witness_sp(), sp, 0U);
-  return clocks_stack_witness_bytes_below_dtcm_top(sp, dtcm_top);
-}
-
 static FLASHMEM void clocks_stack_witness_note(uint32_t context) {
   if (!clocks_stack_witness_ready()) return;
 
@@ -6246,7 +6240,6 @@ static bool campaign_start_prologue_consume_private_candidate(
     bool ocxo2_valid,
     const clocks_alpha_lane_forensics_t& ocxo2_f,
     const char* reason) {
-  const bool v_fl = floorline_candidate_present(vclock_valid, vclock_f);
   const bool o1_fl = floorline_candidate_present(ocxo1_valid, ocxo1_f);
   const bool o2_fl = floorline_candidate_present(ocxo2_valid, ocxo2_f);
 

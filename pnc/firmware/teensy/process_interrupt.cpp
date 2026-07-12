@@ -866,11 +866,6 @@ static bool interrupt_feature_cntr_locked(
   return s.locked && s.post_lock_mismatch_count == 0U;
 }
 
-static bool interrupt_feature_cntr_anomaly(
-    const interrupt_integrity_qtimer_cntr_match_check_t& s) {
-  return s.locked && s.post_lock_mismatch_count != 0U;
-}
-
 static void interrupt_feature_update_qtimer_counter_custody(void) {
   // QTIMER_COUNTER_CUSTODY is a readiness statement about the active
   // count/compare generation gate, not about the passive +1 CNTR-read
@@ -1807,14 +1802,6 @@ static constexpr bool     VCLOCK_CH2_EPOCH_NATIVE_ENABLED = true;
 static constexpr uint32_t VCLOCK_CH2_EPOCH_REJECT_NONE = 0;
 static constexpr uint32_t VCLOCK_CH2_EPOCH_REJECT_BACKDATE_ZERO = 1;
 static constexpr uint32_t VCLOCK_CH2_EPOCH_REJECT_BACKDATE_TOO_LARGE = 2;
-
-static const char* vclock_ch2_epoch_reject_reason_name(uint32_t reason) {
-  switch (reason) {
-    case VCLOCK_CH2_EPOCH_REJECT_BACKDATE_ZERO: return "BACKDATE_ZERO";
-    case VCLOCK_CH2_EPOCH_REJECT_BACKDATE_TOO_LARGE: return "BACKDATE_TOO_LARGE";
-    default: return "NONE";
-  }
-}
 
 static volatile uint32_t g_vclock_ch2_epoch_native_service_count = 0;
 static volatile uint32_t g_vclock_ch2_epoch_native_publish_count = 0;
@@ -3566,9 +3553,6 @@ static bool ocxo_lane_start_local_cadence_at_target(interrupt_subscriber_kind_t 
                                                     synthetic_clock32_t& clock32,
                                                     uint32_t target_counter32,
                                                     uint32_t reason);
-static uint32_t ocxo_one_second_next_target_after(
-    uint32_t epoch_counter32,
-    uint32_t current_counter32);
 static bool ocxo_lane_program_local_cadence_compare(
     ocxo_lane_t& lane,
     synthetic_clock32_t& clock32,
@@ -3587,11 +3571,6 @@ static void ocxo_lane_install_logical_grid(interrupt_subscriber_kind_t kind,
                                            synthetic_clock32_t& clock32,
                                            uint32_t epoch_counter32,
                                            uint32_t reason);
-static void ocxo_lane_maybe_arm_one_second_compare(
-    interrupt_subscriber_kind_t kind,
-    ocxo_lane_t& lane,
-    synthetic_clock32_t& clock32,
-    uint32_t reason);
 
 // ============================================================================
 // QTimer1 CH0 low-word counter
@@ -4136,30 +4115,7 @@ static void vclock_clock_tend_from_hardware_low16(uint16_t hardware_low16) {
   g_vclock_clock32.minder_update_count++;
 }
 
-static void synthetic_clock_tend_from_hw16(synthetic_clock32_t&,
-                                           uint16_t) {
-  // Retired for OCXO authority.  16-bit-to-32-bit OCXO rollover is now
-  // authored only by compare ISRs from the armed target identity.
-}
 
-
-static void synthetic_clock_observe_hw16_no_pending_zero(
-    synthetic_clock32_t&,
-    uint16_t) {
-  // Retired for OCXO authority.  Ambient low-word observations are witnesses,
-  // not high-word authors.
-}
-
-
-static void ocxo_lane_maybe_arm_one_second_compare(
-    interrupt_subscriber_kind_t,
-    ocxo_lane_t&,
-    synthetic_clock32_t&,
-    uint32_t) {
-  // Retired.  OCXO cadence is now an ISR-authored +10,000 tick gear ladder;
-  // there is no ambient/heartbeat rollover minder and no deferred arm-window
-  // polling path.
-}
 
 
 static void interrupt_ch2_implicit_rollover_tend(void) {
@@ -5165,11 +5121,6 @@ static constexpr uint32_t FLOORLINE_REASON_SLOPE_ANOMALY     = 9U;
 
 static uint32_t lower_env_abs_i32(int32_t value) {
   return value < 0 ? (uint32_t)(-(int64_t)value) : (uint32_t)value;
-}
-
-static bool lower_env_within_gate(int32_t residual_cycles) {
-  return residual_cycles >= -(int32_t)LOWER_ENV_ERROR_GATE_CYCLES &&
-         residual_cycles <=  (int32_t)LOWER_ENV_ERROR_GATE_CYCLES;
 }
 
 // FloorLine lower-envelope inference remains always compiled as an ordinary
@@ -6757,12 +6708,6 @@ static bool dwt_publication_expected_interval_ruler_qualified(
   const uint64_t upper = (uint64_t)nominal + gate;
   return (uint64_t)expected_interval_cycles >= lower &&
          (uint64_t)expected_interval_cycles <= upper;
-}
-
-static const char* dwt_publication_verdict_name(uint32_t verdict_mask) {
-  const uint32_t reason_id =
-      interrupt_dwt_publication_reason_id_from_verdict_mask(verdict_mask);
-  return interrupt_dwt_publication_reason_name(reason_id);
 }
 
 static void dwt_publication_diag_seed(dwt_repair_diag_t& diag) {
@@ -8719,17 +8664,6 @@ static bool ocxo_lane_start_local_cadence_at_target(interrupt_subscriber_kind_t,
 }
 
 
-static uint32_t ocxo_one_second_next_target_after(
-    uint32_t epoch_counter32,
-    uint32_t current_counter32) {
-  const uint32_t delta = current_counter32 - epoch_counter32;
-  if (delta > 0x7FFFFFFFUL) {
-    return epoch_counter32 + OCXO_WITNESS_ONE_SECOND_COUNTS;
-  }
-  const uint32_t seconds_completed = delta / OCXO_WITNESS_ONE_SECOND_COUNTS;
-  return epoch_counter32 + ((seconds_completed + 1U) * OCXO_WITNESS_ONE_SECOND_COUNTS);
-}
-
 static uint32_t ocxo_sample_next_target_after(
     uint32_t epoch_counter32,
     uint32_t current_counter32) {
@@ -9334,13 +9268,6 @@ ocxo_fact_ring_for(ocxo_runtime_context_t& ctx) {
       : g_ocxo2_fact_ring;
 }
 
-static const ocxo_perishable_ring_t&
-ocxo_fact_ring_for(const ocxo_runtime_context_t& ctx) {
-  return (ctx.kind == interrupt_subscriber_kind_t::OCXO1)
-      ? g_ocxo1_fact_ring
-      : g_ocxo2_fact_ring;
-}
-
 static const char* ocxo_fact_drain_name(const ocxo_runtime_context_t& ctx) {
   return ctx.fact_drain_name ? ctx.fact_drain_name : ctx.name;
 }
@@ -9377,13 +9304,6 @@ static int32_t dwt_cycles_for_ocxo_ticks_signed(int32_t ticks) {
 static bool ocxo_fact_ring_push_from_isr(ocxo_runtime_context_t& ctx,
                                          const interrupt_perishable_fact_t& fact);
 static void ocxo_fact_drain_callback(timepop_ctx_t*, timepop_diag_t*, void* user_data);
-
-static uint32_t ocxo_fact_ring_pending(
-    const ocxo_perishable_ring_t& ring) {
-  const uint32_t tail = ring.tail;
-  dmb_barrier();
-  return ring.head - tail;
-}
 
 static bool ocxo_fact_ring_pop(ocxo_runtime_context_t& ctx,
                                interrupt_perishable_fact_t& out) {
@@ -10992,21 +10912,6 @@ static void interrupt_handoff_service_isr(void) {
 }
 
 
-static void ocxo_cadence_update_synthetic_identity(
-    ocxo_runtime_context_t&,
-    const ocxo_cadence_isr_sample_t&) {
-  // Retired from handoff.  The priority-0 OCXO compare ISR is the only owner
-  // of 16-bit rollover extension and synthetic counter32 advancement.
-}
-
-
-static void ocxo_cadence_update_sample_phase(
-    ocxo_runtime_context_t&,
-    ocxo_cadence_isr_sample_t&) {
-  // Retired from handoff.  The priority-0 OCXO compare ISR advances the
-  // +10,000 tick ladder and stamps whether that tooth is the one-second
-  // bookend.
-}
 
 
 static bool ocxo_cadence_feed_smartzero(
@@ -11025,14 +10930,6 @@ static bool ocxo_cadence_feed_smartzero(
                                sample.event_dwt,
                                sample.target_counter32,
                                sample.target_low16);
-}
-
-static void ocxo_cadence_rearm_or_stop(
-    ocxo_runtime_context_t&,
-    ocxo_cadence_isr_sample_t&,
-    bool) {
-  // Retired from handoff.  OCXO compare rearm/stop decisions are made in the
-  // priority-0 compare ISR so 16-bit rollover custody cannot be deferred.
 }
 
 
@@ -11098,14 +10995,6 @@ static interrupt_perishable_fact_t ocxo_cadence_build_perishable_fact(
   fact.sample_period_ticks = ctx.lane->cadence_sample_period_ticks;
 
   return fact;
-}
-
-static void ocxo_cadence_update_one_second_witness(
-    ocxo_runtime_context_t& ctx,
-    const ocxo_cadence_isr_sample_t& sample) {
-  if (!sample.one_second_due) return;
-  ctx.lane->witness_target_counter32 = sample.target_counter32;
-  ctx.lane->witness_target_low16 = sample.target_low16;
 }
 
 static void ocxo_cadence_enqueue_fact(

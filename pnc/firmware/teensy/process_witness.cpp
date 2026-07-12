@@ -85,17 +85,7 @@ static constexpr int  WITNESS_GPT_PIN = 14;
 static constexpr const char* WITNESS_GPT_PROVIDER = "GPT2_OCR1_EXTCLK";
 static constexpr uint32_t WITNESS_GPT_IRQ_PRIORITY = 32;
 
-// GPT register bits used locally.  Teensy core versions normally provide some
-// of these, but keeping local names makes the witness self-contained.
-#define GPT_CR_EN              (1u << 0)
-#define GPT_CR_ENMOD           (1u << 1)
-#define GPT_CR_CLKSRC(n)       (((uint32_t)(n) & 7u) << 6)
-#define GPT_CR_FRR             (1u << 9)
-#define GPT_CR_SWR             (1u << 15)
-#define GPT_IR_OF1IE           (1u << 0)
-#define GPT_SR_OF1             (1u << 0)
-
-static constexpr uint32_t GPT_CR_CLKSRC_EXTERNAL = 3u;
+// GPT register-bit definitions are supplied by the Teensy core's imxrt.h.
 
 static constexpr uint64_t GPIO_HIGH_OFFSET_NS   = 500500000ULL;  // PPS + 500.500 ms quiet-phase stimulus
 static constexpr uint64_t GPIO_LOW_OFFSET_NS    = 600500000ULL;  // 100 ms high interval after quiet-phase stimulus
@@ -506,21 +496,6 @@ static inline void witness_gpt_refresh_live_registers(void) {
   }
 }
 
-static inline void witness_gpt_clear_compare_flag(void) {
-  if ((GPT2_SR & GPT_SR_OF1) != 0) {
-    g_gpt_compare_flag_clear_poll_count++;
-  }
-  GPT2_SR = GPT_SR_OF1;
-}
-
-static inline void witness_gpt_disable_compare_irq(void) {
-  GPT2_IR &= ~GPT_IR_OF1IE;
-}
-
-static inline void witness_gpt_enable_compare_irq(void) {
-  GPT2_IR |= GPT_IR_OF1IE;
-}
-
 static void witness_gpt_configure_pin(void) {
   // Known-good POC route:
   //   Teensy pin 14
@@ -577,30 +552,6 @@ static void witness_gpt_init_hardware(void) {
   g_gpt_configured = true;
 
   witness_gpt_refresh_live_registers();
-}
-
-static bool witness_gpt_arm_next_stimulus(void) {
-  if (!g_gpt_configured || !g_witness_running) {
-    g_gpt_arm_fail_count++;
-    return false;
-  }
-
-  // Continuous-ladder doctrine: foreground never chases OCR1.  GPT2_OCR1 is
-  // kept in the future by the GPT ISR itself.  This function remains as a
-  // liveness hook for reports and future commands.
-  witness_gpt_refresh_live_registers();
-
-  if ((GPT2_SR & GPT_SR_OF1) != 0) {
-    g_gpt_compare_flag_seen_poll_count++;
-  }
-
-  const int32_t delta =
-      (int32_t)((int64_t)GPT2_OCR1 - (int64_t)GPT2_CNT);
-  if (delta < -1 && (GPT2_SR & GPT_SR_OF1) == 0) {
-    g_gpt_compare_missed_poll_count++;
-  }
-
-  return true;
 }
 
 void witness_gpt2_isr(void) {
