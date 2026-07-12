@@ -1213,11 +1213,19 @@ void clocks_alpha_recover_reprime_ocxo_state(void);
 uint32_t clocks_alpha_recover_reprime_count(void);
 
 // Compact recovery reattachment proof.  RECOVER deliberately cuts OCXO
-// measurement custody; Beta must not resume public TIMEBASE publication until
-// Alpha has observed fresh post-recovery OCXO edge/forensic/projection evidence
-// for both lanes.  This surface is report/control-plane evidence only.
+// measurement custody.  Readiness is layered: a fresh integer clockface may be
+// published before the stricter PhaseLedger/refined-interval science proof is
+// complete.  Beta may therefore publish an explicitly degraded timeline row,
+// but Welford, PPB, and servo remain gated until science_ready is true for both
+// lanes.  This surface is report/control-plane evidence only.
 struct clocks_alpha_recover_reattach_snapshot_t {
+  // Readiness is deliberately split.  clockface_ready proves that the lane
+  // can publish a fresh post-RECOVER OCXO clockface.  science_ready additionally
+  // proves the PhaseLedger/refined interval required by Welford, PPB, and servo.
+  // ready remains a compatibility alias for science_ready.
   bool     ready = false;
+  bool     clockface_ready = false;
+  bool     science_ready = false;
   uint32_t clock_id = 0;
   uint32_t reprime_count = 0;
 

@@ -163,9 +163,10 @@ SYNC_FRAGMENT_TIMEOUT_S = 35.0
 SYNC_RECOVER_TIMEOUT_S = 45.0
 SYNC_POLL_S = 0.005
 
-# Clean recovery may legitimately consume hidden firmware candidates while
-# Alpha/CounterLedger/PhaseLedger proves fresh OCXO custody.  This timeout is
-# for the whole clean-row wait, not just the first visible pair.
+# Recovery may legitimately consume hidden firmware candidates while
+# Alpha/CounterLedger/PhaseLedger proves fresh OCXO custody.  The legacy
+# constant name remains, but this now bounds the wait for the first truthful
+# timeline-admissible pair, not for fully mature OCXO science.
 SYNC_RECOVER_CLEAN_TIMEOUT_S = 90.0
 
 # A recovery that produces no public TIMEBASE pair inside this window is not
@@ -184,12 +185,11 @@ RECOVERY_FIRST_PAIR_TIMEOUT_S = 45.0
 AUTO_RECOVERY_MAX_ATTEMPTS = 3
 AUTO_RECOVERY_RETRY_DELAY_S = 1.0
 
-# Pi-side fast retry for the specific degraded RECOVER shape seen in the
-# field: Teensy is publishing public rows, but each row remains degraded,
-# reattach is still not ready, and OCXO science is still not clean.  Do not
-# burn the entire clean-recovery timeout waiting for the firmware stall flag;
-# abort this RECOVER attempt and retry from the latest durable TIMEBASE.
-RECOVERY_DEGRADED_PUBLICATION_FAST_RETRY_ROWS = 10
+# Recovery admission is layered.  A truthful PPS/VCLOCK/GNSS/DWT timeline row
+# is persistable even while OCXO clockface or refined science is still
+# initializing.  The Teensy marks those rows explicitly; the Pi must not restart
+# RECOVER merely because science_valid is false.
+RECOVERY_ADMIT_DEGRADED_TIMELINE = True
 
 # RECOVER transaction watchdog.  A Teensy USB/firmware reboot after CLOCKS.RECOVER
 # has been accepted can erase the in-flight RECOVER lifecycle while the Pi is
@@ -208,6 +208,7 @@ SYNC_LOG_INTERVAL_S = 5.0
 TIMEBASE_INGRESS_QUEUE_MAXSIZE = 0
 TIMEBASE_FRAGMENT_TOPIC = "TIMEBASE_FRAGMENT"
 TIMEBASE_FORENSICS_TOPIC = "TIMEBASE_FORENSICS"
+CLOCKS_RECOVERY_STALLED_TOPIC = "CLOCKS_RECOVERY_STALLED"
 TIMEBASE_PAIR_TIMEOUT_S = 5.0
 
 # Final TIMEBASE courtroom.  This is the Pi-side last-mile acceptance gate:
@@ -402,6 +403,7 @@ _diag: Dict[str, Any] = {
     "last_timebase_final_court_delta_raw_offset": {},
     "timebase_final_court_row_dropped": 0,
     "timebase_final_court_row_fatal_escalated": 0,
+    "timebase_final_court_degraded_recovery_admitted": 0,
     "timebase_final_court_consecutive_row_fatal": 0,
     "timebase_final_court_row_fatal_escalate_threshold": TIMEBASE_FINAL_COURT_ROW_FATAL_ESCALATE_CONSECUTIVE,
     "last_timebase_final_court_row_drop": {},
@@ -480,8 +482,9 @@ _diag: Dict[str, Any] = {
     "recovery_transitional_pairs_discarded": 0,
     "recovery_clean_timeouts": 0,
     "recovery_clean_stalls": 0,
-    "recovery_degraded_fast_retry_count": 0,
-    "recovery_degraded_fast_retry_rows": RECOVERY_DEGRADED_PUBLICATION_FAST_RETRY_ROWS,
+    "recovery_degraded_rows_admitted": 0,
+    "recovery_science_clean_rows_admitted": 0,
+    "last_recovery_admission": {},
     "recovery_inflight_health_polls": 0,
     "recovery_inflight_health_empty": 0,
     "recovery_inflight_command_lost": 0,
@@ -489,7 +492,6 @@ _diag: Dict[str, Any] = {
     "last_recovery_command_lost": {},
     "last_recovery_transitional_pair": {},
     "last_recovery_clean_timeout": {},
-    "last_recovery_degraded_fast_retry": {},
 
     # GNSS wait
     "gnss_waits": 0,
@@ -544,6 +546,17 @@ _diag: Dict[str, Any] = {
     "watchdog_anomaly_recovery_started": 0,
     "watchdog_anomaly_event_enqueue_failures": 0,
     "last_watchdog_anomaly": {},
+
+    # Dedicated recovery-liveness anomaly.  This is observational and never
+    # initiates RECOVER; restarting would destroy the evidence being awaited.
+    "recovery_stalled_events_received": 0,
+    "recovery_stalled_event_enqueue_failures": 0,
+    "last_recovery_stalled": {},
+
+    # CLOCKS startup lifecycle serialization
+    "startup_control_ready": False,
+    "startup_control_busy_rejections": 0,
+    "last_startup_control_rejection": {},
 
     # TIMEBASE silence / Teensy restart detection
     "timebase_silence_monitor_started": False,
@@ -869,6 +882,10 @@ def _gnss_raw_reset() -> None:
 
 _campaign_active: bool = False
 
+# The command server is exposed early so PUBSUB can discover subscriptions, but
+# START/RESUME must not race the boot DAC push and active-campaign recovery.
+_startup_control_ready = threading.Event()
+
 _last_pps_vclock_count_seen: Optional[int] = None
 
 # Last PPS/VCLOCK count accepted into TIMEBASE processing.
@@ -942,7 +959,7 @@ class RecoverySyncTimeout(RecoveryRetryableFailure):
 
 
 class RecoveryCleanTimeout(RecoveryRetryableFailure):
-    """Raised when RECOVER publishes rows but never reaches a clean row."""
+    """Legacy name for a recovery that never reaches a timeline-admissible row."""
 
 
 class RecoveryInterrupted(RecoveryRetryableFailure):
@@ -2425,6 +2442,10 @@ def _fetch_teensy_recovery_status() -> Dict[str, Any]:
 
 def _recovery_inflight_status_compact(status: Dict[str, Any]) -> Dict[str, Any]:
     """Extract the flat RECOVER identity/lifecycle fields used by Pi."""
+    generation = _as_int(status.get("recovery_generation"))
+    if generation is None:
+        generation = _as_int(status.get("request_count"))
+
     return {
         "report": status.get("report"),
         "schema": status.get("schema"),
@@ -2436,6 +2457,19 @@ def _recovery_inflight_status_compact(status: Dict[str, Any]) -> Dict[str, Any]:
         "recover_reattach_active": _recovery_bool(status.get("recover_reattach_active")),
         "recover_reattach_degraded_active": _recovery_bool(status.get("recover_reattach_degraded_active")),
         "recover_reattach_reason": status.get("recover_reattach_reason"),
+        "recover_timeline_ready": _recovery_bool(status.get("recover_timeline_ready")),
+        "recover_clockface_ready": _recovery_bool(status.get("recover_clockface_ready")),
+        "recover_science_ready": _recovery_bool(status.get("recover_science_ready")),
+        "recover_reattach_stalled": bool(
+            _fragment_recovery_bool(
+                status,
+                "recover_reattach_stalled",
+                "degraded_publication_stalled",
+            )
+        ),
+        "degraded_no_progress_row_count": _as_int(status.get("degraded_no_progress_row_count")),
+        "degraded_last_progress_public_count": _as_int(status.get("degraded_last_progress_public_count")),
+        "recovery_generation": generation,
         "request_count": _as_int(status.get("request_count")),
         "base_count": _as_int(status.get("base_count")),
         "expected_first_public_count": _as_int(status.get("expected_first_public_count")),
@@ -2458,12 +2492,25 @@ def _recovery_inflight_lost_reason(
     base_count = _as_int(status.get("base_count"))
     expected_first_reported = _as_int(status.get("expected_first_public_count"))
     request_count = _as_int(status.get("request_count"))
+    expected_generation = _as_int(monitor.get("recovery_generation"))
+    reported_generation = _as_int(status.get("recovery_generation"))
+    if reported_generation is None:
+        reported_generation = request_count
 
     lifecycle_active = _recovery_bool(status.get("recover_lifecycle_active"))
     reattach_active = _recovery_bool(status.get("recover_reattach_active"))
     degraded_active = _recovery_bool(status.get("recover_reattach_degraded_active"))
     warmup_active = _recovery_bool(status.get("warmup_active"))
     campaign_state = str(status.get("campaign_state") or "").upper()
+
+    if (
+        expected_generation is not None
+        and expected_generation > 0
+        and reported_generation is not None
+        and reported_generation > 0
+        and reported_generation != expected_generation
+    ):
+        return "recover_generation_mismatch"
 
     if base_count == expected_base and expected_first_reported == expected_first:
         return None
@@ -2568,79 +2615,295 @@ def _fragment_ocxo_science_clean(fragment: Dict[str, Any]) -> Tuple[bool, Dict[s
     return clean, lanes
 
 
-def _recovery_degraded_fast_retry_match(verdict: Dict[str, Any]) -> bool:
-    """True for the degraded RECOVER stream that should trigger a fast retry."""
-    reasons_raw = verdict.get("reasons")
-    if not isinstance(reasons_raw, list):
-        return False
-    reasons = {str(r) for r in reasons_raw}
-    return {
-        "degraded_publication_active",
-        "reattach_not_ready",
-        "ocxo_science_not_clean",
-    }.issubset(reasons)
+def _fragment_recovery_bool(fragment: Dict[str, Any], *keys: str) -> Optional[bool]:
+    """Return the first explicitly present Boolean recovery field."""
+    for key in keys:
+        value = _path_get(fragment, key)
+        if value is not None:
+            return _recovery_bool(value)
+    return None
 
 
-def _recovery_clean_verdict(
+def _fragment_recovery_any_true(
+    fragment: Dict[str, Any],
+    *keys: str,
+) -> Optional[bool]:
+    """OR explicit recovery flags without letting an early false hide a later true."""
+    found = False
+    for key in keys:
+        value = _path_get(fragment, key)
+        if value is None:
+            continue
+        found = True
+        if _recovery_bool(value):
+            return True
+    return False if found else None
+
+
+def _fragment_recovery_timeline_ready(
+    fragment: Dict[str, Any],
+    pps_vclock_count: int,
+) -> bool:
+    explicit = _fragment_recovery_bool(
+        fragment,
+        "recover_timeline_ready",
+        "timeline_valid",
+    )
+    if explicit is not None:
+        return explicit
+
+    gnss_ns = _fragment_int(fragment, "gnss_ns", "gnss.ns", default=0)
+    dwt_cycles = _fragment_int(
+        fragment,
+        "dwt_cycles",
+        "dwt.cycles",
+        "dwt.total_cycles",
+        default=0,
+    )
+    return int(pps_vclock_count) > 0 and gnss_ns > 0 and dwt_cycles > 0
+
+
+def _recovery_admission_verdict(
     *,
     fragment: Dict[str, Any],
     status: Dict[str, Any],
     pps_vclock_count: int,
 ) -> Tuple[bool, Dict[str, Any]]:
-    """Decide whether the sync pair is safe to persist as recovered TIMEBASE."""
+    """Decide whether a recovered row is truthful enough to persist.
+
+    Timeline admission is intentionally weaker than OCXO science admission.
+    A degraded row is admissible only when the Teensy explicitly identifies the
+    transition; mere absence of science is never silently reclassified.
+    """
     science_clean, lanes = _fragment_ocxo_science_clean(fragment)
     report_available = bool(status)
-    active = _recovery_bool(status.get("recover_reattach_active"))
-    degraded = _recovery_bool(status.get("recover_reattach_degraded_active"))
-    ready = _recovery_bool(status.get("reattach_ready") or status.get("recover_clean_ready"))
-    stalled = _recovery_bool(
-        status.get("recover_reattach_stalled")
-        or status.get("degraded_publication_stalled")
+
+    fragment_active = _fragment_recovery_bool(
+        fragment,
+        "recover_reattach_active",
+    )
+    active = (
+        fragment_active
+        if fragment_active is not None
+        else _recovery_bool(status.get("recover_reattach_active"))
+    )
+
+    fragment_degraded = _fragment_recovery_any_true(
+        fragment,
+        "recover_degraded_active",
+        "recover_degraded_science_hold",
+    )
+    degraded = (
+        fragment_degraded
+        if fragment_degraded is not None
+        else _recovery_bool(status.get("recover_reattach_degraded_active"))
+    )
+
+    stalled = bool(
+        _fragment_recovery_bool(fragment, "recover_reattach_stalled")
+        or _recovery_bool(
+            status.get("recover_reattach_stalled")
+            or status.get("degraded_publication_stalled")
+        )
     )
     watchdog_blocked = _recovery_bool(status.get("watchdog_publication_blocked"))
     watchdog_active = _recovery_bool(status.get("watchdog_anomaly_active"))
-    quarantine_remaining = _as_int(status.get("science_quarantine_remaining"))
+    campaign_state = str(
+        fragment.get("campaign_state")
+        or status.get("campaign_state")
+        or ""
+    ).upper()
+
+    timeline_ready = _fragment_recovery_timeline_ready(
+        fragment,
+        pps_vclock_count,
+    )
+    clockface_ready_explicit = _fragment_recovery_bool(
+        fragment,
+        "recover_clockface_ready",
+        "ocxo_clockface_valid",
+    )
+    science_ready_explicit = _fragment_recovery_bool(
+        fragment,
+        "recover_science_ready",
+        "ocxo_science_valid",
+    )
+    clockface_ready = (
+        clockface_ready_explicit
+        if clockface_ready_explicit is not None
+        else _recovery_bool(status.get("recover_clockface_ready"))
+    )
+    science_ready = (
+        science_ready_explicit
+        if science_ready_explicit is not None
+        else _recovery_bool(
+            status.get("recover_science_ready")
+            or status.get("reattach_ready")
+            or status.get("recover_clean_ready")
+        )
+    )
+
+    quarantine_active = bool(
+        _fragment_recovery_bool(
+            fragment,
+            "recover_science_quarantine_active",
+        )
+    )
+    quarantine_remaining = _as_int(
+        fragment.get("recover_science_quarantine_remaining")
+    )
+    if quarantine_remaining is None:
+        quarantine_remaining = _as_int(status.get("science_quarantine_remaining"))
     if quarantine_remaining is None:
         quarantine_remaining = 0
+    quarantine_active = quarantine_active or quarantine_remaining != 0
 
-    reasons: List[str] = []
+    transition_active = bool(
+        _fragment_recovery_bool(fragment, "recover_transition_active")
+    )
+    explicit_degraded = bool(
+        transition_active
+        or degraded
+        or quarantine_active
+    )
+
+    fragment_generation = _fragment_int(
+        fragment,
+        "recover_generation",
+        default=0,
+    )
+    status_generation = _as_int(status.get("recovery_generation"))
+    if status_generation is None:
+        status_generation = _as_int(status.get("request_count"))
+
+    blocking_reasons: List[str] = []
+    state_reasons: List[str] = []
+
+    # REPORT_RECOVERY is useful corroboration, but the paired fragment is the
+    # publication authority. A transient command/report miss must not bury an
+    # otherwise self-describing canonical row.
     if not report_available:
-        reasons.append("missing_report_recovery")
+        state_reasons.append("report_recovery_unavailable")
     if active:
-        reasons.append("reattach_active")
-    if degraded:
-        reasons.append("degraded_publication_active")
-    if not ready:
-        reasons.append("reattach_not_ready")
-    if stalled:
-        reasons.append("degraded_publication_stalled")
+        blocking_reasons.append("reattach_private_hold_active")
+    if campaign_state != "STARTED":
+        blocking_reasons.append("campaign_not_started")
     if watchdog_blocked or watchdog_active:
-        reasons.append("watchdog_blocked")
-    if quarantine_remaining != 0:
-        reasons.append("science_quarantine")
-    if not science_clean:
-        reasons.append("ocxo_science_not_clean")
+        blocking_reasons.append("watchdog_blocked")
+    if not timeline_ready:
+        blocking_reasons.append("timeline_not_ready")
+    if explicit_degraded and fragment_generation <= 0:
+        blocking_reasons.append("degraded_row_missing_recovery_generation")
+    if (
+        fragment_generation > 0
+        and status_generation is not None
+        and status_generation > 0
+        and fragment_generation != status_generation
+    ):
+        blocking_reasons.append("recovery_generation_mismatch")
 
-    clean = not reasons
-    return clean, {
-        "clean": clean,
-        "reasons": reasons,
+    if degraded:
+        state_reasons.append("degraded_publication_active")
+    if quarantine_active:
+        state_reasons.append("science_quarantine")
+    if not clockface_ready:
+        state_reasons.append("ocxo_clockface_not_ready")
+    if not science_ready:
+        state_reasons.append("ocxo_science_not_ready")
+    if not science_clean:
+        state_reasons.append("ocxo_science_not_clean")
+    if stalled:
+        state_reasons.append("ocxo_science_reattach_stalled")
+
+    science_complete = bool(
+        clockface_ready
+        and science_ready
+        and science_clean
+        and not quarantine_active
+    )
+    degraded_timeline_admissible = bool(
+        RECOVERY_ADMIT_DEGRADED_TIMELINE
+        and explicit_degraded
+        and timeline_ready
+    )
+    admissible = bool(
+        not blocking_reasons
+        and (science_complete or degraded_timeline_admissible)
+    )
+    fully_clean = bool(
+        admissible
+        and science_complete
+        and not explicit_degraded
+        and not stalled
+    )
+
+    if fully_clean:
+        admission_mode = "clean_science"
+    elif admissible:
+        admission_mode = "degraded_timeline"
+    else:
+        admission_mode = "blocked"
+
+    verdict = {
+        "admissible": admissible,
+        "admission_mode": admission_mode,
+        "fully_clean": fully_clean,
+        "degraded_timeline_admissible": degraded_timeline_admissible,
+        "blocking_reasons": blocking_reasons,
+        "state_reasons": state_reasons,
+        # Compatibility alias retained for existing report consumers.
+        "reasons": blocking_reasons + state_reasons,
         "pps_vclock_count": int(pps_vclock_count),
         "report_available": report_available,
-        "recover_reattach_active": active,
-        "recover_reattach_degraded_active": degraded,
-        "reattach_ready": ready,
+        "recover_reattach_active": bool(active),
+        "recover_reattach_degraded_active": bool(degraded),
+        "recover_transition_active": transition_active,
+        "recover_timeline_ready": timeline_ready,
+        "recover_clockface_ready": bool(clockface_ready),
+        "recover_science_ready": bool(science_ready),
         "recover_reattach_stalled": stalled,
+        "explicit_degraded": explicit_degraded,
         "watchdog_blocked": watchdog_blocked or watchdog_active,
+        "science_quarantine_active": quarantine_active,
         "science_quarantine_remaining": int(quarantine_remaining),
+        "science_clean": science_clean,
         "lanes": lanes,
-        "report_reason": status.get("recover_reattach_reason"),
-        "stall_reason": status.get("recover_reattach_stall_reason") or status.get("degraded_publication_stall_reason"),
-        "degraded_window_row_count": _as_int(status.get("recover_reattach_degraded_window_row_count") or status.get("degraded_window_row_count")),
-        "degraded_stall_threshold": _as_int(status.get("recover_reattach_degraded_stall_threshold") or status.get("degraded_stall_threshold")),
+        "report_reason": (
+            fragment.get("recover_reattach_reason")
+            or status.get("recover_reattach_reason")
+        ),
+        "stall_reason": (
+            status.get("recover_reattach_stall_reason")
+            or status.get("degraded_publication_stall_reason")
+            or status.get("degraded_stall_reason")
+        ),
+        "degraded_window_row_count": _as_int(
+            status.get("recover_reattach_degraded_window_row_count")
+            or status.get("degraded_window_row_count")
+        ),
+        "degraded_no_progress_row_count": _as_int(
+            status.get("degraded_no_progress_row_count")
+            or fragment.get("recover_no_progress_rows")
+        ),
+        "degraded_last_progress_public_count": _as_int(
+            status.get("degraded_last_progress_public_count")
+            or fragment.get("recover_last_progress_public_count")
+        ),
+        "degraded_stall_threshold": _as_int(
+            status.get("recover_reattach_degraded_stall_threshold")
+            or status.get("degraded_stall_threshold")
+        ),
         "hidden_candidate_count": _as_int(status.get("hidden_candidate_count")),
         "last_release_public_count": _as_int(status.get("last_release_public_count")),
+        "fragment_recovery_generation": int(fragment_generation),
+        "status_recovery_generation": status_generation,
+        "recovery_generation": (
+            int(fragment_generation)
+            if fragment_generation > 0
+            else status_generation
+        ),
     }
+    return admissible, verdict
 
 
 # ---------------------------------------------------------------------
@@ -2882,6 +3145,40 @@ def _timebase_final_court_check_delta_raw_interval(
             _diag["last_timebase_final_court_delta_raw_offset"] = offset_fields
 
 
+def _timebase_final_court_recovery_degraded_context(
+    timebase: Dict[str, Any],
+) -> bool:
+    """True only for an explicitly marked, timeline-valid recovery row."""
+    fragment = _path_get(timebase, "fragment")
+    if not isinstance(fragment, dict):
+        return False
+
+    timeline_ready = _fragment_recovery_bool(
+        fragment,
+        "recover_timeline_ready",
+        "timeline_valid",
+    )
+    degraded = _fragment_recovery_any_true(
+        fragment,
+        "recover_degraded_science_hold",
+        "recover_degraded_active",
+        "recover_science_quarantine_active",
+        "recover_transition_active",
+    )
+    recovery_generation = _fragment_int(
+        fragment,
+        "recover_generation",
+        default=0,
+    )
+    campaign_state = str(fragment.get("campaign_state") or "").upper()
+    return bool(
+        timeline_ready
+        and degraded
+        and recovery_generation > 0
+        and campaign_state == "STARTED"
+    )
+
+
 def _timebase_final_court_check_ocxo_lane_alive(
     timebase: Dict[str, Any],
     violations: List[Dict[str, Any]],
@@ -2904,6 +3201,8 @@ def _timebase_final_court_check_ocxo_lane_alive(
     if int(public_count) <= TIMEBASE_FINAL_COURT_OCXO_ZERO_MATURE_PUBLIC_COUNT:
         return
 
+    recovery_degraded = _timebase_final_court_recovery_degraded_context(timebase)
+
     for lane in ("ocxo1", "ocxo2"):
         science_path = f"fragment.{lane}.science"
         science = _path_get(timebase, science_path)
@@ -2916,6 +3215,10 @@ def _timebase_final_court_check_ocxo_lane_alive(
             f"fragment.gnss.{lane}_ns",
             f"fragment.{lane}_ns",
             f"teensy_{lane}_ns",
+        )
+        clockface_raw = _path_get(timebase, f"fragment.{lane}.clockface_valid")
+        clockface_valid: Optional[bool] = (
+            None if clockface_raw is None else _timebase_final_court_bool(clockface_raw)
         )
 
         public_count_in_science = _as_int(science.get("public_count"))
@@ -2949,7 +3252,10 @@ def _timebase_final_court_check_ocxo_lane_alive(
             clock_observed_interval,
             clock_floorline_interval,
             clock_interval_ns,
-            gnss_interval_ns,
+            # The GNSS reference interval does not prove that this OCXO
+            # lane contributed any evidence.  Counting it here would let an
+            # all-zero OCXO lane pass merely because the reference second
+            # was present.
             delta_raw_clock_interval,
             delta_floorline_clock_interval,
             total_sample_count,
@@ -2961,7 +3267,13 @@ def _timebase_final_court_check_ocxo_lane_alive(
 
         lane_ns_zero = lane_ns is None or int(lane_ns) == 0
 
-        if not science_flags["science_valid"] or not science_flags["antecedents_complete"]:
+        if (
+            not recovery_degraded
+            and (
+                not science_flags["science_valid"]
+                or not science_flags["antecedents_complete"]
+            )
+        ):
             _timebase_final_court_add_violation(
                 violations,
                 rule="ocxo_science_valid",
@@ -2975,6 +3287,8 @@ def _timebase_final_court_check_ocxo_lane_alive(
                     "mature_after_public_count": TIMEBASE_FINAL_COURT_OCXO_ZERO_MATURE_PUBLIC_COUNT,
                     "lane_ns": lane_ns,
                     "lane_ns_zero": lane_ns_zero,
+                    "clockface_valid": clockface_valid,
+                    "recovery_degraded": recovery_degraded,
                     "clock_raw_dwt_at_edge": clock_raw_dwt,
                     "clock_floorline_dwt_at_edge": clock_floorline_dwt,
                     "clock_published_dwt_at_edge": clock_published_dwt,
@@ -2992,7 +3306,12 @@ def _timebase_final_court_check_ocxo_lane_alive(
                 },
             )
 
-        if lane_ns_zero and not has_nonzero_science_evidence:
+        allow_missing_clockface = recovery_degraded and clockface_valid is not True
+        if (
+            lane_ns_zero
+            and not has_nonzero_science_evidence
+            and not allow_missing_clockface
+        ):
             _timebase_final_court_add_violation(
                 violations,
                 rule="ocxo_lane_alive",
@@ -3005,6 +3324,9 @@ def _timebase_final_court_check_ocxo_lane_alive(
                     "science_public_count": public_count_in_science,
                     "mature_after_public_count": TIMEBASE_FINAL_COURT_OCXO_ZERO_MATURE_PUBLIC_COUNT,
                     "lane_ns": lane_ns,
+                    "clockface_valid": clockface_valid,
+                    "recovery_degraded": recovery_degraded,
+                    "allow_missing_clockface": allow_missing_clockface,
                     "clock_raw_dwt_at_edge": clock_raw_dwt,
                     "clock_floorline_dwt_at_edge": clock_floorline_dwt,
                     "clock_published_dwt_at_edge": clock_published_dwt,
@@ -3028,6 +3350,11 @@ def _timebase_final_court_evaluate(timebase: Dict[str, Any]) -> Tuple[bool, Dict
     violations: List[Dict[str, Any]] = []
     _timebase_final_court_check_delta_raw_interval(timebase, violations)
     _timebase_final_court_check_ocxo_lane_alive(timebase, violations)
+    recovery_degraded = _timebase_final_court_recovery_degraded_context(timebase)
+    if recovery_degraded and not violations:
+        _diag["timebase_final_court_degraded_recovery_admitted"] = (
+            _diag.get("timebase_final_court_degraded_recovery_admitted", 0) + 1
+        )
 
     count = _first_present_int_path(
         timebase,
@@ -3051,6 +3378,7 @@ def _timebase_final_court_evaluate(timebase: Dict[str, Any]) -> Tuple[bool, Dict
         "timebase_pair_version": timebase.get("timebase_pair_version"),
         "rule_count": 3,
         "violation_count": len(violations),
+        "recovery_degraded_context": recovery_degraded,
         "violations": violations,
     }
 
@@ -3868,6 +4196,7 @@ def _start_status_payload() -> Dict[str, Any]:
         seconds_waiting = round(time.monotonic() - _start_requested_monotonic, 3)
 
     return {
+        "startup_control_ready": _startup_control_ready.is_set(),
         "waiting_for_first_fragment": bool(_start_waiting_for_first_fragment),
         "campaign": _start_requested_campaign,
         "requested_at_utc": _start_requested_at_utc,
@@ -3882,6 +4211,38 @@ def _start_status_payload() -> Dict[str, Any]:
         "flash_cut_from": _flash_cut_from_campaign,
         "flash_cut_to": _flash_cut_to_campaign,
         "flash_cut_requested_at_utc": _flash_cut_requested_at_utc,
+    }
+
+
+def _startup_control_gate(operation: str) -> Optional[Dict[str, Any]]:
+    """Reject lifecycle starts until boot reconciliation has completed.
+
+    The command server is intentionally exposed before boot recovery so PUBSUB
+    can discover routes.  START/RESUME, however, must not race the boot DAC push
+    or the active-campaign recovery scan.  STOP, REPORT, CLEAR, and recovery
+    abort remain available throughout startup.
+    """
+    if _startup_control_ready.is_set():
+        return None
+
+    now_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    rejection = {
+        "ts_utc": now_utc,
+        "operation": str(operation),
+        "status": "STARTUP_CONTROL_BUSY",
+        "startup_control_ready": False,
+    }
+    _diag["startup_control_busy_rejections"] = (
+        _diag.get("startup_control_busy_rejections", 0) + 1
+    )
+    _diag["last_startup_control_rejection"] = rejection
+    return {
+        "success": False,
+        "message": (
+            "CLOCKS startup control reconciliation is still in progress; "
+            f"retry {operation} after startup_control_ready becomes true"
+        ),
+        "payload": rejection,
     }
 
 
@@ -3947,6 +4308,53 @@ def on_watchdog_anomaly(payload: Payload) -> None:
     )
     if started:
         _diag["watchdog_anomaly_recovery_started"] += 1
+
+
+def on_recovery_stalled(payload: Payload) -> None:
+    """Record a non-destructive OCXO recovery-liveness anomaly.
+
+    This event means the Teensy timeline is alive but the OCXO science proof has
+    stopped advancing.  It is deliberately not WATCHDOG_ANOMALY: restarting
+    RECOVER here would destroy the very reattachment state being diagnosed.
+    """
+    _diag["recovery_stalled_events_received"] += 1
+    # Compatibility counter: this is a science-cleanliness stall, but it no
+    # longer aborts or restarts the live recovery lifecycle.
+    _diag["recovery_clean_stalls"] = _diag.get("recovery_clean_stalls", 0) + 1
+
+    stalled = dict(payload)
+    snapshot = {
+        "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "reason": stalled.get("reason"),
+        "campaign": stalled.get("campaign"),
+        "campaign_seconds": stalled.get("campaign_seconds"),
+        "recovery_generation": stalled.get("recovery_generation"),
+        "no_progress_rows": stalled.get("no_progress_rows"),
+        "stall_threshold_rows": stalled.get("stall_threshold_rows"),
+        "last_progress_public_count": stalled.get("last_progress_public_count"),
+        "clockface_ready": stalled.get("clockface_ready"),
+        "science_ready": stalled.get("science_ready"),
+    }
+    _diag["last_recovery_stalled"] = snapshot
+
+    try:
+        create_event(CLOCKS_RECOVERY_STALLED_TOPIC, stalled)
+    except Exception:
+        _diag["recovery_stalled_event_enqueue_failures"] += 1
+        logging.exception(
+            "⚠️ [recovery] failed to enqueue %s event",
+            CLOCKS_RECOVERY_STALLED_TOPIC,
+        )
+
+    logging.error(
+        "🧭 [recovery] OCXO science reattachment reports no progress "
+        "(campaign=%s generation=%s rows=%s threshold=%s); "
+        "timeline publication continues and RECOVER is not restarted",
+        snapshot.get("campaign"),
+        snapshot.get("recovery_generation"),
+        snapshot.get("no_progress_rows"),
+        snapshot.get("stall_threshold_rows"),
+    )
 
 
 def _enqueue_timebase_piece(topic: str, payload: Dict[str, Any]) -> None:
@@ -4659,11 +5067,40 @@ def _request_teensy_start(
     return resp
 
 
-def _request_teensy_recover(pps_vclock_count: int, args: Dict[str, Any]) -> None:
+_TEENSY_RECOVER_ACCEPTED_STATUSES = {
+    "recover_requested",
+    "recover_already_active",
+    "recover_already_completed",
+}
+
+
+def _request_teensy_recover(
+    pps_vclock_count: int,
+    args: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Send RECOVER and require an explicit Teensy lifecycle verdict."""
     teensy_args = dict(args)
     teensy_args["pps_count"] = str(int(pps_vclock_count))
     teensy_args["pps_vclock_count"] = str(int(pps_vclock_count))
-    send_command(machine="TEENSY", subsystem="CLOCKS", command="RECOVER", args=teensy_args)
+    resp = send_command(
+        machine="TEENSY",
+        subsystem="CLOCKS",
+        command="RECOVER",
+        args=teensy_args,
+    )
+    outer_success = isinstance(resp, dict) and bool(resp.get("success"))
+    payload = resp.get("payload") if isinstance(resp, dict) else None
+    status = str(payload.get("status") or "") if isinstance(payload, dict) else ""
+    if not outer_success or status not in _TEENSY_RECOVER_ACCEPTED_STATUSES:
+        details = {
+            "status": status or "missing_handler_status",
+            "outer_success": outer_success,
+            "outer_message": resp.get("message") if isinstance(resp, dict) else None,
+            "payload": payload if isinstance(payload, dict) else {},
+            "requested_base_count": int(pps_vclock_count),
+        }
+        raise RecoveryRetryableFailure("teensy_recover_rejected", details)
+    return resp
 
 
 def _request_teensy_recover_abort_best_effort(
@@ -4750,6 +5187,10 @@ def cmd_start(args: Optional[dict]) -> dict:
     handoff should be fixed.
     """
     global _campaign_active, _accepted_pps_vclock_count
+
+    startup_busy = _startup_control_gate("START")
+    if startup_busy is not None:
+        return startup_busy
 
     start_args = _normalize_start_args(args)
     campaign = start_args.get("campaign")
@@ -5150,6 +5591,10 @@ def cmd_resume(args: Optional[dict]) -> dict:
     Re-activate a previously stopped campaign and recover clocks.
     """
     global _campaign_active
+
+    startup_busy = _startup_control_gate("RESUME")
+    if startup_busy is not None:
+        return startup_busy
 
     if not args or "campaign" not in args:
         return {"success": False, "message": "RESUME requires 'campaign' argument"}
@@ -5716,31 +6161,40 @@ def _recover_campaign() -> None:
     if recover_calibrate:
         teensy_recover_args["calibrate_ocxo"] = str(recover_calibrate)
 
-    _request_teensy_recover(int(recover_base_pps_vclock_count), teensy_recover_args)
+    teensy_recover_resp = _request_teensy_recover(
+        int(recover_base_pps_vclock_count),
+        teensy_recover_args,
+    )
+    teensy_recover_payload = (
+        teensy_recover_resp.get("payload", {})
+        if isinstance(teensy_recover_resp, dict)
+        else {}
+    )
 
     recovery_monitor = {
         "campaign": campaign_name,
         "recover_base_pps_vclock_count": int(recover_base_pps_vclock_count),
         "expected_first_public_pps_vclock_count": int(expected_first_public_pps_vclock_count),
+        "recovery_generation": _as_int(teensy_recover_payload.get("recovery_generation")),
+        "recover_status": teensy_recover_payload.get("status"),
         "sent_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "sent_monotonic": time.monotonic(),
     }
 
-    clean_wait_deadline = time.monotonic() + SYNC_RECOVER_CLEAN_TIMEOUT_S
+    admission_wait_deadline = time.monotonic() + SYNC_RECOVER_CLEAN_TIMEOUT_S
     discarded_transitional_pairs = 0
-    degraded_publication_fast_retry_pairs = 0
-    recovery_clean_verdict: Dict[str, Any] = {}
+    recovery_admission_verdict: Dict[str, Any] = {}
 
     while True:
-        remaining = clean_wait_deadline - time.monotonic()
+        remaining = admission_wait_deadline - time.monotonic()
         if remaining <= 0:
-            reason = "recovery_clean_timeout_degraded_publication" if discarded_transitional_pairs else "recover_clean_timeout"
+            reason = "recovery_timeline_admission_timeout"
             details = {
                 "campaign": campaign_name,
                 "expected_first_public_pps_vclock_count": int(expected_first_public_pps_vclock_count),
                 "discarded_transitional_pairs": int(discarded_transitional_pairs),
-                "last_clean_verdict": recovery_clean_verdict,
-                "clean_timeout_s": float(SYNC_RECOVER_CLEAN_TIMEOUT_S),
+                "last_admission_verdict": recovery_admission_verdict,
+                "admission_timeout_s": float(SYNC_RECOVER_CLEAN_TIMEOUT_S),
             }
             _diag["recovery_clean_timeouts"] = _diag.get("recovery_clean_timeouts", 0) + 1
             _diag["last_recovery_clean_timeout"] = {"reason": reason, **details}
@@ -5754,7 +6208,7 @@ def _recover_campaign() -> None:
             )
         except RecoverySyncTimeout as e:
             reason = (
-                "recovery_clean_timeout_degraded_publication"
+                "recovery_timeline_admission_timeout"
                 if discarded_transitional_pairs
                 else e.reason
             )
@@ -5764,7 +6218,7 @@ def _recover_campaign() -> None:
                 "recover_base_pps_vclock_count": int(recover_base_pps_vclock_count),
                 "expected_first_public_pps_vclock_count": int(expected_first_public_pps_vclock_count),
                 "discarded_transitional_pairs": int(discarded_transitional_pairs),
-                "last_clean_verdict": recovery_clean_verdict,
+                "last_admission_verdict": recovery_admission_verdict,
             }
             if discarded_transitional_pairs:
                 _diag["recovery_clean_timeouts"] = _diag.get("recovery_clean_timeouts", 0) + 1
@@ -5775,83 +6229,59 @@ def _recover_campaign() -> None:
             _cleanup_after_recovery_failure(reason, details)
             raise RecoverySyncTimeout(reason, details, cleanup_sent=True) from e
 
-        _raise_if_recovery_interrupted("post_sync_pair_before_clean_verdict")
+        _raise_if_recovery_interrupted("post_sync_pair_before_admission_verdict")
 
         teensy_pps_vclock_count = _extract_teensy_pps_vclock_count(frag)
         first_public_offset = teensy_pps_vclock_count - expected_first_public_pps_vclock_count
         recovery_status = _fetch_teensy_recovery_status()
-        clean, recovery_clean_verdict = _recovery_clean_verdict(
+        admissible, recovery_admission_verdict = _recovery_admission_verdict(
             fragment=frag,
             status=recovery_status,
             pps_vclock_count=teensy_pps_vclock_count,
         )
 
-        if clean:
-            logging.info(
-                "✅ [recovery] clean public pair accepted: count=%d expected=%d offset=%+d waited=%.3fs discarded=%d",
-                teensy_pps_vclock_count,
-                expected_first_public_pps_vclock_count,
-                first_public_offset,
-                waited_s,
-                discarded_transitional_pairs,
-            )
+        _diag["last_recovery_admission"] = recovery_admission_verdict
+        if admissible:
+            if recovery_admission_verdict.get("fully_clean"):
+                _diag["recovery_science_clean_rows_admitted"] = (
+                    _diag.get("recovery_science_clean_rows_admitted", 0) + 1
+                )
+                logging.info(
+                    "✅ [recovery] clean public pair admitted: count=%d expected=%d offset=%+d waited=%.3fs discarded=%d",
+                    teensy_pps_vclock_count,
+                    expected_first_public_pps_vclock_count,
+                    first_public_offset,
+                    waited_s,
+                    discarded_transitional_pairs,
+                )
+            else:
+                _diag["recovery_degraded_rows_admitted"] = (
+                    _diag.get("recovery_degraded_rows_admitted", 0) + 1
+                )
+                logging.warning(
+                    "⚠️ [recovery] truthful degraded timeline pair admitted: "
+                    "count=%d expected=%d offset=%+d state=%s; OCXO science remains gated",
+                    teensy_pps_vclock_count,
+                    expected_first_public_pps_vclock_count,
+                    first_public_offset,
+                    recovery_admission_verdict.get("state_reasons"),
+                )
             break
-
-        if _recovery_bool(recovery_clean_verdict.get("recover_reattach_stalled")):
-            reason = "recovery_degraded_publication_stalled"
-            details = {
-                "campaign": campaign_name,
-                "recover_base_pps_vclock_count": int(recover_base_pps_vclock_count),
-                "expected_first_public_pps_vclock_count": int(expected_first_public_pps_vclock_count),
-                "teensy_pps_vclock_count": int(teensy_pps_vclock_count),
-                "first_public_offset": int(first_public_offset),
-                "discarded_transitional_pairs": int(discarded_transitional_pairs),
-                "last_clean_verdict": recovery_clean_verdict,
-            }
-            _diag["recovery_clean_stalls"] = _diag.get("recovery_clean_stalls", 0) + 1
-            _diag["last_recovery_clean_timeout"] = {"reason": reason, **details}
-            _cleanup_after_recovery_failure(reason, details)
-            raise RecoveryCleanTimeout(reason, details, cleanup_sent=True)
-
-        if _recovery_degraded_fast_retry_match(recovery_clean_verdict):
-            degraded_publication_fast_retry_pairs += 1
-        else:
-            degraded_publication_fast_retry_pairs = 0
-
-        if degraded_publication_fast_retry_pairs >= int(RECOVERY_DEGRADED_PUBLICATION_FAST_RETRY_ROWS):
-            reason = "recovery_degraded_publication_fast_retry"
-            details = {
-                "campaign": campaign_name,
-                "recover_base_pps_vclock_count": int(recover_base_pps_vclock_count),
-                "expected_first_public_pps_vclock_count": int(expected_first_public_pps_vclock_count),
-                "teensy_pps_vclock_count": int(teensy_pps_vclock_count),
-                "first_public_offset": int(first_public_offset),
-                "discarded_transitional_pairs": int(discarded_transitional_pairs + 1),
-                "degraded_fast_retry_pairs": int(degraded_publication_fast_retry_pairs),
-                "degraded_fast_retry_threshold": int(RECOVERY_DEGRADED_PUBLICATION_FAST_RETRY_ROWS),
-                "last_clean_verdict": recovery_clean_verdict,
-            }
-            _diag["recovery_degraded_fast_retry_count"] = (
-                _diag.get("recovery_degraded_fast_retry_count", 0) + 1
-            )
-            _diag["recovery_clean_stalls"] = _diag.get("recovery_clean_stalls", 0) + 1
-            _diag["last_recovery_degraded_fast_retry"] = {"reason": reason, **details}
-            _diag["last_recovery_clean_timeout"] = {"reason": reason, **details}
-            _cleanup_after_recovery_failure(reason, details)
-            raise RecoveryCleanTimeout(reason, details, cleanup_sent=True)
 
         discarded_transitional_pairs += 1
         _diag["recovery_transitional_pairs_discarded"] = (
             _diag.get("recovery_transitional_pairs_discarded", 0) + 1
         )
-        _diag["last_recovery_transitional_pair"] = recovery_clean_verdict
+        _diag["last_recovery_transitional_pair"] = recovery_admission_verdict
         logging.warning(
-            "⚠️ [recovery] discarding transitional public pair count=%d expected=%d offset=%+d reasons=%s status_reason=%s",
+            "⚠️ [recovery] discarding non-admissible pair count=%d expected=%d "
+            "offset=%+d blockers=%s state=%s status_reason=%s",
             teensy_pps_vclock_count,
             expected_first_public_pps_vclock_count,
             first_public_offset,
-            recovery_clean_verdict.get("reasons"),
-            recovery_clean_verdict.get("report_reason"),
+            recovery_admission_verdict.get("blocking_reasons"),
+            recovery_admission_verdict.get("state_reasons"),
+            recovery_admission_verdict.get("report_reason"),
         )
 
         # Release the processor thread to discard this pair while campaign
@@ -5898,7 +6328,9 @@ def _recover_campaign() -> None:
         "first_public_offset": int(first_public_offset),
         "skipped_records_expected": False,
         "gnss_raw_recovery_uses_seed_before_first_public": True,
-        "clean_recovery_verdict": recovery_clean_verdict,
+        "clean_recovery_verdict": recovery_admission_verdict,
+        "recovery_admission_verdict": recovery_admission_verdict,
+        "recovery_fully_clean_at_admission": bool(recovery_admission_verdict.get("fully_clean")),
         "discarded_transitional_pairs": int(discarded_transitional_pairs),
         "gnss_raw_restored": bool(gnss_raw_restored),
     })
@@ -5919,8 +6351,11 @@ def _recover_campaign() -> None:
         first_public_offset,
     )
     logging.info(
-        "✅ [recovery] campaign '%s' recovered — TIMEBASE resumes with first public count=%d",
-        campaign_name, teensy_pps_vclock_count,
+        "✅ [recovery] campaign '%s' timeline recovered — TIMEBASE resumes with "
+        "first public count=%d science_clean=%s",
+        campaign_name,
+        teensy_pps_vclock_count,
+        bool(recovery_admission_verdict.get("fully_clean")),
     )
 
 
@@ -7248,6 +7683,9 @@ def startup_teensy_quiet_delay() -> None:
 def run() -> None:
     setup_logging()
 
+    _startup_control_ready.clear()
+    _diag["startup_control_ready"] = False
+
     logging.info(
         "🕐 [clocks] v10 — PPS/VCLOCK TIMEBASE schema. Teensy PPS/VCLOCK count is canonical. "
         "Four clock domains: GNSS (reference), DWT, OCXO1, OCXO2. "
@@ -7257,7 +7695,7 @@ def run() -> None:
         "START while active performs seamless flash-cut to new campaign. "
         "Commands: START, STOP, RESUME, RECOVER_ABORT, REPORT, CLEAR, DELETE, TRUNCATE, SET_DAC, DITHER, "
         "SET_BASELINE, BASELINE_INFO, LIST_CAMPAIGNS, CLOCKS_INFO. "
-        "Subscriptions: TIMEBASE_FRAGMENT, TIMEBASE_FORENSICS, WATCHDOG_ANOMALY."
+        "Subscriptions: TIMEBASE_FRAGMENT, TIMEBASE_FORENSICS, WATCHDOG_ANOMALY, CLOCKS_RECOVERY_STALLED."
     )
 
     # Start command + pubsub servers first, but hold off on active work.
@@ -7272,6 +7710,7 @@ def run() -> None:
             "TIMEBASE_FRAGMENT": on_timebase_fragment,
             "TIMEBASE_FORENSICS": on_timebase_forensics,
             "WATCHDOG_ANOMALY": on_watchdog_anomaly,
+            CLOCKS_RECOVERY_STALLED_TOPIC: on_recovery_stalled,
         },
         blocking=False,
     )
@@ -7357,38 +7796,65 @@ def run() -> None:
         name="clocks-timebase-silence-monitor",
     ).start()
 
-    # Recover or stop stray Teensy
-    row = _get_active_campaign()
-    if row is None:
-        _request_teensy_stop_best_effort()
+    # Recover or stop stray Teensy. START/RESUME remain closed until this
+    # reconciliation is complete, preventing a user START from creating a new
+    # zero-row active campaign that this same boot path then mistakes for stale
+    # recovery work.
+    try:
+        row = _get_active_campaign()
+        if row is None:
+            _request_teensy_stop_best_effort()
+            try:
+                effective_location = _ensure_gnss_mode_for_current_location()
+                if effective_location:
+                    logging.info(
+                        "📡 [clocks] boot idle state — GNSS kept in TO mode for '%s'",
+                        effective_location,
+                    )
+                else:
+                    logging.info("📡 [clocks] boot idle state — GNSS in NORMAL mode")
+            except Exception:
+                logging.exception(
+                    "⚠️ [clocks] failed to reconcile GNSS mode at boot idle"
+                )
+        else:
+            try:
+                _recover_campaign()
+            except TeensyStartRejected as e:
+                # _request_teensy_start already emitted the full handler evidence.
+                logging.error(
+                    "💥 [clocks] boot START rejected (%s); command interface remains available",
+                    e.status,
+                )
+                _cleanup_after_recovery_failure(
+                    "boot_start_rejected",
+                    {"error": str(e), "status": e.status},
+                )
+            except Exception as e:
+                logging.exception(
+                    "💥 [clocks] boot recovery failed; CLOCKS command interface remains available"
+                )
+                _cleanup_after_recovery_failure(
+                    "boot_recovery_failed",
+                    {"error": str(e)},
+                )
+    except Exception as e:
+        logging.exception(
+            "💥 [clocks] boot lifecycle reconciliation failed; command interface remains available"
+        )
         try:
-            effective_location = _ensure_gnss_mode_for_current_location()
-            if effective_location:
-                logging.info("📡 [clocks] boot idle state — GNSS kept in TO mode for '%s'", effective_location)
-            else:
-                logging.info("📡 [clocks] boot idle state — GNSS in NORMAL mode")
-        except Exception:
-            logging.exception("⚠️ [clocks] failed to reconcile GNSS mode at boot idle")
-    else:
-        try:
-            _recover_campaign()
-        except TeensyStartRejected as e:
-            # _request_teensy_start already emitted the full handler evidence.
-            # Avoid a second traceback-sized rendering of the same rejection.
-            logging.error(
-                "💥 [clocks] boot START rejected (%s); command interface remains available",
-                e.status,
-            )
             _cleanup_after_recovery_failure(
-                "boot_start_rejected",
-                {"error": str(e), "status": e.status},
+                "boot_lifecycle_reconciliation_failed",
+                {"error": str(e)},
             )
-        except Exception as e:
-            # Boot must not die merely because campaign recovery/startup is
-            # waiting or failed.  Keep the command interface alive so the
-            # operator can REPORT, STOP, CLEAR, DELETE, or START explicitly.
-            logging.exception("💥 [clocks] boot recovery failed; CLOCKS command interface remains available")
-            _cleanup_after_recovery_failure("boot_recovery_failed", {"error": str(e)})
+        except Exception:
+            logging.exception("⚠️ [clocks] boot lifecycle cleanup also failed")
+    finally:
+        _startup_control_ready.set()
+        _diag["startup_control_ready"] = True
+        logging.info(
+            "✅ [clocks] startup control reconciliation complete — START/RESUME enabled"
+        )
 
     # Block forever
     logging.info("🏁 [clocks] entering main loop")

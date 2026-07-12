@@ -7228,9 +7228,15 @@ bool clocks_alpha_ocxo_recover_reattach_snapshot(
     const bool refined_interval_valid =
         ledger_valid && ledger->refined_interval_valid &&
         ledger->refined_interval_ns != 0ULL;
-    const bool ledger_ready =
-        ledger_valid && capture_ready && interval_valid && phase_ready &&
-        phase_lag_ok && refined_valid && refined_interval_valid;
+
+    // A fresh integer PPS-sampled CounterLedger interval is sufficient to
+    // publish the OCXO clockface.  PhaseLedger refinement remains the stricter
+    // science gate for residuals, Welford, PPB, and servo input.
+    const bool clockface_ready =
+        ledger_valid && capture_ready && interval_valid && ledger->ns != 0ULL;
+    const bool science_ready =
+        clockface_ready && phase_ready && phase_lag_ok &&
+        refined_valid && refined_interval_valid;
 
     r.counterledger_mode = true;
     r.counterledger_snapshot_ok = ledger_snapshot_ok;
@@ -7242,6 +7248,8 @@ bool clocks_alpha_ocxo_recover_reattach_snapshot(
     r.counterledger_phase_lag_ok = phase_lag_ok;
     r.counterledger_refined_valid = refined_valid;
     r.counterledger_refined_interval_valid = refined_interval_valid;
+    r.clockface_ready = clockface_ready;
+    r.science_ready = science_ready;
     r.counterledger_sample_count = ledger ? ledger->sample_count : 0U;
     r.counterledger_pps_sequence = ledger ? ledger->pps_sequence : 0U;
     r.counterledger_phase_pps_sequence = ledger ? ledger->phase_pps_sequence : 0U;
@@ -7424,14 +7432,19 @@ bool clocks_alpha_ocxo_recover_reattach_snapshot(
     r.counterledger_refined_interval_ns =
         ledger ? ledger->refined_interval_ns : 0ULL;
 
-    r.projection_ready = ledger_ready;
-    r.ready = ledger_ready;
+    // Historical projection_ready/ready fields retain their strict
+    // science semantics for compatibility.  New callers must use the explicit
+    // clockface_ready/science_ready split above.
+    r.projection_ready = science_ready;
+    r.ready = science_ready;
   } else {
-    r.ready =
-        r.forensics_ready &&
-        r.edge_history_ready &&
-        r.projection_ready &&
-        r.public_ns_nonzero;
+    const bool clockface_ready =
+        r.projection_ready && r.public_ns_nonzero;
+    const bool science_ready =
+        r.forensics_ready && r.edge_history_ready && clockface_ready;
+    r.clockface_ready = clockface_ready;
+    r.science_ready = science_ready;
+    r.ready = science_ready;
   }
 
   return true;
