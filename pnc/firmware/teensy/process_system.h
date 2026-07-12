@@ -119,24 +119,39 @@ enum {
 };
 
 // name must be a string literal or other immortal storage; only the pointer
-// is retained.
-void zpnet_sentinel_enter(uint32_t slot, const char* name, uint32_t exc_return);
-void zpnet_sentinel_exit(uint32_t slot);
+// is retained.  Both macros capture SP at the caller's own frame level, so
+// the entry/exit MSP comparison sees the handler's frame rather than the
+// sentinel functions' differing prologues.
+void zpnet_sentinel_enter(uint32_t slot,
+                          const char* name,
+                          uint32_t exc_return,
+                          uint32_t caller_sp);
+void zpnet_sentinel_exit(uint32_t slot, uint32_t caller_sp);
 
 #if defined(__arm__)
 #define ZPNET_SENTINEL_ENTER(slot, name)                                     \
   do {                                                                       \
     uint32_t zpnet_sentinel_exc_return_;                                     \
+    uint32_t zpnet_sentinel_sp_;                                             \
     __asm__ volatile("mov %0, lr"                                            \
                      : "=r"(zpnet_sentinel_exc_return_));                    \
-    zpnet_sentinel_enter((slot), (name), zpnet_sentinel_exc_return_);        \
+    __asm__ volatile("mov %0, sp"                                            \
+                     : "=r"(zpnet_sentinel_sp_));                            \
+    zpnet_sentinel_enter((slot), (name), zpnet_sentinel_exc_return_,         \
+                         zpnet_sentinel_sp_);                                \
+  } while (0)
+#define ZPNET_SENTINEL_EXIT(slot)                                            \
+  do {                                                                       \
+    uint32_t zpnet_sentinel_sp_;                                             \
+    __asm__ volatile("mov %0, sp"                                            \
+                     : "=r"(zpnet_sentinel_sp_));                            \
+    zpnet_sentinel_exit((slot), zpnet_sentinel_sp_);                         \
   } while (0)
 #else
 #define ZPNET_SENTINEL_ENTER(slot, name)                                     \
-  zpnet_sentinel_enter((slot), (name), 0U)
+  zpnet_sentinel_enter((slot), (name), 0U, 0U)
+#define ZPNET_SENTINEL_EXIT(slot) zpnet_sentinel_exit((slot), 0U)
 #endif
-
-#define ZPNET_SENTINEL_EXIT(slot) zpnet_sentinel_exit((slot))
 
 // ============================================================================
 // Feature status substrate

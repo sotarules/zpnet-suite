@@ -354,7 +354,7 @@ static uint32_t g_sentinel_violations_suppressed = 0;
 static volatile bool g_sentinel_event_pending = false;
 static bool g_sentinel_event_emitted = false;
 
-static constexpr uint32_t ZPNET_SENTINEL_MAGIC = 0x53454E32UL;  // 'SEN2'
+static constexpr uint32_t ZPNET_SENTINEL_MAGIC = 0x53454E33UL;  // 'SEN3'
 
 typedef struct {
   uint32_t magic;
@@ -666,7 +666,10 @@ static void sentinel_latch_violation(const zpnet_sentinel_slot_t* s,
                    sizeof(g_sentinel_violation_retained));
 }
 
-void zpnet_sentinel_enter(uint32_t slot, const char* name, uint32_t exc_return) {
+void zpnet_sentinel_enter(uint32_t slot,
+                          const char* name,
+                          uint32_t exc_return,
+                          uint32_t caller_sp) {
   if (slot >= (uint32_t)ZPNET_SENTINEL_SLOT_COUNT) {
     g_sentinel_bad_slot++;
     return;
@@ -684,7 +687,11 @@ void zpnet_sentinel_enter(uint32_t slot, const char* name, uint32_t exc_return) 
   const uint32_t fpcar = ZPNET_SCB_FPCAR;
 
   s->exc_return = exc_return;
-  s->msp_entry = msp;
+  // MSP integrity uses the SP captured by the macro at the caller's own
+  // frame level.  Reading MSP inside this function would bake the differing
+  // prologue depths of enter() and exit() into the comparison and fire a
+  // false MSP_MISMATCH on every pass (the validation-run lesson).
+  s->msp_entry = caller_sp;
   s->fpccr_entry = fpccr;
   s->fpcar_entry = fpcar;
   s->dwt_entry = ARM_DWT_CYCCNT;
@@ -733,9 +740,15 @@ void zpnet_sentinel_enter(uint32_t slot, const char* name, uint32_t exc_return) 
       }
     }
 
-    // 3. Bounded signature scan up the main stack from the current MSP.
+    // 3. Bounded signature scan up the main stack.  Start at the caller's
+    //    frame level when the macro supplied it — the frames of interest sit
+    //    above the caller, and this keeps the sentinel's own locals out of
+    //    the scan window.
     if (frame == 0U) {
-      const uint32_t begin = (msp + 7U) & ~7U;
+      const uint32_t scan_from =
+          (caller_sp >= 0x20000000UL && caller_sp < dtcm_end) ? caller_sp
+                                                              : msp;
+      const uint32_t begin = (scan_from + 7U) & ~7U;
       for (uint32_t base = begin;
            base + 32U <= dtcm_end && base < begin + ZPNET_SENTINEL_SCAN_BYTES;
            base += 8U) {
@@ -776,7 +789,7 @@ void zpnet_sentinel_enter(uint32_t slot, const char* name, uint32_t exc_return) 
   }
 }
 
-void zpnet_sentinel_exit(uint32_t slot) {
+void zpnet_sentinel_exit(uint32_t slot, uint32_t caller_sp) {
   if (slot >= (uint32_t)ZPNET_SENTINEL_SLOT_COUNT) {
     g_sentinel_bad_slot++;
     return;
@@ -789,12 +802,11 @@ void zpnet_sentinel_exit(uint32_t slot) {
   }
   s->active = 0U;
 
-  const uint32_t msp = sentinel_read_msp();
   const uint32_t fpccr = ZPNET_SCB_FPCCR;
   const uint32_t fpcar = ZPNET_SCB_FPCAR;
   const uint32_t dwt = ARM_DWT_CYCCNT;
 
-  s->msp_exit_last = msp;
+  s->msp_exit_last = caller_sp;
   s->dwt_exit_last = dwt;
   // Lazy FP state consumed during this pass: an FP instruction executed in
   // handler context and flushed the foreground's FP registers into the
@@ -824,14 +836,17 @@ void zpnet_sentinel_exit(uint32_t slot) {
     }
   }
 
-  if (msp != s->msp_entry) {
+  // Like-for-like comparison: both values were captured by the macros at
+  // the caller's frame level.  A zero on either side means a capture was
+  // unavailable (non-ARM build path) — no verdict from missing evidence.
+  if (caller_sp != 0U && s->msp_entry != 0U && caller_sp != s->msp_entry) {
     kind |= ZPNET_SENTINEL_KIND_MSP;
     s->msp_mismatch++;
   }
 
   if (kind != 0U) {
     sentinel_latch_violation(s, slot, kind, exit_words, diff_mask,
-                             exit_checksum, msp, fpccr, fpcar, dwt);
+                             exit_checksum, caller_sp, fpccr, fpcar, dwt);
   }
 
   // Pop after any latch so the violation's foreground correlation still saw
