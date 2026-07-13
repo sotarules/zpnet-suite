@@ -3,11 +3,11 @@ ZPNet CLOCKS Process — TIMEBASE Authority (Pi-side) — v10 PPS/VCLOCK - Revis
 
 Core contract (v2026-03+):
 
-  CLOCKS is a pure traffic cop.  It owns NO clock state.  It receives
-  TIMEBASE_FRAGMENT from the Teensy (containing PPS/VCLOCK, GNSS, DWT,
-  OCXO1, and OCXO2 nanosecond ledgers), decorates each fragment with environment snapshots and
-  GF-8802 discipline data, computes Welford statistics, and persists
-  the result as an immutable TIMEBASE row.
+  CLOCKS is a pure traffic cop and final TIMEBASE arbiter.  It owns NO
+  Teensy clock state.  It receives one TIMEBASE_FRAGMENT candidate containing
+  the science fragment plus embedded forensics, decorates it with Pi-owned
+  environment and GF-8802 evidence, and either persists a compatible immutable
+  TIMEBASE row or logs the complete rejected candidate as a canonical gap.
 
   Architecture:
     • Teensy owns: PPS/VCLOCK count, GNSS/PPS/VCLOCK ns, DWT ns/cycles, OCXO1 ns, OCXO2 ns — in TIMEBASE_FRAGMENT
@@ -84,14 +84,15 @@ Core contract (v2026-03+):
     OCXOs are never disturbed.  Nanosecond counters and pps_count
     reset to zero under the new campaign name.
 
-  Fragment queue architecture (retained):
+  Unified candidate queue architecture:
 
-    Fragment reception is decoupled from processing:
-      • on_timebase_fragment() — PUBSUB handler.  Fast path.
-      • _process_loop() — dedicated thread.  Straight-through path.
+    Candidate reception is decoupled from processing:
+      • on_timebase_fragment() — PUBSUB handler.  Fast path and liveness only.
+      • _process_loop() — dedicated thread, final court, persistence or drop.
 
 Responsibilities:
-  * Receive TIMEBASE_FRAGMENT from Teensy (queue-buffered)
+  * Receive unified TIMEBASE_FRAGMENT candidates from Teensy (queue-buffered)
+  * Adjudicate each candidate and log every rejected raw record
   * Fetch GF-8802 discipline snapshot from GNSS (GET_GNSS_INFO)
   * Augment fragment with GNSS time, environment, and system time
   * Publish TIMEBASE
@@ -116,14 +117,17 @@ Semantics:
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import math
+import os
 import queue
 import threading
 import subprocess
 import time
 from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
 from typing import Dict, Any, List, Optional, Tuple
 
 from zpnet.processes.processes import (
@@ -201,16 +205,24 @@ RECOVERY_SYNC_HEALTH_GRACE_S = 3.0
 
 SYNC_LOG_INTERVAL_S = 5.0
 
-# TIMEBASE ingress queue: maxsize=0 means unbounded
+# TIMEBASE ingress queue: maxsize=0 means unbounded.
 #
-# TIMEBASE_FRAGMENT and TIMEBASE_FORENSICS arrive independently on PUBSUB.
-# The PUBSUB handlers enqueue tiny topic/payload envelopes; the processor
-# thread performs the exact PPS-count pair join before building TIMEBASE.
+# The Teensy now emits one TIMEBASE_FRAGMENT candidate containing both the
+# science fragment and an embedded ``forensics`` object.  The topic name is
+# retained so routing remains stable; PostgreSQL still receives the compatible
+# {fragment, forensics} TIMEBASE shape after Pi-side adjudication.
 TIMEBASE_INGRESS_QUEUE_MAXSIZE = 0
 TIMEBASE_FRAGMENT_TOPIC = "TIMEBASE_FRAGMENT"
-TIMEBASE_FORENSICS_TOPIC = "TIMEBASE_FORENSICS"
+TIMEBASE_FORENSICS_TOPIC = "TIMEBASE_FORENSICS"  # legacy diagnostics only
 CLOCKS_RECOVERY_STALLED_TOPIC = "CLOCKS_RECOVERY_STALLED"
-TIMEBASE_PAIR_TIMEOUT_S = 5.0
+TIMEBASE_PAIR_TIMEOUT_S = 5.0  # legacy exact-pair code is no longer on the live path
+
+INVALID_TIMEBASE_LOG_PATH = os.environ.get(
+    "ZPNET_INVALID_TIMEBASE_LOG_PATH",
+    "/var/log/zpnet/clocks-invalid-timebase.jsonl",
+)
+INVALID_TIMEBASE_LOG_MAX_BYTES = 64 * 1024 * 1024
+INVALID_TIMEBASE_LOG_BACKUP_COUNT = 4
 
 # Final TIMEBASE courtroom.  This is the Pi-side last-mile acceptance gate:
 # it evaluates the fully assembled TIMEBASE dictionary immediately before the
@@ -239,11 +251,10 @@ TIMEBASE_FINAL_COURT_DELTA_RAW_INTERVAL_GATE_CYCLES = 500
 # zero OCXO ns plus zero endpoints/intervals is lane absence, not science.
 TIMEBASE_FINAL_COURT_OCXO_ZERO_MATURE_PUBLIC_COUNT = 2
 
-# Row-fatal final-court rules are bad TIMEBASE rows, not necessarily bad
-# campaigns.  They are still blocked from persistence, but the Pi allows the
-# next row to prove that the firmware recovered naturally before forcing a full
-# STOP/RECOVER lifecycle.  Campaign-fatal rules still trigger immediate
-# recovery.
+# Final-court violations are row verdicts.  They are logged and dropped; a
+# repeated scientific rejection remains a canonical campaign gap and does not
+# become a recovery request merely by repetition.  These legacy constants stay
+# visible in REPORT output during the transition, but no longer control recovery.
 TIMEBASE_FINAL_COURT_ROW_FATAL_RULES = {
     "ocxo_science_valid",
 }
@@ -371,7 +382,12 @@ _last_completed_timebase_pair_count: Optional[int] = None
 # ---------------------------------------------------------------------
 
 _diag: Dict[str, Any] = {
-    # Fragment/forensics ingress (PUBSUB handler — fast path)
+    # Unified candidate ingress (PUBSUB handler — fast path)
+    "timebase_candidates_received": 0,
+    "timebase_candidates_queued": 0,
+    "timebase_candidates_processed": 0,
+
+    # Legacy fragment/forensics aliases retained for REPORT compatibility.
     "fragments_received": 0,
     "fragments_queued": 0,
     "fragments_missing_teensy_pps_count": 0,     # legacy diagnostic alias
@@ -408,6 +424,13 @@ _diag: Dict[str, Any] = {
     "timebase_final_court_consecutive_row_fatal": 0,
     "timebase_final_court_row_fatal_escalate_threshold": TIMEBASE_FINAL_COURT_ROW_FATAL_ESCALATE_CONSECUTIVE,
     "last_timebase_final_court_row_drop": {},
+
+    # Dedicated invalid-TIMEBASE JSONL evidence log.
+    "invalid_timebase_log_path": INVALID_TIMEBASE_LOG_PATH,
+    "invalid_timebase_log_ready": False,
+    "invalid_timebase_log_writes": 0,
+    "invalid_timebase_log_failures": 0,
+    "last_invalid_timebase_log": {},
 
     # Fragment processing (processor thread — slow path)
     "fragments_processed": 0,
@@ -582,6 +605,86 @@ _diag: Dict[str, Any] = {
     "flash_cut_cold_recovery_deferred": 0,
     "last_flash_cut": {},
 }
+
+
+_invalid_timebase_logger = logging.getLogger("zpnet.clocks.invalid_timebase")
+_invalid_timebase_logger.propagate = False
+_invalid_timebase_logger_ready = False
+
+
+def _setup_invalid_timebase_logger() -> None:
+    """Create the dedicated rotating JSONL log used only for rejected rows."""
+    global _invalid_timebase_logger_ready
+
+    if _invalid_timebase_logger_ready:
+        return
+
+    try:
+        parent = os.path.dirname(INVALID_TIMEBASE_LOG_PATH)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+
+        handler = RotatingFileHandler(
+            INVALID_TIMEBASE_LOG_PATH,
+            maxBytes=INVALID_TIMEBASE_LOG_MAX_BYTES,
+            backupCount=INVALID_TIMEBASE_LOG_BACKUP_COUNT,
+            encoding="utf-8",
+        )
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        _invalid_timebase_logger.handlers.clear()
+        _invalid_timebase_logger.addHandler(handler)
+        _invalid_timebase_logger.setLevel(logging.INFO)
+        _invalid_timebase_logger_ready = True
+        _diag["invalid_timebase_log_path"] = INVALID_TIMEBASE_LOG_PATH
+        _diag["invalid_timebase_log_ready"] = True
+    except Exception:
+        _invalid_timebase_logger_ready = False
+        _diag["invalid_timebase_log_ready"] = False
+        _diag["invalid_timebase_log_failures"] += 1
+        logging.exception(
+            "⚠️ [clocks] unable to initialize invalid TIMEBASE log at %s",
+            INVALID_TIMEBASE_LOG_PATH,
+        )
+
+
+def _log_invalid_timebase(
+    *,
+    verdict: Dict[str, Any],
+    raw_record: Dict[str, Any],
+    assembled_timebase: Dict[str, Any],
+) -> None:
+    """Write one complete rejected candidate and its Pi verdict as JSONL."""
+    if not _invalid_timebase_logger_ready:
+        _setup_invalid_timebase_logger()
+
+    entry = {
+        "logged_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "classification": "DROP_ROW",
+        "verdict": verdict,
+        "raw_record": raw_record,
+        "assembled_timebase": assembled_timebase,
+    }
+
+    try:
+        if not _invalid_timebase_logger_ready:
+            raise RuntimeError("invalid TIMEBASE logger is unavailable")
+        _invalid_timebase_logger.info(
+            json.dumps(entry, sort_keys=True, separators=(",", ":"), default=str)
+        )
+        _diag["invalid_timebase_log_writes"] += 1
+        _diag["last_invalid_timebase_log"] = {
+            "logged_at_utc": entry["logged_at_utc"],
+            "campaign": verdict.get("campaign"),
+            "teensy_pps_vclock_count": verdict.get("teensy_pps_vclock_count"),
+            "primary_rule": verdict.get("primary_rule"),
+            "rationale": verdict.get("rationale"),
+            "path": INVALID_TIMEBASE_LOG_PATH,
+        }
+    except Exception:
+        _diag["invalid_timebase_log_failures"] += 1
+        logging.exception(
+            "⚠️ [clocks] failed to write rejected TIMEBASE evidence; row remains dropped"
+        )
 
 # ---------------------------------------------------------------------
 # GNSS stream health canary — lightweight Pi-side check
@@ -1025,29 +1128,32 @@ def _raise_if_recovery_interrupted(context: str) -> None:
     raise RecoveryInterrupted("recovery_interrupted_by_watchdog_anomaly", details)
 
 
-def _note_timebase_activity(topic: str, pps_vclock_count: int) -> None:
+def _note_timebase_activity(
+    topic: str,
+    pps_vclock_count: Optional[int],
+) -> None:
     """
-    Record that a Teensy TIMEBASE publication half was received.
+    Record receipt of one Teensy TIMEBASE candidate.
 
-    The silence monitor uses this as the campaign heartbeat.  Either half of
-    the exact pair is enough to prove that the Teensy/pubsub data plane is not
-    silent; exact-pair integrity remains the processor thread's job.
+    Candidate receipt is the campaign heartbeat even when the Pi later rejects
+    the row.  That keeps transport silence distinct from scientific invalidity.
     """
     global _timebase_last_activity_monotonic
     global _timebase_last_activity_utc
     global _timebase_last_activity_topic
     global _timebase_last_activity_pps_vclock_count
 
+    count = None if pps_vclock_count is None else int(pps_vclock_count)
     now_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     _timebase_last_activity_monotonic = time.monotonic()
     _timebase_last_activity_utc = now_utc
     _timebase_last_activity_topic = topic
-    _timebase_last_activity_pps_vclock_count = int(pps_vclock_count)
+    _timebase_last_activity_pps_vclock_count = count
     _diag["last_timebase_activity"] = {
         "ts_utc": now_utc,
         "topic": topic,
-        "teensy_pps_vclock_count": int(pps_vclock_count),
-        "pps_count": int(pps_vclock_count),
+        "teensy_pps_vclock_count": count,
+        "pps_count": count,
     }
 
 
@@ -1829,8 +1935,8 @@ def _wait_for_timebase_routes(
     timeout_s: float = 30.0,
     poll_s: float = 0.5,
 ) -> None:
-    """Confirm both TIMEBASE pair routes without noisy normal-path logging."""
-    required = {TIMEBASE_FRAGMENT_TOPIC, TIMEBASE_FORENSICS_TOPIC}
+    """Confirm the unified TIMEBASE candidate route."""
+    required = {TIMEBASE_FRAGMENT_TOPIC}
     t0 = time.monotonic()
     last_log = t0
     last_missing = sorted(required)
@@ -2045,7 +2151,7 @@ def _fetch_gnss_info() -> Optional[Dict[str, Any]]:
 
 
 def _begin_sync_wait(expected_pps: int) -> None:
-    """Prepare to wait for the first public TIMEBASE pair at/after a count."""
+    """Prepare to wait for the first Pi-accepted TIMEBASE candidate."""
     global _sync_expected_pps_vclock, _sync_fragment
 
     with _sync_lock:
@@ -2075,7 +2181,7 @@ def _end_sync_wait(
     global _sync_expected_pps_vclock
 
     logging.info(
-        "⏳ [recovery] waiting for first public TIMEBASE pair >= %s",
+        "⏳ [recovery] waiting for first accepted TIMEBASE candidate >= %s",
         str(_sync_expected_pps_vclock),
     )
 
@@ -2146,8 +2252,8 @@ def _end_sync_wait(
         return frag, float(waited)
 
 
-def _signal_sync_pair_if_needed(fragment: Dict[str, Any], pps_vclock_count: int) -> bool:
-    """Satisfy RECOVER sync only after the complete TIMEBASE pair is present."""
+def _signal_sync_candidate_if_needed(fragment: Dict[str, Any], pps_vclock_count: int) -> bool:
+    """Satisfy RECOVER sync only after the Pi court accepts a candidate."""
     global _sync_fragment
 
     with _sync_lock:
@@ -3049,6 +3155,100 @@ def _timebase_final_court_add_violation(
     violations.append(violation)
 
 
+def _timebase_final_court_check_candidate_envelope(
+    timebase: Dict[str, Any],
+    violations: List[Dict[str, Any]],
+) -> None:
+    """Validate the unified Teensy candidate before examining clock science."""
+    fragment = timebase.get("fragment")
+    forensics = timebase.get("forensics")
+
+    if not isinstance(fragment, dict):
+        _timebase_final_court_add_violation(
+            violations,
+            rule="candidate_fragment_present",
+            lane="candidate",
+            message="unified TIMEBASE candidate has no fragment object",
+            fields={"bad_field": "fragment", "bad_value": fragment},
+        )
+        return
+
+    if not isinstance(forensics, dict) or not forensics:
+        _timebase_final_court_add_violation(
+            violations,
+            rule="embedded_forensics_present",
+            lane="candidate",
+            message="unified TIMEBASE candidate has no embedded forensics object",
+            fields={
+                "bad_field": "forensics",
+                "bad_value": forensics,
+                "fragment_forensics_embedded": fragment.get("forensics_embedded"),
+            },
+        )
+
+    outer_count = _first_present_int_path(
+        timebase,
+        "teensy_pps_vclock_count",
+        "pps_count",
+    )
+    fragment_count = _first_present_int_path(
+        fragment,
+        "teensy_pps_vclock_count",
+        "pps_count",
+    )
+    forensics_count = (
+        _first_present_int_path(
+            forensics,
+            "teensy_pps_vclock_count",
+            "pps_count",
+        )
+        if isinstance(forensics, dict)
+        else None
+    )
+    if (
+        outer_count is None
+        or fragment_count is None
+        or forensics_count is None
+        or outer_count != fragment_count
+        or outer_count != forensics_count
+    ):
+        _timebase_final_court_add_violation(
+            violations,
+            rule="candidate_identity_consistent",
+            lane="candidate",
+            message="candidate, fragment, and forensics PPS/VCLOCK identities must agree",
+            fields={
+                "outer_count": outer_count,
+                "fragment_count": fragment_count,
+                "forensics_count": forensics_count,
+                "identity_error": timebase.get("identity_error"),
+            },
+        )
+
+    campaign = str(timebase.get("campaign") or "")
+    fragment_campaign = str(fragment.get("campaign") or "")
+    forensics_campaign = (
+        str(forensics.get("campaign") or "")
+        if isinstance(forensics, dict)
+        else ""
+    )
+    if (
+        not campaign
+        or (fragment_campaign and fragment_campaign != campaign)
+        or (forensics_campaign and forensics_campaign != campaign)
+    ):
+        _timebase_final_court_add_violation(
+            violations,
+            rule="candidate_campaign_consistent",
+            lane="candidate",
+            message="candidate campaign identity does not match the active campaign",
+            fields={
+                "active_campaign": campaign,
+                "fragment_campaign": fragment_campaign,
+                "forensics_campaign": forensics_campaign,
+            },
+        )
+
 def _timebase_final_court_check_delta_raw_interval(
     timebase: Dict[str, Any],
     violations: List[Dict[str, Any]],
@@ -3358,6 +3558,7 @@ def _timebase_final_court_check_ocxo_lane_alive(
 def _timebase_final_court_evaluate(timebase: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
     """Return (ok, verdict) for the final TIMEBASE dictionary."""
     violations: List[Dict[str, Any]] = []
+    _timebase_final_court_check_candidate_envelope(timebase, violations)
     _timebase_final_court_check_delta_raw_interval(timebase, violations)
     _timebase_final_court_check_ocxo_lane_alive(timebase, violations)
     recovery_degraded = _timebase_final_court_recovery_degraded_context(timebase)
@@ -3372,10 +3573,16 @@ def _timebase_final_court_evaluate(timebase: Dict[str, Any]) -> Tuple[bool, Dict
         "fragment.teensy_pps_vclock_count",
         "pps_count",
     )
+    primary = violations[0] if violations else {}
+    ok = len(violations) == 0
 
     verdict: Dict[str, Any] = {
-        "schema": "WATCHDOG_ANOMALY_PI_TIMEBASE_FINAL_COURT_V1",
+        "schema": "PI_TIMEBASE_FINAL_COURT_V2",
+        "valid": ok,
+        "classification": "ACCEPT" if ok else "DROP_ROW",
         "reason": TIMEBASE_FINAL_COURT_REASON,
+        "primary_rule": primary.get("rule"),
+        "rationale": primary.get("message") if primary else "candidate accepted",
         "source": TIMEBASE_FINAL_COURT_SOURCE,
         "source_process": "CLOCKS",
         "source_report": "TIMEBASE_FINAL_COURT",
@@ -3385,14 +3592,22 @@ def _timebase_final_court_evaluate(timebase: Dict[str, Any]) -> Tuple[bool, Dict
         "pps_count": count,
         "timebase_schema": timebase.get("schema"),
         "fragment_schema": _path_get(timebase, "fragment.schema"),
+        "timebase_message_version": timebase.get("timebase_message_version"),
+        "teensy_evidence_invalid_mask": (
+            _as_int(_path_get(timebase, "fragment.teensy_evidence_invalid_mask")) or 0
+        ),
+        "teensy_evidence_status": _path_get(timebase, "fragment.teensy_evidence_status"),
+        "teensy_evidence_reason": _path_get(
+            timebase, "fragment.teensy_evidence_reason"
+        ),
         "timebase_pair_version": timebase.get("timebase_pair_version"),
-        "rule_count": 3,
+        "rule_count": 4,
         "violation_count": len(violations),
         "recovery_degraded_context": recovery_degraded,
         "violations": violations,
     }
 
-    return len(violations) == 0, verdict
+    return ok, verdict
 
 
 _final_court_row_fatal_consecutive: int = 0
@@ -3446,7 +3661,7 @@ def _timebase_final_court_reset_row_fatal_streak(reason: str) -> None:
 
 
 def _timebase_final_court_note_row_drop(verdict: Dict[str, Any]) -> bool:
-    """Record a row-fatal court block; return True when it should escalate."""
+    """Record a rejected-row streak for diagnostics only."""
     global _final_court_row_fatal_consecutive
     global _final_court_row_fatal_signature
     global _final_court_row_fatal_first_pps
@@ -3492,68 +3707,44 @@ def _timebase_final_court_note_row_drop(verdict: Dict[str, Any]) -> bool:
     )
 
 
-def _timebase_final_court_block(verdict: Dict[str, Any]) -> None:
-    """Record a final-court conviction and start recovery only when needed."""
+def _timebase_final_court_block(
+    verdict: Dict[str, Any],
+    *,
+    raw_record: Dict[str, Any],
+    assembled_timebase: Dict[str, Any],
+) -> None:
+    """Log and drop one invalid row without converting it into recovery."""
     _diag["timebase_final_court_blocked"] += 1
+    verdict["valid"] = False
+    verdict["classification"] = "DROP_ROW"
+    verdict["court_classification"] = "DROP_ROW"
+    verdict["recovery_requested"] = False
     _diag["last_timebase_final_court"] = verdict
 
-    row_fatal = _timebase_final_court_row_fatal(verdict)
-    verdict["court_classification"] = "ROW_FATAL" if row_fatal else "CAMPAIGN_FATAL"
+    _timebase_final_court_note_row_drop(verdict)
+    _log_invalid_timebase(
+        verdict=verdict,
+        raw_record=raw_record,
+        assembled_timebase=assembled_timebase,
+    )
 
-    if row_fatal:
-        should_escalate = _timebase_final_court_note_row_drop(verdict)
-        logging.warning(
-            "⚠️ [clocks] TIMEBASE final court row dropped: campaign=%s pps=%s consecutive=%d/%d violations=%s",
-            verdict.get("campaign"),
-            verdict.get("teensy_pps_vclock_count"),
-            _final_court_row_fatal_consecutive,
-            TIMEBASE_FINAL_COURT_ROW_FATAL_ESCALATE_CONSECUTIVE,
-            verdict.get("violations"),
-        )
-        if not should_escalate:
-            try:
-                create_event("TIMEBASE_ROW_DROPPED", verdict)
-            except Exception:
-                logging.debug("⚠️ [clocks] failed to enqueue TIMEBASE_ROW_DROPPED event", exc_info=True)
-            return
-
-        _diag["timebase_final_court_row_fatal_escalated"] = (
-            _diag.get("timebase_final_court_row_fatal_escalated", 0) + 1
-        )
-        reason = "timebase_final_court_row_fatal_repeated"
-        details = {
-            "payload": verdict,
-            "consecutive_row_fatal_count": _final_court_row_fatal_consecutive,
-            "first_pps_vclock_count": _final_court_row_fatal_first_pps,
-            "last_pps_vclock_count": _final_court_row_fatal_last_pps,
-            "signature": _final_court_row_fatal_signature,
-        }
-    else:
-        _timebase_final_court_reset_row_fatal_streak("campaign_fatal_final_court")
-        reason = TIMEBASE_FINAL_COURT_REASON
-        details = {"payload": verdict}
-
-    logging.error(
-        "💥 [clocks] TIMEBASE final court campaign recovery: campaign=%s pps=%s reason=%s violations=%s",
+    logging.warning(
+        "⚠️ [clocks] invalid TIMEBASE candidate dropped: campaign=%s pps=%s "
+        "rule=%s rationale=%s",
         verdict.get("campaign"),
         verdict.get("teensy_pps_vclock_count"),
-        reason,
-        verdict.get("violations"),
+        verdict.get("primary_rule"),
+        verdict.get("rationale"),
     )
 
     try:
-        create_event("WATCHDOG_ANOMALY", verdict)
+        create_event("TIMEBASE_ROW_DROPPED", verdict)
     except Exception:
         _diag["timebase_final_court_event_enqueue_failures"] += 1
-        logging.exception("⚠️ [clocks] failed to enqueue final-court WATCHDOG_ANOMALY event")
-
-    started = _begin_auto_recovery(
-        reason,
-        details,
-        source=TIMEBASE_FINAL_COURT_SOURCE,
-    )
-    if started:
-        _diag["timebase_final_court_recovery_started"] += 1
+        logging.debug(
+            "⚠️ [clocks] failed to enqueue TIMEBASE_ROW_DROPPED event",
+            exc_info=True,
+        )
 
 
 def _dwt_cycles_to_recover_ns(cycles: int) -> int:
@@ -4589,35 +4780,30 @@ def _accept_timebase_piece_for_pair(
 
 def on_timebase_fragment(payload: Payload) -> None:
     """
-    PUBSUB handler for TIMEBASE_FRAGMENT.
+    PUBSUB handler for the unified Teensy TIMEBASE candidate.
 
-    Fast path only: validate identity, satisfy sync waits, enqueue the fragment
-    half for exact-pair processing with TIMEBASE_FORENSICS.
+    Fast path only: copy, note liveness, and enqueue.  Identity and scientific
+    validity are adjudicated in the processor thread so even malformed rows are
+    captured in the dedicated invalid-TIMEBASE log.
     """
-    global _sync_fragment
-
+    _diag["timebase_candidates_received"] += 1
     _diag["fragments_received"] += 1
-    frag = dict(payload)
+    candidate = dict(payload)
 
+    pps_vclock_count: Optional[int]
     try:
-        pps_vclock_count = _extract_teensy_pps_vclock_count(frag, topic=TIMEBASE_FRAGMENT_TOPIC)
+        pps_vclock_count = _extract_teensy_pps_vclock_count(
+            candidate,
+            topic=TIMEBASE_FRAGMENT_TOPIC,
+        )
     except ValueError:
+        pps_vclock_count = None
         _diag["fragments_missing_teensy_pps_count"] += 1
         _diag["fragments_missing_teensy_pps_vclock_count"] += 1
-        logging.exception(
-            "💥 [clocks] invalid TIMEBASE_FRAGMENT identity; keys=%s payload=%s",
-            sorted(list(frag.keys())),
-            frag,
-        )
-        return
 
-    _normalize_fragment_count_aliases(frag, pps_vclock_count)
     _note_timebase_activity(TIMEBASE_FRAGMENT_TOPIC, pps_vclock_count)
-
-    # Sync waits are satisfied only by the processor thread after the exact
-    # TIMEBASE_FRAGMENT/TIMEBASE_FORENSICS pair is complete.
-
-    _enqueue_timebase_piece(TIMEBASE_FRAGMENT_TOPIC, frag)
+    _enqueue_timebase_piece(TIMEBASE_FRAGMENT_TOPIC, candidate)
+    _diag["timebase_candidates_queued"] += 1
     _diag["fragments_queued"] += 1
 
 
@@ -4670,10 +4856,6 @@ def _process_loop() -> None:
         try:
             piece = _fragment_queue.get(timeout=0.25)
         except queue.Empty:
-            try:
-                _check_timebase_pair_timeouts()
-            except RuntimeError:
-                continue
             continue
 
         _diag["timebase_pieces_processed"] += 1
@@ -4682,85 +4864,62 @@ def _process_loop() -> None:
         topic = str(piece.get("topic") or "")
         payload = piece.get("payload")
         if not isinstance(payload, dict):
-            logging.error("💥 [clocks] processor received malformed TIMEBASE piece: %s", piece)
+            logging.error("💥 [clocks] processor received malformed TIMEBASE candidate: %s", piece)
             continue
 
-        try:
-            pps_piece_count = _extract_teensy_pps_vclock_count(payload, topic=topic or "TIMEBASE")
-        except ValueError:
-            if topic == TIMEBASE_FORENSICS_TOPIC:
-                _diag["forensics_missing_teensy_pps_count"] += 1
-                _diag["forensics_missing_teensy_pps_vclock_count"] += 1
-            else:
-                _diag["fragments_missing_teensy_pps_count"] += 1
-                _diag["fragments_missing_teensy_pps_vclock_count"] += 1
-            logging.exception("💥 [clocks] processor received invalid %s identity", topic or "TIMEBASE piece")
-            continue
-
-        _normalize_fragment_count_aliases(payload, pps_piece_count)
+        raw_record = copy.deepcopy(payload)
+        frag = dict(payload)
+        embedded_forensics = frag.pop("forensics", None)
+        forensics = (
+            dict(embedded_forensics)
+            if isinstance(embedded_forensics, dict)
+            else {}
+        )
 
         try:
-            completed = _accept_timebase_piece_for_pair(
-                topic=topic,
-                payload=payload,
-                pps_vclock_count=int(pps_piece_count),
+            pps_vclock_count = _extract_teensy_pps_vclock_count(
+                frag,
+                topic=topic or TIMEBASE_FRAGMENT_TOPIC,
             )
-        except RuntimeError:
-            continue
-        if completed is None:
-            continue
-
-        frag, forensics, pps_vclock_count = completed
-        try:
-            _validate_completed_timebase_pair(
-                pps_vclock_count=pps_vclock_count,
-                fragment=frag,
-                forensics=forensics,
+            _normalize_fragment_count_aliases(frag, pps_vclock_count)
+            if forensics:
+                _normalize_fragment_count_aliases(forensics, pps_vclock_count)
+        except ValueError as exc:
+            _diag["fragments_missing_teensy_pps_count"] += 1
+            _diag["fragments_missing_teensy_pps_vclock_count"] += 1
+            court_timebase = {
+                "schema": "TIMEBASE_V3",
+                "campaign": str(frag.get("campaign") or ""),
+                "fragment": frag,
+                "forensics": forensics,
+                "identity_error": str(exc),
+            }
+            _diag["timebase_final_court_checks"] += 1
+            _court_ok, court_verdict = _timebase_final_court_evaluate(court_timebase)
+            _timebase_final_court_block(
+                court_verdict,
+                raw_record=raw_record,
+                assembled_timebase=court_timebase,
             )
-        except RuntimeError:
             continue
 
-        sync_matched = _signal_sync_pair_if_needed(frag, pps_vclock_count)
-        if sync_matched and not _campaign_active:
-            # RECOVER uses this exact pair as the first public row. Pause here
-            # until the recovery thread has restored Pi-owned GNSS_RAW/state,
-            # then continue so the pair is persisted instead of discarded.
-            if not _sync_resume_event.wait(timeout=SYNC_RECOVER_TIMEOUT_S):
-                logging.error(
-                    "💥 [recovery] timed out reopening processor for first public pair count=%d",
-                    int(pps_vclock_count),
-                )
-                continue
+        _diag["timebase_candidates_processed"] += 1
+        # Compatibility counter: one unified candidate is one completed former pair.
+        _diag["timebase_pairs_completed"] += 1
 
-        # --- No campaign => ignore only after the exact pair has completed ---
-        # This keeps recovery/cold-start sync traffic from leaving one half of a
-        # pair orphaned in the join buffer.
-        if not _campaign_active:
-            _diag["fragments_ignored_no_campaign"] += 1
-            _diag["forensics_ignored_no_campaign"] += 1
-            continue
-
-        # --- Campaign lookup ---
+        # The active DB campaign supplies the canonical namespace.  During
+        # recovery _campaign_active may still be false while this row is being
+        # used to satisfy the accepted-candidate sync latch.
         row = _get_active_campaign()
-        if row is None:
-            _diag["hard_fault_no_active_campaign"] += 1
-            try:
-                _hard_fault("no_active_campaign", {"teensy_pps_vclock_count": int(pps_vclock_count), "pps_count": int(pps_vclock_count)})
-            except RuntimeError:
-                continue
+        campaign = row["campaign"] if row is not None else str(frag.get("campaign") or "")
+        campaign_payload = row["payload"] if row is not None else {}
 
-        campaign = row["campaign"]
-        campaign_payload = row["payload"]
-
-        # --- Final court preflight before mutating Pi-owned row state ---
-        # A row-fatal court drop must not advance GNSS_RAW, GNSS confession,
-        # accepted PPS identity, or the async START marker.  Build only the
-        # Teensy-authored shell needed by the court, then commit Pi-owned
-        # surfaces after the row is proven persistable.
+        # --- Final court before any Pi-owned state or recovery latch mutates ---
         system_time_utc = datetime.now(timezone.utc)
         system_time_str = system_time_utc.isoformat(timespec="microseconds")
         court_timebase = {
             "schema": "TIMEBASE_V3",
+            "timebase_message_version": frag.get("timebase_message_version"),
             "timebase_pair_version": frag.get("timebase_pair_version"),
             "campaign": campaign,
             "teensy_pps_vclock_count": int(pps_vclock_count),
@@ -4772,20 +4931,68 @@ def _process_loop() -> None:
         _diag["timebase_final_court_checks"] += 1
         court_ok, court_verdict = _timebase_final_court_evaluate(court_timebase)
         if not court_ok:
-            # The final object failed last-mile acceptance.  Do not publish,
-            # persist, or mutate Pi-owned campaign accumulators.  Row-fatal
-            # violations are simply dropped unless they repeat past threshold.
-            _timebase_final_court_block(court_verdict)
+            _timebase_final_court_block(
+                court_verdict,
+                raw_record=raw_record,
+                assembled_timebase=court_timebase,
+            )
             continue
 
         _timebase_final_court_reset_row_fatal_streak("final_court_passed")
         _diag["timebase_final_court_passed"] += 1
+
+        sync_matched = _signal_sync_candidate_if_needed(frag, pps_vclock_count)
+        if sync_matched and not _campaign_active:
+            # RECOVER waits for the first Pi-accepted candidate, not merely the
+            # first transport message.  Pi-owned recovery state is restored
+            # before this accepted row is allowed to persist.
+            if not _sync_resume_event.wait(timeout=SYNC_RECOVER_TIMEOUT_S):
+                logging.error(
+                    "💥 [recovery] timed out reopening processor for first accepted candidate count=%d",
+                    int(pps_vclock_count),
+                )
+                continue
+
+        if not _campaign_active:
+            _diag["fragments_ignored_no_campaign"] += 1
+            continue
+
+        # Refresh after a recovery sync because the control thread may have
+        # activated or switched the campaign while this processor was paused.
+        row = _get_active_campaign()
+        if row is None:
+            _diag["hard_fault_no_active_campaign"] += 1
+            try:
+                _hard_fault(
+                    "no_active_campaign",
+                    {
+                        "teensy_pps_vclock_count": int(pps_vclock_count),
+                        "pps_count": int(pps_vclock_count),
+                    },
+                )
+            except RuntimeError:
+                continue
+
+        campaign = row["campaign"]
+        campaign_payload = row["payload"]
+        if campaign != court_timebase["campaign"]:
+            court_timebase["campaign"] = campaign
+            _diag["timebase_final_court_checks"] += 1
+            court_ok, court_verdict = _timebase_final_court_evaluate(court_timebase)
+            if not court_ok:
+                _timebase_final_court_block(
+                    court_verdict,
+                    raw_record=raw_record,
+                    assembled_timebase=court_timebase,
+                )
+                continue
+
         _diag["fragments_processed"] += 1
         _note_pps_vclock_count(pps_vclock_count)
 
         # --- Accept Teensy PPS/VCLOCK count as observed truth ---
         #
-        # Do not compare this pair against an armed/expected Pi-side count.
+        # Do not compare this candidate against an armed/expected Pi-side count.
         # The Pi is a TIMEBASE traffic cop here, not a campaign-count authority.
         _accepted_pps_vclock_count = int(pps_vclock_count)
         _diag["accepted_pps_count"] = _accepted_pps_vclock_count
@@ -4845,9 +5052,8 @@ def _process_loop() -> None:
             gnss_raw_welford_stddev / math.sqrt(_gnss_raw_welford_n)) if _gnss_raw_welford_n >= 2 else 0.0
 
         # --- GNSS confession PPB candidates ---
-        # Computed here, after exact TIMEBASE pair assembly and final-court
-        # admission, because only admitted rows may advance Pi-owned candidate
-        # state.
+        # Computed here after unified-candidate final-court admission, because
+        # only admitted rows may advance Pi-owned candidate state.
         ppb_candidates = _gnss_confession_update(
             pps_vclock_count=int(pps_vclock_count),
             frag=frag,
@@ -4857,6 +5063,7 @@ def _process_loop() -> None:
         # --- Build TIMEBASE record ---
         timebase = {
             "schema": "TIMEBASE_V3",
+            "timebase_message_version": frag.get("timebase_message_version"),
             "timebase_pair_version": frag.get("timebase_pair_version"),
             "campaign": campaign,
             "campaign_elapsed": _seconds_to_hms(int(pps_vclock_count)),
@@ -4869,7 +5076,7 @@ def _process_loop() -> None:
             "teensy_pps_count": int(pps_vclock_count),   # legacy alias
             "pps_count": int(pps_vclock_count),          # legacy alias
 
-            # Teensy-authored exact pair, ferried through unchanged.
+            # Compatible durable shape reconstructed from one Teensy message.
             "fragment": frag,
             "forensics": forensics,
 
@@ -7705,20 +7912,20 @@ def startup_teensy_quiet_delay() -> None:
 
 def run() -> None:
     setup_logging()
+    _setup_invalid_timebase_logger()
 
     _startup_control_ready.clear()
     _diag["startup_control_ready"] = False
 
     logging.info(
-        "🕐 [clocks] v10 — PPS/VCLOCK TIMEBASE schema. Teensy PPS/VCLOCK count is canonical. "
+        "🕐 [clocks] unified PPS/VCLOCK TIMEBASE candidate schema. Teensy PPS/VCLOCK count is canonical. "
         "Four clock domains: GNSS (reference), DWT, OCXO1, OCXO2. "
-        "DWT/OCXO1/OCXO2 prediction stats from Teensy are authoritative. "
-        "Pi-side Welford for DWT/OCXO1/OCXO2 removed. GNSS stream canary retained. "
-        "Recovery: campaign deactivated + queue drained + first sync pair preserved; valid fragments are never rejected for count mismatch. START and cold recovery are asynchronous; first public rows are expected to be authoritative. "
+        "The Teensy emits one candidate containing fragment + forensics; the Pi is the final row arbiter. "
+        "Invalid candidates are logged in full and dropped as canonical gaps without automatic recovery. "
         "START while active performs seamless flash-cut to new campaign. "
         "Commands: START, STOP, RESUME, RECOVER_ABORT, REPORT, CLEAR, DELETE, TRUNCATE, SET_DAC, DITHER, "
         "SET_BASELINE, BASELINE_INFO, LIST_CAMPAIGNS, CLOCKS_INFO. "
-        "Subscriptions: TIMEBASE_FRAGMENT, TIMEBASE_FORENSICS, WATCHDOG_ANOMALY, CLOCKS_RECOVERY_STALLED."
+        "Subscriptions: TIMEBASE_FRAGMENT, WATCHDOG_ANOMALY, CLOCKS_RECOVERY_STALLED."
     )
 
     # Start command + pubsub servers first, but hold off on active work.
@@ -7731,7 +7938,6 @@ def run() -> None:
         commands=COMMANDS,
         subscriptions={
             "TIMEBASE_FRAGMENT": on_timebase_fragment,
-            "TIMEBASE_FORENSICS": on_timebase_forensics,
             "WATCHDOG_ANOMALY": on_watchdog_anomaly,
             CLOCKS_RECOVERY_STALLED_TOPIC: on_recovery_stalled,
         },

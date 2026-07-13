@@ -50,10 +50,13 @@
 // Servo inputs consume the same PPS-founded OCXO residual surface that feeds
 // the OCXO Welfords, and DAC/TIMEBASE reports expose that provenance.
 //
-// TIMEBASE publication is intentionally split:
-//   TIMEBASE_FRAGMENT   — compact canonical campaign row / science spine.
-//   TIMEBASE_FORENSICS  — companion diagnostic row for the same PPS identity.
-// The Pi pairs the two by pps_count and stores them as { fragment, forensics }.
+// TIMEBASE publication is one continuous candidate stream:
+//   TIMEBASE_FRAGMENT — science spine plus an embedded "forensics" object.
+//
+// The Pi remains the final arbiter and stores accepted candidates in the
+// compatible PostgreSQL { fragment, forensics } shape.  START may privately
+// acquire a PPS0 bookend before public campaign time begins; after public PPS1
+// is released, every campaign identity is emitted continuously.
 //
 // ============================================================================
 
@@ -147,13 +150,10 @@ extern uint32_t clocks_alpha_ocxo_projection_guard_sanity_reject_count(time_cloc
 //
 // Focused report: CLOCKS.REPORT_TIMEBASE_PUBLISH
 
-// Temporary safety valve while the lower-envelope report-only rail is being
-// validated.  Pi-side clocks currently treats TIMEBASE_FRAGMENT and
-// TIMEBASE_FORENSICS as an atomic pair and faults if a new fragment identity
-// arrives while the prior identity has no forensics companion.  Therefore we
-// must keep publishing the TIMEBASE_FORENSICS companion row, but we can make it
-// deliberately tiny until the lower-envelope payload is sane.
-static constexpr bool TIMEBASE_FORENSICS_PUBLISH_ENABLED = true;
+// Embedded-forensics profile.  Keep the forensic child deliberately tiny so a
+// single candidate stays well below Payload::ARENA_MAX.  The legacy constant
+// remains report-visible but is false because no second publication is emitted.
+static constexpr bool TIMEBASE_FORENSICS_PUBLISH_ENABLED = false;
 static constexpr bool TIMEBASE_FORENSICS_MINIMAL_PAYLOAD_ENABLED = true;
 
 // Ultra-slim raw-cycle companion fields for the 1 Hz TIMEBASE_FORENSICS row.
@@ -175,13 +175,11 @@ static constexpr bool TIMEBASE_FORENSICS_MINIMAL_PAYLOAD_ENABLED = true;
 static constexpr bool TIMEBASE_FORENSICS_MICRO_RAW_CYCLES_ENABLED = true;
 static constexpr bool TIMEBASE_FORENSICS_MINIMAL_HEALTH_FIELDS_ENABLED = false;
 
-// Draconian 1 Hz TIMEBASE_FORENSICS diet.
+// Draconian embedded-forensics diet.
 //
-// The companion row is allowed to be tiny: it only has to satisfy Pi-side
-// fragment/forensics pairing and keep the raw_cycles / raw_nanoseconds family
-// supplied with the per-lane DWT endpoint and interval facts they actually use.
-// Bulky courtroom transcripts and CounterLedger/PhaseLedger liveness evidence
-// stay in focused reports and the canonical TIMEBASE_FRAGMENT science spine.
+// The child object carries only the per-lane DWT endpoint and interval facts
+// needed by raw_cycles / raw_nanoseconds.  Bulky courtroom transcripts and
+// CounterLedger/PhaseLedger liveness evidence stay in focused reports.
 static constexpr bool TIMEBASE_FORENSICS_MICRO_AUX_FLOORLINE_FIELDS_ENABLED = false;
 static constexpr bool TIMEBASE_FORENSICS_MICRO_COURT_FIELDS_ENABLED = false;
 static constexpr bool TIMEBASE_FORENSICS_MICRO_COUNTERLEDGER_FIELDS_ENABLED = false;
@@ -198,6 +196,9 @@ static constexpr bool TIMEBASE_FORENSICS_FLOORLINE_PAYLOAD_ENABLED = false;
 // and raw_nanoseconds-style reports.
 static constexpr bool TIMEBASE_FRAGMENT_COMPACT_SCIENCE_ENABLED = true;
 static constexpr bool TIMEBASE_FRAGMENT_PUBLISH_PREDICTION_ENABLED = false;
+
+static constexpr uint32_t TIMEBASE_CANDIDATE_INVALID_OCXO1_CUSTODY = 1U << 0;
+static constexpr uint32_t TIMEBASE_CANDIDATE_INVALID_OCXO2_CUSTODY = 1U << 1;
 
 
 static constexpr uint32_t TIMEBASE_BUILD_STAGE_NONE = 0;
@@ -354,6 +355,13 @@ static clocks_alpha_ocxo_counterledger_snapshot_t
 static clocks_alpha_ocxo_counterledger_snapshot_t
     g_beta_ocxo2_counterledger_row DMAMEM = {};
 
+// The unified candidate keeps two Payload headers alive at once.  Put both
+// reusable headers in RAM2 so the PPS hot path does not spend the remaining
+// RAM1/DTCM stack margin on another automatic Payload object.  Their arenas are
+// already heap-backed and are reused by clear() between rows.
+static Payload g_timebase_candidate_payload DMAMEM;
+static Payload g_timebase_forensics_payload DMAMEM;
+
 static bool     g_timebase_last_ocxo1_pps_projected = false;
 static bool     g_timebase_last_ocxo2_pps_projected = false;
 static bool     g_timebase_last_ocxo1_pps_residual_valid = false;
@@ -418,6 +426,8 @@ static void clocks_beta_features_mark_initializing(void) {
 
 void clocks_beta_features_init(void) {
   clocks_beta_cold_diagnostics_init();
+  g_timebase_candidate_payload.clear();
+  g_timebase_forensics_payload.clear();
   clocks_beta_features_mark_initializing();
 }
 
@@ -949,14 +959,15 @@ static FLASHMEM void payload_add_stack_witness(Payload& p) {
 // Campaign publication handoff
 // ============================================================================
 //
-// Fixed TIMEBASE row burial is retired.  Campaign admission is now gated by
-// Pi/Teensy readiness surfaces; once START/RECOVER is armed, the first public
-// TIMEBASE pair is expected to be the first authoritative row.
+// Fixed TIMEBASE row burial is retired.  START instead owns a private,
+// pre-publication prologue: Alpha and Interrupt continue advancing while Beta
+// keeps campaign_seconds at zero, captures a lawful PPS0 bookend, and releases
+// the next mature candidate as public PPS1.  No public campaign identity is
+// screened or skipped; public campaign time simply has not begun yet.
 //
-// START may still wait before publishing if the live PPS-row OCXO projection
-// needed to capture campaign-public zero has not yet arrived.  That is a
-// pre-publication handoff wait, not skipped campaign time: campaign_seconds
-// does not advance and no canonical TIMEBASE identities are hidden.
+// RECOVER remains different: it resumes an existing public timeline and
+// therefore continues emitting candidate identities while reattachment and
+// science custody recover.
 //
 // RECOVER publishes the next PPS/VCLOCK row after the recovered base count.
 // Recovery science residuals may be quarantined for population hygiene, but
@@ -980,7 +991,7 @@ static volatile uint32_t g_campaign_warmup_suppressed_total = 0;
 // so public PPS1 can carry a fully qualified Delta/FloorLine science sample
 // and enter Welford as n=1.
 static constexpr uint32_t CLOCKS_START_PROLOGUE_FIT_ENDPOINT_GATE_CYCLES = 16U;
-static constexpr uint32_t CLOCKS_START_PROLOGUE_MAX_PRIVATE_CANDIDATES = 0xFFFFFFFFUL;
+static constexpr uint32_t CLOCKS_START_PROLOGUE_MAX_PRIVATE_CANDIDATES = 32U;
 // Bound the purely-private START handoff.  This is not science-row burial; it
 // is a launch-acquisition watchdog so a failed OCXO public-origin/projection
 // proof becomes a local aborted START instead of 90 seconds of TIMEBASE silence.
@@ -1945,6 +1956,7 @@ static void campaign_start_phaseledger_set_reason(const char* reason,
            first_problem ? first_problem : "");
 }
 
+
 static bool campaign_start_phaseledger_capture_ready(
     const clocks_alpha_ocxo_counterledger_snapshot_t& s) {
   return s.last_capture_available &&
@@ -1954,10 +1966,12 @@ static bool campaign_start_phaseledger_capture_ready(
          s.last_capture_sequence == s.pps_sequence;
 }
 
+
 static bool campaign_start_phaseledger_integer_interval_ready(
     const clocks_alpha_ocxo_counterledger_snapshot_t& s) {
   return s.interval_valid && s.interval_ns != 0ULL;
 }
+
 
 static bool campaign_start_phaseledger_phase_ready(
     const clocks_alpha_ocxo_counterledger_snapshot_t& s) {
@@ -1966,21 +1980,25 @@ static bool campaign_start_phaseledger_phase_ready(
          s.phase_pps_sequence <= s.pps_sequence;
 }
 
+
 static bool campaign_start_phaseledger_lag_ready(
     const clocks_alpha_ocxo_counterledger_snapshot_t& s) {
   return campaign_start_phaseledger_phase_ready(s) &&
          s.phase_lag_pps <= CLOCKS_START_PHASELEDGER_EXPECTED_LAG_PPS;
 }
 
+
 static bool campaign_start_phaseledger_refined_ready(
     const clocks_alpha_ocxo_counterledger_snapshot_t& s) {
   return s.refined_valid && s.refined_ns != 0ULL;
 }
 
+
 static bool campaign_start_phaseledger_refined_interval_ready(
     const clocks_alpha_ocxo_counterledger_snapshot_t& s) {
   return s.refined_interval_valid && s.refined_interval_ns != 0ULL;
 }
+
 
 static bool campaign_start_phaseledger_lane_ready(
     bool snapshot_ok,
@@ -1995,6 +2013,7 @@ static bool campaign_start_phaseledger_lane_ready(
          campaign_start_phaseledger_refined_ready(s) &&
          campaign_start_phaseledger_refined_interval_ready(s);
 }
+
 
 static const char* campaign_start_phaseledger_lane_problem(
     bool snapshot_ok,
@@ -2033,6 +2052,7 @@ static const char* campaign_start_phaseledger_lane_problem(
 
   return nullptr;
 }
+
 
 static void campaign_start_phaseledger_count_wait_reason(
     bool ocxo1_snapshot_ok,
@@ -2081,6 +2101,7 @@ static void campaign_start_phaseledger_count_wait_reason(
     return;
   }
 }
+
 
 static bool campaign_start_counterledger_maturity_ready(void) {
   g_start_phaseledger_check_count++;
@@ -2140,6 +2161,7 @@ static bool campaign_start_counterledger_maturity_ready(void) {
                                         problem ? problem : "unknown");
   return false;
 }
+
 
 static bool campaign_start_handoff_ready(void) {
   g_start_handoff_check_count++;
@@ -2225,6 +2247,8 @@ static bool campaign_start_handoff_ready(void) {
   return g_start_handoff_last_ready;
 }
 
+
+
 static void campaign_start_prologue_reset(const char* reason) {
   g_start_prologue_seeded = false;
   g_start_prologue_reference_ready = false;
@@ -2293,12 +2317,11 @@ static void campaign_warmup_begin(campaign_warmup_mode_t mode) {
 
   if (mode == campaign_warmup_mode_t::START) {
     recover_reattach_reset("start_lifecycle");
-    // START now has a science prologue instead of fixed row burial.  The
-    // prologue consumes private candidate rows until it has established an
-    // internal PPS 0 and the next candidate can publish as science-complete
-    // public PPS 1.  campaign_seconds remains zero while this mode is active.
-    // While this private window is open, INTERRUPT relaxes non-poisonous
-    // publication courts so Alpha can build OCXO public-origin evidence.
+
+    // START owns a private acquisition bookend, not a public skipped row.
+    // Interrupt and Alpha continue to run while campaign_seconds remains zero.
+    // The launch-acquisition window relaxes only the non-poisonous publication
+    // courts needed to let OCXO origin, CounterLedger, and PhaseLedger mature.
     interrupt_dwt_publication_launch_acquisition_begin();
     g_campaign_warmup_mode = campaign_warmup_mode_t::START;
     g_campaign_warmup_remaining = 1;
@@ -2578,40 +2601,36 @@ static FLASHMEM void recover_reattach_release(const char* reason, bool degraded)
 }
 
 static bool campaign_warmup_consume_one_candidate_record(void) {
-  if (!campaign_warmup_active()) return false;
-
-  if (g_campaign_warmup_mode == campaign_warmup_mode_t::START) {
-    if (campaign_start_prologue_should_hold()) {
-      // Private prologue, not a public skipped row.  The candidate was either
-      // used as internal PPS 0/bookend evidence or rejected before campaign
-      // time began.  If the prologue timed out and aborted START, leave the
-      // warmup mode cleared instead of re-arming the hold gate.
-      if (campaign_warmup_active()) {
-        g_campaign_warmup_remaining = 1;
-      }
-      return true;
-    }
-
-    interrupt_dwt_publication_launch_acquisition_end();
-    g_campaign_warmup_mode = campaign_warmup_mode_t::NONE;
-    g_campaign_warmup_remaining = 0;
-    g_start_prologue_release_count++;
-    g_start_prologue_last_release_public_count = 1U;
-    safeCopy(g_start_prologue_last_reason,
-             sizeof(g_start_prologue_last_reason),
-             clocks_ocxo_counterledger_mode_enabled()
-                 ? "phaseledger_release_public_pps1"
-                 : "release_public_pps1");
+  if (g_campaign_warmup_mode != campaign_warmup_mode_t::START) {
     return false;
   }
 
-  // RECOVER and NONE both publish immediately under the no-burial doctrine.
-  // RECOVER-specific OCXO reattachment is handled by recover_reattach_should_hold();
-  // unlike START warmup, that gate has a finite degraded-release policy.
+  if (campaign_start_prologue_should_hold()) {
+    // This is private pre-publication evidence.  Alpha/Interrupt have advanced,
+    // but campaign_seconds has not and no public TIMEBASE identity exists yet.
+    if (g_campaign_warmup_mode == campaign_warmup_mode_t::START) {
+      g_campaign_warmup_remaining = 1;
+    }
+    g_campaign_warmup_suppressed_total++;
+    g_timebase_warmup_suppressed_count++;
+    return true;
+  }
+
+  // The current PPS candidate has passed the prologue court.  End the relaxed
+  // Interrupt window before publishing it as the first strict public identity.
+  interrupt_dwt_publication_launch_acquisition_end();
   g_campaign_warmup_mode = campaign_warmup_mode_t::NONE;
   g_campaign_warmup_remaining = 0;
+  g_start_prologue_release_count++;
+  g_start_prologue_last_release_public_count = 1U;
+  safeCopy(g_start_prologue_last_reason,
+           sizeof(g_start_prologue_last_reason),
+           clocks_ocxo_counterledger_mode_enabled()
+               ? "phaseledger_release_public_pps1"
+               : "release_public_pps1");
   return false;
 }
+
 
 static void campaign_warmup_reset(void) {
   interrupt_dwt_publication_launch_acquisition_end();
@@ -2718,34 +2737,6 @@ static uint64_t campaign_public_ocxo2_ns(void) {
                                      g_campaign_public_ocxo2_offset);
 }
 
-static void recover_reattach_advance_hidden_candidate(void) {
-  const uint64_t public_gnss_ns = campaign_public_gnss_ns();
-  const uint64_t public_dwt_total = campaign_public_dwt_total();
-  const uint64_t public_ocxo1_measured_ns = campaign_public_ocxo1_measured_ns();
-  const uint64_t public_ocxo2_measured_ns = campaign_public_ocxo2_measured_ns();
-
-  if (public_gnss_ns != 0ULL) {
-    campaign_seconds = public_gnss_ns / CLOCKS_BETA_NS_PER_SECOND;
-  } else {
-    campaign_seconds++;
-  }
-
-  dwt_cycle_count_total = public_dwt_total;
-  gnss_raw_64 = public_gnss_ns / 100ULL;
-  if (public_ocxo1_measured_ns != 0ULL) {
-    ocxo1_measured_gnss_ticks_64 = public_ocxo1_measured_ns / 100ULL;
-  }
-  if (public_ocxo2_measured_ns != 0ULL) {
-    ocxo2_measured_gnss_ticks_64 = public_ocxo2_measured_ns / 100ULL;
-  }
-
-  g_recover_reattach_hidden_candidate_count++;
-  g_recover_reattach_last_hidden_public_count =
-      (uint32_t)campaign_seconds;
-  g_campaign_warmup_suppressed_total++;
-  g_timebase_warmup_suppressed_count++;
-}
-
 static FLASHMEM bool recover_reattach_should_hold(void) {
   clocks_stack_witness_note_hot(CLOCKS_STACK_CONTEXT_RECOVER_SHOULD_HOLD);
   if (!g_recover_reattach_active) return false;
@@ -2767,6 +2758,14 @@ static FLASHMEM bool recover_reattach_should_hold(void) {
     return false;
   }
 
+  // Legacy "hidden candidate" counters now count emitted recovery candidates.
+  // The identity advances through the normal per-second path below; this gate
+  // only observes how long reattachment remains incomplete.
+  g_recover_reattach_hold_count++;
+  g_recover_reattach_hidden_candidate_count++;
+  g_recover_reattach_last_hidden_public_count =
+      (uint32_t)(campaign_seconds + 1ULL);
+
   if (g_recover_reattach_hidden_candidate_count >=
       CLOCKS_RECOVER_REATTACH_TIMEOUT_CANDIDATES) {
     g_recover_reattach_timeout_count++;
@@ -2774,26 +2773,20 @@ static FLASHMEM bool recover_reattach_should_hold(void) {
       recover_reattach_release("ocxo_reattach_timeout_degraded_release", true);
       return false;
     }
-
-    recover_reattach_set_reason("ocxo_reattach_timeout_still_holding");
-    return true;
-  }
-
-  g_recover_reattach_hold_count++;
-  recover_reattach_advance_hidden_candidate();
-
-  if (!g_recover_reattach_last_ocxo1.clockface_ready &&
-      !g_recover_reattach_last_ocxo2.clockface_ready) {
-    recover_reattach_set_reason("waiting_for_both_ocxo_clockfaces");
+    recover_reattach_set_reason("ocxo_reattach_timeout_candidates_emitted");
+  } else if (!g_recover_reattach_last_ocxo1.clockface_ready &&
+             !g_recover_reattach_last_ocxo2.clockface_ready) {
+    recover_reattach_set_reason("emitting_without_both_ocxo_clockfaces");
   } else if (!g_recover_reattach_last_ocxo1.clockface_ready) {
-    recover_reattach_set_reason("waiting_for_ocxo1_clockface");
+    recover_reattach_set_reason("emitting_without_ocxo1_clockface");
   } else if (!g_recover_reattach_last_ocxo2.clockface_ready) {
-    recover_reattach_set_reason("waiting_for_ocxo2_clockface");
+    recover_reattach_set_reason("emitting_without_ocxo2_clockface");
   } else {
-    recover_reattach_set_reason("waiting_for_ocxo_science");
+    recover_reattach_set_reason("emitting_while_ocxo_science_initializes");
   }
 
-  return true;
+  // Reattachment state remains active, but it no longer gates TIMEBASE.
+  return false;
 }
 
 static FLASHMEM bool recover_reattach_degraded_science_hold_active(void) {
@@ -5914,169 +5907,27 @@ static bool clocks_beta_ocxo_science_custody_ok(
   return row.valid && row.antecedents_complete;
 }
 
-static void clocks_beta_add_ocxo_science_custody_violation(
-    Payload& parent,
-    const char* lane,
-    const clock_science_row_t& row,
-    const clocks_alpha_ocxo_counterledger_snapshot_t& ledger,
-    uint64_t public_ocxo_ns) {
-  Payload v;
-  v.add("lane", lane ? lane : "");
-  v.add("public_ocxo_ns", public_ocxo_ns);
-  v.add("public_count", row.public_count);
-  v.add("science_valid", row.valid);
-  v.add("antecedents_complete", row.antecedents_complete);
-  v.add("delta_raw_valid", row.delta_raw_valid);
-  v.add("delta_raw_reference_interval_cycles",
-        row.delta_raw_reference_interval_cycles);
-  v.add("delta_raw_clock_interval_cycles",
-        row.delta_raw_clock_interval_cycles);
-  v.add("clock_interval_ns", row.clock_interval_ns);
-  v.add("total_valid", row.total_valid);
-  v.add("total_sample_count", row.total_sample_count);
-  v.add("counterledger_valid", ledger.valid);
-  v.add("counterledger_interval_valid", ledger.interval_valid);
-  v.add("counterledger_phase_valid", ledger.phase_valid);
-  v.add("counterledger_refined_valid", ledger.refined_valid);
-  v.add("counterledger_refined_interval_valid", ledger.refined_interval_valid);
-  v.add("counterledger_phase_lag_pps", ledger.phase_lag_pps);
-  v.add("counterledger_phase_pending", ledger.phase_pending);
-  v.add("counterledger_phase_pending_depth", ledger.phase_pending_depth);
-  v.add("counterledger_phase_pending_capacity", ledger.phase_pending_capacity);
-  v.add("counterledger_phase_pending_overflow_count",
-        ledger.phase_pending_overflow_count);
-  v.add("counterledger_phase_pending_drop_count",
-        ledger.phase_pending_drop_count);
-  v.add("counterledger_phase_pending_unbracketed_count",
-        ledger.phase_pending_unbracketed_count);
-  v.add("counterledger_phase_pending_oldest_pps_sequence",
-        ledger.phase_pending_oldest_pps_sequence);
-  v.add("counterledger_phase_pending_newest_pps_sequence",
-        ledger.phase_pending_newest_pps_sequence);
-  v.add("counterledger_phase_pending_last_resolved_pps_sequence",
-        ledger.phase_pending_last_resolved_pps_sequence);
-  v.add("counterledger_phase_pending_last_dropped_pps_sequence",
-        ledger.phase_pending_last_dropped_pps_sequence);
-  v.add("counterledger_phase_pending_last_matched_index",
-        ledger.phase_pending_last_matched_index);
-  v.add("counterledger_phase_last_edge_pair_valid",
-        ledger.phase_last_edge_pair_valid);
-  v.add("counterledger_phase_last_edge_pair_previous_dwt",
-        ledger.phase_last_edge_pair_previous_dwt);
-  v.add("counterledger_phase_last_edge_pair_next_dwt",
-        ledger.phase_last_edge_pair_next_dwt);
-  v.add("counterledger_phase_last_edge_pair_interval_cycles",
-        ledger.phase_last_edge_pair_interval_cycles);
-  v.add("counterledger_phase_last_edge_pair_counter_delta_ticks",
-        ledger.phase_last_edge_pair_counter_delta_ticks);
-  v.add("counterledger_phase_last_edge_pair_update_count",
-        ledger.phase_last_edge_pair_update_count);
-  v.add("counterledger_phase_catchup_attempt_count",
-        ledger.phase_catchup_attempt_count);
-  v.add("counterledger_phase_catchup_success_count",
-        ledger.phase_catchup_success_count);
-  v.add("counterledger_phase_catchup_no_edge_pair_count",
-        ledger.phase_catchup_no_edge_pair_count);
-  v.add("counterledger_phase_catchup_no_pending_count",
-        ledger.phase_catchup_no_pending_count);
-  v.add("counterledger_phase_catchup_unbracketed_count",
-        ledger.phase_catchup_unbracketed_count);
-  v.add("counterledger_phase_catchup_bad_counter_delta_count",
-        ledger.phase_catchup_bad_counter_delta_count);
-  v.add("counterledger_phase_last_catchup_pps_sequence",
-        ledger.phase_last_catchup_pps_sequence);
-  v.add("counterledger_phase_last_catchup_reason_id",
-        ledger.phase_last_catchup_reason_id);
-  v.add("counterledger_phase_last_catchup_reason",
-        clocks_phaseledger_resolve_reason_name(
-            ledger.phase_last_catchup_reason_id));
-  v.add("counterledger_last_phase_resolve_source_id",
-        ledger.phase_last_resolve_source_id);
-  v.add("counterledger_last_phase_resolve_source",
-        clocks_phaseledger_resolve_source_name(
-            ledger.phase_last_resolve_source_id));
-  v.add("counterledger_last_phase_resolve_reason_id",
-        ledger.last_phase_resolve_reason_id);
-  v.add("counterledger_last_phase_resolve_reason",
-        clocks_phaseledger_resolve_reason_name(
-            ledger.last_phase_resolve_reason_id));
-  v.add("counterledger_last_phase_resolve_pps_sequence",
-        ledger.last_phase_resolve_pps_sequence);
-  v.add("counterledger_last_phase_resolve_interval_cycles",
-        ledger.last_phase_resolve_interval_cycles);
-  v.add("counterledger_last_phase_resolve_pps_delta_cycles",
-        ledger.last_phase_resolve_pps_delta_cycles);
-  v.add("counterledger_last_sample_decision_id",
-        ledger.last_sample_decision_id);
-  v.add("counterledger_last_sample_decision",
-        clocks_counterledger_sample_decision_name(
-            ledger.last_sample_decision_id));
-  parent.add_object(lane ? lane : "lane", v);
-}
-
-static bool clocks_beta_public_ocxo_science_court(
+static uint32_t clocks_beta_public_ocxo_science_invalid_mask(
     uint32_t public_count,
-    uint64_t public_gnss_ns,
     uint64_t public_ocxo1_ns,
     uint64_t public_ocxo2_ns,
     const clock_science_row_t& ocxo1_science,
-    const clock_science_row_t& ocxo2_science,
-    const clocks_alpha_ocxo_counterledger_snapshot_t& ocxo1_counterledger,
-    const clocks_alpha_ocxo_counterledger_snapshot_t& ocxo2_counterledger) {
-  if (!clocks_ocxo_counterledger_mode_enabled()) return true;
-  if (public_count <= 2U) return true;
-  if (!clocks_watchdog_campaign_armed()) return true;
-  if (g_recover_reattach_degraded_active) return true;
-  if (g_science_residual_quarantine_last_public_count == public_count) return true;
+    const clock_science_row_t& ocxo2_science) {
+  if (!clocks_ocxo_counterledger_mode_enabled()) return 0U;
+  if (public_count <= 2U) return 0U;
+  if (g_recover_reattach_degraded_active) return 0U;
+  if (g_science_residual_quarantine_last_public_count == public_count) return 0U;
 
-  const bool ocxo1_ok = clocks_beta_ocxo_science_custody_ok(
-      ocxo1_science, public_ocxo1_ns);
-  const bool ocxo2_ok = clocks_beta_ocxo_science_custody_ok(
-      ocxo2_science, public_ocxo2_ns);
-  if (ocxo1_ok && ocxo2_ok) return true;
-
-  Payload p;
-  p.add("schema", "CLOCKS_BETA_OCXO_SCIENCE_CUSTODY_V1");
-  p.add("reason", "beta_ocxo_science_custody_invalid");
-  p.add("source", "TEENSY_CLOCKS_BETA_PRE_PUBLISH_COURT");
-  p.add("campaign", campaign_name);
-  p.add("campaign_seconds", campaign_seconds);
-  p.add("public_count", public_count);
-  p.add("public_gnss_ns", public_gnss_ns);
-  p.add("ocxo1_public_ns", public_ocxo1_ns);
-  p.add("ocxo2_public_ns", public_ocxo2_ns);
-  p.add("ocxo1_ok", ocxo1_ok);
-  p.add("ocxo2_ok", ocxo2_ok);
-  p.add("counterledger_mode", true);
-  p.add("court", "public_ocxo_clockface_requires_valid_phaseledger_science");
-
-  Payload violations;
-  if (!ocxo1_ok) {
-    clocks_beta_add_ocxo_science_custody_violation(
-        violations,
-        "ocxo1",
-        ocxo1_science,
-        ocxo1_counterledger,
-        public_ocxo1_ns);
+  uint32_t mask = 0U;
+  if (!clocks_beta_ocxo_science_custody_ok(
+          ocxo1_science, public_ocxo1_ns)) {
+    mask |= TIMEBASE_CANDIDATE_INVALID_OCXO1_CUSTODY;
   }
-  if (!ocxo2_ok) {
-    clocks_beta_add_ocxo_science_custody_violation(
-        violations,
-        "ocxo2",
-        ocxo2_science,
-        ocxo2_counterledger,
-        public_ocxo2_ns);
+  if (!clocks_beta_ocxo_science_custody_ok(
+          ocxo2_science, public_ocxo2_ns)) {
+    mask |= TIMEBASE_CANDIDATE_INVALID_OCXO2_CUSTODY;
   }
-  p.add_object("violations", violations);
-
-  clocks_watchdog_anomaly_payload("beta_ocxo_science_custody_invalid",
-                                  p,
-                                  public_count,
-                                  (!ocxo1_ok ? 1U : 0U) |
-                                      (!ocxo2_ok ? 2U : 0U),
-                                  ocxo1_counterledger.last_phase_resolve_reason_id,
-                                  ocxo2_counterledger.last_phase_resolve_reason_id);
-  return false;
+  return mask;
 }
 
 static void floorline_science_build_ocxo(
@@ -6229,19 +6080,23 @@ static void floorline_science_build_ocxo(
 }
 
 
+
 static uint32_t beta_abs_i32_to_u32(int32_t value) {
   return (value < 0) ? (uint32_t)(-(int64_t)value) : (uint32_t)value;
 }
 
+
 static bool beta_abs_i32_within_gate(int32_t value, uint32_t gate) {
   return beta_abs_i32_to_u32(value) <= gate;
 }
+
 
 static void campaign_start_prologue_set_reason(const char* reason) {
   safeCopy(g_start_prologue_last_reason,
            sizeof(g_start_prologue_last_reason),
            reason ? reason : "prologue");
 }
+
 
 static bool campaign_start_prologue_fetch_forensics(
     clocks_alpha_lane_forensics_t& vclock_f,
@@ -6266,6 +6121,7 @@ static bool campaign_start_prologue_fetch_forensics(
   }
   return true;
 }
+
 
 static bool campaign_start_prologue_consume_private_candidate(
     bool vclock_valid,
@@ -6338,6 +6194,7 @@ static bool campaign_start_prologue_consume_private_candidate(
   return true;
 }
 
+
 static bool campaign_start_prologue_endpoint_fit_ok(
     const clock_science_row_t& row) {
   return row.valid &&
@@ -6345,10 +6202,12 @@ static bool campaign_start_prologue_endpoint_fit_ok(
          row.delta_raw_clock_interval_cycles != 0U;
 }
 
+
 static bool campaign_start_prologue_reference_fit_ok(
     const delta_residual_reference_t& ref) {
   return ref.captured && ref.gnss_valid && ref.gnss_interval_cycles != 0U;
 }
+
 
 static bool campaign_start_prologue_interval_fit_ok(uint32_t current,
                                                     uint32_t previous) {
@@ -6357,6 +6216,7 @@ static bool campaign_start_prologue_interval_fit_ok(uint32_t current,
       beta_signed_delta_u32(current, previous),
       CLOCKS_START_PROLOGUE_FIT_ENDPOINT_GATE_CYCLES);
 }
+
 
 static bool campaign_start_prologue_private_pps0_continuity_ok(
     bool vclock_valid,
@@ -6455,28 +6315,30 @@ static bool campaign_start_prologue_probe_public_pps1(
     return false;
   }
 
-  if (!campaign_start_prologue_reference_fit_ok(g_delta_previous_vclock_reference)) {
+  if (!campaign_start_prologue_reference_fit_ok(
+          g_delta_previous_vclock_reference)) {
     campaign_start_prologue_set_reason("private_gnss_reference_missing");
     return false;
   }
 
-  // Public PPS 1 must not be allowed to inherit a startup/transient private
-  // PPS 0 interval.  Delta Cycles intentionally compares the OCXO interval
-  // published on the current PPS/VCLOCK row against the previous private
-  // PPS/VCLOCK reference.  If that hidden predecessor was captured across
-  // SmartZero/launch acquisition turbulence, the first public residual can be
-  // poisoned even though all current-row antecedents are nonzero and lawful.
-  // Require the private PPS0 interval and the candidate PPS1 interval to be
-  // continuous on every observed rail; otherwise promote this candidate to the
-  // new private PPS0 and try again on the next row.
+  // The private PPS0 is a continuity witness.  The candidate PPS1 itself uses
+  // the current same-row selected PPS/VCLOCK interval, matching the modern
+  // TIMEBASE_FRAGMENT science path.  Do not resurrect the retired delayed-row
+  // Delta alignment here.
   if (!campaign_start_prologue_private_pps0_continuity_ok(
           vclock_valid, vclock_f, ocxo1_valid, ocxo1_f,
           ocxo2_valid, ocxo2_f)) {
     return false;
   }
 
+  const delta_residual_bookend_t saved_v = g_delta_vclock_bookends;
   const delta_residual_bookend_t saved_o1 = g_delta_ocxo1_bookends;
   const delta_residual_bookend_t saved_o2 = g_delta_ocxo2_bookends;
+
+  const delta_residual_reference_t candidate_reference =
+      delta_residual_capture_vclock_reference(
+          1U, vclock_valid, vclock_f);
+
   g_beta_probe_floorline_o1 = floorline_science_totals_t{};
   g_beta_probe_floorline_o2 = floorline_science_totals_t{};
 
@@ -6487,7 +6349,7 @@ static bool campaign_start_prologue_probe_public_pps1(
       time_clock_id_t::OCXO1,
       1U,
       CLOCKS_BETA_NS_PER_SECOND,
-      g_delta_previous_vclock_reference,
+      candidate_reference,
       vclock_valid,
       vclock_f,
       ocxo1_valid,
@@ -6498,18 +6360,23 @@ static bool campaign_start_prologue_probe_public_pps1(
       time_clock_id_t::OCXO2,
       1U,
       CLOCKS_BETA_NS_PER_SECOND,
-      g_delta_previous_vclock_reference,
+      candidate_reference,
       vclock_valid,
       vclock_f,
       ocxo2_valid,
       ocxo2_f,
       g_beta_probe_floorline_o2);
 
-  // Probe only: restore the real bookends so the public path can consume this
-  // exact candidate once, with Welfords/totals still at n=0.
+  // Probe only.  The public path below must consume this exact candidate once,
+  // including its current VCLOCK and OCXO FloorLine bookends.
+  g_delta_vclock_bookends = saved_v;
   g_delta_ocxo1_bookends = saved_o1;
   g_delta_ocxo2_bookends = saved_o2;
 
+  if (!campaign_start_prologue_reference_fit_ok(candidate_reference)) {
+    campaign_start_prologue_set_reason("candidate_gnss_reference_missing");
+    return false;
+  }
   if (!o1.valid || !o2.valid) {
     campaign_start_prologue_set_reason("waiting_for_delta_observed_valid");
     return false;
@@ -6525,6 +6392,7 @@ static bool campaign_start_prologue_probe_public_pps1(
 
   return true;
 }
+
 
 static void campaign_start_prologue_abort_launch(const char* reason) {
   campaign_start_prologue_set_reason(reason ? reason : "start_handoff_timeout");
@@ -6553,67 +6421,10 @@ static bool campaign_start_prologue_should_hold(void) {
   vclock_f = clocks_alpha_lane_forensics_t{};
   ocxo1_f = clocks_alpha_lane_forensics_t{};
   ocxo2_f = clocks_alpha_lane_forensics_t{};
+
   bool vclock_valid = false;
   bool ocxo1_valid = false;
   bool ocxo2_valid = false;
-
-  if (clocks_ocxo_counterledger_mode_enabled()) {
-    if (!campaign_start_handoff_ready()) {
-      if (g_start_handoff_launch_wait_count != UINT32_MAX) {
-        g_start_handoff_launch_wait_count++;
-      }
-      if (g_start_handoff_launch_wait_count >=
-          CLOCKS_START_HANDOFF_TIMEOUT_CANDIDATES) {
-        campaign_start_prologue_abort_launch("phaseledger_start_handoff_timeout");
-        return true;
-      }
-      campaign_start_prologue_set_reason(g_start_phaseledger_last_reason);
-      return true;
-    }
-
-    g_start_handoff_launch_wait_count = 0;
-
-    if (!campaign_start_prologue_fetch_forensics(vclock_f, ocxo1_f, ocxo2_f,
-                                                 vclock_valid, ocxo1_valid,
-                                                 ocxo2_valid)) {
-      return true;
-    }
-
-    // CounterLedger/PhaseLedger uses the hardware counter + phase suffix for
-    // public OCXO ns, but public PPS1 is still an interval population sample.
-    // Use the same private PPS0 -> candidate PPS1 observed-DWT continuity
-    // witness that protects Delta Cycles.  DWT is not authoring the public
-    // PhaseLedger value here; it is only deciding whether the launch bookend is
-    // clean enough to enter the public campaign population.
-    if (campaign_start_prologue_probe_public_pps1(vclock_valid, vclock_f,
-                                                  ocxo1_valid, ocxo1_f,
-                                                  ocxo2_valid, ocxo2_f)) {
-      g_start_handoff_commit_count++;
-      campaign_start_prologue_set_reason("phaseledger_release_public_pps1");
-      return false;
-    }
-
-    const bool private_limit_reached =
-        g_start_prologue_private_candidate_count >=
-        CLOCKS_START_PROLOGUE_MAX_PRIVATE_CANDIDATES;
-    if (private_limit_reached) {
-      g_start_prologue_private_limit_count++;
-    }
-
-    (void)campaign_start_prologue_consume_private_candidate(
-        vclock_valid,
-        vclock_f,
-        ocxo1_valid,
-        ocxo1_f,
-        ocxo2_valid,
-        ocxo2_f,
-        private_limit_reached
-            ? "phaseledger_private_limit_still_holding"
-            : (g_start_prologue_reference_ready
-                  ? "phaseledger_private_pps0_refreshed_after_probe_reject"
-                  : "phaseledger_private_pps0_seeded"));
-    return true;
-  }
 
   if (!campaign_start_handoff_ready()) {
     if (g_start_handoff_launch_wait_count != UINT32_MAX) {
@@ -6621,32 +6432,55 @@ static bool campaign_start_prologue_should_hold(void) {
     }
     if (g_start_handoff_launch_wait_count >=
         CLOCKS_START_HANDOFF_TIMEOUT_CANDIDATES) {
-      campaign_start_prologue_abort_launch("start_handoff_timeout");
+      campaign_start_prologue_abort_launch(
+          clocks_ocxo_counterledger_mode_enabled()
+              ? "phaseledger_start_handoff_timeout"
+              : "start_handoff_timeout");
       return true;
     }
-    campaign_start_prologue_set_reason("waiting_for_start_handoff");
+    campaign_start_prologue_set_reason(
+        clocks_ocxo_counterledger_mode_enabled()
+            ? g_start_phaseledger_last_reason
+            : "waiting_for_start_handoff");
+    return true;
+  }
+
+  // A ready handoff is not enough if the current observed DWT bookends have
+  // not arrived yet.  Keep the same bounded launch wait active through this
+  // final evidence-acquisition step so START cannot become silently infinite.
+  if (!campaign_start_prologue_fetch_forensics(
+          vclock_f, ocxo1_f, ocxo2_f,
+          vclock_valid, ocxo1_valid, ocxo2_valid)) {
+    if (g_start_handoff_launch_wait_count != UINT32_MAX) {
+      g_start_handoff_launch_wait_count++;
+    }
+    if (g_start_handoff_launch_wait_count >=
+        CLOCKS_START_HANDOFF_TIMEOUT_CANDIDATES) {
+      campaign_start_prologue_abort_launch(
+          "start_observed_bookend_timeout");
+    }
     return true;
   }
   g_start_handoff_launch_wait_count = 0;
 
-  if (!campaign_start_prologue_fetch_forensics(vclock_f, ocxo1_f, ocxo2_f,
-                                               vclock_valid, ocxo1_valid,
-                                               ocxo2_valid)) {
-    return true;
-  }
-
-  if (campaign_start_prologue_probe_public_pps1(vclock_valid, vclock_f,
-                                                ocxo1_valid, ocxo1_f,
-                                                ocxo2_valid, ocxo2_f)) {
+  if (campaign_start_prologue_probe_public_pps1(
+          vclock_valid, vclock_f,
+          ocxo1_valid, ocxo1_f,
+          ocxo2_valid, ocxo2_f)) {
     g_start_handoff_commit_count++;
+    campaign_start_prologue_set_reason(
+        clocks_ocxo_counterledger_mode_enabled()
+            ? "phaseledger_release_public_pps1"
+            : "release_public_pps1");
     return false;
   }
 
-  const bool private_limit_reached =
-      g_start_prologue_private_candidate_count >=
-      CLOCKS_START_PROLOGUE_MAX_PRIVATE_CANDIDATES;
-  if (private_limit_reached) {
+  if (g_start_prologue_private_candidate_count >=
+      CLOCKS_START_PROLOGUE_MAX_PRIVATE_CANDIDATES) {
     g_start_prologue_private_limit_count++;
+    campaign_start_prologue_abort_launch(
+        "start_private_bookend_timeout");
+    return true;
   }
 
   (void)campaign_start_prologue_consume_private_candidate(
@@ -6656,13 +6490,18 @@ static bool campaign_start_prologue_should_hold(void) {
       ocxo1_f,
       ocxo2_valid,
       ocxo2_f,
-      private_limit_reached
-          ? "private_limit_still_holding"
-          : (g_start_prologue_reference_ready
-                ? "private_pps0_refreshed_after_probe_reject"
-                : "private_pps0_seeded"));
+      g_start_prologue_reference_ready
+          ? (clocks_ocxo_counterledger_mode_enabled()
+                 ? "phaseledger_private_pps0_refreshed_after_probe_reject"
+                 : "private_pps0_refreshed_after_probe_reject")
+          : (clocks_ocxo_counterledger_mode_enabled()
+                 ? "phaseledger_private_pps0_seeded"
+                 : "private_pps0_seeded"));
   return true;
 }
+
+
+
 
 static FLASHMEM void payload_add_clock_science_common(Payload& science,
                                              const clock_science_row_t& row) {
@@ -8720,24 +8559,18 @@ void clocks_beta_pps(void) {
     return;
   }
 
-  // ── Publication handoff wait ──
-  //
-  // This is not row burial.  START may hold here while it builds a private
-  // PPS0 and proves that the next candidate can become a science-complete
-  // public PPS1.  Campaign time has not advanced, Welfords are still empty,
-  // and no public TIMEBASE identity is skipped.  RECOVER publishes immediately
-  // on the first PPS after the recovered base.
+  // START privately acquires a lawful PPS0 bookend while campaign_seconds
+  // remains zero.  These are not screened campaign rows: public campaign time
+  // has not begun.  Once PPS1 is released, every public identity is emitted.
   if (campaign_warmup_consume_one_candidate_record()) {
     timebase_build_stage(TIMEBASE_BUILD_STAGE_WARMUP_GATE);
-    publish_dac_tick("HANDOFF_WAIT_GATE");
+    publish_dac_tick("WARMUP_GATE");
     return;
   }
 
-  if (recover_reattach_should_hold()) {
-    timebase_build_stage(TIMEBASE_BUILD_STAGE_RECOVER_REATTACH_GATE);
-    publish_dac_tick("RECOVER_REATTACH_GATE");
-    return;
-  }
+  // RECOVER resumes an existing public timeline, so its reattachment state is
+  // observational here and candidate identities continue to be emitted.
+  (void)recover_reattach_should_hold();
 
   g_timebase_candidate_count++;
   g_timebase_last_candidate_campaign_seconds = campaign_seconds;
@@ -8997,19 +8830,15 @@ void clocks_beta_pps(void) {
                                           ocxo1_floorline_science,
                                           ocxo2_floorline_science);
 
-  if (!clocks_beta_public_ocxo_science_court(public_count,
-                                             public_gnss_ns,
-                                             public_ocxo1_ns,
-                                             public_ocxo2_ns,
-                                             ocxo1_floorline_science,
-                                             ocxo2_floorline_science,
-                                             ocxo1_counterledger,
-                                             ocxo2_counterledger)) {
-    g_timebase_watchdog_gate_count++;
-    timebase_build_stage(TIMEBASE_BUILD_STAGE_WATCHDOG_GATE);
-    publish_dac_tick("OCXO_SCIENCE_CUSTODY_COURT");
-    return;
-  }
+  // Preserve the former pre-publication court as compact evidence.  The Pi
+  // decides whether this candidate becomes a canonical TIMEBASE row.
+  const uint32_t ocxo_science_invalid_mask =
+      clocks_beta_public_ocxo_science_invalid_mask(
+          public_count,
+          public_ocxo1_ns,
+          public_ocxo2_ns,
+          ocxo1_floorline_science,
+          ocxo2_floorline_science);
 
   // ── Legacy cycle-domain residual diagnostics ──
   //
@@ -9139,8 +8968,12 @@ void clocks_beta_pps(void) {
   // frame latches with "TIMEBASE_FRAGMENT" attribution.
   ZPNET_SENTINEL_ENTER(ZPNET_SENTINEL_SLOT_AUX3, "TIMEBASE_FRAGMENT");
 
+  Payload& p = g_timebase_candidate_payload;
+  Payload& f = g_timebase_forensics_payload;
+  p.clear();
+  f.clear();
+
   {
-    Payload p;
     payload_add_timebase_pair_identity(p,
                                        "TIMEBASE_FRAGMENT_V4",
                                        "fragment_version",
@@ -9150,6 +8983,8 @@ void clocks_beta_pps(void) {
                                        public_gnss_ns);
     p.add("paired_forensics_topic", "TIMEBASE_FORENSICS");
     p.add("paired_forensics_schema", "TIMEBASE_FORENSICS_V1");
+    p.add("timebase_message_version", 1U);
+    p.add("forensics_mode", "EMBEDDED");
     p.add("campaign", campaign_name);
     p.add("campaign_state", clocks_campaign_state_name(campaign_state));
     p.add("campaign_seconds", campaign_seconds);
@@ -9183,6 +9018,13 @@ void clocks_beta_pps(void) {
     p.add("recover_degraded_science_hold", recover_degraded_science_hold);
     p.add("recover_reattach_stalled", (bool)g_recover_reattach_stalled);
     p.add("recover_reattach_reason", g_recover_reattach_last_reason);
+    p.add("teensy_evidence_invalid_mask", ocxo_science_invalid_mask);
+    p.add("teensy_evidence_status",
+          ocxo_science_invalid_mask == 0U ? "NOMINAL" : "CUSTODY_WARNING");
+    p.add("teensy_evidence_reason",
+          ocxo_science_invalid_mask == 0U
+              ? "none"
+              : "beta_ocxo_science_custody_invalid");
 
     // Minimal flat compatibility spine.  TIMEBASE stores this fragment as an
     // opaque object, but Pi-side indexing and older tools still need these few
@@ -9351,40 +9193,14 @@ void clocks_beta_pps(void) {
     timebase_build_stage(TIMEBASE_BUILD_STAGE_BUILD_COMPLETE);
 
     timebase_build_stage(TIMEBASE_BUILD_STAGE_ASSIGN_LAST_FRAGMENT);
-    // Heap discipline: do not retain/copy the just-built fragment on Teensy.
+    // The candidate remains in the reusable RAM2 Payload until its embedded
+    // forensics child has been attached and the single publish returns.
     g_timebase_assign_last_fragment_count++;
     g_timebase_last_assign_campaign_seconds = campaign_seconds;
-
-    if (clocks_watchdog_publication_blocked()) {
-      g_timebase_watchdog_gate_count++;
-      timebase_build_stage(TIMEBASE_BUILD_STAGE_WATCHDOG_GATE);
-      publish_dac_tick("WATCHDOG_GATE_PRE_FRAGMENT_PUBLISH");
-      ZPNET_SENTINEL_EXIT(ZPNET_SENTINEL_SLOT_AUX3);
-      return;
-    }
-
-    g_timebase_publish_attempt_count++;
-    g_timebase_last_publish_attempt_campaign_seconds = campaign_seconds;
-    timebase_build_stage(TIMEBASE_BUILD_STAGE_PUBLISH_ATTEMPT);
-    clocks_stack_witness_note_hot(CLOCKS_STACK_CONTEXT_BETA_PPS_PUBLISH);
-    publish("TIMEBASE_FRAGMENT", p);
-
-    g_timebase_publish_return_count++;
-    g_timebase_last_publish_return_campaign_seconds = campaign_seconds;
-    timebase_build_stage(TIMEBASE_BUILD_STAGE_PUBLISH_RETURN);
   }
 
-  ZPNET_SENTINEL_EXIT(ZPNET_SENTINEL_SLOT_AUX3);
-
-  if (!TIMEBASE_FORENSICS_PUBLISH_ENABLED) {
-    g_timebase_forensics_disabled_count++;
-    clocks_watchdog_arm_campaign_publication();
-    return;
-  }
-
-  // Second control point under suspicion: the paired TIMEBASE_FORENSICS
-  // companion row, verified as its own sentinel scope so a violation names
-  // which of the two builds was on the CPU.
+  // Keep the former forensic sentinel as a distinct attribution region even
+  // though the result is now embedded instead of separately published.
   ZPNET_SENTINEL_ENTER(ZPNET_SENTINEL_SLOT_AUX4, "TIMEBASE_FORENSICS");
 
   {
@@ -9392,7 +9208,6 @@ void clocks_beta_pps(void) {
     g_timebase_last_forensics_build_begin_campaign_seconds = campaign_seconds;
     timebase_build_stage(TIMEBASE_BUILD_STAGE_FORENSICS_BUILD_BEGIN);
 
-    Payload f;
     payload_add_timebase_pair_identity(f,
                                        "TIMEBASE_FORENSICS_V1",
                                        "forensics_version",
@@ -9400,22 +9215,19 @@ void clocks_beta_pps(void) {
                                        "forensics",
                                        public_count,
                                        public_gnss_ns);
+    f.add("embedded", true);
     f.add("paired_fragment_topic", "TIMEBASE_FRAGMENT");
     f.add("paired_fragment_schema", "TIMEBASE_FRAGMENT_V4");
     f.add("paired_fragment_version", 4U);
     payload_add_recovery_continuity_forensics(f, public_count);
 
     if (TIMEBASE_FORENSICS_MINIMAL_PAYLOAD_ENABLED) {
-      // Minimal companion mode: publish just enough forensic identity and
-      // provenance to satisfy Pi-side pair assembly while the larger
-      // TIMEBASE_FORENSICS body is temporarily out of the blast radius.
-      //
-      // This is intentionally not a clock-authority surface.  The full deep
-      // forensics remain available through focused reports; this row exists so
-      // TIMEBASE_FRAGMENT identity N always has a matching forensics identity N.
+      // Minimal embedded mode: retain the raw-cycle evidence needed by Pi-side
+      // adjudication and focused tools without reintroducing the large deep
+      // forensic body into the one-second candidate.
       g_timebase_forensics_minimal_count++;
       f.add("minimal", true);
-      f.add("temporary_safety_mode", "MINIMAL_PAIR_ONLY");
+      f.add("temporary_safety_mode", "MINIMAL_EMBEDDED");
 
       if (TIMEBASE_FORENSICS_MINIMAL_HEALTH_FIELDS_ENABLED) {
         f.add("pps_vclock_edge_available", pps_vclock_edge_forensics_valid);
@@ -9687,30 +9499,43 @@ void clocks_beta_pps(void) {
     g_timebase_last_forensics_build_complete_campaign_seconds = campaign_seconds;
     timebase_build_stage(TIMEBASE_BUILD_STAGE_FORENSICS_BUILD_COMPLETE);
 
-    if (clocks_watchdog_publication_blocked()) {
-      g_timebase_watchdog_gate_count++;
-      timebase_build_stage(TIMEBASE_BUILD_STAGE_WATCHDOG_GATE);
-      publish_dac_tick("WATCHDOG_GATE_PRE_FORENSICS_PUBLISH");
-      ZPNET_SENTINEL_EXIT(ZPNET_SENTINEL_SLOT_AUX4);
-      return;
-    }
-
+    // Legacy "forensics publish" counters now describe the embed operation.
     g_timebase_forensics_publish_attempt_count++;
     g_timebase_last_forensics_publish_attempt_campaign_seconds = campaign_seconds;
     timebase_build_stage(TIMEBASE_BUILD_STAGE_FORENSICS_PUBLISH_ATTEMPT);
-    publish("TIMEBASE_FORENSICS", f);
+    const bool forensics_embedded = p.add_object("forensics", f);
+    p.add("forensics_embedded", forensics_embedded);
+    p.add("forensics_schema", "TIMEBASE_FORENSICS_V1");
 
     g_timebase_forensics_publish_return_count++;
     g_timebase_last_forensics_publish_return_campaign_seconds = campaign_seconds;
     timebase_build_stage(TIMEBASE_BUILD_STAGE_FORENSICS_PUBLISH_RETURN);
-    clocks_beta_feature_set_cached("TIMEBASE_PUBLICATION",
-                                   g_clocks_feature_timebase_publication,
-                                   system_feature_status_t::NOMINAL,
-                                   true);
-    clocks_watchdog_arm_campaign_publication();
   }
 
   ZPNET_SENTINEL_EXIT(ZPNET_SENTINEL_SLOT_AUX4);
+
+  // One publish attempt per PPS identity.  Even an embed failure is emitted;
+  // the Pi envelope court will log and drop that candidate rather than mistake
+  // firmware qualification silence for a dead TIMEBASE pipeline.
+  g_timebase_publish_attempt_count++;
+  g_timebase_last_publish_attempt_campaign_seconds = campaign_seconds;
+  timebase_build_stage(TIMEBASE_BUILD_STAGE_PUBLISH_ATTEMPT);
+  clocks_stack_witness_note_hot(CLOCKS_STACK_CONTEXT_BETA_PPS_PUBLISH);
+  publish("TIMEBASE_FRAGMENT", p);
+
+  g_timebase_publish_return_count++;
+  g_timebase_last_publish_return_campaign_seconds = campaign_seconds;
+  timebase_build_stage(TIMEBASE_BUILD_STAGE_PUBLISH_RETURN);
+
+  p.clear();
+  f.clear();
+
+  clocks_beta_feature_set_cached("TIMEBASE_PUBLICATION",
+                                 g_clocks_feature_timebase_publication,
+                                 system_feature_status_t::NOMINAL,
+                                 true);
+  clocks_watchdog_arm_campaign_publication();
+  ZPNET_SENTINEL_EXIT(ZPNET_SENTINEL_SLOT_AUX3);
 }
 
 // ============================================================================
