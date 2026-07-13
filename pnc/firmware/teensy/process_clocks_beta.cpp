@@ -13581,6 +13581,57 @@ static FLASHMEM Payload cmd_set_dac(const Payload& args) {
 }
 
 // ============================================================================
+// GNSS Confession ingress and report
+// ============================================================================
+
+struct gnss_confession_state_t {
+  char     gnss_time[32] = {0};
+  int32_t  pps_timing_error_ns = 0;
+  uint32_t source_sequence = 0;
+  uint32_t receive_count = 0;
+  uint32_t reject_count = 0;
+};
+
+static gnss_confession_state_t g_gnss_confession;
+
+static FLASHMEM void on_gnss_confession(const Payload& payload) {
+  const char* schema = payload.getString("schema");
+  const char* gnss_time = payload.getString("gnss_time");
+  int32_t pps_timing_error_ns = 0;
+  uint32_t source_sequence = 0;
+
+  if (schema == nullptr ||
+      strcmp(schema, "GNSS_CONFESSION_V1") != 0 ||
+      gnss_time == nullptr ||
+      !payload.tryGetInt("pps_timing_error_ns", pps_timing_error_ns) ||
+      !payload.tryGetUInt("sequence", source_sequence)) {
+    g_gnss_confession.reject_count++;
+    return;
+  }
+
+  snprintf(g_gnss_confession.gnss_time,
+           sizeof(g_gnss_confession.gnss_time),
+           "%s",
+           gnss_time);
+  g_gnss_confession.pps_timing_error_ns = pps_timing_error_ns;
+  g_gnss_confession.source_sequence = source_sequence;
+  g_gnss_confession.receive_count++;
+}
+
+static FLASHMEM Payload cmd_report_gnss_confession(const Payload&) {
+  Payload p;
+  p.add("report", "CLOCKS_GNSS_CONFESSION");
+  p.add("topic_schema", "GNSS_CONFESSION_V1");
+  p.add("source", "GF-8802_TPS4");
+  p.add("receive_count", g_gnss_confession.receive_count);
+  p.add("reject_count", g_gnss_confession.reject_count);
+  p.add("source_sequence", g_gnss_confession.source_sequence);
+  p.add("gnss_time", g_gnss_confession.gnss_time);
+  p.add("pps_timing_error_ns", g_gnss_confession.pps_timing_error_ns);
+  return p;
+}
+
+// ============================================================================
 // Process registration
 // ============================================================================
 
@@ -13627,6 +13678,7 @@ static const process_command_entry_t CLOCKS_COMMANDS[] = {
   { "REPORT_ALPHA_FLOW_OCXO2",  cmd_report_alpha_flow_ocxo2  },
   { "REPORT_PREDICTION",       cmd_report_prediction       },
   { "REPORT_STATS",      cmd_report_stats      },
+  { "REPORT_GNSS_CONFESSION", cmd_report_gnss_confession },
   { "REPORT_DAC",        cmd_report_dac        },
   { "DITHER_STATUS",     cmd_dither_status     },
   { "DITHER_ENABLE",     cmd_dither_enable     },
@@ -13639,6 +13691,7 @@ static const process_command_entry_t CLOCKS_COMMANDS[] = {
 static const process_subscription_entry_t CLOCKS_SUBSCRIPTIONS[] = {
   { "TIMEBASE_FRAGMENT", on_timebase_fragment },
   { "FEATURE_STATUS",    on_feature_status    },
+  { "GNSS_CONFESSION",   on_gnss_confession   },
   { nullptr, nullptr },
 };
 

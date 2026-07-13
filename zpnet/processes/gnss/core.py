@@ -63,7 +63,7 @@ from typing import Dict, Optional, Set, TextIO
 
 import serial
 
-from zpnet.processes.processes import server_setup
+from zpnet.processes.processes import publish, server_setup
 from zpnet.shared.db import open_db
 from zpnet.shared.logger import setup_logging
 
@@ -213,6 +213,12 @@ class GnssState:
     tps4_freq_error_ppb: int = 0           # VCLK deviation from nominal
     tps4_learning_time_s: int = 0          # seconds in fine-lock learning
     tps4_holdover_avail_s: int = 0         # holdover seconds remaining
+
+    # GNSS Confession publication custody
+    tps4_revision: int = 0
+    confession_last_tps4_revision: int = 0
+    confession_publish_count: int = 0
+    confession_last_gnss_time: str = ""
 
     # ---------------------------------------------------------------
     # TPS1 (CRW) — Time and Leap Second
@@ -412,6 +418,53 @@ def _send_nmea(body: str) -> bool:
             return False
 
 # ------------------------------------------------------------------
+# GNSS Confession publication
+# ------------------------------------------------------------------
+
+def _gnss_time_key() -> Optional[str]:
+    if not (GNSS.has_time and GNSS.has_date):
+        return None
+
+    return (
+        f"{GNSS.year:04d}-{GNSS.month:02d}-{GNSS.day:02d}"
+        f"T{GNSS.hour:02d}:{GNSS.minute:02d}:{GNSS.second:02d}Z"
+    )
+
+def publish_gnss_confession_if_ready() -> None:
+    """
+    Publish one GF-8802 PPS timing confession for each forecast UTC PPS.
+
+    RMC supplies the upcoming PPS identity; TPS4 supplies the receiver's
+    timing error.  This helper is called after either parser so sentence
+    order within the receiver's early NMEA burst does not matter.
+    """
+    gnss_time = _gnss_time_key()
+    if gnss_time is None or not GNSS.has_discipline:
+        return
+
+    if gnss_time == GNSS.confession_last_gnss_time:
+        return
+
+    if GNSS.tps4_revision == GNSS.confession_last_tps4_revision:
+        return
+
+    sequence = GNSS.confession_publish_count + 1
+    publish(
+        "GNSS_CONFESSION",
+        {
+            "schema": "GNSS_CONFESSION_V1",
+            "source": "GF-8802_TPS4",
+            "sequence": sequence,
+            "gnss_time": gnss_time,
+            "pps_timing_error_ns": GNSS.tps4_pps_timing_error_ns,
+        },
+    )
+
+    GNSS.confession_publish_count = sequence
+    GNSS.confession_last_gnss_time = gnss_time
+    GNSS.confession_last_tps4_revision = GNSS.tps4_revision
+
+# ------------------------------------------------------------------
 # Sentence parsers — standard NMEA
 # ------------------------------------------------------------------
 
@@ -438,6 +491,8 @@ def parse_rmc(line: str) -> None:
     GNSS.month = int(date_s[2:4])
     GNSS.year  = 2000 + int(date_s[4:6])
     GNSS.has_date = True
+
+    publish_gnss_confession_if_ready()
 
     GNSS.has_position = True
 
@@ -512,6 +567,8 @@ def parse_crz(line: str) -> None:
         # parts[8] is reserved
         GNSS.tps4_learning_time_s = int(parts[9])
         GNSS.tps4_holdover_avail_s = int(strip_checksum(parts[10]))
+        GNSS.tps4_revision += 1
+        publish_gnss_confession_if_ready()
     except (IndexError, ValueError) as e:
         logging.warning("[parse_crz] failed to parse TPS4: %s — %s", e, line)
 
