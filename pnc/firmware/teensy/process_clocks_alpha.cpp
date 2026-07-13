@@ -7050,18 +7050,18 @@ volatile bool     g_alpha_runtime_epoch_capture_last_cap_vclock_valid = false;
 volatile bool     g_alpha_runtime_epoch_capture_last_cap_all_lanes_valid = false;
 
 bool clocks_alpha_recover_rearm_interrupt_service(void) {
-  // Boot establishes these subscriptions once in process_clocks_init().  A
-  // warm RECOVER must not subscribe again, but it must be able to recover from
-  // any STOP/abort/publication-blackout path that left a runtime inactive or an
-  // OCXO compare ladder disarmed.  interrupt_start() is the process_interrupt
-  // owner-approved, idempotent way to restore both runtime activity and the
-  // lane-local cadence from the already-installed logical grid.
+  // Boot establishes these subscriptions once in process_clocks_init().  Warm
+  // RECOVER must preserve healthy always-on service exactly as it stands, while
+  // still reviving a runtime/cadence that a prior STOP or fault actually left
+  // inactive.  interrupt_ensure_service() owns that distinction.  In
+  // particular, it does not reset the live VCLOCK anchor ring merely because
+  // the Pi asked firmware to verify service.
   const bool vclock_ok =
-      interrupt_start(interrupt_subscriber_kind_t::VCLOCK);
+      interrupt_ensure_service(interrupt_subscriber_kind_t::VCLOCK);
   const bool ocxo1_ok =
-      interrupt_start(interrupt_subscriber_kind_t::OCXO1);
+      interrupt_ensure_service(interrupt_subscriber_kind_t::OCXO1);
   const bool ocxo2_ok =
-      interrupt_start(interrupt_subscriber_kind_t::OCXO2);
+      interrupt_ensure_service(interrupt_subscriber_kind_t::OCXO2);
   return vclock_ok && ocxo1_ok && ocxo2_ok;
 }
 

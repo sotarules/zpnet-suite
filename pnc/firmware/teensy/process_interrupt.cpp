@@ -12862,6 +12862,113 @@ bool interrupt_start(interrupt_subscriber_kind_t kind) {
                                        OCXO_CADENCE_REASON_START);
 }
 
+bool interrupt_ensure_service(interrupt_subscriber_kind_t kind) {
+  interrupt_subscriber_runtime_t* rt = runtime_for(kind);
+  if (!rt || !rt->desc || !rt->subscribed || !rt->sub.on_event) {
+    return false;
+  }
+
+  if (kind == interrupt_subscriber_kind_t::VCLOCK) {
+    // The native VCLOCK heartbeat is normally always-on, even while subscriber
+    // publication is stopped.  A warm RECOVER must therefore be a no-op when
+    // all three service predicates are already true.  In particular, do not
+    // call interrupt_start(): that function deliberately begins a new
+    // publication epoch and sets g_pvc_anchor_reset_pending.
+    if (rt->active &&
+        g_vclock_lane.active &&
+        g_vclock_heartbeat_armed) {
+      return true;
+    }
+
+    const bool heartbeat_was_armed = g_vclock_heartbeat_armed;
+    {
+      const uint32_t prior_basepri = interrupt_priority0_guard_enter();
+      if (!rt->active) {
+        interrupt_dispatch_invalidate_locked(*rt);
+      }
+      rt->active = true;
+      interrupt_priority0_guard_exit(prior_basepri);
+    }
+
+    g_vclock_lane.active = true;
+
+    if (heartbeat_was_armed) {
+      // interrupt_stop(VCLOCK) leaves the native heartbeat alive and clears
+      // phase_bootstrapped.  Let the next live cadence tooth seed tick_mod_1000
+      // naturally; no anchor reset or mid-second rebootstrap is required.
+      return true;
+    }
+
+    // A genuinely dead native heartbeat is a real service restart.  Rebuild
+    // cadence and request a fresh selected PPS/VCLOCK epoch, but only in this
+    // exceptional path—not for an already-running warm recovery.
+    g_vclock_lane.phase_bootstrapped = false;
+    g_vclock_lane.tick_mod_1000 = 0;
+    vclock_ch2_one_second_disable();
+
+    if (!vclock_heartbeat_arm_timepop()) {
+      const uint32_t prior_basepri = interrupt_priority0_guard_enter();
+      rt->active = false;
+      interrupt_dispatch_invalidate_locked(*rt);
+      interrupt_priority0_guard_exit(prior_basepri);
+      g_vclock_lane.active = false;
+      return false;
+    }
+
+    interrupt_request_pps_rebootstrap();
+    return true;
+  }
+
+  if (ocxo_kind_disabled(kind)) {
+    // A compile-time-disabled lane is intentionally absent, not failed.
+    return true;
+  }
+
+  ocxo_lane_t* lane = ocxo_lane_for(kind);
+  synthetic_clock32_t* clock32 = synthetic_clock_for_kind(kind);
+  if (!lane || !lane->initialized || !clock32) {
+    return false;
+  }
+
+  // cadence_armed can be momentarily false while priority-0 capture hands the
+  // just-fired tooth to the continuation tier.  cadence_enabled is the stable
+  // service predicate: when it is true, the lane owns an active ladder and
+  // must not be restarted from foreground recovery code.
+  if (rt->active && lane->active && lane->cadence_enabled) {
+    return true;
+  }
+
+  {
+    const uint32_t prior_basepri = interrupt_priority0_guard_enter();
+    if (!rt->active) {
+      interrupt_dispatch_invalidate_locked(*rt);
+    }
+    rt->active = true;
+    interrupt_priority0_guard_exit(prior_basepri);
+  }
+  lane->active = true;
+
+  // Resume from the already-installed logical grid.  Do not reset measurement
+  // witnesses, regression, publication custody, or Alpha's epoch here; the
+  // RECOVER PPS gate owns those deliberate discontinuities.
+  const bool ok = ocxo_lane_start_local_cadence(
+      kind, *lane, *clock32, OCXO_CADENCE_REASON_REARM);
+  if (ok) {
+    return true;
+  }
+
+  ocxo_lane_stop_local_cadence(*lane, OCXO_CADENCE_REASON_STOP);
+  lane->active = false;
+  {
+    const uint32_t prior_basepri = interrupt_priority0_guard_enter();
+    rt->active = false;
+    interrupt_dispatch_invalidate_locked(*rt);
+    interrupt_priority0_guard_exit(prior_basepri);
+  }
+  return false;
+}
+
+
 bool interrupt_stop(interrupt_subscriber_kind_t kind) {
   interrupt_subscriber_runtime_t* rt = runtime_for(kind);
   if (!rt || !rt->desc) return false;

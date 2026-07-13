@@ -1413,6 +1413,15 @@ static uint32_t g_science_residual_quarantine_begin_count = 0;
 static uint32_t g_science_residual_quarantine_consumed_count = 0;
 static uint32_t g_science_residual_quarantine_last_public_count = 0;
 
+// DWT is an always-on calibration rail, but its campaign Welford must not learn
+// from the RECOVER boundary itself.  If a genuinely stopped VCLOCK service has
+// to be rebuilt, or recovery is still aligning/quarantining clock custody, the
+// raw interval remains visible in TIMEBASE forensics while the statistical
+// population records the row as a canonical missing sample.
+static uint32_t g_dwt_welford_recovery_quarantine_count = 0;
+static uint32_t g_dwt_welford_recovery_quarantine_last_public_count = 0;
+static uint32_t g_dwt_welford_recovery_quarantine_last_cycles = 0;
+
 // RECOVER OCXO reattachment gate.  Alpha deliberately cuts OCXO measurement
 // custody during warm recovery.  Beta initially treats recovered candidates as
 // private elapsed seconds while waiting for both OCXO lanes to prove fresh
@@ -2643,9 +2652,10 @@ static bool recover_lifecycle_enter_from_command(const char* reason) {
   g_recover_lifecycle_command_custody_reset_count++;
 
   // A post-flash/power-cycle recovery gets this service restoration from boot.
-  // A live TIMEBASE blackout does not reboot the Teensy, so explicitly reassert
-  // the same VCLOCK/OCXO runtime and compare-cadence service here.  Do this at
-  // command acceptance, before the reattachment timeout starts, and fail the
+  // A live TIMEBASE blackout does not reboot the Teensy, so explicitly ensure
+  // the same VCLOCK/OCXO runtime and compare-cadence service here.  The ensure
+  // path is a strict no-op for healthy lanes; only genuinely inactive service
+  // is resumed.  Do this before the reattachment timeout starts, and fail the
   // RECOVER command rather than spending 32 hidden candidates on dead lanes.
   g_recover_lifecycle_interrupt_service_rearm_count++;
   g_recover_lifecycle_last_interrupt_service_rearm_ok =
@@ -8738,11 +8748,31 @@ void clocks_beta_pps(void) {
   ocxo1_measured_gnss_ticks_64        = campaign_public_ocxo1_ns() / 100ull;
   ocxo2_measured_gnss_ticks_64        = campaign_public_ocxo2_ns() / 100ull;
 
+  const uint32_t public_count = (uint32_t)campaign_seconds;
+
   // ── Welford updates ──
   //
   // DWT sample is fed directly as ppb using the uniform sign convention:
   // positive ppb → Teensy running FAST (measured cycles > expected).
-  {
+  //
+  // RECOVER boundary rows are canonical campaign seconds, so the later
+  // welford gap-advance preserves their cardinality.  They are not lawful DWT
+  // population samples, however: service reattachment, continuity alignment,
+  // and the two-row science quarantine may carry a one-row catch-up interval.
+  // Keep that evidence in the raw clocks, but do not let it poison Welford.
+  const bool dwt_welford_recovery_quarantine =
+      g_recover_reattach_active ||
+      g_recover_reattach_degraded_active ||
+      g_science_residual_quarantine_remaining != 0U ||
+      g_recover_continuity_align_pending ||
+      clocks_campaign_recovery_lifecycle_active();
+
+  if (dwt_welford_recovery_quarantine) {
+    g_dwt_welford_recovery_quarantine_count++;
+    g_dwt_welford_recovery_quarantine_last_public_count = public_count;
+    g_dwt_welford_recovery_quarantine_last_cycles =
+        (uint32_t)g_dwt_cycles_between_pps_vclock;
+  } else {
     const double cycles = (double)g_dwt_cycles_between_pps_vclock;
     const double expected = (double)DWT_EXPECTED_PER_PPS;
     const double dwt_ppb_sample = (cycles - expected) / expected * 1e9;
@@ -8791,7 +8821,6 @@ void clocks_beta_pps(void) {
   // The Alpha PPS-projection snapshots remain courtroom collateral.
   const uint64_t public_gnss_ns   = campaign_public_gnss_ns();
   const uint64_t public_dwt_total = campaign_public_dwt_total();
-  const uint32_t public_count = (uint32_t)campaign_seconds;
 
   recover_continuity_align_if_pending(public_count, public_gnss_ns);
 
@@ -13532,6 +13561,12 @@ static FLASHMEM Payload cmd_report_stats(const Payload&) {
         g_science_residual_quarantine_remaining);
   p.add("recover_science_quarantine_last_public_count",
         g_science_residual_quarantine_last_public_count);
+  p.add("dwt_welford_recovery_quarantine_count",
+        g_dwt_welford_recovery_quarantine_count);
+  p.add("dwt_welford_recovery_quarantine_last_public_count",
+        g_dwt_welford_recovery_quarantine_last_public_count);
+  p.add("dwt_welford_recovery_quarantine_last_cycles",
+        g_dwt_welford_recovery_quarantine_last_cycles);
   p.add("welford_gap_advance_count", g_welford_gap_advance_count);
   p.add("welford_gap_advance_last_public_count",
         g_welford_gap_advance_last_public_count);

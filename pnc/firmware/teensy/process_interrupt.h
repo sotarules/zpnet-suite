@@ -993,6 +993,13 @@ void process_interrupt_register(void);
 
 bool interrupt_subscribe(const interrupt_subscription_t& sub);
 bool interrupt_start(interrupt_subscriber_kind_t kind);
+
+// Idempotent recovery service assertion.  Unlike interrupt_start(), this leaves
+// healthy subscriber, VCLOCK-anchor, cadence-regression, and DWT-publication
+// custody untouched.  It performs a narrow restart only when the requested
+// runtime or lane-local cadence is actually inactive.
+bool interrupt_ensure_service(interrupt_subscriber_kind_t kind);
+
 bool interrupt_stop(interrupt_subscriber_kind_t kind);
 
 void interrupt_request_pps_rebootstrap(void);

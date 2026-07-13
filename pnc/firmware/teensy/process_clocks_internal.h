@@ -1208,11 +1208,11 @@ bool clocks_alpha_ocxo_public_origin_ready(void);
 // must not bridge the outage into the first post-recovery residual.
 //
 // A live warm recovery may arrive after a Pi-side publication blackout while
-// the Teensy itself never rebooted.  Reassert the boot-equivalent subscriber/
-// cadence service before RECOVER waits for fresh OCXO evidence.  This is
-// idempotent and does not replace the installed Alpha epoch or re-subscribe
-// callbacks; it only asks process_interrupt to make all three clock services
-// active again.
+// the Teensy itself never rebooted.  Ensure the boot-equivalent subscriber/
+// cadence service before RECOVER waits for fresh OCXO evidence.  Healthy lanes
+// are left bit-for-bit alone; only an actually inactive runtime/cadence is
+// resumed from the installed grid.  This does not replace the Alpha epoch,
+// re-subscribe callbacks, or reset healthy VCLOCK anchor custody.
 bool clocks_alpha_recover_rearm_interrupt_service(void);
 
 // Beta calls this from the RECOVER gate after the recovery request is observed
