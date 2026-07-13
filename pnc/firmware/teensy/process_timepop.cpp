@@ -114,6 +114,7 @@ static constexpr uint32_t MAX_SLOTS = 16;
 static constexpr uint32_t MAX_ASAP_SLOTS = 8;
 static constexpr uint32_t MAX_ALAP_SLOTS = 4;
 static constexpr uint32_t MAX_DISPATCH_MUTATIONS = 24;
+static constexpr uint32_t MAX_DISPATCH_NAME = 63;
 static constexpr bool     TIMEPOP_IDLE_DWT_WITNESS_ENABLED = true;
 static constexpr uint64_t NS_PER_TICK = 100ULL;
 static constexpr uint32_t MAX_DELAY_TICKS = 0x7FFFFFFFU;
@@ -227,6 +228,7 @@ struct timepop_slot_t {
   timepop_callback_t  callback;
   void*               user_data;
   const char*         name;
+  char                queued_name[MAX_DISPATCH_NAME + 1];
 
   // Timed-slot service priority. Lower numeric value runs first when multiple
   // slots share the same captured CH2 fire fact. This never affects compare
@@ -381,7 +383,7 @@ struct timepop_dispatch_mutation_t {
   bool rearm_in_isr = false;
   timepop_callback_t callback = nullptr;
   void* user_data = nullptr;
-  const char* name = nullptr;
+  char name[MAX_DISPATCH_NAME + 1] = {};
   timepop_priority_t priority = TIMEPOP_PRIORITY_DEFAULT;
   timepop_dispatch_phase_t queued_phase = timepop_dispatch_phase_t::IDLE;
 };
@@ -476,6 +478,8 @@ static volatile uint32_t diag_dispatch_mutation_cancel_applied = 0;
 static volatile uint32_t diag_dispatch_mutation_cancel_noop = 0;
 static volatile uint32_t diag_dispatch_mutation_cancel_failures = 0;
 static volatile uint32_t diag_dispatch_mutation_arm_failures = 0;
+static volatile uint32_t diag_dispatch_mutation_name_copies = 0;
+static volatile uint32_t diag_dispatch_mutation_name_too_long = 0;
 
 static volatile uint32_t diag_isr_count          = 0;
 static volatile uint32_t diag_rearm_count        = 0;
@@ -917,9 +921,34 @@ static bool dispatch_mutation_is_arm(timepop_dispatch_mutation_kind_t kind) {
          kind == timepop_dispatch_mutation_kind_t::ARM_ANCHORED_ISR_COUNTER32;
 }
 
+static bool dispatch_mutation_copy_name(timepop_dispatch_mutation_t& m,
+                                        const char* name) {
+  m.name[0] = '\0';
+  if (!name || !*name) return true;
+
+  size_t length = 0;
+  while (length <= MAX_DISPATCH_NAME && name[length] != '\0') {
+    length++;
+  }
+
+  if (length > MAX_DISPATCH_NAME) {
+    diag_dispatch_mutation_name_too_long++;
+    return false;
+  }
+
+  memcpy(m.name, name, length + 1U);
+  diag_dispatch_mutation_name_copies++;
+  return true;
+}
+
+static inline const char* dispatch_mutation_name_or_null(
+    const timepop_dispatch_mutation_t& m) {
+  return m.name[0] ? m.name : nullptr;
+}
+
 static bool dispatch_mutation_name_equals(const timepop_dispatch_mutation_t& m,
                                           const char* name) {
-  if (!name || !*name || !m.name) return false;
+  if (!name || !*name || !m.name[0]) return false;
   return strcmp(m.name, name) == 0;
 }
 
@@ -1074,7 +1103,7 @@ static timepop_handle_t queue_dispatch_relative_arm(uint64_t delay_gnss_ns,
   m.rearm_in_isr = rearm_in_isr;
   m.callback = callback;
   m.user_data = user_data;
-  m.name = name;
+  if (!dispatch_mutation_copy_name(m, name)) return TIMEPOP_INVALID_HANDLE;
   m.priority = priority;
   return queue_dispatch_arm_mutation(m);
 }
@@ -1100,7 +1129,7 @@ static timepop_handle_t queue_dispatch_absolute_arm(int64_t target_gnss_ns,
   m.isr_callback = isr_callback;
   m.callback = callback;
   m.user_data = user_data;
-  m.name = name;
+  if (!dispatch_mutation_copy_name(m, name)) return TIMEPOP_INVALID_HANDLE;
   m.priority = priority;
   return queue_dispatch_arm_mutation(m);
 }
@@ -1120,7 +1149,7 @@ static timepop_handle_t queue_dispatch_anchored_isr_arm(int64_t base_gnss_ns,
   m.gnss0 = base_gnss_ns;
   m.callback = callback;
   m.user_data = user_data;
-  m.name = name;
+  if (!dispatch_mutation_copy_name(m, name)) return TIMEPOP_INVALID_HANDLE;
   m.priority = priority;
   return queue_dispatch_arm_mutation(m);
 }
@@ -1142,7 +1171,7 @@ static timepop_handle_t queue_dispatch_anchored_isr_counter32_arm(int64_t base_g
   m.u32_0 = base_counter32;
   m.callback = callback;
   m.user_data = user_data;
-  m.name = name;
+  if (!dispatch_mutation_copy_name(m, name)) return TIMEPOP_INVALID_HANDLE;
   m.priority = priority;
   return queue_dispatch_arm_mutation(m);
 }
@@ -1159,7 +1188,7 @@ static bool queue_dispatch_cancel_name(const char* name) {
   if (!name || !*name) return false;
   timepop_dispatch_mutation_t m{};
   m.kind = timepop_dispatch_mutation_kind_t::CANCEL_NAME;
-  m.name = name;
+  if (!dispatch_mutation_copy_name(m, name)) return false;
   return queue_dispatch_non_arm_mutation(m);
 }
 
@@ -1260,7 +1289,7 @@ static void timepop_apply_dispatch_mutations(const char* context) {
                                        m.recurring,
                                        m.callback,
                                        m.user_data,
-                                       m.name,
+                                       dispatch_mutation_name_or_null(m),
                                        m.isr_callback,
                                        m.rearm_in_isr,
                                        m.priority,
@@ -1274,7 +1303,7 @@ static void timepop_apply_dispatch_mutations(const char* context) {
                                        m.ns0,
                                        m.callback,
                                        m.user_data,
-                                       m.name,
+                                       dispatch_mutation_name_or_null(m),
                                        m.isr_callback,
                                        m.u32_0,
                                        m.priority,
@@ -1287,7 +1316,7 @@ static void timepop_apply_dispatch_mutations(const char* context) {
                                                 m.ns0,
                                                 m.callback,
                                                 m.user_data,
-                                                m.name,
+                                                dispatch_mutation_name_or_null(m),
                                                 m.priority,
                                                 m.reserved_handle);
         ok = (h == m.reserved_handle && h != TIMEPOP_INVALID_HANDLE);
@@ -1299,7 +1328,7 @@ static void timepop_apply_dispatch_mutations(const char* context) {
                                                                m.ns0,
                                                                m.callback,
                                                                m.user_data,
-                                                               m.name,
+                                                               dispatch_mutation_name_or_null(m),
                                                                m.priority,
                                                                m.reserved_handle);
         ok = (h == m.reserved_handle && h != TIMEPOP_INVALID_HANDLE);
@@ -1786,6 +1815,19 @@ static void record_slot_arm_diag(timepop_slot_t& slot,
   diag_arm_last_already_past = already_past;
   diag_arm_last_had_now = has_now;
   if (already_past) diag_arm_already_past_count++;
+}
+
+static inline void slot_set_name(timepop_slot_t& slot,
+                                 const char* name,
+                                 bool copy_queued_name) {
+  slot.name = name;
+  if (!copy_queued_name || !name) return;
+
+  // Queued names arrive from timepop_dispatch_mutation_t::name, which is
+  // exactly this size and was NUL-terminated before queue insertion.
+  memcpy(slot.queued_name, name, sizeof(slot.queued_name));
+  slot.queued_name[MAX_DISPATCH_NAME] = '\0';
+  slot.name = slot.queued_name;
 }
 
 static inline bool slot_name_equals(const timepop_slot_t& slot, const char* name) {
@@ -3083,6 +3125,8 @@ void timepop_init(void) {
   diag_dispatch_mutation_cancel_noop = 0;
   diag_dispatch_mutation_cancel_failures = 0;
   diag_dispatch_mutation_arm_failures = 0;
+  diag_dispatch_mutation_name_copies = 0;
+  diag_dispatch_mutation_name_too_long = 0;
 
   diag_schedule_next_body_cycles_last = 0;
   diag_schedule_next_body_cycles_max = 0;
@@ -3220,7 +3264,7 @@ static timepop_handle_t arm_absolute_slot_internal(
     slots[i].target_gnss_ns = target_gnss_ns;
     slots[i].callback       = callback;
     slots[i].user_data      = user_data;
-    slots[i].name           = name;
+    slot_set_name(slots[i], name, forced_handle != TIMEPOP_INVALID_HANDLE);
     slots[i].priority       = priority;
     slots[i].fire_gnss_ns   = -1;
     slots[i].isr_callback   = isr_callback;
@@ -3305,7 +3349,7 @@ static timepop_handle_t arm_anchored_recurring_isr_internal(
     slots[i].handle = h;
     slots[i].callback = callback;
     slots[i].user_data = user_data;
-    slots[i].name = name;
+    slot_set_name(slots[i], name, forced_handle != TIMEPOP_INVALID_HANDLE);
     slots[i].priority = priority;
     slots[i].fire_gnss_ns = -1;
     slots[i].isr_callback = true;
@@ -3374,7 +3418,7 @@ static timepop_handle_t arm_anchored_recurring_isr_from_counter32_internal(
     slots[i].handle = h;
     slots[i].callback = callback;
     slots[i].user_data = user_data;
-    slots[i].name = name;
+    slot_set_name(slots[i], name, forced_handle != TIMEPOP_INVALID_HANDLE);
     slots[i].priority = priority;
     slots[i].fire_gnss_ns = -1;
     slots[i].isr_callback = true;
@@ -3455,7 +3499,7 @@ static timepop_handle_t arm_relative_slot_internal(
     slots[i].period_ns    = delay_gnss_ns;
     slots[i].callback     = callback;
     slots[i].user_data    = user_data;
-    slots[i].name         = name;
+    slot_set_name(slots[i], name, forced_handle != TIMEPOP_INVALID_HANDLE);
     slots[i].priority     = priority;
     slots[i].fire_gnss_ns = -1;
     slots[i].target_gnss_ns = -1;
@@ -4511,6 +4555,8 @@ static FLASHMEM Payload cmd_report(const Payload&) {
   out.add("dispatch_mutation_cancel_noop", diag_dispatch_mutation_cancel_noop);
   out.add("dispatch_mutation_cancel_failures", diag_dispatch_mutation_cancel_failures);
   out.add("dispatch_mutation_arm_failures", diag_dispatch_mutation_arm_failures);
+  out.add("dispatch_mutation_name_copies", diag_dispatch_mutation_name_copies);
+  out.add("dispatch_mutation_name_too_long", diag_dispatch_mutation_name_too_long);
   out.add("dispatch_mutation_last_kind",
           (const char*)(diag_dispatch_mutation_last_kind
                             ? diag_dispatch_mutation_last_kind
@@ -4776,6 +4822,8 @@ static FLASHMEM Payload cmd_slots(const Payload&) {
   out.add("dispatch_mutation_applied", diag_dispatch_mutation_applied);
   out.add("dispatch_mutation_apply_failures", diag_dispatch_mutation_apply_failures);
   out.add("dispatch_mutation_arm_failures", diag_dispatch_mutation_arm_failures);
+  out.add("dispatch_mutation_name_copies", diag_dispatch_mutation_name_copies);
+  out.add("dispatch_mutation_name_too_long", diag_dispatch_mutation_name_too_long);
   out.add("dispatch_mutation_cancel_failures", diag_dispatch_mutation_cancel_failures);
   out.add("dispatch_mutation_cancel_noop", diag_dispatch_mutation_cancel_noop);
   out.add("dispatch_mutation_coalesced", diag_dispatch_mutation_coalesced);
