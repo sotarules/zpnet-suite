@@ -7050,18 +7050,22 @@ volatile bool     g_alpha_runtime_epoch_capture_last_cap_vclock_valid = false;
 volatile bool     g_alpha_runtime_epoch_capture_last_cap_all_lanes_valid = false;
 
 bool clocks_alpha_recover_rearm_interrupt_service(void) {
-  // Boot establishes these subscriptions once in process_clocks_init().  Warm
-  // RECOVER must preserve healthy always-on service exactly as it stands, while
-  // still reviving a runtime/cadence that a prior STOP or fault actually left
-  // inactive.  interrupt_ensure_service() owns that distinction.  In
-  // particular, it does not reset the live VCLOCK anchor ring merely because
-  // the Pi asked firmware to verify service.
+  // VCLOCK remains the sovereign running anchor.  Its ensure path is a strict
+  // no-op while the native heartbeat is alive and therefore does not reset the
+  // live PPS/VCLOCK anchor ring.
+  //
+  // OCXO RECOVER is deliberately stronger.  CounterLedger can keep sampling
+  // PPS counters while the one-second capture/handoff/fact-drain ferry is
+  // wedged, so runtime_active/cadence_enabled alone are not a liveness proof.
+  // Cut each stale delivery pipeline while preserving a hardware-verified live
+  // compare ladder; re-arm from the installed logical grid only if the ladder
+  // itself is not provably alive.
   const bool vclock_ok =
       interrupt_ensure_service(interrupt_subscriber_kind_t::VCLOCK);
-  const bool ocxo1_ok =
-      interrupt_ensure_service(interrupt_subscriber_kind_t::OCXO1);
-  const bool ocxo2_ok =
-      interrupt_ensure_service(interrupt_subscriber_kind_t::OCXO2);
+  const bool ocxo1_ok = interrupt_recover_rebootstrap_ocxo_service(
+      interrupt_subscriber_kind_t::OCXO1);
+  const bool ocxo2_ok = interrupt_recover_rebootstrap_ocxo_service(
+      interrupt_subscriber_kind_t::OCXO2);
   return vclock_ok && ocxo1_ok && ocxo2_ok;
 }
 

@@ -1000,6 +1000,14 @@ bool interrupt_start(interrupt_subscriber_kind_t kind);
 // runtime or lane-local cadence is actually inactive.
 bool interrupt_ensure_service(interrupt_subscriber_kind_t kind);
 
+// RECOVER-only OCXO publication-pipeline rebootstrap. Preserves the
+// hardware-verified live compare ladder when possible, but clears stale
+// capture / priority-16 handoff / TimePop fact-drain / deferred-dispatch
+// custody and otherwise rearms the lane from the installed logical grid.
+// Does not touch VCLOCK, SmartZero, the OCXO synthetic zero, or the DACs.
+bool interrupt_recover_rebootstrap_ocxo_service(
+    interrupt_subscriber_kind_t kind);
+
 bool interrupt_stop(interrupt_subscriber_kind_t kind);
 
 void interrupt_request_pps_rebootstrap(void);

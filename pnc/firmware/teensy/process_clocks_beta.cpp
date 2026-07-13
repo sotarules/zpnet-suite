@@ -2653,11 +2653,13 @@ static bool recover_lifecycle_enter_from_command(const char* reason) {
   g_recover_lifecycle_command_custody_reset_count++;
 
   // A post-flash/power-cycle recovery gets this service restoration from boot.
-  // A live TIMEBASE blackout does not reboot the Teensy, so explicitly ensure
-  // the same VCLOCK/OCXO runtime and compare-cadence service here.  The ensure
-  // path is a strict no-op for healthy lanes; only genuinely inactive service
-  // is resumed.  Do this before the reattachment timeout starts, and fail the
-  // RECOVER command rather than spending 32 hidden candidates on dead lanes.
+  // A live TIMEBASE blackout does not reboot the Teensy, so verify sovereign
+  // VCLOCK service and deliberately re-open both OCXO publication ferries here.
+  // A hardware-verified live OCXO compare ladder is preserved; stale capture,
+  // handoff, fact-drain, and subscriber custody are cut, and an unverified
+  // ladder is re-armed from its installed grid.  Do this before the reattachment
+  // timeout starts, and fail RECOVER rather than spending hidden candidates on
+  // a lane that cannot prove compare/IRQ service.
   g_recover_lifecycle_interrupt_service_rearm_count++;
   g_recover_lifecycle_last_interrupt_service_rearm_ok =
       clocks_alpha_recover_rearm_interrupt_service();

@@ -1208,11 +1208,14 @@ bool clocks_alpha_ocxo_public_origin_ready(void);
 // must not bridge the outage into the first post-recovery residual.
 //
 // A live warm recovery may arrive after a Pi-side publication blackout while
-// the Teensy itself never rebooted.  Ensure the boot-equivalent subscriber/
-// cadence service before RECOVER waits for fresh OCXO evidence.  Healthy lanes
-// are left bit-for-bit alone; only an actually inactive runtime/cadence is
-// resumed from the installed grid.  This does not replace the Alpha epoch,
-// re-subscribe callbacks, or reset healthy VCLOCK anchor custody.
+// the Teensy itself never rebooted.  Preserve the healthy sovereign VCLOCK
+// service exactly as it stands, but deliberately cut and re-open each OCXO
+// one-second delivery pipeline.  CounterLedger PPS capture can remain alive
+// while capture/handoff/fact-drain delivery is wedged, so OCXO logical active
+// flags are not sufficient recovery proof.  A hardware-verified live compare
+// ladder is preserved; only an unverified ladder is re-armed from the installed
+// grid.  This does not replace the Alpha epoch, re-subscribe callbacks, reset
+// SmartZero/public-origin state, or disturb VCLOCK anchors.
 bool clocks_alpha_recover_rearm_interrupt_service(void);
 
 // Beta calls this from the RECOVER gate after the recovery request is observed

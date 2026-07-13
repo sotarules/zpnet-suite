@@ -692,6 +692,15 @@ static constexpr uint32_t OCXO_CADENCE_REASON_LOGICAL_ZERO  = 5;
 static constexpr uint32_t OCXO_CADENCE_REASON_REARM         = 6;
 static constexpr uint32_t OCXO_CADENCE_REASON_STOP          = 7;
 
+// RECOVER-only OCXO publication-pipeline rebootstrap stages.  Zero means the
+// latest attempt completed through compare and NVIC verification.  Nonzero
+// values identify the exact boundary that refused the restart; VCLOCK custody
+// is never part of this operation.
+static constexpr uint32_t OCXO_RECOVER_REBOOTSTRAP_STAGE_OK = 0;
+static constexpr uint32_t OCXO_RECOVER_REBOOTSTRAP_STAGE_START_CADENCE = 1;
+static constexpr uint32_t OCXO_RECOVER_REBOOTSTRAP_STAGE_VERIFY_COMPARE = 2;
+static constexpr uint32_t OCXO_RECOVER_REBOOTSTRAP_STAGE_ENABLE_IRQ = 3;
+
 // OCXO witness scheduling/report classifications.  These are instrumentation
 // only: they make VCLOCK_HEARTBEAT arm decisions and OCXO compare-service timing
 // visible without changing whether an event is published.
@@ -3471,6 +3480,28 @@ struct ocxo_lane_t {
   uint32_t witness_fact_high_water = 0;
   uint32_t witness_fact_asap_arm_count = 0;
   uint32_t witness_fact_asap_fail_count = 0;
+
+  // Warm-RECOVER publication-pipeline rebootstrap.  The installed OCXO
+  // synthetic identity and logical grid survive; only stale delivery custody
+  // is cut.  These are lifetime/report diagnostics, not timing authority.
+  uint32_t recover_rebootstrap_attempt_count = 0;
+  uint32_t recover_rebootstrap_success_count = 0;
+  uint32_t recover_rebootstrap_failure_count = 0;
+  uint32_t recover_rebootstrap_capture_drop_count = 0;
+  uint32_t recover_rebootstrap_fact_drop_count = 0;
+  uint32_t recover_rebootstrap_cadence_restart_count = 0;
+  uint32_t recover_rebootstrap_last_capture_drop_count = 0;
+  uint32_t recover_rebootstrap_last_fact_drop_count = 0;
+  bool     recover_rebootstrap_last_cadence_preserved = false;
+  bool     recover_rebootstrap_last_live_compare_verified = false;
+  bool     recover_rebootstrap_last_irq_was_enabled = false;
+  bool     recover_rebootstrap_last_irq_enabled_after = false;
+  uint32_t recover_rebootstrap_last_target_counter32 = 0;
+  uint16_t recover_rebootstrap_last_target_low16 = 0;
+  uint16_t recover_rebootstrap_last_compare_comp1 = 0;
+  uint32_t recover_rebootstrap_last_compare_csctrl = 0;
+  uint32_t recover_rebootstrap_last_failure_stage =
+      OCXO_RECOVER_REBOOTSTRAP_STAGE_OK;
 
   // Canonical one-second custody audit.  A normal OCXO event stream advances
   // exactly 10,000,000 ticks per published edge.
@@ -8848,6 +8879,19 @@ static const char* ocxo_cadence_reason_name(uint32_t reason) {
   }
 }
 
+static const char* ocxo_recover_rebootstrap_stage_name(uint32_t stage) {
+  switch (stage) {
+    case OCXO_RECOVER_REBOOTSTRAP_STAGE_START_CADENCE:
+      return "START_CADENCE";
+    case OCXO_RECOVER_REBOOTSTRAP_STAGE_VERIFY_COMPARE:
+      return "VERIFY_COMPARE";
+    case OCXO_RECOVER_REBOOTSTRAP_STAGE_ENABLE_IRQ:
+      return "ENABLE_IRQ";
+    default:
+      return "OK";
+  }
+}
+
 static uint32_t ocxo_quiet_phase_ticks_for(interrupt_subscriber_kind_t kind) {
   if (kind == interrupt_subscriber_kind_t::OCXO1) return OCXO1_QUIET_PHASE_TICKS;
   if (kind == interrupt_subscriber_kind_t::OCXO2) return OCXO2_QUIET_PHASE_TICKS;
@@ -9114,7 +9158,7 @@ static bool ocxo_lane_start_local_cadence(interrupt_subscriber_kind_t kind,
   lane.tick_mod_1000 = ocxo_sample_tick_mod_for_target(lane, target);
 
   ocxo_lane_prepare_one_second_target(kind, lane, clock32, target, reason);
-  return lane.cadence_enabled;
+  return lane.cadence_enabled && lane.cadence_armed && lane.witness_armed;
 }
 
 
@@ -9675,6 +9719,23 @@ static void ocxo_fact_ring_reset(ocxo_runtime_context_t& ctx) {
   r.high_water = 0;
   r.asap_arm_count = 0;
   r.asap_fail_count = 0;
+}
+
+// Caller has stopped this lane's priority-0 producer and masked the priority-16
+// handoff tier.  Preserve lifetime counters and the monotonic fact sequence;
+// only pending facts and the potentially orphaned drain latch cross the
+// deliberate RECOVER custody cut.
+static uint32_t ocxo_fact_ring_discard_pending_for_recover(
+    ocxo_runtime_context_t& ctx) {
+  ocxo_perishable_ring_t& r = ocxo_fact_ring_for(ctx);
+  const uint32_t tail = r.tail;
+  dmb_barrier();
+  const uint32_t head = r.head;
+  const uint32_t dropped = head - tail;
+  r.tail = head;
+  r.drain_armed = false;
+  dmb_barrier();
+  return dropped;
 }
 
 static int32_t dwt_cycles_for_ocxo_ticks_signed(int32_t ticks) {
@@ -10928,6 +10989,24 @@ static inline uint32_t capture_ring_pending(
   dmb_barrier();
   const uint32_t head = ring.head;
   return head - tail;
+}
+
+// RECOVER-only cursor cut.  The caller has disabled this ring's priority-0
+// producer and masked the shared priority-16 handoff.  Advancing tail to head
+// discards stale capture custody without erasing monotonic/lifetime evidence.
+// A shared handoff IRQ already pending may subsequently run once and find no
+// packet for this lane; it must not be globally cleared because other rails
+// share the same priority-16 continuation tier.
+template <typename T, uint32_t N>
+static uint32_t capture_ring_discard_pending_for_recover(
+    interrupt_capture_ring_t<T, N>& ring) {
+  const uint32_t tail = ring.tail;
+  dmb_barrier();
+  const uint32_t head = ring.head;
+  const uint32_t dropped = head - tail;
+  ring.tail = head;
+  dmb_barrier();
+  return dropped;
 }
 
 template <typename T, uint32_t N>
@@ -12969,6 +13048,241 @@ bool interrupt_ensure_service(interrupt_subscriber_kind_t kind) {
 }
 
 
+bool interrupt_recover_rebootstrap_ocxo_service(
+    interrupt_subscriber_kind_t kind) {
+  if (kind != interrupt_subscriber_kind_t::OCXO1 &&
+      kind != interrupt_subscriber_kind_t::OCXO2) {
+    return false;
+  }
+  if (ocxo_kind_disabled(kind)) {
+    return true;
+  }
+
+  ocxo_runtime_context_t* const ctx = ocxo_context_for(kind);
+  interrupt_subscriber_runtime_t* const rt = runtime_for(kind);
+  if (!ctx || !ctx->lane || !ctx->clock32 ||
+      !rt || !rt->desc || !rt->subscribed || !rt->sub.on_event ||
+      !ctx->lane->initialized) {
+    return false;
+  }
+
+  ocxo_lane_t& lane = *ctx->lane;
+  synthetic_clock32_t& clock32 = *ctx->clock32;
+  interrupt_handoff_source_diag_t& handoff =
+      (kind == interrupt_subscriber_kind_t::OCXO1)
+          ? g_handoff_ocxo1
+          : g_handoff_ocxo2;
+  const uint32_t irq_number =
+      (kind == interrupt_subscriber_kind_t::OCXO1)
+          ? (uint32_t)IRQ_QTIMER2
+          : (uint32_t)IRQ_QTIMER3;
+  const uint32_t irq_mask = interrupt_nvic_irq_mask(irq_number);
+  const bool irq_was_enabled =
+      (interrupt_nvic_iser_word(irq_number) & irq_mask) != 0U;
+
+  lane.recover_rebootstrap_attempt_count++;
+  lane.recover_rebootstrap_last_failure_stage =
+      OCXO_RECOVER_REBOOTSTRAP_STAGE_OK;
+  lane.recover_rebootstrap_last_irq_was_enabled = irq_was_enabled;
+  lane.recover_rebootstrap_last_irq_enabled_after = false;
+
+  // Stop only this OCXO priority-0 producer.  VCLOCK, PPS, the other OCXO lane,
+  // and the shared priority-16 handoff remain live.
+  if (kind == interrupt_subscriber_kind_t::OCXO1) {
+    NVIC_DISABLE_IRQ(IRQ_QTIMER2);
+    g_step0_qtimer2_irq_enabled_by_interrupt = false;
+  } else {
+    NVIC_DISABLE_IRQ(IRQ_QTIMER3);
+    g_step0_qtimer3_irq_enabled_by_interrupt = false;
+  }
+  interrupt_handoff_barrier();
+
+  // A healthy compare ladder is worth preserving: it carries the exact OCXO
+  // synthetic identity that CounterLedger has continued to observe.  Do not
+  // trust logical flags alone, though.  The hardware compare, target identity,
+  // and pre-cut NVIC admission must all agree before the ladder is kept.
+  uint32_t live_csctrl = 0;
+  const bool live_csctrl_ok = qtimer_guard_read_ocxo_csctrl(
+      lane,
+      "ocxo_recover_live_compare",
+      lane.cadence_next_low16,
+      &live_csctrl);
+  const uint16_t live_comp1 = live_csctrl_ok
+      ? lane.module->CH[lane.compare_channel].COMP1
+      : 0U;
+  const bool preserve_live_cadence =
+      irq_was_enabled &&
+      live_csctrl_ok &&
+      rt->active && lane.active &&
+      lane.cadence_enabled && lane.cadence_armed && lane.witness_armed &&
+      lane.witness_target_initialized &&
+      lane.compare_target == lane.cadence_next_low16 &&
+      lane.witness_target_counter32 == lane.cadence_next_counter32 &&
+      lane.witness_target_low16 == lane.cadence_next_low16 &&
+      (live_csctrl & TMR_CSCTRL_TCF1EN) != 0U &&
+      live_comp1 == lane.cadence_next_low16;
+
+  uint32_t capture_dropped = 0;
+  uint32_t fact_dropped = 0;
+  {
+    // BASEPRI masks priority 16 and lower while preserving sacred priority-0
+    // capture on every other timing rail.  This lane's own priority-0 source is
+    // already stopped above.
+    const uint32_t prior_basepri = interrupt_priority0_guard_enter();
+
+    if (kind == interrupt_subscriber_kind_t::OCXO1) {
+      capture_dropped += capture_ring_discard_pending_for_recover(
+          g_ocxo1_1khz_sample_capture_ring);
+      capture_dropped += capture_ring_discard_pending_for_recover(
+          g_ocxo1_one_second_capture_ring);
+    } else {
+      capture_dropped += capture_ring_discard_pending_for_recover(
+          g_ocxo2_1khz_sample_capture_ring);
+      capture_dropped += capture_ring_discard_pending_for_recover(
+          g_ocxo2_one_second_capture_ring);
+    }
+    handoff.pending_count = 0;
+
+    fact_dropped = ocxo_fact_ring_discard_pending_for_recover(*ctx);
+
+    // Invalidate any frozen subscriber tuple without pretending a callback
+    // that is actually executing has already returned.  The normal dispatch
+    // completion path owns dispatch_running.
+    interrupt_dispatch_invalidate_locked(*rt);
+    rt->last_event = interrupt_event_t{};
+    rt->last_diag = interrupt_capture_diag_t{};
+    rt->has_fired = false;
+    rt->active = true;
+    lane.active = true;
+
+    interrupt_priority0_guard_exit(prior_basepri);
+  }
+
+  // Do not cancel the stale named TimePop ASAP slot here.  A cancellation can
+  // enter TimePop's own dispatch-mutation path or briefly use its global
+  // critical section.  The emptied ring makes any already-queued callback a
+  // harmless no-op, and the first fresh arm of the same name retires that old
+  // slot before installing the new drain.
+
+  // Cut all process_interrupt-owned interval evidence at the same boundary.
+  // None of these operations changes clock32 current/zero identity,
+  // cadence_epoch_counter32, DAC state, SmartZero proof, public origin, or any
+  // VCLOCK anchor.
+  ocxo_lane_measurement_witness_reset(lane);
+  ocxo_lane_event_lineage_reset(lane);
+  cadence_regression_reset_kind(kind);
+  lane.witness_last_event_dwt = 0;
+  lane.witness_last_event_counter32 = 0;
+  lane.witness_last_event_published = false;
+  lane.witness_last_fact_sequence = 0;
+  lane.witness_last_fact_one_second_due = false;
+
+  lane.recover_rebootstrap_last_capture_drop_count = capture_dropped;
+  lane.recover_rebootstrap_last_fact_drop_count = fact_dropped;
+  lane.recover_rebootstrap_capture_drop_count += capture_dropped;
+  lane.recover_rebootstrap_fact_drop_count += fact_dropped;
+  lane.recover_rebootstrap_last_cadence_preserved = preserve_live_cadence;
+  lane.recover_rebootstrap_last_live_compare_verified =
+      preserve_live_cadence;
+
+  auto fail_rebootstrap = [&](uint32_t stage) -> bool {
+    if (kind == interrupt_subscriber_kind_t::OCXO1) {
+      NVIC_DISABLE_IRQ(IRQ_QTIMER2);
+      g_step0_qtimer2_irq_enabled_by_interrupt = false;
+    } else {
+      NVIC_DISABLE_IRQ(IRQ_QTIMER3);
+      g_step0_qtimer3_irq_enabled_by_interrupt = false;
+    }
+    interrupt_handoff_barrier();
+    ocxo_lane_stop_local_cadence(lane, OCXO_CADENCE_REASON_STOP);
+    lane.recover_rebootstrap_failure_count++;
+    lane.recover_rebootstrap_last_failure_stage = stage;
+    lane.recover_rebootstrap_last_irq_enabled_after = false;
+    lane.active = false;
+    const uint32_t prior_basepri = interrupt_priority0_guard_enter();
+    rt->active = false;
+    interrupt_dispatch_invalidate_locked(*rt);
+    interrupt_priority0_guard_exit(prior_basepri);
+    return false;
+  };
+
+  if (!preserve_live_cadence) {
+    // Logical active flags did not prove a live authored compare.  Rebuild only
+    // this OCXO ladder from its already-installed logical grid.  The helper now
+    // returns true only when an actual compare tooth is armed.
+    ocxo_lane_stop_local_cadence(lane, OCXO_CADENCE_REASON_REARM);
+    lane.active = true;
+    {
+      const uint32_t prior_basepri = interrupt_priority0_guard_enter();
+      rt->active = true;
+      interrupt_priority0_guard_exit(prior_basepri);
+    }
+    lane.recover_rebootstrap_cadence_restart_count++;
+    if (!ocxo_lane_start_local_cadence(
+            kind, lane, clock32, OCXO_CADENCE_REASON_REARM)) {
+      return fail_rebootstrap(
+          OCXO_RECOVER_REBOOTSTRAP_STAGE_START_CADENCE);
+    }
+  }
+
+  uint32_t verify_csctrl = 0;
+  const bool verify_csctrl_ok = qtimer_guard_read_ocxo_csctrl(
+      lane,
+      "ocxo_recover_verify_compare",
+      lane.cadence_next_low16,
+      &verify_csctrl);
+  const uint16_t verify_comp1 = verify_csctrl_ok
+      ? lane.module->CH[lane.compare_channel].COMP1
+      : 0U;
+  const bool compare_verified =
+      verify_csctrl_ok &&
+      lane.cadence_enabled && lane.cadence_armed && lane.witness_armed &&
+      lane.witness_target_initialized &&
+      lane.compare_target == lane.cadence_next_low16 &&
+      lane.witness_target_counter32 == lane.cadence_next_counter32 &&
+      lane.witness_target_low16 == lane.cadence_next_low16 &&
+      (verify_csctrl & TMR_CSCTRL_TCF1EN) != 0U &&
+      verify_comp1 == lane.cadence_next_low16;
+
+  lane.recover_rebootstrap_last_target_counter32 =
+      lane.cadence_next_counter32;
+  lane.recover_rebootstrap_last_target_low16 = lane.cadence_next_low16;
+  lane.recover_rebootstrap_last_compare_comp1 = verify_comp1;
+  lane.recover_rebootstrap_last_compare_csctrl = verify_csctrl;
+  if (!compare_verified) {
+    return fail_rebootstrap(
+        OCXO_RECOVER_REBOOTSTRAP_STAGE_VERIFY_COMPARE);
+  }
+
+  // Clear only this lane's stale NVIC pending bit.  Do not clear the QTimer
+  // peripheral flag in the preserved-ladder path: if the exact authored tooth
+  // matured while IRQ admission was closed, the level source will reassert and
+  // deliver it into the freshly emptied pipeline after enable.
+  interrupt_nvic_icpr_word(irq_number) = irq_mask;
+  interrupt_handoff_barrier();
+  if (kind == interrupt_subscriber_kind_t::OCXO1) {
+    NVIC_ENABLE_IRQ(IRQ_QTIMER2);
+    g_step0_qtimer2_irq_enabled_by_interrupt = true;
+  } else {
+    NVIC_ENABLE_IRQ(IRQ_QTIMER3);
+    g_step0_qtimer3_irq_enabled_by_interrupt = true;
+  }
+  interrupt_handoff_barrier();
+
+  const bool irq_enabled_after =
+      (interrupt_nvic_iser_word(irq_number) & irq_mask) != 0U;
+  lane.recover_rebootstrap_last_irq_enabled_after = irq_enabled_after;
+  if (!irq_enabled_after) {
+    return fail_rebootstrap(OCXO_RECOVER_REBOOTSTRAP_STAGE_ENABLE_IRQ);
+  }
+
+  lane.recover_rebootstrap_success_count++;
+  lane.recover_rebootstrap_last_failure_stage =
+      OCXO_RECOVER_REBOOTSTRAP_STAGE_OK;
+  return true;
+}
+
+
 bool interrupt_stop(interrupt_subscriber_kind_t kind) {
   interrupt_subscriber_runtime_t* rt = runtime_for(kind);
   if (!rt || !rt->desc) return false;
@@ -13847,6 +14161,16 @@ static FLASHMEM void add_ocxo_lean_lane(Payload& p,
   add_bool("yardstick_excursion", lane.yardstick_last_excursion);
   add_i32("yardstick_auth_error", lane.yardstick_auth_last_error_cycles);
   add_bool("zero_worthy", lane.zw_worthy);
+  add_u32("recover_rebootstrap_attempt_count",
+          lane.recover_rebootstrap_attempt_count);
+  add_u32("recover_rebootstrap_success_count",
+          lane.recover_rebootstrap_success_count);
+  add_u32("recover_rebootstrap_failure_count",
+          lane.recover_rebootstrap_failure_count);
+  add_u32("recover_rebootstrap_last_failure_stage",
+          lane.recover_rebootstrap_last_failure_stage);
+  add_bool("recover_rebootstrap_last_cadence_preserved",
+           lane.recover_rebootstrap_last_cadence_preserved);
   if (want_summary) {
     const lower_env_lane_t* fl = lower_env_lane_for(ctx.kind);
     if (fl) {
@@ -13956,6 +14280,33 @@ static FLASHMEM void add_ocxo_lean_lane(Payload& p,
     add_u32("fact_asap_arm_count", lane.witness_fact_asap_arm_count);
     add_u32("fact_asap_fail_count", lane.witness_fact_asap_fail_count);
     add_u32("fact_overflow", lane.witness_fact_overflow_count);
+    add_u32("recover_rebootstrap_capture_drop_count",
+            lane.recover_rebootstrap_capture_drop_count);
+    add_u32("recover_rebootstrap_fact_drop_count",
+            lane.recover_rebootstrap_fact_drop_count);
+    add_u32("recover_rebootstrap_cadence_restart_count",
+            lane.recover_rebootstrap_cadence_restart_count);
+    add_u32("recover_rebootstrap_last_capture_drop_count",
+            lane.recover_rebootstrap_last_capture_drop_count);
+    add_u32("recover_rebootstrap_last_fact_drop_count",
+            lane.recover_rebootstrap_last_fact_drop_count);
+    add_bool("recover_rebootstrap_last_live_compare_verified",
+             lane.recover_rebootstrap_last_live_compare_verified);
+    add_bool("recover_rebootstrap_last_irq_was_enabled",
+             lane.recover_rebootstrap_last_irq_was_enabled);
+    add_bool("recover_rebootstrap_last_irq_enabled_after",
+             lane.recover_rebootstrap_last_irq_enabled_after);
+    add_u32("recover_rebootstrap_last_target_counter32",
+            lane.recover_rebootstrap_last_target_counter32);
+    add_u32("recover_rebootstrap_last_target_low16",
+            (uint32_t)lane.recover_rebootstrap_last_target_low16);
+    add_u32("recover_rebootstrap_last_compare_comp1",
+            (uint32_t)lane.recover_rebootstrap_last_compare_comp1);
+    add_u32("recover_rebootstrap_last_compare_csctrl",
+            lane.recover_rebootstrap_last_compare_csctrl);
+    add_str("recover_rebootstrap_last_failure_stage_name",
+            ocxo_recover_rebootstrap_stage_name(
+                lane.recover_rebootstrap_last_failure_stage));
     return;
   }
 
