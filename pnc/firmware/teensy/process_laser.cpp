@@ -4,6 +4,7 @@
 #include "events.h"
 #include "payload.h"
 #include "process.h"
+#include "util.h"
 
 #include <Arduino.h>
 #include <Wire.h>
@@ -109,8 +110,8 @@ void process_laser_init(void) {
 
   Payload p;
   p.add("id1_raw", id1_raw);
-  p.add("id1_current_ma", id1_current_ma);
-  p.add("pd_voltage", pd_voltage);
+  p.add("id1_current_ma", toFixedDecimal(id1_current_ma, 6));
+  p.add("pd_voltage", toFixedDecimal(pd_voltage, 6));
   p.add("laser_emitting", pd_voltage > LASER_EMIT_THRESHOLD_V);
 
   enqueueEvent("LASER_INITIALIZATION", p);
@@ -143,8 +144,8 @@ static Payload cmd_report(const Payload& /*args*/) {
 
   float pd_voltage = read_pd_voltage();
 
-  p.add("id1_current_ma", id1_current_ma);
-  p.add("pd_voltage", pd_voltage);
+  p.add("id1_current_ma", toFixedDecimal(id1_current_ma, 6));
+  p.add("pd_voltage", toFixedDecimal(pd_voltage, 6));
   p.add("laser_emitting", pd_voltage > LASER_EMIT_THRESHOLD_V);
 
   return p;

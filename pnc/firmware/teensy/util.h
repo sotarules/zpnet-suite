@@ -1,7 +1,7 @@
 #pragma once
 
-#include "payload.h"
 #include <Arduino.h>
+#include <stdint.h>
 
 // --------------------------------------------------------------
 // Generic utility helpers
@@ -11,19 +11,60 @@
 // They exist to support other modules cleanly.
 //
 
+// ============================================================================
+// Fixed-decimal publication boundary
+// ============================================================================
+//
+// Scientific code may continue to use float/double internally.  Before a value
+// crosses into Payload, convert it here into an integer-only decimal
+// decomposition.  Payload receives only whole/fractional digits plus metadata;
+// no float or double enters its construction/serialization ABI.
+//
+// Conversion preserves the former Payload fixed-format contract:
+//   * decimal places are clamped to [0, 12]
+//   * rounding is half away from zero
+//   * negative values that round to zero are rendered without a minus sign
+//   * NaN, infinity, and magnitudes above 9e18 are represented as invalid
+//
+// The structure deliberately does not combine whole and fractional digits into
+// one scaled int64_t.  Large nanosecond clockfaces can therefore retain up to
+// 12 decimal places without overflowing an intermediate scaled integer.
+
+static constexpr uint8_t FIXED_DECIMAL_MAX_PLACES = 12U;
+
+enum class fixed_decimal_status_t : uint8_t {
+  VALID = 0,
+  NAN_VALUE = 1,
+  POSITIVE_INFINITY = 2,
+  NEGATIVE_INFINITY = 3,
+  OUT_OF_RANGE = 4,
+};
+
+struct fixed_decimal_t {
+  uint64_t whole;
+  uint64_t fractional;
+  uint64_t source_bits;  // Original IEEE-754 evidence; never interpreted by Payload.
+  uint8_t decimal_places;
+  uint8_t negative;
+  fixed_decimal_status_t status;
+
+  bool valid() const {
+    return status == fixed_decimal_status_t::VALID;
+  }
+};
+
+// Convert a floating-point science value into an integer-only decimal object.
+// The floating-point work occurs in the caller/util layer, before Payload is
+// entered.  Payload::add(const fixed_decimal_t&) performs only integer work.
+fixed_decimal_t toFixedDecimal(double value, int decimal_places);
+
+const char* fixedDecimalStatusName(fixed_decimal_status_t status);
+
 // Safe bounded string copy (always null-terminated)
 void safeCopy(char* dst, size_t dst_sz, const char* src);
 
 // Escape a C string for JSON inclusion
 String jsonEscape(const char* s);
-
-// Append a float key/value pair to a JSON body fragment
-void appendFloatKV(
-  String& b,
-  const char* key,
-  float value,
-  int decimals = 5
-);
 
 // CPU temperature in Celsius (best-effort)
 float cpuTempC();

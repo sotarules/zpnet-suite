@@ -25,6 +25,7 @@
 #include "debug.h"
 #include "transport.h"
 #include "payload.h"
+#include "util.h"
 
 #include <Arduino.h>
 #include <stdint.h>
@@ -183,7 +184,7 @@ void debug_log(const char* name, float v) {
   if (!name || !*name) return;
   Payload out;
   out.add("name", name);
-  out.add("value", v);
+  out.add("value", toFixedDecimal((double)v, 6));
   transport_send(TRAFFIC_DEBUG, out);
 }
 
@@ -191,7 +192,7 @@ void debug_log(const char* name, double v) {
   if (!name || !*name) return;
   Payload out;
   out.add("name", name);
-  out.add("value", v);
+  out.add("value", toFixedDecimal(v, 6));
   transport_send(TRAFFIC_DEBUG, out);
 }
 

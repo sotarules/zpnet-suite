@@ -78,6 +78,7 @@
 
 #include <math.h>
 #include <stdlib.h>
+#include <errno.h>
 #include <stdio.h>
 #include <climits>
 #include <string.h>
@@ -3669,7 +3670,11 @@ static FLASHMEM clocks_payload_checked_status_t clocks_payload_try_get_double_ch
     return CLOCKS_PAYLOAD_FIELD_INVALID;
   }
 
-  if (!payload.tryGetDouble(key, out)) {
+  errno = 0;
+  char* end = nullptr;
+  out = strtod(token, &end);
+  if (errno == ERANGE ||
+      !end || end != token + token_len || *end != '\0') {
     court.reason = CLOCKS_PAYLOAD_NUMERIC_LIBC_PARSE_FAILED;
     clocks_payload_numeric_emit_watchdog(payload, context, path, lane,
                                          field, key, court);
@@ -4073,19 +4078,19 @@ static FLASHMEM void publish_welford(Payload& p, const char* prefix, const welfo
   p.add(key, w.n);
 
   snprintf(key, sizeof(key), "%s_welford_mean", prefix);
-  p.add(key, w.mean, 6);
+  p.add(key, toFixedDecimal(w.mean, 6));
 
   snprintf(key, sizeof(key), "%s_welford_stddev", prefix);
-  p.add(key, welford_stddev(w), 6);
+  p.add(key, toFixedDecimal(welford_stddev(w), 6));
 
   snprintf(key, sizeof(key), "%s_welford_stderr", prefix);
-  p.add(key, welford_stderr(w), 6);
+  p.add(key, toFixedDecimal(welford_stderr(w), 6));
 
   snprintf(key, sizeof(key), "%s_welford_min", prefix);
-  p.add(key, (w.n > 0) ? w.min_val : 0.0, 6);
+  p.add(key, toFixedDecimal((w.n > 0) ? w.min_val : 0.0, 6));
 
   snprintf(key, sizeof(key), "%s_welford_max", prefix);
-  p.add(key, (w.n > 0) ? w.max_val : 0.0, 6);
+  p.add(key, toFixedDecimal((w.n > 0) ? w.max_val : 0.0, 6));
 }
 
 // Emits <clock>_tau and <clock>_ppb.  ppb_value is in parts-per-billion
@@ -4381,10 +4386,10 @@ static FLASHMEM void publish_freq(Payload& p, const char* clock_name, double ppb
   const double tau_value = 1.0 + ppb_value / 1e9;
 
   snprintf(key, sizeof(key), "%s_tau", clock_name);
-  p.add(key, tau_value, 12);
+  p.add(key, toFixedDecimal(tau_value, 12));
 
   snprintf(key, sizeof(key), "%s_ppb", clock_name);
-  p.add(key, ppb_value, 3);
+  p.add(key, toFixedDecimal(ppb_value, 3));
 }
 
 
@@ -4491,18 +4496,18 @@ static FLASHMEM void payload_add_welford_object(Payload& parent,
                                        const welford_t& w) {
   Payload obj;
   obj.add("n", w.n);
-  obj.add("mean", w.mean, 6);
-  obj.add("stddev", welford_stddev(w), 6);
-  obj.add("stderr", welford_stderr(w), 6);
-  obj.add("min", (w.n > 0) ? w.min_val : 0.0, 6);
-  obj.add("max", (w.n > 0) ? w.max_val : 0.0, 6);
+  obj.add("mean", toFixedDecimal(w.mean, 6));
+  obj.add("stddev", toFixedDecimal(welford_stddev(w), 6));
+  obj.add("stderr", toFixedDecimal(welford_stderr(w), 6));
+  obj.add("min", toFixedDecimal((w.n > 0) ? w.min_val : 0.0, 6));
+  obj.add("max", toFixedDecimal((w.n > 0) ? w.max_val : 0.0, 6));
   parent.add_object(key, obj);
 }
 
 static FLASHMEM void payload_add_frequency_fields(Payload& obj, double ppb_value) {
   const double tau_value = 1.0 + ppb_value / 1e9;
-  obj.add("tau", tau_value, 12);
-  obj.add("ppb", ppb_value, 3);
+  obj.add("tau", toFixedDecimal(tau_value, 12));
+  obj.add("ppb", toFixedDecimal(ppb_value, 3));
 }
 
 static double campaign_total_tau_from_ratio(uint64_t reference_value,
@@ -6680,17 +6685,17 @@ static FLASHMEM void payload_add_clock_science_common(Payload& science,
     science.add("gnss_interval_ns", row.gnss_interval_ns);
     science.add("clock_interval_ns", row.clock_interval_ns);
     science.add("fast_residual_ns", row.fast_residual_ns);
-    science.add("fast_residual_ns_exact", row.fast_residual_ns_exact, 6);
-    science.add("tau_1s", row.tau_1s, 12);
-    science.add("ppb_1s", row.ppb_1s, 6);
+    science.add("fast_residual_ns_exact", toFixedDecimal(row.fast_residual_ns_exact, 6));
+    science.add("tau_1s", toFixedDecimal(row.tau_1s, 12));
+    science.add("ppb_1s", toFixedDecimal(row.ppb_1s, 6));
 
     // Campaign-total frequency summary.  These five fields are the panel-facing
     // public clockface ratio and must remain in TIMEBASE_FRAGMENT.
     science.add("total_valid", row.total_valid);
     science.add("total_sample_count", row.total_sample_count);
     science.add("total_fast_residual_ns", row.total_fast_residual_ns);
-    science.add("total_tau", row.total_tau, 12);
-    science.add("total_ppb", row.total_ppb, 6);
+    science.add("total_tau", toFixedDecimal(row.total_tau, 12));
+    science.add("total_ppb", toFixedDecimal(row.total_ppb, 6));
 
     // Canonical Delta residual identity.  Keep this numeric and compact; verbose
     // species labels and FloorLine/traditional comparison rails are forensics.
@@ -6707,7 +6712,7 @@ static FLASHMEM void payload_add_clock_science_common(Payload& science,
       science.add("delta_raw_clock_interval_cycles",
                   row.delta_raw_clock_interval_cycles);
       science.add("delta_raw_fast_residual_ns_exact",
-                  row.delta_raw_fast_residual_ns_exact, 6);
+                  toFixedDecimal(row.delta_raw_fast_residual_ns_exact, 6));
     }
     return;
   }
@@ -6768,9 +6773,9 @@ static FLASHMEM void payload_add_clock_science_common(Payload& science,
   science.add("delta_raw_fast_residual_ns",
               row.delta_raw_fast_residual_ns);
   science.add("delta_raw_residual_ns_exact",
-              row.delta_raw_residual_ns_exact, 6);
+              toFixedDecimal(row.delta_raw_residual_ns_exact, 6));
   science.add("delta_raw_fast_residual_ns_exact",
-              row.delta_raw_fast_residual_ns_exact, 6);
+              toFixedDecimal(row.delta_raw_fast_residual_ns_exact, 6));
 
   science.add("delta_floorline_valid", row.delta_floorline_valid);
   science.add("delta_floorline_reference_interval_cycles",
@@ -6786,9 +6791,9 @@ static FLASHMEM void payload_add_clock_science_common(Payload& science,
   science.add("delta_floorline_fast_residual_ns",
               row.delta_floorline_fast_residual_ns);
   science.add("delta_floorline_residual_ns_exact",
-              row.delta_floorline_residual_ns_exact, 6);
+              toFixedDecimal(row.delta_floorline_residual_ns_exact, 6));
   science.add("delta_floorline_fast_residual_ns_exact",
-              row.delta_floorline_fast_residual_ns_exact, 6);
+              toFixedDecimal(row.delta_floorline_fast_residual_ns_exact, 6));
 
   science.add("delta_raw_fast_minus_traditional_ns",
               row.delta_raw_fast_minus_traditional_ns);
@@ -6799,29 +6804,29 @@ static FLASHMEM void payload_add_clock_science_common(Payload& science,
 
   science.add("prior_edge_gnss_ns", row.prior_edge_gnss_ns);
   science.add("current_edge_gnss_ns", row.current_edge_gnss_ns);
-  science.add("prior_edge_gnss_ns_exact", row.prior_edge_gnss_ns_exact, 6);
-  science.add("current_edge_gnss_ns_exact", row.current_edge_gnss_ns_exact, 6);
+  science.add("prior_edge_gnss_ns_exact", toFixedDecimal(row.prior_edge_gnss_ns_exact, 6));
+  science.add("current_edge_gnss_ns_exact", toFixedDecimal(row.current_edge_gnss_ns_exact, 6));
   science.add("gnss_interval_ns", row.gnss_interval_ns);
   science.add("clock_interval_ns", row.clock_interval_ns);
   science.add("fast_residual_ns", row.fast_residual_ns);
-  science.add("gnss_interval_ns_exact", row.gnss_interval_ns_exact, 6);
-  science.add("clock_interval_ns_exact", row.clock_interval_ns_exact, 6);
-  science.add("fast_residual_ns_exact", row.fast_residual_ns_exact, 6);
-  science.add("tau_1s", row.tau_1s, 12);
-  science.add("ppb_1s", row.ppb_1s, 6);
+  science.add("gnss_interval_ns_exact", toFixedDecimal(row.gnss_interval_ns_exact, 6));
+  science.add("clock_interval_ns_exact", toFixedDecimal(row.clock_interval_ns_exact, 6));
+  science.add("fast_residual_ns_exact", toFixedDecimal(row.fast_residual_ns_exact, 6));
+  science.add("tau_1s", toFixedDecimal(row.tau_1s, 12));
+  science.add("ppb_1s", toFixedDecimal(row.ppb_1s, 6));
 
   science.add("traditional_valid", row.traditional_valid);
   science.add("traditional_gnss_interval_ns", row.traditional_gnss_interval_ns);
   science.add("traditional_clock_interval_ns", row.traditional_clock_interval_ns);
   science.add("traditional_fast_residual_ns", row.traditional_fast_residual_ns);
   science.add("traditional_gnss_interval_ns_exact",
-              row.traditional_gnss_interval_ns_exact, 6);
+              toFixedDecimal(row.traditional_gnss_interval_ns_exact, 6));
   science.add("traditional_clock_interval_ns_exact",
-              row.traditional_clock_interval_ns_exact, 6);
+              toFixedDecimal(row.traditional_clock_interval_ns_exact, 6));
   science.add("traditional_fast_residual_ns_exact",
-              row.traditional_fast_residual_ns_exact, 6);
-  science.add("traditional_tau_1s", row.traditional_tau_1s, 12);
-  science.add("traditional_ppb_1s", row.traditional_ppb_1s, 6);
+              toFixedDecimal(row.traditional_fast_residual_ns_exact, 6));
+  science.add("traditional_tau_1s", toFixedDecimal(row.traditional_tau_1s, 12));
+  science.add("traditional_ppb_1s", toFixedDecimal(row.traditional_ppb_1s, 6));
 
   const bool recovery_continuity_aligned =
       ocxo_science_row &&
@@ -6838,11 +6843,11 @@ static FLASHMEM void payload_add_clock_science_common(Payload& science,
   science.add("total_clock_interval_ns", row.total_clock_interval_ns);
   science.add("total_gnss_interval_ns", row.total_gnss_interval_ns);
   science.add("total_fast_residual_ns", row.total_fast_residual_ns);
-  science.add("total_clock_interval_ns_exact", row.total_clock_interval_ns_exact, 6);
-  science.add("total_gnss_interval_ns_exact", row.total_gnss_interval_ns_exact, 6);
-  science.add("total_fast_residual_ns_exact", row.total_fast_residual_ns_exact, 6);
-  science.add("total_tau", row.total_tau, 12);
-  science.add("total_ppb", row.total_ppb, 6);
+  science.add("total_clock_interval_ns_exact", toFixedDecimal(row.total_clock_interval_ns_exact, 6));
+  science.add("total_gnss_interval_ns_exact", toFixedDecimal(row.total_gnss_interval_ns_exact, 6));
+  science.add("total_fast_residual_ns_exact", toFixedDecimal(row.total_fast_residual_ns_exact, 6));
+  science.add("total_tau", toFixedDecimal(row.total_tau, 12));
+  science.add("total_ppb", toFixedDecimal(row.total_ppb, 6));
   science.add("recovery_continuity_aligned", recovery_continuity_aligned);
   science.add("recovery_continuity_target_ns",
               recovery_continuity_aligned
@@ -6862,13 +6867,13 @@ static FLASHMEM void payload_add_clock_science_common(Payload& science,
   science.add("alpha_tau_last_pps_sequence", row.alpha_tau_last_pps_sequence);
   science.add("alpha_tau_last_interval_pps_sequence",
               row.alpha_tau_last_interval_pps_sequence);
-  science.add("alpha_tau", row.alpha_tau, 12);
-  science.add("alpha_tau_ppb", row.alpha_tau_ppb, 6);
-  science.add("alpha_tau_stderr_ppb", row.alpha_tau_stderr_ppb, 6);
+  science.add("alpha_tau", toFixedDecimal(row.alpha_tau, 12));
+  science.add("alpha_tau_ppb", toFixedDecimal(row.alpha_tau_ppb, 6));
+  science.add("alpha_tau_stderr_ppb", toFixedDecimal(row.alpha_tau_stderr_ppb, 6));
   science.add("alpha_tau_interval_mean_ppb",
-              row.alpha_tau_interval_mean_ppb, 6);
+              toFixedDecimal(row.alpha_tau_interval_mean_ppb, 6));
   science.add("alpha_tau_interval_stderr_ppb",
-              row.alpha_tau_interval_stderr_ppb, 6);
+              toFixedDecimal(row.alpha_tau_interval_stderr_ppb, 6));
   science.add("alpha_tau_intercept_ns", row.alpha_tau_intercept_ns);
   science.add("alpha_tau_detrended_fast_residual_ns",
               row.alpha_tau_detrended_fast_residual_ns);
@@ -6882,13 +6887,13 @@ static FLASHMEM void payload_add_clock_science_common(Payload& science,
   science.add("traditional_total_fast_residual_ns",
               row.traditional_total_fast_residual_ns);
   science.add("traditional_total_clock_interval_ns_exact",
-              row.traditional_total_clock_interval_ns_exact, 6);
+              toFixedDecimal(row.traditional_total_clock_interval_ns_exact, 6));
   science.add("traditional_total_gnss_interval_ns_exact",
-              row.traditional_total_gnss_interval_ns_exact, 6);
+              toFixedDecimal(row.traditional_total_gnss_interval_ns_exact, 6));
   science.add("traditional_total_fast_residual_ns_exact",
-              row.traditional_total_fast_residual_ns_exact, 6);
-  science.add("traditional_total_tau", row.traditional_total_tau, 12);
-  science.add("traditional_total_ppb", row.traditional_total_ppb, 6);
+              toFixedDecimal(row.traditional_total_fast_residual_ns_exact, 6));
+  science.add("traditional_total_tau", toFixedDecimal(row.traditional_total_tau, 12));
+  science.add("traditional_total_ppb", toFixedDecimal(row.traditional_total_ppb, 6));
 }
 
 static FLASHMEM void payload_add_vclock_science_object(Payload& lane,
@@ -7471,17 +7476,17 @@ static FLASHMEM void payload_add_counterledger_candidate_object(
   obj.add("block_interval_count", c.block_interval_count);
   obj.add("block_ticks", c.block_ticks);
   obj.add("block_fast_residual_sum_ns", c.block_fast_residual_sum_ns);
-  obj.add("block_mean_fast_residual_ns", c.block_mean_fast_residual_ns, 6);
-  obj.add("block_tau", c.block_tau, 12);
-  obj.add("block_ppb", c.block_ppb, 6);
+  obj.add("block_mean_fast_residual_ns", toFixedDecimal(c.block_mean_fast_residual_ns, 6));
+  obj.add("block_tau", toFixedDecimal(c.block_tau, 12));
+  obj.add("block_ppb", toFixedDecimal(c.block_ppb, 6));
   obj.add("block_phase_valid", c.block_phase_valid);
   obj.add("block_ns_with_phase", c.block_ns_with_phase);
   obj.add("block_fast_residual_sum_ns_with_phase",
           c.block_fast_residual_sum_ns_with_phase);
   obj.add("block_mean_fast_residual_ns_with_phase",
-          c.block_mean_fast_residual_ns_with_phase, 6);
-  obj.add("block_tau_with_phase", c.block_tau_with_phase, 12);
-  obj.add("block_ppb_with_phase", c.block_ppb_with_phase, 6);
+          toFixedDecimal(c.block_mean_fast_residual_ns_with_phase, 6));
+  obj.add("block_tau_with_phase", toFixedDecimal(c.block_tau_with_phase, 12));
+  obj.add("block_ppb_with_phase", toFixedDecimal(c.block_ppb_with_phase, 6));
   obj.add("completed_block_count", c.completed_block_count);
   obj.add("completed_block_valid", c.completed_block_valid);
   obj.add("completed_block_start_pps_sequence",
@@ -7493,19 +7498,19 @@ static FLASHMEM void payload_add_counterledger_candidate_object(
   obj.add("completed_block_fast_residual_sum_ns",
           c.completed_block_fast_residual_sum_ns);
   obj.add("completed_block_mean_fast_residual_ns",
-          c.completed_block_mean_fast_residual_ns, 6);
-  obj.add("completed_block_tau", c.completed_block_tau, 12);
-  obj.add("completed_block_ppb", c.completed_block_ppb, 6);
+          toFixedDecimal(c.completed_block_mean_fast_residual_ns, 6));
+  obj.add("completed_block_tau", toFixedDecimal(c.completed_block_tau, 12));
+  obj.add("completed_block_ppb", toFixedDecimal(c.completed_block_ppb, 6));
   obj.add("completed_block_phase_valid", c.completed_block_phase_valid);
   obj.add("completed_block_ns_with_phase", c.completed_block_ns_with_phase);
   obj.add("completed_block_fast_residual_sum_ns_with_phase",
           c.completed_block_fast_residual_sum_ns_with_phase);
   obj.add("completed_block_mean_fast_residual_ns_with_phase",
-          c.completed_block_mean_fast_residual_ns_with_phase, 6);
+          toFixedDecimal(c.completed_block_mean_fast_residual_ns_with_phase, 6));
   obj.add("completed_block_tau_with_phase",
-          c.completed_block_tau_with_phase, 12);
+          toFixedDecimal(c.completed_block_tau_with_phase, 12));
   obj.add("completed_block_ppb_with_phase",
-          c.completed_block_ppb_with_phase, 6);
+          toFixedDecimal(c.completed_block_ppb_with_phase, 6));
   obj.add("block_gap_reset_count", c.block_gap_reset_count);
   lane.add_object("counterledger", obj);
 }
@@ -7719,25 +7724,25 @@ static FLASHMEM void payload_add_servo_input_diag(Payload& lane,
   input.add("selected_source", servo_input_source_name(d.selected_source));
   input.add("selected_source_id", d.selected_source);
   input.add("selected_valid", d.selected_input_valid);
-  input.add("selected_ppb", d.selected_input_ppb, 6);
+  input.add("selected_ppb", toFixedDecimal(d.selected_input_ppb, 6));
   input.add("selected_residual_ns", d.selected_residual_ns);
   input.add("pps_residual_valid", d.pps_residual_valid);
   input.add("pps_fast_residual_ns", d.pps_fast_residual_ns);
   input.add("pps_gnss_interval_ns", d.pps_gnss_interval_ns);
   input.add("pps_clock_interval_ns", d.pps_clock_interval_ns);
   input.add("mean_welford_n", d.mean_welford_n);
-  input.add("mean_welford_ppb", d.mean_welford_ppb, 6);
+  input.add("mean_welford_ppb", toFixedDecimal(d.mean_welford_ppb, 6));
   input.add("mean_input_valid", d.mean_input_valid);
-  input.add("total_tau", d.total_tau, 12);
-  input.add("total_ppb", d.total_ppb, 6);
+  input.add("total_tau", toFixedDecimal(d.total_tau, 12));
+  input.add("total_ppb", toFixedDecimal(d.total_ppb, 6));
   input.add("total_input_valid", d.total_input_valid);
   input.add("total_catchup_active", d.total_catchup_active);
-  input.add("total_catchup_target_now_ppb", d.total_catchup_target_now_ppb, 6);
-  input.add("total_catchup_control_error_ppb", d.total_catchup_control_error_ppb, 6);
-  input.add("total_catchup_elapsed_seconds", d.total_catchup_elapsed_seconds, 3);
-  input.add("total_catchup_horizon_seconds", d.total_catchup_horizon_seconds, 3);
-  input.add("total_catchup_max_target_ppb", d.total_catchup_max_target_ppb, 3);
-  input.add("now_ppb", d.now_ppb, 6);
+  input.add("total_catchup_target_now_ppb", toFixedDecimal(d.total_catchup_target_now_ppb, 6));
+  input.add("total_catchup_control_error_ppb", toFixedDecimal(d.total_catchup_control_error_ppb, 6));
+  input.add("total_catchup_elapsed_seconds", toFixedDecimal(d.total_catchup_elapsed_seconds, 3));
+  input.add("total_catchup_horizon_seconds", toFixedDecimal(d.total_catchup_horizon_seconds, 3));
+  input.add("total_catchup_max_target_ppb", toFixedDecimal(d.total_catchup_max_target_ppb, 3));
+  input.add("now_ppb", toFixedDecimal(d.now_ppb, 6));
   input.add("now_input_valid", d.now_input_valid);
   lane.add_object("servo_input", input);
 }
@@ -7775,24 +7780,23 @@ static FLASHMEM void payload_add_dac_realization_object(Payload& parent,
   r.add("mode", ocxo_dac_realization_mode_runtime());
   r.add("reference_mode", OCXO_DAC_REFERENCE_MODE);
   r.add("external_vref_used", false);
-  r.add("internal_ref_voltage", OCXO_DAC_INTERNAL_REF_VOLTAGE, 9);
-  r.add("output_gain", OCXO_DAC_OUTPUT_GAIN, 3);
-  r.add("output_full_scale_voltage", OCXO_DAC_OUTPUT_FULL_SCALE_VOLTAGE, 9);
-  r.add("dac_code_scale", OCXO_DAC_CODE_SCALE, 1);
-  r.add("safe_max_output_voltage", OCXO_DAC_SAFE_MAX_OUTPUT_VOLTAGE, 9);
+  r.add("internal_ref_voltage", toFixedDecimal(OCXO_DAC_INTERNAL_REF_VOLTAGE, 9));
+  r.add("output_gain", toFixedDecimal(OCXO_DAC_OUTPUT_GAIN, 3));
+  r.add("output_full_scale_voltage", toFixedDecimal(OCXO_DAC_OUTPUT_FULL_SCALE_VOLTAGE, 9));
+  r.add("dac_code_scale", toFixedDecimal(OCXO_DAC_CODE_SCALE, 1));
+  r.add("safe_max_output_voltage", toFixedDecimal(OCXO_DAC_SAFE_MAX_OUTPUT_VOLTAGE, 9));
   r.add("safe_max_hw_code", (uint32_t)OCXO_DAC_SAFE_MAX_HW_CODE);
-  r.add("fractional_target", s.dac_fractional, 6);
+  r.add("fractional_target", toFixedDecimal(s.dac_fractional, 6));
   r.add("fractional_target_voltage",
-        ocxo_dac_voltage_from_code(s.dac_fractional), 9);
+        toFixedDecimal(ocxo_dac_voltage_from_code(s.dac_fractional), 9));
   r.add("current_hw_code", (uint32_t)s.dac_hw_code);
   r.add("current_hw_voltage",
-        ocxo_dac_voltage_from_code((double)s.dac_hw_code), 9);
+        toFixedDecimal(ocxo_dac_voltage_from_code((double)s.dac_hw_code), 9));
   r.add("rounded_hw_code",
         (uint32_t)ocxo_dac_rounded_hw_code_from_value(s.dac_fractional));
   r.add("rounded_hw_voltage",
-        ocxo_dac_voltage_from_code(
-            (double)ocxo_dac_rounded_hw_code_from_value(s.dac_fractional)),
-        9);
+        toFixedDecimal(ocxo_dac_voltage_from_code(
+            (double)ocxo_dac_rounded_hw_code_from_value(s.dac_fractional)), 9));
 
   r.add("safe_ceiling_active", true);
   r.add("static_rounded_only", ocxo_dac_static_rounded_only_runtime());
@@ -8579,8 +8583,8 @@ static FLASHMEM void payload_add_servo_dac_values(Payload& parent) {
   dac.add("realization_mode", ocxo_dac_realization_mode_runtime());
   dac.add("dither_operator_enabled", clocks_ocxo_dac_dither_operator_enabled());
 
-  dac.add("ocxo1_dac", ocxo1_dac.dac_fractional, 6);
-  dac.add("ocxo2_dac", ocxo2_dac.dac_fractional, 6);
+  dac.add("ocxo1_dac", toFixedDecimal(ocxo1_dac.dac_fractional, 6));
+  dac.add("ocxo2_dac", toFixedDecimal(ocxo2_dac.dac_fractional, 6));
   dac.add("ocxo1_hw_code", (uint32_t)ocxo1_dac.dac_hw_code);
   dac.add("ocxo2_hw_code", (uint32_t)ocxo2_dac.dac_hw_code);
 
@@ -9225,12 +9229,12 @@ void clocks_beta_pps(void) {
         science.add("second_residual_cycles",
                     (int32_t)((int64_t)g_dwt_cycles_between_pps_vclock -
                               (int64_t)DWT_EXPECTED_PER_PPS));
-        science.add("tau_1s", 1.0 + dwt_ppb_1s / 1.0e9, 12);
-        science.add("ppb_1s", dwt_ppb_1s, 6);
+        science.add("tau_1s", toFixedDecimal(1.0 + dwt_ppb_1s / 1.0e9, 12));
+        science.add("ppb_1s", toFixedDecimal(dwt_ppb_1s, 6));
         science.add("total_cycles", public_dwt_total);
         science.add("total_expected_cycles", expected_total_cycles);
-        science.add("total_tau", 1.0 + dwt_total_ppb / 1.0e9, 12);
-        science.add("total_ppb", dwt_total_ppb, 6);
+        science.add("total_tau", toFixedDecimal(1.0 + dwt_total_ppb / 1.0e9, 12));
+        science.add("total_ppb", toFixedDecimal(dwt_total_ppb, 6));
         dwt.add_object("science", science);
       }
       p.add_object("dwt", dwt);
@@ -9265,11 +9269,11 @@ void clocks_beta_pps(void) {
         science.add("gnss_interval_ns", CLOCKS_BETA_NS_PER_SECOND);
         science.add("clock_interval_ns", CLOCKS_BETA_NS_PER_SECOND);
         science.add("fast_residual_ns", 0LL);
-        science.add("gnss_interval_ns_exact", (double)CLOCKS_BETA_NS_PER_SECOND, 6);
-        science.add("clock_interval_ns_exact", (double)CLOCKS_BETA_NS_PER_SECOND, 6);
-        science.add("fast_residual_ns_exact", 0.0, 6);
-        science.add("tau_1s", 1.0, 12);
-        science.add("ppb_1s", 0.0, 6);
+        science.add("gnss_interval_ns_exact", toFixedDecimal((double)CLOCKS_BETA_NS_PER_SECOND, 6));
+        science.add("clock_interval_ns_exact", toFixedDecimal((double)CLOCKS_BETA_NS_PER_SECOND, 6));
+        science.add("fast_residual_ns_exact", toFixedDecimal(0.0, 6));
+        science.add("tau_1s", toFixedDecimal(1.0, 12));
+        science.add("ppb_1s", toFixedDecimal(0.0, 6));
         pps.add_object("science", science);
       }
       p.add_object("pps", pps);
@@ -9978,8 +9982,8 @@ static FLASHMEM Payload cmd_flash_cut(const Payload& args) {
   p.add("warmup_suppression", false);
   p.add("request_count", g_flash_cut_request_count);
   p.add("commit_count", g_flash_cut_commit_count);
-  p.add("ocxo1_dac", ocxo1_dac.dac_fractional);
-  p.add("ocxo2_dac", ocxo2_dac.dac_fractional);
+  p.add("ocxo1_dac", toFixedDecimal(ocxo1_dac.dac_fractional, 6));
+  p.add("ocxo2_dac", toFixedDecimal(ocxo2_dac.dac_fractional, 6));
   p.add("ocxo1_dac_last_write_ok", ocxo1_dac.io_last_write_ok);
   p.add("ocxo2_dac_last_write_ok", ocxo2_dac.io_last_write_ok);
   p.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
@@ -10082,16 +10086,16 @@ static FLASHMEM Payload cmd_start(const Payload& args) {
   p.add("epoch_owner", "CLOCKS_SMARTZERO");
   p.add("epoch_sequence", clocks_alpha_epoch_sequence());
   p.add("epoch_reason", clocks_alpha_epoch_last_reason());
-  p.add("ocxo1_dac", ocxo1_dac.dac_fractional);
-  p.add("ocxo2_dac", ocxo2_dac.dac_fractional);
+  p.add("ocxo1_dac", toFixedDecimal(ocxo1_dac.dac_fractional, 6));
+  p.add("ocxo2_dac", toFixedDecimal(ocxo2_dac.dac_fractional, 6));
   p.add("ocxo1_dac_hw_code", (uint32_t)ocxo1_dac.dac_hw_code);
   p.add("ocxo2_dac_hw_code", (uint32_t)ocxo2_dac.dac_hw_code);
   p.add("ocxo1_dac_voltage",
-        ocxo_dac_voltage_from_code((double)ocxo1_dac.dac_hw_code), 9);
+        toFixedDecimal(ocxo_dac_voltage_from_code((double)ocxo1_dac.dac_hw_code), 9));
   p.add("ocxo2_dac_voltage",
-        ocxo_dac_voltage_from_code((double)ocxo2_dac.dac_hw_code), 9);
+        toFixedDecimal(ocxo_dac_voltage_from_code((double)ocxo2_dac.dac_hw_code), 9));
   p.add("dac_reference_mode", OCXO_DAC_REFERENCE_MODE);
-  p.add("dac_safe_max_output_voltage", OCXO_DAC_SAFE_MAX_OUTPUT_VOLTAGE, 9);
+  p.add("dac_safe_max_output_voltage", toFixedDecimal(OCXO_DAC_SAFE_MAX_OUTPUT_VOLTAGE, 9));
   p.add("dac_safe_max_hw_code", (uint32_t)OCXO_DAC_SAFE_MAX_HW_CODE);
   p.add("ocxo1_dac_last_write_ok", ocxo1_dac.io_last_write_ok);
   p.add("ocxo2_dac_last_write_ok", ocxo2_dac.io_last_write_ok);
@@ -10524,9 +10528,8 @@ static FLASHMEM void add_alpha_event_payload(Payload& p,
           (int32_t)((int64_t)f.dwt_cycles_between_edges -
                     (int64_t)vclock_ref->dwt_cycles_between_edges));
     p.add("dwt_interval_ppb_fast_vs_vclock",
-          ppb_fast_vs_vclock(vclock_ref->dwt_cycles_between_edges,
-                             f.dwt_cycles_between_edges),
-          3);
+          toFixedDecimal(ppb_fast_vs_vclock(vclock_ref->dwt_cycles_between_edges,
+                             f.dwt_cycles_between_edges), 3));
     if (f.bridge_interval_valid && vclock_ref->bridge_interval_valid) {
       p.add("bridge_residual_delta_vs_vclock_ns",
             f.bridge_residual_ns - vclock_ref->bridge_residual_ns);
@@ -10774,17 +10777,15 @@ static FLASHMEM void add_clock_forensics_payload(Payload& p,
       deltas.add("ocxo1_phase_offset_delta_vs_vclock_ns",
                  o1f.phase_offset_ns - vf.phase_offset_ns);
       deltas.add("ocxo1_dwt_interval_ppb_fast_vs_vclock",
-                 ppb_fast_vs_vclock(vf.dwt_cycles_between_edges,
-                                    o1f.dwt_cycles_between_edges),
-                 3);
+                 toFixedDecimal(ppb_fast_vs_vclock(vf.dwt_cycles_between_edges,
+                                    o1f.dwt_cycles_between_edges), 3));
     }
     if (vf_ok && o2f_ok) {
       deltas.add("ocxo2_phase_offset_delta_vs_vclock_ns",
                  o2f.phase_offset_ns - vf.phase_offset_ns);
       deltas.add("ocxo2_dwt_interval_ppb_fast_vs_vclock",
-                 ppb_fast_vs_vclock(vf.dwt_cycles_between_edges,
-                                    o2f.dwt_cycles_between_edges),
-                 3);
+                 toFixedDecimal(ppb_fast_vs_vclock(vf.dwt_cycles_between_edges,
+                                    o2f.dwt_cycles_between_edges), 3));
     }
     forensic.add_object("report_deltas", deltas);
   }
@@ -11268,26 +11269,26 @@ static FLASHMEM void add_compact_smartzero_status(Payload& p) {
 
 static FLASHMEM void add_dac_payload(Payload& p) {
   Payload o1;
-  o1.add("dac", ocxo1_dac.dac_fractional);
+  o1.add("dac", toFixedDecimal(ocxo1_dac.dac_fractional, 6));
   o1.add("dac_hw_code", (uint32_t)ocxo1_dac.dac_hw_code);
   o1.add("dac_voltage",
-         ocxo_dac_voltage_from_code((double)ocxo1_dac.dac_hw_code), 9);
+         toFixedDecimal(ocxo_dac_voltage_from_code((double)ocxo1_dac.dac_hw_code), 9));
   o1.add("dac_fractional_voltage",
-         ocxo_dac_voltage_from_code(ocxo1_dac.dac_fractional), 9);
+         toFixedDecimal(ocxo_dac_voltage_from_code(ocxo1_dac.dac_fractional), 9));
   o1.add("dac_min", ocxo1_dac.dac_min);
   o1.add("dac_max", ocxo1_dac.dac_max);
-  o1.add("servo_last_step", ocxo1_dac.servo_last_step, 6);
-  o1.add("servo_last_residual", ocxo1_dac.servo_last_residual, 6);
-  o1.add("servo_last_ppb", ocxo1_dac.servo_last_residual, 6);
+  o1.add("servo_last_step", toFixedDecimal(ocxo1_dac.servo_last_step, 6));
+  o1.add("servo_last_residual", toFixedDecimal(ocxo1_dac.servo_last_residual, 6));
+  o1.add("servo_last_ppb", toFixedDecimal(ocxo1_dac.servo_last_residual, 6));
   o1.add("servo_settle_count", ocxo1_dac.servo_settle_count);
   o1.add("servo_adjustments", ocxo1_dac.servo_adjustments);
   o1.add("servo_predictor_initialized", ocxo1_dac.servo_predictor_initialized);
-  o1.add("servo_filtered_residual", ocxo1_dac.servo_filtered_residual, 6);
-  o1.add("servo_filtered_ppb", ocxo1_dac.servo_filtered_residual, 6);
-  o1.add("servo_filtered_slope", ocxo1_dac.servo_filtered_slope, 6);
-  o1.add("servo_filtered_ppb_delta", ocxo1_dac.servo_filtered_slope, 6);
-  o1.add("servo_predicted_residual", ocxo1_dac.servo_predicted_residual, 6);
-  o1.add("servo_control_ppb", ocxo1_dac.servo_predicted_residual, 6);
+  o1.add("servo_filtered_residual", toFixedDecimal(ocxo1_dac.servo_filtered_residual, 6));
+  o1.add("servo_filtered_ppb", toFixedDecimal(ocxo1_dac.servo_filtered_residual, 6));
+  o1.add("servo_filtered_slope", toFixedDecimal(ocxo1_dac.servo_filtered_slope, 6));
+  o1.add("servo_filtered_ppb_delta", toFixedDecimal(ocxo1_dac.servo_filtered_slope, 6));
+  o1.add("servo_predicted_residual", toFixedDecimal(ocxo1_dac.servo_predicted_residual, 6));
+  o1.add("servo_control_ppb", toFixedDecimal(ocxo1_dac.servo_predicted_residual, 6));
   o1.add("servo_predictor_updates", ocxo1_dac.servo_predictor_updates);
   o1.add("servo_hold_reason", servo_hold_reason_name(ocxo1_dac.servo_hold_reason));
   o1.add("servo_hold_reason_id", (uint32_t)ocxo1_dac.servo_hold_reason);
@@ -11313,8 +11314,8 @@ static FLASHMEM void add_dac_payload(Payload& p) {
   o1.add("dither_pending_hw_write", ocxo1_dac.dither_pending_hw_write);
   o1.add("dither_pending_hw_code", (uint32_t)ocxo1_dac.dither_pending_hw_code);
   o1.add("pacing_pending", ocxo1_dac.pacing_pending);
-  o1.add("pacing_pending_target", ocxo1_dac.pacing_pending_target, 6);
-  o1.add("pacing_pending_step", ocxo1_dac.pacing_pending_step, 6);
+  o1.add("pacing_pending_target", toFixedDecimal(ocxo1_dac.pacing_pending_target, 6));
+  o1.add("pacing_pending_step", toFixedDecimal(ocxo1_dac.pacing_pending_step, 6));
   o1.add("pacing_intents", ocxo1_dac.pacing_intents);
   o1.add("pacing_deferred_count", ocxo1_dac.pacing_deferred_count);
   o1.add("pacing_commit_count", ocxo1_dac.pacing_commit_count);
@@ -11330,26 +11331,26 @@ static FLASHMEM void add_dac_payload(Payload& p) {
   p.add_object("ocxo1", o1);
 
   Payload o2;
-  o2.add("dac", ocxo2_dac.dac_fractional);
+  o2.add("dac", toFixedDecimal(ocxo2_dac.dac_fractional, 6));
   o2.add("dac_hw_code", (uint32_t)ocxo2_dac.dac_hw_code);
   o2.add("dac_voltage",
-         ocxo_dac_voltage_from_code((double)ocxo2_dac.dac_hw_code), 9);
+         toFixedDecimal(ocxo_dac_voltage_from_code((double)ocxo2_dac.dac_hw_code), 9));
   o2.add("dac_fractional_voltage",
-         ocxo_dac_voltage_from_code(ocxo2_dac.dac_fractional), 9);
+         toFixedDecimal(ocxo_dac_voltage_from_code(ocxo2_dac.dac_fractional), 9));
   o2.add("dac_min", ocxo2_dac.dac_min);
   o2.add("dac_max", ocxo2_dac.dac_max);
-  o2.add("servo_last_step", ocxo2_dac.servo_last_step, 6);
-  o2.add("servo_last_residual", ocxo2_dac.servo_last_residual, 6);
-  o2.add("servo_last_ppb", ocxo2_dac.servo_last_residual, 6);
+  o2.add("servo_last_step", toFixedDecimal(ocxo2_dac.servo_last_step, 6));
+  o2.add("servo_last_residual", toFixedDecimal(ocxo2_dac.servo_last_residual, 6));
+  o2.add("servo_last_ppb", toFixedDecimal(ocxo2_dac.servo_last_residual, 6));
   o2.add("servo_settle_count", ocxo2_dac.servo_settle_count);
   o2.add("servo_adjustments", ocxo2_dac.servo_adjustments);
   o2.add("servo_predictor_initialized", ocxo2_dac.servo_predictor_initialized);
-  o2.add("servo_filtered_residual", ocxo2_dac.servo_filtered_residual, 6);
-  o2.add("servo_filtered_ppb", ocxo2_dac.servo_filtered_residual, 6);
-  o2.add("servo_filtered_slope", ocxo2_dac.servo_filtered_slope, 6);
-  o2.add("servo_filtered_ppb_delta", ocxo2_dac.servo_filtered_slope, 6);
-  o2.add("servo_predicted_residual", ocxo2_dac.servo_predicted_residual, 6);
-  o2.add("servo_control_ppb", ocxo2_dac.servo_predicted_residual, 6);
+  o2.add("servo_filtered_residual", toFixedDecimal(ocxo2_dac.servo_filtered_residual, 6));
+  o2.add("servo_filtered_ppb", toFixedDecimal(ocxo2_dac.servo_filtered_residual, 6));
+  o2.add("servo_filtered_slope", toFixedDecimal(ocxo2_dac.servo_filtered_slope, 6));
+  o2.add("servo_filtered_ppb_delta", toFixedDecimal(ocxo2_dac.servo_filtered_slope, 6));
+  o2.add("servo_predicted_residual", toFixedDecimal(ocxo2_dac.servo_predicted_residual, 6));
+  o2.add("servo_control_ppb", toFixedDecimal(ocxo2_dac.servo_predicted_residual, 6));
   o2.add("servo_predictor_updates", ocxo2_dac.servo_predictor_updates);
   o2.add("servo_hold_reason", servo_hold_reason_name(ocxo2_dac.servo_hold_reason));
   o2.add("servo_hold_reason_id", (uint32_t)ocxo2_dac.servo_hold_reason);
@@ -11375,8 +11376,8 @@ static FLASHMEM void add_dac_payload(Payload& p) {
   o2.add("dither_pending_hw_write", ocxo2_dac.dither_pending_hw_write);
   o2.add("dither_pending_hw_code", (uint32_t)ocxo2_dac.dither_pending_hw_code);
   o2.add("pacing_pending", ocxo2_dac.pacing_pending);
-  o2.add("pacing_pending_target", ocxo2_dac.pacing_pending_target, 6);
-  o2.add("pacing_pending_step", ocxo2_dac.pacing_pending_step, 6);
+  o2.add("pacing_pending_target", toFixedDecimal(ocxo2_dac.pacing_pending_target, 6));
+  o2.add("pacing_pending_step", toFixedDecimal(ocxo2_dac.pacing_pending_step, 6));
   o2.add("pacing_intents", ocxo2_dac.pacing_intents);
   o2.add("pacing_deferred_count", ocxo2_dac.pacing_deferred_count);
   o2.add("pacing_commit_count", ocxo2_dac.pacing_commit_count);
@@ -11396,11 +11397,11 @@ static FLASHMEM void add_dac_payload(Payload& p) {
   p.add("realization_mode", ocxo_dac_realization_mode_runtime());
   p.add("reference_mode", OCXO_DAC_REFERENCE_MODE);
   p.add("external_vref_used", false);
-  p.add("internal_ref_voltage", OCXO_DAC_INTERNAL_REF_VOLTAGE, 9);
-  p.add("output_gain", OCXO_DAC_OUTPUT_GAIN, 3);
-  p.add("output_full_scale_voltage", OCXO_DAC_OUTPUT_FULL_SCALE_VOLTAGE, 9);
-  p.add("dac_code_scale", OCXO_DAC_CODE_SCALE, 1);
-  p.add("safe_max_output_voltage", OCXO_DAC_SAFE_MAX_OUTPUT_VOLTAGE, 9);
+  p.add("internal_ref_voltage", toFixedDecimal(OCXO_DAC_INTERNAL_REF_VOLTAGE, 9));
+  p.add("output_gain", toFixedDecimal(OCXO_DAC_OUTPUT_GAIN, 3));
+  p.add("output_full_scale_voltage", toFixedDecimal(OCXO_DAC_OUTPUT_FULL_SCALE_VOLTAGE, 9));
+  p.add("dac_code_scale", toFixedDecimal(OCXO_DAC_CODE_SCALE, 1));
+  p.add("safe_max_output_voltage", toFixedDecimal(OCXO_DAC_SAFE_MAX_OUTPUT_VOLTAGE, 9));
   p.add("safe_max_hw_code", (uint32_t)OCXO_DAC_SAFE_MAX_HW_CODE);
   p.add("static_rounded_only", ocxo_dac_static_rounded_only_runtime());
   p.add("fractional_stream_possible", ocxo_dac_fractional_stream_possible_runtime());
@@ -11424,7 +11425,7 @@ static FLASHMEM void add_dac_payload(Payload& p) {
         (g_ocxo_dac_commit_selected == &ocxo1_dac)
             ? 1U
             : ((g_ocxo_dac_commit_selected == &ocxo2_dac) ? 2U : 0U));
-  p.add("commit_target", g_ocxo_dac_commit_target, 6);
+  p.add("commit_target", toFixedDecimal(g_ocxo_dac_commit_target, 6));
   p.add("commit_target_hw_code", (uint32_t)g_ocxo_dac_commit_target_hw_code);
   p.add("last_schedule_second", g_ocxo_dac_last_schedule_second);
   p.add("last_commit_second",
@@ -13543,8 +13544,8 @@ static FLASHMEM Payload cmd_report_stats(const Payload&) {
   p.add("ocxo2_alpha_tau_samples", ocxo2_tau.sample_count);
   p.add("ocxo1_alpha_tau_intervals", ocxo1_tau.interval_count);
   p.add("ocxo2_alpha_tau_intervals", ocxo2_tau.interval_count);
-  p.add("ocxo1_alpha_tau_stderr_ppb", ocxo1_tau.stderr_ppb, 6);
-  p.add("ocxo2_alpha_tau_stderr_ppb", ocxo2_tau.stderr_ppb, 6);
+  p.add("ocxo1_alpha_tau_stderr_ppb", toFixedDecimal(ocxo1_tau.stderr_ppb, 6));
+  p.add("ocxo2_alpha_tau_stderr_ppb", toFixedDecimal(ocxo2_tau.stderr_ppb, 6));
   p.add("recover_welford_capture_count", g_recover_welford_capture_count);
   p.add("recover_welford_restore_count", g_recover_welford_restore_count);
   p.add("recover_welford_last_restored_lane_count",
@@ -13582,9 +13583,9 @@ static FLASHMEM void payload_add_dither_status_lane_compact(
     const char* key,
     const ocxo_dac_state_t& dac) {
   Payload lane;
-  lane.add("dac", dac.dac_fractional, 6);
+  lane.add("dac", toFixedDecimal(dac.dac_fractional, 6));
   lane.add("hw_code", (uint32_t)dac.dac_hw_code);
-  lane.add("voltage", ocxo_dac_voltage_from_code((double)dac.dac_hw_code), 9);
+  lane.add("voltage", toFixedDecimal(ocxo_dac_voltage_from_code((double)dac.dac_hw_code), 9));
 
   lane.add("active", dac.dither_active_this_frame);
   lane.add("low_code", (uint32_t)dac.dither_low_code);
@@ -13726,24 +13727,24 @@ static FLASHMEM Payload cmd_set_dac(const Payload& args) {
   }
 
   Payload p;
-  p.add("ocxo1_dac", ocxo1_dac.dac_fractional);
-  p.add("ocxo2_dac", ocxo2_dac.dac_fractional);
+  p.add("ocxo1_dac", toFixedDecimal(ocxo1_dac.dac_fractional, 6));
+  p.add("ocxo2_dac", toFixedDecimal(ocxo2_dac.dac_fractional, 6));
   p.add("ocxo1_dac_last_write_ok", ocxo1_dac.io_last_write_ok);
   p.add("ocxo2_dac_last_write_ok", ocxo2_dac.io_last_write_ok);
   p.add("ocxo1_dac_hw_code", (uint32_t)ocxo1_dac.dac_hw_code);
   p.add("ocxo2_dac_hw_code", (uint32_t)ocxo2_dac.dac_hw_code);
   p.add("ocxo1_dac_voltage",
-        ocxo_dac_voltage_from_code((double)ocxo1_dac.dac_hw_code), 9);
+        toFixedDecimal(ocxo_dac_voltage_from_code((double)ocxo1_dac.dac_hw_code), 9));
   p.add("ocxo2_dac_voltage",
-        ocxo_dac_voltage_from_code((double)ocxo2_dac.dac_hw_code), 9);
+        toFixedDecimal(ocxo_dac_voltage_from_code((double)ocxo2_dac.dac_hw_code), 9));
   p.add("realization_mode", ocxo_dac_realization_mode_runtime());
   p.add("reference_mode", OCXO_DAC_REFERENCE_MODE);
   p.add("external_vref_used", false);
-  p.add("internal_ref_voltage", OCXO_DAC_INTERNAL_REF_VOLTAGE, 9);
-  p.add("output_gain", OCXO_DAC_OUTPUT_GAIN, 3);
-  p.add("output_full_scale_voltage", OCXO_DAC_OUTPUT_FULL_SCALE_VOLTAGE, 9);
-  p.add("dac_code_scale", OCXO_DAC_CODE_SCALE, 1);
-  p.add("safe_max_output_voltage", OCXO_DAC_SAFE_MAX_OUTPUT_VOLTAGE, 9);
+  p.add("internal_ref_voltage", toFixedDecimal(OCXO_DAC_INTERNAL_REF_VOLTAGE, 9));
+  p.add("output_gain", toFixedDecimal(OCXO_DAC_OUTPUT_GAIN, 3));
+  p.add("output_full_scale_voltage", toFixedDecimal(OCXO_DAC_OUTPUT_FULL_SCALE_VOLTAGE, 9));
+  p.add("dac_code_scale", toFixedDecimal(OCXO_DAC_CODE_SCALE, 1));
+  p.add("safe_max_output_voltage", toFixedDecimal(OCXO_DAC_SAFE_MAX_OUTPUT_VOLTAGE, 9));
   p.add("safe_max_hw_code", (uint32_t)OCXO_DAC_SAFE_MAX_HW_CODE);
   p.add("static_rounded_only", ocxo_dac_static_rounded_only_runtime());
   p.add("fractional_stream_possible", ocxo_dac_fractional_stream_possible_runtime());

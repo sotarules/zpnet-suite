@@ -1838,10 +1838,10 @@ static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
   p.add("cpu_freq_mhz", (uint32_t)(F_CPU_ACTUAL / 1000000UL));
 
   // CPU temperature (best-effort)
-  p.add("cpu_temp_c", cpuTempC());
+  p.add("cpu_temp_c", toFixedDecimal(cpuTempC(), 6));
 
   // Internal reference voltage (best-effort)
-  p.add("vref_v", readVrefVolts());
+  p.add("vref_v", toFixedDecimal(readVrefVolts(), 6));
 
   // Heap availability
   p.add("free_heap_bytes", freeHeapBytes());
@@ -1884,9 +1884,12 @@ static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
 
   // CPU usage now means non-spin foreground/ISR work.  True core occupancy is
   // intentionally near 100% because the idle DWT witness loop runs when idle.
-  p.add("cpu_usage_pct", cpu_work_pct_milli / 1000.0f);
-  p.add("cpu_work_pct", cpu_work_pct_milli / 1000.0f);
-  p.add("cpu_idle_spin_pct", cpu_idle_spin_pct_milli / 1000.0f);
+  p.add("cpu_usage_pct",
+        toFixedDecimal(cpu_work_pct_milli / 1000.0f, 6));
+  p.add("cpu_work_pct",
+        toFixedDecimal(cpu_work_pct_milli / 1000.0f, 6));
+  p.add("cpu_idle_spin_pct",
+        toFixedDecimal(cpu_idle_spin_pct_milli / 1000.0f, 6));
 
   // CPU usage diagnostics
   p.add("cpu_work_cycles", (uint32_t)cpu_window_work_cycles);
@@ -1927,7 +1930,8 @@ static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
         memory_health_reason_name(g_system_memory_watchdog_health.primary_reason));
 
   // Legacy accounted callback-busy diagnostics.
-  p.add("cpu_accounted_busy_pct", cpu_usage_get_percent());
+  p.add("cpu_accounted_busy_pct",
+        toFixedDecimal(cpu_usage_get_percent(), 6));
   p.add("cpu_busy_cycles", cpu_usage_get_busy_cycles());
   p.add("cpu_total_cycles", cpu_usage_get_total_cycles());
   p.add("cpu_sample_window_ms", cpu_usage_get_sample_window_ms());

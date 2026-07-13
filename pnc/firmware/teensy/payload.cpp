@@ -1,4 +1,5 @@
 #include "payload.h"
+#include "util.h"
 #include "debug.h"
 
 #include <stdarg.h>
@@ -6,7 +7,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
-#include <math.h>
 #include <errno.h>
 #include <limits.h>
 #include <stddef.h>
@@ -193,6 +193,8 @@ enum payload_error_code_t : uint32_t {
     PAYLOAD_ERR_NONFINITE_NUMBER = 16,
     PAYLOAD_ERR_INVALID_NUMERIC_TOKEN = 17,
     PAYLOAD_ERR_INVALID_CHILD = 18,
+    PAYLOAD_ERR_FIXED_DECIMAL_RANGE = 19,
+    PAYLOAD_ERR_FLOAT_FORMAT_FORBIDDEN = 20,
 };
 
 const char* payload_error_code_name(uint32_t code) {
@@ -216,6 +218,8 @@ const char* payload_error_code_name(uint32_t code) {
         case PAYLOAD_ERR_NONFINITE_NUMBER:   return "NONFINITE_NUMBER";
         case PAYLOAD_ERR_INVALID_NUMERIC_TOKEN: return "INVALID_NUMERIC_TOKEN";
         case PAYLOAD_ERR_INVALID_CHILD:      return "INVALID_CHILD";
+        case PAYLOAD_ERR_FIXED_DECIMAL_RANGE: return "FIXED_DECIMAL_RANGE";
+        case PAYLOAD_ERR_FLOAT_FORMAT_FORBIDDEN: return "FLOAT_FORMAT_FORBIDDEN";
         default:                             return "UNKNOWN";
     }
 }
@@ -310,6 +314,7 @@ enum payload_numeric_reject_reason_t : uint32_t {
     PAYLOAD_NUMERIC_REJECT_NEGATIVE_INFINITY = 3,
     PAYLOAD_NUMERIC_REJECT_INVALID_TOKEN = 4,
     PAYLOAD_NUMERIC_REJECT_FORMAT_FAILURE = 5,
+    PAYLOAD_NUMERIC_REJECT_OUT_OF_RANGE = 6,
 };
 
 const char* payload_numeric_reject_reason_name(uint32_t reason) {
@@ -320,6 +325,7 @@ const char* payload_numeric_reject_reason_name(uint32_t reason) {
         case PAYLOAD_NUMERIC_REJECT_NEGATIVE_INFINITY: return "NEGATIVE_INFINITY";
         case PAYLOAD_NUMERIC_REJECT_INVALID_TOKEN: return "INVALID_TOKEN";
         case PAYLOAD_NUMERIC_REJECT_FORMAT_FAILURE: return "FORMAT_FAILURE";
+        case PAYLOAD_NUMERIC_REJECT_OUT_OF_RANGE: return "OUT_OF_RANGE";
         default: return "UNKNOWN";
     }
 }
@@ -371,6 +377,8 @@ enum payload_operation_id_t : uint32_t {
     PAYLOAD_OP_ADD_DOUBLE = 0x72DB5A0CUL,
     PAYLOAD_OP_ADD_DOUBLE_PRECISION = 0xB5BA038BUL,
     PAYLOAD_OP_ADD_FLOAT = 0xF0CDAC89UL,
+    PAYLOAD_OP_ADD_FIXED_DECIMAL = 0x36F83575UL,
+    PAYLOAD_OP_ADD_FIXED_DECIMAL_KEY = 0xB66DA308UL,
     PAYLOAD_OP_ADD_FMT = 0x04FEDBF4UL,
     PAYLOAD_OP_ADD_FMT_FORMAT = 0x0ADAD95DUL,
     PAYLOAD_OP_ADD_FMT_KEY = 0x891B83D5UL,
@@ -483,6 +491,8 @@ const char* payload_operation_id_name(uint32_t operation_id) {
         case PAYLOAD_OP_ADD_DOUBLE: return "add_double";
         case PAYLOAD_OP_ADD_DOUBLE_PRECISION: return "add_double_precision";
         case PAYLOAD_OP_ADD_FLOAT: return "add_float";
+        case PAYLOAD_OP_ADD_FIXED_DECIMAL: return "add_fixed_decimal";
+        case PAYLOAD_OP_ADD_FIXED_DECIMAL_KEY: return "add_fixed_decimal.key";
         case PAYLOAD_OP_ADD_FMT: return "add_fmt";
         case PAYLOAD_OP_ADD_FMT_FORMAT: return "add_fmt.format";
         case PAYLOAD_OP_ADD_FMT_KEY: return "add_fmt.key";
@@ -683,14 +693,14 @@ static void payload_note_numeric_reject(uint32_t reason,
                                         const void* self,
                                         const char* key,
                                         size_t key_len,
-                                        double value,
+                                        uint64_t source_value_bits,
                                         int precision,
                                         const char* format,
                                         size_t format_capacity,
                                         int format_return,
                                         const char* text,
                                         size_t text_capacity,
-                                        int snprintf_return) {
+                                        int formatter_return) {
     g_payload_last_numeric_reject_reason = reason;
     g_payload_last_numeric_reject_op_id = operation_id;
     g_payload_last_numeric_reject_this = (uint32_t)(uintptr_t)self;
@@ -699,14 +709,13 @@ static void payload_note_numeric_reject(uint32_t reason,
                             key,
                             key_len);
 
-    uint64_t value_bits = 0U;
-    static_assert(sizeof(value_bits) == sizeof(value),
-                  "double evidence size mismatch");
-    memcpy(&value_bits, &value, sizeof(value_bits));
-    g_payload_last_numeric_reject_value_bits = value_bits;
+    // Retained telemetry field names remain source-compatible with the former
+    // floating-point API.  util.cpp captures the source IEEE-754 bits before
+    // Payload receives this integer-only admission object.
+    g_payload_last_numeric_reject_value_bits = source_value_bits;
     g_payload_last_numeric_reject_precision = precision;
     g_payload_last_numeric_reject_format_return = format_return;
-    g_payload_last_numeric_reject_snprintf_return = snprintf_return;
+    g_payload_last_numeric_reject_snprintf_return = formatter_return;
 
     bool format_terminated = false;
     const size_t format_len =
@@ -716,7 +725,7 @@ static void payload_note_numeric_reject(uint32_t reason,
                             sizeof(g_payload_last_numeric_reject_format),
                             format,
                             format_len);
-    payload_capture_numeric_text(text, text_capacity, snprintf_return);
+    payload_capture_numeric_text(text, text_capacity, formatter_return);
 
     switch (reason) {
         case PAYLOAD_NUMERIC_REJECT_NAN:
@@ -735,6 +744,7 @@ static void payload_note_numeric_reject(uint32_t reason,
             g_payload_numeric_invalid_token++;
             break;
         case PAYLOAD_NUMERIC_REJECT_FORMAT_FAILURE:
+        case PAYLOAD_NUMERIC_REJECT_OUT_OF_RANGE:
             g_payload_numeric_format_failure++;
             break;
         default:
@@ -2917,105 +2927,80 @@ static bool payload_format_checked(char* out,
 
 
 // ============================================================================
-// ZPNet fixed-decimal formatter
+// Integer-only fixed-decimal rendering
 // ============================================================================
 //
-// Payload needs one narrow numeric language: finite fixed-point decimal with a
-// bounded precision.  Do not route this through printf/snprintf or locale-aware
-// libc formatting.  The implementation is allocation-free, writes only after
-// the complete output size is known, normalizes negative zero, and performs
-// half-away-from-zero rounding using one guard digit.
-//
-// The magnitude ceiling is deliberately below UINT64_MAX so conversion of the
-// integral part is always defined on every supported compiler.
-//
-bool zpnet_format_fixed(double value,
-                        uint32_t precision,
-                        char* out,
-                        size_t out_size,
-                        size_t* out_length) {
-    static constexpr uint32_t MAX_PRECISION = 12U;
-    static constexpr double MAX_MAGNITUDE = 9000000000000000000.0;
+// Conversion from float/double happens in util.cpp and produces fixed_decimal_t.
+// From this boundary onward Payload operates only on integer decimal parts.
+
+static bool payload_format_fixed_decimal(const fixed_decimal_t& value,
+                                         char* out,
+                                         size_t out_size,
+                                         size_t* out_length) {
+    static constexpr uint64_t POW10[] = {
+        1ULL,
+        10ULL,
+        100ULL,
+        1000ULL,
+        10000ULL,
+        100000ULL,
+        1000000ULL,
+        10000000ULL,
+        100000000ULL,
+        1000000000ULL,
+        10000000000ULL,
+        100000000000ULL,
+        1000000000000ULL,
+    };
 
     if (out_length) *out_length = 0U;
     if (!out || out_size == 0U) return false;
     out[0] = '\0';
 
-    if (precision > MAX_PRECISION || value != value) return false;
-
-    const bool negative = value < 0.0;
-    const double magnitude = negative ? -value : value;
-    if (magnitude > MAX_MAGNITUDE) return false;
-
-    uint64_t whole = (uint64_t)magnitude;
-    double fraction = magnitude - (double)whole;
-    if (fraction < 0.0) fraction = 0.0;
-    if (fraction >= 1.0) fraction = 0.9999999999999999;
-
-    uint8_t fractional_digits[MAX_PRECISION] = {0U};
-    uint8_t guard_digit = 0U;
-
-    for (uint32_t i = 0U; i <= precision; ++i) {
-        const double scaled = fraction * 10.0;
-        int digit = (int)scaled;
-        if (digit < 0) digit = 0;
-        if (digit > 9) digit = 9;
-
-        fraction = scaled - (double)digit;
-        if (fraction < 0.0) fraction = 0.0;
-        if (fraction > 1.0) fraction = 1.0;
-
-        if (i < precision) {
-            fractional_digits[i] = (uint8_t)digit;
-        } else {
-            guard_digit = (uint8_t)digit;
-        }
+    if (!value.valid() ||
+        value.decimal_places > FIXED_DECIMAL_MAX_PLACES ||
+        value.negative > 1U) {
+        return false;
     }
 
-    if (guard_digit >= 5U) {
-        bool carry = true;
-        for (uint32_t i = precision; i != 0U && carry; --i) {
-            uint8_t& digit = fractional_digits[i - 1U];
-            if (digit == 9U) {
-                digit = 0U;
-            } else {
-                ++digit;
-                carry = false;
-            }
-        }
-        if (carry) {
-            ++whole;
-        }
-    }
-
-    bool rounded_nonzero = whole != 0U;
-    for (uint32_t i = 0U; i < precision && !rounded_nonzero; ++i) {
-        rounded_nonzero = fractional_digits[i] != 0U;
-    }
+    const uint64_t scale = POW10[value.decimal_places];
+    if (value.fractional >= scale) return false;
 
     char reversed_whole[20];
     size_t whole_digits = 0U;
-    uint64_t remaining_whole = whole;
+    uint64_t remaining_whole = value.whole;
     do {
         reversed_whole[whole_digits++] =
-            (char)('0' + (uint8_t)(remaining_whole % 10U));
-        remaining_whole /= 10U;
-    } while (remaining_whole != 0U);
+            (char)('0' + (uint8_t)(remaining_whole % 10ULL));
+        remaining_whole /= 10ULL;
+    } while (remaining_whole != 0ULL);
 
-    const size_t sign_chars = negative && rounded_nonzero ? 1U : 0U;
-    const size_t decimal_chars = precision != 0U ? 1U + precision : 0U;
+    const bool nonzero =
+        value.whole != 0ULL || value.fractional != 0ULL;
+    const size_t sign_chars =
+        (value.negative != 0U && nonzero) ? 1U : 0U;
+    const size_t decimal_chars =
+        value.decimal_places != 0U
+            ? 1U + (size_t)value.decimal_places
+            : 0U;
     const size_t required = sign_chars + whole_digits + decimal_chars;
     if (required + 1U > out_size) return false;
 
     size_t pos = 0U;
     if (sign_chars != 0U) out[pos++] = '-';
+
     while (whole_digits != 0U) {
         out[pos++] = reversed_whole[--whole_digits];
     }
-    if (precision != 0U) {
+
+    if (value.decimal_places != 0U) {
         out[pos++] = '.';
-        for (uint32_t i = 0U; i < precision; ++i) {
-            out[pos++] = (char)('0' + fractional_digits[i]);
+        uint64_t divisor = scale / 10ULL;
+        for (uint32_t i = 0U; i < value.decimal_places; ++i) {
+            const uint8_t digit =
+                (uint8_t)((value.fractional / divisor) % 10ULL);
+            out[pos++] = (char)('0' + digit);
+            divisor /= 10ULL;
         }
     }
 
@@ -3023,6 +3008,94 @@ bool zpnet_format_fixed(double value,
     if (out_length) *out_length = pos;
     return true;
 }
+
+// add_fmt() is a string convenience API, not a back door into Payload's retired
+// floating-point construction path.  Reject every printf floating conversion
+// before va_list processing reaches libc.
+static bool payload_format_uses_floating_conversion(const char* fmt,
+                                                    size_t fmt_len) {
+    if (!fmt) return false;
+
+    for (size_t i = 0U; i < fmt_len; ++i) {
+        if (fmt[i] != '%') continue;
+
+        size_t j = i + 1U;
+        if (j >= fmt_len) break;
+        if (fmt[j] == '%') {
+            i = j;
+            continue;
+        }
+
+        // Optional POSIX positional argument prefix: %3$...
+        size_t digits_begin = j;
+        while (j < fmt_len && isdigit((unsigned char)fmt[j])) ++j;
+        if (j < fmt_len && j != digits_begin && fmt[j] == '$') {
+            ++j;
+        } else {
+            j = digits_begin;
+        }
+
+        while (j < fmt_len &&
+               (fmt[j] == '-' || fmt[j] == '+' || fmt[j] == ' ' ||
+                fmt[j] == '#' || fmt[j] == '0' || fmt[j] == '\'')) {
+            ++j;
+        }
+
+        // Width, including an optional positional '*' argument: *4$
+        if (j < fmt_len && fmt[j] == '*') {
+            ++j;
+            const size_t width_position_begin = j;
+            while (j < fmt_len && isdigit((unsigned char)fmt[j])) ++j;
+            if (j < fmt_len && j != width_position_begin && fmt[j] == '$') {
+                ++j;
+            }
+        } else {
+            while (j < fmt_len && isdigit((unsigned char)fmt[j])) ++j;
+        }
+
+        // Precision, including an optional positional '*' argument: .*5$
+        if (j < fmt_len && fmt[j] == '.') {
+            ++j;
+            if (j < fmt_len && fmt[j] == '*') {
+                ++j;
+                const size_t precision_position_begin = j;
+                while (j < fmt_len && isdigit((unsigned char)fmt[j])) ++j;
+                if (j < fmt_len && j != precision_position_begin &&
+                    fmt[j] == '$') {
+                    ++j;
+                }
+            } else {
+                while (j < fmt_len && isdigit((unsigned char)fmt[j])) ++j;
+            }
+        }
+
+        if (j < fmt_len) {
+            if ((fmt[j] == 'h' || fmt[j] == 'l') &&
+                j + 1U < fmt_len && fmt[j + 1U] == fmt[j]) {
+                j += 2U;
+            } else if (fmt[j] == 'h' || fmt[j] == 'l' ||
+                       fmt[j] == 'j' || fmt[j] == 'z' ||
+                       fmt[j] == 't' || fmt[j] == 'L') {
+                ++j;
+            }
+        }
+
+        if (j >= fmt_len) break;
+        switch (fmt[j]) {
+            case 'a': case 'A':
+            case 'e': case 'E':
+            case 'f': case 'F':
+            case 'g': case 'G':
+                return true;
+            default:
+                break;
+        }
+        i = j;
+    }
+
+    return false;
+}
+
 
 // ============================================================================
 // Semantic construction
@@ -3135,32 +3208,34 @@ bool Payload::add(const char* key, bool value) {
                          text, value ? 4U : 5U, ValueKind::BOOLEAN);
 }
 
-bool Payload::_add_floating(const char* key,
-                            double value,
-                            int precision,
-                            uint32_t operation_id) {
+bool Payload::add(const char* key, const fixed_decimal_t& value) {
+    static constexpr uint32_t operation_id =
+        PAYLOAD_OP_ADD_FIXED_DECIMAL;
+
     size_t key_len = 0;
     if (!payload_key_length(key, &key_len)) {
         payload_note_bad_key(key);
-        payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER, operation_id, this);
+        payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER,
+                           PAYLOAD_OP_ADD_FIXED_DECIMAL_KEY,
+                           this);
         return false;
     }
 
-    if (precision < 0) precision = 0;
-    if (precision > 12) precision = 12;
-
-    static constexpr char FORMATTER_NAME[] = "ZPNET_FIXED";
-    char text[64] = {0};
+    static constexpr char FORMATTER_NAME[] = "SCALED_PARTS";
+    char text[40];
+    text[0] = '\0';
     int formatter_result = 0;
 
-    auto substitute_null = [&](uint32_t reason) -> bool {
+    auto substitute_null = [&](uint32_t reason,
+                               uint32_t error_code) -> bool {
+        payload_note_error(error_code, operation_id, this);
         payload_note_numeric_reject(reason,
                                     operation_id,
                                     this,
                                     key ? key : "",
                                     key_len,
-                                    value,
-                                    precision,
+                                    value.source_bits,
+                                    (int)value.decimal_places,
                                     FORMATTER_NAME,
                                     sizeof(FORMATTER_NAME),
                                     (int)(sizeof(FORMATTER_NAME) - 1U),
@@ -3180,47 +3255,49 @@ bool Payload::_add_floating(const char* key,
         return false;
     };
 
-    if (!isfinite(value)) {
-        uint32_t reason = PAYLOAD_NUMERIC_REJECT_NAN;
-        if (isinf(value)) {
-            reason = signbit(value)
-                ? PAYLOAD_NUMERIC_REJECT_NEGATIVE_INFINITY
-                : PAYLOAD_NUMERIC_REJECT_POSITIVE_INFINITY;
+    if (!value.valid()) {
+        switch (value.status) {
+            case fixed_decimal_status_t::NAN_VALUE:
+                return substitute_null(PAYLOAD_NUMERIC_REJECT_NAN,
+                                       PAYLOAD_ERR_NONFINITE_NUMBER);
+            case fixed_decimal_status_t::POSITIVE_INFINITY:
+                return substitute_null(
+                    PAYLOAD_NUMERIC_REJECT_POSITIVE_INFINITY,
+                    PAYLOAD_ERR_NONFINITE_NUMBER);
+            case fixed_decimal_status_t::NEGATIVE_INFINITY:
+                return substitute_null(
+                    PAYLOAD_NUMERIC_REJECT_NEGATIVE_INFINITY,
+                    PAYLOAD_ERR_NONFINITE_NUMBER);
+            case fixed_decimal_status_t::OUT_OF_RANGE:
+                return substitute_null(PAYLOAD_NUMERIC_REJECT_OUT_OF_RANGE,
+                                       PAYLOAD_ERR_FIXED_DECIMAL_RANGE);
+            default:
+                return substitute_null(PAYLOAD_NUMERIC_REJECT_FORMAT_FAILURE,
+                                       PAYLOAD_ERR_FIXED_DECIMAL_RANGE);
         }
-        payload_note_error(PAYLOAD_ERR_NONFINITE_NUMBER, operation_id, this);
-        return substitute_null(reason);
     }
 
     size_t len = 0U;
-    if (!zpnet_format_fixed(value,
-                            (uint32_t)precision,
-                            text,
-                            sizeof(text),
-                            &len)) {
+    if (!payload_format_fixed_decimal(value,
+                                      text,
+                                      sizeof(text),
+                                      &len)) {
         formatter_result = -1;
-        payload_note_error(PAYLOAD_ERR_STRING_TRUNCATION, operation_id, this);
-        return substitute_null(PAYLOAD_NUMERIC_REJECT_FORMAT_FAILURE);
+        return substitute_null(PAYLOAD_NUMERIC_REJECT_FORMAT_FAILURE,
+                               PAYLOAD_ERR_FIXED_DECIMAL_RANGE);
     }
     formatter_result = (int)len;
 
     if (!json_number_token_valid(text, len)) {
-        payload_note_error(PAYLOAD_ERR_INVALID_NUMERIC_TOKEN, operation_id, this);
-        return substitute_null(PAYLOAD_NUMERIC_REJECT_INVALID_TOKEN);
+        return substitute_null(PAYLOAD_NUMERIC_REJECT_INVALID_TOKEN,
+                               PAYLOAD_ERR_INVALID_NUMERIC_TOKEN);
     }
 
-    return _append_value(key ? key : "", key_len, text, len, ValueKind::NUMBER);
-}
-
-bool Payload::add(const char* key, float value) {
-    return _add_floating(key, (double)value, 6, PAYLOAD_OP_ADD_FLOAT);
-}
-
-bool Payload::add(const char* key, double value) {
-    return _add_floating(key, value, 6, PAYLOAD_OP_ADD_DOUBLE);
-}
-
-bool Payload::add(const char* key, double value, int precision) {
-    return _add_floating(key, value, precision, PAYLOAD_OP_ADD_DOUBLE_PRECISION);
+    return _append_value(key ? key : "",
+                         key_len,
+                         text,
+                         len,
+                         ValueKind::NUMBER);
 }
 
 bool Payload::add_fmt(const char* key, const char* fmt, ...) {
@@ -3237,6 +3314,13 @@ bool Payload::add_fmt(const char* key, const char* fmt, ...) {
         (void)fmt_len;
         payload_note_bad_key(key);
         payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER, PAYLOAD_OP_ADD_FMT_FORMAT, this);
+        return false;
+    }
+
+    if (payload_format_uses_floating_conversion(fmt, fmt_len)) {
+        payload_note_error(PAYLOAD_ERR_FLOAT_FORMAT_FORBIDDEN,
+                           PAYLOAD_OP_ADD_FMT_FORMAT,
+                           this);
         return false;
     }
 
@@ -3864,54 +3948,6 @@ bool Payload::tryGetUInt64(const char* key, uint64_t& out) const {
     return true;
 }
 
-bool Payload::tryGetFloat(const char* key, float& out) const {
-    const Entry* e = _find(key);
-    if (!e || !_entry_ok(*e, (size_t)(e - _entries()), PAYLOAD_OP_TRY_FLOAT)) return false;
-    const ValueKind kind = (ValueKind)e->kind;
-    if (kind != ValueKind::NUMBER && kind != ValueKind::STRING) return false;
-
-    const char* value = _value_ptr(*e);
-    if (!json_number_token_valid(value, e->val_len)) return false;
-    char text[96];
-    if (!payload_copy_token(this, key, value, e->val_len,
-                            PAYLOAD_OP_TRY_FLOAT_TOKEN, text, sizeof(text))) {
-        return false;
-    }
-
-    errno = 0;
-    char* end = nullptr;
-    const float parsed = strtof(text, &end);
-    if (errno == ERANGE || !end || *end != '\0' || !isfinite((double)parsed)) {
-        return false;
-    }
-    out = parsed;
-    return true;
-}
-
-bool Payload::tryGetDouble(const char* key, double& out) const {
-    const Entry* e = _find(key);
-    if (!e || !_entry_ok(*e, (size_t)(e - _entries()), PAYLOAD_OP_TRY_DOUBLE)) return false;
-    const ValueKind kind = (ValueKind)e->kind;
-    if (kind != ValueKind::NUMBER && kind != ValueKind::STRING) return false;
-
-    const char* value = _value_ptr(*e);
-    if (!json_number_token_valid(value, e->val_len)) return false;
-    char text[96];
-    if (!payload_copy_token(this, key, value, e->val_len,
-                            PAYLOAD_OP_TRY_DOUBLE_TOKEN, text, sizeof(text))) {
-        return false;
-    }
-
-    errno = 0;
-    char* end = nullptr;
-    const double parsed = strtod(text, &end);
-    if (errno == ERANGE || !end || *end != '\0' || !isfinite(parsed)) {
-        return false;
-    }
-    out = parsed;
-    return true;
-}
-
 bool Payload::getBool(const char* key, bool default_value) const {
     bool value = false;
     return tryGetBool(key, value) ? value : default_value;
@@ -3930,16 +3966,6 @@ uint32_t Payload::getUInt(const char* key, uint32_t default_value) const {
 uint64_t Payload::getUInt64(const char* key, uint64_t default_value) const {
     uint64_t value = 0;
     return tryGetUInt64(key, value) ? value : default_value;
-}
-
-float Payload::getFloat(const char* key, float default_value) const {
-    float value = 0.0f;
-    return tryGetFloat(key, value) ? value : default_value;
-}
-
-double Payload::getDouble(const char* key, double default_value) const {
-    double value = 0.0;
-    return tryGetDouble(key, value) ? value : default_value;
 }
 
 Payload Payload::getPayload(const char* key) const {

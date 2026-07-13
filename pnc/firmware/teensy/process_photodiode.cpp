@@ -4,6 +4,7 @@
 #include "events.h"
 #include "payload.h"
 #include "process.h"
+#include "util.h"
 
 #include <Arduino.h>
 
@@ -149,7 +150,7 @@ static Payload cmd_report(const Payload& /*args*/) {
   p.add("edge_level", PD.edge_level);
   p.add("edge_pulse_count", PD.edge_pulse_count);
   p.add("analog_raw", PD.analog_raw);
-  p.add("analog_v", PD.analog_v);
+  p.add("analog_v", toFixedDecimal(PD.analog_v, 6));
 
   {
     uint32_t count;

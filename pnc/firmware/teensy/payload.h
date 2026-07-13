@@ -18,8 +18,10 @@
     • Values retain their JSON type; strings are never reclassified by text.
     • Add/attach operations are preflighted and committed transactionally.
     • Public mutators return bool; existing callers may ignore the result.
-    • Invalid floating-point values are represented as JSON null, never omitted
-      and never serialized as non-standard NaN/Infinity tokens.
+    • Payload runtime code performs no float or double conversion. Scientific
+      values cross the construction boundary as integer-only fixed_decimal_t
+      objects; floating read accessors are intentionally retired.
+    • Invalid fixed-decimal objects are represented as JSON null, never omitted.
     • Failed add/copy operations leave the prior semantic document unchanged,
       except for the documented invalid-number-to-null compatibility fallback.
     • parseJSON() is a replacement operation and clears on invalid input, matching
@@ -35,10 +37,10 @@
 
   Compatibility:
 
-    The public API and payload_info_t telemetry shape remain source-compatible
-    with Payload v3. Legacy entry/arena telemetry fields are retained; in v4
-    they describe the single backing store where practical and remain zero when
-    a v3-only concept no longer exists.
+    The payload_info_t telemetry shape remains source-compatible with Payload
+    v3. Legacy entry/arena and floating-number diagnostic fields are retained;
+    retired fields remain zero unless an invalid fixed-decimal admission maps
+    naturally onto the former numeric counters.
 
   ============================================================================
 */
@@ -293,15 +295,10 @@ typedef struct {
 
 void payload_get_flight_info(payload_flight_info_t* out);
 
-// Allocation-free, locale-free fixed-decimal formatter used by Payload and
-// available to other ZPNet reporting code. Precision must be in [0, 12].
-// Returns false for NaN, infinity, out-of-range magnitude, or insufficient
-// output space. On failure, out is an empty C string and out_length is zero.
-bool zpnet_format_fixed(double value,
-                        uint32_t precision,
-                        char* out,
-                        size_t out_size,
-                        size_t* out_length);
+// fixed_decimal_t is defined by util.h.  A forward declaration keeps Payload's
+// header independent of the conversion implementation while allowing the
+// integer-only publication object to cross the API by const reference.
+struct fixed_decimal_t;
 
 class Payload;
 class PayloadArray;
@@ -360,9 +357,14 @@ public:
     bool add(const char* key, const char* value);
     bool add(const char* key, const String& value);
     bool add(const char* key, bool value);
-    bool add(const char* key, float value);
-    bool add(const char* key, double value);
-    bool add(const char* key, double value, int precision);
+    bool add(const char* key, const fixed_decimal_t& value);
+
+    // Construction is deliberately hostile to accidental FP reintroduction.
+    // Call toFixedDecimal() in the owning/reporting module, then pass the
+    // resulting integer-only object to the overload above.
+    bool add(const char* key, float value) = delete;
+    bool add(const char* key, double value) = delete;
+    bool add(const char* key, double value, int precision) = delete;
 
     template <typename T>
     typename std::enable_if<
@@ -382,6 +384,8 @@ public:
         return add(key, (uint64_t)value);
     }
 
+    // String-format convenience only. Floating conversion specifiers
+    // (%a/%e/%f/%g and uppercase forms) are rejected before vsnprintf().
     bool add_fmt(const char* key, const char* fmt, ...);
 
     bool add_object(const char* key, const Payload& obj);
@@ -401,15 +405,11 @@ public:
     bool tryGetInt(const char* key, int32_t& out) const;
     bool tryGetUInt(const char* key, uint32_t& out) const;
     bool tryGetUInt64(const char* key, uint64_t& out) const;
-    bool tryGetFloat(const char* key, float& out) const;
-    bool tryGetDouble(const char* key, double& out) const;
 
     bool     getBool(const char* key, bool default_value = false) const;
     int32_t  getInt(const char* key, int32_t default_value = 0) const;
     uint32_t getUInt(const char* key, uint32_t default_value = 0) const;
     uint64_t getUInt64(const char* key, uint64_t default_value = 0) const;
-    float    getFloat(const char* key, float default_value = 0.0f) const;
-    double   getDouble(const char* key, double default_value = 0.0) const;
 
     // Structured accessors
     Payload      getPayload(const char* key) const;
@@ -513,11 +513,6 @@ private:
                        const char* value,
                        size_t value_len,
                        ValueKind kind);
-
-    bool _add_floating(const char* key,
-                       double value,
-                       int precision,
-                       uint32_t operation_id);
 
     bool _append_value_writer(const char* key,
                               size_t key_len,

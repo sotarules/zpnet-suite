@@ -55,6 +55,7 @@
 #include "config.h"
 #include "process.h"
 #include "payload.h"
+#include "util.h"
 #include "timepop.h"
 #include "time.h"
 
@@ -1000,16 +1001,16 @@ static Payload welford_payload(const welford_t& w) {
 
   Payload p;
   p.add("n",             (uint32_t)w.n);
-  p.add("mean_cycles",   w.mean);
-  p.add("stddev_cycles", stddev_cycles);
-  p.add("stderr_cycles", stderr_cycles);
+  p.add("mean_cycles",   toFixedDecimal(w.mean, 6));
+  p.add("stddev_cycles", toFixedDecimal(stddev_cycles, 6));
+  p.add("stderr_cycles", toFixedDecimal(stderr_cycles, 6));
   p.add("min_cycles",    (int32_t)w.min_val);
   p.add("max_cycles",    (int32_t)w.max_val);
-  p.add("mean_ns",       cycles_to_ns(w.mean));
-  p.add("stddev_ns",     cycles_to_ns(stddev_cycles));
-  p.add("stderr_ns",     cycles_to_ns(stderr_cycles));
-  p.add("min_ns",        cycles_to_ns((double)w.min_val));
-  p.add("max_ns",        cycles_to_ns((double)w.max_val));
+  p.add("mean_ns",       toFixedDecimal(cycles_to_ns(w.mean), 6));
+  p.add("stddev_ns",     toFixedDecimal(cycles_to_ns(stddev_cycles), 6));
+  p.add("stderr_ns",     toFixedDecimal(cycles_to_ns(stderr_cycles), 6));
+  p.add("min_ns",        toFixedDecimal(cycles_to_ns((double)w.min_val), 6));
+  p.add("max_ns",        toFixedDecimal(cycles_to_ns((double)w.max_val), 6));
   return p;
 }
 
@@ -1021,9 +1022,9 @@ static Payload ns_welford_payload(const welford_t& w) {
 
   Payload p;
   p.add("n",         (uint32_t)w.n);
-  p.add("mean_ns",   w.mean);
-  p.add("stddev_ns", stddev_ns);
-  p.add("stderr_ns", stderr_ns);
+  p.add("mean_ns",   toFixedDecimal(w.mean, 6));
+  p.add("stddev_ns", toFixedDecimal(stddev_ns, 6));
+  p.add("stderr_ns", toFixedDecimal(stderr_ns, 6));
   p.add("min_ns",    (w.n > 0) ? (int32_t)w.min_val : 0);
   p.add("max_ns",    (w.n > 0) ? (int32_t)w.max_val : 0);
   return p;
@@ -1335,19 +1336,19 @@ static Payload cmd_pps_phase(const Payload&) {
   selection.add("selected_to_fire_ticks", cap.selected_to_fire_ticks);
   selection.add("selected_to_fire_ns", cap.selected_to_fire_ns);
   selection.add("expected_offset_cycles", cap.expected_offset_cycles);
-  selection.add("expected_offset_ns", cycles_to_ns((double)cap.expected_offset_cycles));
+  selection.add("expected_offset_ns", toFixedDecimal(cycles_to_ns((double)cap.expected_offset_cycles), 6));
   selection.add("dynamic_cps", cap.dynamic_cps);
   selection.add("inferred_pvc_dwt_from_timepop", cap.inferred_pvc_dwt_from_timepop);
   p.add_object("selection", selection);
 
   Payload inferred;
   inferred.add("timepop_vs_pvc_phase_cycles", cap.timepop_vs_pvc_phase_cycles);
-  inferred.add("timepop_vs_pvc_phase_ns", cycles_to_ns((double)cap.timepop_vs_pvc_phase_cycles));
-  inferred.add("timepop_vs_pvc_phase_ticks", cap.timepop_vs_pvc_phase_ticks);
+  inferred.add("timepop_vs_pvc_phase_ns", toFixedDecimal(cycles_to_ns((double)cap.timepop_vs_pvc_phase_cycles), 6));
+  inferred.add("timepop_vs_pvc_phase_ticks", toFixedDecimal(cap.timepop_vs_pvc_phase_ticks, 6));
   inferred.add_object("timepop_vs_pvc_welford", welford_payload(g_phase_timepop_vs_pvc_welford));
   inferred.add("physical_pps_to_selected_vclock_cycles", cap.physical_pps_to_selected_vclock_cycles);
-  inferred.add("physical_pps_to_selected_vclock_ns", cycles_to_ns((double)cap.physical_pps_to_selected_vclock_cycles));
-  inferred.add("physical_pps_to_selected_vclock_ticks", cap.physical_pps_to_selected_vclock_ticks);
+  inferred.add("physical_pps_to_selected_vclock_ns", toFixedDecimal(cycles_to_ns((double)cap.physical_pps_to_selected_vclock_cycles), 6));
+  inferred.add("physical_pps_to_selected_vclock_ticks", toFixedDecimal(cap.physical_pps_to_selected_vclock_ticks, 6));
   inferred.add_object("physical_welford", welford_payload(g_phase_physical_pps_to_selected_welford));
   p.add_object("inferred", inferred);
 
@@ -1375,7 +1376,7 @@ static Payload cmd_gpio_delay(const Payload&) {
   last.add("dwt_before", g_gpio_delay_dwt_before);
   last.add("dwt_after", g_gpio_delay_dwt_after);
   last.add("cycles", g_gpio_delay_cycles);
-  last.add("ns", cycles_to_ns((double)g_gpio_delay_cycles));
+  last.add("ns", toFixedDecimal(cycles_to_ns((double)g_gpio_delay_cycles), 6));
   p.add_object("last", last);
 
   p.add_object("welford", welford_payload(g_gpio_delay_welford));
@@ -1397,7 +1398,7 @@ static Payload cmd_dwt_read(const Payload&) {
   last.add("dwt_before", g_dwt_read_before);
   last.add("dwt_after", g_dwt_read_after);
   last.add("cycles", g_dwt_read_cycles);
-  last.add("ns", cycles_to_ns((double)g_dwt_read_cycles));
+  last.add("ns", toFixedDecimal(cycles_to_ns((double)g_dwt_read_cycles), 6));
   p.add_object("last", last);
 
   p.add_object("welford", welford_payload(g_dwt_read_welford));
@@ -1436,14 +1437,14 @@ static Payload cmd_gpt_stim(const Payload&) {
   last.add("dwt_at_arm", g_gpt_dwt_at_arm);
   last.add("dwt_at_isr", g_gpt_dwt_at_isr);
   last.add("delta_cycles", g_gpt_delta_cycles);
-  last.add("delta_ns", cycles_to_ns((double)g_gpt_delta_cycles));
+  last.add("delta_ns", toFixedDecimal(cycles_to_ns((double)g_gpt_delta_cycles), 6));
   last.add("cnt_at_arm", g_gpt_cnt_at_arm);
   last.add("expected_counter", g_gpt_expected_counter);
   last.add("cnt_at_isr", g_gpt_cnt_at_isr);
   last.add("counter_residual_ticks", g_gpt_counter_residual_ticks);
   last.add("sr_at_isr", g_gpt_sr_at_isr);
   last.add("entry_to_counter_read_cycles", g_gpt_entry_to_counter_read_cycles);
-  last.add("entry_to_counter_read_ns", cycles_to_ns((double)g_gpt_entry_to_counter_read_cycles));
+  last.add("entry_to_counter_read_ns", toFixedDecimal(cycles_to_ns((double)g_gpt_entry_to_counter_read_cycles), 6));
   p.add_object("last", last);
 
   p.add_object("latency", welford_payload(g_gpt_welford));
@@ -1508,11 +1509,11 @@ static Payload cmd_qtimer_read(const Payload&) {
   last.add("dwt_after_counter_read", g_qtimer_read_dwt_after_counter_read);
   last.add("counter32_at_read", g_qtimer_read_counter32_at_read);
   last.add("entry_to_read_start_cycles", g_qtimer_read_entry_to_read_start_cycles);
-  last.add("entry_to_read_start_ns", cycles_to_ns((double)g_qtimer_read_entry_to_read_start_cycles));
+  last.add("entry_to_read_start_ns", toFixedDecimal(cycles_to_ns((double)g_qtimer_read_entry_to_read_start_cycles), 6));
   last.add("counter_read_cost_cycles", g_qtimer_read_counter_read_cost_cycles);
-  last.add("counter_read_cost_ns", cycles_to_ns((double)g_qtimer_read_counter_read_cost_cycles));
+  last.add("counter_read_cost_ns", toFixedDecimal(cycles_to_ns((double)g_qtimer_read_counter_read_cost_cycles), 6));
   last.add("entry_to_read_end_cycles", g_qtimer_read_entry_to_read_end_cycles);
-  last.add("entry_to_read_end_ns", cycles_to_ns((double)g_qtimer_read_entry_to_read_end_cycles));
+  last.add("entry_to_read_end_ns", toFixedDecimal(cycles_to_ns((double)g_qtimer_read_entry_to_read_end_cycles), 6));
   p.add_object("last", last);
 
   p.add_object("entry_to_read_start", welford_payload(g_qtimer_read_entry_to_read_start_welford));
@@ -1543,10 +1544,10 @@ static Payload entry_latency_payload(const entry_latency_state_t& s) {
   last.add("shadow_dwt", s.shadow_dwt);
   last.add("shadow_at_isr", s.shadow_at_isr);
   last.add("approach_cycles", s.approach_cycles);
-  last.add("approach_ns", cycles_to_ns((double)s.approach_cycles));
+  last.add("approach_ns", toFixedDecimal(cycles_to_ns((double)s.approach_cycles), 6));
   last.add("isr_entry_dwt_raw", s.isr_entry_dwt_raw);
   last.add("entry_latency_cycles", s.entry_latency_cycles);
-  last.add("entry_latency_ns", cycles_to_ns((double)s.entry_latency_cycles));
+  last.add("entry_latency_ns", toFixedDecimal(cycles_to_ns((double)s.entry_latency_cycles), 6));
   p.add_object("last", last);
 
   p.add_object("welford", welford_payload(s.welford));
@@ -1564,7 +1565,7 @@ static Payload cmd_entry_latency(const Payload&) {
   p.add("model", "ISR_ENTRY_LATENCY_FROM_SPIN_SHADOW");
   p.add("lead_ns", ENTRY_LATENCY_LEAD_NS);
   p.add("timeout_cycles", ENTRY_LATENCY_TIMEOUT_CYCLES);
-  p.add("timeout_ns", cycles_to_ns((double)ENTRY_LATENCY_TIMEOUT_CYCLES));
+  p.add("timeout_ns", toFixedDecimal(cycles_to_ns((double)ENTRY_LATENCY_TIMEOUT_CYCLES), 6));
   p.add_object("pps", entry_latency_payload(g_entry_pps));
   return p;
 }
@@ -1669,13 +1670,13 @@ static Payload cmd_round_trip(const Payload&) {
 
   Payload stimulate;
   stimulate.add("last_cycles", g_source_stim_cycles);
-  stimulate.add("last_ns", cycles_to_ns((double)g_source_stim_cycles));
+  stimulate.add("last_ns", toFixedDecimal(cycles_to_ns((double)g_source_stim_cycles), 6));
   stimulate.add_object("welford", welford_payload(g_source_welford));
   p.add_object("stimulate", stimulate);
 
   Payload gpio;
   gpio.add("last_cycles", g_gpio_delta_cycles);
-  gpio.add("last_ns", cycles_to_ns((double)g_gpio_delta_cycles));
+  gpio.add("last_ns", toFixedDecimal(cycles_to_ns((double)g_gpio_delta_cycles), 6));
   gpio.add_object("welford", welford_payload(g_gpio_welford));
   p.add_object("gpio", gpio);
 
@@ -1692,11 +1693,11 @@ static Payload cmd_round_trip(const Payload&) {
   gpt.add("false_irq", g_gpt_false_irq);
   gpt.add("wrong_window", g_gpt_wrong_window);
   gpt.add("last_cycles", g_gpt_delta_cycles);
-  gpt.add("last_ns", cycles_to_ns((double)g_gpt_delta_cycles));
+  gpt.add("last_ns", toFixedDecimal(cycles_to_ns((double)g_gpt_delta_cycles), 6));
   gpt.add("counter_residual_ticks", g_gpt_counter_residual_ticks);
   gpt.add("entry_to_counter_read_cycles", g_gpt_entry_to_counter_read_cycles);
   gpt.add("entry_to_counter_read_ns",
-          cycles_to_ns((double)g_gpt_entry_to_counter_read_cycles));
+          toFixedDecimal(cycles_to_ns((double)g_gpt_entry_to_counter_read_cycles), 6));
   gpt.add("cnt_at_arm", g_gpt_cnt_at_arm);
   gpt.add("expected_counter", g_gpt_expected_counter);
   gpt.add("cnt_at_isr", g_gpt_cnt_at_isr);
