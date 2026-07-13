@@ -1,118 +1,62 @@
 """
-ZPNet CLOCKS Process — TIMEBASE Authority (Pi-side) — v10 PPS/VCLOCK - Revised
+ZPNet CLOCKS Process — TIMEBASE Authority (Pi-side)
 
-Core contract (v2026-03+):
+Core contract:
 
-  CLOCKS is a pure traffic cop and final TIMEBASE arbiter.  It owns NO
-  Teensy clock state.  It receives one TIMEBASE_FRAGMENT candidate containing
-  the science fragment plus embedded forensics, decorates it with Pi-owned
-  environment and GF-8802 evidence, and either persists a compatible immutable
-  TIMEBASE row or logs the complete rejected candidate as a canonical gap.
+  CLOCKS is a traffic cop and final TIMEBASE arbiter. It owns no Teensy
+  clock state. It receives one unified TIMEBASE_FRAGMENT candidate from
+  the Teensy. That candidate contains the science fragment and an embedded
+  forensics object. CLOCKS decorates the accepted candidate with Pi-owned
+  environment, GF-8802, GNSS_RAW, and system-time evidence, then persists a
+  compatible immutable TIMEBASE row shaped as {fragment, forensics}.
+
+  There is no standalone TIMEBASE_FORENSICS subscription in this process and
+  no two-topic pair join. The durable split between ``fragment`` and
+  ``forensics`` is a PostgreSQL compatibility shape reconstructed from the
+  single Teensy message.
 
   Architecture:
-    • Teensy owns: PPS/VCLOCK count, GNSS/PPS/VCLOCK ns, DWT ns/cycles, OCXO1 ns, OCXO2 ns — in TIMEBASE_FRAGMENT
-    • Pi owns: GNSS_RAW ns (synthetic clock from GF-8802 clock drift) — in TIMEBASE
-    • GNSS owns: GF-8802 discipline state — in GET_GNSS_INFO
-    • CLOCKS owns: correlation, campaign lifecycle
+    • Teensy owns: PPS/VCLOCK identity, GNSS/VCLOCK ns, DWT cycles,
+      OCXO1 ns, OCXO2 ns, firmware stats, and embedded forensics.
+    • Pi owns: GNSS_RAW, GF-8802 correlation, environment correlation,
+      campaign lifecycle, final acceptance court, recovery orchestration,
+      and PostgreSQL persistence.
+    • GNSS owns: receiver discipline state exposed through GET_GNSS_INFO.
 
-  Six clock domains/surfaces: PPS/VCLOCK (canonical count/epoch), GNSS/VCLOCK ns, DWT, OCXO1, OCXO2, GNSS_RAW (Pi-side synthetic).
+  START behavior:
 
-  v9: Prediction-aware statistics.
+    START is asynchronous. The Pi creates/activates the campaign, sends the
+    Teensy START command, and returns. The first public TIMEBASE row arrives
+    later through the normal TIMEBASE_FRAGMENT processor. Firmware may privately
+    acquire a lawful PPS0/start-prologue bookend before public PPS1; the Pi does
+    not model those private candidates as skipped campaign rows.
 
-    The Teensy (process_clocks.cpp v10) now computes trend-aware
-    prediction statistics for DWT, OCXO1, and OCXO2.  Instead of measuring
-    residuals against a fixed nominal frequency (which conflates
-    thermal drift range with measurement noise), the Teensy does
-    linear extrapolation from the two most recent per-second deltas:
+  RECOVER behavior:
 
-      predicted_delta = 2 * prev_delta - prev_prev_delta
-      prediction_residual = actual_delta - predicted_delta
-
-    Welford statistics on the prediction residual directly measure
-    the instrument's actual interpolation uncertainty — "how wrong
-    is my best estimate of this second's crystal rate?"
-
-    The prediction residual stddev is the authoritative confidence
-    metric for sub-second interpolation.  For DWT this is ~3-4
-    cycles (3-4 ns); for OCXO1/OCXO2 ~1 tick (100 ns).
-
-    Pi-side changes:
-      • DWT, OCXO1, and OCXO2 prediction stats are passed through from the
-        Teensy fragment and persisted in TIMEBASE records.
-      • Raw deltas (dwt_delta_raw, ocxo1_delta_raw, ocxo2_delta_raw) are persisted.
-      • Pi-side Welford residual trackers for DWT, OCXO1, OCXO2 are
-        REMOVED — the Teensy's prediction stats are strictly
-        superior and the Pi-side trackers were always second-hand.
-      • GNSS Pi-side residual tracking is RETAINED as a stream
-        health canary (GNSS is phase-coherent so residual == 0;
-        any deviation indicates a problem).
-      • The TIMEBASE stats block uses Teensy prediction stats
-        for DWT/OCXO1/OCXO2 and Pi-side canary stats for GNSS.
-      • The report clock blocks surface prediction stddev as the
-        authoritative interpolation uncertainty.
-
-  Recovery is symmetric across all four domains:
-
-    projected_gnss_ns = recover_base_pps_vclock_count * NS_PER_SECOND
-    projected_ns = projected_gnss_ns * last_clock_ns // last_gnss_ns
-
-  v11 start behavior:
-
-    START is asynchronous.  The Pi creates the campaign, sends the Teensy
-    START command, marks the campaign active, and returns immediately.
-    The first TIMEBASE_FRAGMENT is accepted later by the normal fragment
-    processor.  CLOCKS records the first-fragment wait time as diagnostic
-    state, but it does not hold the command path hostage while waiting.
-
-  v7 recovery hardening (four fixes):
-
-    1. Campaign deactivated immediately on recovery entry — processor
-       thread ignores all fragments during the entire recovery window.
-    2. Fragment queue drained after lowering the Pi campaign gate in warm
-       recovery — eliminates stale-fragment poisoning without stopping the
-       Teensy's always-on VCLOCK/OCXO event service.
-    3. Pi-side PPS/VCLOCK count expectation matching was removed.
-       Every valid TIMEBASE_FRAGMENT is accepted as Teensy-authored truth.
-    4. Pi-owned GNSS_RAW/Welford recovery state is restored before the
-       first recovered public pair is persisted, so recovery no longer drops
-       the sync row.
-
-  Flash-cut campaign switching:
-
-    START while a campaign is active performs a seamless "flash cut"
-    to the new campaign.  The PPS stream continues uninterrupted.
-    OCXOs are never disturbed.  Nanosecond counters and pps_count
-    reset to zero under the new campaign name.
-
-  Unified candidate queue architecture:
-
-    Candidate reception is decoupled from processing:
-      • on_timebase_fragment() — PUBSUB handler.  Fast path and liveness only.
-      • _process_loop() — dedicated thread, final court, persistence or drop.
+    RECOVER uses the last durable TIMEBASE row as the public base, sends a
+    recover command to the Teensy, waits for the first Pi-accepted public row,
+    and restores Pi-owned GNSS_RAW/Welford state immediately before that row is
+    persisted. Timeline rows may be admitted while OCXO science is explicitly
+    degraded/quarantined, but the final court still rejects malformed or
+    incoherent candidates.
 
 Responsibilities:
-  * Receive unified TIMEBASE_FRAGMENT candidates from Teensy (queue-buffered)
-  * Adjudicate each candidate and log every rejected raw record
-  * Fetch GF-8802 discipline snapshot from GNSS (GET_GNSS_INFO)
-  * Augment fragment with GNSS time, environment, and system time
-  * Publish TIMEBASE
-  * Persist TIMEBASE to PostgreSQL (append-only, best-effort)
-  * Pass through Teensy prediction statistics (authoritative)
-  * Denormalize augmented report into active campaign payload
-  * Recover clocks after restart if campaign is active
-  * Subscribe to WATCHDOG_ANOMALY and initiate Pi-side campaign recovery
-  * Flash-cut to new campaign while running (seamless switch)
-  * Return START asynchronously; first fragment arrival is observed later
-  * Command GNSS into Time Only mode when campaign has a location
+  * Receive unified TIMEBASE_FRAGMENT candidates from Teensy.
+  * Adjudicate each candidate and log every rejected raw record.
+  * Fetch GF-8802 discipline snapshots from GNSS.
+  * Augment accepted rows with environment, GNSS_RAW, and system time.
+  * Publish and persist TIMEBASE rows.
+  * Denormalize the latest accepted TIMEBASE row into the active campaign.
+  * Recover clocks after restart if a campaign is active.
+  * Subscribe to WATCHDOG_ANOMALY and initiate Pi-side campaign recovery.
+  * Flash-cut to a new campaign while preserving the hot Teensy stream.
 
 Semantics:
-  * No smoothing, inference, or filtering
-  * TIMEBASE records are sacred and immutable
-  * Derivative statistics (tau, ppb) live only in
-    the campaign report — never in the TIMEBASE row itself
-  * Prediction stats from the Teensy are passed through verbatim
-  * Gaps, jumps, or regressions in PPS/VCLOCK count are observed and recorded, never rejected
-  * WATCHDOG_ANOMALY triggers Pi-side recovery using the last canonical TIMEBASE
+  * No Pi-side smoothing, inference, or repair of Teensy clock state.
+  * TIMEBASE records are immutable.
+  * Gaps, jumps, regressions, and rejected rows are recorded as evidence.
+  * WATCHDOG_ANOMALY is an explicit Teensy continuity surrender and starts
+    Pi-side recovery from the latest canonical TIMEBASE row.
 """
 
 from __future__ import annotations
@@ -161,7 +105,7 @@ GNSS_WAIT_LOG_INTERVAL = 60
 #
 # START/RECOVER are gated by readiness preflight. The Pi no longer expects
 # fixed row burial/warmup suppression as part of normal campaign admission:
-# the first public TIMEBASE pair is supposed to be useful, and if it is not,
+# the first public TIMEBASE row is supposed to be useful, and if it is not,
 # the responsible readiness or handoff gate should be fixed.
 RECOVERY_FIRST_PUBLIC_OFFSET = 1
 SYNC_FRAGMENT_TIMEOUT_S = 35.0
@@ -169,24 +113,24 @@ SYNC_RECOVER_TIMEOUT_S = 45.0
 SYNC_POLL_S = 0.005
 
 # Recovery may legitimately consume hidden firmware candidates while
-# Alpha/CounterLedger/PhaseLedger proves fresh OCXO custody.  The legacy
-# constant name remains, but this now bounds the wait for the first truthful
-# timeline-admissible pair, not for fully mature OCXO science.
+# Alpha/CounterLedger/PhaseLedger proves fresh OCXO custody.  This now bounds
+# the wait for the first truthful timeline-admissible row, not for fully
+# mature OCXO science.
 SYNC_RECOVER_CLEAN_TIMEOUT_S = 90.0
 
-# A recovery that produces no public TIMEBASE pair inside this window is not
-# merely "not clean yet".  Teensy should either publish a clean pair or, after
+# A recovery that produces no public TIMEBASE row inside this window is not
+# merely "not clean yet".  Teensy should either publish a clean row or, after
 # its bounded private reattach window, publish degraded rows that let the Pi
-# observe liveness.  If the first pair never appears, abort the firmware
+# observe liveness.  If the first row never appears, abort the firmware
 # RECOVER lifecycle explicitly instead of recursively hard-faulting the Pi-side
 # recovery thread.
-RECOVERY_FIRST_PAIR_TIMEOUT_S = 45.0
+RECOVERY_FIRST_ROW_TIMEOUT_S = 45.0
 
 # If a new WATCHDOG_ANOMALY arrives while an auto-recovery attempt is already
 # waiting for the first clean public row, the current attempt has been
 # invalidated.  Abort that wait immediately, clean the Teensy RECOVER
 # lifecycle, and retry from the latest durable TIMEBASE instead of sitting on a
-# stale exact-pair wait until timeout.
+# stale accepted-row wait until timeout.
 AUTO_RECOVERY_MAX_ATTEMPTS = 3
 AUTO_RECOVERY_RETRY_DELAY_S = 1.0
 
@@ -198,7 +142,7 @@ RECOVERY_ADMIT_DEGRADED_TIMELINE = True
 
 # RECOVER transaction watchdog.  A Teensy USB/firmware reboot after CLOCKS.RECOVER
 # has been accepted can erase the in-flight RECOVER lifecycle while the Pi is
-# still waiting for the first public pair.  Poll REPORT_RECOVERY during that
+# still waiting for the first public row.  Poll REPORT_RECOVERY during that
 # wait and retry promptly if the recovered base identity disappears.
 RECOVERY_SYNC_HEALTH_POLL_S = 2.0
 RECOVERY_SYNC_HEALTH_GRACE_S = 3.0
@@ -207,15 +151,14 @@ SYNC_LOG_INTERVAL_S = 5.0
 
 # TIMEBASE ingress queue: maxsize=0 means unbounded.
 #
-# The Teensy now emits one TIMEBASE_FRAGMENT candidate containing both the
-# science fragment and an embedded ``forensics`` object.  The topic name is
-# retained so routing remains stable; PostgreSQL still receives the compatible
-# {fragment, forensics} TIMEBASE shape after Pi-side adjudication.
+# The Teensy emits exactly one TIMEBASE_FRAGMENT candidate containing both the
+# science fragment and an embedded ``forensics`` object. PostgreSQL still
+# receives the compatible {fragment, forensics} TIMEBASE shape after Pi-side
+# adjudication, but there is no standalone forensics route or two-topic pair
+# join in the live architecture.
 TIMEBASE_INGRESS_QUEUE_MAXSIZE = 0
 TIMEBASE_FRAGMENT_TOPIC = "TIMEBASE_FRAGMENT"
-TIMEBASE_FORENSICS_TOPIC = "TIMEBASE_FORENSICS"  # legacy diagnostics only
 CLOCKS_RECOVERY_STALLED_TOPIC = "CLOCKS_RECOVERY_STALLED"
-TIMEBASE_PAIR_TIMEOUT_S = 5.0  # legacy exact-pair code is no longer on the live path
 
 INVALID_TIMEBASE_LOG_PATH = os.environ.get(
     "ZPNET_INVALID_TIMEBASE_LOG_PATH",
@@ -310,7 +253,7 @@ TEENSY_HEALTH_RETRY_S = 60.0
 # Async START/Flash Cut silence is not the same thing as a live campaign
 # going dark. START/Flash Cut may still take several seconds while Teensy
 # earns the first canonical row; the Pi waits patiently but expects to accept
-# the first public pair once it appears.
+# the first public row once it appears.
 START_FIRST_FRAGMENT_TIMEOUT_S = 90.0
 FLASH_CUT_FIRST_FRAGMENT_TIMEOUT_S = 180.0
 
@@ -318,7 +261,7 @@ FLASH_CUT_FIRST_FRAGMENT_TIMEOUT_S = 180.0
 #
 # This first-pass gate deliberately uses the global PI SYSTEM feature tree,
 # because Pi SYSTEM has the broadest horizon: Pi-local GNSS/host/power state
-# plus imported Teensy-local timing readiness.  Runtime TIMEBASE pair
+# plus imported Teensy-local timing readiness.  Runtime TIMEBASE row
 # integrity, database command-contract checks, GNSS mode reconciliation, and
 # recovery projection remain local CLOCKS logic.
 #
@@ -368,14 +311,10 @@ TEENSY_CAMPAIGN_GATE_LABEL_TO_FEATURE = {
 }
 
 # ---------------------------------------------------------------------
-# TIMEBASE ingress queue + exact-pair state
+# TIMEBASE ingress queue
 # ---------------------------------------------------------------------
 
 _fragment_queue: queue.Queue[Dict[str, Any]] = queue.Queue(maxsize=TIMEBASE_INGRESS_QUEUE_MAXSIZE)
-
-_timebase_pair_lock = threading.Lock()
-_timebase_pending_pairs: Dict[int, Dict[str, Any]] = {}
-_last_completed_timebase_pair_count: Optional[int] = None
 
 # ---------------------------------------------------------------------
 # Diagnostics (monotonic counters + last anomaly snapshots)
@@ -387,27 +326,18 @@ _diag: Dict[str, Any] = {
     "timebase_candidates_queued": 0,
     "timebase_candidates_processed": 0,
 
-    # Legacy fragment/forensics aliases retained for REPORT compatibility.
+    # Legacy fragment aliases retained for REPORT compatibility. In the live
+    # architecture each fragment is the complete TIMEBASE candidate, including
+    # embedded forensics.
     "fragments_received": 0,
     "fragments_queued": 0,
     "fragments_missing_teensy_pps_count": 0,     # legacy diagnostic alias
     "fragments_missing_teensy_pps_vclock_count": 0,
-    "forensics_received": 0,
-    "forensics_queued": 0,
-    "forensics_missing_teensy_pps_count": 0,
-    "forensics_missing_teensy_pps_vclock_count": 0,
 
-    # TIMEBASE exact-pair join (processor thread — slow path)
-    "timebase_pieces_processed": 0,
-    "timebase_pairs_completed": 0,
-    "timebase_pairs_pending": 0,
-    "timebase_pairs_stale_incomplete": 0,
-    "timebase_pair_duplicate_role": 0,
-    "timebase_pair_late_or_duplicate_count": 0,
-    "timebase_pair_campaign_mismatch": 0,
-    "timebase_pair_version_mismatch": 0,
-    "timebase_pair_timeout": 0,
-    "last_timebase_pair_fault": {},
+    # Unified TIMEBASE candidate processing (processor thread — slow path).
+    "timebase_pieces_processed": 0,              # legacy alias: queue items
+    "timebase_rows_completed": 0,
+    "timebase_pairs_completed": 0,               # legacy alias for rows completed
 
     # TIMEBASE final acceptance court (processor thread — last gate)
     "timebase_final_court_checks": 0,
@@ -432,10 +362,11 @@ _diag: Dict[str, Any] = {
     "invalid_timebase_log_failures": 0,
     "last_invalid_timebase_log": {},
 
-    # Fragment processing (processor thread — slow path)
+    # Candidate processing (processor thread — slow path). Fragment keys are
+    # legacy aliases because the route name remains TIMEBASE_FRAGMENT.
     "fragments_processed": 0,
     "fragments_ignored_no_campaign": 0,
-    "forensics_ignored_no_campaign": 0,
+    "timebase_candidates_ignored_no_campaign": 0,
     "queue_depth_max_seen": 0,
     "queue_depth_current": 0,
 
@@ -503,7 +434,7 @@ _diag: Dict[str, Any] = {
     "recovery_control_state_reassertions": 0,
     "last_recovery_control_state": {},
     "last_recovery": {},
-    "recovery_transitional_pairs_discarded": 0,
+    "recovery_transitional_rows_discarded": 0,
     "recovery_clean_timeouts": 0,
     "recovery_clean_stalls": 0,
     "recovery_degraded_rows_admitted": 0,
@@ -514,7 +445,7 @@ _diag: Dict[str, Any] = {
     "recovery_inflight_command_lost": 0,
     "last_recovery_inflight_health": {},
     "last_recovery_command_lost": {},
-    "last_recovery_transitional_pair": {},
+    "last_recovery_transitional_row": {},
     "last_recovery_clean_timeout": {},
 
     # GNSS wait
@@ -997,9 +928,9 @@ _last_pps_vclock_count_seen: Optional[int] = None
 _accepted_pps_vclock_count: Optional[int] = None
 
 # TIMEBASE silence monitor.  This is intentionally process-local: if a
-# campaign is active and the Teensy stops publishing both TIMEBASE_FRAGMENT
-# and TIMEBASE_FORENSICS, CLOCKS treats the silence as a recoverable Teensy
-# lifecycle event once communication returns.
+# campaign is active and the Teensy stops publishing TIMEBASE_FRAGMENT, CLOCKS
+# treats the silence as a recoverable Teensy lifecycle event once communication
+# returns.
 _timebase_last_activity_monotonic: Optional[float] = None
 _timebase_last_activity_utc: Optional[str] = None
 _timebase_last_activity_topic: Optional[str] = None
@@ -1059,7 +990,7 @@ class RecoveryRetryableFailure(RuntimeError):
 
 
 class RecoverySyncTimeout(RecoveryRetryableFailure):
-    """Raised when a RECOVER lifecycle does not produce a public TIMEBASE pair."""
+    """Raised when a RECOVER lifecycle does not produce a public TIMEBASE row."""
 
 
 class RecoveryCleanTimeout(RecoveryRetryableFailure):
@@ -1394,7 +1325,7 @@ def _timebase_silence_recovery(reason: str, details: Dict[str, Any]) -> None:
 
     This extends boot-time campaign recovery to the live-Pi / rebooted-Teensy
     case.  The database active-campaign row remains the durable intent; the
-    process-local campaign gate is lowered so stale or partial TIMEBASE pieces
+    process-local campaign gate is lowered so stale or partial TIMEBASE candidates
     cannot be persisted while the Teensy is being recovered.
     """
     global _campaign_active, _auto_recovery_in_progress
@@ -2225,7 +2156,7 @@ def _end_sync_wait(
 
         if now - last_log >= SYNC_LOG_INTERVAL_S:
             logging.info(
-                "⏳ [recovery] still waiting for first public pair >= %s (%.1fs/%.0fs)",
+                "⏳ [recovery] still waiting for first public row >= %s (%.1fs/%.0fs)",
                 str(_sync_expected_pps_vclock),
                 now - t0,
                 timeout_s,
@@ -2263,7 +2194,7 @@ def _signal_sync_candidate_if_needed(fragment: Dict[str, Any], pps_vclock_count:
         match = int(pps_vclock_count) >= int(_sync_expected_pps_vclock)
         if match:
             logging.info(
-                "✅ [recovery] first public TIMEBASE pair observed: count=%d expected>=%d",
+                "✅ [recovery] first public TIMEBASE row observed: count=%d expected>=%d",
                 int(pps_vclock_count), int(_sync_expected_pps_vclock),
             )
             _sync_fragment = dict(fragment)
@@ -2446,7 +2377,7 @@ def _restore_gnss_raw_from_last_timebase(
     """Restore the Pi-owned GNSS_RAW synthetic clock and Welford accumulator.
 
     GNSS_RAW is deliberately Pi-only and is not sent to Teensy RECOVER.
-    Restore it to the identity immediately BEFORE the first pair the processor
+    Restore it to the identity immediately BEFORE the first row the processor
     will persist; the processor then folds the first public row in exactly once.
     The Welford accumulator is restored from the last persisted TIMEBASE
     extra_clocks block; missing downtime samples are not invented.
@@ -2895,7 +2826,7 @@ def _recovery_admission_verdict(
     blocking_reasons: List[str] = []
     state_reasons: List[str] = []
 
-    # REPORT_RECOVERY is useful corroboration, but the paired fragment is the
+    # REPORT_RECOVERY is useful corroboration, but the published fragment is the
     # publication authority. A transient command/report miss must not bury an
     # otherwise self-describing canonical row.
     if not report_available:
@@ -3066,7 +2997,7 @@ def _extract_teensy_pps_vclock_count(publication: Dict[str, Any], *, topic: str 
     Return the mandatory canonical one-second identity from a Teensy TIMEBASE publication.
 
     No fallbacks.  No ledger-derived repair.  If this field is missing or
-    invalid, the publication is not a valid TIMEBASE pair member.  The explicit
+    invalid, the publication is not a valid TIMEBASE candidate.  The explicit
     Teensy-authored PPS/VCLOCK count is the only identity surface.
     """
     if PPS_VCLOCK_COUNT_KEY not in publication or publication.get(PPS_VCLOCK_COUNT_KEY) is None:
@@ -3258,7 +3189,7 @@ def _timebase_final_court_check_delta_raw_interval(
 
     This deliberately fishes values out of the final TIMEBASE dictionary rather
     than checking pre-assembly locals.  If Payload construction, JSON shaping,
-    pair merge, or later decoration corrupts the final structure, this gate sees
+    candidate shaping, or later decoration corrupts the final structure, this gate sees
     the same object that would otherwise be written to PostgreSQL.
     """
     for lane in ("ocxo1", "ocxo2"):
@@ -4559,9 +4490,7 @@ def on_recovery_stalled(payload: Payload) -> None:
 
 
 def _enqueue_timebase_piece(topic: str, payload: Dict[str, Any]) -> None:
-    """
-    Enqueue one Teensy TIMEBASE publication for processor-thread pairing.
-    """
+    """Enqueue one Teensy TIMEBASE candidate for processor-thread adjudication."""
     _fragment_queue.put({"topic": topic, "payload": dict(payload)})
 
     depth = _fragment_queue.qsize()
@@ -4570,10 +4499,8 @@ def _enqueue_timebase_piece(topic: str, payload: Dict[str, Any]) -> None:
         _diag["queue_depth_max_seen"] = depth
 
 
-def _drain_timebase_ingress_and_pending() -> int:
-    """Drain inbound TIMEBASE pieces and clear incomplete pair state."""
-    global _last_completed_timebase_pair_count
-
+def _drain_timebase_ingress() -> int:
+    """Drain queued TIMEBASE candidates that belong to an old lifecycle."""
     drained = 0
     while not _fragment_queue.empty():
         try:
@@ -4582,195 +4509,7 @@ def _drain_timebase_ingress_and_pending() -> int:
         except queue.Empty:
             break
 
-    with _timebase_pair_lock:
-        pending = len(_timebase_pending_pairs)
-        _timebase_pending_pairs.clear()
-        _last_completed_timebase_pair_count = None
-        _diag["timebase_pairs_pending"] = 0
-
-    return drained + pending
-
-
-def _timebase_pair_fault(reason: str, details: Dict[str, Any]) -> None:
-    """Record and escalate an exact-pair integrity failure."""
-    _diag["last_timebase_pair_fault"] = {
-        "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        "reason": reason,
-        "details": details,
-    }
-    _hard_fault(reason, details)
-
-
-def _check_timebase_pair_timeouts() -> None:
-    """Fault if one half of a TIMEBASE pair arrives without its companion."""
-    if not _campaign_active and _sync_expected_pps_vclock is None:
-        return
-
-    now = time.monotonic()
-    fault_details = None
-    with _timebase_pair_lock:
-        for count, slot in sorted(_timebase_pending_pairs.items()):
-            first_seen = float(slot.get("first_seen_monotonic", now))
-            age_s = now - first_seen
-            if age_s >= TIMEBASE_PAIR_TIMEOUT_S:
-                fault_details = {
-                    "pps_vclock_count": int(count),
-                    "pps_count": int(count),
-                    "age_s": round(age_s, 3),
-                    "timeout_s": TIMEBASE_PAIR_TIMEOUT_S,
-                    "has_fragment": "fragment" in slot,
-                    "has_forensics": "forensics" in slot,
-                    "roles_present": sorted(list(slot.keys())),
-                }
-                _timebase_pending_pairs.clear()
-                _diag["timebase_pairs_pending"] = 0
-                break
-
-    if fault_details is not None:
-        _diag["timebase_pair_timeout"] += 1
-        _timebase_pair_fault("timebase_pair_timeout", fault_details)
-
-
-def _validate_completed_timebase_pair(
-    *,
-    pps_vclock_count: int,
-    fragment: Dict[str, Any],
-    forensics: Dict[str, Any],
-) -> None:
-    """Validate the two halves of a completed TIMEBASE publication pair."""
-    fragment_count = _extract_teensy_pps_vclock_count(fragment, topic=TIMEBASE_FRAGMENT_TOPIC)
-    forensics_count = _extract_teensy_pps_vclock_count(forensics, topic=TIMEBASE_FORENSICS_TOPIC)
-    if fragment_count != forensics_count or fragment_count != int(pps_vclock_count):
-        _timebase_pair_fault(
-            "timebase_pair_identity_mismatch",
-            {
-                "pair_pps_vclock_count": int(pps_vclock_count),
-                "fragment_pps_vclock_count": int(fragment_count),
-                "forensics_pps_vclock_count": int(forensics_count),
-            },
-        )
-
-    fragment_campaign = str(fragment.get("campaign") or "")
-    forensics_campaign = str(forensics.get("campaign") or "")
-    if fragment_campaign and forensics_campaign and fragment_campaign != forensics_campaign:
-        _diag["timebase_pair_campaign_mismatch"] += 1
-        _timebase_pair_fault(
-            "timebase_pair_campaign_mismatch",
-            {
-                "pps_vclock_count": int(pps_vclock_count),
-                "fragment_campaign": fragment_campaign,
-                "forensics_campaign": forensics_campaign,
-            },
-        )
-
-    fragment_pair_version = _as_int(fragment.get("timebase_pair_version"))
-    forensics_pair_version = _as_int(forensics.get("timebase_pair_version"))
-    if (
-        fragment_pair_version is not None
-        and forensics_pair_version is not None
-        and fragment_pair_version != forensics_pair_version
-    ):
-        _diag["timebase_pair_version_mismatch"] += 1
-        _timebase_pair_fault(
-            "timebase_pair_version_mismatch",
-            {
-                "pps_vclock_count": int(pps_vclock_count),
-                "fragment_pair_version": int(fragment_pair_version),
-                "forensics_pair_version": int(forensics_pair_version),
-            },
-        )
-
-
-def _accept_timebase_piece_for_pair(
-    *,
-    topic: str,
-    payload: Dict[str, Any],
-    pps_vclock_count: int,
-) -> Optional[Tuple[Dict[str, Any], Dict[str, Any], int]]:
-    """
-    Store one TIMEBASE half and return a completed (fragment, forensics, count)
-    tuple only when the exact PPS-count pair is present.
-    """
-    global _last_completed_timebase_pair_count
-
-    if topic == TIMEBASE_FRAGMENT_TOPIC:
-        role = "fragment"
-    elif topic == TIMEBASE_FORENSICS_TOPIC:
-        role = "forensics"
-    else:
-        _timebase_pair_fault("timebase_unknown_piece_topic", {"topic": topic})
-        return None
-
-    fault_reason: Optional[str] = None
-    fault_details: Dict[str, Any] = {}
-
-    with _timebase_pair_lock:
-        last_completed = _last_completed_timebase_pair_count
-        if last_completed is not None and int(pps_vclock_count) <= int(last_completed):
-            _diag["timebase_pair_late_or_duplicate_count"] += 1
-            fault_reason = "timebase_pair_late_or_duplicate_count"
-            fault_details = {
-                "topic": topic,
-                "role": role,
-                "pps_vclock_count": int(pps_vclock_count),
-                "last_completed_pps_vclock_count": int(last_completed),
-            }
-
-        stale_counts = sorted(k for k in _timebase_pending_pairs.keys() if int(k) < int(pps_vclock_count))
-        if stale_counts and fault_reason is None:
-            _diag["timebase_pairs_stale_incomplete"] += len(stale_counts)
-            fault_reason = "timebase_pair_incomplete_before_new_identity"
-            fault_details = {
-                "topic": topic,
-                "role": role,
-                "incoming_pps_vclock_count": int(pps_vclock_count),
-                "stale_pending_counts": [int(k) for k in stale_counts],
-                "stale_pending_roles": {
-                    str(k): sorted(list(_timebase_pending_pairs[k].keys()))
-                    for k in stale_counts
-                },
-            }
-
-        if fault_reason is not None:
-            _timebase_pending_pairs.clear()
-            _diag["timebase_pairs_pending"] = 0
-        else:
-            slot = _timebase_pending_pairs.setdefault(
-                int(pps_vclock_count),
-                {
-                    "first_seen_monotonic": time.monotonic(),
-                    "first_seen_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                },
-            )
-            if role in slot:
-                _diag["timebase_pair_duplicate_role"] += 1
-                fault_reason = "timebase_pair_duplicate_role"
-                fault_details = {
-                    "topic": topic,
-                    "role": role,
-                    "pps_vclock_count": int(pps_vclock_count),
-                    "existing_roles": sorted(list(slot.keys())),
-                }
-                _timebase_pending_pairs.clear()
-                _diag["timebase_pairs_pending"] = 0
-            else:
-                slot[role] = dict(payload)
-                _diag["timebase_pairs_pending"] = len(_timebase_pending_pairs)
-
-                if "fragment" in slot and "forensics" in slot:
-                    fragment = dict(slot["fragment"])
-                    forensics = dict(slot["forensics"])
-                    del _timebase_pending_pairs[int(pps_vclock_count)]
-                    _last_completed_timebase_pair_count = int(pps_vclock_count)
-                    _diag["timebase_pairs_pending"] = len(_timebase_pending_pairs)
-                    _diag["timebase_pairs_completed"] += 1
-                    return fragment, forensics, int(pps_vclock_count)
-
-    if fault_reason is not None:
-        _timebase_pair_fault(fault_reason, fault_details)
-
-    return None
-
+    return drained
 
 
 # ---------------------------------------------------------------------
@@ -4805,34 +4544,6 @@ def on_timebase_fragment(payload: Payload) -> None:
     _enqueue_timebase_piece(TIMEBASE_FRAGMENT_TOPIC, candidate)
     _diag["timebase_candidates_queued"] += 1
     _diag["fragments_queued"] += 1
-
-
-def on_timebase_forensics(payload: Payload) -> None:
-    """
-    PUBSUB handler for TIMEBASE_FORENSICS.
-
-    Fast path only: validate identity and enqueue the forensic half for the
-    processor-thread exact-pair join.
-    """
-    _diag["forensics_received"] += 1
-    forensic = dict(payload)
-
-    try:
-        pps_vclock_count = _extract_teensy_pps_vclock_count(forensic, topic=TIMEBASE_FORENSICS_TOPIC)
-    except ValueError:
-        _diag["forensics_missing_teensy_pps_count"] += 1
-        _diag["forensics_missing_teensy_pps_vclock_count"] += 1
-        logging.exception(
-            "💥 [clocks] invalid TIMEBASE_FORENSICS identity; keys=%s payload=%s",
-            sorted(list(forensic.keys())),
-            forensic,
-        )
-        return
-
-    _normalize_fragment_count_aliases(forensic, pps_vclock_count)
-    _note_timebase_activity(TIMEBASE_FORENSICS_TOPIC, pps_vclock_count)
-    _enqueue_timebase_piece(TIMEBASE_FORENSICS_TOPIC, forensic)
-    _diag["forensics_queued"] += 1
 
 
 # ---------------------------------------------------------------------
@@ -4904,6 +4615,7 @@ def _process_loop() -> None:
             continue
 
         _diag["timebase_candidates_processed"] += 1
+        _diag["timebase_rows_completed"] += 1
         # Compatibility counter: one unified candidate is one completed former pair.
         _diag["timebase_pairs_completed"] += 1
 
@@ -4955,6 +4667,7 @@ def _process_loop() -> None:
 
         if not _campaign_active:
             _diag["fragments_ignored_no_campaign"] += 1
+            _diag["timebase_candidates_ignored_no_campaign"] += 1
             continue
 
         # Refresh after a recovery sync because the control thread may have
@@ -5177,7 +4890,7 @@ def _reset_trackers() -> int:
     _gnss_raw_reset()
     _gnss_confession_reset()
     _timebase_final_court_reset_row_fatal_streak("trackers_reset")
-    return _drain_timebase_ingress_and_pending()
+    return _drain_timebase_ingress()
 
 def _request_teensy_stop_best_effort() -> None:
     try:
@@ -5369,7 +5082,7 @@ def _cleanup_after_recovery_failure(reason: str, details: Dict[str, Any]) -> Non
     _clear_sync_wait()
     _clear_start_wait_state()
     _clear_flash_cut_wait_state()
-    drained = _drain_timebase_ingress_and_pending()
+    drained = _drain_timebase_ingress()
     _request_teensy_recover_abort_best_effort(reason, details)
     _diag["last_recovery_abort"] = {
         **(_diag.get("last_recovery_abort") or {}),
@@ -5398,8 +5111,8 @@ def cmd_start(args: Optional[dict]) -> dict:
     """
     START — asynchronous cold START or hot Flash Cut.
 
-    The Pi prepares DB state and exact-pair ingress before arming Teensy, then
-    accepts the very first complete TIMEBASE pair. There is no Pi-side warmup
+    The Pi prepares DB state and accepted-row ingress before arming Teensy, then
+    accepts the very first TIMEBASE row. There is no Pi-side warmup
     or skipped-row model; if row #1 is unhealthy, the readiness gates or Teensy
     handoff should be fixed.
     """
@@ -5545,7 +5258,7 @@ def cmd_start(args: Optional[dict]) -> dict:
 
     drained = _reset_trackers()
     if drained:
-        logging.info("🧹 [start] drained %d stale TIMEBASE piece(s) before arm", drained)
+        logging.info("🧹 [start] drained %d stale TIMEBASE candidate(s) before arm", drained)
     _clear_sync_wait()
 
     _accepted_pps_vclock_count = None
@@ -5658,7 +5371,7 @@ def cmd_start(args: Optional[dict]) -> dict:
     )
     logging.info(
         "✅ [start] @%s %s accepted by Teensy — campaign='%s' status='%s'; "
-        "awaiting first complete TIMEBASE pair",
+        "awaiting first TIMEBASE row",
         system_time_z(),
         "FLASH_CUT" if flash_cut else "START",
         campaign,
@@ -5731,7 +5444,7 @@ def cmd_stop(_: Optional[dict]) -> dict:
     _campaign_active = False
     _clear_start_wait_state()
     _clear_flash_cut_wait_state()
-    _drain_timebase_ingress_and_pending()
+    _drain_timebase_ingress()
     _reset_trackers()
 
     try:
@@ -5785,7 +5498,7 @@ def cmd_clear(_: Optional[dict]) -> dict:
         _campaign_active = False
         _clear_start_wait_state()
         _clear_flash_cut_wait_state()
-        _drain_timebase_ingress_and_pending()
+        _drain_timebase_ingress()
         _reset_trackers()
 
         logging.info("🗑️ [clocks] CLEAR: deleted %d timebase rows, %d campaigns", tb_count, camp_count)
@@ -6048,7 +5761,7 @@ def _recover_campaign() -> None:
 
         drained = _reset_trackers()
         if drained:
-            logging.info("🧹 [recovery/cold] drained %d stale TIMEBASE piece(s)", drained)
+            logging.info("🧹 [recovery/cold] drained %d stale TIMEBASE candidate(s)", drained)
         _clear_sync_wait()
 
         system_cfg = _get_system_config()
@@ -6081,8 +5794,8 @@ def _recover_campaign() -> None:
 
         # Cold recovery has no prior TIMEBASE row to recover from.  Treat it as
         # an async START of the existing active campaign, matching cmd_start().
-        # The normal processor thread will accept the first complete
-        # TIMEBASE_FRAGMENT/TIMEBASE_FORENSICS pair whenever it arrives.
+        # The normal processor thread will accept the first
+        # TIMEBASE_FRAGMENT candidate whenever it arrives.
         _campaign_active = True
         _arm_timebase_silence_watch("RECOVERY_COLD_START")
 
@@ -6107,7 +5820,7 @@ def _recover_campaign() -> None:
         )
         logging.info(
             "✅ [recovery/cold] START accepted: campaign='%s' status='%s'; "
-            "awaiting first complete TIMEBASE pair",
+            "awaiting first TIMEBASE row",
             campaign_name, teensy_start_status,
         )
 
@@ -6228,9 +5941,9 @@ def _recover_campaign() -> None:
         system_time_z(),
     )
 
-    _drained = _drain_timebase_ingress_and_pending()
+    _drained = _drain_timebase_ingress()
     if _drained > 0:
-        logging.info("🧹 [recovery] drained %d stale TIMEBASE pieces/pending halves", _drained)
+        logging.info("🧹 [recovery] drained %d stale TIMEBASE candidate(s)", _drained)
 
     _reassert_system_dither("recovery", system_cfg)
 
@@ -6297,7 +6010,7 @@ def _recover_campaign() -> None:
     # GNSS_RAW is Pi-owned and has its own reference ledger.  Do not project it
     # as last_gnss_raw_ns / last_gnss_ns; that preserves any poisoned
     # clockface/GNSS ratio across every recovery.  The actual seed immediately
-    # before the first accepted public pair is computed below after the clean
+    # before the first accepted public row is computed below after the clean
     # row is known.
     projected_gnss_raw_ns = 0
     projected_gnss_raw_ref_ns = 0
@@ -6412,7 +6125,7 @@ def _recover_campaign() -> None:
     }
 
     admission_wait_deadline = time.monotonic() + SYNC_RECOVER_CLEAN_TIMEOUT_S
-    discarded_transitional_pairs = 0
+    discarded_transitional_rows = 0
     recovery_admission_verdict: Dict[str, Any] = {}
 
     while True:
@@ -6422,7 +6135,7 @@ def _recover_campaign() -> None:
             details = {
                 "campaign": campaign_name,
                 "expected_first_public_pps_vclock_count": int(expected_first_public_pps_vclock_count),
-                "discarded_transitional_pairs": int(discarded_transitional_pairs),
+                "discarded_transitional_rows": int(discarded_transitional_rows),
                 "last_admission_verdict": recovery_admission_verdict,
                 "admission_timeout_s": float(SYNC_RECOVER_CLEAN_TIMEOUT_S),
             }
@@ -6433,13 +6146,13 @@ def _recover_campaign() -> None:
 
         try:
             frag, waited_s = _end_sync_wait(
-                timeout_s=min(float(remaining), float(RECOVERY_FIRST_PAIR_TIMEOUT_S)),
+                timeout_s=min(float(remaining), float(RECOVERY_FIRST_ROW_TIMEOUT_S)),
                 recovery_monitor=recovery_monitor,
             )
         except RecoverySyncTimeout as e:
             reason = (
                 "recovery_timeline_admission_timeout"
-                if discarded_transitional_pairs
+                if discarded_transitional_rows
                 else e.reason
             )
             details = {
@@ -6447,10 +6160,10 @@ def _recover_campaign() -> None:
                 "campaign": campaign_name,
                 "recover_base_pps_vclock_count": int(recover_base_pps_vclock_count),
                 "expected_first_public_pps_vclock_count": int(expected_first_public_pps_vclock_count),
-                "discarded_transitional_pairs": int(discarded_transitional_pairs),
+                "discarded_transitional_rows": int(discarded_transitional_rows),
                 "last_admission_verdict": recovery_admission_verdict,
             }
-            if discarded_transitional_pairs:
+            if discarded_transitional_rows:
                 _diag["recovery_clean_timeouts"] = _diag.get("recovery_clean_timeouts", 0) + 1
                 _diag["last_recovery_clean_timeout"] = {"reason": reason, **details}
                 _cleanup_after_recovery_failure(reason, details)
@@ -6459,7 +6172,7 @@ def _recover_campaign() -> None:
             _cleanup_after_recovery_failure(reason, details)
             raise RecoverySyncTimeout(reason, details, cleanup_sent=True) from e
 
-        _raise_if_recovery_interrupted("post_sync_pair_before_admission_verdict")
+        _raise_if_recovery_interrupted("post_sync_row_before_admission_verdict")
 
         teensy_pps_vclock_count = _extract_teensy_pps_vclock_count(frag)
         first_public_offset = teensy_pps_vclock_count - expected_first_public_pps_vclock_count
@@ -6477,19 +6190,19 @@ def _recover_campaign() -> None:
                     _diag.get("recovery_science_clean_rows_admitted", 0) + 1
                 )
                 logging.info(
-                    "✅ [recovery] clean public pair admitted: count=%d expected=%d offset=%+d waited=%.3fs discarded=%d",
+                    "✅ [recovery] clean public row admitted: count=%d expected=%d offset=%+d waited=%.3fs discarded=%d",
                     teensy_pps_vclock_count,
                     expected_first_public_pps_vclock_count,
                     first_public_offset,
                     waited_s,
-                    discarded_transitional_pairs,
+                    discarded_transitional_rows,
                 )
             else:
                 _diag["recovery_degraded_rows_admitted"] = (
                     _diag.get("recovery_degraded_rows_admitted", 0) + 1
                 )
                 logging.warning(
-                    "⚠️ [recovery] truthful degraded timeline pair admitted: "
+                    "⚠️ [recovery] truthful degraded timeline row admitted: "
                     "count=%d expected=%d offset=%+d state=%s; OCXO science remains gated",
                     teensy_pps_vclock_count,
                     expected_first_public_pps_vclock_count,
@@ -6498,13 +6211,13 @@ def _recover_campaign() -> None:
                 )
             break
 
-        discarded_transitional_pairs += 1
-        _diag["recovery_transitional_pairs_discarded"] = (
-            _diag.get("recovery_transitional_pairs_discarded", 0) + 1
+        discarded_transitional_rows += 1
+        _diag["recovery_transitional_rows_discarded"] = (
+            _diag.get("recovery_transitional_rows_discarded", 0) + 1
         )
-        _diag["last_recovery_transitional_pair"] = recovery_admission_verdict
+        _diag["last_recovery_transitional_row"] = recovery_admission_verdict
         logging.warning(
-            "⚠️ [recovery] discarding non-admissible pair count=%d expected=%d "
+            "⚠️ [recovery] discarding non-admissible row count=%d expected=%d "
             "offset=%+d blockers=%s state=%s status_reason=%s",
             teensy_pps_vclock_count,
             expected_first_public_pps_vclock_count,
@@ -6514,15 +6227,15 @@ def _recover_campaign() -> None:
             recovery_admission_verdict.get("report_reason"),
         )
 
-        # Release the processor thread to discard this pair while campaign
-        # ingestion is still closed, then arm the next exact-pair sync wait.
+        # Release the processor thread to discard this row while campaign
+        # ingestion is still closed, then arm the next accepted-row sync wait.
         _sync_resume_event.set()
         time.sleep(0.05)
         _begin_sync_wait(expected_pps=int(teensy_pps_vclock_count) + 1)
 
-    # The processor is paused on this exact pair. Restore Pi-owned state to
+    # The processor is paused on this exact row. Restore Pi-owned state to
     # the identity immediately before it, then reopen campaign processing so
-    # the sync pair is persisted as the first recovered public TIMEBASE row.
+    # the sync row is persisted as the first recovered public TIMEBASE row.
     seed_pps_vclock_count = max(0, int(teensy_pps_vclock_count) - 1)
     seed_gnss_ns = seed_pps_vclock_count * NS_PER_SECOND
     gnss_raw_projection = _gnss_raw_recovery_project_seed(
@@ -6561,7 +6274,7 @@ def _recover_campaign() -> None:
         "clean_recovery_verdict": recovery_admission_verdict,
         "recovery_admission_verdict": recovery_admission_verdict,
         "recovery_fully_clean_at_admission": bool(recovery_admission_verdict.get("fully_clean")),
-        "discarded_transitional_pairs": int(discarded_transitional_pairs),
+        "discarded_transitional_rows": int(discarded_transitional_rows),
         "gnss_raw_restored": bool(gnss_raw_restored),
     })
 
@@ -7920,7 +7633,7 @@ def run() -> None:
     logging.info(
         "🕐 [clocks] unified PPS/VCLOCK TIMEBASE candidate schema. Teensy PPS/VCLOCK count is canonical. "
         "Four clock domains: GNSS (reference), DWT, OCXO1, OCXO2. "
-        "The Teensy emits one candidate containing fragment + forensics; the Pi is the final row arbiter. "
+        "The Teensy emits one TIMEBASE_FRAGMENT candidate containing fragment + embedded forensics; the Pi is the final row arbiter. "
         "Invalid candidates are logged in full and dropped as canonical gaps without automatic recovery. "
         "START while active performs seamless flash-cut to new campaign. "
         "Commands: START, STOP, RESUME, RECOVER_ABORT, REPORT, CLEAR, DELETE, TRUNCATE, SET_DAC, DITHER, "

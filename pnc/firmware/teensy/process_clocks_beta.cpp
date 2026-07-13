@@ -4,8 +4,8 @@
 //
 // Statistical surface doctrine:
 //
-//   Teensy owns every statistical quantity published in the TIMEBASE
-//   publication pair. The Pi transcribes what the Teensy says — it does not
+//   Teensy owns every statistical quantity published in the unified TIMEBASE
+//   publication. The Pi transcribes what the Teensy says — it does not
 //   recompute.
 //
 //   Every Welford accumulator is published with the identical suffix set:
@@ -118,7 +118,7 @@ uint64_t recover_ocxo2_ns = 0;
 // Payload alive on Teensy made campaign publication unnecessarily fragile.
 
 // Alpha-authored physical PPS witness DWT audit surface.  These are published
-// into the TIMEBASE publication pair so Pi-side reports can compare physical PPS-to-PPS
+// into the TIMEBASE publication so Pi-side reports can compare physical PPS-to-PPS
 // DWT intervals against the canonical PPS/VCLOCK DWT rail.
 extern volatile uint32_t g_pps_dwt_at_edge;
 extern volatile uint32_t g_pps_dwt_cycles_between_edges;
@@ -133,7 +133,7 @@ extern volatile bool     g_pps_vclock_dwt_cycles_between_edges_valid;
 
 // Alpha OCXO PPS projection guard counters.  Alpha owns the fix and the
 // counters; Beta only surfaces them through focused reports so the normal
-// TIMEBASE pair remains lean and brutally honest.
+// TIMEBASE publication remains lean and brutally honest.
 extern uint32_t clocks_alpha_ocxo_projection_guard_legacy_wrap_count(time_clock_id_t clock);
 extern uint32_t clocks_alpha_ocxo_projection_guard_sanity_reject_count(time_clock_id_t clock);
 
@@ -257,7 +257,6 @@ static uint32_t g_timebase_forensics_build_begin_count = 0;
 static uint32_t g_timebase_forensics_build_complete_count = 0;
 static uint32_t g_timebase_forensics_publish_attempt_count = 0;
 static uint32_t g_timebase_forensics_publish_return_count = 0;
-static uint32_t g_timebase_forensics_disabled_count = 0;
 static uint32_t g_timebase_forensics_minimal_count = 0;
 static uint32_t g_timebase_forensics_micro_raw_count = 0;
 static uint32_t g_timebase_forensics_slim_count = 0;
@@ -653,8 +652,8 @@ static FLASHMEM const char* timebase_build_stage_name(uint32_t stage) {
     case TIMEBASE_BUILD_STAGE_PUBLISH_RETURN: return "PUBLISH_RETURN";
     case TIMEBASE_BUILD_STAGE_FORENSICS_BUILD_BEGIN: return "FORENSICS_BUILD_BEGIN";
     case TIMEBASE_BUILD_STAGE_FORENSICS_BUILD_COMPLETE: return "FORENSICS_BUILD_COMPLETE";
-    case TIMEBASE_BUILD_STAGE_FORENSICS_PUBLISH_ATTEMPT: return "FORENSICS_PUBLISH_ATTEMPT";
-    case TIMEBASE_BUILD_STAGE_FORENSICS_PUBLISH_RETURN: return "FORENSICS_PUBLISH_RETURN";
+    case TIMEBASE_BUILD_STAGE_FORENSICS_PUBLISH_ATTEMPT: return "FORENSICS_EMBED_ATTEMPT";
+    case TIMEBASE_BUILD_STAGE_FORENSICS_PUBLISH_RETURN: return "FORENSICS_EMBED_RETURN";
     default: return "NONE";
   }
 }
@@ -2316,7 +2315,7 @@ static void campaign_warmup_begin(campaign_warmup_mode_t mode) {
   }
 
   if (mode == campaign_warmup_mode_t::START) {
-    recover_reattach_reset("start_lifecycle");
+    recover_reattach_reset("not_recovering");
 
     // START owns a private acquisition bookend, not a public skipped row.
     // Interrupt and Alpha continue to run while campaign_seconds remains zero.
@@ -4479,9 +4478,9 @@ static FLASHMEM void payload_add_prediction_summary(Payload& p) {
 // ============================================================================
 //
 // TIMEBASE_FRAGMENT is now the compact canonical campaign row / science spine.
-// TIMEBASE_FORENSICS is the larger diagnostic companion for the same pps_count.
-// Pi-side clocks pairs the two opaque payloads by identity and persists one
-// TIMEBASE record with { fragment, forensics }.
+// The former TIMEBASE_FORENSICS companion is embedded under fragment.forensics.
+// Pi-side clocks reconstructs the durable compatible TIMEBASE record with
+// { fragment, forensics } from that single unified publication.
 //
 // Keep the legacy flat helpers above for focused reports and transition tools;
 // the publication pair itself uses the helpers below.
@@ -8981,7 +8980,7 @@ void clocks_beta_pps(void) {
                                        "fragment",
                                        public_count,
                                        public_gnss_ns);
-    p.add("paired_forensics_topic", "TIMEBASE_FORENSICS");
+    p.add("paired_forensics_topic", "EMBEDDED");
     p.add("paired_forensics_schema", "TIMEBASE_FORENSICS_V1");
     p.add("timebase_message_version", 1U);
     p.add("forensics_mode", "EMBEDDED");
@@ -9499,7 +9498,7 @@ void clocks_beta_pps(void) {
     g_timebase_last_forensics_build_complete_campaign_seconds = campaign_seconds;
     timebase_build_stage(TIMEBASE_BUILD_STAGE_FORENSICS_BUILD_COMPLETE);
 
-    // Legacy "forensics publish" counters now describe the embed operation.
+    // Legacy counter variables now describe the embedded-forensics attach operation.
     g_timebase_forensics_publish_attempt_count++;
     g_timebase_last_forensics_publish_attempt_campaign_seconds = campaign_seconds;
     timebase_build_stage(TIMEBASE_BUILD_STAGE_FORENSICS_PUBLISH_ATTEMPT);
@@ -11704,14 +11703,14 @@ static FLASHMEM Payload cmd_report_timebase_publish(const Payload&) {
   p.add("build_complete_count", g_timebase_build_complete_count);
   p.add("publish_attempt_count", g_timebase_publish_attempt_count);
   p.add("publish_return_count", g_timebase_publish_return_count);
-  p.add("forensics_publish_attempt_count",
+  p.add("forensics_embed_attempt_count",
         g_timebase_forensics_publish_attempt_count);
-  p.add("forensics_publish_return_count",
+  p.add("forensics_embed_return_count",
         g_timebase_forensics_publish_return_count);
 
   p.add("publish_tail_returning",
         g_timebase_publish_attempt_count == g_timebase_publish_return_count);
-  p.add("forensics_publish_tail_returning",
+  p.add("forensics_embed_tail_returning",
         g_timebase_forensics_publish_attempt_count ==
         g_timebase_forensics_publish_return_count);
   p.add("candidate_minus_build_begin",
@@ -11724,7 +11723,7 @@ static FLASHMEM Payload cmd_report_timebase_publish(const Payload&) {
         (int64_t)g_timebase_publish_attempt_count -
         (int64_t)g_timebase_publish_return_count);
 
-  p.add("forensics_publish_enabled", TIMEBASE_FORENSICS_PUBLISH_ENABLED);
+  p.add("standalone_forensics_publish_enabled", TIMEBASE_FORENSICS_PUBLISH_ENABLED);
   p.add("forensics_minimal_payload_enabled",
         TIMEBASE_FORENSICS_MINIMAL_PAYLOAD_ENABLED);
   p.add("forensics_micro_raw_cycles_enabled",
@@ -11782,9 +11781,8 @@ static FLASHMEM Payload cmd_report_timebase_publish_deep(const Payload&) {
   counters.add("publish_return_count", g_timebase_publish_return_count);
   counters.add("forensics_build_begin_count", g_timebase_forensics_build_begin_count);
   counters.add("forensics_build_complete_count", g_timebase_forensics_build_complete_count);
-  counters.add("forensics_publish_attempt_count", g_timebase_forensics_publish_attempt_count);
-  counters.add("forensics_publish_return_count", g_timebase_forensics_publish_return_count);
-  counters.add("forensics_disabled_count", g_timebase_forensics_disabled_count);
+  counters.add("forensics_embed_attempt_count", g_timebase_forensics_publish_attempt_count);
+  counters.add("forensics_embed_return_count", g_timebase_forensics_publish_return_count);
   counters.add("forensics_minimal_count", g_timebase_forensics_minimal_count);
   counters.add("forensics_micro_raw_count", g_timebase_forensics_micro_raw_count);
   counters.add("forensics_slim_count", g_timebase_forensics_slim_count);
@@ -11865,15 +11863,15 @@ static FLASHMEM Payload cmd_report_timebase_publish_deep(const Payload&) {
   counters.add("flash_cut_commit_count", g_flash_cut_commit_count);
   counters.add("flash_cut_reject_count", g_flash_cut_reject_count);
   counters.add("flash_cut_busy_reject_count", g_flash_cut_busy_reject_count);
-  counters.add("welford_gap_advance_count", g_welford_gap_advance_count);
-  counters.add("welford_gap_advance_last_public_count",
+  counters.add("welford_cardinality_align_count", g_welford_gap_advance_count);
+  counters.add("welford_cardinality_align_last_public_count",
                g_welford_gap_advance_last_public_count);
-  counters.add("welford_gap_advance_last_lane_count",
+  counters.add("welford_cardinality_align_last_lane_count",
                g_welford_gap_advance_last_lane_count);
   p.add_object("counters", counters);
 
   Payload gates;
-  gates.add("forensics_publish_enabled", TIMEBASE_FORENSICS_PUBLISH_ENABLED);
+  gates.add("standalone_forensics_publish_enabled", TIMEBASE_FORENSICS_PUBLISH_ENABLED);
   gates.add("forensics_minimal_payload_enabled", TIMEBASE_FORENSICS_MINIMAL_PAYLOAD_ENABLED);
   gates.add("forensics_micro_raw_cycles_enabled",
             TIMEBASE_FORENSICS_MICRO_RAW_CYCLES_ENABLED);
@@ -11999,8 +11997,8 @@ static FLASHMEM Payload cmd_report_timebase_publish_deep(const Payload&) {
   last.add("publish_return_campaign_seconds", g_timebase_last_publish_return_campaign_seconds);
   last.add("forensics_build_begin_campaign_seconds", g_timebase_last_forensics_build_begin_campaign_seconds);
   last.add("forensics_build_complete_campaign_seconds", g_timebase_last_forensics_build_complete_campaign_seconds);
-  last.add("forensics_publish_attempt_campaign_seconds", g_timebase_last_forensics_publish_attempt_campaign_seconds);
-  last.add("forensics_publish_return_campaign_seconds", g_timebase_last_forensics_publish_return_campaign_seconds);
+  last.add("forensics_embed_attempt_campaign_seconds", g_timebase_last_forensics_publish_attempt_campaign_seconds);
+  last.add("forensics_embed_return_campaign_seconds", g_timebase_last_forensics_publish_return_campaign_seconds);
   last.add("public_count", g_timebase_last_public_count);
   last.add("public_gnss_ns", g_timebase_last_public_gnss_ns);
   last.add("public_dwt_total", g_timebase_last_public_dwt_total);
@@ -12021,8 +12019,8 @@ static FLASHMEM Payload cmd_report_timebase_publish_deep(const Payload&) {
   start_handoff.add("dwt_publication_launch_acquisition",
                     interrupt_dwt_publication_launch_acquisition_active());
   start_handoff.add("origin_ready", g_start_handoff_last_origin_ready);
-  start_handoff.add("ocxo1_projection_ready", g_start_handoff_last_ocxo1_projection_ready);
-  start_handoff.add("ocxo2_projection_ready", g_start_handoff_last_ocxo2_projection_ready);
+  start_handoff.add("ocxo1_authority_ready", g_start_handoff_last_ocxo1_projection_ready);
+  start_handoff.add("ocxo2_authority_ready", g_start_handoff_last_ocxo2_projection_ready);
   start_handoff.add("raw_gnss_ns", g_start_handoff_last_raw_gnss_ns);
   start_handoff.add("raw_ocxo1_ns", g_start_handoff_last_raw_ocxo1_ns);
   start_handoff.add("raw_ocxo2_ns", g_start_handoff_last_raw_ocxo2_ns);
@@ -12062,16 +12060,16 @@ static FLASHMEM Payload cmd_report_timebase_publish_deep(const Payload&) {
   gaps.add("publish_attempt_minus_return", (int64_t)g_timebase_publish_attempt_count - (int64_t)g_timebase_publish_return_count);
   gaps.add("publish_return_lag_vs_campaign_seconds", (int64_t)campaign_seconds - (int64_t)g_timebase_last_publish_return_campaign_seconds);
   gaps.add("publish_tail_returning", g_timebase_publish_attempt_count == g_timebase_publish_return_count);
-  gaps.add("forensics_build_complete_minus_publish_attempt",
+  gaps.add("forensics_build_complete_minus_embed_attempt",
            (int64_t)g_timebase_forensics_build_complete_count -
            (int64_t)g_timebase_forensics_publish_attempt_count);
-  gaps.add("forensics_publish_attempt_minus_return",
+  gaps.add("forensics_embed_attempt_minus_return",
            (int64_t)g_timebase_forensics_publish_attempt_count -
            (int64_t)g_timebase_forensics_publish_return_count);
-  gaps.add("forensics_publish_tail_returning",
+  gaps.add("forensics_embed_tail_returning",
            g_timebase_forensics_publish_attempt_count ==
            g_timebase_forensics_publish_return_count);
-  gaps.add("forensics_disabled", !TIMEBASE_FORENSICS_PUBLISH_ENABLED);
+  gaps.add("standalone_forensics_disabled", !TIMEBASE_FORENSICS_PUBLISH_ENABLED);
   gaps.add("forensics_minimal_payload", TIMEBASE_FORENSICS_MINIMAL_PAYLOAD_ENABLED);
   gaps.add("forensics_micro_raw_cycles",
            TIMEBASE_FORENSICS_MICRO_RAW_CYCLES_ENABLED);
@@ -13395,10 +13393,10 @@ static FLASHMEM Payload cmd_report_stats(const Payload&) {
         g_dwt_welford_recovery_quarantine_last_public_count);
   p.add("dwt_welford_recovery_quarantine_last_cycles",
         g_dwt_welford_recovery_quarantine_last_cycles);
-  p.add("welford_gap_advance_count", g_welford_gap_advance_count);
-  p.add("welford_gap_advance_last_public_count",
+  p.add("welford_cardinality_align_count", g_welford_gap_advance_count);
+  p.add("welford_cardinality_align_last_public_count",
         g_welford_gap_advance_last_public_count);
-  p.add("welford_gap_advance_last_lane_count",
+  p.add("welford_cardinality_align_last_lane_count",
         g_welford_gap_advance_last_lane_count);
   return p;
 }
