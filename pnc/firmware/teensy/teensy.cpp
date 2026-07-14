@@ -379,5 +379,8 @@ void setup() {
 // ============================================================================
 
 void loop() {
+  transport_note_runtime_loop();
+  transport_poll();
   timepop_dispatch();
+  transport_poll();
 }

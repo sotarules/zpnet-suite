@@ -126,6 +126,11 @@ static constexpr uint32_t SCHEDULE_MIN_ARM_LEAD_TICKS = 64;
 static constexpr uint32_t HEARTBEAT_TICKS = 10000;
 static constexpr uint32_t PREDICT_MAX_QTIMER_ELAPSED = 15000000U;
 static constexpr uint32_t ONE_HZ_TICKS = 10000000U;
+// SpinIdle is a witness, not an owner of the main loop.  Bound each residence
+// to roughly 1 ms at 1.008 GHz so imperative transport_poll() can keep USB
+// commands and D0 heartbeat alive even when TimePop has no scheduled-context
+// work pending.
+static constexpr uint32_t TIMEPOP_IDLE_WITNESS_SPIN_BUDGET_CYCLES = 1008000U;
 static constexpr bool     TIMEPOP_SLOT_PRIORITY_ORDERING_ENABLED = true;
 static constexpr const char* WITNESS_SCHEDULER_NAME = "WITNESS_SCHEDULER";
 
@@ -413,6 +418,7 @@ static volatile bool     diag_idle_witness_running = false;
 static volatile uint32_t diag_idle_witness_enter_count = 0;
 static volatile uint32_t diag_idle_witness_exit_count = 0;
 static volatile uint32_t diag_idle_witness_pending_exit_count = 0;
+static volatile uint32_t diag_idle_witness_yield_count = 0;
 static volatile uint32_t diag_idle_witness_last_enter_dwt = 0;
 static volatile uint32_t diag_idle_witness_last_exit_dwt = 0;
 static volatile uint64_t diag_idle_witness_total_cycles = 0;
@@ -685,6 +691,40 @@ static volatile uint32_t diag_epoch_last_anchor_counter32_at_pps_vclock = 0;
 static volatile uint32_t diag_epoch_last_schedule_next_calls_before = 0;
 static volatile uint32_t diag_epoch_last_schedule_next_calls_after = 0;
 
+
+
+// Compact allocation-free health snapshot for the transport PPS heartbeat.
+// Keep this local ABI scalar-only so D0 liveness never depends on Payload or
+// TimePop command/report machinery.
+struct timepop_health_snapshot_t {
+  uint32_t active_count = 0;
+  bool     pending = false;
+  uint32_t dispatch_depth = 0;
+  uint32_t dispatch_phase = 0;
+
+  uint32_t isr_count = 0;
+  uint32_t isr_callbacks = 0;
+  uint32_t expired_count = 0;
+  uint32_t dispatch_calls = 0;
+  uint32_t dispatch_callbacks = 0;
+
+  uint32_t arm_failures = 0;
+  uint32_t schedule_next_calls_total = 0;
+  uint32_t schedule_next_too_close_count = 0;
+  uint32_t schedule_next_passed_count = 0;
+  uint32_t missed_deadline_slots = 0;
+
+  uint32_t dispatch_mutation_count = 0;
+  uint32_t dispatch_mutation_overflow = 0;
+
+  bool     idle_witness_running = false;
+  uint32_t idle_witness_shadow_dwt = 0;
+  uint32_t idle_witness_enter_count = 0;
+  uint32_t idle_witness_exit_count = 0;
+  uint32_t idle_witness_pending_exit_count = 0;
+  uint32_t idle_witness_yield_count = 0;
+  uint32_t idle_witness_last_residency_cycles = 0;
+};
 
 
 // ============================================================================
@@ -1230,6 +1270,15 @@ static void timepop_idle_witness_spin_until_pending(void) {
       break;
     }
     g_timepop_idle_witness_shadow_dwt = dwt;
+    if ((uint32_t)(dwt - enter_dwt) >= TIMEPOP_IDLE_WITNESS_SPIN_BUDGET_CYCLES) {
+      const uint32_t residency = dwt - enter_dwt;
+      timepop_idle_witness_note_wall_cycles(dwt);
+      diag_idle_witness_yield_count++;
+      diag_idle_witness_last_exit_dwt = dwt;
+      diag_idle_witness_last_residency_cycles = residency;
+      diag_idle_witness_total_cycles += (uint64_t)residency;
+      break;
+    }
   }
 
   diag_idle_witness_running = false;
@@ -3076,6 +3125,7 @@ void timepop_init(void) {
   diag_idle_witness_enter_count = 0;
   diag_idle_witness_exit_count = 0;
   diag_idle_witness_pending_exit_count = 0;
+  diag_idle_witness_yield_count = 0;
   diag_idle_witness_last_enter_dwt = 0;
   diag_idle_witness_last_exit_dwt = 0;
 
@@ -4381,6 +4431,38 @@ uint32_t timepop_active_count(void) {
   return n;
 }
 
+FLASHMEM void timepop_health_snapshot(timepop_health_snapshot_t* out) {
+  if (!out) return;
+
+  out->active_count = timepop_active_count();
+  out->pending = timepop_pending;
+  out->dispatch_depth = dispatch_depth;
+  out->dispatch_phase = (uint32_t)dispatch_phase;
+
+  out->isr_count = diag_isr_count;
+  out->isr_callbacks = diag_isr_callbacks;
+  out->expired_count = expired_count;
+  out->dispatch_calls = diag_dispatch_calls;
+  out->dispatch_callbacks = diag_dispatch_callbacks;
+
+  out->arm_failures = diag_arm_failures;
+  out->schedule_next_calls_total = diag_schedule_next_calls_total;
+  out->schedule_next_too_close_count = diag_schedule_next_too_close_count;
+  out->schedule_next_passed_count = diag_schedule_next_passed_count;
+  out->missed_deadline_slots = diag_missed_deadline_slots;
+
+  out->dispatch_mutation_count = dispatch_mutation_count;
+  out->dispatch_mutation_overflow = diag_dispatch_mutation_overflow;
+
+  out->idle_witness_running = diag_idle_witness_running;
+  out->idle_witness_shadow_dwt = g_timepop_idle_witness_shadow_dwt;
+  out->idle_witness_enter_count = diag_idle_witness_enter_count;
+  out->idle_witness_exit_count = diag_idle_witness_exit_count;
+  out->idle_witness_pending_exit_count = diag_idle_witness_pending_exit_count;
+  out->idle_witness_yield_count = diag_idle_witness_yield_count;
+  out->idle_witness_last_residency_cycles = diag_idle_witness_last_residency_cycles;
+}
+
 bool timepop_idle_witness_snapshot(timepop_idle_witness_snapshot_t* out) {
   if (!out) return false;
 
@@ -4434,6 +4516,7 @@ static FLASHMEM Payload cmd_report(const Payload&) {
   out.add("idle_dwt_witness_enter_count", idle_witness.enter_count);
   out.add("idle_dwt_witness_exit_count", idle_witness.exit_count);
   out.add("idle_dwt_witness_pending_exit_count", idle_witness.pending_exit_count);
+  out.add("idle_dwt_witness_yield_count", diag_idle_witness_yield_count);
   out.add("idle_dwt_witness_last_enter_dwt", idle_witness.last_enter_dwt);
   out.add("idle_dwt_witness_last_exit_dwt", idle_witness.last_exit_dwt);
   out.add("idle_dwt_witness_total_cycles", idle_witness.snapshot_total_cycles);

@@ -21,10 +21,11 @@
 //
 //   • transport_send() serializes one payload into one complete wire image.
 //   • The wire image includes the traffic byte.
-//   • A TIMEPOP-driven pump performs physical transmission.
+//   • transport_poll(), called from the runtime loop, performs physical I/O.
 //   • The pump advances only by bytes actually accepted by Serial.
 //   • Each job owns its heap allocation — freed on completion.
 //   • Memory is bounded via soft budget cap (TX_BUDGET_MAX).
+//   • TimePop is not in the command-plane liveness path.
 //
 // Serial-only doctrine:
 //
@@ -105,6 +106,28 @@ void transport_send(
 
 
 // =============================================================
+// Runtime-loop transport service
+// =============================================================
+//
+// Imperative transport service.  This is intentionally not a TimePop client:
+// the command/debug data plane must remain alive even when scheduled TimePop
+// work stalls, backs up, or mis-schedules.  The runtime loop should call this
+// before and after timepop_dispatch(); the implementation self-throttles to a
+// 1 ms service interval.
+//
+
+void transport_poll(void);
+
+
+// Runtime-loop witness.  The main loop calls this once per iteration before
+// transport_poll()/timepop_dispatch().  The PPS heartbeat publishes the counter
+// so a live heartbeat can distinguish a healthy foreground loop from a system
+// trapped inside TimePop/SpinIdle or a user callback.
+
+void transport_note_runtime_loop(void);
+
+
+// =============================================================
 // Transport diagnostics snapshot
 // =============================================================
 //
@@ -116,6 +139,24 @@ void transport_send(
 //
 
 typedef struct {
+
+  // ===========================================================
+  // Runtime-loop transport lifeline + D0 heartbeat
+  // ===========================================================
+
+  uint32_t poll_count;              // Runtime-loop transport service passes
+  uint32_t poll_skipped_too_soon;   // Calls skipped by 1 ms throttle
+  uint32_t rx_poll_count;           // Imperative RX polls
+  uint32_t tx_poll_count;           // Imperative TX pump passes
+  uint32_t runtime_loop_count;      // Runtime loop iterations observed
+  uint32_t poll_interval_us;        // Current imperative poll interval
+
+  uint32_t heartbeat_build_count;   // D0 heartbeat frames built
+  uint32_t heartbeat_send_count;    // D0 heartbeat frames fully sent
+  uint32_t heartbeat_drop_pending;  // PPS beats skipped because prior beat pending
+  uint32_t heartbeat_build_fail;    // Fixed-buffer formatting failures
+  uint32_t heartbeat_last_edge_count;
+  uint32_t heartbeat_bytes_sent;
 
   // ===========================================================
   // TX — Budget / Queue Health
