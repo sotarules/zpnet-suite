@@ -1805,14 +1805,6 @@ void system_enter_quiescence(void) {
 //   • No inference
 // ------------------------------------------------------------
 static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
-  // Control point under suspicion (Crash1 dwell region): REPORT runs in
-  // thread mode, so this scope contributes MSP integrity, pass accounting,
-  // and — most importantly — the retained beacon: if the poisoned exception
-  // return lands while REPORT is under construction, the beacon names it
-  // after the reboot, and any handler-pass violation latched meanwhile
-  // carries REPORT as its foreground correlation.
-  ZPNET_SENTINEL_ENTER(ZPNET_SENTINEL_SLOT_AUX5, "SYSTEM_REPORT");
-
   Payload p;
 
   // Firmware identity
@@ -1938,7 +1930,6 @@ static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
 
   p.add_object("features", system_features_tree_payload());
 
-  ZPNET_SENTINEL_EXIT(ZPNET_SENTINEL_SLOT_AUX5);
   return p;
 }
 

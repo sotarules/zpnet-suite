@@ -74,26 +74,27 @@ void process_system_register(void);
 // Exception-frame sentinel
 // ============================================================================
 //
-// Purpose (Crash1 follow-up): catch corruption of a stacked exception frame
-// while the corrupting handler pass is still on the CPU, with attribution.
+// Purpose: catch corruption of a stacked exception frame while the corrupting
+// handler pass is still on the CPU, with attribution.
 //
-// Theory under test: a handler-tier pass corrupts the 8-word basic exception
-// frame stacked at exception entry; the subsequent exception return then
-// lawfully restores a poisoned register file into the foreground, which
-// statistically lands in FP-heavy report construction and trips over memset.
+// Current deployment follows the retained HardFault evidence:
+//
+//   • the priority-16 interrupt handoff ISR is the outer custody boundary;
+//   • the lane-specific DWT publication tribunal is the crash victim region;
+//   • lane-specific fatal-forensics construction is nested separately so a
+//     recurrence distinguishes courtroom arithmetic from evidence capture.
 //
 // Usage contract:
 //
 //   void my_handler(void) {
-//     ZPNET_SENTINEL_ENTER(ZPNET_SENTINEL_SLOT_HANDOFF, "HANDOFF");
+//     ZPNET_SENTINEL_ENTER(ZPNET_SENTINEL_SLOT_HANDOFF_ISR, "HANDOFF_ISR");
 //     ... handler body ...
-//     ZPNET_SENTINEL_EXIT(ZPNET_SENTINEL_SLOT_HANDOFF);
+//     ZPNET_SENTINEL_EXIT(ZPNET_SENTINEL_SLOT_HANDOFF_ISR);
 //   }
 //
-//   • ENTER must be the FIRST statement of the handler body: it captures
-//     EXC_RETURN from LR by inline assembly before the first BL can clobber
-//     it.  An implausible capture is counted and the sentinel falls back to
-//     its other frame-location strategies.
+//   • ENTER must run before the first function call can clobber LR.  A timing
+//     handler may take its sacred first-instruction register capture before
+//     ENTER, provided that capture is inline and performs no call.
 //   • EXIT must be the LAST statement before every return, at the same brace
 //     level as ENTER, with no VLAs or alloca between them (the MSP
 //     entry/exit comparison assumes a fixed frame).
@@ -107,15 +108,15 @@ void process_system_register(void);
 // SENTINEL_ANOMALY event per boot from serialized foreground context.
 
 enum {
-  ZPNET_SENTINEL_SLOT_HANDOFF   = 0,  // priority-16 handoff tier
-  ZPNET_SENTINEL_SLOT_PPS       = 1,  // PPS capture ISR (debug builds)
-  ZPNET_SENTINEL_SLOT_SMARTZERO = 2,  // SmartZero sampling ISR (debug builds)
-  ZPNET_SENTINEL_SLOT_AUX3      = 3,
-  ZPNET_SENTINEL_SLOT_AUX4      = 4,
-  ZPNET_SENTINEL_SLOT_AUX5      = 5,
-  ZPNET_SENTINEL_SLOT_AUX6      = 6,
-  ZPNET_SENTINEL_SLOT_AUX7      = 7,
-  ZPNET_SENTINEL_SLOT_COUNT     = 8,
+  ZPNET_SENTINEL_SLOT_HANDOFF_ISR              = 0,
+  ZPNET_SENTINEL_SLOT_DWT_PUBLICATION_VCLOCK   = 1,
+  ZPNET_SENTINEL_SLOT_DWT_PUBLICATION_OCXO1    = 2,
+  ZPNET_SENTINEL_SLOT_DWT_PUBLICATION_OCXO2    = 3,
+  ZPNET_SENTINEL_SLOT_DWT_FATAL_VCLOCK         = 4,
+  ZPNET_SENTINEL_SLOT_DWT_FATAL_OCXO1          = 5,
+  ZPNET_SENTINEL_SLOT_DWT_FATAL_OCXO2          = 6,
+  ZPNET_SENTINEL_SLOT_RESERVED                 = 7,
+  ZPNET_SENTINEL_SLOT_COUNT                    = 8,
 };
 
 // name must be a string literal or other immortal storage; only the pointer

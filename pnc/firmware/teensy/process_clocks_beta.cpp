@@ -8959,14 +8959,6 @@ void clocks_beta_pps(void) {
   timebase_build_stage(TIMEBASE_BUILD_STAGE_BUILD_BEGIN);
   clocks_stack_witness_note_hot(CLOCKS_STACK_CONTEXT_BETA_PPS_BUILD);
 
-  // Control point under suspicion (Crash1 dwell region).  This scope runs
-  // inside alpha's PPS handoff — handler mode — so the sentinel locates the
-  // preempted foreground's stacked frame (FPCAR anchor when the foreground
-  // was FP-active) and verifies its 8 basic words across the entire
-  // fragment build + publish.  A wild write from this region onto that
-  // frame latches with "TIMEBASE_FRAGMENT" attribution.
-  ZPNET_SENTINEL_ENTER(ZPNET_SENTINEL_SLOT_AUX3, "TIMEBASE_FRAGMENT");
-
   Payload& p = g_timebase_candidate_payload;
   Payload& f = g_timebase_forensics_payload;
   p.clear();
@@ -9197,10 +9189,6 @@ void clocks_beta_pps(void) {
     g_timebase_assign_last_fragment_count++;
     g_timebase_last_assign_campaign_seconds = campaign_seconds;
   }
-
-  // Keep the former forensic sentinel as a distinct attribution region even
-  // though the result is now embedded instead of separately published.
-  ZPNET_SENTINEL_ENTER(ZPNET_SENTINEL_SLOT_AUX4, "TIMEBASE_FORENSICS");
 
   {
     g_timebase_forensics_build_begin_count++;
@@ -9511,8 +9499,6 @@ void clocks_beta_pps(void) {
     timebase_build_stage(TIMEBASE_BUILD_STAGE_FORENSICS_PUBLISH_RETURN);
   }
 
-  ZPNET_SENTINEL_EXIT(ZPNET_SENTINEL_SLOT_AUX4);
-
   // One publish attempt per PPS identity.  Even an embed failure is emitted;
   // the Pi envelope court will log and drop that candidate rather than mistake
   // firmware qualification silence for a dead TIMEBASE pipeline.
@@ -9534,7 +9520,6 @@ void clocks_beta_pps(void) {
                                  system_feature_status_t::NOMINAL,
                                  true);
   clocks_watchdog_arm_campaign_publication();
-  ZPNET_SENTINEL_EXIT(ZPNET_SENTINEL_SLOT_AUX3);
 }
 
 // ============================================================================

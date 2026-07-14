@@ -7431,6 +7431,20 @@ static void dwt_publication_record_fatal_forensics(
     bool floorline_candidate,
     bool floorline_published,
     uint32_t floorline_dwt) {
+  const uint32_t sentinel_slot =
+      req.kind == interrupt_subscriber_kind_t::VCLOCK
+          ? ZPNET_SENTINEL_SLOT_DWT_FATAL_VCLOCK
+          : (req.kind == interrupt_subscriber_kind_t::OCXO1
+                 ? ZPNET_SENTINEL_SLOT_DWT_FATAL_OCXO1
+                 : ZPNET_SENTINEL_SLOT_DWT_FATAL_OCXO2);
+  const char* const sentinel_name =
+      req.kind == interrupt_subscriber_kind_t::VCLOCK
+          ? "DWT_FATAL_VCLOCK"
+          : (req.kind == interrupt_subscriber_kind_t::OCXO1
+                 ? "DWT_FATAL_OCXO1"
+                 : "DWT_FATAL_OCXO2");
+  ZPNET_SENTINEL_ENTER(sentinel_slot, sentinel_name);
+
   const uint32_t next_count = g_dwt_publication_last_fatal.record_count + 1U;
   dwt_publication_forensics_t f{};
   f.valid = true;
@@ -7544,13 +7558,35 @@ static void dwt_publication_record_fatal_forensics(
   }
 
   g_dwt_publication_last_fatal = f;
+  ZPNET_SENTINEL_EXIT(sentinel_slot);
 }
 
 static bool dwt_publication_adjudicate_or_watchdog(
     const dwt_publication_request_t& req,
     dwt_repair_diag_t& diag) {
+  const uint32_t sentinel_slot =
+      req.kind == interrupt_subscriber_kind_t::VCLOCK
+          ? ZPNET_SENTINEL_SLOT_DWT_PUBLICATION_VCLOCK
+          : (req.kind == interrupt_subscriber_kind_t::OCXO1
+                 ? ZPNET_SENTINEL_SLOT_DWT_PUBLICATION_OCXO1
+                 : (req.kind == interrupt_subscriber_kind_t::OCXO2
+                        ? ZPNET_SENTINEL_SLOT_DWT_PUBLICATION_OCXO2
+                        : ZPNET_SENTINEL_SLOT_RESERVED));
+  const char* const sentinel_name =
+      req.kind == interrupt_subscriber_kind_t::VCLOCK
+          ? "DWT_PUBLICATION_VCLOCK"
+          : (req.kind == interrupt_subscriber_kind_t::OCXO1
+                 ? "DWT_PUBLICATION_OCXO1"
+                 : (req.kind == interrupt_subscriber_kind_t::OCXO2
+                        ? "DWT_PUBLICATION_OCXO2"
+                        : "DWT_PUBLICATION_UNKNOWN"));
+  ZPNET_SENTINEL_ENTER(sentinel_slot, sentinel_name);
+
   dwt_publication_lane_state_t* s = dwt_publication_lane_state_for(req.kind);
-  if (!s) return false;
+  if (!s) {
+    ZPNET_SENTINEL_EXIT(sentinel_slot);
+    return false;
+  }
 
   dwt_publication_diag_seed(diag);
 
@@ -7811,6 +7847,7 @@ static bool dwt_publication_adjudicate_or_watchdog(
                    : (strict_ready
                           ? INTERRUPT_DWT_PUBLICATION_REASON_STRICT_PUBLICATION_QUARANTINE
                           : INTERRUPT_DWT_PUBLICATION_REASON_STARTUP_HARD_QUARANTINE));
+        ZPNET_SENTINEL_EXIT(sentinel_slot);
         return false;
       }
 
@@ -7848,6 +7885,7 @@ static bool dwt_publication_adjudicate_or_watchdog(
   } else {
     s->accept_count = 0;
   }
+  ZPNET_SENTINEL_EXIT(sentinel_slot);
   return true;
 }
 
@@ -11317,10 +11355,12 @@ static bool interrupt_handoff_drain_one_oldest(uint32_t handoff_entry_dwt) {
 }
 
 static void interrupt_handoff_service_isr(void) {
-  const uint32_t entry_dwt = ARM_DWT_CYCCNT;  // first instruction: handoff latency proof.
+  const uint32_t entry_dwt = ARM_DWT_CYCCNT;  // SACRED first instruction.
+  ZPNET_SENTINEL_ENTER(ZPNET_SENTINEL_SLOT_HANDOFF_ISR, "HANDOFF_ISR");
 
   if (g_interrupt_handoff.running) {
     g_interrupt_handoff.reentry_count++;
+    ZPNET_SENTINEL_EXIT(ZPNET_SENTINEL_SLOT_HANDOFF_ISR);
     return;
   }
 
@@ -11376,6 +11416,8 @@ static void interrupt_handoff_service_isr(void) {
     g_interrupt_handoff.unserved_request_count =
         g_interrupt_handoff.request_count - g_interrupt_handoff.served_request_count;
   }
+
+  ZPNET_SENTINEL_EXIT(ZPNET_SENTINEL_SLOT_HANDOFF_ISR);
 }
 
 
