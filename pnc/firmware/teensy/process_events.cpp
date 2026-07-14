@@ -50,7 +50,7 @@ struct EventItem {
   char payload[EVT_BODY_MAX];  // full JSON object or empty string
 };
 
-static EventItem evtq[EVT_MAX];
+static EventItem evtq[EVT_MAX] DMAMEM;
 static size_t evt_head  = 0;
 static size_t evt_tail  = 0;
 static size_t evt_count = 0;

@@ -162,7 +162,7 @@ CLOCKS_RECOVERY_STALLED_TOPIC = "CLOCKS_RECOVERY_STALLED"
 
 INVALID_TIMEBASE_LOG_PATH = os.environ.get(
     "ZPNET_INVALID_TIMEBASE_LOG_PATH",
-    "/var/log/zpnet/clocks-invalid-timebase.jsonl",
+    "/home/mule/zpnet/logs/clocks-invalid-timebase.jsonl",
 )
 INVALID_TIMEBASE_LOG_MAX_BYTES = 64 * 1024 * 1024
 INVALID_TIMEBASE_LOG_BACKUP_COUNT = 4
