@@ -120,9 +120,8 @@ void transport_poll(void);
 
 
 // Runtime-loop witness.  The main loop calls this once per iteration before
-// transport_poll()/timepop_dispatch().  The PPS heartbeat publishes the counter
-// so a live heartbeat can distinguish a healthy foreground loop from a system
-// trapped inside TimePop/SpinIdle or a user callback.
+// transport_poll()/timepop_dispatch().  TRANSPORT_INFO exposes the counter so
+// foreground-loop progress remains observable without a second TX path.
 
 void transport_note_runtime_loop(void);
 
@@ -141,7 +140,7 @@ void transport_note_runtime_loop(void);
 typedef struct {
 
   // ===========================================================
-  // Runtime-loop transport lifeline + D0 heartbeat
+  // Runtime-loop transport lifeline
   // ===========================================================
 
   uint32_t poll_count;              // Runtime-loop transport service passes
@@ -150,13 +149,6 @@ typedef struct {
   uint32_t tx_poll_count;           // Imperative TX pump passes
   uint32_t runtime_loop_count;      // Runtime loop iterations observed
   uint32_t poll_interval_us;        // Current imperative poll interval
-
-  uint32_t heartbeat_build_count;   // D0 heartbeat frames built
-  uint32_t heartbeat_send_count;    // D0 heartbeat frames fully sent
-  uint32_t heartbeat_drop_pending;  // PPS beats skipped because prior beat pending
-  uint32_t heartbeat_build_fail;    // Fixed-buffer formatting failures
-  uint32_t heartbeat_last_edge_count;
-  uint32_t heartbeat_bytes_sent;
 
   // ===========================================================
   // TX — Budget / Queue Health
