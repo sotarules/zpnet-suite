@@ -1331,6 +1331,7 @@ def _timebase_silence_recovery(reason: str, details: Dict[str, Any]) -> None:
     global _campaign_active, _auto_recovery_in_progress
     global _timebase_silence_recovery_active
 
+    attempts = 0
     try:
         while True:
             if _teensy_clocks_health_ok():
@@ -1339,6 +1340,8 @@ def _timebase_silence_recovery(reason: str, details: Dict[str, Any]) -> None:
                     "invoking campaign recovery",
                     system_time_z(),
                 )
+                attempts += 1
+                _diag["auto_recovery_attempts"] = _diag.get("auto_recovery_attempts", 0) + 1
                 _diag["timebase_silence_recovery_started"] += 1
                 try:
                     _recover_campaign()
@@ -1349,16 +1352,61 @@ def _timebase_silence_recovery(reason: str, details: Dict[str, Any]) -> None:
                     return
                 except RecoveryRetryableFailure as e:
                     _diag["auto_recovery_failures"] = _diag.get("auto_recovery_failures", 0) + 1
+                    if not getattr(e, "cleanup_sent", False):
+                        _cleanup_after_recovery_failure(e.reason, e.details)
+
+                    status = str((e.details or {}).get("status") or "")
+                    terminal_firmware_rejection = (
+                        status == "recover_rejected_interrupt_service_rearm"
+                    )
+                    attempts_exhausted = attempts >= int(AUTO_RECOVERY_MAX_ATTEMPTS)
+
+                    if terminal_firmware_rejection or attempts_exhausted:
+                        stop_reason = (
+                            "terminal_firmware_rejection"
+                            if terminal_firmware_rejection
+                            else "attempt_limit"
+                        )
+                        _diag["auto_recovery_exhausted"] = (
+                            _diag.get("auto_recovery_exhausted", 0) + 1
+                        )
+                        _diag["last_auto_recovery_exhausted"] = {
+                            "ts_utc": datetime.now(timezone.utc)
+                                .isoformat()
+                                .replace("+00:00", "Z"),
+                            "attempts": int(attempts),
+                            "max_attempts": int(AUTO_RECOVERY_MAX_ATTEMPTS),
+                            "stop_reason": stop_reason,
+                            "failure_reason": e.reason,
+                            "status": status or None,
+                            "details": e.details,
+                        }
+                        logging.error(
+                            "💥 [clocks] TIMEBASE silence recovery stopped after %d attempt(s): "
+                            "reason=%s status=%s. The Teensy is commandable but cannot "
+                            "re-enter RECOVER from its present interrupt-service state; "
+                            "the durable campaign remains available for recovery after "
+                            "firmware repair/reboot.",
+                            attempts,
+                            e.reason,
+                            status or "unknown",
+                            exc_info=True,
+                        )
+                        return
+
+                    _diag["auto_recovery_retries"] = (
+                        _diag.get("auto_recovery_retries", 0) + 1
+                    )
                     logging.warning(
-                        "⚠️ [clocks] TIMEBASE silence recovery retryable failure: %s details=%s — "
-                        "retrying after %.1fs",
+                        "⚠️ [clocks] TIMEBASE silence recovery retryable failure "
+                        "(attempt %d/%d): %s details=%s — retrying after %.1fs",
+                        attempts,
+                        int(AUTO_RECOVERY_MAX_ATTEMPTS),
                         e.reason,
                         e.details,
                         float(AUTO_RECOVERY_RETRY_DELAY_S),
                         exc_info=True,
                     )
-                    if not getattr(e, "cleanup_sent", False):
-                        _cleanup_after_recovery_failure(e.reason, e.details)
                     time.sleep(float(AUTO_RECOVERY_RETRY_DELAY_S))
                     continue
                 except Exception:
