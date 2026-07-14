@@ -274,9 +274,10 @@ FLASH_CUT_FIRST_FRAGMENT_TIMEOUT_S = 180.0
 # COUNTER32_LINEAGE and OCXO_PUBLIC_ORIGIN are admission prerequisites because
 # Teensy START rejects while either is not NOMINAL.  STATIC_PREDICTION remains
 # post-start evidence because it is not part of the Teensy admission court.
-# CLOCKS also polls Teensy REPORT_GATE directly before START/RECOVER so a small
-# FEATURE_STATUS propagation delay cannot turn a lawful wait into a rejected
-# command.
+# CLOCKS also polls Teensy REPORT_GATE directly before START/RECOVER.  That
+# report is the exact firmware admission authority.  When it is open, stale
+# TEENSY.* INITIALIZING entries in PI SYSTEM's asynchronously imported feature
+# mirror are retained as diagnostics but cannot veto the lawful transition.
 FEATURE_PREFLIGHT_PROFILE = "CAMPAIGN_PREFLIGHT"
 FEATURE_PREFLIGHT_REQUIRED = (
     "PI.SYSTEM.FEATURE_STATUS",
@@ -459,6 +460,8 @@ _diag: Dict[str, Any] = {
     "preflight_feature_checks": 0,
     "preflight_feature_blocked": 0,
     "preflight_feature_unavailable": 0,
+    "preflight_teensy_mirror_bypass_count": 0,
+    "last_preflight_teensy_mirror_bypass": {},
     "last_preflight_feature_gate": {},
     "teensy_campaign_gate_checks": 0,
     "teensy_campaign_gate_blocked": 0,
@@ -6503,8 +6506,20 @@ def _feature_gate_reason(blocker: Dict[str, Any]) -> str:
     return f"{name} is {status}"
 
 
-def _check_feature_preflight(context: str) -> tuple[bool, list[str]]:
-    """Check the standardized feature-status campaign preflight profile."""
+def _check_feature_preflight(
+    context: str,
+    *,
+    direct_teensy_gate_open: bool = False,
+) -> tuple[bool, list[str]]:
+    """Check the standardized feature-status campaign preflight profile.
+
+    PI.SYSTEM.FEATURES is authoritative for Pi-local prerequisites.  Its
+    TEENSY subtree is an asynchronously imported mirror, so it may temporarily
+    retain INITIALIZING after the live Teensy gate has already opened.  When
+    CLOCKS.REPORT_GATE directly proves the exact firmware admission gate open,
+    stale TEENSY.* mirror blockers become diagnostic evidence rather than a
+    second veto.
+    """
     _diag["preflight_feature_checks"] += 1
 
     try:
@@ -6516,28 +6531,58 @@ def _check_feature_preflight(context: str) -> tuple[bool, list[str]]:
             "context": context,
             "profile": FEATURE_PREFLIGHT_PROFILE,
             "status": "UNAVAILABLE",
+            "direct_teensy_gate_open": bool(direct_teensy_gate_open),
             "error": str(e),
         }
         return False, [f"{FEATURE_PREFLIGHT_PROFILE}: feature tree unavailable ({e})"]
 
-    blockers = blocking_features(features, FEATURE_PREFLIGHT_REQUIRED)
-    if blockers:
-        _diag["preflight_feature_blocked"] += 1
-        compact_blockers = [
-            {
-                "name": str(b.get("name") or "?"),
-                "status": str(b.get("status") or "HOLD"),
-                "detail": str(b.get("detail") or ""),
-            }
-            for b in blockers
+    raw_blockers = blocking_features(features, FEATURE_PREFLIGHT_REQUIRED)
+    compact_raw_blockers = [
+        {
+            "name": str(b.get("name") or "?"),
+            "status": str(b.get("status") or "HOLD"),
+            "detail": str(b.get("detail") or ""),
+        }
+        for b in raw_blockers
+    ]
+
+    bypassed_teensy_blockers: list[Dict[str, str]] = []
+    compact_blockers = compact_raw_blockers
+    if direct_teensy_gate_open:
+        bypassed_teensy_blockers = [
+            blocker
+            for blocker in compact_raw_blockers
+            if str(blocker.get("name") or "").startswith("TEENSY.")
         ]
+        compact_blockers = [
+            blocker
+            for blocker in compact_raw_blockers
+            if not str(blocker.get("name") or "").startswith("TEENSY.")
+        ]
+
+        if bypassed_teensy_blockers:
+            _diag["preflight_teensy_mirror_bypass_count"] = (
+                _diag.get("preflight_teensy_mirror_bypass_count", 0) + 1
+            )
+            _diag["last_preflight_teensy_mirror_bypass"] = {
+                "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "context": context,
+                "authority": "TEENSY.CLOCKS.REPORT_GATE",
+                "blockers": bypassed_teensy_blockers,
+            }
+
+    if compact_blockers:
+        _diag["preflight_feature_blocked"] += 1
         _diag["last_preflight_feature_gate"] = {
             "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "context": context,
             "profile": FEATURE_PREFLIGHT_PROFILE,
             "status": "BLOCKED",
             "required_count": len(FEATURE_PREFLIGHT_REQUIRED),
+            "direct_teensy_gate_open": bool(direct_teensy_gate_open),
             "blockers": compact_blockers,
+            "raw_blockers": compact_raw_blockers,
+            "bypassed_teensy_blockers": bypassed_teensy_blockers,
         }
         return False, [
             f"{FEATURE_PREFLIGHT_PROFILE}: {_feature_gate_reason(blocker)}"
@@ -6550,6 +6595,10 @@ def _check_feature_preflight(context: str) -> tuple[bool, list[str]]:
         "profile": FEATURE_PREFLIGHT_PROFILE,
         "status": "NOMINAL",
         "required_count": len(FEATURE_PREFLIGHT_REQUIRED),
+        "direct_teensy_gate_open": bool(direct_teensy_gate_open),
+        "raw_blockers": compact_raw_blockers,
+        "bypassed_teensy_blockers": bypassed_teensy_blockers,
+        "teensy_mirror_reconciled": bool(bypassed_teensy_blockers),
     }
     return True, []
 
@@ -6688,18 +6737,24 @@ def _check_preflight(context: str = "campaign") -> tuple[bool, list[str]]:
     reasons: list[str] = []
 
     # -----------------------------------------------------------------
-    # 0. Standardized feature-status readiness profile
+    # 0. Exact Teensy CLOCKS admission gate
     # -----------------------------------------------------------------
-    feature_ready, feature_reasons = _check_feature_preflight(context)
-    if not feature_ready:
-        reasons.extend(feature_reasons)
-
-    # -----------------------------------------------------------------
-    # 0b. Exact Teensy CLOCKS admission gate
-    # -----------------------------------------------------------------
+    # Poll the firmware authority first.  The PI SYSTEM feature tree contains
+    # an asynchronously imported TEENSY mirror; an open direct gate is allowed
+    # to reconcile stale TEENSY.* INITIALIZING entries in that mirror.
     teensy_gate_ready, teensy_gate_reasons = _check_teensy_campaign_gate(context)
     if not teensy_gate_ready:
         reasons.extend(teensy_gate_reasons)
+
+    # -----------------------------------------------------------------
+    # 0b. Standardized feature-status readiness profile
+    # -----------------------------------------------------------------
+    feature_ready, feature_reasons = _check_feature_preflight(
+        context,
+        direct_teensy_gate_open=teensy_gate_ready,
+    )
+    if not feature_ready:
+        reasons.extend(feature_reasons)
 
     # -----------------------------------------------------------------
     # 1. GNSS time valid
@@ -7108,6 +7163,10 @@ def cmd_clocks_info(_: Optional[dict]) -> Dict[str, Any]:
             "profile": FEATURE_PREFLIGHT_PROFILE,
             "required_features": list(FEATURE_PREFLIGHT_REQUIRED),
             "post_start_expected_features": list(FEATURE_PREFLIGHT_POST_START_EXPECTED),
+            "teensy_admission_authority": "TEENSY.CLOCKS.REPORT_GATE",
+            "pi_teensy_feature_mirror_role": (
+                "diagnostic when direct gate is open; fallback blocker otherwise"
+            ),
         },
         "timebase_silence_monitor": {
             "timeout_s": TIMEBASE_SILENCE_TIMEOUT_S,
