@@ -15,6 +15,7 @@
 
 #include "process_system.h"
 #include "memory_info.h"
+#include "frame_sentinel.h"
 #include "crash_forensics.h"
 #include "config.h"
 #include "process.h"
@@ -555,6 +556,22 @@ static FLASHMEM void system_memory_watchdog_emit(void) {
   g_system_memory_watchdog_event_count++;
 }
 
+static void system_memory_audit_sentinel(void) {
+  // The memory audit is a thread-mode victim region.  Open the historical
+  // priority-zero focus gate while it runs so the existing QTimer/PPS handler
+  // courts execute their dual V1+V2 bookends.  Preserve a pre-existing focus
+  // request in case another diagnostic region owns it.
+  const bool prior_focus = g_zpnet_sentinel_cpu_usage_focus_active;
+  g_zpnet_sentinel_cpu_usage_focus_active = true;
+
+  FRAME_SENTINEL_ENTER(FRAME_SENTINEL_SLOT_MEMORY_AUDIT,
+                       "MEMORY_AUDIT");
+  memory_info_audit(&g_system_memory_watchdog_health);
+  FRAME_SENTINEL_EXIT(FRAME_SENTINEL_SLOT_MEMORY_AUDIT);
+
+  g_zpnet_sentinel_cpu_usage_focus_active = prior_focus;
+}
+
 static FLASHMEM void system_memory_watchdog_alap_cb(timepop_ctx_t*,
                                                     timepop_diag_t*,
                                                     void*) {
@@ -586,7 +603,7 @@ static FLASHMEM void system_memory_watchdog_alap_cb(timepop_ctx_t*,
       system_watchdog_trace_stage_t::AUDIT_ENTER,
       g_system_memory_watchdog_health.audit_count + 1U,
       (uint32_t)g_system_memory_watchdog_health.status);
-  memory_info_audit(&g_system_memory_watchdog_health);
+  system_memory_audit_sentinel();
   system_watchdog_trace_record(
       system_watchdog_trace_stage_t::AUDIT_RETURN,
       (uint32_t)g_system_memory_watchdog_health.status,
@@ -608,16 +625,6 @@ static FLASHMEM void system_memory_watchdog_alap_cb(timepop_ctx_t*,
         g_system_memory_watchdog_event_count,
         g_system_memory_watchdog_event_emitted ? 1U : 0U);
   }
-
-  // Frame-sentinel verdicts are announced here, in serialized foreground
-  // context, never from the handler pass that detected them.  The 5-second
-  // watchdog cadence bounds announcement latency; the evidence itself was
-  // latched at detection time and is not perishable.
-  system_watchdog_trace_record(
-      system_watchdog_trace_stage_t::SENTINEL_BEGIN, 0U, 0U);
-  system_sentinel_service();
-  system_watchdog_trace_record(
-      system_watchdog_trace_stage_t::SENTINEL_END, 0U, 0U);
 
   // If another timed fire arrived while this ALAP service was running, arrange
   // one more serialized pass rather than doing nested work here.
@@ -4053,7 +4060,7 @@ static FLASHMEM Payload cmd_get_feature(const Payload& args) {
 // SENTINEL_INFO — exception-frame sentinel state and verdicts
 // ------------------------------------------------------------
 static FLASHMEM Payload cmd_sentinel_info(const Payload& /*args*/) {
-  return system_sentinel_payload();
+  return frame_sentinel_report_payload();
 }
 
 // ------------------------------------------------------------
@@ -4082,7 +4089,10 @@ static FLASHMEM Payload cmd_payload_flight_info(const Payload& /*args*/) {
 // ------------------------------------------------------------
 static FLASHMEM Payload cmd_crash_info(const Payload& /*args*/) {
   system_crash_report_capture_once();
-  return system_crash_report_payload(true);
+  Payload report = system_crash_report_payload(true);
+  Payload sentinel = frame_sentinel_report_payload();
+  report.add_object("frame_sentinel", sentinel);
+  return report;
 }
 
 // ------------------------------------------------------------
@@ -4096,6 +4106,7 @@ static FLASHMEM Payload cmd_crash_clear(const Payload& /*args*/) {
   g_system_crash_report_truncated = false;
   g_system_crash_report_bytes = 0;
   g_system_crash_report_text[0] = '\0';
+  frame_sentinel_clear();
 
   // Release the retained sentinel verdict so the next violation can latch.
   g_sentinel_violation_retained.magic = 0U;
@@ -4117,6 +4128,7 @@ static FLASHMEM Payload cmd_crash_clear(const Payload& /*args*/) {
   Payload resp = ok_payload();
   resp.add("crash_report_cleared", true);
   resp.add("crash_forensics_cleared", true);
+  resp.add("frame_sentinel_v2_cleared", true);
   resp.add("sentinel_cleared", true);
   resp.add("runtime_ledger_cleared", true);
   resp.add("memory_audit_trace_cleared", true);
@@ -4205,5 +4217,6 @@ void process_system_register(void) {
   process_register("SYSTEM", &SYSTEM_PROCESS);
   g_system_feature_fragment_publish_enabled = true;
   system_feature_schedule_fragment_publish();
+
   system_memory_watchdog_arm();
 }

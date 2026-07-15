@@ -59,6 +59,7 @@
 
 #include "process_interrupt.h"
 #include "process_clocks.h"
+#include "frame_sentinel.h"
 #include "process_system.h"
 
 #include "config.h"
@@ -6329,6 +6330,31 @@ static void lower_env_seal(lower_env_lane_t& lane,
   interrupt_feature_update_floorline();
 }
 
+static void lower_env_seal_sentinel(lower_env_lane_t& lane,
+                                    uint32_t observed_dwt,
+                                    uint32_t target_counter32,
+                                    uint16_t target_hw16,
+                                    uint16_t observed_hw16) {
+  // Open the existing priority-zero ISR focus gate for the full FloorLine
+  // victim interval.  The current QTimer/PPS wrappers already consult this
+  // flag before entering their handler-specific sentinel slots.
+  const bool prior_focus = g_zpnet_sentinel_cpu_usage_focus_active;
+  g_zpnet_sentinel_cpu_usage_focus_active = true;
+
+  FRAME_SENTINEL_ENTER(FRAME_SENTINEL_SLOT_FLOORLINE_SEAL,
+                       "FLOORLINE_SEAL");
+
+  lower_env_seal(lane,
+                 observed_dwt,
+                 target_counter32,
+                 target_hw16,
+                 observed_hw16);
+
+  FRAME_SENTINEL_EXIT(FRAME_SENTINEL_SLOT_FLOORLINE_SEAL);
+
+  g_zpnet_sentinel_cpu_usage_focus_active = prior_focus;
+}
+
 static void cadence_regression_observe(interrupt_subscriber_kind_t kind,
                                        uint32_t observed_dwt,
                                        uint32_t target_counter32,
@@ -6369,8 +6395,8 @@ static void cadence_regression_observe(interrupt_subscriber_kind_t kind,
     lane->active_sample_rejected_count++;
     lane->active_sample_hard_rejected_count++;
     if (closes_second) {
-      lower_env_seal(*lane, observed_dwt, target_counter32,
-                     target_hw16, observed_hw16);
+      lower_env_seal_sentinel(*lane, observed_dwt, target_counter32,
+                              target_hw16, observed_hw16);
     }
     return;
   }
@@ -6395,8 +6421,8 @@ static void cadence_regression_observe(interrupt_subscriber_kind_t kind,
   }
 
   if (closes_second) {
-    lower_env_seal(*lane, observed_dwt, target_counter32,
-                   target_hw16, observed_hw16);
+    lower_env_seal_sentinel(*lane, observed_dwt, target_counter32,
+                            target_hw16, observed_hw16);
   }
 }
 

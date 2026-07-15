@@ -1,6 +1,7 @@
 #pragma once
 
 #include "process.h"
+#include "frame_sentinel.h"
 #include <Arduino.h>
 
 /**
@@ -79,6 +80,16 @@ void process_system_register(void);
 // Exception-frame sentinel
 // ============================================================================
 //
+// New instrumentation should use Frame Sentinel V2 from frame_sentinel.h.
+// V2 is a standalone platform module: detection and retention occur in the
+// sandwich itself, event service is driven directly by loop(), and SYSTEM owns
+// only its read/clear command surface.
+//
+// The declarations below are the retained V1 compatibility surface used by
+// existing crash-hunt sites.  They may be migrated to FRAME_SENTINEL_ENTER /
+// FRAME_SENTINEL_EXIT incrementally without coupling new work to the memory
+// watchdog.
+//
 // Purpose: catch corruption of a stacked exception frame while the corrupting
 // handler pass is still on the CPU, with attribution.
 //
@@ -151,6 +162,8 @@ void zpnet_sentinel_exit(uint32_t slot, uint32_t caller_sp);
                      : "=r"(zpnet_sentinel_exc_return_));                    \
     __asm__ volatile("mov %0, sp"                                            \
                      : "=r"(zpnet_sentinel_sp_));                            \
+    frame_sentinel_enter((slot), (name), zpnet_sentinel_exc_return_,         \
+                         zpnet_sentinel_sp_);                                \
     zpnet_sentinel_enter((slot), (name), zpnet_sentinel_exc_return_,         \
                          zpnet_sentinel_sp_);                                \
   } while (0)
@@ -159,12 +172,20 @@ void zpnet_sentinel_exit(uint32_t slot, uint32_t caller_sp);
     uint32_t zpnet_sentinel_sp_;                                             \
     __asm__ volatile("mov %0, sp"                                            \
                      : "=r"(zpnet_sentinel_sp_));                            \
+    frame_sentinel_exit((slot), zpnet_sentinel_sp_);                         \
     zpnet_sentinel_exit((slot), zpnet_sentinel_sp_);                         \
   } while (0)
 #else
 #define ZPNET_SENTINEL_ENTER(slot, name)                                     \
-  zpnet_sentinel_enter((slot), (name), 0U, 0U)
-#define ZPNET_SENTINEL_EXIT(slot) zpnet_sentinel_exit((slot), 0U)
+  do {                                                                       \
+    frame_sentinel_enter((slot), (name), 0U, 0U);                            \
+    zpnet_sentinel_enter((slot), (name), 0U, 0U);                            \
+  } while (0)
+#define ZPNET_SENTINEL_EXIT(slot)                                            \
+  do {                                                                       \
+    frame_sentinel_exit((slot), 0U);                                         \
+    zpnet_sentinel_exit((slot), 0U);                                         \
+  } while (0)
 #endif
 
 // ============================================================================
