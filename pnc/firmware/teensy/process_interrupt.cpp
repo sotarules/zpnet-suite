@@ -72,7 +72,6 @@
 
 #include <Arduino.h>
 #include "imxrt.h"
-#include <math.h>
 #include <stdio.h>
 #include <string.h>
 #include <climits>
@@ -5299,6 +5298,55 @@ static int32_t pps_floorline_i32_from_i64(int64_t value) {
   return (int32_t)value;
 }
 
+// Integer-only Q16 statistics for FloorLine.
+//
+// FloorLine sealing runs from both priority-0 capture and priority-16 handoff
+// paths.  Do not let diagnostic mean/stddev calculation execute a VFP
+// instruction and thereby consume lazy foreground FP state.  These helpers
+// preserve the existing population-statistics/Q16 report contract using only
+// integer arithmetic.
+static uint32_t lower_env_isqrt_u64(uint64_t value) {
+  uint64_t result = 0U;
+  uint64_t bit = 1ULL << 62;
+
+  while (bit > value) bit >>= 2;
+  while (bit != 0U) {
+    if (value >= result + bit) {
+      value -= result + bit;
+      result = (result >> 1) + bit;
+    } else {
+      result >>= 1;
+    }
+    bit >>= 2;
+  }
+
+  return (uint32_t)result;
+}
+
+static uint64_t lower_env_ratio_q32(uint64_t numerator,
+                                    uint32_t denominator) {
+  if (denominator == 0U) return 0U;
+
+  const uint64_t whole = numerator / (uint64_t)denominator;
+  const uint64_t remainder = numerator % (uint64_t)denominator;
+  if (whole > (UINT64_MAX >> 32)) return UINT64_MAX;
+
+  return (whole << 32) +
+         ((remainder << 32) / (uint64_t)denominator);
+}
+
+static uint64_t lower_env_ratio_q16(uint64_t numerator,
+                                    uint32_t denominator) {
+  if (denominator == 0U) return 0U;
+
+  const uint64_t whole = numerator / (uint64_t)denominator;
+  const uint64_t remainder = numerator % (uint64_t)denominator;
+  if (whole > (UINT64_MAX >> 16)) return UINT64_MAX;
+
+  return (whole << 16) +
+         ((remainder << 16) / (uint64_t)denominator);
+}
+
 // FloorLine lower-envelope inference remains always compiled. Measured clock
 // publication does not select it at the call site; the rail supplies comparison
 // evidence and the narrowly scoped physical-PPS ISR-latency repair candidate.
@@ -5561,13 +5609,21 @@ static void lower_env_copy_residual_forensics(cadence_regression_result_t& r,
     return;
   }
 
-  const double n = (double)lane.active_residual_sample_count;
-  const double mean = (double)lane.active_residual_sum_cycles / n;
-  double variance =
-      ((double)lane.active_residual_square_sum_cycles / n) - (mean * mean);
-  if (variance < 0.0) variance = 0.0;
-  r.residual_mean_q16_cycles = (int32_t)(mean * 65536.0);
-  r.residual_stddev_q16_cycles = (uint32_t)(sqrt(variance) * 65536.0);
+  const uint32_t count = lane.active_residual_sample_count;
+  const int64_t mean_q16 =
+      (lane.active_residual_sum_cycles * 65536LL) / (int64_t)count;
+  const uint64_t mean_abs_q16 = mean_q16 >= 0
+      ? (uint64_t)mean_q16
+      : (uint64_t)(-mean_q16);
+  const uint64_t mean_square_q32 = mean_abs_q16 * mean_abs_q16;
+  const uint64_t second_moment_q32 = lower_env_ratio_q32(
+      lane.active_residual_square_sum_cycles, count);
+  const uint64_t variance_q32 = second_moment_q32 > mean_square_q32
+      ? second_moment_q32 - mean_square_q32
+      : 0U;
+
+  r.residual_mean_q16_cycles = pps_floorline_i32_from_i64(mean_q16);
+  r.residual_stddev_q16_cycles = lower_env_isqrt_u64(variance_q32);
 }
 
 static uint32_t lower_env_quality_confidence_ppm(
@@ -6274,8 +6330,8 @@ static void lower_env_seal(lower_env_lane_t& lane,
   r.slope_q16_cycles_per_sample = (uint64_t)full_slope_q16;
   r.slope_delta_q16_cycles_per_sample = slope_delta_q16;
   r.fit_error_mean_q16_cycles = (int32_t)(residual_sum_q16 / (int64_t)n);
-  r.fit_error_stddev_q16_cycles = (uint32_t)sqrt(
-      ((double)residual_sq_sum_q16 * 65536.0) / (double)n);
+  r.fit_error_stddev_q16_cycles = lower_env_isqrt_u64(
+      lower_env_ratio_q16(residual_sq_sum_q16, n));
   r.fit_error_min_cycles = (min_residual_cycles == INT32_MAX) ? 0 : min_residual_cycles;
   r.fit_error_max_cycles = (max_residual_cycles == INT32_MIN) ? 0 : max_residual_cycles;
   r.fit_error_gt_plus4_count = gt_plus4;
@@ -13519,6 +13575,207 @@ static void qtimer1_init_ch2_scheduler(void) {
   IMXRT_TMR1.CH[QTIMER1_RETIRED_AUX_CH].CMPLD2 = 0;
 }
 
+// ============================================================================
+// Cortex-M7 floating-point exception-context policy
+// ============================================================================
+//
+// process_interrupt owns the boundary at which ZPNet interrupt-bearing
+// hardware becomes live.  Install the CPU-wide exception-context policy here,
+// before any ZPNet QTimer/GPIO IRQ can run:
+//
+//   ASPEN = 1  automatic FP context preservation enabled
+//   LSPEN = 0  lazy/deferred FP stacking disabled (eager preservation)
+//
+// This does not disable the FPU and does not restrict compiler use of VFP
+// registers inside an ISR.  It removes only the mid-handler lazy materialize
+// transition implicated by Frame Sentinel.  The policy is installed once; it
+// is never rewritten after interrupt hardware has become live.
+
+static constexpr uintptr_t INTERRUPT_FPU_FPCCR_ADDRESS = 0xE000EF34UL;
+static constexpr uintptr_t INTERRUPT_SCB_CPACR_ADDRESS = 0xE000ED88UL;
+static constexpr uint32_t INTERRUPT_FPU_FPCCR_ASPEN  = 1UL << 31;
+static constexpr uint32_t INTERRUPT_FPU_FPCCR_LSPEN  = 1UL << 30;
+static constexpr uint32_t INTERRUPT_FPU_FPCCR_LSPACT = 1UL << 0;
+static constexpr uint32_t INTERRUPT_FPU_FPCCR_POLICY_MASK =
+    INTERRUPT_FPU_FPCCR_ASPEN |
+    INTERRUPT_FPU_FPCCR_LSPEN |
+    INTERRUPT_FPU_FPCCR_LSPACT;
+static constexpr uint32_t INTERRUPT_FPU_FPCCR_POLICY_VALUE =
+    INTERRUPT_FPU_FPCCR_ASPEN;
+static constexpr uint32_t INTERRUPT_SCB_CPACR_CP10_CP11_FULL =
+    0x00F00000UL;
+static constexpr uint32_t INTERRUPT_CONTROL_FPCA = 1UL << 2;
+
+enum class interrupt_fpu_policy_failure_t : uint32_t {
+  NONE = 0,
+  CALLED_FROM_EXCEPTION = 1,
+  LAZY_STATE_ALREADY_ACTIVE = 2,
+  FPCCR_READBACK_MISMATCH = 3,
+  FPU_ACCESS_NOT_ENABLED = 4,
+};
+
+struct interrupt_fpu_context_policy_state_t {
+  bool attempted = false;
+  bool write_performed = false;
+  bool installed = false;
+  bool last_verify_ok = false;
+
+  uint32_t attempt_count = 0;
+  uint32_t verify_count = 0;
+  uint32_t report_count = 0;
+  uint32_t irq_enable_block_count = 0;
+
+  uint32_t ipsr_at_install = 0;
+  uint32_t primask_at_install = 0;
+  uint32_t control_at_install = 0;
+  uint32_t cpacr_at_install = 0;
+  uint32_t cpacr_after_install = 0;
+
+  uint32_t fpccr_before = 0;
+  uint32_t fpccr_desired = 0;
+  uint32_t fpccr_after = 0;
+  uint32_t last_verify_fpccr = 0;
+  uint32_t last_verify_cpacr = 0;
+  uint32_t last_irq_enable_fpccr = 0;
+
+  interrupt_fpu_policy_failure_t failure =
+      interrupt_fpu_policy_failure_t::NONE;
+};
+
+static interrupt_fpu_context_policy_state_t g_interrupt_fpu_context_policy{};
+
+static inline volatile uint32_t& interrupt_fpu_fpccr_register(void) {
+  return *reinterpret_cast<volatile uint32_t*>(
+      INTERRUPT_FPU_FPCCR_ADDRESS);
+}
+
+static inline volatile uint32_t& interrupt_scb_cpacr_register(void) {
+  return *reinterpret_cast<volatile uint32_t*>(
+      INTERRUPT_SCB_CPACR_ADDRESS);
+}
+
+static inline uint32_t interrupt_control_register(void) {
+  uint32_t value = 0;
+  __asm__ volatile ("mrs %0, control" : "=r" (value) :: "memory");
+  return value;
+}
+
+static inline bool interrupt_fpu_fpccr_policy_matches(uint32_t fpccr) {
+  return (fpccr & INTERRUPT_FPU_FPCCR_POLICY_MASK) ==
+         INTERRUPT_FPU_FPCCR_POLICY_VALUE;
+}
+
+static inline bool interrupt_fpu_access_enabled(uint32_t cpacr) {
+  return (cpacr & INTERRUPT_SCB_CPACR_CP10_CP11_FULL) ==
+         INTERRUPT_SCB_CPACR_CP10_CP11_FULL;
+}
+
+static bool interrupt_fpu_context_policy_verify_current(void) {
+  interrupt_fpu_context_policy_state_t& s =
+      g_interrupt_fpu_context_policy;
+  s.verify_count++;
+  s.last_verify_fpccr = interrupt_fpu_fpccr_register();
+  s.last_verify_cpacr = interrupt_scb_cpacr_register();
+  s.last_verify_ok =
+      s.attempted &&
+      s.installed &&
+      interrupt_fpu_fpccr_policy_matches(s.last_verify_fpccr) &&
+      interrupt_fpu_access_enabled(s.last_verify_cpacr);
+  return s.last_verify_ok;
+}
+
+static bool interrupt_fpu_context_policy_install_once(void) {
+  interrupt_fpu_context_policy_state_t& s =
+      g_interrupt_fpu_context_policy;
+
+  // Never rewrite FPCCR after the one early-boot installation attempt.  A
+  // later caller may verify the policy, but runtime toggling is forbidden.
+  if (s.attempted) {
+    return interrupt_fpu_context_policy_verify_current();
+  }
+
+  s.attempted = true;
+  s.attempt_count++;
+  s.ipsr_at_install = interrupt_ipsr();
+  s.primask_at_install = interrupt_primask();
+  s.control_at_install = interrupt_control_register();
+  s.cpacr_at_install = interrupt_scb_cpacr_register();
+
+  if (s.ipsr_at_install != 0U) {
+    s.failure = interrupt_fpu_policy_failure_t::CALLED_FROM_EXCEPTION;
+    return false;
+  }
+
+  uint32_t prior_primask = 0;
+  __asm__ volatile ("mrs %0, primask" : "=r" (prior_primask) :: "memory");
+  __asm__ volatile ("cpsid i" ::: "memory");
+  __asm__ volatile ("dsb" ::: "memory");
+
+  s.fpccr_before = interrupt_fpu_fpccr_register();
+  s.fpccr_desired =
+      (s.fpccr_before | INTERRUPT_FPU_FPCCR_ASPEN) &
+      ~INTERRUPT_FPU_FPCCR_LSPEN;
+
+  if ((s.fpccr_before & INTERRUPT_FPU_FPCCR_LSPACT) != 0U) {
+    s.failure =
+        interrupt_fpu_policy_failure_t::LAZY_STATE_ALREADY_ACTIVE;
+  } else {
+    s.write_performed = (s.fpccr_desired != s.fpccr_before);
+    if (s.write_performed) {
+      interrupt_fpu_fpccr_register() = s.fpccr_desired;
+    }
+
+    __asm__ volatile ("dsb" ::: "memory");
+    __asm__ volatile ("isb" ::: "memory");
+
+    s.fpccr_after = interrupt_fpu_fpccr_register();
+    s.cpacr_after_install = interrupt_scb_cpacr_register();
+
+    if (!interrupt_fpu_fpccr_policy_matches(s.fpccr_after)) {
+      s.failure =
+          interrupt_fpu_policy_failure_t::FPCCR_READBACK_MISMATCH;
+    } else if (!interrupt_fpu_access_enabled(s.cpacr_after_install)) {
+      s.failure =
+          interrupt_fpu_policy_failure_t::FPU_ACCESS_NOT_ENABLED;
+    } else {
+      s.failure = interrupt_fpu_policy_failure_t::NONE;
+      s.installed = true;
+    }
+  }
+
+  __asm__ volatile ("msr primask, %0"
+                    :: "r" (prior_primask)
+                    : "memory");
+  __asm__ volatile ("isb" ::: "memory");
+
+  return interrupt_fpu_context_policy_verify_current();
+}
+
+static FLASHMEM const char* interrupt_fpu_policy_failure_name(
+    interrupt_fpu_policy_failure_t failure) {
+  switch (failure) {
+    case interrupt_fpu_policy_failure_t::CALLED_FROM_EXCEPTION:
+      return "CALLED_FROM_EXCEPTION";
+    case interrupt_fpu_policy_failure_t::LAZY_STATE_ALREADY_ACTIVE:
+      return "LAZY_STATE_ALREADY_ACTIVE";
+    case interrupt_fpu_policy_failure_t::FPCCR_READBACK_MISMATCH:
+      return "FPCCR_READBACK_MISMATCH";
+    case interrupt_fpu_policy_failure_t::FPU_ACCESS_NOT_ENABLED:
+      return "FPU_ACCESS_NOT_ENABLED";
+    default:
+      return "NONE";
+  }
+}
+
+static FLASHMEM const char* interrupt_fpu_policy_mode_name(uint32_t fpccr) {
+  const bool aspen = (fpccr & INTERRUPT_FPU_FPCCR_ASPEN) != 0U;
+  const bool lspen = (fpccr & INTERRUPT_FPU_FPCCR_LSPEN) != 0U;
+  if (aspen && !lspen) return "AUTOMATIC_EAGER";
+  if (aspen && lspen) return "AUTOMATIC_LAZY";
+  if (!aspen && !lspen) return "SOFTWARE_MANAGED";
+  return "INVALID_ASPEN0_LSPEN1";
+}
+
 static bool g_interrupt_dmamem_initialized = false;
 
 static void interrupt_dmamem_cold_init(void) {
@@ -13585,6 +13842,10 @@ static void interrupt_dmamem_cold_init(void) {
 }
 
 void process_interrupt_init_hardware(void) {
+  // Install the CPU exception-context policy before any ZPNet interrupt-bearing
+  // hardware is configured.  A failed installation leaves every compare/IRQ
+  // path dark and remains visible through INTERRUPT.REPORT_FPU_CONTEXT.
+  if (!interrupt_fpu_context_policy_install_once()) return;
   if (g_interrupt_hw_ready) return;
 
   interrupt_dmamem_cold_init();
@@ -13942,6 +14203,16 @@ void process_interrupt_init(void) {
 
 void process_interrupt_enable_irqs(void) {
   if (g_interrupt_irqs_enabled) return;
+
+  // Never make an interrupt vector live unless the eager automatic FP-context
+  // policy still matches the register readback at this exact boundary.
+  if (!g_interrupt_hw_ready ||
+      !interrupt_fpu_context_policy_verify_current()) {
+    g_interrupt_fpu_context_policy.irq_enable_block_count++;
+    g_interrupt_fpu_context_policy.last_irq_enable_fpccr =
+        interrupt_fpu_fpccr_register();
+    return;
+  }
 
   interrupt_handoff_configure();
 
@@ -14740,7 +15011,7 @@ static FLASHMEM Payload cmd_report(const Payload&) {
   Payload p;
   p.add("report", "INTERRUPT_LEAN");
   p.add("schema", "INTERRUPT_LEAN_V1");
-  p.add("available_reports", "REPORT_STATUS REPORT_PPS REPORT_CADENCE REPORT_SMARTZERO REPORT_BRIDGE REPORT_HANDOFF REPORT_LOWER_ENVELOPE REPORT_PUBLICATION REPORT_INTEGRITY REPORT_LANES REPORT_LANE");
+  p.add("available_reports", "REPORT_STATUS REPORT_FPU_CONTEXT REPORT_PPS REPORT_CADENCE REPORT_SMARTZERO REPORT_BRIDGE REPORT_HANDOFF REPORT_LOWER_ENVELOPE REPORT_PUBLICATION REPORT_INTEGRITY REPORT_LANES REPORT_LANE");
   p.add("report_lane_sections", "summary clock gate service yardstick floorline");
   p.add("hw_ready", g_interrupt_hw_ready);
   p.add("runtime_ready", g_interrupt_runtime_ready);
@@ -14766,6 +15037,95 @@ static FLASHMEM Payload cmd_report_status(const Payload&) {
   add_runtime_summary(p, "vclock", g_rt_vclock, g_vclock_lane.irq_count, g_rt_vclock ? g_rt_vclock->event_count : 0U);
   add_runtime_summary(p, "ocxo1", g_rt_ocxo1, g_ocxo1_lane.irq_count, g_ocxo1_lane.witness_fire_count);
   add_runtime_summary(p, "ocxo2", g_rt_ocxo2, g_ocxo2_lane.irq_count, g_ocxo2_lane.witness_fire_count);
+  const uint32_t fpu_fpccr = interrupt_fpu_fpccr_register();
+  const uint32_t fpu_cpacr = interrupt_scb_cpacr_register();
+  p.add("fpu_context_policy_ok",
+        g_interrupt_fpu_context_policy.attempted &&
+        g_interrupt_fpu_context_policy.installed &&
+        interrupt_fpu_fpccr_policy_matches(fpu_fpccr) &&
+        interrupt_fpu_access_enabled(fpu_cpacr));
+  p.add("fpu_context_mode", interrupt_fpu_policy_mode_name(fpu_fpccr));
+  return p;
+}
+
+static FLASHMEM Payload cmd_report_fpu_context(const Payload&) {
+  interrupt_fpu_context_policy_state_t& s =
+      g_interrupt_fpu_context_policy;
+  s.report_count++;
+
+  const bool verified_now = interrupt_fpu_context_policy_verify_current();
+  const uint32_t fpccr = s.last_verify_fpccr;
+  const uint32_t cpacr = s.last_verify_cpacr;
+  const uint32_t control = interrupt_control_register();
+
+  Payload p;
+  p.add("report", "INTERRUPT_FPU_CONTEXT");
+  p.add("schema", "INTERRUPT_FPU_CONTEXT_POLICY_V1");
+  p.add("policy", "AUTOMATIC_EAGER");
+  p.add("summary",
+        "automatic FP context preservation enabled; lazy stacking disabled");
+  p.add("configured_correctly", verified_now);
+  p.add("safe_to_enable_interrupts", verified_now && g_interrupt_hw_ready);
+  p.add("hw_ready", g_interrupt_hw_ready);
+  p.add("runtime_ready", g_interrupt_runtime_ready);
+  p.add("irqs_enabled", g_interrupt_irqs_enabled);
+  p.add("report_count", s.report_count);
+
+  {
+    Payload expected;
+    expected.add("aspen", true);
+    expected.add("lspen", false);
+    expected.add("lspact", false);
+    expected.add("fpccr_policy_mask", INTERRUPT_FPU_FPCCR_POLICY_MASK);
+    expected.add("fpccr_policy_value", INTERRUPT_FPU_FPCCR_POLICY_VALUE);
+    expected.add("cp10_cp11_full_access_mask",
+                 INTERRUPT_SCB_CPACR_CP10_CP11_FULL);
+    p.add_object("expected", expected);
+  }
+
+  {
+    Payload install;
+    install.add("attempted", s.attempted);
+    install.add("installed", s.installed);
+    install.add("write_performed", s.write_performed);
+    install.add("attempt_count", s.attempt_count);
+    install.add("failure_id", (uint32_t)s.failure);
+    install.add("failure", interrupt_fpu_policy_failure_name(s.failure));
+    install.add("ipsr", s.ipsr_at_install);
+    install.add("primask", s.primask_at_install);
+    install.add("control", s.control_at_install);
+    install.add("fpca", (s.control_at_install & INTERRUPT_CONTROL_FPCA) != 0U);
+    install.add("cpacr", s.cpacr_at_install);
+    install.add("cpacr_after", s.cpacr_after_install);
+    install.add("fpccr_before", s.fpccr_before);
+    install.add("fpccr_desired", s.fpccr_desired);
+    install.add("fpccr_after", s.fpccr_after);
+    install.add("before_mode", interrupt_fpu_policy_mode_name(s.fpccr_before));
+    install.add("after_mode", interrupt_fpu_policy_mode_name(s.fpccr_after));
+    p.add_object("install", install);
+  }
+
+  {
+    Payload current;
+    current.add("verified", verified_now);
+    current.add("verify_count", s.verify_count);
+    current.add("fpccr", fpccr);
+    current.add("cpacr", cpacr);
+    current.add("control", control);
+    current.add("mode", interrupt_fpu_policy_mode_name(fpccr));
+    current.add("aspen", (fpccr & INTERRUPT_FPU_FPCCR_ASPEN) != 0U);
+    current.add("lspen", (fpccr & INTERRUPT_FPU_FPCCR_LSPEN) != 0U);
+    current.add("lspact", (fpccr & INTERRUPT_FPU_FPCCR_LSPACT) != 0U);
+    current.add("fpca", (control & INTERRUPT_CONTROL_FPCA) != 0U);
+    current.add("fpccr_policy_match",
+                interrupt_fpu_fpccr_policy_matches(fpccr));
+    current.add("cp10_cp11_full_access",
+                interrupt_fpu_access_enabled(cpacr));
+    current.add("irq_enable_block_count", s.irq_enable_block_count);
+    current.add("last_irq_enable_fpccr", s.last_irq_enable_fpccr);
+    p.add_object("current", current);
+  }
+
   return p;
 }
 
@@ -15207,6 +15567,7 @@ static FLASHMEM Payload cmd_report_ocxo_isr_raw_dwt(const Payload&) {
 static const process_command_entry_t INTERRUPT_COMMANDS[] = {
   { "REPORT",          cmd_report          },
   { "REPORT_STATUS",   cmd_report_status   },
+  { "REPORT_FPU_CONTEXT", cmd_report_fpu_context },
   { "REPORT_PPS",      cmd_report_pps      },
   { "REPORT_CADENCE",  cmd_report_cadence  },
   { "REPORT_SMARTZERO", cmd_report_smartzero },
