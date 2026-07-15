@@ -5,7 +5,7 @@
 class Payload;
 
 // ============================================================================
-// Frame Sentinel V5
+// Frame Sentinel V6
 // ============================================================================
 //
 // Frame Sentinel is an independent platform diagnostic.  It has no dependency
@@ -53,6 +53,7 @@ enum : uint32_t {
   FRAME_SENTINEL_KIND_FP_WORD_CHANGED       = 1U << 4,
   FRAME_SENTINEL_KIND_FRAME_TYPE_CHANGED    = 1U << 5,
   FRAME_SENTINEL_KIND_FP_GEOMETRY_CHANGED   = 1U << 6,
+  FRAME_SENTINEL_KIND_SCOPE_METADATA_CORRUPT = 1U << 7,
 };
 
 void frame_sentinel_init(void);
