@@ -8,7 +8,7 @@
 
 /*
   ============================================================================
-  Payload v4 — Single-Store Typed JSON Carrier
+  Payload v4.1 — Single-Store Typed JSON Carrier
   ============================================================================
 
   HARD CONTRACT:
@@ -17,6 +17,8 @@
     • The entry directory and all owned bytes live in that same region.
     • Values retain their JSON type; strings are never reclassified by text.
     • Add/attach operations are preflighted and committed transactionally.
+    • Borrowed key/value spans are revalidated immediately before final copy,
+      after any storage growth or internal-alias remapping.
     • Public mutators return bool; existing callers may ignore the result.
     • Payload runtime code performs no float or double conversion. Scientific
       values cross the construction boundary as integer-only fixed_decimal_t
@@ -294,6 +296,69 @@ typedef struct {
 } payload_flight_info_t;
 
 void payload_get_flight_info(payload_flight_info_t* out);
+
+// ============================================================================
+// Payload append transaction recorder (retained, read-only)
+// ============================================================================
+//
+// V4.1 records key/value pointer custody across _ensure_room() and the final
+// copy boundary. Each entry is scalar-only, allocation-free, committed with
+// sequence/complement, and cache-flushed into RAM2.
+
+#define PAYLOAD_APPEND_TRACE_ENTRIES 16U
+
+enum class payload_append_trace_stage_t : uint32_t {
+  NONE             = 0,
+  ENTER            = 1,
+  PRE_ENSURE       = 2,
+  ENSURE_FAILED    = 3,
+  POST_ENSURE      = 4,
+  PRE_VALUE_COPY   = 5,
+  VALUE_COPY_DONE  = 6,
+  PRE_KEY_COPY     = 7,
+  KEY_COPY_DONE    = 8,
+  COMMIT           = 9,
+  FINAL_SPAN_FAIL  = 10,
+};
+
+typedef struct {
+  uint32_t sequence;
+  uint32_t sequence_inv;
+  uint32_t stage;
+  uint32_t this_ptr;
+  uint32_t key_ptr;
+  uint32_t value_ptr;
+  uint32_t key_len;
+  uint32_t value_len;
+  uint32_t kind;
+  uint32_t storage_ptr;
+  uint32_t capacity;
+  uint32_t data_begin;
+  uint32_t entry_count;
+  uint32_t alias_flags;   // bit 0 key alias, bit 1 value alias
+  uint32_t key_offset;
+  uint32_t value_offset;
+  int32_t  data_shift;
+  uint32_t key_off;
+  uint32_t val_off;
+  uint32_t dwt_cyccnt;
+  uint32_t ipsr;
+} payload_append_trace_entry_t;
+
+typedef struct {
+  uint32_t valid;
+  uint32_t count;
+  uint32_t newest_sequence;
+  payload_append_trace_entry_t entries[PAYLOAD_APPEND_TRACE_ENTRIES];
+} payload_append_trace_bank_snapshot_t;
+
+typedef struct {
+  payload_append_trace_bank_snapshot_t live;
+  payload_append_trace_bank_snapshot_t retained;
+} payload_append_trace_snapshot_t;
+
+void payload_get_append_trace(payload_append_trace_snapshot_t* out);
+void payload_clear_retained_append_trace();
 
 // fixed_decimal_t is defined by util.h.  A forward declaration keeps Payload's
 // header independent of the conversion implementation while allowing the

@@ -12,7 +12,7 @@
 #include <stddef.h>
 
 // ============================================================================
-// Payload v4 instrumentation
+// Payload v4.1 instrumentation
 // ============================================================================
 
 static volatile uint32_t g_payload_instances_constructed = 0;
@@ -399,6 +399,8 @@ enum payload_operation_id_t : uint32_t {
     PAYLOAD_OP_APPEND_VALUE = 0x60D27BE3UL,
     PAYLOAD_OP_APPEND_VALUE_LENGTH = 0x80AAE437UL,
     PAYLOAD_OP_APPEND_VALUE_UTF8 = 0x333B0378UL,
+    PAYLOAD_OP_APPEND_FINAL_KEY_SPAN = 0x4E7E6B11UL,
+    PAYLOAD_OP_APPEND_FINAL_VALUE_SPAN = 0xA8C2F6D3UL,
     PAYLOAD_OP_APPEND_WRITER = 0xCF4278D5UL,
     PAYLOAD_OP_APPEND_WRITER_KEY = 0x3151E968UL,
     PAYLOAD_OP_APPEND_WRITER_LENGTH = 0x06E0EA19UL,
@@ -513,6 +515,8 @@ const char* payload_operation_id_name(uint32_t operation_id) {
         case PAYLOAD_OP_APPEND_VALUE: return "append_value";
         case PAYLOAD_OP_APPEND_VALUE_LENGTH: return "append_value.length";
         case PAYLOAD_OP_APPEND_VALUE_UTF8: return "append_value.utf8";
+        case PAYLOAD_OP_APPEND_FINAL_KEY_SPAN: return "append_value.final_key_span";
+        case PAYLOAD_OP_APPEND_FINAL_VALUE_SPAN: return "append_value.final_value_span";
         case PAYLOAD_OP_APPEND_WRITER: return "append_writer";
         case PAYLOAD_OP_APPEND_WRITER_KEY: return "append_writer.key";
         case PAYLOAD_OP_APPEND_WRITER_LENGTH: return "append_writer.length";
@@ -1077,6 +1081,195 @@ static void payload_guarded_free(void* block,
 #else
 #define PAYLOAD_RETAINED_MEM
 #endif
+
+// ---- Retained append transaction recorder --------------------------------
+//
+// This recorder is intentionally independent of the general Payload flight
+// ring. The crash under investigation lost that ring, while the exact append
+// arguments are the evidence needed to separate caller custody, growth, alias
+// remapping, and final-copy failures.
+
+static constexpr uint32_t PAYLOAD_APPEND_TRACE_MAGIC = 0x50413431UL;  // 'PA41'
+static constexpr uint32_t PAYLOAD_APPEND_TRACE_SCHEMA_VERSION = 1U;
+
+struct payload_append_trace_bank_t {
+    uint32_t magic;
+    uint32_t magic_inv;
+    uint32_t schema_version;
+    uint32_t capacity;
+    payload_append_trace_entry_t entries[PAYLOAD_APPEND_TRACE_ENTRIES];
+};
+
+static payload_append_trace_bank_t g_payload_append_trace_live PAYLOAD_RETAINED_MEM;
+static payload_append_trace_bank_t g_payload_append_trace_retained PAYLOAD_RETAINED_MEM;
+static bool g_payload_append_trace_boot_latched = false;
+static volatile uint32_t g_payload_append_trace_next_sequence = 0U;
+
+static inline void payload_append_trace_dmb() {
+#if defined(__arm__)
+    __asm__ volatile("dmb" ::: "memory");
+#endif
+}
+
+static bool payload_append_trace_bank_valid(
+    const payload_append_trace_bank_t& bank) {
+    return bank.magic == PAYLOAD_APPEND_TRACE_MAGIC &&
+           (bank.magic ^ bank.magic_inv) == 0xFFFFFFFFUL &&
+           bank.schema_version == PAYLOAD_APPEND_TRACE_SCHEMA_VERSION &&
+           bank.capacity == PAYLOAD_APPEND_TRACE_ENTRIES;
+}
+
+static bool payload_append_trace_entry_valid(
+    const payload_append_trace_entry_t& entry) {
+    return entry.sequence != 0U &&
+           (entry.sequence ^ entry.sequence_inv) == 0xFFFFFFFFUL;
+}
+
+static void payload_append_trace_initialize_live() {
+    memset((void*)&g_payload_append_trace_live, 0,
+           sizeof(g_payload_append_trace_live));
+    g_payload_append_trace_live.schema_version =
+        PAYLOAD_APPEND_TRACE_SCHEMA_VERSION;
+    g_payload_append_trace_live.capacity = PAYLOAD_APPEND_TRACE_ENTRIES;
+    g_payload_append_trace_live.magic_inv = ~PAYLOAD_APPEND_TRACE_MAGIC;
+    g_payload_append_trace_live.magic = PAYLOAD_APPEND_TRACE_MAGIC;
+    g_payload_append_trace_next_sequence = 0U;
+    payload_retained_flush(&g_payload_append_trace_live,
+                           sizeof(g_payload_append_trace_live));
+}
+
+static void payload_append_trace_boot_latch() {
+    if (g_payload_append_trace_boot_latched) return;
+    g_payload_append_trace_boot_latched = true;
+
+    if (payload_append_trace_bank_valid(g_payload_append_trace_live)) {
+        g_payload_append_trace_retained = g_payload_append_trace_live;
+    } else {
+        memset((void*)&g_payload_append_trace_retained, 0,
+               sizeof(g_payload_append_trace_retained));
+    }
+    payload_retained_flush(&g_payload_append_trace_retained,
+                           sizeof(g_payload_append_trace_retained));
+    payload_append_trace_initialize_live();
+}
+
+static void payload_append_trace_record(
+    payload_append_trace_stage_t stage,
+    const void* self,
+    const char* key,
+    size_t key_len,
+    const char* value,
+    size_t value_len,
+    uint32_t kind,
+    const void* storage,
+    size_t capacity,
+    size_t data_begin,
+    size_t entry_count,
+    bool key_alias,
+    bool value_alias,
+    size_t key_offset,
+    size_t value_offset,
+    int32_t data_shift,
+    size_t key_off,
+    size_t val_off) {
+    payload_append_trace_boot_latch();
+
+    uint32_t sequence = g_payload_append_trace_next_sequence + 1U;
+    if (sequence == 0U) sequence = 1U;
+    g_payload_append_trace_next_sequence = sequence;
+
+    payload_append_trace_entry_t& entry =
+        g_payload_append_trace_live.entries[
+            (sequence - 1U) % PAYLOAD_APPEND_TRACE_ENTRIES];
+
+    entry.sequence = 0U;
+    entry.sequence_inv = 0U;
+    payload_append_trace_dmb();
+    payload_retained_flush(&entry, 2U * sizeof(uint32_t));
+
+    entry.stage = (uint32_t)stage;
+    entry.this_ptr = (uint32_t)(uintptr_t)self;
+    entry.key_ptr = (uint32_t)(uintptr_t)key;
+    entry.value_ptr = (uint32_t)(uintptr_t)value;
+    entry.key_len = (uint32_t)key_len;
+    entry.value_len = (uint32_t)value_len;
+    entry.kind = kind;
+    entry.storage_ptr = (uint32_t)(uintptr_t)storage;
+    entry.capacity = (uint32_t)capacity;
+    entry.data_begin = (uint32_t)data_begin;
+    entry.entry_count = (uint32_t)entry_count;
+    entry.alias_flags = (key_alias ? 1U : 0U) |
+                        (value_alias ? 2U : 0U);
+    entry.key_offset = (uint32_t)key_offset;
+    entry.value_offset = (uint32_t)value_offset;
+    entry.data_shift = data_shift;
+    entry.key_off = (uint32_t)key_off;
+    entry.val_off = (uint32_t)val_off;
+    entry.dwt_cyccnt = payload_read_dwt();
+    entry.ipsr = payload_read_ipsr();
+
+    entry.sequence_inv = ~sequence;
+    payload_append_trace_dmb();
+    entry.sequence = sequence;
+    payload_append_trace_dmb();
+    payload_retained_flush(&entry, sizeof(entry));
+}
+
+static void payload_append_trace_snapshot_bank(
+    const payload_append_trace_bank_t& bank,
+    payload_append_trace_bank_snapshot_t* out) {
+    memset(out, 0, sizeof(*out));
+    if (!payload_append_trace_bank_valid(bank)) return;
+    out->valid = 1U;
+
+    for (uint32_t i = 0U; i < PAYLOAD_APPEND_TRACE_ENTRIES; ++i) {
+        const volatile payload_append_trace_entry_t* source =
+            &bank.entries[i];
+        const uint32_t sequence_before = source->sequence;
+        const uint32_t sequence_inv_before = source->sequence_inv;
+        if (sequence_before == 0U ||
+            (sequence_before ^ sequence_inv_before) != 0xFFFFFFFFUL) {
+            continue;
+        }
+
+        const payload_append_trace_entry_t candidate = bank.entries[i];
+        payload_append_trace_dmb();
+        if (source->sequence != sequence_before ||
+            source->sequence_inv != sequence_inv_before ||
+            !payload_append_trace_entry_valid(candidate)) {
+            continue;
+        }
+
+        uint32_t pos = out->count;
+        while (pos > 0U &&
+               out->entries[pos - 1U].sequence > candidate.sequence) {
+            out->entries[pos] = out->entries[pos - 1U];
+            --pos;
+        }
+        out->entries[pos] = candidate;
+        ++out->count;
+    }
+    if (out->count != 0U) {
+        out->newest_sequence = out->entries[out->count - 1U].sequence;
+    }
+}
+
+void payload_get_append_trace(payload_append_trace_snapshot_t* out) {
+    if (!out) return;
+    payload_append_trace_boot_latch();
+    memset(out, 0, sizeof(*out));
+    payload_append_trace_snapshot_bank(g_payload_append_trace_live,
+                                       &out->live);
+    payload_append_trace_snapshot_bank(g_payload_append_trace_retained,
+                                       &out->retained);
+}
+
+void payload_clear_retained_append_trace() {
+    memset((void*)&g_payload_append_trace_retained, 0,
+           sizeof(g_payload_append_trace_retained));
+    payload_retained_flush(&g_payload_append_trace_retained,
+                           sizeof(g_payload_append_trace_retained));
+}
 
 static constexpr uint32_t PAYLOAD_FLIGHT_MAGIC = 0x464C5952UL;  // 'FLYR'
 
@@ -2639,6 +2832,13 @@ bool Payload::_append_value(const char* key,
                             const char* value,
                             size_t value_len,
                             ValueKind kind) {
+    payload_append_trace_record(payload_append_trace_stage_t::ENTER,
+                                this,
+                                key, key_len,
+                                value, value_len,
+                                (uint32_t)kind,
+                                nullptr, 0U, 0U, 0U,
+                                false, false, 0U, 0U, 0, 0U, 0U);
     if (!_self_ok(PAYLOAD_OP_APPEND_VALUE)) return false;
     payload_note_handler_context(PAYLOAD_OP_APPEND_VALUE, this,
                                  &g_payload_handler_ctx_mutate);
@@ -2738,7 +2938,27 @@ bool Payload::_append_value(const char* key,
 
     const size_t additional_data = key_len + 1U + value_len + 1U;
     int32_t shift = 0;
-    if (!_ensure_room(1U, additional_data, &shift)) return false;
+    payload_append_trace_record(payload_append_trace_stage_t::PRE_ENSURE,
+                                this,
+                                key, key_len,
+                                value, value_len,
+                                (uint32_t)kind,
+                                old_storage, old_capacity, old_data_begin, _count,
+                                key_alias, value_alias,
+                                key_offset, value_offset,
+                                shift, 0U, 0U);
+    if (!_ensure_room(1U, additional_data, &shift)) {
+        payload_append_trace_record(payload_append_trace_stage_t::ENSURE_FAILED,
+                                    this,
+                                    key, key_len,
+                                    value, value_len,
+                                    (uint32_t)kind,
+                                    _storage(), _capacity(), _data_begin, _count,
+                                    key_alias, value_alias,
+                                    key_offset, value_offset,
+                                    shift, 0U, 0U);
+        return false;
+    }
 
     uint8_t* storage = _storage();
     if (key_alias) {
@@ -2754,15 +2974,102 @@ bool Payload::_append_value(const char* key,
         value = reinterpret_cast<const char*>(storage + remapped);
     }
 
+    payload_append_trace_record(payload_append_trace_stage_t::POST_ENSURE,
+                                this,
+                                key, key_len,
+                                value, value_len,
+                                (uint32_t)kind,
+                                storage, _capacity(), _data_begin, _count,
+                                key_alias, value_alias,
+                                key_offset, value_offset,
+                                shift, 0U, 0U);
+
+    // V4.1 closes the validation-to-use gap. Growth, allocator activity, and
+    // internal alias relocation all occur before this point, so the spans are
+    // checked again at the exact custody boundary immediately preceding copy.
+    if (value_len != 0 &&
+        !payload_span_readable(value, value_len,
+                               PAYLOAD_OP_APPEND_FINAL_VALUE_SPAN)) {
+        payload_append_trace_record(payload_append_trace_stage_t::FINAL_SPAN_FAIL,
+                                    this,
+                                    key, key_len,
+                                    value, value_len,
+                                    (uint32_t)kind,
+                                    storage, _capacity(), _data_begin, _count,
+                                    key_alias, value_alias,
+                                    key_offset, value_offset,
+                                    shift, 0U, 0U);
+        payload_note_bad_key(key);
+        payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER,
+                           PAYLOAD_OP_APPEND_FINAL_VALUE_SPAN,
+                           this);
+        return false;
+    }
+    if (key_len != 0 &&
+        !payload_span_readable(key, key_len,
+                               PAYLOAD_OP_APPEND_FINAL_KEY_SPAN)) {
+        payload_append_trace_record(payload_append_trace_stage_t::FINAL_SPAN_FAIL,
+                                    this,
+                                    key, key_len,
+                                    value, value_len,
+                                    (uint32_t)kind,
+                                    storage, _capacity(), _data_begin, _count,
+                                    key_alias, value_alias,
+                                    key_offset, value_offset,
+                                    shift, 0U, 0U);
+        payload_note_bad_key(key);
+        payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER,
+                           PAYLOAD_OP_APPEND_FINAL_KEY_SPAN,
+                           this);
+        return false;
+    }
+
     const uint16_t val_off =
         (uint16_t)(_data_begin - (uint16_t)(value_len + 1U));
     const uint16_t key_off =
         (uint16_t)(val_off - (uint16_t)(key_len + 1U));
 
+    payload_append_trace_record(payload_append_trace_stage_t::PRE_VALUE_COPY,
+                                this,
+                                key, key_len,
+                                value, value_len,
+                                (uint32_t)kind,
+                                storage, _capacity(), _data_begin, _count,
+                                key_alias, value_alias,
+                                key_offset, value_offset,
+                                shift, key_off, val_off);
     if (value_len != 0) memmove(storage + val_off, value, value_len);
     storage[(size_t)val_off + value_len] = '\0';
+    payload_append_trace_record(payload_append_trace_stage_t::VALUE_COPY_DONE,
+                                this,
+                                key, key_len,
+                                value, value_len,
+                                (uint32_t)kind,
+                                storage, _capacity(), _data_begin, _count,
+                                key_alias, value_alias,
+                                key_offset, value_offset,
+                                shift, key_off, val_off);
+
+    payload_append_trace_record(payload_append_trace_stage_t::PRE_KEY_COPY,
+                                this,
+                                key, key_len,
+                                value, value_len,
+                                (uint32_t)kind,
+                                storage, _capacity(), _data_begin, _count,
+                                key_alias, value_alias,
+                                key_offset, value_offset,
+                                shift, key_off, val_off);
     if (key_len != 0) memmove(storage + key_off, key, key_len);
     storage[(size_t)key_off + key_len] = '\0';
+    payload_append_trace_record(payload_append_trace_stage_t::KEY_COPY_DONE,
+                                this,
+                                key, key_len,
+                                value, value_len,
+                                (uint32_t)kind,
+                                storage, _capacity(), _data_begin, _count,
+                                key_alias, value_alias,
+                                key_offset, value_offset,
+                                shift, key_off, val_off);
 
     Entry entry{};
     entry.key_off = key_off;
@@ -2775,6 +3082,15 @@ bool Payload::_append_value(const char* key,
     _entries()[_count] = entry;
     _set_data_begin(key_off);
     _set_count((uint16_t)(_count + 1U));
+    payload_append_trace_record(payload_append_trace_stage_t::COMMIT,
+                                this,
+                                key, key_len,
+                                value, value_len,
+                                (uint32_t)kind,
+                                storage, _capacity(), _data_begin, _count,
+                                key_alias, value_alias,
+                                key_offset, value_offset,
+                                shift, key_off, val_off);
 
     if (_count > g_payload_entry_high_water_global) {
         g_payload_entry_high_water_global = _count;

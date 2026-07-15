@@ -2863,6 +2863,8 @@ static FLASHMEM Payload system_sentinel_payload(void) {
 // The snapshot is taken into static storage before response construction
 // begins, because building the response mutates the live ring.
 static payload_flight_info_t g_system_payload_flight_scratch;
+static payload_append_trace_snapshot_t
+    g_system_payload_append_trace_scratch DMAMEM;
 
 static FLASHMEM Payload system_payload_flight_bank_payload(
     uint32_t valid,
@@ -2909,6 +2911,121 @@ static FLASHMEM Payload system_payload_flight_payload(bool retained_only) {
                                                       f.live_sequence,
                                                       f.live_count,
                                                       f.live));
+  }
+  return out;
+}
+
+
+// ================================================================
+// Payload v4.1 append transaction recorder — reporting surface
+// ================================================================
+
+static const char* payload_append_trace_stage_name(uint32_t stage) {
+  switch ((payload_append_trace_stage_t)stage) {
+    case payload_append_trace_stage_t::ENTER:           return "ENTER";
+    case payload_append_trace_stage_t::PRE_ENSURE:      return "PRE_ENSURE";
+    case payload_append_trace_stage_t::ENSURE_FAILED:   return "ENSURE_FAILED";
+    case payload_append_trace_stage_t::POST_ENSURE:     return "POST_ENSURE";
+    case payload_append_trace_stage_t::PRE_VALUE_COPY:  return "PRE_VALUE_COPY";
+    case payload_append_trace_stage_t::VALUE_COPY_DONE: return "VALUE_COPY_DONE";
+    case payload_append_trace_stage_t::PRE_KEY_COPY:    return "PRE_KEY_COPY";
+    case payload_append_trace_stage_t::KEY_COPY_DONE:   return "KEY_COPY_DONE";
+    case payload_append_trace_stage_t::COMMIT:          return "COMMIT";
+    case payload_append_trace_stage_t::FINAL_SPAN_FAIL: return "FINAL_SPAN_FAIL";
+    default:                                             return "NONE";
+  }
+}
+
+static FLASHMEM Payload system_payload_append_trace_entry_payload(
+    const payload_append_trace_entry_t& entry) {
+  Payload out;
+  out.add("sequence", entry.sequence);
+  out.add("stage_id", entry.stage);
+  out.add("stage", payload_append_trace_stage_name(entry.stage));
+  system_crash_add_hex32(out, "this", entry.this_ptr);
+  system_crash_add_hex32(out, "key_ptr", entry.key_ptr);
+  system_crash_add_hex32(out, "value_ptr", entry.value_ptr);
+  out.add("key_len", entry.key_len);
+  out.add("value_len", entry.value_len);
+  out.add("kind", entry.kind);
+  system_crash_add_hex32(out, "storage_ptr", entry.storage_ptr);
+  out.add("capacity", entry.capacity);
+  out.add("data_begin", entry.data_begin);
+  out.add("entry_count", entry.entry_count);
+  out.add("key_alias", (entry.alias_flags & 1U) != 0U);
+  out.add("value_alias", (entry.alias_flags & 2U) != 0U);
+  out.add("key_offset", entry.key_offset);
+  out.add("value_offset", entry.value_offset);
+  out.add("data_shift", entry.data_shift);
+  out.add("key_off", entry.key_off);
+  out.add("val_off", entry.val_off);
+  system_crash_add_hex32(out, "dwt", entry.dwt_cyccnt);
+  out.add("ipsr", entry.ipsr);
+  return out;
+}
+
+static FLASHMEM Payload system_payload_append_trace_payload(
+    const Payload& args) {
+  payload_get_append_trace(&g_system_payload_append_trace_scratch);
+
+  bool bank_valid = true;
+  const bool live_bank = system_trace_report_live_bank(args, &bank_valid);
+  if (!bank_valid) {
+    Payload error;
+    error.add("error", "bank must be live or retained");
+    return error;
+  }
+
+  const uint32_t requested = system_trace_report_count(args);
+  const uint32_t offset = system_trace_report_offset(args);
+  const payload_append_trace_bank_snapshot_t& bank = live_bank
+      ? g_system_payload_append_trace_scratch.live
+      : g_system_payload_append_trace_scratch.retained;
+  uint32_t begin = 0U;
+  uint32_t end = 0U;
+  system_trace_bounds(bank.count, requested, offset, &begin, &end);
+
+  Payload out;
+  out.add("schema", "ZPNET_PAYLOAD_APPEND_TRACE_V1");
+  out.add("bank", live_bank ? "live" : "retained");
+  out.add("valid", bank.valid != 0U);
+  out.add("capacity", PAYLOAD_APPEND_TRACE_ENTRIES);
+  out.add("available_count", bank.count);
+  out.add("newest_sequence", bank.newest_sequence);
+  out.add("requested_count", requested);
+  out.add("returned_count", end - begin);
+  out.add("offset_from_newest", offset);
+  out.add("has_older", begin != 0U);
+  out.add("has_newer", offset != 0U && bank.count != 0U);
+  out.add("first_sequence", begin < end ? bank.entries[begin].sequence : 0U);
+  out.add("last_sequence", begin < end ? bank.entries[end - 1U].sequence : 0U);
+
+  PayloadArray records;
+  for (uint32_t i = begin; i < end; ++i) {
+    Payload record =
+        system_payload_append_trace_entry_payload(bank.entries[i]);
+    record.add("bank_index", i);
+    records.add(record);
+  }
+  out.add_array("records", records);
+  return out;
+}
+
+static FLASHMEM Payload system_payload_append_trace_summary_payload(void) {
+  payload_get_append_trace(&g_system_payload_append_trace_scratch);
+  const payload_append_trace_bank_snapshot_t& retained =
+      g_system_payload_append_trace_scratch.retained;
+
+  Payload out;
+  out.add("schema", "ZPNET_PAYLOAD_APPEND_TRACE_SUMMARY_V1");
+  out.add("retained_valid", retained.valid != 0U);
+  out.add("retained_count", retained.count);
+  out.add("newest_sequence", retained.newest_sequence);
+  if (retained.valid != 0U && retained.count != 0U) {
+    out.add_object(
+        "newest",
+        system_payload_append_trace_entry_payload(
+            retained.entries[retained.count - 1U]));
   }
   return out;
 }
@@ -2998,8 +3115,9 @@ static FLASHMEM Payload system_crash_report_payload(bool include_text) {
   p.add_object("extended", system_crash_forensics_payload());
 
   // Frame-sentinel verdict, runtime breadcrumbs, TimePop dispatch flight
-  // recorder, and Payload flight recorder are retained through reboot so they
-  // can sit beside the exception evidence they explain.  The beacon says which
+  // recorder, Payload flight recorder, and Payload append transaction trace
+  // are retained through reboot so they can sit beside the exception evidence
+  // they explain.  The beacon says which
   // sentinel regions were active; the dispatch summary says the last committed
   // callback/control-flow stage.
   p.add_object("sentinel",
@@ -3019,6 +3137,8 @@ static FLASHMEM Payload system_crash_report_payload(bool include_text) {
   p.add_object("memory_watchdog_trace",
                system_watchdog_trace_summary_payload());
   p.add_object("payload_flight", system_payload_flight_payload(true));
+  p.add_object("payload_append_trace",
+               system_payload_append_trace_summary_payload());
   return p;
 }
 
@@ -3746,13 +3866,15 @@ static void system_dmamem_ensure_initialized(void) {
          sizeof(g_system_watchdog_trace_scratch));
   memset((void*)&g_system_timepop_dispatch_trace_scratch, 0,
          sizeof(g_system_timepop_dispatch_trace_scratch));
+  memset((void*)&g_system_payload_append_trace_scratch, 0,
+         sizeof(g_system_payload_append_trace_scratch));
 
   // crash_forensics.cpp owns its retained RAM2 record.  Never initialize or
   // clear that record here; it may be the only surviving witness to a reboot.
   // The same custody applies to g_sentinel_violation_retained, the runtime
   // ledger pair, memory-audit/watchdog trace banks, TimePop's dispatch-flight
-  // banks, and the Payload flight rings in payload.cpp: all are NOLOAD retained
-  // evidence, validated before use and
+  // banks, Payload flight rings, and Payload append-trace banks in payload.cpp:
+  // all are NOLOAD retained evidence, validated before use and
   // released only by explicit CRASH_CLEAR or their one-time per-boot latch.
   g_system_dmamem_initialized = true;
 }
@@ -4084,6 +4206,14 @@ static FLASHMEM Payload cmd_payload_flight_info(const Payload& /*args*/) {
   return system_payload_flight_payload(false);
 }
 
+
+// ------------------------------------------------------------
+// PAYLOAD_APPEND_TRACE — bounded retained/live append transaction transcript
+// ------------------------------------------------------------
+static FLASHMEM Payload cmd_payload_append_trace(const Payload& args) {
+  return system_payload_append_trace_payload(args);
+}
+
 // ------------------------------------------------------------
 // CRASH_INFO — core CrashReport plus retained structured exception evidence
 // ------------------------------------------------------------
@@ -4124,6 +4254,7 @@ static FLASHMEM Payload cmd_crash_clear(const Payload& /*args*/) {
   memory_audit_trace_clear_retained();
   system_watchdog_trace_clear_retained();
   timepop_dispatch_trace_clear_retained();
+  payload_clear_retained_append_trace();
 
   Payload resp = ok_payload();
   resp.add("crash_report_cleared", true);
@@ -4134,6 +4265,7 @@ static FLASHMEM Payload cmd_crash_clear(const Payload& /*args*/) {
   resp.add("memory_audit_trace_cleared", true);
   resp.add("memory_watchdog_trace_cleared", true);
   resp.add("timepop_dispatch_trace_cleared", true);
+  resp.add("payload_append_trace_cleared", true);
   return resp;
 }
 
@@ -4194,6 +4326,7 @@ static const process_command_entry_t SYSTEM_COMMANDS[] = {
   { "MEMORY_AUDIT_INFO", cmd_memory_audit_info },
   { "TIMEPOP_DISPATCH_INFO", cmd_timepop_dispatch_info },
   { "PAYLOAD_FLIGHT_INFO", cmd_payload_flight_info },
+  { "PAYLOAD_APPEND_TRACE", cmd_payload_append_trace },
   { "DEBUG",            cmd_debug            },
   { "STATUS",           cmd_status           },
   { nullptr,            nullptr }
