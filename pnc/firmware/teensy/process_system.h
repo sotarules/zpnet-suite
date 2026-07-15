@@ -169,10 +169,14 @@ void zpnet_sentinel_exit(uint32_t slot, uint32_t caller_sp);
   } while (0)
 #define ZPNET_SENTINEL_EXIT(slot)                                            \
   do {                                                                       \
+    uint32_t zpnet_sentinel_exc_return_;                                     \
     uint32_t zpnet_sentinel_sp_;                                             \
+    __asm__ volatile("mov %0, lr"                                            \
+                     : "=r"(zpnet_sentinel_exc_return_));                    \
     __asm__ volatile("mov %0, sp"                                            \
                      : "=r"(zpnet_sentinel_sp_));                            \
-    frame_sentinel_exit((slot), zpnet_sentinel_sp_);                         \
+    frame_sentinel_exit_ex((slot), zpnet_sentinel_exc_return_,               \
+                           zpnet_sentinel_sp_);                              \
     zpnet_sentinel_exit((slot), zpnet_sentinel_sp_);                         \
   } while (0)
 #else
@@ -183,7 +187,7 @@ void zpnet_sentinel_exit(uint32_t slot, uint32_t caller_sp);
   } while (0)
 #define ZPNET_SENTINEL_EXIT(slot)                                            \
   do {                                                                       \
-    frame_sentinel_exit((slot), 0U);                                         \
+    frame_sentinel_exit_ex((slot), 0U, 0U);                                         \
     zpnet_sentinel_exit((slot), 0U);                                         \
   } while (0)
 #endif

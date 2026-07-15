@@ -5,7 +5,7 @@
 class Payload;
 
 // ============================================================================
-// Frame Sentinel V2
+// Frame Sentinel V5
 // ============================================================================
 //
 // Frame Sentinel is an independent platform diagnostic.  It has no dependency
@@ -50,6 +50,9 @@ enum : uint32_t {
   FRAME_SENTINEL_KIND_CALLER_SP_CHANGED    = 1U << 1,
   FRAME_SENTINEL_KIND_CONTEXT_WORD_CHANGED = 1U << 2,
   FRAME_SENTINEL_KIND_FRAME_MOVED          = 1U << 3,
+  FRAME_SENTINEL_KIND_FP_WORD_CHANGED       = 1U << 4,
+  FRAME_SENTINEL_KIND_FRAME_TYPE_CHANGED    = 1U << 5,
+  FRAME_SENTINEL_KIND_FP_GEOMETRY_CHANGED   = 1U << 6,
 };
 
 void frame_sentinel_init(void);
@@ -57,6 +60,9 @@ void frame_sentinel_enter(uint32_t slot,
                           const char* name,
                           uint32_t exc_return,
                           uint32_t caller_sp);
+void frame_sentinel_exit_ex(uint32_t slot,
+                            uint32_t exc_return,
+                            uint32_t caller_sp);
 void frame_sentinel_exit(uint32_t slot, uint32_t caller_sp);
 
 // Called directly by loop().  Emits at most one SENTINEL_ANOMALY event per boot.
@@ -85,13 +91,17 @@ bool frame_sentinel_scope_active(void);
 
 #define FRAME_SENTINEL_EXIT(slot)                                              \
   do {                                                                         \
+    uint32_t frame_sentinel_exc_return_;                                       \
     uint32_t frame_sentinel_sp_;                                               \
+    __asm__ volatile("mov %0, lr"                                              \
+                     : "=r"(frame_sentinel_exc_return_));                      \
     __asm__ volatile("mov %0, sp"                                              \
                      : "=r"(frame_sentinel_sp_));                              \
-    frame_sentinel_exit((slot), frame_sentinel_sp_);                           \
+    frame_sentinel_exit_ex((slot), frame_sentinel_exc_return_,                 \
+                           frame_sentinel_sp_);                                \
   } while (0)
 #else
 #define FRAME_SENTINEL_ENTER(slot, name)                                       \
   frame_sentinel_enter((slot), (name), 0U, 0U)
-#define FRAME_SENTINEL_EXIT(slot) frame_sentinel_exit((slot), 0U)
+#define FRAME_SENTINEL_EXIT(slot) frame_sentinel_exit_ex((slot), 0U, 0U)
 #endif

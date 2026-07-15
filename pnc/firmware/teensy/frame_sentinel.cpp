@@ -11,15 +11,20 @@ extern "C" unsigned long _estack;
 #define FRAME_SENTINEL_FPCAR (*(volatile uint32_t*)0xE000EF38UL)
 
 static constexpr uint32_t FRAME_SENTINEL_MAGIC =
-    0x46535632UL;  // 'FSV2'
+    0x46535635UL;  // 'FSV5'
 static constexpr uint32_t FRAME_SENTINEL_BEACON_MAGIC =
-    0x46534232UL;  // 'FSB2'
-static constexpr uint32_t FRAME_SENTINEL_SCHEMA_VERSION = 2U;
+    0x46534235UL;  // 'FSB5'
+static constexpr uint32_t FRAME_SENTINEL_SCHEMA_VERSION = 5U;
 static constexpr uint32_t FRAME_SENTINEL_BASIC_WORDS = 8U;
+static constexpr uint32_t FRAME_SENTINEL_FP_WORDS = 18U;
 static constexpr uint32_t FRAME_SENTINEL_CONTEXT_WORDS = 32U;
 static constexpr uint32_t FRAME_SENTINEL_SCAN_BYTES = 512U;
 static constexpr uint32_t FRAME_SENTINEL_BEACON_DEPTH = 6U;
 static constexpr uint32_t FRAME_SENTINEL_MAX_EXCEPTION = 255U;
+static constexpr uint32_t FRAME_SENTINEL_BASIC_BYTES =
+    FRAME_SENTINEL_BASIC_WORDS * sizeof(uint32_t);
+static constexpr uint32_t FRAME_SENTINEL_FP_BYTES =
+    FRAME_SENTINEL_FP_WORDS * sizeof(uint32_t);
 
 enum : uint32_t {
   FRAME_SENTINEL_SOURCE_NONE  = 0U,
@@ -28,23 +33,37 @@ enum : uint32_t {
   FRAME_SENTINEL_SOURCE_SCAN  = 3U,
 };
 
+struct frame_sentinel_geometry_t {
+  uint32_t source;
+  uint32_t raw_frame_address;
+  uint32_t fp_frame_address;
+  uint32_t basic_frame_address;
+  uint32_t context_address;
+  uint32_t extended;
+  uint32_t alignment_word;
+  uint32_t core_content_plausible;
+  uint32_t fp_evidence_trusted;
+  uint32_t valid;
+};
+
 struct frame_sentinel_scope_t {
   volatile uint32_t active;
   char name[24];
   uint32_t pass;
   uint32_t ipsr;
-  uint32_t exc_return;
+  uint32_t exc_return_entry;
   uint32_t caller_sp_entry;
   uint32_t dwt_entry;
   uint32_t fpccr_entry;
   uint32_t fpcar_entry;
 
-  uint32_t frame_address;
-  uint32_t frame_source;
+  frame_sentinel_geometry_t geometry_entry;
   uint32_t frame_entry[FRAME_SENTINEL_BASIC_WORDS];
   uint32_t frame_entry_checksum;
 
-  uint32_t context_address;
+  uint32_t fp_entry[FRAME_SENTINEL_FP_WORDS];
+  uint32_t fp_entry_checksum;
+
   uint32_t context_count;
   uint32_t context_entry[FRAME_SENTINEL_CONTEXT_WORDS];
   uint32_t context_entry_checksum;
@@ -55,7 +74,11 @@ struct frame_sentinel_scope_t {
   uint32_t frame_missing;
   uint32_t context_located;
   uint32_t context_missing;
+  uint32_t extended_frames;
+  uint32_t fpcar_geometry_used;
   uint32_t lspact_consumed;
+  uint32_t frame_type_changed;
+  uint32_t geometry_changed;
   uint32_t unbalanced_enter;
   uint32_t unbalanced_exit;
 };
@@ -87,7 +110,8 @@ struct alignas(32) frame_sentinel_violation_t {
   uint32_t slot;
   uint32_t pass;
   uint32_t ipsr;
-  uint32_t exc_return;
+  uint32_t exc_return_entry;
+  uint32_t exc_return_exit;
   char name[24];
 
   uint32_t caller_sp_entry;
@@ -99,17 +123,30 @@ struct alignas(32) frame_sentinel_violation_t {
   uint32_t fpcar_entry;
   uint32_t fpcar_exit;
   uint32_t lspact_consumed;
+  uint32_t exc_return_entry_valid;
+  uint32_t exc_return_exit_valid;
+  uint32_t frame_type_entry_extended;
+  uint32_t frame_type_exit_extended;
 
-  uint32_t frame_address_entry;
-  uint32_t frame_address_exit;
-  uint32_t frame_source;
+  frame_sentinel_geometry_t geometry_entry;
+  frame_sentinel_geometry_t geometry_exit;
+
   uint32_t frame_diff_mask;
   uint32_t frame_entry_checksum;
   uint32_t frame_exit_checksum;
   uint32_t frame_entry[FRAME_SENTINEL_BASIC_WORDS];
   uint32_t frame_exit[FRAME_SENTINEL_BASIC_WORDS];
 
-  uint32_t context_address;
+  uint32_t fp_diff_mask;
+  uint32_t fp_entry_checksum;
+  uint32_t fp_exit_checksum;
+  uint32_t fp_first_diff_index;
+  uint32_t fp_first_diff_address;
+  uint32_t fp_first_diff_entry;
+  uint32_t fp_first_diff_exit;
+  uint32_t fp_entry[FRAME_SENTINEL_FP_WORDS];
+  uint32_t fp_exit[FRAME_SENTINEL_FP_WORDS];
+
   uint32_t context_count;
   uint32_t context_diff_mask;
   uint32_t context_entry_checksum;
@@ -339,36 +376,151 @@ bool frame_sentinel_scope_active(void) {
   return g_frame_sentinel_active_depth != 0U;
 }
 
-static uint32_t frame_sentinel_locate_frame(uint32_t ipsr,
-                                            uint32_t exc_return,
-                                            uint32_t caller_sp,
-                                            uint32_t fpccr,
-                                            uint32_t fpcar,
-                                            uint32_t* source_out) {
-  *source_out = FRAME_SENTINEL_SOURCE_NONE;
-  if (ipsr == 0U) return 0U;
+static bool frame_sentinel_copy_words(uint32_t address,
+                                      uint32_t* out,
+                                      uint32_t count) {
+  if (!out ||
+      !frame_sentinel_range_readable(address, count * sizeof(uint32_t))) {
+    return false;
+  }
+  const volatile uint32_t* words =
+      (const volatile uint32_t*)(uintptr_t)address;
+  for (uint32_t i = 0U; i < count; ++i) out[i] = words[i];
+  return true;
+}
+
+static bool frame_sentinel_basic_frame_plausible(uint32_t address,
+                                                 uint32_t exc_return) {
+  if (!frame_sentinel_range_readable(address, FRAME_SENTINEL_BASIC_BYTES)) {
+    return false;
+  }
+  const volatile uint32_t* words =
+      (const volatile uint32_t*)(uintptr_t)address;
+  return frame_sentinel_pc_plausible(words[6]) &&
+         frame_sentinel_lr_plausible(words[5]) &&
+         frame_sentinel_xpsr_plausible(words[7], exc_return);
+}
+
+static uint32_t frame_sentinel_exc_return_extended(uint32_t exc_return) {
+  return frame_sentinel_exc_return_plausible(exc_return) &&
+         (exc_return & (1UL << 4)) == 0U;
+}
+
+static frame_sentinel_geometry_t frame_sentinel_geometry_from_basic(
+    uint32_t source,
+    uint32_t basic_frame_address,
+    uint32_t extended,
+    uint32_t exc_return,
+    bool require_plausible_core) {
+  frame_sentinel_geometry_t geometry{};
+  geometry.source = source;
+  geometry.basic_frame_address = basic_frame_address;
+  geometry.extended = extended ? 1U : 0U;
+
+  if (!frame_sentinel_range_readable(
+          basic_frame_address, FRAME_SENTINEL_BASIC_BYTES)) {
+    return geometry;
+  }
+
+  geometry.core_content_plausible =
+      frame_sentinel_basic_frame_plausible(
+          basic_frame_address, exc_return) ? 1U : 0U;
+  if (require_plausible_core && !geometry.core_content_plausible) {
+    return geometry;
+  }
+
+  const volatile uint32_t* basic =
+      (const volatile uint32_t*)(uintptr_t)basic_frame_address;
+  geometry.alignment_word =
+      (basic[7] & (1UL << 9)) != 0U ? 1U : 0U;
+
+  if (geometry.extended) {
+    if (basic_frame_address < FRAME_SENTINEL_FP_BYTES) return geometry;
+    geometry.raw_frame_address =
+        basic_frame_address - FRAME_SENTINEL_FP_BYTES;
+    geometry.fp_frame_address = geometry.raw_frame_address;
+    if (!frame_sentinel_range_readable(
+            geometry.fp_frame_address, FRAME_SENTINEL_FP_BYTES)) {
+      return geometry;
+    }
+    // FPCAR and PSP are architectural anchors.  SCAN is heuristic and may
+    // observe stack words that merely resemble a frame, so its FP prefix is
+    // descriptive only and cannot independently convict FP mutation.
+    geometry.fp_evidence_trusted =
+        source == FRAME_SENTINEL_SOURCE_SCAN ? 0U : 1U;
+  } else {
+    geometry.raw_frame_address = basic_frame_address;
+    geometry.fp_frame_address = 0U;
+    geometry.fp_evidence_trusted = 0U;
+  }
+
+  geometry.context_address =
+      basic_frame_address + FRAME_SENTINEL_BASIC_BYTES +
+      geometry.alignment_word * sizeof(uint32_t);
+  if (!frame_sentinel_range_readable(
+          geometry.context_address,
+          FRAME_SENTINEL_CONTEXT_WORDS * sizeof(uint32_t))) {
+    geometry.context_address = 0U;
+  }
+
+  geometry.valid = 1U;
+  return geometry;
+}
+
+static frame_sentinel_geometry_t frame_sentinel_locate_geometry(
+    uint32_t ipsr,
+    uint32_t exc_return,
+    uint32_t caller_sp,
+    uint32_t fpccr,
+    uint32_t fpcar) {
+  frame_sentinel_geometry_t none{};
+  if (ipsr == 0U) return none;
 
   const uint32_t dtcm_end = (uint32_t)(uintptr_t)&_estack;
-
-  if ((fpccr & 0x1U) != 0U && fpcar >= 0x20000020UL) {
-    const uint32_t candidate = fpcar - 0x20U;
-    if (frame_sentinel_range_readable(candidate, 32U)) {
-      *source_out = FRAME_SENTINEL_SOURCE_FPCAR;
-      return candidate;
-    }
-  }
-
   const bool exc_plausible =
       frame_sentinel_exc_return_plausible(exc_return);
-  if (exc_plausible && (exc_return & 0x4U) != 0U) {
-    const uint32_t psp = frame_sentinel_read_psp();
-    if (frame_sentinel_range_readable(psp, 32U)) {
-      *source_out = FRAME_SENTINEL_SOURCE_PSP;
-      return psp;
-    }
+  const uint32_t extended =
+      frame_sentinel_exc_return_extended(exc_return);
+
+  // FPCAR points 0x20 bytes into the reserved lazy-FP area on the observed
+  // Cortex-M7 stack geometry.  Therefore:
+  //
+  //   raw FP frame = FPCAR - 0x20
+  //   core frame   = FPCAR + 0x28
+  //
+  // LSPACT makes this an architectural anchor.  Preserve the geometry even
+  // when the saved core words are already implausible; plausibility is reported
+  // separately rather than being allowed to erase deterministic evidence.
+  if ((fpccr & 0x1U) != 0U && fpcar >= 0x20000020UL) {
+    const uint32_t observed_basic = fpcar + 0x28U;
+    frame_sentinel_geometry_t geometry =
+        frame_sentinel_geometry_from_basic(
+            FRAME_SENTINEL_SOURCE_FPCAR,
+            observed_basic,
+            true,
+            exc_return,
+            false);
+    if (geometry.valid) return geometry;
+
   }
 
-  if (!exc_plausible) return 0U;
+  // PSP points at the raw hardware frame.  For an extended frame the eight
+  // core words begin after the 18-word FP prefix.
+  if (exc_plausible && (exc_return & 0x4U) != 0U) {
+    const uint32_t psp = frame_sentinel_read_psp();
+    const uint32_t basic =
+        extended ? psp + FRAME_SENTINEL_FP_BYTES : psp;
+    frame_sentinel_geometry_t geometry =
+        frame_sentinel_geometry_from_basic(
+            FRAME_SENTINEL_SOURCE_PSP,
+            basic,
+            extended,
+            exc_return,
+            true);
+    if (geometry.valid) return geometry;
+  }
+
+  if (!exc_plausible) return none;
 
   const uint32_t msp = frame_sentinel_read_msp();
   const uint32_t scan_from =
@@ -376,49 +528,28 @@ static uint32_t frame_sentinel_locate_frame(uint32_t ipsr,
           ? caller_sp
           : msp;
   const uint32_t begin = (scan_from + 7U) & ~7U;
-  for (uint32_t address = begin;
-       address + 32U <= dtcm_end &&
-       address < begin + FRAME_SENTINEL_SCAN_BYTES;
-       address += 8U) {
-    const volatile uint32_t* words =
-        (const volatile uint32_t*)(uintptr_t)address;
-    if (frame_sentinel_pc_plausible(words[6]) &&
-        frame_sentinel_lr_plausible(words[5]) &&
-        frame_sentinel_xpsr_plausible(words[7], exc_return)) {
-      *source_out = FRAME_SENTINEL_SOURCE_SCAN;
-      return address;
-    }
-  }
-  return 0U;
-}
-
-static uint32_t frame_sentinel_context_address(
-    uint32_t frame_address,
-    uint32_t frame_source,
-    uint32_t exc_return,
-    const uint32_t* frame_words) {
-  if (frame_address == 0U || !frame_words) return 0U;
-
-  // The interrupted software stack is above the hardware frame.  When the
-  // FPCAR strategy is active, the reserved lazy-FP area sits between the basic
-  // frame and the interrupted software stack; skip its 18 words.
-  uint32_t bytes = 32U;
-  const bool extended =
-      frame_source == FRAME_SENTINEL_SOURCE_FPCAR ||
-      (frame_sentinel_exc_return_plausible(exc_return) &&
-       (exc_return & (1UL << 4)) == 0U);
-  if (extended) bytes += 18U * sizeof(uint32_t);
-
-  // xPSR[9] means the processor inserted one alignment word.
-  if ((frame_words[7] & (1UL << 9)) != 0U) {
-    bytes += sizeof(uint32_t);
+  for (uint32_t raw = begin;
+       raw + FRAME_SENTINEL_BASIC_BYTES +
+               (extended ? FRAME_SENTINEL_FP_BYTES : 0U) <= dtcm_end &&
+       raw < begin + FRAME_SENTINEL_SCAN_BYTES;
+       raw += 8U) {
+    // Respect EXC_RETURN's frame type while scanning.  For an extended frame,
+    // raw points at S0 and the core frame begins 18 words later.  Scanning raw
+    // FP words as though they were R0-xPSR recreates the exact category error
+    // this diagnostic is intended to detect.
+    const uint32_t basic =
+        raw + (extended ? FRAME_SENTINEL_FP_BYTES : 0U);
+    frame_sentinel_geometry_t geometry =
+        frame_sentinel_geometry_from_basic(
+            FRAME_SENTINEL_SOURCE_SCAN,
+            basic,
+            extended,
+            exc_return,
+            true);
+    if (geometry.valid) return geometry;
   }
 
-  const uint32_t address = frame_address + bytes;
-  return frame_sentinel_range_readable(
-             address, FRAME_SENTINEL_CONTEXT_WORDS * sizeof(uint32_t))
-      ? address
-      : 0U;
+  return none;
 }
 
 void frame_sentinel_enter(uint32_t slot,
@@ -440,7 +571,7 @@ void frame_sentinel_enter(uint32_t slot,
 
   frame_sentinel_copy_name(scope.name, sizeof(scope.name), name);
   scope.ipsr = frame_sentinel_read_ipsr();
-  scope.exc_return = exc_return;
+  scope.exc_return_entry = exc_return;
   scope.caller_sp_entry = caller_sp;
   scope.dwt_entry = ARM_DWT_CYCCNT;
   scope.fpccr_entry = FRAME_SENTINEL_FPCCR;
@@ -449,41 +580,60 @@ void frame_sentinel_enter(uint32_t slot,
   frame_sentinel_beacon_push(slot, name, scope.pass, scope.ipsr,
                              scope.dwt_entry);
 
-  scope.frame_address = frame_sentinel_locate_frame(
+  scope.geometry_entry = frame_sentinel_locate_geometry(
       scope.ipsr, exc_return, caller_sp, scope.fpccr_entry,
-      scope.fpcar_entry, &scope.frame_source);
-  scope.context_address = 0U;
+      scope.fpcar_entry);
   scope.context_count = 0U;
 
-  if (scope.frame_address == 0U) {
+  if (!scope.geometry_entry.valid) {
     if (scope.ipsr != 0U) scope.frame_missing++;
     return;
   }
 
   scope.frame_located++;
-  const volatile uint32_t* frame =
-      (const volatile uint32_t*)(uintptr_t)scope.frame_address;
-  for (uint32_t i = 0U; i < FRAME_SENTINEL_BASIC_WORDS; ++i) {
-    scope.frame_entry[i] = frame[i];
+  if (scope.geometry_entry.extended) scope.extended_frames++;
+  if (scope.geometry_entry.source == FRAME_SENTINEL_SOURCE_FPCAR) {
+    scope.fpcar_geometry_used++;
+  }
+
+  if (!frame_sentinel_copy_words(
+          scope.geometry_entry.basic_frame_address,
+          scope.frame_entry,
+          FRAME_SENTINEL_BASIC_WORDS)) {
+    scope.frame_missing++;
+    return;
   }
   scope.frame_entry_checksum =
       frame_sentinel_checksum(scope.frame_entry,
                               FRAME_SENTINEL_BASIC_WORDS);
 
-  scope.context_address = frame_sentinel_context_address(
-      scope.frame_address, scope.frame_source, scope.exc_return,
-      scope.frame_entry);
-  if (scope.context_address == 0U) {
+  memset(scope.fp_entry, 0, sizeof(scope.fp_entry));
+  scope.fp_entry_checksum = 0U;
+  if (scope.geometry_entry.extended &&
+      scope.geometry_entry.fp_frame_address != 0U &&
+      frame_sentinel_copy_words(
+          scope.geometry_entry.fp_frame_address,
+          scope.fp_entry,
+          FRAME_SENTINEL_FP_WORDS)) {
+    scope.fp_entry_checksum =
+        frame_sentinel_checksum(scope.fp_entry,
+                                FRAME_SENTINEL_FP_WORDS);
+  }
+
+  if (scope.geometry_entry.context_address == 0U) {
     scope.context_missing++;
     return;
   }
 
   scope.context_located++;
   scope.context_count = FRAME_SENTINEL_CONTEXT_WORDS;
-  const volatile uint32_t* context =
-      (const volatile uint32_t*)(uintptr_t)scope.context_address;
-  for (uint32_t i = 0U; i < scope.context_count; ++i) {
-    scope.context_entry[i] = context[i];
+  if (!frame_sentinel_copy_words(
+          scope.geometry_entry.context_address,
+          scope.context_entry,
+          scope.context_count)) {
+    scope.context_count = 0U;
+    scope.context_missing++;
+    return;
   }
   scope.context_entry_checksum =
       frame_sentinel_checksum(scope.context_entry, scope.context_count);
@@ -510,24 +660,30 @@ static void frame_sentinel_fill_violation(
     const frame_sentinel_scope_t& scope,
     uint32_t slot,
     uint32_t kind,
+    uint32_t exc_return_exit,
     uint32_t caller_sp_exit,
     uint32_t dwt_exit,
     uint32_t fpccr_exit,
     uint32_t fpcar_exit,
-    uint32_t frame_address_exit,
+    const frame_sentinel_geometry_t& geometry_exit,
     const uint32_t* frame_exit,
     uint32_t frame_diff_mask,
     uint32_t frame_exit_checksum,
+    const uint32_t* fp_exit,
+    uint32_t fp_diff_mask,
+    uint32_t fp_exit_checksum,
+    uint32_t fp_first_diff_index,
     const uint32_t* context_exit,
     uint32_t context_diff_mask,
     uint32_t context_exit_checksum,
-    uint32_t first_diff_index) {
+    uint32_t context_first_diff_index) {
   memset((void*)&violation, 0, sizeof(violation));
   violation.kind = kind;
   violation.slot = slot;
   violation.pass = scope.pass;
   violation.ipsr = scope.ipsr;
-  violation.exc_return = scope.exc_return;
+  violation.exc_return_entry = scope.exc_return_entry;
+  violation.exc_return_exit = exc_return_exit;
   frame_sentinel_copy_name(violation.name, sizeof(violation.name),
                            scope.name);
 
@@ -541,13 +697,23 @@ static void frame_sentinel_fill_violation(
   violation.fpcar_exit = fpcar_exit;
   violation.lspact_consumed =
       ((scope.fpccr_entry & 0x1U) != 0U &&
-       (fpccr_exit & 0x1U) == 0U)
-          ? 1U
+       (fpccr_exit & 0x1U) == 0U) ? 1U : 0U;
+  violation.exc_return_entry_valid =
+      frame_sentinel_exc_return_plausible(scope.exc_return_entry) ? 1U : 0U;
+  violation.exc_return_exit_valid =
+      frame_sentinel_exc_return_plausible(exc_return_exit) ? 1U : 0U;
+  violation.frame_type_entry_extended =
+      violation.exc_return_entry_valid
+          ? frame_sentinel_exc_return_extended(scope.exc_return_entry)
+          : 0U;
+  violation.frame_type_exit_extended =
+      violation.exc_return_exit_valid
+          ? frame_sentinel_exc_return_extended(exc_return_exit)
           : 0U;
 
-  violation.frame_address_entry = scope.frame_address;
-  violation.frame_address_exit = frame_address_exit;
-  violation.frame_source = scope.frame_source;
+  violation.geometry_entry = scope.geometry_entry;
+  violation.geometry_exit = geometry_exit;
+
   violation.frame_diff_mask = frame_diff_mask;
   violation.frame_entry_checksum = scope.frame_entry_checksum;
   violation.frame_exit_checksum = frame_exit_checksum;
@@ -556,19 +722,35 @@ static void frame_sentinel_fill_violation(
     violation.frame_exit[i] = frame_exit ? frame_exit[i] : 0U;
   }
 
-  violation.context_address = scope.context_address;
+  violation.fp_diff_mask = fp_diff_mask;
+  violation.fp_entry_checksum = scope.fp_entry_checksum;
+  violation.fp_exit_checksum = fp_exit_checksum;
+  violation.fp_first_diff_index = fp_first_diff_index;
+  if (fp_first_diff_index < FRAME_SENTINEL_FP_WORDS) {
+    violation.fp_first_diff_address =
+        scope.geometry_entry.fp_frame_address +
+        fp_first_diff_index * sizeof(uint32_t);
+    violation.fp_first_diff_entry = scope.fp_entry[fp_first_diff_index];
+    violation.fp_first_diff_exit = fp_exit[fp_first_diff_index];
+  }
+  for (uint32_t i = 0U; i < FRAME_SENTINEL_FP_WORDS; ++i) {
+    violation.fp_entry[i] = scope.fp_entry[i];
+    violation.fp_exit[i] = fp_exit ? fp_exit[i] : 0U;
+  }
+
   violation.context_count = scope.context_count;
   violation.context_diff_mask = context_diff_mask;
   violation.context_entry_checksum = scope.context_entry_checksum;
   violation.context_exit_checksum = context_exit_checksum;
-  violation.context_first_diff_index = first_diff_index;
-  if (first_diff_index < scope.context_count) {
+  violation.context_first_diff_index = context_first_diff_index;
+  if (context_first_diff_index < scope.context_count) {
     violation.context_first_diff_address =
-        scope.context_address + first_diff_index * sizeof(uint32_t);
+        scope.geometry_entry.context_address +
+        context_first_diff_index * sizeof(uint32_t);
     violation.context_first_diff_entry =
-        scope.context_entry[first_diff_index];
+        scope.context_entry[context_first_diff_index];
     violation.context_first_diff_exit =
-        context_exit[first_diff_index];
+        context_exit[context_first_diff_index];
   }
   for (uint32_t i = 0U; i < FRAME_SENTINEL_CONTEXT_WORDS; ++i) {
     violation.context_entry[i] = scope.context_entry[i];
@@ -585,27 +767,33 @@ static void frame_sentinel_latch(
     const frame_sentinel_scope_t& scope,
     uint32_t slot,
     uint32_t kind,
+    uint32_t exc_return_exit,
     uint32_t caller_sp_exit,
     uint32_t dwt_exit,
     uint32_t fpccr_exit,
     uint32_t fpcar_exit,
-    uint32_t frame_address_exit,
+    const frame_sentinel_geometry_t& geometry_exit,
     const uint32_t* frame_exit,
     uint32_t frame_diff_mask,
     uint32_t frame_exit_checksum,
+    const uint32_t* fp_exit,
+    uint32_t fp_diff_mask,
+    uint32_t fp_exit_checksum,
+    uint32_t fp_first_diff_index,
     const uint32_t* context_exit,
     uint32_t context_diff_mask,
     uint32_t context_exit_checksum,
-    uint32_t first_diff_index) {
+    uint32_t context_first_diff_index) {
   g_frame_sentinel_violations++;
   g_frame_sentinel_event_pending = true;
 
   frame_sentinel_fill_violation(
       g_frame_sentinel_violation_last, scope, slot, kind,
-      caller_sp_exit, dwt_exit, fpccr_exit, fpcar_exit,
-      frame_address_exit, frame_exit, frame_diff_mask,
-      frame_exit_checksum, context_exit, context_diff_mask,
-      context_exit_checksum, first_diff_index);
+      exc_return_exit, caller_sp_exit, dwt_exit, fpccr_exit, fpcar_exit,
+      geometry_exit, frame_exit, frame_diff_mask, frame_exit_checksum,
+      fp_exit, fp_diff_mask, fp_exit_checksum, fp_first_diff_index,
+      context_exit, context_diff_mask, context_exit_checksum,
+      context_first_diff_index);
   g_frame_sentinel_violation_last_present = true;
 
   if (frame_sentinel_violation_valid(
@@ -616,15 +804,18 @@ static void frame_sentinel_latch(
 
   frame_sentinel_fill_violation(
       g_frame_sentinel_violation_retained, scope, slot, kind,
-      caller_sp_exit, dwt_exit, fpccr_exit, fpcar_exit,
-      frame_address_exit, frame_exit, frame_diff_mask,
-      frame_exit_checksum, context_exit, context_diff_mask,
-      context_exit_checksum, first_diff_index);
+      exc_return_exit, caller_sp_exit, dwt_exit, fpccr_exit, fpcar_exit,
+      geometry_exit, frame_exit, frame_diff_mask, frame_exit_checksum,
+      fp_exit, fp_diff_mask, fp_exit_checksum, fp_first_diff_index,
+      context_exit, context_diff_mask, context_exit_checksum,
+      context_first_diff_index);
   arm_dcache_flush((void*)&g_frame_sentinel_violation_retained,
                    sizeof(g_frame_sentinel_violation_retained));
 }
 
-void frame_sentinel_exit(uint32_t slot, uint32_t caller_sp) {
+void frame_sentinel_exit_ex(uint32_t slot,
+                            uint32_t exc_return_exit,
+                            uint32_t caller_sp) {
   if (slot >= FRAME_SENTINEL_SLOT_COUNT) {
     g_frame_sentinel_bad_slot++;
     return;
@@ -642,54 +833,99 @@ void frame_sentinel_exit(uint32_t slot, uint32_t caller_sp) {
   const uint32_t dwt_exit = ARM_DWT_CYCCNT;
   const uint32_t fpccr_exit = FRAME_SENTINEL_FPCCR;
   const uint32_t fpcar_exit = FRAME_SENTINEL_FPCAR;
-  if ((scope.fpccr_entry & 0x1U) != 0U &&
-      (fpccr_exit & 0x1U) == 0U) {
-    scope.lspact_consumed++;
-  }
+  const bool lspact_consumed =
+      (scope.fpccr_entry & 0x1U) != 0U &&
+      (fpccr_exit & 0x1U) == 0U;
+  if (lspact_consumed) scope.lspact_consumed++;
 
-  uint32_t kind = 0U;
   uint32_t frame_exit[FRAME_SENTINEL_BASIC_WORDS] = {};
   uint32_t frame_diff_mask = 0U;
-  uint32_t frame_exit_checksum = 0U;
-  uint32_t frame_address_exit = scope.frame_address;
 
-  if (scope.frame_address != 0U &&
-      frame_sentinel_range_readable(scope.frame_address, 32U)) {
-    const volatile uint32_t* words =
-        (const volatile uint32_t*)(uintptr_t)scope.frame_address;
+  // V5 doctrine: inspect the trusted core frame first.  If any core word has
+  // changed, commit that evidence immediately and leave the damaged execution
+  // environment.  Do not checksum, resolve fresh geometry, or inspect FP/
+  // context windows after observing the primary corruption.
+  if (scope.geometry_entry.valid &&
+      frame_sentinel_copy_words(
+          scope.geometry_entry.basic_frame_address,
+          frame_exit,
+          FRAME_SENTINEL_BASIC_WORDS)) {
     for (uint32_t i = 0U; i < FRAME_SENTINEL_BASIC_WORDS; ++i) {
-      frame_exit[i] = words[i];
       if (frame_exit[i] != scope.frame_entry[i]) {
         frame_diff_mask |= 1U << i;
       }
     }
-    frame_exit_checksum =
-        frame_sentinel_checksum(frame_exit, FRAME_SENTINEL_BASIC_WORDS);
+
     if (frame_diff_mask != 0U) {
-      kind |= FRAME_SENTINEL_KIND_FRAME_WORD_CHANGED;
+      const frame_sentinel_geometry_t no_exit_geometry = {};
+      const uint32_t fp_exit[FRAME_SENTINEL_FP_WORDS] = {};
+      const uint32_t context_exit[FRAME_SENTINEL_CONTEXT_WORDS] = {};
+
+      frame_sentinel_latch(
+          scope, slot, FRAME_SENTINEL_KIND_FRAME_WORD_CHANGED,
+          exc_return_exit, caller_sp, dwt_exit, fpccr_exit, fpcar_exit,
+          no_exit_geometry,
+          frame_exit, frame_diff_mask, 0U,
+          fp_exit, 0U, 0U, UINT32_MAX,
+          context_exit, 0U, 0U, UINT32_MAX);
+
+      frame_sentinel_beacon_pop(dwt_exit);
+      return;
+    }
+  }
+
+  uint32_t kind = 0U;
+
+  const uint32_t effective_exc_return =
+      frame_sentinel_exc_return_plausible(exc_return_exit)
+          ? exc_return_exit
+          : scope.exc_return_entry;
+  const frame_sentinel_geometry_t geometry_exit =
+      frame_sentinel_locate_geometry(
+          scope.ipsr, effective_exc_return, caller_sp,
+          fpccr_exit, fpcar_exit);
+
+  uint32_t fp_exit[FRAME_SENTINEL_FP_WORDS] = {};
+  uint32_t fp_diff_mask = 0U;
+  uint32_t fp_first_diff_index = UINT32_MAX;
+  if (scope.geometry_entry.extended &&
+      scope.geometry_entry.fp_frame_address != 0U &&
+      frame_sentinel_copy_words(
+          scope.geometry_entry.fp_frame_address,
+          fp_exit,
+          FRAME_SENTINEL_FP_WORDS)) {
+    for (uint32_t i = 0U; i < FRAME_SENTINEL_FP_WORDS; ++i) {
+      if (fp_exit[i] != scope.fp_entry[i]) {
+        fp_diff_mask |= 1U << i;
+        if (fp_first_diff_index == UINT32_MAX) fp_first_diff_index = i;
+      }
+    }
+
+    // Materializing a lazy FP frame lawfully changes this area.  A change
+    // without the LSPACT 1->0 transition is suspicious.
+    if (fp_diff_mask != 0U && !lspact_consumed &&
+        scope.geometry_entry.fp_evidence_trusted != 0U) {
+      kind |= FRAME_SENTINEL_KIND_FP_WORD_CHANGED;
     }
   }
 
   uint32_t context_exit[FRAME_SENTINEL_CONTEXT_WORDS] = {};
   uint32_t context_diff_mask = 0U;
-  uint32_t context_exit_checksum = 0U;
-  uint32_t first_diff_index = UINT32_MAX;
-
-  if (scope.context_address != 0U && scope.context_count != 0U &&
-      frame_sentinel_range_readable(
-          scope.context_address,
-          scope.context_count * sizeof(uint32_t))) {
-    const volatile uint32_t* words =
-        (const volatile uint32_t*)(uintptr_t)scope.context_address;
+  uint32_t context_first_diff_index = UINT32_MAX;
+  if (scope.geometry_entry.context_address != 0U &&
+      scope.context_count != 0U &&
+      frame_sentinel_copy_words(
+          scope.geometry_entry.context_address,
+          context_exit,
+          scope.context_count)) {
     for (uint32_t i = 0U; i < scope.context_count; ++i) {
-      context_exit[i] = words[i];
       if (context_exit[i] != scope.context_entry[i]) {
         context_diff_mask |= 1U << i;
-        if (first_diff_index == UINT32_MAX) first_diff_index = i;
+        if (context_first_diff_index == UINT32_MAX) {
+          context_first_diff_index = i;
+        }
       }
     }
-    context_exit_checksum =
-        frame_sentinel_checksum(context_exit, scope.context_count);
     if (context_diff_mask != 0U) {
       kind |= FRAME_SENTINEL_KIND_CONTEXT_WORD_CHANGED;
     }
@@ -700,26 +936,38 @@ void frame_sentinel_exit(uint32_t slot, uint32_t caller_sp) {
     kind |= FRAME_SENTINEL_KIND_CALLER_SP_CHANGED;
   }
 
-  uint32_t current_source = FRAME_SENTINEL_SOURCE_NONE;
-  const uint32_t resolved_exit = frame_sentinel_locate_frame(
-      scope.ipsr, scope.exc_return, caller_sp, fpccr_exit,
-      fpcar_exit, &current_source);
-  if (scope.frame_address != 0U && resolved_exit != 0U &&
-      resolved_exit != scope.frame_address) {
-    kind |= FRAME_SENTINEL_KIND_FRAME_MOVED;
-    frame_address_exit = resolved_exit;
+  if (frame_sentinel_exc_return_plausible(exc_return_exit) &&
+      frame_sentinel_exc_return_extended(scope.exc_return_entry) !=
+          frame_sentinel_exc_return_extended(exc_return_exit)) {
+    kind |= FRAME_SENTINEL_KIND_FRAME_TYPE_CHANGED;
+    scope.frame_type_changed++;
+  }
+
+  if (scope.geometry_entry.valid && geometry_exit.valid &&
+      (scope.geometry_entry.basic_frame_address !=
+           geometry_exit.basic_frame_address ||
+       scope.geometry_entry.raw_frame_address !=
+           geometry_exit.raw_frame_address ||
+       scope.geometry_entry.extended != geometry_exit.extended)) {
+    kind |= FRAME_SENTINEL_KIND_FP_GEOMETRY_CHANGED;
+    scope.geometry_changed++;
   }
 
   if (kind != 0U) {
     frame_sentinel_latch(
-        scope, slot, kind, caller_sp, dwt_exit, fpccr_exit,
-        fpcar_exit, frame_address_exit, frame_exit,
-        frame_diff_mask, frame_exit_checksum, context_exit,
-        context_diff_mask, context_exit_checksum, first_diff_index);
+        scope, slot, kind, exc_return_exit, caller_sp, dwt_exit,
+        fpccr_exit, fpcar_exit, geometry_exit,
+        frame_exit, frame_diff_mask, 0U,
+        fp_exit, fp_diff_mask, 0U, fp_first_diff_index,
+        context_exit, context_diff_mask, 0U,
+        context_first_diff_index);
   }
 
-  // Keep this scope active in the beacon until after violation attribution.
   frame_sentinel_beacon_pop(dwt_exit);
+}
+
+void frame_sentinel_exit(uint32_t slot, uint32_t caller_sp) {
+  frame_sentinel_exit_ex(slot, 0U, caller_sp);
 }
 
 static const char* frame_sentinel_source_name(uint32_t source) {
@@ -736,7 +984,7 @@ static void frame_sentinel_emit(void) {
       g_frame_sentinel_violation_last;
 
   Payload event;
-  event.add("schema", "ZPNET_FRAME_SENTINEL_V2_ANOMALY");
+  event.add("schema", "ZPNET_FRAME_SENTINEL_V5_ANOMALY");
   event.add("name", violation.name);
   event.add("slot", violation.slot);
   event.add("kind", violation.kind);
@@ -767,7 +1015,6 @@ Payload frame_sentinel_report_payload(void) {
 
   const frame_sentinel_violation_t* violation = nullptr;
   const char* bank = "none";
-
   if (frame_sentinel_violation_valid(
           g_frame_sentinel_violation_retained)) {
     violation = &g_frame_sentinel_violation_retained;
@@ -780,11 +1027,16 @@ Payload frame_sentinel_report_payload(void) {
   }
 
   Payload report;
-  report.add("schema", "ZPNET_FRAME_SENTINEL_V2");
+  report.add("schema", "ZPNET_FRAME_SENTINEL_V5");
   report.add("version", FRAME_SENTINEL_SCHEMA_VERSION);
   report.add("standalone", true);
   report.add("service", "main_loop");
+  report.add("fpu_aware", true);
+  report.add("exit_checksums_enabled", false);
+  report.add("core_change_fast_latch", true);
   report.add("slot_count", (uint32_t)FRAME_SENTINEL_SLOT_COUNT);
+  report.add("basic_frame_words", FRAME_SENTINEL_BASIC_WORDS);
+  report.add("fp_frame_words", FRAME_SENTINEL_FP_WORDS);
   report.add("context_words", FRAME_SENTINEL_CONTEXT_WORDS);
   report.add("enters", g_frame_sentinel_enters);
   report.add("exits", g_frame_sentinel_exits);
@@ -802,22 +1054,93 @@ Payload frame_sentinel_report_payload(void) {
     evidence.add("pass", violation->pass);
     evidence.add("kind", violation->kind);
     evidence.add("ipsr", violation->ipsr);
-    evidence.add_fmt("exc_return", "0x%08lX",
-                     (unsigned long)violation->exc_return);
+    evidence.add_fmt("exc_return_entry", "0x%08lX",
+                     (unsigned long)violation->exc_return_entry);
+    evidence.add_fmt("exc_return_exit", "0x%08lX",
+                     (unsigned long)violation->exc_return_exit);
+    evidence.add("exc_return_entry_valid",
+                 violation->exc_return_entry_valid != 0U);
+    evidence.add("exc_return_exit_valid",
+                 violation->exc_return_exit_valid != 0U);
+    evidence.add("frame_type_entry_known",
+                 violation->exc_return_entry_valid != 0U);
+    evidence.add("frame_type_exit_known",
+                 violation->exc_return_exit_valid != 0U);
+    evidence.add("frame_type_entry_extended",
+                 violation->frame_type_entry_extended != 0U);
+    evidence.add("frame_type_exit_extended",
+                 violation->frame_type_exit_extended != 0U);
     evidence.add_fmt("caller_sp_entry", "0x%08lX",
                      (unsigned long)violation->caller_sp_entry);
     evidence.add_fmt("caller_sp_exit", "0x%08lX",
                      (unsigned long)violation->caller_sp_exit);
-    evidence.add_fmt("frame_entry", "0x%08lX",
-                     (unsigned long)violation->frame_address_entry);
-    evidence.add_fmt("frame_exit", "0x%08lX",
-                     (unsigned long)violation->frame_address_exit);
-    evidence.add("frame_source",
-                 frame_sentinel_source_name(violation->frame_source));
+    evidence.add_fmt("fpccr_entry", "0x%08lX",
+                     (unsigned long)violation->fpccr_entry);
+    evidence.add_fmt("fpccr_exit", "0x%08lX",
+                     (unsigned long)violation->fpccr_exit);
+    evidence.add_fmt("fpcar_entry", "0x%08lX",
+                     (unsigned long)violation->fpcar_entry);
+    evidence.add_fmt("fpcar_exit", "0x%08lX",
+                     (unsigned long)violation->fpcar_exit);
+    evidence.add("lspact_consumed",
+                 violation->lspact_consumed != 0U);
+
+    Payload entry_geometry;
+    entry_geometry.add("valid", violation->geometry_entry.valid != 0U);
+    entry_geometry.add("source",
+        frame_sentinel_source_name(violation->geometry_entry.source));
+    entry_geometry.add("extended",
+                       violation->geometry_entry.extended != 0U);
+    entry_geometry.add("alignment_word",
+                       violation->geometry_entry.alignment_word != 0U);
+    entry_geometry.add("core_content_plausible",
+                       violation->geometry_entry.core_content_plausible != 0U);
+    entry_geometry.add("fp_evidence_trusted",
+                       violation->geometry_entry.fp_evidence_trusted != 0U);
+    entry_geometry.add_fmt("raw_frame", "0x%08lX",
+        (unsigned long)violation->geometry_entry.raw_frame_address);
+    entry_geometry.add_fmt("fp_frame", "0x%08lX",
+        (unsigned long)violation->geometry_entry.fp_frame_address);
+    entry_geometry.add_fmt("basic_frame", "0x%08lX",
+        (unsigned long)violation->geometry_entry.basic_frame_address);
+    entry_geometry.add_fmt("context", "0x%08lX",
+        (unsigned long)violation->geometry_entry.context_address);
+    evidence.add_object("entry_geometry", entry_geometry);
+
+    Payload exit_geometry;
+    exit_geometry.add("valid", violation->geometry_exit.valid != 0U);
+    exit_geometry.add("source",
+        frame_sentinel_source_name(violation->geometry_exit.source));
+    exit_geometry.add("extended",
+                      violation->geometry_exit.extended != 0U);
+    exit_geometry.add("alignment_word",
+                      violation->geometry_exit.alignment_word != 0U);
+    exit_geometry.add("core_content_plausible",
+                      violation->geometry_exit.core_content_plausible != 0U);
+    exit_geometry.add("fp_evidence_trusted",
+                      violation->geometry_exit.fp_evidence_trusted != 0U);
+    exit_geometry.add_fmt("raw_frame", "0x%08lX",
+        (unsigned long)violation->geometry_exit.raw_frame_address);
+    exit_geometry.add_fmt("fp_frame", "0x%08lX",
+        (unsigned long)violation->geometry_exit.fp_frame_address);
+    exit_geometry.add_fmt("basic_frame", "0x%08lX",
+        (unsigned long)violation->geometry_exit.basic_frame_address);
+    exit_geometry.add_fmt("context", "0x%08lX",
+        (unsigned long)violation->geometry_exit.context_address);
+    evidence.add_object("exit_geometry", exit_geometry);
+
     evidence.add_fmt("frame_diff_mask", "0x%02lX",
                      (unsigned long)violation->frame_diff_mask);
-    evidence.add_fmt("context_address", "0x%08lX",
-                     (unsigned long)violation->context_address);
+    evidence.add_fmt("fp_diff_mask", "0x%08lX",
+                     (unsigned long)violation->fp_diff_mask);
+    evidence.add("fp_first_diff_index",
+                 violation->fp_first_diff_index);
+    evidence.add_fmt("fp_first_diff_address", "0x%08lX",
+                     (unsigned long)violation->fp_first_diff_address);
+    evidence.add_fmt("fp_first_diff_entry", "0x%08lX",
+                     (unsigned long)violation->fp_first_diff_entry);
+    evidence.add_fmt("fp_first_diff_exit", "0x%08lX",
+                     (unsigned long)violation->fp_first_diff_exit);
     evidence.add("context_count", violation->context_count);
     evidence.add_fmt("context_diff_mask", "0x%08lX",
                      (unsigned long)violation->context_diff_mask);
@@ -829,16 +1152,6 @@ Payload frame_sentinel_report_payload(void) {
                      (unsigned long)violation->context_first_diff_entry);
     evidence.add_fmt("context_first_diff_exit", "0x%08lX",
                      (unsigned long)violation->context_first_diff_exit);
-    evidence.add_fmt("fpccr_entry", "0x%08lX",
-                     (unsigned long)violation->fpccr_entry);
-    evidence.add_fmt("fpccr_exit", "0x%08lX",
-                     (unsigned long)violation->fpccr_exit);
-    evidence.add_fmt("fpcar_entry", "0x%08lX",
-                     (unsigned long)violation->fpcar_entry);
-    evidence.add_fmt("fpcar_exit", "0x%08lX",
-                     (unsigned long)violation->fpcar_exit);
-    evidence.add("lspact_consumed",
-                 violation->lspact_consumed != 0U);
     evidence.add("victim_depth", violation->victim_depth);
     evidence.add("victim", violation->victim_name);
     evidence.add("victim_slot", violation->victim_slot);
@@ -851,11 +1164,9 @@ Payload frame_sentinel_report_payload(void) {
   const bool retained_beacon_valid =
       frame_sentinel_beacon_valid(g_frame_sentinel_beacon_retained);
   beacon.add("valid", retained_beacon_valid);
-
   if (retained_beacon_valid) {
     beacon.add("depth", g_frame_sentinel_beacon_retained.depth);
     beacon.add("overflow", g_frame_sentinel_beacon_retained.overflow);
-
     if (g_frame_sentinel_beacon_retained.depth != 0U) {
       const frame_sentinel_beacon_entry_t& active =
           g_frame_sentinel_beacon_retained.active[0];
@@ -864,11 +1175,9 @@ Payload frame_sentinel_report_payload(void) {
       beacon.add("outermost_pass", active.pass);
       beacon.add("outermost_ipsr", active.ipsr);
     }
-
     beacon.add("last_completed",
                g_frame_sentinel_beacon_retained.last_completed.name);
   }
-
   report.add_object("previous_boot_beacon", beacon);
   return report;
 }
