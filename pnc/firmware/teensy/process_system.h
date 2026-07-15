@@ -77,12 +77,15 @@ void process_system_register(void);
 // Purpose: catch corruption of a stacked exception frame while the corrupting
 // handler pass is still on the CPU, with attribution.
 //
-// Current deployment follows the retained HardFault evidence:
+// Current crash-hunt deployment follows the retained fault evidence:
 //
-//   • the priority-16 interrupt handoff ISR is the outer custody boundary;
-//   • the lane-specific DWT publication tribunal is the crash victim region;
-//   • lane-specific fatal-forensics construction is nested separately so a
-//     recurrence distinguishes courtroom arithmetic from evidence capture.
+//   • CPU_USAGE is a thread-mode victim marker around cpu_usage_sample();
+//   • QTimer1, QTimer2, QTimer3, and PPS GPIO get distinct priority-0 slots;
+//   • those priority-0 scopes arm only while CPU_USAGE is active, preserving
+//     normal capture latency while still inspecting every interrupt that can
+//     preempt the recurring 0x426 crash neighborhood;
+//   • the priority-16 handoff and lane-specific publication tribunals remain
+//     independently attributable.
 //
 // Usage contract:
 //
@@ -115,8 +118,13 @@ enum {
   ZPNET_SENTINEL_SLOT_DWT_FATAL_VCLOCK         = 4,
   ZPNET_SENTINEL_SLOT_DWT_FATAL_OCXO1          = 5,
   ZPNET_SENTINEL_SLOT_DWT_FATAL_OCXO2          = 6,
-  ZPNET_SENTINEL_SLOT_RESERVED                 = 7,
-  ZPNET_SENTINEL_SLOT_COUNT                    = 8,
+  ZPNET_SENTINEL_SLOT_CPU_USAGE                = 7,
+  ZPNET_SENTINEL_SLOT_QTIMER1_ISR              = 8,
+  ZPNET_SENTINEL_SLOT_QTIMER2_ISR              = 9,
+  ZPNET_SENTINEL_SLOT_QTIMER3_ISR              = 10,
+  ZPNET_SENTINEL_SLOT_PPS_GPIO_ISR             = 11,
+  ZPNET_SENTINEL_SLOT_RESERVED                 = 12,
+  ZPNET_SENTINEL_SLOT_COUNT                    = 13,
 };
 
 // name must be a string literal or other immortal storage; only the pointer
@@ -153,6 +161,42 @@ void zpnet_sentinel_exit(uint32_t slot, uint32_t caller_sp);
   zpnet_sentinel_enter((slot), (name), 0U, 0U)
 #define ZPNET_SENTINEL_EXIT(slot) zpnet_sentinel_exit((slot), 0U)
 #endif
+
+// ============================================================================
+// Foreground / CPU-usage retained crash breadcrumbs
+// ============================================================================
+//
+// The main loop records its current imperative phase.  cpu_usage_tick() then
+// latches the phase and marks one CPU sample active before entering the tiny
+// DWT-read victim.  Both live and previous-boot records are reported through
+// SYSTEM.SENTINEL_INFO and SYSTEM.CRASH_INFO.
+
+enum class zpnet_foreground_phase_t : uint32_t {
+  NONE             = 0,
+  TRANSPORT_PRE    = 1,
+  TIMEPOP_DISPATCH = 2,
+  TRANSPORT_POST   = 3,
+};
+
+enum class zpnet_cpu_usage_stage_t : uint32_t {
+  IDLE               = 0,
+  CALLBACK_ENTER     = 1,
+  DWT_READ_COMPLETE  = 2,
+  BUSY_READ_COMPLETE = 3,
+  MILLIS_COMPLETE    = 4,
+  CALLBACK_EXIT      = 5,
+};
+
+void zpnet_foreground_phase_note(zpnet_foreground_phase_t phase);
+void zpnet_cpu_usage_ledger_enter(void) __attribute__((noinline));
+void zpnet_cpu_usage_ledger_stage(zpnet_cpu_usage_stage_t stage,
+                                  uint32_t value) __attribute__((noinline));
+void zpnet_cpu_usage_ledger_exit(void) __attribute__((noinline));
+
+// Priority-0 ISR wrappers sample this flag inline before their first call.
+// It is true only across cpu_usage_sample(), so the expensive frame court does
+// not run continuously on the 1 kHz timing rails.
+extern volatile bool g_zpnet_sentinel_cpu_usage_focus_active;
 
 // ============================================================================
 // Feature status substrate

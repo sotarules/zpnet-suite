@@ -12150,18 +12150,32 @@ static void qtimer2_isr(void) {
   const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;  // SACRED: first instruction.
   const uint16_t generation_gate_ambient_low16 =
       IMXRT_TMR2.CH[QTIMER2_OCXO1_CH].CNTR;
+  const bool sentinel_focus = g_zpnet_sentinel_cpu_usage_focus_active;
+  if (sentinel_focus) {
+    ZPNET_SENTINEL_ENTER(ZPNET_SENTINEL_SLOT_QTIMER2_ISR, "QTIMER2_ISR");
+  }
   ocxo_cadence_capture_priority0(g_ocxo1_ctx,
                                  isr_entry_dwt_raw,
                                  generation_gate_ambient_low16);
+  if (sentinel_focus) {
+    ZPNET_SENTINEL_EXIT(ZPNET_SENTINEL_SLOT_QTIMER2_ISR);
+  }
 }
 
 static void qtimer3_isr(void) {
   const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;  // SACRED: first instruction.
   const uint16_t generation_gate_ambient_low16 =
       IMXRT_TMR3.CH[QTIMER3_OCXO2_CH].CNTR;
+  const bool sentinel_focus = g_zpnet_sentinel_cpu_usage_focus_active;
+  if (sentinel_focus) {
+    ZPNET_SENTINEL_ENTER(ZPNET_SENTINEL_SLOT_QTIMER3_ISR, "QTIMER3_ISR");
+  }
   ocxo_cadence_capture_priority0(g_ocxo2_ctx,
                                  isr_entry_dwt_raw,
                                  generation_gate_ambient_low16);
+  if (sentinel_focus) {
+    ZPNET_SENTINEL_EXIT(ZPNET_SENTINEL_SLOT_QTIMER3_ISR);
+  }
 }
 
 // ============================================================================
@@ -12468,6 +12482,10 @@ static void qtimer1_ch2_capture_priority0(uint32_t isr_entry_dwt_raw,
 static void qtimer1_isr(void) {
   const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;  // SACRED: first instruction.
   const uint16_t generation_gate_vclock_low16 = qtimer1_ch0_counter_now();
+  const bool sentinel_focus = g_zpnet_sentinel_cpu_usage_focus_active;
+  if (sentinel_focus) {
+    ZPNET_SENTINEL_ENTER(ZPNET_SENTINEL_SLOT_QTIMER1_ISR, "QTIMER1_ISR");
+  }
 
   // VCLOCK authority: QTimer1 CH0 is the pin-bound VCLOCK count+compare rail.
   const uint32_t vclock_csctrl = IMXRT_TMR1.CH[QTIMER1_VCLOCK_CH].CSCTRL;
@@ -12475,6 +12493,9 @@ static void qtimer1_isr(void) {
     qtimer1_vclock_capture_priority0(isr_entry_dwt_raw,
                                      vclock_csctrl,
                                      generation_gate_vclock_low16);
+    if (sentinel_focus) {
+      ZPNET_SENTINEL_EXIT(ZPNET_SENTINEL_SLOT_QTIMER1_ISR);
+    }
     return;
   }
 
@@ -12483,6 +12504,9 @@ static void qtimer1_isr(void) {
   const uint32_t timepop_csctrl = IMXRT_TMR1.CH[QTIMER1_TIMEPOP_CH].CSCTRL;
   if (timepop_csctrl & TMR_CSCTRL_TCF1) {
     qtimer1_ch2_capture_priority0(isr_entry_dwt_raw, timepop_csctrl);
+    if (sentinel_focus) {
+      ZPNET_SENTINEL_EXIT(ZPNET_SENTINEL_SLOT_QTIMER1_ISR);
+    }
     return;
   }
 
@@ -12490,6 +12514,10 @@ static void qtimer1_isr(void) {
   const uint32_t aux_csctrl = IMXRT_TMR1.CH[QTIMER1_RETIRED_AUX_CH].CSCTRL;
   if (aux_csctrl & TMR_CSCTRL_TCF1) {
     qtimer1_ch1_clear_compare_flag();
+  }
+
+  if (sentinel_focus) {
+    ZPNET_SENTINEL_EXIT(ZPNET_SENTINEL_SLOT_QTIMER1_ISR);
   }
 }
 
@@ -12767,8 +12795,9 @@ static void interrupt_handoff_process_pps(const pps_capture_packet_t& packet) {
   }
 }
 
-void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
-  pps_capture_packet_t packet{};
+static inline __attribute__((always_inline)) void
+pps_capture_packet_fill_priority0(pps_capture_packet_t& packet,
+                                  uint32_t isr_entry_dwt_raw) {
   packet.sequence = ++g_pps_capture_sequence;
   packet.isr_entry_dwt_raw = isr_entry_dwt_raw;
 
@@ -12782,12 +12811,20 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
   packet.ocxo_capture_hw_ready =
       (OCXO1_DISABLED || packet.ocxo1_capture_hw_ready) &&
       (OCXO2_DISABLED || packet.ocxo2_capture_hw_ready);
-  packet.ocxo1_hardware16 = packet.ocxo1_capture_hw_ready ? IMXRT_TMR2.CH[QTIMER_CLOCK_COUNTER_CH].CNTR : 0;
-  packet.ocxo2_hardware16 = packet.ocxo2_capture_hw_ready ? IMXRT_TMR3.CH[g_ocxo2_lane.counter_channel].CNTR : 0;
+  packet.ocxo1_hardware16 = packet.ocxo1_capture_hw_ready
+      ? IMXRT_TMR2.CH[QTIMER_CLOCK_COUNTER_CH].CNTR
+      : 0;
+  packet.ocxo2_hardware16 = packet.ocxo2_capture_hw_ready
+      ? IMXRT_TMR3.CH[g_ocxo2_lane.counter_channel].CNTR
+      : 0;
   packet.capture_end_raw = ARM_DWT_CYCCNT;
   packet.capture_exit_dwt = ARM_DWT_CYCCNT;
   packet.rebootstrap_pending_at_capture = g_pps_rebootstrap_pending;
+}
 
+static void pps_capture_packet_enqueue_priority0(
+    const pps_capture_packet_t& packet,
+    uint32_t isr_entry_dwt_raw) {
   if (capture_ring_push_from_priority0(g_pps_capture_ring,
                                        g_handoff_pps,
                                        packet)) {
@@ -12798,9 +12835,28 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
   interrupt_handoff_note_priority0_body(g_handoff_pps, isr_entry_dwt_raw);
 }
 
+void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
+  pps_capture_packet_t packet{};
+  pps_capture_packet_fill_priority0(packet, isr_entry_dwt_raw);
+  pps_capture_packet_enqueue_priority0(packet, isr_entry_dwt_raw);
+}
+
 static void pps_gpio_isr(void) {
   const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;
-  process_interrupt_gpio6789_irq(isr_entry_dwt_raw);
+
+  // Preserve the sacred multi-clock capture window before the focused frame
+  // court performs cache maintenance or any out-of-line call.
+  pps_capture_packet_t packet{};
+  pps_capture_packet_fill_priority0(packet, isr_entry_dwt_raw);
+
+  const bool sentinel_focus = g_zpnet_sentinel_cpu_usage_focus_active;
+  if (sentinel_focus) {
+    ZPNET_SENTINEL_ENTER(ZPNET_SENTINEL_SLOT_PPS_GPIO_ISR, "PPS_GPIO_ISR");
+  }
+  pps_capture_packet_enqueue_priority0(packet, isr_entry_dwt_raw);
+  if (sentinel_focus) {
+    ZPNET_SENTINEL_EXIT(ZPNET_SENTINEL_SLOT_PPS_GPIO_ISR);
+  }
 }
 
 void interrupt_pps_edge_register_dispatch(pps_edge_dispatch_fn fn) {

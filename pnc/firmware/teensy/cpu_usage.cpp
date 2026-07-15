@@ -1,5 +1,6 @@
 #include "cpu_usage.h"
 #include "timepop.h"
+#include "process_system.h"
 #include <Arduino.h>
 
 // ------------------------------------------------------------
@@ -51,7 +52,15 @@ void cpu_usage_init(void) {
 // ------------------------------------------------------------
 
 static void cpu_usage_tick(timepop_ctx_t*, timepop_diag_t*, void*) {
+  zpnet_cpu_usage_ledger_enter();
+  ZPNET_SENTINEL_ENTER(ZPNET_SENTINEL_SLOT_CPU_USAGE, "CPU_USAGE");
+  g_zpnet_sentinel_cpu_usage_focus_active = true;
+
   cpu_usage_sample();
+
+  g_zpnet_sentinel_cpu_usage_focus_active = false;
+  zpnet_cpu_usage_ledger_exit();
+  ZPNET_SENTINEL_EXIT(ZPNET_SENTINEL_SLOT_CPU_USAGE);
 }
 
 void cpu_usage_init_timer(void) {
@@ -78,12 +87,19 @@ void cpu_usage_account_busy(uint32_t cycles) {
 void cpu_usage_sample(void) {
 
     uint32_t total_now = ARM_DWT_CYCCNT;
+    zpnet_cpu_usage_ledger_stage(
+        zpnet_cpu_usage_stage_t::DWT_READ_COMPLETE, total_now);
+
     uint32_t busy_now  = busy_cycles_accum;
+    zpnet_cpu_usage_ledger_stage(
+        zpnet_cpu_usage_stage_t::BUSY_READ_COMPLETE, busy_now);
 
     uint32_t total_delta = total_now - last_total_cycles;
     uint32_t busy_delta  = busy_now  - last_busy_cycles;
 
     uint32_t now_ms = millis();
+    zpnet_cpu_usage_ledger_stage(
+        zpnet_cpu_usage_stage_t::MILLIS_COMPLETE, now_ms);
     uint32_t window_ms = now_ms - last_sample_time_ms;
 
     // --------------------------------------------------------

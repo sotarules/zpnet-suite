@@ -379,8 +379,11 @@ void setup() {
 // ============================================================================
 
 void loop() {
+  zpnet_foreground_phase_note(zpnet_foreground_phase_t::TRANSPORT_PRE);
   transport_note_runtime_loop();
   transport_poll();
+  zpnet_foreground_phase_note(zpnet_foreground_phase_t::TIMEPOP_DISPATCH);
   timepop_dispatch();
+  zpnet_foreground_phase_note(zpnet_foreground_phase_t::TRANSPORT_POST);
   transport_poll();
 }

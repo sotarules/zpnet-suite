@@ -63,6 +63,181 @@ static bool system_cpu_window_initialized = false;
 static uint64_t system_cpu_window_last_wall_cycles = 0;
 static uint64_t system_cpu_window_last_idle_cycles = 0;
 
+// ============================================================================
+// Retained foreground / CPU-usage crash ledger
+// ============================================================================
+//
+// This is deliberately tiny and scalar-only.  The live RAM2 record is updated
+// by loop() and cpu_usage_tick(); on the next boot its final committed image is
+// copied to the retained bank before current activity overwrites it.  Ordinary
+// phase notes remain cache-local; CPU_USAGE entry flushes the whole record, so
+// the 0x426 crash path commits its phase without adding another DWT read or a
+// cache-maintenance operation to every loop transition.
+
+static constexpr uint32_t ZPNET_RUNTIME_LEDGER_MAGIC = 0x52554E31UL;  // 'RUN1'
+static constexpr uint32_t ZPNET_CPU_USAGE_STATE_IDLE = 0U;
+static constexpr uint32_t ZPNET_CPU_USAGE_STATE_ACTIVE = 1U;
+
+typedef struct {
+  uint32_t magic;
+  uint32_t magic_inv;
+
+  uint32_t foreground_sequence;
+  uint32_t foreground_sequence_inv;
+  uint32_t foreground_phase;
+
+  uint32_t cpu_usage_sequence;
+  uint32_t cpu_usage_sequence_inv;
+  uint32_t cpu_usage_state;
+  uint32_t cpu_usage_state_inv;
+  uint32_t cpu_usage_stage;
+  uint32_t cpu_usage_stage_inv;
+  uint32_t cpu_usage_stage_value;
+  uint32_t cpu_usage_stage_value_inv;
+  uint32_t cpu_usage_foreground_sequence;
+  uint32_t cpu_usage_foreground_phase;
+  uint32_t cpu_usage_ipsr;
+} zpnet_runtime_ledger_t;
+
+static_assert(sizeof(zpnet_runtime_ledger_t) == 64U,
+              "runtime crash ledger must stay two cache lines");
+
+static zpnet_runtime_ledger_t g_runtime_ledger DMAMEM;
+static zpnet_runtime_ledger_t g_runtime_ledger_retained DMAMEM;
+static bool g_runtime_ledger_boot_latched = false;  // BSS: zero every boot
+
+volatile bool g_zpnet_sentinel_cpu_usage_focus_active = false;
+
+static bool runtime_ledger_header_valid(const zpnet_runtime_ledger_t* ledger) {
+  return ledger &&
+         ledger->magic == ZPNET_RUNTIME_LEDGER_MAGIC &&
+         (ledger->magic ^ ledger->magic_inv) == 0xFFFFFFFFUL;
+}
+
+static bool runtime_ledger_foreground_valid(
+    const zpnet_runtime_ledger_t* ledger) {
+  return runtime_ledger_header_valid(ledger) &&
+         (ledger->foreground_sequence ^ ledger->foreground_sequence_inv) ==
+             0xFFFFFFFFUL;
+}
+
+static bool runtime_ledger_cpu_usage_valid(
+    const zpnet_runtime_ledger_t* ledger) {
+  return runtime_ledger_header_valid(ledger) &&
+         (ledger->cpu_usage_sequence ^ ledger->cpu_usage_sequence_inv) ==
+             0xFFFFFFFFUL &&
+         (ledger->cpu_usage_state ^ ledger->cpu_usage_state_inv) ==
+             0xFFFFFFFFUL &&
+         (ledger->cpu_usage_stage ^ ledger->cpu_usage_stage_inv) ==
+             0xFFFFFFFFUL &&
+         (ledger->cpu_usage_stage_value ^
+          ledger->cpu_usage_stage_value_inv) == 0xFFFFFFFFUL;
+}
+
+static void runtime_ledger_initialize_live(void) {
+  memset((void*)&g_runtime_ledger, 0, sizeof(g_runtime_ledger));
+  g_runtime_ledger.foreground_sequence_inv = 0xFFFFFFFFUL;
+  g_runtime_ledger.cpu_usage_sequence_inv = 0xFFFFFFFFUL;
+  g_runtime_ledger.cpu_usage_state = ZPNET_CPU_USAGE_STATE_IDLE;
+  g_runtime_ledger.cpu_usage_state_inv = ~ZPNET_CPU_USAGE_STATE_IDLE;
+  g_runtime_ledger.cpu_usage_stage =
+      (uint32_t)zpnet_cpu_usage_stage_t::IDLE;
+  g_runtime_ledger.cpu_usage_stage_inv =
+      ~(uint32_t)zpnet_cpu_usage_stage_t::IDLE;
+  g_runtime_ledger.cpu_usage_stage_value = 0U;
+  g_runtime_ledger.cpu_usage_stage_value_inv = ~0U;
+  g_runtime_ledger.magic_inv = ~ZPNET_RUNTIME_LEDGER_MAGIC;
+  g_runtime_ledger.magic = ZPNET_RUNTIME_LEDGER_MAGIC;
+  arm_dcache_flush((void*)&g_runtime_ledger, sizeof(g_runtime_ledger));
+}
+
+static void runtime_ledger_boot_latch(void) {
+  if (g_runtime_ledger_boot_latched) return;
+  g_runtime_ledger_boot_latched = true;
+
+  if (runtime_ledger_header_valid(&g_runtime_ledger)) {
+    g_runtime_ledger_retained = g_runtime_ledger;
+  } else {
+    memset((void*)&g_runtime_ledger_retained, 0,
+           sizeof(g_runtime_ledger_retained));
+  }
+  arm_dcache_flush((void*)&g_runtime_ledger_retained,
+                   sizeof(g_runtime_ledger_retained));
+
+  runtime_ledger_initialize_live();
+}
+
+static inline uint32_t runtime_ledger_ipsr(void) {
+  uint32_t ipsr = 0;
+  __asm__ volatile("mrs %0, ipsr" : "=r"(ipsr));
+  return ipsr & 0x1FFU;
+}
+
+void zpnet_foreground_phase_note(zpnet_foreground_phase_t phase) {
+  runtime_ledger_boot_latch();
+
+  const uint32_t sequence = g_runtime_ledger.foreground_sequence + 1U;
+  g_runtime_ledger.foreground_sequence_inv =
+      g_runtime_ledger.foreground_sequence;  // invalidate while mutating
+  g_runtime_ledger.foreground_phase = (uint32_t)phase;
+  g_runtime_ledger.foreground_sequence_inv = ~sequence;
+  g_runtime_ledger.foreground_sequence = sequence;  // commit last
+}
+
+static void runtime_ledger_cpu_usage_set_stage(
+    zpnet_cpu_usage_stage_t stage,
+    uint32_t value) {
+  const uint32_t stage_id = (uint32_t)stage;
+  g_runtime_ledger.cpu_usage_stage = stage_id;
+  g_runtime_ledger.cpu_usage_stage_inv = ~stage_id;
+  g_runtime_ledger.cpu_usage_stage_value = value;
+  g_runtime_ledger.cpu_usage_stage_value_inv = ~value;
+}
+
+void zpnet_cpu_usage_ledger_enter(void) {
+  runtime_ledger_boot_latch();
+
+  const uint32_t sequence = g_runtime_ledger.cpu_usage_sequence + 1U;
+  g_runtime_ledger.cpu_usage_sequence_inv =
+      g_runtime_ledger.cpu_usage_sequence;  // invalidate while mutating
+  g_runtime_ledger.cpu_usage_foreground_sequence =
+      g_runtime_ledger.foreground_sequence;
+  g_runtime_ledger.cpu_usage_foreground_phase =
+      g_runtime_ledger.foreground_phase;
+  g_runtime_ledger.cpu_usage_ipsr = runtime_ledger_ipsr();
+  g_runtime_ledger.cpu_usage_state = ZPNET_CPU_USAGE_STATE_ACTIVE;
+  g_runtime_ledger.cpu_usage_state_inv = ~ZPNET_CPU_USAGE_STATE_ACTIVE;
+  runtime_ledger_cpu_usage_set_stage(
+      zpnet_cpu_usage_stage_t::CALLBACK_ENTER, 0U);
+  g_runtime_ledger.cpu_usage_sequence_inv = ~sequence;
+  g_runtime_ledger.cpu_usage_sequence = sequence;  // commit last
+  arm_dcache_flush((void*)&g_runtime_ledger, sizeof(g_runtime_ledger));
+}
+
+void zpnet_cpu_usage_ledger_stage(zpnet_cpu_usage_stage_t stage,
+                                  uint32_t value) {
+  runtime_ledger_boot_latch();
+
+  const uint32_t sequence = g_runtime_ledger.cpu_usage_sequence;
+  g_runtime_ledger.cpu_usage_sequence_inv = sequence;  // invalidate
+  runtime_ledger_cpu_usage_set_stage(stage, value);
+  g_runtime_ledger.cpu_usage_sequence_inv = ~sequence;  // commit last
+  arm_dcache_flush((void*)&g_runtime_ledger, sizeof(g_runtime_ledger));
+}
+
+void zpnet_cpu_usage_ledger_exit(void) {
+  runtime_ledger_boot_latch();
+
+  const uint32_t sequence = g_runtime_ledger.cpu_usage_sequence;
+  g_runtime_ledger.cpu_usage_sequence_inv = sequence;  // invalidate
+  g_runtime_ledger.cpu_usage_state = ZPNET_CPU_USAGE_STATE_IDLE;
+  g_runtime_ledger.cpu_usage_state_inv = ~ZPNET_CPU_USAGE_STATE_IDLE;
+  runtime_ledger_cpu_usage_set_stage(
+      zpnet_cpu_usage_stage_t::CALLBACK_EXIT, 0U);
+  g_runtime_ledger.cpu_usage_sequence_inv = ~sequence;  // commit last
+  arm_dcache_flush((void*)&g_runtime_ledger, sizeof(g_runtime_ledger));
+}
+
 // --------------------------------------------------------------
 // Always-on memory integrity watchdog
 // --------------------------------------------------------------
@@ -272,9 +447,10 @@ static void system_memory_watchdog_arm(void) {
 //      8-word basic frame sits at FPCAR − 0x20.  Deterministic for the
 //      FP-active foreground that Crash1 implicates.
 //   2. PSP — EXC_RETURN reports the process stack as the return stack.
-//   3. Bounded signature scan — walk up the main stack from the current MSP
-//      for an 8-aligned base whose word[6]/word[7] look like a stacked
-//      PC/xPSR pair.  Heuristic; frame_source records the weaker pedigree.
+//   3. Bounded signature scan — observational fallback only.  A candidate must
+//      match EXC_RETURN's thread/handler return semantics and carry plausible
+//      stacked PC, LR, and xPSR values.  SCAN changes are counted but cannot
+//      latch a frame-corruption verdict in this crash-hunt build.
 //
 // Everything on the enter/exit path is scalar, allocator-free, bounded, and
 // runs from ITCM (deliberately not FLASHMEM).  Verdicts are latched to a
@@ -308,6 +484,8 @@ static constexpr uint32_t ZPNET_SENTINEL_KIND_MSP   = 0x2U;
 
 // Bounded upward scan window from the current MSP, in bytes.
 static constexpr uint32_t ZPNET_SENTINEL_SCAN_BYTES = 512U;
+static constexpr uint32_t ZPNET_SENTINEL_SCAN_MAX_EXCEPTION = 255U;
+static constexpr bool ZPNET_SENTINEL_SCAN_VERDICTS_ENABLED = false;
 
 typedef struct {
   volatile uint32_t active;
@@ -333,6 +511,7 @@ typedef struct {
   uint32_t thread_mode_passes;
   uint32_t exc_return_implausible;
   uint32_t checksum_fail;
+  uint32_t scan_change_ignored;
   uint32_t msp_mismatch;
   uint32_t lspact_consumed;
 } zpnet_sentinel_slot_t;
@@ -349,6 +528,7 @@ static uint32_t g_sentinel_frames_fpcar = 0;
 static uint32_t g_sentinel_frames_psp = 0;
 static uint32_t g_sentinel_frames_scan = 0;
 static uint32_t g_sentinel_frames_none = 0;
+static uint32_t g_sentinel_scan_changes_ignored = 0;
 static uint32_t g_sentinel_violations_this_boot = 0;
 static uint32_t g_sentinel_violations_suppressed = 0;
 static volatile bool g_sentinel_event_pending = false;
@@ -399,9 +579,22 @@ static zpnet_sentinel_violation_t g_sentinel_violation_last;
 static bool g_sentinel_violation_last_present = false;
 
 static bool sentinel_retained_valid(void) {
-  return g_sentinel_violation_retained.magic == ZPNET_SENTINEL_MAGIC &&
-         (g_sentinel_violation_retained.magic ^
-          g_sentinel_violation_retained.magic_inv) == 0xFFFFFFFFUL;
+  const bool header_valid =
+      g_sentinel_violation_retained.magic == ZPNET_SENTINEL_MAGIC &&
+      (g_sentinel_violation_retained.magic ^
+       g_sentinel_violation_retained.magic_inv) == 0xFFFFFFFFUL;
+  if (!header_valid) return false;
+
+  // Earlier builds allowed heuristic SCAN candidates to latch frame-only
+  // verdicts.  The live evidence proved those were ordinary stack reuse.
+  // Do not let a stale false verdict occupy the first-latch bank forever.
+  if (!ZPNET_SENTINEL_SCAN_VERDICTS_ENABLED &&
+      g_sentinel_violation_retained.frame_source ==
+          ZPNET_SENTINEL_FRAME_SCAN &&
+      (g_sentinel_violation_retained.kind & ZPNET_SENTINEL_KIND_MSP) == 0U) {
+    return false;
+  }
+  return true;
 }
 
 static inline uint32_t sentinel_read_msp(void) {
@@ -424,9 +617,31 @@ static inline uint32_t sentinel_read_ipsr(void) {
 
 static inline bool sentinel_pc_plausible(uint32_t pc) {
   if ((pc & 1U) != 0U) return false;
-  if (pc < 0x00080000UL) return true;                        // ITCM
+  if (pc >= 0x00000400UL && pc < 0x00080000UL) return true;  // runtime ITCM
   if (pc >= 0x60000000UL && pc < 0x61000000UL) return true;  // QSPI flash map
   return false;
+}
+
+static inline bool sentinel_exc_return_plausible(uint32_t value) {
+  return (value & 0xFFFFFF00UL) == 0xFFFFFF00UL &&
+         (value & 1U) != 0U;
+}
+
+static inline bool sentinel_stacked_lr_plausible(uint32_t lr) {
+  if (sentinel_exc_return_plausible(lr)) return true;
+  if ((lr & 1U) == 0U) return false;
+  return sentinel_pc_plausible(lr & ~1U);
+}
+
+static inline bool sentinel_stacked_xpsr_plausible(uint32_t xpsr,
+                                                    uint32_t exc_return) {
+  if ((xpsr & (1UL << 24)) == 0U) return false;
+
+  const uint32_t stacked_exception = xpsr & 0x1FFU;
+  const bool return_to_thread = (exc_return & (1UL << 3)) != 0U;
+  if (return_to_thread) return stacked_exception == 0U;
+  return stacked_exception != 0U &&
+         stacked_exception <= ZPNET_SENTINEL_SCAN_MAX_EXCEPTION;
 }
 
 static uint32_t sentinel_checksum(const uint32_t* words) {
@@ -709,7 +924,7 @@ void zpnet_sentinel_enter(uint32_t slot,
   // the authoritative context witness, so a failed capture only removes the
   // PSP strategy, never the verdict.  Counted only in handler mode; in a
   // thread-mode scope the capture is meaningless by construction.
-  const bool exc_plausible = (exc_return & 0xFFFFFF00UL) == 0xFFFFFF00UL;
+  const bool exc_plausible = sentinel_exc_return_plausible(exc_return);
   if (!exc_plausible && s->ipsr != 0U) s->exc_return_implausible++;
 
   const uint32_t dtcm_end = (uint32_t)(uintptr_t)&_estack;
@@ -744,7 +959,7 @@ void zpnet_sentinel_enter(uint32_t slot,
     //    frame level when the macro supplied it — the frames of interest sit
     //    above the caller, and this keeps the sentinel's own locals out of
     //    the scan window.
-    if (frame == 0U) {
+    if (frame == 0U && exc_plausible) {
       const uint32_t scan_from =
           (caller_sp >= 0x20000000UL && caller_sp < dtcm_end) ? caller_sp
                                                               : msp;
@@ -753,9 +968,12 @@ void zpnet_sentinel_enter(uint32_t slot,
            base + 32U <= dtcm_end && base < begin + ZPNET_SENTINEL_SCAN_BYTES;
            base += 8U) {
         const volatile uint32_t* w = (const volatile uint32_t*)(uintptr_t)base;
+        const uint32_t lr = w[5];
         const uint32_t pc = w[6];
         const uint32_t xpsr = w[7];
-        if (sentinel_pc_plausible(pc) && (xpsr & (1UL << 24)) != 0U) {
+        if (sentinel_pc_plausible(pc) &&
+            sentinel_stacked_lr_plausible(lr) &&
+            sentinel_stacked_xpsr_plausible(xpsr, exc_return)) {
           frame = base;
           source = ZPNET_SENTINEL_FRAME_SCAN;
           break;
@@ -831,8 +1049,14 @@ void zpnet_sentinel_exit(uint32_t slot, uint32_t caller_sp) {
       if (exit_words[i] != s->entry_words[i]) diff_mask |= (1U << (uint32_t)i);
     }
     if (diff_mask != 0U) {
-      kind |= ZPNET_SENTINEL_KIND_FRAME;
-      s->checksum_fail++;
+      if (s->frame_source == ZPNET_SENTINEL_FRAME_SCAN &&
+          !ZPNET_SENTINEL_SCAN_VERDICTS_ENABLED) {
+        s->scan_change_ignored++;
+        g_sentinel_scan_changes_ignored++;
+      } else {
+        kind |= ZPNET_SENTINEL_KIND_FRAME;
+        s->checksum_fail++;
+      }
     }
   }
 
@@ -1526,6 +1750,84 @@ static FLASHMEM Payload system_sentinel_beacon_payload(
   return out;
 }
 
+static const char* runtime_foreground_phase_name(uint32_t phase) {
+  switch ((zpnet_foreground_phase_t)phase) {
+    case zpnet_foreground_phase_t::TRANSPORT_PRE:    return "TRANSPORT_PRE";
+    case zpnet_foreground_phase_t::TIMEPOP_DISPATCH: return "TIMEPOP_DISPATCH";
+    case zpnet_foreground_phase_t::TRANSPORT_POST:   return "TRANSPORT_POST";
+    default:                                         return "NONE";
+  }
+}
+
+static const char* runtime_cpu_usage_state_name(uint32_t state) {
+  return state == ZPNET_CPU_USAGE_STATE_ACTIVE ? "ACTIVE" : "IDLE";
+}
+
+static const char* runtime_cpu_usage_stage_name(uint32_t stage) {
+  switch ((zpnet_cpu_usage_stage_t)stage) {
+    case zpnet_cpu_usage_stage_t::CALLBACK_ENTER:
+      return "CALLBACK_ENTER";
+    case zpnet_cpu_usage_stage_t::DWT_READ_COMPLETE:
+      return "DWT_READ_COMPLETE";
+    case zpnet_cpu_usage_stage_t::BUSY_READ_COMPLETE:
+      return "BUSY_READ_COMPLETE";
+    case zpnet_cpu_usage_stage_t::MILLIS_COMPLETE:
+      return "MILLIS_COMPLETE";
+    case zpnet_cpu_usage_stage_t::CALLBACK_EXIT:
+      return "CALLBACK_EXIT";
+    default:
+      return "IDLE";
+  }
+}
+
+static FLASHMEM Payload system_runtime_ledger_bank_payload(
+    const zpnet_runtime_ledger_t* ledger) {
+  Payload out;
+  const bool header_valid = runtime_ledger_header_valid(ledger);
+  const bool foreground_valid = runtime_ledger_foreground_valid(ledger);
+  const bool cpu_usage_valid = runtime_ledger_cpu_usage_valid(ledger);
+
+  out.add("header_valid", header_valid);
+  out.add("foreground_valid", foreground_valid);
+  out.add("cpu_usage_valid", cpu_usage_valid);
+  if (!header_valid) return out;
+
+  out.add("foreground_sequence", ledger->foreground_sequence);
+  out.add("foreground_phase_id", ledger->foreground_phase);
+  out.add("foreground_phase",
+          runtime_foreground_phase_name(ledger->foreground_phase));
+  out.add("cpu_usage_sequence", ledger->cpu_usage_sequence);
+  out.add("cpu_usage_state_id", ledger->cpu_usage_state);
+  out.add("cpu_usage_state",
+          runtime_cpu_usage_state_name(ledger->cpu_usage_state));
+  out.add("cpu_usage_stage_id", ledger->cpu_usage_stage);
+  out.add("cpu_usage_stage",
+          runtime_cpu_usage_stage_name(ledger->cpu_usage_stage));
+  out.add("cpu_usage_stage_value", ledger->cpu_usage_stage_value);
+  out.add("cpu_usage_foreground_sequence",
+          ledger->cpu_usage_foreground_sequence);
+  out.add("cpu_usage_foreground_phase_id",
+          ledger->cpu_usage_foreground_phase);
+  out.add("cpu_usage_foreground_phase",
+          runtime_foreground_phase_name(ledger->cpu_usage_foreground_phase));
+  out.add("cpu_usage_ipsr", ledger->cpu_usage_ipsr);
+  return out;
+}
+
+static FLASHMEM Payload system_runtime_ledger_payload(void) {
+  runtime_ledger_boot_latch();
+
+  Payload out;
+  out.add("schema", "ZPNET_RUNTIME_LEDGER_V1");
+  out.add("cpu_usage_focus_active_now",
+          (bool)g_zpnet_sentinel_cpu_usage_focus_active);
+  out.add_object("live",
+                 system_runtime_ledger_bank_payload(&g_runtime_ledger));
+  out.add_object("retained",
+                 system_runtime_ledger_bank_payload(&g_runtime_ledger_retained));
+  return out;
+}
+
 static FLASHMEM Payload system_sentinel_payload(void) {
   Payload out;
   out.add("schema", "ZPNET_SENTINEL_V1");
@@ -1539,6 +1841,8 @@ static FLASHMEM Payload system_sentinel_payload(void) {
   out.add("frames_psp", g_sentinel_frames_psp);
   out.add("frames_scan", g_sentinel_frames_scan);
   out.add("frames_none", g_sentinel_frames_none);
+  out.add("scan_verdicts_enabled", ZPNET_SENTINEL_SCAN_VERDICTS_ENABLED);
+  out.add("scan_changes_ignored", g_sentinel_scan_changes_ignored);
   out.add("violations_this_boot", g_sentinel_violations_this_boot);
   out.add("violations_suppressed", g_sentinel_violations_suppressed);
   out.add("event_pending", (bool)g_sentinel_event_pending);
@@ -1568,6 +1872,7 @@ static FLASHMEM Payload system_sentinel_payload(void) {
     slot.add("thread_mode_passes", s->thread_mode_passes);
     slot.add("exc_return_implausible", s->exc_return_implausible);
     slot.add("checksum_fail", s->checksum_fail);
+    slot.add("scan_change_ignored", s->scan_change_ignored);
     slot.add("msp_mismatch", s->msp_mismatch);
     slot.add("lspact_consumed", s->lspact_consumed);
     slots.add(slot);
@@ -1594,6 +1899,7 @@ static FLASHMEM Payload system_sentinel_payload(void) {
                  system_sentinel_violation_payload(
                      &g_sentinel_violation_retained,
                      sentinel_retained_valid()));
+  out.add_object("runtime_ledger", system_runtime_ledger_payload());
   return out;
 }
 
@@ -1751,6 +2057,7 @@ static FLASHMEM Payload system_crash_report_payload(bool include_text) {
                system_sentinel_beacon_payload(
                    &g_sentinel_beacon_retained,
                    sentinel_beacon_valid(&g_sentinel_beacon_retained)));
+  p.add_object("runtime_ledger", system_runtime_ledger_payload());
   p.add_object("payload_flight", system_payload_flight_payload(true));
   return p;
 }
@@ -2466,6 +2773,7 @@ static void system_dmamem_ensure_initialized(void) {
   // initialize every SYSTEM RAM2 object before early CLOCKS/INTERRUPT feature
   // publishers inspect the registry.  This function is intentionally lazy
   // because those publishers run before process_system_register().
+  runtime_ledger_boot_latch();
   g_system_memory_watchdog_health = memory_health_t{};
   system_feature_registry_reset();
   memset(g_system_crash_report_text, 0, sizeof(g_system_crash_report_text));
@@ -2474,10 +2782,10 @@ static void system_dmamem_ensure_initialized(void) {
 
   // crash_forensics.cpp owns its retained RAM2 record.  Never initialize or
   // clear that record here; it may be the only surviving witness to a reboot.
-  // The same custody applies to g_sentinel_violation_retained and to the
-  // Payload flight rings in payload.cpp: all are NOLOAD retained evidence,
-  // validated by magic+complement and released only by explicit CRASH_CLEAR
-  // (sentinel) or the per-boot latch (flight rings).
+  // The same custody applies to g_sentinel_violation_retained, the runtime
+  // ledger pair, and the Payload flight rings in payload.cpp: all are NOLOAD
+  // retained evidence, validated before use and released only by explicit
+  // CRASH_CLEAR or their one-time per-boot latch.
   g_system_dmamem_initialized = true;
 }
 
@@ -2822,10 +3130,16 @@ static FLASHMEM Payload cmd_crash_clear(const Payload& /*args*/) {
   g_sentinel_violation_last_present = false;
   g_sentinel_event_pending = false;
 
+  memset((void*)&g_runtime_ledger_retained, 0,
+         sizeof(g_runtime_ledger_retained));
+  arm_dcache_flush((void*)&g_runtime_ledger_retained,
+                   sizeof(g_runtime_ledger_retained));
+
   Payload resp = ok_payload();
   resp.add("crash_report_cleared", true);
   resp.add("crash_forensics_cleared", true);
   resp.add("sentinel_cleared", true);
+  resp.add("runtime_ledger_cleared", true);
   return resp;
 }
 
