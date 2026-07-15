@@ -117,6 +117,15 @@
 //   never changes compare scheduling and never applies to ASAP/ALAP. Existing
 //   callers use TIMEPOP_PRIORITY_DEFAULT and retain stable slot-index order.
 //
+//   Name ownership:
+//
+//   TimePop copies every accepted name into fixed internal storage before an
+//   arm operation returns.  Timed slots never retain caller pointers.  Each
+//   deferred mailbox has separate owned pending and dispatching name buffers,
+//   because a callback may re-arm the same mailbox while the prior request is
+//   still executing.  Names longer than 63 characters are rejected rather
+//   than truncated.
+//
 // ============================================================================
 
 #pragma once

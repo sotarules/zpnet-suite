@@ -114,7 +114,7 @@ static constexpr uint32_t MAX_SLOTS = 16;
 static constexpr uint32_t MAX_ASAP_SLOTS = 8;
 static constexpr uint32_t MAX_ALAP_SLOTS = 4;
 static constexpr uint32_t MAX_DISPATCH_MUTATIONS = 24;
-static constexpr uint32_t MAX_DISPATCH_NAME = 63;
+static constexpr uint32_t MAX_TIMEPOP_NAME = 63;
 static constexpr bool     TIMEPOP_IDLE_DWT_WITNESS_ENABLED = true;
 static constexpr uint64_t NS_PER_TICK = 100ULL;
 static constexpr uint32_t MAX_DELAY_TICKS = 0x7FFFFFFFU;
@@ -142,6 +142,39 @@ static constexpr const char* WITNESS_SCHEDULER_NAME = "WITNESS_SCHEDULER";
 // handoff context.  TimePop therefore processes CH2 event facts directly; it
 // does not own a private scheduler IRQ or second CH2 queue.
 static constexpr const char* TIMEPOP_CH2_SERVICE_CONTEXT = "PROCESS_INTERRUPT_HANDOFF_DIRECT";
+
+// Every accepted TimePop name is copied into fixed TimePop-owned storage.
+// Empty / null names remain unnamed.  Names longer than MAX_TIMEPOP_NAME are
+// rejected rather than truncated so singleton replacement and cancellation
+// cannot acquire ambiguous identities.
+static bool timepop_copy_name(char* destination, const char* source) {
+  if (!source || !*source) {
+    destination[0] = '\0';
+    return true;
+  }
+
+  size_t length = 0;
+  while (length <= MAX_TIMEPOP_NAME && source[length] != '\0') {
+    length++;
+  }
+  if (length > MAX_TIMEPOP_NAME) {
+    destination[0] = '\0';
+    return false;
+  }
+
+  memmove(destination, source, length + 1U);
+  return true;
+}
+
+static inline void timepop_copy_owned_name(char* destination,
+                                           const char* source) {
+  memcpy(destination, source, MAX_TIMEPOP_NAME + 1U);
+  destination[MAX_TIMEPOP_NAME] = '\0';
+}
+
+static inline const char* timepop_name_or_null(const char* name) {
+  return (name && name[0]) ? name : nullptr;
+}
 
 
 // ============================================================================
@@ -232,8 +265,7 @@ struct timepop_slot_t {
 
   timepop_callback_t  callback;
   void*               user_data;
-  const char*         name;
-  char                queued_name[MAX_DISPATCH_NAME + 1];
+  char                name[MAX_TIMEPOP_NAME + 1];
 
   // Timed-slot service priority. Lower numeric value runs first when multiple
   // slots share the same captured CH2 fire fact. This never affects compare
@@ -313,10 +345,12 @@ struct deferred_slot_t {
   timepop_handle_t    handle;          // pending request handle
   timepop_callback_t  callback;        // pending request callback
   void*               user_data;       // pending request user data
-  const char*         name;            // pending request name
+  char                name[MAX_TIMEPOP_NAME + 1];
 
+  // The running callback and a newly re-armed pending callback may coexist in
+  // this mailbox.  Keep their identities in independent owned buffers.
   timepop_handle_t    dispatch_handle; // currently-running request handle
-  const char*         dispatch_name;   // currently-running request name
+  char                dispatch_name[MAX_TIMEPOP_NAME + 1];
   uint32_t            generation;
 };
 
@@ -400,7 +434,7 @@ struct timepop_dispatch_mutation_t {
   bool rearm_in_isr = false;
   timepop_callback_t callback = nullptr;
   void* user_data = nullptr;
-  char name[MAX_DISPATCH_NAME + 1] = {};
+  char name[MAX_TIMEPOP_NAME + 1] = {};
   timepop_priority_t priority = TIMEPOP_PRIORITY_DEFAULT;
   timepop_dispatch_phase_t queued_phase = timepop_dispatch_phase_t::IDLE;
 };
@@ -695,13 +729,14 @@ static volatile uint32_t diag_asap_slots_high_water   = 0;
 static volatile uint32_t diag_alap_slots_high_water   = 0;
 static volatile uint32_t diag_arm_failures            = 0;
 static volatile uint32_t diag_named_replacements      = 0;
+static volatile uint32_t diag_name_too_long           = 0;
 
 static volatile uint32_t diag_asap_armed              = 0;
 static volatile uint32_t diag_asap_dispatched         = 0;
 static volatile uint32_t diag_asap_arm_failures       = 0;
 static volatile uint32_t diag_asap_last_armed_dwt     = 0;
 static volatile uint32_t diag_asap_last_dispatch_dwt  = 0;
-static volatile const char* diag_asap_last_armed_name = nullptr;
+static char              diag_asap_last_armed_name[MAX_TIMEPOP_NAME + 1] = {};
 static volatile uint32_t diag_asap_replacements       = 0;
 static volatile uint32_t diag_asap_cancelled          = 0;
 static volatile uint32_t diag_asap_arm_while_dispatching = 0;
@@ -711,7 +746,7 @@ static volatile uint32_t diag_alap_dispatched         = 0;
 static volatile uint32_t diag_alap_arm_failures       = 0;
 static volatile uint32_t diag_alap_last_armed_dwt     = 0;
 static volatile uint32_t diag_alap_last_dispatch_dwt  = 0;
-static volatile const char* diag_alap_last_armed_name = nullptr;
+static char              diag_alap_last_armed_name[MAX_TIMEPOP_NAME + 1] = {};
 static volatile uint32_t diag_alap_replacements       = 0;
 static volatile uint32_t diag_alap_cancelled          = 0;
 static volatile uint32_t diag_alap_arm_while_dispatching = 0;
@@ -775,7 +810,7 @@ static volatile uint32_t diag_schedule_next_invalid_time_count = 0;
 static volatile uint32_t diag_schedule_next_too_close_max_ticks = 0;
 static volatile uint32_t diag_schedule_next_passed_late_max_ticks = 0;
 static volatile const char* diag_schedule_next_last_pressure_source = nullptr;
-static volatile const char* diag_schedule_next_last_pressure_name = nullptr;
+static char              diag_schedule_next_last_pressure_name[MAX_TIMEPOP_NAME + 1] = {};
 static volatile uint32_t diag_schedule_next_last_pressure_deadline = 0;
 static volatile uint32_t diag_schedule_next_last_pressure_now = 0;
 static volatile uint32_t diag_schedule_next_last_pressure_distance_ticks = 0;
@@ -790,7 +825,7 @@ static volatile uint32_t diag_timed_dispatch_latency_max_cycles = 0;
 static volatile uint64_t diag_timed_dispatch_latency_cycles_sum = 0;
 static volatile uint32_t diag_timed_dispatch_callback_body_last_cycles = 0;
 static volatile uint32_t diag_timed_dispatch_callback_body_max_cycles = 0;
-static volatile const char* diag_timed_dispatch_last_name = nullptr;
+static char              diag_timed_dispatch_last_name[MAX_TIMEPOP_NAME + 1] = {};
 
 // CH2 scheduler-entry diagnostics.
 //
@@ -811,7 +846,7 @@ static volatile uint32_t diag_schedule_next_expired_slots = 0;
 static volatile uint32_t diag_schedule_next_late_max_ticks = 0;
 static volatile uint32_t diag_schedule_next_last_expired_slot = UINT32_MAX;
 static volatile uint32_t diag_schedule_next_last_expired_handle = 0;
-static volatile const char* diag_schedule_next_last_expired_name = nullptr;
+static char              diag_schedule_next_last_expired_name[MAX_TIMEPOP_NAME + 1] = {};
 static volatile uint32_t diag_schedule_next_last_expired_deadline = 0;
 static volatile uint32_t diag_schedule_next_last_expired_now = 0;
 static volatile uint32_t diag_schedule_next_last_expired_late_ticks = 0;
@@ -829,7 +864,7 @@ static volatile uint32_t diag_missed_deadline_too_close_count = 0;
 static volatile uint32_t diag_missed_deadline_late_max_ticks = 0;
 static volatile uint32_t diag_missed_deadline_last_slot = UINT32_MAX;
 static volatile uint32_t diag_missed_deadline_last_handle = 0;
-static volatile const char* diag_missed_deadline_last_name = nullptr;
+static char              diag_missed_deadline_last_name[MAX_TIMEPOP_NAME + 1] = {};
 static volatile const char* diag_missed_deadline_last_source = nullptr;
 static volatile uint32_t diag_missed_deadline_last_deadline = 0;
 static volatile uint32_t diag_missed_deadline_last_now = 0;
@@ -841,7 +876,7 @@ static volatile uint32_t diag_missed_deadline_last_dwt = 0;
 static volatile uint32_t diag_arm_already_past_count = 0;
 static volatile uint32_t diag_arm_last_slot = UINT32_MAX;
 static volatile uint32_t diag_arm_last_handle = 0;
-static volatile const char* diag_arm_last_name = nullptr;
+static char              diag_arm_last_name[MAX_TIMEPOP_NAME + 1] = {};
 static volatile const char* diag_arm_last_source = nullptr;
 static volatile uint32_t diag_arm_last_now = 0;
 static volatile uint32_t diag_arm_last_deadline = 0;
@@ -1218,21 +1253,12 @@ static bool dispatch_mutation_is_arm(timepop_dispatch_mutation_kind_t kind) {
 
 static bool dispatch_mutation_copy_name(timepop_dispatch_mutation_t& m,
                                         const char* name) {
-  m.name[0] = '\0';
-  if (!name || !*name) return true;
-
-  size_t length = 0;
-  while (length <= MAX_DISPATCH_NAME && name[length] != '\0') {
-    length++;
-  }
-
-  if (length > MAX_DISPATCH_NAME) {
+  if (!timepop_copy_name(m.name, name)) {
     diag_dispatch_mutation_name_too_long++;
+    diag_name_too_long++;
     return false;
   }
-
-  memcpy(m.name, name, length + 1U);
-  diag_dispatch_mutation_name_copies++;
+  if (m.name[0]) diag_dispatch_mutation_name_copies++;
   return true;
 }
 
@@ -1818,8 +1844,8 @@ static inline bool deferred_entry_occupied(const deferred_slot_t& slot) {
 static inline bool deferred_name_equals(const deferred_slot_t& slot,
                                         const char* name) {
   if (!name || !*name) return false;
-  if (slot.pending && slot.name && strcmp(slot.name, name) == 0) return true;
-  if (slot.dispatching && slot.dispatch_name &&
+  if (slot.pending && slot.name[0] && strcmp(slot.name, name) == 0) return true;
+  if (slot.dispatching && slot.dispatch_name[0] &&
       strcmp(slot.dispatch_name, name) == 0) return true;
   return false;
 }
@@ -1829,9 +1855,9 @@ static inline void deferred_clear_if_idle(deferred_slot_t& slot) {
   slot.handle = TIMEPOP_INVALID_HANDLE;
   slot.callback = nullptr;
   slot.user_data = nullptr;
-  slot.name = nullptr;
+  slot.name[0] = '\0';
   slot.dispatch_handle = TIMEPOP_INVALID_HANDLE;
-  slot.dispatch_name = nullptr;
+  slot.dispatch_name[0] = '\0';
 }
 
 static inline timepop_handle_t allocate_handle_unlocked(void) {
@@ -1883,7 +1909,7 @@ static uint32_t deferred_cancel_pending_by_name_unlocked(deferred_slot_t* slots_
 
   uint32_t cancelled = 0;
   for (uint32_t i = 0; i < max_slots; i++) {
-    if (!slots_buf[i].pending || !slots_buf[i].name) continue;
+    if (!slots_buf[i].pending || !slots_buf[i].name[0]) continue;
     if (strcmp(slots_buf[i].name, name) != 0) continue;
 
     slots_buf[i].pending = false;
@@ -2175,7 +2201,7 @@ static void record_slot_arm_diag(timepop_slot_t& slot,
 
   diag_arm_last_slot = slot_index_for(slot);
   diag_arm_last_handle = slot.handle;
-  diag_arm_last_name = slot.name;
+  timepop_copy_owned_name(diag_arm_last_name, slot.name);
   diag_arm_last_source = arm_source_str(source);
   diag_arm_last_now = slot.last_arm_now;
   diag_arm_last_deadline = slot.last_arm_deadline;
@@ -2187,21 +2213,8 @@ static void record_slot_arm_diag(timepop_slot_t& slot,
   if (already_past) diag_arm_already_past_count++;
 }
 
-static inline void slot_set_name(timepop_slot_t& slot,
-                                 const char* name,
-                                 bool copy_queued_name) {
-  slot.name = name;
-  if (!copy_queued_name || !name) return;
-
-  // Queued names arrive from timepop_dispatch_mutation_t::name, which is
-  // exactly this size and was NUL-terminated before queue insertion.
-  memcpy(slot.queued_name, name, sizeof(slot.queued_name));
-  slot.queued_name[MAX_DISPATCH_NAME] = '\0';
-  slot.name = slot.queued_name;
-}
-
 static inline bool slot_name_equals(const timepop_slot_t& slot, const char* name) {
-  return slot.name && name && strcmp(slot.name, name) == 0;
+  return slot.active && slot.name[0] && name && strcmp(slot.name, name) == 0;
 }
 
 static inline bool slot_is_one_hz_recurring(const timepop_slot_t& slot) {
@@ -2462,7 +2475,7 @@ static bool timepop_quarantine_missed_deadline(timepop_slot_t& slot,
   update_max_u32(diag_missed_deadline_late_max_ticks, late_ticks);
   diag_missed_deadline_last_slot = idx;
   diag_missed_deadline_last_handle = slot.handle;
-  diag_missed_deadline_last_name = slot.name;
+  timepop_copy_owned_name(diag_missed_deadline_last_name, slot.name);
   diag_missed_deadline_last_source = source;
   diag_missed_deadline_last_deadline = old_deadline;
   diag_missed_deadline_last_now = now;
@@ -2662,7 +2675,7 @@ static bool retire_existing_named_slots(const char* name) {
 
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
     if (!slots[i].active) continue;
-    if (!slots[i].name) continue;
+    if (!slots[i].name[0]) continue;
     if (strcmp(slots[i].name, name) != 0) continue;
 
     slots[i].active = false;
@@ -2755,7 +2768,7 @@ static void schedule_next(void) {
         !slots[i].recurring_base_counter32_fixed) {
       diag_schedule_next_invalid_time_count++;
       diag_schedule_next_last_pressure_source = "schedule_next_invalid_time";
-      diag_schedule_next_last_pressure_name = slots[i].name;
+      timepop_copy_owned_name(diag_schedule_next_last_pressure_name, slots[i].name);
       diag_schedule_next_last_pressure_deadline = slots[i].deadline;
       diag_schedule_next_last_pressure_now = now;
       diag_schedule_next_last_pressure_distance_ticks = slots[i].deadline - now;
@@ -2804,7 +2817,7 @@ static void schedule_next(void) {
       }
 
       diag_schedule_next_last_pressure_source = pressure_source;
-      diag_schedule_next_last_pressure_name = slots[i].name;
+      timepop_copy_owned_name(diag_schedule_next_last_pressure_name, slots[i].name);
       diag_schedule_next_last_pressure_deadline = slots[i].deadline;
       diag_schedule_next_last_pressure_now = now;
       diag_schedule_next_last_pressure_distance_ticks = pressure_distance;
@@ -2816,7 +2829,7 @@ static void schedule_next(void) {
         update_max_u32(diag_schedule_next_late_max_ticks, late_ticks);
         diag_schedule_next_last_expired_slot = i;
         diag_schedule_next_last_expired_handle = slots[i].handle;
-        diag_schedule_next_last_expired_name = slots[i].name;
+        timepop_copy_owned_name(diag_schedule_next_last_expired_name, slots[i].name);
         diag_schedule_next_last_expired_deadline = slots[i].deadline;
         diag_schedule_next_last_expired_now = now;
         diag_schedule_next_last_expired_late_ticks = late_ticks;
@@ -3036,14 +3049,16 @@ static void timepop_process_ch2_event_in_scheduler_irq(const interrupt_event_t& 
   uint32_t audit_witness_late_ticks = 0;
 
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
+    if (!slots[i].active) continue;
+
     if (slot_name_equals(slots[i], WITNESS_SCHEDULER_NAME)) {
       audit_witness_seen = true;
       audit_witness_slot = i;
       audit_witness_handle = slots[i].handle;
-      audit_witness_active = slots[i].active;
+      audit_witness_active = true;
       audit_witness_expired_before = slots[i].expired;
       audit_witness_deadline = slots[i].deadline;
-      if (slots[i].active && !slots[i].expired) {
+      if (!slots[i].expired) {
         audit_witness_reached_before = (slots[i].deadline == now);
         audit_witness_passed_before = deadline_passed(slots[i].deadline, now);
         if (audit_witness_passed_before) {
@@ -3206,7 +3221,7 @@ static void timepop_process_ch2_event_in_scheduler_irq(const interrupt_event_t& 
 
     const timepop_callback_t callback = slots[i].callback;
     void* const callback_user_data = slots[i].user_data;
-    const char* const callback_name = slots[i].name;
+    const char* const callback_name = timepop_name_or_null(slots[i].name);
     const timepop_handle_t callback_handle = slots[i].handle;
 
     TIMEPOP_DISPATCH_TRACE(
@@ -3346,7 +3361,6 @@ static void dispatch_deferred_phase(deferred_slot_t* slots_buf,
     timepop_callback_t callback = nullptr;
     void* user_data = nullptr;
     timepop_handle_t handle = TIMEPOP_INVALID_HANDLE;
-    const char* name = nullptr;
     uint32_t generation = 0U;
 
     {
@@ -3355,18 +3369,19 @@ static void dispatch_deferred_phase(deferred_slot_t* slots_buf,
         callback = slots_buf[i].callback;
         user_data = slots_buf[i].user_data;
         handle = slots_buf[i].handle;
-        name = slots_buf[i].name;
         generation = slots_buf[i].generation;
 
         slots_buf[i].pending = false;
         slots_buf[i].dispatching = true;
         slots_buf[i].dispatch_handle = handle;
-        slots_buf[i].dispatch_name = name;
+        timepop_copy_owned_name(slots_buf[i].dispatch_name, slots_buf[i].name);
+        slots_buf[i].name[0] = '\0';
       }
       critical_exit(saved);
     }
 
     if (!callback || handle == TIMEPOP_INVALID_HANDLE) continue;
+    const char* const name = timepop_name_or_null(slots_buf[i].dispatch_name);
 
     TIMEPOP_DISPATCH_TRACE(
         timepop_dispatch_trace_stage_t::DEFERRED_SELECTED,
@@ -3421,7 +3436,7 @@ static void dispatch_deferred_phase(deferred_slot_t* slots_buf,
           slots_buf[i].dispatch_handle == handle) {
         slots_buf[i].dispatching = false;
         slots_buf[i].dispatch_handle = TIMEPOP_INVALID_HANDLE;
-        slots_buf[i].dispatch_name = nullptr;
+        slots_buf[i].dispatch_name[0] = '\0';
       }
       if (!slots_buf[i].pending && !slots_buf[i].dispatching) {
         deferred_clear_if_idle(slots_buf[i]);
@@ -3453,7 +3468,7 @@ static timepop_handle_t arm_deferred(deferred_slot_t* slots_buf,
                                      volatile uint32_t& arm_failures,
                                      volatile uint32_t& armed_count,
                                      volatile uint32_t& last_armed_dwt,
-                                     volatile const char*& last_armed_name,
+                                     char* last_armed_name,
                                      volatile uint32_t& high_water,
                                      volatile uint32_t& replacements,
                                      volatile uint32_t& other_cancelled_count,
@@ -3463,33 +3478,43 @@ static timepop_handle_t arm_deferred(deferred_slot_t* slots_buf,
                                      const char* name) {
   if (!callback) return TIMEPOP_INVALID_HANDLE;
 
+  char owned_name[MAX_TIMEPOP_NAME + 1] = {};
+  if (!timepop_copy_name(owned_name, name)) {
+    const uint32_t saved = critical_enter();
+    arm_failures++;
+    diag_name_too_long++;
+    critical_exit(saved);
+    return TIMEPOP_INVALID_HANDLE;
+  }
+  const char* const owned_name_ptr = timepop_name_or_null(owned_name);
+
   const uint32_t saved = critical_enter();
 
   // Deferred callbacks are intentionally not timed slots.  Arming ASAP/ALAP
   // from ISR context must not mutate the timed slot table and must not call
   // schedule_next().  Named replacement is therefore restricted to the
   // dedicated deferred lanes.
-  if (name && *name && other_slots_buf && other_max_slots > 0) {
+  if (owned_name_ptr && other_slots_buf && other_max_slots > 0) {
     const uint32_t cancelled =
         deferred_cancel_pending_by_name_unlocked(other_slots_buf,
                                                  other_max_slots,
-                                                 name,
+                                                 owned_name_ptr,
                                                  other_cancelled_count);
     if (cancelled != 0) {
-      for (uint32_t i = 0; i < cancelled; i++) note_named_replacement(name);
+      for (uint32_t i = 0; i < cancelled; i++) note_named_replacement(owned_name_ptr);
     }
   }
 
-  if (name && *name) {
+  if (owned_name_ptr) {
     for (uint32_t i = 0; i < max_slots; i++) {
-      if (!deferred_name_equals(slots_buf[i], name)) continue;
+      if (!deferred_name_equals(slots_buf[i], owned_name_ptr)) continue;
 
       const timepop_handle_t h = allocate_handle_unlocked();
       slots_buf[i].pending = true;
       slots_buf[i].handle = h;
       slots_buf[i].callback = callback;
       slots_buf[i].user_data = user_data;
-      slots_buf[i].name = name;
+      timepop_copy_owned_name(slots_buf[i].name, owned_name);
       slots_buf[i].generation++;
 
       if (slots_buf[i].dispatching) {
@@ -3497,12 +3522,12 @@ static timepop_handle_t arm_deferred(deferred_slot_t* slots_buf,
       } else {
         replacements++;
       }
-      note_named_replacement(name);
+      note_named_replacement(owned_name_ptr);
 
       timepop_pending = true;
       armed_count++;
       last_armed_dwt = ARM_DWT_CYCCNT;
-      last_armed_name = name;
+      timepop_copy_owned_name(last_armed_name, owned_name);
       update_deferred_high_water(slots_buf, max_slots, high_water);
 
       critical_exit(saved);
@@ -3520,13 +3545,13 @@ static timepop_handle_t arm_deferred(deferred_slot_t* slots_buf,
     slots_buf[i].handle = h;
     slots_buf[i].callback = callback;
     slots_buf[i].user_data = user_data;
-    slots_buf[i].name = name;
+    timepop_copy_owned_name(slots_buf[i].name, owned_name);
     slots_buf[i].generation = 1;
 
     timepop_pending = true;
     armed_count++;
     last_armed_dwt = ARM_DWT_CYCCNT;
-    last_armed_name = name;
+    timepop_copy_owned_name(last_armed_name, owned_name);
 
     update_deferred_high_water(slots_buf, max_slots, high_water);
 
@@ -3586,7 +3611,7 @@ void timepop_init(void) {
   diag_asap_arm_failures = 0;
   diag_asap_last_armed_dwt = 0;
   diag_asap_last_dispatch_dwt = 0;
-  diag_asap_last_armed_name = nullptr;
+  diag_asap_last_armed_name[0] = '\0';
   diag_asap_replacements = 0;
   diag_asap_cancelled = 0;
   diag_asap_arm_while_dispatching = 0;
@@ -3596,10 +3621,12 @@ void timepop_init(void) {
   diag_alap_arm_failures = 0;
   diag_alap_last_armed_dwt = 0;
   diag_alap_last_dispatch_dwt = 0;
-  diag_alap_last_armed_name = nullptr;
+  diag_alap_last_armed_name[0] = '\0';
   diag_alap_replacements = 0;
   diag_alap_cancelled = 0;
   diag_alap_arm_while_dispatching = 0;
+
+  diag_name_too_long = 0;
 
   diag_dispatch_depth_max = 0;
   diag_dispatch_mutation_queued = 0;
@@ -3637,7 +3664,7 @@ void timepop_init(void) {
   diag_schedule_next_too_close_max_ticks = 0;
   diag_schedule_next_passed_late_max_ticks = 0;
   diag_schedule_next_last_pressure_source = nullptr;
-  diag_schedule_next_last_pressure_name = nullptr;
+  diag_schedule_next_last_pressure_name[0] = '\0';
   diag_schedule_next_last_pressure_deadline = 0;
   diag_schedule_next_last_pressure_now = 0;
   diag_schedule_next_last_pressure_distance_ticks = 0;
@@ -3649,7 +3676,11 @@ void timepop_init(void) {
   diag_timed_dispatch_latency_cycles_sum = 0;
   diag_timed_dispatch_callback_body_last_cycles = 0;
   diag_timed_dispatch_callback_body_max_cycles = 0;
-  diag_timed_dispatch_last_name = nullptr;
+  diag_timed_dispatch_last_name[0] = '\0';
+
+  diag_schedule_next_last_expired_name[0] = '\0';
+  diag_missed_deadline_last_name[0] = '\0';
+  diag_arm_last_name[0] = '\0';
 
   diag_deadline_negative_offset = 0;
   diag_deadline_last_target_gnss_ns = -1;
@@ -3721,6 +3752,14 @@ static timepop_handle_t arm_absolute_slot_internal(
   if (!callback) return TIMEPOP_INVALID_HANDLE;
   if (target_gnss_ns <= 0) return TIMEPOP_INVALID_HANDLE;
 
+  char owned_name[MAX_TIMEPOP_NAME + 1] = {};
+  if (!timepop_copy_name(owned_name, name)) {
+    diag_arm_failures++;
+    diag_name_too_long++;
+    return TIMEPOP_INVALID_HANDLE;
+  }
+  const char* const owned_name_ptr = timepop_name_or_null(owned_name);
+
   const time_anchor_snapshot_t snap =
       timepop_anchor_snapshot("arm_absolute");
   uint32_t deadline = 0;
@@ -3730,7 +3769,7 @@ static timepop_handle_t arm_absolute_slot_internal(
 
   const uint32_t saved = critical_enter();
 
-  const bool retired_named = retire_existing_named_slots(name);
+  const bool retired_named = retire_existing_named_slots(owned_name_ptr);
   if (retired_named) {
     diag_schedule_next_calls_from_other++;
     schedule_next();
@@ -3760,7 +3799,7 @@ static timepop_handle_t arm_absolute_slot_internal(
     slots[i].target_gnss_ns = target_gnss_ns;
     slots[i].callback       = callback;
     slots[i].user_data      = user_data;
-    slot_set_name(slots[i], name, forced_handle != TIMEPOP_INVALID_HANDLE);
+    timepop_copy_owned_name(slots[i].name, owned_name);
     slots[i].priority       = priority;
     slots[i].fire_gnss_ns   = -1;
     slots[i].isr_callback   = isr_callback;
@@ -3822,9 +3861,17 @@ static timepop_handle_t arm_anchored_recurring_isr_internal(
   if (base_gnss_ns <= 0) return TIMEPOP_INVALID_HANDLE;
   if (period_gnss_ns == 0) return TIMEPOP_INVALID_HANDLE;
 
+  char owned_name[MAX_TIMEPOP_NAME + 1] = {};
+  if (!timepop_copy_name(owned_name, name)) {
+    diag_arm_failures++;
+    diag_name_too_long++;
+    return TIMEPOP_INVALID_HANDLE;
+  }
+  const char* const owned_name_ptr = timepop_name_or_null(owned_name);
+
   const uint32_t saved = critical_enter();
 
-  const bool retired_named = retire_existing_named_slots(name);
+  const bool retired_named = retire_existing_named_slots(owned_name_ptr);
   if (retired_named) {
     diag_schedule_next_calls_from_other++;
     schedule_next();
@@ -3845,7 +3892,7 @@ static timepop_handle_t arm_anchored_recurring_isr_internal(
     slots[i].handle = h;
     slots[i].callback = callback;
     slots[i].user_data = user_data;
-    slot_set_name(slots[i], name, forced_handle != TIMEPOP_INVALID_HANDLE);
+    timepop_copy_owned_name(slots[i].name, owned_name);
     slots[i].priority = priority;
     slots[i].fire_gnss_ns = -1;
     slots[i].isr_callback = true;
@@ -3891,9 +3938,17 @@ static timepop_handle_t arm_anchored_recurring_isr_from_counter32_internal(
   if (base_gnss_ns <= 0) return TIMEPOP_INVALID_HANDLE;
   if (period_gnss_ns == 0) return TIMEPOP_INVALID_HANDLE;
 
+  char owned_name[MAX_TIMEPOP_NAME + 1] = {};
+  if (!timepop_copy_name(owned_name, name)) {
+    diag_arm_failures++;
+    diag_name_too_long++;
+    return TIMEPOP_INVALID_HANDLE;
+  }
+  const char* const owned_name_ptr = timepop_name_or_null(owned_name);
+
   const uint32_t saved = critical_enter();
 
-  const bool retired_named = retire_existing_named_slots(name);
+  const bool retired_named = retire_existing_named_slots(owned_name_ptr);
   if (retired_named) {
     diag_schedule_next_calls_from_other++;
     schedule_next();
@@ -3914,7 +3969,7 @@ static timepop_handle_t arm_anchored_recurring_isr_from_counter32_internal(
     slots[i].handle = h;
     slots[i].callback = callback;
     slots[i].user_data = user_data;
-    slot_set_name(slots[i], name, forced_handle != TIMEPOP_INVALID_HANDLE);
+    timepop_copy_owned_name(slots[i].name, owned_name);
     slots[i].priority = priority;
     slots[i].fire_gnss_ns = -1;
     slots[i].isr_callback = true;
@@ -3969,9 +4024,17 @@ static timepop_handle_t arm_relative_slot_internal(
   if (!callback) return TIMEPOP_INVALID_HANDLE;
   if (rearm_in_isr && (!recurring || !isr_callback)) return TIMEPOP_INVALID_HANDLE;
 
+  char owned_name[MAX_TIMEPOP_NAME + 1] = {};
+  if (!timepop_copy_name(owned_name, name)) {
+    diag_arm_failures++;
+    diag_name_too_long++;
+    return TIMEPOP_INVALID_HANDLE;
+  }
+  const char* const owned_name_ptr = timepop_name_or_null(owned_name);
+
   const uint32_t saved = critical_enter();
 
-  const bool retired_named = retire_existing_named_slots(name);
+  const bool retired_named = retire_existing_named_slots(owned_name_ptr);
   if (retired_named) {
     diag_schedule_next_calls_from_other++;
     schedule_next();
@@ -3995,7 +4058,7 @@ static timepop_handle_t arm_relative_slot_internal(
     slots[i].period_ns    = delay_gnss_ns;
     slots[i].callback     = callback;
     slots[i].user_data    = user_data;
-    slot_set_name(slots[i], name, forced_handle != TIMEPOP_INVALID_HANDLE);
+    timepop_copy_owned_name(slots[i].name, owned_name);
     slots[i].priority     = priority;
     slots[i].fire_gnss_ns = -1;
     slots[i].target_gnss_ns = -1;
@@ -4519,7 +4582,7 @@ uint32_t timepop_cancel_by_name(const char* name) {
   const uint32_t saved = critical_enter();
 
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
-    if (slots[i].active && slots[i].name && strcmp(slots[i].name, name) == 0) {
+    if (slots[i].active && slots[i].name[0] && strcmp(slots[i].name, name) == 0) {
       slots[i].active = false;
       timed_cancelled++;
     }
@@ -4632,7 +4695,7 @@ void timepop_dispatch(void) {
     const timepop_handle_t callback_handle = slots[i].handle;
     const timepop_callback_t callback = slots[i].callback;
     void* const callback_user_data = slots[i].user_data;
-    const char* const callback_name = slots[i].name;
+    const char* const callback_name = timepop_name_or_null(slots[i].name);
     const uint32_t selected_flags =
         timepop_dispatch_trace_slot_flags(slots[i]) |
         (callback_already_ran ? 0x00000100UL : 0U);
@@ -4668,7 +4731,7 @@ void timepop_dispatch(void) {
         if (latency > diag_timed_dispatch_latency_max_cycles) {
           diag_timed_dispatch_latency_max_cycles = latency;
         }
-        diag_timed_dispatch_last_name = callback_name;
+        timepop_copy_name(diag_timed_dispatch_last_name, callback_name);
       }
 
       TIMEPOP_DISPATCH_TRACE(
@@ -5232,6 +5295,9 @@ static FLASHMEM Payload cmd_report(const Payload&) {
   out.add("slots_max",              (uint32_t)MAX_SLOTS);
   out.add("arm_failures",           diag_arm_failures);
   out.add("named_replacements",     diag_named_replacements);
+  out.add("name_storage_owned",       true);
+  out.add("name_max_length",         (uint32_t)MAX_TIMEPOP_NAME);
+  out.add("name_too_long",           diag_name_too_long);
   out.add("epoch_change_count",     diag_epoch_change_count);
   out.add("epoch_last_sequence",    diag_epoch_last_sequence);
   out.add("epoch_timed_slots_seen", diag_epoch_timed_slots_seen);
@@ -5268,7 +5334,7 @@ static FLASHMEM Payload cmd_report(const Payload&) {
   out.add("asap_last_armed_dwt",    diag_asap_last_armed_dwt);
   out.add("asap_last_dispatch_dwt", diag_asap_last_dispatch_dwt);
   out.add("asap_last_armed_name",
-          (const char*)(diag_asap_last_armed_name ? diag_asap_last_armed_name : ""));
+          diag_asap_last_armed_name);
 
   out.add("alap_armed",             diag_alap_armed);
   out.add("alap_dispatched",        diag_alap_dispatched);
@@ -5284,7 +5350,7 @@ static FLASHMEM Payload cmd_report(const Payload&) {
   out.add("alap_last_armed_dwt",    diag_alap_last_armed_dwt);
   out.add("alap_last_dispatch_dwt", diag_alap_last_dispatch_dwt);
   out.add("alap_last_armed_name",
-          (const char*)(diag_alap_last_armed_name ? diag_alap_last_armed_name : ""));
+          diag_alap_last_armed_name);
 
   out.add("dispatch_calls",         diag_dispatch_calls);
   out.add("dispatch_callbacks",     diag_dispatch_callbacks);
@@ -5358,9 +5424,7 @@ static FLASHMEM Payload cmd_report(const Payload&) {
                             ? diag_schedule_next_last_pressure_source
                             : ""));
   out.add("schedule_next_last_pressure_name",
-          (const char*)(diag_schedule_next_last_pressure_name
-                            ? diag_schedule_next_last_pressure_name
-                            : ""));
+          diag_schedule_next_last_pressure_name);
   out.add("schedule_next_last_pressure_deadline",
           diag_schedule_next_last_pressure_deadline);
   out.add("schedule_next_last_pressure_now",
@@ -5385,9 +5449,7 @@ static FLASHMEM Payload cmd_report(const Payload&) {
   out.add("timed_dispatch_callback_body_max_cycles",
           diag_timed_dispatch_callback_body_max_cycles);
   out.add("timed_dispatch_last_name",
-          (const char*)(diag_timed_dispatch_last_name
-                            ? diag_timed_dispatch_last_name
-                            : ""));
+          diag_timed_dispatch_last_name);
   out.add("ch2_service_context", TIMEPOP_CH2_SERVICE_CONTEXT);
   out.add("ch2_direct_call_count", diag_ch2_direct_call_count);
   out.add("ch2_direct_body_cycles_last", diag_ch2_direct_body_cycles_last);
@@ -5401,9 +5463,7 @@ static FLASHMEM Payload cmd_report(const Payload&) {
   out.add("schedule_next_last_expired_slot",   diag_schedule_next_last_expired_slot);
   out.add("schedule_next_last_expired_handle", diag_schedule_next_last_expired_handle);
   out.add("schedule_next_last_expired_name",
-          (const char*)(diag_schedule_next_last_expired_name
-                            ? diag_schedule_next_last_expired_name
-                            : ""));
+          diag_schedule_next_last_expired_name);
   out.add("schedule_next_last_expired_deadline",
           diag_schedule_next_last_expired_deadline);
   out.add("schedule_next_last_expired_now",
@@ -5422,9 +5482,7 @@ static FLASHMEM Payload cmd_report(const Payload&) {
   out.add("missed_deadline_last_slot", diag_missed_deadline_last_slot);
   out.add("missed_deadline_last_handle", diag_missed_deadline_last_handle);
   out.add("missed_deadline_last_name",
-          (const char*)(diag_missed_deadline_last_name
-                            ? diag_missed_deadline_last_name
-                            : ""));
+          diag_missed_deadline_last_name);
   out.add("missed_deadline_last_source",
           (const char*)(diag_missed_deadline_last_source
                             ? diag_missed_deadline_last_source
@@ -5438,7 +5496,7 @@ static FLASHMEM Payload cmd_report(const Payload&) {
   out.add("arm_last_slot",                     diag_arm_last_slot);
   out.add("arm_last_handle",                   diag_arm_last_handle);
   out.add("arm_last_name",
-          (const char*)(diag_arm_last_name ? diag_arm_last_name : ""));
+          diag_arm_last_name);
   out.add("arm_last_source",
           (const char*)(diag_arm_last_source ? diag_arm_last_source : ""));
   out.add("arm_last_now",                      diag_arm_last_now);
@@ -5538,7 +5596,7 @@ static FLASHMEM void add_timers_array(Payload& out) {
     // quarantine bug was found.
     entry.add("slot",      i);
     entry.add("handle",    slots[i].handle);
-    entry.add("name",      slots[i].name ? slots[i].name : "");
+    entry.add("name",      slots[i].name);
     entry.add("priority",  (uint32_t)slots[i].priority);
     entry.add("deadline",  slots[i].deadline);
     entry.add("expired",   slots[i].expired);
@@ -5579,6 +5637,9 @@ static FLASHMEM Payload cmd_slots(const Payload&) {
   out.add("dispatch_mutation_arm_failures", diag_dispatch_mutation_arm_failures);
   out.add("dispatch_mutation_name_copies", diag_dispatch_mutation_name_copies);
   out.add("dispatch_mutation_name_too_long", diag_dispatch_mutation_name_too_long);
+  out.add("name_storage_owned", true);
+  out.add("name_max_length", (uint32_t)MAX_TIMEPOP_NAME);
+  out.add("name_too_long", diag_name_too_long);
   out.add("dispatch_mutation_cancel_failures", diag_dispatch_mutation_cancel_failures);
   out.add("dispatch_mutation_cancel_noop", diag_dispatch_mutation_cancel_noop);
   out.add("dispatch_mutation_coalesced", diag_dispatch_mutation_coalesced);
@@ -5619,9 +5680,7 @@ static FLASHMEM Payload cmd_slots(const Payload&) {
   out.add("missed_deadline_recurring_rearmed", diag_missed_deadline_recurring_rearmed);
   out.add("missed_deadline_one_shot_cancelled", diag_missed_deadline_one_shot_cancelled);
   out.add("missed_deadline_last_name",
-          (const char*)(diag_missed_deadline_last_name
-                            ? diag_missed_deadline_last_name
-                            : ""));
+          diag_missed_deadline_last_name);
   out.add("missed_deadline_last_late_ticks", diag_missed_deadline_last_late_ticks);
   out.add("irq_expired_slots", diag_irq_expired_slots);
   out.add("irq_exact_deadline_slots", diag_irq_exact_deadline_slots);
