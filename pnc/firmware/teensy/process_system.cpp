@@ -955,6 +955,16 @@ static bool system_cstr_equal_ci(const char* a, const char* b) {
   return *a == *b;
 }
 
+// Public FEATURE_STATUS is the mission-readiness annunciator, not a dump of
+// every diagnostic witness. QTIMER_DWT_RULER remains in the internal registry
+// and in INTERRUPT.REPORT_INTEGRITY, but its ISR-displacement-sensitive state
+// must not strobe the operator-facing feature tree.
+static bool system_feature_publicly_visible(
+    const system_feature_slot_t& slot) {
+  return !(system_cstr_equal(slot.subsystem, "INTERRUPT") &&
+           system_cstr_equal(slot.feature, "QTIMER_DWT_RULER"));
+}
+
 const char* system_feature_status_str(system_feature_status_t status) {
   switch (status) {
     case system_feature_status_t::NOMINAL:      return "NOMINAL";
@@ -1092,7 +1102,9 @@ bool system_feature_set(const char* subsystem,
 
   slot.status = status;
   (void)detail;
-  system_feature_note_changed();
+  if (system_feature_publicly_visible(slot)) {
+    system_feature_note_changed();
+  }
   return true;
 }
 
@@ -1131,12 +1143,14 @@ static FLASHMEM Payload system_features_tree_payload(void) {
 
   for (size_t i = 0; i < SYSTEM_FEATURE_MAX_FEATURES; i++) {
     if (!g_system_features[i].used) continue;
+    if (!system_feature_publicly_visible(g_system_features[i])) continue;
 
     const char* subsystem = g_system_features[i].subsystem;
 
     bool already_emitted = false;
     for (size_t j = 0; j < i; j++) {
       if (!g_system_features[j].used) continue;
+      if (!system_feature_publicly_visible(g_system_features[j])) continue;
       if (system_cstr_equal(g_system_features[j].subsystem, subsystem)) {
         already_emitted = true;
         break;
@@ -1147,6 +1161,7 @@ static FLASHMEM Payload system_features_tree_payload(void) {
     Payload subsystem_payload;
     for (size_t k = 0; k < SYSTEM_FEATURE_MAX_FEATURES; k++) {
       if (!g_system_features[k].used) continue;
+      if (!system_feature_publicly_visible(g_system_features[k])) continue;
       if (!system_cstr_equal(g_system_features[k].subsystem, subsystem)) continue;
 
       subsystem_payload.add(

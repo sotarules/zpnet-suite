@@ -238,6 +238,14 @@ _SYSTEM_LOCK = threading.Lock()
 
 FEATURE_STATUSES = {"INITIALIZING", "NOMINAL", "HOLD", "ANOMALY"}
 
+# Public FEATURE_STATUS is a mission-readiness surface.  The raw QTimer/DWT
+# interval witness remains available through Teensy INTERRUPT diagnostics, but
+# its ISR-displacement-sensitive state is intentionally not an annunciator.
+_PUBLIC_FEATURE_EXCLUSIONS = {
+    ("TEENSY", "INTERRUPT", "QTIMER_DWT_RULER"),
+}
+
+
 _FEATURE_LOCK = threading.Lock()
 _PI_FEATURES: Dict[str, Dict[str, Dict[str, str]]] = {"PI": {}}
 _TEENSY_FEATURES: Dict[str, Dict[str, Dict[str, str]]] = {"TEENSY": {}}
@@ -291,6 +299,8 @@ def _copy_feature_tree(tree: Any) -> Dict[str, Dict[str, Dict[str, str]]]:
             for feature, entry in features.items():
                 feature_key = str(feature).strip().upper()
                 if not feature_key:
+                    continue
+                if (machine_key, subsystem_key, feature_key) in _PUBLIC_FEATURE_EXCLUSIONS:
                     continue
                 if isinstance(entry, dict):
                     status = entry.get("status")
