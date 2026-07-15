@@ -264,6 +264,220 @@ static uint32_t g_system_memory_watchdog_alap_arm_count = 0;
 static uint32_t g_system_memory_watchdog_alap_arm_failures = 0;
 static uint32_t g_system_memory_watchdog_alap_run_count = 0;
 
+
+// ============================================================================
+// Retained memory-watchdog callback flight recorder
+// ============================================================================
+//
+// This is intentionally separate from memory_info's audit recorder.  The
+// watchdog trace answers which outer callback boundary was crossed; the audit
+// trace answers which internal observation/court stage was reached.  Entries
+// are scalar-only, allocation-free, Payload-free, and flushed one at a time.
+
+static constexpr uint32_t SYSTEM_WATCHDOG_TRACE_MAGIC = 0x57444631UL;  // 'WDF1'
+static constexpr uint32_t SYSTEM_WATCHDOG_TRACE_SCHEMA_VERSION = 1U;
+static constexpr uint32_t SYSTEM_WATCHDOG_TRACE_ENTRIES = 16U;
+
+enum class system_watchdog_trace_stage_t : uint32_t {
+  NONE           = 0,
+  WATCHDOG_ENTER = 1,
+  NO_PENDING     = 2,
+  AUDIT_ENTER    = 3,
+  AUDIT_RETURN   = 4,
+  EMIT_BEGIN     = 5,
+  EMIT_END       = 6,
+  SENTINEL_BEGIN = 7,
+  SENTINEL_END   = 8,
+  REARM_BEGIN    = 9,
+  REARM_END      = 10,
+  WATCHDOG_EXIT  = 11,
+};
+
+struct alignas(32) system_watchdog_trace_entry_t {
+  uint32_t sequence;
+  uint32_t sequence_inv;
+  uint32_t stage;
+  uint32_t dwt;
+  uint32_t ipsr;
+  uint32_t value0;
+  uint32_t value1;
+  uint32_t reserved;
+};
+
+static_assert(sizeof(system_watchdog_trace_entry_t) == 32U,
+              "watchdog trace entry must stay one cache line");
+
+struct alignas(32) system_watchdog_trace_bank_t {
+  uint32_t magic;
+  uint32_t magic_inv;
+  uint32_t schema_version;
+  uint32_t capacity;
+  uint32_t reserved[4];
+  system_watchdog_trace_entry_t entries[SYSTEM_WATCHDOG_TRACE_ENTRIES];
+};
+
+static_assert((sizeof(system_watchdog_trace_bank_t) % 32U) == 0U,
+              "watchdog trace bank must occupy complete cache lines");
+
+struct system_watchdog_trace_bank_snapshot_t {
+  bool valid;
+  uint32_t count;
+  uint32_t newest_sequence;
+  system_watchdog_trace_entry_t entries[SYSTEM_WATCHDOG_TRACE_ENTRIES];
+};
+
+struct system_watchdog_trace_snapshot_t {
+  system_watchdog_trace_bank_snapshot_t live;
+  system_watchdog_trace_bank_snapshot_t retained;
+};
+
+static system_watchdog_trace_bank_t g_system_watchdog_trace_live DMAMEM;
+static system_watchdog_trace_bank_t g_system_watchdog_trace_retained DMAMEM;
+static bool g_system_watchdog_trace_boot_latched = false;  // ordinary BSS
+static uint32_t g_system_watchdog_trace_next_sequence = 0U;
+
+static inline void system_watchdog_trace_dmb(void) {
+  __asm__ volatile("dmb" ::: "memory");
+}
+
+static inline uint32_t system_watchdog_trace_ipsr(void) {
+  uint32_t ipsr = 0U;
+#if defined(__arm__)
+  __asm__ volatile("mrs %0, ipsr" : "=r"(ipsr));
+#endif
+  return ipsr & 0x1FFU;
+}
+
+static bool system_watchdog_trace_bank_valid(
+    const system_watchdog_trace_bank_t& bank) {
+  return bank.magic == SYSTEM_WATCHDOG_TRACE_MAGIC &&
+         (bank.magic ^ bank.magic_inv) == 0xFFFFFFFFUL &&
+         bank.schema_version == SYSTEM_WATCHDOG_TRACE_SCHEMA_VERSION &&
+         bank.capacity == SYSTEM_WATCHDOG_TRACE_ENTRIES;
+}
+
+static bool system_watchdog_trace_entry_valid(
+    const system_watchdog_trace_entry_t& entry) {
+  return entry.sequence != 0U &&
+         (entry.sequence ^ entry.sequence_inv) == 0xFFFFFFFFUL;
+}
+
+static void system_watchdog_trace_initialize_live(void) {
+  memset((void*)&g_system_watchdog_trace_live, 0,
+         sizeof(g_system_watchdog_trace_live));
+  g_system_watchdog_trace_live.schema_version =
+      SYSTEM_WATCHDOG_TRACE_SCHEMA_VERSION;
+  g_system_watchdog_trace_live.capacity = SYSTEM_WATCHDOG_TRACE_ENTRIES;
+  g_system_watchdog_trace_live.magic_inv = ~SYSTEM_WATCHDOG_TRACE_MAGIC;
+  g_system_watchdog_trace_live.magic = SYSTEM_WATCHDOG_TRACE_MAGIC;
+  g_system_watchdog_trace_next_sequence = 0U;
+  arm_dcache_flush((void*)&g_system_watchdog_trace_live,
+                   sizeof(g_system_watchdog_trace_live));
+}
+
+static void system_watchdog_trace_boot_latch(void) {
+  if (g_system_watchdog_trace_boot_latched) return;
+  g_system_watchdog_trace_boot_latched = true;
+
+  if (system_watchdog_trace_bank_valid(g_system_watchdog_trace_live)) {
+    g_system_watchdog_trace_retained = g_system_watchdog_trace_live;
+  } else {
+    memset((void*)&g_system_watchdog_trace_retained, 0,
+           sizeof(g_system_watchdog_trace_retained));
+  }
+  arm_dcache_flush((void*)&g_system_watchdog_trace_retained,
+                   sizeof(g_system_watchdog_trace_retained));
+  system_watchdog_trace_initialize_live();
+}
+
+static void system_watchdog_trace_record(system_watchdog_trace_stage_t stage,
+                                         uint32_t value0,
+                                         uint32_t value1) {
+  system_watchdog_trace_boot_latch();
+
+  uint32_t sequence = g_system_watchdog_trace_next_sequence + 1U;
+  if (sequence == 0U) sequence = 1U;
+  g_system_watchdog_trace_next_sequence = sequence;
+
+  system_watchdog_trace_entry_t& entry =
+      g_system_watchdog_trace_live.entries[
+          (sequence - 1U) % SYSTEM_WATCHDOG_TRACE_ENTRIES];
+
+  entry.sequence = 0U;
+  entry.sequence_inv = 0U;
+  system_watchdog_trace_dmb();
+
+  entry.stage = (uint32_t)stage;
+  entry.dwt = ARM_DWT_CYCCNT;
+  entry.ipsr = system_watchdog_trace_ipsr();
+  entry.value0 = value0;
+  entry.value1 = value1;
+  entry.reserved = 0U;
+
+  entry.sequence_inv = ~sequence;
+  system_watchdog_trace_dmb();
+  entry.sequence = sequence;  // commit last
+  system_watchdog_trace_dmb();
+  arm_dcache_flush((void*)&entry, sizeof(entry));
+}
+
+static void system_watchdog_trace_snapshot_bank(
+    const system_watchdog_trace_bank_t& bank,
+    system_watchdog_trace_bank_snapshot_t* out) {
+  memset((void*)out, 0, sizeof(*out));
+  out->valid = system_watchdog_trace_bank_valid(bank);
+  if (!out->valid) return;
+
+  for (uint32_t i = 0U; i < SYSTEM_WATCHDOG_TRACE_ENTRIES; ++i) {
+    const volatile system_watchdog_trace_entry_t* source = &bank.entries[i];
+    const uint32_t sequence_before = source->sequence;
+    const uint32_t sequence_inv_before = source->sequence_inv;
+    if (sequence_before == 0U ||
+        (sequence_before ^ sequence_inv_before) != 0xFFFFFFFFUL) {
+      continue;
+    }
+
+    const system_watchdog_trace_entry_t candidate = bank.entries[i];
+    system_watchdog_trace_dmb();
+    if (source->sequence != sequence_before ||
+        source->sequence_inv != sequence_inv_before ||
+        !system_watchdog_trace_entry_valid(candidate)) {
+      continue;
+    }
+
+    uint32_t pos = out->count;
+    while (pos > 0U &&
+           out->entries[pos - 1U].sequence > candidate.sequence) {
+      out->entries[pos] = out->entries[pos - 1U];
+      --pos;
+    }
+    out->entries[pos] = candidate;
+    ++out->count;
+  }
+
+  if (out->count != 0U) {
+    out->newest_sequence = out->entries[out->count - 1U].sequence;
+  }
+}
+
+static void system_watchdog_trace_snapshot(
+    system_watchdog_trace_snapshot_t* out) {
+  if (!out) return;
+  system_watchdog_trace_boot_latch();
+  memset((void*)out, 0, sizeof(*out));
+  system_watchdog_trace_snapshot_bank(g_system_watchdog_trace_live,
+                                      &out->live);
+  system_watchdog_trace_snapshot_bank(g_system_watchdog_trace_retained,
+                                      &out->retained);
+}
+
+static void system_watchdog_trace_clear_retained(void) {
+  memset((void*)&g_system_watchdog_trace_retained, 0,
+         sizeof(g_system_watchdog_trace_retained));
+  arm_dcache_flush((void*)&g_system_watchdog_trace_retained,
+                   sizeof(g_system_watchdog_trace_retained));
+}
+
 // ============================================================================
 // Always-on memory integrity watchdog
 // ============================================================================
@@ -344,9 +558,22 @@ static FLASHMEM void system_memory_watchdog_emit(void) {
 static FLASHMEM void system_memory_watchdog_alap_cb(timepop_ctx_t*,
                                                     timepop_diag_t*,
                                                     void*) {
+  system_watchdog_trace_record(
+      system_watchdog_trace_stage_t::WATCHDOG_ENTER,
+      g_system_memory_watchdog_alap_pending ? 1U : 0U,
+      g_system_memory_watchdog_alap_run_count);
+
   g_system_memory_watchdog_alap_armed = false;
 
   if (!g_system_memory_watchdog_alap_pending) {
+    system_watchdog_trace_record(
+        system_watchdog_trace_stage_t::NO_PENDING,
+        g_system_memory_watchdog_alap_arm_count,
+        g_system_memory_watchdog_alap_arm_failures);
+    system_watchdog_trace_record(
+        system_watchdog_trace_stage_t::WATCHDOG_EXIT,
+        g_system_memory_watchdog_alap_run_count,
+        (uint32_t)g_system_memory_watchdog_health.status);
     return;
   }
 
@@ -355,7 +582,15 @@ static FLASHMEM void system_memory_watchdog_alap_cb(timepop_ctx_t*,
 
   // All allocator-, Payload-, and publication-bearing work belongs here in
   // serialized foreground context, never in the timed callback.
+  system_watchdog_trace_record(
+      system_watchdog_trace_stage_t::AUDIT_ENTER,
+      g_system_memory_watchdog_health.audit_count + 1U,
+      (uint32_t)g_system_memory_watchdog_health.status);
   memory_info_audit(&g_system_memory_watchdog_health);
+  system_watchdog_trace_record(
+      system_watchdog_trace_stage_t::AUDIT_RETURN,
+      (uint32_t)g_system_memory_watchdog_health.status,
+      g_system_memory_watchdog_health.audit_count);
 
   if (g_system_memory_watchdog_health.status ==
           memory_health_status_t::ANOMALY &&
@@ -363,20 +598,45 @@ static FLASHMEM void system_memory_watchdog_alap_cb(timepop_ctx_t*,
     // Latch before constructing the event so a Payload failure during the
     // best-effort anomaly transcript cannot create a recursive event storm.
     g_system_memory_watchdog_event_emitted = true;
+    system_watchdog_trace_record(
+        system_watchdog_trace_stage_t::EMIT_BEGIN,
+        (uint32_t)g_system_memory_watchdog_health.primary_reason,
+        g_system_memory_watchdog_health.latched_reason_mask);
     system_memory_watchdog_emit();
+    system_watchdog_trace_record(
+        system_watchdog_trace_stage_t::EMIT_END,
+        g_system_memory_watchdog_event_count,
+        g_system_memory_watchdog_event_emitted ? 1U : 0U);
   }
 
   // Frame-sentinel verdicts are announced here, in serialized foreground
   // context, never from the handler pass that detected them.  The 5-second
   // watchdog cadence bounds announcement latency; the evidence itself was
   // latched at detection time and is not perishable.
+  system_watchdog_trace_record(
+      system_watchdog_trace_stage_t::SENTINEL_BEGIN, 0U, 0U);
   system_sentinel_service();
+  system_watchdog_trace_record(
+      system_watchdog_trace_stage_t::SENTINEL_END, 0U, 0U);
 
   // If another timed fire arrived while this ALAP service was running, arrange
   // one more serialized pass rather than doing nested work here.
   if (g_system_memory_watchdog_alap_pending) {
+    system_watchdog_trace_record(
+        system_watchdog_trace_stage_t::REARM_BEGIN,
+        g_system_memory_watchdog_alap_arm_count,
+        g_system_memory_watchdog_alap_arm_failures);
     system_memory_watchdog_schedule_alap();
+    system_watchdog_trace_record(
+        system_watchdog_trace_stage_t::REARM_END,
+        g_system_memory_watchdog_alap_armed ? 1U : 0U,
+        g_system_memory_watchdog_alap_arm_failures);
   }
+
+  system_watchdog_trace_record(
+      system_watchdog_trace_stage_t::WATCHDOG_EXIT,
+      g_system_memory_watchdog_alap_run_count,
+      (uint32_t)g_system_memory_watchdog_health.status);
 }
 
 static void system_memory_watchdog_schedule_alap(void) {
@@ -1454,7 +1714,7 @@ static FLASHMEM Payload system_crash_forensics_payload(void) {
   crash_forensics_get_status(&status);
 
   Payload out;
-  out.add("schema", "ZPNET_CRASH_FORENSICS_V1");
+  out.add("schema", "ZPNET_CRASH_FORENSICS_V2");
   out.add("installed_now", status.installed);
   out.add("present", status.present);
   out.add("header_valid", status.header_valid);
@@ -1497,6 +1757,31 @@ static FLASHMEM Payload system_crash_forensics_payload(void) {
           (record->flags & CRASH_FORENSICS_FLAG_RETURN_TO_THREAD) != 0U);
   out.add("interrupted_handler",
           (record->flags & CRASH_FORENSICS_FLAG_INTERRUPTED_HANDLER) != 0U);
+  out.add("frame_content_plausible",
+          (record->flags & CRASH_FORENSICS_FLAG_FRAME_CONTENT_PLAUSIBLE) != 0U);
+  out.add("capture_skipped",
+          (record->flags & CRASH_FORENSICS_FLAG_CAPTURE_SKIPPED) != 0U);
+
+  Payload capture_skips;
+  capture_skips.add("active_stack_reason_id",
+                    record->active_stack_skip_reason);
+  capture_skips.add("active_stack_reason",
+                    crash_forensics_capture_skip_reason_name(
+                        record->active_stack_skip_reason));
+  capture_skips.add("other_stack_reason_id",
+                    record->other_stack_skip_reason);
+  capture_skips.add("other_stack_reason",
+                    crash_forensics_capture_skip_reason_name(
+                        record->other_stack_skip_reason));
+  capture_skips.add("pc_window_reason_id", record->pc_window_skip_reason);
+  capture_skips.add("pc_window_reason",
+                    crash_forensics_capture_skip_reason_name(
+                        record->pc_window_skip_reason));
+  capture_skips.add("lr_window_reason_id", record->lr_window_skip_reason);
+  capture_skips.add("lr_window_reason",
+                    crash_forensics_capture_skip_reason_name(
+                        record->lr_window_skip_reason));
+  out.add_object("capture_skips", capture_skips);
 
   Payload frame;
   system_crash_add_hex32(frame, "raw_frame_address", record->raw_frame_address);
@@ -1829,6 +2114,358 @@ static FLASHMEM Payload system_runtime_ledger_payload(void) {
 }
 
 // ============================================================================
+// Retained memory-audit / watchdog traces — reporting surface
+// ============================================================================
+
+static memory_audit_trace_snapshot_t
+    g_system_memory_audit_trace_scratch DMAMEM;
+static system_watchdog_trace_snapshot_t
+    g_system_watchdog_trace_scratch DMAMEM;
+
+static constexpr uint32_t SYSTEM_TRACE_REPORT_DEFAULT_COUNT = 8U;
+static constexpr uint32_t SYSTEM_TRACE_REPORT_MAX_COUNT = 8U;
+
+static const char* system_memory_audit_trace_stage_name(uint32_t stage) {
+  switch ((memory_audit_trace_stage_t)stage) {
+    case memory_audit_trace_stage_t::AUDIT_ENTER:        return "AUDIT_ENTER";
+    case memory_audit_trace_stage_t::MEMORY_GET_ENTER:   return "MEMORY_GET_ENTER";
+    case memory_audit_trace_stage_t::STACK_SNAPSHOT:     return "STACK_SNAPSHOT";
+    case memory_audit_trace_stage_t::STACK_PAINT_SCAN:   return "STACK_PAINT_SCAN";
+    case memory_audit_trace_stage_t::HEAP_INFO:          return "HEAP_INFO";
+    case memory_audit_trace_stage_t::MEMORY_GET_EXIT:    return "MEMORY_GET_EXIT";
+    case memory_audit_trace_stage_t::PAYLOAD_INFO_ENTER: return "PAYLOAD_INFO_ENTER";
+    case memory_audit_trace_stage_t::PAYLOAD_INFO_RETURN:return "PAYLOAD_INFO_RETURN";
+    case memory_audit_trace_stage_t::PAYLOAD_SELF_OK:    return "PAYLOAD_SELF_OK";
+    case memory_audit_trace_stage_t::STRING_POINTERS:    return "STRING_POINTERS";
+    case memory_audit_trace_stage_t::HEALTH_RULES:       return "HEALTH_RULES";
+    case memory_audit_trace_stage_t::HEALTH_COMMIT:      return "HEALTH_COMMIT";
+    case memory_audit_trace_stage_t::OUTPUT_COPY:        return "OUTPUT_COPY";
+    case memory_audit_trace_stage_t::AUDIT_EXIT:         return "AUDIT_EXIT";
+    default:                                              return "NONE";
+  }
+}
+
+static const char* system_memory_audit_trace_value_meaning(uint32_t stage) {
+  switch ((memory_audit_trace_stage_t)stage) {
+    case memory_audit_trace_stage_t::AUDIT_ENTER:
+      return "next_audit_count|prior_health_status";
+    case memory_audit_trace_stage_t::MEMORY_GET_ENTER:
+      return "stack_pointer|sampled_low_water";
+    case memory_audit_trace_stage_t::STACK_SNAPSHOT:
+      return "stack_free_current|stack_current";
+    case memory_audit_trace_stage_t::STACK_PAINT_SCAN:
+      return "paint_start|paint_end";
+    case memory_audit_trace_stage_t::HEAP_INFO:
+      return "ram2_start|ram2_end";
+    case memory_audit_trace_stage_t::MEMORY_GET_EXIT:
+      return "stack_free_high_water|heap_free_total";
+    case memory_audit_trace_stage_t::PAYLOAD_INFO_ENTER:
+      return "prior_payload_alive|prior_payload_last_error";
+    case memory_audit_trace_stage_t::PAYLOAD_INFO_RETURN:
+      return "payload_alive|payload_last_error";
+    case memory_audit_trace_stage_t::PAYLOAD_SELF_OK:
+      return "self_ok_fail|integrity_fail";
+    case memory_audit_trace_stage_t::STRING_POINTERS:
+      return "string_pointer_fault|last_pointer_reason";
+    case memory_audit_trace_stage_t::HEALTH_RULES:
+      return "map_flags|payload_lifetime_mismatch";
+    case memory_audit_trace_stage_t::HEALTH_COMMIT:
+      return "active_reason_mask|primary_reason_id";
+    case memory_audit_trace_stage_t::OUTPUT_COPY:
+      return "out_present|audit_count";
+    case memory_audit_trace_stage_t::AUDIT_EXIT:
+      return "audit_count|health_status";
+    default:
+      return "raw";
+  }
+}
+
+static const char* system_watchdog_trace_stage_name(uint32_t stage) {
+  switch ((system_watchdog_trace_stage_t)stage) {
+    case system_watchdog_trace_stage_t::WATCHDOG_ENTER: return "WATCHDOG_ENTER";
+    case system_watchdog_trace_stage_t::NO_PENDING:     return "NO_PENDING";
+    case system_watchdog_trace_stage_t::AUDIT_ENTER:    return "AUDIT_ENTER";
+    case system_watchdog_trace_stage_t::AUDIT_RETURN:   return "AUDIT_RETURN";
+    case system_watchdog_trace_stage_t::EMIT_BEGIN:     return "EMIT_BEGIN";
+    case system_watchdog_trace_stage_t::EMIT_END:       return "EMIT_END";
+    case system_watchdog_trace_stage_t::SENTINEL_BEGIN: return "SENTINEL_BEGIN";
+    case system_watchdog_trace_stage_t::SENTINEL_END:   return "SENTINEL_END";
+    case system_watchdog_trace_stage_t::REARM_BEGIN:    return "REARM_BEGIN";
+    case system_watchdog_trace_stage_t::REARM_END:      return "REARM_END";
+    case system_watchdog_trace_stage_t::WATCHDOG_EXIT:  return "WATCHDOG_EXIT";
+    default:                                             return "NONE";
+  }
+}
+
+static const char* system_watchdog_trace_value_meaning(uint32_t stage) {
+  switch ((system_watchdog_trace_stage_t)stage) {
+    case system_watchdog_trace_stage_t::WATCHDOG_ENTER:
+      return "pending|prior_run_count";
+    case system_watchdog_trace_stage_t::NO_PENDING:
+      return "alap_arm_count|alap_arm_failures";
+    case system_watchdog_trace_stage_t::AUDIT_ENTER:
+      return "next_audit_count|prior_health_status";
+    case system_watchdog_trace_stage_t::AUDIT_RETURN:
+      return "health_status|audit_count";
+    case system_watchdog_trace_stage_t::EMIT_BEGIN:
+      return "primary_reason_id|latched_reason_mask";
+    case system_watchdog_trace_stage_t::EMIT_END:
+      return "event_count|event_emitted";
+    case system_watchdog_trace_stage_t::REARM_BEGIN:
+      return "alap_arm_count|alap_arm_failures";
+    case system_watchdog_trace_stage_t::REARM_END:
+      return "alap_armed|alap_arm_failures";
+    case system_watchdog_trace_stage_t::WATCHDOG_EXIT:
+      return "run_count|health_status";
+    default:
+      return "raw";
+  }
+}
+
+static uint32_t system_trace_report_count(const Payload& args) {
+  uint32_t count = args.has("count")
+      ? args.getUInt("count")
+      : SYSTEM_TRACE_REPORT_DEFAULT_COUNT;
+  if (count == 0U) count = 1U;
+  if (count > SYSTEM_TRACE_REPORT_MAX_COUNT) {
+    count = SYSTEM_TRACE_REPORT_MAX_COUNT;
+  }
+  return count;
+}
+
+static uint32_t system_trace_report_offset(const Payload& args) {
+  return args.has("offset") ? args.getUInt("offset") : 0U;
+}
+
+static bool system_trace_report_live_bank(const Payload& args,
+                                          bool* valid) {
+  if (valid) *valid = true;
+  const char* bank = args.getString("bank");
+  if (!bank || !*bank || system_cstr_equal_ci(bank, "retained")) {
+    return false;
+  }
+  if (system_cstr_equal_ci(bank, "live")) {
+    return true;
+  }
+  if (valid) *valid = false;
+  return false;
+}
+
+static void system_trace_bounds(uint32_t available,
+                                uint32_t requested,
+                                uint32_t offset_from_newest,
+                                uint32_t* out_begin,
+                                uint32_t* out_end) {
+  uint32_t end = 0U;
+  if (offset_from_newest < available) {
+    end = available - offset_from_newest;
+  }
+  const uint32_t begin = end > requested ? end - requested : 0U;
+  if (out_begin) *out_begin = begin;
+  if (out_end) *out_end = end;
+}
+
+static FLASHMEM Payload system_memory_audit_trace_entry_payload(
+    const memory_audit_trace_entry_t& entry) {
+  Payload out;
+  out.add("sequence", entry.sequence);
+  out.add("stage_id", entry.stage);
+  out.add("stage", system_memory_audit_trace_stage_name(entry.stage));
+  system_crash_add_hex32(out, "dwt", entry.dwt);
+  out.add("ipsr", entry.ipsr);
+  system_crash_add_hex32(out, "value0", entry.value0);
+  system_crash_add_hex32(out, "value1", entry.value1);
+  out.add("value_meaning",
+          system_memory_audit_trace_value_meaning(entry.stage));
+  return out;
+}
+
+static FLASHMEM Payload system_watchdog_trace_entry_payload(
+    const system_watchdog_trace_entry_t& entry) {
+  Payload out;
+  out.add("sequence", entry.sequence);
+  out.add("stage_id", entry.stage);
+  out.add("stage", system_watchdog_trace_stage_name(entry.stage));
+  system_crash_add_hex32(out, "dwt", entry.dwt);
+  out.add("ipsr", entry.ipsr);
+  system_crash_add_hex32(out, "value0", entry.value0);
+  system_crash_add_hex32(out, "value1", entry.value1);
+  out.add("value_meaning", system_watchdog_trace_value_meaning(entry.stage));
+  return out;
+}
+
+static FLASHMEM Payload system_memory_audit_trace_bank_payload(
+    const memory_audit_trace_bank_snapshot_t& bank,
+    const char* bank_name,
+    uint32_t requested,
+    uint32_t offset_from_newest) {
+  uint32_t begin = 0U;
+  uint32_t end = 0U;
+  system_trace_bounds(bank.count, requested, offset_from_newest, &begin, &end);
+
+  Payload out;
+  out.add("bank", bank_name);
+  out.add("valid", bank.valid);
+  out.add("capacity", MEMORY_AUDIT_TRACE_ENTRIES);
+  out.add("available_count", bank.count);
+  out.add("newest_sequence", bank.newest_sequence);
+  out.add("requested_count", requested);
+  out.add("returned_count", end - begin);
+  out.add("offset_from_newest", offset_from_newest);
+  out.add("has_older", begin != 0U);
+  out.add("has_newer", offset_from_newest != 0U && bank.count != 0U);
+  out.add("first_sequence", begin < end ? bank.entries[begin].sequence : 0U);
+  out.add("last_sequence", begin < end ? bank.entries[end - 1U].sequence : 0U);
+
+  PayloadArray records;
+  for (uint32_t i = begin; i < end; ++i) {
+    Payload record = system_memory_audit_trace_entry_payload(bank.entries[i]);
+    record.add("bank_index", i);
+    records.add(record);
+  }
+  out.add_array("records", records);
+  return out;
+}
+
+static FLASHMEM Payload system_watchdog_trace_bank_payload(
+    const system_watchdog_trace_bank_snapshot_t& bank,
+    const char* bank_name,
+    uint32_t requested,
+    uint32_t offset_from_newest) {
+  uint32_t begin = 0U;
+  uint32_t end = 0U;
+  system_trace_bounds(bank.count, requested, offset_from_newest, &begin, &end);
+
+  Payload out;
+  out.add("bank", bank_name);
+  out.add("valid", bank.valid);
+  out.add("capacity", SYSTEM_WATCHDOG_TRACE_ENTRIES);
+  out.add("available_count", bank.count);
+  out.add("newest_sequence", bank.newest_sequence);
+  out.add("requested_count", requested);
+  out.add("returned_count", end - begin);
+  out.add("offset_from_newest", offset_from_newest);
+  out.add("has_older", begin != 0U);
+  out.add("has_newer", offset_from_newest != 0U && bank.count != 0U);
+  out.add("first_sequence", begin < end ? bank.entries[begin].sequence : 0U);
+  out.add("last_sequence", begin < end ? bank.entries[end - 1U].sequence : 0U);
+
+  PayloadArray records;
+  for (uint32_t i = begin; i < end; ++i) {
+    Payload record = system_watchdog_trace_entry_payload(bank.entries[i]);
+    record.add("bank_index", i);
+    records.add(record);
+  }
+  out.add_array("records", records);
+  return out;
+}
+
+static FLASHMEM Payload system_memory_audit_trace_summary_payload(void) {
+  memory_audit_trace_snapshot(&g_system_memory_audit_trace_scratch);
+  const memory_audit_trace_bank_snapshot_t& retained =
+      g_system_memory_audit_trace_scratch.retained;
+
+  Payload out;
+  out.add("schema", "ZPNET_MEMORY_AUDIT_TRACE_SUMMARY_V1");
+  out.add("retained_valid", retained.valid);
+  out.add("retained_count", retained.count);
+  out.add("newest_sequence", retained.newest_sequence);
+  if (retained.valid && retained.count != 0U) {
+    out.add_object("newest",
+                   system_memory_audit_trace_entry_payload(
+                       retained.entries[retained.count - 1U]));
+  }
+  return out;
+}
+
+static FLASHMEM Payload system_watchdog_trace_summary_payload(void) {
+  system_watchdog_trace_snapshot(&g_system_watchdog_trace_scratch);
+  const system_watchdog_trace_bank_snapshot_t& retained =
+      g_system_watchdog_trace_scratch.retained;
+
+  Payload out;
+  out.add("schema", "ZPNET_MEMORY_WATCHDOG_TRACE_SUMMARY_V1");
+  out.add("retained_valid", retained.valid);
+  out.add("retained_count", retained.count);
+  out.add("newest_sequence", retained.newest_sequence);
+  if (retained.valid && retained.count != 0U) {
+    out.add_object("newest",
+                   system_watchdog_trace_entry_payload(
+                       retained.entries[retained.count - 1U]));
+  }
+  return out;
+}
+
+static FLASHMEM Payload system_memory_audit_info_payload(const Payload& args) {
+  const char* source = args.getString("source");
+  const bool audit_source =
+      !source || !*source || system_cstr_equal_ci(source, "audit");
+  const bool watchdog_source =
+      source && system_cstr_equal_ci(source, "watchdog");
+  if (!audit_source && !watchdog_source) {
+    Payload error;
+    error.add("error", "source must be audit or watchdog");
+    return error;
+  }
+
+  bool bank_valid = true;
+  const bool live_bank = system_trace_report_live_bank(args, &bank_valid);
+  if (!bank_valid) {
+    Payload error;
+    error.add("error", "bank must be live or retained");
+    return error;
+  }
+
+  const uint32_t requested = system_trace_report_count(args);
+  const uint32_t offset = system_trace_report_offset(args);
+  const char* bank_name = live_bank ? "live" : "retained";
+
+  Payload out;
+  out.add("schema", "ZPNET_MEMORY_AUDIT_INFO_V1");
+  out.add("source", audit_source ? "audit" : "watchdog");
+
+  if (audit_source) {
+    memory_audit_trace_snapshot(&g_system_memory_audit_trace_scratch);
+    const memory_audit_trace_bank_snapshot_t& bank = live_bank
+        ? g_system_memory_audit_trace_scratch.live
+        : g_system_memory_audit_trace_scratch.retained;
+    out.add_object("trace",
+                   system_memory_audit_trace_bank_payload(
+                       bank, bank_name, requested, offset));
+  } else {
+    system_watchdog_trace_snapshot(&g_system_watchdog_trace_scratch);
+    const system_watchdog_trace_bank_snapshot_t& bank = live_bank
+        ? g_system_watchdog_trace_scratch.live
+        : g_system_watchdog_trace_scratch.retained;
+    out.add_object("trace",
+                   system_watchdog_trace_bank_payload(
+                       bank, bank_name, requested, offset));
+  }
+
+  Payload health;
+  health.add("status",
+             memory_health_status_name(g_system_memory_watchdog_health.status));
+  health.add("reason",
+             memory_health_reason_name(
+                 g_system_memory_watchdog_health.primary_reason));
+  health.add("audit_count", g_system_memory_watchdog_health.audit_count);
+  health.add("latched_reason_mask",
+             g_system_memory_watchdog_health.latched_reason_mask);
+  out.add_object("health", health);
+
+  Payload watchdog;
+  watchdog.add("alap_pending", (bool)g_system_memory_watchdog_alap_pending);
+  watchdog.add("alap_armed", (bool)g_system_memory_watchdog_alap_armed);
+  watchdog.add("alap_run_count", g_system_memory_watchdog_alap_run_count);
+  watchdog.add("alap_arm_count", g_system_memory_watchdog_alap_arm_count);
+  watchdog.add("alap_arm_failures",
+               g_system_memory_watchdog_alap_arm_failures);
+  watchdog.add("event_count", g_system_memory_watchdog_event_count);
+  out.add_object("watchdog", watchdog);
+  return out;
+}
+
+// ============================================================================
 // Retained TimePop dispatch flight recorder — reporting surface
 // ============================================================================
 //
@@ -2043,40 +2680,78 @@ static FLASHMEM Payload system_timepop_dispatch_trace_entry_payload(
   return out;
 }
 
-static FLASHMEM Payload system_timepop_dispatch_trace_bank_payload(
-    const timepop_dispatch_trace_bank_snapshot_t& bank) {
+static FLASHMEM Payload system_timepop_dispatch_trace_compact_entry_payload(
+    const timepop_dispatch_trace_entry_t& entry) {
   Payload out;
-  out.add("valid", bank.valid);
-  out.add("count", bank.count);
-  out.add("newest_sequence", bank.newest_sequence);
-
-  PayloadArray records;
-  for (uint32_t i = 0U;
-       i < bank.count && i < TIMEPOP_DISPATCH_TRACE_ENTRIES;
-       ++i) {
-    Payload record =
-        system_timepop_dispatch_trace_entry_payload(bank.entries[i]);
-    record.add("index", i);
-    records.add(record);
-  }
-  out.add_array("records", records);
+  out.add("sequence", entry.sequence);
+  out.add("stage_id", entry.stage);
+  out.add("stage", timepop_dispatch_trace_stage_name(entry.stage));
+  out.add("phase", timepop_dispatch_trace_phase_name(entry.phase));
+  out.add("kind", timepop_dispatch_trace_kind_name(entry.kind));
+  out.add("slot_index", entry.slot_index);
+  out.add("handle", entry.handle);
+  system_crash_add_hex32(out, "callback", entry.callback);
+  system_crash_add_hex32(out, "slot_callback", entry.slot_callback);
+  out.add("callback_matches_slot",
+          entry.callback != 0U && entry.callback == entry.slot_callback);
+  out.add("callback_executable",
+          timepop_dispatch_trace_executable_address(entry.callback));
+  system_crash_add_hex32(out, "user_data", entry.user_data);
+  system_crash_add_hex32(out, "name_ptr", entry.name_ptr);
+  system_crash_add_hex32(out, "caller_sp", entry.caller_sp);
+  system_crash_add_hex32(out, "site_pc", entry.site_pc);
+  system_crash_add_hex32(out, "dwt", entry.dwt);
+  out.add("ipsr", entry.ipsr);
+  system_crash_add_hex32(out, "aux", entry.aux);
+  out.add("aux_meaning",
+          timepop_dispatch_trace_aux_meaning(entry.stage, entry.kind));
   return out;
 }
 
-static FLASHMEM Payload system_timepop_dispatch_trace_payload(void) {
+static FLASHMEM Payload system_timepop_dispatch_trace_payload(
+    const Payload& args) {
   timepop_dispatch_trace_snapshot(&g_system_timepop_dispatch_trace_scratch);
 
+  bool bank_valid = true;
+  const bool live_bank = system_trace_report_live_bank(args, &bank_valid);
+  if (!bank_valid) {
+    Payload error;
+    error.add("error", "bank must be live or retained");
+    return error;
+  }
+
+  const uint32_t requested = system_trace_report_count(args);
+  const uint32_t offset = system_trace_report_offset(args);
+  const timepop_dispatch_trace_bank_snapshot_t& bank = live_bank
+      ? g_system_timepop_dispatch_trace_scratch.live
+      : g_system_timepop_dispatch_trace_scratch.retained;
+  uint32_t begin = 0U;
+  uint32_t end = 0U;
+  system_trace_bounds(bank.count, requested, offset, &begin, &end);
+
   Payload out;
-  out.add("schema", "ZPNET_TIMEPOP_DISPATCH_TRACE_V1");
+  out.add("schema", "ZPNET_TIMEPOP_DISPATCH_TRACE_V2");
+  out.add("bank", live_bank ? "live" : "retained");
+  out.add("valid", bank.valid);
   out.add("capacity", TIMEPOP_DISPATCH_TRACE_ENTRIES);
-  out.add_object(
-      "live",
-      system_timepop_dispatch_trace_bank_payload(
-          g_system_timepop_dispatch_trace_scratch.live));
-  out.add_object(
-      "retained",
-      system_timepop_dispatch_trace_bank_payload(
-          g_system_timepop_dispatch_trace_scratch.retained));
+  out.add("available_count", bank.count);
+  out.add("newest_sequence", bank.newest_sequence);
+  out.add("requested_count", requested);
+  out.add("returned_count", end - begin);
+  out.add("offset_from_newest", offset);
+  out.add("has_older", begin != 0U);
+  out.add("has_newer", offset != 0U && bank.count != 0U);
+  out.add("first_sequence", begin < end ? bank.entries[begin].sequence : 0U);
+  out.add("last_sequence", begin < end ? bank.entries[end - 1U].sequence : 0U);
+
+  PayloadArray records;
+  for (uint32_t i = begin; i < end; ++i) {
+    Payload record =
+        system_timepop_dispatch_trace_compact_entry_payload(bank.entries[i]);
+    record.add("bank_index", i);
+    records.add(record);
+  }
+  out.add_array("records", records);
   return out;
 }
 
@@ -2332,6 +3007,10 @@ static FLASHMEM Payload system_crash_report_payload(bool include_text) {
   p.add_object("runtime_ledger", system_runtime_ledger_payload());
   p.add_object("timepop_dispatch_trace",
                system_timepop_dispatch_trace_summary_payload());
+  p.add_object("memory_audit_trace",
+               system_memory_audit_trace_summary_payload());
+  p.add_object("memory_watchdog_trace",
+               system_watchdog_trace_summary_payload());
   p.add_object("payload_flight", system_payload_flight_payload(true));
   return p;
 }
@@ -3048,19 +3727,25 @@ static void system_dmamem_ensure_initialized(void) {
   // publishers inspect the registry.  This function is intentionally lazy
   // because those publishers run before process_system_register().
   runtime_ledger_boot_latch();
+  system_watchdog_trace_boot_latch();
   g_system_memory_watchdog_health = memory_health_t{};
   system_feature_registry_reset();
   memset(g_system_crash_report_text, 0, sizeof(g_system_crash_report_text));
   memset(g_system_debug_buffer, 0, sizeof(g_system_debug_buffer));
   g_system_memory_info_scratch = memory_info_t{};
+  memset((void*)&g_system_memory_audit_trace_scratch, 0,
+         sizeof(g_system_memory_audit_trace_scratch));
+  memset((void*)&g_system_watchdog_trace_scratch, 0,
+         sizeof(g_system_watchdog_trace_scratch));
   memset((void*)&g_system_timepop_dispatch_trace_scratch, 0,
          sizeof(g_system_timepop_dispatch_trace_scratch));
 
   // crash_forensics.cpp owns its retained RAM2 record.  Never initialize or
   // clear that record here; it may be the only surviving witness to a reboot.
   // The same custody applies to g_sentinel_violation_retained, the runtime
-  // ledger pair, TimePop's dispatch-flight banks, and the Payload flight rings
-  // in payload.cpp: all are NOLOAD retained evidence, validated before use and
+  // ledger pair, memory-audit/watchdog trace banks, TimePop's dispatch-flight
+  // banks, and the Payload flight rings in payload.cpp: all are NOLOAD retained
+  // evidence, validated before use and
   // released only by explicit CRASH_CLEAR or their one-time per-boot latch.
   g_system_dmamem_initialized = true;
 }
@@ -3372,10 +4057,17 @@ static FLASHMEM Payload cmd_sentinel_info(const Payload& /*args*/) {
 }
 
 // ------------------------------------------------------------
-// TIMEPOP_DISPATCH_INFO — retained + live callback/control-flow transcript
+// MEMORY_AUDIT_INFO — bounded retained/live audit or watchdog transcript
 // ------------------------------------------------------------
-static FLASHMEM Payload cmd_timepop_dispatch_info(const Payload& /*args*/) {
-  return system_timepop_dispatch_trace_payload();
+static FLASHMEM Payload cmd_memory_audit_info(const Payload& args) {
+  return system_memory_audit_info_payload(args);
+}
+
+// ------------------------------------------------------------
+// TIMEPOP_DISPATCH_INFO — bounded callback/control-flow transcript
+// ------------------------------------------------------------
+static FLASHMEM Payload cmd_timepop_dispatch_info(const Payload& args) {
+  return system_timepop_dispatch_trace_payload(args);
 }
 
 // ------------------------------------------------------------
@@ -3418,6 +4110,8 @@ static FLASHMEM Payload cmd_crash_clear(const Payload& /*args*/) {
   arm_dcache_flush((void*)&g_runtime_ledger_retained,
                    sizeof(g_runtime_ledger_retained));
 
+  memory_audit_trace_clear_retained();
+  system_watchdog_trace_clear_retained();
   timepop_dispatch_trace_clear_retained();
 
   Payload resp = ok_payload();
@@ -3425,6 +4119,8 @@ static FLASHMEM Payload cmd_crash_clear(const Payload& /*args*/) {
   resp.add("crash_forensics_cleared", true);
   resp.add("sentinel_cleared", true);
   resp.add("runtime_ledger_cleared", true);
+  resp.add("memory_audit_trace_cleared", true);
+  resp.add("memory_watchdog_trace_cleared", true);
   resp.add("timepop_dispatch_trace_cleared", true);
   return resp;
 }
@@ -3483,6 +4179,7 @@ static const process_command_entry_t SYSTEM_COMMANDS[] = {
   { "CRASH_INFO",       cmd_crash_info       },
   { "CRASH_CLEAR",      cmd_crash_clear      },
   { "SENTINEL_INFO",    cmd_sentinel_info    },
+  { "MEMORY_AUDIT_INFO", cmd_memory_audit_info },
   { "TIMEPOP_DISPATCH_INFO", cmd_timepop_dispatch_info },
   { "PAYLOAD_FLIGHT_INFO", cmd_payload_flight_info },
   { "DEBUG",            cmd_debug            },

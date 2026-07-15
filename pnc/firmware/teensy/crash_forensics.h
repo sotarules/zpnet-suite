@@ -16,7 +16,7 @@
 // naturally aligned, and simple to validate after reboot.
 // ============================================================================
 
-static constexpr uint32_t CRASH_FORENSICS_SCHEMA_VERSION = 1U;
+static constexpr uint32_t CRASH_FORENSICS_SCHEMA_VERSION = 2U;
 static constexpr size_t CRASH_FORENSICS_NVIC_WORDS = 5U;
 static constexpr size_t CRASH_FORENSICS_MPU_REGIONS = 16U;
 static constexpr size_t CRASH_FORENSICS_FP_FRAME_WORDS = 18U;
@@ -29,6 +29,22 @@ enum crash_forensics_frame_source_t : uint32_t {
     CRASH_FORENSICS_FRAME_NONE = 0U,
     CRASH_FORENSICS_FRAME_MSP = 1U,
     CRASH_FORENSICS_FRAME_PSP = 2U,
+};
+
+enum crash_forensics_capture_skip_reason_t : uint32_t {
+    CRASH_FORENSICS_SKIP_NONE = 0U,
+    CRASH_FORENSICS_SKIP_INVALID_ARGUMENT = 1U,
+    CRASH_FORENSICS_SKIP_ZERO_ADDRESS = 2U,
+    CRASH_FORENSICS_SKIP_UNALIGNED_ADDRESS = 3U,
+    CRASH_FORENSICS_SKIP_ADDRESS_OVERFLOW = 4U,
+    CRASH_FORENSICS_SKIP_OUTSIDE_STACK_MEMORY = 5U,
+    CRASH_FORENSICS_SKIP_OUTSIDE_EXECUTABLE_MEMORY = 6U,
+    CRASH_FORENSICS_SKIP_MPU_DENIED = 7U,
+    CRASH_FORENSICS_SKIP_STACKING_FAULT = 8U,
+    CRASH_FORENSICS_SKIP_FRAME_XPSR_IMPLAUSIBLE = 9U,
+    CRASH_FORENSICS_SKIP_PC_IMPLAUSIBLE = 10U,
+    CRASH_FORENSICS_SKIP_LR_IMPLAUSIBLE = 11U,
+    CRASH_FORENSICS_SKIP_DUPLICATE_STACK = 12U,
 };
 
 enum crash_forensics_flag_t : uint32_t {
@@ -46,6 +62,8 @@ enum crash_forensics_flag_t : uint32_t {
     CRASH_FORENSICS_FLAG_LR_WINDOW_CAPTURED = 1UL << 11,
     CRASH_FORENSICS_FLAG_MPU_CAPTURED = 1UL << 12,
     CRASH_FORENSICS_FLAG_NVIC_CAPTURED = 1UL << 13,
+    CRASH_FORENSICS_FLAG_FRAME_CONTENT_PLAUSIBLE = 1UL << 14,
+    CRASH_FORENSICS_FLAG_CAPTURE_SKIPPED = 1UL << 15,
 };
 
 struct crash_forensics_record_t {
@@ -166,9 +184,16 @@ struct crash_forensics_record_t {
     uint32_t lr_window_word_count;
     uint32_t lr_window_words[CRASH_FORENSICS_LR_WINDOW_WORDS];
 
+    // A skipped capture is evidence, not an error path.  Each reason is scalar
+    // and survives even when a suspect window was deliberately not touched.
+    uint32_t active_stack_skip_reason;
+    uint32_t other_stack_skip_reason;
+    uint32_t pc_window_skip_reason;
+    uint32_t lr_window_skip_reason;
+
     // Keep the complete object cache-line sized.  The CRC covers all words
     // before crc32; committed and its complement are the final publication gate.
-    uint32_t reserved_tail[2];
+    uint32_t reserved_tail[6];
     uint32_t crc32;
     uint32_t committed;
     uint32_t committed_inv;
@@ -195,3 +220,4 @@ void crash_forensics_clear(void);
 
 const char* crash_forensics_exception_name(uint32_t exception_number);
 const char* crash_forensics_frame_source_name(uint32_t frame_source);
+const char* crash_forensics_capture_skip_reason_name(uint32_t reason);

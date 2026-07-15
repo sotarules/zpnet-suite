@@ -204,6 +204,63 @@ struct memory_health_t {
 };
 
 // ============================================================================
+// Retained memory-audit flight recorder
+// ============================================================================
+//
+// The ring records only scalar stage transitions.  It never allocates, logs,
+// formats, or constructs a Payload.  The live bank is copied to retained RAM2
+// once at the next boot before current audit activity can overwrite it.
+
+static constexpr uint32_t MEMORY_AUDIT_TRACE_ENTRIES = 16U;
+
+enum class memory_audit_trace_stage_t : uint32_t {
+    NONE                = 0,
+    AUDIT_ENTER         = 1,
+    MEMORY_GET_ENTER    = 2,
+    STACK_SNAPSHOT      = 3,
+    STACK_PAINT_SCAN    = 4,
+    HEAP_INFO           = 5,
+    MEMORY_GET_EXIT     = 6,
+    PAYLOAD_INFO_ENTER  = 7,
+    PAYLOAD_INFO_RETURN = 8,
+    PAYLOAD_SELF_OK     = 9,
+    STRING_POINTERS     = 10,
+    HEALTH_RULES        = 11,
+    HEALTH_COMMIT       = 12,
+    OUTPUT_COPY         = 13,
+    AUDIT_EXIT          = 14,
+};
+
+struct memory_audit_trace_entry_t {
+    uint32_t sequence;
+    uint32_t sequence_inv;
+    uint32_t stage;
+    uint32_t dwt;
+    uint32_t ipsr;
+    uint32_t value0;
+    uint32_t value1;
+    uint32_t reserved;
+};
+
+static_assert(sizeof(memory_audit_trace_entry_t) == 32U,
+              "memory audit trace entry must stay one cache line");
+
+struct memory_audit_trace_bank_snapshot_t {
+    bool valid;
+    uint32_t count;
+    uint32_t newest_sequence;
+    memory_audit_trace_entry_t entries[MEMORY_AUDIT_TRACE_ENTRIES];
+};
+
+struct memory_audit_trace_snapshot_t {
+    memory_audit_trace_bank_snapshot_t live;
+    memory_audit_trace_bank_snapshot_t retained;
+};
+
+void memory_audit_trace_snapshot(memory_audit_trace_snapshot_t* out);
+void memory_audit_trace_clear_retained(void);
+
+// ============================================================================
 // API
 // ============================================================================
 

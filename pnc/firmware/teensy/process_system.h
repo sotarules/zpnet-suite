@@ -57,8 +57,11 @@
  *       - CPU usage metrics
  *       - memory availability
  *       - internal diagnostics
- *   • TIMEPOP_DISPATCH_INFO — return live and retained TimePop callback,
- *     mutation, and rearm flight-recorder entries for control-flow analysis
+ *   • MEMORY_AUDIT_INFO — return a bounded retained/live scalar transcript
+ *     from either memory_info_audit() or its SYSTEM watchdog callback wrapper;
+ *     accepts source=audit|watchdog, bank=retained|live, count=1..8, offset=N
+ *   • TIMEPOP_DISPATCH_INFO — return a bounded TimePop callback, mutation, and
+ *     rearm transcript; accepts bank=retained|live, count=1..8, offset=N
  *
  * Terminal Transitions:
  *   • Shutdown and bootloader entry are explicit, irreversible boundary

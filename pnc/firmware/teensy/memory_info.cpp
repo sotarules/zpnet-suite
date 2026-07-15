@@ -79,11 +79,204 @@ static uint32_t _heap_arena_prev   = 0;
 
 static constexpr uint32_t MEMORY_HEAP_FREE_CRITICAL_BYTES = 32768UL;
 
-// Keep recurring audit snapshots and the sticky verdict in RAM2 so the memory
-// court does not consume the DTCM stack runway it is responsible for judging.
-static memory_info_t   _memory_health_memory_scratch DMAMEM = {};
-static payload_info_t  _memory_health_payload_scratch DMAMEM = {};
-static memory_health_t _memory_health DMAMEM = {};
+// Keep recurring audit working state in ordinary RAM1/DTCM.  These objects are
+// current-boot mutable state, not retained evidence, and therefore should use
+// normal C/C++ initialization semantics and deterministic tightly-coupled RAM.
+// Only the dedicated retained audit trace banks below remain in DMAMEM.
+static memory_info_t   _memory_health_memory_scratch = {};
+static payload_info_t  _memory_health_payload_scratch = {};
+static memory_health_t _memory_health = {};
+
+
+// ============================================================================
+// Retained memory-audit flight recorder
+// ============================================================================
+//
+// The audit is itself part of the trusted platform.  This ring therefore uses
+// only fixed RAM2 storage, scalar writes, sequence/complement commit, and one
+// cache flush per entry.  The surviving live bank is latched at the next boot
+// before current activity can overwrite it.
+
+static constexpr uint32_t MEMORY_AUDIT_TRACE_MAGIC = 0x4D414631UL;  // 'MAF1'
+static constexpr uint32_t MEMORY_AUDIT_TRACE_SCHEMA_VERSION = 1U;
+
+struct alignas(32) memory_audit_trace_bank_t {
+    uint32_t magic;
+    uint32_t magic_inv;
+    uint32_t schema_version;
+    uint32_t capacity;
+    uint32_t reserved[4];
+    memory_audit_trace_entry_t entries[MEMORY_AUDIT_TRACE_ENTRIES];
+};
+
+static_assert((sizeof(memory_audit_trace_bank_t) % 32U) == 0U,
+              "memory audit trace bank must occupy complete cache lines");
+
+static memory_audit_trace_bank_t _memory_audit_trace_live DMAMEM;
+static memory_audit_trace_bank_t _memory_audit_trace_retained DMAMEM;
+static bool _memory_audit_trace_boot_latched = false;  // ordinary BSS
+static volatile bool _memory_audit_trace_active = false;  // ordinary BSS
+static uint32_t _memory_audit_trace_next_sequence = 0U;
+
+static inline void memory_audit_trace_dmb(void) {
+    __asm__ volatile("dmb" ::: "memory");
+}
+
+static inline uint32_t memory_audit_trace_ipsr(void) {
+    uint32_t ipsr = 0U;
+#if defined(__arm__)
+    __asm__ volatile("mrs %0, ipsr" : "=r"(ipsr));
+#endif
+    return ipsr & 0x1FFU;
+}
+
+static inline uint32_t memory_audit_trace_irq_lock(void) {
+    uint32_t primask = 0U;
+#if defined(__arm__)
+    __asm__ volatile("mrs %0, primask" : "=r"(primask) :: "memory");
+    __asm__ volatile("cpsid i" ::: "memory");
+#endif
+    return primask;
+}
+
+static inline void memory_audit_trace_irq_unlock(uint32_t primask) {
+#if defined(__arm__)
+    __asm__ volatile("msr primask, %0" :: "r"(primask) : "memory");
+#else
+    (void)primask;
+#endif
+}
+
+static bool memory_audit_trace_bank_valid(
+    const memory_audit_trace_bank_t& bank) {
+    return bank.magic == MEMORY_AUDIT_TRACE_MAGIC &&
+           (bank.magic ^ bank.magic_inv) == 0xFFFFFFFFUL &&
+           bank.schema_version == MEMORY_AUDIT_TRACE_SCHEMA_VERSION &&
+           bank.capacity == MEMORY_AUDIT_TRACE_ENTRIES;
+}
+
+static bool memory_audit_trace_entry_valid(
+    const memory_audit_trace_entry_t& entry) {
+    return entry.sequence != 0U &&
+           (entry.sequence ^ entry.sequence_inv) == 0xFFFFFFFFUL;
+}
+
+static void memory_audit_trace_initialize_live(void) {
+    memset((void*)&_memory_audit_trace_live, 0,
+           sizeof(_memory_audit_trace_live));
+    _memory_audit_trace_live.schema_version =
+        MEMORY_AUDIT_TRACE_SCHEMA_VERSION;
+    _memory_audit_trace_live.capacity = MEMORY_AUDIT_TRACE_ENTRIES;
+    _memory_audit_trace_live.magic_inv = ~MEMORY_AUDIT_TRACE_MAGIC;
+    _memory_audit_trace_live.magic = MEMORY_AUDIT_TRACE_MAGIC;
+    _memory_audit_trace_next_sequence = 0U;
+    arm_dcache_flush((void*)&_memory_audit_trace_live,
+                     sizeof(_memory_audit_trace_live));
+}
+
+static void memory_audit_trace_boot_latch(void) {
+    if (_memory_audit_trace_boot_latched) return;
+    _memory_audit_trace_boot_latched = true;
+
+    if (memory_audit_trace_bank_valid(_memory_audit_trace_live)) {
+        _memory_audit_trace_retained = _memory_audit_trace_live;
+    } else {
+        memset((void*)&_memory_audit_trace_retained, 0,
+               sizeof(_memory_audit_trace_retained));
+    }
+    arm_dcache_flush((void*)&_memory_audit_trace_retained,
+                     sizeof(_memory_audit_trace_retained));
+    memory_audit_trace_initialize_live();
+}
+
+static void memory_audit_trace_record(memory_audit_trace_stage_t stage,
+                                      uint32_t value0,
+                                      uint32_t value1) {
+    memory_audit_trace_boot_latch();
+
+    uint32_t sequence = 0U;
+    const uint32_t saved_primask = memory_audit_trace_irq_lock();
+    sequence = _memory_audit_trace_next_sequence + 1U;
+    if (sequence == 0U) sequence = 1U;
+    _memory_audit_trace_next_sequence = sequence;
+    memory_audit_trace_irq_unlock(saved_primask);
+
+    memory_audit_trace_entry_t& entry =
+        _memory_audit_trace_live.entries[
+            (sequence - 1U) % MEMORY_AUDIT_TRACE_ENTRIES];
+
+    entry.sequence = 0U;
+    entry.sequence_inv = 0U;
+    memory_audit_trace_dmb();
+
+    entry.stage = (uint32_t)stage;
+    entry.dwt = ARM_DWT_CYCCNT;
+    entry.ipsr = memory_audit_trace_ipsr();
+    entry.value0 = value0;
+    entry.value1 = value1;
+    entry.reserved = 0U;
+
+    entry.sequence_inv = ~sequence;
+    memory_audit_trace_dmb();
+    entry.sequence = sequence;  // commit last
+    memory_audit_trace_dmb();
+    arm_dcache_flush((void*)&entry, sizeof(entry));
+}
+
+static void memory_audit_trace_snapshot_bank(
+    const memory_audit_trace_bank_t& bank,
+    memory_audit_trace_bank_snapshot_t* out) {
+    memset((void*)out, 0, sizeof(*out));
+    out->valid = memory_audit_trace_bank_valid(bank);
+    if (!out->valid) return;
+
+    for (uint32_t i = 0U; i < MEMORY_AUDIT_TRACE_ENTRIES; ++i) {
+        const volatile memory_audit_trace_entry_t* source = &bank.entries[i];
+        const uint32_t sequence_before = source->sequence;
+        const uint32_t sequence_inv_before = source->sequence_inv;
+        if (sequence_before == 0U ||
+            (sequence_before ^ sequence_inv_before) != 0xFFFFFFFFUL) {
+            continue;
+        }
+
+        const memory_audit_trace_entry_t candidate = bank.entries[i];
+        memory_audit_trace_dmb();
+        if (source->sequence != sequence_before ||
+            source->sequence_inv != sequence_inv_before ||
+            !memory_audit_trace_entry_valid(candidate)) {
+            continue;
+        }
+
+        uint32_t pos = out->count;
+        while (pos > 0U &&
+               out->entries[pos - 1U].sequence > candidate.sequence) {
+            out->entries[pos] = out->entries[pos - 1U];
+            --pos;
+        }
+        out->entries[pos] = candidate;
+        ++out->count;
+    }
+
+    if (out->count != 0U) {
+        out->newest_sequence = out->entries[out->count - 1U].sequence;
+    }
+}
+
+void memory_audit_trace_snapshot(memory_audit_trace_snapshot_t* out) {
+    if (!out) return;
+    memory_audit_trace_boot_latch();
+    memset((void*)out, 0, sizeof(*out));
+    memory_audit_trace_snapshot_bank(_memory_audit_trace_live, &out->live);
+    memory_audit_trace_snapshot_bank(_memory_audit_trace_retained,
+                                     &out->retained);
+}
+
+void memory_audit_trace_clear_retained(void) {
+    memset((void*)&_memory_audit_trace_retained, 0,
+           sizeof(_memory_audit_trace_retained));
+    arm_dcache_flush((void*)&_memory_audit_trace_retained,
+                     sizeof(_memory_audit_trace_retained));
+}
 
 // ============================================================================
 // Address helpers
@@ -145,6 +338,10 @@ static const char* memory_info_stack_paint_skip_reason_name(uint32_t reason) {
 // ============================================================================
 
 void memory_info_init() {
+
+    // Latch the previous boot's final audit transcript before any current-boot
+    // audit can reuse the live ring.
+    memory_audit_trace_boot_latch();
 
     // Teensy places DMAMEM in the NOLOAD .bss.dma section.  Startup clears
     // ordinary BSS only, so explicitly establish every RAM2 object's boot
@@ -240,6 +437,19 @@ void memory_info_init() {
 void memory_info_get(memory_info_t* out) {
     if (!out) return;
 
+    // Only the foreground court invocation owns these internal breadcrumbs.
+    // An unrelated ISR-side snapshot that preempts the audit remains a normal
+    // read-only memory_info_get() call and cannot become a recorder writer.
+    const bool audit_trace =
+        _memory_audit_trace_active && memory_audit_trace_ipsr() == 0U;
+
+    if (audit_trace) {
+        memory_audit_trace_record(
+            memory_audit_trace_stage_t::MEMORY_GET_ENTER,
+            memory_info_stack_pointer(),
+            _stack_sp_min);
+    }
+
     memset(out, 0, sizeof(memory_info_t));
 
     // --------------------------------------------------------
@@ -272,6 +482,17 @@ void memory_info_get(memory_info_t* out) {
     }
 
     out->stack_free_current = memory_info_sub_or_zero(sp, static_end);
+
+    if (audit_trace) {
+        memory_audit_trace_record(
+            memory_audit_trace_stage_t::STACK_SNAPSHOT,
+            out->stack_free_current,
+            out->stack_current);
+        memory_audit_trace_record(
+            memory_audit_trace_stage_t::STACK_PAINT_SCAN,
+            _stack_paint_start,
+            _stack_paint_end);
+    }
 
     // Empirical high-water scan.  The stack grows downward from _estack and
     // consumes the high end of the painted runway first.  We scan the full
@@ -347,6 +568,12 @@ void memory_info_get(memory_info_t* out) {
     uint32_t ram2_end   = (uint32_t)&_heap_end;
     out->heap_total = ram2_end - ram2_start;
 
+    if (audit_trace) {
+        memory_audit_trace_record(
+            memory_audit_trace_stage_t::HEAP_INFO,
+            ram2_start,
+            ram2_end);
+    }
     struct mallinfo mi = mallinfo();
 
     out->heap_arena         = mi.arena;       // committed by sbrk
@@ -392,6 +619,13 @@ void memory_info_get(memory_info_t* out) {
     } else {
         out->stack_usage_pct = 100;
         out->stack_free_pct = 0;
+    }
+
+    if (audit_trace) {
+        memory_audit_trace_record(
+            memory_audit_trace_stage_t::MEMORY_GET_EXIT,
+            out->stack_free_high_water,
+            out->heap_free_total);
     }
 }
 
@@ -448,8 +682,31 @@ const char* memory_health_reason_name(memory_health_reason_t reason) {
 }
 
 void memory_info_audit(memory_health_t* out) {
+    memory_audit_trace_record(
+        memory_audit_trace_stage_t::AUDIT_ENTER,
+        _memory_health.audit_count + 1U,
+        (uint32_t)_memory_health.status);
+    _memory_audit_trace_active = true;
+
     memory_info_get(&_memory_health_memory_scratch);
+
+    memory_audit_trace_record(
+        memory_audit_trace_stage_t::PAYLOAD_INFO_ENTER,
+        _memory_health_payload_scratch.alive_now,
+        _memory_health_payload_scratch.last_error_code);
     payload_get_info(&_memory_health_payload_scratch);
+    memory_audit_trace_record(
+        memory_audit_trace_stage_t::PAYLOAD_INFO_RETURN,
+        _memory_health_payload_scratch.alive_now,
+        _memory_health_payload_scratch.last_error_code);
+    memory_audit_trace_record(
+        memory_audit_trace_stage_t::PAYLOAD_SELF_OK,
+        _memory_health_payload_scratch.self_ok_fail,
+        _memory_health_payload_scratch.integrity_fail);
+    memory_audit_trace_record(
+        memory_audit_trace_stage_t::STRING_POINTERS,
+        _memory_health_payload_scratch.string_pointer_fault,
+        _memory_health_payload_scratch.last_string_pointer_fault_reason);
 
     const memory_info_t& memory = _memory_health_memory_scratch;
     const payload_info_t& payload = _memory_health_payload_scratch;
@@ -473,6 +730,14 @@ void memory_info_audit(memory_health_t* out) {
 
     uint32_t active_reason_mask = 0U;
     memory_health_reason_t primary_reason = memory_health_reason_t::NONE;
+
+    const uint32_t map_flags =
+        (dtcm_map_invalid ? 1U : 0U) |
+        (heap_map_invalid ? 2U : 0U);
+    memory_audit_trace_record(
+        memory_audit_trace_stage_t::HEALTH_RULES,
+        map_flags,
+        payload_lifetime_mismatch ? 1U : 0U);
 
     if (!memory.initialized) {
         memory_health_add_reason(active_reason_mask, primary_reason,
@@ -549,6 +814,11 @@ void memory_info_audit(memory_health_t* out) {
                                  memory_health_reason_t::PAYLOAD_LIFETIME_MISMATCH);
     }
 
+    memory_audit_trace_record(
+        memory_audit_trace_stage_t::HEALTH_COMMIT,
+        active_reason_mask,
+        (uint32_t)primary_reason);
+
     _memory_health.audit_count++;
     _memory_health.active_reason_mask = active_reason_mask;
     _memory_health.heap_free_critical_bytes = MEMORY_HEAP_FREE_CRITICAL_BYTES;
@@ -609,9 +879,19 @@ void memory_info_audit(memory_health_t* out) {
         ? memory_health_status_t::ANOMALY
         : memory_health_status_t::NOMINAL;
 
+    memory_audit_trace_record(
+        memory_audit_trace_stage_t::OUTPUT_COPY,
+        out ? 1U : 0U,
+        _memory_health.audit_count);
     if (out) {
         *out = _memory_health;
     }
+
+    memory_audit_trace_record(
+        memory_audit_trace_stage_t::AUDIT_EXIT,
+        _memory_health.audit_count,
+        (uint32_t)_memory_health.status);
+    _memory_audit_trace_active = false;
 }
 
 void memory_info_get_health(memory_health_t* out) {
