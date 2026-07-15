@@ -342,6 +342,18 @@ enum class timepop_dispatch_phase_t : uint8_t {
   APPLYING_MUTATIONS,
 };
 
+static_assert((uint32_t)timepop_dispatch_phase_t::IDLE ==
+                  (uint32_t)timepop_dispatch_trace_phase_t::IDLE &&
+              (uint32_t)timepop_dispatch_phase_t::ASAP ==
+                  (uint32_t)timepop_dispatch_trace_phase_t::ASAP &&
+              (uint32_t)timepop_dispatch_phase_t::TIMED ==
+                  (uint32_t)timepop_dispatch_trace_phase_t::TIMED &&
+              (uint32_t)timepop_dispatch_phase_t::ALAP ==
+                  (uint32_t)timepop_dispatch_trace_phase_t::ALAP &&
+              (uint32_t)timepop_dispatch_phase_t::APPLYING_MUTATIONS ==
+                  (uint32_t)timepop_dispatch_trace_phase_t::APPLYING_MUTATIONS,
+              "dispatch trace phase ABI must match TimePop dispatch phase");
+
 static const char* dispatch_phase_str(timepop_dispatch_phase_t phase) {
   switch (phase) {
     case timepop_dispatch_phase_t::ASAP: return "ASAP";
@@ -426,6 +438,249 @@ static volatile uint32_t diag_idle_witness_last_residency_cycles = 0;
 static volatile uint64_t diag_idle_witness_wall_cycles = 0;
 static volatile uint32_t diag_idle_witness_wall_last_dwt = 0;
 static volatile bool     diag_idle_witness_wall_initialized = false;
+
+// ============================================================================
+// Retained TimePop dispatch flight recorder
+// ============================================================================
+//
+// This ring answers a narrow control-flow question after reboot: which callback
+// pointer was selected, did the callback return, and what scheduler operation
+// followed it?  Entries are scalar-only and exactly 64 bytes.  We preserve
+// pointers as integers and never dereference a possibly corrupt name while
+// recording.
+//
+// Each entry commits with sequence/complement after all other fields.  The
+// entry itself is cache-flushed immediately.  A priority handler may preempt a
+// foreground recorder, but sequence reservation gives each writer a distinct
+// ring cell; snapshot code accepts only fully committed entries.
+
+static constexpr uint32_t TIMEPOP_DISPATCH_TRACE_MAGIC =
+    0x54504631UL;  // 'TPF1'
+static constexpr uint32_t TIMEPOP_DISPATCH_TRACE_SCHEMA_VERSION = 1U;
+
+struct alignas(32) timepop_dispatch_trace_bank_t {
+  uint32_t magic;
+  uint32_t magic_inv;
+  uint32_t schema_version;
+  uint32_t capacity;
+  uint32_t reserved[4];
+  timepop_dispatch_trace_entry_t entries[TIMEPOP_DISPATCH_TRACE_ENTRIES];
+};
+
+static_assert(sizeof(timepop_dispatch_trace_bank_t) % 32U == 0U,
+              "TimePop dispatch trace bank must be cache-line aligned");
+
+static timepop_dispatch_trace_bank_t g_timepop_dispatch_trace_live DMAMEM;
+static timepop_dispatch_trace_bank_t g_timepop_dispatch_trace_retained DMAMEM;
+static bool g_timepop_dispatch_trace_boot_latched = false;
+static volatile uint32_t g_timepop_dispatch_trace_next_sequence = 0;
+
+static inline void timepop_dispatch_trace_dmb(void) {
+  __asm__ volatile("dmb" ::: "memory");
+}
+
+static inline uint32_t timepop_dispatch_trace_ipsr(void) {
+  uint32_t ipsr = 0;
+#if defined(__arm__)
+  __asm__ volatile("mrs %0, ipsr" : "=r"(ipsr));
+#endif
+  return ipsr & 0x1FFU;
+}
+
+static inline uint32_t timepop_dispatch_trace_callback_address(
+    timepop_callback_t callback) {
+  return callback
+      ? (uint32_t)reinterpret_cast<uintptr_t>(callback)
+      : 0U;
+}
+
+static bool timepop_dispatch_trace_bank_valid(
+    const timepop_dispatch_trace_bank_t& bank) {
+  return bank.magic == TIMEPOP_DISPATCH_TRACE_MAGIC &&
+         (bank.magic ^ bank.magic_inv) == 0xFFFFFFFFUL &&
+         bank.schema_version == TIMEPOP_DISPATCH_TRACE_SCHEMA_VERSION &&
+         bank.capacity == TIMEPOP_DISPATCH_TRACE_ENTRIES;
+}
+
+static bool timepop_dispatch_trace_entry_valid(
+    const timepop_dispatch_trace_entry_t& entry) {
+  return entry.sequence != 0U &&
+         (entry.sequence ^ entry.sequence_inv) == 0xFFFFFFFFUL;
+}
+
+static void timepop_dispatch_trace_initialize_live(void) {
+  memset((void*)&g_timepop_dispatch_trace_live, 0,
+         sizeof(g_timepop_dispatch_trace_live));
+  g_timepop_dispatch_trace_live.schema_version =
+      TIMEPOP_DISPATCH_TRACE_SCHEMA_VERSION;
+  g_timepop_dispatch_trace_live.capacity = TIMEPOP_DISPATCH_TRACE_ENTRIES;
+  g_timepop_dispatch_trace_live.magic_inv = ~TIMEPOP_DISPATCH_TRACE_MAGIC;
+  g_timepop_dispatch_trace_live.magic = TIMEPOP_DISPATCH_TRACE_MAGIC;
+  g_timepop_dispatch_trace_next_sequence = 0U;
+  arm_dcache_flush((void*)&g_timepop_dispatch_trace_live,
+                   sizeof(g_timepop_dispatch_trace_live));
+}
+
+static void timepop_dispatch_trace_boot_latch(void) {
+  if (g_timepop_dispatch_trace_boot_latched) return;
+  g_timepop_dispatch_trace_boot_latched = true;
+
+  if (timepop_dispatch_trace_bank_valid(g_timepop_dispatch_trace_live)) {
+    g_timepop_dispatch_trace_retained = g_timepop_dispatch_trace_live;
+  } else {
+    memset((void*)&g_timepop_dispatch_trace_retained, 0,
+           sizeof(g_timepop_dispatch_trace_retained));
+  }
+  arm_dcache_flush((void*)&g_timepop_dispatch_trace_retained,
+                   sizeof(g_timepop_dispatch_trace_retained));
+
+  timepop_dispatch_trace_initialize_live();
+}
+
+static __attribute__((noinline)) void timepop_dispatch_trace_record(
+    timepop_dispatch_trace_stage_t stage,
+    timepop_dispatch_trace_kind_t kind,
+    uint32_t slot_index,
+    timepop_handle_t handle,
+    timepop_callback_t callback,
+    timepop_callback_t slot_callback,
+    void* user_data,
+    const char* name,
+    uint32_t aux,
+    uint32_t caller_sp) {
+  const uint32_t site_pc =
+      (uint32_t)(uintptr_t)__builtin_return_address(0);
+  timepop_dispatch_trace_boot_latch();
+
+  uint32_t sequence = 0U;
+  {
+    const uint32_t saved = critical_enter();
+    sequence = g_timepop_dispatch_trace_next_sequence + 1U;
+    if (sequence == 0U) sequence = 1U;
+    g_timepop_dispatch_trace_next_sequence = sequence;
+    critical_exit(saved);
+  }
+
+  timepop_dispatch_trace_entry_t& entry =
+      g_timepop_dispatch_trace_live.entries[
+          (sequence - 1U) % TIMEPOP_DISPATCH_TRACE_ENTRIES];
+
+  // Invalidate before reusing a ring cell.
+  entry.sequence = 0U;
+  entry.sequence_inv = 0U;
+  timepop_dispatch_trace_dmb();
+
+  entry.stage = (uint32_t)stage;
+  entry.phase = (uint32_t)dispatch_phase;
+  entry.kind = (uint32_t)kind;
+  entry.slot_index = slot_index;
+  entry.handle = handle;
+  entry.callback = timepop_dispatch_trace_callback_address(callback);
+  entry.slot_callback =
+      timepop_dispatch_trace_callback_address(slot_callback);
+  entry.user_data = (uint32_t)(uintptr_t)user_data;
+  entry.name_ptr = (uint32_t)(uintptr_t)name;
+  entry.caller_sp = caller_sp;
+  entry.site_pc = site_pc;
+  entry.dwt = ARM_DWT_CYCCNT;
+  entry.ipsr = timepop_dispatch_trace_ipsr();
+  entry.aux = aux;
+
+  entry.sequence_inv = ~sequence;
+  timepop_dispatch_trace_dmb();
+  entry.sequence = sequence;  // commit last
+  timepop_dispatch_trace_dmb();
+
+  arm_dcache_flush((void*)&entry, sizeof(entry));
+}
+
+#if defined(__arm__)
+#define TIMEPOP_DISPATCH_TRACE(stage, kind, slot_index, handle, callback,      \
+                               slot_callback, user_data, name, aux)           \
+  do {                                                                        \
+    uint32_t timepop_dispatch_trace_sp_;                                       \
+    __asm__ volatile("mov %0, sp" : "=r"(timepop_dispatch_trace_sp_));         \
+    timepop_dispatch_trace_record((stage), (kind), (slot_index), (handle),     \
+                                  (callback), (slot_callback), (user_data),    \
+                                  (name), (aux),                               \
+                                  timepop_dispatch_trace_sp_);                 \
+  } while (0)
+#else
+#define TIMEPOP_DISPATCH_TRACE(stage, kind, slot_index, handle, callback,      \
+                               slot_callback, user_data, name, aux)           \
+  timepop_dispatch_trace_record((stage), (kind), (slot_index), (handle),       \
+                                (callback), (slot_callback), (user_data),      \
+                                (name), (aux), 0U)
+#endif
+
+static uint32_t timepop_dispatch_trace_slot_flags(
+    const timepop_slot_t& slot) {
+  return (slot.active ? 1U : 0U) |
+         (slot.expired ? 2U : 0U) |
+         (slot.recurring ? 4U : 0U) |
+         (slot.isr_callback ? 8U : 0U) |
+         (slot.rearm_in_isr ? 16U : 0U);
+}
+
+static void timepop_dispatch_trace_snapshot_bank(
+    const timepop_dispatch_trace_bank_t& bank,
+    timepop_dispatch_trace_bank_snapshot_t* out) {
+  memset((void*)out, 0, sizeof(*out));
+  out->valid = timepop_dispatch_trace_bank_valid(bank);
+  if (!out->valid) return;
+
+  for (uint32_t i = 0; i < TIMEPOP_DISPATCH_TRACE_ENTRIES; ++i) {
+    const volatile timepop_dispatch_trace_entry_t* source =
+        &bank.entries[i];
+    const uint32_t sequence_before = source->sequence;
+    const uint32_t sequence_inv_before = source->sequence_inv;
+    if (sequence_before == 0U ||
+        (sequence_before ^ sequence_inv_before) != 0xFFFFFFFFUL) {
+      continue;
+    }
+
+    timepop_dispatch_trace_entry_t candidate =
+        bank.entries[i];
+    timepop_dispatch_trace_dmb();
+
+    if (source->sequence != sequence_before ||
+        source->sequence_inv != sequence_inv_before ||
+        !timepop_dispatch_trace_entry_valid(candidate)) {
+      continue;
+    }
+
+    uint32_t pos = out->count;
+    while (pos > 0U &&
+           out->entries[pos - 1U].sequence > candidate.sequence) {
+      out->entries[pos] = out->entries[pos - 1U];
+      pos--;
+    }
+    out->entries[pos] = candidate;
+    out->count++;
+  }
+
+  if (out->count != 0U) {
+    out->newest_sequence = out->entries[out->count - 1U].sequence;
+  }
+}
+
+void timepop_dispatch_trace_snapshot(
+    timepop_dispatch_trace_snapshot_t* out) {
+  if (!out) return;
+  timepop_dispatch_trace_boot_latch();
+  memset((void*)out, 0, sizeof(*out));
+  timepop_dispatch_trace_snapshot_bank(g_timepop_dispatch_trace_live,
+                                       &out->live);
+  timepop_dispatch_trace_snapshot_bank(g_timepop_dispatch_trace_retained,
+                                       &out->retained);
+}
+
+void timepop_dispatch_trace_clear_retained(void) {
+  memset((void*)&g_timepop_dispatch_trace_retained, 0,
+         sizeof(g_timepop_dispatch_trace_retained));
+  arm_dcache_flush((void*)&g_timepop_dispatch_trace_retained,
+                   sizeof(g_timepop_dispatch_trace_retained));
+}
 
 // ============================================================================
 // Diagnostics
@@ -1314,7 +1569,19 @@ static void timepop_apply_dispatch_mutations(const char* context) {
   dispatch_applying_mutations = true;
   const timepop_dispatch_phase_t prior_phase = dispatch_phase;
   dispatch_phase = timepop_dispatch_phase_t::APPLYING_MUTATIONS;
+  const uint32_t queued_at_entry = dispatch_mutation_count;
   critical_exit(saved);
+
+  TIMEPOP_DISPATCH_TRACE(
+      timepop_dispatch_trace_stage_t::MUTATION_BARRIER_ENTER,
+      timepop_dispatch_trace_kind_t::MUTATION,
+      TIMEPOP_DISPATCH_TRACE_NO_SLOT,
+      TIMEPOP_INVALID_HANDLE,
+      nullptr,
+      nullptr,
+      nullptr,
+      context,
+      queued_at_entry);
 
   diag_dispatch_mutation_apply_passes++;
   diag_dispatch_mutation_last_context = context;
@@ -1324,13 +1591,26 @@ static void timepop_apply_dispatch_mutations(const char* context) {
   while (pop_dispatch_mutation(m)) {
     bool ok = false;
     timepop_handle_t h = TIMEPOP_INVALID_HANDLE;
-
-    diag_dispatch_mutation_last_kind = dispatch_mutation_kind_str(m.kind);
-    diag_dispatch_mutation_last_phase = dispatch_phase_str(m.queued_phase);
-    diag_dispatch_mutation_last_handle =
+    const timepop_handle_t mutation_handle =
         (m.kind == timepop_dispatch_mutation_kind_t::CANCEL_HANDLE)
             ? m.cancel_handle
             : m.reserved_handle;
+    const char* mutation_name = dispatch_mutation_name_or_null(m);
+
+    diag_dispatch_mutation_last_kind = dispatch_mutation_kind_str(m.kind);
+    diag_dispatch_mutation_last_phase = dispatch_phase_str(m.queued_phase);
+    diag_dispatch_mutation_last_handle = mutation_handle;
+
+    TIMEPOP_DISPATCH_TRACE(
+        timepop_dispatch_trace_stage_t::MUTATION_SELECTED,
+        timepop_dispatch_trace_kind_t::MUTATION,
+        TIMEPOP_DISPATCH_TRACE_NO_SLOT,
+        mutation_handle,
+        m.callback,
+        nullptr,
+        m.user_data,
+        mutation_name,
+        (uint32_t)m.kind);
 
     switch (m.kind) {
       case timepop_dispatch_mutation_kind_t::ARM_RELATIVE:
@@ -1338,7 +1618,7 @@ static void timepop_apply_dispatch_mutations(const char* context) {
                                        m.recurring,
                                        m.callback,
                                        m.user_data,
-                                       dispatch_mutation_name_or_null(m),
+                                       mutation_name,
                                        m.isr_callback,
                                        m.rearm_in_isr,
                                        m.priority,
@@ -1352,7 +1632,7 @@ static void timepop_apply_dispatch_mutations(const char* context) {
                                        m.ns0,
                                        m.callback,
                                        m.user_data,
-                                       dispatch_mutation_name_or_null(m),
+                                       mutation_name,
                                        m.isr_callback,
                                        m.u32_0,
                                        m.priority,
@@ -1365,7 +1645,7 @@ static void timepop_apply_dispatch_mutations(const char* context) {
                                                 m.ns0,
                                                 m.callback,
                                                 m.user_data,
-                                                dispatch_mutation_name_or_null(m),
+                                                mutation_name,
                                                 m.priority,
                                                 m.reserved_handle);
         ok = (h == m.reserved_handle && h != TIMEPOP_INVALID_HANDLE);
@@ -1377,7 +1657,7 @@ static void timepop_apply_dispatch_mutations(const char* context) {
                                                                m.ns0,
                                                                m.callback,
                                                                m.user_data,
-                                                               dispatch_mutation_name_or_null(m),
+                                                               mutation_name,
                                                                m.priority,
                                                                m.reserved_handle);
         ok = (h == m.reserved_handle && h != TIMEPOP_INVALID_HANDLE);
@@ -1415,6 +1695,36 @@ static void timepop_apply_dispatch_mutations(const char* context) {
         diag_dispatch_mutation_cancel_failures++;
       }
     }
+
+    uint32_t result_slot = TIMEPOP_DISPATCH_TRACE_NO_SLOT;
+    timepop_callback_t result_slot_callback = nullptr;
+    void* result_slot_user_data = m.user_data;
+    const char* result_slot_name = mutation_name;
+    if (h != TIMEPOP_INVALID_HANDLE) {
+      for (uint32_t i = 0U; i < MAX_SLOTS; ++i) {
+        if (!slots[i].active || slots[i].handle != h) continue;
+        result_slot = i;
+        result_slot_callback = slots[i].callback;
+        result_slot_user_data = slots[i].user_data;
+        result_slot_name = slots[i].name;
+        break;
+      }
+    }
+
+    const uint32_t result_aux =
+        ((uint32_t)m.kind & 0xFFU) |
+        (ok ? 0x00000100UL : 0U) |
+        ((dispatch_mutation_count & 0xFFFFU) << 16);
+    TIMEPOP_DISPATCH_TRACE(
+        timepop_dispatch_trace_stage_t::MUTATION_RESULT,
+        timepop_dispatch_trace_kind_t::MUTATION,
+        result_slot,
+        h != TIMEPOP_INVALID_HANDLE ? h : mutation_handle,
+        m.callback,
+        result_slot_callback,
+        result_slot_user_data,
+        result_slot_name,
+        result_aux);
   }
 
   const uint32_t schedule_after = diag_schedule_next_calls_total;
@@ -1433,6 +1743,17 @@ static void timepop_apply_dispatch_mutations(const char* context) {
   dispatch_phase = prior_phase;
   dispatch_applying_mutations = false;
   critical_exit(saved2);
+
+  TIMEPOP_DISPATCH_TRACE(
+      timepop_dispatch_trace_stage_t::MUTATION_BARRIER_EXIT,
+      timepop_dispatch_trace_kind_t::MUTATION,
+      TIMEPOP_DISPATCH_TRACE_NO_SLOT,
+      TIMEPOP_INVALID_HANDLE,
+      nullptr,
+      nullptr,
+      nullptr,
+      context,
+      schedule_delta);
 }
 
 // ============================================================================
@@ -2883,23 +3204,89 @@ static void timepop_process_ch2_event_in_scheduler_irq(const interrupt_event_t& 
     if (i >= MAX_SLOTS) break;
     irq_callback_dispatched[i] = true;
 
+    const timepop_callback_t callback = slots[i].callback;
+    void* const callback_user_data = slots[i].user_data;
+    const char* const callback_name = slots[i].name;
+    const timepop_handle_t callback_handle = slots[i].handle;
+
+    TIMEPOP_DISPATCH_TRACE(
+        timepop_dispatch_trace_stage_t::IRQ_SELECTED,
+        timepop_dispatch_trace_kind_t::ISR_TIMED,
+        i,
+        callback_handle,
+        callback,
+        slots[i].callback,
+        callback_user_data,
+        callback_name,
+        slots[i].deadline);
+
     timepop_ctx_t ctx;
     slot_build_ctx(slots[i], ctx);
 
     timepop_diag_t diag;
     slot_build_diag(slots[i], dwt_entry, diag);
 
-    slots[i].callback(&ctx, &diag, slots[i].user_data);
+    TIMEPOP_DISPATCH_TRACE(
+        timepop_dispatch_trace_stage_t::CALLBACK_ENTER,
+        timepop_dispatch_trace_kind_t::ISR_TIMED,
+        i,
+        callback_handle,
+        callback,
+        slots[i].callback,
+        callback_user_data,
+        callback_name,
+        timepop_dispatch_trace_slot_flags(slots[i]));
+
+    callback(&ctx, &diag, callback_user_data);
+
+    TIMEPOP_DISPATCH_TRACE(
+        timepop_dispatch_trace_stage_t::CALLBACK_RETURN,
+        timepop_dispatch_trace_kind_t::ISR_TIMED,
+        i,
+        slots[i].handle,
+        callback,
+        slots[i].callback,
+        callback_user_data,
+        callback_name,
+        timepop_dispatch_trace_slot_flags(slots[i]));
+
     slots[i].isr_callback_fired = true;
     diag_isr_callbacks++;
 
     if (slots[i].recurring && slots[i].rearm_in_isr) {
-      if (rearm_recurring_slot_from_irq(slots[i], now, event_fire_gnss_ns, anchor)) {
+      TIMEPOP_DISPATCH_TRACE(
+          timepop_dispatch_trace_stage_t::REARM_BEGIN,
+          timepop_dispatch_trace_kind_t::REARM,
+          i,
+          slots[i].handle,
+          callback,
+          slots[i].callback,
+          slots[i].user_data,
+          slots[i].name,
+          slots[i].deadline);
+
+      const bool rearmed =
+          rearm_recurring_slot_from_irq(slots[i],
+                                        now,
+                                        event_fire_gnss_ns,
+                                        anchor);
+      if (rearmed) {
         diag_isr_recurring_rearmed++;
       } else {
         slots[i] = {};
         diag_isr_recurring_rearm_failures++;
       }
+
+      TIMEPOP_DISPATCH_TRACE(
+          timepop_dispatch_trace_stage_t::REARM_END,
+          timepop_dispatch_trace_kind_t::REARM,
+          i,
+          slots[i].handle,
+          callback,
+          slots[i].callback,
+          slots[i].user_data,
+          slots[i].name,
+          rearmed ? slots[i].deadline : 0U);
     }
   }
 
@@ -2950,11 +3337,17 @@ static void dispatch_deferred_phase(deferred_slot_t* slots_buf,
                                     uint32_t max_slots,
                                     volatile uint32_t& dispatched_count,
                                     volatile uint32_t& last_dispatch_dwt) {
+  const timepop_dispatch_trace_kind_t trace_kind =
+      (slots_buf == asap_slots)
+          ? timepop_dispatch_trace_kind_t::ASAP
+          : timepop_dispatch_trace_kind_t::ALAP;
+
   for (uint32_t i = 0; i < max_slots; i++) {
     timepop_callback_t callback = nullptr;
     void* user_data = nullptr;
     timepop_handle_t handle = TIMEPOP_INVALID_HANDLE;
     const char* name = nullptr;
+    uint32_t generation = 0U;
 
     {
       const uint32_t saved = critical_enter();
@@ -2963,6 +3356,7 @@ static void dispatch_deferred_phase(deferred_slot_t* slots_buf,
         user_data = slots_buf[i].user_data;
         handle = slots_buf[i].handle;
         name = slots_buf[i].name;
+        generation = slots_buf[i].generation;
 
         slots_buf[i].pending = false;
         slots_buf[i].dispatching = true;
@@ -2974,12 +3368,45 @@ static void dispatch_deferred_phase(deferred_slot_t* slots_buf,
 
     if (!callback || handle == TIMEPOP_INVALID_HANDLE) continue;
 
+    TIMEPOP_DISPATCH_TRACE(
+        timepop_dispatch_trace_stage_t::DEFERRED_SELECTED,
+        trace_kind,
+        i,
+        handle,
+        callback,
+        slots_buf[i].callback,
+        user_data,
+        name,
+        generation);
+
     timepop_ctx_t ctx;
     build_deferred_ctx(handle, ctx);
+
+    TIMEPOP_DISPATCH_TRACE(
+        timepop_dispatch_trace_stage_t::CALLBACK_ENTER,
+        trace_kind,
+        i,
+        handle,
+        callback,
+        slots_buf[i].callback,
+        user_data,
+        name,
+        generation);
 
     const uint32_t start = ARM_DWT_CYCCNT;
     callback(&ctx, nullptr, user_data);
     const uint32_t end = ARM_DWT_CYCCNT;
+
+    TIMEPOP_DISPATCH_TRACE(
+        timepop_dispatch_trace_stage_t::CALLBACK_RETURN,
+        trace_kind,
+        i,
+        handle,
+        callback,
+        slots_buf[i].callback,
+        user_data,
+        name,
+        end - start);
 
     cpu_usage_account_busy(end - start);
     diag_dispatch_callbacks++;
@@ -3001,6 +3428,21 @@ static void dispatch_deferred_phase(deferred_slot_t* slots_buf,
       }
       critical_exit(saved);
     }
+
+    const uint32_t cleanup_flags =
+        (slots_buf[i].pending ? 1U : 0U) |
+        (slots_buf[i].dispatching ? 2U : 0U) |
+        ((slots_buf[i].generation & 0xFFFFU) << 16);
+    TIMEPOP_DISPATCH_TRACE(
+        timepop_dispatch_trace_stage_t::DEFERRED_CLEANUP,
+        trace_kind,
+        i,
+        slots_buf[i].handle,
+        callback,
+        slots_buf[i].callback,
+        slots_buf[i].user_data,
+        slots_buf[i].name,
+        cleanup_flags);
   }
 }
 
@@ -3111,6 +3553,10 @@ static timepop_handle_t arm_deferred(deferred_slot_t* slots_buf,
 // ============================================================================
 
 void timepop_init(void) {
+  // Preserve the previous boot's final dispatch transcript before any current
+  // TimePop activity can overwrite the live RAM2 bank.
+  timepop_dispatch_trace_boot_latch();
+
   for (uint32_t i = 0; i < MAX_SLOTS; i++) slots[i] = {};
   for (uint32_t i = 0; i < MAX_ASAP_SLOTS; i++) asap_slots[i] = {};
   for (uint32_t i = 0; i < MAX_ALAP_SLOTS; i++) alap_slots[i] = {};
@@ -4122,7 +4568,29 @@ void timepop_dispatch(void) {
 
   diag_dispatch_calls++;
 
+  TIMEPOP_DISPATCH_TRACE(
+      timepop_dispatch_trace_stage_t::DISPATCH_ENTER,
+      timepop_dispatch_trace_kind_t::DISPATCH,
+      TIMEPOP_DISPATCH_TRACE_NO_SLOT,
+      TIMEPOP_INVALID_HANDLE,
+      nullptr,
+      nullptr,
+      nullptr,
+      nullptr,
+      diag_dispatch_calls);
+
   timepop_dispatch_enter(timepop_dispatch_phase_t::ASAP);
+
+  TIMEPOP_DISPATCH_TRACE(
+      timepop_dispatch_trace_stage_t::PHASE_ASAP,
+      timepop_dispatch_trace_kind_t::DISPATCH,
+      TIMEPOP_DISPATCH_TRACE_NO_SLOT,
+      TIMEPOP_INVALID_HANDLE,
+      nullptr,
+      nullptr,
+      nullptr,
+      nullptr,
+      deferred_pending_count(asap_slots, MAX_ASAP_SLOTS));
 
   dispatch_deferred_phase(asap_slots,
                           MAX_ASAP_SLOTS,
@@ -4131,6 +4599,17 @@ void timepop_dispatch(void) {
 
   timepop_apply_dispatch_mutations("after_asap");
   timepop_dispatch_set_phase(timepop_dispatch_phase_t::TIMED);
+
+  TIMEPOP_DISPATCH_TRACE(
+      timepop_dispatch_trace_stage_t::PHASE_TIMED,
+      timepop_dispatch_trace_kind_t::DISPATCH,
+      TIMEPOP_DISPATCH_TRACE_NO_SLOT,
+      TIMEPOP_INVALID_HANDLE,
+      nullptr,
+      nullptr,
+      nullptr,
+      nullptr,
+      expired_count);
 
   const uint32_t dispatch_now = vclock_count();
   (void)dispatch_now;
@@ -4151,6 +4630,24 @@ void timepop_dispatch(void) {
     // its next appointment is fully authored below.
     const bool callback_already_ran = slots[i].isr_callback_fired;
     const timepop_handle_t callback_handle = slots[i].handle;
+    const timepop_callback_t callback = slots[i].callback;
+    void* const callback_user_data = slots[i].user_data;
+    const char* const callback_name = slots[i].name;
+    const uint32_t selected_flags =
+        timepop_dispatch_trace_slot_flags(slots[i]) |
+        (callback_already_ran ? 0x00000100UL : 0U);
+
+    TIMEPOP_DISPATCH_TRACE(
+        timepop_dispatch_trace_stage_t::TIMED_SELECTED,
+        timepop_dispatch_trace_kind_t::TIMED,
+        i,
+        callback_handle,
+        callback,
+        slots[i].callback,
+        callback_user_data,
+        callback_name,
+        selected_flags);
+
     slots[i].isr_callback_fired = false;
 
     if (!callback_already_ran) {
@@ -4171,13 +4668,40 @@ void timepop_dispatch(void) {
         if (latency > diag_timed_dispatch_latency_max_cycles) {
           diag_timed_dispatch_latency_max_cycles = latency;
         }
-        diag_timed_dispatch_last_name = slots[i].name;
+        diag_timed_dispatch_last_name = callback_name;
       }
 
-      slots[i].callback(&ctx, &diag, slots[i].user_data);
+      TIMEPOP_DISPATCH_TRACE(
+          timepop_dispatch_trace_stage_t::CALLBACK_ENTER,
+          timepop_dispatch_trace_kind_t::TIMED,
+          i,
+          callback_handle,
+          callback,
+          slots[i].callback,
+          callback_user_data,
+          callback_name,
+          timepop_dispatch_trace_slot_flags(slots[i]));
+
+      // The local target is the exact pointer recorded immediately above.
+      // If it is corrupt, the retained CALL_ENTER entry survives the resulting
+      // instruction-access fault.  If return state is corrupt, CALL_RETURN is
+      // absent even though the recorded callback target was executable.
+      callback(&ctx, &diag, callback_user_data);
 
       const uint32_t end = ARM_DWT_CYCCNT;
       const uint32_t body_cycles = end - start;
+
+      TIMEPOP_DISPATCH_TRACE(
+          timepop_dispatch_trace_stage_t::CALLBACK_RETURN,
+          timepop_dispatch_trace_kind_t::TIMED,
+          i,
+          slots[i].handle,
+          callback,
+          slots[i].callback,
+          callback_user_data,
+          callback_name,
+          body_cycles);
+
       diag_timed_dispatch_callback_body_last_cycles = body_cycles;
       if (body_cycles > diag_timed_dispatch_callback_body_max_cycles) {
         diag_timed_dispatch_callback_body_max_cycles = body_cycles;
@@ -4189,9 +4713,38 @@ void timepop_dispatch(void) {
       timepop_apply_dispatch_mutations("timed_callback");
     }
 
+    const bool handle_matches = slots[i].handle == callback_handle;
+    const bool callback_matches = slots[i].callback == callback;
+    const uint32_t post_callback_flags =
+        timepop_dispatch_trace_slot_flags(slots[i]) |
+        (callback_already_ran ? 0x00000100UL : 0U) |
+        (handle_matches ? 0x00000200UL : 0U) |
+        (callback_matches ? 0x00000400UL : 0U);
+
+    TIMEPOP_DISPATCH_TRACE(
+        timepop_dispatch_trace_stage_t::TIMED_SLOT_AFTER_CALLBACK,
+        timepop_dispatch_trace_kind_t::TIMED,
+        i,
+        slots[i].handle,
+        callback,
+        slots[i].callback,
+        slots[i].user_data,
+        slots[i].name,
+        post_callback_flags);
+
     // The callback may have cancelled or otherwise retired this slot.  Do not
     // resurrect it by performing the normal recurring rearm path afterward.
     if (!slots[i].active) {
+      TIMEPOP_DISPATCH_TRACE(
+          timepop_dispatch_trace_stage_t::SLOT_RETIRED,
+          timepop_dispatch_trace_kind_t::TIMED,
+          i,
+          callback_handle,
+          callback,
+          slots[i].callback,
+          callback_user_data,
+          callback_name,
+          1U);  // callback/mutation retired the slot
       slots[i].expired = false;
       slots[i].isr_callback_fired = false;
       continue;
@@ -4199,38 +4752,79 @@ void timepop_dispatch(void) {
     if (slots[i].handle != callback_handle) {
       // A dispatch-time mutation replaced this table entry at a safe barrier.
       // Do not let the completed callback clean up or rearm the new occupant.
+      TIMEPOP_DISPATCH_TRACE(
+          timepop_dispatch_trace_stage_t::SLOT_REPLACED,
+          timepop_dispatch_trace_kind_t::TIMED,
+          i,
+          slots[i].handle,
+          callback,
+          slots[i].callback,
+          slots[i].user_data,
+          slots[i].name,
+          callback_handle);
       continue;
     }
 
     // ── Recurring rearm ──
     if (slots[i].recurring) {
+      TIMEPOP_DISPATCH_TRACE(
+          timepop_dispatch_trace_stage_t::REARM_BEGIN,
+          timepop_dispatch_trace_kind_t::REARM,
+          i,
+          slots[i].handle,
+          callback,
+          slots[i].callback,
+          slots[i].user_data,
+          slots[i].name,
+          slots[i].deadline);
+
       if (slots[i].recurrence_mode == timepop_recurrence_mode_t::ABSOLUTE &&
           slots[i].recurring_period_gnss_ns > 0 &&
           slots[i].target_gnss_ns > 0) {
-        int64_t next_target_gnss_ns = slots[i].target_gnss_ns + (int64_t)slots[i].recurring_period_gnss_ns;
+        int64_t next_target_gnss_ns =
+            slots[i].target_gnss_ns +
+            (int64_t)slots[i].recurring_period_gnss_ns;
         const int64_t now_gnss_ns = time_gnss_ns_now();
-        if (slots[i].recurring_base_fixed && slots[i].recurring_base_gnss_ns > 0) {
+        if (slots[i].recurring_base_fixed &&
+            slots[i].recurring_base_gnss_ns > 0) {
           uint32_t skipped = 0;
-          if (!anchored_next_target_gnss_ns(slots[i].recurring_base_gnss_ns,
-                                            slots[i].recurring_period_gnss_ns,
-                                            now_gnss_ns,
-                                            next_target_gnss_ns,
-                                            &skipped)) {
+          if (!anchored_next_target_gnss_ns(
+                  slots[i].recurring_base_gnss_ns,
+                  slots[i].recurring_period_gnss_ns,
+                  now_gnss_ns,
+                  next_target_gnss_ns,
+                  &skipped)) {
             slots[i].active = false;
             slots[i].expired = false;
             slots[i].isr_callback_fired = false;
+            TIMEPOP_DISPATCH_TRACE(
+                timepop_dispatch_trace_stage_t::SLOT_RETIRED,
+                timepop_dispatch_trace_kind_t::REARM,
+                i,
+                callback_handle,
+                callback,
+                slots[i].callback,
+                slots[i].user_data,
+                slots[i].name,
+                2U);  // absolute grid could not author a next target
             continue;
           }
-          if (next_target_gnss_ns > slots[i].target_gnss_ns + (int64_t)slots[i].recurring_period_gnss_ns) {
+          if (next_target_gnss_ns >
+              slots[i].target_gnss_ns +
+                  (int64_t)slots[i].recurring_period_gnss_ns) {
             slots[i].recurring_immediate_expire_count++;
             slots[i].recurring_catchup_count += skipped;
           }
           slots[i].recurring_last_skipped_intervals = skipped;
           slots[i].recurring_total_skipped_intervals += skipped;
-        } else if (now_gnss_ns >= 0 && next_target_gnss_ns <= now_gnss_ns) {
+        } else if (now_gnss_ns >= 0 &&
+                   next_target_gnss_ns <= now_gnss_ns) {
           const uint64_t missed =
-              (uint64_t)((now_gnss_ns - next_target_gnss_ns) / (int64_t)slots[i].recurring_period_gnss_ns) + 1ULL;
-          next_target_gnss_ns += (int64_t)(missed * slots[i].recurring_period_gnss_ns);
+              (uint64_t)((now_gnss_ns - next_target_gnss_ns) /
+                         (int64_t)slots[i].recurring_period_gnss_ns) +
+              1ULL;
+          next_target_gnss_ns +=
+              (int64_t)(missed * slots[i].recurring_period_gnss_ns);
           slots[i].recurring_immediate_expire_count++;
           slots[i].recurring_catchup_count += (uint32_t)missed;
           slots[i].recurring_last_skipped_intervals = (uint32_t)missed;
@@ -4240,16 +4834,27 @@ void timepop_dispatch(void) {
         const time_anchor_snapshot_t snap =
             timepop_anchor_snapshot("dispatch_rearm");
         uint32_t next_deadline = 0;
-        if (!gnss_ns_to_vclock_deadline(next_target_gnss_ns, snap, next_deadline)) {
+        if (!gnss_ns_to_vclock_deadline(
+                next_target_gnss_ns, snap, next_deadline)) {
           slots[i].active = false;
           slots[i].expired = false;
           slots[i].isr_callback_fired = false;
+          TIMEPOP_DISPATCH_TRACE(
+              timepop_dispatch_trace_stage_t::SLOT_RETIRED,
+              timepop_dispatch_trace_kind_t::REARM,
+              i,
+              callback_handle,
+              callback,
+              slots[i].callback,
+              slots[i].user_data,
+              slots[i].name,
+              3U);  // GNSS target could not convert to a VCLOCK deadline
         } else {
           slots[i].target_gnss_ns = next_target_gnss_ns;
           slots[i].deadline = next_deadline;
           slots[i].recurring_rearmed_count++;
           slots[i].predicted_dwt = predict_dwt_at_deadline(
-            slots[i].deadline, slots[i].prediction_valid);
+              slots[i].deadline, slots[i].prediction_valid);
           slots[i].expired = false;
           record_slot_arm_diag(slots[i],
                                timepop_arm_source_t::DISPATCH_ABSOLUTE_REARM,
@@ -4260,11 +4865,32 @@ void timepop_dispatch(void) {
           diag_schedule_next_calls_from_dispatch++;
           schedule_next();
           critical_exit(saved);
+
+          TIMEPOP_DISPATCH_TRACE(
+              timepop_dispatch_trace_stage_t::REARM_END,
+              timepop_dispatch_trace_kind_t::REARM,
+              i,
+              slots[i].handle,
+              callback,
+              slots[i].callback,
+              slots[i].user_data,
+              slots[i].name,
+              slots[i].deadline);
         }
       } else if (slots[i].period_ticks == 0) {
         slots[i].active = false;
         slots[i].expired = false;
         slots[i].isr_callback_fired = false;
+        TIMEPOP_DISPATCH_TRACE(
+            timepop_dispatch_trace_stage_t::SLOT_RETIRED,
+            timepop_dispatch_trace_kind_t::REARM,
+            i,
+            callback_handle,
+            callback,
+            slots[i].callback,
+            slots[i].user_data,
+            slots[i].name,
+            4U);  // recurring slot had no lawful period
       } else {
         // Relative recurring is only a bootstrap/fallback state.  As soon as a
         // lawful time anchor is available, promote it onto the PPS/VCLOCK phase
@@ -4291,34 +4917,68 @@ void timepop_dispatch(void) {
         }
 
         slots[i].predicted_dwt = predict_dwt_at_deadline(
-          slots[i].deadline, slots[i].prediction_valid);
+            slots[i].deadline, slots[i].prediction_valid);
 
         if (slots[i].prediction_valid && slots[i].target_gnss_ns < 0) {
-          slots[i].target_gnss_ns = time_gnss_ns_at_dwt(slots[i].predicted_dwt);
+          slots[i].target_gnss_ns =
+              time_gnss_ns_at_dwt(slots[i].predicted_dwt);
         }
 
         slots[i].expired = false;
-        record_slot_arm_diag(slots[i],
-                             slots[i].is_absolute
-                                 ? timepop_arm_source_t::DISPATCH_PHASE_LOCKED_REARM
-                                 : timepop_arm_source_t::DISPATCH_RELATIVE_REARM,
-                             true,
-                             vclock_count(),
-                             slots[i].target_gnss_ns);
+        record_slot_arm_diag(
+            slots[i],
+            slots[i].is_absolute
+                ? timepop_arm_source_t::DISPATCH_PHASE_LOCKED_REARM
+                : timepop_arm_source_t::DISPATCH_RELATIVE_REARM,
+            true,
+            vclock_count(),
+            slots[i].target_gnss_ns);
         const uint32_t saved = critical_enter();
         diag_schedule_next_calls_from_dispatch++;
         schedule_next();
         critical_exit(saved);
+
+        TIMEPOP_DISPATCH_TRACE(
+            timepop_dispatch_trace_stage_t::REARM_END,
+            timepop_dispatch_trace_kind_t::REARM,
+            i,
+            slots[i].handle,
+            callback,
+            slots[i].callback,
+            slots[i].user_data,
+            slots[i].name,
+            slots[i].deadline);
       }
     } else {
       slots[i].active = false;
       slots[i].expired = false;
       slots[i].isr_callback_fired = false;
+      TIMEPOP_DISPATCH_TRACE(
+          timepop_dispatch_trace_stage_t::SLOT_RETIRED,
+          timepop_dispatch_trace_kind_t::TIMED,
+          i,
+          callback_handle,
+          callback,
+          slots[i].callback,
+          slots[i].user_data,
+          slots[i].name,
+          5U);  // normal one-shot completion
     }
   }
 
   timepop_apply_dispatch_mutations("after_timed");
   timepop_dispatch_set_phase(timepop_dispatch_phase_t::ALAP);
+
+  TIMEPOP_DISPATCH_TRACE(
+      timepop_dispatch_trace_stage_t::PHASE_ALAP,
+      timepop_dispatch_trace_kind_t::DISPATCH,
+      TIMEPOP_DISPATCH_TRACE_NO_SLOT,
+      TIMEPOP_INVALID_HANDLE,
+      nullptr,
+      nullptr,
+      nullptr,
+      nullptr,
+      deferred_pending_count(alap_slots, MAX_ALAP_SLOTS));
 
   dispatch_deferred_phase(alap_slots,
                           MAX_ALAP_SLOTS,
@@ -4335,10 +4995,22 @@ void timepop_dispatch(void) {
 
   timepop_dispatch_leave();
 
+  TIMEPOP_DISPATCH_TRACE(
+      timepop_dispatch_trace_stage_t::DISPATCH_LEAVE,
+      timepop_dispatch_trace_kind_t::DISPATCH,
+      TIMEPOP_DISPATCH_TRACE_NO_SLOT,
+      TIMEPOP_INVALID_HANDLE,
+      nullptr,
+      nullptr,
+      nullptr,
+      nullptr,
+      timepop_pending ? 1U : 0U);
+
   if (!timepop_pending) {
     timepop_idle_witness_spin_until_pending();
   }
 }
+
 // ============================================================================
 // Epoch boundary
 // ============================================================================

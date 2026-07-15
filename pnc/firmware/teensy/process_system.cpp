@@ -1828,6 +1828,277 @@ static FLASHMEM Payload system_runtime_ledger_payload(void) {
   return out;
 }
 
+// ============================================================================
+// Retained TimePop dispatch flight recorder — reporting surface
+// ============================================================================
+//
+// The snapshot buffer lives in RAM2 so a report about main-stack control-flow
+// damage does not consume several kilobytes of that same stack.  The recorder
+// itself stores only scalar addresses; reporting classifies them but never
+// dereferences callback, user-data, or name pointers.
+
+static timepop_dispatch_trace_snapshot_t
+    g_system_timepop_dispatch_trace_scratch DMAMEM;
+
+static const char* timepop_dispatch_trace_stage_name(uint32_t stage) {
+  switch ((timepop_dispatch_trace_stage_t)stage) {
+    case timepop_dispatch_trace_stage_t::DISPATCH_ENTER:
+      return "DISPATCH_ENTER";
+    case timepop_dispatch_trace_stage_t::PHASE_ASAP:
+      return "PHASE_ASAP";
+    case timepop_dispatch_trace_stage_t::DEFERRED_SELECTED:
+      return "DEFERRED_SELECTED";
+    case timepop_dispatch_trace_stage_t::CALLBACK_ENTER:
+      return "CALLBACK_ENTER";
+    case timepop_dispatch_trace_stage_t::CALLBACK_RETURN:
+      return "CALLBACK_RETURN";
+    case timepop_dispatch_trace_stage_t::DEFERRED_CLEANUP:
+      return "DEFERRED_CLEANUP";
+    case timepop_dispatch_trace_stage_t::MUTATION_BARRIER_ENTER:
+      return "MUTATION_BARRIER_ENTER";
+    case timepop_dispatch_trace_stage_t::MUTATION_SELECTED:
+      return "MUTATION_SELECTED";
+    case timepop_dispatch_trace_stage_t::MUTATION_RESULT:
+      return "MUTATION_RESULT";
+    case timepop_dispatch_trace_stage_t::MUTATION_BARRIER_EXIT:
+      return "MUTATION_BARRIER_EXIT";
+    case timepop_dispatch_trace_stage_t::PHASE_TIMED:
+      return "PHASE_TIMED";
+    case timepop_dispatch_trace_stage_t::TIMED_SELECTED:
+      return "TIMED_SELECTED";
+    case timepop_dispatch_trace_stage_t::TIMED_SLOT_AFTER_CALLBACK:
+      return "TIMED_SLOT_AFTER_CALLBACK";
+    case timepop_dispatch_trace_stage_t::REARM_BEGIN:
+      return "REARM_BEGIN";
+    case timepop_dispatch_trace_stage_t::REARM_END:
+      return "REARM_END";
+    case timepop_dispatch_trace_stage_t::SLOT_RETIRED:
+      return "SLOT_RETIRED";
+    case timepop_dispatch_trace_stage_t::SLOT_REPLACED:
+      return "SLOT_REPLACED";
+    case timepop_dispatch_trace_stage_t::PHASE_ALAP:
+      return "PHASE_ALAP";
+    case timepop_dispatch_trace_stage_t::DISPATCH_LEAVE:
+      return "DISPATCH_LEAVE";
+    case timepop_dispatch_trace_stage_t::IRQ_SELECTED:
+      return "IRQ_SELECTED";
+    default:
+      return "NONE";
+  }
+}
+
+static const char* timepop_dispatch_trace_kind_name(uint32_t kind) {
+  switch ((timepop_dispatch_trace_kind_t)kind) {
+    case timepop_dispatch_trace_kind_t::DISPATCH:
+      return "DISPATCH";
+    case timepop_dispatch_trace_kind_t::ASAP:
+      return "ASAP";
+    case timepop_dispatch_trace_kind_t::TIMED:
+      return "TIMED";
+    case timepop_dispatch_trace_kind_t::ALAP:
+      return "ALAP";
+    case timepop_dispatch_trace_kind_t::ISR_TIMED:
+      return "ISR_TIMED";
+    case timepop_dispatch_trace_kind_t::MUTATION:
+      return "MUTATION";
+    case timepop_dispatch_trace_kind_t::REARM:
+      return "REARM";
+    default:
+      return "NONE";
+  }
+}
+
+static const char* timepop_dispatch_trace_phase_name(uint32_t phase) {
+  switch ((timepop_dispatch_trace_phase_t)phase) {
+    case timepop_dispatch_trace_phase_t::ASAP:
+      return "ASAP";
+    case timepop_dispatch_trace_phase_t::TIMED:
+      return "TIMED";
+    case timepop_dispatch_trace_phase_t::ALAP:
+      return "ALAP";
+    case timepop_dispatch_trace_phase_t::APPLYING_MUTATIONS:
+      return "APPLYING_MUTATIONS";
+    default:
+      return "IDLE";
+  }
+}
+
+static bool timepop_dispatch_trace_executable_address(uint32_t value) {
+  if (value == 0U) return false;
+  return sentinel_pc_plausible(value & ~1U);
+}
+
+static const char* timepop_dispatch_trace_retire_reason(uint32_t reason) {
+  switch (reason) {
+    case 1U: return "CALLBACK_OR_MUTATION_RETIRED_SLOT";
+    case 2U: return "ABSOLUTE_GRID_NEXT_TARGET_FAILED";
+    case 3U: return "GNSS_TO_VCLOCK_DEADLINE_FAILED";
+    case 4U: return "RECURRING_PERIOD_INVALID";
+    case 5U: return "ONE_SHOT_COMPLETE";
+    default: return "UNKNOWN";
+  }
+}
+
+static const char* timepop_dispatch_trace_aux_meaning(uint32_t stage,
+                                                       uint32_t kind) {
+  const timepop_dispatch_trace_stage_t stage_id =
+      (timepop_dispatch_trace_stage_t)stage;
+  const timepop_dispatch_trace_kind_t kind_id =
+      (timepop_dispatch_trace_kind_t)kind;
+
+  switch (stage_id) {
+    case timepop_dispatch_trace_stage_t::DISPATCH_ENTER:
+      return "dispatch_call_count";
+    case timepop_dispatch_trace_stage_t::PHASE_ASAP:
+    case timepop_dispatch_trace_stage_t::PHASE_ALAP:
+      return "pending_deferred_count";
+    case timepop_dispatch_trace_stage_t::PHASE_TIMED:
+      return "expired_count";
+    case timepop_dispatch_trace_stage_t::DEFERRED_SELECTED:
+      return "deferred_generation";
+    case timepop_dispatch_trace_stage_t::CALLBACK_ENTER:
+      return (kind_id == timepop_dispatch_trace_kind_t::ASAP ||
+              kind_id == timepop_dispatch_trace_kind_t::ALAP)
+          ? "deferred_generation"
+          : "slot_flags";
+    case timepop_dispatch_trace_stage_t::CALLBACK_RETURN:
+      return kind_id == timepop_dispatch_trace_kind_t::ISR_TIMED
+          ? "slot_flags"
+          : "callback_body_cycles";
+    case timepop_dispatch_trace_stage_t::DEFERRED_CLEANUP:
+      return "pending(bit0)|dispatching(bit1)|generation(bits16-31)";
+    case timepop_dispatch_trace_stage_t::MUTATION_BARRIER_ENTER:
+      return "queued_mutation_count";
+    case timepop_dispatch_trace_stage_t::MUTATION_SELECTED:
+      return "mutation_kind_id";
+    case timepop_dispatch_trace_stage_t::MUTATION_RESULT:
+      return "kind(bits0-7)|ok(bit8)|remaining_queue(bits16-31)";
+    case timepop_dispatch_trace_stage_t::MUTATION_BARRIER_EXIT:
+      return "schedule_next_call_delta";
+    case timepop_dispatch_trace_stage_t::TIMED_SELECTED:
+      return "slot_flags|callback_already_ran(bit8)";
+    case timepop_dispatch_trace_stage_t::TIMED_SLOT_AFTER_CALLBACK:
+      return "slot_flags|already_ran(bit8)|handle_match(bit9)|callback_match(bit10)";
+    case timepop_dispatch_trace_stage_t::REARM_BEGIN:
+    case timepop_dispatch_trace_stage_t::REARM_END:
+    case timepop_dispatch_trace_stage_t::IRQ_SELECTED:
+      return "slot_deadline";
+    case timepop_dispatch_trace_stage_t::SLOT_RETIRED:
+      return "retire_reason_id";
+    case timepop_dispatch_trace_stage_t::SLOT_REPLACED:
+      return "prior_handle";
+    case timepop_dispatch_trace_stage_t::DISPATCH_LEAVE:
+      return "timepop_pending";
+    default:
+      return "raw";
+  }
+}
+
+static FLASHMEM Payload system_timepop_dispatch_trace_entry_payload(
+    const timepop_dispatch_trace_entry_t& entry) {
+  Payload out;
+  out.add("sequence", entry.sequence);
+  out.add("stage_id", entry.stage);
+  out.add("stage", timepop_dispatch_trace_stage_name(entry.stage));
+  out.add("phase_id", entry.phase);
+  out.add("phase", timepop_dispatch_trace_phase_name(entry.phase));
+  out.add("kind_id", entry.kind);
+  out.add("kind", timepop_dispatch_trace_kind_name(entry.kind));
+  out.add("slot_index", entry.slot_index);
+  out.add("has_slot", entry.slot_index != TIMEPOP_DISPATCH_TRACE_NO_SLOT);
+  out.add("handle", entry.handle);
+
+  system_crash_add_hex32(out, "callback", entry.callback);
+  out.add("callback_null", entry.callback == 0U);
+  system_crash_add_hex32(out, "slot_callback", entry.slot_callback);
+  out.add("callback_matches_slot",
+          entry.callback != 0U && entry.callback == entry.slot_callback);
+  out.add("callback_executable",
+          timepop_dispatch_trace_executable_address(entry.callback));
+  out.add("slot_callback_executable",
+          timepop_dispatch_trace_executable_address(entry.slot_callback));
+
+  system_crash_add_hex32(out, "user_data", entry.user_data);
+  system_crash_add_hex32(out, "name_ptr", entry.name_ptr);
+  system_crash_add_hex32(out, "caller_sp", entry.caller_sp);
+  system_crash_add_hex32(out, "site_pc", entry.site_pc);
+  out.add("site_pc_executable",
+          timepop_dispatch_trace_executable_address(entry.site_pc));
+  system_crash_add_hex32(out, "dwt", entry.dwt);
+  out.add("ipsr", entry.ipsr);
+  system_crash_add_hex32(out, "aux", entry.aux);
+  out.add("aux_meaning",
+          timepop_dispatch_trace_aux_meaning(entry.stage, entry.kind));
+  if ((timepop_dispatch_trace_stage_t)entry.stage ==
+      timepop_dispatch_trace_stage_t::SLOT_RETIRED) {
+    out.add("retire_reason",
+            timepop_dispatch_trace_retire_reason(entry.aux));
+  }
+  if ((timepop_dispatch_trace_stage_t)entry.stage ==
+      timepop_dispatch_trace_stage_t::MUTATION_RESULT) {
+    out.add("mutation_ok", (entry.aux & 0x00000100UL) != 0U);
+    out.add("mutation_kind_id", entry.aux & 0xFFU);
+    out.add("mutation_queue_remaining", entry.aux >> 16);
+  }
+  return out;
+}
+
+static FLASHMEM Payload system_timepop_dispatch_trace_bank_payload(
+    const timepop_dispatch_trace_bank_snapshot_t& bank) {
+  Payload out;
+  out.add("valid", bank.valid);
+  out.add("count", bank.count);
+  out.add("newest_sequence", bank.newest_sequence);
+
+  PayloadArray records;
+  for (uint32_t i = 0U;
+       i < bank.count && i < TIMEPOP_DISPATCH_TRACE_ENTRIES;
+       ++i) {
+    Payload record =
+        system_timepop_dispatch_trace_entry_payload(bank.entries[i]);
+    record.add("index", i);
+    records.add(record);
+  }
+  out.add_array("records", records);
+  return out;
+}
+
+static FLASHMEM Payload system_timepop_dispatch_trace_payload(void) {
+  timepop_dispatch_trace_snapshot(&g_system_timepop_dispatch_trace_scratch);
+
+  Payload out;
+  out.add("schema", "ZPNET_TIMEPOP_DISPATCH_TRACE_V1");
+  out.add("capacity", TIMEPOP_DISPATCH_TRACE_ENTRIES);
+  out.add_object(
+      "live",
+      system_timepop_dispatch_trace_bank_payload(
+          g_system_timepop_dispatch_trace_scratch.live));
+  out.add_object(
+      "retained",
+      system_timepop_dispatch_trace_bank_payload(
+          g_system_timepop_dispatch_trace_scratch.retained));
+  return out;
+}
+
+static FLASHMEM Payload system_timepop_dispatch_trace_summary_payload(void) {
+  timepop_dispatch_trace_snapshot(&g_system_timepop_dispatch_trace_scratch);
+  const timepop_dispatch_trace_bank_snapshot_t& retained =
+      g_system_timepop_dispatch_trace_scratch.retained;
+
+  Payload out;
+  out.add("schema", "ZPNET_TIMEPOP_DISPATCH_TRACE_SUMMARY_V1");
+  out.add("retained_valid", retained.valid);
+  out.add("retained_count", retained.count);
+  out.add("newest_sequence", retained.newest_sequence);
+  if (retained.valid && retained.count != 0U) {
+    out.add_object(
+        "newest",
+        system_timepop_dispatch_trace_entry_payload(
+            retained.entries[retained.count - 1U]));
+  }
+  return out;
+}
+
 static FLASHMEM Payload system_sentinel_payload(void) {
   Payload out;
   out.add("schema", "ZPNET_SENTINEL_V1");
@@ -2044,10 +2315,11 @@ static FLASHMEM Payload system_crash_report_payload(bool include_text) {
   }
   p.add_object("extended", system_crash_forensics_payload());
 
-  // Frame-sentinel verdict and Payload flight recorder: both are retained
-  // through reboot (RAM2 NOLOAD, magic-validated) precisely so they can sit
-  // next to the exception evidence they explain.  The retained beacon says
-  // which sentinel regions were active at the moment of death.
+  // Frame-sentinel verdict, runtime breadcrumbs, TimePop dispatch flight
+  // recorder, and Payload flight recorder are retained through reboot so they
+  // can sit beside the exception evidence they explain.  The beacon says which
+  // sentinel regions were active; the dispatch summary says the last committed
+  // callback/control-flow stage.
   p.add_object("sentinel",
                system_sentinel_violation_payload(
                    &g_sentinel_violation_retained,
@@ -2058,6 +2330,8 @@ static FLASHMEM Payload system_crash_report_payload(bool include_text) {
                    &g_sentinel_beacon_retained,
                    sentinel_beacon_valid(&g_sentinel_beacon_retained)));
   p.add_object("runtime_ledger", system_runtime_ledger_payload());
+  p.add_object("timepop_dispatch_trace",
+               system_timepop_dispatch_trace_summary_payload());
   p.add_object("payload_flight", system_payload_flight_payload(true));
   return p;
 }
@@ -2779,13 +3053,15 @@ static void system_dmamem_ensure_initialized(void) {
   memset(g_system_crash_report_text, 0, sizeof(g_system_crash_report_text));
   memset(g_system_debug_buffer, 0, sizeof(g_system_debug_buffer));
   g_system_memory_info_scratch = memory_info_t{};
+  memset((void*)&g_system_timepop_dispatch_trace_scratch, 0,
+         sizeof(g_system_timepop_dispatch_trace_scratch));
 
   // crash_forensics.cpp owns its retained RAM2 record.  Never initialize or
   // clear that record here; it may be the only surviving witness to a reboot.
   // The same custody applies to g_sentinel_violation_retained, the runtime
-  // ledger pair, and the Payload flight rings in payload.cpp: all are NOLOAD
-  // retained evidence, validated before use and released only by explicit
-  // CRASH_CLEAR or their one-time per-boot latch.
+  // ledger pair, TimePop's dispatch-flight banks, and the Payload flight rings
+  // in payload.cpp: all are NOLOAD retained evidence, validated before use and
+  // released only by explicit CRASH_CLEAR or their one-time per-boot latch.
   g_system_dmamem_initialized = true;
 }
 
@@ -3096,6 +3372,13 @@ static FLASHMEM Payload cmd_sentinel_info(const Payload& /*args*/) {
 }
 
 // ------------------------------------------------------------
+// TIMEPOP_DISPATCH_INFO — retained + live callback/control-flow transcript
+// ------------------------------------------------------------
+static FLASHMEM Payload cmd_timepop_dispatch_info(const Payload& /*args*/) {
+  return system_timepop_dispatch_trace_payload();
+}
+
+// ------------------------------------------------------------
 // PAYLOAD_FLIGHT_INFO — retained + live Payload flight recorder
 // ------------------------------------------------------------
 static FLASHMEM Payload cmd_payload_flight_info(const Payload& /*args*/) {
@@ -3135,11 +3418,14 @@ static FLASHMEM Payload cmd_crash_clear(const Payload& /*args*/) {
   arm_dcache_flush((void*)&g_runtime_ledger_retained,
                    sizeof(g_runtime_ledger_retained));
 
+  timepop_dispatch_trace_clear_retained();
+
   Payload resp = ok_payload();
   resp.add("crash_report_cleared", true);
   resp.add("crash_forensics_cleared", true);
   resp.add("sentinel_cleared", true);
   resp.add("runtime_ledger_cleared", true);
+  resp.add("timepop_dispatch_trace_cleared", true);
   return resp;
 }
 
@@ -3197,6 +3483,7 @@ static const process_command_entry_t SYSTEM_COMMANDS[] = {
   { "CRASH_INFO",       cmd_crash_info       },
   { "CRASH_CLEAR",      cmd_crash_clear      },
   { "SENTINEL_INFO",    cmd_sentinel_info    },
+  { "TIMEPOP_DISPATCH_INFO", cmd_timepop_dispatch_info },
   { "PAYLOAD_FLIGHT_INFO", cmd_payload_flight_info },
   { "DEBUG",            cmd_debug            },
   { "STATUS",           cmd_status           },

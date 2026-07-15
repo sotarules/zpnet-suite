@@ -57,6 +57,8 @@
  *       - CPU usage metrics
  *       - memory availability
  *       - internal diagnostics
+ *   • TIMEPOP_DISPATCH_INFO — return live and retained TimePop callback,
+ *     mutation, and rearm flight-recorder entries for control-flow analysis
  *
  * Terminal Transitions:
  *   • Shutdown and bootloader entry are explicit, irreversible boundary

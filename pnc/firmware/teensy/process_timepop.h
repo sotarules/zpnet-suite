@@ -154,6 +154,100 @@ struct timepop_idle_witness_snapshot_t {
 
 bool timepop_idle_witness_snapshot(timepop_idle_witness_snapshot_t* out);
 
+// ============================================================================
+// Retained TimePop dispatch flight recorder
+// ============================================================================
+//
+// The dispatch recorder is a scalar-only RAM2 ring.  It records every TimePop
+// callback selection, entry, and return, plus mutation barriers and recurring
+// rearm outcomes.  The live bank is copied to a retained bank at the next boot
+// before current activity overwrites it.  No callback name is dereferenced or
+// copied: name_ptr is preserved as an address so corrupt metadata cannot make
+// the recorder fault while trying to describe the original fault.
+
+static constexpr uint32_t TIMEPOP_DISPATCH_TRACE_ENTRIES = 32U;
+static constexpr uint32_t TIMEPOP_DISPATCH_TRACE_NO_SLOT = 0xFFFFFFFFUL;
+
+enum class timepop_dispatch_trace_stage_t : uint32_t {
+  NONE                      = 0,
+  DISPATCH_ENTER            = 1,
+  PHASE_ASAP                = 2,
+  DEFERRED_SELECTED         = 3,
+  CALLBACK_ENTER            = 4,
+  CALLBACK_RETURN           = 5,
+  DEFERRED_CLEANUP          = 6,
+  MUTATION_BARRIER_ENTER    = 7,
+  MUTATION_SELECTED         = 8,
+  MUTATION_RESULT           = 9,
+  MUTATION_BARRIER_EXIT     = 10,
+  PHASE_TIMED               = 11,
+  TIMED_SELECTED            = 12,
+  TIMED_SLOT_AFTER_CALLBACK = 13,
+  REARM_BEGIN               = 14,
+  REARM_END                 = 15,
+  SLOT_RETIRED              = 16,
+  SLOT_REPLACED             = 17,
+  PHASE_ALAP                = 18,
+  DISPATCH_LEAVE            = 19,
+  IRQ_SELECTED              = 20,
+};
+
+enum class timepop_dispatch_trace_kind_t : uint32_t {
+  NONE      = 0,
+  DISPATCH  = 1,
+  ASAP      = 2,
+  TIMED     = 3,
+  ALAP      = 4,
+  ISR_TIMED = 5,
+  MUTATION  = 6,
+  REARM     = 7,
+};
+
+enum class timepop_dispatch_trace_phase_t : uint32_t {
+  IDLE               = 0,
+  ASAP               = 1,
+  TIMED              = 2,
+  ALAP               = 3,
+  APPLYING_MUTATIONS = 4,
+};
+
+struct timepop_dispatch_trace_entry_t {
+  uint32_t sequence;
+  uint32_t sequence_inv;
+  uint32_t stage;
+  uint32_t phase;
+  uint32_t kind;
+  uint32_t slot_index;
+  uint32_t handle;
+  uint32_t callback;
+  uint32_t slot_callback;
+  uint32_t user_data;
+  uint32_t name_ptr;
+  uint32_t caller_sp;
+  uint32_t site_pc;
+  uint32_t dwt;
+  uint32_t ipsr;
+  uint32_t aux;
+};
+
+static_assert(sizeof(timepop_dispatch_trace_entry_t) == 64U,
+              "TimePop dispatch trace entry must stay one cache-line pair");
+
+struct timepop_dispatch_trace_bank_snapshot_t {
+  bool valid;
+  uint32_t count;
+  uint32_t newest_sequence;
+  timepop_dispatch_trace_entry_t entries[TIMEPOP_DISPATCH_TRACE_ENTRIES];
+};
+
+struct timepop_dispatch_trace_snapshot_t {
+  timepop_dispatch_trace_bank_snapshot_t live;
+  timepop_dispatch_trace_bank_snapshot_t retained;
+};
+
+void timepop_dispatch_trace_snapshot(timepop_dispatch_trace_snapshot_t* out);
+void timepop_dispatch_trace_clear_retained(void);
+
 typedef uint8_t timepop_priority_t;
 static constexpr timepop_priority_t TIMEPOP_PRIORITY_FIRST   = 0U;
 static constexpr timepop_priority_t TIMEPOP_PRIORITY_DEFAULT = 128U;
