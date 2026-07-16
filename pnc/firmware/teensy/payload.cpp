@@ -1118,10 +1118,11 @@ static void payload_guarded_free(void* block,
 
 // ---- Retained design-by-contract incident recorder -------------------------
 //
-// The mutator path records only fixed scalar evidence.  It never allocates,
-// traverses an untrusted label, constructs a diagnostic Payload, or calls the
-// event bus.  SYSTEM later consumes the bounded pending queue from serialized
-// foreground context.
+// The retained transcript remains fixed scalar evidence.  After that record is
+// committed, a thread-mode failure may also capture one bounded, allocation-free
+// serialization prefix into the pending-event copy.  Handler-context failures
+// skip the extra traversal.  No contract path constructs a diagnostic Payload or
+// calls the event bus; SYSTEM consumes the queue in serialized foreground.
 
 static constexpr uint32_t PAYLOAD_CONTRACT_MAGIC = 0x50444331UL;  // 'PDC1'
 static constexpr uint32_t PAYLOAD_CONTRACT_SCHEMA_VERSION = 1U;
@@ -1139,13 +1140,18 @@ static payload_contract_bank_t g_payload_contract_retained PAYLOAD_RETAINED_MEM;
 static bool g_payload_contract_boot_latched = false;
 static volatile uint32_t g_payload_contract_next_sequence = 0U;
 
-static payload_contract_incident_t
+static payload_contract_event_t
     g_payload_contract_pending[PAYLOAD_CONTRACT_PENDING_ENTRIES];
 static volatile uint32_t g_payload_contract_pending_head = 0U;
 static volatile uint32_t g_payload_contract_pending_tail = 0U;
 static volatile uint32_t g_payload_contract_pending_count = 0U;
 static payload_contract_incident_t g_payload_contract_first_this_boot;
 static payload_contract_snapshot_t g_payload_contract_info_scratch;
+
+static void payload_contract_capture_prefix(
+    uint32_t operation_id,
+    const void* self,
+    payload_contract_event_t* event);
 
 static inline void payload_contract_dmb(void) {
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
@@ -1280,13 +1286,17 @@ static void payload_contract_record(
     payload_contract_dmb();
     payload_retained_flush(&incident, sizeof(incident));
 
+    payload_contract_event_t pending{};
+    pending.incident = incident;
+    payload_contract_capture_prefix(operation_id, self, &pending);
+
     const uint32_t saved = critical_enter();
     if (!payload_contract_incident_valid(
             g_payload_contract_first_this_boot)) {
         g_payload_contract_first_this_boot = incident;
     }
     if (g_payload_contract_pending_count < PAYLOAD_CONTRACT_PENDING_ENTRIES) {
-        g_payload_contract_pending[g_payload_contract_pending_head] = incident;
+        g_payload_contract_pending[g_payload_contract_pending_head] = pending;
         g_payload_contract_pending_head =
             (g_payload_contract_pending_head + 1U) %
             PAYLOAD_CONTRACT_PENDING_ENTRIES;
@@ -1383,7 +1393,7 @@ void payload_contract_get_info(payload_contract_info_t* out) {
     }
 }
 
-bool payload_contract_event_peek(payload_contract_incident_t* out) {
+bool payload_contract_event_peek(payload_contract_event_t* out) {
     if (!out) return false;
     const uint32_t saved = critical_enter();
     const bool available = g_payload_contract_pending_count != 0U;
@@ -2760,6 +2770,314 @@ struct payload_contract_state_t {
     uint32_t val_len = 0U;
     uint32_t kind = 0U;
 };
+
+static bool payload_contract_span_readable_pure(const void* ptr,
+                                                  size_t len);
+
+struct payload_contract_prefix_writer_t {
+    char* out;
+    size_t capacity;
+    size_t length;
+    bool truncated;
+
+    payload_contract_prefix_writer_t(char* buffer, size_t buffer_capacity)
+        : out(buffer),
+          capacity(buffer_capacity),
+          length(0U),
+          truncated(false) {
+        if (out && capacity != 0U) out[0] = '\0';
+    }
+
+    bool append_char(char ch) {
+        if (!out || capacity == 0U || length + 1U >= capacity) {
+            truncated = true;
+            return false;
+        }
+        out[length++] = ch;
+        out[length] = '\0';
+        return true;
+    }
+
+    bool append_atomic(const char* text, size_t text_length) {
+        if ((!text && text_length != 0U) ||
+            !out ||
+            capacity == 0U ||
+            text_length > capacity - 1U - length) {
+            truncated = true;
+            return false;
+        }
+        if (text_length != 0U) {
+            memcpy(out + length, text, text_length);
+            length += text_length;
+            out[length] = '\0';
+        }
+        return true;
+    }
+
+    bool append_span(const char* text, size_t text_length) {
+        if (!text && text_length != 0U) {
+            truncated = true;
+            return false;
+        }
+        size_t i = 0U;
+        while (i < text_length) {
+            const uint8_t ch = (uint8_t)text[i];
+            if (ch < 0x80U) {
+                if (!append_char((char)ch)) return false;
+                ++i;
+                continue;
+            }
+
+            size_t sequence_length = 0U;
+            if (!json_validate_utf8_sequence(
+                    reinterpret_cast<const uint8_t*>(text),
+                    text_length,
+                    i,
+                    &sequence_length) ||
+                !append_atomic(text + i, sequence_length)) {
+                truncated = true;
+                return false;
+            }
+            i += sequence_length;
+        }
+        return true;
+    }
+
+    bool append_escaped(const char* text, size_t text_length) {
+        if (!text && text_length != 0U) {
+            truncated = true;
+            return false;
+        }
+        for (size_t i = 0U; i < text_length; ++i) {
+            const uint8_t ch = (uint8_t)text[i];
+            switch (ch) {
+                case '"':
+                    if (!append_span("\\\"", 2U)) return false;
+                    break;
+                case '\\':
+                    if (!append_span("\\\\", 2U)) return false;
+                    break;
+                case '\b':
+                    if (!append_span("\\b", 2U)) return false;
+                    break;
+                case '\f':
+                    if (!append_span("\\f", 2U)) return false;
+                    break;
+                case '\n':
+                    if (!append_span("\\n", 2U)) return false;
+                    break;
+                case '\r':
+                    if (!append_span("\\r", 2U)) return false;
+                    break;
+                case '\t':
+                    if (!append_span("\\t", 2U)) return false;
+                    break;
+                default:
+                    if (ch < 0x20U) {
+                        const char escaped[6] = {
+                            '\\', 'u', '0', '0',
+                            json_hex_digit((uint8_t)(ch >> 4)),
+                            json_hex_digit((uint8_t)(ch & 0x0FU)),
+                        };
+                        if (!append_span(escaped, sizeof(escaped))) {
+                            return false;
+                        }
+                    } else if (ch < 0x80U) {
+                        if (!append_char((char)ch)) return false;
+                    } else {
+                        size_t sequence_length = 0U;
+                        if (!json_validate_utf8_sequence(
+                                reinterpret_cast<const uint8_t*>(text),
+                                text_length,
+                                i,
+                                &sequence_length) ||
+                            !append_atomic(text + i, sequence_length)) {
+                            truncated = true;
+                            return false;
+                        }
+                        i += sequence_length - 1U;
+                    }
+                    break;
+            }
+        }
+        return true;
+    }
+};
+
+struct payload_contract_prefix_access_t {
+    static bool capture(const Payload& object,
+                        char* out,
+                        size_t capacity,
+                        uint32_t* out_length,
+                        uint32_t* out_truncated) {
+        if (out_length) *out_length = 0U;
+        if (out_truncated) *out_truncated = 0U;
+        if (!out || capacity == 0U) return false;
+        out[0] = '\0';
+
+        payload_contract_state_t state{};
+        if (!object._contract_inspect(&state)) return false;
+
+        payload_contract_prefix_writer_t writer(out, capacity);
+        bool complete = writer.append_char('{');
+        const Payload::Entry* entries = object._entries();
+        const uint8_t* storage = object._storage();
+
+        for (size_t i = 0U; complete && i < object._count; ++i) {
+            const Payload::Entry& entry = entries[i];
+            if (i != 0U) complete = writer.append_char(',');
+            if (complete) complete = writer.append_char('"');
+            if (complete) {
+                complete = writer.append_escaped(
+                    reinterpret_cast<const char*>(storage + entry.key_off),
+                    entry.key_len);
+            }
+            if (complete) complete = writer.append_span("\":", 2U);
+
+            if (complete &&
+                (Payload::ValueKind)entry.kind ==
+                    Payload::ValueKind::STRING) {
+                complete = writer.append_char('"');
+                if (complete) {
+                    complete = writer.append_escaped(
+                        reinterpret_cast<const char*>(
+                            storage + entry.val_off),
+                        entry.val_len);
+                }
+                if (complete) complete = writer.append_char('"');
+            } else if (complete) {
+                complete = writer.append_span(
+                    reinterpret_cast<const char*>(
+                        storage + entry.val_off),
+                    entry.val_len);
+            }
+        }
+        if (complete) complete = writer.append_char('}');
+
+        if (out_length) *out_length = (uint32_t)writer.length;
+        if (out_truncated) {
+            *out_truncated =
+                (!complete || writer.truncated) ? 1U : 0U;
+        }
+        return true;
+    }
+
+    static bool capture(const PayloadArray& object,
+                        char* out,
+                        size_t capacity,
+                        uint32_t* out_length,
+                        uint32_t* out_truncated) {
+        if (out_length) *out_length = 0U;
+        if (out_truncated) *out_truncated = 0U;
+        if (!out || capacity == 0U) return false;
+        out[0] = '\0';
+
+        payload_contract_state_t state{};
+        if (!object._contract_inspect(&state)) return false;
+
+        payload_contract_prefix_writer_t writer(out, capacity);
+        const bool complete =
+            writer.append_span(object._data(), (size_t)object._length);
+        if (out_length) *out_length = (uint32_t)writer.length;
+        if (out_truncated) {
+            *out_truncated =
+                (!complete || writer.truncated) ? 1U : 0U;
+        }
+        return true;
+    }
+};
+
+enum class payload_contract_prefix_kind_t : uint32_t {
+    NONE = 0U,
+    PAYLOAD = 1U,
+    ARRAY = 2U,
+};
+
+static payload_contract_prefix_kind_t
+payload_contract_prefix_kind_for_operation(uint32_t operation_id) {
+    switch (operation_id) {
+        case PAYLOAD_OP_ARRAY_ADD_WRITE:
+        case PAYLOAD_OP_ARRAY_ALLOC:
+        case PAYLOAD_OP_ARRAY_CAPACITY:
+        case PAYLOAD_OP_ARRAY_PARSE:
+        case PAYLOAD_OP_ARRAY_PARSE_INVALID:
+        case PAYLOAD_OP_ARRAY_RELEASE_STORAGE:
+        case PAYLOAD_OP_ARRAY_RELEASE_STORAGE_GUARD:
+            return payload_contract_prefix_kind_t::ARRAY;
+
+        // These operation IDs are shared by Payload and PayloadArray, or belong
+        // to a view rather than an owning object.  Do not guess the layout.
+        case PAYLOAD_OP_NONE:
+        case PAYLOAD_OP_CLEAR:
+        case PAYLOAD_OP_COPY_ASSIGN:
+        case PAYLOAD_OP_COPY_ASSIGN_SOURCE:
+        case PAYLOAD_OP_COPY_FROM:
+        case PAYLOAD_OP_HEAP_BLOCK:
+        case PAYLOAD_OP_JSON_SIZE:
+        case PAYLOAD_OP_MOVE_ASSIGN_SOURCE:
+        case PAYLOAD_OP_MOVE_FROM:
+        case PAYLOAD_OP_ARRAY_VIEW_GET:
+        case PAYLOAD_OP_ARRAY_VIEW_SIZE:
+        case PAYLOAD_OP_ARRAY_VIEW_VALID:
+            return payload_contract_prefix_kind_t::NONE;
+
+        default:
+            return payload_contract_prefix_kind_t::PAYLOAD;
+    }
+}
+
+static void payload_contract_capture_prefix(
+    uint32_t operation_id,
+    const void* self,
+    payload_contract_event_t* event) {
+    if (!event) return;
+
+    event->payload_prefix_valid = 0U;
+    event->payload_prefix_length = 0U;
+    event->payload_prefix_truncated = 0U;
+    event->payload_prefix[0] = '\0';
+
+    // Handler-context contract recording must remain fixed-cost and avoid a
+    // second whole-object traversal.  Foreground failures get the richer clue.
+    if (!self || event->incident.ipsr != 0U) return;
+
+    bool captured = false;
+    switch (payload_contract_prefix_kind_for_operation(operation_id)) {
+        case payload_contract_prefix_kind_t::PAYLOAD:
+            if (payload_contract_span_readable_pure(self, sizeof(Payload))) {
+                captured = payload_contract_prefix_access_t::capture(
+                    *reinterpret_cast<const Payload*>(self),
+                    event->payload_prefix,
+                    sizeof(event->payload_prefix),
+                    &event->payload_prefix_length,
+                    &event->payload_prefix_truncated);
+            }
+            break;
+
+        case payload_contract_prefix_kind_t::ARRAY:
+            if (payload_contract_span_readable_pure(
+                    self, sizeof(PayloadArray))) {
+                captured = payload_contract_prefix_access_t::capture(
+                    *reinterpret_cast<const PayloadArray*>(self),
+                    event->payload_prefix,
+                    sizeof(event->payload_prefix),
+                    &event->payload_prefix_length,
+                    &event->payload_prefix_truncated);
+            }
+            break;
+
+        default:
+            break;
+    }
+
+    if (captured) {
+        event->payload_prefix_valid = 1U;
+    } else {
+        event->payload_prefix_length = 0U;
+        event->payload_prefix_truncated = 0U;
+        event->payload_prefix[0] = '\0';
+    }
+}
 
 static constexpr uint32_t PAYLOAD_CONTRACT_HASH_SEED = 0x811C9DC5UL;
 static constexpr uint32_t PAYLOAD_CONTRACT_HASH_PRIME = 0x01000193UL;

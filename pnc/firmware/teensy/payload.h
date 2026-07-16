@@ -58,13 +58,16 @@
 // ============================================================================
 //
 // Payload never constructs an event from inside a mutator or integrity court.
-// A failure is reduced to this fixed scalar record and placed in a bounded
-// incident queue plus a retained RAM2 transcript.  SYSTEM later constructs one
-// small best-effort PAYLOAD_CONTRACT_ANOMALY event in serialized foreground
-// context while incident recursion is suppressed.
+// A failure is reduced to a fixed scalar incident and placed in the retained
+// RAM2 transcript.  For thread-mode failures, the pending-event copy also gets
+// a bounded, allocation-free serialization prefix when the operation identifies
+// the object type and the current structure is safely inspectable.  SYSTEM later
+// constructs one best-effort PAYLOAD_CONTRACT_ANOMALY event in serialized
+// foreground context while incident recursion is suppressed.
 
 #define PAYLOAD_CONTRACT_INCIDENT_ENTRIES 16U
 #define PAYLOAD_CONTRACT_PENDING_ENTRIES  8U
+#define PAYLOAD_CONTRACT_PREFIX_BYTES     96U
 
 // The contract implementation contains no conditional assembly and no inline
 // assembly. Existing platform helpers provide DWT/IPSR and critical sections.
@@ -140,6 +143,14 @@ struct payload_contract_incident_t {
   uint32_t ipsr;
 };
 
+struct payload_contract_event_t {
+  payload_contract_incident_t incident;
+  uint32_t payload_prefix_valid;
+  uint32_t payload_prefix_length;
+  uint32_t payload_prefix_truncated;
+  char payload_prefix[PAYLOAD_CONTRACT_PREFIX_BYTES];
+};
+
 struct payload_contract_bank_snapshot_t {
   uint32_t valid;
   uint32_t count;
@@ -176,7 +187,7 @@ const char* payload_contract_phase_name(uint32_t phase);
 const char* payload_contract_reason_name(uint32_t reason);
 void payload_contract_get_info(payload_contract_info_t* out);
 void payload_contract_get_snapshot(payload_contract_snapshot_t* out);
-bool payload_contract_event_peek(payload_contract_incident_t* out);
+bool payload_contract_event_peek(payload_contract_event_t* out);
 void payload_contract_event_begin(void);
 void payload_contract_event_end(bool emitted);
 void payload_contract_clear_retained(void);
@@ -516,6 +527,7 @@ void payload_clear_retained_append_trace();
 struct fixed_decimal_t;
 
 struct payload_contract_state_t;
+struct payload_contract_prefix_access_t;
 
 class Payload;
 class PayloadArray;
@@ -657,6 +669,7 @@ public:
 
 private:
     friend void payload_get_info(payload_info_t* out);
+    friend struct payload_contract_prefix_access_t;
     friend class PayloadArray;
 
     enum class ValueKind : uint8_t {
@@ -800,6 +813,7 @@ public:
     bool contract_valid() const;
 
 private:
+    friend struct payload_contract_prefix_access_t;
     friend class Payload;
 
     static constexpr size_t INLINE_STORAGE = 256;

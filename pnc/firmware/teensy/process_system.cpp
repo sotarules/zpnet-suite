@@ -2262,12 +2262,16 @@ static FLASHMEM Payload system_payload_contract_summary_payload(void) {
 }
 
 static void system_payload_contract_service(void) {
-  payload_contract_incident_t incident{};
-  if (!payload_contract_event_peek(&incident)) return;
+  payload_contract_event_t pending{};
+  if (!payload_contract_event_peek(&pending)) return;
+  const payload_contract_incident_t& incident = pending.incident;
 
-  // Seven compact scalar entries keep the anomaly notice inside Payload's
-  // inline store.  Names and the full expected/observed evidence remain on the
-  // authoritative PAYLOAD_CONTRACT_INFO surface; the event is only the bell.
+  // Keep the compact numeric identity for compatibility, but make the event
+  // self-decoding and attach the bounded serialization clue captured at the
+  // original failure boundary.  Prefix capture is best effort: handler-context
+  // incidents, ambiguous object kinds, and structurally unsafe objects report
+  // payload_prefix_valid=false rather than risking a diagnostic recursion.
+  //
   // Keep suppression active through the diagnostic Payload destructor as well
   // as construction and enqueue, so cleanup cannot recursively diagnose the
   // object that was created only to report the original incident.
@@ -2278,12 +2282,27 @@ static void system_payload_contract_service(void) {
     ok = event.add("schema", "ZPNET_PAYLOAD_CONTRACT_V1");
     if (ok) ok = event.add("sequence", incident.sequence);
     if (ok) ok = event.add("phase_id", incident.phase);
+    if (ok) ok = event.add("phase",
+                           payload_contract_phase_name(incident.phase));
     if (ok) ok = event.add("reason_id", incident.reason);
+    if (ok) ok = event.add("reason",
+                           payload_contract_reason_name(incident.reason));
     if (ok) ok = event.add("operation_id", incident.operation_id);
+    if (ok) ok = event.add(
+        "operation", payload_operation_id_name(incident.operation_id));
     if (ok) ok = event.add("object", incident.object_ptr);
     if (ok) ok = event.add("generation", incident.generation);
+    if (ok) {
+      ok = event.add("payload_prefix_valid",
+                     pending.payload_prefix_valid != 0U);
+    }
+    if (ok) {
+      ok = event.add("payload_prefix_truncated",
+                     pending.payload_prefix_truncated != 0U);
+    }
+    if (ok) ok = event.add("payload_prefix", pending.payload_prefix);
 
-    if (ok) ok = !event.heap_entries() && event.contract_valid();
+    if (ok) ok = event.contract_valid();
     if (ok) enqueueEvent("PAYLOAD_CONTRACT_ANOMALY", event);
   }
   payload_contract_event_end(ok);
