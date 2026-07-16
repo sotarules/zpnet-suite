@@ -221,3 +221,204 @@ void crash_forensics_clear(void);
 const char* crash_forensics_exception_name(uint32_t exception_number);
 const char* crash_forensics_frame_source_name(uint32_t frame_source);
 const char* crash_forensics_capture_skip_reason_name(uint32_t reason);
+
+// ============================================================================
+// Retained stack watchpoint (DWT comparator + DebugMonitor)
+// ============================================================================
+//
+// Diagnostic trap for the boot-time MEMMANAGE investigation.  A DWT comparator
+// watches CPU writes to a small fixed window of DTCM stack that held the
+// corrupted saved return addresses.  Each write raises the DebugMonitor
+// exception; the handler records the writer's stacked PC/LR and the current
+// window contents into a DMAMEM ring that survives the subsequent fault and
+// reboot, in the same retained-bank idiom as the other flight recorders.
+//
+// The handler is allocation-free, logging-free, and Payload-free.  A write is
+// classified anomalous when the writer's own stack pointer sits entirely above
+// the watched window: lawful code never stores below its live frame, so such a
+// hit is the rogue store this trap exists to catch.
+//
+// The DWT observes CPU stores only.  A DMA-mastered write would not trigger.
+
+static constexpr uint32_t CRASH_STACK_WATCH_ENTRIES = 16U;
+
+struct crash_stack_watch_entry_t {
+    uint32_t sequence;
+    uint32_t sequence_inv;
+    uint32_t dwt;
+    uint32_t pc;
+    uint32_t lr;
+    uint32_t xpsr;
+    uint32_t writer_sp;
+    uint32_t exc_return;
+    uint32_t watched[4];
+};
+
+static_assert(sizeof(crash_stack_watch_entry_t) == 48U,
+              "Stack watch entry layout drifted");
+
+struct crash_stack_watch_bank_snapshot_t {
+    bool valid;
+    uint32_t count;
+    uint32_t newest_sequence;
+    uint32_t hits_total;
+    uint32_t anomalous_total;
+    crash_stack_watch_entry_t first_anomalous;
+    crash_stack_watch_entry_t entries[CRASH_STACK_WATCH_ENTRIES];
+};
+
+struct crash_stack_watch_snapshot_t {
+    bool enabled;
+    bool armed;
+    uint32_t arm_skip_reason;
+    uint32_t arm_attempts;
+    uint32_t last_dhcsr;
+    uint32_t watch_address;
+    uint32_t watch_bytes;
+    uint32_t effective_comp_address;
+    uint32_t effective_mask;
+    crash_stack_watch_bank_snapshot_t live;
+    crash_stack_watch_bank_snapshot_t retained;
+};
+
+enum crash_stack_watch_skip_reason_t : uint32_t {
+    CRASH_STACK_WATCH_SKIP_NONE = 0U,
+    CRASH_STACK_WATCH_SKIP_DISABLED = 1U,
+    CRASH_STACK_WATCH_SKIP_HALTING_DEBUG_ACTIVE = 2U,
+};
+
+void crash_stack_watch_snapshot(crash_stack_watch_snapshot_t* out);
+void crash_stack_watch_clear_retained(void);
+const char* crash_stack_watch_skip_reason_name(uint32_t reason);
+
+// ============================================================================
+// Stack altitude tripwire (SP-floor overlap detector)
+// ============================================================================
+//
+// Companion diagnostic for the boot-crash investigation.  The memory-watchdog
+// audit publishes its entry SP as a floor while it runs.  During the audit,
+// the true foreground SP is always at or below that floor, so any exception
+// frame whose top lies ABOVE the floor was stacked against a stale/wrong SP —
+// the alien-frame event under investigation.  ISR entries call the inline
+// check; a violation latches retained scalar evidence.  Cost when the floor
+// is inactive: one volatile load and a compare.
+//
+// The check is advisory instrumentation: it attributes, it never alters
+// control flow.  A negative result across armed crashes is also evidence —
+// it argues the corruption is a software write, not mis-stacked entry.
+
+static constexpr uint32_t CRASH_STACK_TRIPWIRE_ENTRIES = 8U;
+
+static constexpr uint32_t CRASH_TRIPWIRE_SITE_NONE      = 0U;
+static constexpr uint32_t CRASH_TRIPWIRE_SITE_HANDOFF   = 1U;
+static constexpr uint32_t CRASH_TRIPWIRE_SITE_QTIMER1   = 2U;
+static constexpr uint32_t CRASH_TRIPWIRE_SITE_QTIMER2   = 3U;
+static constexpr uint32_t CRASH_TRIPWIRE_SITE_QTIMER3   = 4U;
+static constexpr uint32_t CRASH_TRIPWIRE_SITE_PPS_GPIO  = 5U;
+
+struct crash_stack_tripwire_entry_t {
+    uint32_t sequence;
+    uint32_t sequence_inv;
+    uint32_t site;
+    uint32_t msp;
+    uint32_t exc_return;
+    uint32_t floor;
+    uint32_t frame_top_estimate;
+    uint32_t dwt;
+    uint32_t ipsr;
+    uint32_t reserved[3];
+};
+
+static_assert(sizeof(crash_stack_tripwire_entry_t) == 48U,
+              "Stack tripwire entry layout drifted");
+
+struct crash_stack_tripwire_bank_snapshot_t {
+    bool valid;
+    uint32_t count;
+    uint32_t newest_sequence;
+    uint32_t violation_total;
+    crash_stack_tripwire_entry_t first;
+    crash_stack_tripwire_entry_t entries[CRASH_STACK_TRIPWIRE_ENTRIES];
+};
+
+struct crash_stack_tripwire_snapshot_t {
+    bool floor_active_now;
+    uint32_t floor_now;
+    uint32_t floor_publish_count;
+    crash_stack_tripwire_bank_snapshot_t live;
+    crash_stack_tripwire_bank_snapshot_t retained;
+};
+
+void crash_stack_tripwire_snapshot(crash_stack_tripwire_snapshot_t* out);
+void crash_stack_tripwire_clear_retained(void);
+const char* crash_stack_tripwire_site_name(uint32_t site);
+
+// Out-of-line violation latcher; called only on overlap.
+void crash_stack_tripwire_latch(uint32_t site,
+                                uint32_t msp,
+                                uint32_t exc_return,
+                                uint32_t floor,
+                                uint32_t frame_top_estimate);
+
+// Published SP floor.  Zero means inactive.  Written from foreground only.
+extern volatile uint32_t g_crash_stack_tripwire_floor;
+extern volatile uint32_t g_crash_stack_tripwire_floor_publish_count;
+
+// Foreground publisher.  Call at the guarded region's entry and exit.
+static inline void crash_stack_tripwire_floor_enter(void) {
+    uint32_t sp;
+    __asm__ volatile("mov %0, sp" : "=r"(sp));
+    g_crash_stack_tripwire_floor = sp;
+    g_crash_stack_tripwire_floor_publish_count =
+        g_crash_stack_tripwire_floor_publish_count + 1U;
+    __asm__ volatile("dmb" ::: "memory");
+}
+
+static inline void crash_stack_tripwire_floor_exit(void) {
+    __asm__ volatile("dmb" ::: "memory");
+    g_crash_stack_tripwire_floor = 0U;
+}
+
+// ISR-entry check.  Place after the sacred first capture and before the first
+// out-of-line call so LR still holds EXC_RETURN; sites that must run later
+// (after calls) are handled by the conservative frame-size fallback below.
+static inline void crash_stack_tripwire_isr_check(uint32_t site) {
+    const uint32_t floor = g_crash_stack_tripwire_floor;
+    if (floor == 0U) return;
+
+    uint32_t msp;
+    uint32_t lr;
+    __asm__ volatile("mrs %0, msp" : "=r"(msp));
+    __asm__ volatile("mov %0, lr" : "=r"(lr));
+
+    // Frame size from EXC_RETURN when LR still plausibly holds it (0xFFFFFFxx).
+    // Otherwise assume the SMALL basic frame: under-estimating the frame top
+    // can only suppress a report, never fabricate one.
+    uint32_t frame_bytes = 0x20U;
+    if ((lr & 0xFFFFFF00UL) == 0xFFFFFF00UL && (lr & 0x10U) == 0U) {
+        frame_bytes = 0x68U;
+    }
+
+    // msp here is at or below the hardware frame base (the compiler prologue
+    // may already have pushed), so this estimate is a LOWER bound on the true
+    // frame top.  Lawful stacking keeps the true top at or below the live SP,
+    // which is at or below the floor; an estimate above the floor is proof.
+    const uint32_t frame_top_estimate = msp + frame_bytes;
+    if (frame_top_estimate > floor) {
+        crash_stack_tripwire_latch(site, msp, lr, floor, frame_top_estimate);
+    }
+}
+
+// Retryable arming.  Software cannot clear DHCSR.C_DEBUGEN (only the debug
+// port or a power-on reset can), so when the bootloader chip leaves halting
+// debug latched after a flash, the install-time arm attempt is declined.  This
+// service retries cheaply from foreground paths; it arms the instant the
+// debug session is released and is a no-op once armed.
+void crash_stack_watch_service(void);
+
+// Retryable arming.  Software cannot clear DHCSR.C_DEBUGEN (only the debug
+// port or a power-on reset can), so when the bootloader chip leaves halting
+// debug latched after a flash, the install-time arm attempt is declined.  This
+// service retries cheaply from foreground paths; it arms the instant the
+// debug session is released and is a no-op once armed.
+void crash_stack_watch_service(void);

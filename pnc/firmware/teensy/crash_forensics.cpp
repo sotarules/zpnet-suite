@@ -31,6 +31,7 @@ static constexpr size_t CRASH_FORENSICS_VECTOR_HARDFAULT = 3U;
 static constexpr size_t CRASH_FORENSICS_VECTOR_MEMMANAGE = 4U;
 static constexpr size_t CRASH_FORENSICS_VECTOR_BUSFAULT = 5U;
 static constexpr size_t CRASH_FORENSICS_VECTOR_USAGEFAULT = 6U;
+static constexpr size_t CRASH_STACK_WATCH_VECTOR_DEBUGMON = 12U;
 
 // Cortex-M7 system-register addresses.  Fixed addresses keep the fault path
 // independent of CMSIS naming differences across Teensyduino releases.
@@ -54,6 +55,9 @@ static constexpr uintptr_t REG_CPACR  = 0xE000ED88UL;
 static constexpr uintptr_t REG_DEMCR  = 0xE000EDFCUL;
 static constexpr uintptr_t REG_DWT_CTRL = 0xE0001000UL;
 static constexpr uintptr_t REG_DWT_CYCCNT = 0xE0001004UL;
+static constexpr uintptr_t REG_DWT_COMP1 = 0xE0001030UL;
+static constexpr uintptr_t REG_DWT_MASK1 = 0xE0001034UL;
+static constexpr uintptr_t REG_DWT_FUNCTION1 = 0xE0001038UL;
 static constexpr uintptr_t REG_ACTLR = 0xE000E008UL;
 static constexpr uintptr_t REG_SYST_CSR = 0xE000E010UL;
 static constexpr uintptr_t REG_SYST_RVR = 0xE000E014UL;
@@ -873,6 +877,489 @@ void crash_forensics_fault_entry(void) {
 }
 
 // ============================================================================
+// Retained stack watchpoint (DWT comparator 1 + DebugMonitor)
+// ============================================================================
+//
+// See crash_forensics.h for doctrine.  The watch window and enable are
+// compile-time constants so a diagnostic build can retarget them in one edit.
+// The watched window derives from the reproducible boot-crash reconstructions:
+// crash #1 poisoned saved-LR slots at 0x20037EA4/0x20037EAC (mallinfo path);
+// crash #2 poisoned a slot near 0x20037D24 (payload_get_info path).  MASK = 10
+// covers the aligned 1 KB window 0x20037C00..0x20037FFF spanning both.
+
+static constexpr bool     CRASH_STACK_WATCH_ENABLED = true;
+static constexpr uint32_t CRASH_STACK_WATCH_ADDRESS = 0x20037C00UL;
+static constexpr uint32_t CRASH_STACK_WATCH_MASK = 10UL;
+static constexpr uint32_t CRASH_STACK_WATCH_BYTES = 1UL << CRASH_STACK_WATCH_MASK;
+
+static constexpr uint32_t CRASH_STACK_WATCH_MAGIC = 0x5A505357UL;  // "ZPSW"
+static constexpr uint32_t CRASH_STACK_WATCH_SCHEMA_VERSION = 1U;
+
+static constexpr uintptr_t REG_DHCSR = 0xE000EDF0UL;
+static constexpr uint32_t DHCSR_C_DEBUGEN = 1UL << 0;
+
+static constexpr uint32_t DEMCR_TRCENA = 1UL << 24;
+static constexpr uint32_t DEMCR_MON_EN = 1UL << 16;
+static constexpr uint32_t DFSR_DWTTRAP = 1UL << 2;
+static constexpr uint32_t DWT_FUNCTION_WRITE_WATCH = 0x6UL;
+
+struct alignas(32) crash_stack_watch_bank_t {
+    uint32_t magic;
+    uint32_t magic_inv;
+    uint32_t schema_version;
+    uint32_t capacity;
+    uint32_t hits_total;
+    uint32_t anomalous_total;
+    uint32_t reserved0;
+    uint32_t reserved1;
+    crash_stack_watch_entry_t first_anomalous;
+    crash_stack_watch_entry_t entries[CRASH_STACK_WATCH_ENTRIES];
+    uint32_t reserved_tail[4];
+};
+
+static_assert((sizeof(crash_stack_watch_bank_t) % 32U) == 0U,
+              "Stack watch bank must occupy complete Cortex-M7 cache lines");
+
+alignas(32) static crash_stack_watch_bank_t g_crash_stack_watch_live DMAMEM;
+alignas(32) static crash_stack_watch_bank_t g_crash_stack_watch_retained DMAMEM;
+
+// Ordinary BSS: cleared each boot, so the latch runs exactly once per boot.
+static bool g_crash_stack_watch_boot_latched = false;
+static bool g_crash_stack_watch_armed = false;
+static uint32_t g_crash_stack_watch_skip_reason = CRASH_STACK_WATCH_SKIP_NONE;
+static uint32_t g_crash_stack_watch_arm_attempts = 0U;
+static uint32_t g_crash_stack_watch_last_dhcsr = 0U;
+static uint32_t g_crash_stack_watch_effective_comp = 0U;
+static uint32_t g_crash_stack_watch_effective_mask = 0U;
+
+extern "C" void crash_stack_watch_debugmon_entry(void);
+
+static bool crash_stack_watch_bank_valid(const crash_stack_watch_bank_t& bank) {
+    return bank.magic == CRASH_STACK_WATCH_MAGIC &&
+           (bank.magic ^ bank.magic_inv) == 0xFFFFFFFFUL &&
+           bank.schema_version == CRASH_STACK_WATCH_SCHEMA_VERSION &&
+           bank.capacity == CRASH_STACK_WATCH_ENTRIES;
+}
+
+static void crash_stack_watch_flush_bank(crash_stack_watch_bank_t& bank) {
+    arm_dcache_flush(&bank, sizeof(bank));
+}
+
+static void crash_stack_watch_initialize_live(void) {
+    crash_stack_watch_bank_t& bank = g_crash_stack_watch_live;
+    for (size_t i = 0; i < sizeof(bank) / sizeof(uint32_t); ++i) {
+        reinterpret_cast<volatile uint32_t*>(&bank)[i] = 0U;
+    }
+    bank.schema_version = CRASH_STACK_WATCH_SCHEMA_VERSION;
+    bank.capacity = CRASH_STACK_WATCH_ENTRIES;
+    bank.magic_inv = ~CRASH_STACK_WATCH_MAGIC;
+    bank.magic = CRASH_STACK_WATCH_MAGIC;
+    crash_stack_watch_flush_bank(bank);
+}
+
+// Latch the previous boot's final hit transcript before current-boot hits can
+// overwrite it, then start a fresh live ring.  DMAMEM survives the warm reboot;
+// the DebugMonitor handler flushes every mutation so a sudden reset cannot
+// strand entries in the data cache.
+static void crash_stack_watch_boot_latch(void) {
+    if (g_crash_stack_watch_boot_latched) return;
+    g_crash_stack_watch_boot_latched = true;
+
+    if (crash_stack_watch_bank_valid(g_crash_stack_watch_live)) {
+        g_crash_stack_watch_retained = g_crash_stack_watch_live;
+        crash_stack_watch_flush_bank(g_crash_stack_watch_retained);
+    }
+    crash_stack_watch_initialize_live();
+}
+
+static void crash_stack_watch_arm(void) {
+    if (!CRASH_STACK_WATCH_ENABLED) {
+        g_crash_stack_watch_skip_reason = CRASH_STACK_WATCH_SKIP_DISABLED;
+        return;
+    }
+
+    crash_stack_watch_boot_latch();
+
+    // Monitor-mode debug only engages while halting debug is off.  The Teensy
+    // bootloader chip programs this part over the debug port and can leave
+    // DHCSR.C_DEBUGEN latched after a flash; with it set, MON_EN is ignored
+    // and the first watchpoint match HALTS the core.  Software writes cannot
+    // modify C_DEBUGEN (only the debug port or a power-on reset can), so a
+    // latched debug session is a retryable decline, not a failure:
+    // crash_stack_watch_service() re-attempts from foreground paths and arms
+    // the moment the session is released.
+    g_crash_stack_watch_arm_attempts++;
+    g_crash_stack_watch_last_dhcsr = reg32(REG_DHCSR);
+    if ((g_crash_stack_watch_last_dhcsr & DHCSR_C_DEBUGEN) != 0U) {
+        g_crash_stack_watch_skip_reason =
+            CRASH_STACK_WATCH_SKIP_HALTING_DEBUG_ACTIVE;
+        return;
+    }
+
+    _VectorsRam[CRASH_STACK_WATCH_VECTOR_DEBUGMON] =
+        crash_stack_watch_debugmon_entry;
+
+    reg32_write(REG_DEMCR, reg32(REG_DEMCR) | DEMCR_TRCENA | DEMCR_MON_EN);
+    reg32_write(REG_DWT_COMP1, CRASH_STACK_WATCH_ADDRESS);
+    reg32_write(REG_DWT_MASK1, CRASH_STACK_WATCH_MASK);
+    crash_barrier();
+
+    // Verify the hardware accepted the address mask.  If not, fall back to
+    // watching the single highest-value word exactly: _mallinfo_r's saved-LR
+    // slot in the reconstructed frame.
+    g_crash_stack_watch_effective_mask = reg32(REG_DWT_MASK1);
+    if (g_crash_stack_watch_effective_mask != CRASH_STACK_WATCH_MASK) {
+        reg32_write(REG_DWT_MASK1, 0U);
+        reg32_write(REG_DWT_COMP1, 0x20037EA4UL);
+        crash_barrier();
+        g_crash_stack_watch_effective_mask = reg32(REG_DWT_MASK1);
+    }
+    g_crash_stack_watch_effective_comp = reg32(REG_DWT_COMP1);
+
+    (void)reg32(REG_DWT_FUNCTION1);  // read clears a stale MATCHED bit
+    reg32_write(REG_DWT_FUNCTION1, DWT_FUNCTION_WRITE_WATCH);
+    crash_barrier();
+
+    g_crash_stack_watch_skip_reason = CRASH_STACK_WATCH_SKIP_NONE;
+    g_crash_stack_watch_armed = true;
+}
+
+// Cheap idempotent retry: two register reads when already armed or still
+// declined, the full arm sequence the first time halting debug reads clear.
+// Safe from any foreground context; allocation-free, logging-free.
+void crash_stack_watch_service(void) {
+    if (!CRASH_STACK_WATCH_ENABLED) return;
+    if (g_crash_stack_watch_armed) return;
+    crash_stack_watch_arm();
+}
+
+// Naked shim: select the stacked frame, preserve alignment, call the body.
+extern "C" __attribute__((naked)) void crash_stack_watch_debugmon_entry(void) {
+    __asm__ volatile(
+        "tst lr, #4\n"
+        "ite eq\n"
+        "mrseq r0, msp\n"
+        "mrsne r0, psp\n"
+        "mov r1, lr\n"
+        "push {r4, lr}\n"
+        "bl crash_stack_watch_debugmon_body\n"
+        "pop {r4, pc}\n");
+}
+
+extern "C" void crash_stack_watch_debugmon_body(uint32_t* frame,
+                                                uint32_t exc_return) {
+    // One-shot disarm so this handler's own stores cannot re-match, then
+    // acknowledge the debug event.
+    (void)reg32(REG_DWT_FUNCTION1);  // read clears MATCHED
+    reg32_write(REG_DWT_FUNCTION1, 0U);
+    reg32_write(REG_DFSR, DFSR_DWTTRAP);
+
+    crash_stack_watch_bank_t& bank = g_crash_stack_watch_live;
+    if (!crash_stack_watch_bank_valid(bank)) {
+        reg32_write(REG_DWT_FUNCTION1, DWT_FUNCTION_WRITE_WATCH);
+        return;
+    }
+
+    uint32_t pc = 0U;
+    uint32_t lr = 0U;
+    uint32_t xpsr = 0U;
+    uint32_t writer_sp = 0U;
+    if (frame != nullptr) {
+        pc = frame[6];
+        lr = frame[5];
+        xpsr = frame[7];
+        uint32_t frame_bytes = ((exc_return & (1UL << 4)) == 0U) ? 0x68U : 0x20U;
+        if ((xpsr & (1UL << 9)) != 0U) frame_bytes += 4U;
+        writer_sp = reinterpret_cast<uint32_t>(frame) + frame_bytes;
+    }
+
+    const uint32_t sequence = ++bank.hits_total;
+    crash_stack_watch_entry_t& entry =
+        bank.entries[(sequence - 1U) % CRASH_STACK_WATCH_ENTRIES];
+
+    entry.sequence = 0U;
+    entry.sequence_inv = 0U;
+    entry.dwt = reg32(REG_DWT_CYCCNT);
+    entry.pc = pc;
+    entry.lr = lr;
+    entry.xpsr = xpsr;
+    entry.writer_sp = writer_sp;
+    entry.exc_return = exc_return;
+    volatile const uint32_t* watched =
+        reinterpret_cast<volatile const uint32_t*>(CRASH_STACK_WATCH_ADDRESS);
+    entry.watched[0] = watched[0];
+    entry.watched[1] = watched[1];
+    entry.watched[2] = watched[2];
+    entry.watched[3] = watched[3];
+    entry.sequence_inv = ~sequence;
+    entry.sequence = sequence;
+
+    // Lawful code never stores below its own live frame.  A writer whose SP
+    // sits entirely above the watched window is the rogue store.
+    if (writer_sp >= CRASH_STACK_WATCH_ADDRESS + CRASH_STACK_WATCH_BYTES) {
+        bank.anomalous_total++;
+        if (bank.first_anomalous.sequence == 0U) {
+            bank.first_anomalous = entry;
+        }
+    }
+
+    crash_stack_watch_flush_bank(bank);
+    reg32_write(REG_DWT_FUNCTION1, DWT_FUNCTION_WRITE_WATCH);
+}
+
+static void crash_stack_watch_snapshot_bank(
+    const crash_stack_watch_bank_t& bank,
+    crash_stack_watch_bank_snapshot_t* out) {
+    for (size_t i = 0; i < sizeof(*out); ++i) {
+        reinterpret_cast<uint8_t*>(out)[i] = 0U;
+    }
+    out->valid = crash_stack_watch_bank_valid(bank);
+    if (!out->valid) return;
+
+    out->hits_total = bank.hits_total;
+    out->anomalous_total = bank.anomalous_total;
+    out->first_anomalous = bank.first_anomalous;
+
+    for (uint32_t i = 0U; i < CRASH_STACK_WATCH_ENTRIES; ++i) {
+        const crash_stack_watch_entry_t& candidate = bank.entries[i];
+        if (candidate.sequence == 0U ||
+            (candidate.sequence ^ candidate.sequence_inv) != 0xFFFFFFFFUL) {
+            continue;
+        }
+        uint32_t pos = out->count;
+        while (pos > 0U &&
+               out->entries[pos - 1U].sequence > candidate.sequence) {
+            out->entries[pos] = out->entries[pos - 1U];
+            --pos;
+        }
+        out->entries[pos] = candidate;
+        ++out->count;
+    }
+    if (out->count != 0U) {
+        out->newest_sequence = out->entries[out->count - 1U].sequence;
+    }
+}
+
+FLASHMEM void crash_stack_watch_snapshot(crash_stack_watch_snapshot_t* out) {
+    if (!out) return;
+    crash_stack_watch_boot_latch();
+
+    out->enabled = CRASH_STACK_WATCH_ENABLED;
+    out->armed = g_crash_stack_watch_armed;
+    out->arm_skip_reason = g_crash_stack_watch_skip_reason;
+    out->arm_attempts = g_crash_stack_watch_arm_attempts;
+    out->last_dhcsr = g_crash_stack_watch_last_dhcsr;
+    out->watch_address = CRASH_STACK_WATCH_ADDRESS;
+    out->watch_bytes = CRASH_STACK_WATCH_BYTES;
+    out->effective_comp_address = g_crash_stack_watch_effective_comp;
+    out->effective_mask = g_crash_stack_watch_effective_mask;
+
+    const uint32_t saved_primask = read_primask();
+    disable_interrupts();
+    crash_stack_watch_snapshot_bank(g_crash_stack_watch_live, &out->live);
+    crash_stack_watch_snapshot_bank(g_crash_stack_watch_retained,
+                                    &out->retained);
+    write_primask(saved_primask);
+}
+
+FLASHMEM const char* crash_stack_watch_skip_reason_name(uint32_t reason) {
+    switch (reason) {
+        case CRASH_STACK_WATCH_SKIP_NONE: return "NONE";
+        case CRASH_STACK_WATCH_SKIP_DISABLED: return "DISABLED";
+        case CRASH_STACK_WATCH_SKIP_HALTING_DEBUG_ACTIVE:
+            return "HALTING_DEBUG_ACTIVE";
+        default: return "UNKNOWN";
+    }
+}
+
+FLASHMEM void crash_stack_watch_clear_retained(void) {
+    const uint32_t saved_primask = read_primask();
+    disable_interrupts();
+    for (size_t i = 0;
+         i < sizeof(g_crash_stack_watch_retained) / sizeof(uint32_t); ++i) {
+        reinterpret_cast<volatile uint32_t*>(
+            &g_crash_stack_watch_retained)[i] = 0U;
+    }
+    crash_stack_watch_flush_bank(g_crash_stack_watch_retained);
+    write_primask(saved_primask);
+}
+
+// ============================================================================
+// Stack altitude tripwire (SP-floor overlap detector)
+// ============================================================================
+
+static constexpr uint32_t CRASH_STACK_TRIPWIRE_MAGIC = 0x5A505457UL;  // "ZPTW"
+static constexpr uint32_t CRASH_STACK_TRIPWIRE_SCHEMA_VERSION = 1U;
+
+struct alignas(32) crash_stack_tripwire_bank_t {
+    uint32_t magic;
+    uint32_t magic_inv;
+    uint32_t schema_version;
+    uint32_t capacity;
+    uint32_t violation_total;
+    uint32_t reserved0;
+    uint32_t reserved1;
+    uint32_t reserved2;
+    crash_stack_tripwire_entry_t first;
+    crash_stack_tripwire_entry_t entries[CRASH_STACK_TRIPWIRE_ENTRIES];
+    uint32_t reserved_tail[4];
+};
+
+static_assert((sizeof(crash_stack_tripwire_bank_t) % 32U) == 0U,
+              "Stack tripwire bank must occupy complete Cortex-M7 cache lines");
+
+alignas(32) static crash_stack_tripwire_bank_t g_crash_stack_tripwire_live DMAMEM;
+alignas(32) static crash_stack_tripwire_bank_t g_crash_stack_tripwire_retained DMAMEM;
+
+// Ordinary BSS: cleared each boot.
+volatile uint32_t g_crash_stack_tripwire_floor = 0U;
+volatile uint32_t g_crash_stack_tripwire_floor_publish_count = 0U;
+static bool g_crash_stack_tripwire_boot_latched = false;
+
+static bool crash_stack_tripwire_bank_valid(
+    const crash_stack_tripwire_bank_t& bank) {
+    return bank.magic == CRASH_STACK_TRIPWIRE_MAGIC &&
+           (bank.magic ^ bank.magic_inv) == 0xFFFFFFFFUL &&
+           bank.schema_version == CRASH_STACK_TRIPWIRE_SCHEMA_VERSION &&
+           bank.capacity == CRASH_STACK_TRIPWIRE_ENTRIES;
+}
+
+static void crash_stack_tripwire_flush_bank(crash_stack_tripwire_bank_t& bank) {
+    arm_dcache_flush(&bank, sizeof(bank));
+}
+
+static void crash_stack_tripwire_initialize_live(void) {
+    crash_stack_tripwire_bank_t& bank = g_crash_stack_tripwire_live;
+    for (size_t i = 0; i < sizeof(bank) / sizeof(uint32_t); ++i) {
+        reinterpret_cast<volatile uint32_t*>(&bank)[i] = 0U;
+    }
+    bank.schema_version = CRASH_STACK_TRIPWIRE_SCHEMA_VERSION;
+    bank.capacity = CRASH_STACK_TRIPWIRE_ENTRIES;
+    bank.magic_inv = ~CRASH_STACK_TRIPWIRE_MAGIC;
+    bank.magic = CRASH_STACK_TRIPWIRE_MAGIC;
+    crash_stack_tripwire_flush_bank(bank);
+}
+
+static void crash_stack_tripwire_boot_latch(void) {
+    if (g_crash_stack_tripwire_boot_latched) return;
+    g_crash_stack_tripwire_boot_latched = true;
+
+    if (crash_stack_tripwire_bank_valid(g_crash_stack_tripwire_live)) {
+        g_crash_stack_tripwire_retained = g_crash_stack_tripwire_live;
+        crash_stack_tripwire_flush_bank(g_crash_stack_tripwire_retained);
+    }
+    crash_stack_tripwire_initialize_live();
+}
+
+// Violation latcher.  Runs in ISR context; scalar-only, allocation-free.
+// Rare by construction (never fires in a healthy system), so the full-bank
+// cache flush is acceptable.
+void crash_stack_tripwire_latch(uint32_t site,
+                                uint32_t msp,
+                                uint32_t exc_return,
+                                uint32_t floor,
+                                uint32_t frame_top_estimate) {
+    crash_stack_tripwire_bank_t& bank = g_crash_stack_tripwire_live;
+    if (!crash_stack_tripwire_bank_valid(bank)) return;
+
+    const uint32_t sequence = ++bank.violation_total;
+    crash_stack_tripwire_entry_t& entry =
+        bank.entries[(sequence - 1U) % CRASH_STACK_TRIPWIRE_ENTRIES];
+
+    entry.sequence = 0U;
+    entry.sequence_inv = 0U;
+    entry.site = site;
+    entry.msp = msp;
+    entry.exc_return = exc_return;
+    entry.floor = floor;
+    entry.frame_top_estimate = frame_top_estimate;
+    entry.dwt = reg32(REG_DWT_CYCCNT);
+    entry.ipsr = read_ipsr();
+    entry.reserved[0] = 0U;
+    entry.reserved[1] = 0U;
+    entry.reserved[2] = 0U;
+    entry.sequence_inv = ~sequence;
+    entry.sequence = sequence;
+
+    if (bank.first.sequence == 0U) {
+        bank.first = entry;
+    }
+
+    crash_stack_tripwire_flush_bank(bank);
+}
+
+static void crash_stack_tripwire_snapshot_bank(
+    const crash_stack_tripwire_bank_t& bank,
+    crash_stack_tripwire_bank_snapshot_t* out) {
+    for (size_t i = 0; i < sizeof(*out); ++i) {
+        reinterpret_cast<uint8_t*>(out)[i] = 0U;
+    }
+    out->valid = crash_stack_tripwire_bank_valid(bank);
+    if (!out->valid) return;
+
+    out->violation_total = bank.violation_total;
+    out->first = bank.first;
+
+    for (uint32_t i = 0U; i < CRASH_STACK_TRIPWIRE_ENTRIES; ++i) {
+        const crash_stack_tripwire_entry_t& candidate = bank.entries[i];
+        if (candidate.sequence == 0U ||
+            (candidate.sequence ^ candidate.sequence_inv) != 0xFFFFFFFFUL) {
+            continue;
+        }
+        uint32_t pos = out->count;
+        while (pos > 0U &&
+               out->entries[pos - 1U].sequence > candidate.sequence) {
+            out->entries[pos] = out->entries[pos - 1U];
+            --pos;
+        }
+        out->entries[pos] = candidate;
+        ++out->count;
+    }
+    if (out->count != 0U) {
+        out->newest_sequence = out->entries[out->count - 1U].sequence;
+    }
+}
+
+FLASHMEM void crash_stack_tripwire_snapshot(crash_stack_tripwire_snapshot_t* out) {
+    if (!out) return;
+    crash_stack_tripwire_boot_latch();
+
+    out->floor_active_now = (g_crash_stack_tripwire_floor != 0U);
+    out->floor_now = g_crash_stack_tripwire_floor;
+    out->floor_publish_count = g_crash_stack_tripwire_floor_publish_count;
+
+    const uint32_t saved_primask = read_primask();
+    disable_interrupts();
+    crash_stack_tripwire_snapshot_bank(g_crash_stack_tripwire_live, &out->live);
+    crash_stack_tripwire_snapshot_bank(g_crash_stack_tripwire_retained,
+                                       &out->retained);
+    write_primask(saved_primask);
+}
+
+FLASHMEM void crash_stack_tripwire_clear_retained(void) {
+    const uint32_t saved_primask = read_primask();
+    disable_interrupts();
+    for (size_t i = 0;
+         i < sizeof(g_crash_stack_tripwire_retained) / sizeof(uint32_t); ++i) {
+        reinterpret_cast<volatile uint32_t*>(
+            &g_crash_stack_tripwire_retained)[i] = 0U;
+    }
+    crash_stack_tripwire_flush_bank(g_crash_stack_tripwire_retained);
+    write_primask(saved_primask);
+}
+
+FLASHMEM const char* crash_stack_tripwire_site_name(uint32_t site) {
+    switch (site) {
+        case CRASH_TRIPWIRE_SITE_HANDOFF:  return "HANDOFF_ISR";
+        case CRASH_TRIPWIRE_SITE_QTIMER1:  return "QTIMER1_ISR";
+        case CRASH_TRIPWIRE_SITE_QTIMER2:  return "QTIMER2_ISR";
+        case CRASH_TRIPWIRE_SITE_QTIMER3:  return "QTIMER3_ISR";
+        case CRASH_TRIPWIRE_SITE_PPS_GPIO: return "PPS_GPIO_ISR";
+        default:                           return "UNKNOWN";
+    }
+}
+
+// ============================================================================
 // Installation, validation and reporting API
 // ============================================================================
 
@@ -887,6 +1374,10 @@ FLASHMEM void crash_forensics_install(void) {
 
     crash_barrier();
     g_crash_forensics_capture_active = 0U;
+
+    crash_stack_watch_arm();
+    crash_stack_tripwire_boot_latch();
+
     write_primask(saved_primask);
 }
 

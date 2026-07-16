@@ -536,6 +536,10 @@ static FLASHMEM void system_memory_watchdog_emit(void) {
 static FLASHMEM void system_memory_watchdog_alap_cb(timepop_ctx_t*,
                                                     timepop_diag_t*,
                                                     void*) {
+  // Retry stack-watch arming just before the audit window the boot-crash
+  // investigation identified as the strike zone.  No-op once armed.
+  crash_stack_watch_service();
+
   system_watchdog_trace_record(
       system_watchdog_trace_stage_t::WATCHDOG_ENTER,
       g_system_memory_watchdog_alap_pending ? 1U : 0U,
@@ -2357,6 +2361,149 @@ static FLASHMEM void system_crash_report_capture_once(void) {
   g_system_crash_report_truncated = out.truncated();
 }
 
+static crash_stack_watch_snapshot_t g_system_stack_watch_scratch DMAMEM;
+
+static FLASHMEM Payload system_stack_watch_entry_payload(
+    const crash_stack_watch_entry_t& entry,
+    uint32_t watch_address,
+    uint32_t watch_bytes) {
+  Payload p;
+  p.add("sequence", entry.sequence);
+  p.add("dwt", entry.dwt);
+  system_crash_add_hex32(p, "pc", entry.pc);
+  system_crash_add_hex32(p, "lr", entry.lr);
+  system_crash_add_hex32(p, "xpsr", entry.xpsr);
+  system_crash_add_hex32(p, "writer_sp", entry.writer_sp);
+  system_crash_add_hex32(p, "exc_return", entry.exc_return);
+  p.add("anomalous",
+        entry.writer_sp >= watch_address + watch_bytes);
+  PayloadArray watched;
+  for (size_t i = 0; i < 4U; ++i) {
+    Payload word;
+    word.add("index", (uint32_t)i);
+    system_crash_add_hex32(word, "address",
+                           watch_address + (uint32_t)(i * 4U));
+    system_crash_add_hex32(word, "value", entry.watched[i]);
+    watched.add(word);
+  }
+  p.add_array("watched", watched);
+  return p;
+}
+
+static FLASHMEM Payload system_stack_watch_bank_payload(
+    const crash_stack_watch_bank_snapshot_t& bank,
+    uint32_t watch_address,
+    uint32_t watch_bytes) {
+  Payload p;
+  p.add("valid", bank.valid);
+  p.add("count", bank.count);
+  p.add("newest_sequence", bank.newest_sequence);
+  p.add("hits_total", bank.hits_total);
+  p.add("anomalous_total", bank.anomalous_total);
+  if (!bank.valid) return p;
+
+  if (bank.first_anomalous.sequence != 0U) {
+    p.add_object("first_anomalous",
+                 system_stack_watch_entry_payload(bank.first_anomalous,
+                                                  watch_address,
+                                                  watch_bytes));
+  }
+
+  PayloadArray entries;
+  for (uint32_t i = 0U; i < bank.count; ++i) {
+    entries.add(system_stack_watch_entry_payload(bank.entries[i],
+                                                 watch_address,
+                                                 watch_bytes));
+  }
+  p.add_array("entries", entries);
+  return p;
+}
+
+static FLASHMEM Payload system_stack_watch_payload(void) {
+  system_dmamem_ensure_initialized();
+  crash_stack_watch_service();
+  crash_stack_watch_snapshot(&g_system_stack_watch_scratch);
+  const crash_stack_watch_snapshot_t& snap = g_system_stack_watch_scratch;
+
+  Payload p;
+  p.add("schema", "ZPNET_STACK_WATCH_V1");
+  p.add("enabled", snap.enabled);
+  p.add("armed", snap.armed);
+  p.add("arm_skip_reason", snap.arm_skip_reason);
+  p.add("arm_skip_reason_name",
+        crash_stack_watch_skip_reason_name(snap.arm_skip_reason));
+  p.add("arm_attempts", snap.arm_attempts);
+  system_crash_add_hex32(p, "last_dhcsr", snap.last_dhcsr);
+  system_crash_add_hex32(p, "watch_address", snap.watch_address);
+  p.add("watch_bytes", snap.watch_bytes);
+  system_crash_add_hex32(p, "effective_comp_address",
+                         snap.effective_comp_address);
+  p.add("effective_mask", snap.effective_mask);
+  p.add_object("retained",
+               system_stack_watch_bank_payload(snap.retained,
+                                               snap.watch_address,
+                                               snap.watch_bytes));
+  p.add_object("live",
+               system_stack_watch_bank_payload(snap.live,
+                                               snap.watch_address,
+                                               snap.watch_bytes));
+  return p;
+}
+
+static crash_stack_tripwire_snapshot_t g_system_stack_tripwire_scratch DMAMEM;
+
+static FLASHMEM Payload system_stack_tripwire_entry_payload(
+    const crash_stack_tripwire_entry_t& entry) {
+  Payload p;
+  p.add("sequence", entry.sequence);
+  p.add("site", entry.site);
+  p.add("site_name", crash_stack_tripwire_site_name(entry.site));
+  system_crash_add_hex32(p, "msp", entry.msp);
+  system_crash_add_hex32(p, "exc_return", entry.exc_return);
+  system_crash_add_hex32(p, "floor", entry.floor);
+  system_crash_add_hex32(p, "frame_top_estimate", entry.frame_top_estimate);
+  p.add("overshoot_bytes", entry.frame_top_estimate - entry.floor);
+  p.add("dwt", entry.dwt);
+  p.add("ipsr", entry.ipsr);
+  return p;
+}
+
+static FLASHMEM Payload system_stack_tripwire_bank_payload(
+    const crash_stack_tripwire_bank_snapshot_t& bank) {
+  Payload p;
+  p.add("valid", bank.valid);
+  p.add("count", bank.count);
+  p.add("newest_sequence", bank.newest_sequence);
+  p.add("violation_total", bank.violation_total);
+  if (!bank.valid) return p;
+
+  if (bank.first.sequence != 0U) {
+    p.add_object("first", system_stack_tripwire_entry_payload(bank.first));
+  }
+
+  PayloadArray entries;
+  for (uint32_t i = 0U; i < bank.count; ++i) {
+    entries.add(system_stack_tripwire_entry_payload(bank.entries[i]));
+  }
+  p.add_array("entries", entries);
+  return p;
+}
+
+static FLASHMEM Payload system_stack_tripwire_payload(void) {
+  system_dmamem_ensure_initialized();
+  crash_stack_tripwire_snapshot(&g_system_stack_tripwire_scratch);
+  const crash_stack_tripwire_snapshot_t& snap = g_system_stack_tripwire_scratch;
+
+  Payload p;
+  p.add("schema", "ZPNET_STACK_TRIPWIRE_V1");
+  p.add("floor_active_now", snap.floor_active_now);
+  system_crash_add_hex32(p, "floor_now", snap.floor_now);
+  p.add("floor_publish_count", snap.floor_publish_count);
+  p.add_object("retained", system_stack_tripwire_bank_payload(snap.retained));
+  p.add_object("live", system_stack_tripwire_bank_payload(snap.live));
+  return p;
+}
+
 static FLASHMEM Payload system_crash_report_payload(bool include_text) {
   Payload p;
   p.add("core_fault_present_now", (bool)CrashReport);
@@ -2384,6 +2531,8 @@ static FLASHMEM Payload system_crash_report_payload(bool include_text) {
                system_payload_append_trace_summary_payload());
   p.add_object("payload_contract",
                system_payload_contract_summary_payload());
+  p.add_object("stack_watch", system_stack_watch_payload());
+  p.add_object("stack_tripwire", system_stack_tripwire_payload());
   return p;
 }
 
@@ -3555,6 +3704,8 @@ static FLASHMEM Payload cmd_crash_clear(const Payload& /*args*/) {
   timepop_dispatch_trace_clear_retained();
   payload_clear_retained_append_trace();
   payload_contract_clear_retained();
+  crash_stack_watch_clear_retained();
+  crash_stack_tripwire_clear_retained();
 
   Payload resp = ok_payload();
   resp.add("crash_report_cleared", true);
@@ -3564,6 +3715,8 @@ static FLASHMEM Payload cmd_crash_clear(const Payload& /*args*/) {
   resp.add("memory_watchdog_trace_cleared", true);
   resp.add("timepop_dispatch_trace_cleared", true);
   resp.add("payload_append_trace_cleared", true);
+  resp.add("stack_watch_retained_cleared", true);
+  resp.add("stack_tripwire_retained_cleared", true);
   resp.add("payload_contract_cleared", true);
   return resp;
 }

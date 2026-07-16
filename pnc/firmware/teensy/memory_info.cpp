@@ -1,5 +1,6 @@
 #include "memory_info.h"
 #include "payload.h"
+#include "crash_forensics.h"
 
 #include <Arduino.h>
 #include <malloc.h>
@@ -674,6 +675,11 @@ const char* memory_health_reason_name(memory_health_reason_t reason) {
 }
 
 void memory_info_audit(memory_health_t* out) {
+    // Publish this audit's SP as the stack-tripwire floor: while the audit
+    // runs, the live foreground SP is always at or below this value, so any
+    // exception frame stacked above it is unlawful.  See crash_forensics.h.
+    crash_stack_tripwire_floor_enter();
+
     memory_audit_trace_record(
         memory_audit_trace_stage_t::AUDIT_ENTER,
         _memory_health.audit_count + 1U,
@@ -884,6 +890,8 @@ void memory_info_audit(memory_health_t* out) {
         _memory_health.audit_count,
         (uint32_t)_memory_health.status);
     _memory_audit_trace_active = false;
+
+    crash_stack_tripwire_floor_exit();
 }
 
 void memory_info_get_health(memory_health_t* out) {

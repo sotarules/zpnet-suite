@@ -60,6 +60,7 @@
 #include "process_interrupt.h"
 #include "process_clocks.h"
 #include "process_system.h"
+#include "crash_forensics.h"
 
 #include "config.h"
 #include "debug.h"
@@ -11379,6 +11380,7 @@ static bool interrupt_handoff_drain_one_oldest(uint32_t handoff_entry_dwt) {
 
 static void interrupt_handoff_service_isr(void) {
   const uint32_t entry_dwt = ARM_DWT_CYCCNT;  // SACRED first instruction.
+  crash_stack_tripwire_isr_check(CRASH_TRIPWIRE_SITE_HANDOFF);
   if (g_interrupt_handoff.running) {
     g_interrupt_handoff.reentry_count++;
     return;
@@ -12169,6 +12171,7 @@ static void qtimer2_isr(void) {
   const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;  // SACRED: first instruction.
   const uint16_t generation_gate_ambient_low16 =
       IMXRT_TMR2.CH[QTIMER2_OCXO1_CH].CNTR;
+  crash_stack_tripwire_isr_check(CRASH_TRIPWIRE_SITE_QTIMER2);
   ocxo_cadence_capture_priority0(g_ocxo1_ctx,
                                  isr_entry_dwt_raw,
                                  generation_gate_ambient_low16);
@@ -12178,6 +12181,7 @@ static void qtimer3_isr(void) {
   const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;  // SACRED: first instruction.
   const uint16_t generation_gate_ambient_low16 =
       IMXRT_TMR3.CH[QTIMER3_OCXO2_CH].CNTR;
+  crash_stack_tripwire_isr_check(CRASH_TRIPWIRE_SITE_QTIMER3);
   ocxo_cadence_capture_priority0(g_ocxo2_ctx,
                                  isr_entry_dwt_raw,
                                  generation_gate_ambient_low16);
@@ -12487,6 +12491,7 @@ static void qtimer1_ch2_capture_priority0(uint32_t isr_entry_dwt_raw,
 static void qtimer1_isr(void) {
   const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;  // SACRED: first instruction.
   const uint16_t generation_gate_vclock_low16 = qtimer1_ch0_counter_now();
+  crash_stack_tripwire_isr_check(CRASH_TRIPWIRE_SITE_QTIMER1);
   // VCLOCK authority: QTimer1 CH0 is the pin-bound VCLOCK count+compare rail.
   const uint32_t vclock_csctrl = IMXRT_TMR1.CH[QTIMER1_VCLOCK_CH].CSCTRL;
   if (vclock_csctrl & TMR_CSCTRL_TCF1) {
@@ -12841,6 +12846,11 @@ static void pps_gpio_isr(void) {
   pps_capture_packet_fill_priority0(packet, isr_entry_dwt_raw);
 
   pps_capture_packet_enqueue_priority0(packet, isr_entry_dwt_raw);
+
+  // After the sacred multi-clock capture window on purpose: LR no longer
+  // holds EXC_RETURN here, so the check runs with the conservative
+  // basic-frame estimate.
+  crash_stack_tripwire_isr_check(CRASH_TRIPWIRE_SITE_PPS_GPIO);
 }
 
 void interrupt_pps_edge_register_dispatch(pps_edge_dispatch_fn fn) {
