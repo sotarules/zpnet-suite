@@ -59,7 +59,6 @@
 
 #include "process_interrupt.h"
 #include "process_clocks.h"
-#include "frame_sentinel.h"
 #include "process_system.h"
 
 #include "config.h"
@@ -6386,31 +6385,6 @@ static void lower_env_seal(lower_env_lane_t& lane,
   interrupt_feature_update_floorline();
 }
 
-static void lower_env_seal_sentinel(lower_env_lane_t& lane,
-                                    uint32_t observed_dwt,
-                                    uint32_t target_counter32,
-                                    uint16_t target_hw16,
-                                    uint16_t observed_hw16) {
-  // Open the existing priority-zero ISR focus gate for the full FloorLine
-  // victim interval.  The current QTimer/PPS wrappers already consult this
-  // flag before entering their handler-specific sentinel slots.
-  const bool prior_focus = g_zpnet_sentinel_cpu_usage_focus_active;
-  g_zpnet_sentinel_cpu_usage_focus_active = true;
-
-  FRAME_SENTINEL_ENTER(FRAME_SENTINEL_SLOT_FLOORLINE_SEAL,
-                       "FLOORLINE_SEAL");
-
-  lower_env_seal(lane,
-                 observed_dwt,
-                 target_counter32,
-                 target_hw16,
-                 observed_hw16);
-
-  FRAME_SENTINEL_EXIT(FRAME_SENTINEL_SLOT_FLOORLINE_SEAL);
-
-  g_zpnet_sentinel_cpu_usage_focus_active = prior_focus;
-}
-
 static void cadence_regression_observe(interrupt_subscriber_kind_t kind,
                                        uint32_t observed_dwt,
                                        uint32_t target_counter32,
@@ -6451,7 +6425,7 @@ static void cadence_regression_observe(interrupt_subscriber_kind_t kind,
     lane->active_sample_rejected_count++;
     lane->active_sample_hard_rejected_count++;
     if (closes_second) {
-      lower_env_seal_sentinel(*lane, observed_dwt, target_counter32,
+      lower_env_seal(*lane, observed_dwt, target_counter32,
                               target_hw16, observed_hw16);
     }
     return;
@@ -6477,7 +6451,7 @@ static void cadence_regression_observe(interrupt_subscriber_kind_t kind,
   }
 
   if (closes_second) {
-    lower_env_seal_sentinel(*lane, observed_dwt, target_counter32,
+    lower_env_seal(*lane, observed_dwt, target_counter32,
                             target_hw16, observed_hw16);
   }
 }
@@ -7513,20 +7487,6 @@ static void dwt_publication_record_fatal_forensics(
     bool floorline_candidate,
     bool floorline_published,
     uint32_t floorline_dwt) {
-  const uint32_t sentinel_slot =
-      req.kind == interrupt_subscriber_kind_t::VCLOCK
-          ? ZPNET_SENTINEL_SLOT_DWT_FATAL_VCLOCK
-          : (req.kind == interrupt_subscriber_kind_t::OCXO1
-                 ? ZPNET_SENTINEL_SLOT_DWT_FATAL_OCXO1
-                 : ZPNET_SENTINEL_SLOT_DWT_FATAL_OCXO2);
-  const char* const sentinel_name =
-      req.kind == interrupt_subscriber_kind_t::VCLOCK
-          ? "DWT_FATAL_VCLOCK"
-          : (req.kind == interrupt_subscriber_kind_t::OCXO1
-                 ? "DWT_FATAL_OCXO1"
-                 : "DWT_FATAL_OCXO2");
-  ZPNET_SENTINEL_ENTER(sentinel_slot, sentinel_name);
-
   const uint32_t next_count = g_dwt_publication_last_fatal.record_count + 1U;
   dwt_publication_forensics_t f{};
   f.valid = true;
@@ -7640,35 +7600,13 @@ static void dwt_publication_record_fatal_forensics(
   }
 
   g_dwt_publication_last_fatal = f;
-  ZPNET_SENTINEL_EXIT(sentinel_slot);
 }
 
 static bool dwt_publication_adjudicate_or_watchdog(
     const dwt_publication_request_t& req,
     dwt_repair_diag_t& diag) {
-  const uint32_t sentinel_slot =
-      req.kind == interrupt_subscriber_kind_t::VCLOCK
-          ? ZPNET_SENTINEL_SLOT_DWT_PUBLICATION_VCLOCK
-          : (req.kind == interrupt_subscriber_kind_t::OCXO1
-                 ? ZPNET_SENTINEL_SLOT_DWT_PUBLICATION_OCXO1
-                 : (req.kind == interrupt_subscriber_kind_t::OCXO2
-                        ? ZPNET_SENTINEL_SLOT_DWT_PUBLICATION_OCXO2
-                        : ZPNET_SENTINEL_SLOT_RESERVED));
-  const char* const sentinel_name =
-      req.kind == interrupt_subscriber_kind_t::VCLOCK
-          ? "DWT_PUBLICATION_VCLOCK"
-          : (req.kind == interrupt_subscriber_kind_t::OCXO1
-                 ? "DWT_PUBLICATION_OCXO1"
-                 : (req.kind == interrupt_subscriber_kind_t::OCXO2
-                        ? "DWT_PUBLICATION_OCXO2"
-                        : "DWT_PUBLICATION_UNKNOWN"));
-  ZPNET_SENTINEL_ENTER(sentinel_slot, sentinel_name);
-
   dwt_publication_lane_state_t* s = dwt_publication_lane_state_for(req.kind);
-  if (!s) {
-    ZPNET_SENTINEL_EXIT(sentinel_slot);
-    return false;
-  }
+  if (!s) return false;
 
   dwt_publication_diag_seed(diag);
 
@@ -7929,7 +7867,6 @@ static bool dwt_publication_adjudicate_or_watchdog(
                    : (strict_ready
                           ? INTERRUPT_DWT_PUBLICATION_REASON_STRICT_PUBLICATION_QUARANTINE
                           : INTERRUPT_DWT_PUBLICATION_REASON_STARTUP_HARD_QUARANTINE));
-        ZPNET_SENTINEL_EXIT(sentinel_slot);
         return false;
       }
 
@@ -7967,7 +7904,6 @@ static bool dwt_publication_adjudicate_or_watchdog(
   } else {
     s->accept_count = 0;
   }
-  ZPNET_SENTINEL_EXIT(sentinel_slot);
   return true;
 }
 
@@ -11438,11 +11374,8 @@ static bool interrupt_handoff_drain_one_oldest(uint32_t handoff_entry_dwt) {
 
 static void interrupt_handoff_service_isr(void) {
   const uint32_t entry_dwt = ARM_DWT_CYCCNT;  // SACRED first instruction.
-  ZPNET_SENTINEL_ENTER(ZPNET_SENTINEL_SLOT_HANDOFF_ISR, "HANDOFF_ISR");
-
   if (g_interrupt_handoff.running) {
     g_interrupt_handoff.reentry_count++;
-    ZPNET_SENTINEL_EXIT(ZPNET_SENTINEL_SLOT_HANDOFF_ISR);
     return;
   }
 
@@ -11499,7 +11432,6 @@ static void interrupt_handoff_service_isr(void) {
         g_interrupt_handoff.request_count - g_interrupt_handoff.served_request_count;
   }
 
-  ZPNET_SENTINEL_EXIT(ZPNET_SENTINEL_SLOT_HANDOFF_ISR);
 }
 
 
@@ -12232,32 +12164,18 @@ static void qtimer2_isr(void) {
   const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;  // SACRED: first instruction.
   const uint16_t generation_gate_ambient_low16 =
       IMXRT_TMR2.CH[QTIMER2_OCXO1_CH].CNTR;
-  const bool sentinel_focus = g_zpnet_sentinel_cpu_usage_focus_active;
-  if (sentinel_focus) {
-    ZPNET_SENTINEL_ENTER(ZPNET_SENTINEL_SLOT_QTIMER2_ISR, "QTIMER2_ISR");
-  }
   ocxo_cadence_capture_priority0(g_ocxo1_ctx,
                                  isr_entry_dwt_raw,
                                  generation_gate_ambient_low16);
-  if (sentinel_focus) {
-    ZPNET_SENTINEL_EXIT(ZPNET_SENTINEL_SLOT_QTIMER2_ISR);
-  }
 }
 
 static void qtimer3_isr(void) {
   const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;  // SACRED: first instruction.
   const uint16_t generation_gate_ambient_low16 =
       IMXRT_TMR3.CH[QTIMER3_OCXO2_CH].CNTR;
-  const bool sentinel_focus = g_zpnet_sentinel_cpu_usage_focus_active;
-  if (sentinel_focus) {
-    ZPNET_SENTINEL_ENTER(ZPNET_SENTINEL_SLOT_QTIMER3_ISR, "QTIMER3_ISR");
-  }
   ocxo_cadence_capture_priority0(g_ocxo2_ctx,
                                  isr_entry_dwt_raw,
                                  generation_gate_ambient_low16);
-  if (sentinel_focus) {
-    ZPNET_SENTINEL_EXIT(ZPNET_SENTINEL_SLOT_QTIMER3_ISR);
-  }
 }
 
 // ============================================================================
@@ -12564,20 +12482,12 @@ static void qtimer1_ch2_capture_priority0(uint32_t isr_entry_dwt_raw,
 static void qtimer1_isr(void) {
   const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;  // SACRED: first instruction.
   const uint16_t generation_gate_vclock_low16 = qtimer1_ch0_counter_now();
-  const bool sentinel_focus = g_zpnet_sentinel_cpu_usage_focus_active;
-  if (sentinel_focus) {
-    ZPNET_SENTINEL_ENTER(ZPNET_SENTINEL_SLOT_QTIMER1_ISR, "QTIMER1_ISR");
-  }
-
   // VCLOCK authority: QTimer1 CH0 is the pin-bound VCLOCK count+compare rail.
   const uint32_t vclock_csctrl = IMXRT_TMR1.CH[QTIMER1_VCLOCK_CH].CSCTRL;
   if (vclock_csctrl & TMR_CSCTRL_TCF1) {
     qtimer1_vclock_capture_priority0(isr_entry_dwt_raw,
                                      vclock_csctrl,
                                      generation_gate_vclock_low16);
-    if (sentinel_focus) {
-      ZPNET_SENTINEL_EXIT(ZPNET_SENTINEL_SLOT_QTIMER1_ISR);
-    }
     return;
   }
 
@@ -12586,9 +12496,6 @@ static void qtimer1_isr(void) {
   const uint32_t timepop_csctrl = IMXRT_TMR1.CH[QTIMER1_TIMEPOP_CH].CSCTRL;
   if (timepop_csctrl & TMR_CSCTRL_TCF1) {
     qtimer1_ch2_capture_priority0(isr_entry_dwt_raw, timepop_csctrl);
-    if (sentinel_focus) {
-      ZPNET_SENTINEL_EXIT(ZPNET_SENTINEL_SLOT_QTIMER1_ISR);
-    }
     return;
   }
 
@@ -12598,9 +12505,6 @@ static void qtimer1_isr(void) {
     qtimer1_ch1_clear_compare_flag();
   }
 
-  if (sentinel_focus) {
-    ZPNET_SENTINEL_EXIT(ZPNET_SENTINEL_SLOT_QTIMER1_ISR);
-  }
 }
 
 // ============================================================================
@@ -12926,19 +12830,12 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
 static void pps_gpio_isr(void) {
   const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;
 
-  // Preserve the sacred multi-clock capture window before the focused frame
-  // court performs cache maintenance or any out-of-line call.
+  // Preserve the sacred multi-clock capture window before any
+  // out-of-line call.
   pps_capture_packet_t packet{};
   pps_capture_packet_fill_priority0(packet, isr_entry_dwt_raw);
 
-  const bool sentinel_focus = g_zpnet_sentinel_cpu_usage_focus_active;
-  if (sentinel_focus) {
-    ZPNET_SENTINEL_ENTER(ZPNET_SENTINEL_SLOT_PPS_GPIO_ISR, "PPS_GPIO_ISR");
-  }
   pps_capture_packet_enqueue_priority0(packet, isr_entry_dwt_raw);
-  if (sentinel_focus) {
-    ZPNET_SENTINEL_EXIT(ZPNET_SENTINEL_SLOT_PPS_GPIO_ISR);
-  }
 }
 
 void interrupt_pps_edge_register_dispatch(pps_edge_dispatch_fn fn) {
@@ -13588,8 +13485,8 @@ static void qtimer1_init_ch2_scheduler(void) {
 //
 // This does not disable the FPU and does not restrict compiler use of VFP
 // registers inside an ISR.  It removes only the mid-handler lazy materialize
-// transition implicated by Frame Sentinel.  The policy is installed once; it
-// is never rewritten after interrupt hardware has become live.
+// transition under investigation.  The policy is installed once; it is never
+// rewritten after interrupt hardware has become live.
 
 static constexpr uintptr_t INTERRUPT_FPU_FPCCR_ADDRESS = 0xE000EF34UL;
 static constexpr uintptr_t INTERRUPT_SCB_CPACR_ADDRESS = 0xE000ED88UL;

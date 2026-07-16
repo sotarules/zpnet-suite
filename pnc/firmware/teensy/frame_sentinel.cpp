@@ -1,3 +1,6 @@
+#if 0
+// Retired: Frame Sentinel is excluded from the firmware baseline.
+
 #include "frame_sentinel.h"
 
 #include "events.h"
@@ -1252,3 +1255,5 @@ void frame_sentinel_clear(void) {
   g_frame_sentinel_event_pending = false;
   g_frame_sentinel_event_emitted = false;
 }
+
+#endif  // Retired Frame Sentinel

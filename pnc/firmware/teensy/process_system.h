@@ -1,7 +1,6 @@
 #pragma once
 
 #include "process.h"
-#include "frame_sentinel.h"
 #include <Arduino.h>
 
 /**
@@ -77,6 +76,10 @@
 
 // Register SYSTEM command surface
 void process_system_register(void);
+
+#if 0
+// Retired: Frame Sentinel declarations are excluded from the firmware baseline.
+// Keeping the historical text disabled makes any missed user fail to compile.
 
 // ============================================================================
 // Exception-frame sentinel
@@ -194,14 +197,16 @@ void zpnet_sentinel_exit(uint32_t slot, uint32_t caller_sp);
   } while (0)
 #endif
 
+#endif  // Retired Frame Sentinel declaration surface
+
 // ============================================================================
 // Foreground / CPU-usage retained crash breadcrumbs
 // ============================================================================
 //
 // The main loop records its current imperative phase.  cpu_usage_tick() then
-// latches the phase and marks one CPU sample active before entering the tiny
-// DWT-read victim.  Both live and previous-boot records are reported through
-// SYSTEM.SENTINEL_INFO and SYSTEM.CRASH_INFO.
+// latches the phase and marks one CPU sample active around the recurring
+// sampler.  Both live and previous-boot records are reported through
+// SYSTEM.CRASH_INFO.
 
 enum class zpnet_foreground_phase_t : uint32_t {
   NONE             = 0,
@@ -224,11 +229,6 @@ void zpnet_cpu_usage_ledger_enter(void) __attribute__((noinline));
 void zpnet_cpu_usage_ledger_stage(zpnet_cpu_usage_stage_t stage,
                                   uint32_t value) __attribute__((noinline));
 void zpnet_cpu_usage_ledger_exit(void) __attribute__((noinline));
-
-// Priority-0 ISR wrappers sample this flag inline before their first call.
-// It is true only across cpu_usage_sample(), so the expensive frame court does
-// not run continuously on the 1 kHz timing rails.
-extern volatile bool g_zpnet_sentinel_cpu_usage_focus_active;
 
 // ============================================================================
 // Feature status substrate

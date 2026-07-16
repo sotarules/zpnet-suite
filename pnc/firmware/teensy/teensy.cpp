@@ -7,7 +7,6 @@
 
 #include "config.h"
 #include "crash_forensics.h"
-#include "frame_sentinel.h"
 #include "memory_info.h"
 #include "timepop.h"
 #include "events.h"
@@ -179,7 +178,6 @@ void setup() {
   // ----------------------------------------------------------
 
   memory_info_init();
-  frame_sentinel_init();
   cpu_usage_init();
 
   // process_interrupt owns all interrupt-vector-bearing hardware:
@@ -384,12 +382,10 @@ void loop() {
   zpnet_foreground_phase_note(zpnet_foreground_phase_t::TRANSPORT_PRE);
   transport_note_runtime_loop();
   transport_poll();
-  frame_sentinel_service();
 
   zpnet_foreground_phase_note(zpnet_foreground_phase_t::TIMEPOP_DISPATCH);
   timepop_dispatch();
 
   zpnet_foreground_phase_note(zpnet_foreground_phase_t::TRANSPORT_POST);
   transport_poll();
-  frame_sentinel_service();
 }

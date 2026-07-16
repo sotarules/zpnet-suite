@@ -53,14 +53,8 @@ void cpu_usage_init(void) {
 
 static void cpu_usage_tick(timepop_ctx_t*, timepop_diag_t*, void*) {
   zpnet_cpu_usage_ledger_enter();
-  ZPNET_SENTINEL_ENTER(ZPNET_SENTINEL_SLOT_CPU_USAGE, "CPU_USAGE");
-  g_zpnet_sentinel_cpu_usage_focus_active = true;
-
   cpu_usage_sample();
-
-  g_zpnet_sentinel_cpu_usage_focus_active = false;
   zpnet_cpu_usage_ledger_exit();
-  ZPNET_SENTINEL_EXIT(ZPNET_SENTINEL_SLOT_CPU_USAGE);
 }
 
 void cpu_usage_init_timer(void) {

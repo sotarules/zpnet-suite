@@ -15,7 +15,6 @@
 
 #include "process_system.h"
 #include "memory_info.h"
-#include "frame_sentinel.h"
 #include "crash_forensics.h"
 #include "config.h"
 #include "process.h"
@@ -48,7 +47,6 @@ static void system_feature_schedule_fragment_publish(void);
 static void system_memory_watchdog_arm(void);
 static void system_memory_watchdog_schedule_alap(void);
 static void system_dmamem_ensure_initialized(void);
-static void system_sentinel_service(void);
 static void system_payload_contract_service(void);
 
 // --------------------------------------------------------------
@@ -107,8 +105,6 @@ static_assert(sizeof(zpnet_runtime_ledger_t) == 64U,
 static zpnet_runtime_ledger_t g_runtime_ledger DMAMEM;
 static zpnet_runtime_ledger_t g_runtime_ledger_retained DMAMEM;
 static bool g_runtime_ledger_boot_latched = false;  // BSS: zero every boot
-
-volatile bool g_zpnet_sentinel_cpu_usage_focus_active = false;
 
 static bool runtime_ledger_header_valid(const zpnet_runtime_ledger_t* ledger) {
   return ledger &&
@@ -288,8 +284,6 @@ enum class system_watchdog_trace_stage_t : uint32_t {
   AUDIT_RETURN   = 4,
   EMIT_BEGIN     = 5,
   EMIT_END       = 6,
-  SENTINEL_BEGIN = 7,
-  SENTINEL_END   = 8,
   REARM_BEGIN    = 9,
   REARM_END      = 10,
   WATCHDOG_EXIT  = 11,
@@ -557,22 +551,6 @@ static FLASHMEM void system_memory_watchdog_emit(void) {
   g_system_memory_watchdog_event_count++;
 }
 
-static void system_memory_audit_sentinel(void) {
-  // The memory audit is a thread-mode victim region.  Open the historical
-  // priority-zero focus gate while it runs so the existing QTimer/PPS handler
-  // courts execute their dual V1+V2 bookends.  Preserve a pre-existing focus
-  // request in case another diagnostic region owns it.
-  const bool prior_focus = g_zpnet_sentinel_cpu_usage_focus_active;
-  g_zpnet_sentinel_cpu_usage_focus_active = true;
-
-  FRAME_SENTINEL_ENTER(FRAME_SENTINEL_SLOT_MEMORY_AUDIT,
-                       "MEMORY_AUDIT");
-  memory_info_audit(&g_system_memory_watchdog_health);
-  FRAME_SENTINEL_EXIT(FRAME_SENTINEL_SLOT_MEMORY_AUDIT);
-
-  g_zpnet_sentinel_cpu_usage_focus_active = prior_focus;
-}
-
 static FLASHMEM void system_memory_watchdog_alap_cb(timepop_ctx_t*,
                                                     timepop_diag_t*,
                                                     void*) {
@@ -604,7 +582,7 @@ static FLASHMEM void system_memory_watchdog_alap_cb(timepop_ctx_t*,
       system_watchdog_trace_stage_t::AUDIT_ENTER,
       g_system_memory_watchdog_health.audit_count + 1U,
       (uint32_t)g_system_memory_watchdog_health.status);
-  system_memory_audit_sentinel();
+  memory_info_audit(&g_system_memory_watchdog_health);
   system_watchdog_trace_record(
       system_watchdog_trace_stage_t::AUDIT_RETURN,
       (uint32_t)g_system_memory_watchdog_health.status,
@@ -704,679 +682,6 @@ static void system_memory_watchdog_arm(void) {
   }
 
   g_system_memory_watchdog_armed = true;
-}
-
-// ================================================================
-// Exception-frame sentinel — core
-// ================================================================
-//
-// Catch corruption of a stacked exception frame while the corrupting handler
-// pass is still on the CPU, with attribution.  See process_system.h for the
-// usage contract (ZPNET_SENTINEL_ENTER/EXIT placement rules).
-//
-// Frame location strategies, in evidence-quality order:
-//
-//   1. FPCAR anchor — EXC_RETURN reports an extended frame and FPCCR.LSPACT
-//      is still pending, so FPCAR points at the reserved FP area and the
-//      8-word basic frame sits at FPCAR − 0x20.  Deterministic for the
-//      FP-active foreground that Crash1 implicates.
-//   2. PSP — EXC_RETURN reports the process stack as the return stack.
-//   3. Bounded signature scan — observational fallback only.  A candidate must
-//      match EXC_RETURN's thread/handler return semantics and carry plausible
-//      stacked PC, LR, and xPSR values.  SCAN changes are counted but cannot
-//      latch a frame-corruption verdict in this crash-hunt build.
-//
-// Everything on the enter/exit path is scalar, allocator-free, bounded, and
-// runs from ITCM (deliberately not FLASHMEM).  Verdicts are latched to a
-// RAM2 NOLOAD record (magic+complement, dcache-flushed) so they survive the
-// reboot that typically follows successful frame corruption.
-
-extern "C" unsigned long _estack;
-
-#define ZPNET_SCB_FPCCR (*(volatile uint32_t*)0xE000EF34UL)
-#define ZPNET_SCB_FPCAR (*(volatile uint32_t*)0xE000EF38UL)
-
-enum {
-  ZPNET_SENTINEL_FRAME_NONE  = 0,
-  ZPNET_SENTINEL_FRAME_FPCAR = 1,
-  ZPNET_SENTINEL_FRAME_PSP   = 2,
-  ZPNET_SENTINEL_FRAME_SCAN  = 3,
-};
-
-static const char* sentinel_frame_source_name(uint32_t source) {
-  switch (source) {
-    case ZPNET_SENTINEL_FRAME_FPCAR: return "FPCAR";
-    case ZPNET_SENTINEL_FRAME_PSP:   return "PSP";
-    case ZPNET_SENTINEL_FRAME_SCAN:  return "SCAN";
-    default:                         return "NONE";
-  }
-}
-
-// Violation kind bitmask
-static constexpr uint32_t ZPNET_SENTINEL_KIND_FRAME = 0x1U;
-static constexpr uint32_t ZPNET_SENTINEL_KIND_MSP   = 0x2U;
-
-// Bounded upward scan window from the current MSP, in bytes.
-static constexpr uint32_t ZPNET_SENTINEL_SCAN_BYTES = 512U;
-static constexpr uint32_t ZPNET_SENTINEL_SCAN_MAX_EXCEPTION = 255U;
-static constexpr bool ZPNET_SENTINEL_SCAN_VERDICTS_ENABLED = false;
-
-typedef struct {
-  volatile uint32_t active;
-  const char* name;
-  uint32_t pass;
-  uint32_t exc_return;
-  uint32_t frame_address;
-  uint32_t frame_source;
-  uint32_t entry_words[8];
-  uint32_t entry_checksum;
-  uint32_t msp_entry;
-  uint32_t fpccr_entry;
-  uint32_t fpcar_entry;
-  uint32_t dwt_entry;
-  uint32_t ipsr;
-  // Last completed pass
-  uint32_t msp_exit_last;
-  uint32_t exit_checksum_last;
-  uint32_t dwt_exit_last;
-  // Per-slot verdict counters
-  uint32_t frames_located;
-  uint32_t frames_missing;
-  uint32_t thread_mode_passes;
-  uint32_t exc_return_implausible;
-  uint32_t checksum_fail;
-  uint32_t scan_change_ignored;
-  uint32_t msp_mismatch;
-  uint32_t lspact_consumed;
-} zpnet_sentinel_slot_t;
-
-// Ordinary BSS: per-boot state, guaranteed zeroed by startup.
-static zpnet_sentinel_slot_t g_sentinel_slots[ZPNET_SENTINEL_SLOT_COUNT];
-
-static uint32_t g_sentinel_enters = 0;
-static uint32_t g_sentinel_exits = 0;
-static uint32_t g_sentinel_bad_slot = 0;
-static uint32_t g_sentinel_unbalanced_enter = 0;
-static uint32_t g_sentinel_unbalanced_exit = 0;
-static uint32_t g_sentinel_frames_fpcar = 0;
-static uint32_t g_sentinel_frames_psp = 0;
-static uint32_t g_sentinel_frames_scan = 0;
-static uint32_t g_sentinel_frames_none = 0;
-static uint32_t g_sentinel_scan_changes_ignored = 0;
-static uint32_t g_sentinel_violations_this_boot = 0;
-static uint32_t g_sentinel_violations_suppressed = 0;
-static volatile bool g_sentinel_event_pending = false;
-static bool g_sentinel_event_emitted = false;
-
-static constexpr uint32_t ZPNET_SENTINEL_MAGIC = 0x53454E33UL;  // 'SEN3'
-
-typedef struct {
-  uint32_t magic;
-  uint32_t magic_inv;
-  uint32_t kind;
-  uint32_t slot;
-  char     name[24];
-  uint32_t pass;
-  uint32_t frame_address;
-  uint32_t frame_source;
-  uint32_t exc_return;
-  uint32_t ipsr;
-  uint32_t msp_entry;
-  uint32_t msp_exit;
-  uint32_t fpccr_entry;
-  uint32_t fpccr_exit;
-  uint32_t fpcar_entry;
-  uint32_t fpcar_exit;
-  uint32_t dwt_entry;
-  uint32_t dwt_exit;
-  uint32_t entry_words[8];
-  uint32_t exit_words[8];
-  uint32_t diff_mask;
-  uint32_t entry_checksum;
-  uint32_t exit_checksum;
-  // Foreground correlation: the outermost sentinel region that was active
-  // when the violation latched (typically the thread-mode victim region the
-  // corrupting handler pass preempted).
-  uint32_t foreground_region_depth;
-  uint32_t foreground_region_slot;
-  uint32_t foreground_region_pass;
-  char     foreground_region_name[24];
-} zpnet_sentinel_violation_t;
-
-// Retained verdict — RAM2 NOLOAD, first violation latched until CRASH_CLEAR.
-// Deliberately excluded from system_dmamem_ensure_initialized(): like the
-// crash_forensics record, it may be the only surviving witness to a reboot.
-static zpnet_sentinel_violation_t g_sentinel_violation_retained DMAMEM;
-
-// This boot's most recent violation (overwritten each time); BSS.
-static zpnet_sentinel_violation_t g_sentinel_violation_last;
-static bool g_sentinel_violation_last_present = false;
-
-static bool sentinel_retained_valid(void) {
-  const bool header_valid =
-      g_sentinel_violation_retained.magic == ZPNET_SENTINEL_MAGIC &&
-      (g_sentinel_violation_retained.magic ^
-       g_sentinel_violation_retained.magic_inv) == 0xFFFFFFFFUL;
-  if (!header_valid) return false;
-
-  // Earlier builds allowed heuristic SCAN candidates to latch frame-only
-  // verdicts.  The live evidence proved those were ordinary stack reuse.
-  // Do not let a stale false verdict occupy the first-latch bank forever.
-  if (!ZPNET_SENTINEL_SCAN_VERDICTS_ENABLED &&
-      g_sentinel_violation_retained.frame_source ==
-          ZPNET_SENTINEL_FRAME_SCAN &&
-      (g_sentinel_violation_retained.kind & ZPNET_SENTINEL_KIND_MSP) == 0U) {
-    return false;
-  }
-  return true;
-}
-
-static inline uint32_t sentinel_read_msp(void) {
-  uint32_t msp;
-  __asm__ volatile("mrs %0, msp" : "=r"(msp));
-  return msp;
-}
-
-static inline uint32_t sentinel_read_psp(void) {
-  uint32_t psp;
-  __asm__ volatile("mrs %0, psp" : "=r"(psp));
-  return psp;
-}
-
-static inline uint32_t sentinel_read_ipsr(void) {
-  uint32_t ipsr;
-  __asm__ volatile("mrs %0, ipsr" : "=r"(ipsr));
-  return ipsr & 0x1FFU;
-}
-
-static inline bool sentinel_pc_plausible(uint32_t pc) {
-  if ((pc & 1U) != 0U) return false;
-  if (pc >= 0x00000400UL && pc < 0x00080000UL) return true;  // runtime ITCM
-  if (pc >= 0x60000000UL && pc < 0x61000000UL) return true;  // QSPI flash map
-  return false;
-}
-
-static inline bool sentinel_exc_return_plausible(uint32_t value) {
-  return (value & 0xFFFFFF00UL) == 0xFFFFFF00UL &&
-         (value & 1U) != 0U;
-}
-
-static inline bool sentinel_stacked_lr_plausible(uint32_t lr) {
-  if (sentinel_exc_return_plausible(lr)) return true;
-  if ((lr & 1U) == 0U) return false;
-  return sentinel_pc_plausible(lr & ~1U);
-}
-
-static inline bool sentinel_stacked_xpsr_plausible(uint32_t xpsr,
-                                                    uint32_t exc_return) {
-  if ((xpsr & (1UL << 24)) == 0U) return false;
-
-  const uint32_t stacked_exception = xpsr & 0x1FFU;
-  const bool return_to_thread = (exc_return & (1UL << 3)) != 0U;
-  if (return_to_thread) return stacked_exception == 0U;
-  return stacked_exception != 0U &&
-         stacked_exception <= ZPNET_SENTINEL_SCAN_MAX_EXCEPTION;
-}
-
-static uint32_t sentinel_checksum(const uint32_t* words) {
-  // FNV-1a style word fold — cheap, order-sensitive, table-free.
-  uint32_t h = 0x811C9DC5UL;
-  for (int i = 0; i < 8; ++i) {
-    h ^= words[i];
-    h *= 0x01000193UL;
-  }
-  return h;
-}
-
-static void sentinel_copy_name(char* dst, size_t dst_size, const char* src) {
-  size_t i = 0;
-  if (!dst || dst_size == 0U) return;
-  if (src) {
-    for (; i + 1U < dst_size && src[i] != '\0'; ++i) dst[i] = src[i];
-  }
-  dst[i] = '\0';
-}
-
-// ----------------------------------------------------------------
-// Region beacon — "what was the firmware doing when it died?"
-// ----------------------------------------------------------------
-//
-// Every sentinel scope (handler pass or thread-mode victim region) is pushed
-// onto a small retained stack at ENTER and popped at EXIT.  The beacon lives
-// in RAM2 (NOLOAD, magic-validated, dcache-flushed), so after a crash the
-// previous boot's beacon answers directly: which control points were active
-// at the moment of death — e.g. "SYSTEM_REPORT in thread mode, preempted by
-// a HANDOFF pass that was mid-TIMEBASE_FRAGMENT".  The same snapshot is
-// folded into every latched violation as the foreground correlation.
-//
-// Push/pop guard their read-modify-write with a PRIMASK critical section a
-// few instructions long, because a handler-mode scope can preempt a
-// thread-mode scope mid-update.
-
-static constexpr uint32_t ZPNET_SENTINEL_BEACON_MAGIC = 0x53424E31UL;  // 'SBN1'
-static constexpr uint32_t ZPNET_SENTINEL_BEACON_DEPTH = 4U;
-
-typedef struct {
-  uint32_t slot;
-  uint32_t pass;
-  uint32_t dwt_enter;
-  uint32_t ipsr;
-  char     name[24];
-} zpnet_sentinel_beacon_entry_t;
-
-typedef struct {
-  uint32_t magic;
-  uint32_t magic_inv;
-  uint32_t depth;     // active nested sentinel scopes
-  uint32_t overflow;  // enters observed beyond stack capacity
-  zpnet_sentinel_beacon_entry_t active[ZPNET_SENTINEL_BEACON_DEPTH];
-  zpnet_sentinel_beacon_entry_t last_completed;
-  uint32_t last_completed_dwt_exit;
-} zpnet_sentinel_beacon_t;
-
-// NOLOAD retained pair, latched once per boot exactly like the Payload
-// flight rings: the surviving live beacon (the crash-moment truth) is copied
-// into the retained bank before this boot's first scope overwrites it.
-static zpnet_sentinel_beacon_t g_sentinel_beacon DMAMEM;
-static zpnet_sentinel_beacon_t g_sentinel_beacon_retained DMAMEM;
-static bool g_sentinel_beacon_boot_latched = false;  // BSS: zero every boot
-
-static bool sentinel_beacon_valid(const zpnet_sentinel_beacon_t* b) {
-  return b->magic == ZPNET_SENTINEL_BEACON_MAGIC &&
-         (b->magic ^ b->magic_inv) == 0xFFFFFFFFUL;
-}
-
-static void sentinel_beacon_boot_latch(void) {
-  if (g_sentinel_beacon_boot_latched) return;
-  g_sentinel_beacon_boot_latched = true;
-
-  if (sentinel_beacon_valid(&g_sentinel_beacon)) {
-    g_sentinel_beacon_retained = g_sentinel_beacon;
-  } else {
-    memset((void*)&g_sentinel_beacon_retained, 0,
-           sizeof(g_sentinel_beacon_retained));
-  }
-  arm_dcache_flush((void*)&g_sentinel_beacon_retained,
-                   sizeof(g_sentinel_beacon_retained));
-
-  memset((void*)&g_sentinel_beacon, 0, sizeof(g_sentinel_beacon));
-  g_sentinel_beacon.magic_inv = ~ZPNET_SENTINEL_BEACON_MAGIC;
-  g_sentinel_beacon.magic = ZPNET_SENTINEL_BEACON_MAGIC;
-  arm_dcache_flush((void*)&g_sentinel_beacon, sizeof(g_sentinel_beacon));
-}
-
-static inline uint32_t sentinel_irq_lock(void) {
-  uint32_t primask;
-  __asm__ volatile("mrs %0, primask" : "=r"(primask));
-  __asm__ volatile("cpsid i" ::: "memory");
-  return primask;
-}
-
-static inline void sentinel_irq_unlock(uint32_t primask) {
-  if ((primask & 1U) == 0U) {
-    __asm__ volatile("cpsie i" ::: "memory");
-  }
-}
-
-static void sentinel_beacon_push(uint32_t slot,
-                                 const char* name,
-                                 uint32_t pass,
-                                 uint32_t ipsr,
-                                 uint32_t dwt) {
-  sentinel_beacon_boot_latch();
-
-  const uint32_t primask = sentinel_irq_lock();
-  const uint32_t d = g_sentinel_beacon.depth;
-  if (d < ZPNET_SENTINEL_BEACON_DEPTH) {
-    zpnet_sentinel_beacon_entry_t* e = &g_sentinel_beacon.active[d];
-    e->slot = slot;
-    e->pass = pass;
-    e->dwt_enter = dwt;
-    e->ipsr = ipsr;
-    sentinel_copy_name(e->name, sizeof(e->name), name);
-  } else {
-    g_sentinel_beacon.overflow++;
-  }
-  g_sentinel_beacon.depth = d + 1U;
-  sentinel_irq_unlock(primask);
-
-  arm_dcache_flush((void*)&g_sentinel_beacon, sizeof(g_sentinel_beacon));
-}
-
-static void sentinel_beacon_pop(uint32_t dwt_exit) {
-  sentinel_beacon_boot_latch();
-
-  const uint32_t primask = sentinel_irq_lock();
-  uint32_t d = g_sentinel_beacon.depth;
-  if (d != 0U) {
-    d--;
-    if (d < ZPNET_SENTINEL_BEACON_DEPTH) {
-      g_sentinel_beacon.last_completed = g_sentinel_beacon.active[d];
-      g_sentinel_beacon.last_completed_dwt_exit = dwt_exit;
-      memset((void*)&g_sentinel_beacon.active[d], 0,
-             sizeof(g_sentinel_beacon.active[d]));
-    }
-    g_sentinel_beacon.depth = d;
-  }
-  sentinel_irq_unlock(primask);
-
-  arm_dcache_flush((void*)&g_sentinel_beacon, sizeof(g_sentinel_beacon));
-}
-
-static void sentinel_fill_violation(zpnet_sentinel_violation_t* v,
-                                    const zpnet_sentinel_slot_t* s,
-                                    uint32_t slot,
-                                    uint32_t kind,
-                                    const uint32_t* exit_words,
-                                    uint32_t diff_mask,
-                                    uint32_t exit_checksum,
-                                    uint32_t msp_exit,
-                                    uint32_t fpccr_exit,
-                                    uint32_t fpcar_exit,
-                                    uint32_t dwt_exit) {
-  v->magic = 0U;  // invalidate while the record is inconsistent
-  v->kind = kind;
-  v->slot = slot;
-  sentinel_copy_name(v->name, sizeof(v->name), s->name);
-  v->pass = s->pass;
-  v->frame_address = s->frame_address;
-  v->frame_source = s->frame_source;
-  v->exc_return = s->exc_return;
-  v->ipsr = s->ipsr;
-  v->msp_entry = s->msp_entry;
-  v->msp_exit = msp_exit;
-  v->fpccr_entry = s->fpccr_entry;
-  v->fpccr_exit = fpccr_exit;
-  v->fpcar_entry = s->fpcar_entry;
-  v->fpcar_exit = fpcar_exit;
-  v->dwt_entry = s->dwt_entry;
-  v->dwt_exit = dwt_exit;
-  for (int i = 0; i < 8; ++i) {
-    v->entry_words[i] = s->entry_words[i];
-    v->exit_words[i] = exit_words ? exit_words[i] : 0U;
-  }
-  v->diff_mask = diff_mask;
-  v->entry_checksum = s->entry_checksum;
-  v->exit_checksum = exit_checksum;
-
-  // Foreground correlation: entries[0] is the outermost active sentinel
-  // scope — typically the thread-mode victim region the violating handler
-  // pass preempted.
-  v->foreground_region_depth = g_sentinel_beacon.depth;
-  if (g_sentinel_beacon.depth != 0U) {
-    const zpnet_sentinel_beacon_entry_t* fg = &g_sentinel_beacon.active[0];
-    v->foreground_region_slot = fg->slot;
-    v->foreground_region_pass = fg->pass;
-    sentinel_copy_name(v->foreground_region_name,
-                       sizeof(v->foreground_region_name),
-                       fg->name);
-  } else {
-    v->foreground_region_slot = 0U;
-    v->foreground_region_pass = 0U;
-    v->foreground_region_name[0] = '\0';
-  }
-
-  v->magic_inv = ~ZPNET_SENTINEL_MAGIC;
-  v->magic = ZPNET_SENTINEL_MAGIC;  // commit last
-}
-
-static void sentinel_latch_violation(const zpnet_sentinel_slot_t* s,
-                                     uint32_t slot,
-                                     uint32_t kind,
-                                     const uint32_t* exit_words,
-                                     uint32_t diff_mask,
-                                     uint32_t exit_checksum,
-                                     uint32_t msp_exit,
-                                     uint32_t fpccr_exit,
-                                     uint32_t fpcar_exit,
-                                     uint32_t dwt_exit) {
-  g_sentinel_violations_this_boot++;
-  g_sentinel_event_pending = true;
-
-  // This boot's most recent violation is always recorded.
-  sentinel_fill_violation(&g_sentinel_violation_last, s, slot, kind,
-                          exit_words, diff_mask, exit_checksum, msp_exit,
-                          fpccr_exit, fpcar_exit, dwt_exit);
-  g_sentinel_violation_last_present = true;
-
-  // The retained record follows first-latch policy: earlier evidence is
-  // more valuable than later, and it holds until explicit CRASH_CLEAR.
-  if (sentinel_retained_valid()) {
-    g_sentinel_violations_suppressed++;
-    return;
-  }
-  sentinel_fill_violation(&g_sentinel_violation_retained, s, slot, kind,
-                          exit_words, diff_mask, exit_checksum, msp_exit,
-                          fpccr_exit, fpcar_exit, dwt_exit);
-
-  // RAM2 is write-back cached and a reset can discard dirty lines; flush so
-  // the physical retained image matches the record just committed.
-  arm_dcache_flush((void*)&g_sentinel_violation_retained,
-                   sizeof(g_sentinel_violation_retained));
-}
-
-void zpnet_sentinel_enter(uint32_t slot,
-                          const char* name,
-                          uint32_t exc_return,
-                          uint32_t caller_sp) {
-  if (slot >= (uint32_t)ZPNET_SENTINEL_SLOT_COUNT) {
-    g_sentinel_bad_slot++;
-    return;
-  }
-  zpnet_sentinel_slot_t* s = &g_sentinel_slots[slot];
-  if (s->active) g_sentinel_unbalanced_enter++;
-  s->active = 1U;
-  s->pass++;
-  s->name = name;
-  g_sentinel_enters++;
-
-  const uint32_t msp = sentinel_read_msp();
-  const uint32_t psp = sentinel_read_psp();
-  const uint32_t fpccr = ZPNET_SCB_FPCCR;
-  const uint32_t fpcar = ZPNET_SCB_FPCAR;
-
-  s->exc_return = exc_return;
-  // MSP integrity uses the SP captured by the macro at the caller's own
-  // frame level.  Reading MSP inside this function would bake the differing
-  // prologue depths of enter() and exit() into the comparison and fire a
-  // false MSP_MISMATCH on every pass (the validation-run lesson).
-  s->msp_entry = caller_sp;
-  s->fpccr_entry = fpccr;
-  s->fpcar_entry = fpcar;
-  s->dwt_entry = ARM_DWT_CYCCNT;
-  s->ipsr = sentinel_read_ipsr();
-
-  // Every scope — handler pass or thread-mode victim region — announces
-  // itself on the retained beacon so a crash mid-scope is attributable
-  // after the reboot.
-  sentinel_beacon_push(slot, name, s->pass, s->ipsr, s->dwt_entry);
-
-  // EXC_RETURN values are 0xFFFFFFxx.  Anything else means the macro's LR
-  // capture was already clobbered — expected whenever ENTER sits one or more
-  // calls below the true handler entry (the beta control points live inside
-  // alpha's PPS handoff) and always in thread mode.  IPSR, read directly, is
-  // the authoritative context witness, so a failed capture only removes the
-  // PSP strategy, never the verdict.  Counted only in handler mode; in a
-  // thread-mode scope the capture is meaningless by construction.
-  const bool exc_plausible = sentinel_exc_return_plausible(exc_return);
-  if (!exc_plausible && s->ipsr != 0U) s->exc_return_implausible++;
-
-  const uint32_t dtcm_end = (uint32_t)(uintptr_t)&_estack;
-  uint32_t frame = 0U;
-  uint32_t source = ZPNET_SENTINEL_FRAME_NONE;
-
-  if (s->ipsr != 0U) {
-    // 1. FPCAR anchor: lazy FP stacking still pending means an extended
-    //    frame was reserved for the most recently preempted FP-active
-    //    context, and FPCAR addresses its FP area, 0x20 above the basic
-    //    frame.  Keyed on IPSR + LSPACT alone — architecturally valid no
-    //    matter how many calls deep this scope sits, and deterministic for
-    //    the FP-active foreground Crash1 implicates.
-    if ((fpccr & 0x1U) != 0U) {
-      const uint32_t candidate = fpcar - 0x20U;
-      if (candidate >= 0x20000000UL && candidate < dtcm_end &&
-          (candidate & 3U) == 0U) {
-        frame = candidate;
-        source = ZPNET_SENTINEL_FRAME_FPCAR;
-      }
-    }
-
-    // 2. PSP: the preempted context stacked onto the process stack.
-    if (frame == 0U && exc_plausible && (exc_return & 0x4U) != 0U) {
-      if (psp >= 0x20000000UL && psp < dtcm_end && (psp & 3U) == 0U) {
-        frame = psp;
-        source = ZPNET_SENTINEL_FRAME_PSP;
-      }
-    }
-
-    // 3. Bounded signature scan up the main stack.  Start at the caller's
-    //    frame level when the macro supplied it — the frames of interest sit
-    //    above the caller, and this keeps the sentinel's own locals out of
-    //    the scan window.
-    if (frame == 0U && exc_plausible) {
-      const uint32_t scan_from =
-          (caller_sp >= 0x20000000UL && caller_sp < dtcm_end) ? caller_sp
-                                                              : msp;
-      const uint32_t begin = (scan_from + 7U) & ~7U;
-      for (uint32_t base = begin;
-           base + 32U <= dtcm_end && base < begin + ZPNET_SENTINEL_SCAN_BYTES;
-           base += 8U) {
-        const volatile uint32_t* w = (const volatile uint32_t*)(uintptr_t)base;
-        const uint32_t lr = w[5];
-        const uint32_t pc = w[6];
-        const uint32_t xpsr = w[7];
-        if (sentinel_pc_plausible(pc) &&
-            sentinel_stacked_lr_plausible(lr) &&
-            sentinel_stacked_xpsr_plausible(xpsr, exc_return)) {
-          frame = base;
-          source = ZPNET_SENTINEL_FRAME_SCAN;
-          break;
-        }
-      }
-    }
-  } else {
-    // Thread mode: there is no live stacked frame that belongs to this
-    // scope.  Anything a scan would find is dead stack memory that every
-    // subsequent exception legally rewrites, so checksumming it would
-    // manufacture false violations.  The scope still gets MSP integrity,
-    // pass accounting, and the beacon.
-    s->thread_mode_passes++;
-  }
-
-  s->frame_address = frame;
-  s->frame_source = source;
-  if (frame != 0U) {
-    s->frames_located++;
-    const volatile uint32_t* w = (const volatile uint32_t*)(uintptr_t)frame;
-    for (int i = 0; i < 8; ++i) s->entry_words[i] = w[i];
-    s->entry_checksum = sentinel_checksum(s->entry_words);
-    switch (source) {
-      case ZPNET_SENTINEL_FRAME_FPCAR: g_sentinel_frames_fpcar++; break;
-      case ZPNET_SENTINEL_FRAME_PSP:   g_sentinel_frames_psp++;   break;
-      default:                         g_sentinel_frames_scan++;  break;
-    }
-  } else if (s->ipsr != 0U) {
-    s->frames_missing++;
-    g_sentinel_frames_none++;
-  }
-}
-
-void zpnet_sentinel_exit(uint32_t slot, uint32_t caller_sp) {
-  if (slot >= (uint32_t)ZPNET_SENTINEL_SLOT_COUNT) {
-    g_sentinel_bad_slot++;
-    return;
-  }
-  zpnet_sentinel_slot_t* s = &g_sentinel_slots[slot];
-  g_sentinel_exits++;
-  if (!s->active) {
-    g_sentinel_unbalanced_exit++;
-    return;
-  }
-  s->active = 0U;
-
-  const uint32_t fpccr = ZPNET_SCB_FPCCR;
-  const uint32_t fpcar = ZPNET_SCB_FPCAR;
-  const uint32_t dwt = ARM_DWT_CYCCNT;
-
-  s->msp_exit_last = caller_sp;
-  s->dwt_exit_last = dwt;
-  // Lazy FP state consumed during this pass: an FP instruction executed in
-  // handler context and flushed the foreground's FP registers into the
-  // reserved stack area.  Legal — but it is exactly the lazy-stacking
-  // choreography under suspicion, so count every occurrence.
-  if ((s->fpccr_entry & 0x1U) != 0U && (fpccr & 0x1U) == 0U) {
-    s->lspact_consumed++;
-  }
-
-  uint32_t kind = 0U;
-  uint32_t exit_words[8] = {0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U};
-  uint32_t exit_checksum = 0U;
-  uint32_t diff_mask = 0U;
-
-  if (s->frame_address != 0U) {
-    const volatile uint32_t* w =
-        (const volatile uint32_t*)(uintptr_t)s->frame_address;
-    for (int i = 0; i < 8; ++i) exit_words[i] = w[i];
-    exit_checksum = sentinel_checksum(exit_words);
-    s->exit_checksum_last = exit_checksum;
-    for (int i = 0; i < 8; ++i) {
-      if (exit_words[i] != s->entry_words[i]) diff_mask |= (1U << (uint32_t)i);
-    }
-    if (diff_mask != 0U) {
-      if (s->frame_source == ZPNET_SENTINEL_FRAME_SCAN &&
-          !ZPNET_SENTINEL_SCAN_VERDICTS_ENABLED) {
-        s->scan_change_ignored++;
-        g_sentinel_scan_changes_ignored++;
-      } else {
-        kind |= ZPNET_SENTINEL_KIND_FRAME;
-        s->checksum_fail++;
-      }
-    }
-  }
-
-  // Like-for-like comparison: both values were captured by the macros at
-  // the caller's frame level.  A zero on either side means a capture was
-  // unavailable (non-ARM build path) — no verdict from missing evidence.
-  if (caller_sp != 0U && s->msp_entry != 0U && caller_sp != s->msp_entry) {
-    kind |= ZPNET_SENTINEL_KIND_MSP;
-    s->msp_mismatch++;
-  }
-
-  if (kind != 0U) {
-    sentinel_latch_violation(s, slot, kind, exit_words, diff_mask,
-                             exit_checksum, caller_sp, fpccr, fpcar, dwt);
-  }
-
-  // Pop after any latch so the violation's foreground correlation still saw
-  // this scope (and its ancestors) as active.
-  sentinel_beacon_pop(dwt);
-}
-
-static FLASHMEM void system_sentinel_emit(void) {
-  // Stay inside Payload's eight inline entries (see the memory watchdog
-  // emit rationale): the anomaly transcript must not require heap.
-  const zpnet_sentinel_violation_t* v = &g_sentinel_violation_last;
-  Payload ev;
-  ev.add("schema", "ZPNET_SENTINEL_ANOMALY_V1");
-  ev.add("name", v->name);
-  ev.add("kind", v->kind);
-  ev.add("pass", v->pass);
-  ev.add_fmt("frame", "0x%08lX", (unsigned long)v->frame_address);
-  ev.add_fmt("diff_mask", "0x%02lX", (unsigned long)v->diff_mask);
-  ev.add("source", sentinel_frame_source_name(v->frame_source));
-  ev.add("ipsr", v->ipsr);
-  enqueueEvent("SENTINEL_ANOMALY", ev);
-}
-
-static void system_sentinel_service(void) {
-  // Serialized foreground context only (watchdog ALAP).  One announcement
-  // per boot; SENTINEL_INFO carries the full evidence at any time.
-  if (g_sentinel_event_pending && !g_sentinel_event_emitted &&
-      g_sentinel_violation_last_present) {
-    g_sentinel_event_emitted = true;
-    g_sentinel_event_pending = false;
-    system_sentinel_emit();
-  }
 }
 
 // --------------------------------------------------------------
@@ -1957,97 +1262,8 @@ static FLASHMEM Payload system_crash_forensics_payload(void) {
 static constexpr size_t SYSTEM_CRASH_REPORT_TEXT_MAX = 2048;
 
 // ================================================================
-// Exception-frame sentinel — reporting surface
+// Runtime-ledger reporting surface
 // ================================================================
-
-static FLASHMEM Payload system_sentinel_violation_payload(
-    const zpnet_sentinel_violation_t* v,
-    bool valid) {
-  Payload out;
-  out.add("valid", valid);
-  if (!valid) return out;
-
-  out.add("kind", v->kind);
-  out.add("kind_frame_checksum",
-          (v->kind & ZPNET_SENTINEL_KIND_FRAME) != 0U);
-  out.add("kind_msp_mismatch",
-          (v->kind & ZPNET_SENTINEL_KIND_MSP) != 0U);
-  out.add("slot", v->slot);
-  out.add("name", v->name);
-  out.add("pass", v->pass);
-  system_crash_add_hex32(out, "frame_address", v->frame_address);
-  out.add("frame_source", sentinel_frame_source_name(v->frame_source));
-  system_crash_add_hex32(out, "exc_return", v->exc_return);
-  out.add("ipsr", v->ipsr);
-  system_crash_add_hex32(out, "msp_entry", v->msp_entry);
-  system_crash_add_hex32(out, "msp_exit", v->msp_exit);
-  system_crash_add_hex32(out, "fpccr_entry", v->fpccr_entry);
-  system_crash_add_hex32(out, "fpccr_exit", v->fpccr_exit);
-  system_crash_add_hex32(out, "fpcar_entry", v->fpcar_entry);
-  system_crash_add_hex32(out, "fpcar_exit", v->fpcar_exit);
-  out.add("dwt_entry", v->dwt_entry);
-  out.add("dwt_exit", v->dwt_exit);
-  system_crash_add_hex32(out, "diff_mask", v->diff_mask);
-  system_crash_add_hex32(out, "entry_checksum", v->entry_checksum);
-  system_crash_add_hex32(out, "exit_checksum", v->exit_checksum);
-
-  Payload foreground;
-  foreground.add("depth", v->foreground_region_depth);
-  foreground.add("slot", v->foreground_region_slot);
-  foreground.add("name", v->foreground_region_name);
-  foreground.add("pass", v->foreground_region_pass);
-  out.add_object("foreground_region", foreground);
-
-  PayloadArray words;
-  for (size_t i = 0; i < 8U; ++i) {
-    Payload word;
-    word.add("index", (uint32_t)i);
-    system_crash_add_hex32(word, "entry", v->entry_words[i]);
-    system_crash_add_hex32(word, "exit", v->exit_words[i]);
-    word.add("changed", (v->diff_mask & (1U << (uint32_t)i)) != 0U);
-    words.add(word);
-  }
-  out.add_array("frame_words", words);
-  return out;
-}
-
-static FLASHMEM Payload system_sentinel_beacon_payload(
-    const zpnet_sentinel_beacon_t* b,
-    bool valid) {
-  Payload out;
-  out.add("valid", valid);
-  if (!valid) return out;
-
-  out.add("depth", b->depth);
-  out.add("overflow", b->overflow);
-
-  PayloadArray active;
-  const uint32_t bounded =
-      b->depth < ZPNET_SENTINEL_BEACON_DEPTH ? b->depth
-                                             : ZPNET_SENTINEL_BEACON_DEPTH;
-  for (uint32_t i = 0; i < bounded; ++i) {
-    const zpnet_sentinel_beacon_entry_t* e = &b->active[i];
-    Payload entry;
-    entry.add("level", i);
-    entry.add("slot", e->slot);
-    entry.add("name", e->name);
-    entry.add("pass", e->pass);
-    entry.add("ipsr", e->ipsr);
-    entry.add("dwt_enter", e->dwt_enter);
-    active.add(entry);
-  }
-  out.add_array("active", active);
-
-  Payload completed;
-  completed.add("slot", b->last_completed.slot);
-  completed.add("name", b->last_completed.name);
-  completed.add("pass", b->last_completed.pass);
-  completed.add("ipsr", b->last_completed.ipsr);
-  completed.add("dwt_enter", b->last_completed.dwt_enter);
-  completed.add("dwt_exit", b->last_completed_dwt_exit);
-  out.add_object("last_completed", completed);
-  return out;
-}
 
 static const char* runtime_foreground_phase_name(uint32_t phase) {
   switch ((zpnet_foreground_phase_t)phase) {
@@ -2118,8 +1334,6 @@ static FLASHMEM Payload system_runtime_ledger_payload(void) {
 
   Payload out;
   out.add("schema", "ZPNET_RUNTIME_LEDGER_V1");
-  out.add("cpu_usage_focus_active_now",
-          (bool)g_zpnet_sentinel_cpu_usage_focus_active);
   out.add_object("live",
                  system_runtime_ledger_bank_payload(&g_runtime_ledger));
   out.add_object("retained",
@@ -2202,8 +1416,6 @@ static const char* system_watchdog_trace_stage_name(uint32_t stage) {
     case system_watchdog_trace_stage_t::AUDIT_RETURN:   return "AUDIT_RETURN";
     case system_watchdog_trace_stage_t::EMIT_BEGIN:     return "EMIT_BEGIN";
     case system_watchdog_trace_stage_t::EMIT_END:       return "EMIT_END";
-    case system_watchdog_trace_stage_t::SENTINEL_BEGIN: return "SENTINEL_BEGIN";
-    case system_watchdog_trace_stage_t::SENTINEL_END:   return "SENTINEL_END";
     case system_watchdog_trace_stage_t::REARM_BEGIN:    return "REARM_BEGIN";
     case system_watchdog_trace_stage_t::REARM_END:      return "REARM_END";
     case system_watchdog_trace_stage_t::WATCHDOG_EXIT:  return "WATCHDOG_EXIT";
@@ -2576,7 +1788,9 @@ static const char* timepop_dispatch_trace_phase_name(uint32_t phase) {
 
 static bool timepop_dispatch_trace_executable_address(uint32_t value) {
   if (value == 0U) return false;
-  return sentinel_pc_plausible(value & ~1U);
+  const uint32_t address = value & ~1U;
+  if (address >= 0x00000400UL && address < 0x00080000UL) return true;
+  return address >= 0x60000000UL && address < 0x61000000UL;
 }
 
 static const char* timepop_dispatch_trace_retire_reason(uint32_t reason) {
@@ -2785,81 +1999,6 @@ static FLASHMEM Payload system_timepop_dispatch_trace_summary_payload(void) {
         system_timepop_dispatch_trace_entry_payload(
             retained.entries[retained.count - 1U]));
   }
-  return out;
-}
-
-static FLASHMEM Payload system_sentinel_payload(void) {
-  Payload out;
-  out.add("schema", "ZPNET_SENTINEL_V1");
-
-  out.add("enters", g_sentinel_enters);
-  out.add("exits", g_sentinel_exits);
-  out.add("bad_slot", g_sentinel_bad_slot);
-  out.add("unbalanced_enter", g_sentinel_unbalanced_enter);
-  out.add("unbalanced_exit", g_sentinel_unbalanced_exit);
-  out.add("frames_fpcar", g_sentinel_frames_fpcar);
-  out.add("frames_psp", g_sentinel_frames_psp);
-  out.add("frames_scan", g_sentinel_frames_scan);
-  out.add("frames_none", g_sentinel_frames_none);
-  out.add("scan_verdicts_enabled", ZPNET_SENTINEL_SCAN_VERDICTS_ENABLED);
-  out.add("scan_changes_ignored", g_sentinel_scan_changes_ignored);
-  out.add("violations_this_boot", g_sentinel_violations_this_boot);
-  out.add("violations_suppressed", g_sentinel_violations_suppressed);
-  out.add("event_pending", (bool)g_sentinel_event_pending);
-  out.add("event_emitted", g_sentinel_event_emitted);
-
-  PayloadArray slots;
-  for (uint32_t i = 0; i < (uint32_t)ZPNET_SENTINEL_SLOT_COUNT; ++i) {
-    const zpnet_sentinel_slot_t* s = &g_sentinel_slots[i];
-    if (s->pass == 0U) continue;  // never armed this boot
-    Payload slot;
-    slot.add("slot", i);
-    slot.add("name", s->name ? s->name : "");
-    slot.add("pass", s->pass);
-    slot.add("active", s->active != 0U);
-    system_crash_add_hex32(slot, "frame_address", s->frame_address);
-    slot.add("frame_source", sentinel_frame_source_name(s->frame_source));
-    system_crash_add_hex32(slot, "exc_return", s->exc_return);
-    slot.add("ipsr", s->ipsr);
-    system_crash_add_hex32(slot, "msp_entry", s->msp_entry);
-    system_crash_add_hex32(slot, "msp_exit_last", s->msp_exit_last);
-    system_crash_add_hex32(slot, "entry_checksum", s->entry_checksum);
-    system_crash_add_hex32(slot, "exit_checksum_last", s->exit_checksum_last);
-    system_crash_add_hex32(slot, "fpccr_entry", s->fpccr_entry);
-    system_crash_add_hex32(slot, "fpcar_entry", s->fpcar_entry);
-    slot.add("frames_located", s->frames_located);
-    slot.add("frames_missing", s->frames_missing);
-    slot.add("thread_mode_passes", s->thread_mode_passes);
-    slot.add("exc_return_implausible", s->exc_return_implausible);
-    slot.add("checksum_fail", s->checksum_fail);
-    slot.add("scan_change_ignored", s->scan_change_ignored);
-    slot.add("msp_mismatch", s->msp_mismatch);
-    slot.add("lspact_consumed", s->lspact_consumed);
-    slots.add(slot);
-  }
-  out.add_array("slots", slots);
-
-  // Beacon boot-latch runs lazily; querying SENTINEL_INFO before any scope
-  // has executed must still populate the retained bank.
-  sentinel_beacon_boot_latch();
-  out.add_object("beacon",
-                 system_sentinel_beacon_payload(
-                     &g_sentinel_beacon,
-                     sentinel_beacon_valid(&g_sentinel_beacon)));
-  out.add_object("beacon_retained",
-                 system_sentinel_beacon_payload(
-                     &g_sentinel_beacon_retained,
-                     sentinel_beacon_valid(&g_sentinel_beacon_retained)));
-
-  out.add_object("last_violation",
-                 system_sentinel_violation_payload(
-                     &g_sentinel_violation_last,
-                     g_sentinel_violation_last_present));
-  out.add_object("retained_violation",
-                 system_sentinel_violation_payload(
-                     &g_sentinel_violation_retained,
-                     sentinel_retained_valid()));
-  out.add_object("runtime_ledger", system_runtime_ledger_payload());
   return out;
 }
 
@@ -3246,21 +2385,9 @@ static FLASHMEM Payload system_crash_report_payload(bool include_text) {
   }
   p.add_object("extended", system_crash_forensics_payload());
 
-  // Frame-sentinel verdict, runtime breadcrumbs, TimePop dispatch flight
-  // recorder, Payload flight recorder, and Payload append transaction trace
-  // are retained through reboot so they can sit beside the exception evidence
-  // they explain.  The beacon says which
-  // sentinel regions were active; the dispatch summary says the last committed
-  // callback/control-flow stage.
-  p.add_object("sentinel",
-               system_sentinel_violation_payload(
-                   &g_sentinel_violation_retained,
-                   sentinel_retained_valid()));
-  sentinel_beacon_boot_latch();
-  p.add_object("sentinel_beacon",
-               system_sentinel_beacon_payload(
-                   &g_sentinel_beacon_retained,
-                   sentinel_beacon_valid(&g_sentinel_beacon_retained)));
+  // Runtime breadcrumbs, TimePop dispatch history, memory-audit history,
+  // and Payload forensics remain retained through reboot beside the processor
+  // exception evidence.
   p.add_object("runtime_ledger", system_runtime_ledger_payload());
   p.add_object("timepop_dispatch_trace",
                system_timepop_dispatch_trace_summary_payload());
@@ -4038,8 +3165,8 @@ static void system_dmamem_ensure_initialized(void) {
 
   // crash_forensics.cpp owns its retained RAM2 record.  Never initialize or
   // clear that record here; it may be the only surviving witness to a reboot.
-  // The same custody applies to g_sentinel_violation_retained, the runtime
-  // ledger pair, memory-audit/watchdog trace banks, TimePop's dispatch-flight
+  // The same custody applies to the runtime ledger pair, memory-audit/watchdog
+  // trace banks, TimePop's dispatch-flight
   // banks, Payload flight rings, and Payload append-trace banks in payload.cpp:
   // all are NOLOAD retained evidence, validated before use and
   // released only by explicit CRASH_CLEAR or their one-time per-boot latch.
@@ -4346,13 +3473,6 @@ static FLASHMEM Payload cmd_get_feature(const Payload& args) {
 }
 
 // ------------------------------------------------------------
-// SENTINEL_INFO — exception-frame sentinel state and verdicts
-// ------------------------------------------------------------
-static FLASHMEM Payload cmd_sentinel_info(const Payload& /*args*/) {
-  return frame_sentinel_report_payload();
-}
-
-// ------------------------------------------------------------
 // MEMORY_AUDIT_INFO — bounded retained/live audit or watchdog transcript
 // ------------------------------------------------------------
 static FLASHMEM Payload cmd_memory_audit_info(const Payload& args) {
@@ -4393,10 +3513,7 @@ static FLASHMEM Payload cmd_payload_contract_info(const Payload& /*args*/) {
 // ------------------------------------------------------------
 static FLASHMEM Payload cmd_crash_info(const Payload& /*args*/) {
   system_crash_report_capture_once();
-  Payload report = system_crash_report_payload(true);
-  Payload sentinel = frame_sentinel_report_payload();
-  report.add_object("frame_sentinel", sentinel);
-  return report;
+  return system_crash_report_payload(true);
 }
 
 // ------------------------------------------------------------
@@ -4410,16 +3527,6 @@ static FLASHMEM Payload cmd_crash_clear(const Payload& /*args*/) {
   g_system_crash_report_truncated = false;
   g_system_crash_report_bytes = 0;
   g_system_crash_report_text[0] = '\0';
-  frame_sentinel_clear();
-
-  // Release the retained sentinel verdict so the next violation can latch.
-  g_sentinel_violation_retained.magic = 0U;
-  g_sentinel_violation_retained.magic_inv = 0U;
-  arm_dcache_flush((void*)&g_sentinel_violation_retained,
-                   sizeof(g_sentinel_violation_retained));
-  g_sentinel_violation_last_present = false;
-  g_sentinel_event_pending = false;
-
   memset((void*)&g_runtime_ledger_retained, 0,
          sizeof(g_runtime_ledger_retained));
   arm_dcache_flush((void*)&g_runtime_ledger_retained,
@@ -4434,8 +3541,6 @@ static FLASHMEM Payload cmd_crash_clear(const Payload& /*args*/) {
   Payload resp = ok_payload();
   resp.add("crash_report_cleared", true);
   resp.add("crash_forensics_cleared", true);
-  resp.add("frame_sentinel_v2_cleared", true);
-  resp.add("sentinel_cleared", true);
   resp.add("runtime_ledger_cleared", true);
   resp.add("memory_audit_trace_cleared", true);
   resp.add("memory_watchdog_trace_cleared", true);
@@ -4498,7 +3603,6 @@ static const process_command_entry_t SYSTEM_COMMANDS[] = {
   { "GET_FEATURE",      cmd_get_feature      },
   { "CRASH_INFO",       cmd_crash_info       },
   { "CRASH_CLEAR",      cmd_crash_clear      },
-  { "SENTINEL_INFO",    cmd_sentinel_info    },
   { "MEMORY_AUDIT_INFO", cmd_memory_audit_info },
   { "TIMEPOP_DISPATCH_INFO", cmd_timepop_dispatch_info },
   { "PAYLOAD_FLIGHT_INFO", cmd_payload_flight_info },

@@ -1,5 +1,9 @@
 #pragma once
 
+#if 0
+// Retired: Frame Sentinel is excluded from the firmware baseline.
+// Any missed user will fail because this header declares no symbols.
+
 #include <Arduino.h>
 
 class Payload;
@@ -106,3 +110,5 @@ bool frame_sentinel_scope_active(void);
   frame_sentinel_enter((slot), (name), 0U, 0U)
 #define FRAME_SENTINEL_EXIT(slot) frame_sentinel_exit_ex((slot), 0U, 0U)
 #endif
+
+#endif  // Retired Frame Sentinel
