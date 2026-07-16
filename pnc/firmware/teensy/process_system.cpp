@@ -3822,5 +3822,6 @@ void process_system_register(void) {
   g_system_feature_fragment_publish_enabled = true;
   system_feature_schedule_fragment_publish();
 
-  system_memory_watchdog_arm();
+  // MULE: completely defeat watchdog
+  //system_memory_watchdog_arm();
 }

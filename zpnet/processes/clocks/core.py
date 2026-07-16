@@ -5970,7 +5970,33 @@ def _recover_campaign() -> None:
     except Exception as e:
         raise RuntimeError(f"recovery failed: {e}")
 
-    _wait_for_preflight("recovery")
+    # Warm recovery after a Teensy reboot must not depend on the exact
+    # campaign-admission gate used by START.  REPORT_GATE may legitimately
+    # report FEATURE_STATUS unseen immediately after reboot, which creates a
+    # circular wait: the Pi refuses RECOVER until the Teensy has republished
+    # readiness state, while the Teensy needs RECOVER to resume the campaign
+    # publication lifecycle.
+    #
+    # Keep all concrete recovery safeguards below:
+    #   * GNSS mode has already been reconciled above.
+    #   * TIMEBASE PUBSUB routing is verified immediately below.
+    #   * CLOCKS.RECOVER itself must return an explicitly accepted firmware
+    #     lifecycle status in _request_teensy_recover().
+    #
+    # START, Flash Cut, and zero-row cold recovery remain preflight-gated.
+    _diag["last_preflight_wait"] = {
+        "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "context": "recovery",
+        "status": "BYPASSED",
+        "checks": 0,
+        "waited_s": 0.0,
+        "bypass_reason": "warm_recovery_after_teensy_reboot",
+    }
+    logging.info(
+        "%s bypassing START admission gate for warm recovery; "
+        "CLOCKS.RECOVER firmware verdict remains authoritative",
+        PREFLIGHT_LOG_PREFIX,
+    )
 
     _wait_for_timebase_routes(context="recovery")
 
