@@ -17,8 +17,13 @@
     • The entry directory and all owned bytes live in that same region.
     • Values retain their JSON type; strings are never reclassified by text.
     • Add/attach operations are preflighted and committed transactionally.
+    • Every state-changing operation is governed by explicit preconditions,
+      whole-object invariants, and operation-specific postconditions.
     • Borrowed key/value spans are revalidated immediately before final copy,
       after any storage growth or internal-alias remapping.
+    • Every successfully verified mutation advances an object-local generation
+      and structural fingerprint.  A later mismatch is classified as drift
+      between mutation boundaries rather than silently accepted.
     • Public mutators return bool; existing callers may ignore the result.
     • Payload runtime code performs no float or double conversion. Scientific
       values cross the construction boundary as integer-only fixed_decimal_t
@@ -46,6 +51,135 @@
 
   ============================================================================
 */
+
+
+// ============================================================================
+// Payload design-by-contract evidence (retained, scalar-only)
+// ============================================================================
+//
+// Payload never constructs an event from inside a mutator or integrity court.
+// A failure is reduced to this fixed scalar record and placed in a bounded
+// incident queue plus a retained RAM2 transcript.  SYSTEM later constructs one
+// small best-effort PAYLOAD_CONTRACT_ANOMALY event in serialized foreground
+// context while incident recursion is suppressed.
+
+#define PAYLOAD_CONTRACT_INCIDENT_ENTRIES 16U
+#define PAYLOAD_CONTRACT_PENDING_ENTRIES  8U
+
+// The contract implementation contains no conditional assembly and no inline
+// assembly. Existing platform helpers provide DWT/IPSR and critical sections.
+
+enum class payload_contract_phase_t : uint32_t {
+  NONE             = 0,
+  PRECONDITION     = 1,
+  PRE_INVARIANT    = 2,
+  POST_INVARIANT   = 3,
+  POSTCONDITION    = 4,
+  OBSERVED_DRIFT   = 5,
+  MUTATION_FAILURE = 6,
+  EVENT_EMISSION   = 7,
+};
+
+enum class payload_contract_reason_t : uint32_t {
+  NONE                         = 0,
+  INPUT_POINTER                = 1,
+  INPUT_LENGTH                 = 2,
+  INPUT_SYNTAX                 = 3,
+  INPUT_KIND                   = 4,
+  SOURCE_INVALID               = 5,
+  ALLOCATION_FAILURE           = 6,
+  SERIALIZATION_FAILURE        = 7,
+  HEAP_GUARD                   = 8,
+  COUNT_GUARD                  = 9,
+  DATA_BEGIN_GUARD             = 10,
+  HEAP_HEADER                  = 11,
+  STORAGE_UNREADABLE           = 12,
+  CAPACITY_RANGE               = 13,
+  COUNT_RANGE                  = 14,
+  DATA_RANGE                   = 15,
+  DIRECTORY_DATA_OVERLAP       = 16,
+  ENTRY_KIND                   = 17,
+  ENTRY_KEY_RANGE              = 18,
+  ENTRY_VALUE_RANGE            = 19,
+  ENTRY_KEY_TERMINATOR         = 20,
+  ENTRY_VALUE_TERMINATOR       = 21,
+  PACKED_LAYOUT                = 22,
+  SEMANTIC_KEY                 = 23,
+  SEMANTIC_VALUE               = 24,
+  STAMP_GUARD                  = 25,
+  STAMP_MISMATCH               = 26,
+  EXPECTED_COUNT               = 27,
+  EXPECTED_DATA_DELTA          = 28,
+  EXPECTED_SEMANTIC_PREFIX     = 29,
+  EXPECTED_NEW_ENTRY           = 30,
+  EXPECTED_EMPTY               = 31,
+  EXPECTED_COPY                = 32,
+  EXPECTED_MOVE_SOURCE_EMPTY   = 33,
+  EXPECTED_PRESERVATION        = 34,
+  EXPECTED_ARRAY_DELTA         = 35,
+  INTERNAL_FAILURE             = 36,
+};
+
+struct payload_contract_incident_t {
+  uint32_t sequence;
+  uint32_t sequence_inv;
+  uint32_t phase;
+  uint32_t reason;
+  uint32_t operation_id;
+  uint32_t object_ptr;
+  uint32_t related_ptr;
+  uint32_t generation;
+  uint32_t entry_index;
+  uint32_t expected0;
+  uint32_t observed0;
+  uint32_t expected1;
+  uint32_t observed1;
+  uint32_t before_fingerprint;
+  uint32_t after_fingerprint;
+  uint32_t dwt_cyccnt;
+  uint32_t ipsr;
+};
+
+struct payload_contract_bank_snapshot_t {
+  uint32_t valid;
+  uint32_t count;
+  uint32_t newest_sequence;
+  payload_contract_incident_t entries[PAYLOAD_CONTRACT_INCIDENT_ENTRIES];
+};
+
+struct payload_contract_snapshot_t {
+  payload_contract_bank_snapshot_t live;
+  payload_contract_bank_snapshot_t retained;
+};
+
+struct payload_contract_info_t {
+  uint32_t checks;
+  uint32_t successful_mutations;
+  uint32_t precondition_failures;
+  uint32_t pre_invariant_failures;
+  uint32_t post_invariant_failures;
+  uint32_t postcondition_failures;
+  uint32_t observed_drift_failures;
+  uint32_t mutation_failures;
+  uint32_t incidents;
+  uint32_t pending_events;
+  uint32_t pending_overflow;
+  uint32_t event_emitted;
+  uint32_t event_emit_failed;
+  uint32_t event_incidents_suppressed;
+  payload_contract_incident_t first_this_boot;
+  payload_contract_incident_t latest_this_boot;
+  payload_contract_incident_t latest_retained;
+};
+
+const char* payload_contract_phase_name(uint32_t phase);
+const char* payload_contract_reason_name(uint32_t reason);
+void payload_contract_get_info(payload_contract_info_t* out);
+void payload_contract_get_snapshot(payload_contract_snapshot_t* out);
+bool payload_contract_event_peek(payload_contract_incident_t* out);
+void payload_contract_event_begin(void);
+void payload_contract_event_end(bool emitted);
+void payload_contract_clear_retained(void);
 
 // ============================================================================
 // Payload Instrumentation Snapshot (Read-Only, Monotonic)
@@ -244,6 +378,22 @@ typedef struct {
   uint32_t alloc_overlap_dwt;
   uint32_t alloc_overlap_depth;
 
+  // Design-by-contract summary
+  uint32_t contract_checks;
+  uint32_t contract_successful_mutations;
+  uint32_t contract_precondition_failures;
+  uint32_t contract_pre_invariant_failures;
+  uint32_t contract_post_invariant_failures;
+  uint32_t contract_postcondition_failures;
+  uint32_t contract_observed_drift_failures;
+  uint32_t contract_mutation_failures;
+  uint32_t contract_incidents;
+  uint32_t contract_pending_events;
+  uint32_t contract_pending_overflow;
+  uint32_t contract_event_emitted;
+  uint32_t contract_event_emit_failed;
+  uint32_t contract_event_incidents_suppressed;
+
 } payload_info_t;
 
 void payload_get_info(payload_info_t* out);
@@ -364,6 +514,8 @@ void payload_clear_retained_append_trace();
 // header independent of the conversion implementation while allowing the
 // integer-only publication object to cross the API by const reference.
 struct fixed_decimal_t;
+
+struct payload_contract_state_t;
 
 class Payload;
 class PayloadArray;
@@ -489,6 +641,7 @@ public:
     size_t arena_capacity() const;
     size_t entry_capacity() const;
     bool heap_entries() const;
+    bool contract_valid() const;
 
     void debug_dump(const char* tag) const;
 
@@ -541,6 +694,10 @@ private:
     uint16_t  _count_guard;
     uint16_t  _data_begin;
     uint16_t  _data_begin_guard;
+    uint32_t  _contract_generation;
+    uint32_t  _contract_generation_guard;
+    uint32_t  _contract_fingerprint;
+    uint32_t  _contract_fingerprint_guard;
     alignas(uint32_t) uint8_t _inline_storage[INLINE_STORAGE];
 
     bool _heap_guard_ok() const;
@@ -566,6 +723,31 @@ private:
     bool _self_ok(uint32_t operation_id) const;
     bool _entry_ok(const Entry& e, size_t index, uint32_t operation_id) const;
     bool _layout_ok(uint32_t operation_id) const;
+
+    bool _contract_inspect(payload_contract_state_t* out) const;
+    bool _contract_begin(uint32_t operation_id,
+                         payload_contract_state_t* before) const;
+    bool _contract_finish_preserve(uint32_t operation_id,
+                                   const payload_contract_state_t& before,
+                                   size_t minimum_capacity);
+    bool _contract_finish_add(uint32_t operation_id,
+                              const payload_contract_state_t& before,
+                              size_t key_len,
+                              size_t value_len,
+                              ValueKind kind,
+                              uint32_t expected_key_hash,
+                              uint32_t expected_value_hash);
+    bool _contract_finish_clear(uint32_t operation_id,
+                                const payload_contract_state_t& before);
+    bool _contract_finish_copy(uint32_t operation_id,
+                               const payload_contract_state_t& before,
+                               uint32_t expected_semantic_hash);
+    bool _contract_abort(uint32_t operation_id,
+                         const payload_contract_state_t& before);
+    void _contract_accept(const payload_contract_state_t& state);
+    uint32_t _contract_semantic_hash(size_t entry_limit) const;
+    uint32_t _json_hash_unchecked() const;
+
     const Entry* _find(const char* key, size_t key_len) const;
     const Entry* _find(const char* key) const;
 
@@ -615,6 +797,7 @@ public:
 
     size_t  size() const;
     Payload get(size_t idx) const;
+    bool contract_valid() const;
 
 private:
     friend class Payload;
@@ -626,6 +809,10 @@ private:
     uintptr_t _heap_block_guard;
     uint16_t  _length;
     uint16_t  _length_guard;
+    uint32_t  _contract_generation;
+    uint32_t  _contract_generation_guard;
+    uint32_t  _contract_fingerprint;
+    uint32_t  _contract_fingerprint_guard;
     alignas(uint32_t) char _inline_storage[INLINE_STORAGE];
 
     bool _heap_guard_ok() const;
@@ -637,6 +824,26 @@ private:
     const char* _data() const;
     size_t _capacity() const;
     bool _self_ok() const;
+    bool _contract_inspect(payload_contract_state_t* out) const;
+    bool _contract_begin(uint32_t operation_id,
+                         payload_contract_state_t* before) const;
+    bool _contract_finish_preserve(uint32_t operation_id,
+                                   const payload_contract_state_t& before,
+                                   size_t minimum_capacity);
+    bool _contract_finish_add(uint32_t operation_id,
+                              const payload_contract_state_t& before,
+                              size_t object_size,
+                              uint32_t object_hash);
+    bool _contract_finish_clear(uint32_t operation_id,
+                                const payload_contract_state_t& before);
+    bool _contract_finish_copy(uint32_t operation_id,
+                               const payload_contract_state_t& before,
+                               uint32_t expected_hash);
+    bool _contract_abort(uint32_t operation_id,
+                         const payload_contract_state_t& before);
+    void _contract_accept(const payload_contract_state_t& state);
+    uint32_t _json_hash_unchecked() const;
+
     bool _ensure_capacity(size_t needed);
     void _release_storage();
     void _move_from(PayloadArray& other);

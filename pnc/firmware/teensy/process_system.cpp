@@ -49,6 +49,7 @@ static void system_memory_watchdog_arm(void);
 static void system_memory_watchdog_schedule_alap(void);
 static void system_dmamem_ensure_initialized(void);
 static void system_sentinel_service(void);
+static void system_payload_contract_service(void);
 
 // --------------------------------------------------------------
 // Internal terminal state
@@ -625,6 +626,12 @@ static FLASHMEM void system_memory_watchdog_alap_cb(timepop_ctx_t*,
         g_system_memory_watchdog_event_count,
         g_system_memory_watchdog_event_emitted ? 1U : 0U);
   }
+
+  // Payload mutators only leave scalar incidents.  Convert at most one into
+  // a durable event here, after the audit, from serialized foreground context.
+  // The event builder runs under Payload's incident-suppression guard so a
+  // diagnostic Payload failure cannot recursively diagnose itself.
+  system_payload_contract_service();
 
   // If another timed fire arrived while this ALAP service was running, arrange
   // one more serialized pass rather than doing nested work here.
@@ -3030,6 +3037,131 @@ static FLASHMEM Payload system_payload_append_trace_summary_payload(void) {
   return out;
 }
 
+
+// ================================================================
+// Payload design-by-contract — reporting and event service
+// ================================================================
+
+static payload_contract_info_t
+    g_system_payload_contract_info_scratch DMAMEM;
+
+static bool system_payload_contract_incident_valid(
+    const payload_contract_incident_t& incident) {
+  return incident.sequence != 0U &&
+         (incident.sequence ^ incident.sequence_inv) == 0xFFFFFFFFUL;
+}
+
+static FLASHMEM Payload system_payload_contract_incident_payload(
+    const payload_contract_incident_t& incident) {
+  Payload out;
+  const bool valid = system_payload_contract_incident_valid(incident);
+  out.add("valid", valid);
+  if (!valid) return out;
+
+  out.add("sequence", incident.sequence);
+  out.add("phase_id", incident.phase);
+  out.add("phase", payload_contract_phase_name(incident.phase));
+  out.add("reason_id", incident.reason);
+  out.add("reason", payload_contract_reason_name(incident.reason));
+  out.add("operation_id", incident.operation_id);
+  out.add("operation", payload_operation_id_name(incident.operation_id));
+  system_crash_add_hex32(out, "object", incident.object_ptr);
+  system_crash_add_hex32(out, "related", incident.related_ptr);
+  out.add("generation", incident.generation);
+  out.add("entry_index", incident.entry_index);
+  system_crash_add_hex32(out, "expected0", incident.expected0);
+  system_crash_add_hex32(out, "observed0", incident.observed0);
+  system_crash_add_hex32(out, "expected1", incident.expected1);
+  system_crash_add_hex32(out, "observed1", incident.observed1);
+  system_crash_add_hex32(out, "before_fingerprint",
+                         incident.before_fingerprint);
+  system_crash_add_hex32(out, "after_fingerprint",
+                         incident.after_fingerprint);
+  system_crash_add_hex32(out, "dwt", incident.dwt_cyccnt);
+  out.add("ipsr", incident.ipsr);
+  return out;
+}
+
+static FLASHMEM Payload system_payload_contract_info_payload(void) {
+  payload_contract_get_info(&g_system_payload_contract_info_scratch);
+  const payload_contract_info_t& info =
+      g_system_payload_contract_info_scratch;
+
+  Payload out;
+  out.add("schema", "ZPNET_PAYLOAD_CONTRACT_V1");
+  out.add("checks", info.checks);
+  out.add("successful_mutations", info.successful_mutations);
+  out.add("precondition_failures", info.precondition_failures);
+  out.add("pre_invariant_failures", info.pre_invariant_failures);
+  out.add("post_invariant_failures", info.post_invariant_failures);
+  out.add("postcondition_failures", info.postcondition_failures);
+  out.add("observed_drift_failures", info.observed_drift_failures);
+  out.add("mutation_failures", info.mutation_failures);
+  out.add("incidents", info.incidents);
+  out.add("pending_events", info.pending_events);
+  out.add("pending_overflow", info.pending_overflow);
+  out.add("event_emitted", info.event_emitted);
+  out.add("event_emit_failed", info.event_emit_failed);
+  out.add("event_incidents_suppressed",
+          info.event_incidents_suppressed);
+  out.add_object("first_this_boot",
+                 system_payload_contract_incident_payload(
+                     info.first_this_boot));
+  out.add_object("latest_this_boot",
+                 system_payload_contract_incident_payload(
+                     info.latest_this_boot));
+  out.add_object("latest_retained",
+                 system_payload_contract_incident_payload(
+                     info.latest_retained));
+  return out;
+}
+
+static FLASHMEM Payload system_payload_contract_summary_payload(void) {
+  payload_contract_get_info(&g_system_payload_contract_info_scratch);
+  const payload_contract_info_t& info =
+      g_system_payload_contract_info_scratch;
+
+  Payload out;
+  out.add("schema", "ZPNET_PAYLOAD_CONTRACT_SUMMARY_V1");
+  out.add("incidents", info.incidents);
+  out.add("pending_events", info.pending_events);
+  out.add("post_invariant_failures", info.post_invariant_failures);
+  out.add("postcondition_failures", info.postcondition_failures);
+  out.add("observed_drift_failures", info.observed_drift_failures);
+  out.add_object("latest_retained",
+                 system_payload_contract_incident_payload(
+                     info.latest_retained));
+  return out;
+}
+
+static void system_payload_contract_service(void) {
+  payload_contract_incident_t incident{};
+  if (!payload_contract_event_peek(&incident)) return;
+
+  // Seven compact scalar entries keep the anomaly notice inside Payload's
+  // inline store.  Names and the full expected/observed evidence remain on the
+  // authoritative PAYLOAD_CONTRACT_INFO surface; the event is only the bell.
+  // Keep suppression active through the diagnostic Payload destructor as well
+  // as construction and enqueue, so cleanup cannot recursively diagnose the
+  // object that was created only to report the original incident.
+  payload_contract_event_begin();
+  bool ok = false;
+  {
+    Payload event;
+    ok = event.add("schema", "ZPNET_PAYLOAD_CONTRACT_V1");
+    if (ok) ok = event.add("sequence", incident.sequence);
+    if (ok) ok = event.add("phase_id", incident.phase);
+    if (ok) ok = event.add("reason_id", incident.reason);
+    if (ok) ok = event.add("operation_id", incident.operation_id);
+    if (ok) ok = event.add("object", incident.object_ptr);
+    if (ok) ok = event.add("generation", incident.generation);
+
+    if (ok) ok = !event.heap_entries() && event.contract_valid();
+    if (ok) enqueueEvent("PAYLOAD_CONTRACT_ANOMALY", event);
+  }
+  payload_contract_event_end(ok);
+}
+
 static bool g_system_crash_report_captured = false;
 static bool g_system_crash_report_core_fault_present = false;
 static bool g_system_crash_report_truncated = false;
@@ -3139,6 +3271,8 @@ static FLASHMEM Payload system_crash_report_payload(bool include_text) {
   p.add_object("payload_flight", system_payload_flight_payload(true));
   p.add_object("payload_append_trace",
                system_payload_append_trace_summary_payload());
+  p.add_object("payload_contract",
+               system_payload_contract_summary_payload());
   return p;
 }
 
@@ -3839,6 +3973,37 @@ static FLASHMEM Payload cmd_payload_info(const Payload& /*args*/) {
   p.add("payload_alloc_overlap_dwt", info.alloc_overlap_dwt);
   p.add("payload_alloc_overlap_depth", info.alloc_overlap_depth);
 
+  // ==========================================================
+  // Design-by-contract court
+  // ==========================================================
+
+  p.add("payload_contract_checks", info.contract_checks);
+  p.add("payload_contract_successful_mutations",
+        info.contract_successful_mutations);
+  p.add("payload_contract_precondition_failures",
+        info.contract_precondition_failures);
+  p.add("payload_contract_pre_invariant_failures",
+        info.contract_pre_invariant_failures);
+  p.add("payload_contract_post_invariant_failures",
+        info.contract_post_invariant_failures);
+  p.add("payload_contract_postcondition_failures",
+        info.contract_postcondition_failures);
+  p.add("payload_contract_observed_drift_failures",
+        info.contract_observed_drift_failures);
+  p.add("payload_contract_mutation_failures",
+        info.contract_mutation_failures);
+  p.add("payload_contract_incidents", info.contract_incidents);
+  p.add("payload_contract_pending_events",
+        info.contract_pending_events);
+  p.add("payload_contract_pending_overflow",
+        info.contract_pending_overflow);
+  p.add("payload_contract_event_emitted",
+        info.contract_event_emitted);
+  p.add("payload_contract_event_emit_failed",
+        info.contract_event_emit_failed);
+  p.add("payload_contract_event_incidents_suppressed",
+        info.contract_event_incidents_suppressed);
+
   return p;
 }
 
@@ -3868,6 +4033,8 @@ static void system_dmamem_ensure_initialized(void) {
          sizeof(g_system_timepop_dispatch_trace_scratch));
   memset((void*)&g_system_payload_append_trace_scratch, 0,
          sizeof(g_system_payload_append_trace_scratch));
+  memset((void*)&g_system_payload_contract_info_scratch, 0,
+         sizeof(g_system_payload_contract_info_scratch));
 
   // crash_forensics.cpp owns its retained RAM2 record.  Never initialize or
   // clear that record here; it may be the only surviving witness to a reboot.
@@ -4215,6 +4382,13 @@ static FLASHMEM Payload cmd_payload_append_trace(const Payload& args) {
 }
 
 // ------------------------------------------------------------
+// PAYLOAD_CONTRACT_INFO — contract counters and first/latest incidents
+// ------------------------------------------------------------
+static FLASHMEM Payload cmd_payload_contract_info(const Payload& /*args*/) {
+  return system_payload_contract_info_payload();
+}
+
+// ------------------------------------------------------------
 // CRASH_INFO — core CrashReport plus retained structured exception evidence
 // ------------------------------------------------------------
 static FLASHMEM Payload cmd_crash_info(const Payload& /*args*/) {
@@ -4255,6 +4429,7 @@ static FLASHMEM Payload cmd_crash_clear(const Payload& /*args*/) {
   system_watchdog_trace_clear_retained();
   timepop_dispatch_trace_clear_retained();
   payload_clear_retained_append_trace();
+  payload_contract_clear_retained();
 
   Payload resp = ok_payload();
   resp.add("crash_report_cleared", true);
@@ -4266,6 +4441,7 @@ static FLASHMEM Payload cmd_crash_clear(const Payload& /*args*/) {
   resp.add("memory_watchdog_trace_cleared", true);
   resp.add("timepop_dispatch_trace_cleared", true);
   resp.add("payload_append_trace_cleared", true);
+  resp.add("payload_contract_cleared", true);
   return resp;
 }
 
@@ -4327,6 +4503,7 @@ static const process_command_entry_t SYSTEM_COMMANDS[] = {
   { "TIMEPOP_DISPATCH_INFO", cmd_timepop_dispatch_info },
   { "PAYLOAD_FLIGHT_INFO", cmd_payload_flight_info },
   { "PAYLOAD_APPEND_TRACE", cmd_payload_append_trace },
+  { "PAYLOAD_CONTRACT_INFO", cmd_payload_contract_info },
   { "DEBUG",            cmd_debug            },
   { "STATUS",           cmd_status           },
   { nullptr,            nullptr }

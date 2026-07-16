@@ -169,6 +169,32 @@ static volatile uint32_t g_payload_last_error_this = 0;
 static volatile uint32_t g_payload_last_error_op_id = 0;
 static char g_payload_last_error_op[32] = {0};
 
+// Design-by-contract counters.  Incident records themselves are defined with
+// the retained recorders below, after the platform retention helpers exist.
+static volatile uint32_t g_payload_contract_checks = 0;
+static volatile uint32_t g_payload_contract_successful_mutations = 0;
+static volatile uint32_t g_payload_contract_precondition_failures = 0;
+static volatile uint32_t g_payload_contract_pre_invariant_failures = 0;
+static volatile uint32_t g_payload_contract_post_invariant_failures = 0;
+static volatile uint32_t g_payload_contract_postcondition_failures = 0;
+static volatile uint32_t g_payload_contract_observed_drift_failures = 0;
+static volatile uint32_t g_payload_contract_mutation_failures = 0;
+static volatile uint32_t g_payload_contract_incidents = 0;
+static volatile uint32_t g_payload_contract_pending_overflow = 0;
+static volatile uint32_t g_payload_contract_event_emitted = 0;
+static volatile uint32_t g_payload_contract_event_emit_failed = 0;
+static volatile uint32_t g_payload_contract_event_incidents_suppressed = 0;
+static volatile uint32_t g_payload_contract_suppression_depth = 0;
+
+static void payload_contract_note_error(uint32_t code,
+                                        uint32_t operation_id,
+                                        const void* self);
+static void payload_contract_note_integrity(uint32_t operation_id,
+                                            const void* self,
+                                            uint32_t entry_index,
+                                            uint32_t expected,
+                                            uint32_t observed);
+
 // ============================================================================
 // Error and compatibility reason codes
 // ============================================================================
@@ -833,6 +859,7 @@ static inline void payload_note_error(uint32_t code,
     g_payload_last_error_op_id = operation_id;
     g_payload_last_error_op[0] = '\0';
     payload_flight_note(operation_id, self, PAYLOAD_FLIGHT_FLAG_ERROR);
+    payload_contract_note_error(code, operation_id, self);
 }
 
 static void payload_increment_integrity_reason(uint32_t reason) {
@@ -884,6 +911,12 @@ static void payload_note_integrity(
     g_payload_last_error_op_id = g_payload_last_self_ok_fail_op_id;
     payload_flight_note(operation_id, self,
                         PAYLOAD_FLIGHT_FLAG_ERROR | PAYLOAD_FLIGHT_FLAG_INTEGRITY);
+    payload_contract_note_integrity(
+        operation_id,
+        self,
+        evidence ? evidence->entry_index : 0xFFFFFFFFUL,
+        evidence ? evidence->expected_upper : 0U,
+        evidence ? evidence->val_end : reason);
 
     if (g_payload_first_self_ok_fail_captured == 0U) {
         g_payload_first_self_ok_fail_captured = 1U;
@@ -1081,6 +1114,454 @@ static void payload_guarded_free(void* block,
 #else
 #define PAYLOAD_RETAINED_MEM
 #endif
+
+
+// ---- Retained design-by-contract incident recorder -------------------------
+//
+// The mutator path records only fixed scalar evidence.  It never allocates,
+// traverses an untrusted label, constructs a diagnostic Payload, or calls the
+// event bus.  SYSTEM later consumes the bounded pending queue from serialized
+// foreground context.
+
+static constexpr uint32_t PAYLOAD_CONTRACT_MAGIC = 0x50444331UL;  // 'PDC1'
+static constexpr uint32_t PAYLOAD_CONTRACT_SCHEMA_VERSION = 1U;
+
+struct payload_contract_bank_t {
+    uint32_t magic;
+    uint32_t magic_inv;
+    uint32_t schema_version;
+    uint32_t capacity;
+    payload_contract_incident_t entries[PAYLOAD_CONTRACT_INCIDENT_ENTRIES];
+};
+
+static payload_contract_bank_t g_payload_contract_live PAYLOAD_RETAINED_MEM;
+static payload_contract_bank_t g_payload_contract_retained PAYLOAD_RETAINED_MEM;
+static bool g_payload_contract_boot_latched = false;
+static volatile uint32_t g_payload_contract_next_sequence = 0U;
+
+static payload_contract_incident_t
+    g_payload_contract_pending[PAYLOAD_CONTRACT_PENDING_ENTRIES];
+static volatile uint32_t g_payload_contract_pending_head = 0U;
+static volatile uint32_t g_payload_contract_pending_tail = 0U;
+static volatile uint32_t g_payload_contract_pending_count = 0U;
+static payload_contract_incident_t g_payload_contract_first_this_boot;
+static payload_contract_snapshot_t g_payload_contract_info_scratch;
+
+static inline void payload_contract_dmb(void) {
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+}
+
+static bool payload_contract_bank_valid(const payload_contract_bank_t& bank) {
+    return bank.magic == PAYLOAD_CONTRACT_MAGIC &&
+           (bank.magic ^ bank.magic_inv) == 0xFFFFFFFFUL &&
+           bank.schema_version == PAYLOAD_CONTRACT_SCHEMA_VERSION &&
+           bank.capacity == PAYLOAD_CONTRACT_INCIDENT_ENTRIES;
+}
+
+static bool payload_contract_incident_valid(
+    const payload_contract_incident_t& incident) {
+    return incident.sequence != 0U &&
+           (incident.sequence ^ incident.sequence_inv) == 0xFFFFFFFFUL;
+}
+
+static void payload_contract_initialize_live(void) {
+    memset((void*)&g_payload_contract_live, 0,
+           sizeof(g_payload_contract_live));
+    g_payload_contract_live.schema_version =
+        PAYLOAD_CONTRACT_SCHEMA_VERSION;
+    g_payload_contract_live.capacity = PAYLOAD_CONTRACT_INCIDENT_ENTRIES;
+    g_payload_contract_live.magic_inv = ~PAYLOAD_CONTRACT_MAGIC;
+    g_payload_contract_live.magic = PAYLOAD_CONTRACT_MAGIC;
+    g_payload_contract_next_sequence = 0U;
+    payload_retained_flush(&g_payload_contract_live,
+                           sizeof(g_payload_contract_live));
+}
+
+static void payload_contract_boot_latch(void) {
+    if (g_payload_contract_boot_latched) return;
+    g_payload_contract_boot_latched = true;
+
+    if (payload_contract_bank_valid(g_payload_contract_live)) {
+        g_payload_contract_retained = g_payload_contract_live;
+    } else {
+        memset((void*)&g_payload_contract_retained, 0,
+               sizeof(g_payload_contract_retained));
+    }
+    payload_retained_flush(&g_payload_contract_retained,
+                           sizeof(g_payload_contract_retained));
+    payload_contract_initialize_live();
+}
+
+static void payload_contract_increment_phase(uint32_t phase) {
+    switch ((payload_contract_phase_t)phase) {
+        case payload_contract_phase_t::PRECONDITION:
+            g_payload_contract_precondition_failures++;
+            break;
+        case payload_contract_phase_t::PRE_INVARIANT:
+            g_payload_contract_pre_invariant_failures++;
+            break;
+        case payload_contract_phase_t::POST_INVARIANT:
+            g_payload_contract_post_invariant_failures++;
+            break;
+        case payload_contract_phase_t::POSTCONDITION:
+            g_payload_contract_postcondition_failures++;
+            break;
+        case payload_contract_phase_t::OBSERVED_DRIFT:
+            g_payload_contract_observed_drift_failures++;
+            break;
+        case payload_contract_phase_t::MUTATION_FAILURE:
+            g_payload_contract_mutation_failures++;
+            break;
+        default:
+            break;
+    }
+}
+
+static void payload_contract_record(
+    payload_contract_phase_t phase,
+    payload_contract_reason_t reason,
+    uint32_t operation_id,
+    const void* self,
+    const void* related,
+    uint32_t generation,
+    uint32_t entry_index,
+    uint32_t expected0,
+    uint32_t observed0,
+    uint32_t expected1,
+    uint32_t observed1,
+    uint32_t before_fingerprint,
+    uint32_t after_fingerprint) {
+    if (g_payload_contract_suppression_depth != 0U) {
+        g_payload_contract_event_incidents_suppressed++;
+        return;
+    }
+
+    payload_contract_boot_latch();
+    g_payload_contract_incidents++;
+    payload_contract_increment_phase((uint32_t)phase);
+
+    uint32_t sequence = 0U;
+    {
+        const uint32_t saved = critical_enter();
+        sequence = g_payload_contract_next_sequence + 1U;
+        if (sequence == 0U) sequence = 1U;
+        g_payload_contract_next_sequence = sequence;
+        critical_exit(saved);
+    }
+
+    payload_contract_incident_t& incident =
+        g_payload_contract_live.entries[
+            (sequence - 1U) % PAYLOAD_CONTRACT_INCIDENT_ENTRIES];
+
+    incident.sequence = 0U;
+    incident.sequence_inv = 0U;
+    payload_contract_dmb();
+    payload_retained_flush(&incident, 2U * sizeof(uint32_t));
+
+    incident.phase = (uint32_t)phase;
+    incident.reason = (uint32_t)reason;
+    incident.operation_id = operation_id;
+    incident.object_ptr = (uint32_t)(uintptr_t)self;
+    incident.related_ptr = (uint32_t)(uintptr_t)related;
+    incident.generation = generation;
+    incident.entry_index = entry_index;
+    incident.expected0 = expected0;
+    incident.observed0 = observed0;
+    incident.expected1 = expected1;
+    incident.observed1 = observed1;
+    incident.before_fingerprint = before_fingerprint;
+    incident.after_fingerprint = after_fingerprint;
+    incident.dwt_cyccnt = payload_read_dwt();
+    incident.ipsr = payload_read_ipsr();
+
+    incident.sequence_inv = ~sequence;
+    payload_contract_dmb();
+    incident.sequence = sequence;
+    payload_contract_dmb();
+    payload_retained_flush(&incident, sizeof(incident));
+
+    const uint32_t saved = critical_enter();
+    if (!payload_contract_incident_valid(
+            g_payload_contract_first_this_boot)) {
+        g_payload_contract_first_this_boot = incident;
+    }
+    if (g_payload_contract_pending_count < PAYLOAD_CONTRACT_PENDING_ENTRIES) {
+        g_payload_contract_pending[g_payload_contract_pending_head] = incident;
+        g_payload_contract_pending_head =
+            (g_payload_contract_pending_head + 1U) %
+            PAYLOAD_CONTRACT_PENDING_ENTRIES;
+        g_payload_contract_pending_count++;
+    } else {
+        g_payload_contract_pending_overflow++;
+    }
+    critical_exit(saved);
+}
+
+static void payload_contract_snapshot_bank(
+    const payload_contract_bank_t& bank,
+    payload_contract_bank_snapshot_t* out) {
+    memset(out, 0, sizeof(*out));
+    if (!payload_contract_bank_valid(bank)) return;
+    out->valid = 1U;
+
+    for (uint32_t i = 0U; i < PAYLOAD_CONTRACT_INCIDENT_ENTRIES; ++i) {
+        const volatile payload_contract_incident_t* source = &bank.entries[i];
+        const uint32_t sequence_before = source->sequence;
+        const uint32_t sequence_inv_before = source->sequence_inv;
+        if (sequence_before == 0U ||
+            (sequence_before ^ sequence_inv_before) != 0xFFFFFFFFUL) {
+            continue;
+        }
+
+        const payload_contract_incident_t candidate = bank.entries[i];
+        payload_contract_dmb();
+        if (source->sequence != sequence_before ||
+            source->sequence_inv != sequence_inv_before ||
+            !payload_contract_incident_valid(candidate)) {
+            continue;
+        }
+
+        uint32_t pos = out->count;
+        while (pos > 0U &&
+               out->entries[pos - 1U].sequence > candidate.sequence) {
+            out->entries[pos] = out->entries[pos - 1U];
+            --pos;
+        }
+        out->entries[pos] = candidate;
+        ++out->count;
+    }
+
+    if (out->count != 0U) {
+        out->newest_sequence = out->entries[out->count - 1U].sequence;
+    }
+}
+
+void payload_contract_get_snapshot(payload_contract_snapshot_t* out) {
+    if (!out) return;
+    payload_contract_boot_latch();
+    memset(out, 0, sizeof(*out));
+    payload_contract_snapshot_bank(g_payload_contract_live, &out->live);
+    payload_contract_snapshot_bank(g_payload_contract_retained,
+                                   &out->retained);
+}
+
+void payload_contract_get_info(payload_contract_info_t* out) {
+    if (!out) return;
+    payload_contract_get_snapshot(&g_payload_contract_info_scratch);
+    const payload_contract_snapshot_t& snapshot =
+        g_payload_contract_info_scratch;
+    memset(out, 0, sizeof(*out));
+
+    out->checks = g_payload_contract_checks;
+    out->successful_mutations = g_payload_contract_successful_mutations;
+    out->precondition_failures = g_payload_contract_precondition_failures;
+    out->pre_invariant_failures = g_payload_contract_pre_invariant_failures;
+    out->post_invariant_failures = g_payload_contract_post_invariant_failures;
+    out->postcondition_failures = g_payload_contract_postcondition_failures;
+    out->observed_drift_failures =
+        g_payload_contract_observed_drift_failures;
+    out->mutation_failures = g_payload_contract_mutation_failures;
+    out->incidents = g_payload_contract_incidents;
+    out->pending_events = g_payload_contract_pending_count;
+    out->pending_overflow = g_payload_contract_pending_overflow;
+    out->event_emitted = g_payload_contract_event_emitted;
+    out->event_emit_failed = g_payload_contract_event_emit_failed;
+    out->event_incidents_suppressed =
+        g_payload_contract_event_incidents_suppressed;
+
+    if (payload_contract_incident_valid(
+            g_payload_contract_first_this_boot)) {
+        out->first_this_boot = g_payload_contract_first_this_boot;
+    }
+    if (snapshot.live.count != 0U) {
+        out->latest_this_boot =
+            snapshot.live.entries[snapshot.live.count - 1U];
+    }
+    if (snapshot.retained.count != 0U) {
+        out->latest_retained =
+            snapshot.retained.entries[snapshot.retained.count - 1U];
+    }
+}
+
+bool payload_contract_event_peek(payload_contract_incident_t* out) {
+    if (!out) return false;
+    const uint32_t saved = critical_enter();
+    const bool available = g_payload_contract_pending_count != 0U;
+    if (available) {
+        *out = g_payload_contract_pending[g_payload_contract_pending_tail];
+    }
+    critical_exit(saved);
+    return available;
+}
+
+void payload_contract_event_begin(void) {
+    const uint32_t saved = critical_enter();
+    g_payload_contract_suppression_depth++;
+    critical_exit(saved);
+}
+
+void payload_contract_event_end(bool emitted) {
+    const uint32_t saved = critical_enter();
+    if (g_payload_contract_suppression_depth != 0U) {
+        g_payload_contract_suppression_depth--;
+    }
+    if (g_payload_contract_pending_count != 0U) {
+        memset(&g_payload_contract_pending[g_payload_contract_pending_tail],
+               0,
+               sizeof(g_payload_contract_pending[0]));
+        g_payload_contract_pending_tail =
+            (g_payload_contract_pending_tail + 1U) %
+            PAYLOAD_CONTRACT_PENDING_ENTRIES;
+        g_payload_contract_pending_count--;
+    }
+    if (emitted) g_payload_contract_event_emitted++;
+    else g_payload_contract_event_emit_failed++;
+    critical_exit(saved);
+}
+
+void payload_contract_clear_retained(void) {
+    memset((void*)&g_payload_contract_retained, 0,
+           sizeof(g_payload_contract_retained));
+    payload_retained_flush(&g_payload_contract_retained,
+                           sizeof(g_payload_contract_retained));
+}
+
+const char* payload_contract_phase_name(uint32_t phase) {
+    switch ((payload_contract_phase_t)phase) {
+        case payload_contract_phase_t::PRECONDITION: return "PRECONDITION";
+        case payload_contract_phase_t::PRE_INVARIANT: return "PRE_INVARIANT";
+        case payload_contract_phase_t::POST_INVARIANT: return "POST_INVARIANT";
+        case payload_contract_phase_t::POSTCONDITION: return "POSTCONDITION";
+        case payload_contract_phase_t::OBSERVED_DRIFT: return "OBSERVED_DRIFT";
+        case payload_contract_phase_t::MUTATION_FAILURE: return "MUTATION_FAILURE";
+        case payload_contract_phase_t::EVENT_EMISSION: return "EVENT_EMISSION";
+        default: return "NONE";
+    }
+}
+
+const char* payload_contract_reason_name(uint32_t reason) {
+    switch ((payload_contract_reason_t)reason) {
+        case payload_contract_reason_t::INPUT_POINTER: return "INPUT_POINTER";
+        case payload_contract_reason_t::INPUT_LENGTH: return "INPUT_LENGTH";
+        case payload_contract_reason_t::INPUT_SYNTAX: return "INPUT_SYNTAX";
+        case payload_contract_reason_t::INPUT_KIND: return "INPUT_KIND";
+        case payload_contract_reason_t::SOURCE_INVALID: return "SOURCE_INVALID";
+        case payload_contract_reason_t::ALLOCATION_FAILURE: return "ALLOCATION_FAILURE";
+        case payload_contract_reason_t::SERIALIZATION_FAILURE: return "SERIALIZATION_FAILURE";
+        case payload_contract_reason_t::HEAP_GUARD: return "HEAP_GUARD";
+        case payload_contract_reason_t::COUNT_GUARD: return "COUNT_GUARD";
+        case payload_contract_reason_t::DATA_BEGIN_GUARD: return "DATA_BEGIN_GUARD";
+        case payload_contract_reason_t::HEAP_HEADER: return "HEAP_HEADER";
+        case payload_contract_reason_t::STORAGE_UNREADABLE: return "STORAGE_UNREADABLE";
+        case payload_contract_reason_t::CAPACITY_RANGE: return "CAPACITY_RANGE";
+        case payload_contract_reason_t::COUNT_RANGE: return "COUNT_RANGE";
+        case payload_contract_reason_t::DATA_RANGE: return "DATA_RANGE";
+        case payload_contract_reason_t::DIRECTORY_DATA_OVERLAP: return "DIRECTORY_DATA_OVERLAP";
+        case payload_contract_reason_t::ENTRY_KIND: return "ENTRY_KIND";
+        case payload_contract_reason_t::ENTRY_KEY_RANGE: return "ENTRY_KEY_RANGE";
+        case payload_contract_reason_t::ENTRY_VALUE_RANGE: return "ENTRY_VALUE_RANGE";
+        case payload_contract_reason_t::ENTRY_KEY_TERMINATOR: return "ENTRY_KEY_TERMINATOR";
+        case payload_contract_reason_t::ENTRY_VALUE_TERMINATOR: return "ENTRY_VALUE_TERMINATOR";
+        case payload_contract_reason_t::PACKED_LAYOUT: return "PACKED_LAYOUT";
+        case payload_contract_reason_t::SEMANTIC_KEY: return "SEMANTIC_KEY";
+        case payload_contract_reason_t::SEMANTIC_VALUE: return "SEMANTIC_VALUE";
+        case payload_contract_reason_t::STAMP_GUARD: return "STAMP_GUARD";
+        case payload_contract_reason_t::STAMP_MISMATCH: return "STAMP_MISMATCH";
+        case payload_contract_reason_t::EXPECTED_COUNT: return "EXPECTED_COUNT";
+        case payload_contract_reason_t::EXPECTED_DATA_DELTA: return "EXPECTED_DATA_DELTA";
+        case payload_contract_reason_t::EXPECTED_SEMANTIC_PREFIX: return "EXPECTED_SEMANTIC_PREFIX";
+        case payload_contract_reason_t::EXPECTED_NEW_ENTRY: return "EXPECTED_NEW_ENTRY";
+        case payload_contract_reason_t::EXPECTED_EMPTY: return "EXPECTED_EMPTY";
+        case payload_contract_reason_t::EXPECTED_COPY: return "EXPECTED_COPY";
+        case payload_contract_reason_t::EXPECTED_MOVE_SOURCE_EMPTY: return "EXPECTED_MOVE_SOURCE_EMPTY";
+        case payload_contract_reason_t::EXPECTED_PRESERVATION: return "EXPECTED_PRESERVATION";
+        case payload_contract_reason_t::EXPECTED_ARRAY_DELTA: return "EXPECTED_ARRAY_DELTA";
+        case payload_contract_reason_t::INTERNAL_FAILURE: return "INTERNAL_FAILURE";
+        default: return "NONE";
+    }
+}
+
+static payload_contract_reason_t payload_contract_reason_for_error(
+    uint32_t code) {
+    switch (code) {
+        case PAYLOAD_ERR_BAD_STRING_POINTER:
+            return payload_contract_reason_t::INPUT_POINTER;
+        case PAYLOAD_ERR_STRING_TOO_LONG:
+        case PAYLOAD_ERR_ARENA_LIMIT:
+        case PAYLOAD_ERR_ENTRY_OVERFLOW:
+            return payload_contract_reason_t::INPUT_LENGTH;
+        case PAYLOAD_ERR_JSON_INVALID:
+        case PAYLOAD_ERR_PARSE_ERROR:
+        case PAYLOAD_ERR_INVALID_NUMERIC_TOKEN:
+        case PAYLOAD_ERR_NONFINITE_NUMBER:
+        case PAYLOAD_ERR_FIXED_DECIMAL_RANGE:
+        case PAYLOAD_ERR_FLOAT_FORMAT_FORBIDDEN:
+            return payload_contract_reason_t::INPUT_SYNTAX;
+        case PAYLOAD_ERR_INVALID_KIND:
+        case PAYLOAD_ERR_INVALID_CHILD:
+            return payload_contract_reason_t::INPUT_KIND;
+        case PAYLOAD_ERR_ENTRY_ALLOC_FAIL:
+        case PAYLOAD_ERR_ARENA_ALLOC_FAIL:
+        case PAYLOAD_ERR_COPY_ALLOC_FAIL:
+            return payload_contract_reason_t::ALLOCATION_FAILURE;
+        case PAYLOAD_ERR_SERIALIZE_OVERFLOW:
+        case PAYLOAD_ERR_TO_JSON_FAIL:
+        case PAYLOAD_ERR_STRING_TRUNCATION:
+            return payload_contract_reason_t::SERIALIZATION_FAILURE;
+        case PAYLOAD_ERR_INTEGRITY:
+        case PAYLOAD_ERR_STORAGE_CORRUPT:
+            return payload_contract_reason_t::INTERNAL_FAILURE;
+        default:
+            return payload_contract_reason_t::INTERNAL_FAILURE;
+    }
+}
+
+static void payload_contract_note_error(uint32_t code,
+                                        uint32_t operation_id,
+                                        const void* self) {
+    const payload_contract_reason_t reason =
+        payload_contract_reason_for_error(code);
+    const payload_contract_phase_t phase =
+        (reason == payload_contract_reason_t::INPUT_POINTER ||
+         reason == payload_contract_reason_t::INPUT_LENGTH ||
+         reason == payload_contract_reason_t::INPUT_SYNTAX ||
+         reason == payload_contract_reason_t::INPUT_KIND)
+            ? payload_contract_phase_t::PRECONDITION
+            : payload_contract_phase_t::MUTATION_FAILURE;
+    payload_contract_record(phase,
+                            reason,
+                            operation_id,
+                            self,
+                            nullptr,
+                            0U,
+                            0xFFFFFFFFUL,
+                            code,
+                            0U,
+                            0U,
+                            0U,
+                            0U,
+                            0U);
+}
+
+static void payload_contract_note_integrity(uint32_t operation_id,
+                                            const void* self,
+                                            uint32_t entry_index,
+                                            uint32_t expected,
+                                            uint32_t observed) {
+    payload_contract_record(payload_contract_phase_t::PRE_INVARIANT,
+                            payload_contract_reason_t::INTERNAL_FAILURE,
+                            operation_id,
+                            self,
+                            nullptr,
+                            0U,
+                            entry_index,
+                            expected,
+                            observed,
+                            0U,
+                            0U,
+                            0U,
+                            0U);
+}
 
 // ---- Retained append transaction recorder --------------------------------
 //
@@ -2252,6 +2733,1115 @@ static bool json_array_locate(const char* json,
     }
     return false;
 }
+
+// ============================================================================
+// Design-by-contract core
+// ============================================================================
+//
+// The inspector is observational.  It performs no allocation, no event work,
+// and no mutation of the object under inspection.  A successful mutation is
+// accepted only after whole-object invariants and the operation-specific delta
+// have both been proved.
+
+struct payload_contract_state_t {
+    bool valid = false;
+    payload_contract_reason_t reason = payload_contract_reason_t::NONE;
+    uint32_t entry_index = 0xFFFFFFFFUL;
+    uint32_t capacity = 0U;
+    uint32_t count = 0U;
+    uint32_t data_begin = 0U;
+    uint32_t data_used = 0U;
+    uint32_t structural_fingerprint = 0U;
+    uint32_t semantic_fingerprint = 0U;
+    uint32_t element_count = 0U;
+    uint32_t key_off = 0U;
+    uint32_t key_len = 0U;
+    uint32_t val_off = 0U;
+    uint32_t val_len = 0U;
+    uint32_t kind = 0U;
+};
+
+static constexpr uint32_t PAYLOAD_CONTRACT_HASH_SEED = 0x811C9DC5UL;
+static constexpr uint32_t PAYLOAD_CONTRACT_HASH_PRIME = 0x01000193UL;
+
+static uint32_t payload_contract_hash_byte(uint32_t hash, uint8_t byte) {
+    hash ^= byte;
+    hash *= PAYLOAD_CONTRACT_HASH_PRIME;
+    return hash;
+}
+
+static uint32_t payload_contract_hash_u32(uint32_t hash, uint32_t value) {
+    hash = payload_contract_hash_byte(hash, (uint8_t)(value & 0xFFU));
+    hash = payload_contract_hash_byte(hash, (uint8_t)((value >> 8) & 0xFFU));
+    hash = payload_contract_hash_byte(hash, (uint8_t)((value >> 16) & 0xFFU));
+    hash = payload_contract_hash_byte(hash, (uint8_t)((value >> 24) & 0xFFU));
+    return hash;
+}
+
+static uint32_t payload_contract_hash_bytes(uint32_t hash,
+                                            const void* data,
+                                            size_t length) {
+    const uint8_t* bytes = reinterpret_cast<const uint8_t*>(data);
+    for (size_t i = 0U; i < length; ++i) {
+        hash = payload_contract_hash_byte(hash, bytes[i]);
+    }
+    return hash;
+}
+
+static uint32_t payload_contract_span_hash(const void* data, size_t length) {
+    uint32_t hash = payload_contract_hash_u32(PAYLOAD_CONTRACT_HASH_SEED,
+                                              (uint32_t)length);
+    return length != 0U
+        ? payload_contract_hash_bytes(hash, data, length)
+        : hash;
+}
+
+static bool payload_contract_span_readable_pure(const void* ptr, size_t len) {
+    if (len == 0U) return true;
+    size_t remaining = 0U;
+    uint32_t ignored_reason = 0U;
+    return payload_pointer_remaining(ptr, &remaining, &ignored_reason) &&
+           len <= remaining;
+}
+
+static bool payload_contract_heap_capacity_pure(const void* raw,
+                                                const void* expected_owner,
+                                                size_t minimum,
+                                                size_t maximum,
+                                                uint32_t* out_capacity) {
+    if (out_capacity) *out_capacity = 0U;
+    if (!raw || !expected_owner || !payload_heap_header_span_readable(raw)) {
+        return false;
+    }
+
+    uint32_t header[4] = {0U, 0U, 0U, 0U};
+    memcpy(header, raw, sizeof(header));
+    const uint32_t capacity = header[0];
+    const uint32_t owner_cookie = payload_heap_owner_cookie(expected_owner);
+    if ((capacity ^ header[1]) != 0xFFFFFFFFUL ||
+        (header[2] ^ header[3]) != 0xFFFFFFFFUL ||
+        header[2] != owner_cookie ||
+        capacity < minimum || capacity > maximum) {
+        return false;
+    }
+    if (!payload_contract_span_readable_pure(payload_heap_bytes(raw),
+                                             capacity)) {
+        return false;
+    }
+    if (out_capacity) *out_capacity = capacity;
+    return true;
+}
+
+static void payload_contract_record_state_failure(
+    payload_contract_phase_t phase,
+    uint32_t operation_id,
+    const void* self,
+    const payload_contract_state_t& state,
+    uint32_t generation,
+    uint32_t before_fingerprint) {
+    payload_contract_record(phase,
+                            state.reason,
+                            operation_id,
+                            self,
+                            nullptr,
+                            generation,
+                            state.entry_index,
+                            state.key_off,
+                            state.val_off,
+                            state.key_len,
+                            state.val_len,
+                            before_fingerprint,
+                            state.structural_fingerprint);
+}
+
+static void payload_contract_record_postcondition(
+    uint32_t operation_id,
+    const void* self,
+    const void* related,
+    uint32_t generation,
+    payload_contract_reason_t reason,
+    uint32_t entry_index,
+    uint32_t expected0,
+    uint32_t observed0,
+    uint32_t expected1,
+    uint32_t observed1,
+    uint32_t before_fingerprint,
+    uint32_t after_fingerprint) {
+    payload_contract_record(payload_contract_phase_t::POSTCONDITION,
+                            reason,
+                            operation_id,
+                            self,
+                            related,
+                            generation,
+                            entry_index,
+                            expected0,
+                            observed0,
+                            expected1,
+                            observed1,
+                            before_fingerprint,
+                            after_fingerprint);
+}
+
+static uint32_t payload_contract_hash_escaped(uint32_t hash,
+                                              const char* text,
+                                              size_t length) {
+    for (size_t i = 0U; i < length; ++i) {
+        const uint8_t ch = (uint8_t)text[i];
+        switch (ch) {
+            case '"':
+                hash = payload_contract_hash_byte(hash, '\\');
+                hash = payload_contract_hash_byte(hash, '"');
+                break;
+            case '\\':
+                hash = payload_contract_hash_byte(hash, '\\');
+                hash = payload_contract_hash_byte(hash, '\\');
+                break;
+            case '\b':
+                hash = payload_contract_hash_byte(hash, '\\');
+                hash = payload_contract_hash_byte(hash, 'b');
+                break;
+            case '\f':
+                hash = payload_contract_hash_byte(hash, '\\');
+                hash = payload_contract_hash_byte(hash, 'f');
+                break;
+            case '\n':
+                hash = payload_contract_hash_byte(hash, '\\');
+                hash = payload_contract_hash_byte(hash, 'n');
+                break;
+            case '\r':
+                hash = payload_contract_hash_byte(hash, '\\');
+                hash = payload_contract_hash_byte(hash, 'r');
+                break;
+            case '\t':
+                hash = payload_contract_hash_byte(hash, '\\');
+                hash = payload_contract_hash_byte(hash, 't');
+                break;
+            default:
+                if (ch < 0x20U) {
+                    hash = payload_contract_hash_byte(hash, '\\');
+                    hash = payload_contract_hash_byte(hash, 'u');
+                    hash = payload_contract_hash_byte(hash, '0');
+                    hash = payload_contract_hash_byte(hash, '0');
+                    hash = payload_contract_hash_byte(
+                        hash, (uint8_t)json_hex_digit((uint8_t)(ch >> 4)));
+                    hash = payload_contract_hash_byte(
+                        hash, (uint8_t)json_hex_digit((uint8_t)(ch & 0x0FU)));
+                } else {
+                    hash = payload_contract_hash_byte(hash, ch);
+                }
+                break;
+        }
+    }
+    return hash;
+}
+
+uint32_t Payload::_contract_semantic_hash(size_t entry_limit) const {
+    const Entry* entries = _entries();
+    const uint8_t* storage = _storage();
+    const size_t bounded = entry_limit < _count ? entry_limit : _count;
+    uint32_t hash = payload_contract_hash_u32(PAYLOAD_CONTRACT_HASH_SEED,
+                                              (uint32_t)bounded);
+    for (size_t i = 0U; i < bounded; ++i) {
+        const Entry& entry = entries[i];
+        hash = payload_contract_hash_u32(hash, entry.kind);
+        hash = payload_contract_hash_u32(hash, entry.key_len);
+        hash = payload_contract_hash_bytes(hash,
+                                           storage + entry.key_off,
+                                           entry.key_len);
+        hash = payload_contract_hash_u32(hash, entry.val_len);
+        hash = payload_contract_hash_bytes(hash,
+                                           storage + entry.val_off,
+                                           entry.val_len);
+    }
+    return hash;
+}
+
+uint32_t Payload::_json_hash_unchecked() const {
+    const Entry* entries = _entries();
+    const uint8_t* storage = _storage();
+    uint32_t hash = payload_contract_hash_u32(
+        PAYLOAD_CONTRACT_HASH_SEED, (uint32_t)_json_size());
+    hash = payload_contract_hash_byte(hash, '{');
+    for (size_t i = 0U; i < _count; ++i) {
+        const Entry& entry = entries[i];
+        if (i != 0U) hash = payload_contract_hash_byte(hash, ',');
+        hash = payload_contract_hash_byte(hash, '"');
+        hash = payload_contract_hash_escaped(
+            hash,
+            reinterpret_cast<const char*>(storage + entry.key_off),
+            entry.key_len);
+        hash = payload_contract_hash_byte(hash, '"');
+        hash = payload_contract_hash_byte(hash, ':');
+        if ((ValueKind)entry.kind == ValueKind::STRING) {
+            hash = payload_contract_hash_byte(hash, '"');
+            hash = payload_contract_hash_escaped(
+                hash,
+                reinterpret_cast<const char*>(storage + entry.val_off),
+                entry.val_len);
+            hash = payload_contract_hash_byte(hash, '"');
+        } else {
+            hash = payload_contract_hash_bytes(hash,
+                                               storage + entry.val_off,
+                                               entry.val_len);
+        }
+    }
+    return payload_contract_hash_byte(hash, '}');
+}
+
+bool Payload::_contract_inspect(payload_contract_state_t* out) const {
+    if (!out) return false;
+    *out = payload_contract_state_t{};
+
+    if (!_heap_guard_ok()) {
+        out->reason = payload_contract_reason_t::HEAP_GUARD;
+        return false;
+    }
+    if (!_count_guard_ok()) {
+        out->reason = payload_contract_reason_t::COUNT_GUARD;
+        return false;
+    }
+    if (!_data_begin_guard_ok()) {
+        out->reason = payload_contract_reason_t::DATA_BEGIN_GUARD;
+        return false;
+    }
+
+    const uint8_t* storage = nullptr;
+    uint32_t capacity = 0U;
+    if (_heap_block) {
+        if (!payload_contract_heap_capacity_pure(_heap_block,
+                                                 this,
+                                                 INLINE_STORAGE + 1U,
+                                                 STORAGE_MAX,
+                                                 &capacity)) {
+            out->reason = payload_contract_reason_t::HEAP_HEADER;
+            return false;
+        }
+        storage = payload_heap_bytes((const void*)_heap_block);
+    } else {
+        capacity = INLINE_STORAGE;
+        storage = _inline_storage;
+    }
+
+    out->capacity = capacity;
+    out->count = _count;
+    out->data_begin = _data_begin;
+    if (!storage ||
+        !payload_contract_span_readable_pure(storage, capacity)) {
+        out->reason = payload_contract_reason_t::STORAGE_UNREADABLE;
+        return false;
+    }
+    if (capacity == 0U || capacity > STORAGE_MAX) {
+        out->reason = payload_contract_reason_t::CAPACITY_RANGE;
+        return false;
+    }
+    if (_count > MAX_ENTRIES) {
+        out->reason = payload_contract_reason_t::COUNT_RANGE;
+        return false;
+    }
+    if (_data_begin > capacity || capacity - _data_begin > ARENA_MAX) {
+        out->reason = payload_contract_reason_t::DATA_RANGE;
+        return false;
+    }
+    out->data_used = capacity - _data_begin;
+
+    const size_t directory_bytes = (size_t)_count * sizeof(Entry);
+    if (directory_bytes > _data_begin) {
+        out->reason = payload_contract_reason_t::DIRECTORY_DATA_OVERLAP;
+        return false;
+    }
+
+    const Entry* entries = reinterpret_cast<const Entry*>(storage);
+    size_t expected_upper = capacity;
+    for (size_t i = 0U; i < _count; ++i) {
+        const Entry& entry = entries[i];
+        out->entry_index = (uint32_t)i;
+        out->key_off = entry.key_off;
+        out->key_len = entry.key_len;
+        out->val_off = entry.val_off;
+        out->val_len = entry.val_len;
+        out->kind = entry.kind;
+
+        if (entry.reserved != 0U ||
+            entry.kind < (uint8_t)ValueKind::STRING ||
+            entry.kind > (uint8_t)ValueKind::ARRAY) {
+            out->reason = payload_contract_reason_t::ENTRY_KIND;
+            return false;
+        }
+
+        const size_t key_end = (size_t)entry.key_off + entry.key_len;
+        const size_t val_end = (size_t)entry.val_off + entry.val_len;
+        if (entry.key_off < _data_begin || key_end >= capacity) {
+            out->reason = payload_contract_reason_t::ENTRY_KEY_RANGE;
+            return false;
+        }
+        if (entry.val_off < _data_begin || val_end >= capacity) {
+            out->reason = payload_contract_reason_t::ENTRY_VALUE_RANGE;
+            return false;
+        }
+        if (storage[key_end] != '\0') {
+            out->reason = payload_contract_reason_t::ENTRY_KEY_TERMINATOR;
+            return false;
+        }
+        if (storage[val_end] != '\0') {
+            out->reason = payload_contract_reason_t::ENTRY_VALUE_TERMINATOR;
+            return false;
+        }
+        if (key_end + 1U != (size_t)entry.val_off ||
+            val_end + 1U != expected_upper) {
+            out->reason = payload_contract_reason_t::PACKED_LAYOUT;
+            return false;
+        }
+
+        const char* key = reinterpret_cast<const char*>(storage + entry.key_off);
+        const char* value =
+            reinterpret_cast<const char*>(storage + entry.val_off);
+        if (!payload_utf8_valid(key, entry.key_len)) {
+            out->reason = payload_contract_reason_t::SEMANTIC_KEY;
+            return false;
+        }
+
+        bool value_ok = true;
+        switch ((ValueKind)entry.kind) {
+            case ValueKind::STRING:
+                value_ok = payload_utf8_valid(value, entry.val_len);
+                break;
+            case ValueKind::NUMBER:
+                value_ok = json_number_token_valid(value, entry.val_len);
+                break;
+            case ValueKind::BOOLEAN:
+                value_ok =
+                    (entry.val_len == 4U &&
+                     memcmp(value, "true", 4U) == 0) ||
+                    (entry.val_len == 5U &&
+                     memcmp(value, "false", 5U) == 0);
+                break;
+            case ValueKind::NIL:
+                value_ok = entry.val_len == 4U &&
+                           memcmp(value, "null", 4U) == 0;
+                break;
+            case ValueKind::OBJECT:
+                value_ok = json_validate_exact(
+                    reinterpret_cast<const uint8_t*>(value),
+                    entry.val_len,
+                    json_value_type_t::OBJECT);
+                break;
+            case ValueKind::ARRAY:
+                value_ok = json_validate_exact(
+                    reinterpret_cast<const uint8_t*>(value),
+                    entry.val_len,
+                    json_value_type_t::ARRAY);
+                break;
+            default:
+                value_ok = false;
+                break;
+        }
+        if (!value_ok) {
+            out->reason = payload_contract_reason_t::SEMANTIC_VALUE;
+            return false;
+        }
+        expected_upper = entry.key_off;
+    }
+
+    if (expected_upper != _data_begin) {
+        out->reason = payload_contract_reason_t::PACKED_LAYOUT;
+        return false;
+    }
+
+    uint32_t structural = PAYLOAD_CONTRACT_HASH_SEED;
+    structural = payload_contract_hash_u32(
+        structural, (uint32_t)(uintptr_t)_heap_block);
+    structural = payload_contract_hash_u32(structural, capacity);
+    structural = payload_contract_hash_u32(structural, _count);
+    structural = payload_contract_hash_u32(structural, _data_begin);
+    structural = payload_contract_hash_bytes(structural,
+                                             storage,
+                                             directory_bytes);
+    structural = payload_contract_hash_bytes(structural,
+                                             storage + _data_begin,
+                                             capacity - _data_begin);
+
+    out->entry_index = 0xFFFFFFFFUL;
+    out->key_off = 0U;
+    out->key_len = 0U;
+    out->val_off = 0U;
+    out->val_len = 0U;
+    out->kind = 0U;
+    out->structural_fingerprint = structural;
+    out->semantic_fingerprint = _contract_semantic_hash(_count);
+    out->valid = true;
+    out->reason = payload_contract_reason_t::NONE;
+    return true;
+}
+
+void Payload::_contract_accept(const payload_contract_state_t& state) {
+    payload_contract_boot_latch();
+    uint32_t generation = _contract_generation + 1U;
+    if (generation == 0U) generation = 1U;
+    _contract_generation = generation;
+    _contract_generation_guard = ~generation;
+    _contract_fingerprint = state.structural_fingerprint;
+    _contract_fingerprint_guard = ~state.structural_fingerprint;
+}
+
+bool Payload::_contract_begin(uint32_t operation_id,
+                              payload_contract_state_t* before) const {
+    g_payload_contract_checks++;
+    payload_contract_boot_latch();
+
+    const bool prior_stamp_valid =
+        (_contract_generation ^ _contract_generation_guard) ==
+            0xFFFFFFFFUL &&
+        (_contract_fingerprint ^ _contract_fingerprint_guard) ==
+            0xFFFFFFFFUL &&
+        _contract_generation != 0U;
+
+    payload_contract_state_t state{};
+    if (!_contract_inspect(&state)) {
+        payload_contract_record_state_failure(
+            prior_stamp_valid
+                ? payload_contract_phase_t::OBSERVED_DRIFT
+                : payload_contract_phase_t::PRE_INVARIANT,
+            operation_id,
+            this,
+            state,
+            _contract_generation,
+            _contract_fingerprint);
+        return false;
+    }
+
+    if ((_contract_generation ^ _contract_generation_guard) !=
+            0xFFFFFFFFUL ||
+        (_contract_fingerprint ^ _contract_fingerprint_guard) !=
+            0xFFFFFFFFUL ||
+        _contract_generation == 0U) {
+        payload_contract_record(payload_contract_phase_t::OBSERVED_DRIFT,
+                                payload_contract_reason_t::STAMP_GUARD,
+                                operation_id,
+                                this,
+                                nullptr,
+                                _contract_generation,
+                                0xFFFFFFFFUL,
+                                ~_contract_generation,
+                                _contract_generation_guard,
+                                ~_contract_fingerprint,
+                                _contract_fingerprint_guard,
+                                _contract_fingerprint,
+                                state.structural_fingerprint);
+        return false;
+    }
+
+    if (state.structural_fingerprint != _contract_fingerprint) {
+        payload_contract_record(payload_contract_phase_t::OBSERVED_DRIFT,
+                                payload_contract_reason_t::STAMP_MISMATCH,
+                                operation_id,
+                                this,
+                                nullptr,
+                                _contract_generation,
+                                0xFFFFFFFFUL,
+                                _contract_fingerprint,
+                                state.structural_fingerprint,
+                                state.semantic_fingerprint,
+                                state.count,
+                                _contract_fingerprint,
+                                state.structural_fingerprint);
+        return false;
+    }
+
+    if (before) *before = state;
+    return true;
+}
+
+bool Payload::contract_valid() const {
+    payload_contract_state_t state{};
+    if (!_contract_inspect(&state)) return false;
+    return (_contract_generation ^ _contract_generation_guard) ==
+               0xFFFFFFFFUL &&
+           (_contract_fingerprint ^ _contract_fingerprint_guard) ==
+               0xFFFFFFFFUL &&
+           _contract_generation != 0U &&
+           state.structural_fingerprint == _contract_fingerprint;
+}
+
+bool Payload::_contract_finish_preserve(
+    uint32_t operation_id,
+    const payload_contract_state_t& before,
+    size_t minimum_capacity) {
+    payload_contract_state_t after{};
+    if (!_contract_inspect(&after)) {
+        payload_contract_record_state_failure(
+            payload_contract_phase_t::POST_INVARIANT,
+            operation_id,
+            this,
+            after,
+            _contract_generation,
+            before.structural_fingerprint);
+        return false;
+    }
+    if (after.count != before.count ||
+        after.data_used != before.data_used ||
+        after.semantic_fingerprint != before.semantic_fingerprint ||
+        after.capacity < minimum_capacity) {
+        payload_contract_record_postcondition(
+            operation_id,
+            this,
+            nullptr,
+            _contract_generation,
+            payload_contract_reason_t::EXPECTED_PRESERVATION,
+            0xFFFFFFFFUL,
+            before.count,
+            after.count,
+            before.semantic_fingerprint,
+            after.semantic_fingerprint,
+            before.structural_fingerprint,
+            after.structural_fingerprint);
+        return false;
+    }
+    _contract_accept(after);
+    g_payload_contract_successful_mutations++;
+    return true;
+}
+
+bool Payload::_contract_finish_add(
+    uint32_t operation_id,
+    const payload_contract_state_t& before,
+    size_t key_len,
+    size_t value_len,
+    ValueKind kind,
+    uint32_t expected_key_hash,
+    uint32_t expected_value_hash) {
+    payload_contract_state_t after{};
+    if (!_contract_inspect(&after)) {
+        payload_contract_record_state_failure(
+            payload_contract_phase_t::POST_INVARIANT,
+            operation_id,
+            this,
+            after,
+            _contract_generation,
+            before.structural_fingerprint);
+        return false;
+    }
+
+    const uint32_t expected_count = before.count + 1U;
+    if (after.count != expected_count) {
+        payload_contract_record_postcondition(
+            operation_id, this, nullptr, _contract_generation,
+            payload_contract_reason_t::EXPECTED_COUNT,
+            before.count, expected_count, after.count,
+            0U, 0U,
+            before.structural_fingerprint,
+            after.structural_fingerprint);
+        return false;
+    }
+
+    const uint32_t expected_data_used =
+        before.data_used + (uint32_t)key_len + (uint32_t)value_len + 2U;
+    if (after.data_used != expected_data_used) {
+        payload_contract_record_postcondition(
+            operation_id, this, nullptr, _contract_generation,
+            payload_contract_reason_t::EXPECTED_DATA_DELTA,
+            before.count, expected_data_used, after.data_used,
+            before.data_used, after.data_used,
+            before.structural_fingerprint,
+            after.structural_fingerprint);
+        return false;
+    }
+
+    const uint32_t prefix_hash = _contract_semantic_hash(before.count);
+    if (prefix_hash != before.semantic_fingerprint) {
+        payload_contract_record_postcondition(
+            operation_id, this, nullptr, _contract_generation,
+            payload_contract_reason_t::EXPECTED_SEMANTIC_PREFIX,
+            before.count, before.semantic_fingerprint, prefix_hash,
+            0U, 0U,
+            before.structural_fingerprint,
+            after.structural_fingerprint);
+        return false;
+    }
+
+    const Entry& entry = _entries()[before.count];
+    const uint8_t* storage = _storage();
+    const uint32_t key_hash = payload_contract_span_hash(
+        storage + entry.key_off, entry.key_len);
+    const uint32_t value_hash = payload_contract_span_hash(
+        storage + entry.val_off, entry.val_len);
+    if (entry.key_len != key_len ||
+        entry.val_len != value_len ||
+        entry.kind != (uint8_t)kind ||
+        key_hash != expected_key_hash ||
+        value_hash != expected_value_hash) {
+        payload_contract_record_postcondition(
+            operation_id, this, nullptr, _contract_generation,
+            payload_contract_reason_t::EXPECTED_NEW_ENTRY,
+            before.count, expected_key_hash, key_hash,
+            expected_value_hash, value_hash,
+            before.structural_fingerprint,
+            after.structural_fingerprint);
+        return false;
+    }
+
+    _contract_accept(after);
+    g_payload_contract_successful_mutations++;
+    return true;
+}
+
+bool Payload::_contract_finish_clear(
+    uint32_t operation_id,
+    const payload_contract_state_t& before) {
+    payload_contract_state_t after{};
+    if (!_contract_inspect(&after)) {
+        payload_contract_record_state_failure(
+            payload_contract_phase_t::POST_INVARIANT,
+            operation_id,
+            this,
+            after,
+            _contract_generation,
+            before.structural_fingerprint);
+        return false;
+    }
+    if (after.count != 0U || after.data_used != 0U) {
+        payload_contract_record_postcondition(
+            operation_id, this, nullptr, _contract_generation,
+            payload_contract_reason_t::EXPECTED_EMPTY,
+            0xFFFFFFFFUL, 0U, after.count, 0U, after.data_used,
+            before.structural_fingerprint,
+            after.structural_fingerprint);
+        return false;
+    }
+    _contract_accept(after);
+    g_payload_contract_successful_mutations++;
+    return true;
+}
+
+bool Payload::_contract_finish_copy(
+    uint32_t operation_id,
+    const payload_contract_state_t& before,
+    uint32_t expected_semantic_hash) {
+    payload_contract_state_t after{};
+    if (!_contract_inspect(&after)) {
+        payload_contract_record_state_failure(
+            payload_contract_phase_t::POST_INVARIANT,
+            operation_id,
+            this,
+            after,
+            _contract_generation,
+            before.structural_fingerprint);
+        return false;
+    }
+    if (after.semantic_fingerprint != expected_semantic_hash) {
+        payload_contract_record_postcondition(
+            operation_id, this, nullptr, _contract_generation,
+            payload_contract_reason_t::EXPECTED_COPY,
+            0xFFFFFFFFUL,
+            expected_semantic_hash,
+            after.semantic_fingerprint,
+            before.semantic_fingerprint,
+            after.semantic_fingerprint,
+            before.structural_fingerprint,
+            after.structural_fingerprint);
+        return false;
+    }
+    _contract_accept(after);
+    g_payload_contract_successful_mutations++;
+    return true;
+}
+
+bool Payload::_contract_abort(uint32_t operation_id,
+                              const payload_contract_state_t& before) {
+    payload_contract_state_t after{};
+    if (!_contract_inspect(&after)) {
+        payload_contract_record_state_failure(
+            payload_contract_phase_t::POST_INVARIANT,
+            operation_id,
+            this,
+            after,
+            _contract_generation,
+            before.structural_fingerprint);
+        return false;
+    }
+    if (after.count != before.count ||
+        after.semantic_fingerprint != before.semantic_fingerprint) {
+        payload_contract_record_postcondition(
+            operation_id, this, nullptr, _contract_generation,
+            payload_contract_reason_t::EXPECTED_PRESERVATION,
+            0xFFFFFFFFUL,
+            before.count,
+            after.count,
+            before.semantic_fingerprint,
+            after.semantic_fingerprint,
+            before.structural_fingerprint,
+            after.structural_fingerprint);
+        return false;
+    }
+    _contract_accept(after);
+    return true;
+}
+
+uint32_t PayloadArray::_json_hash_unchecked() const {
+    return payload_contract_span_hash(_data(), _length);
+}
+
+bool PayloadArray::_contract_inspect(payload_contract_state_t* out) const {
+    if (!out) return false;
+    *out = payload_contract_state_t{};
+
+    if (!_heap_guard_ok()) {
+        out->reason = payload_contract_reason_t::HEAP_GUARD;
+        return false;
+    }
+    if (!_length_guard_ok()) {
+        out->reason = payload_contract_reason_t::COUNT_GUARD;
+        return false;
+    }
+
+    const char* data = nullptr;
+    uint32_t capacity = 0U;
+    if (_heap_block) {
+        if (!payload_contract_heap_capacity_pure(_heap_block,
+                                                 this,
+                                                 INLINE_STORAGE + 1U,
+                                                 STORAGE_MAX,
+                                                 &capacity)) {
+            out->reason = payload_contract_reason_t::HEAP_HEADER;
+            return false;
+        }
+        data = reinterpret_cast<const char*>(
+            payload_heap_bytes((const void*)_heap_block));
+    } else {
+        capacity = INLINE_STORAGE;
+        data = _inline_storage;
+    }
+
+    out->capacity = capacity;
+    out->count = _length;
+    out->data_used = _length;
+    if (!data || !payload_contract_span_readable_pure(data, capacity)) {
+        out->reason = payload_contract_reason_t::STORAGE_UNREADABLE;
+        return false;
+    }
+    if (capacity < 3U || capacity > STORAGE_MAX ||
+        _length < 2U || (size_t)_length >= capacity) {
+        out->reason = payload_contract_reason_t::CAPACITY_RANGE;
+        return false;
+    }
+    if (data[0] != '[' || data[_length - 1U] != ']' ||
+        data[_length] != '\0') {
+        out->reason = payload_contract_reason_t::PACKED_LAYOUT;
+        return false;
+    }
+    if (!json_validate_exact(reinterpret_cast<const uint8_t*>(data),
+                             _length,
+                             json_value_type_t::ARRAY)) {
+        out->reason = payload_contract_reason_t::SEMANTIC_VALUE;
+        return false;
+    }
+    size_t element_count = 0U;
+    if (!json_array_locate(data,
+                           _length,
+                           SIZE_MAX,
+                           &element_count,
+                           nullptr)) {
+        out->reason = payload_contract_reason_t::SEMANTIC_VALUE;
+        return false;
+    }
+
+    uint32_t structural = PAYLOAD_CONTRACT_HASH_SEED;
+    structural = payload_contract_hash_u32(
+        structural, (uint32_t)(uintptr_t)_heap_block);
+    structural = payload_contract_hash_u32(structural, capacity);
+    structural = payload_contract_hash_u32(structural, _length);
+    structural = payload_contract_hash_bytes(structural,
+                                             data,
+                                             (size_t)_length + 1U);
+
+    out->structural_fingerprint = structural;
+    out->semantic_fingerprint = payload_contract_span_hash(data, _length);
+    out->element_count = (uint32_t)element_count;
+    out->valid = true;
+    out->reason = payload_contract_reason_t::NONE;
+    return true;
+}
+
+void PayloadArray::_contract_accept(const payload_contract_state_t& state) {
+    payload_contract_boot_latch();
+    uint32_t generation = _contract_generation + 1U;
+    if (generation == 0U) generation = 1U;
+    _contract_generation = generation;
+    _contract_generation_guard = ~generation;
+    _contract_fingerprint = state.structural_fingerprint;
+    _contract_fingerprint_guard = ~state.structural_fingerprint;
+}
+
+bool PayloadArray::_contract_begin(uint32_t operation_id,
+                                   payload_contract_state_t* before) const {
+    g_payload_contract_checks++;
+    payload_contract_boot_latch();
+
+    const bool prior_stamp_valid =
+        (_contract_generation ^ _contract_generation_guard) ==
+            0xFFFFFFFFUL &&
+        (_contract_fingerprint ^ _contract_fingerprint_guard) ==
+            0xFFFFFFFFUL &&
+        _contract_generation != 0U;
+
+    payload_contract_state_t state{};
+    if (!_contract_inspect(&state)) {
+        payload_contract_record_state_failure(
+            prior_stamp_valid
+                ? payload_contract_phase_t::OBSERVED_DRIFT
+                : payload_contract_phase_t::PRE_INVARIANT,
+            operation_id,
+            this,
+            state,
+            _contract_generation,
+            _contract_fingerprint);
+        return false;
+    }
+    if ((_contract_generation ^ _contract_generation_guard) !=
+            0xFFFFFFFFUL ||
+        (_contract_fingerprint ^ _contract_fingerprint_guard) !=
+            0xFFFFFFFFUL ||
+        _contract_generation == 0U) {
+        payload_contract_record(payload_contract_phase_t::OBSERVED_DRIFT,
+                                payload_contract_reason_t::STAMP_GUARD,
+                                operation_id,
+                                this,
+                                nullptr,
+                                _contract_generation,
+                                0xFFFFFFFFUL,
+                                ~_contract_generation,
+                                _contract_generation_guard,
+                                ~_contract_fingerprint,
+                                _contract_fingerprint_guard,
+                                _contract_fingerprint,
+                                state.structural_fingerprint);
+        return false;
+    }
+    if (state.structural_fingerprint != _contract_fingerprint) {
+        payload_contract_record(payload_contract_phase_t::OBSERVED_DRIFT,
+                                payload_contract_reason_t::STAMP_MISMATCH,
+                                operation_id,
+                                this,
+                                nullptr,
+                                _contract_generation,
+                                0xFFFFFFFFUL,
+                                _contract_fingerprint,
+                                state.structural_fingerprint,
+                                state.semantic_fingerprint,
+                                state.element_count,
+                                _contract_fingerprint,
+                                state.structural_fingerprint);
+        return false;
+    }
+    if (before) *before = state;
+    return true;
+}
+
+bool PayloadArray::contract_valid() const {
+    payload_contract_state_t state{};
+    if (!_contract_inspect(&state)) return false;
+    return (_contract_generation ^ _contract_generation_guard) ==
+               0xFFFFFFFFUL &&
+           (_contract_fingerprint ^ _contract_fingerprint_guard) ==
+               0xFFFFFFFFUL &&
+           _contract_generation != 0U &&
+           state.structural_fingerprint == _contract_fingerprint;
+}
+
+bool PayloadArray::_contract_finish_preserve(
+    uint32_t operation_id,
+    const payload_contract_state_t& before,
+    size_t minimum_capacity) {
+    payload_contract_state_t after{};
+    if (!_contract_inspect(&after)) {
+        payload_contract_record_state_failure(
+            payload_contract_phase_t::POST_INVARIANT,
+            operation_id,
+            this,
+            after,
+            _contract_generation,
+            before.structural_fingerprint);
+        return false;
+    }
+    if (after.semantic_fingerprint != before.semantic_fingerprint ||
+        after.element_count != before.element_count ||
+        after.capacity < minimum_capacity) {
+        payload_contract_record_postcondition(
+            operation_id, this, nullptr, _contract_generation,
+            payload_contract_reason_t::EXPECTED_PRESERVATION,
+            0xFFFFFFFFUL,
+            before.semantic_fingerprint,
+            after.semantic_fingerprint,
+            before.element_count,
+            after.element_count,
+            before.structural_fingerprint,
+            after.structural_fingerprint);
+        return false;
+    }
+    _contract_accept(after);
+    g_payload_contract_successful_mutations++;
+    return true;
+}
+
+bool PayloadArray::_contract_finish_add(
+    uint32_t operation_id,
+    const payload_contract_state_t& before,
+    size_t object_size,
+    uint32_t object_hash) {
+    payload_contract_state_t after{};
+    if (!_contract_inspect(&after)) {
+        payload_contract_record_state_failure(
+            payload_contract_phase_t::POST_INVARIANT,
+            operation_id,
+            this,
+            after,
+            _contract_generation,
+            before.structural_fingerprint);
+        return false;
+    }
+
+    const uint32_t expected_elements = before.element_count + 1U;
+    const uint32_t comma = before.element_count == 0U ? 0U : 1U;
+    const uint32_t expected_length =
+        before.count + comma + (uint32_t)object_size;
+    if (after.element_count != expected_elements ||
+        after.count != expected_length) {
+        payload_contract_record_postcondition(
+            operation_id, this, nullptr, _contract_generation,
+            payload_contract_reason_t::EXPECTED_ARRAY_DELTA,
+            before.element_count,
+            expected_elements,
+            after.element_count,
+            expected_length,
+            after.count,
+            before.structural_fingerprint,
+            after.structural_fingerprint);
+        return false;
+    }
+
+    size_t count = 0U;
+    json_value_span_t span{};
+    if (!json_array_locate(_data(),
+                           _length,
+                           before.element_count,
+                           &count,
+                           &span) ||
+        span.type != json_value_type_t::OBJECT ||
+        payload_contract_span_hash(_data() + span.begin,
+                                   span.end - span.begin) != object_hash) {
+        payload_contract_record_postcondition(
+            operation_id, this, nullptr, _contract_generation,
+            payload_contract_reason_t::EXPECTED_NEW_ENTRY,
+            before.element_count,
+            object_hash,
+            span.end > span.begin
+                ? payload_contract_span_hash(_data() + span.begin,
+                                             span.end - span.begin)
+                : 0U,
+            (uint32_t)object_size,
+            span.end > span.begin ? (uint32_t)(span.end - span.begin) : 0U,
+            before.structural_fingerprint,
+            after.structural_fingerprint);
+        return false;
+    }
+
+    _contract_accept(after);
+    g_payload_contract_successful_mutations++;
+    return true;
+}
+
+bool PayloadArray::_contract_finish_clear(
+    uint32_t operation_id,
+    const payload_contract_state_t& before) {
+    payload_contract_state_t after{};
+    if (!_contract_inspect(&after)) {
+        payload_contract_record_state_failure(
+            payload_contract_phase_t::POST_INVARIANT,
+            operation_id,
+            this,
+            after,
+            _contract_generation,
+            before.structural_fingerprint);
+        return false;
+    }
+    if (after.count != 2U || after.element_count != 0U) {
+        payload_contract_record_postcondition(
+            operation_id, this, nullptr, _contract_generation,
+            payload_contract_reason_t::EXPECTED_EMPTY,
+            0xFFFFFFFFUL, 2U, after.count, 0U, after.element_count,
+            before.structural_fingerprint,
+            after.structural_fingerprint);
+        return false;
+    }
+    _contract_accept(after);
+    g_payload_contract_successful_mutations++;
+    return true;
+}
+
+bool PayloadArray::_contract_finish_copy(
+    uint32_t operation_id,
+    const payload_contract_state_t& before,
+    uint32_t expected_hash) {
+    payload_contract_state_t after{};
+    if (!_contract_inspect(&after)) {
+        payload_contract_record_state_failure(
+            payload_contract_phase_t::POST_INVARIANT,
+            operation_id,
+            this,
+            after,
+            _contract_generation,
+            before.structural_fingerprint);
+        return false;
+    }
+    if (after.semantic_fingerprint != expected_hash) {
+        payload_contract_record_postcondition(
+            operation_id, this, nullptr, _contract_generation,
+            payload_contract_reason_t::EXPECTED_COPY,
+            0xFFFFFFFFUL,
+            expected_hash,
+            after.semantic_fingerprint,
+            before.semantic_fingerprint,
+            after.semantic_fingerprint,
+            before.structural_fingerprint,
+            after.structural_fingerprint);
+        return false;
+    }
+    _contract_accept(after);
+    g_payload_contract_successful_mutations++;
+    return true;
+}
+
+bool PayloadArray::_contract_abort(
+    uint32_t operation_id,
+    const payload_contract_state_t& before) {
+    payload_contract_state_t after{};
+    if (!_contract_inspect(&after)) {
+        payload_contract_record_state_failure(
+            payload_contract_phase_t::POST_INVARIANT,
+            operation_id,
+            this,
+            after,
+            _contract_generation,
+            before.structural_fingerprint);
+        return false;
+    }
+    if (after.semantic_fingerprint != before.semantic_fingerprint ||
+        after.element_count != before.element_count) {
+        payload_contract_record_postcondition(
+            operation_id, this, nullptr, _contract_generation,
+            payload_contract_reason_t::EXPECTED_PRESERVATION,
+            0xFFFFFFFFUL,
+            before.semantic_fingerprint,
+            after.semantic_fingerprint,
+            before.element_count,
+            after.element_count,
+            before.structural_fingerprint,
+            after.structural_fingerprint);
+        return false;
+    }
+    _contract_accept(after);
+    return true;
+}
+
 // ============================================================================
 // Payload storage and lifecycle
 // ============================================================================
@@ -2263,11 +3853,27 @@ Payload::Payload()
       _count_guard(UINT16_MAX),
       _data_begin((uint16_t)INLINE_STORAGE),
       _data_begin_guard((uint16_t)~(uint16_t)INLINE_STORAGE),
+      _contract_generation(0U),
+      _contract_generation_guard(0xFFFFFFFFUL),
+      _contract_fingerprint(0U),
+      _contract_fingerprint_guard(0xFFFFFFFFUL),
       _inline_storage{} {
     payload_mark_constructed();
     payload_note_handler_context(PAYLOAD_OP_CTOR, this,
                                  &g_payload_handler_ctx_ctor);
     payload_flight_note(PAYLOAD_OP_CTOR, this, 0U);
+    payload_contract_state_t state{};
+    if (_contract_inspect(&state)) {
+        _contract_accept(state);
+    } else {
+        payload_contract_record_state_failure(
+            payload_contract_phase_t::POST_INVARIANT,
+            PAYLOAD_OP_CTOR,
+            this,
+            state,
+            0U,
+            0U);
+    }
 }
 
 Payload::~Payload() {
@@ -2283,19 +3889,49 @@ Payload::Payload(Payload&& other) noexcept
       _count_guard(UINT16_MAX),
       _data_begin((uint16_t)INLINE_STORAGE),
       _data_begin_guard((uint16_t)~(uint16_t)INLINE_STORAGE),
+      _contract_generation(0U),
+      _contract_generation_guard(0xFFFFFFFFUL),
+      _contract_fingerprint(0U),
+      _contract_fingerprint_guard(0xFFFFFFFFUL),
       _inline_storage{} {
     payload_mark_constructed();
     payload_note_handler_context(PAYLOAD_OP_CTOR, this,
                                  &g_payload_handler_ctx_ctor);
     payload_flight_note(PAYLOAD_OP_CTOR, this, 0U);
+    payload_contract_state_t empty{};
+    if (_contract_inspect(&empty)) _contract_accept(empty);
     _move_from(other);
 }
 
 Payload& Payload::operator=(Payload&& other) noexcept {
     if (this == &other) return *this;
-    if (!other._layout_ok(PAYLOAD_OP_MOVE_ASSIGN_SOURCE)) return *this;
+
+    payload_contract_state_t before{};
+    payload_contract_state_t source{};
+    if (!_contract_begin(PAYLOAD_OP_MOVE_FROM, &before)) return *this;
+    if (!other._contract_begin(PAYLOAD_OP_MOVE_ASSIGN_SOURCE, &source)) {
+        payload_contract_record(payload_contract_phase_t::PRECONDITION,
+                                payload_contract_reason_t::SOURCE_INVALID,
+                                PAYLOAD_OP_MOVE_ASSIGN_SOURCE,
+                                this,
+                                &other,
+                                _contract_generation,
+                                0xFFFFFFFFUL,
+                                1U,
+                                0U,
+                                0U,
+                                0U,
+                                before.structural_fingerprint,
+                                0U);
+        return *this;
+    }
+
+    const uint32_t expected_semantic = source.semantic_fingerprint;
     _release_storage();
     _move_from(other);
+    (void)_contract_finish_copy(PAYLOAD_OP_MOVE_FROM,
+                                before,
+                                expected_semantic);
     return *this;
 }
 
@@ -2306,28 +3942,62 @@ Payload::Payload(const Payload& other)
       _count_guard(UINT16_MAX),
       _data_begin((uint16_t)INLINE_STORAGE),
       _data_begin_guard((uint16_t)~(uint16_t)INLINE_STORAGE),
+      _contract_generation(0U),
+      _contract_generation_guard(0xFFFFFFFFUL),
+      _contract_fingerprint(0U),
+      _contract_fingerprint_guard(0xFFFFFFFFUL),
       _inline_storage{} {
     payload_mark_constructed();
     payload_note_handler_context(PAYLOAD_OP_CTOR, this,
                                  &g_payload_handler_ctx_ctor);
     payload_flight_note(PAYLOAD_OP_CTOR, this, 0U);
+    payload_contract_state_t empty{};
+    if (_contract_inspect(&empty)) _contract_accept(empty);
     if (!_copy_from(other)) {
-        payload_note_error(PAYLOAD_ERR_COPY_ALLOC_FAIL, PAYLOAD_OP_COPY_CTOR, this);
+        payload_note_error(PAYLOAD_ERR_COPY_ALLOC_FAIL,
+                           PAYLOAD_OP_COPY_CTOR,
+                           this);
     }
 }
 
 Payload& Payload::operator=(const Payload& other) {
     if (this == &other) return *this;
-    if (!other._layout_ok(PAYLOAD_OP_COPY_ASSIGN_SOURCE)) return *this;
 
-    Payload temp;
-    if (!temp._copy_from(other)) {
-        payload_note_error(PAYLOAD_ERR_COPY_ALLOC_FAIL, PAYLOAD_OP_COPY_ASSIGN, this);
+    payload_contract_state_t before{};
+    payload_contract_state_t source{};
+    if (!_contract_begin(PAYLOAD_OP_COPY_ASSIGN, &before)) return *this;
+    if (!other._contract_begin(PAYLOAD_OP_COPY_ASSIGN_SOURCE, &source)) {
+        payload_contract_record(payload_contract_phase_t::PRECONDITION,
+                                payload_contract_reason_t::SOURCE_INVALID,
+                                PAYLOAD_OP_COPY_ASSIGN_SOURCE,
+                                this,
+                                &other,
+                                _contract_generation,
+                                0xFFFFFFFFUL,
+                                1U,
+                                0U,
+                                0U,
+                                0U,
+                                before.structural_fingerprint,
+                                0U);
         return *this;
     }
 
+    Payload temp;
+    if (!temp._copy_from(other)) {
+        payload_note_error(PAYLOAD_ERR_COPY_ALLOC_FAIL,
+                           PAYLOAD_OP_COPY_ASSIGN,
+                           this);
+        (void)_contract_abort(PAYLOAD_OP_COPY_ASSIGN, before);
+        return *this;
+    }
+
+    const uint32_t expected_semantic = source.semantic_fingerprint;
     _release_storage();
     _move_from(temp);
+    (void)_contract_finish_copy(PAYLOAD_OP_COPY_ASSIGN,
+                                before,
+                                expected_semantic);
     return *this;
 }
 
@@ -2394,7 +4064,20 @@ void Payload::_reset_empty() {
     _set_count(0U);
     _set_data_begin((uint16_t)INLINE_STORAGE);
     memset(_inline_storage, 0, sizeof(_inline_storage));
+    payload_contract_state_t state{};
+    if (_contract_inspect(&state)) {
+        _contract_accept(state);
+    } else {
+        payload_contract_record_state_failure(
+            payload_contract_phase_t::POST_INVARIANT,
+            PAYLOAD_OP_CLEAR,
+            this,
+            state,
+            _contract_generation,
+            _contract_fingerprint);
+    }
 }
+
 
 void Payload::_release_storage() {
     if (!_heap_guard_ok()) {
@@ -2421,36 +4104,98 @@ void Payload::_release_storage() {
 }
 
 void Payload::_move_from(Payload& other) {
-    if (!other._layout_ok(PAYLOAD_OP_MOVE_FROM)) {
-        _reset_empty();
+    payload_contract_state_t before{};
+    payload_contract_state_t source{};
+    if (!_contract_begin(PAYLOAD_OP_MOVE_FROM, &before)) return;
+    if (!other._contract_begin(PAYLOAD_OP_MOVE_FROM, &source)) {
+        payload_contract_record(payload_contract_phase_t::PRECONDITION,
+                                payload_contract_reason_t::SOURCE_INVALID,
+                                PAYLOAD_OP_MOVE_FROM,
+                                this,
+                                &other,
+                                _contract_generation,
+                                0xFFFFFFFFUL,
+                                1U,
+                                0U,
+                                0U,
+                                0U,
+                                before.structural_fingerprint,
+                                0U);
         return;
     }
 
+    const uint32_t expected_semantic = source.semantic_fingerprint;
     if (other._heap_block) {
         if (!payload_heap_rebind_owner(other._heap_block,
                                        &other,
                                        this,
                                        INLINE_STORAGE + 1U,
                                        STORAGE_MAX)) {
-            _reset_empty();
+            payload_note_error(PAYLOAD_ERR_STORAGE_CORRUPT,
+                               PAYLOAD_OP_MOVE_FROM,
+                               this);
             return;
         }
         _set_heap_block(other._heap_block);
         _set_count(other._count);
         _set_data_begin(other._data_begin);
         other._reset_empty();
+    } else {
+        memcpy(_inline_storage, other._inline_storage, INLINE_STORAGE);
+        _set_heap_block(nullptr);
+        _set_count(other._count);
+        _set_data_begin(other._data_begin);
+        other._reset_empty();
+    }
+
+    if (!_contract_finish_copy(PAYLOAD_OP_MOVE_FROM,
+                               before,
+                               expected_semantic)) {
         return;
     }
 
-    memcpy(_inline_storage, other._inline_storage, INLINE_STORAGE);
-    _set_heap_block(nullptr);
-    _set_count(other._count);
-    _set_data_begin(other._data_begin);
-    other._reset_empty();
+    payload_contract_state_t source_after{};
+    if (!other._contract_inspect(&source_after) ||
+        source_after.count != 0U ||
+        source_after.data_used != 0U ||
+        !other.contract_valid()) {
+        payload_contract_record_postcondition(
+            PAYLOAD_OP_MOVE_FROM,
+            this,
+            &other,
+            _contract_generation,
+            payload_contract_reason_t::EXPECTED_MOVE_SOURCE_EMPTY,
+            0xFFFFFFFFUL,
+            0U,
+            source_after.count,
+            0U,
+            source_after.data_used,
+            before.structural_fingerprint,
+            source_after.structural_fingerprint);
+    }
 }
 
+
 bool Payload::_copy_from(const Payload& other) {
-    if (!other._layout_ok(PAYLOAD_OP_COPY_FROM)) return false;
+    payload_contract_state_t before{};
+    payload_contract_state_t source{};
+    if (!_contract_begin(PAYLOAD_OP_COPY_FROM, &before)) return false;
+    if (!other._contract_begin(PAYLOAD_OP_COPY_FROM, &source)) {
+        payload_contract_record(payload_contract_phase_t::PRECONDITION,
+                                payload_contract_reason_t::SOURCE_INVALID,
+                                PAYLOAD_OP_COPY_FROM,
+                                this,
+                                &other,
+                                _contract_generation,
+                                0xFFFFFFFFUL,
+                                1U,
+                                0U,
+                                0U,
+                                0U,
+                                before.structural_fingerprint,
+                                0U);
+        return false;
+    }
 
     const size_t source_data_used = other._data_used();
     const size_t required =
@@ -2461,10 +4206,18 @@ bool Payload::_copy_from(const Payload& other) {
         target_capacity = payload_growth_capacity(INLINE_STORAGE,
                                                   required,
                                                   STORAGE_MAX);
-        if (target_capacity == 0) return false;
+        if (target_capacity == 0U) {
+            payload_note_error(PAYLOAD_ERR_ARENA_LIMIT,
+                               PAYLOAD_OP_COPY_FROM,
+                               this);
+            return false;
+        }
         void* block = payload_heap_allocate(target_capacity, this);
         if (!block) {
             g_payload_arena_alloc_fail++;
+            payload_note_error(PAYLOAD_ERR_COPY_ALLOC_FAIL,
+                               PAYLOAD_OP_COPY_FROM,
+                               this);
             return false;
         }
         _set_heap_block(block);
@@ -2479,36 +4232,41 @@ bool Payload::_copy_from(const Payload& other) {
     }
 
     uint8_t* target = _storage();
-    const uint8_t* source = other._storage();
+    const uint8_t* source_storage = other._storage();
     const uint16_t target_data_begin =
         (uint16_t)(target_capacity - source_data_used);
     const int32_t shift =
         (int32_t)target_data_begin - (int32_t)other._data_begin;
 
-    if (other._count != 0) {
-        memcpy(target, source, (size_t)other._count * sizeof(Entry));
+    if (other._count != 0U) {
+        memcpy(target,
+               source_storage,
+               (size_t)other._count * sizeof(Entry));
         Entry* entries = reinterpret_cast<Entry*>(target);
-        for (size_t i = 0; i < other._count; ++i) {
-            entries[i].key_off = (uint16_t)((int32_t)entries[i].key_off + shift);
-            entries[i].val_off = (uint16_t)((int32_t)entries[i].val_off + shift);
+        for (size_t i = 0U; i < other._count; ++i) {
+            entries[i].key_off =
+                (uint16_t)((int32_t)entries[i].key_off + shift);
+            entries[i].val_off =
+                (uint16_t)((int32_t)entries[i].val_off + shift);
         }
     }
-    if (source_data_used != 0) {
+    if (source_data_used != 0U) {
         memcpy(target + target_data_begin,
-               source + other._data_begin,
+               source_storage + other._data_begin,
                source_data_used);
     }
 
     _set_count(other._count);
     _set_data_begin(target_data_begin);
-    return true;
+    return _contract_finish_copy(PAYLOAD_OP_COPY_FROM,
+                                 before,
+                                 source.semantic_fingerprint);
 }
 
+
 bool Payload::clear() {
-    if (!_self_ok(PAYLOAD_OP_CLEAR)) {
-        _release_storage();
-        return false;
-    }
+    payload_contract_state_t before{};
+    if (!_contract_begin(PAYLOAD_OP_CLEAR, &before)) return false;
 
     uint8_t* storage = _storage();
     const size_t entry_bytes = (size_t)_count * sizeof(Entry);
@@ -2518,8 +4276,9 @@ bool Payload::clear() {
 
     _set_count(0U);
     _set_data_begin((uint16_t)_capacity());
-    return true;
+    return _contract_finish_clear(PAYLOAD_OP_CLEAR, before);
 }
+
 
 bool Payload::empty() const {
     return !_self_ok(PAYLOAD_OP_EMPTY) || _count == 0;
@@ -2711,6 +4470,8 @@ bool Payload::_layout_ok(uint32_t operation_id) const {
 
 const Payload::Entry* Payload::_find(const char* key, size_t key_len) const {
     if (!_layout_ok(PAYLOAD_OP_FIND_LAYOUT)) return nullptr;
+    payload_contract_state_t observed{};
+    if (!_contract_begin(PAYLOAD_OP_FIND_LAYOUT, &observed)) return nullptr;
     const Entry* entries = _entries();
     const uint8_t* storage = _storage();
     for (size_t i = 0; i < _count; ++i) {
@@ -2745,18 +4506,23 @@ bool Payload::_ensure_room(size_t additional_entries,
                            size_t additional_data,
                            int32_t* data_shift) {
     if (data_shift) *data_shift = 0;
-    if (!_self_ok(PAYLOAD_OP_ENSURE_ROOM)) return false;
+    payload_contract_state_t before{};
+    if (!_contract_begin(PAYLOAD_OP_ENSURE_ROOM, &before)) return false;
 
     if (additional_entries > MAX_ENTRIES - _count) {
         g_payload_entry_overflow++;
-        payload_note_error(PAYLOAD_ERR_ENTRY_OVERFLOW, PAYLOAD_OP_ENSURE_ROOM_ENTRIES, this);
+        payload_note_error(PAYLOAD_ERR_ENTRY_OVERFLOW,
+                           PAYLOAD_OP_ENSURE_ROOM_ENTRIES,
+                           this);
         return false;
     }
 
     const size_t data_used = _data_used();
     if (additional_data > ARENA_MAX - data_used) {
         g_payload_arena_alloc_fail++;
-        payload_note_error(PAYLOAD_ERR_ARENA_LIMIT, PAYLOAD_OP_ENSURE_ROOM_DATA, this);
+        payload_note_error(PAYLOAD_ERR_ARENA_LIMIT,
+                           PAYLOAD_OP_ENSURE_ROOM_DATA,
+                           this);
         return false;
     }
 
@@ -2765,20 +4531,23 @@ bool Payload::_ensure_room(size_t additional_entries,
         new_count * sizeof(Entry) + data_used + additional_data;
     const size_t old_capacity = _capacity();
     if (required <= old_capacity) return true;
-    if (!_layout_ok(PAYLOAD_OP_ENSURE_ROOM_GROW)) return false;
 
     const size_t new_capacity =
         payload_growth_capacity(old_capacity, required, STORAGE_MAX);
-    if (new_capacity == 0 || new_capacity > UINT16_MAX) {
+    if (new_capacity == 0U || new_capacity > UINT16_MAX) {
         g_payload_arena_alloc_fail++;
-        payload_note_error(PAYLOAD_ERR_ARENA_LIMIT, PAYLOAD_OP_ENSURE_ROOM_CAPACITY, this);
+        payload_note_error(PAYLOAD_ERR_ARENA_LIMIT,
+                           PAYLOAD_OP_ENSURE_ROOM_CAPACITY,
+                           this);
         return false;
     }
 
     void* new_block = payload_heap_allocate(new_capacity, this);
     if (!new_block) {
         g_payload_arena_alloc_fail++;
-        payload_note_error(PAYLOAD_ERR_ARENA_ALLOC_FAIL, PAYLOAD_OP_ENSURE_ROOM_ALLOC, this);
+        payload_note_error(PAYLOAD_ERR_ARENA_ALLOC_FAIL,
+                           PAYLOAD_OP_ENSURE_ROOM_ALLOC,
+                           this);
         return false;
     }
     payload_flight_note(PAYLOAD_OP_ENSURE_ROOM_ALLOC, this, 0U);
@@ -2791,17 +4560,19 @@ bool Payload::_ensure_room(size_t additional_entries,
     const int32_t shift =
         (int32_t)new_data_begin - (int32_t)_data_begin;
 
-    if (_count != 0) {
-        memcpy(new_storage, old_storage, (size_t)_count * sizeof(Entry));
+    if (_count != 0U) {
+        memcpy(new_storage,
+               old_storage,
+               (size_t)_count * sizeof(Entry));
         Entry* copied_entries = reinterpret_cast<Entry*>(new_storage);
-        for (size_t i = 0; i < _count; ++i) {
+        for (size_t i = 0U; i < _count; ++i) {
             copied_entries[i].key_off =
                 (uint16_t)((int32_t)copied_entries[i].key_off + shift);
             copied_entries[i].val_off =
                 (uint16_t)((int32_t)copied_entries[i].val_off + shift);
         }
     }
-    if (data_used != 0) {
+    if (data_used != 0U) {
         memcpy(new_storage + new_data_begin,
                old_storage + _data_begin,
                data_used);
@@ -2812,7 +4583,8 @@ bool Payload::_ensure_room(size_t additional_entries,
     _set_heap_block(new_block);
     _set_data_begin(new_data_begin);
 
-    payload_note_heap_delta((int32_t)new_capacity - (int32_t)old_heap_capacity);
+    payload_note_heap_delta((int32_t)new_capacity -
+                            (int32_t)old_heap_capacity);
     g_payload_arena_realloc_count++;
     const size_t data_capacity =
         new_capacity - new_count * sizeof(Entry);
@@ -2821,11 +4593,16 @@ bool Payload::_ensure_room(size_t additional_entries,
     }
 
     if (old_block) {
-        payload_guarded_free(old_block, PAYLOAD_OP_ENSURE_ROOM_ALLOC, this);
+        payload_guarded_free(old_block,
+                             PAYLOAD_OP_ENSURE_ROOM_ALLOC,
+                             this);
     }
     if (data_shift) *data_shift = shift;
-    return true;
+    return _contract_finish_preserve(PAYLOAD_OP_ENSURE_ROOM,
+                                     before,
+                                     required);
 }
+
 
 bool Payload::_append_value(const char* key,
                             size_t key_len,
@@ -2839,35 +4616,59 @@ bool Payload::_append_value(const char* key,
                                 (uint32_t)kind,
                                 nullptr, 0U, 0U, 0U,
                                 false, false, 0U, 0U, 0, 0U, 0U);
-    if (!_self_ok(PAYLOAD_OP_APPEND_VALUE)) return false;
+
+    payload_contract_state_t before{};
+    if (!_contract_begin(PAYLOAD_OP_APPEND_VALUE, &before)) return false;
+
     payload_note_handler_context(PAYLOAD_OP_APPEND_VALUE, this,
                                  &g_payload_handler_ctx_mutate);
     payload_flight_note(PAYLOAD_OP_APPEND_VALUE, this, 0U);
-    if ((!key && key_len != 0) || (!value && value_len != 0)) return false;
+
+    if ((!key && key_len != 0U) || (!value && value_len != 0U)) {
+        payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER,
+                           PAYLOAD_OP_APPEND_INPUT_VALUE,
+                           this);
+        return false;
+    }
     if (key_len > UINT16_MAX || value_len > UINT16_MAX) {
-        payload_note_error(PAYLOAD_ERR_STRING_TOO_LONG, PAYLOAD_OP_APPEND_VALUE_LENGTH, this);
+        payload_note_error(PAYLOAD_ERR_STRING_TOO_LONG,
+                           PAYLOAD_OP_APPEND_VALUE_LENGTH,
+                           this);
         return false;
     }
-    if (key_len != 0 && !payload_span_readable(key, key_len, PAYLOAD_OP_APPEND_KEY)) {
+    if (key_len != 0U &&
+        !payload_span_readable(key, key_len, PAYLOAD_OP_APPEND_KEY)) {
         payload_note_bad_key(key);
-        payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER, PAYLOAD_OP_APPEND_KEY, this);
+        payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER,
+                           PAYLOAD_OP_APPEND_KEY,
+                           this);
         return false;
     }
-    if (value_len != 0 && !payload_span_readable(value, value_len, PAYLOAD_OP_APPEND_INPUT_VALUE)) {
+    if (value_len != 0U &&
+        !payload_span_readable(value,
+                               value_len,
+                               PAYLOAD_OP_APPEND_INPUT_VALUE)) {
         payload_note_bad_key(key);
-        payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER, PAYLOAD_OP_APPEND_INPUT_VALUE, this);
+        payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER,
+                           PAYLOAD_OP_APPEND_INPUT_VALUE,
+                           this);
         return false;
     }
     if (!payload_utf8_valid(key, key_len)) {
         g_payload_parse_error++;
         g_payload_json_invalid_utf8_key++;
-        payload_note_error(PAYLOAD_ERR_JSON_INVALID, PAYLOAD_OP_APPEND_VALUE_UTF8, this);
+        payload_note_error(PAYLOAD_ERR_JSON_INVALID,
+                           PAYLOAD_OP_APPEND_VALUE_UTF8,
+                           this);
         return false;
     }
-    if (kind == ValueKind::STRING && !payload_utf8_valid(value, value_len)) {
+    if (kind == ValueKind::STRING &&
+        !payload_utf8_valid(value, value_len)) {
         g_payload_parse_error++;
         g_payload_json_invalid_utf8_value++;
-        payload_note_error(PAYLOAD_ERR_JSON_INVALID, PAYLOAD_OP_APPEND_VALUE_UTF8, this);
+        payload_note_error(PAYLOAD_ERR_JSON_INVALID,
+                           PAYLOAD_OP_APPEND_VALUE_UTF8,
+                           this);
         return false;
     }
 
@@ -2905,9 +4706,19 @@ bool Payload::_append_value(const char* key,
     }
     if (!typed_value_valid) {
         g_payload_invalid_kind++;
-        payload_note_error(PAYLOAD_ERR_JSON_INVALID, PAYLOAD_OP_APPEND_VALUE, this);
+        payload_note_error(PAYLOAD_ERR_JSON_INVALID,
+                           PAYLOAD_OP_APPEND_VALUE,
+                           this);
         return false;
     }
+
+    // Take value-oriented evidence before any growth can relocate aliased
+    // input.  Postconditions compare the committed bytes to these hashes,
+    // never to a borrowed pointer whose lifetime may have changed.
+    const uint32_t expected_key_hash =
+        payload_contract_span_hash(key, key_len);
+    const uint32_t expected_value_hash =
+        payload_contract_span_hash(value, value_len);
 
     const uint8_t* old_storage = _storage();
     const size_t old_capacity = _capacity();
@@ -2915,15 +4726,15 @@ bool Payload::_append_value(const char* key,
 
     bool key_alias = false;
     bool value_alias = false;
-    size_t key_offset = 0;
-    size_t value_offset = 0;
+    size_t key_offset = 0U;
+    size_t value_offset = 0U;
     if (key) {
         const uintptr_t address = (uintptr_t)key;
         const uintptr_t begin = (uintptr_t)old_storage;
         const uintptr_t end = begin + old_capacity;
         if (address >= begin && address < end) {
             key_alias = true;
-            key_offset = (size_t)(address - (uintptr_t)old_storage);
+            key_offset = (size_t)(address - begin);
         }
     }
     if (value) {
@@ -2932,7 +4743,7 @@ bool Payload::_append_value(const char* key,
         const uintptr_t end = begin + old_capacity;
         if (address >= begin && address < end) {
             value_alias = true;
-            value_offset = (size_t)(address - (uintptr_t)old_storage);
+            value_offset = (size_t)(address - begin);
         }
     }
 
@@ -2943,7 +4754,8 @@ bool Payload::_append_value(const char* key,
                                 key, key_len,
                                 value, value_len,
                                 (uint32_t)kind,
-                                old_storage, old_capacity, old_data_begin, _count,
+                                old_storage, old_capacity,
+                                old_data_begin, _count,
                                 key_alias, value_alias,
                                 key_offset, value_offset,
                                 shift, 0U, 0U);
@@ -2953,10 +4765,12 @@ bool Payload::_append_value(const char* key,
                                     key, key_len,
                                     value, value_len,
                                     (uint32_t)kind,
-                                    _storage(), _capacity(), _data_begin, _count,
+                                    _storage(), _capacity(),
+                                    _data_begin, _count,
                                     key_alias, value_alias,
                                     key_offset, value_offset,
                                     shift, 0U, 0U);
+        _contract_abort(PAYLOAD_OP_APPEND_VALUE, before);
         return false;
     }
 
@@ -2979,23 +4793,23 @@ bool Payload::_append_value(const char* key,
                                 key, key_len,
                                 value, value_len,
                                 (uint32_t)kind,
-                                storage, _capacity(), _data_begin, _count,
+                                storage, _capacity(),
+                                _data_begin, _count,
                                 key_alias, value_alias,
                                 key_offset, value_offset,
                                 shift, 0U, 0U);
 
-    // V4.1 closes the validation-to-use gap. Growth, allocator activity, and
-    // internal alias relocation all occur before this point, so the spans are
-    // checked again at the exact custody boundary immediately preceding copy.
-    if (value_len != 0 &&
-        !payload_span_readable(value, value_len,
+    if (value_len != 0U &&
+        !payload_span_readable(value,
+                               value_len,
                                PAYLOAD_OP_APPEND_FINAL_VALUE_SPAN)) {
         payload_append_trace_record(payload_append_trace_stage_t::FINAL_SPAN_FAIL,
                                     this,
                                     key, key_len,
                                     value, value_len,
                                     (uint32_t)kind,
-                                    storage, _capacity(), _data_begin, _count,
+                                    storage, _capacity(),
+                                    _data_begin, _count,
                                     key_alias, value_alias,
                                     key_offset, value_offset,
                                     shift, 0U, 0U);
@@ -3003,17 +4817,20 @@ bool Payload::_append_value(const char* key,
         payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER,
                            PAYLOAD_OP_APPEND_FINAL_VALUE_SPAN,
                            this);
+        _contract_abort(PAYLOAD_OP_APPEND_VALUE, before);
         return false;
     }
-    if (key_len != 0 &&
-        !payload_span_readable(key, key_len,
+    if (key_len != 0U &&
+        !payload_span_readable(key,
+                               key_len,
                                PAYLOAD_OP_APPEND_FINAL_KEY_SPAN)) {
         payload_append_trace_record(payload_append_trace_stage_t::FINAL_SPAN_FAIL,
                                     this,
                                     key, key_len,
                                     value, value_len,
                                     (uint32_t)kind,
-                                    storage, _capacity(), _data_begin, _count,
+                                    storage, _capacity(),
+                                    _data_begin, _count,
                                     key_alias, value_alias,
                                     key_offset, value_offset,
                                     shift, 0U, 0U);
@@ -3021,6 +4838,26 @@ bool Payload::_append_value(const char* key,
         payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER,
                            PAYLOAD_OP_APPEND_FINAL_KEY_SPAN,
                            this);
+        _contract_abort(PAYLOAD_OP_APPEND_VALUE, before);
+        return false;
+    }
+
+    if ((size_t)_data_begin < additional_data) {
+        payload_contract_record(
+            payload_contract_phase_t::POST_INVARIANT,
+            payload_contract_reason_t::DIRECTORY_DATA_OVERLAP,
+            PAYLOAD_OP_APPEND_VALUE,
+            this,
+            nullptr,
+            _contract_generation,
+            before.count,
+            (uint32_t)additional_data,
+            _data_begin,
+            0U,
+            0U,
+            before.structural_fingerprint,
+            _contract_fingerprint);
+        _contract_abort(PAYLOAD_OP_APPEND_VALUE, before);
         return false;
     }
 
@@ -3034,18 +4871,22 @@ bool Payload::_append_value(const char* key,
                                 key, key_len,
                                 value, value_len,
                                 (uint32_t)kind,
-                                storage, _capacity(), _data_begin, _count,
+                                storage, _capacity(),
+                                _data_begin, _count,
                                 key_alias, value_alias,
                                 key_offset, value_offset,
                                 shift, key_off, val_off);
-    if (value_len != 0) memmove(storage + val_off, value, value_len);
+    if (value_len != 0U) {
+        memmove(storage + val_off, value, value_len);
+    }
     storage[(size_t)val_off + value_len] = '\0';
     payload_append_trace_record(payload_append_trace_stage_t::VALUE_COPY_DONE,
                                 this,
                                 key, key_len,
                                 value, value_len,
                                 (uint32_t)kind,
-                                storage, _capacity(), _data_begin, _count,
+                                storage, _capacity(),
+                                _data_begin, _count,
                                 key_alias, value_alias,
                                 key_offset, value_offset,
                                 shift, key_off, val_off);
@@ -3055,18 +4896,22 @@ bool Payload::_append_value(const char* key,
                                 key, key_len,
                                 value, value_len,
                                 (uint32_t)kind,
-                                storage, _capacity(), _data_begin, _count,
+                                storage, _capacity(),
+                                _data_begin, _count,
                                 key_alias, value_alias,
                                 key_offset, value_offset,
                                 shift, key_off, val_off);
-    if (key_len != 0) memmove(storage + key_off, key, key_len);
+    if (key_len != 0U) {
+        memmove(storage + key_off, key, key_len);
+    }
     storage[(size_t)key_off + key_len] = '\0';
     payload_append_trace_record(payload_append_trace_stage_t::KEY_COPY_DONE,
                                 this,
                                 key, key_len,
                                 value, value_len,
                                 (uint32_t)kind,
-                                storage, _capacity(), _data_begin, _count,
+                                storage, _capacity(),
+                                _data_begin, _count,
                                 key_alias, value_alias,
                                 key_offset, value_offset,
                                 shift, key_off, val_off);
@@ -3077,7 +4922,7 @@ bool Payload::_append_value(const char* key,
     entry.val_off = val_off;
     entry.val_len = (uint16_t)value_len;
     entry.kind = (uint8_t)kind;
-    entry.reserved = 0;
+    entry.reserved = 0U;
 
     _entries()[_count] = entry;
     _set_data_begin(key_off);
@@ -3087,10 +4932,21 @@ bool Payload::_append_value(const char* key,
                                 key, key_len,
                                 value, value_len,
                                 (uint32_t)kind,
-                                storage, _capacity(), _data_begin, _count,
+                                storage, _capacity(),
+                                _data_begin, _count,
                                 key_alias, value_alias,
                                 key_offset, value_offset,
                                 shift, key_off, val_off);
+
+    if (!_contract_finish_add(PAYLOAD_OP_APPEND_VALUE,
+                              before,
+                              key_len,
+                              value_len,
+                              kind,
+                              expected_key_hash,
+                              expected_value_hash)) {
+        return false;
+    }
 
     if (_count > g_payload_entry_high_water_global) {
         g_payload_entry_high_water_global = _count;
@@ -3104,50 +4960,107 @@ bool Payload::_append_value(const char* key,
     }
     return true;
 }
+
 bool Payload::_append_value_writer(const char* key,
                                    size_t key_len,
                                    size_t value_len,
                                    ValueKind kind,
                                    const Payload* object_value,
                                    const PayloadArray* array_value) {
-    if (!_self_ok(PAYLOAD_OP_APPEND_WRITER)) return false;
+    payload_contract_state_t before{};
+    if (!_contract_begin(PAYLOAD_OP_APPEND_WRITER, &before)) return false;
+
     payload_note_handler_context(PAYLOAD_OP_APPEND_WRITER, this,
                                  &g_payload_handler_ctx_mutate);
     payload_flight_note(PAYLOAD_OP_APPEND_WRITER, this, 0U);
-    if ((!object_value && !array_value) || (object_value && array_value)) return false;
-    if (key_len > UINT16_MAX || value_len > UINT16_MAX) {
-        payload_note_error(PAYLOAD_ERR_STRING_TOO_LONG, PAYLOAD_OP_APPEND_WRITER_LENGTH, this);
+
+    if ((!object_value && !array_value) ||
+        (object_value && array_value)) {
+        payload_note_error(PAYLOAD_ERR_INVALID_CHILD,
+                           PAYLOAD_OP_APPEND_WRITER,
+                           this);
         return false;
     }
-    if (key_len != 0 && !payload_span_readable(key, key_len, PAYLOAD_OP_APPEND_WRITER_KEY)) {
+    if ((object_value && !object_value->contract_valid()) ||
+        (array_value && !array_value->contract_valid())) {
+        payload_contract_record(payload_contract_phase_t::PRECONDITION,
+                                payload_contract_reason_t::SOURCE_INVALID,
+                                PAYLOAD_OP_APPEND_WRITER,
+                                this,
+                                object_value
+                                    ? static_cast<const void*>(object_value)
+                                    : static_cast<const void*>(array_value),
+                                _contract_generation,
+                                0xFFFFFFFFUL,
+                                1U,
+                                0U,
+                                0U,
+                                0U,
+                                before.structural_fingerprint,
+                                0U);
+        return false;
+    }
+    if (key_len > UINT16_MAX || value_len > UINT16_MAX) {
+        payload_note_error(PAYLOAD_ERR_STRING_TOO_LONG,
+                           PAYLOAD_OP_APPEND_WRITER_LENGTH,
+                           this);
+        return false;
+    }
+    if (key_len != 0U &&
+        !payload_span_readable(key,
+                               key_len,
+                               PAYLOAD_OP_APPEND_WRITER_KEY)) {
         payload_note_bad_key(key);
-        payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER, PAYLOAD_OP_APPEND_WRITER_KEY, this);
+        payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER,
+                           PAYLOAD_OP_APPEND_WRITER_KEY,
+                           this);
         return false;
     }
     if (!payload_utf8_valid(key, key_len)) {
         g_payload_parse_error++;
         g_payload_json_invalid_utf8_key++;
-        payload_note_error(PAYLOAD_ERR_JSON_INVALID, PAYLOAD_OP_APPEND_WRITER_UTF8, this);
+        payload_note_error(PAYLOAD_ERR_JSON_INVALID,
+                           PAYLOAD_OP_APPEND_WRITER_UTF8,
+                           this);
         return false;
     }
+
+    const size_t actual_value_len = object_value
+        ? object_value->_json_size()
+        : array_value->_json_size();
+    if (actual_value_len == 0U || actual_value_len != value_len) {
+        payload_note_error(PAYLOAD_ERR_INVALID_CHILD,
+                           PAYLOAD_OP_APPEND_WRITER_LENGTH,
+                           this);
+        return false;
+    }
+    const uint32_t expected_key_hash =
+        payload_contract_span_hash(key, key_len);
+    const uint32_t expected_value_hash = object_value
+        ? object_value->_json_hash_unchecked()
+        : array_value->_json_hash_unchecked();
+
     const uint8_t* old_storage = _storage();
     const size_t old_capacity = _capacity();
     const size_t old_data_begin = _data_begin;
     bool key_alias = false;
-    size_t key_offset = 0;
+    size_t key_offset = 0U;
     if (key) {
         const uintptr_t address = (uintptr_t)key;
         const uintptr_t begin = (uintptr_t)old_storage;
         const uintptr_t end = begin + old_capacity;
         if (address >= begin && address < end) {
             key_alias = true;
-            key_offset = (size_t)(address - (uintptr_t)old_storage);
+            key_offset = (size_t)(address - begin);
         }
     }
 
     const size_t additional_data = key_len + 1U + value_len + 1U;
     int32_t shift = 0;
-    if (!_ensure_room(1U, additional_data, &shift)) return false;
+    if (!_ensure_room(1U, additional_data, &shift)) {
+        _contract_abort(PAYLOAD_OP_APPEND_WRITER, before);
+        return false;
+    }
 
     uint8_t* storage = _storage();
     if (key_alias) {
@@ -3157,12 +5070,77 @@ bool Payload::_append_value_writer(const char* key,
         key = reinterpret_cast<const char*>(storage + remapped);
     }
 
+    if (key_len != 0U &&
+        !payload_span_readable(key,
+                               key_len,
+                               PAYLOAD_OP_APPEND_FINAL_KEY_SPAN)) {
+        payload_note_bad_key(key);
+        payload_note_error(PAYLOAD_ERR_BAD_STRING_POINTER,
+                           PAYLOAD_OP_APPEND_FINAL_KEY_SPAN,
+                           this);
+        _contract_abort(PAYLOAD_OP_APPEND_WRITER, before);
+        return false;
+    }
+
+    // The child remains a value source until its complete JSON image has been
+    // written.  Re-prove it after parent growth, then compare its hash to the
+    // pre-growth value-oriented snapshot.
+    const bool child_still_valid = object_value
+        ? object_value->contract_valid()
+        : array_value->contract_valid();
+    const size_t child_size_now = object_value
+        ? object_value->_json_size()
+        : array_value->_json_size();
+    const uint32_t child_hash_now = object_value
+        ? object_value->_json_hash_unchecked()
+        : array_value->_json_hash_unchecked();
+    if (!child_still_valid ||
+        child_size_now != value_len ||
+        child_hash_now != expected_value_hash) {
+        payload_contract_record(payload_contract_phase_t::PRECONDITION,
+                                payload_contract_reason_t::SOURCE_INVALID,
+                                PAYLOAD_OP_APPEND_WRITER,
+                                this,
+                                object_value
+                                    ? static_cast<const void*>(object_value)
+                                    : static_cast<const void*>(array_value),
+                                _contract_generation,
+                                0xFFFFFFFFUL,
+                                expected_value_hash,
+                                child_hash_now,
+                                (uint32_t)value_len,
+                                (uint32_t)child_size_now,
+                                before.structural_fingerprint,
+                                _contract_fingerprint);
+        _contract_abort(PAYLOAD_OP_APPEND_WRITER, before);
+        return false;
+    }
+
+    if ((size_t)_data_begin < additional_data) {
+        payload_contract_record(
+            payload_contract_phase_t::POST_INVARIANT,
+            payload_contract_reason_t::DIRECTORY_DATA_OVERLAP,
+            PAYLOAD_OP_APPEND_WRITER,
+            this,
+            nullptr,
+            _contract_generation,
+            before.count,
+            (uint32_t)additional_data,
+            _data_begin,
+            0U,
+            0U,
+            before.structural_fingerprint,
+            _contract_fingerprint);
+        _contract_abort(PAYLOAD_OP_APPEND_WRITER, before);
+        return false;
+    }
+
     const uint16_t val_off =
         (uint16_t)(_data_begin - (uint16_t)(value_len + 1U));
     const uint16_t key_off =
         (uint16_t)(val_off - (uint16_t)(key_len + 1U));
 
-    size_t written = 0;
+    size_t written = 0U;
     if (object_value) {
         written = object_value->_write_json_unchecked(
             reinterpret_cast<char*>(storage + val_off));
@@ -3174,11 +5152,14 @@ bool Payload::_append_value_writer(const char* key,
         payload_note_error(PAYLOAD_ERR_SERIALIZE_OVERFLOW,
                            PAYLOAD_OP_APPEND_WRITER_WRITE,
                            this);
+        _contract_abort(PAYLOAD_OP_APPEND_WRITER, before);
         return false;
     }
     storage[(size_t)val_off + value_len] = '\0';
 
-    if (key_len != 0) memmove(storage + key_off, key, key_len);
+    if (key_len != 0U) {
+        memmove(storage + key_off, key, key_len);
+    }
     storage[(size_t)key_off + key_len] = '\0';
 
     Entry entry{};
@@ -3187,11 +5168,21 @@ bool Payload::_append_value_writer(const char* key,
     entry.val_off = val_off;
     entry.val_len = (uint16_t)value_len;
     entry.kind = (uint8_t)kind;
-    entry.reserved = 0;
+    entry.reserved = 0U;
 
     _entries()[_count] = entry;
     _set_data_begin(key_off);
     _set_count((uint16_t)(_count + 1U));
+
+    if (!_contract_finish_add(PAYLOAD_OP_APPEND_WRITER,
+                              before,
+                              key_len,
+                              value_len,
+                              kind,
+                              expected_key_hash,
+                              expected_value_hash)) {
+        return false;
+    }
 
     if (_count > g_payload_entry_high_water_global) {
         g_payload_entry_high_water_global = _count;
@@ -3205,6 +5196,7 @@ bool Payload::_append_value_writer(const char* key,
     }
     return true;
 }
+
 
 static bool payload_key_length(const char* key, size_t* out_len) {
     if (!key) {
@@ -3732,6 +5724,8 @@ bool Payload::add_raw_object(const char* key, const char* raw_json_object) {
 
 size_t Payload::_json_size() const {
     if (!_layout_ok(PAYLOAD_OP_JSON_SIZE)) return 0;
+    payload_contract_state_t observed{};
+    if (!_contract_begin(PAYLOAD_OP_JSON_SIZE, &observed)) return 0;
 
     size_t total = 2U;  // {}
     const Entry* entries = _entries();
@@ -3944,25 +5938,32 @@ static uint8_t payload_kind_code_from_json_type(json_value_type_t type) {
 }
 
 bool Payload::parseJSON(const uint8_t* data, size_t len) {
+    payload_contract_state_t before{};
+    if (!_contract_begin(PAYLOAD_OP_PARSEJSON_DATA, &before)) return false;
+
     payload_note_handler_context(PAYLOAD_OP_PARSEJSON_DATA, this,
                                  &g_payload_handler_ctx_mutate);
     payload_flight_note(PAYLOAD_OP_PARSEJSON_DATA, this, 0U);
     if (!data || len < 2U || len > ARENA_MAX ||
         !payload_span_readable(data, len, PAYLOAD_OP_PARSEJSON_DATA)) {
-        clear();
+        (void)clear();
         g_payload_parse_error++;
         g_payload_json_invalid_syntax++;
-            payload_note_error(PAYLOAD_ERR_PARSE_ERROR, PAYLOAD_OP_PARSEJSON_DATA, this);
+        payload_note_error(PAYLOAD_ERR_PARSE_ERROR,
+                           PAYLOAD_OP_PARSEJSON_DATA,
+                           this);
         return false;
     }
 
     json_cursor_t c{data, len, 0};
     json_skip_ws(c);
     if (c.pos >= c.len || c.data[c.pos] != '{') {
-        clear();
+        (void)clear();
         g_payload_parse_error++;
         g_payload_json_invalid_syntax++;
-            payload_note_error(PAYLOAD_ERR_PARSE_ERROR, PAYLOAD_OP_PARSEJSON_OPEN, this);
+        payload_note_error(PAYLOAD_ERR_PARSE_ERROR,
+                           PAYLOAD_OP_PARSEJSON_OPEN,
+                           this);
         return false;
     }
     ++c.pos;
@@ -3973,44 +5974,71 @@ bool Payload::parseJSON(const uint8_t* data, size_t len) {
         ++c.pos;
         json_skip_ws(c);
         if (c.pos != c.len) {
-            clear();
+            (void)clear();
             g_payload_parse_error++;
             g_payload_json_invalid_syntax++;
-            payload_note_error(PAYLOAD_ERR_PARSE_ERROR, PAYLOAD_OP_PARSEJSON_TRAILING, this);
+            payload_note_error(PAYLOAD_ERR_PARSE_ERROR,
+                               PAYLOAD_OP_PARSEJSON_TRAILING,
+                               this);
             return false;
         }
+
+        payload_contract_state_t parsed_state{};
+        if (!parsed._contract_inspect(&parsed_state)) {
+            payload_contract_record_state_failure(
+                payload_contract_phase_t::POST_INVARIANT,
+                PAYLOAD_OP_PARSEJSON_DATA,
+                &parsed,
+                parsed_state,
+                parsed._contract_generation,
+                parsed._contract_fingerprint);
+            return false;
+        }
+        const uint32_t expected_semantic =
+            parsed_state.semantic_fingerprint;
         *this = static_cast<Payload&&>(parsed);
-        return true;
+        return _contract_finish_copy(PAYLOAD_OP_PARSEJSON_DATA,
+                                     before,
+                                     expected_semantic);
     }
 
     while (c.pos < c.len) {
-        size_t key_begin = 0;
-        size_t key_end = 0;
-        size_t key_decoded_len = 0;
-        if (!json_scan_string(c, &key_begin, &key_end, &key_decoded_len)) {
-            clear();
+        size_t key_begin = 0U;
+        size_t key_end = 0U;
+        size_t key_decoded_len = 0U;
+        if (!json_scan_string(c,
+                              &key_begin,
+                              &key_end,
+                              &key_decoded_len)) {
+            (void)clear();
             g_payload_parse_error++;
             g_payload_json_invalid_syntax++;
-            payload_note_error(PAYLOAD_ERR_PARSE_ERROR, PAYLOAD_OP_PARSEJSON_KEY, this);
+            payload_note_error(PAYLOAD_ERR_PARSE_ERROR,
+                               PAYLOAD_OP_PARSEJSON_KEY,
+                               this);
             return false;
         }
 
         json_skip_ws(c);
         if (c.pos >= c.len || c.data[c.pos] != ':') {
-            clear();
+            (void)clear();
             g_payload_parse_error++;
             g_payload_json_invalid_syntax++;
-            payload_note_error(PAYLOAD_ERR_PARSE_ERROR, PAYLOAD_OP_PARSEJSON_COLON, this);
+            payload_note_error(PAYLOAD_ERR_PARSE_ERROR,
+                               PAYLOAD_OP_PARSEJSON_COLON,
+                               this);
             return false;
         }
         ++c.pos;
 
         json_value_span_t value;
         if (!json_scan_value(c, 1U, &value)) {
-            clear();
+            (void)clear();
             g_payload_parse_error++;
             g_payload_json_invalid_syntax++;
-            payload_note_error(PAYLOAD_ERR_PARSE_ERROR, PAYLOAD_OP_PARSEJSON_VALUE, this);
+            payload_note_error(PAYLOAD_ERR_PARSE_ERROR,
+                               PAYLOAD_OP_PARSEJSON_VALUE,
+                               this);
             return false;
         }
 
@@ -4018,54 +6046,92 @@ bool Payload::parseJSON(const uint8_t* data, size_t len) {
             value.type == json_value_type_t::STRING
                 ? value.decoded_length
                 : value.end - value.begin;
-        if (key_decoded_len > UINT16_MAX || value_stored_len > UINT16_MAX) {
-            clear();
+        if (key_decoded_len > UINT16_MAX ||
+            value_stored_len > UINT16_MAX) {
+            (void)clear();
             g_payload_parse_error++;
-            payload_note_error(PAYLOAD_ERR_ARENA_LIMIT, PAYLOAD_OP_PARSEJSON_LENGTH, this);
+            payload_note_error(PAYLOAD_ERR_ARENA_LIMIT,
+                               PAYLOAD_OP_PARSEJSON_LENGTH,
+                               this);
+            return false;
+        }
+
+        payload_contract_state_t parsed_before{};
+        if (!parsed._contract_begin(PAYLOAD_OP_PARSEJSON_DATA,
+                                    &parsed_before)) {
+            (void)clear();
             return false;
         }
 
         const size_t additional_data =
             key_decoded_len + 1U + value_stored_len + 1U;
         if (!parsed._ensure_room(1U, additional_data, nullptr)) {
-            clear();
+            (void)clear();
             g_payload_parse_error++;
-            payload_note_error(PAYLOAD_ERR_ARENA_ALLOC_FAIL, PAYLOAD_OP_PARSEJSON_RESERVE, this);
+            payload_note_error(PAYLOAD_ERR_ARENA_ALLOC_FAIL,
+                               PAYLOAD_OP_PARSEJSON_RESERVE,
+                               this);
             return false;
         }
 
         uint8_t* storage = parsed._storage();
+        if ((size_t)parsed._data_begin < additional_data) {
+            payload_contract_record(
+                payload_contract_phase_t::POST_INVARIANT,
+                payload_contract_reason_t::DIRECTORY_DATA_OVERLAP,
+                PAYLOAD_OP_PARSEJSON_DATA,
+                &parsed,
+                nullptr,
+                parsed._contract_generation,
+                parsed_before.count,
+                (uint32_t)additional_data,
+                parsed._data_begin,
+                0U,
+                0U,
+                parsed_before.structural_fingerprint,
+                parsed._contract_fingerprint);
+            (void)clear();
+            return false;
+        }
+
         const uint16_t val_off =
-            (uint16_t)(parsed._data_begin - (uint16_t)(value_stored_len + 1U));
+            (uint16_t)(parsed._data_begin -
+                       (uint16_t)(value_stored_len + 1U));
         const uint16_t key_off =
-            (uint16_t)(val_off - (uint16_t)(key_decoded_len + 1U));
+            (uint16_t)(val_off -
+                       (uint16_t)(key_decoded_len + 1U));
 
         if (!json_decode_string(data,
                                 key_begin,
                                 key_end,
                                 reinterpret_cast<char*>(storage + key_off),
                                 key_decoded_len)) {
-            clear();
+            (void)clear();
             g_payload_parse_error++;
             g_payload_json_decode_fail++;
-            payload_note_error(PAYLOAD_ERR_PARSE_ERROR, PAYLOAD_OP_PARSEJSON_KEY_DECODE, this);
+            payload_note_error(PAYLOAD_ERR_PARSE_ERROR,
+                               PAYLOAD_OP_PARSEJSON_KEY_DECODE,
+                               this);
             return false;
         }
 
         if (value.type == json_value_type_t::STRING) {
-            if (!json_decode_string(data,
-                                    value.begin,
-                                    value.end,
-                                    reinterpret_cast<char*>(storage + val_off),
-                                    value.decoded_length)) {
-                clear();
+            if (!json_decode_string(
+                    data,
+                    value.begin,
+                    value.end,
+                    reinterpret_cast<char*>(storage + val_off),
+                    value.decoded_length)) {
+                (void)clear();
                 g_payload_parse_error++;
                 g_payload_json_decode_fail++;
-            payload_note_error(PAYLOAD_ERR_PARSE_ERROR, PAYLOAD_OP_PARSEJSON_VALUE_DECODE, this);
+                payload_note_error(PAYLOAD_ERR_PARSE_ERROR,
+                                   PAYLOAD_OP_PARSEJSON_VALUE_DECODE,
+                                   this);
                 return false;
             }
         } else {
-            if (value_stored_len != 0) {
+            if (value_stored_len != 0U) {
                 memcpy(storage + val_off,
                        data + value.begin,
                        value_stored_len);
@@ -4073,17 +6139,38 @@ bool Payload::parseJSON(const uint8_t* data, size_t len) {
             storage[(size_t)val_off + value_stored_len] = '\0';
         }
 
+        const uint8_t kind_code =
+            payload_kind_code_from_json_type(value.type);
+        const ValueKind stored_kind = (ValueKind)kind_code;
+        const uint32_t expected_key_hash =
+            payload_contract_span_hash(storage + key_off,
+                                       key_decoded_len);
+        const uint32_t expected_value_hash =
+            payload_contract_span_hash(storage + val_off,
+                                       value_stored_len);
+
         Entry entry{};
         entry.key_off = key_off;
         entry.key_len = (uint16_t)key_decoded_len;
         entry.val_off = val_off;
         entry.val_len = (uint16_t)value_stored_len;
-        entry.kind = payload_kind_code_from_json_type(value.type);
-        entry.reserved = 0;
+        entry.kind = kind_code;
+        entry.reserved = 0U;
 
         parsed._entries()[parsed._count] = entry;
         parsed._set_data_begin(key_off);
         parsed._set_count((uint16_t)(parsed._count + 1U));
+
+        if (!parsed._contract_finish_add(PAYLOAD_OP_PARSEJSON_DATA,
+                                         parsed_before,
+                                         key_decoded_len,
+                                         value_stored_len,
+                                         stored_kind,
+                                         expected_key_hash,
+                                         expected_value_hash)) {
+            (void)clear();
+            return false;
+        }
 
         if (parsed._count > g_payload_entry_high_water_global) {
             g_payload_entry_high_water_global = parsed._count;
@@ -4098,40 +6185,65 @@ bool Payload::parseJSON(const uint8_t* data, size_t len) {
 
         json_skip_ws(c);
         if (c.pos >= c.len) {
-            clear();
+            (void)clear();
             g_payload_parse_error++;
             g_payload_json_invalid_syntax++;
-            payload_note_error(PAYLOAD_ERR_PARSE_ERROR, PAYLOAD_OP_PARSEJSON_EOF, this);
+            payload_note_error(PAYLOAD_ERR_PARSE_ERROR,
+                               PAYLOAD_OP_PARSEJSON_EOF,
+                               this);
             return false;
         }
         if (c.data[c.pos] == '}') {
             ++c.pos;
             json_skip_ws(c);
             if (c.pos != c.len) {
-                clear();
+                (void)clear();
                 g_payload_parse_error++;
                 g_payload_json_invalid_syntax++;
-            payload_note_error(PAYLOAD_ERR_PARSE_ERROR, PAYLOAD_OP_PARSEJSON_TRAILING, this);
+                payload_note_error(PAYLOAD_ERR_PARSE_ERROR,
+                                   PAYLOAD_OP_PARSEJSON_TRAILING,
+                                   this);
                 return false;
             }
+
+            payload_contract_state_t parsed_state{};
+            if (!parsed._contract_inspect(&parsed_state)) {
+                payload_contract_record_state_failure(
+                    payload_contract_phase_t::POST_INVARIANT,
+                    PAYLOAD_OP_PARSEJSON_DATA,
+                    &parsed,
+                    parsed_state,
+                    parsed._contract_generation,
+                    parsed._contract_fingerprint);
+                (void)clear();
+                return false;
+            }
+            const uint32_t expected_semantic =
+                parsed_state.semantic_fingerprint;
             *this = static_cast<Payload&&>(parsed);
-            return true;
+            return _contract_finish_copy(PAYLOAD_OP_PARSEJSON_DATA,
+                                         before,
+                                         expected_semantic);
         }
         if (c.data[c.pos] != ',') {
-            clear();
+            (void)clear();
             g_payload_parse_error++;
             g_payload_json_invalid_syntax++;
-            payload_note_error(PAYLOAD_ERR_PARSE_ERROR, PAYLOAD_OP_PARSEJSON_SEPARATOR, this);
+            payload_note_error(PAYLOAD_ERR_PARSE_ERROR,
+                               PAYLOAD_OP_PARSEJSON_SEPARATOR,
+                               this);
             return false;
         }
         ++c.pos;
         json_skip_ws(c);
     }
 
-    clear();
+    (void)clear();
     g_payload_parse_error++;
     g_payload_json_invalid_syntax++;
-            payload_note_error(PAYLOAD_ERR_PARSE_ERROR, PAYLOAD_OP_PARSEJSON_UNCLOSED, this);
+    payload_note_error(PAYLOAD_ERR_PARSE_ERROR,
+                       PAYLOAD_OP_PARSEJSON_UNCLOSED,
+                       this);
     return false;
 }
 
@@ -4433,10 +6545,16 @@ PayloadArray::PayloadArray()
       _heap_block_guard(UINTPTR_MAX),
       _length(2),
       _length_guard((uint16_t)~(uint16_t)2U),
+      _contract_generation(0U),
+      _contract_generation_guard(0xFFFFFFFFUL),
+      _contract_fingerprint(0U),
+      _contract_fingerprint_guard(0xFFFFFFFFUL),
       _inline_storage{} {
     _inline_storage[0] = '[';
     _inline_storage[1] = ']';
     _inline_storage[2] = '\0';
+    payload_contract_state_t state{};
+    if (_contract_inspect(&state)) _contract_accept(state);
 }
 
 PayloadArray::~PayloadArray() {
@@ -4448,20 +6566,54 @@ PayloadArray::PayloadArray(const PayloadArray& other)
       _heap_block_guard(UINTPTR_MAX),
       _length(2),
       _length_guard((uint16_t)~(uint16_t)2U),
+      _contract_generation(0U),
+      _contract_generation_guard(0xFFFFFFFFUL),
+      _contract_fingerprint(0U),
+      _contract_fingerprint_guard(0xFFFFFFFFUL),
       _inline_storage{} {
     _inline_storage[0] = '[';
     _inline_storage[1] = ']';
     _inline_storage[2] = '\0';
+    payload_contract_state_t empty{};
+    if (_contract_inspect(&empty)) _contract_accept(empty);
     (void)_copy_from(other);
 }
 
 PayloadArray& PayloadArray::operator=(const PayloadArray& other) {
     if (this == &other) return *this;
-    if (other._json_size() == 0U) return *this;
+
+    payload_contract_state_t before{};
+    payload_contract_state_t source{};
+    if (!_contract_begin(PAYLOAD_OP_COPY_ASSIGN, &before)) return *this;
+    if (!other._contract_begin(PAYLOAD_OP_COPY_ASSIGN_SOURCE, &source)) {
+        payload_contract_record(payload_contract_phase_t::PRECONDITION,
+                                payload_contract_reason_t::SOURCE_INVALID,
+                                PAYLOAD_OP_COPY_ASSIGN_SOURCE,
+                                this,
+                                &other,
+                                _contract_generation,
+                                0xFFFFFFFFUL,
+                                1U,
+                                0U,
+                                0U,
+                                0U,
+                                before.structural_fingerprint,
+                                0U);
+        return *this;
+    }
+
     PayloadArray temp;
-    if (!temp._copy_from(other)) return *this;
+    if (!temp._copy_from(other)) {
+        (void)_contract_abort(PAYLOAD_OP_COPY_ASSIGN, before);
+        return *this;
+    }
+
+    const uint32_t expected_hash = source.semantic_fingerprint;
     _release_storage();
     _move_from(temp);
+    (void)_contract_finish_copy(PAYLOAD_OP_COPY_ASSIGN,
+                                before,
+                                expected_hash);
     return *this;
 }
 
@@ -4470,18 +6622,48 @@ PayloadArray::PayloadArray(PayloadArray&& other) noexcept
       _heap_block_guard(UINTPTR_MAX),
       _length(2),
       _length_guard((uint16_t)~(uint16_t)2U),
+      _contract_generation(0U),
+      _contract_generation_guard(0xFFFFFFFFUL),
+      _contract_fingerprint(0U),
+      _contract_fingerprint_guard(0xFFFFFFFFUL),
       _inline_storage{} {
     _inline_storage[0] = '[';
     _inline_storage[1] = ']';
     _inline_storage[2] = '\0';
+    payload_contract_state_t empty{};
+    if (_contract_inspect(&empty)) _contract_accept(empty);
     _move_from(other);
 }
 
 PayloadArray& PayloadArray::operator=(PayloadArray&& other) noexcept {
     if (this == &other) return *this;
-    if (other._json_size() == 0U) return *this;
+
+    payload_contract_state_t before{};
+    payload_contract_state_t source{};
+    if (!_contract_begin(PAYLOAD_OP_MOVE_FROM, &before)) return *this;
+    if (!other._contract_begin(PAYLOAD_OP_MOVE_ASSIGN_SOURCE, &source)) {
+        payload_contract_record(payload_contract_phase_t::PRECONDITION,
+                                payload_contract_reason_t::SOURCE_INVALID,
+                                PAYLOAD_OP_MOVE_ASSIGN_SOURCE,
+                                this,
+                                &other,
+                                _contract_generation,
+                                0xFFFFFFFFUL,
+                                1U,
+                                0U,
+                                0U,
+                                0U,
+                                before.structural_fingerprint,
+                                0U);
+        return *this;
+    }
+
+    const uint32_t expected_hash = source.semantic_fingerprint;
     _release_storage();
     _move_from(other);
+    (void)_contract_finish_copy(PAYLOAD_OP_MOVE_FROM,
+                                before,
+                                expected_hash);
     return *this;
 }
 
@@ -4533,22 +6715,33 @@ bool PayloadArray::_self_ok() const {
 }
 
 bool PayloadArray::_ensure_capacity(size_t needed) {
-    if (!_self_ok()) return false;
+    payload_contract_state_t before{};
+    if (!_contract_begin(PAYLOAD_OP_ARRAY_CAPACITY, &before)) return false;
+
     const size_t old_capacity = _capacity();
     if (needed <= old_capacity) return true;
     if (needed > STORAGE_MAX) {
         g_payload_arena_alloc_fail++;
-        payload_note_error(PAYLOAD_ERR_ARENA_LIMIT, PAYLOAD_OP_ARRAY_CAPACITY, this);
+        payload_note_error(PAYLOAD_ERR_ARENA_LIMIT,
+                           PAYLOAD_OP_ARRAY_CAPACITY,
+                           this);
         return false;
     }
 
     const size_t new_capacity =
         payload_growth_capacity(old_capacity, needed, STORAGE_MAX);
-    if (new_capacity == 0) return false;
+    if (new_capacity == 0U) {
+        payload_note_error(PAYLOAD_ERR_ARENA_LIMIT,
+                           PAYLOAD_OP_ARRAY_CAPACITY,
+                           this);
+        return false;
+    }
     void* block = payload_heap_allocate(new_capacity, this);
     if (!block) {
         g_payload_arena_alloc_fail++;
-        payload_note_error(PAYLOAD_ERR_ARENA_ALLOC_FAIL, PAYLOAD_OP_ARRAY_ALLOC, this);
+        payload_note_error(PAYLOAD_ERR_ARENA_ALLOC_FAIL,
+                           PAYLOAD_OP_ARRAY_ALLOC,
+                           this);
         return false;
     }
 
@@ -4557,7 +6750,8 @@ bool PayloadArray::_ensure_capacity(size_t needed) {
     void* old_block = _heap_block;
     const size_t old_heap_capacity = old_block ? old_capacity : 0U;
     _set_heap_block(block);
-    payload_note_heap_delta((int32_t)new_capacity - (int32_t)old_heap_capacity);
+    payload_note_heap_delta((int32_t)new_capacity -
+                            (int32_t)old_heap_capacity);
     g_payload_arena_realloc_count++;
     if (new_capacity > g_payload_max_arena_capacity_seen) {
         g_payload_max_arena_capacity_seen = (uint32_t)new_capacity;
@@ -4565,8 +6759,11 @@ bool PayloadArray::_ensure_capacity(size_t needed) {
     if (old_block) {
         payload_guarded_free(old_block, PAYLOAD_OP_ARRAY_ALLOC, this);
     }
-    return true;
+    return _contract_finish_preserve(PAYLOAD_OP_ARRAY_CAPACITY,
+                                     before,
+                                     needed);
 }
+
 
 void PayloadArray::_release_storage() {
     if (!_heap_guard_ok()) {
@@ -4578,15 +6775,21 @@ void PayloadArray::_release_storage() {
         memset(_inline_storage, 0, sizeof(_inline_storage));
         _inline_storage[0] = '[';
         _inline_storage[1] = ']';
+        payload_contract_state_t state{};
+        if (_contract_inspect(&state)) _contract_accept(state);
         return;
     }
     if (_heap_block) {
         const size_t capacity =
-            payload_heap_capacity(_heap_block, this, INLINE_STORAGE + 1U, STORAGE_MAX);
-        if (capacity != 0) {
+            payload_heap_capacity(_heap_block,
+                                  this,
+                                  INLINE_STORAGE + 1U,
+                                  STORAGE_MAX);
+        if (capacity != 0U) {
             payload_note_heap_delta(-(int32_t)capacity);
             payload_guarded_free(_heap_block,
-                                 PAYLOAD_OP_ARRAY_RELEASE_STORAGE, this);
+                                 PAYLOAD_OP_ARRAY_RELEASE_STORAGE,
+                                 this);
         } else {
             payload_note_integrity(PAYLOAD_SELF_OK_ENTRIES_SPAN_UNREADABLE,
                                    PAYLOAD_OP_ARRAY_RELEASE_STORAGE,
@@ -4598,64 +6801,136 @@ void PayloadArray::_release_storage() {
     memset(_inline_storage, 0, sizeof(_inline_storage));
     _inline_storage[0] = '[';
     _inline_storage[1] = ']';
+    payload_contract_state_t state{};
+    if (_contract_inspect(&state)) _contract_accept(state);
 }
 
+
 void PayloadArray::_move_from(PayloadArray& other) {
-    if (other._json_size() == 0U) return;
+    payload_contract_state_t before{};
+    payload_contract_state_t source{};
+    if (!_contract_begin(PAYLOAD_OP_MOVE_FROM, &before)) return;
+    if (!other._contract_begin(PAYLOAD_OP_MOVE_FROM, &source)) {
+        payload_contract_record(payload_contract_phase_t::PRECONDITION,
+                                payload_contract_reason_t::SOURCE_INVALID,
+                                PAYLOAD_OP_MOVE_FROM,
+                                this,
+                                &other,
+                                _contract_generation,
+                                0xFFFFFFFFUL,
+                                1U,
+                                0U,
+                                0U,
+                                0U,
+                                before.structural_fingerprint,
+                                0U);
+        return;
+    }
+
+    const uint32_t expected_hash = source.semantic_fingerprint;
     if (other._heap_block) {
         if (!payload_heap_rebind_owner(other._heap_block,
                                        &other,
                                        this,
                                        INLINE_STORAGE + 1U,
                                        STORAGE_MAX)) {
+            payload_note_error(PAYLOAD_ERR_STORAGE_CORRUPT,
+                               PAYLOAD_OP_MOVE_FROM,
+                               this);
             return;
         }
         _set_heap_block(other._heap_block);
         _set_length(other._length);
         other._set_heap_block(nullptr);
         other._release_storage();
+    } else {
+        memcpy(_inline_storage, other._inline_storage, INLINE_STORAGE);
+        _set_heap_block(nullptr);
+        _set_length(other._length);
+        other._release_storage();
+    }
+
+    if (!_contract_finish_copy(PAYLOAD_OP_MOVE_FROM,
+                               before,
+                               expected_hash)) {
         return;
     }
 
-    memcpy(_inline_storage, other._inline_storage, INLINE_STORAGE);
-    _set_heap_block(nullptr);
-    _set_length(other._length);
-    other.clear();
+    payload_contract_state_t source_after{};
+    if (!other._contract_inspect(&source_after) ||
+        source_after.element_count != 0U ||
+        source_after.count != 2U ||
+        !other.contract_valid()) {
+        payload_contract_record_postcondition(
+            PAYLOAD_OP_MOVE_FROM,
+            this,
+            &other,
+            _contract_generation,
+            payload_contract_reason_t::EXPECTED_MOVE_SOURCE_EMPTY,
+            0xFFFFFFFFUL,
+            0U,
+            source_after.element_count,
+            2U,
+            source_after.count,
+            before.structural_fingerprint,
+            source_after.structural_fingerprint);
+    }
 }
+
 
 bool PayloadArray::_copy_from(const PayloadArray& other) {
-    if (other._json_size() == 0U) return false;
-    if (!_ensure_capacity((size_t)other._length + 1U)) return false;
-    memcpy(_data(), other._data(), (size_t)other._length + 1U);
-    _set_length(other._length);
-    return true;
-}
-
-bool PayloadArray::clear() {
-    if (!_self_ok()) {
-        _release_storage();
+    payload_contract_state_t before{};
+    payload_contract_state_t source{};
+    if (!_contract_begin(PAYLOAD_OP_COPY_FROM, &before)) return false;
+    if (!other._contract_begin(PAYLOAD_OP_COPY_FROM, &source)) {
+        payload_contract_record(payload_contract_phase_t::PRECONDITION,
+                                payload_contract_reason_t::SOURCE_INVALID,
+                                PAYLOAD_OP_COPY_FROM,
+                                this,
+                                &other,
+                                _contract_generation,
+                                0xFFFFFFFFUL,
+                                1U,
+                                0U,
+                                0U,
+                                0U,
+                                before.structural_fingerprint,
+                                0U);
         return false;
     }
+    if (!_ensure_capacity((size_t)other._length + 1U)) {
+        _contract_abort(PAYLOAD_OP_COPY_FROM, before);
+        return false;
+    }
+    memcpy(_data(), other._data(), (size_t)other._length + 1U);
+    _set_length(other._length);
+    return _contract_finish_copy(PAYLOAD_OP_COPY_FROM,
+                                 before,
+                                 source.semantic_fingerprint);
+}
+
+
+bool PayloadArray::clear() {
+    payload_contract_state_t before{};
+    if (!_contract_begin(PAYLOAD_OP_CLEAR, &before)) return false;
     char* data = _data();
     memset(data, 0, _capacity());
     data[0] = '[';
     data[1] = ']';
+    data[2] = '\0';
     _set_length(2U);
-    return true;
+    return _contract_finish_clear(PAYLOAD_OP_CLEAR, before);
 }
+
 
 bool PayloadArray::empty() const {
     return !_self_ok() || _length == 2U;
 }
 
 size_t PayloadArray::_json_size() const {
-    if (!_self_ok()) return 0;
-    return json_validate_exact(
-               reinterpret_cast<const uint8_t*>(_data()),
-               _length,
-               json_value_type_t::ARRAY)
-        ? _length
-        : 0U;
+    payload_contract_state_t observed{};
+    if (!_contract_begin(PAYLOAD_OP_JSON_SIZE, &observed)) return 0U;
+    return _length;
 }
 
 size_t PayloadArray::_write_json_unchecked(char* out) const {
@@ -4670,25 +6945,71 @@ String PayloadArray::to_json() const {
 }
 
 bool PayloadArray::add(const Payload& obj) {
-    if (!_self_ok()) return false;
+    payload_contract_state_t before{};
+    if (!_contract_begin(PAYLOAD_OP_ARRAY_ADD_WRITE, &before)) return false;
+    if (!obj.contract_valid()) {
+        payload_contract_record(payload_contract_phase_t::PRECONDITION,
+                                payload_contract_reason_t::SOURCE_INVALID,
+                                PAYLOAD_OP_ARRAY_ADD_WRITE,
+                                this,
+                                &obj,
+                                _contract_generation,
+                                before.element_count,
+                                1U,
+                                0U,
+                                0U,
+                                0U,
+                                before.structural_fingerprint,
+                                0U);
+        return false;
+    }
+
     const size_t object_size = obj._json_size();
-    if (object_size == 0) {
+    if (object_size == 0U) {
         payload_note_error(PAYLOAD_ERR_INVALID_CHILD,
                            PAYLOAD_OP_ARRAY_ADD_WRITE,
                            this);
         return false;
     }
+    const uint32_t object_hash = obj._json_hash_unchecked();
 
     const size_t comma = _length == 2U ? 0U : 1U;
     const size_t new_length = (size_t)_length + comma + object_size;
-    if (new_length > UINT16_MAX || !_ensure_capacity(new_length + 1U)) {
+    if (new_length > UINT16_MAX) {
+        payload_note_error(PAYLOAD_ERR_STRING_TOO_LONG,
+                           PAYLOAD_OP_ARRAY_ADD_WRITE,
+                           this);
+        return false;
+    }
+    if (!_ensure_capacity(new_length + 1U)) {
+        _contract_abort(PAYLOAD_OP_ARRAY_ADD_WRITE, before);
+        return false;
+    }
+
+    if (!obj.contract_valid() ||
+        obj._json_size() != object_size ||
+        obj._json_hash_unchecked() != object_hash) {
+        payload_contract_record(payload_contract_phase_t::PRECONDITION,
+                                payload_contract_reason_t::SOURCE_INVALID,
+                                PAYLOAD_OP_ARRAY_ADD_WRITE,
+                                this,
+                                &obj,
+                                _contract_generation,
+                                before.element_count,
+                                object_hash,
+                                obj._json_hash_unchecked(),
+                                (uint32_t)object_size,
+                                (uint32_t)obj._json_size(),
+                                before.structural_fingerprint,
+                                _contract_fingerprint);
+        _contract_abort(PAYLOAD_OP_ARRAY_ADD_WRITE, before);
         return false;
     }
 
     char* data = _data();
     const size_t old_length = _length;
-    size_t pos = old_length - 1U;  // replace old closing bracket
-    if (comma != 0) data[pos++] = ',';
+    size_t pos = old_length - 1U;
+    if (comma != 0U) data[pos++] = ',';
     const size_t written = obj._write_json_unchecked(data + pos);
     if (written != object_size) {
         data[old_length - 1U] = ']';
@@ -4696,26 +7017,36 @@ bool PayloadArray::add(const Payload& obj) {
         payload_note_error(PAYLOAD_ERR_SERIALIZE_OVERFLOW,
                            PAYLOAD_OP_ARRAY_ADD_WRITE,
                            this);
+        _contract_abort(PAYLOAD_OP_ARRAY_ADD_WRITE, before);
         return false;
     }
     pos += written;
     data[pos++] = ']';
     data[pos] = '\0';
     _set_length((uint16_t)pos);
-    return true;
+    return _contract_finish_add(PAYLOAD_OP_ARRAY_ADD_WRITE,
+                                before,
+                                object_size,
+                                object_hash);
 }
 
+
 bool PayloadArray::parseJSON(const char* json) {
-    size_t length = 0;
+    payload_contract_state_t before{};
+    if (!_contract_begin(PAYLOAD_OP_ARRAY_PARSE, &before)) return false;
+
+    size_t length = 0U;
     if (!json || !payload_cstr_len_checked(json,
                                            STORAGE_MAX - 1U,
                                            PAYLOAD_OP_ARRAY_PARSE,
                                            &length,
                                            false)) {
-        clear();
+        (void)clear();
         g_payload_parse_error++;
         g_payload_json_invalid_raw_array++;
-        payload_note_error(PAYLOAD_ERR_JSON_INVALID, PAYLOAD_OP_ARRAY_PARSE, this);
+        payload_note_error(PAYLOAD_ERR_JSON_INVALID,
+                           PAYLOAD_OP_ARRAY_PARSE,
+                           this);
         return false;
     }
 
@@ -4724,29 +7055,53 @@ bool PayloadArray::parseJSON(const char* json) {
                              length,
                              json_value_type_t::ARRAY,
                              &span)) {
-        clear();
+        (void)clear();
         g_payload_parse_error++;
         g_payload_json_invalid_raw_array++;
-        payload_note_error(PAYLOAD_ERR_JSON_INVALID, PAYLOAD_OP_ARRAY_PARSE_INVALID, this);
+        payload_note_error(PAYLOAD_ERR_JSON_INVALID,
+                           PAYLOAD_OP_ARRAY_PARSE_INVALID,
+                           this);
         return false;
     }
 
     const size_t trimmed_length = span.end - span.begin;
     if (trimmed_length > UINT16_MAX) {
-        clear();
+        (void)clear();
+        payload_note_error(PAYLOAD_ERR_STRING_TOO_LONG,
+                           PAYLOAD_OP_ARRAY_PARSE,
+                           this);
         return false;
     }
 
+    const uint32_t expected_hash =
+        payload_contract_span_hash(json + span.begin, trimmed_length);
+
     PayloadArray parsed;
-    if (!parsed._ensure_capacity(trimmed_length + 1U)) {
-        clear();
+    payload_contract_state_t parsed_before{};
+    if (!parsed._contract_begin(PAYLOAD_OP_ARRAY_PARSE,
+                                &parsed_before)) {
+        (void)clear();
         return false;
     }
+    if (!parsed._ensure_capacity(trimmed_length + 1U)) {
+        (void)clear();
+        return false;
+    }
+
     memcpy(parsed._data(), json + span.begin, trimmed_length);
     parsed._data()[trimmed_length] = '\0';
     parsed._set_length((uint16_t)trimmed_length);
+    if (!parsed._contract_finish_copy(PAYLOAD_OP_ARRAY_PARSE,
+                                      parsed_before,
+                                      expected_hash)) {
+        (void)clear();
+        return false;
+    }
+
     *this = static_cast<PayloadArray&&>(parsed);
-    return true;
+    return _contract_finish_copy(PAYLOAD_OP_ARRAY_PARSE,
+                                 before,
+                                 expected_hash);
 }
 
 size_t PayloadArray::size() const {
@@ -4990,4 +7345,23 @@ void payload_get_info(payload_info_t* out) {
     out->alloc_overlap_this = g_payload_alloc_overlap_this;
     out->alloc_overlap_dwt = g_payload_alloc_overlap_dwt;
     out->alloc_overlap_depth = g_payload_alloc_overlap_depth;
+
+    payload_contract_info_t contract{};
+    payload_contract_get_info(&contract);
+    out->contract_checks = contract.checks;
+    out->contract_successful_mutations = contract.successful_mutations;
+    out->contract_precondition_failures = contract.precondition_failures;
+    out->contract_pre_invariant_failures = contract.pre_invariant_failures;
+    out->contract_post_invariant_failures = contract.post_invariant_failures;
+    out->contract_postcondition_failures = contract.postcondition_failures;
+    out->contract_observed_drift_failures =
+        contract.observed_drift_failures;
+    out->contract_mutation_failures = contract.mutation_failures;
+    out->contract_incidents = contract.incidents;
+    out->contract_pending_events = contract.pending_events;
+    out->contract_pending_overflow = contract.pending_overflow;
+    out->contract_event_emitted = contract.event_emitted;
+    out->contract_event_emit_failed = contract.event_emit_failed;
+    out->contract_event_incidents_suppressed =
+        contract.event_incidents_suppressed;
 }

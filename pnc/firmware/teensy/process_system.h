@@ -63,6 +63,8 @@
  *     accepts source=audit|watchdog, bank=retained|live, count=1..8, offset=N
  *   • TIMEPOP_DISPATCH_INFO — return a bounded TimePop callback, mutation, and
  *     rearm transcript; accepts bank=retained|live, count=1..8, offset=N
+ *   • PAYLOAD_CONTRACT_INFO — return design-by-contract counters plus the
+ *     first/latest current-boot incident and latest retained incident
  *
  * Terminal Transitions:
  *   • Shutdown and bootloader entry are explicit, irreversible boundary
