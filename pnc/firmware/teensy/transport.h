@@ -212,6 +212,28 @@ typedef struct {
   uint32_t rx_expected_traffic_missing; // Expected traffic byte absent
 
   // ===========================================================
+  // RX — Guarded RAM2 placement experiment
+  // ===========================================================
+
+  uint32_t rx_buffer_in_dmamem;
+  uint32_t rx_buffer_address;
+  size_t   rx_buffer_size;
+  size_t   rx_buffer_alignment;
+  uint32_t rx_buffer_alignment_ok;
+  uint32_t rx_poison_byte;
+  uint32_t rx_storage_init_count;
+  uint32_t rx_json_terminator_count;
+  uint32_t rx_guard_check_count;
+  uint32_t rx_guard_failure_count;
+  uint32_t rx_guard_before_failure_count;
+  uint32_t rx_guard_after_failure_count;
+  uint32_t rx_guard_last_stage;     // 1=before parse, 2=after parse, 3=after dispatch
+  uint32_t rx_guard_last_side;      // 1=before buffer, 2=after buffer
+  uint32_t rx_guard_last_index;
+  uint32_t rx_guard_last_expected;
+  uint32_t rx_guard_last_observed;
+
+  // ===========================================================
   // RX — Startup attach quarantine / first-corruption witness
   // ===========================================================
 

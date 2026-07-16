@@ -53,6 +53,21 @@ static constexpr uint32_t TRANSPORT_RX_STARTUP_GRACE_MS = 15000UL;
 static constexpr size_t FRAME_SLACK = 64;
 static constexpr size_t RX_BUF_MAX = TRANSPORT_MAX_MESSAGE + FRAME_SLACK;
 
+// RAM2 placement experiment.  The RX body is CPU-written/CPU-read, but the
+// earlier bare-DMAMEM experiment produced message corruption.  Fence the
+// payload with dedicated cache lines, poison it at initialization, and retain
+// first-failure evidence so this trial can distinguish placement from an
+// overrun/overread or neighboring cache-maintenance problem.
+static constexpr size_t   RX_CACHE_LINE_BYTES = 32U;
+static constexpr size_t   RX_GUARD_WORDS =
+    RX_CACHE_LINE_BYTES / sizeof(uint32_t);
+static constexpr uint8_t  RX_POISON_BYTE = 0xA5U;
+static constexpr uint32_t RX_GUARD_BEFORE_WORD = 0x52584742UL;  // 'RXGB'
+static constexpr uint32_t RX_GUARD_AFTER_WORD  = 0x52584741UL;  // 'RXGA'
+
+static_assert((RX_BUF_MAX % RX_CACHE_LINE_BYTES) == 0U,
+              "RX buffer must occupy complete cache lines");
+
 static constexpr size_t TX_JOB_MAX = 64;
 static constexpr size_t TX_BUDGET_MAX = 48 * 1024;
 
@@ -62,7 +77,8 @@ static constexpr size_t STX_LEN   = 5;
 static constexpr char   ETX_SEQ[] = "<ETX>";
 static constexpr size_t ETX_LEN   = 5;
 
-static const char* BUILD_FINGERPRINT = "__FP__ZPNET_SERIAL_CANONICAL_WIRE__";
+static const char* BUILD_FINGERPRINT =
+    "__FP__ZPNET_SERIAL_CANONICAL_WIRE_RX_DMAMEM_GUARDED__";
 static const char* TRANSPORT_LIFELINE_FINGERPRINT = "__FP__ZPNET_TRANSPORT_LOOP_LIFELINE__";
 
 // =============================================================
@@ -138,7 +154,27 @@ static uint32_t transport_last_poll_us = 0;
 
 static transport_receive_cb_t recv_cb[256] = { nullptr };
 
-static uint8_t rx_buf[RX_BUF_MAX];
+struct alignas(RX_CACHE_LINE_BYTES) rx_storage_t {
+  uint32_t guard_before[RX_GUARD_WORDS];
+  uint8_t  buffer[RX_BUF_MAX];
+  uint32_t guard_after[RX_GUARD_WORDS];
+};
+
+static_assert(offsetof(rx_storage_t, buffer) == RX_CACHE_LINE_BYTES,
+              "RX buffer must begin after one guard cache line");
+static_assert((offsetof(rx_storage_t, guard_after) % RX_CACHE_LINE_BYTES) == 0U,
+              "RX trailing guard must begin on a cache-line boundary");
+static_assert((sizeof(rx_storage_t) % RX_CACHE_LINE_BYTES) == 0U,
+              "RX storage must occupy complete cache lines");
+
+// Deliberately uninitialized by startup: transport_init() establishes the
+// guard and poison patterns before the first receive poll.
+static rx_storage_t g_rx_storage DMAMEM;
+
+static inline uint8_t* rx_buffer(void) {
+  return g_rx_storage.buffer;
+}
+
 static size_t  rx_len = 0;
 
 static bool    rx_have_traffic = false;
@@ -154,6 +190,25 @@ static volatile uint32_t rx_bad_etx_count            = 0;
 static volatile uint32_t rx_len_overflow_count       = 0;
 static volatile uint32_t rx_overlap_count            = 0;
 static volatile uint32_t rx_expected_traffic_missing = 0;
+
+enum class rx_guard_stage_t : uint32_t {
+  NONE          = 0U,
+  BEFORE_PARSE  = 1U,
+  AFTER_PARSE   = 2U,
+  AFTER_DISPATCH = 3U,
+};
+
+static volatile uint32_t rx_storage_init_count = 0;
+static volatile uint32_t rx_json_terminator_count = 0;
+static volatile uint32_t rx_guard_check_count = 0;
+static volatile uint32_t rx_guard_failure_count = 0;
+static volatile uint32_t rx_guard_before_failure_count = 0;
+static volatile uint32_t rx_guard_after_failure_count = 0;
+static volatile uint32_t rx_guard_last_stage = 0;
+static volatile uint32_t rx_guard_last_side = 0;  // 1=before, 2=after
+static volatile uint32_t rx_guard_last_index = 0xFFFFFFFFUL;
+static volatile uint32_t rx_guard_last_expected = 0;
+static volatile uint32_t rx_guard_last_observed = 0;
 
 static uint32_t rx_init_ms = 0;
 static bool     rx_first_frame_seen = false;
@@ -175,6 +230,80 @@ static void rx_startup_note_missing_byte(uint8_t b) {
     rx_startup_first_missing_byte = b;
   }
   rx_startup_last_missing_byte = b;
+}
+
+static void rx_storage_initialize(void) {
+  for (size_t i = 0; i < RX_GUARD_WORDS; ++i) {
+    g_rx_storage.guard_before[i] = RX_GUARD_BEFORE_WORD;
+    g_rx_storage.guard_after[i] = RX_GUARD_AFTER_WORD;
+  }
+  memset(rx_buffer(), RX_POISON_BYTE, RX_BUF_MAX);
+  rx_storage_init_count++;
+}
+
+static void rx_guard_note_failure(rx_guard_stage_t stage,
+                                  uint32_t side,
+                                  uint32_t index,
+                                  uint32_t expected,
+                                  uint32_t observed) {
+  rx_guard_last_stage = (uint32_t)stage;
+  rx_guard_last_side = side;
+  rx_guard_last_index = index;
+  rx_guard_last_expected = expected;
+  rx_guard_last_observed = observed;
+
+  char line[192];
+  snprintf(line, sizeof(line),
+           "RX_GUARD stage=%lu side=%lu index=%lu expected=0x%08lX "
+           "observed=0x%08lX rx_len=%lu buffer=0x%08lX",
+           (unsigned long)stage,
+           (unsigned long)side,
+           (unsigned long)index,
+           (unsigned long)expected,
+           (unsigned long)observed,
+           (unsigned long)rx_len,
+           (unsigned long)(uintptr_t)rx_buffer());
+  debug_log("transport.rx_guard", line);
+}
+
+static bool rx_guard_check(rx_guard_stage_t stage) {
+  rx_guard_check_count++;
+
+  bool ok = true;
+  bool recorded = false;
+  uint32_t before_bad = 0U;
+  uint32_t after_bad = 0U;
+
+  for (size_t i = 0; i < RX_GUARD_WORDS; ++i) {
+    const uint32_t observed = g_rx_storage.guard_before[i];
+    if (observed == RX_GUARD_BEFORE_WORD) continue;
+    ok = false;
+    before_bad++;
+    if (!recorded) {
+      rx_guard_note_failure(stage, 1U, (uint32_t)i,
+                            RX_GUARD_BEFORE_WORD, observed);
+      recorded = true;
+    }
+  }
+
+  for (size_t i = 0; i < RX_GUARD_WORDS; ++i) {
+    const uint32_t observed = g_rx_storage.guard_after[i];
+    if (observed == RX_GUARD_AFTER_WORD) continue;
+    ok = false;
+    after_bad++;
+    if (!recorded) {
+      rx_guard_note_failure(stage, 2U, (uint32_t)i,
+                            RX_GUARD_AFTER_WORD, observed);
+      recorded = true;
+    }
+  }
+
+  if (!ok) {
+    rx_guard_failure_count++;
+    rx_guard_before_failure_count += before_bad;
+    rx_guard_after_failure_count += after_bad;
+  }
+  return ok;
 }
 
 // =============================================================
@@ -361,7 +490,7 @@ static inline bool rx_stx_accepts(uint8_t b) {
     return true;
 
   for (size_t i = 0; i < rx_len; ++i) {
-    if (rx_buf[i] != (uint8_t)STX_SEQ[i])
+    if (rx_buffer()[i] != (uint8_t)STX_SEQ[i])
       return false;
   }
 
@@ -373,7 +502,7 @@ static inline bool rx_header_complete() {
     return false;
 
   for (size_t i = STX_LEN; i < rx_len; ++i) {
-    if (rx_buf[i] == (uint8_t)'>')
+    if (rx_buffer()[i] == (uint8_t)'>')
       return true;
   }
 
@@ -408,7 +537,7 @@ static void dispatch_if_complete() {
   if (rx_len < STX_LEN)
     return;
 
-  if (memcmp(rx_buf, STX_SEQ, STX_LEN) != 0) {
+  if (memcmp(rx_buffer(), STX_SEQ, STX_LEN) != 0) {
     if (rx_startup_grace_active()) {
       rx_startup_bad_stx_suppressed++;
     } else {
@@ -422,8 +551,8 @@ static void dispatch_if_complete() {
   size_t declared_len = 0;
   bool saw_digit = false;
 
-  while (i < rx_len && rx_buf[i] != '>') {
-    uint8_t c = rx_buf[i];
+  while (i < rx_len && rx_buffer()[i] != '>') {
+    uint8_t c = rx_buffer()[i];
     if (c < '0' || c > '9') {
       if (rx_startup_grace_active()) {
         rx_startup_len_overflow_suppressed++;
@@ -459,7 +588,7 @@ static void dispatch_if_complete() {
     return;
 
   size_t etx_pos = json_start + declared_len;
-  if (memcmp(rx_buf + etx_pos, ETX_SEQ, ETX_LEN) != 0) {
+  if (memcmp(rx_buffer() + etx_pos, ETX_SEQ, ETX_LEN) != 0) {
     if (rx_startup_grace_active()) {
       rx_startup_bad_etx_suppressed++;
     } else {
@@ -469,15 +598,36 @@ static void dispatch_if_complete() {
     return;
   }
 
+  if (!rx_guard_check(rx_guard_stage_t::BEFORE_PARSE)) {
+    rx_reset_hard();
+    return;
+  }
+
+  // ETX is already validated.  Replace its first byte with an explicit NUL so
+  // any hidden C-string dependency or one-byte parser overread sees a lawful
+  // terminator while parseJSON() still receives the authoritative JSON length.
+  rx_buffer()[etx_pos] = '\0';
+  rx_json_terminator_count++;
+
   rx_first_frame_seen = true;
   rx_frames_complete++;
 
   Payload p;
-  p.parseJSON(rx_buf + json_start, declared_len);
+  p.parseJSON(rx_buffer() + json_start, declared_len);
+
+  if (!rx_guard_check(rx_guard_stage_t::AFTER_PARSE)) {
+    rx_reset_hard();
+    return;
+  }
 
   if (recv_cb[rx_traffic]) {
     rx_frames_dispatched++;
     recv_cb[rx_traffic](p);
+  }
+
+  if (!rx_guard_check(rx_guard_stage_t::AFTER_DISPATCH)) {
+    rx_reset_hard();
+    return;
   }
 
   rx_reset_hard();
@@ -524,7 +674,7 @@ static void rx_serial_tick() {
       return;
     }
 
-    rx_buf[rx_len++] = b;
+    rx_buffer()[rx_len++] = b;
     rx_bytes_total++;
     appended = true;
 
@@ -601,6 +751,25 @@ FLASHMEM void transport_get_info(transport_info_t* out) {
   out->rx_overlap                   = rx_overlap_count;
   out->rx_expected_traffic_missing  = rx_expected_traffic_missing;
 
+  out->rx_buffer_in_dmamem = 1U;
+  out->rx_buffer_address = (uint32_t)(uintptr_t)rx_buffer();
+  out->rx_buffer_size = RX_BUF_MAX;
+  out->rx_buffer_alignment = RX_CACHE_LINE_BYTES;
+  out->rx_buffer_alignment_ok =
+      (((uintptr_t)rx_buffer() & (RX_CACHE_LINE_BYTES - 1U)) == 0U) ? 1U : 0U;
+  out->rx_poison_byte = RX_POISON_BYTE;
+  out->rx_storage_init_count = rx_storage_init_count;
+  out->rx_json_terminator_count = rx_json_terminator_count;
+  out->rx_guard_check_count = rx_guard_check_count;
+  out->rx_guard_failure_count = rx_guard_failure_count;
+  out->rx_guard_before_failure_count = rx_guard_before_failure_count;
+  out->rx_guard_after_failure_count = rx_guard_after_failure_count;
+  out->rx_guard_last_stage = rx_guard_last_stage;
+  out->rx_guard_last_side = rx_guard_last_side;
+  out->rx_guard_last_index = rx_guard_last_index;
+  out->rx_guard_last_expected = rx_guard_last_expected;
+  out->rx_guard_last_observed = rx_guard_last_observed;
+
   out->rx_first_frame_seen = rx_first_frame_seen ? 1U : 0U;
   out->rx_startup_grace_active = rx_startup_grace_active() ? 1U : 0U;
   out->rx_startup_grace_ms = TRANSPORT_RX_STARTUP_GRACE_MS;
@@ -623,6 +792,8 @@ FLASHMEM void transport_get_info(transport_info_t* out) {
 // =============================================================
 
 void transport_init(void) {
+
+  rx_storage_initialize();
 
   ZPNET_SERIAL.begin(USB_SERIAL_BAUD);
   rx_init_ms = millis();

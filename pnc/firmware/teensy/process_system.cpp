@@ -64,15 +64,14 @@ static uint64_t system_cpu_window_last_wall_cycles = 0;
 static uint64_t system_cpu_window_last_idle_cycles = 0;
 
 // ============================================================================
-// Retained foreground / CPU-usage crash ledger
+// Foreground / CPU-usage crash ledger
 // ============================================================================
 //
-// This is deliberately tiny and scalar-only.  The live RAM2 record is updated
-// by loop() and cpu_usage_tick(); on the next boot its final committed image is
-// copied to the retained bank before current activity overwrites it.  Ordinary
-// phase notes remain cache-local; CPU_USAGE entry flushes the whole record, so
-// the 0x426 crash path commits its phase without adding another DWT read or a
-// cache-maintenance operation to every loop transition.
+// This is deliberately tiny and scalar-only.  It is updated continuously by
+// loop() and cpu_usage_tick(), so both compatibility banks use ordinary RAM1
+// in this deterministic-memory baseline.  The retained-bank API remains
+// compatible, but RAM1 startup initialization means it does not preserve the
+// previous boot's final image.
 
 static constexpr uint32_t ZPNET_RUNTIME_LEDGER_MAGIC = 0x52554E31UL;  // 'RUN1'
 static constexpr uint32_t ZPNET_CPU_USAGE_STATE_IDLE = 0U;
@@ -102,8 +101,8 @@ typedef struct {
 static_assert(sizeof(zpnet_runtime_ledger_t) == 64U,
               "runtime crash ledger must stay two cache lines");
 
-static zpnet_runtime_ledger_t g_runtime_ledger DMAMEM;
-static zpnet_runtime_ledger_t g_runtime_ledger_retained DMAMEM;
+static zpnet_runtime_ledger_t g_runtime_ledger = {};
+static zpnet_runtime_ledger_t g_runtime_ledger_retained = {};
 static bool g_runtime_ledger_boot_latched = false;  // BSS: zero every boot
 
 static bool runtime_ledger_header_valid(const zpnet_runtime_ledger_t* ledger) {
@@ -146,22 +145,16 @@ static void runtime_ledger_initialize_live(void) {
   g_runtime_ledger.cpu_usage_stage_value_inv = ~0U;
   g_runtime_ledger.magic_inv = ~ZPNET_RUNTIME_LEDGER_MAGIC;
   g_runtime_ledger.magic = ZPNET_RUNTIME_LEDGER_MAGIC;
-  arm_dcache_flush((void*)&g_runtime_ledger, sizeof(g_runtime_ledger));
 }
 
 static void runtime_ledger_boot_latch(void) {
   if (g_runtime_ledger_boot_latched) return;
   g_runtime_ledger_boot_latched = true;
 
-  if (runtime_ledger_header_valid(&g_runtime_ledger)) {
-    g_runtime_ledger_retained = g_runtime_ledger;
-  } else {
-    memset((void*)&g_runtime_ledger_retained, 0,
-           sizeof(g_runtime_ledger_retained));
-  }
-  arm_dcache_flush((void*)&g_runtime_ledger_retained,
-                   sizeof(g_runtime_ledger_retained));
-
+  // Both banks are ordinary RAM1 and were zeroed by startup.  Keep the
+  // compatibility retained surface empty and initialize the live ledger.
+  memset((void*)&g_runtime_ledger_retained, 0,
+         sizeof(g_runtime_ledger_retained));
   runtime_ledger_initialize_live();
 }
 
@@ -209,7 +202,6 @@ void zpnet_cpu_usage_ledger_enter(void) {
       zpnet_cpu_usage_stage_t::CALLBACK_ENTER, 0U);
   g_runtime_ledger.cpu_usage_sequence_inv = ~sequence;
   g_runtime_ledger.cpu_usage_sequence = sequence;  // commit last
-  arm_dcache_flush((void*)&g_runtime_ledger, sizeof(g_runtime_ledger));
 }
 
 void zpnet_cpu_usage_ledger_stage(zpnet_cpu_usage_stage_t stage,
@@ -220,7 +212,6 @@ void zpnet_cpu_usage_ledger_stage(zpnet_cpu_usage_stage_t stage,
   g_runtime_ledger.cpu_usage_sequence_inv = sequence;  // invalidate
   runtime_ledger_cpu_usage_set_stage(stage, value);
   g_runtime_ledger.cpu_usage_sequence_inv = ~sequence;  // commit last
-  arm_dcache_flush((void*)&g_runtime_ledger, sizeof(g_runtime_ledger));
 }
 
 void zpnet_cpu_usage_ledger_exit(void) {
@@ -233,7 +224,6 @@ void zpnet_cpu_usage_ledger_exit(void) {
   runtime_ledger_cpu_usage_set_stage(
       zpnet_cpu_usage_stage_t::CALLBACK_EXIT, 0U);
   g_runtime_ledger.cpu_usage_sequence_inv = ~sequence;  // commit last
-  arm_dcache_flush((void*)&g_runtime_ledger, sizeof(g_runtime_ledger));
 }
 
 // --------------------------------------------------------------
@@ -242,7 +232,7 @@ void zpnet_cpu_usage_ledger_exit(void) {
 // memory_info owns observation, rule evaluation, and the sticky health verdict.
 // SYSTEM owns only TimePop scheduling and the one WATCHDOG_ANOMALY emission.
 
-static memory_health_t g_system_memory_watchdog_health DMAMEM = {};
+static memory_health_t g_system_memory_watchdog_health = {};
 static timepop_handle_t g_system_memory_watchdog_handle = TIMEPOP_INVALID_HANDLE;
 static bool     g_system_memory_watchdog_armed = false;
 static bool     g_system_memory_watchdog_event_emitted = false;
@@ -264,13 +254,14 @@ static uint32_t g_system_memory_watchdog_alap_run_count = 0;
 
 
 // ============================================================================
-// Retained memory-watchdog callback flight recorder
+// Memory-watchdog callback flight recorder
 // ============================================================================
 //
 // This is intentionally separate from memory_info's audit recorder.  The
 // watchdog trace answers which outer callback boundary was crossed; the audit
 // trace answers which internal observation/court stage was reached.  Entries
-// are scalar-only, allocation-free, Payload-free, and flushed one at a time.
+// are scalar-only, allocation-free, and Payload-free.  The recurring watchdog
+// path keeps both compatibility banks in ordinary RAM1.
 
 static constexpr uint32_t SYSTEM_WATCHDOG_TRACE_MAGIC = 0x57444631UL;  // 'WDF1'
 static constexpr uint32_t SYSTEM_WATCHDOG_TRACE_SCHEMA_VERSION = 1U;
@@ -327,8 +318,8 @@ struct system_watchdog_trace_snapshot_t {
   system_watchdog_trace_bank_snapshot_t retained;
 };
 
-static system_watchdog_trace_bank_t g_system_watchdog_trace_live DMAMEM;
-static system_watchdog_trace_bank_t g_system_watchdog_trace_retained DMAMEM;
+static system_watchdog_trace_bank_t g_system_watchdog_trace_live = {};
+static system_watchdog_trace_bank_t g_system_watchdog_trace_retained = {};
 static bool g_system_watchdog_trace_boot_latched = false;  // ordinary BSS
 static uint32_t g_system_watchdog_trace_next_sequence = 0U;
 
@@ -367,22 +358,16 @@ static void system_watchdog_trace_initialize_live(void) {
   g_system_watchdog_trace_live.magic_inv = ~SYSTEM_WATCHDOG_TRACE_MAGIC;
   g_system_watchdog_trace_live.magic = SYSTEM_WATCHDOG_TRACE_MAGIC;
   g_system_watchdog_trace_next_sequence = 0U;
-  arm_dcache_flush((void*)&g_system_watchdog_trace_live,
-                   sizeof(g_system_watchdog_trace_live));
 }
 
 static void system_watchdog_trace_boot_latch(void) {
   if (g_system_watchdog_trace_boot_latched) return;
   g_system_watchdog_trace_boot_latched = true;
 
-  if (system_watchdog_trace_bank_valid(g_system_watchdog_trace_live)) {
-    g_system_watchdog_trace_retained = g_system_watchdog_trace_live;
-  } else {
-    memset((void*)&g_system_watchdog_trace_retained, 0,
-           sizeof(g_system_watchdog_trace_retained));
-  }
-  arm_dcache_flush((void*)&g_system_watchdog_trace_retained,
-                   sizeof(g_system_watchdog_trace_retained));
+  // Both banks are ordinary RAM1 and were zeroed by startup.  Keep the
+  // compatibility retained surface empty and initialize the live recorder.
+  memset((void*)&g_system_watchdog_trace_retained, 0,
+         sizeof(g_system_watchdog_trace_retained));
   system_watchdog_trace_initialize_live();
 }
 
@@ -414,7 +399,6 @@ static void system_watchdog_trace_record(system_watchdog_trace_stage_t stage,
   system_watchdog_trace_dmb();
   entry.sequence = sequence;  // commit last
   system_watchdog_trace_dmb();
-  arm_dcache_flush((void*)&entry, sizeof(entry));
 }
 
 static void system_watchdog_trace_snapshot_bank(
@@ -470,8 +454,6 @@ static void system_watchdog_trace_snapshot(
 static void system_watchdog_trace_clear_retained(void) {
   memset((void*)&g_system_watchdog_trace_retained, 0,
          sizeof(g_system_watchdog_trace_retained));
-  arm_dcache_flush((void*)&g_system_watchdog_trace_retained,
-                   sizeof(g_system_watchdog_trace_retained));
 }
 
 // ============================================================================
@@ -726,7 +708,9 @@ struct system_feature_slot_t {
   system_feature_status_t status = system_feature_status_t::INITIALIZING;
 };
 
-static system_feature_slot_t g_system_features[SYSTEM_FEATURE_MAX_FEATURES] DMAMEM = {};
+// The timing subsystems update this registry and foreground serializes it.
+// Keep the shared feature-control plane in deterministic RAM1.
+static system_feature_slot_t g_system_features[SYSTEM_FEATURE_MAX_FEATURES] = {};
 
 static void system_feature_registry_reset(void) {
   for (size_t i = 0; i < SYSTEM_FEATURE_MAX_FEATURES; i++) {
@@ -2786,6 +2770,41 @@ static FLASHMEM Payload cmd_transport_info(const Payload& /*args*/) {
   p.add("rx_expected_traffic_missing", info.rx_expected_traffic_missing);
 
   // ==========================================================
+  // RX — Guarded RAM2 placement experiment
+  // ==========================================================
+
+  p.add("rx_buffer_in_dmamem", info.rx_buffer_in_dmamem != 0U);
+  p.add_fmt("rx_buffer_address", "0x%08lX",
+            (unsigned long)info.rx_buffer_address);
+  p.add("rx_buffer_size", info.rx_buffer_size);
+  p.add("rx_buffer_alignment", info.rx_buffer_alignment);
+  p.add("rx_buffer_alignment_ok", info.rx_buffer_alignment_ok != 0U);
+  p.add_fmt("rx_poison_byte", "0x%02lX",
+            (unsigned long)info.rx_poison_byte);
+  p.add("rx_storage_init_count", info.rx_storage_init_count);
+  p.add("rx_json_terminator_count", info.rx_json_terminator_count);
+  p.add("rx_guard_check_count", info.rx_guard_check_count);
+  p.add("rx_guard_failure_count", info.rx_guard_failure_count);
+  p.add("rx_guard_before_failure_count",
+        info.rx_guard_before_failure_count);
+  p.add("rx_guard_after_failure_count",
+        info.rx_guard_after_failure_count);
+  p.add("rx_guard_last_stage", info.rx_guard_last_stage);
+  p.add("rx_guard_last_stage_name",
+        info.rx_guard_last_stage == 1U ? "BEFORE_PARSE" :
+        info.rx_guard_last_stage == 2U ? "AFTER_PARSE" :
+        info.rx_guard_last_stage == 3U ? "AFTER_DISPATCH" : "NONE");
+  p.add("rx_guard_last_side", info.rx_guard_last_side);
+  p.add("rx_guard_last_side_name",
+        info.rx_guard_last_side == 1U ? "BEFORE_BUFFER" :
+        info.rx_guard_last_side == 2U ? "AFTER_BUFFER" : "NONE");
+  p.add("rx_guard_last_index", info.rx_guard_last_index);
+  p.add_fmt("rx_guard_last_expected", "0x%02lX",
+            (unsigned long)info.rx_guard_last_expected);
+  p.add_fmt("rx_guard_last_observed", "0x%02lX",
+            (unsigned long)info.rx_guard_last_observed);
+
+  // ==========================================================
   // RX — Startup attach quarantine / first-corruption witness
   // ==========================================================
 
@@ -3141,10 +3160,11 @@ static memory_info_t g_system_memory_info_scratch DMAMEM = {};
 static void system_dmamem_ensure_initialized(void) {
   if (g_system_dmamem_initialized) return;
 
-  // Teensy places DMAMEM in the NOLOAD .bss.dma section.  Explicitly
-  // initialize every SYSTEM RAM2 object before early CLOCKS/INTERRUPT feature
-  // publishers inspect the registry.  This function is intentionally lazy
-  // because those publishers run before process_system_register().
+  // Explicitly initialize the remaining SYSTEM RAM2 scratch objects before
+  // early CLOCKS/INTERRUPT publishers can reach them.  RAM1 operational state
+  // is reset here as well so the one-time startup transaction is deterministic.
+  // This function remains lazy because those publishers run before
+  // process_system_register().
   runtime_ledger_boot_latch();
   system_watchdog_trace_boot_latch();
   g_system_memory_watchdog_health = memory_health_t{};
@@ -3165,11 +3185,11 @@ static void system_dmamem_ensure_initialized(void) {
 
   // crash_forensics.cpp owns its retained RAM2 record.  Never initialize or
   // clear that record here; it may be the only surviving witness to a reboot.
-  // The same custody applies to the runtime ledger pair, memory-audit/watchdog
-  // trace banks, TimePop's dispatch-flight
-  // banks, Payload flight rings, and Payload append-trace banks in payload.cpp:
-  // all are NOLOAD retained evidence, validated before use and
-  // released only by explicit CRASH_CLEAR or their one-time per-boot latch.
+  // The same custody applies to Payload flight rings and Payload append-trace
+  // banks in payload.cpp: those remaining NOLOAD records are validated before
+  // use and released only by explicit CRASH_CLEAR or their one-time boot latch.
+  // Runtime, memory-audit/watchdog, and TimePop live recorders are RAM1 in this
+  // deterministic-memory baseline and intentionally do not survive reboot.
   g_system_dmamem_initialized = true;
 }
 
@@ -3529,8 +3549,6 @@ static FLASHMEM Payload cmd_crash_clear(const Payload& /*args*/) {
   g_system_crash_report_text[0] = '\0';
   memset((void*)&g_runtime_ledger_retained, 0,
          sizeof(g_runtime_ledger_retained));
-  arm_dcache_flush((void*)&g_runtime_ledger_retained,
-                   sizeof(g_runtime_ledger_retained));
 
   memory_audit_trace_clear_retained();
   system_watchdog_trace_clear_retained();

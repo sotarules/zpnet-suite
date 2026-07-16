@@ -474,19 +474,19 @@ static volatile uint32_t diag_idle_witness_wall_last_dwt = 0;
 static volatile bool     diag_idle_witness_wall_initialized = false;
 
 // ============================================================================
-// Retained TimePop dispatch flight recorder
+// TimePop dispatch flight recorder
 // ============================================================================
 //
-// This ring answers a narrow control-flow question after reboot: which callback
-// pointer was selected, did the callback return, and what scheduler operation
-// followed it?  Entries are scalar-only and exactly 64 bytes.  We preserve
-// pointers as integers and never dereference a possibly corrupt name while
-// recording.
+// This ring answers a narrow control-flow question: which callback pointer was
+// selected, did the callback return, and what scheduler operation followed it?
+// It is part of the live dispatch path and therefore uses ordinary RAM1 in this
+// deterministic-memory baseline.  The retained-bank API remains compatible,
+// but RAM1 startup initialization means it does not survive a reboot.
 //
-// Each entry commits with sequence/complement after all other fields.  The
-// entry itself is cache-flushed immediately.  A priority handler may preempt a
-// foreground recorder, but sequence reservation gives each writer a distinct
-// ring cell; snapshot code accepts only fully committed entries.
+// Each entry commits with sequence/complement after all other fields.  A
+// priority handler may preempt a foreground recorder, but sequence reservation
+// gives each writer a distinct ring cell; snapshot code accepts only fully
+// committed entries.
 
 static constexpr uint32_t TIMEPOP_DISPATCH_TRACE_MAGIC =
     0x54504631UL;  // 'TPF1'
@@ -504,8 +504,8 @@ struct alignas(32) timepop_dispatch_trace_bank_t {
 static_assert(sizeof(timepop_dispatch_trace_bank_t) % 32U == 0U,
               "TimePop dispatch trace bank must be cache-line aligned");
 
-static timepop_dispatch_trace_bank_t g_timepop_dispatch_trace_live DMAMEM;
-static timepop_dispatch_trace_bank_t g_timepop_dispatch_trace_retained DMAMEM;
+static timepop_dispatch_trace_bank_t g_timepop_dispatch_trace_live = {};
+static timepop_dispatch_trace_bank_t g_timepop_dispatch_trace_retained = {};
 static bool g_timepop_dispatch_trace_boot_latched = false;
 static volatile uint32_t g_timepop_dispatch_trace_next_sequence = 0;
 
@@ -551,23 +551,16 @@ static void timepop_dispatch_trace_initialize_live(void) {
   g_timepop_dispatch_trace_live.magic_inv = ~TIMEPOP_DISPATCH_TRACE_MAGIC;
   g_timepop_dispatch_trace_live.magic = TIMEPOP_DISPATCH_TRACE_MAGIC;
   g_timepop_dispatch_trace_next_sequence = 0U;
-  arm_dcache_flush((void*)&g_timepop_dispatch_trace_live,
-                   sizeof(g_timepop_dispatch_trace_live));
 }
 
 static void timepop_dispatch_trace_boot_latch(void) {
   if (g_timepop_dispatch_trace_boot_latched) return;
   g_timepop_dispatch_trace_boot_latched = true;
 
-  if (timepop_dispatch_trace_bank_valid(g_timepop_dispatch_trace_live)) {
-    g_timepop_dispatch_trace_retained = g_timepop_dispatch_trace_live;
-  } else {
-    memset((void*)&g_timepop_dispatch_trace_retained, 0,
-           sizeof(g_timepop_dispatch_trace_retained));
-  }
-  arm_dcache_flush((void*)&g_timepop_dispatch_trace_retained,
-                   sizeof(g_timepop_dispatch_trace_retained));
-
+  // Both banks are ordinary RAM1 and were zeroed by startup.  Keep the
+  // compatibility retained surface empty and initialize the live recorder.
+  memset((void*)&g_timepop_dispatch_trace_retained, 0,
+         sizeof(g_timepop_dispatch_trace_retained));
   timepop_dispatch_trace_initialize_live();
 }
 
@@ -624,8 +617,6 @@ static __attribute__((noinline)) void timepop_dispatch_trace_record(
   timepop_dispatch_trace_dmb();
   entry.sequence = sequence;  // commit last
   timepop_dispatch_trace_dmb();
-
-  arm_dcache_flush((void*)&entry, sizeof(entry));
 }
 
 #if defined(__arm__)
@@ -712,8 +703,6 @@ void timepop_dispatch_trace_snapshot(
 void timepop_dispatch_trace_clear_retained(void) {
   memset((void*)&g_timepop_dispatch_trace_retained, 0,
          sizeof(g_timepop_dispatch_trace_retained));
-  arm_dcache_flush((void*)&g_timepop_dispatch_trace_retained,
-                   sizeof(g_timepop_dispatch_trace_retained));
 }
 
 // ============================================================================

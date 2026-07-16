@@ -82,20 +82,21 @@ static constexpr uint32_t MEMORY_HEAP_FREE_CRITICAL_BYTES = 32768UL;
 // Keep recurring audit working state in ordinary RAM1/DTCM.  These objects are
 // current-boot mutable state, not retained evidence, and therefore should use
 // normal C/C++ initialization semantics and deterministic tightly-coupled RAM.
-// Only the dedicated retained audit trace banks below remain in DMAMEM.
+// The audit trace banks below are also live audit working state in this
+// deterministic-memory baseline and therefore remain in RAM1.
 static memory_info_t   _memory_health_memory_scratch = {};
 static payload_info_t  _memory_health_payload_scratch = {};
 static memory_health_t _memory_health = {};
 
 
 // ============================================================================
-// Retained memory-audit flight recorder
+// Memory-audit flight recorder
 // ============================================================================
 //
-// The audit is itself part of the trusted platform.  This ring therefore uses
-// only fixed RAM2 storage, scalar writes, sequence/complement commit, and one
-// cache flush per entry.  The surviving live bank is latched at the next boot
-// before current activity can overwrite it.
+// The audit is itself part of the trusted platform.  Both compatibility banks
+// use ordinary RAM1 so the recurring audit path never crosses cached RAM2.
+// The retained-bank API remains stable, but RAM1 startup initialization means
+// it does not preserve evidence across a reboot in this baseline.
 
 static constexpr uint32_t MEMORY_AUDIT_TRACE_MAGIC = 0x4D414631UL;  // 'MAF1'
 static constexpr uint32_t MEMORY_AUDIT_TRACE_SCHEMA_VERSION = 1U;
@@ -112,8 +113,8 @@ struct alignas(32) memory_audit_trace_bank_t {
 static_assert((sizeof(memory_audit_trace_bank_t) % 32U) == 0U,
               "memory audit trace bank must occupy complete cache lines");
 
-static memory_audit_trace_bank_t _memory_audit_trace_live DMAMEM;
-static memory_audit_trace_bank_t _memory_audit_trace_retained DMAMEM;
+static memory_audit_trace_bank_t _memory_audit_trace_live = {};
+static memory_audit_trace_bank_t _memory_audit_trace_retained = {};
 static bool _memory_audit_trace_boot_latched = false;  // ordinary BSS
 static volatile bool _memory_audit_trace_active = false;  // ordinary BSS
 static uint32_t _memory_audit_trace_next_sequence = 0U;
@@ -170,22 +171,16 @@ static void memory_audit_trace_initialize_live(void) {
     _memory_audit_trace_live.magic_inv = ~MEMORY_AUDIT_TRACE_MAGIC;
     _memory_audit_trace_live.magic = MEMORY_AUDIT_TRACE_MAGIC;
     _memory_audit_trace_next_sequence = 0U;
-    arm_dcache_flush((void*)&_memory_audit_trace_live,
-                     sizeof(_memory_audit_trace_live));
 }
 
 static void memory_audit_trace_boot_latch(void) {
     if (_memory_audit_trace_boot_latched) return;
     _memory_audit_trace_boot_latched = true;
 
-    if (memory_audit_trace_bank_valid(_memory_audit_trace_live)) {
-        _memory_audit_trace_retained = _memory_audit_trace_live;
-    } else {
-        memset((void*)&_memory_audit_trace_retained, 0,
-               sizeof(_memory_audit_trace_retained));
-    }
-    arm_dcache_flush((void*)&_memory_audit_trace_retained,
-                     sizeof(_memory_audit_trace_retained));
+    // Both banks are ordinary RAM1 and were zeroed by startup.  Keep the
+    // compatibility retained surface empty and initialize the live recorder.
+    memset((void*)&_memory_audit_trace_retained, 0,
+           sizeof(_memory_audit_trace_retained));
     memory_audit_trace_initialize_live();
 }
 
@@ -220,7 +215,6 @@ static void memory_audit_trace_record(memory_audit_trace_stage_t stage,
     memory_audit_trace_dmb();
     entry.sequence = sequence;  // commit last
     memory_audit_trace_dmb();
-    arm_dcache_flush((void*)&entry, sizeof(entry));
 }
 
 static void memory_audit_trace_snapshot_bank(
@@ -274,8 +268,6 @@ void memory_audit_trace_snapshot(memory_audit_trace_snapshot_t* out) {
 void memory_audit_trace_clear_retained(void) {
     memset((void*)&_memory_audit_trace_retained, 0,
            sizeof(_memory_audit_trace_retained));
-    arm_dcache_flush((void*)&_memory_audit_trace_retained,
-                     sizeof(_memory_audit_trace_retained));
 }
 
 // ============================================================================
@@ -343,9 +335,9 @@ void memory_info_init() {
     // audit can reuse the live ring.
     memory_audit_trace_boot_latch();
 
-    // Teensy places DMAMEM in the NOLOAD .bss.dma section.  Startup clears
-    // ordinary BSS only, so explicitly establish every RAM2 object's boot
-    // state before the first audit can read it.
+    // Establish an explicit current-boot audit baseline.  These objects now
+    // use ordinary RAM1 initialization; the assignments keep re-init behavior
+    // deterministic without relying on retained RAM2 semantics.
     _memory_health_memory_scratch = memory_info_t{};
     _memory_health_payload_scratch = payload_info_t{};
     _memory_health = memory_health_t{};

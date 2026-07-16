@@ -80,10 +80,11 @@
 // ISR / hot-path placement
 // ============================================================================
 //
-// Interrupt helpers and globals use normal compiler/linker placement so the
-// timing code remains easier to read and reason about.  Exception: bulky
-// report/scratch/ring stores below are explicitly placed in DMAMEM/RAM2 in the
-// crash-hunt build so RAM1 leaves enough DTCM headroom for ISR/foreground stack.
+// Interrupt helpers and operational globals use ordinary RAM1 placement.
+// Cold report scratch, post-failure evidence, and foreground-only bulk state
+// may remain in DMAMEM/RAM2.  State crossing priority-0 capture, priority-16
+// handoff, TimePop dispatch, or foreground reporting must not depend on cached
+// RAM2 timing.
 
 // process_clocks owns watchdog publication/stop semantics.  process_interrupt
 // only raises hard timing-identity faults through this narrow boundary.
@@ -255,7 +256,7 @@ static constexpr uint32_t COUNTER32_LINEAGE_LOCK_STREAK = 8U;
 // create false-negative mismatch blocks that look like real post-lock faults.
 static constexpr bool QTIMER_DWT_1KHZ_REQUIRES_ONE_SECOND_LOCK = true;
 
-static interrupt_integrity_snapshot_t g_interrupt_integrity DMAMEM = {};
+static interrupt_integrity_snapshot_t g_interrupt_integrity = {};
 static interrupt_integrity_snapshot_t g_interrupt_integrity_report_scratch DMAMEM = {};
 
 static void interrupt_integrity_note_vclock_gnss_ns(uint32_t sequence,
@@ -1104,7 +1105,7 @@ struct snapshot_store_t {
   volatile uint16_t pvc_ch3_at_edge           = 0;
 };
 
-static snapshot_store_t g_store DMAMEM;
+static snapshot_store_t g_store = {};
 
 static inline void dmb_barrier(void) {
   __asm__ volatile ("dmb" ::: "memory");
@@ -1203,7 +1204,7 @@ struct pps_yardstick_store_t {
   volatile uint32_t reset_count = 0;
 };
 
-static pps_yardstick_store_t g_pps_yardstick DMAMEM;
+static pps_yardstick_store_t g_pps_yardstick = {};
 static bool     g_pps_yardstick_prev_valid = false;
 static uint32_t g_pps_yardstick_prev_sequence = 0;
 static uint32_t g_pps_yardstick_prev_counter32 = 0;
@@ -1358,7 +1359,7 @@ struct smartzero2_system_t {
   uint32_t epoch_captures_qualified = 0;
   uint32_t epoch_captures_unqualified = 0;
 };
-static smartzero2_system_t g_smartzero2 DMAMEM;
+static smartzero2_system_t g_smartzero2 = {};
 
 struct epoch_capture_store_t {
   volatile uint32_t seq = 0;
@@ -1393,7 +1394,7 @@ struct epoch_capture_store_t {
   volatile uint32_t ocxo2_counter32 = 0;
 };
 
-static epoch_capture_store_t g_epoch_capture_store DMAMEM;
+static epoch_capture_store_t g_epoch_capture_store = {};
 
 static void epoch_capture_publish(const interrupt_epoch_capture_t& cap) {
   g_epoch_capture_store.seq++;
@@ -1531,7 +1532,7 @@ static volatile uint32_t g_pvc_anchor_seq = 0;
 static volatile uint32_t g_pvc_anchor_head = 0;
 static volatile uint32_t g_pvc_anchor_count = 0;
 static volatile bool     g_pvc_anchor_reset_pending = false;
-static pvc_anchor_record_t g_pvc_anchor_ring[PVC_ANCHOR_RING_SIZE] DMAMEM;
+static pvc_anchor_record_t g_pvc_anchor_ring[PVC_ANCHOR_RING_SIZE] = {};
 
 // Report-only accounting for CLOCKS/Alpha GNSS-label annotations.
 // The label API does not create anchors or change event custody; these counters
@@ -1777,7 +1778,7 @@ struct pps_gpio_heartbeat_t {
   uint32_t last_dwt     = 0;     // pps_vclock.dwt_at_edge of most recent edge
   int64_t  last_gnss_ns = -1;    // GNSS labels are CLOCKS-owned; unavailable here.
 };
-static pps_gpio_heartbeat_t g_pps_gpio_heartbeat DMAMEM;
+static pps_gpio_heartbeat_t g_pps_gpio_heartbeat = {};
 
 static uint32_t g_gpio_irq_count = 0;
 static uint32_t g_gpio_miss_count = 0;
@@ -1799,7 +1800,7 @@ struct pps_post_isr_mailbox_t {
   uint32_t isr_entry_dwt_raw = 0;
 };
 
-static pps_post_isr_mailbox_t g_pps_post_isr DMAMEM = {};
+static pps_post_isr_mailbox_t g_pps_post_isr = {};
 static void pps_post_isr_asap_callback(timepop_ctx_t*, timepop_diag_t*, void*);
 
 static volatile bool     g_pps_relay_timer_active = false;
@@ -1856,9 +1857,9 @@ struct vclock_epoch_latch_t {
   uint32_t sacred_dwt = 0;
 };
 
-static pps_t g_last_pps_witness DMAMEM = {};
+static pps_t g_last_pps_witness = {};
 static bool  g_last_pps_witness_valid = false;
-static vclock_epoch_latch_t g_vclock_epoch_latch DMAMEM = {};
+static vclock_epoch_latch_t g_vclock_epoch_latch = {};
 
 // Intrinsic CH2 PPS/VCLOCK selected-epoch publication.
 //
@@ -2046,7 +2047,7 @@ static uint32_t pps_vclock_phase_cycles_from_edges(const pps_t& pps,
                     (uint64_t)VCLOCK_COUNTS_PER_SECOND);
 }
 
-static pps_vclock_edge_authority_t g_pps_vclock_edge_authority DMAMEM = {};
+static pps_vclock_edge_authority_t g_pps_vclock_edge_authority = {};
 static bool     g_pps_vclock_phase_lower_valid = false;
 static uint32_t g_pps_vclock_phase_lower_cycles = 0;
 static uint32_t g_pps_vclock_edge_authority_update_count = 0;
@@ -2890,7 +2891,7 @@ static const interrupt_subscriber_descriptor_t DESCRIPTORS[] = {
   { interrupt_subscriber_kind_t::OCXO2,  "OCXO2",  interrupt_provider_kind_t::QTIMER3, interrupt_lane_t::QTIMER3_CH3_COMP },
 };
 
-static interrupt_subscriber_runtime_t g_subscribers[MAX_INTERRUPT_SUBSCRIBERS] DMAMEM = {};
+static interrupt_subscriber_runtime_t g_subscribers[MAX_INTERRUPT_SUBSCRIBERS] = {};
 static uint32_t g_subscriber_count = 0;
 static bool g_interrupt_hw_ready = false;
 static bool g_interrupt_runtime_ready = false;
@@ -2945,7 +2946,7 @@ struct vclock_lane_t {
   uint32_t bootstrap_count = 0;
   uint32_t cadence_hits_total = 0;
 };
-static vclock_lane_t g_vclock_lane DMAMEM;
+static vclock_lane_t g_vclock_lane = {};
 
 
 // ============================================================================
@@ -3059,9 +3060,9 @@ struct generation_gate_lane_t {
   uint32_t feature_custody_post_lock_reject_count = 0;
 };
 
-static generation_gate_lane_t g_generation_gate_vclock DMAMEM = {};
-static generation_gate_lane_t g_generation_gate_ocxo1 DMAMEM = {};
-static generation_gate_lane_t g_generation_gate_ocxo2 DMAMEM = {};
+static generation_gate_lane_t g_generation_gate_vclock = {};
+static generation_gate_lane_t g_generation_gate_ocxo1 = {};
+static generation_gate_lane_t g_generation_gate_ocxo2 = {};
 
 static bool generation_gate_feature_locked(const generation_gate_lane_t& s) {
   return s.feature_custody_locked &&
@@ -3757,8 +3758,8 @@ struct ocxo_qtimer_diag_t {
   volatile uint32_t dwt_coordinate_source = OCXO_DWT_SOURCE_NONE;
 };
 
-static ocxo_qtimer_diag_t g_ocxo1_qtimer_diag DMAMEM = {};
-static ocxo_qtimer_diag_t g_ocxo2_qtimer_diag DMAMEM = {};
+static ocxo_qtimer_diag_t g_ocxo1_qtimer_diag = {};
+static ocxo_qtimer_diag_t g_ocxo2_qtimer_diag = {};
 
 struct ocxo_runtime_context_t {
   interrupt_subscriber_kind_t kind = interrupt_subscriber_kind_t::NONE;
@@ -4292,7 +4293,7 @@ struct smartzero_runtime_t {
   smartzero_lane_runtime_t lanes[SMARTZERO_LANE_COUNT];
 };
 
-static smartzero_runtime_t g_smartzero DMAMEM = {};
+static smartzero_runtime_t g_smartzero = {};
 
 static interrupt_subscriber_kind_t smartzero_kind_for_index(uint32_t index) {
   switch (index) {
@@ -5260,7 +5261,7 @@ struct pps_floorline_repair_state_t {
 };
 
 static volatile uint32_t g_pps_floorline_repair_seq = 0;
-static pps_floorline_repair_state_t g_pps_floorline_repair DMAMEM = {};
+static pps_floorline_repair_state_t g_pps_floorline_repair = {};
 
 static void pps_floorline_repair_store(
     const pps_floorline_repair_state_t& value) {
@@ -5485,11 +5486,12 @@ struct lower_env_lane_t {
   uint32_t overflow_reset_count = 0;
 };
 
-// These are bulky priority-16/foreground diagnostic ledgers.  Keeping them in
-// RAM2 preserves scarce RAM1 for stack without slowing priority-0 capture.
-static lower_env_lane_t g_lower_env_vclock DMAMEM;
-static lower_env_lane_t g_lower_env_ocxo1 DMAMEM;
-static lower_env_lane_t g_lower_env_ocxo2 DMAMEM;
+// These ledgers are bulky, but sealing and mutation occur in both priority-0
+// capture and priority-16 handoff paths, and foreground reports read them.
+// Keep all three QTimer lanes uniform and deterministic in RAM1.
+static lower_env_lane_t g_lower_env_vclock = {};
+static lower_env_lane_t g_lower_env_ocxo1 = {};
+static lower_env_lane_t g_lower_env_ocxo2 = {};
 static uint32_t g_lower_env_snapshot_count = 0;
 static bool g_interrupt_feature_floorline_latched_nominal = false;
 
@@ -6873,6 +6875,9 @@ struct dwt_publication_request_t {
   const dwt_repair_diag_t* repair = nullptr;
 };
 
+// Final one-second publication adjudication runs only in deferred foreground
+// fact-drain/recovery paths.  Keep this compact three-lane state in RAM2 for
+// now; it does not cross the capture/handoff boundary under test.
 static dwt_publication_lane_state_t g_dwt_publication_vclock DMAMEM = {};
 static dwt_publication_lane_state_t g_dwt_publication_ocxo1 DMAMEM = {};
 static dwt_publication_lane_state_t g_dwt_publication_ocxo2 DMAMEM = {};
@@ -8363,7 +8368,7 @@ struct vclock_perishable_ring_t {
   volatile uint32_t asap_fail_count = 0;
 };
 
-static vclock_perishable_ring_t g_vclock_fact_ring DMAMEM = {};
+static vclock_perishable_ring_t g_vclock_fact_ring = {};
 static void vclock_fact_drain_callback(timepop_ctx_t*, timepop_diag_t*, void*);
 
 static void vclock_fact_ring_reset(void) {
@@ -9746,8 +9751,8 @@ struct ocxo_perishable_ring_t {
   volatile uint32_t asap_fail_count = 0;
 };
 
-static ocxo_perishable_ring_t g_ocxo1_fact_ring DMAMEM = {};
-static ocxo_perishable_ring_t g_ocxo2_fact_ring DMAMEM = {};
+static ocxo_perishable_ring_t g_ocxo1_fact_ring = {};
+static ocxo_perishable_ring_t g_ocxo2_fact_ring = {};
 
 static ocxo_perishable_ring_t&
 ocxo_fact_ring_for(ocxo_runtime_context_t& ctx) {
@@ -10832,12 +10837,12 @@ struct interrupt_handoff_diag_t {
   volatile const char* last_request_context = nullptr;
 };
 
-static interrupt_handoff_diag_t g_interrupt_handoff DMAMEM = {};
-static interrupt_handoff_source_diag_t g_handoff_qtimer1_ch1 DMAMEM = {};
-static interrupt_handoff_source_diag_t g_handoff_qtimer1_ch2 DMAMEM = {};
-static interrupt_handoff_source_diag_t g_handoff_ocxo1 DMAMEM = {};
-static interrupt_handoff_source_diag_t g_handoff_ocxo2 DMAMEM = {};
-static interrupt_handoff_source_diag_t g_handoff_pps DMAMEM = {};
+static interrupt_handoff_diag_t g_interrupt_handoff = {};
+static interrupt_handoff_source_diag_t g_handoff_qtimer1_ch1 = {};
+static interrupt_handoff_source_diag_t g_handoff_qtimer1_ch2 = {};
+static interrupt_handoff_source_diag_t g_handoff_ocxo1 = {};
+static interrupt_handoff_source_diag_t g_handoff_ocxo2 = {};
+static interrupt_handoff_source_diag_t g_handoff_pps = {};
 static volatile uint32_t g_interrupt_capture_sequence = 0;
 static volatile uint32_t g_pps_capture_sequence = 0;
 
@@ -13673,14 +13678,15 @@ static FLASHMEM const char* interrupt_fpu_policy_mode_name(uint32_t fpccr) {
   return "INVALID_ASPEN0_LSPEN1";
 }
 
-static bool g_interrupt_dmamem_initialized = false;
+static bool g_interrupt_state_initialized = false;
 
-static void interrupt_dmamem_cold_init(void) {
-  if (g_interrupt_dmamem_initialized) return;
+static void interrupt_state_cold_init(void) {
+  if (g_interrupt_state_initialized) return;
 
-  // Teensy places DMAMEM in the NOLOAD .bss.dma section.  Startup clears
-  // ordinary BSS only, so perform one complete RAM2 cold initialization before
-  // hardware setup can expose any of these stores to foreground code or an ISR.
+  // Establish one ordered baseline for both deterministic RAM1 operational
+  // state and the remaining cold/report-only RAM2 stores.  Startup already
+  // initializes RAM1, but the explicit assignments keep this transaction
+  // complete and make re-init behavior independent of placement.
   g_interrupt_integrity = interrupt_integrity_snapshot_t{};
   g_interrupt_integrity_report_scratch = interrupt_integrity_snapshot_t{};
   g_store = snapshot_store_t{};
@@ -13735,7 +13741,7 @@ static void interrupt_dmamem_cold_init(void) {
   g_handoff_ocxo2 = interrupt_handoff_source_diag_t{};
   g_handoff_pps = interrupt_handoff_source_diag_t{};
 
-  g_interrupt_dmamem_initialized = true;
+  g_interrupt_state_initialized = true;
 }
 
 void process_interrupt_init_hardware(void) {
@@ -13745,7 +13751,7 @@ void process_interrupt_init_hardware(void) {
   if (!interrupt_fpu_context_policy_install_once()) return;
   if (g_interrupt_hw_ready) return;
 
-  interrupt_dmamem_cold_init();
+  interrupt_state_cold_init();
   interrupt_features_mark_initializing();
 
   g_ocxo1_lane.name = "OCXO1";
