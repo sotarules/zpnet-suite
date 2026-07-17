@@ -23,8 +23,12 @@ volatile uint32_t g_crash_forensics_capture_active = 0U;
 alignas(8) uint32_t g_crash_forensics_emergency_stack[512];
 }
 
+alignas(32) static crash_forensics_core_record_t
+    g_crash_forensics_core_record DMAMEM;
 alignas(32) static crash_forensics_record_t g_crash_forensics_record DMAMEM;
 
+static constexpr uint32_t CRASH_FORENSICS_CORE_MAGIC = 0x5A504343UL; // "ZPCC"
+static constexpr uint32_t CRASH_FORENSICS_CORE_COMMITTED = 0x434F5245UL; // "CORE"
 static constexpr uint32_t CRASH_FORENSICS_MAGIC = 0x5A504346UL;     // "ZPCF"
 static constexpr uint32_t CRASH_FORENSICS_COMMITTED = 0x434F4D54UL; // "COMT"
 static constexpr size_t CRASH_FORENSICS_VECTOR_HARDFAULT = 3U;
@@ -151,12 +155,15 @@ static void zero_record(crash_forensics_record_t& record) {
     }
 }
 
-static uint32_t record_crc32(const crash_forensics_record_t& record) {
-    const uint32_t* p = reinterpret_cast<const uint32_t*>(&record);
-    const uint32_t* const end = reinterpret_cast<const uint32_t*>(
-        reinterpret_cast<const uint8_t*>(&record) +
-        offsetof(crash_forensics_record_t, crc32));
+static void zero_core_record(crash_forensics_core_record_t& record) {
+    uint32_t* words = reinterpret_cast<uint32_t*>(&record);
+    for (size_t i = 0; i < sizeof(record) / sizeof(uint32_t); ++i) {
+        words[i] = 0U;
+    }
+}
 
+static uint32_t crash_crc32_words(const uint32_t* p,
+                                  const uint32_t* end) {
     uint32_t crc = 0xFFFFFFFFUL;
     while (p < end) {
         crc ^= *p++;
@@ -165,6 +172,25 @@ static uint32_t record_crc32(const crash_forensics_record_t& record) {
         }
     }
     return crc;
+}
+
+static uint32_t core_record_crc32(
+    const crash_forensics_core_record_t& record) {
+    const uint32_t* const begin =
+        reinterpret_cast<const uint32_t*>(&record);
+    const uint32_t* const end = reinterpret_cast<const uint32_t*>(
+        reinterpret_cast<const uint8_t*>(&record) +
+        offsetof(crash_forensics_core_record_t, crc32));
+    return crash_crc32_words(begin, end);
+}
+
+static uint32_t record_crc32(const crash_forensics_record_t& record) {
+    const uint32_t* const begin =
+        reinterpret_cast<const uint32_t*>(&record);
+    const uint32_t* const end = reinterpret_cast<const uint32_t*>(
+        reinterpret_cast<const uint8_t*>(&record) +
+        offsetof(crash_forensics_record_t, crc32));
+    return crash_crc32_words(begin, end);
 }
 
 static bool range_contains(uintptr_t begin,
@@ -487,14 +513,367 @@ static uint32_t capture_centered_executable_window(
     return static_cast<uint32_t>(count);
 }
 
+static bool core_stack_span_readable(uintptr_t address, size_t bytes) {
+    uintptr_t begin = 0U;
+    uintptr_t end = 0U;
+    return stack_region_for(address, &begin, &end) &&
+           range_contains(begin, end, address, bytes);
+}
+
+static uint32_t capture_core_stack_words(
+    uint32_t base,
+    uint32_t* destination,
+    size_t capacity,
+    uint32_t* out_skip_reason) {
+    if (out_skip_reason) *out_skip_reason = CRASH_FORENSICS_SKIP_NONE;
+    if (!destination || capacity == 0U) {
+        if (out_skip_reason) {
+            *out_skip_reason = CRASH_FORENSICS_SKIP_INVALID_ARGUMENT;
+        }
+        return 0U;
+    }
+    if (base == 0U) {
+        if (out_skip_reason) *out_skip_reason = CRASH_FORENSICS_SKIP_ZERO_ADDRESS;
+        return 0U;
+    }
+    if ((base & 3U) != 0U) {
+        if (out_skip_reason) {
+            *out_skip_reason = CRASH_FORENSICS_SKIP_UNALIGNED_ADDRESS;
+        }
+        return 0U;
+    }
+
+    uintptr_t begin = 0U;
+    uintptr_t end = 0U;
+    if (!stack_region_for(base, &begin, &end)) {
+        if (out_skip_reason) {
+            *out_skip_reason = CRASH_FORENSICS_SKIP_OUTSIDE_STACK_MEMORY;
+        }
+        return 0U;
+    }
+
+    const size_t available =
+        static_cast<size_t>(end - static_cast<uintptr_t>(base)) /
+        sizeof(uint32_t);
+    const size_t count = capacity < available ? capacity : available;
+    if (count == 0U) {
+        if (out_skip_reason) {
+            *out_skip_reason = CRASH_FORENSICS_SKIP_ADDRESS_OVERFLOW;
+        }
+        return 0U;
+    }
+
+    for (size_t i = 0U; i < count; ++i) {
+        destination[i] = *reinterpret_cast<volatile const uint32_t*>(
+            static_cast<uintptr_t>(base) + i * sizeof(uint32_t));
+    }
+    return static_cast<uint32_t>(count);
+}
+
+static bool core_pc_plausible(uint32_t pc) {
+    if (pc == 0U || (pc & 1U) != 0U) return false;
+    uintptr_t begin = 0U;
+    uintptr_t end = 0U;
+    return executable_region_for(pc, &begin, &end) &&
+           range_contains(begin, end, pc, sizeof(uint16_t));
+}
+
+static bool core_lr_plausible(uint32_t lr) {
+    if (exception_return_value(lr)) return true;
+    if (lr == 0U || (lr & 1U) == 0U) return false;
+    const uint32_t address = lr & ~1UL;
+    uintptr_t begin = 0U;
+    uintptr_t end = 0U;
+    return executable_region_for(address, &begin, &end) &&
+           range_contains(begin, end, address, sizeof(uint16_t));
+}
+
+struct crash_basic_frame_selection_t {
+    bool readable;
+    bool plausible;
+    bool lr_plausible;
+    uint32_t offset_words;
+    uint32_t address;
+};
+
+static crash_basic_frame_selection_t core_basic_frame_candidate(
+    uint32_t frame_sp,
+    uint32_t offset_words) {
+    crash_basic_frame_selection_t candidate{};
+    candidate.offset_words = offset_words;
+
+    const uint32_t offset_bytes = offset_words * sizeof(uint32_t);
+    if ((frame_sp & 3U) != 0U ||
+        frame_sp > UINT32_MAX - offset_bytes) {
+        return candidate;
+    }
+
+    candidate.address = frame_sp + offset_bytes;
+    candidate.readable =
+        core_stack_span_readable(candidate.address, 8U * sizeof(uint32_t));
+    if (!candidate.readable) return candidate;
+
+    const volatile uint32_t* const basic =
+        reinterpret_cast<volatile const uint32_t*>(candidate.address);
+    const uint32_t lr = basic[5];
+    const uint32_t pc = basic[6];
+    const uint32_t xpsr = basic[7];
+    candidate.lr_plausible = core_lr_plausible(lr);
+    candidate.plausible =
+        (xpsr & (1UL << 24)) != 0U &&
+        core_pc_plausible(pc);
+    return candidate;
+}
+
+static crash_basic_frame_selection_t extended_basic_frame_candidate(
+    uint32_t frame_sp,
+    uint32_t offset_words) {
+    crash_basic_frame_selection_t candidate{};
+    candidate.offset_words = offset_words;
+
+    const uint32_t offset_bytes = offset_words * sizeof(uint32_t);
+    if ((frame_sp & 3U) != 0U ||
+        frame_sp > UINT32_MAX - offset_bytes) {
+        return candidate;
+    }
+
+    candidate.address = frame_sp + offset_bytes;
+    candidate.readable =
+        stack_span_readable(candidate.address, 8U * sizeof(uint32_t));
+    if (!candidate.readable) return candidate;
+
+    const volatile uint32_t* const basic =
+        reinterpret_cast<volatile const uint32_t*>(candidate.address);
+    const uint32_t lr = basic[5];
+    const uint32_t pc = basic[6];
+    const uint32_t xpsr = basic[7];
+    candidate.lr_plausible = stacked_lr_plausible(lr);
+    candidate.plausible =
+        (xpsr & (1UL << 24)) != 0U &&
+        stacked_pc_plausible(pc);
+    return candidate;
+}
+
+static crash_basic_frame_selection_t select_basic_frame(
+    const crash_basic_frame_selection_t& architectural,
+    const crash_basic_frame_selection_t& alternate) {
+    // EXC_RETURN is the architectural starting point, but lazy FP stacking or
+    // damaged exception metadata can make its bit-4 frame-shape hint disagree
+    // with the words actually present on the stack.  Prefer a frame that proves
+    // itself through xPSR, executable PC and lawful LR.
+    if (architectural.plausible && alternate.plausible) {
+        // A lawful LR strengthens a candidate, but an implausible stacked LR is
+        // itself valid crash evidence and must never disqualify an otherwise
+        // proven exception frame.
+        if (architectural.lr_plausible != alternate.lr_plausible) {
+            return architectural.lr_plausible ? architectural : alternate;
+        }
+        return architectural;
+    }
+    if (architectural.plausible) return architectural;
+    if (alternate.plausible) return alternate;
+
+    // If neither candidate is fully plausible, preserve the architectural
+    // preference when it is at least readable.  This keeps malformed-frame
+    // evidence available without allowing the hint to override a proven frame.
+    if (architectural.readable) return architectural;
+    return alternate;
+}
+
+static bool core_record_header_valid(
+    const crash_forensics_core_record_t& record) {
+    return record.magic == CRASH_FORENSICS_CORE_MAGIC &&
+           record.magic_inv == ~CRASH_FORENSICS_CORE_MAGIC &&
+           record.schema_version == CRASH_FORENSICS_CORE_SCHEMA_VERSION &&
+           record.record_size == sizeof(crash_forensics_core_record_t) &&
+           record.committed == CRASH_FORENSICS_CORE_COMMITTED &&
+           record.committed_inv == ~CRASH_FORENSICS_CORE_COMMITTED;
+}
+
+static bool core_record_crc_valid(
+    const crash_forensics_core_record_t& record) {
+    return core_record_header_valid(record) &&
+           core_record_crc32(record) == record.crc32;
+}
+
+static void core_record_publish_stage(
+    crash_forensics_capture_stage_t stage) {
+    crash_forensics_core_record_t& record = g_crash_forensics_core_record;
+    const uint32_t value = static_cast<uint32_t>(stage);
+
+    // Invalidate the pair first.  A fault during the update leaves the core
+    // record valid while making only the progress marker incoherent.
+    record.capture_stage_inv = value;
+    crash_barrier();
+    record.capture_stage = value;
+    record.capture_stage_inv = ~value;
+    crash_barrier();
+
+    arm_dcache_flush_delete(&record, sizeof(record));
+    crash_barrier();
+}
+
+static void capture_core_record_from_entry(
+    const crash_forensics_entry_context_t* entry,
+    uint32_t sequence) {
+    crash_forensics_core_record_t& record = g_crash_forensics_core_record;
+    zero_core_record(record);
+
+    record.magic = CRASH_FORENSICS_CORE_MAGIC;
+    record.magic_inv = ~CRASH_FORENSICS_CORE_MAGIC;
+    record.schema_version = CRASH_FORENSICS_CORE_SCHEMA_VERSION;
+    record.record_size = sizeof(crash_forensics_core_record_t);
+    record.capture_sequence = sequence;
+    record.capture_stage = CRASH_FORENSICS_STAGE_CORE_BEGIN;
+    record.capture_stage_inv = ~CRASH_FORENSICS_STAGE_CORE_BEGIN;
+
+    record.exception_number = read_ipsr() & 0x1FFU;
+    record.exc_return = entry->exc_return;
+    record.original_msp = entry->msp;
+    record.original_psp = entry->psp;
+    record.primask = entry->primask;
+    record.basepri = entry->basepri;
+    record.faultmask = entry->faultmask;
+    record.control = entry->control;
+    record.dwt_cyccnt = reg32(REG_DWT_CYCCNT);
+    record.cpu_hz = static_cast<uint32_t>(F_CPU_ACTUAL);
+
+    record.r4 = entry->r4;
+    record.r5 = entry->r5;
+    record.r6 = entry->r6;
+    record.r7 = entry->r7;
+    record.r8 = entry->r8;
+    record.r9 = entry->r9;
+    record.r10 = entry->r10;
+    record.r11 = entry->r11;
+
+    record.cfsr = reg32(REG_CFSR);
+    record.hfsr = reg32(REG_HFSR);
+    record.dfsr = reg32(REG_DFSR);
+    record.afsr = reg32(REG_AFSR);
+    record.mmfar = reg32(REG_MMFAR);
+    record.bfar = reg32(REG_BFAR);
+    record.shcsr = reg32(REG_SHCSR);
+    record.icsr = reg32(REG_ICSR);
+    record.fpccr = reg32(REG_FPCCR);
+    record.fpcar = reg32(REG_FPCAR);
+
+    record.frame_source = (entry->exc_return & (1UL << 2))
+        ? CRASH_FORENSICS_FRAME_PSP
+        : CRASH_FORENSICS_FRAME_MSP;
+    record.raw_frame_address = entry->frame_sp;
+
+    const bool extended_frame = (entry->exc_return & (1UL << 4)) == 0U;
+    if (extended_frame) {
+        record.flags |= CRASH_FORENSICS_FLAG_EXTENDED_FP_FRAME;
+    }
+    if (entry->exc_return & (1UL << 3)) {
+        record.flags |= CRASH_FORENSICS_FLAG_RETURN_TO_THREAD;
+    }
+
+    const bool stacking_fault =
+        (record.cfsr & CFSR_STACKING_ERROR_MASK) != 0U;
+    if (stacking_fault) {
+        record.flags |= CRASH_FORENSICS_FLAG_STACKING_FAULT;
+    }
+
+    const uint32_t architectural_offset_words =
+        extended_frame ? 18U : 0U;
+    const uint32_t alternate_offset_words =
+        extended_frame ? 0U : 18U;
+    const crash_basic_frame_selection_t architectural =
+        core_basic_frame_candidate(entry->frame_sp,
+                                   architectural_offset_words);
+    const crash_basic_frame_selection_t alternate =
+        core_basic_frame_candidate(entry->frame_sp,
+                                   alternate_offset_words);
+    const crash_basic_frame_selection_t selected =
+        select_basic_frame(architectural, alternate);
+
+    const uint32_t selected_basic_offset_words = selected.offset_words;
+    record.basic_frame_address = selected.address;
+    const bool frame_readable = selected.readable;
+    if (frame_readable) {
+        record.flags |= CRASH_FORENSICS_FLAG_FRAME_ADDRESS_READABLE;
+    }
+
+    if (frame_readable && !stacking_fault) {
+        const volatile uint32_t* const basic =
+            reinterpret_cast<volatile const uint32_t*>(
+                record.basic_frame_address);
+
+        record.r0 = basic[0];
+        record.r1 = basic[1];
+        record.r2 = basic[2];
+        record.r3 = basic[3];
+        record.r12 = basic[4];
+        record.stacked_lr = basic[5];
+        record.stacked_pc = basic[6];
+        record.stacked_xpsr = basic[7];
+        record.interrupted_exception_number = record.stacked_xpsr & 0x1FFU;
+        record.flags |= CRASH_FORENSICS_FLAG_BASIC_FRAME_VALID;
+
+        uint32_t complete_frame_words = selected_basic_offset_words + 8U;
+        if ((record.stacked_xpsr & (1UL << 9)) != 0U) {
+            complete_frame_words++;
+            record.flags |= CRASH_FORENSICS_FLAG_STACK_ALIGNMENT_WORD;
+        }
+        if (entry->frame_sp <=
+            UINT32_MAX - complete_frame_words * sizeof(uint32_t)) {
+            record.interrupted_sp =
+                entry->frame_sp + complete_frame_words * sizeof(uint32_t);
+        }
+
+        if (record.interrupted_exception_number != 0U) {
+            record.flags |= CRASH_FORENSICS_FLAG_INTERRUPTED_HANDLER;
+        }
+        if ((record.stacked_xpsr & (1UL << 24)) != 0U &&
+            core_pc_plausible(record.stacked_pc) &&
+            core_lr_plausible(record.stacked_lr)) {
+            record.flags |= CRASH_FORENSICS_FLAG_FRAME_CONTENT_PLAUSIBLE;
+        }
+    }
+
+    record.stack_base = entry->frame_sp;
+    if (stacking_fault) {
+        record.stack_skip_reason = CRASH_FORENSICS_SKIP_STACKING_FAULT;
+    } else {
+        record.stack_word_count = capture_core_stack_words(
+            record.stack_base,
+            record.stack_words,
+            CRASH_FORENSICS_CORE_STACK_WORDS,
+            &record.stack_skip_reason);
+        if (record.stack_word_count != 0U) {
+            record.flags |= CRASH_FORENSICS_FLAG_ACTIVE_STACK_CAPTURED;
+        }
+    }
+
+    record.crc32 = core_record_crc32(record);
+    crash_barrier();
+    record.committed = CRASH_FORENSICS_CORE_COMMITTED;
+    record.committed_inv = ~CRASH_FORENSICS_CORE_COMMITTED;
+    record.capture_stage = CRASH_FORENSICS_STAGE_CORE_COMMITTED;
+    record.capture_stage_inv = ~CRASH_FORENSICS_STAGE_CORE_COMMITTED;
+    crash_barrier();
+
+    arm_dcache_flush_delete(&record, sizeof(record));
+    crash_barrier();
+}
+
+
 static uint32_t coherent_prior_sequence(void) {
+    if (core_record_crc_valid(g_crash_forensics_core_record)) {
+        return g_crash_forensics_core_record.capture_sequence;
+    }
+
     const crash_forensics_record_t& record = g_crash_forensics_record;
     if (record.magic != CRASH_FORENSICS_MAGIC ||
         record.magic_inv != ~CRASH_FORENSICS_MAGIC ||
         record.schema_version != CRASH_FORENSICS_SCHEMA_VERSION ||
         record.record_size != sizeof(crash_forensics_record_t) ||
         record.committed != CRASH_FORENSICS_COMMITTED ||
-        record.committed_inv != ~CRASH_FORENSICS_COMMITTED) {
+        record.committed_inv != ~CRASH_FORENSICS_COMMITTED ||
+        record_crc32(record) != record.crc32) {
         return 0U;
     }
     return record.capture_sequence;
@@ -512,6 +891,12 @@ extern "C" void crash_forensics_capture_from_entry(
     uint32_t sequence = coherent_prior_sequence() + 1U;
     if (sequence == 0U) sequence = 1U;
 
+    // Phase 1: commit the small, direct-read core record before any MPU walk,
+    // executable-window inspection, or extended stack capture can fault.
+    capture_core_record_from_entry(entry, sequence);
+    core_record_publish_stage(CRASH_FORENSICS_STAGE_EXTENDED_BEGIN);
+
+    // Phase 2: preserve the existing rich recorder as best-effort evidence.
     zero_record(record);
     record.magic = CRASH_FORENSICS_MAGIC;
     record.magic_inv = ~CRASH_FORENSICS_MAGIC;
@@ -573,7 +958,6 @@ extern "C" void crash_forensics_capture_from_entry(
     record.raw_frame_address = entry->frame_sp;
 
     const bool extended_frame = (entry->exc_return & (1UL << 4)) == 0U;
-    const uint32_t basic_offset_words = extended_frame ? 18U : 0U;
     if (extended_frame) {
         record.flags |= CRASH_FORENSICS_FLAG_EXTENDED_FP_FRAME;
     }
@@ -586,17 +970,22 @@ extern "C" void crash_forensics_capture_from_entry(
         record.flags |= CRASH_FORENSICS_FLAG_STACKING_FAULT;
     }
 
-    const size_t required_frame_bytes =
-        static_cast<size_t>(basic_offset_words + 8U) * sizeof(uint32_t);
-    const uint32_t basic_offset_bytes = basic_offset_words * 4U;
-    const bool basic_address_valid =
-        entry->frame_sp <= UINT32_MAX - basic_offset_bytes;
-    record.basic_frame_address = basic_address_valid
-        ? entry->frame_sp + basic_offset_bytes
-        : 0U;
-    const bool frame_readable = basic_address_valid &&
-        (entry->frame_sp & 3U) == 0U &&
-        stack_span_readable(entry->frame_sp, required_frame_bytes);
+    const uint32_t architectural_offset_words =
+        extended_frame ? 18U : 0U;
+    const uint32_t alternate_offset_words =
+        extended_frame ? 0U : 18U;
+    const crash_basic_frame_selection_t architectural =
+        extended_basic_frame_candidate(entry->frame_sp,
+                                       architectural_offset_words);
+    const crash_basic_frame_selection_t alternate =
+        extended_basic_frame_candidate(entry->frame_sp,
+                                       alternate_offset_words);
+    const crash_basic_frame_selection_t selected =
+        select_basic_frame(architectural, alternate);
+
+    const uint32_t selected_basic_offset_words = selected.offset_words;
+    record.basic_frame_address = selected.address;
+    const bool frame_readable = selected.readable;
     if (frame_readable) {
         record.flags |= CRASH_FORENSICS_FLAG_FRAME_ADDRESS_READABLE;
     }
@@ -604,7 +993,9 @@ extern "C" void crash_forensics_capture_from_entry(
     if (frame_readable && !stacking_fault) {
         const volatile uint32_t* const raw_frame =
             reinterpret_cast<volatile const uint32_t*>(entry->frame_sp);
-        const volatile uint32_t* const basic = raw_frame + basic_offset_words;
+        const volatile uint32_t* const basic =
+            reinterpret_cast<volatile const uint32_t*>(
+                record.basic_frame_address);
 
         record.r0 = basic[0];
         record.r1 = basic[1];
@@ -648,7 +1039,8 @@ extern "C" void crash_forensics_capture_from_entry(
             record.flags |= CRASH_FORENSICS_FLAG_STACK_ALIGNMENT_WORD;
         }
 
-        if (extended_frame && stack_span_readable(
+        if (extended_frame &&
+            selected_basic_offset_words == 18U && stack_span_readable(
                 entry->frame_sp,
                 CRASH_FORENSICS_FP_FRAME_WORDS * sizeof(uint32_t))) {
             record.fp_frame_word_count = CRASH_FORENSICS_FP_FRAME_WORDS;
@@ -658,6 +1050,8 @@ extern "C" void crash_forensics_capture_from_entry(
             record.flags |= CRASH_FORENSICS_FLAG_FP_FRAME_CAPTURED;
         }
     }
+
+    core_record_publish_stage(CRASH_FORENSICS_STAGE_EXTENDED_STACKS);
 
     record.active_stack_base = entry->frame_sp;
     if (stacking_fault) {
@@ -692,6 +1086,8 @@ extern "C" void crash_forensics_capture_from_entry(
             record.flags |= CRASH_FORENSICS_FLAG_OTHER_STACK_CAPTURED;
         }
     }
+
+    core_record_publish_stage(CRASH_FORENSICS_STAGE_EXTENDED_WINDOWS);
 
     if ((record.flags & CRASH_FORENSICS_FLAG_FRAME_CONTENT_PLAUSIBLE) != 0U) {
         record.pc_window_word_count = capture_centered_executable_window(
@@ -729,6 +1125,8 @@ extern "C" void crash_forensics_capture_from_entry(
         record.flags |= CRASH_FORENSICS_FLAG_CAPTURE_SKIPPED;
     }
 
+    core_record_publish_stage(CRASH_FORENSICS_STAGE_EXTENDED_NVIC);
+
     record.vector_hardfault =
         static_cast<uint32_t>(reinterpret_cast<uintptr_t>(
             _VectorsRam[CRASH_FORENSICS_VECTOR_HARDFAULT]));
@@ -762,6 +1160,8 @@ extern "C" void crash_forensics_capture_from_entry(
     }
     record.flags |= CRASH_FORENSICS_FLAG_NVIC_CAPTURED;
 
+    core_record_publish_stage(CRASH_FORENSICS_STAGE_EXTENDED_MPU);
+
     record.mpu_type = reg32(REG_MPU_TYPE);
     record.mpu_ctrl = reg32(REG_MPU_CTRL);
     record.mpu_rnr = reg32(REG_MPU_RNR);
@@ -788,6 +1188,8 @@ extern "C" void crash_forensics_capture_from_entry(
 
     arm_dcache_flush_delete(&record, sizeof(record));
     crash_barrier();
+
+    core_record_publish_stage(CRASH_FORENSICS_STAGE_EXTENDED_COMMITTED);
 }
 
 // ============================================================================
@@ -1395,27 +1797,51 @@ FLASHMEM bool crash_forensics_installed(void) {
 FLASHMEM void crash_forensics_get_status(crash_forensics_status_t* out) {
     if (!out) return;
 
+    *out = crash_forensics_status_t{};
     out->installed = crash_forensics_installed();
-    out->present = false;
-    out->header_valid = false;
-    out->crc_valid = false;
-    out->stored_crc = g_crash_forensics_record.crc32;
-    out->computed_crc = 0U;
+
+    const crash_forensics_core_record_t& core =
+        g_crash_forensics_core_record;
+    out->core_stored_crc = core.crc32;
+    out->core_present =
+        core.magic == CRASH_FORENSICS_CORE_MAGIC &&
+        core.magic_inv == ~CRASH_FORENSICS_CORE_MAGIC;
+    if (out->core_present) {
+        out->core_header_valid = core_record_header_valid(core);
+        if (out->core_header_valid) {
+            out->core_computed_crc = core_record_crc32(core);
+            out->core_crc_valid =
+                out->core_computed_crc == core.crc32;
+        }
+    }
 
     const crash_forensics_record_t& record = g_crash_forensics_record;
-    out->present = record.magic == CRASH_FORENSICS_MAGIC &&
-                   record.magic_inv == ~CRASH_FORENSICS_MAGIC;
-    if (!out->present) return;
+    out->stored_crc = record.crc32;
+    out->extended_present =
+        record.magic == CRASH_FORENSICS_MAGIC &&
+        record.magic_inv == ~CRASH_FORENSICS_MAGIC;
+    if (out->extended_present) {
+        out->header_valid =
+            record.schema_version == CRASH_FORENSICS_SCHEMA_VERSION &&
+            record.record_size == sizeof(crash_forensics_record_t) &&
+            record.committed == CRASH_FORENSICS_COMMITTED &&
+            record.committed_inv == ~CRASH_FORENSICS_COMMITTED;
+        if (out->header_valid) {
+            out->computed_crc = record_crc32(record);
+            out->crc_valid = out->computed_crc == record.crc32;
+        }
+    }
 
-    out->header_valid =
-        record.schema_version == CRASH_FORENSICS_SCHEMA_VERSION &&
-        record.record_size == sizeof(crash_forensics_record_t) &&
-        record.committed == CRASH_FORENSICS_COMMITTED &&
-        record.committed_inv == ~CRASH_FORENSICS_COMMITTED;
-    if (!out->header_valid) return;
+    out->present = out->core_present || out->extended_present;
+}
 
-    out->computed_crc = record_crc32(record);
-    out->crc_valid = out->computed_crc == record.crc32;
+FLASHMEM const crash_forensics_core_record_t*
+crash_forensics_core_record(void) {
+    crash_forensics_status_t status{};
+    crash_forensics_get_status(&status);
+    return status.core_crc_valid
+        ? &g_crash_forensics_core_record
+        : nullptr;
 }
 
 FLASHMEM const crash_forensics_record_t* crash_forensics_record(void) {
@@ -1427,8 +1853,11 @@ FLASHMEM const crash_forensics_record_t* crash_forensics_record(void) {
 FLASHMEM void crash_forensics_clear(void) {
     const uint32_t saved_primask = read_primask();
     disable_interrupts();
+    zero_core_record(g_crash_forensics_core_record);
     zero_record(g_crash_forensics_record);
     crash_barrier();
+    arm_dcache_flush_delete(&g_crash_forensics_core_record,
+                            sizeof(g_crash_forensics_core_record));
     arm_dcache_flush_delete(&g_crash_forensics_record,
                             sizeof(g_crash_forensics_record));
     crash_barrier();
@@ -1451,6 +1880,29 @@ FLASHMEM const char* crash_forensics_frame_source_name(uint32_t frame_source) {
         case CRASH_FORENSICS_FRAME_MSP: return "MSP";
         case CRASH_FORENSICS_FRAME_PSP: return "PSP";
         default: return "NONE";
+    }
+}
+
+FLASHMEM const char* crash_forensics_capture_stage_name(uint32_t stage) {
+    switch ((crash_forensics_capture_stage_t)stage) {
+        case CRASH_FORENSICS_STAGE_CORE_BEGIN:
+            return "CORE_BEGIN";
+        case CRASH_FORENSICS_STAGE_CORE_COMMITTED:
+            return "CORE_COMMITTED";
+        case CRASH_FORENSICS_STAGE_EXTENDED_BEGIN:
+            return "EXTENDED_BEGIN";
+        case CRASH_FORENSICS_STAGE_EXTENDED_STACKS:
+            return "EXTENDED_STACKS";
+        case CRASH_FORENSICS_STAGE_EXTENDED_WINDOWS:
+            return "EXTENDED_WINDOWS";
+        case CRASH_FORENSICS_STAGE_EXTENDED_NVIC:
+            return "EXTENDED_NVIC";
+        case CRASH_FORENSICS_STAGE_EXTENDED_MPU:
+            return "EXTENDED_MPU";
+        case CRASH_FORENSICS_STAGE_EXTENDED_COMMITTED:
+            return "EXTENDED_COMMITTED";
+        default:
+            return "NONE";
     }
 }
 

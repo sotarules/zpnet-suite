@@ -17,9 +17,11 @@
 // ============================================================================
 
 static constexpr uint32_t CRASH_FORENSICS_SCHEMA_VERSION = 2U;
+static constexpr uint32_t CRASH_FORENSICS_CORE_SCHEMA_VERSION = 1U;
 static constexpr size_t CRASH_FORENSICS_NVIC_WORDS = 5U;
 static constexpr size_t CRASH_FORENSICS_MPU_REGIONS = 16U;
 static constexpr size_t CRASH_FORENSICS_FP_FRAME_WORDS = 18U;
+static constexpr size_t CRASH_FORENSICS_CORE_STACK_WORDS = 32U;
 static constexpr size_t CRASH_FORENSICS_ACTIVE_STACK_WORDS = 64U;
 static constexpr size_t CRASH_FORENSICS_OTHER_STACK_WORDS = 16U;
 static constexpr size_t CRASH_FORENSICS_PC_WINDOW_WORDS = 24U;
@@ -29,6 +31,18 @@ enum crash_forensics_frame_source_t : uint32_t {
     CRASH_FORENSICS_FRAME_NONE = 0U,
     CRASH_FORENSICS_FRAME_MSP = 1U,
     CRASH_FORENSICS_FRAME_PSP = 2U,
+};
+
+enum crash_forensics_capture_stage_t : uint32_t {
+    CRASH_FORENSICS_STAGE_NONE = 0U,
+    CRASH_FORENSICS_STAGE_CORE_BEGIN = 1U,
+    CRASH_FORENSICS_STAGE_CORE_COMMITTED = 2U,
+    CRASH_FORENSICS_STAGE_EXTENDED_BEGIN = 3U,
+    CRASH_FORENSICS_STAGE_EXTENDED_STACKS = 4U,
+    CRASH_FORENSICS_STAGE_EXTENDED_WINDOWS = 5U,
+    CRASH_FORENSICS_STAGE_EXTENDED_NVIC = 6U,
+    CRASH_FORENSICS_STAGE_EXTENDED_MPU = 7U,
+    CRASH_FORENSICS_STAGE_EXTENDED_COMMITTED = 8U,
 };
 
 enum crash_forensics_capture_skip_reason_t : uint32_t {
@@ -65,6 +79,78 @@ enum crash_forensics_flag_t : uint32_t {
     CRASH_FORENSICS_FLAG_FRAME_CONTENT_PLAUSIBLE = 1UL << 14,
     CRASH_FORENSICS_FLAG_CAPTURE_SKIPPED = 1UL << 15,
 };
+
+struct crash_forensics_core_record_t {
+    uint32_t magic;
+    uint32_t magic_inv;
+    uint32_t schema_version;
+    uint32_t record_size;
+    uint32_t capture_sequence;
+    uint32_t flags;
+
+    uint32_t exception_number;
+    uint32_t interrupted_exception_number;
+    uint32_t frame_source;
+    uint32_t raw_frame_address;
+    uint32_t basic_frame_address;
+    uint32_t interrupted_sp;
+    uint32_t exc_return;
+    uint32_t original_msp;
+    uint32_t original_psp;
+    uint32_t primask;
+    uint32_t basepri;
+    uint32_t faultmask;
+    uint32_t control;
+    uint32_t dwt_cyccnt;
+    uint32_t cpu_hz;
+
+    uint32_t r0;
+    uint32_t r1;
+    uint32_t r2;
+    uint32_t r3;
+    uint32_t r12;
+    uint32_t stacked_lr;
+    uint32_t stacked_pc;
+    uint32_t stacked_xpsr;
+
+    uint32_t r4;
+    uint32_t r5;
+    uint32_t r6;
+    uint32_t r7;
+    uint32_t r8;
+    uint32_t r9;
+    uint32_t r10;
+    uint32_t r11;
+
+    uint32_t cfsr;
+    uint32_t hfsr;
+    uint32_t dfsr;
+    uint32_t afsr;
+    uint32_t mmfar;
+    uint32_t bfar;
+    uint32_t shcsr;
+    uint32_t icsr;
+    uint32_t fpccr;
+    uint32_t fpcar;
+
+    uint32_t stack_base;
+    uint32_t stack_word_count;
+    uint32_t stack_skip_reason;
+    uint32_t stack_words[CRASH_FORENSICS_CORE_STACK_WORDS];
+
+    uint32_t crc32;
+    uint32_t committed;
+    uint32_t committed_inv;
+
+    // Progress is deliberately outside the core CRC.  The core record remains
+    // valid even if a later stage update or extended capture faults.
+    uint32_t capture_stage;
+    uint32_t capture_stage_inv;
+    uint32_t reserved_tail[1];
+};
+
+static_assert((sizeof(crash_forensics_core_record_t) % 32U) == 0U,
+              "Core crash record must occupy complete Cortex-M7 cache lines");
 
 struct crash_forensics_record_t {
     // Retained-record envelope.
@@ -202,6 +288,14 @@ struct crash_forensics_record_t {
 struct crash_forensics_status_t {
     bool installed;
     bool present;
+
+    bool core_present;
+    bool core_header_valid;
+    bool core_crc_valid;
+    uint32_t core_stored_crc;
+    uint32_t core_computed_crc;
+
+    bool extended_present;
     bool header_valid;
     bool crc_valid;
     uint32_t stored_crc;
@@ -215,11 +309,13 @@ void crash_forensics_install(void);
 bool crash_forensics_installed(void);
 
 void crash_forensics_get_status(crash_forensics_status_t* out);
+const crash_forensics_core_record_t* crash_forensics_core_record(void);
 const crash_forensics_record_t* crash_forensics_record(void);
 void crash_forensics_clear(void);
 
 const char* crash_forensics_exception_name(uint32_t exception_number);
 const char* crash_forensics_frame_source_name(uint32_t frame_source);
+const char* crash_forensics_capture_stage_name(uint32_t stage);
 const char* crash_forensics_capture_skip_reason_name(uint32_t reason);
 
 // ============================================================================

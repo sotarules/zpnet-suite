@@ -1016,18 +1016,130 @@ static FLASHMEM Payload system_crash_word_window_payload(uint32_t base,
   return out;
 }
 
+static FLASHMEM Payload system_crash_core_forensics_payload(
+    const crash_forensics_core_record_t& record) {
+  Payload out;
+  out.add("schema", "ZPNET_CRASH_FORENSICS_CORE_V1");
+  out.add("schema_version", record.schema_version);
+  out.add("record_size", record.record_size);
+  out.add("capture_sequence", record.capture_sequence);
+  out.add("flags", record.flags);
+  system_crash_add_hex32(out, "flags_hex", record.flags);
+  system_crash_add_hex32(out, "committed", record.committed);
+  system_crash_add_hex32(out, "committed_inv", record.committed_inv);
+
+  const bool stage_coherent =
+      (record.capture_stage ^ record.capture_stage_inv) == 0xFFFFFFFFUL;
+  out.add("capture_stage_coherent", stage_coherent);
+  out.add("capture_stage_id", record.capture_stage);
+  out.add("capture_stage",
+          stage_coherent
+              ? crash_forensics_capture_stage_name(record.capture_stage)
+              : "INCOHERENT");
+
+  out.add("exception_number", record.exception_number);
+  out.add("exception_name",
+          crash_forensics_exception_name(record.exception_number));
+  out.add("interrupted_exception_number",
+          record.interrupted_exception_number);
+  out.add("frame_source",
+          crash_forensics_frame_source_name(record.frame_source));
+
+  Payload frame;
+  system_crash_add_hex32(frame, "raw_frame_address",
+                         record.raw_frame_address);
+  system_crash_add_hex32(frame, "basic_frame_address",
+                         record.basic_frame_address);
+  system_crash_add_hex32(frame, "interrupted_sp", record.interrupted_sp);
+  system_crash_add_hex32(frame, "exc_return", record.exc_return);
+  system_crash_add_hex32(frame, "r0", record.r0);
+  system_crash_add_hex32(frame, "r1", record.r1);
+  system_crash_add_hex32(frame, "r2", record.r2);
+  system_crash_add_hex32(frame, "r3", record.r3);
+  system_crash_add_hex32(frame, "r12", record.r12);
+  system_crash_add_hex32(frame, "lr", record.stacked_lr);
+  system_crash_add_hex32(frame, "pc", record.stacked_pc);
+  system_crash_add_hex32(frame, "xpsr", record.stacked_xpsr);
+  out.add_object("exception_frame", frame);
+
+  Payload callee_saved;
+  system_crash_add_hex32(callee_saved, "r4", record.r4);
+  system_crash_add_hex32(callee_saved, "r5", record.r5);
+  system_crash_add_hex32(callee_saved, "r6", record.r6);
+  system_crash_add_hex32(callee_saved, "r7", record.r7);
+  system_crash_add_hex32(callee_saved, "r8", record.r8);
+  system_crash_add_hex32(callee_saved, "r9", record.r9);
+  system_crash_add_hex32(callee_saved, "r10", record.r10);
+  system_crash_add_hex32(callee_saved, "r11", record.r11);
+  out.add_object("callee_saved", callee_saved);
+
+  Payload control;
+  system_crash_add_hex32(control, "msp", record.original_msp);
+  system_crash_add_hex32(control, "psp", record.original_psp);
+  system_crash_add_hex32(control, "primask", record.primask);
+  system_crash_add_hex32(control, "basepri", record.basepri);
+  system_crash_add_hex32(control, "faultmask", record.faultmask);
+  system_crash_add_hex32(control, "control", record.control);
+  system_crash_add_hex32(control, "dwt_cyccnt", record.dwt_cyccnt);
+  control.add("cpu_hz", record.cpu_hz);
+  out.add_object("processor_control", control);
+
+  Payload fault;
+  system_crash_add_hex32(fault, "cfsr", record.cfsr);
+  system_crash_add_hex32(fault, "hfsr", record.hfsr);
+  system_crash_add_hex32(fault, "dfsr", record.dfsr);
+  system_crash_add_hex32(fault, "afsr", record.afsr);
+  system_crash_add_hex32(fault, "mmfar", record.mmfar);
+  system_crash_add_hex32(fault, "bfar", record.bfar);
+  system_crash_add_hex32(fault, "shcsr", record.shcsr);
+  system_crash_add_hex32(fault, "icsr", record.icsr);
+  system_crash_add_hex32(fault, "fpccr", record.fpccr);
+  system_crash_add_hex32(fault, "fpcar", record.fpcar);
+  out.add_object("fault_registers", fault);
+
+  Payload stack = system_crash_word_window_payload(
+      record.stack_base,
+      record.stack_word_count,
+      record.stack_words,
+      CRASH_FORENSICS_CORE_STACK_WORDS);
+  stack.add("skip_reason_id", record.stack_skip_reason);
+  stack.add("skip_reason",
+            crash_forensics_capture_skip_reason_name(
+                record.stack_skip_reason));
+  out.add_object("stack", stack);
+
+  return out;
+}
+
 static FLASHMEM Payload system_crash_forensics_payload(void) {
   crash_forensics_status_t status{};
   crash_forensics_get_status(&status);
 
   Payload out;
-  out.add("schema", "ZPNET_CRASH_FORENSICS_V2");
+  out.add("schema", "ZPNET_CRASH_FORENSICS_V3");
   out.add("installed_now", status.installed);
   out.add("present", status.present);
+
+  out.add("core_present", status.core_present);
+  out.add("core_header_valid", status.core_header_valid);
+  out.add("core_crc_valid", status.core_crc_valid);
+  system_crash_add_hex32(out, "core_stored_crc",
+                         status.core_stored_crc);
+  system_crash_add_hex32(out, "core_computed_crc",
+                         status.core_computed_crc);
+
+  out.add("extended_present", status.extended_present);
   out.add("header_valid", status.header_valid);
   out.add("crc_valid", status.crc_valid);
   system_crash_add_hex32(out, "stored_crc", status.stored_crc);
   system_crash_add_hex32(out, "computed_crc", status.computed_crc);
+
+  const crash_forensics_core_record_t* core =
+      crash_forensics_core_record();
+  if (core) {
+    out.add_object("core",
+                   system_crash_core_forensics_payload(*core));
+  }
 
   const crash_forensics_record_t* record = crash_forensics_record();
   if (!record) return out;
