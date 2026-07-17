@@ -1038,6 +1038,10 @@ static constexpr uint32_t HANDOFF_QTIMER1_CH1_RING_SIZE = 8U;
 static constexpr uint32_t HANDOFF_QTIMER1_CH2_RING_SIZE = 16U;
 static constexpr uint32_t HANDOFF_OCXO_RING_SIZE = 8U;
 static constexpr uint32_t HANDOFF_PPS_RING_SIZE = 4U;
+static constexpr const char* INTERRUPT_FLOORLINE_WRITER_CONTEXT =
+    "PRIORITY16_HANDOFF_SINGLE_WRITER";
+static constexpr const char* INTERRUPT_SUBSCRIBER_DISPATCH_CONTEXT =
+    "TIMEPOP_ASAP_AFTER_FACT_DRAIN_UNWIND";
 
 
 // ============================================================================
@@ -5487,22 +5491,154 @@ struct lower_env_lane_t {
   uint32_t overflow_reset_count = 0;
 };
 
-// These ledgers are bulky, but sealing and mutation occur in both priority-0
-// capture and priority-16 handoff paths, and foreground reports read them.
-// Keep all three QTimer lanes uniform and deterministic in RAM1.
-static lower_env_lane_t g_lower_env_vclock = {};
-static lower_env_lane_t g_lower_env_ocxo1 = {};
-static lower_env_lane_t g_lower_env_ocxo2 = {};
-static uint32_t g_lower_env_snapshot_count = 0;
-static bool g_interrupt_feature_floorline_latched_nominal = false;
+// FloorLine has one operational writer: the priority-16 handoff tier.  All
+// three QTimer lanes cross an immutable priority-0 capture boundary before
+// entering the estimator.  Foreground publication/reporting reads a coherent
+// whole-lane snapshot instead of the live writer state.
+struct lower_env_lane_store_t {
+  volatile uint32_t seq = 0;
+  lower_env_lane_t lane{};
+};
 
-static lower_env_lane_t* lower_env_lane_for(interrupt_subscriber_kind_t kind) {
+struct lower_env_consumer_state_t {
+  uint32_t last_raw_bookend_sequence = 0;
+  uint32_t raw_bookend_report_count = 0;
+  uint32_t watchdog_anomaly_count = 0;
+  uint32_t last_watchdog_reason = 0;
+};
+
+static lower_env_lane_store_t g_lower_env_vclock_store = {};
+static lower_env_lane_store_t g_lower_env_ocxo1_store = {};
+static lower_env_lane_store_t g_lower_env_ocxo2_store = {};
+static lower_env_consumer_state_t g_lower_env_consumer_vclock = {};
+static lower_env_consumer_state_t g_lower_env_consumer_ocxo1 = {};
+static lower_env_consumer_state_t g_lower_env_consumer_ocxo2 = {};
+static uint32_t g_lower_env_snapshot_count = 0;
+static volatile bool g_interrupt_feature_floorline_latched_nominal = false;
+
+// Foreground-only scratch lives outside the application stack.  Copying the
+// complete lane keeps the snapshot mechanism simple and automatically covers
+// future report fields without creating a second diagnostic schema.
+static lower_env_lane_t g_lower_env_report_scratch DMAMEM = {};
+
+static lower_env_lane_store_t* lower_env_store_for(
+    interrupt_subscriber_kind_t kind) {
   switch (kind) {
-    case interrupt_subscriber_kind_t::VCLOCK: return &g_lower_env_vclock;
-    case interrupt_subscriber_kind_t::OCXO1:  return &g_lower_env_ocxo1;
-    case interrupt_subscriber_kind_t::OCXO2:  return &g_lower_env_ocxo2;
+    case interrupt_subscriber_kind_t::VCLOCK: return &g_lower_env_vclock_store;
+    case interrupt_subscriber_kind_t::OCXO1:  return &g_lower_env_ocxo1_store;
+    case interrupt_subscriber_kind_t::OCXO2:  return &g_lower_env_ocxo2_store;
     default: return nullptr;
   }
+}
+
+static lower_env_lane_t* lower_env_lane_for(
+    interrupt_subscriber_kind_t kind) {
+  lower_env_lane_store_t* const store = lower_env_store_for(kind);
+  return store ? &store->lane : nullptr;
+}
+
+static lower_env_consumer_state_t* lower_env_consumer_for(
+    interrupt_subscriber_kind_t kind) {
+  switch (kind) {
+    case interrupt_subscriber_kind_t::VCLOCK: return &g_lower_env_consumer_vclock;
+    case interrupt_subscriber_kind_t::OCXO1:  return &g_lower_env_consumer_ocxo1;
+    case interrupt_subscriber_kind_t::OCXO2:  return &g_lower_env_consumer_ocxo2;
+    default: return nullptr;
+  }
+}
+
+static inline void lower_env_write_begin(lower_env_lane_store_t& store) {
+  store.seq++;
+  dmb_barrier();
+}
+
+static inline void lower_env_write_end(lower_env_lane_store_t& store) {
+  dmb_barrier();
+  store.seq++;
+}
+
+static bool lower_env_lane_snapshot(interrupt_subscriber_kind_t kind,
+                                    lower_env_lane_t* out) {
+  if (!out) return false;
+  lower_env_lane_store_t* const store = lower_env_store_for(kind);
+  if (!store) return false;
+
+  for (uint32_t attempt = 0; attempt < 4U; attempt++) {
+    const uint32_t s1 = store->seq;
+    if ((s1 & 1U) != 0U) continue;
+    dmb_barrier();
+    *out = store->lane;
+    dmb_barrier();
+    const uint32_t s2 = store->seq;
+    if (s1 == s2 && (s2 & 1U) == 0U) {
+      lower_env_consumer_state_t* const consumer =
+          lower_env_consumer_for(kind);
+      if (consumer) {
+        out->raw_bookend_anomaly_report_count =
+            consumer->raw_bookend_report_count;
+        out->watchdog_anomaly_count += consumer->watchdog_anomaly_count;
+        if (consumer->last_watchdog_reason != 0U) {
+          out->last_watchdog_reason = consumer->last_watchdog_reason;
+        }
+        if (out->raw_bookend_anomaly_sequence <=
+            consumer->last_raw_bookend_sequence) {
+          out->raw_bookend_anomaly_pending = false;
+        }
+      }
+      return true;
+    }
+  }
+
+  *out = lower_env_lane_t{};
+  return false;
+}
+
+static bool lower_env_result_load(interrupt_subscriber_kind_t kind,
+                                  cadence_regression_result_t* out) {
+  if (!out) return false;
+  lower_env_lane_store_t* const store = lower_env_store_for(kind);
+  if (!store) {
+    *out = cadence_regression_result_t{};
+    return false;
+  }
+
+  for (uint32_t attempt = 0; attempt < 4U; attempt++) {
+    const uint32_t s1 = store->seq;
+    if ((s1 & 1U) != 0U) continue;
+    dmb_barrier();
+    *out = store->lane.last;
+    dmb_barrier();
+    const uint32_t s2 = store->seq;
+    if (s1 == s2 && (s2 & 1U) == 0U) return out->valid;
+  }
+
+  *out = cadence_regression_result_t{};
+  return false;
+}
+
+static bool lower_env_seen_valid_estimate_load(
+    interrupt_subscriber_kind_t kind) {
+  lower_env_lane_store_t* const store = lower_env_store_for(kind);
+  if (!store) return false;
+
+  for (uint32_t attempt = 0; attempt < 4U; attempt++) {
+    const uint32_t s1 = store->seq;
+    if ((s1 & 1U) != 0U) continue;
+    dmb_barrier();
+    const bool seen = store->lane.floorline_seen_valid_estimate;
+    dmb_barrier();
+    const uint32_t s2 = store->seq;
+    if (s1 == s2 && (s2 & 1U) == 0U) return seen;
+  }
+  return false;
+}
+
+static const lower_env_lane_t* lower_env_report_snapshot(
+    interrupt_subscriber_kind_t kind) {
+  if (!lower_env_lane_snapshot(kind, &g_lower_env_report_scratch)) {
+    return nullptr;
+  }
+  return &g_lower_env_report_scratch;
 }
 
 static uint64_t lower_env_default_slope_q16(void) {
@@ -5677,7 +5813,8 @@ static void lower_env_note_fallback(lower_env_lane_t& lane) {
   }
 }
 
-static void lower_env_watchdog_anomaly(lower_env_lane_t& lane,
+static __attribute__((noinline)) void lower_env_watchdog_anomaly(
+    lower_env_lane_t& lane,
                                        uint32_t reason,
                                        uint32_t detail0,
                                        uint32_t detail1,
@@ -5693,35 +5830,54 @@ static void lower_env_watchdog_anomaly(lower_env_lane_t& lane,
 }
 
 static void lower_env_reset_lane(interrupt_subscriber_kind_t kind) {
-  lower_env_lane_t* lane = lower_env_lane_for(kind);
-  if (!lane) return;
-  const char* name = lane->name;
-  *lane = lower_env_lane_t{};
-  lane->kind = kind;
-  lane->name = name;
-  lane->reset_count++;
+  lower_env_lane_store_t* const store = lower_env_store_for(kind);
+  lower_env_consumer_state_t* const consumer = lower_env_consumer_for(kind);
+  if (!store || !consumer) return;
+
+  // Runtime reset is a serialized control-plane mutation.  Priority 0 no
+  // longer touches FloorLine, and BASEPRI excludes its priority-16 writer.
+  const uint32_t prior_basepri = interrupt_priority0_guard_enter();
+  const char* const name = store->lane.name;
+  lower_env_write_begin(*store);
+  store->lane = lower_env_lane_t{};
+  store->lane.kind = kind;
+  store->lane.name = name;
+  store->lane.reset_count++;
+  lower_env_write_end(*store);
+  *consumer = lower_env_consumer_state_t{};
+  interrupt_priority0_guard_exit(prior_basepri);
+
   interrupt_feature_update_floorline();
 }
 
 static void lower_env_reset_all(void) {
   g_interrupt_feature_floorline_latched_nominal = false;
-  g_lower_env_vclock = lower_env_lane_t{};
-  g_lower_env_vclock.kind = interrupt_subscriber_kind_t::VCLOCK;
-  g_lower_env_vclock.name = "vclock";
-  g_lower_env_ocxo1 = lower_env_lane_t{};
-  g_lower_env_ocxo1.kind = interrupt_subscriber_kind_t::OCXO1;
-  g_lower_env_ocxo1.name = "ocxo1";
-  g_lower_env_ocxo2 = lower_env_lane_t{};
-  g_lower_env_ocxo2.kind = interrupt_subscriber_kind_t::OCXO2;
-  g_lower_env_ocxo2.name = "ocxo2";
+
+  g_lower_env_vclock_store.seq = 0;
+  g_lower_env_vclock_store.lane = lower_env_lane_t{};
+  g_lower_env_vclock_store.lane.kind = interrupt_subscriber_kind_t::VCLOCK;
+  g_lower_env_vclock_store.lane.name = "vclock";
+
+  g_lower_env_ocxo1_store.seq = 0;
+  g_lower_env_ocxo1_store.lane = lower_env_lane_t{};
+  g_lower_env_ocxo1_store.lane.kind = interrupt_subscriber_kind_t::OCXO1;
+  g_lower_env_ocxo1_store.lane.name = "ocxo1";
+
+  g_lower_env_ocxo2_store.seq = 0;
+  g_lower_env_ocxo2_store.lane = lower_env_lane_t{};
+  g_lower_env_ocxo2_store.lane.kind = interrupt_subscriber_kind_t::OCXO2;
+  g_lower_env_ocxo2_store.lane.name = "ocxo2";
+
+  g_lower_env_consumer_vclock = lower_env_consumer_state_t{};
+  g_lower_env_consumer_ocxo1 = lower_env_consumer_state_t{};
+  g_lower_env_consumer_ocxo2 = lower_env_consumer_state_t{};
   g_lower_env_snapshot_count = 0;
   interrupt_feature_update_floorline();
 }
 
 static bool interrupt_feature_floorline_lane_nominal(
     interrupt_subscriber_kind_t kind) {
-  const lower_env_lane_t* lane = lower_env_lane_for(kind);
-  return lane && lane->floorline_seen_valid_estimate;
+  return lower_env_seen_valid_estimate_load(kind);
 }
 
 static void interrupt_feature_update_floorline(void) {
@@ -5862,23 +6018,32 @@ static FLASHMEM bool lower_env_raw_bookend_watchdog_if_pending(
     const cadence_regression_result_t& r,
     const dwt_repair_diag_t& diag,
     const char* handoff_phase) {
-  lower_env_lane_t* lane = lower_env_lane_for(kind);
-  if (!lane || !lane->raw_bookend_anomaly_pending) return true;
+  const lower_env_lane_t* lane = lower_env_report_snapshot(kind);
+  lower_env_consumer_state_t* const consumer = lower_env_consumer_for(kind);
+  if (!lane || !consumer || !lane->raw_bookend_anomaly_pending) return true;
   if (lane->raw_bookend_anomaly_sequence != r.sequence) return true;
-
-  if (!clocks_watchdog_campaign_armed()) {
-    // Pre-campaign/start-prologue raw witness discontinuities are diagnostics;
-    // do not let a stale pending record fire after the campaign later arms.
-    lane->raw_bookend_anomaly_pending = false;
+  if (lane->raw_bookend_anomaly_sequence <=
+      consumer->last_raw_bookend_sequence) {
     return true;
   }
 
-  if (lane->raw_bookend_anomaly_report_count != UINT32_MAX) {
-    lane->raw_bookend_anomaly_report_count++;
+  // Foreground owns consumption state; priority 16 remains the sole writer of
+  // the live FloorLine estimator.
+  consumer->last_raw_bookend_sequence = lane->raw_bookend_anomaly_sequence;
+
+  if (!clocks_watchdog_campaign_armed()) {
+    // Pre-campaign/start-prologue raw witness discontinuities are diagnostics;
+    // consuming the immutable record prevents it from firing after START.
+    return true;
   }
-  lane->raw_bookend_anomaly_pending = false;
-  lane->watchdog_anomaly_count++;
-  lane->last_watchdog_reason = lane->raw_bookend_anomaly_reason;
+
+  if (consumer->raw_bookend_report_count != UINT32_MAX) {
+    consumer->raw_bookend_report_count++;
+  }
+  if (consumer->watchdog_anomaly_count != UINT32_MAX) {
+    consumer->watchdog_anomaly_count++;
+  }
+  consumer->last_watchdog_reason = lane->raw_bookend_anomaly_reason;
 
   const char* reason =
       lower_env_raw_bookend_reason_name(lane->raw_bookend_anomaly_reason);
@@ -6021,7 +6186,7 @@ static FLASHMEM bool lower_env_raw_bookend_watchdog_if_pending(
             lane->previous_slope_q16_cycles_per_sample);
   state.add("raw_bookend_anomaly_count", lane->raw_bookend_anomaly_count);
   state.add("raw_bookend_anomaly_report_count",
-            lane->raw_bookend_anomaly_report_count);
+            consumer->raw_bookend_report_count);
   state.add("floorline_valid_estimate_count", lane->floorline_valid_estimate_count);
   state.add("fallback_publish_count", lane->fallback_publish_count);
   state.add("invalid_window_count", lane->invalid_window_count);
@@ -6095,7 +6260,8 @@ static void lower_env_decide_publication(cadence_regression_result_t& r) {
   r.confidence_ppm = lower_env_quality_confidence_ppm(r);
 }
 
-static void lower_env_publish_invalid_window(lower_env_lane_t& lane,
+static __attribute__((noinline)) void lower_env_publish_invalid_window(
+    lower_env_lane_t& lane,
                                              uint32_t observed_dwt,
                                              uint32_t target_counter32,
                                              uint16_t target_hw16,
@@ -6157,10 +6323,10 @@ static void lower_env_publish_invalid_window(lower_env_lane_t& lane,
   lane.invalid_window_count++;
   lower_env_note_fallback(lane);
   lower_env_clear_active(lane);
-  interrupt_feature_update_floorline();
 }
 
-static void lower_env_seal(lower_env_lane_t& lane,
+static __attribute__((noinline)) void lower_env_seal(
+    lower_env_lane_t& lane,
                            uint32_t observed_dwt,
                            uint32_t target_counter32,
                            uint16_t target_hw16,
@@ -6392,39 +6558,45 @@ static void lower_env_seal(lower_env_lane_t& lane,
     lower_env_note_fallback(lane);
   }
   lower_env_clear_active(lane);
-  interrupt_feature_update_floorline();
 }
 
-static void cadence_regression_observe(interrupt_subscriber_kind_t kind,
-                                       uint32_t observed_dwt,
-                                       uint32_t target_counter32,
-                                       uint16_t target_hw16,
-                                       uint16_t observed_hw16,
-                                       bool closes_second) {
-  lower_env_lane_t* lane = lower_env_lane_for(kind);
-  if (!lane) return;
+// All three measured lanes enter this function only from the priority-16
+// handoff tier.  Priority 0 captures immutable edge facts and never performs
+// FloorLine arithmetic or mutates FloorLine state.
+static __attribute__((noinline)) void floorline_observe_handoff(
+    interrupt_subscriber_kind_t kind,
+    uint32_t observed_dwt,
+    uint32_t target_counter32,
+    uint16_t target_hw16,
+    uint16_t observed_hw16,
+    bool closes_second) {
+  lower_env_lane_store_t* const store = lower_env_store_for(kind);
+  if (!store) return;
+  lower_env_lane_t& lane = store->lane;
 
-  if (lane->active_sample_count >= LOWER_ENV_SAMPLE_RATE_HZ) {
-    lane->overflow_reset_count++;
-    lower_env_clear_active(*lane);
+  lower_env_write_begin(*store);
+
+  if (lane.active_sample_count >= LOWER_ENV_SAMPLE_RATE_HZ) {
+    lane.overflow_reset_count++;
+    lower_env_clear_active(lane);
   }
 
-  if (!lane->active_valid) {
-    lower_env_clear_active(*lane);
-    lane->active_valid = true;
-    lane->active_base_dwt = observed_dwt;
+  if (!lane.active_valid) {
+    lower_env_clear_active(lane);
+    lane.active_valid = true;
+    lane.active_base_dwt = observed_dwt;
   }
 
-  const uint32_t x = lane->active_sample_count++;
-  const uint64_t slope_q16 = lane->previous_slope_valid
-      ? lane->previous_slope_q16_cycles_per_sample
+  const uint32_t x = lane.active_sample_count++;
+  const uint64_t slope_q16 = lane.previous_slope_valid
+      ? lane.previous_slope_q16_cycles_per_sample
       : lower_env_default_slope_q16();
   const uint32_t predicted_dwt =
-      lane->active_base_dwt +
+      lane.active_base_dwt +
       lower_env_round_q16_u32((int64_t)slope_q16 * (int64_t)x);
   const int32_t residual = lower_env_signed_delta_u32(predicted_dwt, observed_dwt);
   const uint32_t abs_residual = lower_env_abs_i32(residual);
-  lower_env_note_residual(*lane, residual);
+  lower_env_note_residual(lane, residual);
 
   // FloorLine V2 treats the 4-cycle band as quality evidence.  Samples beyond
   // that band are still useful for the robust lower-envelope population.  Only
@@ -6432,50 +6604,46 @@ static void cadence_regression_observe(interrupt_subscriber_kind_t kind,
   // current candidate: publication will fall back to observed rather than
   // withdrawing the FLOORLINE rail.
   if (abs_residual > LOWER_ENV_SAMPLE_HARD_REJECT_CYCLES) {
-    lane->active_sample_rejected_count++;
-    lane->active_sample_hard_rejected_count++;
-    if (closes_second) {
-      lower_env_seal(*lane, observed_dwt, target_counter32,
-                              target_hw16, observed_hw16);
+    lane.active_sample_rejected_count++;
+    lane.active_sample_hard_rejected_count++;
+  } else {
+    lane.active_sample_accepted_count++;
+
+    uint32_t bucket_index =
+        (x * LOWER_ENV_BUCKET_COUNT) / LOWER_ENV_SAMPLE_RATE_HZ;
+    if (bucket_index >= LOWER_ENV_BUCKET_COUNT) {
+      bucket_index = LOWER_ENV_BUCKET_COUNT - 1U;
     }
-    return;
-  }
 
-  lane->active_sample_accepted_count++;
-
-  uint32_t bucket_index = (x * LOWER_ENV_BUCKET_COUNT) / LOWER_ENV_SAMPLE_RATE_HZ;
-  if (bucket_index >= LOWER_ENV_BUCKET_COUNT) bucket_index = LOWER_ENV_BUCKET_COUNT - 1U;
-
-  lower_env_bucket_t& b = lane->buckets[bucket_index];
-  if (!b.valid) {
-    lane->active_bucket_count++;
-  }
-  if (!b.valid || residual < b.residual_cycles) {
-    b.valid = true;
-    b.x = (uint16_t)x;
-    b.dwt = observed_dwt;
-    b.counter32 = target_counter32;
-    b.target_hw16 = target_hw16;
-    b.observed_hw16 = observed_hw16;
-    b.residual_cycles = residual;
+    lower_env_bucket_t& b = lane.buckets[bucket_index];
+    if (!b.valid) {
+      lane.active_bucket_count++;
+    }
+    if (!b.valid || residual < b.residual_cycles) {
+      b.valid = true;
+      b.x = (uint16_t)x;
+      b.dwt = observed_dwt;
+      b.counter32 = target_counter32;
+      b.target_hw16 = target_hw16;
+      b.observed_hw16 = observed_hw16;
+      b.residual_cycles = residual;
+    }
   }
 
   if (closes_second) {
-    lower_env_seal(*lane, observed_dwt, target_counter32,
-                            target_hw16, observed_hw16);
+    lower_env_seal(lane, observed_dwt, target_counter32,
+                   target_hw16, observed_hw16);
+  }
+
+  lower_env_write_end(*store);
+  if (closes_second) {
+    interrupt_feature_update_floorline();
   }
 }
 
 static bool cadence_regression_latest_result(interrupt_subscriber_kind_t kind,
                                              cadence_regression_result_t* out) {
-  if (!out) return false;
-  lower_env_lane_t* lane = lower_env_lane_for(kind);
-  if (!lane) {
-    *out = cadence_regression_result_t{};
-    return false;
-  }
-  *out = lane->last;
-  return out->valid;
+  return lower_env_result_load(kind, out);
 }
 
 static const char* pps_floorline_repair_reason_name(uint32_t reason) {
@@ -7615,7 +7783,7 @@ static void dwt_publication_record_fatal_forensics(
   g_dwt_publication_last_fatal = f;
 }
 
-static bool dwt_publication_adjudicate_or_watchdog(
+static __attribute__((noinline)) bool dwt_publication_adjudicate_or_watchdog(
     const dwt_publication_request_t& req,
     dwt_repair_diag_t& diag) {
   dwt_publication_lane_state_t* s = dwt_publication_lane_state_for(req.kind);
@@ -7925,7 +8093,7 @@ static bool dwt_publication_adjudicate_or_watchdog(
 // Diag fill + event dispatch
 // ============================================================================
 
-static void deferred_dispatch_callback(timepop_ctx_t*, timepop_diag_t*, void*);
+static __attribute__((noinline)) void deferred_dispatch_callback(timepop_ctx_t*, timepop_diag_t*, void*);
 
 static void fill_diag(interrupt_capture_diag_t& diag,
                       const interrupt_subscriber_runtime_t& rt,
@@ -8111,7 +8279,7 @@ static bool interrupt_dispatch_begin(
   return true;
 }
 
-static void deferred_dispatch_callback(timepop_ctx_t*,
+static __attribute__((noinline)) void deferred_dispatch_callback(timepop_ctx_t*,
                                        timepop_diag_t*,
                                        void* user_data) {
   auto* rt = static_cast<interrupt_subscriber_runtime_t*>(user_data);
@@ -8155,14 +8323,14 @@ static void deferred_dispatch_callback(timepop_ctx_t*,
   interrupt_priority0_guard_exit(finish_basepri);
 }
 
-static void emit_one_second_event(interrupt_subscriber_runtime_t& rt,
-                                  uint32_t dwt_at_event,
-                                  uint32_t authored_counter32,
-                                  uint32_t pps_coincidence_cycles = 0,
-                                  bool     pps_coincidence_valid  = false,
-                                  const dwt_repair_diag_t* repair = nullptr,
-                                  bool dispatch_immediately = false,
-                                  const cadence_regression_result_t* regression = nullptr) {
+static __attribute__((noinline)) void emit_one_second_event(
+    interrupt_subscriber_runtime_t& rt,
+    uint32_t dwt_at_event,
+    uint32_t authored_counter32,
+    uint32_t pps_coincidence_cycles = 0,
+    bool pps_coincidence_valid = false,
+    const dwt_repair_diag_t* repair = nullptr,
+    const cadence_regression_result_t* regression = nullptr) {
   if (!rt.active) return;
 
   interrupt_event_t event {};
@@ -8312,10 +8480,9 @@ static void emit_one_second_event(interrupt_subscriber_runtime_t& rt,
   rt.has_fired  = true;
   rt.event_count++;
 
-  (void)interrupt_dispatch_begin(rt,
-                                 event,
-                                 diag,
-                                 !dispatch_immediately);
+  // Every measured lane crosses the same publication boundary: prepare the
+  // immutable tuple here and invoke the subscriber only after this frame exits.
+  (void)interrupt_dispatch_begin(rt, event, diag, true);
 }
 
 // ============================================================================
@@ -8775,7 +8942,7 @@ static void vclock_ch2_epoch_native_service(uint32_t qtimer_event_dwt,
                                                        tick_mod_seed);
 }
 
-static void vclock_apply_perishable_fact_deferred(
+static __attribute__((noinline)) void vclock_apply_perishable_fact_deferred(
     const vclock_perishable_fact_t& fact) {
   if (!fact.one_second_due || !g_rt_vclock || !g_rt_vclock->active) {
     return;
@@ -8890,13 +9057,12 @@ static void vclock_apply_perishable_fact_deferred(
                         coincidence_cycles,
                         coincidence_valid,
                         &dwt_diag,
-                        true,
                         &lower_env);
 
   pps_edge_dispatch_arm_or_call_from_foreground("PPS_VCLOCK_DISPATCH");
 }
 
-static void vclock_fact_drain_callback(timepop_ctx_t*,
+static __attribute__((noinline)) void vclock_fact_drain_callback(timepop_ctx_t*,
                                        timepop_diag_t*,
                                        void*) {
   for (;;) {
@@ -9371,7 +9537,7 @@ static void ocxo_lane_install_logical_grid(interrupt_subscriber_kind_t kind,
 // VCLOCK_HEARTBEAT is now native QTimer1 CH0 count+compare custody; TimePop
 // remains on QTimer1 CH2 as scheduler only.
 
-static void vclock_heartbeat_native_service(uint32_t isr_entry_dwt_raw,
+static __attribute__((noinline)) void vclock_heartbeat_native_service(uint32_t isr_entry_dwt_raw,
                                            uint32_t qtimer_event_dwt,
                                            uint32_t cadence_counter32) {
   if (!g_interrupt_hw_ready) return;
@@ -9408,7 +9574,7 @@ static void vclock_heartbeat_native_service(uint32_t isr_entry_dwt_raw,
     const uint16_t floorline_observed_low16 = bookend.due
         ? bookend.observed_low16
         : fired_low16;
-    cadence_regression_observe(interrupt_subscriber_kind_t::VCLOCK,
+    floorline_observe_handoff(interrupt_subscriber_kind_t::VCLOCK,
                                floorline_observed_dwt,
                                floorline_counter32,
                                floorline_target_low16,
@@ -9595,7 +9761,7 @@ static void vclock_heartbeat_native_service(uint32_t isr_entry_dwt_raw,
       emit_one_second_event(*g_rt_vclock, published_dwt,
                             target_counter32,
                             coincidence_cycles, coincidence_valid, &dwt_diag,
-                            false, &lower_env);
+                            &lower_env);
 
       pps_edge_dispatch_arm_or_call_from_foreground("PPS_VCLOCK_DISPATCH");
 
@@ -9821,7 +9987,10 @@ static int32_t dwt_cycles_for_ocxo_ticks_signed(int32_t ticks) {
 
 static bool ocxo_fact_ring_push_from_isr(ocxo_runtime_context_t& ctx,
                                          const interrupt_perishable_fact_t& fact);
-static void ocxo_fact_drain_callback(timepop_ctx_t*, timepop_diag_t*, void* user_data);
+static __attribute__((noinline)) void ocxo1_fact_drain_callback(
+    timepop_ctx_t*, timepop_diag_t*, void*);
+static __attribute__((noinline)) void ocxo2_fact_drain_callback(
+    timepop_ctx_t*, timepop_diag_t*, void*);
 
 static bool ocxo_fact_ring_pop(ocxo_runtime_context_t& ctx,
                                interrupt_perishable_fact_t& out) {
@@ -9882,8 +10051,12 @@ static bool ocxo_fact_ring_push_from_isr(ocxo_runtime_context_t& ctx,
     r.asap_arm_count++;
     if (lane) lane->witness_fact_asap_arm_count = r.asap_arm_count;
 
+    const timepop_callback_t callback =
+        (ctx.kind == interrupt_subscriber_kind_t::OCXO1)
+            ? ocxo1_fact_drain_callback
+            : ocxo2_fact_drain_callback;
     const timepop_handle_t h =
-        timepop_arm_asap(ocxo_fact_drain_callback, &ctx, ocxo_fact_drain_name(ctx));
+        timepop_arm_asap(callback, nullptr, ocxo_fact_drain_name(ctx));
     if (h == TIMEPOP_INVALID_HANDLE) {
       r.drain_armed = false;
       r.asap_fail_count++;
@@ -10489,7 +10662,7 @@ static uint32_t ocxo_lane_yardstick_observe(ocxo_lane_t& lane,
   return published_dwt;
 }
 
-static void ocxo_apply_perishable_fact_deferred(
+static __attribute__((noinline)) void ocxo_apply_perishable_fact_deferred(
     ocxo_runtime_context_t& ctx,
     const interrupt_perishable_fact_t& fact) {
   ocxo_lane_t* lane = ctx.lane;
@@ -10716,30 +10889,39 @@ static void ocxo_apply_perishable_fact_deferred(
   lane->witness_previous_event_counter32 = fact.target_counter32;
   lane->witness_previous_event_counter32_valid = true;
 
-  // We are already in TimePop ASAP/foreground context. Dispatch the authored
-  // rollover OCXO edge directly from the fact drain.
+  // Prepare an immutable subscriber tuple now, but run the CLOCKS callback in
+  // a later ASAP pass after this fact-drain frame has unwound.
   emit_one_second_event(*rt,
                         published_dwt,
                         fact.target_counter32,
                         0,
                         false,
                         &dwt_diag,
-                        true,
                         &lower_env);
 
 }
 
-static void ocxo_fact_drain_callback(timepop_ctx_t*,
-                                     timepop_diag_t*,
-                                     void* user_data) {
-  auto* ctx = static_cast<ocxo_runtime_context_t*>(user_data);
-  if (!ctx || !ctx->lane) return;
-
+static __attribute__((noinline)) void ocxo_fact_drain_lane(
+    ocxo_runtime_context_t& ctx) {
   for (;;) {
     interrupt_perishable_fact_t fact{};
-    if (!ocxo_fact_ring_pop(*ctx, fact)) break;
-    ocxo_apply_perishable_fact_deferred(*ctx, fact);
+    if (!ocxo_fact_ring_pop(ctx, fact)) break;
+    ocxo_apply_perishable_fact_deferred(ctx, fact);
   }
+}
+
+static __attribute__((noinline)) void ocxo1_fact_drain_callback(
+    timepop_ctx_t*,
+    timepop_diag_t*,
+    void*) {
+  ocxo_fact_drain_lane(g_ocxo1_ctx);
+}
+
+static __attribute__((noinline)) void ocxo2_fact_drain_callback(
+    timepop_ctx_t*,
+    timepop_diag_t*,
+    void*) {
+  ocxo_fact_drain_lane(g_ocxo2_ctx);
 }
 
 struct ocxo_cadence_isr_sample_t {
@@ -10753,6 +10935,7 @@ struct ocxo_cadence_isr_sample_t {
 
   bool had_armed = false;
   bool had_active_rt = false;
+  bool lane_active = false;
   bool was_smartzero_current = false;
 
   uint32_t target_counter32 = 0;
@@ -10884,8 +11067,9 @@ struct qtimer1_vclock_capture_packet_t {
 
 struct ocxo_1khz_tend_capture_t {
   // Priority-0-only 1 kHz gear-tooth record.  This structure maintains the
-  // local +10,000 tick ladder and may feed SmartZero, but it is never the
-  // subscriber-facing OCXO one-second capture contract.
+  // local +10,000 tick ladder and carries immutable sample facts to the
+  // priority-16 FloorLine/SmartZero writer.  It is never the subscriber-facing
+  // OCXO one-second capture contract.
   uint32_t isr_entry_dwt_raw = 0;
   uint32_t capture_exit_dwt = 0;
   uint32_t authored_dwt_at_event = 0;
@@ -10898,6 +11082,8 @@ struct ocxo_1khz_tend_capture_t {
   bool cadence_armed = false;
   bool lane_active = false;
   bool rt_active = false;
+  bool was_smartzero_current = false;
+  bool one_second_due = false;
   uint32_t tick_mod_at_event = 0;
   uint32_t arm_remaining_ticks = 0;
   uint16_t arm_low16 = 0;
@@ -10912,9 +11098,10 @@ struct ocxo_1khz_tend_capture_t {
 };
 
 struct ocxo_1khz_sample_capture_packet_t {
-  // Handoff packet for SmartZero/acquisition samples.  It is deliberately not
-  // shaped like the one-second OCXO edge packet, so a millisecond sample
-  // cannot masquerade as subscriber timing truth.
+  // Handoff packet for every active 1 kHz OCXO sample.  Priority 16 is the
+  // common FloorLine writer for VCLOCK, OCXO1 and OCXO2; SmartZero consumes
+  // the same immutable packet only while this lane owns acquisition.  The
+  // packet is deliberately not shaped like the subscriber one-second edge.
   uint32_t sequence = 0;
   uint32_t isr_entry_dwt_raw = 0;
   uint32_t capture_exit_dwt = 0;
@@ -10926,6 +11113,10 @@ struct ocxo_1khz_sample_capture_packet_t {
   uint32_t target_counter32 = 0;
   uint16_t target_low16 = 0;
   bool cadence_armed = false;
+  bool lane_active = false;
+  bool rt_active = false;
+  bool was_smartzero_current = false;
+  bool one_second_due = false;
   uint32_t tick_mod_at_event = 0;
   uint32_t arm_remaining_ticks = 0;
   uint16_t arm_low16 = 0;
@@ -11214,10 +11405,10 @@ static void interrupt_handoff_process_qtimer1_vclock(
     const qtimer1_vclock_capture_packet_t& packet);
 static void interrupt_handoff_process_qtimer1_ch2(
     const qtimer1_ch2_capture_packet_t& packet);
-static void interrupt_handoff_process_ocxo_1khz_sample(
+static __attribute__((noinline)) void interrupt_handoff_process_ocxo_1khz_sample(
     ocxo_runtime_context_t& ctx,
     const ocxo_1khz_sample_capture_packet_t& packet);
-static void interrupt_handoff_process_ocxo_one_second(
+static __attribute__((noinline)) void interrupt_handoff_process_ocxo_one_second(
     ocxo_runtime_context_t& ctx,
     const ocxo_one_second_capture_packet_t& packet);
 static void interrupt_handoff_process_pps(const pps_capture_packet_t& packet);
@@ -11558,6 +11749,10 @@ static void ocxo_1khz_packet_from_tend_capture(
   packet.target_counter32 = tick.target_counter32;
   packet.target_low16 = tick.target_low16;
   packet.cadence_armed = tick.cadence_armed;
+  packet.lane_active = tick.lane_active;
+  packet.rt_active = tick.rt_active;
+  packet.was_smartzero_current = tick.was_smartzero_current;
+  packet.one_second_due = tick.one_second_due;
   packet.tick_mod_at_event = tick.tick_mod_at_event;
   packet.arm_remaining_ticks = tick.arm_remaining_ticks;
   packet.arm_low16 = tick.arm_low16;
@@ -11656,9 +11851,10 @@ static ocxo_cadence_isr_sample_t ocxo_sample_from_1khz_capture(
     const ocxo_1khz_sample_capture_packet_t& packet) {
   ocxo_cadence_isr_sample_t sample{};
   ocxo_fill_common_handoff_sample(ctx, packet, sample);
-  sample.had_active_rt = false;
-  sample.was_smartzero_current = true;
-  sample.one_second_due = false;
+  sample.had_active_rt = packet.rt_active;
+  sample.lane_active = packet.lane_active;
+  sample.was_smartzero_current = packet.was_smartzero_current;
+  sample.one_second_due = packet.one_second_due;
   return sample;
 }
 
@@ -11668,12 +11864,14 @@ static ocxo_cadence_isr_sample_t ocxo_sample_from_one_second_capture(
   ocxo_cadence_isr_sample_t sample{};
   ocxo_fill_common_handoff_sample(ctx, packet, sample);
   sample.had_active_rt = packet.had_active_rt;
+  sample.lane_active = packet.had_active_rt;
   sample.was_smartzero_current = false;
   sample.one_second_due = true;
   return sample;
 }
 
-static void ocxo_cadence_capture_priority0(ocxo_runtime_context_t& ctx,
+static __attribute__((noinline)) void ocxo_cadence_capture_priority0(
+    ocxo_runtime_context_t& ctx,
                                            uint32_t isr_entry_dwt_raw,
                                            uint16_t generation_gate_ambient_low16) {
   ocxo_lane_t& lane = *ctx.lane;
@@ -11898,15 +12096,6 @@ static void ocxo_cadence_capture_priority0(ocxo_runtime_context_t& ctx,
                  (int64_t)service_offset_correction_cycles);
   const uint32_t authored_dwt_at_event = observed_dwt_at_target;
 
-  if (!was_smartzero_current && lane.active) {
-    cadence_regression_observe(ctx.kind,
-                               observed_dwt_at_target,
-                               target_counter32,
-                               target_low16,
-                               service_counter_low16,
-                               one_second_due);
-  }
-
   const uint16_t accepted_hardware_low16 =
       hardware_low16_from_semantic(target_counter32);
 
@@ -11922,6 +12111,8 @@ static void ocxo_cadence_capture_priority0(ocxo_runtime_context_t& ctx,
   tick.lane_active = lane.active;
   interrupt_subscriber_runtime_t* const rt_at_capture = ocxo_runtime_for(ctx);
   tick.rt_active = rt_at_capture && rt_at_capture->active;
+  tick.was_smartzero_current = was_smartzero_current;
+  tick.one_second_due = one_second_due;
   tick.tick_mod_at_event = event_tick_mod;
   tick.arm_remaining_ticks = lane.witness_last_arm_remaining_ticks;
   tick.arm_low16 = lane.witness_last_arm_low16;
@@ -12069,10 +12260,15 @@ static void ocxo_cadence_capture_priority0(ocxo_runtime_context_t& ctx,
 
   tick.capture_exit_dwt = ARM_DWT_CYCCNT;
 
-  const bool needs_1khz_sample_handoff = was_smartzero_current;
+  const bool needs_1khz_sample_handoff =
+      tick.lane_active || tick.was_smartzero_current;
   const bool needs_one_second_handoff =
-      one_second_due && tick.rt_active && tick.lane_active;
+      tick.one_second_due && tick.rt_active && tick.lane_active;
+  bool handed_off = false;
 
+  // Every active 1 kHz tooth crosses the same immutable capture boundary.
+  // This removes FloorLine arithmetic from priority 0 and gives VCLOCK,
+  // OCXO1 and OCXO2 one priority-16 writer discipline.
   if (needs_1khz_sample_handoff) {
     ocxo_1khz_sample_capture_packet_t packet{};
     ocxo_1khz_packet_from_tend_capture(packet, tick);
@@ -12083,14 +12279,16 @@ static void ocxo_cadence_capture_priority0(ocxo_runtime_context_t& ctx,
             : g_ocxo2_1khz_sample_capture_ring;
 
     if (capture_ring_push_from_priority0(ring, diag, packet)) {
-      interrupt_handoff_request_from_capture_isr(
-          ctx.kind == interrupt_subscriber_kind_t::OCXO1
-              ? "qtimer2_ocxo1_1khz_sample"
-              : "qtimer3_ocxo2_1khz_sample");
+      handed_off = true;
     } else {
       lane.miss_count++;
     }
-  } else if (needs_one_second_handoff) {
+  }
+
+  // The boundary tooth also carries the subscriber-facing one-second packet.
+  // Its capture sequence follows the 1 kHz sample, so priority 16 seals
+  // FloorLine before preparing publication for this same edge.
+  if (needs_one_second_handoff) {
     ocxo_one_second_capture_packet_t packet{};
     ocxo_one_second_packet_from_tend_capture(packet, tick);
     interrupt_capture_ring_t<ocxo_one_second_capture_packet_t,
@@ -12100,14 +12298,18 @@ static void ocxo_cadence_capture_priority0(ocxo_runtime_context_t& ctx,
             : g_ocxo2_one_second_capture_ring;
 
     if (capture_ring_push_from_priority0(ring, diag, packet)) {
-      interrupt_handoff_request_from_capture_isr(
-          ctx.kind == interrupt_subscriber_kind_t::OCXO1
-              ? "qtimer2_ocxo1_one_second"
-              : "qtimer3_ocxo2_one_second");
+      handed_off = true;
     } else {
       lane.miss_count++;
     }
-  } else {
+  }
+
+  if (handed_off) {
+    interrupt_handoff_request_from_capture_isr(
+        ctx.kind == interrupt_subscriber_kind_t::OCXO1
+            ? "qtimer2_ocxo1_capture"
+            : "qtimer3_ocxo2_capture");
+  } else if (!needs_1khz_sample_handoff && !needs_one_second_handoff) {
     diag.capture_count++;
     diag.last_capture_dwt = isr_entry_dwt_raw;
   }
@@ -12116,41 +12318,51 @@ static void ocxo_cadence_capture_priority0(ocxo_runtime_context_t& ctx,
 }
 
 
-static void interrupt_handoff_process_ocxo_1khz_sample(
+static __attribute__((noinline)) void interrupt_handoff_process_ocxo_1khz_sample(
     ocxo_runtime_context_t& ctx,
     const ocxo_1khz_sample_capture_packet_t& packet) {
   ocxo_lane_t& lane = *ctx.lane;
   ocxo_cadence_isr_sample_t sample =
       ocxo_sample_from_1khz_capture(ctx, packet);
 
-  if (sample.rt) {
+  if (sample.rt && sample.was_smartzero_current) {
     sample.rt->irq_count++;
   }
 
-  // This path is intentionally 1 kHz/acquisition only.  It can advance
-  // SmartZero state, but it cannot enqueue an OCXO one-second publication.
-  lane.cadence_last_one_second_due = false;
+  // This path never publishes a subscriber edge.  It is the common 1 kHz
+  // priority-16 custody tier for both FloorLine and SmartZero.
+  lane.cadence_last_one_second_due = sample.one_second_due;
 
-  // Priority 16 is the sole SmartZero data writer.  Apply the hardware rearm
-  // result captured by priority 0 before feeding the corresponding sample.
-  if (packet.smartzero_rearm_committed) {
-    const int idx = smartzero_index_for_kind(ctx.kind);
-    if (idx >= 0) {
-      smartzero_write_begin();
-      g_smartzero.lanes[idx].pub.next_target_counter32 =
-          packet.smartzero_next_target_counter32;
-      g_smartzero.lanes[idx].pub.arm_count++;
-      smartzero_write_end();
-    }
+  if (sample.lane_active && !sample.was_smartzero_current) {
+    floorline_observe_handoff(ctx.kind,
+                              sample.event_dwt,
+                              sample.target_counter32,
+                              sample.target_low16,
+                              sample.service_counter_low16,
+                              sample.one_second_due);
   }
 
-  const bool cadence_reauthored_by_smartzero =
-      ocxo_cadence_feed_smartzero(ctx, sample);
-  (void)cadence_reauthored_by_smartzero;
+  if (sample.was_smartzero_current) {
+    // Priority 16 is the sole SmartZero data writer.  Apply the hardware rearm
+    // result captured by priority 0 before feeding the corresponding sample.
+    if (packet.smartzero_rearm_committed) {
+      const int idx = smartzero_index_for_kind(ctx.kind);
+      if (idx >= 0) {
+        smartzero_write_begin();
+        g_smartzero.lanes[idx].pub.next_target_counter32 =
+            packet.smartzero_next_target_counter32;
+        g_smartzero.lanes[idx].pub.arm_count++;
+        smartzero_write_end();
+      }
+    }
+
+    const bool cadence_reauthored_by_smartzero =
+        ocxo_cadence_feed_smartzero(ctx, sample);
+    (void)cadence_reauthored_by_smartzero;
+  }
 }
 
-
-static void interrupt_handoff_process_ocxo_one_second(
+static __attribute__((noinline)) void interrupt_handoff_process_ocxo_one_second(
     ocxo_runtime_context_t& ctx,
     const ocxo_one_second_capture_packet_t& packet) {
   ocxo_lane_t& lane = *ctx.lane;
@@ -12322,7 +12534,7 @@ static void interrupt_handoff_process_qtimer1_ch1(
   }
 }
 
-static void vclock_heartbeat_native_service(uint32_t isr_entry_dwt_raw,
+static __attribute__((noinline)) void vclock_heartbeat_native_service(uint32_t isr_entry_dwt_raw,
                                            uint32_t qtimer_event_dwt,
                                            uint32_t cadence_counter32);
 
@@ -13743,9 +13955,15 @@ static void interrupt_state_cold_init(void) {
   g_dwt_publication_ocxo2 = dwt_publication_lane_state_t{};
   g_dwt_publication_last_fatal = dwt_publication_forensics_t{};
 
-  g_lower_env_vclock = lower_env_lane_t{};
-  g_lower_env_ocxo1 = lower_env_lane_t{};
-  g_lower_env_ocxo2 = lower_env_lane_t{};
+  g_lower_env_vclock_store.seq = 0;
+  g_lower_env_vclock_store.lane = lower_env_lane_t{};
+  g_lower_env_ocxo1_store.seq = 0;
+  g_lower_env_ocxo1_store.lane = lower_env_lane_t{};
+  g_lower_env_ocxo2_store.seq = 0;
+  g_lower_env_ocxo2_store.lane = lower_env_lane_t{};
+  g_lower_env_consumer_vclock = lower_env_consumer_state_t{};
+  g_lower_env_consumer_ocxo1 = lower_env_consumer_state_t{};
+  g_lower_env_consumer_ocxo2 = lower_env_consumer_state_t{};
 
   g_vclock_fact_ring = vclock_perishable_ring_t{};
   g_ocxo1_fact_ring = ocxo_perishable_ring_t{};
@@ -14487,7 +14705,7 @@ static FLASHMEM void add_ocxo_lean_lane(Payload& p,
   add_bool("recover_rebootstrap_last_cadence_preserved",
            lane.recover_rebootstrap_last_cadence_preserved);
   if (want_summary) {
-    const lower_env_lane_t* fl = lower_env_lane_for(ctx.kind);
+    const lower_env_lane_t* fl = lower_env_report_snapshot(ctx.kind);
     if (fl) {
       add_floorline_flat(p, prefix, *fl);
     }
@@ -14626,7 +14844,7 @@ static FLASHMEM void add_ocxo_lean_lane(Payload& p,
   }
 
   if (want_floorline) {
-    const lower_env_lane_t* fl = lower_env_lane_for(ctx.kind);
+    const lower_env_lane_t* fl = lower_env_report_snapshot(ctx.kind);
     if (fl) {
       add_floorline_flat(p, prefix, *fl);
     }
@@ -15372,6 +15590,9 @@ static FLASHMEM Payload cmd_report_lower_envelope(const Payload&) {
   p.add("publish_min_buckets", LOWER_ENV_PUBLISH_MIN_BUCKETS);
   p.add("snapshot_count", ++g_lower_env_snapshot_count);
   p.add("policy", "floorline_v2_continuous_best_estimate_latched_feature");
+  p.add("writer_context", INTERRUPT_FLOORLINE_WRITER_CONTEXT);
+  p.add("snapshot_transport", "SEQLOCK_WHOLE_LANE_SNAPSHOT");
+  p.add("subscriber_dispatch_context", INTERRUPT_SUBSCRIBER_DISPATCH_CONTEXT);
 
 
   pps_yardstick_snapshot_t y{};
@@ -15401,12 +15622,22 @@ static FLASHMEM Payload cmd_report_lower_envelope(const Payload&) {
 
   Payload lanes;
   const bool pps_valid = pps_loaded && y.valid && y.interval_now_cycles != 0U;
-  add_lower_env_lane_payload(lanes, "vclock", g_lower_env_vclock,
-                             pps_valid, y.interval_now_cycles, true);
-  add_lower_env_lane_payload(lanes, "ocxo1", g_lower_env_ocxo1,
-                             false, 0U, false);
-  add_lower_env_lane_payload(lanes, "ocxo2", g_lower_env_ocxo2,
-                             false, 0U, false);
+  const lower_env_lane_t* floorline =
+      lower_env_report_snapshot(interrupt_subscriber_kind_t::VCLOCK);
+  if (floorline) {
+    add_lower_env_lane_payload(lanes, "vclock", *floorline,
+                               pps_valid, y.interval_now_cycles, true);
+  }
+  floorline = lower_env_report_snapshot(interrupt_subscriber_kind_t::OCXO1);
+  if (floorline) {
+    add_lower_env_lane_payload(lanes, "ocxo1", *floorline,
+                               false, 0U, false);
+  }
+  floorline = lower_env_report_snapshot(interrupt_subscriber_kind_t::OCXO2);
+  if (floorline) {
+    add_lower_env_lane_payload(lanes, "ocxo2", *floorline,
+                               false, 0U, false);
+  }
   p.add_object("lanes", lanes);
   return p;
 }
@@ -15428,6 +15659,8 @@ static FLASHMEM Payload cmd_report_handoff(const Payload&) {
   Payload p;
   p.add("report", "INTERRUPT_HANDOFF");
   p.add("configured", (bool)g_interrupt_handoff.configured);
+  p.add("floorline_writer_context", INTERRUPT_FLOORLINE_WRITER_CONTEXT);
+  p.add("subscriber_dispatch_context", INTERRUPT_SUBSCRIBER_DISPATCH_CONTEXT);
   p.add("request_count", (uint32_t)g_interrupt_handoff.request_count);
   p.add("entry_count", (uint32_t)g_interrupt_handoff.entry_count);
   p.add("served_request_count", (uint32_t)g_interrupt_handoff.served_request_count);
@@ -15465,7 +15698,9 @@ static FLASHMEM Payload cmd_report_lane(const Payload& args) {
     p.add("tick_mod_1000", g_vclock_lane.tick_mod_1000);
     p.add("ch2_one_second_enabled", (bool)g_vclock_ch2_one_second_enabled);
     p.add("ch2_next_counter32", (uint32_t)g_vclock_ch2_one_second_next_counter32);
-    add_floorline_flat(p, "vclock", g_lower_env_vclock);
+    const lower_env_lane_t* const floorline =
+        lower_env_report_snapshot(interrupt_subscriber_kind_t::VCLOCK);
+    if (floorline) add_floorline_flat(p, "vclock", *floorline);
     return p;
   }
   const char* section = args.getString("section");
