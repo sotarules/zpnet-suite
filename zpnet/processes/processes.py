@@ -274,7 +274,24 @@ def _serve_commands(
         conn, _ = srv.accept()
         with conn:
             raw = conn.recv(65536)
-            req = json.loads(raw.decode("utf-8"))
+            if not raw:
+                logging.warning(
+                    "[commands] %s empty request ignored",
+                    subsystem,
+                )
+                continue
+
+            try:
+                req = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                logging.exception(
+                    "[commands] %s malformed request ignored "
+                    "(bytes=%d preview=%r)",
+                    subsystem,
+                    len(raw),
+                    raw[:256],
+                )
+                continue
 
             cmd = req["command"]
             args = req.get("args")

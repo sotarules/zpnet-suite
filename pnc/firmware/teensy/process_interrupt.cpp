@@ -6166,8 +6166,15 @@ static void lower_env_seal(lower_env_lane_t& lane,
                            uint16_t target_hw16,
                            uint16_t observed_hw16) {
   const uint32_t n = lane.active_bucket_count;
-  if (!lane.active_valid || n < LOWER_ENV_FIT_MIN_BUCKETS ||
-      lane.active_sample_count == 0) {
+  const bool structurally_valid =
+      lane.active_valid &&
+      lane.active_sample_count >= LOWER_ENV_PUBLISH_MIN_SAMPLES &&
+      lane.active_sample_count <= LOWER_ENV_SAMPLE_RATE_HZ &&
+      lane.active_sample_accepted_count <= lane.active_sample_count &&
+      n >= LOWER_ENV_PUBLISH_MIN_BUCKETS &&
+      n <= LOWER_ENV_BUCKET_COUNT &&
+      n <= lane.active_sample_accepted_count;
+  if (!structurally_valid) {
     lower_env_publish_invalid_window(lane, observed_dwt, target_counter32,
                                      target_hw16, observed_hw16);
     return;
