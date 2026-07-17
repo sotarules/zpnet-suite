@@ -1522,7 +1522,8 @@ def system_poller() -> None:
             clocks_payload = build_clocks_status()
             transport_payload = build_transport_status()
             payload_payload = build_payload_status()
-            memory_payload = build_memory_status()
+            # MULE: do not ask for memory information too dangerous because of mallinfo
+            #memory_payload = build_memory_status()
             process_payload = build_process_status()
 
             teensy_features = _teensy_feature_tree_from_report(teensy_payload)
@@ -1550,7 +1551,7 @@ def system_poller() -> None:
                 "clocks": dict(clocks_payload),
                 "transport": dict(transport_payload),
                 "payload": dict(payload_payload),
-                "memory": dict(memory_payload),
+                #"memory": dict(memory_payload),
                 "process": dict(process_payload),
                 "features": features,
             }

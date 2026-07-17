@@ -2651,8 +2651,9 @@ static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
   p.add("vref_v", toFixedDecimal(readVrefVolts(), 6));
 
   // Heap availability
-  p.add("free_heap_bytes", freeHeapBytes());
-  p.add("max_alloc_bytes", maxAllocBytes());
+  // MULE: COMMENTED OUT for STABILITY
+  //p.add("free_heap_bytes", freeHeapBytes());
+  //p.add("max_alloc_bytes", maxAllocBytes());
 
   timepop_idle_witness_snapshot_t idle{};
   timepop_idle_witness_snapshot(&idle);
