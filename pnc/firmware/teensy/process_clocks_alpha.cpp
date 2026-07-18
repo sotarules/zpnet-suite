@@ -54,6 +54,21 @@ void time_clock_reset_all(void);
 
 static constexpr uint64_t NS_PER_SECOND_U64 = 1000000000ULL;
 
+static void alpha_science_reject(clocks_science_reject_reason_t reason,
+                                 time_clock_id_t clock,
+                                 uint32_t detail0 = 0U,
+                                 uint32_t detail1 = 0U,
+                                 uint32_t detail2 = 0U,
+                                 uint32_t detail3 = 0U) {
+  clocks_science_reject(clocks_science_reject_source_t::ALPHA,
+                        reason,
+                        (uint32_t)((uint8_t)clock),
+                        detail0,
+                        detail1,
+                        detail2,
+                        detail3);
+}
+
 static_assert(NS_PER_SECOND_U64 ==
               (uint64_t)VCLOCK_COUNTS_PER_SECOND * 100ULL,
               "VCLOCK pulse identity broken: NS_PER_SECOND_U64 != "
@@ -3445,16 +3460,16 @@ static bool alpha_counterledger_apply_pps_sample(
   if (out_ns) *out_ns = s.refined_valid ? s.refined_ns : s.ns;
 
   if (implausible_reseed) {
-    // The bad capture has been preserved in the CounterLedger transcript and
-    // the lane has been re-seeded without advancing ticks64.  During an armed
-    // campaign this is a continuity surrender: stopping is safer than silently
-    // carrying a frozen or inferred OCXO clockface into TIMEBASE/recovery.
-    clocks_watchdog_anomaly(
-        "alpha_counterledger_interval_implausible",
+    // Preserve the bad capture and re-seed this lane, but keep the campaign
+    // timeline alive.  Beta will publish the next candidate as SCIENCE_REJECT
+    // and the Pi will retain it only in the rejected-row evidence log.
+    alpha_science_reject(
+        clocks_science_reject_reason_t::ALPHA_COUNTERLEDGER_INTERVAL,
+        clock,
         pps_sequence,
-        (uint32_t)((uint8_t)clock),
         delta_ticks,
-        ALPHA_COUNTERLEDGER_EXPECTED_INTERVAL_TICKS);
+        ALPHA_COUNTERLEDGER_EXPECTED_INTERVAL_TICKS,
+        0U);
     return false;
   }
 
@@ -5620,11 +5635,13 @@ static uint64_t alpha_ocxo_apply_measured_second(time_clock_id_t clock,
           if (out_real_interval_ns) *out_real_interval_ns = real_interval_ns;
           if (out_residual_fast_ns) *out_residual_fast_ns = residual_fast_ns;
         } else {
-          clocks_watchdog_anomaly("alpha_bridge_nonmonotonic_ns",
-                                  (uint32_t)((uint8_t)clock),
-                                  m->pending_edge_dwt,
-                                  (uint32_t)resolved_ns,
-                                  (uint32_t)m->ns_at_edge);
+          alpha_science_reject(
+              clocks_science_reject_reason_t::ALPHA_BRIDGE_NONMONOTONIC,
+              clock,
+              m->pending_edge_dwt,
+              (uint32_t)resolved_ns,
+              (uint32_t)m->ns_at_edge,
+              0U);
         }
         m->dwt64_at_edge += (uint64_t)dwt_cycles;
       } else {
@@ -5683,11 +5700,13 @@ static uint64_t alpha_ocxo_project_measured_ns_to_dwt(time_clock_id_t clock,
       (uint64_t)alpha_projection_signed_window_cycles()) {
     alpha_ocxo_pps_projection_guard_t* g = alpha_ocxo_pps_projection_guard(clock);
     if (g) g->measured_projection_reject_count++;
-    clocks_watchdog_anomaly("alpha_ocxo_project_dwt_window",
-                            (uint32_t)((uint8_t)clock),
-                            target_dwt,
-                            m->dwt_at_edge,
-                            legacy_unsigned_delta);
+    alpha_science_reject(
+        clocks_science_reject_reason_t::ALPHA_OCXO_PROJECTION_WINDOW,
+        clock,
+        target_dwt,
+        m->dwt_at_edge,
+        legacy_unsigned_delta,
+        0U);
     return m->ns_at_edge;
   }
 
@@ -5746,11 +5765,13 @@ static uint64_t alpha_ocxo_project_measured_ns_to_dwt_live(time_clock_id_t clock
       (uint64_t)alpha_projection_signed_window_cycles()) {
     alpha_ocxo_pps_projection_guard_t* g = alpha_ocxo_pps_projection_guard(clock);
     if (g) g->measured_projection_reject_count++;
-    clocks_watchdog_anomaly("alpha_ocxo_live_project_dwt_window",
-                            (uint32_t)((uint8_t)clock),
-                            target_dwt,
-                            m->pending_edge_dwt,
-                            legacy_unsigned_delta);
+    alpha_science_reject(
+        clocks_science_reject_reason_t::ALPHA_OCXO_PROJECTION_WINDOW,
+        clock,
+        target_dwt,
+        m->pending_edge_dwt,
+        legacy_unsigned_delta,
+        1U);
     return pending_gnss_ns;
   }
 
@@ -7917,11 +7938,21 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
   alpha_event_flow_note_ticks64(time_clock, ticks64_ok, applied_event,
                                 counter32_delta_since_previous_event);
   if (!ticks64_ok) {
-    clocks_watchdog_anomaly("alpha_clock_apply_failed",
-                            (uint32_t)((uint8_t)time_clock),
-                            applied_event.counter32_at_event,
-                            applied_event.dwt_at_event,
-                            0);
+    if (time_clock == time_clock_id_t::VCLOCK) {
+      clocks_watchdog_anomaly("alpha_clock_apply_failed",
+                              (uint32_t)((uint8_t)time_clock),
+                              applied_event.counter32_at_event,
+                              applied_event.dwt_at_event,
+                              0);
+    } else {
+      alpha_science_reject(
+          clocks_science_reject_reason_t::ALPHA_OCXO_CLOCK_APPLY,
+          time_clock,
+          applied_event.counter32_at_event,
+          applied_event.dwt_at_event,
+          0U,
+          0U);
+    }
     return;
   }
 
@@ -8349,12 +8380,16 @@ static bool alpha_sample_all_clocks_at_pps_vclock(const pps_edge_snapshot_t& sna
           (cap.ocxo1_capture_valid ? 1U : 0U) |
           (cap.ocxo2_capture_valid ? 2U : 0U) |
           (cap.all_lanes_capture_valid ? 4U : 0U);
-      clocks_watchdog_anomaly("alpha_counterledger_capture_invalid",
-                              snap.sequence,
-                              cap.sequence,
-                              cap.valid ? 1U : 0U,
-                              lane_bits);
-      return false;
+      clocks_science_reject(
+          clocks_science_reject_source_t::ALPHA,
+          clocks_science_reject_reason_t::ALPHA_COUNTERLEDGER_CAPTURE,
+          lane_bits,
+          snap.sequence,
+          cap.sequence,
+          cap.valid ? 1U : 0U,
+          lane_bits);
+      // Continue the PPS/VCLOCK timeline.  Invalid OCXO clockfaces remain zero
+      // or stale evidence and Beta marks the candidate DO_NOT_USE.
     }
   }
 

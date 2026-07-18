@@ -71,6 +71,45 @@ void process_clocks_init(void);
 void process_clocks_register(void);
 
 // -----------------------------------------------------------------------------
+// Campaign candidate science disposition
+// -----------------------------------------------------------------------------
+//
+// Once public PPS1 exists, survivable lane-science failures must remain visible
+// as TIMEBASE_FRAGMENT candidates instead of silently stopping the campaign.
+// Alpha and process_interrupt report those failures through this tiny latch;
+// Beta consumes the first pending verdict at the next candidate boundary and
+// stamps the fragment SCIENCE_REJECT.  Fundamental PPS/VCLOCK identity, memory,
+// payload, and publication failures continue to use WATCHDOG_ANOMALY.
+
+enum class clocks_science_reject_source_t : uint8_t {
+  NONE      = 0,
+  BETA      = 1,
+  ALPHA     = 2,
+  INTERRUPT = 3,
+};
+
+enum class clocks_science_reject_reason_t : uint16_t {
+  NONE                                = 0,
+  BETA_OCXO_SCIENCE_CUSTODY           = 100,
+  INTERRUPT_FLOORLINE_FIT             = 200,
+  INTERRUPT_RAW_BOOKEND               = 201,
+  INTERRUPT_OCXO_DWT_PUBLICATION      = 202,
+  ALPHA_COUNTERLEDGER_INTERVAL        = 300,
+  ALPHA_BRIDGE_NONMONOTONIC           = 301,
+  ALPHA_OCXO_PROJECTION_WINDOW        = 302,
+  ALPHA_OCXO_CLOCK_APPLY              = 303,
+  ALPHA_COUNTERLEDGER_CAPTURE         = 304,
+};
+
+void clocks_science_reject(clocks_science_reject_source_t source,
+                           clocks_science_reject_reason_t reason,
+                           uint32_t lane,
+                           uint32_t detail0 = 0U,
+                           uint32_t detail1 = 0U,
+                           uint32_t detail2 = 0U,
+                           uint32_t detail3 = 0U);
+
+// -----------------------------------------------------------------------------
 // Direct accessors (escape hatches)
 // -----------------------------------------------------------------------------
 

@@ -128,6 +128,28 @@ __attribute__((weak)) void clocks_watchdog_anomaly_payload(const char* reason,
 // campaign ledger is actually armed.
 bool clocks_watchdog_campaign_armed(void);
 
+static bool interrupt_science_reject_lane(
+    interrupt_subscriber_kind_t kind) {
+  return kind == interrupt_subscriber_kind_t::OCXO1 ||
+         kind == interrupt_subscriber_kind_t::OCXO2;
+}
+
+static void interrupt_science_reject(
+    clocks_science_reject_reason_t reason,
+    interrupt_subscriber_kind_t kind,
+    uint32_t detail0 = 0U,
+    uint32_t detail1 = 0U,
+    uint32_t detail2 = 0U,
+    uint32_t detail3 = 0U) {
+  clocks_science_reject(clocks_science_reject_source_t::INTERRUPT,
+                        reason,
+                        (uint32_t)kind,
+                        detail0,
+                        detail1,
+                        detail2,
+                        detail3);
+}
+
 static char interrupt_ascii_fold(char c) {
   return (c >= 'a' && c <= 'z') ? (char)(c - ('a' - 'A')) : c;
 }
@@ -5821,12 +5843,13 @@ static __attribute__((noinline)) void lower_env_watchdog_anomaly(
                                        uint32_t detail2 = 0U) {
   lane.watchdog_anomaly_count++;
   lane.last_watchdog_reason = reason;
-  clocks_watchdog_anomaly("floorline_v2_anomaly",
-                          (uint32_t)lane.kind,
-                          reason,
-                          detail0,
-                          detail1);
-  (void)detail2;
+  interrupt_science_reject(
+      clocks_science_reject_reason_t::INTERRUPT_FLOORLINE_FIT,
+      lane.kind,
+      reason,
+      detail0,
+      detail1,
+      detail2);
 }
 
 static void lower_env_reset_lane(interrupt_subscriber_kind_t kind) {
@@ -6045,163 +6068,21 @@ static FLASHMEM bool lower_env_raw_bookend_watchdog_if_pending(
   }
   consumer->last_watchdog_reason = lane->raw_bookend_anomaly_reason;
 
-  const char* reason =
-      lower_env_raw_bookend_reason_name(lane->raw_bookend_anomaly_reason);
   const uint32_t observed_interval =
       lane->raw_bookend_anomaly_observed_interval_cycles;
-  const uint32_t reference_cycles =
-      lane->raw_bookend_anomaly_reference_cycles;
 
-  Payload root;
-  root.add("schema", "WATCHDOG_ANOMALY_INTERRUPT_RAW_BOOKEND_V1");
-  root.add("reason", reason);
-  root.add("source_process", "INTERRUPT");
-  root.add("source_report", "LOWER_ENV_RAW_BOOKEND_COURT");
-  root.add("summary", "raw observed lower-envelope bookend interval collapsed before subscriber publication");
-  root.add("kind", interrupt_subscriber_kind_str(kind));
-  root.add("lane", lane->name ? lane->name : "");
-  root.add("handoff_phase", handoff_phase ? handoff_phase : "unknown");
-  root.add("lower_env_source", lower_env_raw_bookend_source_name(
-                                lane->raw_bookend_anomaly_source));
-  root.add("campaign_armed", true);
-  root.add("watchdog_dwt", (uint32_t)ARM_DWT_CYCCNT);
-  root.add("ipsr", interrupt_ipsr());
-  root.add("primask", interrupt_primask());
-
-  {
-  Payload interval;
-  interval.add("observed_interval_cycles", observed_interval);
-  interval.add("reference_cycles", reference_cycles);
-  interval.add("fatal_max_cycles", LOWER_ENV_RAW_BOOKEND_FATAL_MAX_CYCLES);
-  interval.add("observed_minus_reference_cycles",
-               (int32_t)((int64_t)(uint64_t)observed_interval -
-                         (int64_t)(uint64_t)reference_cycles));
-  interval.add("previous_observed_edge_dwt",
-               lane->raw_bookend_anomaly_previous_observed_dwt);
-  interval.add("current_observed_edge_dwt",
-               lane->raw_bookend_anomaly_current_observed_dwt);
-  interval.add("current_minus_previous_observed_cycles",
-               (int32_t)(lane->raw_bookend_anomaly_current_observed_dwt -
-                         lane->raw_bookend_anomaly_previous_observed_dwt));
-  root.add_object("raw_observed_interval", interval);  }
-
-
-  {
-  Payload counter;
-  counter.add("previous_target_counter32",
-              lane->raw_bookend_anomaly_previous_target_counter32);
-  counter.add("current_target_counter32",
-              lane->raw_bookend_anomaly_current_target_counter32);
-  counter.add("target_counter_delta_ticks",
-              lane->raw_bookend_anomaly_current_target_counter32 -
-              lane->raw_bookend_anomaly_previous_target_counter32);
-  counter.add("expected_one_second_delta_ticks",
-              (uint32_t)VCLOCK_COUNTS_PER_SECOND);
-  counter.add("previous_target_low16",
-              (uint32_t)lane->raw_bookend_anomaly_previous_target_hw16);
-  counter.add("previous_observed_low16",
-              (uint32_t)lane->raw_bookend_anomaly_previous_observed_hw16);
-  counter.add("current_target_low16",
-              (uint32_t)lane->raw_bookend_anomaly_current_target_hw16);
-  counter.add("current_observed_low16",
-              (uint32_t)lane->raw_bookend_anomaly_current_observed_hw16);
-  counter.add("previous_observed_minus_target_ticks",
-              (uint32_t)((uint16_t)(
-                  lane->raw_bookend_anomaly_previous_observed_hw16 -
-                  lane->raw_bookend_anomaly_previous_target_hw16)));
-  counter.add("current_observed_minus_target_ticks",
-              (uint32_t)((uint16_t)(
-                  lane->raw_bookend_anomaly_current_observed_hw16 -
-                  lane->raw_bookend_anomaly_current_target_hw16)));
-  root.add_object("counter_lineage", counter);  }
-
-
-  {
-  Payload floorline;
-  floorline.add("valid", r.valid);
-  floorline.add("sequence", r.sequence);
-  floorline.add("candidate_present", r.candidate_present);
-  floorline.add("publish_floorline", r.publish_floorline);
-  floorline.add("fallback_used", r.fallback_used);
-  floorline.add("publish_source", lower_env_publish_source_name(r.publish_source));
-  floorline.add("publish_reason", lower_env_publish_reason_name(r.publish_reason));
-  floorline.add("confidence_ppm", r.confidence_ppm);
-  floorline.add("sample_count", r.sample_count);
-  floorline.add("selected_bucket_count", r.selected_bucket_count);
-  floorline.add("sample_accepted_count", r.sample_accepted_count);
-  floorline.add("sample_rejected_count", r.sample_rejected_count);
-  floorline.add("sample_hard_rejected_count", r.sample_hard_rejected_count);
-  floorline.add("observed_edge_dwt", r.observed_dwt_at_event);
-  floorline.add("inferred_edge_dwt", r.inferred_dwt_at_event);
-  floorline.add("inferred_minus_observed_edge_cycles",
-                r.inferred_minus_observed_cycles);
-  floorline.add("inferred_interval_valid", r.inferred_interval_valid);
-  floorline.add("inferred_interval_cycles", r.inferred_interval_cycles);
-  floorline.add("inferred_minus_observed_interval_cycles",
-                r.inferred_minus_observed_interval_cycles);
-  floorline.add("slope_q16_cycles_per_sample", r.slope_q16_cycles_per_sample);
-  floorline.add("slope_delta_q16_cycles_per_sample",
-                r.slope_delta_q16_cycles_per_sample);
-  floorline.add("candidate_interval_error_cycles",
-                r.candidate_interval_error_cycles);
-  floorline.add("residual_min_cycles", r.residual_min_cycles);
-  floorline.add("residual_max_cycles", r.residual_max_cycles);
-  floorline.add("residual_abs_gt4_count", r.residual_abs_gt4_count);
-  floorline.add("residual_abs_gt16_count", r.residual_abs_gt16_count);
-  floorline.add("residual_abs_gt32_count", r.residual_abs_gt32_count);
-  floorline.add("residual_abs_gt64_count", r.residual_abs_gt64_count);
-  floorline.add("residual_abs_gt128_count", r.residual_abs_gt128_count);
-  root.add_object("floorline", floorline);  }
-
-
-  {
-  Payload published;
-  published.add("published_dwt", diag.used_dwt);
-  published.add("observed_dwt", diag.original_dwt);
-  published.add("published_minus_observed_cycles", diag.error_cycles);
-  published.add("synthetic", diag.synthetic);
-  published.add("repair_candidate", diag.candidate);
-  published.add("repair_reason", diag.reason ? diag.reason : "");
-  published.add("isr_entry_dwt_raw", diag.isr_entry_dwt_raw);
-  published.add("event_dwt_from_isr_entry_raw",
-                diag.event_dwt_from_isr_entry_raw);
-  published.add("isr_entry_to_event_correction_cycles",
-                diag.isr_entry_to_event_correction_cycles);
-  root.add_object("published_edge", published);  }
-
-
-  {
-  Payload state;
-  state.add("active_valid", lane->active_valid);
-  state.add("active_base_dwt", lane->active_base_dwt);
-  state.add("active_sample_count", lane->active_sample_count);
-  state.add("active_bucket_count", lane->active_bucket_count);
-  state.add("active_sample_accepted_count", lane->active_sample_accepted_count);
-  state.add("active_sample_rejected_count", lane->active_sample_rejected_count);
-  state.add("active_sample_hard_rejected_count", lane->active_sample_hard_rejected_count);
-  state.add("previous_inferred_edge_valid", lane->previous_inferred_edge_valid);
-  state.add("previous_inferred_edge_dwt", lane->previous_inferred_edge_dwt);
-  state.add("previous_slope_valid", lane->previous_slope_valid);
-  state.add("previous_slope_q16_cycles_per_sample",
-            lane->previous_slope_q16_cycles_per_sample);
-  state.add("raw_bookend_anomaly_count", lane->raw_bookend_anomaly_count);
-  state.add("raw_bookend_anomaly_report_count",
-            consumer->raw_bookend_report_count);
-  state.add("floorline_valid_estimate_count", lane->floorline_valid_estimate_count);
-  state.add("fallback_publish_count", lane->fallback_publish_count);
-  state.add("invalid_window_count", lane->invalid_window_count);
-  state.add("overflow_reset_count", lane->overflow_reset_count);
-  state.add("reset_count", lane->reset_count);
-  state.add("update_count", lane->update_count);
-  root.add_object("lane_state", state);  }
-
-
-  clocks_watchdog_anomaly_payload("lower_env_raw_bookend_anomaly",
-                                  root,
-                                  (uint32_t)kind,
-                                  observed_interval,
-                                  lane->raw_bookend_anomaly_current_observed_dwt,
-                                  lane->raw_bookend_anomaly_current_target_counter32);
+  // The complete lower-envelope transcript remains in the lane report store and
+  // the candidate's embedded micro forensics.  Do not allocate a second verbose
+  // watchdog Payload merely to reject this science row.
+  (void)diag;
+  (void)handoff_phase;
+  interrupt_science_reject(
+      clocks_science_reject_reason_t::INTERRUPT_RAW_BOOKEND,
+      kind,
+      observed_interval,
+      lane->raw_bookend_anomaly_current_observed_dwt,
+      lane->raw_bookend_anomaly_current_target_counter32,
+      lane->raw_bookend_anomaly_reason);
   return false;
 }
 
@@ -8031,15 +7912,27 @@ static __attribute__((noinline)) bool dwt_publication_adjudicate_or_watchdog(
         if (launch_acquisition) {
           g_dwt_publication_launch_hard_block_count++;
         } else if (campaign_armed || strict_ready) {
-          dwt_publication_raise_verbose_watchdog(req,
-                                                  diag,
-                                                  *s,
-                                                  g_dwt_publication_last_fatal,
-                                                  blocking_mask,
-                                                  always_blocking,
-                                                  launch_blocking,
-                                                  launch_relaxed,
-                                                  strict_ready);
+          if (interrupt_science_reject_lane(req.kind)) {
+            interrupt_science_reject(
+                clocks_science_reject_reason_t::INTERRUPT_OCXO_DWT_PUBLICATION,
+                req.kind,
+                req.sequence,
+                blocking_mask,
+                req.published_dwt,
+                req.target_counter32);
+          } else {
+            // VCLOCK is the campaign timeline itself.  If its publication court
+            // cannot author an edge, ordinary candidate testimony is impossible.
+            dwt_publication_raise_verbose_watchdog(req,
+                                                    diag,
+                                                    *s,
+                                                    g_dwt_publication_last_fatal,
+                                                    blocking_mask,
+                                                    always_blocking,
+                                                    launch_blocking,
+                                                    launch_relaxed,
+                                                    strict_ready);
+          }
         }
         diag.publication_verdict_reason_id = launch_acquisition
             ? INTERRUPT_DWT_PUBLICATION_REASON_LAUNCH_ACQUISITION_HARD_QUARANTINE

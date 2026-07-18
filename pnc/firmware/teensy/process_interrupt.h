@@ -52,8 +52,10 @@ enum class interrupt_event_status_t : uint8_t {
 };
 
 // Final DWT-at-edge publication tribunal verdict bits.  These are mirrored
-// from process_interrupt.cpp so TIMEBASE/raw_cycles tooling can decode a
-// WATCHDOG_ANOMALY mask without depending on private firmware internals.
+// from process_interrupt.cpp so TIMEBASE/raw_cycles tooling can decode the
+// evidence without private firmware internals.  A blocked OCXO verdict becomes
+// a SCIENCE_REJECT candidate; a blocked VCLOCK verdict remains WATCHDOG_ANOMALY
+// because VCLOCK is the campaign timeline itself.
 static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_VERDICT_OK = 0U;
 static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_VERDICT_ZERO_DWT = 1u << 0;
 static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_VERDICT_SOURCE_MISMATCH = 1u << 1;
@@ -254,10 +256,10 @@ struct interrupt_capture_diag_t {
   uint32_t dwt_synthetic_threshold_cycles = 0;
   const char* dwt_synthetic_reason = nullptr;
 
-  // Final DWT-at-edge publication tribunal.  A nonzero verdict means the
-  // event was not admissible and should have raised WATCHDOG_ANOMALY before
-  // subscriber publication.  FloorLine verdict bits are retained for ABI
-  // decoding but are diagnostic after FloorLine publication deprecation.
+  // Final DWT-at-edge publication tribunal.  A nonzero blocking verdict means
+  // the event was not admissible before subscriber publication.  OCXO failures
+  // become SCIENCE_REJECT testimony; VCLOCK failures raise WATCHDOG_ANOMALY.
+  // FloorLine verdict bits remain diagnostic after publication deprecation.
   // OK events carry zero here for audit continuity.
   uint32_t dwt_publication_verdict_mask = 0;
   uint32_t dwt_publication_verdict_reason_id = INTERRUPT_DWT_PUBLICATION_REASON_OK;

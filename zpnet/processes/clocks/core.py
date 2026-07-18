@@ -159,6 +159,12 @@ SYNC_LOG_INTERVAL_S = 5.0
 TIMEBASE_INGRESS_QUEUE_MAXSIZE = 0
 TIMEBASE_FRAGMENT_TOPIC = "TIMEBASE_FRAGMENT"
 CLOCKS_RECOVERY_STALLED_TOPIC = "CLOCKS_RECOVERY_STALLED"
+TIMEBASE_CANDIDATE_ACCEPT = "ACCEPT"
+TIMEBASE_CANDIDATE_SCIENCE_REJECT = "SCIENCE_REJECT"
+TIMEBASE_CANDIDATE_DISPOSITIONS = {
+    TIMEBASE_CANDIDATE_ACCEPT,
+    TIMEBASE_CANDIDATE_SCIENCE_REJECT,
+}
 
 INVALID_TIMEBASE_LOG_PATH = os.environ.get(
     "ZPNET_INVALID_TIMEBASE_LOG_PATH",
@@ -355,6 +361,13 @@ _diag: Dict[str, Any] = {
     "timebase_final_court_consecutive_row_fatal": 0,
     "timebase_final_court_row_fatal_escalate_threshold": TIMEBASE_FINAL_COURT_ROW_FATAL_ESCALATE_CONSECUTIVE,
     "last_timebase_final_court_row_drop": {},
+
+    # Firmware-authored candidate disposition.  SCIENCE_REJECT is heartbeat
+    # testimony, not a TIMEBASE row and not a recovery request.
+    "firmware_science_reject_received": 0,
+    "firmware_science_reject_logged": 0,
+    "firmware_science_reject_log_failures": 0,
+    "last_firmware_science_reject": {},
 
     # Dedicated invalid-TIMEBASE JSONL evidence log.
     "invalid_timebase_log_path": INVALID_TIMEBASE_LOG_PATH,
@@ -593,7 +606,7 @@ def _log_invalid_timebase(
 
     entry = {
         "logged_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        "classification": "DROP_ROW",
+        "classification": str(verdict.get("classification") or "DROP_ROW"),
         "verdict": verdict,
         "raw_record": raw_record,
         "assembled_timebase": assembled_timebase,
@@ -619,6 +632,96 @@ def _log_invalid_timebase(
         logging.exception(
             "⚠️ [clocks] failed to write rejected TIMEBASE evidence; row remains dropped"
         )
+
+
+def _candidate_disposition(fragment: Dict[str, Any]) -> str:
+    """Return the normalized firmware-authored candidate disposition."""
+    raw = str(fragment.get("candidate_disposition") or TIMEBASE_CANDIDATE_ACCEPT)
+    return raw.strip().upper()
+
+
+def _drop_firmware_science_reject(
+    *,
+    campaign: str,
+    pps_vclock_count: int,
+    fragment: Dict[str, Any],
+    raw_record: Dict[str, Any],
+    assembled_timebase: Dict[str, Any],
+) -> None:
+    """Log one explicit firmware science rejection without publishing TIMEBASE."""
+    reason_code = _as_int(fragment.get("candidate_reason_code")) or 0
+    reason = str(fragment.get("candidate_reason") or "unspecified")
+    source = str(fragment.get("candidate_source") or "UNKNOWN")
+    lane = _as_int(fragment.get("candidate_lane")) or 0
+    reject_mask = _as_int(fragment.get("candidate_reject_mask")) or 0
+    details = {
+        "detail0": _as_int(fragment.get("candidate_detail0")) or 0,
+        "detail1": _as_int(fragment.get("candidate_detail1")) or 0,
+        "detail2": _as_int(fragment.get("candidate_detail2")) or 0,
+        "detail3": _as_int(fragment.get("candidate_detail3")) or 0,
+    }
+    verdict = {
+        "schema": "PI_FIRMWARE_SCIENCE_REJECT_V1",
+        "valid": False,
+        "classification": "FIRMWARE_SCIENCE_REJECT",
+        "court_classification": "DROP_ROW",
+        "reason": "firmware_science_reject",
+        "primary_rule": "candidate_disposition",
+        "rationale": "firmware testified that this campaign second is not canonical science",
+        "source": source,
+        "source_process": "TEENSY_CLOCKS",
+        "source_report": "TIMEBASE_FRAGMENT",
+        "campaign": campaign,
+        "teensy_pps_vclock_count": int(pps_vclock_count),
+        "teensy_pps_count": int(pps_vclock_count),
+        "pps_count": int(pps_vclock_count),
+        "candidate_disposition": TIMEBASE_CANDIDATE_SCIENCE_REJECT,
+        "candidate_use": fragment.get("candidate_use"),
+        "candidate_reason_code": int(reason_code),
+        "candidate_reason": reason,
+        "candidate_source": source,
+        "candidate_lane": int(lane),
+        "candidate_reject_mask": int(reject_mask),
+        "candidate_details": details,
+        "timeline_valid": fragment.get("timeline_valid"),
+        "ocxo_clockface_valid": fragment.get("ocxo_clockface_valid"),
+        "ocxo_science_valid": fragment.get("ocxo_science_valid"),
+        "recovery_requested": False,
+        "invalid_timebase_log_path": INVALID_TIMEBASE_LOG_PATH,
+    }
+
+    _diag["firmware_science_reject_received"] += 1
+    _diag["last_firmware_science_reject"] = {
+        "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        **verdict,
+    }
+    before_writes = int(_diag.get("invalid_timebase_log_writes") or 0)
+    _log_invalid_timebase(
+        verdict=verdict,
+        raw_record=raw_record,
+        assembled_timebase=assembled_timebase,
+    )
+    if int(_diag.get("invalid_timebase_log_writes") or 0) > before_writes:
+        _diag["firmware_science_reject_logged"] += 1
+    else:
+        _diag["firmware_science_reject_log_failures"] += 1
+
+    logging.error(
+        "🧪 [clocks] firmware SCIENCE_REJECT — campaign=%s count=%d "
+        "source=%s reason=%s(%d) lane=%d mask=0x%08x details=%s; "
+        "candidate remains heartbeat evidence but will NOT publish TIMEBASE or persist PostgreSQL. "
+        "Full raw candidate follows: %s",
+        campaign,
+        int(pps_vclock_count),
+        source,
+        reason,
+        int(reason_code),
+        int(lane),
+        int(reject_mask),
+        details,
+        json.dumps(raw_record, sort_keys=True, separators=(",", ":"), default=str),
+    )
+
 
 # ---------------------------------------------------------------------
 # GNSS stream health canary — lightweight Pi-side check
@@ -3155,6 +3258,19 @@ def _timebase_final_court_check_candidate_envelope(
         )
         return
 
+    disposition = _candidate_disposition(fragment)
+    if disposition not in TIMEBASE_CANDIDATE_DISPOSITIONS:
+        _timebase_final_court_add_violation(
+            violations,
+            rule="candidate_disposition_known",
+            lane="candidate",
+            message="candidate disposition is not recognized",
+            fields={
+                "candidate_disposition": fragment.get("candidate_disposition"),
+                "allowed": sorted(TIMEBASE_CANDIDATE_DISPOSITIONS),
+            },
+        )
+
     if not isinstance(forensics, dict) or not forensics:
         _timebase_final_court_add_violation(
             violations,
@@ -4691,6 +4807,25 @@ def _process_loop() -> None:
             "fragment": frag,
             "forensics": forensics,
         }
+
+        if _candidate_disposition(frag) == TIMEBASE_CANDIDATE_SCIENCE_REJECT:
+            # Receipt was already recorded as TIMEBASE heartbeat in the PUBSUB
+            # fast path.  Track candidate identity, retain the complete evidence,
+            # and stop before final court, recovery sync, GNSS_RAW, publication,
+            # or PostgreSQL state can advance.
+            _note_pps_vclock_count(int(pps_vclock_count))
+            _timebase_final_court_reset_row_fatal_streak(
+                "firmware_science_reject"
+            )
+            _drop_firmware_science_reject(
+                campaign=campaign,
+                pps_vclock_count=int(pps_vclock_count),
+                fragment=frag,
+                raw_record=raw_record,
+                assembled_timebase=court_timebase,
+            )
+            continue
+
         _diag["timebase_final_court_checks"] += 1
         court_ok, court_verdict = _timebase_final_court_evaluate(court_timebase)
         if not court_ok:

@@ -200,6 +200,124 @@ static constexpr bool TIMEBASE_FRAGMENT_PUBLISH_PREDICTION_ENABLED = false;
 static constexpr uint32_t TIMEBASE_CANDIDATE_INVALID_OCXO1_CUSTODY = 1U << 0;
 static constexpr uint32_t TIMEBASE_CANDIDATE_INVALID_OCXO2_CUSTODY = 1U << 1;
 
+// Defined with the watchdog state later in this translation unit.  The science
+// reject latch is intentionally armed only after the first public candidate has
+// returned, so pre-campaign/start-prologue evidence cannot poison public PPS1.
+bool clocks_watchdog_campaign_armed(void);
+
+// Cross-layer science-reject latch.  State is an atomic three-state word:
+//   0 = idle, 1 = writer owns the record, 2 = complete record awaits Beta.
+// The first survivable failure wins the next candidate; later failures coalesce
+// into counters rather than replacing the original testimony.
+struct clocks_science_reject_record_t {
+  clocks_science_reject_source_t source = clocks_science_reject_source_t::NONE;
+  clocks_science_reject_reason_t reason = clocks_science_reject_reason_t::NONE;
+  uint32_t lane = 0U;
+  uint32_t detail0 = 0U;
+  uint32_t detail1 = 0U;
+  uint32_t detail2 = 0U;
+  uint32_t detail3 = 0U;
+};
+
+static volatile uint32_t g_science_reject_latch_state = 0U;
+static clocks_science_reject_record_t g_science_reject_latch DMAMEM = {};
+static volatile uint32_t g_science_reject_raise_count = 0U;
+static volatile uint32_t g_science_reject_coalesced_count = 0U;
+static uint32_t g_science_reject_consumed_count = 0U;
+static uint32_t g_science_reject_last_public_count = 0U;
+static clocks_science_reject_record_t g_science_reject_last DMAMEM = {};
+
+static const char* clocks_science_reject_source_name(
+    clocks_science_reject_source_t source) {
+  switch (source) {
+    case clocks_science_reject_source_t::BETA: return "BETA";
+    case clocks_science_reject_source_t::ALPHA: return "ALPHA";
+    case clocks_science_reject_source_t::INTERRUPT: return "INTERRUPT";
+    default: return "NONE";
+  }
+}
+
+static const char* clocks_science_reject_reason_name(
+    clocks_science_reject_reason_t reason) {
+  switch (reason) {
+    case clocks_science_reject_reason_t::BETA_OCXO_SCIENCE_CUSTODY:
+      return "beta_ocxo_science_custody";
+    case clocks_science_reject_reason_t::INTERRUPT_FLOORLINE_FIT:
+      return "interrupt_floorline_fit";
+    case clocks_science_reject_reason_t::INTERRUPT_RAW_BOOKEND:
+      return "interrupt_raw_bookend";
+    case clocks_science_reject_reason_t::INTERRUPT_OCXO_DWT_PUBLICATION:
+      return "interrupt_ocxo_dwt_publication";
+    case clocks_science_reject_reason_t::ALPHA_COUNTERLEDGER_INTERVAL:
+      return "alpha_counterledger_interval";
+    case clocks_science_reject_reason_t::ALPHA_BRIDGE_NONMONOTONIC:
+      return "alpha_bridge_nonmonotonic";
+    case clocks_science_reject_reason_t::ALPHA_OCXO_PROJECTION_WINDOW:
+      return "alpha_ocxo_projection_window";
+    case clocks_science_reject_reason_t::ALPHA_OCXO_CLOCK_APPLY:
+      return "alpha_ocxo_clock_apply";
+    case clocks_science_reject_reason_t::ALPHA_COUNTERLEDGER_CAPTURE:
+      return "alpha_counterledger_capture";
+    default: return "none";
+  }
+}
+
+void clocks_science_reject(clocks_science_reject_source_t source,
+                           clocks_science_reject_reason_t reason,
+                           uint32_t lane,
+                           uint32_t detail0,
+                           uint32_t detail1,
+                           uint32_t detail2,
+                           uint32_t detail3) {
+  if (reason == clocks_science_reject_reason_t::NONE ||
+      !clocks_watchdog_campaign_armed()) {
+    return;
+  }
+
+  uint32_t expected = 0U;
+  if (!__atomic_compare_exchange_n(&g_science_reject_latch_state,
+                                   &expected,
+                                   1U,
+                                   false,
+                                   __ATOMIC_ACQ_REL,
+                                   __ATOMIC_ACQUIRE)) {
+    (void)__atomic_add_fetch(&g_science_reject_coalesced_count,
+                             1U,
+                             __ATOMIC_RELAXED);
+    return;
+  }
+
+  g_science_reject_latch.source = source;
+  g_science_reject_latch.reason = reason;
+  g_science_reject_latch.lane = lane;
+  g_science_reject_latch.detail0 = detail0;
+  g_science_reject_latch.detail1 = detail1;
+  g_science_reject_latch.detail2 = detail2;
+  g_science_reject_latch.detail3 = detail3;
+  (void)__atomic_add_fetch(&g_science_reject_raise_count,
+                           1U,
+                           __ATOMIC_RELAXED);
+  __atomic_store_n(&g_science_reject_latch_state, 2U, __ATOMIC_RELEASE);
+}
+
+static bool clocks_science_reject_consume(
+    clocks_science_reject_record_t& out) {
+  if (__atomic_load_n(&g_science_reject_latch_state,
+                      __ATOMIC_ACQUIRE) != 2U) {
+    out = clocks_science_reject_record_t{};
+    return false;
+  }
+
+  out = g_science_reject_latch;
+  g_science_reject_consumed_count++;
+  __atomic_store_n(&g_science_reject_latch_state, 0U, __ATOMIC_RELEASE);
+  return out.reason != clocks_science_reject_reason_t::NONE;
+}
+
+static void clocks_science_reject_clear(void) {
+  __atomic_store_n(&g_science_reject_latch_state, 0U, __ATOMIC_RELEASE);
+}
+
 
 static constexpr uint32_t TIMEBASE_BUILD_STAGE_NONE = 0;
 static constexpr uint32_t TIMEBASE_BUILD_STAGE_ENTRY = 1;
@@ -260,6 +378,8 @@ static uint32_t g_timebase_forensics_publish_return_count = 0;
 static uint32_t g_timebase_forensics_minimal_count = 0;
 static uint32_t g_timebase_forensics_micro_raw_count = 0;
 static uint32_t g_timebase_forensics_slim_count = 0;
+static uint32_t g_timebase_science_reject_candidate_count = 0;
+static uint32_t g_timebase_accept_candidate_count = 0;
 
 static uint32_t g_timebase_last_stage = TIMEBASE_BUILD_STAGE_NONE;
 static uint64_t g_timebase_last_entry_campaign_seconds = 0;
@@ -1351,6 +1471,8 @@ static clock_science_row_t g_beta_probe_ocxo1_science_row DMAMEM = {};
 static clock_science_row_t g_beta_probe_ocxo2_science_row DMAMEM = {};
 static floorline_science_totals_t g_beta_probe_floorline_o1 DMAMEM = {};
 static floorline_science_totals_t g_beta_probe_floorline_o2 DMAMEM = {};
+static floorline_science_totals_t g_beta_row_floorline_o1_before DMAMEM = {};
+static floorline_science_totals_t g_beta_row_floorline_o2_before DMAMEM = {};
 
 static const char* delta_raw_interval_reject_reason(uint32_t cycles) {
   if (cycles == 0U) return "interval_zero";
@@ -7993,6 +8115,7 @@ static void ocxo_dac_apply_synthetic_servo_step(ocxo_dac_state_t& dac,
 
 static void campaign_accounting_reset_common(bool reset_servo_runtime) {
   clocks_watchdog_disarm_campaign_publication();
+  clocks_science_reject_clear();
 
   // Beta-local accounting reset only.  Alpha owns the active time/epoch
   // projection. Do not invalidate it here: after SmartZero install the new
@@ -8463,6 +8586,7 @@ void clocks_beta_pps(void) {
     timebase_build_stage(TIMEBASE_BUILD_STAGE_STOP_GATE);
     const bool was_started = (campaign_state == clocks_campaign_state_t::STARTED);
     clocks_watchdog_clear_surrender_for_new_lifecycle();
+    clocks_science_reject_clear();
     campaign_state = clocks_campaign_state_t::STOPPED;
     request_stop = false;
     request_zero = false;
@@ -8605,17 +8729,9 @@ void clocks_beta_pps(void) {
       g_recover_continuity_align_pending ||
       clocks_campaign_recovery_lifecycle_active();
 
-  if (dwt_welford_recovery_quarantine) {
-    g_dwt_welford_recovery_quarantine_count++;
-    g_dwt_welford_recovery_quarantine_last_public_count = public_count;
-    g_dwt_welford_recovery_quarantine_last_cycles =
-        (uint32_t)g_dwt_cycles_between_pps_vclock;
-  } else {
-    const double cycles = (double)g_dwt_cycles_between_pps_vclock;
-    const double expected = (double)DWT_EXPECTED_PER_PPS;
-    const double dwt_ppb_sample = (cycles - expected) / expected * 1e9;
-    welford_update(welford_dwt, dwt_ppb_sample);
-  }
+  // DWT Welford mutation is deferred until after the candidate disposition
+  // court below.  A SCIENCE_REJECT row advances campaign identity but may not
+  // enter any campaign statistical population.
 
   clocks_alpha_lane_forensics_t& vclock_forensics = g_beta_pps_vclock_forensics;
   clocks_alpha_lane_forensics_t& ocxo1_forensics = g_beta_pps_ocxo1_forensics;
@@ -8672,8 +8788,6 @@ void clocks_beta_pps(void) {
       ocxo2_pps_projection_ok && ocxo2_pps_projection.valid &&
       ocxo2_pps_projection.projected_ocxo_ns_at_pps != 0;
 
-  (void)welfords_advance_non_ocxo_gap_before_row(public_count);
-
   // Delta residuals are now same-row aligned. PhaseLedger may have its own
   // lawful suffix lag internally, but Beta must not compare the previous
   // PPS/VCLOCK interval against the current OCXO interval. Capture the
@@ -8695,6 +8809,8 @@ void clocks_beta_pps(void) {
   // campaign public-ledger ratios.
   clock_science_row_t& ocxo1_floorline_science = g_beta_ocxo1_science_row;
   clock_science_row_t& ocxo2_floorline_science = g_beta_ocxo2_science_row;
+  g_beta_row_floorline_o1_before = g_floorline_science_ocxo1;
+  g_beta_row_floorline_o2_before = g_floorline_science_ocxo2;
   floorline_science_build_ocxo(ocxo1_floorline_science,
                                time_clock_id_t::OCXO1,
                                public_count,
@@ -8839,6 +8955,36 @@ void clocks_beta_pps(void) {
           ocxo1_floorline_science,
           ocxo2_floorline_science);
 
+  clocks_science_reject_record_t candidate_reject{};
+  const bool external_science_reject =
+      clocks_science_reject_consume(candidate_reject);
+  if (!external_science_reject && ocxo_science_invalid_mask != 0U) {
+    candidate_reject.source = clocks_science_reject_source_t::BETA;
+    candidate_reject.reason =
+        clocks_science_reject_reason_t::BETA_OCXO_SCIENCE_CUSTODY;
+    candidate_reject.lane = ocxo_science_invalid_mask;
+    candidate_reject.detail0 = ocxo_science_invalid_mask;
+  }
+  const bool candidate_science_reject =
+      candidate_reject.reason != clocks_science_reject_reason_t::NONE ||
+      ocxo_science_invalid_mask != 0U;
+
+  if (candidate_science_reject) {
+    // floorline_science_build_ocxo() updates diagnostic totals while building
+    // the evidence row.  Rejected testimony must not enter those populations.
+    g_floorline_science_ocxo1 = g_beta_row_floorline_o1_before;
+    g_floorline_science_ocxo2 = g_beta_row_floorline_o2_before;
+    g_timebase_science_reject_candidate_count++;
+    g_science_reject_last_public_count = public_count;
+    g_science_reject_last = candidate_reject;
+    clocks_beta_feature_set_cached("SCIENCE_RESIDUALS",
+                                   g_clocks_feature_science_residuals,
+                                   system_feature_status_t::ANOMALY,
+                                   true);
+  } else {
+    g_timebase_accept_candidate_count++;
+  }
+
   // ── Legacy cycle-domain residual diagnostics ──
   //
   // This older static-prediction diagnostic remains forensic-only.  Canonical
@@ -8869,77 +9015,86 @@ void clocks_beta_pps(void) {
   const ocxo_cycle_residual_diag_t& ocxo2_cycle_residual_diag =
       g_beta_ocxo2_cycle_residual_diag;
 
-  // VCLOCK measurement Welford — bridge-interpolation self-test.
-  // Sample in ns; mean == ppb under the "ns/sec == ppb" identity.
-  if (g_vclock_measurement.gnss_ns_between_edges != 0) {
-    welford_update(welford_vclock, (double)g_vclock_measurement.second_residual_ns);
-  }
-
-  (void)welfords_advance_ocxo_gap_before_valid_row(
-      public_count,
-      ocxo1_floorline_science.valid,
-      ocxo2_floorline_science.valid);
-
-  // OCXO Welfords consume the exact canonical Delta residual.  The integer
-  // pps_residual.fast_residual_ns remains the public compatibility rendering;
-  // Welford keeps the sub-ns Delta value so mean/stddev do not throw away
-  // the same-yardstick cycle-domain precision.
-  if (ocxo1_floorline_science.valid) {
-    welford_update(welford_ocxo1,
-                   ocxo1_floorline_science.fast_residual_ns_exact);
-  }
-  if (ocxo2_floorline_science.valid) {
-    welford_update(welford_ocxo2,
-                   ocxo2_floorline_science.fast_residual_ns_exact);
-  }
-
-  // PPS witness statistics are owned by the witness/PPS_PHASE path.
-  // Beta publishes the accumulator but does not update it here.
-
-  const bool ocxo1_total_slope_valid =
-      pps_residuals.ocxo1_valid && ocxo1_floorline_science.total_valid;
-  const bool ocxo2_total_slope_valid =
-      pps_residuals.ocxo2_valid && ocxo2_floorline_science.total_valid;
-  const double ocxo1_total_tau = ocxo1_floorline_science.total_valid
-      ? ocxo1_floorline_science.total_tau
-      : 1.0;
-  const double ocxo2_total_tau = ocxo2_floorline_science.total_valid
-      ? ocxo2_floorline_science.total_tau
-      : 1.0;
-
-  // SERVOS live command handoff.  Apply here so this same campaign row's
-  // servo_input.selected_source and subsequent ocxo_calibration_servo() agree.
+  // SERVOS live command handoff is control-plane state, so it still commits on
+  // a rejected science row.  Scientific inputs, statistics, and DAC motion do not.
   clocks_commit_pending_servo_mode_change();
 
-  servo_input_diag_update(g_servo_input_ocxo1,
-                          pps_residuals.ocxo1_valid,
-                          pps_residuals.gnss_interval_ns,
-                          pps_residuals.ocxo1_interval_ns,
-                          pps_residuals.ocxo1_fast_residual_ns,
-                          ocxo1_floorline_science.fast_residual_ns_exact,
-                          welford_ocxo1,
-                          ocxo1_total_slope_valid,
-                          ocxo1_total_tau);
-  servo_input_diag_update(g_servo_input_ocxo2,
-                          pps_residuals.ocxo2_valid,
-                          pps_residuals.gnss_interval_ns,
-                          pps_residuals.ocxo2_interval_ns,
-                          pps_residuals.ocxo2_fast_residual_ns,
-                          ocxo2_floorline_science.fast_residual_ns_exact,
-                          welford_ocxo2,
-                          ocxo2_total_slope_valid,
-                          ocxo2_total_tau);
+  if (!candidate_science_reject) {
+    if (dwt_welford_recovery_quarantine) {
+      g_dwt_welford_recovery_quarantine_count++;
+      g_dwt_welford_recovery_quarantine_last_public_count = public_count;
+      g_dwt_welford_recovery_quarantine_last_cycles =
+          (uint32_t)g_dwt_cycles_between_pps_vclock;
+    } else {
+      const double cycles = (double)g_dwt_cycles_between_pps_vclock;
+      const double expected = (double)DWT_EXPECTED_PER_PPS;
+      const double dwt_ppb_sample = (cycles - expected) / expected * 1e9;
+      welford_update(welford_dwt, dwt_ppb_sample);
+    }
 
-  timebase_build_stage(TIMEBASE_BUILD_STAGE_WELFORD);
+    // VCLOCK measurement Welford — bridge-interpolation self-test.
+    if (g_vclock_measurement.gnss_ns_between_edges != 0) {
+      welford_update(welford_vclock,
+                     (double)g_vclock_measurement.second_residual_ns);
+    }
 
-  // Servo runs AFTER Delta residual/Welford updates so it sees this
-  // second's canonical science residual sample.
-  ocxo_calibration_servo();
-  timebase_build_stage(TIMEBASE_BUILD_STAGE_SERVO);
+    (void)welfords_advance_non_ocxo_gap_before_row(public_count);
+    (void)welfords_advance_ocxo_gap_before_valid_row(
+        public_count,
+        ocxo1_floorline_science.valid,
+        ocxo2_floorline_science.valid);
 
-  // DAC Welfords — track servo effort (the TEMPEST signal).
-  welford_update(welford_ocxo1_dac, ocxo_dac_fractional_snapshot(ocxo1_dac));
-  welford_update(welford_ocxo2_dac, ocxo_dac_fractional_snapshot(ocxo2_dac));
+    if (ocxo1_floorline_science.valid) {
+      welford_update(welford_ocxo1,
+                     ocxo1_floorline_science.fast_residual_ns_exact);
+    }
+    if (ocxo2_floorline_science.valid) {
+      welford_update(welford_ocxo2,
+                     ocxo2_floorline_science.fast_residual_ns_exact);
+    }
+
+    const bool ocxo1_total_slope_valid =
+        pps_residuals.ocxo1_valid && ocxo1_floorline_science.total_valid;
+    const bool ocxo2_total_slope_valid =
+        pps_residuals.ocxo2_valid && ocxo2_floorline_science.total_valid;
+    const double ocxo1_total_tau = ocxo1_floorline_science.total_valid
+        ? ocxo1_floorline_science.total_tau
+        : 1.0;
+    const double ocxo2_total_tau = ocxo2_floorline_science.total_valid
+        ? ocxo2_floorline_science.total_tau
+        : 1.0;
+
+    servo_input_diag_update(g_servo_input_ocxo1,
+                            pps_residuals.ocxo1_valid,
+                            pps_residuals.gnss_interval_ns,
+                            pps_residuals.ocxo1_interval_ns,
+                            pps_residuals.ocxo1_fast_residual_ns,
+                            ocxo1_floorline_science.fast_residual_ns_exact,
+                            welford_ocxo1,
+                            ocxo1_total_slope_valid,
+                            ocxo1_total_tau);
+    servo_input_diag_update(g_servo_input_ocxo2,
+                            pps_residuals.ocxo2_valid,
+                            pps_residuals.gnss_interval_ns,
+                            pps_residuals.ocxo2_interval_ns,
+                            pps_residuals.ocxo2_fast_residual_ns,
+                            ocxo2_floorline_science.fast_residual_ns_exact,
+                            welford_ocxo2,
+                            ocxo2_total_slope_valid,
+                            ocxo2_total_tau);
+
+    timebase_build_stage(TIMEBASE_BUILD_STAGE_WELFORD);
+    ocxo_calibration_servo();
+    timebase_build_stage(TIMEBASE_BUILD_STAGE_SERVO);
+
+    welford_update(welford_ocxo1_dac,
+                   ocxo_dac_fractional_snapshot(ocxo1_dac));
+    welford_update(welford_ocxo2_dac,
+                   ocxo_dac_fractional_snapshot(ocxo2_dac));
+  } else {
+    servo_input_diag_reset(g_servo_input_ocxo1);
+    servo_input_diag_reset(g_servo_input_ocxo2);
+  }
   timebase_build_stage(TIMEBASE_BUILD_STAGE_DAC_WELFORD);
 
   publish_dac_tick("STARTED");
@@ -8979,6 +9134,24 @@ void clocks_beta_pps(void) {
     p.add("campaign", campaign_name);
     p.add("campaign_state", clocks_campaign_state_name(campaign_state));
     p.add("campaign_seconds", campaign_seconds);
+    p.add("candidate_disposition_schema",
+          "TIMEBASE_CANDIDATE_DISPOSITION_V1");
+    p.add("candidate_disposition",
+          candidate_science_reject ? "SCIENCE_REJECT" : "ACCEPT");
+    p.add("candidate_use",
+          candidate_science_reject ? "DO_NOT_USE" : "CANONICAL_CANDIDATE");
+    p.add("candidate_reason_code",
+          (uint32_t)candidate_reject.reason);
+    p.add("candidate_reason",
+          clocks_science_reject_reason_name(candidate_reject.reason));
+    p.add("candidate_source",
+          clocks_science_reject_source_name(candidate_reject.source));
+    p.add("candidate_lane", candidate_reject.lane);
+    p.add("candidate_detail0", candidate_reject.detail0);
+    p.add("candidate_detail1", candidate_reject.detail1);
+    p.add("candidate_detail2", candidate_reject.detail2);
+    p.add("candidate_detail3", candidate_reject.detail3);
+    p.add("candidate_reject_mask", ocxo_science_invalid_mask);
     p.add("timeline_valid", recover_timeline_ready);
     p.add("ocxo_clockface_valid", recover_clockface_ready);
     p.add("ocxo_science_valid", recover_science_ready);
@@ -11688,6 +11861,23 @@ static FLASHMEM Payload cmd_report_timebase_publish(const Payload&) {
   p.add("build_complete_count", g_timebase_build_complete_count);
   p.add("publish_attempt_count", g_timebase_publish_attempt_count);
   p.add("publish_return_count", g_timebase_publish_return_count);
+  p.add("candidate_accept_count", g_timebase_accept_candidate_count);
+  p.add("candidate_science_reject_count",
+        g_timebase_science_reject_candidate_count);
+  p.add("science_reject_raise_count",
+        (uint32_t)g_science_reject_raise_count);
+  p.add("science_reject_coalesced_count",
+        (uint32_t)g_science_reject_coalesced_count);
+  p.add("science_reject_consumed_count", g_science_reject_consumed_count);
+  p.add("science_reject_last_public_count",
+        g_science_reject_last_public_count);
+  p.add("science_reject_last_source",
+        clocks_science_reject_source_name(g_science_reject_last.source));
+  p.add("science_reject_last_reason_code",
+        (uint32_t)g_science_reject_last.reason);
+  p.add("science_reject_last_reason",
+        clocks_science_reject_reason_name(g_science_reject_last.reason));
+  p.add("science_reject_last_lane", g_science_reject_last.lane);
   p.add("forensics_embed_attempt_count",
         g_timebase_forensics_publish_attempt_count);
   p.add("forensics_embed_return_count",

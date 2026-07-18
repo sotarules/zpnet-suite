@@ -9,6 +9,16 @@
 //   says.  This prevents diffusion of authority and gives every downstream
 //   consumer a single well-defined source of truth.
 //
+// Candidate disposition:
+//
+//   After public PPS1, every survivable campaign second is still published.
+//   ACCEPT candidates may advance Welford/servo state and may become durable
+//   TIMEBASE rows.  SCIENCE_REJECT candidates testify to the same campaign
+//   identity but are explicitly DO_NOT_USE: Beta leaves campaign execution
+//   alive, protects statistical/servo state, and the Pi logs rather than
+//   publishes or persists them.  WATCHDOG_ANOMALY remains the continuity
+//   surrender path when an honest candidate cannot be authored.
+//
 // Epoch authority:
 //
 //   PPS is a witness and selector. process_interrupt observes the physical
