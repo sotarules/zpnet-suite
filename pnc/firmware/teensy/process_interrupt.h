@@ -101,6 +101,13 @@ static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_REASON_STARTUP_RELAXED_DIAGN
 static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_REASON_SIDE_RAIL_DIAGNOSTIC = 21U;
 static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_REASON_UNKNOWN = 22U;
 
+// FloorLine vertical-anchor policy IDs carried in regression diagnostics.
+// SINGLE_MIN identifies the retired ShakeOut1 behavior; MEDIAN8 is the robust
+// estimator that anchors to the median of the eight lowest pre-shift fit errors.
+static constexpr uint32_t INTERRUPT_FLOORLINE_ANCHOR_POLICY_UNKNOWN = 0U;
+static constexpr uint32_t INTERRUPT_FLOORLINE_ANCHOR_POLICY_SINGLE_MIN = 1U;
+static constexpr uint32_t INTERRUPT_FLOORLINE_ANCHOR_POLICY_MEDIAN8 = 2U;
+
 static inline uint32_t interrupt_dwt_publication_reason_id_from_verdict_mask(
     uint32_t verdict_mask) {
   if (verdict_mask == INTERRUPT_DWT_PUBLICATION_VERDICT_OK) {
@@ -348,6 +355,17 @@ struct interrupt_capture_diag_t {
   uint32_t regression_fit_error_gt_plus4_count = 0;
   uint32_t regression_fit_error_lt_minus4_count = 0;
   uint32_t regression_fit_error_abs_gt4_count = 0;
+
+  // Compact FloorLine anchor transcript.  Q16 fields let TIMEBASE/raw_floorline
+  // distinguish an isolated single minimum from the selected robust lower
+  // population without restoring the crash-prone rich per-row payload.
+  uint32_t regression_anchor_policy_id =
+      INTERRUPT_FLOORLINE_ANCHOR_POLICY_UNKNOWN;
+  uint32_t regression_anchor_population_count = 0;
+  int32_t  regression_anchor_single_min_q16_cycles = 0;
+  int32_t  regression_anchor_second_q16_cycles = 0;
+  int32_t  regression_anchor_selected_q16_cycles = 0;
+  int32_t  regression_anchor_selected_minus_single_min_q16_cycles = 0;
 
   uint32_t anchor_sequence_used = 0;
   uint32_t anchor_age_slots = 0;

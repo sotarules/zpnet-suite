@@ -1916,6 +1916,13 @@ struct alpha_lane_forensics_store_t {
   uint32_t regression_fit_error_gt_plus4_count = 0;
   uint32_t regression_fit_error_lt_minus4_count = 0;
   uint32_t regression_fit_error_abs_gt4_count = 0;
+  uint32_t regression_anchor_policy_id =
+      INTERRUPT_FLOORLINE_ANCHOR_POLICY_UNKNOWN;
+  uint32_t regression_anchor_population_count = 0;
+  int32_t  regression_anchor_single_min_q16_cycles = 0;
+  int32_t  regression_anchor_second_q16_cycles = 0;
+  int32_t  regression_anchor_selected_q16_cycles = 0;
+  int32_t  regression_anchor_selected_minus_single_min_q16_cycles = 0;
 };
 
 static alpha_lane_forensics_store_t g_vclock_forensics DMAMEM = {};
@@ -5990,6 +5997,13 @@ static void alpha_forensics_reset_store(alpha_lane_forensics_store_t& s) {
   s.regression_fit_error_gt_plus4_count = 0;
   s.regression_fit_error_lt_minus4_count = 0;
   s.regression_fit_error_abs_gt4_count = 0;
+  s.regression_anchor_policy_id =
+      INTERRUPT_FLOORLINE_ANCHOR_POLICY_UNKNOWN;
+  s.regression_anchor_population_count = 0;
+  s.regression_anchor_single_min_q16_cycles = 0;
+  s.regression_anchor_second_q16_cycles = 0;
+  s.regression_anchor_selected_q16_cycles = 0;
+  s.regression_anchor_selected_minus_single_min_q16_cycles = 0;
 
   clocks_alpha_dmb();
   s.seq++;
@@ -6321,6 +6335,17 @@ static void alpha_forensics_publish(time_clock_id_t clock_id,
         diag->regression_fit_error_lt_minus4_count;
     s->regression_fit_error_abs_gt4_count =
         diag->regression_fit_error_abs_gt4_count;
+    s->regression_anchor_policy_id = diag->regression_anchor_policy_id;
+    s->regression_anchor_population_count =
+        diag->regression_anchor_population_count;
+    s->regression_anchor_single_min_q16_cycles =
+        diag->regression_anchor_single_min_q16_cycles;
+    s->regression_anchor_second_q16_cycles =
+        diag->regression_anchor_second_q16_cycles;
+    s->regression_anchor_selected_q16_cycles =
+        diag->regression_anchor_selected_q16_cycles;
+    s->regression_anchor_selected_minus_single_min_q16_cycles =
+        diag->regression_anchor_selected_minus_single_min_q16_cycles;
   } else {
     s->dwt_synthetic = false;
     s->dwt_repair_candidate = false;
@@ -6483,6 +6508,13 @@ static void alpha_forensics_publish(time_clock_id_t clock_id,
     s->regression_fit_error_gt_plus4_count = 0;
     s->regression_fit_error_lt_minus4_count = 0;
     s->regression_fit_error_abs_gt4_count = 0;
+    s->regression_anchor_policy_id =
+        INTERRUPT_FLOORLINE_ANCHOR_POLICY_UNKNOWN;
+    s->regression_anchor_population_count = 0;
+    s->regression_anchor_single_min_q16_cycles = 0;
+    s->regression_anchor_second_q16_cycles = 0;
+    s->regression_anchor_selected_q16_cycles = 0;
+    s->regression_anchor_selected_minus_single_min_q16_cycles = 0;
   }
 
   clocks_alpha_dmb();
@@ -6755,6 +6787,17 @@ bool clocks_alpha_lane_forensics(time_clock_id_t clock,
         s->regression_fit_error_lt_minus4_count;
     out->regression_fit_error_abs_gt4_count =
         s->regression_fit_error_abs_gt4_count;
+    out->regression_anchor_policy_id = s->regression_anchor_policy_id;
+    out->regression_anchor_population_count =
+        s->regression_anchor_population_count;
+    out->regression_anchor_single_min_q16_cycles =
+        s->regression_anchor_single_min_q16_cycles;
+    out->regression_anchor_second_q16_cycles =
+        s->regression_anchor_second_q16_cycles;
+    out->regression_anchor_selected_q16_cycles =
+        s->regression_anchor_selected_q16_cycles;
+    out->regression_anchor_selected_minus_single_min_q16_cycles =
+        s->regression_anchor_selected_minus_single_min_q16_cycles;
 
     clocks_alpha_dmb();
     const uint32_t seq2 = s->seq;

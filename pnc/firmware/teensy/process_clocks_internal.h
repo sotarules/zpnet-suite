@@ -955,6 +955,14 @@ struct clocks_alpha_lane_forensics_t {
   uint32_t regression_fit_error_gt_plus4_count;
   uint32_t regression_fit_error_lt_minus4_count;
   uint32_t regression_fit_error_abs_gt4_count;
+
+  // Compact robust-anchor transcript copied from process_interrupt.
+  uint32_t regression_anchor_policy_id;
+  uint32_t regression_anchor_population_count;
+  int32_t  regression_anchor_single_min_q16_cycles;
+  int32_t  regression_anchor_second_q16_cycles;
+  int32_t  regression_anchor_selected_q16_cycles;
+  int32_t  regression_anchor_selected_minus_single_min_q16_cycles;
 };
 
 bool clocks_alpha_lane_forensics(time_clock_id_t clock,

@@ -9424,8 +9424,9 @@ void clocks_beta_pps(void) {
         // No authority is changed here.  This is a compact telemetry tap only.
         g_timebase_forensics_micro_raw_count++;
         f.add("micro_raw_cycles", true);
-        f.add("micro_schema", "MICRO_RAW_CYCLES_V2_LEAN");
-        f.add("micro_profile", "DWT_ENDPOINTS_ONLY");
+        f.add("micro_schema", "MICRO_RAW_CYCLES_V3_LEAN");
+        f.add("micro_profile", "DWT_ENDPOINTS_FLOORLINE_ANCHOR");
+        f.add("fl_anchor_schema", "FLOORLINE_ANCHOR_V1");
         if (TIMEBASE_FORENSICS_MICRO_COURT_FIELDS_ENABLED) {
           f.add("court_schema", "DWT_PUBLICATION_COURT_V1");
         }
@@ -9470,6 +9471,12 @@ void clocks_beta_pps(void) {
         f.add("v_used", v_pub_dwt);
         f.add("v_fl_cyc", v_fl_cyc);
         f.add("v_fl_err", v_fl ? vclock_forensics.regression_inferred_minus_observed_cycles : 0);
+        f.add("v_fl_ap", v_fl ? vclock_forensics.regression_anchor_policy_id : 0U);
+        f.add("v_fl_an", v_fl ? vclock_forensics.regression_anchor_population_count : 0U);
+        f.add("v_fl_e0q", v_fl ? vclock_forensics.regression_anchor_single_min_q16_cycles : 0);
+        f.add("v_fl_e1q", v_fl ? vclock_forensics.regression_anchor_second_q16_cycles : 0);
+        f.add("v_fl_selq", v_fl ? vclock_forensics.regression_anchor_selected_q16_cycles : 0);
+        f.add("v_fl_liftq", v_fl ? vclock_forensics.regression_anchor_selected_minus_single_min_q16_cycles : 0);
         if (TIMEBASE_FORENSICS_MICRO_AUX_FLOORLINE_FIELDS_ENABLED) {
           f.add("v_fl_src", v_ok && vclock_forensics.dwt_interval_sample_accepted ? 1U : 0U);
           f.add("v_fl_reason", v_ok ? vclock_forensics.dwt_interval_reject_streak : 0U);
@@ -9504,6 +9511,12 @@ void clocks_beta_pps(void) {
         f.add("o1_used", o1_pub_dwt);
         f.add("o1_fl_cyc", o1_fl_cyc);
         f.add("o1_fl_err", o1_fl ? ocxo1_forensics.regression_inferred_minus_observed_cycles : 0);
+        f.add("o1_fl_ap", o1_fl ? ocxo1_forensics.regression_anchor_policy_id : 0U);
+        f.add("o1_fl_an", o1_fl ? ocxo1_forensics.regression_anchor_population_count : 0U);
+        f.add("o1_fl_e0q", o1_fl ? ocxo1_forensics.regression_anchor_single_min_q16_cycles : 0);
+        f.add("o1_fl_e1q", o1_fl ? ocxo1_forensics.regression_anchor_second_q16_cycles : 0);
+        f.add("o1_fl_selq", o1_fl ? ocxo1_forensics.regression_anchor_selected_q16_cycles : 0);
+        f.add("o1_fl_liftq", o1_fl ? ocxo1_forensics.regression_anchor_selected_minus_single_min_q16_cycles : 0);
         if (TIMEBASE_FORENSICS_MICRO_AUX_FLOORLINE_FIELDS_ENABLED) {
           f.add("o1_fl_src", o1_ok && ocxo1_forensics.dwt_interval_sample_accepted ? 1U : 0U);
           f.add("o1_fl_reason", o1_ok ? ocxo1_forensics.dwt_interval_reject_streak : 0U);
@@ -9544,6 +9557,12 @@ void clocks_beta_pps(void) {
         f.add("o2_used", o2_pub_dwt);
         f.add("o2_fl_cyc", o2_fl_cyc);
         f.add("o2_fl_err", o2_fl ? ocxo2_forensics.regression_inferred_minus_observed_cycles : 0);
+        f.add("o2_fl_ap", o2_fl ? ocxo2_forensics.regression_anchor_policy_id : 0U);
+        f.add("o2_fl_an", o2_fl ? ocxo2_forensics.regression_anchor_population_count : 0U);
+        f.add("o2_fl_e0q", o2_fl ? ocxo2_forensics.regression_anchor_single_min_q16_cycles : 0);
+        f.add("o2_fl_e1q", o2_fl ? ocxo2_forensics.regression_anchor_second_q16_cycles : 0);
+        f.add("o2_fl_selq", o2_fl ? ocxo2_forensics.regression_anchor_selected_q16_cycles : 0);
+        f.add("o2_fl_liftq", o2_fl ? ocxo2_forensics.regression_anchor_selected_minus_single_min_q16_cycles : 0);
         if (TIMEBASE_FORENSICS_MICRO_AUX_FLOORLINE_FIELDS_ENABLED) {
           f.add("o2_fl_src", o2_ok && ocxo2_forensics.dwt_interval_sample_accepted ? 1U : 0U);
           f.add("o2_fl_reason", o2_ok ? ocxo2_forensics.dwt_interval_reject_streak : 0U);

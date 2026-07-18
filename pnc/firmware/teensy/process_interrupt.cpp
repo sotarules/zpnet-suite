@@ -5184,7 +5184,9 @@ static const char* dispatch_timer_name(interrupt_subscriber_kind_t kind) {
 // window for each 1 kHz lane.  Each second is divided into fixed buckets; each
 // bucket retains only the sample with the lowest residual against the prior
 // window's predicted line.  At the one-second edge, a line is fit through those
-// bucket winners and shifted to touch the lower selected point.
+// bucket winners and anchored to the median of the eight lowest pre-shift fit
+// errors.  This preserves a lower-envelope estimate without allowing one
+// isolated minimum to drag the entire line tens of cycles early.
 //
 // VCLOCK and OCXO subscriber edges remain observation-derived: FloorLine does
 // not replace those measured QTimer coordinates. The one exception is the
@@ -5198,6 +5200,8 @@ static const char* dispatch_timer_name(interrupt_subscriber_kind_t kind) {
 static constexpr uint32_t LOWER_ENV_SAMPLE_RATE_HZ = 1000U;
 static constexpr uint32_t LOWER_ENV_BUCKET_COUNT = 64U;
 static constexpr uint32_t LOWER_ENV_FIT_MIN_BUCKETS = 8U;
+static constexpr uint32_t LOWER_ENV_ANCHOR_POPULATION_COUNT = 8U;
+static constexpr uint32_t FLOORLINE_ANCHOR_POLICY_MEDIAN8 = 2U;
 
 // FloorLine V2 doctrine:
 //   * the 4-cycle gate is a quality/forensics threshold, not a sample veto;
@@ -5327,8 +5331,8 @@ static int32_t pps_floorline_i32_from_i64(int64_t value) {
 
 // Integer-only Q16 statistics for FloorLine.
 //
-// FloorLine sealing runs from both priority-0 capture and priority-16 handoff
-// paths.  Do not let diagnostic mean/stddev calculation execute a VFP
+// FloorLine sealing runs from the single priority-16 handoff writer.  Do not
+// let diagnostic mean/stddev calculation execute a VFP
 // instruction and thereby consume lazy foreground FP state.  These helpers
 // preserve the existing population-statistics/Q16 report contract using only
 // integer arithmetic.
@@ -5408,6 +5412,16 @@ struct cadence_regression_result_t {
   uint32_t fit_error_lt_minus4_count = 0;
   uint32_t fit_error_abs_gt4_count = 0;
 
+  // Robust lower-envelope anchor transcript.  The estimator chooses the
+  // median of the eight lowest pre-shift fit errors; e0/e1 and lift preserve
+  // enough evidence for compact TIMEBASE/raw_floorline diagnosis.
+  uint32_t anchor_policy_id = FLOORLINE_ANCHOR_POLICY_MEDIAN8;
+  uint32_t anchor_population_count = 0;
+  int32_t  anchor_single_min_q16_cycles = 0;
+  int32_t  anchor_second_q16_cycles = 0;
+  int32_t  anchor_selected_q16_cycles = 0;
+  int32_t  anchor_selected_minus_single_min_q16_cycles = 0;
+
   bool     observed_interval_valid = false;
   bool     inferred_interval_valid = false;
   uint32_t observed_interval_cycles = 0;
@@ -5441,6 +5455,50 @@ struct cadence_regression_result_t {
   uint32_t residual_abs_gt64_count = 0;
   uint32_t residual_abs_gt128_count = 0;
 };
+
+// lower_env_seal() has one priority-16 writer.  Keep the eight-value order
+// statistic out of its automatic stack frame: the earlier rich-instrumentation
+// build made this function large enough to become a crash exposure point.
+static int64_t g_lower_env_anchor_scratch_q16[
+    LOWER_ENV_ANCHOR_POPULATION_COUNT] = {};
+
+static void lower_env_anchor_scratch_reset(void) {
+  for (uint32_t i = 0; i < LOWER_ENV_ANCHOR_POPULATION_COUNT; i++) {
+    g_lower_env_anchor_scratch_q16[i] = INT64_MAX;
+  }
+}
+
+static void lower_env_anchor_scratch_consider(int64_t value_q16) {
+  for (uint32_t i = 0; i < LOWER_ENV_ANCHOR_POPULATION_COUNT; i++) {
+    if (value_q16 >= g_lower_env_anchor_scratch_q16[i]) continue;
+    for (uint32_t j = LOWER_ENV_ANCHOR_POPULATION_COUNT - 1U; j > i; j--) {
+      g_lower_env_anchor_scratch_q16[j] =
+          g_lower_env_anchor_scratch_q16[j - 1U];
+    }
+    g_lower_env_anchor_scratch_q16[i] = value_q16;
+    return;
+  }
+}
+
+static int64_t lower_env_average_i64_nearest(int64_t a, int64_t b) {
+  // Fit errors are bounded by the FloorLine sample and slope courts, so a+b
+  // cannot approach int64 range.  Round an exact half away from zero.
+  const int64_t sum = a + b;
+  if (sum >= 0LL) return (sum + 1LL) / 2LL;
+  return -(((-sum) + 1LL) / 2LL);
+}
+
+static int32_t lower_env_i32_from_i64(int64_t value) {
+  if (value > INT32_MAX) return INT32_MAX;
+  if (value < INT32_MIN) return INT32_MIN;
+  return (int32_t)value;
+}
+
+static const char* lower_env_anchor_policy_name(uint32_t policy_id) {
+  return policy_id == FLOORLINE_ANCHOR_POLICY_MEDIAN8
+      ? "median8_lowest_fit_errors"
+      : "unknown";
+}
 
 struct lower_env_lane_t {
   interrupt_subscriber_kind_t kind = interrupt_subscriber_kind_t::NONE;
@@ -6302,7 +6360,6 @@ static __attribute__((noinline)) void lower_env_seal(
     return;
   }
 
-  int64_t min_residual_q16 = INT64_MAX;
   int64_t residual_sum_q16 = 0;
   uint64_t residual_sq_sum_q16 = 0;
   int32_t min_residual_cycles = INT32_MAX;
@@ -6310,14 +6367,18 @@ static __attribute__((noinline)) void lower_env_seal(
   uint32_t gt_plus4 = 0;
   uint32_t lt_minus4 = 0;
   uint32_t abs_gt4 = 0;
+  int64_t anchor_single_min_q16 = 0;
+  int64_t anchor_second_q16 = 0;
+  int64_t anchor_selected_q16 = 0;
+  uint32_t anchor_population_count = 0;
 
   for (uint32_t pass = 0; pass < 2; pass++) {
-    min_residual_q16 = INT64_MAX;
     residual_sum_q16 = 0;
     residual_sq_sum_q16 = 0;
     min_residual_cycles = INT32_MAX;
     max_residual_cycles = INT32_MIN;
     gt_plus4 = lt_minus4 = abs_gt4 = 0;
+    if (pass == 0) lower_env_anchor_scratch_reset();
 
     for (uint32_t i = 0; i < LOWER_ENV_BUCKET_COUNT; i++) {
       const lower_env_bucket_t& b = lane.buckets[i];
@@ -6327,8 +6388,9 @@ static __attribute__((noinline)) void lower_env_seal(
       const int64_t fit_residual_q16 =
           residual_intercept_q16 + slope_delta_q16 * (int64_t)b.x;
       const int64_t fit_error_q16 = observed_residual_q16 - fit_residual_q16;
-      if (fit_error_q16 < min_residual_q16) min_residual_q16 = fit_error_q16;
-      if (pass == 1) {
+      if (pass == 0) {
+        lower_env_anchor_scratch_consider(fit_error_q16);
+      } else {
         residual_sum_q16 += fit_error_q16;
         const int64_t abs_q16 = fit_error_q16 >= 0 ? fit_error_q16 : -fit_error_q16;
         residual_sq_sum_q16 += (uint64_t)((abs_q16 * abs_q16) >> 16);
@@ -6344,10 +6406,28 @@ static __attribute__((noinline)) void lower_env_seal(
       }
     }
 
-    if (pass == 0 && min_residual_q16 != INT64_MAX) {
-      // Shift the residual line onto the lower envelope.  After this shift the
-      // lowest selected residual is exactly zero in Q16.
-      residual_intercept_q16 += min_residual_q16;
+    if (pass == 0) {
+      while (anchor_population_count < LOWER_ENV_ANCHOR_POPULATION_COUNT &&
+             g_lower_env_anchor_scratch_q16[anchor_population_count] !=
+                 INT64_MAX) {
+        anchor_population_count++;
+      }
+      if (anchor_population_count < LOWER_ENV_ANCHOR_POPULATION_COUNT) {
+        lower_env_publish_invalid_window(lane, observed_dwt, target_counter32,
+                                         target_hw16, observed_hw16);
+        return;
+      }
+
+      anchor_single_min_q16 = g_lower_env_anchor_scratch_q16[0];
+      anchor_second_q16 = g_lower_env_anchor_scratch_q16[1];
+      anchor_selected_q16 = lower_env_average_i64_nearest(
+          g_lower_env_anchor_scratch_q16[3],
+          g_lower_env_anchor_scratch_q16[4]);
+
+      // Robust lower-envelope anchor: the bucket minima already select the low
+      // population.  Anchor the regression to the center of its lowest eight
+      // members rather than allowing one isolated e0 to move the whole line.
+      residual_intercept_q16 += anchor_selected_q16;
     }
   }
 
@@ -6393,6 +6473,15 @@ static __attribute__((noinline)) void lower_env_seal(
   r.fit_error_gt_plus4_count = gt_plus4;
   r.fit_error_lt_minus4_count = lt_minus4;
   r.fit_error_abs_gt4_count = abs_gt4;
+  r.anchor_policy_id = FLOORLINE_ANCHOR_POLICY_MEDIAN8;
+  r.anchor_population_count = anchor_population_count;
+  r.anchor_single_min_q16_cycles =
+      lower_env_i32_from_i64(anchor_single_min_q16);
+  r.anchor_second_q16_cycles = lower_env_i32_from_i64(anchor_second_q16);
+  r.anchor_selected_q16_cycles =
+      lower_env_i32_from_i64(anchor_selected_q16);
+  r.anchor_selected_minus_single_min_q16_cycles = lower_env_i32_from_i64(
+      anchor_selected_q16 - anchor_single_min_q16);
 
   r.observed_interval_valid = lane.previous_observed_edge_valid;
   r.observed_interval_cycles = r.observed_interval_valid
@@ -6747,6 +6836,15 @@ static inline void copy_regression_diag(interrupt_capture_diag_t& diag,
   diag.regression_fit_error_gt_plus4_count = r->fit_error_gt_plus4_count;
   diag.regression_fit_error_lt_minus4_count = r->fit_error_lt_minus4_count;
   diag.regression_fit_error_abs_gt4_count = r->fit_error_abs_gt4_count;
+  diag.regression_anchor_policy_id = r->anchor_policy_id;
+  diag.regression_anchor_population_count = r->anchor_population_count;
+  diag.regression_anchor_single_min_q16_cycles =
+      r->anchor_single_min_q16_cycles;
+  diag.regression_anchor_second_q16_cycles = r->anchor_second_q16_cycles;
+  diag.regression_anchor_selected_q16_cycles =
+      r->anchor_selected_q16_cycles;
+  diag.regression_anchor_selected_minus_single_min_q16_cycles =
+      r->anchor_selected_minus_single_min_q16_cycles;
 }
 
 
@@ -15372,6 +15470,15 @@ static FLASHMEM void add_lower_env_lane_payload(Payload& parent,
   obj.add("fit_error_min_cycles", r.fit_error_min_cycles);
   obj.add("fit_error_max_cycles", r.fit_error_max_cycles);
   obj.add("fit_error_abs_gt4_count", r.fit_error_abs_gt4_count);
+  obj.add("anchor_policy_id", r.anchor_policy_id);
+  obj.add("anchor_policy", lower_env_anchor_policy_name(r.anchor_policy_id));
+  obj.add("anchor_population_count", r.anchor_population_count);
+  obj.add("anchor_single_min_q16_cycles",
+          r.anchor_single_min_q16_cycles);
+  obj.add("anchor_second_q16_cycles", r.anchor_second_q16_cycles);
+  obj.add("anchor_selected_q16_cycles", r.anchor_selected_q16_cycles);
+  obj.add("anchor_selected_minus_single_min_q16_cycles",
+          r.anchor_selected_minus_single_min_q16_cycles);
   obj.add("residual_sample_count", r.residual_sample_count);
   obj.add("residual_min_cycles", r.residual_min_cycles);
   obj.add("residual_max_cycles", r.residual_max_cycles);
@@ -15419,7 +15526,7 @@ static FLASHMEM void add_floorline_flat(Payload& p,
     p.add(key, value ? value : "");
   };
 
-  add_str("version", "v2");
+  add_str("version", "v3_median8_anchor");
   add_bool("valid", r.valid);
   add_bool("published", r.publish_floorline);
   add_bool("fallback_used", r.fallback_used);
@@ -15456,6 +15563,14 @@ static FLASHMEM void add_floorline_flat(Payload& p,
   add_i32("fit_error_min", r.fit_error_min_cycles);
   add_i32("fit_error_max", r.fit_error_max_cycles);
   add_u32("fit_error_abs_gt4", r.fit_error_abs_gt4_count);
+  add_u32("anchor_policy_id", r.anchor_policy_id);
+  add_str("anchor_policy", lower_env_anchor_policy_name(r.anchor_policy_id));
+  add_u32("anchor_population_count", r.anchor_population_count);
+  add_i32("anchor_single_min_q16", r.anchor_single_min_q16_cycles);
+  add_i32("anchor_second_q16", r.anchor_second_q16_cycles);
+  add_i32("anchor_selected_q16", r.anchor_selected_q16_cycles);
+  add_i32("anchor_lift_q16",
+          r.anchor_selected_minus_single_min_q16_cycles);
   add_u32("residual_count", r.residual_sample_count);
   add_i32("residual_min", r.residual_min_cycles);
   add_i32("residual_max", r.residual_max_cycles);
@@ -15472,7 +15587,7 @@ static FLASHMEM Payload cmd_report_lower_envelope(const Payload&) {
   Payload p;
   p.add("report", "INTERRUPT_LOWER_ENVELOPE");
   p.add("description",
-        "1 kHz FloorLine V2 robust lower-envelope edge estimator");
+        "1 kHz FloorLine V3 median-eight lower-envelope edge estimator");
   p.add("sample_rate_hz", LOWER_ENV_SAMPLE_RATE_HZ);
   p.add("bucket_count", LOWER_ENV_BUCKET_COUNT);
   p.add("error_gate_cycles", LOWER_ENV_ERROR_GATE_CYCLES);
@@ -15482,7 +15597,11 @@ static FLASHMEM Payload cmd_report_lower_envelope(const Payload&) {
   p.add("publish_min_samples", LOWER_ENV_PUBLISH_MIN_SAMPLES);
   p.add("publish_min_buckets", LOWER_ENV_PUBLISH_MIN_BUCKETS);
   p.add("snapshot_count", ++g_lower_env_snapshot_count);
-  p.add("policy", "floorline_v2_continuous_best_estimate_latched_feature");
+  p.add("policy", "floorline_v3_median8_lower_envelope_anchor");
+  p.add("anchor_policy_id", FLOORLINE_ANCHOR_POLICY_MEDIAN8);
+  p.add("anchor_policy",
+        lower_env_anchor_policy_name(FLOORLINE_ANCHOR_POLICY_MEDIAN8));
+  p.add("anchor_population_count", LOWER_ENV_ANCHOR_POPULATION_COUNT);
   p.add("writer_context", INTERRUPT_FLOORLINE_WRITER_CONTEXT);
   p.add("snapshot_transport", "SEQLOCK_WHOLE_LANE_SNAPSHOT");
   p.add("subscriber_dispatch_context", INTERRUPT_SUBSCRIBER_DISPATCH_CONTEXT);

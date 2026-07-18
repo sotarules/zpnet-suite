@@ -1,13 +1,15 @@
 """
 ZPNet Raw FloorLine — per-row FloorLine estimator autopsy and anchor simulation.
 
-Reads the rich ``forensics.floorline`` snapshots captured by the temporary
-FloorLine instrumentation build.  The report is deliberately historical and
-read-only: it does not modify TIMEBASE or recompute authoritative clock science.
+Reads both the rich ``forensics.floorline`` snapshots captured by the temporary
+ShakeOut1 instrumentation build and the compact ``MICRO_RAW_CYCLES_V3_LEAN``
+anchor transcript emitted by the repaired estimator.  The report is read-only:
+it does not modify TIMEBASE or recompute authoritative clock science.
 
 The main table emits one line per TIMEBASE row per selected clock.  It shows the
-single-minimum anchor used by firmware, the shape of the lowest-error cluster,
-the resulting endpoint/interval errors, and a simulated alternative anchor.
+firmware-selected anchor, the shape of the lowest-error cluster, endpoint and
+interval errors, and—on rich historical rows—a simulated alternative anchor.
+VCLOCK rows also show the FloorLine-projected physical PPS error.
 
 Typical ZPNet usage:
 
@@ -73,6 +75,15 @@ LANE_KEYS: Dict[str, str] = {
     "VCLOCK": "vclock",
     "OCXO1": "ocxo1",
     "OCXO2": "ocxo2",
+}
+MICRO_PREFIXES: Dict[str, str] = {
+    "VCLOCK": "v",
+    "OCXO1": "o1",
+    "OCXO2": "o2",
+}
+ANCHOR_POLICY_NAMES: Dict[int, str] = {
+    1: "single_min",
+    2: "median8",
 }
 ANCHOR_CHOICES: Tuple[str, ...] = (
     "second",
@@ -319,6 +330,44 @@ def pps_count_from_schema(rec: Dict[str, Any]) -> Optional[int]:
     )
 
 
+def physical_pps_dwt_from_schema(rec: Dict[str, Any]) -> Optional[int]:
+    root = _root(rec)
+    frag = _frag(rec)
+    forensic = _forensics(rec)
+    return _first_int(
+        frag.get("pps_dwt_at_edge"),
+        forensic.get("pps_dwt_at_edge"),
+        root.get("pps_dwt_at_edge"),
+        _nested_get(frag, "pps", "dwt_at_edge"),
+    )
+
+
+def pps_vclock_phase_from_schema(rec: Dict[str, Any]) -> Optional[int]:
+    root = _root(rec)
+    frag = _frag(rec)
+    forensic = _forensics(rec)
+    pps_dwt = physical_pps_dwt_from_schema(rec)
+    pvc_dwt = _first_int(
+        frag.get("dwt_at_pps_vclock"),
+        forensic.get("dwt_at_pps_vclock"),
+        root.get("dwt_at_pps_vclock"),
+        forensic.get("v_pub"),
+    )
+    endpoint_phase = (
+        signed_delta_u32(pps_dwt, pvc_dwt)
+        if pps_dwt is not None and pvc_dwt is not None
+        else None
+    )
+    if endpoint_phase is not None and 0 <= endpoint_phase <= 512:
+        return endpoint_phase
+    return _first_int(
+        frag.get("pps_vclock_phase_cycles"),
+        forensic.get("pps_vclock_phase_cycles"),
+        root.get("pps_vclock_phase_cycles"),
+        _nested_get(frag, "pps", "vclock_phase_cycles"),
+    )
+
+
 # -----------------------------------------------------------------------------
 # Firmware-equivalent arithmetic and alternative anchors
 # -----------------------------------------------------------------------------
@@ -373,8 +422,12 @@ def anchor_q16(errors: Sequence[int], strategy: str) -> Optional[int]:
 
 
 def _average_int(a: int, b: int) -> int:
-    # Symmetric nearest-integer average.  Q16 values can be negative.
-    return int(round((a + b) / 2.0))
+    # Mirror firmware: fit errors are tightly bounded, so a+b is safe.
+    # Divide the signed sum with exact halves rounded away from zero.
+    total = a + b
+    if total >= 0:
+        return (total + 1) // 2
+    return -(((-total) + 1) // 2)
 
 
 def _median_q16(values: Sequence[int]) -> Optional[int]:
@@ -445,7 +498,7 @@ def lowest_errors_q16(lane_obj: Dict[str, Any]) -> List[int]:
     return result
 
 
-def extract_lane_snapshot(
+def _extract_rich_lane_snapshot(
     rec: Dict[str, Any],
     lane: str,
     alternative: str,
@@ -514,7 +567,10 @@ def extract_lane_snapshot(
     return {
         "pps_count": pps_count_from_schema(rec),
         "lane": lane,
+        "source_mode": "rich",
         "schema": _as_str(fl_root.get("schema")),
+        "anchor_policy_id": 1,
+        "anchor_policy": "single_min",
         "root_available": bool(fl_root),
         "available": _first_bool(lane_obj.get("available"), bool(lane_obj)),
         "aligned": _as_bool(lane_obj.get("consumer_sequence_aligned")),
@@ -571,6 +627,129 @@ def extract_lane_snapshot(
         ),
         "candidate_interval_error": _as_int(interval.get("candidate_interval_error_cycles")),
     }
+
+
+def _extract_compact_lane_snapshot(
+    rec: Dict[str, Any],
+    lane: str,
+) -> Dict[str, Any]:
+    forensic = _forensics(rec)
+    prefix = MICRO_PREFIXES[lane]
+    schema = _as_str(forensic.get("micro_schema"))
+    anchor_schema = _as_str(forensic.get("fl_anchor_schema"))
+    available = (
+        schema == "MICRO_RAW_CYCLES_V3_LEAN"
+        and anchor_schema == "FLOORLINE_ANCHOR_V1"
+    )
+    pps_count = pps_count_from_schema(rec)
+
+    observed_dwt = _first_int(
+        forensic.get(f"{prefix}_raw"),
+        forensic.get(f"{prefix}_orig"),
+    )
+    captured_endpoint = _as_int(forensic.get(f"{prefix}_fl"))
+    policy_id = _as_int(forensic.get(f"{prefix}_fl_ap"))
+    population_count = _as_int(forensic.get(f"{prefix}_fl_an"))
+    e0 = _as_int(forensic.get(f"{prefix}_fl_e0q"))
+    e1 = _as_int(forensic.get(f"{prefix}_fl_e1q"))
+    selected = _as_int(forensic.get(f"{prefix}_fl_selq"))
+    lift = _as_int(forensic.get(f"{prefix}_fl_liftq"))
+    candidate_present = bool(captured_endpoint)
+    valid = bool(available and candidate_present and policy_id and population_count)
+    captured_bias = _first_int(
+        forensic.get(f"{prefix}_fl_err"),
+        signed_delta_u32(observed_dwt, captured_endpoint)
+        if observed_dwt is not None and captured_endpoint is not None
+        else None,
+    )
+
+    return {
+        "pps_count": pps_count,
+        "lane": lane,
+        "source_mode": "compact",
+        "schema": schema,
+        "anchor_policy_id": policy_id,
+        "anchor_policy": ANCHOR_POLICY_NAMES.get(policy_id or 0, "unknown"),
+        "root_available": available,
+        "available": available,
+        "aligned": True if available else None,
+        "expected_sequence": pps_count,
+        "sequence": pps_count,
+        "valid": valid,
+        "candidate_present": candidate_present,
+        "fallback_used": False if valid else None,
+        "publish_source": "floorline" if valid else None,
+        "publish_reason": ANCHOR_POLICY_NAMES.get(policy_id or 0, "compact"),
+        "sample_count": None,
+        "sample_count_before": None,
+        "closing_sample_x": None,
+        "bucket_count": None,
+        "overflow_before": None,
+        "overflow_count_before": None,
+        "overflow_count_after": None,
+        "invalid_window_count": None,
+        "update_count": None,
+        "observed_dwt": observed_dwt,
+        "captured_before_clamp": captured_endpoint,
+        "captured_endpoint": captured_endpoint,
+        "captured_clamped": None,
+        "captured_bias": captured_bias,
+        "current_reconstructed_before": None,
+        "current_reconstructed_endpoint": None,
+        "current_reconstructed_clamped": None,
+        "reconstruction_delta": None,
+        "alt_before_clamp": None,
+        "alt_endpoint": None,
+        "alt_clamped": None,
+        "alt_bias": None,
+        "base_dwt": None,
+        "edge_x": None,
+        "full_slope_q16": None,
+        "slope_derived_interval": _as_int(forensic.get(f"{prefix}_fl_cyc")),
+        "pre_intercept_q16": None,
+        "post_intercept_q16": None,
+        "chosen_shift_q16": selected,
+        "alt_shift_q16": None,
+        "lift_q16": lift,
+        "errors_q16": [value for value in (e0, e1) if value is not None],
+        "e0_q16": e0,
+        "e1_q16": e1,
+        "gap_q16": (e1 - e0) if e0 is not None and e1 is not None else None,
+        "reported_observed_interval": _as_int(forensic.get(f"{prefix}_obs")),
+        # Compact *_fl_cyc is slope-derived; derive endpoint interval below.
+        "reported_floorline_interval": None,
+        "reported_floorline_interval_error": None,
+        "candidate_interval_error": None,
+    }
+
+
+def _attach_vclock_pps_sanity(row: Dict[str, Any], rec: Dict[str, Any]) -> None:
+    row["pps_floorline_error"] = None
+    row["pps_floorline_projected_dwt"] = None
+    if row.get("lane") != "VCLOCK":
+        return
+    pps_dwt = physical_pps_dwt_from_schema(rec)
+    phase = pps_vclock_phase_from_schema(rec)
+    floorline_dwt = _as_int(row.get("captured_endpoint"))
+    if pps_dwt is None or phase is None or floorline_dwt is None:
+        return
+    projected_pps = (floorline_dwt - phase) & U32_MASK
+    row["pps_floorline_projected_dwt"] = projected_pps
+    row["pps_floorline_error"] = signed_delta_u32(pps_dwt, projected_pps)
+
+
+def extract_lane_snapshot(
+    rec: Dict[str, Any],
+    lane: str,
+    alternative: str,
+) -> Dict[str, Any]:
+    fl_root = _floorline(rec)
+    if _as_str(fl_root.get("schema")) == "FLOORLINE_FORENSICS_V1":
+        row = _extract_rich_lane_snapshot(rec, lane, alternative)
+    else:
+        row = _extract_compact_lane_snapshot(rec, lane)
+    _attach_vclock_pps_sanity(row, rec)
+    return row
 
 
 def enrich_intervals(rows: List[Dict[str, Any]]) -> None:
@@ -763,6 +942,7 @@ def table_header() -> Tuple[str, str]:
         ("alt", 8),
         ("lift", 7),
         ("fl_b", 6),
+        ("p_fl", 6),
         ("alt_b", 6),
         ("fl_i", 6),
         ("alt_i", 6),
@@ -796,6 +976,7 @@ def row_line(row: Dict[str, Any]) -> str:
             fmt_float(q16_cycles(row.get("alt_shift_q16")), 8),
             fmt_float(q16_cycles(row.get("lift_q16")), 7),
             fmt_int(row.get("captured_bias"), 6, signed=True),
+            fmt_int(row.get("pps_floorline_error"), 6, signed=True),
             fmt_int(row.get("alt_bias"), 6, signed=True),
             fmt_int(row.get("actual_interval_error"), 6, signed=True),
             fmt_int(row.get("alt_interval_error"), 6, signed=True),
@@ -811,7 +992,13 @@ def detail_lines(row: Dict[str, Any], alternative: str) -> List[str]:
     errors_text = " ".join(
         f"e{i}={q16_cycles(value):+.3f}" for i, value in enumerate(errors)
     ) or "---"
-    lines = [f"      errors: {errors_text} cycles"]
+    lines = [
+        f"      source: {row.get('source_mode', '---')} "
+        f"schema={row.get('schema', '---')} "
+        f"policy={row.get('anchor_policy', '---')} "
+        f"policy_id={row.get('anchor_policy_id', '---')}"
+    ]
+    lines.append(f"      errors: {errors_text} cycles")
     lines.append(
         "      window: "
         f"before={row.get('sample_count_before', '---')} "
@@ -832,6 +1019,12 @@ def detail_lines(row: Dict[str, Any], alternative: str) -> List[str]:
         f"{alternative}_pre={row.get('alt_before_clamp', '---')} "
         f"{alternative}={row.get('alt_endpoint', '---')}"
     )
+    if row.get("lane") == "VCLOCK":
+        lines.append(
+            "      PPS sanity: "
+            f"projected_pps={row.get('pps_floorline_projected_dwt', '---')} "
+            f"projected_minus_physical={row.get('pps_floorline_error', '---')} cycles"
+        )
     lines.append(
         "      intervals: "
         f"observed={row.get('observed_interval', '---')} "
@@ -879,6 +1072,8 @@ def summarize(
         reconstruction_bad = sum(
             row.get("reconstruction_delta") not in (None, 0) for row in lane_rows
         )
+        rich_rows = sum(row.get("source_mode") == "rich" for row in lane_rows)
+        compact_rows = sum(row.get("source_mode") == "compact" for row in lane_rows)
         chosen_equals_e0 = sum(
             row.get("chosen_shift_q16") is not None
             and row.get("chosen_shift_q16") == row.get("e0_q16")
@@ -900,6 +1095,7 @@ def summarize(
         slope_interval_stats = RunningStats()
         interval_identity_stats = RunningStats()
         alt_identity_stats = RunningStats()
+        pps_floorline_stats = RunningStats()
         shift_bias_corr = PairStats()
         gap_lift_corr = PairStats()
 
@@ -930,6 +1126,7 @@ def summarize(
             slope_interval_stats.update(slope_ierr)
             interval_identity_stats.update(_as_float(row.get("actual_interval_identity_error")))
             alt_identity_stats.update(_as_float(row.get("alt_interval_identity_error")))
+            pps_floorline_stats.update(_as_float(row.get("pps_floorline_error")))
             shift_bias_corr.update(chosen_shift, actual_bias)
             gap_lift_corr.update(gap, lift)
 
@@ -947,39 +1144,44 @@ def summarize(
         print("─" * len(lane))
         print(
             f"  rows={len(lane_rows):,}  available={available:,}  aligned={aligned:,}  "
-            f"valid={valid:,}  overflow-at-close={overflow:,}  "
-            f"isolated-e0(gap≥{gap_gate:g})={isolated:,}"
+            f"valid={valid:,}  rich={rich_rows:,}  compact={compact_rows:,}  "
+            f"overflow-at-close={overflow:,}  isolated-e0(gap≥{gap_gate:g})={isolated:,}"
         )
         print(
-            f"  chosen-shift==e0: {chosen_equals_e0:,}/{len(lane_rows):,}  "
+            f"  selected-anchor==e0: {chosen_equals_e0:,}/{len(lane_rows):,}  "
             f"simulator reconstruction mismatches: {reconstruction_bad:,}"
         )
         print_stats("Firmware chosen shift", shift_stats)
         print_stats(f"Alternative shift ({alternative})", alt_stats)
         print_stats("e1 - e0 isolation gap", gap_stats)
-        print_stats("Alternative line lift", lift_stats)
+        print_stats("Selected/alternative lift from e0", lift_stats)
         print_stats("Captured endpoint bias", actual_bias_stats)
         print_stats(f"Simulated {alternative} endpoint bias", alt_bias_stats)
         print_stats("Captured FloorLine interval error", actual_interval_stats)
         print_stats(f"Simulated {alternative} interval error", alt_interval_stats)
         print_stats("Slope-derived interval error", slope_interval_stats)
+        if lane == "VCLOCK":
+            print_stats("VCLOCK FloorLine projected PPS error", pps_floorline_stats)
         print_stats("Captured interval identity error", interval_identity_stats)
         print_stats(f"Simulated {alternative} identity error", alt_identity_stats)
 
-        endpoint_pct = (
-            100.0 * endpoint_improved / endpoint_compared if endpoint_compared else 0.0
-        )
-        interval_pct = (
-            100.0 * interval_improved / interval_compared if interval_compared else 0.0
-        )
-        print(
-            f"  |endpoint bias| improved: {endpoint_improved:,}/{endpoint_compared:,} "
-            f"({endpoint_pct:.1f}%)"
-        )
-        print(
-            f"  |interval error| improved: {interval_improved:,}/{interval_compared:,} "
-            f"({interval_pct:.1f}%)"
-        )
+        if endpoint_compared:
+            endpoint_pct = 100.0 * endpoint_improved / endpoint_compared
+            print(
+                f"  |endpoint bias| improved: {endpoint_improved:,}/{endpoint_compared:,} "
+                f"({endpoint_pct:.1f}%)"
+            )
+        else:
+            print("  historical alternative endpoint comparison: unavailable")
+
+        if interval_compared:
+            interval_pct = 100.0 * interval_improved / interval_compared
+            print(
+                f"  |interval error| improved: {interval_improved:,}/{interval_compared:,} "
+                f"({interval_pct:.1f}%)"
+            )
+        else:
+            print("  historical alternative interval comparison: unavailable")
         corr = shift_bias_corr.correlation
         print(
             "  corr(chosen shift, endpoint bias): "
@@ -987,7 +1189,7 @@ def summarize(
         )
         corr = gap_lift_corr.correlation
         print(
-            "  corr(e0 isolation gap, alternative lift): "
+            "  corr(e0 isolation gap, selected/alternative lift): "
             + (f"{corr:+.6f}" if corr is not None else "---")
         )
 
@@ -1027,16 +1229,17 @@ def analyze(
     print(
         f"Campaign: {campaign}  "
         f"({len(records):,} TIMEBASE rows, {len(rows):,} lane rows, "
-        f"anchor={alternative})"
+        f"historical_alt={alternative})"
     )
     print()
     print("FloorLine lower-envelope anchor audit")
     print("═════════════════════════════════")
     print("  One output row per TIMEBASE row per selected clock.")
-    print("  shift is firmware's single-minimum anchor; alt is the simulated replacement.")
+    print("  shift is the firmware-selected anchor; alt exists only for rich historical rows.")
+    print("  lift is selected/alternative anchor minus e0; p_fl is VCLOCK-projected PPS error.")
     print("  fl_b/alt_b are endpoint biases; fl_i/alt_i are interval errors.")
     print("  slp_i is the independent fitted-slope interval error.")
-    print("  rcn validates the simulator against the captured current endpoint; expect 0.")
+    print("  rcn validates rich-row reconstruction; compact rows intentionally show ---.")
     print(
         f"  Interesting gates: e1-e0 gap ≥ {gap_gate:g}, "
         f"|shift| ≥ {shift_gate:g}, |bias/interval error| ≥ {interval_gate:d} cycles."
@@ -1057,7 +1260,14 @@ def analyze(
     print()
     print(f"Lane rows shown:    {len(displayed):,}")
     print(f"Lane rows analyzed: {len(rows):,}")
-    missing_schema = sum(row.get("schema") != "FLOORLINE_FORENSICS_V1" for row in rows)
+    missing_schema = sum(not row.get("root_available") for row in rows)
+    rich_schema = sum(row.get("source_mode") == "rich" for row in rows)
+    compact_schema = sum(
+        row.get("source_mode") == "compact" and row.get("root_available")
+        for row in rows
+    )
+    print(f"Rich schema lane rows:          {rich_schema:,}")
+    print(f"Compact V3 schema lane rows:    {compact_schema:,}")
     print(f"Missing/other schema lane rows: {missing_schema:,}")
 
     summarize(rows, clocks, alternative, gap_gate)
@@ -1065,8 +1275,9 @@ def analyze(
     print()
     print("Interpretation guide")
     print("════════════════════")
-    print("  • Large gap with large positive lift means one isolated e0 pulled the whole line down.")
-    print("  • rcn=0 proves the report reconstructed firmware's current endpoint exactly.")
+    print("  • Large gap with large positive lift means median8 rejected an isolated e0.")
+    print("  • p_fl near zero means VCLOCK FloorLine projects back onto physical PPS.")
+    print("  • rcn=0 proves rich-row reconstruction; compact rows need no reconstruction.")
     print("  • Compare fl_b vs alt_b to judge endpoint quantization/latency relief.")
     print("  • Compare fl_i vs alt_i across the campaign; interval noise is the change in")
     print("    endpoint bias from one row to the next.")
@@ -1079,7 +1290,7 @@ def analyze(
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="raw_floorline",
-        description="Analyze FLOORLINE_FORENSICS_V1 rows and simulate robust anchors.",
+        description="Analyze rich or compact FloorLine anchor evidence and VCLOCK/PPS agreement.",
     )
     parser.add_argument("campaign", help="TIMEBASE campaign name, e.g. ShakeOut1")
     parser.add_argument(
