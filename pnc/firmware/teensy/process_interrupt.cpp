@@ -8305,6 +8305,13 @@ static __attribute__((noinline)) void deferred_dispatch_callback(timepop_ctx_t*,
   rt->dispatch_running = true;
   interrupt_priority0_guard_exit(prior_basepri);
 
+  // VCLOCK's PPS/Beta continuation must run only after Alpha has consumed the
+  // matching frozen VCLOCK event/diagnostic tuple.  Queuing both as peer ASAP
+  // jobs allowed the PPS continuation to occasionally win the race and snapshot
+  // Alpha's previous VCLOCK forensics row.
+  const bool dispatch_pps_edge_after_callback =
+      rt->desc->kind == interrupt_subscriber_kind_t::VCLOCK;
+
   rt->dispatch_count++;
   callback(rt->deferred.event, &rt->deferred.diag, callback_user_data);
 
@@ -8312,6 +8319,11 @@ static __attribute__((noinline)) void deferred_dispatch_callback(timepop_ctx_t*,
   rt->dispatch_running = false;
   rt->deferred = interrupt_deferred_dispatch_t{};
   interrupt_priority0_guard_exit(finish_basepri);
+
+  if (dispatch_pps_edge_after_callback) {
+    pps_edge_dispatch_arm_or_call_from_foreground(
+        "PPS_VCLOCK_DISPATCH_AFTER_VCLOCK");
+  }
 }
 
 static __attribute__((noinline)) void emit_one_second_event(
@@ -9050,7 +9062,8 @@ static __attribute__((noinline)) void vclock_apply_perishable_fact_deferred(
                         &dwt_diag,
                         &lower_env);
 
-  pps_edge_dispatch_arm_or_call_from_foreground("PPS_VCLOCK_DISPATCH");
+  // The PPS/Beta continuation is chained by deferred_dispatch_callback after
+  // Alpha consumes this exact frozen VCLOCK tuple.
 }
 
 static __attribute__((noinline)) void vclock_fact_drain_callback(timepop_ctx_t*,
@@ -9754,7 +9767,8 @@ static __attribute__((noinline)) void vclock_heartbeat_native_service(uint32_t i
                             coincidence_cycles, coincidence_valid, &dwt_diag,
                             &lower_env);
 
-      pps_edge_dispatch_arm_or_call_from_foreground("PPS_VCLOCK_DISPATCH");
+      // The PPS/Beta continuation is chained by deferred_dispatch_callback after
+      // Alpha consumes this exact frozen VCLOCK tuple.
 
       if (bookend.due && bookend.ch2_owned) {
         vclock_ch2_one_second_advance_after_bookend(bookend.target_counter32,

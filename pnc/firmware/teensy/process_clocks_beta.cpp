@@ -8695,6 +8695,23 @@ void clocks_beta_pps(void) {
   // observational here and candidate identities continue to be emitted.
   (void)recover_reattach_should_hold();
 
+  // Final Beta custody gate: acquire the current Alpha VCLOCK forensic row
+  // before campaign identity advances.  The forensic event and the canonical
+  // PPS/VCLOCK globals are two views of the same authored bookend; accepting a
+  // mismatch would publish the previous diagnostic endpoint beside the current
+  // TIMEBASE interval.
+  clocks_alpha_lane_forensics_t& vclock_forensics =
+      g_beta_pps_vclock_forensics;
+  vclock_forensics = clocks_alpha_lane_forensics_t{};
+  const bool vclock_forensics_valid =
+      clocks_alpha_lane_forensics(time_clock_id_t::VCLOCK,
+                                  &vclock_forensics);
+  if (!vclock_forensics_valid ||
+      vclock_forensics.last_event_counter32 != g_counter32_at_pps_vclock ||
+      vclock_forensics.last_event_dwt != g_dwt_at_pps_vclock) {
+    return;
+  }
+
   g_timebase_candidate_count++;
   g_timebase_last_candidate_campaign_seconds = campaign_seconds;
   timebase_build_stage(TIMEBASE_BUILD_STAGE_CANDIDATE);
@@ -8733,15 +8750,11 @@ void clocks_beta_pps(void) {
   // court below.  A SCIENCE_REJECT row advances campaign identity but may not
   // enter any campaign statistical population.
 
-  clocks_alpha_lane_forensics_t& vclock_forensics = g_beta_pps_vclock_forensics;
   clocks_alpha_lane_forensics_t& ocxo1_forensics = g_beta_pps_ocxo1_forensics;
   clocks_alpha_lane_forensics_t& ocxo2_forensics = g_beta_pps_ocxo2_forensics;
-  vclock_forensics = clocks_alpha_lane_forensics_t{};
   ocxo1_forensics = clocks_alpha_lane_forensics_t{};
   ocxo2_forensics = clocks_alpha_lane_forensics_t{};
 
-  const bool vclock_forensics_valid =
-      clocks_alpha_lane_forensics(time_clock_id_t::VCLOCK, &vclock_forensics);
   const bool ocxo1_forensics_valid =
       clocks_alpha_lane_forensics(time_clock_id_t::OCXO1, &ocxo1_forensics);
   const bool ocxo2_forensics_valid =

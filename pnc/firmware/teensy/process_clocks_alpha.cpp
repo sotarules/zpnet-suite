@@ -8705,6 +8705,17 @@ static void pps_selector_callback(const pps_edge_snapshot_t& snap) {
     update_pps_vclock_bridge_anchor(snap);
   }
 
+  // Once an Alpha epoch exists, Beta may only consume a PPS/VCLOCK snapshot
+  // after Alpha has applied the matching VCLOCK subscriber event.  The two
+  // identities are authored from the same process_interrupt bookend.  A
+  // mismatch therefore means the callback/continuation ordering has regressed;
+  // publishing here would repeat the previous VCLOCK forensic endpoint.
+  if (epoch_ready() &&
+      (g_last_vclock_event_counter32_at_event != snap.counter32_at_edge ||
+       g_prev_dwt_at_vclock_event != snap.dwt_at_edge)) {
+    return;
+  }
+
   maybe_publish_fragment();
 }
 
