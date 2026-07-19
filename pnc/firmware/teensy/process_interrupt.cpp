@@ -1494,7 +1494,6 @@ bool interrupt_last_epoch_capture(interrupt_epoch_capture_t* out) {
 
 static pps_edge_dispatch_fn g_pps_edge_dispatch = nullptr;
 static void pps_edge_dispatch_trampoline(timepop_ctx_t*, timepop_diag_t*, void*);
-static void pps_edge_dispatch_arm_or_call_from_foreground(const char* name);
 
 // ============================================================================
 // DWT cycles-per-second compatibility
@@ -2884,6 +2883,12 @@ struct interrupt_deferred_dispatch_t {
   void* user_data = nullptr;
   interrupt_event_t event{};
   interrupt_capture_diag_t diag{};
+
+  // VCLOCK alone carries a same-transaction PPS/Beta continuation.  Freeze the
+  // snapshot beside Alpha's event so the later callback never rereads mutable
+  // "latest PPS" state and can never join event N to snapshot N+1.
+  bool pps_continuation_valid = false;
+  pps_edge_snapshot_t pps_continuation{};
 };
 
 struct interrupt_subscriber_runtime_t {
@@ -8085,6 +8090,7 @@ static __attribute__((noinline)) bool dwt_publication_adjudicate_or_watchdog(
 // ============================================================================
 
 static __attribute__((noinline)) void deferred_dispatch_callback(timepop_ctx_t*, timepop_diag_t*, void*);
+static bool vclock_fact_ring_arm_drain_from_timepop(void);
 
 static void fill_diag(interrupt_capture_diag_t& diag,
                       const interrupt_subscriber_runtime_t& rt,
@@ -8238,6 +8244,26 @@ static bool interrupt_dispatch_begin(
     rt.deferred.user_data = callback_user_data;
     rt.deferred.event = event;
     rt.deferred.diag = diag;
+
+    if (rt.desc->kind == interrupt_subscriber_kind_t::VCLOCK) {
+      const pps_edge_snapshot_t snap = interrupt_last_pps_edge();
+
+      // emit_one_second_event() runs immediately after the matching
+      // PPS/VCLOCK publication.  Refuse to arm a cross-second transaction if
+      // that invariant is ever violated; dropping one row is recoverable,
+      // mutating Alpha/Beta with mixed identities is not.
+      if (snap.counter32_at_edge != event.counter32_at_event ||
+          snap.dwt_at_edge != event.dwt_at_event) {
+        rt.dispatch_stale_drop_count++;
+        rt.deferred = interrupt_deferred_dispatch_t{};
+        interrupt_priority0_guard_exit(prior_basepri);
+        return false;
+      }
+
+      rt.deferred.pps_continuation_valid = true;
+      rt.deferred.pps_continuation = snap;
+    }
+
     interrupt_priority0_guard_exit(prior_basepri);
 
     const timepop_handle_t handle =
@@ -8276,12 +8302,24 @@ static __attribute__((noinline)) void deferred_dispatch_callback(timepop_ctx_t*,
   auto* rt = static_cast<interrupt_subscriber_runtime_t*>(user_data);
   if (!rt || !rt->desc) return;
 
+  const bool is_vclock =
+      rt->desc->kind == interrupt_subscriber_kind_t::VCLOCK;
+
   interrupt_subscriber_event_fn callback = nullptr;
   void* callback_user_data = nullptr;
+  interrupt_event_t event{};
+  interrupt_capture_diag_t diag{};
+  bool pps_continuation_valid = false;
+  pps_edge_snapshot_t pps_continuation{};
 
   const uint32_t prior_basepri = interrupt_priority0_guard_enter();
   if (!rt->deferred.pending || rt->dispatch_running) {
+    const bool may_rearm_vclock =
+        is_vclock && !rt->deferred.pending && !rt->dispatch_running;
     interrupt_priority0_guard_exit(prior_basepri);
+    if (may_rearm_vclock) {
+      (void)vclock_fact_ring_arm_drain_from_timepop();
+    }
     return;
   }
 
@@ -8290,6 +8328,9 @@ static __attribute__((noinline)) void deferred_dispatch_callback(timepop_ctx_t*,
     rt->dispatch_stale_drop_count++;
     rt->deferred = interrupt_deferred_dispatch_t{};
     interrupt_priority0_guard_exit(prior_basepri);
+    if (is_vclock) {
+      (void)vclock_fact_ring_arm_drain_from_timepop();
+    }
     return;
   }
 
@@ -8299,30 +8340,41 @@ static __attribute__((noinline)) void deferred_dispatch_callback(timepop_ctx_t*,
     rt->dispatch_invalid_callback_count++;
     rt->deferred = interrupt_deferred_dispatch_t{};
     interrupt_priority0_guard_exit(prior_basepri);
+    if (is_vclock) {
+      (void)vclock_fact_ring_arm_drain_from_timepop();
+    }
     return;
   }
 
+  // Copy the complete transaction out of the runtime before invoking user code.
+  // A subscriber may stop or replace itself synchronously; local custody keeps
+  // this callback coherent while binding_generation invalidates later work.
+  event = rt->deferred.event;
+  diag = rt->deferred.diag;
+  pps_continuation_valid = rt->deferred.pps_continuation_valid;
+  pps_continuation = rt->deferred.pps_continuation;
   rt->dispatch_running = true;
   interrupt_priority0_guard_exit(prior_basepri);
 
-  // VCLOCK's PPS/Beta continuation must run only after Alpha has consumed the
-  // matching frozen VCLOCK event/diagnostic tuple.  Queuing both as peer ASAP
-  // jobs allowed the PPS continuation to occasionally win the race and snapshot
-  // Alpha's previous VCLOCK forensics row.
-  const bool dispatch_pps_edge_after_callback =
-      rt->desc->kind == interrupt_subscriber_kind_t::VCLOCK;
-
   rt->dispatch_count++;
-  callback(rt->deferred.event, &rt->deferred.diag, callback_user_data);
+  callback(event, &diag, callback_user_data);
 
   const uint32_t finish_basepri = interrupt_priority0_guard_enter();
   rt->dispatch_running = false;
   rt->deferred = interrupt_deferred_dispatch_t{};
   interrupt_priority0_guard_exit(finish_basepri);
 
-  if (dispatch_pps_edge_after_callback) {
-    pps_edge_dispatch_arm_or_call_from_foreground(
-        "PPS_VCLOCK_DISPATCH_AFTER_VCLOCK");
+  if (is_vclock) {
+    // Alpha and Beta are one foreground transaction.  Invoke Beta directly with
+    // the frozen snapshot; do not enqueue a second ASAP callback and do not read
+    // interrupt_last_pps_edge() after another fact can advance global state.
+    if (pps_continuation_valid && g_pps_edge_dispatch) {
+      g_pps_edge_dispatch(pps_continuation);
+    }
+
+    // Only now may the next VCLOCK fact enter Alpha.  This serializes the whole
+    // Alpha -> PPS/Beta custody chain while still leaving priority-0 capture free.
+    (void)vclock_fact_ring_arm_drain_from_timepop();
   }
 }
 
@@ -8587,9 +8639,12 @@ static bool vclock_fact_ring_pop(vclock_perishable_fact_t& out) {
   dmb_barrier();
   g_vclock_fact_ring.tail = tail + 1U;
   g_vclock_fact_ring.drain_count++;
-  if ((tail + 1U) == head) {
-    g_vclock_fact_ring.drain_armed = false;
-  }
+
+  // drain_armed represents the callback invocation currently consuming this
+  // fact, not ownership of the entire queue.  The Alpha/Beta transaction will
+  // explicitly rearm the next fact after custody is released.
+  g_vclock_fact_ring.drain_armed = false;
+
   interrupt_priority0_guard_exit(prior_basepri);
   return true;
 }
@@ -8618,6 +8673,14 @@ static bool vclock_fact_ring_push_no_arm_from_isr(vclock_perishable_fact_t fact)
 
 static bool vclock_fact_ring_arm_drain_from_timepop(void) {
   if (vclock_fact_ring_pending() == 0 || g_vclock_fact_ring.drain_armed) return false;
+
+  // A queued or executing VCLOCK subscriber owns the complete Alpha -> Beta
+  // transaction.  Priority-16 capture may continue filling the fact ring, but
+  // no other TimePop path may arm the next fact until that transaction releases.
+  if (g_rt_vclock &&
+      (g_rt_vclock->deferred.pending || g_rt_vclock->dispatch_running)) {
+    return false;
+  }
 
   g_vclock_fact_ring.drain_armed = true;
   g_vclock_fact_ring.asap_arm_count++;
@@ -9069,10 +9132,20 @@ static __attribute__((noinline)) void vclock_apply_perishable_fact_deferred(
 static __attribute__((noinline)) void vclock_fact_drain_callback(timepop_ctx_t*,
                                        timepop_diag_t*,
                                        void*) {
-  for (;;) {
-    vclock_perishable_fact_t fact{};
-    if (!vclock_fact_ring_pop(fact)) break;
-    vclock_apply_perishable_fact_deferred(fact);
+  vclock_perishable_fact_t fact{};
+  if (!vclock_fact_ring_pop(fact)) return;
+
+  vclock_apply_perishable_fact_deferred(fact);
+
+  // A successful one-second publication has reserved VCLOCK's deferred Alpha
+  // transaction; its completion path will rearm the next fact after Beta.  If
+  // this fact was rejected before dispatch, keep the queue moving here instead
+  // of leaving drain_armed false with pending work stranded.
+  const bool transaction_pending =
+      g_rt_vclock &&
+      (g_rt_vclock->deferred.pending || g_rt_vclock->dispatch_running);
+  if (!transaction_pending) {
+    (void)vclock_fact_ring_arm_drain_from_timepop();
   }
 }
 
@@ -12754,23 +12827,6 @@ static void pps_edge_dispatch_trampoline(timepop_ctx_t*, timepop_diag_t*, void*)
   const pps_edge_snapshot_t snap = interrupt_last_pps_edge();
   g_pps_edge_dispatch(snap);
 }
-
-static void pps_edge_dispatch_arm_or_call_from_foreground(const char* name) {
-  if (!g_pps_edge_dispatch) return;
-
-  const timepop_handle_t h =
-      timepop_arm_asap(pps_edge_dispatch_trampoline,
-                       nullptr,
-                       name ? name : "PPS_VCLOCK_DISPATCH");
-  if (h == TIMEPOP_INVALID_HANDLE) {
-    // We are already in foreground/deferred context on the steady-state
-    // VCLOCK publication path.  Dropping the dispatch here creates a missing
-    // TIMEBASE row, so fall back to a direct callback instead of losing the
-    // already-authored PPS/VCLOCK bookend.
-    pps_edge_dispatch_trampoline(nullptr, nullptr, nullptr);
-  }
-}
-
 
 static void pps_relay_assert_from_isr(uint32_t sequence) {
   // PPS relay HIGH is a physical PPS witness and stays in ISR context.
