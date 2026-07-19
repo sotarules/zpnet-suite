@@ -62,6 +62,8 @@
  *     accepts source=audit|watchdog, bank=retained|live, count=1..8, offset=N
  *   • TIMEPOP_DISPATCH_INFO — return a bounded TimePop callback, mutation, and
  *     rearm transcript; accepts bank=retained|live, count=1..8, offset=N
+ *   • CRASH_POLICY — return live CPU/FPU exception policy plus a compact
+ *     consistency analysis of retained core and extended exception frames
  *   • PAYLOAD_CONTRACT_INFO — return design-by-contract counters plus the
  *     first/latest current-boot incident and latest retained incident
  *

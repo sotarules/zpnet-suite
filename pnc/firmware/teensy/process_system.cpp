@@ -1359,6 +1359,594 @@ static FLASHMEM Payload system_crash_forensics_payload(void) {
   return out;
 }
 
+
+// ============================================================================
+// CRASH_POLICY — live exception/FPU policy plus retained-frame interpretation
+// ============================================================================
+//
+// This report deliberately does not dereference any address from the retained
+// crash record.  It compares the recorder's scalar choices against the Armv7-M
+// EXC_RETURN contract and reports the live system-control/FPU policy that would
+// govern a newly taken exception.
+//
+// Armv7-M EXC_RETURN fields used here:
+//   bit 2: 0 = MSP, 1 = PSP
+//   bit 3: 0 = return to Handler mode, 1 = return to Thread mode
+//   bit 4: 0 = extended FP frame, 1 = basic frame
+//
+// An extended FP frame contributes 18 words before the eight-word basic frame.
+// The optional stack-alignment word follows the basic frame and is identified
+// by stacked xPSR bit 9.
+
+static constexpr uintptr_t SYSTEM_SCS_ACTLR  = 0xE000E008UL;
+static constexpr uintptr_t SYSTEM_SCB_CPUID  = 0xE000ED00UL;
+static constexpr uintptr_t SYSTEM_SCB_ICSR   = 0xE000ED04UL;
+static constexpr uintptr_t SYSTEM_SCB_VTOR   = 0xE000ED08UL;
+static constexpr uintptr_t SYSTEM_SCB_AIRCR  = 0xE000ED0CUL;
+static constexpr uintptr_t SYSTEM_SCB_SCR    = 0xE000ED10UL;
+static constexpr uintptr_t SYSTEM_SCB_CCR    = 0xE000ED14UL;
+static constexpr uintptr_t SYSTEM_SCB_SHCSR  = 0xE000ED24UL;
+static constexpr uintptr_t SYSTEM_SCB_CFSR   = 0xE000ED28UL;
+static constexpr uintptr_t SYSTEM_SCB_HFSR   = 0xE000ED2CUL;
+static constexpr uintptr_t SYSTEM_SCB_DFSR   = 0xE000ED30UL;
+static constexpr uintptr_t SYSTEM_SCB_MMFAR  = 0xE000ED34UL;
+static constexpr uintptr_t SYSTEM_SCB_BFAR   = 0xE000ED38UL;
+static constexpr uintptr_t SYSTEM_SCB_AFSR   = 0xE000ED3CUL;
+static constexpr uintptr_t SYSTEM_SCB_CPACR  = 0xE000ED88UL;
+static constexpr uintptr_t SYSTEM_FPU_FPCCR  = 0xE000EF34UL;
+static constexpr uintptr_t SYSTEM_FPU_FPCAR  = 0xE000EF38UL;
+static constexpr uintptr_t SYSTEM_FPU_FPDSCR = 0xE000EF3CUL;
+static constexpr uintptr_t SYSTEM_FPU_MVFR0  = 0xE000EF40UL;
+static constexpr uintptr_t SYSTEM_FPU_MVFR1  = 0xE000EF44UL;
+static constexpr uintptr_t SYSTEM_DHCSR      = 0xE000EDF0UL;
+static constexpr uintptr_t SYSTEM_DEMCR      = 0xE000EDFCUL;
+static constexpr uintptr_t SYSTEM_DWT_CTRL   = 0xE0001000UL;
+
+static constexpr uint32_t SYSTEM_EXC_RETURN_HANDLER_MSP_EXTENDED = 0xFFFFFFE1UL;
+static constexpr uint32_t SYSTEM_EXC_RETURN_THREAD_MSP_EXTENDED  = 0xFFFFFFE9UL;
+static constexpr uint32_t SYSTEM_EXC_RETURN_THREAD_PSP_EXTENDED  = 0xFFFFFFEDUL;
+static constexpr uint32_t SYSTEM_EXC_RETURN_HANDLER_MSP_BASIC    = 0xFFFFFFF1UL;
+static constexpr uint32_t SYSTEM_EXC_RETURN_THREAD_MSP_BASIC     = 0xFFFFFFF9UL;
+static constexpr uint32_t SYSTEM_EXC_RETURN_THREAD_PSP_BASIC     = 0xFFFFFFFDUL;
+
+static inline uint32_t system_crash_policy_read32(uintptr_t address) {
+  return *reinterpret_cast<volatile const uint32_t*>(address);
+}
+
+static bool system_crash_policy_exc_return_recognized(uint32_t value) {
+  switch (value) {
+    case SYSTEM_EXC_RETURN_HANDLER_MSP_EXTENDED:
+    case SYSTEM_EXC_RETURN_THREAD_MSP_EXTENDED:
+    case SYSTEM_EXC_RETURN_THREAD_PSP_EXTENDED:
+    case SYSTEM_EXC_RETURN_HANDLER_MSP_BASIC:
+    case SYSTEM_EXC_RETURN_THREAD_MSP_BASIC:
+    case SYSTEM_EXC_RETURN_THREAD_PSP_BASIC:
+      return true;
+    default:
+      return false;
+  }
+}
+
+static const char* system_crash_policy_exc_return_name(uint32_t value) {
+  switch (value) {
+    case SYSTEM_EXC_RETURN_HANDLER_MSP_EXTENDED:
+      return "HANDLER_MSP_EXTENDED";
+    case SYSTEM_EXC_RETURN_THREAD_MSP_EXTENDED:
+      return "THREAD_MSP_EXTENDED";
+    case SYSTEM_EXC_RETURN_THREAD_PSP_EXTENDED:
+      return "THREAD_PSP_EXTENDED";
+    case SYSTEM_EXC_RETURN_HANDLER_MSP_BASIC:
+      return "HANDLER_MSP_BASIC";
+    case SYSTEM_EXC_RETURN_THREAD_MSP_BASIC:
+      return "THREAD_MSP_BASIC";
+    case SYSTEM_EXC_RETURN_THREAD_PSP_BASIC:
+      return "THREAD_PSP_BASIC";
+    default:
+      return "UNRECOGNIZED";
+  }
+}
+
+static bool system_crash_policy_executable_address(uint32_t value) {
+  if (value == 0U) return false;
+  const uint32_t address = value & ~1UL;
+
+  // Teensy 4.1 executable regions used by this firmware:
+  //   ITCM:       0x00000400 .. 0x0007FFFF
+  //   FlexSPI2:   0x60000000 .. 0x60FFFFFF
+  if (address >= 0x00000400UL && address < 0x00080000UL) return true;
+  return address >= 0x60000000UL && address < 0x61000000UL;
+}
+
+static bool system_crash_policy_dtcm_address(uint32_t value) {
+  return value >= 0x20000000UL && value < 0x20080000UL;
+}
+
+static const char* system_crash_policy_assessment(
+    bool exc_return_recognized,
+    bool hardware_stacking_fault,
+    bool selected_sp_matches,
+    bool basic_address_matches,
+    bool interrupted_sp_matches_or_unavailable,
+    bool xpsr_thumb,
+    bool xpsr_mode_consistent,
+    bool pc_executable,
+    bool lr_plausible) {
+  if (!exc_return_recognized) return "EXC_RETURN_UNRECOGNIZED";
+  if (hardware_stacking_fault) return "HARDWARE_STACKING_FAULT_REPORTED";
+  if (!selected_sp_matches) return "SELECTED_STACK_POINTER_MISMATCH";
+  if (!basic_address_matches) return "BASIC_FRAME_ADDRESS_MISMATCH";
+  if (!interrupted_sp_matches_or_unavailable) {
+    return "INTERRUPTED_STACK_POINTER_MISMATCH";
+  }
+  if (!xpsr_thumb) return "STACKED_XPSR_THUMB_BIT_CLEAR";
+  if (!xpsr_mode_consistent) return "STACKED_XPSR_MODE_INCONSISTENT";
+  if (!pc_executable) return "STACKED_PC_NOT_EXECUTABLE";
+  if (!lr_plausible) return "STACKED_LR_NOT_PLAUSIBLE";
+  return "FRAME_POLICY_COHERENT";
+}
+
+struct system_crash_policy_record_view_t {
+  const char* source;
+  uint32_t flags;
+  uint32_t raw_frame_address;
+  uint32_t basic_frame_address;
+  uint32_t interrupted_sp;
+  bool has_interrupted_sp;
+  uint32_t exc_return;
+  uint32_t stacked_lr;
+  uint32_t stacked_pc;
+  uint32_t stacked_xpsr;
+  uint32_t original_msp;
+  uint32_t original_psp;
+  uint32_t cfsr;
+  uint32_t hfsr;
+  uint32_t shcsr;
+  uint32_t icsr;
+  uint32_t fpccr;
+  uint32_t fpcar;
+  uint32_t ccr;
+  uint32_t cpacr;
+  uint32_t fpdscr;
+  bool has_extended_control;
+};
+
+static system_crash_policy_record_view_t
+system_crash_policy_core_view(const crash_forensics_core_record_t& record) {
+  system_crash_policy_record_view_t view{};
+  view.source = "CORE";
+  view.flags = record.flags;
+  view.raw_frame_address = record.raw_frame_address;
+  view.basic_frame_address = record.basic_frame_address;
+  view.interrupted_sp = record.interrupted_sp;
+  view.has_interrupted_sp = true;
+  view.exc_return = record.exc_return;
+  view.stacked_lr = record.stacked_lr;
+  view.stacked_pc = record.stacked_pc;
+  view.stacked_xpsr = record.stacked_xpsr;
+  view.original_msp = record.original_msp;
+  view.original_psp = record.original_psp;
+  view.cfsr = record.cfsr;
+  view.hfsr = record.hfsr;
+  view.shcsr = record.shcsr;
+  view.icsr = record.icsr;
+  view.fpccr = record.fpccr;
+  view.fpcar = record.fpcar;
+  view.has_extended_control = false;
+  return view;
+}
+
+static system_crash_policy_record_view_t
+system_crash_policy_extended_view(const crash_forensics_record_t& record) {
+  system_crash_policy_record_view_t view{};
+  view.source = "EXTENDED";
+  view.flags = record.flags;
+  view.raw_frame_address = record.raw_frame_address;
+  view.basic_frame_address = record.basic_frame_address;
+  view.interrupted_sp = 0U;
+  view.has_interrupted_sp = false;
+  view.exc_return = record.exc_return;
+  view.stacked_lr = record.stacked_lr;
+  view.stacked_pc = record.stacked_pc;
+  view.stacked_xpsr = record.stacked_xpsr;
+  view.original_msp = record.original_msp;
+  view.original_psp = record.original_psp;
+  view.cfsr = record.cfsr;
+  view.hfsr = record.hfsr;
+  view.shcsr = record.shcsr;
+  view.icsr = record.icsr;
+  view.fpccr = record.fpccr;
+  view.fpcar = record.fpcar;
+  view.ccr = record.ccr;
+  view.cpacr = record.cpacr;
+  view.fpdscr = record.fpdscr;
+  view.has_extended_control = true;
+  return view;
+}
+
+static FLASHMEM Payload system_crash_policy_record_payload(
+    const system_crash_policy_record_view_t& record) {
+  const bool exc_return_recognized =
+      system_crash_policy_exc_return_recognized(record.exc_return);
+  const bool use_psp = (record.exc_return & (1UL << 2)) != 0U;
+  const bool return_to_thread = (record.exc_return & (1UL << 3)) != 0U;
+  const bool basic_frame = (record.exc_return & (1UL << 4)) != 0U;
+  const bool extended_frame = !basic_frame;
+  const uint32_t extension_words = extended_frame ? 18U : 0U;
+  const uint32_t selected_sp = use_psp ? record.original_psp : record.original_msp;
+  const uint32_t expected_basic =
+      record.raw_frame_address + extension_words * sizeof(uint32_t);
+  const bool stack_alignment_word =
+      (record.stacked_xpsr & (1UL << 9)) != 0U;
+  const uint32_t expected_interrupted_sp =
+      expected_basic + 8U * sizeof(uint32_t) +
+      (stack_alignment_word ? sizeof(uint32_t) : 0U);
+
+  const uint32_t xpsr_exception_number = record.stacked_xpsr & 0x1FFU;
+  const bool xpsr_thumb = (record.stacked_xpsr & (1UL << 24)) != 0U;
+  const bool xpsr_mode_consistent =
+      return_to_thread ? (xpsr_exception_number == 0U)
+                       : (xpsr_exception_number != 0U);
+  const bool pc_executable =
+      system_crash_policy_executable_address(record.stacked_pc);
+  const bool lr_executable =
+      system_crash_policy_executable_address(record.stacked_lr);
+  const bool lr_exc_return =
+      system_crash_policy_exc_return_recognized(record.stacked_lr);
+  const bool lr_plausible = lr_executable || lr_exc_return;
+
+  const bool memory_stacking_fault =
+      (record.cfsr & ((1UL << 3) | (1UL << 4) | (1UL << 5))) != 0U;
+  const bool bus_stacking_fault =
+      (record.cfsr & ((1UL << 11) | (1UL << 12) | (1UL << 13))) != 0U;
+  const bool hardware_stacking_fault =
+      memory_stacking_fault || bus_stacking_fault;
+
+  const bool selected_sp_matches =
+      selected_sp == record.raw_frame_address;
+  const bool basic_address_matches =
+      expected_basic == record.basic_frame_address;
+  const bool interrupted_sp_matches =
+      !record.has_interrupted_sp ||
+      expected_interrupted_sp == record.interrupted_sp;
+  const bool extended_flag =
+      (record.flags & CRASH_FORENSICS_FLAG_EXTENDED_FP_FRAME) != 0U;
+  const bool format_flag_matches =
+      extended_flag == extended_frame;
+
+  const bool frame_content_plausible =
+      exc_return_recognized &&
+      !hardware_stacking_fault &&
+      selected_sp_matches &&
+      basic_address_matches &&
+      interrupted_sp_matches &&
+      xpsr_thumb &&
+      xpsr_mode_consistent &&
+      pc_executable &&
+      lr_plausible;
+
+  Payload out;
+  out.add("source", record.source);
+  system_crash_add_hex32(out, "flags", record.flags);
+  system_crash_add_hex32(out, "exc_return", record.exc_return);
+  out.add("exc_return_name",
+          system_crash_policy_exc_return_name(record.exc_return));
+  out.add("exc_return_recognized", exc_return_recognized);
+  out.add("return_stack", use_psp ? "PSP" : "MSP");
+  out.add("return_mode", return_to_thread ? "THREAD" : "HANDLER");
+  out.add("frame_format", basic_frame ? "BASIC" : "EXTENDED_FP");
+  out.add("frame_extension_words", extension_words);
+  out.add("frame_extension_bytes",
+          extension_words * (uint32_t)sizeof(uint32_t));
+
+  system_crash_add_hex32(out, "raw_frame_address",
+                         record.raw_frame_address);
+  system_crash_add_hex32(out, "selected_stack_pointer", selected_sp);
+  out.add("selected_stack_pointer_matches_raw", selected_sp_matches);
+  system_crash_add_hex32(out, "recorded_basic_frame_address",
+                         record.basic_frame_address);
+  system_crash_add_hex32(out, "expected_basic_frame_address",
+                         expected_basic);
+  out.add("basic_frame_address_matches_policy", basic_address_matches);
+
+  out.add("record_has_interrupted_sp", record.has_interrupted_sp);
+  if (record.has_interrupted_sp) {
+    system_crash_add_hex32(out, "recorded_interrupted_sp",
+                           record.interrupted_sp);
+  }
+  system_crash_add_hex32(out, "expected_interrupted_sp",
+                         expected_interrupted_sp);
+  out.add("stack_alignment_word", stack_alignment_word);
+  out.add("interrupted_sp_matches_policy", interrupted_sp_matches);
+
+  Payload stacked;
+  system_crash_add_hex32(stacked, "pc", record.stacked_pc);
+  stacked.add("pc_executable", pc_executable);
+  system_crash_add_hex32(stacked, "lr", record.stacked_lr);
+  stacked.add("lr_executable", lr_executable);
+  stacked.add("lr_is_exc_return", lr_exc_return);
+  stacked.add("lr_plausible", lr_plausible);
+  system_crash_add_hex32(stacked, "xpsr", record.stacked_xpsr);
+  stacked.add("xpsr_thumb", xpsr_thumb);
+  stacked.add("xpsr_exception_number", xpsr_exception_number);
+  stacked.add("xpsr_mode_consistent", xpsr_mode_consistent);
+  out.add_object("stacked_state", stacked);
+
+  Payload fault;
+  system_crash_add_hex32(fault, "cfsr", record.cfsr);
+  system_crash_add_hex32(fault, "hfsr", record.hfsr);
+  system_crash_add_hex32(fault, "shcsr", record.shcsr);
+  system_crash_add_hex32(fault, "icsr", record.icsr);
+  fault.add("iaccviol", (record.cfsr & (1UL << 0)) != 0U);
+  fault.add("daccviol", (record.cfsr & (1UL << 1)) != 0U);
+  fault.add("munstkerr", (record.cfsr & (1UL << 3)) != 0U);
+  fault.add("mstkerr", (record.cfsr & (1UL << 4)) != 0U);
+  fault.add("mlsperr", (record.cfsr & (1UL << 5)) != 0U);
+  fault.add("mmarvalid", (record.cfsr & (1UL << 7)) != 0U);
+  fault.add("ibuserr", (record.cfsr & (1UL << 8)) != 0U);
+  fault.add("preciserr", (record.cfsr & (1UL << 9)) != 0U);
+  fault.add("impreciserr", (record.cfsr & (1UL << 10)) != 0U);
+  fault.add("unstkerr", (record.cfsr & (1UL << 11)) != 0U);
+  fault.add("stkerr", (record.cfsr & (1UL << 12)) != 0U);
+  fault.add("lsperr", (record.cfsr & (1UL << 13)) != 0U);
+  fault.add("bfarvalid", (record.cfsr & (1UL << 15)) != 0U);
+  fault.add("undefinstr", (record.cfsr & (1UL << 16)) != 0U);
+  fault.add("invstate", (record.cfsr & (1UL << 17)) != 0U);
+  fault.add("invpc", (record.cfsr & (1UL << 18)) != 0U);
+  fault.add("nocp", (record.cfsr & (1UL << 19)) != 0U);
+  fault.add("unaligned", (record.cfsr & (1UL << 24)) != 0U);
+  fault.add("divbyzero", (record.cfsr & (1UL << 25)) != 0U);
+  fault.add("hardware_stacking_fault", hardware_stacking_fault);
+  out.add_object("fault_decode", fault);
+
+  Payload fp;
+  system_crash_add_hex32(fp, "fpccr", record.fpccr);
+  system_crash_add_hex32(fp, "fpcar", record.fpcar);
+  fp.add("fpcar_in_dtcm", system_crash_policy_dtcm_address(record.fpcar));
+  fp.add("fpcar_aligned_8", (record.fpcar & 7U) == 0U);
+  fp.add("fpcar_minus_raw_frame",
+         (int32_t)(record.fpcar - record.raw_frame_address));
+  fp.add("aspen", (record.fpccr & (1UL << 31)) != 0U);
+  fp.add("lspen", (record.fpccr & (1UL << 30)) != 0U);
+  fp.add("monrdy", (record.fpccr & (1UL << 8)) != 0U);
+  fp.add("bfrdy", (record.fpccr & (1UL << 6)) != 0U);
+  fp.add("mmrdy", (record.fpccr & (1UL << 5)) != 0U);
+  fp.add("hfrdy", (record.fpccr & (1UL << 4)) != 0U);
+  fp.add("thread", (record.fpccr & (1UL << 3)) != 0U);
+  fp.add("user", (record.fpccr & (1UL << 1)) != 0U);
+  fp.add("lspact", (record.fpccr & (1UL << 0)) != 0U);
+  fp.add("automatic_eager_policy",
+         (record.fpccr & (1UL << 31)) != 0U &&
+         (record.fpccr & (1UL << 30)) == 0U);
+  fp.add("record_extended_flag", extended_flag);
+  fp.add("record_format_flag_matches_exc_return", format_flag_matches);
+  if (record.has_extended_control) {
+    system_crash_add_hex32(fp, "fpdscr", record.fpdscr);
+    system_crash_add_hex32(fp, "cpacr", record.cpacr);
+    system_crash_add_hex32(fp, "ccr", record.ccr);
+  }
+  out.add_object("floating_point", fp);
+
+  out.add("record_basic_frame_valid_flag",
+          (record.flags & CRASH_FORENSICS_FLAG_BASIC_FRAME_VALID) != 0U);
+  out.add("record_frame_content_plausible_flag",
+          (record.flags & CRASH_FORENSICS_FLAG_FRAME_CONTENT_PLAUSIBLE) != 0U);
+  out.add("record_stacking_fault_flag",
+          (record.flags & CRASH_FORENSICS_FLAG_STACKING_FAULT) != 0U);
+  out.add("computed_frame_content_plausible", frame_content_plausible);
+  out.add("assessment_is_inference", true);
+  out.add("assessment",
+          system_crash_policy_assessment(
+              exc_return_recognized,
+              hardware_stacking_fault,
+              selected_sp_matches,
+              basic_address_matches,
+              interrupted_sp_matches,
+              xpsr_thumb,
+              xpsr_mode_consistent,
+              pc_executable,
+              lr_plausible));
+  return out;
+}
+
+struct system_crash_policy_live_special_t {
+  uint32_t msp;
+  uint32_t psp;
+  uint32_t sp;
+  uint32_t lr;
+  uint32_t control;
+  uint32_t primask;
+  uint32_t basepri;
+  uint32_t faultmask;
+  uint32_t ipsr;
+  uint32_t xpsr;
+};
+
+static inline system_crash_policy_live_special_t
+system_crash_policy_live_special_snapshot(void) {
+  system_crash_policy_live_special_t out{};
+#if defined(__arm__)
+  __asm__ volatile("mrs %0, msp" : "=r"(out.msp));
+  __asm__ volatile("mrs %0, psp" : "=r"(out.psp));
+  __asm__ volatile("mov %0, sp" : "=r"(out.sp));
+  __asm__ volatile("mov %0, lr" : "=r"(out.lr));
+  __asm__ volatile("mrs %0, control" : "=r"(out.control));
+  __asm__ volatile("mrs %0, primask" : "=r"(out.primask));
+  __asm__ volatile("mrs %0, basepri" : "=r"(out.basepri));
+  __asm__ volatile("mrs %0, faultmask" : "=r"(out.faultmask));
+  __asm__ volatile("mrs %0, ipsr" : "=r"(out.ipsr));
+  __asm__ volatile("mrs %0, xpsr" : "=r"(out.xpsr));
+#endif
+  return out;
+}
+
+static FLASHMEM Payload system_crash_policy_live_payload(void) {
+  const system_crash_policy_live_special_t special =
+      system_crash_policy_live_special_snapshot();
+
+  const uint32_t cpuid = system_crash_policy_read32(SYSTEM_SCB_CPUID);
+  const uint32_t actlr = system_crash_policy_read32(SYSTEM_SCS_ACTLR);
+  const uint32_t icsr = system_crash_policy_read32(SYSTEM_SCB_ICSR);
+  const uint32_t vtor = system_crash_policy_read32(SYSTEM_SCB_VTOR);
+  const uint32_t aircr = system_crash_policy_read32(SYSTEM_SCB_AIRCR);
+  const uint32_t scr = system_crash_policy_read32(SYSTEM_SCB_SCR);
+  const uint32_t ccr = system_crash_policy_read32(SYSTEM_SCB_CCR);
+  const uint32_t shcsr = system_crash_policy_read32(SYSTEM_SCB_SHCSR);
+  const uint32_t cfsr = system_crash_policy_read32(SYSTEM_SCB_CFSR);
+  const uint32_t hfsr = system_crash_policy_read32(SYSTEM_SCB_HFSR);
+  const uint32_t dfsr = system_crash_policy_read32(SYSTEM_SCB_DFSR);
+  const uint32_t mmfar = system_crash_policy_read32(SYSTEM_SCB_MMFAR);
+  const uint32_t bfar = system_crash_policy_read32(SYSTEM_SCB_BFAR);
+  const uint32_t afsr = system_crash_policy_read32(SYSTEM_SCB_AFSR);
+  const uint32_t cpacr = system_crash_policy_read32(SYSTEM_SCB_CPACR);
+  const uint32_t fpccr = system_crash_policy_read32(SYSTEM_FPU_FPCCR);
+  const uint32_t fpcar = system_crash_policy_read32(SYSTEM_FPU_FPCAR);
+  const uint32_t fpdscr = system_crash_policy_read32(SYSTEM_FPU_FPDSCR);
+  const uint32_t mvfr0 = system_crash_policy_read32(SYSTEM_FPU_MVFR0);
+  const uint32_t mvfr1 = system_crash_policy_read32(SYSTEM_FPU_MVFR1);
+  const uint32_t dhcsr = system_crash_policy_read32(SYSTEM_DHCSR);
+  const uint32_t demcr = system_crash_policy_read32(SYSTEM_DEMCR);
+  const uint32_t dwt_ctrl = system_crash_policy_read32(SYSTEM_DWT_CTRL);
+
+  Payload out;
+
+  Payload processor;
+  system_crash_add_hex32(processor, "msp", special.msp);
+  system_crash_add_hex32(processor, "psp", special.psp);
+  system_crash_add_hex32(processor, "sp", special.sp);
+  system_crash_add_hex32(processor, "lr", special.lr);
+  system_crash_add_hex32(processor, "control", special.control);
+  system_crash_add_hex32(processor, "primask", special.primask);
+  system_crash_add_hex32(processor, "basepri", special.basepri);
+  system_crash_add_hex32(processor, "faultmask", special.faultmask);
+  system_crash_add_hex32(processor, "ipsr", special.ipsr);
+  system_crash_add_hex32(processor, "xpsr", special.xpsr);
+  processor.add("exception_number", special.ipsr & 0x1FFU);
+  processor.add("thread_mode", (special.ipsr & 0x1FFU) == 0U);
+  processor.add("using_psp", (special.control & (1UL << 1)) != 0U);
+  processor.add("unprivileged", (special.control & 1UL) != 0U);
+  processor.add("fp_context_active", (special.control & (1UL << 2)) != 0U);
+  out.add_object("processor", processor);
+
+  Payload system_control;
+  system_crash_add_hex32(system_control, "cpuid", cpuid);
+  system_crash_add_hex32(system_control, "actlr", actlr);
+  system_crash_add_hex32(system_control, "icsr", icsr);
+  system_crash_add_hex32(system_control, "vtor", vtor);
+  system_crash_add_hex32(system_control, "aircr", aircr);
+  system_crash_add_hex32(system_control, "scr", scr);
+  system_crash_add_hex32(system_control, "ccr", ccr);
+  system_crash_add_hex32(system_control, "shcsr", shcsr);
+  system_crash_add_hex32(system_control, "cfsr", cfsr);
+  system_crash_add_hex32(system_control, "hfsr", hfsr);
+  system_crash_add_hex32(system_control, "dfsr", dfsr);
+  system_crash_add_hex32(system_control, "mmfar", mmfar);
+  system_crash_add_hex32(system_control, "bfar", bfar);
+  system_crash_add_hex32(system_control, "afsr", afsr);
+  system_crash_add_hex32(system_control, "cpacr", cpacr);
+  system_control.add("icsr_vectactive", icsr & 0x1FFU);
+  system_control.add("icsr_rettobase", (icsr & (1UL << 11)) != 0U);
+  system_control.add("icsr_vectpending", (icsr >> 12) & 0x1FFU);
+  system_control.add("icsr_isrpending", (icsr & (1UL << 22)) != 0U);
+  system_control.add("ccr_unalign_trp", (ccr & (1UL << 3)) != 0U);
+  system_control.add("ccr_div_0_trp", (ccr & (1UL << 4)) != 0U);
+  system_control.add("ccr_stkalign", (ccr & (1UL << 9)) != 0U);
+  system_control.add("memfault_enabled", (shcsr & (1UL << 16)) != 0U);
+  system_control.add("busfault_enabled", (shcsr & (1UL << 17)) != 0U);
+  system_control.add("usagefault_enabled", (shcsr & (1UL << 18)) != 0U);
+  system_control.add("cp10_access", (cpacr >> 20) & 3U);
+  system_control.add("cp11_access", (cpacr >> 22) & 3U);
+  system_control.add("fpu_full_access", (cpacr & 0x00F00000UL) == 0x00F00000UL);
+  out.add_object("system_control", system_control);
+
+  Payload fp;
+  system_crash_add_hex32(fp, "fpccr", fpccr);
+  system_crash_add_hex32(fp, "fpcar", fpcar);
+  system_crash_add_hex32(fp, "fpdscr", fpdscr);
+  system_crash_add_hex32(fp, "mvfr0", mvfr0);
+  system_crash_add_hex32(fp, "mvfr1", mvfr1);
+  fp.add("aspen", (fpccr & (1UL << 31)) != 0U);
+  fp.add("lspen", (fpccr & (1UL << 30)) != 0U);
+  fp.add("monrdy", (fpccr & (1UL << 8)) != 0U);
+  fp.add("bfrdy", (fpccr & (1UL << 6)) != 0U);
+  fp.add("mmrdy", (fpccr & (1UL << 5)) != 0U);
+  fp.add("hfrdy", (fpccr & (1UL << 4)) != 0U);
+  fp.add("thread", (fpccr & (1UL << 3)) != 0U);
+  fp.add("user", (fpccr & (1UL << 1)) != 0U);
+  fp.add("lspact", (fpccr & (1UL << 0)) != 0U);
+  fp.add("fpcar_in_dtcm", system_crash_policy_dtcm_address(fpcar));
+  fp.add("fpcar_aligned_8", (fpcar & 7U) == 0U);
+  fp.add("expected_context_mode", "AUTOMATIC_EAGER");
+  fp.add("automatic_eager_policy",
+         (fpccr & (1UL << 31)) != 0U &&
+         (fpccr & (1UL << 30)) == 0U);
+  fp.add("context_policy_ok",
+         (fpccr & (1UL << 31)) != 0U &&
+         (fpccr & (1UL << 30)) == 0U &&
+         (cpacr & 0x00F00000UL) == 0x00F00000UL);
+  out.add_object("floating_point", fp);
+
+  Payload debug;
+  system_crash_add_hex32(debug, "dhcsr", dhcsr);
+  system_crash_add_hex32(debug, "demcr", demcr);
+  system_crash_add_hex32(debug, "dwt_ctrl", dwt_ctrl);
+  debug.add("debug_enabled", (dhcsr & (1UL << 0)) != 0U);
+  debug.add("core_halted", (dhcsr & (1UL << 17)) != 0U);
+  debug.add("register_transfer_ready", (dhcsr & (1UL << 16)) != 0U);
+  debug.add("reset_seen", (dhcsr & (1UL << 25)) != 0U);
+  debug.add("trace_enabled", (demcr & (1UL << 24)) != 0U);
+  debug.add("dwt_cycle_counter_enabled", (dwt_ctrl & 1UL) != 0U);
+  debug.add("stack_watch_debugger_conflict",
+            (dhcsr & (1UL << 0)) != 0U);
+  out.add_object("debug", debug);
+
+  out.add("fault_status_clear_now", cfsr == 0U && hfsr == 0U);
+  return out;
+}
+
+static FLASHMEM Payload system_crash_policy_payload(void) {
+  crash_forensics_status_t status{};
+  crash_forensics_get_status(&status);
+
+  Payload out;
+  out.add("schema", "ZPNET_CRASH_POLICY_V1");
+  out.add("architecture", "ARMV7M_CORTEX_M7");
+  out.add("frame_source_rule", "EXC_RETURN[2]: 0=MSP 1=PSP");
+  out.add("return_mode_rule", "EXC_RETURN[3]: 0=HANDLER 1=THREAD");
+  out.add("frame_format_rule", "EXC_RETURN[4]: 0=EXTENDED_FP 1=BASIC");
+  out.add("extended_frame_words", 18U);
+  out.add("basic_frame_words", 8U);
+  out.add_object("live", system_crash_policy_live_payload());
+
+  Payload retained;
+  retained.add("core_present", status.core_present);
+  retained.add("core_header_valid", status.core_header_valid);
+  retained.add("core_crc_valid", status.core_crc_valid);
+  retained.add("extended_present", status.extended_present);
+  retained.add("extended_header_valid", status.header_valid);
+  retained.add("extended_crc_valid", status.crc_valid);
+
+  const crash_forensics_core_record_t* core =
+      crash_forensics_core_record();
+  if (core) {
+    retained.add_object(
+        "core",
+        system_crash_policy_record_payload(
+            system_crash_policy_core_view(*core)));
+  }
+
+  const crash_forensics_record_t* extended =
+      crash_forensics_record();
+  if (extended) {
+    retained.add_object(
+        "extended",
+        system_crash_policy_record_payload(
+            system_crash_policy_extended_view(*extended)));
+  }
+
+  out.add_object("retained", retained);
+  return out;
+}
+
 static constexpr size_t SYSTEM_CRASH_REPORT_TEXT_MAX = 2048;
 
 // ================================================================
@@ -3818,6 +4406,13 @@ static FLASHMEM Payload cmd_crash_info(const Payload& /*args*/) {
 }
 
 // ------------------------------------------------------------
+// CRASH_POLICY — live exception/FPU policy and retained-frame consistency
+// ------------------------------------------------------------
+static FLASHMEM Payload cmd_crash_policy(const Payload& /*args*/) {
+  return system_crash_policy_payload();
+}
+
+// ------------------------------------------------------------
 // CRASH_CLEAR — explicitly clear cached and core CrashReport state
 // ------------------------------------------------------------
 static FLASHMEM Payload cmd_crash_clear(const Payload& /*args*/) {
@@ -3905,6 +4500,7 @@ static const process_command_entry_t SYSTEM_COMMANDS[] = {
   { "SET_FEATURE",      cmd_set_feature      },
   { "GET_FEATURE",      cmd_get_feature      },
   { "CRASH_INFO",       cmd_crash_info       },
+  { "CRASH_POLICY",     cmd_crash_policy     },
   { "CRASH_CLEAR",      cmd_crash_clear      },
   { "MEMORY_AUDIT_INFO", cmd_memory_audit_info },
   { "TIMEPOP_DISPATCH_INFO", cmd_timepop_dispatch_info },

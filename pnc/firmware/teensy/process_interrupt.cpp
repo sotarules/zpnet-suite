@@ -1494,6 +1494,7 @@ bool interrupt_last_epoch_capture(interrupt_epoch_capture_t* out) {
 
 static pps_edge_dispatch_fn g_pps_edge_dispatch = nullptr;
 static void pps_edge_dispatch_trampoline(timepop_ctx_t*, timepop_diag_t*, void*);
+static bool interrupt_callback_address_executable(uintptr_t bits);
 
 // ============================================================================
 // DWT cycles-per-second compatibility
@@ -2433,7 +2434,8 @@ static bool publish_selected_epoch_from_vclock_cadence(uint32_t cadence_counter3
   g_vclock_ch2_epoch_native_last_reject_reason = VCLOCK_CH2_EPOCH_REJECT_NONE;
   g_vclock_ch2_epoch_native_publish_count++;
 
-  if (g_pps_edge_dispatch) {
+  const pps_edge_dispatch_fn pps_dispatch = g_pps_edge_dispatch;
+  if (interrupt_callback_address_executable((uintptr_t)pps_dispatch)) {
     const timepop_handle_t h =
         timepop_arm_asap(pps_edge_dispatch_trampoline,
                          nullptr,
@@ -5336,11 +5338,10 @@ static int32_t pps_floorline_i32_from_i64(int64_t value) {
 
 // Integer-only Q16 statistics for FloorLine.
 //
-// FloorLine sealing runs from the single priority-16 handoff writer.  Do not
-// let diagnostic mean/stddev calculation execute a VFP
-// instruction and thereby consume lazy foreground FP state.  These helpers
-// preserve the existing population-statistics/Q16 report contract using only
-// integer arithmetic.
+// FloorLine sealing runs from the serialized foreground fact drain.  Keep the
+// calculation integer-only so the numerical contract is unchanged and the
+// priority-16 handoff never inherits lazy floating-point state through a helper.
+// These helpers preserve the existing population-statistics/Q16 report contract.
 static uint32_t lower_env_isqrt_u64(uint64_t value) {
   uint64_t result = 0U;
   uint64_t bit = 1ULL << 62;
@@ -5461,29 +5462,8 @@ struct cadence_regression_result_t {
   uint32_t residual_abs_gt128_count = 0;
 };
 
-// lower_env_seal() has one priority-16 writer.  Keep the eight-value order
-// statistic out of its automatic stack frame: the earlier rich-instrumentation
-// build made this function large enough to become a crash exposure point.
-static int64_t g_lower_env_anchor_scratch_q16[
-    LOWER_ENV_ANCHOR_POPULATION_COUNT] = {};
-
-static void lower_env_anchor_scratch_reset(void) {
-  for (uint32_t i = 0; i < LOWER_ENV_ANCHOR_POPULATION_COUNT; i++) {
-    g_lower_env_anchor_scratch_q16[i] = INT64_MAX;
-  }
-}
-
-static void lower_env_anchor_scratch_consider(int64_t value_q16) {
-  for (uint32_t i = 0; i < LOWER_ENV_ANCHOR_POPULATION_COUNT; i++) {
-    if (value_q16 >= g_lower_env_anchor_scratch_q16[i]) continue;
-    for (uint32_t j = LOWER_ENV_ANCHOR_POPULATION_COUNT - 1U; j > i; j--) {
-      g_lower_env_anchor_scratch_q16[j] =
-          g_lower_env_anchor_scratch_q16[j - 1U];
-    }
-    g_lower_env_anchor_scratch_q16[i] = value_q16;
-    return;
-  }
-}
+// The deferred anchor helper owns its eight-value order statistic locally.
+// FloorLine no longer carries shared anchor scratch across custody boundaries.
 
 static int64_t lower_env_average_i64_nearest(int64_t a, int64_t b) {
   // Fit errors are bounded by the FloorLine sample and slope courts, so a+b
@@ -5576,13 +5556,22 @@ struct lower_env_lane_t {
   uint32_t overflow_reset_count = 0;
 };
 
-// FloorLine has one operational writer: the priority-16 handoff tier.  All
-// three QTimer lanes cross an immutable priority-0 capture boundary before
-// entering the estimator.  Foreground publication/reporting reads a coherent
-// whole-lane snapshot instead of the live writer state.
+// FloorLine has one priority-16 active-window writer and one serialized
+// foreground sealing owner.  seal_pending freezes the bucket window so those
+// custody domains never touch it concurrently.  Foreground reporting reads a
+// coherent whole-lane snapshot instead of the live writer state.
 struct lower_env_lane_store_t {
   volatile uint32_t seq = 0;
   lower_env_lane_t lane{};
+
+  // Priority 16 freezes the completed active window in place.  While pending,
+  // later 1 kHz samples leave the lane untouched; the matching foreground fact
+  // drain seals and clears the window before reopening it to the handoff tier.
+  volatile bool     seal_pending = false;
+  volatile uint32_t seal_observed_dwt = 0;
+  volatile uint32_t seal_target_counter32 = 0;
+  volatile uint16_t seal_target_hw16 = 0;
+  volatile uint16_t seal_observed_hw16 = 0;
 };
 
 struct lower_env_consumer_state_t {
@@ -5920,10 +5909,15 @@ static void lower_env_reset_lane(interrupt_subscriber_kind_t kind) {
   lower_env_consumer_state_t* const consumer = lower_env_consumer_for(kind);
   if (!store || !consumer) return;
 
-  // Runtime reset is a serialized control-plane mutation.  Priority 0 no
-  // longer touches FloorLine, and BASEPRI excludes its priority-16 writer.
+  // Runtime reset is a serialized control-plane mutation.  Priority 0 never
+  // touches FloorLine, and BASEPRI excludes its priority-16 window writer.
   const uint32_t prior_basepri = interrupt_priority0_guard_enter();
   const char* const name = store->lane.name;
+  store->seal_pending = false;
+  store->seal_observed_dwt = 0;
+  store->seal_target_counter32 = 0;
+  store->seal_target_hw16 = 0;
+  store->seal_observed_hw16 = 0;
   lower_env_write_begin(*store);
   store->lane = lower_env_lane_t{};
   store->lane.kind = kind;
@@ -5940,16 +5934,31 @@ static void lower_env_reset_all(void) {
   g_interrupt_feature_floorline_latched_nominal = false;
 
   g_lower_env_vclock_store.seq = 0;
+  g_lower_env_vclock_store.seal_pending = false;
+  g_lower_env_vclock_store.seal_observed_dwt = 0;
+  g_lower_env_vclock_store.seal_target_counter32 = 0;
+  g_lower_env_vclock_store.seal_target_hw16 = 0;
+  g_lower_env_vclock_store.seal_observed_hw16 = 0;
   g_lower_env_vclock_store.lane = lower_env_lane_t{};
   g_lower_env_vclock_store.lane.kind = interrupt_subscriber_kind_t::VCLOCK;
   g_lower_env_vclock_store.lane.name = "vclock";
 
   g_lower_env_ocxo1_store.seq = 0;
+  g_lower_env_ocxo1_store.seal_pending = false;
+  g_lower_env_ocxo1_store.seal_observed_dwt = 0;
+  g_lower_env_ocxo1_store.seal_target_counter32 = 0;
+  g_lower_env_ocxo1_store.seal_target_hw16 = 0;
+  g_lower_env_ocxo1_store.seal_observed_hw16 = 0;
   g_lower_env_ocxo1_store.lane = lower_env_lane_t{};
   g_lower_env_ocxo1_store.lane.kind = interrupt_subscriber_kind_t::OCXO1;
   g_lower_env_ocxo1_store.lane.name = "ocxo1";
 
   g_lower_env_ocxo2_store.seq = 0;
+  g_lower_env_ocxo2_store.seal_pending = false;
+  g_lower_env_ocxo2_store.seal_observed_dwt = 0;
+  g_lower_env_ocxo2_store.seal_target_counter32 = 0;
+  g_lower_env_ocxo2_store.seal_target_hw16 = 0;
+  g_lower_env_ocxo2_store.seal_observed_hw16 = 0;
   g_lower_env_ocxo2_store.lane = lower_env_lane_t{};
   g_lower_env_ocxo2_store.lane.kind = interrupt_subscriber_kind_t::OCXO2;
   g_lower_env_ocxo2_store.lane.name = "ocxo2";
@@ -6269,12 +6278,291 @@ static __attribute__((noinline)) void lower_env_publish_invalid_window(
   lower_env_clear_active(lane);
 }
 
-static __attribute__((noinline)) void lower_env_seal(
+struct lower_env_fit_model_t {
+  int64_t prior_slope_q16 = 0;
+  int64_t slope_delta_q16 = 0;
+  int64_t residual_intercept_q16 = 0;
+  int64_t full_slope_q16 = 0;
+};
+
+struct lower_env_anchor_result_t {
+  uint32_t population_count = 0;
+  int64_t single_min_q16 = 0;
+  int64_t second_q16 = 0;
+  int64_t selected_q16 = 0;
+};
+
+struct lower_env_fit_error_stats_t {
+  int64_t residual_sum_q16 = 0;
+  uint64_t residual_sq_sum_q16 = 0;
+  int32_t min_residual_cycles = INT32_MAX;
+  int32_t max_residual_cycles = INT32_MIN;
+  uint32_t gt_plus4 = 0;
+  uint32_t lt_minus4 = 0;
+  uint32_t abs_gt4 = 0;
+};
+
+// Fit lower-envelope residuals against the prior-second line, not absolute
+// DWT deltas: observed = prior_line(x) + residual_line(x).  The complete slope
+// is therefore prior_slope plus the fitted residual slope delta.
+static __attribute__((noinline)) bool lower_env_fit_selected_buckets(
+    const lower_env_lane_t& lane,
+    uint32_t n,
+    int64_t prior_slope_q16,
+    lower_env_fit_model_t& out) {
+  int64_t sum_x = 0;
+  int64_t sum_y = 0;
+  int64_t sum_xx = 0;
+  int64_t sum_xy = 0;
+  for (uint32_t i = 0; i < LOWER_ENV_BUCKET_COUNT; i++) {
+    const lower_env_bucket_t& b = lane.buckets[i];
+    if (!b.valid) continue;
+    const int64_t x = (int64_t)b.x;
+    const int64_t y = (int64_t)b.residual_cycles;
+    sum_x += x;
+    sum_y += y;
+    sum_xx += x * x;
+    sum_xy += x * y;
+  }
+
+  const int64_t denom = (int64_t)n * sum_xx - sum_x * sum_x;
+  if (denom == 0) return false;
+
+  const int64_t slope_delta_num =
+      ((int64_t)n * sum_xy - sum_x * sum_y) << 16;
+  out.prior_slope_q16 = prior_slope_q16;
+  out.slope_delta_q16 = slope_delta_num / denom;
+  out.residual_intercept_q16 = (((int64_t)sum_y << 16) -
+                                out.slope_delta_q16 * sum_x) /
+                               (int64_t)n;
+  out.full_slope_q16 = out.prior_slope_q16 + out.slope_delta_q16;
+  return true;
+}
+
+static __attribute__((noinline)) bool lower_env_select_anchor(
+    const lower_env_lane_t& lane,
+    const lower_env_fit_model_t& fit,
+    lower_env_anchor_result_t& out) {
+  int64_t lowest[LOWER_ENV_ANCHOR_POPULATION_COUNT]{};
+  uint32_t count = 0;
+
+  for (uint32_t i = 0; i < LOWER_ENV_BUCKET_COUNT; i++) {
+    const lower_env_bucket_t& b = lane.buckets[i];
+    if (!b.valid) continue;
+
+    const int64_t observed_residual_q16 =
+        (int64_t)b.residual_cycles << 16;
+    const int64_t fit_residual_q16 =
+        fit.residual_intercept_q16 +
+        fit.slope_delta_q16 * (int64_t)b.x;
+    const int64_t fit_error_q16 =
+        observed_residual_q16 - fit_residual_q16;
+
+    if (count < LOWER_ENV_ANCHOR_POPULATION_COUNT) {
+      lowest[count++] = fit_error_q16;
+      continue;
+    }
+
+    uint32_t largest_index = 0;
+    for (uint32_t j = 1; j < LOWER_ENV_ANCHOR_POPULATION_COUNT; j++) {
+      if (lowest[j] > lowest[largest_index]) largest_index = j;
+    }
+    if (fit_error_q16 < lowest[largest_index]) {
+      lowest[largest_index] = fit_error_q16;
+    }
+  }
+
+  if (count < LOWER_ENV_ANCHOR_POPULATION_COUNT) return false;
+
+  // Eight elements are deliberately sorted with scalar assignments.  The old
+  // insertion shift encouraged a memmove inside the already-large seal frame.
+  for (uint32_t i = 1; i < LOWER_ENV_ANCHOR_POPULATION_COUNT; i++) {
+    const int64_t value = lowest[i];
+    uint32_t j = i;
+    while (j > 0U && value < lowest[j - 1U]) {
+      lowest[j] = lowest[j - 1U];
+      j--;
+    }
+    lowest[j] = value;
+  }
+
+  out.population_count = count;
+  out.single_min_q16 = lowest[0];
+  out.second_q16 = lowest[1];
+  out.selected_q16 = lower_env_average_i64_nearest(lowest[3], lowest[4]);
+  return true;
+}
+
+static __attribute__((noinline)) void lower_env_measure_fit_errors(
+    const lower_env_lane_t& lane,
+    const lower_env_fit_model_t& fit,
+    lower_env_fit_error_stats_t& out) {
+  out = lower_env_fit_error_stats_t{};
+
+  for (uint32_t i = 0; i < LOWER_ENV_BUCKET_COUNT; i++) {
+    const lower_env_bucket_t& b = lane.buckets[i];
+    if (!b.valid) continue;
+
+    const int64_t observed_residual_q16 =
+        (int64_t)b.residual_cycles << 16;
+    const int64_t fit_residual_q16 =
+        fit.residual_intercept_q16 +
+        fit.slope_delta_q16 * (int64_t)b.x;
+    const int64_t fit_error_q16 =
+        observed_residual_q16 - fit_residual_q16;
+
+    out.residual_sum_q16 += fit_error_q16;
+    const int64_t abs_q16 =
+        fit_error_q16 >= 0 ? fit_error_q16 : -fit_error_q16;
+    out.residual_sq_sum_q16 +=
+        (uint64_t)((abs_q16 * abs_q16) >> 16);
+
+    const int32_t residual_cycles = (int32_t)(fit_error_q16 >> 16);
+    if (residual_cycles < out.min_residual_cycles) {
+      out.min_residual_cycles = residual_cycles;
+    }
+    if (residual_cycles > out.max_residual_cycles) {
+      out.max_residual_cycles = residual_cycles;
+    }
+    if (residual_cycles > (int32_t)LOWER_ENV_ERROR_GATE_CYCLES) {
+      out.gt_plus4++;
+    }
+    if (residual_cycles < -(int32_t)LOWER_ENV_ERROR_GATE_CYCLES) {
+      out.lt_minus4++;
+    }
+    if (residual_cycles > (int32_t)LOWER_ENV_ERROR_GATE_CYCLES ||
+        residual_cycles < -(int32_t)LOWER_ENV_ERROR_GATE_CYCLES) {
+      out.abs_gt4++;
+    }
+  }
+}
+
+static __attribute__((noinline)) void lower_env_finalize_sealed_window(
     lower_env_lane_t& lane,
-                           uint32_t observed_dwt,
-                           uint32_t target_counter32,
-                           uint16_t target_hw16,
-                           uint16_t observed_hw16) {
+    uint32_t n,
+    const lower_env_fit_model_t& fit,
+    const lower_env_anchor_result_t& anchor,
+    const lower_env_fit_error_stats_t& stats,
+    uint32_t observed_dwt,
+    uint32_t target_counter32,
+    uint16_t target_hw16,
+    uint16_t observed_hw16) {
+  const uint32_t edge_x = lane.active_sample_count - 1U;
+  const int64_t prior_edge_delta_q16 =
+      fit.prior_slope_q16 * (int64_t)edge_x;
+  const int64_t residual_edge_delta_q16 =
+      fit.residual_intercept_q16 +
+      fit.slope_delta_q16 * (int64_t)edge_x;
+  const int64_t inferred_delta_q16 =
+      prior_edge_delta_q16 + residual_edge_delta_q16;
+  uint32_t inferred_edge_dwt =
+      lane.active_base_dwt + lower_env_round_q16_u32(inferred_delta_q16);
+  int32_t inferred_minus_observed =
+      lower_env_signed_delta_u32(observed_dwt, inferred_edge_dwt);
+  if (inferred_minus_observed > 0) {
+    // One-sided latency law: the inferred least-late edge must not be later
+    // than the actual observed edge.
+    inferred_edge_dwt = observed_dwt;
+    inferred_minus_observed = 0;
+  }
+
+  cadence_regression_result_t r{};
+  r.valid = true;
+  r.candidate_present = true;
+  r.sequence = ++lane.update_count;
+  r.sample_count = lane.active_sample_count;
+  r.sample_accepted_count = lane.active_sample_accepted_count;
+  r.sample_rejected_count = lane.active_sample_rejected_count;
+  r.sample_hard_rejected_count = lane.active_sample_hard_rejected_count;
+  r.selected_bucket_count = n;
+  r.observed_dwt_at_event = observed_dwt;
+  r.inferred_dwt_at_event = inferred_edge_dwt;
+  r.inferred_minus_observed_cycles = inferred_minus_observed;
+  r.target_counter32_at_event = target_counter32;
+  r.target_hardware16_at_event = target_hw16;
+  r.observed_hardware16_at_event = observed_hw16;
+  r.slope_q16_cycles_per_sample = (uint64_t)fit.full_slope_q16;
+  r.slope_delta_q16_cycles_per_sample = fit.slope_delta_q16;
+  r.fit_error_mean_q16_cycles =
+      (int32_t)(stats.residual_sum_q16 / (int64_t)n);
+  r.fit_error_stddev_q16_cycles = lower_env_isqrt_u64(
+      lower_env_ratio_q16(stats.residual_sq_sum_q16, n));
+  r.fit_error_min_cycles =
+      (stats.min_residual_cycles == INT32_MAX)
+          ? 0
+          : stats.min_residual_cycles;
+  r.fit_error_max_cycles =
+      (stats.max_residual_cycles == INT32_MIN)
+          ? 0
+          : stats.max_residual_cycles;
+  r.fit_error_gt_plus4_count = stats.gt_plus4;
+  r.fit_error_lt_minus4_count = stats.lt_minus4;
+  r.fit_error_abs_gt4_count = stats.abs_gt4;
+  r.anchor_policy_id = FLOORLINE_ANCHOR_POLICY_MEDIAN8;
+  r.anchor_population_count = anchor.population_count;
+  r.anchor_single_min_q16_cycles =
+      lower_env_i32_from_i64(anchor.single_min_q16);
+  r.anchor_second_q16_cycles = lower_env_i32_from_i64(anchor.second_q16);
+  r.anchor_selected_q16_cycles = lower_env_i32_from_i64(anchor.selected_q16);
+  r.anchor_selected_minus_single_min_q16_cycles = lower_env_i32_from_i64(
+      anchor.selected_q16 - anchor.single_min_q16);
+
+  r.observed_interval_valid = lane.previous_observed_edge_valid;
+  r.observed_interval_cycles = r.observed_interval_valid
+      ? (observed_dwt - lane.previous_observed_edge_dwt)
+      : 0U;
+  r.inferred_interval_valid = lane.previous_inferred_edge_valid;
+  r.inferred_interval_cycles = r.inferred_interval_valid
+      ? (inferred_edge_dwt - lane.previous_inferred_edge_dwt)
+      : 0U;
+  if (r.observed_interval_valid && r.inferred_interval_valid) {
+    r.inferred_minus_observed_interval_cycles =
+        (r.inferred_interval_cycles >= r.observed_interval_cycles)
+            ? (int32_t)(r.inferred_interval_cycles -
+                        r.observed_interval_cycles)
+            : -(int32_t)(r.observed_interval_cycles -
+                         r.inferred_interval_cycles);
+  }
+
+  r.gate_cycles = LOWER_ENV_ERROR_GATE_CYCLES;
+  r.sample_hard_reject_gate_cycles = LOWER_ENV_SAMPLE_HARD_REJECT_CYCLES;
+  r.bucket_required_count = LOWER_ENV_PUBLISH_MIN_BUCKETS;
+  r.sample_required_count = LOWER_ENV_PUBLISH_MIN_SAMPLES;
+  lower_env_copy_residual_forensics(r, lane);
+  lower_env_decide_publication(r);
+  lower_env_note_raw_bookend_anomaly(
+      lane, r, LOWER_ENV_RAW_BOOKEND_SOURCE_SEALED_WINDOW);
+
+  lane.previous_observed_edge_dwt = observed_dwt;
+  lane.previous_observed_edge_valid = true;
+  lane.previous_observed_edge_target_counter32 = target_counter32;
+  lane.previous_observed_edge_target_hw16 = target_hw16;
+  lane.previous_observed_edge_observed_hw16 = observed_hw16;
+  lane.previous_inferred_edge_dwt =
+      r.publish_floorline ? inferred_edge_dwt : observed_dwt;
+  lane.previous_inferred_edge_valid = true;
+  lane.previous_slope_q16_cycles_per_sample = r.publish_floorline
+      ? (uint64_t)fit.full_slope_q16
+      : (r.observed_interval_valid
+            ? lower_env_slope_from_observed_interval_q16(
+                  r.observed_interval_cycles)
+            : lower_env_default_slope_q16());
+  lane.previous_slope_valid = true;
+  lane.last = r;
+  if (r.publish_floorline) {
+    lower_env_note_valid_estimate(lane);
+  } else {
+    lower_env_note_fallback(lane);
+  }
+  lower_env_clear_active(lane);
+}
+
+static __attribute__((noinline)) void lower_env_seal_deferred(
+    lower_env_lane_t& lane,
+    uint32_t observed_dwt,
+    uint32_t target_counter32,
+    uint16_t target_hw16,
+    uint16_t observed_hw16) {
   const uint32_t n = lane.active_bucket_count;
   const bool structurally_valid =
       lane.active_valid &&
@@ -6299,245 +6587,75 @@ static __attribute__((noinline)) void lower_env_seal(
     return;
   }
 
-  // Fit the LOWER-ENVELOPE RESIDUALS against the prior-second line, not the
-  // absolute DWT deltas.  The previous first pass accidentally treated the
-  // selected residual surface as a fresh absolute line, which made the reported
-  // slope collapse to the residual slope class (~hundreds of MHz) and pushed
-  // inferred edges hundreds of millions of cycles below the observed edge.  The
-  // real model is:
-  //
-  //   observed = prior_line(x) + residual_line(x), residual >= true_lateness
-  //
-  // so the full inferred slope is prior_slope + residual_slope_delta.
-  int64_t sum_x = 0;
-  int64_t sum_y = 0;
-  int64_t sum_xx = 0;
-  int64_t sum_xy = 0;
-  for (uint32_t i = 0; i < LOWER_ENV_BUCKET_COUNT; i++) {
-    const lower_env_bucket_t& b = lane.buckets[i];
-    if (!b.valid) continue;
-    const int64_t x = (int64_t)b.x;
-    const int64_t y = (int64_t)b.residual_cycles;
-    sum_x += x;
-    sum_y += y;
-    sum_xx += x * x;
-    sum_xy += x * y;
-  }
-
-  const int64_t denom = (int64_t)n * sum_xx - sum_x * sum_x;
-  if (denom == 0) {
+  lower_env_fit_model_t fit{};
+  if (!lower_env_fit_selected_buckets(lane, n, prior_slope_q16, fit)) {
     lower_env_publish_invalid_window(lane, observed_dwt, target_counter32,
                                      target_hw16, observed_hw16);
     return;
   }
 
-  const int64_t slope_delta_num = ((int64_t)n * sum_xy - sum_x * sum_y) << 16;
-  const int64_t slope_delta_q16 = slope_delta_num / denom;
-  int64_t residual_intercept_q16 = (((int64_t)sum_y << 16) -
-                                    slope_delta_q16 * sum_x) /
-                                   (int64_t)n;
-  const int64_t full_slope_q16 = prior_slope_q16 + slope_delta_q16;
-  if (full_slope_q16 <= 0) {
-    lower_env_watchdog_anomaly(lane,
-                               FLOORLINE_REASON_SLOPE_ANOMALY,
-                               (uint32_t)n,
-                               (uint32_t)(prior_slope_q16 & 0xFFFFFFFFULL),
-                               0U);
+  if (fit.full_slope_q16 <= 0) {
+    lower_env_watchdog_anomaly(
+        lane,
+        FLOORLINE_REASON_SLOPE_ANOMALY,
+        n,
+        (uint32_t)(prior_slope_q16 & 0xFFFFFFFFULL),
+        0U);
     lower_env_publish_invalid_window(lane, observed_dwt, target_counter32,
                                      target_hw16, observed_hw16);
     return;
   }
 
-  const int64_t default_slope_q16 = (int64_t)lower_env_default_slope_q16();
+  const int64_t default_slope_q16 =
+      (int64_t)lower_env_default_slope_q16();
   if (default_slope_q16 > 0 &&
-      (full_slope_q16 < (default_slope_q16 *
-                         (int64_t)LOWER_ENV_WATCHDOG_SLOPE_NUMERATOR) /
-                            (int64_t)LOWER_ENV_WATCHDOG_SLOPE_DENOMINATOR ||
-       full_slope_q16 > default_slope_q16 *
-                            (int64_t)LOWER_ENV_WATCHDOG_SLOPE_MULTIPLIER)) {
-    lower_env_watchdog_anomaly(lane,
-                               FLOORLINE_REASON_SLOPE_ANOMALY,
-                               (uint32_t)n,
-                               (uint32_t)(full_slope_q16 & 0xFFFFFFFFULL),
-                               (uint32_t)(default_slope_q16 & 0xFFFFFFFFULL));
+      (fit.full_slope_q16 <
+           (default_slope_q16 *
+            (int64_t)LOWER_ENV_WATCHDOG_SLOPE_NUMERATOR) /
+               (int64_t)LOWER_ENV_WATCHDOG_SLOPE_DENOMINATOR ||
+       fit.full_slope_q16 >
+           default_slope_q16 *
+               (int64_t)LOWER_ENV_WATCHDOG_SLOPE_MULTIPLIER)) {
+    lower_env_watchdog_anomaly(
+        lane,
+        FLOORLINE_REASON_SLOPE_ANOMALY,
+        n,
+        (uint32_t)(fit.full_slope_q16 & 0xFFFFFFFFULL),
+        (uint32_t)(default_slope_q16 & 0xFFFFFFFFULL));
     lower_env_publish_invalid_window(lane, observed_dwt, target_counter32,
                                      target_hw16, observed_hw16);
     return;
   }
 
-  int64_t residual_sum_q16 = 0;
-  uint64_t residual_sq_sum_q16 = 0;
-  int32_t min_residual_cycles = INT32_MAX;
-  int32_t max_residual_cycles = INT32_MIN;
-  uint32_t gt_plus4 = 0;
-  uint32_t lt_minus4 = 0;
-  uint32_t abs_gt4 = 0;
-  int64_t anchor_single_min_q16 = 0;
-  int64_t anchor_second_q16 = 0;
-  int64_t anchor_selected_q16 = 0;
-  uint32_t anchor_population_count = 0;
-
-  for (uint32_t pass = 0; pass < 2; pass++) {
-    residual_sum_q16 = 0;
-    residual_sq_sum_q16 = 0;
-    min_residual_cycles = INT32_MAX;
-    max_residual_cycles = INT32_MIN;
-    gt_plus4 = lt_minus4 = abs_gt4 = 0;
-    if (pass == 0) lower_env_anchor_scratch_reset();
-
-    for (uint32_t i = 0; i < LOWER_ENV_BUCKET_COUNT; i++) {
-      const lower_env_bucket_t& b = lane.buckets[i];
-      if (!b.valid) continue;
-      const int64_t observed_residual_q16 =
-          (int64_t)b.residual_cycles << 16;
-      const int64_t fit_residual_q16 =
-          residual_intercept_q16 + slope_delta_q16 * (int64_t)b.x;
-      const int64_t fit_error_q16 = observed_residual_q16 - fit_residual_q16;
-      if (pass == 0) {
-        lower_env_anchor_scratch_consider(fit_error_q16);
-      } else {
-        residual_sum_q16 += fit_error_q16;
-        const int64_t abs_q16 = fit_error_q16 >= 0 ? fit_error_q16 : -fit_error_q16;
-        residual_sq_sum_q16 += (uint64_t)((abs_q16 * abs_q16) >> 16);
-        const int32_t residual_cycles = (int32_t)(fit_error_q16 >> 16);
-        if (residual_cycles < min_residual_cycles) min_residual_cycles = residual_cycles;
-        if (residual_cycles > max_residual_cycles) max_residual_cycles = residual_cycles;
-        if (residual_cycles > (int32_t)LOWER_ENV_ERROR_GATE_CYCLES) gt_plus4++;
-        if (residual_cycles < -(int32_t)LOWER_ENV_ERROR_GATE_CYCLES) lt_minus4++;
-        if (residual_cycles > (int32_t)LOWER_ENV_ERROR_GATE_CYCLES ||
-            residual_cycles < -(int32_t)LOWER_ENV_ERROR_GATE_CYCLES) {
-          abs_gt4++;
-        }
-      }
-    }
-
-    if (pass == 0) {
-      while (anchor_population_count < LOWER_ENV_ANCHOR_POPULATION_COUNT &&
-             g_lower_env_anchor_scratch_q16[anchor_population_count] !=
-                 INT64_MAX) {
-        anchor_population_count++;
-      }
-      if (anchor_population_count < LOWER_ENV_ANCHOR_POPULATION_COUNT) {
-        lower_env_publish_invalid_window(lane, observed_dwt, target_counter32,
-                                         target_hw16, observed_hw16);
-        return;
-      }
-
-      anchor_single_min_q16 = g_lower_env_anchor_scratch_q16[0];
-      anchor_second_q16 = g_lower_env_anchor_scratch_q16[1];
-      anchor_selected_q16 = lower_env_average_i64_nearest(
-          g_lower_env_anchor_scratch_q16[3],
-          g_lower_env_anchor_scratch_q16[4]);
-
-      // Robust lower-envelope anchor: the bucket minima already select the low
-      // population.  Anchor the regression to the center of its lowest eight
-      // members rather than allowing one isolated e0 to move the whole line.
-      residual_intercept_q16 += anchor_selected_q16;
-    }
+  lower_env_anchor_result_t anchor{};
+  if (!lower_env_select_anchor(lane, fit, anchor)) {
+    lower_env_publish_invalid_window(lane, observed_dwt, target_counter32,
+                                     target_hw16, observed_hw16);
+    return;
   }
 
-  const uint32_t edge_x = lane.active_sample_count - 1U;
-  const int64_t prior_edge_delta_q16 = prior_slope_q16 * (int64_t)edge_x;
-  const int64_t residual_edge_delta_q16 =
-      residual_intercept_q16 + slope_delta_q16 * (int64_t)edge_x;
-  const int64_t inferred_delta_q16 = prior_edge_delta_q16 + residual_edge_delta_q16;
-  uint32_t inferred_edge_dwt =
-      lane.active_base_dwt + lower_env_round_q16_u32(inferred_delta_q16);
-  int32_t inferred_minus_observed =
-      lower_env_signed_delta_u32(observed_dwt, inferred_edge_dwt);
-  if (inferred_minus_observed > 0) {
-    // One-sided latency law: the inferred least-late edge must not be later
-    // than the actual observed edge.  Clamp report-only output rather than
-    // publishing a fantasy early/negative-latency result.
-    inferred_edge_dwt = observed_dwt;
-    inferred_minus_observed = 0;
-  }
+  // Robust lower-envelope anchor: the bucket minima already select the low
+  // population.  Anchor the regression to the center of its lowest eight.
+  fit.residual_intercept_q16 += anchor.selected_q16;
 
-  cadence_regression_result_t r{};
-  r.valid = true;
-  r.candidate_present = true;
-  r.sequence = ++lane.update_count;
-  r.sample_count = lane.active_sample_count;
-  r.sample_accepted_count = lane.active_sample_accepted_count;
-  r.sample_rejected_count = lane.active_sample_rejected_count;
-  r.sample_hard_rejected_count = lane.active_sample_hard_rejected_count;
-  r.selected_bucket_count = n;
-  r.observed_dwt_at_event = observed_dwt;
-  r.inferred_dwt_at_event = inferred_edge_dwt;
-  r.inferred_minus_observed_cycles = inferred_minus_observed;
-  r.target_counter32_at_event = target_counter32;
-  r.target_hardware16_at_event = target_hw16;
-  r.observed_hardware16_at_event = observed_hw16;
-  r.slope_q16_cycles_per_sample = (uint64_t)full_slope_q16;
-  r.slope_delta_q16_cycles_per_sample = slope_delta_q16;
-  r.fit_error_mean_q16_cycles = (int32_t)(residual_sum_q16 / (int64_t)n);
-  r.fit_error_stddev_q16_cycles = lower_env_isqrt_u64(
-      lower_env_ratio_q16(residual_sq_sum_q16, n));
-  r.fit_error_min_cycles = (min_residual_cycles == INT32_MAX) ? 0 : min_residual_cycles;
-  r.fit_error_max_cycles = (max_residual_cycles == INT32_MIN) ? 0 : max_residual_cycles;
-  r.fit_error_gt_plus4_count = gt_plus4;
-  r.fit_error_lt_minus4_count = lt_minus4;
-  r.fit_error_abs_gt4_count = abs_gt4;
-  r.anchor_policy_id = FLOORLINE_ANCHOR_POLICY_MEDIAN8;
-  r.anchor_population_count = anchor_population_count;
-  r.anchor_single_min_q16_cycles =
-      lower_env_i32_from_i64(anchor_single_min_q16);
-  r.anchor_second_q16_cycles = lower_env_i32_from_i64(anchor_second_q16);
-  r.anchor_selected_q16_cycles =
-      lower_env_i32_from_i64(anchor_selected_q16);
-  r.anchor_selected_minus_single_min_q16_cycles = lower_env_i32_from_i64(
-      anchor_selected_q16 - anchor_single_min_q16);
-
-  r.observed_interval_valid = lane.previous_observed_edge_valid;
-  r.observed_interval_cycles = r.observed_interval_valid
-      ? (observed_dwt - lane.previous_observed_edge_dwt)
-      : 0U;
-  r.inferred_interval_valid = lane.previous_inferred_edge_valid;
-  r.inferred_interval_cycles = r.inferred_interval_valid
-      ? (inferred_edge_dwt - lane.previous_inferred_edge_dwt)
-      : 0U;
-  if (r.observed_interval_valid && r.inferred_interval_valid) {
-    r.inferred_minus_observed_interval_cycles =
-        (r.inferred_interval_cycles >= r.observed_interval_cycles)
-            ? (int32_t)(r.inferred_interval_cycles - r.observed_interval_cycles)
-            : -(int32_t)(r.observed_interval_cycles - r.inferred_interval_cycles);
-  }
-
-  r.gate_cycles = LOWER_ENV_ERROR_GATE_CYCLES;
-  r.sample_hard_reject_gate_cycles = LOWER_ENV_SAMPLE_HARD_REJECT_CYCLES;
-  r.bucket_required_count = LOWER_ENV_PUBLISH_MIN_BUCKETS;
-  r.sample_required_count = LOWER_ENV_PUBLISH_MIN_SAMPLES;
-  lower_env_copy_residual_forensics(r, lane);
-  lower_env_decide_publication(r);
-  lower_env_note_raw_bookend_anomaly(
-      lane, r, LOWER_ENV_RAW_BOOKEND_SOURCE_SEALED_WINDOW);
-
-  lane.previous_observed_edge_dwt = observed_dwt;
-  lane.previous_observed_edge_valid = true;
-  lane.previous_observed_edge_target_counter32 = target_counter32;
-  lane.previous_observed_edge_target_hw16 = target_hw16;
-  lane.previous_observed_edge_observed_hw16 = observed_hw16;
-  lane.previous_inferred_edge_dwt =
-      r.publish_floorline ? inferred_edge_dwt : observed_dwt;
-  lane.previous_inferred_edge_valid = true;
-  lane.previous_slope_q16_cycles_per_sample = r.publish_floorline
-      ? (uint64_t)full_slope_q16
-      : (r.observed_interval_valid
-            ? lower_env_slope_from_observed_interval_q16(r.observed_interval_cycles)
-            : lower_env_default_slope_q16());
-  lane.previous_slope_valid = true;
-  lane.last = r;
-  if (r.publish_floorline) {
-    lower_env_note_valid_estimate(lane);
-  } else {
-    lower_env_note_fallback(lane);
-  }
-  lower_env_clear_active(lane);
+  lower_env_fit_error_stats_t stats{};
+  lower_env_measure_fit_errors(lane, fit, stats);
+  lower_env_finalize_sealed_window(lane,
+                                   n,
+                                   fit,
+                                   anchor,
+                                   stats,
+                                   observed_dwt,
+                                   target_counter32,
+                                   target_hw16,
+                                   observed_hw16);
 }
 
 // All three measured lanes enter this function only from the priority-16
 // handoff tier.  Priority 0 captures immutable edge facts and never performs
-// FloorLine arithmetic or mutates FloorLine state.
+// FloorLine arithmetic or mutates FloorLine state.  The one-second bookend
+// freezes the active window; rich sealing is completed by the matching
+// foreground perishable-fact drain.
 static __attribute__((noinline)) void floorline_observe_handoff(
     interrupt_subscriber_kind_t kind,
     uint32_t observed_dwt,
@@ -6547,8 +6665,15 @@ static __attribute__((noinline)) void floorline_observe_handoff(
     bool closes_second) {
   lower_env_lane_store_t* const store = lower_env_store_for(kind);
   if (!store) return;
-  lower_env_lane_t& lane = store->lane;
 
+  // The foreground seal owns the frozen lane until it clears seal_pending.
+  // Priority 16 deliberately drops any intervening 1 kHz samples instead of
+  // touching the bucket array while lower-priority code is reading it.
+  if (store->seal_pending) {
+    return;
+  }
+
+  lower_env_lane_t& lane = store->lane;
   lower_env_write_begin(*store);
 
   if (lane.active_sample_count >= LOWER_ENV_SAMPLE_RATE_HZ) {
@@ -6569,15 +6694,14 @@ static __attribute__((noinline)) void floorline_observe_handoff(
   const uint32_t predicted_dwt =
       lane.active_base_dwt +
       lower_env_round_q16_u32((int64_t)slope_q16 * (int64_t)x);
-  const int32_t residual = lower_env_signed_delta_u32(predicted_dwt, observed_dwt);
+  const int32_t residual =
+      lower_env_signed_delta_u32(predicted_dwt, observed_dwt);
   const uint32_t abs_residual = lower_env_abs_i32(residual);
   lower_env_note_residual(lane, residual);
 
-  // FloorLine V2 treats the 4-cycle band as quality evidence.  Samples beyond
-  // that band are still useful for the robust lower-envelope population.  Only
-  // gross residuals are excluded from the fit, and even that only affects the
-  // current candidate: publication will fall back to observed rather than
-  // withdrawing the FLOORLINE rail.
+  // The 4-cycle band is quality evidence, not a sample veto.  Only gross
+  // residuals are excluded from the bucket fit; a failed seal still falls back
+  // to the observed edge in foreground.
   if (abs_residual > LOWER_ENV_SAMPLE_HARD_REJECT_CYCLES) {
     lane.active_sample_rejected_count++;
     lane.active_sample_hard_rejected_count++;
@@ -6591,9 +6715,7 @@ static __attribute__((noinline)) void floorline_observe_handoff(
     }
 
     lower_env_bucket_t& b = lane.buckets[bucket_index];
-    if (!b.valid) {
-      lane.active_bucket_count++;
-    }
+    if (!b.valid) lane.active_bucket_count++;
     if (!b.valid || residual < b.residual_cycles) {
       b.valid = true;
       b.x = (uint16_t)x;
@@ -6606,19 +6728,85 @@ static __attribute__((noinline)) void floorline_observe_handoff(
   }
 
   if (closes_second) {
-    lower_env_seal(lane, observed_dwt, target_counter32,
-                   target_hw16, observed_hw16);
+    store->seal_observed_dwt = observed_dwt;
+    store->seal_target_counter32 = target_counter32;
+    store->seal_target_hw16 = target_hw16;
+    store->seal_observed_hw16 = observed_hw16;
+    dmb_barrier();
+    store->seal_pending = true;
   }
 
   lower_env_write_end(*store);
-  if (closes_second) {
-    interrupt_feature_update_floorline();
+}
+
+static __attribute__((noinline)) bool lower_env_finish_deferred_seal(
+    interrupt_subscriber_kind_t kind,
+    uint32_t through_target_counter32) {
+  lower_env_lane_store_t* const store = lower_env_store_for(kind);
+  if (!store) return false;
+
+  uint32_t prior_basepri = interrupt_priority0_guard_enter();
+  if (!store->seal_pending) {
+    interrupt_priority0_guard_exit(prior_basepri);
+    return false;
   }
+
+  const uint32_t pending_target_counter32 = store->seal_target_counter32;
+  if ((int32_t)(through_target_counter32 - pending_target_counter32) < 0) {
+    interrupt_priority0_guard_exit(prior_basepri);
+    return false;
+  }
+
+  const uint32_t observed_dwt = store->seal_observed_dwt;
+  const uint16_t target_hw16 = store->seal_target_hw16;
+  const uint16_t observed_hw16 = store->seal_observed_hw16;
+
+  // Keep the seqlock odd for the complete foreground calculation.  Priority 16
+  // sees seal_pending and leaves the lane untouched, while priority 0 remains
+  // fully unmasked by the BASEPRI guard release below.
+  lower_env_write_begin(*store);
+  interrupt_priority0_guard_exit(prior_basepri);
+
+  lower_env_seal_deferred(store->lane,
+                          observed_dwt,
+                          pending_target_counter32,
+                          target_hw16,
+                          observed_hw16);
+
+  prior_basepri = interrupt_priority0_guard_enter();
+  lower_env_write_end(*store);
+  store->seal_observed_dwt = 0;
+  store->seal_target_counter32 = 0;
+  store->seal_target_hw16 = 0;
+  store->seal_observed_hw16 = 0;
+  dmb_barrier();
+  store->seal_pending = false;
+  interrupt_priority0_guard_exit(prior_basepri);
+
+  interrupt_feature_update_floorline();
+  return true;
 }
 
 static bool cadence_regression_latest_result(interrupt_subscriber_kind_t kind,
                                              cadence_regression_result_t* out) {
   return lower_env_result_load(kind, out);
+}
+
+static bool cadence_regression_result_for_bookend(
+    interrupt_subscriber_kind_t kind,
+    uint32_t observed_dwt,
+    uint32_t target_counter32,
+    cadence_regression_result_t* out) {
+  if (!out) return false;
+
+  (void)lower_env_finish_deferred_seal(kind, target_counter32);
+  if (!cadence_regression_latest_result(kind, out) ||
+      out->target_counter32_at_event != target_counter32 ||
+      out->observed_dwt_at_event != observed_dwt) {
+    *out = cadence_regression_result_t{};
+    return false;
+  }
+  return true;
 }
 
 static const char* pps_floorline_repair_reason_name(uint32_t reason) {
@@ -7142,6 +7330,10 @@ static volatile uint32_t g_dwt_publication_launch_begin_count = 0;
 static volatile uint32_t g_dwt_publication_launch_end_count = 0;
 static volatile uint32_t g_dwt_publication_launch_relaxed_count = 0;
 static volatile uint32_t g_dwt_publication_launch_hard_block_count = 0;
+static volatile uint32_t g_dwt_publication_startup_relaxed_count = 0;
+static volatile uint32_t g_dwt_publication_startup_relaxed_last_kind = 0;
+static volatile uint32_t g_dwt_publication_startup_relaxed_last_sequence = 0;
+static volatile uint32_t g_dwt_publication_startup_relaxed_last_mask = 0;
 
 void interrupt_dwt_publication_launch_acquisition_begin(void) {
   if (!g_dwt_publication_launch_acquisition_active) {
@@ -7180,6 +7372,10 @@ static void dwt_publication_reset_all(void) {
   dwt_publication_reset_lane(interrupt_subscriber_kind_t::VCLOCK);
   dwt_publication_reset_lane(interrupt_subscriber_kind_t::OCXO1);
   dwt_publication_reset_lane(interrupt_subscriber_kind_t::OCXO2);
+  g_dwt_publication_startup_relaxed_count = 0;
+  g_dwt_publication_startup_relaxed_last_kind = 0;
+  g_dwt_publication_startup_relaxed_last_sequence = 0;
+  g_dwt_publication_startup_relaxed_last_mask = 0;
 }
 
 static volatile uint32_t g_interrupt_recover_publication_custody_reset_count = 0;
@@ -7275,9 +7471,22 @@ static uint32_t dwt_publication_nominal_interval_for_delta(
                     (uint64_t)VCLOCK_COUNTS_PER_SECOND);
 }
 
+static bool dwt_publication_live_interval_ruler_ready(void) {
+  // A numerically plausible CPS is not yet courtroom law.  The sequence-5 boot
+  // transcript proved that the live calibration can still move by hundreds of
+  // thousands of cycles while remaining inside the intentionally broad 1%
+  // poison gate.  Interval verdicts become admissible only after CLOCKS has a
+  // live calibration and the sovereign VCLOCK one-second DWT ruler has earned
+  // its recovery streak.
+  return clocks_dwt_calibration_valid() &&
+         interrupt_feature_dwt_interval_recovered(
+             g_interrupt_integrity.vclock_qtimer_dwt.one_second);
+}
+
 static bool dwt_publication_expected_interval_ruler_qualified(
     uint32_t expected_counter_delta_ticks,
     uint32_t expected_interval_cycles) {
+  if (!dwt_publication_live_interval_ruler_ready()) return false;
   if (expected_counter_delta_ticks == 0U || expected_interval_cycles == 0U) {
     return false;
   }
@@ -7774,6 +7983,7 @@ static __attribute__((noinline)) bool dwt_publication_adjudicate_or_watchdog(
   if (!s) return false;
 
   dwt_publication_diag_seed(diag);
+  diag.publication_watchdog_count = s->watchdog_count;
 
   const uint32_t expected_counter_delta =
       dwt_publication_expected_counter_delta_ticks(req.kind);
@@ -7976,9 +8186,6 @@ static __attribute__((noinline)) bool dwt_publication_adjudicate_or_watchdog(
     // has produced a short clean streak process_interrupt becomes locally strict
     // even if CLOCKS has not yet marked campaign watchdog continuity armed.
     if (fatal_verdict != DWT_PUBLICATION_VERDICT_OK) {
-      s->watchdog_count++;
-      diag.publication_watchdog_count = s->watchdog_count;
-
       const bool campaign_armed = clocks_watchdog_campaign_armed();
       const bool launch_acquisition =
           interrupt_dwt_publication_launch_acquisition_active();
@@ -7996,22 +8203,23 @@ static __attribute__((noinline)) bool dwt_publication_adjudicate_or_watchdog(
           : ((campaign_armed || strict_ready) ? fatal_verdict : always_blocking);
       const bool blocked = blocking_mask != DWT_PUBLICATION_VERDICT_OK;
 
-      dwt_publication_record_fatal_forensics(req,
-                                             diag,
-                                             *s,
-                                             verdict,
-                                             fatal_verdict,
-                                             campaign_armed,
-                                             blocked,
-                                             launch_acquisition,
-                                             launch_blocking,
-                                             launch_relaxed,
-                                             floorline_valid,
-                                             floorline_candidate,
-                                             floorline_published,
-                                             floorline_dwt);
-
       if (blocked) {
+        s->watchdog_count++;
+        diag.publication_watchdog_count = s->watchdog_count;
+        dwt_publication_record_fatal_forensics(req,
+                                               diag,
+                                               *s,
+                                               verdict,
+                                               fatal_verdict,
+                                               campaign_armed,
+                                               true,
+                                               launch_acquisition,
+                                               launch_blocking,
+                                               launch_relaxed,
+                                               floorline_valid,
+                                               floorline_candidate,
+                                               floorline_published,
+                                               floorline_dwt);
         if (launch_acquisition) {
           g_dwt_publication_launch_hard_block_count++;
         } else if (campaign_armed || strict_ready) {
@@ -8056,6 +8264,10 @@ static __attribute__((noinline)) bool dwt_publication_adjudicate_or_watchdog(
         diag.publication_verdict_reason_id =
           INTERRUPT_DWT_PUBLICATION_REASON_LAUNCH_ACQUISITION_RELAXED_DIAGNOSTIC;
       } else {
+        g_dwt_publication_startup_relaxed_count++;
+        g_dwt_publication_startup_relaxed_last_kind = (uint32_t)req.kind;
+        g_dwt_publication_startup_relaxed_last_sequence = req.sequence;
+        g_dwt_publication_startup_relaxed_last_mask = fatal_verdict;
         diag.publication_verdict_reason_id =
           INTERRUPT_DWT_PUBLICATION_REASON_STARTUP_RELAXED_DIAGNOSTIC;
       }
@@ -8182,17 +8394,21 @@ static void fill_diag(interrupt_capture_diag_t& diag,
   }
 }
 
-static bool interrupt_subscriber_callback_executable(
-    interrupt_subscriber_event_fn callback) {
-  if (!callback) return false;
-  const uintptr_t bits = (uintptr_t)callback;
+static bool interrupt_callback_address_executable(uintptr_t bits) {
+  if (bits == 0U) return false;
   const uintptr_t address = bits & ~uintptr_t(1U);
 
   // Teensy 4.1 code executes from ITCM or the QSPI XIP window.  In particular,
-  // OCRAM/DMAMEM subscriber-table addresses are data and must never become an
-  // indirect branch target.
+  // OCRAM/DMAMEM addresses are data and must never become an indirect branch
+  // target.  Keep this predicate common to subscriber and hosted callback
+  // surfaces so every indirect call uses the same executable-address law.
   return address < 0x00100000UL ||
          (address >= 0x60000000UL && address < 0x61000000UL);
+}
+
+static bool interrupt_subscriber_callback_executable(
+    interrupt_subscriber_event_fn callback) {
+  return interrupt_callback_address_executable((uintptr_t)callback);
 }
 
 static void interrupt_dispatch_invalidate_locked(
@@ -8368,8 +8584,10 @@ static __attribute__((noinline)) void deferred_dispatch_callback(timepop_ctx_t*,
     // Alpha and Beta are one foreground transaction.  Invoke Beta directly with
     // the frozen snapshot; do not enqueue a second ASAP callback and do not read
     // interrupt_last_pps_edge() after another fact can advance global state.
-    if (pps_continuation_valid && g_pps_edge_dispatch) {
-      g_pps_edge_dispatch(pps_continuation);
+    const pps_edge_dispatch_fn pps_dispatch = g_pps_edge_dispatch;
+    if (pps_continuation_valid &&
+        interrupt_callback_address_executable((uintptr_t)pps_dispatch)) {
+      pps_dispatch(pps_continuation);
     }
 
     // Only now may the next VCLOCK fact enter Alpha.  This serializes the whole
@@ -8843,21 +9061,20 @@ static bool vclock_ch2_one_second_service(
 
   // Passive ISR sanity witness retired.
 
-  if (vclock_fact_ring_push_no_arm_from_isr(fact)) {
+  const bool enqueued = vclock_fact_ring_push_no_arm_from_isr(fact);
+  if (enqueued) {
     g_vclock_ch2_one_second_enqueue_count++;
   } else {
-    // Leave the target armed so the heartbeat fallback path can still publish
-    // the same authored bookend rather than silently losing a public edge.
+    // Queue pressure is loss-visible.  Never replace a failed foreground handoff
+    // with synchronous publication inside the priority-16 heartbeat.
     g_vclock_ch2_one_second_drop_count++;
-    return false;
   }
 
-  // Advance as a gear, not as a service-time rubber band.  If service is ever
-  // more than one second late, skip stale teeth diagnostically instead of
-  // trying to flood the drain with catch-up publications.
+  // Advance as a gear even when the fact ring is full.  Re-entering the same
+  // stale target would turn one lost public edge into an interrupt loop.
   vclock_ch2_one_second_advance_after_bookend(bookend.target_counter32,
                                               bookend.service_counter32);
-  return true;
+  return enqueued;
 }
 
 static void vclock_ch2_smartzero_reset_attempt_state(void) {
@@ -9019,8 +9236,11 @@ static __attribute__((noinline)) void vclock_apply_perishable_fact_deferred(
       fact.witness_pps_valid ? fact.witness_pps : pps_t{};
 
   cadence_regression_result_t lower_env{};
-  (void)cadence_regression_latest_result(interrupt_subscriber_kind_t::VCLOCK,
-                                         &lower_env);
+  (void)cadence_regression_result_for_bookend(
+      interrupt_subscriber_kind_t::VCLOCK,
+      observed_dwt,
+      fact.target_counter32,
+      &lower_env);
 
   const pps_t witness_pps = fact.witness_pps_valid
       ? pps_floorline_repair_physical_edge(raw_witness_pps,
@@ -9716,138 +9936,50 @@ static __attribute__((noinline)) void vclock_heartbeat_native_service(uint32_t i
       // bookend before this bookkeeping block reached the fallback branch.
       g_vclock_heartbeat_one_second_handoff_skip_count++;
     } else if (same_event_fallback_due) {
-      // Bootstrap/failsafe path.  Publish the same cadence event that FloorLine
-      // just observed/sealed.  Do not switch to the adjacent tick_mod tooth.
+      // No rich publication path is permitted in priority 16.  A CH2-owned
+      // bookend reaches this branch only when its foreground fact enqueue was
+      // loss-visible; the service routine has already advanced the gear.  The
+      // legacy bootstrap path is still preserved by enqueueing the same event
+      // into the ordinary foreground fact ring.
       if (bookend.due && bookend.ch2_owned) {
         g_vclock_heartbeat_one_second_fallback_count++;
       } else {
         g_vclock_heartbeat_one_second_legacy_count++;
-      }
 
-      const uint32_t observed_dwt = bookend.due
-          ? bookend.observed_dwt_at_event
-          : qtimer_event_dwt;
-      const uint32_t target_counter32 = bookend.due
-          ? bookend.target_counter32
-          : cadence_counter32;
-      const uint16_t target_low16 = bookend.due
-          ? bookend.target_low16
-          : fired_low16;
-      const pps_t raw_witness_pps = bookend.due
-          ? bookend.witness_pps
-          : (g_last_pps_witness_valid ? g_last_pps_witness : pps_t{});
-      const bool witness_pps_valid = bookend.due
-          ? bookend.witness_pps_valid
-          : g_last_pps_witness_valid;
-      const uint32_t fallback_sequence = bookend.due
-          ? bookend.fallback_sequence
-          : (g_pps_gpio_heartbeat.edge_count + 1U);
+        vclock_perishable_fact_t fact{};
+        fact.isr_entry_dwt_raw = bookend.due
+            ? bookend.isr_entry_dwt_raw
+            : isr_entry_dwt_raw;
+        fact.observed_dwt_at_event = bookend.due
+            ? bookend.observed_dwt_at_event
+            : qtimer_event_dwt;
+        fact.target_counter32 = bookend.due
+            ? bookend.target_counter32
+            : cadence_counter32;
+        fact.target_low16 = bookend.due
+            ? bookend.target_low16
+            : fired_low16;
+        fact.observed_low16 = bookend.due
+            ? bookend.observed_low16
+            : fired_low16;
+        fact.one_second_due = true;
+        fact.witness_pps_valid = bookend.due
+            ? bookend.witness_pps_valid
+            : g_last_pps_witness_valid;
+        fact.witness_pps = bookend.due
+            ? bookend.witness_pps
+            : (g_last_pps_witness_valid ? g_last_pps_witness : pps_t{});
+        fact.fallback_sequence = bookend.due
+            ? bookend.fallback_sequence
+            : (g_pps_gpio_heartbeat.edge_count + 1U);
 
-      uint32_t coincidence_cycles = 0;
-      bool     coincidence_valid  = false;
-      dwt_repair_diag_t dwt_diag{};
-      cadence_regression_result_t lower_env{};
-      (void)cadence_regression_latest_result(interrupt_subscriber_kind_t::VCLOCK,
-                                             &lower_env);
-
-      const pps_t witness_pps = witness_pps_valid
-          ? pps_floorline_repair_physical_edge(raw_witness_pps,
-                                               lower_env,
-                                               observed_dwt,
-                                               target_counter32)
-          : raw_witness_pps;
-      const bool pps_floorline_repaired =
-          pps_floorline_repair_applied_for_sequence(witness_pps.sequence);
-
-      bool phase_projection_valid = false;
-      uint32_t phase_cycles = 0;
-      const uint32_t published_dwt =
-          vclock_published_dwt_at_edge(witness_pps_valid ? witness_pps : pps_t{},
-                                       observed_dwt,
-                                       target_counter32,
-                                       target_low16,
-                                       &phase_projection_valid,
-                                       &phase_cycles);
-      (void)phase_cycles;
-
-      dwt_publication_diag_begin(dwt_diag,
-                                 observed_dwt,
-                                 bookend.due ? bookend.isr_entry_dwt_raw : 0U,
-                                 pps_floorline_repaired
-                                     ? "pps_vclock_floorline_projection_fallback"
-                                     : (phase_projection_valid
-                                           ? "vclock_observed_pps_phase_witness_fallback"
-                                           : "vclock_observed_no_pps_fallback"));
-      copy_floorline_interval_to_diag(dwt_diag, lower_env);
-      if (pps_floorline_repaired) {
-        dwt_diag.interval_resync_applied = true;
-      }
-      dwt_publication_diag_choose(dwt_diag,
-                                  published_dwt,
-                                  observed_dwt,
-                                  LOWER_ENV_PUBLISH_HARD_EDGE_GATE_CYCLES,
-                                  pps_floorline_repaired
-                                      ? "pps_vclock_floorline_projection_fallback"
-                                      : (phase_projection_valid
-                                            ? "vclock_observed_pps_phase_witness_fallback"
-                                            : "vclock_observed_no_pps_fallback"));
-      if (pps_floorline_repaired) {
-        dwt_diag.interval_resync_applied = true;
-      }
-
-      coincidence_cycles = 0;
-      coincidence_valid = false;
-      if (witness_pps_valid && witness_pps.sequence > 0) {
-        const int32_t cycles_since_pps =
-            (int32_t)(published_dwt - witness_pps.dwt_at_edge);
-        if (llabs((long long)cycles_since_pps) <
-            DWT_PPS_COINCIDENCE_THRESHOLD_CYCLES) {
-          coincidence_cycles = (uint32_t)(cycles_since_pps >= 0
-              ? cycles_since_pps
-              : -cycles_since_pps);
-          coincidence_valid = true;
+        const bool enqueued = vclock_fact_ring_push_no_arm_from_isr(fact);
+        vclock_ch2_one_second_enable_after_heartbeat(fact.target_counter32);
+        if (enqueued) {
+          vclock_ch2_fact_drain_arm_after_timepop();
+        } else {
+          g_vclock_ch2_one_second_drop_count++;
         }
-      }
-      const uint32_t publication_sequence =
-          (witness_pps_valid && witness_pps.sequence != 0)
-              ? witness_pps.sequence
-              : fallback_sequence;
-      dwt_publication_request_t publication{};
-      publication.kind = interrupt_subscriber_kind_t::VCLOCK;
-      publication.sequence = publication_sequence;
-      publication.published_dwt = published_dwt;
-      publication.observed_dwt = observed_dwt;
-      publication.expected_published_dwt = published_dwt;
-      publication.target_counter32 = target_counter32;
-      publication.target_low16 = target_low16;
-      publication.service_low16_valid = true;
-      publication.service_low16 = bookend.due ? bookend.observed_low16 : fired_low16;
-      publication.floorline = &lower_env;
-      publication.repair = &dwt_diag;
-      if (!dwt_publication_adjudicate_or_watchdog(publication, dwt_diag)) {
-        return;
-      }
-
-      publish_vclock_domain_pps_vclock(witness_pps_valid ? witness_pps : pps_t{},
-                                        publication_sequence,
-                                        published_dwt,
-                                        target_counter32,
-                                        target_low16,
-                                        observed_dwt);
-
-      emit_one_second_event(*g_rt_vclock, published_dwt,
-                            target_counter32,
-                            coincidence_cycles, coincidence_valid, &dwt_diag,
-                            &lower_env);
-
-      // The PPS/Beta continuation is chained by deferred_dispatch_callback after
-      // Alpha consumes this exact frozen VCLOCK tuple.
-
-      if (bookend.due && bookend.ch2_owned) {
-        vclock_ch2_one_second_advance_after_bookend(bookend.target_counter32,
-                                                    bookend.service_counter32);
-      } else {
-        vclock_ch2_one_second_enable_after_heartbeat(target_counter32);
       }
     }
   } else {
@@ -10864,7 +10996,10 @@ static __attribute__((noinline)) void ocxo_apply_perishable_fact_deferred(
   (void)yardstick_published_dwt;
 
   cadence_regression_result_t lower_env{};
-  (void)cadence_regression_latest_result(ctx.kind, &lower_env);
+  (void)cadence_regression_result_for_bookend(ctx.kind,
+                                              observed_dwt,
+                                              fact.target_counter32,
+                                              &lower_env);
   copy_floorline_interval_to_diag(dwt_diag, lower_env);
   const uint32_t published_dwt =
       ocxo_published_dwt_at_edge(observed_dwt, lower_env);
@@ -11066,10 +11201,10 @@ struct interrupt_handoff_source_diag_t {
   volatile uint32_t last_sequence = 0;
   volatile uint32_t last_capture_dwt = 0;
   volatile uint32_t last_handoff_entry_dwt = 0;
+  volatile uint32_t last_capture_service_dwt = 0;
   volatile uint32_t last_capture_to_handoff_cycles = 0;
   volatile uint32_t max_capture_to_handoff_cycles = 0;
-  volatile uint32_t last_priority0_body_cycles = 0;
-  volatile uint32_t max_priority0_body_cycles = 0;
+  volatile uint32_t entry_overtaken_by_capture_count = 0;
   volatile uint32_t last_handoff_body_cycles = 0;
   volatile uint32_t max_handoff_body_cycles = 0;
 };
@@ -11091,12 +11226,14 @@ struct interrupt_handoff_diag_t {
   volatile uint32_t drain_budget_exhausted_count = 0;
   volatile uint32_t last_request_dwt = 0;
   volatile uint32_t last_entry_dwt = 0;
+  volatile uint32_t last_request_service_dwt = 0;
   volatile uint32_t last_exit_dwt = 0;
   volatile uint32_t last_latency_cycles = 0;
   volatile uint32_t min_latency_cycles = UINT32_MAX;
   volatile uint32_t max_latency_cycles = 0;
   volatile uint64_t latency_cycles_sum = 0;
   volatile uint32_t latency_sample_count = 0;
+  volatile uint32_t entry_overtaken_by_request_count = 0;
   volatile uint32_t last_body_cycles = 0;
   volatile uint32_t max_body_cycles = 0;
   volatile uint32_t last_request_ipsr = 0;
@@ -11418,22 +11555,22 @@ static bool interrupt_handoff_any_pending(void) {
          capture_ring_pending(g_pps_capture_ring) != 0;
 }
 
-static void interrupt_handoff_note_priority0_body(
-    interrupt_handoff_source_diag_t& diag,
-    uint32_t isr_entry_dwt_raw) {
-  const uint32_t body = ARM_DWT_CYCCNT - isr_entry_dwt_raw;
-  diag.last_priority0_body_cycles = body;
-  if (body > diag.max_priority0_body_cycles) {
-    diag.max_priority0_body_cycles = body;
-  }
-}
-
 static void interrupt_handoff_note_source_entry(
     interrupt_handoff_source_diag_t& diag,
     uint32_t capture_dwt,
     uint32_t handoff_entry_dwt) {
-  const uint32_t latency = handoff_entry_dwt - capture_dwt;
+  // Priority 0 may preempt the priority-16 handoff after the handler's opening
+  // timestamp.  A packet captured during that preemption therefore has a lawful
+  // capture_dwt later than handoff_entry_dwt.  Measure to the instant this
+  // source is actually claimed instead of unsigned-subtracting two differently
+  // ordered timestamps into an apparent ~2^32-cycle latency.
+  const uint32_t service_dwt = ARM_DWT_CYCCNT;
+  if ((int32_t)(handoff_entry_dwt - capture_dwt) < 0) {
+    diag.entry_overtaken_by_capture_count++;
+  }
+  const uint32_t latency = service_dwt - capture_dwt;
   diag.last_handoff_entry_dwt = handoff_entry_dwt;
+  diag.last_capture_service_dwt = service_dwt;
   diag.last_capture_to_handoff_cycles = latency;
   if (latency > diag.max_capture_to_handoff_cycles) {
     diag.max_capture_to_handoff_cycles = latency;
@@ -11671,7 +11808,16 @@ static void interrupt_handoff_service_isr(void) {
   if (g_interrupt_handoff.pending) {
     g_interrupt_handoff.pending = false;
     g_interrupt_handoff.served_request_count++;
-    const uint32_t latency = entry_dwt - g_interrupt_handoff.last_request_dwt;
+    // A priority-0 capture may update last_request_dwt after entry_dwt was
+    // sampled.  Snapshot the request, then measure to the current service point;
+    // request-to-entry remains useful only as an overtaken-order diagnostic.
+    const uint32_t request_dwt = g_interrupt_handoff.last_request_dwt;
+    if ((int32_t)(entry_dwt - request_dwt) < 0) {
+      g_interrupt_handoff.entry_overtaken_by_request_count++;
+    }
+    const uint32_t service_dwt = ARM_DWT_CYCCNT;
+    const uint32_t latency = service_dwt - request_dwt;
+    g_interrupt_handoff.last_request_service_dwt = service_dwt;
     g_interrupt_handoff.last_latency_cycles = latency;
     if (latency < g_interrupt_handoff.min_latency_cycles) {
       g_interrupt_handoff.min_latency_cycles = latency;
@@ -11953,10 +12099,6 @@ static __attribute__((noinline)) void ocxo_cadence_capture_priority0(
                                            uint32_t isr_entry_dwt_raw,
                                            uint16_t generation_gate_ambient_low16) {
   ocxo_lane_t& lane = *ctx.lane;
-  interrupt_handoff_source_diag_t& diag =
-      (ctx.kind == interrupt_subscriber_kind_t::OCXO1)
-          ? g_handoff_ocxo1
-          : g_handoff_ocxo2;
 
   uint32_t csctrl_entry = 0;
   if (!qtimer_guard_read_ocxo_csctrl(lane,
@@ -11964,7 +12106,6 @@ static __attribute__((noinline)) void ocxo_cadence_capture_priority0(
                                      lane.compare_target,
                                      &csctrl_entry)) {
     qtimer_guard_quarantine_ocxo_lane(lane, "ocxo_priority0_entry");
-    interrupt_handoff_note_priority0_body(diag, isr_entry_dwt_raw);
     return;
   }
 
@@ -11973,7 +12114,6 @@ static __attribute__((noinline)) void ocxo_cadence_capture_priority0(
   if ((csctrl_entry & TMR_CSCTRL_TCF1) == 0) {
     lane.cadence_false_irq_count++;
     lane.witness_false_irq_count++;
-    interrupt_handoff_note_priority0_body(diag, isr_entry_dwt_raw);
     return;
   }
 
@@ -11981,13 +12121,11 @@ static __attribute__((noinline)) void ocxo_cadence_capture_priority0(
     lane.cadence_false_irq_count++;
     lane.witness_false_irq_count++;
     if (!ocxo_lane_clear_compare_flag(lane)) {
-      interrupt_handoff_note_priority0_body(diag, isr_entry_dwt_raw);
       return;
     }
     (void)ocxo_lane_disable_compare(lane);
     lane.cadence_armed = false;
     lane.witness_armed = false;
-    interrupt_handoff_note_priority0_body(diag, isr_entry_dwt_raw);
     return;
   }
 
@@ -12064,7 +12202,6 @@ static __attribute__((noinline)) void ocxo_cadence_capture_priority0(
       isr_entry_dwt_raw);
   if (!generation_accepted) {
     if (!ocxo_lane_clear_compare_flag(lane)) {
-      interrupt_handoff_note_priority0_body(diag, isr_entry_dwt_raw);
       return;
     }
 
@@ -12142,7 +12279,6 @@ static __attribute__((noinline)) void ocxo_cadence_capture_priority0(
         lane.witness_schedule_last_ticks_until_arm_window = 0;
 
         if (!ocxo_lane_program_compare(lane, next_low16)) {
-          interrupt_handoff_note_priority0_body(diag, isr_entry_dwt_raw);
           return;
         }
         lane.cadence_armed = true;
@@ -12154,7 +12290,6 @@ static __attribute__((noinline)) void ocxo_cadence_capture_priority0(
     }
 
 
-    interrupt_handoff_note_priority0_body(diag, isr_entry_dwt_raw);
     return;
   }
 
@@ -12201,7 +12336,6 @@ static __attribute__((noinline)) void ocxo_cadence_capture_priority0(
   // 0.  Reaching this point means the immediate low16 witness resolved into a
   // lawful 32-bit generation for the authored target.
   if (!ocxo_lane_clear_compare_flag(lane)) {
-    interrupt_handoff_note_priority0_body(diag, isr_entry_dwt_raw);
     return;
   }
 
@@ -12305,7 +12439,6 @@ static __attribute__((noinline)) void ocxo_cadence_capture_priority0(
       lane.witness_schedule_last_ticks_until_arm_window = 0;
 
       if (!ocxo_lane_program_compare(lane, next_low16)) {
-        interrupt_handoff_note_priority0_body(diag, isr_entry_dwt_raw);
         return;
       }
       lane.cadence_armed = true;
@@ -12331,7 +12464,6 @@ static __attribute__((noinline)) void ocxo_cadence_capture_priority0(
                                      lane.compare_target,
                                      &csctrl_after_program)) {
     qtimer_guard_quarantine_ocxo_lane(lane, "ocxo_priority0_after_program");
-    interrupt_handoff_note_priority0_body(diag, isr_entry_dwt_raw);
     return;
   }
   tick.csctrl_after_program = csctrl_after_program;
@@ -12350,13 +12482,17 @@ static __attribute__((noinline)) void ocxo_cadence_capture_priority0(
   if (needs_1khz_sample_handoff) {
     ocxo_1khz_sample_capture_packet_t packet{};
     ocxo_1khz_packet_from_tend_capture(packet, tick);
-    interrupt_capture_ring_t<ocxo_1khz_sample_capture_packet_t,
-                             HANDOFF_OCXO_RING_SIZE>& ring =
-        (ctx.kind == interrupt_subscriber_kind_t::OCXO1)
-            ? g_ocxo1_1khz_sample_capture_ring
-            : g_ocxo2_1khz_sample_capture_ring;
 
-    if (capture_ring_push_from_priority0(ring, diag, packet)) {
+    bool pushed = false;
+    if (ctx.kind == interrupt_subscriber_kind_t::OCXO1) {
+      pushed = capture_ring_push_from_priority0(
+          g_ocxo1_1khz_sample_capture_ring, g_handoff_ocxo1, packet);
+    } else if (ctx.kind == interrupt_subscriber_kind_t::OCXO2) {
+      pushed = capture_ring_push_from_priority0(
+          g_ocxo2_1khz_sample_capture_ring, g_handoff_ocxo2, packet);
+    }
+
+    if (pushed) {
       handed_off = true;
     } else {
       lane.miss_count++;
@@ -12369,13 +12505,17 @@ static __attribute__((noinline)) void ocxo_cadence_capture_priority0(
   if (needs_one_second_handoff) {
     ocxo_one_second_capture_packet_t packet{};
     ocxo_one_second_packet_from_tend_capture(packet, tick);
-    interrupt_capture_ring_t<ocxo_one_second_capture_packet_t,
-                             HANDOFF_OCXO_RING_SIZE>& ring =
-        (ctx.kind == interrupt_subscriber_kind_t::OCXO1)
-            ? g_ocxo1_one_second_capture_ring
-            : g_ocxo2_one_second_capture_ring;
 
-    if (capture_ring_push_from_priority0(ring, diag, packet)) {
+    bool pushed = false;
+    if (ctx.kind == interrupt_subscriber_kind_t::OCXO1) {
+      pushed = capture_ring_push_from_priority0(
+          g_ocxo1_one_second_capture_ring, g_handoff_ocxo1, packet);
+    } else if (ctx.kind == interrupt_subscriber_kind_t::OCXO2) {
+      pushed = capture_ring_push_from_priority0(
+          g_ocxo2_one_second_capture_ring, g_handoff_ocxo2, packet);
+    }
+
+    if (pushed) {
       handed_off = true;
     } else {
       lane.miss_count++;
@@ -12388,11 +12528,16 @@ static __attribute__((noinline)) void ocxo_cadence_capture_priority0(
             ? "qtimer2_ocxo1_capture"
             : "qtimer3_ocxo2_capture");
   } else if (!needs_1khz_sample_handoff && !needs_one_second_handoff) {
-    diag.capture_count++;
-    diag.last_capture_dwt = isr_entry_dwt_raw;
+    // Transitional/unowned OCXO IRQs are still counted, but diagnostic ownership
+    // is fixed by the physical ISR lane instead of a long-lived generic reference.
+    if (ctx.kind == interrupt_subscriber_kind_t::OCXO1) {
+      g_handoff_ocxo1.capture_count++;
+      g_handoff_ocxo1.last_capture_dwt = isr_entry_dwt_raw;
+    } else if (ctx.kind == interrupt_subscriber_kind_t::OCXO2) {
+      g_handoff_ocxo2.capture_count++;
+      g_handoff_ocxo2.last_capture_dwt = isr_entry_dwt_raw;
+    }
   }
-
-  interrupt_handoff_note_priority0_body(diag, isr_entry_dwt_raw);
 }
 
 
@@ -12491,7 +12636,8 @@ static void qtimer3_isr(void) {
 static volatile interrupt_qtimer1_ch2_handler_fn g_qtimer1_ch2_handler = nullptr;
 
 void interrupt_register_qtimer1_ch2_handler(interrupt_qtimer1_ch2_handler_fn cb) {
-  g_qtimer1_ch2_handler = cb;
+  g_qtimer1_ch2_handler =
+      interrupt_callback_address_executable((uintptr_t)cb) ? cb : nullptr;
 }
 
 // ============================================================================
@@ -12500,7 +12646,8 @@ void interrupt_register_qtimer1_ch2_handler(interrupt_qtimer1_ch2_handler_fn cb)
 
 void interrupt_register_pps_entry_latency_handler(
     interrupt_pps_entry_latency_handler_fn cb) {
-  g_pps_entry_latency_handler = cb;
+  g_pps_entry_latency_handler =
+      interrupt_callback_address_executable((uintptr_t)cb) ? cb : nullptr;
 }
 
 // ============================================================================
@@ -12508,7 +12655,8 @@ void interrupt_register_pps_entry_latency_handler(
 // ============================================================================
 
 void interrupt_register_qtimer1_ch1_handler(interrupt_qtimer1_ch1_handler_fn cb) {
-  g_qtimer1_ch1_handler = cb;
+  g_qtimer1_ch1_handler =
+      interrupt_callback_address_executable((uintptr_t)cb) ? cb : nullptr;
 }
 
 static void qtimer1_ch1_schedule_next_hop(void) {
@@ -12607,8 +12755,9 @@ static void interrupt_handoff_process_qtimer1_ch1(
   event.dwt_at_event = qtimer_event_dwt;
   event.gnss_ns_at_event = gnss_ns;
 
-  if (g_qtimer1_ch1_handler) {
-    g_qtimer1_ch1_handler(event);
+  const interrupt_qtimer1_ch1_handler_fn callback = g_qtimer1_ch1_handler;
+  if (interrupt_callback_address_executable((uintptr_t)callback)) {
+    callback(event);
   }
 }
 
@@ -12640,7 +12789,8 @@ static void interrupt_handoff_process_qtimer1_ch2(
 
   // QTimer1 CH2 is TimePop scheduler-only.  VCLOCK custody services run on
   // the native CH0 heartbeat; do not author VCLOCK facts from this sibling rail.
-  if (g_qtimer1_ch2_handler) {
+  const interrupt_qtimer1_ch2_handler_fn callback = g_qtimer1_ch2_handler;
+  if (interrupt_callback_address_executable((uintptr_t)callback)) {
     const bridge_projection_t bridge = interrupt_dwt_to_vclock_gnss_projection(qtimer_event_dwt);
     const int64_t  gnss_ns = bridge.gnss_ns;
     bridge_projection_record_stats(interrupt_subscriber_kind_t::TIMEPOP, bridge);
@@ -12670,7 +12820,7 @@ static void interrupt_handoff_process_qtimer1_ch2(
     diag.dwt_used_minus_event_cycles = 0;
       bridge_projection_copy_to_diag(diag, bridge);
 
-    g_qtimer1_ch2_handler(event, diag);
+    callback(event, diag);
   }
 
 }
@@ -12717,8 +12867,6 @@ static void qtimer1_vclock_capture_priority0(uint32_t isr_entry_dwt_raw,
   if (!generation_accepted) {
     qtimer1_vclock_clear_compare_flag();
 
-    interrupt_handoff_note_priority0_body(g_handoff_qtimer1_ch1,
-                                          isr_entry_dwt_raw);
     return;
   }
 
@@ -12761,8 +12909,6 @@ static void qtimer1_vclock_capture_priority0(uint32_t isr_entry_dwt_raw,
                                        packet)) {
     interrupt_handoff_request_from_capture_isr("qtimer1_ch0_vclock_capture");
   }
-  interrupt_handoff_note_priority0_body(g_handoff_qtimer1_ch1,
-                                        isr_entry_dwt_raw);
 }
 
 static void qtimer1_ch2_capture_priority0(uint32_t isr_entry_dwt_raw,
@@ -12781,8 +12927,6 @@ static void qtimer1_ch2_capture_priority0(uint32_t isr_entry_dwt_raw,
                                        packet)) {
     interrupt_handoff_request_from_capture_isr("qtimer1_ch2_capture");
   }
-  interrupt_handoff_note_priority0_body(g_handoff_qtimer1_ch2,
-                                        isr_entry_dwt_raw);
 }
 
 static void qtimer1_isr(void) {
@@ -12822,10 +12966,11 @@ static void qtimer1_isr(void) {
 // into PPS and PPS_VCLOCK event-coordinate values and never propagated.
 
 static void pps_edge_dispatch_trampoline(timepop_ctx_t*, timepop_diag_t*, void*) {
-  if (!g_pps_edge_dispatch) return;
+  const pps_edge_dispatch_fn callback = g_pps_edge_dispatch;
+  if (!interrupt_callback_address_executable((uintptr_t)callback)) return;
 
   const pps_edge_snapshot_t snap = interrupt_last_pps_edge();
-  g_pps_edge_dispatch(snap);
+  callback(snap);
 }
 
 static void pps_relay_assert_from_isr(uint32_t sequence) {
@@ -12890,8 +13035,10 @@ static void pps_post_isr_publish_inline(const interrupt_epoch_capture_t& cap,
                                         uint32_t isr_entry_dwt_raw) {
   epoch_capture_publish(cap);
 
-  if (g_pps_entry_latency_handler) {
-    g_pps_entry_latency_handler(cap.sequence, isr_entry_dwt_raw);
+  const interrupt_pps_entry_latency_handler_fn callback =
+      g_pps_entry_latency_handler;
+  if (interrupt_callback_address_executable((uintptr_t)callback)) {
+    callback(cap.sequence, isr_entry_dwt_raw);
   }
 }
 
@@ -13099,8 +13246,7 @@ pps_capture_packet_fill_priority0(pps_capture_packet_t& packet,
 }
 
 static void pps_capture_packet_enqueue_priority0(
-    const pps_capture_packet_t& packet,
-    uint32_t isr_entry_dwt_raw) {
+    const pps_capture_packet_t& packet) {
   if (capture_ring_push_from_priority0(g_pps_capture_ring,
                                        g_handoff_pps,
                                        packet)) {
@@ -13108,13 +13254,12 @@ static void pps_capture_packet_enqueue_priority0(
   } else {
     g_gpio_miss_count++;
   }
-  interrupt_handoff_note_priority0_body(g_handoff_pps, isr_entry_dwt_raw);
 }
 
 void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
   pps_capture_packet_t packet{};
   pps_capture_packet_fill_priority0(packet, isr_entry_dwt_raw);
-  pps_capture_packet_enqueue_priority0(packet, isr_entry_dwt_raw);
+  pps_capture_packet_enqueue_priority0(packet);
 }
 
 static void pps_gpio_isr(void) {
@@ -13125,7 +13270,7 @@ static void pps_gpio_isr(void) {
   pps_capture_packet_t packet{};
   pps_capture_packet_fill_priority0(packet, isr_entry_dwt_raw);
 
-  pps_capture_packet_enqueue_priority0(packet, isr_entry_dwt_raw);
+  pps_capture_packet_enqueue_priority0(packet);
 
   // After the sacred multi-clock capture window on purpose: LR no longer
   // holds EXC_RETURN here, so the check runs with the conservative
@@ -13134,7 +13279,8 @@ static void pps_gpio_isr(void) {
 }
 
 void interrupt_pps_edge_register_dispatch(pps_edge_dispatch_fn fn) {
-  g_pps_edge_dispatch = fn;
+  g_pps_edge_dispatch =
+      interrupt_callback_address_executable((uintptr_t)fn) ? fn : nullptr;
 }
 
 // ============================================================================
@@ -14017,10 +14163,25 @@ static void interrupt_state_cold_init(void) {
   g_dwt_publication_last_fatal = dwt_publication_forensics_t{};
 
   g_lower_env_vclock_store.seq = 0;
+  g_lower_env_vclock_store.seal_pending = false;
+  g_lower_env_vclock_store.seal_observed_dwt = 0;
+  g_lower_env_vclock_store.seal_target_counter32 = 0;
+  g_lower_env_vclock_store.seal_target_hw16 = 0;
+  g_lower_env_vclock_store.seal_observed_hw16 = 0;
   g_lower_env_vclock_store.lane = lower_env_lane_t{};
   g_lower_env_ocxo1_store.seq = 0;
+  g_lower_env_ocxo1_store.seal_pending = false;
+  g_lower_env_ocxo1_store.seal_observed_dwt = 0;
+  g_lower_env_ocxo1_store.seal_target_counter32 = 0;
+  g_lower_env_ocxo1_store.seal_target_hw16 = 0;
+  g_lower_env_ocxo1_store.seal_observed_hw16 = 0;
   g_lower_env_ocxo1_store.lane = lower_env_lane_t{};
   g_lower_env_ocxo2_store.seq = 0;
+  g_lower_env_ocxo2_store.seal_pending = false;
+  g_lower_env_ocxo2_store.seal_observed_dwt = 0;
+  g_lower_env_ocxo2_store.seal_target_counter32 = 0;
+  g_lower_env_ocxo2_store.seal_target_hw16 = 0;
+  g_lower_env_ocxo2_store.seal_observed_hw16 = 0;
   g_lower_env_ocxo2_store.lane = lower_env_lane_t{};
   g_lower_env_consumer_vclock = lower_env_consumer_state_t{};
   g_lower_env_consumer_ocxo1 = lower_env_consumer_state_t{};
@@ -14991,6 +15152,23 @@ static FLASHMEM Payload cmd_report_publication(const Payload&) {
   p.add("launch_relaxed_count", (uint32_t)g_dwt_publication_launch_relaxed_count);
   p.add("launch_hard_block_count",
         (uint32_t)g_dwt_publication_launch_hard_block_count);
+  p.add("startup_relaxed_count",
+        (uint32_t)g_dwt_publication_startup_relaxed_count);
+  p.add("startup_relaxed_last_kind",
+        (uint32_t)g_dwt_publication_startup_relaxed_last_kind);
+  p.add("startup_relaxed_last_kind_name",
+        dwt_publication_kind_name_u32(
+            (uint32_t)g_dwt_publication_startup_relaxed_last_kind));
+  p.add("startup_relaxed_last_sequence",
+        (uint32_t)g_dwt_publication_startup_relaxed_last_sequence);
+  p.add("startup_relaxed_last_mask",
+        (uint32_t)g_dwt_publication_startup_relaxed_last_mask);
+  p.add("startup_relaxed_last_reason",
+        interrupt_dwt_publication_reason_name(
+            interrupt_dwt_publication_reason_id_from_verdict_mask(
+                (uint32_t)g_dwt_publication_startup_relaxed_last_mask)));
+  p.add("interval_ruler_ready_now",
+        dwt_publication_live_interval_ruler_ready());
 
   p.add("published_dwt", f.published_dwt);
   p.add("observed_dwt", f.observed_dwt);
@@ -15734,7 +15912,9 @@ static FLASHMEM void add_handoff_source(Payload& p,
   snprintf(key, sizeof(key), "%s_overrun", prefix); p.add(key, (uint32_t)s.overrun_count);
   snprintf(key, sizeof(key), "%s_high_water", prefix); p.add(key, (uint32_t)s.high_water);
   snprintf(key, sizeof(key), "%s_pending", prefix); p.add(key, (uint32_t)s.pending_count);
+  snprintf(key, sizeof(key), "%s_last_latency", prefix); p.add(key, (uint32_t)s.last_capture_to_handoff_cycles);
   snprintf(key, sizeof(key), "%s_max_latency", prefix); p.add(key, (uint32_t)s.max_capture_to_handoff_cycles);
+  snprintf(key, sizeof(key), "%s_entry_overtaken", prefix); p.add(key, (uint32_t)s.entry_overtaken_by_capture_count);
 }
 
 static FLASHMEM Payload cmd_report_handoff(const Payload&) {
@@ -15743,12 +15923,20 @@ static FLASHMEM Payload cmd_report_handoff(const Payload&) {
   p.add("configured", (bool)g_interrupt_handoff.configured);
   p.add("floorline_writer_context", INTERRUPT_FLOORLINE_WRITER_CONTEXT);
   p.add("subscriber_dispatch_context", INTERRUPT_SUBSCRIBER_DISPATCH_CONTEXT);
+  p.add("priority0_body_timing_enabled", false);
   p.add("request_count", (uint32_t)g_interrupt_handoff.request_count);
   p.add("entry_count", (uint32_t)g_interrupt_handoff.entry_count);
   p.add("served_request_count", (uint32_t)g_interrupt_handoff.served_request_count);
   p.add("reentry_count", (uint32_t)g_interrupt_handoff.reentry_count);
   p.add("repend_count", (uint32_t)g_interrupt_handoff.repend_count);
+  p.add("last_latency_cycles", (uint32_t)g_interrupt_handoff.last_latency_cycles);
+  p.add("min_latency_cycles",
+        g_interrupt_handoff.latency_sample_count
+            ? (uint32_t)g_interrupt_handoff.min_latency_cycles
+            : 0U);
   p.add("max_latency_cycles", (uint32_t)g_interrupt_handoff.max_latency_cycles);
+  p.add("entry_overtaken_by_request_count",
+        (uint32_t)g_interrupt_handoff.entry_overtaken_by_request_count);
   p.add("max_body_cycles", (uint32_t)g_interrupt_handoff.max_body_cycles);
   add_handoff_source(p, "ch1", g_handoff_qtimer1_ch1);
   add_handoff_source(p, "ch2", g_handoff_qtimer1_ch2);
