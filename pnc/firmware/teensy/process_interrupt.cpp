@@ -706,7 +706,21 @@ static void deferred_dispatch_callback(timepop_ctx_t*, timepop_diag_t*,
       (uint32_t)(uintptr_t)rt->desc->name,
       event.counter32_at_event);
   rt->dispatch_count++;
+  crash_dispatch_breadcrumb_note(
+      CRASH_DISPATCH_BREADCRUMB_SUBSCRIBER_ENTER,
+      (uint32_t)(uintptr_t)callback,
+      (uint32_t)rt->desc->kind,
+      event.counter32_at_event,
+      (uint32_t)(uintptr_t)callback_user_data,
+      (uint32_t)(uintptr_t)rt);
   callback(event, &rt->last_diag, callback_user_data);
+  crash_dispatch_breadcrumb_note(
+      CRASH_DISPATCH_BREADCRUMB_SUBSCRIBER_RETURN,
+      (uint32_t)(uintptr_t)callback,
+      (uint32_t)rt->desc->kind,
+      event.counter32_at_event,
+      (uint32_t)(uintptr_t)callback_user_data,
+      (uint32_t)(uintptr_t)rt);
   ZPNET_EXECUTION_TRACE(
       timepop_dispatch_trace_stage_t::SUBSCRIBER_RETURN,
       trace_kind,
@@ -718,10 +732,24 @@ static void deferred_dispatch_callback(timepop_ctx_t*, timepop_diag_t*,
       (uint32_t)(uintptr_t)rt->desc->name,
       event.counter32_at_event);
 
+  crash_dispatch_breadcrumb_note(
+      CRASH_DISPATCH_BREADCRUMB_CLEANUP_ENTER,
+      (uint32_t)(uintptr_t)callback,
+      (uint32_t)rt->desc->kind,
+      event.counter32_at_event,
+      (uint32_t)(uintptr_t)callback_user_data,
+      (uint32_t)(uintptr_t)rt);
   const uint32_t finish_basepri = interrupt_priority0_guard_enter();
   rt->dispatch_running = false;
   rt->deferred = interrupt_deferred_dispatch_t{};
   interrupt_priority0_guard_exit(finish_basepri);
+  crash_dispatch_breadcrumb_note(
+      CRASH_DISPATCH_BREADCRUMB_CLEANUP_COMPLETE,
+      (uint32_t)(uintptr_t)callback,
+      (uint32_t)rt->desc->kind,
+      event.counter32_at_event,
+      (uint32_t)(uintptr_t)callback_user_data,
+      (uint32_t)(uintptr_t)rt);
 
   if (rt->desc->kind == interrupt_subscriber_kind_t::VCLOCK &&
       pps_continuation_valid) {

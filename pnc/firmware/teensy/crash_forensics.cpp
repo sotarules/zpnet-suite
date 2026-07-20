@@ -29,6 +29,12 @@ alignas(8) uint32_t g_crash_forensics_emergency_stack[512];
 alignas(32) static crash_forensics_core_record_t
     g_crash_forensics_core_record DMAMEM;
 alignas(32) static crash_forensics_record_t g_crash_forensics_record DMAMEM;
+alignas(32) static crash_dispatch_breadcrumb_t
+    g_crash_dispatch_breadcrumb_live[2] DMAMEM;
+alignas(32) static crash_dispatch_breadcrumb_t
+    g_crash_dispatch_breadcrumb_retained DMAMEM;
+static bool g_crash_dispatch_breadcrumb_boot_latched = false;
+
 
 static constexpr uint32_t CRASH_FORENSICS_CORE_MAGIC = 0x5A504343UL; // "ZPCC"
 static constexpr uint32_t CRASH_FORENSICS_CORE_COMMITTED = 0x434F5245UL; // "CORE"
@@ -149,6 +155,94 @@ static inline void disable_interrupts(void) {
 
 static inline void crash_barrier(void) {
     asm volatile("dsb\nisb" ::: "memory");
+}
+
+static bool crash_dispatch_breadcrumb_code_address(uint32_t value) {
+    if (value == 0U) return false;
+    const uint32_t address = value & ~1UL;
+    return (address >= 0x00000400UL && address < 0x00100000UL) ||
+           (address >= 0x60000000UL && address < 0x61000000UL);
+}
+
+static bool crash_dispatch_breadcrumb_data_address(uint32_t value) {
+    return (value >= 0x20000000UL && value < 0x20080000UL) ||
+           (value >= 0x20200000UL && value < 0x20280000UL);
+}
+
+static bool crash_dispatch_breadcrumb_valid(
+    const crash_dispatch_breadcrumb_t& breadcrumb) {
+    const bool stage_valid =
+        breadcrumb.stage >= CRASH_DISPATCH_BREADCRUMB_SUBSCRIBER_ENTER &&
+        breadcrumb.stage <= CRASH_DISPATCH_BREADCRUMB_CLEANUP_COMPLETE;
+    const bool user_data_valid =
+        breadcrumb.user_data == 0U ||
+        crash_dispatch_breadcrumb_data_address(breadcrumb.user_data);
+
+    return breadcrumb.sequence != 0U &&
+           (breadcrumb.sequence ^ breadcrumb.sequence_inv) == 0xFFFFFFFFUL &&
+           breadcrumb.schema_version ==
+               CRASH_DISPATCH_BREADCRUMB_SCHEMA_VERSION &&
+           breadcrumb.reserved0 == CRASH_DISPATCH_BREADCRUMB_MAGIC &&
+           breadcrumb.reserved1 == ~CRASH_DISPATCH_BREADCRUMB_MAGIC &&
+           stage_valid &&
+           breadcrumb.subscriber_kind >= 1U &&
+           breadcrumb.subscriber_kind <= 3U &&
+           breadcrumb.ipsr == 0U &&
+           (breadcrumb.basepri & ~0xFFUL) == 0U &&
+           crash_dispatch_breadcrumb_code_address(breadcrumb.callback) &&
+           crash_dispatch_breadcrumb_code_address(breadcrumb.lr) &&
+           crash_dispatch_breadcrumb_data_address(breadcrumb.msp) &&
+           crash_dispatch_breadcrumb_data_address(breadcrumb.runtime) &&
+           user_data_valid;
+}
+
+static void crash_dispatch_breadcrumb_zero(
+    crash_dispatch_breadcrumb_t& breadcrumb) {
+    uint32_t* words = reinterpret_cast<uint32_t*>(&breadcrumb);
+    for (size_t i = 0U;
+         i < sizeof(breadcrumb) / sizeof(uint32_t);
+         ++i) {
+        words[i] = 0U;
+    }
+}
+
+static void crash_dispatch_breadcrumb_flush(
+    crash_dispatch_breadcrumb_t& breadcrumb) {
+    arm_dcache_flush(&breadcrumb, sizeof(breadcrumb));
+}
+
+static const crash_dispatch_breadcrumb_t*
+crash_dispatch_breadcrumb_newest_live(void) {
+    const bool valid0 =
+        crash_dispatch_breadcrumb_valid(g_crash_dispatch_breadcrumb_live[0]);
+    const bool valid1 =
+        crash_dispatch_breadcrumb_valid(g_crash_dispatch_breadcrumb_live[1]);
+    if (!valid0) return valid1 ? &g_crash_dispatch_breadcrumb_live[1] : nullptr;
+    if (!valid1) return &g_crash_dispatch_breadcrumb_live[0];
+    return (int32_t)(g_crash_dispatch_breadcrumb_live[1].sequence -
+                     g_crash_dispatch_breadcrumb_live[0].sequence) > 0
+        ? &g_crash_dispatch_breadcrumb_live[1]
+        : &g_crash_dispatch_breadcrumb_live[0];
+}
+
+static void crash_dispatch_breadcrumb_boot_latch(void) {
+    if (g_crash_dispatch_breadcrumb_boot_latched) return;
+    g_crash_dispatch_breadcrumb_boot_latched = true;
+
+    const crash_dispatch_breadcrumb_t* newest =
+        crash_dispatch_breadcrumb_newest_live();
+    if (newest) {
+        g_crash_dispatch_breadcrumb_retained = *newest;
+        crash_dispatch_breadcrumb_flush(
+            g_crash_dispatch_breadcrumb_retained);
+    }
+
+    for (size_t i = 0U; i < 2U; ++i) {
+        crash_dispatch_breadcrumb_zero(
+            g_crash_dispatch_breadcrumb_live[i]);
+        crash_dispatch_breadcrumb_flush(
+            g_crash_dispatch_breadcrumb_live[i]);
+    }
 }
 
 static void zero_record(crash_forensics_record_t& record) {
@@ -1773,6 +1867,108 @@ FLASHMEM const char* crash_stack_tripwire_site_name(uint32_t site) {
 }
 
 // ============================================================================
+// Retained deferred-dispatch breadcrumb
+// ============================================================================
+
+void crash_dispatch_breadcrumb_note(uint32_t stage,
+                                    uint32_t callback,
+                                    uint32_t subscriber_kind,
+                                    uint32_t event_counter32,
+                                    uint32_t user_data,
+                                    uint32_t runtime) {
+    crash_dispatch_breadcrumb_boot_latch();
+
+    uint32_t msp = 0U;
+    uint32_t lr = 0U;
+    uint32_t basepri = 0U;
+    uint32_t ipsr = 0U;
+#if defined(__arm__)
+    __asm__ volatile("mrs %0, msp" : "=r"(msp));
+    __asm__ volatile("mov %0, lr" : "=r"(lr));
+    __asm__ volatile("mrs %0, basepri" : "=r"(basepri));
+    __asm__ volatile("mrs %0, ipsr" : "=r"(ipsr));
+#endif
+
+    const crash_dispatch_breadcrumb_t* newest =
+        crash_dispatch_breadcrumb_newest_live();
+    uint32_t sequence = newest ? newest->sequence + 1U : 1U;
+    if (sequence == 0U) sequence = 1U;
+
+    crash_dispatch_breadcrumb_t& breadcrumb =
+        g_crash_dispatch_breadcrumb_live[sequence & 1U];
+    breadcrumb.sequence = 0U;
+    breadcrumb.sequence_inv = 0U;
+    crash_barrier();
+
+    breadcrumb.schema_version =
+        CRASH_DISPATCH_BREADCRUMB_SCHEMA_VERSION;
+    breadcrumb.stage = stage;
+    breadcrumb.dwt = reg32(REG_DWT_CYCCNT);
+    breadcrumb.msp = msp;
+    breadcrumb.lr = lr;
+    breadcrumb.basepri = basepri;
+    breadcrumb.ipsr = ipsr & 0x1FFU;
+    breadcrumb.callback = callback;
+    breadcrumb.subscriber_kind = subscriber_kind;
+    breadcrumb.event_counter32 = event_counter32;
+    breadcrumb.user_data = user_data;
+    breadcrumb.runtime = runtime;
+    breadcrumb.reserved0 = CRASH_DISPATCH_BREADCRUMB_MAGIC;
+    breadcrumb.reserved1 = ~CRASH_DISPATCH_BREADCRUMB_MAGIC;
+
+    crash_barrier();
+    breadcrumb.sequence_inv = ~sequence;
+    breadcrumb.sequence = sequence;
+    crash_barrier();
+    crash_dispatch_breadcrumb_flush(breadcrumb);
+}
+
+FLASHMEM void crash_dispatch_breadcrumb_snapshot(
+    crash_dispatch_breadcrumb_snapshot_t* out) {
+    if (!out) return;
+    crash_dispatch_breadcrumb_boot_latch();
+
+    const uint32_t saved_primask = read_primask();
+    disable_interrupts();
+
+    const crash_dispatch_breadcrumb_t* newest =
+        crash_dispatch_breadcrumb_newest_live();
+    out->live = newest ? *newest : crash_dispatch_breadcrumb_t{};
+    out->retained = g_crash_dispatch_breadcrumb_retained;
+    out->live_valid = newest != nullptr;
+    out->retained_valid =
+        crash_dispatch_breadcrumb_valid(out->retained);
+
+    write_primask(saved_primask);
+}
+
+FLASHMEM void crash_dispatch_breadcrumb_clear_retained(void) {
+    const uint32_t saved_primask = read_primask();
+    disable_interrupts();
+    crash_dispatch_breadcrumb_zero(
+        g_crash_dispatch_breadcrumb_retained);
+    crash_dispatch_breadcrumb_flush(
+        g_crash_dispatch_breadcrumb_retained);
+    write_primask(saved_primask);
+}
+
+FLASHMEM const char* crash_dispatch_breadcrumb_stage_name(
+    uint32_t stage) {
+    switch ((crash_dispatch_breadcrumb_stage_t)stage) {
+        case CRASH_DISPATCH_BREADCRUMB_SUBSCRIBER_ENTER:
+            return "SUBSCRIBER_ENTER";
+        case CRASH_DISPATCH_BREADCRUMB_SUBSCRIBER_RETURN:
+            return "SUBSCRIBER_RETURN";
+        case CRASH_DISPATCH_BREADCRUMB_CLEANUP_ENTER:
+            return "CLEANUP_ENTER";
+        case CRASH_DISPATCH_BREADCRUMB_CLEANUP_COMPLETE:
+            return "CLEANUP_COMPLETE";
+        default:
+            return "NONE";
+    }
+}
+
+// ============================================================================
 // Installation, validation and reporting API
 // ============================================================================
 
@@ -1788,6 +1984,7 @@ FLASHMEM void crash_forensics_install(void) {
     crash_barrier();
     g_crash_forensics_capture_active = 0U;
 
+    crash_dispatch_breadcrumb_boot_latch();
     crash_stack_watch_arm();
     crash_stack_tripwire_boot_latch();
 
@@ -1866,11 +2063,15 @@ FLASHMEM void crash_forensics_clear(void) {
     disable_interrupts();
     zero_core_record(g_crash_forensics_core_record);
     zero_record(g_crash_forensics_record);
+    crash_dispatch_breadcrumb_zero(
+        g_crash_dispatch_breadcrumb_retained);
     crash_barrier();
     arm_dcache_flush_delete(&g_crash_forensics_core_record,
                             sizeof(g_crash_forensics_core_record));
     arm_dcache_flush_delete(&g_crash_forensics_record,
                             sizeof(g_crash_forensics_record));
+    crash_dispatch_breadcrumb_flush(
+        g_crash_dispatch_breadcrumb_retained);
     crash_barrier();
     write_primask(saved_primask);
 }

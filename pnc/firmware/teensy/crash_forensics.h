@@ -21,7 +21,7 @@ static constexpr uint32_t CRASH_FORENSICS_CORE_SCHEMA_VERSION = 1U;
 static constexpr size_t CRASH_FORENSICS_NVIC_WORDS = 5U;
 static constexpr size_t CRASH_FORENSICS_MPU_REGIONS = 16U;
 static constexpr size_t CRASH_FORENSICS_FP_FRAME_WORDS = 18U;
-static constexpr size_t CRASH_FORENSICS_CORE_STACK_WORDS = 32U;
+static constexpr size_t CRASH_FORENSICS_CORE_STACK_WORDS = 128U;
 static constexpr size_t CRASH_FORENSICS_ACTIVE_STACK_WORDS = 64U;
 static constexpr size_t CRASH_FORENSICS_OTHER_STACK_WORDS = 16U;
 static constexpr size_t CRASH_FORENSICS_PC_WINDOW_WORDS = 24U;
@@ -317,6 +317,61 @@ const char* crash_forensics_exception_name(uint32_t exception_number);
 const char* crash_forensics_frame_source_name(uint32_t frame_source);
 const char* crash_forensics_capture_stage_name(uint32_t stage);
 const char* crash_forensics_capture_skip_reason_name(uint32_t reason);
+
+// ============================================================================
+// Retained deferred-dispatch breadcrumb
+// ============================================================================
+
+static constexpr uint32_t CRASH_DISPATCH_BREADCRUMB_SCHEMA_VERSION = 1U;
+static constexpr uint32_t CRASH_DISPATCH_BREADCRUMB_MAGIC = 0x5A504442UL; // "ZPDB"
+
+enum crash_dispatch_breadcrumb_stage_t : uint32_t {
+    CRASH_DISPATCH_BREADCRUMB_NONE = 0U,
+    CRASH_DISPATCH_BREADCRUMB_SUBSCRIBER_ENTER = 1U,
+    CRASH_DISPATCH_BREADCRUMB_SUBSCRIBER_RETURN = 2U,
+    CRASH_DISPATCH_BREADCRUMB_CLEANUP_ENTER = 3U,
+    CRASH_DISPATCH_BREADCRUMB_CLEANUP_COMPLETE = 4U,
+};
+
+struct crash_dispatch_breadcrumb_t {
+    uint32_t sequence;
+    uint32_t sequence_inv;
+    uint32_t schema_version;
+    uint32_t stage;
+    uint32_t dwt;
+    uint32_t msp;
+    uint32_t lr;
+    uint32_t basepri;
+    uint32_t ipsr;
+    uint32_t callback;
+    uint32_t subscriber_kind;
+    uint32_t event_counter32;
+    uint32_t user_data;
+    uint32_t runtime;
+    uint32_t reserved0;
+    uint32_t reserved1;
+};
+
+static_assert(sizeof(crash_dispatch_breadcrumb_t) == 64U,
+              "Dispatch breadcrumb must stay two cache lines");
+
+struct crash_dispatch_breadcrumb_snapshot_t {
+    bool live_valid;
+    bool retained_valid;
+    crash_dispatch_breadcrumb_t live;
+    crash_dispatch_breadcrumb_t retained;
+};
+
+void crash_dispatch_breadcrumb_note(uint32_t stage,
+                                    uint32_t callback,
+                                    uint32_t subscriber_kind,
+                                    uint32_t event_counter32,
+                                    uint32_t user_data,
+                                    uint32_t runtime);
+void crash_dispatch_breadcrumb_snapshot(
+    crash_dispatch_breadcrumb_snapshot_t* out);
+void crash_dispatch_breadcrumb_clear_retained(void);
+const char* crash_dispatch_breadcrumb_stage_name(uint32_t stage);
 
 // ============================================================================
 // Retained stack watchpoint (DWT comparator + DebugMonitor)

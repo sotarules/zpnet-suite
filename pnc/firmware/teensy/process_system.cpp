@@ -2513,6 +2513,55 @@ static FLASHMEM Payload system_stack_tripwire_payload(void) {
   return p;
 }
 
+static crash_dispatch_breadcrumb_snapshot_t
+    g_system_dispatch_breadcrumb_scratch DMAMEM;
+
+static FLASHMEM Payload system_dispatch_breadcrumb_entry_payload(
+    bool valid,
+    const crash_dispatch_breadcrumb_t& breadcrumb) {
+  Payload p;
+  p.add("valid", valid);
+  if (!valid) return p;
+
+  p.add("schema_version", breadcrumb.schema_version);
+  p.add("sequence", breadcrumb.sequence);
+  p.add("stage_id", breadcrumb.stage);
+  p.add("stage",
+        crash_dispatch_breadcrumb_stage_name(breadcrumb.stage));
+  system_crash_add_hex32(p, "dwt", breadcrumb.dwt);
+  system_crash_add_hex32(p, "msp", breadcrumb.msp);
+  system_crash_add_hex32(p, "lr", breadcrumb.lr);
+  system_crash_add_hex32(p, "basepri", breadcrumb.basepri);
+  p.add("ipsr", breadcrumb.ipsr);
+  system_crash_add_hex32(p, "callback", breadcrumb.callback);
+  p.add("subscriber_kind", breadcrumb.subscriber_kind);
+  system_crash_add_hex32(p, "event_counter32",
+                         breadcrumb.event_counter32);
+  system_crash_add_hex32(p, "user_data", breadcrumb.user_data);
+  system_crash_add_hex32(p, "runtime", breadcrumb.runtime);
+  return p;
+}
+
+static FLASHMEM Payload system_dispatch_breadcrumb_payload(void) {
+  system_dmamem_ensure_initialized();
+  crash_dispatch_breadcrumb_snapshot(
+      &g_system_dispatch_breadcrumb_scratch);
+
+  Payload p;
+  p.add("schema", "ZPNET_DISPATCH_BREADCRUMB_V1");
+  p.add_object(
+      "retained",
+      system_dispatch_breadcrumb_entry_payload(
+          g_system_dispatch_breadcrumb_scratch.retained_valid,
+          g_system_dispatch_breadcrumb_scratch.retained));
+  p.add_object(
+      "live",
+      system_dispatch_breadcrumb_entry_payload(
+          g_system_dispatch_breadcrumb_scratch.live_valid,
+          g_system_dispatch_breadcrumb_scratch.live));
+  return p;
+}
+
 static FLASHMEM Payload system_crash_report_payload(bool include_text) {
   Payload p;
   p.add("core_fault_present_now", (bool)CrashReport);
@@ -2528,6 +2577,8 @@ static FLASHMEM Payload system_crash_report_payload(bool include_text) {
   // Runtime breadcrumbs, unified Execution Trace, and Payload forensics remain
   // retained through reboot beside the processor exception evidence.
   p.add_object("runtime_ledger", system_runtime_ledger_payload());
+  p.add_object("dispatch_breadcrumb",
+               system_dispatch_breadcrumb_payload());
   p.add_object("execution_trace",
                system_execution_trace_summary_payload());
   p.add_object("payload_flight", system_payload_flight_payload(true));
@@ -3309,6 +3360,8 @@ static void system_dmamem_ensure_initialized(void) {
          sizeof(g_system_payload_append_trace_scratch));
   memset((void*)&g_system_payload_contract_info_scratch, 0,
          sizeof(g_system_payload_contract_info_scratch));
+  memset((void*)&g_system_dispatch_breadcrumb_scratch, 0,
+         sizeof(g_system_dispatch_breadcrumb_scratch));
 
   // crash_forensics.cpp owns its retained RAM2 record.  Never initialize or
   // clear that record here; it may be the only surviving witness to a reboot.
@@ -3509,6 +3562,7 @@ static FLASHMEM Payload cmd_crash_clear(const Payload& /*args*/) {
   Payload resp = ok_payload();
   resp.add("crash_report_cleared", true);
   resp.add("crash_forensics_cleared", true);
+  resp.add("dispatch_breadcrumb_retained_cleared", true);
   resp.add("runtime_ledger_cleared", true);
   resp.add("execution_trace_cleared", true);
   resp.add("timepop_dispatch_trace_cleared", true);
