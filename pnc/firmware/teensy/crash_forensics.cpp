@@ -17,6 +17,9 @@ extern unsigned long _stext;
 extern unsigned long _etext;
 extern unsigned long _estack;
 void crash_forensics_fault_entry(void);
+void execution_trace_capture_fault(uint32_t fault_dwt,
+                                   uint32_t crash_sequence)
+    __attribute__((weak));
 
 // Ordinary BSS: cleared by startup before startup_late_hook() installs us.
 volatile uint32_t g_crash_forensics_capture_active = 0U;
@@ -894,6 +897,14 @@ extern "C" void crash_forensics_capture_from_entry(
     // Phase 1: commit the small, direct-read core record before any MPU walk,
     // executable-window inspection, or extended stack capture can fault.
     capture_core_record_from_entry(entry, sequence);
+
+    // Preserve the last committed ISR/handoff/TimePop control-flow transcript
+    // immediately after the core record.  The weak boundary keeps crash
+    // forensics usable in builds that do not include Execution Trace.
+    if (execution_trace_capture_fault) {
+        execution_trace_capture_fault(reg32(REG_DWT_CYCCNT), sequence);
+    }
+
     core_record_publish_stage(CRASH_FORENSICS_STAGE_EXTENDED_BEGIN);
 
     // Phase 2: preserve the existing rich recorder as best-effort evidence.

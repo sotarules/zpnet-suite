@@ -2433,6 +2433,24 @@ static const char* timepop_dispatch_trace_stage_name(uint32_t stage) {
       return "DISPATCH_LEAVE";
     case timepop_dispatch_trace_stage_t::IRQ_SELECTED:
       return "IRQ_SELECTED";
+    case timepop_dispatch_trace_stage_t::ISR_ENTER:
+      return "ISR_ENTER";
+    case timepop_dispatch_trace_stage_t::ISR_CAPTURED:
+      return "ISR_CAPTURED";
+    case timepop_dispatch_trace_stage_t::ISR_EXIT:
+      return "ISR_EXIT";
+    case timepop_dispatch_trace_stage_t::HANDOFF_ENTER:
+      return "HANDOFF_ENTER";
+    case timepop_dispatch_trace_stage_t::HANDOFF_DEQUEUE:
+      return "HANDOFF_DEQUEUE";
+    case timepop_dispatch_trace_stage_t::HANDOFF_EXIT:
+      return "HANDOFF_EXIT";
+    case timepop_dispatch_trace_stage_t::SUBSCRIBER_SELECTED:
+      return "SUBSCRIBER_SELECTED";
+    case timepop_dispatch_trace_stage_t::SUBSCRIBER_ENTER:
+      return "SUBSCRIBER_ENTER";
+    case timepop_dispatch_trace_stage_t::SUBSCRIBER_RETURN:
+      return "SUBSCRIBER_RETURN";
     default:
       return "NONE";
   }
@@ -2454,6 +2472,24 @@ static const char* timepop_dispatch_trace_kind_name(uint32_t kind) {
       return "MUTATION";
     case timepop_dispatch_trace_kind_t::REARM:
       return "REARM";
+    case timepop_dispatch_trace_kind_t::ISR_QTIMER1:
+      return "ISR_QTIMER1";
+    case timepop_dispatch_trace_kind_t::ISR_VCLOCK:
+      return "ISR_VCLOCK";
+    case timepop_dispatch_trace_kind_t::ISR_OCXO1:
+      return "ISR_OCXO1";
+    case timepop_dispatch_trace_kind_t::ISR_OCXO2:
+      return "ISR_OCXO2";
+    case timepop_dispatch_trace_kind_t::ISR_PPS:
+      return "ISR_PPS";
+    case timepop_dispatch_trace_kind_t::INTERRUPT_HANDOFF:
+      return "INTERRUPT_HANDOFF";
+    case timepop_dispatch_trace_kind_t::SUBSCRIBER_VCLOCK:
+      return "SUBSCRIBER_VCLOCK";
+    case timepop_dispatch_trace_kind_t::SUBSCRIBER_OCXO1:
+      return "SUBSCRIBER_OCXO1";
+    case timepop_dispatch_trace_kind_t::SUBSCRIBER_OCXO2:
+      return "SUBSCRIBER_OCXO2";
     default:
       return "NONE";
   }
@@ -2542,6 +2578,23 @@ static const char* timepop_dispatch_trace_aux_meaning(uint32_t stage,
       return "prior_handle";
     case timepop_dispatch_trace_stage_t::DISPATCH_LEAVE:
       return "timepop_pending";
+    case timepop_dispatch_trace_stage_t::ISR_ENTER:
+      return "captured_counter_or_source_status";
+    case timepop_dispatch_trace_stage_t::ISR_CAPTURED:
+      return "capture_window_cycles";
+    case timepop_dispatch_trace_stage_t::ISR_EXIT:
+      return "captured_counter_or_source_status";
+    case timepop_dispatch_trace_stage_t::HANDOFF_ENTER:
+      return "pending";
+    case timepop_dispatch_trace_stage_t::HANDOFF_DEQUEUE:
+      return "handoff_entry_dwt";
+    case timepop_dispatch_trace_stage_t::HANDOFF_EXIT:
+      return "drained_count|pending_or_reentry(bit31)";
+    case timepop_dispatch_trace_stage_t::SUBSCRIBER_SELECTED:
+      return "dispatch_mode(bits0-1)|binding_generation(bits16-31)";
+    case timepop_dispatch_trace_stage_t::SUBSCRIBER_ENTER:
+    case timepop_dispatch_trace_stage_t::SUBSCRIBER_RETURN:
+      return "event_counter32_or_source_specific";
     default:
       return "raw";
   }
@@ -2561,6 +2614,11 @@ static FLASHMEM Payload system_timepop_dispatch_trace_entry_payload(
   out.add("has_slot", entry.slot_index != TIMEPOP_DISPATCH_TRACE_NO_SLOT);
   out.add("handle", entry.handle);
 
+  // Generic Execution Trace aliases.  The established TimePop field names
+  // remain below for compatibility with TIMEPOP_DISPATCH_INFO.
+  out.add("subject_index", entry.slot_index);
+  out.add("identity", entry.handle);
+
   system_crash_add_hex32(out, "callback", entry.callback);
   out.add("callback_null", entry.callback == 0U);
   system_crash_add_hex32(out, "slot_callback", entry.slot_callback);
@@ -2571,8 +2629,15 @@ static FLASHMEM Payload system_timepop_dispatch_trace_entry_payload(
   out.add("slot_callback_executable",
           timepop_dispatch_trace_executable_address(entry.slot_callback));
 
+  system_crash_add_hex32(out, "target", entry.callback);
+  system_crash_add_hex32(out, "related_target", entry.slot_callback);
+  out.add("target_executable",
+          timepop_dispatch_trace_executable_address(entry.callback));
+
   system_crash_add_hex32(out, "user_data", entry.user_data);
   system_crash_add_hex32(out, "name_ptr", entry.name_ptr);
+  system_crash_add_hex32(out, "object", entry.user_data);
+  system_crash_add_hex32(out, "label_ptr", entry.name_ptr);
   system_crash_add_hex32(out, "caller_sp", entry.caller_sp);
   system_crash_add_hex32(out, "site_pc", entry.site_pc);
   out.add("site_pc_executable",
@@ -2606,14 +2671,20 @@ static FLASHMEM Payload system_timepop_dispatch_trace_compact_entry_payload(
   out.add("kind", timepop_dispatch_trace_kind_name(entry.kind));
   out.add("slot_index", entry.slot_index);
   out.add("handle", entry.handle);
+  out.add("subject_index", entry.slot_index);
+  out.add("identity", entry.handle);
   system_crash_add_hex32(out, "callback", entry.callback);
   system_crash_add_hex32(out, "slot_callback", entry.slot_callback);
+  system_crash_add_hex32(out, "target", entry.callback);
+  system_crash_add_hex32(out, "related_target", entry.slot_callback);
   out.add("callback_matches_slot",
           entry.callback != 0U && entry.callback == entry.slot_callback);
   out.add("callback_executable",
           timepop_dispatch_trace_executable_address(entry.callback));
   system_crash_add_hex32(out, "user_data", entry.user_data);
   system_crash_add_hex32(out, "name_ptr", entry.name_ptr);
+  system_crash_add_hex32(out, "object", entry.user_data);
+  system_crash_add_hex32(out, "label_ptr", entry.name_ptr);
   system_crash_add_hex32(out, "caller_sp", entry.caller_sp);
   system_crash_add_hex32(out, "site_pc", entry.site_pc);
   system_crash_add_hex32(out, "dwt", entry.dwt);
@@ -2624,8 +2695,9 @@ static FLASHMEM Payload system_timepop_dispatch_trace_compact_entry_payload(
   return out;
 }
 
-static FLASHMEM Payload system_timepop_dispatch_trace_payload(
-    const Payload& args) {
+static FLASHMEM Payload system_execution_trace_payload(
+    const Payload& args,
+    bool legacy_timepop_schema) {
   timepop_dispatch_trace_snapshot(&g_system_timepop_dispatch_trace_scratch);
 
   bool bank_valid = true;
@@ -2646,9 +2718,18 @@ static FLASHMEM Payload system_timepop_dispatch_trace_payload(
   system_trace_bounds(bank.count, requested, offset, &begin, &end);
 
   Payload out;
-  out.add("schema", "ZPNET_TIMEPOP_DISPATCH_TRACE_V2");
+  out.add("schema", legacy_timepop_schema
+      ? "ZPNET_TIMEPOP_DISPATCH_TRACE_V2"
+      : "ZPNET_EXECUTION_TRACE_V1");
+  out.add("report", legacy_timepop_schema
+      ? "TIMEPOP_DISPATCH_INFO"
+      : "EXECUTION_TRACE");
   out.add("bank", live_bank ? "live" : "retained");
   out.add("valid", bank.valid);
+  out.add("fault_captured", bank.fault_captured);
+  system_crash_add_hex32(out, "fault_dwt", bank.fault_dwt);
+  out.add("crash_sequence", bank.crash_sequence);
+  out.add("trace_sequence_at_capture", bank.trace_sequence_at_capture);
   out.add("capacity", TIMEPOP_DISPATCH_TRACE_ENTRIES);
   out.add("available_count", bank.count);
   out.add("newest_sequence", bank.newest_sequence);
@@ -2671,14 +2752,18 @@ static FLASHMEM Payload system_timepop_dispatch_trace_payload(
   return out;
 }
 
-static FLASHMEM Payload system_timepop_dispatch_trace_summary_payload(void) {
+static FLASHMEM Payload system_execution_trace_summary_payload(void) {
   timepop_dispatch_trace_snapshot(&g_system_timepop_dispatch_trace_scratch);
   const timepop_dispatch_trace_bank_snapshot_t& retained =
       g_system_timepop_dispatch_trace_scratch.retained;
 
   Payload out;
-  out.add("schema", "ZPNET_TIMEPOP_DISPATCH_TRACE_SUMMARY_V1");
+  out.add("schema", "ZPNET_EXECUTION_TRACE_SUMMARY_V1");
   out.add("retained_valid", retained.valid);
+  out.add("fault_captured", retained.fault_captured);
+  system_crash_add_hex32(out, "fault_dwt", retained.fault_dwt);
+  out.add("crash_sequence", retained.crash_sequence);
+  out.add("trace_sequence_at_capture", retained.trace_sequence_at_capture);
   out.add("retained_count", retained.count);
   out.add("newest_sequence", retained.newest_sequence);
   if (retained.valid && retained.count != 0U) {
@@ -3235,12 +3320,12 @@ static FLASHMEM Payload system_crash_report_payload(bool include_text) {
   }
   p.add_object("extended", system_crash_forensics_payload());
 
-  // Runtime breadcrumbs, TimePop dispatch history, memory-audit history,
+  // Runtime breadcrumbs, unified Execution Trace, memory-audit history,
   // and Payload forensics remain retained through reboot beside the processor
   // exception evidence.
   p.add_object("runtime_ledger", system_runtime_ledger_payload());
-  p.add_object("timepop_dispatch_trace",
-               system_timepop_dispatch_trace_summary_payload());
+  p.add_object("execution_trace",
+               system_execution_trace_summary_payload());
   p.add_object("memory_audit_trace",
                system_memory_audit_trace_summary_payload());
   p.add_object("memory_watchdog_trace",
@@ -4369,10 +4454,17 @@ static FLASHMEM Payload cmd_memory_audit_info(const Payload& args) {
 }
 
 // ------------------------------------------------------------
-// TIMEPOP_DISPATCH_INFO — bounded callback/control-flow transcript
+// EXECUTION_TRACE — retained/live ISR-to-TimePop control-flow transcript
+// ------------------------------------------------------------
+static FLASHMEM Payload cmd_execution_trace(const Payload& args) {
+  return system_execution_trace_payload(args, false);
+}
+
+// ------------------------------------------------------------
+// TIMEPOP_DISPATCH_INFO — compatibility alias for the shared transcript
 // ------------------------------------------------------------
 static FLASHMEM Payload cmd_timepop_dispatch_info(const Payload& args) {
-  return system_timepop_dispatch_trace_payload(args);
+  return system_execution_trace_payload(args, true);
 }
 
 // ------------------------------------------------------------
@@ -4440,6 +4532,7 @@ static FLASHMEM Payload cmd_crash_clear(const Payload& /*args*/) {
   resp.add("runtime_ledger_cleared", true);
   resp.add("memory_audit_trace_cleared", true);
   resp.add("memory_watchdog_trace_cleared", true);
+  resp.add("execution_trace_cleared", true);
   resp.add("timepop_dispatch_trace_cleared", true);
   resp.add("payload_append_trace_cleared", true);
   resp.add("stack_watch_retained_cleared", true);
@@ -4503,6 +4596,7 @@ static const process_command_entry_t SYSTEM_COMMANDS[] = {
   { "CRASH_POLICY",     cmd_crash_policy     },
   { "CRASH_CLEAR",      cmd_crash_clear      },
   { "MEMORY_AUDIT_INFO", cmd_memory_audit_info },
+  { "EXECUTION_TRACE", cmd_execution_trace },
   { "TIMEPOP_DISPATCH_INFO", cmd_timepop_dispatch_info },
   { "PAYLOAD_FLIGHT_INFO", cmd_payload_flight_info },
   { "PAYLOAD_APPEND_TRACE", cmd_payload_append_trace },
@@ -4531,6 +4625,5 @@ void process_system_register(void) {
   g_system_feature_fragment_publish_enabled = true;
   system_feature_schedule_fragment_publish();
 
-  // MULE: completely defeat watchdog
-  //system_memory_watchdog_arm();
+  system_memory_watchdog_arm();
 }

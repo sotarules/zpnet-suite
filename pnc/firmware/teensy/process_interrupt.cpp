@@ -8411,6 +8411,20 @@ static bool interrupt_subscriber_callback_executable(
   return interrupt_callback_address_executable((uintptr_t)callback);
 }
 
+static timepop_dispatch_trace_kind_t interrupt_execution_trace_subscriber_kind(
+    interrupt_subscriber_kind_t kind) {
+  switch (kind) {
+    case interrupt_subscriber_kind_t::VCLOCK:
+      return timepop_dispatch_trace_kind_t::SUBSCRIBER_VCLOCK;
+    case interrupt_subscriber_kind_t::OCXO1:
+      return timepop_dispatch_trace_kind_t::SUBSCRIBER_OCXO1;
+    case interrupt_subscriber_kind_t::OCXO2:
+      return timepop_dispatch_trace_kind_t::SUBSCRIBER_OCXO2;
+    default:
+      return timepop_dispatch_trace_kind_t::NONE;
+  }
+}
+
 static void interrupt_dispatch_invalidate_locked(
     interrupt_subscriber_runtime_t& rt) {
   rt.binding_generation++;
@@ -8482,6 +8496,17 @@ static bool interrupt_dispatch_begin(
 
     interrupt_priority0_guard_exit(prior_basepri);
 
+    ZPNET_EXECUTION_TRACE(
+        timepop_dispatch_trace_stage_t::SUBSCRIBER_SELECTED,
+        interrupt_execution_trace_subscriber_kind(rt.desc->kind),
+        (uint32_t)rt.desc->kind,
+        event.counter32_at_event,
+        (uint32_t)(uintptr_t)callback,
+        (uint32_t)(uintptr_t)rt.sub.on_event,
+        (uint32_t)(uintptr_t)callback_user_data,
+        (uint32_t)(uintptr_t)rt.desc->name,
+        1U | (binding_generation << 16));
+
     const timepop_handle_t handle =
         timepop_arm_asap(deferred_dispatch_callback,
                          &rt,
@@ -8503,8 +8528,40 @@ static bool interrupt_dispatch_begin(
   rt.dispatch_running = true;
   interrupt_priority0_guard_exit(prior_basepri);
 
+  const timepop_dispatch_trace_kind_t trace_kind =
+      interrupt_execution_trace_subscriber_kind(rt.desc->kind);
+  ZPNET_EXECUTION_TRACE(
+      timepop_dispatch_trace_stage_t::SUBSCRIBER_SELECTED,
+      trace_kind,
+      (uint32_t)rt.desc->kind,
+      event.counter32_at_event,
+      (uint32_t)(uintptr_t)callback,
+      (uint32_t)(uintptr_t)rt.sub.on_event,
+      (uint32_t)(uintptr_t)callback_user_data,
+      (uint32_t)(uintptr_t)rt.desc->name,
+      binding_generation << 16);
+  ZPNET_EXECUTION_TRACE(
+      timepop_dispatch_trace_stage_t::SUBSCRIBER_ENTER,
+      trace_kind,
+      (uint32_t)rt.desc->kind,
+      event.counter32_at_event,
+      (uint32_t)(uintptr_t)callback,
+      0U,
+      (uint32_t)(uintptr_t)callback_user_data,
+      (uint32_t)(uintptr_t)rt.desc->name,
+      event.counter32_at_event);
   rt.dispatch_count++;
   callback(event, &diag, callback_user_data);
+  ZPNET_EXECUTION_TRACE(
+      timepop_dispatch_trace_stage_t::SUBSCRIBER_RETURN,
+      trace_kind,
+      (uint32_t)rt.desc->kind,
+      event.counter32_at_event,
+      (uint32_t)(uintptr_t)callback,
+      0U,
+      (uint32_t)(uintptr_t)callback_user_data,
+      (uint32_t)(uintptr_t)rt.desc->name,
+      event.counter32_at_event);
 
   const uint32_t finish_basepri = interrupt_priority0_guard_enter();
   rt.dispatch_running = false;
@@ -8572,8 +8629,40 @@ static __attribute__((noinline)) void deferred_dispatch_callback(timepop_ctx_t*,
   rt->dispatch_running = true;
   interrupt_priority0_guard_exit(prior_basepri);
 
+  const timepop_dispatch_trace_kind_t trace_kind =
+      interrupt_execution_trace_subscriber_kind(rt->desc->kind);
+  ZPNET_EXECUTION_TRACE(
+      timepop_dispatch_trace_stage_t::SUBSCRIBER_SELECTED,
+      trace_kind,
+      (uint32_t)rt->desc->kind,
+      event.counter32_at_event,
+      (uint32_t)(uintptr_t)callback,
+      (uint32_t)(uintptr_t)rt->sub.on_event,
+      (uint32_t)(uintptr_t)callback_user_data,
+      (uint32_t)(uintptr_t)rt->desc->name,
+      2U | (rt->deferred.binding_generation << 16));
+  ZPNET_EXECUTION_TRACE(
+      timepop_dispatch_trace_stage_t::SUBSCRIBER_ENTER,
+      trace_kind,
+      (uint32_t)rt->desc->kind,
+      event.counter32_at_event,
+      (uint32_t)(uintptr_t)callback,
+      0U,
+      (uint32_t)(uintptr_t)callback_user_data,
+      (uint32_t)(uintptr_t)rt->desc->name,
+      event.counter32_at_event);
   rt->dispatch_count++;
   callback(event, &diag, callback_user_data);
+  ZPNET_EXECUTION_TRACE(
+      timepop_dispatch_trace_stage_t::SUBSCRIBER_RETURN,
+      trace_kind,
+      (uint32_t)rt->desc->kind,
+      event.counter32_at_event,
+      (uint32_t)(uintptr_t)callback,
+      0U,
+      (uint32_t)(uintptr_t)callback_user_data,
+      (uint32_t)(uintptr_t)rt->desc->name,
+      event.counter32_at_event);
 
   const uint32_t finish_basepri = interrupt_priority0_guard_enter();
   rt->dispatch_running = false;
@@ -8587,7 +8676,27 @@ static __attribute__((noinline)) void deferred_dispatch_callback(timepop_ctx_t*,
     const pps_edge_dispatch_fn pps_dispatch = g_pps_edge_dispatch;
     if (pps_continuation_valid &&
         interrupt_callback_address_executable((uintptr_t)pps_dispatch)) {
+      ZPNET_EXECUTION_TRACE(
+          timepop_dispatch_trace_stage_t::SUBSCRIBER_ENTER,
+          timepop_dispatch_trace_kind_t::SUBSCRIBER_VCLOCK,
+          (uint32_t)interrupt_subscriber_kind_t::VCLOCK,
+          pps_continuation.sequence,
+          (uint32_t)(uintptr_t)pps_dispatch,
+          0U,
+          0U,
+          (uint32_t)(uintptr_t)"PPS_BETA_CONTINUATION",
+          pps_continuation.counter32_at_edge);
       pps_dispatch(pps_continuation);
+      ZPNET_EXECUTION_TRACE(
+          timepop_dispatch_trace_stage_t::SUBSCRIBER_RETURN,
+          timepop_dispatch_trace_kind_t::SUBSCRIBER_VCLOCK,
+          (uint32_t)interrupt_subscriber_kind_t::VCLOCK,
+          pps_continuation.sequence,
+          (uint32_t)(uintptr_t)pps_dispatch,
+          0U,
+          0U,
+          (uint32_t)(uintptr_t)"PPS_BETA_CONTINUATION",
+          pps_continuation.counter32_at_edge);
     }
 
     // Only now may the next VCLOCK fact enter Alpha.  This serializes the whole
@@ -11671,6 +11780,43 @@ static bool interrupt_handoff_drain_one_oldest(uint32_t handoff_entry_dwt) {
   }
   if (!have) return false;
 
+  timepop_dispatch_trace_kind_t trace_kind =
+      timepop_dispatch_trace_kind_t::INTERRUPT_HANDOFF;
+  switch (best) {
+    case SRC_CH1:
+      trace_kind = timepop_dispatch_trace_kind_t::ISR_QTIMER1;
+      break;
+    case SRC_VCLOCK:
+      trace_kind = timepop_dispatch_trace_kind_t::ISR_VCLOCK;
+      break;
+    case SRC_CH2:
+      trace_kind = timepop_dispatch_trace_kind_t::ISR_TIMED;
+      break;
+    case SRC_OCXO1_1KHZ:
+    case SRC_OCXO1_1S:
+      trace_kind = timepop_dispatch_trace_kind_t::ISR_OCXO1;
+      break;
+    case SRC_OCXO2_1KHZ:
+    case SRC_OCXO2_1S:
+      trace_kind = timepop_dispatch_trace_kind_t::ISR_OCXO2;
+      break;
+    case SRC_PPS:
+      trace_kind = timepop_dispatch_trace_kind_t::ISR_PPS;
+      break;
+    default:
+      break;
+  }
+  ZPNET_EXECUTION_TRACE(
+      timepop_dispatch_trace_stage_t::HANDOFF_DEQUEUE,
+      trace_kind,
+      (uint32_t)best,
+      best_seq,
+      0U,
+      0U,
+      0U,
+      0U,
+      handoff_entry_dwt);
+
   const uint32_t body_start = ARM_DWT_CYCCNT;
   switch (best) {
     case SRC_CH1: {
@@ -11794,8 +11940,28 @@ static bool interrupt_handoff_drain_one_oldest(uint32_t handoff_entry_dwt) {
 static void interrupt_handoff_service_isr(void) {
   const uint32_t entry_dwt = ARM_DWT_CYCCNT;  // SACRED first instruction.
   crash_stack_tripwire_isr_check(CRASH_TRIPWIRE_SITE_HANDOFF);
+  ZPNET_EXECUTION_TRACE(
+      timepop_dispatch_trace_stage_t::HANDOFF_ENTER,
+      timepop_dispatch_trace_kind_t::INTERRUPT_HANDOFF,
+      0U,
+      g_interrupt_handoff.entry_count + 1U,
+      0U,
+      0U,
+      0U,
+      (uint32_t)(uintptr_t)"PRIORITY16_HANDOFF",
+      g_interrupt_handoff.pending ? 1U : 0U);
   if (g_interrupt_handoff.running) {
     g_interrupt_handoff.reentry_count++;
+    ZPNET_EXECUTION_TRACE(
+        timepop_dispatch_trace_stage_t::HANDOFF_EXIT,
+        timepop_dispatch_trace_kind_t::INTERRUPT_HANDOFF,
+        1U,
+        g_interrupt_handoff.entry_count,
+        0U,
+        0U,
+        0U,
+        (uint32_t)(uintptr_t)"PRIORITY16_HANDOFF",
+        0x80000000UL | g_interrupt_handoff.reentry_count);
     return;
   }
 
@@ -11860,6 +12026,17 @@ static void interrupt_handoff_service_isr(void) {
     g_interrupt_handoff.unserved_request_count =
         g_interrupt_handoff.request_count - g_interrupt_handoff.served_request_count;
   }
+
+  ZPNET_EXECUTION_TRACE(
+      timepop_dispatch_trace_stage_t::HANDOFF_EXIT,
+      timepop_dispatch_trace_kind_t::INTERRUPT_HANDOFF,
+      0U,
+      g_interrupt_handoff.entry_count,
+      0U,
+      0U,
+      0U,
+      (uint32_t)(uintptr_t)"PRIORITY16_HANDOFF",
+      drained | (g_interrupt_handoff.pending ? 0x80000000UL : 0U));
 
 }
 
@@ -12614,9 +12791,29 @@ static void qtimer2_isr(void) {
   const uint16_t generation_gate_ambient_low16 =
       IMXRT_TMR2.CH[QTIMER2_OCXO1_CH].CNTR;
   crash_stack_tripwire_isr_check(CRASH_TRIPWIRE_SITE_QTIMER2);
+  ZPNET_EXECUTION_TRACE(
+      timepop_dispatch_trace_stage_t::ISR_ENTER,
+      timepop_dispatch_trace_kind_t::ISR_OCXO1,
+      QTIMER2_OCXO1_CH,
+      g_ocxo1_lane.cadence_fire_count,
+      0U,
+      0U,
+      (uint32_t)(uintptr_t)&g_ocxo1_ctx,
+      (uint32_t)(uintptr_t)"QTIMER2_OCXO1_ISR",
+      generation_gate_ambient_low16);
   ocxo_cadence_capture_priority0(g_ocxo1_ctx,
                                  isr_entry_dwt_raw,
                                  generation_gate_ambient_low16);
+  ZPNET_EXECUTION_TRACE(
+      timepop_dispatch_trace_stage_t::ISR_EXIT,
+      timepop_dispatch_trace_kind_t::ISR_OCXO1,
+      QTIMER2_OCXO1_CH,
+      g_ocxo1_lane.cadence_fire_count,
+      0U,
+      0U,
+      (uint32_t)(uintptr_t)&g_ocxo1_ctx,
+      (uint32_t)(uintptr_t)"QTIMER2_OCXO1_ISR",
+      generation_gate_ambient_low16);
 }
 
 static void qtimer3_isr(void) {
@@ -12624,9 +12821,29 @@ static void qtimer3_isr(void) {
   const uint16_t generation_gate_ambient_low16 =
       IMXRT_TMR3.CH[QTIMER3_OCXO2_CH].CNTR;
   crash_stack_tripwire_isr_check(CRASH_TRIPWIRE_SITE_QTIMER3);
+  ZPNET_EXECUTION_TRACE(
+      timepop_dispatch_trace_stage_t::ISR_ENTER,
+      timepop_dispatch_trace_kind_t::ISR_OCXO2,
+      QTIMER3_OCXO2_CH,
+      g_ocxo2_lane.cadence_fire_count,
+      0U,
+      0U,
+      (uint32_t)(uintptr_t)&g_ocxo2_ctx,
+      (uint32_t)(uintptr_t)"QTIMER3_OCXO2_ISR",
+      generation_gate_ambient_low16);
   ocxo_cadence_capture_priority0(g_ocxo2_ctx,
                                  isr_entry_dwt_raw,
                                  generation_gate_ambient_low16);
+  ZPNET_EXECUTION_TRACE(
+      timepop_dispatch_trace_stage_t::ISR_EXIT,
+      timepop_dispatch_trace_kind_t::ISR_OCXO2,
+      QTIMER3_OCXO2_CH,
+      g_ocxo2_lane.cadence_fire_count,
+      0U,
+      0U,
+      (uint32_t)(uintptr_t)&g_ocxo2_ctx,
+      (uint32_t)(uintptr_t)"QTIMER3_OCXO2_ISR",
+      generation_gate_ambient_low16);
 }
 
 // ============================================================================
@@ -12757,7 +12974,27 @@ static void interrupt_handoff_process_qtimer1_ch1(
 
   const interrupt_qtimer1_ch1_handler_fn callback = g_qtimer1_ch1_handler;
   if (interrupt_callback_address_executable((uintptr_t)callback)) {
+    ZPNET_EXECUTION_TRACE(
+        timepop_dispatch_trace_stage_t::SUBSCRIBER_ENTER,
+        timepop_dispatch_trace_kind_t::ISR_QTIMER1,
+        QTIMER1_RETIRED_AUX_CH,
+        event.sequence,
+        (uint32_t)(uintptr_t)callback,
+        (uint32_t)(uintptr_t)g_qtimer1_ch1_handler,
+        0U,
+        (uint32_t)(uintptr_t)"QTIMER1_CH1_HOSTED",
+        event.counter32_at_event);
     callback(event);
+    ZPNET_EXECUTION_TRACE(
+        timepop_dispatch_trace_stage_t::SUBSCRIBER_RETURN,
+        timepop_dispatch_trace_kind_t::ISR_QTIMER1,
+        QTIMER1_RETIRED_AUX_CH,
+        event.sequence,
+        (uint32_t)(uintptr_t)callback,
+        (uint32_t)(uintptr_t)g_qtimer1_ch1_handler,
+        0U,
+        (uint32_t)(uintptr_t)"QTIMER1_CH1_HOSTED",
+        event.counter32_at_event);
   }
 }
 
@@ -12820,7 +13057,27 @@ static void interrupt_handoff_process_qtimer1_ch2(
     diag.dwt_used_minus_event_cycles = 0;
       bridge_projection_copy_to_diag(diag, bridge);
 
+    ZPNET_EXECUTION_TRACE(
+        timepop_dispatch_trace_stage_t::SUBSCRIBER_ENTER,
+        timepop_dispatch_trace_kind_t::ISR_TIMED,
+        QTIMER1_TIMEPOP_CH,
+        ch2_event_counter32,
+        (uint32_t)(uintptr_t)callback,
+        (uint32_t)(uintptr_t)g_qtimer1_ch2_handler,
+        0U,
+        (uint32_t)(uintptr_t)"QTIMER1_CH2_TIMEPOP",
+        qtimer_event_dwt);
     callback(event, diag);
+    ZPNET_EXECUTION_TRACE(
+        timepop_dispatch_trace_stage_t::SUBSCRIBER_RETURN,
+        timepop_dispatch_trace_kind_t::ISR_TIMED,
+        QTIMER1_TIMEPOP_CH,
+        ch2_event_counter32,
+        (uint32_t)(uintptr_t)callback,
+        (uint32_t)(uintptr_t)g_qtimer1_ch2_handler,
+        0U,
+        (uint32_t)(uintptr_t)"QTIMER1_CH2_TIMEPOP",
+        qtimer_event_dwt);
   }
 
 }
@@ -12933,12 +13190,32 @@ static void qtimer1_isr(void) {
   const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;  // SACRED: first instruction.
   const uint16_t generation_gate_vclock_low16 = qtimer1_ch0_counter_now();
   crash_stack_tripwire_isr_check(CRASH_TRIPWIRE_SITE_QTIMER1);
+  ZPNET_EXECUTION_TRACE(
+      timepop_dispatch_trace_stage_t::ISR_ENTER,
+      timepop_dispatch_trace_kind_t::ISR_QTIMER1,
+      TIMEPOP_DISPATCH_TRACE_NO_SLOT,
+      g_interrupt_handoff.request_count,
+      0U,
+      0U,
+      0U,
+      (uint32_t)(uintptr_t)"QTIMER1_SHARED_ISR",
+      generation_gate_vclock_low16);
   // VCLOCK authority: QTimer1 CH0 is the pin-bound VCLOCK count+compare rail.
   const uint32_t vclock_csctrl = IMXRT_TMR1.CH[QTIMER1_VCLOCK_CH].CSCTRL;
   if (vclock_csctrl & TMR_CSCTRL_TCF1) {
     qtimer1_vclock_capture_priority0(isr_entry_dwt_raw,
                                      vclock_csctrl,
                                      generation_gate_vclock_low16);
+    ZPNET_EXECUTION_TRACE(
+        timepop_dispatch_trace_stage_t::ISR_EXIT,
+        timepop_dispatch_trace_kind_t::ISR_VCLOCK,
+        QTIMER1_VCLOCK_CH,
+        g_generation_gate_vclock.generation_gate_observe_count,
+        0U,
+        0U,
+        0U,
+        (uint32_t)(uintptr_t)"QTIMER1_VCLOCK_ISR",
+        vclock_csctrl);
     return;
   }
 
@@ -12947,6 +13224,16 @@ static void qtimer1_isr(void) {
   const uint32_t timepop_csctrl = IMXRT_TMR1.CH[QTIMER1_TIMEPOP_CH].CSCTRL;
   if (timepop_csctrl & TMR_CSCTRL_TCF1) {
     qtimer1_ch2_capture_priority0(isr_entry_dwt_raw, timepop_csctrl);
+    ZPNET_EXECUTION_TRACE(
+        timepop_dispatch_trace_stage_t::ISR_EXIT,
+        timepop_dispatch_trace_kind_t::ISR_TIMED,
+        QTIMER1_TIMEPOP_CH,
+        g_qtimer1_ch2_last_target_counter32,
+        0U,
+        0U,
+        0U,
+        (uint32_t)(uintptr_t)"QTIMER1_CH2_ISR",
+        timepop_csctrl);
     return;
   }
 
@@ -12955,6 +13242,19 @@ static void qtimer1_isr(void) {
   if (aux_csctrl & TMR_CSCTRL_TCF1) {
     qtimer1_ch1_clear_compare_flag();
   }
+
+  ZPNET_EXECUTION_TRACE(
+      timepop_dispatch_trace_stage_t::ISR_EXIT,
+      timepop_dispatch_trace_kind_t::ISR_QTIMER1,
+      (aux_csctrl & TMR_CSCTRL_TCF1)
+          ? QTIMER1_RETIRED_AUX_CH
+          : TIMEPOP_DISPATCH_TRACE_NO_SLOT,
+      g_interrupt_handoff.request_count,
+      0U,
+      0U,
+      0U,
+      (uint32_t)(uintptr_t)"QTIMER1_SHARED_ISR",
+      aux_csctrl);
 
 }
 
@@ -12970,7 +13270,27 @@ static void pps_edge_dispatch_trampoline(timepop_ctx_t*, timepop_diag_t*, void*)
   if (!interrupt_callback_address_executable((uintptr_t)callback)) return;
 
   const pps_edge_snapshot_t snap = interrupt_last_pps_edge();
+  ZPNET_EXECUTION_TRACE(
+      timepop_dispatch_trace_stage_t::SUBSCRIBER_ENTER,
+      timepop_dispatch_trace_kind_t::SUBSCRIBER_VCLOCK,
+      (uint32_t)interrupt_subscriber_kind_t::VCLOCK,
+      snap.sequence,
+      (uint32_t)(uintptr_t)callback,
+      (uint32_t)(uintptr_t)g_pps_edge_dispatch,
+      0U,
+      (uint32_t)(uintptr_t)"PPS_EDGE_DISPATCH",
+      snap.counter32_at_edge);
   callback(snap);
+  ZPNET_EXECUTION_TRACE(
+      timepop_dispatch_trace_stage_t::SUBSCRIBER_RETURN,
+      timepop_dispatch_trace_kind_t::SUBSCRIBER_VCLOCK,
+      (uint32_t)interrupt_subscriber_kind_t::VCLOCK,
+      snap.sequence,
+      (uint32_t)(uintptr_t)callback,
+      (uint32_t)(uintptr_t)g_pps_edge_dispatch,
+      0U,
+      (uint32_t)(uintptr_t)"PPS_EDGE_DISPATCH",
+      snap.counter32_at_edge);
 }
 
 static void pps_relay_assert_from_isr(uint32_t sequence) {
@@ -13038,7 +13358,27 @@ static void pps_post_isr_publish_inline(const interrupt_epoch_capture_t& cap,
   const interrupt_pps_entry_latency_handler_fn callback =
       g_pps_entry_latency_handler;
   if (interrupt_callback_address_executable((uintptr_t)callback)) {
+    ZPNET_EXECUTION_TRACE(
+        timepop_dispatch_trace_stage_t::SUBSCRIBER_ENTER,
+        timepop_dispatch_trace_kind_t::ISR_PPS,
+        0U,
+        cap.sequence,
+        (uint32_t)(uintptr_t)callback,
+        (uint32_t)(uintptr_t)g_pps_entry_latency_handler,
+        0U,
+        (uint32_t)(uintptr_t)"PPS_ENTRY_LATENCY",
+        isr_entry_dwt_raw);
     callback(cap.sequence, isr_entry_dwt_raw);
+    ZPNET_EXECUTION_TRACE(
+        timepop_dispatch_trace_stage_t::SUBSCRIBER_RETURN,
+        timepop_dispatch_trace_kind_t::ISR_PPS,
+        0U,
+        cap.sequence,
+        (uint32_t)(uintptr_t)callback,
+        (uint32_t)(uintptr_t)g_pps_entry_latency_handler,
+        0U,
+        (uint32_t)(uintptr_t)"PPS_ENTRY_LATENCY",
+        isr_entry_dwt_raw);
   }
 }
 
@@ -13270,12 +13610,34 @@ static void pps_gpio_isr(void) {
   pps_capture_packet_t packet{};
   pps_capture_packet_fill_priority0(packet, isr_entry_dwt_raw);
 
+  ZPNET_EXECUTION_TRACE(
+      timepop_dispatch_trace_stage_t::ISR_CAPTURED,
+      timepop_dispatch_trace_kind_t::ISR_PPS,
+      0U,
+      packet.sequence,
+      0U,
+      0U,
+      0U,
+      (uint32_t)(uintptr_t)"PPS_GPIO_ISR",
+      packet.capture_end_raw - isr_entry_dwt_raw);
+
   pps_capture_packet_enqueue_priority0(packet);
 
   // After the sacred multi-clock capture window on purpose: LR no longer
   // holds EXC_RETURN here, so the check runs with the conservative
   // basic-frame estimate.
   crash_stack_tripwire_isr_check(CRASH_TRIPWIRE_SITE_PPS_GPIO);
+
+  ZPNET_EXECUTION_TRACE(
+      timepop_dispatch_trace_stage_t::ISR_EXIT,
+      timepop_dispatch_trace_kind_t::ISR_PPS,
+      0U,
+      packet.sequence,
+      0U,
+      0U,
+      0U,
+      (uint32_t)(uintptr_t)"PPS_GPIO_ISR",
+      packet.capture_exit_dwt - isr_entry_dwt_raw);
 }
 
 void interrupt_pps_edge_register_dispatch(pps_edge_dispatch_fn fn) {

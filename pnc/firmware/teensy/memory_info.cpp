@@ -3,7 +3,6 @@
 #include "crash_forensics.h"
 
 #include <Arduino.h>
-#include <malloc.h>
 #include <string.h>
 
 // ============================================================================
@@ -69,10 +68,6 @@ static uint32_t _stack_paint_start   = 0;
 static uint32_t _stack_paint_end     = 0;
 static uint32_t _stack_paint_bytes   = 0;
 static uint32_t _stack_paint_skip_reason = MEMORY_STACK_PAINT_SKIP_NONE;
-
-// Heap arena tracking
-static uint32_t _heap_arena_hwm    = 0;
-static uint32_t _heap_arena_prev   = 0;
 
 // ============================================================================
 // Memory health court state
@@ -257,7 +252,7 @@ static void memory_audit_trace_snapshot_bank(
     }
 }
 
-void memory_audit_trace_snapshot(memory_audit_trace_snapshot_t* out) {
+FLASHMEM void memory_audit_trace_snapshot(memory_audit_trace_snapshot_t* out) {
     if (!out) return;
     memory_audit_trace_boot_latch();
     memset((void*)out, 0, sizeof(*out));
@@ -266,7 +261,7 @@ void memory_audit_trace_snapshot(memory_audit_trace_snapshot_t* out) {
                                      &out->retained);
 }
 
-void memory_audit_trace_clear_retained(void) {
+FLASHMEM void memory_audit_trace_clear_retained(void) {
     memset((void*)&_memory_audit_trace_retained, 0,
            sizeof(_memory_audit_trace_retained));
 }
@@ -411,11 +406,6 @@ void memory_info_init() {
         }
     }
 
-    // Initialize heap tracking
-    struct mallinfo mi = mallinfo();
-    _heap_arena_hwm  = mi.arena;
-    _heap_arena_prev = mi.arena;
-
     _memory_health.status = memory_health_status_t::UNASSESSED;
     _memory_health.primary_reason = memory_health_reason_t::NONE;
     _memory_health.heap_free_critical_bytes = MEMORY_HEAP_FREE_CRITICAL_BYTES;
@@ -427,7 +417,7 @@ void memory_info_init() {
 // Snapshot
 // ============================================================================
 
-void memory_info_get(memory_info_t* out) {
+FLASHMEM void memory_info_get(memory_info_t* out) {
     if (!out) return;
 
     // Only the foreground court invocation owns these internal breadcrumbs.
@@ -567,42 +557,17 @@ void memory_info_get(memory_info_t* out) {
             ram2_start,
             ram2_end);
     }
-    struct mallinfo mi = mallinfo();
-
-    out->heap_arena         = mi.arena;       // committed by sbrk
-    out->heap_used          = mi.uordblks;    // in active allocations
-    out->heap_free_internal = mi.fordblks;    // freed but trapped
-
-    // Free space above sbrk frontier
+    // Free space above the sbrk frontier.  Do not call mallinfo() here:
+    // its allocator walk is not safe against preemption by code that may touch
+    // the heap.  The mallinfo-dependent detail fields remain zero from memset().
     uint32_t brkval = (uint32_t)__brkval;
     if (brkval == 0) brkval = ram2_start;     // no allocations yet
     out->heap_free_above = (brkval < ram2_end) ? (ram2_end - brkval) : 0;
-
-    out->heap_free_total = out->heap_free_internal + out->heap_free_above;
-
-    // --------------------------------------------------------
-    // High-water and trend tracking
-    // --------------------------------------------------------
-
-    if (mi.arena > _heap_arena_hwm) {
-        _heap_arena_hwm = mi.arena;
-    }
-    out->heap_arena_high_water = _heap_arena_hwm;
-
-    // Leak detection: is the heap arena still growing?
-    out->heap_growing = (mi.arena > _heap_arena_prev);
-    _heap_arena_prev = mi.arena;
+    out->heap_free_total = out->heap_free_above;
 
     // --------------------------------------------------------
     // Derived health indicators
     // --------------------------------------------------------
-
-    if (mi.arena > 0) {
-        out->heap_fragmentation_pct =
-            (out->heap_free_internal * 100) / mi.arena;
-    } else {
-        out->heap_fragmentation_pct = 0;
-    }
 
     if (out->dtcm_stack_avail > 0) {
         out->stack_usage_pct =
@@ -641,7 +606,7 @@ static void memory_health_add_reason(uint32_t& mask,
     }
 }
 
-const char* memory_health_status_name(memory_health_status_t status) {
+FLASHMEM const char* memory_health_status_name(memory_health_status_t status) {
     switch (status) {
         case memory_health_status_t::NOMINAL:    return "NOMINAL";
         case memory_health_status_t::ANOMALY:    return "ANOMALY";
@@ -650,7 +615,7 @@ const char* memory_health_status_name(memory_health_status_t status) {
     }
 }
 
-const char* memory_health_reason_name(memory_health_reason_t reason) {
+FLASHMEM const char* memory_health_reason_name(memory_health_reason_t reason) {
     switch (reason) {
         case memory_health_reason_t::NONE:                         return "NONE";
         case memory_health_reason_t::NOT_INITIALIZED:              return "NOT_INITIALIZED";
@@ -674,7 +639,7 @@ const char* memory_health_reason_name(memory_health_reason_t reason) {
     }
 }
 
-void memory_info_audit(memory_health_t* out) {
+FLASHMEM void memory_info_audit(memory_health_t* out) {
     // Publish this audit's SP as the stack-tripwire floor: while the audit
     // runs, the live foreground SP is always at or below this value, so any
     // exception frame stacked above it is unlawful.  See crash_forensics.h.
@@ -721,9 +686,7 @@ void memory_info_audit(memory_health_t* out) {
 
     const bool heap_map_invalid =
         memory.heap_total == 0U ||
-        memory.heap_arena > memory.heap_total ||
-        memory.heap_used > memory.heap_arena ||
-        memory.heap_free_internal > memory.heap_arena ||
+        memory.heap_free_above > memory.heap_total ||
         memory.heap_free_total > memory.heap_total;
 
     uint32_t active_reason_mask = 0U;
@@ -894,7 +857,7 @@ void memory_info_audit(memory_health_t* out) {
     crash_stack_tripwire_floor_exit();
 }
 
-void memory_info_get_health(memory_health_t* out) {
+FLASHMEM void memory_info_get_health(memory_health_t* out) {
     if (!out) return;
     *out = _memory_health;
 }

@@ -60,8 +60,12 @@
  *   • MEMORY_AUDIT_INFO — return a bounded retained/live scalar transcript
  *     from either memory_info_audit() or its SYSTEM watchdog callback wrapper;
  *     accepts source=audit|watchdog, bank=retained|live, count=1..8, offset=N
- *   • TIMEPOP_DISPATCH_INFO — return a bounded TimePop callback, mutation, and
- *     rearm transcript; accepts bank=retained|live, count=1..8, offset=N
+ *   • EXECUTION_TRACE — return the bounded ISR-to-handoff-to-subscriber-to-
+ *     TimePop control-flow transcript.  The live ring runs in RAM1; fault entry
+ *     copies committed records into retained RAM2 before reboot.  Accepts
+ *     bank=retained|live, count=1..8, offset=N; retained is the default.
+ *   • TIMEPOP_DISPATCH_INFO — compatibility alias for EXECUTION_TRACE using
+ *     the earlier TimePop report schema
  *   • CRASH_POLICY — return live CPU/FPU exception policy plus a compact
  *     consistency analysis of retained core and extended exception frames
  *   • PAYLOAD_CONTRACT_INFO — return design-by-contract counters plus the

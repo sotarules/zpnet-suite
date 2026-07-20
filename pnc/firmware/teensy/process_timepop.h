@@ -164,15 +164,18 @@ struct timepop_idle_witness_snapshot_t {
 bool timepop_idle_witness_snapshot(timepop_idle_witness_snapshot_t* out);
 
 // ============================================================================
-// Retained TimePop dispatch flight recorder
+// Retained Execution Trace
 // ============================================================================
 //
-// The dispatch recorder is a scalar-only RAM2 ring.  It records every TimePop
-// callback selection, entry, and return, plus mutation barriers and recurring
-// rearm outcomes.  The live bank is copied to a retained bank at the next boot
-// before current activity overwrites it.  No callback name is dereferenced or
-// copied: name_ptr is preserved as an address so corrupt metadata cannot make
-// the recorder fault while trying to describe the original fault.
+// Execution Trace is the scalar-only control-flow flight recorder shared by
+// process_interrupt and process_timepop.  It records interrupt custody,
+// priority-handoff/subscriber boundaries, TimePop callback selection and return,
+// mutation barriers, and recurring rearm outcomes in one chronological ring.
+//
+// The live ring remains in fast ordinary RAM1.  The fault handler copies its
+// committed entries into a retained RAM2 bank before reboot.  No callback or
+// label string is dereferenced or copied: name_ptr remains only an address so
+// corrupt metadata cannot make the recorder fault while describing the fault.
 
 static constexpr uint32_t TIMEPOP_DISPATCH_TRACE_ENTRIES = 32U;
 static constexpr uint32_t TIMEPOP_DISPATCH_TRACE_NO_SLOT = 0xFFFFFFFFUL;
@@ -199,6 +202,18 @@ enum class timepop_dispatch_trace_stage_t : uint32_t {
   PHASE_ALAP                = 18,
   DISPATCH_LEAVE            = 19,
   IRQ_SELECTED              = 20,
+
+  ISR_ENTER                 = 32,
+  ISR_CAPTURED              = 33,
+  ISR_EXIT                  = 34,
+
+  HANDOFF_ENTER             = 40,
+  HANDOFF_DEQUEUE           = 41,
+  HANDOFF_EXIT              = 42,
+
+  SUBSCRIBER_SELECTED       = 48,
+  SUBSCRIBER_ENTER          = 49,
+  SUBSCRIBER_RETURN         = 50,
 };
 
 enum class timepop_dispatch_trace_kind_t : uint32_t {
@@ -210,6 +225,16 @@ enum class timepop_dispatch_trace_kind_t : uint32_t {
   ISR_TIMED = 5,
   MUTATION  = 6,
   REARM     = 7,
+
+  ISR_QTIMER1       = 16,
+  ISR_VCLOCK        = 17,
+  ISR_OCXO1         = 18,
+  ISR_OCXO2         = 19,
+  ISR_PPS           = 20,
+  INTERRUPT_HANDOFF = 21,
+  SUBSCRIBER_VCLOCK = 22,
+  SUBSCRIBER_OCXO1  = 23,
+  SUBSCRIBER_OCXO2  = 24,
 };
 
 enum class timepop_dispatch_trace_phase_t : uint32_t {
@@ -244,8 +269,12 @@ static_assert(sizeof(timepop_dispatch_trace_entry_t) == 64U,
 
 struct timepop_dispatch_trace_bank_snapshot_t {
   bool valid;
+  bool fault_captured;
   uint32_t count;
   uint32_t newest_sequence;
+  uint32_t fault_dwt;
+  uint32_t crash_sequence;
+  uint32_t trace_sequence_at_capture;
   timepop_dispatch_trace_entry_t entries[TIMEPOP_DISPATCH_TRACE_ENTRIES];
 };
 
@@ -256,6 +285,50 @@ struct timepop_dispatch_trace_snapshot_t {
 
 void timepop_dispatch_trace_snapshot(timepop_dispatch_trace_snapshot_t* out);
 void timepop_dispatch_trace_clear_retained(void);
+
+// Generic scalar recording surface used by process_interrupt.  Field mapping
+// intentionally reuses the established TimePop entry ABI:
+//
+//   subject_index  -> slot_index
+//   identity       -> handle
+//   target         -> callback
+//   related_target -> slot_callback
+//   object         -> user_data
+//   label_ptr      -> name_ptr
+//
+// Interpretation is determined by stage/kind.  caller_sp is captured by the
+// macro at the caller's frame level; site_pc is captured inside the recorder.
+void execution_trace_record(timepop_dispatch_trace_stage_t stage,
+                            timepop_dispatch_trace_kind_t kind,
+                            uint32_t subject_index,
+                            uint32_t identity,
+                            uint32_t target,
+                            uint32_t related_target,
+                            uint32_t object,
+                            uint32_t label_ptr,
+                            uint32_t aux,
+                            uint32_t caller_sp);
+
+extern "C" void execution_trace_capture_fault(uint32_t fault_dwt,
+                                               uint32_t crash_sequence);
+
+#if defined(__arm__)
+#define ZPNET_EXECUTION_TRACE(stage, kind, subject_index, identity, target,    \
+                              related_target, object, label_ptr, aux)         \
+  do {                                                                        \
+    uint32_t zpnet_execution_trace_sp_;                                       \
+    __asm__ volatile("mov %0, sp" : "=r"(zpnet_execution_trace_sp_));         \
+    execution_trace_record((stage), (kind), (subject_index), (identity),      \
+                           (target), (related_target), (object), (label_ptr),  \
+                           (aux), zpnet_execution_trace_sp_);                  \
+  } while (0)
+#else
+#define ZPNET_EXECUTION_TRACE(stage, kind, subject_index, identity, target,    \
+                              related_target, object, label_ptr, aux)         \
+  execution_trace_record((stage), (kind), (subject_index), (identity),        \
+                         (target), (related_target), (object), (label_ptr),    \
+                         (aux), 0U)
+#endif
 
 typedef uint8_t timepop_priority_t;
 static constexpr timepop_priority_t TIMEPOP_PRIORITY_FIRST   = 0U;

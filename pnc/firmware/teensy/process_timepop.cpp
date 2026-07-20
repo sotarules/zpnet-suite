@@ -474,40 +474,53 @@ static volatile uint32_t diag_idle_witness_wall_last_dwt = 0;
 static volatile bool     diag_idle_witness_wall_initialized = false;
 
 // ============================================================================
-// TimePop dispatch flight recorder
+// Execution Trace — TimePop-owned shared recorder
 // ============================================================================
 //
-// This ring answers a narrow control-flow question: which callback pointer was
-// selected, did the callback return, and what scheduler operation followed it?
-// It is part of the live dispatch path and therefore uses ordinary RAM1 in this
-// deterministic-memory baseline.  The retained-bank API remains compatible,
-// but RAM1 startup initialization means it does not survive a reboot.
+// The live ring stays in fast ordinary RAM1 and accepts both TimePop and
+// process_interrupt boundary records.  At fault entry crash_forensics invokes
+// execution_trace_capture_fault(), which copies the committed image into the
+// retained RAM2 bank and flushes it before reboot.
 //
 // Each entry commits with sequence/complement after all other fields.  A
-// priority handler may preempt a foreground recorder, but sequence reservation
-// gives each writer a distinct ring cell; snapshot code accepts only fully
-// committed entries.
+// priority handler may preempt a foreground recorder; atomic sequence
+// reservation gives each writer a distinct ring cell without masking priority
+// zero.  Snapshot code accepts only fully committed entries.
 
 static constexpr uint32_t TIMEPOP_DISPATCH_TRACE_MAGIC =
-    0x54504631UL;  // 'TPF1'
-static constexpr uint32_t TIMEPOP_DISPATCH_TRACE_SCHEMA_VERSION = 1U;
+    0x45545232UL;  // 'ETR2'
+static constexpr uint32_t TIMEPOP_DISPATCH_TRACE_SCHEMA_VERSION = 2U;
+static constexpr uint32_t TIMEPOP_DISPATCH_TRACE_FLAG_FAULT_CAPTURED = 1U;
 
 struct alignas(32) timepop_dispatch_trace_bank_t {
   uint32_t magic;
   uint32_t magic_inv;
   uint32_t schema_version;
   uint32_t capacity;
-  uint32_t reserved[4];
+  uint32_t fault_dwt;
+  uint32_t crash_sequence;
+  uint32_t trace_sequence_at_capture;
+  uint32_t flags;
   timepop_dispatch_trace_entry_t entries[TIMEPOP_DISPATCH_TRACE_ENTRIES];
 };
 
 static_assert(sizeof(timepop_dispatch_trace_bank_t) % 32U == 0U,
               "TimePop dispatch trace bank must be cache-line aligned");
 
-static timepop_dispatch_trace_bank_t g_timepop_dispatch_trace_live = {};
-static timepop_dispatch_trace_bank_t g_timepop_dispatch_trace_retained = {};
+static timepop_dispatch_trace_bank_t g_timepop_dispatch_trace_live = {
+  TIMEPOP_DISPATCH_TRACE_MAGIC,
+  ~TIMEPOP_DISPATCH_TRACE_MAGIC,
+  TIMEPOP_DISPATCH_TRACE_SCHEMA_VERSION,
+  TIMEPOP_DISPATCH_TRACE_ENTRIES,
+  0U,
+  0U,
+  0U,
+  0U,
+  {}
+};
+static timepop_dispatch_trace_bank_t g_timepop_dispatch_trace_retained DMAMEM;
 static bool g_timepop_dispatch_trace_boot_latched = false;
-static volatile uint32_t g_timepop_dispatch_trace_next_sequence = 0;
+static uint32_t g_timepop_dispatch_trace_next_sequence = 0;
 
 static inline void timepop_dispatch_trace_dmb(void) {
   __asm__ volatile("dmb" ::: "memory");
@@ -548,6 +561,10 @@ static void timepop_dispatch_trace_initialize_live(void) {
   g_timepop_dispatch_trace_live.schema_version =
       TIMEPOP_DISPATCH_TRACE_SCHEMA_VERSION;
   g_timepop_dispatch_trace_live.capacity = TIMEPOP_DISPATCH_TRACE_ENTRIES;
+  g_timepop_dispatch_trace_live.fault_dwt = 0U;
+  g_timepop_dispatch_trace_live.crash_sequence = 0U;
+  g_timepop_dispatch_trace_live.trace_sequence_at_capture = 0U;
+  g_timepop_dispatch_trace_live.flags = 0U;
   g_timepop_dispatch_trace_live.magic_inv = ~TIMEPOP_DISPATCH_TRACE_MAGIC;
   g_timepop_dispatch_trace_live.magic = TIMEPOP_DISPATCH_TRACE_MAGIC;
   g_timepop_dispatch_trace_next_sequence = 0U;
@@ -557,11 +574,87 @@ static void timepop_dispatch_trace_boot_latch(void) {
   if (g_timepop_dispatch_trace_boot_latched) return;
   g_timepop_dispatch_trace_boot_latched = true;
 
-  // Both banks are ordinary RAM1 and were zeroed by startup.  Keep the
-  // compatibility retained surface empty and initialize the live recorder.
-  memset((void*)&g_timepop_dispatch_trace_retained, 0,
-         sizeof(g_timepop_dispatch_trace_retained));
-  timepop_dispatch_trace_initialize_live();
+  // The retained bank is DMAMEM/NOLOAD and belongs to the previous fault until
+  // CRASH_CLEAR or the next fault capture.  Never clear it during startup.
+  if (!timepop_dispatch_trace_bank_valid(g_timepop_dispatch_trace_live)) {
+    timepop_dispatch_trace_initialize_live();
+  }
+}
+
+static __attribute__((noinline)) void execution_trace_record_core(
+    timepop_dispatch_trace_stage_t stage,
+    timepop_dispatch_trace_kind_t kind,
+    uint32_t subject_index,
+    uint32_t identity,
+    uint32_t target,
+    uint32_t related_target,
+    uint32_t object,
+    uint32_t label_ptr,
+    uint32_t aux,
+    uint32_t caller_sp,
+    uint32_t site_pc) {
+  timepop_dispatch_trace_boot_latch();
+
+  uint32_t sequence = __atomic_add_fetch(
+      &g_timepop_dispatch_trace_next_sequence, 1U, __ATOMIC_RELAXED);
+  if (sequence == 0U) {
+    sequence = __atomic_add_fetch(
+        &g_timepop_dispatch_trace_next_sequence, 1U, __ATOMIC_RELAXED);
+  }
+
+  timepop_dispatch_trace_entry_t& entry =
+      g_timepop_dispatch_trace_live.entries[
+          (sequence - 1U) % TIMEPOP_DISPATCH_TRACE_ENTRIES];
+
+  // Invalidate before reusing a ring cell.
+  entry.sequence = 0U;
+  entry.sequence_inv = 0U;
+  timepop_dispatch_trace_dmb();
+
+  entry.stage = (uint32_t)stage;
+  entry.phase = (uint32_t)dispatch_phase;
+  entry.kind = (uint32_t)kind;
+  entry.slot_index = subject_index;
+  entry.handle = identity;
+  entry.callback = target;
+  entry.slot_callback = related_target;
+  entry.user_data = object;
+  entry.name_ptr = label_ptr;
+  entry.caller_sp = caller_sp;
+  entry.site_pc = site_pc;
+  entry.dwt = ARM_DWT_CYCCNT;
+  entry.ipsr = timepop_dispatch_trace_ipsr();
+  entry.aux = aux;
+
+  entry.sequence_inv = ~sequence;
+  timepop_dispatch_trace_dmb();
+  entry.sequence = sequence;  // commit last
+  timepop_dispatch_trace_dmb();
+}
+
+void execution_trace_record(timepop_dispatch_trace_stage_t stage,
+                            timepop_dispatch_trace_kind_t kind,
+                            uint32_t subject_index,
+                            uint32_t identity,
+                            uint32_t target,
+                            uint32_t related_target,
+                            uint32_t object,
+                            uint32_t label_ptr,
+                            uint32_t aux,
+                            uint32_t caller_sp) {
+  const uint32_t site_pc =
+      (uint32_t)(uintptr_t)__builtin_return_address(0);
+  execution_trace_record_core(stage,
+                              kind,
+                              subject_index,
+                              identity,
+                              target,
+                              related_target,
+                              object,
+                              label_ptr,
+                              aux,
+                              caller_sp,
+                              site_pc);
 }
 
 static __attribute__((noinline)) void timepop_dispatch_trace_record(
@@ -577,46 +670,18 @@ static __attribute__((noinline)) void timepop_dispatch_trace_record(
     uint32_t caller_sp) {
   const uint32_t site_pc =
       (uint32_t)(uintptr_t)__builtin_return_address(0);
-  timepop_dispatch_trace_boot_latch();
-
-  uint32_t sequence = 0U;
-  {
-    const uint32_t saved = critical_enter();
-    sequence = g_timepop_dispatch_trace_next_sequence + 1U;
-    if (sequence == 0U) sequence = 1U;
-    g_timepop_dispatch_trace_next_sequence = sequence;
-    critical_exit(saved);
-  }
-
-  timepop_dispatch_trace_entry_t& entry =
-      g_timepop_dispatch_trace_live.entries[
-          (sequence - 1U) % TIMEPOP_DISPATCH_TRACE_ENTRIES];
-
-  // Invalidate before reusing a ring cell.
-  entry.sequence = 0U;
-  entry.sequence_inv = 0U;
-  timepop_dispatch_trace_dmb();
-
-  entry.stage = (uint32_t)stage;
-  entry.phase = (uint32_t)dispatch_phase;
-  entry.kind = (uint32_t)kind;
-  entry.slot_index = slot_index;
-  entry.handle = handle;
-  entry.callback = timepop_dispatch_trace_callback_address(callback);
-  entry.slot_callback =
-      timepop_dispatch_trace_callback_address(slot_callback);
-  entry.user_data = (uint32_t)(uintptr_t)user_data;
-  entry.name_ptr = (uint32_t)(uintptr_t)name;
-  entry.caller_sp = caller_sp;
-  entry.site_pc = site_pc;
-  entry.dwt = ARM_DWT_CYCCNT;
-  entry.ipsr = timepop_dispatch_trace_ipsr();
-  entry.aux = aux;
-
-  entry.sequence_inv = ~sequence;
-  timepop_dispatch_trace_dmb();
-  entry.sequence = sequence;  // commit last
-  timepop_dispatch_trace_dmb();
+  execution_trace_record_core(
+      stage,
+      kind,
+      slot_index,
+      handle,
+      timepop_dispatch_trace_callback_address(callback),
+      timepop_dispatch_trace_callback_address(slot_callback),
+      (uint32_t)(uintptr_t)user_data,
+      (uint32_t)(uintptr_t)name,
+      aux,
+      caller_sp,
+      site_pc);
 }
 
 #if defined(__arm__)
@@ -653,6 +718,12 @@ static void timepop_dispatch_trace_snapshot_bank(
   memset((void*)out, 0, sizeof(*out));
   out->valid = timepop_dispatch_trace_bank_valid(bank);
   if (!out->valid) return;
+
+  out->fault_captured =
+      (bank.flags & TIMEPOP_DISPATCH_TRACE_FLAG_FAULT_CAPTURED) != 0U;
+  out->fault_dwt = bank.fault_dwt;
+  out->crash_sequence = bank.crash_sequence;
+  out->trace_sequence_at_capture = bank.trace_sequence_at_capture;
 
   for (uint32_t i = 0; i < TIMEPOP_DISPATCH_TRACE_ENTRIES; ++i) {
     const volatile timepop_dispatch_trace_entry_t* source =
@@ -703,6 +774,50 @@ void timepop_dispatch_trace_snapshot(
 void timepop_dispatch_trace_clear_retained(void) {
   memset((void*)&g_timepop_dispatch_trace_retained, 0,
          sizeof(g_timepop_dispatch_trace_retained));
+  arm_dcache_flush_delete(&g_timepop_dispatch_trace_retained,
+                          sizeof(g_timepop_dispatch_trace_retained));
+  __asm__ volatile("dsb\nisb" ::: "memory");
+}
+
+extern "C" void execution_trace_capture_fault(uint32_t fault_dwt,
+                                               uint32_t crash_sequence) {
+  timepop_dispatch_trace_bank_t& retained =
+      g_timepop_dispatch_trace_retained;
+
+  // Invalidate the publication pair before copying.  A nested failure leaves
+  // the old bank invalid rather than presenting a mixed transcript as valid.
+  retained.magic = 0U;
+  retained.magic_inv = 0U;
+  timepop_dispatch_trace_dmb();
+
+  retained.schema_version = TIMEPOP_DISPATCH_TRACE_SCHEMA_VERSION;
+  retained.capacity = TIMEPOP_DISPATCH_TRACE_ENTRIES;
+  retained.fault_dwt = fault_dwt;
+  retained.crash_sequence = crash_sequence;
+  retained.trace_sequence_at_capture = __atomic_load_n(
+      &g_timepop_dispatch_trace_next_sequence, __ATOMIC_RELAXED);
+  retained.flags = TIMEPOP_DISPATCH_TRACE_FLAG_FAULT_CAPTURED;
+
+  volatile uint32_t* destination =
+      reinterpret_cast<volatile uint32_t*>(retained.entries);
+  const volatile uint32_t* source =
+      reinterpret_cast<const volatile uint32_t*>(
+          g_timepop_dispatch_trace_live.entries);
+  constexpr size_t entry_bytes = sizeof(retained.entries);
+  static_assert((entry_bytes % sizeof(uint32_t)) == 0U,
+                "Execution Trace entries must be word-copyable");
+  constexpr size_t entry_words = entry_bytes / sizeof(uint32_t);
+  for (size_t i = 0U; i < entry_words; ++i) {
+    destination[i] = source[i];
+  }
+
+  retained.magic_inv = ~TIMEPOP_DISPATCH_TRACE_MAGIC;
+  timepop_dispatch_trace_dmb();
+  retained.magic = TIMEPOP_DISPATCH_TRACE_MAGIC;  // commit last
+  __asm__ volatile("dsb\nisb" ::: "memory");
+
+  arm_dcache_flush_delete(&retained, sizeof(retained));
+  __asm__ volatile("dsb\nisb" ::: "memory");
 }
 
 // ============================================================================
@@ -3567,8 +3682,8 @@ static timepop_handle_t arm_deferred(deferred_slot_t* slots_buf,
 // ============================================================================
 
 void timepop_init(void) {
-  // Preserve the previous boot's final dispatch transcript before any current
-  // TimePop activity can overwrite the live RAM2 bank.
+  // Initialize the live Execution Trace surface without touching the retained
+  // fault-time bank from the previous boot.
   timepop_dispatch_trace_boot_latch();
 
   for (uint32_t i = 0; i < MAX_SLOTS; i++) slots[i] = {};
