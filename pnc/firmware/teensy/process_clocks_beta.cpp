@@ -242,12 +242,6 @@ static const char* clocks_science_reject_reason_name(
   switch (reason) {
     case clocks_science_reject_reason_t::BETA_OCXO_SCIENCE_CUSTODY:
       return "beta_ocxo_science_custody";
-    case clocks_science_reject_reason_t::INTERRUPT_FLOORLINE_FIT:
-      return "interrupt_floorline_fit";
-    case clocks_science_reject_reason_t::INTERRUPT_RAW_BOOKEND:
-      return "interrupt_raw_bookend";
-    case clocks_science_reject_reason_t::INTERRUPT_OCXO_DWT_PUBLICATION:
-      return "interrupt_ocxo_dwt_publication";
     case clocks_science_reject_reason_t::ALPHA_COUNTERLEDGER_INTERVAL:
       return "alpha_counterledger_interval";
     case clocks_science_reject_reason_t::ALPHA_BRIDGE_NONMONOTONIC:

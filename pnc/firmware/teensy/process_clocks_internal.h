@@ -231,9 +231,10 @@ uint64_t clocks_dwt_cycles_at_dwt(uint32_t dwt32);
 //
 //   sampled_ticks_since_zero * 100 ns
 //
-// DWT/Delta/FloorLine remain diagnostics. Public OCXO TAU/PPB become simple
-// campaign clockface ratios, and OCXO Welfords consume the 100 ns-quantized
-// CounterLedger one-second residuals.
+// CounterLedger remains a witness only.  PhaseLedger/PPS projection remains
+// public OCXO clock authority, with Delta Cycles as the independent
+// cycle-domain candidate.  No FloorLine, EMA, yardstick, or other alternative
+// DWT estimator participates in publication.
 
 enum class clocks_ocxo_public_ns_authority_t : uint8_t {
   TRADITIONAL_PPS_PROJECTION = 0,
@@ -242,12 +243,12 @@ enum class clocks_ocxo_public_ns_authority_t : uint8_t {
 
 static constexpr clocks_ocxo_public_ns_authority_t
     CLOCKS_OCXO_PUBLIC_NS_AUTHORITY =
-        clocks_ocxo_public_ns_authority_t::PPS_COUNTERLEDGER;
+        clocks_ocxo_public_ns_authority_t::TRADITIONAL_PPS_PROJECTION;
 
 // CounterLedger can also be advanced and reported without authoring public OCXO
-// nanoseconds when the authority switch above is returned to traditional mode.
-// With PPS_COUNTERLEDGER selected, reporting remains enabled but the published
-// counterledger.report_only field is false.
+// nanoseconds.  With traditional PhaseLedger/PPS projection selected above,
+// reporting remains enabled and CounterLedger is explicitly a witness rather
+// than publication authority.
 static constexpr bool CLOCKS_OCXO_COUNTERLEDGER_REPORT_ONLY_ENABLED = true;
 
 // CounterLedger frequency is fundamentally a long-baseline integer-tick

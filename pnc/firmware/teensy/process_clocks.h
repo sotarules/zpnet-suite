@@ -91,9 +91,6 @@ enum class clocks_science_reject_source_t : uint8_t {
 enum class clocks_science_reject_reason_t : uint16_t {
   NONE                                = 0,
   BETA_OCXO_SCIENCE_CUSTODY           = 100,
-  INTERRUPT_FLOORLINE_FIT             = 200,
-  INTERRUPT_RAW_BOOKEND               = 201,
-  INTERRUPT_OCXO_DWT_PUBLICATION      = 202,
   ALPHA_COUNTERLEDGER_INTERVAL        = 300,
   ALPHA_BRIDGE_NONMONOTONIC           = 301,
   ALPHA_OCXO_PROJECTION_WINDOW        = 302,

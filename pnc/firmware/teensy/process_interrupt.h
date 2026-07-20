@@ -1,10 +1,15 @@
 // ============================================================================
-// process_interrupt.h — lean operational ABI
+// process_interrupt.h — observed-edge custody ABI
 // ============================================================================
-// Public interrupt custody API.  Comments and retired doctrine text have been
-// trimmed; field layout is preserved for source compatibility with current
-// CLOCKS/TIMEBASE consumers while process_interrupt.cpp removes retired
-// diagnostic producers.
+// process_interrupt publishes only raw/latency-adjusted observed DWT-at-edge
+// facts paired with authored compare-target identities.  FloorLine, EMA,
+// predictor, inferred-endpoint, repair-candidate, and 1 kHz OCXO cadence
+// producers do not exist in process_interrupt.cpp.
+//
+// A small set of historical diagnostic fields remains in the public structure
+// layout so current CLOCKS/TIMEBASE consumers continue to compile during this
+// architectural cut.  Those fields are compatibility storage only: the
+// observed-only implementation leaves every alternative-estimator field zero.
 // ============================================================================
 
 #pragma once
@@ -51,11 +56,10 @@ enum class interrupt_event_status_t : uint8_t {
   FAULT,
 };
 
-// Final DWT-at-edge publication tribunal verdict bits.  These are mirrored
-// from process_interrupt.cpp so TIMEBASE/raw_cycles tooling can decode the
-// evidence without private firmware internals.  A blocked OCXO verdict becomes
-// a SCIENCE_REJECT candidate; a blocked VCLOCK verdict remains WATCHDOG_ANOMALY
-// because VCLOCK is the campaign timeline itself.
+// Historical publication-court bit assignments retained for wire/source
+// compatibility.  The observed-only implementation authors only
+// INTERRUPT_DWT_PUBLICATION_VERDICT_OK; all alternative-estimator bits remain
+// zero and no publication court can replace an observed edge.
 static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_VERDICT_OK = 0U;
 static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_VERDICT_ZERO_DWT = 1u << 0;
 static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_VERDICT_SOURCE_MISMATCH = 1u << 1;
@@ -101,9 +105,8 @@ static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_REASON_STARTUP_RELAXED_DIAGN
 static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_REASON_SIDE_RAIL_DIAGNOSTIC = 21U;
 static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_REASON_UNKNOWN = 22U;
 
-// FloorLine vertical-anchor policy IDs carried in regression diagnostics.
-// SINGLE_MIN identifies the retired ShakeOut1 behavior; MEDIAN8 is the robust
-// estimator that anchors to the median of the eight lowest pre-shift fit errors.
+// Historical FloorLine IDs retained only to preserve the current diagnostic
+// structure layout.  process_interrupt never authors a FloorLine policy.
 static constexpr uint32_t INTERRUPT_FLOORLINE_ANCHOR_POLICY_UNKNOWN = 0U;
 static constexpr uint32_t INTERRUPT_FLOORLINE_ANCHOR_POLICY_SINGLE_MIN = 1U;
 static constexpr uint32_t INTERRUPT_FLOORLINE_ANCHOR_POLICY_MEDIAN8 = 2U;
@@ -263,11 +266,8 @@ struct interrupt_capture_diag_t {
   uint32_t dwt_synthetic_threshold_cycles = 0;
   const char* dwt_synthetic_reason = nullptr;
 
-  // Final DWT-at-edge publication tribunal.  A nonzero blocking verdict means
-  // the event was not admissible before subscriber publication.  OCXO failures
-  // become SCIENCE_REJECT testimony; VCLOCK failures raise WATCHDOG_ANOMALY.
-  // FloorLine verdict bits remain diagnostic after publication deprecation.
-  // OK events carry zero here for audit continuity.
+  // Compatibility surface.  Observed edges are always published directly;
+  // verdict_mask is always OK and no candidate can repair or replace DWT.
   uint32_t dwt_publication_verdict_mask = 0;
   uint32_t dwt_publication_verdict_reason_id = INTERRUPT_DWT_PUBLICATION_REASON_OK;
   uint32_t dwt_publication_watchdog_count = 0;
@@ -335,8 +335,8 @@ struct interrupt_capture_diag_t {
   int32_t  dwt_yardstick_auth_error_cycles = 0;
   bool     dwt_yardstick_auth_anchor_applied = false;
 
-  // Legacy FloorLine/lower-envelope diagnostic surface.  These fields are no
-  // longer subscriber-facing DWT publication authority.
+  // Retained ABI padding for former FloorLine diagnostics.  The observed-only
+  // implementation leaves this complete block zero.
   bool     regression_valid = false;
   uint32_t regression_sequence = 0;
   uint32_t regression_sample_count = 0;
@@ -483,9 +483,9 @@ struct interrupt_capture_diag_t {
 static constexpr int32_t DWT_PPS_COINCIDENCE_THRESHOLD_CYCLES = 10000;
 
 static constexpr uint32_t SMARTZERO_LANE_COUNT = 3;
-static constexpr uint32_t SMARTZERO_SAMPLE_RATE_HZ = 1000;
-static constexpr uint32_t SMARTZERO_COUNTER_DELTA_TICKS = 10000;
-static constexpr int32_t  SMARTZERO_DEFAULT_TOLERANCE_CYCLES = 4;
+static constexpr uint32_t SMARTZERO_SAMPLE_RATE_HZ = 1;
+static constexpr uint32_t SMARTZERO_COUNTER_DELTA_TICKS = 10000000;
+static constexpr int32_t  SMARTZERO_DEFAULT_TOLERANCE_CYCLES = 32;
 
 enum class interrupt_smartzero_phase_t : uint8_t {
   IDLE     = 0,
@@ -1020,11 +1020,10 @@ bool interrupt_start(interrupt_subscriber_kind_t kind);
 // runtime or lane-local cadence is actually inactive.
 bool interrupt_ensure_service(interrupt_subscriber_kind_t kind);
 
-// RECOVER-only OCXO publication-pipeline rebootstrap. Preserves the
-// hardware-verified live compare ladder when possible, but clears stale
-// capture / priority-16 handoff / TimePop fact-drain / deferred-dispatch
-// custody and otherwise rearms the lane from the installed logical grid.
-// Does not touch VCLOCK, SmartZero, the OCXO synthetic zero, or the DACs.
+// RECOVER-only OCXO observed-edge rebootstrap.  Clears stale capture and
+// deferred-dispatch custody, preserves the installed logical grid, and lets
+// VCLOCK tend the next authored one-second target into its safe arm window.
+// Does not touch VCLOCK, SmartZero proof state, the OCXO logical zero, or DACs.
 bool interrupt_recover_rebootstrap_ocxo_service(
     interrupt_subscriber_kind_t kind);
 

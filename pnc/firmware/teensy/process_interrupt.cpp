@@ -2,59 +2,25 @@
 // process_interrupt.cpp
 // ============================================================================
 //
-// PPS and PPS_VCLOCK doctrine (this file authors both):
+// process_interrupt owns only executable custody and observed edge facts.
 //
-//   • PPS         — physical GPIO edge facts. The ISR-entry DWT observation is
-//                   latency-adjusted and retained as raw evidence. When the
-//                   same-second VCLOCK FloorLine projection differs by more
-//                   than the PPS arbitration threshold, that projection is
-//                   published as the best electrical PPS estimate.
+// Priority 0 is the sacred capture tier:
+//   * ARM_DWT_CYCCNT is captured as the first instruction of every timing ISR.
+//   * the hardware source is defused;
+//   * the already-authored compare target is retained as event identity;
+//   * an optional ambient low-word read is retained as witness evidence only;
+//   * a bounded scalar packet is handed to priority 16.
 //
-//   • PPS_VCLOCK  — the VCLOCK edge selected by the physical PPS pulse.  This
-//                   is the canonical timing authority of the system.  Its
-//                   counter32/ch3 are the VCLOCK-counter identity of the
-//                   chosen edge; its dwt is that same edge's DWT coordinate;
-//                   its gnss_ns is VCLOCK-authored (advances by exactly 1e9
-//                   per PPS) and is therefore quantized to 100 ns — the ns
-//                   value always ends in "00".  PPS_VCLOCK ns is computed
-//                   from VCLOCK counter ticks × 100, never from DWT.
+// Priority 16 owns continuation:
+//   * VCLOCK extends the three 16-bit timer domains and tends OCXO target arms;
+//   * raw ISR-entry DWT is converted once to the calibrated event coordinate;
+//   * one-second VCLOCK/OCXO events are authored from observed DWT plus the
+//     known compare target;
+//   * subscriber delivery is scheduled into foreground TimePop ASAP context.
 //
-//   • _raw rule   — _raw is reserved for one thing: ARM_DWT_CYCCNT captured
-//                   as the first instruction of an ISR.  The moment a value
-//                   is latency-adjusted, the _raw is gone.  Raw ISR-entry DWT
-//                   may now appear only on the explicit diagnostic field
-//                   dwt_isr_entry_raw; it is evidence, never event authority.
-//
-// TimePop is the principled exception to the "no DWT conversion in
-// PPS_VCLOCK" rule: it projects legacy-CH2-API / actual-CH1 fire facts onto
-// the PPS_VCLOCK timeline for scheduling diagnostics. Subscriber-facing DWT
-// publication is now observation-derived for every measured lane: VCLOCK and
-// OCXO lanes publish the latency-adjusted observed edge from their own QTimer
-// event facts. The physical PPS GPIO edge remains the selector/witness for the
-// PPS_VCLOCK identity and for the smooth DWT/GNSS slope; PPS-derived/lower-
-// phase VCLOCK estimates are diagnostic witnesses only. FloorLine/lower-
-// envelope remains non-authoritative for VCLOCK/OCXO edge publication, but a
-// separate magnitude court may use it to replace a discrepant physical PPS
-// GPIO endpoint, regardless of sign. Raw PPS evidence is always retained.
-// Counter32/GNSS identity remains exact authority.
-// CLOCKS/Alpha owns measured-GNSS interval construction from consecutive
-// authored edge DWTs.
-//
-// Lanes:
-//   VCLOCK : QTimer1 CH0 counter + compare
-//   OCXO1  : QTimer2 CH0 counter + compare
-//   OCXO2  : QTimer3 CH3 physical adapter, counter + compare
-//   TimePop: QTimer1 CH2 scheduler-only compare intervals
-//
-// The PPS GPIO ISR captures DWT as its first instruction, then reads the
-// QTimer1 CH0 low-word counter.  process_interrupt maps that low-word
-// hardware observation into the private synthetic 32-bit VCLOCK identity.
-// When a rebootstrap is pending, it records the selected VCLOCK edge.
-// Native QTimer1 CH1 custody now consumes that pending edge after TimePop has
-// processed a legacy-CH2-API / actual-CH1 compare event, back-projects to the selected edge, and
-// publishes the canonical PPS_VCLOCK epoch.  Native CH1 also owns steady-state
-// VCLOCK one-second fact authorship, VCLOCK SmartZero sampling, PPS_RELAY
-// deassert, fact-drain arming, and passive 16-bit rollover tending.
+// There is no FloorLine, EMA, predictor, inferred endpoint, repair candidate,
+// yardstick DWT authority, 1 kHz OCXO ladder, or alternative publication court
+// in this module.  Ambient counter reads are witnesses and never event truth.
 // ============================================================================
 
 #include "process_interrupt.h"
@@ -76,30 +42,14 @@
 #include <string.h>
 #include <climits>
 
-
-// ============================================================================
-// ISR / hot-path placement
-// ============================================================================
-//
-// Interrupt helpers and operational globals use ordinary RAM1 placement.
-// Cold report scratch, post-failure evidence, and foreground-only bulk state
-// may remain in DMAMEM/RAM2.  State crossing priority-0 capture, priority-16
-// handoff, TimePop dispatch, or foreground reporting must not depend on cached
-// RAM2 timing.
-
-// process_clocks owns watchdog publication/stop semantics.  process_interrupt
-// only raises hard timing-identity faults through this narrow boundary.
+// process_clocks owns campaign surrender/science-reject semantics.
 void clocks_watchdog_anomaly(const char* reason,
                              uint32_t detail0,
                              uint32_t detail1,
                              uint32_t detail2,
                              uint32_t detail3);
+bool clocks_watchdog_campaign_armed(void);
 
-// Optional verbose watchdog boundary.  process_clocks may provide this strong
-// symbol to own WATCHDOG_ANOMALY semantics and latch campaign-publication
-// surrender before the evidence is emitted.  The weak fallback publishes the
-// supplied Payload directly as the WATCHDOG_ANOMALY body so non-CLOCKS builds
-// still expose the first fatal publication-court record.
 void clocks_watchdog_anomaly_payload(const char* reason,
                                      const Payload& payload,
                                      uint32_t detail0,
@@ -108,12 +58,13 @@ void clocks_watchdog_anomaly_payload(const char* reason,
                                      uint32_t detail3)
     __attribute__((weak));
 
-__attribute__((weak)) void clocks_watchdog_anomaly_payload(const char* reason,
-                                     const Payload& payload,
-                                     uint32_t detail0,
-                                     uint32_t detail1,
-                                     uint32_t detail2,
-                                     uint32_t detail3) {
+__attribute__((weak)) void clocks_watchdog_anomaly_payload(
+    const char* reason,
+    const Payload& payload,
+    uint32_t detail0,
+    uint32_t detail1,
+    uint32_t detail2,
+    uint32_t detail3) {
   (void)reason;
   (void)detail0;
   (void)detail1;
@@ -122,1030 +73,77 @@ __attribute__((weak)) void clocks_watchdog_anomaly_payload(const char* reason,
   publish("WATCHDOG_ANOMALY", payload);
 }
 
-// WATCHDOG_ANOMALY is a campaign-continuity surrender, not a boot/pre-campaign
-// diagnostic channel.  VCLOCK custody runs continuously before CLOCKS START, so
-// final-publication courts must remain diagnostic-only until CLOCKS says a
-// campaign ledger is actually armed.
-bool clocks_watchdog_campaign_armed(void);
-
-static bool interrupt_science_reject_lane(
-    interrupt_subscriber_kind_t kind) {
-  return kind == interrupt_subscriber_kind_t::OCXO1 ||
-         kind == interrupt_subscriber_kind_t::OCXO2;
-}
-
-static void interrupt_science_reject(
-    clocks_science_reject_reason_t reason,
-    interrupt_subscriber_kind_t kind,
-    uint32_t detail0 = 0U,
-    uint32_t detail1 = 0U,
-    uint32_t detail2 = 0U,
-    uint32_t detail3 = 0U) {
-  clocks_science_reject(clocks_science_reject_source_t::INTERRUPT,
-                        reason,
-                        (uint32_t)kind,
-                        detail0,
-                        detail1,
-                        detail2,
-                        detail3);
-}
-
-static char interrupt_ascii_fold(char c) {
-  return (c >= 'a' && c <= 'z') ? (char)(c - ('a' - 'A')) : c;
-}
-
-static bool interrupt_cstr_equal_ci(const char* a, const char* b) {
-  if (!a || !b) return false;
-  while (*a && *b) {
-    if (interrupt_ascii_fold(*a) != interrupt_ascii_fold(*b)) return false;
-    ++a;
-    ++b;
-  }
-  return *a == *b;
-}
-
 // ============================================================================
-// Constants
+// Fixed doctrine
 // ============================================================================
 
-// Memory-pressure trim profile.  Keep the new priority-handoff forensics intact,
-// but retire bulky legacy diagnostic buffers that are no longer part of timing
-// authority.
-static constexpr bool INTERRUPT_REDUCED_DIAGNOSTICS = true;
-
-// The GPIO/QTimer latency constants are measured by the latency calibration
-// process as full software-stimulus-to-ISR paths.  process_interrupt needs the
-// event-coordinate ISR-entry correction, so subtract the known software pin
-// launch overhead from those totals.
-static constexpr uint32_t STIMULUS_LAUNCH_LATENCY_CYCLES = 5;
-
-// PPS_VCLOCK epoch selection: the canonical edge is the first VCLOCK edge
-// after the physical PPS pulse.  Counter32 offset is currently 0 because
-// the GPIO ISR's bus-delayed counter read is already that selected edge on
-// this hardware.  Tunable named constants so live measurements can adjust.
-static constexpr uint32_t VCLOCK_EPOCH_TICKS_AFTER_PHYSICAL_PPS = 1;
-static constexpr int32_t  VCLOCK_EPOCH_COUNTER32_OFFSET_TICKS   = 0;
-// The PPS GPIO ISR reads the VCLOCK low word after the selected edge has
-// already matured.  Empirically this observation is two 10 MHz ticks later
-// than the sacred first-after-PPS VCLOCK edge.
-static constexpr uint32_t VCLOCK_EPOCH_OBSERVED_TICKS_AFTER_SELECTED = 2;
-static constexpr int64_t  GNSS_NS_PER_SECOND                    = 1000000000LL;
-
-// PPS/VCLOCK edge authority tribunal.  The three candidates are deliberately
-// kept tiny so the hot path publishes one chosen DWT coordinate plus compact
-// courtroom collateral: PPS+learned-phase, VCLOCK observed, and predictor.
-static constexpr uint32_t PPS_VCLOCK_EDGE_AGREEMENT_GATE_CYCLES = 8U;
-
-// DWT→PPS_VCLOCK anchor selection for OCXO/TimePop event projection.
-// A DWT event near a PPS boundary may be serviced after the PPS ISR has
-// published the next anchor.  The latest anchor can therefore be coherent but
-// semantically wrong for that event.  Keep a tiny immutable history and choose
-// the newest anchor that makes the event land in a lawful post-anchor window.
-static constexpr uint32_t PVC_ANCHOR_RING_SIZE = 4;
-static constexpr uint64_t PVC_ANCHOR_MAX_EVENT_OFFSET_NS = 1250000000ULL;
-
-static constexpr uint32_t ANCHOR_SELECT_NONE     = 0;
-static constexpr uint32_t ANCHOR_SELECT_LATEST   = 1;
-static constexpr uint32_t ANCHOR_SELECT_PREVIOUS = 2;
-static constexpr uint32_t ANCHOR_SELECT_OLDER    = 3;
-static constexpr uint32_t ANCHOR_SELECT_FAILED   = 4;
-
-static constexpr uint32_t ANCHOR_FAIL_RING_UNSTABLE = 1u << 0;
-static constexpr uint32_t ANCHOR_FAIL_NO_ANCHORS    = 1u << 1;
-static constexpr uint32_t ANCHOR_FAIL_BAD_ANCHOR    = 1u << 2;
-static constexpr uint32_t ANCHOR_FAIL_NO_CPS        = 1u << 3;
-static constexpr uint32_t ANCHOR_FAIL_DELTA_RANGE   = 1u << 4;
-static constexpr uint32_t ANCHOR_FAIL_NO_PLAUSIBLE  = 1u << 5;
-
-// VCLOCK endpoint repair is currently disabled / witness-only.
-//
-// The previous active diagnostic path proved useful but could destabilize the
-// foreground path while we are still validating the new VCLOCK-domain anchor
-// architecture.  Leave the constants and report surface in place, but keep the
-// ISR hot path passive until we explicitly re-enable the experiment.
-static constexpr bool     VCLOCK_DWT_REPAIR_DIAG_ENABLED = false;
-static constexpr uint32_t VCLOCK_DWT_REPAIR_THRESHOLD_CYCLES = 10;
-static constexpr uint32_t VCLOCK_DWT_REPAIR_MIN_HISTORY_COUNT = 8;
-static constexpr uint32_t VCLOCK_DWT_REPAIR_MAX_PREDICTION_RESIDUAL_CYCLES = 25;
-
-// The retired predictor rail has been removed.  FloorLine/lower-envelope is now
-// diagnostic only.  Subscriber-facing DWT-at-edge publication is derived from
-// observed facts for all measured lanes: VCLOCK publishes its latency-adjusted
-// observed QTimer edge, and OCXO lanes publish their latency-adjusted observed
-// QTimer edges. PPS+learned lower-phase remains a VCLOCK courtroom witness,
-// not subscriber publication authority.
-
-// Epoch-ready PPS capture packet.  The ISR captures the first-instruction DWT
-// and the three lane hardware counters in one tiny custody window.  DWT runs
-// at ~1.008 GHz, so 101 cycles is roughly one 10 MHz tick.  The packet remains
-// available for the entire following second; ZERO can select it asynchronously.
-static constexpr uint32_t EPOCH_CAPTURE_MAX_WINDOW_CYCLES =
-    (DWT_EXPECTED_PER_PPS + (VCLOCK_COUNTS_PER_SECOND - 1U)) /
-    VCLOCK_COUNTS_PER_SECOND;
-// CounterLedger lane admission is a bounded sample-quality gate, not the
-// stricter global all-lanes courtroom badge.  Allow a tiny two-tick custody
-// window so a 101/103-cycle measurement edge cannot starve both OCXO lanes,
-// while still rejecting genuinely long PPS capture windows.
-static constexpr uint32_t EPOCH_CAPTURE_COUNTERLEDGER_MAX_WINDOW_CYCLES =
-    EPOCH_CAPTURE_MAX_WINDOW_CYCLES * 2U;
-
-// Reporting-only integrity checks.  These counters intentionally do not feed
-// authority, repair, watchdog, gating, or SmartZero.  They are pure courtroom
-// arithmetic over already-authored edge facts.
-static constexpr uint32_t VCLOCK_PPS_INTERVAL_INTEGRITY_GATE_CYCLES = 10U;
-static constexpr int64_t  VCLOCK_GNSS_NS_INTEGRITY_GATE_NS = 16LL;
-// Immediate CNTR-vs-COMP low-word check.  Live evidence shows the first
-// priority-0 CNTR read after the sacred DWT capture is deterministically one
-// 10 MHz tick after the compare target on all active QuadTimer lanes.
-// Treat +1 as the invariant; exact target equality is not expected here.
-static constexpr int32_t QTIMER_CNTR_MATCH_EXPECTED_OFFSET_TICKS = 1;
-// A lane is considered locked after this many consecutive +1 observations.
-// This separates startup/pre-grid transients from steady-state integrity.
-static constexpr uint32_t QTIMER_CNTR_MATCH_LOCK_STREAK = 1000U;
-// Immediate DWT interval check for the same QuadTimer match stream.
-// The raw first-instruction DWT interval between accepted compare teeth must
-// agree with the target-counter interval converted through the live DWT/GNSS
-// cycles-per-second ruler.  This is report-only; recovery policy comes later.
-static constexpr uint32_t QTIMER_DWT_MATCH_GATE_CYCLES = 20U;
-static constexpr uint32_t QTIMER_DWT_1KHZ_LOCK_STREAK = 1000U;
-static constexpr uint32_t QTIMER_DWT_1S_LOCK_STREAK = 8U;
-// Counter32 lineage is a one-second edge-adjacency readiness rail.  It should
-// recover like the DWT ruler after a historical bad sample instead of using
-// lifetime bad_count as a permanent launch-pad veto.
-static constexpr uint32_t COUNTER32_LINEAGE_LOCK_STREAK = 8U;
-// The 1 kHz DWT check depends on the live DWT/GNSS cycles-per-second
-// ruler.  Do not let it enter the operational courtroom until the slower
-// one-second DWT surface has locked; otherwise startup CPS/ruler movement can
-// create false-negative mismatch blocks that look like real post-lock faults.
-static constexpr bool QTIMER_DWT_1KHZ_REQUIRES_ONE_SECOND_LOCK = true;
-
-static interrupt_integrity_snapshot_t g_interrupt_integrity = {};
-static interrupt_integrity_snapshot_t g_interrupt_integrity_report_scratch DMAMEM = {};
-
-static void interrupt_integrity_note_vclock_gnss_ns(uint32_t sequence,
-                                                    uint32_t dwt_at_edge,
-                                                    uint32_t counter32_at_edge);
-static void interrupt_integrity_note_qtimer_cntr_match(
-    interrupt_subscriber_kind_t kind,
-    uint32_t sequence,
-    uint32_t target_counter32,
-    uint16_t expected_low16,
-    uint16_t ambient_low16,
-    uint32_t isr_entry_dwt_raw);
-static void interrupt_integrity_note_qtimer_dwt_match(
-    interrupt_subscriber_kind_t kind,
-    uint32_t sequence,
-    uint32_t target_counter32,
-    uint32_t isr_entry_dwt_raw,
-    bool one_second_boundary);
-
-// Teensy SYSTEM feature-state publication.  These helpers only publish local
-// INTERRUPT-owned truth; they do not gate or repair the timing rails.
-static void interrupt_features_mark_initializing(void);
-static void interrupt_feature_note_pps_vclock_authority(
-    const pps_vclock_edge_authority_t& authority);
-static bool interrupt_feature_pps_vclock_authority_service_ready(
-    const pps_vclock_edge_authority_t& authority);
-static bool interrupt_feature_qtimer_counter_custody_generation_locked(void);
-static bool interrupt_feature_qtimer_counter_custody_generation_anomaly(void);
-static void interrupt_feature_update_qtimer_counter_custody(void);
-static void interrupt_feature_update_qtimer_dwt_ruler(void);
-static void interrupt_feature_update_counter32_lineage(void);
-static void interrupt_feature_update_floorline(void);
-
-static uint32_t interrupt_integrity_abs_i32(int32_t value) {
-  return value < 0 ? (uint32_t)(-(int64_t)value) : (uint32_t)value;
-}
-
-static uint64_t interrupt_integrity_abs_i64(int64_t value) {
-  if (value >= 0) return (uint64_t)value;
-  return (uint64_t)(-(value + 1LL)) + 1ULL;
-}
-
-static interrupt_integrity_counter_check_t*
-interrupt_integrity_counter_store(interrupt_subscriber_kind_t kind) {
-  switch (kind) {
-    case interrupt_subscriber_kind_t::VCLOCK:
-      return &g_interrupt_integrity.vclock_counter;
-    case interrupt_subscriber_kind_t::OCXO1:
-      return &g_interrupt_integrity.ocxo1_counter;
-    case interrupt_subscriber_kind_t::OCXO2:
-      return &g_interrupt_integrity.ocxo2_counter;
-    default:
-      return nullptr;
-  }
-}
-
-static interrupt_integrity_qtimer_cntr_match_check_t*
-interrupt_integrity_qtimer_cntr_store(interrupt_subscriber_kind_t kind) {
-  switch (kind) {
-    case interrupt_subscriber_kind_t::VCLOCK:
-      return &g_interrupt_integrity.vclock_qtimer_cntr;
-    case interrupt_subscriber_kind_t::OCXO1:
-      return &g_interrupt_integrity.ocxo1_qtimer_cntr;
-    case interrupt_subscriber_kind_t::OCXO2:
-      return &g_interrupt_integrity.ocxo2_qtimer_cntr;
-    default:
-      return nullptr;
-  }
-}
-
-static interrupt_integrity_qtimer_dwt_match_check_t*
-interrupt_integrity_qtimer_dwt_store(interrupt_subscriber_kind_t kind) {
-  switch (kind) {
-    case interrupt_subscriber_kind_t::VCLOCK:
-      return &g_interrupt_integrity.vclock_qtimer_dwt;
-    case interrupt_subscriber_kind_t::OCXO1:
-      return &g_interrupt_integrity.ocxo1_qtimer_dwt;
-    case interrupt_subscriber_kind_t::OCXO2:
-      return &g_interrupt_integrity.ocxo2_qtimer_dwt;
-    default:
-      return nullptr;
-  }
-}
-
-bool interrupt_integrity_snapshot(interrupt_integrity_snapshot_t* out) {
-  if (!out) return false;
-  g_interrupt_integrity.snapshot_count++;
-  g_interrupt_integrity.valid =
-      g_interrupt_integrity.vclock_gnss_ns.valid ||
-      g_interrupt_integrity.vclock_qtimer_cntr.valid ||
-      g_interrupt_integrity.ocxo1_qtimer_cntr.valid ||
-      g_interrupt_integrity.ocxo2_qtimer_cntr.valid ||
-      g_interrupt_integrity.vclock_qtimer_dwt.valid ||
-      g_interrupt_integrity.ocxo1_qtimer_dwt.valid ||
-      g_interrupt_integrity.ocxo2_qtimer_dwt.valid ||
-      g_interrupt_integrity.vclock_pps_interval.valid ||
-      g_interrupt_integrity.vclock_counter.valid ||
-      g_interrupt_integrity.ocxo1_counter.valid ||
-      g_interrupt_integrity.ocxo2_counter.valid;
-  *out = g_interrupt_integrity;
-  return out->valid;
-}
-
-void interrupt_integrity_note_vclock_pps_interval(uint32_t sequence,
-                                                  bool pps_interval_valid,
-                                                  uint32_t pps_interval_cycles,
-                                                  bool vclock_interval_valid,
-                                                  uint32_t vclock_interval_cycles) {
-  interrupt_integrity_interval_check_t& s =
-      g_interrupt_integrity.vclock_pps_interval;
-  s.valid = true;
-  s.sequence = sequence;
-  s.gate_cycles = VCLOCK_PPS_INTERVAL_INTEGRITY_GATE_CYCLES;
-  s.pps_interval_valid = pps_interval_valid;
-  s.vclock_interval_valid = vclock_interval_valid;
-  s.pps_interval_cycles = pps_interval_valid ? pps_interval_cycles : 0U;
-  s.vclock_interval_cycles = vclock_interval_valid ? vclock_interval_cycles : 0U;
-
-  if (!pps_interval_valid || !vclock_interval_valid ||
-      pps_interval_cycles == 0U || vclock_interval_cycles == 0U) {
-    s.skipped_count++;
-    s.last_ok = false;
-    s.vclock_minus_pps_cycles = 0;
-    return;
-  }
-
-  const int32_t delta =
-      (vclock_interval_cycles >= pps_interval_cycles)
-          ? (int32_t)(vclock_interval_cycles - pps_interval_cycles)
-          : -(int32_t)(pps_interval_cycles - vclock_interval_cycles);
-  s.vclock_minus_pps_cycles = delta;
-  s.test_count++;
-
-  if (interrupt_integrity_abs_i32(delta) <=
-      VCLOCK_PPS_INTERVAL_INTEGRITY_GATE_CYCLES) {
-    s.ok_count++;
-    s.last_ok = true;
-  } else {
-    s.bad_count++;
-    s.last_ok = false;
-  }
-}
-
-void interrupt_integrity_note_counter32(interrupt_subscriber_kind_t kind,
-                                        uint32_t sequence,
-                                        bool interval_valid,
-                                        uint32_t observed_delta_ticks,
-                                        uint32_t expected_delta_ticks,
-                                        uint32_t current_counter32) {
-  interrupt_integrity_counter_check_t* s =
-      interrupt_integrity_counter_store(kind);
-  if (!s) return;
-
-  s->valid = true;
-  s->sequence = sequence;
-  s->expected_delta_ticks = expected_delta_ticks;
-  s->observed_delta_ticks = interval_valid ? observed_delta_ticks : 0U;
-  s->current_counter32 = current_counter32;
-  s->previous_counter32 = interval_valid
-      ? (current_counter32 - observed_delta_ticks)
-      : 0U;
-  s->lock_streak_required = COUNTER32_LINEAGE_LOCK_STREAK;
-
-  if (!interval_valid || expected_delta_ticks == 0U) {
-    // Missing first/prior edge evidence is not a lineage failure.  Preserve
-    // lifetime skipped accounting, but do not poison the feature gate or reset
-    // an already-earned clean streak.
-    s->skipped_count++;
-    s->last_sample_counted = false;
-    s->observed_minus_expected_ticks = 0;
-    interrupt_feature_update_counter32_lineage();
-    return;
-  }
-
-  const int32_t error =
-      (observed_delta_ticks >= expected_delta_ticks)
-          ? (int32_t)(observed_delta_ticks - expected_delta_ticks)
-          : -(int32_t)(expected_delta_ticks - observed_delta_ticks);
-  s->observed_minus_expected_ticks = error;
-  s->test_count++;
-  s->last_sample_counted = true;
-
-  const bool was_locked = s->locked;
-  const bool ok = (error == 0);
-
-  if (ok) {
-    s->ok_count++;
-    s->last_ok = true;
-    if (s->consecutive_ok_count != UINT32_MAX) {
-      s->consecutive_ok_count++;
-    }
-  } else {
-    s->bad_count++;
-    s->last_ok = false;
-    s->consecutive_ok_count = 0;
-    if (s->first_bad_sequence == 0U) {
-      s->first_bad_sequence = sequence;
-    }
-    s->last_bad_sequence = sequence;
-    s->last_bad_observed_delta_ticks = observed_delta_ticks;
-    s->last_bad_expected_delta_ticks = expected_delta_ticks;
-    s->last_bad_observed_minus_expected_ticks = error;
-  }
-
-  if (was_locked) {
-    if (ok) {
-      s->post_lock_ok_count++;
-    } else {
-      s->post_lock_bad_count++;
-    }
-  } else {
-    if (ok) {
-      s->prelock_ok_count++;
-    } else {
-      s->prelock_bad_count++;
-    }
-
-    if (ok && s->consecutive_ok_count >= COUNTER32_LINEAGE_LOCK_STREAK) {
-      s->locked = true;
-      s->lock_sequence = sequence;
-      s->lock_count++;
-    }
-  }
-
-  interrupt_feature_update_counter32_lineage();
-}
-
-// VCLOCK/relay TimePop heartbeat.
-//
-// VCLOCK_HEARTBEAT remains a critical recurring TimePop ISR client on the
-// sovereign QTimer1 CH1 rail, but it is no longer a rollover owner.  VCLOCK still uses this rail deliberately:
-// TimePop's same-deadline coalescing keeps VCLOCK facts on one perishable ISR
-// surface and avoids introducing a competing preemptive VCLOCK compare.
-static constexpr uint64_t VCLOCK_HEARTBEAT_PERIOD_NS = 1000000ULL;
-
-// PPS relay ownership lives in process_interrupt because the visible relay edge
-// is a physical PPS witness.  The rising edge is asserted directly inside the
-// PPS GPIO ISR; the 500 ms deassert is driven by intrinsic QTimer1 CH1
-// elapsed-tick service so relay-off no longer depends on VCLOCK_HEARTBEAT
-// callback dispatch.
-static constexpr uint64_t PPS_RELAY_OFF_NS = 500000000ULL;
-static constexpr uint32_t PPS_RELAY_OFF_CADENCE_TICKS =
-    (uint32_t)(PPS_RELAY_OFF_NS / VCLOCK_HEARTBEAT_PERIOD_NS);
-static_assert((PPS_RELAY_OFF_NS % VCLOCK_HEARTBEAT_PERIOD_NS) == 0ULL,
-              "PPS relay off interval must be an integer VCLOCK_HEARTBEAT period");
-static_assert(PPS_RELAY_OFF_CADENCE_TICKS == 500U,
-              "PPS relay off interval should be 500 cadence ticks");
-
-// OCXO DWT authorship.  OCXO1 and OCXO2 live on separate QuadTimer
-// modules/vectors.  Each OCXO ISR still captures ARM_DWT_CYCCNT as first
-// instruction for private evidence; subscriber-facing DWT is the latency-
-// adjusted observed edge.  FloorLine and yardstick remain diagnostic evidence.
-static constexpr uint32_t OCXO_DWT_SOURCE_NONE = 0;
-static constexpr uint32_t OCXO_DWT_SOURCE_ISR_ENTRY = 1;
-static constexpr uint32_t OCXO_DWT_SOURCE_FLOORLINE = 3;
-
-// PPS-Yardstick OCXO DWT inference (Stage 1 -- OBSERVATIONAL ONLY).
-//
-// Model: the physical PPS-to-PPS DWT interval (GPIO path, unquantized) is the
-// live yardstick for Teensy CPU-clock drift.  The OCXO's own second is stable
-// to ~1e-11, so the only lawful second-to-second change in its measured DWT
-// interval is that same yardstick drift:
-//
-//   O_inferred[n] = O_chain[n-1] * G_now / G_prev
-//
-// carried in Q16 fixed point so sub-cycle truth accumulates instead of being
-// re-quantized each second.  The QTimer-measured interval (4-cycle lattice)
-// is demoted to validator: agreement within the gate band confirms the
-// inferred value; disagreement marks an excursion of the ISR/service
-// displacement class.
-//
-// The retired predictor rail has been removed.  The yardstick rail remains as
-// an OCXO physics audit and zero-worthiness input, while OCXO publication uses
-// the latency-adjusted observed DWT-at-edge.
-static constexpr bool     OCXO_YARDSTICK_DWT_AUTHORITY_ENABLED = false; // Yardstick is diagnostic only
-static constexpr uint32_t OCXO_YARDSTICK_GATE_THRESHOLD_CYCLES = 16;
-// Anchored yardstick witness rail.  This remains a PI-anchored
-// yardstick chain: each second the anchored interval is scaled by the same
-// PPS yardstick step as the free chain, the endpoint advances by it, and on
-// gate-agree seconds the observed endpoint corrects the loop:
-//
-//   err       = observed - anchored_endpoint        (Q16)
-//   endpoint += err >> ANCHOR_P_SHIFT               (proportional, phase)
-//   interval += err >> ANCHOR_I_SHIFT               (integral, frequency)
-//
-// Plover2 measured a +2 cycle/seed-bias interval and a +1.76 cycles/s free
-// chain walk.  A proportional-only anchor would park K * bias cycles off
-// truth; the integral term drives steady-state error to ZERO under constant
-// interval bias and slowly absorbs real per-lane oven drift -- it is what
-// makes the two lanes individual.  With P=1/8 and I=1/256 at 1 Hz the loop
-// is critically damped (zeta = 1) and the +/-2 cycle observed lattice noise
-// reaches the witness endpoint attenuated to ~0.25 cycles.  On excursion
-// seconds no correction is applied: the rail coasts on pure inference (the
-// excursion guard).  The yardstick feed-forward carries the thermal slope, so
-// the loop only ever fights zero-mean noise and bias -- there is no systematic
-// lag and no integer dead zone.
-// Retuned 2026-06-12 from Zero3 evidence: at P=1/8, I=1/256 the loop's
-// standing endpoint error is ~8x any interval mistune and its ~100 s natural
-// period sat next to the campaign's thermal oscillation; the published
-// endpoint wandered +/-25 cycles common-mode (aerr columns, raw_cycles).
-// P=1/2 caps the standing error at ~2x interval mistune; I=1/64 drops the
-// loop period to ~16 s (zeta = 2, overdamped) so it recovers between thermal
-// reversals.  Cost: ~1 extra cycle of lattice noise in the published
-// endpoint, against the +/-25 it eliminates.
-static constexpr uint32_t OCXO_YARDSTICK_ANCHOR_P_SHIFT = 1;   // 1/2
-static constexpr uint32_t OCXO_YARDSTICK_ANCHOR_I_SHIFT = 6;   // 1/64
-
-// Anchor acquisition gear shift.  A cold or re-seeded anchor rail carries the
-// seed's quantization bias in its interval; with tracking-gain integral
-// (1/256) the loop parks at ~8x that bias for tens of seconds (P-term
-// balance, tau ~ 30 s) -- demonstrably unconverged state that correctly
-// blocks zero-worthiness but slows cold-boot readiness.  For the first
-// OCXO_YARDSTICK_ANCHOR_FAST_LOCK_SECONDS agree seconds after any seed or
-// reseed the integral runs at acquisition gain (1/32, tau ~ 4 s), then
-// drops to tracking gain.  Qualification thresholds are unchanged: the gate
-// demands the same settled evidence; the loop simply earns it sooner.
-static constexpr uint32_t OCXO_YARDSTICK_ANCHOR_FAST_LOCK_SECONDS = 32;
-static constexpr uint32_t OCXO_YARDSTICK_ANCHOR_FAST_I_SHIFT = 4;  // 1/16
-
-// ============================================================================
-// SmartZero Generation 2 ("ZeroWorthy") -- convergence-qualified zero, Stage A
-// ============================================================================
-//
-// Doctrine: zero is the SELECTION of an already-qualified canonical second,
-// not the acquisition of new proof.  The v1 SmartZero pair test certifies
-// that one millisecond of custody was mechanically clean (a glitch detector,
-// ~4 ppm stringency over its 1 ms baseline); it cannot see common-mode
-// displacement, lattice phase, or post-restart oven retrace -- all of which
-// it enshrines into the epoch.  Gen-2 instead maintains a continuous
-// per-lane ZERO-WORTHY verdict from the yardstick witness rail:
-//
-//   A lane is zero-worthy when, for ZERO_WORTHY_STREAK_SECONDS consecutive
-//   seconds, every second was a clean gate-agree second (no excursion, no
-//   stale yardstick, no adjacency fault, no reseed), the PI anchor loop
-//   error stayed within ZERO_WORTHY_MAX_ABS_AUTH_ERROR_CYCLES, and the
-//   window sum of loop errors stayed within
-//   ZERO_WORTHY_MAX_ABS_ERROR_SUM_CYCLES.
-//
-// The window-sum criterion is the retrace detector: the PI loop converts a
-// drifting oven into a persistent small same-sign error -- each second
-// individually innocent, the sum guilty (Plover3's post-flash retrace ran
-// ~+4 cycles/s of sustained loop error and must disqualify zeroing).
-//
-// An 8-second streak at gate threshold 16 over one-second baselines is an
-// effective parts-per-billion, two-independent-witness qualification; a
-// displacement common to both edges of one v1 millisecond pair cannot
-// survive eight seconds of agreement between the QTimer lane rail and the
-// PPS/GPIO yardstick without being real physics.
-//
-// Stage A is OBSERVATIONAL: verdicts, streaks, and disqualification
-// forensics are maintained and reported (INTERRUPT.REPORT_LANE
-// section=zero_worthy), and epoch capture packets are counted as
-// qualified/unqualified, but ZERO authority remains with v1 SmartZero until
-// SMARTZERO2_SELECTION_AUTHORITY_ENABLED flips after live validation.
-static constexpr bool     SMARTZERO2_SELECTION_AUTHORITY_ENABLED = false;
-static constexpr uint32_t ZERO_WORTHY_STREAK_SECONDS = 8;
-// Bounds recalibrated from live Zero1 evidence (2026-06-12): at tracking
-// gain the anchor loop error on hardware carries the physical PPS witness
-// jitter through the yardstick feed-forward, so steady-state |auth_error|
-// runs hotter than the noiseless simulation predicted and a 6-cycle bound
-// thrashed on error magnitude.  10/40 keeps the same shape (window mean
-// bound = magnitude/2) while remaining well inside the 16-cycle excursion
-// gate; the raw_cycles anchor-error histogram and policy table are the
-// instruments for refining these from campaign data.
-static constexpr int32_t  ZERO_WORTHY_MAX_ABS_AUTH_ERROR_CYCLES = 10;
-static constexpr int32_t  ZERO_WORTHY_MAX_ABS_ERROR_SUM_CYCLES = 40;
-// Chain endpoint is carried modulo 2^48 in Q16, which is exactly modulo 2^32
-// DWT cycles -- wrap arithmetic stays consistent with the uint32 DWT domain.
-static constexpr uint64_t YARDSTICK_ENDPOINT_Q16_MASK = (1ULL << 48) - 1ULL;
-// A one-second PPS yardstick interval qualifies only if the VCLOCK counter
-// advanced one nominal second within this tick tolerance (100 us).  Outside
-// the band the interval is a dropout/multi-second artifact, not a yardstick.
-static constexpr uint32_t PPS_YARDSTICK_COUNTER_TOLERANCE_TICKS = 1000U;
-// Sanity bound on the per-second yardstick step.  |G_now - G_prev| beyond
-// ~100 ppm/s is physically impossible thermal slew and also protects the
-// 64-bit interval-scaling product from overflow.
-static constexpr uint32_t PPS_YARDSTICK_MAX_ABS_DELTA_G_CYCLES = 100000U;
-
-// OCXO local target constants.  Normal OCXO operation is a +10,000 tick
-// ISR-authored compare ladder.  Each ISR match advances the private 32-bit
-// identity by the armed target, and every 1000th ladder tooth is published as
-// the one-second OCXO event.  This keeps the 16-bit compare unambiguous and
-// removes ambient rollover minding from OCXO authority.
-static constexpr uint32_t OCXO_CADENCE_INTERVAL_TICKS = 10000U;
-static constexpr uint32_t OCXO_WITNESS_ONE_SECOND_COUNTS =
-    (uint32_t)VCLOCK_COUNTS_PER_SECOND;
-static_assert(OCXO_WITNESS_ONE_SECOND_COUNTS == 10000000U,
-              "OCXO witness edge interval must be one 10 MHz second");
-static_assert(OCXO_WITNESS_ONE_SECOND_COUNTS ==
-              (OCXO_CADENCE_INTERVAL_TICKS * TICKS_PER_SECOND_EVENT),
-              "OCXO one-second interval must equal 1000 SmartZero sample ticks");
-
-// The hardware compare sees only the low 16 bits.  Therefore the target is
-// unambiguous whenever it is strictly less than one low-word revolution away.
-// The previous 10,000-tick window was the same size as the VCLOCK 1 ms tender
-// cadence, so a lane could notice the target just after the safe point and
-// skip an entire one-second bookend.  Give the same-channel OCXO lanes several
-// tender chances while retaining a generous 16,384-tick guard before the next
-// low-word lap.
-static constexpr uint32_t OCXO_WITNESS_LOWWORD_RANGE_TICKS = 65536U;
-static constexpr uint32_t OCXO_WITNESS_ARM_WINDOW_TICKS = 49152U;
-static constexpr uint32_t OCXO_WITNESS_MIN_ARM_LEAD_TICKS = 64U;
-static_assert(OCXO_WITNESS_MIN_ARM_LEAD_TICKS < OCXO_WITNESS_ARM_WINDOW_TICKS,
-              "OCXO minimum arm lead must be inside the arm window");
-static_assert(OCXO_WITNESS_ARM_WINDOW_TICKS < OCXO_WITNESS_LOWWORD_RANGE_TICKS,
-              "OCXO arm window must remain inside one 16-bit compare lap");
-
-// OCXO quiet-phase report surface.
-//
-// These constants describe the nominal phase placement of OCXO lane samples
-// inside the VCLOCK millisecond cell.  They are retained as report/back-compat
-// surfaces, but steady-state OCXO publication is now the local one-second edge
-// compare.  SmartZero may still use +10,000-tick acquisition samples.
-static constexpr bool     OCXO_QUIET_PHASE_SAMPLING_ENABLED = true;
-static constexpr uint32_t OCXO_QUIET_PHASE_PERIOD_TICKS = OCXO_CADENCE_INTERVAL_TICKS;
-static constexpr uint32_t OCXO1_QUIET_PHASE_TICKS = 2500U;  // +250 us
-static constexpr uint32_t OCXO2_QUIET_PHASE_TICKS = 7500U;  // +750 us
-static constexpr uint32_t OCXO_QUIET_PHASE_MIN_LEAD_TICKS =
-    OCXO_WITNESS_MIN_ARM_LEAD_TICKS;
-static_assert(OCXO_QUIET_PHASE_PERIOD_TICKS == 10000U,
-              "OCXO quiet phase period must be one VCLOCK millisecond");
-static_assert(OCXO1_QUIET_PHASE_TICKS < OCXO_QUIET_PHASE_PERIOD_TICKS,
-              "OCXO1 quiet phase must be inside the millisecond cell");
-static_assert(OCXO2_QUIET_PHASE_TICKS < OCXO_QUIET_PHASE_PERIOD_TICKS,
-              "OCXO2 quiet phase must be inside the millisecond cell");
-
-static constexpr uint32_t OCXO_CADENCE_REASON_NONE          = 0;
-static constexpr uint32_t OCXO_CADENCE_REASON_BOOTSTRAP     = 1;
-static constexpr uint32_t OCXO_CADENCE_REASON_START         = 2;
-static constexpr uint32_t OCXO_CADENCE_REASON_SMARTZERO     = 3;
-static constexpr uint32_t OCXO_CADENCE_REASON_LOGICAL_GRID  = 4;
-static constexpr uint32_t OCXO_CADENCE_REASON_LOGICAL_ZERO  = 5;
-static constexpr uint32_t OCXO_CADENCE_REASON_REARM         = 6;
-static constexpr uint32_t OCXO_CADENCE_REASON_STOP          = 7;
-
-// RECOVER-only OCXO publication-pipeline rebootstrap stages.  Zero means the
-// latest attempt completed through compare and NVIC verification.  Nonzero
-// values identify the exact boundary that refused the restart; VCLOCK custody
-// is never part of this operation.
-static constexpr uint32_t OCXO_RECOVER_REBOOTSTRAP_STAGE_OK = 0;
-static constexpr uint32_t OCXO_RECOVER_REBOOTSTRAP_STAGE_START_CADENCE = 1;
-static constexpr uint32_t OCXO_RECOVER_REBOOTSTRAP_STAGE_VERIFY_COMPARE = 2;
-static constexpr uint32_t OCXO_RECOVER_REBOOTSTRAP_STAGE_ENABLE_IRQ = 3;
-
-// OCXO witness scheduling/report classifications.  These are instrumentation
-// only: they make VCLOCK_HEARTBEAT arm decisions and OCXO compare-service timing
-// visible without changing whether an event is published.
-static constexpr uint32_t OCXO_SCHEDULE_DECISION_NONE               = 0;
-static constexpr uint32_t OCXO_SCHEDULE_DECISION_INACTIVE           = 1;
-static constexpr uint32_t OCXO_SCHEDULE_DECISION_ALREADY_ARMED      = 2;
-static constexpr uint32_t OCXO_SCHEDULE_DECISION_TARGET_INITIALIZED = 3;
-static constexpr uint32_t OCXO_SCHEDULE_DECISION_TARGET_ADVANCED    = 4;
-static constexpr uint32_t OCXO_SCHEDULE_DECISION_TOO_CLOSE          = 5;
-static constexpr uint32_t OCXO_SCHEDULE_DECISION_OUTSIDE_WINDOW     = 6;
-static constexpr uint32_t OCXO_SCHEDULE_DECISION_ARMED              = 7;
-static constexpr uint32_t OCXO_SCHEDULE_DECISION_GENERATION_GUARD_BLOCKED = 8;
-
-static constexpr uint32_t OCXO_SERVICE_CLASS_NONE                   = 0;
-static constexpr uint32_t OCXO_SERVICE_CLASS_FALSE_IRQ              = 1;
-static constexpr uint32_t OCXO_SERVICE_CLASS_EARLY_PRETARGET        = 2;
-static constexpr uint32_t OCXO_SERVICE_CLASS_ON_OR_AFTER_TARGET     = 3;
-
-// Lower-envelope edge inference supersedes the old linear-regression experiment.
-// No regression constants/state/windows remain in process_interrupt.
-
-// ============================================================================
-// Symmetric OCXO disable matrix (temporary A/B experiment surface)
-// ============================================================================
-//
-// These compile-time switches silence OCXO lanes at the lowest practical
-// firmware level while leaving VCLOCK untouched.  A disabled OCXO lane:
-//   * does not initialize its QTimer input/compare channel,
-//   * does not enable its NVIC IRQ,
-//   * does not start local cadence,
-//   * does not enqueue/drain perishable facts,
-//   * does not publish OCXO one-second events.
-//
-// Disabled OCXO lanes still receive an explicit synthetic SmartZero proof,
-// copied from the locked VCLOCK proof, so Alpha's existing three-lane epoch
-// invariant can complete without changing process_clocks.
-//
-// Normal baseline: both false.  For the VCLOCK-only test set both true.
-static constexpr bool OCXO1_DISABLED = false;
-static constexpr bool OCXO2_DISABLED = false;
-static constexpr bool OCXO_DISABLE_EXPERIMENT = OCXO1_DISABLED || OCXO2_DISABLED;
-static constexpr uint32_t OCXO_DISABLED_COUNT =
-    (OCXO1_DISABLED ? 1U : 0U) + (OCXO2_DISABLED ? 1U : 0U);
-
-// ============================================================================
-// SYSTEM feature status — INTERRUPT-owned readiness surfaces
-// ============================================================================
-//
-// process_interrupt owns only local custody facts.  SYSTEM is the registry; it
-// does not infer these states.  The updates below are reporting-only in this
-// migration step: no timing path branches on feature status.
-
-static system_feature_status_t g_interrupt_feature_pps_vclock_authority =
-    system_feature_status_t::ANOMALY;
-static system_feature_status_t g_interrupt_feature_floorline =
-    system_feature_status_t::ANOMALY;
-static system_feature_status_t g_interrupt_feature_qtimer_counter_custody =
-    system_feature_status_t::ANOMALY;
-static system_feature_status_t g_interrupt_feature_qtimer_dwt_ruler =
-    system_feature_status_t::ANOMALY;
-static system_feature_status_t g_interrupt_feature_counter32_lineage =
-    system_feature_status_t::ANOMALY;
-
-static constexpr uint32_t
-    INTERRUPT_FEATURE_PPS_VCLOCK_AUTHORITY_INIT_REJECT_ANOMALY_COUNT = 32U;
-static uint32_t
-    g_interrupt_feature_pps_vclock_authority_init_reject_count = 0;
-
-static void interrupt_feature_set_cached(const char* feature,
-                                         system_feature_status_t& cached,
-                                         system_feature_status_t status,
-                                         bool force = false) {
-  if (force || cached != status || !system_feature_has("INTERRUPT", feature)) {
-    (void)system_feature_set("INTERRUPT", feature, status, nullptr);
-    cached = status;
-  }
-}
-
-static bool interrupt_feature_lane_required(interrupt_subscriber_kind_t kind) {
-  if (kind == interrupt_subscriber_kind_t::VCLOCK) return true;
-  if (kind == interrupt_subscriber_kind_t::OCXO1) return !OCXO1_DISABLED;
-  if (kind == interrupt_subscriber_kind_t::OCXO2) return !OCXO2_DISABLED;
-  return false;
-}
-
-static void interrupt_features_mark_initializing(void) {
-  g_interrupt_feature_pps_vclock_authority_init_reject_count = 0;
-
-  interrupt_feature_set_cached("PPS_VCLOCK_AUTHORITY",
-                               g_interrupt_feature_pps_vclock_authority,
-                               system_feature_status_t::INITIALIZING,
-                               true);
-  interrupt_feature_set_cached("FLOORLINE",
-                               g_interrupt_feature_floorline,
-                               system_feature_status_t::INITIALIZING,
-                               true);
-  interrupt_feature_set_cached("QTIMER_COUNTER_CUSTODY",
-                               g_interrupt_feature_qtimer_counter_custody,
-                               system_feature_status_t::INITIALIZING,
-                               true);
-  interrupt_feature_set_cached("QTIMER_DWT_RULER",
-                               g_interrupt_feature_qtimer_dwt_ruler,
-                               system_feature_status_t::INITIALIZING,
-                               true);
-  interrupt_feature_set_cached("COUNTER32_LINEAGE",
-                               g_interrupt_feature_counter32_lineage,
-                               system_feature_status_t::INITIALIZING,
-                               true);
-}
-
-static bool interrupt_feature_pps_vclock_authority_service_ready(
-    const pps_vclock_edge_authority_t& authority) {
-  // Launch-pad readiness is deliberately about the authored PPS/VCLOCK edge,
-  // not about whether every courtroom witness agrees on the same row yet.
-  // FloorLine may correctly demote the raw observed VCLOCK endpoint, and the
-  // predictor may still be maturing.  The pre-campaign feature should become
-  // NOMINAL once INTERRUPT has authored a plausible first-after-PPS VCLOCK
-  // identity and DWT coordinate from live PPS + VCLOCK evidence.
-  const uint32_t essential_invalid_mask =
-      PPS_VCLOCK_EDGE_INVALID_NO_PPS |
-      PPS_VCLOCK_EDGE_INVALID_NO_OBSERVED;
-
-  const bool identity_available =
-      authority.sequence != 0U &&
-      authority.pps_dwt_at_edge != 0U &&
-      authority.authority_dwt_at_edge != 0U &&
-      authority.counter32_at_edge != 0U;
-  if (!identity_available) return false;
-
-  if ((authority.invalid_mask & essential_invalid_mask) != 0U) return false;
-
-  // Launch-pad readiness is intentionally a service/identity proof, not the
-  // full PPS/VCLOCK courtroom.  The strict one-cell DWT plausibility check can
-  // be too narrow when the selected authority is carried by FloorLine or a
-  // fallback witness while the ordinary report courts are still converging.
-  // Other feature rails own DWT-ruler, counter-custody, FloorLine, and lineage
-  // health.  If INTERRUPT has live PPS + observed VCLOCK evidence and authored
-  // a nonzero selected identity, PPS_VCLOCK_AUTHORITY must be allowed to reach
-  // NOMINAL instead of remaining INITIALIZING forever.
-  return true;
-}
-
-static void interrupt_feature_note_pps_vclock_authority(
-    const pps_vclock_edge_authority_t& authority) {
-  if (authority.valid ||
-      interrupt_feature_pps_vclock_authority_service_ready(authority)) {
-    interrupt_feature_set_cached("PPS_VCLOCK_AUTHORITY",
-                                 g_interrupt_feature_pps_vclock_authority,
-                                 system_feature_status_t::NOMINAL);
-    g_interrupt_feature_pps_vclock_authority_init_reject_count = 0;
-    return;
-  }
-
-  // Startup rows can fail the full agreement court before the prediction/phase
-  // surfaces are mature, but this feature is now a hard Pi preflight gate.  Do
-  // not allow a missing/essential-invalid authority stream to stay silently in
-  // INITIALIZING forever: after a bounded number of PPS/VCLOCK authority rows,
-  // surface ANOMALY.  A later good row still promotes back to NOMINAL above.
-  if (g_interrupt_feature_pps_vclock_authority_init_reject_count !=
-      0xFFFFFFFFUL) {
-    g_interrupt_feature_pps_vclock_authority_init_reject_count++;
-  }
-
-  if (g_interrupt_feature_pps_vclock_authority_init_reject_count >=
-      INTERRUPT_FEATURE_PPS_VCLOCK_AUTHORITY_INIT_REJECT_ANOMALY_COUNT) {
-    interrupt_feature_set_cached("PPS_VCLOCK_AUTHORITY",
-                                 g_interrupt_feature_pps_vclock_authority,
-                                 system_feature_status_t::ANOMALY);
-  }
-}
-
-static bool interrupt_feature_cntr_locked(
-    const interrupt_integrity_qtimer_cntr_match_check_t& s) {
-  return s.locked && s.post_lock_mismatch_count == 0U;
-}
-
-static void interrupt_feature_update_qtimer_counter_custody(void) {
-  // QTIMER_COUNTER_CUSTODY is a readiness statement about the active
-  // count/compare generation gate, not about the passive +1 CNTR-read
-  // forensic.  The +1 check remains in REPORT_INTEGRITY, but launch-pad
-  // readiness should follow the custody gate that actually decides whether
-  // a compare tooth belongs to the authored synthetic 32-bit target.
-  const bool generation_nominal =
-      interrupt_feature_qtimer_counter_custody_generation_locked();
-  const bool generation_anomaly =
-      interrupt_feature_qtimer_counter_custody_generation_anomaly();
-
-  // Compatibility fallback: if the older exact-offset forensic has already
-  // locked cleanly on every required lane, that is also sufficient evidence.
-  // It is deliberately not allowed to demote the feature on its own; exact
-  // first-read offset is report-only witness material, while generation-gate
-  // rejects are the active custody failure.
-  const bool v_diag_ok = interrupt_feature_cntr_locked(g_interrupt_integrity.vclock_qtimer_cntr);
-  const bool o1_diag_ok = !interrupt_feature_lane_required(interrupt_subscriber_kind_t::OCXO1) ||
-      interrupt_feature_cntr_locked(g_interrupt_integrity.ocxo1_qtimer_cntr);
-  const bool o2_diag_ok = !interrupt_feature_lane_required(interrupt_subscriber_kind_t::OCXO2) ||
-      interrupt_feature_cntr_locked(g_interrupt_integrity.ocxo2_qtimer_cntr);
-  const bool diagnostic_nominal = v_diag_ok && o1_diag_ok && o2_diag_ok;
-
-  interrupt_feature_set_cached(
-      "QTIMER_COUNTER_CUSTODY",
-      g_interrupt_feature_qtimer_counter_custody,
-      generation_anomaly ? system_feature_status_t::ANOMALY
-                         : ((generation_nominal || diagnostic_nominal)
-                               ? system_feature_status_t::NOMINAL
-                               : system_feature_status_t::INITIALIZING));
-}
-
-static bool interrupt_feature_dwt_interval_recovered(
-    const interrupt_integrity_qtimer_dwt_interval_check_t& s) {
-  // QTIMER_DWT_RULER is a launch-readiness scalar, not an eternal sin ledger.
-  // Historical post-lock excursions remain visible in REPORT_INTEGRITY, but a
-  // known catch-up/rebootstrap discontinuity should not hold preflight forever
-  // after the ruler has rebuilt its clean streak.
-  return s.locked && s.last_ok &&
-         s.consecutive_ok_count >= s.lock_streak_required;
-}
-
-static bool interrupt_feature_dwt_interval_active_anomaly(
-    const interrupt_integrity_qtimer_dwt_interval_check_t& s) {
-  // A locked rail is anomalous only while its most recent counted sample is
-  // bad.  Once clean samples resume, the feature returns to INITIALIZING until
-  // the same lock streak is rebuilt, then NOMINAL.
-  return s.locked && s.test_count != 0U && !s.last_ok;
-}
-
-static bool interrupt_feature_dwt_locked(
-    const interrupt_integrity_qtimer_dwt_match_check_t& s) {
-  return interrupt_feature_dwt_interval_recovered(s.one_second) &&
-         interrupt_feature_dwt_interval_recovered(s.hz1k);
-}
-
-static bool interrupt_feature_dwt_anomaly(
-    const interrupt_integrity_qtimer_dwt_match_check_t& s) {
-  return interrupt_feature_dwt_interval_active_anomaly(s.one_second) ||
-         interrupt_feature_dwt_interval_active_anomaly(s.hz1k);
-}
-
-static void interrupt_feature_update_qtimer_dwt_ruler(void) {
-  // Readiness uses the sovereign VCLOCK DWT ruler only. OCXO DWT interval
-  // checks remain diagnostic physics surfaces and are not global readiness.
-  const bool v_ok = interrupt_feature_dwt_locked(g_interrupt_integrity.vclock_qtimer_dwt);
-  const bool anomaly = interrupt_feature_dwt_anomaly(g_interrupt_integrity.vclock_qtimer_dwt);
-
-  interrupt_feature_set_cached(
-      "QTIMER_DWT_RULER",
-      g_interrupt_feature_qtimer_dwt_ruler,
-      anomaly ? system_feature_status_t::ANOMALY
-              : (v_ok ? system_feature_status_t::NOMINAL
-                      : system_feature_status_t::INITIALIZING));
-}
-
-static bool interrupt_feature_counter_lineage_recovered(
-    const interrupt_integrity_counter_check_t& s) {
-  // Launch readiness is a current/recovered-state predicate.  Lifetime
-  // bad_count remains courtroom evidence, but one stale violation must not
-  // veto every future campaign once exact one-second lineage has rebuilt a
-  // clean streak.
-  return s.valid && s.locked && s.last_sample_counted && s.last_ok &&
-         s.consecutive_ok_count >= s.lock_streak_required;
-}
-
-static bool interrupt_feature_counter_lineage_active_anomaly(
-    const interrupt_integrity_counter_check_t& s) {
-  // A locked lineage rail is anomalous only while its most recent counted
-  // sample is bad.  Clean samples move the feature back through INITIALIZING
-  // until the recovery streak is rebuilt, then NOMINAL.
-  return s.valid && s.locked && s.last_sample_counted && !s.last_ok;
-}
-
-static void interrupt_feature_update_counter32_lineage(void) {
-  const bool v_ok = interrupt_feature_counter_lineage_recovered(
-      g_interrupt_integrity.vclock_counter);
-  const bool o1_ok = !interrupt_feature_lane_required(interrupt_subscriber_kind_t::OCXO1) ||
-      interrupt_feature_counter_lineage_recovered(g_interrupt_integrity.ocxo1_counter);
-  const bool o2_ok = !interrupt_feature_lane_required(interrupt_subscriber_kind_t::OCXO2) ||
-      interrupt_feature_counter_lineage_recovered(g_interrupt_integrity.ocxo2_counter);
-  const bool anomaly =
-      interrupt_feature_counter_lineage_active_anomaly(
-          g_interrupt_integrity.vclock_counter) ||
-      (interrupt_feature_lane_required(interrupt_subscriber_kind_t::OCXO1) &&
-       interrupt_feature_counter_lineage_active_anomaly(
-           g_interrupt_integrity.ocxo1_counter)) ||
-      (interrupt_feature_lane_required(interrupt_subscriber_kind_t::OCXO2) &&
-       interrupt_feature_counter_lineage_active_anomaly(
-           g_interrupt_integrity.ocxo2_counter));
-
-  interrupt_feature_set_cached(
-      "COUNTER32_LINEAGE",
-      g_interrupt_feature_counter32_lineage,
-      anomaly ? system_feature_status_t::ANOMALY
-              : ((v_ok && o1_ok && o2_ok)
-                    ? system_feature_status_t::NOMINAL
-                    : system_feature_status_t::INITIALIZING));
-}
-
-// ============================================================================
-// Priority handoff migration baseline — safety rails
-// ============================================================================
-//
-// These constants and mirrors make the current capture/handoff architecture and
-// applied NVIC priorities visible in INTERRUPT.REPORT.  This release changes
-// interrupt behavior deliberately: priority 0 becomes reentry-safe capture,
-// and priority 16 performs custody continuation.
-
-// Priority doctrine for the reentry-safe capture / priority-handoff migration.
-//
-// Priority 0 is the sacred capture tier.  It must capture immutable hardware
-// facts, defuse the interrupt source, enqueue a reentry-safe capture packet,
-// pend the handoff tier, and exit.  Priority 16 is the handoff tier: still
-// interrupt context, still before foreground/ASAP, but no longer able to delay
-// sacred priority-0 clock capture.
-static constexpr uint32_t INTERRUPT_PRIORITY_CAPTURE        = 0;
-static constexpr uint32_t INTERRUPT_PRIORITY_HANDOFF        = 16;
-static constexpr uint32_t INTERRUPT_PRIORITY_BACKGROUND_IRQ = 32;
-
-static constexpr uint32_t INTERRUPT_STEP0_EXPECTED_QTIMER1_PRIORITY  = INTERRUPT_PRIORITY_CAPTURE;
-static constexpr uint32_t INTERRUPT_STEP0_EXPECTED_QTIMER2_PRIORITY  = INTERRUPT_PRIORITY_CAPTURE;
-static constexpr uint32_t INTERRUPT_STEP0_EXPECTED_QTIMER3_PRIORITY  = INTERRUPT_PRIORITY_CAPTURE;
-static constexpr uint32_t INTERRUPT_STEP0_EXPECTED_GPIO6789_PRIORITY = INTERRUPT_PRIORITY_CAPTURE;
-
-// TimePop currently owns IRQ_SOFTWARE(70) for its POC handoff.  process_interrupt
-// deliberately uses an adjacent normal external IRQ so the two POCs can coexist
-// until TimePop's duplicate handoff layer is retired.
-static constexpr uint32_t     INTERRUPT_HANDOFF_IRQ_NUMBER = 71U;
+static constexpr uint32_t INTERRUPT_PRIORITY_CAPTURE = 0U;
+static constexpr uint32_t INTERRUPT_PRIORITY_HANDOFF = 16U;
+static constexpr uint32_t INTERRUPT_PRIORITY0_PRESERVING_BASEPRI = 16U;
+static constexpr uint32_t INTERRUPT_HANDOFF_IRQ_NUMBER = 71U;
 static constexpr IRQ_NUMBER_t INTERRUPT_HANDOFF_IRQ =
     (IRQ_NUMBER_t)INTERRUPT_HANDOFF_IRQ_NUMBER;
-static constexpr const char*  INTERRUPT_HANDOFF_IRQ_NAME = "NVIC_EXTERNAL_71";
-static constexpr const char*  INTERRUPT_CAPTURE_DISCIPLINE = "REENTRY_SAFE_CAPTURE";
-static constexpr const char*  INTERRUPT_HANDOFF_MECHANISM = "NVIC_ISPR_PRIORITY_HANDOFF";
-static constexpr uint32_t     INTERRUPT_HANDOFF_DRAIN_BUDGET = 32U;
+static constexpr uint32_t INTERRUPT_HANDOFF_DRAIN_BUDGET = 32U;
 
-static constexpr uint32_t HANDOFF_QTIMER1_CH1_RING_SIZE = 8U;
-static constexpr uint32_t HANDOFF_QTIMER1_CH2_RING_SIZE = 16U;
-static constexpr uint32_t HANDOFF_OCXO_RING_SIZE = 8U;
+static constexpr uint32_t HANDOFF_QTIMER1_RING_SIZE = 16U;
+static constexpr uint32_t HANDOFF_OCXO_RING_SIZE = 4U;
 static constexpr uint32_t HANDOFF_PPS_RING_SIZE = 4U;
-static constexpr const char* INTERRUPT_FLOORLINE_WRITER_CONTEXT =
-    "PRIORITY16_HANDOFF_SINGLE_WRITER";
-static constexpr const char* INTERRUPT_SUBSCRIBER_DISPATCH_CONTEXT =
-    "TIMEPOP_ASAP_AFTER_FACT_DRAIN_UNWIND";
 
+static constexpr uint8_t QTIMER1_VCLOCK_CH = 0U;
+static constexpr uint8_t QTIMER1_RETIRED_AUX_CH = 1U;
+static constexpr uint8_t QTIMER1_TIMEPOP_CH = 2U;
+static constexpr uint8_t QTIMER1_VCLOCK_PCS = 0U;
+static constexpr uint8_t QTIMER1_TIMEPOP_PCS = 0U;
+static constexpr uint8_t QTIMER2_OCXO1_CH = 0U;
+static constexpr uint8_t QTIMER2_OCXO1_PCS = 0U;
+static constexpr uint8_t QTIMER3_OCXO2_CH = 3U;
+static constexpr uint8_t QTIMER3_OCXO2_PCS = 3U;
 
-// ============================================================================
-// Pin-bound QuadTimer lane doctrine
-// ============================================================================
-//
-// A clock lane is the physical QTimer channel that receives that lane's input
-// pin.  That same channel owns low-word observation, compare-match service,
-// and event-time correction.  Sibling channels may host schedulers or reports,
-// but they are not timing authority for the lane.
-//
-//   VCLOCK : QTimer1 CH0, Teensy pin 10, count + compare
-//   OCXO1  : QTimer2 CH0, Teensy pin 13, count + compare
-//   OCXO2  : QTimer3 CH3, Teensy pin 15, count + compare
-//   TimePop: QTimer1 CH2 scheduler only; never VCLOCK edge authority
-//
-// This is the hard-learned invariant from Court11: do not correct a compare
-// event timestamp with a sibling passive counter rail.
-static constexpr uint8_t QTIMER1_VCLOCK_CH       = 0;
-static constexpr uint8_t QTIMER1_RETIRED_AUX_CH  = 1;
-static constexpr uint8_t QTIMER1_TIMEPOP_CH      = 2;
-static constexpr uint8_t QTIMER1_VCLOCK_PCS      = 0;
-static constexpr uint8_t QTIMER1_TIMEPOP_PCS     = 0;
+static constexpr uint32_t STIMULUS_LAUNCH_LATENCY_CYCLES = 5U;
+static constexpr uint32_t VCLOCK_EPOCH_TICKS_AFTER_PHYSICAL_PPS = 1U;
+static constexpr int32_t VCLOCK_EPOCH_COUNTER32_OFFSET_TICKS = 0;
+static constexpr uint32_t OCXO_ONE_SECOND_TICKS =
+    (uint32_t)VCLOCK_COUNTS_PER_SECOND;
+static constexpr uint32_t OCXO_ARM_WINDOW_TICKS = 49152U;
+static constexpr uint32_t OCXO_MIN_ARM_LEAD_TICKS = 64U;
+static constexpr uint32_t COUNTER32_LINEAGE_LOCK_STREAK = 8U;
+static constexpr uint32_t QTIMER_DWT_1S_LOCK_STREAK = 8U;
+static constexpr uint32_t QTIMER_DWT_MATCH_GATE_CYCLES = 24U;
+static constexpr uint32_t SMARTZERO_ONE_SECOND_TOLERANCE_CYCLES = 32U;
 
-static constexpr uint8_t QTIMER2_OCXO1_CH        = 0;
-static constexpr uint8_t QTIMER2_OCXO1_PCS       = 0;
+static_assert(OCXO_ONE_SECOND_TICKS == 10000000U,
+              "OCXO one-second target must be 10,000,000 ticks");
+static_assert(OCXO_MIN_ARM_LEAD_TICKS < OCXO_ARM_WINDOW_TICKS,
+              "OCXO arm lead must be inside arm window");
+static_assert(OCXO_ARM_WINDOW_TICKS < 65536U,
+              "OCXO arm window must stay inside one low-word revolution");
 
-static constexpr uint8_t QTIMER3_OCXO2_CH        = 3;
-static constexpr uint8_t QTIMER3_OCXO2_PCS       = 3;
+static constexpr bool OCXO1_DISABLED = false;
+static constexpr bool OCXO2_DISABLED = false;
 
-// Legacy generic names retained for the many helper paths that are now lane
-// local by construction.  For OCXO1 these resolve to the same channel; OCXO2
-// carries its physical channel directly in the lane descriptor.
-static constexpr uint8_t QTIMER_CLOCK_COUNTER_CH = QTIMER2_OCXO1_CH;
-static constexpr uint8_t QTIMER_CLOCK_COMPARE_CH = QTIMER2_OCXO1_CH;
-static constexpr uint8_t QTIMER_CLOCK_PCS        = QTIMER2_OCXO1_PCS;
-
-static constexpr const char* QTIMER_UNIFORM_DOCTRINE =
-    "PIN_BOUND_SAME_CHANNEL_COUNT_COMPARE_TIMEPOP_CH2_SCHEDULER_ONLY";
+static bool g_interrupt_hw_ready = false;
+static bool g_interrupt_runtime_ready = false;
+static bool g_interrupt_irqs_enabled = false;
 
 // ============================================================================
-// PPS / PPS_VCLOCK doctrine
+// CPU / ordering helpers
 // ============================================================================
-//
-// pps_t and pps_vclock_t are defined publicly in process_interrupt.h.
-// Both structs carry only event-coordinate (latency-adjusted) values; no
-// _raw is published.  They share a sequence number — they describe the
-// same physical edge from two perspectives (physical truth vs canonical
-// VCLOCK-selected edge).
-
-// ============================================================================
-// Snapshot store (seqlock)
-// ============================================================================
-
-struct snapshot_store_t {
-  volatile uint32_t seq = 0;
-
-  volatile uint32_t pps_sequence              = 0;
-  volatile uint32_t pps_dwt_at_edge           = 0;
-  volatile uint32_t pps_counter32_at_edge     = 0;
-  volatile uint16_t pps_ch3_at_edge           = 0;
-
-  volatile uint32_t pvc_sequence              = 0;
-  volatile uint32_t pvc_dwt_at_edge           = 0;
-  volatile uint32_t pvc_counter32_at_edge     = 0;
-  volatile uint16_t pvc_ch3_at_edge           = 0;
-};
-
-static snapshot_store_t g_store = {};
 
 static inline void dmb_barrier(void) {
   __asm__ volatile ("dmb" ::: "memory");
 }
 
-// Priority-0-preserving exclusion guard.
-//
-// ZPNet timing doctrine forbids foreground/handoff code from globally masking
-// the sacred capture tier.  PRIMASK/global IRQ masking blocks PPS/VCLOCK/OCXO
-// priority-0 capture and can turn a harmless bookkeeping critical section into
-// a poisoned timing witness.  Use BASEPRI instead: mask only priority 16 and
-// lower-priority work while leaving priority 0 able to preempt.
-static constexpr uint32_t INTERRUPT_PRIORITY0_PRESERVING_BASEPRI = 16U;
+static inline void interrupt_handoff_barrier(void) {
+  __asm__ volatile ("dsb" ::: "memory");
+  __asm__ volatile ("isb" ::: "memory");
+}
+
+static inline uint32_t interrupt_ipsr(void) {
+  uint32_t value = 0;
+  __asm__ volatile ("mrs %0, ipsr" : "=r" (value) :: "memory");
+  return value;
+}
+
 
 static inline uint32_t interrupt_priority0_guard_enter(void) {
   uint32_t prior_basepri = 0;
@@ -1165,1710 +163,315 @@ static inline void interrupt_priority0_guard_exit(uint32_t prior_basepri) {
   __asm__ volatile ("msr basepri, %0" :: "r" (prior_basepri) : "memory");
 }
 
+static bool interrupt_callback_address_executable(uintptr_t bits) {
+  if (bits == 0U) return false;
+  const uintptr_t address = bits & ~uintptr_t(1U);
+  return address < 0x00100000UL ||
+         (address >= 0x60000000UL && address < 0x61000000UL);
+}
+
+static char interrupt_ascii_fold(char c) {
+  return (c >= 'a' && c <= 'z') ? (char)(c - ('a' - 'A')) : c;
+}
+
+static bool interrupt_cstr_equal_ci(const char* a, const char* b) {
+  if (!a || !b) return false;
+  while (*a && *b) {
+    if (interrupt_ascii_fold(*a) != interrupt_ascii_fold(*b)) return false;
+    ++a;
+    ++b;
+  }
+  return *a == *b;
+}
+
+static uint32_t interrupt_abs_i32(int32_t value) {
+  return value < 0 ? (uint32_t)(-(int64_t)value) : (uint32_t)value;
+}
+
+static inline uint32_t qtimer_event_dwt_from_isr_entry_raw(
+    uint32_t isr_entry_dwt_raw) {
+  return isr_entry_dwt_raw -
+      (QTIMER_TOTAL_LATENCY - STIMULUS_LAUNCH_LATENCY_CYCLES);
+}
+
+static inline uint32_t pps_dwt_from_isr_entry_raw(
+    uint32_t isr_entry_dwt_raw) {
+  return isr_entry_dwt_raw -
+      (GPIO_TOTAL_LATENCY - STIMULUS_LAUNCH_LATENCY_CYCLES);
+}
+
+// ============================================================================
+// Snapshot stores
+// ============================================================================
+
+struct snapshot_store_t {
+  volatile uint32_t seq = 0;
+  volatile uint32_t pps_sequence = 0;
+  volatile uint32_t pps_dwt_at_edge = 0;
+  volatile uint32_t pps_counter32_at_edge = 0;
+  volatile uint16_t pps_ch3_at_edge = 0;
+  volatile uint32_t pvc_sequence = 0;
+  volatile uint32_t pvc_dwt_at_edge = 0;
+  volatile uint32_t pvc_counter32_at_edge = 0;
+  volatile uint16_t pvc_ch3_at_edge = 0;
+};
+
+static snapshot_store_t g_store{};
+
 static void store_publish(const pps_t& pps, const pps_vclock_t& pvc) {
   g_store.seq++;
   dmb_barrier();
-  g_store.pps_sequence          = pps.sequence;
-  g_store.pps_dwt_at_edge       = pps.dwt_at_edge;
+  g_store.pps_sequence = pps.sequence;
+  g_store.pps_dwt_at_edge = pps.dwt_at_edge;
   g_store.pps_counter32_at_edge = pps.counter32_at_edge;
-  g_store.pps_ch3_at_edge       = pps.ch3_at_edge;
-  g_store.pvc_sequence          = pvc.sequence;
-  g_store.pvc_dwt_at_edge       = pvc.dwt_at_edge;
+  g_store.pps_ch3_at_edge = pps.ch3_at_edge;
+  g_store.pvc_sequence = pvc.sequence;
+  g_store.pvc_dwt_at_edge = pvc.dwt_at_edge;
   g_store.pvc_counter32_at_edge = pvc.counter32_at_edge;
-  g_store.pvc_ch3_at_edge       = pvc.ch3_at_edge;
+  g_store.pvc_ch3_at_edge = pvc.ch3_at_edge;
   dmb_barrier();
   g_store.seq++;
 }
 
 static bool store_load(pps_t& pps, pps_vclock_t& pvc) {
-  for (int attempt = 0; attempt < 4; attempt++) {
-    const uint32_t s1 = g_store.seq;
+  for (uint32_t attempt = 0; attempt < 4U; ++attempt) {
+    const uint32_t seq1 = g_store.seq;
+    if (seq1 & 1U) continue;
     dmb_barrier();
-    pps.sequence          = g_store.pps_sequence;
-    pps.dwt_at_edge       = g_store.pps_dwt_at_edge;
+    pps.sequence = g_store.pps_sequence;
+    pps.dwt_at_edge = g_store.pps_dwt_at_edge;
     pps.counter32_at_edge = g_store.pps_counter32_at_edge;
-    pps.ch3_at_edge       = g_store.pps_ch3_at_edge;
-    pvc.sequence          = g_store.pvc_sequence;
-    pvc.dwt_at_edge       = g_store.pvc_dwt_at_edge;
+    pps.ch3_at_edge = g_store.pps_ch3_at_edge;
+    pvc.sequence = g_store.pvc_sequence;
+    pvc.dwt_at_edge = g_store.pvc_dwt_at_edge;
     pvc.counter32_at_edge = g_store.pvc_counter32_at_edge;
-    pvc.ch3_at_edge       = g_store.pvc_ch3_at_edge;
-    pvc.gnss_ns_at_edge   = -1;  // GNSS labels are CLOCKS-owned.
+    pvc.ch3_at_edge = g_store.pvc_ch3_at_edge;
+    pvc.gnss_ns_at_edge = -1;
     dmb_barrier();
-    const uint32_t s2 = g_store.seq;
-    if (s1 == s2 && (s1 & 1u) == 0u) return true;
+    const uint32_t seq2 = g_store.seq;
+    if (seq1 == seq2 && (seq2 & 1U) == 0U) return true;
   }
+  pps = pps_t{};
+  pvc = pps_vclock_t{};
   return false;
 }
 
 static pps_vclock_t store_load_pvc(void) {
-  pps_t pps;
-  pps_vclock_t pvc;
-  store_load(pps, pvc);
+  pps_t pps{};
+  pps_vclock_t pvc{};
+  (void)store_load(pps, pvc);
   return pvc;
 }
 
-// ============================================================================
-// PPS yardstick store (seqlock) -- physical PPS-to-PPS DWT interval pair
-// ============================================================================
-//
-// The PPS handoff first authors the raw GPIO-to-GPIO interval so always-on
-// custody remains continuous before CLOCKS START. The same-second VCLOCK
-// FloorLine arbitration may replace G_now whenever the raw physical PPS edge
-// differs from the projected edge beyond the magnitude threshold. G_prev
-// remains the prior accepted interval. Readers use the seqlock; writer
-// operations are serialized with
-// the priority-0-preserving guard so timing capture itself is never masked.
-
-struct pps_yardstick_store_t {
-  volatile uint32_t seq = 0;
-  volatile bool     valid = false;             // both intervals present
-  volatile uint32_t sequence = 0;              // PPS edge count closing G_now
-  volatile uint32_t interval_now_cycles = 0;   // G_now
-  volatile uint32_t interval_prev_cycles = 0;  // G_prev
-  volatile uint32_t accept_count = 0;
-  volatile uint32_t reject_count = 0;
-  volatile uint32_t repair_count = 0;
-  volatile uint32_t reset_count = 0;
-};
-
-static pps_yardstick_store_t g_pps_yardstick = {};
-static bool     g_pps_yardstick_prev_valid = false;
-static uint32_t g_pps_yardstick_prev_sequence = 0;
-static uint32_t g_pps_yardstick_prev_counter32 = 0;
-// Previous PPS endpoint admitted to the yardstick. This is ordinarily the
-// latency-adjusted GPIO observation, but it becomes the VCLOCK FloorLine-
-// projected physical PPS coordinate when magnitude arbitration selects it.
-static uint32_t g_pps_yardstick_prev_dwt = 0;
-
-struct pps_yardstick_snapshot_t {
-  bool     valid = false;
-  uint32_t sequence = 0;
-  uint32_t interval_now_cycles = 0;
-  uint32_t interval_prev_cycles = 0;
-  uint32_t accept_count = 0;
-  uint32_t reject_count = 0;
-  uint32_t repair_count = 0;
-  uint32_t reset_count = 0;
-};
-
-// Caller holds the priority-0-preserving writer guard.
-static void pps_yardstick_record_interval_locked(uint32_t pps_sequence,
-                                                 uint32_t interval_cycles,
-                                                 uint32_t counter_delta_ticks) {
-  const uint32_t nominal = (uint32_t)VCLOCK_COUNTS_PER_SECOND;
-  const uint32_t tick_error = (counter_delta_ticks >= nominal)
-      ? counter_delta_ticks - nominal
-      : nominal - counter_delta_ticks;
-
-  g_pps_yardstick.seq++;
-  dmb_barrier();
-  if (tick_error <= PPS_YARDSTICK_COUNTER_TOLERANCE_TICKS &&
-      interval_cycles != 0) {
-    g_pps_yardstick.interval_prev_cycles = g_pps_yardstick.interval_now_cycles;
-    g_pps_yardstick.interval_now_cycles = interval_cycles;
-    g_pps_yardstick.valid = (g_pps_yardstick.interval_prev_cycles != 0);
-    g_pps_yardstick.sequence = pps_sequence;
-    g_pps_yardstick.accept_count++;
-  } else {
-    g_pps_yardstick.interval_prev_cycles = 0;
-    g_pps_yardstick.interval_now_cycles = 0;
-    g_pps_yardstick.valid = false;
-    g_pps_yardstick.sequence = pps_sequence;
-    g_pps_yardstick.reject_count++;
-  }
-  dmb_barrier();
-  g_pps_yardstick.seq++;
-}
-
-static void pps_yardstick_record_raw_edge(const pps_t& pps,
-                                           uint32_t observed_counter32) {
-  const uint32_t prior_basepri = interrupt_priority0_guard_enter();
-  if (g_pps_yardstick_prev_valid) {
-    const uint32_t observed_counter_delta =
-        observed_counter32 - g_pps_yardstick_prev_counter32;
-    const uint32_t observed_dwt_delta =
-        pps.dwt_at_edge - g_pps_yardstick_prev_dwt;
-    pps_yardstick_record_interval_locked(pps.sequence,
-                                         observed_dwt_delta,
-                                         observed_counter_delta);
-  }
-  g_pps_yardstick_prev_valid = true;
-  g_pps_yardstick_prev_sequence = pps.sequence;
-  g_pps_yardstick_prev_counter32 = observed_counter32;
-  g_pps_yardstick_prev_dwt = pps.dwt_at_edge;
-  interrupt_priority0_guard_exit(prior_basepri);
-}
-
-// Replace only the newest interval, preserving interval_prev as the prior
-// accepted interval. The GPIO handoff authors the raw interval first so
-// pre-campaign custody remains continuous; same-second FloorLine arbitration
-// may then replace that endpoint before any OCXO publication consumes it.
-static bool pps_yardstick_replace_latest_interval(uint32_t pps_sequence,
-                                                   uint32_t interval_cycles,
-                                                   uint32_t endpoint_dwt) {
-  if (pps_sequence == 0U || interval_cycles == 0U || endpoint_dwt == 0U) {
-    return false;
-  }
-
-  const uint32_t prior_basepri = interrupt_priority0_guard_enter();
-  g_pps_yardstick.seq++;
-  dmb_barrier();
-  const bool replace =
-      g_pps_yardstick.sequence == pps_sequence &&
-      g_pps_yardstick_prev_sequence == pps_sequence &&
-      g_pps_yardstick.interval_now_cycles != 0U;
-  if (replace) {
-    g_pps_yardstick.interval_now_cycles = interval_cycles;
-    g_pps_yardstick.valid =
-        g_pps_yardstick.interval_prev_cycles != 0U;
-    g_pps_yardstick.repair_count++;
-    g_pps_yardstick_prev_dwt = endpoint_dwt;
-  }
-  dmb_barrier();
-  g_pps_yardstick.seq++;
-  interrupt_priority0_guard_exit(prior_basepri);
-  return replace;
-}
-
-static bool pps_yardstick_load(pps_yardstick_snapshot_t& out) {
-  for (int attempt = 0; attempt < 4; attempt++) {
-    const uint32_t s1 = g_pps_yardstick.seq;
-    dmb_barrier();
-    out.valid = g_pps_yardstick.valid;
-    out.sequence = g_pps_yardstick.sequence;
-    out.interval_now_cycles = g_pps_yardstick.interval_now_cycles;
-    out.interval_prev_cycles = g_pps_yardstick.interval_prev_cycles;
-    out.accept_count = g_pps_yardstick.accept_count;
-    out.reject_count = g_pps_yardstick.reject_count;
-    out.repair_count = g_pps_yardstick.repair_count;
-    out.reset_count = g_pps_yardstick.reset_count;
-    dmb_barrier();
-    const uint32_t s2 = g_pps_yardstick.seq;
-    if (s1 == s2 && (s1 & 1u) == 0u) return true;
-  }
-  out = pps_yardstick_snapshot_t{};
-  return false;
-}
-
-static void pps_yardstick_reset(void) {
-  const uint32_t prior_basepri = interrupt_priority0_guard_enter();
-  g_pps_yardstick.seq++;
-  dmb_barrier();
-  g_pps_yardstick.valid = false;
-  g_pps_yardstick.interval_now_cycles = 0;
-  g_pps_yardstick.interval_prev_cycles = 0;
-  g_pps_yardstick.reset_count++;
-  dmb_barrier();
-  g_pps_yardstick.seq++;
-  interrupt_priority0_guard_exit(prior_basepri);
-}
-
-// ============================================================================
-// Epoch-ready PPS capture packet (seqlock)
-// ============================================================================
-//
-// This packet is authored on every PPS GPIO ISR from the ISR's opening custody
-// window.  The 16-bit hardware reads are retained only as forensic evidence;
-// runtime consumers use the translated process_interrupt-owned synthetic
-// 32-bit lane coordinates.  ZERO consumers select this already-authored packet
-// later.
-
-// SmartZero Gen-2 system-level worthiness evidence.  all_lanes_worthy is
-// authored in deferred dispatch context (lane fact drain) and read by the
-// PPS ISR when stamping epoch capture qualification counters; it is a single
-// volatile bool, so the cross-context read is coherent.
-struct smartzero2_system_t {
-  volatile bool all_lanes_worthy = false;
-  uint32_t all_worthy_second_count = 0;
-  uint32_t all_worthy_streak_seconds = 0;
-  uint32_t first_all_worthy_pps_sequence = 0;
-  uint32_t last_pps_sequence_checked = 0;
-  uint32_t epoch_captures_qualified = 0;
-  uint32_t epoch_captures_unqualified = 0;
-};
-static smartzero2_system_t g_smartzero2 = {};
-
 struct epoch_capture_store_t {
   volatile uint32_t seq = 0;
-
-  volatile bool     valid = false;
-  volatile uint32_t sequence = 0;
-  volatile uint32_t capture_dwt_start_raw = 0;
-  volatile uint32_t capture_dwt_after_vclock_raw = 0;
-  volatile uint32_t capture_dwt_end_raw = 0;
-  volatile uint32_t capture_window_cycles = 0;
-  volatile uint32_t vclock_read_offset_cycles = 0;
-
-  // Latency-adjusted DWT coordinate of the selected PPS_VCLOCK edge,
-  // derived directly from the same first-instruction PPS ISR raw capture
-  // that authored this epoch-ready packet.  CLOCKS ZERO consumes this field
-  // instead of requiring the most recent published PPS_VCLOCK snapshot to
-  // have caught up to this GPIO edge.
-  volatile uint32_t vclock_dwt_at_edge = 0;
-
-  volatile bool     vclock_capture_valid = false;
-  volatile bool     ocxo1_capture_valid = false;
-  volatile bool     ocxo2_capture_valid = false;
-  volatile bool     all_lanes_capture_valid = false;
-
-  volatile uint16_t vclock_hardware16_observed = 0;
-  volatile uint16_t vclock_hardware16_selected = 0;
-  volatile uint16_t ocxo1_hardware16 = 0;
-  volatile uint16_t ocxo2_hardware16 = 0;
-
-  volatile uint32_t vclock_counter32 = 0;
-  volatile uint32_t ocxo1_counter32 = 0;
-  volatile uint32_t ocxo2_counter32 = 0;
+  interrupt_epoch_capture_t value{};
 };
 
-static epoch_capture_store_t g_epoch_capture_store = {};
+static epoch_capture_store_t g_epoch_capture{};
 
-static void epoch_capture_publish(const interrupt_epoch_capture_t& cap) {
-  g_epoch_capture_store.seq++;
-  // Gen-2 evidence: would this capture packet have been selection-eligible?
-  if (g_smartzero2.all_lanes_worthy) {
-    g_smartzero2.epoch_captures_qualified++;
-  } else {
-    g_smartzero2.epoch_captures_unqualified++;
-  }
+static void epoch_capture_publish(const interrupt_epoch_capture_t& value) {
+  g_epoch_capture.seq++;
   dmb_barrier();
-
-  g_epoch_capture_store.valid = cap.valid;
-  g_epoch_capture_store.sequence = cap.sequence;
-  g_epoch_capture_store.capture_dwt_start_raw = cap.capture_dwt_start_raw;
-  g_epoch_capture_store.capture_dwt_after_vclock_raw = cap.capture_dwt_after_vclock_raw;
-  g_epoch_capture_store.capture_dwt_end_raw = cap.capture_dwt_end_raw;
-  g_epoch_capture_store.capture_window_cycles = cap.capture_window_cycles;
-  g_epoch_capture_store.vclock_read_offset_cycles = cap.vclock_read_offset_cycles;
-  g_epoch_capture_store.vclock_dwt_at_edge = cap.vclock_dwt_at_edge;
-  g_epoch_capture_store.vclock_capture_valid = cap.vclock_capture_valid;
-  g_epoch_capture_store.ocxo1_capture_valid = cap.ocxo1_capture_valid;
-  g_epoch_capture_store.ocxo2_capture_valid = cap.ocxo2_capture_valid;
-  g_epoch_capture_store.all_lanes_capture_valid = cap.all_lanes_capture_valid;
-  g_epoch_capture_store.vclock_hardware16_observed = cap.vclock_hardware16_observed;
-  g_epoch_capture_store.vclock_hardware16_selected = cap.vclock_hardware16_selected;
-  g_epoch_capture_store.ocxo1_hardware16 = cap.ocxo1_hardware16;
-  g_epoch_capture_store.ocxo2_hardware16 = cap.ocxo2_hardware16;
-  g_epoch_capture_store.vclock_counter32 = cap.vclock_counter32;
-  g_epoch_capture_store.ocxo1_counter32 = cap.ocxo1_counter32;
-  g_epoch_capture_store.ocxo2_counter32 = cap.ocxo2_counter32;
-
+  g_epoch_capture.value = value;
   dmb_barrier();
-  g_epoch_capture_store.seq++;
+  g_epoch_capture.seq++;
 }
 
 bool interrupt_last_epoch_capture(interrupt_epoch_capture_t* out) {
   if (!out) return false;
-
-  for (int attempt = 0; attempt < 4; attempt++) {
-    const uint32_t s1 = g_epoch_capture_store.seq;
+  for (uint32_t attempt = 0; attempt < 4U; ++attempt) {
+    const uint32_t seq1 = g_epoch_capture.seq;
+    if (seq1 & 1U) continue;
     dmb_barrier();
-
-    out->valid = g_epoch_capture_store.valid;
-    out->sequence = g_epoch_capture_store.sequence;
-    out->capture_dwt_start_raw = g_epoch_capture_store.capture_dwt_start_raw;
-    out->capture_dwt_after_vclock_raw = g_epoch_capture_store.capture_dwt_after_vclock_raw;
-    out->capture_dwt_end_raw = g_epoch_capture_store.capture_dwt_end_raw;
-    out->capture_window_cycles = g_epoch_capture_store.capture_window_cycles;
-    out->vclock_read_offset_cycles = g_epoch_capture_store.vclock_read_offset_cycles;
-    out->vclock_dwt_at_edge = g_epoch_capture_store.vclock_dwt_at_edge;
-    out->vclock_capture_valid = g_epoch_capture_store.vclock_capture_valid;
-    out->ocxo1_capture_valid = g_epoch_capture_store.ocxo1_capture_valid;
-    out->ocxo2_capture_valid = g_epoch_capture_store.ocxo2_capture_valid;
-    out->all_lanes_capture_valid = g_epoch_capture_store.all_lanes_capture_valid;
-    out->vclock_hardware16_observed = g_epoch_capture_store.vclock_hardware16_observed;
-    out->vclock_hardware16_selected = g_epoch_capture_store.vclock_hardware16_selected;
-    out->ocxo1_hardware16 = g_epoch_capture_store.ocxo1_hardware16;
-    out->ocxo2_hardware16 = g_epoch_capture_store.ocxo2_hardware16;
-    out->vclock_counter32 = g_epoch_capture_store.vclock_counter32;
-    out->ocxo1_counter32 = g_epoch_capture_store.ocxo1_counter32;
-    out->ocxo2_counter32 = g_epoch_capture_store.ocxo2_counter32;
-
+    *out = g_epoch_capture.value;
     dmb_barrier();
-    const uint32_t s2 = g_epoch_capture_store.seq;
-    if (s1 == s2 && (s1 & 1u) == 0u) return out->valid;
+    const uint32_t seq2 = g_epoch_capture.seq;
+    if (seq1 == seq2 && (seq2 & 1U) == 0U) return out->valid;
   }
-
+  *out = interrupt_epoch_capture_t{};
   return false;
 }
 
+// ============================================================================
+// Physical PPS / selected VCLOCK state
+// ============================================================================
+
+struct pps_gpio_heartbeat_t {
+  uint32_t edge_count = 0;
+  uint32_t last_dwt = 0;
+  int64_t last_gnss_ns = -1;
+};
+
+static pps_gpio_heartbeat_t g_pps_gpio_heartbeat{};
+static uint32_t g_gpio_irq_count = 0;
+static uint32_t g_gpio_miss_count = 0;
+static pps_t g_last_pps_witness{};
+static bool g_last_pps_witness_valid = false;
+static volatile bool g_pps_rebootstrap_pending = false;
+static uint32_t g_pps_rebootstrap_count = 0;
+static pps_vclock_edge_authority_t g_pps_vclock_edge_authority{};
 static pps_edge_dispatch_fn g_pps_edge_dispatch = nullptr;
-static void pps_edge_dispatch_trampoline(timepop_ctx_t*, timepop_diag_t*, void*);
-static bool interrupt_callback_address_executable(uintptr_t bits);
+static volatile interrupt_pps_entry_latency_handler_fn
+    g_pps_entry_latency_handler = nullptr;
 
-// ============================================================================
-// DWT cycles-per-second compatibility
-// ============================================================================
-//
-// process_interrupt no longer asks process_time for dynamic CPS.  The legacy
-// interrupt_dynamic_cps() now mirrors CLOCKS static PPS/GPIO-derived
-// DWT cycles-per-GNSS-second.  Gamma/dynamic prediction has been retired.
+// CLOCKS may continue labeling observed anchors.  process_interrupt no longer
+// projects lower-priority events into GNSS; it retains only the latest label as
+// report evidence and a cycles-per-second fallback.
+struct observed_anchor_t {
+  uint32_t sequence = 0;
+  uint32_t counter32 = 0;
+  uint64_t gnss_ns = 0;
+  uint32_t cps = 0;
+  bool valid = false;
+  uint32_t update_count = 0;
+};
+static observed_anchor_t g_observed_anchor{};
 
-static uint32_t interrupt_vclock_cycles_per_second(void);
+void interrupt_pps_vclock_label_anchor(uint32_t sequence,
+                                       uint32_t counter32_at_edge,
+                                       uint64_t gnss_ns_at_edge,
+                                       uint32_t dwt_cycles_per_second) {
+  if (sequence == 0U || dwt_cycles_per_second == 0U) return;
+  const uint32_t prior = interrupt_priority0_guard_enter();
+  g_observed_anchor.sequence = sequence;
+  g_observed_anchor.counter32 = counter32_at_edge;
+  g_observed_anchor.gnss_ns = gnss_ns_at_edge;
+  g_observed_anchor.cps = dwt_cycles_per_second;
+  g_observed_anchor.valid = true;
+  g_observed_anchor.update_count++;
+  interrupt_priority0_guard_exit(prior);
+}
+
+static uint32_t interrupt_vclock_cycles_per_second(void) {
+  const uint32_t calibrated = clocks_dwt_cycles_per_gnss_second();
+  if (calibrated != 0U) return calibrated;
+  if (g_observed_anchor.valid && g_observed_anchor.cps != 0U) {
+    return g_observed_anchor.cps;
+  }
+  return (uint32_t)DWT_EXPECTED_PER_PPS;
+}
 
 uint32_t interrupt_dynamic_cps(void) {
   return interrupt_vclock_cycles_per_second();
 }
 
 // ============================================================================
-// PPS_VCLOCK anchor history (for DWT→GNSS projection)
+// Synthetic 32-bit clock identities
 // ============================================================================
-//
-// The latest PPS_VCLOCK anchor is not always the correct anchor for a lower-
-// priority OCXO/TimePop event.  If an event occurs just before a PPS boundary
-// but is serviced after the priority-0 PPS ISR publishes the next anchor,
-// projecting against the latest anchor turns "slightly before" into a huge
-// unsigned DWT delta.  The ring preserves recent immutable anchors so the
-// projector can choose the newest anchor that makes the event physically
-// plausible.
 
-struct pvc_anchor_record_t {
-  uint32_t sequence = 0;
-  uint32_t dwt_at_edge = 0;
-  uint32_t counter32_at_edge = 0;
-  int64_t  gnss_ns_at_edge = -1;
-  uint32_t cps = 0;
-  bool     cps_valid = false;
+struct synthetic_clock32_t {
+  bool zeroed = false;
+  uint64_t zero_ns = 0;
+  uint32_t zero_counter32 = 0;
+  uint32_t current_counter32 = 0;
+  uint64_t current_ns = 0;
+  uint16_t hardware16 = 0;
+  uint32_t zero_count = 0;
+  uint32_t minder_update_count = 0;
+  bool pending_zero = false;
+  uint64_t pending_zero_ns = 0;
+  uint32_t pending_zero_counter32 = 0;
+  uint32_t pending_zero_count = 0;
 };
 
-struct bridge_projection_t {
-  int64_t  gnss_ns = -1;
-  uint32_t anchor_sequence_used = 0;
-  uint32_t anchor_age_slots = 0;
-  uint32_t anchor_selection_kind = ANCHOR_SELECT_FAILED;
-  uint32_t anchor_dwt_at_edge = 0;
-  int64_t  anchor_gnss_ns_at_edge = -1;
-  uint32_t anchor_cps = 0;
-  uint64_t anchor_ns_delta = 0;
-  uint32_t anchor_failure_mask = 0;
+struct vclock_synthetic_clock32_t : synthetic_clock32_t {
+  uint16_t hardware_low16_at_zero = 0;
+  uint16_t hardware_low16_at_current = 0;
+  bool hardware_anchor_valid = false;
+  uint32_t hardware_anchor_update_count = 0;
 };
 
-struct bridge_anchor_stats_t {
-  uint32_t latest_count = 0;
-  uint32_t previous_count = 0;
-  uint32_t older_count = 0;
-  uint32_t failed_count = 0;
-  uint32_t last_selection_kind = ANCHOR_SELECT_NONE;
-  uint32_t last_anchor_age_slots = 0;
-  uint32_t last_anchor_sequence_used = 0;
-  uint64_t last_anchor_ns_delta = 0;
-  uint32_t last_anchor_failure_mask = 0;
-};
+static vclock_synthetic_clock32_t g_vclock_clock32{};
+static synthetic_clock32_t g_ocxo1_clock32{};
+static synthetic_clock32_t g_ocxo2_clock32{};
 
-static volatile uint32_t g_pvc_anchor_seq = 0;
-static volatile uint32_t g_pvc_anchor_head = 0;
-static volatile uint32_t g_pvc_anchor_count = 0;
-static volatile bool     g_pvc_anchor_reset_pending = false;
-static pvc_anchor_record_t g_pvc_anchor_ring[PVC_ANCHOR_RING_SIZE] = {};
-
-// Report-only accounting for CLOCKS/Alpha GNSS-label annotations.
-// The label API does not create anchors or change event custody; these counters
-// only make successful/missed annotations visible in INTERRUPT.REPORT_BRIDGE.
-static uint32_t g_pvc_anchor_label_update_count = 0;
-static uint32_t g_pvc_anchor_label_miss_count = 0;
-static uint32_t g_pvc_anchor_label_invalid_count = 0;
-static uint32_t g_pvc_anchor_label_last_sequence = 0;
-static uint32_t g_pvc_anchor_label_last_counter32 = 0;
-static int64_t  g_pvc_anchor_label_last_gnss_ns = -1;
-static uint32_t g_pvc_anchor_label_last_cps = 0;
-static uint32_t g_pvc_anchor_label_last_match_age_slots = 0xFFFFFFFFUL;
-static uint32_t g_pvc_anchor_label_last_match_index = 0xFFFFFFFFUL;
-static bool     g_pvc_anchor_label_last_success = false;
-
-static bridge_anchor_stats_t g_bridge_stats_timepop DMAMEM = {};
-static bridge_anchor_stats_t g_bridge_stats_ocxo1 DMAMEM = {};
-static bridge_anchor_stats_t g_bridge_stats_ocxo2 DMAMEM = {};
-
-static void pvc_anchor_ring_reset(void) {
-  g_pvc_anchor_seq++;
-  dmb_barrier();
-
-  g_pvc_anchor_head = 0;
-  g_pvc_anchor_count = 0;
-  g_pvc_anchor_reset_pending = false;
-  g_pvc_anchor_label_update_count = 0;
-  g_pvc_anchor_label_miss_count = 0;
-  g_pvc_anchor_label_invalid_count = 0;
-  g_pvc_anchor_label_last_sequence = 0;
-  g_pvc_anchor_label_last_counter32 = 0;
-  g_pvc_anchor_label_last_gnss_ns = -1;
-  g_pvc_anchor_label_last_cps = 0;
-  g_pvc_anchor_label_last_match_age_slots = 0xFFFFFFFFUL;
-  g_pvc_anchor_label_last_match_index = 0xFFFFFFFFUL;
-  g_pvc_anchor_label_last_success = false;
-  for (uint32_t i = 0; i < PVC_ANCHOR_RING_SIZE; i++) {
-    g_pvc_anchor_ring[i] = pvc_anchor_record_t{};
-  }
-
-  dmb_barrier();
-  g_pvc_anchor_seq++;
+static inline uint32_t clock32_from_ns(uint64_t ns) {
+  return (uint32_t)((ns / 100ULL) & 0xFFFFFFFFULL);
 }
 
-static void pvc_anchor_publish(const pps_vclock_t& pvc) {
-  const uint32_t next = (g_pvc_anchor_count == 0)
-      ? 0
-      : ((g_pvc_anchor_head + 1u) % PVC_ANCHOR_RING_SIZE);
-
-  g_pvc_anchor_seq++;
-  dmb_barrier();
-
-  g_pvc_anchor_ring[next].sequence = pvc.sequence;
-  g_pvc_anchor_ring[next].dwt_at_edge = pvc.dwt_at_edge;
-  g_pvc_anchor_ring[next].counter32_at_edge = pvc.counter32_at_edge;
-  g_pvc_anchor_ring[next].gnss_ns_at_edge = pvc.gnss_ns_at_edge;
-
-  // Store a reconstructive CPS with each anchor without consulting process_time.
-  // The newest anchor uses the just-measured previous PPS_VCLOCK interval as
-  // its forward projection denominator, matching the old random-walk policy.
-  uint32_t cps = 0;
-  bool cps_valid = false;
-  if (g_pvc_anchor_count > 0) {
-    const pvc_anchor_record_t& prev = g_pvc_anchor_ring[g_pvc_anchor_head];
-    if (prev.sequence != 0) {
-      cps = pvc.dwt_at_edge - prev.dwt_at_edge;
-      cps_valid = (cps != 0);
-    }
-  }
-  g_pvc_anchor_ring[next].cps = cps;
-  g_pvc_anchor_ring[next].cps_valid = cps_valid;
-
-  g_pvc_anchor_head = next;
-  if (g_pvc_anchor_count < PVC_ANCHOR_RING_SIZE) {
-    g_pvc_anchor_count++;
-  }
-
-  dmb_barrier();
-  g_pvc_anchor_seq++;
+uint32_t interrupt_clock32_from_ns(uint64_t ns) {
+  return clock32_from_ns(ns);
 }
 
-static bool pvc_anchor_snapshot(pvc_anchor_record_t* out, uint32_t& out_count) {
-  out_count = 0;
-
-  for (int attempt = 0; attempt < 4; attempt++) {
-    const uint32_t s1 = g_pvc_anchor_seq;
-    dmb_barrier();
-
-    const uint32_t count = g_pvc_anchor_count;
-    const uint32_t head = g_pvc_anchor_head;
-    const uint32_t bounded = (count > PVC_ANCHOR_RING_SIZE) ? PVC_ANCHOR_RING_SIZE : count;
-
-    for (uint32_t age = 0; age < bounded; age++) {
-      const uint32_t idx = (head + PVC_ANCHOR_RING_SIZE - age) % PVC_ANCHOR_RING_SIZE;
-      out[age].sequence = g_pvc_anchor_ring[idx].sequence;
-      out[age].dwt_at_edge = g_pvc_anchor_ring[idx].dwt_at_edge;
-      out[age].counter32_at_edge = g_pvc_anchor_ring[idx].counter32_at_edge;
-      out[age].gnss_ns_at_edge = g_pvc_anchor_ring[idx].gnss_ns_at_edge;
-      out[age].cps = g_pvc_anchor_ring[idx].cps;
-      out[age].cps_valid = g_pvc_anchor_ring[idx].cps_valid;
-    }
-
-    dmb_barrier();
-    const uint32_t s2 = g_pvc_anchor_seq;
-    if (s1 == s2 && (s1 & 1u) == 0u) {
-      out_count = bounded;
-      return true;
-    }
-  }
-
-  return false;
+static void synthetic_clock_birth(synthetic_clock32_t& clock,
+                                  uint16_t hardware16) {
+  clock.zeroed = true;
+  clock.zero_ns = (uint64_t)hardware16 * 100ULL;
+  clock.zero_counter32 = (uint32_t)hardware16;
+  clock.current_counter32 = (uint32_t)hardware16;
+  clock.current_ns = (uint64_t)hardware16 * 100ULL;
+  clock.hardware16 = hardware16;
+  clock.pending_zero = false;
 }
 
-// Label an already-authored PPS_VCLOCK anchor with CLOCKS/Alpha's campaign
-// GNSS identity and PPS/GPIO-derived static DWT cycles-per-second ruler.
-// This is deliberately a ring annotation only: process_interrupt still owns
-// anchor selection and DWT-to-GNSS projection for subscriber events, but it
-// does not invent campaign GNSS labels locally.
-void interrupt_pps_vclock_label_anchor(uint32_t sequence,
-                                       uint32_t counter32_at_edge,
-                                       uint64_t gnss_ns_at_edge,
-                                       uint32_t dwt_cycles_per_second) {
-  if (sequence == 0 || dwt_cycles_per_second == 0) {
-    g_pvc_anchor_label_invalid_count++;
-    g_pvc_anchor_label_last_sequence = sequence;
-    g_pvc_anchor_label_last_counter32 = counter32_at_edge;
-    g_pvc_anchor_label_last_gnss_ns = (int64_t)gnss_ns_at_edge;
-    g_pvc_anchor_label_last_cps = dwt_cycles_per_second;
-    g_pvc_anchor_label_last_match_age_slots = 0xFFFFFFFFUL;
-    g_pvc_anchor_label_last_match_index = 0xFFFFFFFFUL;
-    g_pvc_anchor_label_last_success = false;
+static void synthetic_clock_zero(synthetic_clock32_t& clock, uint64_t ns) {
+  clock.zeroed = true;
+  clock.zero_ns = ns;
+  clock.zero_counter32 = clock32_from_ns(ns);
+  clock.current_counter32 = clock.zero_counter32;
+  clock.current_ns = ns;
+  clock.hardware16 = (uint16_t)clock.current_counter32;
+  clock.zero_count++;
+  clock.pending_zero = false;
+}
+
+static void vclock_anchor_hardware(uint32_t counter32, uint16_t hardware16) {
+  g_vclock_clock32.current_counter32 = counter32;
+  g_vclock_clock32.current_ns = (uint64_t)counter32 * 100ULL;
+  g_vclock_clock32.hardware16 = hardware16;
+  g_vclock_clock32.hardware_low16_at_current = hardware16;
+  g_vclock_clock32.hardware_anchor_valid = true;
+  g_vclock_clock32.hardware_anchor_update_count++;
+}
+
+static uint32_t vclock_synthetic_from_hardware_low16(uint16_t hardware16) {
+  if (!g_vclock_clock32.zeroed) return (uint32_t)hardware16;
+  if (g_vclock_clock32.hardware_anchor_valid) {
+    return g_vclock_clock32.current_counter32 +
+        (uint32_t)((uint16_t)(hardware16 -
+                             g_vclock_clock32.hardware_low16_at_current));
+  }
+  return g_vclock_clock32.zero_counter32 +
+      (uint32_t)((uint16_t)(hardware16 -
+                           g_vclock_clock32.hardware_low16_at_zero));
+}
+
+static uint16_t vclock_hardware_low16_from_synthetic(uint32_t counter32) {
+  if (!g_vclock_clock32.zeroed) return (uint16_t)counter32;
+  return (uint16_t)(g_vclock_clock32.hardware_low16_at_zero +
+                    (uint16_t)(counter32 -
+                               g_vclock_clock32.zero_counter32));
+}
+
+static void vclock_tend_from_hardware(uint16_t hardware16) {
+  if (!g_vclock_clock32.zeroed) {
+    synthetic_clock_birth(g_vclock_clock32, hardware16);
+    g_vclock_clock32.hardware_low16_at_zero = hardware16;
+    vclock_anchor_hardware((uint32_t)hardware16, hardware16);
     return;
   }
-
-  const uint32_t prior_basepri = interrupt_priority0_guard_enter();
-
-  uint32_t match = PVC_ANCHOR_RING_SIZE;
-  uint32_t match_age = 0xFFFFFFFFUL;
-  const uint32_t count = g_pvc_anchor_count;
-  const uint32_t bounded =
-      (count > PVC_ANCHOR_RING_SIZE) ? PVC_ANCHOR_RING_SIZE : count;
-  const uint32_t head = g_pvc_anchor_head;
-
-  for (uint32_t age = 0; age < bounded; age++) {
-    const uint32_t idx =
-        (head + PVC_ANCHOR_RING_SIZE - age) % PVC_ANCHOR_RING_SIZE;
-    const pvc_anchor_record_t& a = g_pvc_anchor_ring[idx];
-    if (a.sequence == sequence && a.counter32_at_edge == counter32_at_edge) {
-      match = idx;
-      match_age = age;
-      break;
-    }
-  }
-
-  g_pvc_anchor_label_last_sequence = sequence;
-  g_pvc_anchor_label_last_counter32 = counter32_at_edge;
-  g_pvc_anchor_label_last_gnss_ns = (int64_t)gnss_ns_at_edge;
-  g_pvc_anchor_label_last_cps = dwt_cycles_per_second;
-  g_pvc_anchor_label_last_match_age_slots = match_age;
-  g_pvc_anchor_label_last_match_index = match;
-
-  if (match < PVC_ANCHOR_RING_SIZE) {
-    g_pvc_anchor_seq++;
-    dmb_barrier();
-
-    g_pvc_anchor_ring[match].gnss_ns_at_edge = (int64_t)gnss_ns_at_edge;
-    g_pvc_anchor_ring[match].cps = dwt_cycles_per_second;
-    g_pvc_anchor_ring[match].cps_valid = true;
-
-    dmb_barrier();
-    g_pvc_anchor_seq++;
-
-    g_pvc_anchor_label_update_count++;
-    g_pvc_anchor_label_last_success = true;
-  } else {
-    g_pvc_anchor_label_miss_count++;
-    g_pvc_anchor_label_last_success = false;
-  }
-
-  interrupt_priority0_guard_exit(prior_basepri);
+  const uint32_t counter32 =
+      vclock_synthetic_from_hardware_low16(hardware16);
+  vclock_anchor_hardware(counter32, hardware16);
+  g_vclock_clock32.minder_update_count++;
 }
 
-static void bridge_projection_copy_to_diag(interrupt_capture_diag_t& diag,
-                                           const bridge_projection_t& proj) {
-  diag.anchor_sequence_used = proj.anchor_sequence_used;
-  diag.anchor_age_slots = proj.anchor_age_slots;
-  diag.anchor_selection_kind = proj.anchor_selection_kind;
-  diag.anchor_dwt_at_edge = proj.anchor_dwt_at_edge;
-  diag.anchor_gnss_ns_at_edge = proj.anchor_gnss_ns_at_edge;
-  diag.anchor_cps = proj.anchor_cps;
-  diag.anchor_ns_delta = proj.anchor_ns_delta;
-  diag.anchor_failure_mask = proj.anchor_failure_mask;
-}
-
-static bridge_anchor_stats_t* bridge_stats_for(interrupt_subscriber_kind_t kind) {
-  if (kind == interrupt_subscriber_kind_t::TIMEPOP) return &g_bridge_stats_timepop;
-  if (kind == interrupt_subscriber_kind_t::OCXO1) return &g_bridge_stats_ocxo1;
-  if (kind == interrupt_subscriber_kind_t::OCXO2) return &g_bridge_stats_ocxo2;
-  return nullptr;
-}
-
-static void bridge_projection_record_stats(interrupt_subscriber_kind_t kind,
-                                           const bridge_projection_t& proj) {
-  bridge_anchor_stats_t* s = bridge_stats_for(kind);
-  if (!s) return;
-
-  if (proj.anchor_selection_kind == ANCHOR_SELECT_LATEST) {
-    s->latest_count++;
-  } else if (proj.anchor_selection_kind == ANCHOR_SELECT_PREVIOUS) {
-    s->previous_count++;
-  } else if (proj.anchor_selection_kind == ANCHOR_SELECT_OLDER) {
-    s->older_count++;
-  } else if (proj.anchor_selection_kind == ANCHOR_SELECT_FAILED) {
-    s->failed_count++;
-  }
-
-  s->last_selection_kind = proj.anchor_selection_kind;
-  s->last_anchor_age_slots = proj.anchor_age_slots;
-  s->last_anchor_sequence_used = proj.anchor_sequence_used;
-  s->last_anchor_ns_delta = proj.anchor_ns_delta;
-  s->last_anchor_failure_mask = proj.anchor_failure_mask;
-}
-
-// ============================================================================
-// EDGE — PPS GPIO heartbeat
-// ============================================================================
-//
-// State owned by the EDGE command:
-//   • g_pps_gpio_heartbeat — running tally of PPS GPIO edges plus the last
-//     edge's PPS_VCLOCK DWT and gnss_ns.  Updated in the PPS GPIO ISR.
-//   • g_gpio_irq_count   — total PPS GPIO ISR entries.
-//   • g_gpio_miss_count  — incremented when a GPIO ISR ran but did not
-//     identify a PPS edge to process.
-//
-// The snapshot store (g_store, declared elsewhere in this file) holds the
-// last pps_t and pps_vclock_t.  cmd_edge reads it via store_load() and
-// publishes both views alongside the heartbeat tally.
-//
-// EDGE is a heartbeat plus a snapshot of "the last edge from two perspectives."
-
-struct pps_gpio_heartbeat_t {
-  uint32_t edge_count   = 0;
-  uint32_t last_dwt     = 0;     // pps_vclock.dwt_at_edge of most recent edge
-  int64_t  last_gnss_ns = -1;    // GNSS labels are CLOCKS-owned; unavailable here.
-};
-static pps_gpio_heartbeat_t g_pps_gpio_heartbeat = {};
-
-static uint32_t g_gpio_irq_count = 0;
-static uint32_t g_gpio_miss_count = 0;
-
-// PPS post-ISR drain.  The GPIO ISR still captures the physical PPS witness
-// facts and the small three-counter custody window immediately, because those
-// are the timing facts.  Publication of the epoch packet and diagnostic entry
-// callback are deferred to a TimePop ASAP slot so the priority-0 PPS ISR stays
-// as short as possible.
-struct pps_post_isr_mailbox_t {
-  volatile bool pending = false;
-  volatile uint32_t arm_count = 0;
-  volatile uint32_t drain_count = 0;
-  volatile uint32_t overwrite_count = 0;
-  volatile uint32_t asap_fail_count = 0;
-  volatile uint32_t last_sequence = 0;
-  volatile uint32_t last_capture_window_cycles = 0;
-  interrupt_epoch_capture_t cap{};
-  uint32_t isr_entry_dwt_raw = 0;
-};
-
-static pps_post_isr_mailbox_t g_pps_post_isr = {};
-static void pps_post_isr_asap_callback(timepop_ctx_t*, timepop_diag_t*, void*);
-
-static volatile bool     g_pps_relay_timer_active = false;
-static volatile bool     g_pps_relay_deassert_arm_pending = false;
-static volatile uint32_t g_pps_relay_deassert_countdown_ticks = 0;
-static volatile uint32_t g_pps_relay_assert_count = 0;
-static volatile uint32_t g_pps_relay_deassert_count = 0;
-static volatile uint32_t g_pps_relay_deassert_arm_count = 0;
-static volatile uint32_t g_pps_relay_deassert_arm_fail_count = 0;
-static volatile uint32_t g_pps_relay_deassert_arm_skip_count = 0;
-static volatile uint32_t g_pps_relay_last_assert_sequence = 0;
-static volatile bool     g_pps_relay_pin_initialized = false;
-
-// Intrinsic CH2 relay deassertion.  This is the first deliberately tiny
-// function moved out of VCLOCK_HEARTBEAT.  CH2 may fire for many TimePop
-// reasons, so this counts elapsed VCLOCK ticks and decrements the relay
-// countdown only for full 1 ms cells.
-static volatile bool     g_pps_relay_ch2_tick_valid = false;
-static volatile uint32_t g_pps_relay_ch2_last_counter32 = 0;
-static volatile uint32_t g_pps_relay_ch2_tick_count = 0;
-static volatile uint32_t g_pps_relay_ch2_catchup_count = 0;
-
-static void pps_relay_assert_from_isr(uint32_t sequence);
-static void pps_relay_ch2_tick(uint32_t vclock_counter32);
-
-// ============================================================================
-// PPS witness + VCLOCK-domain canonical epoch latch
-// ============================================================================
-//
-// PPS GPIO is a witness/selector only.  It never authors the public
-// PPS/VCLOCK DWT coordinate.  The super-canonical PPS/VCLOCK DWT coordinate is
-// now authored from the native QTimer1 CH0 VCLOCK count+compare rail.  TimePop
-// CH2 may schedule callbacks, but it does not author VCLOCK edge facts.
-//
-// During rebootstrap, the PPS ISR selects the VCLOCK counter identity of the
-// sacred edge.  The next native CH0 VCLOCK cadence event back-projects from
-// its own same-channel compare fact to author the selected edge's DWT.  After
-// bootstrap, every 1000th phase-locked CH0 cadence event authors the next
-// canonical PPS/VCLOCK bookend directly.
-
-struct vclock_epoch_latch_t {
-  bool     pending = false;
-  pps_t    pps{};
-
-  uint32_t counter32_at_edge = 0;
-  uint16_t ch3_at_edge = 0;
-  uint32_t observed_counter32 = 0;
-  uint16_t observed_ch3 = 0;
-  uint32_t observed_ticks_after_selected = 0;
-  uint32_t first_cadence_counter32 = 0;
-  uint32_t first_cadence_dwt = 0;
-  uint32_t backdate_ticks = 0;
-  uint32_t backdate_cycles = 0;
-  uint32_t sacred_dwt = 0;
-};
-
-static pps_t g_last_pps_witness = {};
-static bool  g_last_pps_witness_valid = false;
-static vclock_epoch_latch_t g_vclock_epoch_latch = {};
-
-// Intrinsic CH2 PPS/VCLOCK selected-epoch publication.
-//
-// The PPS GPIO ISR remains the selector of the sacred VCLOCK edge identity.
-// Native CH2 now consumes that pending latch after TimePop has processed a CH2
-// compare event, then back-projects from the CH2 event DWT to the selected
-// PPS_VCLOCK edge.  VCLOCK_HEARTBEAT no longer authors bootstrap/rebootstrap
-// publication; it only observes pending epoch work and steps aside.
-static constexpr bool     VCLOCK_CH2_EPOCH_NATIVE_ENABLED = true;
-static constexpr uint32_t VCLOCK_CH2_EPOCH_REJECT_NONE = 0;
-static constexpr uint32_t VCLOCK_CH2_EPOCH_REJECT_BACKDATE_ZERO = 1;
-static constexpr uint32_t VCLOCK_CH2_EPOCH_REJECT_BACKDATE_TOO_LARGE = 2;
-
-static volatile uint32_t g_vclock_ch2_epoch_native_service_count = 0;
-static volatile uint32_t g_vclock_ch2_epoch_native_publish_count = 0;
-static volatile uint32_t g_vclock_ch2_epoch_native_bad_backdate_count = 0;
-static volatile uint32_t g_vclock_ch2_epoch_native_last_reject_reason = VCLOCK_CH2_EPOCH_REJECT_NONE;
-static volatile uint32_t g_vclock_ch2_epoch_native_dispatch_arm_count = 0;
-static volatile uint32_t g_vclock_ch2_epoch_native_dispatch_arm_fail_count = 0;
-static volatile uint32_t g_vclock_ch2_epoch_native_last_selected_counter32 = 0;
-static volatile uint32_t g_vclock_ch2_epoch_native_last_service_counter32 = 0;
-static volatile uint32_t g_vclock_ch2_epoch_native_last_backdate_ticks = 0;
-static volatile uint32_t g_vclock_ch2_epoch_native_last_backdate_cycles = 0;
-static volatile uint32_t g_vclock_ch2_epoch_native_last_sacred_dwt = 0;
-static volatile uint32_t g_vclock_ch2_epoch_native_last_sequence = 0;
-static volatile uint32_t g_vclock_heartbeat_epoch_authority_retired_count = 0;
-static volatile uint32_t g_vclock_heartbeat_epoch_pending_skip_count = 0;
-
-struct dwt_repair_diag_t {
-  bool     valid = false;
-  bool     candidate = false;
-  bool     synthetic = false;
-  uint32_t original_dwt = 0;
-  uint32_t predicted_dwt = 0;
-  uint32_t used_dwt = 0;
-  uint32_t isr_entry_dwt_raw = 0;
-  uint32_t event_dwt_from_isr_entry_raw = 0;
-  int32_t  isr_entry_to_event_correction_cycles = 0;
-  int32_t  error_cycles = 0;
-  uint32_t threshold_cycles = 0;
-  const char* reason = "none";
-
-  // Final DWT-at-edge publication tribunal.  This is not a repair rail: any
-  // nonzero verdict mask is a hard custody/physics failure and must raise
-  // WATCHDOG_ANOMALY before subscriber publication.
-  uint32_t publication_verdict_mask = 0;
-  uint32_t publication_verdict_reason_id = INTERRUPT_DWT_PUBLICATION_REASON_OK;
-  uint32_t publication_watchdog_count = 0;
-  uint32_t publication_gate_cycles = 0;
-  uint32_t publication_cross_rail_gate_cycles = 0;
-  uint32_t publication_service_offset_gate_ticks = 0;
-  uint32_t publication_expected_counter_delta_ticks = 0;
-  uint32_t publication_observed_counter_delta_ticks = 0;
-  uint32_t publication_expected_interval_cycles = 0;
-  uint32_t publication_published_interval_cycles = 0;
-  uint32_t publication_observed_interval_cycles = 0;
-  uint32_t publication_floorline_interval_cycles = 0;
-  int32_t  publication_published_interval_error_cycles = 0;
-  int32_t  publication_observed_interval_error_cycles = 0;
-  int32_t  publication_floorline_interval_error_cycles = 0;
-  int32_t  publication_published_minus_observed_cycles = 0;
-  int32_t  publication_floorline_minus_observed_cycles = 0;
-  int32_t  publication_service_offset_signed_ticks = 0;
-  int64_t  publication_vclock_gnss_error_ns = 0;
-
-
-  // DWT interval evidence.  The retired predictor interval-gate producer has been
-  // removed; these fields now carry FloorLine/yardstick interval evidence.
-  bool     interval_gate_valid = false;
-  bool     interval_sample_accepted = false;
-  bool     interval_sample_rejected = false;
-  uint32_t interval_observed_cycles = 0;
-  uint32_t interval_prediction_cycles = 0;
-  uint32_t interval_effective_cycles = 0;
-  int32_t  interval_residual_cycles = 0;
-  uint32_t interval_gate_threshold_cycles = 0;
-  uint32_t interval_accept_count = 0;
-  uint32_t interval_reject_count = 0;
-  bool     interval_resync_applied = false;
-  uint32_t interval_resync_count = 0;
-  uint32_t interval_reject_streak = 0;
-
-  // OCXO event-lineage audit.  A normal OCXO one-second event must advance
-  // exactly OCXO_WITNESS_ONE_SECOND_COUNTS target ticks from the previous
-  // published OCXO event.  This survived predictor retirement as useful custody
-  // evidence.
-  bool     interval_adjacency_gate_valid = false;
-  bool     interval_adjacency_ok = false;
-  bool     interval_adjacency_rejected = false;
-  uint32_t interval_counter_delta_ticks = 0;
-  uint32_t interval_expected_counter_delta_ticks = 0;
-  uint32_t interval_adjacency_reject_count = 0;
-
-  // PPS-Yardstick inference audit.  These fields change no FloorLine
-  // publication authority.
-  bool     yardstick_valid = false;
-  bool     yardstick_stale = false;
-  bool     yardstick_seeded_this_event = false;
-  bool     yardstick_excursion = false;
-  uint32_t yardstick_pps_sequence = 0;
-  uint32_t yardstick_pps_seq_delta = 0;
-  uint32_t yardstick_g_now_cycles = 0;
-  uint32_t yardstick_g_prev_cycles = 0;
-  uint32_t yardstick_inferred_interval_cycles = 0;
-  uint32_t yardstick_observed_interval_cycles = 0;
-  int32_t  yardstick_inferred_minus_observed_cycles = 0;
-  uint32_t yardstick_inferred_endpoint_dwt = 0;
-  uint32_t yardstick_inferred_endpoint_frac_q16 = 0;
-  int32_t  yardstick_endpoint_minus_observed_cycles = 0;
-  uint32_t yardstick_gate_threshold_cycles = 0;
-  uint32_t yardstick_gate_agree_count = 0;
-  uint32_t yardstick_gate_excursion_count = 0;
-
-  // Yardstick audit.  The yardstick_auth_* fields expose the anchored ledger:
-  // endpoint, PI loop error, and whether the anchor correction fired.
-  bool     yardstick_authority = false;
-  uint32_t yardstick_auth_endpoint_dwt = 0;
-  uint32_t yardstick_auth_endpoint_frac_q16 = 0;
-  int32_t  yardstick_auth_error_cycles = 0;
-  bool     yardstick_auth_anchor_applied = false;
-};
-
-
-// ============================================================================
-// VCLOCK GNSS labels
-// ============================================================================
-//
-// process_interrupt intentionally does not own campaign GNSS labels. It owns
-// event custody: DWT coordinates, VCLOCK/OCXO counter identities, low-word
-// phases, and phase diagnostics. CLOCKS/Alpha/Beta own the campaign GNSS
-// timeline and publish pps_ns / pps_vclock_ns / vclock_ns in TIMEBASE_FRAGMENT.
-//
-// Returning -1 here is deliberate. A local VCLOCK-relative nanosecond value
-// would be worse than unavailable because it could be mistaken for CLOCKS'
-// campaign GNSS ledger.
-
-static int64_t vclock_gnss_from_counter32(uint32_t) {
-  return -1;
-}
-
-static uint32_t pvc_anchor_latest_cps(void) {
-  if (g_pvc_anchor_count == 0) return 0;
-  const pvc_anchor_record_t& a = g_pvc_anchor_ring[g_pvc_anchor_head];
-  return (a.cps_valid && a.cps != 0) ? a.cps : 0;
-}
-
-static uint32_t interrupt_vclock_cycles_per_second(void) {
-  const uint32_t calibrated = clocks_dwt_cycles_per_gnss_second();
-  if (calibrated != 0) return calibrated;
-
-  const uint32_t anchor_cps = pvc_anchor_latest_cps();
-  if (anchor_cps != 0) return anchor_cps;
-
-  return DWT_EXPECTED_PER_PPS;
-}
-
-static uint32_t vclock_cycles_for_ticks(uint32_t vclock_ticks) {
-  const uint32_t cycles = interrupt_vclock_cycles_per_second();
-
-  return (uint32_t)(((uint64_t)cycles * (uint64_t)vclock_ticks +
-                     (uint64_t)VCLOCK_COUNTS_PER_SECOND / 2ULL) /
-                    (uint64_t)VCLOCK_COUNTS_PER_SECOND);
-}
-
-static uint32_t pps_vclock_phase_cycles_from_edges(const pps_t& pps,
-                                                   const pps_vclock_t& pvc) {
-  // Scalar PPS→VCLOCK phase, by definition less than one 10 MHz tick.
-  //
-  // pvc.dwt_at_edge may be any later VCLOCK edge authored on the TimePop rail.
-  // Since all VCLOCK edges are separated by exactly one 10 MHz tick, the
-  // phase from physical PPS to the selected first-after-PPS VCLOCK edge is the
-  // DWT delta to any VCLOCK edge, modulo the DWT cycles in one 100 ns tick.
-  //
-  // Use scaled integer arithmetic rather than truncating cycles_per_tick:
-  //   phase_scaled = (delta_dwt * 10,000,000) mod dwt_cycles_per_second
-  //   phase_cycles = round(phase_scaled / 10,000,000)
-  const uint32_t cycles = interrupt_vclock_cycles_per_second();
-  const uint32_t delta_dwt = pvc.dwt_at_edge - pps.dwt_at_edge;
-  const uint64_t phase_scaled =
-      ((uint64_t)delta_dwt * (uint64_t)VCLOCK_COUNTS_PER_SECOND) %
-      (uint64_t)cycles;
-
-  return (uint32_t)((phase_scaled +
-                     (uint64_t)VCLOCK_COUNTS_PER_SECOND / 2ULL) /
-                    (uint64_t)VCLOCK_COUNTS_PER_SECOND);
-}
-
-static pps_vclock_edge_authority_t g_pps_vclock_edge_authority = {};
-static bool     g_pps_vclock_phase_lower_valid = false;
-static uint32_t g_pps_vclock_phase_lower_cycles = 0;
-static uint32_t g_pps_vclock_edge_authority_update_count = 0;
-static uint32_t g_pps_vclock_edge_authority_reject_count = 0;
-
-static bool pps_vclock_projection_inputs_valid(const pps_t& pps,
-                                               uint32_t observed_vclock_dwt) {
-  return pps.sequence != 0U && pps.dwt_at_edge != 0U && observed_vclock_dwt != 0U;
-}
-
-static bool pps_vclock_learn_phase_from_observation(
-    const pps_t& pps,
-    uint32_t observed_vclock_dwt,
-    uint32_t counter32_at_edge,
-    uint16_t ch3_at_edge,
-    uint32_t* out_observed_phase_cycles = nullptr) {
-  if (out_observed_phase_cycles) *out_observed_phase_cycles = 0U;
-  if (!pps_vclock_projection_inputs_valid(pps, observed_vclock_dwt)) {
-    return false;
-  }
-
-  pps_vclock_t observed{};
-  observed.sequence = pps.sequence;
-  observed.dwt_at_edge = observed_vclock_dwt;
-  observed.counter32_at_edge = counter32_at_edge;
-  observed.ch3_at_edge = ch3_at_edge;
-
-  const uint32_t observed_phase_cycles =
-      pps_vclock_phase_cycles_from_edges(pps, observed);
-  if (out_observed_phase_cycles) {
-    *out_observed_phase_cycles = observed_phase_cycles;
-  }
-
-  // The instantaneous observed phase contains the VCLOCK 4-cycle lattice we
-  // are trying to neutralize.  Learn a one-sided lower phase from observation,
-  // then publish PPS + learned_phase.  This keeps the rail observation-derived
-  // without simply reconstructing the quantized observed VCLOCK edge.
-  if (!g_pps_vclock_phase_lower_valid ||
-      observed_phase_cycles < g_pps_vclock_phase_lower_cycles) {
-    g_pps_vclock_phase_lower_cycles = observed_phase_cycles;
-    g_pps_vclock_phase_lower_valid = true;
-  }
-  return true;
-}
-
-static uint32_t pps_projected_vclock_dwt_from_learned_phase(
-    const pps_t& pps,
-    uint32_t observed_vclock_dwt,
-    uint32_t counter32_at_edge,
-    uint16_t ch3_at_edge,
-    bool* out_valid = nullptr,
-    uint32_t* out_phase_cycles = nullptr) {
-  if (out_valid) *out_valid = false;
-  if (out_phase_cycles) *out_phase_cycles = 0U;
-
-  uint32_t observed_phase_cycles = 0;
-  if (!pps_vclock_learn_phase_from_observation(pps,
-                                                observed_vclock_dwt,
-                                                counter32_at_edge,
-                                                ch3_at_edge,
-                                                &observed_phase_cycles)) {
-    return observed_vclock_dwt;
-  }
-
-  const uint32_t phase_cycles = g_pps_vclock_phase_lower_valid
-      ? g_pps_vclock_phase_lower_cycles
-      : observed_phase_cycles;
-  if (out_valid) *out_valid = true;
-  if (out_phase_cycles) *out_phase_cycles = phase_cycles;
-  return pps.dwt_at_edge + phase_cycles;
-}
-
-static int32_t pps_vclock_signed_delta_near(uint32_t from_dwt,
-                                            uint32_t to_dwt) {
-  const uint32_t u = (uint32_t)(to_dwt - from_dwt);
-  if (u <= 0x7FFFFFFFUL) return (int32_t)u;
-  const uint32_t magnitude = (uint32_t)((~u) + 1U);
-  if (magnitude == 0x80000000UL) return (int32_t)(-2147483647 - 1);
-  return -(int32_t)magnitude;
-}
-
-
-static void pps_vclock_edge_authority_reset(void) {
-  g_pps_vclock_edge_authority = pps_vclock_edge_authority_t{};
-  g_pps_vclock_phase_lower_valid = false;
-  g_pps_vclock_phase_lower_cycles = 0;
-  g_pps_vclock_edge_authority_update_count = 0;
-  g_pps_vclock_edge_authority_reject_count = 0;
-}
-
-static pps_vclock_edge_authority_t pps_vclock_edge_authority_build(
-    const pps_t& pps,
-    uint32_t sequence,
-    uint32_t predicted_dwt_at_edge,
-    uint32_t observed_dwt_at_edge,
-    uint32_t counter32_at_edge,
-    uint16_t ch3_at_edge) {
-  pps_vclock_edge_authority_t a{};
-  a.sequence = sequence;
-  a.update_count = ++g_pps_vclock_edge_authority_update_count;
-  a.gate_cycles = PPS_VCLOCK_EDGE_AGREEMENT_GATE_CYCLES;
-  a.pps_dwt_at_edge = pps.dwt_at_edge;
-  a.vclock_observed_dwt_at_edge = observed_dwt_at_edge;
-  a.vclock_predicted_dwt_at_edge = predicted_dwt_at_edge;
-  a.counter32_at_edge = counter32_at_edge;
-  a.ch3_at_edge = ch3_at_edge;
-  a.dwt_cycles_per_second = interrupt_vclock_cycles_per_second();
-
-  const bool pps_valid = (pps.sequence != 0 && pps.dwt_at_edge != 0);
-  const bool observed_valid = (observed_dwt_at_edge != 0);
-  const bool prediction_valid = (predicted_dwt_at_edge != 0);
-
-  if (!pps_valid) a.invalid_mask |= PPS_VCLOCK_EDGE_INVALID_NO_PPS;
-  if (!observed_valid) a.invalid_mask |= PPS_VCLOCK_EDGE_INVALID_NO_OBSERVED;
-  if (!prediction_valid) a.invalid_mask |= PPS_VCLOCK_EDGE_INVALID_NO_PREDICTION;
-
-  if (pps_valid && observed_valid) {
-    uint32_t observed_phase_cycles = 0;
-    if (pps_vclock_learn_phase_from_observation(pps,
-                                                 observed_dwt_at_edge,
-                                                 counter32_at_edge,
-                                                 ch3_at_edge,
-                                                 &observed_phase_cycles)) {
-      a.observed_phase_cycles = observed_phase_cycles;
-      a.observed_phase_valid = true;
-    }
-  }
-
-  a.learned_phase_valid = g_pps_vclock_phase_lower_valid;
-  a.learned_phase_cycles = g_pps_vclock_phase_lower_cycles;
-  if (!a.learned_phase_valid) {
-    a.invalid_mask |= PPS_VCLOCK_EDGE_INVALID_NO_PHASE;
-  }
-
-  const bool pps_candidate_valid = pps_valid && a.learned_phase_valid;
-  if (pps_candidate_valid) {
-    a.pps_projected_vclock_dwt_at_edge =
-        pps.dwt_at_edge + a.learned_phase_cycles;
-  }
-
-  const uint32_t reference_dwt = prediction_valid
-      ? predicted_dwt_at_edge
-      : (pps_candidate_valid
-            ? a.pps_projected_vclock_dwt_at_edge
-            : observed_dwt_at_edge);
-  int32_t min_delta = INT32_MAX;
-  int32_t max_delta = INT32_MIN;
-  uint32_t candidate_count = 0;
-
-  if (pps_candidate_valid) {
-    const int32_t d = pps_vclock_signed_delta_near(
-        reference_dwt, a.pps_projected_vclock_dwt_at_edge);
-    if (d < min_delta) min_delta = d;
-    if (d > max_delta) max_delta = d;
-    candidate_count++;
-  }
-  if (observed_valid) {
-    const int32_t d = pps_vclock_signed_delta_near(
-        reference_dwt, observed_dwt_at_edge);
-    if (d < min_delta) min_delta = d;
-    if (d > max_delta) max_delta = d;
-    candidate_count++;
-  }
-  if (prediction_valid) {
-    const int32_t d = pps_vclock_signed_delta_near(
-        reference_dwt, predicted_dwt_at_edge);
-    if (d < min_delta) min_delta = d;
-    if (d > max_delta) max_delta = d;
-    candidate_count++;
-  }
-
-  a.agreement_span_cycles = (candidate_count != 0)
-      ? (uint32_t)((int64_t)max_delta - (int64_t)min_delta)
-      : 0U;
-
-  const bool all_candidates_valid = pps_candidate_valid &&
-                                    observed_valid &&
-                                    prediction_valid;
-  if (!all_candidates_valid ||
-      a.agreement_span_cycles > PPS_VCLOCK_EDGE_AGREEMENT_GATE_CYCLES) {
-    a.invalid_mask |= PPS_VCLOCK_EDGE_INVALID_AGREEMENT;
-  }
-
-  if (observed_valid && prediction_valid &&
-      pps_vclock_signed_delta_near(predicted_dwt_at_edge,
-                                   observed_dwt_at_edge) <
-          -(int32_t)PPS_VCLOCK_EDGE_AGREEMENT_GATE_CYCLES) {
-    // An observed edge substantially before the predictor violates the
-    // one-sided latency law.  Record the violation even if the fallback below
-    // keeps the system alive.
-    a.invalid_mask |= PPS_VCLOCK_EDGE_INVALID_OBSERVED_EARLY;
-  }
-
-  a.valid = (a.invalid_mask == PPS_VCLOCK_EDGE_INVALID_NONE);
-
-  // Publication authority is now apples-to-apples observed edge truth:
-  // VCLOCK publishes the same latency-adjusted observed QTimer-edge species as
-  // the OCXO subscriber lanes. PPS+learned lower-phase and predictor/lower
-  // envelope candidates remain courtroom witnesses only; they do not replace
-  // the subscriber DWT coordinate.
-  if (observed_valid) {
-    a.authority_dwt_at_edge = observed_dwt_at_edge;
-    a.decision = PPS_VCLOCK_EDGE_DECISION_OBSERVED_FALLBACK;
-  } else if (prediction_valid) {
-    a.authority_dwt_at_edge = predicted_dwt_at_edge;
-    if (pps_candidate_valid &&
-        predicted_dwt_at_edge == a.pps_projected_vclock_dwt_at_edge) {
-      a.decision = PPS_VCLOCK_EDGE_DECISION_PPS_PHASE_FALLBACK;
-    } else {
-      a.decision = PPS_VCLOCK_EDGE_DECISION_PREDICTION_FALLBACK;
-    }
-  } else if (pps_candidate_valid) {
-    a.authority_dwt_at_edge = a.pps_projected_vclock_dwt_at_edge;
-    a.decision = PPS_VCLOCK_EDGE_DECISION_PPS_PHASE_FALLBACK;
-  } else {
-    a.authority_dwt_at_edge = 0U;
-    a.decision = PPS_VCLOCK_EDGE_DECISION_NONE;
-  }
-
-  if (!a.valid) {
-    g_pps_vclock_edge_authority_reject_count++;
-  }
-  a.reject_count = g_pps_vclock_edge_authority_reject_count;
-
-  a.authority_minus_pps_cycles = pps_valid
-      ? pps_vclock_signed_delta_near(pps.dwt_at_edge, a.authority_dwt_at_edge)
-      : 0;
-  a.authority_minus_vclock_observed_cycles = observed_valid
-      ? pps_vclock_signed_delta_near(observed_dwt_at_edge, a.authority_dwt_at_edge)
-      : 0;
-  a.authority_minus_prediction_cycles = prediction_valid
-      ? pps_vclock_signed_delta_near(predicted_dwt_at_edge, a.authority_dwt_at_edge)
-      : 0;
-  a.prediction_minus_pps_projected_cycles =
-      (prediction_valid && pps_candidate_valid)
-          ? pps_vclock_signed_delta_near(a.pps_projected_vclock_dwt_at_edge,
-                                         predicted_dwt_at_edge)
-          : 0;
-  a.pps_projected_minus_observed_cycles =
-      (observed_valid && pps_candidate_valid)
-          ? pps_vclock_signed_delta_near(observed_dwt_at_edge,
-                                         a.pps_projected_vclock_dwt_at_edge)
-          : 0;
-  a.observed_minus_prediction_cycles =
-      (observed_valid && prediction_valid)
-          ? pps_vclock_signed_delta_near(predicted_dwt_at_edge,
-                                         observed_dwt_at_edge)
-          : 0;
-
-  g_pps_vclock_edge_authority = a;
-  interrupt_feature_note_pps_vclock_authority(a);
-  return a;
-}
-
-static void publish_vclock_domain_pps_vclock(const pps_t& pps,
-                                             uint32_t sequence,
-                                             uint32_t dwt_at_edge,
-                                             uint32_t counter32_at_edge,
-                                             uint16_t ch3_at_edge,
-                                             uint32_t observed_dwt_at_edge = 0) {
-  const uint32_t observed_dwt = observed_dwt_at_edge ? observed_dwt_at_edge : dwt_at_edge;
-  bool phase_projection_valid = false;
-  uint32_t phase_cycles = 0;
-  const uint32_t pps_projected_dwt =
-      pps_projected_vclock_dwt_from_learned_phase(pps,
-                                                observed_dwt,
-                                                counter32_at_edge,
-                                                ch3_at_edge,
-                                                &phase_projection_valid,
-                                                &phase_cycles);
-  (void)phase_cycles;
-
-  // PPS_VCLOCK DWT publication uses the observed VCLOCK edge so the VCLOCK
-  // subscription and the OCXO subscriptions share the same DWT-at-edge species.
-  // The PPS-derived/lower-phase value remains available inside the authority
-  // transcript as pps_projected_vclock_dwt_at_edge.
-  const uint32_t publication_dwt = observed_dwt ? observed_dwt : dwt_at_edge;
-  const uint32_t prediction_witness_dwt = phase_projection_valid
-      ? pps_projected_dwt
-      : 0U;
-
-  const pps_vclock_edge_authority_t authority =
-      pps_vclock_edge_authority_build(pps,
-                                      sequence,
-                                      prediction_witness_dwt,
-                                      publication_dwt,
-                                      counter32_at_edge,
-                                      ch3_at_edge);
-
-  pps_vclock_t pvc;
-  pvc.sequence = sequence;
-  pvc.dwt_at_edge = authority.authority_dwt_at_edge;
-  pvc.counter32_at_edge = counter32_at_edge;
-  pvc.ch3_at_edge = ch3_at_edge;
-  pvc.gnss_ns_at_edge = -1;  // GNSS labels are CLOCKS-owned.
-
-  interrupt_integrity_note_vclock_gnss_ns(sequence,
-                                          pvc.dwt_at_edge,
-                                          pvc.counter32_at_edge);
-
-  g_pps_gpio_heartbeat.last_dwt = pvc.dwt_at_edge;
-  g_pps_gpio_heartbeat.last_gnss_ns = -1;
-
-  if (g_pvc_anchor_reset_pending) {
-    pvc_anchor_ring_reset();
-  }
-
-  store_publish(pps, pvc);
-  pvc_anchor_publish(pvc);
-}
-
-static bool publish_selected_epoch_from_vclock_cadence(uint32_t cadence_counter32,
-                                                       uint32_t cadence_event_dwt) {
-  if (!g_vclock_epoch_latch.pending) return false;
-
-  const uint32_t selected_counter32 = g_vclock_epoch_latch.counter32_at_edge;
-  const uint32_t backdate_ticks = cadence_counter32 - selected_counter32;
-
-  g_vclock_ch2_epoch_native_last_selected_counter32 = selected_counter32;
-  g_vclock_ch2_epoch_native_last_service_counter32 = cadence_counter32;
-  g_vclock_ch2_epoch_native_last_backdate_ticks = backdate_ticks;
-
-  if (backdate_ticks == 0) {
-    g_vclock_ch2_epoch_native_bad_backdate_count++;
-    g_vclock_ch2_epoch_native_last_reject_reason =
-        VCLOCK_CH2_EPOCH_REJECT_BACKDATE_ZERO;
-    return false;
-  }
-
-  if (backdate_ticks > VCLOCK_COUNTS_PER_SECOND) {
-    g_vclock_ch2_epoch_native_bad_backdate_count++;
-    g_vclock_ch2_epoch_native_last_reject_reason =
-        VCLOCK_CH2_EPOCH_REJECT_BACKDATE_TOO_LARGE;
-    return false;
-  }
-
-  const uint32_t backdate_cycles = vclock_cycles_for_ticks(backdate_ticks);
-  const uint32_t anchor_dwt = cadence_event_dwt - backdate_cycles;
-
-  g_vclock_epoch_latch.first_cadence_counter32 = cadence_counter32;
-  g_vclock_epoch_latch.first_cadence_dwt = cadence_event_dwt;
-  g_vclock_epoch_latch.backdate_ticks = backdate_ticks;
-  g_vclock_epoch_latch.backdate_cycles = backdate_cycles;
-  g_vclock_epoch_latch.sacred_dwt = anchor_dwt;
-
-  g_vclock_ch2_epoch_native_last_backdate_cycles = backdate_cycles;
-  g_vclock_ch2_epoch_native_last_sacred_dwt = anchor_dwt;
-  g_vclock_ch2_epoch_native_last_sequence = g_vclock_epoch_latch.pps.sequence;
-
-  publish_vclock_domain_pps_vclock(g_vclock_epoch_latch.pps,
-                                    g_vclock_epoch_latch.pps.sequence,
-                                    anchor_dwt,
-                                    selected_counter32,
-                                    g_vclock_epoch_latch.ch3_at_edge);
-
-  g_vclock_epoch_latch.pending = false;
-  g_vclock_ch2_epoch_native_last_reject_reason = VCLOCK_CH2_EPOCH_REJECT_NONE;
-  g_vclock_ch2_epoch_native_publish_count++;
-
-  const pps_edge_dispatch_fn pps_dispatch = g_pps_edge_dispatch;
-  if (interrupt_callback_address_executable((uintptr_t)pps_dispatch)) {
-    const timepop_handle_t h =
-        timepop_arm_asap(pps_edge_dispatch_trampoline,
-                         nullptr,
-                         "PPS_VCLOCK_EPOCH_DISPATCH");
-    if (h == TIMEPOP_INVALID_HANDLE) {
-      g_vclock_ch2_epoch_native_dispatch_arm_fail_count++;
-    } else {
-      g_vclock_ch2_epoch_native_dispatch_arm_count++;
-    }
-  }
-
-  return true;
-}
-
-// ============================================================================
-// Latency adjusters — convert raw ISR-entry DWT to event coordinates
-// ============================================================================
-//
-// These are the ONLY producers of event-coordinate DWT values, and they
-// are the ONLY place in the codebase that applies hardware latency math.
-// Called exactly once per ISR, on the first-instruction _raw capture.
-// All downstream code consumes the returned value as event-coordinate
-// truth and applies no further adjustment.
-
-static inline uint32_t pps_dwt_from_isr_entry_raw(uint32_t isr_entry_dwt_raw) {
-  return isr_entry_dwt_raw - (GPIO_TOTAL_LATENCY - STIMULUS_LAUNCH_LATENCY_CYCLES);
-}
-
-static inline uint32_t pps_vclock_dwt_from_pps_isr_entry_raw(uint32_t isr_entry_dwt_raw) {
-  return isr_entry_dwt_raw + (uint32_t)CANONICAL_VCLOCK_EPOCH_MINUS_RAW_PPS_ISR_CYCLES;
-}
-
-static inline uint32_t qtimer_event_dwt_from_isr_entry_raw(uint32_t isr_entry_dwt_raw) {
-  return isr_entry_dwt_raw - (QTIMER_TOTAL_LATENCY - STIMULUS_LAUNCH_LATENCY_CYCLES);
-}
-
-// ============================================================================
-// DWT → GNSS conversion (the OCXO/TimePop exception)
-// ============================================================================
-
-static bridge_projection_t interrupt_dwt_to_vclock_gnss_projection(uint32_t dwt_at_event) {
-  bridge_projection_t out{};
-  out.gnss_ns = -1;
-  out.anchor_selection_kind = ANCHOR_SELECT_FAILED;
-
-  pvc_anchor_record_t anchors[PVC_ANCHOR_RING_SIZE];
-  uint32_t count = 0;
-  if (!pvc_anchor_snapshot(anchors, count)) {
-    out.anchor_failure_mask |= ANCHOR_FAIL_RING_UNSTABLE;
-    return out;
-  }
-
-  if (count == 0) {
-    out.anchor_failure_mask |= ANCHOR_FAIL_NO_ANCHORS;
-    return out;
-  }
-
-  for (uint32_t age = 0; age < count; age++) {
-    const pvc_anchor_record_t& a = anchors[age];
-
-    if (a.sequence == 0 || a.gnss_ns_at_edge < 0) {
-      out.anchor_failure_mask |= ANCHOR_FAIL_BAD_ANCHOR;
-      continue;
-    }
-
-    if (!a.cps_valid || a.cps == 0) {
-      out.anchor_failure_mask |= ANCHOR_FAIL_NO_CPS;
-      continue;
-    }
-    const uint32_t cps = a.cps;
-
-    const uint32_t dwt_delta = dwt_at_event - a.dwt_at_edge;
-    const uint64_t ns_delta =
-        ((uint64_t)dwt_delta * (uint64_t)GNSS_NS_PER_SECOND + (uint64_t)cps / 2ULL) /
-        (uint64_t)cps;
-
-    if (ns_delta > PVC_ANCHOR_MAX_EVENT_OFFSET_NS) {
-      out.anchor_failure_mask |= ANCHOR_FAIL_DELTA_RANGE;
-      continue;
-    }
-
-    out.gnss_ns = a.gnss_ns_at_edge + (int64_t)ns_delta;
-    out.anchor_sequence_used = a.sequence;
-    out.anchor_age_slots = age;
-    out.anchor_selection_kind = (age == 0)
-        ? ANCHOR_SELECT_LATEST
-        : ((age == 1) ? ANCHOR_SELECT_PREVIOUS : ANCHOR_SELECT_OLDER);
-    out.anchor_dwt_at_edge = a.dwt_at_edge;
-    out.anchor_gnss_ns_at_edge = a.gnss_ns_at_edge;
-    out.anchor_cps = cps;
-    out.anchor_ns_delta = ns_delta;
-    return out;
-  }
-
-  out.anchor_failure_mask |= ANCHOR_FAIL_NO_PLAUSIBLE;
-  return out;
-}
-
-static void interrupt_integrity_note_vclock_gnss_ns(uint32_t sequence,
-                                                    uint32_t dwt_at_edge,
-                                                    uint32_t counter32_at_edge) {
-  interrupt_integrity_gnss_ns_check_t& s =
-      g_interrupt_integrity.vclock_gnss_ns;
-
-  s.valid = true;
-  s.sequence = sequence;
-  s.dwt_at_edge = dwt_at_edge;
-  s.counter32_at_edge = counter32_at_edge;
-  s.expected_gnss_ns = -1;
-  s.gate_ns = VCLOCK_GNSS_NS_INTEGRITY_GATE_NS;
-  s.anchor_sequence_delta = 0;
-  s.computed_valid = false;
-  s.computed_gnss_ns = -1;
-  s.error_ns = 0;
-  s.anchor_sequence_used = 0;
-  s.anchor_age_slots = 0;
-  s.anchor_selection_kind = ANCHOR_SELECT_FAILED;
-  s.anchor_dwt_at_edge = 0;
-  s.anchor_gnss_ns_at_edge = -1;
-  s.anchor_cps = 0;
-  s.anchor_ns_delta = 0;
-  s.anchor_failure_mask = 0;
-
-  if (sequence == 0 || dwt_at_edge == 0) {
-    s.skipped_count++;
-    s.last_ok = false;
+static void synthetic_clock_tend_from_hardware(synthetic_clock32_t& clock,
+                                                uint16_t hardware16) {
+  if (!clock.zeroed) {
+    synthetic_clock_birth(clock, hardware16);
     return;
   }
-
-  const bridge_projection_t proj =
-      interrupt_dwt_to_vclock_gnss_projection(dwt_at_edge);
-  s.anchor_sequence_used = proj.anchor_sequence_used;
-  s.anchor_age_slots = proj.anchor_age_slots;
-  s.anchor_selection_kind = proj.anchor_selection_kind;
-  s.anchor_dwt_at_edge = proj.anchor_dwt_at_edge;
-  s.anchor_gnss_ns_at_edge = proj.anchor_gnss_ns_at_edge;
-  s.anchor_cps = proj.anchor_cps;
-  s.anchor_ns_delta = proj.anchor_ns_delta;
-  s.anchor_failure_mask = proj.anchor_failure_mask;
-
-  if (proj.gnss_ns < 0 ||
-      proj.anchor_sequence_used == 0 ||
-      proj.anchor_gnss_ns_at_edge < 0) {
-    s.skipped_count++;
-    s.last_ok = false;
-    return;
-  }
-
-  const int64_t sequence_delta =
-      (int64_t)sequence - (int64_t)proj.anchor_sequence_used;
-  s.anchor_sequence_delta = sequence_delta;
-  s.expected_gnss_ns =
-      proj.anchor_gnss_ns_at_edge +
-      sequence_delta * (int64_t)GNSS_NS_PER_SECOND;
-
-  s.computed_valid = true;
-  s.computed_gnss_ns = proj.gnss_ns;
-  s.error_ns = proj.gnss_ns - s.expected_gnss_ns;
-  s.test_count++;
-
-  if (s.error_ns == 0) {
-    s.exact_match_count++;
-  }
-
-  if (interrupt_integrity_abs_i64(s.error_ns) <=
-      (uint64_t)VCLOCK_GNSS_NS_INTEGRITY_GATE_NS) {
-    s.match_count++;
-    s.last_ok = true;
-  } else {
-    s.mismatch_count++;
-    s.last_ok = false;
-  }
+  const uint32_t delta = (uint32_t)((uint16_t)(hardware16 - clock.hardware16));
+  clock.current_counter32 += delta;
+  clock.current_ns += (uint64_t)delta * 100ULL;
+  clock.hardware16 = hardware16;
+  clock.minder_update_count++;
 }
-
-static void interrupt_integrity_note_qtimer_cntr_match(
-    interrupt_subscriber_kind_t kind,
-    uint32_t sequence,
-    uint32_t target_counter32,
-    uint16_t expected_low16,
-    uint16_t ambient_low16,
-    uint32_t isr_entry_dwt_raw) {
-  interrupt_integrity_qtimer_cntr_match_check_t* s =
-      interrupt_integrity_qtimer_cntr_store(kind);
-  if (!s) return;
-
-  const uint16_t delta_mod = (uint16_t)(ambient_low16 - expected_low16);
-  const int32_t delta_signed = (int32_t)((int16_t)delta_mod);
-  const uint32_t abs_delta = interrupt_integrity_abs_i32(delta_signed);
-
-  s->valid = true;
-  s->sequence = sequence;
-  s->target_counter32 = target_counter32;
-  s->expected_low16 = expected_low16;
-  s->ambient_low16 = ambient_low16;
-  s->delta_mod65536_ticks = (uint32_t)delta_mod;
-  s->delta_signed_ticks = delta_signed;
-  s->abs_delta_ticks = abs_delta;
-  s->expected_offset_ticks = QTIMER_CNTR_MATCH_EXPECTED_OFFSET_TICKS;
-  s->lock_streak_required = QTIMER_CNTR_MATCH_LOCK_STREAK;
-  s->observed_minus_expected_offset_ticks =
-      delta_signed - QTIMER_CNTR_MATCH_EXPECTED_OFFSET_TICKS;
-  s->isr_entry_dwt_raw = isr_entry_dwt_raw;
-  s->test_count++;
-
-  const bool was_locked = s->locked;
-  const bool ok = (delta_signed == QTIMER_CNTR_MATCH_EXPECTED_OFFSET_TICKS);
-
-  if (ok) {
-    s->match_count++;
-    s->last_ok = true;
-    if (s->consecutive_ok_count != UINT32_MAX) {
-      s->consecutive_ok_count++;
-    }
-  } else {
-    s->mismatch_count++;
-    s->last_ok = false;
-    s->consecutive_ok_count = 0;
-    if (s->first_mismatch_sequence == 0) {
-      s->first_mismatch_sequence = sequence;
-    }
-    s->last_mismatch_sequence = sequence;
-    s->last_mismatch_delta_signed_ticks = delta_signed;
-    s->last_mismatch_observed_minus_expected_offset_ticks =
-        s->observed_minus_expected_offset_ticks;
-  }
-
-  if (was_locked) {
-    if (ok) {
-      s->post_lock_match_count++;
-    } else {
-      s->post_lock_mismatch_count++;
-    }
-  } else {
-    if (ok) {
-      s->prelock_match_count++;
-    } else {
-      s->prelock_mismatch_count++;
-    }
-
-    if (ok && s->consecutive_ok_count >= QTIMER_CNTR_MATCH_LOCK_STREAK) {
-      s->locked = true;
-      s->lock_sequence = sequence;
-      s->lock_count++;
-    }
-  }
-
-  interrupt_feature_update_qtimer_counter_custody();
-}
-
-static void interrupt_integrity_note_qtimer_dwt_interval(
-    interrupt_integrity_qtimer_dwt_interval_check_t& s,
-    uint32_t sequence,
-    uint32_t target_counter32,
-    uint32_t isr_entry_dwt_raw,
-    uint32_t lock_streak_required,
-    bool ruler_qualified) {
-  s.valid = true;
-  s.sequence = sequence;
-  s.target_counter32 = target_counter32;
-  s.dwt_at_match = isr_entry_dwt_raw;
-  s.gate_cycles = QTIMER_DWT_MATCH_GATE_CYCLES;
-  s.lock_streak_required = lock_streak_required;
-
-  if (!s.previous_valid) {
-    s.previous_valid = true;
-    s.previous_sequence = sequence;
-    s.previous_target_counter32 = target_counter32;
-    s.previous_dwt_at_match = isr_entry_dwt_raw;
-    s.skipped_count++;
-    s.last_ok = false;
-    return;
-  }
-
-  if (!ruler_qualified) {
-    // The interval can be physically fine while the expected-cycle ruler is
-    // still settling.  Keep the latest endpoint as the next baseline, but do
-    // not count this as a match or mismatch.  The integrity question is
-    // whether failures happen after the ruler-qualified lock boundary, not
-    // whether startup CPS movement can fool an over-eager checker.
-    s.ruler_qualified = false;
-    s.ruler_wait_count++;
-    s.skipped_count++;
-    s.last_ok = false;
-    s.previous_sequence = sequence;
-    s.previous_target_counter32 = target_counter32;
-    s.previous_dwt_at_match = isr_entry_dwt_raw;
-    return;
-  }
-
-  if (!s.ruler_qualified) {
-    // First sample after the slower ruler has qualified.  Establish a fresh
-    // baseline so the first counted interval cannot straddle the warmup/lock
-    // transition.
-    s.ruler_qualified = true;
-    s.first_qualified_sequence = sequence;
-    s.ruler_qualification_count++;
-    s.skipped_count++;
-    s.last_ok = false;
-    s.previous_sequence = sequence;
-    s.previous_target_counter32 = target_counter32;
-    s.previous_dwt_at_match = isr_entry_dwt_raw;
-    return;
-  }
-
-  const uint32_t previous_sequence = s.previous_sequence;
-  const uint32_t previous_target_counter32 = s.previous_target_counter32;
-  const uint32_t previous_dwt_at_match = s.previous_dwt_at_match;
-
-  const uint32_t target_delta_ticks =
-      target_counter32 - previous_target_counter32;
-  const uint32_t observed_cycles =
-      isr_entry_dwt_raw - previous_dwt_at_match;
-  const uint32_t expected_cycles = vclock_cycles_for_ticks(target_delta_ticks);
-
-  s.previous_sequence = sequence;
-  s.previous_target_counter32 = target_counter32;
-  s.previous_dwt_at_match = isr_entry_dwt_raw;
-
-  s.interval_previous_sequence = previous_sequence;
-  s.interval_previous_target_counter32 = previous_target_counter32;
-  s.interval_previous_dwt_at_match = previous_dwt_at_match;
-  s.target_delta_ticks = target_delta_ticks;
-  s.observed_cycles = observed_cycles;
-  s.expected_cycles = expected_cycles;
-
-  if (target_delta_ticks == 0 || expected_cycles == 0) {
-    s.skipped_count++;
-    s.last_ok = false;
-    s.error_cycles = 0;
-    s.abs_error_cycles = 0;
-    return;
-  }
-
-  const int64_t error64 =
-      (int64_t)(uint64_t)observed_cycles - (int64_t)(uint64_t)expected_cycles;
-  const int32_t error = (error64 > INT32_MAX)
-      ? INT32_MAX
-      : ((error64 < INT32_MIN) ? INT32_MIN : (int32_t)error64);
-  const uint32_t abs_error = interrupt_integrity_abs_i32(error);
-  const bool ok = abs_error <= QTIMER_DWT_MATCH_GATE_CYCLES;
-  const bool was_locked = s.locked;
-
-  s.error_cycles = error;
-  s.abs_error_cycles = abs_error;
-  s.test_count++;
-
-  if (ok) {
-    s.match_count++;
-    s.last_ok = true;
-    if (s.consecutive_ok_count != UINT32_MAX) {
-      s.consecutive_ok_count++;
-    }
-  } else {
-    s.mismatch_count++;
-    s.last_ok = false;
-    s.consecutive_ok_count = 0;
-    if (error < -(int32_t)QTIMER_DWT_MATCH_GATE_CYCLES) {
-      s.too_short_count++;
-    } else if (error > (int32_t)QTIMER_DWT_MATCH_GATE_CYCLES) {
-      s.too_long_count++;
-    }
-    if (s.first_mismatch_sequence == 0) {
-      s.first_mismatch_sequence = sequence;
-    }
-    s.last_mismatch_sequence = sequence;
-    s.last_mismatch_error_cycles = error;
-    s.last_mismatch_observed_cycles = observed_cycles;
-    s.last_mismatch_expected_cycles = expected_cycles;
-  }
-
-  if (was_locked) {
-    if (ok) {
-      s.post_lock_match_count++;
-    } else {
-      s.post_lock_mismatch_count++;
-    }
-  } else {
-    if (ok) {
-      s.prelock_match_count++;
-    } else {
-      s.prelock_mismatch_count++;
-    }
-
-    if (ok && s.consecutive_ok_count >= lock_streak_required) {
-      s.locked = true;
-      s.lock_sequence = sequence;
-      s.lock_count++;
-    }
-  }
-}
-
-static void interrupt_integrity_note_qtimer_dwt_match(
-    interrupt_subscriber_kind_t kind,
-    uint32_t sequence,
-    uint32_t target_counter32,
-    uint32_t isr_entry_dwt_raw,
-    bool one_second_boundary) {
-  interrupt_integrity_qtimer_dwt_match_check_t* s =
-      interrupt_integrity_qtimer_dwt_store(kind);
-  if (!s) return;
-
-  s->valid = true;
-  s->sequence = sequence;
-  s->target_counter32 = target_counter32;
-  s->dwt_at_match = isr_entry_dwt_raw;
-  s->one_second_boundary = one_second_boundary;
-
-  if (one_second_boundary) {
-    interrupt_integrity_note_qtimer_dwt_interval(
-        s->one_second,
-        sequence,
-        target_counter32,
-        isr_entry_dwt_raw,
-        QTIMER_DWT_1S_LOCK_STREAK,
-        true);
-  }
-
-  const bool hz1k_ruler_qualified =
-      !QTIMER_DWT_1KHZ_REQUIRES_ONE_SECOND_LOCK || s->one_second.locked;
-  interrupt_integrity_note_qtimer_dwt_interval(
-      s->hz1k,
-      sequence,
-      target_counter32,
-      isr_entry_dwt_raw,
-      QTIMER_DWT_1KHZ_LOCK_STREAK,
-      hz1k_ruler_qualified);
-
-  interrupt_feature_update_qtimer_dwt_ruler();
-}
-
 
 // ============================================================================
-// Subscriber runtime
+// Subscriber runtime and foreground custody
 // ============================================================================
 
 struct interrupt_subscriber_descriptor_t {
@@ -2884,34 +487,25 @@ struct interrupt_deferred_dispatch_t {
   interrupt_subscriber_event_fn callback = nullptr;
   void* user_data = nullptr;
   interrupt_event_t event{};
-  interrupt_capture_diag_t diag{};
-
-  // VCLOCK alone carries a same-transaction PPS/Beta continuation.  Freeze the
-  // snapshot beside Alpha's event so the later callback never rereads mutable
-  // "latest PPS" state and can never join event N to snapshot N+1.
   bool pps_continuation_valid = false;
   pps_edge_snapshot_t pps_continuation{};
 };
 
 struct interrupt_subscriber_runtime_t {
   const interrupt_subscriber_descriptor_t* desc = nullptr;
-  interrupt_subscription_t sub {};
+  interrupt_subscription_t sub{};
   bool subscribed = false;
   bool active = false;
-  interrupt_event_t last_event {};
-  interrupt_capture_diag_t last_diag {};
+  interrupt_event_t last_event{};
+  interrupt_capture_diag_t last_diag{};
   bool has_fired = false;
-
-  // Deferred delivery owns a frozen event/diagnostic/callback tuple.  It never
-  // asks the later TimePop callback to reinterpret mutable last_* or sub state.
-  uint32_t binding_generation = 1;
+  uint32_t binding_generation = 1U;
   interrupt_deferred_dispatch_t deferred{};
   bool dispatch_running = false;
   uint32_t dispatch_busy_drop_count = 0;
   uint32_t dispatch_stale_drop_count = 0;
   uint32_t dispatch_invalid_callback_count = 0;
   uint32_t dispatch_arm_fail_count = 0;
-
   uint32_t start_count = 0;
   uint32_t stop_count = 0;
   uint32_t irq_count = 0;
@@ -2920,2247 +514,26 @@ struct interrupt_subscriber_runtime_t {
 };
 
 static const interrupt_subscriber_descriptor_t DESCRIPTORS[] = {
-  { interrupt_subscriber_kind_t::VCLOCK, "VCLOCK", interrupt_provider_kind_t::QTIMER1, interrupt_lane_t::QTIMER1_CH0_COMP },
-  { interrupt_subscriber_kind_t::OCXO1,  "OCXO1",  interrupt_provider_kind_t::QTIMER2, interrupt_lane_t::QTIMER2_CH0_COMP },
-  { interrupt_subscriber_kind_t::OCXO2,  "OCXO2",  interrupt_provider_kind_t::QTIMER3, interrupt_lane_t::QTIMER3_CH3_COMP },
+  { interrupt_subscriber_kind_t::VCLOCK, "VCLOCK",
+    interrupt_provider_kind_t::QTIMER1,
+    interrupt_lane_t::QTIMER1_CH0_COMP },
+  { interrupt_subscriber_kind_t::OCXO1, "OCXO1",
+    interrupt_provider_kind_t::QTIMER2,
+    interrupt_lane_t::QTIMER2_CH0_COMP },
+  { interrupt_subscriber_kind_t::OCXO2, "OCXO2",
+    interrupt_provider_kind_t::QTIMER3,
+    interrupt_lane_t::QTIMER3_CH3_COMP },
 };
 
-static interrupt_subscriber_runtime_t g_subscribers[MAX_INTERRUPT_SUBSCRIBERS] = {};
+static interrupt_subscriber_runtime_t g_subscribers[MAX_INTERRUPT_SUBSCRIBERS]{};
 static uint32_t g_subscriber_count = 0;
-static bool g_interrupt_hw_ready = false;
-static bool g_interrupt_runtime_ready = false;
-static bool g_interrupt_irqs_enabled = false;
-
-static volatile uint32_t g_step0_qtimer1_priority_applied  = 0xFFFFFFFFUL;
-static volatile uint32_t g_step0_qtimer2_priority_applied  = 0xFFFFFFFFUL;
-static volatile uint32_t g_step0_qtimer3_priority_applied  = 0xFFFFFFFFUL;
-static volatile uint32_t g_step0_gpio6789_priority_applied = 0xFFFFFFFFUL;
-
-static volatile bool g_step0_qtimer1_irq_enabled_by_interrupt  = false;
-static volatile bool g_step0_qtimer2_irq_enabled_by_interrupt  = false;
-static volatile bool g_step0_qtimer3_irq_enabled_by_interrupt  = false;
-static volatile bool g_step0_gpio6789_configured_by_interrupt = false;
-
-
-static volatile bool     g_pps_rebootstrap_pending = false;
-static volatile uint32_t g_pps_rebootstrap_count   = 0;
-
 static interrupt_subscriber_runtime_t* g_rt_vclock = nullptr;
-static interrupt_subscriber_runtime_t* g_rt_ocxo1  = nullptr;
-static interrupt_subscriber_runtime_t* g_rt_ocxo2  = nullptr;
+static interrupt_subscriber_runtime_t* g_rt_ocxo1 = nullptr;
+static interrupt_subscriber_runtime_t* g_rt_ocxo2 = nullptr;
 
-static volatile interrupt_pps_entry_latency_handler_fn
-    g_pps_entry_latency_handler = nullptr;
-
-
-// ============================================================================
-// Per-lane state
-// ============================================================================
-// ============================================================================
-// Retired phase-ledger replacement
-// ============================================================================
-//
-// The retired phase-correction witness has been removed.
-// The OCXO compare ladder owns target identity directly, so hardware low16
-// projection is now just the semantic counter low word.
-
-static inline uint16_t hardware_low16_from_semantic(uint32_t semantic_counter32) {
-  return (uint16_t)(semantic_counter32 & 0xFFFFU);
-}
-
-struct vclock_lane_t {
-  bool     initialized = false;
-  bool     active = false;
-  bool     phase_bootstrapped = false;
-  uint16_t compare_target = 0;
-  uint32_t tick_mod_1000 = 0;
-  uint32_t logical_count32_at_last_second = 0;
-  uint32_t irq_count = 0;
-  uint32_t miss_count = 0;
-  uint32_t bootstrap_count = 0;
-  uint32_t cadence_hits_total = 0;
-};
-static vclock_lane_t g_vclock_lane = {};
-
-
-// ============================================================================
-// Compare-generation gate — active 32-bit target custody
-// ============================================================================
-//
-// This is the mission-path remnant that survived retirement of the old
-// 1 kHz capture-forensics feature.  A QuadTimer compare flag proves only low16
-// equality; it does not prove the match belongs to the intended synthetic
-// 32-bit target generation.  Every compare ISR therefore resolves the
-// immediate ambient low16 witness into the lane's synthetic 32-bit timeline,
-// compares that resolved coordinate to the authored target, and only then
-// advances the +10,000 tick cadence.
-//
-// The old 1 kHz interval forensics and monolithic capture report are gone.
-// This gate remains because it is active custody, not diagnostics.
-
-static constexpr uint32_t GENERATION_GATE_LATE_ACCEPT_WARN_TICKS = 8U;
-
-// Far-late compare-tooth policy.
-//
-// Far-late accepts are currently witness-only.  The previous experimental
-// reject/rearm behavior proved too aggressive during OCXO2 startup: a harmless
-// late service tooth could be converted into a run of wrong-generation rejects.
-// Keep the threshold and compact black-box snapshot fields, but do not let a
-// far-late positive delta reject or reauthor the OCXO compare ladder.
-static constexpr bool     GENERATION_GATE_REJECT_FAR_LATE_ENABLED = false;
-static constexpr uint32_t GENERATION_GATE_FAR_LATE_REJECT_TICKS =
-    GENERATION_GATE_LATE_ACCEPT_WARN_TICKS;
-
-static constexpr uint32_t GENERATION_GATE_REASON_NONE = 0U;
-static constexpr uint32_t GENERATION_GATE_REASON_NEVER = 1U;
-static constexpr uint32_t GENERATION_GATE_REASON_RESET = 2U;
-static constexpr uint32_t GENERATION_GATE_REASON_REJECT_BEFORE_TARGET = 3U;
-static constexpr uint32_t GENERATION_GATE_REASON_REJECT_FAR_LATE = 4U;
-static constexpr uint32_t GENERATION_GATE_REASON_ACCEPT_EQUALS_TARGET = 5U;
-static constexpr uint32_t GENERATION_GATE_REASON_ACCEPT_SLIGHTLY_LATE = 6U;
-static constexpr uint32_t GENERATION_GATE_REASON_ACCEPT_LATE_OR_MISSED_TOOTH = 7U;
-
-struct generation_gate_lane_t {
-  uint32_t generation_gate_observe_count = 0;
-  uint32_t generation_gate_accept_count = 0;
-  uint32_t generation_gate_reject_count = 0;
-  uint32_t generation_gate_early_reject_count = 0;
-  uint32_t generation_gate_late_accept_count = 0;
-  uint32_t generation_gate_far_late_accept_count = 0;
-  uint32_t generation_gate_far_late_reject_count = 0;
-  uint32_t generation_gate_max_far_late_delta_ticks = 0;
-
-  bool     generation_gate_last_far_late_valid = false;
-  bool     generation_gate_last_far_late_accepted = false;
-  uint32_t generation_gate_last_far_late_resolved_counter32 = 0;
-  uint32_t generation_gate_last_far_late_target_counter32 = 0;
-  int32_t  generation_gate_last_far_late_delta_ticks = 0;
-  uint16_t generation_gate_last_far_late_ambient_low16 = 0;
-  uint16_t generation_gate_last_far_late_target_low16 = 0;
-  uint32_t generation_gate_last_far_late_clock32_current_counter32 = 0;
-  uint16_t generation_gate_last_far_late_clock32_hardware16 = 0;
-  uint32_t generation_gate_last_far_late_target_semantic_delta_ticks = 0;
-  uint32_t generation_gate_last_far_late_target_hardware_delta_ticks = 0;
-  int32_t  generation_gate_last_far_late_domain_skew_ticks = 0;
-  uint32_t generation_gate_last_far_late_isr_entry_dwt_raw = 0;
-  uint32_t generation_gate_last_far_late_tick_mod = 0;
-  bool     generation_gate_last_far_late_one_second_due = false;
-  bool     generation_gate_last_far_late_smartzero = false;
-  bool     generation_gate_last_far_late_rejected = false;
-  uint32_t generation_gate_last_far_late_reason_id = GENERATION_GATE_REASON_NONE;
-
-  bool     generation_gate_last_accepted = false;
-  uint32_t generation_gate_last_resolved_counter32 = 0;
-  uint32_t generation_gate_last_target_counter32 = 0;
-  int32_t  generation_gate_last_delta_ticks = 0;
-  uint16_t generation_gate_last_ambient_low16 = 0;
-  uint16_t generation_gate_last_target_low16 = 0;
-  uint32_t generation_gate_last_clock32_current_counter32 = 0;
-  uint16_t generation_gate_last_clock32_hardware16 = 0;
-  uint32_t generation_gate_last_target_semantic_delta_ticks = 0;
-  uint32_t generation_gate_last_target_hardware_delta_ticks = 0;
-  int32_t  generation_gate_last_domain_skew_ticks = 0;
-  uint32_t generation_gate_last_isr_entry_dwt_raw = 0;
-  uint32_t generation_gate_last_tick_mod = 0;
-  bool     generation_gate_last_one_second_due = false;
-  bool     generation_gate_last_smartzero = false;
-  uint32_t generation_gate_last_reason_id = GENERATION_GATE_REASON_NEVER;
-
-  bool     generation_gate_last_reject_valid = false;
-  uint32_t generation_gate_last_reject_resolved_counter32 = 0;
-  uint32_t generation_gate_last_reject_target_counter32 = 0;
-  int32_t  generation_gate_last_reject_delta_ticks = 0;
-  uint16_t generation_gate_last_reject_ambient_low16 = 0;
-  uint16_t generation_gate_last_reject_target_low16 = 0;
-  uint32_t generation_gate_last_reject_clock32_current_counter32 = 0;
-  uint16_t generation_gate_last_reject_clock32_hardware16 = 0;
-  uint32_t generation_gate_last_reject_target_semantic_delta_ticks = 0;
-  uint32_t generation_gate_last_reject_target_hardware_delta_ticks = 0;
-  int32_t  generation_gate_last_reject_domain_skew_ticks = 0;
-  uint32_t generation_gate_last_reject_isr_entry_dwt_raw = 0;
-  uint32_t generation_gate_last_reject_tick_mod = 0;
-  bool     generation_gate_last_reject_one_second_due = false;
-  bool     generation_gate_last_reject_smartzero = false;
-  uint32_t generation_gate_last_reject_reason_id = GENERATION_GATE_REASON_NONE;
-
-  // Feature-readiness custody lock.  Startup/pre-grid rejects are allowed to
-  // remain prelock evidence.  Once a lane has produced a sustained streak of
-  // accepted generation-gate observations, any later reject is a real custody
-  // anomaly for QTIMER_COUNTER_CUSTODY.
-  bool     feature_custody_locked = false;
-  uint32_t feature_custody_lock_sequence = 0;
-  uint32_t feature_custody_lock_count = 0;
-  uint32_t feature_custody_consecutive_accept_count = 0;
-  uint32_t feature_custody_post_lock_reject_count = 0;
-};
-
-static generation_gate_lane_t g_generation_gate_vclock = {};
-static generation_gate_lane_t g_generation_gate_ocxo1 = {};
-static generation_gate_lane_t g_generation_gate_ocxo2 = {};
-
-static bool generation_gate_feature_locked(const generation_gate_lane_t& s) {
-  return s.feature_custody_locked &&
-         s.feature_custody_post_lock_reject_count == 0U;
-}
-
-static bool generation_gate_feature_anomaly(const generation_gate_lane_t& s) {
-  return s.feature_custody_locked &&
-         s.feature_custody_post_lock_reject_count != 0U;
-}
-
-static bool interrupt_feature_qtimer_counter_custody_generation_locked(void) {
-  const bool v_ok = generation_gate_feature_locked(g_generation_gate_vclock);
-  const bool o1_ok = !interrupt_feature_lane_required(interrupt_subscriber_kind_t::OCXO1) ||
-      generation_gate_feature_locked(g_generation_gate_ocxo1);
-  const bool o2_ok = !interrupt_feature_lane_required(interrupt_subscriber_kind_t::OCXO2) ||
-      generation_gate_feature_locked(g_generation_gate_ocxo2);
-  return v_ok && o1_ok && o2_ok;
-}
-
-static bool interrupt_feature_qtimer_counter_custody_generation_anomaly(void) {
-  return generation_gate_feature_anomaly(g_generation_gate_vclock) ||
-      (interrupt_feature_lane_required(interrupt_subscriber_kind_t::OCXO1) &&
-       generation_gate_feature_anomaly(g_generation_gate_ocxo1)) ||
-      (interrupt_feature_lane_required(interrupt_subscriber_kind_t::OCXO2) &&
-       generation_gate_feature_anomaly(g_generation_gate_ocxo2));
-}
-
-static void generation_gate_reset_lane(generation_gate_lane_t& s) {
-  s = generation_gate_lane_t{};
-  s.generation_gate_last_reason_id = GENERATION_GATE_REASON_RESET;
-  s.generation_gate_last_reject_reason_id = GENERATION_GATE_REASON_NONE;
-  s.generation_gate_last_far_late_reason_id = GENERATION_GATE_REASON_NONE;
-}
-
-static void generation_gate_reset_all(void) {
-  generation_gate_reset_lane(g_generation_gate_vclock);
-  generation_gate_reset_lane(g_generation_gate_ocxo1);
-  generation_gate_reset_lane(g_generation_gate_ocxo2);
-}
-
-static uint32_t generation_gate_reason_id(int32_t resolved_minus_target_ticks,
-                                          bool far_late_rejected) {
-  if (resolved_minus_target_ticks < 0) {
-    return GENERATION_GATE_REASON_REJECT_BEFORE_TARGET;
-  }
-  if (far_late_rejected) {
-    return GENERATION_GATE_REASON_REJECT_FAR_LATE;
-  }
-  if (resolved_minus_target_ticks == 0) {
-    return GENERATION_GATE_REASON_ACCEPT_EQUALS_TARGET;
-  }
-  if ((uint32_t)resolved_minus_target_ticks <=
-      GENERATION_GATE_LATE_ACCEPT_WARN_TICKS) {
-    return GENERATION_GATE_REASON_ACCEPT_SLIGHTLY_LATE;
-  }
-  return GENERATION_GATE_REASON_ACCEPT_LATE_OR_MISSED_TOOTH;
-}
-
-static const char* generation_gate_reason_name(uint32_t reason) {
-  switch (reason) {
-    case GENERATION_GATE_REASON_NEVER:
-      return "never";
-    case GENERATION_GATE_REASON_RESET:
-      return "reset";
-    case GENERATION_GATE_REASON_REJECT_BEFORE_TARGET:
-      return "reject_resolved_counter32_before_target32";
-    case GENERATION_GATE_REASON_REJECT_FAR_LATE:
-      return "reject_resolved_counter32_far_late";
-    case GENERATION_GATE_REASON_ACCEPT_EQUALS_TARGET:
-      return "accept_resolved_counter32_equals_target32";
-    case GENERATION_GATE_REASON_ACCEPT_SLIGHTLY_LATE:
-      return "accept_resolved_counter32_slightly_late";
-    case GENERATION_GATE_REASON_ACCEPT_LATE_OR_MISSED_TOOTH:
-      return "accept_resolved_counter32_late_or_missed_tooth";
-    default:
-      return "none";
-  }
-}
-
-static bool generation_gate_record(
-    generation_gate_lane_t& s,
-    uint32_t resolved_counter32,
-    uint32_t target_counter32,
-    uint16_t ambient_low16,
-    uint16_t target_low16,
-    uint32_t clock32_current_counter32,
-    uint16_t clock32_hardware16,
-    bool reject_far_late_accepts,
-    uint32_t tick_mod,
-    bool one_second_due,
-    bool smartzero,
-    uint32_t isr_entry_dwt_raw) {
-  const int32_t delta = (int32_t)(resolved_counter32 - target_counter32);
-  const uint32_t target_semantic_delta_ticks =
-      target_counter32 - clock32_current_counter32;
-  const uint32_t target_hardware_delta_ticks =
-      (uint32_t)((uint16_t)(target_low16 - clock32_hardware16));
-  const int32_t domain_skew_ticks =
-      (int32_t)((int64_t)target_hardware_delta_ticks -
-                (int64_t)target_semantic_delta_ticks);
-  const bool far_late = delta > (int32_t)GENERATION_GATE_LATE_ACCEPT_WARN_TICKS;
-  const bool far_late_rejected =
-      far_late &&
-      reject_far_late_accepts &&
-      GENERATION_GATE_REJECT_FAR_LATE_ENABLED &&
-      (uint32_t)delta > GENERATION_GATE_FAR_LATE_REJECT_TICKS;
-  const bool accepted = delta >= 0 && !far_late_rejected;
-  const uint32_t reason_id = generation_gate_reason_id(delta, far_late_rejected);
-
-  s.generation_gate_observe_count++;
-  if (far_late) {
-    if ((uint32_t)delta > s.generation_gate_max_far_late_delta_ticks) {
-      s.generation_gate_max_far_late_delta_ticks = (uint32_t)delta;
-    }
-    s.generation_gate_last_far_late_valid = true;
-    s.generation_gate_last_far_late_accepted = accepted;
-    s.generation_gate_last_far_late_resolved_counter32 = resolved_counter32;
-    s.generation_gate_last_far_late_target_counter32 = target_counter32;
-    s.generation_gate_last_far_late_delta_ticks = delta;
-    s.generation_gate_last_far_late_ambient_low16 = ambient_low16;
-    s.generation_gate_last_far_late_target_low16 = target_low16;
-    s.generation_gate_last_far_late_clock32_current_counter32 = clock32_current_counter32;
-    s.generation_gate_last_far_late_clock32_hardware16 = clock32_hardware16;
-    s.generation_gate_last_far_late_target_semantic_delta_ticks = target_semantic_delta_ticks;
-    s.generation_gate_last_far_late_target_hardware_delta_ticks = target_hardware_delta_ticks;
-    s.generation_gate_last_far_late_domain_skew_ticks = domain_skew_ticks;
-    s.generation_gate_last_far_late_isr_entry_dwt_raw = isr_entry_dwt_raw;
-    s.generation_gate_last_far_late_tick_mod = tick_mod;
-    s.generation_gate_last_far_late_one_second_due = one_second_due;
-    s.generation_gate_last_far_late_smartzero = smartzero;
-    s.generation_gate_last_far_late_rejected = far_late_rejected;
-    s.generation_gate_last_far_late_reason_id = reason_id;
-  }
-
-  const bool feature_was_locked = s.feature_custody_locked;
-  if (accepted) {
-    s.generation_gate_accept_count++;
-    if (s.feature_custody_consecutive_accept_count != UINT32_MAX) {
-      s.feature_custody_consecutive_accept_count++;
-    }
-    if (delta > 0) {
-      s.generation_gate_late_accept_count++;
-      if (far_late) {
-        s.generation_gate_far_late_accept_count++;
-      }
-    }
-  } else {
-    s.generation_gate_reject_count++;
-    s.feature_custody_consecutive_accept_count = 0;
-    if (feature_was_locked) {
-      s.feature_custody_post_lock_reject_count++;
-    }
-    if (delta < 0) {
-      s.generation_gate_early_reject_count++;
-    } else if (far_late_rejected) {
-      s.generation_gate_far_late_reject_count++;
-    }
-  }
-
-  if (!feature_was_locked &&
-      accepted &&
-      s.feature_custody_consecutive_accept_count >= QTIMER_CNTR_MATCH_LOCK_STREAK) {
-    s.feature_custody_locked = true;
-    s.feature_custody_lock_sequence = s.generation_gate_observe_count;
-    s.feature_custody_lock_count++;
-  }
-
-  s.generation_gate_last_accepted = accepted;
-  s.generation_gate_last_resolved_counter32 = resolved_counter32;
-  s.generation_gate_last_target_counter32 = target_counter32;
-  s.generation_gate_last_delta_ticks = delta;
-  s.generation_gate_last_ambient_low16 = ambient_low16;
-  s.generation_gate_last_target_low16 = target_low16;
-  s.generation_gate_last_clock32_current_counter32 = clock32_current_counter32;
-  s.generation_gate_last_clock32_hardware16 = clock32_hardware16;
-  s.generation_gate_last_target_semantic_delta_ticks = target_semantic_delta_ticks;
-  s.generation_gate_last_target_hardware_delta_ticks = target_hardware_delta_ticks;
-  s.generation_gate_last_domain_skew_ticks = domain_skew_ticks;
-  s.generation_gate_last_isr_entry_dwt_raw = isr_entry_dwt_raw;
-  s.generation_gate_last_tick_mod = tick_mod;
-  s.generation_gate_last_one_second_due = one_second_due;
-  s.generation_gate_last_smartzero = smartzero;
-  s.generation_gate_last_reason_id = reason_id;
-
-  if (!accepted) {
-    s.generation_gate_last_reject_valid = true;
-    s.generation_gate_last_reject_resolved_counter32 = resolved_counter32;
-    s.generation_gate_last_reject_target_counter32 = target_counter32;
-    s.generation_gate_last_reject_delta_ticks = delta;
-    s.generation_gate_last_reject_ambient_low16 = ambient_low16;
-    s.generation_gate_last_reject_target_low16 = target_low16;
-    s.generation_gate_last_reject_clock32_current_counter32 = clock32_current_counter32;
-    s.generation_gate_last_reject_clock32_hardware16 = clock32_hardware16;
-    s.generation_gate_last_reject_target_semantic_delta_ticks = target_semantic_delta_ticks;
-    s.generation_gate_last_reject_target_hardware_delta_ticks = target_hardware_delta_ticks;
-    s.generation_gate_last_reject_domain_skew_ticks = domain_skew_ticks;
-    s.generation_gate_last_reject_isr_entry_dwt_raw = isr_entry_dwt_raw;
-    s.generation_gate_last_reject_tick_mod = tick_mod;
-    s.generation_gate_last_reject_one_second_due = one_second_due;
-    s.generation_gate_last_reject_smartzero = smartzero;
-    s.generation_gate_last_reject_reason_id = reason_id;
-  }
-
-  interrupt_feature_update_qtimer_counter_custody();
-  return accepted;
-}
-
-static generation_gate_lane_t& generation_gate_for_ocxo_kind(
+static interrupt_subscriber_runtime_t* runtime_for(
     interrupt_subscriber_kind_t kind) {
-  return (kind == interrupt_subscriber_kind_t::OCXO1)
-      ? g_generation_gate_ocxo1
-      : g_generation_gate_ocxo2;
-}
-
-
-static void dwt_publication_diag_begin(dwt_repair_diag_t& out,
-                                       uint32_t observed_dwt,
-                                       uint32_t isr_entry_dwt_raw,
-                                       const char* reason) {
-  out = dwt_repair_diag_t{};
-  out.valid = true;
-  out.original_dwt = observed_dwt;
-  out.isr_entry_dwt_raw = isr_entry_dwt_raw;
-  out.event_dwt_from_isr_entry_raw = observed_dwt;
-  out.isr_entry_to_event_correction_cycles = isr_entry_dwt_raw
-      ? (int32_t)(observed_dwt - isr_entry_dwt_raw)
-      : 0;
-  out.reason = reason ? reason : "floorline";
-}
-
-static void dwt_publication_diag_choose(dwt_repair_diag_t& out,
-                                        uint32_t published_dwt,
-                                        uint32_t observed_dwt,
-                                        uint32_t threshold_cycles,
-                                        const char* reason) {
-  out.candidate = (published_dwt != observed_dwt);
-  out.synthetic = (published_dwt != observed_dwt);
-  out.predicted_dwt = published_dwt;
-  out.used_dwt = published_dwt;
-  out.error_cycles = (int32_t)(published_dwt - observed_dwt);
-  out.threshold_cycles = threshold_cycles;
-  out.reason = reason ? reason : "floorline";
-}
-
-struct synthetic_clock32_t;
-struct ocxo_runtime_context_t;
-
-struct ocxo_lane_t {
-  const char* name = nullptr;
-  IMXRT_TMR_t* module = nullptr;
-  uint8_t      channel = 0;  // legacy alias for active compare channel
-  uint8_t      counter_channel = 0;  // passive counter channel
-  uint8_t      compare_channel = 0;  // active compare channel
-  uint8_t      pcs = 0;
-  int          input_pin = -1;
-  bool     initialized = false;
-  bool     active = false;
-  bool     phase_bootstrapped = false;
-  uint16_t compare_target = 0;
-  uint32_t tick_mod_1000 = 0;
-  uint32_t logical_count32_at_last_second = 0;
-  uint32_t irq_count = 0;
-  uint32_t miss_count = 0;
-  uint32_t bootstrap_count = 0;
-  uint32_t cadence_hits_total = 0;
-
-  // Lane-local compare custody.  In steady state this is a one-second edge
-  // target; during SmartZero it temporarily becomes a +10,000-tick acquisition
-  // target.  The compare target is a process_interrupt-authored synthetic
-  // counter32 identity; the low 16 bits are merely the hardware projection
-  // used to arm the local QTimer channel.
-  bool     cadence_enabled = false;
-  bool     cadence_armed = false;
-  bool     cadence_epoch_valid = false;
-  uint32_t cadence_epoch_counter32 = 0;
-
-  // Configured quiet phase of this OCXO sample ladder inside the VCLOCK
-  // millisecond cell.  This is a subscriber contract field: process_clocks may
-  // back-project the clean observed sample to the logical one-second boundary.
-  bool     cadence_sample_phase_valid = false;
-  uint32_t cadence_sample_phase_ticks = 0;
-  uint32_t cadence_sample_phase_us = 0;
-  uint32_t cadence_sample_phase_ns = 0;
-  uint32_t cadence_sample_period_ticks = 0;
-  uint32_t cadence_phase_align_start_count = 0;
-  uint32_t cadence_last_phase_align_vclock_counter32 = 0;
-  uint32_t cadence_last_phase_align_vclock_phase_ticks = 0;
-  uint32_t cadence_last_phase_align_ticks_until_target = 0;
-  uint32_t cadence_last_phase_align_ocxo_counter32 = 0;
-
-  uint32_t cadence_next_counter32 = 0;
-  uint16_t cadence_next_low16 = 0;
-  uint32_t cadence_last_target_counter32 = 0;
-  uint16_t cadence_last_target_low16 = 0;
-  uint16_t cadence_last_service_low16 = 0;
-  uint32_t cadence_arm_count = 0;
-  uint32_t cadence_rearm_count = 0;
-  uint32_t cadence_fire_count = 0;
-  uint32_t cadence_false_irq_count = 0;
-  uint32_t cadence_one_second_due_count = 0;
-  uint32_t cadence_last_fire_dwt = 0;
-  uint32_t cadence_last_isr_entry_dwt_raw = 0;
-  int32_t  cadence_last_service_offset_signed_ticks = 0;
-  uint32_t cadence_last_service_offset_abs_ticks = 0;
-  uint32_t cadence_last_interpreted_late_ticks = 0;
-  uint32_t cadence_last_early_ticks = 0;
-  bool     cadence_last_was_early = false;
-  bool     cadence_last_one_second_due = false;
-  uint32_t cadence_last_program_csctrl_before = 0;
-  uint32_t cadence_last_program_csctrl_after = 0;
-  bool     cadence_last_program_flag_before = false;
-  bool     cadence_last_program_flag_after = false;
-  bool     cadence_last_program_enabled_before = false;
-  bool     cadence_last_program_enabled_after = false;
-  uint32_t cadence_last_reason = OCXO_CADENCE_REASON_NONE;
-
-  // Once-per-second OCXO witness surface.  In steady state this is the local
-  // one-second compare target itself.  During SmartZero this surface remains
-  // quiet until acquisition re-authors the normal one-second grid.
-  bool     witness_target_initialized = false;
-  bool     witness_armed = false;
-  uint32_t witness_target_counter32 = 0;
-  uint16_t witness_target_low16 = 0;
-  uint32_t witness_arm_count = 0;
-  uint32_t witness_fire_count = 0;
-  uint32_t witness_false_irq_count = 0;
-  uint32_t witness_missed_target_count = 0;
-  uint32_t witness_late_arm_count = 0;
-
-  // Final COMP1 write-boundary guard.  A QTimer compare sees only low16;
-  // these counters prove that no steady-state lane can program a low-word
-  // match unless the intended 32-bit target is actually the next occurrence.
-  uint32_t witness_generation_guard_block_count = 0;
-  uint32_t witness_generation_guard_last_remaining_ticks = 0;
-  uint32_t witness_generation_guard_last_current_counter32 = 0;
-  uint32_t witness_generation_guard_last_target_counter32 = 0;
-  uint32_t witness_generation_guard_last_reason = OCXO_CADENCE_REASON_NONE;
-
-  uint32_t witness_last_arm_remaining_ticks = 0;
-  uint32_t witness_last_event_dwt = 0;
-  uint32_t witness_last_event_counter32 = 0;
-
-  // Legacy ambiguous surface retained for continuity.  This is the raw
-  // 16-bit modular delta: isr_counter_low16 - target_low16 (mod 65536).
-  // Values > 32767 mean early service, not very-late service.
-  uint32_t witness_last_late_ticks = 0;
-
-  // VCLOCK_HEARTBEAT arm-decision diagnostics.
-  uint32_t witness_schedule_last_decision = OCXO_SCHEDULE_DECISION_NONE;
-  uint32_t witness_schedule_last_current_counter32 = 0;
-  uint32_t witness_schedule_last_target_counter32 = 0;
-  uint32_t witness_schedule_last_remaining_ticks = 0;
-  uint32_t witness_schedule_last_phase_ticks = 0;
-  uint32_t witness_schedule_last_ticks_until_arm_window = 0;
-  uint16_t witness_schedule_last_current_low16 = 0;
-  uint16_t witness_schedule_last_target_low16 = 0;
-
-  // Arming snapshots.
-  uint32_t witness_last_arm_dwt_raw = 0;
-  uint32_t witness_last_arm_counter32 = 0;
-  uint16_t witness_last_arm_low16 = 0;
-  uint16_t witness_last_arm_compare_low16 = 0;
-  uint32_t witness_last_arm_counter_minus_compare_ticks = 0;
-  uint32_t witness_last_arm_compare_remaining_ticks = 0;
-  uint32_t witness_last_arm_target_counter32 = 0;
-  uint16_t witness_last_arm_target_low16 = 0;
-  uint32_t witness_last_arm_to_isr_ticks = 0;
-  uint32_t witness_last_compare_arm_to_isr_ticks = 0;
-  uint32_t witness_last_arm_to_isr_dwt_cycles = 0;
-  uint32_t witness_last_program_csctrl_before = 0;
-  uint32_t witness_last_program_csctrl_after = 0;
-  bool     witness_last_program_flag_before = false;
-  bool     witness_last_program_flag_after = false;
-  bool     witness_last_program_enabled_before = false;
-  bool     witness_last_program_enabled_after = false;
-
-  // Compare-service diagnostics.  These are report-only and do not change
-  // publish/compare behavior.
-  uint32_t witness_last_isr_csctrl_entry = 0;
-  uint32_t witness_last_isr_csctrl_after_disable = 0;
-  bool     witness_last_isr_compare_flag_entry = false;
-  bool     witness_last_isr_compare_enabled_entry = false;
-  bool     witness_last_isr_compare_flag_after_disable = false;
-  bool     witness_last_isr_compare_enabled_after_disable = false;
-  bool     witness_last_irq_had_armed = false;
-  bool     witness_last_irq_had_active_rt = false;
-
-  uint16_t witness_last_target_low16 = 0;
-  uint16_t witness_last_isr_counter_low16 = 0;
-  uint16_t witness_last_isr_compare_low16 = 0;
-  uint32_t witness_last_isr_counter_minus_compare_ticks = 0;
-  uint32_t witness_last_compare_delta_mod65536_ticks = 0;
-  int32_t  witness_last_compare_service_offset_signed_ticks = 0;
-  uint32_t witness_last_compare_interpreted_late_ticks = 0;
-  uint32_t witness_last_compare_early_ticks = 0;
-  uint32_t witness_last_target_delta_mod65536_ticks = 0;
-  uint32_t witness_last_interpreted_late_ticks = 0;
-  uint32_t witness_last_early_ticks = 0;
-  int32_t  witness_last_service_offset_signed_ticks = 0;
-  uint32_t witness_last_service_offset_abs_ticks = 0;
-  bool     witness_last_service_was_early = false;
-  bool     witness_last_service_was_on_or_after_target = false;
-  uint32_t witness_last_service_class = OCXO_SERVICE_CLASS_NONE;
-
-  // Deferred perishable-fact diagnostics.  The ISR captures these facts, but
-  // foreground ASAP interprets them and updates this report surface.
-  uint32_t witness_last_fact_sequence = 0;
-  int32_t  witness_last_service_correction_cycles = 0;
-  uint32_t witness_last_service_corrected_dwt = 0;
-  bool     witness_last_fact_one_second_due = false;
-  uint32_t witness_fact_enqueue_count = 0;
-  uint32_t witness_fact_drain_count = 0;
-  uint32_t witness_fact_overflow_count = 0;
-  uint32_t witness_fact_high_water = 0;
-  uint32_t witness_fact_asap_arm_count = 0;
-  uint32_t witness_fact_asap_fail_count = 0;
-
-  // Warm-RECOVER publication-pipeline rebootstrap.  The installed OCXO
-  // synthetic identity and logical grid survive; only stale delivery custody
-  // is cut.  These are lifetime/report diagnostics, not timing authority.
-  uint32_t recover_rebootstrap_attempt_count = 0;
-  uint32_t recover_rebootstrap_success_count = 0;
-  uint32_t recover_rebootstrap_failure_count = 0;
-  uint32_t recover_rebootstrap_capture_drop_count = 0;
-  uint32_t recover_rebootstrap_fact_drop_count = 0;
-  uint32_t recover_rebootstrap_cadence_restart_count = 0;
-  uint32_t recover_rebootstrap_last_capture_drop_count = 0;
-  uint32_t recover_rebootstrap_last_fact_drop_count = 0;
-  bool     recover_rebootstrap_last_cadence_preserved = false;
-  bool     recover_rebootstrap_last_live_compare_verified = false;
-  bool     recover_rebootstrap_last_irq_was_enabled = false;
-  bool     recover_rebootstrap_last_irq_enabled_after = false;
-  uint32_t recover_rebootstrap_last_target_counter32 = 0;
-  uint16_t recover_rebootstrap_last_target_low16 = 0;
-  uint16_t recover_rebootstrap_last_compare_comp1 = 0;
-  uint32_t recover_rebootstrap_last_compare_csctrl = 0;
-  uint32_t recover_rebootstrap_last_failure_stage =
-      OCXO_RECOVER_REBOOTSTRAP_STAGE_OK;
-
-  // Canonical one-second custody audit.  A normal OCXO event stream advances
-  // exactly 10,000,000 ticks per published edge.
-  bool     witness_previous_event_counter32_valid = false;
-  uint32_t witness_previous_event_counter32 = 0;
-  uint32_t witness_last_counter_delta_ticks = 0;
-  uint32_t witness_counter_delta_violation_count = 0;
-  uint32_t witness_last_bad_counter_delta = 0;
-
-  uint32_t witness_service_count = 0;
-  uint32_t witness_early_service_count = 0;
-  uint32_t witness_on_or_after_service_count = 0;
-  uint32_t witness_valid_publish_count = 0;
-  uint32_t witness_early_service_published_count = 0;
-  bool     witness_last_event_published = false;
-
-  // OCXO event-lineage diagnostics.  These survived predictor retirement: they
-  // answer whether this one-second sample was actually adjacent to the previous
-  // published OCXO target identity.
-  bool     counter_adjacency_last_valid = false;
-  bool     counter_adjacency_last_ok = false;
-  bool     counter_adjacency_last_rejected = false;
-  uint32_t counter_adjacency_last_delta_ticks = 0;
-  uint32_t counter_adjacency_expected_delta_ticks = OCXO_WITNESS_ONE_SECOND_COUNTS;
-  uint32_t counter_adjacency_reject_count = 0;
-
-  // PPS-Yardstick inference rail (Stage 1 -- observational, not authority).
-  // The chain is the inferred OCXO DWT ledger: interval and free-running
-  // endpoint carried in Q16 fixed-point cycles (endpoint modulo 2^48 Q16 ==
-  // 2^32 DWT cycles).  This rail keeps its own previous-observed baseline so
-  // it does not depend on retired predictor internals.
-  bool     yardstick_chain_valid = false;
-  uint64_t yardstick_chain_endpoint_q16 = 0;
-  uint64_t yardstick_chain_interval_q16 = 0;
-  bool     yardstick_last_used_pps_sequence_valid = false;
-  uint32_t yardstick_last_used_pps_sequence = 0;
-  bool     yardstick_prev_observed_valid = false;
-  uint32_t yardstick_prev_observed_dwt = 0;
-
-  uint32_t yardstick_update_count = 0;
-  uint32_t yardstick_seed_count = 0;
-  uint32_t yardstick_stale_hold_count = 0;
-  uint32_t yardstick_gate_agree_count = 0;
-  uint32_t yardstick_gate_excursion_count = 0;
-  uint32_t yardstick_adjacency_reseed_count = 0;
-  uint32_t yardstick_coherent_reseed_count = 0;
-  uint32_t yardstick_excursion_streak = 0;
-  uint32_t yardstick_last_excursion_observed_interval_cycles = 0;
-
-  bool     yardstick_last_valid = false;
-  bool     yardstick_last_stale = false;
-  bool     yardstick_last_excursion = false;
-  uint32_t yardstick_last_g_now_cycles = 0;
-  uint32_t yardstick_last_g_prev_cycles = 0;
-  uint32_t yardstick_last_pps_seq_delta = 0;
-  uint32_t yardstick_last_inferred_interval_cycles = 0;
-  uint32_t yardstick_last_observed_interval_cycles = 0;
-  int32_t  yardstick_last_inferred_minus_observed_cycles = 0;
-  int32_t  yardstick_last_endpoint_minus_observed_cycles = 0;
-
-  // Steady-state audit accumulators (agree seconds only; excursion seconds
-  // are by definition observed-side corruption and would poison the
-  // seed-bias / chain-walk evidence these exist to collect).
-  int32_t  yardstick_endpoint_minus_observed_min_cycles = 0;
-  int32_t  yardstick_endpoint_minus_observed_max_cycles = 0;
-  uint32_t yardstick_max_abs_inferred_minus_observed_cycles = 0;
-  int64_t  yardstick_sum_inferred_minus_observed_cycles = 0;
-
-  // Anchored yardstick witness rail.  Separate Q16 state from the free
-  // chain above: the free chain stays a pure physics audit; the anchored
-  // rail is the PI-corrected zero-worthiness / oven-drift witness.
-  bool     yardstick_auth_valid = false;
-  uint64_t yardstick_auth_endpoint_q16 = 0;
-  uint64_t yardstick_auth_interval_q16 = 0;
-  uint32_t yardstick_auth_publish_count = 0;
-  uint32_t yardstick_auth_agree_publish_count = 0;
-  uint32_t yardstick_auth_excursion_publish_count = 0;
-  uint32_t yardstick_auth_stale_publish_count = 0;
-  uint32_t yardstick_auth_observed_fallback_count = 0;
-  uint32_t yardstick_auth_anchor_correction_count = 0;
-  int32_t  yardstick_auth_last_error_cycles = 0;
-  uint32_t yardstick_auth_last_published_dwt = 0;
-  uint32_t yardstick_auth_fast_lock_remaining_seconds = 0;
-
-  // SmartZero Gen-2 zero-worthiness (Stage A, observational).  Ring of the
-  // last ZERO_WORTHY_STREAK_SECONDS clean-second anchor loop errors; any
-  // unclean second empties the ring.  zw_worthy requires a full ring with a
-  // bounded window sum.
-  int32_t  zw_error_ring[ZERO_WORTHY_STREAK_SECONDS] = {};
-  uint8_t  zw_ring_index = 0;
-  uint8_t  zw_ring_count = 0;
-  int32_t  zw_window_error_sum = 0;
-  uint32_t zw_window_max_abs_error = 0;
-  uint32_t zw_clean_streak_seconds = 0;
-  bool     zw_worthy = false;
-  uint32_t zw_worthy_streak_seconds = 0;
-  uint32_t zw_seconds_evaluated = 0;
-  uint32_t zw_worthy_second_count = 0;
-  uint32_t zw_transition_count = 0;
-  uint32_t zw_first_worthy_after_seconds = 0;  // 0 = never yet worthy
-  const char* zw_last_disqualify_reason = "zw_never_evaluated";
-  uint32_t zw_disqualify_rail_invalid_count = 0;
-  uint32_t zw_disqualify_excursion_count = 0;
-  uint32_t zw_disqualify_stale_count = 0;
-  uint32_t zw_disqualify_seed_count = 0;
-  uint32_t zw_disqualify_adjacency_count = 0;
-  uint32_t zw_disqualify_no_interval_count = 0;
-  uint32_t zw_disqualify_error_magnitude_count = 0;
-  uint32_t zw_disqualify_error_sum_count = 0;
-  uint32_t zw_disqualify_streak_building_count = 0;
-  uint32_t zw_disqualify_fast_lock_count = 0;
-};
-static ocxo_lane_t g_ocxo1_lane;
-static ocxo_lane_t g_ocxo2_lane;
-
-static ocxo_lane_t* ocxo_lane_for(interrupt_subscriber_kind_t kind);
-static inline uint16_t ocxo_lane_counter_now(const ocxo_lane_t& lane);
-static inline uint16_t ocxo_lane_compare_counter_now(const ocxo_lane_t& lane);
-static bool ocxo_lane_program_compare(ocxo_lane_t& lane, uint16_t target_low16);
-static bool ocxo_lane_disable_compare(ocxo_lane_t& lane);
-static bool ocxo_lane_clear_compare_flag(ocxo_lane_t& lane);
-static inline bool ocxo_lane_compare_flag_pending(const ocxo_lane_t& lane);
-static void ocxo_qtimer_diag_record(ocxo_runtime_context_t& ctx,
-                                    uint32_t isr_entry_dwt_raw,
-                                    uint32_t event_dwt,
-                                    uint32_t legacy_late_ticks,
-                                    uint32_t interpreted_late_ticks,
-                                    uint32_t early_ticks,
-                                    int32_t service_offset_signed_ticks,
-                                    uint32_t service_offset_abs_ticks,
-                                    uint32_t target_delta_mod65536_ticks,
-                                    uint16_t target_low16,
-                                    uint16_t isr_counter_low16,
-                                    uint32_t dwt_coordinate_source);
-static bool ocxo_lane_start_local_cadence(interrupt_subscriber_kind_t kind,
-                                          ocxo_lane_t& lane,
-                                          synthetic_clock32_t& clock32,
-                                          uint32_t reason);
-static bool ocxo_lane_start_local_cadence_at_target(interrupt_subscriber_kind_t kind,
-                                                    ocxo_lane_t& lane,
-                                                    synthetic_clock32_t& clock32,
-                                                    uint32_t target_counter32,
-                                                    uint32_t reason);
-static bool ocxo_lane_program_local_cadence_compare(
-    ocxo_lane_t& lane,
-    synthetic_clock32_t& clock32,
-    uint32_t target_counter32,
-    uint32_t reason);
-static void ocxo_lane_stop_local_cadence(ocxo_lane_t& lane, uint32_t reason);
-static void ocxo_lane_counter_adjacency_reset(ocxo_lane_t& lane);
-static void ocxo_lane_yardstick_reset(ocxo_lane_t& lane);
-static void ocxo_lane_event_lineage_reset(ocxo_lane_t& lane);
-static void ocxo_lane_measurement_witness_reset(ocxo_lane_t& lane);
-static void ocxo_lane_install_hardware_synthetic_mapping(ocxo_lane_t& lane,
-                                                        synthetic_clock32_t& clock32,
-                                                        uint32_t epoch_counter32);
-static void ocxo_lane_install_logical_grid(interrupt_subscriber_kind_t kind,
-                                           ocxo_lane_t& lane,
-                                           synthetic_clock32_t& clock32,
-                                           uint32_t epoch_counter32,
-                                           uint32_t reason);
-
-// ============================================================================
-// QTimer1 CH0 low-word counter
-// ============================================================================
-//
-// CH0 is the only VCLOCK hardware counter used by process_interrupt now.
-// CH1 is deliberately not cascaded; it remains free for a future dedicated
-// VCLOCK-domain compare rail.  Any public 32-bit VCLOCK identity is synthetic
-// and authored below.
-
-static inline uint16_t qtimer1_ch0_counter_now(void) {
-  return IMXRT_TMR1.CH[0].CNTR;
-}
-
-// ============================================================================
-// Private synthetic 32-bit clock identities
-// ============================================================================
-//
-// Each QTimer-derived clock domain has a private process_interrupt-owned
-// synthetic 32-bit identity.  The public contract is simple: subscribers get
-// counter32_at_event only in the interrupt event payload.  They do not read
-// timer hardware, and they do not author counter identities themselves.
-//
-// For VCLOCK, the synthetic identity is mapped to QTimer1 CH0's 16-bit
-// hardware counter by a low-word anchor established at an exact edge.  CH1 is
-// no longer cascaded.  TimePop schedules by synthetic deadlines while
-// process_interrupt alone translates those deadlines into low-word hardware
-// compare values.  For OCXO lanes, the synthetic identity is advanced by the
-// exact 10 MHz tick interval of the process_interrupt-owned cadence.
-
-struct synthetic_clock32_t {
-  bool     zeroed = false;
-  uint64_t zero_ns = 0;
-  uint32_t zero_counter32 = 0;
-  uint32_t current_counter32 = 0;
-  uint64_t current_ns = 0;
-  uint16_t hardware16 = 0;
-  uint32_t zero_count = 0;
-  uint32_t minder_update_count = 0;
-
-  bool     pending_zero = false;
-  uint64_t pending_zero_ns = 0;
-  uint32_t pending_zero_counter32 = 0;
-  uint32_t pending_zero_count = 0;
-};
-
-struct vclock_synthetic_clock32_t : synthetic_clock32_t {
-  uint16_t hardware_low16_at_zero = 0;
-  uint16_t hardware_low16_at_current = 0;
-  bool     hardware_anchor_valid = false;
-  uint32_t hardware_anchor_update_count = 0;
-};
-
-static vclock_synthetic_clock32_t g_vclock_clock32;
-static synthetic_clock32_t        g_ocxo1_clock32;
-static synthetic_clock32_t        g_ocxo2_clock32;
-
-// OCXO pending-zero retirement audit.  OCXO timing identity is now authored
-// only by explicit zero/grid installation and by the priority-0 compare
-// ladder.  request_zero remains a VCLOCK/PPS asynchronous mechanism; OCXO
-// request_zero calls are acknowledged as retired no-ops and counted here.
-static uint32_t g_ocxo1_pending_zero_request_retired_count = 0;
-static uint32_t g_ocxo2_pending_zero_request_retired_count = 0;
-static uint32_t g_ocxo_pending_zero_request_retired_count = 0;
-static uint32_t g_ocxo_pending_zero_request_last_counter32 = 0;
-static interrupt_subscriber_kind_t g_ocxo_pending_zero_request_last_kind =
-    interrupt_subscriber_kind_t::NONE;
-
-static volatile uint32_t g_qtimer1_ch1_sequence = 0;
-static volatile uint32_t g_qtimer1_ch1_target_counter32 = 0;
-static volatile uint32_t g_qtimer1_ch1_next_compare_counter32 = 0;
-static volatile uint32_t g_qtimer1_ch1_arm_count = 0;
-static volatile uint32_t g_qtimer1_ch1_fire_count = 0;
-static volatile uint32_t g_qtimer1_ch1_hop_count = 0;
-static volatile bool     g_qtimer1_ch1_active = false;
-static volatile interrupt_qtimer1_ch1_handler_fn g_qtimer1_ch1_handler = nullptr;
-
-static volatile uint32_t g_qtimer1_ch2_last_target_counter32 = 0;
-static volatile uint32_t g_qtimer1_ch2_arm_count = 0;
-
-struct ocxo_qtimer_diag_t {
-  volatile uint32_t count = 0;
-  volatile uint32_t late_ticks = 0;  // legacy raw modular delta
-  volatile uint32_t interpreted_late_ticks = 0;
-  volatile uint32_t early_ticks = 0;
-  volatile int32_t  service_offset_signed_ticks = 0;
-  volatile uint32_t service_offset_abs_ticks = 0;
-  volatile uint32_t target_delta_mod65536_ticks = 0;
-  volatile uint16_t target_low16 = 0;
-  volatile uint16_t isr_counter_low16 = 0;
-  volatile uint32_t dwt_raw = 0;
-  volatile uint32_t event_dwt = 0;
-  volatile uint32_t dwt_coordinate_source = OCXO_DWT_SOURCE_NONE;
-};
-
-static ocxo_qtimer_diag_t g_ocxo1_qtimer_diag = {};
-static ocxo_qtimer_diag_t g_ocxo2_qtimer_diag = {};
-
-struct ocxo_runtime_context_t {
-  interrupt_subscriber_kind_t kind = interrupt_subscriber_kind_t::NONE;
-  interrupt_provider_kind_t provider = interrupt_provider_kind_t::NONE;
-  interrupt_lane_t lane_id = interrupt_lane_t::NONE;
-  const char* name = nullptr;
-  const char* prefix = nullptr;
-  const char* cadence_source = nullptr;
-  const char* counter_source = nullptr;
-  const char* dwt_authority = nullptr;
-  const char* fact_drain_name = nullptr;
-  ocxo_lane_t* lane = nullptr;
-  synthetic_clock32_t* clock32 = nullptr;
-  interrupt_subscriber_runtime_t** rt_slot = nullptr;
-  ocxo_qtimer_diag_t* qtimer_diag = nullptr;
-};
-
-static ocxo_runtime_context_t g_ocxo1_ctx = {
-  interrupt_subscriber_kind_t::OCXO1,
-  interrupt_provider_kind_t::QTIMER2,
-  interrupt_lane_t::QTIMER2_CH0_COMP,
-  "OCXO1",
-  "ocxo1",
-  "QTIMER2_CH0_ISR_1KHZ_LADDER_PIN13",
-  "QTIMER2_CH0_LOCAL_SYNTHETIC_COUNTER32",
-  "QTIMER2_CH0_LATENCY_ADJUSTED_OBSERVED_DWT",
-  "OCXO1_FACT_DRAIN",
-  &g_ocxo1_lane,
-  &g_ocxo1_clock32,
-  &g_rt_ocxo1,
-  &g_ocxo1_qtimer_diag,
-};
-
-static ocxo_runtime_context_t g_ocxo2_ctx = {
-  interrupt_subscriber_kind_t::OCXO2,
-  interrupt_provider_kind_t::QTIMER3,
-  interrupt_lane_t::QTIMER3_CH3_COMP,
-  "OCXO2",
-  "ocxo2",
-  "QTIMER3_CH3_ISR_1KHZ_LADDER_PIN15",
-  "QTIMER3_CH3_LOCAL_SYNTHETIC_COUNTER32_PIN15",
-  "QTIMER3_CH3_LATENCY_ADJUSTED_OBSERVED_DWT",
-  "OCXO2_FACT_DRAIN",
-  &g_ocxo2_lane,
-  &g_ocxo2_clock32,
-  &g_rt_ocxo2,
-  &g_ocxo2_qtimer_diag,
-};
-
-static ocxo_runtime_context_t* ocxo_context_for(interrupt_subscriber_kind_t kind) {
-  if (kind == interrupt_subscriber_kind_t::OCXO1) return &g_ocxo1_ctx;
-  if (kind == interrupt_subscriber_kind_t::OCXO2) return &g_ocxo2_ctx;
-  return nullptr;
-}
-
-static bool ocxo_kind_disabled(interrupt_subscriber_kind_t kind) {
-  if (kind == interrupt_subscriber_kind_t::OCXO1) return OCXO1_DISABLED;
-  if (kind == interrupt_subscriber_kind_t::OCXO2) return OCXO2_DISABLED;
-  return false;
-}
-
-static interrupt_subscriber_runtime_t* ocxo_runtime_for(const ocxo_runtime_context_t& ctx) {
-  return ctx.rt_slot ? *ctx.rt_slot : nullptr;
-}
-
-static volatile bool     g_vclock_heartbeat_armed = false;
-static volatile uint32_t g_vclock_heartbeat_next_counter32 = 0;
-static volatile uint32_t g_vclock_heartbeat_arm_count = 0;
-static volatile uint32_t g_vclock_heartbeat_arm_failures = 0;
-static volatile uint32_t g_vclock_heartbeat_fire_count = 0;
-static volatile uint32_t g_vclock_heartbeat_vclock_ticks = 0;
-static volatile uint32_t g_vclock_heartbeat_ocxo1_rollover_updates_retired = 0;
-static volatile uint32_t g_vclock_heartbeat_ocxo2_rollover_updates_retired = 0;
-static volatile uint16_t g_vclock_heartbeat_last_vclock_hw16 = 0;
-static volatile uint16_t g_vclock_heartbeat_last_ocxo1_hw16_retired = 0;
-static volatile uint16_t g_vclock_heartbeat_last_ocxo2_hw16_retired = 0;
-static volatile uint32_t g_vclock_heartbeat_last_vclock_counter32 = 0;
-static volatile uint32_t g_vclock_heartbeat_last_ocxo1_counter32_retired = 0;
-static volatile uint32_t g_vclock_heartbeat_last_ocxo2_counter32_retired = 0;
-
-// Passive CH2 rollover tend — VCLOCK only.
-//
-// OCXO ambient rollover minding is retired.  OCXO 32-bit identity advances
-// only in the OCXO compare ISR from the armed target that actually matched.
-// This helper remains only for the VCLOCK synthetic layer while TimePop uses
-// the scheduler rail.
-static constexpr bool     CH2_IMPLICIT_ROLLOVER_ENABLED = true;
-static volatile uint32_t g_ch2_implicit_rollover_count = 0;
-static volatile uint32_t g_ch2_implicit_rollover_vclock_updates = 0;
-static volatile uint32_t g_ch2_implicit_rollover_ocxo1_updates = 0;
-static volatile uint32_t g_ch2_implicit_rollover_ocxo2_updates = 0;
-static volatile uint16_t g_ch2_implicit_rollover_last_vclock_hw16 = 0;
-static volatile uint16_t g_ch2_implicit_rollover_last_ocxo1_hw16 = 0;
-static volatile uint16_t g_ch2_implicit_rollover_last_ocxo2_hw16 = 0;
-static volatile uint32_t g_ch2_implicit_rollover_last_vclock_counter32 = 0;
-static volatile uint32_t g_ch2_implicit_rollover_last_ocxo1_counter32 = 0;
-static volatile uint32_t g_ch2_implicit_rollover_last_ocxo2_counter32 = 0;
-
-// Intrinsic CH2 VCLOCK one-second handoff.
-//
-// CH2 owns VCLOCK one-second fact authorship, but the first post-epoch target
-// is deliberately seeded on the legacy heartbeat-compatible grid.  The prior
-// attempt to seed the first target directly at selected_epoch + 10,000,000
-// changed the first public bookend phase and destabilized the command path.
-// This version migrates first-bookend publication to CH2 while preserving the
-// old first-bookend identity; after that CH2 advances by exact +10,000,000
-// gear teeth as before.
-static volatile bool     g_vclock_ch2_one_second_enabled = false;
-static volatile uint32_t g_vclock_ch2_one_second_next_counter32 = 0;
-static volatile uint32_t g_vclock_ch2_one_second_enable_count = 0;
-static volatile uint32_t g_vclock_ch2_one_second_reset_count = 0;
-static volatile uint32_t g_vclock_ch2_one_second_service_count = 0;
-static volatile uint32_t g_vclock_ch2_one_second_enqueue_count = 0;
-static volatile uint32_t g_vclock_ch2_one_second_late_count = 0;
-static volatile uint32_t g_vclock_ch2_one_second_late_max_ticks = 0;
-static volatile uint32_t g_vclock_ch2_one_second_catchup_count = 0;
-static volatile uint32_t g_vclock_ch2_one_second_drop_count = 0;
-static volatile uint32_t g_vclock_ch2_one_second_last_target_counter32 = 0;
-static volatile uint32_t g_vclock_ch2_one_second_last_service_counter32 = 0;
-static volatile uint32_t g_vclock_ch2_one_second_last_dwt = 0;
-static volatile uint32_t g_vclock_ch2_one_second_epoch_enable_count = 0;
-static volatile uint32_t g_vclock_ch2_one_second_epoch_base_counter32 = 0;
-static volatile uint32_t g_vclock_ch2_one_second_epoch_service_counter32 = 0;
-static volatile uint32_t g_vclock_ch2_one_second_epoch_target_counter32 = 0;
-static volatile uint32_t g_vclock_ch2_one_second_epoch_tick_mod_seed = 0;
-static volatile uint32_t g_vclock_ch2_one_second_epoch_remaining_cells = 0;
-static volatile uint32_t g_vclock_ch2_one_second_epoch_residual_ticks = 0;
-static volatile uint32_t g_vclock_ch2_one_second_heartbeat_enable_count = 0;
-static volatile uint32_t g_vclock_heartbeat_one_second_legacy_count = 0;
-static volatile uint32_t g_vclock_heartbeat_one_second_handoff_skip_count = 0;
-static volatile uint32_t g_vclock_heartbeat_one_second_fallback_count = 0;
-
-// Intrinsic CH2 VCLOCK SmartZero sampling.
-//
-// SmartZero needs adjacent +10,000-tick VCLOCK samples. CH2 fires for the
-// TimePop rail, not exclusively for a 1 kHz heartbeat, so this surface is a
-// fixed-grid sampler rather than an every-CH2-fire sampler. The first CH2
-// event while SmartZero owns VCLOCK seeds the grid; subsequent samples are
-// authored at exact +10,000 counter identities and DWT is back-projected if
-// the CH2 service event is slightly late.
-static constexpr bool     VCLOCK_CH2_SMARTZERO_NATIVE_ENABLED = true;
-static volatile bool     g_vclock_ch2_smartzero_seeded = false;
-static volatile uint32_t g_vclock_ch2_smartzero_next_counter32 = 0;
-static volatile uint32_t g_vclock_ch2_smartzero_reset_count = 0;
-static volatile uint32_t g_vclock_ch2_smartzero_seed_count = 0;
-static volatile uint32_t g_vclock_ch2_smartzero_deactivate_count = 0;
-static volatile uint32_t g_vclock_ch2_smartzero_service_count = 0;
-static volatile uint32_t g_vclock_ch2_smartzero_transaction_skip_count = 0;
-static volatile uint32_t g_vclock_ch2_smartzero_feed_count = 0;
-static volatile uint32_t g_vclock_ch2_smartzero_late_count = 0;
-static volatile uint32_t g_vclock_ch2_smartzero_late_max_ticks = 0;
-static volatile uint32_t g_vclock_ch2_smartzero_resync_count = 0;
-static volatile uint32_t g_vclock_ch2_smartzero_drop_count = 0;
-static volatile uint32_t g_vclock_ch2_smartzero_waiting_for_cps_count = 0;
-static volatile uint32_t g_vclock_ch2_smartzero_first_sample_count = 0;
-static volatile uint32_t g_vclock_ch2_smartzero_accepted_count = 0;
-static volatile uint32_t g_vclock_ch2_smartzero_rejected_dwt_count = 0;
-static volatile uint32_t g_vclock_ch2_smartzero_rejected_counter_count = 0;
-static volatile uint32_t g_vclock_ch2_smartzero_last_target_counter32 = 0;
-static volatile uint32_t g_vclock_ch2_smartzero_last_service_counter32 = 0;
-static volatile uint32_t g_vclock_ch2_smartzero_last_dwt = 0;
-static volatile uint32_t g_vclock_ch2_smartzero_last_late_ticks = 0;
-static volatile uint32_t g_vclock_heartbeat_smartzero_authority_retired_count = 0;
-
-// Native VCLOCK fact-drain arming.
-//
-// QTimer1 CH0 now authors steady-state VCLOCK one-second facts.  The perishable
-// fact still drains through the safe TimePop ASAP path, but the arm decision no
-// longer waits for the scheduler rail.
-static volatile uint32_t g_vclock_ch2_fact_drain_service_count = 0;
-static volatile uint32_t g_vclock_ch2_fact_drain_arm_count = 0;
-static volatile uint32_t g_vclock_heartbeat_fact_drain_authority_retired_count = 0;
-
-static inline uint32_t clock32_from_ns(uint64_t ns) {
-  return (uint32_t)((ns / 100ULL) & 0xFFFFFFFFULL);
-}
-
-uint32_t interrupt_clock32_from_ns(uint64_t ns) {
-  return clock32_from_ns(ns);
-}
-
-static synthetic_clock32_t* synthetic_clock_for_kind(interrupt_subscriber_kind_t kind) {
-  ocxo_runtime_context_t* ctx = ocxo_context_for(kind);
-  return ctx ? ctx->clock32 : nullptr;
-}
-
-static void synthetic_clock_zero(synthetic_clock32_t& c, uint64_t ns) {
-  c.zeroed = true;
-  c.zero_ns = ns;
-  c.zero_counter32 = clock32_from_ns(ns);
-  c.current_counter32 = c.zero_counter32;
-  c.current_ns = ns;
-  c.hardware16 = (uint16_t)c.current_counter32;
-  c.zero_count++;
-  c.pending_zero = false;
-}
-
-static void vclock_clock_anchor_hardware_low16(uint32_t synthetic_counter32,
-                                                 uint16_t hardware_low16) {
-  g_vclock_clock32.current_counter32 = synthetic_counter32;
-  g_vclock_clock32.current_ns = (uint64_t)synthetic_counter32 * 100ULL;
-  g_vclock_clock32.hardware16 = hardware_low16;
-  g_vclock_clock32.hardware_low16_at_current = hardware_low16;
-  g_vclock_clock32.hardware_anchor_valid = true;
-  g_vclock_clock32.hardware_anchor_update_count++;
-}
-
-static void vclock_clock_zero_at_hardware_low16(uint64_t ns,
-                                                uint16_t hardware_low16) {
-  g_vclock_clock32.zeroed = true;
-  g_vclock_clock32.zero_ns = ns;
-  g_vclock_clock32.zero_counter32 = clock32_from_ns(ns);
-  g_vclock_clock32.hardware_low16_at_zero = hardware_low16;
-  g_vclock_clock32.zero_count++;
-  g_vclock_clock32.pending_zero = false;
-  vclock_clock_anchor_hardware_low16(g_vclock_clock32.zero_counter32,
-                                     hardware_low16);
-}
-
-static void synthetic_clock_bootstrap_from_hw16(synthetic_clock32_t& c, uint16_t hardware16);
-static void vclock_clock_bootstrap_from_hw16(uint16_t hardware16);
-static uint32_t project_counter32_from_hw16(const synthetic_clock32_t& c, uint16_t hardware16);
-static inline void synthetic_clock_consume_pending_zero_if_any(synthetic_clock32_t& c);
-static void cadence_regression_reset_kind(interrupt_subscriber_kind_t kind);
-static void vclock_fact_ring_reset(void);
-static void vclock_ch2_one_second_disable(void);
-static void vclock_ch2_one_second_enable_after_heartbeat(uint32_t last_counter32);
-static void vclock_ch2_one_second_enable_from_epoch_legacy_grid(
-    uint32_t selected_counter32,
-    uint32_t service_counter32,
-    uint32_t tick_mod_seed);
-struct vclock_one_second_bookend_t;
-static bool vclock_ch2_one_second_service(
-    const vclock_one_second_bookend_t& bookend);
-static void vclock_ch2_smartzero_reset_attempt_state(void);
-static void vclock_ch2_smartzero_deactivate(void);
-static void vclock_ch2_smartzero_service(uint32_t qtimer_event_dwt,
-                                         uint32_t service_counter32);
-
-static void interrupt_handoff_configure(void);
-static void interrupt_handoff_request_from_capture_isr(const char* context);
-static void interrupt_handoff_service_isr(void);
-
-static uint32_t vclock_synthetic_from_hardware_low16(uint16_t hardware_low16) {
-  if (!g_vclock_clock32.zeroed) return (uint32_t)hardware_low16;
-
-  if (g_vclock_clock32.hardware_anchor_valid) {
-    return g_vclock_clock32.current_counter32 +
-           (uint32_t)((uint16_t)(hardware_low16 -
-                                g_vclock_clock32.hardware_low16_at_current));
-  }
-
-  return g_vclock_clock32.zero_counter32 +
-         (uint32_t)((uint16_t)(hardware_low16 -
-                              g_vclock_clock32.hardware_low16_at_zero));
-}
-
-static uint16_t vclock_hardware_low16_from_synthetic(uint32_t synthetic_counter32) {
-  if (!g_vclock_clock32.zeroed) return (uint16_t)(synthetic_counter32 & 0xFFFFU);
-
-  return (uint16_t)(g_vclock_clock32.hardware_low16_at_zero +
-                   (uint16_t)(synthetic_counter32 -
-                              g_vclock_clock32.zero_counter32));
-}
-
-bool interrupt_clock32_zero_from_ns(interrupt_subscriber_kind_t kind, uint64_t ns) {
-  if (kind == interrupt_subscriber_kind_t::VCLOCK) {
-    vclock_clock_zero_at_hardware_low16(ns, qtimer1_ch0_counter_now());
-    g_vclock_lane.logical_count32_at_last_second = g_vclock_clock32.current_counter32;
-    vclock_ch2_one_second_disable();
-    cadence_regression_reset_kind(interrupt_subscriber_kind_t::VCLOCK);
-    vclock_fact_ring_reset();
-    return true;
-  }
-
-  synthetic_clock32_t* c = synthetic_clock_for_kind(kind);
-  if (!c) return false;
-  synthetic_clock_zero(*c, ns);
-
-  ocxo_lane_t* lane = ocxo_lane_for(kind);
-  if (lane) {
-    lane->logical_count32_at_last_second = c->current_counter32;
-    lane->tick_mod_1000 = 0;
-    ocxo_lane_install_logical_grid(kind, *lane, *c, c->zero_counter32,
-                                   OCXO_CADENCE_REASON_LOGICAL_ZERO);
-  }
-  return true;
-}
-
-bool interrupt_clock32_request_zero_from_ns(interrupt_subscriber_kind_t kind, uint64_t ns) {
-  const uint32_t counter32 = clock32_from_ns(ns);
-
-  if (kind == interrupt_subscriber_kind_t::VCLOCK) {
-    g_vclock_clock32.pending_zero = true;
-    g_vclock_clock32.pending_zero_ns = ns;
-    g_vclock_clock32.pending_zero_counter32 = counter32;
-    g_vclock_clock32.pending_zero_count++;
-    vclock_ch2_one_second_disable();
-    cadence_regression_reset_kind(interrupt_subscriber_kind_t::VCLOCK);
-    vclock_fact_ring_reset();
-    return true;
-  }
-
-  if (kind == interrupt_subscriber_kind_t::OCXO1 ||
-      kind == interrupt_subscriber_kind_t::OCXO2) {
-    synthetic_clock32_t* c = synthetic_clock_for_kind(kind);
-    if (!c) return false;
-
-    // Retired by doctrine: OCXO request-zero is intentionally not deferred.
-    // A deferred zero would be consumed later by synthetic_clock advancement,
-    // outside the same coherent transaction that reauthors current_counter32,
-    // hardware16, cadence_epoch_counter32, cadence_next_counter32, and
-    // tick_mod_1000.  OCXO zero/epoch changes must use the explicit
-    // interrupt_clock32_zero_from_ns() / interrupt_ocxo_logical_grid_epoch()
-    // paths instead.  Clear any stale pending bit defensively, but do not
-    // increment c->pending_zero_count; that field should remain zero for OCXO.
-    c->pending_zero = false;
-    c->pending_zero_ns = 0;
-    c->pending_zero_counter32 = 0;
-
-    g_ocxo_pending_zero_request_retired_count++;
-    g_ocxo_pending_zero_request_last_kind = kind;
-    g_ocxo_pending_zero_request_last_counter32 = counter32;
-    if (kind == interrupt_subscriber_kind_t::OCXO1) {
-      g_ocxo1_pending_zero_request_retired_count++;
-    } else {
-      g_ocxo2_pending_zero_request_retired_count++;
-    }
-
-    // Acknowledge the command contract while doing no deferred mutation.
-    return true;
-  }
-
-  return false;
-}
-
-void interrupt_ocxo_logical_grid_epoch(uint32_t ocxo1_epoch_counter32,
-                                       uint32_t ocxo2_epoch_counter32) {
-  if (!OCXO1_DISABLED && g_ocxo1_lane.initialized) {
-    ocxo_lane_install_logical_grid(interrupt_subscriber_kind_t::OCXO1,
-                                   g_ocxo1_lane,
-                                   g_ocxo1_clock32,
-                                   ocxo1_epoch_counter32,
-                                   OCXO_CADENCE_REASON_LOGICAL_GRID);
-  }
-
-  if (!OCXO2_DISABLED && g_ocxo2_lane.initialized) {
-    ocxo_lane_install_logical_grid(interrupt_subscriber_kind_t::OCXO2,
-                                   g_ocxo2_lane,
-                                   g_ocxo2_clock32,
-                                   ocxo2_epoch_counter32,
-                                   OCXO_CADENCE_REASON_LOGICAL_GRID);
-  }
-}
-
-static inline void synthetic_clock_consume_pending_zero_if_any(synthetic_clock32_t& c) {
-  if (!c.pending_zero) return;
-  synthetic_clock_zero(c, c.pending_zero_ns);
-}
-
-static inline uint32_t synthetic_clock_advance_at_hardware(synthetic_clock32_t& c,
-                                                           uint32_t ticks,
-                                                           uint16_t hardware16_at_event) {
-  synthetic_clock_consume_pending_zero_if_any(c);
-  c.current_counter32 += ticks;
-  c.current_ns += (uint64_t)ticks * 100ULL;
-  c.hardware16 = hardware16_at_event;
-  return c.current_counter32;
-}
-
-uint32_t interrupt_qtimer1_counter32_now(void)   { return vclock_synthetic_from_hardware_low16(qtimer1_ch0_counter_now()); }
-uint16_t interrupt_qtimer2_ch0_counter_now(void) {
-  return OCXO1_DISABLED ? 0U : IMXRT_TMR2.CH[QTIMER_CLOCK_COUNTER_CH].CNTR;
-}
-uint16_t interrupt_qtimer3_ch0_counter_now(void) {
-  return OCXO2_DISABLED ? 0U : IMXRT_TMR3.CH[QTIMER_CLOCK_COUNTER_CH].CNTR;
-}
-uint16_t interrupt_qtimer3_ch3_counter_now(void) {
-  // OCXO2 physical adapter: pin 15 is QTimer3 TIMER3.
-  return OCXO2_DISABLED ? 0U : IMXRT_TMR3.CH[QTIMER3_OCXO2_CH].CNTR;
-}
-
-static inline uint32_t cadence_mod_for_ticks(uint32_t ticks, uint32_t interval) {
-  if (interval == 0) return 0;
-  return (ticks / interval) % TICKS_PER_SECOND_EVENT;
-}
-
-static uint32_t project_counter32_from_hw16(const synthetic_clock32_t& c,
-                                            uint16_t hardware16) {
-  // Boot-safety rule: before a lane has been explicitly born/zeroed, raw
-  // hardware low-word observations are still safe diagnostic coordinates.
-  // Do not project from an uninitialized synthetic anchor.  This preserves
-  // the old pre-epoch behavior and keeps early PPS/REPORT paths harmless.
-  if (!c.zeroed) return (uint32_t)hardware16;
-
-  return c.current_counter32 + (uint32_t)((uint16_t)(hardware16 - c.hardware16));
-}
-
-static uint64_t project_ns64_from_hw16(const synthetic_clock32_t& c,
-                                       uint16_t hardware16) {
-  // Same boot-safety rule as COUNT32 projection.  This value is not global
-  // truth before ZERO; it is only a harmless local low-word-derived surface.
-  if (!c.zeroed) return (uint64_t)hardware16 * 100ULL;
-
-  const uint32_t delta = (uint32_t)((uint16_t)(hardware16 - c.hardware16));
-  return c.current_ns + (uint64_t)delta * 100ULL;
-}
-
-static void synthetic_clock_bootstrap_from_hw16(synthetic_clock32_t& c,
-                                                uint16_t hardware16) {
-  // This is not a user ZERO.  It merely gives the synthetic extender a
-  // coherent birth anchor so early ISR/report paths never project from an
-  // all-zero default object.
-  c.zeroed = true;
-  c.zero_ns = (uint64_t)hardware16 * 100ULL;
-  c.zero_counter32 = (uint32_t)hardware16;
-  c.current_counter32 = (uint32_t)hardware16;
-  c.current_ns = (uint64_t)hardware16 * 100ULL;
-  c.hardware16 = hardware16;
-  c.pending_zero = false;
-}
-
-static void vclock_clock_bootstrap_from_hw16(uint16_t hardware16) {
-  // Birth the VCLOCK synthetic layer without declaring a logical ZERO.  The
-  // PPS/VCLOCK rebootstrap and CLOCKS.ZERO paths may later install the real
-  // coordinate origin, but the interrupt layer is safe immediately after IRQs
-  // go live.
-  g_vclock_clock32.zeroed = true;
-  g_vclock_clock32.zero_ns = (uint64_t)hardware16 * 100ULL;
-  g_vclock_clock32.zero_counter32 = (uint32_t)hardware16;
-  g_vclock_clock32.hardware_low16_at_zero = hardware16;
-  g_vclock_clock32.pending_zero = false;
-  vclock_clock_anchor_hardware_low16((uint32_t)hardware16, hardware16);
-  g_vclock_lane.logical_count32_at_last_second = (uint32_t)hardware16;
-}
-
-static void vclock_clock_tend_from_hardware_low16(uint16_t hardware_low16) {
-  if (!g_vclock_clock32.zeroed) {
-    vclock_clock_bootstrap_from_hw16(hardware_low16);
-    return;
-  }
-
-  const uint32_t counter32 = vclock_synthetic_from_hardware_low16(hardware_low16);
-  vclock_clock_anchor_hardware_low16(counter32, hardware_low16);
-  g_vclock_clock32.minder_update_count++;
-}
-
-
-
-
-static void interrupt_ch2_implicit_rollover_tend(void) {
-  if (!CH2_IMPLICIT_ROLLOVER_ENABLED || !g_interrupt_hw_ready) return;
-
-  g_ch2_implicit_rollover_count++;
-
-  // VCLOCK still has a synthetic CH0 layer used by TimePop scheduling.
-  // OCXO rollover authority is deliberately absent here: OCXO high-word
-  // identity is advanced only by the OCXO compare ISR from the armed target.
-  const uint16_t vclock_hw16 = qtimer1_ch0_counter_now();
-  vclock_clock_tend_from_hardware_low16(vclock_hw16);
-  g_ch2_implicit_rollover_vclock_updates++;
-  g_ch2_implicit_rollover_last_vclock_hw16 = vclock_hw16;
-  g_ch2_implicit_rollover_last_vclock_counter32 =
-      g_vclock_clock32.current_counter32;
-}
-
-
-bool interrupt_clock_snapshot(interrupt_subscriber_kind_t kind, interrupt_clock_snapshot_t* out) {
-  if (!out) return false;
-
-  if (kind == interrupt_subscriber_kind_t::VCLOCK) {
-    const uint16_t hw = qtimer1_ch0_counter_now();
-    out->hardware16 = hw;
-    out->counter32 = vclock_synthetic_from_hardware_low16(hw);
-    out->ns64 = project_ns64_from_hw16(g_vclock_clock32, hw);
-    return true;
-  }
-
-  if (kind == interrupt_subscriber_kind_t::OCXO1) {
-    if (OCXO1_DISABLED) return false;
-    const uint16_t hw = IMXRT_TMR2.CH[QTIMER_CLOCK_COUNTER_CH].CNTR;
-    out->hardware16 = hw;
-    out->counter32 = g_ocxo1_clock32.current_counter32;
-    out->ns64 = g_ocxo1_clock32.current_ns;
-    return true;
-  }
-
-  if (kind == interrupt_subscriber_kind_t::OCXO2) {
-    if (OCXO2_DISABLED) return false;
-    const uint16_t hw = IMXRT_TMR3.CH[g_ocxo2_lane.counter_channel].CNTR;
-    out->hardware16 = hw;
-    out->counter32 = g_ocxo2_clock32.current_counter32;
-    out->ns64 = g_ocxo2_clock32.current_ns;
-    return true;
-  }
-
-  return false;
-}
-
-
-// ============================================================================
-// SmartZero(R) — mathematically-qualified logical zero acquisition
-// ============================================================================
-//
-// The old epoch packet trusted a latency-adjusted ISR capture. SmartZero does
-// not.  It observes consecutive 1 kHz edge captures and accepts a lane only
-// when the DWT interval matches the current PPS/GPIO-derived cycles-per-second
-// ruler within a tight cycle window.  The later edge of the accepted pair is
-// the lane's canonical zero anchor.  Acquisition is strictly serial:
-// VCLOCK -> OCXO1 -> OCXO2.
-
-static constexpr uint32_t SMARTZERO_INTERVAL_TICKS = SMARTZERO_COUNTER_DELTA_TICKS;
-static constexpr int32_t  SMARTZERO_INTERVAL_TOLERANCE_CYCLES =
-    SMARTZERO_DEFAULT_TOLERANCE_CYCLES;
-
-struct smartzero_lane_runtime_t {
-  interrupt_smartzero_lane_snapshot_t pub{};
-  bool previous_present = false;
-};
-
-struct smartzero_runtime_t {
-  volatile uint32_t seq = 0;
-  interrupt_smartzero_phase_t phase = interrupt_smartzero_phase_t::IDLE;
-  bool running = false;
-  bool complete = false;
-  uint32_t sequence = 0;
-  uint32_t begin_count = 0;
-  uint32_t complete_count = 0;
-  uint32_t abort_count = 0;
-  uint32_t current_lane_index = 0;
-  smartzero_lane_runtime_t lanes[SMARTZERO_LANE_COUNT];
-};
-
-static smartzero_runtime_t g_smartzero = {};
-
-static interrupt_subscriber_kind_t smartzero_kind_for_index(uint32_t index) {
-  switch (index) {
-    case 0: return interrupt_subscriber_kind_t::VCLOCK;
-    case 1: return interrupt_subscriber_kind_t::OCXO1;
-    case 2: return interrupt_subscriber_kind_t::OCXO2;
-    default: return interrupt_subscriber_kind_t::NONE;
-  }
-}
-
-static int smartzero_index_for_kind(interrupt_subscriber_kind_t kind) {
-  if (kind == interrupt_subscriber_kind_t::VCLOCK) return 0;
-  if (kind == interrupt_subscriber_kind_t::OCXO1)  return 1;
-  if (kind == interrupt_subscriber_kind_t::OCXO2)  return 2;
-  return -1;
-}
-
-static bool smartzero_lane_enabled(uint32_t index) {
-  const interrupt_subscriber_kind_t kind = smartzero_kind_for_index(index);
-  if (kind == interrupt_subscriber_kind_t::VCLOCK) return true;
-  return !ocxo_kind_disabled(kind);
-}
-
-static bool smartzero_find_next_enabled_lane(uint32_t start_index,
-                                             uint32_t* out_index) {
-  for (uint32_t i = start_index; i < SMARTZERO_LANE_COUNT; i++) {
-    if (smartzero_lane_enabled(i)) {
-      if (out_index) *out_index = i;
-      return true;
-    }
-  }
-  return false;
-}
-
-static void smartzero_install_disabled_surrogate_locked(uint32_t index) {
-  if (index == 0 || index >= SMARTZERO_LANE_COUNT) return;
-  if (smartzero_lane_enabled(index)) return;
-
-  // VCLOCK is never disabled and must already be locked before SmartZero can
-  // complete.  Use it as the neutral synthetic proof source for disabled OCXO
-  // lanes.  Disabled lanes never publish events; this is only an epoch-gate
-  // compatibility proof for Alpha's existing three-lane invariant.
-  const interrupt_smartzero_lane_snapshot_t& src = g_smartzero.lanes[0].pub;
-  smartzero_lane_runtime_t& dst_runtime = g_smartzero.lanes[index];
-  interrupt_smartzero_lane_snapshot_t& dst = dst_runtime.pub;
-
-  dst_runtime.previous_present = false;
-  dst.kind = smartzero_kind_for_index(index);
-  dst.state = interrupt_smartzero_lane_state_t::LOCKED;
-  dst.last_decision = interrupt_smartzero_decision_t::ACCEPTED;
-  dst.sample_count = 0;
-  dst.interval_attempt_count = 0;
-  dst.accepted_count = 1;
-  dst.rejected_count = 0;
-  dst.waiting_for_cps_count = 0;
-  dst.expected_interval_cycles = src.expected_interval_cycles;
-  dst.tolerance_cycles = SMARTZERO_INTERVAL_TOLERANCE_CYCLES;
-  dst.required_counter_delta_ticks = SMARTZERO_INTERVAL_TICKS;
-  dst.cps_used = src.cps_used;
-  dst.last_sample_dwt = src.last_sample_dwt;
-  dst.last_sample_counter32 = src.last_sample_counter32;
-  dst.last_sample_hardware16 = src.last_sample_hardware16;
-  dst.previous_sample_dwt = src.previous_sample_dwt;
-  dst.previous_sample_counter32 = src.previous_sample_counter32;
-  dst.previous_sample_hardware16 = src.previous_sample_hardware16;
-  dst.last_interval_cycles = src.last_interval_cycles;
-  dst.last_interval_error_cycles = src.last_interval_error_cycles;
-  dst.max_abs_interval_error_cycles = src.max_abs_interval_error_cycles;
-  dst.last_counter_delta_ticks = src.last_counter_delta_ticks;
-  dst.anchor_dwt = src.anchor_dwt;
-  dst.anchor_counter32 = src.anchor_counter32;
-  dst.anchor_hardware16 = src.anchor_hardware16;
-  dst.anchor_pair_previous_dwt = src.anchor_pair_previous_dwt;
-  dst.anchor_pair_previous_counter32 = src.anchor_pair_previous_counter32;
-  dst.arm_count = 0;
-  dst.fire_count = 0;
-  dst.next_target_counter32 = 0;
-}
-
-static void smartzero_install_disabled_surrogates_locked(void) {
-  smartzero_install_disabled_surrogate_locked(1);
-  smartzero_install_disabled_surrogate_locked(2);
-}
-
-static const char* smartzero_decision_name(interrupt_smartzero_decision_t d) {
-  switch (d) {
-    case interrupt_smartzero_decision_t::WAITING_FOR_CPS:  return "WAITING_FOR_CPS";
-    case interrupt_smartzero_decision_t::FIRST_SAMPLE:     return "FIRST_SAMPLE";
-    case interrupt_smartzero_decision_t::ACCEPTED:         return "ACCEPTED";
-    case interrupt_smartzero_decision_t::REJECTED_DWT:     return "REJECTED_DWT";
-    case interrupt_smartzero_decision_t::REJECTED_COUNTER: return "REJECTED_COUNTER";
-    default:                                               return "NONE";
-  }
-}
-
-static const char* smartzero_lane_state_name(interrupt_smartzero_lane_state_t s) {
-  switch (s) {
-    case interrupt_smartzero_lane_state_t::ACQUIRING: return "ACQUIRING";
-    case interrupt_smartzero_lane_state_t::LOCKED:    return "LOCKED";
-    default:                                         return "IDLE";
-  }
-}
-
-static const char* smartzero_phase_name(interrupt_smartzero_phase_t p) {
-  switch (p) {
-    case interrupt_smartzero_phase_t::RUNNING:  return "RUNNING";
-    case interrupt_smartzero_phase_t::COMPLETE: return "COMPLETE";
-    case interrupt_smartzero_phase_t::ABORTED:  return "ABORTED";
-    default:                                    return "IDLE";
-  }
-}
-
-static inline void smartzero_write_begin(void) {
-  g_smartzero.seq++;
-  dmb_barrier();
-}
-
-static inline void smartzero_write_end(void) {
-  dmb_barrier();
-  g_smartzero.seq++;
-}
-
-static void smartzero_reset_lane(uint32_t index) {
-  smartzero_lane_runtime_t& r = g_smartzero.lanes[index];
-  r = smartzero_lane_runtime_t{};
-  r.pub.kind = smartzero_kind_for_index(index);
-  r.pub.state = interrupt_smartzero_lane_state_t::IDLE;
-  r.pub.last_decision = interrupt_smartzero_decision_t::NONE;
-  r.pub.tolerance_cycles = SMARTZERO_INTERVAL_TOLERANCE_CYCLES;
-  r.pub.required_counter_delta_ticks = SMARTZERO_INTERVAL_TICKS;
-}
-
-static bool smartzero_is_current_lane(interrupt_subscriber_kind_t kind) {
-  // This predicate is read from priority 0.  It must never observe the middle
-  // of a foreground/priority-16 SmartZero transaction.
-  for (uint32_t attempt = 0; attempt < 2U; attempt++) {
-    const uint32_t seq1 = g_smartzero.seq;
-    if (seq1 & 1U) continue;
-    dmb_barrier();
-
-    const bool running = g_smartzero.running;
-    const bool complete = g_smartzero.complete;
-    const uint32_t lane_index = g_smartzero.current_lane_index;
-
-    dmb_barrier();
-    const uint32_t seq2 = g_smartzero.seq;
-    if (seq1 == seq2 && (seq2 & 1U) == 0U) {
-      return running && !complete &&
-             smartzero_kind_for_index(lane_index) == kind;
-    }
-  }
-  return false;
-}
-
-static uint32_t smartzero_expected_interval_cycles(uint32_t* out_cps) {
-  const uint32_t cps = interrupt_vclock_cycles_per_second();
-  if (out_cps) *out_cps = cps;
-
-  // SmartZero's admissibility ruler is intentionally PPS/GPIO-derived.  The
-  // fallback DWT_EXPECTED_PER_PPS is close, but ZERO authority should wait for
-  // the physical PPS witness to give us a live one-second ruler.
-  if (!clocks_dwt_calibration_valid() || cps == 0) return 0;
-
-  return (uint32_t)(((uint64_t)cps +
-                     (uint64_t)SMARTZERO_SAMPLE_RATE_HZ / 2ULL) /
-                    (uint64_t)SMARTZERO_SAMPLE_RATE_HZ);
-}
-
-static void smartzero_arm_ocxo_lane(interrupt_subscriber_kind_t kind) {
-  const int idx = smartzero_index_for_kind(kind);
-  if (idx < 0) return;
-
-  if (ocxo_kind_disabled(kind)) return;
-
-  ocxo_lane_t* lane = ocxo_lane_for(kind);
-  synthetic_clock32_t* clock32 = synthetic_clock_for_kind(kind);
-  if (!lane || !clock32 || !lane->initialized) return;
-
-  // SmartZero rides the same ISR-authored +10,000 tick ladder as steady
-  // state.  Do not refresh the OCXO high word from an ambient low16 read here;
-  // the next compare identity is the next authored gear tooth after the
-  // current ISR-owned synthetic coordinate.
-  ocxo_lane_stop_local_cadence(*lane, OCXO_CADENCE_REASON_SMARTZERO);
-
-  const uint32_t target_counter32 =
-      clock32->current_counter32 + SMARTZERO_INTERVAL_TICKS;
-
-  smartzero_lane_runtime_t& r = g_smartzero.lanes[idx];
-  r.pub.next_target_counter32 = target_counter32;
-  r.pub.arm_count++;
-
-  (void)ocxo_lane_start_local_cadence_at_target(kind, *lane, *clock32,
-                                                target_counter32,
-                                                OCXO_CADENCE_REASON_SMARTZERO);
-}
-
-
-static void smartzero_arm_current_lane(void) {
-  const interrupt_subscriber_kind_t kind =
-      smartzero_kind_for_index(g_smartzero.current_lane_index);
-  if (kind == interrupt_subscriber_kind_t::OCXO1 ||
-      kind == interrupt_subscriber_kind_t::OCXO2) {
-    smartzero_arm_ocxo_lane(kind);
-  }
-}
-
-static void smartzero_advance_or_complete(void) {
-  uint32_t next_index = 0;
-  if (!smartzero_find_next_enabled_lane(g_smartzero.current_lane_index + 1U,
-                                        &next_index)) {
-    smartzero_install_disabled_surrogates_locked();
-    g_smartzero.running = false;
-    g_smartzero.complete = true;
-    g_smartzero.phase = interrupt_smartzero_phase_t::COMPLETE;
-    g_smartzero.complete_count++;
-    return;
-  }
-
-  g_smartzero.current_lane_index = next_index;
-  smartzero_lane_runtime_t& next = g_smartzero.lanes[g_smartzero.current_lane_index];
-  next.pub.state = interrupt_smartzero_lane_state_t::ACQUIRING;
-  next.pub.last_decision = interrupt_smartzero_decision_t::NONE;
-  next.previous_present = false;
-  smartzero_arm_current_lane();
-}
-
-static bool smartzero_feed_sample(interrupt_subscriber_kind_t kind,
-                                  uint32_t event_dwt,
-                                  uint32_t counter32,
-                                  uint16_t hardware16) {
-  if (!smartzero_is_current_lane(kind)) return false;
-
-  const int idx = smartzero_index_for_kind(kind);
-  if (idx < 0) return false;
-
-  uint32_t cps = 0;
-  const uint32_t expected = smartzero_expected_interval_cycles(&cps);
-
-  smartzero_write_begin();
-
-  smartzero_lane_runtime_t& r = g_smartzero.lanes[idx];
-  interrupt_smartzero_lane_snapshot_t& z = r.pub;
-
-  z.state = interrupt_smartzero_lane_state_t::ACQUIRING;
-  z.sample_count++;
-  z.cps_used = cps;
-  z.expected_interval_cycles = expected;
-  z.last_sample_dwt = event_dwt;
-  z.last_sample_counter32 = counter32;
-  z.last_sample_hardware16 = hardware16;
-
-  if (expected == 0) {
-    z.waiting_for_cps_count++;
-    z.last_decision = interrupt_smartzero_decision_t::WAITING_FOR_CPS;
-    r.previous_present = false;
-    smartzero_write_end();
-    return false;
-  }
-
-  if (!r.previous_present) {
-    z.previous_sample_dwt = event_dwt;
-    z.previous_sample_counter32 = counter32;
-    z.previous_sample_hardware16 = hardware16;
-    z.last_decision = interrupt_smartzero_decision_t::FIRST_SAMPLE;
-    r.previous_present = true;
-    smartzero_write_end();
-    return false;
-  }
-
-  const uint32_t previous_dwt = z.previous_sample_dwt;
-  const uint32_t previous_counter32 = z.previous_sample_counter32;
-  const uint16_t previous_hw16 = z.previous_sample_hardware16;
-
-  const uint32_t interval_cycles = event_dwt - previous_dwt;
-  const uint32_t counter_delta = counter32 - previous_counter32;
-  const int32_t error_cycles =
-      (int32_t)((int64_t)interval_cycles - (int64_t)expected);
-  const uint32_t abs_error = (uint32_t)(error_cycles < 0
-      ? -(int64_t)error_cycles
-      :  (int64_t)error_cycles);
-
-  z.interval_attempt_count++;
-  z.last_interval_cycles = interval_cycles;
-  z.last_interval_error_cycles = error_cycles;
-  z.last_counter_delta_ticks = counter_delta;
-  if (abs_error > z.max_abs_interval_error_cycles) {
-    z.max_abs_interval_error_cycles = abs_error;
-  }
-
-  const bool counter_ok = (counter_delta == SMARTZERO_INTERVAL_TICKS);
-  const bool dwt_ok = ((int32_t)abs_error <= SMARTZERO_INTERVAL_TOLERANCE_CYCLES);
-
-  if (counter_ok && dwt_ok) {
-    bool ocxo_cadence_reauthored = false;
-
-    z.accepted_count++;
-    z.state = interrupt_smartzero_lane_state_t::LOCKED;
-    z.last_decision = interrupt_smartzero_decision_t::ACCEPTED;
-    z.anchor_dwt = event_dwt;
-    z.anchor_counter32 = counter32;
-    z.anchor_hardware16 = hardware16;
-    z.anchor_pair_previous_dwt = previous_dwt;
-    z.anchor_pair_previous_counter32 = previous_counter32;
-
-    if (kind == interrupt_subscriber_kind_t::OCXO1 ||
-        kind == interrupt_subscriber_kind_t::OCXO2) {
-      ocxo_lane_t* lane = ocxo_lane_for(kind);
-      synthetic_clock32_t* clock32 = synthetic_clock_for_kind(kind);
-      if (lane && clock32) {
-        ocxo_lane_install_logical_grid(kind, *lane, *clock32, counter32,
-                                       OCXO_CADENCE_REASON_SMARTZERO);
-        ocxo_cadence_reauthored = true;
-        if (!lane->active) {
-          ocxo_lane_stop_local_cadence(*lane, OCXO_CADENCE_REASON_SMARTZERO);
-        }
-      }
-    }
-
-    smartzero_advance_or_complete();
-    smartzero_write_end();
-    return ocxo_cadence_reauthored;
-  }
-
-  z.rejected_count++;
-  z.last_decision = counter_ok
-      ? interrupt_smartzero_decision_t::REJECTED_DWT
-      : interrupt_smartzero_decision_t::REJECTED_COUNTER;
-
-  // Roll the observation window forward.  If this sample was the bad one, the
-  // next interval will reject; if it was good, the next good edge can lock.
-  z.previous_sample_dwt = event_dwt;
-  z.previous_sample_counter32 = counter32;
-  z.previous_sample_hardware16 = hardware16;
-  (void)previous_hw16;
-
-  smartzero_write_end();
-  return false;
-}
-
-// OCXO SmartZero samples are served by the same local OCXO compare ISR used
-// for steady-state one-second edge capture.  There is intentionally no
-// separate SmartZero ISR path here; SmartZero temporarily changes the next
-// authored target spacing to +10,000 ticks and feeds smartzero_feed_sample()
-// with that authored compare-target identity.
-
-bool interrupt_smartzero_begin(void) {
-  if (!g_interrupt_runtime_ready || !g_interrupt_hw_ready) return false;
-
-  // Foreground owns this lifecycle transition.  Mask priority 16 while the
-  // SmartZero SEQLOCK is odd; priority 0 remains unmasked and will simply
-  // decline the unstable snapshot for that one tooth.
-  const uint32_t prior_basepri = interrupt_priority0_guard_enter();
-  smartzero_write_begin();
-
-  g_smartzero.running = true;
-  g_smartzero.complete = false;
-  g_smartzero.phase = interrupt_smartzero_phase_t::RUNNING;
-  g_smartzero.sequence++;
-  g_smartzero.begin_count++;
-  g_smartzero.current_lane_index = 0;
-  for (uint32_t i = 0; i < SMARTZERO_LANE_COUNT; i++) {
-    smartzero_reset_lane(i);
-  }
-  g_smartzero.lanes[0].pub.state = interrupt_smartzero_lane_state_t::ACQUIRING;
-  vclock_ch2_smartzero_reset_attempt_state();
-
-  // SmartZero takes temporary custody of the OCXO local compare cadence only
-  // when each OCXO lane becomes current.  Stop any running OCXO cadence now so
-  // the acquisition sequence can re-author clean +10,000-tick sample ladders.
-  if (!OCXO1_DISABLED) ocxo_lane_stop_local_cadence(g_ocxo1_lane, OCXO_CADENCE_REASON_SMARTZERO);
-  if (!OCXO2_DISABLED) ocxo_lane_stop_local_cadence(g_ocxo2_lane, OCXO_CADENCE_REASON_SMARTZERO);
-
-  smartzero_write_end();
-  interrupt_priority0_guard_exit(prior_basepri);
-  return true;
-}
-
-void interrupt_smartzero_abort(void) {
-  const uint32_t prior_basepri = interrupt_priority0_guard_enter();
-  smartzero_write_begin();
-  g_smartzero.running = false;
-  g_smartzero.complete = false;
-  g_smartzero.phase = interrupt_smartzero_phase_t::ABORTED;
-  g_smartzero.abort_count++;
-  g_smartzero.current_lane_index = SMARTZERO_LANE_COUNT;
-
-  // Live acquisition state is not the installed proof.  When a live attempt
-  // is aborted, clear its lane proof surface so reports do not show stale
-  // LOCKED anchors under smartzero_complete=false.  CLOCKS/Alpha retains the
-  // installed SmartZero proof separately.
-  for (uint32_t i = 0; i < SMARTZERO_LANE_COUNT; i++) {
-    smartzero_reset_lane(i);
-  }
-
-  smartzero_write_end();
-  interrupt_priority0_guard_exit(prior_basepri);
-  vclock_ch2_smartzero_deactivate();
-
-  // SmartZero may temporarily stop/re-author the OCXO local compare path
-  // while acquiring lane proofs.  Aborting the *live acquisition attempt* must
-  // not silently disable active clock service.  If an OCXO lane is active,
-  // restore its normal one-second edge compare from the currently installed
-  // grid; if it is inactive, leave it stopped as before.
-  if (!OCXO1_DISABLED) {
-    if (g_ocxo1_lane.active) {
-      (void)ocxo_lane_start_local_cadence(interrupt_subscriber_kind_t::OCXO1,
-                                          g_ocxo1_lane,
-                                          g_ocxo1_clock32,
-                                          OCXO_CADENCE_REASON_START);
-    } else {
-      ocxo_lane_stop_local_cadence(g_ocxo1_lane, OCXO_CADENCE_REASON_STOP);
-    }
-  }
-
-  if (!OCXO2_DISABLED) {
-    if (g_ocxo2_lane.active) {
-      (void)ocxo_lane_start_local_cadence(interrupt_subscriber_kind_t::OCXO2,
-                                          g_ocxo2_lane,
-                                          g_ocxo2_clock32,
-                                          OCXO_CADENCE_REASON_START);
-    } else {
-      ocxo_lane_stop_local_cadence(g_ocxo2_lane, OCXO_CADENCE_REASON_STOP);
-    }
-  }
-}
-
-bool interrupt_smartzero_running(void) {
-  return g_smartzero.running && !g_smartzero.complete;
-}
-
-bool interrupt_smartzero_complete(void) {
-  return g_smartzero.complete;
-}
-
-static bool smartzero_snapshot_load(interrupt_smartzero_snapshot_t* out) {
-  if (!out) return false;
-
-  for (int attempt = 0; attempt < 4; attempt++) {
-    const uint32_t seq1 = g_smartzero.seq;
-    if (seq1 & 1U) continue;
-    dmb_barrier();
-
-    interrupt_smartzero_snapshot_t local{};
-    local.phase = g_smartzero.phase;
-    local.running = g_smartzero.running;
-    local.complete = g_smartzero.complete;
-    local.aborted = (g_smartzero.phase == interrupt_smartzero_phase_t::ABORTED);
-    local.sequence = g_smartzero.sequence;
-    local.begin_count = g_smartzero.begin_count;
-    local.complete_count = g_smartzero.complete_count;
-    local.abort_count = g_smartzero.abort_count;
-    local.current_lane_index = g_smartzero.current_lane_index;
-    local.current_lane = g_smartzero.running
-        ? smartzero_kind_for_index(g_smartzero.current_lane_index)
-        : interrupt_subscriber_kind_t::NONE;
-    local.tolerance_cycles = SMARTZERO_INTERVAL_TOLERANCE_CYCLES;
-    local.sample_rate_hz = SMARTZERO_SAMPLE_RATE_HZ;
-    local.counter_delta_ticks = SMARTZERO_INTERVAL_TICKS;
-    for (uint32_t i = 0; i < SMARTZERO_LANE_COUNT; i++) {
-      local.lanes[i] = g_smartzero.lanes[i].pub;
-    }
-
-    dmb_barrier();
-    const uint32_t seq2 = g_smartzero.seq;
-    if (seq1 == seq2 && (seq2 & 1U) == 0U) {
-      *out = local;
-      return true;
-    }
-  }
-
-  *out = interrupt_smartzero_snapshot_t{};
-  return false;
-}
-
-bool interrupt_smartzero_live_snapshot(interrupt_smartzero_snapshot_t* out) {
-  return smartzero_snapshot_load(out) && out->complete;
-}
-
-bool interrupt_smartzero_snapshot(interrupt_smartzero_snapshot_t* out) {
-  return interrupt_smartzero_live_snapshot(out);
-}
-
-// Forward declarations used by the OCXO-only MMIO guard below.  The concrete
-// helpers live in the priority-handoff section later in this file.
-static inline uint32_t interrupt_ipsr(void);
-static inline uint32_t interrupt_primask(void);
-
-// ============================================================================
-// Compare channel helpers
-// ============================================================================
-
-static inline void qtimer_clear_compare_flag(IMXRT_TMR_t& module, uint8_t ch) {
-  module.CH[ch].CSCTRL &= ~(TMR_CSCTRL_TCF1 | TMR_CSCTRL_TCF2);
-  (void)module.CH[ch].CSCTRL;
-}
-
-static inline void qtimer_program_compare(IMXRT_TMR_t& module,
-                                          uint8_t ch,
-                                          uint16_t target_low16) {
-  qtimer_clear_compare_flag(module, ch);
-  module.CH[ch].COMP1  = target_low16;
-  module.CH[ch].CMPLD1 = target_low16;
-  qtimer_clear_compare_flag(module, ch);
-  module.CH[ch].CSCTRL |= TMR_CSCTRL_TCF1EN;
-}
-
-static inline void qtimer_disable_compare(IMXRT_TMR_t& module, uint8_t ch) {
-  module.CH[ch].CSCTRL &= ~TMR_CSCTRL_TCF1EN;
-  qtimer_clear_compare_flag(module, ch);
-  qtimer_clear_compare_flag(module, ch);
-}
-
-// OCXO-only MMIO guard.  This deliberately leaves the generic QTimer helpers
-// unchanged for VCLOCK/TimePop.  The guard exists to catch the specific crash
-// class where a corrupted OCXO lane/module/channel would form an impossible
-// QTimer register address before the CPU attempts the halfword access.  Success
-// is silent; only failures emit debug_log evidence and quarantine that OCXO
-// lane so a pending compare flag cannot become a reboot loop.
-static constexpr uint32_t QTIMER_MMIO_GUARD_LOG_LIMIT = 32U;
-static volatile uint32_t g_qtimer_mmio_guard_fail_count = 0;
-
-enum class qtimer_guard_reg_t : uint8_t {
-  CSCTRL = 0,
-  CNTR   = 1,
-};
-
-static const char* qtimer_guard_reg_name(qtimer_guard_reg_t reg) {
-  switch (reg) {
-    case qtimer_guard_reg_t::CNTR:   return "CNTR";
-    case qtimer_guard_reg_t::CSCTRL:
-    default:                         return "CSCTRL";
-  }
-}
-
-static uintptr_t qtimer_guard_reg_addr(IMXRT_TMR_t* module,
-                                       uint8_t ch,
-                                       qtimer_guard_reg_t reg) {
-  const uintptr_t base = (uintptr_t)module;
-  const uintptr_t tmr1 = (uintptr_t)&IMXRT_TMR1;
-
-  if (reg == qtimer_guard_reg_t::CNTR) {
-    const uintptr_t off0 =
-        (uintptr_t)&IMXRT_TMR1.CH[0].CNTR - tmr1;
-    const uintptr_t stride =
-        (uintptr_t)&IMXRT_TMR1.CH[1].CNTR -
-        (uintptr_t)&IMXRT_TMR1.CH[0].CNTR;
-    return base + off0 + ((uintptr_t)ch * stride);
-  }
-
-  const uintptr_t off0 =
-      (uintptr_t)&IMXRT_TMR1.CH[0].CSCTRL - tmr1;
-  const uintptr_t stride =
-      (uintptr_t)&IMXRT_TMR1.CH[1].CSCTRL -
-      (uintptr_t)&IMXRT_TMR1.CH[0].CSCTRL;
-  return base + off0 + ((uintptr_t)ch * stride);
-}
-
-static bool qtimer_guard_known_module(uintptr_t module_addr) {
-  return module_addr == (uintptr_t)&IMXRT_TMR1 ||
-         module_addr == (uintptr_t)&IMXRT_TMR2 ||
-         module_addr == (uintptr_t)&IMXRT_TMR3 ||
-         module_addr == (uintptr_t)&IMXRT_TMR4;
-}
-
-static uint32_t qtimer_guard_kind_for_lane(const ocxo_lane_t& lane) {
-  if (&lane == &g_ocxo1_lane) return (uint32_t)interrupt_subscriber_kind_t::OCXO1;
-  if (&lane == &g_ocxo2_lane) return (uint32_t)interrupt_subscriber_kind_t::OCXO2;
-  return (uint32_t)interrupt_subscriber_kind_t::NONE;
-}
-
-static IMXRT_TMR_t* qtimer_guard_expected_module_for_lane(const ocxo_lane_t& lane) {
-  if (&lane == &g_ocxo1_lane) return &IMXRT_TMR2;
-  if (&lane == &g_ocxo2_lane) return &IMXRT_TMR3;
-  return nullptr;
-}
-
-static uint8_t qtimer_guard_expected_channel_for_lane(const ocxo_lane_t& lane) {
-  if (&lane == &g_ocxo1_lane) return QTIMER2_OCXO1_CH;
-  if (&lane == &g_ocxo2_lane) return QTIMER3_OCXO2_CH;
-  return 0xFFU;
-}
-
-static void qtimer_guard_log_failure(const ocxo_lane_t& lane,
-                                     const char* op,
-                                     qtimer_guard_reg_t reg,
-                                     uint8_t ch,
-                                     uint16_t target_low16,
-                                     uintptr_t reg_addr,
-                                     bool module_known,
-                                     bool module_expected,
-                                     bool channel_ok,
-                                     bool channel_expected,
-                                     bool aligned) {
-  const uint32_t count = ++g_qtimer_mmio_guard_fail_count;
-  if (count > QTIMER_MMIO_GUARD_LOG_LIMIT &&
-      (count & 0x3FFU) != 0U) {
-    return;
-  }
-
-  const uintptr_t module_addr = (uintptr_t)lane.module;
-  const uintptr_t expected_module_addr =
-      (uintptr_t)qtimer_guard_expected_module_for_lane(lane);
-  const uint32_t kind = qtimer_guard_kind_for_lane(lane);
-  const uint8_t expected_ch = qtimer_guard_expected_channel_for_lane(lane);
-
-  char line[256];
-  snprintf(line, sizeof(line),
-           "QTIMER_MMIO_GUARD fail=%lu op=%s reg=%s kind=%lu lane=0x%08lX "
-           "module=0x%08lX exp_module=0x%08lX ch=%u exp_ch=%u "
-           "addr=0x%08lX target=0x%04X known=%u mod_ok=%u ch_ok=%u "
-           "ch_exp=%u aligned=%u ipsr=%lu primask=%lu dwt=%lu",
-           (unsigned long)count,
-           op ? op : "?",
-           qtimer_guard_reg_name(reg),
-           (unsigned long)kind,
-           (unsigned long)(uintptr_t)&lane,
-           (unsigned long)module_addr,
-           (unsigned long)expected_module_addr,
-           (unsigned)ch,
-           (unsigned)expected_ch,
-           (unsigned long)reg_addr,
-           (unsigned)target_low16,
-           module_known ? 1U : 0U,
-           module_expected ? 1U : 0U,
-           channel_ok ? 1U : 0U,
-           channel_expected ? 1U : 0U,
-           aligned ? 1U : 0U,
-           (unsigned long)interrupt_ipsr(),
-           (unsigned long)interrupt_primask(),
-           (unsigned long)ARM_DWT_CYCCNT);
-  debug_log("interrupt.qtimer_guard", line);
-}
-
-static bool qtimer_guard_ocxo_reg(const ocxo_lane_t& lane,
-                                  const char* op,
-                                  qtimer_guard_reg_t reg,
-                                  uint8_t ch,
-                                  uint16_t target_low16,
-                                  uintptr_t* out_addr = nullptr) {
-  IMXRT_TMR_t* const expected_module =
-      qtimer_guard_expected_module_for_lane(lane);
-  const uint8_t expected_ch = qtimer_guard_expected_channel_for_lane(lane);
-  IMXRT_TMR_t* const module = lane.module;
-  const uintptr_t module_addr = (uintptr_t)module;
-  const uintptr_t expected_module_addr = (uintptr_t)expected_module;
-  const uintptr_t reg_addr = qtimer_guard_reg_addr(module, ch, reg);
-
-  const bool module_known = qtimer_guard_known_module(module_addr);
-  const bool module_expected =
-      expected_module && module_addr == expected_module_addr;
-  const bool channel_ok = ch < 4U;
-  const bool channel_expected = ch == expected_ch;
-  const bool aligned = (reg_addr & 1U) == 0U;
-  if (out_addr) *out_addr = reg_addr;
-
-  if (module_known && module_expected &&
-      channel_ok && channel_expected && aligned) {
-    return true;
-  }
-
-  qtimer_guard_log_failure(lane, op, reg, ch, target_low16, reg_addr,
-                           module_known, module_expected, channel_ok,
-                           channel_expected, aligned);
-  return false;
-}
-
-static void qtimer_guard_quarantine_ocxo_lane(ocxo_lane_t& lane,
-                                              const char* op) {
-  lane.cadence_enabled = false;
-  lane.cadence_armed = false;
-  lane.witness_armed = false;
-  lane.cadence_last_reason = OCXO_CADENCE_REASON_STOP;
-
-  if (&lane == &g_ocxo1_lane) {
-    NVIC_DISABLE_IRQ(IRQ_QTIMER2);
-    g_step0_qtimer2_irq_enabled_by_interrupt = false;
-  } else if (&lane == &g_ocxo2_lane) {
-    NVIC_DISABLE_IRQ(IRQ_QTIMER3);
-    g_step0_qtimer3_irq_enabled_by_interrupt = false;
-  }
-
-  char line[160];
-  snprintf(line, sizeof(line),
-           "QTIMER_MMIO_GUARD quarantine op=%s kind=%lu lane=0x%08lX",
-           op ? op : "?",
-           (unsigned long)qtimer_guard_kind_for_lane(lane),
-           (unsigned long)(uintptr_t)&lane);
-  debug_log("interrupt.qtimer_guard", line);
-}
-
-static bool qtimer_guard_read_ocxo_u16(const ocxo_lane_t& lane,
-                                       const char* op,
-                                       qtimer_guard_reg_t reg,
-                                       uint8_t ch,
-                                       uint16_t target_low16,
-                                       uint16_t* out) {
-  if (!out) return false;
-  if (!qtimer_guard_ocxo_reg(lane, op, reg, ch, target_low16)) {
-    *out = 0U;
-    return false;
-  }
-
-  if (reg == qtimer_guard_reg_t::CNTR) {
-    *out = lane.module->CH[ch].CNTR;
-  } else {
-    *out = lane.module->CH[ch].CSCTRL;
-  }
-  return true;
-}
-
-static bool qtimer_guard_read_ocxo_csctrl(const ocxo_lane_t& lane,
-                                          const char* op,
-                                          uint16_t target_low16,
-                                          uint32_t* out) {
-  uint16_t value = 0;
-  const bool ok = qtimer_guard_read_ocxo_u16(lane, op,
-                                             qtimer_guard_reg_t::CSCTRL,
-                                             lane.compare_channel,
-                                             target_low16,
-                                             &value);
-  if (out) *out = ok ? (uint32_t)value : 0U;
-  return ok;
-}
-
-static bool qtimer_guard_clear_ocxo_compare_flag(ocxo_lane_t& lane,
-                                                 const char* op) {
-  if (!qtimer_guard_ocxo_reg(lane, op, qtimer_guard_reg_t::CSCTRL,
-                             lane.compare_channel, lane.compare_target)) {
-    qtimer_guard_quarantine_ocxo_lane(lane, op);
-    return false;
-  }
-
-  lane.module->CH[lane.compare_channel].CSCTRL &=
-      ~(TMR_CSCTRL_TCF1 | TMR_CSCTRL_TCF2);
-  (void)lane.module->CH[lane.compare_channel].CSCTRL;
-  return true;
-}
-
-static bool qtimer_guard_program_ocxo_compare(ocxo_lane_t& lane,
-                                              uint16_t target_low16,
-                                              const char* op) {
-  if (!qtimer_guard_clear_ocxo_compare_flag(lane, op)) return false;
-
-  if (!qtimer_guard_ocxo_reg(lane, op, qtimer_guard_reg_t::CSCTRL,
-                             lane.compare_channel, target_low16)) {
-    qtimer_guard_quarantine_ocxo_lane(lane, op);
-    return false;
-  }
-
-  lane.module->CH[lane.compare_channel].COMP1  = target_low16;
-  lane.module->CH[lane.compare_channel].CMPLD1 = target_low16;
-
-  if (!qtimer_guard_clear_ocxo_compare_flag(lane, op)) return false;
-
-  if (!qtimer_guard_ocxo_reg(lane, op, qtimer_guard_reg_t::CSCTRL,
-                             lane.compare_channel, target_low16)) {
-    qtimer_guard_quarantine_ocxo_lane(lane, op);
-    return false;
-  }
-  lane.module->CH[lane.compare_channel].CSCTRL |= TMR_CSCTRL_TCF1EN;
-  return true;
-}
-
-static bool qtimer_guard_disable_ocxo_compare(ocxo_lane_t& lane,
-                                              const char* op) {
-  if (!qtimer_guard_ocxo_reg(lane, op, qtimer_guard_reg_t::CSCTRL,
-                             lane.compare_channel, lane.compare_target)) {
-    qtimer_guard_quarantine_ocxo_lane(lane, op);
-    return false;
-  }
-
-  lane.module->CH[lane.compare_channel].CSCTRL &= ~TMR_CSCTRL_TCF1EN;
-  if (!qtimer_guard_clear_ocxo_compare_flag(lane, op)) return false;
-  if (!qtimer_guard_clear_ocxo_compare_flag(lane, op)) return false;
-  return true;
-}
-
-// Legacy QTimer1 CH1 hosted-rail API remains retired.  VCLOCK authority now
-// lives on CH0 and TimePop scheduling lives on CH2.
-static inline void qtimer1_ch1_clear_compare_flag(void) {
-  qtimer_clear_compare_flag(IMXRT_TMR1, QTIMER1_RETIRED_AUX_CH);
-}
-
-static inline void qtimer1_ch1_program_compare(uint16_t) {
-  // Disabled: do not program the retired QTimer1 CH1 rail.
-}
-
-static inline void qtimer1_ch1_disable_compare_hw(void) {
-  qtimer_disable_compare(IMXRT_TMR1, QTIMER1_RETIRED_AUX_CH);
-}
-
-static inline void qtimer1_vclock_clear_compare_flag(void) {
-  qtimer_clear_compare_flag(IMXRT_TMR1, QTIMER1_VCLOCK_CH);
-}
-
-static inline void qtimer1_vclock_program_compare(uint16_t target_low16) {
-  qtimer_program_compare(IMXRT_TMR1, QTIMER1_VCLOCK_CH, target_low16);
-}
-
-static inline void qtimer1_vclock_disable_compare(void) {
-  qtimer_disable_compare(IMXRT_TMR1, QTIMER1_VCLOCK_CH);
-}
-
-// TimePop's public "CH2" API now drives real QTimer1 CH2 again.  It is a
-// scheduler rail only and must not author VCLOCK edge facts.
-static inline void qtimer1_ch2_clear_compare_flag(void) {
-  qtimer_clear_compare_flag(IMXRT_TMR1, QTIMER1_TIMEPOP_CH);
-}
-
-static inline void qtimer1_ch2_program_compare(uint16_t target_low16) {
-  qtimer_program_compare(IMXRT_TMR1, QTIMER1_TIMEPOP_CH, target_low16);
-}
-
-static inline bool ocxo_compare_clear_flag(ocxo_lane_t& lane) {
-  return qtimer_guard_clear_ocxo_compare_flag(lane, "ocxo_compare_clear_flag");
-}
-
-static inline bool ocxo_compare_program(ocxo_lane_t& lane,
-                                        uint16_t target_low16) {
-  return qtimer_guard_program_ocxo_compare(lane, target_low16,
-                                           "ocxo_compare_program");
-}
-
-static inline bool ocxo_compare_disable(ocxo_lane_t& lane) {
-  return qtimer_guard_disable_ocxo_compare(lane, "ocxo_compare_disable");
-}
-
-// ============================================================================
-// Subscriber lookup helpers
-// ============================================================================
-
-static interrupt_subscriber_runtime_t* runtime_for(interrupt_subscriber_kind_t kind) {
-  for (uint32_t i = 0; i < g_subscriber_count; i++) {
+  for (uint32_t i = 0; i < g_subscriber_count; ++i) {
     if (g_subscribers[i].desc && g_subscribers[i].desc->kind == kind) {
       return &g_subscribers[i];
     }
@@ -5168,3242 +541,13 @@ static interrupt_subscriber_runtime_t* runtime_for(interrupt_subscriber_kind_t k
   return nullptr;
 }
 
-static ocxo_lane_t* ocxo_lane_for(interrupt_subscriber_kind_t kind) {
-  ocxo_runtime_context_t* ctx = ocxo_context_for(kind);
-  return ctx ? ctx->lane : nullptr;
-}
-
 static const char* dispatch_timer_name(interrupt_subscriber_kind_t kind) {
   switch (kind) {
     case interrupt_subscriber_kind_t::VCLOCK: return "VCLOCK_DISPATCH";
-    case interrupt_subscriber_kind_t::OCXO1:  return "OCXO1_DISPATCH";
-    case interrupt_subscriber_kind_t::OCXO2:  return "OCXO2_DISPATCH";
+    case interrupt_subscriber_kind_t::OCXO1: return "OCXO1_DISPATCH";
+    case interrupt_subscriber_kind_t::OCXO2: return "OCXO2_DISPATCH";
     default: return "";
   }
-}
-
-// ============================================================================
-// Lower-envelope edge inference — lane evidence + guarded PPS normalization
-// ============================================================================
-//
-// ISR/service latency is one-sided: it can make an observed QTimer edge late,
-// but it cannot make it early.  This rail keeps a tiny streaming lower-envelope
-// window for each 1 kHz lane.  Each second is divided into fixed buckets; each
-// bucket retains only the sample with the lowest residual against the prior
-// window's predicted line.  At the one-second edge, a line is fit through those
-// bucket winners and anchored to the median of the eight lowest pre-shift fit
-// errors.  This preserves a lower-envelope estimate without allowing one
-// isolated minimum to drag the entire line tens of cycles early.
-//
-// VCLOCK and OCXO subscriber edges remain observation-derived: FloorLine does
-// not replace those measured QTimer coordinates. The one exception is the
-// physical PPS GPIO witness, which has no dynamic service-offset correction.
-// When raw PPS and the qualified same-second VCLOCK FloorLine projection differ
-// beyond the magnitude threshold, the projection becomes the published PPS
-// edge and the DWT/GNSS yardstick endpoint. The old regression_* ABI fields
-// remain the transport
-// surface for the evidence.
-
-static constexpr uint32_t LOWER_ENV_SAMPLE_RATE_HZ = 1000U;
-static constexpr uint32_t LOWER_ENV_BUCKET_COUNT = 64U;
-static constexpr uint32_t LOWER_ENV_FIT_MIN_BUCKETS = 8U;
-static constexpr uint32_t LOWER_ENV_ANCHOR_POPULATION_COUNT = 8U;
-static constexpr uint32_t FLOORLINE_ANCHOR_POLICY_MEDIAN8 = 2U;
-
-// FloorLine V2 doctrine:
-//   * the 4-cycle gate is a quality/forensics threshold, not a sample veto;
-//   * ordinary samples are retained and the estimator decides how to use them;
-//   * only grossly implausible per-sample residuals are excluded from the fit;
-//   * if a fit cannot be produced, publication falls back to the observed
-//     edge and reports the fallback instead of withdrawing the FLOORLINE rail.
-static constexpr uint32_t LOWER_ENV_ERROR_GATE_CYCLES = 4U;
-static constexpr uint32_t LOWER_ENV_SAMPLE_HARD_REJECT_CYCLES = 512U;
-static constexpr uint32_t LOWER_ENV_RESIDUAL_BIN16_CYCLES = 16U;
-static constexpr uint32_t LOWER_ENV_RESIDUAL_BIN32_CYCLES = 32U;
-static constexpr uint32_t LOWER_ENV_RESIDUAL_BIN64_CYCLES = 64U;
-static constexpr uint32_t LOWER_ENV_RESIDUAL_BIN128_CYCLES = 128U;
-static constexpr uint32_t LOWER_ENV_PUBLISH_MIN_SAMPLES = 128U;
-static constexpr uint32_t LOWER_ENV_PUBLISH_MIN_BUCKETS = 32U;
-// Candidate-to-observed deltas of tens or even ~100 cycles are exactly the
-// ISR-delay class FloorLine exists to remove.  These hard gates are therefore
-// broad sanity rails, not quality thresholds.
-static constexpr uint32_t LOWER_ENV_PUBLISH_HARD_EDGE_GATE_CYCLES = 256U;
-static constexpr uint32_t LOWER_ENV_PUBLISH_HARD_INTERVAL_GATE_CYCLES = 256U;
-static constexpr uint32_t LOWER_ENV_WATCHDOG_SLOPE_NUMERATOR = 1U;
-static constexpr uint32_t LOWER_ENV_WATCHDOG_SLOPE_DENOMINATOR = 2U;
-static constexpr uint32_t LOWER_ENV_WATCHDOG_SLOPE_MULTIPLIER = 2U;
-
-static constexpr uint32_t FLOORLINE_PUBLISH_SOURCE_OBSERVED  = 0U;
-static constexpr uint32_t FLOORLINE_PUBLISH_SOURCE_FLOORLINE = 1U;
-
-// FloorLine/lower-envelope remains diagnostic for measured VCLOCK/OCXO edge
-// publication. Keep the old metadata populated for reports; physical-PPS
-// normalization is governed separately by the strict repair court below.
-static constexpr bool DWT_PUBLICATION_FLOORLINE_AUTHORITY_ENABLED = false;
-
-static constexpr uint32_t FLOORLINE_REASON_ACCEPTED          = 0U;
-static constexpr uint32_t FLOORLINE_REASON_INIT              = 1U;
-static constexpr uint32_t FLOORLINE_REASON_SAMPLE_STARVED    = 2U;
-static constexpr uint32_t FLOORLINE_REASON_BUCKET_STARVED    = 3U;
-static constexpr uint32_t FLOORLINE_REASON_FIT_INVALID       = 4U;
-static constexpr uint32_t FLOORLINE_REASON_FIT_OUTLIER       = 5U;
-static constexpr uint32_t FLOORLINE_REASON_INTERVAL_GATE     = 6U;
-static constexpr uint32_t FLOORLINE_REASON_EDGE_GATE         = 7U;
-static constexpr uint32_t FLOORLINE_REASON_OBSERVED_FALLBACK = 8U;
-static constexpr uint32_t FLOORLINE_REASON_SLOPE_ANOMALY     = 9U;
-
-// Physical-PPS FloorLine substitution policy.
-//
-// The GPIO PPS edge is normally retained.  When it disagrees with the same-
-// second VCLOCK FloorLine projection by at least this magnitude, publish the
-// projected physical PPS edge instead.  The sign is deliberately irrelevant:
-// this is edge arbitration, not a causal classification of ISR latency.
-static constexpr uint32_t PPS_FLOORLINE_REPAIR_TRIGGER_CYCLES = 1024U;
-
-static constexpr uint32_t PPS_FLOORLINE_REPAIR_REASON_NONE = 0U;
-static constexpr uint32_t PPS_FLOORLINE_REPAIR_REASON_APPLIED = 1U;
-static constexpr uint32_t PPS_FLOORLINE_REPAIR_REASON_NO_HISTORY = 2U;
-static constexpr uint32_t PPS_FLOORLINE_REPAIR_REASON_SEQUENCE_MISMATCH = 3U;
-static constexpr uint32_t PPS_FLOORLINE_REPAIR_REASON_FLOORLINE_UNQUALIFIED = 4U;
-static constexpr uint32_t PPS_FLOORLINE_REPAIR_REASON_NO_PHASE = 5U;
-static constexpr uint32_t PPS_FLOORLINE_REPAIR_REASON_DELTA_BELOW_THRESHOLD = 6U;
-static constexpr uint32_t PPS_FLOORLINE_REPAIR_REASON_REWRITE_FAILED = 7U;
-
-struct pps_floorline_repair_state_t {
-  bool     valid = false;
-  bool     applied = false;
-  bool     floorline_qualified = false;
-  bool     phase_qualified = false;
-  bool     magnitude_qualified = false;
-  bool     yardstick_rewritten = false;
-  uint32_t sequence = 0;
-  uint32_t attempt_count = 0;
-  uint32_t applied_count = 0;
-  uint32_t reject_count = 0;
-  uint32_t reason = PPS_FLOORLINE_REPAIR_REASON_NONE;
-  uint32_t raw_pps_dwt = 0;
-  uint32_t inferred_pps_dwt = 0;
-  uint32_t used_pps_dwt = 0;
-  uint32_t observed_vclock_dwt = 0;
-  uint32_t floorline_vclock_dwt = 0;
-  int32_t  raw_minus_inferred_cycles = 0;
-  int32_t  observed_vclock_minus_floorline_cycles = 0;
-  uint32_t previous_interval_cycles = 0;
-  uint32_t raw_interval_cycles = 0;
-  uint32_t inferred_interval_cycles = 0;
-  int32_t  raw_interval_error_cycles = 0;
-  int32_t  inferred_interval_error_cycles = 0;
-  uint32_t floorline_confidence_ppm = 0;
-  uint32_t floorline_sample_count = 0;
-  uint32_t floorline_selected_bucket_count = 0;
-};
-
-static volatile uint32_t g_pps_floorline_repair_seq = 0;
-static pps_floorline_repair_state_t g_pps_floorline_repair = {};
-
-static void pps_floorline_repair_store(
-    const pps_floorline_repair_state_t& value) {
-  const uint32_t prior_basepri = interrupt_priority0_guard_enter();
-  g_pps_floorline_repair_seq++;
-  dmb_barrier();
-  g_pps_floorline_repair = value;
-  dmb_barrier();
-  g_pps_floorline_repair_seq++;
-  interrupt_priority0_guard_exit(prior_basepri);
-}
-
-static bool pps_floorline_repair_load(pps_floorline_repair_state_t& out) {
-  for (uint32_t attempt = 0; attempt < 4U; attempt++) {
-    const uint32_t seq1 = g_pps_floorline_repair_seq;
-    if (seq1 & 1U) continue;
-    dmb_barrier();
-    out = g_pps_floorline_repair;
-    dmb_barrier();
-    const uint32_t seq2 = g_pps_floorline_repair_seq;
-    if (seq1 == seq2 && (seq2 & 1U) == 0U) return true;
-  }
-  out = pps_floorline_repair_state_t{};
-  return false;
-}
-
-static uint32_t lower_env_abs_i32(int32_t value) {
-  return value < 0 ? (uint32_t)(-(int64_t)value) : (uint32_t)value;
-}
-
-static int32_t pps_floorline_i32_from_i64(int64_t value) {
-  if (value > INT32_MAX) return INT32_MAX;
-  if (value < INT32_MIN) return INT32_MIN;
-  return (int32_t)value;
-}
-
-// Integer-only Q16 statistics for FloorLine.
-//
-// FloorLine sealing runs from the serialized foreground fact drain.  Keep the
-// calculation integer-only so the numerical contract is unchanged and the
-// priority-16 handoff never inherits lazy floating-point state through a helper.
-// These helpers preserve the existing population-statistics/Q16 report contract.
-static uint32_t lower_env_isqrt_u64(uint64_t value) {
-  uint64_t result = 0U;
-  uint64_t bit = 1ULL << 62;
-
-  while (bit > value) bit >>= 2;
-  while (bit != 0U) {
-    if (value >= result + bit) {
-      value -= result + bit;
-      result = (result >> 1) + bit;
-    } else {
-      result >>= 1;
-    }
-    bit >>= 2;
-  }
-
-  return (uint32_t)result;
-}
-
-static uint64_t lower_env_ratio_q32(uint64_t numerator,
-                                    uint32_t denominator) {
-  if (denominator == 0U) return 0U;
-
-  const uint64_t whole = numerator / (uint64_t)denominator;
-  const uint64_t remainder = numerator % (uint64_t)denominator;
-  if (whole > (UINT64_MAX >> 32)) return UINT64_MAX;
-
-  return (whole << 32) +
-         ((remainder << 32) / (uint64_t)denominator);
-}
-
-static uint64_t lower_env_ratio_q16(uint64_t numerator,
-                                    uint32_t denominator) {
-  if (denominator == 0U) return 0U;
-
-  const uint64_t whole = numerator / (uint64_t)denominator;
-  const uint64_t remainder = numerator % (uint64_t)denominator;
-  if (whole > (UINT64_MAX >> 16)) return UINT64_MAX;
-
-  return (whole << 16) +
-         ((remainder << 16) / (uint64_t)denominator);
-}
-
-// FloorLine lower-envelope inference remains always compiled. Measured clock
-// publication does not select it at the call site; the rail supplies comparison
-// evidence and the narrowly scoped physical-PPS ISR-latency repair candidate.
-
-struct lower_env_bucket_t {
-  bool     valid = false;
-  uint16_t x = 0;
-  uint32_t dwt = 0;
-  uint32_t counter32 = 0;
-  uint16_t target_hw16 = 0;
-  uint16_t observed_hw16 = 0;
-  int32_t  residual_cycles = 0;
-};
-
-struct cadence_regression_result_t {
-  bool     valid = false;
-  uint32_t sequence = 0;
-  uint32_t sample_count = 0;
-  uint32_t observed_dwt_at_event = 0;
-  uint32_t inferred_dwt_at_event = 0;
-  int32_t  inferred_minus_observed_cycles = 0;
-  uint32_t target_counter32_at_event = 0;
-  uint16_t target_hardware16_at_event = 0;
-  uint16_t observed_hardware16_at_event = 0;
-  uint64_t slope_q16_cycles_per_sample = 0;
-  int64_t  slope_delta_q16_cycles_per_sample = 0;
-  int32_t  fit_error_mean_q16_cycles = 0;
-  uint32_t fit_error_stddev_q16_cycles = 0;
-  int32_t  fit_error_min_cycles = 0;
-  int32_t  fit_error_max_cycles = 0;
-  uint32_t fit_error_gt_plus4_count = 0;
-  uint32_t fit_error_lt_minus4_count = 0;
-  uint32_t fit_error_abs_gt4_count = 0;
-
-  // Robust lower-envelope anchor transcript.  The estimator chooses the
-  // median of the eight lowest pre-shift fit errors; e0/e1 and lift preserve
-  // enough evidence for compact TIMEBASE/raw_floorline diagnosis.
-  uint32_t anchor_policy_id = FLOORLINE_ANCHOR_POLICY_MEDIAN8;
-  uint32_t anchor_population_count = 0;
-  int32_t  anchor_single_min_q16_cycles = 0;
-  int32_t  anchor_second_q16_cycles = 0;
-  int32_t  anchor_selected_q16_cycles = 0;
-  int32_t  anchor_selected_minus_single_min_q16_cycles = 0;
-
-  bool     observed_interval_valid = false;
-  bool     inferred_interval_valid = false;
-  uint32_t observed_interval_cycles = 0;
-  uint32_t inferred_interval_cycles = 0;
-  int32_t  inferred_minus_observed_interval_cycles = 0;
-  uint32_t selected_bucket_count = 0;
-
-  bool     candidate_present = false;
-  bool     publish_floorline = false;
-  bool     fallback_used = false;
-  uint32_t publish_source = FLOORLINE_PUBLISH_SOURCE_OBSERVED;
-  uint32_t publish_reason = FLOORLINE_REASON_INIT;
-  uint32_t confidence_ppm = 0;
-  uint32_t sample_accepted_count = 0;
-  uint32_t sample_rejected_count = 0;
-  uint32_t sample_hard_rejected_count = 0;
-  uint32_t bucket_required_count = LOWER_ENV_PUBLISH_MIN_BUCKETS;
-  uint32_t sample_required_count = LOWER_ENV_PUBLISH_MIN_SAMPLES;
-  uint32_t gate_cycles = LOWER_ENV_ERROR_GATE_CYCLES;
-  uint32_t sample_hard_reject_gate_cycles = LOWER_ENV_SAMPLE_HARD_REJECT_CYCLES;
-  int32_t  candidate_interval_error_cycles = 0;
-
-  uint32_t residual_sample_count = 0;
-  int32_t  residual_min_cycles = 0;
-  int32_t  residual_max_cycles = 0;
-  int32_t  residual_mean_q16_cycles = 0;
-  uint32_t residual_stddev_q16_cycles = 0;
-  uint32_t residual_abs_gt4_count = 0;
-  uint32_t residual_abs_gt16_count = 0;
-  uint32_t residual_abs_gt32_count = 0;
-  uint32_t residual_abs_gt64_count = 0;
-  uint32_t residual_abs_gt128_count = 0;
-};
-
-// The deferred anchor helper owns its eight-value order statistic locally.
-// FloorLine no longer carries shared anchor scratch across custody boundaries.
-
-static int64_t lower_env_average_i64_nearest(int64_t a, int64_t b) {
-  // Fit errors are bounded by the FloorLine sample and slope courts, so a+b
-  // cannot approach int64 range.  Round an exact half away from zero.
-  const int64_t sum = a + b;
-  if (sum >= 0LL) return (sum + 1LL) / 2LL;
-  return -(((-sum) + 1LL) / 2LL);
-}
-
-static int32_t lower_env_i32_from_i64(int64_t value) {
-  if (value > INT32_MAX) return INT32_MAX;
-  if (value < INT32_MIN) return INT32_MIN;
-  return (int32_t)value;
-}
-
-static const char* lower_env_anchor_policy_name(uint32_t policy_id) {
-  return policy_id == FLOORLINE_ANCHOR_POLICY_MEDIAN8
-      ? "median8_lowest_fit_errors"
-      : "unknown";
-}
-
-struct lower_env_lane_t {
-  interrupt_subscriber_kind_t kind = interrupt_subscriber_kind_t::NONE;
-  const char* name = "";
-
-  lower_env_bucket_t buckets[LOWER_ENV_BUCKET_COUNT]{};
-  bool     active_valid = false;
-  uint32_t active_sample_count = 0;
-  uint32_t active_bucket_count = 0;
-  uint32_t active_sample_accepted_count = 0;
-  uint32_t active_sample_rejected_count = 0;
-  uint32_t active_sample_hard_rejected_count = 0;
-  uint32_t active_base_dwt = 0;
-
-  uint32_t active_residual_sample_count = 0;
-  int32_t  active_residual_min_cycles = 0;
-  int32_t  active_residual_max_cycles = 0;
-  int64_t  active_residual_sum_cycles = 0;
-  uint64_t active_residual_square_sum_cycles = 0;
-  uint32_t active_residual_abs_gt4_count = 0;
-  uint32_t active_residual_abs_gt16_count = 0;
-  uint32_t active_residual_abs_gt32_count = 0;
-  uint32_t active_residual_abs_gt64_count = 0;
-  uint32_t active_residual_abs_gt128_count = 0;
-
-  bool     floorline_seen_valid_estimate = false;
-  uint32_t floorline_valid_estimate_count = 0;
-  uint32_t fallback_publish_count = 0;
-  uint32_t watchdog_anomaly_count = 0;
-  uint32_t last_watchdog_reason = 0;
-
-  bool     previous_observed_edge_valid = false;
-  uint32_t previous_observed_edge_dwt = 0;
-  uint32_t previous_observed_edge_target_counter32 = 0;
-  uint16_t previous_observed_edge_target_hw16 = 0;
-  uint16_t previous_observed_edge_observed_hw16 = 0;
-
-  // Raw observed bookend courtroom.  These fields capture the exact facts
-  // before previous_observed_edge_* is overwritten, then the foreground
-  // one-second handoff emits WATCHDOG_ANOMALY if the campaign ledger is armed.
-  bool     raw_bookend_anomaly_pending = false;
-  uint32_t raw_bookend_anomaly_count = 0;
-  uint32_t raw_bookend_anomaly_report_count = 0;
-  uint32_t raw_bookend_anomaly_sequence = 0;
-  uint32_t raw_bookend_anomaly_reason = 0;
-  uint32_t raw_bookend_anomaly_source = 0;
-  uint32_t raw_bookend_anomaly_observed_interval_cycles = 0;
-  uint32_t raw_bookend_anomaly_reference_cycles = 0;
-  uint32_t raw_bookend_anomaly_previous_observed_dwt = 0;
-  uint32_t raw_bookend_anomaly_current_observed_dwt = 0;
-  uint32_t raw_bookend_anomaly_previous_target_counter32 = 0;
-  uint32_t raw_bookend_anomaly_current_target_counter32 = 0;
-  uint16_t raw_bookend_anomaly_previous_target_hw16 = 0;
-  uint16_t raw_bookend_anomaly_previous_observed_hw16 = 0;
-  uint16_t raw_bookend_anomaly_current_target_hw16 = 0;
-  uint16_t raw_bookend_anomaly_current_observed_hw16 = 0;
-  uint32_t raw_bookend_anomaly_update_count = 0;
-  uint32_t raw_bookend_anomaly_invalid_window_count = 0;
-  uint32_t raw_bookend_anomaly_fallback_publish_count = 0;
-
-  bool     previous_inferred_edge_valid = false;
-  uint32_t previous_inferred_edge_dwt = 0;
-  bool     previous_slope_valid = false;
-  uint64_t previous_slope_q16_cycles_per_sample = 0;
-
-  cadence_regression_result_t last{};
-  uint32_t update_count = 0;
-  uint32_t reset_count = 0;
-  uint32_t invalid_window_count = 0;
-  uint32_t overflow_reset_count = 0;
-};
-
-// FloorLine has one priority-16 active-window writer and one serialized
-// foreground sealing owner.  seal_pending freezes the bucket window so those
-// custody domains never touch it concurrently.  Foreground reporting reads a
-// coherent whole-lane snapshot instead of the live writer state.
-struct lower_env_lane_store_t {
-  volatile uint32_t seq = 0;
-  lower_env_lane_t lane{};
-
-  // Priority 16 freezes the completed active window in place.  While pending,
-  // later 1 kHz samples leave the lane untouched; the matching foreground fact
-  // drain seals and clears the window before reopening it to the handoff tier.
-  volatile bool     seal_pending = false;
-  volatile uint32_t seal_observed_dwt = 0;
-  volatile uint32_t seal_target_counter32 = 0;
-  volatile uint16_t seal_target_hw16 = 0;
-  volatile uint16_t seal_observed_hw16 = 0;
-};
-
-struct lower_env_consumer_state_t {
-  uint32_t last_raw_bookend_sequence = 0;
-  uint32_t raw_bookend_report_count = 0;
-  uint32_t watchdog_anomaly_count = 0;
-  uint32_t last_watchdog_reason = 0;
-};
-
-static lower_env_lane_store_t g_lower_env_vclock_store = {};
-static lower_env_lane_store_t g_lower_env_ocxo1_store = {};
-static lower_env_lane_store_t g_lower_env_ocxo2_store = {};
-static lower_env_consumer_state_t g_lower_env_consumer_vclock = {};
-static lower_env_consumer_state_t g_lower_env_consumer_ocxo1 = {};
-static lower_env_consumer_state_t g_lower_env_consumer_ocxo2 = {};
-static uint32_t g_lower_env_snapshot_count = 0;
-static volatile bool g_interrupt_feature_floorline_latched_nominal = false;
-
-// Foreground-only scratch lives outside the application stack.  Copying the
-// complete lane keeps the snapshot mechanism simple and automatically covers
-// future report fields without creating a second diagnostic schema.
-static lower_env_lane_t g_lower_env_report_scratch DMAMEM = {};
-
-static lower_env_lane_store_t* lower_env_store_for(
-    interrupt_subscriber_kind_t kind) {
-  switch (kind) {
-    case interrupt_subscriber_kind_t::VCLOCK: return &g_lower_env_vclock_store;
-    case interrupt_subscriber_kind_t::OCXO1:  return &g_lower_env_ocxo1_store;
-    case interrupt_subscriber_kind_t::OCXO2:  return &g_lower_env_ocxo2_store;
-    default: return nullptr;
-  }
-}
-
-static lower_env_lane_t* lower_env_lane_for(
-    interrupt_subscriber_kind_t kind) {
-  lower_env_lane_store_t* const store = lower_env_store_for(kind);
-  return store ? &store->lane : nullptr;
-}
-
-static lower_env_consumer_state_t* lower_env_consumer_for(
-    interrupt_subscriber_kind_t kind) {
-  switch (kind) {
-    case interrupt_subscriber_kind_t::VCLOCK: return &g_lower_env_consumer_vclock;
-    case interrupt_subscriber_kind_t::OCXO1:  return &g_lower_env_consumer_ocxo1;
-    case interrupt_subscriber_kind_t::OCXO2:  return &g_lower_env_consumer_ocxo2;
-    default: return nullptr;
-  }
-}
-
-static inline void lower_env_write_begin(lower_env_lane_store_t& store) {
-  store.seq++;
-  dmb_barrier();
-}
-
-static inline void lower_env_write_end(lower_env_lane_store_t& store) {
-  dmb_barrier();
-  store.seq++;
-}
-
-static bool lower_env_lane_snapshot(interrupt_subscriber_kind_t kind,
-                                    lower_env_lane_t* out) {
-  if (!out) return false;
-  lower_env_lane_store_t* const store = lower_env_store_for(kind);
-  if (!store) return false;
-
-  for (uint32_t attempt = 0; attempt < 4U; attempt++) {
-    const uint32_t s1 = store->seq;
-    if ((s1 & 1U) != 0U) continue;
-    dmb_barrier();
-    *out = store->lane;
-    dmb_barrier();
-    const uint32_t s2 = store->seq;
-    if (s1 == s2 && (s2 & 1U) == 0U) {
-      lower_env_consumer_state_t* const consumer =
-          lower_env_consumer_for(kind);
-      if (consumer) {
-        out->raw_bookend_anomaly_report_count =
-            consumer->raw_bookend_report_count;
-        out->watchdog_anomaly_count += consumer->watchdog_anomaly_count;
-        if (consumer->last_watchdog_reason != 0U) {
-          out->last_watchdog_reason = consumer->last_watchdog_reason;
-        }
-        if (out->raw_bookend_anomaly_sequence <=
-            consumer->last_raw_bookend_sequence) {
-          out->raw_bookend_anomaly_pending = false;
-        }
-      }
-      return true;
-    }
-  }
-
-  *out = lower_env_lane_t{};
-  return false;
-}
-
-static bool lower_env_result_load(interrupt_subscriber_kind_t kind,
-                                  cadence_regression_result_t* out) {
-  if (!out) return false;
-  lower_env_lane_store_t* const store = lower_env_store_for(kind);
-  if (!store) {
-    *out = cadence_regression_result_t{};
-    return false;
-  }
-
-  for (uint32_t attempt = 0; attempt < 4U; attempt++) {
-    const uint32_t s1 = store->seq;
-    if ((s1 & 1U) != 0U) continue;
-    dmb_barrier();
-    *out = store->lane.last;
-    dmb_barrier();
-    const uint32_t s2 = store->seq;
-    if (s1 == s2 && (s2 & 1U) == 0U) return out->valid;
-  }
-
-  *out = cadence_regression_result_t{};
-  return false;
-}
-
-static bool lower_env_seen_valid_estimate_load(
-    interrupt_subscriber_kind_t kind) {
-  lower_env_lane_store_t* const store = lower_env_store_for(kind);
-  if (!store) return false;
-
-  for (uint32_t attempt = 0; attempt < 4U; attempt++) {
-    const uint32_t s1 = store->seq;
-    if ((s1 & 1U) != 0U) continue;
-    dmb_barrier();
-    const bool seen = store->lane.floorline_seen_valid_estimate;
-    dmb_barrier();
-    const uint32_t s2 = store->seq;
-    if (s1 == s2 && (s2 & 1U) == 0U) return seen;
-  }
-  return false;
-}
-
-static const lower_env_lane_t* lower_env_report_snapshot(
-    interrupt_subscriber_kind_t kind) {
-  if (!lower_env_lane_snapshot(kind, &g_lower_env_report_scratch)) {
-    return nullptr;
-  }
-  return &g_lower_env_report_scratch;
-}
-
-static uint64_t lower_env_default_slope_q16(void) {
-  const uint32_t cps = interrupt_vclock_cycles_per_second();
-  return ((uint64_t)cps << 16) / (uint64_t)LOWER_ENV_SAMPLE_RATE_HZ;
-}
-
-static uint64_t lower_env_slope_from_observed_interval_q16(
-    uint32_t observed_interval_cycles) {
-  return observed_interval_cycles
-      ? (((uint64_t)observed_interval_cycles << 16) / LOWER_ENV_SAMPLE_RATE_HZ)
-      : lower_env_default_slope_q16();
-}
-
-static int32_t lower_env_signed_delta_u32(uint32_t from_dwt, uint32_t to_dwt) {
-  const uint32_t delta = to_dwt - from_dwt;
-  if (delta <= 0x7FFFFFFFUL) return (int32_t)delta;
-  const uint32_t magnitude = (uint32_t)((~delta) + 1U);
-  if (magnitude == 0x80000000UL) return (int32_t)(-2147483647 - 1);
-  return -(int32_t)magnitude;
-}
-
-static uint32_t lower_env_round_q16_u32(int64_t q16) {
-  if (q16 >= 0) return (uint32_t)((q16 + 32768LL) >> 16);
-  return (uint32_t)(-(((-q16) + 32768LL) >> 16));
-}
-
-static void lower_env_clear_active(lower_env_lane_t& lane) {
-  for (uint32_t i = 0; i < LOWER_ENV_BUCKET_COUNT; i++) {
-    lane.buckets[i] = lower_env_bucket_t{};
-  }
-  lane.active_valid = false;
-  lane.active_sample_count = 0;
-  lane.active_bucket_count = 0;
-  lane.active_sample_accepted_count = 0;
-  lane.active_sample_rejected_count = 0;
-  lane.active_sample_hard_rejected_count = 0;
-  lane.active_base_dwt = 0;
-  lane.active_residual_sample_count = 0;
-  lane.active_residual_min_cycles = 0;
-  lane.active_residual_max_cycles = 0;
-  lane.active_residual_sum_cycles = 0;
-  lane.active_residual_square_sum_cycles = 0;
-  lane.active_residual_abs_gt4_count = 0;
-  lane.active_residual_abs_gt16_count = 0;
-  lane.active_residual_abs_gt32_count = 0;
-  lane.active_residual_abs_gt64_count = 0;
-  lane.active_residual_abs_gt128_count = 0;
-}
-
-static void lower_env_note_residual(lower_env_lane_t& lane,
-                                    int32_t residual_cycles) {
-  const uint32_t abs_residual = lower_env_abs_i32(residual_cycles);
-  if (lane.active_residual_sample_count == 0) {
-    lane.active_residual_min_cycles = residual_cycles;
-    lane.active_residual_max_cycles = residual_cycles;
-  } else {
-    if (residual_cycles < lane.active_residual_min_cycles) {
-      lane.active_residual_min_cycles = residual_cycles;
-    }
-    if (residual_cycles > lane.active_residual_max_cycles) {
-      lane.active_residual_max_cycles = residual_cycles;
-    }
-  }
-
-  lane.active_residual_sample_count++;
-  lane.active_residual_sum_cycles += (int64_t)residual_cycles;
-  lane.active_residual_square_sum_cycles +=
-      (uint64_t)abs_residual * (uint64_t)abs_residual;
-
-  if (abs_residual > LOWER_ENV_ERROR_GATE_CYCLES) {
-    lane.active_residual_abs_gt4_count++;
-  }
-  if (abs_residual > LOWER_ENV_RESIDUAL_BIN16_CYCLES) {
-    lane.active_residual_abs_gt16_count++;
-  }
-  if (abs_residual > LOWER_ENV_RESIDUAL_BIN32_CYCLES) {
-    lane.active_residual_abs_gt32_count++;
-  }
-  if (abs_residual > LOWER_ENV_RESIDUAL_BIN64_CYCLES) {
-    lane.active_residual_abs_gt64_count++;
-  }
-  if (abs_residual > LOWER_ENV_RESIDUAL_BIN128_CYCLES) {
-    lane.active_residual_abs_gt128_count++;
-  }
-}
-
-static void lower_env_copy_residual_forensics(cadence_regression_result_t& r,
-                                              const lower_env_lane_t& lane) {
-  r.residual_sample_count = lane.active_residual_sample_count;
-  r.residual_min_cycles = lane.active_residual_sample_count
-      ? lane.active_residual_min_cycles
-      : 0;
-  r.residual_max_cycles = lane.active_residual_sample_count
-      ? lane.active_residual_max_cycles
-      : 0;
-  r.residual_abs_gt4_count = lane.active_residual_abs_gt4_count;
-  r.residual_abs_gt16_count = lane.active_residual_abs_gt16_count;
-  r.residual_abs_gt32_count = lane.active_residual_abs_gt32_count;
-  r.residual_abs_gt64_count = lane.active_residual_abs_gt64_count;
-  r.residual_abs_gt128_count = lane.active_residual_abs_gt128_count;
-
-  if (lane.active_residual_sample_count == 0) {
-    r.residual_mean_q16_cycles = 0;
-    r.residual_stddev_q16_cycles = 0;
-    return;
-  }
-
-  const uint32_t count = lane.active_residual_sample_count;
-  const int64_t mean_q16 =
-      (lane.active_residual_sum_cycles * 65536LL) / (int64_t)count;
-  const uint64_t mean_abs_q16 = mean_q16 >= 0
-      ? (uint64_t)mean_q16
-      : (uint64_t)(-mean_q16);
-  const uint64_t mean_square_q32 = mean_abs_q16 * mean_abs_q16;
-  const uint64_t second_moment_q32 = lower_env_ratio_q32(
-      lane.active_residual_square_sum_cycles, count);
-  const uint64_t variance_q32 = second_moment_q32 > mean_square_q32
-      ? second_moment_q32 - mean_square_q32
-      : 0U;
-
-  r.residual_mean_q16_cycles = pps_floorline_i32_from_i64(mean_q16);
-  r.residual_stddev_q16_cycles = lower_env_isqrt_u64(variance_q32);
-}
-
-static uint32_t lower_env_quality_confidence_ppm(
-    const cadence_regression_result_t& r) {
-  if (!r.valid) return 0U;
-  if (!r.candidate_present || r.fallback_used) return 250000U;
-
-  uint32_t score = 1000000U;
-
-  if (r.sample_accepted_count < LOWER_ENV_PUBLISH_MIN_SAMPLES) {
-    const uint32_t sample_score =
-        (r.sample_accepted_count * 1000000U) / LOWER_ENV_PUBLISH_MIN_SAMPLES;
-    if (sample_score < score) score = sample_score;
-  }
-
-  if (r.selected_bucket_count < LOWER_ENV_PUBLISH_MIN_BUCKETS) {
-    const uint32_t bucket_score =
-        (r.selected_bucket_count * 1000000U) / LOWER_ENV_PUBLISH_MIN_BUCKETS;
-    if (bucket_score < score) score = bucket_score;
-  }
-
-  if (r.residual_sample_count != 0U) {
-    const uint32_t noisy = r.residual_abs_gt64_count + r.sample_hard_rejected_count;
-    if (noisy != 0U) {
-      const uint32_t penalty =
-          (noisy >= r.residual_sample_count)
-              ? 700000U
-              : (uint32_t)(((uint64_t)noisy * 700000ULL) /
-                           (uint64_t)r.residual_sample_count);
-      score = (penalty >= score) ? 0U : (score - penalty);
-    }
-  }
-
-  return score;
-}
-
-static void lower_env_note_valid_estimate(lower_env_lane_t& lane) {
-  if (!lane.floorline_seen_valid_estimate) {
-    lane.floorline_seen_valid_estimate = true;
-  }
-  if (lane.floorline_valid_estimate_count != UINT32_MAX) {
-    lane.floorline_valid_estimate_count++;
-  }
-}
-
-static void lower_env_note_fallback(lower_env_lane_t& lane) {
-  if (lane.fallback_publish_count != UINT32_MAX) {
-    lane.fallback_publish_count++;
-  }
-}
-
-static __attribute__((noinline)) void lower_env_watchdog_anomaly(
-    lower_env_lane_t& lane,
-                                       uint32_t reason,
-                                       uint32_t detail0,
-                                       uint32_t detail1,
-                                       uint32_t detail2 = 0U) {
-  lane.watchdog_anomaly_count++;
-  lane.last_watchdog_reason = reason;
-  interrupt_science_reject(
-      clocks_science_reject_reason_t::INTERRUPT_FLOORLINE_FIT,
-      lane.kind,
-      reason,
-      detail0,
-      detail1,
-      detail2);
-}
-
-static void lower_env_reset_lane(interrupt_subscriber_kind_t kind) {
-  lower_env_lane_store_t* const store = lower_env_store_for(kind);
-  lower_env_consumer_state_t* const consumer = lower_env_consumer_for(kind);
-  if (!store || !consumer) return;
-
-  // Runtime reset is a serialized control-plane mutation.  Priority 0 never
-  // touches FloorLine, and BASEPRI excludes its priority-16 window writer.
-  const uint32_t prior_basepri = interrupt_priority0_guard_enter();
-  const char* const name = store->lane.name;
-  store->seal_pending = false;
-  store->seal_observed_dwt = 0;
-  store->seal_target_counter32 = 0;
-  store->seal_target_hw16 = 0;
-  store->seal_observed_hw16 = 0;
-  lower_env_write_begin(*store);
-  store->lane = lower_env_lane_t{};
-  store->lane.kind = kind;
-  store->lane.name = name;
-  store->lane.reset_count++;
-  lower_env_write_end(*store);
-  *consumer = lower_env_consumer_state_t{};
-  interrupt_priority0_guard_exit(prior_basepri);
-
-  interrupt_feature_update_floorline();
-}
-
-static void lower_env_reset_all(void) {
-  g_interrupt_feature_floorline_latched_nominal = false;
-
-  g_lower_env_vclock_store.seq = 0;
-  g_lower_env_vclock_store.seal_pending = false;
-  g_lower_env_vclock_store.seal_observed_dwt = 0;
-  g_lower_env_vclock_store.seal_target_counter32 = 0;
-  g_lower_env_vclock_store.seal_target_hw16 = 0;
-  g_lower_env_vclock_store.seal_observed_hw16 = 0;
-  g_lower_env_vclock_store.lane = lower_env_lane_t{};
-  g_lower_env_vclock_store.lane.kind = interrupt_subscriber_kind_t::VCLOCK;
-  g_lower_env_vclock_store.lane.name = "vclock";
-
-  g_lower_env_ocxo1_store.seq = 0;
-  g_lower_env_ocxo1_store.seal_pending = false;
-  g_lower_env_ocxo1_store.seal_observed_dwt = 0;
-  g_lower_env_ocxo1_store.seal_target_counter32 = 0;
-  g_lower_env_ocxo1_store.seal_target_hw16 = 0;
-  g_lower_env_ocxo1_store.seal_observed_hw16 = 0;
-  g_lower_env_ocxo1_store.lane = lower_env_lane_t{};
-  g_lower_env_ocxo1_store.lane.kind = interrupt_subscriber_kind_t::OCXO1;
-  g_lower_env_ocxo1_store.lane.name = "ocxo1";
-
-  g_lower_env_ocxo2_store.seq = 0;
-  g_lower_env_ocxo2_store.seal_pending = false;
-  g_lower_env_ocxo2_store.seal_observed_dwt = 0;
-  g_lower_env_ocxo2_store.seal_target_counter32 = 0;
-  g_lower_env_ocxo2_store.seal_target_hw16 = 0;
-  g_lower_env_ocxo2_store.seal_observed_hw16 = 0;
-  g_lower_env_ocxo2_store.lane = lower_env_lane_t{};
-  g_lower_env_ocxo2_store.lane.kind = interrupt_subscriber_kind_t::OCXO2;
-  g_lower_env_ocxo2_store.lane.name = "ocxo2";
-
-  g_lower_env_consumer_vclock = lower_env_consumer_state_t{};
-  g_lower_env_consumer_ocxo1 = lower_env_consumer_state_t{};
-  g_lower_env_consumer_ocxo2 = lower_env_consumer_state_t{};
-  g_lower_env_snapshot_count = 0;
-  interrupt_feature_update_floorline();
-}
-
-static bool interrupt_feature_floorline_lane_nominal(
-    interrupt_subscriber_kind_t kind) {
-  return lower_env_seen_valid_estimate_load(kind);
-}
-
-static void interrupt_feature_update_floorline(void) {
-  if (g_interrupt_feature_floorline_latched_nominal) {
-    interrupt_feature_set_cached("FLOORLINE",
-                                 g_interrupt_feature_floorline,
-                                 system_feature_status_t::NOMINAL);
-    return;
-  }
-
-  const bool v_ok = interrupt_feature_floorline_lane_nominal(
-      interrupt_subscriber_kind_t::VCLOCK);
-  const bool o1_ok = !interrupt_feature_lane_required(interrupt_subscriber_kind_t::OCXO1) ||
-      interrupt_feature_floorline_lane_nominal(interrupt_subscriber_kind_t::OCXO1);
-  const bool o2_ok = !interrupt_feature_lane_required(interrupt_subscriber_kind_t::OCXO2) ||
-      interrupt_feature_floorline_lane_nominal(interrupt_subscriber_kind_t::OCXO2);
-
-  if (v_ok && o1_ok && o2_ok) {
-    g_interrupt_feature_floorline_latched_nominal = true;
-    interrupt_feature_set_cached("FLOORLINE",
-                                 g_interrupt_feature_floorline,
-                                 system_feature_status_t::NOMINAL);
-    return;
-  }
-
-  interrupt_feature_set_cached("FLOORLINE",
-                               g_interrupt_feature_floorline,
-                               system_feature_status_t::INITIALIZING);
-}
-
-static const char* lower_env_publish_source_name(uint32_t source) {
-  switch (source) {
-    case FLOORLINE_PUBLISH_SOURCE_FLOORLINE: return "floorline";
-    case FLOORLINE_PUBLISH_SOURCE_OBSERVED:  return "observed";
-    default: return "unknown";
-  }
-}
-
-static const char* lower_env_publish_reason_name(uint32_t reason) {
-  switch (reason) {
-    case FLOORLINE_REASON_ACCEPTED:       return "accepted";
-    case FLOORLINE_REASON_INIT:           return "init";
-    case FLOORLINE_REASON_SAMPLE_STARVED: return "sample_starved";
-    case FLOORLINE_REASON_BUCKET_STARVED: return "bucket_starved";
-    case FLOORLINE_REASON_FIT_INVALID:    return "fit_invalid";
-    case FLOORLINE_REASON_FIT_OUTLIER:    return "fit_outlier";
-    case FLOORLINE_REASON_INTERVAL_GATE:  return "interval_gate";
-    case FLOORLINE_REASON_EDGE_GATE:      return "edge_gate";
-    case FLOORLINE_REASON_OBSERVED_FALLBACK: return "observed_fallback";
-    case FLOORLINE_REASON_SLOPE_ANOMALY:  return "slope_anomaly";
-    default: return "unknown";
-  }
-}
-
-
-// Raw observed bookend court.  This is deliberately separate from the final
-// DWT publication court: the diagnostic FloorLine candidate and published
-// observation-derived endpoint may remain perfectly lawful while the raw
-// observed witness interval collapses to 0 or 1 cycles.  Capture the
-// facts at the lower-envelope boundary, before previous_observed_edge_* is
-// overwritten, then publish the WATCHDOG_ANOMALY from the foreground one-second
-// handoff if the campaign continuity watchdog is armed.
-static constexpr uint32_t LOWER_ENV_RAW_BOOKEND_REASON_NONE = 0;
-static constexpr uint32_t LOWER_ENV_RAW_BOOKEND_REASON_ZERO = 1;
-static constexpr uint32_t LOWER_ENV_RAW_BOOKEND_REASON_ONE_CYCLE = 2;
-static constexpr uint32_t LOWER_ENV_RAW_BOOKEND_SOURCE_UNKNOWN = 0;
-static constexpr uint32_t LOWER_ENV_RAW_BOOKEND_SOURCE_INVALID_WINDOW = 1;
-static constexpr uint32_t LOWER_ENV_RAW_BOOKEND_SOURCE_SEALED_WINDOW = 2;
-static constexpr uint32_t LOWER_ENV_RAW_BOOKEND_FATAL_MAX_CYCLES = 1U;
-
-static const char* lower_env_raw_bookend_reason_name(uint32_t reason) {
-  switch (reason) {
-    case LOWER_ENV_RAW_BOOKEND_REASON_ZERO:
-      return "raw_observed_interval_zero_cycles";
-    case LOWER_ENV_RAW_BOOKEND_REASON_ONE_CYCLE:
-      return "raw_observed_interval_one_cycle";
-    default:
-      return "raw_observed_interval_unknown";
-  }
-}
-
-static const char* lower_env_raw_bookend_source_name(uint32_t source) {
-  switch (source) {
-    case LOWER_ENV_RAW_BOOKEND_SOURCE_INVALID_WINDOW:
-      return "invalid_window";
-    case LOWER_ENV_RAW_BOOKEND_SOURCE_SEALED_WINDOW:
-      return "sealed_window";
-    default:
-      return "unknown";
-  }
-}
-
-static void lower_env_note_raw_bookend_anomaly(
-    lower_env_lane_t& lane,
-    const cadence_regression_result_t& r,
-    uint32_t source) {
-  if (!r.observed_interval_valid) return;
-  if (r.observed_interval_cycles > LOWER_ENV_RAW_BOOKEND_FATAL_MAX_CYCLES) {
-    return;
-  }
-
-  lane.raw_bookend_anomaly_pending = true;
-  if (lane.raw_bookend_anomaly_count != UINT32_MAX) {
-    lane.raw_bookend_anomaly_count++;
-  }
-  lane.raw_bookend_anomaly_sequence = r.sequence;
-  lane.raw_bookend_anomaly_reason = (r.observed_interval_cycles == 0U)
-      ? LOWER_ENV_RAW_BOOKEND_REASON_ZERO
-      : LOWER_ENV_RAW_BOOKEND_REASON_ONE_CYCLE;
-  lane.raw_bookend_anomaly_source = source;
-  lane.raw_bookend_anomaly_observed_interval_cycles = r.observed_interval_cycles;
-  lane.raw_bookend_anomaly_reference_cycles = interrupt_vclock_cycles_per_second();
-  if (lane.raw_bookend_anomaly_reference_cycles == 0U) {
-    lane.raw_bookend_anomaly_reference_cycles = (uint32_t)DWT_EXPECTED_PER_PPS;
-  }
-  lane.raw_bookend_anomaly_previous_observed_dwt =
-      lane.previous_observed_edge_dwt;
-  lane.raw_bookend_anomaly_current_observed_dwt = r.observed_dwt_at_event;
-  lane.raw_bookend_anomaly_previous_target_counter32 =
-      lane.previous_observed_edge_target_counter32;
-  lane.raw_bookend_anomaly_current_target_counter32 =
-      r.target_counter32_at_event;
-  lane.raw_bookend_anomaly_previous_target_hw16 =
-      lane.previous_observed_edge_target_hw16;
-  lane.raw_bookend_anomaly_previous_observed_hw16 =
-      lane.previous_observed_edge_observed_hw16;
-  lane.raw_bookend_anomaly_current_target_hw16 =
-      r.target_hardware16_at_event;
-  lane.raw_bookend_anomaly_current_observed_hw16 =
-      r.observed_hardware16_at_event;
-  lane.raw_bookend_anomaly_update_count = lane.update_count;
-  lane.raw_bookend_anomaly_invalid_window_count = lane.invalid_window_count;
-  lane.raw_bookend_anomaly_fallback_publish_count = lane.fallback_publish_count;
-}
-
-static FLASHMEM bool lower_env_raw_bookend_watchdog_if_pending(
-    interrupt_subscriber_kind_t kind,
-    const cadence_regression_result_t& r,
-    const dwt_repair_diag_t& diag,
-    const char* handoff_phase) {
-  const lower_env_lane_t* lane = lower_env_report_snapshot(kind);
-  lower_env_consumer_state_t* const consumer = lower_env_consumer_for(kind);
-  if (!lane || !consumer || !lane->raw_bookend_anomaly_pending) return true;
-  if (lane->raw_bookend_anomaly_sequence != r.sequence) return true;
-  if (lane->raw_bookend_anomaly_sequence <=
-      consumer->last_raw_bookend_sequence) {
-    return true;
-  }
-
-  // Foreground owns consumption state; priority 16 remains the sole writer of
-  // the live FloorLine estimator.
-  consumer->last_raw_bookend_sequence = lane->raw_bookend_anomaly_sequence;
-
-  if (!clocks_watchdog_campaign_armed()) {
-    // Pre-campaign/start-prologue raw witness discontinuities are diagnostics;
-    // consuming the immutable record prevents it from firing after START.
-    return true;
-  }
-
-  if (consumer->raw_bookend_report_count != UINT32_MAX) {
-    consumer->raw_bookend_report_count++;
-  }
-  if (consumer->watchdog_anomaly_count != UINT32_MAX) {
-    consumer->watchdog_anomaly_count++;
-  }
-  consumer->last_watchdog_reason = lane->raw_bookend_anomaly_reason;
-
-  const uint32_t observed_interval =
-      lane->raw_bookend_anomaly_observed_interval_cycles;
-
-  // The complete lower-envelope transcript remains in the lane report store and
-  // the candidate's embedded micro forensics.  Do not allocate a second verbose
-  // watchdog Payload merely to reject this science row.
-  (void)diag;
-  (void)handoff_phase;
-  interrupt_science_reject(
-      clocks_science_reject_reason_t::INTERRUPT_RAW_BOOKEND,
-      kind,
-      observed_interval,
-      lane->raw_bookend_anomaly_current_observed_dwt,
-      lane->raw_bookend_anomaly_current_target_counter32,
-      lane->raw_bookend_anomaly_reason);
-  return false;
-}
-
-static void lower_env_decide_publication(cadence_regression_result_t& r) {
-  r.publish_source = FLOORLINE_PUBLISH_SOURCE_OBSERVED;
-  r.publish_reason = FLOORLINE_REASON_INIT;
-  r.publish_floorline = false;
-  r.fallback_used = true;
-  r.candidate_interval_error_cycles =
-      (r.observed_interval_valid && r.inferred_interval_valid)
-          ? r.inferred_minus_observed_interval_cycles
-          : 0;
-
-  if (!r.valid || !r.candidate_present || r.inferred_dwt_at_event == 0U) {
-    r.publish_reason = FLOORLINE_REASON_OBSERVED_FALLBACK;
-    r.confidence_ppm = lower_env_quality_confidence_ppm(r);
-    return;
-  }
-
-  uint32_t soft_reason = FLOORLINE_REASON_ACCEPTED;
-  if (r.sample_accepted_count < LOWER_ENV_PUBLISH_MIN_SAMPLES) {
-    soft_reason = FLOORLINE_REASON_SAMPLE_STARVED;
-  } else if (r.selected_bucket_count < LOWER_ENV_PUBLISH_MIN_BUCKETS) {
-    soft_reason = FLOORLINE_REASON_BUCKET_STARVED;
-  } else if (r.fit_error_abs_gt4_count != 0U ||
-             r.residual_abs_gt4_count != 0U) {
-    soft_reason = FLOORLINE_REASON_FIT_OUTLIER;
-  } else if ((r.observed_interval_valid && r.inferred_interval_valid) &&
-             lower_env_abs_i32(r.inferred_minus_observed_interval_cycles) >
-                 LOWER_ENV_ERROR_GATE_CYCLES) {
-    soft_reason = FLOORLINE_REASON_INTERVAL_GATE;
-  } else if (lower_env_abs_i32(r.inferred_minus_observed_cycles) >
-             LOWER_ENV_ERROR_GATE_CYCLES) {
-    soft_reason = FLOORLINE_REASON_EDGE_GATE;
-  }
-
-  if ((r.observed_interval_valid && r.inferred_interval_valid) &&
-      lower_env_abs_i32(r.inferred_minus_observed_interval_cycles) >
-          LOWER_ENV_PUBLISH_HARD_INTERVAL_GATE_CYCLES) {
-    r.publish_reason = FLOORLINE_REASON_INTERVAL_GATE;
-    r.confidence_ppm = lower_env_quality_confidence_ppm(r);
-    return;
-  }
-
-  if (lower_env_abs_i32(r.inferred_minus_observed_cycles) >
-      LOWER_ENV_PUBLISH_HARD_EDGE_GATE_CYCLES) {
-    r.publish_reason = FLOORLINE_REASON_EDGE_GATE;
-    r.confidence_ppm = lower_env_quality_confidence_ppm(r);
-    return;
-  }
-
-  r.publish_source = FLOORLINE_PUBLISH_SOURCE_FLOORLINE;
-  r.publish_reason = soft_reason;
-  r.publish_floorline = true;
-  r.fallback_used = false;
-  r.confidence_ppm = lower_env_quality_confidence_ppm(r);
-}
-
-static __attribute__((noinline)) void lower_env_publish_invalid_window(
-    lower_env_lane_t& lane,
-                                             uint32_t observed_dwt,
-                                             uint32_t target_counter32,
-                                             uint16_t target_hw16,
-                                             uint16_t observed_hw16) {
-  cadence_regression_result_t r{};
-  r.valid = true;
-  r.sequence = ++lane.update_count;
-  r.sample_count = lane.active_sample_count;
-  r.selected_bucket_count = lane.active_bucket_count;
-  r.observed_dwt_at_event = observed_dwt;
-  r.inferred_dwt_at_event = observed_dwt;
-  r.candidate_present = false;
-  r.publish_source = FLOORLINE_PUBLISH_SOURCE_OBSERVED;
-  r.publish_reason =
-      (lane.active_sample_accepted_count < LOWER_ENV_PUBLISH_MIN_SAMPLES)
-          ? FLOORLINE_REASON_SAMPLE_STARVED
-          : FLOORLINE_REASON_BUCKET_STARVED;
-  r.publish_floorline = false;
-  r.fallback_used = true;
-  r.confidence_ppm = 250000U;
-  r.sample_accepted_count = lane.active_sample_accepted_count;
-  r.sample_rejected_count = lane.active_sample_rejected_count;
-  r.sample_hard_rejected_count = lane.active_sample_hard_rejected_count;
-  r.gate_cycles = LOWER_ENV_ERROR_GATE_CYCLES;
-  r.sample_hard_reject_gate_cycles = LOWER_ENV_SAMPLE_HARD_REJECT_CYCLES;
-  r.inferred_minus_observed_cycles = 0;
-  r.target_counter32_at_event = target_counter32;
-  r.target_hardware16_at_event = target_hw16;
-  r.observed_hardware16_at_event = observed_hw16;
-  r.slope_q16_cycles_per_sample = lane.previous_slope_valid
-      ? lane.previous_slope_q16_cycles_per_sample
-      : lower_env_default_slope_q16();
-  r.inferred_interval_valid = lane.previous_inferred_edge_valid;
-  r.observed_interval_valid = lane.previous_observed_edge_valid;
-  r.observed_interval_cycles = lane.previous_observed_edge_valid
-      ? (observed_dwt - lane.previous_observed_edge_dwt)
-      : 0U;
-  r.inferred_interval_cycles = r.observed_interval_valid
-      ? r.observed_interval_cycles
-      : 0U;
-  r.inferred_minus_observed_interval_cycles = 0;
-  lower_env_copy_residual_forensics(r, lane);
-  lower_env_note_raw_bookend_anomaly(
-      lane, r, LOWER_ENV_RAW_BOOKEND_SOURCE_INVALID_WINDOW);
-
-  lane.previous_observed_edge_dwt = observed_dwt;
-  lane.previous_observed_edge_valid = true;
-  lane.previous_observed_edge_target_counter32 = target_counter32;
-  lane.previous_observed_edge_target_hw16 = target_hw16;
-  lane.previous_observed_edge_observed_hw16 = observed_hw16;
-  lane.previous_inferred_edge_dwt = observed_dwt;
-  lane.previous_inferred_edge_valid = true;
-  lane.previous_slope_q16_cycles_per_sample =
-      r.observed_interval_valid
-          ? lower_env_slope_from_observed_interval_q16(r.observed_interval_cycles)
-          : lower_env_default_slope_q16();
-  lane.previous_slope_valid = true;
-  lane.last = r;
-  lane.invalid_window_count++;
-  lower_env_note_fallback(lane);
-  lower_env_clear_active(lane);
-}
-
-struct lower_env_fit_model_t {
-  int64_t prior_slope_q16 = 0;
-  int64_t slope_delta_q16 = 0;
-  int64_t residual_intercept_q16 = 0;
-  int64_t full_slope_q16 = 0;
-};
-
-struct lower_env_anchor_result_t {
-  uint32_t population_count = 0;
-  int64_t single_min_q16 = 0;
-  int64_t second_q16 = 0;
-  int64_t selected_q16 = 0;
-};
-
-struct lower_env_fit_error_stats_t {
-  int64_t residual_sum_q16 = 0;
-  uint64_t residual_sq_sum_q16 = 0;
-  int32_t min_residual_cycles = INT32_MAX;
-  int32_t max_residual_cycles = INT32_MIN;
-  uint32_t gt_plus4 = 0;
-  uint32_t lt_minus4 = 0;
-  uint32_t abs_gt4 = 0;
-};
-
-// Fit lower-envelope residuals against the prior-second line, not absolute
-// DWT deltas: observed = prior_line(x) + residual_line(x).  The complete slope
-// is therefore prior_slope plus the fitted residual slope delta.
-static __attribute__((noinline)) bool lower_env_fit_selected_buckets(
-    const lower_env_lane_t& lane,
-    uint32_t n,
-    int64_t prior_slope_q16,
-    lower_env_fit_model_t& out) {
-  int64_t sum_x = 0;
-  int64_t sum_y = 0;
-  int64_t sum_xx = 0;
-  int64_t sum_xy = 0;
-  for (uint32_t i = 0; i < LOWER_ENV_BUCKET_COUNT; i++) {
-    const lower_env_bucket_t& b = lane.buckets[i];
-    if (!b.valid) continue;
-    const int64_t x = (int64_t)b.x;
-    const int64_t y = (int64_t)b.residual_cycles;
-    sum_x += x;
-    sum_y += y;
-    sum_xx += x * x;
-    sum_xy += x * y;
-  }
-
-  const int64_t denom = (int64_t)n * sum_xx - sum_x * sum_x;
-  if (denom == 0) return false;
-
-  const int64_t slope_delta_num =
-      ((int64_t)n * sum_xy - sum_x * sum_y) << 16;
-  out.prior_slope_q16 = prior_slope_q16;
-  out.slope_delta_q16 = slope_delta_num / denom;
-  out.residual_intercept_q16 = (((int64_t)sum_y << 16) -
-                                out.slope_delta_q16 * sum_x) /
-                               (int64_t)n;
-  out.full_slope_q16 = out.prior_slope_q16 + out.slope_delta_q16;
-  return true;
-}
-
-static __attribute__((noinline)) bool lower_env_select_anchor(
-    const lower_env_lane_t& lane,
-    const lower_env_fit_model_t& fit,
-    lower_env_anchor_result_t& out) {
-  int64_t lowest[LOWER_ENV_ANCHOR_POPULATION_COUNT]{};
-  uint32_t count = 0;
-
-  for (uint32_t i = 0; i < LOWER_ENV_BUCKET_COUNT; i++) {
-    const lower_env_bucket_t& b = lane.buckets[i];
-    if (!b.valid) continue;
-
-    const int64_t observed_residual_q16 =
-        (int64_t)b.residual_cycles << 16;
-    const int64_t fit_residual_q16 =
-        fit.residual_intercept_q16 +
-        fit.slope_delta_q16 * (int64_t)b.x;
-    const int64_t fit_error_q16 =
-        observed_residual_q16 - fit_residual_q16;
-
-    if (count < LOWER_ENV_ANCHOR_POPULATION_COUNT) {
-      lowest[count++] = fit_error_q16;
-      continue;
-    }
-
-    uint32_t largest_index = 0;
-    for (uint32_t j = 1; j < LOWER_ENV_ANCHOR_POPULATION_COUNT; j++) {
-      if (lowest[j] > lowest[largest_index]) largest_index = j;
-    }
-    if (fit_error_q16 < lowest[largest_index]) {
-      lowest[largest_index] = fit_error_q16;
-    }
-  }
-
-  if (count < LOWER_ENV_ANCHOR_POPULATION_COUNT) return false;
-
-  // Eight elements are deliberately sorted with scalar assignments.  The old
-  // insertion shift encouraged a memmove inside the already-large seal frame.
-  for (uint32_t i = 1; i < LOWER_ENV_ANCHOR_POPULATION_COUNT; i++) {
-    const int64_t value = lowest[i];
-    uint32_t j = i;
-    while (j > 0U && value < lowest[j - 1U]) {
-      lowest[j] = lowest[j - 1U];
-      j--;
-    }
-    lowest[j] = value;
-  }
-
-  out.population_count = count;
-  out.single_min_q16 = lowest[0];
-  out.second_q16 = lowest[1];
-  out.selected_q16 = lower_env_average_i64_nearest(lowest[3], lowest[4]);
-  return true;
-}
-
-static __attribute__((noinline)) void lower_env_measure_fit_errors(
-    const lower_env_lane_t& lane,
-    const lower_env_fit_model_t& fit,
-    lower_env_fit_error_stats_t& out) {
-  out = lower_env_fit_error_stats_t{};
-
-  for (uint32_t i = 0; i < LOWER_ENV_BUCKET_COUNT; i++) {
-    const lower_env_bucket_t& b = lane.buckets[i];
-    if (!b.valid) continue;
-
-    const int64_t observed_residual_q16 =
-        (int64_t)b.residual_cycles << 16;
-    const int64_t fit_residual_q16 =
-        fit.residual_intercept_q16 +
-        fit.slope_delta_q16 * (int64_t)b.x;
-    const int64_t fit_error_q16 =
-        observed_residual_q16 - fit_residual_q16;
-
-    out.residual_sum_q16 += fit_error_q16;
-    const int64_t abs_q16 =
-        fit_error_q16 >= 0 ? fit_error_q16 : -fit_error_q16;
-    out.residual_sq_sum_q16 +=
-        (uint64_t)((abs_q16 * abs_q16) >> 16);
-
-    const int32_t residual_cycles = (int32_t)(fit_error_q16 >> 16);
-    if (residual_cycles < out.min_residual_cycles) {
-      out.min_residual_cycles = residual_cycles;
-    }
-    if (residual_cycles > out.max_residual_cycles) {
-      out.max_residual_cycles = residual_cycles;
-    }
-    if (residual_cycles > (int32_t)LOWER_ENV_ERROR_GATE_CYCLES) {
-      out.gt_plus4++;
-    }
-    if (residual_cycles < -(int32_t)LOWER_ENV_ERROR_GATE_CYCLES) {
-      out.lt_minus4++;
-    }
-    if (residual_cycles > (int32_t)LOWER_ENV_ERROR_GATE_CYCLES ||
-        residual_cycles < -(int32_t)LOWER_ENV_ERROR_GATE_CYCLES) {
-      out.abs_gt4++;
-    }
-  }
-}
-
-static __attribute__((noinline)) void lower_env_finalize_sealed_window(
-    lower_env_lane_t& lane,
-    uint32_t n,
-    const lower_env_fit_model_t& fit,
-    const lower_env_anchor_result_t& anchor,
-    const lower_env_fit_error_stats_t& stats,
-    uint32_t observed_dwt,
-    uint32_t target_counter32,
-    uint16_t target_hw16,
-    uint16_t observed_hw16) {
-  const uint32_t edge_x = lane.active_sample_count - 1U;
-  const int64_t prior_edge_delta_q16 =
-      fit.prior_slope_q16 * (int64_t)edge_x;
-  const int64_t residual_edge_delta_q16 =
-      fit.residual_intercept_q16 +
-      fit.slope_delta_q16 * (int64_t)edge_x;
-  const int64_t inferred_delta_q16 =
-      prior_edge_delta_q16 + residual_edge_delta_q16;
-  uint32_t inferred_edge_dwt =
-      lane.active_base_dwt + lower_env_round_q16_u32(inferred_delta_q16);
-  int32_t inferred_minus_observed =
-      lower_env_signed_delta_u32(observed_dwt, inferred_edge_dwt);
-  if (inferred_minus_observed > 0) {
-    // One-sided latency law: the inferred least-late edge must not be later
-    // than the actual observed edge.
-    inferred_edge_dwt = observed_dwt;
-    inferred_minus_observed = 0;
-  }
-
-  cadence_regression_result_t r{};
-  r.valid = true;
-  r.candidate_present = true;
-  r.sequence = ++lane.update_count;
-  r.sample_count = lane.active_sample_count;
-  r.sample_accepted_count = lane.active_sample_accepted_count;
-  r.sample_rejected_count = lane.active_sample_rejected_count;
-  r.sample_hard_rejected_count = lane.active_sample_hard_rejected_count;
-  r.selected_bucket_count = n;
-  r.observed_dwt_at_event = observed_dwt;
-  r.inferred_dwt_at_event = inferred_edge_dwt;
-  r.inferred_minus_observed_cycles = inferred_minus_observed;
-  r.target_counter32_at_event = target_counter32;
-  r.target_hardware16_at_event = target_hw16;
-  r.observed_hardware16_at_event = observed_hw16;
-  r.slope_q16_cycles_per_sample = (uint64_t)fit.full_slope_q16;
-  r.slope_delta_q16_cycles_per_sample = fit.slope_delta_q16;
-  r.fit_error_mean_q16_cycles =
-      (int32_t)(stats.residual_sum_q16 / (int64_t)n);
-  r.fit_error_stddev_q16_cycles = lower_env_isqrt_u64(
-      lower_env_ratio_q16(stats.residual_sq_sum_q16, n));
-  r.fit_error_min_cycles =
-      (stats.min_residual_cycles == INT32_MAX)
-          ? 0
-          : stats.min_residual_cycles;
-  r.fit_error_max_cycles =
-      (stats.max_residual_cycles == INT32_MIN)
-          ? 0
-          : stats.max_residual_cycles;
-  r.fit_error_gt_plus4_count = stats.gt_plus4;
-  r.fit_error_lt_minus4_count = stats.lt_minus4;
-  r.fit_error_abs_gt4_count = stats.abs_gt4;
-  r.anchor_policy_id = FLOORLINE_ANCHOR_POLICY_MEDIAN8;
-  r.anchor_population_count = anchor.population_count;
-  r.anchor_single_min_q16_cycles =
-      lower_env_i32_from_i64(anchor.single_min_q16);
-  r.anchor_second_q16_cycles = lower_env_i32_from_i64(anchor.second_q16);
-  r.anchor_selected_q16_cycles = lower_env_i32_from_i64(anchor.selected_q16);
-  r.anchor_selected_minus_single_min_q16_cycles = lower_env_i32_from_i64(
-      anchor.selected_q16 - anchor.single_min_q16);
-
-  r.observed_interval_valid = lane.previous_observed_edge_valid;
-  r.observed_interval_cycles = r.observed_interval_valid
-      ? (observed_dwt - lane.previous_observed_edge_dwt)
-      : 0U;
-  r.inferred_interval_valid = lane.previous_inferred_edge_valid;
-  r.inferred_interval_cycles = r.inferred_interval_valid
-      ? (inferred_edge_dwt - lane.previous_inferred_edge_dwt)
-      : 0U;
-  if (r.observed_interval_valid && r.inferred_interval_valid) {
-    r.inferred_minus_observed_interval_cycles =
-        (r.inferred_interval_cycles >= r.observed_interval_cycles)
-            ? (int32_t)(r.inferred_interval_cycles -
-                        r.observed_interval_cycles)
-            : -(int32_t)(r.observed_interval_cycles -
-                         r.inferred_interval_cycles);
-  }
-
-  r.gate_cycles = LOWER_ENV_ERROR_GATE_CYCLES;
-  r.sample_hard_reject_gate_cycles = LOWER_ENV_SAMPLE_HARD_REJECT_CYCLES;
-  r.bucket_required_count = LOWER_ENV_PUBLISH_MIN_BUCKETS;
-  r.sample_required_count = LOWER_ENV_PUBLISH_MIN_SAMPLES;
-  lower_env_copy_residual_forensics(r, lane);
-  lower_env_decide_publication(r);
-  lower_env_note_raw_bookend_anomaly(
-      lane, r, LOWER_ENV_RAW_BOOKEND_SOURCE_SEALED_WINDOW);
-
-  lane.previous_observed_edge_dwt = observed_dwt;
-  lane.previous_observed_edge_valid = true;
-  lane.previous_observed_edge_target_counter32 = target_counter32;
-  lane.previous_observed_edge_target_hw16 = target_hw16;
-  lane.previous_observed_edge_observed_hw16 = observed_hw16;
-  lane.previous_inferred_edge_dwt =
-      r.publish_floorline ? inferred_edge_dwt : observed_dwt;
-  lane.previous_inferred_edge_valid = true;
-  lane.previous_slope_q16_cycles_per_sample = r.publish_floorline
-      ? (uint64_t)fit.full_slope_q16
-      : (r.observed_interval_valid
-            ? lower_env_slope_from_observed_interval_q16(
-                  r.observed_interval_cycles)
-            : lower_env_default_slope_q16());
-  lane.previous_slope_valid = true;
-  lane.last = r;
-  if (r.publish_floorline) {
-    lower_env_note_valid_estimate(lane);
-  } else {
-    lower_env_note_fallback(lane);
-  }
-  lower_env_clear_active(lane);
-}
-
-static __attribute__((noinline)) void lower_env_seal_deferred(
-    lower_env_lane_t& lane,
-    uint32_t observed_dwt,
-    uint32_t target_counter32,
-    uint16_t target_hw16,
-    uint16_t observed_hw16) {
-  const uint32_t n = lane.active_bucket_count;
-  const bool structurally_valid =
-      lane.active_valid &&
-      lane.active_sample_count >= LOWER_ENV_PUBLISH_MIN_SAMPLES &&
-      lane.active_sample_count <= LOWER_ENV_SAMPLE_RATE_HZ &&
-      lane.active_sample_accepted_count <= lane.active_sample_count &&
-      n >= LOWER_ENV_PUBLISH_MIN_BUCKETS &&
-      n <= LOWER_ENV_BUCKET_COUNT &&
-      n <= lane.active_sample_accepted_count;
-  if (!structurally_valid) {
-    lower_env_publish_invalid_window(lane, observed_dwt, target_counter32,
-                                     target_hw16, observed_hw16);
-    return;
-  }
-
-  const int64_t prior_slope_q16 = lane.previous_slope_valid
-      ? (int64_t)lane.previous_slope_q16_cycles_per_sample
-      : (int64_t)lower_env_default_slope_q16();
-  if (prior_slope_q16 <= 0) {
-    lower_env_publish_invalid_window(lane, observed_dwt, target_counter32,
-                                     target_hw16, observed_hw16);
-    return;
-  }
-
-  lower_env_fit_model_t fit{};
-  if (!lower_env_fit_selected_buckets(lane, n, prior_slope_q16, fit)) {
-    lower_env_publish_invalid_window(lane, observed_dwt, target_counter32,
-                                     target_hw16, observed_hw16);
-    return;
-  }
-
-  if (fit.full_slope_q16 <= 0) {
-    lower_env_watchdog_anomaly(
-        lane,
-        FLOORLINE_REASON_SLOPE_ANOMALY,
-        n,
-        (uint32_t)(prior_slope_q16 & 0xFFFFFFFFULL),
-        0U);
-    lower_env_publish_invalid_window(lane, observed_dwt, target_counter32,
-                                     target_hw16, observed_hw16);
-    return;
-  }
-
-  const int64_t default_slope_q16 =
-      (int64_t)lower_env_default_slope_q16();
-  if (default_slope_q16 > 0 &&
-      (fit.full_slope_q16 <
-           (default_slope_q16 *
-            (int64_t)LOWER_ENV_WATCHDOG_SLOPE_NUMERATOR) /
-               (int64_t)LOWER_ENV_WATCHDOG_SLOPE_DENOMINATOR ||
-       fit.full_slope_q16 >
-           default_slope_q16 *
-               (int64_t)LOWER_ENV_WATCHDOG_SLOPE_MULTIPLIER)) {
-    lower_env_watchdog_anomaly(
-        lane,
-        FLOORLINE_REASON_SLOPE_ANOMALY,
-        n,
-        (uint32_t)(fit.full_slope_q16 & 0xFFFFFFFFULL),
-        (uint32_t)(default_slope_q16 & 0xFFFFFFFFULL));
-    lower_env_publish_invalid_window(lane, observed_dwt, target_counter32,
-                                     target_hw16, observed_hw16);
-    return;
-  }
-
-  lower_env_anchor_result_t anchor{};
-  if (!lower_env_select_anchor(lane, fit, anchor)) {
-    lower_env_publish_invalid_window(lane, observed_dwt, target_counter32,
-                                     target_hw16, observed_hw16);
-    return;
-  }
-
-  // Robust lower-envelope anchor: the bucket minima already select the low
-  // population.  Anchor the regression to the center of its lowest eight.
-  fit.residual_intercept_q16 += anchor.selected_q16;
-
-  lower_env_fit_error_stats_t stats{};
-  lower_env_measure_fit_errors(lane, fit, stats);
-  lower_env_finalize_sealed_window(lane,
-                                   n,
-                                   fit,
-                                   anchor,
-                                   stats,
-                                   observed_dwt,
-                                   target_counter32,
-                                   target_hw16,
-                                   observed_hw16);
-}
-
-// All three measured lanes enter this function only from the priority-16
-// handoff tier.  Priority 0 captures immutable edge facts and never performs
-// FloorLine arithmetic or mutates FloorLine state.  The one-second bookend
-// freezes the active window; rich sealing is completed by the matching
-// foreground perishable-fact drain.
-static __attribute__((noinline)) void floorline_observe_handoff(
-    interrupt_subscriber_kind_t kind,
-    uint32_t observed_dwt,
-    uint32_t target_counter32,
-    uint16_t target_hw16,
-    uint16_t observed_hw16,
-    bool closes_second) {
-  lower_env_lane_store_t* const store = lower_env_store_for(kind);
-  if (!store) return;
-
-  // The foreground seal owns the frozen lane until it clears seal_pending.
-  // Priority 16 deliberately drops any intervening 1 kHz samples instead of
-  // touching the bucket array while lower-priority code is reading it.
-  if (store->seal_pending) {
-    return;
-  }
-
-  lower_env_lane_t& lane = store->lane;
-  lower_env_write_begin(*store);
-
-  if (lane.active_sample_count >= LOWER_ENV_SAMPLE_RATE_HZ) {
-    lane.overflow_reset_count++;
-    lower_env_clear_active(lane);
-  }
-
-  if (!lane.active_valid) {
-    lower_env_clear_active(lane);
-    lane.active_valid = true;
-    lane.active_base_dwt = observed_dwt;
-  }
-
-  const uint32_t x = lane.active_sample_count++;
-  const uint64_t slope_q16 = lane.previous_slope_valid
-      ? lane.previous_slope_q16_cycles_per_sample
-      : lower_env_default_slope_q16();
-  const uint32_t predicted_dwt =
-      lane.active_base_dwt +
-      lower_env_round_q16_u32((int64_t)slope_q16 * (int64_t)x);
-  const int32_t residual =
-      lower_env_signed_delta_u32(predicted_dwt, observed_dwt);
-  const uint32_t abs_residual = lower_env_abs_i32(residual);
-  lower_env_note_residual(lane, residual);
-
-  // The 4-cycle band is quality evidence, not a sample veto.  Only gross
-  // residuals are excluded from the bucket fit; a failed seal still falls back
-  // to the observed edge in foreground.
-  if (abs_residual > LOWER_ENV_SAMPLE_HARD_REJECT_CYCLES) {
-    lane.active_sample_rejected_count++;
-    lane.active_sample_hard_rejected_count++;
-  } else {
-    lane.active_sample_accepted_count++;
-
-    uint32_t bucket_index =
-        (x * LOWER_ENV_BUCKET_COUNT) / LOWER_ENV_SAMPLE_RATE_HZ;
-    if (bucket_index >= LOWER_ENV_BUCKET_COUNT) {
-      bucket_index = LOWER_ENV_BUCKET_COUNT - 1U;
-    }
-
-    lower_env_bucket_t& b = lane.buckets[bucket_index];
-    if (!b.valid) lane.active_bucket_count++;
-    if (!b.valid || residual < b.residual_cycles) {
-      b.valid = true;
-      b.x = (uint16_t)x;
-      b.dwt = observed_dwt;
-      b.counter32 = target_counter32;
-      b.target_hw16 = target_hw16;
-      b.observed_hw16 = observed_hw16;
-      b.residual_cycles = residual;
-    }
-  }
-
-  if (closes_second) {
-    store->seal_observed_dwt = observed_dwt;
-    store->seal_target_counter32 = target_counter32;
-    store->seal_target_hw16 = target_hw16;
-    store->seal_observed_hw16 = observed_hw16;
-    dmb_barrier();
-    store->seal_pending = true;
-  }
-
-  lower_env_write_end(*store);
-}
-
-static __attribute__((noinline)) bool lower_env_finish_deferred_seal(
-    interrupt_subscriber_kind_t kind,
-    uint32_t through_target_counter32) {
-  lower_env_lane_store_t* const store = lower_env_store_for(kind);
-  if (!store) return false;
-
-  uint32_t prior_basepri = interrupt_priority0_guard_enter();
-  if (!store->seal_pending) {
-    interrupt_priority0_guard_exit(prior_basepri);
-    return false;
-  }
-
-  const uint32_t pending_target_counter32 = store->seal_target_counter32;
-  if ((int32_t)(through_target_counter32 - pending_target_counter32) < 0) {
-    interrupt_priority0_guard_exit(prior_basepri);
-    return false;
-  }
-
-  const uint32_t observed_dwt = store->seal_observed_dwt;
-  const uint16_t target_hw16 = store->seal_target_hw16;
-  const uint16_t observed_hw16 = store->seal_observed_hw16;
-
-  // Keep the seqlock odd for the complete foreground calculation.  Priority 16
-  // sees seal_pending and leaves the lane untouched, while priority 0 remains
-  // fully unmasked by the BASEPRI guard release below.
-  lower_env_write_begin(*store);
-  interrupt_priority0_guard_exit(prior_basepri);
-
-  lower_env_seal_deferred(store->lane,
-                          observed_dwt,
-                          pending_target_counter32,
-                          target_hw16,
-                          observed_hw16);
-
-  prior_basepri = interrupt_priority0_guard_enter();
-  lower_env_write_end(*store);
-  store->seal_observed_dwt = 0;
-  store->seal_target_counter32 = 0;
-  store->seal_target_hw16 = 0;
-  store->seal_observed_hw16 = 0;
-  dmb_barrier();
-  store->seal_pending = false;
-  interrupt_priority0_guard_exit(prior_basepri);
-
-  interrupt_feature_update_floorline();
-  return true;
-}
-
-static bool cadence_regression_latest_result(interrupt_subscriber_kind_t kind,
-                                             cadence_regression_result_t* out) {
-  return lower_env_result_load(kind, out);
-}
-
-static bool cadence_regression_result_for_bookend(
-    interrupt_subscriber_kind_t kind,
-    uint32_t observed_dwt,
-    uint32_t target_counter32,
-    cadence_regression_result_t* out) {
-  if (!out) return false;
-
-  (void)lower_env_finish_deferred_seal(kind, target_counter32);
-  if (!cadence_regression_latest_result(kind, out) ||
-      out->target_counter32_at_event != target_counter32 ||
-      out->observed_dwt_at_event != observed_dwt) {
-    *out = cadence_regression_result_t{};
-    return false;
-  }
-  return true;
-}
-
-static const char* pps_floorline_repair_reason_name(uint32_t reason) {
-  switch (reason) {
-    case PPS_FLOORLINE_REPAIR_REASON_APPLIED:
-      return "pps_vclock_floorline_projection";
-    case PPS_FLOORLINE_REPAIR_REASON_NO_HISTORY:
-      return "no_yardstick_history";
-    case PPS_FLOORLINE_REPAIR_REASON_SEQUENCE_MISMATCH:
-      return "yardstick_sequence_mismatch";
-    case PPS_FLOORLINE_REPAIR_REASON_FLOORLINE_UNQUALIFIED:
-      return "floorline_unqualified";
-    case PPS_FLOORLINE_REPAIR_REASON_NO_PHASE:
-      return "pps_vclock_phase_unavailable";
-    case PPS_FLOORLINE_REPAIR_REASON_DELTA_BELOW_THRESHOLD:
-      return "pps_floorline_delta_below_threshold";
-    case PPS_FLOORLINE_REPAIR_REASON_REWRITE_FAILED:
-      return "yardstick_rewrite_failed";
-    default:
-      return "none";
-  }
-}
-
-static bool pps_floorline_repair_applied_for_sequence(uint32_t sequence) {
-  pps_floorline_repair_state_t snapshot{};
-  return pps_floorline_repair_load(snapshot) &&
-         snapshot.valid && snapshot.applied &&
-         snapshot.sequence == sequence;
-}
-
-static bool pps_floorline_repair_covers_interval_verdict(
-    const dwt_repair_diag_t* repair,
-    const cadence_regression_result_t* floorline) {
-  if (!repair || !floorline) return false;
-  if (!repair->yardstick_valid || repair->yardstick_pps_sequence == 0U) {
-    return false;
-  }
-  if (!pps_floorline_repair_applied_for_sequence(
-          repair->yardstick_pps_sequence)) {
-    return false;
-  }
-
-  // Do not hide a real measured-lane failure. The exemption is only for the
-  // same PPS row whose raw endpoint was replaced, and only while the measured
-  // lane's own FloorLine interval still agrees with its observed interval.
-  return floorline->valid &&
-         floorline->observed_interval_valid &&
-         floorline->inferred_interval_valid &&
-         lower_env_abs_i32(
-             floorline->inferred_minus_observed_interval_cycles) <=
-             LOWER_ENV_PUBLISH_HARD_INTERVAL_GATE_CYCLES;
-}
-
-static pps_t pps_floorline_repair_physical_edge(
-    const pps_t& raw_pps,
-    const cadence_regression_result_t& floorline,
-    uint32_t observed_vclock_dwt,
-    uint32_t target_counter32) {
-  pps_t used_pps = raw_pps;
-
-  pps_floorline_repair_state_t previous{};
-  (void)pps_floorline_repair_load(previous);
-
-  // Normal and fallback VCLOCK paths may converge on the same one-second
-  // bookend. Reuse an already selected projection for this PPS sequence.
-  if (previous.valid && previous.applied &&
-      previous.sequence == raw_pps.sequence) {
-    used_pps.dwt_at_edge = previous.used_pps_dwt;
-    return used_pps;
-  }
-
-  pps_floorline_repair_state_t next{};
-  next.valid = raw_pps.sequence != 0U && raw_pps.dwt_at_edge != 0U;
-  next.sequence = raw_pps.sequence;
-  next.attempt_count = previous.attempt_count + 1U;
-  next.applied_count = previous.applied_count;
-  next.reject_count = previous.reject_count;
-  next.raw_pps_dwt = raw_pps.dwt_at_edge;
-  next.used_pps_dwt = raw_pps.dwt_at_edge;
-  next.observed_vclock_dwt = observed_vclock_dwt;
-  next.floorline_vclock_dwt = floorline.inferred_dwt_at_event;
-  next.floorline_confidence_ppm = floorline.confidence_ppm;
-  next.floorline_sample_count = floorline.sample_count;
-  next.floorline_selected_bucket_count = floorline.selected_bucket_count;
-
-  next.floorline_qualified =
-      next.valid &&
-      floorline.valid &&
-      floorline.candidate_present &&
-      floorline.publish_floorline &&
-      !floorline.fallback_used &&
-      floorline.inferred_dwt_at_event != 0U &&
-      floorline.observed_dwt_at_event == observed_vclock_dwt &&
-      floorline.target_counter32_at_event == target_counter32;
-  if (!next.floorline_qualified) {
-    next.reason = PPS_FLOORLINE_REPAIR_REASON_FLOORLINE_UNQUALIFIED;
-    next.reject_count++;
-    pps_floorline_repair_store(next);
-    return used_pps;
-  }
-
-  next.phase_qualified = g_pps_vclock_phase_lower_valid;
-  if (!next.phase_qualified) {
-    next.reason = PPS_FLOORLINE_REPAIR_REASON_NO_PHASE;
-    next.reject_count++;
-    pps_floorline_repair_store(next);
-    return used_pps;
-  }
-
-  // Convert the VCLOCK FloorLine endpoint into the corresponding physical PPS
-  // endpoint using the continuously learned PPS->VCLOCK phase.
-  next.inferred_pps_dwt =
-      floorline.inferred_dwt_at_event - g_pps_vclock_phase_lower_cycles;
-  next.raw_minus_inferred_cycles =
-      lower_env_signed_delta_u32(next.inferred_pps_dwt,
-                                 raw_pps.dwt_at_edge);
-  next.observed_vclock_minus_floorline_cycles =
-      lower_env_signed_delta_u32(floorline.inferred_dwt_at_event,
-                                 observed_vclock_dwt);
-
-  // Symmetric arbitration: sign does not matter. If the observed physical PPS
-  // coordinate is materially separated from the qualified projection, use the
-  // projection. Ordinary few-cycle disagreement keeps the observed edge.
-  next.magnitude_qualified =
-      lower_env_abs_i32(next.raw_minus_inferred_cycles) >=
-          PPS_FLOORLINE_REPAIR_TRIGGER_CYCLES;
-  if (!next.magnitude_qualified) {
-    next.reason = PPS_FLOORLINE_REPAIR_REASON_DELTA_BELOW_THRESHOLD;
-    pps_floorline_repair_store(next);
-    return used_pps;
-  }
-
-  // The raw GPIO endpoint was already admitted to the PPS yardstick by the PPS
-  // handoff. Replace that same endpoint and interval before any OCXO court uses
-  // the ruler. This is bookkeeping, not an additional qualification gate.
-  pps_yardstick_snapshot_t yardstick{};
-  const bool yardstick_loaded = pps_yardstick_load(yardstick);
-  if (!yardstick_loaded || !g_pps_yardstick_prev_valid ||
-      yardstick.interval_now_cycles == 0U) {
-    next.reason = PPS_FLOORLINE_REPAIR_REASON_NO_HISTORY;
-    next.reject_count++;
-    pps_floorline_repair_store(next);
-    return used_pps;
-  }
-
-  if (yardstick.sequence != raw_pps.sequence ||
-      g_pps_yardstick_prev_sequence != raw_pps.sequence) {
-    next.reason = PPS_FLOORLINE_REPAIR_REASON_SEQUENCE_MISMATCH;
-    next.reject_count++;
-    pps_floorline_repair_store(next);
-    return used_pps;
-  }
-
-  next.previous_interval_cycles = yardstick.interval_prev_cycles;
-  next.raw_interval_cycles = yardstick.interval_now_cycles;
-  next.raw_interval_error_cycles = pps_floorline_i32_from_i64(
-      (int64_t)(uint64_t)yardstick.interval_now_cycles -
-      (int64_t)(uint64_t)yardstick.interval_prev_cycles);
-
-  const uint32_t previous_used_pps_dwt =
-      raw_pps.dwt_at_edge - yardstick.interval_now_cycles;
-  next.inferred_interval_cycles =
-      next.inferred_pps_dwt - previous_used_pps_dwt;
-  next.inferred_interval_error_cycles = pps_floorline_i32_from_i64(
-      (int64_t)(uint64_t)next.inferred_interval_cycles -
-      (int64_t)(uint64_t)yardstick.interval_prev_cycles);
-
-  if (!pps_yardstick_replace_latest_interval(raw_pps.sequence,
-                                              next.inferred_interval_cycles,
-                                              next.inferred_pps_dwt)) {
-    next.reason = PPS_FLOORLINE_REPAIR_REASON_REWRITE_FAILED;
-    next.reject_count++;
-    pps_floorline_repair_store(next);
-    return used_pps;
-  }
-  next.yardstick_rewritten = true;
-
-  used_pps.dwt_at_edge = next.inferred_pps_dwt;
-  {
-    const uint32_t prior_basepri = interrupt_priority0_guard_enter();
-    g_last_pps_witness = used_pps;
-    g_last_pps_witness_valid = true;
-    interrupt_priority0_guard_exit(prior_basepri);
-  }
-
-  next.applied = true;
-  next.reason = PPS_FLOORLINE_REPAIR_REASON_APPLIED;
-  next.used_pps_dwt = used_pps.dwt_at_edge;
-  next.applied_count++;
-  pps_floorline_repair_store(next);
-  return used_pps;
-}
-
-static inline void cadence_regression_reset_kind(interrupt_subscriber_kind_t kind) {
-  lower_env_reset_lane(kind);
-}
-static inline void cadence_regression_reset_all(void) {
-  lower_env_reset_all();
-}
-static inline void copy_regression_diag(interrupt_capture_diag_t& diag,
-                                        const cadence_regression_result_t* r) {
-  if (!r) return;
-  diag.regression_valid = r->valid;
-  diag.regression_sequence = r->sequence;
-  diag.regression_sample_count = r->sample_count;
-  diag.regression_observed_dwt_at_event = r->observed_dwt_at_event;
-  diag.regression_inferred_dwt_at_event = r->inferred_dwt_at_event;
-  diag.regression_inferred_minus_observed_cycles =
-      r->inferred_minus_observed_cycles;
-  diag.regression_target_counter32_at_event = r->target_counter32_at_event;
-  diag.regression_target_hardware16_at_event = r->target_hardware16_at_event;
-  diag.regression_observed_hardware16_at_event = r->observed_hardware16_at_event;
-  diag.regression_slope_q16_cycles_per_sample = r->slope_q16_cycles_per_sample;
-  diag.regression_slope_delta_q16_cycles_per_sample =
-      r->slope_delta_q16_cycles_per_sample;
-  diag.regression_fit_error_mean_q16_cycles = r->fit_error_mean_q16_cycles;
-  diag.regression_fit_error_stddev_q16_cycles = r->fit_error_stddev_q16_cycles;
-  diag.regression_fit_error_min_cycles = r->fit_error_min_cycles;
-  diag.regression_fit_error_max_cycles = r->fit_error_max_cycles;
-  diag.regression_fit_error_gt_plus4_count = r->fit_error_gt_plus4_count;
-  diag.regression_fit_error_lt_minus4_count = r->fit_error_lt_minus4_count;
-  diag.regression_fit_error_abs_gt4_count = r->fit_error_abs_gt4_count;
-  diag.regression_anchor_policy_id = r->anchor_policy_id;
-  diag.regression_anchor_population_count = r->anchor_population_count;
-  diag.regression_anchor_single_min_q16_cycles =
-      r->anchor_single_min_q16_cycles;
-  diag.regression_anchor_second_q16_cycles = r->anchor_second_q16_cycles;
-  diag.regression_anchor_selected_q16_cycles =
-      r->anchor_selected_q16_cycles;
-  diag.regression_anchor_selected_minus_single_min_q16_cycles =
-      r->anchor_selected_minus_single_min_q16_cycles;
-}
-
-
-static inline void copy_floorline_interval_to_diag(
-    dwt_repair_diag_t& diag,
-    const cadence_regression_result_t& r) {
-  const bool floorline_authority =
-      DWT_PUBLICATION_FLOORLINE_AUTHORITY_ENABLED && r.publish_floorline;
-
-  diag.interval_gate_valid = r.observed_interval_valid || r.inferred_interval_valid;
-  diag.interval_sample_accepted = floorline_authority;
-  diag.interval_sample_rejected = !floorline_authority;
-  diag.interval_observed_cycles = r.observed_interval_valid
-      ? r.observed_interval_cycles
-      : 0U;
-  diag.interval_prediction_cycles = r.inferred_interval_valid
-      ? r.inferred_interval_cycles
-      : 0U;
-  diag.interval_effective_cycles = r.observed_interval_valid
-      ? r.observed_interval_cycles
-      : 0U;
-  diag.interval_residual_cycles =
-      (r.observed_interval_valid && r.inferred_interval_valid)
-          ? r.candidate_interval_error_cycles
-          : 0;
-  diag.interval_gate_threshold_cycles = LOWER_ENV_ERROR_GATE_CYCLES;
-  diag.interval_accept_count = r.sample_accepted_count;
-  diag.interval_reject_count = r.sample_rejected_count;
-  // Retired predictor fields reused as compact FloorLine diagnostic forensics.
-  diag.interval_resync_applied = r.fallback_used;
-  diag.interval_resync_count = r.selected_bucket_count;
-  diag.interval_reject_streak = r.publish_reason;
-}
-
-static inline uint32_t vclock_published_dwt_at_edge(
-    const pps_t& pps,
-    uint32_t observed_dwt_at_edge,
-    uint32_t counter32_at_edge,
-    uint16_t ch3_at_edge,
-    bool* out_phase_valid = nullptr,
-    uint32_t* out_phase_cycles = nullptr) {
-  // Keep learning/reporting the PPS-derived lower-phase witness, but do not
-  // publish it as the VCLOCK subscriber DWT. Delta Cycles needs VCLOCK and
-  // OCXO intervals measured in the same observed QTimer edge species.
-  (void)pps_projected_vclock_dwt_from_learned_phase(pps,
-                                                    observed_dwt_at_edge,
-                                                    counter32_at_edge,
-                                                    ch3_at_edge,
-                                                    out_phase_valid,
-                                                    out_phase_cycles);
-  return observed_dwt_at_edge;
-}
-
-static inline uint32_t ocxo_published_dwt_at_edge(
-    uint32_t observed_dwt_at_edge,
-    const cadence_regression_result_t&) {
-  // FloorLine remains populated for diagnostics, but OCXO publication is now
-  // the latency-adjusted observed edge.
-  return observed_dwt_at_edge;
-}
-
-// ============================================================================
-// Final DWT-at-edge publication tribunal
-// ============================================================================
-//
-// This is the hard-fail courtroom immediately before subscriber publication.
-// It does not repair, resync, fall back, or choose a different endpoint.  The
-// publisher has already chosen its observation-derived endpoint; this tribunal
-// asks whether that final fact is physically and semantically admissible.
-// FloorLine fields remain diagnostic witnesses only.  A
-// nonzero verdict normally emits WATCHDOG_ANOMALY and the caller must not
-// publish. START launch-acquisition is the bounded exception: non-poisonous
-// transient/ruler verdicts may pass only to build pre-publication Alpha
-// evidence, while impossible DWT/source facts remain quarantined.
-
-static constexpr uint32_t DWT_PUBLICATION_EDGE_GATE_CYCLES =
-    LOWER_ENV_PUBLISH_HARD_EDGE_GATE_CYCLES;
-static constexpr uint32_t DWT_PUBLICATION_INTERVAL_GATE_CYCLES = 1024U;
-static constexpr uint32_t DWT_PUBLICATION_CROSS_RAIL_GATE_CYCLES = 4096U;
-static constexpr uint32_t DWT_PUBLICATION_SERVICE_OFFSET_GATE_TICKS = 1024U;
-static constexpr int64_t DWT_PUBLICATION_VCLOCK_GNSS_GATE_NS =
-    VCLOCK_GNSS_NS_INTEGRITY_GATE_NS;
-
-// Publication-court startup policy.  Source/custody impossibilities are never
-// admissible.  Interval/ruler courts get a short local warmup window so START
-// can form its first anchors without treating a settling ruler as edge poison.
-// After this many clean accepted publications on a lane, process_interrupt is
-// locally strict even if CLOCKS has not yet reported campaign watchdog arming.
-static constexpr uint32_t DWT_PUBLICATION_STRICT_ACCEPT_COUNT = 8U;
-// The expected-interval ruler itself must remain in the physical DWT
-// neighborhood before it can be used as law.  The live system moves by ppm; a
-// 1% gate is deliberately huge and only catches uninitialized/poisoned rulers.
-static constexpr uint32_t DWT_PUBLICATION_RULER_PLAUSIBILITY_PPM = 10000U;
-
-static constexpr uint32_t DWT_PUBLICATION_VERDICT_OK = 0U;
-static constexpr uint32_t DWT_PUBLICATION_VERDICT_ZERO_DWT = 1u << 0;
-static constexpr uint32_t DWT_PUBLICATION_VERDICT_SOURCE_MISMATCH = 1u << 1;
-static constexpr uint32_t DWT_PUBLICATION_VERDICT_FLOORLINE_EDGE = 1u << 2;
-static constexpr uint32_t DWT_PUBLICATION_VERDICT_FLOORLINE_INTERVAL = 1u << 3;
-static constexpr uint32_t DWT_PUBLICATION_VERDICT_FLOORLINE_LATE = 1u << 4;
-static constexpr uint32_t DWT_PUBLICATION_VERDICT_COUNTER_LOW16 = 1u << 5;
-static constexpr uint32_t DWT_PUBLICATION_VERDICT_SERVICE_OFFSET = 1u << 6;
-static constexpr uint32_t DWT_PUBLICATION_VERDICT_COUNTER_DELTA = 1u << 7;
-static constexpr uint32_t DWT_PUBLICATION_VERDICT_OBSERVED_INTERVAL = 1u << 8;
-static constexpr uint32_t DWT_PUBLICATION_VERDICT_PUBLISHED_INTERVAL = 1u << 9;
-static constexpr uint32_t DWT_PUBLICATION_VERDICT_CROSS_RAIL = 1u << 10;
-static constexpr uint32_t DWT_PUBLICATION_VERDICT_GNSS_PROJECTION = 1u << 11;
-static constexpr uint32_t DWT_PUBLICATION_VERDICT_COUNTER_ADJACENCY = 1u << 12;
-static constexpr uint32_t DWT_PUBLICATION_VERDICT_YARDSTICK_EXCURSION = 1u << 13;
-static constexpr uint32_t DWT_PUBLICATION_VERDICT_RULER_UNQUALIFIED = 1u << 14;
-
-static constexpr uint32_t DWT_PUBLICATION_SIDE_RAIL_DIAGNOSTIC_MASK =
-    DWT_PUBLICATION_VERDICT_GNSS_PROJECTION |
-    DWT_PUBLICATION_VERDICT_YARDSTICK_EXCURSION;
-
-static constexpr uint32_t DWT_PUBLICATION_ALWAYS_BLOCK_MASK =
-    DWT_PUBLICATION_VERDICT_ZERO_DWT |
-    DWT_PUBLICATION_VERDICT_SOURCE_MISMATCH |
-    DWT_PUBLICATION_VERDICT_COUNTER_LOW16 |
-    DWT_PUBLICATION_VERDICT_SERVICE_OFFSET |
-    DWT_PUBLICATION_VERDICT_COUNTER_DELTA |
-    DWT_PUBLICATION_VERDICT_COUNTER_ADJACENCY;
-
-// Private START launch-acquisition is deliberately narrower than ordinary
-// startup relaxation.  It exists so Alpha can receive sane edge facts long
-// enough to form OCXO public-origin / PPS projection evidence.  It must never
-// admit forged/poisoned coordinates: zero DWT, source-domain mismatch, or a
-// target low-word identity contradiction still stop at this courthouse door.
-static constexpr uint32_t DWT_PUBLICATION_LAUNCH_BLOCK_MASK =
-    DWT_PUBLICATION_VERDICT_ZERO_DWT |
-    DWT_PUBLICATION_VERDICT_SOURCE_MISMATCH |
-    DWT_PUBLICATION_VERDICT_COUNTER_LOW16;
-
-struct dwt_publication_lane_state_t {
-  bool     previous_valid = false;
-  uint32_t previous_published_dwt = 0;
-  uint32_t previous_observed_dwt = 0;
-  uint32_t previous_floorline_dwt = 0;
-  uint32_t previous_counter32 = 0;
-  bool     last_interval_valid = false;
-  uint32_t last_published_interval_cycles = 0;
-  uint32_t accept_count = 0;
-  uint32_t watchdog_count = 0;
-  uint32_t last_verdict_mask = DWT_PUBLICATION_VERDICT_OK;
-  uint32_t last_sequence = 0;
-  uint32_t last_published_dwt = 0;
-  uint32_t last_observed_dwt = 0;
-  uint32_t last_counter32 = 0;
-};
-
-struct dwt_publication_request_t {
-  interrupt_subscriber_kind_t kind = interrupt_subscriber_kind_t::NONE;
-  uint32_t sequence = 0;
-  uint32_t published_dwt = 0;
-  uint32_t observed_dwt = 0;
-  uint32_t expected_published_dwt = 0;  // 0 => observed_dwt
-  uint32_t target_counter32 = 0;
-  uint16_t target_low16 = 0;
-  bool     service_low16_valid = false;
-  uint16_t service_low16 = 0;
-
-  // Last-step watchdog forensics.  These fields do not change publication
-  // authority; they let a blocked WATCHDOG_ANOMALY distinguish priority-0
-  // edge authorship from foreground re-derivation/copy mistakes.
-  uint32_t capture_authored_dwt = 0;
-  uint32_t capture_raw_event_dwt = 0;
-  uint32_t capture_isr_entry_dwt_raw = 0;
-  uint32_t capture_arm_dwt_raw = 0;
-  uint32_t capture_arm_to_isr_ticks = 0;
-  uint32_t capture_arm_to_isr_dwt_cycles = 0;
-  int32_t  capture_service_offset_ticks = 0;
-  int32_t  capture_service_correction_cycles = 0;
-  uint16_t capture_service_counter_low16 = 0;
-  uint16_t capture_service_compare_low16 = 0;
-  uint32_t capture_service_counter_minus_compare_ticks = 0;
-  uint32_t capture_compare_delta_mod65536_ticks = 0;
-  uint32_t capture_target_delta_mod65536_ticks = 0;
-  uint32_t capture_interpreted_late_ticks = 0;
-  uint32_t capture_early_ticks = 0;
-  uint32_t capture_service_offset_abs_ticks = 0;
-
-  const cadence_regression_result_t* floorline = nullptr;
-  const dwt_repair_diag_t* repair = nullptr;
-};
-
-// Final one-second publication adjudication runs only in deferred foreground
-// fact-drain/recovery paths.  Keep this compact three-lane state in RAM2 for
-// now; it does not cross the capture/handoff boundary under test.
-static dwt_publication_lane_state_t g_dwt_publication_vclock DMAMEM = {};
-static dwt_publication_lane_state_t g_dwt_publication_ocxo1 DMAMEM = {};
-static dwt_publication_lane_state_t g_dwt_publication_ocxo2 DMAMEM = {};
-
-struct dwt_publication_forensics_t {
-  bool     valid = false;
-  uint32_t record_count = 0;
-  uint32_t kind = 0;
-  uint32_t sequence = 0;
-  uint32_t verdict_mask = DWT_PUBLICATION_VERDICT_OK;
-  uint32_t fatal_mask = DWT_PUBLICATION_VERDICT_OK;
-  uint32_t verdict_reason_id = INTERRUPT_DWT_PUBLICATION_REASON_OK;
-  bool     campaign_armed = false;
-  bool     blocked = false;
-  bool     launch_acquisition_active = false;
-  uint32_t launch_block_mask = DWT_PUBLICATION_VERDICT_OK;
-  uint32_t launch_relaxed_mask = DWT_PUBLICATION_VERDICT_OK;
-
-  uint32_t published_dwt = 0;
-  uint32_t observed_dwt = 0;
-  uint32_t target_counter32 = 0;
-  uint16_t target_low16 = 0;
-  bool     service_low16_valid = false;
-  uint16_t service_low16 = 0;
-  int32_t  service_offset_ticks = 0;
-
-  bool     previous_valid = false;
-  uint32_t previous_published_dwt = 0;
-  uint32_t previous_observed_dwt = 0;
-  uint32_t previous_floorline_dwt = 0;
-  uint32_t previous_counter32 = 0;
-
-  uint32_t expected_counter_delta_ticks = 0;
-  uint32_t observed_counter_delta_ticks = 0;
-  uint32_t expected_interval_cycles = 0;
-  uint32_t published_interval_cycles = 0;
-  uint32_t observed_interval_cycles = 0;
-  uint32_t floorline_interval_cycles = 0;
-  int32_t  published_interval_error_cycles = 0;
-  int32_t  observed_interval_error_cycles = 0;
-  int32_t  floorline_interval_error_cycles = 0;
-  int32_t  published_minus_observed_cycles = 0;
-  int32_t  floorline_minus_observed_cycles = 0;
-
-  bool     floorline_valid = false;
-  bool     floorline_candidate = false;
-  bool     floorline_published = false;
-  bool     floorline_fallback_used = false;
-  uint32_t floorline_dwt = 0;
-  uint32_t floorline_sequence = 0;
-  uint32_t floorline_sample_count = 0;
-  uint32_t floorline_selected_bucket_count = 0;
-  uint32_t floorline_publish_source = FLOORLINE_PUBLISH_SOURCE_OBSERVED;
-  uint32_t floorline_publish_reason = FLOORLINE_REASON_INIT;
-  uint32_t floorline_confidence_ppm = 0;
-
-  uint32_t capture_authored_dwt = 0;
-  uint32_t capture_raw_event_dwt = 0;
-  uint32_t capture_isr_entry_dwt_raw = 0;
-  uint32_t capture_arm_dwt_raw = 0;
-  uint32_t capture_arm_to_isr_ticks = 0;
-  uint32_t capture_arm_to_isr_dwt_cycles = 0;
-  int32_t  capture_service_offset_ticks = 0;
-  int32_t  capture_service_correction_cycles = 0;
-  uint16_t capture_service_counter_low16 = 0;
-  uint16_t capture_service_compare_low16 = 0;
-  uint32_t capture_service_counter_minus_compare_ticks = 0;
-  uint32_t capture_compare_delta_mod65536_ticks = 0;
-  uint32_t capture_target_delta_mod65536_ticks = 0;
-  uint32_t capture_interpreted_late_ticks = 0;
-  uint32_t capture_early_ticks = 0;
-  uint32_t capture_service_offset_abs_ticks = 0;
-
-  uint32_t repair_original_dwt = 0;
-  uint32_t repair_predicted_dwt = 0;
-  uint32_t repair_used_dwt = 0;
-  uint32_t repair_event_from_isr_entry_raw = 0;
-  int32_t  repair_isr_entry_to_event_correction_cycles = 0;
-  int32_t  repair_error_cycles = 0;
-  const char* repair_reason = "none";
-
-  bool     yardstick_valid = false;
-  bool     yardstick_stale = false;
-  bool     yardstick_seeded = false;
-  bool     yardstick_excursion = false;
-  uint32_t yardstick_pps_sequence = 0;
-  uint32_t yardstick_pps_seq_delta = 0;
-  uint32_t yardstick_g_now_cycles = 0;
-  uint32_t yardstick_g_prev_cycles = 0;
-  uint32_t yardstick_inferred_interval_cycles = 0;
-  uint32_t yardstick_observed_interval_cycles = 0;
-  int32_t  yardstick_inferred_minus_observed_cycles = 0;
-  uint32_t yardstick_auth_endpoint_dwt = 0;
-  int32_t  yardstick_auth_error_cycles = 0;
-  bool     yardstick_auth_anchor_applied = false;
-};
-
-static dwt_publication_forensics_t g_dwt_publication_last_fatal DMAMEM = {};
-
-static volatile bool     g_dwt_publication_launch_acquisition_active = false;
-static volatile uint32_t g_dwt_publication_launch_begin_count = 0;
-static volatile uint32_t g_dwt_publication_launch_end_count = 0;
-static volatile uint32_t g_dwt_publication_launch_relaxed_count = 0;
-static volatile uint32_t g_dwt_publication_launch_hard_block_count = 0;
-static volatile uint32_t g_dwt_publication_startup_relaxed_count = 0;
-static volatile uint32_t g_dwt_publication_startup_relaxed_last_kind = 0;
-static volatile uint32_t g_dwt_publication_startup_relaxed_last_sequence = 0;
-static volatile uint32_t g_dwt_publication_startup_relaxed_last_mask = 0;
-
-void interrupt_dwt_publication_launch_acquisition_begin(void) {
-  if (!g_dwt_publication_launch_acquisition_active) {
-    g_dwt_publication_launch_begin_count++;
-  }
-  g_dwt_publication_launch_acquisition_active = true;
-}
-
-void interrupt_dwt_publication_launch_acquisition_end(void) {
-  if (g_dwt_publication_launch_acquisition_active) {
-    g_dwt_publication_launch_end_count++;
-  }
-  g_dwt_publication_launch_acquisition_active = false;
-}
-
-bool interrupt_dwt_publication_launch_acquisition_active(void) {
-  return g_dwt_publication_launch_acquisition_active;
-}
-
-static dwt_publication_lane_state_t* dwt_publication_lane_state_for(
-    interrupt_subscriber_kind_t kind) {
-  switch (kind) {
-    case interrupt_subscriber_kind_t::VCLOCK: return &g_dwt_publication_vclock;
-    case interrupt_subscriber_kind_t::OCXO1:  return &g_dwt_publication_ocxo1;
-    case interrupt_subscriber_kind_t::OCXO2:  return &g_dwt_publication_ocxo2;
-    default: return nullptr;
-  }
-}
-
-static void dwt_publication_reset_lane(interrupt_subscriber_kind_t kind) {
-  dwt_publication_lane_state_t* s = dwt_publication_lane_state_for(kind);
-  if (s) *s = dwt_publication_lane_state_t{};
-}
-
-static void dwt_publication_reset_all(void) {
-  dwt_publication_reset_lane(interrupt_subscriber_kind_t::VCLOCK);
-  dwt_publication_reset_lane(interrupt_subscriber_kind_t::OCXO1);
-  dwt_publication_reset_lane(interrupt_subscriber_kind_t::OCXO2);
-  g_dwt_publication_startup_relaxed_count = 0;
-  g_dwt_publication_startup_relaxed_last_kind = 0;
-  g_dwt_publication_startup_relaxed_last_sequence = 0;
-  g_dwt_publication_startup_relaxed_last_mask = 0;
-}
-
-static volatile uint32_t g_interrupt_recover_publication_custody_reset_count = 0;
-
-void interrupt_recover_reset_publication_custody(void) {
-  // RECOVER is a custody discontinuity.  Reset the final DWT publication
-  // court's previous-row memory so the first post-recovery OCXO/VCLOCK event
-  // becomes a seed, not an interval measured against stale pre-recovery
-  // evidence.  The lower-envelope/FloorLine rail is diagnostic, but it also
-  // carries previous endpoint state used by TIMEBASE forensics; cut it at the
-  // same boundary so reports do not splice the outage into one synthetic
-  // interval.
-  dwt_publication_reset_all();
-  g_dwt_publication_last_fatal = dwt_publication_forensics_t{};
-
-  cadence_regression_reset_kind(interrupt_subscriber_kind_t::VCLOCK);
-  cadence_regression_reset_kind(interrupt_subscriber_kind_t::OCXO1);
-  cadence_regression_reset_kind(interrupt_subscriber_kind_t::OCXO2);
-
-  g_interrupt_recover_publication_custody_reset_count++;
-}
-
-uint32_t interrupt_recover_publication_custody_reset_count(void) {
-  return g_interrupt_recover_publication_custody_reset_count;
-}
-
-static bool dwt_publication_vclock_gnss_projection_ready(uint32_t sequence) {
-  // The final publication tribunal can only hard-fail the VCLOCK DWT->GNSS
-  // projection after CLOCKS/Alpha has labeled at least one anchor in this
-  // freshly reset ring.  During START/RECOVER the first public VCLOCK edge is
-  // what creates the new anchor; before the label callback catches up, using
-  // an older/cross-campaign label would turn a correct bootstrap edge into a
-  // false WATCHDOG loop.  Skipping this court until a fresh nearby label exists
-  // is not a repair: the DWT fact is still judged by source, counter, interval,
-  // service-offset, and cross-rail courts.
-  if (sequence == 0U) return false;
-  if (g_pvc_anchor_label_update_count == 0U ||
-      !g_pvc_anchor_label_last_success ||
-      g_pvc_anchor_label_last_sequence == 0U) {
-    return false;
-  }
-
-  const int32_t label_age =
-      (int32_t)((uint32_t)sequence - g_pvc_anchor_label_last_sequence);
-  return label_age >= 0 &&
-         (uint32_t)label_age <= PVC_ANCHOR_RING_SIZE;
-}
-
-static uint32_t dwt_publication_expected_counter_delta_ticks(
-    interrupt_subscriber_kind_t kind) {
-  switch (kind) {
-    case interrupt_subscriber_kind_t::VCLOCK:
-      return (uint32_t)VCLOCK_COUNTS_PER_SECOND;
-    case interrupt_subscriber_kind_t::OCXO1:
-    case interrupt_subscriber_kind_t::OCXO2:
-      return OCXO_WITNESS_ONE_SECOND_COUNTS;
-    default:
-      return 0U;
-  }
-}
-
-static uint16_t dwt_publication_expected_low16(
-    interrupt_subscriber_kind_t kind,
-    uint32_t counter32) {
-  if (kind == interrupt_subscriber_kind_t::VCLOCK) {
-    return vclock_hardware_low16_from_synthetic(counter32);
-  }
-  return hardware_low16_from_semantic(counter32);
-}
-
-static int32_t dwt_publication_i32_from_i64(int64_t v) {
-  if (v > INT32_MAX) return INT32_MAX;
-  if (v < INT32_MIN) return INT32_MIN;
-  return (int32_t)v;
-}
-
-static uint32_t dwt_publication_abs_i32(int32_t v) {
-  return v < 0 ? (uint32_t)(-(int64_t)v) : (uint32_t)v;
-}
-
-static bool dwt_publication_strict_ready(
-    const dwt_publication_lane_state_t& s) {
-  return s.previous_valid &&
-         s.accept_count >= DWT_PUBLICATION_STRICT_ACCEPT_COUNT;
-}
-
-static uint32_t dwt_publication_nominal_interval_for_delta(
-    uint32_t expected_counter_delta_ticks) {
-  if (expected_counter_delta_ticks == 0U) return 0U;
-  return (uint32_t)(((uint64_t)DWT_EXPECTED_PER_PPS *
-                     (uint64_t)expected_counter_delta_ticks +
-                     (uint64_t)VCLOCK_COUNTS_PER_SECOND / 2ULL) /
-                    (uint64_t)VCLOCK_COUNTS_PER_SECOND);
-}
-
-static bool dwt_publication_live_interval_ruler_ready(void) {
-  // A numerically plausible CPS is not yet courtroom law.  The sequence-5 boot
-  // transcript proved that the live calibration can still move by hundreds of
-  // thousands of cycles while remaining inside the intentionally broad 1%
-  // poison gate.  Interval verdicts become admissible only after CLOCKS has a
-  // live calibration and the sovereign VCLOCK one-second DWT ruler has earned
-  // its recovery streak.
-  return clocks_dwt_calibration_valid() &&
-         interrupt_feature_dwt_interval_recovered(
-             g_interrupt_integrity.vclock_qtimer_dwt.one_second);
-}
-
-static bool dwt_publication_expected_interval_ruler_qualified(
-    uint32_t expected_counter_delta_ticks,
-    uint32_t expected_interval_cycles) {
-  if (!dwt_publication_live_interval_ruler_ready()) return false;
-  if (expected_counter_delta_ticks == 0U || expected_interval_cycles == 0U) {
-    return false;
-  }
-
-  const uint32_t nominal =
-      dwt_publication_nominal_interval_for_delta(expected_counter_delta_ticks);
-  if (nominal == 0U) return false;
-
-  const uint64_t gate =
-      ((uint64_t)nominal *
-       (uint64_t)DWT_PUBLICATION_RULER_PLAUSIBILITY_PPM) /
-      1000000ULL;
-  const uint64_t lower = (gate >= nominal) ? 0ULL : ((uint64_t)nominal - gate);
-  const uint64_t upper = (uint64_t)nominal + gate;
-  return (uint64_t)expected_interval_cycles >= lower &&
-         (uint64_t)expected_interval_cycles <= upper;
-}
-
-static void dwt_publication_diag_seed(dwt_repair_diag_t& diag) {
-  diag.publication_verdict_mask = DWT_PUBLICATION_VERDICT_OK;
-  diag.publication_verdict_reason_id = INTERRUPT_DWT_PUBLICATION_REASON_OK;
-  diag.publication_gate_cycles = DWT_PUBLICATION_INTERVAL_GATE_CYCLES;
-  diag.publication_cross_rail_gate_cycles = DWT_PUBLICATION_CROSS_RAIL_GATE_CYCLES;
-  diag.publication_service_offset_gate_ticks =
-      DWT_PUBLICATION_SERVICE_OFFSET_GATE_TICKS;
-}
-
-static void dwt_publication_note_cross_rail(
-    const dwt_publication_lane_state_t& other,
-    uint32_t published_interval_cycles,
-    uint32_t& verdict_mask) {
-  if (!other.last_interval_valid) return;
-  const int64_t delta =
-      (int64_t)(uint64_t)published_interval_cycles -
-      (int64_t)(uint64_t)other.last_published_interval_cycles;
-  if (interrupt_integrity_abs_i64(delta) >
-      (uint64_t)DWT_PUBLICATION_CROSS_RAIL_GATE_CYCLES) {
-    verdict_mask |= DWT_PUBLICATION_VERDICT_CROSS_RAIL;
-  }
-}
-
-
-static FLASHMEM void dwt_publication_append_keyword(char* out,
-                                           size_t out_size,
-                                           const char* keyword) {
-  if (!out || out_size == 0U || !keyword || !*keyword) return;
-  const size_t used = strlen(out);
-  if (used >= out_size - 1U) return;
-  snprintf(out + used, out_size - used, "%s%s", used ? "," : "", keyword);
-}
-
-static FLASHMEM const char* dwt_publication_verdict_keywords(uint32_t mask,
-                                                    char* out,
-                                                    size_t out_size) {
-  if (!out || out_size == 0U) return "";
-  out[0] = '\0';
-  if (mask == DWT_PUBLICATION_VERDICT_OK) {
-    dwt_publication_append_keyword(out, out_size, "ok");
-    return out;
-  }
-  if (mask & DWT_PUBLICATION_VERDICT_ZERO_DWT) {
-    dwt_publication_append_keyword(out, out_size, "zero_dwt");
-  }
-  if (mask & DWT_PUBLICATION_VERDICT_SOURCE_MISMATCH) {
-    dwt_publication_append_keyword(out, out_size, "source_mismatch");
-  }
-  if (mask & DWT_PUBLICATION_VERDICT_FLOORLINE_EDGE) {
-    dwt_publication_append_keyword(out, out_size, "floorline_edge");
-  }
-  if (mask & DWT_PUBLICATION_VERDICT_FLOORLINE_INTERVAL) {
-    dwt_publication_append_keyword(out, out_size, "floorline_interval");
-  }
-  if (mask & DWT_PUBLICATION_VERDICT_FLOORLINE_LATE) {
-    dwt_publication_append_keyword(out, out_size, "floorline_late");
-  }
-  if (mask & DWT_PUBLICATION_VERDICT_COUNTER_LOW16) {
-    dwt_publication_append_keyword(out, out_size, "counter_low16");
-  }
-  if (mask & DWT_PUBLICATION_VERDICT_SERVICE_OFFSET) {
-    dwt_publication_append_keyword(out, out_size, "service_offset");
-  }
-  if (mask & DWT_PUBLICATION_VERDICT_COUNTER_DELTA) {
-    dwt_publication_append_keyword(out, out_size, "counter_delta");
-  }
-  if (mask & DWT_PUBLICATION_VERDICT_OBSERVED_INTERVAL) {
-    dwt_publication_append_keyword(out, out_size, "observed_interval");
-  }
-  if (mask & DWT_PUBLICATION_VERDICT_PUBLISHED_INTERVAL) {
-    dwt_publication_append_keyword(out, out_size, "published_interval");
-  }
-  if (mask & DWT_PUBLICATION_VERDICT_CROSS_RAIL) {
-    dwt_publication_append_keyword(out, out_size, "cross_rail");
-  }
-  if (mask & DWT_PUBLICATION_VERDICT_GNSS_PROJECTION) {
-    dwt_publication_append_keyword(out, out_size, "gnss_projection");
-  }
-  if (mask & DWT_PUBLICATION_VERDICT_COUNTER_ADJACENCY) {
-    dwt_publication_append_keyword(out, out_size, "counter_adjacency");
-  }
-  if (mask & DWT_PUBLICATION_VERDICT_YARDSTICK_EXCURSION) {
-    dwt_publication_append_keyword(out, out_size, "yardstick_excursion");
-  }
-  if (mask & DWT_PUBLICATION_VERDICT_RULER_UNQUALIFIED) {
-    dwt_publication_append_keyword(out, out_size, "ruler_unqualified");
-  }
-  return out;
-}
-
-static FLASHMEM void dwt_publication_add_cross_rail_payload(
-    Payload& parent,
-    const char* key,
-    const dwt_publication_lane_state_t& other,
-    uint32_t published_interval_cycles) {
-  Payload p;
-  p.add("last_interval_valid", other.last_interval_valid);
-  p.add("last_sequence", other.last_sequence);
-  p.add("last_published_dwt", other.last_published_dwt);
-  p.add("last_observed_dwt", other.last_observed_dwt);
-  p.add("last_counter32", other.last_counter32);
-  p.add("last_interval_cycles", other.last_published_interval_cycles);
-  int32_t delta = 0;
-  bool outside_gate = false;
-  if (other.last_interval_valid && published_interval_cycles != 0U) {
-    const int64_t d = (int64_t)(uint64_t)published_interval_cycles -
-                      (int64_t)(uint64_t)other.last_published_interval_cycles;
-    delta = dwt_publication_i32_from_i64(d);
-    outside_gate = interrupt_integrity_abs_i64(d) >
-        (uint64_t)DWT_PUBLICATION_CROSS_RAIL_GATE_CYCLES;
-  }
-  p.add("published_minus_rail_cycles", delta);
-  p.add("outside_gate", outside_gate);
-  parent.add_object(key, p);
-}
-
-static FLASHMEM void dwt_publication_raise_verbose_watchdog(
-    const dwt_publication_request_t& req,
-    const dwt_repair_diag_t& diag,
-    const dwt_publication_lane_state_t& lane_state,
-    const dwt_publication_forensics_t& f,
-    uint32_t blocking_mask,
-    uint32_t always_blocking,
-    uint32_t launch_blocking,
-    uint32_t launch_relaxed,
-    bool strict_ready) {
-  // Payload copies strings at add-time, so one reusable buffer replaces seven
-  // simultaneously live 320-byte arrays on the fatal path.
-  char keywords[320];
-
-  Payload root;
-  root.add("schema", "WATCHDOG_ANOMALY_DWT_PUBLICATION_VERBOSE_V1");
-  root.add("reason", "dwt_publication_anomaly");
-  root.add("source_process", "INTERRUPT");
-  root.add("source_report", "DWT_PUBLICATION_COURTROOM");
-  root.add("summary", "blocked before subscriber publication; payload is self-contained and does not depend on REPORT_PUBLICATION");
-  root.add("kind", interrupt_subscriber_kind_str(req.kind));
-  root.add("sequence", req.sequence);
-  root.add("blocked", f.blocked);
-  root.add("campaign_armed", f.campaign_armed);
-  root.add("strict_ready", strict_ready);
-  root.add("watchdog_dwt", (uint32_t)ARM_DWT_CYCCNT);
-  root.add("ipsr", interrupt_ipsr());
-  root.add("primask", interrupt_primask());
-
-  {
-  Payload court;
-  const uint32_t primary_reason_id =
-      interrupt_dwt_publication_reason_id_from_verdict_mask(f.verdict_mask);
-  const uint32_t fatal_reason_id =
-      interrupt_dwt_publication_reason_id_from_verdict_mask(f.fatal_mask);
-  court.add("primary_verdict_id", primary_reason_id);
-  court.add("primary_verdict", interrupt_dwt_publication_reason_name(primary_reason_id));
-  court.add("fatal_primary_verdict_id", fatal_reason_id);
-  court.add("fatal_primary_verdict", interrupt_dwt_publication_reason_name(fatal_reason_id));
-  court.add("verdict_keywords",
-            dwt_publication_verdict_keywords(f.verdict_mask,
-                                             keywords,
-                                             sizeof(keywords)));
-  court.add("fatal_keywords",
-            dwt_publication_verdict_keywords(f.fatal_mask,
-                                             keywords,
-                                             sizeof(keywords)));
-  court.add("blocking_keywords",
-            dwt_publication_verdict_keywords(blocking_mask,
-                                             keywords,
-                                             sizeof(keywords)));
-  court.add("always_blocking_keywords",
-            dwt_publication_verdict_keywords(always_blocking,
-                                             keywords,
-                                             sizeof(keywords)));
-  court.add("launch_blocking_keywords",
-            dwt_publication_verdict_keywords(launch_blocking,
-                                             keywords,
-                                             sizeof(keywords)));
-  court.add("launch_relaxed_keywords",
-            dwt_publication_verdict_keywords(launch_relaxed,
-                                             keywords,
-                                             sizeof(keywords)));
-  court.add("side_rail_diagnostic_keywords",
-            dwt_publication_verdict_keywords(
-                f.verdict_mask & DWT_PUBLICATION_SIDE_RAIL_DIAGNOSTIC_MASK,
-                keywords,
-                sizeof(keywords)));
-  court.add("launch_acquisition_active_at_record", f.launch_acquisition_active);
-  court.add("launch_begin_count", (uint32_t)g_dwt_publication_launch_begin_count);
-  court.add("launch_end_count", (uint32_t)g_dwt_publication_launch_end_count);
-  court.add("launch_relaxed_count", (uint32_t)g_dwt_publication_launch_relaxed_count);
-  court.add("launch_hard_block_count", (uint32_t)g_dwt_publication_launch_hard_block_count);
-  court.add("lane_accept_count_before_event", lane_state.accept_count);
-  court.add("lane_watchdog_count", lane_state.watchdog_count);
-  court.add("forensic_record_count", f.record_count);
-  root.add_object("court", court);  }
-
-
-  {
-  Payload event;
-  event.add("kind", interrupt_subscriber_kind_str(req.kind));
-  event.add("sequence", f.sequence);
-  event.add("published_dwt", f.published_dwt);
-  event.add("observed_dwt", f.observed_dwt);
-  event.add("published_minus_observed_cycles", f.published_minus_observed_cycles);
-  event.add("target_counter32", f.target_counter32);
-  event.add("target_low16", (uint32_t)f.target_low16);
-  event.add("expected_low16",
-            (uint32_t)dwt_publication_expected_low16(req.kind,
-                                                     f.target_counter32));
-  event.add("service_low16_valid", f.service_low16_valid);
-  event.add("service_low16", (uint32_t)f.service_low16);
-  event.add("service_offset_ticks", f.service_offset_ticks);
-  root.add_object("event", event);  }
-
-
-  {
-  Payload previous;
-  previous.add("valid", f.previous_valid);
-  previous.add("published_dwt", f.previous_published_dwt);
-  previous.add("observed_dwt", f.previous_observed_dwt);
-  previous.add("floorline_dwt", f.previous_floorline_dwt);
-  previous.add("counter32", f.previous_counter32);
-  root.add_object("previous_publication", previous);  }
-
-
-  {
-  Payload lineage;
-  lineage.add("expected_counter_delta_ticks", f.expected_counter_delta_ticks);
-  lineage.add("observed_counter_delta_ticks", f.observed_counter_delta_ticks);
-  lineage.add("counter_delta_error_ticks",
-              dwt_publication_i32_from_i64(
-                  (int64_t)(uint64_t)f.observed_counter_delta_ticks -
-                  (int64_t)(uint64_t)f.expected_counter_delta_ticks));
-  lineage.add("expected_interval_cycles", f.expected_interval_cycles);
-  lineage.add("published_interval_cycles", f.published_interval_cycles);
-  lineage.add("observed_interval_cycles", f.observed_interval_cycles);
-  lineage.add("floorline_interval_cycles", f.floorline_interval_cycles);
-  lineage.add("published_interval_error_cycles", f.published_interval_error_cycles);
-  lineage.add("observed_interval_error_cycles", f.observed_interval_error_cycles);
-  lineage.add("floorline_interval_error_cycles", f.floorline_interval_error_cycles);
-  lineage.add("floorline_minus_observed_cycles", f.floorline_minus_observed_cycles);
-  lineage.add("ruler_gate_cycles", DWT_PUBLICATION_INTERVAL_GATE_CYCLES);
-  lineage.add("cross_rail_gate_cycles", DWT_PUBLICATION_CROSS_RAIL_GATE_CYCLES);
-  lineage.add("service_offset_gate_ticks", DWT_PUBLICATION_SERVICE_OFFSET_GATE_TICKS);
-  root.add_object("lineage", lineage);  }
-
-
-  {
-  Payload cross;
-  dwt_publication_add_cross_rail_payload(cross, "vclock", g_dwt_publication_vclock,
-                                         f.published_interval_cycles);
-  dwt_publication_add_cross_rail_payload(cross, "ocxo1", g_dwt_publication_ocxo1,
-                                         f.published_interval_cycles);
-  dwt_publication_add_cross_rail_payload(cross, "ocxo2", g_dwt_publication_ocxo2,
-                                         f.published_interval_cycles);
-  root.add_object("cross_rail", cross);  }
-
-
-  {
-  Payload floorline;
-  floorline.add("valid", f.floorline_valid);
-  floorline.add("candidate", f.floorline_candidate);
-  floorline.add("published", f.floorline_published);
-  floorline.add("fallback_used", f.floorline_fallback_used);
-  floorline.add("dwt", f.floorline_dwt);
-  floorline.add("sequence", f.floorline_sequence);
-  floorline.add("sample_count", f.floorline_sample_count);
-  floorline.add("selected_bucket_count", f.floorline_selected_bucket_count);
-  floorline.add("publish_source", lower_env_publish_source_name(f.floorline_publish_source));
-  floorline.add("publish_reason", lower_env_publish_reason_name(f.floorline_publish_reason));
-  floorline.add("confidence_ppm", f.floorline_confidence_ppm);
-  root.add_object("floorline", floorline);  }
-
-
-  {
-  Payload capture;
-  capture.add("authored_dwt", f.capture_authored_dwt);
-  capture.add("raw_event_dwt", f.capture_raw_event_dwt);
-  capture.add("isr_entry_dwt_raw", f.capture_isr_entry_dwt_raw);
-  capture.add("arm_dwt_raw", f.capture_arm_dwt_raw);
-  capture.add("arm_to_isr_ticks", f.capture_arm_to_isr_ticks);
-  capture.add("arm_to_isr_dwt_cycles", f.capture_arm_to_isr_dwt_cycles);
-  capture.add("service_offset_ticks", f.capture_service_offset_ticks);
-  capture.add("service_correction_cycles", f.capture_service_correction_cycles);
-  capture.add("service_counter_low16", (uint32_t)f.capture_service_counter_low16);
-  capture.add("service_compare_low16", (uint32_t)f.capture_service_compare_low16);
-  capture.add("service_counter_minus_compare_ticks", f.capture_service_counter_minus_compare_ticks);
-  capture.add("compare_delta_mod65536_ticks", f.capture_compare_delta_mod65536_ticks);
-  capture.add("target_delta_mod65536_ticks", f.capture_target_delta_mod65536_ticks);
-  capture.add("interpreted_late_ticks", f.capture_interpreted_late_ticks);
-  capture.add("early_ticks", f.capture_early_ticks);
-  capture.add("service_offset_abs_ticks", f.capture_service_offset_abs_ticks);
-  capture.add("recomputed_minus_capture_authored_cycles",
-              (int32_t)(f.observed_dwt - f.capture_authored_dwt));
-  capture.add("published_minus_capture_authored_cycles",
-              (int32_t)(f.published_dwt - f.capture_authored_dwt));
-  capture.add("raw_minus_capture_authored_cycles",
-              (int32_t)(f.capture_raw_event_dwt - f.capture_authored_dwt));
-  root.add_object("capture", capture);  }
-
-
-  {
-  Payload repair;
-  repair.add("original_dwt", f.repair_original_dwt);
-  repair.add("predicted_dwt", f.repair_predicted_dwt);
-  repair.add("used_dwt", f.repair_used_dwt);
-  repair.add("event_from_isr_entry_raw", f.repair_event_from_isr_entry_raw);
-  repair.add("isr_entry_to_event_correction_cycles",
-             f.repair_isr_entry_to_event_correction_cycles);
-  repair.add("error_cycles", f.repair_error_cycles);
-  repair.add("reason", f.repair_reason ? f.repair_reason : "none");
-  repair.add("vclock_gnss_error_ns_i32",
-             dwt_publication_i32_from_i64(diag.publication_vclock_gnss_error_ns));
-  root.add_object("repair", repair);  }
-
-
-  {
-  Payload yardstick;
-  yardstick.add("valid", f.yardstick_valid);
-  yardstick.add("stale", f.yardstick_stale);
-  yardstick.add("seeded", f.yardstick_seeded);
-  yardstick.add("excursion", f.yardstick_excursion);
-  yardstick.add("pps_sequence", f.yardstick_pps_sequence);
-  yardstick.add("pps_seq_delta", f.yardstick_pps_seq_delta);
-  yardstick.add("g_now_cycles", f.yardstick_g_now_cycles);
-  yardstick.add("g_prev_cycles", f.yardstick_g_prev_cycles);
-  yardstick.add("inferred_interval_cycles", f.yardstick_inferred_interval_cycles);
-  yardstick.add("observed_interval_cycles", f.yardstick_observed_interval_cycles);
-  yardstick.add("inferred_minus_observed_cycles", f.yardstick_inferred_minus_observed_cycles);
-  yardstick.add("auth_endpoint_dwt", f.yardstick_auth_endpoint_dwt);
-  yardstick.add("auth_error_cycles", f.yardstick_auth_error_cycles);
-  yardstick.add("auth_anchor_applied", f.yardstick_auth_anchor_applied);
-  root.add_object("yardstick", yardstick);  }
-
-
-  clocks_watchdog_anomaly_payload("dwt_publication_anomaly",
-                                  root,
-                                  (uint32_t)req.kind,
-                                  f.verdict_mask,
-                                  req.published_dwt,
-                                  req.target_counter32);
-}
-
-static void dwt_publication_record_fatal_forensics(
-    const dwt_publication_request_t& req,
-    const dwt_repair_diag_t& diag,
-    const dwt_publication_lane_state_t& previous_state,
-    uint32_t verdict_mask,
-    uint32_t fatal_mask,
-    bool campaign_armed,
-    bool blocked,
-    bool launch_acquisition,
-    uint32_t launch_block_mask,
-    uint32_t launch_relaxed_mask,
-    bool floorline_valid,
-    bool floorline_candidate,
-    bool floorline_published,
-    uint32_t floorline_dwt) {
-  const uint32_t next_count = g_dwt_publication_last_fatal.record_count + 1U;
-  dwt_publication_forensics_t f{};
-  f.valid = true;
-  f.record_count = next_count;
-  f.kind = (uint32_t)req.kind;
-  f.sequence = req.sequence;
-  f.verdict_mask = verdict_mask;
-  f.fatal_mask = fatal_mask;
-  f.verdict_reason_id =
-      interrupt_dwt_publication_reason_id_from_verdict_mask(verdict_mask);
-  f.campaign_armed = campaign_armed;
-  f.blocked = blocked;
-  f.launch_acquisition_active = launch_acquisition;
-  f.launch_block_mask = launch_block_mask;
-  f.launch_relaxed_mask = launch_relaxed_mask;
-
-  f.published_dwt = req.published_dwt;
-  f.observed_dwt = req.observed_dwt;
-  f.target_counter32 = req.target_counter32;
-  f.target_low16 = req.target_low16;
-  f.service_low16_valid = req.service_low16_valid;
-  f.service_low16 = req.service_low16;
-  f.service_offset_ticks = diag.publication_service_offset_signed_ticks;
-
-  f.previous_valid = previous_state.previous_valid;
-  f.previous_published_dwt = previous_state.previous_published_dwt;
-  f.previous_observed_dwt = previous_state.previous_observed_dwt;
-  f.previous_floorline_dwt = previous_state.previous_floorline_dwt;
-  f.previous_counter32 = previous_state.previous_counter32;
-
-  f.expected_counter_delta_ticks = diag.publication_expected_counter_delta_ticks;
-  f.observed_counter_delta_ticks = diag.publication_observed_counter_delta_ticks;
-  f.expected_interval_cycles = diag.publication_expected_interval_cycles;
-  f.published_interval_cycles = diag.publication_published_interval_cycles;
-  f.observed_interval_cycles = diag.publication_observed_interval_cycles;
-  f.floorline_interval_cycles = diag.publication_floorline_interval_cycles;
-  f.published_interval_error_cycles =
-      diag.publication_published_interval_error_cycles;
-  f.observed_interval_error_cycles =
-      diag.publication_observed_interval_error_cycles;
-  f.floorline_interval_error_cycles =
-      diag.publication_floorline_interval_error_cycles;
-  f.published_minus_observed_cycles =
-      diag.publication_published_minus_observed_cycles;
-  f.floorline_minus_observed_cycles =
-      diag.publication_floorline_minus_observed_cycles;
-
-  f.floorline_valid = floorline_valid;
-  f.floorline_candidate = floorline_candidate;
-  f.floorline_published = floorline_published;
-  f.floorline_dwt = floorline_dwt;
-  if (req.floorline) {
-    f.floorline_fallback_used = req.floorline->fallback_used;
-    f.floorline_sequence = req.floorline->sequence;
-    f.floorline_sample_count = req.floorline->sample_count;
-    f.floorline_selected_bucket_count = req.floorline->selected_bucket_count;
-    f.floorline_publish_source = req.floorline->publish_source;
-    f.floorline_publish_reason = req.floorline->publish_reason;
-    f.floorline_confidence_ppm = req.floorline->confidence_ppm;
-  }
-
-  f.capture_authored_dwt = req.capture_authored_dwt;
-  f.capture_raw_event_dwt = req.capture_raw_event_dwt;
-  f.capture_isr_entry_dwt_raw = req.capture_isr_entry_dwt_raw;
-  f.capture_arm_dwt_raw = req.capture_arm_dwt_raw;
-  f.capture_arm_to_isr_ticks = req.capture_arm_to_isr_ticks;
-  f.capture_arm_to_isr_dwt_cycles = req.capture_arm_to_isr_dwt_cycles;
-  f.capture_service_offset_ticks = req.capture_service_offset_ticks;
-  f.capture_service_correction_cycles = req.capture_service_correction_cycles;
-  f.capture_service_counter_low16 = req.capture_service_counter_low16;
-  f.capture_service_compare_low16 = req.capture_service_compare_low16;
-  f.capture_service_counter_minus_compare_ticks =
-      req.capture_service_counter_minus_compare_ticks;
-  f.capture_compare_delta_mod65536_ticks =
-      req.capture_compare_delta_mod65536_ticks;
-  f.capture_target_delta_mod65536_ticks =
-      req.capture_target_delta_mod65536_ticks;
-  f.capture_interpreted_late_ticks = req.capture_interpreted_late_ticks;
-  f.capture_early_ticks = req.capture_early_ticks;
-  f.capture_service_offset_abs_ticks = req.capture_service_offset_abs_ticks;
-
-  if (req.repair) {
-    f.repair_original_dwt = req.repair->original_dwt;
-    f.repair_predicted_dwt = req.repair->predicted_dwt;
-    f.repair_used_dwt = req.repair->used_dwt;
-    f.repair_event_from_isr_entry_raw =
-        req.repair->event_dwt_from_isr_entry_raw;
-    f.repair_isr_entry_to_event_correction_cycles =
-        req.repair->isr_entry_to_event_correction_cycles;
-    f.repair_error_cycles = req.repair->error_cycles;
-    f.repair_reason = req.repair->reason ? req.repair->reason : "none";
-
-    f.yardstick_valid = req.repair->yardstick_valid;
-    f.yardstick_stale = req.repair->yardstick_stale;
-    f.yardstick_seeded = req.repair->yardstick_seeded_this_event;
-    f.yardstick_excursion = req.repair->yardstick_excursion;
-    f.yardstick_pps_sequence = req.repair->yardstick_pps_sequence;
-    f.yardstick_pps_seq_delta = req.repair->yardstick_pps_seq_delta;
-    f.yardstick_g_now_cycles = req.repair->yardstick_g_now_cycles;
-    f.yardstick_g_prev_cycles = req.repair->yardstick_g_prev_cycles;
-    f.yardstick_inferred_interval_cycles =
-        req.repair->yardstick_inferred_interval_cycles;
-    f.yardstick_observed_interval_cycles =
-        req.repair->yardstick_observed_interval_cycles;
-    f.yardstick_inferred_minus_observed_cycles =
-        req.repair->yardstick_inferred_minus_observed_cycles;
-    f.yardstick_auth_endpoint_dwt = req.repair->yardstick_auth_endpoint_dwt;
-    f.yardstick_auth_error_cycles = req.repair->yardstick_auth_error_cycles;
-    f.yardstick_auth_anchor_applied =
-        req.repair->yardstick_auth_anchor_applied;
-  }
-
-  g_dwt_publication_last_fatal = f;
-}
-
-static __attribute__((noinline)) bool dwt_publication_adjudicate_or_watchdog(
-    const dwt_publication_request_t& req,
-    dwt_repair_diag_t& diag) {
-  dwt_publication_lane_state_t* s = dwt_publication_lane_state_for(req.kind);
-  if (!s) return false;
-
-  dwt_publication_diag_seed(diag);
-  diag.publication_watchdog_count = s->watchdog_count;
-
-  const uint32_t expected_counter_delta =
-      dwt_publication_expected_counter_delta_ticks(req.kind);
-  const bool floorline_valid = req.floorline && req.floorline->valid;
-  const bool floorline_candidate =
-      floorline_valid && req.floorline->candidate_present &&
-      req.floorline->inferred_dwt_at_event != 0U;
-  // FloorLine is no longer a publication authority.  Keep its candidate
-  // geometry in the courtroom forensics, but the source-law expected endpoint
-  // comes from the caller's observed edge authority: OCXO observed DWT or
-  // VCLOCK observed DWT. PPS+learned phase is a witness, not source law.
-  const bool floorline_published = false;
-  const uint32_t floorline_dwt = floorline_candidate
-      ? req.floorline->inferred_dwt_at_event
-      : 0U;
-  const uint32_t expected_published_dwt = req.expected_published_dwt
-      ? req.expected_published_dwt
-      : req.observed_dwt;
-
-  uint32_t verdict = DWT_PUBLICATION_VERDICT_OK;
-  diag.publication_expected_counter_delta_ticks = expected_counter_delta;
-
-  if (req.published_dwt == 0U || req.observed_dwt == 0U) {
-    verdict |= DWT_PUBLICATION_VERDICT_ZERO_DWT;
-  }
-
-  if (req.published_dwt != expected_published_dwt) {
-    verdict |= DWT_PUBLICATION_VERDICT_SOURCE_MISMATCH;
-  }
-
-  diag.publication_published_minus_observed_cycles =
-      lower_env_signed_delta_u32(req.observed_dwt, req.published_dwt);
-
-  if (floorline_candidate) {
-    const int32_t fl_minus_observed =
-        lower_env_signed_delta_u32(req.observed_dwt, floorline_dwt);
-    diag.publication_floorline_minus_observed_cycles = fl_minus_observed;
-
-    // FloorLine remains a diagnostic witness.  Its edge/interval deltas are
-    // copied into the publication diagnostics, but they no longer contribute
-    // verdict bits or block subscriber publication.
-    if (req.floorline->observed_interval_valid &&
-        req.floorline->inferred_interval_valid) {
-      diag.publication_observed_interval_cycles =
-          req.floorline->observed_interval_cycles;
-      diag.publication_floorline_interval_cycles =
-          req.floorline->inferred_interval_cycles;
-      diag.publication_floorline_interval_error_cycles =
-          req.floorline->inferred_minus_observed_interval_cycles;
-    }
-  }
-
-  const uint16_t expected_low16 =
-      dwt_publication_expected_low16(req.kind, req.target_counter32);
-  if (req.target_low16 != expected_low16) {
-    verdict |= DWT_PUBLICATION_VERDICT_COUNTER_LOW16;
-  }
-
-  if (req.service_low16_valid) {
-    const int32_t service_offset =
-        (int32_t)((int16_t)((uint16_t)(req.service_low16 - req.target_low16)));
-    diag.publication_service_offset_signed_ticks = service_offset;
-    if (dwt_publication_abs_i32(service_offset) >
-        DWT_PUBLICATION_SERVICE_OFFSET_GATE_TICKS) {
-      verdict |= DWT_PUBLICATION_VERDICT_SERVICE_OFFSET;
-    }
-  }
-
-  if (req.repair) {
-    if (req.repair->interval_adjacency_gate_valid &&
-        req.repair->interval_adjacency_rejected) {
-      verdict |= DWT_PUBLICATION_VERDICT_COUNTER_ADJACENCY;
-    }
-    if (req.repair->yardstick_valid && req.repair->yardstick_excursion) {
-      verdict |= DWT_PUBLICATION_VERDICT_YARDSTICK_EXCURSION;
-    }
-  }
-
-  uint32_t published_interval = 0U;
-  bool published_interval_valid = false;
-  if (s->previous_valid) {
-    const uint32_t observed_counter_delta =
-        req.target_counter32 - s->previous_counter32;
-    diag.publication_observed_counter_delta_ticks = observed_counter_delta;
-    if (observed_counter_delta != expected_counter_delta) {
-      verdict |= DWT_PUBLICATION_VERDICT_COUNTER_DELTA;
-    }
-
-    const uint32_t expected_interval =
-        vclock_cycles_for_ticks(expected_counter_delta);
-    diag.publication_expected_interval_cycles = expected_interval;
-
-    published_interval = req.published_dwt - s->previous_published_dwt;
-    const uint32_t observed_interval = req.observed_dwt - s->previous_observed_dwt;
-    diag.publication_published_interval_cycles = published_interval;
-    diag.publication_observed_interval_cycles = observed_interval;
-    published_interval_valid = (published_interval != 0U);
-
-    if (published_interval == 0U || observed_interval == 0U) {
-      verdict |= DWT_PUBLICATION_VERDICT_ZERO_DWT;
-    }
-
-    const bool interval_ruler_qualified =
-        dwt_publication_expected_interval_ruler_qualified(
-            expected_counter_delta, expected_interval);
-    if (!interval_ruler_qualified) {
-      verdict |= DWT_PUBLICATION_VERDICT_RULER_UNQUALIFIED;
-    } else {
-      const int64_t pub_error64 =
-          (int64_t)(uint64_t)published_interval -
-          (int64_t)(uint64_t)expected_interval;
-      const int64_t obs_error64 =
-          (int64_t)(uint64_t)observed_interval -
-          (int64_t)(uint64_t)expected_interval;
-      diag.publication_published_interval_error_cycles =
-          dwt_publication_i32_from_i64(pub_error64);
-      diag.publication_observed_interval_error_cycles =
-          dwt_publication_i32_from_i64(obs_error64);
-
-      if (interrupt_integrity_abs_i64(pub_error64) >
-          (uint64_t)DWT_PUBLICATION_INTERVAL_GATE_CYCLES) {
-        verdict |= DWT_PUBLICATION_VERDICT_PUBLISHED_INTERVAL;
-      }
-      if (interrupt_integrity_abs_i64(obs_error64) >
-          (uint64_t)DWT_PUBLICATION_INTERVAL_GATE_CYCLES) {
-        verdict |= DWT_PUBLICATION_VERDICT_OBSERVED_INTERVAL;
-      }
-    }
-  }
-
-  // A qualified physical-PPS substitution has already replaced the bad GPIO
-  // endpoint in the yardstick. If a same-row OCXO audit still sees the stale
-  // pre-substitution ruler, do not convert that known repaired ruler failure
-  // into OBSERVED_INTERVAL/PUBLISHED_INTERVAL WATCHDOG_ANOMALY. Other courts
-  // (counter lineage, service offset, source identity, cross-rail, etc.) remain
-  // fully active.
-  if (pps_floorline_repair_covers_interval_verdict(req.repair,
-                                                       req.floorline)) {
-    verdict &= ~(DWT_PUBLICATION_VERDICT_OBSERVED_INTERVAL |
-                 DWT_PUBLICATION_VERDICT_PUBLISHED_INTERVAL);
-  }
-
-  if (published_interval_valid) {
-    if (req.kind != interrupt_subscriber_kind_t::VCLOCK) {
-      dwt_publication_note_cross_rail(g_dwt_publication_vclock,
-                                      published_interval,
-                                      verdict);
-    }
-    if (req.kind != interrupt_subscriber_kind_t::OCXO1) {
-      dwt_publication_note_cross_rail(g_dwt_publication_ocxo1,
-                                      published_interval,
-                                      verdict);
-    }
-    if (req.kind != interrupt_subscriber_kind_t::OCXO2) {
-      dwt_publication_note_cross_rail(g_dwt_publication_ocxo2,
-                                      published_interval,
-                                      verdict);
-    }
-  }
-
-  if (req.kind == interrupt_subscriber_kind_t::VCLOCK &&
-      req.sequence != 0U && req.published_dwt != 0U &&
-      dwt_publication_vclock_gnss_projection_ready(req.sequence)) {
-    const bridge_projection_t proj =
-        interrupt_dwt_to_vclock_gnss_projection(req.published_dwt);
-    if (proj.gnss_ns >= 0 && proj.anchor_sequence_used != 0U &&
-        proj.anchor_gnss_ns_at_edge >= 0) {
-      const int64_t sequence_delta =
-          (int64_t)req.sequence - (int64_t)proj.anchor_sequence_used;
-      const int64_t expected_gnss_ns =
-          proj.anchor_gnss_ns_at_edge +
-          sequence_delta * (int64_t)GNSS_NS_PER_SECOND;
-      const int64_t error_ns = proj.gnss_ns - expected_gnss_ns;
-      diag.publication_vclock_gnss_error_ns = error_ns;
-      if (interrupt_integrity_abs_i64(error_ns) >
-          (uint64_t)DWT_PUBLICATION_VCLOCK_GNSS_GATE_NS) {
-        verdict |= DWT_PUBLICATION_VERDICT_GNSS_PROJECTION;
-      }
-    }
-  }
-
-  diag.publication_verdict_mask = verdict;
-  diag.publication_verdict_reason_id =
-      interrupt_dwt_publication_reason_id_from_verdict_mask(verdict);
-  s->last_verdict_mask = verdict;
-  s->last_sequence = req.sequence;
-  s->last_published_dwt = req.published_dwt;
-  s->last_observed_dwt = req.observed_dwt;
-  s->last_counter32 = req.target_counter32;
-
-  const uint32_t fatal_verdict =
-      verdict & ~DWT_PUBLICATION_SIDE_RAIL_DIAGNOSTIC_MASK;
-
-  if (verdict != DWT_PUBLICATION_VERDICT_OK) {
-    // The tribunal records both hard publication-law failures and side-rail
-    // audit failures in the same diagnostic mask.  GNSS projection and
-    // yardstick disagreement remain diagnostic witnesses.  All other bits are
-    // publication law.  Startup may relax interval/ruler/cross-rail law briefly,
-    // but source/custody impossibilities are never admissible, and after a lane
-    // has produced a short clean streak process_interrupt becomes locally strict
-    // even if CLOCKS has not yet marked campaign watchdog continuity armed.
-    if (fatal_verdict != DWT_PUBLICATION_VERDICT_OK) {
-      const bool campaign_armed = clocks_watchdog_campaign_armed();
-      const bool launch_acquisition =
-          interrupt_dwt_publication_launch_acquisition_active();
-      const bool strict_ready =
-          !launch_acquisition && dwt_publication_strict_ready(*s);
-      const uint32_t always_blocking =
-          fatal_verdict & DWT_PUBLICATION_ALWAYS_BLOCK_MASK;
-      const uint32_t launch_blocking =
-          fatal_verdict & DWT_PUBLICATION_LAUNCH_BLOCK_MASK;
-      const uint32_t launch_relaxed =
-          launch_acquisition ? (fatal_verdict & ~DWT_PUBLICATION_LAUNCH_BLOCK_MASK)
-                             : DWT_PUBLICATION_VERDICT_OK;
-      const uint32_t blocking_mask = launch_acquisition
-          ? launch_blocking
-          : ((campaign_armed || strict_ready) ? fatal_verdict : always_blocking);
-      const bool blocked = blocking_mask != DWT_PUBLICATION_VERDICT_OK;
-
-      if (blocked) {
-        s->watchdog_count++;
-        diag.publication_watchdog_count = s->watchdog_count;
-        dwt_publication_record_fatal_forensics(req,
-                                               diag,
-                                               *s,
-                                               verdict,
-                                               fatal_verdict,
-                                               campaign_armed,
-                                               true,
-                                               launch_acquisition,
-                                               launch_blocking,
-                                               launch_relaxed,
-                                               floorline_valid,
-                                               floorline_candidate,
-                                               floorline_published,
-                                               floorline_dwt);
-        if (launch_acquisition) {
-          g_dwt_publication_launch_hard_block_count++;
-        } else if (campaign_armed || strict_ready) {
-          if (interrupt_science_reject_lane(req.kind)) {
-            interrupt_science_reject(
-                clocks_science_reject_reason_t::INTERRUPT_OCXO_DWT_PUBLICATION,
-                req.kind,
-                req.sequence,
-                blocking_mask,
-                req.published_dwt,
-                req.target_counter32);
-          } else {
-            // VCLOCK is the campaign timeline itself.  If its publication court
-            // cannot author an edge, ordinary candidate testimony is impossible.
-            dwt_publication_raise_verbose_watchdog(req,
-                                                    diag,
-                                                    *s,
-                                                    g_dwt_publication_last_fatal,
-                                                    blocking_mask,
-                                                    always_blocking,
-                                                    launch_blocking,
-                                                    launch_relaxed,
-                                                    strict_ready);
-          }
-        }
-        diag.publication_verdict_reason_id = launch_acquisition
-            ? INTERRUPT_DWT_PUBLICATION_REASON_LAUNCH_ACQUISITION_HARD_QUARANTINE
-            : (campaign_armed
-                   ? interrupt_dwt_publication_reason_id_from_verdict_mask(verdict)
-                   : (strict_ready
-                          ? INTERRUPT_DWT_PUBLICATION_REASON_STRICT_PUBLICATION_QUARANTINE
-                          : INTERRUPT_DWT_PUBLICATION_REASON_STARTUP_HARD_QUARANTINE));
-        return false;
-      }
-
-      // START launch-acquisition deliberately admits non-poisonous transient
-      // interval/ruler/FloorLine/adjacency evidence so Alpha can form the OCXO
-      // public-origin handoff.  The verdict remains visible and the window is
-      // explicitly ended by Beta before public PPS1 is released.
-      if (launch_acquisition) {
-        g_dwt_publication_launch_relaxed_count++;
-        diag.publication_verdict_reason_id =
-          INTERRUPT_DWT_PUBLICATION_REASON_LAUNCH_ACQUISITION_RELAXED_DIAGNOSTIC;
-      } else {
-        g_dwt_publication_startup_relaxed_count++;
-        g_dwt_publication_startup_relaxed_last_kind = (uint32_t)req.kind;
-        g_dwt_publication_startup_relaxed_last_sequence = req.sequence;
-        g_dwt_publication_startup_relaxed_last_mask = fatal_verdict;
-        diag.publication_verdict_reason_id =
-          INTERRUPT_DWT_PUBLICATION_REASON_STARTUP_RELAXED_DIAGNOSTIC;
-      }
-    } else {
-      diag.publication_verdict_reason_id =
-        INTERRUPT_DWT_PUBLICATION_REASON_SIDE_RAIL_DIAGNOSTIC;
-    }
-  }
-
-  s->previous_valid = true;
-  s->previous_published_dwt = req.published_dwt;
-  s->previous_observed_dwt = req.observed_dwt;
-  s->previous_floorline_dwt = floorline_candidate ? floorline_dwt : req.observed_dwt;
-  s->previous_counter32 = req.target_counter32;
-  if (published_interval_valid) {
-    s->last_interval_valid = true;
-    s->last_published_interval_cycles = published_interval;
-  }
-  if (fatal_verdict == DWT_PUBLICATION_VERDICT_OK) {
-    if (s->accept_count != UINT32_MAX) {
-      s->accept_count++;
-    }
-  } else {
-    s->accept_count = 0;
-  }
-  return true;
-}
-
-
-// ============================================================================
-// Diag fill + event dispatch
-// ============================================================================
-
-static __attribute__((noinline)) void deferred_dispatch_callback(timepop_ctx_t*, timepop_diag_t*, void*);
-static bool vclock_fact_ring_arm_drain_from_timepop(void);
-
-static void fill_diag(interrupt_capture_diag_t& diag,
-                      const interrupt_subscriber_runtime_t& rt,
-                      const interrupt_event_t& event) {
-  diag.enabled  = true;
-  diag.provider = rt.desc->provider;
-  diag.lane     = rt.desc->lane;
-  diag.kind     = rt.desc->kind;
-  diag.dwt_at_event       = event.dwt_at_event;
-  diag.gnss_ns_at_event   = event.gnss_ns_at_event;
-  diag.counter32_at_event = event.counter32_at_event;
-
-  if (rt.desc->kind == interrupt_subscriber_kind_t::VCLOCK) {
-    diag.pps_edge_sequence          = g_pps_gpio_heartbeat.edge_count;
-    diag.pps_edge_dwt_isr_entry_raw = g_pps_gpio_heartbeat.last_dwt;  // legacy field; carries pvc.dwt_at_edge
-    diag.pps_edge_gnss_ns           = g_pps_gpio_heartbeat.last_gnss_ns;
-    diag.pps_edge_minus_event_ns =
-        (g_pps_gpio_heartbeat.last_gnss_ns >= 0 && event.gnss_ns_at_event != 0)
-            ? (g_pps_gpio_heartbeat.last_gnss_ns - (int64_t)event.gnss_ns_at_event)
-            : 0;
-    diag.pps_coincidence_cycles = event.pps_coincidence_cycles;
-    diag.pps_coincidence_valid  = event.pps_coincidence_valid;
-  }
-
-  if (rt.desc->kind == interrupt_subscriber_kind_t::OCXO1 ||
-      rt.desc->kind == interrupt_subscriber_kind_t::OCXO2) {
-    const ocxo_lane_t* lane = ocxo_lane_for(rt.desc->kind);
-    if (lane) {
-      diag.ocxo_service_class = lane->witness_last_service_class;
-      diag.ocxo_service_offset_signed_ticks =
-          lane->witness_last_service_offset_signed_ticks;
-      diag.ocxo_service_offset_abs_ticks =
-          lane->witness_last_service_offset_abs_ticks;
-      diag.ocxo_interpreted_late_ticks =
-          lane->witness_last_interpreted_late_ticks;
-      diag.ocxo_early_ticks = lane->witness_last_early_ticks;
-      diag.ocxo_target_delta_mod65536_ticks =
-          lane->witness_last_target_delta_mod65536_ticks;
-      diag.ocxo_arm_remaining_ticks = lane->witness_last_arm_remaining_ticks;
-      diag.ocxo_arm_to_isr_ticks = lane->witness_last_arm_to_isr_ticks;
-      diag.ocxo_arm_to_isr_dwt_cycles = lane->witness_last_arm_to_isr_dwt_cycles;
-      diag.ocxo_arm_counter_low16 = lane->witness_last_arm_low16;
-      diag.ocxo_arm_compare_low16 = lane->witness_last_arm_compare_low16;
-      diag.ocxo_arm_counter_minus_compare_ticks =
-          lane->witness_last_arm_counter_minus_compare_ticks;
-      diag.ocxo_arm_compare_remaining_ticks =
-          lane->witness_last_arm_compare_remaining_ticks;
-      diag.ocxo_isr_counter_low16 = lane->witness_last_isr_counter_low16;
-      diag.ocxo_isr_compare_low16 = lane->witness_last_isr_compare_low16;
-      diag.ocxo_isr_counter_minus_compare_ticks =
-          lane->witness_last_isr_counter_minus_compare_ticks;
-      diag.ocxo_compare_delta_mod65536_ticks =
-          lane->witness_last_compare_delta_mod65536_ticks;
-      diag.ocxo_compare_service_offset_signed_ticks =
-          lane->witness_last_compare_service_offset_signed_ticks;
-      diag.ocxo_compare_interpreted_late_ticks =
-          lane->witness_last_compare_interpreted_late_ticks;
-      diag.ocxo_compare_early_ticks = lane->witness_last_compare_early_ticks;
-      diag.ocxo_compare_arm_to_isr_ticks =
-          lane->witness_last_compare_arm_to_isr_ticks;
-      diag.ocxo_perishable_fact_sequence = lane->witness_last_fact_sequence;
-      diag.ocxo_service_correction_cycles =
-          lane->witness_last_service_correction_cycles;
-      // Traditional-authority build: do not populate the legacy
-      // service-corrected endpoint field.  Alpha treats zero here as
-      // "no replacement" and consumes event.dwt_at_event directly.
-      // The scalar correction magnitude remains visible in
-      // ocxo_service_correction_cycles; the regression-inferred endpoint is
-      // published in the regression_* diagnostic fields.
-      diag.ocxo_service_corrected_dwt_at_event = 0U;
-      diag.ocxo_fact_ring_overflow_count = lane->witness_fact_overflow_count;
-      diag.ocxo_counter_delta_violation_count =
-          lane->witness_counter_delta_violation_count;
-      diag.ocxo_last_bad_counter_delta = lane->witness_last_bad_counter_delta;
-      diag.ocxo_last_counter_delta_ticks = lane->witness_last_counter_delta_ticks;
-      diag.ocxo_expected_counter_delta_ticks = OCXO_WITNESS_ONE_SECOND_COUNTS;
-      diag.ocxo_counter_adjacency_valid = lane->counter_adjacency_last_valid;
-      diag.ocxo_counter_adjacency_ok = lane->counter_adjacency_last_ok;
-      diag.ocxo_counter_adjacency_rejected = lane->counter_adjacency_last_rejected;
-      diag.ocxo_counter_adjacency_reject_count = lane->counter_adjacency_reject_count;
-      diag.ocxo_sample_phase_valid = lane->cadence_sample_phase_valid;
-      diag.ocxo_sample_phase_ticks = lane->cadence_sample_phase_ticks;
-      diag.ocxo_sample_phase_ns = lane->cadence_sample_phase_ns;
-      diag.ocxo_sample_phase_us = lane->cadence_sample_phase_us;
-      diag.ocxo_sample_period_ticks = lane->cadence_sample_period_ticks;
-      diag.ocxo_sample_dwt_at_event = event.dwt_at_event;
-      diag.ocxo_sample_counter32_at_event = event.counter32_at_event;
-    }
-  }
-}
-
-static bool interrupt_callback_address_executable(uintptr_t bits) {
-  if (bits == 0U) return false;
-  const uintptr_t address = bits & ~uintptr_t(1U);
-
-  // Teensy 4.1 code executes from ITCM or the QSPI XIP window.  In particular,
-  // OCRAM/DMAMEM addresses are data and must never become an indirect branch
-  // target.  Keep this predicate common to subscriber and hosted callback
-  // surfaces so every indirect call uses the same executable-address law.
-  return address < 0x00100000UL ||
-         (address >= 0x60000000UL && address < 0x61000000UL);
 }
 
 static bool interrupt_subscriber_callback_executable(
@@ -8425,32 +569,25 @@ static timepop_dispatch_trace_kind_t interrupt_execution_trace_subscriber_kind(
   }
 }
 
+static void deferred_dispatch_callback(timepop_ctx_t*, timepop_diag_t*, void*);
+
 static void interrupt_dispatch_invalidate_locked(
     interrupt_subscriber_runtime_t& rt) {
   rt.binding_generation++;
   if (rt.binding_generation == 0U) rt.binding_generation = 1U;
-
-  // A callback may synchronously stop or replace its own subscription.  Keep
-  // the active snapshot alive until that call returns; the generation change
-  // makes it stale for every later dispatch.
-  if (!rt.dispatch_running) {
-    rt.deferred = interrupt_deferred_dispatch_t{};
-  }
+  if (!rt.dispatch_running) rt.deferred = interrupt_deferred_dispatch_t{};
 }
 
-static bool interrupt_dispatch_begin(
-    interrupt_subscriber_runtime_t& rt,
-    const interrupt_event_t& event,
-    const interrupt_capture_diag_t& diag,
-    bool deferred) {
+static bool interrupt_dispatch_begin(interrupt_subscriber_runtime_t& rt,
+                                     const interrupt_event_t& event) {
   interrupt_subscriber_event_fn callback = nullptr;
   void* callback_user_data = nullptr;
   uint32_t binding_generation = 0;
 
   const uint32_t prior_basepri = interrupt_priority0_guard_enter();
   if (!rt.subscribed || !rt.active || !rt.sub.on_event ||
-      rt.dispatch_running || (deferred && rt.deferred.pending)) {
-    if (rt.dispatch_running || (deferred && rt.deferred.pending)) {
+      rt.dispatch_running || rt.deferred.pending) {
+    if (rt.dispatch_running || rt.deferred.pending) {
       rt.dispatch_busy_drop_count++;
     }
     interrupt_priority0_guard_exit(prior_basepri);
@@ -8460,72 +597,22 @@ static bool interrupt_dispatch_begin(
   callback = rt.sub.on_event;
   callback_user_data = rt.sub.user_data;
   binding_generation = rt.binding_generation;
-
   if (!interrupt_subscriber_callback_executable(callback)) {
     rt.dispatch_invalid_callback_count++;
     interrupt_priority0_guard_exit(prior_basepri);
     return false;
   }
 
-  if (deferred) {
-    rt.deferred.pending = true;
-    rt.deferred.binding_generation = binding_generation;
-    rt.deferred.callback = callback;
-    rt.deferred.user_data = callback_user_data;
-    rt.deferred.event = event;
-    rt.deferred.diag = diag;
+  rt.deferred.pending = true;
+  rt.deferred.binding_generation = binding_generation;
+  rt.deferred.callback = callback;
+  rt.deferred.user_data = callback_user_data;
+  rt.deferred.event = event;
 
-    if (rt.desc->kind == interrupt_subscriber_kind_t::VCLOCK) {
-      const pps_edge_snapshot_t snap = interrupt_last_pps_edge();
-
-      // emit_one_second_event() runs immediately after the matching
-      // PPS/VCLOCK publication.  Refuse to arm a cross-second transaction if
-      // that invariant is ever violated; dropping one row is recoverable,
-      // mutating Alpha/Beta with mixed identities is not.
-      if (snap.counter32_at_edge != event.counter32_at_event ||
-          snap.dwt_at_edge != event.dwt_at_event) {
-        rt.dispatch_stale_drop_count++;
-        rt.deferred = interrupt_deferred_dispatch_t{};
-        interrupt_priority0_guard_exit(prior_basepri);
-        return false;
-      }
-
-      rt.deferred.pps_continuation_valid = true;
-      rt.deferred.pps_continuation = snap;
-    }
-
-    interrupt_priority0_guard_exit(prior_basepri);
-
-    ZPNET_EXECUTION_TRACE(
-        timepop_dispatch_trace_stage_t::SUBSCRIBER_SELECTED,
-        interrupt_execution_trace_subscriber_kind(rt.desc->kind),
-        (uint32_t)rt.desc->kind,
-        event.counter32_at_event,
-        (uint32_t)(uintptr_t)callback,
-        (uint32_t)(uintptr_t)rt.sub.on_event,
-        (uint32_t)(uintptr_t)callback_user_data,
-        (uint32_t)(uintptr_t)rt.desc->name,
-        1U | (binding_generation << 16));
-
-    const timepop_handle_t handle =
-        timepop_arm_asap(deferred_dispatch_callback,
-                         &rt,
-                         dispatch_timer_name(rt.desc->kind));
-    if (handle == TIMEPOP_INVALID_HANDLE) {
-      const uint32_t restore_basepri = interrupt_priority0_guard_enter();
-      if (!rt.dispatch_running &&
-          rt.deferred.pending &&
-          rt.deferred.binding_generation == binding_generation) {
-        rt.deferred = interrupt_deferred_dispatch_t{};
-      }
-      rt.dispatch_arm_fail_count++;
-      interrupt_priority0_guard_exit(restore_basepri);
-      return false;
-    }
-    return true;
+  if (rt.desc->kind == interrupt_subscriber_kind_t::VCLOCK) {
+    rt.deferred.pps_continuation_valid = true;
+    rt.deferred.pps_continuation = interrupt_last_pps_edge();
   }
-
-  rt.dispatch_running = true;
   interrupt_priority0_guard_exit(prior_basepri);
 
   const timepop_dispatch_trace_kind_t trace_kind =
@@ -8539,71 +626,46 @@ static bool interrupt_dispatch_begin(
       (uint32_t)(uintptr_t)rt.sub.on_event,
       (uint32_t)(uintptr_t)callback_user_data,
       (uint32_t)(uintptr_t)rt.desc->name,
-      binding_generation << 16);
-  ZPNET_EXECUTION_TRACE(
-      timepop_dispatch_trace_stage_t::SUBSCRIBER_ENTER,
-      trace_kind,
-      (uint32_t)rt.desc->kind,
-      event.counter32_at_event,
-      (uint32_t)(uintptr_t)callback,
-      0U,
-      (uint32_t)(uintptr_t)callback_user_data,
-      (uint32_t)(uintptr_t)rt.desc->name,
-      event.counter32_at_event);
-  rt.dispatch_count++;
-  callback(event, &diag, callback_user_data);
-  ZPNET_EXECUTION_TRACE(
-      timepop_dispatch_trace_stage_t::SUBSCRIBER_RETURN,
-      trace_kind,
-      (uint32_t)rt.desc->kind,
-      event.counter32_at_event,
-      (uint32_t)(uintptr_t)callback,
-      0U,
-      (uint32_t)(uintptr_t)callback_user_data,
-      (uint32_t)(uintptr_t)rt.desc->name,
-      event.counter32_at_event);
+      1U | (binding_generation << 16));
 
-  const uint32_t finish_basepri = interrupt_priority0_guard_enter();
-  rt.dispatch_running = false;
-  interrupt_priority0_guard_exit(finish_basepri);
+  const timepop_handle_t handle =
+      timepop_arm_asap(deferred_dispatch_callback,
+                       &rt,
+                       dispatch_timer_name(rt.desc->kind));
+  if (handle == TIMEPOP_INVALID_HANDLE) {
+    const uint32_t restore = interrupt_priority0_guard_enter();
+    if (!rt.dispatch_running && rt.deferred.pending &&
+        rt.deferred.binding_generation == binding_generation) {
+      rt.deferred = interrupt_deferred_dispatch_t{};
+    }
+    rt.dispatch_arm_fail_count++;
+    interrupt_priority0_guard_exit(restore);
+    return false;
+  }
   return true;
 }
 
-static __attribute__((noinline)) void deferred_dispatch_callback(timepop_ctx_t*,
-                                       timepop_diag_t*,
+static void deferred_dispatch_callback(timepop_ctx_t*, timepop_diag_t*,
                                        void* user_data) {
   auto* rt = static_cast<interrupt_subscriber_runtime_t*>(user_data);
   if (!rt || !rt->desc) return;
 
-  const bool is_vclock =
-      rt->desc->kind == interrupt_subscriber_kind_t::VCLOCK;
-
   interrupt_subscriber_event_fn callback = nullptr;
   void* callback_user_data = nullptr;
   interrupt_event_t event{};
-  interrupt_capture_diag_t diag{};
   bool pps_continuation_valid = false;
   pps_edge_snapshot_t pps_continuation{};
 
   const uint32_t prior_basepri = interrupt_priority0_guard_enter();
   if (!rt->deferred.pending || rt->dispatch_running) {
-    const bool may_rearm_vclock =
-        is_vclock && !rt->deferred.pending && !rt->dispatch_running;
     interrupt_priority0_guard_exit(prior_basepri);
-    if (may_rearm_vclock) {
-      (void)vclock_fact_ring_arm_drain_from_timepop();
-    }
     return;
   }
-
   if (!rt->subscribed || !rt->active ||
       rt->deferred.binding_generation != rt->binding_generation) {
     rt->dispatch_stale_drop_count++;
     rt->deferred = interrupt_deferred_dispatch_t{};
     interrupt_priority0_guard_exit(prior_basepri);
-    if (is_vclock) {
-      (void)vclock_fact_ring_arm_drain_from_timepop();
-    }
     return;
   }
 
@@ -8613,17 +675,10 @@ static __attribute__((noinline)) void deferred_dispatch_callback(timepop_ctx_t*,
     rt->dispatch_invalid_callback_count++;
     rt->deferred = interrupt_deferred_dispatch_t{};
     interrupt_priority0_guard_exit(prior_basepri);
-    if (is_vclock) {
-      (void)vclock_fact_ring_arm_drain_from_timepop();
-    }
     return;
   }
 
-  // Copy the complete transaction out of the runtime before invoking user code.
-  // A subscriber may stop or replace itself synchronously; local custody keeps
-  // this callback coherent while binding_generation invalidates later work.
   event = rt->deferred.event;
-  diag = rt->deferred.diag;
   pps_continuation_valid = rt->deferred.pps_continuation_valid;
   pps_continuation = rt->deferred.pps_continuation;
   rt->dispatch_running = true;
@@ -8631,16 +686,6 @@ static __attribute__((noinline)) void deferred_dispatch_callback(timepop_ctx_t*,
 
   const timepop_dispatch_trace_kind_t trace_kind =
       interrupt_execution_trace_subscriber_kind(rt->desc->kind);
-  ZPNET_EXECUTION_TRACE(
-      timepop_dispatch_trace_stage_t::SUBSCRIBER_SELECTED,
-      trace_kind,
-      (uint32_t)rt->desc->kind,
-      event.counter32_at_event,
-      (uint32_t)(uintptr_t)callback,
-      (uint32_t)(uintptr_t)rt->sub.on_event,
-      (uint32_t)(uintptr_t)callback_user_data,
-      (uint32_t)(uintptr_t)rt->desc->name,
-      2U | (rt->deferred.binding_generation << 16));
   ZPNET_EXECUTION_TRACE(
       timepop_dispatch_trace_stage_t::SUBSCRIBER_ENTER,
       trace_kind,
@@ -8652,7 +697,7 @@ static __attribute__((noinline)) void deferred_dispatch_callback(timepop_ctx_t*,
       (uint32_t)(uintptr_t)rt->desc->name,
       event.counter32_at_event);
   rt->dispatch_count++;
-  callback(event, &diag, callback_user_data);
+  callback(event, &rt->last_diag, callback_user_data);
   ZPNET_EXECUTION_TRACE(
       timepop_dispatch_trace_stage_t::SUBSCRIBER_RETURN,
       trace_kind,
@@ -8669,2636 +714,1021 @@ static __attribute__((noinline)) void deferred_dispatch_callback(timepop_ctx_t*,
   rt->deferred = interrupt_deferred_dispatch_t{};
   interrupt_priority0_guard_exit(finish_basepri);
 
-  if (is_vclock) {
-    // Alpha and Beta are one foreground transaction.  Invoke Beta directly with
-    // the frozen snapshot; do not enqueue a second ASAP callback and do not read
-    // interrupt_last_pps_edge() after another fact can advance global state.
-    const pps_edge_dispatch_fn pps_dispatch = g_pps_edge_dispatch;
-    if (pps_continuation_valid &&
-        interrupt_callback_address_executable((uintptr_t)pps_dispatch)) {
-      ZPNET_EXECUTION_TRACE(
-          timepop_dispatch_trace_stage_t::SUBSCRIBER_ENTER,
-          timepop_dispatch_trace_kind_t::SUBSCRIBER_VCLOCK,
-          (uint32_t)interrupt_subscriber_kind_t::VCLOCK,
-          pps_continuation.sequence,
-          (uint32_t)(uintptr_t)pps_dispatch,
-          0U,
-          0U,
-          (uint32_t)(uintptr_t)"PPS_BETA_CONTINUATION",
-          pps_continuation.counter32_at_edge);
-      pps_dispatch(pps_continuation);
-      ZPNET_EXECUTION_TRACE(
-          timepop_dispatch_trace_stage_t::SUBSCRIBER_RETURN,
-          timepop_dispatch_trace_kind_t::SUBSCRIBER_VCLOCK,
-          (uint32_t)interrupt_subscriber_kind_t::VCLOCK,
-          pps_continuation.sequence,
-          (uint32_t)(uintptr_t)pps_dispatch,
-          0U,
-          0U,
-          (uint32_t)(uintptr_t)"PPS_BETA_CONTINUATION",
-          pps_continuation.counter32_at_edge);
+  if (rt->desc->kind == interrupt_subscriber_kind_t::VCLOCK &&
+      pps_continuation_valid) {
+    const pps_edge_dispatch_fn callback_pps = g_pps_edge_dispatch;
+    if (interrupt_callback_address_executable((uintptr_t)callback_pps)) {
+      callback_pps(pps_continuation);
     }
-
-    // Only now may the next VCLOCK fact enter Alpha.  This serializes the whole
-    // Alpha -> PPS/Beta custody chain while still leaving priority-0 capture free.
-    (void)vclock_fact_ring_arm_drain_from_timepop();
   }
 }
 
-static __attribute__((noinline)) void emit_one_second_event(
-    interrupt_subscriber_runtime_t& rt,
-    uint32_t dwt_at_event,
-    uint32_t authored_counter32,
-    uint32_t pps_coincidence_cycles = 0,
-    bool pps_coincidence_valid = false,
-    const dwt_repair_diag_t* repair = nullptr,
-    const cadence_regression_result_t* regression = nullptr) {
-  if (!rt.active) return;
-
-  interrupt_event_t event {};
-  event.kind         = rt.desc->kind;
-  event.provider     = rt.desc->provider;
-  event.lane         = rt.desc->lane;
-  event.dwt_at_event = dwt_at_event;
-  event.counter32_at_event     = authored_counter32;
-  event.pps_coincidence_cycles = pps_coincidence_cycles;
-  event.pps_coincidence_valid  = pps_coincidence_valid;
-
-  // VCLOCK remains unavailable here because process_interrupt does not
-  // invent campaign GNSS labels for the sovereign PPS/VCLOCK rail.
-  // OCXO lanes normalize the authored sample DWT through the labeled
-  // PPS_VCLOCK anchor ring. For OCXO this is a subscriber-visible
-  // GNSS-at-sample witness only; Alpha has not yet promoted it to
-  // canonical residual/servo truth.
-  bridge_projection_t bridge{};
-  int64_t gnss_ns = -1;
-  if (rt.desc->kind == interrupt_subscriber_kind_t::VCLOCK) {
-    gnss_ns = vclock_gnss_from_counter32(authored_counter32);
-    bridge.anchor_selection_kind = ANCHOR_SELECT_NONE;
-  } else {
-    bridge = interrupt_dwt_to_vclock_gnss_projection(dwt_at_event);
-    gnss_ns = bridge.gnss_ns;
-    bridge_projection_record_stats(rt.desc->kind, bridge);
-  }
-  event.gnss_ns_at_event = (gnss_ns >= 0) ? (uint64_t)gnss_ns : 0;
-  event.status = interrupt_event_status_t::OK;
-
-  interrupt_capture_diag_t diag {};
-  fill_diag(diag, rt, event);
-  copy_regression_diag(diag, regression);
-  if (repair) {
-    diag.dwt_synthetic = repair->synthetic;
-    diag.dwt_repair_candidate = repair->candidate;
-    diag.dwt_original_at_event = repair->original_dwt;
-    diag.dwt_predicted_at_event = repair->predicted_dwt;
-    diag.dwt_used_at_event = repair->used_dwt;
-    diag.dwt_isr_entry_raw = repair->isr_entry_dwt_raw;
-    diag.dwt_event_from_isr_entry_raw = repair->event_dwt_from_isr_entry_raw;
-    diag.dwt_isr_entry_to_event_correction_cycles =
-        repair->isr_entry_to_event_correction_cycles;
-    diag.dwt_published_minus_event_cycles =
-        (int32_t)(event.dwt_at_event - repair->event_dwt_from_isr_entry_raw);
-    diag.dwt_used_minus_event_cycles =
-        (int32_t)(repair->used_dwt - repair->event_dwt_from_isr_entry_raw);
-    diag.dwt_synthetic_error_cycles = repair->error_cycles;
-    diag.dwt_synthetic_threshold_cycles = repair->threshold_cycles;
-    diag.dwt_synthetic_reason = repair->reason;
-    diag.dwt_publication_verdict_mask = repair->publication_verdict_mask;
-    diag.dwt_publication_verdict_reason_id = repair->publication_verdict_reason_id;
-    diag.dwt_publication_watchdog_count = repair->publication_watchdog_count;
-    diag.dwt_publication_gate_cycles = repair->publication_gate_cycles;
-    diag.dwt_publication_cross_rail_gate_cycles =
-        repair->publication_cross_rail_gate_cycles;
-    diag.dwt_publication_service_offset_gate_ticks =
-        repair->publication_service_offset_gate_ticks;
-    diag.dwt_publication_expected_counter_delta_ticks =
-        repair->publication_expected_counter_delta_ticks;
-    diag.dwt_publication_observed_counter_delta_ticks =
-        repair->publication_observed_counter_delta_ticks;
-    diag.dwt_publication_expected_interval_cycles =
-        repair->publication_expected_interval_cycles;
-    diag.dwt_publication_published_interval_cycles =
-        repair->publication_published_interval_cycles;
-    diag.dwt_publication_observed_interval_cycles =
-        repair->publication_observed_interval_cycles;
-    diag.dwt_publication_floorline_interval_cycles =
-        repair->publication_floorline_interval_cycles;
-    diag.dwt_publication_published_interval_error_cycles =
-        repair->publication_published_interval_error_cycles;
-    diag.dwt_publication_observed_interval_error_cycles =
-        repair->publication_observed_interval_error_cycles;
-    diag.dwt_publication_floorline_interval_error_cycles =
-        repair->publication_floorline_interval_error_cycles;
-    diag.dwt_publication_published_minus_observed_cycles =
-        repair->publication_published_minus_observed_cycles;
-    diag.dwt_publication_floorline_minus_observed_cycles =
-        repair->publication_floorline_minus_observed_cycles;
-    diag.dwt_publication_service_offset_signed_ticks =
-        repair->publication_service_offset_signed_ticks;
-    diag.dwt_publication_vclock_gnss_error_ns =
-        repair->publication_vclock_gnss_error_ns;
-    diag.dwt_interval_gate_valid = repair->interval_gate_valid;
-    diag.dwt_interval_sample_accepted = repair->interval_sample_accepted;
-    diag.dwt_interval_sample_rejected = repair->interval_sample_rejected;
-    diag.dwt_interval_observed_cycles = repair->interval_observed_cycles;
-    diag.dwt_interval_prediction_cycles = repair->interval_prediction_cycles;
-    diag.dwt_interval_effective_cycles = repair->interval_effective_cycles;
-    diag.dwt_interval_residual_cycles = repair->interval_residual_cycles;
-    diag.dwt_interval_gate_threshold_cycles = repair->interval_gate_threshold_cycles;
-    diag.dwt_interval_accept_count = repair->interval_accept_count;
-    diag.dwt_interval_reject_count = repair->interval_reject_count;
-    diag.dwt_interval_resync_applied = repair->interval_resync_applied;
-    diag.dwt_interval_resync_count = repair->interval_resync_count;
-    diag.dwt_interval_reject_streak = repair->interval_reject_streak;
-    diag.dwt_interval_adjacency_gate_valid = repair->interval_adjacency_gate_valid;
-    diag.dwt_interval_adjacency_ok = repair->interval_adjacency_ok;
-    diag.dwt_interval_adjacency_rejected = repair->interval_adjacency_rejected;
-    diag.dwt_interval_counter_delta_ticks = repair->interval_counter_delta_ticks;
-    diag.dwt_interval_expected_counter_delta_ticks =
-        repair->interval_expected_counter_delta_ticks;
-    diag.dwt_interval_adjacency_reject_count =
-        repair->interval_adjacency_reject_count;
-    diag.dwt_yardstick_valid = repair->yardstick_valid;
-    diag.dwt_yardstick_stale = repair->yardstick_stale;
-    diag.dwt_yardstick_seeded = repair->yardstick_seeded_this_event;
-    diag.dwt_yardstick_excursion = repair->yardstick_excursion;
-    diag.dwt_yardstick_pps_sequence = repair->yardstick_pps_sequence;
-    diag.dwt_yardstick_pps_seq_delta = repair->yardstick_pps_seq_delta;
-    diag.dwt_yardstick_g_now_cycles = repair->yardstick_g_now_cycles;
-    diag.dwt_yardstick_g_prev_cycles = repair->yardstick_g_prev_cycles;
-    diag.dwt_yardstick_inferred_interval_cycles =
-        repair->yardstick_inferred_interval_cycles;
-    diag.dwt_yardstick_observed_interval_cycles =
-        repair->yardstick_observed_interval_cycles;
-    diag.dwt_yardstick_inferred_minus_observed_cycles =
-        repair->yardstick_inferred_minus_observed_cycles;
-    diag.dwt_yardstick_inferred_endpoint_dwt =
-        repair->yardstick_inferred_endpoint_dwt;
-    diag.dwt_yardstick_inferred_endpoint_frac_q16 =
-        repair->yardstick_inferred_endpoint_frac_q16;
-    diag.dwt_yardstick_endpoint_minus_observed_cycles =
-        repair->yardstick_endpoint_minus_observed_cycles;
-    diag.dwt_yardstick_gate_threshold_cycles =
-        repair->yardstick_gate_threshold_cycles;
-    diag.dwt_yardstick_gate_agree_count = repair->yardstick_gate_agree_count;
-    diag.dwt_yardstick_gate_excursion_count =
-        repair->yardstick_gate_excursion_count;
-    diag.dwt_yardstick_authority = repair->yardstick_authority;
-    diag.dwt_yardstick_auth_endpoint_dwt =
-        repair->yardstick_auth_endpoint_dwt;
-    diag.dwt_yardstick_auth_endpoint_frac_q16 =
-        repair->yardstick_auth_endpoint_frac_q16;
-    diag.dwt_yardstick_auth_error_cycles =
-        repair->yardstick_auth_error_cycles;
-    diag.dwt_yardstick_auth_anchor_applied =
-        repair->yardstick_auth_anchor_applied;
-  }
-  if (rt.desc->kind != interrupt_subscriber_kind_t::VCLOCK) {
-    bridge_projection_copy_to_diag(diag, bridge);
-  }
-
-  rt.last_event = event;
-  rt.last_diag  = diag;
-  rt.has_fired  = true;
-  rt.event_count++;
-
-  // Every measured lane crosses the same publication boundary: prepare the
-  // immutable tuple here and invoke the subscriber only after this frame exits.
-  (void)interrupt_dispatch_begin(rt, event, diag, true);
-}
-
 // ============================================================================
-// VCLOCK perishable cadence fact ring
+// Lane state
 // ============================================================================
 
-static constexpr uint32_t VCLOCK_PERISHABLE_FACT_RING_SIZE = 8;
-static constexpr const char* VCLOCK_FACT_DRAIN_NAME = "VCLOCK_FACT_DRAIN";
-
-// One authored VCLOCK cadence tooth can be an ordinary 1 kHz sample, or it can
-// be the one-second bookend.  Build this packet once per CH0 handoff and feed
-// the same event identity to FloorLine and to publication.  Publication is now
-// observation-derived, so FloorLine can be compared against the exact same
-// one-second tooth without silently switching between adjacent 1 ms teeth.
-struct vclock_one_second_bookend_t {
-  bool     due = false;
-  bool     ch2_owned = false;
-  bool     legacy_owned = false;
-
-  uint32_t isr_entry_dwt_raw = 0;
-  uint32_t observed_dwt_at_event = 0;
-  uint32_t target_counter32 = 0;
-  uint16_t target_low16 = 0;
-  uint16_t observed_low16 = 0;
-
-  uint32_t service_counter32 = 0;
-  uint32_t late_ticks = 0;
-
-  bool     witness_pps_valid = false;
-  pps_t    witness_pps{};
-  uint32_t fallback_sequence = 0;
+struct vclock_lane_t {
+  bool initialized = false;
+  bool active = false;
+  bool phase_bootstrapped = false;
+  uint32_t next_one_second_counter32 = 0;
+  bool one_second_grid_valid = false;
+  uint32_t irq_count = 0;
+  uint32_t miss_count = 0;
+  uint32_t bootstrap_count = 0;
+  uint32_t heartbeat_count = 0;
+  uint32_t one_second_count = 0;
+  uint32_t last_target_counter32 = 0;
+  uint32_t last_dwt_at_edge = 0;
+  uint32_t last_isr_entry_dwt_raw = 0;
 };
 
-struct vclock_perishable_fact_t {
-  uint32_t sequence = 0;
-  uint32_t isr_entry_dwt_raw = 0;
-  uint32_t observed_dwt_at_event = 0;
-  uint32_t target_counter32 = 0;
-  uint16_t target_low16 = 0;
-  uint16_t observed_low16 = 0;
-  bool one_second_due = false;
-  bool witness_pps_valid = false;
-  pps_t witness_pps{};
-  uint32_t fallback_sequence = 0;
+struct ocxo_lane_t {
+  interrupt_subscriber_kind_t kind = interrupt_subscriber_kind_t::NONE;
+  const char* name = nullptr;
+  IMXRT_TMR_t* module = nullptr;
+  uint8_t channel = 0;
+  uint8_t pcs = 0;
+  int input_pin = -1;
+
+  bool initialized = false;
+  bool active = false;
+  bool target_grid_valid = false;
+  bool compare_armed = false;
+  uint32_t grid_epoch_counter32 = 0;
+  uint32_t next_target_counter32 = 0;
+  uint32_t armed_target_counter32 = 0;
+  uint16_t armed_target_low16 = 0;
+
+  uint32_t irq_count = 0;
+  uint32_t miss_count = 0;
+  uint32_t arm_count = 0;
+  uint32_t fire_count = 0;
+  uint32_t false_irq_count = 0;
+  uint32_t missed_target_count = 0;
+  uint32_t rollover_tend_count = 0;
+  uint32_t arm_window_wait_count = 0;
+  uint32_t arm_too_close_count = 0;
+  uint32_t rebootstrap_count = 0;
+  uint32_t recover_count = 0;
+
+  uint32_t last_arm_dwt = 0;
+  uint32_t last_arm_counter32 = 0;
+  uint16_t last_arm_hardware16 = 0;
+  uint32_t last_arm_remaining_ticks = 0;
+  uint32_t last_isr_entry_dwt_raw = 0;
+  uint32_t last_dwt_at_edge = 0;
+  uint32_t last_event_counter32 = 0;
+  uint16_t last_ambient_low16 = 0;
+  uint16_t last_compare_low16 = 0;
+  int32_t last_ambient_minus_target_ticks = 0;
+
+  bool previous_event_valid = false;
+  uint32_t previous_event_counter32 = 0;
+  uint32_t last_counter_delta_ticks = 0;
+  uint32_t counter_delta_violation_count = 0;
+  uint32_t dispatch_sequence = 0;
 };
 
-struct vclock_perishable_ring_t {
-  vclock_perishable_fact_t facts[VCLOCK_PERISHABLE_FACT_RING_SIZE]{};
-  volatile uint32_t head = 0;  // producer-owned monotonic cursor
-  volatile uint32_t tail = 0;  // consumer-owned monotonic cursor
-  volatile bool drain_armed = false;
-  volatile uint32_t sequence = 0;
-  volatile uint32_t enqueue_count = 0;
-  volatile uint32_t drain_count = 0;
-  volatile uint32_t overflow_count = 0;
-  volatile uint32_t high_water = 0;
-  volatile uint32_t asap_arm_count = 0;
-  volatile uint32_t asap_fail_count = 0;
-};
-
-static vclock_perishable_ring_t g_vclock_fact_ring = {};
-static void vclock_fact_drain_callback(timepop_ctx_t*, timepop_diag_t*, void*);
-
-static void vclock_fact_ring_reset(void) {
-  dwt_publication_reset_lane(interrupt_subscriber_kind_t::VCLOCK);
-  for (uint32_t i = 0; i < VCLOCK_PERISHABLE_FACT_RING_SIZE; i++) {
-    g_vclock_fact_ring.facts[i] = vclock_perishable_fact_t{};
-  }
-  g_vclock_fact_ring.head = 0;
-  g_vclock_fact_ring.tail = 0;
-  g_vclock_fact_ring.drain_armed = false;
-  g_vclock_fact_ring.sequence = 0;
-  g_vclock_fact_ring.enqueue_count = 0;
-  g_vclock_fact_ring.drain_count = 0;
-  g_vclock_fact_ring.overflow_count = 0;
-  g_vclock_fact_ring.high_water = 0;
-  g_vclock_fact_ring.asap_arm_count = 0;
-  g_vclock_fact_ring.asap_fail_count = 0;
-}
-
-static uint32_t vclock_fact_ring_pending(void) {
-  const uint32_t tail = g_vclock_fact_ring.tail;
-  dmb_barrier();
-  return g_vclock_fact_ring.head - tail;
-}
-
-static bool vclock_fact_ring_pop(vclock_perishable_fact_t& out) {
-  const uint32_t prior_basepri = interrupt_priority0_guard_enter();
-  const uint32_t tail = g_vclock_fact_ring.tail;
-  const uint32_t head = g_vclock_fact_ring.head;
-  if (tail == head) {
-    g_vclock_fact_ring.drain_armed = false;
-    interrupt_priority0_guard_exit(prior_basepri);
-    return false;
-  }
-
-  dmb_barrier();
-  out = g_vclock_fact_ring.facts[tail % VCLOCK_PERISHABLE_FACT_RING_SIZE];
-  dmb_barrier();
-  g_vclock_fact_ring.tail = tail + 1U;
-  g_vclock_fact_ring.drain_count++;
-
-  // drain_armed represents the callback invocation currently consuming this
-  // fact, not ownership of the entire queue.  The Alpha/Beta transaction will
-  // explicitly rearm the next fact after custody is released.
-  g_vclock_fact_ring.drain_armed = false;
-
-  interrupt_priority0_guard_exit(prior_basepri);
-  return true;
-}
-
-static bool vclock_fact_ring_push_no_arm_from_isr(vclock_perishable_fact_t fact) {
-  const uint32_t head = g_vclock_fact_ring.head;
-  dmb_barrier();
-  const uint32_t pending = head - g_vclock_fact_ring.tail;
-  if (pending >= VCLOCK_PERISHABLE_FACT_RING_SIZE) {
-    g_vclock_fact_ring.overflow_count++;
-    g_vclock_lane.miss_count++;
-    return false;
-  }
-
-  fact.sequence = ++g_vclock_fact_ring.sequence;
-  g_vclock_fact_ring.facts[head % VCLOCK_PERISHABLE_FACT_RING_SIZE] = fact;
-  dmb_barrier();
-  g_vclock_fact_ring.head = head + 1U;
-  g_vclock_fact_ring.enqueue_count++;
-  const uint32_t pending_after = pending + 1U;
-  if (pending_after > g_vclock_fact_ring.high_water) {
-    g_vclock_fact_ring.high_water = pending_after;
-  }
-  return true;
-}
-
-static bool vclock_fact_ring_arm_drain_from_timepop(void) {
-  if (vclock_fact_ring_pending() == 0 || g_vclock_fact_ring.drain_armed) return false;
-
-  // A queued or executing VCLOCK subscriber owns the complete Alpha -> Beta
-  // transaction.  Priority-16 capture may continue filling the fact ring, but
-  // no other TimePop path may arm the next fact until that transaction releases.
-  if (g_rt_vclock &&
-      (g_rt_vclock->deferred.pending || g_rt_vclock->dispatch_running)) {
-    return false;
-  }
-
-  g_vclock_fact_ring.drain_armed = true;
-  g_vclock_fact_ring.asap_arm_count++;
-  const timepop_handle_t h =
-      timepop_arm_asap(vclock_fact_drain_callback, nullptr,
-                       VCLOCK_FACT_DRAIN_NAME);
-  if (h == TIMEPOP_INVALID_HANDLE) {
-    g_vclock_fact_ring.drain_armed = false;
-    g_vclock_fact_ring.asap_fail_count++;
-    return false;
-  }
-
-  return true;
-}
-
-static void vclock_ch2_one_second_advance_after_bookend(
-    uint32_t target_counter32,
-    uint32_t service_counter32) {
-  uint32_t next = target_counter32 + (uint32_t)VCLOCK_COUNTS_PER_SECOND;
-  while ((int32_t)(service_counter32 - next) >= 0) {
-    next += (uint32_t)VCLOCK_COUNTS_PER_SECOND;
-    g_vclock_ch2_one_second_catchup_count++;
-    g_vclock_ch2_one_second_drop_count++;
-  }
-  g_vclock_ch2_one_second_next_counter32 = next;
-}
-
-static vclock_one_second_bookend_t vclock_one_second_bookend_build(
-    uint32_t isr_entry_dwt_raw,
-    uint32_t qtimer_event_dwt,
-    uint32_t cadence_counter32,
-    uint16_t fired_low16) {
-  vclock_one_second_bookend_t out{};
-  out.isr_entry_dwt_raw = isr_entry_dwt_raw;
-  out.service_counter32 = cadence_counter32;
-  out.observed_low16 = fired_low16;
-  out.witness_pps_valid = g_last_pps_witness_valid;
-  out.witness_pps = g_last_pps_witness_valid ? g_last_pps_witness : pps_t{};
-  out.fallback_sequence = g_pps_gpio_heartbeat.edge_count + 1U;
-
-  if (!g_vclock_lane.active || !g_rt_vclock || !g_rt_vclock->active) {
-    return out;
-  }
-
-  uint32_t target_counter32 = 0;
-  bool ch2_due = false;
-  if (g_vclock_ch2_one_second_enabled) {
-    target_counter32 = g_vclock_ch2_one_second_next_counter32;
-    ch2_due = ((int32_t)(cadence_counter32 - target_counter32) >= 0);
-  }
-
-  const bool legacy_due =
-      !g_vclock_ch2_one_second_enabled &&
-      g_vclock_lane.phase_bootstrapped &&
-      ((g_vclock_lane.tick_mod_1000 + 1U) >= TICKS_PER_SECOND_EVENT);
-
-  if (!ch2_due && !legacy_due) {
-    return out;
-  }
-
-  out.due = true;
-  out.ch2_owned = ch2_due;
-  out.legacy_owned = legacy_due && !ch2_due;
-  out.target_counter32 = ch2_due ? target_counter32 : cadence_counter32;
-  out.target_low16 = vclock_hardware_low16_from_synthetic(out.target_counter32);
-  out.late_ticks = cadence_counter32 - out.target_counter32;
-  out.observed_dwt_at_event = qtimer_event_dwt;
-  if (out.late_ticks != 0) {
-    out.observed_dwt_at_event -= vclock_cycles_for_ticks(out.late_ticks);
-  }
-
-  return out;
-}
-
-static void vclock_ch2_fact_drain_arm_after_timepop(void) {
-  if (!g_interrupt_runtime_ready) return;
-
-  g_vclock_ch2_fact_drain_service_count++;
-  if (vclock_fact_ring_arm_drain_from_timepop()) {
-    g_vclock_ch2_fact_drain_arm_count++;
-  }
-}
-
-static void vclock_ch2_one_second_disable(void) {
-  if (g_vclock_ch2_one_second_enabled ||
-      g_vclock_ch2_one_second_next_counter32 != 0) {
-    g_vclock_ch2_one_second_reset_count++;
-  }
-  g_vclock_ch2_one_second_enabled = false;
-  g_vclock_ch2_one_second_next_counter32 = 0;
-}
-
-static void vclock_ch2_one_second_enable_from_epoch_legacy_grid(
-    uint32_t selected_counter32,
-    uint32_t service_counter32,
-    uint32_t tick_mod_seed) {
-  // Preserve the last-known-good first-bookend identity while moving the
-  // authorship path itself out of VCLOCK_HEARTBEAT.  In the old path, the
-  // heartbeat consumed the epoch at service_counter32, seeded tick_mod_1000
-  // from selected_to_service_ticks / 10,000, and published the first bookend
-  // when that modulo reached 1000.  Seed CH2 to that same counter identity.
-  const uint32_t bounded_mod = tick_mod_seed % TICKS_PER_SECOND_EVENT;
-  const uint32_t remaining_cells = TICKS_PER_SECOND_EVENT - bounded_mod;
-  const uint32_t target_counter32 =
-      service_counter32 + remaining_cells * VCLOCK_INTERVAL_COUNTS;
-  const uint32_t sacred_target =
-      selected_counter32 + (uint32_t)VCLOCK_COUNTS_PER_SECOND;
-
-  g_vclock_ch2_one_second_next_counter32 = target_counter32;
-  g_vclock_ch2_one_second_enabled = true;
-  g_vclock_ch2_one_second_enable_count++;
-  g_vclock_ch2_one_second_epoch_enable_count++;
-  g_vclock_ch2_one_second_epoch_base_counter32 = selected_counter32;
-  g_vclock_ch2_one_second_epoch_service_counter32 = service_counter32;
-  g_vclock_ch2_one_second_epoch_target_counter32 = target_counter32;
-  g_vclock_ch2_one_second_epoch_tick_mod_seed = bounded_mod;
-  g_vclock_ch2_one_second_epoch_remaining_cells = remaining_cells;
-  g_vclock_ch2_one_second_epoch_residual_ticks =
-      target_counter32 - sacred_target;
-}
-
-static void vclock_ch2_one_second_enable_after_heartbeat(uint32_t last_counter32) {
-  // Emergency fallback re-seed only. Normal bootstrap and steady state should
-  // be armed from the epoch-compatible CH2 path above.
-  g_vclock_ch2_one_second_next_counter32 =
-      last_counter32 + (uint32_t)VCLOCK_COUNTS_PER_SECOND;
-  g_vclock_ch2_one_second_enabled = true;
-  g_vclock_ch2_one_second_enable_count++;
-  g_vclock_ch2_one_second_heartbeat_enable_count++;
-}
-
-static bool vclock_ch2_one_second_service(
-    const vclock_one_second_bookend_t& bookend) {
-  if (!bookend.due || !bookend.ch2_owned) return false;
-  if (!g_vclock_ch2_one_second_enabled) return false;
-  if (!g_vclock_lane.active || !g_rt_vclock || !g_rt_vclock->active) return false;
-
-  if (bookend.late_ticks != 0) {
-    g_vclock_ch2_one_second_late_count++;
-    if (bookend.late_ticks > g_vclock_ch2_one_second_late_max_ticks) {
-      g_vclock_ch2_one_second_late_max_ticks = bookend.late_ticks;
-    }
-  }
-
-  vclock_perishable_fact_t fact{};
-  fact.isr_entry_dwt_raw = bookend.isr_entry_dwt_raw;
-  fact.observed_dwt_at_event = bookend.observed_dwt_at_event;
-  fact.target_counter32 = bookend.target_counter32;
-  fact.target_low16 = bookend.target_low16;
-  fact.observed_low16 = bookend.observed_low16;
-  fact.one_second_due = true;
-  fact.witness_pps_valid = bookend.witness_pps_valid;
-  fact.witness_pps = bookend.witness_pps;
-  fact.fallback_sequence = bookend.fallback_sequence;
-
-  g_vclock_ch2_one_second_service_count++;
-  g_vclock_ch2_one_second_last_target_counter32 = bookend.target_counter32;
-  g_vclock_ch2_one_second_last_service_counter32 = bookend.service_counter32;
-  g_vclock_ch2_one_second_last_dwt = bookend.observed_dwt_at_event;
-
-  // Passive ISR sanity witness retired.
-
-  const bool enqueued = vclock_fact_ring_push_no_arm_from_isr(fact);
-  if (enqueued) {
-    g_vclock_ch2_one_second_enqueue_count++;
-  } else {
-    // Queue pressure is loss-visible.  Never replace a failed foreground handoff
-    // with synchronous publication inside the priority-16 heartbeat.
-    g_vclock_ch2_one_second_drop_count++;
-  }
-
-  // Advance as a gear even when the fact ring is full.  Re-entering the same
-  // stale target would turn one lost public edge into an interrupt loop.
-  vclock_ch2_one_second_advance_after_bookend(bookend.target_counter32,
-                                              bookend.service_counter32);
-  return enqueued;
-}
-
-static void vclock_ch2_smartzero_reset_attempt_state(void) {
-  g_vclock_ch2_smartzero_seeded = false;
-  g_vclock_ch2_smartzero_next_counter32 = 0;
-  g_vclock_ch2_smartzero_reset_count++;
-}
-
-static void vclock_ch2_smartzero_deactivate(void) {
-  if (g_vclock_ch2_smartzero_seeded || g_vclock_ch2_smartzero_next_counter32 != 0) {
-    g_vclock_ch2_smartzero_deactivate_count++;
-  }
-  g_vclock_ch2_smartzero_seeded = false;
-  g_vclock_ch2_smartzero_next_counter32 = 0;
-}
-
-static void vclock_ch2_smartzero_record_decision(interrupt_smartzero_decision_t d) {
-  switch (d) {
-    case interrupt_smartzero_decision_t::WAITING_FOR_CPS:
-      g_vclock_ch2_smartzero_waiting_for_cps_count++;
-      break;
-    case interrupt_smartzero_decision_t::FIRST_SAMPLE:
-      g_vclock_ch2_smartzero_first_sample_count++;
-      break;
-    case interrupt_smartzero_decision_t::ACCEPTED:
-      g_vclock_ch2_smartzero_accepted_count++;
-      break;
-    case interrupt_smartzero_decision_t::REJECTED_DWT:
-      g_vclock_ch2_smartzero_rejected_dwt_count++;
-      break;
-    case interrupt_smartzero_decision_t::REJECTED_COUNTER:
-      g_vclock_ch2_smartzero_rejected_counter_count++;
-      break;
-    default:
-      break;
-  }
-}
-
-static void vclock_ch2_smartzero_service(uint32_t qtimer_event_dwt,
-                                         uint32_t service_counter32) {
-  if (!VCLOCK_CH2_SMARTZERO_NATIVE_ENABLED) return;
-
-  if ((g_smartzero.seq & 1U) != 0) {
-    g_vclock_ch2_smartzero_transaction_skip_count++;
-    return;
-  }
-
-  if (!smartzero_is_current_lane(interrupt_subscriber_kind_t::VCLOCK)) {
-    vclock_ch2_smartzero_deactivate();
-    return;
-  }
-
-  g_vclock_ch2_smartzero_service_count++;
-
-  uint32_t target_counter32 = g_vclock_ch2_smartzero_next_counter32;
-  if (!g_vclock_ch2_smartzero_seeded) {
-    target_counter32 = service_counter32;
-    g_vclock_ch2_smartzero_seeded = true;
-    g_vclock_ch2_smartzero_seed_count++;
-  } else if ((int32_t)(service_counter32 - target_counter32) < 0) {
-    return;
-  }
-
-  const uint32_t late_ticks = service_counter32 - target_counter32;
-  if (late_ticks >= SMARTZERO_INTERVAL_TICKS) {
-    // Do not feed a stale tooth that would force SmartZero to observe a
-    // non-adjacent counter delta. Re-seed on the next CH2 event instead.
-    g_vclock_ch2_smartzero_resync_count++;
-    g_vclock_ch2_smartzero_drop_count++;
-    g_vclock_ch2_smartzero_seeded = false;
-    g_vclock_ch2_smartzero_next_counter32 = 0;
-    return;
-  }
-
-  uint32_t authored_dwt = qtimer_event_dwt;
-  if (late_ticks != 0) {
-    g_vclock_ch2_smartzero_late_count++;
-    if (late_ticks > g_vclock_ch2_smartzero_late_max_ticks) {
-      g_vclock_ch2_smartzero_late_max_ticks = late_ticks;
-    }
-    authored_dwt -= vclock_cycles_for_ticks(late_ticks);
-  }
-
-  const uint16_t target_low16 = vclock_hardware_low16_from_synthetic(target_counter32);
-  g_vclock_ch2_smartzero_last_target_counter32 = target_counter32;
-  g_vclock_ch2_smartzero_last_service_counter32 = service_counter32;
-  g_vclock_ch2_smartzero_last_dwt = authored_dwt;
-  g_vclock_ch2_smartzero_last_late_ticks = late_ticks;
-
-  g_vclock_ch2_smartzero_feed_count++;
-  (void)smartzero_feed_sample(interrupt_subscriber_kind_t::VCLOCK,
-                              authored_dwt,
-                              target_counter32,
-                              target_low16);
-
-  const int idx = smartzero_index_for_kind(interrupt_subscriber_kind_t::VCLOCK);
-  if (idx >= 0) {
-    vclock_ch2_smartzero_record_decision(g_smartzero.lanes[idx].pub.last_decision);
-  }
-
-  if (!smartzero_is_current_lane(interrupt_subscriber_kind_t::VCLOCK)) {
-    vclock_ch2_smartzero_deactivate();
-    return;
-  }
-
-  g_vclock_ch2_smartzero_next_counter32 =
-      target_counter32 + SMARTZERO_INTERVAL_TICKS;
-}
-
-static void vclock_ch2_epoch_native_service(uint32_t qtimer_event_dwt,
-                                             uint32_t service_counter32) {
-  if (!VCLOCK_CH2_EPOCH_NATIVE_ENABLED) return;
-  if (!g_interrupt_runtime_ready || !g_interrupt_hw_ready) return;
-  if (!g_vclock_epoch_latch.pending) return;
-
-  g_vclock_ch2_epoch_native_service_count++;
-
-  const uint32_t selected_counter32 = g_vclock_epoch_latch.counter32_at_edge;
-  const uint32_t selected_to_service_ticks = service_counter32 - selected_counter32;
-  g_vclock_ch2_epoch_native_last_selected_counter32 = selected_counter32;
-  g_vclock_ch2_epoch_native_last_service_counter32 = service_counter32;
-  g_vclock_ch2_epoch_native_last_backdate_ticks = selected_to_service_ticks;
-
-  const bool published =
-      publish_selected_epoch_from_vclock_cadence(service_counter32,
-                                                 qtimer_event_dwt);
-  if (!published) return;
-
-  // Preserve the old heartbeat phase semantics, but author them from the same
-  // native CH0 service fact that published the selected epoch.  The next
-  // heartbeat will increment from this millisecond-cell position; it will not
-  // decide the epoch itself.
-  const uint32_t tick_mod_seed =
-      (selected_to_service_ticks / VCLOCK_INTERVAL_COUNTS) %
-      TICKS_PER_SECOND_EVENT;
-  g_vclock_lane.tick_mod_1000 = tick_mod_seed;
-  g_vclock_lane.logical_count32_at_last_second = service_counter32;
-  g_vclock_lane.compare_target =
-      (uint16_t)(g_vclock_epoch_latch.ch3_at_edge +
-                 (uint16_t)VCLOCK_INTERVAL_COUNTS);
-
-  // Move the first post-epoch publication path to CH2 without changing the
-  // first public bookend identity from the last-known-good build.  The first
-  // exact selected+1s target remains a future goal, but the previous attempt
-  // changed boot ordering enough to clobber command service.
-  vclock_ch2_one_second_enable_from_epoch_legacy_grid(selected_counter32,
-                                                       service_counter32,
-                                                       tick_mod_seed);
-}
-
-static __attribute__((noinline)) void vclock_apply_perishable_fact_deferred(
-    const vclock_perishable_fact_t& fact) {
-  if (!fact.one_second_due || !g_rt_vclock || !g_rt_vclock->active) {
-    return;
-  }
-
-  const uint32_t observed_dwt = fact.observed_dwt_at_event;
-  const pps_t raw_witness_pps =
-      fact.witness_pps_valid ? fact.witness_pps : pps_t{};
-
-  cadence_regression_result_t lower_env{};
-  (void)cadence_regression_result_for_bookend(
-      interrupt_subscriber_kind_t::VCLOCK,
-      observed_dwt,
-      fact.target_counter32,
-      &lower_env);
-
-  const pps_t witness_pps = fact.witness_pps_valid
-      ? pps_floorline_repair_physical_edge(raw_witness_pps,
-                                           lower_env,
-                                           observed_dwt,
-                                           fact.target_counter32)
-      : raw_witness_pps;
-  const bool pps_floorline_repaired =
-      pps_floorline_repair_applied_for_sequence(witness_pps.sequence);
-
-  bool phase_projection_valid = false;
-  uint32_t phase_cycles = 0;
-  const uint32_t published_dwt =
-      vclock_published_dwt_at_edge(witness_pps,
-                                   observed_dwt,
-                                   fact.target_counter32,
-                                   fact.target_low16,
-                                   &phase_projection_valid,
-                                   &phase_cycles);
-  (void)phase_cycles;
-
-  dwt_repair_diag_t dwt_diag{};
-  dwt_publication_diag_begin(dwt_diag,
-                             observed_dwt,
-                             fact.isr_entry_dwt_raw,
-                             pps_floorline_repaired
-                                 ? "pps_vclock_floorline_projection"
-                                 : (phase_projection_valid
-                                       ? "vclock_observed_pps_phase_witness"
-                                       : "vclock_observed_no_pps"));
-  copy_floorline_interval_to_diag(dwt_diag, lower_env);
-  if (pps_floorline_repaired) {
-    dwt_diag.interval_resync_applied = true;
-    dwt_diag.reason = "pps_vclock_floorline_projection";
-  }
-
-  uint32_t coincidence_cycles = 0;
-  bool coincidence_valid = false;
-  if (witness_pps.sequence > 0) {
-    const int32_t cycles_since_pps =
-        (int32_t)(published_dwt - witness_pps.dwt_at_edge);
-    if (llabs((long long)cycles_since_pps) <
-        DWT_PPS_COINCIDENCE_THRESHOLD_CYCLES) {
-      coincidence_cycles = (uint32_t)(cycles_since_pps >= 0
-          ? cycles_since_pps
-          : -cycles_since_pps);
-      coincidence_valid = true;
-    }
-  }
-
-  dwt_publication_diag_choose(dwt_diag,
-                              published_dwt,
-                              observed_dwt,
-                              LOWER_ENV_PUBLISH_HARD_EDGE_GATE_CYCLES,
-                              pps_floorline_repaired
-                                  ? "pps_vclock_floorline_projection"
-                                  : (phase_projection_valid
-                                        ? "vclock_observed_pps_phase_witness"
-                                        : "vclock_observed_no_pps"));
-  if (pps_floorline_repaired) {
-    dwt_diag.interval_resync_applied = true;
-  }
-
-  if (!lower_env_raw_bookend_watchdog_if_pending(
-          interrupt_subscriber_kind_t::VCLOCK,
-          lower_env,
-          dwt_diag,
-          "vclock_fact_drain")) {
-    return;
-  }
-
-  const uint32_t publication_sequence =
-      (witness_pps.sequence != 0) ? witness_pps.sequence : fact.fallback_sequence;
-  dwt_publication_request_t publication{};
-  publication.kind = interrupt_subscriber_kind_t::VCLOCK;
-  publication.sequence = publication_sequence;
-  publication.published_dwt = published_dwt;
-  publication.observed_dwt = observed_dwt;
-  publication.expected_published_dwt = published_dwt;
-  publication.target_counter32 = fact.target_counter32;
-  publication.target_low16 = fact.target_low16;
-  publication.service_low16_valid = true;
-  publication.service_low16 = fact.observed_low16;
-  publication.floorline = &lower_env;
-  publication.repair = &dwt_diag;
-  if (!dwt_publication_adjudicate_or_watchdog(publication, dwt_diag)) {
-    return;
-  }
-
-  publish_vclock_domain_pps_vclock(witness_pps,
-                                    publication_sequence,
-                                    published_dwt,
-                                    fact.target_counter32,
-                                    fact.target_low16,
-                                    observed_dwt);
-
-  emit_one_second_event(*g_rt_vclock,
-                        published_dwt,
-                        fact.target_counter32,
-                        coincidence_cycles,
-                        coincidence_valid,
-                        &dwt_diag,
-                        &lower_env);
-
-  // The PPS/Beta continuation is chained by deferred_dispatch_callback after
-  // Alpha consumes this exact frozen VCLOCK tuple.
-}
-
-static __attribute__((noinline)) void vclock_fact_drain_callback(timepop_ctx_t*,
-                                       timepop_diag_t*,
-                                       void*) {
-  vclock_perishable_fact_t fact{};
-  if (!vclock_fact_ring_pop(fact)) return;
-
-  vclock_apply_perishable_fact_deferred(fact);
-
-  // A successful one-second publication has reserved VCLOCK's deferred Alpha
-  // transaction; its completion path will rearm the next fact after Beta.  If
-  // this fact was rejected before dispatch, keep the queue moving here instead
-  // of leaving drain_armed false with pending work stranded.
-  const bool transaction_pending =
-      g_rt_vclock &&
-      (g_rt_vclock->deferred.pending || g_rt_vclock->dispatch_running);
-  if (!transaction_pending) {
-    (void)vclock_fact_ring_arm_drain_from_timepop();
-  }
-}
-
-
-// ============================================================================
-// Cadence surfaces — VCLOCK TimePop heartbeat + OCXO lane-local compare custody
-// ============================================================================
-
-static const char* ocxo_schedule_decision_name(uint32_t decision) {
-  switch (decision) {
-    case OCXO_SCHEDULE_DECISION_INACTIVE: return "INACTIVE";
-    case OCXO_SCHEDULE_DECISION_ALREADY_ARMED: return "ALREADY_ARMED";
-    case OCXO_SCHEDULE_DECISION_TARGET_INITIALIZED: return "TARGET_INITIALIZED";
-    case OCXO_SCHEDULE_DECISION_TARGET_ADVANCED: return "TARGET_ADVANCED";
-    case OCXO_SCHEDULE_DECISION_TOO_CLOSE: return "TOO_CLOSE";
-    case OCXO_SCHEDULE_DECISION_OUTSIDE_WINDOW: return "OUTSIDE_WINDOW";
-    case OCXO_SCHEDULE_DECISION_ARMED: return "ARMED";
-    case OCXO_SCHEDULE_DECISION_GENERATION_GUARD_BLOCKED:
-      return "GENERATION_GUARD_BLOCKED";
-    default: return "NONE";
-  }
-}
-
-static const char* ocxo_service_class_name(uint32_t service_class) {
-  switch (service_class) {
-    case OCXO_SERVICE_CLASS_FALSE_IRQ: return "FALSE_IRQ";
-    case OCXO_SERVICE_CLASS_EARLY_PRETARGET: return "EARLY_PRETARGET";
-    case OCXO_SERVICE_CLASS_ON_OR_AFTER_TARGET: return "ON_OR_AFTER_TARGET";
-    default: return "NONE";
-  }
-}
-
-static const char* ocxo_cadence_reason_name(uint32_t reason) {
-  switch (reason) {
-    case OCXO_CADENCE_REASON_BOOTSTRAP:    return "BOOTSTRAP";
-    case OCXO_CADENCE_REASON_START:        return "START";
-    case OCXO_CADENCE_REASON_SMARTZERO:    return "SMARTZERO";
-    case OCXO_CADENCE_REASON_LOGICAL_GRID: return "LOGICAL_GRID";
-    case OCXO_CADENCE_REASON_LOGICAL_ZERO: return "LOGICAL_ZERO";
-    case OCXO_CADENCE_REASON_REARM:        return "REARM";
-    case OCXO_CADENCE_REASON_STOP:         return "STOP";
-    default:                               return "NONE";
-  }
-}
-
-static const char* ocxo_recover_rebootstrap_stage_name(uint32_t stage) {
-  switch (stage) {
-    case OCXO_RECOVER_REBOOTSTRAP_STAGE_START_CADENCE:
-      return "START_CADENCE";
-    case OCXO_RECOVER_REBOOTSTRAP_STAGE_VERIFY_COMPARE:
-      return "VERIFY_COMPARE";
-    case OCXO_RECOVER_REBOOTSTRAP_STAGE_ENABLE_IRQ:
-      return "ENABLE_IRQ";
-    default:
-      return "OK";
-  }
-}
-
-static uint32_t ocxo_quiet_phase_ticks_for(interrupt_subscriber_kind_t kind) {
-  if (kind == interrupt_subscriber_kind_t::OCXO1) return OCXO1_QUIET_PHASE_TICKS;
-  if (kind == interrupt_subscriber_kind_t::OCXO2) return OCXO2_QUIET_PHASE_TICKS;
-  return 0U;
-}
-
-static uint32_t ocxo_phase_ticks_to_us(uint32_t phase_ticks) {
-  return (uint32_t)(((uint64_t)phase_ticks * 100ULL + 500ULL) / 1000ULL);
-}
-
-static uint32_t ocxo_phase_ticks_to_ns(uint32_t phase_ticks) {
-  return phase_ticks * 100U;
-}
-
-static bool ocxo_lane_program_local_cadence_compare(ocxo_lane_t& lane,
-                                                    synthetic_clock32_t& clock32,
-                                                    uint32_t target_counter32,
-                                                    uint32_t reason) {
-  const uint16_t hw16 = clock32.hardware16;
-  const uint16_t cmp16 = clock32.hardware16;
-  const uint32_t current_counter32 = clock32.current_counter32;
-  const uint32_t remaining = target_counter32 - current_counter32;
-  const uint16_t target_low16 =
-      hardware_low16_from_semantic(target_counter32);
-
-  lane.witness_schedule_last_current_counter32 = current_counter32;
-  lane.witness_schedule_last_target_counter32 = target_counter32;
-  lane.witness_schedule_last_remaining_ticks = remaining;
-  lane.witness_schedule_last_current_low16 = hw16;
-  lane.witness_schedule_last_target_low16 = target_low16;
-  lane.witness_schedule_last_phase_ticks =
-      lane.cadence_epoch_valid
-          ? (current_counter32 - lane.cadence_epoch_counter32)
-          : 0U;
-
-  const bool target_is_behind = (remaining == 0 || remaining > 0x7FFFFFFFUL);
-  const bool too_far = !target_is_behind &&
-                       (remaining > OCXO_WITNESS_ARM_WINDOW_TICKS);
-  const bool too_close = !target_is_behind &&
-                         (remaining < OCXO_WITNESS_MIN_ARM_LEAD_TICKS);
-
-  if (target_is_behind || too_far || too_close) {
-    uint32_t csctrl_before = 0;
-    if (!qtimer_guard_read_ocxo_csctrl(lane,
-                                       "ocxo_local_guard_before",
-                                       target_low16,
-                                       &csctrl_before)) {
-      qtimer_guard_quarantine_ocxo_lane(lane, "ocxo_local_guard_before");
-      return false;
-    }
-    lane.cadence_last_program_csctrl_before = csctrl_before;
-    lane.cadence_last_program_flag_before =
-        (csctrl_before & TMR_CSCTRL_TCF1) != 0;
-    lane.cadence_last_program_enabled_before =
-        (csctrl_before & TMR_CSCTRL_TCF1EN) != 0;
-
-    lane.cadence_next_counter32 = target_counter32;
-    lane.cadence_next_low16 = target_low16;
-    lane.compare_target = target_low16;
-    lane.witness_target_initialized = true;
-    lane.witness_target_counter32 = target_counter32;
-    lane.witness_target_low16 = target_low16;
-
-    if (too_close) {
-      lane.witness_late_arm_count++;
-      lane.witness_schedule_last_decision = OCXO_SCHEDULE_DECISION_TOO_CLOSE;
-    } else if (too_far) {
-      lane.witness_schedule_last_decision = OCXO_SCHEDULE_DECISION_OUTSIDE_WINDOW;
-    } else {
-      lane.witness_schedule_last_decision =
-          OCXO_SCHEDULE_DECISION_GENERATION_GUARD_BLOCKED;
-    }
-    lane.witness_schedule_last_ticks_until_arm_window =
-        too_far ? (remaining - OCXO_WITNESS_ARM_WINDOW_TICKS) : 0U;
-
-    lane.witness_generation_guard_block_count++;
-    lane.witness_generation_guard_last_remaining_ticks = remaining;
-    lane.witness_generation_guard_last_current_counter32 = current_counter32;
-    lane.witness_generation_guard_last_target_counter32 = target_counter32;
-    lane.witness_generation_guard_last_reason = reason;
-
-    const bool disabled_ok = ocxo_lane_disable_compare(lane);
-    lane.cadence_armed = false;
-    lane.witness_armed = false;
-    lane.cadence_last_program_csctrl_after = 0;
-    lane.cadence_last_program_flag_after = false;
-    lane.cadence_last_program_enabled_after = false;
-    if (disabled_ok) {
-      uint32_t csctrl_after = 0;
-      if (qtimer_guard_read_ocxo_csctrl(lane,
-                                        "ocxo_local_guard_after_disable",
-                                        target_low16,
-                                        &csctrl_after)) {
-        lane.cadence_last_program_csctrl_after = csctrl_after;
-        lane.cadence_last_program_flag_after =
-            (csctrl_after & TMR_CSCTRL_TCF1) != 0;
-        lane.cadence_last_program_enabled_after =
-            (csctrl_after & TMR_CSCTRL_TCF1EN) != 0;
-      }
-    }
-    lane.cadence_last_reason = reason;
-    return false;
-  }
-
-  uint32_t csctrl_before = 0;
-  if (!qtimer_guard_read_ocxo_csctrl(lane,
-                                     "ocxo_local_program_before",
-                                     target_low16,
-                                     &csctrl_before)) {
-    qtimer_guard_quarantine_ocxo_lane(lane, "ocxo_local_program_before");
-    return false;
-  }
-  lane.cadence_last_program_csctrl_before = csctrl_before;
-  lane.cadence_last_program_flag_before =
-      (csctrl_before & TMR_CSCTRL_TCF1) != 0;
-  lane.cadence_last_program_enabled_before =
-      (csctrl_before & TMR_CSCTRL_TCF1EN) != 0;
-
-  lane.cadence_next_counter32 = target_counter32;
-  lane.cadence_next_low16 = target_low16;
-  lane.compare_target = target_low16;
-  lane.witness_armed = true;
-  lane.witness_target_initialized = true;
-  lane.witness_target_counter32 = target_counter32;
-  lane.witness_target_low16 = target_low16;
-
-  lane.witness_last_arm_dwt_raw = ARM_DWT_CYCCNT;
-  lane.witness_last_arm_counter32 = current_counter32;
-  lane.witness_last_arm_low16 = hw16;
-  lane.witness_last_arm_compare_low16 = cmp16;
-  lane.witness_last_arm_counter_minus_compare_ticks =
-      (uint32_t)((uint16_t)(hw16 - cmp16));
-  lane.witness_last_arm_compare_remaining_ticks =
-      (uint32_t)((uint16_t)(target_low16 - cmp16));
-  lane.witness_last_arm_target_counter32 = target_counter32;
-  lane.witness_last_arm_target_low16 = target_low16;
-  lane.witness_last_arm_remaining_ticks = remaining;
-  lane.witness_schedule_last_decision = OCXO_SCHEDULE_DECISION_ARMED;
-  lane.witness_schedule_last_ticks_until_arm_window = 0;
-
-  if (!ocxo_lane_program_compare(lane, target_low16)) {
-    lane.cadence_armed = false;
-    lane.witness_armed = false;
-    lane.cadence_last_reason = reason;
-    return false;
-  }
-
-  uint32_t csctrl_after = 0;
-  if (!qtimer_guard_read_ocxo_csctrl(lane,
-                                     "ocxo_local_program_after",
-                                     target_low16,
-                                     &csctrl_after)) {
-    qtimer_guard_quarantine_ocxo_lane(lane, "ocxo_local_program_after");
-    return false;
-  }
-  lane.cadence_last_program_csctrl_after = csctrl_after;
-  lane.cadence_last_program_flag_after =
-      (csctrl_after & TMR_CSCTRL_TCF1) != 0;
-  lane.cadence_last_program_enabled_after =
-      (csctrl_after & TMR_CSCTRL_TCF1EN) != 0;
-  lane.cadence_armed = true;
-  lane.cadence_arm_count++;
-  if (reason == OCXO_CADENCE_REASON_REARM) {
-    lane.cadence_rearm_count++;
-  }
-  lane.cadence_last_reason = reason;
-  return true;
-}
-
-
-static bool ocxo_lane_start_local_cadence_at_target(interrupt_subscriber_kind_t,
-                                                    ocxo_lane_t& lane,
-                                                    synthetic_clock32_t& clock32,
-                                                    uint32_t target_counter32,
-                                                    uint32_t reason) {
-  if (!lane.initialized) return false;
-
-  lane.cadence_enabled = true;
-  lane.cadence_last_reason = reason;
-  return ocxo_lane_program_local_cadence_compare(lane, clock32,
-                                                  target_counter32, reason);
-}
-
-
-static uint32_t ocxo_sample_next_target_after(
-    uint32_t epoch_counter32,
-    uint32_t current_counter32) {
-  const uint32_t delta = current_counter32 - epoch_counter32;
-  if (delta > 0x7FFFFFFFUL) {
-    return epoch_counter32 + OCXO_CADENCE_INTERVAL_TICKS;
-  }
-  const uint32_t samples_completed = delta / OCXO_CADENCE_INTERVAL_TICKS;
-  return epoch_counter32 + ((samples_completed + 1U) * OCXO_CADENCE_INTERVAL_TICKS);
-}
-
-static uint32_t ocxo_sample_tick_mod_for_target(const ocxo_lane_t& lane,
-                                                uint32_t target_counter32) {
-  if (!lane.cadence_epoch_valid) return 1U;
-  const uint32_t delta = target_counter32 - lane.cadence_epoch_counter32;
-  return (delta / OCXO_CADENCE_INTERVAL_TICKS) % TICKS_PER_SECOND_EVENT;
-}
-
-static void ocxo_lane_prepare_one_second_target(
-    interrupt_subscriber_kind_t,
-    ocxo_lane_t& lane,
-    synthetic_clock32_t& clock32,
-    uint32_t target_counter32,
-    uint32_t reason) {
-  // Historical name retained.  The target is now the next +10,000 tick gear
-  // tooth of the ISR-authored OCXO ladder, not a far one-second low-word
-  // match.  Because the target is one millisecond ahead of the previous
-  // authored tooth, it can be programmed immediately without ambient rollover
-  // minding or arm-window polling.
-  if (!lane.initialized) return;
-
-  lane.cadence_enabled = true;
-  lane.cadence_armed = false;
-  lane.witness_armed = false;
-  lane.cadence_last_reason = reason;
-  (void)ocxo_lane_program_local_cadence_compare(lane, clock32,
-                                                 target_counter32, reason);
-}
-
-
-static bool ocxo_lane_start_local_cadence(interrupt_subscriber_kind_t kind,
-                                          ocxo_lane_t& lane,
-                                          synthetic_clock32_t& clock32,
-                                          uint32_t reason) {
-  if (!lane.initialized) return false;
-
-  uint32_t target = 0;
-  if (lane.cadence_epoch_valid) {
-    target = ocxo_sample_next_target_after(lane.cadence_epoch_counter32,
-                                           clock32.current_counter32);
-  } else {
-    // Pre-logical-grid fallback.  The synthetic current coordinate is whatever
-    // the most recent authored ISR target established (or the boot birth
-    // anchor).  This starts the short ladder; it does not continuously mind
-    // rollover from ambient reads.
-    target = clock32.current_counter32 + OCXO_CADENCE_INTERVAL_TICKS;
-  }
-
-  if (OCXO_QUIET_PHASE_SAMPLING_ENABLED &&
-      (kind == interrupt_subscriber_kind_t::OCXO1 ||
-       kind == interrupt_subscriber_kind_t::OCXO2)) {
-    lane.cadence_sample_phase_valid = true;
-    lane.cadence_sample_phase_ticks = ocxo_quiet_phase_ticks_for(kind);
-    lane.cadence_sample_phase_us = ocxo_phase_ticks_to_us(lane.cadence_sample_phase_ticks);
-    lane.cadence_sample_phase_ns = ocxo_phase_ticks_to_ns(lane.cadence_sample_phase_ticks);
-    lane.cadence_sample_period_ticks = OCXO_CADENCE_INTERVAL_TICKS;
-  } else {
-    lane.cadence_sample_phase_valid = false;
-    lane.cadence_sample_phase_ticks = 0;
-    lane.cadence_sample_phase_us = 0;
-    lane.cadence_sample_phase_ns = 0;
-    lane.cadence_sample_period_ticks = OCXO_CADENCE_INTERVAL_TICKS;
-  }
-
-  if (!lane.phase_bootstrapped) {
-    lane.phase_bootstrapped = true;
-    lane.bootstrap_count++;
-  }
-
-  lane.tick_mod_1000 = ocxo_sample_tick_mod_for_target(lane, target);
-
-  ocxo_lane_prepare_one_second_target(kind, lane, clock32, target, reason);
-  return lane.cadence_enabled && lane.cadence_armed && lane.witness_armed;
-}
-
-
-
-static void ocxo_lane_counter_adjacency_reset(ocxo_lane_t& lane) {
-  lane.counter_adjacency_last_valid = false;
-  lane.counter_adjacency_last_ok = false;
-  lane.counter_adjacency_last_rejected = false;
-  lane.counter_adjacency_last_delta_ticks = 0;
-  lane.counter_adjacency_expected_delta_ticks = OCXO_WITNESS_ONE_SECOND_COUNTS;
-  lane.counter_adjacency_reject_count = 0;
-}
-
-static void ocxo_lane_yardstick_reset(ocxo_lane_t& lane) {
-  lane.yardstick_chain_valid = false;
-  lane.yardstick_chain_endpoint_q16 = 0;
-  lane.yardstick_chain_interval_q16 = 0;
-  lane.yardstick_last_used_pps_sequence_valid = false;
-  lane.yardstick_last_used_pps_sequence = 0;
-  lane.yardstick_prev_observed_valid = false;
-  lane.yardstick_prev_observed_dwt = 0;
-  lane.yardstick_update_count = 0;
-  lane.yardstick_seed_count = 0;
-  lane.yardstick_stale_hold_count = 0;
-  lane.yardstick_gate_agree_count = 0;
-  lane.yardstick_gate_excursion_count = 0;
-  lane.yardstick_adjacency_reseed_count = 0;
-  lane.yardstick_coherent_reseed_count = 0;
-  lane.yardstick_excursion_streak = 0;
-  lane.yardstick_last_excursion_observed_interval_cycles = 0;
-  lane.yardstick_last_valid = false;
-  lane.yardstick_last_stale = false;
-  lane.yardstick_last_excursion = false;
-  lane.yardstick_last_g_now_cycles = 0;
-  lane.yardstick_last_g_prev_cycles = 0;
-  lane.yardstick_last_pps_seq_delta = 0;
-  lane.yardstick_last_inferred_interval_cycles = 0;
-  lane.yardstick_last_observed_interval_cycles = 0;
-  lane.yardstick_last_inferred_minus_observed_cycles = 0;
-  lane.yardstick_last_endpoint_minus_observed_cycles = 0;
-  lane.yardstick_endpoint_minus_observed_min_cycles = 0;
-  lane.yardstick_endpoint_minus_observed_max_cycles = 0;
-  lane.yardstick_max_abs_inferred_minus_observed_cycles = 0;
-  lane.yardstick_sum_inferred_minus_observed_cycles = 0;
-  lane.yardstick_auth_valid = false;
-  lane.yardstick_auth_endpoint_q16 = 0;
-  lane.yardstick_auth_interval_q16 = 0;
-  lane.yardstick_auth_publish_count = 0;
-  lane.yardstick_auth_agree_publish_count = 0;
-  lane.yardstick_auth_excursion_publish_count = 0;
-  lane.yardstick_auth_stale_publish_count = 0;
-  lane.yardstick_auth_observed_fallback_count = 0;
-  lane.yardstick_auth_anchor_correction_count = 0;
-  lane.yardstick_auth_last_error_cycles = 0;
-  lane.yardstick_auth_last_published_dwt = 0;
-  lane.yardstick_auth_fast_lock_remaining_seconds = 0;
-
-  for (uint32_t i = 0; i < ZERO_WORTHY_STREAK_SECONDS; i++) {
-    lane.zw_error_ring[i] = 0;
-  }
-  lane.zw_ring_index = 0;
-  lane.zw_ring_count = 0;
-  lane.zw_window_error_sum = 0;
-  lane.zw_window_max_abs_error = 0;
-  lane.zw_clean_streak_seconds = 0;
-  lane.zw_worthy = false;
-  lane.zw_worthy_streak_seconds = 0;
-  lane.zw_seconds_evaluated = 0;
-  lane.zw_worthy_second_count = 0;
-  lane.zw_transition_count = 0;
-  lane.zw_first_worthy_after_seconds = 0;
-  lane.zw_last_disqualify_reason = "zw_reset";
-  lane.zw_disqualify_rail_invalid_count = 0;
-  lane.zw_disqualify_excursion_count = 0;
-  lane.zw_disqualify_stale_count = 0;
-  lane.zw_disqualify_seed_count = 0;
-  lane.zw_disqualify_adjacency_count = 0;
-  lane.zw_disqualify_no_interval_count = 0;
-  lane.zw_disqualify_error_magnitude_count = 0;
-  lane.zw_disqualify_error_sum_count = 0;
-  lane.zw_disqualify_streak_building_count = 0;
-  lane.zw_disqualify_fast_lock_count = 0;
-}
-
-static void ocxo_lane_event_lineage_reset(ocxo_lane_t& lane) {
-  lane.witness_previous_event_counter32_valid = false;
-  lane.witness_previous_event_counter32 = 0;
-  lane.witness_last_counter_delta_ticks = 0;
-}
-
-static void ocxo_lane_measurement_witness_reset(ocxo_lane_t& lane) {
-  if (&lane == &g_ocxo1_lane) {
-    dwt_publication_reset_lane(interrupt_subscriber_kind_t::OCXO1);
-  } else if (&lane == &g_ocxo2_lane) {
-    dwt_publication_reset_lane(interrupt_subscriber_kind_t::OCXO2);
-  }
-  // Measurement/witness state only.  This deliberately does not touch
-  // clock32.current_counter32, clock32.hardware16, cadence_epoch_counter32,
-  // cadence_next_counter32, or any programmed hardware compare mapping.
-  ocxo_lane_counter_adjacency_reset(lane);
-  ocxo_lane_yardstick_reset(lane);
-}
-
-static void ocxo_lane_install_hardware_synthetic_mapping(
-    ocxo_lane_t& lane,
-    synthetic_clock32_t&,
-    uint32_t epoch_counter32) {
-  // Mapping/grid state only.  Do not reset measurement witnesses here;
-  // callers choose measurement reset explicitly so mapping changes and witness
-  // resets cannot be conflated.
-  lane.cadence_epoch_valid = true;
-  lane.cadence_epoch_counter32 = epoch_counter32;
-  lane.tick_mod_1000 = 0;
-}
-
-static void ocxo_lane_stop_local_cadence(ocxo_lane_t& lane, uint32_t reason) {
-  lane.cadence_enabled = false;
-  lane.cadence_armed = false;
-  lane.witness_armed = false;
-  lane.cadence_last_reason = reason;
-  ocxo_lane_disable_compare(lane);
-}
-
-static void ocxo_lane_install_logical_grid(interrupt_subscriber_kind_t kind,
-                                           ocxo_lane_t& lane,
-                                           synthetic_clock32_t& clock32,
-                                           uint32_t epoch_counter32,
-                                           uint32_t reason) {
-  ocxo_lane_install_hardware_synthetic_mapping(lane, clock32, epoch_counter32);
-  ocxo_lane_measurement_witness_reset(lane);
-  ocxo_lane_event_lineage_reset(lane);
-  cadence_regression_reset_kind(kind);
-
-  if (lane.active || smartzero_is_current_lane(kind)) {
-    (void)ocxo_lane_start_local_cadence(kind, lane, clock32, reason);
-  }
-}
-
-// The old TimePop-hosted VCLOCK heartbeat has been retired.  OCXO1 and OCXO2
-// maintain their own one-second compare custody on their local QTimer channels.
-// VCLOCK_HEARTBEAT is now native QTimer1 CH0 count+compare custody; TimePop
-// remains on QTimer1 CH2 as scheduler only.
-
-static __attribute__((noinline)) void vclock_heartbeat_native_service(uint32_t isr_entry_dwt_raw,
-                                           uint32_t qtimer_event_dwt,
-                                           uint32_t cadence_counter32) {
-  if (!g_interrupt_hw_ready) return;
-
-  const uint16_t fired_low16 = (uint16_t)(cadence_counter32 & 0xFFFFU);
-
-  g_vclock_heartbeat_fire_count++;
-
-  // Native VCLOCK heartbeat: CH0 is the pin-bound VCLOCK channel and therefore
-  // owns the 1 ms custody cadence, one-second bookends, SmartZero samples,
-  // relay deassert countdown, and PPS/VCLOCK epoch publication.  TimePop's CH2
-  // rail is scheduler-only and never authors VCLOCK edge facts.
-  g_vclock_lane.logical_count32_at_last_second = cadence_counter32;
-  g_vclock_heartbeat_vclock_ticks++;
-  g_vclock_heartbeat_last_vclock_hw16 = fired_low16;
-  g_vclock_heartbeat_last_vclock_counter32 = cadence_counter32;
-
-  const vclock_one_second_bookend_t bookend =
-      vclock_one_second_bookend_build(isr_entry_dwt_raw,
-                                      qtimer_event_dwt,
-                                      cadence_counter32,
-                                      fired_low16);
-
-  if (g_vclock_lane.active && g_rt_vclock && g_rt_vclock->active) {
-    const uint32_t floorline_observed_dwt = bookend.due
-        ? bookend.observed_dwt_at_event
-        : qtimer_event_dwt;
-    const uint32_t floorline_counter32 = bookend.due
-        ? bookend.target_counter32
-        : cadence_counter32;
-    const uint16_t floorline_target_low16 = bookend.due
-        ? bookend.target_low16
-        : fired_low16;
-    const uint16_t floorline_observed_low16 = bookend.due
-        ? bookend.observed_low16
-        : fired_low16;
-    floorline_observe_handoff(interrupt_subscriber_kind_t::VCLOCK,
-                               floorline_observed_dwt,
-                               floorline_counter32,
-                               floorline_target_low16,
-                               floorline_observed_low16,
-                               bookend.due);
-  }
-
-  // CH0 has already run the native custody services below before the legacy
-  // heartbeat bookkeeping block decides whether a fallback publication is
-  // required.
-
-
-  interrupt_ch2_implicit_rollover_tend();
-  pps_relay_ch2_tick(cadence_counter32);
-  const bool vclock_one_second_served =
-      vclock_ch2_one_second_service(bookend);
-  vclock_ch2_smartzero_service(qtimer_event_dwt,
-                               cadence_counter32);
-  vclock_ch2_epoch_native_service(qtimer_event_dwt,
-                                  cadence_counter32);
-  vclock_ch2_fact_drain_arm_after_timepop();
-
-  if (g_rt_vclock) {
-    g_rt_vclock->irq_count++;
-  }
-  g_vclock_lane.irq_count++;
-
-  if (g_vclock_lane.active && g_rt_vclock && g_rt_vclock->active) {
-    if (!g_vclock_lane.phase_bootstrapped) {
-      g_vclock_lane.phase_bootstrapped = true;
-      g_vclock_lane.bootstrap_count++;
-      g_vclock_lane.tick_mod_1000 = 0;
-    }
-
-    g_vclock_lane.cadence_hits_total++;
-
-    if (g_vclock_epoch_latch.pending) {
-      // Native CH0 custody publishes bootstrap/rebootstrap selected epochs.
-      // The heartbeat deliberately does not consume the latch or advance the
-      // one-second modulo while the selected epoch is pending; the CH0 service
-      // that publishes the epoch will seed tick_mod_1000 from its own event
-      // facts.
-      g_vclock_heartbeat_epoch_authority_retired_count++;
-      g_vclock_heartbeat_epoch_pending_skip_count++;
-      return;
-    }
-
-    const bool tick_mod_wrapped =
-        (++g_vclock_lane.tick_mod_1000 >= TICKS_PER_SECOND_EVENT);
-    if (tick_mod_wrapped) {
-      g_vclock_lane.tick_mod_1000 = 0;
-    }
-
-    const bool normal_bookend_served =
-        bookend.due && bookend.ch2_owned && vclock_one_second_served;
-    const bool same_event_fallback_due =
-        (bookend.due && bookend.ch2_owned && !vclock_one_second_served) ||
-        (tick_mod_wrapped && !g_vclock_ch2_one_second_enabled);
-
-    if (normal_bookend_served) {
-      // Normal path: native CH0 authored and enqueued this exact one-second
-      // bookend before this bookkeeping block reached the fallback branch.
-      g_vclock_heartbeat_one_second_handoff_skip_count++;
-    } else if (same_event_fallback_due) {
-      // No rich publication path is permitted in priority 16.  A CH2-owned
-      // bookend reaches this branch only when its foreground fact enqueue was
-      // loss-visible; the service routine has already advanced the gear.  The
-      // legacy bootstrap path is still preserved by enqueueing the same event
-      // into the ordinary foreground fact ring.
-      if (bookend.due && bookend.ch2_owned) {
-        g_vclock_heartbeat_one_second_fallback_count++;
-      } else {
-        g_vclock_heartbeat_one_second_legacy_count++;
-
-        vclock_perishable_fact_t fact{};
-        fact.isr_entry_dwt_raw = bookend.due
-            ? bookend.isr_entry_dwt_raw
-            : isr_entry_dwt_raw;
-        fact.observed_dwt_at_event = bookend.due
-            ? bookend.observed_dwt_at_event
-            : qtimer_event_dwt;
-        fact.target_counter32 = bookend.due
-            ? bookend.target_counter32
-            : cadence_counter32;
-        fact.target_low16 = bookend.due
-            ? bookend.target_low16
-            : fired_low16;
-        fact.observed_low16 = bookend.due
-            ? bookend.observed_low16
-            : fired_low16;
-        fact.one_second_due = true;
-        fact.witness_pps_valid = bookend.due
-            ? bookend.witness_pps_valid
-            : g_last_pps_witness_valid;
-        fact.witness_pps = bookend.due
-            ? bookend.witness_pps
-            : (g_last_pps_witness_valid ? g_last_pps_witness : pps_t{});
-        fact.fallback_sequence = bookend.due
-            ? bookend.fallback_sequence
-            : (g_pps_gpio_heartbeat.edge_count + 1U);
-
-        const bool enqueued = vclock_fact_ring_push_no_arm_from_isr(fact);
-        vclock_ch2_one_second_enable_after_heartbeat(fact.target_counter32);
-        if (enqueued) {
-          vclock_ch2_fact_drain_arm_after_timepop();
-        } else {
-          g_vclock_ch2_one_second_drop_count++;
-        }
-      }
-    }
-  } else {
-    g_vclock_lane.miss_count++;
-  }
-
-  // OCXO lanes are intentionally absent here.  Their 16-bit rollover cadence is
-  // device-local on QTimer2/QTimer3; CH0 only hosts VCLOCK custody.
-}
-
-static bool vclock_heartbeat_arm_timepop(void) {
-  // Historical function name retained for call-site stability.  It now arms
-  // the native QTimer1 CH0 VCLOCK heartbeat rather than a TimePop recurring
-  // scheduler slot.
-  if (!g_interrupt_hw_ready || !g_interrupt_runtime_ready) return false;
-
-  const uint16_t hw16 = qtimer1_ch0_counter_now();
-  vclock_clock_tend_from_hardware_low16(hw16);
-
-  const uint32_t now = g_vclock_clock32.current_counter32;
-  const uint32_t target = now + VCLOCK_INTERVAL_COUNTS;
-  g_vclock_heartbeat_next_counter32 = target;
-
-  qtimer1_vclock_program_compare((uint16_t)(target & 0xFFFFU));
-
-  g_vclock_heartbeat_armed = true;
-  g_vclock_heartbeat_arm_count++;
-  g_vclock_lane.phase_bootstrapped = true;
-  g_vclock_lane.bootstrap_count++;
-  return true;
-}
-
-// ============================================================================
-// OCXO lanes — pin-bound same-channel count+compare custody
-// ============================================================================
-//
-static bool ocxo_lane_program_compare(ocxo_lane_t& lane, uint16_t target_low16) {
-  return ocxo_compare_program(lane, target_low16);
-}
-
-static bool ocxo_lane_disable_compare(ocxo_lane_t& lane) {
-  return ocxo_compare_disable(lane);
-}
-
-// ISR discipline for OCXO lanes is reentry-safe capture only:
-//   1. capture first-instruction DWT,
-//   2. snapshot only perishable hardware/state facts,
-//   3. clear/defuse the compare flag,
-//   4. enqueue the immutable capture packet,
-//   5. pend the priority-16 handoff tier and exit.
-//
-// The handoff tier computes event-DWT, service offset, SmartZero state,
-// synthetic identity updates, rearm/stop policy, and foreground fact enqueue.
-// ============================================================================
-
-// ----------------------------------------------------------------------------
-// OCXO one-second fact ring — ISR capture, ASAP interpretation.
-// ----------------------------------------------------------------------------
-//
-// The former build enqueued every 1 kHz OCXO cadence sample and asked
-// foreground TimePop ASAP to drain/interpret them. That proved too expensive.
-// Steady-state OCXO now enqueues only the local one-second edge compare.
-// SmartZero may temporarily use +10,000-tick acquisition samples, but those
-// samples do not publish as OCXO one-second events until SmartZero re-authors
-// the normal one-second grid.
-//
-// The ring remains per-lane and loss-visible, with a normal publication rate
-// of 1 Hz per active OCXO lane.
-
-static constexpr uint32_t OCXO_PERISHABLE_FACT_RING_SIZE = 8;
-
-struct interrupt_perishable_fact_t {
+struct ocxo_runtime_context_t {
   interrupt_subscriber_kind_t kind = interrupt_subscriber_kind_t::NONE;
   interrupt_provider_kind_t provider = interrupt_provider_kind_t::NONE;
-  interrupt_lane_t lane = interrupt_lane_t::NONE;
-
-  uint32_t sequence = 0;
-
-  // Captured as first ISR instruction.  This remains private custody evidence;
-  // published event DWT remains latency-adjusted service_dwt_at_event.
-  uint32_t isr_entry_dwt_raw = 0;
-  uint32_t service_dwt_at_event = 0;
-
-  // Priority-0 authored edge coordinate.  The foreground path currently
-  // recomputes the same value from service_dwt_at_event + service_offset
-  // evidence; keep the original sealed coordinate so watchdog forensics can
-  // prove whether the copy/ferry or the original capture is at fault.
-  uint32_t authored_dwt_at_event = 0;
-
-  // Authored target identity.  This is the event identity, not an ambient read.
-  uint32_t target_counter32 = 0;
-  uint16_t target_low16 = 0;
-
-  // Split-channel low-word witnesses.  counter_* is the passive identity rail;
-  // compare_* is the active hardware compare rail.  If OCXO1's CH0/CH1 split
-  // is manufacturing excursions, these values will show phase plateaus/jumps.
-  uint16_t arm_counter_low16 = 0;
-  uint16_t arm_compare_low16 = 0;
-  uint32_t arm_counter_minus_compare_ticks = 0;
-  uint32_t arm_compare_remaining_ticks = 0;
-
-  // Hardware observation at ISR service time.
-  uint16_t service_counter_low16 = 0;
-  uint16_t service_compare_low16 = 0;
-  uint32_t service_counter_minus_compare_ticks = 0;
-  uint32_t compare_delta_mod65536_ticks = 0;
-  int16_t compare_service_offset_ticks = 0;
-  uint32_t compare_interpreted_late_ticks = 0;
-  uint32_t compare_early_ticks = 0;
-  uint32_t compare_arm_to_isr_ticks = 0;
-  int16_t service_offset_ticks = 0;
-  uint32_t service_offset_abs_ticks = 0;
-  uint32_t interpreted_late_ticks = 0;
-  uint32_t early_ticks = 0;
-  uint32_t target_delta_mod65536_ticks = 0;
-
-  // Arming/service forensics captured before interpretation.
-  uint32_t arm_dwt_raw = 0;
-  uint32_t arm_remaining_ticks = 0;
-  uint32_t arm_to_isr_ticks = 0;
-  uint32_t arm_to_isr_dwt_cycles = 0;
-  uint32_t csctrl_entry = 0;
-  uint32_t csctrl_after_disable = 0;
-  bool compare_flag_seen = false;
-  bool compare_enabled_entry = false;
-  bool compare_flag_after_disable = false;
-  bool compare_enabled_after_disable = false;
-  bool had_armed = false;
-  bool had_active_rt = false;
-
-  uint32_t service_class = OCXO_SERVICE_CLASS_NONE;
-  bool one_second_due = false;
-  bool exact_target_identity = true;
-
-  bool sample_phase_valid = false;
-  uint32_t sample_phase_ticks = 0;
-  uint32_t sample_phase_us = 0;
-  uint32_t sample_phase_ns = 0;
-  uint32_t sample_period_ticks = 0;
+  interrupt_lane_t lane_id = interrupt_lane_t::NONE;
+  const char* name = nullptr;
+  ocxo_lane_t* lane = nullptr;
+  synthetic_clock32_t* clock32 = nullptr;
+  interrupt_subscriber_runtime_t** rt_slot = nullptr;
 };
 
-struct ocxo_perishable_ring_t {
-  interrupt_perishable_fact_t facts[OCXO_PERISHABLE_FACT_RING_SIZE]{};
-  volatile uint32_t head = 0;  // producer-owned monotonic cursor
-  volatile uint32_t tail = 0;  // consumer-owned monotonic cursor
-  volatile bool drain_armed = false;
-  volatile uint32_t sequence = 0;
-  volatile uint32_t enqueue_count = 0;
-  volatile uint32_t drain_count = 0;
-  volatile uint32_t overflow_count = 0;
-  volatile uint32_t high_water = 0;
-  volatile uint32_t asap_arm_count = 0;
-  volatile uint32_t asap_fail_count = 0;
+static vclock_lane_t g_vclock_lane{};
+static ocxo_lane_t g_ocxo1_lane{};
+static ocxo_lane_t g_ocxo2_lane{};
+static ocxo_runtime_context_t g_ocxo1_ctx{
+  interrupt_subscriber_kind_t::OCXO1,
+  interrupt_provider_kind_t::QTIMER2,
+  interrupt_lane_t::QTIMER2_CH0_COMP,
+  "OCXO1",
+  &g_ocxo1_lane,
+  &g_ocxo1_clock32,
+  &g_rt_ocxo1,
+};
+static ocxo_runtime_context_t g_ocxo2_ctx{
+  interrupt_subscriber_kind_t::OCXO2,
+  interrupt_provider_kind_t::QTIMER3,
+  interrupt_lane_t::QTIMER3_CH3_COMP,
+  "OCXO2",
+  &g_ocxo2_lane,
+  &g_ocxo2_clock32,
+  &g_rt_ocxo2,
 };
 
-static ocxo_perishable_ring_t g_ocxo1_fact_ring = {};
-static ocxo_perishable_ring_t g_ocxo2_fact_ring = {};
-
-static ocxo_perishable_ring_t&
-ocxo_fact_ring_for(ocxo_runtime_context_t& ctx) {
-  return (ctx.kind == interrupt_subscriber_kind_t::OCXO1)
-      ? g_ocxo1_fact_ring
-      : g_ocxo2_fact_ring;
+static ocxo_runtime_context_t* ocxo_context_for(
+    interrupt_subscriber_kind_t kind) {
+  if (kind == interrupt_subscriber_kind_t::OCXO1) return &g_ocxo1_ctx;
+  if (kind == interrupt_subscriber_kind_t::OCXO2) return &g_ocxo2_ctx;
+  return nullptr;
 }
 
-static const char* ocxo_fact_drain_name(const ocxo_runtime_context_t& ctx) {
-  return ctx.fact_drain_name ? ctx.fact_drain_name : ctx.name;
+static bool ocxo_kind_disabled(interrupt_subscriber_kind_t kind) {
+  if (kind == interrupt_subscriber_kind_t::OCXO1) return OCXO1_DISABLED;
+  if (kind == interrupt_subscriber_kind_t::OCXO2) return OCXO2_DISABLED;
+  return false;
 }
 
-static void ocxo_fact_ring_reset(ocxo_runtime_context_t& ctx) {
-  ocxo_perishable_ring_t& r = ocxo_fact_ring_for(ctx);
-  for (uint32_t i = 0; i < OCXO_PERISHABLE_FACT_RING_SIZE; i++) {
-    r.facts[i] = interrupt_perishable_fact_t{};
-  }
-  r.head = 0;
-  r.tail = 0;
-  r.drain_armed = false;
-  r.sequence = 0;
-  r.enqueue_count = 0;
-  r.drain_count = 0;
-  r.overflow_count = 0;
-  r.high_water = 0;
-  r.asap_arm_count = 0;
-  r.asap_fail_count = 0;
+static interrupt_subscriber_runtime_t* ocxo_runtime_for(
+    const ocxo_runtime_context_t& ctx) {
+  return ctx.rt_slot ? *ctx.rt_slot : nullptr;
 }
 
-// Caller has stopped this lane's priority-0 producer and masked the priority-16
-// handoff tier.  Preserve lifetime counters and the monotonic fact sequence;
-// only pending facts and the potentially orphaned drain latch cross the
-// deliberate RECOVER custody cut.
-static uint32_t ocxo_fact_ring_discard_pending_for_recover(
-    ocxo_runtime_context_t& ctx) {
-  ocxo_perishable_ring_t& r = ocxo_fact_ring_for(ctx);
-  const uint32_t tail = r.tail;
-  dmb_barrier();
-  const uint32_t head = r.head;
-  const uint32_t dropped = head - tail;
-  r.tail = head;
-  r.drain_armed = false;
-  dmb_barrier();
-  return dropped;
-}
-
-static int32_t dwt_cycles_for_ocxo_ticks_signed(int32_t ticks) {
-  const uint32_t cps = interrupt_vclock_cycles_per_second();
-  if (cps == 0 || ticks == 0) return 0;
-
-  const int64_t numerator = (int64_t)ticks * (int64_t)cps;
-  const int64_t denom = (int64_t)OCXO_WITNESS_ONE_SECOND_COUNTS;
-  if (numerator >= 0) {
-    return (int32_t)((numerator + denom / 2) / denom);
-  }
-  return (int32_t)(-(((-numerator) + denom / 2) / denom));
-}
-
-static bool ocxo_fact_ring_push_from_isr(ocxo_runtime_context_t& ctx,
-                                         const interrupt_perishable_fact_t& fact);
-static __attribute__((noinline)) void ocxo1_fact_drain_callback(
-    timepop_ctx_t*, timepop_diag_t*, void*);
-static __attribute__((noinline)) void ocxo2_fact_drain_callback(
-    timepop_ctx_t*, timepop_diag_t*, void*);
-
-static bool ocxo_fact_ring_pop(ocxo_runtime_context_t& ctx,
-                               interrupt_perishable_fact_t& out) {
-  ocxo_perishable_ring_t& r = ocxo_fact_ring_for(ctx);
-
-  const uint32_t prior_basepri = interrupt_priority0_guard_enter();
-  const uint32_t tail = r.tail;
-  const uint32_t head = r.head;
-  if (tail == head) {
-    r.drain_armed = false;
-    interrupt_priority0_guard_exit(prior_basepri);
-    return false;
-  }
-
-  dmb_barrier();
-  out = r.facts[tail % OCXO_PERISHABLE_FACT_RING_SIZE];
-  dmb_barrier();
-  r.tail = tail + 1U;
-  r.drain_count++;
-  if ((tail + 1U) == head) {
-    r.drain_armed = false;
-  }
-  interrupt_priority0_guard_exit(prior_basepri);
-  return true;
-}
-
-static bool ocxo_fact_ring_push_from_isr(ocxo_runtime_context_t& ctx,
-                                         const interrupt_perishable_fact_t& fact) {
-  ocxo_perishable_ring_t& r = ocxo_fact_ring_for(ctx);
-  ocxo_lane_t* lane = ctx.lane;
-
-  const uint32_t head = r.head;
-  dmb_barrier();
-  const uint32_t pending = head - r.tail;
-  if (pending >= OCXO_PERISHABLE_FACT_RING_SIZE) {
-    r.overflow_count++;
-    if (lane) {
-      lane->witness_fact_overflow_count = r.overflow_count;
-    }
-    return false;
-  }
-
-  r.facts[head % OCXO_PERISHABLE_FACT_RING_SIZE] = fact;
-  dmb_barrier();
-  r.head = head + 1U;
-  r.enqueue_count++;
-  const uint32_t pending_after = pending + 1U;
-  if (pending_after > r.high_water) r.high_water = pending_after;
-
-  if (lane) {
-    lane->witness_fact_enqueue_count = r.enqueue_count;
-    lane->witness_fact_overflow_count = r.overflow_count;
-    lane->witness_fact_high_water = r.high_water;
-  }
-
-  if (!r.drain_armed) {
-    r.drain_armed = true;
-    r.asap_arm_count++;
-    if (lane) lane->witness_fact_asap_arm_count = r.asap_arm_count;
-
-    const timepop_callback_t callback =
-        (ctx.kind == interrupt_subscriber_kind_t::OCXO1)
-            ? ocxo1_fact_drain_callback
-            : ocxo2_fact_drain_callback;
-    const timepop_handle_t h =
-        timepop_arm_asap(callback, nullptr, ocxo_fact_drain_name(ctx));
-    if (h == TIMEPOP_INVALID_HANDLE) {
-      r.drain_armed = false;
-      r.asap_fail_count++;
-      if (lane) lane->witness_fact_asap_fail_count = r.asap_fail_count;
-      return false;
-    }
-  }
-
-  return true;
-}
-
-
-static inline bool ocxo_lane_compare_flag_pending(const ocxo_lane_t& lane) {
-  uint32_t csctrl = 0;
-  if (!qtimer_guard_read_ocxo_csctrl(lane,
-                                     "ocxo_compare_flag_pending",
-                                     lane.compare_target,
-                                     &csctrl)) {
-    return false;
-  }
-  return (csctrl & TMR_CSCTRL_TCF1) != 0;
-}
-
-static inline uint16_t ocxo_lane_counter_now(const ocxo_lane_t& lane) {
-  uint16_t value = 0;
-  (void)qtimer_guard_read_ocxo_u16(lane,
-                                   "ocxo_counter_now",
-                                   qtimer_guard_reg_t::CNTR,
-                                   lane.counter_channel,
-                                   lane.compare_target,
-                                   &value);
-  return value;
-}
-
-static inline uint16_t ocxo_lane_compare_counter_now(const ocxo_lane_t& lane) {
-  uint16_t value = 0;
-  (void)qtimer_guard_read_ocxo_u16(lane,
-                                   "ocxo_compare_counter_now",
-                                   qtimer_guard_reg_t::CNTR,
-                                   lane.compare_channel,
-                                   lane.compare_target,
-                                   &value);
-  return value;
-}
-
-static bool ocxo_lane_clear_compare_flag(ocxo_lane_t& lane) {
-  return ocxo_compare_clear_flag(lane);
-}
-
-static void ocxo_qtimer_diag_record(ocxo_runtime_context_t& ctx,
-                                    uint32_t isr_entry_dwt_raw,
-                                    uint32_t event_dwt,
-                                    uint32_t legacy_late_ticks,
-                                    uint32_t interpreted_late_ticks = 0,
-                                    uint32_t early_ticks = 0,
-                                    int32_t service_offset_signed_ticks = 0,
-                                    uint32_t service_offset_abs_ticks = 0,
-                                    uint32_t target_delta_mod65536_ticks = 0,
-                                    uint16_t target_low16 = 0,
-                                    uint16_t isr_counter_low16 = 0,
-                                    uint32_t dwt_coordinate_source = OCXO_DWT_SOURCE_ISR_ENTRY) {
-  if (!ctx.qtimer_diag) return;
-
-  ocxo_qtimer_diag_t& d = *ctx.qtimer_diag;
-  d.count++;
-  d.dwt_raw = isr_entry_dwt_raw;
-  d.event_dwt = event_dwt;
-  d.dwt_coordinate_source = dwt_coordinate_source;
-  d.late_ticks = legacy_late_ticks;
-  d.interpreted_late_ticks = interpreted_late_ticks;
-  d.early_ticks = early_ticks;
-  d.service_offset_signed_ticks = service_offset_signed_ticks;
-  d.service_offset_abs_ticks = service_offset_abs_ticks;
-  d.target_delta_mod65536_ticks = target_delta_mod65536_ticks;
-  d.target_low16 = target_low16;
-  d.isr_counter_low16 = isr_counter_low16;
-}
-
-
-static void ocxo_lane_counter_adjacency_note(ocxo_lane_t& lane,
-                                             bool valid,
-                                             uint32_t delta_ticks,
-                                             dwt_repair_diag_t* out_diag) {
-  const bool ok = !valid || delta_ticks == OCXO_WITNESS_ONE_SECOND_COUNTS;
-
-  lane.counter_adjacency_last_valid = valid;
-  lane.counter_adjacency_last_ok = ok;
-  lane.counter_adjacency_last_rejected = valid && !ok;
-  lane.counter_adjacency_last_delta_ticks = valid ? delta_ticks : 0U;
-  lane.counter_adjacency_expected_delta_ticks = OCXO_WITNESS_ONE_SECOND_COUNTS;
-  if (valid && !ok) {
-    lane.counter_adjacency_reject_count++;
-  }
-
-  if (out_diag) {
-    out_diag->interval_adjacency_gate_valid = valid;
-    out_diag->interval_adjacency_ok = ok;
-    out_diag->interval_adjacency_rejected = valid && !ok;
-    out_diag->interval_counter_delta_ticks = valid ? delta_ticks : 0U;
-    out_diag->interval_expected_counter_delta_ticks = OCXO_WITNESS_ONE_SECOND_COUNTS;
-    out_diag->interval_adjacency_reject_count = lane.counter_adjacency_reject_count;
-  }
-}
+static void interrupt_features_note_observed_edge(void);
+static void interrupt_features_note_ocxo_custody(void);
+static void interrupt_features_note_lineage(void);
 
 // ============================================================================
-// PPS-Yardstick OCXO DWT inference (Stage 1 -- OBSERVATIONAL ONLY)
+// Passive integrity evidence
 // ============================================================================
-//
-// PPS/Yardstick rail beside FloorLine.  This function no longer competes with
-// the retired predictor; it maintains the OCXO physics audit and zero-worthiness
-// evidence while the published OCXO DWT-at-edge remains the latency-adjusted
-// observed endpoint.
-//
-// Per event:
-//   1. Load the PPS yardstick pair (G_now, G_prev).  A non-advancing PPS
-//      sequence, an unusable pair, or an insane step is STALE: the chain
-//      interval holds (pure last-second prediction) and is flagged.
-//   2. Scale the chain interval by the yardstick step:
-//        O' = O * G_now / G_prev = O + (O * (G_now - G_prev)) / G_prev
-//      computed exactly in 64-bit Q16 (the delta form avoids overflow; it is
-//      the exact ratio, not a first-order approximation).
-//   3. Advance the free-running chain endpoint by the inferred interval.
-//   4. Validate against the QTimer-observed interval (4-cycle lattice):
-//      agreement within OCXO_YARDSTICK_GATE_THRESHOLD_CYCLES confirms the
-//      inference; a violation is an excursion of the ISR/service
-//      displacement class.
-//   5. Coherent repeated excursions (observed intervals agreeing with each
-//      other) mean the OCXO genuinely moved; reseed the chain from the
-//      observed surface instead of diverging.
-//
-// Known Stage-1 limitation, deliberately measured rather than masked: the
-// chain interval is seeded from ONE quantized observation and may carry up
-// to ~one lattice step of constant seed bias.  Seed bias appears as (a) a
-// constant offset in the agree-second inferred-minus-observed mean and (b) a
-// linear endpoint walk at that same rate.  Stage-1 telemetry exposes both so
-// Stage 2 can choose the seed/anchor policy from data.
 
-// SmartZero Gen-2 per-second worthiness classification.  Exactly one kind is
-// assigned per observed second by ocxo_lane_yardstick_observe.
-enum class zero_worthy_second_kind_t : uint8_t {
-  AGREE,                 // clean gate-agree second, fresh yardstick
-  EXCURSION,             // gate excursion (incl. both halves of a paired transient)
-  STALE,                 // no fresh PPS yardstick this second
-  SEED,                  // chain (re)seeded from observed this second
-  RAIL_INVALID,          // chain not yet valid (init)
-  ADJACENCY_FAULT,       // non-1-second counter lineage
-  NO_OBSERVED_INTERVAL,  // chained but no prior observed endpoint (degenerate)
-};
+static interrupt_integrity_snapshot_t g_interrupt_integrity{};
+static interrupt_integrity_snapshot_t g_interrupt_integrity_report_scratch
+    DMAMEM{};
 
-static void ocxo_lane_zero_worthy_update(ocxo_lane_t& lane,
-                                         zero_worthy_second_kind_t kind,
-                                         int32_t auth_error_cycles,
-                                         bool anchor_fast_lock_active) {
-  lane.zw_seconds_evaluated++;
-  const bool was_worthy = lane.zw_worthy;
-
-  const char* disqualify = nullptr;
+static interrupt_integrity_counter_check_t* integrity_counter_for(
+    interrupt_subscriber_kind_t kind) {
   switch (kind) {
-    case zero_worthy_second_kind_t::AGREE:
-      break;
-    case zero_worthy_second_kind_t::EXCURSION:
-      disqualify = "zw_gate_excursion";
-      lane.zw_disqualify_excursion_count++;
-      break;
-    case zero_worthy_second_kind_t::STALE:
-      disqualify = "zw_yardstick_stale";
-      lane.zw_disqualify_stale_count++;
-      break;
-    case zero_worthy_second_kind_t::SEED:
-      disqualify = "zw_chain_seed";
-      lane.zw_disqualify_seed_count++;
-      break;
-    case zero_worthy_second_kind_t::RAIL_INVALID:
-      disqualify = "zw_rail_invalid";
-      lane.zw_disqualify_rail_invalid_count++;
-      break;
-    case zero_worthy_second_kind_t::ADJACENCY_FAULT:
-      disqualify = "zw_counter_adjacency";
-      lane.zw_disqualify_adjacency_count++;
-      break;
-    case zero_worthy_second_kind_t::NO_OBSERVED_INTERVAL:
-      disqualify = "zw_no_observed_interval";
-      lane.zw_disqualify_no_interval_count++;
-      break;
-  }
-
-  if (!disqualify && kind == zero_worthy_second_kind_t::AGREE) {
-    if (anchor_fast_lock_active) {
-      // Acquisition-gain seconds are definitionally not converged state:
-      // the hot integral (1/32) passes lattice and PPS-witness noise into
-      // the interval at 8x tracking gain.  They are excluded from
-      // worthiness eligibility so they neither qualify a zero nor pollute
-      // the magnitude/sum disqualification statistics.
-      disqualify = "zw_fast_lock_acquisition";
-      lane.zw_disqualify_fast_lock_count++;
-    }
-  }
-  if (!disqualify && kind == zero_worthy_second_kind_t::AGREE) {
-    const int32_t abs_err = auth_error_cycles < 0
-        ? -auth_error_cycles : auth_error_cycles;
-    if (abs_err > ZERO_WORTHY_MAX_ABS_AUTH_ERROR_CYCLES) {
-      disqualify = "zw_auth_error_magnitude";
-      lane.zw_disqualify_error_magnitude_count++;
-    }
-  }
-
-  if (disqualify) {
-    // Any unclean second empties the window: the streak restarts from zero.
-    for (uint32_t i = 0; i < ZERO_WORTHY_STREAK_SECONDS; i++) {
-      lane.zw_error_ring[i] = 0;
-    }
-    lane.zw_ring_index = 0;
-    lane.zw_ring_count = 0;
-    lane.zw_window_error_sum = 0;
-    lane.zw_window_max_abs_error = 0;
-    lane.zw_clean_streak_seconds = 0;
-    lane.zw_worthy = false;
-    lane.zw_worthy_streak_seconds = 0;
-    lane.zw_last_disqualify_reason = disqualify;
-    if (was_worthy) lane.zw_transition_count++;
-    return;
-  }
-
-  // Clean second: push the anchor loop error into the ring.
-  if (lane.zw_ring_count == ZERO_WORTHY_STREAK_SECONDS) {
-    lane.zw_window_error_sum -= lane.zw_error_ring[lane.zw_ring_index];
-  } else {
-    lane.zw_ring_count++;
-  }
-  lane.zw_error_ring[lane.zw_ring_index] = auth_error_cycles;
-  lane.zw_window_error_sum += auth_error_cycles;
-  lane.zw_ring_index =
-      (uint8_t)((lane.zw_ring_index + 1U) % ZERO_WORTHY_STREAK_SECONDS);
-  lane.zw_clean_streak_seconds++;
-
-  uint32_t max_abs = 0;
-  for (uint32_t i = 0; i < lane.zw_ring_count; i++) {
-    const int32_t v = lane.zw_error_ring[i];
-    const uint32_t a = (uint32_t)(v < 0 ? -v : v);
-    if (a > max_abs) max_abs = a;
-  }
-  lane.zw_window_max_abs_error = max_abs;
-
-  bool worthy = false;
-  if (lane.zw_ring_count < ZERO_WORTHY_STREAK_SECONDS) {
-    lane.zw_last_disqualify_reason = "zw_streak_building";
-    lane.zw_disqualify_streak_building_count++;
-  } else {
-    const int32_t abs_sum = lane.zw_window_error_sum < 0
-        ? -lane.zw_window_error_sum : lane.zw_window_error_sum;
-    if (abs_sum > ZERO_WORTHY_MAX_ABS_ERROR_SUM_CYCLES) {
-      // The retrace detector: persistent same-sign loop error means the
-      // oven is still moving; the anchor would memorialize a transient.
-      lane.zw_last_disqualify_reason = "zw_error_sum_retrace";
-      lane.zw_disqualify_error_sum_count++;
-    } else {
-      worthy = true;
-    }
-  }
-
-  lane.zw_worthy = worthy;
-  if (worthy) {
-    lane.zw_worthy_second_count++;
-    lane.zw_worthy_streak_seconds++;
-    if (lane.zw_first_worthy_after_seconds == 0) {
-      lane.zw_first_worthy_after_seconds = lane.zw_seconds_evaluated;
-    }
-  } else {
-    lane.zw_worthy_streak_seconds = 0;
-  }
-  if (worthy != was_worthy) lane.zw_transition_count++;
-}
-
-// System-level all-lanes verdict.  Disabled lanes are vacuously worthy,
-// mirroring v1 SmartZero's synthetic proof for disabled lanes.  Counting is
-// keyed to the PPS yardstick sequence so each qualified GNSS second is
-// counted exactly once even though both lanes call through here.
-static void smartzero2_system_update(uint32_t pps_sequence) {
-  ocxo_lane_t* l1 = ocxo_lane_for(interrupt_subscriber_kind_t::OCXO1);
-  ocxo_lane_t* l2 = ocxo_lane_for(interrupt_subscriber_kind_t::OCXO2);
-  const bool l1_ok =
-      ocxo_kind_disabled(interrupt_subscriber_kind_t::OCXO1) ||
-      (l1 && l1->zw_worthy);
-  const bool l2_ok =
-      ocxo_kind_disabled(interrupt_subscriber_kind_t::OCXO2) ||
-      (l2 && l2->zw_worthy);
-  const bool all = l1_ok && l2_ok;
-  g_smartzero2.all_lanes_worthy = all;
-
-  if (pps_sequence != 0 &&
-      pps_sequence != g_smartzero2.last_pps_sequence_checked) {
-    g_smartzero2.last_pps_sequence_checked = pps_sequence;
-    if (all) {
-      g_smartzero2.all_worthy_second_count++;
-      g_smartzero2.all_worthy_streak_seconds++;
-      if (g_smartzero2.first_all_worthy_pps_sequence == 0) {
-        g_smartzero2.first_all_worthy_pps_sequence = pps_sequence;
-      }
-    } else {
-      g_smartzero2.all_worthy_streak_seconds = 0;
-    }
+    case interrupt_subscriber_kind_t::VCLOCK:
+      return &g_interrupt_integrity.vclock_counter;
+    case interrupt_subscriber_kind_t::OCXO1:
+      return &g_interrupt_integrity.ocxo1_counter;
+    case interrupt_subscriber_kind_t::OCXO2:
+      return &g_interrupt_integrity.ocxo2_counter;
+    default:
+      return nullptr;
   }
 }
 
-static uint32_t ocxo_lane_yardstick_observe(ocxo_lane_t& lane,
-                                            uint32_t observed_dwt,
-                                            bool counter_adjacency_valid,
-                                            uint32_t counter_delta_ticks,
-                                            dwt_repair_diag_t* out_diag,
-                                            const char** out_reason) {
-  const char* reason = "ocxo_yardstick_init";
-  uint32_t published_dwt = observed_dwt;
-
-  const bool counter_adjacency_ok =
-      !counter_adjacency_valid ||
-      counter_delta_ticks == OCXO_WITNESS_ONE_SECOND_COUNTS;
-
-  pps_yardstick_snapshot_t y{};
-  const bool y_loaded = pps_yardstick_load(y);
-  const bool y_usable = y_loaded && y.valid &&
-                        y.interval_now_cycles != 0 &&
-                        y.interval_prev_cycles != 0;
-
-  uint32_t pps_seq_delta = 0;
-  if (y_usable) {
-    pps_seq_delta = lane.yardstick_last_used_pps_sequence_valid
-        ? (y.sequence - lane.yardstick_last_used_pps_sequence)
-        : 1U;
+static interrupt_integrity_qtimer_dwt_match_check_t* integrity_dwt_for(
+    interrupt_subscriber_kind_t kind) {
+  switch (kind) {
+    case interrupt_subscriber_kind_t::VCLOCK:
+      return &g_interrupt_integrity.vclock_qtimer_dwt;
+    case interrupt_subscriber_kind_t::OCXO1:
+      return &g_interrupt_integrity.ocxo1_qtimer_dwt;
+    case interrupt_subscriber_kind_t::OCXO2:
+      return &g_interrupt_integrity.ocxo2_qtimer_dwt;
+    default:
+      return nullptr;
   }
+}
 
-  const int64_t delta_g = y_usable
-      ? (int64_t)y.interval_now_cycles - (int64_t)y.interval_prev_cycles
-      : 0;
-  const bool delta_g_sane =
-      (delta_g >= -(int64_t)PPS_YARDSTICK_MAX_ABS_DELTA_G_CYCLES) &&
-      (delta_g <=  (int64_t)PPS_YARDSTICK_MAX_ABS_DELTA_G_CYCLES);
+void interrupt_integrity_note_counter32(interrupt_subscriber_kind_t kind,
+                                        uint32_t sequence,
+                                        bool interval_valid,
+                                        uint32_t observed_delta_ticks,
+                                        uint32_t expected_delta_ticks,
+                                        uint32_t current_counter32) {
+  interrupt_integrity_counter_check_t* state = integrity_counter_for(kind);
+  if (!state) return;
 
-  const bool stale = !y_usable || pps_seq_delta == 0 || !delta_g_sane;
-
-  // Observed one-second interval against this rail's own previous endpoint.
-  const bool have_observed_interval = lane.yardstick_prev_observed_valid;
-  const uint32_t observed_interval = have_observed_interval
-      ? (observed_dwt - lane.yardstick_prev_observed_dwt)
+  state->valid = true;
+  state->sequence = sequence;
+  state->expected_delta_ticks = expected_delta_ticks;
+  state->observed_delta_ticks = interval_valid ? observed_delta_ticks : 0U;
+  state->current_counter32 = current_counter32;
+  state->previous_counter32 = interval_valid
+      ? current_counter32 - observed_delta_ticks
       : 0U;
-  if (out_diag) {
-    out_diag->interval_gate_valid = have_observed_interval;
-    out_diag->interval_observed_cycles = have_observed_interval
-        ? observed_interval
-        : 0U;
-    out_diag->interval_gate_threshold_cycles = OCXO_YARDSTICK_GATE_THRESHOLD_CYCLES;
-  }
+  state->lock_streak_required = COUNTER32_LINEAGE_LOCK_STREAK;
 
-  bool seeded = false;
-  bool excursion = false;
-  bool anchor_applied = false;
-  int32_t auth_error_cycles = 0;
-  int32_t inferred_minus_observed = 0;
-  int32_t endpoint_minus_observed = 0;
-  uint32_t inferred_interval_rounded = 0;
-  zero_worthy_second_kind_t zw_kind =
-      zero_worthy_second_kind_t::RAIL_INVALID;
-  bool zw_fast_lock_active = false;
-
-  if (counter_adjacency_valid && !counter_adjacency_ok) {
-    // Non-adjacent target identity: the interval ending at this edge is not
-    // a lawful one-second sample.  Drop both rails; the next adjacent pair
-    // reseeds them.  The edge itself is real and is published as observed.
-    lane.yardstick_chain_valid = false;
-    lane.yardstick_auth_valid = false;
-    lane.yardstick_adjacency_reseed_count++;
-    lane.yardstick_excursion_streak = 0;
-    lane.yardstick_auth_observed_fallback_count++;
-    reason = "ocxo_yardstick_adjacency_observed";
-    zw_kind = zero_worthy_second_kind_t::ADJACENCY_FAULT;
-  } else if (!lane.yardstick_chain_valid) {
-    if (have_observed_interval && observed_interval != 0) {
-      // Seed both rails from the first lawful observed interval (quantized;
-      // the anchor's integral term absorbs the seed bias in steady state).
-      lane.yardstick_chain_valid = true;
-      lane.yardstick_chain_interval_q16 = ((uint64_t)observed_interval) << 16;
-      lane.yardstick_chain_endpoint_q16 =
-          (((uint64_t)observed_dwt) << 16) & YARDSTICK_ENDPOINT_Q16_MASK;
-      lane.yardstick_auth_valid = true;
-      lane.yardstick_auth_interval_q16 = ((uint64_t)observed_interval) << 16;
-      lane.yardstick_auth_endpoint_q16 =
-          (((uint64_t)observed_dwt) << 16) & YARDSTICK_ENDPOINT_Q16_MASK;
-      lane.yardstick_seed_count++;
-      lane.yardstick_excursion_streak = 0;
-      seeded = true;
-      lane.yardstick_auth_fast_lock_remaining_seconds =
-          OCXO_YARDSTICK_ANCHOR_FAST_LOCK_SECONDS;
-      inferred_interval_rounded = observed_interval;
-      reason = "ocxo_yardstick_seed";
-      zw_kind = zero_worthy_second_kind_t::SEED;
-    } else {
-      lane.yardstick_auth_observed_fallback_count++;
-      reason = "ocxo_yardstick_init";
-      zw_kind = zero_worthy_second_kind_t::RAIL_INVALID;
-    }
-  } else {
-    // ---- Free chain (Stage 1 physics audit, unchanged) ----
-    zw_fast_lock_active =
-        lane.yardstick_auth_fast_lock_remaining_seconds > 0U;
-    if (!stale) {
-      const int64_t correction_q16 =
-          ((int64_t)lane.yardstick_chain_interval_q16 * delta_g) /
-          (int64_t)y.interval_prev_cycles;
-      lane.yardstick_chain_interval_q16 =
-          (uint64_t)((int64_t)lane.yardstick_chain_interval_q16 +
-                     correction_q16);
-    } else {
-      lane.yardstick_stale_hold_count++;
-    }
-
-    lane.yardstick_chain_endpoint_q16 =
-        (lane.yardstick_chain_endpoint_q16 +
-         lane.yardstick_chain_interval_q16) &
-        YARDSTICK_ENDPOINT_Q16_MASK;
-
-    inferred_interval_rounded =
-        (uint32_t)((lane.yardstick_chain_interval_q16 + 0x8000ULL) >> 16);
-
-    // ---- Anchored authority rail: scale and advance with the same step ----
-    if (!stale) {
-      const int64_t auth_correction_q16 =
-          ((int64_t)lane.yardstick_auth_interval_q16 * delta_g) /
-          (int64_t)y.interval_prev_cycles;
-      lane.yardstick_auth_interval_q16 =
-          (uint64_t)((int64_t)lane.yardstick_auth_interval_q16 +
-                     auth_correction_q16);
-    }
-    lane.yardstick_auth_endpoint_q16 =
-        (lane.yardstick_auth_endpoint_q16 +
-         lane.yardstick_auth_interval_q16) &
-        YARDSTICK_ENDPOINT_Q16_MASK;
-
-    if (have_observed_interval && observed_interval != 0) {
-      inferred_minus_observed =
-          (int32_t)(inferred_interval_rounded - observed_interval);
-      const uint32_t abs_imo = (uint32_t)(inferred_minus_observed < 0
-          ? -(int64_t)inferred_minus_observed
-          : (int64_t)inferred_minus_observed);
-      excursion = abs_imo > OCXO_YARDSTICK_GATE_THRESHOLD_CYCLES;
-
-      const uint32_t inferred_endpoint_dwt =
-          (uint32_t)(lane.yardstick_chain_endpoint_q16 >> 16);
-      endpoint_minus_observed =
-          (int32_t)(inferred_endpoint_dwt - observed_dwt);
-
-      // PI loop error: observed minus advanced anchored endpoint, in Q16,
-      // sign-extended from the 48-bit modular endpoint domain.
-      int64_t err_q16 =
-          (int64_t)(((((uint64_t)observed_dwt) << 16) -
-                     lane.yardstick_auth_endpoint_q16) &
-                    YARDSTICK_ENDPOINT_Q16_MASK);
-      if (err_q16 > (int64_t)(YARDSTICK_ENDPOINT_Q16_MASK >> 1)) {
-        err_q16 -= (int64_t)(YARDSTICK_ENDPOINT_Q16_MASK + 1ULL);
-      }
-      auth_error_cycles = (int32_t)(err_q16 >> 16);
-
-      if (excursion) {
-        lane.yardstick_gate_excursion_count++;
-
-        lane.yardstick_excursion_streak++;
-        lane.yardstick_last_excursion_observed_interval_cycles =
-            observed_interval;
-
-        // Hard-fail doctrine: a coherent run of excursions is not something
-        // the interrupt layer should quietly absorb.  The final publication
-        // tribunal below treats yardstick excursions as inadmissible and raises
-        // WATCHDOG_ANOMALY, so the previous self-reseed path is intentionally
-        // retired instead of masking the campaign-level failure evidence.
-
-        // Excursion guard: the observed edge is quarantined evidence; the
-        // anchored yardstick rail coasts as witness material only.  The final
-        // publication tribunal hard-fails before subscriber publication.
-        lane.yardstick_auth_excursion_publish_count++;
-        reason = "ocxo_yardstick_excursion_guard";
-        zw_kind = zero_worthy_second_kind_t::EXCURSION;
-      } else {
-        lane.yardstick_gate_agree_count++;
-        lane.yardstick_excursion_streak = 0;
-
-        lane.yardstick_sum_inferred_minus_observed_cycles +=
-            (int64_t)inferred_minus_observed;
-        if (abs_imo > lane.yardstick_max_abs_inferred_minus_observed_cycles) {
-          lane.yardstick_max_abs_inferred_minus_observed_cycles = abs_imo;
-        }
-        if (lane.yardstick_gate_agree_count == 1U ||
-            endpoint_minus_observed <
-                lane.yardstick_endpoint_minus_observed_min_cycles) {
-          lane.yardstick_endpoint_minus_observed_min_cycles =
-              endpoint_minus_observed;
-        }
-        if (lane.yardstick_gate_agree_count == 1U ||
-            endpoint_minus_observed >
-                lane.yardstick_endpoint_minus_observed_max_cycles) {
-          lane.yardstick_endpoint_minus_observed_max_cycles =
-              endpoint_minus_observed;
-        }
-
-        // Anchor correction (agree seconds only).
-        lane.yardstick_auth_endpoint_q16 =
-            (uint64_t)((int64_t)lane.yardstick_auth_endpoint_q16 +
-                       (err_q16 >> OCXO_YARDSTICK_ANCHOR_P_SHIFT)) &
-            YARDSTICK_ENDPOINT_Q16_MASK;
-        const uint32_t anchor_i_shift =
-            lane.yardstick_auth_fast_lock_remaining_seconds > 0U
-                ? OCXO_YARDSTICK_ANCHOR_FAST_I_SHIFT
-                : OCXO_YARDSTICK_ANCHOR_I_SHIFT;
-        lane.yardstick_auth_interval_q16 =
-            (uint64_t)((int64_t)lane.yardstick_auth_interval_q16 +
-                       (err_q16 >> anchor_i_shift));
-        if (lane.yardstick_auth_fast_lock_remaining_seconds > 0U) {
-          lane.yardstick_auth_fast_lock_remaining_seconds--;
-        }
-        lane.yardstick_auth_anchor_correction_count++;
-        anchor_applied = true;
-
-        lane.yardstick_auth_agree_publish_count++;
-        reason = stale ? "ocxo_yardstick_stale_hold" : "ocxo_yardstick";
-        zw_kind = stale ? zero_worthy_second_kind_t::STALE
-                        : zero_worthy_second_kind_t::AGREE;
-      }
-      if (stale && !excursion) {
-        lane.yardstick_auth_stale_publish_count++;
-        reason = "ocxo_yardstick_stale_hold";
-      }
-    } else if (stale) {
-      lane.yardstick_auth_stale_publish_count++;
-      reason = "ocxo_yardstick_stale_hold";
-      zw_kind = zero_worthy_second_kind_t::NO_OBSERVED_INTERVAL;
-    } else {
-      reason = "ocxo_yardstick";
-      zw_kind = zero_worthy_second_kind_t::NO_OBSERVED_INTERVAL;
-    }
-
-    published_dwt =
-        (uint32_t)((lane.yardstick_auth_endpoint_q16 + 0x8000ULL) >> 16);
-    lane.yardstick_auth_publish_count++;
-    lane.yardstick_update_count++;
-  }
-
-  // Consume the yardstick step and advance this rail's observed baseline.
-  if (y_usable && pps_seq_delta != 0) {
-    lane.yardstick_last_used_pps_sequence = y.sequence;
-    lane.yardstick_last_used_pps_sequence_valid = true;
-  }
-  lane.yardstick_prev_observed_dwt = observed_dwt;
-  lane.yardstick_prev_observed_valid = true;
-
-  ocxo_lane_zero_worthy_update(lane, zw_kind, auth_error_cycles,
-                               zw_fast_lock_active);
-  smartzero2_system_update(y_usable ? y.sequence : 0U);
-
-  lane.yardstick_last_valid = lane.yardstick_chain_valid;
-  lane.yardstick_last_stale = stale;
-  lane.yardstick_last_excursion = excursion;
-  lane.yardstick_last_g_now_cycles = y_usable ? y.interval_now_cycles : 0U;
-  lane.yardstick_last_g_prev_cycles = y_usable ? y.interval_prev_cycles : 0U;
-  lane.yardstick_last_pps_seq_delta = pps_seq_delta;
-  lane.yardstick_last_inferred_interval_cycles = inferred_interval_rounded;
-  lane.yardstick_last_observed_interval_cycles = observed_interval;
-  lane.yardstick_last_inferred_minus_observed_cycles = inferred_minus_observed;
-  lane.yardstick_last_endpoint_minus_observed_cycles = endpoint_minus_observed;
-  lane.yardstick_auth_last_error_cycles = auth_error_cycles;
-  lane.yardstick_auth_last_published_dwt = published_dwt;
-
-  if (out_diag) {
-    out_diag->yardstick_valid = lane.yardstick_chain_valid;
-    out_diag->yardstick_stale = stale;
-    out_diag->yardstick_seeded_this_event = seeded;
-    out_diag->yardstick_excursion = excursion;
-    out_diag->yardstick_pps_sequence = y_usable ? y.sequence : 0U;
-    out_diag->yardstick_pps_seq_delta = pps_seq_delta;
-    out_diag->yardstick_g_now_cycles = y_usable ? y.interval_now_cycles : 0U;
-    out_diag->yardstick_g_prev_cycles = y_usable ? y.interval_prev_cycles : 0U;
-    out_diag->yardstick_inferred_interval_cycles = inferred_interval_rounded;
-    out_diag->yardstick_observed_interval_cycles = observed_interval;
-    out_diag->yardstick_inferred_minus_observed_cycles =
-        inferred_minus_observed;
-    out_diag->yardstick_inferred_endpoint_dwt =
-        (uint32_t)(lane.yardstick_chain_endpoint_q16 >> 16);
-    out_diag->yardstick_inferred_endpoint_frac_q16 =
-        (uint32_t)(lane.yardstick_chain_endpoint_q16 & 0xFFFFULL);
-    out_diag->yardstick_endpoint_minus_observed_cycles =
-        endpoint_minus_observed;
-    out_diag->yardstick_gate_threshold_cycles =
-        OCXO_YARDSTICK_GATE_THRESHOLD_CYCLES;
-    out_diag->yardstick_gate_agree_count = lane.yardstick_gate_agree_count;
-    out_diag->yardstick_gate_excursion_count =
-        lane.yardstick_gate_excursion_count;
-    out_diag->yardstick_authority = OCXO_YARDSTICK_DWT_AUTHORITY_ENABLED;
-    out_diag->yardstick_auth_endpoint_dwt =
-        (uint32_t)(lane.yardstick_auth_endpoint_q16 >> 16);
-    out_diag->yardstick_auth_endpoint_frac_q16 =
-        (uint32_t)(lane.yardstick_auth_endpoint_q16 & 0xFFFFULL);
-    out_diag->yardstick_auth_error_cycles = auth_error_cycles;
-    out_diag->yardstick_auth_anchor_applied = anchor_applied;
-  }
-
-  if (out_reason) *out_reason = reason;
-  return published_dwt;
-}
-
-static __attribute__((noinline)) void ocxo_apply_perishable_fact_deferred(
-    ocxo_runtime_context_t& ctx,
-    const interrupt_perishable_fact_t& fact) {
-  ocxo_lane_t* lane = ctx.lane;
-  if (!lane) return;
-
-  interrupt_subscriber_runtime_t* rt = ocxo_runtime_for(ctx);
-
-  const ocxo_perishable_ring_t& ring = ocxo_fact_ring_for(ctx);
-  lane->witness_fact_drain_count = ring.drain_count;
-  lane->witness_fact_overflow_count = ring.overflow_count;
-  lane->witness_fact_high_water = ring.high_water;
-  lane->witness_fact_asap_arm_count = ring.asap_arm_count;
-  lane->witness_fact_asap_fail_count = ring.asap_fail_count;
-
-  const int32_t correction_cycles =
-      dwt_cycles_for_ocxo_ticks_signed((int32_t)fact.service_offset_ticks);
-  const uint32_t corrected_dwt =
-      (uint32_t)((int64_t)fact.service_dwt_at_event -
-                 (int64_t)correction_cycles);
-
-  lane->witness_last_fact_sequence = fact.sequence;
-  lane->witness_last_fact_one_second_due = fact.one_second_due;
-  lane->witness_last_isr_csctrl_entry = fact.csctrl_entry;
-  lane->witness_last_isr_compare_flag_entry = fact.compare_flag_seen;
-  lane->witness_last_isr_compare_enabled_entry = fact.compare_enabled_entry;
-  lane->witness_last_irq_had_armed = fact.had_armed;
-  lane->witness_last_irq_had_active_rt = fact.had_active_rt;
-  lane->witness_last_target_low16 = fact.target_low16;
-  lane->witness_last_arm_dwt_raw = fact.arm_dwt_raw;
-  lane->witness_last_arm_counter32 = fact.target_counter32 - fact.arm_remaining_ticks;
-  lane->witness_last_arm_low16 = fact.arm_counter_low16;
-  lane->witness_last_arm_compare_low16 = fact.arm_compare_low16;
-  lane->witness_last_arm_counter_minus_compare_ticks =
-      fact.arm_counter_minus_compare_ticks;
-  lane->witness_last_arm_compare_remaining_ticks =
-      fact.arm_compare_remaining_ticks;
-  lane->witness_last_arm_target_counter32 = fact.target_counter32;
-  lane->witness_last_arm_target_low16 = fact.target_low16;
-  lane->witness_last_arm_remaining_ticks = fact.arm_remaining_ticks;
-  lane->witness_last_isr_counter_low16 = fact.service_counter_low16;
-  lane->witness_last_isr_compare_low16 = fact.service_compare_low16;
-  lane->witness_last_isr_counter_minus_compare_ticks =
-      fact.service_counter_minus_compare_ticks;
-  lane->witness_last_compare_delta_mod65536_ticks =
-      fact.compare_delta_mod65536_ticks;
-  lane->witness_last_compare_service_offset_signed_ticks =
-      (int32_t)fact.compare_service_offset_ticks;
-  lane->witness_last_compare_interpreted_late_ticks =
-      fact.compare_interpreted_late_ticks;
-  lane->witness_last_compare_early_ticks = fact.compare_early_ticks;
-  lane->witness_last_compare_arm_to_isr_ticks =
-      fact.compare_arm_to_isr_ticks;
-  lane->witness_last_target_delta_mod65536_ticks =
-      fact.target_delta_mod65536_ticks;
-  lane->witness_last_interpreted_late_ticks = fact.interpreted_late_ticks;
-  lane->witness_last_early_ticks = fact.early_ticks;
-  lane->witness_last_service_offset_signed_ticks =
-      (int32_t)fact.service_offset_ticks;
-  lane->witness_last_service_offset_abs_ticks = fact.service_offset_abs_ticks;
-  lane->witness_last_service_was_early = (fact.service_offset_ticks < 0);
-  lane->witness_last_service_was_on_or_after_target =
-      (fact.service_offset_ticks >= 0);
-  lane->witness_last_arm_to_isr_ticks = fact.arm_to_isr_ticks;
-  lane->witness_last_arm_to_isr_dwt_cycles = fact.arm_to_isr_dwt_cycles;
-  lane->witness_last_service_class = fact.service_class;
-  lane->witness_last_isr_csctrl_after_disable = fact.csctrl_after_disable;
-  lane->witness_last_isr_compare_flag_after_disable =
-      fact.compare_flag_after_disable;
-  lane->witness_last_isr_compare_enabled_after_disable =
-      fact.compare_enabled_after_disable;
-  lane->witness_last_service_correction_cycles = correction_cycles;
-  lane->witness_last_service_corrected_dwt = corrected_dwt;
-  lane->witness_last_late_ticks = fact.target_delta_mod65536_ticks;
-  lane->witness_last_event_published = false;
-
-  lane->witness_service_count++;
-  if (fact.service_class == OCXO_SERVICE_CLASS_FALSE_IRQ) {
-    lane->witness_false_irq_count++;
-  } else if (fact.service_offset_ticks < 0) {
-    lane->witness_early_service_count++;
-  } else {
-    lane->witness_on_or_after_service_count++;
-  }
-
-  // Linear regression is disabled and the OCXO per-sample forensic experiment
-  // has been retired from the hot path.  Only one-second rollover facts reach
-  // this foreground drain.
-
-  if (!fact.one_second_due || !rt || !rt->active) {
+  if (!interval_valid || expected_delta_ticks == 0U) {
+    state->skipped_count++;
+    state->last_sample_counted = false;
+    state->last_ok = false;
+    state->observed_minus_expected_ticks = 0;
     return;
   }
 
-  const uint32_t observed_dwt = corrected_dwt;
+  const int32_t error = observed_delta_ticks >= expected_delta_ticks
+      ? (int32_t)(observed_delta_ticks - expected_delta_ticks)
+      : -(int32_t)(expected_delta_ticks - observed_delta_ticks);
+  state->observed_minus_expected_ticks = error;
+  state->test_count++;
+  state->last_sample_counted = true;
+  const bool was_locked = state->locked;
+  const bool ok = error == 0;
+  state->last_ok = ok;
 
-  dwt_repair_diag_t dwt_diag{};
-  dwt_publication_diag_begin(dwt_diag,
-                             observed_dwt,
-                             fact.isr_entry_dwt_raw,
-                             "ocxo_observed");
-
-  // A skipped or duplicated one-second target is a custody discontinuity, not
-  // an interval sample.  Preserve this useful lineage evidence outside the
-  // retired predictor machinery.
-  const bool counter_adjacency_valid =
-      lane->witness_previous_event_counter32_valid;
-  const uint32_t counter_delta_ticks = counter_adjacency_valid
-      ? (fact.target_counter32 - lane->witness_previous_event_counter32)
-      : 0U;
-  ocxo_lane_counter_adjacency_note(*lane,
-                                   counter_adjacency_valid,
-                                   counter_delta_ticks,
-                                   &dwt_diag);
-
-  // PPS-Yardstick anchored rail remains as physics audit and zero-worthiness
-  // evidence.  Publication below deliberately uses the latency-adjusted
-  // observed endpoint; FloorLine is diagnostic-only.
-  const char* yardstick_reason = "ocxo_yardstick_init";
-  const uint32_t yardstick_published_dwt = ocxo_lane_yardstick_observe(
-      *lane, observed_dwt, counter_adjacency_valid, counter_delta_ticks,
-      &dwt_diag, &yardstick_reason);
-  (void)yardstick_published_dwt;
-
-  cadence_regression_result_t lower_env{};
-  (void)cadence_regression_result_for_bookend(ctx.kind,
-                                              observed_dwt,
-                                              fact.target_counter32,
-                                              &lower_env);
-  copy_floorline_interval_to_diag(dwt_diag, lower_env);
-  const uint32_t published_dwt =
-      ocxo_published_dwt_at_edge(observed_dwt, lower_env);
-
-  // Truthful authority audit.  OCXO publication is the latency-adjusted
-  // observed endpoint. FloorLine, yardstick, and counter adjacency remain
-  // evidence only.
-  dwt_publication_diag_choose(dwt_diag,
-                              published_dwt,
-                              observed_dwt,
-                              LOWER_ENV_PUBLISH_HARD_EDGE_GATE_CYCLES,
-                              "ocxo_observed");
-  dwt_diag.yardstick_authority = false;
-
-  if (!lower_env_raw_bookend_watchdog_if_pending(
-          ctx.kind,
-          lower_env,
-          dwt_diag,
-          "ocxo_fact_drain")) {
-    return;
-  }
-
-  dwt_publication_request_t publication{};
-  publication.kind = ctx.kind;
-  publication.sequence = fact.sequence;
-  publication.published_dwt = published_dwt;
-  publication.observed_dwt = observed_dwt;
-  publication.expected_published_dwt = observed_dwt;
-  publication.target_counter32 = fact.target_counter32;
-  publication.target_low16 = fact.target_low16;
-  publication.service_low16_valid = true;
-  publication.service_low16 = fact.service_counter_low16;
-  publication.capture_authored_dwt = fact.authored_dwt_at_event;
-  publication.capture_raw_event_dwt = fact.service_dwt_at_event;
-  publication.capture_isr_entry_dwt_raw = fact.isr_entry_dwt_raw;
-  publication.capture_arm_dwt_raw = fact.arm_dwt_raw;
-  publication.capture_arm_to_isr_ticks = fact.arm_to_isr_ticks;
-  publication.capture_arm_to_isr_dwt_cycles = fact.arm_to_isr_dwt_cycles;
-  publication.capture_service_offset_ticks = (int32_t)fact.service_offset_ticks;
-  publication.capture_service_correction_cycles = correction_cycles;
-  publication.capture_service_counter_low16 = fact.service_counter_low16;
-  publication.capture_service_compare_low16 = fact.service_compare_low16;
-  publication.capture_service_counter_minus_compare_ticks =
-      fact.service_counter_minus_compare_ticks;
-  publication.capture_compare_delta_mod65536_ticks =
-      fact.compare_delta_mod65536_ticks;
-  publication.capture_target_delta_mod65536_ticks =
-      fact.target_delta_mod65536_ticks;
-  publication.capture_interpreted_late_ticks = fact.interpreted_late_ticks;
-  publication.capture_early_ticks = fact.early_ticks;
-  publication.capture_service_offset_abs_ticks = fact.service_offset_abs_ticks;
-  publication.floorline = &lower_env;
-  publication.repair = &dwt_diag;
-  if (!dwt_publication_adjudicate_or_watchdog(publication, dwt_diag)) {
-    return;
-  }
-
-  const bool published_synthetic = (published_dwt != observed_dwt);
-
-  const uint32_t dwt_coordinate_source = published_synthetic
-      ? OCXO_DWT_SOURCE_FLOORLINE
-      : OCXO_DWT_SOURCE_ISR_ENTRY;
-
-  ocxo_qtimer_diag_record(ctx,
-                          fact.isr_entry_dwt_raw,
-                          published_dwt,
-                          fact.target_delta_mod65536_ticks,
-                          fact.interpreted_late_ticks,
-                          fact.early_ticks,
-                          (int32_t)fact.service_offset_ticks,
-                          fact.service_offset_abs_ticks,
-                          fact.target_delta_mod65536_ticks,
-                          fact.target_low16,
-                          fact.service_counter_low16,
-                          dwt_coordinate_source);
-
-  lane->witness_fire_count++;
-  lane->irq_count++;
-  lane->logical_count32_at_last_second = fact.target_counter32;
-
-  lane->witness_last_event_dwt = published_dwt;
-  lane->witness_last_event_counter32 = fact.target_counter32;
-  lane->witness_last_event_published = true;
-  lane->witness_valid_publish_count++;
-  if (fact.service_offset_ticks < 0) {
-    lane->witness_early_service_published_count++;
-  }
-
-  if (lane->witness_previous_event_counter32_valid) {
-    const uint32_t delta =
-        fact.target_counter32 - lane->witness_previous_event_counter32;
-    lane->witness_last_counter_delta_ticks = delta;
-    if (delta != OCXO_WITNESS_ONE_SECOND_COUNTS) {
-      lane->witness_counter_delta_violation_count++;
-      lane->witness_last_bad_counter_delta = delta;
+  if (ok) {
+    state->ok_count++;
+    if (state->consecutive_ok_count != UINT32_MAX) {
+      state->consecutive_ok_count++;
     }
+    if (was_locked) state->post_lock_ok_count++;
+    else state->prelock_ok_count++;
   } else {
-    lane->witness_last_counter_delta_ticks = 0;
+    state->bad_count++;
+    state->consecutive_ok_count = 0;
+    if (state->first_bad_sequence == 0U) {
+      state->first_bad_sequence = sequence;
+    }
+    state->last_bad_sequence = sequence;
+    state->last_bad_observed_delta_ticks = observed_delta_ticks;
+    state->last_bad_expected_delta_ticks = expected_delta_ticks;
+    state->last_bad_observed_minus_expected_ticks = error;
+    if (was_locked) state->post_lock_bad_count++;
+    else state->prelock_bad_count++;
   }
-  lane->witness_previous_event_counter32 = fact.target_counter32;
-  lane->witness_previous_event_counter32_valid = true;
 
-  // Prepare an immutable subscriber tuple now, but run the CLOCKS callback in
-  // a later ASAP pass after this fact-drain frame has unwound.
-  emit_one_second_event(*rt,
-                        published_dwt,
-                        fact.target_counter32,
-                        0,
-                        false,
-                        &dwt_diag,
-                        &lower_env);
-
-}
-
-static __attribute__((noinline)) void ocxo_fact_drain_lane(
-    ocxo_runtime_context_t& ctx) {
-  for (;;) {
-    interrupt_perishable_fact_t fact{};
-    if (!ocxo_fact_ring_pop(ctx, fact)) break;
-    ocxo_apply_perishable_fact_deferred(ctx, fact);
+  if (!was_locked && ok &&
+      state->consecutive_ok_count >= COUNTER32_LINEAGE_LOCK_STREAK) {
+    state->locked = true;
+    state->lock_sequence = sequence;
+    state->lock_count++;
   }
 }
 
-static __attribute__((noinline)) void ocxo1_fact_drain_callback(
-    timepop_ctx_t*,
-    timepop_diag_t*,
-    void*) {
-  ocxo_fact_drain_lane(g_ocxo1_ctx);
+void interrupt_integrity_note_vclock_pps_interval(
+    uint32_t sequence,
+    bool pps_interval_valid,
+    uint32_t pps_interval_cycles,
+    bool vclock_interval_valid,
+    uint32_t vclock_interval_cycles) {
+  interrupt_integrity_interval_check_t& state =
+      g_interrupt_integrity.vclock_pps_interval;
+  state.valid = true;
+  state.sequence = sequence;
+  state.gate_cycles = 10U;
+  state.pps_interval_valid = pps_interval_valid;
+  state.vclock_interval_valid = vclock_interval_valid;
+  state.pps_interval_cycles = pps_interval_valid ? pps_interval_cycles : 0U;
+  state.vclock_interval_cycles =
+      vclock_interval_valid ? vclock_interval_cycles : 0U;
+  if (!pps_interval_valid || !vclock_interval_valid ||
+      pps_interval_cycles == 0U || vclock_interval_cycles == 0U) {
+    state.skipped_count++;
+    state.last_ok = false;
+    state.vclock_minus_pps_cycles = 0;
+    return;
+  }
+  const int32_t delta = vclock_interval_cycles >= pps_interval_cycles
+      ? (int32_t)(vclock_interval_cycles - pps_interval_cycles)
+      : -(int32_t)(pps_interval_cycles - vclock_interval_cycles);
+  state.vclock_minus_pps_cycles = delta;
+  state.test_count++;
+  state.last_ok = interrupt_abs_i32(delta) <= state.gate_cycles;
+  if (state.last_ok) state.ok_count++;
+  else state.bad_count++;
 }
 
-static __attribute__((noinline)) void ocxo2_fact_drain_callback(
-    timepop_ctx_t*,
-    timepop_diag_t*,
-    void*) {
-  ocxo_fact_drain_lane(g_ocxo2_ctx);
+static void integrity_note_dwt_interval(interrupt_subscriber_kind_t kind,
+                                        uint32_t sequence,
+                                        uint32_t target_counter32,
+                                        uint32_t dwt_at_match) {
+  interrupt_integrity_qtimer_dwt_match_check_t* match =
+      integrity_dwt_for(kind);
+  if (!match) return;
+  match->valid = true;
+  match->sequence = sequence;
+  match->target_counter32 = target_counter32;
+  match->dwt_at_match = dwt_at_match;
+  match->one_second_boundary = true;
+
+  // The historical 1 kHz member remains an ABI shell and is never authored.
+  interrupt_integrity_qtimer_dwt_interval_check_t& state = match->one_second;
+  state.valid = true;
+  state.sequence = sequence;
+  state.target_counter32 = target_counter32;
+  state.dwt_at_match = dwt_at_match;
+  state.gate_cycles = QTIMER_DWT_MATCH_GATE_CYCLES;
+  state.lock_streak_required = QTIMER_DWT_1S_LOCK_STREAK;
+  state.ruler_qualified = true;
+
+  if (!state.previous_valid) {
+    state.previous_valid = true;
+    state.previous_sequence = sequence;
+    state.previous_target_counter32 = target_counter32;
+    state.previous_dwt_at_match = dwt_at_match;
+    state.skipped_count++;
+    state.last_ok = false;
+    return;
+  }
+
+  const uint32_t prior_sequence = state.previous_sequence;
+  const uint32_t prior_target = state.previous_target_counter32;
+  const uint32_t prior_dwt = state.previous_dwt_at_match;
+  const uint32_t target_delta = target_counter32 - prior_target;
+  const uint32_t observed_cycles = dwt_at_match - prior_dwt;
+  const uint32_t cps = interrupt_vclock_cycles_per_second();
+  const uint32_t expected_cycles = target_delta == OCXO_ONE_SECOND_TICKS
+      ? cps
+      : (uint32_t)(((uint64_t)cps * (uint64_t)target_delta +
+                    (uint64_t)OCXO_ONE_SECOND_TICKS / 2ULL) /
+                   (uint64_t)OCXO_ONE_SECOND_TICKS);
+
+  state.previous_sequence = sequence;
+  state.previous_target_counter32 = target_counter32;
+  state.previous_dwt_at_match = dwt_at_match;
+  state.interval_previous_sequence = prior_sequence;
+  state.interval_previous_target_counter32 = prior_target;
+  state.interval_previous_dwt_at_match = prior_dwt;
+  state.target_delta_ticks = target_delta;
+  state.observed_cycles = observed_cycles;
+  state.expected_cycles = expected_cycles;
+
+  if (target_delta == 0U || expected_cycles == 0U) {
+    state.skipped_count++;
+    state.last_ok = false;
+    return;
+  }
+
+  const int64_t error64 = (int64_t)(uint64_t)observed_cycles -
+                          (int64_t)(uint64_t)expected_cycles;
+  const int32_t error = error64 > INT32_MAX
+      ? INT32_MAX
+      : (error64 < INT32_MIN ? INT32_MIN : (int32_t)error64);
+  const uint32_t abs_error = interrupt_abs_i32(error);
+  const bool was_locked = state.locked;
+  const bool ok = abs_error <= state.gate_cycles;
+  state.error_cycles = error;
+  state.abs_error_cycles = abs_error;
+  state.test_count++;
+  state.last_ok = ok;
+
+  if (ok) {
+    state.match_count++;
+    if (state.consecutive_ok_count != UINT32_MAX) {
+      state.consecutive_ok_count++;
+    }
+    if (was_locked) state.post_lock_match_count++;
+    else state.prelock_match_count++;
+  } else {
+    state.mismatch_count++;
+    state.consecutive_ok_count = 0;
+    if (error < -(int32_t)state.gate_cycles) state.too_short_count++;
+    if (error > (int32_t)state.gate_cycles) state.too_long_count++;
+    if (state.first_mismatch_sequence == 0U) {
+      state.first_mismatch_sequence = sequence;
+    }
+    state.last_mismatch_sequence = sequence;
+    state.last_mismatch_error_cycles = error;
+    state.last_mismatch_observed_cycles = observed_cycles;
+    state.last_mismatch_expected_cycles = expected_cycles;
+    if (was_locked) state.post_lock_mismatch_count++;
+    else state.prelock_mismatch_count++;
+  }
+
+  if (!was_locked && ok &&
+      state.consecutive_ok_count >= QTIMER_DWT_1S_LOCK_STREAK) {
+    state.locked = true;
+    state.lock_sequence = sequence;
+    state.lock_count++;
+  }
 }
 
-struct ocxo_cadence_isr_sample_t {
-  interrupt_subscriber_runtime_t* rt = nullptr;
+bool interrupt_integrity_snapshot(interrupt_integrity_snapshot_t* out) {
+  if (!out) return false;
+  g_interrupt_integrity.snapshot_count++;
+  g_interrupt_integrity.valid =
+      g_interrupt_integrity.vclock_counter.valid ||
+      g_interrupt_integrity.ocxo1_counter.valid ||
+      g_interrupt_integrity.ocxo2_counter.valid ||
+      g_interrupt_integrity.vclock_qtimer_dwt.valid ||
+      g_interrupt_integrity.ocxo1_qtimer_dwt.valid ||
+      g_interrupt_integrity.ocxo2_qtimer_dwt.valid ||
+      g_interrupt_integrity.vclock_pps_interval.valid;
+  g_interrupt_integrity_report_scratch = g_interrupt_integrity;
+  *out = g_interrupt_integrity_report_scratch;
+  return out->valid;
+}
 
-  uint32_t isr_entry_dwt_raw = 0;
-  uint32_t isr_csctrl_entry = 0;
-  uint32_t isr_csctrl_after_program = 0;
-  uint32_t raw_event_dwt = 0;
-  uint32_t event_dwt = 0;
+// ============================================================================
+// One-second SmartZero proof
+// ============================================================================
 
-  bool had_armed = false;
-  bool had_active_rt = false;
-  bool lane_active = false;
-  bool was_smartzero_current = false;
-
-  uint32_t target_counter32 = 0;
-  uint16_t target_low16 = 0;
-  uint16_t arm_counter_low16 = 0;
-  uint16_t arm_compare_low16 = 0;
-  uint32_t arm_counter_minus_compare_ticks = 0;
-  uint32_t arm_compare_remaining_ticks = 0;
-  uint16_t service_counter_low16 = 0;
-  uint16_t service_compare_low16 = 0;
-  uint32_t service_counter_minus_compare_ticks = 0;
-  uint32_t target_delta_mod65536_ticks = 0;
-  uint32_t compare_delta_mod65536_ticks = 0;
-
-  int16_t service_offset_signed_ticks = 0;
-  int16_t compare_service_offset_signed_ticks = 0;
-  uint32_t compare_interpreted_late_ticks = 0;
-  uint32_t compare_early_ticks = 0;
-  uint32_t compare_arm_to_isr_ticks = 0;
-  bool service_was_early = false;
-  uint32_t early_ticks = 0;
-  uint32_t interpreted_late_ticks = 0;
-  uint32_t service_offset_abs_ticks = 0;
-
-  uint32_t arm_dwt_raw = 0;
-  uint32_t arm_remaining_ticks = 0;
-  uint32_t arm_to_isr_ticks = 0;
-  uint32_t arm_to_isr_dwt_cycles = 0;
-
-  bool one_second_due = false;
+struct smartzero_lane_runtime_t {
+  interrupt_smartzero_lane_snapshot_t pub{};
+  bool previous_present = false;
 };
 
+struct smartzero_runtime_t {
+  volatile uint32_t seq = 0;
+  interrupt_smartzero_phase_t phase = interrupt_smartzero_phase_t::IDLE;
+  bool running = false;
+  bool complete = false;
+  uint32_t sequence = 0;
+  uint32_t begin_count = 0;
+  uint32_t complete_count = 0;
+  uint32_t abort_count = 0;
+  uint32_t current_lane_index = 0;
+  smartzero_lane_runtime_t lanes[SMARTZERO_LANE_COUNT]{};
+};
+
+static smartzero_runtime_t g_smartzero{};
+
+static interrupt_subscriber_kind_t smartzero_kind_for_index(uint32_t index) {
+  switch (index) {
+    case 0: return interrupt_subscriber_kind_t::VCLOCK;
+    case 1: return interrupt_subscriber_kind_t::OCXO1;
+    case 2: return interrupt_subscriber_kind_t::OCXO2;
+    default: return interrupt_subscriber_kind_t::NONE;
+  }
+}
+
+static int smartzero_index_for_kind(interrupt_subscriber_kind_t kind) {
+  if (kind == interrupt_subscriber_kind_t::VCLOCK) return 0;
+  if (kind == interrupt_subscriber_kind_t::OCXO1) return 1;
+  if (kind == interrupt_subscriber_kind_t::OCXO2) return 2;
+  return -1;
+}
+
+static inline void smartzero_write_begin(void) {
+  g_smartzero.seq++;
+  dmb_barrier();
+}
+
+static inline void smartzero_write_end(void) {
+  dmb_barrier();
+  g_smartzero.seq++;
+}
+
+static void smartzero_reset_lane(uint32_t index) {
+  smartzero_lane_runtime_t& runtime = g_smartzero.lanes[index];
+  runtime = smartzero_lane_runtime_t{};
+  runtime.pub.kind = smartzero_kind_for_index(index);
+  runtime.pub.state = interrupt_smartzero_lane_state_t::IDLE;
+  runtime.pub.last_decision = interrupt_smartzero_decision_t::NONE;
+  runtime.pub.tolerance_cycles = SMARTZERO_ONE_SECOND_TOLERANCE_CYCLES;
+  runtime.pub.required_counter_delta_ticks = OCXO_ONE_SECOND_TICKS;
+}
+
+static bool smartzero_is_current_lane(interrupt_subscriber_kind_t kind) {
+  for (uint32_t attempt = 0; attempt < 2U; ++attempt) {
+    const uint32_t seq1 = g_smartzero.seq;
+    if (seq1 & 1U) continue;
+    dmb_barrier();
+    const bool running = g_smartzero.running;
+    const bool complete = g_smartzero.complete;
+    const uint32_t lane_index = g_smartzero.current_lane_index;
+    dmb_barrier();
+    const uint32_t seq2 = g_smartzero.seq;
+    if (seq1 == seq2 && (seq2 & 1U) == 0U) {
+      return running && !complete &&
+          smartzero_kind_for_index(lane_index) == kind;
+    }
+  }
+  return false;
+}
+
+static void smartzero_advance_or_complete(void) {
+  uint32_t next = g_smartzero.current_lane_index + 1U;
+  while (next < SMARTZERO_LANE_COUNT) {
+    const interrupt_subscriber_kind_t kind = smartzero_kind_for_index(next);
+    if (!ocxo_kind_disabled(kind)) break;
+    ++next;
+  }
+  if (next >= SMARTZERO_LANE_COUNT) {
+    g_smartzero.running = false;
+    g_smartzero.complete = true;
+    g_smartzero.phase = interrupt_smartzero_phase_t::COMPLETE;
+    g_smartzero.complete_count++;
+    return;
+  }
+  g_smartzero.current_lane_index = next;
+  smartzero_lane_runtime_t& runtime = g_smartzero.lanes[next];
+  runtime.previous_present = false;
+  runtime.pub.state = interrupt_smartzero_lane_state_t::ACQUIRING;
+  runtime.pub.last_decision = interrupt_smartzero_decision_t::NONE;
+}
+
+static void smartzero_feed_one_second(interrupt_subscriber_kind_t kind,
+                                      uint32_t dwt_at_event,
+                                      uint32_t counter32_at_event,
+                                      uint16_t target_low16) {
+  if (!smartzero_is_current_lane(kind)) return;
+  const int index = smartzero_index_for_kind(kind);
+  if (index < 0) return;
+
+  const uint32_t expected_cycles = interrupt_vclock_cycles_per_second();
+  smartzero_write_begin();
+  smartzero_lane_runtime_t& runtime = g_smartzero.lanes[index];
+  interrupt_smartzero_lane_snapshot_t& lane = runtime.pub;
+  lane.state = interrupt_smartzero_lane_state_t::ACQUIRING;
+  lane.sample_count++;
+  lane.cps_used = expected_cycles;
+  lane.expected_interval_cycles = expected_cycles;
+  lane.last_sample_dwt = dwt_at_event;
+  lane.last_sample_counter32 = counter32_at_event;
+  lane.last_sample_hardware16 = target_low16;
+
+  if (expected_cycles == 0U) {
+    lane.waiting_for_cps_count++;
+    lane.last_decision = interrupt_smartzero_decision_t::WAITING_FOR_CPS;
+    runtime.previous_present = false;
+    smartzero_write_end();
+    return;
+  }
+
+  if (!runtime.previous_present) {
+    lane.previous_sample_dwt = dwt_at_event;
+    lane.previous_sample_counter32 = counter32_at_event;
+    lane.previous_sample_hardware16 = target_low16;
+    lane.last_decision = interrupt_smartzero_decision_t::FIRST_SAMPLE;
+    runtime.previous_present = true;
+    smartzero_write_end();
+    return;
+  }
+
+  const uint32_t interval_cycles =
+      dwt_at_event - lane.previous_sample_dwt;
+  const uint32_t counter_delta =
+      counter32_at_event - lane.previous_sample_counter32;
+  const int32_t error = (int32_t)((int64_t)interval_cycles -
+                                  (int64_t)expected_cycles);
+  const uint32_t abs_error = interrupt_abs_i32(error);
+  lane.interval_attempt_count++;
+  lane.last_interval_cycles = interval_cycles;
+  lane.last_interval_error_cycles = error;
+  lane.last_counter_delta_ticks = counter_delta;
+  if (abs_error > lane.max_abs_interval_error_cycles) {
+    lane.max_abs_interval_error_cycles = abs_error;
+  }
+
+  const bool counter_ok = counter_delta == OCXO_ONE_SECOND_TICKS;
+  const bool dwt_ok =
+      abs_error <= (uint32_t)SMARTZERO_ONE_SECOND_TOLERANCE_CYCLES;
+  if (counter_ok && dwt_ok) {
+    lane.accepted_count++;
+    lane.state = interrupt_smartzero_lane_state_t::LOCKED;
+    lane.last_decision = interrupt_smartzero_decision_t::ACCEPTED;
+    lane.anchor_dwt = dwt_at_event;
+    lane.anchor_counter32 = counter32_at_event;
+    lane.anchor_hardware16 = target_low16;
+    lane.anchor_pair_previous_dwt = lane.previous_sample_dwt;
+    lane.anchor_pair_previous_counter32 = lane.previous_sample_counter32;
+    smartzero_advance_or_complete();
+    smartzero_write_end();
+    return;
+  }
+
+  lane.rejected_count++;
+  lane.last_decision = counter_ok
+      ? interrupt_smartzero_decision_t::REJECTED_DWT
+      : interrupt_smartzero_decision_t::REJECTED_COUNTER;
+  lane.previous_sample_dwt = dwt_at_event;
+  lane.previous_sample_counter32 = counter32_at_event;
+  lane.previous_sample_hardware16 = target_low16;
+  smartzero_write_end();
+}
+
+bool interrupt_smartzero_begin(void) {
+  if (!g_interrupt_runtime_ready || !g_interrupt_hw_ready) return false;
+  const uint32_t prior = interrupt_priority0_guard_enter();
+  smartzero_write_begin();
+  g_smartzero.running = true;
+  g_smartzero.complete = false;
+  g_smartzero.phase = interrupt_smartzero_phase_t::RUNNING;
+  g_smartzero.sequence++;
+  g_smartzero.begin_count++;
+  g_smartzero.current_lane_index = 0U;
+  for (uint32_t i = 0; i < SMARTZERO_LANE_COUNT; ++i) {
+    smartzero_reset_lane(i);
+  }
+  g_smartzero.lanes[0].pub.state =
+      interrupt_smartzero_lane_state_t::ACQUIRING;
+  smartzero_write_end();
+  interrupt_priority0_guard_exit(prior);
+  return true;
+}
+
+void interrupt_smartzero_abort(void) {
+  const uint32_t prior = interrupt_priority0_guard_enter();
+  smartzero_write_begin();
+  g_smartzero.running = false;
+  g_smartzero.complete = false;
+  g_smartzero.phase = interrupt_smartzero_phase_t::ABORTED;
+  g_smartzero.abort_count++;
+  g_smartzero.current_lane_index = SMARTZERO_LANE_COUNT;
+  for (uint32_t i = 0; i < SMARTZERO_LANE_COUNT; ++i) {
+    smartzero_reset_lane(i);
+  }
+  smartzero_write_end();
+  interrupt_priority0_guard_exit(prior);
+}
+
+bool interrupt_smartzero_running(void) {
+  return g_smartzero.running && !g_smartzero.complete;
+}
+
+bool interrupt_smartzero_complete(void) {
+  return g_smartzero.complete;
+}
+
+static bool smartzero_snapshot_load(interrupt_smartzero_snapshot_t* out) {
+  if (!out) return false;
+  for (uint32_t attempt = 0; attempt < 4U; ++attempt) {
+    const uint32_t seq1 = g_smartzero.seq;
+    if (seq1 & 1U) continue;
+    dmb_barrier();
+    interrupt_smartzero_snapshot_t local{};
+    local.phase = g_smartzero.phase;
+    local.running = g_smartzero.running;
+    local.complete = g_smartzero.complete;
+    local.aborted = g_smartzero.phase == interrupt_smartzero_phase_t::ABORTED;
+    local.sequence = g_smartzero.sequence;
+    local.begin_count = g_smartzero.begin_count;
+    local.complete_count = g_smartzero.complete_count;
+    local.abort_count = g_smartzero.abort_count;
+    local.current_lane_index = g_smartzero.current_lane_index;
+    local.current_lane = g_smartzero.running
+        ? smartzero_kind_for_index(g_smartzero.current_lane_index)
+        : interrupt_subscriber_kind_t::NONE;
+    local.tolerance_cycles = SMARTZERO_ONE_SECOND_TOLERANCE_CYCLES;
+    local.sample_rate_hz = 1U;
+    local.counter_delta_ticks = OCXO_ONE_SECOND_TICKS;
+    for (uint32_t i = 0; i < SMARTZERO_LANE_COUNT; ++i) {
+      local.lanes[i] = g_smartzero.lanes[i].pub;
+    }
+    dmb_barrier();
+    const uint32_t seq2 = g_smartzero.seq;
+    if (seq1 == seq2 && (seq2 & 1U) == 0U) {
+      *out = local;
+      return true;
+    }
+  }
+  *out = interrupt_smartzero_snapshot_t{};
+  return false;
+}
+
+bool interrupt_smartzero_live_snapshot(interrupt_smartzero_snapshot_t* out) {
+  return smartzero_snapshot_load(out) && out->complete;
+}
+
+bool interrupt_smartzero_snapshot(interrupt_smartzero_snapshot_t* out) {
+  return interrupt_smartzero_live_snapshot(out);
+}
+
 // ============================================================================
-// Priority handoff tier — reentry-safe capture packets
+// QTimer helpers and authored one-second target custody
 // ============================================================================
-//
-// Priority-0 ISRs capture immutable packets only.  The handoff tier runs at
-// priority 16 and performs the former ISR continuation work: event authorship,
-// rollover tending, SmartZero feed/rearm, TimePop delivery, and ASAP drain
-// arming.  Per-source rings make priority-0 capture reentry-safe: a later
-// interrupt cannot overwrite an earlier packet before the handoff tier owns it.
+
+static inline void qtimer_clear_compare_flag(IMXRT_TMR_t& module,
+                                              uint8_t channel) {
+  module.CH[channel].CSCTRL &= ~(TMR_CSCTRL_TCF1 | TMR_CSCTRL_TCF2);
+  (void)module.CH[channel].CSCTRL;
+}
+
+static inline void qtimer_program_compare(IMXRT_TMR_t& module,
+                                          uint8_t channel,
+                                          uint16_t target_low16) {
+  qtimer_clear_compare_flag(module, channel);
+  module.CH[channel].COMP1 = target_low16;
+  module.CH[channel].CMPLD1 = target_low16;
+  qtimer_clear_compare_flag(module, channel);
+  module.CH[channel].CSCTRL |= TMR_CSCTRL_TCF1EN;
+}
+
+static inline void qtimer_disable_compare(IMXRT_TMR_t& module,
+                                          uint8_t channel) {
+  module.CH[channel].CSCTRL &= ~TMR_CSCTRL_TCF1EN;
+  qtimer_clear_compare_flag(module, channel);
+  qtimer_clear_compare_flag(module, channel);
+}
+
+static inline uint16_t qtimer1_ch0_counter_now(void) {
+  return IMXRT_TMR1.CH[QTIMER1_VCLOCK_CH].CNTR;
+}
+
+static inline void qtimer1_vclock_program_compare(uint16_t target_low16) {
+  qtimer_program_compare(IMXRT_TMR1, QTIMER1_VCLOCK_CH, target_low16);
+}
+
+static inline void qtimer1_vclock_clear_compare_flag(void) {
+  qtimer_clear_compare_flag(IMXRT_TMR1, QTIMER1_VCLOCK_CH);
+}
+
+static inline void qtimer1_ch2_program_compare(uint16_t target_low16) {
+  qtimer_program_compare(IMXRT_TMR1, QTIMER1_TIMEPOP_CH, target_low16);
+}
+
+static inline void qtimer1_ch2_clear_compare_flag(void) {
+  qtimer_clear_compare_flag(IMXRT_TMR1, QTIMER1_TIMEPOP_CH);
+}
+
+static inline uint16_t ocxo_counter_now(const ocxo_lane_t& lane) {
+  return lane.module->CH[lane.channel].CNTR;
+}
+
+static void ocxo_disable_compare(ocxo_lane_t& lane) {
+  qtimer_disable_compare(*lane.module, lane.channel);
+  lane.compare_armed = false;
+  lane.armed_target_counter32 = 0U;
+  lane.armed_target_low16 = 0U;
+}
+
+static uint16_t ocxo_hardware_low16_for_target(
+    const synthetic_clock32_t& clock,
+    uint32_t target_counter32) {
+  return (uint16_t)(clock.hardware16 +
+                    (uint16_t)(target_counter32 -
+                               clock.current_counter32));
+}
+
+static bool ocxo_target_is_due_or_behind(uint32_t current_counter32,
+                                         uint32_t target_counter32) {
+  const uint32_t remaining = target_counter32 - current_counter32;
+  return remaining == 0U || remaining > 0x7FFFFFFFUL;
+}
+
+static void ocxo_tend_and_arm(ocxo_runtime_context_t& ctx) {
+  ocxo_lane_t& lane = *ctx.lane;
+  synthetic_clock32_t& clock = *ctx.clock32;
+  if (!lane.initialized) return;
+
+  const uint16_t ambient_low16 = ocxo_counter_now(lane);
+  synthetic_clock_tend_from_hardware(clock, ambient_low16);
+  lane.rollover_tend_count++;
+  lane.last_ambient_low16 = ambient_low16;
+
+  if (!lane.active || !lane.target_grid_valid || lane.compare_armed) return;
+
+  while (ocxo_target_is_due_or_behind(clock.current_counter32,
+                                      lane.next_target_counter32)) {
+    lane.next_target_counter32 += OCXO_ONE_SECOND_TICKS;
+    lane.missed_target_count++;
+  }
+
+  const uint32_t remaining =
+      lane.next_target_counter32 - clock.current_counter32;
+  if (remaining > OCXO_ARM_WINDOW_TICKS) {
+    lane.arm_window_wait_count++;
+    return;
+  }
+  if (remaining < OCXO_MIN_ARM_LEAD_TICKS) {
+    lane.arm_too_close_count++;
+    lane.missed_target_count++;
+    lane.next_target_counter32 += OCXO_ONE_SECOND_TICKS;
+    return;
+  }
+
+  const uint16_t target_low16 =
+      ocxo_hardware_low16_for_target(clock, lane.next_target_counter32);
+  lane.last_arm_dwt = ARM_DWT_CYCCNT;
+  lane.last_arm_counter32 = clock.current_counter32;
+  lane.last_arm_hardware16 = clock.hardware16;
+  lane.last_arm_remaining_ticks = remaining;
+  lane.armed_target_counter32 = lane.next_target_counter32;
+  lane.armed_target_low16 = target_low16;
+  qtimer_program_compare(*lane.module, lane.channel, target_low16);
+  lane.compare_armed = true;
+  lane.arm_count++;
+}
+
+static bool ocxo_start_one_second_service(ocxo_runtime_context_t& ctx) {
+  ocxo_lane_t& lane = *ctx.lane;
+  synthetic_clock32_t& clock = *ctx.clock32;
+  if (!lane.initialized) return false;
+  lane.active = true;
+  if (!clock.zeroed) synthetic_clock_birth(clock, ocxo_counter_now(lane));
+  if (!lane.target_grid_valid) {
+    lane.grid_epoch_counter32 = clock.current_counter32;
+    lane.next_target_counter32 =
+        clock.current_counter32 + OCXO_ONE_SECOND_TICKS;
+    lane.target_grid_valid = true;
+  }
+  ocxo_tend_and_arm(ctx);
+  interrupt_features_note_ocxo_custody();
+  // A target several months of CPU cycles away is intentionally not armed yet;
+  // VCLOCK will tend it into the safe 16-bit programming window.
+  return true;
+}
+
+static void ocxo_stop_one_second_service(ocxo_runtime_context_t& ctx) {
+  ocxo_lane_t& lane = *ctx.lane;
+  lane.active = false;
+  if (lane.initialized) ocxo_disable_compare(lane);
+}
+
+// ============================================================================
+// Clock API
+// ============================================================================
+
+bool interrupt_clock32_zero_from_ns(interrupt_subscriber_kind_t kind,
+                                    uint64_t ns) {
+  if (kind == interrupt_subscriber_kind_t::VCLOCK) {
+    const uint16_t hardware16 = qtimer1_ch0_counter_now();
+    synthetic_clock_zero(g_vclock_clock32, ns);
+    g_vclock_clock32.hardware_low16_at_zero = hardware16;
+    vclock_anchor_hardware(g_vclock_clock32.zero_counter32, hardware16);
+    g_vclock_lane.one_second_grid_valid = false;
+    return true;
+  }
+
+  ocxo_runtime_context_t* ctx = ocxo_context_for(kind);
+  if (!ctx || !ctx->lane->initialized) return false;
+  const uint16_t hardware16 = ocxo_counter_now(*ctx->lane);
+  synthetic_clock_zero(*ctx->clock32, ns);
+  ctx->clock32->hardware16 = hardware16;
+  ctx->lane->grid_epoch_counter32 = ctx->clock32->current_counter32;
+  ctx->lane->next_target_counter32 =
+      ctx->clock32->current_counter32 + OCXO_ONE_SECOND_TICKS;
+  ctx->lane->target_grid_valid = true;
+  if (ctx->lane->compare_armed) ocxo_disable_compare(*ctx->lane);
+  return true;
+}
+
+bool interrupt_clock32_request_zero_from_ns(interrupt_subscriber_kind_t kind,
+                                            uint64_t ns) {
+  if (kind == interrupt_subscriber_kind_t::VCLOCK) {
+    g_vclock_clock32.pending_zero = true;
+    g_vclock_clock32.pending_zero_ns = ns;
+    g_vclock_clock32.pending_zero_counter32 = clock32_from_ns(ns);
+    g_vclock_clock32.pending_zero_count++;
+    return true;
+  }
+  // OCXO epoch changes are coherent foreground transactions, never deferred
+  // mutations.  CLOCKS uses interrupt_ocxo_logical_grid_epoch() for them.
+  if (kind == interrupt_subscriber_kind_t::OCXO1 ||
+      kind == interrupt_subscriber_kind_t::OCXO2) {
+    return true;
+  }
+  return false;
+}
+
+void interrupt_ocxo_logical_grid_epoch(uint32_t ocxo1_epoch_counter32,
+                                       uint32_t ocxo2_epoch_counter32) {
+  struct install_t {
+    ocxo_runtime_context_t* ctx;
+    uint32_t epoch;
+  } installs[] = {
+    { &g_ocxo1_ctx, ocxo1_epoch_counter32 },
+    { &g_ocxo2_ctx, ocxo2_epoch_counter32 },
+  };
+
+  const uint32_t prior = interrupt_priority0_guard_enter();
+  for (install_t& install : installs) {
+    ocxo_lane_t& lane = *install.ctx->lane;
+    synthetic_clock32_t& clock = *install.ctx->clock32;
+    if (!lane.initialized) continue;
+    if (lane.compare_armed) ocxo_disable_compare(lane);
+    const uint16_t hardware16 = ocxo_counter_now(lane);
+    clock.zeroed = true;
+    clock.zero_counter32 = install.epoch;
+    clock.zero_ns = (uint64_t)install.epoch * 100ULL;
+    clock.current_counter32 = install.epoch;
+    clock.current_ns = (uint64_t)install.epoch * 100ULL;
+    clock.hardware16 = hardware16;
+    clock.pending_zero = false;
+    lane.grid_epoch_counter32 = install.epoch;
+    lane.next_target_counter32 = install.epoch + OCXO_ONE_SECOND_TICKS;
+    lane.target_grid_valid = true;
+    lane.previous_event_valid = false;
+    lane.last_counter_delta_ticks = 0U;
+  }
+  interrupt_priority0_guard_exit(prior);
+}
+
+bool interrupt_clock_snapshot(interrupt_subscriber_kind_t kind,
+                              interrupt_clock_snapshot_t* out) {
+  if (!out) return false;
+  if (kind == interrupt_subscriber_kind_t::VCLOCK) {
+    const uint16_t hardware16 = qtimer1_ch0_counter_now();
+    out->hardware16 = hardware16;
+    out->counter32 = vclock_synthetic_from_hardware_low16(hardware16);
+    out->ns64 = (uint64_t)out->counter32 * 100ULL;
+    return true;
+  }
+  ocxo_runtime_context_t* ctx = ocxo_context_for(kind);
+  if (!ctx || !ctx->lane->initialized || !ctx->clock32->zeroed) return false;
+  const uint16_t hardware16 = ocxo_counter_now(*ctx->lane);
+  const uint32_t delta =
+      (uint32_t)((uint16_t)(hardware16 - ctx->clock32->hardware16));
+  out->hardware16 = hardware16;
+  out->counter32 = ctx->clock32->current_counter32 + delta;
+  out->ns64 = ctx->clock32->current_ns + (uint64_t)delta * 100ULL;
+  return true;
+}
+
+uint32_t interrupt_qtimer1_counter32_now(void) {
+  return vclock_synthetic_from_hardware_low16(qtimer1_ch0_counter_now());
+}
+
+uint16_t interrupt_qtimer2_ch0_counter_now(void) {
+  return OCXO1_DISABLED ? 0U : IMXRT_TMR2.CH[QTIMER2_OCXO1_CH].CNTR;
+}
+
+uint16_t interrupt_qtimer3_ch0_counter_now(void) {
+  // Legacy accessor: OCXO2 authority is physically on QTimer3 CH3.
+  return OCXO2_DISABLED ? 0U : IMXRT_TMR3.CH[0].CNTR;
+}
+
+uint16_t interrupt_qtimer3_ch3_counter_now(void) {
+  return OCXO2_DISABLED ? 0U : IMXRT_TMR3.CH[QTIMER3_OCXO2_CH].CNTR;
+}
+
+// ============================================================================
+// Native VCLOCK / TimePop hardware state
+// ============================================================================
+
+static volatile bool g_vclock_heartbeat_armed = false;
+static volatile uint32_t g_vclock_heartbeat_next_counter32 = 0U;
+static volatile uint16_t g_vclock_heartbeat_target_low16 = 0U;
+static volatile uint32_t g_vclock_heartbeat_arm_count = 0U;
+static volatile uint32_t g_qtimer1_ch2_last_target_counter32 = 0U;
+static volatile uint32_t g_qtimer1_ch2_arm_count = 0U;
+static volatile interrupt_qtimer1_ch2_handler_fn g_qtimer1_ch2_handler = nullptr;
+static volatile interrupt_qtimer1_ch1_handler_fn g_qtimer1_ch1_handler = nullptr;
+static interrupt_capture_diag_t g_timepop_interrupt_diag{};
+
+static volatile bool g_pps_relay_active = false;
+static volatile uint32_t g_pps_relay_countdown_cells = 0U;
+static volatile uint32_t g_pps_relay_assert_count = 0U;
+static volatile uint32_t g_pps_relay_deassert_count = 0U;
+static constexpr uint32_t PPS_RELAY_OFF_CELLS = 500U;
+
+void interrupt_register_qtimer1_ch2_handler(
+    interrupt_qtimer1_ch2_handler_fn callback) {
+  g_qtimer1_ch2_handler =
+      interrupt_callback_address_executable((uintptr_t)callback)
+          ? callback
+          : nullptr;
+}
+
+void interrupt_register_pps_entry_latency_handler(
+    interrupt_pps_entry_latency_handler_fn callback) {
+  g_pps_entry_latency_handler =
+      interrupt_callback_address_executable((uintptr_t)callback)
+          ? callback
+          : nullptr;
+}
+
+void interrupt_register_qtimer1_ch1_handler(
+    interrupt_qtimer1_ch1_handler_fn callback) {
+  g_qtimer1_ch1_handler =
+      interrupt_callback_address_executable((uintptr_t)callback)
+          ? callback
+          : nullptr;
+}
+
+bool interrupt_qtimer1_ch1_arm_compare(uint32_t) {
+  return false;
+}
+
+void interrupt_qtimer1_ch1_disable_compare(void) {
+  qtimer_disable_compare(IMXRT_TMR1, QTIMER1_RETIRED_AUX_CH);
+}
+
+uint16_t interrupt_qtimer1_ch1_counter_now(void) {
+  return IMXRT_TMR1.CH[QTIMER1_RETIRED_AUX_CH].CNTR;
+}
+
+uint16_t interrupt_qtimer1_ch1_comp1_now(void) {
+  return IMXRT_TMR1.CH[QTIMER1_RETIRED_AUX_CH].COMP1;
+}
+
+uint16_t interrupt_qtimer1_ch1_csctrl_now(void) {
+  return IMXRT_TMR1.CH[QTIMER1_RETIRED_AUX_CH].CSCTRL;
+}
+
+uint32_t interrupt_vclock_counter32_observe_ambient(void) {
+  return vclock_synthetic_from_hardware_low16(qtimer1_ch0_counter_now());
+}
+
+void interrupt_qtimer1_ch2_arm_compare(uint32_t target_counter32) {
+  g_qtimer1_ch2_last_target_counter32 = target_counter32;
+  g_qtimer1_ch2_arm_count++;
+  qtimer1_ch2_program_compare(
+      vclock_hardware_low16_from_synthetic(target_counter32));
+}
+
+uint16_t interrupt_qtimer1_ch2_counter_now(void) {
+  return IMXRT_TMR1.CH[QTIMER1_TIMEPOP_CH].CNTR;
+}
+
+uint16_t interrupt_qtimer1_ch2_comp1_now(void) {
+  return IMXRT_TMR1.CH[QTIMER1_TIMEPOP_CH].COMP1;
+}
+
+uint16_t interrupt_qtimer1_ch2_csctrl_now(void) {
+  return IMXRT_TMR1.CH[QTIMER1_TIMEPOP_CH].CSCTRL;
+}
+
+static bool vclock_heartbeat_arm(void) {
+  const uint16_t hardware16 = qtimer1_ch0_counter_now();
+  vclock_tend_from_hardware(hardware16);
+  const uint32_t target =
+      g_vclock_clock32.current_counter32 + VCLOCK_INTERVAL_COUNTS;
+  const uint16_t target_low16 =
+      vclock_hardware_low16_from_synthetic(target);
+  g_vclock_heartbeat_next_counter32 = target;
+  g_vclock_heartbeat_target_low16 = target_low16;
+  qtimer1_vclock_program_compare(target_low16);
+  g_vclock_heartbeat_armed = true;
+  g_vclock_heartbeat_arm_count++;
+  return true;
+}
+
+// ============================================================================
+// Priority-0 capture rings / priority-16 handoff
+// ============================================================================
 
 struct interrupt_handoff_source_diag_t {
   volatile uint32_t capture_count = 0;
@@ -11309,13 +1739,8 @@ struct interrupt_handoff_source_diag_t {
   volatile uint32_t pending_count = 0;
   volatile uint32_t last_sequence = 0;
   volatile uint32_t last_capture_dwt = 0;
-  volatile uint32_t last_handoff_entry_dwt = 0;
-  volatile uint32_t last_capture_service_dwt = 0;
   volatile uint32_t last_capture_to_handoff_cycles = 0;
   volatile uint32_t max_capture_to_handoff_cycles = 0;
-  volatile uint32_t entry_overtaken_by_capture_count = 0;
-  volatile uint32_t last_handoff_body_cycles = 0;
-  volatile uint32_t max_handoff_body_cycles = 0;
 };
 
 struct interrupt_handoff_diag_t {
@@ -11326,275 +1751,109 @@ struct interrupt_handoff_diag_t {
   volatile uint32_t request_count = 0;
   volatile uint32_t entry_count = 0;
   volatile uint32_t exit_count = 0;
-  volatile uint32_t served_request_count = 0;
-  volatile uint32_t unserved_request_count = 0;
-  volatile uint32_t spurious_entry_count = 0;
   volatile uint32_t reentry_count = 0;
   volatile uint32_t repend_count = 0;
-  volatile uint32_t drain_pass_count = 0;
   volatile uint32_t drain_budget_exhausted_count = 0;
   volatile uint32_t last_request_dwt = 0;
   volatile uint32_t last_entry_dwt = 0;
-  volatile uint32_t last_request_service_dwt = 0;
-  volatile uint32_t last_exit_dwt = 0;
   volatile uint32_t last_latency_cycles = 0;
   volatile uint32_t min_latency_cycles = UINT32_MAX;
   volatile uint32_t max_latency_cycles = 0;
-  volatile uint64_t latency_cycles_sum = 0;
-  volatile uint32_t latency_sample_count = 0;
-  volatile uint32_t entry_overtaken_by_request_count = 0;
-  volatile uint32_t last_body_cycles = 0;
-  volatile uint32_t max_body_cycles = 0;
-  volatile uint32_t last_request_ipsr = 0;
-  volatile uint32_t entry_ipsr = 0;
-  volatile uint32_t last_request_primask = 0;
-  volatile uint32_t entry_primask = 0;
-  volatile const char* last_request_context = nullptr;
 };
 
-static interrupt_handoff_diag_t g_interrupt_handoff = {};
-static interrupt_handoff_source_diag_t g_handoff_qtimer1_ch1 = {};
-static interrupt_handoff_source_diag_t g_handoff_qtimer1_ch2 = {};
-static interrupt_handoff_source_diag_t g_handoff_ocxo1 = {};
-static interrupt_handoff_source_diag_t g_handoff_ocxo2 = {};
-static interrupt_handoff_source_diag_t g_handoff_pps = {};
-static volatile uint32_t g_interrupt_capture_sequence = 0;
-static volatile uint32_t g_pps_capture_sequence = 0;
+static interrupt_handoff_diag_t g_interrupt_handoff{};
+static interrupt_handoff_source_diag_t g_handoff_vclock{};
+static interrupt_handoff_source_diag_t g_handoff_ch2{};
+static interrupt_handoff_source_diag_t g_handoff_ocxo1{};
+static interrupt_handoff_source_diag_t g_handoff_ocxo2{};
+static interrupt_handoff_source_diag_t g_handoff_pps{};
+static volatile uint32_t g_interrupt_capture_sequence = 0U;
 
-struct qtimer1_ch1_capture_packet_t {
+struct vclock_capture_packet_t {
   uint32_t sequence = 0;
   uint32_t isr_entry_dwt_raw = 0;
   uint32_t capture_exit_dwt = 0;
-  uint32_t csctrl_entry = 0;
-  bool active_at_capture = false;
   uint32_t target_counter32 = 0;
-  uint32_t next_compare_counter32 = 0;
-};
-
-struct qtimer1_ch2_capture_packet_t {
-  uint32_t sequence = 0;
-  uint32_t isr_entry_dwt_raw = 0;
-  uint32_t ch2_event_counter32 = 0;
-  uint32_t capture_exit_dwt = 0;
-  uint32_t csctrl_entry = 0;
-};
-
-struct qtimer1_vclock_capture_packet_t {
-  uint32_t sequence = 0;
-  uint32_t isr_entry_dwt_raw = 0;
-  uint32_t target_counter32 = 0;
-  uint32_t service_counter32 = 0;
+  uint16_t target_low16 = 0;
   uint16_t service_low16 = 0;
-  uint32_t capture_exit_dwt = 0;
-  uint32_t csctrl_entry = 0;
 };
 
-struct ocxo_1khz_tend_capture_t {
-  // Priority-0-only 1 kHz gear-tooth record.  This structure maintains the
-  // local +10,000 tick ladder and carries immutable sample facts to the
-  // priority-16 FloorLine/SmartZero writer.  It is never the subscriber-facing
-  // OCXO one-second capture contract.
-  uint32_t isr_entry_dwt_raw = 0;
-  uint32_t capture_exit_dwt = 0;
-  uint32_t authored_dwt_at_event = 0;
-
-  uint32_t csctrl_entry = 0;
-  uint16_t service_counter_low16 = 0;
-  uint16_t service_compare_low16 = 0;
-  uint32_t target_counter32 = 0;
-  uint16_t target_low16 = 0;
-  bool cadence_armed = false;
-  bool lane_active = false;
-  bool rt_active = false;
-  bool was_smartzero_current = false;
-  bool one_second_due = false;
-  uint32_t tick_mod_at_event = 0;
-  uint32_t arm_remaining_ticks = 0;
-  uint16_t arm_low16 = 0;
-  uint16_t arm_compare_low16 = 0;
-  uint32_t arm_dwt_raw = 0;
-  uint32_t csctrl_after_program = 0;
-
-  // Priority 0 may author the next hardware target, but it must not write the
-  // SmartZero SEQLOCK.  Ferry the rearm result to the priority-16 single writer.
-  bool smartzero_rearm_committed = false;
-  uint32_t smartzero_next_target_counter32 = 0;
-};
-
-struct ocxo_1khz_sample_capture_packet_t {
-  // Handoff packet for every active 1 kHz OCXO sample.  Priority 16 is the
-  // common FloorLine writer for VCLOCK, OCXO1 and OCXO2; SmartZero consumes
-  // the same immutable packet only while this lane owns acquisition.  The
-  // packet is deliberately not shaped like the subscriber one-second edge.
+struct ch2_capture_packet_t {
   uint32_t sequence = 0;
   uint32_t isr_entry_dwt_raw = 0;
   uint32_t capture_exit_dwt = 0;
-  uint32_t authored_dwt_at_event = 0;
-
-  uint32_t csctrl_entry = 0;
-  uint16_t service_counter_low16 = 0;
-  uint16_t service_compare_low16 = 0;
   uint32_t target_counter32 = 0;
-  uint16_t target_low16 = 0;
-  bool cadence_armed = false;
-  bool lane_active = false;
-  bool rt_active = false;
-  bool was_smartzero_current = false;
-  bool one_second_due = false;
-  uint32_t tick_mod_at_event = 0;
-  uint32_t arm_remaining_ticks = 0;
-  uint16_t arm_low16 = 0;
-  uint16_t arm_compare_low16 = 0;
-  uint32_t arm_dwt_raw = 0;
-  uint32_t csctrl_after_program = 0;
-  bool smartzero_rearm_committed = false;
-  uint32_t smartzero_next_target_counter32 = 0;
 };
 
-struct ocxo_one_second_capture_packet_t {
-  // Subscriber-facing OCXO one-second capture packet.  This packet is born
-  // only on the exact 1000th +10,000 tick tooth of the local OCXO ladder.
-  // It carries no SmartZero/cadence-purpose flags; it is the special event.
+struct ocxo_capture_packet_t {
   uint32_t sequence = 0;
   uint32_t isr_entry_dwt_raw = 0;
   uint32_t capture_exit_dwt = 0;
-  uint32_t authored_dwt_at_event = 0;
-
-  uint32_t csctrl_entry = 0;
-  uint16_t service_counter_low16 = 0;
-  uint16_t service_compare_low16 = 0;
   uint32_t target_counter32 = 0;
   uint16_t target_low16 = 0;
-  bool cadence_armed = false;
-  bool had_active_rt = false;
-  uint32_t tick_mod_at_event = 0;
-  uint32_t arm_remaining_ticks = 0;
-  uint16_t arm_low16 = 0;
-  uint16_t arm_compare_low16 = 0;
-  uint32_t arm_dwt_raw = 0;
-  uint32_t csctrl_after_program = 0;
+  uint16_t ambient_low16 = 0;
+  uint16_t compare_low16 = 0;
+  bool active_at_capture = false;
 };
 
 struct pps_capture_packet_t {
   uint32_t sequence = 0;
   uint32_t isr_entry_dwt_raw = 0;
-  uint32_t capture_after_vclock_raw = 0;
-  uint32_t capture_end_raw = 0;
   uint32_t capture_exit_dwt = 0;
-  uint16_t vclock_hardware16_observed = 0;
+  uint16_t vclock_hardware16 = 0;
   uint16_t ocxo1_hardware16 = 0;
   uint16_t ocxo2_hardware16 = 0;
-
-
-  bool ocxo1_capture_hw_ready = false;
-  bool ocxo2_capture_hw_ready = false;
-  bool ocxo_capture_hw_ready = false;
-  bool rebootstrap_pending_at_capture = false;
+  bool ocxo1_valid = false;
+  bool ocxo2_valid = false;
 };
 
 template <typename T, uint32_t N>
 struct interrupt_capture_ring_t {
-  // Single-producer/single-consumer monotonic cursors.  Priority 0 owns head;
-  // priority 16 owns tail.  No field is read/modified/written by both sides.
   T items[N]{};
   volatile uint32_t head = 0;
   volatile uint32_t tail = 0;
 };
 
-static interrupt_capture_ring_t<qtimer1_ch1_capture_packet_t,
-                                HANDOFF_QTIMER1_CH1_RING_SIZE>
-    g_qtimer1_ch1_capture_ring;
-static interrupt_capture_ring_t<qtimer1_vclock_capture_packet_t,
-                                HANDOFF_QTIMER1_CH1_RING_SIZE>
-    g_qtimer1_vclock_capture_ring;
-static interrupt_capture_ring_t<qtimer1_ch2_capture_packet_t,
-                                HANDOFF_QTIMER1_CH2_RING_SIZE>
-    g_qtimer1_ch2_capture_ring;
-static interrupt_capture_ring_t<ocxo_1khz_sample_capture_packet_t,
+static interrupt_capture_ring_t<vclock_capture_packet_t,
+                                HANDOFF_QTIMER1_RING_SIZE>
+    g_vclock_capture_ring{};
+static interrupt_capture_ring_t<ch2_capture_packet_t,
+                                HANDOFF_QTIMER1_RING_SIZE>
+    g_ch2_capture_ring{};
+static interrupt_capture_ring_t<ocxo_capture_packet_t,
                                 HANDOFF_OCXO_RING_SIZE>
-    g_ocxo1_1khz_sample_capture_ring;
-static interrupt_capture_ring_t<ocxo_1khz_sample_capture_packet_t,
+    g_ocxo1_capture_ring{};
+static interrupt_capture_ring_t<ocxo_capture_packet_t,
                                 HANDOFF_OCXO_RING_SIZE>
-    g_ocxo2_1khz_sample_capture_ring;
-static interrupt_capture_ring_t<ocxo_one_second_capture_packet_t,
-                                HANDOFF_OCXO_RING_SIZE>
-    g_ocxo1_one_second_capture_ring;
-static interrupt_capture_ring_t<ocxo_one_second_capture_packet_t,
-                                HANDOFF_OCXO_RING_SIZE>
-    g_ocxo2_one_second_capture_ring;
-static interrupt_capture_ring_t<pps_capture_packet_t, HANDOFF_PPS_RING_SIZE>
-    g_pps_capture_ring;
+    g_ocxo2_capture_ring{};
+static interrupt_capture_ring_t<pps_capture_packet_t,
+                                HANDOFF_PPS_RING_SIZE>
+    g_pps_capture_ring{};
 
 static inline volatile uint32_t& interrupt_nvic_ispr_word(uint32_t irq) {
-  volatile uint32_t* const ispr = (volatile uint32_t*)0xE000E200UL;
-  return ispr[irq >> 5];
-}
-
-static inline volatile uint32_t& interrupt_nvic_iser_word(uint32_t irq) {
-  volatile uint32_t* const iser = (volatile uint32_t*)0xE000E100UL;
-  return iser[irq >> 5];
+  volatile uint32_t* const base = (volatile uint32_t*)0xE000E200UL;
+  return base[irq >> 5];
 }
 
 static inline volatile uint32_t& interrupt_nvic_icpr_word(uint32_t irq) {
-  volatile uint32_t* const icpr = (volatile uint32_t*)0xE000E280UL;
-  return icpr[irq >> 5];
-}
-
-static inline volatile uint32_t& interrupt_nvic_iabr_word(uint32_t irq) {
-  volatile uint32_t* const iabr = (volatile uint32_t*)0xE000E300UL;
-  return iabr[irq >> 5];
+  volatile uint32_t* const base = (volatile uint32_t*)0xE000E280UL;
+  return base[irq >> 5];
 }
 
 static inline uint32_t interrupt_nvic_irq_mask(uint32_t irq) {
   return 1UL << (irq & 31U);
 }
 
-static inline void interrupt_handoff_barrier(void) {
-  __asm__ volatile ("dsb" ::: "memory");
-  __asm__ volatile ("isb" ::: "memory");
-}
-
-static inline uint32_t interrupt_ipsr(void) {
-  uint32_t v = 0;
-  __asm__ volatile ("mrs %0, ipsr" : "=r" (v) :: "memory");
-  return v;
-}
-
-static inline uint32_t interrupt_primask(void) {
-  uint32_t v = 0;
-  __asm__ volatile ("mrs %0, primask" : "=r" (v) :: "memory");
-  return v;
-}
-
 template <typename T, uint32_t N>
-static inline uint32_t capture_ring_pending(
+static uint32_t capture_ring_pending(
     const interrupt_capture_ring_t<T, N>& ring) {
   const uint32_t tail = ring.tail;
   dmb_barrier();
-  const uint32_t head = ring.head;
-  return head - tail;
-}
-
-// RECOVER-only cursor cut.  The caller has disabled this ring's priority-0
-// producer and masked the shared priority-16 handoff.  Advancing tail to head
-// discards stale capture custody without erasing monotonic/lifetime evidence.
-// A shared handoff IRQ already pending may subsequently run once and find no
-// packet for this lane; it must not be globally cleared because other rails
-// share the same priority-16 continuation tier.
-template <typename T, uint32_t N>
-static uint32_t capture_ring_discard_pending_for_recover(
-    interrupt_capture_ring_t<T, N>& ring) {
-  const uint32_t tail = ring.tail;
-  dmb_barrier();
-  const uint32_t head = ring.head;
-  const uint32_t dropped = head - tail;
-  ring.tail = head;
-  dmb_barrier();
-  return dropped;
+  return ring.head - tail;
 }
 
 template <typename T, uint32_t N>
-static bool capture_ring_push_from_priority0(
+static bool capture_ring_push_priority0(
     interrupt_capture_ring_t<T, N>& ring,
     interrupt_handoff_source_diag_t& diag,
     T packet) {
@@ -11605,12 +1864,10 @@ static bool capture_ring_push_from_priority0(
     diag.overrun_count++;
     return false;
   }
-
   packet.sequence = ++g_interrupt_capture_sequence;
   ring.items[head % N] = packet;
   dmb_barrier();
   ring.head = head + 1U;
-
   const uint32_t pending_after = pending + 1U;
   diag.capture_count++;
   diag.enqueue_count++;
@@ -11622,19 +1879,17 @@ static bool capture_ring_push_from_priority0(
 }
 
 template <typename T, uint32_t N>
-static bool capture_ring_pop_for_handoff(
+static bool capture_ring_pop_handoff(
     interrupt_capture_ring_t<T, N>& ring,
     interrupt_handoff_source_diag_t& diag,
-    T& out) {
+    T& packet) {
   const uint32_t tail = ring.tail;
   const uint32_t head = ring.head;
   if (tail == head) return false;
-
   dmb_barrier();
-  out = ring.items[tail % N];
+  packet = ring.items[tail % N];
   dmb_barrier();
   ring.tail = tail + 1U;
-
   diag.dequeue_count++;
   diag.pending_count = head - (tail + 1U);
   return true;
@@ -11642,2020 +1897,839 @@ static bool capture_ring_pop_for_handoff(
 
 template <typename T, uint32_t N>
 static bool capture_ring_peek_sequence(
-    interrupt_capture_ring_t<T, N>& ring,
-    uint32_t& seq) {
+    const interrupt_capture_ring_t<T, N>& ring,
+    uint32_t& sequence) {
   const uint32_t tail = ring.tail;
   const uint32_t head = ring.head;
   if (tail == head) return false;
-
   dmb_barrier();
-  seq = ring.items[tail % N].sequence;
+  sequence = ring.items[tail % N].sequence;
   return true;
 }
 
-static bool interrupt_handoff_any_pending(void) {
-  return capture_ring_pending(g_qtimer1_ch1_capture_ring) != 0 ||
-         capture_ring_pending(g_qtimer1_vclock_capture_ring) != 0 ||
-         capture_ring_pending(g_qtimer1_ch2_capture_ring) != 0 ||
-         capture_ring_pending(g_ocxo1_1khz_sample_capture_ring) != 0 ||
-         capture_ring_pending(g_ocxo2_1khz_sample_capture_ring) != 0 ||
-         capture_ring_pending(g_ocxo1_one_second_capture_ring) != 0 ||
-         capture_ring_pending(g_ocxo2_one_second_capture_ring) != 0 ||
-         capture_ring_pending(g_pps_capture_ring) != 0;
+static bool handoff_any_pending(void) {
+  return capture_ring_pending(g_vclock_capture_ring) != 0U ||
+         capture_ring_pending(g_ch2_capture_ring) != 0U ||
+         capture_ring_pending(g_ocxo1_capture_ring) != 0U ||
+         capture_ring_pending(g_ocxo2_capture_ring) != 0U ||
+         capture_ring_pending(g_pps_capture_ring) != 0U;
 }
 
-static void interrupt_handoff_note_source_entry(
-    interrupt_handoff_source_diag_t& diag,
-    uint32_t capture_dwt,
-    uint32_t handoff_entry_dwt) {
-  // Priority 0 may preempt the priority-16 handoff after the handler's opening
-  // timestamp.  A packet captured during that preemption therefore has a lawful
-  // capture_dwt later than handoff_entry_dwt.  Measure to the instant this
-  // source is actually claimed instead of unsigned-subtracting two differently
-  // ordered timestamps into an apparent ~2^32-cycle latency.
-  const uint32_t service_dwt = ARM_DWT_CYCCNT;
-  if ((int32_t)(handoff_entry_dwt - capture_dwt) < 0) {
-    diag.entry_overtaken_by_capture_count++;
-  }
-  const uint32_t latency = service_dwt - capture_dwt;
-  diag.last_handoff_entry_dwt = handoff_entry_dwt;
-  diag.last_capture_service_dwt = service_dwt;
+static void interrupt_handoff_request_priority0(void) {
+  g_interrupt_handoff.pending = true;
+  g_interrupt_handoff.request_count++;
+  g_interrupt_handoff.last_request_dwt = ARM_DWT_CYCCNT;
+  dmb_barrier();
+  interrupt_nvic_ispr_word(INTERRUPT_HANDOFF_IRQ_NUMBER) =
+      interrupt_nvic_irq_mask(INTERRUPT_HANDOFF_IRQ_NUMBER);
+}
+
+static void update_handoff_latency(interrupt_handoff_source_diag_t& diag,
+                                   uint32_t capture_dwt,
+                                   uint32_t entry_dwt) {
+  const uint32_t latency = entry_dwt - capture_dwt;
   diag.last_capture_to_handoff_cycles = latency;
   if (latency > diag.max_capture_to_handoff_cycles) {
     diag.max_capture_to_handoff_cycles = latency;
   }
 }
 
-static void interrupt_handoff_note_source_body(
-    interrupt_handoff_source_diag_t& diag,
-    uint32_t start_dwt) {
-  const uint32_t body = ARM_DWT_CYCCNT - start_dwt;
-  diag.last_handoff_body_cycles = body;
-  if (body > diag.max_handoff_body_cycles) {
-    diag.max_handoff_body_cycles = body;
+// ============================================================================
+// Observed event authorship
+// ============================================================================
+
+static void fill_observed_diag(interrupt_capture_diag_t& diag,
+                               const interrupt_event_t& event,
+                               uint32_t isr_entry_dwt_raw,
+                               uint16_t ambient_low16,
+                               uint16_t target_low16,
+                               uint32_t sequence) {
+  diag.enabled = true;
+  diag.provider = event.provider;
+  diag.lane = event.lane;
+  diag.kind = event.kind;
+  diag.dwt_at_event = event.dwt_at_event;
+  diag.gnss_ns_at_event = event.gnss_ns_at_event;
+  diag.counter32_at_event = event.counter32_at_event;
+  diag.dwt_synthetic = false;
+  diag.dwt_repair_candidate = false;
+  diag.dwt_original_at_event = event.dwt_at_event;
+  diag.dwt_predicted_at_event = 0U;
+  diag.dwt_used_at_event = event.dwt_at_event;
+  diag.dwt_isr_entry_raw = isr_entry_dwt_raw;
+  diag.dwt_event_from_isr_entry_raw = event.dwt_at_event;
+  diag.dwt_isr_entry_to_event_correction_cycles =
+      (int32_t)(event.dwt_at_event - isr_entry_dwt_raw);
+  diag.dwt_published_minus_event_cycles = 0;
+  diag.dwt_used_minus_event_cycles = 0;
+  diag.dwt_synthetic_error_cycles = 0;
+  diag.dwt_synthetic_threshold_cycles = 0U;
+  diag.dwt_synthetic_reason = "observed";
+  diag.dwt_publication_verdict_mask =
+      INTERRUPT_DWT_PUBLICATION_VERDICT_OK;
+  diag.dwt_publication_verdict_reason_id =
+      INTERRUPT_DWT_PUBLICATION_REASON_OK;
+
+  // Compatibility ABI fields below carry observed/target facts only.  No
+  // alternative estimator is computed or selected.
+  diag.ocxo_perishable_fact_sequence = sequence;
+  diag.ocxo_service_corrected_dwt_at_event = event.dwt_at_event;
+  diag.ocxo_boundary_dwt_at_event = event.dwt_at_event;
+  diag.ocxo_boundary_counter32_at_event = event.counter32_at_event;
+  diag.ocxo_boundary_correction_cycles = 0;
+  diag.ocxo_isr_counter_low16 = ambient_low16;
+  diag.ocxo_isr_compare_low16 = target_low16;
+  diag.ocxo_compare_delta_mod65536_ticks =
+      (uint32_t)((uint16_t)(ambient_low16 - target_low16));
+  diag.ocxo_compare_service_offset_signed_ticks =
+      (int32_t)((int16_t)(uint16_t)(ambient_low16 - target_low16));
+  diag.ocxo_compare_interpreted_late_ticks =
+      diag.ocxo_compare_service_offset_signed_ticks >= 0
+          ? (uint32_t)diag.ocxo_compare_service_offset_signed_ticks
+          : 0U;
+  diag.ocxo_compare_early_ticks =
+      diag.ocxo_compare_service_offset_signed_ticks < 0
+          ? (uint32_t)(-(int64_t)diag.ocxo_compare_service_offset_signed_ticks)
+          : 0U;
+  diag.ocxo_service_offset_signed_ticks =
+      diag.ocxo_compare_service_offset_signed_ticks;
+  diag.ocxo_service_offset_abs_ticks =
+      interrupt_abs_i32(diag.ocxo_service_offset_signed_ticks);
+  diag.ocxo_interpreted_late_ticks =
+      diag.ocxo_compare_interpreted_late_ticks;
+  diag.ocxo_early_ticks = diag.ocxo_compare_early_ticks;
+  diag.ocxo_target_delta_mod65536_ticks =
+      diag.ocxo_compare_delta_mod65536_ticks;
+  diag.ocxo_sample_phase_valid = false;
+  diag.ocxo_sample_period_ticks = OCXO_ONE_SECOND_TICKS;
+  diag.ocxo_sample_dwt_at_event = event.dwt_at_event;
+  diag.ocxo_sample_counter32_at_event = event.counter32_at_event;
+}
+
+static bool emit_observed_event(interrupt_subscriber_runtime_t& rt,
+                                uint32_t dwt_at_event,
+                                uint32_t counter32_at_event,
+                                uint32_t isr_entry_dwt_raw,
+                                uint16_t ambient_low16,
+                                uint16_t target_low16,
+                                uint32_t sequence) {
+  if (!rt.active || !rt.desc || dwt_at_event == 0U) return false;
+
+  const uint32_t prior = interrupt_priority0_guard_enter();
+  const bool busy = rt.dispatch_running || rt.deferred.pending;
+  if (busy) rt.dispatch_busy_drop_count++;
+  interrupt_priority0_guard_exit(prior);
+  if (busy) return false;
+
+  rt.last_event = interrupt_event_t{};
+  rt.last_event.kind = rt.desc->kind;
+  rt.last_event.provider = rt.desc->provider;
+  rt.last_event.lane = rt.desc->lane;
+  rt.last_event.status = interrupt_event_status_t::OK;
+  rt.last_event.dwt_at_event = dwt_at_event;
+  rt.last_event.counter32_at_event = counter32_at_event;
+  rt.last_event.gnss_ns_at_event = 0U;
+
+  fill_observed_diag(rt.last_diag,
+                     rt.last_event,
+                     isr_entry_dwt_raw,
+                     ambient_low16,
+                     target_low16,
+                     sequence);
+  rt.has_fired = true;
+  rt.event_count++;
+  return interrupt_dispatch_begin(rt, rt.last_event);
+}
+
+static void publish_observed_pps_vclock(uint32_t sequence,
+                                        uint32_t dwt_at_edge,
+                                        uint32_t counter32_at_edge,
+                                        uint16_t target_low16) {
+  pps_t pps = g_last_pps_witness_valid
+      ? g_last_pps_witness
+      : pps_t{};
+  if (pps.sequence == 0U) {
+    pps.sequence = sequence;
+    pps.dwt_at_edge = dwt_at_edge;
+    pps.counter32_at_edge = counter32_at_edge;
+    pps.ch3_at_edge = target_low16;
+  }
+
+  pps_vclock_t pvc{};
+  pvc.sequence = sequence;
+  pvc.dwt_at_edge = dwt_at_edge;
+  pvc.counter32_at_edge = counter32_at_edge;
+  pvc.ch3_at_edge = target_low16;
+  pvc.gnss_ns_at_edge = -1;
+
+  pps_vclock_edge_authority_t authority{};
+  authority.valid = dwt_at_edge != 0U;
+  authority.sequence = sequence;
+  authority.update_count = g_pps_vclock_edge_authority.update_count + 1U;
+  authority.authority_dwt_at_edge = dwt_at_edge;
+  authority.pps_dwt_at_edge = pps.dwt_at_edge;
+  authority.vclock_observed_dwt_at_edge = dwt_at_edge;
+  authority.counter32_at_edge = counter32_at_edge;
+  authority.ch3_at_edge = target_low16;
+  authority.dwt_cycles_per_second = interrupt_vclock_cycles_per_second();
+  authority.decision = PPS_VCLOCK_EDGE_DECISION_OBSERVED_FALLBACK;
+  authority.invalid_mask = authority.valid
+      ? PPS_VCLOCK_EDGE_INVALID_NONE
+      : PPS_VCLOCK_EDGE_INVALID_NO_OBSERVED;
+  authority.authority_minus_pps_cycles = pps.dwt_at_edge != 0U
+      ? (int32_t)(dwt_at_edge - pps.dwt_at_edge)
+      : 0;
+  g_pps_vclock_edge_authority = authority;
+
+  store_publish(pps, pvc);
+  g_pps_gpio_heartbeat.last_dwt = dwt_at_edge;
+  g_pps_gpio_heartbeat.last_gnss_ns = -1;
+}
+
+static void pps_relay_tick_from_vclock(void) {
+  if (!g_pps_relay_active || g_pps_relay_countdown_cells == 0U) return;
+  g_pps_relay_countdown_cells--;
+  if (g_pps_relay_countdown_cells == 0U) {
+    digitalWriteFast(GNSS_PPS_RELAY, LOW);
+    g_pps_relay_active = false;
+    g_pps_relay_deassert_count++;
   }
 }
 
-static void interrupt_handoff_request_from_capture_isr(const char* context) {
-  g_interrupt_handoff.request_count++;
-  g_interrupt_handoff.pending = true;
-  g_interrupt_handoff.last_request_dwt = ARM_DWT_CYCCNT;
-  g_interrupt_handoff.last_request_context = context;
-  g_interrupt_handoff.last_request_ipsr = interrupt_ipsr();
-  g_interrupt_handoff.last_request_primask = interrupt_primask();
+// ============================================================================
+// Priority-16 packet processing
+// ============================================================================
 
-  interrupt_nvic_ispr_word(INTERRUPT_HANDOFF_IRQ_NUMBER) =
-      interrupt_nvic_irq_mask(INTERRUPT_HANDOFF_IRQ_NUMBER);
-  interrupt_handoff_barrier();
+static void process_vclock_packet(const vclock_capture_packet_t& packet) {
+  const uint32_t captured_target = packet.target_counter32;
+  const uint16_t target_low16 = packet.target_low16;
+  const uint32_t service_counter32 =
+      vclock_synthetic_from_hardware_low16(packet.service_low16);
+  uint32_t event_target = captured_target;
+
+  vclock_anchor_hardware(captured_target, target_low16);
+  g_vclock_lane.heartbeat_count++;
+  g_vclock_lane.irq_count++;
+  g_vclock_lane.last_isr_entry_dwt_raw = packet.isr_entry_dwt_raw;
+  const uint32_t dwt_at_edge =
+      qtimer_event_dwt_from_isr_entry_raw(packet.isr_entry_dwt_raw);
+  g_vclock_lane.last_dwt_at_edge = dwt_at_edge;
+
+  uint32_t next = captured_target + VCLOCK_INTERVAL_COUNTS;
+  if (g_vclock_clock32.pending_zero) {
+    const uint64_t ns = g_vclock_clock32.pending_zero_ns;
+    g_vclock_clock32.pending_zero = false;
+    synthetic_clock_zero(g_vclock_clock32, ns);
+    g_vclock_clock32.hardware_low16_at_zero = target_low16;
+    vclock_anchor_hardware(g_vclock_clock32.zero_counter32, target_low16);
+    event_target = g_vclock_clock32.zero_counter32;
+    next = event_target + VCLOCK_INTERVAL_COUNTS;
+    g_vclock_lane.one_second_grid_valid = false;
+  } else {
+    while ((int32_t)(service_counter32 - next) >= 0) {
+      next += VCLOCK_INTERVAL_COUNTS;
+      g_vclock_lane.miss_count++;
+    }
+  }
+
+  const uint16_t next_low16 =
+      vclock_hardware_low16_from_synthetic(next);
+  g_vclock_heartbeat_next_counter32 = next;
+  g_vclock_heartbeat_target_low16 = next_low16;
+  qtimer1_vclock_program_compare(next_low16);
+  g_vclock_lane.last_target_counter32 = event_target;
+
+  // VCLOCK owns all periodic low-word extension and OCXO arm tending.
+  if (!OCXO1_DISABLED) ocxo_tend_and_arm(g_ocxo1_ctx);
+  if (!OCXO2_DISABLED) ocxo_tend_and_arm(g_ocxo2_ctx);
+  pps_relay_tick_from_vclock();
+
+  if (!g_vclock_lane.one_second_grid_valid &&
+      g_last_pps_witness_valid) {
+    g_vclock_lane.next_one_second_counter32 = event_target;
+    g_vclock_lane.one_second_grid_valid = true;
+  }
+
+  if (g_vclock_lane.one_second_grid_valid &&
+      event_target == g_vclock_lane.next_one_second_counter32) {
+    const uint32_t sequence = g_last_pps_witness_valid
+        ? g_last_pps_witness.sequence
+        : (g_vclock_lane.one_second_count + 1U);
+    g_vclock_lane.one_second_count++;
+    g_vclock_lane.next_one_second_counter32 += OCXO_ONE_SECOND_TICKS;
+    publish_observed_pps_vclock(sequence,
+                                dwt_at_edge,
+                                event_target,
+                                target_low16);
+    interrupt_features_note_observed_edge();
+    integrity_note_dwt_interval(interrupt_subscriber_kind_t::VCLOCK,
+                                sequence,
+                                event_target,
+                                dwt_at_edge);
+    smartzero_feed_one_second(interrupt_subscriber_kind_t::VCLOCK,
+                              dwt_at_edge,
+                              event_target,
+                              target_low16);
+    interrupt_features_note_lineage();
+    if (g_rt_vclock && g_rt_vclock->active) {
+      g_rt_vclock->irq_count++;
+      (void)emit_observed_event(*g_rt_vclock,
+                                dwt_at_edge,
+                                event_target,
+                                packet.isr_entry_dwt_raw,
+                                packet.service_low16,
+                                target_low16,
+                                sequence);
+    }
+  }
+}
+
+static void process_ch2_packet(const ch2_capture_packet_t& packet) {
+  const interrupt_qtimer1_ch2_handler_fn callback = g_qtimer1_ch2_handler;
+  if (!interrupt_callback_address_executable((uintptr_t)callback)) return;
+
+  interrupt_event_t event{};
+  event.kind = interrupt_subscriber_kind_t::TIMEPOP;
+  event.provider = interrupt_provider_kind_t::QTIMER1;
+  event.lane = interrupt_lane_t::QTIMER1_CH2_COMP;
+  event.status = interrupt_event_status_t::OK;
+  event.dwt_at_event =
+      qtimer_event_dwt_from_isr_entry_raw(packet.isr_entry_dwt_raw);
+  event.counter32_at_event = packet.target_counter32;
+  event.gnss_ns_at_event = 0U;
+
+  fill_observed_diag(g_timepop_interrupt_diag,
+                     event,
+                     packet.isr_entry_dwt_raw,
+                     (uint16_t)packet.target_counter32,
+                     (uint16_t)packet.target_counter32,
+                     packet.sequence);
+  ZPNET_EXECUTION_TRACE(
+      timepop_dispatch_trace_stage_t::SUBSCRIBER_ENTER,
+      timepop_dispatch_trace_kind_t::ISR_TIMED,
+      QTIMER1_TIMEPOP_CH,
+      packet.target_counter32,
+      (uint32_t)(uintptr_t)callback,
+      (uint32_t)(uintptr_t)g_qtimer1_ch2_handler,
+      0U,
+      (uint32_t)(uintptr_t)"QTIMER1_CH2_TIMEPOP",
+      event.dwt_at_event);
+  callback(event, g_timepop_interrupt_diag);
+  ZPNET_EXECUTION_TRACE(
+      timepop_dispatch_trace_stage_t::SUBSCRIBER_RETURN,
+      timepop_dispatch_trace_kind_t::ISR_TIMED,
+      QTIMER1_TIMEPOP_CH,
+      packet.target_counter32,
+      (uint32_t)(uintptr_t)callback,
+      (uint32_t)(uintptr_t)g_qtimer1_ch2_handler,
+      0U,
+      (uint32_t)(uintptr_t)"QTIMER1_CH2_TIMEPOP",
+      event.dwt_at_event);
+}
+
+static void process_ocxo_packet(ocxo_runtime_context_t& ctx,
+                                const ocxo_capture_packet_t& packet) {
+  ocxo_lane_t& lane = *ctx.lane;
+  synthetic_clock32_t& clock = *ctx.clock32;
+  lane.irq_count++;
+  lane.last_isr_entry_dwt_raw = packet.isr_entry_dwt_raw;
+  lane.last_ambient_low16 = packet.ambient_low16;
+  lane.last_compare_low16 = packet.compare_low16;
+  lane.last_ambient_minus_target_ticks =
+      (int32_t)((int16_t)(uint16_t)(packet.ambient_low16 -
+                                    packet.target_low16));
+
+  // The semantic event identity is the target authored before the match.  The
+  // ambient read is witness-only and cannot advance, reject, or replace it.
+  const uint32_t target = packet.target_counter32;
+  if (!packet.active_at_capture || target == 0U) {
+    lane.false_irq_count++;
+    lane.miss_count++;
+    lane.compare_armed = false;
+    lane.armed_target_counter32 = 0U;
+    lane.armed_target_low16 = 0U;
+    return;
+  }
+
+  const uint32_t dwt_at_edge =
+      qtimer_event_dwt_from_isr_entry_raw(packet.isr_entry_dwt_raw);
+  lane.last_dwt_at_edge = dwt_at_edge;
+  lane.last_event_counter32 = target;
+  lane.fire_count++;
+  lane.compare_armed = false;
+  lane.armed_target_counter32 = 0U;
+  lane.armed_target_low16 = 0U;
+
+  const uint32_t advance = target - clock.current_counter32;
+  clock.current_counter32 = target;
+  clock.current_ns += (uint64_t)advance * 100ULL;
+  clock.hardware16 = packet.target_low16;
+
+  const bool interval_valid = lane.previous_event_valid;
+  const uint32_t delta = interval_valid
+      ? target - lane.previous_event_counter32
+      : 0U;
+  lane.last_counter_delta_ticks = delta;
+  if (interval_valid && delta != OCXO_ONE_SECOND_TICKS) {
+    lane.counter_delta_violation_count++;
+  }
+  lane.previous_event_valid = true;
+  lane.previous_event_counter32 = target;
+  lane.next_target_counter32 = target + OCXO_ONE_SECOND_TICKS;
+  lane.target_grid_valid = true;
+  lane.dispatch_sequence++;
+
+  interrupt_integrity_note_counter32(ctx.kind,
+                                     lane.dispatch_sequence,
+                                     interval_valid,
+                                     delta,
+                                     OCXO_ONE_SECOND_TICKS,
+                                     target);
+  integrity_note_dwt_interval(ctx.kind,
+                              lane.dispatch_sequence,
+                              target,
+                              dwt_at_edge);
+  smartzero_feed_one_second(ctx.kind,
+                            dwt_at_edge,
+                            target,
+                            packet.target_low16);
+  interrupt_features_note_ocxo_custody();
+  interrupt_features_note_lineage();
+
+  interrupt_subscriber_runtime_t* rt = ocxo_runtime_for(ctx);
+  if (rt && rt->active && packet.active_at_capture) {
+    rt->irq_count++;
+    (void)emit_observed_event(*rt,
+                              dwt_at_edge,
+                              target,
+                              packet.isr_entry_dwt_raw,
+                              packet.ambient_low16,
+                              packet.target_low16,
+                              lane.dispatch_sequence);
+  } else {
+    lane.miss_count++;
+  }
+}
+
+static void process_pps_packet(const pps_capture_packet_t& packet) {
+  pps_t pps{};
+  pps.sequence = ++g_pps_gpio_heartbeat.edge_count;
+  pps.dwt_at_edge = pps_dwt_from_isr_entry_raw(packet.isr_entry_dwt_raw);
+  pps.counter32_at_edge =
+      vclock_synthetic_from_hardware_low16(packet.vclock_hardware16);
+  pps.ch3_at_edge = packet.vclock_hardware16;
+  g_last_pps_witness = pps;
+  g_last_pps_witness_valid = true;
+  g_gpio_irq_count++;
+
+  interrupt_epoch_capture_t capture{};
+  capture.valid = true;
+  capture.sequence = pps.sequence;
+  capture.capture_dwt_start_raw = packet.isr_entry_dwt_raw;
+  capture.capture_dwt_after_vclock_raw = packet.isr_entry_dwt_raw;
+  capture.capture_dwt_end_raw = packet.capture_exit_dwt;
+  capture.capture_window_cycles =
+      packet.capture_exit_dwt - packet.isr_entry_dwt_raw;
+  capture.vclock_read_offset_cycles = 0U;
+  capture.vclock_dwt_at_edge = pps.dwt_at_edge;
+  capture.vclock_capture_valid = true;
+  capture.ocxo1_capture_valid = packet.ocxo1_valid;
+  capture.ocxo2_capture_valid = packet.ocxo2_valid;
+  capture.all_lanes_capture_valid =
+      capture.vclock_capture_valid &&
+      capture.ocxo1_capture_valid &&
+      capture.ocxo2_capture_valid;
+  capture.vclock_hardware16_observed = packet.vclock_hardware16;
+  capture.vclock_hardware16_selected = packet.vclock_hardware16;
+  capture.ocxo1_hardware16 = packet.ocxo1_hardware16;
+  capture.ocxo2_hardware16 = packet.ocxo2_hardware16;
+  capture.vclock_counter32 = pps.counter32_at_edge;
+
+  // CounterLedger is now a witness only.  Project its ambient reads through the
+  // VCLOCK-tended synthetic anchors without mutating event identity.
+  if (packet.ocxo1_valid) {
+    const uint32_t delta = (uint32_t)((uint16_t)(
+        packet.ocxo1_hardware16 - g_ocxo1_clock32.hardware16));
+    capture.ocxo1_counter32 = g_ocxo1_clock32.current_counter32 + delta;
+  }
+  if (packet.ocxo2_valid) {
+    const uint32_t delta = (uint32_t)((uint16_t)(
+        packet.ocxo2_hardware16 - g_ocxo2_clock32.hardware16));
+    capture.ocxo2_counter32 = g_ocxo2_clock32.current_counter32 + delta;
+  }
+  epoch_capture_publish(capture);
+
+  // The next observed native VCLOCK tooth becomes the initial one-second grid
+  // after boot/rebootstrap.  No DWT back-projection is performed.
+  if (!g_vclock_lane.one_second_grid_valid || g_pps_rebootstrap_pending) {
+    g_vclock_lane.next_one_second_counter32 =
+        g_vclock_heartbeat_next_counter32;
+    g_vclock_lane.one_second_grid_valid = true;
+    g_pps_rebootstrap_pending = false;
+    g_pps_rebootstrap_count++;
+  }
+
+  const interrupt_pps_entry_latency_handler_fn callback =
+      g_pps_entry_latency_handler;
+  if (interrupt_callback_address_executable((uintptr_t)callback)) {
+    callback(pps.sequence, packet.isr_entry_dwt_raw);
+  }
+}
+
+static bool handoff_drain_one_oldest(uint32_t entry_dwt) {
+  enum source_t : uint8_t {
+    SRC_NONE,
+    SRC_VCLOCK,
+    SRC_CH2,
+    SRC_OCXO1,
+    SRC_OCXO2,
+    SRC_PPS,
+  };
+  source_t source = SRC_NONE;
+  uint32_t best = UINT32_MAX;
+  uint32_t sequence = 0U;
+
+  if (capture_ring_peek_sequence(g_vclock_capture_ring, sequence) &&
+      sequence < best) {
+    best = sequence;
+    source = SRC_VCLOCK;
+  }
+  if (capture_ring_peek_sequence(g_ch2_capture_ring, sequence) &&
+      sequence < best) {
+    best = sequence;
+    source = SRC_CH2;
+  }
+  if (capture_ring_peek_sequence(g_ocxo1_capture_ring, sequence) &&
+      sequence < best) {
+    best = sequence;
+    source = SRC_OCXO1;
+  }
+  if (capture_ring_peek_sequence(g_ocxo2_capture_ring, sequence) &&
+      sequence < best) {
+    best = sequence;
+    source = SRC_OCXO2;
+  }
+  if (capture_ring_peek_sequence(g_pps_capture_ring, sequence) &&
+      sequence < best) {
+    best = sequence;
+    source = SRC_PPS;
+  }
+  if (source == SRC_NONE) return false;
+
+  switch (source) {
+    case SRC_VCLOCK: {
+      vclock_capture_packet_t packet{};
+      if (capture_ring_pop_handoff(g_vclock_capture_ring,
+                                   g_handoff_vclock,
+                                   packet)) {
+        update_handoff_latency(g_handoff_vclock,
+                               packet.isr_entry_dwt_raw,
+                               entry_dwt);
+        process_vclock_packet(packet);
+      }
+      break;
+    }
+    case SRC_CH2: {
+      ch2_capture_packet_t packet{};
+      if (capture_ring_pop_handoff(g_ch2_capture_ring,
+                                   g_handoff_ch2,
+                                   packet)) {
+        update_handoff_latency(g_handoff_ch2,
+                               packet.isr_entry_dwt_raw,
+                               entry_dwt);
+        process_ch2_packet(packet);
+      }
+      break;
+    }
+    case SRC_OCXO1: {
+      ocxo_capture_packet_t packet{};
+      if (capture_ring_pop_handoff(g_ocxo1_capture_ring,
+                                   g_handoff_ocxo1,
+                                   packet)) {
+        update_handoff_latency(g_handoff_ocxo1,
+                               packet.isr_entry_dwt_raw,
+                               entry_dwt);
+        process_ocxo_packet(g_ocxo1_ctx, packet);
+      }
+      break;
+    }
+    case SRC_OCXO2: {
+      ocxo_capture_packet_t packet{};
+      if (capture_ring_pop_handoff(g_ocxo2_capture_ring,
+                                   g_handoff_ocxo2,
+                                   packet)) {
+        update_handoff_latency(g_handoff_ocxo2,
+                               packet.isr_entry_dwt_raw,
+                               entry_dwt);
+        process_ocxo_packet(g_ocxo2_ctx, packet);
+      }
+      break;
+    }
+    case SRC_PPS: {
+      pps_capture_packet_t packet{};
+      if (capture_ring_pop_handoff(g_pps_capture_ring,
+                                   g_handoff_pps,
+                                   packet)) {
+        update_handoff_latency(g_handoff_pps,
+                               packet.isr_entry_dwt_raw,
+                               entry_dwt);
+        process_pps_packet(packet);
+      }
+      break;
+    }
+    default:
+      return false;
+  }
+  return true;
+}
+
+static void interrupt_handoff_service_isr(void) {
+  const uint32_t entry_dwt = ARM_DWT_CYCCNT;
+  if (g_interrupt_handoff.running) {
+    g_interrupt_handoff.reentry_count++;
+    interrupt_handoff_request_priority0();
+    return;
+  }
+  g_interrupt_handoff.running = true;
+  g_interrupt_handoff.pending = false;
+  g_interrupt_handoff.entry_count++;
+  g_interrupt_handoff.last_entry_dwt = entry_dwt;
+  const uint32_t latency = entry_dwt - g_interrupt_handoff.last_request_dwt;
+  g_interrupt_handoff.last_latency_cycles = latency;
+  if (latency < g_interrupt_handoff.min_latency_cycles) {
+    g_interrupt_handoff.min_latency_cycles = latency;
+  }
+  if (latency > g_interrupt_handoff.max_latency_cycles) {
+    g_interrupt_handoff.max_latency_cycles = latency;
+  }
+
+  ZPNET_EXECUTION_TRACE(
+      timepop_dispatch_trace_stage_t::HANDOFF_ENTER,
+      timepop_dispatch_trace_kind_t::INTERRUPT_HANDOFF,
+      TIMEPOP_DISPATCH_TRACE_NO_SLOT,
+      g_interrupt_handoff.entry_count,
+      0U,
+      0U,
+      0U,
+      (uint32_t)(uintptr_t)"INTERRUPT_HANDOFF",
+      entry_dwt);
+
+  uint32_t drained = 0U;
+  while (drained < INTERRUPT_HANDOFF_DRAIN_BUDGET &&
+         handoff_drain_one_oldest(entry_dwt)) {
+    ++drained;
+  }
+  if (handoff_any_pending()) {
+    g_interrupt_handoff.drain_budget_exhausted_count++;
+    g_interrupt_handoff.repend_count++;
+    interrupt_handoff_request_priority0();
+  }
+
+  ZPNET_EXECUTION_TRACE(
+      timepop_dispatch_trace_stage_t::HANDOFF_EXIT,
+      timepop_dispatch_trace_kind_t::INTERRUPT_HANDOFF,
+      TIMEPOP_DISPATCH_TRACE_NO_SLOT,
+      g_interrupt_handoff.entry_count,
+      0U,
+      0U,
+      0U,
+      (uint32_t)(uintptr_t)"INTERRUPT_HANDOFF",
+      drained);
+
+  g_interrupt_handoff.exit_count++;
+  g_interrupt_handoff.running = false;
 }
 
 static void interrupt_handoff_configure(void) {
   if (g_interrupt_handoff.configured) return;
-
   attachInterruptVector(INTERRUPT_HANDOFF_IRQ, interrupt_handoff_service_isr);
   NVIC_SET_PRIORITY(INTERRUPT_HANDOFF_IRQ, INTERRUPT_PRIORITY_HANDOFF);
   interrupt_nvic_icpr_word(INTERRUPT_HANDOFF_IRQ_NUMBER) =
       interrupt_nvic_irq_mask(INTERRUPT_HANDOFF_IRQ_NUMBER);
   interrupt_handoff_barrier();
   NVIC_ENABLE_IRQ(INTERRUPT_HANDOFF_IRQ);
-
   g_interrupt_handoff.configured = true;
   g_interrupt_handoff.configure_count++;
 }
 
-static void interrupt_handoff_process_qtimer1_ch1(
-    const qtimer1_ch1_capture_packet_t& packet);
-static void interrupt_handoff_process_qtimer1_vclock(
-    const qtimer1_vclock_capture_packet_t& packet);
-static void interrupt_handoff_process_qtimer1_ch2(
-    const qtimer1_ch2_capture_packet_t& packet);
-static __attribute__((noinline)) void interrupt_handoff_process_ocxo_1khz_sample(
-    ocxo_runtime_context_t& ctx,
-    const ocxo_1khz_sample_capture_packet_t& packet);
-static __attribute__((noinline)) void interrupt_handoff_process_ocxo_one_second(
-    ocxo_runtime_context_t& ctx,
-    const ocxo_one_second_capture_packet_t& packet);
-static void interrupt_handoff_process_pps(const pps_capture_packet_t& packet);
-
-static bool interrupt_handoff_drain_one_oldest(uint32_t handoff_entry_dwt) {
-  bool have = false;
-  uint32_t best_seq = 0xFFFFFFFFUL;
-  uint32_t seq = 0;
-  enum source_t : uint8_t {
-    SRC_NONE,
-    SRC_CH1,
-    SRC_VCLOCK,
-    SRC_CH2,
-    SRC_OCXO1_1KHZ,
-    SRC_OCXO1_1S,
-    SRC_OCXO2_1KHZ,
-    SRC_OCXO2_1S,
-    SRC_PPS
-  };
-  source_t best = SRC_NONE;
-
-  if (capture_ring_peek_sequence(g_qtimer1_ch1_capture_ring, seq) && seq < best_seq) {
-    best_seq = seq; best = SRC_CH1; have = true;
-  }
-  if (capture_ring_peek_sequence(g_qtimer1_vclock_capture_ring, seq) && seq < best_seq) {
-    best_seq = seq; best = SRC_VCLOCK; have = true;
-  }
-  if (capture_ring_peek_sequence(g_qtimer1_ch2_capture_ring, seq) && seq < best_seq) {
-    best_seq = seq; best = SRC_CH2; have = true;
-  }
-  if (capture_ring_peek_sequence(g_ocxo1_1khz_sample_capture_ring, seq) && seq < best_seq) {
-    best_seq = seq; best = SRC_OCXO1_1KHZ; have = true;
-  }
-  if (capture_ring_peek_sequence(g_ocxo1_one_second_capture_ring, seq) && seq < best_seq) {
-    best_seq = seq; best = SRC_OCXO1_1S; have = true;
-  }
-  if (capture_ring_peek_sequence(g_ocxo2_1khz_sample_capture_ring, seq) && seq < best_seq) {
-    best_seq = seq; best = SRC_OCXO2_1KHZ; have = true;
-  }
-  if (capture_ring_peek_sequence(g_ocxo2_one_second_capture_ring, seq) && seq < best_seq) {
-    best_seq = seq; best = SRC_OCXO2_1S; have = true;
-  }
-  if (capture_ring_peek_sequence(g_pps_capture_ring, seq) && seq < best_seq) {
-    best_seq = seq; best = SRC_PPS; have = true;
-  }
-  if (!have) return false;
-
-  timepop_dispatch_trace_kind_t trace_kind =
-      timepop_dispatch_trace_kind_t::INTERRUPT_HANDOFF;
-  switch (best) {
-    case SRC_CH1:
-      trace_kind = timepop_dispatch_trace_kind_t::ISR_QTIMER1;
-      break;
-    case SRC_VCLOCK:
-      trace_kind = timepop_dispatch_trace_kind_t::ISR_VCLOCK;
-      break;
-    case SRC_CH2:
-      trace_kind = timepop_dispatch_trace_kind_t::ISR_TIMED;
-      break;
-    case SRC_OCXO1_1KHZ:
-    case SRC_OCXO1_1S:
-      trace_kind = timepop_dispatch_trace_kind_t::ISR_OCXO1;
-      break;
-    case SRC_OCXO2_1KHZ:
-    case SRC_OCXO2_1S:
-      trace_kind = timepop_dispatch_trace_kind_t::ISR_OCXO2;
-      break;
-    case SRC_PPS:
-      trace_kind = timepop_dispatch_trace_kind_t::ISR_PPS;
-      break;
-    default:
-      break;
-  }
-  ZPNET_EXECUTION_TRACE(
-      timepop_dispatch_trace_stage_t::HANDOFF_DEQUEUE,
-      trace_kind,
-      (uint32_t)best,
-      best_seq,
-      0U,
-      0U,
-      0U,
-      0U,
-      handoff_entry_dwt);
-
-  const uint32_t body_start = ARM_DWT_CYCCNT;
-  switch (best) {
-    case SRC_CH1: {
-      qtimer1_ch1_capture_packet_t packet{};
-      if (capture_ring_pop_for_handoff(g_qtimer1_ch1_capture_ring,
-                                       g_handoff_qtimer1_ch1,
-                                       packet)) {
-        interrupt_handoff_note_source_entry(g_handoff_qtimer1_ch1,
-                                            packet.isr_entry_dwt_raw,
-                                            handoff_entry_dwt);
-        interrupt_handoff_process_qtimer1_ch1(packet);
-        interrupt_handoff_note_source_body(g_handoff_qtimer1_ch1, body_start);
-        return true;
-      }
-      break;
-    }
-    case SRC_VCLOCK: {
-      qtimer1_vclock_capture_packet_t packet{};
-      if (capture_ring_pop_for_handoff(g_qtimer1_vclock_capture_ring,
-                                       g_handoff_qtimer1_ch1,
-                                       packet)) {
-        interrupt_handoff_note_source_entry(g_handoff_qtimer1_ch1,
-                                            packet.isr_entry_dwt_raw,
-                                            handoff_entry_dwt);
-        interrupt_handoff_process_qtimer1_vclock(packet);
-        interrupt_handoff_note_source_body(g_handoff_qtimer1_ch1, body_start);
-        return true;
-      }
-      break;
-    }
-    case SRC_CH2: {
-      qtimer1_ch2_capture_packet_t packet{};
-      if (capture_ring_pop_for_handoff(g_qtimer1_ch2_capture_ring,
-                                       g_handoff_qtimer1_ch2,
-                                       packet)) {
-        interrupt_handoff_note_source_entry(g_handoff_qtimer1_ch2,
-                                            packet.isr_entry_dwt_raw,
-                                            handoff_entry_dwt);
-        interrupt_handoff_process_qtimer1_ch2(packet);
-        interrupt_handoff_note_source_body(g_handoff_qtimer1_ch2, body_start);
-        return true;
-      }
-      break;
-    }
-    case SRC_OCXO1_1KHZ: {
-      ocxo_1khz_sample_capture_packet_t packet{};
-      if (capture_ring_pop_for_handoff(g_ocxo1_1khz_sample_capture_ring,
-                                       g_handoff_ocxo1,
-                                       packet)) {
-        interrupt_handoff_note_source_entry(g_handoff_ocxo1,
-                                            packet.isr_entry_dwt_raw,
-                                            handoff_entry_dwt);
-        interrupt_handoff_process_ocxo_1khz_sample(g_ocxo1_ctx, packet);
-        interrupt_handoff_note_source_body(g_handoff_ocxo1, body_start);
-        return true;
-      }
-      break;
-    }
-    case SRC_OCXO1_1S: {
-      ocxo_one_second_capture_packet_t packet{};
-      if (capture_ring_pop_for_handoff(g_ocxo1_one_second_capture_ring,
-                                       g_handoff_ocxo1,
-                                       packet)) {
-        interrupt_handoff_note_source_entry(g_handoff_ocxo1,
-                                            packet.isr_entry_dwt_raw,
-                                            handoff_entry_dwt);
-        interrupt_handoff_process_ocxo_one_second(g_ocxo1_ctx, packet);
-        interrupt_handoff_note_source_body(g_handoff_ocxo1, body_start);
-        return true;
-      }
-      break;
-    }
-    case SRC_OCXO2_1KHZ: {
-      ocxo_1khz_sample_capture_packet_t packet{};
-      if (capture_ring_pop_for_handoff(g_ocxo2_1khz_sample_capture_ring,
-                                       g_handoff_ocxo2,
-                                       packet)) {
-        interrupt_handoff_note_source_entry(g_handoff_ocxo2,
-                                            packet.isr_entry_dwt_raw,
-                                            handoff_entry_dwt);
-        interrupt_handoff_process_ocxo_1khz_sample(g_ocxo2_ctx, packet);
-        interrupt_handoff_note_source_body(g_handoff_ocxo2, body_start);
-        return true;
-      }
-      break;
-    }
-    case SRC_OCXO2_1S: {
-      ocxo_one_second_capture_packet_t packet{};
-      if (capture_ring_pop_for_handoff(g_ocxo2_one_second_capture_ring,
-                                       g_handoff_ocxo2,
-                                       packet)) {
-        interrupt_handoff_note_source_entry(g_handoff_ocxo2,
-                                            packet.isr_entry_dwt_raw,
-                                            handoff_entry_dwt);
-        interrupt_handoff_process_ocxo_one_second(g_ocxo2_ctx, packet);
-        interrupt_handoff_note_source_body(g_handoff_ocxo2, body_start);
-        return true;
-      }
-      break;
-    }
-    case SRC_PPS: {
-      pps_capture_packet_t packet{};
-      if (capture_ring_pop_for_handoff(g_pps_capture_ring,
-                                       g_handoff_pps,
-                                       packet)) {
-        interrupt_handoff_note_source_entry(g_handoff_pps,
-                                            packet.isr_entry_dwt_raw,
-                                            handoff_entry_dwt);
-        interrupt_handoff_process_pps(packet);
-        interrupt_handoff_note_source_body(g_handoff_pps, body_start);
-        return true;
-      }
-      break;
-    }
-    default:
-      break;
-  }
-  return false;
-}
-
-static void interrupt_handoff_service_isr(void) {
-  const uint32_t entry_dwt = ARM_DWT_CYCCNT;  // SACRED first instruction.
-  crash_stack_tripwire_isr_check(CRASH_TRIPWIRE_SITE_HANDOFF);
-  ZPNET_EXECUTION_TRACE(
-      timepop_dispatch_trace_stage_t::HANDOFF_ENTER,
-      timepop_dispatch_trace_kind_t::INTERRUPT_HANDOFF,
-      0U,
-      g_interrupt_handoff.entry_count + 1U,
-      0U,
-      0U,
-      0U,
-      (uint32_t)(uintptr_t)"PRIORITY16_HANDOFF",
-      g_interrupt_handoff.pending ? 1U : 0U);
-  if (g_interrupt_handoff.running) {
-    g_interrupt_handoff.reentry_count++;
-    ZPNET_EXECUTION_TRACE(
-        timepop_dispatch_trace_stage_t::HANDOFF_EXIT,
-        timepop_dispatch_trace_kind_t::INTERRUPT_HANDOFF,
-        1U,
-        g_interrupt_handoff.entry_count,
-        0U,
-        0U,
-        0U,
-        (uint32_t)(uintptr_t)"PRIORITY16_HANDOFF",
-        0x80000000UL | g_interrupt_handoff.reentry_count);
-    return;
-  }
-
-  g_interrupt_handoff.running = true;
-  g_interrupt_handoff.entry_count++;
-  g_interrupt_handoff.last_entry_dwt = entry_dwt;
-  g_interrupt_handoff.entry_ipsr = interrupt_ipsr();
-  g_interrupt_handoff.entry_primask = interrupt_primask();
-
-  if (g_interrupt_handoff.pending) {
-    g_interrupt_handoff.pending = false;
-    g_interrupt_handoff.served_request_count++;
-    // A priority-0 capture may update last_request_dwt after entry_dwt was
-    // sampled.  Snapshot the request, then measure to the current service point;
-    // request-to-entry remains useful only as an overtaken-order diagnostic.
-    const uint32_t request_dwt = g_interrupt_handoff.last_request_dwt;
-    if ((int32_t)(entry_dwt - request_dwt) < 0) {
-      g_interrupt_handoff.entry_overtaken_by_request_count++;
-    }
-    const uint32_t service_dwt = ARM_DWT_CYCCNT;
-    const uint32_t latency = service_dwt - request_dwt;
-    g_interrupt_handoff.last_request_service_dwt = service_dwt;
-    g_interrupt_handoff.last_latency_cycles = latency;
-    if (latency < g_interrupt_handoff.min_latency_cycles) {
-      g_interrupt_handoff.min_latency_cycles = latency;
-    }
-    if (latency > g_interrupt_handoff.max_latency_cycles) {
-      g_interrupt_handoff.max_latency_cycles = latency;
-    }
-    g_interrupt_handoff.latency_cycles_sum += (uint64_t)latency;
-    g_interrupt_handoff.latency_sample_count++;
-  } else if (!interrupt_handoff_any_pending()) {
-    g_interrupt_handoff.spurious_entry_count++;
-  }
-
-  uint32_t drained = 0;
-  while (drained < INTERRUPT_HANDOFF_DRAIN_BUDGET &&
-         interrupt_handoff_drain_one_oldest(entry_dwt)) {
-    drained++;
-  }
-  g_interrupt_handoff.drain_pass_count++;
-
-  if (interrupt_handoff_any_pending()) {
-    g_interrupt_handoff.drain_budget_exhausted_count++;
-    g_interrupt_handoff.repend_count++;
-    g_interrupt_handoff.pending = true;
-    interrupt_nvic_ispr_word(INTERRUPT_HANDOFF_IRQ_NUMBER) =
-        interrupt_nvic_irq_mask(INTERRUPT_HANDOFF_IRQ_NUMBER);
-    interrupt_handoff_barrier();
-  }
-
-  g_interrupt_handoff.running = false;
-  g_interrupt_handoff.exit_count++;
-  g_interrupt_handoff.last_exit_dwt = ARM_DWT_CYCCNT;
-  g_interrupt_handoff.last_body_cycles =
-      g_interrupt_handoff.last_exit_dwt - entry_dwt;
-  if (g_interrupt_handoff.last_body_cycles > g_interrupt_handoff.max_body_cycles) {
-    g_interrupt_handoff.max_body_cycles = g_interrupt_handoff.last_body_cycles;
-  }
-
-  if (g_interrupt_handoff.request_count >= g_interrupt_handoff.served_request_count) {
-    g_interrupt_handoff.unserved_request_count =
-        g_interrupt_handoff.request_count - g_interrupt_handoff.served_request_count;
-  }
-
-  ZPNET_EXECUTION_TRACE(
-      timepop_dispatch_trace_stage_t::HANDOFF_EXIT,
-      timepop_dispatch_trace_kind_t::INTERRUPT_HANDOFF,
-      0U,
-      g_interrupt_handoff.entry_count,
-      0U,
-      0U,
-      0U,
-      (uint32_t)(uintptr_t)"PRIORITY16_HANDOFF",
-      drained | (g_interrupt_handoff.pending ? 0x80000000UL : 0U));
-
-}
-
-
-
-
-static bool ocxo_cadence_feed_smartzero(
-    ocxo_runtime_context_t& ctx,
-    const ocxo_cadence_isr_sample_t& sample) {
-  if (sample.was_smartzero_current) {
-    const int idx = smartzero_index_for_kind(ctx.kind);
-    if (idx >= 0) {
-      smartzero_write_begin();
-      g_smartzero.lanes[idx].pub.fire_count++;
-      smartzero_write_end();
-    }
-  }
-
-  return smartzero_feed_sample(ctx.kind,
-                               sample.event_dwt,
-                               sample.target_counter32,
-                               sample.target_low16);
-}
-
-
-static interrupt_perishable_fact_t ocxo_cadence_build_perishable_fact(
-    ocxo_runtime_context_t& ctx,
-    ocxo_cadence_isr_sample_t& sample) {
-  ocxo_perishable_ring_t& ring = ocxo_fact_ring_for(ctx);
-
-  interrupt_perishable_fact_t fact{};
-  fact.kind = ctx.kind;
-  fact.provider = ctx.provider;
-  fact.lane = ctx.lane_id;
-  fact.sequence = ++ring.sequence;
-  fact.isr_entry_dwt_raw = sample.isr_entry_dwt_raw;
-  fact.service_dwt_at_event = sample.raw_event_dwt;
-  fact.authored_dwt_at_event = sample.event_dwt;
-  fact.target_counter32 = sample.target_counter32;
-  fact.target_low16 = sample.target_low16;
-  fact.arm_counter_low16 = sample.arm_counter_low16;
-  fact.arm_compare_low16 = sample.arm_compare_low16;
-  fact.arm_counter_minus_compare_ticks = sample.arm_counter_minus_compare_ticks;
-  fact.arm_compare_remaining_ticks = sample.arm_compare_remaining_ticks;
-  fact.service_counter_low16 = sample.service_counter_low16;
-  fact.service_compare_low16 = sample.service_compare_low16;
-  fact.service_counter_minus_compare_ticks =
-      sample.service_counter_minus_compare_ticks;
-  fact.compare_delta_mod65536_ticks = sample.compare_delta_mod65536_ticks;
-  fact.compare_service_offset_ticks =
-      sample.compare_service_offset_signed_ticks;
-  fact.compare_interpreted_late_ticks = sample.compare_interpreted_late_ticks;
-  fact.compare_early_ticks = sample.compare_early_ticks;
-  fact.compare_arm_to_isr_ticks = sample.compare_arm_to_isr_ticks;
-  fact.service_offset_ticks = sample.service_offset_signed_ticks;
-  fact.service_offset_abs_ticks = sample.service_offset_abs_ticks;
-  fact.interpreted_late_ticks = sample.interpreted_late_ticks;
-  fact.early_ticks = sample.early_ticks;
-  fact.target_delta_mod65536_ticks = sample.target_delta_mod65536_ticks;
-  fact.arm_dwt_raw = sample.arm_dwt_raw;
-  fact.arm_remaining_ticks = sample.arm_remaining_ticks;
-  fact.arm_to_isr_ticks = sample.arm_to_isr_ticks;
-  fact.arm_to_isr_dwt_cycles = sample.arm_to_isr_dwt_cycles;
-  fact.csctrl_entry = sample.isr_csctrl_entry;
-  fact.csctrl_after_disable = sample.isr_csctrl_after_program;
-  fact.compare_flag_seen = true;
-  fact.compare_enabled_entry =
-      (sample.isr_csctrl_entry & TMR_CSCTRL_TCF1EN) != 0;
-  fact.compare_flag_after_disable =
-      (sample.isr_csctrl_after_program & TMR_CSCTRL_TCF1) != 0;
-  fact.compare_enabled_after_disable =
-      (sample.isr_csctrl_after_program & TMR_CSCTRL_TCF1EN) != 0;
-  fact.had_armed = sample.had_armed;
-  fact.had_active_rt = sample.had_active_rt;
-  fact.one_second_due = sample.one_second_due && sample.had_active_rt;
-  fact.service_class = sample.had_armed
-      ? (sample.service_was_early ? OCXO_SERVICE_CLASS_EARLY_PRETARGET
-                                  : OCXO_SERVICE_CLASS_ON_OR_AFTER_TARGET)
-      : OCXO_SERVICE_CLASS_FALSE_IRQ;
-  fact.exact_target_identity = true;
-  fact.sample_phase_valid = ctx.lane->cadence_sample_phase_valid;
-  fact.sample_phase_ticks = ctx.lane->cadence_sample_phase_ticks;
-  fact.sample_phase_us = ctx.lane->cadence_sample_phase_us;
-  fact.sample_phase_ns = ctx.lane->cadence_sample_phase_ns;
-  fact.sample_period_ticks = ctx.lane->cadence_sample_period_ticks;
-
-  return fact;
-}
-
-static void ocxo_cadence_enqueue_fact(
-    ocxo_runtime_context_t& ctx,
-    const interrupt_perishable_fact_t& fact) {
-  ocxo_lane_t& lane = *ctx.lane;
-
-  if (!ocxo_fact_ring_push_from_isr(ctx, fact)) {
-    // The ring reports the overflow.  Count the lane miss as well so the
-    // existing lane report shows that a hardware event was not handed off.
-    lane.miss_count++;
-  }
-}
-
-static void ocxo_1khz_packet_from_tend_capture(
-    ocxo_1khz_sample_capture_packet_t& packet,
-    const ocxo_1khz_tend_capture_t& tick) {
-  packet.isr_entry_dwt_raw = tick.isr_entry_dwt_raw;
-  packet.capture_exit_dwt = tick.capture_exit_dwt;
-  packet.authored_dwt_at_event = tick.authored_dwt_at_event;
-  packet.csctrl_entry = tick.csctrl_entry;
-  packet.service_counter_low16 = tick.service_counter_low16;
-  packet.service_compare_low16 = tick.service_compare_low16;
-  packet.target_counter32 = tick.target_counter32;
-  packet.target_low16 = tick.target_low16;
-  packet.cadence_armed = tick.cadence_armed;
-  packet.lane_active = tick.lane_active;
-  packet.rt_active = tick.rt_active;
-  packet.was_smartzero_current = tick.was_smartzero_current;
-  packet.one_second_due = tick.one_second_due;
-  packet.tick_mod_at_event = tick.tick_mod_at_event;
-  packet.arm_remaining_ticks = tick.arm_remaining_ticks;
-  packet.arm_low16 = tick.arm_low16;
-  packet.arm_compare_low16 = tick.arm_compare_low16;
-  packet.arm_dwt_raw = tick.arm_dwt_raw;
-  packet.csctrl_after_program = tick.csctrl_after_program;
-  packet.smartzero_rearm_committed = tick.smartzero_rearm_committed;
-  packet.smartzero_next_target_counter32 =
-      tick.smartzero_next_target_counter32;
-}
-
-static void ocxo_one_second_packet_from_tend_capture(
-    ocxo_one_second_capture_packet_t& packet,
-    const ocxo_1khz_tend_capture_t& tick) {
-  packet.isr_entry_dwt_raw = tick.isr_entry_dwt_raw;
-  packet.capture_exit_dwt = tick.capture_exit_dwt;
-  packet.authored_dwt_at_event = tick.authored_dwt_at_event;
-  packet.csctrl_entry = tick.csctrl_entry;
-  packet.service_counter_low16 = tick.service_counter_low16;
-  packet.service_compare_low16 = tick.service_compare_low16;
-  packet.target_counter32 = tick.target_counter32;
-  packet.target_low16 = tick.target_low16;
-  packet.cadence_armed = tick.cadence_armed;
-  packet.had_active_rt = tick.rt_active && tick.lane_active;
-  packet.tick_mod_at_event = tick.tick_mod_at_event;
-  packet.arm_remaining_ticks = tick.arm_remaining_ticks;
-  packet.arm_low16 = tick.arm_low16;
-  packet.arm_compare_low16 = tick.arm_compare_low16;
-  packet.arm_dwt_raw = tick.arm_dwt_raw;
-  packet.csctrl_after_program = tick.csctrl_after_program;
-}
-
-template <typename PacketT>
-static void ocxo_fill_common_handoff_sample(
-    ocxo_runtime_context_t& ctx,
-    const PacketT& packet,
-    ocxo_cadence_isr_sample_t& sample) {
-  sample.rt = ocxo_runtime_for(ctx);
-  sample.isr_entry_dwt_raw = packet.isr_entry_dwt_raw;
-  sample.isr_csctrl_entry = packet.csctrl_entry;
-  sample.had_armed = packet.cadence_armed;
-  sample.target_counter32 = packet.target_counter32;
-  sample.target_low16 = packet.target_low16;
-  sample.arm_counter_low16 = packet.arm_low16;
-  sample.arm_compare_low16 = packet.arm_compare_low16;
-  sample.arm_counter_minus_compare_ticks =
-      (uint32_t)((uint16_t)(sample.arm_counter_low16 - sample.arm_compare_low16));
-  sample.arm_compare_remaining_ticks =
-      (uint32_t)((uint16_t)(sample.target_low16 - sample.arm_compare_low16));
-  sample.service_counter_low16 = packet.service_counter_low16;
-  sample.service_compare_low16 = packet.service_compare_low16;
-  sample.service_counter_minus_compare_ticks =
-      (uint32_t)((uint16_t)(sample.service_counter_low16 - sample.service_compare_low16));
-  sample.target_delta_mod65536_ticks =
-      (uint32_t)((uint16_t)(sample.service_counter_low16 - sample.target_low16));
-  sample.compare_delta_mod65536_ticks =
-      (uint32_t)((uint16_t)(sample.service_compare_low16 - sample.target_low16));
-  sample.service_offset_signed_ticks =
-      (int16_t)((uint16_t)sample.target_delta_mod65536_ticks);
-  sample.compare_service_offset_signed_ticks =
-      (int16_t)((uint16_t)sample.compare_delta_mod65536_ticks);
-  sample.service_was_early = (sample.service_offset_signed_ticks < 0);
-  sample.early_ticks = sample.service_was_early
-      ? (uint32_t)(-(int32_t)sample.service_offset_signed_ticks)
-      : 0U;
-  sample.interpreted_late_ticks = sample.service_was_early
-      ? 0U
-      : (uint32_t)sample.service_offset_signed_ticks;
-  sample.service_offset_abs_ticks = sample.service_was_early
-      ? sample.early_ticks
-      : sample.interpreted_late_ticks;
-  const bool compare_was_early = (sample.compare_service_offset_signed_ticks < 0);
-  sample.compare_early_ticks = compare_was_early
-      ? (uint32_t)(-(int32_t)sample.compare_service_offset_signed_ticks)
-      : 0U;
-  sample.compare_interpreted_late_ticks = compare_was_early
-      ? 0U
-      : (uint32_t)sample.compare_service_offset_signed_ticks;
-  sample.compare_arm_to_isr_ticks =
-      (uint32_t)((uint16_t)(sample.service_compare_low16 - packet.arm_compare_low16));
-  sample.arm_dwt_raw = packet.arm_dwt_raw;
-  sample.arm_remaining_ticks = packet.arm_remaining_ticks;
-  sample.arm_to_isr_ticks =
-      (uint32_t)((uint16_t)(sample.service_counter_low16 - packet.arm_low16));
-  sample.arm_to_isr_dwt_cycles =
-      sample.isr_entry_dwt_raw - packet.arm_dwt_raw;
-  sample.raw_event_dwt = qtimer_event_dwt_from_isr_entry_raw(sample.isr_entry_dwt_raw);
-  sample.event_dwt = packet.authored_dwt_at_event
-      ? packet.authored_dwt_at_event
-      : sample.raw_event_dwt;
-  sample.isr_csctrl_after_program = packet.csctrl_after_program;
-}
-
-static ocxo_cadence_isr_sample_t ocxo_sample_from_1khz_capture(
-    ocxo_runtime_context_t& ctx,
-    const ocxo_1khz_sample_capture_packet_t& packet) {
-  ocxo_cadence_isr_sample_t sample{};
-  ocxo_fill_common_handoff_sample(ctx, packet, sample);
-  sample.had_active_rt = packet.rt_active;
-  sample.lane_active = packet.lane_active;
-  sample.was_smartzero_current = packet.was_smartzero_current;
-  sample.one_second_due = packet.one_second_due;
-  return sample;
-}
-
-static ocxo_cadence_isr_sample_t ocxo_sample_from_one_second_capture(
-    ocxo_runtime_context_t& ctx,
-    const ocxo_one_second_capture_packet_t& packet) {
-  ocxo_cadence_isr_sample_t sample{};
-  ocxo_fill_common_handoff_sample(ctx, packet, sample);
-  sample.had_active_rt = packet.had_active_rt;
-  sample.lane_active = packet.had_active_rt;
-  sample.was_smartzero_current = false;
-  sample.one_second_due = true;
-  return sample;
-}
-
-static __attribute__((noinline)) void ocxo_cadence_capture_priority0(
-    ocxo_runtime_context_t& ctx,
-                                           uint32_t isr_entry_dwt_raw,
-                                           uint16_t generation_gate_ambient_low16) {
-  ocxo_lane_t& lane = *ctx.lane;
-
-  uint32_t csctrl_entry = 0;
-  if (!qtimer_guard_read_ocxo_csctrl(lane,
-                                     "ocxo_priority0_entry",
-                                     lane.compare_target,
-                                     &csctrl_entry)) {
-    qtimer_guard_quarantine_ocxo_lane(lane, "ocxo_priority0_entry");
-    return;
-  }
-
-  // False/unowned IRQs are defused in the capture tier; there is no meaningful
-  // edge packet to hand off.
-  if ((csctrl_entry & TMR_CSCTRL_TCF1) == 0) {
-    lane.cadence_false_irq_count++;
-    lane.witness_false_irq_count++;
-    return;
-  }
-
-  if (!lane.cadence_enabled || !lane.cadence_armed) {
-    lane.cadence_false_irq_count++;
-    lane.witness_false_irq_count++;
-    if (!ocxo_lane_clear_compare_flag(lane)) {
-      return;
-    }
-    (void)ocxo_lane_disable_compare(lane);
-    lane.cadence_armed = false;
-    lane.witness_armed = false;
-    return;
-  }
-
-  const uint32_t target_counter32 = lane.cadence_next_counter32;
-  const uint16_t target_low16 =
-      hardware_low16_from_semantic(target_counter32);
-  // The counter witness captured immediately after the sacred DWT read is now
-  // the compare-generation witness.  A later ambient read may already be in a
-  // different 10 MHz cell, so do not use it to decide whether the 16-bit match
-  // belongs to the intended 32-bit target generation.
-  const uint16_t service_counter_low16 = generation_gate_ambient_low16;
-  const uint16_t service_compare_low16 = ocxo_lane_compare_counter_now(lane);
-  const uint32_t target_delta_mod65536_ticks =
-      (uint32_t)((uint16_t)(service_counter_low16 - target_low16));
-  const int16_t service_offset_ticks =
-      (int16_t)((uint16_t)target_delta_mod65536_ticks);
-  const bool service_was_early = (service_offset_ticks < 0);
-  const uint32_t interpreted_late_ticks = service_was_early
-      ? 0U
-      : (uint32_t)service_offset_ticks;
-  const uint32_t early_ticks = service_was_early
-      ? (uint32_t)(-(int32_t)service_offset_ticks)
-      : 0U;
-  const uint32_t service_offset_abs_ticks = service_was_early
-      ? early_ticks
-      : interpreted_late_ticks;
-  const uint32_t arm_to_isr_ticks =
-      (uint32_t)((uint16_t)(service_counter_low16 - lane.witness_last_arm_low16));
-  const uint32_t arm_to_isr_dwt_cycles =
-      isr_entry_dwt_raw - lane.witness_last_arm_dwt_raw;
-
-  const bool was_smartzero_current = smartzero_is_current_lane(ctx.kind);
-  const uint32_t event_tick_mod = lane.tick_mod_1000;
-  const bool one_second_due =
-      (!was_smartzero_current && lane.cadence_epoch_valid && event_tick_mod == 0U);
-  const bool keep_running = lane.active || was_smartzero_current;
-
-  // 32-bit generation gate.  The QTimer compare flag proves only low16
-  // equality.  Resolve the immediate ambient low16 witness into the lane's
-  // synthetic 32-bit timeline first; an apparent match that resolves before
-  // the authored target is a false/wrong-generation interrupt and must not
-  // advance the +10,000 tick ladder.
-  generation_gate_lane_t& generation_gate_lane = generation_gate_for_ocxo_kind(ctx.kind);
-  const uint32_t integrity_sequence =
-      generation_gate_lane.generation_gate_observe_count + 1U;
-  interrupt_integrity_note_qtimer_cntr_match(
-      ctx.kind,
-      integrity_sequence,
-      target_counter32,
-      target_low16,
-      service_counter_low16,
-      isr_entry_dwt_raw);
-  const uint32_t gate_clock32_current_counter32 = ctx.clock32
-      ? ctx.clock32->current_counter32
-      : target_counter32;
-  const uint16_t gate_clock32_hardware16 = ctx.clock32
-      ? ctx.clock32->hardware16
-      : target_low16;
-  const uint32_t resolved_counter32 = ctx.clock32
-      ? project_counter32_from_hw16(*ctx.clock32, service_counter_low16)
-      : target_counter32;
-  const bool generation_accepted = generation_gate_record(
-      generation_gate_lane,
-      resolved_counter32,
-      target_counter32,
-      service_counter_low16,
-      target_low16,
-      gate_clock32_current_counter32,
-      gate_clock32_hardware16,
-      false,
-      event_tick_mod,
-      one_second_due,
-      was_smartzero_current,
-      isr_entry_dwt_raw);
-  if (!generation_accepted) {
-    if (!ocxo_lane_clear_compare_flag(lane)) {
-      return;
-    }
-
-    const bool far_late_rejected =
-        generation_gate_lane.generation_gate_last_reason_id ==
-            GENERATION_GATE_REASON_REJECT_FAR_LATE;
-
-    if (far_late_rejected && keep_running) {
-      // A far-late tooth is not accepted as a custody sample, but leaving the
-      // stale COMP1 target armed would strand the local ladder until the next
-      // 16-bit lap.  Skip exactly this tooth and arm the next semantic tooth
-      // from the live low-word witness.  The next accepted tooth will expose
-      // the skipped interval through generation-gate diagnostics;
-      // this path does not publish a one-second fact.
-      const uint32_t next_target = target_counter32 + OCXO_CADENCE_INTERVAL_TICKS;
-      const uint16_t next_low16 =
-          hardware_low16_from_semantic(next_target);
-      const uint32_t next_remaining =
-          (uint32_t)((uint16_t)(next_low16 - service_counter_low16));
-      const bool target_is_behind = (next_remaining == 0);
-      const bool too_close = !target_is_behind &&
-          next_remaining < OCXO_WITNESS_MIN_ARM_LEAD_TICKS;
-      const bool too_far = !target_is_behind &&
-          next_remaining > (OCXO_WITNESS_LOWWORD_RANGE_TICKS -
-                            OCXO_WITNESS_MIN_ARM_LEAD_TICKS);
-
-      lane.cadence_next_counter32 = next_target;
-      lane.cadence_next_low16 = next_low16;
-      lane.compare_target = next_low16;
-      lane.witness_target_initialized = true;
-      lane.witness_target_counter32 = next_target;
-      lane.witness_target_low16 = next_low16;
-      lane.witness_schedule_last_current_counter32 = resolved_counter32;
-      lane.witness_schedule_last_target_counter32 = next_target;
-      lane.witness_schedule_last_remaining_ticks = next_remaining;
-      lane.witness_schedule_last_current_low16 = service_counter_low16;
-      lane.witness_schedule_last_target_low16 = next_low16;
-      lane.witness_schedule_last_phase_ticks = lane.cadence_epoch_valid
-          ? (target_counter32 - lane.cadence_epoch_counter32)
-          : 0U;
-
-      if (lane.cadence_epoch_valid) {
-        lane.tick_mod_1000 = (event_tick_mod + 1U) % TICKS_PER_SECOND_EVENT;
-      }
-
-      if (target_is_behind || too_close || too_far) {
-        lane.witness_generation_guard_block_count++;
-        lane.witness_generation_guard_last_remaining_ticks = next_remaining;
-        lane.witness_generation_guard_last_current_counter32 = resolved_counter32;
-        lane.witness_generation_guard_last_target_counter32 = next_target;
-        lane.witness_generation_guard_last_reason = OCXO_CADENCE_REASON_REARM;
-        lane.witness_schedule_last_decision = too_close
-            ? OCXO_SCHEDULE_DECISION_TOO_CLOSE
-            : (too_far ? OCXO_SCHEDULE_DECISION_OUTSIDE_WINDOW
-                       : OCXO_SCHEDULE_DECISION_GENERATION_GUARD_BLOCKED);
-        lane.witness_schedule_last_ticks_until_arm_window =
-            too_far ? (next_remaining - OCXO_WITNESS_ARM_WINDOW_TICKS) : 0U;
-        if (too_close) lane.witness_late_arm_count++;
-        (void)ocxo_lane_disable_compare(lane);
-        lane.cadence_armed = false;
-        lane.witness_armed = false;
-      } else {
-        lane.witness_last_arm_dwt_raw = ARM_DWT_CYCCNT;
-        lane.witness_last_arm_counter32 = resolved_counter32;
-        lane.witness_last_arm_low16 = service_counter_low16;
-        lane.witness_last_arm_compare_low16 = service_compare_low16;
-        lane.witness_last_arm_counter_minus_compare_ticks =
-            (uint32_t)((uint16_t)(service_counter_low16 - service_compare_low16));
-        lane.witness_last_arm_compare_remaining_ticks =
-            (uint32_t)((uint16_t)(next_low16 - service_compare_low16));
-        lane.witness_last_arm_target_counter32 = next_target;
-        lane.witness_last_arm_target_low16 = next_low16;
-        lane.witness_last_arm_remaining_ticks = next_remaining;
-        lane.witness_schedule_last_decision = OCXO_SCHEDULE_DECISION_ARMED;
-        lane.witness_schedule_last_ticks_until_arm_window = 0;
-
-        if (!ocxo_lane_program_compare(lane, next_low16)) {
-          return;
-        }
-        lane.cadence_armed = true;
-        lane.witness_armed = true;
-        lane.cadence_arm_count++;
-        lane.cadence_rearm_count++;
-        lane.cadence_last_reason = OCXO_CADENCE_REASON_REARM;
-      }
-    }
-
-
-    return;
-  }
-
-
-  interrupt_integrity_note_qtimer_dwt_match(ctx.kind,
-                                            integrity_sequence,
-                                            target_counter32,
-                                            isr_entry_dwt_raw,
-                                            one_second_due);
-
-  const uint32_t raw_qtimer_event_dwt =
-      qtimer_event_dwt_from_isr_entry_raw(isr_entry_dwt_raw);
-  const int32_t service_offset_correction_cycles =
-      dwt_cycles_for_ocxo_ticks_signed((int32_t)service_offset_ticks);
-  const uint32_t observed_dwt_at_target =
-      (uint32_t)((int64_t)raw_qtimer_event_dwt -
-                 (int64_t)service_offset_correction_cycles);
-  const uint32_t authored_dwt_at_event = observed_dwt_at_target;
-
-  const uint16_t accepted_hardware_low16 =
-      hardware_low16_from_semantic(target_counter32);
-
-  ocxo_1khz_tend_capture_t tick{};
-  tick.isr_entry_dwt_raw = isr_entry_dwt_raw;
-  tick.authored_dwt_at_event = authored_dwt_at_event;
-  tick.csctrl_entry = csctrl_entry;
-  tick.service_counter_low16 = service_counter_low16;
-  tick.service_compare_low16 = service_compare_low16;
-  tick.target_counter32 = target_counter32;
-  tick.target_low16 = target_low16;
-  tick.cadence_armed = lane.cadence_armed;
-  tick.lane_active = lane.active;
-  interrupt_subscriber_runtime_t* const rt_at_capture = ocxo_runtime_for(ctx);
-  tick.rt_active = rt_at_capture && rt_at_capture->active;
-  tick.was_smartzero_current = was_smartzero_current;
-  tick.one_second_due = one_second_due;
-  tick.tick_mod_at_event = event_tick_mod;
-  tick.arm_remaining_ticks = lane.witness_last_arm_remaining_ticks;
-  tick.arm_low16 = lane.witness_last_arm_low16;
-  tick.arm_compare_low16 = lane.witness_last_arm_compare_low16;
-  tick.arm_dwt_raw = lane.witness_last_arm_dwt_raw;
-
-  // Defuse the source and immediately advance the OCXO gear train in priority
-  // 0.  Reaching this point means the immediate low16 witness resolved into a
-  // lawful 32-bit generation for the authored target.
-  if (!ocxo_lane_clear_compare_flag(lane)) {
-    return;
-  }
-
-  if (ctx.clock32) {
-    ctx.clock32->current_counter32 = target_counter32;
-    ctx.clock32->current_ns = (uint64_t)target_counter32 * 100ULL;
-    ctx.clock32->hardware16 = accepted_hardware_low16;
-    ctx.clock32->minder_update_count++;
-  }
-
-  lane.logical_count32_at_last_second = target_counter32;
-  lane.compare_target = target_low16;
-  lane.cadence_hits_total++;
-  lane.cadence_fire_count++;
-  lane.cadence_last_target_counter32 = target_counter32;
-  lane.cadence_last_target_low16 = target_low16;
-  lane.cadence_last_service_low16 = service_counter_low16;
-  lane.cadence_last_fire_dwt = authored_dwt_at_event;
-  lane.cadence_last_isr_entry_dwt_raw = isr_entry_dwt_raw;
-  lane.cadence_last_service_offset_signed_ticks = (int32_t)service_offset_ticks;
-  lane.cadence_last_service_offset_abs_ticks = service_offset_abs_ticks;
-  lane.cadence_last_interpreted_late_ticks = interpreted_late_ticks;
-  lane.cadence_last_early_ticks = early_ticks;
-  lane.cadence_last_was_early = service_was_early;
-  lane.witness_last_arm_to_isr_ticks = arm_to_isr_ticks;
-  lane.witness_last_arm_to_isr_dwt_cycles = arm_to_isr_dwt_cycles;
-  lane.cadence_last_one_second_due = one_second_due;
-  if (one_second_due) lane.cadence_one_second_due_count++;
-
-  if (was_smartzero_current) {
-    if (++lane.tick_mod_1000 >= TICKS_PER_SECOND_EVENT) {
-      lane.tick_mod_1000 = 0;
-    }
-  } else if (lane.cadence_epoch_valid) {
-    lane.tick_mod_1000 = (event_tick_mod + 1U) % TICKS_PER_SECOND_EVENT;
-  }
-
-  if (keep_running) {
-    const uint32_t next_target = target_counter32 + OCXO_CADENCE_INTERVAL_TICKS;
-    const uint16_t next_low16 =
-        hardware_low16_from_semantic(next_target);
-    const int16_t service_offset_after_accept =
-        (int16_t)((uint16_t)(service_counter_low16 - accepted_hardware_low16));
-    const uint32_t arm_current_counter32 =
-        (uint32_t)((int64_t)target_counter32 +
-                   (int64_t)service_offset_after_accept);
-    const uint32_t next_remaining =
-        (uint32_t)((uint16_t)(next_low16 - service_counter_low16));
-
-    lane.cadence_next_counter32 = next_target;
-    lane.cadence_next_low16 = next_low16;
-    lane.compare_target = next_low16;
-    lane.witness_target_initialized = true;
-    lane.witness_target_counter32 = next_target;
-    lane.witness_target_low16 = next_low16;
-    lane.witness_schedule_last_current_counter32 = arm_current_counter32;
-    lane.witness_schedule_last_target_counter32 = next_target;
-    lane.witness_schedule_last_remaining_ticks = next_remaining;
-    lane.witness_schedule_last_current_low16 = service_counter_low16;
-    lane.witness_schedule_last_target_low16 = next_low16;
-    lane.witness_schedule_last_phase_ticks = lane.cadence_epoch_valid
-        ? (target_counter32 - lane.cadence_epoch_counter32)
-        : 0U;
-
-    const bool target_is_behind = (next_remaining == 0);
-    const bool too_close = !target_is_behind &&
-        next_remaining < OCXO_WITNESS_MIN_ARM_LEAD_TICKS;
-    const bool too_far = !target_is_behind &&
-        next_remaining > (OCXO_WITNESS_LOWWORD_RANGE_TICKS -
-                          OCXO_WITNESS_MIN_ARM_LEAD_TICKS);
-
-    if (target_is_behind || too_close || too_far) {
-      lane.witness_generation_guard_block_count++;
-      lane.witness_generation_guard_last_remaining_ticks = next_remaining;
-      lane.witness_generation_guard_last_current_counter32 = arm_current_counter32;
-      lane.witness_generation_guard_last_target_counter32 = next_target;
-      lane.witness_generation_guard_last_reason = OCXO_CADENCE_REASON_REARM;
-      lane.witness_schedule_last_decision = too_close
-          ? OCXO_SCHEDULE_DECISION_TOO_CLOSE
-          : (too_far ? OCXO_SCHEDULE_DECISION_OUTSIDE_WINDOW
-                     : OCXO_SCHEDULE_DECISION_GENERATION_GUARD_BLOCKED);
-      lane.witness_schedule_last_ticks_until_arm_window =
-          too_far ? (next_remaining - OCXO_WITNESS_ARM_WINDOW_TICKS) : 0U;
-      if (too_close) lane.witness_late_arm_count++;
-      (void)ocxo_lane_disable_compare(lane);
-      lane.cadence_armed = false;
-      lane.witness_armed = false;
-    } else {
-      lane.witness_last_arm_dwt_raw = ARM_DWT_CYCCNT;
-      lane.witness_last_arm_counter32 = arm_current_counter32;
-      lane.witness_last_arm_low16 = service_counter_low16;
-      lane.witness_last_arm_compare_low16 = service_compare_low16;
-      lane.witness_last_arm_counter_minus_compare_ticks =
-          (uint32_t)((uint16_t)(service_counter_low16 - service_compare_low16));
-      lane.witness_last_arm_compare_remaining_ticks =
-          (uint32_t)((uint16_t)(next_low16 - service_compare_low16));
-      lane.witness_last_arm_target_counter32 = next_target;
-      lane.witness_last_arm_target_low16 = next_low16;
-      lane.witness_last_arm_remaining_ticks = next_remaining;
-      lane.witness_schedule_last_decision = OCXO_SCHEDULE_DECISION_ARMED;
-      lane.witness_schedule_last_ticks_until_arm_window = 0;
-
-      if (!ocxo_lane_program_compare(lane, next_low16)) {
-        return;
-      }
-      lane.cadence_armed = true;
-      lane.witness_armed = true;
-      lane.cadence_arm_count++;
-      lane.cadence_rearm_count++;
-      lane.cadence_last_reason = OCXO_CADENCE_REASON_REARM;
-      if (was_smartzero_current) {
-        tick.smartzero_rearm_committed = true;
-        tick.smartzero_next_target_counter32 = next_target;
-      }
-    }
-  } else {
-    (void)ocxo_lane_disable_compare(lane);
-    lane.cadence_enabled = false;
-    lane.cadence_armed = false;
-    lane.witness_armed = false;
-    lane.cadence_last_reason = OCXO_CADENCE_REASON_STOP;
-  }
-  uint32_t csctrl_after_program = 0;
-  if (!qtimer_guard_read_ocxo_csctrl(lane,
-                                     "ocxo_priority0_after_program",
-                                     lane.compare_target,
-                                     &csctrl_after_program)) {
-    qtimer_guard_quarantine_ocxo_lane(lane, "ocxo_priority0_after_program");
-    return;
-  }
-  tick.csctrl_after_program = csctrl_after_program;
-
-  tick.capture_exit_dwt = ARM_DWT_CYCCNT;
-
-  const bool needs_1khz_sample_handoff =
-      tick.lane_active || tick.was_smartzero_current;
-  const bool needs_one_second_handoff =
-      tick.one_second_due && tick.rt_active && tick.lane_active;
-  bool handed_off = false;
-
-  // Every active 1 kHz tooth crosses the same immutable capture boundary.
-  // This removes FloorLine arithmetic from priority 0 and gives VCLOCK,
-  // OCXO1 and OCXO2 one priority-16 writer discipline.
-  if (needs_1khz_sample_handoff) {
-    ocxo_1khz_sample_capture_packet_t packet{};
-    ocxo_1khz_packet_from_tend_capture(packet, tick);
-
-    bool pushed = false;
-    if (ctx.kind == interrupt_subscriber_kind_t::OCXO1) {
-      pushed = capture_ring_push_from_priority0(
-          g_ocxo1_1khz_sample_capture_ring, g_handoff_ocxo1, packet);
-    } else if (ctx.kind == interrupt_subscriber_kind_t::OCXO2) {
-      pushed = capture_ring_push_from_priority0(
-          g_ocxo2_1khz_sample_capture_ring, g_handoff_ocxo2, packet);
-    }
-
-    if (pushed) {
-      handed_off = true;
-    } else {
-      lane.miss_count++;
-    }
-  }
-
-  // The boundary tooth also carries the subscriber-facing one-second packet.
-  // Its capture sequence follows the 1 kHz sample, so priority 16 seals
-  // FloorLine before preparing publication for this same edge.
-  if (needs_one_second_handoff) {
-    ocxo_one_second_capture_packet_t packet{};
-    ocxo_one_second_packet_from_tend_capture(packet, tick);
-
-    bool pushed = false;
-    if (ctx.kind == interrupt_subscriber_kind_t::OCXO1) {
-      pushed = capture_ring_push_from_priority0(
-          g_ocxo1_one_second_capture_ring, g_handoff_ocxo1, packet);
-    } else if (ctx.kind == interrupt_subscriber_kind_t::OCXO2) {
-      pushed = capture_ring_push_from_priority0(
-          g_ocxo2_one_second_capture_ring, g_handoff_ocxo2, packet);
-    }
-
-    if (pushed) {
-      handed_off = true;
-    } else {
-      lane.miss_count++;
-    }
-  }
-
-  if (handed_off) {
-    interrupt_handoff_request_from_capture_isr(
-        ctx.kind == interrupt_subscriber_kind_t::OCXO1
-            ? "qtimer2_ocxo1_capture"
-            : "qtimer3_ocxo2_capture");
-  } else if (!needs_1khz_sample_handoff && !needs_one_second_handoff) {
-    // Transitional/unowned OCXO IRQs are still counted, but diagnostic ownership
-    // is fixed by the physical ISR lane instead of a long-lived generic reference.
-    if (ctx.kind == interrupt_subscriber_kind_t::OCXO1) {
-      g_handoff_ocxo1.capture_count++;
-      g_handoff_ocxo1.last_capture_dwt = isr_entry_dwt_raw;
-    } else if (ctx.kind == interrupt_subscriber_kind_t::OCXO2) {
-      g_handoff_ocxo2.capture_count++;
-      g_handoff_ocxo2.last_capture_dwt = isr_entry_dwt_raw;
-    }
-  }
-}
-
-
-static __attribute__((noinline)) void interrupt_handoff_process_ocxo_1khz_sample(
-    ocxo_runtime_context_t& ctx,
-    const ocxo_1khz_sample_capture_packet_t& packet) {
-  ocxo_lane_t& lane = *ctx.lane;
-  ocxo_cadence_isr_sample_t sample =
-      ocxo_sample_from_1khz_capture(ctx, packet);
-
-  if (sample.rt && sample.was_smartzero_current) {
-    sample.rt->irq_count++;
-  }
-
-  // This path never publishes a subscriber edge.  It is the common 1 kHz
-  // priority-16 custody tier for both FloorLine and SmartZero.
-  lane.cadence_last_one_second_due = sample.one_second_due;
-
-  if (sample.lane_active && !sample.was_smartzero_current) {
-    floorline_observe_handoff(ctx.kind,
-                              sample.event_dwt,
-                              sample.target_counter32,
-                              sample.target_low16,
-                              sample.service_counter_low16,
-                              sample.one_second_due);
-  }
-
-  if (sample.was_smartzero_current) {
-    // Priority 16 is the sole SmartZero data writer.  Apply the hardware rearm
-    // result captured by priority 0 before feeding the corresponding sample.
-    if (packet.smartzero_rearm_committed) {
-      const int idx = smartzero_index_for_kind(ctx.kind);
-      if (idx >= 0) {
-        smartzero_write_begin();
-        g_smartzero.lanes[idx].pub.next_target_counter32 =
-            packet.smartzero_next_target_counter32;
-        g_smartzero.lanes[idx].pub.arm_count++;
-        smartzero_write_end();
-      }
-    }
-
-    const bool cadence_reauthored_by_smartzero =
-        ocxo_cadence_feed_smartzero(ctx, sample);
-    (void)cadence_reauthored_by_smartzero;
-  }
-}
-
-static __attribute__((noinline)) void interrupt_handoff_process_ocxo_one_second(
-    ocxo_runtime_context_t& ctx,
-    const ocxo_one_second_capture_packet_t& packet) {
-  ocxo_lane_t& lane = *ctx.lane;
-  ocxo_cadence_isr_sample_t sample =
-      ocxo_sample_from_one_second_capture(ctx, packet);
-
-  if (sample.rt) {
-    sample.rt->irq_count++;
-  }
-
-  // This is the only OCXO handoff path allowed to create a one-second fact.
-  lane.cadence_last_one_second_due = true;
-
-  if (sample.had_active_rt) {
-    interrupt_perishable_fact_t fact =
-        ocxo_cadence_build_perishable_fact(ctx, sample);
-    ocxo_cadence_enqueue_fact(ctx, fact);
-  }
-
-  lane.cadence_last_one_second_due = true;
-}
-
-
-static void qtimer2_isr(void) {
-  const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;  // SACRED: first instruction.
-  const uint16_t generation_gate_ambient_low16 =
-      IMXRT_TMR2.CH[QTIMER2_OCXO1_CH].CNTR;
-  crash_stack_tripwire_isr_check(CRASH_TRIPWIRE_SITE_QTIMER2);
-  ZPNET_EXECUTION_TRACE(
-      timepop_dispatch_trace_stage_t::ISR_ENTER,
-      timepop_dispatch_trace_kind_t::ISR_OCXO1,
-      QTIMER2_OCXO1_CH,
-      g_ocxo1_lane.cadence_fire_count,
-      0U,
-      0U,
-      (uint32_t)(uintptr_t)&g_ocxo1_ctx,
-      (uint32_t)(uintptr_t)"QTIMER2_OCXO1_ISR",
-      generation_gate_ambient_low16);
-  ocxo_cadence_capture_priority0(g_ocxo1_ctx,
-                                 isr_entry_dwt_raw,
-                                 generation_gate_ambient_low16);
-  ZPNET_EXECUTION_TRACE(
-      timepop_dispatch_trace_stage_t::ISR_EXIT,
-      timepop_dispatch_trace_kind_t::ISR_OCXO1,
-      QTIMER2_OCXO1_CH,
-      g_ocxo1_lane.cadence_fire_count,
-      0U,
-      0U,
-      (uint32_t)(uintptr_t)&g_ocxo1_ctx,
-      (uint32_t)(uintptr_t)"QTIMER2_OCXO1_ISR",
-      generation_gate_ambient_low16);
-}
-
-static void qtimer3_isr(void) {
-  const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;  // SACRED: first instruction.
-  const uint16_t generation_gate_ambient_low16 =
-      IMXRT_TMR3.CH[QTIMER3_OCXO2_CH].CNTR;
-  crash_stack_tripwire_isr_check(CRASH_TRIPWIRE_SITE_QTIMER3);
-  ZPNET_EXECUTION_TRACE(
-      timepop_dispatch_trace_stage_t::ISR_ENTER,
-      timepop_dispatch_trace_kind_t::ISR_OCXO2,
-      QTIMER3_OCXO2_CH,
-      g_ocxo2_lane.cadence_fire_count,
-      0U,
-      0U,
-      (uint32_t)(uintptr_t)&g_ocxo2_ctx,
-      (uint32_t)(uintptr_t)"QTIMER3_OCXO2_ISR",
-      generation_gate_ambient_low16);
-  ocxo_cadence_capture_priority0(g_ocxo2_ctx,
-                                 isr_entry_dwt_raw,
-                                 generation_gate_ambient_low16);
-  ZPNET_EXECUTION_TRACE(
-      timepop_dispatch_trace_stage_t::ISR_EXIT,
-      timepop_dispatch_trace_kind_t::ISR_OCXO2,
-      QTIMER3_OCXO2_CH,
-      g_ocxo2_lane.cadence_fire_count,
-      0U,
-      0U,
-      (uint32_t)(uintptr_t)&g_ocxo2_ctx,
-      (uint32_t)(uintptr_t)"QTIMER3_OCXO2_ISR",
-      generation_gate_ambient_low16);
-}
-
 // ============================================================================
-// QTimer1 vector — dispatches CH2 (TimePop)
+// Sacred priority-0 capture
 // ============================================================================
 
-static volatile interrupt_qtimer1_ch2_handler_fn g_qtimer1_ch2_handler = nullptr;
+static void qtimer1_capture_vclock_priority0(uint32_t isr_entry_dwt_raw,
+                                              uint16_t service_low16) {
+  const uint32_t target = g_vclock_heartbeat_next_counter32;
+  const uint16_t target_low16 = g_vclock_heartbeat_target_low16;
 
-void interrupt_register_qtimer1_ch2_handler(interrupt_qtimer1_ch2_handler_fn cb) {
-  g_qtimer1_ch2_handler =
-      interrupt_callback_address_executable((uintptr_t)cb) ? cb : nullptr;
-}
-
-// ============================================================================
-// PPS GPIO ISR-entry listener — hosted diagnostics hook for process_witness
-// ============================================================================
-
-void interrupt_register_pps_entry_latency_handler(
-    interrupt_pps_entry_latency_handler_fn cb) {
-  g_pps_entry_latency_handler =
-      interrupt_callback_address_executable((uintptr_t)cb) ? cb : nullptr;
-}
-
-// ============================================================================
-// QTimer1 CH1 compare service — hosted rail for process_witness
-// ============================================================================
-
-void interrupt_register_qtimer1_ch1_handler(interrupt_qtimer1_ch1_handler_fn cb) {
-  g_qtimer1_ch1_handler =
-      interrupt_callback_address_executable((uintptr_t)cb) ? cb : nullptr;
-}
-
-static void qtimer1_ch1_schedule_next_hop(void) {
-  if (!g_qtimer1_ch1_active) return;
-
-  const uint32_t now = vclock_synthetic_from_hardware_low16(qtimer1_ch0_counter_now());
-  const uint32_t remaining = g_qtimer1_ch1_target_counter32 - now;
-
-  // If the target is behind us in modular time, stop rather than generating
-  // misleading event facts.  The caller can re-arm from a fresh PPS anchor.
-  if (remaining == 0 || remaining > 0x7FFFFFFFUL) {
-    g_qtimer1_ch1_active = false;
-    qtimer1_ch1_disable_compare_hw();
-    return;
-  }
-
-  static constexpr uint32_t CH1_MAX_COMPARE_STEP_TICKS = 49123U;
-
-  const uint32_t step =
-      (remaining > CH1_MAX_COMPARE_STEP_TICKS)
-          ? CH1_MAX_COMPARE_STEP_TICKS
-          : remaining;
-
-  g_qtimer1_ch1_next_compare_counter32 = now + step;
-
-  const uint16_t hardware_target =
-      vclock_hardware_low16_from_synthetic(g_qtimer1_ch1_next_compare_counter32);
-  qtimer1_ch1_program_compare(hardware_target);
-}
-
-bool interrupt_qtimer1_ch1_arm_compare(uint32_t target_counter32) {
-  (void)target_counter32;
-  g_qtimer1_ch1_arm_count++;
-  g_qtimer1_ch1_active = false;
-  return false;
-}
-
-void interrupt_qtimer1_ch1_disable_compare(void) {
-  g_qtimer1_ch1_active = false;
-  qtimer1_ch1_disable_compare_hw();
-}
-
-uint16_t interrupt_qtimer1_ch1_counter_now(void) { return IMXRT_TMR1.CH[QTIMER1_RETIRED_AUX_CH].CNTR; }
-uint16_t interrupt_qtimer1_ch1_comp1_now(void)   { return IMXRT_TMR1.CH[QTIMER1_RETIRED_AUX_CH].COMP1; }
-uint16_t interrupt_qtimer1_ch1_csctrl_now(void)  { return IMXRT_TMR1.CH[QTIMER1_RETIRED_AUX_CH].CSCTRL; }
-
-// ============================================================================
-// TimePop hardware service API
-// ============================================================================
-
-uint32_t interrupt_vclock_counter32_observe_ambient(void) {
-  return vclock_synthetic_from_hardware_low16(qtimer1_ch0_counter_now());
-}
-
-void interrupt_qtimer1_ch2_arm_compare(uint32_t target_counter32) {
-  g_qtimer1_ch2_last_target_counter32 = target_counter32;
-  g_qtimer1_ch2_arm_count++;
-  const uint16_t hardware_target = vclock_hardware_low16_from_synthetic(target_counter32);
-  qtimer1_ch2_program_compare(hardware_target);
-}
-
-uint16_t interrupt_qtimer1_ch2_counter_now(void) { return IMXRT_TMR1.CH[QTIMER1_TIMEPOP_CH].CNTR; }
-uint16_t interrupt_qtimer1_ch2_comp1_now(void)   { return IMXRT_TMR1.CH[QTIMER1_TIMEPOP_CH].COMP1; }
-uint16_t interrupt_qtimer1_ch2_csctrl_now(void)  { return IMXRT_TMR1.CH[QTIMER1_TIMEPOP_CH].CSCTRL; }
-
-static void interrupt_handoff_process_qtimer1_ch1(
-    const qtimer1_ch1_capture_packet_t& packet) {
-  if (!packet.active_at_capture) {
-    qtimer1_ch1_disable_compare_hw();
-    return;
-  }
-
-  const uint32_t fired_counter32 = packet.next_compare_counter32;
-
-  if (fired_counter32 != packet.target_counter32) {
-    g_qtimer1_ch1_hop_count++;
-    qtimer1_ch1_schedule_next_hop();
-    return;
-  }
-
-  g_qtimer1_ch1_active = false;
-  qtimer1_ch1_disable_compare_hw();
-  g_qtimer1_ch1_fire_count++;
-
-  const uint32_t qtimer_event_dwt =
-      qtimer_event_dwt_from_isr_entry_raw(packet.isr_entry_dwt_raw);
-  const int64_t gnss_ns = vclock_gnss_from_counter32(fired_counter32);
-
-  interrupt_qtimer1_ch1_compare_event_t event{};
-  event.sequence = ++g_qtimer1_ch1_sequence;
-  event.target_counter32 = packet.target_counter32;
-  event.counter32_at_event = fired_counter32;
-  event.counter32_residual_ticks =
-      (int32_t)(fired_counter32 - packet.target_counter32);
-  event.isr_entry_dwt_raw = packet.isr_entry_dwt_raw;
-  event.dwt_at_event = qtimer_event_dwt;
-  event.gnss_ns_at_event = gnss_ns;
-
-  const interrupt_qtimer1_ch1_handler_fn callback = g_qtimer1_ch1_handler;
-  if (interrupt_callback_address_executable((uintptr_t)callback)) {
-    ZPNET_EXECUTION_TRACE(
-        timepop_dispatch_trace_stage_t::SUBSCRIBER_ENTER,
-        timepop_dispatch_trace_kind_t::ISR_QTIMER1,
-        QTIMER1_RETIRED_AUX_CH,
-        event.sequence,
-        (uint32_t)(uintptr_t)callback,
-        (uint32_t)(uintptr_t)g_qtimer1_ch1_handler,
-        0U,
-        (uint32_t)(uintptr_t)"QTIMER1_CH1_HOSTED",
-        event.counter32_at_event);
-    callback(event);
-    ZPNET_EXECUTION_TRACE(
-        timepop_dispatch_trace_stage_t::SUBSCRIBER_RETURN,
-        timepop_dispatch_trace_kind_t::ISR_QTIMER1,
-        QTIMER1_RETIRED_AUX_CH,
-        event.sequence,
-        (uint32_t)(uintptr_t)callback,
-        (uint32_t)(uintptr_t)g_qtimer1_ch1_handler,
-        0U,
-        (uint32_t)(uintptr_t)"QTIMER1_CH1_HOSTED",
-        event.counter32_at_event);
-  }
-}
-
-static __attribute__((noinline)) void vclock_heartbeat_native_service(uint32_t isr_entry_dwt_raw,
-                                           uint32_t qtimer_event_dwt,
-                                           uint32_t cadence_counter32);
-
-static void interrupt_handoff_process_qtimer1_vclock(
-    const qtimer1_vclock_capture_packet_t& packet) {
-  const uint32_t service_counter32 = packet.service_counter32;
-  const uint32_t target_counter32 = packet.target_counter32;
-  const uint32_t late_ticks = service_counter32 - target_counter32;
-
-  uint32_t qtimer_event_dwt = qtimer_event_dwt_from_isr_entry_raw(packet.isr_entry_dwt_raw);
-  if (late_ticks != 0 && late_ticks < VCLOCK_INTERVAL_COUNTS) {
-    qtimer_event_dwt -= vclock_cycles_for_ticks(late_ticks);
-  }
-
-  vclock_heartbeat_native_service(packet.isr_entry_dwt_raw,
-                                  qtimer_event_dwt,
-                                  target_counter32);
-}
-
-static void interrupt_handoff_process_qtimer1_ch2(
-    const qtimer1_ch2_capture_packet_t& packet) {
-  const uint32_t isr_entry_dwt_raw = packet.isr_entry_dwt_raw;
-  const uint32_t qtimer_event_dwt = qtimer_event_dwt_from_isr_entry_raw(isr_entry_dwt_raw);
-  const uint32_t ch2_event_counter32 = packet.ch2_event_counter32;
-
-  // QTimer1 CH2 is TimePop scheduler-only.  VCLOCK custody services run on
-  // the native CH0 heartbeat; do not author VCLOCK facts from this sibling rail.
-  const interrupt_qtimer1_ch2_handler_fn callback = g_qtimer1_ch2_handler;
-  if (interrupt_callback_address_executable((uintptr_t)callback)) {
-    const bridge_projection_t bridge = interrupt_dwt_to_vclock_gnss_projection(qtimer_event_dwt);
-    const int64_t  gnss_ns = bridge.gnss_ns;
-    bridge_projection_record_stats(interrupt_subscriber_kind_t::TIMEPOP, bridge);
-
-    interrupt_event_t event{};
-    event.kind     = interrupt_subscriber_kind_t::TIMEPOP;
-    event.provider = interrupt_provider_kind_t::QTIMER1;
-    event.lane     = interrupt_lane_t::QTIMER1_CH2_COMP;
-    event.status   = interrupt_event_status_t::OK;
-    event.dwt_at_event       = qtimer_event_dwt;
-    event.gnss_ns_at_event   = (gnss_ns >= 0) ? (uint64_t)gnss_ns : 0;
-    event.counter32_at_event = ch2_event_counter32;
-
-    interrupt_capture_diag_t diag{};
-    diag.enabled  = true;
-    diag.provider = interrupt_provider_kind_t::QTIMER1;
-    diag.lane     = interrupt_lane_t::QTIMER1_CH2_COMP;
-    diag.kind     = interrupt_subscriber_kind_t::TIMEPOP;
-    diag.dwt_at_event       = qtimer_event_dwt;
-    diag.gnss_ns_at_event   = event.gnss_ns_at_event;
-    diag.counter32_at_event = event.counter32_at_event;
-    diag.dwt_isr_entry_raw  = isr_entry_dwt_raw;
-    diag.dwt_event_from_isr_entry_raw = qtimer_event_dwt;
-    diag.dwt_isr_entry_to_event_correction_cycles =
-        (int32_t)(qtimer_event_dwt - isr_entry_dwt_raw);
-    diag.dwt_published_minus_event_cycles = 0;
-    diag.dwt_used_minus_event_cycles = 0;
-      bridge_projection_copy_to_diag(diag, bridge);
-
-    ZPNET_EXECUTION_TRACE(
-        timepop_dispatch_trace_stage_t::SUBSCRIBER_ENTER,
-        timepop_dispatch_trace_kind_t::ISR_TIMED,
-        QTIMER1_TIMEPOP_CH,
-        ch2_event_counter32,
-        (uint32_t)(uintptr_t)callback,
-        (uint32_t)(uintptr_t)g_qtimer1_ch2_handler,
-        0U,
-        (uint32_t)(uintptr_t)"QTIMER1_CH2_TIMEPOP",
-        qtimer_event_dwt);
-    callback(event, diag);
-    ZPNET_EXECUTION_TRACE(
-        timepop_dispatch_trace_stage_t::SUBSCRIBER_RETURN,
-        timepop_dispatch_trace_kind_t::ISR_TIMED,
-        QTIMER1_TIMEPOP_CH,
-        ch2_event_counter32,
-        (uint32_t)(uintptr_t)callback,
-        (uint32_t)(uintptr_t)g_qtimer1_ch2_handler,
-        0U,
-        (uint32_t)(uintptr_t)"QTIMER1_CH2_TIMEPOP",
-        qtimer_event_dwt);
-  }
-
-}
-
-static void qtimer1_vclock_capture_priority0(uint32_t isr_entry_dwt_raw,
-                                             uint32_t csctrl_entry,
-                                             uint16_t generation_gate_ambient_low16) {
-  const uint32_t target_counter32 = g_vclock_heartbeat_next_counter32;
-  const uint16_t target_low16 = (uint16_t)(target_counter32 & 0xFFFFU);
-
-  // Resolve the immediate low16 witness into the VCLOCK 32-bit timeline
-  // before treating the compare flag as a custody tooth.
-  const uint16_t service_low16 = generation_gate_ambient_low16;
-  const uint32_t service_counter32 =
-      vclock_synthetic_from_hardware_low16(service_low16);
-  const uint32_t integrity_sequence =
-      g_generation_gate_vclock.generation_gate_observe_count + 1U;
-  const bool one_second_boundary =
-      g_vclock_ch2_one_second_enabled
-          ? ((int32_t)(target_counter32 -
-                       g_vclock_ch2_one_second_next_counter32) >= 0)
-          : (g_vclock_lane.phase_bootstrapped &&
-             ((g_vclock_lane.tick_mod_1000 + 1U) >= TICKS_PER_SECOND_EVENT));
-  interrupt_integrity_note_qtimer_cntr_match(
-      interrupt_subscriber_kind_t::VCLOCK,
-      integrity_sequence,
-      target_counter32,
-      target_low16,
-      service_low16,
-      isr_entry_dwt_raw);
-  const bool generation_accepted = generation_gate_record(
-      g_generation_gate_vclock,
-      service_counter32,
-      target_counter32,
-      service_low16,
-      target_low16,
-      g_vclock_clock32.current_counter32,
-      g_vclock_clock32.hardware16,
-      false,
-      g_vclock_lane.tick_mod_1000,
-      one_second_boundary,
-      false,
-      isr_entry_dwt_raw);
-  if (!generation_accepted) {
-    qtimer1_vclock_clear_compare_flag();
-
-    return;
-  }
-
-  interrupt_integrity_note_qtimer_dwt_match(interrupt_subscriber_kind_t::VCLOCK,
-                                            integrity_sequence,
-                                            target_counter32,
-                                            isr_entry_dwt_raw,
-                                            one_second_boundary);
-
-  uint32_t vclock_observed_dwt_at_target =
-      qtimer_event_dwt_from_isr_entry_raw(isr_entry_dwt_raw);
-  const uint32_t vclock_late_ticks = service_counter32 - target_counter32;
-  if (vclock_late_ticks != 0 && vclock_late_ticks < VCLOCK_INTERVAL_COUNTS) {
-    vclock_observed_dwt_at_target -= vclock_cycles_for_ticks(vclock_late_ticks);
-  }
-
+  // Priority 0 defuses the source and captures facts only.  Priority 16 owns
+  // catch-up arithmetic and programming of the next VCLOCK compare.
+  IMXRT_TMR1.CH[QTIMER1_VCLOCK_CH].CSCTRL &= ~TMR_CSCTRL_TCF1EN;
   qtimer1_vclock_clear_compare_flag();
 
-  qtimer1_vclock_capture_packet_t packet{};
+  vclock_capture_packet_t packet{};
   packet.isr_entry_dwt_raw = isr_entry_dwt_raw;
-  packet.target_counter32 = target_counter32;
-  packet.service_counter32 = service_counter32;
+  packet.target_counter32 = target;
+  packet.target_low16 = target_low16;
   packet.service_low16 = service_low16;
-  packet.csctrl_entry = csctrl_entry;
-
-  // Re-arm the next native 1 ms VCLOCK compare immediately in the capture
-  // tier.  The handoff tier may interpret the event, but the clock rail must
-  // not wait on it to keep ticking.
-  uint32_t next = target_counter32 + VCLOCK_INTERVAL_COUNTS;
-  while ((int32_t)(service_counter32 - next) >= 0) {
-    next += VCLOCK_INTERVAL_COUNTS;
-  }
-  g_vclock_heartbeat_next_counter32 = next;
-  qtimer1_vclock_program_compare((uint16_t)(next & 0xFFFFU));
-
   packet.capture_exit_dwt = ARM_DWT_CYCCNT;
-
-  if (capture_ring_push_from_priority0(g_qtimer1_vclock_capture_ring,
-                                       g_handoff_qtimer1_ch1,
-                                       packet)) {
-    interrupt_handoff_request_from_capture_isr("qtimer1_ch0_vclock_capture");
+  if (capture_ring_push_priority0(g_vclock_capture_ring,
+                                  g_handoff_vclock,
+                                  packet)) {
+    interrupt_handoff_request_priority0();
+    return;
   }
+
+  // An overrun has already lost this tooth.  Keep VCLOCK alive with the
+  // smallest possible anomaly fallback; ordinary rearm never runs here.
+  const uint32_t next = target + VCLOCK_INTERVAL_COUNTS;
+  const uint16_t next_low16 = (uint16_t)(target_low16 +
+                                         (uint16_t)VCLOCK_INTERVAL_COUNTS);
+  g_vclock_heartbeat_next_counter32 = next;
+  g_vclock_heartbeat_target_low16 = next_low16;
+  qtimer1_vclock_program_compare(next_low16);
 }
 
-static void qtimer1_ch2_capture_priority0(uint32_t isr_entry_dwt_raw,
-                                            uint32_t csctrl_entry) {
+static void qtimer1_capture_ch2_priority0(uint32_t isr_entry_dwt_raw) {
   qtimer1_ch2_clear_compare_flag();
-
-  qtimer1_ch2_capture_packet_t packet{};
+  ch2_capture_packet_t packet{};
   packet.isr_entry_dwt_raw = isr_entry_dwt_raw;
-  packet.ch2_event_counter32 = g_qtimer1_ch2_last_target_counter32;
-  packet.csctrl_entry = csctrl_entry;
-
+  packet.target_counter32 = g_qtimer1_ch2_last_target_counter32;
   packet.capture_exit_dwt = ARM_DWT_CYCCNT;
-
-  if (capture_ring_push_from_priority0(g_qtimer1_ch2_capture_ring,
-                                       g_handoff_qtimer1_ch2,
-                                       packet)) {
-    interrupt_handoff_request_from_capture_isr("qtimer1_ch2_capture");
+  if (capture_ring_push_priority0(g_ch2_capture_ring,
+                                  g_handoff_ch2,
+                                  packet)) {
+    interrupt_handoff_request_priority0();
   }
 }
 
 static void qtimer1_isr(void) {
-  const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;  // SACRED: first instruction.
-  const uint16_t generation_gate_vclock_low16 = qtimer1_ch0_counter_now();
+  const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;
   crash_stack_tripwire_isr_check(CRASH_TRIPWIRE_SITE_QTIMER1);
-  ZPNET_EXECUTION_TRACE(
-      timepop_dispatch_trace_stage_t::ISR_ENTER,
-      timepop_dispatch_trace_kind_t::ISR_QTIMER1,
-      TIMEPOP_DISPATCH_TRACE_NO_SLOT,
-      g_interrupt_handoff.request_count,
-      0U,
-      0U,
-      0U,
-      (uint32_t)(uintptr_t)"QTIMER1_SHARED_ISR",
-      generation_gate_vclock_low16);
-  // VCLOCK authority: QTimer1 CH0 is the pin-bound VCLOCK count+compare rail.
-  const uint32_t vclock_csctrl = IMXRT_TMR1.CH[QTIMER1_VCLOCK_CH].CSCTRL;
-  if (vclock_csctrl & TMR_CSCTRL_TCF1) {
-    qtimer1_vclock_capture_priority0(isr_entry_dwt_raw,
-                                     vclock_csctrl,
-                                     generation_gate_vclock_low16);
-    ZPNET_EXECUTION_TRACE(
-        timepop_dispatch_trace_stage_t::ISR_EXIT,
-        timepop_dispatch_trace_kind_t::ISR_VCLOCK,
-        QTIMER1_VCLOCK_CH,
-        g_generation_gate_vclock.generation_gate_observe_count,
-        0U,
-        0U,
-        0U,
-        (uint32_t)(uintptr_t)"QTIMER1_VCLOCK_ISR",
-        vclock_csctrl);
+
+  const uint32_t vclock_csctrl =
+      IMXRT_TMR1.CH[QTIMER1_VCLOCK_CH].CSCTRL;
+  const uint32_t ch2_csctrl =
+      IMXRT_TMR1.CH[QTIMER1_TIMEPOP_CH].CSCTRL;
+
+  // Same-vector matches share the same first-instruction DWT capture.  This is
+  // intentional: co-timed TimePop work cannot delay or remeasure VCLOCK.
+  if ((vclock_csctrl & TMR_CSCTRL_TCF1) != 0U) {
+    const uint16_t vclock_service_low16 =
+        IMXRT_TMR1.CH[QTIMER1_VCLOCK_CH].CNTR;
+    qtimer1_capture_vclock_priority0(isr_entry_dwt_raw,
+                                     vclock_service_low16);
+  }
+  if ((ch2_csctrl & TMR_CSCTRL_TCF1) != 0U) {
+    qtimer1_capture_ch2_priority0(isr_entry_dwt_raw);
+  }
+}
+
+static void ocxo_capture_priority0(
+    ocxo_runtime_context_t& ctx,
+    interrupt_capture_ring_t<ocxo_capture_packet_t,
+                             HANDOFF_OCXO_RING_SIZE>& ring,
+    interrupt_handoff_source_diag_t& handoff,
+    uint32_t isr_entry_dwt_raw) {
+  ocxo_lane_t& lane = *ctx.lane;
+  const uint32_t csctrl = lane.module->CH[lane.channel].CSCTRL;
+  if ((csctrl & TMR_CSCTRL_TCF1) == 0U) {
+    lane.false_irq_count++;
     return;
   }
 
-  // TimePop scheduler only: QTimer1 CH2 may wake callbacks, but it never
-  // authors VCLOCK edge identity or event-time correction.
-  const uint32_t timepop_csctrl = IMXRT_TMR1.CH[QTIMER1_TIMEPOP_CH].CSCTRL;
-  if (timepop_csctrl & TMR_CSCTRL_TCF1) {
-    qtimer1_ch2_capture_priority0(isr_entry_dwt_raw, timepop_csctrl);
-    ZPNET_EXECUTION_TRACE(
-        timepop_dispatch_trace_stage_t::ISR_EXIT,
-        timepop_dispatch_trace_kind_t::ISR_TIMED,
-        QTIMER1_TIMEPOP_CH,
-        g_qtimer1_ch2_last_target_counter32,
-        0U,
-        0U,
-        0U,
-        (uint32_t)(uintptr_t)"QTIMER1_CH2_ISR",
-        timepop_csctrl);
-    return;
-  }
+  // DWT was captured before any of these reads.  CNTR and COMP1 are retained
+  // only as witnesses; the semantic identity is the authored target below.
+  const uint16_t ambient_low16 = lane.module->CH[lane.channel].CNTR;
+  const uint16_t compare_low16 = lane.module->CH[lane.channel].COMP1;
+  const uint32_t target_counter32 = lane.armed_target_counter32;
+  const uint16_t target_low16 = lane.armed_target_low16;
+  const bool active = lane.active && lane.compare_armed &&
+      target_counter32 != 0U;
 
-  // Defensive defuse for the retired QTimer1 CH1 rail.
-  const uint32_t aux_csctrl = IMXRT_TMR1.CH[QTIMER1_RETIRED_AUX_CH].CSCTRL;
-  if (aux_csctrl & TMR_CSCTRL_TCF1) {
-    qtimer1_ch1_clear_compare_flag();
-  }
+  qtimer_disable_compare(*lane.module, lane.channel);
+  lane.compare_armed = false;
 
-  ZPNET_EXECUTION_TRACE(
-      timepop_dispatch_trace_stage_t::ISR_EXIT,
-      timepop_dispatch_trace_kind_t::ISR_QTIMER1,
-      (aux_csctrl & TMR_CSCTRL_TCF1)
-          ? QTIMER1_RETIRED_AUX_CH
-          : TIMEPOP_DISPATCH_TRACE_NO_SLOT,
-      g_interrupt_handoff.request_count,
-      0U,
-      0U,
-      0U,
-      (uint32_t)(uintptr_t)"QTIMER1_SHARED_ISR",
-      aux_csctrl);
-
-}
-
-// ============================================================================
-// PPS GPIO ISR — authors PPS and PPS_VCLOCK from the same _raw capture
-// ============================================================================
-//
-// The _raw is the first-instruction capture.  It is converted IMMEDIATELY
-// into PPS and PPS_VCLOCK event-coordinate values and never propagated.
-
-static void pps_edge_dispatch_trampoline(timepop_ctx_t*, timepop_diag_t*, void*) {
-  const pps_edge_dispatch_fn callback = g_pps_edge_dispatch;
-  if (!interrupt_callback_address_executable((uintptr_t)callback)) return;
-
-  const pps_edge_snapshot_t snap = interrupt_last_pps_edge();
-  ZPNET_EXECUTION_TRACE(
-      timepop_dispatch_trace_stage_t::SUBSCRIBER_ENTER,
-      timepop_dispatch_trace_kind_t::SUBSCRIBER_VCLOCK,
-      (uint32_t)interrupt_subscriber_kind_t::VCLOCK,
-      snap.sequence,
-      (uint32_t)(uintptr_t)callback,
-      (uint32_t)(uintptr_t)g_pps_edge_dispatch,
-      0U,
-      (uint32_t)(uintptr_t)"PPS_EDGE_DISPATCH",
-      snap.counter32_at_edge);
-  callback(snap);
-  ZPNET_EXECUTION_TRACE(
-      timepop_dispatch_trace_stage_t::SUBSCRIBER_RETURN,
-      timepop_dispatch_trace_kind_t::SUBSCRIBER_VCLOCK,
-      (uint32_t)interrupt_subscriber_kind_t::VCLOCK,
-      snap.sequence,
-      (uint32_t)(uintptr_t)callback,
-      (uint32_t)(uintptr_t)g_pps_edge_dispatch,
-      0U,
-      (uint32_t)(uintptr_t)"PPS_EDGE_DISPATCH",
-      snap.counter32_at_edge);
-}
-
-static void pps_relay_assert_from_isr(uint32_t sequence) {
-  // PPS relay HIGH is a physical PPS witness and stays in ISR context.
-  // Relay LOW is intentionally *not* scheduled through TimePop.  Instead,
-  // intrinsic QTimer1 CH1 service counts elapsed 1 ms VCLOCK cells and
-  // deasserts the relay when the counter reaches zero.  This removes
-  // relay-off from TimePop callback/ASAP/one-shot slot mutation entirely.
-  digitalWriteFast(GNSS_PPS_RELAY, HIGH);
-  g_pps_relay_assert_count++;
-  g_pps_relay_last_assert_sequence = sequence;
-  g_pps_relay_deassert_countdown_ticks = PPS_RELAY_OFF_CADENCE_TICKS;
-  g_pps_relay_ch2_last_counter32 =
-      vclock_synthetic_from_hardware_low16(qtimer1_ch0_counter_now());
-  g_pps_relay_ch2_tick_valid = true;
-  g_pps_relay_deassert_arm_pending = false;
-  g_pps_relay_timer_active = true;
-  g_pps_relay_deassert_arm_count++;
-}
-
-static void pps_relay_ch2_tick(uint32_t vclock_counter32) {
-  if (!g_interrupt_hw_ready) return;
-
-  uint32_t ticks = g_pps_relay_deassert_countdown_ticks;
-  if (!g_pps_relay_timer_active || ticks == 0) {
-    g_pps_relay_ch2_tick_valid = false;
-    return;
-  }
-
-  if (!g_pps_relay_ch2_tick_valid) {
-    g_pps_relay_ch2_last_counter32 = vclock_counter32;
-    g_pps_relay_ch2_tick_valid = true;
-    return;
-  }
-
-  const uint32_t elapsed_ticks =
-      vclock_counter32 - g_pps_relay_ch2_last_counter32;
-  if (elapsed_ticks < VCLOCK_INTERVAL_COUNTS) return;
-
-  const uint32_t elapsed_cells = elapsed_ticks / VCLOCK_INTERVAL_COUNTS;
-  if (elapsed_cells > 1U) {
-    g_pps_relay_ch2_catchup_count += (elapsed_cells - 1U);
-  }
-
-  if (elapsed_cells >= ticks) {
-    g_pps_relay_deassert_countdown_ticks = 0;
-    g_pps_relay_ch2_tick_valid = false;
-    g_pps_relay_ch2_tick_count += ticks;
-    digitalWriteFast(GNSS_PPS_RELAY, LOW);
-    g_pps_relay_timer_active = false;
-    g_pps_relay_deassert_count++;
-    return;
-  }
-
-  ticks -= elapsed_cells;
-  g_pps_relay_deassert_countdown_ticks = ticks;
-  g_pps_relay_ch2_last_counter32 += elapsed_cells * VCLOCK_INTERVAL_COUNTS;
-  g_pps_relay_ch2_tick_count += elapsed_cells;
-}
-
-static void pps_post_isr_publish_inline(const interrupt_epoch_capture_t& cap,
-                                        uint32_t isr_entry_dwt_raw) {
-  epoch_capture_publish(cap);
-
-  const interrupt_pps_entry_latency_handler_fn callback =
-      g_pps_entry_latency_handler;
-  if (interrupt_callback_address_executable((uintptr_t)callback)) {
-    ZPNET_EXECUTION_TRACE(
-        timepop_dispatch_trace_stage_t::SUBSCRIBER_ENTER,
-        timepop_dispatch_trace_kind_t::ISR_PPS,
-        0U,
-        cap.sequence,
-        (uint32_t)(uintptr_t)callback,
-        (uint32_t)(uintptr_t)g_pps_entry_latency_handler,
-        0U,
-        (uint32_t)(uintptr_t)"PPS_ENTRY_LATENCY",
-        isr_entry_dwt_raw);
-    callback(cap.sequence, isr_entry_dwt_raw);
-    ZPNET_EXECUTION_TRACE(
-        timepop_dispatch_trace_stage_t::SUBSCRIBER_RETURN,
-        timepop_dispatch_trace_kind_t::ISR_PPS,
-        0U,
-        cap.sequence,
-        (uint32_t)(uintptr_t)callback,
-        (uint32_t)(uintptr_t)g_pps_entry_latency_handler,
-        0U,
-        (uint32_t)(uintptr_t)"PPS_ENTRY_LATENCY",
-        isr_entry_dwt_raw);
-  }
-}
-
-static void pps_post_isr_asap_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
-  interrupt_epoch_capture_t cap{};
-  uint32_t isr_entry_dwt_raw = 0;
-  bool had_sample = false;
-
-  const uint32_t prior_basepri = interrupt_priority0_guard_enter();
-  had_sample = g_pps_post_isr.pending;
-  if (had_sample) {
-    cap = g_pps_post_isr.cap;
-    isr_entry_dwt_raw = g_pps_post_isr.isr_entry_dwt_raw;
-    g_pps_post_isr.pending = false;
-  }
-  interrupt_priority0_guard_exit(prior_basepri);
-
-  if (!had_sample) return;
-
-  g_pps_post_isr.drain_count++;
-  pps_post_isr_publish_inline(cap, isr_entry_dwt_raw);
-}
-
-static void pps_post_isr_defer(const interrupt_epoch_capture_t& cap,
-                               uint32_t isr_entry_dwt_raw) {
-  if (!g_interrupt_runtime_ready) {
-    pps_post_isr_publish_inline(cap, isr_entry_dwt_raw);
-    return;
-  }
-
-  const uint32_t prior_basepri = interrupt_priority0_guard_enter();
-  if (g_pps_post_isr.pending) {
-    g_pps_post_isr.overwrite_count++;
-  }
-  g_pps_post_isr.cap = cap;
-  g_pps_post_isr.isr_entry_dwt_raw = isr_entry_dwt_raw;
-  g_pps_post_isr.pending = true;
-  g_pps_post_isr.arm_count++;
-  g_pps_post_isr.last_sequence = cap.sequence;
-  g_pps_post_isr.last_capture_window_cycles = cap.capture_window_cycles;
-  interrupt_priority0_guard_exit(prior_basepri);
-
-  const timepop_handle_t h =
-      timepop_arm_asap(pps_post_isr_asap_callback, nullptr, "PPS_POST_ISR");
-  if (h == TIMEPOP_INVALID_HANDLE) {
-    interrupt_epoch_capture_t fallback{};
-    uint32_t fallback_raw = 0;
-    bool had_sample = false;
-
-    const uint32_t prior_basepri = interrupt_priority0_guard_enter();
-    had_sample = g_pps_post_isr.pending;
-    if (had_sample) {
-      fallback = g_pps_post_isr.cap;
-      fallback_raw = g_pps_post_isr.isr_entry_dwt_raw;
-      g_pps_post_isr.pending = false;
-      g_pps_post_isr.asap_fail_count++;
-    }
-    interrupt_priority0_guard_exit(prior_basepri);
-
-    if (had_sample) {
-      pps_post_isr_publish_inline(fallback, fallback_raw);
-    }
-  }
-}
-
-static void interrupt_handoff_process_pps(const pps_capture_packet_t& packet) {
-  const uint32_t isr_entry_dwt_raw = packet.isr_entry_dwt_raw;
-
-  const uint32_t epoch_capture_start_raw = isr_entry_dwt_raw;
-  const uint16_t hardware_low16 = packet.vclock_hardware16_observed;
-  const uint32_t epoch_capture_after_vclock_raw = packet.capture_after_vclock_raw;
-  const bool ocxo_capture_hw_ready = packet.ocxo_capture_hw_ready;
-  const uint16_t ocxo1_hardware16 = packet.ocxo1_hardware16;
-  const uint16_t ocxo2_hardware16 = packet.ocxo2_hardware16;
-  const uint32_t epoch_capture_end_raw = packet.capture_end_raw;
-
-  const uint16_t ch3_now = hardware_low16;
-
-  const uint16_t selected_low16 =
-      (uint16_t)(hardware_low16 -
-                 (uint16_t)VCLOCK_EPOCH_OBSERVED_TICKS_AFTER_SELECTED);
-
-  if (g_vclock_clock32.pending_zero) {
-    vclock_clock_zero_at_hardware_low16(g_vclock_clock32.pending_zero_ns,
-                                        selected_low16);
-  }
-
-  const uint32_t observed_counter32 =
-      vclock_synthetic_from_hardware_low16(hardware_low16) +
-      (uint32_t)VCLOCK_EPOCH_COUNTER32_OFFSET_TICKS;
-  const uint32_t selected_counter32 =
-      observed_counter32 - VCLOCK_EPOCH_OBSERVED_TICKS_AFTER_SELECTED;
-
-  const uint32_t ocxo1_counter32 = packet.ocxo1_capture_hw_ready
-      ? g_ocxo1_clock32.current_counter32
-      : 0;
-  const uint32_t ocxo2_counter32 = packet.ocxo2_capture_hw_ready
-      ? g_ocxo2_clock32.current_counter32
-      : 0;
-
-  g_gpio_irq_count++;
-  g_pps_gpio_heartbeat.edge_count++;
-  pps_relay_assert_from_isr(g_pps_gpio_heartbeat.edge_count);
-
-  interrupt_epoch_capture_t epoch_cap{};
-  epoch_cap.sequence = g_pps_gpio_heartbeat.edge_count;
-  epoch_cap.capture_dwt_start_raw = epoch_capture_start_raw;
-  epoch_cap.capture_dwt_after_vclock_raw = epoch_capture_after_vclock_raw;
-  epoch_cap.capture_dwt_end_raw = epoch_capture_end_raw;
-  epoch_cap.capture_window_cycles = epoch_capture_end_raw - epoch_capture_start_raw;
-  epoch_cap.vclock_read_offset_cycles =
-      epoch_capture_after_vclock_raw - epoch_capture_start_raw;
-  epoch_cap.vclock_dwt_at_edge =
-      pps_vclock_dwt_from_pps_isr_entry_raw(isr_entry_dwt_raw);
-  epoch_cap.vclock_capture_valid =
-      epoch_cap.vclock_read_offset_cycles <= EPOCH_CAPTURE_MAX_WINDOW_CYCLES;
-  // Per-lane CounterLedger admission facts.  These deliberately describe
-  // whether each OCXO counter was captured in a bounded PPS packet; the
-  // stricter one-tick all_lanes_capture_valid flag remains a global courtroom
-  // quality witness, not the lane admission gate.
-  const bool counterledger_capture_window_valid =
-      epoch_cap.capture_window_cycles <=
-      EPOCH_CAPTURE_COUNTERLEDGER_MAX_WINDOW_CYCLES;
-  epoch_cap.ocxo1_capture_valid =
-      packet.ocxo1_capture_hw_ready && counterledger_capture_window_valid;
-  epoch_cap.ocxo2_capture_valid =
-      packet.ocxo2_capture_hw_ready && counterledger_capture_window_valid;
-  epoch_cap.all_lanes_capture_valid =
-      ocxo_capture_hw_ready &&
-      epoch_cap.capture_window_cycles <= EPOCH_CAPTURE_MAX_WINDOW_CYCLES;
-  epoch_cap.valid = g_interrupt_runtime_ready && epoch_cap.vclock_capture_valid;
-  epoch_cap.vclock_hardware16_observed = hardware_low16;
-  epoch_cap.vclock_hardware16_selected = selected_low16;
-  epoch_cap.ocxo1_hardware16 = ocxo1_hardware16;
-  epoch_cap.ocxo2_hardware16 = ocxo2_hardware16;
-  epoch_cap.vclock_counter32 = selected_counter32;
-  epoch_cap.ocxo1_counter32 = ocxo1_counter32;
-  epoch_cap.ocxo2_counter32 = ocxo2_counter32;
-
-  pps_t pps;
-  pps.sequence          = g_pps_gpio_heartbeat.edge_count;
-  pps.dwt_at_edge       = pps_dwt_from_isr_entry_raw(isr_entry_dwt_raw);
-  pps.counter32_at_edge = observed_counter32;
-  pps.ch3_at_edge       = ch3_now;
-
-  g_last_pps_witness = pps;
-  g_last_pps_witness_valid = true;
-
-  pps_yardstick_record_raw_edge(pps, observed_counter32);
-
-  pps_post_isr_defer(epoch_cap, isr_entry_dwt_raw);
-
-  if (packet.rebootstrap_pending_at_capture && g_pps_rebootstrap_pending) {
-    g_pps_rebootstrap_pending = false;
-    g_pps_rebootstrap_count++;
-
-    g_vclock_epoch_latch.pending = true;
-    g_vclock_epoch_latch.pps = pps;
-    g_vclock_epoch_latch.counter32_at_edge = selected_counter32;
-    g_vclock_epoch_latch.ch3_at_edge = selected_low16;
-    g_vclock_epoch_latch.observed_counter32 = observed_counter32;
-    g_vclock_epoch_latch.observed_ch3 = ch3_now;
-    g_vclock_epoch_latch.observed_ticks_after_selected =
-        VCLOCK_EPOCH_OBSERVED_TICKS_AFTER_SELECTED;
-    g_vclock_epoch_latch.first_cadence_counter32 = 0;
-    g_vclock_epoch_latch.first_cadence_dwt = 0;
-    g_vclock_epoch_latch.backdate_ticks = 0;
-    g_vclock_epoch_latch.backdate_cycles = 0;
-    g_vclock_epoch_latch.sacred_dwt = 0;
-
-    g_vclock_lane.phase_bootstrapped = true;
-    g_vclock_lane.tick_mod_1000 = 0;
-    g_vclock_lane.compare_target =
-        (uint16_t)(selected_low16 + (uint16_t)VCLOCK_INTERVAL_COUNTS);
-    g_vclock_lane.logical_count32_at_last_second = selected_counter32;
-    vclock_clock_anchor_hardware_low16(selected_counter32, selected_low16);
-  }
-}
-
-static inline __attribute__((always_inline)) void
-pps_capture_packet_fill_priority0(pps_capture_packet_t& packet,
-                                  uint32_t isr_entry_dwt_raw) {
-  packet.sequence = ++g_pps_capture_sequence;
+  ocxo_capture_packet_t packet{};
   packet.isr_entry_dwt_raw = isr_entry_dwt_raw;
-
-  packet.vclock_hardware16_observed = qtimer1_ch0_counter_now();
-  packet.capture_after_vclock_raw = ARM_DWT_CYCCNT;
-
-  packet.ocxo1_capture_hw_ready =
-      g_interrupt_hw_ready && !OCXO1_DISABLED && g_ocxo1_lane.initialized;
-  packet.ocxo2_capture_hw_ready =
-      g_interrupt_hw_ready && !OCXO2_DISABLED && g_ocxo2_lane.initialized;
-  packet.ocxo_capture_hw_ready =
-      (OCXO1_DISABLED || packet.ocxo1_capture_hw_ready) &&
-      (OCXO2_DISABLED || packet.ocxo2_capture_hw_ready);
-  packet.ocxo1_hardware16 = packet.ocxo1_capture_hw_ready
-      ? IMXRT_TMR2.CH[QTIMER_CLOCK_COUNTER_CH].CNTR
-      : 0;
-  packet.ocxo2_hardware16 = packet.ocxo2_capture_hw_ready
-      ? IMXRT_TMR3.CH[g_ocxo2_lane.counter_channel].CNTR
-      : 0;
-  packet.capture_end_raw = ARM_DWT_CYCCNT;
+  packet.target_counter32 = target_counter32;
+  packet.target_low16 = target_low16;
+  packet.ambient_low16 = ambient_low16;
+  packet.compare_low16 = compare_low16;
+  packet.active_at_capture = active;
   packet.capture_exit_dwt = ARM_DWT_CYCCNT;
-  packet.rebootstrap_pending_at_capture = g_pps_rebootstrap_pending;
+  if (capture_ring_push_priority0(ring, handoff, packet)) {
+    interrupt_handoff_request_priority0();
+  }
 }
 
-static void pps_capture_packet_enqueue_priority0(
-    const pps_capture_packet_t& packet) {
-  if (capture_ring_push_from_priority0(g_pps_capture_ring,
-                                       g_handoff_pps,
-                                       packet)) {
-    interrupt_handoff_request_from_capture_isr("pps_gpio_capture");
+static void qtimer2_isr(void) {
+  const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;
+  crash_stack_tripwire_isr_check(CRASH_TRIPWIRE_SITE_QTIMER2);
+  ocxo_capture_priority0(g_ocxo1_ctx,
+                         g_ocxo1_capture_ring,
+                         g_handoff_ocxo1,
+                         isr_entry_dwt_raw);
+}
+
+static void qtimer3_isr(void) {
+  const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;
+  crash_stack_tripwire_isr_check(CRASH_TRIPWIRE_SITE_QTIMER3);
+  ocxo_capture_priority0(g_ocxo2_ctx,
+                         g_ocxo2_capture_ring,
+                         g_handoff_ocxo2,
+                         isr_entry_dwt_raw);
+}
+
+void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
+  const uint16_t vclock_hardware16 = qtimer1_ch0_counter_now();
+  const bool ocxo1_valid = !OCXO1_DISABLED && g_ocxo1_lane.initialized;
+  const bool ocxo2_valid = !OCXO2_DISABLED && g_ocxo2_lane.initialized;
+  const uint16_t ocxo1_hardware16 = ocxo1_valid
+      ? IMXRT_TMR2.CH[QTIMER2_OCXO1_CH].CNTR
+      : 0U;
+  const uint16_t ocxo2_hardware16 = ocxo2_valid
+      ? IMXRT_TMR3.CH[QTIMER3_OCXO2_CH].CNTR
+      : 0U;
+
+  // The relay is the one physical side effect retained at capture priority.
+  digitalWriteFast(GNSS_PPS_RELAY, HIGH);
+  g_pps_relay_active = true;
+  g_pps_relay_countdown_cells = PPS_RELAY_OFF_CELLS;
+  g_pps_relay_assert_count++;
+
+  pps_capture_packet_t packet{};
+  packet.isr_entry_dwt_raw = isr_entry_dwt_raw;
+  packet.vclock_hardware16 = vclock_hardware16;
+  packet.ocxo1_hardware16 = ocxo1_hardware16;
+  packet.ocxo2_hardware16 = ocxo2_hardware16;
+  packet.ocxo1_valid = ocxo1_valid;
+  packet.ocxo2_valid = ocxo2_valid;
+  packet.capture_exit_dwt = ARM_DWT_CYCCNT;
+  if (capture_ring_push_priority0(g_pps_capture_ring,
+                                  g_handoff_pps,
+                                  packet)) {
+    interrupt_handoff_request_priority0();
   } else {
     g_gpio_miss_count++;
   }
 }
 
-void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
-  pps_capture_packet_t packet{};
-  pps_capture_packet_fill_priority0(packet, isr_entry_dwt_raw);
-  pps_capture_packet_enqueue_priority0(packet);
-}
-
 static void pps_gpio_isr(void) {
   const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;
-
-  // Preserve the sacred multi-clock capture window before any
-  // out-of-line call.
-  pps_capture_packet_t packet{};
-  pps_capture_packet_fill_priority0(packet, isr_entry_dwt_raw);
-
-  ZPNET_EXECUTION_TRACE(
-      timepop_dispatch_trace_stage_t::ISR_CAPTURED,
-      timepop_dispatch_trace_kind_t::ISR_PPS,
-      0U,
-      packet.sequence,
-      0U,
-      0U,
-      0U,
-      (uint32_t)(uintptr_t)"PPS_GPIO_ISR",
-      packet.capture_end_raw - isr_entry_dwt_raw);
-
-  pps_capture_packet_enqueue_priority0(packet);
-
-  // After the sacred multi-clock capture window on purpose: LR no longer
-  // holds EXC_RETURN here, so the check runs with the conservative
-  // basic-frame estimate.
   crash_stack_tripwire_isr_check(CRASH_TRIPWIRE_SITE_PPS_GPIO);
-
-  ZPNET_EXECUTION_TRACE(
-      timepop_dispatch_trace_stage_t::ISR_EXIT,
-      timepop_dispatch_trace_kind_t::ISR_PPS,
-      0U,
-      packet.sequence,
-      0U,
-      0U,
-      0U,
-      (uint32_t)(uintptr_t)"PPS_GPIO_ISR",
-      packet.capture_exit_dwt - isr_entry_dwt_raw);
+  process_interrupt_gpio6789_irq(isr_entry_dwt_raw);
 }
 
-void interrupt_pps_edge_register_dispatch(pps_edge_dispatch_fn fn) {
+// ============================================================================
+// Public snapshots / compatibility control boundaries
+// ============================================================================
+
+void interrupt_pps_edge_register_dispatch(pps_edge_dispatch_fn callback) {
   g_pps_edge_dispatch =
-      interrupt_callback_address_executable((uintptr_t)fn) ? fn : nullptr;
+      interrupt_callback_address_executable((uintptr_t)callback)
+          ? callback
+          : nullptr;
 }
-
-// ============================================================================
-// PPS / PPS_VCLOCK accessors
-// ============================================================================
-//
-// interrupt_last_pps_vclock() — canonical PPS_VCLOCK epoch.
-// interrupt_last_pps_edge()   — legacy projection, for back-compat with
-//                               consumers that still take pps_edge_snapshot_t.
-//                               Field map documented inline below.
-//
-// There is intentionally no public interrupt_last_pps() accessor.  Physical
-// PPS GPIO DWT is a private witness/audit fact, not a timing primitive.
 
 pps_vclock_t interrupt_last_pps_vclock(void) {
   return store_load_pvc();
@@ -13664,76 +2738,53 @@ pps_vclock_t interrupt_last_pps_vclock(void) {
 bool interrupt_last_pps_vclock_phase_estimate(
     pps_vclock_phase_estimate_t* out) {
   if (!out) return false;
-  const pps_vclock_edge_authority_t a = g_pps_vclock_edge_authority;
-  pps_vclock_phase_estimate_t e{};
-  e.valid = a.learned_phase_valid || a.valid;
-  e.lattice_dwt_at_edge = a.vclock_observed_dwt_at_edge;
-  const uint32_t estimated_dwt = a.pps_projected_vclock_dwt_at_edge
-      ? a.pps_projected_vclock_dwt_at_edge
-      : a.authority_dwt_at_edge;
-  e.estimated_dwt_at_edge = estimated_dwt;
-  e.correction_cycles = a.vclock_observed_dwt_at_edge
-      ? pps_vclock_signed_delta_near(a.vclock_observed_dwt_at_edge,
-                                     estimated_dwt)
-      : 0;
-  e.phase_mod_scaled_cycles = a.learned_phase_cycles;
-  e.tick_scaled_cycles = vclock_cycles_for_ticks(1U);
-  e.scale = 1U;
-  e.dwt_cycles_per_second = a.dwt_cycles_per_second;
-  e.pps_sequence = a.sequence;
-  e.pvc_sequence = a.sequence;
-  e.pps_dwt_at_edge = a.pps_dwt_at_edge;
-  e.pps_counter32_at_edge = a.counter32_at_edge;
-  e.pvc_counter32_at_edge = a.counter32_at_edge;
-  *out = e;
-  return e.valid;
+  const pps_vclock_edge_authority_t authority =
+      g_pps_vclock_edge_authority;
+  pps_vclock_phase_estimate_t estimate{};
+  estimate.valid = authority.valid;
+  estimate.lattice_dwt_at_edge = authority.authority_dwt_at_edge;
+  estimate.estimated_dwt_at_edge = authority.authority_dwt_at_edge;
+  estimate.correction_cycles = 0;
+  estimate.phase_mod_scaled_cycles = 0U;
+  estimate.tick_scaled_cycles = 0U;
+  estimate.scale = 1U;
+  estimate.dwt_cycles_per_second = authority.dwt_cycles_per_second;
+  estimate.pps_sequence = authority.sequence;
+  estimate.pvc_sequence = authority.sequence;
+  estimate.pps_dwt_at_edge = authority.pps_dwt_at_edge;
+  estimate.pps_counter32_at_edge = authority.counter32_at_edge;
+  estimate.pvc_counter32_at_edge = authority.counter32_at_edge;
+  *out = estimate;
+  return estimate.valid;
 }
 
-// Legacy projection.  Field map:
-//   snapshot.dwt_at_edge       <- pvc.dwt_at_edge       (observed PPS_VCLOCK)
-//   snapshot.counter32_at_edge <- pvc.counter32_at_edge (PPS_VCLOCK)
-//   snapshot.ch3_at_edge       <- pvc.ch3_at_edge       (PPS_VCLOCK)
-//   snapshot.gnss_ns_at_edge   <- -1 (GNSS labels are CLOCKS-owned)
-//   snapshot.physical_pps_dwt_raw_at_edge        <- original GPIO observation
-//   snapshot.physical_pps_dwt_normalized_at_edge <- observed or FloorLine repair
-//   snapshot.physical_pps_counter/ch3             <- physical ISR read facts
-//   snapshot.dwt_raw_at_edge   <- pvc.dwt_at_edge       (legacy alias;
-//                                                        observed, not raw, held
-//                                                        for API continuity)
-
 pps_edge_snapshot_t interrupt_last_pps_edge(void) {
-  pps_t pps;
-  pps_vclock_t pvc;
-  store_load(pps, pvc);
+  pps_t pps{};
+  pps_vclock_t pvc{};
+  (void)store_load(pps, pvc);
 
   pps_edge_snapshot_t out{};
-  out.sequence          = pvc.sequence;
-  out.dwt_at_edge       = pvc.dwt_at_edge;
-  out.dwt_raw_at_edge   = pvc.dwt_at_edge;     // legacy alias, NOT raw
+  out.sequence = pvc.sequence;
+  out.dwt_at_edge = pvc.dwt_at_edge;
+  out.dwt_raw_at_edge = pvc.dwt_at_edge;
   out.counter32_at_edge = pvc.counter32_at_edge;
-  out.ch3_at_edge       = pvc.ch3_at_edge;
-  out.gnss_ns_at_edge   = -1;  // GNSS labels are CLOCKS-owned.
-
-  pps_floorline_repair_state_t pps_repair{};
-  const bool pps_repair_matches =
-      pps_floorline_repair_load(pps_repair) &&
-      pps_repair.valid && pps_repair.sequence == pps.sequence;
-  out.physical_pps_dwt_raw_at_edge = pps_repair_matches
-      ? pps_repair.raw_pps_dwt
-      : pps.dwt_at_edge;
+  out.ch3_at_edge = pvc.ch3_at_edge;
+  out.gnss_ns_at_edge = -1;
+  out.physical_pps_dwt_raw_at_edge = pps.dwt_at_edge;
   out.physical_pps_dwt_normalized_at_edge = pps.dwt_at_edge;
-  out.physical_pps_counter32_at_read      = pps.counter32_at_edge;
-  out.physical_pps_ch3_at_read            = pps.ch3_at_edge;
-  out.vclock_epoch_counter32              = pvc.counter32_at_edge;
-  out.vclock_epoch_ch3                    = pvc.ch3_at_edge;
-  out.vclock_epoch_ticks_after_pps        = VCLOCK_EPOCH_TICKS_AFTER_PHYSICAL_PPS;
-  out.vclock_epoch_counter32_offset_ticks = VCLOCK_EPOCH_COUNTER32_OFFSET_TICKS;
-  out.vclock_epoch_dwt_offset_cycles      = CANONICAL_VCLOCK_EPOCH_MINUS_RAW_PPS_ISR_CYCLES;
-  out.vclock_epoch_selected               = true;
+  out.physical_pps_counter32_at_read = pps.counter32_at_edge;
+  out.physical_pps_ch3_at_read = pps.ch3_at_edge;
+  out.vclock_epoch_counter32 = pvc.counter32_at_edge;
+  out.vclock_epoch_ch3 = pvc.ch3_at_edge;
+  out.vclock_epoch_ticks_after_pps =
+      VCLOCK_EPOCH_TICKS_AFTER_PHYSICAL_PPS;
+  out.vclock_epoch_counter32_offset_ticks =
+      VCLOCK_EPOCH_COUNTER32_OFFSET_TICKS;
+  out.vclock_epoch_dwt_offset_cycles = 0;
+  out.vclock_epoch_selected = pvc.sequence != 0U;
   out.vclock_edge_authority = g_pps_vclock_edge_authority;
   return out;
 }
-
 
 interrupt_pps_edge_heartbeat_t interrupt_pps_edge_heartbeat(void) {
   interrupt_pps_edge_heartbeat_t out{};
@@ -13745,476 +2796,184 @@ interrupt_pps_edge_heartbeat_t interrupt_pps_edge_heartbeat(void) {
   return out;
 }
 
+static bool g_publication_launch_acquisition = false;
+static uint32_t g_recover_publication_custody_reset_count = 0U;
+
+void interrupt_dwt_publication_launch_acquisition_begin(void) {
+  g_publication_launch_acquisition = true;
+}
+
+void interrupt_dwt_publication_launch_acquisition_end(void) {
+  g_publication_launch_acquisition = false;
+}
+
+bool interrupt_dwt_publication_launch_acquisition_active(void) {
+  return g_publication_launch_acquisition;
+}
+
+void interrupt_recover_reset_publication_custody(void) {
+  g_recover_publication_custody_reset_count++;
+  g_ocxo1_lane.previous_event_valid = false;
+  g_ocxo1_lane.previous_event_counter32 = 0U;
+  g_ocxo1_lane.last_counter_delta_ticks = 0U;
+  g_ocxo2_lane.previous_event_valid = false;
+  g_ocxo2_lane.previous_event_counter32 = 0U;
+  g_ocxo2_lane.last_counter_delta_ticks = 0U;
+  g_interrupt_integrity.ocxo1_counter =
+      interrupt_integrity_counter_check_t{};
+  g_interrupt_integrity.ocxo2_counter =
+      interrupt_integrity_counter_check_t{};
+  g_interrupt_integrity.ocxo1_qtimer_dwt =
+      interrupt_integrity_qtimer_dwt_match_check_t{};
+  g_interrupt_integrity.ocxo2_qtimer_dwt =
+      interrupt_integrity_qtimer_dwt_match_check_t{};
+}
+
+uint32_t interrupt_recover_publication_custody_reset_count(void) {
+  return g_recover_publication_custody_reset_count;
+}
+
 // ============================================================================
-// Subscribe / start / stop / etc.
+// Subscription / service lifecycle
 // ============================================================================
 
-bool interrupt_subscribe(const interrupt_subscription_t& sub) {
+bool interrupt_subscribe(const interrupt_subscription_t& subscription) {
   if (!g_interrupt_runtime_ready) return false;
-  if (sub.kind == interrupt_subscriber_kind_t::NONE || !sub.on_event) return false;
-  interrupt_subscriber_runtime_t* rt = runtime_for(sub.kind);
+  if (subscription.kind == interrupt_subscriber_kind_t::NONE ||
+      !subscription.on_event) {
+    return false;
+  }
+  interrupt_subscriber_runtime_t* rt = runtime_for(subscription.kind);
   if (!rt || !rt->desc) return false;
-
-  const uint32_t prior_basepri = interrupt_priority0_guard_enter();
+  const uint32_t prior = interrupt_priority0_guard_enter();
   interrupt_dispatch_invalidate_locked(*rt);
-  rt->sub = sub;
+  rt->sub = subscription;
   rt->subscribed = true;
-  interrupt_priority0_guard_exit(prior_basepri);
+  interrupt_priority0_guard_exit(prior);
   return true;
 }
 
 bool interrupt_start(interrupt_subscriber_kind_t kind) {
   interrupt_subscriber_runtime_t* rt = runtime_for(kind);
   if (!rt || !rt->desc) return false;
-  {
-    const uint32_t prior_basepri = interrupt_priority0_guard_enter();
-    interrupt_dispatch_invalidate_locked(*rt);
-    interrupt_priority0_guard_exit(prior_basepri);
-  }
+  const uint32_t prior = interrupt_priority0_guard_enter();
+  interrupt_dispatch_invalidate_locked(*rt);
+  rt->active = true;
   rt->start_count++;
-  cadence_regression_reset_kind(kind);
-  dwt_publication_reset_lane(kind);
+  interrupt_priority0_guard_exit(prior);
 
   if (kind == interrupt_subscriber_kind_t::VCLOCK) {
-    // START/RECOVER/Flash Cut begins a new publication epoch.  The previous
-    // always-on VCLOCK heartbeat and any prior labeled anchors are valid
-    // witnesses, but they are not valid baselines for the new subscriber
-    // campaign ledger.  Resetting here prevents the first campaign edge from
-    // being judged against pre-campaign state.
-    g_pvc_anchor_reset_pending = true;
-    rt->active = true;
     g_vclock_lane.active = true;
-    g_vclock_lane.phase_bootstrapped = true;
-    g_vclock_lane.tick_mod_1000 = 0;
-    vclock_ch2_one_second_disable();
-    // VCLOCK_HEARTBEAT is armed once during process_interrupt_init() as the
-    // native CH0 1 ms custody cadence.  Starting VCLOCK must not arm a second
-    // cadence slot.
-    return g_vclock_heartbeat_armed || vclock_heartbeat_arm_timepop();
+    return g_vclock_heartbeat_armed || vclock_heartbeat_arm();
   }
 
-  if (ocxo_kind_disabled(kind)) {
-    rt->active = false;
-    ocxo_lane_t* disabled_lane = ocxo_lane_for(kind);
-    if (disabled_lane) {
-      disabled_lane->active = false;
-      disabled_lane->cadence_enabled = false;
-      disabled_lane->cadence_armed = false;
-      disabled_lane->witness_armed = false;
-    }
-    return true;
-  }
-
-  rt->active = true;
-  ocxo_lane_t* lane = ocxo_lane_for(kind);
-  if (!lane || !lane->initialized) return false;
-  lane->active = true;
-  lane->phase_bootstrapped = true;
-  lane->tick_mod_1000 = 0;
-  ocxo_lane_measurement_witness_reset(*lane);
-
-  // OCXO lanes now own only their local one-second edge compare.  Start the
-  // one-second edge compare from the installed logical grid when available;
-  // otherwise birth from the current low-word observation.
-  return ocxo_lane_start_local_cadence(kind, *lane,
-                                       *synthetic_clock_for_kind(kind),
-                                       OCXO_CADENCE_REASON_START);
+  ocxo_runtime_context_t* ctx = ocxo_context_for(kind);
+  if (!ctx || ocxo_kind_disabled(kind)) return ctx != nullptr;
+  return ocxo_start_one_second_service(*ctx);
 }
 
 bool interrupt_ensure_service(interrupt_subscriber_kind_t kind) {
   interrupt_subscriber_runtime_t* rt = runtime_for(kind);
-  if (!rt || !rt->desc || !rt->subscribed || !rt->sub.on_event) {
-    return false;
-  }
-
+  if (!rt || !rt->subscribed || !rt->sub.on_event) return false;
   if (kind == interrupt_subscriber_kind_t::VCLOCK) {
-    // The native VCLOCK heartbeat is normally always-on, even while subscriber
-    // publication is stopped.  A warm RECOVER must therefore be a no-op when
-    // all three service predicates are already true.  In particular, do not
-    // call interrupt_start(): that function deliberately begins a new
-    // publication epoch and sets g_pvc_anchor_reset_pending.
-    if (rt->active &&
-        g_vclock_lane.active &&
-        g_vclock_heartbeat_armed) {
-      return true;
-    }
-
-    const bool heartbeat_was_armed = g_vclock_heartbeat_armed;
-    {
-      const uint32_t prior_basepri = interrupt_priority0_guard_enter();
-      if (!rt->active) {
-        interrupt_dispatch_invalidate_locked(*rt);
-      }
-      rt->active = true;
-      interrupt_priority0_guard_exit(prior_basepri);
-    }
-
+    if (!rt->active) rt->active = true;
     g_vclock_lane.active = true;
-
-    if (heartbeat_was_armed) {
-      // interrupt_stop(VCLOCK) leaves the native heartbeat alive and clears
-      // phase_bootstrapped.  Let the next live cadence tooth seed tick_mod_1000
-      // naturally; no anchor reset or mid-second rebootstrap is required.
-      return true;
-    }
-
-    // A genuinely dead native heartbeat is a real service restart.  Rebuild
-    // cadence and request a fresh selected PPS/VCLOCK epoch, but only in this
-    // exceptional path—not for an already-running warm recovery.
-    g_vclock_lane.phase_bootstrapped = false;
-    g_vclock_lane.tick_mod_1000 = 0;
-    vclock_ch2_one_second_disable();
-
-    if (!vclock_heartbeat_arm_timepop()) {
-      const uint32_t prior_basepri = interrupt_priority0_guard_enter();
-      rt->active = false;
-      interrupt_dispatch_invalidate_locked(*rt);
-      interrupt_priority0_guard_exit(prior_basepri);
-      g_vclock_lane.active = false;
-      return false;
-    }
-
-    interrupt_request_pps_rebootstrap();
-    return true;
+    return g_vclock_heartbeat_armed || vclock_heartbeat_arm();
   }
-
-  if (ocxo_kind_disabled(kind)) {
-    // A compile-time-disabled lane is intentionally absent, not failed.
-    return true;
-  }
-
-  ocxo_lane_t* lane = ocxo_lane_for(kind);
-  synthetic_clock32_t* clock32 = synthetic_clock_for_kind(kind);
-  if (!lane || !lane->initialized || !clock32) {
-    return false;
-  }
-
-  // cadence_armed can be momentarily false while priority-0 capture hands the
-  // just-fired tooth to the continuation tier.  cadence_enabled is the stable
-  // service predicate: when it is true, the lane owns an active ladder and
-  // must not be restarted from foreground recovery code.
-  if (rt->active && lane->active && lane->cadence_enabled) {
-    return true;
-  }
-
-  {
-    const uint32_t prior_basepri = interrupt_priority0_guard_enter();
-    if (!rt->active) {
-      interrupt_dispatch_invalidate_locked(*rt);
-    }
-    rt->active = true;
-    interrupt_priority0_guard_exit(prior_basepri);
-  }
-  lane->active = true;
-
-  // Resume from the already-installed logical grid.  Do not reset measurement
-  // witnesses, regression, publication custody, or Alpha's epoch here; the
-  // RECOVER PPS gate owns those deliberate discontinuities.
-  const bool ok = ocxo_lane_start_local_cadence(
-      kind, *lane, *clock32, OCXO_CADENCE_REASON_REARM);
-  if (ok) {
-    return true;
-  }
-
-  ocxo_lane_stop_local_cadence(*lane, OCXO_CADENCE_REASON_STOP);
-  lane->active = false;
-  {
-    const uint32_t prior_basepri = interrupt_priority0_guard_enter();
-    rt->active = false;
-    interrupt_dispatch_invalidate_locked(*rt);
-    interrupt_priority0_guard_exit(prior_basepri);
-  }
-  return false;
+  ocxo_runtime_context_t* ctx = ocxo_context_for(kind);
+  if (!ctx || ocxo_kind_disabled(kind)) return ctx != nullptr;
+  if (!rt->active) rt->active = true;
+  return ocxo_start_one_second_service(*ctx);
 }
 
+template <typename T, uint32_t N>
+static uint32_t capture_ring_discard_pending(
+    interrupt_capture_ring_t<T, N>& ring) {
+  const uint32_t tail = ring.tail;
+  dmb_barrier();
+  const uint32_t head = ring.head;
+  ring.tail = head;
+  dmb_barrier();
+  return head - tail;
+}
 
 bool interrupt_recover_rebootstrap_ocxo_service(
     interrupt_subscriber_kind_t kind) {
-  if (kind != interrupt_subscriber_kind_t::OCXO1 &&
-      kind != interrupt_subscriber_kind_t::OCXO2) {
-    return false;
-  }
-  if (ocxo_kind_disabled(kind)) {
-    return true;
-  }
-
-  ocxo_runtime_context_t* const ctx = ocxo_context_for(kind);
-  interrupt_subscriber_runtime_t* const rt = runtime_for(kind);
-  if (!ctx || !ctx->lane || !ctx->clock32 ||
-      !rt || !rt->desc || !rt->subscribed || !rt->sub.on_event ||
-      !ctx->lane->initialized) {
-    return false;
-  }
+  ocxo_runtime_context_t* ctx = ocxo_context_for(kind);
+  interrupt_subscriber_runtime_t* rt = runtime_for(kind);
+  if (!ctx || !rt || ocxo_kind_disabled(kind)) return ctx != nullptr;
 
   ocxo_lane_t& lane = *ctx->lane;
-  synthetic_clock32_t& clock32 = *ctx->clock32;
-  interrupt_handoff_source_diag_t& handoff =
-      (kind == interrupt_subscriber_kind_t::OCXO1)
-          ? g_handoff_ocxo1
-          : g_handoff_ocxo2;
-  const uint32_t irq_number =
-      (kind == interrupt_subscriber_kind_t::OCXO1)
-          ? (uint32_t)IRQ_QTIMER2
-          : (uint32_t)IRQ_QTIMER3;
-  const uint32_t irq_mask = interrupt_nvic_irq_mask(irq_number);
-  const bool irq_was_enabled =
-      (interrupt_nvic_iser_word(irq_number) & irq_mask) != 0U;
-
-  lane.recover_rebootstrap_attempt_count++;
-  lane.recover_rebootstrap_last_failure_stage =
-      OCXO_RECOVER_REBOOTSTRAP_STAGE_OK;
-  lane.recover_rebootstrap_last_irq_was_enabled = irq_was_enabled;
-  lane.recover_rebootstrap_last_irq_enabled_after = false;
-
-  // Stop only this OCXO priority-0 producer.  VCLOCK, PPS, the other OCXO lane,
-  // and the shared priority-16 handoff remain live.
+  if (!lane.initialized) return false;
   if (kind == interrupt_subscriber_kind_t::OCXO1) {
     NVIC_DISABLE_IRQ(IRQ_QTIMER2);
-    g_step0_qtimer2_irq_enabled_by_interrupt = false;
   } else {
     NVIC_DISABLE_IRQ(IRQ_QTIMER3);
-    g_step0_qtimer3_irq_enabled_by_interrupt = false;
-  }
-  interrupt_handoff_barrier();
-
-  // A healthy compare ladder is worth preserving: it carries the exact OCXO
-  // synthetic identity that CounterLedger has continued to observe.  Do not
-  // trust logical flags alone, though.  The hardware compare, target identity,
-  // and pre-cut NVIC admission must all agree before the ladder is kept.
-  uint32_t live_csctrl = 0;
-  const bool live_csctrl_ok = qtimer_guard_read_ocxo_csctrl(
-      lane,
-      "ocxo_recover_live_compare",
-      lane.cadence_next_low16,
-      &live_csctrl);
-  const uint16_t live_comp1 = live_csctrl_ok
-      ? lane.module->CH[lane.compare_channel].COMP1
-      : 0U;
-  const bool preserve_live_cadence =
-      irq_was_enabled &&
-      live_csctrl_ok &&
-      rt->active && lane.active &&
-      lane.cadence_enabled && lane.cadence_armed && lane.witness_armed &&
-      lane.witness_target_initialized &&
-      lane.compare_target == lane.cadence_next_low16 &&
-      lane.witness_target_counter32 == lane.cadence_next_counter32 &&
-      lane.witness_target_low16 == lane.cadence_next_low16 &&
-      (live_csctrl & TMR_CSCTRL_TCF1EN) != 0U &&
-      live_comp1 == lane.cadence_next_low16;
-
-  uint32_t capture_dropped = 0;
-  uint32_t fact_dropped = 0;
-  {
-    // BASEPRI masks priority 16 and lower while preserving sacred priority-0
-    // capture on every other timing rail.  This lane's own priority-0 source is
-    // already stopped above.
-    const uint32_t prior_basepri = interrupt_priority0_guard_enter();
-
-    if (kind == interrupt_subscriber_kind_t::OCXO1) {
-      capture_dropped += capture_ring_discard_pending_for_recover(
-          g_ocxo1_1khz_sample_capture_ring);
-      capture_dropped += capture_ring_discard_pending_for_recover(
-          g_ocxo1_one_second_capture_ring);
-    } else {
-      capture_dropped += capture_ring_discard_pending_for_recover(
-          g_ocxo2_1khz_sample_capture_ring);
-      capture_dropped += capture_ring_discard_pending_for_recover(
-          g_ocxo2_one_second_capture_ring);
-    }
-    handoff.pending_count = 0;
-
-    fact_dropped = ocxo_fact_ring_discard_pending_for_recover(*ctx);
-
-    // Invalidate any frozen subscriber tuple without pretending a callback
-    // that is actually executing has already returned.  The normal dispatch
-    // completion path owns dispatch_running.
-    interrupt_dispatch_invalidate_locked(*rt);
-    rt->last_event = interrupt_event_t{};
-    rt->last_diag = interrupt_capture_diag_t{};
-    rt->has_fired = false;
-    rt->active = true;
-    lane.active = true;
-
-    interrupt_priority0_guard_exit(prior_basepri);
   }
 
-  // Do not cancel the stale named TimePop ASAP slot here.  A cancellation can
-  // enter TimePop's own dispatch-mutation path or briefly use its global
-  // critical section.  The emptied ring makes any already-queued callback a
-  // harmless no-op, and the first fresh arm of the same name retires that old
-  // slot before installing the new drain.
-
-  // Cut all process_interrupt-owned interval evidence at the same boundary.
-  // None of these operations changes clock32 current/zero identity,
-  // cadence_epoch_counter32, DAC state, SmartZero proof, public origin, or any
-  // VCLOCK anchor.
-  ocxo_lane_measurement_witness_reset(lane);
-  ocxo_lane_event_lineage_reset(lane);
-  cadence_regression_reset_kind(kind);
-  lane.witness_last_event_dwt = 0;
-  lane.witness_last_event_counter32 = 0;
-  lane.witness_last_event_published = false;
-  lane.witness_last_fact_sequence = 0;
-  lane.witness_last_fact_one_second_due = false;
-
-  lane.recover_rebootstrap_last_capture_drop_count = capture_dropped;
-  lane.recover_rebootstrap_last_fact_drop_count = fact_dropped;
-  lane.recover_rebootstrap_capture_drop_count += capture_dropped;
-  lane.recover_rebootstrap_fact_drop_count += fact_dropped;
-  lane.recover_rebootstrap_last_cadence_preserved = preserve_live_cadence;
-  lane.recover_rebootstrap_last_live_compare_verified =
-      preserve_live_cadence;
-
-  auto fail_rebootstrap = [&](uint32_t stage) -> bool {
-    if (kind == interrupt_subscriber_kind_t::OCXO1) {
-      NVIC_DISABLE_IRQ(IRQ_QTIMER2);
-      g_step0_qtimer2_irq_enabled_by_interrupt = false;
-    } else {
-      NVIC_DISABLE_IRQ(IRQ_QTIMER3);
-      g_step0_qtimer3_irq_enabled_by_interrupt = false;
-    }
-    interrupt_handoff_barrier();
-    ocxo_lane_stop_local_cadence(lane, OCXO_CADENCE_REASON_STOP);
-    lane.recover_rebootstrap_failure_count++;
-    lane.recover_rebootstrap_last_failure_stage = stage;
-    lane.recover_rebootstrap_last_irq_enabled_after = false;
-    lane.active = false;
-    const uint32_t prior_basepri = interrupt_priority0_guard_enter();
-    rt->active = false;
-    interrupt_dispatch_invalidate_locked(*rt);
-    interrupt_priority0_guard_exit(prior_basepri);
-    return false;
-  };
-
-  if (!preserve_live_cadence) {
-    // Logical active flags did not prove a live authored compare.  Rebuild only
-    // this OCXO ladder from its already-installed logical grid.  The helper now
-    // returns true only when an actual compare tooth is armed.
-    ocxo_lane_stop_local_cadence(lane, OCXO_CADENCE_REASON_REARM);
-    lane.active = true;
-    {
-      const uint32_t prior_basepri = interrupt_priority0_guard_enter();
-      rt->active = true;
-      interrupt_priority0_guard_exit(prior_basepri);
-    }
-    lane.recover_rebootstrap_cadence_restart_count++;
-    if (!ocxo_lane_start_local_cadence(
-            kind, lane, clock32, OCXO_CADENCE_REASON_REARM)) {
-      return fail_rebootstrap(
-          OCXO_RECOVER_REBOOTSTRAP_STAGE_START_CADENCE);
-    }
+  const uint32_t prior = interrupt_priority0_guard_enter();
+  if (kind == interrupt_subscriber_kind_t::OCXO1) {
+    (void)capture_ring_discard_pending(g_ocxo1_capture_ring);
+  } else {
+    (void)capture_ring_discard_pending(g_ocxo2_capture_ring);
   }
+  interrupt_dispatch_invalidate_locked(*rt);
+  rt->last_event = interrupt_event_t{};
+  rt->last_diag = interrupt_capture_diag_t{};
+  rt->has_fired = false;
+  rt->active = true;
+  lane.active = true;
+  lane.previous_event_valid = false;
+  if (lane.compare_armed) ocxo_disable_compare(lane);
+  lane.rebootstrap_count++;
+  interrupt_priority0_guard_exit(prior);
 
-  uint32_t verify_csctrl = 0;
-  const bool verify_csctrl_ok = qtimer_guard_read_ocxo_csctrl(
-      lane,
-      "ocxo_recover_verify_compare",
-      lane.cadence_next_low16,
-      &verify_csctrl);
-  const uint16_t verify_comp1 = verify_csctrl_ok
-      ? lane.module->CH[lane.compare_channel].COMP1
-      : 0U;
-  const bool compare_verified =
-      verify_csctrl_ok &&
-      lane.cadence_enabled && lane.cadence_armed && lane.witness_armed &&
-      lane.witness_target_initialized &&
-      lane.compare_target == lane.cadence_next_low16 &&
-      lane.witness_target_counter32 == lane.cadence_next_counter32 &&
-      lane.witness_target_low16 == lane.cadence_next_low16 &&
-      (verify_csctrl & TMR_CSCTRL_TCF1EN) != 0U &&
-      verify_comp1 == lane.cadence_next_low16;
-
-  lane.recover_rebootstrap_last_target_counter32 =
-      lane.cadence_next_counter32;
-  lane.recover_rebootstrap_last_target_low16 = lane.cadence_next_low16;
-  lane.recover_rebootstrap_last_compare_comp1 = verify_comp1;
-  lane.recover_rebootstrap_last_compare_csctrl = verify_csctrl;
-  if (!compare_verified) {
-    return fail_rebootstrap(
-        OCXO_RECOVER_REBOOTSTRAP_STAGE_VERIFY_COMPARE);
-  }
-
-  // Clear only this lane's stale NVIC pending bit.  Do not clear the QTimer
-  // peripheral flag in the preserved-ladder path: if the exact authored tooth
-  // matured while IRQ admission was closed, the level source will reassert and
-  // deliver it into the freshly emptied pipeline after enable.
-  interrupt_nvic_icpr_word(irq_number) = irq_mask;
-  interrupt_handoff_barrier();
+  const bool started = ocxo_start_one_second_service(*ctx);
   if (kind == interrupt_subscriber_kind_t::OCXO1) {
     NVIC_ENABLE_IRQ(IRQ_QTIMER2);
-    g_step0_qtimer2_irq_enabled_by_interrupt = true;
   } else {
     NVIC_ENABLE_IRQ(IRQ_QTIMER3);
-    g_step0_qtimer3_irq_enabled_by_interrupt = true;
   }
-  interrupt_handoff_barrier();
-
-  const bool irq_enabled_after =
-      (interrupt_nvic_iser_word(irq_number) & irq_mask) != 0U;
-  lane.recover_rebootstrap_last_irq_enabled_after = irq_enabled_after;
-  if (!irq_enabled_after) {
-    return fail_rebootstrap(OCXO_RECOVER_REBOOTSTRAP_STAGE_ENABLE_IRQ);
-  }
-
-  lane.recover_rebootstrap_success_count++;
-  lane.recover_rebootstrap_last_failure_stage =
-      OCXO_RECOVER_REBOOTSTRAP_STAGE_OK;
-  return true;
+  lane.recover_count++;
+  return started;
 }
-
 
 bool interrupt_stop(interrupt_subscriber_kind_t kind) {
   interrupt_subscriber_runtime_t* rt = runtime_for(kind);
   if (!rt || !rt->desc) return false;
-  {
-    const uint32_t prior_basepri = interrupt_priority0_guard_enter();
-    rt->active = false;
-    interrupt_dispatch_invalidate_locked(*rt);
-    interrupt_priority0_guard_exit(prior_basepri);
-  }
+  const uint32_t prior = interrupt_priority0_guard_enter();
+  rt->active = false;
   rt->stop_count++;
-  cadence_regression_reset_kind(kind);
-  dwt_publication_reset_lane(kind);
+  interrupt_dispatch_invalidate_locked(*rt);
+  interrupt_priority0_guard_exit(prior);
 
   if (kind == interrupt_subscriber_kind_t::VCLOCK) {
     g_vclock_lane.active = false;
-    g_vclock_lane.phase_bootstrapped = false;
-    vclock_ch2_one_second_disable();
-    // Do not cancel VCLOCK_HEARTBEAT here; it is the system-wide native CH0
-    // cadence for VCLOCK custody and passive rollover tending.
     return true;
   }
-  ocxo_lane_t* lane = ocxo_lane_for(kind);
-  if (!lane) return false;
-  lane->active = false;
-  if (ocxo_kind_disabled(kind)) {
-    lane->cadence_enabled = false;
-    lane->cadence_armed = false;
-    lane->witness_armed = false;
-    return true;
-  }
-  ocxo_lane_stop_local_cadence(*lane, OCXO_CADENCE_REASON_STOP);
+  ocxo_runtime_context_t* ctx = ocxo_context_for(kind);
+  if (!ctx) return false;
+  ocxo_stop_one_second_service(*ctx);
   return true;
 }
 
 void interrupt_request_pps_rebootstrap(void) {
   g_pps_rebootstrap_pending = true;
-  g_vclock_epoch_latch = vclock_epoch_latch_t{};
-  vclock_ch2_one_second_disable();
-  cadence_regression_reset_kind(interrupt_subscriber_kind_t::VCLOCK);
-  vclock_fact_ring_reset();
-  // Rebootstrap selects a fresh PPS_VCLOCK edge identity.
-  g_pvc_anchor_reset_pending = true;
+  g_vclock_lane.one_second_grid_valid = false;
 }
 
-bool interrupt_pps_rebootstrap_pending(void) { return g_pps_rebootstrap_pending; }
+bool interrupt_pps_rebootstrap_pending(void) {
+  return g_pps_rebootstrap_pending;
+}
 
-const interrupt_event_t* interrupt_last_event(interrupt_subscriber_kind_t kind) {
+const interrupt_event_t* interrupt_last_event(
+    interrupt_subscriber_kind_t kind) {
   interrupt_subscriber_runtime_t* rt = runtime_for(kind);
   return (!rt || !rt->has_fired) ? nullptr : &rt->last_event;
 }
 
-const interrupt_capture_diag_t* interrupt_last_diag(interrupt_subscriber_kind_t kind) {
+const interrupt_capture_diag_t* interrupt_last_diag(
+    interrupt_subscriber_kind_t kind) {
   interrupt_subscriber_runtime_t* rt = runtime_for(kind);
   return (!rt || !rt->has_fired) ? nullptr : &rt->last_diag;
 }
@@ -14222,124 +2981,76 @@ const interrupt_capture_diag_t* interrupt_last_diag(interrupt_subscriber_kind_t 
 void interrupt_prespin_service(timepop_ctx_t*, timepop_diag_t*, void*) {}
 
 // ============================================================================
-// Hardware + runtime init
+// Feature registry (observed-only platform surfaces)
 // ============================================================================
 
-static void qtimer_init_count_compare_channel(IMXRT_TMR_t& module,
-                                                uint8_t ch,
-                                                uint8_t pcs) {
-  module.CH[ch].CTRL   = 0;
-  module.CH[ch].SCTRL  = 0;
-  module.CH[ch].CSCTRL = 0;
-  module.CH[ch].LOAD   = 0;
-  module.CH[ch].CNTR   = 0;
-  module.CH[ch].COMP1  = 0xFFFF;
-  module.CH[ch].CMPLD1 = 0xFFFF;
-  module.CH[ch].CMPLD2 = 0;
-  module.CH[ch].CTRL   = TMR_CTRL_CM(1) | TMR_CTRL_PCS(pcs);
+static void interrupt_features_mark_initializing(void) {
+  (void)system_feature_set("INTERRUPT", "PPS_VCLOCK_AUTHORITY",
+                           system_feature_status_t::INITIALIZING, nullptr);
+  (void)system_feature_set("INTERRUPT", "QTIMER_COUNTER_CUSTODY",
+                           system_feature_status_t::INITIALIZING, nullptr);
+  (void)system_feature_set("INTERRUPT", "QTIMER_DWT_RULER",
+                           system_feature_status_t::INITIALIZING, nullptr);
+  (void)system_feature_set("INTERRUPT", "COUNTER32_LINEAGE",
+                           system_feature_status_t::INITIALIZING, nullptr);
+  (void)system_feature_set("INTERRUPT", "OBSERVED_EDGE_AUTHORITY",
+                           system_feature_status_t::INITIALIZING, nullptr);
 }
 
-static void qtimer1_init_vclock_base(void) {
-  CCM_CCGR6 |= CCM_CCGR6_QTIMER1(CCM_CCGR_ON);
-
-  *(portConfigRegister(10)) = 1;
-  IOMUXC_SW_PAD_CTL_PAD_GPIO_B0_00 =
-      IOMUXC_PAD_HYS | IOMUXC_PAD_PKE | IOMUXC_PAD_PUE | IOMUXC_PAD_DSE(4);
-
-  qtimer_init_count_compare_channel(IMXRT_TMR1, QTIMER1_VCLOCK_CH,
-                                    QTIMER1_VCLOCK_PCS);
-
-  // Native VCLOCK authority: CH0 both counts the pin-bound VCLOCK input and
-  // raises the compare interrupt for the 1 ms custody heartbeat.
-  qtimer1_vclock_disable_compare();
-  IMXRT_TMR1.CH[QTIMER1_VCLOCK_CH].CSCTRL |= TMR_CSCTRL_TCF1;
-  (void)IMXRT_TMR1.CH[QTIMER1_VCLOCK_CH].CNTR;
+static void interrupt_features_note_observed_edge(void) {
+  (void)system_feature_set("INTERRUPT", "PPS_VCLOCK_AUTHORITY",
+                           system_feature_status_t::NOMINAL, nullptr);
+  (void)system_feature_set("INTERRUPT", "OBSERVED_EDGE_AUTHORITY",
+                           system_feature_status_t::NOMINAL, nullptr);
+  (void)system_feature_set("INTERRUPT", "QTIMER_DWT_RULER",
+                           system_feature_status_t::NOMINAL, nullptr);
 }
 
-static void qtimer1_init_ch2_scheduler(void) {
-  // TimePop scheduler: real QTimer1 CH2.  It counts the VCLOCK-derived timer
-  // source for scheduling, but its compare events are scheduler facts only.
-  qtimer_init_count_compare_channel(IMXRT_TMR1, QTIMER1_TIMEPOP_CH,
-                                    QTIMER1_TIMEPOP_PCS);
-  qtimer_disable_compare(IMXRT_TMR1, QTIMER1_TIMEPOP_CH);
+static void interrupt_features_note_ocxo_custody(void) {
+  const bool ocxo1_ok = OCXO1_DISABLED ||
+      (g_ocxo1_lane.target_grid_valid && g_ocxo1_lane.active);
+  const bool ocxo2_ok = OCXO2_DISABLED ||
+      (g_ocxo2_lane.target_grid_valid && g_ocxo2_lane.active);
+  const system_feature_status_t status = ocxo1_ok && ocxo2_ok
+      ? system_feature_status_t::NOMINAL
+      : system_feature_status_t::INITIALIZING;
+  (void)system_feature_set("INTERRUPT", "QTIMER_COUNTER_CUSTODY",
+                           status, nullptr);
+}
 
-  // Retired sibling rail.  Keep it explicitly defused so CH0/CH2 are the only
-  // active QTimer1 compare sources.
-  IMXRT_TMR1.CH[QTIMER1_RETIRED_AUX_CH].CTRL = 0;
-  IMXRT_TMR1.CH[QTIMER1_RETIRED_AUX_CH].SCTRL = 0;
-  IMXRT_TMR1.CH[QTIMER1_RETIRED_AUX_CH].CSCTRL = 0;
-  IMXRT_TMR1.CH[QTIMER1_RETIRED_AUX_CH].LOAD = 0;
-  IMXRT_TMR1.CH[QTIMER1_RETIRED_AUX_CH].CNTR = 0;
-  IMXRT_TMR1.CH[QTIMER1_RETIRED_AUX_CH].COMP1 = 0xFFFF;
-  IMXRT_TMR1.CH[QTIMER1_RETIRED_AUX_CH].CMPLD1 = 0xFFFF;
-  IMXRT_TMR1.CH[QTIMER1_RETIRED_AUX_CH].CMPLD2 = 0;
+static void interrupt_features_note_lineage(void) {
+  const bool vclock_ok = g_interrupt_integrity.vclock_qtimer_dwt.one_second.valid;
+  const bool ocxo1_ok = OCXO1_DISABLED ||
+      g_interrupt_integrity.ocxo1_counter.valid;
+  const bool ocxo2_ok = OCXO2_DISABLED ||
+      g_interrupt_integrity.ocxo2_counter.valid;
+  (void)system_feature_set("INTERRUPT", "COUNTER32_LINEAGE",
+                           (vclock_ok && ocxo1_ok && ocxo2_ok)
+                               ? system_feature_status_t::NOMINAL
+                               : system_feature_status_t::INITIALIZING,
+                           nullptr);
 }
 
 // ============================================================================
 // Cortex-M7 floating-point exception-context policy
 // ============================================================================
-//
-// process_interrupt owns the boundary at which ZPNet interrupt-bearing
-// hardware becomes live.  Install the CPU-wide exception-context policy here,
-// before any ZPNet QTimer/GPIO IRQ can run:
-//
-//   ASPEN = 1  automatic FP context preservation enabled
-//   LSPEN = 0  lazy/deferred FP stacking disabled (eager preservation)
-//
-// This does not disable the FPU and does not restrict compiler use of VFP
-// registers inside an ISR.  It removes only the mid-handler lazy materialize
-// transition under investigation.  The policy is installed once; it is never
-// rewritten after interrupt hardware has become live.
 
 static constexpr uintptr_t INTERRUPT_FPU_FPCCR_ADDRESS = 0xE000EF34UL;
 static constexpr uintptr_t INTERRUPT_SCB_CPACR_ADDRESS = 0xE000ED88UL;
-static constexpr uint32_t INTERRUPT_FPU_FPCCR_ASPEN  = 1UL << 31;
-static constexpr uint32_t INTERRUPT_FPU_FPCCR_LSPEN  = 1UL << 30;
-static constexpr uint32_t INTERRUPT_FPU_FPCCR_LSPACT = 1UL << 0;
-static constexpr uint32_t INTERRUPT_FPU_FPCCR_POLICY_MASK =
-    INTERRUPT_FPU_FPCCR_ASPEN |
-    INTERRUPT_FPU_FPCCR_LSPEN |
-    INTERRUPT_FPU_FPCCR_LSPACT;
-static constexpr uint32_t INTERRUPT_FPU_FPCCR_POLICY_VALUE =
-    INTERRUPT_FPU_FPCCR_ASPEN;
-static constexpr uint32_t INTERRUPT_SCB_CPACR_CP10_CP11_FULL =
-    0x00F00000UL;
-static constexpr uint32_t INTERRUPT_CONTROL_FPCA = 1UL << 2;
-
-enum class interrupt_fpu_policy_failure_t : uint32_t {
-  NONE = 0,
-  CALLED_FROM_EXCEPTION = 1,
-  LAZY_STATE_ALREADY_ACTIVE = 2,
-  FPCCR_READBACK_MISMATCH = 3,
-  FPU_ACCESS_NOT_ENABLED = 4,
-};
+static constexpr uint32_t INTERRUPT_FPU_FPCCR_ASPEN = 1UL << 31;
+static constexpr uint32_t INTERRUPT_FPU_FPCCR_LSPEN = 1UL << 30;
+static constexpr uint32_t INTERRUPT_SCB_CPACR_CP10_CP11_FULL = 0x00F00000UL;
 
 struct interrupt_fpu_context_policy_state_t {
   bool attempted = false;
-  bool write_performed = false;
   bool installed = false;
-  bool last_verify_ok = false;
-
   uint32_t attempt_count = 0;
   uint32_t verify_count = 0;
-  uint32_t report_count = 0;
   uint32_t irq_enable_block_count = 0;
-
-  uint32_t ipsr_at_install = 0;
-  uint32_t primask_at_install = 0;
-  uint32_t control_at_install = 0;
-  uint32_t cpacr_at_install = 0;
-  uint32_t cpacr_after_install = 0;
-
   uint32_t fpccr_before = 0;
-  uint32_t fpccr_desired = 0;
   uint32_t fpccr_after = 0;
   uint32_t last_verify_fpccr = 0;
   uint32_t last_verify_cpacr = 0;
-  uint32_t last_irq_enable_fpccr = 0;
-
-  interrupt_fpu_policy_failure_t failure =
-      interrupt_fpu_policy_failure_t::NONE;
 };
 
 static interrupt_fpu_context_policy_state_t g_interrupt_fpu_context_policy{};
@@ -14354,2032 +3065,568 @@ static inline volatile uint32_t& interrupt_scb_cpacr_register(void) {
       INTERRUPT_SCB_CPACR_ADDRESS);
 }
 
-static inline uint32_t interrupt_control_register(void) {
-  uint32_t value = 0;
-  __asm__ volatile ("mrs %0, control" : "=r" (value) :: "memory");
-  return value;
-}
-
-static inline bool interrupt_fpu_fpccr_policy_matches(uint32_t fpccr) {
-  return (fpccr & INTERRUPT_FPU_FPCCR_POLICY_MASK) ==
-         INTERRUPT_FPU_FPCCR_POLICY_VALUE;
-}
-
-static inline bool interrupt_fpu_access_enabled(uint32_t cpacr) {
-  return (cpacr & INTERRUPT_SCB_CPACR_CP10_CP11_FULL) ==
-         INTERRUPT_SCB_CPACR_CP10_CP11_FULL;
-}
-
 static bool interrupt_fpu_context_policy_verify_current(void) {
-  interrupt_fpu_context_policy_state_t& s =
+  interrupt_fpu_context_policy_state_t& state =
       g_interrupt_fpu_context_policy;
-  s.verify_count++;
-  s.last_verify_fpccr = interrupt_fpu_fpccr_register();
-  s.last_verify_cpacr = interrupt_scb_cpacr_register();
-  s.last_verify_ok =
-      s.attempted &&
-      s.installed &&
-      interrupt_fpu_fpccr_policy_matches(s.last_verify_fpccr) &&
-      interrupt_fpu_access_enabled(s.last_verify_cpacr);
-  return s.last_verify_ok;
+  state.verify_count++;
+  state.last_verify_fpccr = interrupt_fpu_fpccr_register();
+  state.last_verify_cpacr = interrupt_scb_cpacr_register();
+  return state.attempted && state.installed &&
+      (state.last_verify_fpccr & INTERRUPT_FPU_FPCCR_ASPEN) != 0U &&
+      (state.last_verify_fpccr & INTERRUPT_FPU_FPCCR_LSPEN) == 0U &&
+      (state.last_verify_cpacr & INTERRUPT_SCB_CPACR_CP10_CP11_FULL) ==
+          INTERRUPT_SCB_CPACR_CP10_CP11_FULL;
 }
 
 static bool interrupt_fpu_context_policy_install_once(void) {
-  interrupt_fpu_context_policy_state_t& s =
+  interrupt_fpu_context_policy_state_t& state =
       g_interrupt_fpu_context_policy;
+  if (state.attempted) return interrupt_fpu_context_policy_verify_current();
+  state.attempted = true;
+  state.attempt_count++;
+  if (interrupt_ipsr() != 0U) return false;
 
-  // Never rewrite FPCCR after the one early-boot installation attempt.  A
-  // later caller may verify the policy, but runtime toggling is forbidden.
-  if (s.attempted) {
-    return interrupt_fpu_context_policy_verify_current();
-  }
-
-  s.attempted = true;
-  s.attempt_count++;
-  s.ipsr_at_install = interrupt_ipsr();
-  s.primask_at_install = interrupt_primask();
-  s.control_at_install = interrupt_control_register();
-  s.cpacr_at_install = interrupt_scb_cpacr_register();
-
-  if (s.ipsr_at_install != 0U) {
-    s.failure = interrupt_fpu_policy_failure_t::CALLED_FROM_EXCEPTION;
-    return false;
-  }
-
-  uint32_t prior_primask = 0;
+  uint32_t prior_primask = 0U;
   __asm__ volatile ("mrs %0, primask" : "=r" (prior_primask) :: "memory");
   __asm__ volatile ("cpsid i" ::: "memory");
   __asm__ volatile ("dsb" ::: "memory");
-
-  s.fpccr_before = interrupt_fpu_fpccr_register();
-  s.fpccr_desired =
-      (s.fpccr_before | INTERRUPT_FPU_FPCCR_ASPEN) &
+  state.fpccr_before = interrupt_fpu_fpccr_register();
+  interrupt_fpu_fpccr_register() =
+      (state.fpccr_before | INTERRUPT_FPU_FPCCR_ASPEN) &
       ~INTERRUPT_FPU_FPCCR_LSPEN;
-
-  if ((s.fpccr_before & INTERRUPT_FPU_FPCCR_LSPACT) != 0U) {
-    s.failure =
-        interrupt_fpu_policy_failure_t::LAZY_STATE_ALREADY_ACTIVE;
-  } else {
-    s.write_performed = (s.fpccr_desired != s.fpccr_before);
-    if (s.write_performed) {
-      interrupt_fpu_fpccr_register() = s.fpccr_desired;
-    }
-
-    __asm__ volatile ("dsb" ::: "memory");
-    __asm__ volatile ("isb" ::: "memory");
-
-    s.fpccr_after = interrupt_fpu_fpccr_register();
-    s.cpacr_after_install = interrupt_scb_cpacr_register();
-
-    if (!interrupt_fpu_fpccr_policy_matches(s.fpccr_after)) {
-      s.failure =
-          interrupt_fpu_policy_failure_t::FPCCR_READBACK_MISMATCH;
-    } else if (!interrupt_fpu_access_enabled(s.cpacr_after_install)) {
-      s.failure =
-          interrupt_fpu_policy_failure_t::FPU_ACCESS_NOT_ENABLED;
-    } else {
-      s.failure = interrupt_fpu_policy_failure_t::NONE;
-      s.installed = true;
-    }
-  }
-
-  __asm__ volatile ("msr primask, %0"
-                    :: "r" (prior_primask)
-                    : "memory");
+  __asm__ volatile ("dsb" ::: "memory");
   __asm__ volatile ("isb" ::: "memory");
-
+  state.fpccr_after = interrupt_fpu_fpccr_register();
+  state.installed =
+      (state.fpccr_after & INTERRUPT_FPU_FPCCR_ASPEN) != 0U &&
+      (state.fpccr_after & INTERRUPT_FPU_FPCCR_LSPEN) == 0U &&
+      (interrupt_scb_cpacr_register() &
+       INTERRUPT_SCB_CPACR_CP10_CP11_FULL) ==
+          INTERRUPT_SCB_CPACR_CP10_CP11_FULL;
+  __asm__ volatile ("msr primask, %0" :: "r" (prior_primask) : "memory");
+  __asm__ volatile ("isb" ::: "memory");
   return interrupt_fpu_context_policy_verify_current();
 }
 
-static FLASHMEM const char* interrupt_fpu_policy_failure_name(
-    interrupt_fpu_policy_failure_t failure) {
-  switch (failure) {
-    case interrupt_fpu_policy_failure_t::CALLED_FROM_EXCEPTION:
-      return "CALLED_FROM_EXCEPTION";
-    case interrupt_fpu_policy_failure_t::LAZY_STATE_ALREADY_ACTIVE:
-      return "LAZY_STATE_ALREADY_ACTIVE";
-    case interrupt_fpu_policy_failure_t::FPCCR_READBACK_MISMATCH:
-      return "FPCCR_READBACK_MISMATCH";
-    case interrupt_fpu_policy_failure_t::FPU_ACCESS_NOT_ENABLED:
-      return "FPU_ACCESS_NOT_ENABLED";
-    default:
-      return "NONE";
-  }
+// ============================================================================
+// Hardware and lifecycle initialization
+// ============================================================================
+
+static void qtimer_init_count_compare_channel(IMXRT_TMR_t& module,
+                                               uint8_t channel,
+                                               uint8_t pcs) {
+  module.CH[channel].CTRL = 0;
+  module.CH[channel].SCTRL = 0;
+  module.CH[channel].CSCTRL = 0;
+  module.CH[channel].LOAD = 0;
+  module.CH[channel].CNTR = 0;
+  module.CH[channel].COMP1 = 0xFFFF;
+  module.CH[channel].CMPLD1 = 0xFFFF;
+  module.CH[channel].CMPLD2 = 0;
+  module.CH[channel].CTRL = TMR_CTRL_CM(1) | TMR_CTRL_PCS(pcs);
 }
 
-static FLASHMEM const char* interrupt_fpu_policy_mode_name(uint32_t fpccr) {
-  const bool aspen = (fpccr & INTERRUPT_FPU_FPCCR_ASPEN) != 0U;
-  const bool lspen = (fpccr & INTERRUPT_FPU_FPCCR_LSPEN) != 0U;
-  if (aspen && !lspen) return "AUTOMATIC_EAGER";
-  if (aspen && lspen) return "AUTOMATIC_LAZY";
-  if (!aspen && !lspen) return "SOFTWARE_MANAGED";
-  return "INVALID_ASPEN0_LSPEN1";
+static void qtimer1_init_vclock_base(void) {
+  CCM_CCGR6 |= CCM_CCGR6_QTIMER1(CCM_CCGR_ON);
+  *(portConfigRegister(10)) = 1;
+  IOMUXC_SW_PAD_CTL_PAD_GPIO_B0_00 =
+      IOMUXC_PAD_HYS | IOMUXC_PAD_PKE | IOMUXC_PAD_PUE |
+      IOMUXC_PAD_DSE(4);
+  qtimer_init_count_compare_channel(IMXRT_TMR1,
+                                    QTIMER1_VCLOCK_CH,
+                                    QTIMER1_VCLOCK_PCS);
+  qtimer_disable_compare(IMXRT_TMR1, QTIMER1_VCLOCK_CH);
 }
 
-static bool g_interrupt_state_initialized = false;
-
-static void interrupt_state_cold_init(void) {
-  if (g_interrupt_state_initialized) return;
-
-  // Establish one ordered baseline for both deterministic RAM1 operational
-  // state and the remaining cold/report-only RAM2 stores.  Startup already
-  // initializes RAM1, but the explicit assignments keep this transaction
-  // complete and make re-init behavior independent of placement.
-  g_interrupt_integrity = interrupt_integrity_snapshot_t{};
-  g_interrupt_integrity_report_scratch = interrupt_integrity_snapshot_t{};
-  g_store = snapshot_store_t{};
-  g_pps_yardstick = pps_yardstick_store_t{};
-  g_pps_floorline_repair_seq = 0;
-  g_pps_floorline_repair = pps_floorline_repair_state_t{};
-  g_smartzero2 = smartzero2_system_t{};
-  g_epoch_capture_store = epoch_capture_store_t{};
-
-  for (auto& anchor : g_pvc_anchor_ring) {
-    anchor = pvc_anchor_record_t{};
-  }
-  g_bridge_stats_timepop = bridge_anchor_stats_t{};
-  g_bridge_stats_ocxo1 = bridge_anchor_stats_t{};
-  g_bridge_stats_ocxo2 = bridge_anchor_stats_t{};
-
-  g_pps_gpio_heartbeat = pps_gpio_heartbeat_t{};
-  g_pps_post_isr = pps_post_isr_mailbox_t{};
-  g_last_pps_witness = pps_t{};
-  g_vclock_epoch_latch = vclock_epoch_latch_t{};
-  g_pps_vclock_edge_authority = pps_vclock_edge_authority_t{};
-
-  for (auto& subscriber : g_subscribers) {
-    subscriber = interrupt_subscriber_runtime_t{};
-  }
-  g_vclock_lane = vclock_lane_t{};
-
-  g_generation_gate_vclock = generation_gate_lane_t{};
-  g_generation_gate_ocxo1 = generation_gate_lane_t{};
-  g_generation_gate_ocxo2 = generation_gate_lane_t{};
-  g_ocxo1_qtimer_diag = ocxo_qtimer_diag_t{};
-  g_ocxo2_qtimer_diag = ocxo_qtimer_diag_t{};
-  g_smartzero = smartzero_runtime_t{};
-
-  g_dwt_publication_vclock = dwt_publication_lane_state_t{};
-  g_dwt_publication_ocxo1 = dwt_publication_lane_state_t{};
-  g_dwt_publication_ocxo2 = dwt_publication_lane_state_t{};
-  g_dwt_publication_last_fatal = dwt_publication_forensics_t{};
-
-  g_lower_env_vclock_store.seq = 0;
-  g_lower_env_vclock_store.seal_pending = false;
-  g_lower_env_vclock_store.seal_observed_dwt = 0;
-  g_lower_env_vclock_store.seal_target_counter32 = 0;
-  g_lower_env_vclock_store.seal_target_hw16 = 0;
-  g_lower_env_vclock_store.seal_observed_hw16 = 0;
-  g_lower_env_vclock_store.lane = lower_env_lane_t{};
-  g_lower_env_ocxo1_store.seq = 0;
-  g_lower_env_ocxo1_store.seal_pending = false;
-  g_lower_env_ocxo1_store.seal_observed_dwt = 0;
-  g_lower_env_ocxo1_store.seal_target_counter32 = 0;
-  g_lower_env_ocxo1_store.seal_target_hw16 = 0;
-  g_lower_env_ocxo1_store.seal_observed_hw16 = 0;
-  g_lower_env_ocxo1_store.lane = lower_env_lane_t{};
-  g_lower_env_ocxo2_store.seq = 0;
-  g_lower_env_ocxo2_store.seal_pending = false;
-  g_lower_env_ocxo2_store.seal_observed_dwt = 0;
-  g_lower_env_ocxo2_store.seal_target_counter32 = 0;
-  g_lower_env_ocxo2_store.seal_target_hw16 = 0;
-  g_lower_env_ocxo2_store.seal_observed_hw16 = 0;
-  g_lower_env_ocxo2_store.lane = lower_env_lane_t{};
-  g_lower_env_consumer_vclock = lower_env_consumer_state_t{};
-  g_lower_env_consumer_ocxo1 = lower_env_consumer_state_t{};
-  g_lower_env_consumer_ocxo2 = lower_env_consumer_state_t{};
-
-  g_vclock_fact_ring = vclock_perishable_ring_t{};
-  g_ocxo1_fact_ring = ocxo_perishable_ring_t{};
-  g_ocxo2_fact_ring = ocxo_perishable_ring_t{};
-
-  g_interrupt_handoff = interrupt_handoff_diag_t{};
-  g_handoff_qtimer1_ch1 = interrupt_handoff_source_diag_t{};
-  g_handoff_qtimer1_ch2 = interrupt_handoff_source_diag_t{};
-  g_handoff_ocxo1 = interrupt_handoff_source_diag_t{};
-  g_handoff_ocxo2 = interrupt_handoff_source_diag_t{};
-  g_handoff_pps = interrupt_handoff_source_diag_t{};
-
-  g_interrupt_state_initialized = true;
+static void qtimer1_init_ch2_scheduler(void) {
+  qtimer_init_count_compare_channel(IMXRT_TMR1,
+                                    QTIMER1_TIMEPOP_CH,
+                                    QTIMER1_TIMEPOP_PCS);
+  qtimer_disable_compare(IMXRT_TMR1, QTIMER1_TIMEPOP_CH);
+  IMXRT_TMR1.CH[QTIMER1_RETIRED_AUX_CH].CTRL = 0;
+  IMXRT_TMR1.CH[QTIMER1_RETIRED_AUX_CH].SCTRL = 0;
+  IMXRT_TMR1.CH[QTIMER1_RETIRED_AUX_CH].CSCTRL = 0;
+  IMXRT_TMR1.CH[QTIMER1_RETIRED_AUX_CH].LOAD = 0;
+  IMXRT_TMR1.CH[QTIMER1_RETIRED_AUX_CH].CNTR = 0;
+  IMXRT_TMR1.CH[QTIMER1_RETIRED_AUX_CH].COMP1 = 0xFFFF;
+  IMXRT_TMR1.CH[QTIMER1_RETIRED_AUX_CH].CMPLD1 = 0xFFFF;
+  IMXRT_TMR1.CH[QTIMER1_RETIRED_AUX_CH].CMPLD2 = 0;
 }
 
 void process_interrupt_init_hardware(void) {
-  // Install the CPU exception-context policy before any ZPNet interrupt-bearing
-  // hardware is configured.  A failed installation leaves every compare/IRQ
-  // path dark and remains visible through INTERRUPT.REPORT_FPU_CONTEXT.
   if (!interrupt_fpu_context_policy_install_once()) return;
   if (g_interrupt_hw_ready) return;
 
-  interrupt_state_cold_init();
-  interrupt_features_mark_initializing();
-
+  g_ocxo1_lane.kind = interrupt_subscriber_kind_t::OCXO1;
   g_ocxo1_lane.name = "OCXO1";
   g_ocxo1_lane.module = &IMXRT_TMR2;
-  g_ocxo1_lane.channel = QTIMER_CLOCK_COMPARE_CH;
-  g_ocxo1_lane.counter_channel = QTIMER_CLOCK_COUNTER_CH;
-  g_ocxo1_lane.compare_channel = QTIMER_CLOCK_COMPARE_CH;
-  g_ocxo1_lane.pcs = QTIMER_CLOCK_PCS;
+  g_ocxo1_lane.channel = QTIMER2_OCXO1_CH;
+  g_ocxo1_lane.pcs = QTIMER2_OCXO1_PCS;
   g_ocxo1_lane.input_pin = OCXO1_PIN;
 
+  g_ocxo2_lane.kind = interrupt_subscriber_kind_t::OCXO2;
   g_ocxo2_lane.name = "OCXO2";
   g_ocxo2_lane.module = &IMXRT_TMR3;
   g_ocxo2_lane.channel = QTIMER3_OCXO2_CH;
-  g_ocxo2_lane.counter_channel = QTIMER3_OCXO2_CH;
-  g_ocxo2_lane.compare_channel = QTIMER3_OCXO2_CH;
   g_ocxo2_lane.pcs = QTIMER3_OCXO2_PCS;
   g_ocxo2_lane.input_pin = OCXO2_PIN;
 
   pinMode(GNSS_PPS_RELAY, OUTPUT);
   digitalWriteFast(GNSS_PPS_RELAY, LOW);
-  g_pps_relay_pin_initialized = true;
 
   if (!OCXO1_DISABLED) {
     CCM_CCGR6 |= CCM_CCGR6_QTIMER2(CCM_CCGR_ON);
     *(portConfigRegister(OCXO1_PIN)) = 1;
-    #if defined(IOMUXC_QTIMER2_TIMER0_SELECT_INPUT)
+#if defined(IOMUXC_QTIMER2_TIMER0_SELECT_INPUT)
     IOMUXC_QTIMER2_TIMER0_SELECT_INPUT = 1;
-    #endif
-
+#endif
     IMXRT_TMR2.ENBL &= ~(uint16_t)(1U << QTIMER2_OCXO1_CH);
-    qtimer_init_count_compare_channel(IMXRT_TMR2, QTIMER2_OCXO1_CH,
-                                      g_ocxo1_lane.pcs);
-    ocxo_lane_disable_compare(g_ocxo1_lane);
+    qtimer_init_count_compare_channel(IMXRT_TMR2,
+                                      QTIMER2_OCXO1_CH,
+                                      QTIMER2_OCXO1_PCS);
+    qtimer_disable_compare(IMXRT_TMR2, QTIMER2_OCXO1_CH);
     IMXRT_TMR2.CH[QTIMER2_OCXO1_CH].CNTR = 0;
     IMXRT_TMR2.ENBL |= (uint16_t)(1U << QTIMER2_OCXO1_CH);
+    g_ocxo1_lane.initialized = true;
   }
 
   if (!OCXO2_DISABLED) {
     CCM_CCGR6 |= CCM_CCGR6_QTIMER3(CCM_CCGR_ON);
     *(portConfigRegister(OCXO2_PIN)) = 1;
-    #if defined(IOMUXC_QTIMER3_TIMER0_SELECT_INPUT)
-    IOMUXC_QTIMER3_TIMER0_SELECT_INPUT = 0;
-    #endif
-    #if defined(IOMUXC_QTIMER3_TIMER3_SELECT_INPUT)
+#if defined(IOMUXC_QTIMER3_TIMER3_SELECT_INPUT)
     IOMUXC_QTIMER3_TIMER3_SELECT_INPUT = 1;
-    #endif
-
+#endif
     IMXRT_TMR3.ENBL &= ~(uint16_t)((1U << QTIMER3_OCXO2_CH) |
                                    (1U << 0) | (1U << 1) | (1U << 2));
-
-    // Defuse non-pin-bound siblings explicitly.  Pin 15 feeds QTimer3 CH3;
-    // only CH3 is an OCXO2 authority rail.
-    for (uint8_t ch = 0; ch < 3; ch++) {
-      IMXRT_TMR3.CH[ch].CTRL = 0;
-      IMXRT_TMR3.CH[ch].SCTRL = 0;
-      IMXRT_TMR3.CH[ch].CSCTRL = 0;
+    for (uint8_t channel = 0; channel < 3U; ++channel) {
+      IMXRT_TMR3.CH[channel].CTRL = 0;
+      IMXRT_TMR3.CH[channel].SCTRL = 0;
+      IMXRT_TMR3.CH[channel].CSCTRL = 0;
     }
-
     qtimer_init_count_compare_channel(IMXRT_TMR3,
                                       QTIMER3_OCXO2_CH,
-                                      g_ocxo2_lane.pcs);
-    ocxo_lane_disable_compare(g_ocxo2_lane);
+                                      QTIMER3_OCXO2_PCS);
+    qtimer_disable_compare(IMXRT_TMR3, QTIMER3_OCXO2_CH);
     IMXRT_TMR3.CH[QTIMER3_OCXO2_CH].CNTR = 0;
     IMXRT_TMR3.ENBL |= (uint16_t)(1U << QTIMER3_OCXO2_CH);
+    g_ocxo2_lane.initialized = true;
   }
 
-  g_ocxo1_lane.initialized = !OCXO1_DISABLED;
-  g_ocxo2_lane.initialized = !OCXO2_DISABLED;
-
-  // QTimer1 synchronized channel start: ENBL=0 first, configure the
-  // pin-bound VCLOCK CH0 authority rail and the separate CH2 TimePop scheduler,
-  // then start exactly those two channels together.
   IMXRT_TMR1.ENBL = 0;
   qtimer1_init_vclock_base();
   qtimer1_init_ch2_scheduler();
-  g_vclock_lane.initialized = true;
   IMXRT_TMR1.CH[QTIMER1_VCLOCK_CH].CNTR = 0;
   IMXRT_TMR1.CH[QTIMER1_TIMEPOP_CH].CNTR = 0;
   IMXRT_TMR1.CH[QTIMER1_RETIRED_AUX_CH].CNTR = 0;
   IMXRT_TMR1.ENBL = (uint16_t)((1U << QTIMER1_VCLOCK_CH) |
                                (1U << QTIMER1_TIMEPOP_CH));
-
+  g_vclock_lane.initialized = true;
   g_interrupt_hw_ready = true;
 }
 
 static void runtime_init_subscribers(void) {
-  g_subscriber_count = 0;
+  g_subscriber_count = 0U;
   g_rt_vclock = nullptr;
   g_rt_ocxo1 = nullptr;
   g_rt_ocxo2 = nullptr;
-
-  for (auto& rt : g_subscribers) rt = interrupt_subscriber_runtime_t{};
-
-  for (uint32_t i = 0; i < (sizeof(DESCRIPTORS) / sizeof(DESCRIPTORS[0])); i++) {
-    interrupt_subscriber_runtime_t& rt = g_subscribers[g_subscriber_count++];
+  for (interrupt_subscriber_runtime_t& rt : g_subscribers) {
     rt = interrupt_subscriber_runtime_t{};
+  }
+  for (uint32_t i = 0U;
+       i < sizeof(DESCRIPTORS) / sizeof(DESCRIPTORS[0]);
+       ++i) {
+    interrupt_subscriber_runtime_t& rt =
+        g_subscribers[g_subscriber_count++];
     rt.desc = &DESCRIPTORS[i];
-    if      (rt.desc->kind == interrupt_subscriber_kind_t::VCLOCK) g_rt_vclock = &rt;
-    else if (rt.desc->kind == interrupt_subscriber_kind_t::OCXO1)  g_rt_ocxo1  = &rt;
-    else if (rt.desc->kind == interrupt_subscriber_kind_t::OCXO2)  g_rt_ocxo2  = &rt;
+    if (rt.desc->kind == interrupt_subscriber_kind_t::VCLOCK) {
+      g_rt_vclock = &rt;
+    } else if (rt.desc->kind == interrupt_subscriber_kind_t::OCXO1) {
+      g_rt_ocxo1 = &rt;
+    } else if (rt.desc->kind == interrupt_subscriber_kind_t::OCXO2) {
+      g_rt_ocxo2 = &rt;
+    }
   }
-}
-
-static void runtime_reset_pps_state(void) {
-  g_pps_gpio_heartbeat = pps_gpio_heartbeat_t{};
-  g_gpio_irq_count = 0;
-  g_gpio_miss_count = 0;
-  g_pps_post_isr = pps_post_isr_mailbox_t{};
-  g_pps_relay_timer_active = false;
-  g_pps_relay_deassert_arm_pending = false;
-  g_pps_relay_deassert_countdown_ticks = 0;
-  g_pps_relay_assert_count = 0;
-  g_pps_relay_deassert_count = 0;
-  g_pps_relay_deassert_arm_count = 0;
-  g_pps_relay_deassert_arm_fail_count = 0;
-  g_pps_relay_deassert_arm_skip_count = 0;
-  g_pps_relay_last_assert_sequence = 0;
-  g_pps_relay_ch2_tick_valid = false;
-  g_pps_relay_ch2_last_counter32 = 0;
-  g_pps_relay_ch2_tick_count = 0;
-  g_pps_relay_ch2_catchup_count = 0;
-  g_last_pps_witness = pps_t{};
-  g_last_pps_witness_valid = false;
-  g_pps_floorline_repair_seq = 0;
-  g_pps_floorline_repair = pps_floorline_repair_state_t{};
-  g_vclock_epoch_latch = vclock_epoch_latch_t{};
-  pps_vclock_edge_authority_reset();
-  g_pps_rebootstrap_pending = false;
-  g_pps_rebootstrap_count = 0;
-}
-
-static void runtime_reset_snapshot_and_bridge_state(void) {
-  g_store = snapshot_store_t{};
-  g_epoch_capture_store = epoch_capture_store_t{};
-  pvc_anchor_ring_reset();
-  g_bridge_stats_timepop = bridge_anchor_stats_t{};
-  g_bridge_stats_ocxo1 = bridge_anchor_stats_t{};
-  g_bridge_stats_ocxo2 = bridge_anchor_stats_t{};
-  g_pps_edge_dispatch = nullptr;
-  g_pps_entry_latency_handler = nullptr;
-}
-
-static void runtime_reset_smartzero_state(void) {
-  g_smartzero = smartzero_runtime_t{};
-  g_smartzero2 = smartzero2_system_t{};
-  for (uint32_t i = 0; i < SMARTZERO_LANE_COUNT; i++) {
-    smartzero_reset_lane(i);
-  }
-}
-
-static void runtime_reset_clock32_state(void) {
-  g_vclock_clock32 = vclock_synthetic_clock32_t{};
-  g_ocxo1_clock32 = synthetic_clock32_t{};
-  g_ocxo2_clock32 = synthetic_clock32_t{};
-  g_ocxo1_pending_zero_request_retired_count = 0;
-  g_ocxo2_pending_zero_request_retired_count = 0;
-  g_ocxo_pending_zero_request_retired_count = 0;
-  g_ocxo_pending_zero_request_last_counter32 = 0;
-  g_ocxo_pending_zero_request_last_kind = interrupt_subscriber_kind_t::NONE;
-}
-
-static void runtime_bootstrap_synthetic_clocks_if_ready(void) {
-  // Defensive birth anchors.  These are not logical ZERO operations; they
-  // simply make process_interrupt's synthetic coordinate extenders safe before
-  // CLOCKS has installed a user/campaign epoch.
-  if (!g_interrupt_hw_ready) return;
-
-  vclock_clock_bootstrap_from_hw16(qtimer1_ch0_counter_now());
-  if (!OCXO1_DISABLED && g_ocxo1_lane.initialized) {
-    synthetic_clock_bootstrap_from_hw16(g_ocxo1_clock32, IMXRT_TMR2.CH[QTIMER_CLOCK_COUNTER_CH].CNTR);
-    g_ocxo1_lane.logical_count32_at_last_second = g_ocxo1_clock32.current_counter32;
-  }
-  if (!OCXO2_DISABLED && g_ocxo2_lane.initialized) {
-    synthetic_clock_bootstrap_from_hw16(g_ocxo2_clock32, IMXRT_TMR3.CH[g_ocxo2_lane.counter_channel].CNTR);
-    g_ocxo2_lane.logical_count32_at_last_second = g_ocxo2_clock32.current_counter32;
-  }
-}
-
-static void runtime_reset_qtimer_host_state(void) {
-  g_qtimer1_ch1_sequence = 0;
-  g_qtimer1_ch1_target_counter32 = 0;
-  g_qtimer1_ch1_next_compare_counter32 = 0;
-  g_qtimer1_ch1_arm_count = 0;
-  g_qtimer1_ch1_fire_count = 0;
-  g_qtimer1_ch1_hop_count = 0;
-  g_qtimer1_ch1_active = false;
-  g_qtimer1_ch1_handler = nullptr;
-  g_qtimer1_ch2_last_target_counter32 = 0;
-  g_qtimer1_ch2_arm_count = 0;
-  g_qtimer1_vclock_capture_ring =
-      interrupt_capture_ring_t<qtimer1_vclock_capture_packet_t,
-                               HANDOFF_QTIMER1_CH1_RING_SIZE>{};
-  g_qtimer1_ch2_capture_ring =
-      interrupt_capture_ring_t<qtimer1_ch2_capture_packet_t,
-                               HANDOFF_QTIMER1_CH2_RING_SIZE>{};
-  g_ocxo1_qtimer_diag = ocxo_qtimer_diag_t{};
-  g_ocxo2_qtimer_diag = ocxo_qtimer_diag_t{};
-}
-
-static void runtime_reset_vclock_heartbeat_state(void) {
-  g_vclock_heartbeat_armed = false;
-  g_vclock_heartbeat_next_counter32 = 0;
-  g_vclock_heartbeat_arm_count = 0;
-  g_vclock_heartbeat_arm_failures = 0;
-  g_vclock_heartbeat_fire_count = 0;
-  g_vclock_heartbeat_vclock_ticks = 0;
-  g_vclock_heartbeat_ocxo1_rollover_updates_retired = 0;
-  g_vclock_heartbeat_ocxo2_rollover_updates_retired = 0;
-  g_vclock_heartbeat_last_vclock_hw16 = 0;
-  g_vclock_heartbeat_last_ocxo1_hw16_retired = 0;
-  g_vclock_heartbeat_last_ocxo2_hw16_retired = 0;
-  g_vclock_heartbeat_last_vclock_counter32 = 0;
-  g_vclock_heartbeat_last_ocxo1_counter32_retired = 0;
-  g_vclock_heartbeat_last_ocxo2_counter32_retired = 0;
-
-  g_ch2_implicit_rollover_count = 0;
-  g_ch2_implicit_rollover_vclock_updates = 0;
-  g_ch2_implicit_rollover_ocxo1_updates = 0;
-  g_ch2_implicit_rollover_ocxo2_updates = 0;
-  g_ch2_implicit_rollover_last_vclock_hw16 = 0;
-  g_ch2_implicit_rollover_last_ocxo1_hw16 = 0;
-  g_ch2_implicit_rollover_last_ocxo2_hw16 = 0;
-  g_ch2_implicit_rollover_last_vclock_counter32 = 0;
-  g_ch2_implicit_rollover_last_ocxo1_counter32 = 0;
-  g_ch2_implicit_rollover_last_ocxo2_counter32 = 0;
-
-  g_vclock_ch2_one_second_enabled = false;
-  g_vclock_ch2_one_second_next_counter32 = 0;
-  g_vclock_ch2_one_second_enable_count = 0;
-  g_vclock_ch2_one_second_reset_count = 0;
-  g_vclock_ch2_one_second_service_count = 0;
-  g_vclock_ch2_one_second_enqueue_count = 0;
-  g_vclock_ch2_one_second_late_count = 0;
-  g_vclock_ch2_one_second_late_max_ticks = 0;
-  g_vclock_ch2_one_second_catchup_count = 0;
-  g_vclock_ch2_one_second_drop_count = 0;
-  g_vclock_ch2_one_second_last_target_counter32 = 0;
-  g_vclock_ch2_one_second_last_service_counter32 = 0;
-  g_vclock_ch2_one_second_last_dwt = 0;
-  g_vclock_ch2_one_second_epoch_enable_count = 0;
-  g_vclock_ch2_one_second_epoch_base_counter32 = 0;
-  g_vclock_ch2_one_second_epoch_service_counter32 = 0;
-  g_vclock_ch2_one_second_epoch_target_counter32 = 0;
-  g_vclock_ch2_one_second_epoch_tick_mod_seed = 0;
-  g_vclock_ch2_one_second_epoch_remaining_cells = 0;
-  g_vclock_ch2_one_second_epoch_residual_ticks = 0;
-  g_vclock_ch2_one_second_heartbeat_enable_count = 0;
-  g_vclock_heartbeat_one_second_legacy_count = 0;
-  g_vclock_heartbeat_one_second_handoff_skip_count = 0;
-  g_vclock_heartbeat_one_second_fallback_count = 0;
-
-  g_vclock_ch2_smartzero_seeded = false;
-  g_vclock_ch2_smartzero_next_counter32 = 0;
-  g_vclock_ch2_smartzero_reset_count = 0;
-  g_vclock_ch2_smartzero_seed_count = 0;
-  g_vclock_ch2_smartzero_deactivate_count = 0;
-  g_vclock_ch2_smartzero_service_count = 0;
-  g_vclock_ch2_smartzero_transaction_skip_count = 0;
-  g_vclock_ch2_smartzero_feed_count = 0;
-  g_vclock_ch2_smartzero_late_count = 0;
-  g_vclock_ch2_smartzero_late_max_ticks = 0;
-  g_vclock_ch2_smartzero_resync_count = 0;
-  g_vclock_ch2_smartzero_drop_count = 0;
-  g_vclock_ch2_smartzero_waiting_for_cps_count = 0;
-  g_vclock_ch2_smartzero_first_sample_count = 0;
-  g_vclock_ch2_smartzero_accepted_count = 0;
-  g_vclock_ch2_smartzero_rejected_dwt_count = 0;
-  g_vclock_ch2_smartzero_rejected_counter_count = 0;
-  g_vclock_ch2_smartzero_last_target_counter32 = 0;
-  g_vclock_ch2_smartzero_last_service_counter32 = 0;
-  g_vclock_ch2_smartzero_last_dwt = 0;
-  g_vclock_ch2_smartzero_last_late_ticks = 0;
-  g_vclock_heartbeat_smartzero_authority_retired_count = 0;
-
-  g_vclock_ch2_fact_drain_service_count = 0;
-  g_vclock_ch2_fact_drain_arm_count = 0;
-  g_vclock_heartbeat_fact_drain_authority_retired_count = 0;
-  g_vclock_ch2_epoch_native_service_count = 0;
-  g_vclock_ch2_epoch_native_publish_count = 0;
-  g_vclock_ch2_epoch_native_bad_backdate_count = 0;
-  g_vclock_ch2_epoch_native_last_reject_reason = VCLOCK_CH2_EPOCH_REJECT_NONE;
-  g_vclock_ch2_epoch_native_dispatch_arm_count = 0;
-  g_vclock_ch2_epoch_native_dispatch_arm_fail_count = 0;
-  g_vclock_ch2_epoch_native_last_selected_counter32 = 0;
-  g_vclock_ch2_epoch_native_last_service_counter32 = 0;
-  g_vclock_ch2_epoch_native_last_backdate_ticks = 0;
-  g_vclock_ch2_epoch_native_last_backdate_cycles = 0;
-  g_vclock_ch2_epoch_native_last_sacred_dwt = 0;
-  g_vclock_ch2_epoch_native_last_sequence = 0;
-  g_vclock_heartbeat_epoch_authority_retired_count = 0;
-  g_vclock_heartbeat_epoch_pending_skip_count = 0;
-
-  pps_yardstick_reset();
-  g_pps_yardstick_prev_valid = false;
-  g_pps_yardstick_prev_sequence = 0;
-  g_pps_yardstick_prev_counter32 = 0;
-  g_pps_yardstick_prev_dwt = 0;
-  g_pps_floorline_repair_seq = 0;
-  g_pps_floorline_repair = pps_floorline_repair_state_t{};
-
-  g_interrupt_handoff = interrupt_handoff_diag_t{};
-  g_handoff_qtimer1_ch1 = interrupt_handoff_source_diag_t{};
-  g_handoff_qtimer1_ch2 = interrupt_handoff_source_diag_t{};
-  g_handoff_ocxo1 = interrupt_handoff_source_diag_t{};
-  g_handoff_ocxo2 = interrupt_handoff_source_diag_t{};
-  g_handoff_pps = interrupt_handoff_source_diag_t{};
-  g_qtimer1_ch1_capture_ring = interrupt_capture_ring_t<qtimer1_ch1_capture_packet_t, HANDOFF_QTIMER1_CH1_RING_SIZE>{};
-  g_qtimer1_vclock_capture_ring = interrupt_capture_ring_t<qtimer1_vclock_capture_packet_t, HANDOFF_QTIMER1_CH1_RING_SIZE>{};
-  g_qtimer1_ch2_capture_ring = interrupt_capture_ring_t<qtimer1_ch2_capture_packet_t, HANDOFF_QTIMER1_CH2_RING_SIZE>{};
-  g_ocxo1_1khz_sample_capture_ring = interrupt_capture_ring_t<ocxo_1khz_sample_capture_packet_t, HANDOFF_OCXO_RING_SIZE>{};
-  g_ocxo2_1khz_sample_capture_ring = interrupt_capture_ring_t<ocxo_1khz_sample_capture_packet_t, HANDOFF_OCXO_RING_SIZE>{};
-  g_ocxo1_one_second_capture_ring = interrupt_capture_ring_t<ocxo_one_second_capture_packet_t, HANDOFF_OCXO_RING_SIZE>{};
-  g_ocxo2_one_second_capture_ring = interrupt_capture_ring_t<ocxo_one_second_capture_packet_t, HANDOFF_OCXO_RING_SIZE>{};
-  g_pps_capture_ring = interrupt_capture_ring_t<pps_capture_packet_t, HANDOFF_PPS_RING_SIZE>{};
-  g_interrupt_capture_sequence = 0;
-  g_pps_capture_sequence = 0;
-  generation_gate_reset_all();
-
-}
-
-static void runtime_reset_ocxo_fact_rings(void) {
-  if (!OCXO1_DISABLED) ocxo_fact_ring_reset(g_ocxo1_ctx);
-  if (!OCXO2_DISABLED) ocxo_fact_ring_reset(g_ocxo2_ctx);
-}
-
-static void runtime_reset_for_init(void) {
-  g_interrupt_integrity = interrupt_integrity_snapshot_t{};
-  runtime_init_subscribers();
-  runtime_reset_pps_state();
-  runtime_reset_snapshot_and_bridge_state();
-  runtime_reset_clock32_state();
-  runtime_reset_smartzero_state();
-  runtime_bootstrap_synthetic_clocks_if_ready();
-  runtime_reset_qtimer_host_state();
-  runtime_reset_vclock_heartbeat_state();
-  vclock_fact_ring_reset();
-  runtime_reset_ocxo_fact_rings();
-  dwt_publication_reset_all();
-  cadence_regression_reset_all();
-  interrupt_features_mark_initializing();
 }
 
 void process_interrupt_init(void) {
   if (g_interrupt_runtime_ready) return;
-
-  runtime_reset_for_init();
-
+  runtime_init_subscribers();
+  g_interrupt_integrity = interrupt_integrity_snapshot_t{};
+  g_store = snapshot_store_t{};
+  g_epoch_capture = epoch_capture_store_t{};
+  g_pps_gpio_heartbeat = pps_gpio_heartbeat_t{};
+  g_last_pps_witness = pps_t{};
+  g_last_pps_witness_valid = false;
+  g_pps_vclock_edge_authority = pps_vclock_edge_authority_t{};
+  g_smartzero = smartzero_runtime_t{};
+  for (uint32_t i = 0; i < SMARTZERO_LANE_COUNT; ++i) {
+    smartzero_reset_lane(i);
+  }
   g_interrupt_runtime_ready = true;
+  interrupt_features_mark_initializing();
   interrupt_handoff_configure();
-  (void)vclock_heartbeat_arm_timepop();
+  (void)vclock_heartbeat_arm();
 }
 
 void process_interrupt_enable_irqs(void) {
   if (g_interrupt_irqs_enabled) return;
-
-  // Never make an interrupt vector live unless the eager automatic FP-context
-  // policy still matches the register readback at this exact boundary.
   if (!g_interrupt_hw_ready ||
       !interrupt_fpu_context_policy_verify_current()) {
     g_interrupt_fpu_context_policy.irq_enable_block_count++;
-    g_interrupt_fpu_context_policy.last_irq_enable_fpccr =
-        interrupt_fpu_fpccr_register();
     return;
   }
 
   interrupt_handoff_configure();
-
   attachInterruptVector(IRQ_QTIMER1, qtimer1_isr);
-  // VCLOCK/TimePop QTimer1 is the sovereign timing rail.  Keep the entire
-  // shared QTimer1 vector at highest priority; same-vector logical ordering
-  // is handled inside TimePop/process_interrupt.
-  NVIC_SET_PRIORITY(IRQ_QTIMER1, INTERRUPT_STEP0_EXPECTED_QTIMER1_PRIORITY);
-  g_step0_qtimer1_priority_applied = INTERRUPT_STEP0_EXPECTED_QTIMER1_PRIORITY;
+  NVIC_SET_PRIORITY(IRQ_QTIMER1, INTERRUPT_PRIORITY_CAPTURE);
   NVIC_ENABLE_IRQ(IRQ_QTIMER1);
-  g_step0_qtimer1_irq_enabled_by_interrupt = true;
 
   if (!OCXO1_DISABLED) {
     attachInterruptVector(IRQ_QTIMER2, qtimer2_isr);
-    NVIC_SET_PRIORITY(IRQ_QTIMER2, INTERRUPT_STEP0_EXPECTED_QTIMER2_PRIORITY);
-    g_step0_qtimer2_priority_applied = INTERRUPT_STEP0_EXPECTED_QTIMER2_PRIORITY;
+    NVIC_SET_PRIORITY(IRQ_QTIMER2, INTERRUPT_PRIORITY_CAPTURE);
     NVIC_ENABLE_IRQ(IRQ_QTIMER2);
-    g_step0_qtimer2_irq_enabled_by_interrupt = true;
-  } else {
-    g_step0_qtimer2_priority_applied = 0xFFFFFFFFUL;
-    g_step0_qtimer2_irq_enabled_by_interrupt = false;
   }
-
   if (!OCXO2_DISABLED) {
     attachInterruptVector(IRQ_QTIMER3, qtimer3_isr);
-    NVIC_SET_PRIORITY(IRQ_QTIMER3, INTERRUPT_STEP0_EXPECTED_QTIMER3_PRIORITY);
-    g_step0_qtimer3_priority_applied = INTERRUPT_STEP0_EXPECTED_QTIMER3_PRIORITY;
+    NVIC_SET_PRIORITY(IRQ_QTIMER3, INTERRUPT_PRIORITY_CAPTURE);
     NVIC_ENABLE_IRQ(IRQ_QTIMER3);
-    g_step0_qtimer3_irq_enabled_by_interrupt = true;
-  } else {
-    g_step0_qtimer3_priority_applied = 0xFFFFFFFFUL;
-    g_step0_qtimer3_irq_enabled_by_interrupt = false;
   }
 
   pinMode(GNSS_PPS_PIN, INPUT);
   attachInterrupt(digitalPinToInterrupt(GNSS_PPS_PIN), pps_gpio_isr, RISING);
-  // PPS GPIO is now a witness/selector, not the highest-priority timing
-  // interpolation rail.  Keep it below QTimer1 so VCLOCK/TimePop event facts
-  // are not delayed by PPS witness work.
-  NVIC_SET_PRIORITY(IRQ_GPIO6789, INTERRUPT_STEP0_EXPECTED_GPIO6789_PRIORITY);
-  g_step0_gpio6789_priority_applied = INTERRUPT_STEP0_EXPECTED_GPIO6789_PRIORITY;
-  g_step0_gpio6789_configured_by_interrupt = true;
-
+  NVIC_SET_PRIORITY(IRQ_GPIO6789, INTERRUPT_PRIORITY_CAPTURE);
   g_interrupt_irqs_enabled = true;
 }
 
-
 // ============================================================================
-// Lean command/report surface
+// Lean observed-only reports
 // ============================================================================
-// process_interrupt reports now expose only operational custody state.  Legacy
-// lane courtroom dumps, regression windows, SpinCatch/SpinIdle, raw-DWT CSVs,
-// and register museum reports were removed to reduce payload and maintenance
-// pressure.  Permanent edge-authority courtroom fields will be added here in
-// the next phase.
 
-static FLASHMEM void add_runtime_summary(Payload& p,
+static FLASHMEM void add_runtime_summary(Payload& payload,
                                          const char* prefix,
-                                         interrupt_subscriber_runtime_t* rt,
-                                         uint32_t irq_count,
-                                         uint32_t event_count) {
+                                         const interrupt_subscriber_runtime_t* rt) {
   char key[64];
-  snprintf(key, sizeof(key), "%s_subscribed", prefix); p.add(key, rt ? rt->subscribed : false);
-  snprintf(key, sizeof(key), "%s_active", prefix);     p.add(key, rt ? rt->active : false);
-  snprintf(key, sizeof(key), "%s_started", prefix);    p.add(key, rt ? rt->start_count : 0U);
-  snprintf(key, sizeof(key), "%s_stopped", prefix);    p.add(key, rt ? rt->stop_count : 0U);
-  snprintf(key, sizeof(key), "%s_irq_count", prefix);  p.add(key, irq_count);
-  snprintf(key, sizeof(key), "%s_event_count", prefix);p.add(key, event_count);
+  snprintf(key, sizeof(key), "%s_subscribed", prefix);
+  payload.add(key, rt ? rt->subscribed : false);
+  snprintf(key, sizeof(key), "%s_active", prefix);
+  payload.add(key, rt ? rt->active : false);
+  snprintf(key, sizeof(key), "%s_event_count", prefix);
+  payload.add(key, rt ? rt->event_count : 0U);
   snprintf(key, sizeof(key), "%s_dispatch_count", prefix);
-  p.add(key, rt ? rt->dispatch_count : 0U);
+  payload.add(key, rt ? rt->dispatch_count : 0U);
   snprintf(key, sizeof(key), "%s_dispatch_busy_drop_count", prefix);
-  p.add(key, rt ? rt->dispatch_busy_drop_count : 0U);
-  snprintf(key, sizeof(key), "%s_dispatch_stale_drop_count", prefix);
-  p.add(key, rt ? rt->dispatch_stale_drop_count : 0U);
-  snprintf(key, sizeof(key), "%s_dispatch_invalid_callback_count", prefix);
-  p.add(key, rt ? rt->dispatch_invalid_callback_count : 0U);
+  payload.add(key, rt ? rt->dispatch_busy_drop_count : 0U);
   snprintf(key, sizeof(key), "%s_dispatch_arm_fail_count", prefix);
-  p.add(key, rt ? rt->dispatch_arm_fail_count : 0U);
+  payload.add(key, rt ? rt->dispatch_arm_fail_count : 0U);
 }
 
-
-static FLASHMEM void add_generation_gate_lane(Payload& p,
-                                              const char* prefix,
-                                              const generation_gate_lane_t& s) {
-  char key[128];
-  auto add_bool = [&](const char* suffix, bool value) {
-    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
-    p.add(key, value);
-  };
-  auto add_u32 = [&](const char* suffix, uint32_t value) {
-    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
-    p.add(key, value);
-  };
-  auto add_i32 = [&](const char* suffix, int32_t value) {
-    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
-    p.add(key, value);
-  };
-  auto add_str = [&](const char* suffix, const char* value) {
-    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
-    p.add(key, value ? value : "");
-  };
-
-  add_u32("generation_gate_observe_count", s.generation_gate_observe_count);
-  add_u32("generation_gate_accept_count", s.generation_gate_accept_count);
-  add_u32("generation_gate_reject_count", s.generation_gate_reject_count);
-  add_u32("generation_gate_early_reject_count", s.generation_gate_early_reject_count);
-  add_u32("generation_gate_late_accept_count", s.generation_gate_late_accept_count);
-  add_bool("generation_gate_far_late_reject_enabled",
-           GENERATION_GATE_REJECT_FAR_LATE_ENABLED);
-  add_u32("generation_gate_far_late_reject_threshold_ticks",
-          GENERATION_GATE_FAR_LATE_REJECT_TICKS);
-  add_u32("generation_gate_far_late_accept_count", s.generation_gate_far_late_accept_count);
-  add_u32("generation_gate_far_late_reject_count", s.generation_gate_far_late_reject_count);
-  add_u32("generation_gate_max_far_late_delta_ticks", s.generation_gate_max_far_late_delta_ticks);
-
-  add_bool("generation_gate_last_far_late_valid", s.generation_gate_last_far_late_valid);
-  add_bool("generation_gate_last_far_late_accepted", s.generation_gate_last_far_late_accepted);
-  add_bool("generation_gate_last_far_late_rejected", s.generation_gate_last_far_late_rejected);
-  add_u32("generation_gate_last_far_late_reason_id", s.generation_gate_last_far_late_reason_id);
-  add_str("generation_gate_last_far_late_reason",
-          generation_gate_reason_name(s.generation_gate_last_far_late_reason_id));
-  add_i32("generation_gate_last_far_late_delta_ticks", s.generation_gate_last_far_late_delta_ticks);
-  add_u32("generation_gate_last_far_late_resolved_counter32", s.generation_gate_last_far_late_resolved_counter32);
-  add_u32("generation_gate_last_far_late_target_counter32", s.generation_gate_last_far_late_target_counter32);
-  add_u32("generation_gate_last_far_late_target_low16", (uint32_t)s.generation_gate_last_far_late_target_low16);
-  add_u32("generation_gate_last_far_late_service_counter_low16", (uint32_t)s.generation_gate_last_far_late_ambient_low16);
-  add_u32("generation_gate_last_far_late_clock32_current_counter32", s.generation_gate_last_far_late_clock32_current_counter32);
-  add_u32("generation_gate_last_far_late_clock32_hardware16", (uint32_t)s.generation_gate_last_far_late_clock32_hardware16);
-  add_u32("generation_gate_last_far_late_target_semantic_delta_ticks", s.generation_gate_last_far_late_target_semantic_delta_ticks);
-  add_u32("generation_gate_last_far_late_target_hardware_delta_ticks", s.generation_gate_last_far_late_target_hardware_delta_ticks);
-  add_i32("generation_gate_last_far_late_domain_skew_ticks", s.generation_gate_last_far_late_domain_skew_ticks);
-  add_u32("generation_gate_last_far_late_tick_mod", s.generation_gate_last_far_late_tick_mod);
-  add_bool("generation_gate_last_far_late_one_second_due", s.generation_gate_last_far_late_one_second_due);
-
-  add_bool("generation_gate_last_accepted", s.generation_gate_last_accepted);
-  add_u32("generation_gate_last_reason_id", s.generation_gate_last_reason_id);
-  add_str("generation_gate_last_reason",
-          generation_gate_reason_name(s.generation_gate_last_reason_id));
-  add_i32("generation_gate_last_delta_ticks", s.generation_gate_last_delta_ticks);
-  add_u32("generation_gate_last_resolved_counter32", s.generation_gate_last_resolved_counter32);
-  add_u32("generation_gate_last_target_counter32", s.generation_gate_last_target_counter32);
-  add_u32("generation_gate_last_target_low16", (uint32_t)s.generation_gate_last_target_low16);
-  add_u32("generation_gate_last_service_counter_low16", (uint32_t)s.generation_gate_last_ambient_low16);
-  add_u32("generation_gate_last_clock32_current_counter32", s.generation_gate_last_clock32_current_counter32);
-  add_u32("generation_gate_last_clock32_hardware16", (uint32_t)s.generation_gate_last_clock32_hardware16);
-  add_u32("generation_gate_last_target_semantic_delta_ticks", s.generation_gate_last_target_semantic_delta_ticks);
-  add_u32("generation_gate_last_target_hardware_delta_ticks", s.generation_gate_last_target_hardware_delta_ticks);
-  add_i32("generation_gate_last_domain_skew_ticks", s.generation_gate_last_domain_skew_ticks);
-  add_u32("generation_gate_last_tick_mod", s.generation_gate_last_tick_mod);
-  add_bool("generation_gate_last_one_second_due", s.generation_gate_last_one_second_due);
-
-  add_bool("generation_gate_last_reject_valid", s.generation_gate_last_reject_valid);
-  add_u32("generation_gate_last_reject_reason_id", s.generation_gate_last_reject_reason_id);
-  add_str("generation_gate_last_reject_reason",
-          generation_gate_reason_name(s.generation_gate_last_reject_reason_id));
-  add_i32("generation_gate_last_reject_delta_ticks", s.generation_gate_last_reject_delta_ticks);
-  add_u32("generation_gate_last_reject_resolved_counter32", s.generation_gate_last_reject_resolved_counter32);
-  add_u32("generation_gate_last_reject_target_counter32", s.generation_gate_last_reject_target_counter32);
-  add_u32("generation_gate_last_reject_target_low16", (uint32_t)s.generation_gate_last_reject_target_low16);
-  add_u32("generation_gate_last_reject_service_counter_low16", (uint32_t)s.generation_gate_last_reject_ambient_low16);
-  add_u32("generation_gate_last_reject_clock32_current_counter32", s.generation_gate_last_reject_clock32_current_counter32);
-  add_u32("generation_gate_last_reject_clock32_hardware16", (uint32_t)s.generation_gate_last_reject_clock32_hardware16);
-  add_u32("generation_gate_last_reject_target_semantic_delta_ticks", s.generation_gate_last_reject_target_semantic_delta_ticks);
-  add_u32("generation_gate_last_reject_target_hardware_delta_ticks", s.generation_gate_last_reject_target_hardware_delta_ticks);
-  add_i32("generation_gate_last_reject_domain_skew_ticks", s.generation_gate_last_reject_domain_skew_ticks);
-  add_u32("generation_gate_last_reject_tick_mod", s.generation_gate_last_reject_tick_mod);
-  add_bool("generation_gate_last_reject_one_second_due", s.generation_gate_last_reject_one_second_due);
-}
-
-static FLASHMEM void add_floorline_flat(Payload& p,
-                                           const char* prefix,
-                                           const lower_env_lane_t& lane);
-
-static FLASHMEM void add_ocxo_lean_lane(Payload& p,
-                                        const char* prefix,
-                                        ocxo_runtime_context_t& ctx,
-                                        const char* section = nullptr) {
+static FLASHMEM void add_ocxo_lane_report(Payload& payload,
+                                          const char* prefix,
+                                          const ocxo_runtime_context_t& ctx) {
   const ocxo_lane_t& lane = *ctx.lane;
-  const synthetic_clock32_t* const clock32 = ctx.clock32;
-  const interrupt_subscriber_runtime_t* const rt =
-      ctx.rt_slot ? *ctx.rt_slot : nullptr;
-  const char* requested_section = (section && *section) ? section : "summary";
-
-  const bool want_summary = interrupt_cstr_equal_ci(requested_section, "summary") ||
-                            interrupt_cstr_equal_ci(requested_section, "lean");
-  const bool want_clock = interrupt_cstr_equal_ci(requested_section, "clock");
-  const bool want_gate = interrupt_cstr_equal_ci(requested_section, "gate") ||
-                         interrupt_cstr_equal_ci(requested_section, "generation") ||
-                         interrupt_cstr_equal_ci(requested_section, "generation_gate");
-  const bool want_service = interrupt_cstr_equal_ci(requested_section, "service");
-  const bool want_yardstick = interrupt_cstr_equal_ci(requested_section, "yardstick") ||
-                              interrupt_cstr_equal_ci(requested_section, "zero");
-  const bool want_floorline = interrupt_cstr_equal_ci(requested_section, "floorline") ||
-                              interrupt_cstr_equal_ci(requested_section, "lower_envelope");
-
-  char key[112];
+  const synthetic_clock32_t& clock = *ctx.clock32;
+  char key[80];
   auto add_bool = [&](const char* suffix, bool value) {
     snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
-    p.add(key, value);
+    payload.add(key, value);
   };
   auto add_u32 = [&](const char* suffix, uint32_t value) {
     snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
-    p.add(key, value);
+    payload.add(key, value);
   };
   auto add_i32 = [&](const char* suffix, int32_t value) {
     snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
-    p.add(key, value);
-  };
-  auto add_str = [&](const char* suffix, const char* value) {
-    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
-    p.add(key, value ? value : "");
+    payload.add(key, value);
   };
 
-  add_str("section", requested_section);
-  add_str("available_sections", "summary clock gate service yardstick floorline");
-  if (!(want_summary || want_clock || want_gate || want_service ||
-        want_yardstick || want_floorline)) {
-    add_str("error", "unknown section");
-    return;
-  }
-
-  // Snapshot the cross-field coordinate state as one small critical-section
-  // read.  The foreground report is not timing authority, but mixed reads
-  // across a 1 kHz ISR rearm can otherwise make fields such as
-  // cadence_next_minus_live_ticks appear impossible by exactly one gear tooth.
-  bool     clock32_zeroed = false;
-  bool     clock32_pending_zero = false;
-  uint32_t clock32_pending_zero_counter32 = 0;
-  uint32_t clock32_pending_zero_count = 0;
-  uint32_t clock32_pending_zero_retired_request_count = 0;
-  uint32_t clock32_pending_zero_retired_request_total = 0;
-  uint32_t clock32_current = 0;
-  uint32_t clock32_zero = 0;
-  uint16_t clock32_hw_anchor = 0;
-  uint32_t clock32_minder_update_count = 0;
-  bool     cadence_enabled = false;
-  bool     cadence_armed = false;
-  bool     cadence_epoch_valid = false;
-  uint32_t cadence_epoch_counter32 = 0;
-  uint32_t cadence_next_counter32 = 0;
-  uint16_t cadence_next_low16 = 0;
-
-  const uint32_t prior_basepri = interrupt_priority0_guard_enter();
-  if (clock32) {
-    clock32_zeroed = clock32->zeroed;
-    clock32_pending_zero = clock32->pending_zero;
-    clock32_pending_zero_counter32 = clock32->pending_zero_counter32;
-    clock32_pending_zero_count = clock32->pending_zero_count;
-    clock32_current = clock32->current_counter32;
-    clock32_zero = clock32->zero_counter32;
-    clock32_hw_anchor = clock32->hardware16;
-    clock32_minder_update_count = clock32->minder_update_count;
-  }
-  if (ctx.kind == interrupt_subscriber_kind_t::OCXO1) {
-    clock32_pending_zero_retired_request_count =
-        g_ocxo1_pending_zero_request_retired_count;
-  } else if (ctx.kind == interrupt_subscriber_kind_t::OCXO2) {
-    clock32_pending_zero_retired_request_count =
-        g_ocxo2_pending_zero_request_retired_count;
-  }
-  clock32_pending_zero_retired_request_total =
-      g_ocxo_pending_zero_request_retired_count;
-  cadence_enabled = lane.cadence_enabled;
-  cadence_armed = lane.cadence_armed;
-  cadence_epoch_valid = lane.cadence_epoch_valid;
-  cadence_epoch_counter32 = lane.cadence_epoch_counter32;
-  cadence_next_counter32 = lane.cadence_next_counter32;
-  cadence_next_low16 = lane.cadence_next_low16;
-  interrupt_priority0_guard_exit(prior_basepri);
-
-  const uint16_t live_hw16 = lane.initialized ? ocxo_lane_counter_now(lane) : 0U;
-  const uint16_t live_compare_hw16 =
-      lane.initialized ? ocxo_lane_compare_counter_now(lane) : 0U;
-  const uint32_t live_low16_delta_from_clock32 =
-      (lane.initialized && clock32)
-          ? (uint32_t)((uint16_t)(live_hw16 - clock32_hw_anchor))
-          : 0U;
-  const uint32_t live_projected_counter32 =
-      (lane.initialized && clock32)
-          ? (clock32_current + live_low16_delta_from_clock32)
-          : clock32_current;
-  const uint32_t live_delta_from_clock32 = live_low16_delta_from_clock32;
-  const uint32_t next_minus_clock32 =
-      cadence_enabled ? (cadence_next_counter32 - clock32_current) : 0U;
-  const uint32_t next_minus_live =
-      cadence_enabled ? (cadence_next_counter32 - live_projected_counter32) : 0U;
-  const uint32_t epoch_to_clock32 =
-      cadence_epoch_valid ? (clock32_current - cadence_epoch_counter32) : 0U;
-  const uint32_t epoch_to_next =
-      cadence_epoch_valid ? (cadence_next_counter32 - cadence_epoch_counter32) : 0U;
-  uint32_t live_compare_csctrl = 0U;
-  uint16_t live_compare_comp1 = 0U;
-  if (lane.initialized &&
-      qtimer_guard_read_ocxo_csctrl(lane,
-                                    "ocxo_report_compare_csctrl",
-                                    lane.compare_target,
-                                    &live_compare_csctrl)) {
-    live_compare_comp1 = lane.module->CH[lane.compare_channel].COMP1;
-  }
-
-  const generation_gate_lane_t& gate = generation_gate_for_ocxo_kind(ctx.kind);
-
-  // Always-return summary: keep this deliberately small.  Expensive surfaces
-  // live behind section=clock/gate/service/yardstick so one bad
-  // report cannot starve the command socket or force a service restart.
-  add_str("kind", interrupt_subscriber_kind_str(ctx.kind));
   add_bool("initialized", lane.initialized);
   add_bool("active", lane.active);
-  add_bool("runtime_active", rt ? rt->active : false);
-  add_bool("subscribed", rt ? rt->subscribed : false);
-  add_u32("runtime_event_count", rt ? rt->event_count : 0U);
-  add_u32("irq_count", lane.irq_count);
-  add_u32("cadence_fire_count", lane.cadence_fire_count);
-  add_u32("valid_publish_count", lane.witness_valid_publish_count);
-  add_u32("counter_delta", lane.witness_last_counter_delta_ticks);
-  add_u32("bad_counter_count", lane.witness_counter_delta_violation_count);
-  add_bool("cadence_enabled", cadence_enabled);
-  add_bool("cadence_armed", cadence_armed);
-  add_u32("cadence_next_counter32", cadence_next_counter32);
-  add_u32("cadence_next_low16", (uint32_t)cadence_next_low16);
-  add_u32("cadence_next_minus_live_ticks", next_minus_live);
-  add_u32("clock32_current_counter32", clock32_current);
-  add_u32("clock32_hardware16_anchor", (uint32_t)clock32_hw_anchor);
-  add_bool("clock32_pending_zero", clock32_pending_zero);
-  add_u32("clock32_pending_zero_count", clock32_pending_zero_count);
-  add_u32("clock32_pending_zero_retired_request_count",
-          clock32_pending_zero_retired_request_count);
-  add_u32("live_hw16", (uint32_t)live_hw16);
-  add_u32("live_projected_counter32", live_projected_counter32);
-  add_u32("live_low16_delta_from_clock32_ticks", live_low16_delta_from_clock32);
-  add_u32("generation_gate_reject_count", gate.generation_gate_reject_count);
-  add_u32("generation_gate_early_reject_count", gate.generation_gate_early_reject_count);
-  add_u32("generation_gate_far_late_accept_count", gate.generation_gate_far_late_accept_count);
-  add_u32("generation_gate_far_late_reject_count", gate.generation_gate_far_late_reject_count);
-  add_bool("generation_gate_last_accepted", gate.generation_gate_last_accepted);
-  add_i32("generation_gate_last_delta_ticks", gate.generation_gate_last_delta_ticks);
-  add_i32("generation_gate_last_domain_skew_ticks", gate.generation_gate_last_domain_skew_ticks);
-  add_bool("generation_gate_last_reject_valid", gate.generation_gate_last_reject_valid);
-  add_i32("generation_gate_last_reject_delta_ticks", gate.generation_gate_last_reject_delta_ticks);
-  add_i32("generation_gate_last_reject_domain_skew_ticks", gate.generation_gate_last_reject_domain_skew_ticks);
-  add_bool("yardstick_excursion", lane.yardstick_last_excursion);
-  add_i32("yardstick_auth_error", lane.yardstick_auth_last_error_cycles);
-  add_bool("zero_worthy", lane.zw_worthy);
-  add_u32("recover_rebootstrap_attempt_count",
-          lane.recover_rebootstrap_attempt_count);
-  add_u32("recover_rebootstrap_success_count",
-          lane.recover_rebootstrap_success_count);
-  add_u32("recover_rebootstrap_failure_count",
-          lane.recover_rebootstrap_failure_count);
-  add_u32("recover_rebootstrap_last_failure_stage",
-          lane.recover_rebootstrap_last_failure_stage);
-  add_bool("recover_rebootstrap_last_cadence_preserved",
-           lane.recover_rebootstrap_last_cadence_preserved);
-  if (want_summary) {
-    const lower_env_lane_t* fl = lower_env_report_snapshot(ctx.kind);
-    if (fl) {
-      add_floorline_flat(p, prefix, *fl);
-    }
-    return;
-  }
-
-  if (want_gate) {
-    add_generation_gate_lane(p, prefix, gate);
-    return;
-  }
-
-  if (want_clock) {
-    add_str("cadence_source", ctx.cadence_source);
-    add_str("counter_source", ctx.counter_source);
-    add_str("dwt_authority", ctx.dwt_authority);
-    add_bool("clock32_zeroed", clock32_zeroed);
-    add_u32("clock32_zero_counter32", clock32_zero);
-    add_u32("clock32_pending_zero_counter32", clock32_pending_zero_counter32);
-    add_u32("clock32_pending_zero_retired_request_total",
-            clock32_pending_zero_retired_request_total);
-    add_str("clock32_pending_zero_policy", "OCXO_REQUEST_ZERO_RETIRED_NOOP");
-    add_u32("clock32_minder_update_count", clock32_minder_update_count);
-    add_u32("live_compare_hw16", (uint32_t)live_compare_hw16);
-    add_u32("live_counter_minus_compare_ticks",
-            (uint32_t)((uint16_t)(live_hw16 - live_compare_hw16)));
-    add_u32("live_delta_from_clock32_ticks", live_delta_from_clock32);
-    add_u32("live_compare_comp1", (uint32_t)live_compare_comp1);
-    add_u32("live_compare_csctrl", live_compare_csctrl);
-    add_bool("live_compare_flag", (live_compare_csctrl & TMR_CSCTRL_TCF1) != 0);
-    add_bool("live_compare_enabled", (live_compare_csctrl & TMR_CSCTRL_TCF1EN) != 0);
-    add_bool("cadence_epoch_valid", cadence_epoch_valid);
-    add_u32("cadence_epoch_counter32", cadence_epoch_counter32);
-    add_u32("cadence_next_minus_clock32_ticks", next_minus_clock32);
-    add_u32("cadence_epoch_to_clock32_ticks", epoch_to_clock32);
-    add_u32("cadence_epoch_to_next_ticks", epoch_to_next);
-    add_u32("cadence_arm_count", lane.cadence_arm_count);
-    add_u32("cadence_rearm_count", lane.cadence_rearm_count);
-    add_u32("cadence_false_irq_count", lane.cadence_false_irq_count);
-    add_u32("cadence_one_second_due_count", lane.cadence_one_second_due_count);
-    add_bool("cadence_last_one_second_due", lane.cadence_last_one_second_due);
-    add_u32("cadence_last_reason_id", lane.cadence_last_reason);
-    add_str("cadence_last_reason", ocxo_cadence_reason_name(lane.cadence_last_reason));
-    add_bool("cadence_last_program_enabled_after", lane.cadence_last_program_enabled_after);
-    add_bool("cadence_last_program_flag_after", lane.cadence_last_program_flag_after);
-    add_bool("smartzero_current_lane", smartzero_is_current_lane(ctx.kind));
-    return;
-  }
-
-  if (want_service) {
-    add_u32("witness_fire_count", lane.witness_fire_count);
-    add_u32("bad_counter_delta", lane.witness_last_bad_counter_delta);
-    add_u32("dwt_at_edge", lane.witness_last_event_dwt);
-    add_u32("counter32_at_edge", lane.witness_last_event_counter32);
-    add_bool("witness_target_initialized", lane.witness_target_initialized);
-    add_bool("witness_armed", lane.witness_armed);
-    add_u32("witness_target_counter32", lane.witness_target_counter32);
-    add_u32("witness_target_low16", (uint32_t)lane.witness_target_low16);
-    add_u32("witness_arm_count", lane.witness_arm_count);
-    add_u32("witness_late_arm_count", lane.witness_late_arm_count);
-    add_u32("generation_guard_block_count", lane.witness_generation_guard_block_count);
-    add_u32("generation_guard_last_remaining_ticks", lane.witness_generation_guard_last_remaining_ticks);
-    add_u32("generation_guard_last_current_counter32", lane.witness_generation_guard_last_current_counter32);
-    add_u32("generation_guard_last_target_counter32", lane.witness_generation_guard_last_target_counter32);
-    add_u32("generation_guard_last_reason_id", lane.witness_generation_guard_last_reason);
-    add_str("generation_guard_last_reason", ocxo_cadence_reason_name(lane.witness_generation_guard_last_reason));
-    add_u32("witness_false_irq_count", lane.witness_false_irq_count);
-    add_u32("schedule_decision_id", lane.witness_schedule_last_decision);
-    add_str("schedule_decision", ocxo_schedule_decision_name(lane.witness_schedule_last_decision));
-    add_u32("schedule_current_counter32", lane.witness_schedule_last_current_counter32);
-    add_u32("schedule_target_counter32", lane.witness_schedule_last_target_counter32);
-    add_u32("schedule_remaining_ticks", lane.witness_schedule_last_remaining_ticks);
-    add_u32("schedule_current_low16", (uint32_t)lane.witness_schedule_last_current_low16);
-    add_u32("schedule_target_low16", (uint32_t)lane.witness_schedule_last_target_low16);
-    add_u32("arm_dwt_raw", lane.witness_last_arm_dwt_raw);
-    add_u32("arm_counter32", lane.witness_last_arm_counter32);
-    add_u32("arm_low16", (uint32_t)lane.witness_last_arm_low16);
-    add_u32("arm_compare_low16", (uint32_t)lane.witness_last_arm_compare_low16);
-    add_u32("arm_remaining_ticks", lane.witness_last_arm_remaining_ticks);
-    add_u32("arm_to_isr_ticks", lane.witness_last_arm_to_isr_ticks);
-    add_u32("arm_to_isr_dwt_cycles", lane.witness_last_arm_to_isr_dwt_cycles);
-    add_u32("service_class_id", lane.witness_last_service_class);
-    add_str("service_class", ocxo_service_class_name(lane.witness_last_service_class));
-    add_i32("service_offset_ticks", lane.witness_last_service_offset_signed_ticks);
-    add_u32("service_offset_abs_ticks", lane.witness_last_service_offset_abs_ticks);
-    add_u32("target_delta_mod65536_ticks", lane.witness_last_target_delta_mod65536_ticks);
-    add_u32("interpreted_late_ticks", lane.witness_last_interpreted_late_ticks);
-    add_u32("early_ticks", lane.witness_last_early_ticks);
-    add_u32("isr_counter_low16", (uint32_t)lane.witness_last_isr_counter_low16);
-    add_u32("isr_compare_low16", (uint32_t)lane.witness_last_isr_compare_low16);
-    add_u32("compare_delta_mod65536_ticks", lane.witness_last_compare_delta_mod65536_ticks);
-    add_i32("compare_offset_ticks", lane.witness_last_compare_service_offset_signed_ticks);
-    add_u32("compare_interpreted_late_ticks", lane.witness_last_compare_interpreted_late_ticks);
-    add_u32("compare_early_ticks", lane.witness_last_compare_early_ticks);
-    add_u32("compare_arm_to_isr_ticks", lane.witness_last_compare_arm_to_isr_ticks);
-    add_bool("last_event_published", lane.witness_last_event_published);
-    add_bool("last_irq_had_armed", lane.witness_last_irq_had_armed);
-    add_bool("last_irq_had_active_rt", lane.witness_last_irq_had_active_rt);
-    add_u32("service_count", lane.witness_service_count);
-    add_u32("early_service_count", lane.witness_early_service_count);
-    add_u32("on_or_after_service_count", lane.witness_on_or_after_service_count);
-    add_u32("fact_sequence", lane.witness_last_fact_sequence);
-    add_u32("fact_enqueue_count", lane.witness_fact_enqueue_count);
-    add_u32("fact_drain_count", lane.witness_fact_drain_count);
-    add_u32("fact_high_water", lane.witness_fact_high_water);
-    add_u32("fact_asap_arm_count", lane.witness_fact_asap_arm_count);
-    add_u32("fact_asap_fail_count", lane.witness_fact_asap_fail_count);
-    add_u32("fact_overflow", lane.witness_fact_overflow_count);
-    add_u32("recover_rebootstrap_capture_drop_count",
-            lane.recover_rebootstrap_capture_drop_count);
-    add_u32("recover_rebootstrap_fact_drop_count",
-            lane.recover_rebootstrap_fact_drop_count);
-    add_u32("recover_rebootstrap_cadence_restart_count",
-            lane.recover_rebootstrap_cadence_restart_count);
-    add_u32("recover_rebootstrap_last_capture_drop_count",
-            lane.recover_rebootstrap_last_capture_drop_count);
-    add_u32("recover_rebootstrap_last_fact_drop_count",
-            lane.recover_rebootstrap_last_fact_drop_count);
-    add_bool("recover_rebootstrap_last_live_compare_verified",
-             lane.recover_rebootstrap_last_live_compare_verified);
-    add_bool("recover_rebootstrap_last_irq_was_enabled",
-             lane.recover_rebootstrap_last_irq_was_enabled);
-    add_bool("recover_rebootstrap_last_irq_enabled_after",
-             lane.recover_rebootstrap_last_irq_enabled_after);
-    add_u32("recover_rebootstrap_last_target_counter32",
-            lane.recover_rebootstrap_last_target_counter32);
-    add_u32("recover_rebootstrap_last_target_low16",
-            (uint32_t)lane.recover_rebootstrap_last_target_low16);
-    add_u32("recover_rebootstrap_last_compare_comp1",
-            (uint32_t)lane.recover_rebootstrap_last_compare_comp1);
-    add_u32("recover_rebootstrap_last_compare_csctrl",
-            lane.recover_rebootstrap_last_compare_csctrl);
-    add_str("recover_rebootstrap_last_failure_stage_name",
-            ocxo_recover_rebootstrap_stage_name(
-                lane.recover_rebootstrap_last_failure_stage));
-    return;
-  }
-
-  if (want_floorline) {
-    const lower_env_lane_t* fl = lower_env_report_snapshot(ctx.kind);
-    if (fl) {
-      add_floorline_flat(p, prefix, *fl);
-    }
-    return;
-  }
-
-  if (want_yardstick) {
-    add_bool("yardstick_valid", lane.yardstick_last_valid);
-    add_bool("yardstick_stale", lane.yardstick_last_stale);
-    add_i32("yardstick_imo", lane.yardstick_last_inferred_minus_observed_cycles);
-    add_u32("yardstick_update_count", lane.yardstick_update_count);
-    add_u32("yardstick_seed_count", lane.yardstick_seed_count);
-    add_u32("yardstick_gate_agree_count", lane.yardstick_gate_agree_count);
-    add_u32("yardstick_gate_excursion_count", lane.yardstick_gate_excursion_count);
-    add_i32("yardstick_endpoint_minus_observed_cycles", lane.yardstick_last_endpoint_minus_observed_cycles);
-    add_u32("yardstick_auth_publish_count", lane.yardstick_auth_publish_count);
-    add_u32("yardstick_auth_anchor_correction_count", lane.yardstick_auth_anchor_correction_count);
-    add_i32("yardstick_auth_error_cycles", lane.yardstick_auth_last_error_cycles);
-    add_u32("yardstick_auth_last_published_dwt", lane.yardstick_auth_last_published_dwt);
-    add_bool("zero_worthy", lane.zw_worthy);
-    add_u32("zw_clean_streak_seconds", lane.zw_clean_streak_seconds);
-    add_u32("zw_worthy_streak_seconds", lane.zw_worthy_streak_seconds);
-    add_u32("zw_seconds_evaluated", lane.zw_seconds_evaluated);
-    add_i32("zw_window_error_sum", lane.zw_window_error_sum);
-    add_u32("zw_window_max_abs_error", lane.zw_window_max_abs_error);
-    add_str("zw_last_disqualify_reason", lane.zw_last_disqualify_reason);
-    return;
-  }
-
-}
-
-static const char* dwt_publication_kind_name_u32(uint32_t kind) {
-  return interrupt_subscriber_kind_str((interrupt_subscriber_kind_t)kind);
-}
-
-static const char* dwt_publication_forensics_hint(
-    const dwt_publication_forensics_t& f) {
-  if (!f.valid) return "none";
-  if (f.capture_authored_dwt != 0U &&
-      f.observed_dwt != f.capture_authored_dwt) {
-    return "deferred_recomputed_dwt_differs_from_priority0_authored_dwt";
-  }
-  if (f.previous_valid &&
-      f.expected_counter_delta_ticks == f.observed_counter_delta_ticks &&
-      (f.verdict_mask & (DWT_PUBLICATION_VERDICT_OBSERVED_INTERVAL |
-                         DWT_PUBLICATION_VERDICT_PUBLISHED_INTERVAL)) != 0U) {
-    return "counter_lineage_ok_but_dwt_interval_bad";
-  }
-  if ((f.verdict_mask & DWT_PUBLICATION_VERDICT_COUNTER_DELTA) != 0U) {
-    return "counter_lineage_discontinuity";
-  }
-  if ((f.verdict_mask & DWT_PUBLICATION_VERDICT_SERVICE_OFFSET) != 0U) {
-    return "service_offset_outside_gate";
-  }
-  return "see_mask";
-}
-
-static FLASHMEM Payload cmd_report_publication(const Payload&) {
-  const dwt_publication_forensics_t& f = g_dwt_publication_last_fatal;
-  Payload p;
-  p.add("report", "INTERRUPT_DWT_PUBLICATION_FORENSICS");
-  p.add("schema", "INTERRUPT_DWT_PUBLICATION_FORENSICS_V1");
-  p.add("valid", f.valid);
-  p.add("record_count", f.record_count);
-  p.add("hint", dwt_publication_forensics_hint(f));
-
-  p.add("kind", f.kind);
-  p.add("kind_name", dwt_publication_kind_name_u32(f.kind));
-  p.add("sequence", f.sequence);
-  p.add("verdict_mask", f.verdict_mask);
-  p.add("fatal_mask", f.fatal_mask);
-  p.add("verdict_reason_id", f.verdict_reason_id);
-  p.add("verdict_reason", interrupt_dwt_publication_reason_name(f.verdict_reason_id));
-  p.add("campaign_armed", f.campaign_armed);
-  p.add("blocked", f.blocked);
-  p.add("launch_acquisition_active_now",
-        interrupt_dwt_publication_launch_acquisition_active());
-  p.add("launch_acquisition_active_at_record", f.launch_acquisition_active);
-  p.add("launch_block_mask", f.launch_block_mask);
-  p.add("launch_relaxed_mask", f.launch_relaxed_mask);
-  p.add("launch_begin_count", (uint32_t)g_dwt_publication_launch_begin_count);
-  p.add("launch_end_count", (uint32_t)g_dwt_publication_launch_end_count);
-  p.add("launch_relaxed_count", (uint32_t)g_dwt_publication_launch_relaxed_count);
-  p.add("launch_hard_block_count",
-        (uint32_t)g_dwt_publication_launch_hard_block_count);
-  p.add("startup_relaxed_count",
-        (uint32_t)g_dwt_publication_startup_relaxed_count);
-  p.add("startup_relaxed_last_kind",
-        (uint32_t)g_dwt_publication_startup_relaxed_last_kind);
-  p.add("startup_relaxed_last_kind_name",
-        dwt_publication_kind_name_u32(
-            (uint32_t)g_dwt_publication_startup_relaxed_last_kind));
-  p.add("startup_relaxed_last_sequence",
-        (uint32_t)g_dwt_publication_startup_relaxed_last_sequence);
-  p.add("startup_relaxed_last_mask",
-        (uint32_t)g_dwt_publication_startup_relaxed_last_mask);
-  p.add("startup_relaxed_last_reason",
-        interrupt_dwt_publication_reason_name(
-            interrupt_dwt_publication_reason_id_from_verdict_mask(
-                (uint32_t)g_dwt_publication_startup_relaxed_last_mask)));
-  p.add("interval_ruler_ready_now",
-        dwt_publication_live_interval_ruler_ready());
-
-  p.add("published_dwt", f.published_dwt);
-  p.add("observed_dwt", f.observed_dwt);
-  p.add("target_counter32", f.target_counter32);
-  p.add("target_low16", (uint32_t)f.target_low16);
-  p.add("service_low16_valid", f.service_low16_valid);
-  p.add("service_low16", (uint32_t)f.service_low16);
-  p.add("service_offset_ticks", f.service_offset_ticks);
-
-  p.add("previous_valid", f.previous_valid);
-  p.add("previous_published_dwt", f.previous_published_dwt);
-  p.add("previous_observed_dwt", f.previous_observed_dwt);
-  p.add("previous_floorline_dwt", f.previous_floorline_dwt);
-  p.add("previous_counter32", f.previous_counter32);
-
-  p.add("expected_counter_delta_ticks", f.expected_counter_delta_ticks);
-  p.add("observed_counter_delta_ticks", f.observed_counter_delta_ticks);
-  p.add("expected_interval_cycles", f.expected_interval_cycles);
-  p.add("published_interval_cycles", f.published_interval_cycles);
-  p.add("observed_interval_cycles", f.observed_interval_cycles);
-  p.add("floorline_interval_cycles", f.floorline_interval_cycles);
-  p.add("published_interval_error_cycles", f.published_interval_error_cycles);
-  p.add("observed_interval_error_cycles", f.observed_interval_error_cycles);
-  p.add("floorline_interval_error_cycles", f.floorline_interval_error_cycles);
-  p.add("published_minus_observed_cycles", f.published_minus_observed_cycles);
-  p.add("floorline_minus_observed_cycles", f.floorline_minus_observed_cycles);
-
-  p.add("floorline_valid", f.floorline_valid);
-  p.add("floorline_candidate", f.floorline_candidate);
-  p.add("floorline_published", f.floorline_published);
-  p.add("floorline_fallback_used", f.floorline_fallback_used);
-  p.add("floorline_dwt", f.floorline_dwt);
-  p.add("floorline_sequence", f.floorline_sequence);
-  p.add("floorline_sample_count", f.floorline_sample_count);
-  p.add("floorline_selected_bucket_count", f.floorline_selected_bucket_count);
-  p.add("floorline_publish_source", lower_env_publish_source_name(f.floorline_publish_source));
-  p.add("floorline_publish_reason", lower_env_publish_reason_name(f.floorline_publish_reason));
-  p.add("floorline_confidence_ppm", f.floorline_confidence_ppm);
-
-  p.add("capture_authored_dwt", f.capture_authored_dwt);
-  p.add("capture_raw_event_dwt", f.capture_raw_event_dwt);
-  p.add("capture_isr_entry_dwt_raw", f.capture_isr_entry_dwt_raw);
-  p.add("capture_arm_dwt_raw", f.capture_arm_dwt_raw);
-  p.add("capture_arm_to_isr_ticks", f.capture_arm_to_isr_ticks);
-  p.add("capture_arm_to_isr_dwt_cycles", f.capture_arm_to_isr_dwt_cycles);
-  p.add("capture_service_offset_ticks", f.capture_service_offset_ticks);
-  p.add("capture_service_correction_cycles", f.capture_service_correction_cycles);
-  p.add("capture_service_counter_low16", (uint32_t)f.capture_service_counter_low16);
-  p.add("capture_service_compare_low16", (uint32_t)f.capture_service_compare_low16);
-  p.add("capture_service_counter_minus_compare_ticks", f.capture_service_counter_minus_compare_ticks);
-  p.add("capture_compare_delta_mod65536_ticks", f.capture_compare_delta_mod65536_ticks);
-  p.add("capture_target_delta_mod65536_ticks", f.capture_target_delta_mod65536_ticks);
-  p.add("capture_interpreted_late_ticks", f.capture_interpreted_late_ticks);
-  p.add("capture_early_ticks", f.capture_early_ticks);
-  p.add("capture_service_offset_abs_ticks", f.capture_service_offset_abs_ticks);
-  p.add("recomputed_minus_capture_authored_cycles",
-        (int32_t)(f.observed_dwt - f.capture_authored_dwt));
-  p.add("published_minus_capture_authored_cycles",
-        (int32_t)(f.published_dwt - f.capture_authored_dwt));
-  p.add("raw_minus_capture_authored_cycles",
-        (int32_t)(f.capture_raw_event_dwt - f.capture_authored_dwt));
-
-  p.add("repair_original_dwt", f.repair_original_dwt);
-  p.add("repair_predicted_dwt", f.repair_predicted_dwt);
-  p.add("repair_used_dwt", f.repair_used_dwt);
-  p.add("repair_event_from_isr_entry_raw", f.repair_event_from_isr_entry_raw);
-  p.add("repair_isr_entry_to_event_correction_cycles",
-        f.repair_isr_entry_to_event_correction_cycles);
-  p.add("repair_error_cycles", f.repair_error_cycles);
-  p.add("repair_reason", f.repair_reason ? f.repair_reason : "");
-
-  p.add("yardstick_valid", f.yardstick_valid);
-  p.add("yardstick_stale", f.yardstick_stale);
-  p.add("yardstick_seeded", f.yardstick_seeded);
-  p.add("yardstick_excursion", f.yardstick_excursion);
-  p.add("yardstick_pps_sequence", f.yardstick_pps_sequence);
-  p.add("yardstick_pps_seq_delta", f.yardstick_pps_seq_delta);
-  p.add("yardstick_g_now_cycles", f.yardstick_g_now_cycles);
-  p.add("yardstick_g_prev_cycles", f.yardstick_g_prev_cycles);
-  p.add("yardstick_inferred_interval_cycles", f.yardstick_inferred_interval_cycles);
-  p.add("yardstick_observed_interval_cycles", f.yardstick_observed_interval_cycles);
-  p.add("yardstick_inferred_minus_observed_cycles",
-        f.yardstick_inferred_minus_observed_cycles);
-  p.add("yardstick_auth_endpoint_dwt", f.yardstick_auth_endpoint_dwt);
-  p.add("yardstick_auth_error_cycles", f.yardstick_auth_error_cycles);
-  p.add("yardstick_auth_anchor_applied", f.yardstick_auth_anchor_applied);
-  return p;
-}
-
-static FLASHMEM Payload cmd_report_integrity(const Payload&) {
-  // Ultra-lean integrity report.
-  // The old monolithic integrity report was too large for the command path.
-  // This surface reports only the launch-annunciator facts needed to diagnose
-  // QTIMER_DWT_RULER and related custody gates.
-  interrupt_integrity_snapshot_t& s = g_interrupt_integrity_report_scratch;
-  s = interrupt_integrity_snapshot_t{};
-  const bool snapshot_valid = interrupt_integrity_snapshot(&s);
-
-  const interrupt_integrity_qtimer_dwt_interval_check_t& d1 =
-      s.vclock_qtimer_dwt.one_second;
-  const interrupt_integrity_qtimer_dwt_interval_check_t& dk =
-      s.vclock_qtimer_dwt.hz1k;
-  const interrupt_integrity_gnss_ns_check_t& g = s.vclock_gnss_ns;
-
-  Payload p;
-  p.add("report", "INTERRUPT_INTEGRITY_MIN");
-  p.add("schema", "INTERRUPT_INTEGRITY_MIN_V1");
-  p.add("valid", snapshot_valid);
-  p.add("snapshot_count", s.snapshot_count);
-
-  p.add("qtimer_dwt_feature_nominal",
-        g_interrupt_feature_qtimer_dwt_ruler == system_feature_status_t::NOMINAL);
-  p.add("qtimer_dwt_feature_initializing",
-        g_interrupt_feature_qtimer_dwt_ruler == system_feature_status_t::INITIALIZING);
-  p.add("qtimer_dwt_feature_anomaly",
-        g_interrupt_feature_qtimer_dwt_ruler == system_feature_status_t::ANOMALY);
-  p.add("qtimer_dwt_gate_cycles", QTIMER_DWT_MATCH_GATE_CYCLES);
-
-  p.add("dwt_1s_locked", d1.locked);
-  p.add("dwt_1s_clean_streak", d1.consecutive_ok_count);
-  p.add("dwt_1s_recovery_required", d1.lock_streak_required);
-  p.add("dwt_1s_post_lock_mismatch", d1.post_lock_mismatch_count);
-  p.add("dwt_1s_last_mismatch_seq", d1.last_mismatch_sequence);
-  p.add("dwt_1s_last_mismatch_error", d1.last_mismatch_error_cycles);
-  p.add("dwt_1s_observed", d1.observed_cycles);
-  p.add("dwt_1s_expected", d1.expected_cycles);
-  p.add("dwt_1s_error", d1.error_cycles);
-  p.add("dwt_1s_test_count", d1.test_count);
-  p.add("dwt_1s_mismatch_count", d1.mismatch_count);
-  p.add("dwt_1s_too_short", d1.too_short_count);
-  p.add("dwt_1s_too_long", d1.too_long_count);
-
-  p.add("dwt_1k_locked", dk.locked);
-  p.add("dwt_1k_clean_streak", dk.consecutive_ok_count);
-  p.add("dwt_1k_recovery_required", dk.lock_streak_required);
-  p.add("dwt_1k_post_lock_mismatch", dk.post_lock_mismatch_count);
-  p.add("dwt_1k_last_mismatch_seq", dk.last_mismatch_sequence);
-  p.add("dwt_1k_last_mismatch_error", dk.last_mismatch_error_cycles);
-  p.add("dwt_1k_observed", dk.observed_cycles);
-  p.add("dwt_1k_expected", dk.expected_cycles);
-  p.add("dwt_1k_error", dk.error_cycles);
-  p.add("dwt_1k_test_count", dk.test_count);
-  p.add("dwt_1k_mismatch_count", dk.mismatch_count);
-  p.add("dwt_1k_too_short", dk.too_short_count);
-  p.add("dwt_1k_too_long", dk.too_long_count);
-
-  p.add("qtimer_counter_feature_nominal",
-        g_interrupt_feature_qtimer_counter_custody == system_feature_status_t::NOMINAL);
-  p.add("qtimer_counter_feature_anomaly",
-        g_interrupt_feature_qtimer_counter_custody == system_feature_status_t::ANOMALY);
-  p.add("cntr_vclock_locked", g_generation_gate_vclock.feature_custody_locked);
-  p.add("cntr_vclock_post_lock_reject",
-        g_generation_gate_vclock.feature_custody_post_lock_reject_count);
-  p.add("cntr_ocxo1_locked", g_generation_gate_ocxo1.feature_custody_locked);
-  p.add("cntr_ocxo1_post_lock_reject",
-        g_generation_gate_ocxo1.feature_custody_post_lock_reject_count);
-  p.add("cntr_ocxo2_locked", g_generation_gate_ocxo2.feature_custody_locked);
-  p.add("cntr_ocxo2_post_lock_reject",
-        g_generation_gate_ocxo2.feature_custody_post_lock_reject_count);
-
-  p.add("counter32_lineage_feature_nominal",
-        g_interrupt_feature_counter32_lineage == system_feature_status_t::NOMINAL);
-  p.add("counter32_lineage_feature_initializing",
-        g_interrupt_feature_counter32_lineage == system_feature_status_t::INITIALIZING);
-  p.add("counter32_lineage_feature_anomaly",
-        g_interrupt_feature_counter32_lineage == system_feature_status_t::ANOMALY);
-
-  auto add_lineage = [&](const char* prefix,
-                         const interrupt_integrity_counter_check_t& c) {
-    char key[96];
-
-    auto add_bool = [&](const char* suffix, bool value) {
-      snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
-      p.add(key, value);
-    };
-    auto add_u32 = [&](const char* suffix, uint32_t value) {
-      snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
-      p.add(key, value);
-    };
-    auto add_i32 = [&](const char* suffix, int32_t value) {
-      snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
-      p.add(key, value);
-    };
-
-    add_bool("valid", c.valid);
-    add_bool("locked", c.locked);
-    add_bool("last_counted", c.last_sample_counted);
-    add_bool("last_ok", c.last_ok);
-    add_u32("clean_streak", c.consecutive_ok_count);
-    add_u32("recovery_required", c.lock_streak_required);
-    add_u32("test_count", c.test_count);
-    add_u32("bad_count", c.bad_count);
-    add_u32("prelock_bad", c.prelock_bad_count);
-    add_u32("post_lock_bad", c.post_lock_bad_count);
-    add_u32("last_bad_seq", c.last_bad_sequence);
-    add_u32("observed_delta", c.observed_delta_ticks);
-    add_u32("expected_delta", c.expected_delta_ticks);
-    add_i32("error", c.observed_minus_expected_ticks);
-    add_i32("last_bad_error", c.last_bad_observed_minus_expected_ticks);
-  };
-
-  add_lineage("c32_vclock", s.vclock_counter);
-  add_lineage("c32_ocxo1", s.ocxo1_counter);
-  add_lineage("c32_ocxo2", s.ocxo2_counter);
-
-  p.add("vclock_gnss_valid", g.valid);
-  p.add("vclock_gnss_computed", g.computed_valid);
-  p.add("vclock_gnss_last_ok", g.last_ok);
-  p.add("vclock_gnss_test_count", g.test_count);
-  p.add("vclock_gnss_mismatch_count", g.mismatch_count);
-  p.add("vclock_gnss_error_ns_i32", (int32_t)g.error_ns);
-
-  return p;
-}
-
-static FLASHMEM Payload cmd_report(const Payload&) {
-  Payload p;
-  p.add("report", "INTERRUPT_LEAN");
-  p.add("schema", "INTERRUPT_LEAN_V1");
-  p.add("available_reports", "REPORT_STATUS REPORT_FPU_CONTEXT REPORT_PPS REPORT_CADENCE REPORT_SMARTZERO REPORT_BRIDGE REPORT_HANDOFF REPORT_LOWER_ENVELOPE REPORT_PUBLICATION REPORT_INTEGRITY REPORT_LANES REPORT_LANE");
-  p.add("report_lane_sections", "summary clock gate service yardstick floorline");
-  p.add("hw_ready", g_interrupt_hw_ready);
-  p.add("runtime_ready", g_interrupt_runtime_ready);
-  p.add("irqs_enabled", g_interrupt_irqs_enabled);
-  p.add("diagnostic_policy", "OPERATIONAL_CUSTODY_ONLY");
-  p.add("retired", "linear_regression raw_dwt_csv qtimer_register_museum");
-  return p;
+  add_bool("target_grid_valid", lane.target_grid_valid);
+  add_bool("compare_armed", lane.compare_armed);
+  add_u32("clock32", clock.current_counter32);
+  add_u32("hardware16", (uint32_t)clock.hardware16);
+  add_u32("grid_epoch_counter32", lane.grid_epoch_counter32);
+  add_u32("next_target_counter32", lane.next_target_counter32);
+  add_u32("armed_target_counter32", lane.armed_target_counter32);
+  add_u32("armed_target_low16", (uint32_t)lane.armed_target_low16);
+  add_u32("one_second_ticks", OCXO_ONE_SECOND_TICKS);
+  add_u32("arm_count", lane.arm_count);
+  add_u32("fire_count", lane.fire_count);
+  add_u32("missed_target_count", lane.missed_target_count);
+  add_u32("rollover_tend_count", lane.rollover_tend_count);
+  add_u32("arm_window_wait_count", lane.arm_window_wait_count);
+  add_u32("arm_too_close_count", lane.arm_too_close_count);
+  add_u32("last_arm_remaining_ticks", lane.last_arm_remaining_ticks);
+  add_u32("last_dwt_at_edge", lane.last_dwt_at_edge);
+  add_u32("last_event_counter32", lane.last_event_counter32);
+  add_u32("last_ambient_low16", (uint32_t)lane.last_ambient_low16);
+  add_u32("last_compare_low16", (uint32_t)lane.last_compare_low16);
+  add_i32("ambient_minus_target_ticks",
+          lane.last_ambient_minus_target_ticks);
+  add_u32("counter_delta_ticks", lane.last_counter_delta_ticks);
+  add_u32("counter_delta_violation_count",
+          lane.counter_delta_violation_count);
 }
 
 static FLASHMEM Payload cmd_report_status(const Payload&) {
-  Payload p;
-  p.add("report", "INTERRUPT_STATUS");
-  p.add("hw_ready", g_interrupt_hw_ready);
-  p.add("runtime_ready", g_interrupt_runtime_ready);
-  p.add("irqs_enabled", g_interrupt_irqs_enabled);
-  p.add("handoff_configured", g_interrupt_handoff.configured);
-  p.add("handoff_pending", g_interrupt_handoff.pending);
-  p.add("pps_rebootstrap_pending", g_pps_rebootstrap_pending);
-  p.add("q1_priority", (uint32_t)g_step0_qtimer1_priority_applied);
-  p.add("q2_priority", (uint32_t)g_step0_qtimer2_priority_applied);
-  p.add("q3_priority", (uint32_t)g_step0_qtimer3_priority_applied);
-  p.add("gpio_priority", (uint32_t)g_step0_gpio6789_priority_applied);
-  add_runtime_summary(p, "vclock", g_rt_vclock, g_vclock_lane.irq_count, g_rt_vclock ? g_rt_vclock->event_count : 0U);
-  add_runtime_summary(p, "ocxo1", g_rt_ocxo1, g_ocxo1_lane.irq_count, g_ocxo1_lane.witness_fire_count);
-  add_runtime_summary(p, "ocxo2", g_rt_ocxo2, g_ocxo2_lane.irq_count, g_ocxo2_lane.witness_fire_count);
-  const uint32_t fpu_fpccr = interrupt_fpu_fpccr_register();
-  const uint32_t fpu_cpacr = interrupt_scb_cpacr_register();
-  p.add("fpu_context_policy_ok",
-        g_interrupt_fpu_context_policy.attempted &&
-        g_interrupt_fpu_context_policy.installed &&
-        interrupt_fpu_fpccr_policy_matches(fpu_fpccr) &&
-        interrupt_fpu_access_enabled(fpu_cpacr));
-  p.add("fpu_context_mode", interrupt_fpu_policy_mode_name(fpu_fpccr));
-  return p;
+  Payload payload;
+  payload.add("report", "INTERRUPT_STATUS");
+  payload.add("architecture", "OBSERVED_EDGE_ONLY");
+  payload.add("floorline_present", false);
+  payload.add("ema_present", false);
+  payload.add("yardstick_dwt_candidate_present", false);
+  payload.add("ocxo_1khz_cadence_present", false);
+  payload.add("ocxo_match_period_ticks", OCXO_ONE_SECOND_TICKS);
+  payload.add("priority0", INTERRUPT_PRIORITY_CAPTURE);
+  payload.add("priority16", INTERRUPT_PRIORITY_HANDOFF);
+  payload.add("hardware_ready", g_interrupt_hw_ready);
+  payload.add("runtime_ready", g_interrupt_runtime_ready);
+  payload.add("irqs_enabled", g_interrupt_irqs_enabled);
+  payload.add("vclock_heartbeat_armed", (bool)g_vclock_heartbeat_armed);
+  payload.add("vclock_heartbeat_count", g_vclock_lane.heartbeat_count);
+  payload.add("vclock_one_second_count", g_vclock_lane.one_second_count);
+  add_runtime_summary(payload, "vclock", g_rt_vclock);
+  add_runtime_summary(payload, "ocxo1", g_rt_ocxo1);
+  add_runtime_summary(payload, "ocxo2", g_rt_ocxo2);
+  return payload;
+}
+
+static FLASHMEM Payload cmd_report(const Payload& args) {
+  return cmd_report_status(args);
 }
 
 static FLASHMEM Payload cmd_report_fpu_context(const Payload&) {
-  interrupt_fpu_context_policy_state_t& s =
-      g_interrupt_fpu_context_policy;
-  s.report_count++;
-
-  const bool verified_now = interrupt_fpu_context_policy_verify_current();
-  const uint32_t fpccr = s.last_verify_fpccr;
-  const uint32_t cpacr = s.last_verify_cpacr;
-  const uint32_t control = interrupt_control_register();
-
-  Payload p;
-  p.add("report", "INTERRUPT_FPU_CONTEXT");
-  p.add("schema", "INTERRUPT_FPU_CONTEXT_POLICY_V1");
-  p.add("policy", "AUTOMATIC_EAGER");
-  p.add("summary",
-        "automatic FP context preservation enabled; lazy stacking disabled");
-  p.add("configured_correctly", verified_now);
-  p.add("safe_to_enable_interrupts", verified_now && g_interrupt_hw_ready);
-  p.add("hw_ready", g_interrupt_hw_ready);
-  p.add("runtime_ready", g_interrupt_runtime_ready);
-  p.add("irqs_enabled", g_interrupt_irqs_enabled);
-  p.add("report_count", s.report_count);
-
-  {
-    Payload expected;
-    expected.add("aspen", true);
-    expected.add("lspen", false);
-    expected.add("lspact", false);
-    expected.add("fpccr_policy_mask", INTERRUPT_FPU_FPCCR_POLICY_MASK);
-    expected.add("fpccr_policy_value", INTERRUPT_FPU_FPCCR_POLICY_VALUE);
-    expected.add("cp10_cp11_full_access_mask",
-                 INTERRUPT_SCB_CPACR_CP10_CP11_FULL);
-    p.add_object("expected", expected);
-  }
-
-  {
-    Payload install;
-    install.add("attempted", s.attempted);
-    install.add("installed", s.installed);
-    install.add("write_performed", s.write_performed);
-    install.add("attempt_count", s.attempt_count);
-    install.add("failure_id", (uint32_t)s.failure);
-    install.add("failure", interrupt_fpu_policy_failure_name(s.failure));
-    install.add("ipsr", s.ipsr_at_install);
-    install.add("primask", s.primask_at_install);
-    install.add("control", s.control_at_install);
-    install.add("fpca", (s.control_at_install & INTERRUPT_CONTROL_FPCA) != 0U);
-    install.add("cpacr", s.cpacr_at_install);
-    install.add("cpacr_after", s.cpacr_after_install);
-    install.add("fpccr_before", s.fpccr_before);
-    install.add("fpccr_desired", s.fpccr_desired);
-    install.add("fpccr_after", s.fpccr_after);
-    install.add("before_mode", interrupt_fpu_policy_mode_name(s.fpccr_before));
-    install.add("after_mode", interrupt_fpu_policy_mode_name(s.fpccr_after));
-    p.add_object("install", install);
-  }
-
-  {
-    Payload current;
-    current.add("verified", verified_now);
-    current.add("verify_count", s.verify_count);
-    current.add("fpccr", fpccr);
-    current.add("cpacr", cpacr);
-    current.add("control", control);
-    current.add("mode", interrupt_fpu_policy_mode_name(fpccr));
-    current.add("aspen", (fpccr & INTERRUPT_FPU_FPCCR_ASPEN) != 0U);
-    current.add("lspen", (fpccr & INTERRUPT_FPU_FPCCR_LSPEN) != 0U);
-    current.add("lspact", (fpccr & INTERRUPT_FPU_FPCCR_LSPACT) != 0U);
-    current.add("fpca", (control & INTERRUPT_CONTROL_FPCA) != 0U);
-    current.add("fpccr_policy_match",
-                interrupt_fpu_fpccr_policy_matches(fpccr));
-    current.add("cp10_cp11_full_access",
-                interrupt_fpu_access_enabled(cpacr));
-    current.add("irq_enable_block_count", s.irq_enable_block_count);
-    current.add("last_irq_enable_fpccr", s.last_irq_enable_fpccr);
-    p.add_object("current", current);
-  }
-
-  return p;
+  Payload payload;
+  payload.add("report", "INTERRUPT_FPU_CONTEXT");
+  payload.add("attempted", g_interrupt_fpu_context_policy.attempted);
+  payload.add("installed", g_interrupt_fpu_context_policy.installed);
+  payload.add("attempt_count", g_interrupt_fpu_context_policy.attempt_count);
+  payload.add("verify_count", g_interrupt_fpu_context_policy.verify_count);
+  payload.add("irq_enable_block_count",
+              g_interrupt_fpu_context_policy.irq_enable_block_count);
+  payload.add("fpccr_before", g_interrupt_fpu_context_policy.fpccr_before);
+  payload.add("fpccr_after", g_interrupt_fpu_context_policy.fpccr_after);
+  payload.add("last_verify_fpccr",
+              g_interrupt_fpu_context_policy.last_verify_fpccr);
+  payload.add("last_verify_cpacr",
+              g_interrupt_fpu_context_policy.last_verify_cpacr);
+  return payload;
 }
 
 static FLASHMEM Payload cmd_report_pps(const Payload&) {
-  Payload p;
-  p.add("report", "INTERRUPT_PPS");
-  p.add("edge_count", g_pps_gpio_heartbeat.edge_count);
-  p.add("gpio_irq_count", g_gpio_irq_count);
-  p.add("gpio_miss_count", g_gpio_miss_count);
-  p.add("last_pvc_dwt", g_pps_gpio_heartbeat.last_dwt);
-  p.add("relay_assert_count", (uint32_t)g_pps_relay_assert_count);
-  p.add("relay_deassert_count", (uint32_t)g_pps_relay_deassert_count);
-  p.add("post_isr_arm_count", (uint32_t)g_pps_post_isr.arm_count);
-  p.add("post_isr_drain_count", (uint32_t)g_pps_post_isr.drain_count);
-  p.add("post_isr_overwrite_count", (uint32_t)g_pps_post_isr.overwrite_count);
-  pps_t pps{}; pps_vclock_t pvc{}; store_load(pps, pvc);
-  p.add("pps_sequence", pps.sequence);
-  p.add("pps_dwt_at_edge", pps.dwt_at_edge);
-  p.add("pvc_sequence", pvc.sequence);
-  p.add("pvc_dwt_at_edge", pvc.dwt_at_edge);
-  p.add("pvc_counter32_at_edge", pvc.counter32_at_edge);
-  pps_yardstick_snapshot_t y{}; (void)pps_yardstick_load(y);
-  pps_floorline_repair_state_t pps_repair{};
-  (void)pps_floorline_repair_load(pps_repair);
-  p.add("yardstick_valid", y.valid);
-  p.add("yardstick_sequence", y.sequence);
-  p.add("yardstick_g_now", y.interval_now_cycles);
-  p.add("yardstick_g_prev", y.interval_prev_cycles);
-  p.add("yardstick_accept_count", y.accept_count);
-  p.add("yardstick_reject_count", y.reject_count);
-  p.add("yardstick_repair_count", y.repair_count);
-  p.add("pps_floorline_repair_valid", pps_repair.valid);
-  p.add("pps_floorline_repair_applied", pps_repair.applied);
-  p.add("pps_floorline_repair_reason",
-        pps_floorline_repair_reason_name(pps_repair.reason));
-  p.add("pps_floorline_repair_sequence", pps_repair.sequence);
-  p.add("pps_floorline_repair_attempt_count",
-        pps_repair.attempt_count);
-  p.add("pps_floorline_repair_applied_count",
-        pps_repair.applied_count);
-  p.add("pps_floorline_repair_reject_count",
-        pps_repair.reject_count);
-  p.add("pps_floorline_floorline_qualified",
-        pps_repair.floorline_qualified);
-  p.add("pps_floorline_phase_qualified", pps_repair.phase_qualified);
-  p.add("pps_floorline_magnitude_qualified",
-        pps_repair.magnitude_qualified);
-  p.add("pps_floorline_yardstick_rewritten",
-        pps_repair.yardstick_rewritten);
-  p.add("pps_floorline_trigger_cycles",
-        PPS_FLOORLINE_REPAIR_TRIGGER_CYCLES);
-  p.add("pps_floorline_raw_dwt", pps_repair.raw_pps_dwt);
-  p.add("pps_floorline_inferred_dwt",
-        pps_repair.inferred_pps_dwt);
-  p.add("pps_floorline_used_dwt", pps_repair.used_pps_dwt);
-  p.add("pps_floorline_raw_minus_inferred_cycles",
-        pps_repair.raw_minus_inferred_cycles);
-  p.add("pps_floorline_observed_vclock_minus_floorline_cycles",
-        pps_repair.observed_vclock_minus_floorline_cycles);
-  p.add("pps_floorline_confidence_ppm",
-        pps_repair.floorline_confidence_ppm);
-  p.add("pps_floorline_sample_count",
-        pps_repair.floorline_sample_count);
-  p.add("pps_floorline_selected_bucket_count",
-        pps_repair.floorline_selected_bucket_count);
-  p.add("pps_floorline_raw_interval_cycles",
-        pps_repair.raw_interval_cycles);
-  p.add("pps_floorline_inferred_interval_cycles",
-        pps_repair.inferred_interval_cycles);
-  p.add("pps_floorline_previous_interval_cycles",
-        pps_repair.previous_interval_cycles);
-  p.add("pps_floorline_raw_interval_error_cycles",
-        pps_repair.raw_interval_error_cycles);
-  p.add("pps_floorline_inferred_interval_error_cycles",
-        pps_repair.inferred_interval_error_cycles);
-  return p;
+  Payload payload;
+  payload.add("report", "INTERRUPT_PPS");
+  const pps_edge_snapshot_t snapshot = interrupt_last_pps_edge();
+  payload.add("sequence", snapshot.sequence);
+  payload.add("pps_dwt_at_edge",
+              snapshot.physical_pps_dwt_normalized_at_edge);
+  payload.add("vclock_dwt_at_edge", snapshot.dwt_at_edge);
+  payload.add("vclock_counter32_at_edge", snapshot.counter32_at_edge);
+  payload.add("vclock_target_low16", (uint32_t)snapshot.ch3_at_edge);
+  payload.add("authority", "OBSERVED_QTIMER_EDGE");
+  payload.add("gpio_irq_count", g_gpio_irq_count);
+  payload.add("gpio_miss_count", g_gpio_miss_count);
+  payload.add("relay_active", (bool)g_pps_relay_active);
+  payload.add("relay_assert_count", (uint32_t)g_pps_relay_assert_count);
+  payload.add("relay_deassert_count", (uint32_t)g_pps_relay_deassert_count);
+  payload.add("rebootstrap_pending", (bool)g_pps_rebootstrap_pending);
+  payload.add("rebootstrap_count", g_pps_rebootstrap_count);
+  return payload;
 }
 
 static FLASHMEM Payload cmd_report_cadence(const Payload&) {
-  Payload p;
-  p.add("report", "INTERRUPT_CADENCE");
-  p.add("vclock_heartbeat_armed", (bool)g_vclock_heartbeat_armed);
-  p.add("vclock_heartbeat_fire_count", (uint32_t)g_vclock_heartbeat_fire_count);
-  p.add("vclock_ch2_one_second_enabled", (bool)g_vclock_ch2_one_second_enabled);
-  p.add("vclock_ch2_one_second_service_count", (uint32_t)g_vclock_ch2_one_second_service_count);
-  p.add("vclock_ch2_one_second_enqueue_count", (uint32_t)g_vclock_ch2_one_second_enqueue_count);
-  p.add("vclock_ch2_one_second_drop_count", (uint32_t)g_vclock_ch2_one_second_drop_count);
-  p.add("ch2_rollover_count", (uint32_t)g_ch2_implicit_rollover_count);
-  add_ocxo_lean_lane(p, "ocxo1", g_ocxo1_ctx);
-  add_ocxo_lean_lane(p, "ocxo2", g_ocxo2_ctx);
-  return p;
+  Payload payload;
+  payload.add("report", "INTERRUPT_CADENCE");
+  payload.add("vclock_period_ticks", (uint32_t)VCLOCK_INTERVAL_COUNTS);
+  payload.add("ocxo_period_ticks", OCXO_ONE_SECOND_TICKS);
+  payload.add("ocxo_arm_window_ticks", OCXO_ARM_WINDOW_TICKS);
+  payload.add("ocxo_min_arm_lead_ticks", OCXO_MIN_ARM_LEAD_TICKS);
+  payload.add("rollover_owner", "VCLOCK_PRIORITY16");
+  payload.add("vclock_rearm_context", "PRIORITY16_HANDOFF");
+  payload.add("counter_authority", "AUTHORED_COMPARE_TARGET");
+  payload.add("ambient_counter_role", "WITNESS_ONLY");
+  add_ocxo_lane_report(payload, "ocxo1", g_ocxo1_ctx);
+  add_ocxo_lane_report(payload, "ocxo2", g_ocxo2_ctx);
+  return payload;
+}
+
+static const char* smartzero_phase_name(interrupt_smartzero_phase_t phase) {
+  switch (phase) {
+    case interrupt_smartzero_phase_t::RUNNING: return "RUNNING";
+    case interrupt_smartzero_phase_t::COMPLETE: return "COMPLETE";
+    case interrupt_smartzero_phase_t::ABORTED: return "ABORTED";
+    default: return "IDLE";
+  }
 }
 
 static FLASHMEM Payload cmd_report_smartzero(const Payload&) {
-  Payload p;
-  p.add("report", "INTERRUPT_SMARTZERO");
-
+  Payload payload;
+  payload.add("report", "INTERRUPT_SMARTZERO");
   interrupt_smartzero_snapshot_t snapshot{};
-  const bool snapshot_ok = smartzero_snapshot_load(&snapshot);
-  p.add("snapshot_ok", snapshot_ok);
-  p.add("phase", smartzero_phase_name(snapshot.phase));
-  p.add("running", snapshot.running);
-  p.add("complete", snapshot.complete);
-  p.add("sequence", snapshot.sequence);
-  p.add("begin_count", snapshot.begin_count);
-  p.add("complete_count", snapshot.complete_count);
-  p.add("abort_count", snapshot.abort_count);
-  p.add("current_lane_index", snapshot.current_lane_index);
-  p.add("all_lanes_worthy", (bool)g_smartzero2.all_lanes_worthy);
-  p.add("all_worthy_second_count", g_smartzero2.all_worthy_second_count);
-  for (uint32_t i = 0; i < SMARTZERO_LANE_COUNT; i++) {
-    char prefix[24]; snprintf(prefix, sizeof(prefix), "lane%u_", (unsigned)i);
-    char key[48];
-    const auto& lane = snapshot.lanes[i];
-    snprintf(key, sizeof(key), "%skind", prefix); p.add(key, interrupt_subscriber_kind_str(lane.kind));
-    snprintf(key, sizeof(key), "%sstate", prefix); p.add(key, smartzero_lane_state_name(lane.state));
-    snprintf(key, sizeof(key), "%sdecision", prefix); p.add(key, smartzero_decision_name(lane.last_decision));
-    snprintf(key, sizeof(key), "%saccepted", prefix); p.add(key, lane.accepted_count);
-    snprintf(key, sizeof(key), "%srejected", prefix); p.add(key, lane.rejected_count);
-    snprintf(key, sizeof(key), "%sanchor_dwt", prefix); p.add(key, lane.anchor_dwt);
-    snprintf(key, sizeof(key), "%sanchor_counter32", prefix); p.add(key, lane.anchor_counter32);
+  (void)smartzero_snapshot_load(&snapshot);
+  payload.add("phase", smartzero_phase_name(snapshot.phase));
+  payload.add("running", snapshot.running);
+  payload.add("complete", snapshot.complete);
+  payload.add("sequence", snapshot.sequence);
+  payload.add("sample_rate_hz", 1U);
+  payload.add("counter_delta_ticks", OCXO_ONE_SECOND_TICKS);
+  payload.add("tolerance_cycles", SMARTZERO_ONE_SECOND_TOLERANCE_CYCLES);
+  for (uint32_t i = 0; i < SMARTZERO_LANE_COUNT; ++i) {
+    const interrupt_smartzero_lane_snapshot_t& lane = snapshot.lanes[i];
+    char key[64];
+    const char* prefix = i == 0U ? "vclock" : (i == 1U ? "ocxo1" : "ocxo2");
+    snprintf(key, sizeof(key), "%s_sample_count", prefix);
+    payload.add(key, lane.sample_count);
+    snprintf(key, sizeof(key), "%s_interval_attempt_count", prefix);
+    payload.add(key, lane.interval_attempt_count);
+    snprintf(key, sizeof(key), "%s_accepted_count", prefix);
+    payload.add(key, lane.accepted_count);
+    snprintf(key, sizeof(key), "%s_rejected_count", prefix);
+    payload.add(key, lane.rejected_count);
+    snprintf(key, sizeof(key), "%s_anchor_dwt", prefix);
+    payload.add(key, lane.anchor_dwt);
+    snprintf(key, sizeof(key), "%s_anchor_counter32", prefix);
+    payload.add(key, lane.anchor_counter32);
   }
-  return p;
+  return payload;
 }
 
-static FLASHMEM Payload cmd_report_bridge(const Payload&) {
-  Payload p;
-  p.add("report", "INTERRUPT_BRIDGE");
-  p.add("anchor_count", (uint32_t)g_pvc_anchor_count);
-  p.add("anchor_head", (uint32_t)g_pvc_anchor_head);
-  p.add("label_update_count", g_pvc_anchor_label_update_count);
-  p.add("label_miss_count", g_pvc_anchor_label_miss_count);
-  p.add("label_invalid_count", g_pvc_anchor_label_invalid_count);
-  p.add("last_label_sequence", g_pvc_anchor_label_last_sequence);
-  p.add("last_label_success", g_pvc_anchor_label_last_success);
-  p.add("timepop_failed", g_bridge_stats_timepop.failed_count);
-  p.add("ocxo1_failed", g_bridge_stats_ocxo1.failed_count);
-  p.add("ocxo2_failed", g_bridge_stats_ocxo2.failed_count);
-  return p;
-}
-
-
-static uint32_t lower_env_slope_cycles_per_second(const cadence_regression_result_t& r) {
-  return r.slope_q16_cycles_per_sample
-      ? (uint32_t)(((uint64_t)r.slope_q16_cycles_per_sample *
-                    (uint64_t)LOWER_ENV_SAMPLE_RATE_HZ + 32768ULL) >> 16)
-      : 0U;
-}
-
-static FLASHMEM void add_lower_env_lane_payload(Payload& parent,
-                                                const char* key,
-                                                const lower_env_lane_t& lane,
-                                                bool pps_valid,
-                                                uint32_t pps_interval_cycles,
-                                                bool include_pps_compare) {
-  const cadence_regression_result_t& r = lane.last;
-  Payload obj;
-  obj.add("valid", r.valid);
-  obj.add("kind", interrupt_subscriber_kind_str(lane.kind));
-  obj.add("sequence", r.sequence);
-  obj.add("update_count", lane.update_count);
-  obj.add("reset_count", lane.reset_count);
-  obj.add("invalid_window_count", lane.invalid_window_count);
-  obj.add("overflow_reset_count", lane.overflow_reset_count);
-  obj.add("window_sample_count", r.sample_count);
-
-  obj.add("publish_source", r.publish_source);
-  obj.add("publish_source_name", lower_env_publish_source_name(r.publish_source));
-  obj.add("publish_reason", r.publish_reason);
-  obj.add("publish_reason_name", lower_env_publish_reason_name(r.publish_reason));
-  obj.add("floorline_published", r.publish_floorline);
-  obj.add("candidate_present", r.candidate_present);
-  obj.add("fallback_used", r.fallback_used);
-  obj.add("confidence_ppm", r.confidence_ppm);
-  obj.add("feature_latched_nominal", g_interrupt_feature_floorline_latched_nominal);
-  obj.add("ever_valid_estimate", lane.floorline_seen_valid_estimate);
-  obj.add("valid_estimate_count", lane.floorline_valid_estimate_count);
-  obj.add("fallback_publish_count", lane.fallback_publish_count);
-  obj.add("watchdog_anomaly_count", lane.watchdog_anomaly_count);
-  obj.add("last_watchdog_reason", lane.last_watchdog_reason);
-
-  obj.add("gate_cycles", LOWER_ENV_ERROR_GATE_CYCLES);
-  obj.add("hard_edge_gate_cycles", LOWER_ENV_PUBLISH_HARD_EDGE_GATE_CYCLES);
-  obj.add("hard_interval_gate_cycles",
-          LOWER_ENV_PUBLISH_HARD_INTERVAL_GATE_CYCLES);
-  obj.add("sample_accepted_count", r.sample_accepted_count);
-  obj.add("sample_rejected_count", r.sample_rejected_count);
-  obj.add("sample_hard_rejected_count", r.sample_hard_rejected_count);
-  obj.add("sample_hard_reject_gate_cycles", r.sample_hard_reject_gate_cycles);
-  obj.add("sample_required_count", LOWER_ENV_PUBLISH_MIN_SAMPLES);
-  obj.add("bucket_count", LOWER_ENV_BUCKET_COUNT);
-  obj.add("selected_bucket_count", r.selected_bucket_count);
-  obj.add("bucket_required_count", LOWER_ENV_PUBLISH_MIN_BUCKETS);
-  obj.add("sample_rate_hz", LOWER_ENV_SAMPLE_RATE_HZ);
-
-  obj.add("observed_edge_dwt", r.observed_dwt_at_event);
-  obj.add("inferred_edge_dwt", r.inferred_dwt_at_event);
-  obj.add("inferred_minus_observed_edge_cycles",
-          r.inferred_minus_observed_cycles);
-
-  obj.add("observed_interval_cycles", r.observed_interval_cycles);
-  obj.add("inferred_interval_cycles", r.inferred_interval_cycles);
-  obj.add("inferred_minus_observed_interval_cycles",
-          r.inferred_minus_observed_interval_cycles);
-  const uint32_t pub_interval =
-      r.publish_floorline ? r.inferred_interval_cycles
-                          : r.observed_interval_cycles;
-  obj.add("published_interval_cycles", pub_interval);
-
-  obj.add("slope_cycles_per_second", lower_env_slope_cycles_per_second(r));
-  obj.add("fit_error_mean_q16_cycles", r.fit_error_mean_q16_cycles);
-  obj.add("fit_error_stddev_q16_cycles", r.fit_error_stddev_q16_cycles);
-  obj.add("fit_error_min_cycles", r.fit_error_min_cycles);
-  obj.add("fit_error_max_cycles", r.fit_error_max_cycles);
-  obj.add("fit_error_abs_gt4_count", r.fit_error_abs_gt4_count);
-  obj.add("anchor_policy_id", r.anchor_policy_id);
-  obj.add("anchor_policy", lower_env_anchor_policy_name(r.anchor_policy_id));
-  obj.add("anchor_population_count", r.anchor_population_count);
-  obj.add("anchor_single_min_q16_cycles",
-          r.anchor_single_min_q16_cycles);
-  obj.add("anchor_second_q16_cycles", r.anchor_second_q16_cycles);
-  obj.add("anchor_selected_q16_cycles", r.anchor_selected_q16_cycles);
-  obj.add("anchor_selected_minus_single_min_q16_cycles",
-          r.anchor_selected_minus_single_min_q16_cycles);
-  obj.add("residual_sample_count", r.residual_sample_count);
-  obj.add("residual_min_cycles", r.residual_min_cycles);
-  obj.add("residual_max_cycles", r.residual_max_cycles);
-  obj.add("residual_mean_q16_cycles", r.residual_mean_q16_cycles);
-  obj.add("residual_stddev_q16_cycles", r.residual_stddev_q16_cycles);
-  obj.add("residual_abs_gt4_count", r.residual_abs_gt4_count);
-  obj.add("residual_abs_gt16_count", r.residual_abs_gt16_count);
-  obj.add("residual_abs_gt32_count", r.residual_abs_gt32_count);
-  obj.add("residual_abs_gt64_count", r.residual_abs_gt64_count);
-  obj.add("residual_abs_gt128_count", r.residual_abs_gt128_count);
-
-  if (include_pps_compare) {
-    obj.add("pps_observed_interval_valid", pps_valid);
-    obj.add("pps_observed_interval_cycles", pps_valid ? pps_interval_cycles : 0U);
-    obj.add("published_minus_pps_cycles",
-            (pps_valid && pub_interval != 0U)
-                ? ((pub_interval >= pps_interval_cycles)
-                       ? (int32_t)(pub_interval - pps_interval_cycles)
-                       : -(int32_t)(pps_interval_cycles - pub_interval))
-                : 0);
-  }
-
-  parent.add_object(key, obj);
-}
-
-static FLASHMEM void add_floorline_flat(Payload& p,
-                                           const char* prefix,
-                                           const lower_env_lane_t& lane) {
-  const cadence_regression_result_t& r = lane.last;
-  char key[96];
-  auto add_bool = [&](const char* suffix, bool value) {
-    snprintf(key, sizeof(key), "%s_floorline_%s", prefix, suffix);
-    p.add(key, value);
-  };
-  auto add_u32 = [&](const char* suffix, uint32_t value) {
-    snprintf(key, sizeof(key), "%s_floorline_%s", prefix, suffix);
-    p.add(key, value);
-  };
-  auto add_i32 = [&](const char* suffix, int32_t value) {
-    snprintf(key, sizeof(key), "%s_floorline_%s", prefix, suffix);
-    p.add(key, value);
-  };
-  auto add_str = [&](const char* suffix, const char* value) {
-    snprintf(key, sizeof(key), "%s_floorline_%s", prefix, suffix);
-    p.add(key, value ? value : "");
-  };
-
-  add_str("version", "v3_median8_anchor");
-  add_bool("valid", r.valid);
-  add_bool("published", r.publish_floorline);
-  add_bool("fallback_used", r.fallback_used);
-  add_bool("candidate_present", r.candidate_present);
-  add_bool("ever_valid_estimate", lane.floorline_seen_valid_estimate);
-  add_bool("feature_latched_nominal", g_interrupt_feature_floorline_latched_nominal);
-  add_str("publish_source", lower_env_publish_source_name(r.publish_source));
-  add_str("publish_reason", lower_env_publish_reason_name(r.publish_reason));
-  add_u32("confidence_ppm", r.confidence_ppm);
-  add_u32("sequence", r.sequence);
-  add_u32("update_count", lane.update_count);
-  add_u32("valid_estimate_count", lane.floorline_valid_estimate_count);
-  add_u32("fallback_count", lane.fallback_publish_count);
-  add_u32("watchdog_anomaly_count", lane.watchdog_anomaly_count);
-  add_u32("sample_count", r.sample_count);
-  add_u32("sample_accepted", r.sample_accepted_count);
-  add_u32("sample_rejected", r.sample_rejected_count);
-  add_u32("sample_hard_rejected", r.sample_hard_rejected_count);
-  add_u32("selected_bucket_count", r.selected_bucket_count);
-  add_u32("bucket_count", LOWER_ENV_BUCKET_COUNT);
-  add_u32("sample_rate_hz", LOWER_ENV_SAMPLE_RATE_HZ);
-  add_u32("soft_gate_cycles", LOWER_ENV_ERROR_GATE_CYCLES);
-  add_u32("hard_sample_gate_cycles", LOWER_ENV_SAMPLE_HARD_REJECT_CYCLES);
-  add_u32("hard_edge_gate_cycles", LOWER_ENV_PUBLISH_HARD_EDGE_GATE_CYCLES);
-  add_u32("observed_edge_dwt", r.observed_dwt_at_event);
-  add_u32("inferred_edge_dwt", r.inferred_dwt_at_event);
-  add_i32("inferred_minus_observed_cycles", r.inferred_minus_observed_cycles);
-  add_u32("observed_interval_cycles", r.observed_interval_cycles);
-  add_u32("inferred_interval_cycles", r.inferred_interval_cycles);
-  add_i32("interval_error_cycles", r.inferred_minus_observed_interval_cycles);
-  add_u32("slope_cycles_per_second", lower_env_slope_cycles_per_second(r));
-  add_i32("fit_error_mean_q16", r.fit_error_mean_q16_cycles);
-  add_u32("fit_error_stddev_q16", r.fit_error_stddev_q16_cycles);
-  add_i32("fit_error_min", r.fit_error_min_cycles);
-  add_i32("fit_error_max", r.fit_error_max_cycles);
-  add_u32("fit_error_abs_gt4", r.fit_error_abs_gt4_count);
-  add_u32("anchor_policy_id", r.anchor_policy_id);
-  add_str("anchor_policy", lower_env_anchor_policy_name(r.anchor_policy_id));
-  add_u32("anchor_population_count", r.anchor_population_count);
-  add_i32("anchor_single_min_q16", r.anchor_single_min_q16_cycles);
-  add_i32("anchor_second_q16", r.anchor_second_q16_cycles);
-  add_i32("anchor_selected_q16", r.anchor_selected_q16_cycles);
-  add_i32("anchor_lift_q16",
-          r.anchor_selected_minus_single_min_q16_cycles);
-  add_u32("residual_count", r.residual_sample_count);
-  add_i32("residual_min", r.residual_min_cycles);
-  add_i32("residual_max", r.residual_max_cycles);
-  add_i32("residual_mean_q16", r.residual_mean_q16_cycles);
-  add_u32("residual_stddev_q16", r.residual_stddev_q16_cycles);
-  add_u32("residual_abs_gt4", r.residual_abs_gt4_count);
-  add_u32("residual_abs_gt16", r.residual_abs_gt16_count);
-  add_u32("residual_abs_gt32", r.residual_abs_gt32_count);
-  add_u32("residual_abs_gt64", r.residual_abs_gt64_count);
-  add_u32("residual_abs_gt128", r.residual_abs_gt128_count);
-}
-
-static FLASHMEM Payload cmd_report_lower_envelope(const Payload&) {
-  Payload p;
-  p.add("report", "INTERRUPT_LOWER_ENVELOPE");
-  p.add("description",
-        "1 kHz FloorLine V3 median-eight lower-envelope edge estimator");
-  p.add("sample_rate_hz", LOWER_ENV_SAMPLE_RATE_HZ);
-  p.add("bucket_count", LOWER_ENV_BUCKET_COUNT);
-  p.add("error_gate_cycles", LOWER_ENV_ERROR_GATE_CYCLES);
-  p.add("publish_hard_edge_gate_cycles", LOWER_ENV_PUBLISH_HARD_EDGE_GATE_CYCLES);
-  p.add("publish_hard_interval_gate_cycles",
-        LOWER_ENV_PUBLISH_HARD_INTERVAL_GATE_CYCLES);
-  p.add("publish_min_samples", LOWER_ENV_PUBLISH_MIN_SAMPLES);
-  p.add("publish_min_buckets", LOWER_ENV_PUBLISH_MIN_BUCKETS);
-  p.add("snapshot_count", ++g_lower_env_snapshot_count);
-  p.add("policy", "floorline_v3_median8_lower_envelope_anchor");
-  p.add("anchor_policy_id", FLOORLINE_ANCHOR_POLICY_MEDIAN8);
-  p.add("anchor_policy",
-        lower_env_anchor_policy_name(FLOORLINE_ANCHOR_POLICY_MEDIAN8));
-  p.add("anchor_population_count", LOWER_ENV_ANCHOR_POPULATION_COUNT);
-  p.add("writer_context", INTERRUPT_FLOORLINE_WRITER_CONTEXT);
-  p.add("snapshot_transport", "SEQLOCK_WHOLE_LANE_SNAPSHOT");
-  p.add("subscriber_dispatch_context", INTERRUPT_SUBSCRIBER_DISPATCH_CONTEXT);
-
-
-  pps_yardstick_snapshot_t y{};
-  const bool pps_loaded = pps_yardstick_load(y);
-  pps_floorline_repair_state_t pps_repair{};
-  (void)pps_floorline_repair_load(pps_repair);
-  Payload pps;
-  pps.add("loaded", pps_loaded);
-  pps.add("valid", pps_loaded && y.valid);
-  pps.add("sequence", pps_loaded ? y.sequence : 0U);
-  pps.add("observed_interval_cycles", (pps_loaded && y.valid) ? y.interval_now_cycles : 0U);
-  pps.add("previous_interval_cycles", (pps_loaded && y.valid) ? y.interval_prev_cycles : 0U);
-  pps.add("accept_count", pps_loaded ? y.accept_count : 0U);
-  pps.add("reject_count", pps_loaded ? y.reject_count : 0U);
-  pps.add("repair_count", pps_loaded ? y.repair_count : 0U);
-  pps.add("reset_count", pps_loaded ? y.reset_count : 0U);
-  pps.add("floorline_repair_applied", pps_repair.applied);
-  pps.add("floorline_repair_reason",
-          pps_floorline_repair_reason_name(pps_repair.reason));
-  pps.add("floorline_raw_dwt", pps_repair.raw_pps_dwt);
-  pps.add("floorline_inferred_dwt",
-          pps_repair.inferred_pps_dwt);
-  pps.add("floorline_used_dwt", pps_repair.used_pps_dwt);
-  pps.add("floorline_raw_minus_inferred_cycles",
-          pps_repair.raw_minus_inferred_cycles);
-  p.add_object("pps", pps);
-
-  Payload lanes;
-  const bool pps_valid = pps_loaded && y.valid && y.interval_now_cycles != 0U;
-  const lower_env_lane_t* floorline =
-      lower_env_report_snapshot(interrupt_subscriber_kind_t::VCLOCK);
-  if (floorline) {
-    add_lower_env_lane_payload(lanes, "vclock", *floorline,
-                               pps_valid, y.interval_now_cycles, true);
-  }
-  floorline = lower_env_report_snapshot(interrupt_subscriber_kind_t::OCXO1);
-  if (floorline) {
-    add_lower_env_lane_payload(lanes, "ocxo1", *floorline,
-                               false, 0U, false);
-  }
-  floorline = lower_env_report_snapshot(interrupt_subscriber_kind_t::OCXO2);
-  if (floorline) {
-    add_lower_env_lane_payload(lanes, "ocxo2", *floorline,
-                               false, 0U, false);
-  }
-  p.add_object("lanes", lanes);
-  return p;
-}
-
-static FLASHMEM void add_handoff_source(Payload& p,
-                                        const char* prefix,
-                                        const interrupt_handoff_source_diag_t& s) {
+static FLASHMEM void add_handoff_source(
+    Payload& payload,
+    const char* prefix,
+    const interrupt_handoff_source_diag_t& source) {
   char key[64];
-  snprintf(key, sizeof(key), "%s_capture", prefix); p.add(key, (uint32_t)s.capture_count);
-  snprintf(key, sizeof(key), "%s_enqueue", prefix); p.add(key, (uint32_t)s.enqueue_count);
-  snprintf(key, sizeof(key), "%s_dequeue", prefix); p.add(key, (uint32_t)s.dequeue_count);
-  snprintf(key, sizeof(key), "%s_overrun", prefix); p.add(key, (uint32_t)s.overrun_count);
-  snprintf(key, sizeof(key), "%s_high_water", prefix); p.add(key, (uint32_t)s.high_water);
-  snprintf(key, sizeof(key), "%s_pending", prefix); p.add(key, (uint32_t)s.pending_count);
-  snprintf(key, sizeof(key), "%s_last_latency", prefix); p.add(key, (uint32_t)s.last_capture_to_handoff_cycles);
-  snprintf(key, sizeof(key), "%s_max_latency", prefix); p.add(key, (uint32_t)s.max_capture_to_handoff_cycles);
-  snprintf(key, sizeof(key), "%s_entry_overtaken", prefix); p.add(key, (uint32_t)s.entry_overtaken_by_capture_count);
+  snprintf(key, sizeof(key), "%s_capture", prefix);
+  payload.add(key, (uint32_t)source.capture_count);
+  snprintf(key, sizeof(key), "%s_dequeue", prefix);
+  payload.add(key, (uint32_t)source.dequeue_count);
+  snprintf(key, sizeof(key), "%s_overrun", prefix);
+  payload.add(key, (uint32_t)source.overrun_count);
+  snprintf(key, sizeof(key), "%s_pending", prefix);
+  payload.add(key, (uint32_t)source.pending_count);
+  snprintf(key, sizeof(key), "%s_high_water", prefix);
+  payload.add(key, (uint32_t)source.high_water);
+  snprintf(key, sizeof(key), "%s_max_latency_cycles", prefix);
+  payload.add(key, (uint32_t)source.max_capture_to_handoff_cycles);
 }
 
 static FLASHMEM Payload cmd_report_handoff(const Payload&) {
-  Payload p;
-  p.add("report", "INTERRUPT_HANDOFF");
-  p.add("configured", (bool)g_interrupt_handoff.configured);
-  p.add("floorline_writer_context", INTERRUPT_FLOORLINE_WRITER_CONTEXT);
-  p.add("subscriber_dispatch_context", INTERRUPT_SUBSCRIBER_DISPATCH_CONTEXT);
-  p.add("priority0_body_timing_enabled", false);
-  p.add("request_count", (uint32_t)g_interrupt_handoff.request_count);
-  p.add("entry_count", (uint32_t)g_interrupt_handoff.entry_count);
-  p.add("served_request_count", (uint32_t)g_interrupt_handoff.served_request_count);
-  p.add("reentry_count", (uint32_t)g_interrupt_handoff.reentry_count);
-  p.add("repend_count", (uint32_t)g_interrupt_handoff.repend_count);
-  p.add("last_latency_cycles", (uint32_t)g_interrupt_handoff.last_latency_cycles);
-  p.add("min_latency_cycles",
-        g_interrupt_handoff.latency_sample_count
-            ? (uint32_t)g_interrupt_handoff.min_latency_cycles
-            : 0U);
-  p.add("max_latency_cycles", (uint32_t)g_interrupt_handoff.max_latency_cycles);
-  p.add("entry_overtaken_by_request_count",
-        (uint32_t)g_interrupt_handoff.entry_overtaken_by_request_count);
-  p.add("max_body_cycles", (uint32_t)g_interrupt_handoff.max_body_cycles);
-  add_handoff_source(p, "ch1", g_handoff_qtimer1_ch1);
-  add_handoff_source(p, "ch2", g_handoff_qtimer1_ch2);
-  add_handoff_source(p, "ocxo1", g_handoff_ocxo1);
-  add_handoff_source(p, "ocxo2", g_handoff_ocxo2);
-  add_handoff_source(p, "pps", g_handoff_pps);
-  return p;
+  Payload payload;
+  payload.add("report", "INTERRUPT_HANDOFF");
+  payload.add("configured", (bool)g_interrupt_handoff.configured);
+  payload.add("request_count", (uint32_t)g_interrupt_handoff.request_count);
+  payload.add("entry_count", (uint32_t)g_interrupt_handoff.entry_count);
+  payload.add("exit_count", (uint32_t)g_interrupt_handoff.exit_count);
+  payload.add("reentry_count", (uint32_t)g_interrupt_handoff.reentry_count);
+  payload.add("repend_count", (uint32_t)g_interrupt_handoff.repend_count);
+  payload.add("last_latency_cycles",
+              (uint32_t)g_interrupt_handoff.last_latency_cycles);
+  payload.add("min_latency_cycles",
+              g_interrupt_handoff.entry_count != 0U
+                  ? (uint32_t)g_interrupt_handoff.min_latency_cycles
+                  : 0U);
+  payload.add("max_latency_cycles",
+              (uint32_t)g_interrupt_handoff.max_latency_cycles);
+  add_handoff_source(payload, "vclock", g_handoff_vclock);
+  add_handoff_source(payload, "ch2", g_handoff_ch2);
+  add_handoff_source(payload, "ocxo1", g_handoff_ocxo1);
+  add_handoff_source(payload, "ocxo2", g_handoff_ocxo2);
+  add_handoff_source(payload, "pps", g_handoff_pps);
+  return payload;
+}
+
+static FLASHMEM Payload cmd_report_integrity(const Payload&) {
+  Payload payload;
+  payload.add("report", "INTERRUPT_INTEGRITY");
+  interrupt_integrity_snapshot_t snapshot{};
+  (void)interrupt_integrity_snapshot(&snapshot);
+  payload.add("valid", snapshot.valid);
+  payload.add("vclock_counter_valid", snapshot.vclock_counter.valid);
+  payload.add("vclock_counter_last_ok", snapshot.vclock_counter.last_ok);
+  payload.add("ocxo1_counter_valid", snapshot.ocxo1_counter.valid);
+  payload.add("ocxo1_counter_last_ok", snapshot.ocxo1_counter.last_ok);
+  payload.add("ocxo1_counter_bad_count", snapshot.ocxo1_counter.bad_count);
+  payload.add("ocxo2_counter_valid", snapshot.ocxo2_counter.valid);
+  payload.add("ocxo2_counter_last_ok", snapshot.ocxo2_counter.last_ok);
+  payload.add("ocxo2_counter_bad_count", snapshot.ocxo2_counter.bad_count);
+  payload.add("vclock_dwt_valid", snapshot.vclock_qtimer_dwt.one_second.valid);
+  payload.add("vclock_dwt_error_cycles",
+              snapshot.vclock_qtimer_dwt.one_second.error_cycles);
+  payload.add("ocxo1_dwt_valid", snapshot.ocxo1_qtimer_dwt.one_second.valid);
+  payload.add("ocxo1_dwt_error_cycles",
+              snapshot.ocxo1_qtimer_dwt.one_second.error_cycles);
+  payload.add("ocxo2_dwt_valid", snapshot.ocxo2_qtimer_dwt.one_second.valid);
+  payload.add("ocxo2_dwt_error_cycles",
+              snapshot.ocxo2_qtimer_dwt.one_second.error_cycles);
+  payload.add("hz1k_rails_authored", false);
+  return payload;
 }
 
 static FLASHMEM Payload cmd_report_lanes(const Payload&) {
-  Payload p;
-  p.add("report", "INTERRUPT_LANES");
-  add_runtime_summary(p, "vclock", g_rt_vclock, g_vclock_lane.irq_count, g_rt_vclock ? g_rt_vclock->event_count : 0U);
-  add_ocxo_lean_lane(p, "ocxo1", g_ocxo1_ctx);
-  add_ocxo_lean_lane(p, "ocxo2", g_ocxo2_ctx);
-  return p;
+  Payload payload;
+  payload.add("report", "INTERRUPT_LANES");
+  add_runtime_summary(payload, "vclock", g_rt_vclock);
+  add_ocxo_lane_report(payload, "ocxo1", g_ocxo1_ctx);
+  add_ocxo_lane_report(payload, "ocxo2", g_ocxo2_ctx);
+  return payload;
 }
 
 static FLASHMEM Payload cmd_report_lane(const Payload& args) {
+  Payload payload;
+  payload.add("report", "INTERRUPT_LANE");
   const char* lane = args.getString("lane");
   if (!lane || !*lane) lane = args.getString("name");
-  Payload p;
-  p.add("report", "INTERRUPT_LANE");
-  p.add("lane", lane ? lane : "");
-  if (!lane || !*lane) { p.add("error", "missing lane parameter"); return p; }
-  if (interrupt_cstr_equal_ci(lane, "VCLOCK") || interrupt_cstr_equal_ci(lane, "VCLK")) {
-    add_runtime_summary(p, "vclock", g_rt_vclock, g_vclock_lane.irq_count, g_rt_vclock ? g_rt_vclock->event_count : 0U);
-    p.add("logical_count32", g_vclock_lane.logical_count32_at_last_second);
-    p.add("tick_mod_1000", g_vclock_lane.tick_mod_1000);
-    p.add("ch2_one_second_enabled", (bool)g_vclock_ch2_one_second_enabled);
-    p.add("ch2_next_counter32", (uint32_t)g_vclock_ch2_one_second_next_counter32);
-    const lower_env_lane_t* const floorline =
-        lower_env_report_snapshot(interrupt_subscriber_kind_t::VCLOCK);
-    if (floorline) add_floorline_flat(p, "vclock", *floorline);
-    return p;
+  if (!lane || !*lane) {
+    payload.add("error", "missing lane parameter");
+    return payload;
   }
-  const char* section = args.getString("section");
-  if (!section || !*section) section = args.getString("detail");
-  if (interrupt_cstr_equal_ci(lane, "OCXO1") || interrupt_cstr_equal_ci(lane, "O1")) { add_ocxo_lean_lane(p, "ocxo1", g_ocxo1_ctx, section); return p; }
-  if (interrupt_cstr_equal_ci(lane, "OCXO2") || interrupt_cstr_equal_ci(lane, "O2")) { add_ocxo_lean_lane(p, "ocxo2", g_ocxo2_ctx, section); return p; }
-  p.add("error", "unknown lane");
-  return p;
-}
-
-static FLASHMEM Payload cmd_report_qtimer_regs(const Payload&) {
-  Payload p; p.add("report", "INTERRUPT_QTIMER_REGS"); p.add("retired", true); return p;
-}
-
-static FLASHMEM Payload cmd_report_ocxo_isr_raw_dwt(const Payload&) {
-  Payload p; p.add("report", "INTERRUPT_OCXO_ISR_RAW_DWT"); p.add("retired", true); return p;
+  payload.add("lane", lane);
+  if (interrupt_cstr_equal_ci(lane, "VCLOCK") ||
+      interrupt_cstr_equal_ci(lane, "VCLK")) {
+    add_runtime_summary(payload, "vclock", g_rt_vclock);
+    payload.add("heartbeat_count", g_vclock_lane.heartbeat_count);
+    payload.add("one_second_count", g_vclock_lane.one_second_count);
+    payload.add("last_target_counter32", g_vclock_lane.last_target_counter32);
+    payload.add("last_dwt_at_edge", g_vclock_lane.last_dwt_at_edge);
+    return payload;
+  }
+  if (interrupt_cstr_equal_ci(lane, "OCXO1") ||
+      interrupt_cstr_equal_ci(lane, "O1")) {
+    add_ocxo_lane_report(payload, "ocxo1", g_ocxo1_ctx);
+    return payload;
+  }
+  if (interrupt_cstr_equal_ci(lane, "OCXO2") ||
+      interrupt_cstr_equal_ci(lane, "O2")) {
+    add_ocxo_lane_report(payload, "ocxo2", g_ocxo2_ctx);
+    return payload;
+  }
+  payload.add("error", "unknown lane");
+  return payload;
 }
 
 static const process_command_entry_t INTERRUPT_COMMANDS[] = {
-  { "REPORT",          cmd_report          },
-  { "REPORT_STATUS",   cmd_report_status   },
+  { "REPORT", cmd_report },
+  { "REPORT_STATUS", cmd_report_status },
   { "REPORT_FPU_CONTEXT", cmd_report_fpu_context },
-  { "REPORT_PPS",      cmd_report_pps      },
-  { "REPORT_CADENCE",  cmd_report_cadence  },
+  { "REPORT_PPS", cmd_report_pps },
+  { "REPORT_CADENCE", cmd_report_cadence },
   { "REPORT_SMARTZERO", cmd_report_smartzero },
-  { "REPORT_BRIDGE",   cmd_report_bridge   },
   { "REPORT_HANDOFF", cmd_report_handoff },
-  { "REPORT_LOWER_ENVELOPE", cmd_report_lower_envelope },
-  { "REPORT_PUBLICATION", cmd_report_publication },
   { "REPORT_INTEGRITY", cmd_report_integrity },
-  { "REPORT_LANES",    cmd_report_lanes    },
-  { "REPORT_LANE",     cmd_report_lane     },
-  { "REPORT_QTIMER_REGS", cmd_report_qtimer_regs },
-  { "REPORT_OCXO_ISR_RAW_DWT", cmd_report_ocxo_isr_raw_dwt },
-  { nullptr,           nullptr             }
+  { "REPORT_LANES", cmd_report_lanes },
+  { "REPORT_LANE", cmd_report_lane },
+  { nullptr, nullptr },
 };
 
 static const process_vtable_t INTERRUPT_PROCESS = {
-  .process_id    = "INTERRUPT",
-  .commands      = INTERRUPT_COMMANDS,
-  .subscriptions = nullptr
+  .process_id = "INTERRUPT",
+  .commands = INTERRUPT_COMMANDS,
+  .subscriptions = nullptr,
 };
 
 FLASHMEM void process_interrupt_register(void) {
   process_register("INTERRUPT", &INTERRUPT_PROCESS);
 }
-
 
 // ============================================================================
 // Stringifiers
@@ -16387,21 +3634,21 @@ FLASHMEM void process_interrupt_register(void) {
 
 const char* interrupt_subscriber_kind_str(interrupt_subscriber_kind_t kind) {
   switch (kind) {
-    case interrupt_subscriber_kind_t::VCLOCK:  return "VCLOCK";
-    case interrupt_subscriber_kind_t::OCXO1:   return "OCXO1";
-    case interrupt_subscriber_kind_t::OCXO2:   return "OCXO2";
+    case interrupt_subscriber_kind_t::VCLOCK: return "VCLOCK";
+    case interrupt_subscriber_kind_t::OCXO1: return "OCXO1";
+    case interrupt_subscriber_kind_t::OCXO2: return "OCXO2";
     case interrupt_subscriber_kind_t::TIMEPOP: return "TIMEPOP";
-    default:                                   return "NONE";
+    default: return "NONE";
   }
 }
 
 const char* interrupt_provider_kind_str(interrupt_provider_kind_t provider) {
   switch (provider) {
-    case interrupt_provider_kind_t::QTIMER1:  return "QTIMER1";
-    case interrupt_provider_kind_t::QTIMER2:  return "QTIMER2";
-    case interrupt_provider_kind_t::QTIMER3:  return "QTIMER3";
+    case interrupt_provider_kind_t::QTIMER1: return "QTIMER1";
+    case interrupt_provider_kind_t::QTIMER2: return "QTIMER2";
+    case interrupt_provider_kind_t::QTIMER3: return "QTIMER3";
     case interrupt_provider_kind_t::GPIO6789: return "GPIO6789";
-    default:                                  return "NONE";
+    default: return "NONE";
   }
 }
 
@@ -16416,7 +3663,7 @@ const char* interrupt_lane_str(interrupt_lane_t lane) {
     case interrupt_lane_t::QTIMER3_CH0_COMP: return "QTIMER3_CH0_COMP";
     case interrupt_lane_t::QTIMER3_CH1_COMP: return "QTIMER3_CH1_COMP";
     case interrupt_lane_t::QTIMER3_CH3_COMP: return "QTIMER3_CH3_COMP";
-    case interrupt_lane_t::GPIO_EDGE:        return "GPIO_EDGE";
-    default:                                 return "NONE";
+    case interrupt_lane_t::GPIO_EDGE: return "GPIO_EDGE";
+    default: return "NONE";
   }
 }
