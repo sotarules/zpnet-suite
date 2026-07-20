@@ -3459,6 +3459,85 @@ static const char* smartzero_phase_name(interrupt_smartzero_phase_t phase) {
   }
 }
 
+static const char* smartzero_lane_state_name(
+    interrupt_smartzero_lane_state_t state) {
+  switch (state) {
+    case interrupt_smartzero_lane_state_t::ACQUIRING: return "ACQUIRING";
+    case interrupt_smartzero_lane_state_t::LOCKED: return "LOCKED";
+    default: return "IDLE";
+  }
+}
+
+static const char* smartzero_decision_name(
+    interrupt_smartzero_decision_t decision) {
+  switch (decision) {
+    case interrupt_smartzero_decision_t::WAITING_FOR_CPS:
+      return "WAITING_FOR_CPS";
+    case interrupt_smartzero_decision_t::FIRST_SAMPLE:
+      return "FIRST_SAMPLE";
+    case interrupt_smartzero_decision_t::ACCEPTED:
+      return "ACCEPTED";
+    case interrupt_smartzero_decision_t::REJECTED_DWT:
+      return "REJECTED_DWT";
+    case interrupt_smartzero_decision_t::REJECTED_COUNTER:
+      return "REJECTED_COUNTER";
+    default:
+      return "NONE";
+  }
+}
+
+static const char* smartzero_lane_name(interrupt_subscriber_kind_t kind) {
+  switch (kind) {
+    case interrupt_subscriber_kind_t::VCLOCK: return "VCLOCK";
+    case interrupt_subscriber_kind_t::OCXO1: return "OCXO1";
+    case interrupt_subscriber_kind_t::OCXO2: return "OCXO2";
+    default: return "NONE";
+  }
+}
+
+static FLASHMEM void add_smartzero_lane_report(
+    Payload& payload,
+    const char* prefix,
+    const interrupt_smartzero_lane_snapshot_t& lane) {
+  char key[64];
+
+  auto add_string = [&](const char* suffix, const char* value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    payload.add(key, value);
+  };
+  auto add_u32 = [&](const char* suffix, uint32_t value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    payload.add(key, value);
+  };
+  auto add_i32 = [&](const char* suffix, int32_t value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    payload.add(key, value);
+  };
+
+  add_string("state", smartzero_lane_state_name(lane.state));
+  add_string("last_decision", smartzero_decision_name(lane.last_decision));
+  add_u32("sample_count", lane.sample_count);
+  add_u32("interval_attempt_count", lane.interval_attempt_count);
+  add_u32("accepted_count", lane.accepted_count);
+  add_u32("rejected_count", lane.rejected_count);
+  add_u32("waiting_for_cps_count", lane.waiting_for_cps_count);
+  add_u32("cps_used", lane.cps_used);
+  add_u32("expected_interval_cycles", lane.expected_interval_cycles);
+  add_u32("last_interval_cycles", lane.last_interval_cycles);
+  add_i32("last_interval_error_cycles", lane.last_interval_error_cycles);
+  add_u32("max_abs_interval_error_cycles",
+          lane.max_abs_interval_error_cycles);
+  add_u32("last_counter_delta_ticks", lane.last_counter_delta_ticks);
+  add_u32("required_counter_delta_ticks",
+          lane.required_counter_delta_ticks);
+  add_u32("previous_sample_dwt", lane.previous_sample_dwt);
+  add_u32("last_sample_dwt", lane.last_sample_dwt);
+  add_u32("previous_sample_counter32", lane.previous_sample_counter32);
+  add_u32("last_sample_counter32", lane.last_sample_counter32);
+  add_u32("anchor_dwt", lane.anchor_dwt);
+  add_u32("anchor_counter32", lane.anchor_counter32);
+}
+
 static FLASHMEM Payload cmd_report_smartzero(const Payload&) {
   Payload payload;
   payload.add("report", "INTERRUPT_SMARTZERO");
@@ -3467,26 +3546,20 @@ static FLASHMEM Payload cmd_report_smartzero(const Payload&) {
   payload.add("phase", smartzero_phase_name(snapshot.phase));
   payload.add("running", snapshot.running);
   payload.add("complete", snapshot.complete);
+  payload.add("aborted", snapshot.aborted);
   payload.add("sequence", snapshot.sequence);
-  payload.add("sample_rate_hz", 1U);
-  payload.add("counter_delta_ticks", OCXO_ONE_SECOND_TICKS);
-  payload.add("tolerance_cycles", SMARTZERO_ONE_SECOND_TOLERANCE_CYCLES);
+  payload.add("begin_count", snapshot.begin_count);
+  payload.add("complete_count", snapshot.complete_count);
+  payload.add("abort_count", snapshot.abort_count);
+  payload.add("current_lane_index", snapshot.current_lane_index);
+  payload.add("current_lane", smartzero_lane_name(snapshot.current_lane));
+  payload.add("sample_rate_hz", snapshot.sample_rate_hz);
+  payload.add("counter_delta_ticks", snapshot.counter_delta_ticks);
+  payload.add("tolerance_cycles", snapshot.tolerance_cycles);
+
   for (uint32_t i = 0; i < SMARTZERO_LANE_COUNT; ++i) {
-    const interrupt_smartzero_lane_snapshot_t& lane = snapshot.lanes[i];
-    char key[64];
     const char* prefix = i == 0U ? "vclock" : (i == 1U ? "ocxo1" : "ocxo2");
-    snprintf(key, sizeof(key), "%s_sample_count", prefix);
-    payload.add(key, lane.sample_count);
-    snprintf(key, sizeof(key), "%s_interval_attempt_count", prefix);
-    payload.add(key, lane.interval_attempt_count);
-    snprintf(key, sizeof(key), "%s_accepted_count", prefix);
-    payload.add(key, lane.accepted_count);
-    snprintf(key, sizeof(key), "%s_rejected_count", prefix);
-    payload.add(key, lane.rejected_count);
-    snprintf(key, sizeof(key), "%s_anchor_dwt", prefix);
-    payload.add(key, lane.anchor_dwt);
-    snprintf(key, sizeof(key), "%s_anchor_counter32", prefix);
-    payload.add(key, lane.anchor_counter32);
+    add_smartzero_lane_report(payload, prefix, snapshot.lanes[i]);
   }
   return payload;
 }
