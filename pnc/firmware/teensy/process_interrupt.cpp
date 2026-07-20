@@ -791,7 +791,14 @@ struct ocxo_lane_t {
   bool initialized = false;
   bool active = false;
   bool target_grid_valid = false;
-  bool compare_armed = false;
+  volatile bool compare_armed = false;
+
+  // Priority 0 defuses an authored compare before priority 16 can commit it.
+  // While capture_pending is true, VCLOCK must not tend this synthetic clock or
+  // interpret the disabled compare as a missed target.
+  volatile bool capture_pending = false;
+  uint32_t capture_pending_target_counter32 = 0;
+
   uint32_t grid_epoch_counter32 = 0;
   uint32_t next_target_counter32 = 0;
   uint32_t armed_target_counter32 = 0;
@@ -808,6 +815,19 @@ struct ocxo_lane_t {
   uint32_t arm_too_close_count = 0;
   uint32_t rebootstrap_count = 0;
   uint32_t recover_count = 0;
+
+  uint32_t capture_pending_set_count = 0;
+  uint32_t capture_pending_clear_count = 0;
+  uint32_t capture_pending_tend_skip_count = 0;
+  uint32_t capture_pending_enqueue_fail_count = 0;
+  uint32_t capture_pending_missing_count = 0;
+  uint32_t capture_pending_target_mismatch_count = 0;
+  uint32_t capture_pending_recovery_discard_count = 0;
+
+  uint32_t target_commit_rollback_count = 0;
+  uint32_t target_commit_ns_underflow_count = 0;
+  int32_t last_target_commit_delta_ticks = 0;
+  uint32_t last_target_commit_rollback_ticks = 0;
 
   uint32_t last_arm_dwt = 0;
   uint32_t last_arm_counter32 = 0;
@@ -1694,12 +1714,22 @@ static void ocxo_tend_and_arm(ocxo_runtime_context_t& ctx) {
   synthetic_clock32_t& clock = *ctx.clock32;
   if (!lane.initialized) return;
 
+  // Read compare_armed first.  If the compare has not fired, it owns the lane
+  // and the final < 65,536-tick interval needs no rollover tending.  If
+  // priority 0 fired before this read, compare_armed is false and its subsequent
+  // capture_pending write is the second half of the custody test.
+  if (lane.compare_armed) return;
+  if (lane.capture_pending) {
+    lane.capture_pending_tend_skip_count++;
+    return;
+  }
+
   const uint16_t ambient_low16 = ocxo_counter_now(lane);
   synthetic_clock_tend_from_hardware(clock, ambient_low16);
   lane.rollover_tend_count++;
   lane.last_ambient_low16 = ambient_low16;
 
-  if (!lane.active || !lane.target_grid_valid || lane.compare_armed) return;
+  if (!lane.active || !lane.target_grid_valid) return;
 
   while (ocxo_target_is_due_or_behind(clock.current_counter32,
                                       lane.next_target_counter32)) {
@@ -1728,8 +1758,12 @@ static void ocxo_tend_and_arm(ocxo_runtime_context_t& ctx) {
   lane.last_arm_remaining_ticks = remaining;
   lane.armed_target_counter32 = lane.next_target_counter32;
   lane.armed_target_low16 = target_low16;
-  qtimer_program_compare(*lane.module, lane.channel, target_low16);
+
+  // Publish software custody before hardware can assert the compare IRQ.
+  dmb_barrier();
   lane.compare_armed = true;
+  dmb_barrier();
+  qtimer_program_compare(*lane.module, lane.channel, target_low16);
   lane.arm_count++;
 }
 
@@ -1992,6 +2026,7 @@ struct interrupt_handoff_source_diag_t {
   volatile uint32_t last_capture_dwt = 0;
   volatile uint32_t last_capture_to_handoff_cycles = 0;
   volatile uint32_t max_capture_to_handoff_cycles = 0;
+  volatile uint32_t latency_invalid_count = 0;
 };
 
 struct interrupt_handoff_diag_t {
@@ -2010,6 +2045,7 @@ struct interrupt_handoff_diag_t {
   volatile uint32_t last_latency_cycles = 0;
   volatile uint32_t min_latency_cycles = UINT32_MAX;
   volatile uint32_t max_latency_cycles = 0;
+  volatile uint32_t latency_invalid_count = 0;
 };
 
 static interrupt_handoff_diag_t g_interrupt_handoff{};
@@ -2167,18 +2203,32 @@ static bool handoff_any_pending(void) {
 }
 
 static void interrupt_handoff_request_priority0(void) {
+  const uint32_t request_dwt = ARM_DWT_CYCCNT;
+
+  // Preserve the first request that created the pending handoff.  Later
+  // priority-0 captures coalesce into that handoff and must not replace its
+  // timestamp with a value newer than the already-entered priority-16 ISR.
+  if (!g_interrupt_handoff.pending) {
+    g_interrupt_handoff.last_request_dwt = request_dwt;
+  }
   g_interrupt_handoff.pending = true;
   g_interrupt_handoff.request_count++;
-  g_interrupt_handoff.last_request_dwt = ARM_DWT_CYCCNT;
   dmb_barrier();
   interrupt_nvic_ispr_word(INTERRUPT_HANDOFF_IRQ_NUMBER) =
       interrupt_nvic_irq_mask(INTERRUPT_HANDOFF_IRQ_NUMBER);
 }
 
 static void update_handoff_latency(interrupt_handoff_source_diag_t& diag,
-                                   uint32_t capture_dwt,
-                                   uint32_t entry_dwt) {
-  const uint32_t latency = entry_dwt - capture_dwt;
+                                   uint32_t capture_dwt) {
+  // A priority-0 packet may arrive after the current handoff ISR entered but
+  // before it reaches this source.  Measure to the actual dequeue point rather
+  // than subtracting from the older handoff-entry timestamp.
+  const uint32_t dequeue_dwt = ARM_DWT_CYCCNT;
+  const uint32_t latency = dequeue_dwt - capture_dwt;
+  if ((int32_t)latency < 0) {
+    diag.latency_invalid_count++;
+    return;
+  }
   diag.last_capture_to_handoff_cycles = latency;
   if (latency > diag.max_capture_to_handoff_cycles) {
     diag.max_capture_to_handoff_cycles = latency;
@@ -2478,6 +2528,25 @@ static void process_ch2_packet(const ch2_capture_packet_t& packet) {
       event.dwt_at_event);
 }
 
+static void ocxo_complete_capture_custody(
+    ocxo_lane_t& lane,
+    const ocxo_capture_packet_t& packet) {
+  if (!packet.active_at_capture) return;
+
+  if (!lane.capture_pending) {
+    lane.capture_pending_missing_count++;
+  } else {
+    lane.capture_pending_clear_count++;
+  }
+  if (lane.capture_pending_target_counter32 != packet.target_counter32) {
+    lane.capture_pending_target_mismatch_count++;
+  }
+  lane.capture_pending_target_counter32 = 0U;
+  dmb_barrier();
+  lane.capture_pending = false;
+  dmb_barrier();
+}
+
 static void process_ocxo_packet(ocxo_runtime_context_t& ctx,
                                 const ocxo_capture_packet_t& packet) {
   ocxo_lane_t& lane = *ctx.lane;
@@ -2499,6 +2568,7 @@ static void process_ocxo_packet(ocxo_runtime_context_t& ctx,
     lane.compare_armed = false;
     lane.armed_target_counter32 = 0U;
     lane.armed_target_low16 = 0U;
+    ocxo_complete_capture_custody(lane, packet);
     return;
   }
 
@@ -2511,9 +2581,29 @@ static void process_ocxo_packet(ocxo_runtime_context_t& ctx,
   lane.armed_target_counter32 = 0U;
   lane.armed_target_low16 = 0U;
 
-  const uint32_t advance = target - clock.current_counter32;
+  const int32_t target_delta =
+      (int32_t)(target - clock.current_counter32);
+  lane.last_target_commit_delta_ticks = target_delta;
+  lane.last_target_commit_rollback_ticks = 0U;
+  if (target_delta >= 0) {
+    clock.current_ns += (uint64_t)(uint32_t)target_delta * 100ULL;
+  } else {
+    // This should remain zero after armed/pending custody is enforced.  Keep the
+    // 64-bit clock coherent if another lifecycle path ever advances past a
+    // captured authored target, and leave an explicit diagnostic footprint.
+    const uint32_t rollback_ticks =
+        (uint32_t)(-(int64_t)target_delta);
+    const uint64_t rollback_ns = (uint64_t)rollback_ticks * 100ULL;
+    lane.target_commit_rollback_count++;
+    lane.last_target_commit_rollback_ticks = rollback_ticks;
+    if (clock.current_ns >= rollback_ns) {
+      clock.current_ns -= rollback_ns;
+    } else {
+      clock.current_ns = 0U;
+      lane.target_commit_ns_underflow_count++;
+    }
+  }
   clock.current_counter32 = target;
-  clock.current_ns += (uint64_t)advance * 100ULL;
   clock.hardware16 = packet.target_low16;
 
   const bool interval_valid = lane.previous_event_valid;
@@ -2529,6 +2619,10 @@ static void process_ocxo_packet(ocxo_runtime_context_t& ctx,
   lane.next_target_counter32 = target + OCXO_ONE_SECOND_TICKS;
   lane.target_grid_valid = true;
   lane.dispatch_sequence++;
+
+  // The observed target is now committed in both counter and nanosecond
+  // custody.  Only now may VCLOCK resume tending this lane.
+  ocxo_complete_capture_custody(lane, packet);
 
   interrupt_integrity_note_counter32(ctx.kind,
                                      lane.dispatch_sequence,
@@ -2627,7 +2721,7 @@ static void process_pps_packet(const pps_capture_packet_t& packet) {
   }
 }
 
-static bool handoff_drain_one_oldest(uint32_t entry_dwt) {
+static bool handoff_drain_one_oldest(void) {
   enum source_t : uint8_t {
     SRC_NONE,
     SRC_VCLOCK,
@@ -2674,8 +2768,7 @@ static bool handoff_drain_one_oldest(uint32_t entry_dwt) {
                                    g_handoff_vclock,
                                    packet)) {
         update_handoff_latency(g_handoff_vclock,
-                               packet.isr_entry_dwt_raw,
-                               entry_dwt);
+                               packet.isr_entry_dwt_raw);
         process_vclock_packet(packet);
       }
       break;
@@ -2686,8 +2779,7 @@ static bool handoff_drain_one_oldest(uint32_t entry_dwt) {
                                    g_handoff_ch2,
                                    packet)) {
         update_handoff_latency(g_handoff_ch2,
-                               packet.isr_entry_dwt_raw,
-                               entry_dwt);
+                               packet.isr_entry_dwt_raw);
         process_ch2_packet(packet);
       }
       break;
@@ -2698,8 +2790,7 @@ static bool handoff_drain_one_oldest(uint32_t entry_dwt) {
                                    g_handoff_ocxo1,
                                    packet)) {
         update_handoff_latency(g_handoff_ocxo1,
-                               packet.isr_entry_dwt_raw,
-                               entry_dwt);
+                               packet.isr_entry_dwt_raw);
         process_ocxo_packet(g_ocxo1_ctx, packet);
       }
       break;
@@ -2710,8 +2801,7 @@ static bool handoff_drain_one_oldest(uint32_t entry_dwt) {
                                    g_handoff_ocxo2,
                                    packet)) {
         update_handoff_latency(g_handoff_ocxo2,
-                               packet.isr_entry_dwt_raw,
-                               entry_dwt);
+                               packet.isr_entry_dwt_raw);
         process_ocxo_packet(g_ocxo2_ctx, packet);
       }
       break;
@@ -2722,8 +2812,7 @@ static bool handoff_drain_one_oldest(uint32_t entry_dwt) {
                                    g_handoff_pps,
                                    packet)) {
         update_handoff_latency(g_handoff_pps,
-                               packet.isr_entry_dwt_raw,
-                               entry_dwt);
+                               packet.isr_entry_dwt_raw);
         process_pps_packet(packet);
       }
       break;
@@ -2741,17 +2830,26 @@ static void interrupt_handoff_service_isr(void) {
     interrupt_handoff_request_priority0();
     return;
   }
+  // Snapshot the request while pending is still true.  Priority-0 requests
+  // arriving before this snapshot coalesce without replacing its timestamp.
+  const uint32_t request_dwt = g_interrupt_handoff.last_request_dwt;
   g_interrupt_handoff.running = true;
   g_interrupt_handoff.pending = false;
   g_interrupt_handoff.entry_count++;
   g_interrupt_handoff.last_entry_dwt = entry_dwt;
-  const uint32_t latency = entry_dwt - g_interrupt_handoff.last_request_dwt;
-  g_interrupt_handoff.last_latency_cycles = latency;
-  if (latency < g_interrupt_handoff.min_latency_cycles) {
-    g_interrupt_handoff.min_latency_cycles = latency;
-  }
-  if (latency > g_interrupt_handoff.max_latency_cycles) {
-    g_interrupt_handoff.max_latency_cycles = latency;
+
+  const uint32_t latency = entry_dwt - request_dwt;
+  if ((int32_t)latency >= 0) {
+    g_interrupt_handoff.last_latency_cycles = latency;
+    if (latency < g_interrupt_handoff.min_latency_cycles) {
+      g_interrupt_handoff.min_latency_cycles = latency;
+    }
+    if (latency > g_interrupt_handoff.max_latency_cycles) {
+      g_interrupt_handoff.max_latency_cycles = latency;
+    }
+  } else {
+    g_interrupt_handoff.last_latency_cycles = 0U;
+    g_interrupt_handoff.latency_invalid_count++;
   }
 
   ZPNET_EXECUTION_TRACE(
@@ -2767,7 +2865,7 @@ static void interrupt_handoff_service_isr(void) {
 
   uint32_t drained = 0U;
   while (drained < INTERRUPT_HANDOFF_DRAIN_BUDGET &&
-         handoff_drain_one_oldest(entry_dwt)) {
+         handoff_drain_one_oldest()) {
     ++drained;
   }
   if (handoff_any_pending()) {
@@ -2892,9 +2990,13 @@ static void ocxo_capture_priority0(
   // only as witnesses; the semantic identity is the authored target below.
   const uint16_t ambient_low16 = lane.module->CH[lane.channel].CNTR;
   const uint16_t compare_low16 = lane.module->CH[lane.channel].COMP1;
+
+  // compare_armed is the publication word for the authored identity below.
+  const bool compare_owned = lane.compare_armed;
+  dmb_barrier();
   const uint32_t target_counter32 = lane.armed_target_counter32;
   const uint16_t target_low16 = lane.armed_target_low16;
-  const bool active = lane.active && lane.compare_armed &&
+  const bool active = lane.active && compare_owned &&
       target_counter32 != 0U;
 
   qtimer_disable_compare(*lane.module, lane.channel);
@@ -2909,7 +3011,22 @@ static void ocxo_capture_priority0(
   packet.active_at_capture = active;
   packet.capture_exit_dwt = ARM_DWT_CYCCNT;
   if (capture_ring_push_priority0(ring, handoff, packet)) {
+    if (active) {
+      lane.capture_pending_target_counter32 = target_counter32;
+      dmb_barrier();
+      lane.capture_pending = true;
+      lane.capture_pending_set_count++;
+    }
     interrupt_handoff_request_priority0();
+    return;
+  }
+
+  if (active) {
+    // The compare was observed but could not enter custody.  Leave the lane
+    // eligible for ordinary missed-target recovery on the next VCLOCK tend.
+    lane.capture_pending = false;
+    lane.capture_pending_target_counter32 = 0U;
+    lane.capture_pending_enqueue_fail_count++;
   }
 }
 
@@ -3175,6 +3292,14 @@ bool interrupt_recover_rebootstrap_ocxo_service(
   rt->active = true;
   lane.active = true;
   lane.previous_event_valid = false;
+  if (lane.capture_pending) {
+    lane.capture_pending_recovery_discard_count++;
+    lane.capture_pending_clear_count++;
+  }
+  lane.capture_pending_target_counter32 = 0U;
+  dmb_barrier();
+  lane.capture_pending = false;
+  dmb_barrier();
   if (lane.compare_armed) ocxo_disable_compare(lane);
   lane.rebootstrap_count++;
   interrupt_priority0_guard_exit(prior);
@@ -3594,6 +3719,9 @@ static FLASHMEM void add_ocxo_lane_report(Payload& payload,
   add_bool("active", lane.active);
   add_bool("target_grid_valid", lane.target_grid_valid);
   add_bool("compare_armed", lane.compare_armed);
+  add_bool("capture_pending", (bool)lane.capture_pending);
+  add_u32("capture_pending_target_counter32",
+          lane.capture_pending_target_counter32);
   add_u32("clock32", clock.current_counter32);
   add_u32("hardware16", (uint32_t)clock.hardware16);
   add_u32("grid_epoch_counter32", lane.grid_epoch_counter32);
@@ -3607,6 +3735,26 @@ static FLASHMEM void add_ocxo_lane_report(Payload& payload,
   add_u32("rollover_tend_count", lane.rollover_tend_count);
   add_u32("arm_window_wait_count", lane.arm_window_wait_count);
   add_u32("arm_too_close_count", lane.arm_too_close_count);
+  add_u32("capture_pending_set_count", lane.capture_pending_set_count);
+  add_u32("capture_pending_clear_count", lane.capture_pending_clear_count);
+  add_u32("capture_pending_tend_skip_count",
+          lane.capture_pending_tend_skip_count);
+  add_u32("capture_pending_enqueue_fail_count",
+          lane.capture_pending_enqueue_fail_count);
+  add_u32("capture_pending_missing_count",
+          lane.capture_pending_missing_count);
+  add_u32("capture_pending_target_mismatch_count",
+          lane.capture_pending_target_mismatch_count);
+  add_u32("capture_pending_recovery_discard_count",
+          lane.capture_pending_recovery_discard_count);
+  add_u32("target_commit_rollback_count",
+          lane.target_commit_rollback_count);
+  add_u32("target_commit_ns_underflow_count",
+          lane.target_commit_ns_underflow_count);
+  add_i32("last_target_commit_delta_ticks",
+          lane.last_target_commit_delta_ticks);
+  add_u32("last_target_commit_rollback_ticks",
+          lane.last_target_commit_rollback_ticks);
   add_u32("last_arm_remaining_ticks", lane.last_arm_remaining_ticks);
   add_u32("last_dwt_at_edge", lane.last_dwt_at_edge);
   add_u32("last_event_counter32", lane.last_event_counter32);
@@ -3848,23 +3996,33 @@ static FLASHMEM void add_handoff_source(
   payload.add(key, (uint32_t)source.pending_count);
   snprintf(key, sizeof(key), "%s_high_water", prefix);
   payload.add(key, (uint32_t)source.high_water);
+  snprintf(key, sizeof(key), "%s_last_latency_cycles", prefix);
+  payload.add(key, (uint32_t)source.last_capture_to_handoff_cycles);
   snprintf(key, sizeof(key), "%s_max_latency_cycles", prefix);
   payload.add(key, (uint32_t)source.max_capture_to_handoff_cycles);
+  snprintf(key, sizeof(key), "%s_latency_invalid_count", prefix);
+  payload.add(key, (uint32_t)source.latency_invalid_count);
 }
 
 static FLASHMEM Payload cmd_report_handoff(const Payload&) {
   Payload payload;
   payload.add("report", "INTERRUPT_HANDOFF");
+  payload.add("entry_latency_measurement", "FIRST_REQUEST_TO_ENTRY");
+  payload.add("source_latency_measurement", "CAPTURE_TO_DEQUEUE");
   payload.add("configured", (bool)g_interrupt_handoff.configured);
   payload.add("request_count", (uint32_t)g_interrupt_handoff.request_count);
   payload.add("entry_count", (uint32_t)g_interrupt_handoff.entry_count);
   payload.add("exit_count", (uint32_t)g_interrupt_handoff.exit_count);
   payload.add("reentry_count", (uint32_t)g_interrupt_handoff.reentry_count);
   payload.add("repend_count", (uint32_t)g_interrupt_handoff.repend_count);
+  payload.add("drain_budget_exhausted_count",
+              (uint32_t)g_interrupt_handoff.drain_budget_exhausted_count);
+  payload.add("latency_invalid_count",
+              (uint32_t)g_interrupt_handoff.latency_invalid_count);
   payload.add("last_latency_cycles",
               (uint32_t)g_interrupt_handoff.last_latency_cycles);
   payload.add("min_latency_cycles",
-              g_interrupt_handoff.entry_count != 0U
+              g_interrupt_handoff.min_latency_cycles != UINT32_MAX
                   ? (uint32_t)g_interrupt_handoff.min_latency_cycles
                   : 0U);
   payload.add("max_latency_cycles",
