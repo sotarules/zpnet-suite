@@ -109,7 +109,14 @@ static constexpr uint32_t OCXO_MIN_ARM_LEAD_TICKS = 64U;
 static constexpr uint32_t COUNTER32_LINEAGE_LOCK_STREAK = 8U;
 static constexpr uint32_t QTIMER_DWT_1S_LOCK_STREAK = 8U;
 static constexpr uint32_t QTIMER_DWT_MATCH_GATE_CYCLES = 24U;
-static constexpr uint32_t SMARTZERO_ONE_SECOND_TOLERANCE_CYCLES = 32U;
+
+// SmartZero is a repeatability vote, not a reference-frequency estimator.
+// Ten recent lawful one-second intervals are retained.  A lane locks when any
+// three occupy a total four-cycle band; the newest member of that band is the
+// accepted current cycle count.
+static constexpr uint32_t SMARTZERO_HISTORY_SIZE = 10U;
+static constexpr uint32_t SMARTZERO_QUORUM_REQUIRED = 3U;
+static constexpr uint32_t SMARTZERO_VOTE_SPAN_CYCLES = 4U;
 
 static_assert(OCXO_ONE_SECOND_TICKS == 10000000U,
               "OCXO one-second target must be 10,000,000 ticks");
@@ -117,6 +124,8 @@ static_assert(OCXO_MIN_ARM_LEAD_TICKS < OCXO_ARM_WINDOW_TICKS,
               "OCXO arm lead must be inside arm window");
 static_assert(OCXO_ARM_WINDOW_TICKS < 65536U,
               "OCXO arm window must stay inside one low-word revolution");
+static_assert(SMARTZERO_QUORUM_REQUIRED <= SMARTZERO_HISTORY_SIZE,
+              "SmartZero quorum must fit inside its history");
 
 static constexpr bool OCXO1_DISABLED = false;
 static constexpr bool OCXO2_DISABLED = false;
@@ -1104,9 +1113,55 @@ bool interrupt_integrity_snapshot(interrupt_integrity_snapshot_t* out) {
 // One-second SmartZero proof
 // ============================================================================
 
+struct smartzero_interval_sample_t {
+  uint32_t interval_cycles = 0;
+  uint32_t previous_dwt = 0;
+  uint32_t current_dwt = 0;
+  uint32_t previous_counter32 = 0;
+  uint32_t current_counter32 = 0;
+  uint16_t current_hardware16 = 0;
+  uint32_t ordinal = 0;
+};
+
+struct smartzero_vote_result_t {
+  bool found = false;
+  uint32_t count = 0;
+  uint32_t min_cycles = 0;
+  uint32_t max_cycles = 0;
+  uint32_t span_cycles = 0;
+  uint32_t closest_three_span_cycles = 0;
+  smartzero_interval_sample_t selected{};
+};
+
+struct smartzero_lane_vote_report_t {
+  uint32_t history_count = 0;
+  uint32_t valid_interval_count = 0;
+  uint32_t quorum_count = 0;
+  uint32_t quorum_min_cycles = 0;
+  uint32_t quorum_max_cycles = 0;
+  uint32_t quorum_span_cycles = 0;
+  uint32_t closest_three_span_cycles = 0;
+  uint32_t accepted_interval_cycles = 0;
+  uint32_t accepted_history_age = 0;
+};
+
 struct smartzero_lane_runtime_t {
   interrupt_smartzero_lane_snapshot_t pub{};
   bool previous_present = false;
+  uint32_t previous_dwt = 0;
+  uint32_t previous_counter32 = 0;
+  uint16_t previous_hardware16 = 0;
+  smartzero_interval_sample_t history[SMARTZERO_HISTORY_SIZE]{};
+  uint32_t history_next = 0;
+  uint32_t history_count = 0;
+  uint32_t interval_ordinal = 0;
+  uint32_t quorum_count = 0;
+  uint32_t quorum_min_cycles = 0;
+  uint32_t quorum_max_cycles = 0;
+  uint32_t quorum_span_cycles = 0;
+  uint32_t closest_three_span_cycles = 0;
+  uint32_t accepted_interval_cycles = 0;
+  uint32_t accepted_history_age = 0;
 };
 
 struct smartzero_runtime_t {
@@ -1156,7 +1211,7 @@ static void smartzero_reset_lane(uint32_t index) {
   runtime.pub.kind = smartzero_kind_for_index(index);
   runtime.pub.state = interrupt_smartzero_lane_state_t::IDLE;
   runtime.pub.last_decision = interrupt_smartzero_decision_t::NONE;
-  runtime.pub.tolerance_cycles = SMARTZERO_ONE_SECOND_TOLERANCE_CYCLES;
+  runtime.pub.tolerance_cycles = SMARTZERO_VOTE_SPAN_CYCLES;
   runtime.pub.required_counter_delta_ticks = OCXO_ONE_SECOND_TICKS;
 }
 
@@ -1176,6 +1231,107 @@ static bool smartzero_is_current_lane(interrupt_subscriber_kind_t kind) {
     }
   }
   return false;
+}
+
+static uint32_t smartzero_history_slot(
+    const smartzero_lane_runtime_t& runtime,
+    uint32_t chronological_index) {
+  const uint32_t oldest =
+      (runtime.history_next + SMARTZERO_HISTORY_SIZE - runtime.history_count) %
+      SMARTZERO_HISTORY_SIZE;
+  return (oldest + chronological_index) % SMARTZERO_HISTORY_SIZE;
+}
+
+static void smartzero_history_push(
+    smartzero_lane_runtime_t& runtime,
+    const smartzero_interval_sample_t& sample) {
+  runtime.history[runtime.history_next] = sample;
+  runtime.history_next =
+      (runtime.history_next + 1U) % SMARTZERO_HISTORY_SIZE;
+  if (runtime.history_count < SMARTZERO_HISTORY_SIZE) {
+    runtime.history_count++;
+  }
+}
+
+static smartzero_vote_result_t smartzero_find_vote(
+    const smartzero_lane_runtime_t& runtime) {
+  smartzero_vote_result_t result{};
+  const uint32_t count = runtime.history_count;
+  if (count < SMARTZERO_QUORUM_REQUIRED) return result;
+
+  const smartzero_interval_sample_t* ordered[SMARTZERO_HISTORY_SIZE]{};
+  for (uint32_t i = 0; i < count; ++i) {
+    ordered[i] =
+        &runtime.history[smartzero_history_slot(runtime, i)];
+  }
+
+  // Sort a bounded pointer list by interval value.  No averaging or smoothing
+  // occurs: this merely makes the closest-three and quorum spans explicit.
+  for (uint32_t i = 1; i < count; ++i) {
+    const smartzero_interval_sample_t* value = ordered[i];
+    uint32_t j = i;
+    while (j > 0U &&
+           (ordered[j - 1U]->interval_cycles > value->interval_cycles ||
+            (ordered[j - 1U]->interval_cycles == value->interval_cycles &&
+             ordered[j - 1U]->ordinal > value->ordinal))) {
+      ordered[j] = ordered[j - 1U];
+      --j;
+    }
+    ordered[j] = value;
+  }
+
+  uint32_t closest_three = UINT32_MAX;
+  for (uint32_t i = 0;
+       i + SMARTZERO_QUORUM_REQUIRED <= count;
+       ++i) {
+    const uint32_t high =
+        ordered[i + SMARTZERO_QUORUM_REQUIRED - 1U]->interval_cycles;
+    const uint32_t span = high - ordered[i]->interval_cycles;
+    if (span < closest_three) closest_three = span;
+  }
+  result.closest_three_span_cycles =
+      closest_three == UINT32_MAX ? 0U : closest_three;
+
+  for (uint32_t i = 0; i < count; ++i) {
+    const uint32_t min_cycles = ordered[i]->interval_cycles;
+    uint32_t end = i;
+    while (end < count &&
+           ordered[end]->interval_cycles - min_cycles <=
+               SMARTZERO_VOTE_SPAN_CYCLES) {
+      ++end;
+    }
+    const uint32_t candidate_count = end - i;
+    if (candidate_count < SMARTZERO_QUORUM_REQUIRED) continue;
+
+    const smartzero_interval_sample_t* newest = ordered[i];
+    uint32_t max_cycles = min_cycles;
+    for (uint32_t j = i; j < end; ++j) {
+      if (ordered[j]->ordinal > newest->ordinal) newest = ordered[j];
+      if (ordered[j]->interval_cycles > max_cycles) {
+        max_cycles = ordered[j]->interval_cycles;
+      }
+    }
+    const uint32_t span = max_cycles - min_cycles;
+
+    const bool better =
+        !result.found ||
+        newest->ordinal > result.selected.ordinal ||
+        (newest->ordinal == result.selected.ordinal &&
+         span < result.span_cycles) ||
+        (newest->ordinal == result.selected.ordinal &&
+         span == result.span_cycles &&
+         candidate_count > result.count);
+    if (!better) continue;
+
+    result.found = true;
+    result.count = candidate_count;
+    result.min_cycles = min_cycles;
+    result.max_cycles = max_cycles;
+    result.span_cycles = span;
+    result.selected = *newest;
+  }
+
+  return result;
 }
 
 static void smartzero_advance_or_complete(void) {
@@ -1207,6 +1363,8 @@ static void smartzero_feed_one_second(interrupt_subscriber_kind_t kind,
   const int index = smartzero_index_for_kind(kind);
   if (index < 0) return;
 
+  // The reference CPS remains report evidence only.  Acceptance is decided by
+  // repeatability within this lane, never by agreement with another oscillator.
   const uint32_t expected_cycles = interrupt_vclock_cycles_per_second();
   smartzero_write_begin();
   smartzero_lane_runtime_t& runtime = g_smartzero.lanes[index];
@@ -1219,15 +1377,10 @@ static void smartzero_feed_one_second(interrupt_subscriber_kind_t kind,
   lane.last_sample_counter32 = counter32_at_event;
   lane.last_sample_hardware16 = target_low16;
 
-  if (expected_cycles == 0U) {
-    lane.waiting_for_cps_count++;
-    lane.last_decision = interrupt_smartzero_decision_t::WAITING_FOR_CPS;
-    runtime.previous_present = false;
-    smartzero_write_end();
-    return;
-  }
-
   if (!runtime.previous_present) {
+    runtime.previous_dwt = dwt_at_event;
+    runtime.previous_counter32 = counter32_at_event;
+    runtime.previous_hardware16 = target_low16;
     lane.previous_sample_dwt = dwt_at_event;
     lane.previous_sample_counter32 = counter32_at_event;
     lane.previous_sample_hardware16 = target_low16;
@@ -1237,45 +1390,90 @@ static void smartzero_feed_one_second(interrupt_subscriber_kind_t kind,
     return;
   }
 
-  const uint32_t interval_cycles =
-      dwt_at_event - lane.previous_sample_dwt;
+  const uint32_t previous_dwt = runtime.previous_dwt;
+  const uint32_t previous_counter32 = runtime.previous_counter32;
+  const uint16_t previous_hardware16 = runtime.previous_hardware16;
+  const uint32_t interval_cycles = dwt_at_event - previous_dwt;
   const uint32_t counter_delta =
-      counter32_at_event - lane.previous_sample_counter32;
-  const int32_t error = (int32_t)((int64_t)interval_cycles -
-                                  (int64_t)expected_cycles);
-  const uint32_t abs_error = interrupt_abs_i32(error);
+      counter32_at_event - previous_counter32;
+
+  lane.previous_sample_dwt = previous_dwt;
+  lane.previous_sample_counter32 = previous_counter32;
+  lane.previous_sample_hardware16 = previous_hardware16;
   lane.interval_attempt_count++;
   lane.last_interval_cycles = interval_cycles;
-  lane.last_interval_error_cycles = error;
   lane.last_counter_delta_ticks = counter_delta;
-  if (abs_error > lane.max_abs_interval_error_cycles) {
-    lane.max_abs_interval_error_cycles = abs_error;
+
+  if (expected_cycles != 0U) {
+    const int64_t error64 =
+        (int64_t)(uint64_t)interval_cycles -
+        (int64_t)(uint64_t)expected_cycles;
+    const int32_t error = error64 > INT32_MAX
+        ? INT32_MAX
+        : (error64 < INT32_MIN ? INT32_MIN : (int32_t)error64);
+    const uint32_t abs_error = interrupt_abs_i32(error);
+    lane.last_interval_error_cycles = error;
+    if (abs_error > lane.max_abs_interval_error_cycles) {
+      lane.max_abs_interval_error_cycles = abs_error;
+    }
+  } else {
+    lane.waiting_for_cps_count++;
+    lane.last_interval_error_cycles = 0;
   }
 
-  const bool counter_ok = counter_delta == OCXO_ONE_SECOND_TICKS;
-  const bool dwt_ok =
-      abs_error <= (uint32_t)SMARTZERO_ONE_SECOND_TOLERANCE_CYCLES;
-  if (counter_ok && dwt_ok) {
-    lane.accepted_count++;
-    lane.state = interrupt_smartzero_lane_state_t::LOCKED;
-    lane.last_decision = interrupt_smartzero_decision_t::ACCEPTED;
-    lane.anchor_dwt = dwt_at_event;
-    lane.anchor_counter32 = counter32_at_event;
-    lane.anchor_hardware16 = target_low16;
-    lane.anchor_pair_previous_dwt = lane.previous_sample_dwt;
-    lane.anchor_pair_previous_counter32 = lane.previous_sample_counter32;
-    smartzero_advance_or_complete();
+  // Every observed endpoint becomes the next interval's left endpoint.  This
+  // naturally exposes a late-ISR positive spike followed by its negative
+  // rebound, while retaining both actual endpoints of the interval just tested.
+  runtime.previous_dwt = dwt_at_event;
+  runtime.previous_counter32 = counter32_at_event;
+  runtime.previous_hardware16 = target_low16;
+
+  if (counter_delta != OCXO_ONE_SECOND_TICKS) {
+    lane.rejected_count++;
+    lane.last_decision = interrupt_smartzero_decision_t::REJECTED_COUNTER;
     smartzero_write_end();
     return;
   }
 
-  lane.rejected_count++;
-  lane.last_decision = counter_ok
-      ? interrupt_smartzero_decision_t::REJECTED_DWT
-      : interrupt_smartzero_decision_t::REJECTED_COUNTER;
-  lane.previous_sample_dwt = dwt_at_event;
-  lane.previous_sample_counter32 = counter32_at_event;
-  lane.previous_sample_hardware16 = target_low16;
+  smartzero_interval_sample_t sample{};
+  sample.interval_cycles = interval_cycles;
+  sample.previous_dwt = previous_dwt;
+  sample.current_dwt = dwt_at_event;
+  sample.previous_counter32 = previous_counter32;
+  sample.current_counter32 = counter32_at_event;
+  sample.current_hardware16 = target_low16;
+  sample.ordinal = ++runtime.interval_ordinal;
+  if (sample.ordinal == 0U) sample.ordinal = ++runtime.interval_ordinal;
+  smartzero_history_push(runtime, sample);
+
+  const smartzero_vote_result_t vote = smartzero_find_vote(runtime);
+  runtime.closest_three_span_cycles = vote.closest_three_span_cycles;
+  runtime.quorum_count = vote.found ? vote.count : 0U;
+  runtime.quorum_min_cycles = vote.found ? vote.min_cycles : 0U;
+  runtime.quorum_max_cycles = vote.found ? vote.max_cycles : 0U;
+  runtime.quorum_span_cycles = vote.found ? vote.span_cycles : 0U;
+
+  if (!vote.found) {
+    lane.rejected_count++;
+    // REJECTED_DWT is retained as the public ABI value; reports name this
+    // condition NO_QUORUM because no individual DWT sample is condemned.
+    lane.last_decision = interrupt_smartzero_decision_t::REJECTED_DWT;
+    smartzero_write_end();
+    return;
+  }
+
+  runtime.accepted_interval_cycles = vote.selected.interval_cycles;
+  runtime.accepted_history_age =
+      runtime.interval_ordinal - vote.selected.ordinal;
+  lane.accepted_count++;
+  lane.state = interrupt_smartzero_lane_state_t::LOCKED;
+  lane.last_decision = interrupt_smartzero_decision_t::ACCEPTED;
+  lane.anchor_dwt = vote.selected.current_dwt;
+  lane.anchor_counter32 = vote.selected.current_counter32;
+  lane.anchor_hardware16 = vote.selected.current_hardware16;
+  lane.anchor_pair_previous_dwt = vote.selected.previous_dwt;
+  lane.anchor_pair_previous_counter32 = vote.selected.previous_counter32;
+  smartzero_advance_or_complete();
   smartzero_write_end();
 }
 
@@ -1322,13 +1520,16 @@ bool interrupt_smartzero_complete(void) {
   return g_smartzero.complete;
 }
 
-static bool smartzero_snapshot_load(interrupt_smartzero_snapshot_t* out) {
+static bool smartzero_snapshot_load(
+    interrupt_smartzero_snapshot_t* out,
+    smartzero_lane_vote_report_t* vote_reports = nullptr) {
   if (!out) return false;
   for (uint32_t attempt = 0; attempt < 4U; ++attempt) {
     const uint32_t seq1 = g_smartzero.seq;
     if (seq1 & 1U) continue;
     dmb_barrier();
     interrupt_smartzero_snapshot_t local{};
+    smartzero_lane_vote_report_t local_votes[SMARTZERO_LANE_COUNT]{};
     local.phase = g_smartzero.phase;
     local.running = g_smartzero.running;
     local.complete = g_smartzero.complete;
@@ -1341,20 +1542,42 @@ static bool smartzero_snapshot_load(interrupt_smartzero_snapshot_t* out) {
     local.current_lane = g_smartzero.running
         ? smartzero_kind_for_index(g_smartzero.current_lane_index)
         : interrupt_subscriber_kind_t::NONE;
-    local.tolerance_cycles = SMARTZERO_ONE_SECOND_TOLERANCE_CYCLES;
+    local.tolerance_cycles = SMARTZERO_VOTE_SPAN_CYCLES;
     local.sample_rate_hz = 1U;
     local.counter_delta_ticks = OCXO_ONE_SECOND_TICKS;
     for (uint32_t i = 0; i < SMARTZERO_LANE_COUNT; ++i) {
-      local.lanes[i] = g_smartzero.lanes[i].pub;
+      const smartzero_lane_runtime_t& runtime = g_smartzero.lanes[i];
+      local.lanes[i] = runtime.pub;
+      local_votes[i].history_count = runtime.history_count;
+      local_votes[i].valid_interval_count = runtime.interval_ordinal;
+      local_votes[i].quorum_count = runtime.quorum_count;
+      local_votes[i].quorum_min_cycles = runtime.quorum_min_cycles;
+      local_votes[i].quorum_max_cycles = runtime.quorum_max_cycles;
+      local_votes[i].quorum_span_cycles = runtime.quorum_span_cycles;
+      local_votes[i].closest_three_span_cycles =
+          runtime.closest_three_span_cycles;
+      local_votes[i].accepted_interval_cycles =
+          runtime.accepted_interval_cycles;
+      local_votes[i].accepted_history_age = runtime.accepted_history_age;
     }
     dmb_barrier();
     const uint32_t seq2 = g_smartzero.seq;
     if (seq1 == seq2 && (seq2 & 1U) == 0U) {
       *out = local;
+      if (vote_reports) {
+        for (uint32_t i = 0; i < SMARTZERO_LANE_COUNT; ++i) {
+          vote_reports[i] = local_votes[i];
+        }
+      }
       return true;
     }
   }
   *out = interrupt_smartzero_snapshot_t{};
+  if (vote_reports) {
+    for (uint32_t i = 0; i < SMARTZERO_LANE_COUNT; ++i) {
+      vote_reports[i] = smartzero_lane_vote_report_t{};
+    }
+  }
   return false;
 }
 
@@ -3478,7 +3701,7 @@ static const char* smartzero_decision_name(
     case interrupt_smartzero_decision_t::ACCEPTED:
       return "ACCEPTED";
     case interrupt_smartzero_decision_t::REJECTED_DWT:
-      return "REJECTED_DWT";
+      return "NO_QUORUM";
     case interrupt_smartzero_decision_t::REJECTED_COUNTER:
       return "REJECTED_COUNTER";
     default:
@@ -3498,7 +3721,8 @@ static const char* smartzero_lane_name(interrupt_subscriber_kind_t kind) {
 static FLASHMEM void add_smartzero_lane_report(
     Payload& payload,
     const char* prefix,
-    const interrupt_smartzero_lane_snapshot_t& lane) {
+    const interrupt_smartzero_lane_snapshot_t& lane,
+    const smartzero_lane_vote_report_t& vote) {
   char key[64];
 
   auto add_string = [&](const char* suffix, const char* value) {
@@ -3519,7 +3743,7 @@ static FLASHMEM void add_smartzero_lane_report(
   add_u32("sample_count", lane.sample_count);
   add_u32("interval_attempt_count", lane.interval_attempt_count);
   add_u32("accepted_count", lane.accepted_count);
-  add_u32("rejected_count", lane.rejected_count);
+  add_u32("no_quorum_count", lane.rejected_count);
   add_u32("waiting_for_cps_count", lane.waiting_for_cps_count);
   add_u32("cps_used", lane.cps_used);
   add_u32("expected_interval_cycles", lane.expected_interval_cycles);
@@ -3536,13 +3760,23 @@ static FLASHMEM void add_smartzero_lane_report(
   add_u32("last_sample_counter32", lane.last_sample_counter32);
   add_u32("anchor_dwt", lane.anchor_dwt);
   add_u32("anchor_counter32", lane.anchor_counter32);
+  add_u32("history_count", vote.history_count);
+  add_u32("valid_interval_count", vote.valid_interval_count);
+  add_u32("quorum_count", vote.quorum_count);
+  add_u32("quorum_min_cycles", vote.quorum_min_cycles);
+  add_u32("quorum_max_cycles", vote.quorum_max_cycles);
+  add_u32("quorum_span_cycles", vote.quorum_span_cycles);
+  add_u32("closest_three_span_cycles", vote.closest_three_span_cycles);
+  add_u32("accepted_interval_cycles", vote.accepted_interval_cycles);
+  add_u32("accepted_history_age", vote.accepted_history_age);
 }
 
 static FLASHMEM Payload cmd_report_smartzero(const Payload&) {
   Payload payload;
   payload.add("report", "INTERRUPT_SMARTZERO");
   interrupt_smartzero_snapshot_t snapshot{};
-  (void)smartzero_snapshot_load(&snapshot);
+  smartzero_lane_vote_report_t votes[SMARTZERO_LANE_COUNT]{};
+  (void)smartzero_snapshot_load(&snapshot, votes);
   payload.add("phase", smartzero_phase_name(snapshot.phase));
   payload.add("running", snapshot.running);
   payload.add("complete", snapshot.complete);
@@ -3553,13 +3787,20 @@ static FLASHMEM Payload cmd_report_smartzero(const Payload&) {
   payload.add("abort_count", snapshot.abort_count);
   payload.add("current_lane_index", snapshot.current_lane_index);
   payload.add("current_lane", smartzero_lane_name(snapshot.current_lane));
+  payload.add("algorithm", "RECENT_THREE_VOTE");
   payload.add("sample_rate_hz", snapshot.sample_rate_hz);
   payload.add("counter_delta_ticks", snapshot.counter_delta_ticks);
+  payload.add("history_size", SMARTZERO_HISTORY_SIZE);
+  payload.add("quorum_required", SMARTZERO_QUORUM_REQUIRED);
+  payload.add("vote_span_cycles", SMARTZERO_VOTE_SPAN_CYCLES);
   payload.add("tolerance_cycles", snapshot.tolerance_cycles);
 
   for (uint32_t i = 0; i < SMARTZERO_LANE_COUNT; ++i) {
     const char* prefix = i == 0U ? "vclock" : (i == 1U ? "ocxo1" : "ocxo2");
-    add_smartzero_lane_report(payload, prefix, snapshot.lanes[i]);
+    add_smartzero_lane_report(payload,
+                              prefix,
+                              snapshot.lanes[i],
+                              votes[i]);
   }
   return payload;
 }
