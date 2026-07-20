@@ -7,14 +7,13 @@
 // SYSTEM is not a lifecycle-managed process.
 // It cannot start or stop from within itself.
 //
-// It exposes authoritative system facts, owns bounded always-on integrity
-// watchdog scheduling, and provides explicit terminal transitions (shutdown,
-// bootloader) that represent irreversible boundary crossings.
+// It exposes authoritative system facts and provides explicit terminal
+// transitions (shutdown, bootloader) that represent irreversible boundary
+// crossings.
 //
 // =============================================================
 
 #include "process_system.h"
-#include "memory_info.h"
 #include "crash_forensics.h"
 #include "config.h"
 #include "process.h"
@@ -32,7 +31,6 @@
 #include <CrashReport.h>
 
 static constexpr uint64_t FLASH_DELAY_NS = 5000000000ULL;  // 5 seconds
-static constexpr uint64_t SYSTEM_MEMORY_WATCHDOG_PERIOD_NS = 5000000000ULL;
 
 // --------------------------------------------------------------
 // Forward declarations (terminal paths)
@@ -44,10 +42,7 @@ extern "C" void enter_bootloader_cleanly(void);
 
 static FLASHMEM Payload system_features_tree_payload(void);
 static void system_feature_schedule_fragment_publish(void);
-static void system_memory_watchdog_arm(void);
-static void system_memory_watchdog_schedule_alap(void);
 static void system_dmamem_ensure_initialized(void);
-static void system_payload_contract_service(void);
 
 // --------------------------------------------------------------
 // Internal terminal state
@@ -226,449 +221,6 @@ void zpnet_cpu_usage_ledger_exit(void) {
   g_runtime_ledger.cpu_usage_sequence_inv = ~sequence;  // commit last
 }
 
-// --------------------------------------------------------------
-// Always-on memory integrity watchdog
-// --------------------------------------------------------------
-// memory_info owns observation, rule evaluation, and the sticky health verdict.
-// SYSTEM owns only TimePop scheduling and the one WATCHDOG_ANOMALY emission.
-
-static memory_health_t g_system_memory_watchdog_health = {};
-static timepop_handle_t g_system_memory_watchdog_handle = TIMEPOP_INVALID_HANDLE;
-static bool     g_system_memory_watchdog_armed = false;
-static bool     g_system_memory_watchdog_event_emitted = false;
-static uint32_t g_system_memory_watchdog_arm_attempts = 0;
-static uint32_t g_system_memory_watchdog_arm_failures = 0;
-static uint32_t g_system_memory_watchdog_callback_count = 0;
-static uint32_t g_system_memory_watchdog_event_count = 0;
-static int64_t  g_system_memory_watchdog_last_fire_gnss_ns = 0;
-static uint32_t g_system_memory_watchdog_last_fire_dwt = 0;
-
-// Timed callbacks may run in interrupt context.  Keep them allocator-free and
-// defer all substantive audit/serialization/publication work to one ALAP
-// foreground service.
-static volatile bool g_system_memory_watchdog_alap_pending = false;
-static volatile bool g_system_memory_watchdog_alap_armed = false;
-static uint32_t g_system_memory_watchdog_alap_arm_count = 0;
-static uint32_t g_system_memory_watchdog_alap_arm_failures = 0;
-static uint32_t g_system_memory_watchdog_alap_run_count = 0;
-
-
-// ============================================================================
-// Memory-watchdog callback flight recorder
-// ============================================================================
-//
-// This is intentionally separate from memory_info's audit recorder.  The
-// watchdog trace answers which outer callback boundary was crossed; the audit
-// trace answers which internal observation/court stage was reached.  Entries
-// are scalar-only, allocation-free, and Payload-free.  The recurring watchdog
-// path keeps both compatibility banks in ordinary RAM1.
-
-static constexpr uint32_t SYSTEM_WATCHDOG_TRACE_MAGIC = 0x57444631UL;  // 'WDF1'
-static constexpr uint32_t SYSTEM_WATCHDOG_TRACE_SCHEMA_VERSION = 1U;
-static constexpr uint32_t SYSTEM_WATCHDOG_TRACE_ENTRIES = 16U;
-
-enum class system_watchdog_trace_stage_t : uint32_t {
-  NONE           = 0,
-  WATCHDOG_ENTER = 1,
-  NO_PENDING     = 2,
-  AUDIT_ENTER    = 3,
-  AUDIT_RETURN   = 4,
-  EMIT_BEGIN     = 5,
-  EMIT_END       = 6,
-  REARM_BEGIN    = 9,
-  REARM_END      = 10,
-  WATCHDOG_EXIT  = 11,
-};
-
-struct alignas(32) system_watchdog_trace_entry_t {
-  uint32_t sequence;
-  uint32_t sequence_inv;
-  uint32_t stage;
-  uint32_t dwt;
-  uint32_t ipsr;
-  uint32_t value0;
-  uint32_t value1;
-  uint32_t reserved;
-};
-
-static_assert(sizeof(system_watchdog_trace_entry_t) == 32U,
-              "watchdog trace entry must stay one cache line");
-
-struct alignas(32) system_watchdog_trace_bank_t {
-  uint32_t magic;
-  uint32_t magic_inv;
-  uint32_t schema_version;
-  uint32_t capacity;
-  uint32_t reserved[4];
-  system_watchdog_trace_entry_t entries[SYSTEM_WATCHDOG_TRACE_ENTRIES];
-};
-
-static_assert((sizeof(system_watchdog_trace_bank_t) % 32U) == 0U,
-              "watchdog trace bank must occupy complete cache lines");
-
-struct system_watchdog_trace_bank_snapshot_t {
-  bool valid;
-  uint32_t count;
-  uint32_t newest_sequence;
-  system_watchdog_trace_entry_t entries[SYSTEM_WATCHDOG_TRACE_ENTRIES];
-};
-
-struct system_watchdog_trace_snapshot_t {
-  system_watchdog_trace_bank_snapshot_t live;
-  system_watchdog_trace_bank_snapshot_t retained;
-};
-
-static system_watchdog_trace_bank_t g_system_watchdog_trace_live = {};
-static system_watchdog_trace_bank_t g_system_watchdog_trace_retained = {};
-static bool g_system_watchdog_trace_boot_latched = false;  // ordinary BSS
-static uint32_t g_system_watchdog_trace_next_sequence = 0U;
-
-static inline void system_watchdog_trace_dmb(void) {
-  __asm__ volatile("dmb" ::: "memory");
-}
-
-static inline uint32_t system_watchdog_trace_ipsr(void) {
-  uint32_t ipsr = 0U;
-#if defined(__arm__)
-  __asm__ volatile("mrs %0, ipsr" : "=r"(ipsr));
-#endif
-  return ipsr & 0x1FFU;
-}
-
-static bool system_watchdog_trace_bank_valid(
-    const system_watchdog_trace_bank_t& bank) {
-  return bank.magic == SYSTEM_WATCHDOG_TRACE_MAGIC &&
-         (bank.magic ^ bank.magic_inv) == 0xFFFFFFFFUL &&
-         bank.schema_version == SYSTEM_WATCHDOG_TRACE_SCHEMA_VERSION &&
-         bank.capacity == SYSTEM_WATCHDOG_TRACE_ENTRIES;
-}
-
-static bool system_watchdog_trace_entry_valid(
-    const system_watchdog_trace_entry_t& entry) {
-  return entry.sequence != 0U &&
-         (entry.sequence ^ entry.sequence_inv) == 0xFFFFFFFFUL;
-}
-
-static void system_watchdog_trace_initialize_live(void) {
-  memset((void*)&g_system_watchdog_trace_live, 0,
-         sizeof(g_system_watchdog_trace_live));
-  g_system_watchdog_trace_live.schema_version =
-      SYSTEM_WATCHDOG_TRACE_SCHEMA_VERSION;
-  g_system_watchdog_trace_live.capacity = SYSTEM_WATCHDOG_TRACE_ENTRIES;
-  g_system_watchdog_trace_live.magic_inv = ~SYSTEM_WATCHDOG_TRACE_MAGIC;
-  g_system_watchdog_trace_live.magic = SYSTEM_WATCHDOG_TRACE_MAGIC;
-  g_system_watchdog_trace_next_sequence = 0U;
-}
-
-static void system_watchdog_trace_boot_latch(void) {
-  if (g_system_watchdog_trace_boot_latched) return;
-  g_system_watchdog_trace_boot_latched = true;
-
-  // Both banks are ordinary RAM1 and were zeroed by startup.  Keep the
-  // compatibility retained surface empty and initialize the live recorder.
-  memset((void*)&g_system_watchdog_trace_retained, 0,
-         sizeof(g_system_watchdog_trace_retained));
-  system_watchdog_trace_initialize_live();
-}
-
-static void system_watchdog_trace_record(system_watchdog_trace_stage_t stage,
-                                         uint32_t value0,
-                                         uint32_t value1) {
-  system_watchdog_trace_boot_latch();
-
-  uint32_t sequence = g_system_watchdog_trace_next_sequence + 1U;
-  if (sequence == 0U) sequence = 1U;
-  g_system_watchdog_trace_next_sequence = sequence;
-
-  system_watchdog_trace_entry_t& entry =
-      g_system_watchdog_trace_live.entries[
-          (sequence - 1U) % SYSTEM_WATCHDOG_TRACE_ENTRIES];
-
-  entry.sequence = 0U;
-  entry.sequence_inv = 0U;
-  system_watchdog_trace_dmb();
-
-  entry.stage = (uint32_t)stage;
-  entry.dwt = ARM_DWT_CYCCNT;
-  entry.ipsr = system_watchdog_trace_ipsr();
-  entry.value0 = value0;
-  entry.value1 = value1;
-  entry.reserved = 0U;
-
-  entry.sequence_inv = ~sequence;
-  system_watchdog_trace_dmb();
-  entry.sequence = sequence;  // commit last
-  system_watchdog_trace_dmb();
-}
-
-static void system_watchdog_trace_snapshot_bank(
-    const system_watchdog_trace_bank_t& bank,
-    system_watchdog_trace_bank_snapshot_t* out) {
-  memset((void*)out, 0, sizeof(*out));
-  out->valid = system_watchdog_trace_bank_valid(bank);
-  if (!out->valid) return;
-
-  for (uint32_t i = 0U; i < SYSTEM_WATCHDOG_TRACE_ENTRIES; ++i) {
-    const volatile system_watchdog_trace_entry_t* source = &bank.entries[i];
-    const uint32_t sequence_before = source->sequence;
-    const uint32_t sequence_inv_before = source->sequence_inv;
-    if (sequence_before == 0U ||
-        (sequence_before ^ sequence_inv_before) != 0xFFFFFFFFUL) {
-      continue;
-    }
-
-    const system_watchdog_trace_entry_t candidate = bank.entries[i];
-    system_watchdog_trace_dmb();
-    if (source->sequence != sequence_before ||
-        source->sequence_inv != sequence_inv_before ||
-        !system_watchdog_trace_entry_valid(candidate)) {
-      continue;
-    }
-
-    uint32_t pos = out->count;
-    while (pos > 0U &&
-           out->entries[pos - 1U].sequence > candidate.sequence) {
-      out->entries[pos] = out->entries[pos - 1U];
-      --pos;
-    }
-    out->entries[pos] = candidate;
-    ++out->count;
-  }
-
-  if (out->count != 0U) {
-    out->newest_sequence = out->entries[out->count - 1U].sequence;
-  }
-}
-
-static void system_watchdog_trace_snapshot(
-    system_watchdog_trace_snapshot_t* out) {
-  if (!out) return;
-  system_watchdog_trace_boot_latch();
-  memset((void*)out, 0, sizeof(*out));
-  system_watchdog_trace_snapshot_bank(g_system_watchdog_trace_live,
-                                      &out->live);
-  system_watchdog_trace_snapshot_bank(g_system_watchdog_trace_retained,
-                                      &out->retained);
-}
-
-static void system_watchdog_trace_clear_retained(void) {
-  memset((void*)&g_system_watchdog_trace_retained, 0,
-         sizeof(g_system_watchdog_trace_retained));
-}
-
-// ============================================================================
-// Always-on memory integrity watchdog
-// ============================================================================
-
-static FLASHMEM void system_memory_watchdog_emit(void) {
-  // Stay inside Payload's eight inline entries.  If the anomaly itself is an
-  // allocator failure, the watchdog transcript must not require a heap-backed
-  // entry table merely to announce it.
-  Payload ev;
-  ev.add("schema", "SYSTEM_MEMORY_WATCHDOG_V1");
-  ev.add("source", "SYSTEM_MEMORY_WATCHDOG");
-  ev.add("reason", memory_health_reason_name(
-      g_system_memory_watchdog_health.primary_reason));
-  ev.add("reason_id", (uint32_t)g_system_memory_watchdog_health.primary_reason);
-  ev.add("audit_count", g_system_memory_watchdog_health.audit_count);
-  ev.add("reason_mask", g_system_memory_watchdog_health.latched_reason_mask);
-
-  // Two reason-specific evidence fields keep the event compact while making
-  // the first failure intelligible.  Full current state remains available
-  // through SYSTEM.MEMORY_INFO and SYSTEM.PAYLOAD_INFO.
-  switch (g_system_memory_watchdog_health.primary_reason) {
-    case memory_health_reason_t::STACK_PAINT_UNAVAILABLE:
-      ev.add("paint_compiled",
-             g_system_memory_watchdog_health.stack_paint_compiled_enabled);
-      ev.add("paint_enabled",
-             g_system_memory_watchdog_health.stack_paint_enabled);
-      break;
-
-    case memory_health_reason_t::STACK_PAINT_OVERRUN:
-    case memory_health_reason_t::STACK_RUNWAY_CRITICAL:
-      ev.add("stack_free_high_water",
-             g_system_memory_watchdog_health.stack_free_high_water);
-      ev.add("stack_paint_overrun",
-             g_system_memory_watchdog_health.stack_paint_overrun);
-      break;
-
-    case memory_health_reason_t::HEAP_MAP_INVALID:
-    case memory_health_reason_t::HEAP_FREE_CRITICAL:
-      ev.add("heap_free_total",
-             g_system_memory_watchdog_health.heap_free_total);
-      ev.add("heap_free_critical",
-             g_system_memory_watchdog_health.heap_free_critical_bytes);
-      break;
-
-    case memory_health_reason_t::PAYLOAD_SELF_OK_FAIL:
-      ev.add("payload_self_ok_fail",
-             g_system_memory_watchdog_health.payload_self_ok_fail);
-      ev.add("payload_self_reason",
-             g_system_memory_watchdog_health.payload_last_self_ok_fail_reason);
-      break;
-
-    case memory_health_reason_t::PAYLOAD_STRING_POINTER_FAULT:
-      ev.add("payload_pointer_fault",
-             g_system_memory_watchdog_health.payload_string_pointer_fault);
-      ev.add("payload_pointer_reason",
-             g_system_memory_watchdog_health.payload_last_string_pointer_fault_reason);
-      break;
-
-    case memory_health_reason_t::PAYLOAD_LIFETIME_MISMATCH:
-      ev.add("payload_constructed",
-             g_system_memory_watchdog_health.payload_instances_constructed);
-      ev.add("payload_destroyed",
-             g_system_memory_watchdog_health.payload_instances_destroyed);
-      break;
-
-    default:
-      ev.add("payload_last_error",
-             g_system_memory_watchdog_health.payload_last_error_code);
-      ev.add("heap_free_total",
-             g_system_memory_watchdog_health.heap_free_total);
-      break;
-  }
-
-  enqueueEvent("WATCHDOG_ANOMALY", ev);
-  g_system_memory_watchdog_event_count++;
-}
-
-static FLASHMEM void system_memory_watchdog_alap_cb(timepop_ctx_t*,
-                                                    timepop_diag_t*,
-                                                    void*) {
-  // Retry stack-watch arming just before the audit window the boot-crash
-  // investigation identified as the strike zone.  No-op once armed.
-  crash_stack_watch_service();
-
-  system_watchdog_trace_record(
-      system_watchdog_trace_stage_t::WATCHDOG_ENTER,
-      g_system_memory_watchdog_alap_pending ? 1U : 0U,
-      g_system_memory_watchdog_alap_run_count);
-
-  g_system_memory_watchdog_alap_armed = false;
-
-  if (!g_system_memory_watchdog_alap_pending) {
-    system_watchdog_trace_record(
-        system_watchdog_trace_stage_t::NO_PENDING,
-        g_system_memory_watchdog_alap_arm_count,
-        g_system_memory_watchdog_alap_arm_failures);
-    system_watchdog_trace_record(
-        system_watchdog_trace_stage_t::WATCHDOG_EXIT,
-        g_system_memory_watchdog_alap_run_count,
-        (uint32_t)g_system_memory_watchdog_health.status);
-    return;
-  }
-
-  g_system_memory_watchdog_alap_pending = false;
-  g_system_memory_watchdog_alap_run_count++;
-
-  // All allocator-, Payload-, and publication-bearing work belongs here in
-  // serialized foreground context, never in the timed callback.
-  system_watchdog_trace_record(
-      system_watchdog_trace_stage_t::AUDIT_ENTER,
-      g_system_memory_watchdog_health.audit_count + 1U,
-      (uint32_t)g_system_memory_watchdog_health.status);
-  memory_info_audit(&g_system_memory_watchdog_health);
-  system_watchdog_trace_record(
-      system_watchdog_trace_stage_t::AUDIT_RETURN,
-      (uint32_t)g_system_memory_watchdog_health.status,
-      g_system_memory_watchdog_health.audit_count);
-
-  if (g_system_memory_watchdog_health.status ==
-          memory_health_status_t::ANOMALY &&
-      !g_system_memory_watchdog_event_emitted) {
-    // Latch before constructing the event so a Payload failure during the
-    // best-effort anomaly transcript cannot create a recursive event storm.
-    g_system_memory_watchdog_event_emitted = true;
-    system_watchdog_trace_record(
-        system_watchdog_trace_stage_t::EMIT_BEGIN,
-        (uint32_t)g_system_memory_watchdog_health.primary_reason,
-        g_system_memory_watchdog_health.latched_reason_mask);
-    system_memory_watchdog_emit();
-    system_watchdog_trace_record(
-        system_watchdog_trace_stage_t::EMIT_END,
-        g_system_memory_watchdog_event_count,
-        g_system_memory_watchdog_event_emitted ? 1U : 0U);
-  }
-
-  // Payload mutators only leave scalar incidents.  Convert at most one into
-  // a durable event here, after the audit, from serialized foreground context.
-  // The event builder runs under Payload's incident-suppression guard so a
-  // diagnostic Payload failure cannot recursively diagnose itself.
-  system_payload_contract_service();
-
-  // If another timed fire arrived while this ALAP service was running, arrange
-  // one more serialized pass rather than doing nested work here.
-  if (g_system_memory_watchdog_alap_pending) {
-    system_watchdog_trace_record(
-        system_watchdog_trace_stage_t::REARM_BEGIN,
-        g_system_memory_watchdog_alap_arm_count,
-        g_system_memory_watchdog_alap_arm_failures);
-    system_memory_watchdog_schedule_alap();
-    system_watchdog_trace_record(
-        system_watchdog_trace_stage_t::REARM_END,
-        g_system_memory_watchdog_alap_armed ? 1U : 0U,
-        g_system_memory_watchdog_alap_arm_failures);
-  }
-
-  system_watchdog_trace_record(
-      system_watchdog_trace_stage_t::WATCHDOG_EXIT,
-      g_system_memory_watchdog_alap_run_count,
-      (uint32_t)g_system_memory_watchdog_health.status);
-}
-
-static void system_memory_watchdog_schedule_alap(void) {
-  if (g_system_memory_watchdog_alap_armed) {
-    return;
-  }
-
-  const timepop_handle_t handle =
-      timepop_arm_alap(system_memory_watchdog_alap_cb,
-                       nullptr,
-                       "SYSTEM_MEMORY_WATCHDOG_ALAP");
-  if (handle == TIMEPOP_INVALID_HANDLE) {
-    g_system_memory_watchdog_alap_arm_failures++;
-    return;
-  }
-
-  g_system_memory_watchdog_alap_armed = true;
-  g_system_memory_watchdog_alap_arm_count++;
-}
-
-static FLASHMEM void system_memory_watchdog_cb(timepop_ctx_t* ctx,
-                                               timepop_diag_t*,
-                                               void*) {
-  // Timed/ISR path: scalar bookkeeping only.  No mallinfo(), Payload,
-  // formatting, publish(), transport work, or heap interaction.
-  g_system_memory_watchdog_callback_count++;
-  if (ctx) {
-    g_system_memory_watchdog_last_fire_gnss_ns = ctx->fire_gnss_ns;
-    g_system_memory_watchdog_last_fire_dwt = ctx->fire_dwt_cyccnt;
-  }
-
-  g_system_memory_watchdog_alap_pending = true;
-  system_memory_watchdog_schedule_alap();
-}
-
-static void system_memory_watchdog_arm(void) {
-  system_dmamem_ensure_initialized();
-  if (g_system_memory_watchdog_armed) return;
-
-  g_system_memory_watchdog_arm_attempts++;
-  g_system_memory_watchdog_handle = timepop_arm(
-      SYSTEM_MEMORY_WATCHDOG_PERIOD_NS,
-      true,
-      system_memory_watchdog_cb,
-      nullptr,
-      "SYSTEM_MEMORY_WATCHDOG");
-
-  if (g_system_memory_watchdog_handle == TIMEPOP_INVALID_HANDLE) {
-    g_system_memory_watchdog_arm_failures++;
-    return;
-  }
-
-  g_system_memory_watchdog_armed = true;
-}
 
 // --------------------------------------------------------------
 // FEATURE_STATUS_FRAGMENT publication custody
@@ -2029,112 +1581,11 @@ static FLASHMEM Payload system_runtime_ledger_payload(void) {
   return out;
 }
 
-// ============================================================================
-// Retained memory-audit / watchdog traces — reporting surface
-// ============================================================================
-
-static memory_audit_trace_snapshot_t
-    g_system_memory_audit_trace_scratch DMAMEM;
-static system_watchdog_trace_snapshot_t
-    g_system_watchdog_trace_scratch DMAMEM;
 
 static constexpr uint32_t SYSTEM_TRACE_REPORT_DEFAULT_COUNT = 8U;
 static constexpr uint32_t SYSTEM_TRACE_REPORT_MAX_COUNT = 8U;
 
-static const char* system_memory_audit_trace_stage_name(uint32_t stage) {
-  switch ((memory_audit_trace_stage_t)stage) {
-    case memory_audit_trace_stage_t::AUDIT_ENTER:        return "AUDIT_ENTER";
-    case memory_audit_trace_stage_t::MEMORY_GET_ENTER:   return "MEMORY_GET_ENTER";
-    case memory_audit_trace_stage_t::STACK_SNAPSHOT:     return "STACK_SNAPSHOT";
-    case memory_audit_trace_stage_t::STACK_PAINT_SCAN:   return "STACK_PAINT_SCAN";
-    case memory_audit_trace_stage_t::HEAP_INFO:          return "HEAP_INFO";
-    case memory_audit_trace_stage_t::MEMORY_GET_EXIT:    return "MEMORY_GET_EXIT";
-    case memory_audit_trace_stage_t::PAYLOAD_INFO_ENTER: return "PAYLOAD_INFO_ENTER";
-    case memory_audit_trace_stage_t::PAYLOAD_INFO_RETURN:return "PAYLOAD_INFO_RETURN";
-    case memory_audit_trace_stage_t::PAYLOAD_SELF_OK:    return "PAYLOAD_SELF_OK";
-    case memory_audit_trace_stage_t::STRING_POINTERS:    return "STRING_POINTERS";
-    case memory_audit_trace_stage_t::HEALTH_RULES:       return "HEALTH_RULES";
-    case memory_audit_trace_stage_t::HEALTH_COMMIT:      return "HEALTH_COMMIT";
-    case memory_audit_trace_stage_t::OUTPUT_COPY:        return "OUTPUT_COPY";
-    case memory_audit_trace_stage_t::AUDIT_EXIT:         return "AUDIT_EXIT";
-    default:                                              return "NONE";
-  }
-}
 
-static const char* system_memory_audit_trace_value_meaning(uint32_t stage) {
-  switch ((memory_audit_trace_stage_t)stage) {
-    case memory_audit_trace_stage_t::AUDIT_ENTER:
-      return "next_audit_count|prior_health_status";
-    case memory_audit_trace_stage_t::MEMORY_GET_ENTER:
-      return "stack_pointer|sampled_low_water";
-    case memory_audit_trace_stage_t::STACK_SNAPSHOT:
-      return "stack_free_current|stack_current";
-    case memory_audit_trace_stage_t::STACK_PAINT_SCAN:
-      return "paint_start|paint_end";
-    case memory_audit_trace_stage_t::HEAP_INFO:
-      return "ram2_start|ram2_end";
-    case memory_audit_trace_stage_t::MEMORY_GET_EXIT:
-      return "stack_free_high_water|heap_free_total";
-    case memory_audit_trace_stage_t::PAYLOAD_INFO_ENTER:
-      return "prior_payload_alive|prior_payload_last_error";
-    case memory_audit_trace_stage_t::PAYLOAD_INFO_RETURN:
-      return "payload_alive|payload_last_error";
-    case memory_audit_trace_stage_t::PAYLOAD_SELF_OK:
-      return "self_ok_fail|integrity_fail";
-    case memory_audit_trace_stage_t::STRING_POINTERS:
-      return "string_pointer_fault|last_pointer_reason";
-    case memory_audit_trace_stage_t::HEALTH_RULES:
-      return "map_flags|payload_lifetime_mismatch";
-    case memory_audit_trace_stage_t::HEALTH_COMMIT:
-      return "active_reason_mask|primary_reason_id";
-    case memory_audit_trace_stage_t::OUTPUT_COPY:
-      return "out_present|audit_count";
-    case memory_audit_trace_stage_t::AUDIT_EXIT:
-      return "audit_count|health_status";
-    default:
-      return "raw";
-  }
-}
-
-static const char* system_watchdog_trace_stage_name(uint32_t stage) {
-  switch ((system_watchdog_trace_stage_t)stage) {
-    case system_watchdog_trace_stage_t::WATCHDOG_ENTER: return "WATCHDOG_ENTER";
-    case system_watchdog_trace_stage_t::NO_PENDING:     return "NO_PENDING";
-    case system_watchdog_trace_stage_t::AUDIT_ENTER:    return "AUDIT_ENTER";
-    case system_watchdog_trace_stage_t::AUDIT_RETURN:   return "AUDIT_RETURN";
-    case system_watchdog_trace_stage_t::EMIT_BEGIN:     return "EMIT_BEGIN";
-    case system_watchdog_trace_stage_t::EMIT_END:       return "EMIT_END";
-    case system_watchdog_trace_stage_t::REARM_BEGIN:    return "REARM_BEGIN";
-    case system_watchdog_trace_stage_t::REARM_END:      return "REARM_END";
-    case system_watchdog_trace_stage_t::WATCHDOG_EXIT:  return "WATCHDOG_EXIT";
-    default:                                             return "NONE";
-  }
-}
-
-static const char* system_watchdog_trace_value_meaning(uint32_t stage) {
-  switch ((system_watchdog_trace_stage_t)stage) {
-    case system_watchdog_trace_stage_t::WATCHDOG_ENTER:
-      return "pending|prior_run_count";
-    case system_watchdog_trace_stage_t::NO_PENDING:
-      return "alap_arm_count|alap_arm_failures";
-    case system_watchdog_trace_stage_t::AUDIT_ENTER:
-      return "next_audit_count|prior_health_status";
-    case system_watchdog_trace_stage_t::AUDIT_RETURN:
-      return "health_status|audit_count";
-    case system_watchdog_trace_stage_t::EMIT_BEGIN:
-      return "primary_reason_id|latched_reason_mask";
-    case system_watchdog_trace_stage_t::EMIT_END:
-      return "event_count|event_emitted";
-    case system_watchdog_trace_stage_t::REARM_BEGIN:
-      return "alap_arm_count|alap_arm_failures";
-    case system_watchdog_trace_stage_t::REARM_END:
-      return "alap_armed|alap_arm_failures";
-    case system_watchdog_trace_stage_t::WATCHDOG_EXIT:
-      return "run_count|health_status";
-    default:
-      return "raw";
-  }
-}
 
 static uint32_t system_trace_report_count(const Payload& args) {
   uint32_t count = args.has("count")
@@ -2177,206 +1628,6 @@ static void system_trace_bounds(uint32_t available,
   const uint32_t begin = end > requested ? end - requested : 0U;
   if (out_begin) *out_begin = begin;
   if (out_end) *out_end = end;
-}
-
-static FLASHMEM Payload system_memory_audit_trace_entry_payload(
-    const memory_audit_trace_entry_t& entry) {
-  Payload out;
-  out.add("sequence", entry.sequence);
-  out.add("stage_id", entry.stage);
-  out.add("stage", system_memory_audit_trace_stage_name(entry.stage));
-  system_crash_add_hex32(out, "dwt", entry.dwt);
-  out.add("ipsr", entry.ipsr);
-  system_crash_add_hex32(out, "value0", entry.value0);
-  system_crash_add_hex32(out, "value1", entry.value1);
-  out.add("value_meaning",
-          system_memory_audit_trace_value_meaning(entry.stage));
-  return out;
-}
-
-static FLASHMEM Payload system_watchdog_trace_entry_payload(
-    const system_watchdog_trace_entry_t& entry) {
-  Payload out;
-  out.add("sequence", entry.sequence);
-  out.add("stage_id", entry.stage);
-  out.add("stage", system_watchdog_trace_stage_name(entry.stage));
-  system_crash_add_hex32(out, "dwt", entry.dwt);
-  out.add("ipsr", entry.ipsr);
-  system_crash_add_hex32(out, "value0", entry.value0);
-  system_crash_add_hex32(out, "value1", entry.value1);
-  out.add("value_meaning", system_watchdog_trace_value_meaning(entry.stage));
-  return out;
-}
-
-static FLASHMEM Payload system_memory_audit_trace_bank_payload(
-    const memory_audit_trace_bank_snapshot_t& bank,
-    const char* bank_name,
-    uint32_t requested,
-    uint32_t offset_from_newest) {
-  uint32_t begin = 0U;
-  uint32_t end = 0U;
-  system_trace_bounds(bank.count, requested, offset_from_newest, &begin, &end);
-
-  Payload out;
-  out.add("bank", bank_name);
-  out.add("valid", bank.valid);
-  out.add("capacity", MEMORY_AUDIT_TRACE_ENTRIES);
-  out.add("available_count", bank.count);
-  out.add("newest_sequence", bank.newest_sequence);
-  out.add("requested_count", requested);
-  out.add("returned_count", end - begin);
-  out.add("offset_from_newest", offset_from_newest);
-  out.add("has_older", begin != 0U);
-  out.add("has_newer", offset_from_newest != 0U && bank.count != 0U);
-  out.add("first_sequence", begin < end ? bank.entries[begin].sequence : 0U);
-  out.add("last_sequence", begin < end ? bank.entries[end - 1U].sequence : 0U);
-
-  PayloadArray records;
-  for (uint32_t i = begin; i < end; ++i) {
-    Payload record = system_memory_audit_trace_entry_payload(bank.entries[i]);
-    record.add("bank_index", i);
-    records.add(record);
-  }
-  out.add_array("records", records);
-  return out;
-}
-
-static FLASHMEM Payload system_watchdog_trace_bank_payload(
-    const system_watchdog_trace_bank_snapshot_t& bank,
-    const char* bank_name,
-    uint32_t requested,
-    uint32_t offset_from_newest) {
-  uint32_t begin = 0U;
-  uint32_t end = 0U;
-  system_trace_bounds(bank.count, requested, offset_from_newest, &begin, &end);
-
-  Payload out;
-  out.add("bank", bank_name);
-  out.add("valid", bank.valid);
-  out.add("capacity", SYSTEM_WATCHDOG_TRACE_ENTRIES);
-  out.add("available_count", bank.count);
-  out.add("newest_sequence", bank.newest_sequence);
-  out.add("requested_count", requested);
-  out.add("returned_count", end - begin);
-  out.add("offset_from_newest", offset_from_newest);
-  out.add("has_older", begin != 0U);
-  out.add("has_newer", offset_from_newest != 0U && bank.count != 0U);
-  out.add("first_sequence", begin < end ? bank.entries[begin].sequence : 0U);
-  out.add("last_sequence", begin < end ? bank.entries[end - 1U].sequence : 0U);
-
-  PayloadArray records;
-  for (uint32_t i = begin; i < end; ++i) {
-    Payload record = system_watchdog_trace_entry_payload(bank.entries[i]);
-    record.add("bank_index", i);
-    records.add(record);
-  }
-  out.add_array("records", records);
-  return out;
-}
-
-static FLASHMEM Payload system_memory_audit_trace_summary_payload(void) {
-  memory_audit_trace_snapshot(&g_system_memory_audit_trace_scratch);
-  const memory_audit_trace_bank_snapshot_t& retained =
-      g_system_memory_audit_trace_scratch.retained;
-
-  Payload out;
-  out.add("schema", "ZPNET_MEMORY_AUDIT_TRACE_SUMMARY_V1");
-  out.add("retained_valid", retained.valid);
-  out.add("retained_count", retained.count);
-  out.add("newest_sequence", retained.newest_sequence);
-  if (retained.valid && retained.count != 0U) {
-    out.add_object("newest",
-                   system_memory_audit_trace_entry_payload(
-                       retained.entries[retained.count - 1U]));
-  }
-  return out;
-}
-
-static FLASHMEM Payload system_watchdog_trace_summary_payload(void) {
-  system_watchdog_trace_snapshot(&g_system_watchdog_trace_scratch);
-  const system_watchdog_trace_bank_snapshot_t& retained =
-      g_system_watchdog_trace_scratch.retained;
-
-  Payload out;
-  out.add("schema", "ZPNET_MEMORY_WATCHDOG_TRACE_SUMMARY_V1");
-  out.add("retained_valid", retained.valid);
-  out.add("retained_count", retained.count);
-  out.add("newest_sequence", retained.newest_sequence);
-  if (retained.valid && retained.count != 0U) {
-    out.add_object("newest",
-                   system_watchdog_trace_entry_payload(
-                       retained.entries[retained.count - 1U]));
-  }
-  return out;
-}
-
-static FLASHMEM Payload system_memory_audit_info_payload(const Payload& args) {
-  const char* source = args.getString("source");
-  const bool audit_source =
-      !source || !*source || system_cstr_equal_ci(source, "audit");
-  const bool watchdog_source =
-      source && system_cstr_equal_ci(source, "watchdog");
-  if (!audit_source && !watchdog_source) {
-    Payload error;
-    error.add("error", "source must be audit or watchdog");
-    return error;
-  }
-
-  bool bank_valid = true;
-  const bool live_bank = system_trace_report_live_bank(args, &bank_valid);
-  if (!bank_valid) {
-    Payload error;
-    error.add("error", "bank must be live or retained");
-    return error;
-  }
-
-  const uint32_t requested = system_trace_report_count(args);
-  const uint32_t offset = system_trace_report_offset(args);
-  const char* bank_name = live_bank ? "live" : "retained";
-
-  Payload out;
-  out.add("schema", "ZPNET_MEMORY_AUDIT_INFO_V1");
-  out.add("source", audit_source ? "audit" : "watchdog");
-
-  if (audit_source) {
-    memory_audit_trace_snapshot(&g_system_memory_audit_trace_scratch);
-    const memory_audit_trace_bank_snapshot_t& bank = live_bank
-        ? g_system_memory_audit_trace_scratch.live
-        : g_system_memory_audit_trace_scratch.retained;
-    out.add_object("trace",
-                   system_memory_audit_trace_bank_payload(
-                       bank, bank_name, requested, offset));
-  } else {
-    system_watchdog_trace_snapshot(&g_system_watchdog_trace_scratch);
-    const system_watchdog_trace_bank_snapshot_t& bank = live_bank
-        ? g_system_watchdog_trace_scratch.live
-        : g_system_watchdog_trace_scratch.retained;
-    out.add_object("trace",
-                   system_watchdog_trace_bank_payload(
-                       bank, bank_name, requested, offset));
-  }
-
-  Payload health;
-  health.add("status",
-             memory_health_status_name(g_system_memory_watchdog_health.status));
-  health.add("reason",
-             memory_health_reason_name(
-                 g_system_memory_watchdog_health.primary_reason));
-  health.add("audit_count", g_system_memory_watchdog_health.audit_count);
-  health.add("latched_reason_mask",
-             g_system_memory_watchdog_health.latched_reason_mask);
-  out.add_object("health", health);
-
-  Payload watchdog;
-  watchdog.add("alap_pending", (bool)g_system_memory_watchdog_alap_pending);
-  watchdog.add("alap_armed", (bool)g_system_memory_watchdog_alap_armed);
-  watchdog.add("alap_run_count", g_system_memory_watchdog_alap_run_count);
-  watchdog.add("alap_arm_count", g_system_memory_watchdog_alap_arm_count);
-  watchdog.add("alap_arm_failures",
-               g_system_memory_watchdog_alap_arm_failures);
-  watchdog.add("event_count", g_system_memory_watchdog_event_count);
-  out.add_object("watchdog", watchdog);
-  return out;
 }
 
 // ============================================================================
@@ -3046,52 +2297,6 @@ static FLASHMEM Payload system_payload_contract_summary_payload(void) {
   return out;
 }
 
-static void system_payload_contract_service(void) {
-  payload_contract_event_t pending{};
-  if (!payload_contract_event_peek(&pending)) return;
-  const payload_contract_incident_t& incident = pending.incident;
-
-  // Keep the compact numeric identity for compatibility, but make the event
-  // self-decoding and attach the bounded serialization clue captured at the
-  // original failure boundary.  Prefix capture is best effort: handler-context
-  // incidents, ambiguous object kinds, and structurally unsafe objects report
-  // payload_prefix_valid=false rather than risking a diagnostic recursion.
-  //
-  // Keep suppression active through the diagnostic Payload destructor as well
-  // as construction and enqueue, so cleanup cannot recursively diagnose the
-  // object that was created only to report the original incident.
-  payload_contract_event_begin();
-  bool ok = false;
-  {
-    Payload event;
-    ok = event.add("schema", "ZPNET_PAYLOAD_CONTRACT_V1");
-    if (ok) ok = event.add("sequence", incident.sequence);
-    if (ok) ok = event.add("phase_id", incident.phase);
-    if (ok) ok = event.add("phase",
-                           payload_contract_phase_name(incident.phase));
-    if (ok) ok = event.add("reason_id", incident.reason);
-    if (ok) ok = event.add("reason",
-                           payload_contract_reason_name(incident.reason));
-    if (ok) ok = event.add("operation_id", incident.operation_id);
-    if (ok) ok = event.add(
-        "operation", payload_operation_id_name(incident.operation_id));
-    if (ok) ok = event.add("object", incident.object_ptr);
-    if (ok) ok = event.add("generation", incident.generation);
-    if (ok) {
-      ok = event.add("payload_prefix_valid",
-                     pending.payload_prefix_valid != 0U);
-    }
-    if (ok) {
-      ok = event.add("payload_prefix_truncated",
-                     pending.payload_prefix_truncated != 0U);
-    }
-    if (ok) ok = event.add("payload_prefix", pending.payload_prefix);
-
-    if (ok) ok = event.contract_valid();
-    if (ok) enqueueEvent("PAYLOAD_CONTRACT_ANOMALY", event);
-  }
-  payload_contract_event_end(ok);
-}
 
 static bool g_system_crash_report_captured = false;
 static bool g_system_crash_report_core_fault_present = false;
@@ -3320,16 +2525,11 @@ static FLASHMEM Payload system_crash_report_payload(bool include_text) {
   }
   p.add_object("extended", system_crash_forensics_payload());
 
-  // Runtime breadcrumbs, unified Execution Trace, memory-audit history,
-  // and Payload forensics remain retained through reboot beside the processor
-  // exception evidence.
+  // Runtime breadcrumbs, unified Execution Trace, and Payload forensics remain
+  // retained through reboot beside the processor exception evidence.
   p.add_object("runtime_ledger", system_runtime_ledger_payload());
   p.add_object("execution_trace",
                system_execution_trace_summary_payload());
-  p.add_object("memory_audit_trace",
-               system_memory_audit_trace_summary_payload());
-  p.add_object("memory_watchdog_trace",
-               system_watchdog_trace_summary_payload());
   p.add_object("payload_flight", system_payload_flight_payload(true));
   p.add_object("payload_append_trace",
                system_payload_append_trace_summary_payload());
@@ -3504,23 +2704,6 @@ static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
   p.add("feature_status_fragment_service_arm_count", g_system_feature_fragment_service_arm_count);
   p.add("feature_status_fragment_service_arm_failures", g_system_feature_fragment_service_arm_failures);
 
-  p.add("memory_watchdog_armed", g_system_memory_watchdog_armed);
-  p.add("memory_watchdog_handle", g_system_memory_watchdog_handle);
-  p.add("memory_watchdog_period_ns", SYSTEM_MEMORY_WATCHDOG_PERIOD_NS);
-  p.add("memory_watchdog_arm_attempts", g_system_memory_watchdog_arm_attempts);
-  p.add("memory_watchdog_arm_failures", g_system_memory_watchdog_arm_failures);
-  p.add("memory_watchdog_callback_count", g_system_memory_watchdog_callback_count);
-  p.add("memory_watchdog_event_emitted", g_system_memory_watchdog_event_emitted);
-  p.add("memory_watchdog_event_count", g_system_memory_watchdog_event_count);
-  p.add("memory_watchdog_alap_pending", (bool)g_system_memory_watchdog_alap_pending);
-  p.add("memory_watchdog_alap_armed", (bool)g_system_memory_watchdog_alap_armed);
-  p.add("memory_watchdog_alap_arm_count", g_system_memory_watchdog_alap_arm_count);
-  p.add("memory_watchdog_alap_arm_failures", g_system_memory_watchdog_alap_arm_failures);
-  p.add("memory_watchdog_alap_run_count", g_system_memory_watchdog_alap_run_count);
-  p.add("memory_health_status",
-        memory_health_status_name(g_system_memory_watchdog_health.status));
-  p.add("memory_health_reason",
-        memory_health_reason_name(g_system_memory_watchdog_health.primary_reason));
 
   // Legacy accounted callback-busy diagnostics.
   p.add("cpu_accounted_busy_pct",
@@ -4107,9 +3290,6 @@ static FLASHMEM Payload cmd_payload_info(const Payload& /*args*/) {
   return p;
 }
 
-// SYSTEM.MEMORY_INFO measures the stack, so its snapshot storage must not live
-// on the stack being measured.  Keep the memory_info_t output buffer in RAM2.
-static memory_info_t g_system_memory_info_scratch DMAMEM = {};
 
 static void system_dmamem_ensure_initialized(void) {
   if (g_system_dmamem_initialized) return;
@@ -4120,16 +3300,9 @@ static void system_dmamem_ensure_initialized(void) {
   // This function remains lazy because those publishers run before
   // process_system_register().
   runtime_ledger_boot_latch();
-  system_watchdog_trace_boot_latch();
-  g_system_memory_watchdog_health = memory_health_t{};
   system_feature_registry_reset();
   memset(g_system_crash_report_text, 0, sizeof(g_system_crash_report_text));
   memset(g_system_debug_buffer, 0, sizeof(g_system_debug_buffer));
-  g_system_memory_info_scratch = memory_info_t{};
-  memset((void*)&g_system_memory_audit_trace_scratch, 0,
-         sizeof(g_system_memory_audit_trace_scratch));
-  memset((void*)&g_system_watchdog_trace_scratch, 0,
-         sizeof(g_system_watchdog_trace_scratch));
   memset((void*)&g_system_timepop_dispatch_trace_scratch, 0,
          sizeof(g_system_timepop_dispatch_trace_scratch));
   memset((void*)&g_system_payload_append_trace_scratch, 0,
@@ -4142,194 +3315,9 @@ static void system_dmamem_ensure_initialized(void) {
   // The same custody applies to Payload flight rings and Payload append-trace
   // banks in payload.cpp: those remaining NOLOAD records are validated before
   // use and released only by explicit CRASH_CLEAR or their one-time boot latch.
-  // Runtime, memory-audit/watchdog, and TimePop live recorders are RAM1 in this
-  // deterministic-memory baseline and intentionally do not survive reboot.
+  // Runtime and TimePop live recorders are RAM1 in this deterministic-memory
+  // baseline and intentionally do not survive reboot.
   g_system_dmamem_initialized = true;
-}
-
-// ============================================================================
-// cmd_memory_info — ZPNet SYSTEM command handler
-// ============================================================================
-//
-// Register in your SYSTEM process command table as:
-//
-//   { "MEMORY_INFO", cmd_memory_info },
-//
-// Call memory_info_init() once in setup() BEFORE other initialization.
-//
-// Query from Pi:
-//   .tc system memory_info
-//
-// Semantics:
-//   • Read-only
-//   • Snapshot-only
-//   • No inference
-//   • No allocation beyond Payload
-//   • No transport emission
-// ============================================================================
-
-static FLASHMEM Payload cmd_memory_info(const Payload& /*args*/) {
-
-    memory_info_get(&g_system_memory_info_scratch);
-    memory_info_get_health(&g_system_memory_watchdog_health);
-    const memory_info_t& info = g_system_memory_info_scratch;
-    const memory_health_t& health = g_system_memory_watchdog_health;
-
-    Payload p;
-
-    // ==========================================================
-    // DTCM / Stack
-    // ==========================================================
-
-    p.add("dtcm_total",          info.dtcm_total);
-    p.add("dtcm_static",         info.dtcm_static);
-    p.add("dtcm_stack_avail",    info.dtcm_stack_avail);
-    p.add("memory_info_initialized", info.initialized);
-    p.add_fmt("stack_init_sp", "0x%08lX",
-              (unsigned long)info.stack_init_sp);
-
-    p.add("stack_current",       info.stack_current);
-    p.add("stack_high_water",    info.stack_high_water);
-    p.add("stack_usage_pct",     info.stack_usage_pct);
-    p.add("stack_free_pct",      info.stack_free_pct);
-    p.add("stack_free_current",  info.stack_free_current);
-    p.add("stack_free_high_water", info.stack_free_high_water);
-    p.add("stack_collision_warn_bytes", info.stack_collision_warn_bytes);
-    p.add("stack_collision_risk", info.stack_collision_risk);
-
-    p.add("stack_paint_compiled_enabled", info.stack_paint_compiled_enabled);
-    p.add("stack_paint_enabled",      info.stack_paint_enabled);
-    p.add("stack_paint_overrun",      info.stack_paint_overrun);
-    p.add("stack_paint_skip_reason",  info.stack_paint_skip_reason);
-    p.add("stack_paint_skip_reason_name",
-          info.stack_paint_skip_reason_name ?
-              info.stack_paint_skip_reason_name : "UNKNOWN");
-    p.add_fmt("stack_paint_pattern", "0x%08lX",
-              (unsigned long)info.stack_paint_pattern);
-    p.add_fmt("stack_paint_start", "0x%08lX",
-              (unsigned long)info.stack_paint_start);
-    p.add_fmt("stack_paint_end", "0x%08lX",
-              (unsigned long)info.stack_paint_end);
-    p.add_fmt("stack_paint_deepest_addr", "0x%08lX",
-              (unsigned long)info.stack_paint_deepest_addr);
-    p.add("stack_paint_guard_bytes", info.stack_paint_guard_bytes);
-    p.add("stack_paint_static_guard_bytes", info.stack_paint_static_guard_bytes);
-    p.add("stack_paint_window_bytes", info.stack_paint_window_bytes);
-    p.add("stack_paint_bytes",       info.stack_paint_bytes);
-    p.add("stack_paint_used",        info.stack_paint_used);
-    p.add("stack_paint_unused",      info.stack_paint_unused);
-    p.add("stack_paint_clobbered",   info.stack_paint_clobbered);
-
-    // ==========================================================
-    // Heap (RAM2)
-    // ==========================================================
-
-    p.add("heap_total",          info.heap_total);
-    p.add("heap_arena",          info.heap_arena);
-    p.add("heap_used",           info.heap_used);
-    p.add("heap_free_internal",  info.heap_free_internal);
-    p.add("heap_free_above",     info.heap_free_above);
-    p.add("heap_free_total",     info.heap_free_total);
-
-    p.add("heap_arena_high_water", info.heap_arena_high_water);
-
-    // ==========================================================
-    // Health indicators
-    // ==========================================================
-
-    p.add("heap_fragmentation_pct", info.heap_fragmentation_pct);
-    p.add("heap_growing",           info.heap_growing);
-
-    // ==========================================================
-    // Always-on memory watchdog validation surface
-    // ==========================================================
-
-    p.add("memory_watchdog_armed", g_system_memory_watchdog_armed);
-    p.add("memory_watchdog_handle", g_system_memory_watchdog_handle);
-    p.add("memory_watchdog_period_ns", SYSTEM_MEMORY_WATCHDOG_PERIOD_NS);
-    p.add("memory_watchdog_arm_attempts", g_system_memory_watchdog_arm_attempts);
-    p.add("memory_watchdog_arm_failures", g_system_memory_watchdog_arm_failures);
-    p.add("memory_watchdog_callback_count", g_system_memory_watchdog_callback_count);
-    p.add("memory_watchdog_event_emitted", g_system_memory_watchdog_event_emitted);
-    p.add("memory_watchdog_event_count", g_system_memory_watchdog_event_count);
-    p.add("memory_watchdog_alap_pending",
-          (bool)g_system_memory_watchdog_alap_pending);
-    p.add("memory_watchdog_alap_armed",
-          (bool)g_system_memory_watchdog_alap_armed);
-    p.add("memory_watchdog_alap_arm_count",
-          g_system_memory_watchdog_alap_arm_count);
-    p.add("memory_watchdog_alap_arm_failures",
-          g_system_memory_watchdog_alap_arm_failures);
-    p.add("memory_watchdog_alap_run_count",
-          g_system_memory_watchdog_alap_run_count);
-    p.add("memory_watchdog_last_fire_gnss_ns",
-          g_system_memory_watchdog_last_fire_gnss_ns);
-    p.add_fmt("memory_watchdog_last_fire_dwt", "0x%08lX",
-              (unsigned long)g_system_memory_watchdog_last_fire_dwt);
-
-    p.add("memory_health_status", memory_health_status_name(health.status));
-    p.add("memory_health_anomaly",
-          health.status == memory_health_status_t::ANOMALY);
-    p.add("memory_health_latched", health.latched);
-    p.add("memory_health_primary_reason_id", (uint32_t)health.primary_reason);
-    p.add("memory_health_primary_reason",
-          memory_health_reason_name(health.primary_reason));
-    p.add("memory_health_active_reason_mask", health.active_reason_mask);
-    p.add("memory_health_latched_reason_mask", health.latched_reason_mask);
-    p.add("memory_health_audit_count", health.audit_count);
-    p.add("memory_health_anomaly_audit_count", health.anomaly_audit_count);
-    p.add("memory_health_first_anomaly_audit", health.first_anomaly_audit);
-    p.add("memory_health_last_anomaly_audit", health.last_anomaly_audit);
-    p.add("memory_health_heap_free_critical_bytes",
-          health.heap_free_critical_bytes);
-    p.add("memory_health_last_stack_free_high_water",
-          health.stack_free_high_water);
-    p.add("memory_health_last_stack_paint_overrun",
-          health.stack_paint_overrun);
-    p.add("memory_health_last_stack_collision_risk",
-          health.stack_collision_risk);
-    p.add("memory_health_last_heap_free_total",
-          health.heap_free_total);
-
-    p.add("memory_health_payload_lifetime_mismatch",
-          health.payload_lifetime_mismatch);
-    p.add("memory_health_payload_instances_constructed",
-          health.payload_instances_constructed);
-    p.add("memory_health_payload_instances_destroyed",
-          health.payload_instances_destroyed);
-    p.add("memory_health_payload_alive_now", health.payload_alive_now);
-    p.add("memory_health_payload_entry_alloc_fail",
-          health.payload_entry_alloc_fail);
-    p.add("memory_health_payload_arena_alloc_fail",
-          health.payload_arena_alloc_fail);
-    p.add("memory_health_payload_entry_overflow",
-          health.payload_entry_overflow);
-    p.add("memory_health_payload_serialize_overflow",
-          health.payload_serialize_overflow);
-    p.add("memory_health_payload_to_json_fail",
-          health.payload_to_json_fail);
-    p.add("memory_health_payload_integrity_fail",
-          health.payload_integrity_fail);
-    p.add("memory_health_payload_invalid_kind",
-          health.payload_invalid_kind);
-    p.add("memory_health_payload_string_pointer_fault",
-          health.payload_string_pointer_fault);
-    p.add("memory_health_payload_self_ok_fail",
-          health.payload_self_ok_fail);
-    p.add("memory_health_payload_entry_high_water",
-          health.payload_entry_high_water);
-    p.add("memory_health_payload_max_entries", health.payload_max_entries);
-    p.add("memory_health_payload_arena_high_water",
-          health.payload_arena_high_water);
-    p.add("memory_health_payload_arena_max", health.payload_arena_max);
-    p.add("memory_health_payload_last_error_code",
-          health.payload_last_error_code);
-    p.add("memory_health_payload_last_string_pointer_fault_reason",
-          health.payload_last_string_pointer_fault_reason);
-    p.add("memory_health_payload_last_self_ok_fail_reason",
-          health.payload_last_self_ok_fail_reason);
-
-    return p;
 }
 
 // ------------------------------------------------------------
@@ -4446,12 +3434,6 @@ static FLASHMEM Payload cmd_get_feature(const Payload& args) {
   return resp;
 }
 
-// ------------------------------------------------------------
-// MEMORY_AUDIT_INFO — bounded retained/live audit or watchdog transcript
-// ------------------------------------------------------------
-static FLASHMEM Payload cmd_memory_audit_info(const Payload& args) {
-  return system_memory_audit_info_payload(args);
-}
 
 // ------------------------------------------------------------
 // EXECUTION_TRACE — retained/live ISR-to-TimePop control-flow transcript
@@ -4518,8 +3500,6 @@ static FLASHMEM Payload cmd_crash_clear(const Payload& /*args*/) {
   memset((void*)&g_runtime_ledger_retained, 0,
          sizeof(g_runtime_ledger_retained));
 
-  memory_audit_trace_clear_retained();
-  system_watchdog_trace_clear_retained();
   timepop_dispatch_trace_clear_retained();
   payload_clear_retained_append_trace();
   payload_contract_clear_retained();
@@ -4530,8 +3510,6 @@ static FLASHMEM Payload cmd_crash_clear(const Payload& /*args*/) {
   resp.add("crash_report_cleared", true);
   resp.add("crash_forensics_cleared", true);
   resp.add("runtime_ledger_cleared", true);
-  resp.add("memory_audit_trace_cleared", true);
-  resp.add("memory_watchdog_trace_cleared", true);
   resp.add("execution_trace_cleared", true);
   resp.add("timepop_dispatch_trace_cleared", true);
   resp.add("payload_append_trace_cleared", true);
@@ -4584,7 +3562,6 @@ static const process_command_entry_t SYSTEM_COMMANDS[] = {
   { "PROCESS_INFO",     cmd_process_info     },
   { "TRANSPORT_INFO",   cmd_transport_info   },
   { "PAYLOAD_INFO",     cmd_payload_info     },
-  { "MEMORY_INFO",      cmd_memory_info      },
   { "ENTER_BOOTLOADER", cmd_enter_bootloader },
   { "SHUTDOWN",         cmd_shutdown         },
   { "PROCESS_LIST",     cmd_process_list     },
@@ -4595,7 +3572,6 @@ static const process_command_entry_t SYSTEM_COMMANDS[] = {
   { "CRASH_INFO",       cmd_crash_info       },
   { "CRASH_POLICY",     cmd_crash_policy     },
   { "CRASH_CLEAR",      cmd_crash_clear      },
-  { "MEMORY_AUDIT_INFO", cmd_memory_audit_info },
   { "EXECUTION_TRACE", cmd_execution_trace },
   { "TIMEPOP_DISPATCH_INFO", cmd_timepop_dispatch_info },
   { "PAYLOAD_FLIGHT_INFO", cmd_payload_flight_info },
@@ -4625,5 +3601,4 @@ void process_system_register(void) {
   g_system_feature_fragment_publish_enabled = true;
   system_feature_schedule_fragment_publish();
 
-  system_memory_watchdog_arm();
 }

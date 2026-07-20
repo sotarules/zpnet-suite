@@ -13,7 +13,6 @@
  *     including:
  *       - firmware identity
  *       - CPU temperature and utilization
- *       - memory availability
  *       - internal reference voltages
  *       - other system-owned invariants
  *
@@ -39,27 +38,17 @@
  * Semantics:
  *   • SYSTEM owns no hardware directly
  *   • SYSTEM normally reports facts without implicit control actions
- *   • SYSTEM owns bounded always-on integrity watchdog scheduling for
- *     system-wide conditions that invalidate all subsystem evidence
- *   • Low-level authorities render watchdog verdicts; SYSTEM emits the
- *     resulting semantic anomaly event without reinterpreting their rules
  *
  * Observation:
  *   • REPORT returns a read-only snapshot of current system state
  *   • REPORT has no control side effects
- *   • A bounded recurring TimePop audits Teensy memory/Payload integrity and
- *     emits one WATCHDOG_ANOMALY per boot if the low-level court latches failure
  *
  * Commands:
  *   • REPORT — return authoritative system snapshot
  *       - firmware version
  *       - CPU temperature
  *       - CPU usage metrics
- *       - memory availability
  *       - internal diagnostics
- *   • MEMORY_AUDIT_INFO — return a bounded retained/live scalar transcript
- *     from either memory_info_audit() or its SYSTEM watchdog callback wrapper;
- *     accepts source=audit|watchdog, bank=retained|live, count=1..8, offset=N
  *   • EXECUTION_TRACE — return the bounded ISR-to-handoff-to-subscriber-to-
  *     TimePop control-flow transcript.  The live ring runs in RAM1; fault entry
  *     copies committed records into retained RAM2 before reboot.  Accepts
@@ -98,8 +87,7 @@ void process_system_register(void);
 //
 // The declarations below are the retained V1 compatibility surface used by
 // existing crash-hunt sites.  They may be migrated to FRAME_SENTINEL_ENTER /
-// FRAME_SENTINEL_EXIT incrementally without coupling new work to the memory
-// watchdog.
+// FRAME_SENTINEL_EXIT incrementally.
 //
 // Purpose: catch corruption of a stacked exception frame while the corrupting
 // handler pass is still on the CPU, with attribution.
