@@ -229,6 +229,11 @@ struct interrupt_event_t {
 
   uint32_t counter32_at_event = 0;
 
+  // Physical PPS row that owns this event.  VCLOCK and the first OCXO
+  // one-second edges after PPS carry the same sequence so CLOCKS can defer
+  // publication without inferring freshness from callback order.
+  uint32_t pps_sequence = 0;
+
   uint32_t pps_coincidence_cycles = 0;
   bool     pps_coincidence_valid  = false;
 };

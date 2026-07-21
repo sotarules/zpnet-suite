@@ -12,11 +12,11 @@
 //
 // Responsibilities:
 //   • Consumption of process_interrupt-authored clock captures
-//   • Nominal clock ledgers and bridge-derived measured residuals
+//   • PPS-synchronous CounterLedger plus exact-row PhaseLedger clockfaces
 //   • Local CLOCKS-owned ZERO/START logical zero-offset installation
 //   • Campaign Flash Cut: hot campaign boundary without Alpha epoch rebase
 //   • PPS/VCLOCK-selected truth capture
-//   • 1 Hz publication of canonical clock tuple
+//   • Deferred 1 Hz publication after both post-PPS OCXO edges complete
 //   • Continuous DWT-to-GNSS calibration (campaign-independent)
 //   • Static PPS/GPIO-based one-second prediction audit for VCLOCK and OCXO lanes
 //   • VCLOCK/OCXO rollover-only event consumption as observed DWT edge timing
@@ -32,6 +32,14 @@
 //   Phase 2: process_clocks_init()
 //     Configures OCXO DACs (both), PPS ISR, relay pins, and CLOCKS
 //     state.  Must be called AFTER timepop_init().
+//
+// TIMEBASE row lifecycle:
+//
+//   PPS opens one active scientific row.  The first OCXO1 and OCXO2
+//   one-second edges carrying that PPS sequence complete their lanes and
+//   resolve the PhaseLedger suffixes.  Only then may Beta publish.  There is
+//   no TIMEBASE row queue; a later PPS finding the row incomplete is a
+//   structural timing failure, not permission to overwrite or infer data.
 //
 // DWT-to-GNSS Calibration:
 //

@@ -2453,7 +2453,8 @@ static bool emit_observed_event(interrupt_subscriber_runtime_t& rt,
                                 uint32_t isr_entry_dwt_raw,
                                 uint16_t ambient_low16,
                                 uint16_t target_low16,
-                                uint32_t sequence) {
+                                uint32_t sequence,
+                                uint32_t pps_sequence) {
   if (!rt.active || !rt.desc || dwt_at_event == 0U) return false;
 
   const uint32_t prior = interrupt_priority0_guard_enter();
@@ -2469,6 +2470,7 @@ static bool emit_observed_event(interrupt_subscriber_runtime_t& rt,
   rt.last_event.status = interrupt_event_status_t::OK;
   rt.last_event.dwt_at_event = dwt_at_event;
   rt.last_event.counter32_at_event = counter32_at_event;
+  rt.last_event.pps_sequence = pps_sequence;
   rt.last_event.gnss_ns_at_event = 0U;
 
   fill_observed_diag(rt.last_diag,
@@ -2622,6 +2624,7 @@ static void process_vclock_packet(const vclock_capture_packet_t& packet) {
                                 packet.isr_entry_dwt_raw,
                                 packet.service_low16,
                                 target_low16,
+                                sequence,
                                 sequence);
     }
   }
@@ -2792,7 +2795,10 @@ static void process_ocxo_packet(const ocxo_runtime_context_t& ctx,
                               packet.isr_entry_dwt_raw,
                               packet.ambient_low16,
                               packet.target_low16,
-                              lane.dispatch_sequence);
+                              lane.dispatch_sequence,
+                              g_last_pps_witness_valid
+                                  ? g_last_pps_witness.sequence
+                                  : 0U);
   } else {
     lane.miss_count++;
   }

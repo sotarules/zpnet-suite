@@ -141,7 +141,7 @@ extern uint32_t clocks_alpha_ocxo_projection_guard_sanity_reject_count(time_cloc
 // TIMEBASE publication-tail diagnostics
 // ============================================================================
 //
-// Report-only flight recorder for the PPS -> Alpha -> Beta -> publish tail.
+// Report-only flight recorder for PPS -> Alpha row completion -> Beta -> publish.
 // These counters deliberately do not change TIMEBASE_FRAGMENT shape or publish
 // behavior. They make it possible to distinguish whether Beta returned through
 // an early gate, reached per-second campaign work, stopped during fragment
@@ -472,7 +472,7 @@ static uint64_t g_start_handoff_last_ocxo2_projection_vclock_ns = 0;
 //
 // These counters are Beta-local forensics only.  They do not authorize clock
 // values; they explain why START was held or released.
-static constexpr uint32_t CLOCKS_START_PHASELEDGER_EXPECTED_LAG_PPS = 1U;
+static constexpr uint32_t CLOCKS_START_PHASELEDGER_EXPECTED_LAG_PPS = 0U;
 // Once PhaseLedger is the standard authority, do not let the science row
 // silently fall back to integer CounterLedger quantization.  A missing
 // refined interval is a startup/maturity fact and should publish as missing
@@ -515,7 +515,7 @@ static clocks_alpha_ocxo_counterledger_snapshot_t
     g_beta_ocxo2_counterledger_row DMAMEM = {};
 
 // The unified candidate keeps two Payload headers alive at once.  Put both
-// reusable headers in RAM2 so the PPS hot path does not spend the remaining
+// reusable headers in RAM2 so the completed-row path does not spend the remaining
 // RAM1/DTCM stack margin on another automatic Payload object.  Their arenas are
 // already heap-backed and are reused by clear() between rows.
 static Payload g_timebase_candidate_payload DMAMEM;
@@ -1283,8 +1283,8 @@ static int64_t g_campaign_public_counterledger_ocxo1_offset = 0;
 static int64_t g_campaign_public_counterledger_ocxo2_offset = 0;
 
 // Canonical OCXO residual rendering.  Delta Cycles is now the authority:
-// each OCXO observed one-second DWT interval is compared against the delayed
-// GNSS/PPS one-second DWT interval covering the same physical second.  The
+// each OCXO observed one-second DWT interval is compared against the exact
+// same-row PPS/VCLOCK one-second DWT interval.  The
 // public pps_residual object remains a compatibility rendering of the
 // canonical Delta result:
 //
@@ -1318,7 +1318,7 @@ struct pps_interval_residuals_t {
 // Traditional projected-GNSS totals are kept beside this for audit.
 static constexpr uint64_t CLOCKS_BETA_NS_PER_SECOND = 1000000000ULL;
 
-// Delta Raw sanity gate.  Delta Raw is only valid when both the delayed
+// Delta Raw sanity gate.  Delta Raw is only valid when both the same-row
 // PPS/VCLOCK reference interval and the OCXO observed interval are plausible
 // one-second DWT spans.  Sentinel / uninitialized values such as 0xFFFFFFFF
 // must remain evidence, but they must never publish with delta_raw_valid=true.
@@ -1473,8 +1473,8 @@ struct clock_science_row_t {
   int32_t  raw_minus_floorline_cycles = 0;
   int32_t  floorline_minus_observed_interval_cycles = 0;
 
-  // Delta residuals: OCXO one-second DWT interval minus the delayed
-  // GNSS/PPS one-second DWT interval that covers the same physical second.
+  // Delta residuals: OCXO one-second DWT interval minus the exact same-row
+  // PPS/VCLOCK one-second DWT interval.
   // The *_residual_cycles fields are Dave-subtraction signed
   // (clock_interval - reference_interval).  The *_fast_residual_* mirrors
   // the project-wide sign convention: positive means the clock is fast.
@@ -2190,6 +2190,7 @@ static bool campaign_start_phaseledger_capture_ready(
   return s.last_capture_available &&
          s.last_capture_valid &&
          s.last_capture_lane_valid &&
+         s.last_capture_all_lanes_valid &&
          s.last_capture_sequence_match &&
          s.last_capture_sequence == s.pps_sequence;
 }
@@ -2204,8 +2205,9 @@ static bool campaign_start_phaseledger_integer_interval_ready(
 static bool campaign_start_phaseledger_phase_ready(
     const clocks_alpha_ocxo_counterledger_snapshot_t& s) {
   return s.phase_valid &&
+         !s.phase_pending &&
          s.phase_pps_sequence != 0U &&
-         s.phase_pps_sequence <= s.pps_sequence;
+         s.phase_pps_sequence == s.pps_sequence;
 }
 
 
@@ -2218,6 +2220,8 @@ static bool campaign_start_phaseledger_lag_ready(
 
 static bool campaign_start_phaseledger_refined_ready(
     const clocks_alpha_ocxo_counterledger_snapshot_t& s) {
+  // Exact phase identity is proven separately; Alpha only marks refined_valid
+  // after deriving refined_ns from that currently resolved phase record.
   return s.refined_valid && s.refined_ns != 0ULL;
 }
 
@@ -5224,14 +5228,14 @@ static FLASHMEM void payload_add_ocxo_service_object(Payload& parent,
 // ============================================================================
 //
 // Courtroom-only legacy diagnostic for the OCXO residual authority chain.
-// The authoritative OCXO residual is now the delayed-reference FloorLine
-// Delta Cycles residual carried in clock_science_row_t::delta_floorline_*;
-// Welfords, tau, pps_residual, and servo input consume that same surface.
+// The authoritative cycle-domain residual is the exact same-row observed-edge
+// Delta carried in clock_science_row_t::delta_raw_*; FloorLine remains a
+// comparison side rail.
 //
 // This older object compares the GNSS/PPS static-prediction DWT interval and
 // each OCXO static-prediction DWT interval in the same Teensy coordinate
 // species.  It remains useful as a rough audit, but it is not the canonical
-// delayed-VCLOCK-reference Delta residual.
+// same-row observed-edge Delta residual.
 //
 // Sign convention is aligned with pps_residual.fast_residual_ns:
 //   positive diagnostic_fast_residual_cycles => OCXO running fast.
@@ -6178,19 +6182,49 @@ static void clock_science_apply_counterledger_row(
       : 0.0;
 }
 
-static bool clocks_beta_counterledger_clockface_ready(
+static bool clocks_beta_counterledger_completed_row_ready(
     const clocks_alpha_ocxo_counterledger_snapshot_t& ledger,
-    uint64_t public_ocxo_ns) {
-  return public_ocxo_ns != 0ULL &&
+    uint32_t completed_pps_sequence) {
+  return completed_pps_sequence != 0U &&
          ledger.valid &&
          ledger.initialized &&
+         ledger.pps_sequence == completed_pps_sequence &&
          ledger.last_capture_available &&
          ledger.last_capture_valid &&
          ledger.last_capture_lane_valid &&
+         ledger.last_capture_all_lanes_valid &&
          ledger.last_capture_sequence_match &&
-         ledger.last_capture_sequence == ledger.pps_sequence &&
-         ledger.interval_valid &&
-         ledger.interval_ns != 0ULL;
+         ledger.last_capture_sequence == completed_pps_sequence &&
+         ledger.phase_valid &&
+         !ledger.phase_pending &&
+         ledger.phase_pps_sequence == completed_pps_sequence &&
+         ledger.phase_lag_pps == 0U &&
+         ledger.refined_valid &&
+         ledger.refined_ns != 0ULL;
+}
+
+static bool clocks_beta_counterledger_clockface_ready(
+    const clocks_alpha_ocxo_counterledger_snapshot_t& ledger,
+    uint32_t completed_pps_sequence,
+    uint64_t public_ocxo_ns) {
+  return public_ocxo_ns != 0ULL &&
+         clocks_beta_counterledger_completed_row_ready(
+             ledger, completed_pps_sequence);
+}
+
+static bool clocks_beta_completed_ocxo_forensics_ready(
+    bool forensics_valid,
+    const clocks_alpha_lane_forensics_t& forensics,
+    const clocks_alpha_ocxo_counterledger_snapshot_t& ledger,
+    uint32_t completed_pps_sequence) {
+  return forensics_valid &&
+         clocks_beta_counterledger_completed_row_ready(
+             ledger, completed_pps_sequence) &&
+         forensics.last_event_dwt == ledger.phase_next_ocxo_dwt_at_edge &&
+         forensics.dwt_cycles_between_edges ==
+             ledger.phase_ocxo_interval_cycles &&
+         forensics.counter32_delta_since_previous_event ==
+             (uint32_t)VCLOCK_COUNTS_PER_SECOND;
 }
 
 static bool clocks_beta_ocxo_science_custody_ok(
@@ -6227,7 +6261,7 @@ static void floorline_science_build_ocxo(
     time_clock_id_t clock,
     uint32_t public_count,
     uint64_t public_gnss_ns,
-    const delta_residual_reference_t& delayed_reference,
+    const delta_residual_reference_t& same_row_reference,
     bool vclock_valid,
     const clocks_alpha_lane_forensics_t& vclock_f,
     bool clock_valid,
@@ -6273,7 +6307,7 @@ static void floorline_science_build_ocxo(
                               row.clock_observed_interval_cycles);
   }
 
-  delta_residual_apply_one(row, delayed_reference, clock_valid, clock_f);
+  delta_residual_apply_one(row, same_row_reference, clock_valid, clock_f);
 
   const bool traditional_antecedents_valid =
       row.clock_floorline_valid &&
@@ -6333,8 +6367,8 @@ static void floorline_science_build_ocxo(
   }
 
   // Delta Cycles is canonical.  A row is science-valid when the OCXO
-  // observed edge-to-edge DWT interval can be compared against the delayed
-  // selected PPS/VCLOCK DWT-edge reference covering the same physical second.
+  // observed edge-to-edge DWT interval can be compared against the exact
+  // same-row selected PPS/VCLOCK DWT-edge reference.
   // FloorLine is retained as a side rail only; it no longer authors TIMEBASE
   // residuals.
   row.valid = row.delta_raw_valid;
@@ -7279,10 +7313,10 @@ static FLASHMEM void payload_add_ocxo_science_object(Payload& lane,
                   ? "COUNTERLEDGER_PPS_CAPTURE"
                   : (TIMEBASE_FRAGMENT_COMPACT_SCIENCE_ENABLED
                          ? "DELTA_OBSERVED_DWT_EDGE"
-                         : "DELTA_CYCLES_OBSERVED_DWT_REFERENCE_DELAY_1"));
+                         : "DELTA_CYCLES_SAME_ROW_OBSERVED_DWT"));
   if (!TIMEBASE_FRAGMENT_COMPACT_SCIENCE_ENABLED) {
     science.add("delta_formula",
-                "fast = delayed_gnss_pps_cycles - ocxo_observed_dwt_cycles");
+                "fast = same_row_pps_vclock_cycles - ocxo_observed_dwt_cycles");
     science.add("traditional_projection_formula",
                 "pps_vclock_gnss_ns + signed(clock_floorline_dwt - pps_vclock_dwt) * 1e9 / projection_cps");
   }
@@ -8250,77 +8284,8 @@ static double servo_total_catchup_target_now_ppb(double total_ppb,
   return servo_clamp(target, SERVO_TOTAL_CATCHUP_MAX_TARGET_PPB);
 }
 
-static void servo_input_diag_update(servo_input_diag_t& d,
-                                    bool pps_residual_valid,
-                                    uint64_t pps_gnss_interval_ns,
-                                    uint64_t pps_clock_interval_ns,
-                                    int64_t pps_fast_residual_ns,
-                                    double pps_fast_residual_ppb,
-                                    const welford_t& w,
-                                    bool total_input_valid,
-                                    double total_tau) {
-  d.pps_residual_valid = pps_residual_valid;
-  d.pps_gnss_interval_ns = pps_residual_valid ? pps_gnss_interval_ns : 0ULL;
-  d.pps_clock_interval_ns = pps_residual_valid ? pps_clock_interval_ns : 0ULL;
-  d.pps_fast_residual_ns = pps_residual_valid ? pps_fast_residual_ns : 0LL;
-
-  d.mean_welford_n = w.n;
-  d.mean_welford_ppb = (w.n > 0) ? w.mean : 0.0;
-  d.mean_input_valid = pps_residual_valid && (w.n >= SERVO_MIN_SAMPLES);
-
-  d.total_tau = total_input_valid ? total_tau : 1.0;
-  d.total_ppb = total_input_valid ? servo_total_ppb_from_tau(total_tau) : 0.0;
-  d.total_input_valid = total_input_valid && pps_residual_valid &&
-                        (campaign_seconds >= SERVO_MIN_SAMPLES);
-
-  // A one-second residual in ns is numerically ppb over a one-second gate.
-  // NOW consumes the exact FloorLine value directly rather than averaging it
-  // into MEAN or folding it into campaign-total tau.
-  d.now_ppb = pps_residual_valid ? pps_fast_residual_ppb : 0.0;
-  d.now_input_valid = pps_residual_valid;
-
-  d.total_catchup_elapsed_seconds = (double)campaign_seconds;
-  d.total_catchup_horizon_seconds = SERVO_TOTAL_CATCHUP_HORIZON_SECONDS;
-  d.total_catchup_max_target_ppb = SERVO_TOTAL_CATCHUP_MAX_TARGET_PPB;
-  d.total_catchup_target_now_ppb = 0.0;
-  d.total_catchup_control_error_ppb = 0.0;
-  d.total_catchup_active = false;
-
-  if (d.total_input_valid && d.now_input_valid) {
-    d.total_catchup_target_now_ppb =
-        servo_total_catchup_target_now_ppb(d.total_ppb, campaign_seconds);
-    d.total_catchup_control_error_ppb =
-        d.now_ppb - d.total_catchup_target_now_ppb;
-    d.total_catchup_active = true;
-  } else {
-    d.total_catchup_control_error_ppb = d.total_ppb;
-  }
-
-  d.selected_residual_ns = 0;
-  if (calibrate_ocxo_mode == servo_mode_t::MEAN) {
-    d.selected_source = SERVO_INPUT_SOURCE_MEAN_PPS_RESIDUAL_WELFORD;
-    d.selected_input_valid = d.mean_input_valid;
-    d.selected_input_ppb = d.mean_input_valid ? d.mean_welford_ppb : 0.0;
-    d.selected_residual_ns = (int64_t)d.selected_input_ppb;
-  } else if (calibrate_ocxo_mode == servo_mode_t::TOTAL) {
-    d.selected_source = SERVO_INPUT_SOURCE_TOTAL_PUBLIC_TAU;
-    d.selected_input_valid = d.total_input_valid;
-    d.selected_input_ppb = d.total_input_valid
-        ? d.total_catchup_control_error_ppb
-        : 0.0;
-    d.selected_residual_ns = (int64_t)d.selected_input_ppb;
-  } else if (calibrate_ocxo_mode == servo_mode_t::NOW) {
-    d.selected_source = SERVO_INPUT_SOURCE_NOW_PPS_RESIDUAL;
-    d.selected_input_valid = d.now_input_valid;
-    d.selected_input_ppb = d.now_input_valid ? d.now_ppb : 0.0;
-    d.selected_residual_ns = pps_residual_valid ? pps_fast_residual_ns : 0;
-  } else {
-    d.selected_source = SERVO_INPUT_SOURCE_NONE;
-    d.selected_input_valid = false;
-    d.selected_input_ppb = 0.0;
-    d.selected_residual_ns = 0;
-  }
-}
+// Servo-input diagnostics are populated directly in clocks_beta_pps().
+// Keep this hot path free of a large reference-heavy helper call boundary.
 
 // ============================================================================
 // Servo DAC requests — dither-owned realization
@@ -8929,7 +8894,7 @@ static FLASHMEM void payload_add_servo_dac_values(Payload& parent) {
 // Servo/DAC state is now piggybacked on TIMEBASE while servos are active
 // through payload_add_servo_dac_values().  Focused command reports
 // (REPORT_DAC / DITHER_STATUS) remain available on demand, but CLOCKS no
-// longer emits an independent 1 Hz DAC_TICK publication from the PPS hot path.
+// longer emits an independent 1 Hz DAC_TICK publication from row completion.
 //
 // Keep this no-op helper so existing gate sites remain visually explicit:
 // those sites are acknowledging DAC/servo transition points, not publishing
@@ -8940,10 +8905,15 @@ static FLASHMEM void publish_dac_tick(const char*) {
 }
 
 // ============================================================================
-// clocks_beta_pps — invoked from alpha's pps_selector_callback
+// clocks_beta_pps — PPS control probe or exact completed-row publication
 // ============================================================================
+//
+// completed_pps_sequence == 0 is a control-only physical-PPS probe used while
+// START/ZERO SmartZero installation is pending.  A non-zero sequence is one
+// immutable Alpha row released only after both post-PPS OCXO edges resolve the
+// exact CounterLedger + PhaseLedger clockfaces for that same PPS.
 
-void clocks_beta_pps(void) {
+void clocks_beta_pps(uint32_t completed_pps_sequence) {
   clocks_stack_witness_note_hot(CLOCKS_STACK_CONTEXT_BETA_PPS_ENTRY);
   g_timebase_pps_entry_count++;
   g_timebase_last_entry_campaign_seconds = campaign_seconds;
@@ -9044,15 +9014,17 @@ void clocks_beta_pps(void) {
     return;
   }
   if (campaign_state != clocks_campaign_state_t::STARTED) {
+    // Idle completed rows still mature Alpha's always-on exact OCXO clockfaces,
+    // but Beta never advances campaign identity or publishes them.
     g_timebase_not_started_gate_count++;
     timebase_build_stage(TIMEBASE_BUILD_STAGE_NOT_STARTED_GATE);
     publish_dac_tick("NOT_STARTED_GATE");
     return;
   }
 
-  // RECOVER resumes an existing public timeline, so its reattachment state is
-  // observational here and candidate identities continue to be emitted.
-  (void)recover_reattach_should_hold();
+  // Sequence zero is never a scientific row.  START/ZERO consumed it above;
+  // any other zero-sequence call is intentionally silent.
+  if (completed_pps_sequence == 0U) return;
 
   // Final Beta custody gate: acquire the current Alpha VCLOCK forensic row
   // before campaign identity advances.  The forensic event and the canonical
@@ -9065,12 +9037,6 @@ void clocks_beta_pps(void) {
   const bool vclock_forensics_valid =
       clocks_alpha_lane_forensics(time_clock_id_t::VCLOCK,
                                   &vclock_forensics);
-  if (!vclock_forensics_valid ||
-      vclock_forensics.last_event_counter32 != g_counter32_at_pps_vclock ||
-      vclock_forensics.last_event_dwt != g_dwt_at_pps_vclock) {
-    return;
-  }
-
   // Form the complete current-row forensic tuple before the START prologue
   // decides whether this candidate remains private PPS0 or becomes public PPS1.
   // The old ordering ran the warmup court first, so it could suppress the very
@@ -9084,6 +9050,79 @@ void clocks_beta_pps(void) {
       clocks_alpha_lane_forensics(time_clock_id_t::OCXO1, &ocxo1_forensics);
   const bool ocxo2_forensics_valid =
       clocks_alpha_lane_forensics(time_clock_id_t::OCXO2, &ocxo2_forensics);
+
+  // The completed row is one immutable scientific identity.  Snapshot every
+  // Alpha authority once, then prove that the PPS/VCLOCK bookend, both
+  // PPS-synchronous CounterLedgers, both PhaseLedger suffixes, and both direct
+  // adjacent OCXO edge intervals all belong to completed_pps_sequence.
+  clocks_pps_vclock_edge_forensics_t& pps_vclock_edge_forensics =
+      g_beta_pps_vclock_edge_forensics;
+  pps_vclock_edge_forensics = clocks_pps_vclock_edge_forensics_t{};
+  const bool pps_vclock_edge_forensics_valid =
+      clocks_alpha_pps_vclock_edge_forensics(&pps_vclock_edge_forensics);
+
+  g_beta_ocxo1_counterledger_row = clocks_alpha_ocxo_counterledger_snapshot_t{};
+  g_beta_ocxo2_counterledger_row = clocks_alpha_ocxo_counterledger_snapshot_t{};
+  const bool ocxo1_counterledger_ok =
+      clocks_alpha_ocxo_counterledger_snapshot(
+          time_clock_id_t::OCXO1, &g_beta_ocxo1_counterledger_row);
+  const bool ocxo2_counterledger_ok =
+      clocks_alpha_ocxo_counterledger_snapshot(
+          time_clock_id_t::OCXO2, &g_beta_ocxo2_counterledger_row);
+  const clocks_alpha_ocxo_counterledger_snapshot_t& ocxo1_counterledger =
+      g_beta_ocxo1_counterledger_row;
+  const clocks_alpha_ocxo_counterledger_snapshot_t& ocxo2_counterledger =
+      g_beta_ocxo2_counterledger_row;
+
+  const bool vclock_sequence_exact =
+      pps_vclock_edge_forensics_valid &&
+      pps_vclock_edge_forensics.sequence == completed_pps_sequence &&
+      pps_vclock_edge_forensics.authority_dwt_at_edge ==
+          g_dwt_at_pps_vclock &&
+      pps_vclock_edge_forensics.counter32_at_edge ==
+          g_counter32_at_pps_vclock &&
+      vclock_forensics_valid &&
+      vclock_forensics.last_event_counter32 == g_counter32_at_pps_vclock &&
+      vclock_forensics.last_event_dwt == g_dwt_at_pps_vclock;
+  if (!vclock_sequence_exact) {
+    clocks_watchdog_anomaly(
+        "beta_completed_vclock_custody",
+        completed_pps_sequence,
+        pps_vclock_edge_forensics_valid
+            ? pps_vclock_edge_forensics.sequence
+            : 0U,
+        vclock_forensics_valid ? vclock_forensics.last_event_counter32 : 0U,
+        vclock_forensics_valid ? vclock_forensics.last_event_dwt : 0U);
+    return;
+  }
+
+  const bool ocxo1_sequence_exact =
+      ocxo1_counterledger_ok &&
+      clocks_beta_completed_ocxo_forensics_ready(
+          ocxo1_forensics_valid, ocxo1_forensics,
+          ocxo1_counterledger, completed_pps_sequence);
+  const bool ocxo2_sequence_exact =
+      ocxo2_counterledger_ok &&
+      clocks_beta_completed_ocxo_forensics_ready(
+          ocxo2_forensics_valid, ocxo2_forensics,
+          ocxo2_counterledger, completed_pps_sequence);
+  if (!ocxo1_sequence_exact || !ocxo2_sequence_exact) {
+    const uint32_t mismatch_mask =
+        (ocxo1_sequence_exact ? 0U : 1U) |
+        (ocxo2_sequence_exact ? 0U : 2U);
+    clocks_watchdog_anomaly(
+        "beta_completed_pps_custody",
+        completed_pps_sequence,
+        ocxo1_counterledger.pps_sequence,
+        ocxo2_counterledger.pps_sequence,
+        mismatch_mask);
+    return;
+  }
+
+  // RECOVER resumes an existing public timeline, so its reattachment state is
+  // observational here and candidate identities continue to be emitted.  Run
+  // that court only after exact completed-row custody has been proven.
+  (void)recover_reattach_should_hold();
 
   // START consumes this exact candidate tuple privately while campaign_seconds
   // remains zero. The helper seeds PPS0 from the normal observed-edge inputs and
@@ -9137,12 +9176,6 @@ void clocks_beta_pps(void) {
   // court below.  A SCIENCE_REJECT row advances campaign identity but may not
   // enter any campaign statistical population.
 
-  clocks_pps_vclock_edge_forensics_t& pps_vclock_edge_forensics =
-      g_beta_pps_vclock_edge_forensics;
-  pps_vclock_edge_forensics = clocks_pps_vclock_edge_forensics_t{};
-  const bool pps_vclock_edge_forensics_valid =
-      clocks_alpha_pps_vclock_edge_forensics(&pps_vclock_edge_forensics);
-
   clocks_alpha_ocxo_pps_projection_snapshot_t& ocxo1_pps_projection =
       g_beta_pps_ocxo1_projection;
   clocks_alpha_ocxo_pps_projection_snapshot_t& ocxo2_pps_projection =
@@ -9178,10 +9211,10 @@ void clocks_beta_pps(void) {
       ocxo2_pps_projection_ok && ocxo2_pps_projection.valid &&
       ocxo2_pps_projection.projected_ocxo_ns_at_pps != 0;
 
-  // Delta residuals are now same-row aligned. PhaseLedger may have its own
-  // lawful suffix lag internally, but Beta must not compare the previous
-  // PPS/VCLOCK interval against the current OCXO interval. Capture the
-  // reference for this public row and use that same identity for OCXO science.
+  // Delta residuals are same-row aligned. Exact-row PhaseLedger completion
+  // has already been proven above, so Beta compares the current PPS/VCLOCK
+  // interval to the current adjacent OCXO intervals. Capture the reference
+  // for this public row and use that same identity for OCXO science.
   const delta_residual_reference_t delta_reference_this_row =
       delta_residual_capture_vclock_reference(public_count,
                                               vclock_forensics_valid,
@@ -9192,7 +9225,7 @@ void clocks_beta_pps(void) {
   // ── Delta Cycles canonical science ──
   //
   // Observed DWT-at-edge owns the canonical residual: each OCXO observed
-  // interval is subtracted from the delayed observed PPS/VCLOCK DWT-edge
+  // interval is subtracted from the same-row observed PPS/VCLOCK DWT-edge
   // interval. FloorLine and projected-GNSS surfaces are preserved under
   // science.delta_floorline_* and science.traditional_* only; neither feeds
   // Welford.  Published OCXO TAU/PPB are re-authored below as simple
@@ -9221,17 +9254,6 @@ void clocks_beta_pps(void) {
                                ocxo2_forensics_valid,
                                ocxo2_forensics,
                                g_floorline_science_ocxo2);
-
-  g_beta_ocxo1_counterledger_row = clocks_alpha_ocxo_counterledger_snapshot_t{};
-  g_beta_ocxo2_counterledger_row = clocks_alpha_ocxo_counterledger_snapshot_t{};
-  (void)clocks_alpha_ocxo_counterledger_snapshot(time_clock_id_t::OCXO1,
-                                                 &g_beta_ocxo1_counterledger_row);
-  (void)clocks_alpha_ocxo_counterledger_snapshot(time_clock_id_t::OCXO2,
-                                                 &g_beta_ocxo2_counterledger_row);
-  const clocks_alpha_ocxo_counterledger_snapshot_t& ocxo1_counterledger =
-      g_beta_ocxo1_counterledger_row;
-  const clocks_alpha_ocxo_counterledger_snapshot_t& ocxo2_counterledger =
-      g_beta_ocxo2_counterledger_row;
 
   clocks_alpha_tau_snapshot_t& ocxo1_alpha_tau = g_beta_pps_ocxo1_alpha_tau;
   clocks_alpha_tau_snapshot_t& ocxo2_alpha_tau = g_beta_pps_ocxo2_alpha_tau;
@@ -9263,10 +9285,12 @@ void clocks_beta_pps(void) {
 
   const bool ocxo1_clockface_valid = clocks_ocxo_counterledger_mode_enabled()
       ? clocks_beta_counterledger_clockface_ready(ocxo1_counterledger,
+                                                   completed_pps_sequence,
                                                    public_ocxo1_ns)
       : (public_ocxo1_ns != 0ULL && ocxo1_pps_projected_valid);
   const bool ocxo2_clockface_valid = clocks_ocxo_counterledger_mode_enabled()
       ? clocks_beta_counterledger_clockface_ready(ocxo2_counterledger,
+                                                   completed_pps_sequence,
                                                    public_ocxo2_ns)
       : (public_ocxo2_ns != 0ULL && ocxo2_pps_projected_valid);
 
@@ -9465,24 +9489,209 @@ void clocks_beta_pps(void) {
         ? ocxo2_floorline_science.total_tau
         : 1.0;
 
-    servo_input_diag_update(g_servo_input_ocxo1,
-                            pps_residuals.ocxo1_valid,
-                            pps_residuals.gnss_interval_ns,
-                            pps_residuals.ocxo1_interval_ns,
-                            pps_residuals.ocxo1_fast_residual_ns,
-                            ocxo1_floorline_science.fast_residual_ns_exact,
-                            welford_ocxo1,
-                            ocxo1_total_slope_valid,
-                            ocxo1_total_tau);
-    servo_input_diag_update(g_servo_input_ocxo2,
-                            pps_residuals.ocxo2_valid,
-                            pps_residuals.gnss_interval_ns,
-                            pps_residuals.ocxo2_interval_ns,
-                            pps_residuals.ocxo2_fast_residual_ns,
-                            ocxo2_floorline_science.fast_residual_ns_exact,
-                            welford_ocxo2,
-                            ocxo2_total_slope_valid,
-                            ocxo2_total_tau);
+    // Populate OCXO1 servo diagnostics directly.  This deliberately avoids a
+    // reference-heavy helper boundary on the completed-row hot path.
+    g_servo_input_ocxo1.pps_residual_valid = pps_residuals.ocxo1_valid;
+    g_servo_input_ocxo1.pps_gnss_interval_ns = pps_residuals.ocxo1_valid
+        ? pps_residuals.gnss_interval_ns
+        : 0ULL;
+    g_servo_input_ocxo1.pps_clock_interval_ns = pps_residuals.ocxo1_valid
+        ? pps_residuals.ocxo1_interval_ns
+        : 0ULL;
+    g_servo_input_ocxo1.pps_fast_residual_ns = pps_residuals.ocxo1_valid
+        ? pps_residuals.ocxo1_fast_residual_ns
+        : 0LL;
+
+    g_servo_input_ocxo1.mean_welford_n = welford_ocxo1.n;
+    g_servo_input_ocxo1.mean_welford_ppb =
+        (welford_ocxo1.n > 0) ? welford_ocxo1.mean : 0.0;
+    g_servo_input_ocxo1.mean_input_valid =
+        pps_residuals.ocxo1_valid &&
+        (welford_ocxo1.n >= SERVO_MIN_SAMPLES);
+
+    g_servo_input_ocxo1.total_tau =
+        ocxo1_total_slope_valid ? ocxo1_total_tau : 1.0;
+    g_servo_input_ocxo1.total_ppb = ocxo1_total_slope_valid
+        ? servo_total_ppb_from_tau(ocxo1_total_tau)
+        : 0.0;
+    g_servo_input_ocxo1.total_input_valid =
+        ocxo1_total_slope_valid &&
+        pps_residuals.ocxo1_valid &&
+        (campaign_seconds >= SERVO_MIN_SAMPLES);
+
+    // A one-second residual in ns is numerically ppb over a one-second gate.
+    g_servo_input_ocxo1.now_ppb = pps_residuals.ocxo1_valid
+        ? ocxo1_floorline_science.fast_residual_ns_exact
+        : 0.0;
+    g_servo_input_ocxo1.now_input_valid = pps_residuals.ocxo1_valid;
+
+    g_servo_input_ocxo1.total_catchup_elapsed_seconds =
+        (double)campaign_seconds;
+    g_servo_input_ocxo1.total_catchup_horizon_seconds =
+        SERVO_TOTAL_CATCHUP_HORIZON_SECONDS;
+    g_servo_input_ocxo1.total_catchup_max_target_ppb =
+        SERVO_TOTAL_CATCHUP_MAX_TARGET_PPB;
+    g_servo_input_ocxo1.total_catchup_target_now_ppb = 0.0;
+    g_servo_input_ocxo1.total_catchup_control_error_ppb = 0.0;
+    g_servo_input_ocxo1.total_catchup_active = false;
+
+    if (g_servo_input_ocxo1.total_input_valid &&
+        g_servo_input_ocxo1.now_input_valid) {
+      g_servo_input_ocxo1.total_catchup_target_now_ppb =
+          servo_total_catchup_target_now_ppb(
+              g_servo_input_ocxo1.total_ppb, campaign_seconds);
+      g_servo_input_ocxo1.total_catchup_control_error_ppb =
+          g_servo_input_ocxo1.now_ppb -
+          g_servo_input_ocxo1.total_catchup_target_now_ppb;
+      g_servo_input_ocxo1.total_catchup_active = true;
+    } else {
+      g_servo_input_ocxo1.total_catchup_control_error_ppb =
+          g_servo_input_ocxo1.total_ppb;
+    }
+
+    g_servo_input_ocxo1.selected_residual_ns = 0;
+    if (calibrate_ocxo_mode == servo_mode_t::MEAN) {
+      g_servo_input_ocxo1.selected_source =
+          SERVO_INPUT_SOURCE_MEAN_PPS_RESIDUAL_WELFORD;
+      g_servo_input_ocxo1.selected_input_valid =
+          g_servo_input_ocxo1.mean_input_valid;
+      g_servo_input_ocxo1.selected_input_ppb =
+          g_servo_input_ocxo1.mean_input_valid
+              ? g_servo_input_ocxo1.mean_welford_ppb
+              : 0.0;
+      g_servo_input_ocxo1.selected_residual_ns =
+          (int64_t)g_servo_input_ocxo1.selected_input_ppb;
+    } else if (calibrate_ocxo_mode == servo_mode_t::TOTAL) {
+      g_servo_input_ocxo1.selected_source =
+          SERVO_INPUT_SOURCE_TOTAL_PUBLIC_TAU;
+      g_servo_input_ocxo1.selected_input_valid =
+          g_servo_input_ocxo1.total_input_valid;
+      g_servo_input_ocxo1.selected_input_ppb =
+          g_servo_input_ocxo1.total_input_valid
+              ? g_servo_input_ocxo1.total_catchup_control_error_ppb
+              : 0.0;
+      g_servo_input_ocxo1.selected_residual_ns =
+          (int64_t)g_servo_input_ocxo1.selected_input_ppb;
+    } else if (calibrate_ocxo_mode == servo_mode_t::NOW) {
+      g_servo_input_ocxo1.selected_source =
+          SERVO_INPUT_SOURCE_NOW_PPS_RESIDUAL;
+      g_servo_input_ocxo1.selected_input_valid =
+          g_servo_input_ocxo1.now_input_valid;
+      g_servo_input_ocxo1.selected_input_ppb =
+          g_servo_input_ocxo1.now_input_valid
+              ? g_servo_input_ocxo1.now_ppb
+              : 0.0;
+      g_servo_input_ocxo1.selected_residual_ns =
+          pps_residuals.ocxo1_valid
+              ? pps_residuals.ocxo1_fast_residual_ns
+              : 0LL;
+    } else {
+      g_servo_input_ocxo1.selected_source = SERVO_INPUT_SOURCE_NONE;
+      g_servo_input_ocxo1.selected_input_valid = false;
+      g_servo_input_ocxo1.selected_input_ppb = 0.0;
+      g_servo_input_ocxo1.selected_residual_ns = 0;
+    }
+
+    // Populate OCXO2 servo diagnostics directly for the same reason.
+    g_servo_input_ocxo2.pps_residual_valid = pps_residuals.ocxo2_valid;
+    g_servo_input_ocxo2.pps_gnss_interval_ns = pps_residuals.ocxo2_valid
+        ? pps_residuals.gnss_interval_ns
+        : 0ULL;
+    g_servo_input_ocxo2.pps_clock_interval_ns = pps_residuals.ocxo2_valid
+        ? pps_residuals.ocxo2_interval_ns
+        : 0ULL;
+    g_servo_input_ocxo2.pps_fast_residual_ns = pps_residuals.ocxo2_valid
+        ? pps_residuals.ocxo2_fast_residual_ns
+        : 0LL;
+
+    g_servo_input_ocxo2.mean_welford_n = welford_ocxo2.n;
+    g_servo_input_ocxo2.mean_welford_ppb =
+        (welford_ocxo2.n > 0) ? welford_ocxo2.mean : 0.0;
+    g_servo_input_ocxo2.mean_input_valid =
+        pps_residuals.ocxo2_valid &&
+        (welford_ocxo2.n >= SERVO_MIN_SAMPLES);
+
+    g_servo_input_ocxo2.total_tau =
+        ocxo2_total_slope_valid ? ocxo2_total_tau : 1.0;
+    g_servo_input_ocxo2.total_ppb = ocxo2_total_slope_valid
+        ? servo_total_ppb_from_tau(ocxo2_total_tau)
+        : 0.0;
+    g_servo_input_ocxo2.total_input_valid =
+        ocxo2_total_slope_valid &&
+        pps_residuals.ocxo2_valid &&
+        (campaign_seconds >= SERVO_MIN_SAMPLES);
+
+    g_servo_input_ocxo2.now_ppb = pps_residuals.ocxo2_valid
+        ? ocxo2_floorline_science.fast_residual_ns_exact
+        : 0.0;
+    g_servo_input_ocxo2.now_input_valid = pps_residuals.ocxo2_valid;
+
+    g_servo_input_ocxo2.total_catchup_elapsed_seconds =
+        (double)campaign_seconds;
+    g_servo_input_ocxo2.total_catchup_horizon_seconds =
+        SERVO_TOTAL_CATCHUP_HORIZON_SECONDS;
+    g_servo_input_ocxo2.total_catchup_max_target_ppb =
+        SERVO_TOTAL_CATCHUP_MAX_TARGET_PPB;
+    g_servo_input_ocxo2.total_catchup_target_now_ppb = 0.0;
+    g_servo_input_ocxo2.total_catchup_control_error_ppb = 0.0;
+    g_servo_input_ocxo2.total_catchup_active = false;
+
+    if (g_servo_input_ocxo2.total_input_valid &&
+        g_servo_input_ocxo2.now_input_valid) {
+      g_servo_input_ocxo2.total_catchup_target_now_ppb =
+          servo_total_catchup_target_now_ppb(
+              g_servo_input_ocxo2.total_ppb, campaign_seconds);
+      g_servo_input_ocxo2.total_catchup_control_error_ppb =
+          g_servo_input_ocxo2.now_ppb -
+          g_servo_input_ocxo2.total_catchup_target_now_ppb;
+      g_servo_input_ocxo2.total_catchup_active = true;
+    } else {
+      g_servo_input_ocxo2.total_catchup_control_error_ppb =
+          g_servo_input_ocxo2.total_ppb;
+    }
+
+    g_servo_input_ocxo2.selected_residual_ns = 0;
+    if (calibrate_ocxo_mode == servo_mode_t::MEAN) {
+      g_servo_input_ocxo2.selected_source =
+          SERVO_INPUT_SOURCE_MEAN_PPS_RESIDUAL_WELFORD;
+      g_servo_input_ocxo2.selected_input_valid =
+          g_servo_input_ocxo2.mean_input_valid;
+      g_servo_input_ocxo2.selected_input_ppb =
+          g_servo_input_ocxo2.mean_input_valid
+              ? g_servo_input_ocxo2.mean_welford_ppb
+              : 0.0;
+      g_servo_input_ocxo2.selected_residual_ns =
+          (int64_t)g_servo_input_ocxo2.selected_input_ppb;
+    } else if (calibrate_ocxo_mode == servo_mode_t::TOTAL) {
+      g_servo_input_ocxo2.selected_source =
+          SERVO_INPUT_SOURCE_TOTAL_PUBLIC_TAU;
+      g_servo_input_ocxo2.selected_input_valid =
+          g_servo_input_ocxo2.total_input_valid;
+      g_servo_input_ocxo2.selected_input_ppb =
+          g_servo_input_ocxo2.total_input_valid
+              ? g_servo_input_ocxo2.total_catchup_control_error_ppb
+              : 0.0;
+      g_servo_input_ocxo2.selected_residual_ns =
+          (int64_t)g_servo_input_ocxo2.selected_input_ppb;
+    } else if (calibrate_ocxo_mode == servo_mode_t::NOW) {
+      g_servo_input_ocxo2.selected_source =
+          SERVO_INPUT_SOURCE_NOW_PPS_RESIDUAL;
+      g_servo_input_ocxo2.selected_input_valid =
+          g_servo_input_ocxo2.now_input_valid;
+      g_servo_input_ocxo2.selected_input_ppb =
+          g_servo_input_ocxo2.now_input_valid
+              ? g_servo_input_ocxo2.now_ppb
+              : 0.0;
+      g_servo_input_ocxo2.selected_residual_ns =
+          pps_residuals.ocxo2_valid
+              ? pps_residuals.ocxo2_fast_residual_ns
+              : 0LL;
+    } else {
+      g_servo_input_ocxo2.selected_source = SERVO_INPUT_SOURCE_NONE;
+      g_servo_input_ocxo2.selected_input_valid = false;
+      g_servo_input_ocxo2.selected_input_ppb = 0.0;
+      g_servo_input_ocxo2.selected_residual_ns = 0;
+    }
 
     timebase_build_stage(TIMEBASE_BUILD_STAGE_WELFORD);
     ocxo_calibration_servo();
@@ -9533,6 +9742,7 @@ void clocks_beta_pps(void) {
     p.add("timebase_message_version", 1U);
     p.add("forensics_mode", "EMBEDDED");
     p.add("campaign", campaign_name);
+    p.add("physical_pps_sequence", completed_pps_sequence);
     p.add("campaign_state", clocks_campaign_state_name(campaign_state));
     p.add("campaign_seconds", campaign_seconds);
     p.add("gate_mode_schema", "CLOCKS_GATE_MODE_V1");
@@ -9656,6 +9866,7 @@ void clocks_beta_pps(void) {
     {
       timebase_build_stage(TIMEBASE_BUILD_STAGE_PPS);
       Payload pps;
+      pps.add("sequence", completed_pps_sequence);
       pps.add("dwt_cycles_between_edges",
               g_pps_dwt_cycles_between_edges_valid
                   ? (uint32_t)g_pps_dwt_cycles_between_edges
@@ -9787,6 +9998,7 @@ void clocks_beta_pps(void) {
                                        public_count,
                                        public_gnss_ns);
     f.add("embedded", true);
+    f.add("physical_pps_sequence", completed_pps_sequence);
     f.add("paired_fragment_topic", "TIMEBASE_FRAGMENT");
     f.add("paired_fragment_schema", "TIMEBASE_FRAGMENT_V4");
     f.add("paired_fragment_version", 4U);
@@ -10102,7 +10314,7 @@ void clocks_beta_pps(void) {
     timebase_build_stage(TIMEBASE_BUILD_STAGE_FORENSICS_PUBLISH_RETURN);
   }
 
-  // One publish attempt per PPS identity.  Even an embed failure is emitted;
+  // One publish attempt per completed PPS identity. Even an embed failure is emitted;
   // the Pi envelope court will log and drop that candidate rather than mistake
   // firmware qualification silence for a dead TIMEBASE pipeline.
   g_timebase_publish_attempt_count++;

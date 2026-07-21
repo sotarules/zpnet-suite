@@ -226,17 +226,12 @@ uint64_t clocks_dwt_cycles_at_dwt(uint32_t dwt32);
 // DWT coordinate, then Beta may render the public clock from Delta Cycles
 // totals.
 //
-// PPS_COUNTERLEDGER makes the public OCXO nanosecond clocks integer hardware
-// tick ledgers sampled at the PPS ISR capture window. process_interrupt owns
-// the counter reads; Alpha consumes only the authored epoch-capture packet and
-// computes OCXO public ns as:
-//
-//   sampled_ticks_since_zero * 100 ns
-//
-// CounterLedger remains a witness only.  PhaseLedger/PPS projection remains
-// public OCXO clock authority, with Delta Cycles as the independent
-// cycle-domain candidate.  No FloorLine, EMA, yardstick, or other alternative
-// DWT estimator participates in publication.
+// PPS_COUNTERLEDGER makes the public OCXO nanosecond clocks the exact
+// PPS-synchronous CounterLedger whole-tick value plus the PhaseLedger 0..99 ns
+// suffix resolved by the first observed OCXO one-second edge after that PPS.
+// Alpha does not release the row to Beta until both lanes resolve the same PPS
+// sequence.  Delta Cycles remains the independent observed-edge frequency
+// candidate; bridge, FloorLine, EMA, and yardstick surfaces are forensic only.
 
 enum class clocks_ocxo_public_ns_authority_t : uint8_t {
   TRADITIONAL_PPS_PROJECTION = 0,
@@ -245,12 +240,10 @@ enum class clocks_ocxo_public_ns_authority_t : uint8_t {
 
 static constexpr clocks_ocxo_public_ns_authority_t
     CLOCKS_OCXO_PUBLIC_NS_AUTHORITY =
-        clocks_ocxo_public_ns_authority_t::TRADITIONAL_PPS_PROJECTION;
+        clocks_ocxo_public_ns_authority_t::PPS_COUNTERLEDGER;
 
-// CounterLedger can also be advanced and reported without authoring public OCXO
-// nanoseconds.  With traditional PhaseLedger/PPS projection selected above,
-// reporting remains enabled and CounterLedger is explicitly a witness rather
-// than publication authority.
+// Keep the full CounterLedger/PhaseLedger report surface enabled while it is
+// public authority; focused reports and TIMEBASE then expose the same lineage.
 static constexpr bool CLOCKS_OCXO_COUNTERLEDGER_REPORT_ONLY_ENABLED = true;
 
 // CounterLedger frequency is fundamentally a long-baseline integer-tick
@@ -1834,7 +1827,9 @@ extern volatile uint32_t watchdog_anomaly_trigger_dwt;
 // Beta entry points
 // ============================================================================
 
-void clocks_beta_pps(void);
+// Consume one immutable Alpha row after PPS, OCXO1, and OCXO2 all identify
+// completed_pps_sequence.  Publication latency is deliberately irrelevant.
+void clocks_beta_pps(uint32_t completed_pps_sequence);
 void clocks_beta_features_init(void);
 void clocks_watchdog_anomaly(const char* reason,
                              uint32_t detail0 = 0,

@@ -2337,13 +2337,10 @@ static constexpr uint32_t ALPHA_COUNTERLEDGER_PHASE_SOURCE_NONE = 0U;
 static constexpr uint32_t ALPHA_COUNTERLEDGER_PHASE_SOURCE_PHYSICAL_PPS_TO_OBSERVED_OCXO_EDGE = 1U;
 static constexpr uint32_t ALPHA_COUNTERLEDGER_PHASE_NEAR_BOUNDARY_NS = 8U;
 
-// PhaseLedger pending PPS custody.  A single pending slot is too fragile when
-// the OCXO edge pair that brackets a PPS arrives after the next PPS sample has
-// already been captured.  Preserve a bounded set of unresolved PPS facts and
-// resolve only the fact actually bracketed by the observed OCXO edge pair.
-// This adds custody memory; it does not relax bracketing, counter-delta, or
-// refined-interval gates.
-static constexpr uint32_t ALPHA_COUNTERLEDGER_PHASE_PENDING_RING_SIZE = 4U;
+// PhaseLedger pending PPS custody.  The practical hardware contract permits
+// exactly one in-progress PPS row: both OCXO one-second edges arrive before
+// the next PPS.  This is one scalar slot, not a queue.
+static constexpr uint32_t ALPHA_COUNTERLEDGER_PHASE_PENDING_SLOT_CAPACITY = 1U;
 
 // CounterLedger is a PPS-sampled 10 MHz integer rail.  A lawful contiguous
 // PPS interval must remain within 10,000 ticks of the nominal 10,000,000-tick
@@ -2391,8 +2388,6 @@ struct alpha_pps_counterledger_lane_t {
   uint32_t pending_phase_pps_dwt_at_edge = 0;
   uint32_t phase_pending_overwrite_count = 0;
 
-  alpha_counterledger_phase_pending_t
-      phase_pending_ring[ALPHA_COUNTERLEDGER_PHASE_PENDING_RING_SIZE] = {};
   uint32_t phase_pending_depth = 0;
   uint32_t phase_pending_depth_max = 0;
   uint32_t phase_pending_enqueue_count = 0;
@@ -2540,6 +2535,20 @@ struct alpha_pps_counterledger_lane_t {
 static alpha_pps_counterledger_lane_t g_ocxo1_pps_counterledger = {};
 static alpha_pps_counterledger_lane_t g_ocxo2_pps_counterledger = {};
 
+// One practical PPS row may be in flight.  OCXO callbacks may run before or
+// after the PPS selector callback, so the latest per-lane PPS identities are
+// retained beside the row rather than queued.
+struct alpha_pending_timebase_row_t {
+  bool     open = false;
+  uint32_t pps_sequence = 0;
+  bool     ocxo1_complete = false;
+  bool     ocxo2_complete = false;
+};
+
+static alpha_pending_timebase_row_t g_alpha_pending_timebase_row = {};
+static uint32_t g_alpha_last_ocxo1_pps_sequence = 0U;
+static uint32_t g_alpha_last_ocxo2_pps_sequence = 0U;
+static uint32_t g_alpha_last_installed_timebase_pps_sequence = 0U;
 
 // ============================================================================
 // Alpha always-on TAU estimator — PhaseLedger slope authority
@@ -2851,111 +2860,55 @@ static bool alpha_counterledger_dwt32_before(uint32_t lhs, uint32_t rhs) {
 
 static void alpha_counterledger_phase_pending_refresh(
     alpha_pps_counterledger_lane_t& s) {
-  uint32_t depth = 0U;
-  uint32_t oldest_seq = 0U;
-  uint32_t newest_seq = 0U;
-  uint32_t newest_dwt = 0U;
-
-  for (uint32_t i = 0; i < ALPHA_COUNTERLEDGER_PHASE_PENDING_RING_SIZE; i++) {
-    const alpha_counterledger_phase_pending_t& p = s.phase_pending_ring[i];
-    if (!p.valid) continue;
-
-    depth++;
-    if (oldest_seq == 0U || p.pps_sequence < oldest_seq) {
-      oldest_seq = p.pps_sequence;
-    }
-    if (newest_seq == 0U || p.pps_sequence > newest_seq) {
-      newest_seq = p.pps_sequence;
-      newest_dwt = p.pps_dwt_at_edge;
-    }
+  s.phase_pending_depth = s.phase_pending ? 1U : 0U;
+  if (s.phase_pending_depth > s.phase_pending_depth_max) {
+    s.phase_pending_depth_max = s.phase_pending_depth;
   }
-
-  s.phase_pending_depth = depth;
-  if (depth > s.phase_pending_depth_max) {
-    s.phase_pending_depth_max = depth;
-  }
-  s.phase_pending = depth != 0U;
-  s.phase_pending_oldest_pps_sequence = oldest_seq;
-  s.phase_pending_newest_pps_sequence = newest_seq;
-  s.pending_phase_pps_sequence = newest_seq;
-  s.pending_phase_pps_dwt_at_edge = newest_dwt;
+  s.phase_pending_oldest_pps_sequence =
+      s.phase_pending ? s.pending_phase_pps_sequence : 0U;
+  s.phase_pending_newest_pps_sequence =
+      s.phase_pending ? s.pending_phase_pps_sequence : 0U;
 }
 
 static void alpha_counterledger_phase_pending_clear(
     alpha_pps_counterledger_lane_t& s) {
-  for (uint32_t i = 0; i < ALPHA_COUNTERLEDGER_PHASE_PENDING_RING_SIZE; i++) {
-    s.phase_pending_ring[i] = alpha_counterledger_phase_pending_t{};
-  }
   s.phase_pending = false;
   s.pending_phase_pps_sequence = 0U;
   s.pending_phase_pps_dwt_at_edge = 0U;
-  s.phase_pending_depth = 0U;
-  s.phase_pending_oldest_pps_sequence = 0U;
-  s.phase_pending_newest_pps_sequence = 0U;
-}
-
-static int alpha_counterledger_phase_pending_find_free(
-    const alpha_pps_counterledger_lane_t& s) {
-  for (uint32_t i = 0; i < ALPHA_COUNTERLEDGER_PHASE_PENDING_RING_SIZE; i++) {
-    if (!s.phase_pending_ring[i].valid) return (int)i;
-  }
-  return -1;
-}
-
-static int alpha_counterledger_phase_pending_find_sequence(
-    const alpha_pps_counterledger_lane_t& s,
-    uint32_t pps_sequence) {
-  for (uint32_t i = 0; i < ALPHA_COUNTERLEDGER_PHASE_PENDING_RING_SIZE; i++) {
-    if (s.phase_pending_ring[i].valid &&
-        s.phase_pending_ring[i].pps_sequence == pps_sequence) {
-      return (int)i;
-    }
-  }
-  return -1;
-}
-
-static int alpha_counterledger_phase_pending_oldest_index(
-    const alpha_pps_counterledger_lane_t& s) {
-  int index = -1;
-  uint32_t oldest_seq = 0U;
-  for (uint32_t i = 0; i < ALPHA_COUNTERLEDGER_PHASE_PENDING_RING_SIZE; i++) {
-    const alpha_counterledger_phase_pending_t& p = s.phase_pending_ring[i];
-    if (!p.valid) continue;
-    if (index < 0 || p.pps_sequence < oldest_seq) {
-      index = (int)i;
-      oldest_seq = p.pps_sequence;
-    }
-  }
-  return index;
+  alpha_counterledger_phase_pending_refresh(s);
 }
 
 static void alpha_counterledger_phase_pending_enqueue(
+    time_clock_id_t clock,
     alpha_pps_counterledger_lane_t& s,
     uint32_t pps_sequence,
     uint32_t pps_dwt_at_edge) {
   if (pps_sequence == 0U || pps_dwt_at_edge == 0U) return;
 
-  int slot = alpha_counterledger_phase_pending_find_sequence(s, pps_sequence);
-  if (slot >= 0) {
-    s.phase_pending_ring[(uint32_t)slot].pps_dwt_at_edge = pps_dwt_at_edge;
-    alpha_counterledger_phase_pending_refresh(s);
+  if (s.phase_pending) {
+    if (s.pending_phase_pps_sequence == pps_sequence) {
+      s.pending_phase_pps_dwt_at_edge = pps_dwt_at_edge;
+      alpha_counterledger_phase_pending_refresh(s);
+      return;
+    }
+
+    // A second PPS reached this lane before the first one resolved.  That is a
+    // structural violation of the one-row hardware contract, not a reason to
+    // grow a queue or silently overwrite custody.
+    const uint32_t prior_sequence = s.pending_phase_pps_sequence;
+    s.phase_pending_overflow_count++;
+    clocks_watchdog_anomaly(
+        "alpha_phaseledger_pending_overlap",
+        (uint32_t)((uint8_t)clock),
+        prior_sequence,
+        pps_sequence,
+        pps_dwt_at_edge);
     return;
   }
 
-  slot = alpha_counterledger_phase_pending_find_free(s);
-  if (slot < 0) {
-    slot = alpha_counterledger_phase_pending_oldest_index(s);
-    if (slot < 0) return;
-    s.phase_pending_overflow_count++;
-    s.phase_pending_drop_count++;
-    s.phase_pending_overwrite_count++;
-    s.phase_pending_last_dropped_pps_sequence =
-        s.phase_pending_ring[(uint32_t)slot].pps_sequence;
-  }
-
-  s.phase_pending_ring[(uint32_t)slot].valid = true;
-  s.phase_pending_ring[(uint32_t)slot].pps_sequence = pps_sequence;
-  s.phase_pending_ring[(uint32_t)slot].pps_dwt_at_edge = pps_dwt_at_edge;
+  s.phase_pending = true;
+  s.pending_phase_pps_sequence = pps_sequence;
+  s.pending_phase_pps_dwt_at_edge = pps_dwt_at_edge;
   s.phase_pending_enqueue_count++;
   alpha_counterledger_phase_pending_refresh(s);
 }
@@ -2964,36 +2917,40 @@ static void alpha_counterledger_phase_pending_remove_at(
     alpha_pps_counterledger_lane_t& s,
     int index,
     bool resolved) {
-  if (index < 0 ||
-      index >= (int)ALPHA_COUNTERLEDGER_PHASE_PENDING_RING_SIZE ||
-      !s.phase_pending_ring[(uint32_t)index].valid) {
-    return;
-  }
+  if (index != 0 || !s.phase_pending) return;
 
-  const uint32_t seq = s.phase_pending_ring[(uint32_t)index].pps_sequence;
-  s.phase_pending_ring[(uint32_t)index] = alpha_counterledger_phase_pending_t{};
+  const uint32_t seq = s.pending_phase_pps_sequence;
+  alpha_counterledger_phase_pending_clear(s);
   if (resolved) {
     s.phase_pending_resolve_count++;
     s.phase_pending_last_resolved_pps_sequence = seq;
-    s.phase_pending_last_matched_index = (uint32_t)index;
+    s.phase_pending_last_matched_index = 0U;
   } else {
     s.phase_pending_drop_count++;
     s.phase_pending_last_dropped_pps_sequence = seq;
   }
-  alpha_counterledger_phase_pending_refresh(s);
 }
 
-static void alpha_counterledger_phase_pending_drop_stale_before(
+static bool alpha_counterledger_phase_pending_reject_stale_before(
+    time_clock_id_t clock,
     alpha_pps_counterledger_lane_t& s,
     uint32_t previous_ocxo_dwt_at_edge) {
-  for (uint32_t i = 0; i < ALPHA_COUNTERLEDGER_PHASE_PENDING_RING_SIZE; i++) {
-    const alpha_counterledger_phase_pending_t& p = s.phase_pending_ring[i];
-    if (!p.valid) continue;
-    if (alpha_counterledger_dwt32_before(p.pps_dwt_at_edge,
-                                         previous_ocxo_dwt_at_edge)) {
-      alpha_counterledger_phase_pending_remove_at(s, (int)i, false);
-    }
+  if (!s.phase_pending ||
+      !alpha_counterledger_dwt32_before(s.pending_phase_pps_dwt_at_edge,
+                                        previous_ocxo_dwt_at_edge)) {
+    return false;
   }
+
+  const uint32_t stale_sequence = s.pending_phase_pps_sequence;
+  const uint32_t stale_dwt = s.pending_phase_pps_dwt_at_edge;
+  alpha_counterledger_phase_pending_remove_at(s, 0, false);
+  clocks_watchdog_anomaly(
+      "alpha_phaseledger_pending_stale",
+      (uint32_t)((uint8_t)clock),
+      stale_sequence,
+      stale_dwt,
+      previous_ocxo_dwt_at_edge);
+  return true;
 }
 
 static bool alpha_counterledger_phase_pending_find_bracketed(
@@ -3003,28 +2960,19 @@ static bool alpha_counterledger_phase_pending_find_bracketed(
     int* out_index,
     alpha_counterledger_phase_pending_t* out_pending,
     uint32_t* out_pps_delta_cycles) {
-  int best = -1;
-  uint32_t best_seq = 0U;
-  uint32_t best_delta = 0U;
+  if (!s.phase_pending) return false;
 
-  for (uint32_t i = 0; i < ALPHA_COUNTERLEDGER_PHASE_PENDING_RING_SIZE; i++) {
-    const alpha_counterledger_phase_pending_t& p = s.phase_pending_ring[i];
-    if (!p.valid) continue;
+  const uint32_t delta =
+      s.pending_phase_pps_dwt_at_edge - previous_ocxo_dwt_at_edge;
+  if (delta > interval_cycles) return false;
 
-    const uint32_t delta = p.pps_dwt_at_edge - previous_ocxo_dwt_at_edge;
-    if (delta > interval_cycles) continue;
-
-    if (best < 0 || p.pps_sequence < best_seq) {
-      best = (int)i;
-      best_seq = p.pps_sequence;
-      best_delta = delta;
-    }
+  if (out_index) *out_index = 0;
+  if (out_pending) {
+    out_pending->valid = true;
+    out_pending->pps_sequence = s.pending_phase_pps_sequence;
+    out_pending->pps_dwt_at_edge = s.pending_phase_pps_dwt_at_edge;
   }
-
-  if (best < 0) return false;
-  if (out_index) *out_index = best;
-  if (out_pending) *out_pending = s.phase_pending_ring[(uint32_t)best];
-  if (out_pps_delta_cycles) *out_pps_delta_cycles = best_delta;
+  if (out_pps_delta_cycles) *out_pps_delta_cycles = delta;
   return true;
 }
 
@@ -3226,6 +3174,81 @@ static uint64_t alpha_phaseledger_refined_ns_with_carry(
   return (out >= carry_ns) ? (out - carry_ns) : 0ULL;
 }
 
+static bool alpha_counterledger_refresh_refined_from_phase(
+    time_clock_id_t clock,
+    alpha_pps_counterledger_lane_t& s) {
+  if (!s.initialized || !s.phase_valid || s.pps_sequence == 0U ||
+      s.phase_pps_sequence != s.pps_sequence) {
+    return false;
+  }
+
+  if (s.refined_valid &&
+      s.refined_phase_pps_sequence == s.pps_sequence) {
+    return true;
+  }
+
+  const uint64_t refined_ns = alpha_phaseledger_refined_ns_with_carry(
+      s.ns,
+      s.phase_unwrapped_carry_ticks,
+      s.phase_after_last_00_ns);
+
+  s.refined_valid = true;
+  s.refined_phase_pps_sequence = s.phase_pps_sequence;
+  s.refined_ns = refined_ns;
+  s.refined_interval_valid = false;
+  s.refined_interval_ns = 0ULL;
+  s.refined_fast_residual_ns = 0LL;
+
+  if (s.last_refined_phase_pps_sequence != 0U &&
+      s.refined_phase_pps_sequence ==
+          (uint32_t)(s.last_refined_phase_pps_sequence + 1U) &&
+      refined_ns >= s.last_refined_ns) {
+    s.refined_interval_valid = s.interval_valid;
+    if (s.refined_interval_valid) {
+      s.refined_interval_ns = refined_ns - s.last_refined_ns;
+      s.refined_fast_residual_ns =
+          (int64_t)s.refined_interval_ns - (int64_t)NS_PER_SECOND_U64;
+      s.refined_interval_accept_count++;
+      if (s.recover_reprime_count != 0U) {
+        s.recover_refined_interval_accept_count++;
+      }
+    }
+  }
+
+  if (s.interval_valid) {
+    alpha_counterledger_add_block_interval(
+        s,
+        s.pps_sequence - 1U,
+        s.pps_sequence,
+        s.last_delta_ticks,
+        s.last_interval_ns,
+        s.last_fast_residual_ns,
+        s.refined_interval_valid,
+        s.refined_interval_ns,
+        s.refined_fast_residual_ns);
+  }
+
+  alpha_tau_note_refined_endpoint(clock,
+                                  s.refined_phase_pps_sequence,
+                                  s.refined_ns,
+                                  s.refined_interval_valid,
+                                  s.refined_interval_ns,
+                                  s.refined_fast_residual_ns);
+  return true;
+}
+
+static bool alpha_counterledger_phase_left_edge_ready(
+    time_clock_id_t clock) {
+  switch (clock) {
+    case time_clock_id_t::OCXO1:
+      return g_ocxo1_measurement.prev_dwt_at_edge != 0U;
+    case time_clock_id_t::OCXO2:
+      return g_ocxo2_measurement.prev_dwt_at_edge != 0U;
+    default:
+      return false;
+  }
+}
+
 static bool alpha_counterledger_interval_plausible(uint32_t delta_ticks) {
   return delta_ticks >= ALPHA_COUNTERLEDGER_MIN_PLAUSIBLE_INTERVAL_TICKS &&
          delta_ticks <= ALPHA_COUNTERLEDGER_MAX_PLAUSIBLE_INTERVAL_TICKS;
@@ -3372,96 +3395,48 @@ static bool alpha_counterledger_apply_pps_sample(
   s.update_count++;
   s.ns = s.ticks64 * (uint64_t)NS_PER_10MHZ_TICK;
 
-  alpha_counterledger_phase_pending_enqueue(s, pps_sequence, pps_dwt_at_edge);
-
-  // PPS-sample-side catch-up: the OCXO edge resolver may have run moments
-  // before this PPS capture was enqueued and reported NO_PENDING_PPS even
-  // though its last edge pair already brackets the PPS fact.  Re-try against
-  // the cached lawful edge pair immediately, before deriving this row's
-  // refined interval.  This does not relax any PhaseLedger gate; it merely
-  // allows resolution from either event ordering.
-  (void)alpha_counterledger_phase_catchup_from_last_edge_pair(clock, s);
-
-  s.last_refined_ns = previous_refined_ns;
-  s.last_refined_phase_pps_sequence = previous_refined_phase_pps_sequence;
-  s.refined_valid = s.phase_valid;
-  s.refined_phase_pps_sequence = s.phase_valid ? s.phase_pps_sequence : 0U;
-  s.refined_ns = s.phase_valid
-      ? alpha_phaseledger_refined_ns_with_carry(
-            s.ns,
-            s.phase_unwrapped_carry_ticks,
-            s.phase_after_last_00_ns)
-      : s.ns;
-
-  // PhaseLedger is intentionally allowed to lag the current PPS row: the next
-  // OCXO 00-edge must arrive before the suffix for that PPS can be known.  The
-  // lag is published so reports can distinguish exact-row phase from a clean
-  // one-row delayed phase witness.
-  const bool phase_not_from_future =
-      s.phase_valid && s.phase_pps_sequence <= pps_sequence;
-  const uint32_t phase_lag = phase_not_from_future
-      ? (uint32_t)(pps_sequence - s.phase_pps_sequence)
+  // Cut the provisional one-row-lagged refined value immediately.  The
+  // current PPS becomes refined only when its own bracketing OCXO edge pair
+  // has resolved.
+  s.last_refined_ns = had_prior_refined ? previous_refined_ns : 0ULL;
+  s.last_refined_phase_pps_sequence = had_prior_refined
+      ? previous_refined_phase_pps_sequence
       : 0U;
-  (void)phase_lag;
-
+  s.refined_valid = false;
+  s.refined_phase_pps_sequence = 0U;
+  s.refined_ns = s.ns;
   s.refined_interval_valid = false;
-  s.refined_interval_ns = 0;
-  s.refined_fast_residual_ns = 0;
-  if (had_prior_refined && s.refined_valid &&
-      s.refined_ns >= previous_refined_ns &&
-      s.refined_phase_pps_sequence ==
-          (uint32_t)(previous_refined_phase_pps_sequence + 1U)) {
-    s.refined_interval_valid = contiguous;
-    if (s.refined_interval_valid) {
-      s.refined_interval_ns = s.refined_ns - previous_refined_ns;
-      s.refined_fast_residual_ns =
-          (int64_t)s.refined_interval_ns - (int64_t)NS_PER_SECOND_U64;
-      s.refined_interval_accept_count++;
-      if (s.recover_reprime_count != 0U) {
-        s.recover_refined_interval_accept_count++;
-      }
-    }
-  }
+  s.refined_interval_ns = 0ULL;
+  s.refined_fast_residual_ns = 0LL;
 
-  // The first sample after SmartZero/RECOVER establishes the PPS-sampled
-  // bookend.  Likewise, if a packet was missed or the contiguous interval is
-  // physically impossible, do not turn the catch-up/stale sample into a false
-  // +/-1e9 ns residual or a valid recovery reattachment proof.
+  // Establish current integer-interval validity before any ordering catch-up
+  // can resolve PhaseLedger and derive the refined interval.
   s.interval_valid = admissible_interval;
   if (!s.interval_valid) {
     if (had_prior_sample && !contiguous) {
       s.interval_gap_count++;
       alpha_counterledger_reset_current_block_for_gap(s);
     }
-    s.last_delta_ticks = 0;
-    s.last_interval_ns = 0;
-    s.last_fast_residual_ns = 0;
-    s.refined_interval_valid = false;
-    s.refined_interval_ns = 0;
-    s.refined_fast_residual_ns = 0;
+    s.last_delta_ticks = 0U;
+    s.last_interval_ns = 0ULL;
+    s.last_fast_residual_ns = 0LL;
   } else {
     s.last_delta_ticks = delta_ticks;
-    s.last_interval_ns = (uint64_t)delta_ticks * (uint64_t)NS_PER_10MHZ_TICK;
+    s.last_interval_ns =
+        (uint64_t)delta_ticks * (uint64_t)NS_PER_10MHZ_TICK;
     s.last_fast_residual_ns =
         (int64_t)s.last_interval_ns - (int64_t)NS_PER_SECOND_U64;
-    alpha_counterledger_add_block_interval(s,
-                                           previous_pps_sequence,
-                                           pps_sequence,
-                                           delta_ticks,
-                                           s.last_interval_ns,
-                                           s.last_fast_residual_ns,
-                                           s.refined_interval_valid,
-                                           s.refined_interval_ns,
-                                           s.refined_fast_residual_ns);
   }
 
-  if (s.refined_valid) {
-    alpha_tau_note_refined_endpoint(clock,
-                                    s.refined_phase_pps_sequence,
-                                    s.refined_ns,
-                                    s.refined_interval_valid,
-                                    s.refined_interval_ns,
-                                    s.refined_fast_residual_ns);
+  if (alpha_counterledger_phase_left_edge_ready(clock)) {
+    alpha_counterledger_phase_pending_enqueue(clock, s, pps_sequence,
+                                               pps_dwt_at_edge);
+
+    // PPS-sample-side catch-up: the OCXO edge resolver may have run moments
+    // before this PPS capture was enqueued.  Re-try the cached adjacent edge
+    // pair; exact-row refinement remains mandatory.
+    (void)alpha_counterledger_phase_catchup_from_last_edge_pair(clock, s);
+    (void)alpha_counterledger_refresh_refined_from_phase(clock, s);
   }
 
   if (out_ns) *out_ns = s.refined_valid ? s.refined_ns : s.ns;
@@ -3568,11 +3543,6 @@ static alpha_pps_counterledger_lane_t* alpha_counterledger_lane_mut(
   }
 }
 
-static bool alpha_counterledger_phase_ready_all(void) {
-  return g_ocxo1_pps_counterledger.phase_valid &&
-         g_ocxo2_pps_counterledger.phase_valid;
-}
-
 static void alpha_counterledger_note_phase_resolve(
     alpha_pps_counterledger_lane_t& s,
     uint32_t reason_id,
@@ -3660,12 +3630,13 @@ static bool alpha_counterledger_resolve_phase_from_ocxo_edge(
     return false;
   }
 
-  // Preserve custody of several unresolved PPS facts.  Facts that are already
-  // behind the lower OCXO edge can never be bracketed by this or any later
-  // adjacent edge pair, so drop them explicitly.  Future facts stay pending.
-  alpha_counterledger_phase_pending_drop_stale_before(
-      *s,
-      previous_ocxo_dwt_at_edge);
+  // Preserve the one pending PPS fact.  If it is already behind the lower
+  // OCXO edge, it can never be bracketed by this or any later adjacent pair,
+  // so drop it explicitly.  A future fact remains pending.
+  if (alpha_counterledger_phase_pending_reject_stale_before(
+          clock, *s, previous_ocxo_dwt_at_edge)) {
+    return false;
+  }
 
   alpha_counterledger_phase_pending_t pending{};
   int pending_index = -1;
@@ -3688,8 +3659,8 @@ static bool alpha_counterledger_resolve_phase_from_ocxo_edge(
       return false;
     }
 
-    // The remaining pending PPS fact(s) are ahead of this OCXO edge pair.
-    // Keep them for a later edge pair instead of overwriting or guessing.
+    // The pending PPS fact is ahead of this OCXO edge pair.  Keep the single
+    // slot for a later adjacent pair instead of overwriting or guessing.
     s->phase_pending_unbracketed_count++;
     const uint32_t pending_delta =
         s->pending_phase_pps_dwt_at_edge - previous_ocxo_dwt_at_edge;
@@ -3790,6 +3761,7 @@ static bool alpha_counterledger_resolve_phase_from_ocxo_edge(
       counter_delta_ticks,
       interval_cycles,
       pps_delta_cycles);
+  (void)alpha_counterledger_refresh_refined_from_phase(clock, *s);
   return true;
 }
 
@@ -3877,9 +3849,8 @@ struct alpha_bridge_anchor_t {
   uint64_t gnss_ns = 0;
 };
 static constexpr uint32_t ALPHA_BRIDGE_ANCHOR_RING_SIZE = 4U;
-// A pending edge unresolved after this many subsequent OCXO edges falls back
-// to legacy ratio conversion (GNSS holdover), truthfully counted.
-static constexpr uint32_t ALPHA_BRIDGE_PENDING_MAX_AGE_EVENTS = 3U;
+// The legacy bridge is forensic only.  It retains one prior edge and resolves
+// or falls back before accepting the next; it has no pending-edge queue.
 static alpha_bridge_anchor_t g_bridge_anchors[ALPHA_BRIDGE_ANCHOR_RING_SIZE] = {};
 static uint32_t g_bridge_anchor_total = 0;
 
@@ -5048,7 +5019,7 @@ bool clocks_alpha_ocxo_counterledger_snapshot(
   out->phase_wrap_count = s->phase_wrap_count;
   out->phase_resolve_count = s->phase_resolve_count;
   out->phase_pending_overwrite_count = s->phase_pending_overwrite_count;
-  out->phase_pending_capacity = ALPHA_COUNTERLEDGER_PHASE_PENDING_RING_SIZE;
+  out->phase_pending_capacity = ALPHA_COUNTERLEDGER_PHASE_PENDING_SLOT_CAPACITY;
   out->phase_pending_depth = s->phase_pending_depth;
   out->phase_pending_depth_max = s->phase_pending_depth_max;
   out->phase_pending_enqueue_count = s->phase_pending_enqueue_count;
@@ -5243,15 +5214,14 @@ static bool alpha_counterledger_lane_ready_light(
 
   const bool phase_ready =
       s.phase_valid &&
+      !s.phase_pending &&
       s.phase_pps_sequence != 0U &&
-      s.phase_pps_sequence <= s.pps_sequence;
-  const uint32_t phase_lag = phase_ready
-      ? (uint32_t)(s.pps_sequence - s.phase_pps_sequence)
-      : 0U;
+      s.phase_pps_sequence == s.pps_sequence;
 
   return s.interval_valid && s.last_interval_ns != 0ULL &&
-         phase_ready && phase_lag <= 1U &&
+         phase_ready &&
          s.refined_valid &&
+         s.refined_phase_pps_sequence == s.pps_sequence &&
          s.refined_interval_valid && s.refined_interval_ns != 0ULL;
 }
 
@@ -5574,6 +5544,225 @@ static void alpha_ocxo_visible_origin_maybe_capture_public_origin(
   alpha_ocxo_visible_origin_refresh_public_ready();
 }
 
+static void alpha_timebase_row_clear(void) {
+  g_alpha_pending_timebase_row = alpha_pending_timebase_row_t{};
+}
+
+static void alpha_timebase_row_reset_all(void) {
+  alpha_timebase_row_clear();
+  g_alpha_last_ocxo1_pps_sequence = 0U;
+  g_alpha_last_ocxo2_pps_sequence = 0U;
+  g_alpha_last_installed_timebase_pps_sequence = 0U;
+}
+
+static bool alpha_timebase_lane_capture_ready(
+    const alpha_pps_counterledger_lane_t& s,
+    uint32_t pps_sequence) {
+  return s.initialized && s.pps_sequence == pps_sequence &&
+      s.last_capture_available && s.last_capture_valid &&
+      s.last_capture_lane_valid && s.last_capture_all_lanes_valid &&
+      s.last_capture_sequence_match &&
+      s.last_capture_sequence == pps_sequence;
+}
+
+static bool alpha_timebase_lane_ready(time_clock_id_t clock,
+                                      uint32_t pps_sequence) {
+  const alpha_pps_counterledger_lane_t* s =
+      alpha_counterledger_lane(clock);
+  return s && alpha_timebase_lane_capture_ready(*s, pps_sequence) &&
+      s->phase_valid && s->phase_pps_sequence == pps_sequence &&
+      !s->phase_pending && s->refined_valid &&
+      s->refined_phase_pps_sequence == pps_sequence &&
+      s->refined_ns != 0ULL;
+}
+
+static bool alpha_timebase_lane_waiting_for_phase(
+    const alpha_pps_counterledger_lane_t& s,
+    uint32_t pps_sequence) {
+  return alpha_timebase_lane_capture_ready(s, pps_sequence) &&
+      s.phase_pending &&
+      s.pending_phase_pps_sequence == pps_sequence;
+}
+
+static uint32_t alpha_timebase_row_missing_mask(uint32_t pps_sequence) {
+  uint32_t missing = 0U;
+  if (!epoch_ready()) missing |= 1U << 0;
+  if (pps_sequence == 0U) missing |= 1U << 1;
+  if (g_ocxo1_measurement.prev_dwt_at_edge == 0U) missing |= 1U << 2;
+  if (g_ocxo2_measurement.prev_dwt_at_edge == 0U) missing |= 1U << 3;
+  if (g_pps_witness_diag.pps_edge_sequence != pps_sequence) missing |= 1U << 4;
+  if (g_dwt_at_pps_vclock == 0U) missing |= 1U << 5;
+  if (g_gnss_ns_at_pps_vclock == 0ULL) missing |= 1U << 6;
+
+  const bool ocxo1_ready =
+      alpha_timebase_lane_ready(time_clock_id_t::OCXO1, pps_sequence) ||
+      alpha_timebase_lane_waiting_for_phase(
+          g_ocxo1_pps_counterledger, pps_sequence);
+  const bool ocxo2_ready =
+      alpha_timebase_lane_ready(time_clock_id_t::OCXO2, pps_sequence) ||
+      alpha_timebase_lane_waiting_for_phase(
+          g_ocxo2_pps_counterledger, pps_sequence);
+  if (!ocxo1_ready) missing |= 1U << 7;
+  if (!ocxo2_ready) missing |= 1U << 8;
+  return missing;
+}
+
+static bool alpha_timebase_install_refined_clockfaces(
+    uint32_t pps_sequence) {
+  if (g_alpha_last_installed_timebase_pps_sequence == pps_sequence) {
+    return true;
+  }
+
+  if (!alpha_timebase_lane_ready(time_clock_id_t::OCXO1, pps_sequence) ||
+      !alpha_timebase_lane_ready(time_clock_id_t::OCXO2, pps_sequence) ||
+      g_pps_witness_diag.pps_edge_sequence != pps_sequence ||
+      g_gnss_ns_at_pps_vclock == 0ULL || g_dwt_at_pps_vclock == 0U) {
+    return false;
+  }
+
+  const uint64_t ocxo1_physical_ns = g_ocxo1_pps_counterledger.refined_ns;
+  const uint64_t ocxo2_physical_ns = g_ocxo2_pps_counterledger.refined_ns;
+
+  alpha_ocxo_visible_origin_maybe_capture_public_origin(
+      time_clock_id_t::OCXO1,
+      pps_sequence,
+      g_gnss_ns_at_pps_vclock,
+      ocxo1_physical_ns);
+  alpha_ocxo_visible_origin_maybe_capture_public_origin(
+      time_clock_id_t::OCXO2,
+      pps_sequence,
+      g_gnss_ns_at_pps_vclock,
+      ocxo2_physical_ns);
+
+  const uint64_t ocxo1_public_ns = alpha_ocxo_public_ns_from_visible_origin(
+      time_clock_id_t::OCXO1, ocxo1_physical_ns);
+  const uint64_t ocxo2_public_ns = alpha_ocxo_public_ns_from_visible_origin(
+      time_clock_id_t::OCXO2, ocxo2_physical_ns);
+
+  g_ocxo1_physical_measured_gnss_ns_at_pps_vclock = ocxo1_physical_ns;
+  g_ocxo2_physical_measured_gnss_ns_at_pps_vclock = ocxo2_physical_ns;
+  g_ocxo1_measured_gnss_ns_at_pps_vclock = ocxo1_public_ns;
+  g_ocxo2_measured_gnss_ns_at_pps_vclock = ocxo2_public_ns;
+
+  g_ocxo1_clock.ledger_ns_count_at_pps_vclock = ocxo1_public_ns;
+  g_ocxo2_clock.ledger_ns_count_at_pps_vclock = ocxo2_public_ns;
+  g_ocxo1_clock.phase_offset_ns =
+      (int64_t)g_gnss_ns_at_pps_vclock - (int64_t)ocxo1_public_ns;
+  g_ocxo2_clock.phase_offset_ns =
+      (int64_t)g_gnss_ns_at_pps_vclock - (int64_t)ocxo2_public_ns;
+  g_ocxo1_clock.zero_established = true;
+  g_ocxo2_clock.zero_established = true;
+
+  (void)time_clock_update(time_clock_id_t::OCXO1,
+                          g_dwt_at_pps_vclock,
+                          ocxo1_public_ns);
+  (void)time_clock_update(time_clock_id_t::OCXO2,
+                          g_dwt_at_pps_vclock,
+                          ocxo2_public_ns);
+  g_alpha_last_installed_timebase_pps_sequence = pps_sequence;
+  return true;
+}
+
+static void alpha_timebase_row_try_complete(void) {
+  if (!g_alpha_pending_timebase_row.open ||
+      !g_alpha_pending_timebase_row.ocxo1_complete ||
+      !g_alpha_pending_timebase_row.ocxo2_complete) {
+    return;
+  }
+
+  const uint32_t pps_sequence =
+      g_alpha_pending_timebase_row.pps_sequence;
+  if (!alpha_timebase_install_refined_clockfaces(pps_sequence)) {
+    clocks_watchdog_anomaly(
+        "alpha_timebase_clockface_install_failed",
+        pps_sequence,
+        g_ocxo1_pps_counterledger.phase_pps_sequence,
+        g_ocxo2_pps_counterledger.phase_pps_sequence,
+        g_pps_witness_diag.pps_edge_sequence);
+    alpha_timebase_row_clear();
+    return;
+  }
+
+  // Clear before entering Beta.  Publication may execute command/lifecycle
+  // paths, but it cannot observe or overwrite an open Alpha row.
+  alpha_timebase_row_clear();
+  clocks_beta_pps(pps_sequence);
+}
+
+static void alpha_timebase_row_note_ocxo_event(
+    time_clock_id_t clock,
+    const interrupt_event_t& event) {
+  uint32_t* latest_sequence = nullptr;
+  bool* row_complete = nullptr;
+  if (clock == time_clock_id_t::OCXO1) {
+    latest_sequence = &g_alpha_last_ocxo1_pps_sequence;
+    row_complete = &g_alpha_pending_timebase_row.ocxo1_complete;
+  } else if (clock == time_clock_id_t::OCXO2) {
+    latest_sequence = &g_alpha_last_ocxo2_pps_sequence;
+    row_complete = &g_alpha_pending_timebase_row.ocxo2_complete;
+  } else {
+    return;
+  }
+
+  *latest_sequence = event.pps_sequence;
+  if (event.pps_sequence == 0U) return;
+
+  // Alpha clockfaces are always-on.  The later of the two OCXO callbacks
+  // installs this exact PPS even when no campaign row is currently open; Beta
+  // publication remains separately gated by the one-row state below.
+  (void)alpha_timebase_install_refined_clockfaces(event.pps_sequence);
+
+  if (!g_alpha_pending_timebase_row.open) return;
+
+  if (event.pps_sequence != g_alpha_pending_timebase_row.pps_sequence) {
+    clocks_watchdog_anomaly(
+        "alpha_timebase_ocxo_sequence_mismatch",
+        (uint32_t)((uint8_t)clock),
+        g_alpha_pending_timebase_row.pps_sequence,
+        event.pps_sequence,
+        event.counter32_at_event);
+    alpha_timebase_row_clear();
+    return;
+  }
+
+  *row_complete = alpha_timebase_lane_ready(clock, event.pps_sequence);
+  alpha_timebase_row_try_complete();
+}
+
+static void alpha_timebase_row_open(uint32_t pps_sequence) {
+  const uint32_t missing = alpha_timebase_row_missing_mask(pps_sequence);
+  if (missing != 0U) {
+    clocks_watchdog_anomaly(
+        "alpha_timebase_row_inputs_missing",
+        pps_sequence,
+        missing,
+        g_ocxo1_pps_counterledger.pps_sequence,
+        g_ocxo2_pps_counterledger.pps_sequence);
+    return;
+  }
+
+  if (g_alpha_pending_timebase_row.open) {
+    clocks_watchdog_anomaly(
+        "alpha_timebase_row_overlap",
+        g_alpha_pending_timebase_row.pps_sequence,
+        pps_sequence,
+        g_alpha_last_ocxo1_pps_sequence,
+        g_alpha_last_ocxo2_pps_sequence);
+    alpha_timebase_row_clear();
+    return;
+  }
+
+  g_alpha_pending_timebase_row.open = true;
+  g_alpha_pending_timebase_row.pps_sequence = pps_sequence;
+  g_alpha_pending_timebase_row.ocxo1_complete =
+      g_alpha_last_ocxo1_pps_sequence == pps_sequence &&
+      alpha_timebase_lane_ready(time_clock_id_t::OCXO1, pps_sequence);
+  g_alpha_pending_timebase_row.ocxo2_complete =
+      g_alpha_last_ocxo2_pps_sequence == pps_sequence &&
+      alpha_timebase_lane_ready(time_clock_id_t::OCXO2, pps_sequence);
+  alpha_timebase_row_try_complete();
+}
+
 static uint64_t alpha_ocxo_apply_measured_second(time_clock_id_t clock,
                                                  uint32_t raw_edge_dwt,
                                                  uint32_t* out_dwt_cycles,
@@ -5591,90 +5780,84 @@ static uint64_t alpha_ocxo_apply_measured_second(time_clock_id_t clock,
   if (out_real_interval_ns) *out_real_interval_ns = 0;
   if (out_residual_fast_ns) *out_residual_fast_ns = 0;
 
-  // Resolve the pending edge against the bridge anchors.  The closing
-  // anchor for edge E arrives one second after E, and always before the
-  // next OCXO edge in normal operation, so resolution happens here with a
-  // one-edge lag.  Resolved coordinates are ABSOLUTE GNSS interpolations:
-  // the measured ledger is re-anchored to truth every second and errors do
-  // not integrate.
+  // The bridge is forensic only.  Resolve the previously observed edge now,
+  // using exact PPS bookends when available and direct DWT-ratio holdover when
+  // they are not.  Either path consumes exactly one adjacent physical edge;
+  // no callback-ordering condition may leave it pending and displace the next
+  // edge from the chain.
   if (m->pending_valid) {
-    uint64_t pending_gnss_ns = 0;
+    const uint32_t pending_edge_dwt = m->pending_edge_dwt;
+    const uint32_t dwt_cycles = m->initialized
+        ? (pending_edge_dwt - m->dwt_at_edge)
+        : 0U;
+
+    uint64_t resolved_ns = 0;
     int32_t phi_cycles = 0;
     uint32_t span_cycles = 0;
-    const bool bracketed = alpha_bridge_interpolate_gnss_ns(
-        m->pending_edge_dwt, &pending_gnss_ns, &phi_cycles, &span_cycles);
+    bool resolved_via_bridge = alpha_bridge_interpolate_gnss_ns(
+        pending_edge_dwt, &resolved_ns, &phi_cycles, &span_cycles);
 
-    bool resolve_legacy = false;
-    if (!bracketed) {
-      m->pending_age_events++;
-      if (m->pending_age_events >= ALPHA_BRIDGE_PENDING_MAX_AGE_EVENTS) {
-        // GNSS holdover: anchors stalled.  Fall back to legacy whole-second
-        // ratio conversion for this edge, truthfully counted.  This is the
-        // pre-bridge math and carries its ruler exposure; the counter is the
-        // audit trail.
-        resolve_legacy = true;
-      }
+    if (!resolved_via_bridge) {
+      resolved_ns = m->initialized
+          ? m->ns_at_edge + alpha_dwt_cycles_to_gnss_ns(dwt_cycles)
+          : alpha_ocxo_seed_ns_at_first_edge(pending_edge_dwt);
+      m->bridge_fallback_count++;
+      m->bridge_last_phi_cycles = 0;
+      m->bridge_last_span_cycles = 0;
     }
 
-    if (bracketed || resolve_legacy) {
-      uint64_t resolved_ns = pending_gnss_ns;
-      if (resolve_legacy) {
-        const uint32_t legacy_cycles = m->pending_edge_dwt - m->dwt_at_edge;
-        resolved_ns = m->initialized
-            ? m->ns_at_edge + alpha_dwt_cycles_to_gnss_ns(legacy_cycles)
-            : alpha_ocxo_seed_ns_at_first_edge(m->pending_edge_dwt);
-        m->bridge_fallback_count++;
-        m->last_resolved_via_bridge = false;
-      } else {
-        m->bridge_resolved_count++;
-        m->last_resolved_via_bridge = true;
-        m->bridge_last_phi_cycles = phi_cycles;
-        m->bridge_last_span_cycles = span_cycles;
-      }
+    if (m->initialized && resolved_ns <= m->ns_at_edge) {
+      alpha_science_reject(
+          clocks_science_reject_reason_t::ALPHA_BRIDGE_NONMONOTONIC,
+          clock,
+          pending_edge_dwt,
+          (uint32_t)resolved_ns,
+          (uint32_t)m->ns_at_edge,
+          0U);
 
-      if (m->initialized) {
-        const uint32_t dwt_cycles = m->pending_edge_dwt - m->dwt_at_edge;
-        if (resolved_ns > m->ns_at_edge) {
-          const uint64_t real_interval_ns = resolved_ns - m->ns_at_edge;
-          const int64_t residual_fast_ns =
-              (int64_t)NS_PER_SECOND_U64 - (int64_t)real_interval_ns;
-          if (out_dwt_cycles) *out_dwt_cycles = dwt_cycles;
-          if (out_real_interval_ns) *out_real_interval_ns = real_interval_ns;
-          if (out_residual_fast_ns) *out_residual_fast_ns = residual_fast_ns;
-        } else {
-          alpha_science_reject(
-              clocks_science_reject_reason_t::ALPHA_BRIDGE_NONMONOTONIC,
-              clock,
-              m->pending_edge_dwt,
-              (uint32_t)resolved_ns,
-              (uint32_t)m->ns_at_edge,
-              0U);
-        }
-        m->dwt64_at_edge += (uint64_t)dwt_cycles;
-      } else {
-        m->initialized = true;
-        m->dwt64_at_edge = clocks_dwt_cycles_at_dwt(m->pending_edge_dwt);
-      }
-      m->ns_at_edge = resolved_ns;
-      m->dwt_at_edge = m->pending_edge_dwt;
-      m->pending_valid = false;
-      m->pending_age_events = 0;
+      // The rejected bridge coordinate is forensic evidence, not permission to
+      // break the edge ledger.  Consume this same adjacent edge through the
+      // direct DWT ratio so later edges cannot pair across it.
+      resolved_ns = m->ns_at_edge + alpha_dwt_cycles_to_gnss_ns(dwt_cycles);
+      resolved_via_bridge = false;
+      m->bridge_fallback_count++;
+      m->bridge_last_phi_cycles = 0;
+      m->bridge_last_span_cycles = 0;
     }
-  }
 
-  // Stash this edge as the new pending observation.  If an old pending is
-  // still unresolved (should not happen below the age guard), force the
-  // legacy path next call rather than silently dropping evidence.
-  if (!m->pending_valid) {
-    m->pending_edge_dwt = raw_edge_dwt;
-    m->pending_valid = true;
+    if (resolved_via_bridge) {
+      m->bridge_resolved_count++;
+      m->bridge_last_phi_cycles = phi_cycles;
+      m->bridge_last_span_cycles = span_cycles;
+    }
+    m->last_resolved_via_bridge = resolved_via_bridge;
+
+    if (m->initialized) {
+      const uint64_t real_interval_ns = resolved_ns - m->ns_at_edge;
+      const int64_t residual_fast_ns =
+          (int64_t)NS_PER_SECOND_U64 - (int64_t)real_interval_ns;
+      if (out_dwt_cycles) *out_dwt_cycles = dwt_cycles;
+      if (out_real_interval_ns) *out_real_interval_ns = real_interval_ns;
+      if (out_residual_fast_ns) *out_residual_fast_ns = residual_fast_ns;
+      m->dwt64_at_edge += (uint64_t)dwt_cycles;
+    } else {
+      m->initialized = true;
+      m->dwt64_at_edge = clocks_dwt_cycles_at_dwt(pending_edge_dwt);
+    }
+
+    m->ns_at_edge = resolved_ns;
+    m->dwt_at_edge = pending_edge_dwt;
+    m->pending_valid = false;
     m->pending_age_events = 0;
-  } else {
-    m->pending_age_events = ALPHA_BRIDGE_PENDING_MAX_AGE_EVENTS;
   }
+
+  // One scalar slot holds the newest edge until the next adjacent edge arrives.
+  // It is always empty here because the prior edge was consumed above.
+  m->pending_edge_dwt = raw_edge_dwt;
+  m->pending_valid = true;
+  m->pending_age_events = 0;
 
   if (!m->initialized) {
-    // Display-only continuity during the one-to-two second bridge warm-up.
     return alpha_ocxo_seed_ns_at_first_edge(raw_edge_dwt);
   }
   return m->ns_at_edge;
@@ -7146,12 +7329,23 @@ void clocks_alpha_recover_reprime_ocxo_state(void) {
   // through pre-recovery state.
   g_alpha_recover_reprime_count++;
 
+  // The row that carried the RECOVER command has already captured both OCXO
+  // edges.  Preserve those two observed endpoints only as the left bookends of
+  // the new chain; all interval, phase, bridge, and publication custody below
+  // is still cut.  The next post-recovery edge therefore forms a wholly fresh
+  // adjacent interval without sacrificing a public PPS row.
+  const uint32_t ocxo1_recover_seed_dwt = g_ocxo1_measurement.dwt_at_edge;
+  const uint32_t ocxo2_recover_seed_dwt = g_ocxo2_measurement.dwt_at_edge;
+
+  alpha_timebase_row_reset_all();         // no pre-recovery PPS row may survive
   alpha_measured_ns_reset_all();          // bridge anchors + pending OCXO edges
   alpha_ocxo_pps_projection_reset_all();  // PPS-row OCXO projection history
   alpha_counterledger_reprime_all_for_recover();
 
   g_ocxo1_measurement = clock_measurement_t{};
   g_ocxo2_measurement = clock_measurement_t{};
+  g_ocxo1_measurement.prev_dwt_at_edge = ocxo1_recover_seed_dwt;
+  g_ocxo2_measurement.prev_dwt_at_edge = ocxo2_recover_seed_dwt;
 
   // Window-error mirrors are report diagnostics.  Clear the OCXO evidence that
   // is interval-relative, but keep public-origin and epoch state intact.
@@ -7305,28 +7499,36 @@ bool clocks_alpha_ocxo_recover_reattach_snapshot(
     const bool phase_ready =
         ledger_valid &&
         ledger->phase_valid &&
+        !ledger->phase_pending &&
         ledger->phase_pps_sequence != 0U &&
-        ledger->phase_pps_sequence <= ledger->pps_sequence;
-    const uint32_t phase_lag = phase_ready
-        ? (uint32_t)(ledger->pps_sequence - ledger->phase_pps_sequence)
-        : 0U;
-    const bool phase_lag_ok = phase_ready && phase_lag <= 1U;
+        ledger->phase_pps_sequence == ledger->pps_sequence;
+    const uint32_t phase_lag = phase_ready ? 0U :
+        ((ledger_valid && ledger->phase_valid &&
+          ledger->phase_pps_sequence <= ledger->pps_sequence)
+             ? (uint32_t)(ledger->pps_sequence -
+                          ledger->phase_pps_sequence)
+             : 0U);
+    const bool phase_lag_ok = phase_ready;
     const bool interval_valid =
         ledger_valid && ledger->interval_valid && ledger->last_interval_ns != 0ULL;
     const bool refined_valid =
-        ledger_valid && ledger->refined_valid && ledger->refined_ns != 0ULL;
+        phase_ready &&
+        ledger->refined_valid &&
+        ledger->refined_phase_pps_sequence == ledger->pps_sequence &&
+        ledger->refined_ns != 0ULL;
     const bool refined_interval_valid =
-        ledger_valid && ledger->refined_interval_valid &&
+        refined_valid &&
+        ledger->refined_interval_valid &&
         ledger->refined_interval_ns != 0ULL;
 
-    // A fresh integer PPS-sampled CounterLedger interval is sufficient to
-    // publish the OCXO clockface.  PhaseLedger refinement remains the stricter
-    // science gate for residuals, Welford, PPB, and servo input.
+    // RECOVER may resume publication only from the exact PPS row completed by
+    // this lane.  Integer CounterLedger state without its matching PhaseLedger
+    // suffix is useful testimony, but it is not a publishable OCXO clockface.
     const bool clockface_ready =
-        ledger_valid && capture_ready && interval_valid && ledger->ns != 0ULL;
+        ledger_valid && capture_ready && phase_ready &&
+        refined_valid && ledger->ns != 0ULL;
     const bool science_ready =
-        clockface_ready && phase_ready && phase_lag_ok &&
-        refined_valid && refined_interval_valid;
+        clockface_ready && interval_valid && refined_interval_valid;
 
     r.counterledger_mode = true;
     r.counterledger_snapshot_ok = ledger_snapshot_ok;
@@ -7345,7 +7547,7 @@ bool clocks_alpha_ocxo_recover_reattach_snapshot(
     r.counterledger_phase_pps_sequence = ledger ? ledger->phase_pps_sequence : 0U;
     r.counterledger_phase_lag_pps = phase_lag;
     r.counterledger_phase_pending_capacity =
-        ledger ? ALPHA_COUNTERLEDGER_PHASE_PENDING_RING_SIZE : 0U;
+        ledger ? ALPHA_COUNTERLEDGER_PHASE_PENDING_SLOT_CAPACITY : 0U;
     r.counterledger_phase_pending_depth =
         ledger ? ledger->phase_pending_depth : 0U;
     r.counterledger_phase_pending_depth_max =
@@ -7609,6 +7811,7 @@ static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
   g_ocxo2_interrupt_diag = {};
   alpha_forensics_reset_all();
   alpha_ticks64_reset_all();
+  alpha_timebase_row_reset_all();
   alpha_counterledger_reset_all();
   alpha_measured_ns_reset_all();
   alpha_ocxo_pps_projection_reset_all();
@@ -7802,6 +8005,14 @@ bool clocks_alpha_zero_from_smartzero(const char* reason) {
   g_ocxo2_measured_ns.ns_at_edge = 0;
   g_ocxo2_measured_ns.dwt_at_edge = ocxo2.anchor_dwt;
   g_ocxo2_measured_ns.dwt64_at_edge = clocks_dwt_cycles_at_dwt(ocxo2.anchor_dwt);
+
+  // SmartZero anchors are observed one-second edges.  Seed the ordinary
+  // measurement ledgers with those exact endpoints so the first post-zero
+  // OCXO edge can bracket the first PPS row instead of requiring a synthetic
+  // extra warm-up second or a pending-row queue.
+  g_vclock_measurement.prev_dwt_at_edge = vclock.anchor_dwt;
+  g_ocxo1_measurement.prev_dwt_at_edge = ocxo1.anchor_dwt;
+  g_ocxo2_measurement.prev_dwt_at_edge = ocxo2.anchor_dwt;
 
   alpha_ocxo_edge_history_install_zero(time_clock_id_t::OCXO1,
                                        ocxo1.anchor_dwt,
@@ -8008,7 +8219,7 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
       applied_event.counter32_at_event);
 
   uint64_t ns_now = counter_ns_now;
-  uint32_t dwt_cycles_between_edges = had_previous
+  const uint32_t dwt_cycles_between_edges = had_previous
       ? (applied_event.dwt_at_event - meas.prev_dwt_at_edge)
       : 0U;
   uint64_t gnss_ns_between_edges = 0;
@@ -8023,19 +8234,16 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
     uint32_t measured_dwt_cycles = 0;
     uint64_t real_interval_ns = 0;
     int64_t residual_fast_ns = 0;
-    // Science edge species: the observed ISR coordinate feeds the bookends.
-    // Its lattice/latency noise is white and unbiased, which the Welford
-    // surfaces average honestly; the published anchored endpoint stays the
-    // subscriber surface.  Long-term ruling (2026-06-12): the lower-envelope
-    // projection replaces this as the science edge once the slope engine
-    // exists.
-    const uint32_t science_edge_dwt =
+    // The legacy GNSS bridge remains a forensic side rail.  Feed it the raw
+    // observed ISR coordinate, but never let its delayed result replace the
+    // direct adjacent-event interval authored above.
+    const uint32_t bridge_edge_dwt =
         (applied_diag != nullptr && applied_diag->dwt_original_at_event != 0U)
             ? applied_diag->dwt_original_at_event
             : applied_event.dwt_at_event;
     const uint64_t physical_ns_now =
         alpha_ocxo_apply_measured_second(time_clock,
-                                         science_edge_dwt,
+                                         bridge_edge_dwt,
                                          &measured_dwt_cycles,
                                          &real_interval_ns,
                                          &residual_fast_ns);
@@ -8050,9 +8258,8 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
     // Split the two OCXO edge species explicitly:
     //
     //   measured_visible_ns
-    //     Conservative bridge-resolved science ledger.  It intentionally has a
-    //     one-edge lag because the closing PPS/GNSS anchor arrives after the
-    //     OCXO edge.  Welfords/servo/forensics may consume this.
+    //     Legacy bridge-resolved forensic ledger.  It may lag one edge, but it
+    //     no longer authors Delta Cycles, Welfords, servo input, or TIMEBASE.
     //
     //   public_edge_ns_for_history
     //     The OCXO clock-domain edge ledger: synthetic 10 MHz ticks since the
@@ -8098,7 +8305,9 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
                                    0U,
                                    0U);
 
-    dwt_cycles_between_edges = measured_dwt_cycles;
+    // measured_dwt_cycles belongs only to the delayed bridge forensic rail.
+    // Canonical OCXO cadence remains the direct subtraction of these two
+    // adjacent observed event coordinates.
     gnss_ns_between_edges = real_interval_ns;
     second_residual_ns = residual_fast_ns;
     window_error_ns = -residual_fast_ns;
@@ -8127,9 +8336,9 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
   }
 
   // Public process_time/time.h coordinates for PPS-founded clocks are authored
-  // at the canonical PPS/VCLOCK row.  OCXO callbacks already stay out of
-  // time.h because their science ledger intentionally has a one-edge lag.
-  // VCLOCK subscriber callbacks are now treated the same way for public time:
+  // only when the canonical PPS row is complete.  OCXO callbacks therefore
+  // retain edge evidence here but never publish a provisional PPS clockface.
+  // VCLOCK subscriber callbacks are treated the same way for public time:
   // they remain measurement/forensic peers, but the user-visible VCLOCK/GNSS
   // basis is the exact PPS/VCLOCK ledger authored in
   // alpha_sample_all_clocks_at_pps_vclock().  This keeps REPORT_SUMMARY from
@@ -8141,7 +8350,9 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
   }
 
   clock.ledger_ns_count_at_edge = ns_now;
-  clock.ledger_ns_count_at_pps_vclock = ns_now;
+  if (!is_ocxo) {
+    clock.ledger_ns_count_at_pps_vclock = ns_now;
+  }
   const uint64_t reference_gnss_ns_at_edge =
       is_ocxo
           ? ns_now
@@ -8213,6 +8424,7 @@ static void apply_ocxo_event(clock_state_t& clock,
   alpha_event_flow_note_callback_accepted(time_clock);
   clocks_apply_epoch_counter_edge(clock, meas, event, diag,
                                   epoch_counter32, time_clock);
+  alpha_timebase_row_note_ocxo_event(time_clock, event);
 }
 
 static void vclock_callback(const interrupt_event_t& event,
@@ -8373,14 +8585,11 @@ static bool alpha_sample_all_clocks_at_pps_vclock(const pps_edge_snapshot_t& sna
     g_alpha_runtime_epoch_capture_sequence_mismatch_count++;
   }
 
-  uint64_t ocxo1_counterledger_ns = 0ULL;
-  uint64_t ocxo2_counterledger_ns = 0ULL;
   const bool counterledger_epoch_ready = alpha_counterledger_epoch_ready();
   const bool counterledger_report_ready =
       clocks_ocxo_counterledger_report_enabled() && counterledger_epoch_ready;
-  const bool counterledger_authority_ready =
-      clocks_ocxo_counterledger_mode() && counterledger_epoch_ready &&
-      alpha_counterledger_phase_ready_all();
+  const bool counterledger_authority_enabled =
+      clocks_ocxo_counterledger_mode() && counterledger_epoch_ready;
   if (counterledger_report_ready) {
     alpha_counterledger_note_capture_status(time_clock_id_t::OCXO1,
                                             g_ocxo1_pps_counterledger,
@@ -8409,16 +8618,16 @@ static bool alpha_sample_all_clocks_at_pps_vclock(const pps_edge_snapshot_t& sna
                                              snap.sequence,
                                              snap.physical_pps_dwt_normalized_at_edge,
                                              cap.ocxo1_counter32,
-                                             &ocxo1_counterledger_ns);
+                                             nullptr);
     const bool applied_ocxo2 = counterledger_capture_ready_ocxo2 &&
         alpha_counterledger_apply_pps_sample(time_clock_id_t::OCXO2,
                                              g_ocxo2_pps_counterledger,
                                              snap.sequence,
                                              snap.physical_pps_dwt_normalized_at_edge,
                                              cap.ocxo2_counter32,
-                                             &ocxo2_counterledger_ns);
+                                             nullptr);
 
-    if ((!applied_ocxo1 || !applied_ocxo2) && counterledger_authority_ready) {
+    if ((!applied_ocxo1 || !applied_ocxo2) && counterledger_authority_enabled) {
       const uint32_t lane_bits =
           (cap.ocxo1_capture_valid ? 1U : 0U) |
           (cap.ocxo2_capture_valid ? 2U : 0U) |
@@ -8519,37 +8728,21 @@ static bool alpha_sample_all_clocks_at_pps_vclock(const pps_edge_snapshot_t& sna
       alpha_ocxo_public_ns_from_visible_origin(time_clock_id_t::OCXO2,
                                                ocxo2_visible_ns);
 
-  if (counterledger_authority_ready) {
-    // CounterLedger is the PPS-sampled clockface authority.  Capture the
-    // public-origin offset from the same PPS-authored samples, then publish the
-    // public OCXO value from the counter ledger rather than from any DWT
-    // projection surface.
-    alpha_ocxo_visible_origin_maybe_capture_public_origin(
-        time_clock_id_t::OCXO1, snap.sequence, vclock_ns, ocxo1_counterledger_ns);
-    alpha_ocxo_visible_origin_maybe_capture_public_origin(
-        time_clock_id_t::OCXO2, snap.sequence, vclock_ns, ocxo2_counterledger_ns);
-    ocxo1_physical_ns = ocxo1_counterledger_ns;
-    ocxo2_physical_ns = ocxo2_counterledger_ns;
-    ocxo1_ns =
-        alpha_ocxo_public_ns_from_visible_origin(time_clock_id_t::OCXO1,
-                                                 ocxo1_counterledger_ns);
-    ocxo2_ns =
-        alpha_ocxo_public_ns_from_visible_origin(time_clock_id_t::OCXO2,
-                                                 ocxo2_counterledger_ns);
-  }
-
-
   g_gnss_ns_at_pps_vclock = vclock_ns;
-  g_ocxo1_physical_measured_gnss_ns_at_pps_vclock = ocxo1_physical_ns;
-  g_ocxo2_physical_measured_gnss_ns_at_pps_vclock = ocxo2_physical_ns;
-  g_ocxo1_measured_gnss_ns_at_pps_vclock = ocxo1_ns;
-  g_ocxo2_measured_gnss_ns_at_pps_vclock = ocxo2_ns;
 
-  // Compatibility mirrors for existing report/Beta surfaces.  The canonical
-  // values are the explicit alpha-owned globals above.
+  // The exact CounterLedger/PhaseLedger OCXO clockfaces for this PPS do not
+  // exist yet.  Leave the prior completed OCXO public values untouched until
+  // the first post-PPS edge from each lane resolves this exact PPS sequence.
+  // Traditional projection mode retains its historical immediate install.
   g_vclock_clock.ledger_ns_count_at_pps_vclock = vclock_ns;
-  g_ocxo1_clock.ledger_ns_count_at_pps_vclock = ocxo1_ns;
-  g_ocxo2_clock.ledger_ns_count_at_pps_vclock = ocxo2_ns;
+  if (!clocks_ocxo_counterledger_mode()) {
+    g_ocxo1_physical_measured_gnss_ns_at_pps_vclock = ocxo1_physical_ns;
+    g_ocxo2_physical_measured_gnss_ns_at_pps_vclock = ocxo2_physical_ns;
+    g_ocxo1_measured_gnss_ns_at_pps_vclock = ocxo1_ns;
+    g_ocxo2_measured_gnss_ns_at_pps_vclock = ocxo2_ns;
+    g_ocxo1_clock.ledger_ns_count_at_pps_vclock = ocxo1_ns;
+    g_ocxo2_clock.ledger_ns_count_at_pps_vclock = ocxo2_ns;
+  }
 
   // Public VCLOCK/GNSS time-domain authority also lives here.  The selected
   // PPS/VCLOCK edge is the exact canonical public row: vclock_ns is authored by
@@ -8562,24 +8755,20 @@ static bool alpha_sample_all_clocks_at_pps_vclock(const pps_edge_snapshot_t& sna
                                             snap.dwt_at_edge,
                                             vclock_ns);
 
-  // Public OCXO time-domain authority lives here too, not in the OCXO callback.
-  // The callback's measured-edge resolver intentionally returns the previous
-  // bridge-resolved OCXO edge, because the current edge remains pending until
-  // the next PPS/GNSS anchor brackets it.  At the PPS/VCLOCK row, however, the
-  // bridge anchor has just been recorded and Alpha can project the OCXO public
-  // clock-domain evidence to this canonical public DWT.
-  // Feed process_time with that PPS-row visible coordinate so time.h clients
-  // no longer inherit the one-edge/one-second measured-ledger lag.
-  (void)time_clock_update(time_clock_id_t::OCXO1, snap.dwt_at_edge, ocxo1_ns);
-  (void)time_clock_update(time_clock_id_t::OCXO2, snap.dwt_at_edge, ocxo2_ns);
+  // Traditional projection mode still installs OCXO time immediately.  In
+  // CounterLedger mode alpha_timebase_install_refined_clockfaces() performs the
+  // only OCXO install after both exact PhaseLedger results have matured.
+  if (!clocks_ocxo_counterledger_mode()) {
+    (void)time_clock_update(time_clock_id_t::OCXO1, snap.dwt_at_edge, ocxo1_ns);
+    (void)time_clock_update(time_clock_id_t::OCXO2, snap.dwt_at_edge, ocxo2_ns);
+    g_ocxo1_clock.phase_offset_ns = (int64_t)vclock_ns - (int64_t)ocxo1_ns;
+    g_ocxo2_clock.phase_offset_ns = (int64_t)vclock_ns - (int64_t)ocxo2_ns;
+    g_ocxo1_clock.zero_established = true;
+    g_ocxo2_clock.zero_established = true;
+  }
 
   g_vclock_clock.phase_offset_ns = 0;
-  g_ocxo1_clock.phase_offset_ns = (int64_t)vclock_ns - (int64_t)ocxo1_ns;
-  g_ocxo2_clock.phase_offset_ns = (int64_t)vclock_ns - (int64_t)ocxo2_ns;
-
   g_vclock_clock.zero_established = true;
-  g_ocxo1_clock.zero_established = true;
-  g_ocxo2_clock.zero_established = true;
   return true;
 }
 
@@ -8673,23 +8862,20 @@ static void update_pps_vclock_bridge_anchor(const pps_edge_snapshot_t& snap) {
   g_dwt_at_pps_vclock = snap.dwt_at_edge;
   g_counter32_at_pps_vclock = snap.counter32_at_edge;
 
+  // If both post-PPS OCXO callbacks ran before this selector continuation, the
+  // cached edge-pair catch-up above has already resolved exact PhaseLedger.
+  // Install the always-on clockfaces now that this PPS DWT/GNSS identity is live.
+  (void)alpha_timebase_install_refined_clockfaces(snap.sequence);
+
   time_pps_vclock_update(snap.dwt_at_edge,
                   dwt_effective_cycles_per_pps_vclock_second(),
                   snap.counter32_at_edge);
 }
 
-static void maybe_publish_fragment(void) {
-  if (campaign_state == clocks_campaign_state_t::STARTED ||
-      campaign_state == clocks_campaign_state_t::RECOVERING ||
-      request_start || request_stop || request_recover || request_zero) {
-    clocks_beta_pps();
-  }
-}
-
 static void pps_selector_callback(const pps_edge_snapshot_t& snap) {
-  // Startup epoch install is now SmartZero-gated.  Explicit START/ZERO
-  // requests are finished by Beta once the same SmartZero proof surface is
-  // complete; startup uses it only when no command-owned acquisition is active.
+  // Startup epoch install is SmartZero-gated.  Explicit START/ZERO requests
+  // are serviced through Beta's sequence-zero control probe below; startup
+  // uses the same proof only when no command-owned acquisition is active.
   bool installed_epoch = false;
   if (!g_epoch_initialized && !request_start && !request_zero) {
     if (!interrupt_smartzero_running() && !interrupt_smartzero_complete()) {
@@ -8701,22 +8887,55 @@ static void pps_selector_callback(const pps_edge_snapshot_t& snap) {
   }
 
   publish_pps_witness_diag(snap);
+
+  // There is one practical row and no queue.  A new PPS cannot overwrite an
+  // older row that is still waiting for either OCXO lane.
+  if (g_alpha_pending_timebase_row.open &&
+      g_alpha_pending_timebase_row.pps_sequence != snap.sequence) {
+    clocks_watchdog_anomaly(
+        "alpha_timebase_row_overlap",
+        g_alpha_pending_timebase_row.pps_sequence,
+        snap.sequence,
+        g_alpha_last_ocxo1_pps_sequence,
+        g_alpha_last_ocxo2_pps_sequence);
+    alpha_timebase_row_clear();
+    return;
+  }
+
   if (!installed_epoch) {
     update_pps_vclock_bridge_anchor(snap);
   }
 
-  // Once an Alpha epoch exists, Beta may only consume a PPS/VCLOCK snapshot
-  // after Alpha has applied the matching VCLOCK subscriber event.  The two
-  // identities are authored from the same process_interrupt bookend.  A
-  // mismatch therefore means the callback/continuation ordering has regressed;
-  // publishing here would repeat the previous VCLOCK forensic endpoint.
+  // Once an Alpha epoch exists, the selected PPS/VCLOCK continuation must be
+  // the same event already consumed by the VCLOCK subscriber.
   if (epoch_ready() &&
       (g_last_vclock_event_counter32_at_event != snap.counter32_at_edge ||
        g_prev_dwt_at_vclock_event != snap.dwt_at_edge)) {
     return;
   }
 
-  maybe_publish_fragment();
+  // Cold or preserved SmartZero control still needs a PPS heartbeat before an
+  // Alpha row can exist.  Sequence zero tells Beta to service START/ZERO only;
+  // it can never publish a TIMEBASE candidate.
+  if (request_start || request_zero) {
+    alpha_timebase_row_clear();
+    clocks_beta_pps(0U);
+    return;
+  }
+
+  // The PPS that installs a new epoch did not traverse the ordinary sampling
+  // path.  The first post-install PPS will open the first exact row.
+  if (installed_epoch || !epoch_ready()) return;
+
+  if (g_dwt_at_pps_vclock != snap.dwt_at_edge ||
+      g_counter32_at_pps_vclock != snap.counter32_at_edge ||
+      g_pps_witness_diag.pps_edge_sequence != snap.sequence) {
+    return;
+  }
+
+  // PPS opens one row.  The first post-PPS OCXO edge from each lane resolves
+  // the exact PhaseLedger suffix; the later lane synchronously releases Beta.
+  alpha_timebase_row_open(snap.sequence);
 }
 
 // ============================================================================
