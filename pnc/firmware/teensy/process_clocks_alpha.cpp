@@ -5807,16 +5807,22 @@ static uint64_t alpha_ocxo_apply_measured_second(time_clock_id_t clock,
     }
 
     if (m->initialized && resolved_ns <= m->ns_at_edge) {
-      alpha_science_reject(
-          clocks_science_reject_reason_t::ALPHA_BRIDGE_NONMONOTONIC,
-          clock,
-          pending_edge_dwt,
-          (uint32_t)resolved_ns,
-          (uint32_t)m->ns_at_edge,
-          0U);
+      // CounterLedger/PhaseLedger owns public OCXO time in this mode.  A
+      // nonmonotonic legacy bridge result remains symmetric OCXO1/OCXO2
+      // forensic evidence, but it must not reject an otherwise lawful row.
+      // Traditional projection mode retains the historical science gate.
+      if (!clocks_ocxo_counterledger_mode()) {
+        alpha_science_reject(
+            clocks_science_reject_reason_t::ALPHA_BRIDGE_NONMONOTONIC,
+            clock,
+            pending_edge_dwt,
+            (uint32_t)resolved_ns,
+            (uint32_t)m->ns_at_edge,
+            0U);
+      }
 
-      // The rejected bridge coordinate is forensic evidence, not permission to
-      // break the edge ledger.  Consume this same adjacent edge through the
+      // A nonmonotonic bridge coordinate is forensic evidence, not permission
+      // to break the edge ledger.  Consume this same adjacent edge through the
       // direct DWT ratio so later edges cannot pair across it.
       resolved_ns = m->ns_at_edge + alpha_dwt_cycles_to_gnss_ns(dwt_cycles);
       resolved_via_bridge = false;
