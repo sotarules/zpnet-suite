@@ -26,7 +26,6 @@
 #include "process_system.h"
 #include "process_pubsub.h"
 #include "process_performance.h"
-#include "process_witness.h"
 
 #include <Arduino.h>
 #include <Wire.h>
@@ -198,9 +197,6 @@ void setup() {
   // will be established later on the first lawful PPS edge.
   process_clocks_init_hardware();
 
-  // Witness
-  process_witness_init_hardware();
-
   // ----------------------------------------------------------
   // Phase 2: Transport boundary comes alive
   // ----------------------------------------------------------
@@ -272,22 +268,6 @@ void setup() {
   debug_log("boot", "process_interrupt_register");
   process_interrupt_register();
   debug_log("boot", "process_interrupt_register done");
-
-  // ----------------------------------------------------------
-  // Witness
-  // ----------------------------------------------------------
-
-  debug_log("boot", "process_witness_init");
-  process_witness_init();
-  debug_log("boot", "process_witness_init done");
-
-  debug_log("boot", "process_witness_enable_irqs");
-  process_witness_enable_irqs();
-  debug_log("boot", "process_witness_enable_irqs done");
-
-  debug_log("boot", "process_witness_register");
-  process_witness_register();
-  debug_log("boot", "process_witness_register done");
 
   // ----------------------------------------------------------
   // Time process registration
