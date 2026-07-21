@@ -522,7 +522,11 @@ struct interrupt_subscriber_runtime_t {
   uint32_t event_count = 0;
 };
 
-static const interrupt_subscriber_descriptor_t DESCRIPTORS[] = {
+static constexpr uint32_t INTERRUPT_SUBSCRIBER_INDEX_VCLOCK = 0U;
+static constexpr uint32_t INTERRUPT_SUBSCRIBER_INDEX_OCXO1 = 1U;
+static constexpr uint32_t INTERRUPT_SUBSCRIBER_INDEX_OCXO2 = 2U;
+
+static constexpr interrupt_subscriber_descriptor_t DESCRIPTORS[] = {
   { interrupt_subscriber_kind_t::VCLOCK, "VCLOCK",
     interrupt_provider_kind_t::QTIMER1,
     interrupt_lane_t::QTIMER1_CH0_COMP },
@@ -534,20 +538,51 @@ static const interrupt_subscriber_descriptor_t DESCRIPTORS[] = {
     interrupt_lane_t::QTIMER3_CH3_COMP },
 };
 
+static constexpr uint32_t INTERRUPT_SUBSCRIBER_COUNT =
+    sizeof(DESCRIPTORS) / sizeof(DESCRIPTORS[0]);
+
+static_assert(INTERRUPT_SUBSCRIBER_COUNT == 3U,
+              "subscriber descriptor indexes require exactly three lanes");
+static_assert(DESCRIPTORS[INTERRUPT_SUBSCRIBER_INDEX_VCLOCK].kind ==
+                  interrupt_subscriber_kind_t::VCLOCK,
+              "VCLOCK descriptor index changed");
+static_assert(DESCRIPTORS[INTERRUPT_SUBSCRIBER_INDEX_OCXO1].kind ==
+                  interrupt_subscriber_kind_t::OCXO1,
+              "OCXO1 descriptor index changed");
+static_assert(DESCRIPTORS[INTERRUPT_SUBSCRIBER_INDEX_OCXO2].kind ==
+                  interrupt_subscriber_kind_t::OCXO2,
+              "OCXO2 descriptor index changed");
+
 static interrupt_subscriber_runtime_t g_subscribers[MAX_INTERRUPT_SUBSCRIBERS]{};
+static_assert(INTERRUPT_SUBSCRIBER_INDEX_OCXO2 < MAX_INTERRUPT_SUBSCRIBERS,
+              "subscriber runtime array cannot hold the static OCXO bindings");
 static uint32_t g_subscriber_count = 0;
-static interrupt_subscriber_runtime_t* g_rt_vclock = nullptr;
-static interrupt_subscriber_runtime_t* g_rt_ocxo1 = nullptr;
-static interrupt_subscriber_runtime_t* g_rt_ocxo2 = nullptr;
+
+static interrupt_subscriber_runtime_t* runtime_at_exact(
+    uint32_t index,
+    interrupt_subscriber_kind_t kind) {
+  if (g_subscriber_count != INTERRUPT_SUBSCRIBER_COUNT ||
+      index >= INTERRUPT_SUBSCRIBER_COUNT) {
+    return nullptr;
+  }
+  interrupt_subscriber_runtime_t& rt = g_subscribers[index];
+  return rt.desc == &DESCRIPTORS[index] && rt.desc->kind == kind
+      ? &rt
+      : nullptr;
+}
 
 static interrupt_subscriber_runtime_t* runtime_for(
     interrupt_subscriber_kind_t kind) {
-  for (uint32_t i = 0; i < g_subscriber_count; ++i) {
-    if (g_subscribers[i].desc && g_subscribers[i].desc->kind == kind) {
-      return &g_subscribers[i];
-    }
+  switch (kind) {
+    case interrupt_subscriber_kind_t::VCLOCK:
+      return runtime_at_exact(INTERRUPT_SUBSCRIBER_INDEX_VCLOCK, kind);
+    case interrupt_subscriber_kind_t::OCXO1:
+      return runtime_at_exact(INTERRUPT_SUBSCRIBER_INDEX_OCXO1, kind);
+    case interrupt_subscriber_kind_t::OCXO2:
+      return runtime_at_exact(INTERRUPT_SUBSCRIBER_INDEX_OCXO2, kind);
+    default:
+      return nullptr;
   }
-  return nullptr;
 }
 
 static const char* dispatch_timer_name(interrupt_subscriber_kind_t kind) {
@@ -815,6 +850,8 @@ struct ocxo_lane_t {
   uint32_t arm_too_close_count = 0;
   uint32_t rebootstrap_count = 0;
   uint32_t recover_count = 0;
+  uint32_t binding_identity_check_count = 0;
+  uint32_t binding_identity_failure_count = 0;
 
   uint32_t capture_pending_set_count = 0;
   uint32_t capture_pending_clear_count = 0;
@@ -854,32 +891,44 @@ struct ocxo_runtime_context_t {
   const char* name = nullptr;
   ocxo_lane_t* lane = nullptr;
   synthetic_clock32_t* clock32 = nullptr;
-  interrupt_subscriber_runtime_t** rt_slot = nullptr;
 };
 
 static vclock_lane_t g_vclock_lane{};
 static ocxo_lane_t g_ocxo1_lane{};
 static ocxo_lane_t g_ocxo2_lane{};
-static ocxo_runtime_context_t g_ocxo1_ctx{
+// These bindings describe permanent hardware identity.  Keep the descriptors
+// immutable so no runtime write can turn one lane into another object species.
+static constexpr ocxo_runtime_context_t g_ocxo1_ctx{
   interrupt_subscriber_kind_t::OCXO1,
   interrupt_provider_kind_t::QTIMER2,
   interrupt_lane_t::QTIMER2_CH0_COMP,
   "OCXO1",
   &g_ocxo1_lane,
   &g_ocxo1_clock32,
-  &g_rt_ocxo1,
 };
-static ocxo_runtime_context_t g_ocxo2_ctx{
+static constexpr ocxo_runtime_context_t g_ocxo2_ctx{
   interrupt_subscriber_kind_t::OCXO2,
   interrupt_provider_kind_t::QTIMER3,
   interrupt_lane_t::QTIMER3_CH3_COMP,
   "OCXO2",
   &g_ocxo2_lane,
   &g_ocxo2_clock32,
-  &g_rt_ocxo2,
 };
 
-static ocxo_runtime_context_t* ocxo_context_for(
+static_assert(g_ocxo1_ctx.kind == interrupt_subscriber_kind_t::OCXO1 &&
+                  g_ocxo1_ctx.provider == interrupt_provider_kind_t::QTIMER2 &&
+                  g_ocxo1_ctx.lane_id == interrupt_lane_t::QTIMER2_CH0_COMP &&
+                  g_ocxo1_ctx.lane == &g_ocxo1_lane &&
+                  g_ocxo1_ctx.clock32 == &g_ocxo1_clock32,
+              "OCXO1 immutable binding changed");
+static_assert(g_ocxo2_ctx.kind == interrupt_subscriber_kind_t::OCXO2 &&
+                  g_ocxo2_ctx.provider == interrupt_provider_kind_t::QTIMER3 &&
+                  g_ocxo2_ctx.lane_id == interrupt_lane_t::QTIMER3_CH3_COMP &&
+                  g_ocxo2_ctx.lane == &g_ocxo2_lane &&
+                  g_ocxo2_ctx.clock32 == &g_ocxo2_clock32,
+              "OCXO2 immutable binding changed");
+
+static const ocxo_runtime_context_t* ocxo_context_for(
     interrupt_subscriber_kind_t kind) {
   if (kind == interrupt_subscriber_kind_t::OCXO1) return &g_ocxo1_ctx;
   if (kind == interrupt_subscriber_kind_t::OCXO2) return &g_ocxo2_ctx;
@@ -894,7 +943,68 @@ static bool ocxo_kind_disabled(interrupt_subscriber_kind_t kind) {
 
 static interrupt_subscriber_runtime_t* ocxo_runtime_for(
     const ocxo_runtime_context_t& ctx) {
-  return ctx.rt_slot ? *ctx.rt_slot : nullptr;
+  return runtime_for(ctx.kind);
+}
+
+static bool ocxo1_static_binding_exact(void) {
+  return g_subscriber_count == INTERRUPT_SUBSCRIBER_COUNT &&
+      runtime_for(interrupt_subscriber_kind_t::OCXO1) ==
+          &g_subscribers[INTERRUPT_SUBSCRIBER_INDEX_OCXO1] &&
+      g_subscribers[INTERRUPT_SUBSCRIBER_INDEX_OCXO1].desc ==
+          &DESCRIPTORS[INTERRUPT_SUBSCRIBER_INDEX_OCXO1] &&
+      g_ocxo1_ctx.kind == interrupt_subscriber_kind_t::OCXO1 &&
+      g_ocxo1_ctx.provider == interrupt_provider_kind_t::QTIMER2 &&
+      g_ocxo1_ctx.lane_id == interrupt_lane_t::QTIMER2_CH0_COMP &&
+      g_ocxo1_ctx.lane == &g_ocxo1_lane &&
+      g_ocxo1_ctx.clock32 == &g_ocxo1_clock32 &&
+      g_ocxo1_lane.kind == interrupt_subscriber_kind_t::OCXO1 &&
+      g_ocxo1_lane.module == &IMXRT_TMR2 &&
+      g_ocxo1_lane.channel == QTIMER2_OCXO1_CH &&
+      g_ocxo1_lane.pcs == QTIMER2_OCXO1_PCS;
+}
+
+static bool ocxo2_static_binding_exact(void) {
+  return g_subscriber_count == INTERRUPT_SUBSCRIBER_COUNT &&
+      runtime_for(interrupt_subscriber_kind_t::OCXO2) ==
+          &g_subscribers[INTERRUPT_SUBSCRIBER_INDEX_OCXO2] &&
+      g_subscribers[INTERRUPT_SUBSCRIBER_INDEX_OCXO2].desc ==
+          &DESCRIPTORS[INTERRUPT_SUBSCRIBER_INDEX_OCXO2] &&
+      g_ocxo2_ctx.kind == interrupt_subscriber_kind_t::OCXO2 &&
+      g_ocxo2_ctx.provider == interrupt_provider_kind_t::QTIMER3 &&
+      g_ocxo2_ctx.lane_id == interrupt_lane_t::QTIMER3_CH3_COMP &&
+      g_ocxo2_ctx.lane == &g_ocxo2_lane &&
+      g_ocxo2_ctx.clock32 == &g_ocxo2_clock32 &&
+      g_ocxo2_lane.kind == interrupt_subscriber_kind_t::OCXO2 &&
+      g_ocxo2_lane.module == &IMXRT_TMR3 &&
+      g_ocxo2_lane.channel == QTIMER3_OCXO2_CH &&
+      g_ocxo2_lane.pcs == QTIMER3_OCXO2_PCS;
+}
+
+static bool ocxo_static_binding_exact(
+    interrupt_subscriber_kind_t kind) {
+  if (kind == interrupt_subscriber_kind_t::OCXO1) {
+    return ocxo1_static_binding_exact();
+  }
+  if (kind == interrupt_subscriber_kind_t::OCXO2) {
+    return ocxo2_static_binding_exact();
+  }
+  return false;
+}
+
+static __attribute__((noinline, noclone))
+bool ocxo1_binding_identity_check(void) {
+  g_ocxo1_lane.binding_identity_check_count++;
+  const bool exact = ocxo1_static_binding_exact();
+  if (!exact) g_ocxo1_lane.binding_identity_failure_count++;
+  return exact;
+}
+
+static __attribute__((noinline, noclone))
+bool ocxo2_binding_identity_check(void) {
+  g_ocxo2_lane.binding_identity_check_count++;
+  const bool exact = ocxo2_static_binding_exact();
+  if (!exact) g_ocxo2_lane.binding_identity_failure_count++;
+  return exact;
 }
 
 static void interrupt_features_note_observed_edge(void);
@@ -1709,7 +1819,7 @@ static bool ocxo_target_is_due_or_behind(uint32_t current_counter32,
   return remaining == 0U || remaining > 0x7FFFFFFFUL;
 }
 
-static void ocxo_tend_and_arm(ocxo_runtime_context_t& ctx) {
+static void ocxo_tend_and_arm(const ocxo_runtime_context_t& ctx) {
   ocxo_lane_t& lane = *ctx.lane;
   synthetic_clock32_t& clock = *ctx.clock32;
   if (!lane.initialized) return;
@@ -1767,9 +1877,14 @@ static void ocxo_tend_and_arm(ocxo_runtime_context_t& ctx) {
   lane.arm_count++;
 }
 
-static bool ocxo_start_one_second_service(ocxo_runtime_context_t& ctx) {
-  ocxo_lane_t& lane = *ctx.lane;
-  synthetic_clock32_t& clock = *ctx.clock32;
+// Lane-bound service boundaries deliberately take no context argument.  Each
+// function reloads its permanent globals after entry, so a caller cannot carry
+// a substituted ring/context pointer into the service-start dereference.
+static __attribute__((noinline, noclone))
+bool ocxo1_start_one_second_service_bound(void) {
+  if (!ocxo1_binding_identity_check()) return false;
+  ocxo_lane_t& lane = g_ocxo1_lane;
+  synthetic_clock32_t& clock = g_ocxo1_clock32;
   if (!lane.initialized) return false;
   lane.active = true;
   if (!clock.zeroed) synthetic_clock_birth(clock, ocxo_counter_now(lane));
@@ -1779,17 +1894,42 @@ static bool ocxo_start_one_second_service(ocxo_runtime_context_t& ctx) {
         clock.current_counter32 + OCXO_ONE_SECOND_TICKS;
     lane.target_grid_valid = true;
   }
-  ocxo_tend_and_arm(ctx);
+  ocxo_tend_and_arm(g_ocxo1_ctx);
   interrupt_features_note_ocxo_custody();
   // A target several months of CPU cycles away is intentionally not armed yet;
   // VCLOCK will tend it into the safe 16-bit programming window.
   return true;
 }
 
-static void ocxo_stop_one_second_service(ocxo_runtime_context_t& ctx) {
-  ocxo_lane_t& lane = *ctx.lane;
-  lane.active = false;
-  if (lane.initialized) ocxo_disable_compare(lane);
+static __attribute__((noinline, noclone))
+bool ocxo2_start_one_second_service_bound(void) {
+  if (!ocxo2_binding_identity_check()) return false;
+  ocxo_lane_t& lane = g_ocxo2_lane;
+  synthetic_clock32_t& clock = g_ocxo2_clock32;
+  if (!lane.initialized) return false;
+  lane.active = true;
+  if (!clock.zeroed) synthetic_clock_birth(clock, ocxo_counter_now(lane));
+  if (!lane.target_grid_valid) {
+    lane.grid_epoch_counter32 = clock.current_counter32;
+    lane.next_target_counter32 =
+        clock.current_counter32 + OCXO_ONE_SECOND_TICKS;
+    lane.target_grid_valid = true;
+  }
+  ocxo_tend_and_arm(g_ocxo2_ctx);
+  interrupt_features_note_ocxo_custody();
+  return true;
+}
+
+static __attribute__((noinline, noclone))
+void ocxo1_stop_one_second_service_bound(void) {
+  g_ocxo1_lane.active = false;
+  if (g_ocxo1_lane.initialized) ocxo_disable_compare(g_ocxo1_lane);
+}
+
+static __attribute__((noinline, noclone))
+void ocxo2_stop_one_second_service_bound(void) {
+  g_ocxo2_lane.active = false;
+  if (g_ocxo2_lane.initialized) ocxo_disable_compare(g_ocxo2_lane);
 }
 
 // ============================================================================
@@ -1807,7 +1947,7 @@ bool interrupt_clock32_zero_from_ns(interrupt_subscriber_kind_t kind,
     return true;
   }
 
-  ocxo_runtime_context_t* ctx = ocxo_context_for(kind);
+  const ocxo_runtime_context_t* ctx = ocxo_context_for(kind);
   if (!ctx || !ctx->lane->initialized) return false;
   const uint16_t hardware16 = ocxo_counter_now(*ctx->lane);
   synthetic_clock_zero(*ctx->clock32, ns);
@@ -1841,7 +1981,7 @@ bool interrupt_clock32_request_zero_from_ns(interrupt_subscriber_kind_t kind,
 void interrupt_ocxo_logical_grid_epoch(uint32_t ocxo1_epoch_counter32,
                                        uint32_t ocxo2_epoch_counter32) {
   struct install_t {
-    ocxo_runtime_context_t* ctx;
+    const ocxo_runtime_context_t* ctx;
     uint32_t epoch;
   } installs[] = {
     { &g_ocxo1_ctx, ocxo1_epoch_counter32 },
@@ -1881,7 +2021,7 @@ bool interrupt_clock_snapshot(interrupt_subscriber_kind_t kind,
     out->ns64 = (uint64_t)out->counter32 * 100ULL;
     return true;
   }
-  ocxo_runtime_context_t* ctx = ocxo_context_for(kind);
+  const ocxo_runtime_context_t* ctx = ocxo_context_for(kind);
   if (!ctx || !ctx->lane->initialized || !ctx->clock32->zeroed) return false;
   const uint16_t hardware16 = ocxo_counter_now(*ctx->lane);
   const uint32_t delta =
@@ -2472,9 +2612,11 @@ static void process_vclock_packet(const vclock_capture_packet_t& packet) {
                               event_target,
                               target_low16);
     interrupt_features_note_lineage();
-    if (g_rt_vclock && g_rt_vclock->active) {
-      g_rt_vclock->irq_count++;
-      (void)emit_observed_event(*g_rt_vclock,
+    interrupt_subscriber_runtime_t* rt_vclock =
+        runtime_for(interrupt_subscriber_kind_t::VCLOCK);
+    if (rt_vclock && rt_vclock->active) {
+      rt_vclock->irq_count++;
+      (void)emit_observed_event(*rt_vclock,
                                 dwt_at_edge,
                                 event_target,
                                 packet.isr_entry_dwt_raw,
@@ -2547,7 +2689,7 @@ static void ocxo_complete_capture_custody(
   dmb_barrier();
 }
 
-static void process_ocxo_packet(ocxo_runtime_context_t& ctx,
+static void process_ocxo_packet(const ocxo_runtime_context_t& ctx,
                                 const ocxo_capture_packet_t& packet) {
   ocxo_lane_t& lane = *ctx.lane;
   synthetic_clock32_t& clock = *ctx.clock32;
@@ -2974,7 +3116,7 @@ static void qtimer1_isr(void) {
 }
 
 static void ocxo_capture_priority0(
-    ocxo_runtime_context_t& ctx,
+    const ocxo_runtime_context_t& ctx,
     interrupt_capture_ring_t<ocxo_capture_packet_t,
                              HANDOFF_OCXO_RING_SIZE>& ring,
     interrupt_handoff_source_diag_t& handoff,
@@ -3235,9 +3377,13 @@ bool interrupt_start(interrupt_subscriber_kind_t kind) {
     return g_vclock_heartbeat_armed || vclock_heartbeat_arm();
   }
 
-  ocxo_runtime_context_t* ctx = ocxo_context_for(kind);
-  if (!ctx || ocxo_kind_disabled(kind)) return ctx != nullptr;
-  return ocxo_start_one_second_service(*ctx);
+  if (kind == interrupt_subscriber_kind_t::OCXO1) {
+    return OCXO1_DISABLED || ocxo1_start_one_second_service_bound();
+  }
+  if (kind == interrupt_subscriber_kind_t::OCXO2) {
+    return OCXO2_DISABLED || ocxo2_start_one_second_service_bound();
+  }
+  return false;
 }
 
 bool interrupt_ensure_service(interrupt_subscriber_kind_t kind) {
@@ -3248,10 +3394,14 @@ bool interrupt_ensure_service(interrupt_subscriber_kind_t kind) {
     g_vclock_lane.active = true;
     return g_vclock_heartbeat_armed || vclock_heartbeat_arm();
   }
-  ocxo_runtime_context_t* ctx = ocxo_context_for(kind);
-  if (!ctx || ocxo_kind_disabled(kind)) return ctx != nullptr;
   if (!rt->active) rt->active = true;
-  return ocxo_start_one_second_service(*ctx);
+  if (kind == interrupt_subscriber_kind_t::OCXO1) {
+    return OCXO1_DISABLED || ocxo1_start_one_second_service_bound();
+  }
+  if (kind == interrupt_subscriber_kind_t::OCXO2) {
+    return OCXO2_DISABLED || ocxo2_start_one_second_service_bound();
+  }
+  return false;
 }
 
 template <typename T, uint32_t N>
@@ -3265,53 +3415,143 @@ static uint32_t capture_ring_discard_pending(
   return head - tail;
 }
 
+// Recovery is intentionally duplicated by lane.  Every phase accepts no
+// pointers or references, reloads only literal permanent objects, and has an
+// explicit compiler boundary.  No context or runtime address survives across
+// the large diagnostic clears or across the final service-start boundary.
+static __attribute__((noinline, noclone))
+void ocxo1_recovery_runtime_reset_bound(void) {
+  interrupt_subscriber_runtime_t& rt =
+      g_subscribers[INTERRUPT_SUBSCRIBER_INDEX_OCXO1];
+  interrupt_dispatch_invalidate_locked(rt);
+  rt.last_event = interrupt_event_t{};
+  rt.last_diag = interrupt_capture_diag_t{};
+  rt.has_fired = false;
+  rt.active = true;
+}
+
+static __attribute__((noinline, noclone))
+void ocxo2_recovery_runtime_reset_bound(void) {
+  interrupt_subscriber_runtime_t& rt =
+      g_subscribers[INTERRUPT_SUBSCRIBER_INDEX_OCXO2];
+  interrupt_dispatch_invalidate_locked(rt);
+  rt.last_event = interrupt_event_t{};
+  rt.last_diag = interrupt_capture_diag_t{};
+  rt.has_fired = false;
+  rt.active = true;
+}
+
+static __attribute__((noinline, noclone))
+void ocxo1_recovery_lane_reset_bound(void) {
+  g_ocxo1_lane.active = true;
+  g_ocxo1_lane.previous_event_valid = false;
+  if (g_ocxo1_lane.capture_pending) {
+    g_ocxo1_lane.capture_pending_recovery_discard_count++;
+    g_ocxo1_lane.capture_pending_clear_count++;
+  }
+  g_ocxo1_lane.capture_pending_target_counter32 = 0U;
+  dmb_barrier();
+  g_ocxo1_lane.capture_pending = false;
+  dmb_barrier();
+  if (g_ocxo1_lane.compare_armed) {
+    ocxo_disable_compare(g_ocxo1_lane);
+  }
+  g_ocxo1_lane.rebootstrap_count++;
+}
+
+static __attribute__((noinline, noclone))
+void ocxo2_recovery_lane_reset_bound(void) {
+  g_ocxo2_lane.active = true;
+  g_ocxo2_lane.previous_event_valid = false;
+  if (g_ocxo2_lane.capture_pending) {
+    g_ocxo2_lane.capture_pending_recovery_discard_count++;
+    g_ocxo2_lane.capture_pending_clear_count++;
+  }
+  g_ocxo2_lane.capture_pending_target_counter32 = 0U;
+  dmb_barrier();
+  g_ocxo2_lane.capture_pending = false;
+  dmb_barrier();
+  if (g_ocxo2_lane.compare_armed) {
+    ocxo_disable_compare(g_ocxo2_lane);
+  }
+  g_ocxo2_lane.rebootstrap_count++;
+}
+
+static __attribute__((noinline, noclone))
+void ocxo1_recovery_prepare_bound(void) {
+  const uint32_t prior = interrupt_priority0_guard_enter();
+  (void)capture_ring_discard_pending(g_ocxo1_capture_ring);
+  ocxo1_recovery_runtime_reset_bound();
+  ocxo1_recovery_lane_reset_bound();
+  interrupt_priority0_guard_exit(prior);
+}
+
+static __attribute__((noinline, noclone))
+void ocxo2_recovery_prepare_bound(void) {
+  const uint32_t prior = interrupt_priority0_guard_enter();
+  (void)capture_ring_discard_pending(g_ocxo2_capture_ring);
+  ocxo2_recovery_runtime_reset_bound();
+  ocxo2_recovery_lane_reset_bound();
+  interrupt_priority0_guard_exit(prior);
+}
+
+static __attribute__((noinline, noclone))
+bool ocxo1_recovery_ready_bound(void) {
+  return ocxo1_binding_identity_check() && g_ocxo1_lane.initialized;
+}
+
+static __attribute__((noinline, noclone))
+bool ocxo2_recovery_ready_bound(void) {
+  return ocxo2_binding_identity_check() && g_ocxo2_lane.initialized;
+}
+
+static __attribute__((noinline, noclone))
+void ocxo1_recovery_complete_bound(void) {
+  g_ocxo1_lane.recover_count++;
+}
+
+static __attribute__((noinline, noclone))
+void ocxo2_recovery_complete_bound(void) {
+  g_ocxo2_lane.recover_count++;
+}
+
+static __attribute__((noinline, noclone))
+bool ocxo1_recover_rebootstrap_bound(void) {
+  if (OCXO1_DISABLED) return true;
+  if (!ocxo1_recovery_ready_bound()) return false;
+
+  NVIC_DISABLE_IRQ(IRQ_QTIMER2);
+  ocxo1_recovery_prepare_bound();
+  const bool started = ocxo1_start_one_second_service_bound();
+  NVIC_ENABLE_IRQ(IRQ_QTIMER2);
+  ocxo1_recovery_complete_bound();
+  return started;
+}
+
+static __attribute__((noinline, noclone))
+bool ocxo2_recover_rebootstrap_bound(void) {
+  if (OCXO2_DISABLED) return true;
+  if (!ocxo2_recovery_ready_bound()) return false;
+
+  NVIC_DISABLE_IRQ(IRQ_QTIMER3);
+  ocxo2_recovery_prepare_bound();
+  const bool started = ocxo2_start_one_second_service_bound();
+  NVIC_ENABLE_IRQ(IRQ_QTIMER3);
+  ocxo2_recovery_complete_bound();
+  return started;
+}
+
+__attribute__((noinline, noclone))
 bool interrupt_recover_rebootstrap_ocxo_service(
     interrupt_subscriber_kind_t kind) {
-  ocxo_runtime_context_t* ctx = ocxo_context_for(kind);
-  interrupt_subscriber_runtime_t* rt = runtime_for(kind);
-  if (!ctx || !rt || ocxo_kind_disabled(kind)) return ctx != nullptr;
-
-  ocxo_lane_t& lane = *ctx->lane;
-  if (!lane.initialized) return false;
-  if (kind == interrupt_subscriber_kind_t::OCXO1) {
-    NVIC_DISABLE_IRQ(IRQ_QTIMER2);
-  } else {
-    NVIC_DISABLE_IRQ(IRQ_QTIMER3);
+  switch (kind) {
+    case interrupt_subscriber_kind_t::OCXO1:
+      return ocxo1_recover_rebootstrap_bound();
+    case interrupt_subscriber_kind_t::OCXO2:
+      return ocxo2_recover_rebootstrap_bound();
+    default:
+      return false;
   }
-
-  const uint32_t prior = interrupt_priority0_guard_enter();
-  if (kind == interrupt_subscriber_kind_t::OCXO1) {
-    (void)capture_ring_discard_pending(g_ocxo1_capture_ring);
-  } else {
-    (void)capture_ring_discard_pending(g_ocxo2_capture_ring);
-  }
-  interrupt_dispatch_invalidate_locked(*rt);
-  rt->last_event = interrupt_event_t{};
-  rt->last_diag = interrupt_capture_diag_t{};
-  rt->has_fired = false;
-  rt->active = true;
-  lane.active = true;
-  lane.previous_event_valid = false;
-  if (lane.capture_pending) {
-    lane.capture_pending_recovery_discard_count++;
-    lane.capture_pending_clear_count++;
-  }
-  lane.capture_pending_target_counter32 = 0U;
-  dmb_barrier();
-  lane.capture_pending = false;
-  dmb_barrier();
-  if (lane.compare_armed) ocxo_disable_compare(lane);
-  lane.rebootstrap_count++;
-  interrupt_priority0_guard_exit(prior);
-
-  const bool started = ocxo_start_one_second_service(*ctx);
-  if (kind == interrupt_subscriber_kind_t::OCXO1) {
-    NVIC_ENABLE_IRQ(IRQ_QTIMER2);
-  } else {
-    NVIC_ENABLE_IRQ(IRQ_QTIMER3);
-  }
-  lane.recover_count++;
-  return started;
 }
 
 bool interrupt_stop(interrupt_subscriber_kind_t kind) {
@@ -3327,10 +3567,15 @@ bool interrupt_stop(interrupt_subscriber_kind_t kind) {
     g_vclock_lane.active = false;
     return true;
   }
-  ocxo_runtime_context_t* ctx = ocxo_context_for(kind);
-  if (!ctx) return false;
-  ocxo_stop_one_second_service(*ctx);
-  return true;
+  if (kind == interrupt_subscriber_kind_t::OCXO1) {
+    ocxo1_stop_one_second_service_bound();
+    return true;
+  }
+  if (kind == interrupt_subscriber_kind_t::OCXO2) {
+    ocxo2_stop_one_second_service_bound();
+    return true;
+  }
+  return false;
 }
 
 void interrupt_request_pps_rebootstrap(void) {
@@ -3602,26 +3847,14 @@ void process_interrupt_init_hardware(void) {
 
 static void runtime_init_subscribers(void) {
   g_subscriber_count = 0U;
-  g_rt_vclock = nullptr;
-  g_rt_ocxo1 = nullptr;
-  g_rt_ocxo2 = nullptr;
   for (interrupt_subscriber_runtime_t& rt : g_subscribers) {
     rt = interrupt_subscriber_runtime_t{};
   }
-  for (uint32_t i = 0U;
-       i < sizeof(DESCRIPTORS) / sizeof(DESCRIPTORS[0]);
-       ++i) {
-    interrupt_subscriber_runtime_t& rt =
-        g_subscribers[g_subscriber_count++];
-    rt.desc = &DESCRIPTORS[i];
-    if (rt.desc->kind == interrupt_subscriber_kind_t::VCLOCK) {
-      g_rt_vclock = &rt;
-    } else if (rt.desc->kind == interrupt_subscriber_kind_t::OCXO1) {
-      g_rt_ocxo1 = &rt;
-    } else if (rt.desc->kind == interrupt_subscriber_kind_t::OCXO2) {
-      g_rt_ocxo2 = &rt;
-    }
+  for (uint32_t i = 0U; i < INTERRUPT_SUBSCRIBER_COUNT; ++i) {
+    g_subscribers[i].desc = &DESCRIPTORS[i];
   }
+  dmb_barrier();
+  g_subscriber_count = INTERRUPT_SUBSCRIBER_COUNT;
 }
 
 void process_interrupt_init(void) {
@@ -3735,6 +3968,14 @@ static FLASHMEM void add_ocxo_lane_report(Payload& payload,
   add_u32("rollover_tend_count", lane.rollover_tend_count);
   add_u32("arm_window_wait_count", lane.arm_window_wait_count);
   add_u32("arm_too_close_count", lane.arm_too_close_count);
+  add_u32("rebootstrap_count", lane.rebootstrap_count);
+  add_u32("recover_count", lane.recover_count);
+  add_u32("binding_identity_check_count",
+          lane.binding_identity_check_count);
+  add_u32("binding_identity_failure_count",
+          lane.binding_identity_failure_count);
+  add_bool("binding_identity_exact",
+           ocxo_static_binding_exact(ctx.kind));
   add_u32("capture_pending_set_count", lane.capture_pending_set_count);
   add_u32("capture_pending_clear_count", lane.capture_pending_clear_count);
   add_u32("capture_pending_tend_skip_count",
@@ -3784,9 +4025,12 @@ static FLASHMEM Payload cmd_report_status(const Payload&) {
   payload.add("vclock_heartbeat_armed", (bool)g_vclock_heartbeat_armed);
   payload.add("vclock_heartbeat_count", g_vclock_lane.heartbeat_count);
   payload.add("vclock_one_second_count", g_vclock_lane.one_second_count);
-  add_runtime_summary(payload, "vclock", g_rt_vclock);
-  add_runtime_summary(payload, "ocxo1", g_rt_ocxo1);
-  add_runtime_summary(payload, "ocxo2", g_rt_ocxo2);
+  add_runtime_summary(
+      payload, "vclock", runtime_for(interrupt_subscriber_kind_t::VCLOCK));
+  add_runtime_summary(
+      payload, "ocxo1", runtime_for(interrupt_subscriber_kind_t::OCXO1));
+  add_runtime_summary(
+      payload, "ocxo2", runtime_for(interrupt_subscriber_kind_t::OCXO2));
   return payload;
 }
 
@@ -4065,7 +4309,8 @@ static FLASHMEM Payload cmd_report_integrity(const Payload&) {
 static FLASHMEM Payload cmd_report_lanes(const Payload&) {
   Payload payload;
   payload.add("report", "INTERRUPT_LANES");
-  add_runtime_summary(payload, "vclock", g_rt_vclock);
+  add_runtime_summary(
+      payload, "vclock", runtime_for(interrupt_subscriber_kind_t::VCLOCK));
   add_ocxo_lane_report(payload, "ocxo1", g_ocxo1_ctx);
   add_ocxo_lane_report(payload, "ocxo2", g_ocxo2_ctx);
   return payload;
@@ -4083,7 +4328,8 @@ static FLASHMEM Payload cmd_report_lane(const Payload& args) {
   payload.add("lane", lane);
   if (interrupt_cstr_equal_ci(lane, "VCLOCK") ||
       interrupt_cstr_equal_ci(lane, "VCLK")) {
-    add_runtime_summary(payload, "vclock", g_rt_vclock);
+    add_runtime_summary(
+        payload, "vclock", runtime_for(interrupt_subscriber_kind_t::VCLOCK));
     payload.add("heartbeat_count", g_vclock_lane.heartbeat_count);
     payload.add("one_second_count", g_vclock_lane.one_second_count);
     payload.add("last_target_counter32", g_vclock_lane.last_target_counter32);
