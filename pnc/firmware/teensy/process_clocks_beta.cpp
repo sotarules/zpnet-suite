@@ -1144,6 +1144,67 @@ static int32_t  g_start_prologue_last_vclock_minus_pps0 = 0;
 static int32_t  g_start_prologue_last_ocxo1_minus_pps0 = 0;
 static int32_t  g_start_prologue_last_ocxo2_minus_pps0 = 0;
 
+// START candidate-readiness transcript.  This court records the exact tuple
+// passed into campaign_start_prologue_candidate_ready().  START interval
+// authority is Alpha's ordinary dwt_cycles_between_edges measurement.  The
+// process_interrupt-authored dwt_interval_observed_cycles member remains visible
+// beside it as audit evidence only; it no longer gates or authors START.
+// Missing bits 3..5 retain their original numeric identities for report
+// compatibility, but now mean that the corresponding Alpha measurement interval
+// is absent or outside the broad lawful one-second band.
+static constexpr uint32_t CLOCKS_START_CANDIDATE_MISSING_VCLOCK_SNAPSHOT =
+    1U << 0;
+static constexpr uint32_t CLOCKS_START_CANDIDATE_MISSING_OCXO1_SNAPSHOT =
+    1U << 1;
+static constexpr uint32_t CLOCKS_START_CANDIDATE_MISSING_OCXO2_SNAPSHOT =
+    1U << 2;
+static constexpr uint32_t CLOCKS_START_CANDIDATE_MISSING_VCLOCK_OBSERVED =
+    1U << 3;
+static constexpr uint32_t CLOCKS_START_CANDIDATE_MISSING_OCXO1_OBSERVED =
+    1U << 4;
+static constexpr uint32_t CLOCKS_START_CANDIDATE_MISSING_OCXO2_OBSERVED =
+    1U << 5;
+static constexpr uint32_t CLOCKS_START_CANDIDATE_MISSING_SELECTED_REFERENCE_VALID =
+    1U << 6;
+static constexpr uint32_t CLOCKS_START_CANDIDATE_MISSING_SELECTED_REFERENCE_INTERVAL =
+    1U << 7;
+static constexpr uint32_t CLOCKS_START_CANDIDATE_MISSING_EFFECTIVE_CPS =
+    1U << 8;
+
+static uint32_t g_start_candidate_check_count = 0;
+static uint32_t g_start_candidate_ready_count = 0;
+static uint32_t g_start_candidate_reject_count = 0;
+static bool     g_start_candidate_last_ready = false;
+static bool     g_start_candidate_last_vclock_snapshot_valid = false;
+static bool     g_start_candidate_last_ocxo1_snapshot_valid = false;
+static bool     g_start_candidate_last_ocxo2_snapshot_valid = false;
+static uint32_t g_start_candidate_last_vclock_observed_interval = 0;
+static uint32_t g_start_candidate_last_ocxo1_observed_interval = 0;
+static uint32_t g_start_candidate_last_ocxo2_observed_interval = 0;
+static uint32_t g_start_candidate_last_vclock_measurement_interval = 0;
+static uint32_t g_start_candidate_last_ocxo1_measurement_interval = 0;
+static uint32_t g_start_candidate_last_ocxo2_measurement_interval = 0;
+static uint32_t g_start_candidate_last_vclock_update_count = 0;
+static uint32_t g_start_candidate_last_ocxo1_update_count = 0;
+static uint32_t g_start_candidate_last_ocxo2_update_count = 0;
+static bool     g_start_candidate_last_selected_reference_valid = false;
+static uint32_t g_start_candidate_last_selected_reference_interval = 0;
+static uint32_t g_start_candidate_last_effective_cps = 0;
+static uint32_t g_start_candidate_last_missing_mask = 0;
+static char     g_start_candidate_last_first_problem[48] = "not_checked";
+
+static uint32_t g_start_candidate_missing_vclock_snapshot_count = 0;
+static uint32_t g_start_candidate_missing_ocxo1_snapshot_count = 0;
+static uint32_t g_start_candidate_missing_ocxo2_snapshot_count = 0;
+// Compatibility names retained: these now count unusable Alpha measurement
+// intervals, not missing process_interrupt audit intervals.
+static uint32_t g_start_candidate_missing_vclock_observed_count = 0;
+static uint32_t g_start_candidate_missing_ocxo1_observed_count = 0;
+static uint32_t g_start_candidate_missing_ocxo2_observed_count = 0;
+static uint32_t g_start_candidate_missing_selected_reference_valid_count = 0;
+static uint32_t g_start_candidate_missing_selected_reference_interval_count = 0;
+static uint32_t g_start_candidate_missing_effective_cps_count = 0;
+
 // Campaign-public continuity transform.
 //
 // Alpha owns the live service/epoch ledgers.  Beta owns campaign presentation:
@@ -1283,9 +1344,6 @@ static delta_residual_bookend_t g_delta_ocxo2_bookends DMAMEM = {};
 // to be automatic locals in START/prologue and 1 Hz publication paths.  Keeping
 // them in RAM2 avoids compiler-generated stack memset in the same upper-DTCM
 // neighborhood reported by CrashReport.
-static clocks_alpha_lane_forensics_t g_beta_start_vclock_forensics DMAMEM = {};
-static clocks_alpha_lane_forensics_t g_beta_start_ocxo1_forensics DMAMEM = {};
-static clocks_alpha_lane_forensics_t g_beta_start_ocxo2_forensics DMAMEM = {};
 static clocks_alpha_lane_forensics_t g_beta_pps_vclock_forensics DMAMEM = {};
 static clocks_alpha_lane_forensics_t g_beta_pps_ocxo1_forensics DMAMEM = {};
 static clocks_alpha_lane_forensics_t g_beta_pps_ocxo2_forensics DMAMEM = {};
@@ -2390,6 +2448,40 @@ static void campaign_start_prologue_reset(const char* reason) {
   g_start_prologue_last_vclock_minus_pps0 = 0;
   g_start_prologue_last_ocxo1_minus_pps0 = 0;
   g_start_prologue_last_ocxo2_minus_pps0 = 0;
+
+  g_start_candidate_check_count = 0;
+  g_start_candidate_ready_count = 0;
+  g_start_candidate_reject_count = 0;
+  g_start_candidate_last_ready = false;
+  g_start_candidate_last_vclock_snapshot_valid = false;
+  g_start_candidate_last_ocxo1_snapshot_valid = false;
+  g_start_candidate_last_ocxo2_snapshot_valid = false;
+  g_start_candidate_last_vclock_observed_interval = 0;
+  g_start_candidate_last_ocxo1_observed_interval = 0;
+  g_start_candidate_last_ocxo2_observed_interval = 0;
+  g_start_candidate_last_vclock_measurement_interval = 0;
+  g_start_candidate_last_ocxo1_measurement_interval = 0;
+  g_start_candidate_last_ocxo2_measurement_interval = 0;
+  g_start_candidate_last_vclock_update_count = 0;
+  g_start_candidate_last_ocxo1_update_count = 0;
+  g_start_candidate_last_ocxo2_update_count = 0;
+  g_start_candidate_last_selected_reference_valid = false;
+  g_start_candidate_last_selected_reference_interval = 0;
+  g_start_candidate_last_effective_cps = 0;
+  g_start_candidate_last_missing_mask = 0;
+  safeCopy(g_start_candidate_last_first_problem,
+           sizeof(g_start_candidate_last_first_problem),
+           "not_checked");
+  g_start_candidate_missing_vclock_snapshot_count = 0;
+  g_start_candidate_missing_ocxo1_snapshot_count = 0;
+  g_start_candidate_missing_ocxo2_snapshot_count = 0;
+  g_start_candidate_missing_vclock_observed_count = 0;
+  g_start_candidate_missing_ocxo1_observed_count = 0;
+  g_start_candidate_missing_ocxo2_observed_count = 0;
+  g_start_candidate_missing_selected_reference_valid_count = 0;
+  g_start_candidate_missing_selected_reference_interval_count = 0;
+  g_start_candidate_missing_effective_cps_count = 0;
+
   g_start_phaseledger_last_ready = false;
   g_start_phaseledger_last_ocxo1_ready = false;
   g_start_phaseledger_last_ocxo2_ready = false;
@@ -2404,7 +2496,13 @@ static void campaign_start_prologue_reset(const char* reason) {
            reason ? reason : "reset");
 }
 
-static bool campaign_start_prologue_should_hold(void);
+static bool campaign_start_prologue_should_hold(
+    bool vclock_valid,
+    const clocks_alpha_lane_forensics_t& vclock_f,
+    bool ocxo1_valid,
+    const clocks_alpha_lane_forensics_t& ocxo1_f,
+    bool ocxo2_valid,
+    const clocks_alpha_lane_forensics_t& ocxo2_f);
 static void flash_cut_clear_pending(void);
 static void ocxo_dac_pacing_abort_all(void);
 static FLASHMEM void recover_reattach_begin(void);
@@ -2715,12 +2813,21 @@ static FLASHMEM void recover_reattach_release(const char* reason, bool degraded)
   recover_reattach_set_reason(reason ? reason : "ocxo_reattach_release");
 }
 
-static bool campaign_warmup_consume_one_candidate_record(void) {
+static bool campaign_warmup_consume_one_candidate_record(
+    bool vclock_valid,
+    const clocks_alpha_lane_forensics_t& vclock_f,
+    bool ocxo1_valid,
+    const clocks_alpha_lane_forensics_t& ocxo1_f,
+    bool ocxo2_valid,
+    const clocks_alpha_lane_forensics_t& ocxo2_f) {
   if (g_campaign_warmup_mode != campaign_warmup_mode_t::START) {
     return false;
   }
 
-  if (campaign_start_prologue_should_hold()) {
+  if (campaign_start_prologue_should_hold(
+          vclock_valid, vclock_f,
+          ocxo1_valid, ocxo1_f,
+          ocxo2_valid, ocxo2_f)) {
     // This is private pre-publication evidence.  Alpha/Interrupt have advanced,
     // but campaign_seconds has not and no public TIMEBASE identity exists yet.
     if (g_campaign_warmup_mode == campaign_warmup_mode_t::START) {
@@ -5133,9 +5240,6 @@ static FLASHMEM void clocks_beta_cold_diagnostics_init(void) {
   g_delta_ocxo1_bookends = delta_residual_bookend_t{};
   g_delta_ocxo2_bookends = delta_residual_bookend_t{};
 
-  g_beta_start_vclock_forensics = clocks_alpha_lane_forensics_t{};
-  g_beta_start_ocxo1_forensics = clocks_alpha_lane_forensics_t{};
-  g_beta_start_ocxo2_forensics = clocks_alpha_lane_forensics_t{};
   g_beta_pps_vclock_forensics = clocks_alpha_lane_forensics_t{};
   g_beta_pps_ocxo1_forensics = clocks_alpha_lane_forensics_t{};
   g_beta_pps_ocxo2_forensics = clocks_alpha_lane_forensics_t{};
@@ -5675,18 +5779,19 @@ static delta_residual_reference_t delta_residual_capture_vclock_reference(
       g_pps_vclock_dwt_cycles_between_edges_valid
           ? (uint32_t)g_pps_vclock_dwt_cycles_between_edges
           : 0U;
-  if (selected_pps_vclock_interval != 0U) {
+  if (delta_raw_interval_cycles_plausible(selected_pps_vclock_interval)) {
     r.gnss_valid = true;
     r.gnss_interval_cycles = selected_pps_vclock_interval;
   }
 
-  // Keep the VCLOCK measured rail as side evidence only. The canonical
-  // reference for Delta Cycles is the exact observed selected PPS/VCLOCK
-  // edge-to-edge interval: current snap.dwt_at_edge minus the previous
-  // snap.dwt_at_edge.
-  if (vclock_valid && vclock_f.dwt_interval_observed_cycles != 0U) {
+  // Alpha's ordinary edge-to-edge measurement is the canonical live interval
+  // consumed by Beta.  process_interrupt's dwt_interval_observed_cycles is a
+  // separate gate-audit field and may legitimately be zero during launch
+  // acquisition; keep that field report-only.
+  if (vclock_valid &&
+      delta_raw_interval_cycles_plausible(vclock_f.dwt_cycles_between_edges)) {
     r.raw_valid = true;
-    r.raw_interval_cycles = vclock_f.dwt_interval_observed_cycles;
+    r.raw_interval_cycles = vclock_f.dwt_cycles_between_edges;
   }
 
   const bool vclock_floorline_valid =
@@ -5721,7 +5826,7 @@ static void delta_residual_apply_one(clock_science_row_t& row,
 
   if (ref_count_aligned && ref.gnss_valid && clock_valid) {
     row.delta_raw_reference_interval_cycles = ref.gnss_interval_cycles;
-    row.delta_raw_clock_interval_cycles = clock_f.dwt_interval_observed_cycles;
+    row.delta_raw_clock_interval_cycles = clock_f.dwt_cycles_between_edges;
 
     const bool reference_plausible = delta_raw_interval_cycles_plausible(
         row.delta_raw_reference_interval_cycles);
@@ -6080,7 +6185,8 @@ static void floorline_science_build_ocxo(
       : 0U;
   row.clock_published_dwt_at_edge = clock_valid ? clock_f.dwt_used_at_event : 0U;
   row.clock_raw_dwt_at_edge = clock_valid ? clock_f.dwt_original_at_event : 0U;
-  row.clock_observed_interval_cycles = clock_valid ? clock_f.dwt_interval_observed_cycles : 0U;
+  row.clock_observed_interval_cycles =
+      clock_valid ? clock_f.dwt_cycles_between_edges : 0U;
   row.clock_effective_interval_cycles = clock_valid ? clock_f.dwt_interval_effective_cycles : 0U;
 
   if (row.clock_floorline_valid) {
@@ -6213,27 +6319,168 @@ static void campaign_start_prologue_set_reason(const char* reason) {
 }
 
 
-static bool campaign_start_prologue_fetch_forensics(
-    clocks_alpha_lane_forensics_t& vclock_f,
-    clocks_alpha_lane_forensics_t& ocxo1_f,
-    clocks_alpha_lane_forensics_t& ocxo2_f,
-    bool& vclock_valid,
-    bool& ocxo1_valid,
-    bool& ocxo2_valid) {
-  vclock_valid = clocks_alpha_lane_forensics(time_clock_id_t::VCLOCK, &vclock_f);
-  ocxo1_valid = clocks_alpha_lane_forensics(time_clock_id_t::OCXO1, &ocxo1_f);
-  ocxo2_valid = clocks_alpha_lane_forensics(time_clock_id_t::OCXO2, &ocxo2_f);
+static const char* campaign_start_candidate_first_problem(uint32_t mask) {
+  if (mask & CLOCKS_START_CANDIDATE_MISSING_VCLOCK_SNAPSHOT) {
+    return "vclock_snapshot";
+  }
+  if (mask & CLOCKS_START_CANDIDATE_MISSING_OCXO1_SNAPSHOT) {
+    return "ocxo1_snapshot";
+  }
+  if (mask & CLOCKS_START_CANDIDATE_MISSING_OCXO2_SNAPSHOT) {
+    return "ocxo2_snapshot";
+  }
+  if (mask & CLOCKS_START_CANDIDATE_MISSING_VCLOCK_OBSERVED) {
+    return g_start_candidate_last_vclock_measurement_interval == 0U
+        ? "vclock_start_interval_missing"
+        : "vclock_start_interval_implausible";
+  }
+  if (mask & CLOCKS_START_CANDIDATE_MISSING_OCXO1_OBSERVED) {
+    return g_start_candidate_last_ocxo1_measurement_interval == 0U
+        ? "ocxo1_start_interval_missing"
+        : "ocxo1_start_interval_implausible";
+  }
+  if (mask & CLOCKS_START_CANDIDATE_MISSING_OCXO2_OBSERVED) {
+    return g_start_candidate_last_ocxo2_measurement_interval == 0U
+        ? "ocxo2_start_interval_missing"
+        : "ocxo2_start_interval_implausible";
+  }
+  if (mask & CLOCKS_START_CANDIDATE_MISSING_SELECTED_REFERENCE_VALID) {
+    return "selected_reference_invalid";
+  }
+  if (mask & CLOCKS_START_CANDIDATE_MISSING_SELECTED_REFERENCE_INTERVAL) {
+    return g_start_candidate_last_selected_reference_interval == 0U
+        ? "selected_reference_interval_missing"
+        : "selected_reference_interval_implausible";
+  }
+  if (mask & CLOCKS_START_CANDIDATE_MISSING_EFFECTIVE_CPS) {
+    return g_start_candidate_last_effective_cps == 0U
+        ? "effective_cps_missing"
+        : "effective_cps_implausible";
+  }
+  return "ready";
+}
 
-  if (!vclock_valid || !ocxo1_valid || !ocxo2_valid ||
-      vclock_f.dwt_interval_observed_cycles == 0U ||
-      ocxo1_f.dwt_interval_observed_cycles == 0U ||
-      ocxo2_f.dwt_interval_observed_cycles == 0U ||
-      !g_pps_vclock_dwt_cycles_between_edges_valid ||
-      g_pps_vclock_dwt_cycles_between_edges == 0U ||
-      g_dwt_cycles_between_pps_vclock == 0U) {
-    campaign_start_prologue_set_reason("waiting_for_observed_delta_bookends");
+
+static void campaign_start_candidate_count_missing(uint32_t mask) {
+  if (mask & CLOCKS_START_CANDIDATE_MISSING_VCLOCK_SNAPSHOT) {
+    g_start_candidate_missing_vclock_snapshot_count++;
+  }
+  if (mask & CLOCKS_START_CANDIDATE_MISSING_OCXO1_SNAPSHOT) {
+    g_start_candidate_missing_ocxo1_snapshot_count++;
+  }
+  if (mask & CLOCKS_START_CANDIDATE_MISSING_OCXO2_SNAPSHOT) {
+    g_start_candidate_missing_ocxo2_snapshot_count++;
+  }
+  if (mask & CLOCKS_START_CANDIDATE_MISSING_VCLOCK_OBSERVED) {
+    g_start_candidate_missing_vclock_observed_count++;
+  }
+  if (mask & CLOCKS_START_CANDIDATE_MISSING_OCXO1_OBSERVED) {
+    g_start_candidate_missing_ocxo1_observed_count++;
+  }
+  if (mask & CLOCKS_START_CANDIDATE_MISSING_OCXO2_OBSERVED) {
+    g_start_candidate_missing_ocxo2_observed_count++;
+  }
+  if (mask & CLOCKS_START_CANDIDATE_MISSING_SELECTED_REFERENCE_VALID) {
+    g_start_candidate_missing_selected_reference_valid_count++;
+  }
+  if (mask & CLOCKS_START_CANDIDATE_MISSING_SELECTED_REFERENCE_INTERVAL) {
+    g_start_candidate_missing_selected_reference_interval_count++;
+  }
+  if (mask & CLOCKS_START_CANDIDATE_MISSING_EFFECTIVE_CPS) {
+    g_start_candidate_missing_effective_cps_count++;
+  }
+}
+
+
+static bool campaign_start_prologue_candidate_ready(
+    bool vclock_valid,
+    const clocks_alpha_lane_forensics_t& vclock_f,
+    bool ocxo1_valid,
+    const clocks_alpha_lane_forensics_t& ocxo1_f,
+    bool ocxo2_valid,
+    const clocks_alpha_lane_forensics_t& ocxo2_f) {
+  // The caller has already formed the current Beta candidate tuple and proved
+  // that VCLOCK matches the selected PPS/VCLOCK identity. Validate that exact
+  // tuple here; do not re-read Alpha stores from the earlier warmup gate and
+  // accidentally mix snapshots from different candidate moments.
+  g_start_candidate_check_count++;
+
+  g_start_candidate_last_vclock_snapshot_valid = vclock_valid;
+  g_start_candidate_last_ocxo1_snapshot_valid = ocxo1_valid;
+  g_start_candidate_last_ocxo2_snapshot_valid = ocxo2_valid;
+  g_start_candidate_last_vclock_observed_interval =
+      vclock_valid ? vclock_f.dwt_interval_observed_cycles : 0U;
+  g_start_candidate_last_ocxo1_observed_interval =
+      ocxo1_valid ? ocxo1_f.dwt_interval_observed_cycles : 0U;
+  g_start_candidate_last_ocxo2_observed_interval =
+      ocxo2_valid ? ocxo2_f.dwt_interval_observed_cycles : 0U;
+  g_start_candidate_last_vclock_measurement_interval =
+      vclock_valid ? vclock_f.dwt_cycles_between_edges : 0U;
+  g_start_candidate_last_ocxo1_measurement_interval =
+      ocxo1_valid ? ocxo1_f.dwt_cycles_between_edges : 0U;
+  g_start_candidate_last_ocxo2_measurement_interval =
+      ocxo2_valid ? ocxo2_f.dwt_cycles_between_edges : 0U;
+  g_start_candidate_last_vclock_update_count =
+      vclock_valid ? vclock_f.update_count : 0U;
+  g_start_candidate_last_ocxo1_update_count =
+      ocxo1_valid ? ocxo1_f.update_count : 0U;
+  g_start_candidate_last_ocxo2_update_count =
+      ocxo2_valid ? ocxo2_f.update_count : 0U;
+  g_start_candidate_last_selected_reference_valid =
+      g_pps_vclock_dwt_cycles_between_edges_valid;
+  g_start_candidate_last_selected_reference_interval =
+      (uint32_t)g_pps_vclock_dwt_cycles_between_edges;
+  g_start_candidate_last_effective_cps =
+      (uint32_t)g_dwt_cycles_between_pps_vclock;
+
+  uint32_t missing = 0U;
+  if (!vclock_valid) {
+    missing |= CLOCKS_START_CANDIDATE_MISSING_VCLOCK_SNAPSHOT;
+  }
+  if (!ocxo1_valid) {
+    missing |= CLOCKS_START_CANDIDATE_MISSING_OCXO1_SNAPSHOT;
+  }
+  if (!ocxo2_valid) {
+    missing |= CLOCKS_START_CANDIDATE_MISSING_OCXO2_SNAPSHOT;
+  }
+  if (!delta_raw_interval_cycles_plausible(
+          g_start_candidate_last_vclock_measurement_interval)) {
+    missing |= CLOCKS_START_CANDIDATE_MISSING_VCLOCK_OBSERVED;
+  }
+  if (!delta_raw_interval_cycles_plausible(
+          g_start_candidate_last_ocxo1_measurement_interval)) {
+    missing |= CLOCKS_START_CANDIDATE_MISSING_OCXO1_OBSERVED;
+  }
+  if (!delta_raw_interval_cycles_plausible(
+          g_start_candidate_last_ocxo2_measurement_interval)) {
+    missing |= CLOCKS_START_CANDIDATE_MISSING_OCXO2_OBSERVED;
+  }
+  if (!g_start_candidate_last_selected_reference_valid) {
+    missing |= CLOCKS_START_CANDIDATE_MISSING_SELECTED_REFERENCE_VALID;
+  }
+  if (!delta_raw_interval_cycles_plausible(
+          g_start_candidate_last_selected_reference_interval)) {
+    missing |= CLOCKS_START_CANDIDATE_MISSING_SELECTED_REFERENCE_INTERVAL;
+  }
+  if (!delta_raw_interval_cycles_plausible(
+          g_start_candidate_last_effective_cps)) {
+    missing |= CLOCKS_START_CANDIDATE_MISSING_EFFECTIVE_CPS;
+  }
+
+  g_start_candidate_last_missing_mask = missing;
+  g_start_candidate_last_ready = (missing == 0U);
+  safeCopy(g_start_candidate_last_first_problem,
+           sizeof(g_start_candidate_last_first_problem),
+           campaign_start_candidate_first_problem(missing));
+
+  if (missing != 0U) {
+    g_start_candidate_reject_count++;
+    campaign_start_candidate_count_missing(missing);
+    campaign_start_prologue_set_reason("waiting_for_lawful_alpha_intervals");
     return false;
   }
+
+  g_start_candidate_ready_count++;
   return true;
 }
 
@@ -6250,13 +6497,19 @@ static bool campaign_start_prologue_consume_private_candidate(
   const bool o2_fl = floorline_candidate_present(ocxo2_valid, ocxo2_f);
 
   if (!vclock_valid || !ocxo1_valid || !ocxo2_valid ||
-      vclock_f.dwt_interval_observed_cycles == 0U ||
-      ocxo1_f.dwt_interval_observed_cycles == 0U ||
-      ocxo2_f.dwt_interval_observed_cycles == 0U ||
+      !delta_raw_interval_cycles_plausible(
+          vclock_f.dwt_cycles_between_edges) ||
+      !delta_raw_interval_cycles_plausible(
+          ocxo1_f.dwt_cycles_between_edges) ||
+      !delta_raw_interval_cycles_plausible(
+          ocxo2_f.dwt_cycles_between_edges) ||
       !g_pps_vclock_dwt_cycles_between_edges_valid ||
-      g_pps_vclock_dwt_cycles_between_edges == 0U ||
-      g_dwt_cycles_between_pps_vclock == 0U) {
-    campaign_start_prologue_set_reason("private_candidate_missing_observed_delta");
+      !delta_raw_interval_cycles_plausible(
+          (uint32_t)g_pps_vclock_dwt_cycles_between_edges) ||
+      !delta_raw_interval_cycles_plausible(
+          (uint32_t)g_dwt_cycles_between_pps_vclock)) {
+    campaign_start_prologue_set_reason(
+        "private_candidate_missing_or_implausible_alpha_interval");
     return false;
   }
 
@@ -6285,20 +6538,20 @@ static bool campaign_start_prologue_consume_private_candidate(
   g_start_prologue_pps0_pps_obs =
       ref.gnss_valid ? ref.gnss_interval_cycles : 0U;
   g_start_prologue_pps0_v_obs =
-      vclock_valid ? vclock_f.dwt_interval_observed_cycles : 0U;
+      vclock_valid ? vclock_f.dwt_cycles_between_edges : 0U;
   g_start_prologue_pps0_v_fl = ref.floorline_interval_cycles;
   g_start_prologue_pps0_o1_obs =
-      ocxo1_valid ? ocxo1_f.dwt_interval_observed_cycles : 0U;
+      ocxo1_valid ? ocxo1_f.dwt_cycles_between_edges : 0U;
   g_start_prologue_pps0_o1_fl = ocxo1_endpoint_interval;
   g_start_prologue_pps0_o2_obs =
-      ocxo2_valid ? ocxo2_f.dwt_interval_observed_cycles : 0U;
+      ocxo2_valid ? ocxo2_f.dwt_cycles_between_edges : 0U;
   g_start_prologue_pps0_o2_fl = ocxo2_endpoint_interval;
   g_start_prologue_pps0_interval_valid =
-      g_start_prologue_pps0_pps_obs != 0U &&
       ref.gnss_valid &&
-      vclock_f.dwt_interval_observed_cycles != 0U &&
-      ocxo1_f.dwt_interval_observed_cycles != 0U &&
-      ocxo2_f.dwt_interval_observed_cycles != 0U;
+      delta_raw_interval_cycles_plausible(g_start_prologue_pps0_pps_obs) &&
+      delta_raw_interval_cycles_plausible(g_start_prologue_pps0_v_obs) &&
+      delta_raw_interval_cycles_plausible(g_start_prologue_pps0_o1_obs) &&
+      delta_raw_interval_cycles_plausible(g_start_prologue_pps0_o2_obs);
 
   g_delta_previous_vclock_reference = ref;
   g_start_prologue_seeded = true;
@@ -6325,8 +6578,11 @@ static bool campaign_start_prologue_reference_fit_ok(
 
 
 static bool campaign_start_prologue_interval_fit_ok(uint32_t current,
-                                                    uint32_t previous) {
-  if (current == 0U || previous == 0U) return false;
+                                                     uint32_t previous) {
+  if (!delta_raw_interval_cycles_plausible(current) ||
+      !delta_raw_interval_cycles_plausible(previous)) {
+    return false;
+  }
   return beta_abs_i32_within_gate(
       beta_signed_delta_u32(current, previous),
       CLOCKS_START_PROLOGUE_FIT_ENDPOINT_GATE_CYCLES);
@@ -6348,11 +6604,11 @@ static bool campaign_start_prologue_private_pps0_continuity_ok(
           ? (uint32_t)g_pps_vclock_dwt_cycles_between_edges
           : 0U;
   const uint32_t current_vclock_interval =
-      vclock_valid ? vclock_f.dwt_interval_observed_cycles : 0U;
+      vclock_valid ? vclock_f.dwt_cycles_between_edges : 0U;
   const uint32_t current_ocxo1_interval =
-      ocxo1_valid ? ocxo1_f.dwt_interval_observed_cycles : 0U;
+      ocxo1_valid ? ocxo1_f.dwt_cycles_between_edges : 0U;
   const uint32_t current_ocxo2_interval =
-      ocxo2_valid ? ocxo2_f.dwt_interval_observed_cycles : 0U;
+      ocxo2_valid ? ocxo2_f.dwt_cycles_between_edges : 0U;
 
   g_start_prologue_last_reference_interval = current_reference_interval;
   g_start_prologue_last_vclock_interval = current_vclock_interval;
@@ -6529,18 +6785,13 @@ static void campaign_start_prologue_abort_launch(const char* reason) {
   timebase_invalidate();
 }
 
-static bool campaign_start_prologue_should_hold(void) {
-  clocks_alpha_lane_forensics_t& vclock_f = g_beta_start_vclock_forensics;
-  clocks_alpha_lane_forensics_t& ocxo1_f = g_beta_start_ocxo1_forensics;
-  clocks_alpha_lane_forensics_t& ocxo2_f = g_beta_start_ocxo2_forensics;
-  vclock_f = clocks_alpha_lane_forensics_t{};
-  ocxo1_f = clocks_alpha_lane_forensics_t{};
-  ocxo2_f = clocks_alpha_lane_forensics_t{};
-
-  bool vclock_valid = false;
-  bool ocxo1_valid = false;
-  bool ocxo2_valid = false;
-
+static bool campaign_start_prologue_should_hold(
+    bool vclock_valid,
+    const clocks_alpha_lane_forensics_t& vclock_f,
+    bool ocxo1_valid,
+    const clocks_alpha_lane_forensics_t& ocxo1_f,
+    bool ocxo2_valid,
+    const clocks_alpha_lane_forensics_t& ocxo2_f) {
   if (!campaign_start_handoff_ready()) {
     if (g_start_handoff_launch_wait_count != UINT32_MAX) {
       g_start_handoff_launch_wait_count++;
@@ -6563,9 +6814,10 @@ static bool campaign_start_prologue_should_hold(void) {
   // A ready handoff is not enough if the current observed DWT bookends have
   // not arrived yet.  Keep the same bounded launch wait active through this
   // final evidence-acquisition step so START cannot become silently infinite.
-  if (!campaign_start_prologue_fetch_forensics(
-          vclock_f, ocxo1_f, ocxo2_f,
-          vclock_valid, ocxo1_valid, ocxo2_valid)) {
+  if (!campaign_start_prologue_candidate_ready(
+          vclock_valid, vclock_f,
+          ocxo1_valid, ocxo1_f,
+          ocxo2_valid, ocxo2_f)) {
     if (g_start_handoff_launch_wait_count != UINT32_MAX) {
       g_start_handoff_launch_wait_count++;
     }
@@ -6879,7 +7131,8 @@ static FLASHMEM void payload_add_vclock_science_object(Payload& lane,
   row.clock_floorline_interval_cycles = row.vclock_floorline_interval_cycles;
   row.clock_published_dwt_at_edge = vclock_valid ? vclock_f.dwt_used_at_event : 0U;
   row.clock_raw_dwt_at_edge = vclock_valid ? vclock_f.dwt_original_at_event : 0U;
-  row.clock_observed_interval_cycles = vclock_valid ? vclock_f.dwt_interval_observed_cycles : 0U;
+  row.clock_observed_interval_cycles =
+      vclock_valid ? vclock_f.dwt_cycles_between_edges : 0U;
   row.clock_effective_interval_cycles = vclock_valid ? vclock_f.dwt_interval_effective_cycles : 0U;
   if (row.clock_floorline_valid) {
     row.published_minus_floorline_cycles =
@@ -8676,15 +8929,6 @@ void clocks_beta_pps(void) {
     return;
   }
 
-  // START privately acquires a lawful PPS0 bookend while campaign_seconds
-  // remains zero.  These are not screened campaign rows: public campaign time
-  // has not begun.  Once PPS1 is released, every public identity is emitted.
-  if (campaign_warmup_consume_one_candidate_record()) {
-    timebase_build_stage(TIMEBASE_BUILD_STAGE_WARMUP_GATE);
-    publish_dac_tick("WARMUP_GATE");
-    return;
-  }
-
   // RECOVER resumes an existing public timeline, so its reattachment state is
   // observational here and candidate identities continue to be emitted.
   (void)recover_reattach_should_hold();
@@ -8703,6 +8947,34 @@ void clocks_beta_pps(void) {
   if (!vclock_forensics_valid ||
       vclock_forensics.last_event_counter32 != g_counter32_at_pps_vclock ||
       vclock_forensics.last_event_dwt != g_dwt_at_pps_vclock) {
+    return;
+  }
+
+  // Form the complete current-row forensic tuple before the START prologue
+  // decides whether this candidate remains private PPS0 or becomes public PPS1.
+  // The old ordering ran the warmup court first, so it could suppress the very
+  // candidate needed to seed its observed bookends.
+  clocks_alpha_lane_forensics_t& ocxo1_forensics = g_beta_pps_ocxo1_forensics;
+  clocks_alpha_lane_forensics_t& ocxo2_forensics = g_beta_pps_ocxo2_forensics;
+  ocxo1_forensics = clocks_alpha_lane_forensics_t{};
+  ocxo2_forensics = clocks_alpha_lane_forensics_t{};
+
+  const bool ocxo1_forensics_valid =
+      clocks_alpha_lane_forensics(time_clock_id_t::OCXO1, &ocxo1_forensics);
+  const bool ocxo2_forensics_valid =
+      clocks_alpha_lane_forensics(time_clock_id_t::OCXO2, &ocxo2_forensics);
+
+  // START consumes this exact candidate tuple privately while campaign_seconds
+  // remains zero. The helper seeds PPS0 from the normal observed-edge inputs and
+  // returns true until a following mature tuple can be released as public PPS1.
+  // Welford, servo, watchdog, payload construction, and publication remain below
+  // this boundary and therefore cannot consume private startup evidence.
+  if (campaign_warmup_consume_one_candidate_record(
+          vclock_forensics_valid, vclock_forensics,
+          ocxo1_forensics_valid, ocxo1_forensics,
+          ocxo2_forensics_valid, ocxo2_forensics)) {
+    timebase_build_stage(TIMEBASE_BUILD_STAGE_WARMUP_GATE);
+    publish_dac_tick("WARMUP_GATE");
     return;
   }
 
@@ -8743,16 +9015,6 @@ void clocks_beta_pps(void) {
   // DWT Welford mutation is deferred until after the candidate disposition
   // court below.  A SCIENCE_REJECT row advances campaign identity but may not
   // enter any campaign statistical population.
-
-  clocks_alpha_lane_forensics_t& ocxo1_forensics = g_beta_pps_ocxo1_forensics;
-  clocks_alpha_lane_forensics_t& ocxo2_forensics = g_beta_pps_ocxo2_forensics;
-  ocxo1_forensics = clocks_alpha_lane_forensics_t{};
-  ocxo2_forensics = clocks_alpha_lane_forensics_t{};
-
-  const bool ocxo1_forensics_valid =
-      clocks_alpha_lane_forensics(time_clock_id_t::OCXO1, &ocxo1_forensics);
-  const bool ocxo2_forensics_valid =
-      clocks_alpha_lane_forensics(time_clock_id_t::OCXO2, &ocxo2_forensics);
 
   clocks_pps_vclock_edge_forensics_t& pps_vclock_edge_forensics =
       g_beta_pps_vclock_edge_forensics;
@@ -13154,6 +13416,123 @@ static FLASHMEM void payload_add_phaseledger_start_lane(
   parent.add_object(key, lane);
 }
 
+static FLASHMEM void payload_add_start_candidate_readiness(Payload& p) {
+  p.add("schema", "CLOCKS_START_CANDIDATE_READINESS_V2");
+  p.add("report_only", true);
+  p.add("gate_behavior_changed", true);
+  p.add("candidate_interval_authority",
+        "ALPHA_DWT_CYCLES_BETWEEN_EDGES");
+  p.add("candidate_audit_interval_source",
+        "PROCESS_INTERRUPT_DWT_INTERVAL_OBSERVED_CYCLES");
+  p.add("candidate_interval_min_cycles",
+        (uint32_t)CLOCKS_DELTA_RAW_INTERVAL_MIN_CYCLES);
+  p.add("candidate_interval_max_cycles",
+        (uint32_t)CLOCKS_DELTA_RAW_INTERVAL_MAX_CYCLES);
+
+  p.add("candidate_check_count", g_start_candidate_check_count);
+  p.add("candidate_ready_count", g_start_candidate_ready_count);
+  p.add("candidate_reject_count", g_start_candidate_reject_count);
+  p.add("candidate_last_ready", g_start_candidate_last_ready);
+  p.add("candidate_missing_mask", g_start_candidate_last_missing_mask);
+  p.add("candidate_first_problem", g_start_candidate_last_first_problem);
+
+  p.add("candidate_vclock_snapshot_valid",
+        g_start_candidate_last_vclock_snapshot_valid);
+  p.add("candidate_ocxo1_snapshot_valid",
+        g_start_candidate_last_ocxo1_snapshot_valid);
+  p.add("candidate_ocxo2_snapshot_valid",
+        g_start_candidate_last_ocxo2_snapshot_valid);
+  p.add("candidate_vclock_observed_interval",
+        g_start_candidate_last_vclock_observed_interval);
+  p.add("candidate_ocxo1_observed_interval",
+        g_start_candidate_last_ocxo1_observed_interval);
+  p.add("candidate_ocxo2_observed_interval",
+        g_start_candidate_last_ocxo2_observed_interval);
+  p.add("candidate_vclock_measurement_interval",
+        g_start_candidate_last_vclock_measurement_interval);
+  p.add("candidate_ocxo1_measurement_interval",
+        g_start_candidate_last_ocxo1_measurement_interval);
+  p.add("candidate_ocxo2_measurement_interval",
+        g_start_candidate_last_ocxo2_measurement_interval);
+  p.add("candidate_vclock_measurement_plausible",
+        delta_raw_interval_cycles_plausible(
+            g_start_candidate_last_vclock_measurement_interval));
+  p.add("candidate_ocxo1_measurement_plausible",
+        delta_raw_interval_cycles_plausible(
+            g_start_candidate_last_ocxo1_measurement_interval));
+  p.add("candidate_ocxo2_measurement_plausible",
+        delta_raw_interval_cycles_plausible(
+            g_start_candidate_last_ocxo2_measurement_interval));
+  p.add("candidate_vclock_update_count",
+        g_start_candidate_last_vclock_update_count);
+  p.add("candidate_ocxo1_update_count",
+        g_start_candidate_last_ocxo1_update_count);
+  p.add("candidate_ocxo2_update_count",
+        g_start_candidate_last_ocxo2_update_count);
+  p.add("candidate_selected_reference_valid",
+        g_start_candidate_last_selected_reference_valid);
+  p.add("candidate_selected_reference_interval",
+        g_start_candidate_last_selected_reference_interval);
+  p.add("candidate_selected_reference_plausible",
+        delta_raw_interval_cycles_plausible(
+            g_start_candidate_last_selected_reference_interval));
+  p.add("candidate_effective_cps", g_start_candidate_last_effective_cps);
+  p.add("candidate_effective_cps_plausible",
+        delta_raw_interval_cycles_plausible(
+            g_start_candidate_last_effective_cps));
+
+  p.add("missing_vclock_snapshot_bit",
+        CLOCKS_START_CANDIDATE_MISSING_VCLOCK_SNAPSHOT);
+  p.add("missing_ocxo1_snapshot_bit",
+        CLOCKS_START_CANDIDATE_MISSING_OCXO1_SNAPSHOT);
+  p.add("missing_ocxo2_snapshot_bit",
+        CLOCKS_START_CANDIDATE_MISSING_OCXO2_SNAPSHOT);
+  p.add("missing_vclock_observed_interval_bit",
+        CLOCKS_START_CANDIDATE_MISSING_VCLOCK_OBSERVED);
+  p.add("missing_ocxo1_observed_interval_bit",
+        CLOCKS_START_CANDIDATE_MISSING_OCXO1_OBSERVED);
+  p.add("missing_ocxo2_observed_interval_bit",
+        CLOCKS_START_CANDIDATE_MISSING_OCXO2_OBSERVED);
+  p.add("unusable_vclock_measurement_interval_bit",
+        CLOCKS_START_CANDIDATE_MISSING_VCLOCK_OBSERVED);
+  p.add("unusable_ocxo1_measurement_interval_bit",
+        CLOCKS_START_CANDIDATE_MISSING_OCXO1_OBSERVED);
+  p.add("unusable_ocxo2_measurement_interval_bit",
+        CLOCKS_START_CANDIDATE_MISSING_OCXO2_OBSERVED);
+  p.add("missing_selected_reference_valid_bit",
+        CLOCKS_START_CANDIDATE_MISSING_SELECTED_REFERENCE_VALID);
+  p.add("missing_selected_reference_interval_bit",
+        CLOCKS_START_CANDIDATE_MISSING_SELECTED_REFERENCE_INTERVAL);
+  p.add("missing_effective_cps_bit",
+        CLOCKS_START_CANDIDATE_MISSING_EFFECTIVE_CPS);
+
+  p.add("missing_vclock_snapshot_count",
+        g_start_candidate_missing_vclock_snapshot_count);
+  p.add("missing_ocxo1_snapshot_count",
+        g_start_candidate_missing_ocxo1_snapshot_count);
+  p.add("missing_ocxo2_snapshot_count",
+        g_start_candidate_missing_ocxo2_snapshot_count);
+  p.add("missing_vclock_observed_interval_count",
+        g_start_candidate_missing_vclock_observed_count);
+  p.add("missing_ocxo1_observed_interval_count",
+        g_start_candidate_missing_ocxo1_observed_count);
+  p.add("missing_ocxo2_observed_interval_count",
+        g_start_candidate_missing_ocxo2_observed_count);
+  p.add("unusable_vclock_measurement_interval_count",
+        g_start_candidate_missing_vclock_observed_count);
+  p.add("unusable_ocxo1_measurement_interval_count",
+        g_start_candidate_missing_ocxo1_observed_count);
+  p.add("unusable_ocxo2_measurement_interval_count",
+        g_start_candidate_missing_ocxo2_observed_count);
+  p.add("missing_selected_reference_valid_count",
+        g_start_candidate_missing_selected_reference_valid_count);
+  p.add("missing_selected_reference_interval_count",
+        g_start_candidate_missing_selected_reference_interval_count);
+  p.add("missing_effective_cps_count",
+        g_start_candidate_missing_effective_cps_count);
+}
+
+
 static FLASHMEM void payload_add_startup_handoff_payload(Payload& p) {
   p.add("report_scope", "START_HANDOFF_PHASELEDGER");
   p.add("authority", clocks_ocxo_public_ns_authority_name());
@@ -13162,6 +13541,11 @@ static FLASHMEM void payload_add_startup_handoff_payload(Payload& p) {
         "PRIVATE_PPS0_CONTINUITY_PLUS_COUNTERLEDGER_PHASELEDGER_MATURITY");
   p.add("dwt_role",
         "launch_witness_only_not_phaseledger_clock_authority");
+  p.add("candidate_readiness_report", "REPORT_START_CANDIDATE");
+  p.add("candidate_check_count", g_start_candidate_check_count);
+  p.add("candidate_last_ready", g_start_candidate_last_ready);
+  p.add("candidate_missing_mask", g_start_candidate_last_missing_mask);
+  p.add("candidate_first_problem", g_start_candidate_last_first_problem);
 
   Payload prologue;
   prologue.add("seeded", g_start_prologue_seeded);
@@ -13270,6 +13654,16 @@ static FLASHMEM void payload_add_startup_handoff_payload(Payload& p) {
   p.add_object("phaseledger", phaseledger);
 }
 
+static FLASHMEM Payload cmd_report_start_candidate(const Payload&) {
+  Payload p;
+  p.add("report", "CLOCKS_START_CANDIDATE_READINESS");
+  p.add("description",
+        "START Alpha-measurement interval court and audit transcript");
+  payload_add_start_candidate_readiness(p);
+  return p;
+}
+
+
 static FLASHMEM Payload cmd_report_startup(const Payload&) {
   Payload p;
   p.add("report", "CLOCKS_STARTUP_HANDOFF");
@@ -13283,7 +13677,7 @@ static FLASHMEM Payload cmd_report(const Payload&) {
   clocks_stack_witness_note_command(CLOCKS_STACK_CONTEXT_REPORT_COMPACT);
   Payload p;
   p.add("report", "CLOCKS_COMPACT");
-  p.add("subreports", "REPORT_STATUS REPORT_SUMMARY REPORT_EPOCH REPORT_SMARTZERO REPORT_INSTALLED_SMARTZERO REPORT_LIVE_SMARTZERO REPORT_FORENSICS REPORT_FORENSICS_VCLOCK REPORT_FORENSICS_OCXO1 REPORT_FORENSICS_OCXO2 REPORT_OCXO_PPS_PROJECTION REPORT_OCXO_PROJECTION_GUARD REPORT_TIMEBASE_PUBLISH REPORT_TIMEBASE_PUBLISH_DEEP REPORT_RECOVERY REPORT_RECOVERY_DEEP REPORT_RECOVER_STATUS REPORT_RECOVER REPORT_STACK_TINY REPORT_STACK_WITNESS REPORT_STACK REPORT_STARTUP REPORT_INTEGRITY REPORT_ALPHA_FLOW REPORT_ALPHA_FLOW_VCLOCK REPORT_ALPHA_FLOW_OCXO1 REPORT_ALPHA_FLOW_OCXO2 REPORT_PREDICTION REPORT_STATS REPORT_DAC DITHER_STATUS DITHER_ENABLE DITHER_DISABLE");
+  p.add("subreports", "REPORT_STATUS REPORT_SUMMARY REPORT_EPOCH REPORT_SMARTZERO REPORT_INSTALLED_SMARTZERO REPORT_LIVE_SMARTZERO REPORT_FORENSICS REPORT_FORENSICS_VCLOCK REPORT_FORENSICS_OCXO1 REPORT_FORENSICS_OCXO2 REPORT_OCXO_PPS_PROJECTION REPORT_OCXO_PROJECTION_GUARD REPORT_TIMEBASE_PUBLISH REPORT_TIMEBASE_PUBLISH_DEEP REPORT_RECOVERY REPORT_RECOVERY_DEEP REPORT_RECOVER_STATUS REPORT_RECOVER REPORT_STACK_TINY REPORT_STACK_WITNESS REPORT_STACK REPORT_START_CANDIDATE REPORT_STARTUP REPORT_INTEGRITY REPORT_ALPHA_FLOW REPORT_ALPHA_FLOW_VCLOCK REPORT_ALPHA_FLOW_OCXO1 REPORT_ALPHA_FLOW_OCXO2 REPORT_PREDICTION REPORT_STATS REPORT_DAC DITHER_STATUS DITHER_ENABLE DITHER_DISABLE");
   add_summary_payload(p);
   add_campaign_payload(p);
 
@@ -13871,6 +14265,7 @@ static const process_command_entry_t CLOCKS_COMMANDS[] = {
   { "REPORT_STACK_WITNESS",    cmd_report_stack            },
   { "REPORT_STACK",            cmd_report_stack            },
   { "STACK_WITNESS_RESET",     cmd_stack_witness_reset     },
+  { "REPORT_START_CANDIDATE",  cmd_report_start_candidate  },
   { "REPORT_STARTUP",          cmd_report_startup          },
   { "REPORT_INTEGRITY",        cmd_report_integrity        },
   { "REPORT_ALPHA_FLOW",       cmd_report_alpha_flow       },

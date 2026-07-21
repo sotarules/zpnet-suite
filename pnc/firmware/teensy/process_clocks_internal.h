@@ -1720,25 +1720,21 @@ uint32_t clocks_ocxo_dac_actuator_commit_failure_count(void);
 const char* clocks_ocxo_dac_actuator_context(void);
 
 // ============================================================================
-// Campaign warmup suppression
+// Campaign startup prologue
 // ============================================================================
 //
-// A newly installed/recovered campaign deliberately suppresses the first N
-// PPS-driven TIMEBASE_FRAGMENT publications. Alpha continues to measure and
-// refine its internal timing state during this quiet period; beta simply
-// refuses to call those records canonical campaign output.
+// START forms the normal current-row forensic candidate before applying its
+// private prologue court. While the court holds, that candidate is consumed as
+// private PPS0 evidence: Alpha and Beta startup bookends advance, but
+// campaign_seconds remains zero and no TIMEBASE_FRAGMENT is published.
 //
-// For START, public campaign identity begins after warmup: the first emitted
-// fragment is teensy_pps_vclock_count=1 and gnss_ns=1e9.
+// The first following candidate that proves startup continuity is released as
+// public PPS1 (teensy_pps_vclock_count=1, gnss_ns=1e9). There is no fixed-N row
+// burial.
 //
-// For RECOVER, the suppressed records are treated as real elapsed campaign
-// seconds. The first emitted fragment therefore appears after a deliberate
-// canonical gap, preserving the recovered absolute PPS identity.
-
-// Minimum START warmup.  This is no longer the public-origin safety mechanism:
-// Beta also waits for Alpha's precomputed OCXO public-origin-ready flag before
-// it captures campaign public bases.
-static constexpr uint32_t CLOCKS_CAMPAIGN_WARMUP_SUPPRESS_PPS = 5;
+// RECOVER is different: it resumes an existing public identity and continues
+// emitting timeline candidates while reattachment/science readiness is exposed
+// explicitly.
 
 // ============================================================================
 // Campaign state
