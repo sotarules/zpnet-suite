@@ -1362,6 +1362,7 @@ static clocks_pps_vclock_edge_forensics_t
 static clocks_alpha_tau_snapshot_t g_beta_pps_ocxo1_alpha_tau DMAMEM = {};
 static clocks_alpha_tau_snapshot_t g_beta_pps_ocxo2_alpha_tau DMAMEM = {};
 static clocks_static_prediction_snapshot_t g_beta_pps_cycle_prediction DMAMEM = {};
+static clocks_static_prediction_snapshot_t g_beta_vclock_cycle_prediction DMAMEM = {};
 static clocks_static_prediction_snapshot_t g_beta_ocxo1_cycle_prediction DMAMEM = {};
 static clocks_static_prediction_snapshot_t g_beta_ocxo2_cycle_prediction DMAMEM = {};
 
@@ -5257,6 +5258,7 @@ static FLASHMEM void clocks_beta_cold_diagnostics_init(void) {
   g_beta_pps_ocxo1_alpha_tau = clocks_alpha_tau_snapshot_t{};
   g_beta_pps_ocxo2_alpha_tau = clocks_alpha_tau_snapshot_t{};
   g_beta_pps_cycle_prediction = clocks_static_prediction_snapshot_t{};
+  g_beta_vclock_cycle_prediction = clocks_static_prediction_snapshot_t{};
   g_beta_ocxo1_cycle_prediction = clocks_static_prediction_snapshot_t{};
   g_beta_ocxo2_cycle_prediction = clocks_static_prediction_snapshot_t{};
 
@@ -7550,6 +7552,40 @@ static FLASHMEM void payload_add_recovery_continuity_forensics(Payload& f,
   f.add("rc_o2_correction_ns", g_recover_continuity_ocxo2_correction_ns);
 }
 
+static FLASHMEM void payload_add_raw_cycles_lane(
+    Payload& parent,
+    const char* key,
+    const char* edge_species,
+    const clocks_static_prediction_snapshot_t& sample) {
+  Payload lane;
+  lane.add("valid", sample.valid);
+  lane.add("edge_species", edge_species);
+  lane.add("completed_interval_count", sample.completed_interval_count);
+  lane.add("observed_cycles", sample.actual_cycles);
+  lane.add("previous_observed_cycles", sample.static_prediction_cycles);
+  lane.add("residual_cycles", sample.static_residual_cycles);
+  parent.add_object(key, lane);
+}
+
+static FLASHMEM void payload_add_raw_cycles_observed(Payload& p) {
+  Payload raw;
+  raw.add("schema", "RAW_CYCLES_OBSERVED_V1");
+  raw.add("residual_definition", "CURRENT_OBSERVED_MINUS_PREVIOUS_OBSERVED");
+  raw.add("cross_rail_residuals", false);
+  raw.add("floorline_used", false);
+  raw.add("projection_used", false);
+
+  payload_add_raw_cycles_lane(raw, "pps", "PHYSICAL_PPS_DWT_EDGE",
+                              g_beta_pps_cycle_prediction);
+  payload_add_raw_cycles_lane(raw, "vclock", "OBSERVED_VCLOCK_DWT_EDGE",
+                              g_beta_vclock_cycle_prediction);
+  payload_add_raw_cycles_lane(raw, "ocxo1", "OBSERVED_OCXO_DWT_EDGE",
+                              g_beta_ocxo1_cycle_prediction);
+  payload_add_raw_cycles_lane(raw, "ocxo2", "OBSERVED_OCXO_DWT_EDGE",
+                              g_beta_ocxo2_cycle_prediction);
+  p.add_object("raw_cycles", raw);
+}
+
 static FLASHMEM void payload_add_vclock_fragment(Payload& p,
                                           uint64_t public_gnss_ns,
                                           uint32_t public_count,
@@ -9261,12 +9297,16 @@ void clocks_beta_pps(void) {
   // Welford, tau, public pps_residual, and servo below; FloorLine remains
   // a comparison side rail in ocxoN.science.delta_floorline_*.
   g_beta_pps_cycle_prediction = prediction_snapshot_for_pps();
+  g_beta_vclock_cycle_prediction =
+      prediction_snapshot_for_clock(time_clock_id_t::VCLOCK);
   g_beta_ocxo1_cycle_prediction =
       prediction_snapshot_for_clock(time_clock_id_t::OCXO1);
   g_beta_ocxo2_cycle_prediction =
       prediction_snapshot_for_clock(time_clock_id_t::OCXO2);
   const clocks_static_prediction_snapshot_t& pps_cycle_prediction =
       g_beta_pps_cycle_prediction;
+  const clocks_static_prediction_snapshot_t& vclock_cycle_prediction =
+      g_beta_vclock_cycle_prediction;
   const clocks_static_prediction_snapshot_t& ocxo1_cycle_prediction =
       g_beta_ocxo1_cycle_prediction;
   const clocks_static_prediction_snapshot_t& ocxo2_cycle_prediction =
@@ -9555,6 +9595,12 @@ void clocks_beta_pps(void) {
       }
       p.add_object("pps", pps);
     }
+
+    // Canonical four-rail raw-cycle surface.  Each residual is local to its
+    // own clock: current observed one-second interval minus the prior observed
+    // one-second interval.  No cross-rail subtraction or alternate estimator
+    // participates in this object.
+    payload_add_raw_cycles_observed(p);
 
     // Prediction remains available through focused reports and forensics.
     // Omit it from the 1 Hz fragment when compact mode is active; raw_cycles
