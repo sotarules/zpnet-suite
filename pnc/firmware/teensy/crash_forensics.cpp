@@ -754,25 +754,23 @@ static crash_basic_frame_selection_t extended_basic_frame_candidate(
 static crash_basic_frame_selection_t select_basic_frame(
     const crash_basic_frame_selection_t& architectural,
     const crash_basic_frame_selection_t& alternate) {
-    // EXC_RETURN is the architectural starting point, but lazy FP stacking or
-    // damaged exception metadata can make its bit-4 frame-shape hint disagree
-    // with the words actually present on the stack.  Prefer a frame that proves
-    // itself through xPSR, executable PC and lawful LR.
-    if (architectural.plausible && alternate.plausible) {
-        // A lawful LR strengthens a candidate, but an implausible stacked LR is
-        // itself valid crash evidence and must never disqualify an otherwise
-        // proven exception frame.
-        if (architectural.lr_plausible != alternate.lr_plausible) {
-            return architectural.lr_plausible ? architectural : alternate;
-        }
-        return architectural;
-    }
-    if (architectural.plausible) return architectural;
-    if (alternate.plausible) return alternate;
+    // EXC_RETURN defines the architectural frame shape.  An alternate offset is
+    // useful only when it independently proves a complete control-flow frame:
+    // lawful xPSR, executable PC, and lawful LR.  Requiring all three prevents
+    // ordinary stack/register residue from winning merely because two words
+    // happen to resemble a Thumb PC and xPSR.
+    const bool architectural_fully_plausible =
+        architectural.plausible && architectural.lr_plausible;
+    const bool alternate_fully_plausible =
+        alternate.plausible && alternate.lr_plausible;
 
-    // If neither candidate is fully plausible, preserve the architectural
-    // preference when it is at least readable.  This keeps malformed-frame
-    // evidence available without allowing the hint to override a proven frame.
+    if (architectural_fully_plausible) return architectural;
+    if (alternate_fully_plausible) return alternate;
+
+    // When neither candidate proves a complete frame, retain the architectural
+    // candidate whenever it is readable.  Its malformed LR/PC/xPSR are primary
+    // crash evidence; an unproven alternate must not replace them and create a
+    // convincing but false source attribution.
     if (architectural.readable) return architectural;
     return alternate;
 }
