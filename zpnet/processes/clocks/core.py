@@ -166,6 +166,14 @@ TIMEBASE_CANDIDATE_DISPOSITIONS = {
     TIMEBASE_CANDIDATE_SCIENCE_REJECT,
 }
 
+# Runtime science gate.  The Pi owns the operator-facing value and pushes it to
+# Teensy CLOCKS.  FORENSIC is the temporary diagnostic default; STRICT will
+# become the production default after the underlying clock math is repaired.
+GATE_MODE_STRICT = "STRICT"
+GATE_MODE_FORENSIC = "FORENSIC"
+GATE_MODES = {GATE_MODE_STRICT, GATE_MODE_FORENSIC}
+GATE_MODE_DEFAULT = GATE_MODE_FORENSIC
+
 INVALID_TIMEBASE_LOG_PATH = os.environ.get(
     "ZPNET_INVALID_TIMEBASE_LOG_PATH",
     "/home/mule/zpnet/logs/clocks-invalid-timebase.jsonl",
@@ -358,6 +366,8 @@ _diag: Dict[str, Any] = {
     "timebase_final_court_row_dropped": 0,
     "timebase_final_court_row_fatal_escalated": 0,
     "timebase_final_court_degraded_recovery_admitted": 0,
+    "timebase_final_court_forensic_admitted": 0,
+    "timebase_final_court_forensic_science_violations": 0,
     "timebase_final_court_consecutive_row_fatal": 0,
     "timebase_final_court_row_fatal_escalate_threshold": TIMEBASE_FINAL_COURT_ROW_FATAL_ESCALATE_CONSECUTIVE,
     "last_timebase_final_court_row_drop": {},
@@ -367,7 +377,15 @@ _diag: Dict[str, Any] = {
     "firmware_science_reject_received": 0,
     "firmware_science_reject_logged": 0,
     "firmware_science_reject_log_failures": 0,
+    "firmware_science_reject_forensic_admitted": 0,
     "last_firmware_science_reject": {},
+
+    # Pi-owned transitive gate mode.
+    "gate_mode": GATE_MODE_DEFAULT,
+    "gate_mode_set_count": 0,
+    "gate_mode_transition_count": 0,
+    "gate_mode_teensy_push_failures": 0,
+    "last_gate_mode_teensy_payload": {},
 
     # Dedicated invalid-TIMEBASE JSONL evidence log.
     "invalid_timebase_log_path": INVALID_TIMEBASE_LOG_PATH,
@@ -631,6 +649,78 @@ def _log_invalid_timebase(
         _diag["invalid_timebase_log_failures"] += 1
         logging.exception(
             "⚠️ [clocks] failed to write rejected TIMEBASE evidence; row remains dropped"
+        )
+
+
+def _normalize_gate_mode(value: Any, *, default: Optional[str] = None) -> Optional[str]:
+    if value is None:
+        return default
+    mode = str(value).strip().upper()
+    return mode if mode in GATE_MODES else default
+
+
+def _gate_mode_forensic() -> bool:
+    return _gate_mode == GATE_MODE_FORENSIC
+
+
+def _set_gate_mode_local(mode: str) -> None:
+    global _gate_mode
+    normalized = _normalize_gate_mode(mode)
+    if normalized is None:
+        raise ValueError(f"invalid gate_mode: {mode!r}")
+    previous = _gate_mode
+    _gate_mode = normalized
+    _diag["gate_mode"] = normalized
+    _diag["gate_mode_set_count"] = int(_diag.get("gate_mode_set_count") or 0) + 1
+    if previous != normalized:
+        _diag["gate_mode_transition_count"] = (
+            int(_diag.get("gate_mode_transition_count") or 0) + 1
+        )
+
+
+def _push_gate_mode_to_teensy(mode: str) -> Dict[str, Any]:
+    normalized = _normalize_gate_mode(mode)
+    if normalized is None:
+        raise ValueError(f"invalid gate_mode: {mode!r}")
+    resp = send_command(
+        machine="TEENSY",
+        subsystem="CLOCKS",
+        command="GATE_MODE",
+        args={"gate_mode": normalized},
+    )
+    if not isinstance(resp, dict) or resp.get("success") is False:
+        raise RuntimeError(f"Teensy GATE_MODE transport failure: {resp!r}")
+    payload = resp.get("payload")
+    payload = dict(payload) if isinstance(payload, dict) else {}
+    effective = _normalize_gate_mode(payload.get("gate_mode"))
+    status = str(payload.get("status") or "")
+    if effective != normalized or status == "gate_mode_rejected":
+        raise RuntimeError(
+            f"Teensy GATE_MODE rejected/mismatched: requested={normalized} payload={payload!r}"
+        )
+    global _gate_mode_last_teensy_payload
+    _gate_mode_last_teensy_payload = payload
+    _diag["last_gate_mode_teensy_payload"] = payload
+    return payload
+
+
+def _persist_gate_mode_config(mode: str) -> None:
+    with open_db() as conn:
+        cur = conn.cursor()
+        blob = json.dumps({"gate_mode": mode})
+        cur.execute(
+            """
+            WITH updated AS (
+                UPDATE config
+                SET payload = COALESCE(payload, '{}'::jsonb) || %s::jsonb
+                WHERE config_key = 'SYSTEM'
+                RETURNING 1
+            )
+            INSERT INTO config (config_key, payload)
+            SELECT 'SYSTEM', %s::jsonb
+            WHERE NOT EXISTS (SELECT 1 FROM updated)
+            """,
+            (blob, blob),
         )
 
 
@@ -1022,6 +1112,8 @@ def _gnss_raw_reset() -> None:
 # ---------------------------------------------------------------------
 
 _campaign_active: bool = False
+_gate_mode: str = GATE_MODE_DEFAULT
+_gate_mode_last_teensy_payload: Dict[str, Any] = {}
 
 # The command server is exposed early so PUBSUB can discover subscriptions, but
 # START/RESUME must not race the boot DAC push and active-campaign recovery.
@@ -3544,6 +3636,10 @@ def _timebase_final_court_check_ocxo_lane_alive(
 
         science_flags = {
             "science_valid": _timebase_final_court_bool(science.get("valid")),
+            "science_worthy": _timebase_final_court_bool(
+                science.get("science_worthy", science.get("valid"))
+            ),
+            "forensic_override": _timebase_final_court_bool(science.get("forensic_override")),
             "antecedents_complete": _timebase_final_court_bool(science.get("antecedents_complete")),
             "clock_floorline_valid": _timebase_final_court_bool(science.get("clock_floorline_valid")),
             "delta_raw_valid": _timebase_final_court_bool(science.get("delta_raw_valid")),
@@ -3578,7 +3674,7 @@ def _timebase_final_court_check_ocxo_lane_alive(
         if (
             not recovery_degraded
             and (
-                not science_flags["science_valid"]
+                not science_flags["science_worthy"]
                 or not science_flags["antecedents_complete"]
             )
         ):
@@ -3654,13 +3750,29 @@ def _timebase_final_court_check_ocxo_lane_alive(
 
 
 def _timebase_final_court_evaluate(timebase: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
-    """Return (ok, verdict) for the final TIMEBASE dictionary."""
-    violations: List[Dict[str, Any]] = []
-    _timebase_final_court_check_candidate_envelope(timebase, violations)
-    _timebase_final_court_check_delta_raw_interval(timebase, violations)
-    _timebase_final_court_check_ocxo_lane_alive(timebase, violations)
+    """Return (accepted, verdict), honoring STRICT versus FORENSIC science gates."""
+    structural_violations: List[Dict[str, Any]] = []
+    science_violations: List[Dict[str, Any]] = []
+
+    # Structural failures are never bypassed.  They mean there is no coherent
+    # record to persist or analyze.
+    _timebase_final_court_check_candidate_envelope(
+        timebase, structural_violations
+    )
+
+    # Numeric/science courts remain fully evaluated in both modes.  FORENSIC
+    # changes only the consequence: evidence is retained and persisted.
+    _timebase_final_court_check_delta_raw_interval(timebase, science_violations)
+    _timebase_final_court_check_ocxo_lane_alive(timebase, science_violations)
+
+    mode = _normalize_gate_mode(timebase.get("gate_mode"), default=_gate_mode)
+    assert mode is not None
+    fatal_violations = list(structural_violations)
+    if mode == GATE_MODE_STRICT:
+        fatal_violations.extend(science_violations)
+
     recovery_degraded = _timebase_final_court_recovery_degraded_context(timebase)
-    if recovery_degraded and not violations:
+    if recovery_degraded and not fatal_violations:
         _diag["timebase_final_court_degraded_recovery_admitted"] = (
             _diag.get("timebase_final_court_degraded_recovery_admitted", 0) + 1
         )
@@ -3671,16 +3783,32 @@ def _timebase_final_court_evaluate(timebase: Dict[str, Any]) -> Tuple[bool, Dict
         "fragment.teensy_pps_vclock_count",
         "pps_count",
     )
-    primary = violations[0] if violations else {}
-    ok = len(violations) == 0
+    primary = (fatal_violations or science_violations or [{}])[0]
+    accepted = len(fatal_violations) == 0
+    forensic_admission = (
+        accepted
+        and mode == GATE_MODE_FORENSIC
+        and len(science_violations) != 0
+    )
 
     verdict: Dict[str, Any] = {
-        "schema": "PI_TIMEBASE_FINAL_COURT_V2",
-        "valid": ok,
-        "classification": "ACCEPT" if ok else "DROP_ROW",
+        "schema": "PI_TIMEBASE_FINAL_COURT_V3",
+        "valid": accepted,
+        "science_valid": len(science_violations) == 0,
+        "classification": (
+            "ACCEPT_FORENSIC" if forensic_admission
+            else "ACCEPT" if accepted
+            else "DROP_ROW"
+        ),
+        "gate_mode": mode,
+        "forensic_admission": forensic_admission,
         "reason": TIMEBASE_FINAL_COURT_REASON,
         "primary_rule": primary.get("rule"),
-        "rationale": primary.get("message") if primary else "candidate accepted",
+        "rationale": (
+            primary.get("message")
+            if primary
+            else "candidate accepted"
+        ),
         "source": TIMEBASE_FINAL_COURT_SOURCE,
         "source_process": "CLOCKS",
         "source_report": "TIMEBASE_FINAL_COURT",
@@ -3700,12 +3828,17 @@ def _timebase_final_court_evaluate(timebase: Dict[str, Any]) -> Tuple[bool, Dict
         ),
         "timebase_pair_version": timebase.get("timebase_pair_version"),
         "rule_count": 4,
-        "violation_count": len(violations),
+        "violation_count": len(structural_violations) + len(science_violations),
+        "fatal_violation_count": len(fatal_violations),
+        "structural_violation_count": len(structural_violations),
+        "science_violation_count": len(science_violations),
         "recovery_degraded_context": recovery_degraded,
-        "violations": violations,
+        "violations": structural_violations + science_violations,
+        "structural_violations": structural_violations,
+        "science_violations": science_violations,
     }
 
-    return ok, verdict
+    return accepted, verdict
 
 
 _final_court_row_fatal_consecutive: int = 0
@@ -4768,6 +4901,7 @@ def _process_loop() -> None:
             court_timebase = {
                 "schema": "TIMEBASE_V3",
                 "campaign": str(frag.get("campaign") or ""),
+                "gate_mode": _gate_mode,
                 "fragment": frag,
                 "forensics": forensics,
                 "identity_error": str(exc),
@@ -4801,6 +4935,7 @@ def _process_loop() -> None:
             "timebase_message_version": frag.get("timebase_message_version"),
             "timebase_pair_version": frag.get("timebase_pair_version"),
             "campaign": campaign,
+            "gate_mode": _gate_mode,
             "teensy_pps_vclock_count": int(pps_vclock_count),
             "teensy_pps_count": int(pps_vclock_count),
             "pps_count": int(pps_vclock_count),
@@ -4808,11 +4943,12 @@ def _process_loop() -> None:
             "forensics": forensics,
         }
 
-        if _candidate_disposition(frag) == TIMEBASE_CANDIDATE_SCIENCE_REJECT:
-            # Receipt was already recorded as TIMEBASE heartbeat in the PUBSUB
-            # fast path.  Track candidate identity, retain the complete evidence,
-            # and stop before final court, recovery sync, GNSS_RAW, publication,
-            # or PostgreSQL state can advance.
+        firmware_science_reject = (
+            _candidate_disposition(frag) == TIMEBASE_CANDIDATE_SCIENCE_REJECT
+        )
+        if firmware_science_reject and not _gate_mode_forensic():
+            # STRICT preserves the production behavior exactly: retain complete
+            # evidence, but do not advance Pi math, publication, or PostgreSQL.
             _note_pps_vclock_count(int(pps_vclock_count))
             _timebase_final_court_reset_row_fatal_streak(
                 "firmware_science_reject"
@@ -4825,6 +4961,26 @@ def _process_loop() -> None:
                 assembled_timebase=court_timebase,
             )
             continue
+        if firmware_science_reject:
+            _diag["firmware_science_reject_received"] += 1
+            _diag["firmware_science_reject_forensic_admitted"] += 1
+            _diag["last_firmware_science_reject"] = {
+                "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "campaign": campaign,
+                "teensy_pps_vclock_count": int(pps_vclock_count),
+                "candidate_reason": frag.get("candidate_reason"),
+                "candidate_reason_code": frag.get("candidate_reason_code"),
+                "candidate_reject_mask": frag.get("candidate_reject_mask"),
+                "gate_mode": _gate_mode,
+                "forensic_admission": True,
+            }
+            logging.warning(
+                "🧪 [clocks] FORENSIC admission of firmware SCIENCE_REJECT: campaign=%s count=%d reason=%s mask=%s",
+                campaign,
+                int(pps_vclock_count),
+                frag.get("candidate_reason"),
+                frag.get("candidate_reject_mask"),
+            )
 
         _diag["timebase_final_court_checks"] += 1
         court_ok, court_verdict = _timebase_final_court_evaluate(court_timebase)
@@ -4838,6 +4994,12 @@ def _process_loop() -> None:
 
         _timebase_final_court_reset_row_fatal_streak("final_court_passed")
         _diag["timebase_final_court_passed"] += 1
+        if court_verdict.get("forensic_admission"):
+            _diag["timebase_final_court_forensic_admitted"] += 1
+            _diag["timebase_final_court_forensic_science_violations"] += int(
+                court_verdict.get("science_violation_count") or 0
+            )
+            _diag["last_timebase_final_court"] = court_verdict
 
         sync_matched = _signal_sync_candidate_if_needed(frag, pps_vclock_count)
         if sync_matched and not _campaign_active:
@@ -4966,6 +5128,12 @@ def _process_loop() -> None:
             "timebase_pair_version": frag.get("timebase_pair_version"),
             "campaign": campaign,
             "campaign_elapsed": _seconds_to_hms(int(pps_vclock_count)),
+            "gate_mode": _gate_mode,
+            "forensic_admission": bool(
+                firmware_science_reject
+                or court_verdict.get("forensic_admission")
+            ),
+            "final_court": court_verdict,
             "location": campaign_payload.get("location"),
 
             "system_time_utc": system_time_str,
@@ -5658,13 +5826,100 @@ def cmd_report(_: Optional[dict]) -> Dict[str, Any]:
             "message": "OK",
             "payload": {
                 "campaign_state": "IDLE",
+                "gate_mode": _gate_mode,
+                "gate_mode_default": GATE_MODE_DEFAULT,
+                "teensy_gate_mode": _gate_mode_last_teensy_payload,
                 "startup": _start_status_payload(),
             },
         }
 
     payload = dict(row["payload"])
+    payload["gate_mode"] = _gate_mode
+    payload["gate_mode_default"] = GATE_MODE_DEFAULT
+    payload["teensy_gate_mode"] = _gate_mode_last_teensy_payload
     payload["startup"] = _start_status_payload()
     return {"success": True, "message": "OK", "payload": payload}
+
+
+def cmd_gate_mode(args: Optional[dict]) -> Dict[str, Any]:
+    raw = None
+    if args:
+        raw = args.get("gate_mode", args.get("mode"))
+
+    # No argument is a report operation.
+    if raw is None:
+        teensy_payload: Dict[str, Any] = {}
+        try:
+            resp = send_command(
+                machine="TEENSY",
+                subsystem="CLOCKS",
+                command="REPORT_GATE_MODE",
+            )
+            if isinstance(resp, dict) and isinstance(resp.get("payload"), dict):
+                teensy_payload = dict(resp["payload"])
+        except Exception:
+            logging.debug("CLOCKS.REPORT_GATE_MODE unavailable", exc_info=True)
+        return {
+            "success": True,
+            "message": "OK",
+            "payload": {
+                "gate_mode": _gate_mode,
+                "default_gate_mode": GATE_MODE_DEFAULT,
+                "allowed": sorted(GATE_MODES),
+                "teensy": teensy_payload or _gate_mode_last_teensy_payload,
+            },
+        }
+
+    requested = _normalize_gate_mode(raw)
+    if requested is None:
+        return {
+            "success": False,
+            "message": f"gate_mode must be STRICT or FORENSIC, got {raw!r}",
+        }
+
+    previous = _gate_mode
+    try:
+        teensy_payload = _push_gate_mode_to_teensy(requested)
+    except Exception as exc:
+        _diag["gate_mode_teensy_push_failures"] += 1
+        logging.exception("❌ [clocks] GATE_MODE Teensy push failed")
+        return {
+            "success": False,
+            "message": str(exc),
+            "payload": {
+                "previous_gate_mode": previous,
+                "requested_gate_mode": requested,
+                "gate_mode": _gate_mode,
+            },
+        }
+
+    _set_gate_mode_local(requested)
+    persist_error = None
+    try:
+        _persist_gate_mode_config(requested)
+    except Exception as exc:
+        persist_error = str(exc)
+        logging.exception(
+            "⚠️ [clocks] GATE_MODE applied at runtime but SYSTEM persistence failed"
+        )
+
+    logging.warning(
+        "🧪 [clocks] gate_mode changed %s -> %s (FORENSIC admits and contaminates rejected numeric rows)",
+        previous,
+        requested,
+    )
+    return {
+        "success": True,
+        "message": "OK",
+        "payload": {
+            "previous_gate_mode": previous,
+            "gate_mode": _gate_mode,
+            "default_gate_mode": GATE_MODE_DEFAULT,
+            "persisted": persist_error is None,
+            "persist_error": persist_error,
+            "teensy": teensy_payload,
+        },
+    }
 
 
 def cmd_clear(_: Optional[dict]) -> dict:
@@ -7315,6 +7570,10 @@ def cmd_list_campaigns(_: Optional[dict]) -> Dict[str, Any]:
 def cmd_clocks_info(_: Optional[dict]) -> Dict[str, Any]:
     payload = {
         "campaign_active": _campaign_active,
+        "gate_mode": _gate_mode,
+        "gate_mode_default": GATE_MODE_DEFAULT,
+        "gate_mode_allowed": sorted(GATE_MODES),
+        "teensy_gate_mode": _gate_mode_last_teensy_payload,
         "last_pps_vclock_count_seen": _last_pps_vclock_count_seen,
         "accepted_pps_vclock_count": _accepted_pps_vclock_count,
         "sync_expected_pps_vclock": _sync_expected_pps_vclock,
@@ -7865,6 +8124,8 @@ COMMANDS = {
     "TRUNCATE": cmd_truncate,
     "SET_DAC": cmd_set_dac,
     "DITHER": cmd_set_dither,
+    "GATE_MODE": cmd_gate_mode,
+    "SET_GATE_MODE": cmd_gate_mode,
     "SET_BASELINE": cmd_set_baseline,
     "BASELINE_INFO": cmd_baseline_info,
     "LIST_CAMPAIGNS": cmd_list_campaigns,
@@ -7902,9 +8163,9 @@ def run() -> None:
         "🕐 [clocks] unified PPS/VCLOCK TIMEBASE candidate schema. Teensy PPS/VCLOCK count is canonical. "
         "Four clock domains: GNSS (reference), DWT, OCXO1, OCXO2. "
         "The Teensy emits one TIMEBASE_FRAGMENT candidate containing fragment + embedded forensics; the Pi is the final row arbiter. "
-        "Invalid candidates are logged in full and dropped as canonical gaps without automatic recovery. "
+        "STRICT drops science-rejected numeric candidates; FORENSIC persists them and allows mathematical contamination. "
         "START while active performs seamless flash-cut to new campaign. "
-        "Commands: START, STOP, RESUME, RECOVER_ABORT, REPORT, CLEAR, DELETE, TRUNCATE, SET_DAC, DITHER, "
+        "Commands: START, STOP, RESUME, RECOVER_ABORT, REPORT, CLEAR, DELETE, TRUNCATE, SET_DAC, DITHER, GATE_MODE, "
         "SET_BASELINE, BASELINE_INFO, LIST_CAMPAIGNS, CLOCKS_INFO. "
         "Subscriptions: TIMEBASE_FRAGMENT, WATCHDOG_ANOMALY, CLOCKS_RECOVERY_STALLED."
     )
@@ -7934,6 +8195,26 @@ def run() -> None:
     # starts or recovers.
     try:
         cfg = _get_system_config()
+
+        configured_gate_mode = _normalize_gate_mode(
+            cfg.get("gate_mode"),
+            default=GATE_MODE_DEFAULT,
+        )
+        assert configured_gate_mode is not None
+        try:
+            teensy_gate_payload = _push_gate_mode_to_teensy(configured_gate_mode)
+            _set_gate_mode_local(configured_gate_mode)
+            logging.warning(
+                "🧪 [clocks] boot gate_mode push: mode=%s Teensy=%s",
+                configured_gate_mode,
+                teensy_gate_payload,
+            )
+        except Exception:
+            _diag["gate_mode_teensy_push_failures"] += 1
+            logging.exception(
+                "⚠️ [clocks] boot gate_mode push failed; retaining synchronized default %s",
+                _gate_mode,
+            )
 
         boot_dither = cfg.get("dither")
         boot_dither_bool = None

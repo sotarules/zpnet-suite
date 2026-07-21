@@ -71,6 +71,25 @@ void process_clocks_init(void);
 void process_clocks_register(void);
 
 // -----------------------------------------------------------------------------
+// Runtime science gate mode
+// -----------------------------------------------------------------------------
+//
+// STRICT preserves the production court: a science-rejected candidate remains
+// visible testimony but cannot mutate campaign math and is expected to be
+// dropped by the Pi.  FORENSIC preserves the same honest verdict while allowing
+// the candidate to flow through totals/Welfords/servo math for diagnosis.
+// Structural corruption and WATCHDOG_ANOMALY behavior are never bypassed.
+
+enum class clocks_gate_mode_t : uint8_t {
+  STRICT   = 0,
+  FORENSIC = 1,
+};
+
+const char* clocks_gate_mode_name(clocks_gate_mode_t mode);
+clocks_gate_mode_t clocks_gate_mode(void);
+bool clocks_gate_mode_forensic(void);
+
+// -----------------------------------------------------------------------------
 // Campaign candidate science disposition
 // -----------------------------------------------------------------------------
 //

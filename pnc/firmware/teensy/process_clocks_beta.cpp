@@ -200,6 +200,52 @@ static constexpr bool TIMEBASE_FRAGMENT_PUBLISH_PREDICTION_ENABLED = false;
 static constexpr uint32_t TIMEBASE_CANDIDATE_INVALID_OCXO1_CUSTODY = 1U << 0;
 static constexpr uint32_t TIMEBASE_CANDIDATE_INVALID_OCXO2_CUSTODY = 1U << 1;
 
+// Runtime gate mode is Pi-controlled through CLOCKS.GATE_MODE.  FORENSIC is the
+// temporary diagnostic default: scientific verdicts remain honest, but rejected
+// numeric rows are allowed to flow through campaign math and downstream TIMEBASE.
+// Structural/watchdog courts are intentionally outside this switch.
+static volatile clocks_gate_mode_t g_clocks_gate_mode =
+    clocks_gate_mode_t::FORENSIC;
+static uint32_t g_clocks_gate_mode_request_count = 0U;
+static uint32_t g_clocks_gate_mode_transition_count = 0U;
+
+const char* clocks_gate_mode_name(clocks_gate_mode_t mode) {
+  switch (mode) {
+    case clocks_gate_mode_t::STRICT:   return "STRICT";
+    case clocks_gate_mode_t::FORENSIC: return "FORENSIC";
+    default:                            return "FORENSIC";
+  }
+}
+
+clocks_gate_mode_t clocks_gate_mode(void) {
+  return g_clocks_gate_mode;
+}
+
+bool clocks_gate_mode_forensic(void) {
+  return clocks_gate_mode() == clocks_gate_mode_t::FORENSIC;
+}
+
+static bool clocks_gate_mode_parse(const char* raw, clocks_gate_mode_t& out) {
+  if (!raw || !*raw) return false;
+  if (!strcasecmp(raw, "STRICT")) {
+    out = clocks_gate_mode_t::STRICT;
+    return true;
+  }
+  if (!strcasecmp(raw, "FORENSIC")) {
+    out = clocks_gate_mode_t::FORENSIC;
+    return true;
+  }
+  return false;
+}
+
+static void clocks_gate_mode_apply(clocks_gate_mode_t mode) {
+  g_clocks_gate_mode_request_count++;
+  if (g_clocks_gate_mode != mode) {
+    g_clocks_gate_mode_transition_count++;
+    g_clocks_gate_mode = mode;
+  }
+}
+
 // Defined with the watchdog state later in this translation unit.  The science
 // reject latch is intentionally armed only after the first public candidate has
 // returned, so pre-campaign/start-prologue evidence cannot poison public PPS1.
@@ -1319,6 +1365,7 @@ static floorline_science_totals_t g_floorline_science_ocxo2 DMAMEM = {};
 
 struct delta_residual_reference_t {
   bool     captured = false;
+  bool     gnss_available = false;
   bool     gnss_valid = false;
   bool     raw_valid = false;
   bool     floorline_valid = false;
@@ -1397,7 +1444,11 @@ static clocks_alpha_tau_snapshot_t
     g_beta_report_ocxo2_tau_scratch DMAMEM = {};
 
 struct clock_science_row_t {
+  // valid means the row contains numeric material usable by the currently
+  // selected gate mode. science_worthy remains the strict production verdict.
   bool     valid = false;
+  bool     science_worthy = false;
+  bool     forensic_override = false;
   bool     antecedents_complete = false;
   uint32_t clock_id = 0;
   uint32_t public_count = 0;
@@ -1428,6 +1479,8 @@ struct clock_science_row_t {
   // (clock_interval - reference_interval).  The *_fast_residual_* mirrors
   // the project-wide sign convention: positive means the clock is fast.
   bool     delta_raw_valid = false;
+  bool     delta_raw_reference_plausible = false;
+  bool     delta_raw_clock_plausible = false;
   bool     delta_floorline_valid = false;
   uint32_t delta_reference_public_count = 0;
   uint32_t delta_publication_public_count = 0;
@@ -1814,7 +1867,8 @@ static pps_interval_residuals_t floorline_interval_residuals_update(
     r.ocxo2_fast_residual_ns = ocxo2_science.fast_residual_ns;
   }
 
-  if (r.ocxo1_valid && r.ocxo2_valid) {
+  if (ocxo1_science.science_worthy &&
+      ocxo2_science.science_worthy) {
     clocks_beta_feature_set_cached("SCIENCE_RESIDUALS",
                                    g_clocks_feature_science_residuals,
                                    system_feature_status_t::NOMINAL);
@@ -5781,10 +5835,12 @@ static delta_residual_reference_t delta_residual_capture_vclock_reference(
       g_pps_vclock_dwt_cycles_between_edges_valid
           ? (uint32_t)g_pps_vclock_dwt_cycles_between_edges
           : 0U;
-  if (delta_raw_interval_cycles_plausible(selected_pps_vclock_interval)) {
-    r.gnss_valid = true;
-    r.gnss_interval_cycles = selected_pps_vclock_interval;
-  }
+  r.gnss_available = g_pps_vclock_dwt_cycles_between_edges_valid;
+  r.gnss_interval_cycles = r.gnss_available
+      ? selected_pps_vclock_interval
+      : 0U;
+  r.gnss_valid = r.gnss_available &&
+      delta_raw_interval_cycles_plausible(selected_pps_vclock_interval);
 
   // Alpha's ordinary edge-to-edge measurement is the canonical live interval
   // consumed by Beta.  process_interrupt's dwt_interval_observed_cycles is a
@@ -5826,17 +5882,40 @@ static void delta_residual_apply_one(clock_science_row_t& row,
       (ref.public_count == row.public_count ||
        (ref.public_count == 0U && row.public_count == 1U));
 
-  if (ref_count_aligned && ref.gnss_valid && clock_valid) {
+  if (ref_count_aligned && ref.gnss_available && clock_valid) {
     row.delta_raw_reference_interval_cycles = ref.gnss_interval_cycles;
     row.delta_raw_clock_interval_cycles = clock_f.dwt_cycles_between_edges;
 
-    const bool reference_plausible = delta_raw_interval_cycles_plausible(
+    row.delta_raw_reference_plausible = delta_raw_interval_cycles_plausible(
         row.delta_raw_reference_interval_cycles);
-    const bool clock_plausible = delta_raw_interval_cycles_plausible(
+    row.delta_raw_clock_plausible = delta_raw_interval_cycles_plausible(
         row.delta_raw_clock_interval_cycles);
+    row.science_worthy = row.delta_raw_reference_plausible &&
+                         row.delta_raw_clock_plausible;
 
-    if (reference_plausible && clock_plausible) {
-      row.delta_raw_valid = true;
+    if (!row.delta_raw_reference_plausible) {
+      delta_raw_interval_note_reject(
+          row,
+          "reference",
+          row.delta_raw_reference_interval_cycles,
+          row.delta_raw_clock_interval_cycles,
+          delta_raw_interval_reject_reason(row.delta_raw_reference_interval_cycles));
+    }
+    if (!row.delta_raw_clock_plausible) {
+      delta_raw_interval_note_reject(
+          row,
+          "clock",
+          row.delta_raw_reference_interval_cycles,
+          row.delta_raw_clock_interval_cycles,
+          delta_raw_interval_reject_reason(row.delta_raw_clock_interval_cycles));
+    }
+
+    const bool permit_numeric_row =
+        row.science_worthy || clocks_gate_mode_forensic();
+    row.delta_raw_valid = permit_numeric_row;
+    row.forensic_override = permit_numeric_row && !row.science_worthy;
+
+    if (permit_numeric_row) {
       row.delta_raw_residual_cycles =
           (int64_t)row.delta_raw_clock_interval_cycles -
           (int64_t)row.delta_raw_reference_interval_cycles;
@@ -5851,24 +5930,6 @@ static void delta_residual_apply_one(clock_science_row_t& row,
           beta_round_double_to_i64(row.delta_raw_residual_ns_exact);
       row.delta_raw_fast_residual_ns =
           beta_round_double_to_i64(row.delta_raw_fast_residual_ns_exact);
-    } else {
-      row.delta_raw_valid = false;
-      if (!reference_plausible) {
-        delta_raw_interval_note_reject(
-            row,
-            "reference",
-            row.delta_raw_reference_interval_cycles,
-            row.delta_raw_clock_interval_cycles,
-            delta_raw_interval_reject_reason(row.delta_raw_reference_interval_cycles));
-      }
-      if (!clock_plausible) {
-        delta_raw_interval_note_reject(
-            row,
-            "clock",
-            row.delta_raw_reference_interval_cycles,
-            row.delta_raw_clock_interval_cycles,
-            delta_raw_interval_reject_reason(row.delta_raw_clock_interval_cycles));
-      }
     }
   }
 
@@ -6059,8 +6120,17 @@ static void clock_science_apply_counterledger_row(
       g_phaseledger_science_missing_ocxo2_count++;
     }
 
-    row.valid = false;
+    // STRICT preserves the production PhaseLedger court.  FORENSIC leaves the
+    // already-built Delta numeric row intact so the missing refined interval
+    // and any 0/2-second cycle pathology can propagate through campaign math.
+    row.science_worthy = false;
     row.antecedents_complete = false;
+    if (clocks_gate_mode_forensic()) {
+      row.forensic_override = true;
+      return;
+    }
+
+    row.valid = false;
     row.gnss_interval_ns = CLOCKS_BETA_NS_PER_SECOND;
     row.gnss_interval_ns_exact = (double)CLOCKS_BETA_NS_PER_SECOND;
     row.clock_interval_ns = 0ULL;
@@ -6082,6 +6152,7 @@ static void clock_science_apply_counterledger_row(
       : ledger.fast_residual_ns;
 
   row.valid = ledger.valid && interval_valid;
+  row.science_worthy = row.valid;
   row.antecedents_complete = row.valid;
   row.prior_edge_gnss_ns = beta_i64_from_u64_saturating(public_gnss_ns) -
                            beta_i64_from_u64_saturating(CLOCKS_BETA_NS_PER_SECOND);
@@ -6126,7 +6197,7 @@ static bool clocks_beta_ocxo_science_custody_ok(
     const clock_science_row_t& row,
     uint64_t public_ocxo_ns) {
   if (public_ocxo_ns == 0ULL) return true;
-  return row.valid && row.antecedents_complete;
+  return row.science_worthy && row.antecedents_complete;
 }
 
 static uint32_t clocks_beta_public_ocxo_science_invalid_mask(
@@ -6135,7 +6206,6 @@ static uint32_t clocks_beta_public_ocxo_science_invalid_mask(
     uint64_t public_ocxo2_ns,
     const clock_science_row_t& ocxo1_science,
     const clock_science_row_t& ocxo2_science) {
-  if (!clocks_ocxo_counterledger_mode_enabled()) return 0U;
   if (public_count <= 2U) return 0U;
   if (g_recover_reattach_degraded_active) return 0U;
   if (g_science_residual_quarantine_last_public_count == public_count) return 0U;
@@ -6268,7 +6338,10 @@ static void floorline_science_build_ocxo(
   // FloorLine is retained as a side rail only; it no longer authors TIMEBASE
   // residuals.
   row.valid = row.delta_raw_valid;
-  row.antecedents_complete = row.delta_raw_valid &&
+  // Keep the strict verdict independent from FORENSIC numeric admission.  A
+  // zero or doubled interval can therefore be mathematically propagated while
+  // SCIENCE_REJECT / SCIENCE_RESIDUALS=ANOMALY remain completely honest.
+  row.antecedents_complete = row.science_worthy &&
                              row.delta_raw_reference_interval_cycles != 0U &&
                              row.delta_raw_clock_interval_cycles != 0U;
 
@@ -6879,8 +6952,10 @@ static FLASHMEM void payload_add_clock_science_common(Payload& science,
       row.clock_id == (uint32_t)((uint8_t)time_clock_id_t::OCXO2);
 
   if (TIMEBASE_FRAGMENT_COMPACT_SCIENCE_ENABLED) {
-    science.add("schema", "TIMEBASE_CLOCK_SCIENCE_COMPACT_V2");
+    science.add("schema", "TIMEBASE_CLOCK_SCIENCE_COMPACT_V3");
     science.add("valid", row.valid);
+    science.add("science_worthy", row.science_worthy);
+    science.add("forensic_override", row.forensic_override);
     science.add("antecedents_complete", row.antecedents_complete);
     science.add("clock_id", row.clock_id);
     science.add("public_count", row.public_count);
@@ -6917,6 +6992,10 @@ static FLASHMEM void payload_add_clock_science_common(Payload& science,
       science.add("delta_reference_public_count", row.delta_reference_public_count);
       science.add("delta_publication_public_count", row.delta_publication_public_count);
       science.add("delta_raw_valid", row.delta_raw_valid);
+      science.add("delta_raw_reference_plausible",
+                  row.delta_raw_reference_plausible);
+      science.add("delta_raw_clock_plausible",
+                  row.delta_raw_clock_plausible);
       science.add("delta_raw_reference_interval_cycles",
                   row.delta_raw_reference_interval_cycles);
       science.add("delta_raw_clock_interval_cycles",
@@ -6927,8 +7006,10 @@ static FLASHMEM void payload_add_clock_science_common(Payload& science,
     return;
   }
 
-  science.add("schema", "TIMEBASE_CLOCK_SCIENCE_V2");
+  science.add("schema", "TIMEBASE_CLOCK_SCIENCE_V3");
   science.add("valid", row.valid);
+  science.add("science_worthy", row.science_worthy);
+  science.add("forensic_override", row.forensic_override);
   science.add("antecedents_complete", row.antecedents_complete);
   science.add("clock_id", row.clock_id);
   science.add("public_count", row.public_count);
@@ -6972,6 +7053,10 @@ static FLASHMEM void payload_add_clock_science_common(Payload& science,
   science.add("delta_publication_public_count", row.delta_publication_public_count);
 
   science.add("delta_raw_valid", row.delta_raw_valid);
+  science.add("delta_raw_reference_plausible",
+              row.delta_raw_reference_plausible);
+  science.add("delta_raw_clock_plausible",
+              row.delta_raw_clock_plausible);
   science.add("delta_raw_reference_interval_cycles",
               row.delta_raw_reference_interval_cycles);
   science.add("delta_raw_clock_interval_cycles",
@@ -9229,9 +9314,9 @@ void clocks_beta_pps(void) {
   const bool recover_clockface_ready =
       ocxo1_clockface_valid && ocxo2_clockface_valid;
   const bool recover_science_ready =
-      ocxo1_floorline_science.valid &&
+      ocxo1_floorline_science.science_worthy &&
       ocxo1_floorline_science.antecedents_complete &&
-      ocxo2_floorline_science.valid &&
+      ocxo2_floorline_science.science_worthy &&
       ocxo2_floorline_science.antecedents_complete;
   const bool recover_transition_active =
       g_recover_reattach_active ||
@@ -9274,11 +9359,18 @@ void clocks_beta_pps(void) {
       candidate_reject.reason != clocks_science_reject_reason_t::NONE ||
       ocxo_science_invalid_mask != 0U;
 
+  const bool candidate_math_permitted =
+      !candidate_science_reject || clocks_gate_mode_forensic();
+
   if (candidate_science_reject) {
-    // floorline_science_build_ocxo() updates diagnostic totals while building
-    // the evidence row.  Rejected testimony must not enter those populations.
-    g_floorline_science_ocxo1 = g_beta_row_floorline_o1_before;
-    g_floorline_science_ocxo2 = g_beta_row_floorline_o2_before;
+    // STRICT rolls back totals exactly as before.  FORENSIC deliberately keeps
+    // the mutations so the rejected row contaminates the same math we need to
+    // diagnose.  The candidate disposition and SCIENCE_RESIDUALS verdict remain
+    // SCIENCE_REJECT / ANOMALY in both modes.
+    if (!clocks_gate_mode_forensic()) {
+      g_floorline_science_ocxo1 = g_beta_row_floorline_o1_before;
+      g_floorline_science_ocxo2 = g_beta_row_floorline_o2_before;
+    }
     g_timebase_science_reject_candidate_count++;
     g_science_reject_last_public_count = public_count;
     g_science_reject_last = candidate_reject;
@@ -9328,7 +9420,7 @@ void clocks_beta_pps(void) {
   // a rejected science row.  Scientific inputs, statistics, and DAC motion do not.
   clocks_commit_pending_servo_mode_change();
 
-  if (!candidate_science_reject) {
+  if (candidate_math_permitted) {
     if (dwt_welford_recovery_quarantine) {
       g_dwt_welford_recovery_quarantine_count++;
       g_dwt_welford_recovery_quarantine_last_public_count = public_count;
@@ -9443,6 +9535,10 @@ void clocks_beta_pps(void) {
     p.add("campaign", campaign_name);
     p.add("campaign_state", clocks_campaign_state_name(campaign_state));
     p.add("campaign_seconds", campaign_seconds);
+    p.add("gate_mode_schema", "CLOCKS_GATE_MODE_V1");
+    p.add("gate_mode", clocks_gate_mode_name(clocks_gate_mode()));
+    p.add("forensic_math_enabled", clocks_gate_mode_forensic());
+    p.add("candidate_math_applied", candidate_math_permitted);
     p.add("candidate_disposition_schema",
           "TIMEBASE_CANDIDATE_DISPOSITION_V1");
     p.add("candidate_disposition",
@@ -11182,6 +11278,10 @@ static FLASHMEM uint64_t report_cached_ocxo2_ns(void) {
 
 static FLASHMEM void add_summary_payload(Payload& p) {
   clocks_stack_witness_note_command(CLOCKS_STACK_CONTEXT_REPORT_SUMMARY);
+  p.add("gate_mode", clocks_gate_mode_name(clocks_gate_mode()));
+  p.add("gate_mode_default", "FORENSIC");
+  p.add("gate_mode_request_count", g_clocks_gate_mode_request_count);
+  p.add("gate_mode_transition_count", g_clocks_gate_mode_transition_count);
 
   // Cached/report-only summary. Do not call process_time projection helpers
   // from the compact report path.
@@ -13754,7 +13854,60 @@ static FLASHMEM Payload cmd_report_status(const Payload&) {
 static FLASHMEM Payload cmd_report_gate(const Payload&) {
   Payload p;
   p.add("report", "CLOCKS_CAMPAIGN_GATE");
+  p.add("gate_mode", clocks_gate_mode_name(clocks_gate_mode()));
+  p.add("forensic_math_enabled", clocks_gate_mode_forensic());
   payload_add_campaign_feature_gate(p);
+  return p;
+}
+
+static FLASHMEM Payload cmd_report_gate_mode(const Payload&) {
+  Payload p;
+  p.add("report", "CLOCKS_GATE_MODE");
+  p.add("schema", "CLOCKS_GATE_MODE_V1");
+  p.add("gate_mode", clocks_gate_mode_name(clocks_gate_mode()));
+  p.add("default_gate_mode", "FORENSIC");
+  p.add("forensic_math_enabled", clocks_gate_mode_forensic());
+  p.add("structural_gates_bypassed", false);
+  p.add("request_count", g_clocks_gate_mode_request_count);
+  p.add("transition_count", g_clocks_gate_mode_transition_count);
+  return p;
+}
+
+static FLASHMEM Payload cmd_gate_mode(const Payload& args) {
+  const char* raw = nullptr;
+  (void)payload_try_get_string_alias(args, raw,
+                                     "gate_mode",
+                                     "GATE_MODE",
+                                     "mode",
+                                     "MODE",
+                                     nullptr,
+                                     nullptr,
+                                     nullptr);
+
+  clocks_gate_mode_t requested = clocks_gate_mode_t::FORENSIC;
+  if (!clocks_gate_mode_parse(raw, requested)) {
+    Payload err;
+    err.add("status", "gate_mode_rejected");
+    err.add("error", raw ? "invalid gate_mode" : "missing gate_mode");
+    err.add("expected", "STRICT|FORENSIC");
+    err.add("supplied", raw ? raw : "");
+    err.add("gate_mode", clocks_gate_mode_name(clocks_gate_mode()));
+    return err;
+  }
+
+  const clocks_gate_mode_t previous = clocks_gate_mode();
+  clocks_gate_mode_apply(requested);
+
+  Payload p;
+  p.add("status", "gate_mode_updated");
+  p.add("schema", "CLOCKS_GATE_MODE_V1");
+  p.add("previous_gate_mode", clocks_gate_mode_name(previous));
+  p.add("gate_mode", clocks_gate_mode_name(clocks_gate_mode()));
+  p.add("default_gate_mode", "FORENSIC");
+  p.add("forensic_math_enabled", clocks_gate_mode_forensic());
+  p.add("structural_gates_bypassed", false);
+  p.add("request_count", g_clocks_gate_mode_request_count);
+  p.add("transition_count", g_clocks_gate_mode_transition_count);
   return p;
 }
 
@@ -14289,6 +14442,9 @@ static const process_command_entry_t CLOCKS_COMMANDS[] = {
   { "REPORT",            cmd_report            },
   { "REPORT_STATUS",     cmd_report_status     },
   { "REPORT_GATE",       cmd_report_gate       },
+  { "GATE_MODE",         cmd_gate_mode         },
+  { "SET_GATE_MODE",     cmd_gate_mode         },
+  { "REPORT_GATE_MODE",  cmd_report_gate_mode  },
   { "REPORT_SUMMARY",    cmd_report_summary    },
   { "REPORT_EPOCH",      cmd_report_epoch      },
   { "REPORT_SMARTZERO",  cmd_report_smartzero  },
