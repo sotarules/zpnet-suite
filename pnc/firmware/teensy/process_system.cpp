@@ -20,7 +20,6 @@
 #include "events.h"
 #include "payload.h"
 #include "publish.h"
-#include "cpu_usage.h"
 #include "util.h"
 #include "timepop.h"
 #include "process_timepop.h"
@@ -59,18 +58,15 @@ static uint64_t system_cpu_window_last_wall_cycles = 0;
 static uint64_t system_cpu_window_last_idle_cycles = 0;
 
 // ============================================================================
-// Foreground / CPU-usage crash ledger
+// Foreground crash ledger
 // ============================================================================
 //
-// This is deliberately tiny and scalar-only.  It is updated continuously by
-// loop() and cpu_usage_tick(), so both compatibility banks use ordinary RAM1
-// in this deterministic-memory baseline.  The retained-bank API remains
-// compatible, but RAM1 startup initialization means it does not preserve the
-// previous boot's final image.
+// This scalar-only ledger records the imperative phase occupied by loop().
+// Both compatibility banks use ordinary RAM1 in this deterministic-memory
+// baseline.  The retained-bank API remains compatible, but RAM1 startup
+// initialization means it does not preserve the previous boot's final image.
 
-static constexpr uint32_t ZPNET_RUNTIME_LEDGER_MAGIC = 0x52554E31UL;  // 'RUN1'
-static constexpr uint32_t ZPNET_CPU_USAGE_STATE_IDLE = 0U;
-static constexpr uint32_t ZPNET_CPU_USAGE_STATE_ACTIVE = 1U;
+static constexpr uint32_t ZPNET_RUNTIME_LEDGER_MAGIC = 0x52554E32UL;  // 'RUN2'
 
 typedef struct {
   uint32_t magic;
@@ -80,21 +76,11 @@ typedef struct {
   uint32_t foreground_sequence_inv;
   uint32_t foreground_phase;
 
-  uint32_t cpu_usage_sequence;
-  uint32_t cpu_usage_sequence_inv;
-  uint32_t cpu_usage_state;
-  uint32_t cpu_usage_state_inv;
-  uint32_t cpu_usage_stage;
-  uint32_t cpu_usage_stage_inv;
-  uint32_t cpu_usage_stage_value;
-  uint32_t cpu_usage_stage_value_inv;
-  uint32_t cpu_usage_foreground_sequence;
-  uint32_t cpu_usage_foreground_phase;
-  uint32_t cpu_usage_ipsr;
+  uint32_t reserved[3];
 } zpnet_runtime_ledger_t;
 
-static_assert(sizeof(zpnet_runtime_ledger_t) == 64U,
-              "runtime crash ledger must stay two cache lines");
+static_assert(sizeof(zpnet_runtime_ledger_t) == 32U,
+              "runtime crash ledger must stay one cache line");
 
 static zpnet_runtime_ledger_t g_runtime_ledger = {};
 static zpnet_runtime_ledger_t g_runtime_ledger_retained = {};
@@ -113,31 +99,9 @@ static bool runtime_ledger_foreground_valid(
              0xFFFFFFFFUL;
 }
 
-static bool runtime_ledger_cpu_usage_valid(
-    const zpnet_runtime_ledger_t* ledger) {
-  return runtime_ledger_header_valid(ledger) &&
-         (ledger->cpu_usage_sequence ^ ledger->cpu_usage_sequence_inv) ==
-             0xFFFFFFFFUL &&
-         (ledger->cpu_usage_state ^ ledger->cpu_usage_state_inv) ==
-             0xFFFFFFFFUL &&
-         (ledger->cpu_usage_stage ^ ledger->cpu_usage_stage_inv) ==
-             0xFFFFFFFFUL &&
-         (ledger->cpu_usage_stage_value ^
-          ledger->cpu_usage_stage_value_inv) == 0xFFFFFFFFUL;
-}
-
 static void runtime_ledger_initialize_live(void) {
   memset((void*)&g_runtime_ledger, 0, sizeof(g_runtime_ledger));
   g_runtime_ledger.foreground_sequence_inv = 0xFFFFFFFFUL;
-  g_runtime_ledger.cpu_usage_sequence_inv = 0xFFFFFFFFUL;
-  g_runtime_ledger.cpu_usage_state = ZPNET_CPU_USAGE_STATE_IDLE;
-  g_runtime_ledger.cpu_usage_state_inv = ~ZPNET_CPU_USAGE_STATE_IDLE;
-  g_runtime_ledger.cpu_usage_stage =
-      (uint32_t)zpnet_cpu_usage_stage_t::IDLE;
-  g_runtime_ledger.cpu_usage_stage_inv =
-      ~(uint32_t)zpnet_cpu_usage_stage_t::IDLE;
-  g_runtime_ledger.cpu_usage_stage_value = 0U;
-  g_runtime_ledger.cpu_usage_stage_value_inv = ~0U;
   g_runtime_ledger.magic_inv = ~ZPNET_RUNTIME_LEDGER_MAGIC;
   g_runtime_ledger.magic = ZPNET_RUNTIME_LEDGER_MAGIC;
 }
@@ -153,12 +117,6 @@ static void runtime_ledger_boot_latch(void) {
   runtime_ledger_initialize_live();
 }
 
-static inline uint32_t runtime_ledger_ipsr(void) {
-  uint32_t ipsr = 0;
-  __asm__ volatile("mrs %0, ipsr" : "=r"(ipsr));
-  return ipsr & 0x1FFU;
-}
-
 void zpnet_foreground_phase_note(zpnet_foreground_phase_t phase) {
   runtime_ledger_boot_latch();
 
@@ -168,57 +126,6 @@ void zpnet_foreground_phase_note(zpnet_foreground_phase_t phase) {
   g_runtime_ledger.foreground_phase = (uint32_t)phase;
   g_runtime_ledger.foreground_sequence_inv = ~sequence;
   g_runtime_ledger.foreground_sequence = sequence;  // commit last
-}
-
-static void runtime_ledger_cpu_usage_set_stage(
-    zpnet_cpu_usage_stage_t stage,
-    uint32_t value) {
-  const uint32_t stage_id = (uint32_t)stage;
-  g_runtime_ledger.cpu_usage_stage = stage_id;
-  g_runtime_ledger.cpu_usage_stage_inv = ~stage_id;
-  g_runtime_ledger.cpu_usage_stage_value = value;
-  g_runtime_ledger.cpu_usage_stage_value_inv = ~value;
-}
-
-void zpnet_cpu_usage_ledger_enter(void) {
-  runtime_ledger_boot_latch();
-
-  const uint32_t sequence = g_runtime_ledger.cpu_usage_sequence + 1U;
-  g_runtime_ledger.cpu_usage_sequence_inv =
-      g_runtime_ledger.cpu_usage_sequence;  // invalidate while mutating
-  g_runtime_ledger.cpu_usage_foreground_sequence =
-      g_runtime_ledger.foreground_sequence;
-  g_runtime_ledger.cpu_usage_foreground_phase =
-      g_runtime_ledger.foreground_phase;
-  g_runtime_ledger.cpu_usage_ipsr = runtime_ledger_ipsr();
-  g_runtime_ledger.cpu_usage_state = ZPNET_CPU_USAGE_STATE_ACTIVE;
-  g_runtime_ledger.cpu_usage_state_inv = ~ZPNET_CPU_USAGE_STATE_ACTIVE;
-  runtime_ledger_cpu_usage_set_stage(
-      zpnet_cpu_usage_stage_t::CALLBACK_ENTER, 0U);
-  g_runtime_ledger.cpu_usage_sequence_inv = ~sequence;
-  g_runtime_ledger.cpu_usage_sequence = sequence;  // commit last
-}
-
-void zpnet_cpu_usage_ledger_stage(zpnet_cpu_usage_stage_t stage,
-                                  uint32_t value) {
-  runtime_ledger_boot_latch();
-
-  const uint32_t sequence = g_runtime_ledger.cpu_usage_sequence;
-  g_runtime_ledger.cpu_usage_sequence_inv = sequence;  // invalidate
-  runtime_ledger_cpu_usage_set_stage(stage, value);
-  g_runtime_ledger.cpu_usage_sequence_inv = ~sequence;  // commit last
-}
-
-void zpnet_cpu_usage_ledger_exit(void) {
-  runtime_ledger_boot_latch();
-
-  const uint32_t sequence = g_runtime_ledger.cpu_usage_sequence;
-  g_runtime_ledger.cpu_usage_sequence_inv = sequence;  // invalidate
-  g_runtime_ledger.cpu_usage_state = ZPNET_CPU_USAGE_STATE_IDLE;
-  g_runtime_ledger.cpu_usage_state_inv = ~ZPNET_CPU_USAGE_STATE_IDLE;
-  runtime_ledger_cpu_usage_set_stage(
-      zpnet_cpu_usage_stage_t::CALLBACK_EXIT, 0U);
-  g_runtime_ledger.cpu_usage_sequence_inv = ~sequence;  // commit last
 }
 
 
@@ -1514,58 +1421,20 @@ static const char* runtime_foreground_phase_name(uint32_t phase) {
   }
 }
 
-static const char* runtime_cpu_usage_state_name(uint32_t state) {
-  return state == ZPNET_CPU_USAGE_STATE_ACTIVE ? "ACTIVE" : "IDLE";
-}
-
-static const char* runtime_cpu_usage_stage_name(uint32_t stage) {
-  switch ((zpnet_cpu_usage_stage_t)stage) {
-    case zpnet_cpu_usage_stage_t::CALLBACK_ENTER:
-      return "CALLBACK_ENTER";
-    case zpnet_cpu_usage_stage_t::DWT_READ_COMPLETE:
-      return "DWT_READ_COMPLETE";
-    case zpnet_cpu_usage_stage_t::BUSY_READ_COMPLETE:
-      return "BUSY_READ_COMPLETE";
-    case zpnet_cpu_usage_stage_t::MILLIS_COMPLETE:
-      return "MILLIS_COMPLETE";
-    case zpnet_cpu_usage_stage_t::CALLBACK_EXIT:
-      return "CALLBACK_EXIT";
-    default:
-      return "IDLE";
-  }
-}
-
 static FLASHMEM Payload system_runtime_ledger_bank_payload(
     const zpnet_runtime_ledger_t* ledger) {
   Payload out;
   const bool header_valid = runtime_ledger_header_valid(ledger);
   const bool foreground_valid = runtime_ledger_foreground_valid(ledger);
-  const bool cpu_usage_valid = runtime_ledger_cpu_usage_valid(ledger);
 
   out.add("header_valid", header_valid);
   out.add("foreground_valid", foreground_valid);
-  out.add("cpu_usage_valid", cpu_usage_valid);
   if (!header_valid) return out;
 
   out.add("foreground_sequence", ledger->foreground_sequence);
   out.add("foreground_phase_id", ledger->foreground_phase);
   out.add("foreground_phase",
           runtime_foreground_phase_name(ledger->foreground_phase));
-  out.add("cpu_usage_sequence", ledger->cpu_usage_sequence);
-  out.add("cpu_usage_state_id", ledger->cpu_usage_state);
-  out.add("cpu_usage_state",
-          runtime_cpu_usage_state_name(ledger->cpu_usage_state));
-  out.add("cpu_usage_stage_id", ledger->cpu_usage_stage);
-  out.add("cpu_usage_stage",
-          runtime_cpu_usage_stage_name(ledger->cpu_usage_stage));
-  out.add("cpu_usage_stage_value", ledger->cpu_usage_stage_value);
-  out.add("cpu_usage_foreground_sequence",
-          ledger->cpu_usage_foreground_sequence);
-  out.add("cpu_usage_foreground_phase_id",
-          ledger->cpu_usage_foreground_phase);
-  out.add("cpu_usage_foreground_phase",
-          runtime_foreground_phase_name(ledger->cpu_usage_foreground_phase));
-  out.add("cpu_usage_ipsr", ledger->cpu_usage_ipsr);
   return out;
 }
 
@@ -1573,13 +1442,14 @@ static FLASHMEM Payload system_runtime_ledger_payload(void) {
   runtime_ledger_boot_latch();
 
   Payload out;
-  out.add("schema", "ZPNET_RUNTIME_LEDGER_V1");
+  out.add("schema", "ZPNET_RUNTIME_LEDGER_V2");
   out.add_object("live",
                  system_runtime_ledger_bank_payload(&g_runtime_ledger));
   out.add_object("retained",
                  system_runtime_ledger_bank_payload(&g_runtime_ledger_retained));
   return out;
 }
+
 
 
 static constexpr uint32_t SYSTEM_TRACE_REPORT_DEFAULT_COUNT = 8U;
@@ -2726,7 +2596,7 @@ static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
   system_cpu_window_last_wall_cycles = wall_cycles_now;
   system_cpu_window_last_idle_cycles = idle_cycles_now;
 
-  // CPU usage now means non-spin foreground/ISR work.  True core occupancy is
+  // CPU work means non-spin foreground/ISR work.  True core occupancy is
   // intentionally near 100% because the idle DWT witness loop runs when idle.
   p.add("cpu_usage_pct",
         toFixedDecimal(cpu_work_pct_milli / 1000.0f, 6));
@@ -2735,7 +2605,7 @@ static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
   p.add("cpu_idle_spin_pct",
         toFixedDecimal(cpu_idle_spin_pct_milli / 1000.0f, 6));
 
-  // CPU usage diagnostics
+  // SpinIdle-derived CPU work diagnostics
   p.add("cpu_work_cycles", (uint32_t)cpu_window_work_cycles);
   p.add("cpu_idle_spin_cycles", (uint32_t)cpu_window_idle_cycles);
   p.add("cpu_window_total_cycles", (uint32_t)cpu_window_total_cycles);
@@ -2755,13 +2625,6 @@ static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
   p.add("feature_status_fragment_service_arm_count", g_system_feature_fragment_service_arm_count);
   p.add("feature_status_fragment_service_arm_failures", g_system_feature_fragment_service_arm_failures);
 
-
-  // Legacy accounted callback-busy diagnostics.
-  p.add("cpu_accounted_busy_pct",
-        toFixedDecimal(cpu_usage_get_percent(), 6));
-  p.add("cpu_busy_cycles", cpu_usage_get_busy_cycles());
-  p.add("cpu_total_cycles", cpu_usage_get_total_cycles());
-  p.add("cpu_sample_window_ms", cpu_usage_get_sample_window_ms());
 
   p.add_object("features", system_features_tree_payload());
 

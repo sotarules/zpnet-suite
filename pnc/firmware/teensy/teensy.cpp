@@ -10,7 +10,6 @@
 #include "memory_info.h"
 #include "timepop.h"
 #include "events.h"
-#include "cpu_usage.h"
 #include "process.h"
 #include "transport.h"
 #include "payload.h"
@@ -93,27 +92,26 @@ static inline void led_off() { digitalWrite(LED_BUILTIN, LOW); }
 //   0. crash_forensics_install()         — reassert retained fault vectors
 //   1. maximize_dwt_determinism()        — CPU clock, DWT counter
 //   2. memory_info_init()                — stack sentinel painting
-//   3. cpu_usage_init()                  — DWT accounting baseline
-//   4. process_interrupt_init_hardware() — QTimer1 CH0/CH1/CH2/CH3 +
+//   3. process_interrupt_init_hardware() — QTimer1 CH0/CH1/CH2/CH3 +
 //                                          QTimer3 CH2/CH3 hardware setup
 //                                          (all compare channels start
 //                                          disabled; no spurious ISRs)
-//   5. timepop_init()                    — slot tables + register
+//   4. timepop_init()                    — slot tables + register
 //                                          QTimer1 CH2 handler with
 //                                          process_interrupt
-//   6. process_clocks_init_hardware()    — DWT enable, rolling helper baselines
-//   7. transport_init()                  — arms RX/TX timers
-//   8. debug_init()                      — transport-routed logging
-//   9. process framework + subsystems    — everything else
-//  10. process_interrupt_init()          — runtime subscriber tables
-//  11. process_interrupt_enable_irqs()   — ISR vectors + NVIC enable;
+//   5. process_clocks_init_hardware()    — DWT enable, rolling helper baselines
+//   6. transport_init()                  — arms RX/TX timers
+//   7. debug_init()                      — transport-routed logging
+//   8. process framework + subsystems    — everything else
+//   9. process_interrupt_init()          — runtime subscriber tables
+//  10. process_interrupt_enable_irqs()   — ISR vectors + NVIC enable;
 //                                          IRQ_QTIMER1, IRQ_QTIMER3,
 //                                          IRQ_GPIO6789 all go live.
 //                                          Any pending CH2 TCF1 from
-//                                          step 5's schedule_next()
+//                                          step 4's schedule_next()
 //                                          fires immediately and
 //                                          dispatches to TimePop.
-//  12. process_clocks_init()             — subscribes VCLOCK/OCXO,
+//  11. process_clocks_init()             — subscribes VCLOCK/OCXO,
 //                                          registers PPS edge dispatch,
 //                                          requests startup epoch zero,
 //                                          starts providers (which arms
@@ -177,7 +175,6 @@ void setup() {
   // ----------------------------------------------------------
 
   memory_info_init();
-  cpu_usage_init();
 
   // process_interrupt owns all interrupt-vector-bearing hardware:
   // QTimer1 (CH0/CH1/CH2/CH3) and QTimer3 (OCXO CH2/CH3).  All
@@ -342,14 +339,6 @@ void setup() {
   debug_log("boot", "process_performance_register");
   process_performance_register();
   debug_log("boot", "process_performance_register done");
-
-  // ----------------------------------------------------------
-  // CPU usage sampling
-  // ----------------------------------------------------------
-
-  debug_log("boot", "cpu_usage_init_timer");
-  cpu_usage_init_timer();
-  debug_log("boot", "cpu_usage_init_timer done");
 
   debug_log("boot", "setup complete");
 }

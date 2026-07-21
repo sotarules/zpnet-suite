@@ -94,7 +94,6 @@
 #include "process.h"
 #include "events.h"
 #include "payload.h"
-#include "cpu_usage.h"
 #include "time.h"
 #include "config.h"
 #include "util.h"
@@ -3527,7 +3526,6 @@ static void dispatch_deferred_phase(deferred_slot_t* slots_buf,
         name,
         end - start);
 
-    cpu_usage_account_busy(end - start);
     diag_dispatch_callbacks++;
     dispatched_count++;
     last_dispatch_dwt = end;
@@ -4874,7 +4872,6 @@ void timepop_dispatch(void) {
         diag_timed_dispatch_callback_body_max_cycles = body_cycles;
       }
 
-      cpu_usage_account_busy(body_cycles);
       diag_dispatch_callbacks++;
 
       timepop_apply_dispatch_mutations("timed_callback");
