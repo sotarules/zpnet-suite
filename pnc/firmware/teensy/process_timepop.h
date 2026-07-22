@@ -137,7 +137,7 @@ void timepop_init(void);
 void process_timepop_register(void);
 
 // Foreground-only CH2 ingress. process_interrupt Priority 16 stores one immutable
-// fire facts; process_interrupt_foreground_service() calls this before
+// fire fact; process_interrupt_foreground_service() calls this before
 // timepop_dispatch().  The capture-loss service restores only future compare
 // custody and never invents the missing physical edge.
 void timepop_accept_ch2_event_foreground(

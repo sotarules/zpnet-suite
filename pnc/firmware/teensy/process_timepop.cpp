@@ -136,9 +136,9 @@ static constexpr const char* WITNESS_SCHEDULER_NAME = "WITNESS_SCHEDULER";
 
 // CH2 scheduler custody.
 //
-// process_interrupt owns both interrupt tiers and the immutable CH2 foreground
-// ring.  TimePop scheduler policy is entered only from the ordinary loop after
-// the event has escaped all handler context.
+// process_interrupt owns both interrupt tiers and the immutable one-fact CH2
+// foreground mailbox.  TimePop scheduler policy is entered only from the
+// ordinary loop after the event has escaped all handler context.
 static constexpr const char* TIMEPOP_CH2_SERVICE_CONTEXT =
     "PROCESS_INTERRUPT_FOREGROUND_FACT";
 

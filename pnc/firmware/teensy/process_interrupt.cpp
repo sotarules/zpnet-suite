@@ -7,7 +7,9 @@
 // Priority 0 is the sacred capture tier:
 //   * ARM_DWT_CYCCNT is captured before any handler work;
 //   * the hardware source is minimally defused;
-//   * the already-authored compare target is retained as event identity;
+//   * a shared-vector compare flag becomes an event only when enable, software
+//     arm custody, and the physically programmed target identity all agree;
+//   * the already-authored physical compare target is retained as event identity;
 //   * only indispensable contemporaneous hardware witnesses are read;
 //   * a bounded scalar packet is enqueued;
 //   * priority 16 is pended once per hardware ISR entry.
@@ -1807,12 +1809,12 @@ static inline void qtimer1_vclock_clear_compare_flag(void) {
   qtimer_clear_compare_flag(IMXRT_TMR1, QTIMER1_VCLOCK_CH);
 }
 
-static inline void qtimer1_ch2_program_compare(uint16_t target_low16) {
-  qtimer_program_compare(IMXRT_TMR1, QTIMER1_TIMEPOP_CH, target_low16);
-}
-
 static inline void qtimer1_ch2_clear_compare_flag(void) {
   qtimer_clear_compare_flag(IMXRT_TMR1, QTIMER1_TIMEPOP_CH);
+}
+
+static inline void qtimer1_ch2_disable_compare_hardware(void) {
+  qtimer_disable_compare(IMXRT_TMR1, QTIMER1_TIMEPOP_CH);
 }
 
 static inline uint16_t ocxo_counter_now(const ocxo_lane_t& lane) {
@@ -2101,14 +2103,35 @@ static volatile uint32_t g_vclock_capture_overrun_rearm_request_count = 0U;
 static uint32_t g_vclock_capture_overrun_rearm_complete_count = 0U;
 static uint32_t g_ocxo1_capture_overrun_recovery_count = 0U;
 static uint32_t g_ocxo2_capture_overrun_recovery_count = 0U;
-static volatile uint32_t g_qtimer1_ch2_last_target_counter32 = 0U;
-static volatile uint32_t g_qtimer1_ch2_arm_count = 0U;
+// CH2 has three distinct identities.  Never collapse them:
+//
+//   requested target — newest target authored by TimePop policy
+//   deferred target  — newest request retained while one fire fact is in custody
+//   armed target     — exact target physically committed to COMP1/CMPLD1
+//
+// Only armed_target may become event identity in the shared QTimer1 ISR.
+static volatile uint32_t g_qtimer1_ch2_last_requested_target_counter32 = 0U;
+static volatile uint32_t g_qtimer1_ch2_request_count = 0U;
+static volatile bool g_qtimer1_ch2_compare_armed = false;
+static volatile uint32_t g_qtimer1_ch2_armed_target_counter32 = 0U;
+static volatile uint16_t g_qtimer1_ch2_armed_target_low16 = 0U;
+static volatile uint32_t g_qtimer1_ch2_physical_arm_count = 0U;
+static volatile uint32_t g_qtimer1_ch2_physical_reprogram_count = 0U;
 static volatile bool g_qtimer1_ch2_fact_outstanding = false;
 static volatile bool g_qtimer1_ch2_deferred_arm_valid = false;
 static volatile uint32_t g_qtimer1_ch2_deferred_arm_target_counter32 = 0U;
 static volatile uint32_t g_qtimer1_ch2_deferred_arm_count = 0U;
 static volatile uint32_t g_qtimer1_ch2_deferred_arm_replace_count = 0U;
 static volatile uint32_t g_qtimer1_ch2_release_arm_count = 0U;
+static volatile uint32_t g_qtimer1_ch2_release_without_arm_count = 0U;
+static volatile uint32_t g_qtimer1_ch2_valid_capture_count = 0U;
+static volatile uint32_t g_qtimer1_ch2_rejected_flag_count = 0U;
+static volatile uint32_t g_qtimer1_ch2_flag_while_disabled_count = 0U;
+static volatile uint32_t g_qtimer1_ch2_flag_while_unarmed_count = 0U;
+static volatile uint32_t g_qtimer1_ch2_flag_while_outstanding_count = 0U;
+static volatile uint32_t g_qtimer1_ch2_target_mismatch_count = 0U;
+// Compatibility aggregate retained for existing reports.  It now counts rejected
+// shared-vector CH2 flags; no rejected flag is allowed to become an event fact.
 static volatile uint32_t g_qtimer1_ch2_unexpected_capture_count = 0U;
 static volatile interrupt_qtimer1_ch1_handler_fn g_qtimer1_ch1_handler = nullptr;
 
@@ -2158,28 +2181,80 @@ uint32_t interrupt_vclock_counter32_observe_ambient(void) {
   return vclock_synthetic_from_hardware_low16(qtimer1_ch0_counter_now());
 }
 
+static void qtimer1_ch2_defer_arm_locked(uint32_t target_counter32) {
+  if (g_qtimer1_ch2_deferred_arm_valid) {
+    g_qtimer1_ch2_deferred_arm_replace_count++;
+  }
+  g_qtimer1_ch2_deferred_arm_target_counter32 = target_counter32;
+  g_qtimer1_ch2_deferred_arm_valid = true;
+  g_qtimer1_ch2_deferred_arm_count++;
+}
+
+// Commit one physical CH2 target.  Caller holds the Priority-16-preserving
+// guard, but Priority 0 is deliberately still allowed to preempt.  The ordering
+// therefore makes every intermediate state harmless to the shared-vector ISR:
+// hardware remains disabled until armed identity and custody state are complete.
+//
+// For an ordinary reprogram, a legitimate old-target fire may preempt just
+// before hardware disable.  After disabling, recheck fact custody; if Priority 0
+// captured that old edge, preserve the new request as deferred work instead of
+// erasing the newly captured fact.  release_owned_fact is true only when the
+// caller is completing custody of the fact that intentionally holds the rail.
+static bool qtimer1_ch2_commit_physical_arm_locked(
+    uint32_t target_counter32,
+    bool release_owned_fact) {
+  auto& ch = IMXRT_TMR1.CH[QTIMER1_TIMEPOP_CH];
+  const bool replacing = g_qtimer1_ch2_compare_armed ||
+      (ch.CSCTRL & TMR_CSCTRL_TCF1EN) != 0U;
+  const uint16_t target_low16 =
+      vclock_hardware_low16_from_synthetic(target_counter32);
+
+  qtimer1_ch2_disable_compare_hardware();
+  dmb_barrier();
+
+  if (!release_owned_fact && g_qtimer1_ch2_fact_outstanding) {
+    qtimer1_ch2_defer_arm_locked(target_counter32);
+    return false;
+  }
+
+  ch.COMP1 = target_low16;
+  ch.CMPLD1 = target_low16;
+  qtimer1_ch2_clear_compare_flag();
+
+  // Publish actual hardware identity before enabling the interrupt source.
+  g_qtimer1_ch2_armed_target_counter32 = target_counter32;
+  g_qtimer1_ch2_armed_target_low16 = target_low16;
+  g_qtimer1_ch2_compare_armed = true;
+  g_qtimer1_ch2_fact_outstanding = false;
+  dmb_barrier();
+
+  // A match may have occurred while programming a disabled channel.  Clear once
+  // more immediately before enabling; TCF1EN is always the final write.
+  qtimer1_ch2_clear_compare_flag();
+  ch.CSCTRL |= TMR_CSCTRL_TCF1EN;
+  (void)ch.CSCTRL;
+
+  g_qtimer1_ch2_physical_arm_count++;
+  if (replacing) g_qtimer1_ch2_physical_reprogram_count++;
+  return true;
+}
+
 void interrupt_qtimer1_ch2_arm_compare(uint32_t target_counter32) {
   const uint32_t prior = interrupt_priority0_guard_enter();
-  g_qtimer1_ch2_last_target_counter32 = target_counter32;
-  g_qtimer1_ch2_arm_count++;
+  g_qtimer1_ch2_last_requested_target_counter32 = target_counter32;
+  g_qtimer1_ch2_request_count++;
 
   // A captured CH2 edge owns the scheduler rail until foreground consumes it.
   // Scheduler policy may continue to author a desired next target while that
-  // fact is in flight, but hardware must remain defused.  Keep only the newest
-  // desired target; foreground releases it after processing the owned fact.
+  // fact is in flight, but hardware remains disabled.  Retain only the newest
+  // desired target; release commits that target as one atomic physical arm.
   if (g_qtimer1_ch2_fact_outstanding) {
-    if (g_qtimer1_ch2_deferred_arm_valid) {
-      g_qtimer1_ch2_deferred_arm_replace_count++;
-    }
-    g_qtimer1_ch2_deferred_arm_target_counter32 = target_counter32;
-    g_qtimer1_ch2_deferred_arm_valid = true;
-    g_qtimer1_ch2_deferred_arm_count++;
+    qtimer1_ch2_defer_arm_locked(target_counter32);
     interrupt_priority0_guard_exit(prior);
     return;
   }
 
-  qtimer1_ch2_program_compare(
-      vclock_hardware_low16_from_synthetic(target_counter32));
+  (void)qtimer1_ch2_commit_physical_arm_locked(target_counter32, false);
   interrupt_priority0_guard_exit(prior);
 }
 
@@ -3252,11 +3327,10 @@ qtimer1_defuse_vclock_priority0(void) {
 
 static __attribute__((always_inline)) inline void
 qtimer1_defuse_timepop_priority0(void) {
-  // CH2 is one-shot across the execution-class boundary.  Disable the old
-  // target before it can recur on the next low-word revolution; foreground
-  // TimePop will choose and program the next compare after consuming the fact.
-  IMXRT_TMR1.CH[QTIMER1_TIMEPOP_CH].CSCTRL &= ~TMR_CSCTRL_TCF1EN;
-  qtimer1_ch2_clear_compare_flag();
+  // CH2 is one-shot across the execution-class boundary.  Disable and double-
+  // clear the source; foreground TimePop may choose the next target only after
+  // the captured fact has completed custody.
+  qtimer1_ch2_disable_compare_hardware();
 }
 
 static __attribute__((always_inline)) inline void
@@ -3289,21 +3363,66 @@ qtimer1_capture_vclock_priority0(uint32_t isr_entry_dwt_raw,
 }
 
 static __attribute__((always_inline)) inline bool
-qtimer1_capture_ch2_priority0(uint32_t isr_entry_dwt_raw) {
-  if (g_qtimer1_ch2_fact_outstanding) {
+qtimer1_service_ch2_flag_priority0(uint32_t isr_entry_dwt_raw,
+                                   uint32_t ch2_csctrl) {
+  const bool interrupt_enabled =
+      (ch2_csctrl & TMR_CSCTRL_TCF1EN) != 0U;
+  const bool software_armed = g_qtimer1_ch2_compare_armed;
+  const bool fact_outstanding = g_qtimer1_ch2_fact_outstanding;
+  const uint16_t hardware_target_low16 =
+      IMXRT_TMR1.CH[QTIMER1_TIMEPOP_CH].COMP1;
+  const bool target_matches = software_armed &&
+      hardware_target_low16 == g_qtimer1_ch2_armed_target_low16;
+
+  // QTimer1 has one vector for all channels.  A disabled CH2 can still carry a
+  // stale/reasserted TCF1 status while CH0 legitimately enters the vector.  A
+  // naked flag is not an event: enabled hardware, software arm custody, exact
+  // programmed-target identity, and no prior fact must all agree.
+  if (!interrupt_enabled || !software_armed || fact_outstanding ||
+      !target_matches) {
+    g_qtimer1_ch2_rejected_flag_count++;
     g_qtimer1_ch2_unexpected_capture_count++;
+    if (!interrupt_enabled) g_qtimer1_ch2_flag_while_disabled_count++;
+    if (!software_armed) g_qtimer1_ch2_flag_while_unarmed_count++;
+    if (fact_outstanding) g_qtimer1_ch2_flag_while_outstanding_count++;
+    if (software_armed && !target_matches) {
+      g_qtimer1_ch2_target_mismatch_count++;
+    }
+
+    // If hardware claimed to be enabled without lawful software custody, seize
+    // and invalidate that rail.  During the legitimate arm-before-enable window
+    // interrupt_enabled is false, so the published arm token remains intact and
+    // the interrupted foreground arm transaction can safely finish.
+    if (interrupt_enabled) {
+      g_qtimer1_ch2_compare_armed = false;
+      g_qtimer1_ch2_armed_target_counter32 = 0U;
+      g_qtimer1_ch2_armed_target_low16 = 0U;
+    }
+    qtimer1_defuse_timepop_priority0();
+    return false;
   }
+
+  const uint32_t target_counter32 =
+      g_qtimer1_ch2_armed_target_counter32;
+
+  // Transfer the physically armed identity into one-shot fact custody before
+  // any lower execution class can author another target.
+  g_qtimer1_ch2_compare_armed = false;
+  g_qtimer1_ch2_armed_target_counter32 = 0U;
+  g_qtimer1_ch2_armed_target_low16 = 0U;
   g_qtimer1_ch2_fact_outstanding = true;
+  dmb_barrier();
   qtimer1_defuse_timepop_priority0();
+  g_qtimer1_ch2_valid_capture_count++;
 
   ch2_capture_packet_t packet{};
   packet.isr_entry_dwt_raw = isr_entry_dwt_raw;
-  packet.target_counter32 = g_qtimer1_ch2_last_target_counter32;
+  packet.target_counter32 = target_counter32;
   if (!capture_ring_push_priority0(g_ch2_capture_ring,
                                    g_handoff_ch2,
                                    packet)) {
     // The hardware rail remains defused.  Priority 16/foreground will recover
-    // scheduler custody rather than allowing the same target to fire again.
+    // scheduler custody rather than inventing or repeating the lost edge.
     g_timepop_foreground_rearm_requested = true;
     g_process_interrupt_foreground_pending = true;
   }
@@ -3326,7 +3445,8 @@ static void qtimer1_isr(void) {
         qtimer1_capture_vclock_priority0(isr_entry_dwt_raw, service_low16);
   }
   if ((ch2_csctrl & TMR_CSCTRL_TCF1) != 0U) {
-    handoff_needed |= qtimer1_capture_ch2_priority0(isr_entry_dwt_raw);
+    handoff_needed |=
+        qtimer1_service_ch2_flag_priority0(isr_entry_dwt_raw, ch2_csctrl);
   }
   if (handoff_needed) {
     interrupt_handoff_request_priority0(isr_entry_dwt_raw);
@@ -3839,24 +3959,31 @@ const interrupt_capture_diag_t* interrupt_last_diag(
 }
 
 static void interrupt_timepop_release_ch2_custody_foreground(void) {
-  bool arm = false;
-  uint32_t target = 0U;
-
   const uint32_t prior = interrupt_priority0_guard_enter();
-  g_qtimer1_ch2_fact_outstanding = false;
   if (g_qtimer1_ch2_deferred_arm_valid) {
-    target = g_qtimer1_ch2_deferred_arm_target_counter32;
+    const uint32_t target =
+        g_qtimer1_ch2_deferred_arm_target_counter32;
     g_qtimer1_ch2_deferred_arm_valid = false;
     g_qtimer1_ch2_deferred_arm_target_counter32 = 0U;
-    arm = true;
+
+    // Keep fact_outstanding true until armed identity and compare registers are
+    // complete.  commit_physical_arm clears custody immediately before enabling
+    // TCF1EN, eliminating the former release-before-programming window.
+    if (qtimer1_ch2_commit_physical_arm_locked(target, true)) {
+      g_qtimer1_ch2_release_arm_count++;
+    }
+  } else {
+    // A normal TimePop pass always authors a heartbeat or a real deadline.  If
+    // it did not, release custody into an explicitly disabled/unarmed state and
+    // leave a court record rather than silently exposing stale hardware.
+    qtimer1_ch2_disable_compare_hardware();
+    g_qtimer1_ch2_compare_armed = false;
+    g_qtimer1_ch2_armed_target_counter32 = 0U;
+    g_qtimer1_ch2_armed_target_low16 = 0U;
+    g_qtimer1_ch2_fact_outstanding = false;
+    g_qtimer1_ch2_release_without_arm_count++;
   }
   interrupt_priority0_guard_exit(prior);
-
-  if (arm) {
-    qtimer1_ch2_program_compare(
-        vclock_hardware_low16_from_synthetic(target));
-    g_qtimer1_ch2_release_arm_count++;
-  }
 }
 
 static void interrupt_timepop_foreground_service(void) {
@@ -4768,6 +4895,28 @@ static FLASHMEM Payload cmd_report_handoff(const Payload&) {
               (uint32_t)g_timepop_foreground_diag.handler_last_ipsr);
   payload.add("timepop_foreground_scheduler_recover_count",
               (uint32_t)g_timepop_foreground_diag.scheduler_recover_count);
+  const uint32_t ch2_csctrl_snapshot =
+      IMXRT_TMR1.CH[QTIMER1_TIMEPOP_CH].CSCTRL;
+  payload.add("ch2_hw_tcf1",
+              (bool)((ch2_csctrl_snapshot & TMR_CSCTRL_TCF1) != 0U));
+  payload.add("ch2_hw_tcf1en",
+              (bool)((ch2_csctrl_snapshot & TMR_CSCTRL_TCF1EN) != 0U));
+  payload.add("ch2_hw_comp1",
+              (uint32_t)IMXRT_TMR1.CH[QTIMER1_TIMEPOP_CH].COMP1);
+  payload.add("ch2_compare_armed",
+              (bool)g_qtimer1_ch2_compare_armed);
+  payload.add("ch2_armed_target_counter32",
+              (uint32_t)g_qtimer1_ch2_armed_target_counter32);
+  payload.add("ch2_armed_target_low16",
+              (uint32_t)g_qtimer1_ch2_armed_target_low16);
+  payload.add("ch2_last_requested_target_counter32",
+              (uint32_t)g_qtimer1_ch2_last_requested_target_counter32);
+  payload.add("ch2_request_count",
+              (uint32_t)g_qtimer1_ch2_request_count);
+  payload.add("ch2_physical_arm_count",
+              (uint32_t)g_qtimer1_ch2_physical_arm_count);
+  payload.add("ch2_physical_reprogram_count",
+              (uint32_t)g_qtimer1_ch2_physical_reprogram_count);
   payload.add("ch2_fact_outstanding",
               (bool)g_qtimer1_ch2_fact_outstanding);
   payload.add("ch2_deferred_arm_valid",
@@ -4780,6 +4929,20 @@ static FLASHMEM Payload cmd_report_handoff(const Payload&) {
               (uint32_t)g_qtimer1_ch2_deferred_arm_replace_count);
   payload.add("ch2_release_arm_count",
               (uint32_t)g_qtimer1_ch2_release_arm_count);
+  payload.add("ch2_release_without_arm_count",
+              (uint32_t)g_qtimer1_ch2_release_without_arm_count);
+  payload.add("ch2_valid_capture_count",
+              (uint32_t)g_qtimer1_ch2_valid_capture_count);
+  payload.add("ch2_rejected_flag_count",
+              (uint32_t)g_qtimer1_ch2_rejected_flag_count);
+  payload.add("ch2_flag_while_disabled_count",
+              (uint32_t)g_qtimer1_ch2_flag_while_disabled_count);
+  payload.add("ch2_flag_while_unarmed_count",
+              (uint32_t)g_qtimer1_ch2_flag_while_unarmed_count);
+  payload.add("ch2_flag_while_outstanding_count",
+              (uint32_t)g_qtimer1_ch2_flag_while_outstanding_count);
+  payload.add("ch2_target_mismatch_count",
+              (uint32_t)g_qtimer1_ch2_target_mismatch_count);
   payload.add("ch2_unexpected_capture_count",
               (uint32_t)g_qtimer1_ch2_unexpected_capture_count);
   add_handoff_source(payload, "vclock", g_handoff_vclock);

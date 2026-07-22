@@ -1047,6 +1047,11 @@ uint16_t interrupt_qtimer1_ch1_comp1_now(void);
 uint16_t interrupt_qtimer1_ch1_csctrl_now(void);
 
 uint32_t interrupt_vclock_counter32_observe_ambient(void);
+
+// Request the next TimePop CH2 deadline.  process_interrupt separates requested,
+// deferred, and physically armed identities.  On the shared QTimer1 vector, a
+// CH2 status flag is accepted only when TCF1EN, software arm custody, programmed
+// COMP1 identity, and the no-outstanding-fact invariant all agree.
 void     interrupt_qtimer1_ch2_arm_compare(uint32_t target_counter32);
 
 struct interrupt_clock_snapshot_t {
