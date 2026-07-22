@@ -2402,8 +2402,9 @@ struct alpha_pps_counterledger_lane_t {
   uint32_t phase_to_next_00_ns = 0;
 
   // PhaseLedger phase_after_last_00_ns is circular in the 0..99 ns OCXO
-  // tick cell.  The refined public clock must unwrap that residue across
-  // the 00 boundary; otherwise a true +3 ns phase walk can publish as -97 ns.
+  // tick cell.  The unwrapped delta/carry fields are diagnostic phase-walk
+  // witnesses only.  CounterLedger already owns whole-tick crossings, so the
+  // refined clockface and interval must not apply the carry a second time.
   int32_t  phase_raw_delta_ns = 0;
   int32_t  phase_unwrapped_delta_ns = 0;
   int64_t  phase_unwrapped_carry_ticks = 0;
@@ -3123,27 +3124,16 @@ static double alpha_counterledger_block_ppb(uint64_t block_ns,
   return (tau - 1.0) * 1.0e9;
 }
 
-static uint64_t alpha_phaseledger_refined_ns_with_carry(
+static uint64_t alpha_phaseledger_refined_ns(
     uint64_t integer_ns,
-    int64_t carry_ticks,
     uint32_t phase_after_last_00_ns) {
+  // CounterLedger already owns every whole 100 ns OCXO tick observed at PPS.
+  // PhaseLedger contributes only the bounded 0..99 ns suffix inside that tick.
+  // A cumulative wrap carry here would count the same hardware tick twice.
   const uint64_t phase = (uint64_t)phase_after_last_00_ns;
-  if (carry_ticks >= 0) {
-    const uint64_t carry_ns = (uint64_t)carry_ticks *
-                              (uint64_t)NS_PER_10MHZ_TICK;
-    uint64_t out = integer_ns;
-    if (UINT64_MAX - out < carry_ns) return UINT64_MAX;
-    out += carry_ns;
-    if (UINT64_MAX - out < phase) return UINT64_MAX;
-    return out + phase;
-  }
-
-  const uint64_t carry_ns = (uint64_t)(-carry_ticks) *
-                            (uint64_t)NS_PER_10MHZ_TICK;
-  uint64_t out = integer_ns;
-  if (UINT64_MAX - out < phase) return UINT64_MAX;
-  out += phase;
-  return (out >= carry_ns) ? (out - carry_ns) : 0ULL;
+  return (UINT64_MAX - integer_ns < phase)
+      ? UINT64_MAX
+      : integer_ns + phase;
 }
 
 static bool alpha_counterledger_refresh_refined_from_phase(
@@ -3159,9 +3149,8 @@ static bool alpha_counterledger_refresh_refined_from_phase(
     return true;
   }
 
-  const uint64_t refined_ns = alpha_phaseledger_refined_ns_with_carry(
+  const uint64_t refined_ns = alpha_phaseledger_refined_ns(
       s.ns,
-      s.phase_unwrapped_carry_ticks,
       s.phase_after_last_00_ns);
 
   s.refined_valid = true;
@@ -3173,13 +3162,19 @@ static bool alpha_counterledger_refresh_refined_from_phase(
 
   if (s.last_refined_phase_pps_sequence != 0U &&
       s.refined_phase_pps_sequence ==
-          (uint32_t)(s.last_refined_phase_pps_sequence + 1U) &&
-      refined_ns >= s.last_refined_ns) {
-    s.refined_interval_valid = s.interval_valid;
+          (uint32_t)(s.last_refined_phase_pps_sequence + 1U)) {
+    // The PPS-sampled integer interval already includes any whole-tick change
+    // that accompanied a 99->0 or 0->99 phase-cell crossing.  Pair it with the
+    // raw signed suffix delta.  Using the unwrapped delta (or a cumulative carry)
+    // would add or remove that same 100 ns tick a second time.
+    const int64_t refined_interval_signed =
+        (int64_t)s.last_interval_ns + (int64_t)s.phase_raw_delta_ns;
+    s.refined_interval_valid =
+        s.interval_valid && refined_interval_signed > 0;
     if (s.refined_interval_valid) {
-      s.refined_interval_ns = refined_ns - s.last_refined_ns;
+      s.refined_interval_ns = (uint64_t)refined_interval_signed;
       s.refined_fast_residual_ns =
-          (int64_t)s.refined_interval_ns - (int64_t)NS_PER_SECOND_U64;
+          refined_interval_signed - (int64_t)NS_PER_SECOND_U64;
       s.refined_interval_accept_count++;
       if (s.recover_reprime_count != 0U) {
         s.recover_refined_interval_accept_count++;

@@ -457,10 +457,10 @@ static uint64_t g_start_handoff_last_ocxo2_projection_vclock_ns = 0;
 // These counters are Beta-local forensics only.  They do not authorize clock
 // values; they explain why START was held or released.
 static constexpr uint32_t CLOCKS_START_PHASELEDGER_EXPECTED_LAG_PPS = 0U;
-// Once PhaseLedger is the standard authority, do not let the science row
-// silently fall back to integer CounterLedger quantization.  A missing
-// refined interval is a startup/maturity fact and should publish as missing
-// science rather than contaminating Welford/PPB with 100 ns stair-steps.
+// CounterLedger/PhaseLedger remains the public OCXO clockface authority and
+// START therefore still requires a mature refined interval.  Per-second science,
+// Welford, and servo authority are Delta Cycles; a missing PhaseLedger interval
+// is counted as sidecar evidence and must not overwrite or invalidate Delta.
 static constexpr bool CLOCKS_PHASELEDGER_SCIENCE_REQUIRE_REFINED_INTERVAL = true;
 static uint32_t g_start_phaseledger_check_count = 0;
 static uint32_t g_start_phaseledger_ready_count = 0;
@@ -1751,8 +1751,8 @@ static uint64_t science_render_legacy_clock_interval_ns(
   if (!row.valid) return 0ULL;
 
   if (clocks_ocxo_counterledger_mode_enabled()) {
-    // CounterLedger residuals are clockface elapsed time: positive fast means
-    // the OCXO ledger advanced more than the GNSS second.
+    // CounterLedger mode changes public clockface authority, not this row's
+    // canonical one-second residual.  The row is still the Delta rendering.
     return row.clock_interval_ns;
   }
 
@@ -5283,9 +5283,7 @@ static FLASHMEM void payload_add_ocxo_pps_residual_object(Payload& parent,
   residual.add("clock_interval_ns", valid ? clock_interval_ns : 0ULL);
   residual.add("fast_residual_ns", valid ? fast_residual_ns : 0LL);
   residual.add("positive_means", "clock_fast");
-  residual.add("source", clocks_ocxo_counterledger_mode_enabled()
-      ? "COUNTERLEDGER_PPS_CAPTURE"
-      : "DELTA_OBSERVED_DWT_EDGE");
+  residual.add("source", "DELTA_OBSERVED_DWT_EDGE");
   residual.add("traditional_preserved_under", "science.traditional_fast_residual_ns");
   parent.add_object("pps_residual", residual);
 }
@@ -5795,12 +5793,15 @@ static void clock_science_apply_counterledger_row(
     clock_science_row_t& row,
     const clocks_alpha_ocxo_counterledger_snapshot_t& ledger,
     uint64_t public_gnss_ns) {
+  (void)public_gnss_ns;
   if (!clocks_ocxo_counterledger_mode_enabled()) return;
 
-  const bool use_phase = ledger.refined_interval_valid &&
-                         ledger.refined_interval_ns != 0ULL;
+  const bool refined_interval_available =
+      ledger.valid && ledger.refined_interval_valid &&
+      ledger.refined_interval_ns != 0ULL;
 
-  if (CLOCKS_PHASELEDGER_SCIENCE_REQUIRE_REFINED_INTERVAL && !use_phase) {
+  if (CLOCKS_PHASELEDGER_SCIENCE_REQUIRE_REFINED_INTERVAL &&
+      !refined_interval_available) {
     g_phaseledger_science_missing_refined_interval_count++;
     g_phaseledger_science_last_missing_public_count = row.public_count;
     if (ledger.clock_id == (uint32_t)((uint8_t)time_clock_id_t::OCXO1)) {
@@ -5809,63 +5810,13 @@ static void clock_science_apply_counterledger_row(
                (uint32_t)((uint8_t)time_clock_id_t::OCXO2)) {
       g_phaseledger_science_missing_ocxo2_count++;
     }
-
-    // STRICT preserves the production PhaseLedger court.  FORENSIC leaves the
-    // already-built Delta numeric row intact so the missing refined interval
-    // and any 0/2-second cycle pathology can propagate through campaign math.
-    row.science_worthy = false;
-    row.antecedents_complete = false;
-    if (clocks_gate_mode_forensic()) {
-      row.forensic_override = true;
-      return;
-    }
-
-    row.valid = false;
-    row.gnss_interval_ns = CLOCKS_BETA_NS_PER_SECOND;
-    row.gnss_interval_ns_exact = (double)CLOCKS_BETA_NS_PER_SECOND;
-    row.clock_interval_ns = 0ULL;
-    row.clock_interval_ns_exact = 0.0;
-    row.fast_residual_ns = 0LL;
-    row.fast_residual_ns_exact = 0.0;
-    row.tau_1s = 1.0;
-    row.ppb_1s = 0.0;
-    return;
   }
 
-  const bool interval_valid = use_phase ||
-      (ledger.interval_valid && ledger.interval_ns != 0ULL);
-  const uint64_t interval_ns = use_phase
-      ? ledger.refined_interval_ns
-      : ledger.interval_ns;
-  const int64_t fast_residual_ns = use_phase
-      ? ledger.refined_fast_residual_ns
-      : ledger.fast_residual_ns;
-
-  row.valid = ledger.valid && interval_valid;
-  row.science_worthy = row.valid;
-  row.antecedents_complete = row.valid;
-  row.prior_edge_gnss_ns = beta_i64_from_u64_saturating(public_gnss_ns) -
-                           beta_i64_from_u64_saturating(CLOCKS_BETA_NS_PER_SECOND);
-  row.current_edge_gnss_ns = beta_i64_from_u64_saturating(public_gnss_ns);
-  row.prior_edge_gnss_ns_exact = (double)row.prior_edge_gnss_ns;
-  row.current_edge_gnss_ns_exact = (double)public_gnss_ns;
-
-  row.gnss_interval_ns = CLOCKS_BETA_NS_PER_SECOND;
-  row.gnss_interval_ns_exact = (double)CLOCKS_BETA_NS_PER_SECOND;
-  row.clock_interval_ns = row.valid ? interval_ns : 0ULL;
-  row.clock_interval_ns_exact = row.valid
-      ? (double)interval_ns
-      : 0.0;
-  row.fast_residual_ns = row.valid ? fast_residual_ns : 0LL;
-  row.fast_residual_ns_exact = row.valid
-      ? (double)fast_residual_ns
-      : 0.0;
-  row.tau_1s = (row.valid && interval_ns != 0ULL)
-      ? ((double)interval_ns / (double)CLOCKS_BETA_NS_PER_SECOND)
-      : 1.0;
-  row.ppb_1s = row.valid
-      ? campaign_total_ppb_from_tau(row.tau_1s)
-      : 0.0;
+  // Deliberately do not rewrite row.{valid,clock_interval,fast_residual,tau,ppb}.
+  // clock_science_build_ocxo() already authored those fields from same-row
+  // observed Delta Cycles.  The full CounterLedger/PhaseLedger candidate remains
+  // published beside it under ocxoN.counterledger, including refined interval,
+  // residual, phase suffix, wrap transcript, and long-block statistics.
 }
 
 static bool clocks_beta_counterledger_completed_row_ready(
@@ -6671,9 +6622,7 @@ static FLASHMEM void payload_add_clock_science_common(Payload& science,
   science.add("public_ns_mode", clocks_ocxo_public_ns_authority_name());
   science.add("residual_source",
               ocxo_science_row
-                  ? (clocks_ocxo_counterledger_mode_enabled()
-                         ? "COUNTERLEDGER_PPS_CAPTURE"
-                         : "DELTA_OBSERVED_DWT_EDGE")
+                  ? "DELTA_OBSERVED_DWT_EDGE"
                   : "GNSS_IDENTITY");
   science.add("traditional_residual_source",
               ocxo_science_row ? "PROJECTED_GNSS_OBSERVED_DWT_CPS" : "NONE");
@@ -6877,11 +6826,9 @@ static FLASHMEM void payload_add_ocxo_science_object(Payload& lane,
                   ? "OBSERVED_DWT_EDGE"
                   : "OBSERVED_DWT_EDGE_AUTHORITY");
   science.add("frequency_source",
-              clocks_ocxo_counterledger_mode_enabled()
-                  ? "COUNTERLEDGER_PPS_CAPTURE"
-                  : (TIMEBASE_FRAGMENT_COMPACT_SCIENCE_ENABLED
-                         ? "DELTA_OBSERVED_DWT_EDGE"
-                         : "DELTA_CYCLES_SAME_ROW_OBSERVED_DWT"));
+              TIMEBASE_FRAGMENT_COMPACT_SCIENCE_ENABLED
+                  ? "DELTA_OBSERVED_DWT_EDGE"
+                  : "DELTA_CYCLES_SAME_ROW_OBSERVED_DWT");
   if (!TIMEBASE_FRAGMENT_COMPACT_SCIENCE_ENABLED) {
     science.add("delta_formula",
                 "fast = same_row_pps_vclock_cycles - ocxo_observed_dwt_cycles");
@@ -7457,10 +7404,10 @@ static FLASHMEM void payload_add_ocxo_fragment(Payload& p,
                                       const clock_science_row_t& science_row) {
   Payload lane;
 
-  // Compact science surface.  The canonical OCXO value is now rendered from
-  // observed-DWT Delta Cycles campaign totals.  measured_gnss_ns and PPS
-  // projection flags remain as legacy/forensic side-channels for dashboards/
-  // report migration.
+  // Compact science surface.  The public OCXO clockface may be authored by
+  // CounterLedger/PhaseLedger, while the per-second residual, Welford, and servo
+  // surfaces remain same-row observed Delta Cycles.  measured_gnss_ns and PPS
+  // projection flags remain legacy/forensic side-channels.
   lane.add("ns", public_ns);
   lane.add("ns_source_id", clocks_ocxo_counterledger_mode_enabled()
       ? 4U
@@ -7579,11 +7526,11 @@ static FLASHMEM void payload_add_ocxo_forensics(Payload& p,
   p.add_object(key, lane);
 }
 
-// Servo source doctrine. MEAN and NOW consume whichever one-second residual
-// surface is canonical for this build: Delta Cycles in traditional mode,
-// CounterLedger PPS-capture residuals in CounterLedger mode. TOTAL consumes the
-// published campaign clockface ratio (public_ocxo_ns / public_gnss_ns) and
-// shapes it through the catch-up controller.
+// Servo source doctrine. MEAN and NOW always consume the same-row observed
+// Delta Cycles residual that feeds the OCXO Welfords and public pps_residual.
+// CounterLedger/PhaseLedger remains a parallel clockface/forensic surface.
+// TOTAL consumes the published campaign clockface ratio
+// (public_ocxo_ns / public_gnss_ns) and shapes it through the catch-up controller.
 static constexpr uint32_t SERVO_INPUT_SOURCE_NONE = 0;
 static constexpr uint32_t SERVO_INPUT_SOURCE_MEAN_PPS_RESIDUAL_WELFORD = 1;
 static constexpr uint32_t SERVO_INPUT_SOURCE_TOTAL_PUBLIC_TAU = 2;
