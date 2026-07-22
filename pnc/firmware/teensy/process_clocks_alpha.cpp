@@ -8704,6 +8704,19 @@ static void pps_selector_callback(const pps_edge_snapshot_t& snap) {
 
   publish_pps_witness_diag(snap);
 
+  if (!installed_epoch) {
+    update_pps_vclock_bridge_anchor(snap);
+  }
+
+  // RECOVER is a control-plane escape hatch and must not depend on OCXO row
+  // completion.  The failure being recovered may be precisely the loss of the
+  // OCXO one-second ferry, so consume the request directly from sovereign PPS.
+  if (request_recover) {
+    alpha_timebase_row_clear();
+    clocks_beta_pps(0U);
+    return;
+  }
+
   // There is one practical row and no queue.  A new PPS cannot overwrite an
   // older row that is still waiting for either OCXO lane.
   if (g_alpha_pending_timebase_row.open &&
@@ -8716,10 +8729,6 @@ static void pps_selector_callback(const pps_edge_snapshot_t& snap) {
         g_alpha_last_ocxo2_pps_sequence);
     alpha_timebase_row_clear();
     return;
-  }
-
-  if (!installed_epoch) {
-    update_pps_vclock_bridge_anchor(snap);
   }
 
   // Once an Alpha epoch exists, the selected PPS/VCLOCK continuation must be

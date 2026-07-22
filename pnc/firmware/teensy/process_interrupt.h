@@ -961,8 +961,10 @@ bool interrupt_start(interrupt_subscriber_kind_t kind);
 bool interrupt_ensure_service(interrupt_subscriber_kind_t kind);
 
 // RECOVER-only OCXO observed-edge rebootstrap.  Clears stale capture and
-// deferred-dispatch custody, preserves the installed logical grid, and lets
-// VCLOCK tend the next authored one-second target into its safe arm window.
+// deferred-dispatch custody, preserves the installed logical clock zero, and
+// rebuilds a fresh wrap-proof 1 kHz target/tooth grid from the live hardware
+// coordinate.  This guarantees that a one-second boundary remains reachable
+// even when the prior 32-bit target coordinate wrapped or lost grid phase.
 // Does not touch VCLOCK, SmartZero proof state, the OCXO logical zero, or DACs.
 bool interrupt_recover_rebootstrap_ocxo_service(
     interrupt_subscriber_kind_t kind);
