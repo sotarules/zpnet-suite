@@ -2550,12 +2550,11 @@ static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
   // This is the ACTUAL core clock, not the compile-time default.
   p.add("cpu_freq_mhz", (uint32_t)(F_CPU_ACTUAL / 1000000UL));
 
-  // CPU temperature (best-effort)
-  p.add("cpu_temp_c", toFixedDecimal(cpuTempC(), 6));
-
-  // Internal reference voltage (best-effort)
-  p.add("vref_v", toFixedDecimal(readVrefVolts(), 6));
-
+  // Deliberately omit CPU temperature and internal-reference voltage from
+  // periodic SYSTEM.REPORT.  Their acquisition APIs return floating point, and
+  // this report executes on the shared foreground/exception MSP stack under
+  // frequent timing interrupts.  Reintroduce them only through a focused,
+  // explicitly isolated integer telemetry surface.
   // Heap availability
   // MULE: COMMENTED OUT for STABILITY
   //p.add("free_heap_bytes", freeHeapBytes());
@@ -2598,12 +2597,14 @@ static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
 
   // CPU work means non-spin foreground/ISR work.  True core occupancy is
   // intentionally near 100% because the idle DWT witness loop runs when idle.
-  p.add("cpu_usage_pct",
-        toFixedDecimal(cpu_work_pct_milli / 1000.0f, 6));
-  p.add("cpu_work_pct",
-        toFixedDecimal(cpu_work_pct_milli / 1000.0f, 6));
-  p.add("cpu_idle_spin_pct",
-        toFixedDecimal(cpu_idle_spin_pct_milli / 1000.0f, 6));
+  //
+  // Publish the already-computed millipercent scalars directly.  SYSTEM.REPORT
+  // must remain integer-only: no floating-point division, fixed_decimal_t
+  // structure return, temporary-reference binding, or numeric reformatting.
+  // The Pi SYSTEM process treats this Teensy payload as a transitive dictionary.
+  p.add("cpu_usage_pct_milli", cpu_work_pct_milli);
+  p.add("cpu_work_pct_milli", cpu_work_pct_milli);
+  p.add("cpu_idle_spin_pct_milli", cpu_idle_spin_pct_milli);
 
   // SpinIdle-derived CPU work diagnostics
   p.add("cpu_work_cycles", (uint32_t)cpu_window_work_cycles);

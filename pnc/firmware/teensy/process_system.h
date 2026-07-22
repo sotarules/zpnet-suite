@@ -44,11 +44,11 @@
  *   • REPORT has no control side effects
  *
  * Commands:
- *   • REPORT — return authoritative system snapshot
+ *   • REPORT — return authoritative integer-only system snapshot
  *       - firmware version
- *       - CPU temperature
- *       - CPU usage metrics
+ *       - scaled-integer CPU usage metrics
  *       - internal diagnostics
+ *       - floating-point environmental telemetry is intentionally excluded
  *   • EXECUTION_TRACE — return the bounded ISR-to-handoff-to-subscriber-to-
  *     TimePop control-flow transcript.  The live ring runs in RAM1; fault entry
  *     copies committed records into retained RAM2 before reboot.  Accepts
