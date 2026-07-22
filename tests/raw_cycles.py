@@ -1,8 +1,10 @@
 """ZPNet raw_cycles — four-rail observed one-second DWT audit.
 
-Every rail is independent.  For PPS, VCLOCK, OCXO1, and OCXO2:
+Every rail is independent.  For PPS, VCLOCK, OCXO1, and OCXO2 the report
+shows both the producer-published lineage and an independent recomputation:
 
-    residual_cycles = observed_cycles[n] - observed_cycles[n - 1]
+    computed_residual = observed_cycles[n] - observed_cycles[n - 1]
+    residual_difference = published_residual - computed_residual
 
 No FloorLine, projection, EMA, inferred endpoint, or cross-rail subtraction is
 used.  Current firmware publishes the preferred facts under
@@ -30,8 +32,20 @@ PLAUSIBLE_MAX = 1_100_000_000
 @dataclass
 class Rail:
     observed: Optional[int] = None
-    previous: Optional[int] = None
-    residual: Optional[int] = None
+
+    # Values published by the firmware producer under fragment.raw_cycles.*.
+    published_previous: Optional[int] = None
+    published_residual: Optional[int] = None
+
+    # Values recomputed independently from adjacent rows returned by this report.
+    computed_previous: Optional[int] = None
+    computed_residual: Optional[int] = None
+
+    # Producer minus report.  Zero means the published lineage agrees exactly
+    # with the adjacent rows shown by raw_cycles.py.
+    previous_difference: Optional[int] = None
+    residual_difference: Optional[int] = None
+
     valid: Optional[bool] = None
     source: str = "MISSING"
 
@@ -142,21 +156,38 @@ def collect(records: Sequence[Dict[str, Any]]) -> List[Row]:
         rails: Dict[str, Rail] = {}
         for name in RAILS:
             obj = d(raw.get(RAIL_KEYS[name]))
-            observed = first_int(obj.get("observed_cycles"), fallback_observed(frag, name))
-            explicit_previous = i(obj.get("previous_observed_cycles"))
-            prior = explicit_previous if explicit_previous is not None else previous[name]
-            explicit_residual = i(obj.get("residual_cycles"))
-            residual = (
-                explicit_residual
-                if explicit_residual is not None
-                else observed - prior
-                if observed is not None and prior is not None
+            observed = first_int(
+                obj.get("observed_cycles"),
+                fallback_observed(frag, name),
+            )
+
+            published_previous = i(obj.get("previous_observed_cycles"))
+            published_residual = i(obj.get("residual_cycles"))
+            computed_previous = previous[name]
+            computed_residual = (
+                observed - computed_previous
+                if observed is not None and computed_previous is not None
                 else None
             )
+            previous_difference = (
+                published_previous - computed_previous
+                if published_previous is not None and computed_previous is not None
+                else None
+            )
+            residual_difference = (
+                published_residual - computed_residual
+                if published_residual is not None and computed_residual is not None
+                else None
+            )
+
             rails[name] = Rail(
                 observed=observed,
-                previous=prior,
-                residual=residual,
+                published_previous=published_previous,
+                published_residual=published_residual,
+                computed_previous=computed_previous,
+                computed_residual=computed_residual,
+                previous_difference=previous_difference,
+                residual_difference=residual_difference,
                 valid=b(obj.get("valid")),
                 source="RAW_CYCLES_OBSERVED_V1" if obj else "OBSERVED_FALLBACK",
             )
@@ -189,8 +220,24 @@ def classify(row: Row, selected: Sequence[str], gate: int) -> List[str]:
             issues.append(f"{name}: implausible observed interval {rail.observed:,d}")
         if rail.valid is False:
             issues.append(f"{name}: producer marked raw-cycle sample invalid")
-        if rail.residual is not None and abs(rail.residual) > gate:
-            issues.append(f"{name}: current-minus-previous residual {rail.residual:+,d} exceeds gate")
+        if (rail.computed_residual is not None and
+                abs(rail.computed_residual) > gate):
+            issues.append(
+                f"{name}: computed current-minus-previous residual "
+                f"{rail.computed_residual:+,d} exceeds gate"
+            )
+        if (rail.previous_difference is not None and
+                rail.previous_difference != 0):
+            issues.append(
+                f"{name}: published previous differs from displayed previous by "
+                f"{rail.previous_difference:+,d} cycles"
+            )
+        if (rail.residual_difference is not None and
+                rail.residual_difference != 0):
+            issues.append(
+                f"{name}: published residual differs from computed residual by "
+                f"{rail.residual_difference:+,d} cycles"
+            )
     return issues
 
 
@@ -253,20 +300,33 @@ def main(argv: Sequence[str]) -> None:
     print(f"Campaign: {campaign}  ({len(rows):,} rows, view={clock or 'ALL'})")
     print("\nFour-rail observed one-second cycle audit")
     print("═════════════════════════════════════")
-    print("  Every residual is current observed interval minus previous observed interval for the same rail.")
+    print("  Published values come from fragment.raw_cycles; computed values use adjacent displayed rows.")
+    print("  Differences are published minus computed.  Zero proves exact agreement.")
     print("  No cross-rail residuals, FloorLine, projection, EMA, or inferred endpoints are used.")
     print(f"  Pathology gate: {gate:,d} cycles.\n")
 
     header = [f"{'pps':>7}"]
     for name in selected:
         prefix = {"PPS":"p", "VCLOCK":"v", "OCXO1":"o1", "OCXO2":"o2"}[name]
-        header += [f"{prefix + '_cyc':>13}", f"{prefix + '_res':>9}"]
+        header += [
+            f"{prefix + '_cyc':>13}",
+            f"{prefix + '_pprev':>13}",
+            f"{prefix + '_cprev':>13}",
+            f"{prefix + '_pdif':>9}",
+            f"{prefix + '_pres':>9}",
+            f"{prefix + '_cres':>9}",
+            f"{prefix + '_rdif':>9}",
+        ]
     print("  ".join(header))
     print("  ".join("─" * len(x) for x in header))
 
     pathologies = 0
     stats: Dict[str, List[int]] = {name: [] for name in selected}
     residual_stats: Dict[str, List[int]] = {name: [] for name in selected}
+    producer_residual_stats: Dict[str, List[int]] = {name: [] for name in selected}
+    previous_mismatch_counts: Dict[str, int] = {name: 0 for name in selected}
+    residual_mismatch_counts: Dict[str, int] = {name: 0 for name in selected}
+    source_counts: Dict[str, Dict[str, int]] = {name: {} for name in selected}
     for row in rows:
         if row.issues:
             pathologies += 1
@@ -275,11 +335,26 @@ def main(argv: Sequence[str]) -> None:
         fields = [fmt(row.count, 7)]
         for name in selected:
             rail = row.rails[name]
-            fields += [fmt(rail.observed, 13), fmt(rail.residual, 9, True)]
+            fields += [
+                fmt(rail.observed, 13),
+                fmt(rail.published_previous, 13),
+                fmt(rail.computed_previous, 13),
+                fmt(rail.previous_difference, 9, True),
+                fmt(rail.published_residual, 9, True),
+                fmt(rail.computed_residual, 9, True),
+                fmt(rail.residual_difference, 9, True),
+            ]
             if rail.observed is not None:
                 stats[name].append(rail.observed)
-            if rail.residual is not None:
-                residual_stats[name].append(rail.residual)
+            if rail.computed_residual is not None:
+                residual_stats[name].append(rail.computed_residual)
+            if rail.published_residual is not None:
+                producer_residual_stats[name].append(rail.published_residual)
+            if rail.previous_difference not in (None, 0):
+                previous_mismatch_counts[name] += 1
+            if rail.residual_difference not in (None, 0):
+                residual_mismatch_counts[name] += 1
+            source_counts[name][rail.source] = source_counts[name].get(rail.source, 0) + 1
         print("  ".join(fields))
         for issue in row.issues:
             print(f"    └─ {issue}")
@@ -289,11 +364,30 @@ def main(argv: Sequence[str]) -> None:
     print("═══════")
     for name in selected:
         vals = stats[name]
-        res = residual_stats[name]
+        computed = residual_stats[name]
+        published = producer_residual_stats[name]
         mean = sum(vals) / len(vals) if vals else math.nan
-        rmean = sum(res) / len(res) if res else math.nan
-        rmax = max((abs(x) for x in res), default=0)
-        print(f"  {name:<6} intervals={len(vals):>5,d} mean={mean:>15,.3f} cycles  residual_mean={rmean:>9,.3f} max_abs={rmax:>5,d}")
+        computed_mean = sum(computed) / len(computed) if computed else math.nan
+        computed_max = max((abs(x) for x in computed), default=0)
+        published_mean = sum(published) / len(published) if published else math.nan
+        published_max = max((abs(x) for x in published), default=0)
+        sources = ",".join(
+            f"{source}:{count}"
+            for source, count in sorted(source_counts[name].items())
+        ) or "none"
+        print(
+            f"  {name:<6} intervals={len(vals):>5,d} "
+            f"mean={mean:>15,.3f} cycles  "
+            f"computed_res_mean={computed_mean:>9,.3f} "
+            f"computed_max_abs={computed_max:>5,d}  "
+            f"published_res_mean={published_mean:>9,.3f} "
+            f"published_max_abs={published_max:>5,d}"
+        )
+        print(
+            f"         previous_mismatches={previous_mismatch_counts[name]:>5,d}  "
+            f"residual_mismatches={residual_mismatch_counts[name]:>5,d}  "
+            f"sources={sources}"
+        )
 
 
 if __name__ == "__main__":

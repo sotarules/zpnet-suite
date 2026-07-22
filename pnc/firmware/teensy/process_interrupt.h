@@ -2,8 +2,9 @@
 // process_interrupt.h — observed-edge custody ABI
 // ============================================================================
 // process_interrupt publishes only raw, latency-adjusted DWT-at-edge facts
-// paired with authored compare-target identities.  It contains no alternative
-// endpoint estimator or repair authority.
+// paired with authored compare-target identities.  A mechanical 1 kHz OCXO
+// cadence may exercise the compare path, but it contains no alternative endpoint
+// estimator or repair authority.
 // ============================================================================
 
 #pragma once
@@ -733,9 +734,9 @@ struct interrupt_integrity_snapshot_t {
   interrupt_integrity_qtimer_cntr_match_check_t ocxo1_qtimer_cntr;
   interrupt_integrity_qtimer_cntr_match_check_t ocxo2_qtimer_cntr;
 
-  // Raw first-instruction DWT intervals between accepted compare teeth must
-  // match the target-counter interval converted to DWT cycles.  The 1 kHz
-  // rail checks every match; the one-second rail checks boundary-to-boundary.
+  // Raw first-instruction DWT intervals between accepted compare teeth.  The
+  // 1 kHz member is reserved for a later analysis pass; the initial cadence
+  // experiment exercises every tooth but authors only the one-second rail.
   interrupt_integrity_qtimer_dwt_match_check_t vclock_qtimer_dwt;
   interrupt_integrity_qtimer_dwt_match_check_t ocxo1_qtimer_dwt;
   interrupt_integrity_qtimer_dwt_match_check_t ocxo2_qtimer_dwt;
