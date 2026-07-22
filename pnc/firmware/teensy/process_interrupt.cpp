@@ -24,9 +24,9 @@
 //     known compare target;
 //   * subscriber delivery is scheduled into foreground TimePop ASAP context.
 //
-// There is no FloorLine, EMA, predictor, inferred endpoint, repair candidate,
-// yardstick DWT authority, 1 kHz OCXO ladder, or alternative publication court
-// in this module.  Ambient counter reads are witnesses and never event truth.
+// There is no alternative endpoint estimator, repair candidate, 1 kHz OCXO
+// ladder, or alternative publication court in this module.  Ambient counter
+// reads are witnesses and never event truth.
 // ============================================================================
 
 #include "process_interrupt.h"
@@ -4065,7 +4065,6 @@ static FLASHMEM Payload cmd_report_status(const Payload&) {
   Payload payload;
   payload.add("report", "INTERRUPT_STATUS");
   payload.add("architecture", "OBSERVED_EDGE_ONLY");
-  payload.add("floorline_present", false);
   payload.add("ema_present", false);
   payload.add("yardstick_dwt_candidate_present", false);
   payload.add("ocxo_1khz_cadence_present", false);

@@ -1746,8 +1746,8 @@ struct alpha_lane_forensics_store_t {
   uint32_t dwt_synthetic_threshold_cycles = 0;
   // Final DWT-at-edge publication tribunal transcript copied from
   // process_interrupt.  These fields do not authorize or repair anything in
-  // Alpha/Beta; they preserve the court verdict beside the raw/used/FloorLine
-  // edge surfaces so TIMEBASE_FORENSICS can explain raw_cycles excursions.
+  // Alpha/Beta; they preserve the court verdict beside the observed edge surfaces
+  // so TIMEBASE_FORENSICS can explain raw_cycles excursions.
   uint32_t dwt_publication_verdict_mask = 0;
   uint32_t dwt_publication_verdict_reason_id = INTERRUPT_DWT_PUBLICATION_REASON_OK;
   uint32_t dwt_publication_watchdog_count = 0;
@@ -1759,12 +1759,9 @@ struct alpha_lane_forensics_store_t {
   uint32_t dwt_publication_expected_interval_cycles = 0;
   uint32_t dwt_publication_published_interval_cycles = 0;
   uint32_t dwt_publication_observed_interval_cycles = 0;
-  uint32_t dwt_publication_floorline_interval_cycles = 0;
   int32_t  dwt_publication_published_interval_error_cycles = 0;
   int32_t  dwt_publication_observed_interval_error_cycles = 0;
-  int32_t  dwt_publication_floorline_interval_error_cycles = 0;
   int32_t  dwt_publication_published_minus_observed_cycles = 0;
-  int32_t  dwt_publication_floorline_minus_observed_cycles = 0;
   int32_t  dwt_publication_service_offset_signed_ticks = 0;
   int64_t  dwt_publication_vclock_gnss_error_ns = 0;
 
@@ -1898,31 +1895,6 @@ struct alpha_lane_forensics_store_t {
   uint32_t spinidle_shadow_to_isr_entry_cycles = 0;
   uint32_t spinidle_shadow_valid_threshold_cycles = 0;
 
-  bool     regression_valid = false;
-  uint32_t regression_sequence = 0;
-  uint32_t regression_sample_count = 0;
-  uint32_t regression_observed_dwt_at_event = 0;
-  uint32_t regression_inferred_dwt_at_event = 0;
-  int32_t  regression_inferred_minus_observed_cycles = 0;
-  uint32_t regression_target_counter32_at_event = 0;
-  uint16_t regression_target_hardware16_at_event = 0;
-  uint16_t regression_observed_hardware16_at_event = 0;
-  uint64_t regression_slope_q16_cycles_per_sample = 0;
-  int64_t  regression_slope_delta_q16_cycles_per_sample = 0;
-  int32_t  regression_fit_error_mean_q16_cycles = 0;
-  uint32_t regression_fit_error_stddev_q16_cycles = 0;
-  int32_t  regression_fit_error_min_cycles = 0;
-  int32_t  regression_fit_error_max_cycles = 0;
-  uint32_t regression_fit_error_gt_plus4_count = 0;
-  uint32_t regression_fit_error_lt_minus4_count = 0;
-  uint32_t regression_fit_error_abs_gt4_count = 0;
-  uint32_t regression_anchor_policy_id =
-      INTERRUPT_FLOORLINE_ANCHOR_POLICY_UNKNOWN;
-  uint32_t regression_anchor_population_count = 0;
-  int32_t  regression_anchor_single_min_q16_cycles = 0;
-  int32_t  regression_anchor_second_q16_cycles = 0;
-  int32_t  regression_anchor_selected_q16_cycles = 0;
-  int32_t  regression_anchor_selected_minus_single_min_q16_cycles = 0;
 };
 
 static alpha_lane_forensics_store_t g_vclock_forensics DMAMEM = {};
@@ -6044,12 +6016,9 @@ static void alpha_forensics_reset_store(alpha_lane_forensics_store_t& s) {
   s.dwt_publication_expected_interval_cycles = 0;
   s.dwt_publication_published_interval_cycles = 0;
   s.dwt_publication_observed_interval_cycles = 0;
-  s.dwt_publication_floorline_interval_cycles = 0;
   s.dwt_publication_published_interval_error_cycles = 0;
   s.dwt_publication_observed_interval_error_cycles = 0;
-  s.dwt_publication_floorline_interval_error_cycles = 0;
   s.dwt_publication_published_minus_observed_cycles = 0;
-  s.dwt_publication_floorline_minus_observed_cycles = 0;
   s.dwt_publication_service_offset_signed_ticks = 0;
   s.dwt_publication_vclock_gnss_error_ns = 0;
   s.dwt_interval_gate_valid = false;
@@ -6168,31 +6137,6 @@ static void alpha_forensics_reset_store(alpha_lane_forensics_store_t& s) {
   s.spinidle_shadow_dwt = 0;
   s.spinidle_shadow_to_isr_entry_cycles = 0;
   s.spinidle_shadow_valid_threshold_cycles = 0;
-  s.regression_valid = false;
-  s.regression_sequence = 0;
-  s.regression_sample_count = 0;
-  s.regression_observed_dwt_at_event = 0;
-  s.regression_inferred_dwt_at_event = 0;
-  s.regression_inferred_minus_observed_cycles = 0;
-  s.regression_target_counter32_at_event = 0;
-  s.regression_target_hardware16_at_event = 0;
-  s.regression_observed_hardware16_at_event = 0;
-  s.regression_slope_q16_cycles_per_sample = 0;
-  s.regression_slope_delta_q16_cycles_per_sample = 0;
-  s.regression_fit_error_mean_q16_cycles = 0;
-  s.regression_fit_error_stddev_q16_cycles = 0;
-  s.regression_fit_error_min_cycles = 0;
-  s.regression_fit_error_max_cycles = 0;
-  s.regression_fit_error_gt_plus4_count = 0;
-  s.regression_fit_error_lt_minus4_count = 0;
-  s.regression_fit_error_abs_gt4_count = 0;
-  s.regression_anchor_policy_id =
-      INTERRUPT_FLOORLINE_ANCHOR_POLICY_UNKNOWN;
-  s.regression_anchor_population_count = 0;
-  s.regression_anchor_single_min_q16_cycles = 0;
-  s.regression_anchor_second_q16_cycles = 0;
-  s.regression_anchor_selected_q16_cycles = 0;
-  s.regression_anchor_selected_minus_single_min_q16_cycles = 0;
 
   clocks_alpha_dmb();
   s.seq++;
@@ -6347,18 +6291,12 @@ static void alpha_forensics_publish(time_clock_id_t clock_id,
         diag->dwt_publication_published_interval_cycles;
     s->dwt_publication_observed_interval_cycles =
         diag->dwt_publication_observed_interval_cycles;
-    s->dwt_publication_floorline_interval_cycles =
-        diag->dwt_publication_floorline_interval_cycles;
     s->dwt_publication_published_interval_error_cycles =
         diag->dwt_publication_published_interval_error_cycles;
     s->dwt_publication_observed_interval_error_cycles =
         diag->dwt_publication_observed_interval_error_cycles;
-    s->dwt_publication_floorline_interval_error_cycles =
-        diag->dwt_publication_floorline_interval_error_cycles;
     s->dwt_publication_published_minus_observed_cycles =
         diag->dwt_publication_published_minus_observed_cycles;
-    s->dwt_publication_floorline_minus_observed_cycles =
-        diag->dwt_publication_floorline_minus_observed_cycles;
     s->dwt_publication_service_offset_signed_ticks =
         diag->dwt_publication_service_offset_signed_ticks;
     s->dwt_publication_vclock_gnss_error_ns =
@@ -6491,50 +6429,6 @@ static void alpha_forensics_publish(time_clock_id_t clock_id,
     s->spinidle_shadow_valid_threshold_cycles =
         diag->spinidle_shadow_valid_threshold_cycles;
 
-    s->regression_valid = diag->regression_valid;
-    s->regression_sequence = diag->regression_sequence;
-    s->regression_sample_count = diag->regression_sample_count;
-    s->regression_observed_dwt_at_event =
-        diag->regression_observed_dwt_at_event;
-    s->regression_inferred_dwt_at_event =
-        diag->regression_inferred_dwt_at_event;
-    s->regression_inferred_minus_observed_cycles =
-        diag->regression_inferred_minus_observed_cycles;
-    s->regression_target_counter32_at_event =
-        diag->regression_target_counter32_at_event;
-    s->regression_target_hardware16_at_event =
-        diag->regression_target_hardware16_at_event;
-    s->regression_observed_hardware16_at_event =
-        diag->regression_observed_hardware16_at_event;
-    s->regression_slope_q16_cycles_per_sample =
-        diag->regression_slope_q16_cycles_per_sample;
-    s->regression_slope_delta_q16_cycles_per_sample =
-        diag->regression_slope_delta_q16_cycles_per_sample;
-    s->regression_fit_error_mean_q16_cycles =
-        diag->regression_fit_error_mean_q16_cycles;
-    s->regression_fit_error_stddev_q16_cycles =
-        diag->regression_fit_error_stddev_q16_cycles;
-    s->regression_fit_error_min_cycles =
-        diag->regression_fit_error_min_cycles;
-    s->regression_fit_error_max_cycles =
-        diag->regression_fit_error_max_cycles;
-    s->regression_fit_error_gt_plus4_count =
-        diag->regression_fit_error_gt_plus4_count;
-    s->regression_fit_error_lt_minus4_count =
-        diag->regression_fit_error_lt_minus4_count;
-    s->regression_fit_error_abs_gt4_count =
-        diag->regression_fit_error_abs_gt4_count;
-    s->regression_anchor_policy_id = diag->regression_anchor_policy_id;
-    s->regression_anchor_population_count =
-        diag->regression_anchor_population_count;
-    s->regression_anchor_single_min_q16_cycles =
-        diag->regression_anchor_single_min_q16_cycles;
-    s->regression_anchor_second_q16_cycles =
-        diag->regression_anchor_second_q16_cycles;
-    s->regression_anchor_selected_q16_cycles =
-        diag->regression_anchor_selected_q16_cycles;
-    s->regression_anchor_selected_minus_single_min_q16_cycles =
-        diag->regression_anchor_selected_minus_single_min_q16_cycles;
   } else {
     s->dwt_synthetic = false;
     s->dwt_repair_candidate = false;
@@ -6559,12 +6453,9 @@ static void alpha_forensics_publish(time_clock_id_t clock_id,
     s->dwt_publication_expected_interval_cycles = 0;
     s->dwt_publication_published_interval_cycles = 0;
     s->dwt_publication_observed_interval_cycles = 0;
-    s->dwt_publication_floorline_interval_cycles = 0;
     s->dwt_publication_published_interval_error_cycles = 0;
     s->dwt_publication_observed_interval_error_cycles = 0;
-    s->dwt_publication_floorline_interval_error_cycles = 0;
     s->dwt_publication_published_minus_observed_cycles = 0;
-    s->dwt_publication_floorline_minus_observed_cycles = 0;
     s->dwt_publication_service_offset_signed_ticks = 0;
     s->dwt_publication_vclock_gnss_error_ns = 0;
     s->dwt_interval_gate_valid = false;
@@ -6679,31 +6570,6 @@ static void alpha_forensics_publish(time_clock_id_t clock_id,
     s->spinidle_shadow_dwt = 0;
     s->spinidle_shadow_to_isr_entry_cycles = 0;
     s->spinidle_shadow_valid_threshold_cycles = 0;
-    s->regression_valid = false;
-    s->regression_sequence = 0;
-    s->regression_sample_count = 0;
-    s->regression_observed_dwt_at_event = 0;
-    s->regression_inferred_dwt_at_event = 0;
-    s->regression_inferred_minus_observed_cycles = 0;
-    s->regression_target_counter32_at_event = 0;
-    s->regression_target_hardware16_at_event = 0;
-    s->regression_observed_hardware16_at_event = 0;
-    s->regression_slope_q16_cycles_per_sample = 0;
-    s->regression_slope_delta_q16_cycles_per_sample = 0;
-    s->regression_fit_error_mean_q16_cycles = 0;
-    s->regression_fit_error_stddev_q16_cycles = 0;
-    s->regression_fit_error_min_cycles = 0;
-    s->regression_fit_error_max_cycles = 0;
-    s->regression_fit_error_gt_plus4_count = 0;
-    s->regression_fit_error_lt_minus4_count = 0;
-    s->regression_fit_error_abs_gt4_count = 0;
-    s->regression_anchor_policy_id =
-        INTERRUPT_FLOORLINE_ANCHOR_POLICY_UNKNOWN;
-    s->regression_anchor_population_count = 0;
-    s->regression_anchor_single_min_q16_cycles = 0;
-    s->regression_anchor_second_q16_cycles = 0;
-    s->regression_anchor_selected_q16_cycles = 0;
-    s->regression_anchor_selected_minus_single_min_q16_cycles = 0;
   }
 
   clocks_alpha_dmb();
@@ -6799,18 +6665,12 @@ bool clocks_alpha_lane_forensics(time_clock_id_t clock,
         s->dwt_publication_published_interval_cycles;
     out->dwt_publication_observed_interval_cycles =
         s->dwt_publication_observed_interval_cycles;
-    out->dwt_publication_floorline_interval_cycles =
-        s->dwt_publication_floorline_interval_cycles;
     out->dwt_publication_published_interval_error_cycles =
         s->dwt_publication_published_interval_error_cycles;
     out->dwt_publication_observed_interval_error_cycles =
         s->dwt_publication_observed_interval_error_cycles;
-    out->dwt_publication_floorline_interval_error_cycles =
-        s->dwt_publication_floorline_interval_error_cycles;
     out->dwt_publication_published_minus_observed_cycles =
         s->dwt_publication_published_minus_observed_cycles;
-    out->dwt_publication_floorline_minus_observed_cycles =
-        s->dwt_publication_floorline_minus_observed_cycles;
     out->dwt_publication_service_offset_signed_ticks =
         s->dwt_publication_service_offset_signed_ticks;
     out->dwt_publication_vclock_gnss_error_ns =
@@ -6943,50 +6803,6 @@ bool clocks_alpha_lane_forensics(time_clock_id_t clock,
         s->spinidle_shadow_to_isr_entry_cycles;
     out->spinidle_shadow_valid_threshold_cycles =
         s->spinidle_shadow_valid_threshold_cycles;
-    out->regression_valid = s->regression_valid;
-    out->regression_sequence = s->regression_sequence;
-    out->regression_sample_count = s->regression_sample_count;
-    out->regression_observed_dwt_at_event =
-        s->regression_observed_dwt_at_event;
-    out->regression_inferred_dwt_at_event =
-        s->regression_inferred_dwt_at_event;
-    out->regression_inferred_minus_observed_cycles =
-        s->regression_inferred_minus_observed_cycles;
-    out->regression_target_counter32_at_event =
-        s->regression_target_counter32_at_event;
-    out->regression_target_hardware16_at_event =
-        s->regression_target_hardware16_at_event;
-    out->regression_observed_hardware16_at_event =
-        s->regression_observed_hardware16_at_event;
-    out->regression_slope_q16_cycles_per_sample =
-        s->regression_slope_q16_cycles_per_sample;
-    out->regression_slope_delta_q16_cycles_per_sample =
-        s->regression_slope_delta_q16_cycles_per_sample;
-    out->regression_fit_error_mean_q16_cycles =
-        s->regression_fit_error_mean_q16_cycles;
-    out->regression_fit_error_stddev_q16_cycles =
-        s->regression_fit_error_stddev_q16_cycles;
-    out->regression_fit_error_min_cycles =
-        s->regression_fit_error_min_cycles;
-    out->regression_fit_error_max_cycles =
-        s->regression_fit_error_max_cycles;
-    out->regression_fit_error_gt_plus4_count =
-        s->regression_fit_error_gt_plus4_count;
-    out->regression_fit_error_lt_minus4_count =
-        s->regression_fit_error_lt_minus4_count;
-    out->regression_fit_error_abs_gt4_count =
-        s->regression_fit_error_abs_gt4_count;
-    out->regression_anchor_policy_id = s->regression_anchor_policy_id;
-    out->regression_anchor_population_count =
-        s->regression_anchor_population_count;
-    out->regression_anchor_single_min_q16_cycles =
-        s->regression_anchor_single_min_q16_cycles;
-    out->regression_anchor_second_q16_cycles =
-        s->regression_anchor_second_q16_cycles;
-    out->regression_anchor_selected_q16_cycles =
-        s->regression_anchor_selected_q16_cycles;
-    out->regression_anchor_selected_minus_single_min_q16_cycles =
-        s->regression_anchor_selected_minus_single_min_q16_cycles;
 
     clocks_alpha_dmb();
     const uint32_t seq2 = s->seq;
@@ -7384,15 +7200,13 @@ uint32_t clocks_alpha_recover_reprime_count(void) {
   return g_alpha_recover_reprime_count;
 }
 
-static bool alpha_recover_floorline_forensics_ready(
+static bool alpha_recover_observed_forensics_ready(
     const alpha_lane_forensics_store_t* f) {
   return f &&
          f->valid &&
          f->update_count != 0U &&
          f->dwt_used_at_event != 0U &&
-         f->regression_inferred_dwt_at_event != 0U &&
-         f->regression_observed_dwt_at_event != 0U &&
-         f->regression_sample_count != 0U;
+         f->dwt_original_at_event != 0U;
 }
 
 bool clocks_alpha_ocxo_recover_reattach_snapshot(
@@ -7416,11 +7230,7 @@ bool clocks_alpha_ocxo_recover_reattach_snapshot(
   r.forensics_last_event_dwt = f ? f->last_event_dwt : 0U;
   r.forensics_last_event_counter32 = f ? f->last_event_counter32 : 0U;
   r.forensics_dwt_used_at_event = f ? f->dwt_used_at_event : 0U;
-  r.forensics_floorline_dwt_at_event =
-      f ? f->regression_inferred_dwt_at_event : 0U;
-  r.forensics_floorline_sample_count =
-      f ? f->regression_sample_count : 0U;
-  r.forensics_ready = alpha_recover_floorline_forensics_ready(f);
+  r.forensics_ready = alpha_recover_observed_forensics_ready(f);
 
   const alpha_ocxo_edge_history_t* h = alpha_ocxo_edge_history(clock);
   r.edge_history_current_valid = h && h->current_valid;

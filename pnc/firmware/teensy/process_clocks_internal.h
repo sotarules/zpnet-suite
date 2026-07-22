@@ -231,7 +231,7 @@ uint64_t clocks_dwt_cycles_at_dwt(uint32_t dwt32);
 // suffix resolved by the first observed OCXO one-second edge after that PPS.
 // Alpha does not release the row to Beta until both lanes resolve the same PPS
 // sequence.  Delta Cycles remains the independent observed-edge frequency
-// candidate; bridge, FloorLine, EMA, and yardstick surfaces are forensic only.
+// candidate; bridge and static projection surfaces remain forensic only.
 
 enum class clocks_ocxo_public_ns_authority_t : uint8_t {
   TRADITIONAL_PPS_PROJECTION = 0,
@@ -769,8 +769,8 @@ struct clocks_alpha_lane_forensics_t {
   uint32_t dwt_synthetic_threshold_cycles;
   // Final DWT-at-edge publication tribunal transcript copied from
   // process_interrupt.  These fields do not authorize or repair anything in
-  // Alpha/Beta; they preserve the court verdict beside the raw/used/FloorLine
-  // edge surfaces so TIMEBASE_FORENSICS can explain raw_cycles excursions.
+  // Alpha/Beta; they preserve the court verdict beside the observed edge surfaces
+  // so TIMEBASE_FORENSICS can explain raw_cycles excursions.
   uint32_t dwt_publication_verdict_mask;
   uint32_t dwt_publication_verdict_reason_id;
   uint32_t dwt_publication_watchdog_count;
@@ -782,12 +782,9 @@ struct clocks_alpha_lane_forensics_t {
   uint32_t dwt_publication_expected_interval_cycles;
   uint32_t dwt_publication_published_interval_cycles;
   uint32_t dwt_publication_observed_interval_cycles;
-  uint32_t dwt_publication_floorline_interval_cycles;
   int32_t  dwt_publication_published_interval_error_cycles;
   int32_t  dwt_publication_observed_interval_error_cycles;
-  int32_t  dwt_publication_floorline_interval_error_cycles;
   int32_t  dwt_publication_published_minus_observed_cycles;
-  int32_t  dwt_publication_floorline_minus_observed_cycles;
   int32_t  dwt_publication_service_offset_signed_ticks;
   int64_t  dwt_publication_vclock_gnss_error_ns;
 
@@ -933,32 +930,6 @@ struct clocks_alpha_lane_forensics_t {
   uint32_t spinidle_shadow_to_isr_entry_cycles;
   uint32_t spinidle_shadow_valid_threshold_cycles;
 
-  bool     regression_valid;
-  uint32_t regression_sequence;
-  uint32_t regression_sample_count;
-  uint32_t regression_observed_dwt_at_event;
-  uint32_t regression_inferred_dwt_at_event;
-  int32_t  regression_inferred_minus_observed_cycles;
-  uint32_t regression_target_counter32_at_event;
-  uint16_t regression_target_hardware16_at_event;
-  uint16_t regression_observed_hardware16_at_event;
-  uint64_t regression_slope_q16_cycles_per_sample;
-  int64_t  regression_slope_delta_q16_cycles_per_sample;
-  int32_t  regression_fit_error_mean_q16_cycles;
-  uint32_t regression_fit_error_stddev_q16_cycles;
-  int32_t  regression_fit_error_min_cycles;
-  int32_t  regression_fit_error_max_cycles;
-  uint32_t regression_fit_error_gt_plus4_count;
-  uint32_t regression_fit_error_lt_minus4_count;
-  uint32_t regression_fit_error_abs_gt4_count;
-
-  // Compact robust-anchor transcript copied from process_interrupt.
-  uint32_t regression_anchor_policy_id;
-  uint32_t regression_anchor_population_count;
-  int32_t  regression_anchor_single_min_q16_cycles;
-  int32_t  regression_anchor_second_q16_cycles;
-  int32_t  regression_anchor_selected_q16_cycles;
-  int32_t  regression_anchor_selected_minus_single_min_q16_cycles;
 };
 
 bool clocks_alpha_lane_forensics(time_clock_id_t clock,
@@ -971,7 +942,7 @@ bool clocks_alpha_lane_forensics(time_clock_id_t clock,
 // Durable per-PPS proof of the selected PPS/VCLOCK DWT coordinate.  This is
 // the permanent TIMEBASE_FORENSICS collateral for the foundational edge
 // authority claim: the physical PPS witness, the VCLOCK observed edge, the
-// predictor/lower-envelope candidate, the chosen coordinate, the agreement
+// phase-derived candidate, the chosen coordinate, the agreement
 // gate, and the tautological GNSS self-map check.
 
 struct clocks_pps_vclock_edge_forensics_t {
@@ -1260,8 +1231,6 @@ struct clocks_alpha_recover_reattach_snapshot_t {
   uint32_t forensics_last_event_dwt = 0;
   uint32_t forensics_last_event_counter32 = 0;
   uint32_t forensics_dwt_used_at_event = 0;
-  uint32_t forensics_floorline_dwt_at_event = 0;
-  uint32_t forensics_floorline_sample_count = 0;
 
   bool     edge_history_ready = false;
   bool     edge_history_current_valid = false;

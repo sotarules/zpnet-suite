@@ -1,15 +1,9 @@
 // ============================================================================
 // process_interrupt.h — observed-edge custody ABI
 // ============================================================================
-// process_interrupt publishes only raw/latency-adjusted observed DWT-at-edge
-// facts paired with authored compare-target identities.  FloorLine, EMA,
-// predictor, inferred-endpoint, repair-candidate, and 1 kHz OCXO cadence
-// producers do not exist in process_interrupt.cpp.
-//
-// A small set of historical diagnostic fields remains in the public structure
-// layout so current CLOCKS/TIMEBASE consumers continue to compile during this
-// architectural cut.  Those fields are compatibility storage only: the
-// observed-only implementation leaves every alternative-estimator field zero.
+// process_interrupt publishes only raw, latency-adjusted DWT-at-edge facts
+// paired with authored compare-target identities.  It contains no alternative
+// endpoint estimator or repair authority.
 // ============================================================================
 
 #pragma once
@@ -63,9 +57,6 @@ enum class interrupt_event_status_t : uint8_t {
 static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_VERDICT_OK = 0U;
 static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_VERDICT_ZERO_DWT = 1u << 0;
 static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_VERDICT_SOURCE_MISMATCH = 1u << 1;
-static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_VERDICT_FLOORLINE_EDGE = 1u << 2;
-static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_VERDICT_FLOORLINE_INTERVAL = 1u << 3;
-static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_VERDICT_FLOORLINE_LATE = 1u << 4;
 static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_VERDICT_COUNTER_LOW16 = 1u << 5;
 static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_VERDICT_SERVICE_OFFSET = 1u << 6;
 static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_VERDICT_COUNTER_DELTA = 1u << 7;
@@ -84,9 +75,6 @@ static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_VERDICT_RULER_UNQUALIFIED = 
 static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_REASON_OK = 0U;
 static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_REASON_ZERO_DWT = 1U;
 static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_REASON_SOURCE_MISMATCH = 2U;
-static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_REASON_FLOORLINE_EDGE = 3U;
-static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_REASON_FLOORLINE_INTERVAL = 4U;
-static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_REASON_FLOORLINE_LATE = 5U;
 static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_REASON_COUNTER_LOW16 = 6U;
 static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_REASON_SERVICE_OFFSET = 7U;
 static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_REASON_COUNTER_DELTA = 8U;
@@ -105,11 +93,6 @@ static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_REASON_STARTUP_RELAXED_DIAGN
 static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_REASON_SIDE_RAIL_DIAGNOSTIC = 21U;
 static constexpr uint32_t INTERRUPT_DWT_PUBLICATION_REASON_UNKNOWN = 22U;
 
-// Historical FloorLine IDs retained only to preserve the current diagnostic
-// structure layout.  process_interrupt never authors a FloorLine policy.
-static constexpr uint32_t INTERRUPT_FLOORLINE_ANCHOR_POLICY_UNKNOWN = 0U;
-static constexpr uint32_t INTERRUPT_FLOORLINE_ANCHOR_POLICY_SINGLE_MIN = 1U;
-static constexpr uint32_t INTERRUPT_FLOORLINE_ANCHOR_POLICY_MEDIAN8 = 2U;
 
 static inline uint32_t interrupt_dwt_publication_reason_id_from_verdict_mask(
     uint32_t verdict_mask) {
@@ -121,15 +104,6 @@ static inline uint32_t interrupt_dwt_publication_reason_id_from_verdict_mask(
   }
   if (verdict_mask & INTERRUPT_DWT_PUBLICATION_VERDICT_SOURCE_MISMATCH) {
     return INTERRUPT_DWT_PUBLICATION_REASON_SOURCE_MISMATCH;
-  }
-  if (verdict_mask & INTERRUPT_DWT_PUBLICATION_VERDICT_FLOORLINE_EDGE) {
-    return INTERRUPT_DWT_PUBLICATION_REASON_FLOORLINE_EDGE;
-  }
-  if (verdict_mask & INTERRUPT_DWT_PUBLICATION_VERDICT_FLOORLINE_INTERVAL) {
-    return INTERRUPT_DWT_PUBLICATION_REASON_FLOORLINE_INTERVAL;
-  }
-  if (verdict_mask & INTERRUPT_DWT_PUBLICATION_VERDICT_FLOORLINE_LATE) {
-    return INTERRUPT_DWT_PUBLICATION_REASON_FLOORLINE_LATE;
   }
   if (verdict_mask & INTERRUPT_DWT_PUBLICATION_VERDICT_COUNTER_LOW16) {
     return INTERRUPT_DWT_PUBLICATION_REASON_COUNTER_LOW16;
@@ -173,12 +147,6 @@ static inline const char* interrupt_dwt_publication_reason_name(
       return "zero_dwt";
     case INTERRUPT_DWT_PUBLICATION_REASON_SOURCE_MISMATCH:
       return "source_mismatch";
-    case INTERRUPT_DWT_PUBLICATION_REASON_FLOORLINE_EDGE:
-      return "floorline_edge";
-    case INTERRUPT_DWT_PUBLICATION_REASON_FLOORLINE_INTERVAL:
-      return "floorline_interval";
-    case INTERRUPT_DWT_PUBLICATION_REASON_FLOORLINE_LATE:
-      return "floorline_late";
     case INTERRUPT_DWT_PUBLICATION_REASON_COUNTER_LOW16:
       return "counter_low16";
     case INTERRUPT_DWT_PUBLICATION_REASON_SERVICE_OFFSET:
@@ -284,12 +252,9 @@ struct interrupt_capture_diag_t {
   uint32_t dwt_publication_expected_interval_cycles = 0;
   uint32_t dwt_publication_published_interval_cycles = 0;
   uint32_t dwt_publication_observed_interval_cycles = 0;
-  uint32_t dwt_publication_floorline_interval_cycles = 0;
   int32_t  dwt_publication_published_interval_error_cycles = 0;
   int32_t  dwt_publication_observed_interval_error_cycles = 0;
-  int32_t  dwt_publication_floorline_interval_error_cycles = 0;
   int32_t  dwt_publication_published_minus_observed_cycles = 0;
-  int32_t  dwt_publication_floorline_minus_observed_cycles = 0;
   int32_t  dwt_publication_service_offset_signed_ticks = 0;
   int64_t  dwt_publication_vclock_gnss_error_ns = 0;
 
@@ -340,37 +305,6 @@ struct interrupt_capture_diag_t {
   int32_t  dwt_yardstick_auth_error_cycles = 0;
   bool     dwt_yardstick_auth_anchor_applied = false;
 
-  // Retained ABI padding for former FloorLine diagnostics.  The observed-only
-  // implementation leaves this complete block zero.
-  bool     regression_valid = false;
-  uint32_t regression_sequence = 0;
-  uint32_t regression_sample_count = 0;
-  uint32_t regression_observed_dwt_at_event = 0;
-  uint32_t regression_inferred_dwt_at_event = 0;
-  int32_t  regression_inferred_minus_observed_cycles = 0;
-  uint32_t regression_target_counter32_at_event = 0;
-  uint16_t regression_target_hardware16_at_event = 0;
-  uint16_t regression_observed_hardware16_at_event = 0;
-  uint64_t regression_slope_q16_cycles_per_sample = 0;
-  int64_t  regression_slope_delta_q16_cycles_per_sample = 0;
-  int32_t  regression_fit_error_mean_q16_cycles = 0;
-  uint32_t regression_fit_error_stddev_q16_cycles = 0;
-  int32_t  regression_fit_error_min_cycles = 0;
-  int32_t  regression_fit_error_max_cycles = 0;
-  uint32_t regression_fit_error_gt_plus4_count = 0;
-  uint32_t regression_fit_error_lt_minus4_count = 0;
-  uint32_t regression_fit_error_abs_gt4_count = 0;
-
-  // Compact FloorLine anchor transcript.  Q16 fields let TIMEBASE/raw_floorline
-  // distinguish an isolated single minimum from the selected robust lower
-  // population without restoring the crash-prone rich per-row payload.
-  uint32_t regression_anchor_policy_id =
-      INTERRUPT_FLOORLINE_ANCHOR_POLICY_UNKNOWN;
-  uint32_t regression_anchor_population_count = 0;
-  int32_t  regression_anchor_single_min_q16_cycles = 0;
-  int32_t  regression_anchor_second_q16_cycles = 0;
-  int32_t  regression_anchor_selected_q16_cycles = 0;
-  int32_t  regression_anchor_selected_minus_single_min_q16_cycles = 0;
 
   uint32_t anchor_sequence_used = 0;
   uint32_t anchor_age_slots = 0;
@@ -857,8 +791,8 @@ struct pps_vclock_t {
 // PPS/VCLOCK edge authority courtroom.  process_interrupt publishes the
 // selected VCLOCK edge's observed QTimer DWT coordinate so VCLOCK and OCXO
 // subscriber intervals share one measured-edge species. The physical PPS GPIO
-// edge plus learned PPS->VCLOCK lower-phase estimate, along with legacy
-// predictor/FloorLine surfaces, remain diagnostic witnesses.
+// edge plus the learned PPS->VCLOCK lower-phase estimate remain diagnostic
+// witnesses.
 static constexpr uint32_t PPS_VCLOCK_EDGE_DECISION_NONE = 0;
 static constexpr uint32_t PPS_VCLOCK_EDGE_DECISION_LOWER_LAWFUL = 1;
 static constexpr uint32_t PPS_VCLOCK_EDGE_DECISION_PREDICTION_FALLBACK = 2;
@@ -1020,7 +954,7 @@ bool interrupt_subscribe(const interrupt_subscription_t& sub);
 bool interrupt_start(interrupt_subscriber_kind_t kind);
 
 // Idempotent recovery service assertion.  Unlike interrupt_start(), this leaves
-// healthy subscriber, VCLOCK-anchor, cadence-regression, and DWT-publication
+// healthy subscriber, VCLOCK-anchor, observed cadence, and publication
 // custody untouched.  It performs a narrow restart only when the requested
 // runtime or lane-local cadence is actually inactive.
 bool interrupt_ensure_service(interrupt_subscriber_kind_t kind);

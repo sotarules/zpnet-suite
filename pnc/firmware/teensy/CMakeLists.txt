@@ -60,7 +60,6 @@ set(ADC_LIB "$ENV{HOME}/Arduino/libraries/ADC")
 set(ZPNET_SOURCES
     bootloader.cpp
     build_fingerprint.cpp
-    cpu_usage.cpp
     debug.cpp
     memory_info.cpp
     payload.cpp
@@ -90,10 +89,10 @@ set(ZPNET_SOURCES
 set(ZPNET_HEADERS
     bootloader.h
     config.h
-    cpu_usage.h
     debug.h
     events.h
-    memory_info.h    payload.h
+    memory_info.h
+    payload.h
     process.h
     process_clocks.h
     process_clocks_internal.h
