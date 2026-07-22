@@ -15,10 +15,10 @@
 //     When recurring=true, the first fire is snapped to the next
 //     PPS/VCLOCK phase-grid boundary implied by delay_gnss_ns; subsequent
 //     fires remain on that grid.
-//   • safe ASAP dispatch         — timepop_arm_asap(...)
-//     Fixed deferred lane, not a timed slot; ISR-safe and drained before slots.
-//   • safe ALAP dispatch         — timepop_arm_alap(...)
-//     Fixed deferred lane, not a timed slot; ISR-safe and drained after slots.
+//   • ASAP dispatch              — timepop_arm_asap(...)
+//     Fixed foreground deferred lane, not a timed slot; drained before slots.
+//   • ALAP dispatch              — timepop_arm_alap(...)
+//     Fixed foreground deferred lane, not a timed slot; drained after slots.
 //   • absolute scheduling        — timepop_arm_at(target_gnss_ns, ...)
 //   • anchor-relative scheduling — timepop_arm_from_anchor(anchor_gnss_ns, offset_gnss_ns, ...)
 //   • caller-owned exact path    — timepop_arm_ns(target_gnss_ns, target_dwt, ...)
@@ -26,9 +26,9 @@
 //     multiple timed slots share one captured CH2 fire fact. ASAP/ALAP are
 //     fixed deferred lanes and intentionally do not participate.
 //   • critical scheduler recurring — timepop_arm_recurring_isr(period_ns, ...)
-//     The callback and recurring rearm happen inside the CH2 scheduler pass
-//     before schedule_next() selects the next compare.  Use only for tiny substrate
-//    maintenance callbacks that TimePop itself depends on for safe scheduling.
+//     The legacy API name is retained, but callback and recurring rearm now run
+//     in the foreground CH2 scheduler pass before schedule_next() selects the
+//     next compare.  Use only for tiny substrate maintenance callbacks.
 //   • counter-base anchored ISR recurring
 //      timepop_arm_recurring_isr_from_base_counter32(base_gnss_ns,
 //                                                    base_counter32,
@@ -62,9 +62,10 @@
 //
 // Dispatch timing:
 //
-//   process_interrupt owns QTimer1 hardware and invokes TimePop's CH2 handler
-//   from its priority-handoff context with a normalized DWT capture and synthetic VCLOCK
-//   counter32 event identity.  TimePop uses that event fact to expire slots.
+//   process_interrupt owns QTimer1 hardware.  Priority 16 transfers a normalized
+//   CH2 fire fact into a process_interrupt-owned foreground mailbox; the ordinary
+//   loop then invokes TimePop with that immutable counter/DWT event identity.
+//   TimePop uses the foreground-delivered event fact to expire slots.
 //   It does not reinterpret PPS/VCLOCK phase and it does not read timer
 //   hardware directly.
 //
@@ -135,12 +136,11 @@ static constexpr const char* WITNESS_SCHEDULER_NAME = "WITNESS_SCHEDULER";
 
 // CH2 scheduler custody.
 //
-// process_interrupt now owns the priority handoff tier.  By the time
-// process_interrupt invokes TimePop's registered CH2 handler, the priority-0
-// hardware capture has already escaped into process_interrupt's priority-16
-// handoff context.  TimePop therefore processes CH2 event facts directly; it
-// does not own a private scheduler IRQ or second CH2 queue.
-static constexpr const char* TIMEPOP_CH2_SERVICE_CONTEXT = "PROCESS_INTERRUPT_HANDOFF_DIRECT";
+// process_interrupt owns both interrupt tiers and the immutable CH2 foreground
+// ring.  TimePop scheduler policy is entered only from the ordinary loop after
+// the event has escaped all handler context.
+static constexpr const char* TIMEPOP_CH2_SERVICE_CONTEXT =
+    "PROCESS_INTERRUPT_FOREGROUND_FACT";
 
 // Every accepted TimePop name is copied into fixed TimePop-owned storage.
 // Empty / null names remain unnamed.  Names longer than MAX_TIMEPOP_NAME are
@@ -327,12 +327,12 @@ struct timepop_slot_t {
 
 
 struct deferred_slot_t {
-  // Dedicated non-timed deferred lane.
+  // Dedicated non-timed foreground deferred lane.
   //
   // ASAP/ALAP callbacks are not TimePop scheduled slots and never own a
-  // VCLOCK deadline.  They may be armed from ISR context: arming only writes
-  // this fixed mailbox under PRIMASK and sets timepop_pending.  It does not
-  // scan/mutate/reorder the timed slot table and it never calls schedule_next().
+  // VCLOCK deadline.  Under the execution-class doctrine they are armed and
+  // dispatched only in foreground.  The fixed mailbox remains allocation-free
+  // and does not scan/mutate/reorder the timed slot table.
   //
   // pending     — a callback is waiting for scheduled-context dispatch.
   // dispatching — this entry's callback is currently running in foreground.
@@ -364,8 +364,8 @@ struct deferred_slot_t {
 // allocation-free mutation queue and applied at explicit dispatch barriers
 // immediately after the current callback returns.
 //
-// Deferred ASAP/ALAP arming remains immediate because those lanes are fixed
-// mailboxes, not timed slots, and do not call schedule_next().
+// Deferred ASAP/ALAP arming remains immediate in foreground because those lanes
+// are fixed mailboxes, not timed slots, and do not call schedule_next().
 
 enum class timepop_dispatch_phase_t : uint8_t {
   IDLE = 0,
@@ -939,6 +939,10 @@ static volatile uint32_t diag_ch2_direct_body_cycles_last = 0;
 static volatile uint32_t diag_ch2_direct_body_cycles_max = 0;
 static volatile uint32_t diag_ch2_direct_last_event_counter32 = 0;
 static volatile uint32_t diag_ch2_direct_last_event_dwt = 0;
+static volatile uint32_t diag_ch2_handler_reject_count = 0;
+static volatile uint32_t diag_ch2_handler_last_ipsr = 0;
+static volatile uint32_t diag_ch2_reentry_reject_count = 0;
+static volatile uint32_t diag_ch2_capture_loss_recover_count = 0;
 
 
 // Normal precision fires should be authored by IRQ_CH2.  If schedule_next()
@@ -1644,7 +1648,7 @@ static void timepop_idle_witness_spin_until_pending(void) {
     // interrupt already happened before the read, pending is true and we do
     // not overwrite the last pre-interrupt shadow with a post-interrupt value.
     const uint32_t dwt = ARM_DWT_CYCCNT;
-    if (timepop_pending) {
+    if (timepop_pending || process_interrupt_foreground_pending()) {
       const uint32_t residency = dwt - enter_dwt;
       timepop_idle_witness_note_wall_cycles(dwt);
       diag_idle_witness_pending_exit_count++;
@@ -3003,7 +3007,7 @@ static void schedule_next(void) {
 }
 
 // ============================================================================
-// ISR helpers
+// Captured-fire helpers (legacy ISR field names retained in diagnostics)
 // ============================================================================
 
 static inline void slot_capture(
@@ -3110,24 +3114,24 @@ static uint32_t select_next_scheduled_callback_slot_by_priority(
 }
 
 // ============================================================================
-// QTimer1 CH2 handler — TimePop priority queue scheduler
+// QTimer1 CH2 foreground ingress — TimePop priority queue scheduler
 // ============================================================================
 //
-// Scheduler-context handler called by process_interrupt after priority-0
-// QTimer1 capture has been handed to process_interrupt's priority-16 custody
-// tier.  Receives the standard event/diag payload — DWT and counter32 already
-// filled in by the dispatcher. TimePop authors fire_gnss_ns from that
-// counter32 identity using VCLOCK arithmetic; any GNSS value in the interrupt
-// payload is diagnostic. The CH2 TCF1 flag is cleared by process_interrupt
-// before this runs, so TimePop never touches QTimer hardware here.
+// Foreground scheduler pass called by process_interrupt after Priority 0 has
+// captured/defused CH2 and Priority 16 has transferred the immutable fact into
+// foreground custody.  DWT and counter32 are already normalized.  TimePop
+// authors fire_gnss_ns from that counter identity; any GNSS value in the
+// interrupt payload remains diagnostic.  TimePop touches QTimer hardware only
+// through schedule_next() after callback and recurrence policy is complete.
 //
-static void timepop_process_ch2_event_in_scheduler_irq(const interrupt_event_t& event,
-                                                       const interrupt_capture_diag_t& /*diag*/) {
+static void timepop_process_ch2_event_foreground(
+    const interrupt_event_t& event,
+    const interrupt_capture_diag_t& /*diag*/) {
 
   const uint32_t dwt_entry      = event.dwt_at_event;
   const uint32_t now            = event.counter32_at_event;
   const time_anchor_snapshot_t anchor =
-      timepop_anchor_snapshot("qtimer1_ch2_irq");
+      timepop_anchor_snapshot("qtimer1_ch2_foreground");
   bool expired_this_pass[MAX_SLOTS] = {};
 
   diag_isr_count++;
@@ -3248,7 +3252,7 @@ static void timepop_process_ch2_event_in_scheduler_irq(const interrupt_event_t& 
       slots[i].irq_late_max_ticks = late_ticks;
     }
 
-    const bool is_critical_isr_recurring =
+    const bool is_critical_scheduler_recurring =
         slots[i].isr_callback && slots[i].rearm_in_isr && slots[i].recurring;
 
     slot_capture(slots[i],
@@ -3262,7 +3266,7 @@ static void timepop_process_ch2_event_in_scheduler_irq(const interrupt_event_t& 
     slots[i].isr_callback_fired = false;
     expired_this_pass[i] = true;
     expired_count++;
-    if (!is_critical_isr_recurring) {
+    if (!is_critical_scheduler_recurring) {
       timepop_pending = true;
       needs_scheduled_dispatch = true;
     }
@@ -3311,8 +3315,9 @@ static void timepop_process_ch2_event_in_scheduler_irq(const interrupt_event_t& 
   }
 
   // Phase 2: now that the fire facts are stable for all simultaneous slots,
-  // dispatch any IRQ-context callbacks.  Slots without isr_callback will be
-  // dispatched later by timepop_dispatch() using the same stored context.
+  // dispatch critical scheduler callbacks in foreground.  The legacy
+  // isr_callback flag now means "before schedule_next", not handler execution.
+  // Other slots are dispatched later by timepop_dispatch() from the same facts.
   // Priority affects callback order only after Phase 1 has captured the
   // shared physical CH2 fire fact for every exact-match slot.
   bool irq_callback_dispatched[MAX_SLOTS] = {};
@@ -3422,22 +3427,53 @@ static void timepop_process_ch2_event_in_scheduler_irq(const interrupt_event_t& 
 }
 
 
-void timepop_qtimer1_ch2_handler(const interrupt_event_t& event,
-                                 const interrupt_capture_diag_t& diag) {
-  // process_interrupt already transported the CH2 hardware event out of the
-  // priority-0 capture tier.  TimePop receives immutable event facts in the
-  // process_interrupt handoff context and performs scheduler policy directly.
+void timepop_accept_ch2_event_foreground(
+    const interrupt_event_t& event,
+    const interrupt_capture_diag_t& diag) {
+  const uint32_t ipsr = timepop_dispatch_trace_ipsr();
+  if (ipsr != 0U) {
+    diag_ch2_handler_reject_count++;
+    diag_ch2_handler_last_ipsr = ipsr;
+    return;
+  }
+  if (dispatch_depth != 0U || dispatch_applying_mutations) {
+    diag_ch2_reentry_reject_count++;
+    return;
+  }
+
+  // Legacy "direct" diagnostic field names are retained for report ABI.  The
+  // call is now direct foreground delivery from process_interrupt's fact mailbox.
   diag_ch2_direct_call_count++;
   diag_ch2_direct_last_event_counter32 = event.counter32_at_event;
   diag_ch2_direct_last_event_dwt = event.dwt_at_event;
 
   const uint32_t body_start = ARM_DWT_CYCCNT;
-  timepop_process_ch2_event_in_scheduler_irq(event, diag);
+  timepop_process_ch2_event_foreground(event, diag);
   const uint32_t body_cycles = ARM_DWT_CYCCNT - body_start;
   diag_ch2_direct_body_cycles_last = body_cycles;
   if (body_cycles > diag_ch2_direct_body_cycles_max) {
     diag_ch2_direct_body_cycles_max = body_cycles;
   }
+}
+
+void timepop_ch2_capture_lost_foreground(void) {
+  const uint32_t ipsr = timepop_dispatch_trace_ipsr();
+  if (ipsr != 0U) {
+    diag_ch2_handler_reject_count++;
+    diag_ch2_handler_last_ipsr = ipsr;
+    return;
+  }
+  if (dispatch_depth != 0U || dispatch_applying_mutations) {
+    diag_ch2_reentry_reject_count++;
+    return;
+  }
+
+  // A lost captured edge cannot be reconstructed.  Re-establish only future
+  // scheduler custody; schedule_next() quarantines deadlines whose exact edge
+  // has already passed and programs the next lawful compare.
+  diag_ch2_capture_loss_recover_count++;
+  diag_schedule_next_calls_from_other++;
+  schedule_next();
 }
 
 
@@ -3707,6 +3743,10 @@ void timepop_init(void) {
   diag_ch2_direct_body_cycles_max = 0;
   diag_ch2_direct_last_event_counter32 = 0;
   diag_ch2_direct_last_event_dwt = 0;
+  diag_ch2_handler_reject_count = 0;
+  diag_ch2_handler_last_ipsr = 0;
+  diag_ch2_reentry_reject_count = 0;
+  diag_ch2_capture_loss_recover_count = 0;
 
   diag_asap_armed = 0;
   diag_asap_dispatched = 0;
@@ -3826,12 +3866,10 @@ void timepop_init(void) {
   diag_epoch_last_anchor_counter32_at_pps_vclock = 0;
   diag_epoch_last_schedule_next_calls_before = 0;
   diag_epoch_last_schedule_next_calls_after = 0;
-  // QTimer1 hardware (CH0/CH2) is initialized by
-  // process_interrupt_init_hardware().  IRQ vector, capture priority, and
-  // priority handoff are owned by process_interrupt.  We just register our
-  // CH2 handler here; process_interrupt invokes it from its handoff context
-  // with a fully-populated event/diag payload.
-  interrupt_register_qtimer1_ch2_handler(timepop_qtimer1_ch2_handler);
+  // QTimer1 hardware and both interrupt tiers are owned by process_interrupt.
+  // The ordinary loop delivers immutable CH2 facts through
+  // timepop_accept_ch2_event_foreground(); TimePop registers no interrupt or
+  // handoff callback.
 
   const uint32_t saved = critical_enter();
   diag_schedule_next_calls_from_other++;
@@ -5557,6 +5595,20 @@ static FLASHMEM Payload cmd_report(const Payload&) {
   out.add("ch2_direct_body_cycles_max", diag_ch2_direct_body_cycles_max);
   out.add("ch2_direct_last_event_counter32", diag_ch2_direct_last_event_counter32);
   out.add("ch2_direct_last_event_dwt", diag_ch2_direct_last_event_dwt);
+  out.add("ch2_foreground_call_count", diag_ch2_direct_call_count);
+  out.add("ch2_foreground_body_cycles_last",
+          diag_ch2_direct_body_cycles_last);
+  out.add("ch2_foreground_body_cycles_max",
+          diag_ch2_direct_body_cycles_max);
+  out.add("ch2_foreground_last_event_counter32",
+          diag_ch2_direct_last_event_counter32);
+  out.add("ch2_foreground_last_event_dwt",
+          diag_ch2_direct_last_event_dwt);
+  out.add("ch2_handler_reject_count", diag_ch2_handler_reject_count);
+  out.add("ch2_handler_last_ipsr", diag_ch2_handler_last_ipsr);
+  out.add("ch2_reentry_reject_count", diag_ch2_reentry_reject_count);
+  out.add("ch2_capture_loss_recover_count",
+          diag_ch2_capture_loss_recover_count);
 
   out.add("schedule_next_expired_passes",      diag_schedule_next_expired_passes);
   out.add("schedule_next_expired_slots",       diag_schedule_next_expired_slots);
@@ -5775,6 +5827,13 @@ static FLASHMEM Payload cmd_slots(const Payload&) {
   out.add("ch2_service_context", TIMEPOP_CH2_SERVICE_CONTEXT);
   out.add("ch2_direct_call_count", diag_ch2_direct_call_count);
   out.add("ch2_direct_body_cycles_max", diag_ch2_direct_body_cycles_max);
+  out.add("ch2_foreground_call_count", diag_ch2_direct_call_count);
+  out.add("ch2_foreground_body_cycles_max",
+          diag_ch2_direct_body_cycles_max);
+  out.add("ch2_handler_reject_count", diag_ch2_handler_reject_count);
+  out.add("ch2_reentry_reject_count", diag_ch2_reentry_reject_count);
+  out.add("ch2_capture_loss_recover_count",
+          diag_ch2_capture_loss_recover_count);
   out.add("schedule_next_expired_slots", diag_schedule_next_expired_slots);
   out.add("schedule_next_late_max_ticks", diag_schedule_next_late_max_ticks);
   out.add("missed_deadline_slots", diag_missed_deadline_slots);

@@ -8,33 +8,33 @@
 //   • priority-queue slot scheduling
 //   • PPS/VCLOCK phase-locked recurring series
 //   • shared captured fire facts for same-event timed clients
-//   • critical recurring scheduler clients that callback/rearm before schedule_next
-//   • fixed non-slot deferred callback dispatch
+//   • critical recurring scheduler clients that callback/rearm in foreground
+//     before schedule_next
+//   • fixed non-slot foreground deferred callback dispatch
 //   • instrumentation / reports
 //   • scheduler policy for QTimer1 CH2 compare deadlines
 //
 // TimePop does not own:
 //   • PPS/GPIO interrupt custody
 //   • OCXO interrupt custody
-//   • QTimer1 vector custody — process_interrupt owns IRQ_QTIMER1 and
-//     dispatches CH2 to TimePop's registered handler from its priority
-//     handoff context
+//   • QTimer1 vector custody — process_interrupt owns IRQ_QTIMER1, transfers
+//     CH2 into an immutable foreground fact mailbox, and invokes TimePop only from
+//     the ordinary loop
 //   • QTimer1 CH0/CH2 hardware mode init — process_interrupt does
 //     the one-time CTRL/SCTRL/CSCTRL/COMP1/CMPLD1 setup
 //
 // Those are owned by process_interrupt. TimePop also does not own a private
-// scheduler IRQ / priority-handoff tier; CH2 scheduler processing runs
-// directly when process_interrupt invokes the registered handler from its
-// handoff context.
+// scheduler IRQ / priority-handoff tier; all CH2 scheduler processing runs in
+// foreground after process_interrupt drains its immutable fact mailbox.
 //
-// QTimer1 CH2 hosted-handler API (TimePop is the hosted client):
+// QTimer1 CH2 foreground-ingress API (TimePop is the hosted client):
 //
 //   QTimer1 has only one IRQ vector shared across all four channels.
-//   process_interrupt owns the vector and dispatches CH2 from its priority-16
-//   handoff context to TimePop's registered handler.  VCLOCK cadence is no longer a separate
-//   QTimer1 compare path; it is a TimePop critical recurring ISR client.
+//   process_interrupt owns the vector and transfers CH2 through Priority 16
+//   into a foreground fact mailbox.  VCLOCK cadence is no longer a separate QTimer1
+//   compare path; it is a TimePop critical recurring scheduler client.
 //
-//   The handler receives a normalized DWT-at-edge capture for the CH2 event.
+//   Foreground ingress receives a normalized DWT-at-edge capture for CH2.
 //
 //   For timed TimePop clients, all slots reached by one physical CH2 event
 //   receive the same fire_vclock_raw, fire_dwt_cyccnt, and fire_gnss_ns.
@@ -56,16 +56,15 @@
 //   canonical VCLOCK/GNSS coordinate system.
 //
 //   TimePop is responsible for:
-//     • registering its CH2 handler at init via
-//       interrupt_register_qtimer1_ch2_handler()
+//     • accepting immutable CH2 facts from process_interrupt in foreground
 //     • requesting CH2 compare target updates from process_interrupt as
 //       slots are scheduled
 //
 //   process_interrupt is responsible for:
 //     • initializing CH0/CH2 hardware (one-time mode/control)
-//     • clearing the CH2 TCF1 flag in the QTimer1 ISR before
-//       invoking TimePop's handler
-//     • building the event/diag payloads passed to TimePop
+//     • disabling/clearing the fired CH2 compare in Priority 0
+//     • normalizing and storing its immutable event identity in Priority 16
+//     • building the event/diag payloads passed to TimePop in foreground
 //
 //   TimePop does not defensively second-guess exact compare fires.  Exact
 //   equality between a slot deadline and the process_interrupt-authored CH2
@@ -88,10 +87,9 @@
 //   ASAP/ALAP:
 //
 //   timepop_arm_asap() and timepop_arm_alap() keep their public API, but are
-//   implemented as fixed deferred mailboxes rather than scheduled slots.  They
-//   are safe to request from ISR context: the request only writes the deferred
-//   lane under PRIMASK and sets the dispatch-pending bit.  ASAP drains before
-//   timed scheduled-context slots; ALAP drains after timed slots.
+//   implemented as fixed foreground deferred mailboxes rather than scheduled
+//   slots.  Under the execution-class doctrine they are requested and dispatched
+//   only in foreground.  ASAP drains before timed slots; ALAP drains after them.
 //
 //   ASAP/ALAP callbacks are normal scheduled-context code and may call the
 //   public timed TimePop arm/cancel APIs.  TimePop serializes those requests
@@ -107,10 +105,10 @@
 //
 //   Critical recurring scheduler clients are the white-glove exception for tiny
 //   substrate-maintenance work.  They are still ordinary TimePop slots and
-//   share CH2 fire facts, but their callbacks and recurring rearm happen
-//   inside the CH2 scheduler pass before schedule_next() selects the next compare.
-//   This pass is invoked from process_interrupt's handoff tier; TimePop does
-//   not own a private priority-handoff IRQ.
+//   share CH2 fire facts, but their callbacks and recurring rearm happen in the
+//   foreground CH2 scheduler pass before schedule_next() selects the next compare.
+//   The legacy ISR API names remain source-compatible but no callback executes
+//   in Priority 0 or Priority 16.
 //
 //   Timed slots may also carry a service priority. Lower numeric priority runs
 //   first when multiple timed slots share one exact CH2 fire fact. Priority
@@ -137,6 +135,15 @@
 void timepop_bootstrap(void);
 void timepop_init(void);
 void process_timepop_register(void);
+
+// Foreground-only CH2 ingress. process_interrupt Priority 16 stores one immutable
+// fire facts; process_interrupt_foreground_service() calls this before
+// timepop_dispatch().  The capture-loss service restores only future compare
+// custody and never invents the missing physical edge.
+void timepop_accept_ch2_event_foreground(
+    const interrupt_event_t& event,
+    const interrupt_capture_diag_t& diag);
+void timepop_ch2_capture_lost_foreground(void);
 
 // Global idle DWT witness.  TimePop updates this foreground/thread-mode
 // shadow whenever scheduled-context dispatch is fully drained and the runtime

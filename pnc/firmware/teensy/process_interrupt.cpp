@@ -23,7 +23,8 @@
 //     intentionally a no-op in this experiment;
 //   * raw ISR-entry DWT is converted once to the calibrated event coordinate;
 //   * only each 1,000th OCXO tooth authors the existing one-second event;
-//   * subscriber delivery is scheduled into foreground TimePop ASAP context.
+//   * immutable CH2 and subscriber work is transferred to foreground-owned
+//     service without entering TimePop or invoking application behavior.
 //
 // There is no alternative endpoint estimator, repair candidate, FloorLine, or
 // alternative publication court in this module.  The 1 kHz ladder conditions
@@ -150,6 +151,7 @@ static constexpr bool OCXO2_DISABLED = false;
 static bool g_interrupt_hw_ready = false;
 static bool g_interrupt_runtime_ready = false;
 static bool g_interrupt_irqs_enabled = false;
+volatile bool g_process_interrupt_foreground_pending = false;
 
 // ============================================================================
 // CPU / ordering helpers
@@ -602,15 +604,6 @@ static interrupt_subscriber_runtime_t* runtime_for(
   }
 }
 
-static const char* dispatch_timer_name(interrupt_subscriber_kind_t kind) {
-  switch (kind) {
-    case interrupt_subscriber_kind_t::VCLOCK: return "VCLOCK_DISPATCH";
-    case interrupt_subscriber_kind_t::OCXO1: return "OCXO1_DISPATCH";
-    case interrupt_subscriber_kind_t::OCXO2: return "OCXO2_DISPATCH";
-    default: return "";
-  }
-}
-
 static bool interrupt_subscriber_callback_executable(
     interrupt_subscriber_event_fn callback) {
   return interrupt_callback_address_executable((uintptr_t)callback);
@@ -629,8 +622,6 @@ static timepop_dispatch_trace_kind_t interrupt_execution_trace_subscriber_kind(
       return timepop_dispatch_trace_kind_t::NONE;
   }
 }
-
-static void deferred_dispatch_callback(timepop_ctx_t*, timepop_diag_t*, void*);
 
 static void interrupt_dispatch_invalidate_locked(
     interrupt_subscriber_runtime_t& rt) {
@@ -664,11 +655,14 @@ static bool interrupt_dispatch_begin(interrupt_subscriber_runtime_t& rt,
     return false;
   }
 
+  // Priority 16 authors only an immutable foreground fact.  It does not call
+  // TimePop, mutate a TimePop mailbox, or execute application behavior.
   rt.deferred.pending = true;
   rt.deferred.binding_generation = binding_generation;
   rt.deferred.callback = callback;
   rt.deferred.user_data = callback_user_data;
   rt.deferred.event = event;
+  g_process_interrupt_foreground_pending = true;
 
   if (rt.desc->kind == interrupt_subscriber_kind_t::VCLOCK) {
     rt.deferred.pps_continuation_valid = true;
@@ -688,29 +682,11 @@ static bool interrupt_dispatch_begin(interrupt_subscriber_runtime_t& rt,
       (uint32_t)(uintptr_t)callback_user_data,
       (uint32_t)(uintptr_t)rt.desc->name,
       1U | (binding_generation << 16));
-
-  const timepop_handle_t handle =
-      timepop_arm_asap(deferred_dispatch_callback,
-                       &rt,
-                       dispatch_timer_name(rt.desc->kind));
-  if (handle == TIMEPOP_INVALID_HANDLE) {
-    const uint32_t restore = interrupt_priority0_guard_enter();
-    if (!rt.dispatch_running && rt.deferred.pending &&
-        rt.deferred.binding_generation == binding_generation) {
-      rt.deferred = interrupt_deferred_dispatch_t{};
-    }
-    rt.dispatch_arm_fail_count++;
-    interrupt_priority0_guard_exit(restore);
-    return false;
-  }
   return true;
 }
 
-static void deferred_dispatch_callback(timepop_ctx_t*, timepop_diag_t*,
-                                       void* user_data) {
-  auto* rt = static_cast<interrupt_subscriber_runtime_t*>(user_data);
-  if (!rt || !rt->desc) return;
-
+static bool interrupt_dispatch_foreground_one(
+    interrupt_subscriber_runtime_t& rt) {
   interrupt_subscriber_event_fn callback = nullptr;
   void* callback_user_data = nullptr;
   interrupt_event_t event{};
@@ -718,97 +694,104 @@ static void deferred_dispatch_callback(timepop_ctx_t*, timepop_diag_t*,
   pps_edge_snapshot_t pps_continuation{};
 
   const uint32_t prior_basepri = interrupt_priority0_guard_enter();
-  if (!rt->deferred.pending || rt->dispatch_running) {
+  if (!rt.deferred.pending || rt.dispatch_running) {
     interrupt_priority0_guard_exit(prior_basepri);
-    return;
+    return false;
   }
-  if (!rt->subscribed || !rt->active ||
-      rt->deferred.binding_generation != rt->binding_generation) {
-    rt->dispatch_stale_drop_count++;
-    rt->deferred = interrupt_deferred_dispatch_t{};
+  if (!rt.subscribed || !rt.active ||
+      rt.deferred.binding_generation != rt.binding_generation) {
+    rt.dispatch_stale_drop_count++;
+    rt.deferred = interrupt_deferred_dispatch_t{};
     interrupt_priority0_guard_exit(prior_basepri);
-    return;
+    return false;
   }
 
-  callback = rt->deferred.callback;
-  callback_user_data = rt->deferred.user_data;
+  callback = rt.deferred.callback;
+  callback_user_data = rt.deferred.user_data;
   if (!interrupt_subscriber_callback_executable(callback)) {
-    rt->dispatch_invalid_callback_count++;
-    rt->deferred = interrupt_deferred_dispatch_t{};
+    rt.dispatch_invalid_callback_count++;
+    rt.deferred = interrupt_deferred_dispatch_t{};
     interrupt_priority0_guard_exit(prior_basepri);
-    return;
+    return false;
   }
 
-  event = rt->deferred.event;
-  pps_continuation_valid = rt->deferred.pps_continuation_valid;
-  pps_continuation = rt->deferred.pps_continuation;
-  rt->dispatch_running = true;
+  event = rt.deferred.event;
+  pps_continuation_valid = rt.deferred.pps_continuation_valid;
+  pps_continuation = rt.deferred.pps_continuation;
+  rt.dispatch_running = true;
   interrupt_priority0_guard_exit(prior_basepri);
 
   const timepop_dispatch_trace_kind_t trace_kind =
-      interrupt_execution_trace_subscriber_kind(rt->desc->kind);
+      interrupt_execution_trace_subscriber_kind(rt.desc->kind);
   ZPNET_EXECUTION_TRACE(
       timepop_dispatch_trace_stage_t::SUBSCRIBER_ENTER,
       trace_kind,
-      (uint32_t)rt->desc->kind,
+      (uint32_t)rt.desc->kind,
       event.counter32_at_event,
       (uint32_t)(uintptr_t)callback,
       0U,
       (uint32_t)(uintptr_t)callback_user_data,
-      (uint32_t)(uintptr_t)rt->desc->name,
+      (uint32_t)(uintptr_t)rt.desc->name,
       event.counter32_at_event);
-  rt->dispatch_count++;
+  rt.dispatch_count++;
   crash_dispatch_breadcrumb_note(
       CRASH_DISPATCH_BREADCRUMB_SUBSCRIBER_ENTER,
       (uint32_t)(uintptr_t)callback,
-      (uint32_t)rt->desc->kind,
+      (uint32_t)rt.desc->kind,
       event.counter32_at_event,
       (uint32_t)(uintptr_t)callback_user_data,
-      (uint32_t)(uintptr_t)rt);
-  callback(event, &rt->last_diag, callback_user_data);
+      (uint32_t)(uintptr_t)&rt);
+  callback(event, &rt.last_diag, callback_user_data);
   crash_dispatch_breadcrumb_note(
       CRASH_DISPATCH_BREADCRUMB_SUBSCRIBER_RETURN,
       (uint32_t)(uintptr_t)callback,
-      (uint32_t)rt->desc->kind,
+      (uint32_t)rt.desc->kind,
       event.counter32_at_event,
       (uint32_t)(uintptr_t)callback_user_data,
-      (uint32_t)(uintptr_t)rt);
+      (uint32_t)(uintptr_t)&rt);
   ZPNET_EXECUTION_TRACE(
       timepop_dispatch_trace_stage_t::SUBSCRIBER_RETURN,
       trace_kind,
-      (uint32_t)rt->desc->kind,
+      (uint32_t)rt.desc->kind,
       event.counter32_at_event,
       (uint32_t)(uintptr_t)callback,
       0U,
       (uint32_t)(uintptr_t)callback_user_data,
-      (uint32_t)(uintptr_t)rt->desc->name,
+      (uint32_t)(uintptr_t)rt.desc->name,
       event.counter32_at_event);
 
   crash_dispatch_breadcrumb_note(
       CRASH_DISPATCH_BREADCRUMB_CLEANUP_ENTER,
       (uint32_t)(uintptr_t)callback,
-      (uint32_t)rt->desc->kind,
+      (uint32_t)rt.desc->kind,
       event.counter32_at_event,
       (uint32_t)(uintptr_t)callback_user_data,
-      (uint32_t)(uintptr_t)rt);
+      (uint32_t)(uintptr_t)&rt);
   const uint32_t finish_basepri = interrupt_priority0_guard_enter();
-  rt->dispatch_running = false;
-  rt->deferred = interrupt_deferred_dispatch_t{};
+  rt.dispatch_running = false;
+  rt.deferred = interrupt_deferred_dispatch_t{};
   interrupt_priority0_guard_exit(finish_basepri);
   crash_dispatch_breadcrumb_note(
       CRASH_DISPATCH_BREADCRUMB_CLEANUP_COMPLETE,
       (uint32_t)(uintptr_t)callback,
-      (uint32_t)rt->desc->kind,
+      (uint32_t)rt.desc->kind,
       event.counter32_at_event,
       (uint32_t)(uintptr_t)callback_user_data,
-      (uint32_t)(uintptr_t)rt);
+      (uint32_t)(uintptr_t)&rt);
 
-  if (rt->desc->kind == interrupt_subscriber_kind_t::VCLOCK &&
+  if (rt.desc->kind == interrupt_subscriber_kind_t::VCLOCK &&
       pps_continuation_valid) {
     const pps_edge_dispatch_fn callback_pps = g_pps_edge_dispatch;
     if (interrupt_callback_address_executable((uintptr_t)callback_pps)) {
       callback_pps(pps_continuation);
     }
+  }
+  return true;
+}
+
+static void interrupt_dispatch_foreground_service(void) {
+  for (uint32_t i = 0U; i < INTERRUPT_SUBSCRIBER_COUNT; ++i) {
+    (void)interrupt_dispatch_foreground_one(g_subscribers[i]);
   }
 }
 
@@ -1047,6 +1030,7 @@ static void interrupt_features_note_observed_edge(void);
 static void interrupt_features_note_ocxo_custody(void);
 static void interrupt_features_note_lineage(void);
 static void interrupt_features_foreground_flush(void);
+static bool interrupt_foreground_work_pending_locked(void);
 
 // ============================================================================
 // Passive integrity evidence
@@ -2119,23 +2103,20 @@ static uint32_t g_ocxo1_capture_overrun_recovery_count = 0U;
 static uint32_t g_ocxo2_capture_overrun_recovery_count = 0U;
 static volatile uint32_t g_qtimer1_ch2_last_target_counter32 = 0U;
 static volatile uint32_t g_qtimer1_ch2_arm_count = 0U;
-static volatile interrupt_qtimer1_ch2_handler_fn g_qtimer1_ch2_handler = nullptr;
+static volatile bool g_qtimer1_ch2_fact_outstanding = false;
+static volatile bool g_qtimer1_ch2_deferred_arm_valid = false;
+static volatile uint32_t g_qtimer1_ch2_deferred_arm_target_counter32 = 0U;
+static volatile uint32_t g_qtimer1_ch2_deferred_arm_count = 0U;
+static volatile uint32_t g_qtimer1_ch2_deferred_arm_replace_count = 0U;
+static volatile uint32_t g_qtimer1_ch2_release_arm_count = 0U;
+static volatile uint32_t g_qtimer1_ch2_unexpected_capture_count = 0U;
 static volatile interrupt_qtimer1_ch1_handler_fn g_qtimer1_ch1_handler = nullptr;
-static interrupt_capture_diag_t g_timepop_interrupt_diag{};
 
 static volatile bool g_pps_relay_active = false;
 static volatile uint32_t g_pps_relay_countdown_cells = 0U;
 static volatile uint32_t g_pps_relay_assert_count = 0U;
 static volatile uint32_t g_pps_relay_deassert_count = 0U;
 static constexpr uint32_t PPS_RELAY_OFF_CELLS = 500U;
-
-void interrupt_register_qtimer1_ch2_handler(
-    interrupt_qtimer1_ch2_handler_fn callback) {
-  g_qtimer1_ch2_handler =
-      interrupt_callback_address_executable((uintptr_t)callback)
-          ? callback
-          : nullptr;
-}
 
 void interrupt_register_pps_entry_latency_handler(
     interrupt_pps_entry_latency_handler_fn callback) {
@@ -2178,10 +2159,28 @@ uint32_t interrupt_vclock_counter32_observe_ambient(void) {
 }
 
 void interrupt_qtimer1_ch2_arm_compare(uint32_t target_counter32) {
+  const uint32_t prior = interrupt_priority0_guard_enter();
   g_qtimer1_ch2_last_target_counter32 = target_counter32;
   g_qtimer1_ch2_arm_count++;
+
+  // A captured CH2 edge owns the scheduler rail until foreground consumes it.
+  // Scheduler policy may continue to author a desired next target while that
+  // fact is in flight, but hardware must remain defused.  Keep only the newest
+  // desired target; foreground releases it after processing the owned fact.
+  if (g_qtimer1_ch2_fact_outstanding) {
+    if (g_qtimer1_ch2_deferred_arm_valid) {
+      g_qtimer1_ch2_deferred_arm_replace_count++;
+    }
+    g_qtimer1_ch2_deferred_arm_target_counter32 = target_counter32;
+    g_qtimer1_ch2_deferred_arm_valid = true;
+    g_qtimer1_ch2_deferred_arm_count++;
+    interrupt_priority0_guard_exit(prior);
+    return;
+  }
+
   qtimer1_ch2_program_compare(
       vclock_hardware_low16_from_synthetic(target_counter32));
+  interrupt_priority0_guard_exit(prior);
 }
 
 uint16_t interrupt_qtimer1_ch2_counter_now(void) {
@@ -2314,6 +2313,31 @@ static interrupt_capture_ring_t<pps_capture_packet_t,
                                 HANDOFF_PPS_RING_SIZE>
     g_pps_capture_ring{};
 
+
+struct timepop_foreground_packet_t {
+  uint32_t sequence = 0U;
+  uint32_t isr_entry_dwt_raw = 0U;
+  uint32_t dwt_at_event = 0U;
+  uint32_t target_counter32 = 0U;
+};
+
+struct timepop_foreground_diag_t {
+  volatile uint32_t enqueue_count = 0U;
+  volatile uint32_t dequeue_count = 0U;
+  volatile uint32_t overrun_count = 0U;
+  volatile uint32_t high_water = 0U;
+  volatile uint32_t service_count = 0U;
+  volatile uint32_t handler_reject_count = 0U;
+  volatile uint32_t handler_last_ipsr = 0U;
+  volatile uint32_t scheduler_recover_count = 0U;
+};
+
+static timepop_foreground_packet_t g_timepop_foreground_mailbox{};
+static volatile bool g_timepop_foreground_mailbox_pending = false;
+static timepop_foreground_diag_t g_timepop_foreground_diag{};
+static volatile bool g_timepop_foreground_rearm_requested = false;
+static bool g_interrupt_foreground_service_running = false;
+
 static inline volatile uint32_t& interrupt_nvic_ispr_word(uint32_t irq) {
   volatile uint32_t* const base = (volatile uint32_t*)0xE000E200UL;
   return base[irq >> 5];
@@ -2390,6 +2414,45 @@ static bool capture_ring_peek_sequence(
   if (tail == head) return false;
   dmb_barrier();
   sequence = ring.items[tail % N].sequence;
+  return true;
+}
+
+static bool timepop_foreground_mailbox_store_handoff(
+    const timepop_foreground_packet_t& packet) {
+  const uint32_t prior = interrupt_priority0_guard_enter();
+  if (g_timepop_foreground_mailbox_pending) {
+    // CH2 is one-shot while a fire fact is under custody.  A second fact is not
+    // queue pressure; it is a broken hardware-custody invariant.
+    g_timepop_foreground_diag.overrun_count++;
+    g_timepop_foreground_rearm_requested = true;
+    g_process_interrupt_foreground_pending = true;
+    interrupt_priority0_guard_exit(prior);
+    return false;
+  }
+  g_timepop_foreground_mailbox = packet;
+  dmb_barrier();
+  g_timepop_foreground_mailbox_pending = true;
+  g_timepop_foreground_diag.enqueue_count++;
+  g_timepop_foreground_diag.high_water = 1U;
+  g_process_interrupt_foreground_pending = true;
+  interrupt_priority0_guard_exit(prior);
+  return true;
+}
+
+static bool timepop_foreground_mailbox_take(
+    timepop_foreground_packet_t& packet) {
+  const uint32_t prior = interrupt_priority0_guard_enter();
+  if (!g_timepop_foreground_mailbox_pending) {
+    interrupt_priority0_guard_exit(prior);
+    return false;
+  }
+  dmb_barrier();
+  packet = g_timepop_foreground_mailbox;
+  g_timepop_foreground_mailbox = timepop_foreground_packet_t{};
+  dmb_barrier();
+  g_timepop_foreground_mailbox_pending = false;
+  g_timepop_foreground_diag.dequeue_count++;
+  interrupt_priority0_guard_exit(prior);
   return true;
 }
 
@@ -2688,46 +2751,27 @@ static void process_vclock_packet(const vclock_capture_packet_t& packet) {
 
 static void process_ch2_packet(const ch2_capture_packet_t& packet) {
   crash_stack_tripwire_isr_check(CRASH_TRIPWIRE_SITE_QTIMER1);
-  const interrupt_qtimer1_ch2_handler_fn callback = g_qtimer1_ch2_handler;
-  if (!interrupt_callback_address_executable((uintptr_t)callback)) return;
 
-  interrupt_event_t event{};
-  event.kind = interrupt_subscriber_kind_t::TIMEPOP;
-  event.provider = interrupt_provider_kind_t::QTIMER1;
-  event.lane = interrupt_lane_t::QTIMER1_CH2_COMP;
-  event.status = interrupt_event_status_t::OK;
-  event.dwt_at_event =
+  timepop_foreground_packet_t foreground{};
+  foreground.sequence = packet.sequence;
+  foreground.isr_entry_dwt_raw = packet.isr_entry_dwt_raw;
+  foreground.dwt_at_event =
       qtimer_event_dwt_from_isr_entry_raw(packet.isr_entry_dwt_raw);
-  event.counter32_at_event = packet.target_counter32;
-  event.gnss_ns_at_event = 0U;
+  foreground.target_counter32 = packet.target_counter32;
 
-  fill_observed_diag(g_timepop_interrupt_diag,
-                     event,
-                     packet.isr_entry_dwt_raw,
-                     (uint16_t)packet.target_counter32,
-                     (uint16_t)packet.target_counter32,
-                     packet.sequence);
+  // Priority 16 ends at immutable custody transfer.  TimePop scheduler state,
+  // callback selection, recurring rearm, and compare selection are foreground.
+  (void)timepop_foreground_mailbox_store_handoff(foreground);
   ZPNET_EXECUTION_TRACE(
-      timepop_dispatch_trace_stage_t::SUBSCRIBER_ENTER,
+      timepop_dispatch_trace_stage_t::HANDOFF_DEQUEUE,
       timepop_dispatch_trace_kind_t::ISR_TIMED,
       QTIMER1_TIMEPOP_CH,
-      packet.target_counter32,
-      (uint32_t)(uintptr_t)callback,
-      (uint32_t)(uintptr_t)g_qtimer1_ch2_handler,
+      packet.sequence,
       0U,
-      (uint32_t)(uintptr_t)"QTIMER1_CH2_TIMEPOP",
-      event.dwt_at_event);
-  callback(event, g_timepop_interrupt_diag);
-  ZPNET_EXECUTION_TRACE(
-      timepop_dispatch_trace_stage_t::SUBSCRIBER_RETURN,
-      timepop_dispatch_trace_kind_t::ISR_TIMED,
-      QTIMER1_TIMEPOP_CH,
-      packet.target_counter32,
-      (uint32_t)(uintptr_t)callback,
-      (uint32_t)(uintptr_t)g_qtimer1_ch2_handler,
       0U,
-      (uint32_t)(uintptr_t)"QTIMER1_CH2_TIMEPOP",
-      event.dwt_at_event);
+      packet.target_counter32,
+      (uint32_t)(uintptr_t)"QTIMER1_CH2_FOREGROUND",
+      foreground.dwt_at_event);
 }
 
 static void ocxo_complete_capture_custody(
@@ -3207,7 +3251,11 @@ qtimer1_defuse_vclock_priority0(void) {
 }
 
 static __attribute__((always_inline)) inline void
-qtimer1_ack_timepop_priority0(void) {
+qtimer1_defuse_timepop_priority0(void) {
+  // CH2 is one-shot across the execution-class boundary.  Disable the old
+  // target before it can recur on the next low-word revolution; foreground
+  // TimePop will choose and program the next compare after consuming the fact.
+  IMXRT_TMR1.CH[QTIMER1_TIMEPOP_CH].CSCTRL &= ~TMR_CSCTRL_TCF1EN;
   qtimer1_ch2_clear_compare_flag();
 }
 
@@ -3242,13 +3290,24 @@ qtimer1_capture_vclock_priority0(uint32_t isr_entry_dwt_raw,
 
 static __attribute__((always_inline)) inline bool
 qtimer1_capture_ch2_priority0(uint32_t isr_entry_dwt_raw) {
-  qtimer1_ack_timepop_priority0();
+  if (g_qtimer1_ch2_fact_outstanding) {
+    g_qtimer1_ch2_unexpected_capture_count++;
+  }
+  g_qtimer1_ch2_fact_outstanding = true;
+  qtimer1_defuse_timepop_priority0();
+
   ch2_capture_packet_t packet{};
   packet.isr_entry_dwt_raw = isr_entry_dwt_raw;
   packet.target_counter32 = g_qtimer1_ch2_last_target_counter32;
-  return capture_ring_push_priority0(g_ch2_capture_ring,
-                                     g_handoff_ch2,
-                                     packet);
+  if (!capture_ring_push_priority0(g_ch2_capture_ring,
+                                   g_handoff_ch2,
+                                   packet)) {
+    // The hardware rail remains defused.  Priority 16/foreground will recover
+    // scheduler custody rather than allowing the same target to fire again.
+    g_timepop_foreground_rearm_requested = true;
+    g_process_interrupt_foreground_pending = true;
+  }
+  return true;
 }
 
 static void qtimer1_isr(void) {
@@ -3779,16 +3838,113 @@ const interrupt_capture_diag_t* interrupt_last_diag(
   return (!rt || !rt->has_fired) ? nullptr : &rt->last_diag;
 }
 
+static void interrupt_timepop_release_ch2_custody_foreground(void) {
+  bool arm = false;
+  uint32_t target = 0U;
+
+  const uint32_t prior = interrupt_priority0_guard_enter();
+  g_qtimer1_ch2_fact_outstanding = false;
+  if (g_qtimer1_ch2_deferred_arm_valid) {
+    target = g_qtimer1_ch2_deferred_arm_target_counter32;
+    g_qtimer1_ch2_deferred_arm_valid = false;
+    g_qtimer1_ch2_deferred_arm_target_counter32 = 0U;
+    arm = true;
+  }
+  interrupt_priority0_guard_exit(prior);
+
+  if (arm) {
+    qtimer1_ch2_program_compare(
+        vclock_hardware_low16_from_synthetic(target));
+    g_qtimer1_ch2_release_arm_count++;
+  }
+}
+
+static void interrupt_timepop_foreground_service(void) {
+  timepop_foreground_packet_t packet{};
+  if (timepop_foreground_mailbox_take(packet)) {
+    interrupt_event_t event{};
+    event.kind = interrupt_subscriber_kind_t::TIMEPOP;
+    event.provider = interrupt_provider_kind_t::QTIMER1;
+    event.lane = interrupt_lane_t::QTIMER1_CH2_COMP;
+    event.status = interrupt_event_status_t::OK;
+    event.dwt_at_event = packet.dwt_at_event;
+    event.counter32_at_event = packet.target_counter32;
+    event.gnss_ns_at_event = 0U;
+
+    interrupt_capture_diag_t diag{};
+    fill_observed_diag(diag,
+                       event,
+                       packet.isr_entry_dwt_raw,
+                       (uint16_t)packet.target_counter32,
+                       (uint16_t)packet.target_counter32,
+                       packet.sequence);
+
+    ZPNET_EXECUTION_TRACE(
+        timepop_dispatch_trace_stage_t::SUBSCRIBER_ENTER,
+        timepop_dispatch_trace_kind_t::ISR_TIMED,
+        QTIMER1_TIMEPOP_CH,
+        packet.sequence,
+        (uint32_t)(uintptr_t)timepop_accept_ch2_event_foreground,
+        0U,
+        packet.target_counter32,
+        (uint32_t)(uintptr_t)"QTIMER1_CH2_FOREGROUND",
+        event.dwt_at_event);
+    timepop_accept_ch2_event_foreground(event, diag);
+    ZPNET_EXECUTION_TRACE(
+        timepop_dispatch_trace_stage_t::SUBSCRIBER_RETURN,
+        timepop_dispatch_trace_kind_t::ISR_TIMED,
+        QTIMER1_TIMEPOP_CH,
+        packet.sequence,
+        (uint32_t)(uintptr_t)timepop_accept_ch2_event_foreground,
+        0U,
+        packet.target_counter32,
+        (uint32_t)(uintptr_t)"QTIMER1_CH2_FOREGROUND",
+        event.dwt_at_event);
+    g_timepop_foreground_diag.service_count++;
+    interrupt_timepop_release_ch2_custody_foreground();
+  }
+
+  bool recover = false;
+  const uint32_t prior = interrupt_priority0_guard_enter();
+  if (g_timepop_foreground_rearm_requested) {
+    g_timepop_foreground_rearm_requested = false;
+    recover = true;
+  }
+  interrupt_priority0_guard_exit(prior);
+  if (recover) {
+    timepop_ch2_capture_lost_foreground();
+    g_timepop_foreground_diag.scheduler_recover_count++;
+    interrupt_timepop_release_ch2_custody_foreground();
+  }
+}
+
 void process_interrupt_foreground_service(void) {
+  const uint32_t ipsr = interrupt_ipsr();
+  if (ipsr != 0U) {
+    g_timepop_foreground_diag.handler_reject_count++;
+    g_timepop_foreground_diag.handler_last_ipsr = ipsr;
+    return;
+  }
+  if (g_interrupt_foreground_service_running) return;
+  g_interrupt_foreground_service_running = true;
+
   // Called once per ordinary loop() pass.  This is the sole bridge from
-  // interrupt-owned scalar feature truth into SYSTEM's foreground registry.
+  // interrupt-owned immutable facts into TimePop, application subscribers,
+  // and SYSTEM's foreground registry.
+  interrupt_timepop_foreground_service();
+  interrupt_dispatch_foreground_service();
   interrupt_features_foreground_flush();
+
+  const uint32_t prior = interrupt_priority0_guard_enter();
+  g_process_interrupt_foreground_pending = interrupt_foreground_work_pending_locked();
+  interrupt_priority0_guard_exit(prior);
+  g_interrupt_foreground_service_running = false;
 }
 
 void interrupt_prespin_service(timepop_ctx_t*, timepop_diag_t*, void*) {
-  // Compatibility TimePop service.  The runtime loop is the authoritative
-  // pump, but any existing prespin invocation remains harmless and idempotent.
-  process_interrupt_foreground_service();
+  // Compatibility callback may run inside TimePop dispatch.  It must never
+  // re-enter TimePop's scheduler through the full foreground bridge.
+  interrupt_features_foreground_flush();
 }
 
 // ============================================================================
@@ -3821,6 +3977,7 @@ static void interrupt_features_mark_dirty(void) {
   dmb_barrier();
   g_interrupt_feature_pending.generation++;
   g_interrupt_feature_pending.dirty = true;
+  g_process_interrupt_foreground_pending = true;
   dmb_barrier();
 }
 
@@ -3924,6 +4081,18 @@ static void interrupt_features_foreground_flush(void) {
     g_interrupt_feature_pending.dirty = true;
   }
   interrupt_priority0_guard_exit(check);
+}
+
+static bool interrupt_foreground_work_pending_locked(void) {
+  if (g_timepop_foreground_mailbox_pending ||
+      g_timepop_foreground_rearm_requested ||
+      g_interrupt_feature_pending.dirty) {
+    return true;
+  }
+  for (uint32_t i = 0U; i < INTERRUPT_SUBSCRIBER_COUNT; ++i) {
+    if (g_subscribers[i].deferred.pending) return true;
+  }
+  return false;
 }
 
 // ============================================================================
@@ -4142,6 +4311,12 @@ void process_interrupt_init(void) {
   g_last_pps_witness_valid = false;
   g_pps_vclock_edge_authority = pps_vclock_edge_authority_t{};
   g_smartzero = smartzero_runtime_t{};
+  g_timepop_foreground_mailbox = timepop_foreground_packet_t{};
+  g_timepop_foreground_mailbox_pending = false;
+  g_timepop_foreground_diag = timepop_foreground_diag_t{};
+  g_timepop_foreground_rearm_requested = false;
+  g_process_interrupt_foreground_pending = false;
+  g_interrupt_foreground_service_running = false;
   for (uint32_t i = 0; i < SMARTZERO_LANE_COUNT; ++i) {
     smartzero_reset_lane(i);
   }
@@ -4577,6 +4752,36 @@ static FLASHMEM Payload cmd_report_handoff(const Payload&) {
               g_ocxo1_capture_overrun_recovery_count);
   payload.add("ocxo2_overrun_recovery_completed",
               g_ocxo2_capture_overrun_recovery_count);
+  payload.add("timepop_foreground_enqueue_count",
+              (uint32_t)g_timepop_foreground_diag.enqueue_count);
+  payload.add("timepop_foreground_dequeue_count",
+              (uint32_t)g_timepop_foreground_diag.dequeue_count);
+  payload.add("timepop_foreground_service_count",
+              (uint32_t)g_timepop_foreground_diag.service_count);
+  payload.add("timepop_foreground_overrun_count",
+              (uint32_t)g_timepop_foreground_diag.overrun_count);
+  payload.add("timepop_foreground_high_water",
+              (uint32_t)g_timepop_foreground_diag.high_water);
+  payload.add("timepop_foreground_handler_reject_count",
+              (uint32_t)g_timepop_foreground_diag.handler_reject_count);
+  payload.add("timepop_foreground_handler_last_ipsr",
+              (uint32_t)g_timepop_foreground_diag.handler_last_ipsr);
+  payload.add("timepop_foreground_scheduler_recover_count",
+              (uint32_t)g_timepop_foreground_diag.scheduler_recover_count);
+  payload.add("ch2_fact_outstanding",
+              (bool)g_qtimer1_ch2_fact_outstanding);
+  payload.add("ch2_deferred_arm_valid",
+              (bool)g_qtimer1_ch2_deferred_arm_valid);
+  payload.add("ch2_deferred_arm_target_counter32",
+              (uint32_t)g_qtimer1_ch2_deferred_arm_target_counter32);
+  payload.add("ch2_deferred_arm_count",
+              (uint32_t)g_qtimer1_ch2_deferred_arm_count);
+  payload.add("ch2_deferred_arm_replace_count",
+              (uint32_t)g_qtimer1_ch2_deferred_arm_replace_count);
+  payload.add("ch2_release_arm_count",
+              (uint32_t)g_qtimer1_ch2_release_arm_count);
+  payload.add("ch2_unexpected_capture_count",
+              (uint32_t)g_qtimer1_ch2_unexpected_capture_count);
   add_handoff_source(payload, "vclock", g_handoff_vclock);
   add_handoff_source(payload, "ch2", g_handoff_ch2);
   add_handoff_source(payload, "ocxo1", g_handoff_ocxo1);

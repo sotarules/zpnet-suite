@@ -13,11 +13,22 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-// Foreground loop service.  Call once per loop() pass; it flushes only pending
-// scalar feature state and returns immediately when no interrupt feature changed.
+// Foreground loop service.  Call once per loop() pass before timepop_dispatch().
+// It drains immutable CH2 fire facts, executes application subscriber callbacks,
+// and flushes scalar feature state.  No TimePop scheduler mutation or application
+// behavior is performed by Priority 0 or Priority 16.
 void process_interrupt_foreground_service(void);
 
-// Compatibility TimePop service; delegates to the same foreground loop service.
+// Scalar wake bit set by Priority 16 whenever immutable foreground work exists.
+// TimePop's foreground idle witness reads it directly so pending custody yields
+// the loop without a cross-translation-unit function call.
+extern volatile bool g_process_interrupt_foreground_pending;
+static inline bool process_interrupt_foreground_pending(void) {
+  return g_process_interrupt_foreground_pending;
+}
+
+// Compatibility TimePop callback.  It flushes feature state only and never
+// re-enters the CH2/subscriber foreground bridge from inside TimePop dispatch.
 void interrupt_prespin_service(timepop_ctx_t*, timepop_diag_t*, void*);
 
 enum class interrupt_subscriber_kind_t : uint8_t {
@@ -1034,12 +1045,6 @@ void interrupt_qtimer1_ch1_disable_compare(void);
 uint16_t interrupt_qtimer1_ch1_counter_now(void);
 uint16_t interrupt_qtimer1_ch1_comp1_now(void);
 uint16_t interrupt_qtimer1_ch1_csctrl_now(void);
-
-using interrupt_qtimer1_ch2_handler_fn =
-    void (*)(const interrupt_event_t& event,
-             const interrupt_capture_diag_t& diag);
-
-void interrupt_register_qtimer1_ch2_handler(interrupt_qtimer1_ch2_handler_fn cb);
 
 uint32_t interrupt_vclock_counter32_observe_ambient(void);
 void     interrupt_qtimer1_ch2_arm_compare(uint32_t target_counter32);
