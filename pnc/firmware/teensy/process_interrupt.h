@@ -19,6 +19,31 @@
 // behavior is performed by Priority 0 or Priority 16.
 void process_interrupt_foreground_service(void);
 
+// Optional TimePop pressure marker.  The recorder itself remains owned by
+// process_interrupt, but TimePop may attach the exact scheduler evidence that
+// caused a passed/too-close/expired decision to the currently active foreground
+// black-box record.  Calls are foreground-only; ISR calls are rejected and
+// counted.  The recorder is passive and never changes scheduler behavior.
+enum class interrupt_timepop_forensic_source_t : uint8_t {
+  NONE = 0,
+  SELECTED_PAST_AT_ENTRY = 1,
+  BECAME_PAST_IN_SCHEDULE_NEXT = 2,
+  ARM_REQUEST_ALREADY_PAST = 3,
+  SCHEDULE_NEXT_PASSED = 4,
+  SCHEDULE_NEXT_TOO_CLOSE = 5,
+  SCHEDULE_NEXT_EXPIRED = 6,
+  OTHER = 255,
+};
+
+void interrupt_forensics_note_timepop_pressure(
+    interrupt_timepop_forensic_source_t source,
+    uint32_t now_counter32,
+    uint32_t deadline_counter32,
+    int32_t signed_now_minus_deadline_ticks,
+    uint32_t slot,
+    uint32_t handle,
+    uint32_t phase);
+
 // Scalar wake bit set by Priority 16 whenever immutable foreground work exists.
 // TimePop's foreground idle witness reads it directly so pending custody yields
 // the loop without a cross-translation-unit function call.

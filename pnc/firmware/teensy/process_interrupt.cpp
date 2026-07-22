@@ -100,6 +100,21 @@ static constexpr uint32_t HANDOFF_QTIMER1_RING_SIZE = 16U;
 static constexpr uint32_t HANDOFF_OCXO_RING_SIZE = 4U;
 static constexpr uint32_t HANDOFF_PPS_RING_SIZE = 4U;
 
+// Foreground black-box recorder.  Two milliseconds is deliberately above
+// the observed normal callback/idle scale while remaining tiny beside the
+// suspected 50 ms event.  CH2 event age retains a tighter 100 us trigger.
+static constexpr uint32_t INTERRUPT_FORENSIC_RING_SIZE = 16U;
+static constexpr uint32_t INTERRUPT_FORENSIC_SERVICE_THRESHOLD_CYCLES =
+    (uint32_t)DWT_EXPECTED_PER_PPS / 500U;
+static constexpr uint32_t INTERRUPT_FORENSIC_GAP_THRESHOLD_CYCLES =
+    (uint32_t)DWT_EXPECTED_PER_PPS / 500U;
+static constexpr uint32_t INTERRUPT_FORENSIC_GAP_THRESHOLD_TICKS = 20000U;
+static constexpr uint32_t INTERRUPT_FORENSIC_CH2_AGE_THRESHOLD_TICKS = 1000U;
+static_assert(INTERRUPT_FORENSIC_SERVICE_THRESHOLD_CYCLES != 0U,
+              "foreground forensic service threshold must be nonzero");
+static_assert(INTERRUPT_FORENSIC_GAP_THRESHOLD_CYCLES != 0U,
+              "foreground forensic gap threshold must be nonzero");
+
 static constexpr uint8_t QTIMER1_VCLOCK_CH = 0U;
 static constexpr uint8_t QTIMER1_RETIRED_AUX_CH = 1U;
 static constexpr uint8_t QTIMER1_TIMEPOP_CH = 2U;
@@ -2413,6 +2428,352 @@ static timepop_foreground_diag_t g_timepop_foreground_diag{};
 static volatile bool g_timepop_foreground_rearm_requested = false;
 static bool g_interrupt_foreground_service_running = false;
 
+// ============================================================================
+// Foreground forensic black box
+// ============================================================================
+
+// A record is retained only when a threshold is crossed or TimePop explicitly
+// attaches a scheduler-pressure marker.  Routine loop passes update maxima but do
+// not consume ring space.  All writes are foreground-only; the sequence word makes
+// report snapshots coherent without masking sacred priority 0.
+enum : uint32_t {
+  INTERRUPT_FORENSIC_TRIGGER_SERVICE_LONG = 1UL << 0,
+  INTERRUPT_FORENSIC_TRIGGER_TIMEPOP_LONG = 1UL << 1,
+  INTERRUPT_FORENSIC_TRIGGER_SUBSCRIBER_LONG = 1UL << 2,
+  INTERRUPT_FORENSIC_TRIGGER_FEATURE_LONG = 1UL << 3,
+  INTERRUPT_FORENSIC_TRIGGER_FINALIZE_LONG = 1UL << 4,
+  INTERRUPT_FORENSIC_TRIGGER_LOOP_GAP_LONG = 1UL << 5,
+  INTERRUPT_FORENSIC_TRIGGER_CH2_AGE_LONG = 1UL << 6,
+  INTERRUPT_FORENSIC_TRIGGER_TIMEPOP_PRESSURE = 1UL << 7,
+};
+
+enum : uint32_t {
+  INTERRUPT_FORENSIC_STATE_MAILBOX_PENDING = 1UL << 0,
+  INTERRUPT_FORENSIC_STATE_CH2_FACT_OUTSTANDING = 1UL << 1,
+  INTERRUPT_FORENSIC_STATE_CH2_COMPARE_ARMED = 1UL << 2,
+  INTERRUPT_FORENSIC_STATE_CH2_DEFERRED_VALID = 1UL << 3,
+  INTERRUPT_FORENSIC_STATE_FOREGROUND_PENDING = 1UL << 4,
+  INTERRUPT_FORENSIC_STATE_REARM_REQUESTED = 1UL << 5,
+};
+
+struct interrupt_foreground_forensic_record_t {
+  uint32_t sequence = 0U;
+  uint32_t trigger_flags = 0U;
+
+  uint32_t prior_service_exit_dwt = 0U;
+  uint32_t prior_service_exit_counter32 = 0U;
+  uint32_t service_start_dwt = 0U;
+  uint32_t service_end_dwt = 0U;
+  uint32_t service_gap_cycles = 0U;
+  uint32_t service_gap_ticks = 0U;
+  uint32_t service_total_cycles = 0U;
+  uint32_t timepop_cycles = 0U;
+  uint32_t subscriber_cycles = 0U;
+  uint32_t feature_cycles = 0U;
+  uint32_t finalize_cycles = 0U;
+
+  uint32_t counter32_entry = 0U;
+  uint32_t counter32_exit = 0U;
+  uint32_t counter32_delta_ticks = 0U;
+  uint32_t pps_count_entry = 0U;
+  uint32_t pps_count_exit = 0U;
+  uint32_t state_flags_entry = 0U;
+  uint32_t state_flags_exit = 0U;
+
+  uint32_t ch2_packet_sequence = 0U;
+  uint32_t ch2_event_target_counter32 = 0U;
+  uint32_t ch2_service_counter32 = 0U;
+  int32_t ch2_event_age_ticks = 0;
+  uint32_t ch2_event_age_abs_ticks = 0U;
+  uint32_t ch2_capture_to_foreground_cycles = 0U;
+
+  uint32_t timepop_service_count_before = 0U;
+  uint32_t timepop_service_count_after = 0U;
+
+  uint32_t pressure_marker_count = 0U;
+  interrupt_timepop_forensic_source_t pressure_source =
+      interrupt_timepop_forensic_source_t::NONE;
+  uint32_t pressure_now_counter32 = 0U;
+  uint32_t pressure_deadline_counter32 = 0U;
+  int32_t pressure_signed_delta_ticks = 0;
+  uint32_t pressure_slot = UINT32_MAX;
+  uint32_t pressure_handle = 0U;
+  uint32_t pressure_phase = 0U;
+  uint32_t pressure_dwt = 0U;
+};
+
+struct interrupt_foreground_forensic_runtime_t {
+  volatile uint32_t write_seq = 0U;
+  interrupt_foreground_forensic_record_t
+      records[INTERRUPT_FORENSIC_RING_SIZE]{};
+
+  uint32_t service_pass_count = 0U;
+  uint32_t total_recorded = 0U;
+  uint32_t overwrite_count = 0U;
+  uint32_t next_record_sequence = 0U;
+  uint32_t previous_service_exit_dwt = 0U;
+  uint32_t previous_service_exit_counter32 = 0U;
+
+  uint32_t pressure_marker_count = 0U;
+  uint32_t pressure_marker_outside_service_count = 0U;
+  uint32_t pressure_marker_isr_reject_count = 0U;
+
+  uint32_t max_service_gap_cycles = 0U;
+  uint32_t max_service_gap_ticks = 0U;
+  uint32_t max_service_total_cycles = 0U;
+  uint32_t max_timepop_cycles = 0U;
+  uint32_t max_subscriber_cycles = 0U;
+  uint32_t max_feature_cycles = 0U;
+  uint32_t max_finalize_cycles = 0U;
+  uint32_t max_ch2_event_age_abs_ticks = 0U;
+  uint32_t max_ch2_capture_to_foreground_cycles = 0U;
+};
+
+static interrupt_foreground_forensic_runtime_t g_interrupt_foreground_forensics{};
+static interrupt_foreground_forensic_record_t g_interrupt_foreground_forensic_live{};
+static bool g_interrupt_foreground_forensic_live_active = false;
+
+static uint32_t interrupt_forensic_state_flags(void) {
+  uint32_t flags = 0U;
+  if (g_timepop_foreground_mailbox_pending) {
+    flags |= INTERRUPT_FORENSIC_STATE_MAILBOX_PENDING;
+  }
+  if (g_qtimer1_ch2_fact_outstanding) {
+    flags |= INTERRUPT_FORENSIC_STATE_CH2_FACT_OUTSTANDING;
+  }
+  if (g_qtimer1_ch2_compare_armed) {
+    flags |= INTERRUPT_FORENSIC_STATE_CH2_COMPARE_ARMED;
+  }
+  if (g_qtimer1_ch2_deferred_arm_valid) {
+    flags |= INTERRUPT_FORENSIC_STATE_CH2_DEFERRED_VALID;
+  }
+  if (g_process_interrupt_foreground_pending) {
+    flags |= INTERRUPT_FORENSIC_STATE_FOREGROUND_PENDING;
+  }
+  if (g_timepop_foreground_rearm_requested) {
+    flags |= INTERRUPT_FORENSIC_STATE_REARM_REQUESTED;
+  }
+  return flags;
+}
+
+static void interrupt_forensics_write_begin(void) {
+  g_interrupt_foreground_forensics.write_seq++;
+  dmb_barrier();
+}
+
+static void interrupt_forensics_write_end(void) {
+  dmb_barrier();
+  g_interrupt_foreground_forensics.write_seq++;
+}
+
+static void interrupt_forensics_commit_record(
+    interrupt_foreground_forensic_record_t record) {
+  interrupt_forensics_write_begin();
+  record.sequence = ++g_interrupt_foreground_forensics.next_record_sequence;
+  if (record.sequence == 0U) {
+    record.sequence = ++g_interrupt_foreground_forensics.next_record_sequence;
+  }
+  const uint32_t slot =
+      g_interrupt_foreground_forensics.total_recorded %
+      INTERRUPT_FORENSIC_RING_SIZE;
+  g_interrupt_foreground_forensics.records[slot] = record;
+  if (g_interrupt_foreground_forensics.total_recorded >=
+      INTERRUPT_FORENSIC_RING_SIZE) {
+    g_interrupt_foreground_forensics.overwrite_count++;
+  }
+  g_interrupt_foreground_forensics.total_recorded++;
+  interrupt_forensics_write_end();
+}
+
+static void interrupt_forensics_begin_service(void) {
+  interrupt_foreground_forensic_runtime_t& runtime =
+      g_interrupt_foreground_forensics;
+  interrupt_foreground_forensic_record_t& record =
+      g_interrupt_foreground_forensic_live;
+  record = interrupt_foreground_forensic_record_t{};
+  record.prior_service_exit_dwt = runtime.previous_service_exit_dwt;
+  record.prior_service_exit_counter32 =
+      runtime.previous_service_exit_counter32;
+  record.service_start_dwt = ARM_DWT_CYCCNT;
+  record.counter32_entry = interrupt_qtimer1_counter32_now();
+  if (record.prior_service_exit_dwt != 0U) {
+    record.service_gap_cycles =
+        record.service_start_dwt - record.prior_service_exit_dwt;
+    record.service_gap_ticks =
+        record.counter32_entry - record.prior_service_exit_counter32;
+  }
+  record.pps_count_entry = g_pps_gpio_heartbeat.edge_count;
+  record.state_flags_entry = interrupt_forensic_state_flags();
+  record.timepop_service_count_before =
+      (uint32_t)g_timepop_foreground_diag.service_count;
+  g_interrupt_foreground_forensic_live_active = true;
+}
+
+static void interrupt_forensics_note_ch2_foreground(
+    const timepop_foreground_packet_t& packet,
+    uint32_t service_dwt,
+    uint32_t service_counter32) {
+  if (!g_interrupt_foreground_forensic_live_active) return;
+  interrupt_foreground_forensic_record_t& record =
+      g_interrupt_foreground_forensic_live;
+  record.ch2_packet_sequence = packet.sequence;
+  record.ch2_event_target_counter32 = packet.target_counter32;
+  record.ch2_service_counter32 = service_counter32;
+  record.ch2_event_age_ticks =
+      (int32_t)(service_counter32 - packet.target_counter32);
+  record.ch2_event_age_abs_ticks =
+      interrupt_abs_i32(record.ch2_event_age_ticks);
+  record.ch2_capture_to_foreground_cycles =
+      service_dwt - packet.isr_entry_dwt_raw;
+  if (record.ch2_event_age_abs_ticks >=
+      INTERRUPT_FORENSIC_CH2_AGE_THRESHOLD_TICKS) {
+    record.trigger_flags |= INTERRUPT_FORENSIC_TRIGGER_CH2_AGE_LONG;
+  }
+}
+
+static void interrupt_forensics_finish_service(void) {
+  interrupt_foreground_forensic_runtime_t& runtime =
+      g_interrupt_foreground_forensics;
+  interrupt_foreground_forensic_record_t& record =
+      g_interrupt_foreground_forensic_live;
+  record.service_end_dwt = ARM_DWT_CYCCNT;
+  record.service_total_cycles =
+      record.service_end_dwt - record.service_start_dwt;
+  record.counter32_exit = interrupt_qtimer1_counter32_now();
+  record.counter32_delta_ticks =
+      record.counter32_exit - record.counter32_entry;
+  record.pps_count_exit = g_pps_gpio_heartbeat.edge_count;
+  record.state_flags_exit = interrupt_forensic_state_flags();
+  record.timepop_service_count_after =
+      (uint32_t)g_timepop_foreground_diag.service_count;
+
+  runtime.service_pass_count++;
+  if (record.service_gap_cycles > runtime.max_service_gap_cycles) {
+    runtime.max_service_gap_cycles = record.service_gap_cycles;
+  }
+  if (record.service_gap_ticks > runtime.max_service_gap_ticks) {
+    runtime.max_service_gap_ticks = record.service_gap_ticks;
+  }
+  if (record.service_total_cycles > runtime.max_service_total_cycles) {
+    runtime.max_service_total_cycles = record.service_total_cycles;
+  }
+  if (record.timepop_cycles > runtime.max_timepop_cycles) {
+    runtime.max_timepop_cycles = record.timepop_cycles;
+  }
+  if (record.subscriber_cycles > runtime.max_subscriber_cycles) {
+    runtime.max_subscriber_cycles = record.subscriber_cycles;
+  }
+  if (record.feature_cycles > runtime.max_feature_cycles) {
+    runtime.max_feature_cycles = record.feature_cycles;
+  }
+  if (record.finalize_cycles > runtime.max_finalize_cycles) {
+    runtime.max_finalize_cycles = record.finalize_cycles;
+  }
+  if (record.ch2_event_age_abs_ticks >
+      runtime.max_ch2_event_age_abs_ticks) {
+    runtime.max_ch2_event_age_abs_ticks = record.ch2_event_age_abs_ticks;
+  }
+  if (record.ch2_capture_to_foreground_cycles >
+      runtime.max_ch2_capture_to_foreground_cycles) {
+    runtime.max_ch2_capture_to_foreground_cycles =
+        record.ch2_capture_to_foreground_cycles;
+  }
+
+  if (record.service_gap_cycles >=
+          INTERRUPT_FORENSIC_GAP_THRESHOLD_CYCLES ||
+      record.service_gap_ticks >=
+          INTERRUPT_FORENSIC_GAP_THRESHOLD_TICKS) {
+    record.trigger_flags |= INTERRUPT_FORENSIC_TRIGGER_LOOP_GAP_LONG;
+  }
+  if (record.service_total_cycles >=
+      INTERRUPT_FORENSIC_SERVICE_THRESHOLD_CYCLES) {
+    record.trigger_flags |= INTERRUPT_FORENSIC_TRIGGER_SERVICE_LONG;
+  }
+  if (record.timepop_cycles >=
+      INTERRUPT_FORENSIC_SERVICE_THRESHOLD_CYCLES) {
+    record.trigger_flags |= INTERRUPT_FORENSIC_TRIGGER_TIMEPOP_LONG;
+  }
+  if (record.subscriber_cycles >=
+      INTERRUPT_FORENSIC_SERVICE_THRESHOLD_CYCLES) {
+    record.trigger_flags |= INTERRUPT_FORENSIC_TRIGGER_SUBSCRIBER_LONG;
+  }
+  if (record.feature_cycles >=
+      INTERRUPT_FORENSIC_SERVICE_THRESHOLD_CYCLES) {
+    record.trigger_flags |= INTERRUPT_FORENSIC_TRIGGER_FEATURE_LONG;
+  }
+  if (record.finalize_cycles >=
+      INTERRUPT_FORENSIC_SERVICE_THRESHOLD_CYCLES) {
+    record.trigger_flags |= INTERRUPT_FORENSIC_TRIGGER_FINALIZE_LONG;
+  }
+
+  runtime.previous_service_exit_dwt = record.service_end_dwt;
+  runtime.previous_service_exit_counter32 = record.counter32_exit;
+  g_interrupt_foreground_forensic_live_active = false;
+  if (record.trigger_flags != 0U) {
+    interrupt_forensics_commit_record(record);
+  }
+}
+
+void interrupt_forensics_note_timepop_pressure(
+    interrupt_timepop_forensic_source_t source,
+    uint32_t now_counter32,
+    uint32_t deadline_counter32,
+    int32_t signed_now_minus_deadline_ticks,
+    uint32_t slot,
+    uint32_t handle,
+    uint32_t phase) {
+  if (interrupt_ipsr() != 0U) {
+    g_interrupt_foreground_forensics.pressure_marker_isr_reject_count++;
+    return;
+  }
+
+  g_interrupt_foreground_forensics.pressure_marker_count++;
+  const uint32_t marker_dwt = ARM_DWT_CYCCNT;
+  if (g_interrupt_foreground_forensic_live_active) {
+    interrupt_foreground_forensic_record_t& record =
+        g_interrupt_foreground_forensic_live;
+    record.trigger_flags |= INTERRUPT_FORENSIC_TRIGGER_TIMEPOP_PRESSURE;
+    record.pressure_marker_count++;
+    if (record.pressure_marker_count == 1U ||
+        interrupt_abs_i32(signed_now_minus_deadline_ticks) >=
+            interrupt_abs_i32(record.pressure_signed_delta_ticks)) {
+      record.pressure_source = source;
+      record.pressure_now_counter32 = now_counter32;
+      record.pressure_deadline_counter32 = deadline_counter32;
+      record.pressure_signed_delta_ticks =
+          signed_now_minus_deadline_ticks;
+      record.pressure_slot = slot;
+      record.pressure_handle = handle;
+      record.pressure_phase = phase;
+      record.pressure_dwt = marker_dwt;
+    }
+    return;
+  }
+
+  // A TimePop pressure decision may occur outside the ordinary interrupt bridge
+  // (for example, a direct foreground arm API).  Preserve it as a stand-alone
+  // record rather than silently losing the evidence.
+  g_interrupt_foreground_forensics.pressure_marker_outside_service_count++;
+  interrupt_foreground_forensic_record_t record{};
+  record.trigger_flags = INTERRUPT_FORENSIC_TRIGGER_TIMEPOP_PRESSURE;
+  record.service_start_dwt = marker_dwt;
+  record.service_end_dwt = marker_dwt;
+  record.counter32_entry = interrupt_qtimer1_counter32_now();
+  record.counter32_exit = record.counter32_entry;
+  record.state_flags_entry = interrupt_forensic_state_flags();
+  record.state_flags_exit = record.state_flags_entry;
+  record.pressure_marker_count = 1U;
+  record.pressure_source = source;
+  record.pressure_now_counter32 = now_counter32;
+  record.pressure_deadline_counter32 = deadline_counter32;
+  record.pressure_signed_delta_ticks = signed_now_minus_deadline_ticks;
+  record.pressure_slot = slot;
+  record.pressure_handle = handle;
+  record.pressure_phase = phase;
+  record.pressure_dwt = marker_dwt;
+  interrupt_forensics_commit_record(record);
+}
+
 static inline volatile uint32_t& interrupt_nvic_ispr_word(uint32_t irq) {
   volatile uint32_t* const base = (volatile uint32_t*)0xE000E200UL;
   return base[irq >> 5];
@@ -3989,6 +4350,13 @@ static void interrupt_timepop_release_ch2_custody_foreground(void) {
 static void interrupt_timepop_foreground_service(void) {
   timepop_foreground_packet_t packet{};
   if (timepop_foreground_mailbox_take(packet)) {
+    const uint32_t forensic_service_dwt = ARM_DWT_CYCCNT;
+    const uint32_t forensic_service_counter32 =
+        interrupt_qtimer1_counter32_now();
+    interrupt_forensics_note_ch2_foreground(packet,
+                                               forensic_service_dwt,
+                                               forensic_service_counter32);
+
     interrupt_event_t event{};
     event.kind = interrupt_subscriber_kind_t::TIMEPOP;
     event.provider = interrupt_provider_kind_t::QTIMER1;
@@ -4054,18 +4422,35 @@ void process_interrupt_foreground_service(void) {
   }
   if (g_interrupt_foreground_service_running) return;
   g_interrupt_foreground_service_running = true;
+  interrupt_forensics_begin_service();
 
   // Called once per ordinary loop() pass.  This is the sole bridge from
   // interrupt-owned immutable facts into TimePop, application subscribers,
-  // and SYSTEM's foreground registry.
+  // and SYSTEM's foreground registry.  Phase timing is passive black-box
+  // evidence and cannot change the order or behavior of the bridge.
+  uint32_t phase_start = ARM_DWT_CYCCNT;
   interrupt_timepop_foreground_service();
-  interrupt_dispatch_foreground_service();
-  interrupt_features_foreground_flush();
+  g_interrupt_foreground_forensic_live.timepop_cycles =
+      ARM_DWT_CYCCNT - phase_start;
 
+  phase_start = ARM_DWT_CYCCNT;
+  interrupt_dispatch_foreground_service();
+  g_interrupt_foreground_forensic_live.subscriber_cycles =
+      ARM_DWT_CYCCNT - phase_start;
+
+  phase_start = ARM_DWT_CYCCNT;
+  interrupt_features_foreground_flush();
+  g_interrupt_foreground_forensic_live.feature_cycles =
+      ARM_DWT_CYCCNT - phase_start;
+
+  phase_start = ARM_DWT_CYCCNT;
   const uint32_t prior = interrupt_priority0_guard_enter();
   g_process_interrupt_foreground_pending = interrupt_foreground_work_pending_locked();
   interrupt_priority0_guard_exit(prior);
   g_interrupt_foreground_service_running = false;
+  g_interrupt_foreground_forensic_live.finalize_cycles =
+      ARM_DWT_CYCCNT - phase_start;
+  interrupt_forensics_finish_service();
 }
 
 void interrupt_prespin_service(timepop_ctx_t*, timepop_diag_t*, void*) {
@@ -4444,6 +4829,11 @@ void process_interrupt_init(void) {
   g_timepop_foreground_rearm_requested = false;
   g_process_interrupt_foreground_pending = false;
   g_interrupt_foreground_service_running = false;
+  g_interrupt_foreground_forensics =
+      interrupt_foreground_forensic_runtime_t{};
+  g_interrupt_foreground_forensic_live =
+      interrupt_foreground_forensic_record_t{};
+  g_interrupt_foreground_forensic_live_active = false;
   for (uint32_t i = 0; i < SMARTZERO_LANE_COUNT; ++i) {
     smartzero_reset_lane(i);
   }
@@ -4953,6 +5343,273 @@ static FLASHMEM Payload cmd_report_handoff(const Payload&) {
   return payload;
 }
 
+static const char* interrupt_timepop_forensic_source_name(
+    interrupt_timepop_forensic_source_t source) {
+  switch (source) {
+    case interrupt_timepop_forensic_source_t::SELECTED_PAST_AT_ENTRY:
+      return "SELECTED_PAST_AT_ENTRY";
+    case interrupt_timepop_forensic_source_t::BECAME_PAST_IN_SCHEDULE_NEXT:
+      return "BECAME_PAST_IN_SCHEDULE_NEXT";
+    case interrupt_timepop_forensic_source_t::ARM_REQUEST_ALREADY_PAST:
+      return "ARM_REQUEST_ALREADY_PAST";
+    case interrupt_timepop_forensic_source_t::SCHEDULE_NEXT_PASSED:
+      return "SCHEDULE_NEXT_PASSED";
+    case interrupt_timepop_forensic_source_t::SCHEDULE_NEXT_TOO_CLOSE:
+      return "SCHEDULE_NEXT_TOO_CLOSE";
+    case interrupt_timepop_forensic_source_t::SCHEDULE_NEXT_EXPIRED:
+      return "SCHEDULE_NEXT_EXPIRED";
+    case interrupt_timepop_forensic_source_t::OTHER:
+      return "OTHER";
+    default:
+      return "NONE";
+  }
+}
+
+static FLASHMEM void add_forensic_record_field(
+    Payload& payload,
+    uint32_t index,
+    const char* suffix,
+    uint32_t value) {
+  char key[64];
+  snprintf(key, sizeof(key), "r%02lu_%s", (unsigned long)index, suffix);
+  payload.add(key, value);
+}
+
+static FLASHMEM void add_forensic_record_field_i32(
+    Payload& payload,
+    uint32_t index,
+    const char* suffix,
+    int32_t value) {
+  char key[64];
+  snprintf(key, sizeof(key), "r%02lu_%s", (unsigned long)index, suffix);
+  payload.add(key, value);
+}
+
+static FLASHMEM void add_forensic_record_field_string(
+    Payload& payload,
+    uint32_t index,
+    const char* suffix,
+    const char* value) {
+  char key[64];
+  snprintf(key, sizeof(key), "r%02lu_%s", (unsigned long)index, suffix);
+  payload.add(key, value);
+}
+
+static FLASHMEM Payload cmd_report_forensics(const Payload&) {
+  Payload payload;
+  payload.add("report", "INTERRUPT_FORENSICS");
+  payload.add("architecture", "FOREGROUND_BLACK_BOX");
+  payload.add("record_order", "OLDEST_TO_NEWEST");
+  payload.add("gap_measurement", "DWT_AND_QTIMER10MHZ");
+  payload.add("timepop_pressure_marker_api_present", true);
+  payload.add("ring_size", INTERRUPT_FORENSIC_RING_SIZE);
+  payload.add("service_threshold_cycles",
+              INTERRUPT_FORENSIC_SERVICE_THRESHOLD_CYCLES);
+  payload.add("gap_threshold_cycles",
+              INTERRUPT_FORENSIC_GAP_THRESHOLD_CYCLES);
+  payload.add("gap_threshold_ticks",
+              INTERRUPT_FORENSIC_GAP_THRESHOLD_TICKS);
+  payload.add("ch2_age_threshold_ticks",
+              INTERRUPT_FORENSIC_CH2_AGE_THRESHOLD_TICKS);
+  payload.add("trigger_service_long_mask",
+              INTERRUPT_FORENSIC_TRIGGER_SERVICE_LONG);
+  payload.add("trigger_timepop_long_mask",
+              INTERRUPT_FORENSIC_TRIGGER_TIMEPOP_LONG);
+  payload.add("trigger_subscriber_long_mask",
+              INTERRUPT_FORENSIC_TRIGGER_SUBSCRIBER_LONG);
+  payload.add("trigger_feature_long_mask",
+              INTERRUPT_FORENSIC_TRIGGER_FEATURE_LONG);
+  payload.add("trigger_finalize_long_mask",
+              INTERRUPT_FORENSIC_TRIGGER_FINALIZE_LONG);
+  payload.add("trigger_loop_gap_long_mask",
+              INTERRUPT_FORENSIC_TRIGGER_LOOP_GAP_LONG);
+  payload.add("trigger_ch2_age_long_mask",
+              INTERRUPT_FORENSIC_TRIGGER_CH2_AGE_LONG);
+  payload.add("trigger_timepop_pressure_mask",
+              INTERRUPT_FORENSIC_TRIGGER_TIMEPOP_PRESSURE);
+
+  payload.add("state_mailbox_pending_mask",
+              INTERRUPT_FORENSIC_STATE_MAILBOX_PENDING);
+  payload.add("state_ch2_fact_outstanding_mask",
+              INTERRUPT_FORENSIC_STATE_CH2_FACT_OUTSTANDING);
+  payload.add("state_ch2_compare_armed_mask",
+              INTERRUPT_FORENSIC_STATE_CH2_COMPARE_ARMED);
+  payload.add("state_ch2_deferred_valid_mask",
+              INTERRUPT_FORENSIC_STATE_CH2_DEFERRED_VALID);
+  payload.add("state_foreground_pending_mask",
+              INTERRUPT_FORENSIC_STATE_FOREGROUND_PENDING);
+  payload.add("state_rearm_requested_mask",
+              INTERRUPT_FORENSIC_STATE_REARM_REQUESTED);
+
+  uint32_t service_pass_count = 0U;
+  uint32_t total_recorded = 0U;
+  uint32_t overwrite_count = 0U;
+  uint32_t pressure_marker_count = 0U;
+  uint32_t pressure_marker_outside_service_count = 0U;
+  uint32_t pressure_marker_isr_reject_count = 0U;
+  uint32_t max_service_gap_cycles = 0U;
+  uint32_t max_service_gap_ticks = 0U;
+  uint32_t max_service_total_cycles = 0U;
+  uint32_t max_timepop_cycles = 0U;
+  uint32_t max_subscriber_cycles = 0U;
+  uint32_t max_feature_cycles = 0U;
+  uint32_t max_finalize_cycles = 0U;
+  uint32_t max_ch2_event_age_abs_ticks = 0U;
+  uint32_t max_ch2_capture_to_foreground_cycles = 0U;
+  bool snapshot_ok = false;
+
+  for (uint32_t attempt = 0U; attempt < 4U; ++attempt) {
+    const uint32_t seq1 = g_interrupt_foreground_forensics.write_seq;
+    if (seq1 & 1U) continue;
+    dmb_barrier();
+    service_pass_count = g_interrupt_foreground_forensics.service_pass_count;
+    total_recorded = g_interrupt_foreground_forensics.total_recorded;
+    overwrite_count = g_interrupt_foreground_forensics.overwrite_count;
+    pressure_marker_count =
+        g_interrupt_foreground_forensics.pressure_marker_count;
+    pressure_marker_outside_service_count =
+        g_interrupt_foreground_forensics.pressure_marker_outside_service_count;
+    pressure_marker_isr_reject_count =
+        g_interrupt_foreground_forensics.pressure_marker_isr_reject_count;
+    max_service_gap_cycles =
+        g_interrupt_foreground_forensics.max_service_gap_cycles;
+    max_service_gap_ticks =
+        g_interrupt_foreground_forensics.max_service_gap_ticks;
+    max_service_total_cycles =
+        g_interrupt_foreground_forensics.max_service_total_cycles;
+    max_timepop_cycles = g_interrupt_foreground_forensics.max_timepop_cycles;
+    max_subscriber_cycles =
+        g_interrupt_foreground_forensics.max_subscriber_cycles;
+    max_feature_cycles = g_interrupt_foreground_forensics.max_feature_cycles;
+    max_finalize_cycles = g_interrupt_foreground_forensics.max_finalize_cycles;
+    max_ch2_event_age_abs_ticks =
+        g_interrupt_foreground_forensics.max_ch2_event_age_abs_ticks;
+    max_ch2_capture_to_foreground_cycles =
+        g_interrupt_foreground_forensics.max_ch2_capture_to_foreground_cycles;
+    dmb_barrier();
+    const uint32_t seq2 = g_interrupt_foreground_forensics.write_seq;
+    if (seq1 == seq2 && (seq2 & 1U) == 0U) {
+      snapshot_ok = true;
+      break;
+    }
+  }
+
+  const uint32_t stored = total_recorded < INTERRUPT_FORENSIC_RING_SIZE
+      ? total_recorded
+      : INTERRUPT_FORENSIC_RING_SIZE;
+  payload.add("snapshot_ok", snapshot_ok);
+  payload.add("service_pass_count", service_pass_count);
+  payload.add("total_recorded", total_recorded);
+  payload.add("records_stored", stored);
+  payload.add("overwrite_count", overwrite_count);
+  payload.add("pressure_marker_count", pressure_marker_count);
+  payload.add("timepop_pressure_marker_wiring_observed",
+              pressure_marker_count != 0U);
+  payload.add("pressure_marker_outside_service_count",
+              pressure_marker_outside_service_count);
+  payload.add("pressure_marker_isr_reject_count",
+              pressure_marker_isr_reject_count);
+  payload.add("max_service_gap_cycles", max_service_gap_cycles);
+  payload.add("max_service_gap_ticks", max_service_gap_ticks);
+  payload.add("max_service_total_cycles", max_service_total_cycles);
+  payload.add("max_timepop_cycles", max_timepop_cycles);
+  payload.add("max_subscriber_cycles", max_subscriber_cycles);
+  payload.add("max_feature_cycles", max_feature_cycles);
+  payload.add("max_finalize_cycles", max_finalize_cycles);
+  payload.add("max_ch2_event_age_abs_ticks", max_ch2_event_age_abs_ticks);
+  payload.add("max_ch2_capture_to_foreground_cycles",
+              max_ch2_capture_to_foreground_cycles);
+  payload.add("live_record_active", g_interrupt_foreground_forensic_live_active);
+
+  if (!snapshot_ok) return payload;
+
+  const uint32_t oldest = total_recorded >= INTERRUPT_FORENSIC_RING_SIZE
+      ? total_recorded % INTERRUPT_FORENSIC_RING_SIZE
+      : 0U;
+  for (uint32_t i = 0U; i < stored; ++i) {
+    const interrupt_foreground_forensic_record_t record =
+        g_interrupt_foreground_forensics.records[
+            (oldest + i) % INTERRUPT_FORENSIC_RING_SIZE];
+    add_forensic_record_field(payload, i, "sequence", record.sequence);
+    add_forensic_record_field(payload, i, "trigger_flags",
+                               record.trigger_flags);
+    add_forensic_record_field(payload, i, "prior_service_exit_dwt",
+                               record.prior_service_exit_dwt);
+    add_forensic_record_field(payload, i,
+                               "prior_service_exit_counter32",
+                               record.prior_service_exit_counter32);
+    add_forensic_record_field(payload, i, "service_start_dwt",
+                               record.service_start_dwt);
+    add_forensic_record_field(payload, i, "service_end_dwt",
+                               record.service_end_dwt);
+    add_forensic_record_field(payload, i, "service_gap_cycles",
+                               record.service_gap_cycles);
+    add_forensic_record_field(payload, i, "service_gap_ticks",
+                               record.service_gap_ticks);
+    add_forensic_record_field(payload, i, "service_total_cycles",
+                               record.service_total_cycles);
+    add_forensic_record_field(payload, i, "timepop_cycles",
+                               record.timepop_cycles);
+    add_forensic_record_field(payload, i, "subscriber_cycles",
+                               record.subscriber_cycles);
+    add_forensic_record_field(payload, i, "feature_cycles",
+                               record.feature_cycles);
+    add_forensic_record_field(payload, i, "finalize_cycles",
+                               record.finalize_cycles);
+    add_forensic_record_field(payload, i, "counter32_entry",
+                               record.counter32_entry);
+    add_forensic_record_field(payload, i, "counter32_exit",
+                               record.counter32_exit);
+    add_forensic_record_field(payload, i, "counter32_delta_ticks",
+                               record.counter32_delta_ticks);
+    add_forensic_record_field(payload, i, "pps_count_entry",
+                               record.pps_count_entry);
+    add_forensic_record_field(payload, i, "pps_count_exit",
+                               record.pps_count_exit);
+    add_forensic_record_field(payload, i, "state_flags_entry",
+                               record.state_flags_entry);
+    add_forensic_record_field(payload, i, "state_flags_exit",
+                               record.state_flags_exit);
+    add_forensic_record_field(payload, i, "ch2_packet_sequence",
+                               record.ch2_packet_sequence);
+    add_forensic_record_field(payload, i, "ch2_event_target_counter32",
+                               record.ch2_event_target_counter32);
+    add_forensic_record_field(payload, i, "ch2_service_counter32",
+                               record.ch2_service_counter32);
+    add_forensic_record_field_i32(payload, i, "ch2_event_age_ticks",
+                                   record.ch2_event_age_ticks);
+    add_forensic_record_field(payload, i, "ch2_event_age_abs_ticks",
+                               record.ch2_event_age_abs_ticks);
+    add_forensic_record_field(payload, i,
+                               "ch2_capture_to_foreground_cycles",
+                               record.ch2_capture_to_foreground_cycles);
+    add_forensic_record_field(payload, i, "timepop_service_count_before",
+                               record.timepop_service_count_before);
+    add_forensic_record_field(payload, i, "timepop_service_count_after",
+                               record.timepop_service_count_after);
+    add_forensic_record_field(payload, i, "pressure_marker_count",
+                               record.pressure_marker_count);
+    add_forensic_record_field_string(
+        payload, i, "pressure_source",
+        interrupt_timepop_forensic_source_name(record.pressure_source));
+    add_forensic_record_field(payload, i, "pressure_now_counter32",
+                               record.pressure_now_counter32);
+    add_forensic_record_field(payload, i, "pressure_deadline_counter32",
+                               record.pressure_deadline_counter32);
+    add_forensic_record_field_i32(payload, i, "pressure_signed_delta_ticks",
+                                   record.pressure_signed_delta_ticks);
+    add_forensic_record_field(payload, i, "pressure_slot",
+                               record.pressure_slot);
+    add_forensic_record_field(payload, i, "pressure_handle",
+                               record.pressure_handle);
+    add_forensic_record_field(payload, i, "pressure_phase",
+                               record.pressure_phase);
+    add_forensic_record_field(payload, i, "pressure_dwt",
+                               record.pressure_dwt);
+  }
+  return payload;
+}
+
 static FLASHMEM Payload cmd_report_integrity(const Payload&) {
   Payload payload;
   payload.add("report", "INTERRUPT_INTEGRITY");
@@ -5034,6 +5691,7 @@ static const process_command_entry_t INTERRUPT_COMMANDS[] = {
   { "REPORT_CADENCE", cmd_report_cadence },
   { "REPORT_SMARTZERO", cmd_report_smartzero },
   { "REPORT_HANDOFF", cmd_report_handoff },
+  { "REPORT_FORENSICS", cmd_report_forensics },
   { "REPORT_INTEGRITY", cmd_report_integrity },
   { "REPORT_LANES", cmd_report_lanes },
   { "REPORT_LANE", cmd_report_lane },
