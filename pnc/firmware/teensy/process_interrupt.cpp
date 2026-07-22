@@ -5,11 +5,17 @@
 // process_interrupt owns only executable custody and observed edge facts.
 //
 // Priority 0 is the sacred capture tier:
-//   * ARM_DWT_CYCCNT is captured as the first instruction of every timing ISR.
-//   * the hardware source is defused;
+//   * ARM_DWT_CYCCNT is captured before any handler work;
+//   * the hardware source is minimally defused;
 //   * the already-authored compare target is retained as event identity;
-//   * an optional ambient low-word read is retained as witness evidence only;
-//   * a bounded scalar packet is handed to priority 16.
+//   * only indispensable contemporaneous hardware witnesses are read;
+//   * a bounded scalar packet is enqueued;
+//   * priority 16 is pended once per hardware ISR entry.
+//
+// Priority 0 performs no crash tripwire scan, capture-window timing, routine
+// queue accounting, target catch-up, compare rearm, feature publication, or
+// subscriber work.  Even anomaly recovery is requested here and executed at
+// priority 16.
 //
 // Priority 16 owns continuation:
 //   * VCLOCK extends the three 16-bit timer domains and tends OCXO target arms;
@@ -2057,6 +2063,10 @@ static volatile bool g_vclock_heartbeat_armed = false;
 static volatile uint32_t g_vclock_heartbeat_next_counter32 = 0U;
 static volatile uint16_t g_vclock_heartbeat_target_low16 = 0U;
 static volatile uint32_t g_vclock_heartbeat_arm_count = 0U;
+static volatile uint32_t g_vclock_capture_overrun_rearm_request_count = 0U;
+static uint32_t g_vclock_capture_overrun_rearm_complete_count = 0U;
+static uint32_t g_ocxo1_capture_overrun_recovery_count = 0U;
+static uint32_t g_ocxo2_capture_overrun_recovery_count = 0U;
 static volatile uint32_t g_qtimer1_ch2_last_target_counter32 = 0U;
 static volatile uint32_t g_qtimer1_ch2_arm_count = 0U;
 static volatile interrupt_qtimer1_ch2_handler_fn g_qtimer1_ch2_handler = nullptr;
@@ -2199,7 +2209,6 @@ static volatile uint32_t g_interrupt_capture_sequence = 0U;
 struct vclock_capture_packet_t {
   uint32_t sequence = 0;
   uint32_t isr_entry_dwt_raw = 0;
-  uint32_t capture_exit_dwt = 0;
   uint32_t target_counter32 = 0;
   uint16_t target_low16 = 0;
   uint16_t service_low16 = 0;
@@ -2208,14 +2217,12 @@ struct vclock_capture_packet_t {
 struct ch2_capture_packet_t {
   uint32_t sequence = 0;
   uint32_t isr_entry_dwt_raw = 0;
-  uint32_t capture_exit_dwt = 0;
   uint32_t target_counter32 = 0;
 };
 
 struct ocxo_capture_packet_t {
   uint32_t sequence = 0;
   uint32_t isr_entry_dwt_raw = 0;
-  uint32_t capture_exit_dwt = 0;
   uint32_t target_counter32 = 0;
   uint16_t target_low16 = 0;
   uint16_t ambient_low16 = 0;
@@ -2226,7 +2233,6 @@ struct ocxo_capture_packet_t {
 struct pps_capture_packet_t {
   uint32_t sequence = 0;
   uint32_t isr_entry_dwt_raw = 0;
-  uint32_t capture_exit_dwt = 0;
   uint16_t vclock_hardware16 = 0;
   uint16_t ocxo1_hardware16 = 0;
   uint16_t ocxo2_hardware16 = 0;
@@ -2286,8 +2292,9 @@ static bool capture_ring_push_priority0(
     T packet) {
   const uint32_t head = ring.head;
   dmb_barrier();
-  const uint32_t pending = head - ring.tail;
-  if (pending >= N) {
+  if (head - ring.tail >= N) {
+    // The overrun count is the one anomaly fact that cannot be reconstructed
+    // after a packet fails to enter custody.  Recovery itself remains priority 16.
     diag.overrun_count++;
     return false;
   }
@@ -2295,13 +2302,6 @@ static bool capture_ring_push_priority0(
   ring.items[head % N] = packet;
   dmb_barrier();
   ring.head = head + 1U;
-  const uint32_t pending_after = pending + 1U;
-  diag.capture_count++;
-  diag.enqueue_count++;
-  diag.pending_count = pending_after;
-  diag.last_sequence = packet.sequence;
-  diag.last_capture_dwt = packet.isr_entry_dwt_raw;
-  if (pending_after > diag.high_water) diag.high_water = pending_after;
   return true;
 }
 
@@ -2313,12 +2313,20 @@ static bool capture_ring_pop_handoff(
   const uint32_t tail = ring.tail;
   const uint32_t head = ring.head;
   if (tail == head) return false;
+  const uint32_t pending_before = head - tail;
   dmb_barrier();
   packet = ring.items[tail % N];
   dmb_barrier();
   ring.tail = tail + 1U;
+
+  // Routine queue accounting belongs to continuation, never sacred capture.
+  diag.capture_count++;
+  diag.enqueue_count++;
   diag.dequeue_count++;
-  diag.pending_count = head - (tail + 1U);
+  diag.pending_count = pending_before - 1U;
+  diag.last_sequence = packet.sequence;
+  diag.last_capture_dwt = packet.isr_entry_dwt_raw;
+  if (pending_before > diag.high_water) diag.high_water = pending_before;
   return true;
 }
 
@@ -2342,15 +2350,11 @@ static bool handoff_any_pending(void) {
          capture_ring_pending(g_pps_capture_ring) != 0U;
 }
 
-static void interrupt_handoff_request_priority0(void) {
-  const uint32_t request_dwt = ARM_DWT_CYCCNT;
-
-  // Preserve the first request that created the pending handoff.  Later
-  // priority-0 captures coalesce into that handoff and must not replace its
-  // timestamp with a value newer than the already-entered priority-16 ISR.
-  if (!g_interrupt_handoff.pending) {
-    g_interrupt_handoff.last_request_dwt = request_dwt;
-  }
+static void interrupt_handoff_request_priority0(uint32_t request_dwt) {
+  // Preserve the first capture that created this pending continuation.  A
+  // same-vector VCLOCK/TimePop pair therefore performs exactly one NVIC pend.
+  if (g_interrupt_handoff.pending) return;
+  g_interrupt_handoff.last_request_dwt = request_dwt;
   g_interrupt_handoff.pending = true;
   g_interrupt_handoff.request_count++;
   dmb_barrier();
@@ -2544,6 +2548,7 @@ static void pps_relay_tick_from_vclock(void) {
 // ============================================================================
 
 static void process_vclock_packet(const vclock_capture_packet_t& packet) {
+  crash_stack_tripwire_isr_check(CRASH_TRIPWIRE_SITE_QTIMER1);
   const uint32_t captured_target = packet.target_counter32;
   const uint16_t target_low16 = packet.target_low16;
   const uint32_t service_counter32 =
@@ -2631,6 +2636,7 @@ static void process_vclock_packet(const vclock_capture_packet_t& packet) {
 }
 
 static void process_ch2_packet(const ch2_capture_packet_t& packet) {
+  crash_stack_tripwire_isr_check(CRASH_TRIPWIRE_SITE_QTIMER1);
   const interrupt_qtimer1_ch2_handler_fn callback = g_qtimer1_ch2_handler;
   if (!interrupt_callback_address_executable((uintptr_t)callback)) return;
 
@@ -2694,6 +2700,10 @@ static void ocxo_complete_capture_custody(
 
 static void process_ocxo_packet(const ocxo_runtime_context_t& ctx,
                                 const ocxo_capture_packet_t& packet) {
+  crash_stack_tripwire_isr_check(
+      ctx.kind == interrupt_subscriber_kind_t::OCXO1
+          ? CRASH_TRIPWIRE_SITE_QTIMER2
+          : CRASH_TRIPWIRE_SITE_QTIMER3);
   ocxo_lane_t& lane = *ctx.lane;
   synthetic_clock32_t& clock = *ctx.clock32;
   lane.irq_count++;
@@ -2719,6 +2729,7 @@ static void process_ocxo_packet(const ocxo_runtime_context_t& ctx,
 
   const uint32_t dwt_at_edge =
       qtimer_event_dwt_from_isr_entry_raw(packet.isr_entry_dwt_raw);
+  lane.capture_pending_set_count++;
   lane.last_dwt_at_edge = dwt_at_edge;
   lane.last_event_counter32 = target;
   lane.fire_count++;
@@ -2805,6 +2816,7 @@ static void process_ocxo_packet(const ocxo_runtime_context_t& ctx,
 }
 
 static void process_pps_packet(const pps_capture_packet_t& packet) {
+  crash_stack_tripwire_isr_check(CRASH_TRIPWIRE_SITE_PPS_GPIO);
   pps_t pps{};
   pps.sequence = ++g_pps_gpio_heartbeat.edge_count;
   pps.dwt_at_edge = pps_dwt_from_isr_entry_raw(packet.isr_entry_dwt_raw);
@@ -2820,9 +2832,8 @@ static void process_pps_packet(const pps_capture_packet_t& packet) {
   capture.sequence = pps.sequence;
   capture.capture_dwt_start_raw = packet.isr_entry_dwt_raw;
   capture.capture_dwt_after_vclock_raw = packet.isr_entry_dwt_raw;
-  capture.capture_dwt_end_raw = packet.capture_exit_dwt;
-  capture.capture_window_cycles =
-      packet.capture_exit_dwt - packet.isr_entry_dwt_raw;
+  capture.capture_dwt_end_raw = packet.isr_entry_dwt_raw;
+  capture.capture_window_cycles = 0U;
   capture.vclock_read_offset_cycles = 0U;
   capture.vclock_dwt_at_edge = pps.dwt_at_edge;
   capture.vclock_capture_valid = true;
@@ -2866,6 +2877,30 @@ static void process_pps_packet(const pps_capture_packet_t& packet) {
       g_pps_entry_latency_handler;
   if (interrupt_callback_address_executable((uintptr_t)callback)) {
     callback(pps.sequence, packet.isr_entry_dwt_raw);
+  }
+}
+
+static void recover_priority0_capture_overruns(void) {
+  const uint32_t vclock_requests =
+      g_vclock_capture_overrun_rearm_request_count;
+  if (g_vclock_capture_overrun_rearm_complete_count != vclock_requests) {
+    g_vclock_capture_overrun_rearm_complete_count = vclock_requests;
+    g_vclock_lane.miss_count++;
+    (void)vclock_heartbeat_arm();
+  }
+
+  const uint32_t ocxo1_requests =
+      g_ocxo1_lane.capture_pending_enqueue_fail_count;
+  if (g_ocxo1_capture_overrun_recovery_count != ocxo1_requests) {
+    g_ocxo1_capture_overrun_recovery_count = ocxo1_requests;
+    ocxo_tend_and_arm(g_ocxo1_ctx);
+  }
+
+  const uint32_t ocxo2_requests =
+      g_ocxo2_lane.capture_pending_enqueue_fail_count;
+  if (g_ocxo2_capture_overrun_recovery_count != ocxo2_requests) {
+    g_ocxo2_capture_overrun_recovery_count = ocxo2_requests;
+    ocxo_tend_and_arm(g_ocxo2_ctx);
   }
 }
 
@@ -2975,7 +3010,7 @@ static void interrupt_handoff_service_isr(void) {
   const uint32_t entry_dwt = ARM_DWT_CYCCNT;
   if (g_interrupt_handoff.running) {
     g_interrupt_handoff.reentry_count++;
-    interrupt_handoff_request_priority0();
+    interrupt_handoff_request_priority0(entry_dwt);
     return;
   }
   // Snapshot the request while pending is still true.  Priority-0 requests
@@ -3016,10 +3051,11 @@ static void interrupt_handoff_service_isr(void) {
          handoff_drain_one_oldest()) {
     ++drained;
   }
+  recover_priority0_capture_overruns();
   if (handoff_any_pending()) {
     g_interrupt_handoff.drain_budget_exhausted_count++;
     g_interrupt_handoff.repend_count++;
-    interrupt_handoff_request_priority0();
+    interrupt_handoff_request_priority0(ARM_DWT_CYCCNT);
   }
 
   ZPNET_EXECUTION_TRACE(
@@ -3053,93 +3089,100 @@ static void interrupt_handoff_configure(void) {
 // Sacred priority-0 capture
 // ============================================================================
 
-static void qtimer1_capture_vclock_priority0(uint32_t isr_entry_dwt_raw,
-                                              uint16_t service_low16) {
-  const uint32_t target = g_vclock_heartbeat_next_counter32;
-  const uint16_t target_low16 = g_vclock_heartbeat_target_low16;
-
-  // Priority 0 defuses the source and captures facts only.  Priority 16 owns
-  // catch-up arithmetic and programming of the next VCLOCK compare.
+static __attribute__((always_inline)) inline void
+qtimer1_defuse_vclock_priority0(void) {
+  // Preserve the established QTimer1 disable/clear/readback sequence exactly;
+  // source defusing is sacred-tier work, but compare rearm is not.
   IMXRT_TMR1.CH[QTIMER1_VCLOCK_CH].CSCTRL &= ~TMR_CSCTRL_TCF1EN;
   qtimer1_vclock_clear_compare_flag();
+}
+
+static __attribute__((always_inline)) inline void
+qtimer1_ack_timepop_priority0(void) {
+  qtimer1_ch2_clear_compare_flag();
+}
+
+static __attribute__((always_inline)) inline void
+qtimer_defuse_ocxo_priority0(IMXRT_TMR_t& module, uint8_t channel) {
+  // Preserve the existing OCXO double-clear/readback hardware sequence.
+  qtimer_disable_compare(module, channel);
+}
+
+static __attribute__((always_inline)) inline bool
+qtimer1_capture_vclock_priority0(uint32_t isr_entry_dwt_raw,
+                                uint16_t service_low16) {
+  const uint32_t target = g_vclock_heartbeat_next_counter32;
+  const uint16_t target_low16 = g_vclock_heartbeat_target_low16;
+  qtimer1_defuse_vclock_priority0();
 
   vclock_capture_packet_t packet{};
   packet.isr_entry_dwt_raw = isr_entry_dwt_raw;
   packet.target_counter32 = target;
   packet.target_low16 = target_low16;
   packet.service_low16 = service_low16;
-  packet.capture_exit_dwt = ARM_DWT_CYCCNT;
   if (capture_ring_push_priority0(g_vclock_capture_ring,
                                   g_handoff_vclock,
                                   packet)) {
-    interrupt_handoff_request_priority0();
-    return;
+    return true;
   }
 
-  // An overrun has already lost this tooth.  Keep VCLOCK alive with the
-  // smallest possible anomaly fallback; ordinary rearm never runs here.
-  const uint32_t next = target + VCLOCK_INTERVAL_COUNTS;
-  const uint16_t next_low16 = (uint16_t)(target_low16 +
-                                         (uint16_t)VCLOCK_INTERVAL_COUNTS);
-  g_vclock_heartbeat_next_counter32 = next;
-  g_vclock_heartbeat_target_low16 = next_low16;
-  qtimer1_vclock_program_compare(next_low16);
+  // Keepalive recovery is deliberately requested here but executed at priority 16.
+  g_vclock_capture_overrun_rearm_request_count++;
+  return true;
 }
 
-static void qtimer1_capture_ch2_priority0(uint32_t isr_entry_dwt_raw) {
-  qtimer1_ch2_clear_compare_flag();
+static __attribute__((always_inline)) inline bool
+qtimer1_capture_ch2_priority0(uint32_t isr_entry_dwt_raw) {
+  qtimer1_ack_timepop_priority0();
   ch2_capture_packet_t packet{};
   packet.isr_entry_dwt_raw = isr_entry_dwt_raw;
   packet.target_counter32 = g_qtimer1_ch2_last_target_counter32;
-  packet.capture_exit_dwt = ARM_DWT_CYCCNT;
-  if (capture_ring_push_priority0(g_ch2_capture_ring,
-                                  g_handoff_ch2,
-                                  packet)) {
-    interrupt_handoff_request_priority0();
-  }
+  return capture_ring_push_priority0(g_ch2_capture_ring,
+                                     g_handoff_ch2,
+                                     packet);
 }
 
 static void qtimer1_isr(void) {
   const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;
-  crash_stack_tripwire_isr_check(CRASH_TRIPWIRE_SITE_QTIMER1);
-
   const uint32_t vclock_csctrl =
       IMXRT_TMR1.CH[QTIMER1_VCLOCK_CH].CSCTRL;
   const uint32_t ch2_csctrl =
       IMXRT_TMR1.CH[QTIMER1_TIMEPOP_CH].CSCTRL;
+  bool handoff_needed = false;
 
-  // Same-vector matches share the same first-instruction DWT capture.  This is
-  // intentional: co-timed TimePop work cannot delay or remeasure VCLOCK.
+  // Same-vector matches share one entry coordinate and one priority-16 pend.
   if ((vclock_csctrl & TMR_CSCTRL_TCF1) != 0U) {
-    const uint16_t vclock_service_low16 =
+    const uint16_t service_low16 =
         IMXRT_TMR1.CH[QTIMER1_VCLOCK_CH].CNTR;
-    qtimer1_capture_vclock_priority0(isr_entry_dwt_raw,
-                                     vclock_service_low16);
+    handoff_needed |=
+        qtimer1_capture_vclock_priority0(isr_entry_dwt_raw, service_low16);
   }
   if ((ch2_csctrl & TMR_CSCTRL_TCF1) != 0U) {
-    qtimer1_capture_ch2_priority0(isr_entry_dwt_raw);
+    handoff_needed |= qtimer1_capture_ch2_priority0(isr_entry_dwt_raw);
+  }
+  if (handoff_needed) {
+    interrupt_handoff_request_priority0(isr_entry_dwt_raw);
   }
 }
 
-static void ocxo_capture_priority0(
-    const ocxo_runtime_context_t& ctx,
+template <uint8_t CHANNEL>
+static __attribute__((always_inline)) inline bool ocxo_capture_priority0(
+    ocxo_lane_t& lane,
+    IMXRT_TMR_t& module,
     interrupt_capture_ring_t<ocxo_capture_packet_t,
                              HANDOFF_OCXO_RING_SIZE>& ring,
     interrupt_handoff_source_diag_t& handoff,
     uint32_t isr_entry_dwt_raw) {
-  ocxo_lane_t& lane = *ctx.lane;
-  const uint32_t csctrl = lane.module->CH[lane.channel].CSCTRL;
+  const uint32_t csctrl = module.CH[CHANNEL].CSCTRL;
   if ((csctrl & TMR_CSCTRL_TCF1) == 0U) {
     lane.false_irq_count++;
-    return;
+    return false;
   }
 
-  // DWT was captured before any of these reads.  CNTR and COMP1 are retained
-  // only as witnesses; the semantic identity is the authored target below.
-  const uint16_t ambient_low16 = lane.module->CH[lane.channel].CNTR;
-  const uint16_t compare_low16 = lane.module->CH[lane.channel].COMP1;
-
-  // compare_armed is the publication word for the authored identity below.
+  // These reads are contemporaneous witnesses.  The authored target remains
+  // semantic identity and no later hardware read may replace it.
+  const uint16_t ambient_low16 = module.CH[CHANNEL].CNTR;
+  const uint16_t compare_low16 = module.CH[CHANNEL].COMP1;
   const bool compare_owned = lane.compare_armed;
   dmb_barrier();
   const uint32_t target_counter32 = lane.armed_target_counter32;
@@ -3147,7 +3190,7 @@ static void ocxo_capture_priority0(
   const bool active = lane.active && compare_owned &&
       target_counter32 != 0U;
 
-  qtimer_disable_compare(*lane.module, lane.channel);
+  qtimer_defuse_ocxo_priority0(module, CHANNEL);
   lane.compare_armed = false;
 
   ocxo_capture_packet_t packet{};
@@ -3157,43 +3200,47 @@ static void ocxo_capture_priority0(
   packet.ambient_low16 = ambient_low16;
   packet.compare_low16 = compare_low16;
   packet.active_at_capture = active;
-  packet.capture_exit_dwt = ARM_DWT_CYCCNT;
   if (capture_ring_push_priority0(ring, handoff, packet)) {
     if (active) {
       lane.capture_pending_target_counter32 = target_counter32;
       dmb_barrier();
       lane.capture_pending = true;
-      lane.capture_pending_set_count++;
     }
-    interrupt_handoff_request_priority0();
-    return;
+    return true;
   }
 
   if (active) {
-    // The compare was observed but could not enter custody.  Leave the lane
-    // eligible for ordinary missed-target recovery on the next VCLOCK tend.
+    // The compare was observed but could not enter custody.  Priority 16 will
+    // tend the lane past the lost target and arm the next lawful target.
     lane.capture_pending = false;
     lane.capture_pending_target_counter32 = 0U;
     lane.capture_pending_enqueue_fail_count++;
   }
+  return true;
 }
 
 static void qtimer2_isr(void) {
   const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;
-  crash_stack_tripwire_isr_check(CRASH_TRIPWIRE_SITE_QTIMER2);
-  ocxo_capture_priority0(g_ocxo1_ctx,
-                         g_ocxo1_capture_ring,
-                         g_handoff_ocxo1,
-                         isr_entry_dwt_raw);
+  if (ocxo_capture_priority0<QTIMER2_OCXO1_CH>(
+          g_ocxo1_lane,
+          IMXRT_TMR2,
+          g_ocxo1_capture_ring,
+          g_handoff_ocxo1,
+          isr_entry_dwt_raw)) {
+    interrupt_handoff_request_priority0(isr_entry_dwt_raw);
+  }
 }
 
 static void qtimer3_isr(void) {
   const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;
-  crash_stack_tripwire_isr_check(CRASH_TRIPWIRE_SITE_QTIMER3);
-  ocxo_capture_priority0(g_ocxo2_ctx,
-                         g_ocxo2_capture_ring,
-                         g_handoff_ocxo2,
-                         isr_entry_dwt_raw);
+  if (ocxo_capture_priority0<QTIMER3_OCXO2_CH>(
+          g_ocxo2_lane,
+          IMXRT_TMR3,
+          g_ocxo2_capture_ring,
+          g_handoff_ocxo2,
+          isr_entry_dwt_raw)) {
+    interrupt_handoff_request_priority0(isr_entry_dwt_raw);
+  }
 }
 
 void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
@@ -3207,7 +3254,9 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
       ? IMXRT_TMR3.CH[QTIMER3_OCXO2_CH].CNTR
       : 0U;
 
-  // The relay is the one physical side effect retained at capture priority.
+  // The edge-coincident relay transition is the sole non-capture side effect.
+  // Its three scalar state writes are inseparable from guaranteeing deassertion
+  // even if the PPS packet cannot enter the handoff ring.
   digitalWriteFast(GNSS_PPS_RELAY, HIGH);
   g_pps_relay_active = true;
   g_pps_relay_countdown_cells = PPS_RELAY_OFF_CELLS;
@@ -3220,11 +3269,10 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
   packet.ocxo2_hardware16 = ocxo2_hardware16;
   packet.ocxo1_valid = ocxo1_valid;
   packet.ocxo2_valid = ocxo2_valid;
-  packet.capture_exit_dwt = ARM_DWT_CYCCNT;
   if (capture_ring_push_priority0(g_pps_capture_ring,
                                   g_handoff_pps,
                                   packet)) {
-    interrupt_handoff_request_priority0();
+    interrupt_handoff_request_priority0(isr_entry_dwt_raw);
   } else {
     g_gpio_miss_count++;
   }
@@ -3232,7 +3280,6 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
 
 static void pps_gpio_isr(void) {
   const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;
-  crash_stack_tripwire_isr_check(CRASH_TRIPWIRE_SITE_PPS_GPIO);
   process_interrupt_gpio6789_irq(isr_entry_dwt_raw);
 }
 
@@ -4277,6 +4324,14 @@ static FLASHMEM Payload cmd_report_handoff(const Payload&) {
                   : 0U);
   payload.add("max_latency_cycles",
               (uint32_t)g_interrupt_handoff.max_latency_cycles);
+  payload.add("vclock_overrun_rearm_requests",
+              (uint32_t)g_vclock_capture_overrun_rearm_request_count);
+  payload.add("vclock_overrun_rearm_completed",
+              g_vclock_capture_overrun_rearm_complete_count);
+  payload.add("ocxo1_overrun_recovery_completed",
+              g_ocxo1_capture_overrun_recovery_count);
+  payload.add("ocxo2_overrun_recovery_completed",
+              g_ocxo2_capture_overrun_recovery_count);
   add_handoff_source(payload, "vclock", g_handoff_vclock);
   add_handoff_source(payload, "ch2", g_handoff_ch2);
   add_handoff_source(payload, "ocxo1", g_handoff_ocxo1);
