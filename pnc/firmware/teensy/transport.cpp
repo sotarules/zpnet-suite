@@ -7,11 +7,11 @@
 // TX Architecture:
 //   • transport_send() serializes one semantic payload into one complete
 //     wire image, including the traffic byte.
-//   • An imperative runtime-loop pump performs physical transmission.
+//   • A recurring TimePop callback performs bounded physical transmission.
 //   • The pump advances by the number of bytes actually accepted by Serial.
 //   • Only transport ever touches Serial for TX.
 //   • Interleave is structurally impossible.
-//   • TimePop is not required for command/debug transport liveness.
+//   • TimePop is the sole runtime custody path for physical TX and RX service.
 //
 // RX Architecture:
 //   • Stream parser, length-authoritative framing.
@@ -34,6 +34,7 @@
 #include "config.h"
 #include "debug.h"
 #include "process_performance.h"
+#include "timepop.h"
 
 #include <Arduino.h>
 #include <string.h>
@@ -43,7 +44,9 @@
 // Constants
 // =============================================================
 
-static constexpr uint32_t TRANSPORT_IMPERATIVE_POLL_US = 1000UL;  // 1 ms
+static constexpr uint64_t TRANSPORT_SERVICE_PERIOD_NS = 2000000ULL;  // 2 ms
+static constexpr size_t TRANSPORT_RX_QUANTUM_MAX = 512U;
+static constexpr size_t TRANSPORT_TX_QUANTUM_MAX = 1024U;
 
 // USB CDC attach/reboot can deliver a tail of a Pi frame after the traffic byte
 // was lost at the host/device boundary.  Until the first lawful incoming frame
@@ -79,7 +82,7 @@ static constexpr size_t ETX_LEN   = 5;
 
 static const char* BUILD_FINGERPRINT =
     "__FP__ZPNET_SERIAL_CANONICAL_WIRE_RX_DMAMEM_GUARDED__";
-static const char* TRANSPORT_LIFELINE_FINGERPRINT = "__FP__ZPNET_TRANSPORT_LOOP_LIFELINE__";
+static const char* TRANSPORT_LIFELINE_FINGERPRINT = "__FP__ZPNET_TRANSPORT_TIMEPOP_RX_ALAP__";
 
 // =============================================================
 // Traffic Validation
@@ -137,7 +140,7 @@ static volatile uint32_t tx_queue_full     = 0;
 static volatile uint32_t tx_rr_drop_count  = 0;
 
 // =============================================================
-// Imperative service counters
+// Scheduled service counters
 // =============================================================
 
 static volatile uint32_t transport_poll_count = 0;
@@ -146,7 +149,6 @@ static volatile uint32_t transport_rx_poll_count = 0;
 static volatile uint32_t transport_tx_poll_count = 0;
 static volatile uint32_t transport_runtime_loop_count = 0;
 
-static uint32_t transport_last_poll_us = 0;
 
 // =============================================================
 // RX State
@@ -190,6 +192,14 @@ static volatile uint32_t rx_bad_etx_count            = 0;
 static volatile uint32_t rx_len_overflow_count       = 0;
 static volatile uint32_t rx_overlap_count            = 0;
 static volatile uint32_t rx_expected_traffic_missing = 0;
+
+// One complete parsed frame may wait here between the bounded timed RX service
+// and ordinary ALAP semantic dispatch.  Payload move assignment transfers owned
+// storage; the mailbox never borrows from the reusable RX byte buffer.
+static bool    rx_dispatch_pending = false;
+static uint8_t rx_dispatch_traffic = 0;
+static Payload rx_dispatch_payload;
+static volatile uint32_t rx_dispatch_alap_arm_fail = 0;
 
 enum class rx_guard_stage_t : uint32_t {
   NONE          = 0U,
@@ -326,7 +336,6 @@ static inline size_t serial_write_some(const uint8_t* buf, size_t len) {
     return 0;
 
   size_t n = ZPNET_SERIAL.write(buf, len);
-  ZPNET_SERIAL.flush();
 
   if (n > len)
     return len;
@@ -335,7 +344,7 @@ static inline size_t serial_write_some(const uint8_t* buf, size_t len) {
 }
 
 // =============================================================
-// TX Pump (imperative runtime-loop, single writer)
+// TX Pump (TimePop scheduled, single writer)
 // =============================================================
 
 static void tx_release_current_job() {
@@ -358,8 +367,19 @@ static void tx_pump_once() {
 
   tx_job_t& job = tx_jobs[tx_job_tail];
 
-  size_t remaining = job.length - job.sent;
-  size_t n = serial_write_some(job.data + job.sent, remaining);
+  const size_t remaining = job.length - job.sent;
+  const int available = ZPNET_SERIAL.availableForWrite();
+
+  if (available <= 0)
+    return;
+
+  size_t quantum = remaining;
+  if (quantum > (size_t)available)
+    quantum = (size_t)available;
+  if (quantum > TRANSPORT_TX_QUANTUM_MAX)
+    quantum = TRANSPORT_TX_QUANTUM_MAX;
+
+  const size_t n = serial_write_some(job.data + job.sent, quantum);
 
   if (n == 0)
     return;
@@ -527,15 +547,35 @@ static inline bool rx_should_resync(uint8_t b) {
   return true;
 }
 
-static void dispatch_if_complete() {
+static void rx_dispatch_alap(
+  timepop_ctx_t*,
+  timepop_diag_t*,
+  void*
+) {
+  const uint8_t traffic = rx_dispatch_traffic;
+  rx_dispatch_pending = false;
+
+  if (recv_cb[traffic]) {
+    rx_frames_dispatched++;
+    recv_cb[traffic](rx_dispatch_payload);
+  }
+
+  rx_dispatch_payload.clear();
+
+  if (!rx_guard_check(rx_guard_stage_t::AFTER_DISPATCH)) {
+    rx_reset_hard();
+  }
+}
+
+static bool dispatch_if_complete() {
 
   if (!rx_have_traffic) {
     rx_len = 0;
-    return;
+    return false;
   }
 
   if (rx_len < STX_LEN)
-    return;
+    return false;
 
   if (memcmp(rx_buffer(), STX_SEQ, STX_LEN) != 0) {
     if (rx_startup_grace_active()) {
@@ -544,7 +584,7 @@ static void dispatch_if_complete() {
       rx_bad_stx_count++;
     }
     rx_reset_hard();
-    return;
+    return false;
   }
 
   size_t i = STX_LEN;
@@ -560,7 +600,7 @@ static void dispatch_if_complete() {
         rx_len_overflow_count++;
       }
       rx_reset_hard();
-      return;
+      return false;
     }
     saw_digit = true;
     declared_len = declared_len * 10 + (size_t)(c - '0');
@@ -568,7 +608,7 @@ static void dispatch_if_complete() {
   }
 
   if (!saw_digit || i >= rx_len)
-    return;
+    return false;
 
   size_t header_end = i;
   size_t json_start = header_end + 1;
@@ -581,11 +621,11 @@ static void dispatch_if_complete() {
       rx_len_overflow_count++;
     }
     rx_reset_hard();
-    return;
+    return false;
   }
 
   if (rx_len < required_total)
-    return;
+    return false;
 
   size_t etx_pos = json_start + declared_len;
   if (memcmp(rx_buffer() + etx_pos, ETX_SEQ, ETX_LEN) != 0) {
@@ -595,12 +635,12 @@ static void dispatch_if_complete() {
       rx_bad_etx_count++;
     }
     rx_reset_hard();
-    return;
+    return false;
   }
 
   if (!rx_guard_check(rx_guard_stage_t::BEFORE_PARSE)) {
     rx_reset_hard();
-    return;
+    return false;
   }
 
   // ETX is already validated.  Replace its first byte with an explicit NUL so
@@ -612,25 +652,29 @@ static void dispatch_if_complete() {
   rx_first_frame_seen = true;
   rx_frames_complete++;
 
-  Payload p;
-  p.parseJSON(rx_buffer() + json_start, declared_len);
+  Payload parsed;
+  parsed.parseJSON(rx_buffer() + json_start, declared_len);
 
   if (!rx_guard_check(rx_guard_stage_t::AFTER_PARSE)) {
     rx_reset_hard();
-    return;
+    return false;
   }
 
-  if (recv_cb[rx_traffic]) {
-    rx_frames_dispatched++;
-    recv_cb[rx_traffic](p);
-  }
-
-  if (!rx_guard_check(rx_guard_stage_t::AFTER_DISPATCH)) {
-    rx_reset_hard();
-    return;
-  }
-
+  rx_dispatch_traffic = rx_traffic;
+  rx_dispatch_payload = static_cast<Payload&&>(parsed);
+  rx_dispatch_pending = true;
   rx_reset_hard();
+
+  if (timepop_arm_alap(
+        rx_dispatch_alap,
+        nullptr,
+        "TRANSPORT_RX_DISPATCH") == TIMEPOP_INVALID_HANDLE) {
+    rx_dispatch_pending = false;
+    rx_dispatch_payload.clear();
+    rx_dispatch_alap_arm_fail++;
+  }
+
+  return true;
 }
 
 // =============================================================
@@ -643,8 +687,11 @@ static void rx_serial_tick() {
 
   bool appended = false;
 
-  while (ZPNET_SERIAL.available()) {
+  size_t consumed = 0;
+
+  while (consumed < TRANSPORT_RX_QUANTUM_MAX && ZPNET_SERIAL.available()) {
     uint8_t b = (uint8_t)ZPNET_SERIAL.read();
+    consumed++;
 
     if (!rx_have_traffic) {
       if (!is_valid_traffic(b)) {
@@ -678,7 +725,8 @@ static void rx_serial_tick() {
     rx_bytes_total++;
     appended = true;
 
-    dispatch_if_complete();
+    if (dispatch_if_complete())
+      break;
   }
 
   if (appended) {
@@ -686,25 +734,28 @@ static void rx_serial_tick() {
   }
 }
 
-void transport_note_runtime_loop(void) {
-  transport_runtime_loop_count++;
-}
-
-void transport_poll(void) {
-  const uint32_t now_us = micros();
-  if (transport_last_poll_us != 0 &&
-      (uint32_t)(now_us - transport_last_poll_us) < TRANSPORT_IMPERATIVE_POLL_US) {
-    transport_poll_skipped_too_soon++;
-    return;
-  }
-  transport_last_poll_us = now_us;
+static void transport_rx_timepop(
+  timepop_ctx_t*,
+  timepop_diag_t*,
+  void*
+) {
   transport_poll_count++;
-
   transport_rx_poll_count++;
   rx_serial_tick();
+}
 
+static void transport_tx_timepop(
+  timepop_ctx_t*,
+  timepop_diag_t*,
+  void*
+) {
+  transport_poll_count++;
   transport_tx_poll_count++;
   tx_pump_once();
+}
+
+void transport_note_runtime_loop(void) {
+  transport_runtime_loop_count++;
 }
 
 // =============================================================
@@ -720,7 +771,7 @@ FLASHMEM void transport_get_info(transport_info_t* out) {
   out->rx_poll_count           = transport_rx_poll_count;
   out->tx_poll_count           = transport_tx_poll_count;
   out->runtime_loop_count      = transport_runtime_loop_count;
-  out->poll_interval_us        = TRANSPORT_IMPERATIVE_POLL_US;
+  out->poll_interval_us        = (uint32_t)(TRANSPORT_SERVICE_PERIOD_NS / 1000ULL);
 
   out->tx_budget_max        = TX_BUDGET_MAX;
   out->tx_budget_used       = tx_budget_used;
@@ -801,6 +852,25 @@ void transport_init(void) {
   rx_len = 0;
   rx_have_traffic = false;
   rx_traffic = 0;
+  rx_dispatch_pending = false;
+  rx_dispatch_traffic = 0;
+  rx_dispatch_payload.clear();
+
+  timepop_arm(
+    TRANSPORT_SERVICE_PERIOD_NS,
+    true,
+    transport_rx_timepop,
+    nullptr,
+    "TRANSPORT_RX"
+  );
+
+  timepop_arm(
+    TRANSPORT_SERVICE_PERIOD_NS,
+    true,
+    transport_tx_timepop,
+    nullptr,
+    "TRANSPORT_TX"
+  );
 
   debug_log("transport", BUILD_FINGERPRINT);
   debug_log("transport", TRANSPORT_LIFELINE_FINGERPRINT);

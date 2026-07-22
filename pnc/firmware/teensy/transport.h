@@ -21,11 +21,11 @@
 //
 //   • transport_send() serializes one payload into one complete wire image.
 //   • The wire image includes the traffic byte.
-//   • transport_poll(), called from the runtime loop, performs physical I/O.
+//   • Recurring TimePop callbacks perform bounded physical I/O.
 //   • The pump advances only by bytes actually accepted by Serial.
 //   • Each job owns its heap allocation — freed on completion.
 //   • Memory is bounded via soft budget cap (TX_BUDGET_MAX).
-//   • TimePop is not in the command-plane liveness path.
+//   • TimePop is the sole physical RX/TX service path.
 //
 // Serial-only doctrine:
 //
@@ -106,22 +106,12 @@ void transport_send(
 
 
 // =============================================================
-// Runtime-loop transport service
+// Runtime-loop witness
 // =============================================================
 //
-// Imperative transport service.  This is intentionally not a TimePop client:
-// the command/debug data plane must remain alive even when scheduled TimePop
-// work stalls, backs up, or mis-schedules.  The runtime loop should call this
-// before and after timepop_dispatch(); the implementation self-throttles to a
-// 1 ms service interval.
-//
-
-void transport_poll(void);
-
-
-// Runtime-loop witness.  The main loop calls this once per iteration before
-// transport_poll()/timepop_dispatch().  TRANSPORT_INFO exposes the counter so
-// foreground-loop progress remains observable without a second TX path.
+// Physical RX/TX service is owned exclusively by recurring TimePop callbacks
+// armed by transport_init().  This witness remains independent so reports can
+// distinguish scheduler/transport progress from ordinary loop progress.
 
 void transport_note_runtime_loop(void);
 
@@ -140,15 +130,15 @@ void transport_note_runtime_loop(void);
 typedef struct {
 
   // ===========================================================
-  // Runtime-loop transport lifeline
+  // Scheduled transport service / runtime witness
   // ===========================================================
 
-  uint32_t poll_count;              // Runtime-loop transport service passes
-  uint32_t poll_skipped_too_soon;   // Calls skipped by 1 ms throttle
-  uint32_t rx_poll_count;           // Imperative RX polls
-  uint32_t tx_poll_count;           // Imperative TX pump passes
+  uint32_t poll_count;              // Total scheduled RX + TX callback passes
+  uint32_t poll_skipped_too_soon;   // Retained ABI field; always zero
+  uint32_t rx_poll_count;           // Scheduled RX callback passes
+  uint32_t tx_poll_count;           // Scheduled TX callback passes
   uint32_t runtime_loop_count;      // Runtime loop iterations observed
-  uint32_t poll_interval_us;        // Current imperative poll interval
+  uint32_t poll_interval_us;        // Scheduled callback period in microseconds
 
   // ===========================================================
   // TX — Budget / Queue Health

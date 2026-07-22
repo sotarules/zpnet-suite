@@ -348,9 +348,7 @@ void setup() {
 // ============================================================================
 
 void loop() {
-  zpnet_foreground_phase_note(zpnet_foreground_phase_t::TRANSPORT_PRE);
   transport_note_runtime_loop();
-  transport_poll();
 
   // Flush interrupt-authored scalar feature truth only from thread-mode
   // foreground.  The service is O(1) when no feature state is pending.
@@ -358,7 +356,4 @@ void loop() {
 
   zpnet_foreground_phase_note(zpnet_foreground_phase_t::TIMEPOP_DISPATCH);
   timepop_dispatch();
-
-  zpnet_foreground_phase_note(zpnet_foreground_phase_t::TRANSPORT_POST);
-  transport_poll();
 }
