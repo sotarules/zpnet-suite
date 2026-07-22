@@ -144,6 +144,11 @@ static uint32_t g_system_feature_fragment_publish_count = 0;
 static uint32_t g_system_feature_fragment_service_arm_count = 0;
 static uint32_t g_system_feature_fragment_service_arm_failures = 0;
 
+// Runtime court: feature-registry mutation and publication scheduling are
+// foreground-only.
+static uint32_t g_system_feature_handler_reject_count = 0;
+static uint32_t g_system_feature_handler_last_ipsr = 0;
+
 // ================================================================
 // Feature status substrate
 // ================================================================
@@ -331,10 +336,30 @@ static int system_feature_alloc_or_find(const char* subsystem,
   return -1;
 }
 
+static inline uint32_t system_feature_current_ipsr(void) {
+#if defined(__arm__)
+  uint32_t value = 0U;
+  __asm__ volatile("mrs %0, ipsr" : "=r"(value) :: "memory");
+  return value;
+#else
+  return 0U;
+#endif
+}
+
 bool system_feature_set(const char* subsystem,
                         const char* feature,
                         system_feature_status_t status,
                         const char* detail) {
+  const uint32_t ipsr = system_feature_current_ipsr();
+  if (ipsr != 0U) {
+    // Priority 0, priority 16, and every other exception context may author only
+    // fixed scalar pending state.  Shared registry search/mutation and TimePop
+    // scheduling are refused here.
+    g_system_feature_handler_reject_count++;
+    g_system_feature_handler_last_ipsr = ipsr;
+    return false;
+  }
+
   if (!subsystem || !*subsystem || !feature || !*feature) return false;
 
   const int existing = system_feature_find(subsystem, feature);
@@ -2625,6 +2650,12 @@ static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
   p.add("feature_status_fragment_service_armed", (bool)g_system_feature_fragment_service_armed);
   p.add("feature_status_fragment_service_arm_count", g_system_feature_fragment_service_arm_count);
   p.add("feature_status_fragment_service_arm_failures", g_system_feature_fragment_service_arm_failures);
+  p.add("feature_status_handler_reject_count",
+        g_system_feature_handler_reject_count);
+  p.add("feature_status_handler_last_ipsr",
+        g_system_feature_handler_last_ipsr);
+  p.add("feature_status_foreground_court_ok",
+        g_system_feature_handler_reject_count == 0U);
 
 
   p.add_object("features", system_features_tree_payload());

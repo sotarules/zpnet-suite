@@ -1046,6 +1046,7 @@ bool ocxo2_binding_identity_check(void) {
 static void interrupt_features_note_observed_edge(void);
 static void interrupt_features_note_ocxo_custody(void);
 static void interrupt_features_note_lineage(void);
+static void interrupt_features_foreground_flush(void);
 
 // ============================================================================
 // Passive integrity evidence
@@ -3778,32 +3779,73 @@ const interrupt_capture_diag_t* interrupt_last_diag(
   return (!rt || !rt->has_fired) ? nullptr : &rt->last_diag;
 }
 
-void interrupt_prespin_service(timepop_ctx_t*, timepop_diag_t*, void*) {}
+void process_interrupt_foreground_service(void) {
+  // Called once per ordinary loop() pass.  This is the sole bridge from
+  // interrupt-owned scalar feature truth into SYSTEM's foreground registry.
+  interrupt_features_foreground_flush();
+}
+
+void interrupt_prespin_service(timepop_ctx_t*, timepop_diag_t*, void*) {
+  // Compatibility TimePop service.  The runtime loop is the authoritative
+  // pump, but any existing prespin invocation remains harmless and idempotent.
+  process_interrupt_foreground_service();
+}
 
 // ============================================================================
-// Feature registry (observed-only platform surfaces)
+// Feature registry handoff (interrupt scalars -> foreground SYSTEM registry)
 // ============================================================================
+
+struct interrupt_feature_pending_t {
+  volatile bool dirty = false;
+  volatile uint32_t generation = 0U;
+  volatile uint8_t pps_vclock_authority =
+      (uint8_t)system_feature_status_t::INITIALIZING;
+  volatile uint8_t qtimer_counter_custody =
+      (uint8_t)system_feature_status_t::INITIALIZING;
+  volatile uint8_t qtimer_dwt_ruler =
+      (uint8_t)system_feature_status_t::INITIALIZING;
+  volatile uint8_t counter32_lineage =
+      (uint8_t)system_feature_status_t::INITIALIZING;
+  volatile uint8_t observed_edge_authority =
+      (uint8_t)system_feature_status_t::INITIALIZING;
+};
+
+static interrupt_feature_pending_t g_interrupt_feature_pending{};
+
+static inline uint8_t interrupt_feature_status_scalar(
+    system_feature_status_t status) {
+  return (uint8_t)status;
+}
+
+static void interrupt_features_mark_dirty(void) {
+  dmb_barrier();
+  g_interrupt_feature_pending.generation++;
+  g_interrupt_feature_pending.dirty = true;
+  dmb_barrier();
+}
 
 static void interrupt_features_mark_initializing(void) {
-  (void)system_feature_set("INTERRUPT", "PPS_VCLOCK_AUTHORITY",
-                           system_feature_status_t::INITIALIZING, nullptr);
-  (void)system_feature_set("INTERRUPT", "QTIMER_COUNTER_CUSTODY",
-                           system_feature_status_t::INITIALIZING, nullptr);
-  (void)system_feature_set("INTERRUPT", "QTIMER_DWT_RULER",
-                           system_feature_status_t::INITIALIZING, nullptr);
-  (void)system_feature_set("INTERRUPT", "COUNTER32_LINEAGE",
-                           system_feature_status_t::INITIALIZING, nullptr);
-  (void)system_feature_set("INTERRUPT", "OBSERVED_EDGE_AUTHORITY",
-                           system_feature_status_t::INITIALIZING, nullptr);
+  g_interrupt_feature_pending.pps_vclock_authority =
+      interrupt_feature_status_scalar(system_feature_status_t::INITIALIZING);
+  g_interrupt_feature_pending.qtimer_counter_custody =
+      interrupt_feature_status_scalar(system_feature_status_t::INITIALIZING);
+  g_interrupt_feature_pending.qtimer_dwt_ruler =
+      interrupt_feature_status_scalar(system_feature_status_t::INITIALIZING);
+  g_interrupt_feature_pending.counter32_lineage =
+      interrupt_feature_status_scalar(system_feature_status_t::INITIALIZING);
+  g_interrupt_feature_pending.observed_edge_authority =
+      interrupt_feature_status_scalar(system_feature_status_t::INITIALIZING);
+  interrupt_features_mark_dirty();
 }
 
 static void interrupt_features_note_observed_edge(void) {
-  (void)system_feature_set("INTERRUPT", "PPS_VCLOCK_AUTHORITY",
-                           system_feature_status_t::NOMINAL, nullptr);
-  (void)system_feature_set("INTERRUPT", "OBSERVED_EDGE_AUTHORITY",
-                           system_feature_status_t::NOMINAL, nullptr);
-  (void)system_feature_set("INTERRUPT", "QTIMER_DWT_RULER",
-                           system_feature_status_t::NOMINAL, nullptr);
+  g_interrupt_feature_pending.pps_vclock_authority =
+      interrupt_feature_status_scalar(system_feature_status_t::NOMINAL);
+  g_interrupt_feature_pending.observed_edge_authority =
+      interrupt_feature_status_scalar(system_feature_status_t::NOMINAL);
+  g_interrupt_feature_pending.qtimer_dwt_ruler =
+      interrupt_feature_status_scalar(system_feature_status_t::NOMINAL);
+  interrupt_features_mark_dirty();
 }
 
 static void interrupt_features_note_ocxo_custody(void) {
@@ -3811,11 +3853,12 @@ static void interrupt_features_note_ocxo_custody(void) {
       (g_ocxo1_lane.target_grid_valid && g_ocxo1_lane.active);
   const bool ocxo2_ok = OCXO2_DISABLED ||
       (g_ocxo2_lane.target_grid_valid && g_ocxo2_lane.active);
-  const system_feature_status_t status = ocxo1_ok && ocxo2_ok
-      ? system_feature_status_t::NOMINAL
-      : system_feature_status_t::INITIALIZING;
-  (void)system_feature_set("INTERRUPT", "QTIMER_COUNTER_CUSTODY",
-                           status, nullptr);
+  g_interrupt_feature_pending.qtimer_counter_custody =
+      interrupt_feature_status_scalar(
+          ocxo1_ok && ocxo2_ok
+              ? system_feature_status_t::NOMINAL
+              : system_feature_status_t::INITIALIZING);
+  interrupt_features_mark_dirty();
 }
 
 static void interrupt_features_note_lineage(void) {
@@ -3824,11 +3867,63 @@ static void interrupt_features_note_lineage(void) {
       g_interrupt_integrity.ocxo1_counter.valid;
   const bool ocxo2_ok = OCXO2_DISABLED ||
       g_interrupt_integrity.ocxo2_counter.valid;
-  (void)system_feature_set("INTERRUPT", "COUNTER32_LINEAGE",
-                           (vclock_ok && ocxo1_ok && ocxo2_ok)
-                               ? system_feature_status_t::NOMINAL
-                               : system_feature_status_t::INITIALIZING,
-                           nullptr);
+  g_interrupt_feature_pending.counter32_lineage =
+      interrupt_feature_status_scalar(
+          (vclock_ok && ocxo1_ok && ocxo2_ok)
+              ? system_feature_status_t::NOMINAL
+              : system_feature_status_t::INITIALIZING);
+  interrupt_features_mark_dirty();
+}
+
+static void interrupt_features_foreground_flush(void) {
+  if (!g_interrupt_feature_pending.dirty) return;
+
+  uint8_t pps_vclock_authority = 0U;
+  uint8_t qtimer_counter_custody = 0U;
+  uint8_t qtimer_dwt_ruler = 0U;
+  uint8_t counter32_lineage = 0U;
+  uint8_t observed_edge_authority = 0U;
+  uint32_t generation = 0U;
+
+  // BASEPRI=16 masks the handoff writer while preserving sacred priority 0.
+  const uint32_t prior = interrupt_priority0_guard_enter();
+  if (!g_interrupt_feature_pending.dirty) {
+    interrupt_priority0_guard_exit(prior);
+    return;
+  }
+  pps_vclock_authority = g_interrupt_feature_pending.pps_vclock_authority;
+  qtimer_counter_custody =
+      g_interrupt_feature_pending.qtimer_counter_custody;
+  qtimer_dwt_ruler = g_interrupt_feature_pending.qtimer_dwt_ruler;
+  counter32_lineage = g_interrupt_feature_pending.counter32_lineage;
+  observed_edge_authority =
+      g_interrupt_feature_pending.observed_edge_authority;
+  generation = g_interrupt_feature_pending.generation;
+  g_interrupt_feature_pending.dirty = false;
+  interrupt_priority0_guard_exit(prior);
+
+  (void)system_feature_set(
+      "INTERRUPT", "PPS_VCLOCK_AUTHORITY",
+      (system_feature_status_t)pps_vclock_authority, nullptr);
+  (void)system_feature_set(
+      "INTERRUPT", "QTIMER_COUNTER_CUSTODY",
+      (system_feature_status_t)qtimer_counter_custody, nullptr);
+  (void)system_feature_set(
+      "INTERRUPT", "QTIMER_DWT_RULER",
+      (system_feature_status_t)qtimer_dwt_ruler, nullptr);
+  (void)system_feature_set(
+      "INTERRUPT", "COUNTER32_LINEAGE",
+      (system_feature_status_t)counter32_lineage, nullptr);
+  (void)system_feature_set(
+      "INTERRUPT", "OBSERVED_EDGE_AUTHORITY",
+      (system_feature_status_t)observed_edge_authority, nullptr);
+
+  // Preserve an update that arrived after the snapshot but before flush ended.
+  const uint32_t check = interrupt_priority0_guard_enter();
+  if (g_interrupt_feature_pending.generation != generation) {
+    g_interrupt_feature_pending.dirty = true;
+  }
+  interrupt_priority0_guard_exit(check);
 }
 
 // ============================================================================

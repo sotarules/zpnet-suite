@@ -117,6 +117,8 @@ const char* system_feature_status_str(system_feature_status_t status);
 bool system_feature_status_parse(const char* status,
                                  system_feature_status_t* out);
 
+// Foreground-only mutation boundary. Calls from any exception/ISR context are
+// rejected by a runtime court; interrupt code must hand off fixed scalar state.
 bool system_feature_set(const char* subsystem,
                         const char* feature,
                         system_feature_status_t status,

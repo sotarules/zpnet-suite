@@ -13,6 +13,11 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+// Foreground loop service.  Call once per loop() pass; it flushes only pending
+// scalar feature state and returns immediately when no interrupt feature changed.
+void process_interrupt_foreground_service(void);
+
+// Compatibility TimePop service; delegates to the same foreground loop service.
 void interrupt_prespin_service(timepop_ctx_t*, timepop_diag_t*, void*);
 
 enum class interrupt_subscriber_kind_t : uint8_t {
