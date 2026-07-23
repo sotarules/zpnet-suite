@@ -20,18 +20,18 @@
 // priority 16.
 //
 // Priority 16 owns continuation:
-//   * VCLOCK extends the three 16-bit timer domains;
-//   * each OCXO maintains a local 1 kHz compare cadence whose capture hook is
-//     intentionally a no-op in this experiment;
+//   * the native VCLOCK heartbeat extends all three 16-bit timer domains;
+//   * each OCXO owns exactly one authored compare target per 10,000,000 ticks;
+//   * VCLOCK tends OCXO low-word lineage until the one-second target enters the
+//     safe 16-bit compare-programming window;
 //   * raw ISR-entry DWT is converted once to the calibrated event coordinate;
-//   * only each 1,000th OCXO tooth authors the existing one-second event;
+//   * every lawful OCXO compare authors one one-second event;
 //   * immutable CH2 and subscriber work is transferred to foreground-owned
 //     service without entering TimePop or invoking application behavior.
 //
 // There is no alternative endpoint estimator, repair candidate, FloorLine, or
-// alternative publication court in this module.  The 1 kHz ladder conditions
-// the hardware path but does not alter, smooth, or publish DWT.  Ambient counter
-// reads are witnesses and never event truth.
+// alternative publication court in this module.  OCXO compare custody is 1 Hz;
+// ambient counter reads are rollover witnesses and never event truth.
 // ============================================================================
 
 #include "process_interrupt.h"
@@ -130,11 +130,8 @@ static constexpr uint32_t VCLOCK_EPOCH_TICKS_AFTER_PHYSICAL_PPS = 1U;
 static constexpr int32_t VCLOCK_EPOCH_COUNTER32_OFFSET_TICKS = 0;
 static constexpr uint32_t OCXO_ONE_SECOND_TICKS =
     (uint32_t)VCLOCK_COUNTS_PER_SECOND;
-static constexpr uint32_t OCXO_CADENCE_HZ = 1000U;
-static constexpr uint32_t OCXO_CADENCE_TICKS =
-    OCXO_ONE_SECOND_TICKS / OCXO_CADENCE_HZ;
-static constexpr uint32_t OCXO_CADENCE_TEETH_PER_SECOND =
-    OCXO_ONE_SECOND_TICKS / OCXO_CADENCE_TICKS;
+static constexpr uint32_t OCXO_COMPARE_RATE_HZ = 1U;
+static constexpr uint32_t OCXO_COMPARE_PERIOD_TICKS = OCXO_ONE_SECOND_TICKS;
 static constexpr uint32_t OCXO_ARM_WINDOW_TICKS = 49152U;
 static constexpr uint32_t OCXO_MIN_ARM_LEAD_TICKS = 64U;
 static constexpr uint32_t COUNTER32_LINEAGE_LOCK_STREAK = 8U;
@@ -151,10 +148,10 @@ static constexpr uint32_t SMARTZERO_VOTE_SPAN_CYCLES = 4U;
 
 static_assert(OCXO_ONE_SECOND_TICKS == 10000000U,
               "OCXO one-second target must be 10,000,000 ticks");
-static_assert(OCXO_CADENCE_TICKS == 10000U,
-              "OCXO cadence tooth must be 10,000 ticks");
-static_assert(OCXO_CADENCE_TEETH_PER_SECOND == 1000U,
-              "OCXO cadence must contain exactly 1,000 teeth per second");
+static_assert(OCXO_COMPARE_RATE_HZ == 1U,
+              "OCXO compare service must run exactly once per second");
+static_assert(OCXO_COMPARE_PERIOD_TICKS == 10000000U,
+              "OCXO compare period must be 10,000,000 ticks");
 static_assert(OCXO_MIN_ARM_LEAD_TICKS < OCXO_ARM_WINDOW_TICKS,
               "OCXO arm lead must be inside arm window");
 static_assert(OCXO_ARM_WINDOW_TICKS < 65536U,
@@ -854,16 +851,10 @@ struct ocxo_lane_t {
   uint32_t grid_epoch_counter32 = 0;
   uint32_t next_target_counter32 = 0;
 
-  // Wrap-proof authored cadence identity.  Counter32 is an event coordinate,
-  // not a safe long-duration phase ruler: (target-grid_epoch) wraps after
-  // 2^32 / 10 MHz.  Carry the 1..1000 tooth ordinal with each authored target
-  // so one-second boundaries remain explicit across counter32 wrap and catch-up.
-  uint16_t next_target_tooth = 1U;
-  uint16_t armed_target_tooth = 0U;
-  uint16_t capture_pending_target_tooth = 0U;
-  uint16_t last_fired_target_tooth = 0U;
-  uint32_t cadence_phase_reset_count = 0U;
-  uint32_t cadence_phase_invalid_count = 0U;
+  // One authored target equals one physical OCXO second.  VCLOCK extends the
+  // low-word lineage between compares, so no intermediate OCXO cadence teeth
+  // are needed to preserve the 32-bit target identity.
+  uint32_t target_grid_reset_count = 0U;
 
   uint32_t armed_target_counter32 = 0;
   uint16_t armed_target_low16 = 0;
@@ -872,8 +863,6 @@ struct ocxo_lane_t {
   uint32_t miss_count = 0;
   uint32_t arm_count = 0;
   uint32_t fire_count = 0;
-  uint32_t cadence_fire_count = 0;
-  uint32_t cadence_boundary_count = 0;
   uint32_t false_irq_count = 0;
   uint32_t missed_target_count = 0;
   uint32_t rollover_tend_count = 0;
@@ -907,11 +896,6 @@ struct ocxo_lane_t {
   uint16_t last_ambient_low16 = 0;
   uint16_t last_compare_low16 = 0;
   int32_t last_ambient_minus_target_ticks = 0;
-
-  bool previous_cadence_event_valid = false;
-  uint32_t previous_cadence_event_counter32 = 0;
-  uint32_t last_cadence_delta_ticks = 0;
-  uint32_t cadence_delta_violation_count = 0;
 
   bool previous_event_valid = false;
   uint32_t previous_event_counter32 = 0;
@@ -1841,7 +1825,6 @@ static void ocxo_disable_compare(ocxo_lane_t& lane) {
   lane.compare_armed = false;
   lane.armed_target_counter32 = 0U;
   lane.armed_target_low16 = 0U;
-  lane.armed_target_tooth = 0U;
 }
 
 static uint16_t ocxo_hardware_low16_for_target(
@@ -1858,28 +1841,17 @@ static bool ocxo_target_is_due_or_behind(uint32_t current_counter32,
   return remaining == 0U || remaining > 0x7FFFFFFFUL;
 }
 
-static uint16_t ocxo_next_target_tooth(uint16_t tooth) {
-  return (tooth >= (uint16_t)OCXO_CADENCE_TEETH_PER_SECOND || tooth == 0U)
-      ? 1U
-      : (uint16_t)(tooth + 1U);
-}
-
 static void ocxo_advance_target(ocxo_lane_t& lane) {
-  lane.next_target_counter32 += OCXO_CADENCE_TICKS;
-  lane.next_target_tooth = ocxo_next_target_tooth(lane.next_target_tooth);
+  lane.next_target_counter32 += OCXO_COMPARE_PERIOD_TICKS;
 }
 
 static void ocxo_reset_target_grid(ocxo_lane_t& lane,
                                    synthetic_clock32_t& clock) {
   lane.grid_epoch_counter32 = clock.current_counter32;
   lane.next_target_counter32 =
-      clock.current_counter32 + OCXO_CADENCE_TICKS;
-  lane.next_target_tooth = 1U;
-  lane.armed_target_tooth = 0U;
-  lane.capture_pending_target_tooth = 0U;
-  lane.last_fired_target_tooth = 0U;
+      clock.current_counter32 + OCXO_COMPARE_PERIOD_TICKS;
   lane.target_grid_valid = true;
-  lane.cadence_phase_reset_count++;
+  lane.target_grid_reset_count++;
 }
 
 static void ocxo_tend_and_arm(const ocxo_runtime_context_t& ctx) {
@@ -1931,7 +1903,6 @@ static void ocxo_tend_and_arm(const ocxo_runtime_context_t& ctx) {
   lane.last_arm_remaining_ticks = remaining;
   lane.armed_target_counter32 = lane.next_target_counter32;
   lane.armed_target_low16 = target_low16;
-  lane.armed_target_tooth = lane.next_target_tooth;
 
   // Publish software custody before hardware can assert the compare IRQ.
   dmb_barrier();
@@ -1957,8 +1928,8 @@ bool ocxo1_start_one_second_service_bound(void) {
   }
   ocxo_tend_and_arm(g_ocxo1_ctx);
   interrupt_features_note_ocxo_custody();
-  // A target several months of CPU cycles away is intentionally not armed yet;
-  // VCLOCK will tend it into the safe 16-bit programming window.
+  // A target one OCXO second away is intentionally not armed yet; VCLOCK
+  // extends low-word lineage and tends it into the safe 16-bit arm window.
   return true;
 }
 
@@ -2058,9 +2029,6 @@ void interrupt_ocxo_logical_grid_epoch(uint32_t ocxo1_epoch_counter32,
     clock.hardware16 = hardware16;
     clock.pending_zero = false;
     ocxo_reset_target_grid(lane, clock);
-    lane.previous_cadence_event_valid = false;
-    lane.previous_cadence_event_counter32 = 0U;
-    lane.last_cadence_delta_ticks = 0U;
     lane.previous_event_valid = false;
     lane.previous_event_counter32 = 0U;
     lane.last_counter_delta_ticks = 0U;
@@ -2364,7 +2332,6 @@ struct ocxo_capture_packet_t {
   uint32_t isr_entry_dwt_raw = 0;
   uint32_t target_counter32 = 0;
   uint16_t target_low16 = 0;
-  uint16_t target_tooth = 0;
   uint16_t ambient_low16 = 0;
   uint16_t compare_low16 = 0;
   bool active_at_capture = false;
@@ -2996,7 +2963,7 @@ static void fill_observed_diag(interrupt_capture_diag_t& diag,
   diag.ocxo_target_delta_mod65536_ticks =
       diag.ocxo_compare_delta_mod65536_ticks;
   diag.ocxo_sample_phase_valid = false;
-  diag.ocxo_sample_period_ticks = OCXO_CADENCE_TICKS;
+  diag.ocxo_sample_period_ticks = OCXO_COMPARE_PERIOD_TICKS;
   diag.ocxo_sample_dwt_at_event = event.dwt_at_event;
   diag.ocxo_sample_counter32_at_event = event.counter32_at_event;
 }
@@ -3220,32 +3187,13 @@ static void ocxo_complete_capture_custody(
   } else {
     lane.capture_pending_clear_count++;
   }
-  if (lane.capture_pending_target_counter32 != packet.target_counter32 ||
-      lane.capture_pending_target_tooth != packet.target_tooth) {
+  if (lane.capture_pending_target_counter32 != packet.target_counter32) {
     lane.capture_pending_target_mismatch_count++;
   }
   lane.capture_pending_target_counter32 = 0U;
-  lane.capture_pending_target_tooth = 0U;
   dmb_barrier();
   lane.capture_pending = false;
   dmb_barrier();
-}
-
-// Experimental 1 kHz capture hook.  It is deliberately empty: the first test
-// asks whether regularly exercising the QuadTimer compare path changes the
-// one-second observed DWT residuals without any estimator or correction.  The
-// scalar arguments define the future analysis seam without retaining history.
-static __attribute__((always_inline)) inline void
-ocxo_floorline_capture_1khz_noop(interrupt_subscriber_kind_t kind,
-                                 uint32_t dwt_at_tooth,
-                                 uint32_t target_counter32,
-                                 uint16_t ambient_low16,
-                                 uint16_t target_low16) {
-  (void)kind;
-  (void)dwt_at_tooth;
-  (void)target_counter32;
-  (void)ambient_low16;
-  (void)target_low16;
 }
 
 static void process_ocxo_packet(const ocxo_runtime_context_t& ctx,
@@ -3263,21 +3211,12 @@ static void process_ocxo_packet(const ocxo_runtime_context_t& ctx,
   // The semantic event identity is the target authored before the match.  The
   // ambient read is witness-only and cannot advance, reject, or replace it.
   const uint32_t target = packet.target_counter32;
-  const uint16_t target_tooth = packet.target_tooth;
-  if (!packet.active_at_capture || target == 0U ||
-      target_tooth == 0U ||
-      target_tooth > (uint16_t)OCXO_CADENCE_TEETH_PER_SECOND) {
-    if (packet.active_at_capture &&
-        (target_tooth == 0U ||
-         target_tooth > (uint16_t)OCXO_CADENCE_TEETH_PER_SECOND)) {
-      lane.cadence_phase_invalid_count++;
-    }
+  if (!packet.active_at_capture || target == 0U) {
     lane.false_irq_count++;
     lane.miss_count++;
     lane.compare_armed = false;
     lane.armed_target_counter32 = 0U;
     lane.armed_target_low16 = 0U;
-    lane.armed_target_tooth = 0U;
     ocxo_complete_capture_custody(lane, packet);
     return;
   }
@@ -3287,17 +3226,9 @@ static void process_ocxo_packet(const ocxo_runtime_context_t& ctx,
   lane.capture_pending_set_count++;
   lane.last_dwt_at_edge = dwt_at_edge;
   lane.last_event_counter32 = target;
-  lane.cadence_fire_count++;
   lane.compare_armed = false;
   lane.armed_target_counter32 = 0U;
   lane.armed_target_low16 = 0U;
-  lane.armed_target_tooth = 0U;
-
-  ocxo_floorline_capture_1khz_noop(ctx.kind,
-                                  dwt_at_edge,
-                                  target,
-                                  packet.ambient_low16,
-                                  packet.target_low16);
 
   const int32_t target_delta =
       (int32_t)(target - clock.current_counter32);
@@ -3324,38 +3255,20 @@ static void process_ocxo_packet(const ocxo_runtime_context_t& ctx,
   clock.current_counter32 = target;
   clock.hardware16 = packet.target_low16;
 
-  const bool cadence_interval_valid = lane.previous_cadence_event_valid;
-  const uint32_t cadence_delta = cadence_interval_valid
-      ? target - lane.previous_cadence_event_counter32
-      : 0U;
-  lane.last_cadence_delta_ticks = cadence_delta;
-  if (cadence_interval_valid && cadence_delta != OCXO_CADENCE_TICKS) {
-    lane.cadence_delta_violation_count++;
-  }
-  lane.previous_cadence_event_valid = true;
-  lane.previous_cadence_event_counter32 = target;
-  lane.next_target_counter32 = target + OCXO_CADENCE_TICKS;
-  lane.next_target_tooth = ocxo_next_target_tooth(target_tooth);
-  lane.last_fired_target_tooth = target_tooth;
+  lane.next_target_counter32 = target + OCXO_COMPARE_PERIOD_TICKS;
   lane.target_grid_valid = true;
 
-  // The observed tooth is now committed in both counter and nanosecond custody.
-  // Clear in-flight ownership, then locally rearm the next 1 ms tooth.
+  // The one-second target is now committed in counter and nanosecond custody.
+  // Clear in-flight ownership; VCLOCK will tend the next target through the
+  // intervening low-word rollovers and arm it only inside the safe window.
   ocxo_complete_capture_custody(lane, packet);
   ocxo_tend_and_arm(ctx);
-
-  // Boundary identity is authored with the compare target.  Never infer it
-  // from a wrapped 32-bit distance to grid_epoch_counter32.
-  const bool one_second_boundary =
-      target_tooth == (uint16_t)OCXO_CADENCE_TEETH_PER_SECOND;
-  if (!one_second_boundary) return;
 
   crash_stack_tripwire_isr_check(
       ctx.kind == interrupt_subscriber_kind_t::OCXO1
           ? CRASH_TRIPWIRE_SITE_QTIMER2
           : CRASH_TRIPWIRE_SITE_QTIMER3);
   lane.fire_count++;
-  lane.cadence_boundary_count++;
   lane.dispatch_sequence++;
 
   const bool interval_valid = lane.previous_event_valid;
@@ -3452,7 +3365,7 @@ static void process_pps_packet(const pps_capture_packet_t& packet) {
   }
   epoch_capture_publish(capture);
 
-  // The next observed native VCLOCK tooth becomes the initial one-second grid
+  // The next observed native VCLOCK heartbeat becomes the initial one-second grid
   // after boot/rebootstrap.  No DWT back-projection is performed.
   if (!g_vclock_lane.one_second_grid_valid || g_pps_rebootstrap_pending) {
     g_vclock_lane.next_one_second_counter32 =
@@ -3836,7 +3749,6 @@ static __attribute__((always_inline)) inline bool ocxo_capture_priority0(
   dmb_barrier();
   const uint32_t target_counter32 = lane.armed_target_counter32;
   const uint16_t target_low16 = lane.armed_target_low16;
-  const uint16_t target_tooth = lane.armed_target_tooth;
   const bool active = lane.active && compare_owned &&
       target_counter32 != 0U;
 
@@ -3847,14 +3759,12 @@ static __attribute__((always_inline)) inline bool ocxo_capture_priority0(
   packet.isr_entry_dwt_raw = isr_entry_dwt_raw;
   packet.target_counter32 = target_counter32;
   packet.target_low16 = target_low16;
-  packet.target_tooth = target_tooth;
   packet.ambient_low16 = ambient_low16;
   packet.compare_low16 = compare_low16;
   packet.active_at_capture = active;
   if (capture_ring_push_priority0(ring, handoff, packet)) {
     if (active) {
       lane.capture_pending_target_counter32 = target_counter32;
-      lane.capture_pending_target_tooth = target_tooth;
       dmb_barrier();
       lane.capture_pending = true;
     }
@@ -3866,7 +3776,6 @@ static __attribute__((always_inline)) inline bool ocxo_capture_priority0(
     // tend the lane past the lost target and arm the next lawful target.
     lane.capture_pending = false;
     lane.capture_pending_target_counter32 = 0U;
-    lane.capture_pending_target_tooth = 0U;
     lane.capture_pending_enqueue_fail_count++;
   }
   return true;
@@ -4150,9 +4059,6 @@ void ocxo2_recovery_runtime_reset_bound(void) {
 static __attribute__((noinline, noclone))
 void ocxo1_recovery_lane_reset_bound(void) {
   g_ocxo1_lane.active = true;
-  g_ocxo1_lane.previous_cadence_event_valid = false;
-  g_ocxo1_lane.previous_cadence_event_counter32 = 0U;
-  g_ocxo1_lane.last_cadence_delta_ticks = 0U;
   g_ocxo1_lane.previous_event_valid = false;
   if (g_ocxo1_lane.capture_pending) {
     g_ocxo1_lane.capture_pending_recovery_discard_count++;
@@ -4165,8 +4071,8 @@ void ocxo1_recovery_lane_reset_bound(void) {
   if (g_ocxo1_lane.compare_armed) {
     ocxo_disable_compare(g_ocxo1_lane);
   }
-  // RECOVER must rebuild a provable target/ordinal pair.  A live 1 kHz ladder
-  // is not sufficient if its one-second phase is no longer reachable.
+  // RECOVER rebuilds one provable one-second target from the live hardware
+  // coordinate; VCLOCK resumes rollover tending after this reset.
   synthetic_clock_tend_from_hardware(g_ocxo1_clock32, ocxo_counter_now(g_ocxo1_lane));
   ocxo_reset_target_grid(g_ocxo1_lane, g_ocxo1_clock32);
   g_ocxo1_lane.rebootstrap_count++;
@@ -4175,9 +4081,6 @@ void ocxo1_recovery_lane_reset_bound(void) {
 static __attribute__((noinline, noclone))
 void ocxo2_recovery_lane_reset_bound(void) {
   g_ocxo2_lane.active = true;
-  g_ocxo2_lane.previous_cadence_event_valid = false;
-  g_ocxo2_lane.previous_cadence_event_counter32 = 0U;
-  g_ocxo2_lane.last_cadence_delta_ticks = 0U;
   g_ocxo2_lane.previous_event_valid = false;
   if (g_ocxo2_lane.capture_pending) {
     g_ocxo2_lane.capture_pending_recovery_discard_count++;
@@ -4190,8 +4093,8 @@ void ocxo2_recovery_lane_reset_bound(void) {
   if (g_ocxo2_lane.compare_armed) {
     ocxo_disable_compare(g_ocxo2_lane);
   }
-  // RECOVER must rebuild a provable target/ordinal pair.  A live 1 kHz ladder
-  // is not sufficient if its one-second phase is no longer reachable.
+  // RECOVER rebuilds one provable one-second target from the live hardware
+  // coordinate; VCLOCK resumes rollover tending after this reset.
   synthetic_clock_tend_from_hardware(g_ocxo2_clock32, ocxo_counter_now(g_ocxo2_lane));
   ocxo_reset_target_grid(g_ocxo2_lane, g_ocxo2_clock32);
   g_ocxo2_lane.rebootstrap_count++;
@@ -4927,26 +4830,27 @@ static FLASHMEM void add_ocxo_lane_report(Payload& payload,
   add_u32("next_target_counter32", lane.next_target_counter32);
   add_u32("armed_target_counter32", lane.armed_target_counter32);
   add_u32("armed_target_low16", (uint32_t)lane.armed_target_low16);
-  add_u32("next_target_tooth", (uint32_t)lane.next_target_tooth);
-  add_u32("armed_target_tooth", (uint32_t)lane.armed_target_tooth);
-  add_u32("capture_pending_target_tooth",
-          (uint32_t)lane.capture_pending_target_tooth);
-  add_u32("last_fired_target_tooth",
-          (uint32_t)lane.last_fired_target_tooth);
-  add_u32("cadence_phase_reset_count", lane.cadence_phase_reset_count);
-  add_u32("cadence_phase_invalid_count", lane.cadence_phase_invalid_count);
+  add_bool("one_second_compare_only", true);
   add_bool("one_second_boundary_reachable",
-           lane.target_grid_valid &&
-           lane.next_target_tooth >= 1U &&
-           lane.next_target_tooth <=
-               (uint16_t)OCXO_CADENCE_TEETH_PER_SECOND);
+           lane.target_grid_valid && lane.next_target_counter32 != 0U);
   add_u32("one_second_ticks", OCXO_ONE_SECOND_TICKS);
+  add_u32("compare_period_ticks", OCXO_COMPARE_PERIOD_TICKS);
+  add_u32("compare_rate_hz", OCXO_COMPARE_RATE_HZ);
+  add_u32("target_grid_reset_count", lane.target_grid_reset_count);
   add_u32("arm_count", lane.arm_count);
   add_u32("fire_count", lane.fire_count);
-  add_u32("cadence_fire_count", lane.cadence_fire_count);
-  add_u32("cadence_boundary_count", lane.cadence_boundary_count);
-  add_u32("cadence_ticks", OCXO_CADENCE_TICKS);
-  add_u32("cadence_hz", OCXO_CADENCE_HZ);
+  // Legacy cadence keys remain explicit zeroes for report compatibility.
+  add_bool("cadence_enabled", false);
+  add_u32("next_target_tooth", 0U);
+  add_u32("armed_target_tooth", 0U);
+  add_u32("capture_pending_target_tooth", 0U);
+  add_u32("last_fired_target_tooth", 0U);
+  add_u32("cadence_phase_reset_count", 0U);
+  add_u32("cadence_phase_invalid_count", 0U);
+  add_u32("cadence_fire_count", 0U);
+  add_u32("cadence_boundary_count", 0U);
+  add_u32("cadence_ticks", 0U);
+  add_u32("cadence_hz", 0U);
   add_u32("missed_target_count", lane.missed_target_count);
   add_u32("rollover_tend_count", lane.rollover_tend_count);
   add_u32("arm_window_wait_count", lane.arm_window_wait_count);
@@ -4986,9 +4890,8 @@ static FLASHMEM void add_ocxo_lane_report(Payload& payload,
   add_u32("last_compare_low16", (uint32_t)lane.last_compare_low16);
   add_i32("ambient_minus_target_ticks",
           lane.last_ambient_minus_target_ticks);
-  add_u32("cadence_delta_ticks", lane.last_cadence_delta_ticks);
-  add_u32("cadence_delta_violation_count",
-          lane.cadence_delta_violation_count);
+  add_u32("cadence_delta_ticks", 0U);
+  add_u32("cadence_delta_violation_count", 0U);
   add_u32("counter_delta_ticks", lane.last_counter_delta_ticks);
   add_u32("counter_delta_violation_count",
           lane.counter_delta_violation_count);
@@ -5000,9 +4903,11 @@ static FLASHMEM Payload cmd_report_status(const Payload&) {
   payload.add("architecture", "OBSERVED_EDGE_ONLY");
   payload.add("ema_present", false);
   payload.add("yardstick_dwt_candidate_present", false);
-  payload.add("ocxo_1khz_cadence_present", true);
-  payload.add("ocxo_1khz_capture_hook", "NOOP");
-  payload.add("ocxo_match_period_ticks", OCXO_CADENCE_TICKS);
+  payload.add("ocxo_1khz_cadence_present", false);
+  payload.add("ocxo_1khz_capture_hook", "DISABLED");
+  payload.add("ocxo_match_period_ticks", OCXO_COMPARE_PERIOD_TICKS);
+  payload.add("ocxo_compare_rate_hz", OCXO_COMPARE_RATE_HZ);
+  payload.add("ocxo_rollover_owner", "VCLOCK_HEARTBEAT");
   payload.add("ocxo_boundary_period_ticks", OCXO_ONE_SECOND_TICKS);
   payload.add("priority0", INTERRUPT_PRIORITY_CAPTURE);
   payload.add("priority16", INTERRUPT_PRIORITY_HANDOFF);
@@ -5068,13 +4973,15 @@ static FLASHMEM Payload cmd_report_cadence(const Payload&) {
   Payload payload;
   payload.add("report", "INTERRUPT_CADENCE");
   payload.add("vclock_period_ticks", (uint32_t)VCLOCK_INTERVAL_COUNTS);
-  payload.add("ocxo_period_ticks", OCXO_CADENCE_TICKS);
-  payload.add("ocxo_cadence_hz", OCXO_CADENCE_HZ);
-  payload.add("ocxo_teeth_per_second", OCXO_CADENCE_TEETH_PER_SECOND);
+  payload.add("ocxo_period_ticks", OCXO_COMPARE_PERIOD_TICKS);
+  payload.add("ocxo_compare_rate_hz", OCXO_COMPARE_RATE_HZ);
+  payload.add("ocxo_1khz_cadence_present", false);
+  payload.add("ocxo_cadence_hz", 0U);
+  payload.add("ocxo_teeth_per_second", 0U);
   payload.add("ocxo_boundary_period_ticks", OCXO_ONE_SECOND_TICKS);
   payload.add("ocxo_arm_window_ticks", OCXO_ARM_WINDOW_TICKS);
   payload.add("ocxo_min_arm_lead_ticks", OCXO_MIN_ARM_LEAD_TICKS);
-  payload.add("rollover_owner", "VCLOCK_PRIORITY16");
+  payload.add("rollover_owner", "VCLOCK_PRIORITY16_HEARTBEAT");
   payload.add("vclock_rearm_context", "PRIORITY16_HANDOFF");
   payload.add("counter_authority", "AUTHORED_COMPARE_TARGET");
   payload.add("ambient_counter_role", "WITNESS_ONLY");
@@ -5633,8 +5540,8 @@ static FLASHMEM Payload cmd_report_integrity(const Payload&) {
   payload.add("ocxo2_dwt_valid", snapshot.ocxo2_qtimer_dwt.one_second.valid);
   payload.add("ocxo2_dwt_error_cycles",
               snapshot.ocxo2_qtimer_dwt.one_second.error_cycles);
-  payload.add("hz1k_cadence_active", true);
-  payload.add("hz1k_capture_hook", "NOOP");
+  payload.add("hz1k_cadence_active", false);
+  payload.add("hz1k_capture_hook", "DISABLED");
   payload.add("hz1k_rails_authored", false);
   return payload;
 }

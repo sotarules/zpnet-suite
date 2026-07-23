@@ -8,7 +8,7 @@
 // mirror.  No slot staging, no installed event wrappers, no late hardware
 // reads masquerading as event truth.
 //
-// OCXO events are delivered as rollover-only one-second events whose DWT
+// OCXO events are delivered as direct one-second compare events whose DWT
 // coordinate is authored by process_interrupt from completed one-second
 // intervals.  The older quiet-zone/sample-phase back-projection path is retired:
 // Alpha now treats OCXO subscriber events as ordinary clock-edge facts and never
@@ -2317,8 +2317,8 @@ static constexpr uint32_t ALPHA_COUNTERLEDGER_PHASE_PENDING_SLOT_CAPACITY = 1U;
 // CounterLedger is a PPS-sampled 10 MHz integer rail.  A lawful contiguous
 // PPS interval must remain within 10,000 ticks of the nominal 10,000,000-tick
 // second.  A deviation of 10,000 ticks is exactly 1 ms / 1,000 ppm: far beyond
-// plausible OCXO physics, but exactly the discrete injury observed when one
-// cadence tooth was lost or mis-associated.  Treat the threshold as inclusive:
+// plausible OCXO physics, but exactly the discrete injury produced when a
+// one-second counter lineage slips by 1 ms.  Treat the threshold as inclusive:
 // abs(delta - nominal) >= 10,000 is inadmissible and must re-seed rather than
 // advance the canonical clockface.
 static constexpr uint32_t ALPHA_COUNTERLEDGER_EXPECTED_INTERVAL_TICKS =
@@ -7313,10 +7313,10 @@ bool clocks_alpha_recover_rearm_interrupt_service(void) {
   //
   // OCXO RECOVER is deliberately stronger.  CounterLedger can keep sampling
   // PPS counters while the one-second capture/handoff/fact-drain ferry is
-  // wedged, so runtime_active/cadence_enabled alone are not a liveness proof.
-  // Cut each stale delivery pipeline while preserving a hardware-verified live
-  // compare ladder; re-arm from the installed logical grid only if the ladder
-  // itself is not provably alive.
+  // wedged, so runtime_active alone is not a liveness proof. Cut each stale
+  // delivery pipeline while preserving a hardware-verified live one-second
+  // compare; re-arm from the installed logical grid only if that target is not
+  // provably alive.
   const bool vclock_ok =
       interrupt_ensure_service(interrupt_subscriber_kind_t::VCLOCK);
   const bool ocxo1_ok = interrupt_recover_rebootstrap_ocxo_service(
@@ -8322,8 +8322,8 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
                                    0U);
 
     // measured_dwt_cycles belongs only to the delayed bridge forensic rail.
-    // Canonical OCXO cadence remains the direct subtraction of these two
-    // adjacent observed event coordinates.
+    // Canonical OCXO interval remains the direct subtraction of these two
+    // adjacent observed one-second event coordinates.
     gnss_ns_between_edges = real_interval_ns;
     second_residual_ns = residual_fast_ns;
     window_error_ns = -residual_fast_ns;

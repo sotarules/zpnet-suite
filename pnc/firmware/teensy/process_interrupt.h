@@ -2,9 +2,9 @@
 // process_interrupt.h — observed-edge custody ABI
 // ============================================================================
 // process_interrupt publishes only raw, latency-adjusted DWT-at-edge facts
-// paired with authored compare-target identities.  A mechanical 1 kHz OCXO
-// cadence may exercise the compare path, but it contains no alternative endpoint
-// estimator or repair authority.
+// paired with authored compare-target identities.  OCXO compare custody is 1 Hz;
+// the native VCLOCK heartbeat extends each 16-bit OCXO timer and arms its next
+// one-second compare only after the target enters the safe programming window.
 // ============================================================================
 
 #pragma once
@@ -413,7 +413,7 @@ struct interrupt_capture_diag_t {
   uint32_t ocxo_sample_phase_ticks = 0;     // 10 MHz ticks; 2500 = +250 us
   uint32_t ocxo_sample_phase_ns = 0;
   uint32_t ocxo_sample_phase_us = 0;
-  uint32_t ocxo_sample_period_ticks = 0;    // normally 10,000 ticks = 1 ms
+  uint32_t ocxo_sample_period_ticks = 0;    // one-second compare: 10,000,000 ticks
   uint32_t ocxo_sample_dwt_at_event = 0;
   uint32_t ocxo_sample_counter32_at_event = 0;
 
@@ -775,9 +775,8 @@ struct interrupt_integrity_snapshot_t {
   interrupt_integrity_qtimer_cntr_match_check_t ocxo1_qtimer_cntr;
   interrupt_integrity_qtimer_cntr_match_check_t ocxo2_qtimer_cntr;
 
-  // Raw first-instruction DWT intervals between accepted compare teeth.  The
-  // 1 kHz member is reserved for a later analysis pass; the initial cadence
-  // experiment exercises every tooth but authors only the one-second rail.
+  // Raw first-instruction DWT intervals between accepted one-second compares.
+  // The historical hz1k member remains an ABI shell and is never authored.
   interrupt_integrity_qtimer_dwt_match_check_t vclock_qtimer_dwt;
   interrupt_integrity_qtimer_dwt_match_check_t ocxo1_qtimer_dwt;
   interrupt_integrity_qtimer_dwt_match_check_t ocxo2_qtimer_dwt;
@@ -996,16 +995,16 @@ bool interrupt_subscribe(const interrupt_subscription_t& sub);
 bool interrupt_start(interrupt_subscriber_kind_t kind);
 
 // Idempotent recovery service assertion.  Unlike interrupt_start(), this leaves
-// healthy subscriber, VCLOCK-anchor, observed cadence, and publication
+// healthy subscriber, VCLOCK-anchor, one-second compare, and publication
 // custody untouched.  It performs a narrow restart only when the requested
-// runtime or lane-local cadence is actually inactive.
+// runtime or lane-local compare service is actually inactive.
 bool interrupt_ensure_service(interrupt_subscriber_kind_t kind);
 
 // RECOVER-only OCXO observed-edge rebootstrap.  Clears stale capture and
 // deferred-dispatch custody, preserves the installed logical clock zero, and
-// rebuilds a fresh wrap-proof 1 kHz target/tooth grid from the live hardware
-// coordinate.  This guarantees that a one-second boundary remains reachable
-// even when the prior 32-bit target coordinate wrapped or lost grid phase.
+// rebuilds one fresh wrap-proof one-second target from the live hardware
+// coordinate.  VCLOCK resumes low-word rollover tending until that target can
+// be armed safely, even if the prior 32-bit coordinate lost grid phase.
 // Does not touch VCLOCK, SmartZero proof state, the OCXO logical zero, or DACs.
 bool interrupt_recover_rebootstrap_ocxo_service(
     interrupt_subscriber_kind_t kind);

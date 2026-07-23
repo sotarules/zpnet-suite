@@ -140,8 +140,8 @@ static inline uint64_t dwt_ns_to_cycles(uint64_t ns) {
 // All five of these globals are authored by alpha::pps_selector_callback
 // from process_interrupt's canonical PPS/VCLOCK snapshots. PPS selects and
 // audits the relationship; the public DWT coordinate itself is the observed
-// VCLOCK/QTimer event coordinate so the bridge, 1 kHz cadence samples, and
-// one-second bookends share one measured-edge species.
+// VCLOCK/QTimer event coordinate so the bridge, VCLOCK heartbeat, and OCXO
+// one-second compare bookends share one measured-edge species.
 // ============================================================================
 
 // Canonical VCLOCK/GNSS and measured OCXO 64-bit ledgers at the most recent
@@ -845,7 +845,7 @@ struct clocks_alpha_lane_forensics_t {
 
   // SlipLedger correction summary from process_interrupt.  The subscriber
   // DWT value is already purified; these fields are the compact forensic
-  // trail for any signed hardware-counter phase correction applied at 1 kHz.
+  // trail for any historical signed hardware-counter phase correction.
   bool     slipledger_active;
   bool     slipledger_event_corrected;
   bool     slipledger_event_violation;
