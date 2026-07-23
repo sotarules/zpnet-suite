@@ -6883,11 +6883,15 @@ static constexpr uint32_t SMARTZERO_INSTALL_STAGE_TIME_ANCHORS     = 6;
 static constexpr uint32_t SMARTZERO_INSTALL_STAGE_TIMEPOP_REAUTHOR = 7;
 static constexpr uint32_t SMARTZERO_INSTALL_STAGE_COMMIT           = 8;
 static constexpr uint32_t SMARTZERO_INSTALL_STAGE_FAIL             = 9;
+static constexpr uint32_t SMARTZERO_INSTALL_STAGE_STAGGER_GRIDS    = 10;
 
 static constexpr uint32_t SMARTZERO_INSTALL_FAIL_NONE              = 0;
 static constexpr uint32_t SMARTZERO_INSTALL_FAIL_REENTRANT         = 1;
 static constexpr uint32_t SMARTZERO_INSTALL_FAIL_NO_COMPLETE_PROOF = 2;
 static constexpr uint32_t SMARTZERO_INSTALL_FAIL_BAD_LANE_PROOF    = 3;
+static constexpr uint32_t SMARTZERO_INSTALL_FAIL_SERVICE_STOP      = 4;
+static constexpr uint32_t SMARTZERO_INSTALL_FAIL_GRID_ZERO         = 5;
+static constexpr uint32_t SMARTZERO_INSTALL_FAIL_MIN_SEPARATION    = 6;
 
 static volatile uint32_t g_alpha_smartzero_install_attempt_count = 0;
 static volatile uint32_t g_alpha_smartzero_install_commit_count = 0;
@@ -6903,6 +6907,19 @@ static volatile bool     g_alpha_smartzero_install_last_success = false;
 static volatile bool     g_alpha_smartzero_install_last_atomic = false;
 static char              g_alpha_smartzero_install_last_reason[32] = {0};
 
+// Last completed physical-grid staggering transaction.  The seqlock keeps
+// focused reports from observing a half-written two-lane install transcript.
+static volatile uint32_t g_alpha_smartzero_delay_seq = 0;
+static clocks_alpha_smartzero_delay_snapshot_t
+    g_alpha_smartzero_delay_snapshot DMAMEM = {};
+static clocks_alpha_smartzero_delay_snapshot_t
+    g_alpha_smartzero_delay_install_scratch DMAMEM = {};
+
+// Tiny current-selector witness used by the SmartZero install transaction.
+// pps_selector_callback authors it before any START/ZERO control path runs.
+static volatile uint32_t g_alpha_latest_selector_reference_sequence = 0;
+static volatile uint32_t g_alpha_latest_selector_reference_dwt = 0;
+
 static volatile uint32_t g_alpha_recover_reprime_count = 0;
 
 static const char* smartzero_install_stage_name(uint32_t stage) {
@@ -6917,8 +6934,184 @@ static const char* smartzero_install_stage_name(uint32_t stage) {
     case SMARTZERO_INSTALL_STAGE_TIMEPOP_REAUTHOR: return "TIMEPOP_REAUTHOR";
     case SMARTZERO_INSTALL_STAGE_COMMIT:           return "COMMIT";
     case SMARTZERO_INSTALL_STAGE_FAIL:             return "FAIL";
+    case SMARTZERO_INSTALL_STAGE_STAGGER_GRIDS:    return "STAGGER_GRIDS";
     default:                                       return "UNKNOWN";
   }
+}
+
+static void alpha_smartzero_delay_publish(
+    const clocks_alpha_smartzero_delay_snapshot_t& local) {
+  g_alpha_smartzero_delay_seq++;
+  clocks_alpha_dmb();
+  g_alpha_smartzero_delay_snapshot = local;
+  clocks_alpha_dmb();
+  g_alpha_smartzero_delay_seq++;
+}
+
+bool clocks_alpha_smartzero_delay_snapshot(
+    clocks_alpha_smartzero_delay_snapshot_t* out) {
+  if (!out) return false;
+  for (int attempt = 0; attempt < 4; ++attempt) {
+    const uint32_t seq1 = g_alpha_smartzero_delay_seq;
+    if (seq1 & 1U) continue;
+    clocks_alpha_dmb();
+    *out = g_alpha_smartzero_delay_snapshot;
+    clocks_alpha_dmb();
+    const uint32_t seq2 = g_alpha_smartzero_delay_seq;
+    if (seq1 == seq2 && (seq2 & 1U) == 0U) {
+      return out->install_count != 0U;
+    }
+  }
+  *out = clocks_alpha_smartzero_delay_snapshot_t{};
+  return false;
+}
+
+static uint32_t alpha_smartzero_minimum_separation_cycles(void) {
+  // Ceil the ns->DWT conversion: this is a minimum-separation contract, so
+  // truncation by even one fractional DWT cycle is not admissible.
+  const uint64_t numerator =
+      CLOCKS_SMARTZERO_MIN_EDGE_SEPARATION_NS * (uint64_t)DWT_NS_DEN +
+      ((uint64_t)DWT_NS_NUM - 1ULL);
+  const uint64_t cycles = numerator / (uint64_t)DWT_NS_NUM;
+  return cycles > (uint64_t)UINT32_MAX ? UINT32_MAX : (uint32_t)cycles;
+}
+
+static void alpha_smartzero_wait_until_dwt(uint32_t earliest_dwt) {
+  while ((int32_t)(DWT_CYCCNT - earliest_dwt) < 0) {
+    // Intentional sub-millisecond spin.  Priority-0 capture remains enabled;
+    // preemption may enlarge the gap but can never make it smaller.
+  }
+}
+
+static void alpha_smartzero_restore_ocxo_service_after_failure(
+    bool prior_epoch_valid,
+    uint32_t prior_ocxo1_counter32,
+    uint32_t prior_ocxo2_counter32) {
+  if (prior_epoch_valid) {
+    interrupt_ocxo_logical_grid_epoch(prior_ocxo1_counter32,
+                                      prior_ocxo2_counter32);
+  }
+  (void)interrupt_start(interrupt_subscriber_kind_t::OCXO1);
+  (void)interrupt_start(interrupt_subscriber_kind_t::OCXO2);
+}
+
+static bool alpha_smartzero_install_staggered_ocxo_grids(
+    const interrupt_smartzero_lane_snapshot_t& ocxo1,
+    const interrupt_smartzero_lane_snapshot_t& ocxo2,
+    uint32_t epoch_sequence,
+    uint32_t smartzero_sequence,
+    uint32_t* out_failure_code) {
+  clocks_alpha_smartzero_delay_snapshot_t& local =
+      g_alpha_smartzero_delay_install_scratch;
+  local = clocks_alpha_smartzero_delay_snapshot_t{};
+  local.epoch_sequence = epoch_sequence;
+  local.smartzero_sequence = smartzero_sequence;
+  local.install_count = g_alpha_smartzero_delay_snapshot.install_count + 1U;
+  local.minimum_separation_us = CLOCKS_SMARTZERO_MIN_EDGE_SEPARATION_US;
+  local.minimum_separation_cycles =
+      alpha_smartzero_minimum_separation_cycles();
+  local.ocxo1_zero_counter32 = ocxo1.anchor_counter32;
+  local.ocxo2_zero_counter32 = ocxo2.anchor_counter32;
+
+  const uint32_t reference_probe_dwt = DWT_CYCCNT;
+  const uint32_t selector_sequence =
+      g_alpha_latest_selector_reference_sequence;
+  const uint32_t selector_dwt = g_alpha_latest_selector_reference_dwt;
+  const uint32_t cps = dwt_effective_cycles_per_pps_vclock_second();
+  const uint32_t reference_age_limit =
+      (cps != 0U ? cps : (uint32_t)DWT_EXPECTED_PER_PPS) / 2U;
+  const uint32_t reference_age = reference_probe_dwt - selector_dwt;
+  local.reference_from_pps_vclock =
+      selector_sequence != 0U && selector_dwt != 0U &&
+      reference_age < reference_age_limit;
+  local.reference_dwt = local.reference_from_pps_vclock
+      ? selector_dwt
+      : reference_probe_dwt;
+
+  const bool prior_epoch_valid =
+      g_epoch_initialized &&
+      g_alpha_epoch_last_ocxo1_zero_valid &&
+      g_alpha_epoch_last_ocxo2_zero_valid;
+  const uint32_t prior_ocxo1_counter32 = g_alpha_epoch_last_ocxo1_counter32;
+  const uint32_t prior_ocxo2_counter32 = g_alpha_epoch_last_ocxo2_counter32;
+
+  const bool ocxo1_stopped =
+      interrupt_stop(interrupt_subscriber_kind_t::OCXO1);
+  const bool ocxo2_stopped =
+      interrupt_stop(interrupt_subscriber_kind_t::OCXO2);
+  if (!ocxo1_stopped || !ocxo2_stopped) {
+    alpha_smartzero_restore_ocxo_service_after_failure(
+        prior_epoch_valid, prior_ocxo1_counter32, prior_ocxo2_counter32);
+    if (out_failure_code) {
+      *out_failure_code = SMARTZERO_INSTALL_FAIL_SERVICE_STOP;
+    }
+    alpha_smartzero_delay_publish(local);
+    return false;
+  }
+
+  local.ocxo1_earliest_dwt =
+      local.reference_dwt + local.minimum_separation_cycles;
+  alpha_smartzero_wait_until_dwt(local.ocxo1_earliest_dwt);
+  local.ocxo1_install_begin_dwt = DWT_CYCCNT;
+  const bool ocxo1_zeroed = interrupt_clock32_zero_from_ns(
+      interrupt_subscriber_kind_t::OCXO1,
+      (uint64_t)ocxo1.anchor_counter32 * (uint64_t)NS_PER_10MHZ_TICK);
+  const bool ocxo1_started =
+      interrupt_start(interrupt_subscriber_kind_t::OCXO1);
+  local.ocxo1_install_complete_dwt = DWT_CYCCNT;
+  local.ocxo1_zero_ok = ocxo1_zeroed && ocxo1_started;
+  local.ocxo1_reference_gap_cycles =
+      local.ocxo1_install_begin_dwt - local.reference_dwt;
+  local.ocxo1_lateness_cycles =
+      local.ocxo1_install_begin_dwt - local.ocxo1_earliest_dwt;
+  local.ocxo1_minimum_satisfied =
+      local.ocxo1_reference_gap_cycles >= local.minimum_separation_cycles;
+
+  if (!local.ocxo1_zero_ok) {
+    alpha_smartzero_restore_ocxo_service_after_failure(
+        prior_epoch_valid, prior_ocxo1_counter32, prior_ocxo2_counter32);
+    if (out_failure_code) *out_failure_code = SMARTZERO_INSTALL_FAIL_GRID_ZERO;
+    alpha_smartzero_delay_publish(local);
+    return false;
+  }
+
+  local.ocxo2_earliest_dwt =
+      local.ocxo1_install_complete_dwt + local.minimum_separation_cycles;
+  alpha_smartzero_wait_until_dwt(local.ocxo2_earliest_dwt);
+  local.ocxo2_install_begin_dwt = DWT_CYCCNT;
+  const bool ocxo2_zeroed = interrupt_clock32_zero_from_ns(
+      interrupt_subscriber_kind_t::OCXO2,
+      (uint64_t)ocxo2.anchor_counter32 * (uint64_t)NS_PER_10MHZ_TICK);
+  const bool ocxo2_started =
+      interrupt_start(interrupt_subscriber_kind_t::OCXO2);
+  local.ocxo2_install_complete_dwt = DWT_CYCCNT;
+  local.ocxo2_zero_ok = ocxo2_zeroed && ocxo2_started;
+  local.ocxo2_from_ocxo1_gap_cycles =
+      local.ocxo2_install_begin_dwt - local.ocxo1_install_complete_dwt;
+  local.ocxo2_lateness_cycles =
+      local.ocxo2_install_begin_dwt - local.ocxo2_earliest_dwt;
+  local.ocxo2_minimum_satisfied =
+      local.ocxo2_from_ocxo1_gap_cycles >= local.minimum_separation_cycles;
+  local.all_minimums_satisfied =
+      local.ocxo1_minimum_satisfied && local.ocxo2_minimum_satisfied;
+  local.valid = local.ocxo1_zero_ok && local.ocxo2_zero_ok &&
+      local.all_minimums_satisfied;
+
+  if (!local.valid) {
+    alpha_smartzero_restore_ocxo_service_after_failure(
+        prior_epoch_valid, prior_ocxo1_counter32, prior_ocxo2_counter32);
+    if (out_failure_code) {
+      *out_failure_code = local.ocxo2_zero_ok
+          ? SMARTZERO_INSTALL_FAIL_MIN_SEPARATION
+          : SMARTZERO_INSTALL_FAIL_GRID_ZERO;
+    }
+    alpha_smartzero_delay_publish(local);
+    return false;
+  }
+
+  if (out_failure_code) *out_failure_code = SMARTZERO_INSTALL_FAIL_NONE;
+  alpha_smartzero_delay_publish(local);
+  return true;
 }
 
 bool clocks_alpha_epoch_last_smartzero(interrupt_smartzero_snapshot_t* out) {
@@ -7762,10 +7955,23 @@ bool clocks_alpha_zero_from_smartzero(const char* reason) {
   const interrupt_smartzero_lane_snapshot_t& ocxo2  = z.lanes[2];
   const uint32_t next_epoch_sequence = g_alpha_epoch_sequence + 1U;
 
-  // Commit window begins.  A complete proof exists, so it is now lawful to
-  // replace the installed science epoch.  epoch_ready() is false while this
-  // transaction runs, so Alpha event consumers cannot apply events against
-  // reset ledgers or half-installed zero offsets.
+  // Re-author the two physical OCXO grids before destroying the prior Alpha
+  // epoch.  g_alpha_epoch_install_in_progress already prevents event consumers
+  // from applying facts during this bounded stop/zero/start transaction.
+  alpha_smartzero_install_mark_stage(SMARTZERO_INSTALL_STAGE_STAGGER_GRIDS);
+  uint32_t stagger_failure = SMARTZERO_INSTALL_FAIL_NONE;
+  if (!alpha_smartzero_install_staggered_ocxo_grids(
+          ocxo1, ocxo2, next_epoch_sequence, z.sequence,
+          &stagger_failure)) {
+    alpha_smartzero_install_fail(SMARTZERO_INSTALL_STAGE_STAGGER_GRIDS,
+                                 stagger_failure);
+    return false;
+  }
+  const clocks_alpha_smartzero_delay_snapshot_t& stagger =
+      g_alpha_smartzero_delay_install_scratch;
+
+  // Commit window begins.  A complete proof and a verified staggered physical
+  // grid now exist, so it is lawful to replace the installed science epoch.
   alpha_smartzero_install_mark_stage(SMARTZERO_INSTALL_STAGE_RESET_STATE);
   alpha_reset_canonical_clock_state_for_new_epoch();
 
@@ -7777,19 +7983,22 @@ bool clocks_alpha_zero_from_smartzero(const char* reason) {
   g_prev_pps_vclock_dwt_at_edge = vclock.anchor_dwt;
   g_prev_pps_vclock_dwt_at_edge_valid = true;
 
+  // Visible-origin phase is now measured from the selected PPS/VCLOCK edge
+  // that triggered this installation to the actual per-lane grid transaction,
+  // not from the historical SmartZero vote endpoints.
   alpha_ocxo_visible_origin_capture_from_smartzero(
       time_clock_id_t::OCXO1,
       next_epoch_sequence,
       z.sequence,
-      vclock.anchor_dwt,
-      ocxo1.anchor_dwt,
+      stagger.reference_dwt,
+      stagger.ocxo1_install_begin_dwt,
       alpha_ocxo_visible_origin_select_cps(vclock, ocxo1));
   alpha_ocxo_visible_origin_capture_from_smartzero(
       time_clock_id_t::OCXO2,
       next_epoch_sequence,
       z.sequence,
-      vclock.anchor_dwt,
-      ocxo2.anchor_dwt,
+      stagger.reference_dwt,
+      stagger.ocxo2_install_begin_dwt,
       alpha_ocxo_visible_origin_select_cps(vclock, ocxo2));
 
   const uint64_t ocxo1_visible_epoch_ns =
@@ -7805,31 +8014,29 @@ bool clocks_alpha_zero_from_smartzero(const char* reason) {
   alpha_counterledger_install_zero(g_ocxo2_pps_counterledger,
                                    ocxo2.anchor_counter32);
 
-  // OCXO measured ledgers have their own mathematically-qualified zero
-  // anchors. The first post-zero OCXO edge measures from that OCXO anchor,
-  // not from the VCLOCK anchor.
+  // Seed each OCXO measurement/edge-history rail from the bounded transaction
+  // entry immediately preceding its physical grid zero.  The first candidate
+  // remains private START evidence; all later intervals are exact edge-to-edge.
   g_ocxo1_measured_ns.initialized = true;
   g_ocxo1_measured_ns.ns_at_edge = 0;
-  g_ocxo1_measured_ns.dwt_at_edge = ocxo1.anchor_dwt;
-  g_ocxo1_measured_ns.dwt64_at_edge = clocks_dwt_cycles_at_dwt(ocxo1.anchor_dwt);
+  g_ocxo1_measured_ns.dwt_at_edge = stagger.ocxo1_install_begin_dwt;
+  g_ocxo1_measured_ns.dwt64_at_edge =
+      clocks_dwt_cycles_at_dwt(stagger.ocxo1_install_begin_dwt);
   g_ocxo2_measured_ns.initialized = true;
   g_ocxo2_measured_ns.ns_at_edge = 0;
-  g_ocxo2_measured_ns.dwt_at_edge = ocxo2.anchor_dwt;
-  g_ocxo2_measured_ns.dwt64_at_edge = clocks_dwt_cycles_at_dwt(ocxo2.anchor_dwt);
+  g_ocxo2_measured_ns.dwt_at_edge = stagger.ocxo2_install_begin_dwt;
+  g_ocxo2_measured_ns.dwt64_at_edge =
+      clocks_dwt_cycles_at_dwt(stagger.ocxo2_install_begin_dwt);
 
-  // SmartZero anchors are observed one-second edges.  Seed the ordinary
-  // measurement ledgers with those exact endpoints so the first post-zero
-  // OCXO edge can bracket the first PPS row instead of requiring a synthetic
-  // extra warm-up second or a pending-row queue.
   g_vclock_measurement.prev_dwt_at_edge = vclock.anchor_dwt;
-  g_ocxo1_measurement.prev_dwt_at_edge = ocxo1.anchor_dwt;
-  g_ocxo2_measurement.prev_dwt_at_edge = ocxo2.anchor_dwt;
+  g_ocxo1_measurement.prev_dwt_at_edge = stagger.ocxo1_install_begin_dwt;
+  g_ocxo2_measurement.prev_dwt_at_edge = stagger.ocxo2_install_begin_dwt;
 
   alpha_ocxo_edge_history_install_zero(time_clock_id_t::OCXO1,
-                                       ocxo1.anchor_dwt,
+                                       stagger.ocxo1_install_begin_dwt,
                                        ocxo1.anchor_counter32);
   alpha_ocxo_edge_history_install_zero(time_clock_id_t::OCXO2,
-                                       ocxo2.anchor_dwt,
+                                       stagger.ocxo2_install_begin_dwt,
                                        ocxo2.anchor_counter32);
 
   clock_mark_epoch_zero(g_vclock_clock);
@@ -7843,16 +8050,14 @@ bool clocks_alpha_zero_from_smartzero(const char* reason) {
   alpha_smartzero_install_mark_stage(SMARTZERO_INSTALL_STAGE_TIME_ANCHORS);
   time_pps_vclock_epoch_reset(vclock.anchor_dwt, vclock.anchor_counter32);
   time_clock_epoch_reset(time_clock_id_t::VCLOCK, vclock.anchor_dwt, 0);
-  time_clock_epoch_reset(time_clock_id_t::OCXO1,  ocxo1.anchor_dwt, ocxo1_visible_epoch_ns);
-  time_clock_epoch_reset(time_clock_id_t::OCXO2,  ocxo2.anchor_dwt, ocxo2_visible_epoch_ns);
+  time_clock_epoch_reset(time_clock_id_t::OCXO1,
+                         stagger.ocxo1_install_begin_dwt,
+                         ocxo1_visible_epoch_ns);
+  time_clock_epoch_reset(time_clock_id_t::OCXO2,
+                         stagger.ocxo2_install_begin_dwt,
+                         ocxo2_visible_epoch_ns);
 
   alpha_smartzero_install_mark_stage(SMARTZERO_INSTALL_STAGE_TIMEPOP_REAUTHOR);
-  // CLOCKS has now selected and installed the OCXO logical zero-offset
-  // counter32 values. Explicitly hand those anchors back to process_interrupt
-  // so the OCXO local compare ladders are re-authored from the installed
-  // SmartZero proof instead of relying on acquisition-side residue.
-  interrupt_ocxo_logical_grid_epoch(ocxo1.anchor_counter32,
-                                    ocxo2.anchor_counter32);
 
   // VCLOCK synthetic coordinate generation changed. Re-author recurring
   // TimePop timers and cancel unsafe old-coordinate one-shots before normal
@@ -8684,6 +8889,9 @@ static void update_pps_vclock_bridge_anchor(const pps_edge_snapshot_t& snap) {
 }
 
 static void pps_selector_callback(const pps_edge_snapshot_t& snap) {
+  g_alpha_latest_selector_reference_sequence = snap.sequence;
+  g_alpha_latest_selector_reference_dwt = snap.dwt_at_edge;
+
   // Startup epoch install is SmartZero-gated.  Explicit START/ZERO requests
   // are serviced through Beta's sequence-zero control probe below; startup
   // uses the same proof only when no command-owned acquisition is active.

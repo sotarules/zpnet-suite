@@ -1824,6 +1824,47 @@ void clocks_watchdog_anomaly_payload(const char* reason,
 // SmartZero acquisition surface and installs canonical logical origins.
 // The legacy interrupt-capture entry point is retained as a compatibility
 // wrapper during migration.
+//
+// Physical-grid staggering is a separate installation fact.  All three
+// clocks retain one logical zero, while Alpha installs OCXO1 no earlier than
+// the selected PPS/VCLOCK reference plus the configured minimum and installs
+// OCXO2 no earlier than the actual OCXO1 completion plus that same minimum.
+// Priority-0 preemption may enlarge either gap; it must never compress one.
+struct clocks_alpha_smartzero_delay_snapshot_t {
+  bool     valid = false;
+  bool     reference_from_pps_vclock = false;
+  bool     ocxo1_zero_ok = false;
+  bool     ocxo2_zero_ok = false;
+  bool     ocxo1_minimum_satisfied = false;
+  bool     ocxo2_minimum_satisfied = false;
+  bool     all_minimums_satisfied = false;
+
+  uint32_t epoch_sequence = 0;
+  uint32_t smartzero_sequence = 0;
+  uint32_t install_count = 0;
+  uint32_t minimum_separation_us = 0;
+  uint32_t minimum_separation_cycles = 0;
+
+  uint32_t reference_dwt = 0;
+
+  uint32_t ocxo1_earliest_dwt = 0;
+  uint32_t ocxo1_install_begin_dwt = 0;
+  uint32_t ocxo1_install_complete_dwt = 0;
+  uint32_t ocxo1_reference_gap_cycles = 0;
+  uint32_t ocxo1_lateness_cycles = 0;
+  uint32_t ocxo1_zero_counter32 = 0;
+
+  uint32_t ocxo2_earliest_dwt = 0;
+  uint32_t ocxo2_install_begin_dwt = 0;
+  uint32_t ocxo2_install_complete_dwt = 0;
+  uint32_t ocxo2_from_ocxo1_gap_cycles = 0;
+  uint32_t ocxo2_lateness_cycles = 0;
+  uint32_t ocxo2_zero_counter32 = 0;
+};
+
+bool clocks_alpha_smartzero_delay_snapshot(
+    clocks_alpha_smartzero_delay_snapshot_t* out);
+
 bool clocks_epoch_pending(void);
 bool clocks_alpha_begin_smartzero_epoch(const char* reason);
 bool clocks_alpha_zero_from_smartzero(const char* reason);

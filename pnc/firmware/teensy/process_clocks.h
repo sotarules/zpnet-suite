@@ -56,6 +56,30 @@
 // ============================================================================
 
 // -----------------------------------------------------------------------------
+// SmartZero physical one-second edge separation
+// -----------------------------------------------------------------------------
+//
+// CLOCKS installs one shared logical zero while deliberately placing the
+// physical OCXO one-second grids apart in real time.  Each configured delay
+// is a minimum: priority-0 preemption may make a separation larger, but the
+// next lane must never be installed sooner than this interval after the
+// actual preceding reference/installation.
+//
+//   OCXO1 install >= selected PPS/VCLOCK reference + minimum
+//   OCXO2 install >= actual OCXO1 install          + minimum
+//
+// The physical offset is intentionally invisible to the public clockface;
+// CounterLedger/PhaseLedger and public-origin normalization retain common
+// logical zero across VCLOCK, OCXO1, and OCXO2.
+//
+static constexpr uint32_t CLOCKS_SMARTZERO_MIN_EDGE_SEPARATION_US = 5U;
+static constexpr uint64_t CLOCKS_SMARTZERO_MIN_EDGE_SEPARATION_NS =
+    (uint64_t)CLOCKS_SMARTZERO_MIN_EDGE_SEPARATION_US * 1000ULL;
+
+static_assert(CLOCKS_SMARTZERO_MIN_EDGE_SEPARATION_US > 0U,
+              "SmartZero physical edge separation must be non-zero");
+
+// -----------------------------------------------------------------------------
 // Initialization — Phase 1 (hardware only, no TimePop dependency)
 // -----------------------------------------------------------------------------
 

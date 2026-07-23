@@ -1389,6 +1389,8 @@ static interrupt_smartzero_snapshot_t
     g_beta_report_live_smartzero_scratch DMAMEM = {};
 static interrupt_smartzero_snapshot_t
     g_beta_report_installed_smartzero_scratch DMAMEM = {};
+static clocks_alpha_smartzero_delay_snapshot_t
+    g_beta_report_smartzero_delay_scratch DMAMEM = {};
 static interrupt_integrity_snapshot_t
     g_beta_report_interrupt_integrity_scratch DMAMEM = {};
 static clocks_alpha_integrity_snapshot_t
@@ -4438,6 +4440,64 @@ static FLASHMEM void payload_add_prefixed_smartzero_compact(
   add_u32("current_lane_index", z.current_lane_index);
 }
 
+static FLASHMEM void payload_add_smartzero_delay_transaction(Payload& p) {
+  clocks_alpha_smartzero_delay_snapshot_t& s =
+      g_beta_report_smartzero_delay_scratch;
+  s = clocks_alpha_smartzero_delay_snapshot_t{};
+  const bool available = clocks_alpha_smartzero_delay_snapshot(&s);
+
+  p.add("smartzero_delay_available", available);
+  p.add("smartzero_delay_valid", available && s.valid);
+  p.add("smartzero_delay_reference_from_pps_vclock",
+        available && s.reference_from_pps_vclock);
+  p.add("smartzero_delay_all_minimums_satisfied",
+        available && s.all_minimums_satisfied);
+  p.add("smartzero_delay_epoch_sequence",
+        available ? s.epoch_sequence : 0U);
+  p.add("smartzero_delay_smartzero_sequence",
+        available ? s.smartzero_sequence : 0U);
+  p.add("smartzero_delay_install_count",
+        available ? s.install_count : 0U);
+  p.add("smartzero_delay_minimum_us",
+        available ? s.minimum_separation_us
+                  : CLOCKS_SMARTZERO_MIN_EDGE_SEPARATION_US);
+  p.add("smartzero_delay_minimum_cycles",
+        available ? s.minimum_separation_cycles : 0U);
+  p.add("smartzero_delay_reference_dwt", available ? s.reference_dwt : 0U);
+
+  p.add("smartzero_delay_ocxo1_zero_ok", available && s.ocxo1_zero_ok);
+  p.add("smartzero_delay_ocxo1_minimum_satisfied",
+        available && s.ocxo1_minimum_satisfied);
+  p.add("smartzero_delay_ocxo1_earliest_dwt",
+        available ? s.ocxo1_earliest_dwt : 0U);
+  p.add("smartzero_delay_ocxo1_install_begin_dwt",
+        available ? s.ocxo1_install_begin_dwt : 0U);
+  p.add("smartzero_delay_ocxo1_install_complete_dwt",
+        available ? s.ocxo1_install_complete_dwt : 0U);
+  p.add("smartzero_delay_ocxo1_reference_gap_cycles",
+        available ? s.ocxo1_reference_gap_cycles : 0U);
+  p.add("smartzero_delay_ocxo1_lateness_cycles",
+        available ? s.ocxo1_lateness_cycles : 0U);
+  p.add("smartzero_delay_ocxo1_zero_counter32",
+        available ? s.ocxo1_zero_counter32 : 0U);
+
+  p.add("smartzero_delay_ocxo2_zero_ok", available && s.ocxo2_zero_ok);
+  p.add("smartzero_delay_ocxo2_minimum_satisfied",
+        available && s.ocxo2_minimum_satisfied);
+  p.add("smartzero_delay_ocxo2_earliest_dwt",
+        available ? s.ocxo2_earliest_dwt : 0U);
+  p.add("smartzero_delay_ocxo2_install_begin_dwt",
+        available ? s.ocxo2_install_begin_dwt : 0U);
+  p.add("smartzero_delay_ocxo2_install_complete_dwt",
+        available ? s.ocxo2_install_complete_dwt : 0U);
+  p.add("smartzero_delay_ocxo2_from_ocxo1_gap_cycles",
+        available ? s.ocxo2_from_ocxo1_gap_cycles : 0U);
+  p.add("smartzero_delay_ocxo2_lateness_cycles",
+        available ? s.ocxo2_lateness_cycles : 0U);
+  p.add("smartzero_delay_ocxo2_zero_counter32",
+        available ? s.ocxo2_zero_counter32 : 0U);
+}
+
 static FLASHMEM void payload_add_smartzero_install_transaction(Payload& p) {
   p.add("smartzero_install_in_progress", clocks_alpha_epoch_install_in_progress());
   p.add("smartzero_install_attempt_count",
@@ -4470,6 +4530,7 @@ static FLASHMEM void payload_add_smartzero_install_transaction(Payload& p) {
         clocks_alpha_smartzero_install_last_atomic());
   p.add("smartzero_install_last_reason",
         clocks_alpha_smartzero_install_last_reason());
+  payload_add_smartzero_delay_transaction(p);
 }
 
 static FLASHMEM void payload_add_visible_origin_snapshot(Payload& parent,
