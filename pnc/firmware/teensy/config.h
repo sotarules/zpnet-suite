@@ -158,6 +158,12 @@ static constexpr uint32_t QTIMER1_CH0_MASK = 0xFFFF;
 // Clock lanes use same-channel count + compare custody.  The scheduler rail
 // may wake callbacks but must not author VCLOCK edge identity.
 //
+// Interrupt execution tiers:
+//   Priority 0  — PPS GPIO, OCXO1, OCXO2 science captures
+//   Priority 16 — shared QTimer1 vector: native VCLOCK CH0 + TimePop CH2
+//   Priority 32 — process_interrupt continuation/handoff
+//   Foreground  — TimePop scheduling policy and application callbacks
+//
 
 // --------------------------------------------------------------
 // Event bus sizing (authoritative)

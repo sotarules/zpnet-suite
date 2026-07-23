@@ -5,6 +5,12 @@
 // paired with authored compare-target identities.  OCXO compare custody is 1 Hz;
 // the native VCLOCK heartbeat extends each 16-bit OCXO timer and arms its next
 // one-second compare only after the target enters the safe programming window.
+//
+// Execution tiers:
+//   Priority 0  — PPS, OCXO1, OCXO2 sovereign science capture
+//   Priority 16 — shared QTimer1 VCLOCK + TimePop CH2 capture
+//   Priority 32 — continuation/handoff and compare rearm
+//   Foreground  — TimePop policy and application callbacks
 // ============================================================================
 
 #pragma once
@@ -16,7 +22,7 @@
 // Foreground loop service.  Call once per loop() pass before timepop_dispatch().
 // It drains immutable CH2 fire facts, executes application subscriber callbacks,
 // and flushes scalar feature state.  No TimePop scheduler mutation or application
-// behavior is performed by Priority 0 or Priority 16.
+// behavior is performed by Priority 0, Priority 16, or Priority 32.
 void process_interrupt_foreground_service(void);
 
 // Optional TimePop pressure marker.  The recorder itself remains owned by
@@ -44,7 +50,7 @@ void interrupt_forensics_note_timepop_pressure(
     uint32_t handle,
     uint32_t phase);
 
-// Scalar wake bit set by Priority 16 whenever immutable foreground work exists.
+// Scalar wake bit set by the interrupt tiers whenever foreground work exists.
 // TimePop's foreground idle witness reads it directly so pending custody yields
 // the loop without a cross-translation-unit function call.
 extern volatile bool g_process_interrupt_foreground_pending;
@@ -1073,7 +1079,9 @@ uint16_t interrupt_qtimer1_ch1_csctrl_now(void);
 uint32_t interrupt_vclock_counter32_observe_ambient(void);
 
 // Request the next TimePop CH2 deadline.  process_interrupt separates requested,
-// deferred, and physically armed identities.  On the shared QTimer1 vector, a
+// deferred, and physically armed identities.  The shared QTimer1 vector runs at
+// Priority 16 so Priority 0 PPS/OCXO science captures can preempt it.  On that
+// shared vector, a
 // CH2 status flag is accepted only when TCF1EN, software arm custody, programmed
 // COMP1 identity, and the no-outstanding-fact invariant all agree.
 void     interrupt_qtimer1_ch2_arm_compare(uint32_t target_counter32);

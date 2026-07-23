@@ -62,9 +62,10 @@
 //
 // Dispatch timing:
 //
-//   process_interrupt owns QTimer1 hardware.  Priority 16 transfers a normalized
-//   CH2 fire fact into a process_interrupt-owned foreground mailbox; the ordinary
-//   loop then invokes TimePop with that immutable counter/DWT event identity.
+//   process_interrupt owns QTimer1 hardware.  Priority 16 captures/defuses the
+//   shared QTimer1 CH2 event, Priority 32 transfers its normalized fact into a
+//   process_interrupt-owned foreground mailbox, and the ordinary loop then
+//   invokes TimePop with that immutable counter/DWT event identity.
 //   TimePop uses the foreground-delivered event fact to expire slots.
 //   It does not reinterpret PPS/VCLOCK phase and it does not read timer
 //   hardware directly.
@@ -136,8 +137,8 @@ static constexpr const char* WITNESS_SCHEDULER_NAME = "WITNESS_SCHEDULER";
 
 // CH2 scheduler custody.
 //
-// process_interrupt owns both interrupt tiers and the immutable one-fact CH2
-// foreground mailbox.  TimePop scheduler policy is entered only from the
+// process_interrupt owns all three interrupt tiers and the immutable one-fact
+// CH2 foreground mailbox.  TimePop scheduler policy is entered only from the
 // ordinary loop after the event has escaped all handler context.
 static constexpr const char* TIMEPOP_CH2_SERVICE_CONTEXT =
     "PROCESS_INTERRUPT_FOREGROUND_FACT";
@@ -3117,8 +3118,8 @@ static uint32_t select_next_scheduled_callback_slot_by_priority(
 // QTimer1 CH2 foreground ingress — TimePop priority queue scheduler
 // ============================================================================
 //
-// Foreground scheduler pass called by process_interrupt after Priority 0 has
-// captured/defused CH2 and Priority 16 has transferred the immutable fact into
+// Foreground scheduler pass called by process_interrupt after Priority 16 has
+// captured/defused CH2 and Priority 32 has transferred the immutable fact into
 // foreground custody.  DWT and counter32 are already normalized.  TimePop
 // authors fire_gnss_ns from that counter identity; any GNSS value in the
 // interrupt payload remains diagnostic.  TimePop touches QTimer hardware only

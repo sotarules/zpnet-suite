@@ -24,15 +24,16 @@
 //     the one-time CTRL/SCTRL/CSCTRL/COMP1/CMPLD1 setup
 //
 // Those are owned by process_interrupt. TimePop also does not own a private
-// scheduler IRQ / priority-handoff tier; all CH2 scheduler processing runs in
-// foreground after process_interrupt drains its immutable fact mailbox.
+// scheduler IRQ / priority-handoff tier; Priority 16 captures QTimer1, Priority 32
+// transfers immutable facts, and all TimePop scheduler processing runs in
+// foreground after process_interrupt drains its mailbox.
 //
 // QTimer1 CH2 foreground-ingress API (TimePop is the hosted client):
 //
 //   QTimer1 has only one IRQ vector shared across all four channels.
-//   process_interrupt owns the vector and transfers CH2 through Priority 16
-//   into a foreground fact mailbox.  VCLOCK cadence is no longer a separate QTimer1
-//   compare path; it is a TimePop critical recurring scheduler client.
+//   process_interrupt owns the Priority-16 vector for native VCLOCK CH0 and
+//   TimePop CH2, then transfers both through Priority-32 continuation.  VCLOCK
+//   cadence remains a native QTimer1 CH0 compare path; TimePop owns CH2 policy.
 //
 //   Foreground ingress receives a normalized DWT-at-edge capture for CH2.
 //
@@ -62,8 +63,8 @@
 //
 //   process_interrupt is responsible for:
 //     • initializing CH0/CH2 hardware (one-time mode/control)
-//     • disabling/clearing the fired CH2 compare in Priority 0
-//     • normalizing and storing its immutable event identity in Priority 16
+//     • disabling/clearing the fired CH2 compare in Priority 16
+//     • normalizing and storing its immutable event identity in Priority 32
 //     • building the event/diag payloads passed to TimePop in foreground
 //
 //   TimePop does not defensively second-guess exact compare fires.  Exact
@@ -108,7 +109,7 @@
 //   share CH2 fire facts, but their callbacks and recurring rearm happen in the
 //   foreground CH2 scheduler pass before schedule_next() selects the next compare.
 //   The legacy ISR API names remain source-compatible but no callback executes
-//   in Priority 0 or Priority 16.
+//   in Priority 0, Priority 16, or Priority 32.
 //
 //   Timed slots may also carry a service priority. Lower numeric priority runs
 //   first when multiple timed slots share one exact CH2 fire fact. Priority
@@ -136,8 +137,9 @@ void timepop_bootstrap(void);
 void timepop_init(void);
 void process_timepop_register(void);
 
-// Foreground-only CH2 ingress. process_interrupt Priority 16 stores one immutable
-// fire fact; process_interrupt_foreground_service() calls this before
+// Foreground-only CH2 ingress. process_interrupt Priority 16 captures the shared
+// QTimer1 event and Priority 32 stores one immutable fire fact;
+// process_interrupt_foreground_service() calls this before
 // timepop_dispatch().  The capture-loss service restores only future compare
 // custody and never invents the missing physical edge.
 void timepop_accept_ch2_event_foreground(
