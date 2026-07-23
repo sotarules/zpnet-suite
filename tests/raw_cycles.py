@@ -59,7 +59,7 @@ class Row:
     issues: List[str]
 
 
-def fetch(campaign: str, skip: int = 0) -> List[Dict[str, Any]]:
+def fetch(campaign: str, skip: int = 0, limit: int = 0) -> List[Dict[str, Any]]:
     pps_key_sql = """
         COALESCE(
           NULLIF(payload->>'pps_count','')::bigint,
@@ -69,10 +69,18 @@ def fetch(campaign: str, skip: int = 0) -> List[Dict[str, Any]]:
     """
     with open_db(row_dict=True) as conn:
         cur = conn.cursor()
-        if skip > 0:
-            # Keyset start: PPS N is the last skipped identity, so --skip 45000
-            # begins at PPS 45001.  A matching database expression index lets
-            # PostgreSQL seek directly to the requested campaign/PPS boundary.
+        if skip > 0 and limit > 0:
+            cur.execute(
+                f"""
+                SELECT payload FROM timebase
+                WHERE campaign = %s
+                  AND ({pps_key_sql}) > %s
+                ORDER BY {pps_key_sql}
+                LIMIT %s
+                """,
+                (campaign, skip, limit),
+            )
+        elif skip > 0:
             cur.execute(
                 f"""
                 SELECT payload FROM timebase
@@ -81,6 +89,16 @@ def fetch(campaign: str, skip: int = 0) -> List[Dict[str, Any]]:
                 ORDER BY {pps_key_sql}
                 """,
                 (campaign, skip),
+            )
+        elif limit > 0:
+            cur.execute(
+                f"""
+                SELECT payload FROM timebase
+                WHERE campaign = %s
+                ORDER BY {pps_key_sql}
+                LIMIT %s
+                """,
+                (campaign, limit),
             )
         else:
             cur.execute(
@@ -306,6 +324,8 @@ def parse(argv: Sequence[str]) -> Tuple[str, int, int, Optional[str], bool, int]
             limit = int(arg)
     if skip < 0:
         raise SystemExit("skip must be zero or greater")
+    if limit < 0:
+        raise SystemExit("limit must be zero or greater")
     if clock is not None and clock not in RAILS:
         raise SystemExit("clock must be PPS, VCLOCK, OCXO1, or OCXO2")
     return campaign, limit, skip, clock, pathology_only, gate
@@ -313,10 +333,8 @@ def parse(argv: Sequence[str]) -> Tuple[str, int, int, Optional[str], bool, int]
 
 def main(argv: Sequence[str]) -> None:
     campaign, limit, skip, clock, pathology_only, gate = parse(argv)
-    records = fetch(campaign, skip)
+    records = fetch(campaign, skip, limit)
     rows = collect(records)
-    if limit > 0:
-        rows = rows[-limit:]
     selected = (clock,) if clock else RAILS
     for row in rows:
         row.issues = classify(row, selected, gate)
