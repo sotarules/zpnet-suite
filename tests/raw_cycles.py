@@ -59,21 +59,38 @@ class Row:
     issues: List[str]
 
 
-def fetch(campaign: str) -> List[Dict[str, Any]]:
+def fetch(campaign: str, skip: int = 0) -> List[Dict[str, Any]]:
+    pps_key_sql = """
+        COALESCE(
+          NULLIF(payload->>'pps_count','')::bigint,
+          NULLIF(payload->'fragment'->>'pps_count','')::bigint,
+          NULLIF(payload->'fragment'->>'campaign_seconds','')::bigint
+        )
+    """
     with open_db(row_dict=True) as conn:
         cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT payload FROM timebase
-            WHERE campaign = %s
-            ORDER BY COALESCE(
-              NULLIF(payload->>'pps_count','')::bigint,
-              NULLIF(payload->'fragment'->>'pps_count','')::bigint,
-              NULLIF(payload->'fragment'->>'campaign_seconds','')::bigint
+        if skip > 0:
+            # Keyset start: PPS N is the last skipped identity, so --skip 45000
+            # begins at PPS 45001.  A matching database expression index lets
+            # PostgreSQL seek directly to the requested campaign/PPS boundary.
+            cur.execute(
+                f"""
+                SELECT payload FROM timebase
+                WHERE campaign = %s
+                  AND ({pps_key_sql}) > %s
+                ORDER BY {pps_key_sql}
+                """,
+                (campaign, skip),
             )
-            """,
-            (campaign,),
-        )
+        else:
+            cur.execute(
+                f"""
+                SELECT payload FROM timebase
+                WHERE campaign = %s
+                ORDER BY {pps_key_sql}
+                """,
+                (campaign,),
+            )
         rows = cur.fetchall()
     out: List[Dict[str, Any]] = []
     for item in rows:
@@ -246,11 +263,12 @@ def fmt(value: Optional[int], width: int, signed: bool = False) -> str:
     return f"{text:>{width}}"
 
 
-def parse(argv: Sequence[str]) -> Tuple[str, int, Optional[str], bool, int]:
+def parse(argv: Sequence[str]) -> Tuple[str, int, int, Optional[str], bool, int]:
     if len(argv) < 2:
-        raise SystemExit("Usage: raw_cycles CAMPAIGN [limit] [clock] [--pathology-only] [--pathology-gate N]")
+        raise SystemExit("Usage: raw_cycles CAMPAIGN [limit] [clock] [--skip N] [--pathology-only] [--pathology-gate N]")
     campaign = argv[1]
     limit = 0
+    skip = 0
     clock: Optional[str] = None
     pathology_only = False
     gate = DEFAULT_GATE_CYCLES
@@ -265,6 +283,10 @@ def parse(argv: Sequence[str]) -> Tuple[str, int, Optional[str], bool, int]:
             gate = int(argv[idx + 1]); idx += 2
         elif arg.startswith("--pathology-gate="):
             gate = int(arg.split("=", 1)[1]); idx += 1
+        elif arg == "--skip":
+            skip = int(argv[idx + 1]); idx += 2
+        elif arg.startswith("--skip="):
+            skip = int(arg.split("=", 1)[1]); idx += 1
         elif arg == "--clock":
             clock = argv[idx + 1].upper(); idx += 2
         elif arg.startswith("--clock="):
@@ -282,14 +304,16 @@ def parse(argv: Sequence[str]) -> Tuple[str, int, Optional[str], bool, int]:
             clock = arg.upper()
         else:
             limit = int(arg)
+    if skip < 0:
+        raise SystemExit("skip must be zero or greater")
     if clock is not None and clock not in RAILS:
         raise SystemExit("clock must be PPS, VCLOCK, OCXO1, or OCXO2")
-    return campaign, limit, clock, pathology_only, gate
+    return campaign, limit, skip, clock, pathology_only, gate
 
 
 def main(argv: Sequence[str]) -> None:
-    campaign, limit, clock, pathology_only, gate = parse(argv)
-    records = fetch(campaign)
+    campaign, limit, skip, clock, pathology_only, gate = parse(argv)
+    records = fetch(campaign, skip)
     rows = collect(records)
     if limit > 0:
         rows = rows[-limit:]
