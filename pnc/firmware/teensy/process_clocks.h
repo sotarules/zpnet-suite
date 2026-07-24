@@ -21,6 +21,8 @@
 //   • Static PPS/GPIO-based one-second prediction audit for VCLOCK and OCXO lanes
 //   • VCLOCK heartbeat and OCXO one-second compare consumption as observed
 //     DWT edge timing
+//   • Per-second ISR-delay verdict transport: delayed/on-time, attributed
+//     blocker, endpoint delay, and signed interval contamination
 //   • Servo DAC intent planning with the dither owner performing all
 //     hardware-facing DAC realization
 //

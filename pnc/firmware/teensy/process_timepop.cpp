@@ -460,7 +460,7 @@ static volatile bool dispatch_applying_mutations = false;
 // calling into TimePop.  It is written only by the idle witness loop below.
 volatile uint32_t g_timepop_idle_witness_shadow_dwt = 0;
 
-static volatile bool     diag_idle_witness_running = false;
+volatile bool            g_timepop_idle_witness_running = false;
 static volatile uint32_t diag_idle_witness_enter_count = 0;
 static volatile uint32_t diag_idle_witness_exit_count = 0;
 static volatile uint32_t diag_idle_witness_pending_exit_count = 0;
@@ -1640,7 +1640,7 @@ static void timepop_idle_witness_spin_until_pending(void) {
   timepop_idle_witness_note_wall_cycles(enter_dwt);
   diag_idle_witness_enter_count++;
   diag_idle_witness_last_enter_dwt = enter_dwt;
-  diag_idle_witness_running = true;
+  g_timepop_idle_witness_running = true;
 
   for (;;) {
     // Read first, then test the dispatch-pending bit, and only then publish
@@ -1650,6 +1650,10 @@ static void timepop_idle_witness_spin_until_pending(void) {
     // not overwrite the last pre-interrupt shadow with a post-interrupt value.
     const uint32_t dwt = ARM_DWT_CYCCNT;
     if (timepop_pending || process_interrupt_foreground_pending()) {
+      // Thread mode has resumed.  Drop the running witness before any exit
+      // accounting so an interrupt arriving during that bookkeeping cannot be
+      // mistaken for exception tail-chaining from the prior SpinIdle sample.
+      g_timepop_idle_witness_running = false;
       const uint32_t residency = dwt - enter_dwt;
       timepop_idle_witness_note_wall_cycles(dwt);
       diag_idle_witness_pending_exit_count++;
@@ -1660,6 +1664,8 @@ static void timepop_idle_witness_spin_until_pending(void) {
     }
     g_timepop_idle_witness_shadow_dwt = dwt;
     if ((uint32_t)(dwt - enter_dwt) >= TIMEPOP_IDLE_WITNESS_SPIN_BUDGET_CYCLES) {
+      // This is an ordinary foreground yield, not a tail-chain window.
+      g_timepop_idle_witness_running = false;
       const uint32_t residency = dwt - enter_dwt;
       timepop_idle_witness_note_wall_cycles(dwt);
       diag_idle_witness_yield_count++;
@@ -1670,7 +1676,7 @@ static void timepop_idle_witness_spin_until_pending(void) {
     }
   }
 
-  diag_idle_witness_running = false;
+  g_timepop_idle_witness_running = false;
   diag_idle_witness_exit_count++;
 }
 
@@ -3731,7 +3737,7 @@ void timepop_init(void) {
   dispatch_applying_mutations = false;
 
   g_timepop_idle_witness_shadow_dwt = 0;
-  diag_idle_witness_running = false;
+  g_timepop_idle_witness_running = false;
   diag_idle_witness_enter_count = 0;
   diag_idle_witness_exit_count = 0;
   diag_idle_witness_pending_exit_count = 0;
@@ -5329,7 +5335,7 @@ FLASHMEM void timepop_health_snapshot(timepop_health_snapshot_t* out) {
   out->dispatch_mutation_count = dispatch_mutation_count;
   out->dispatch_mutation_overflow = diag_dispatch_mutation_overflow;
 
-  out->idle_witness_running = diag_idle_witness_running;
+  out->idle_witness_running = g_timepop_idle_witness_running;
   out->idle_witness_shadow_dwt = g_timepop_idle_witness_shadow_dwt;
   out->idle_witness_enter_count = diag_idle_witness_enter_count;
   out->idle_witness_exit_count = diag_idle_witness_exit_count;
@@ -5343,7 +5349,7 @@ bool timepop_idle_witness_snapshot(timepop_idle_witness_snapshot_t* out) {
 
   out->supported = true;
   out->enabled = TIMEPOP_IDLE_DWT_WITNESS_ENABLED;
-  out->running = diag_idle_witness_running;
+  out->running = g_timepop_idle_witness_running;
   out->shadow_dwt = g_timepop_idle_witness_shadow_dwt;
   out->enter_count = diag_idle_witness_enter_count;
   out->exit_count = diag_idle_witness_exit_count;

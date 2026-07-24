@@ -98,6 +98,79 @@ enum class interrupt_event_status_t : uint8_t {
   FAULT,
 };
 
+// Per-endpoint ISR service verdict.  The interrupt layer integrates SpinIdle,
+// predecessor/tail-chain, priority, and QTimer service evidence and exports the
+// conclusion rather than forcing downstream consumers to interpret registers.
+enum class interrupt_delay_verdict_t : uint8_t {
+  UNKNOWN = 0,
+  ON_TIME = 1,
+  DELAYED = 2,
+};
+
+enum class interrupt_delay_cause_t : uint8_t {
+  NONE = 0,
+  VCLOCK_TIMEPOP = 1,
+  OCXO1 = 2,
+  OCXO2 = 3,
+  PPS = 4,
+  CONTINUATION = 5,
+  MASKING_OR_UNKNOWN_CPU = 6,
+  MULTIPLE_ISR = 7,
+  UNKNOWN = 255,
+};
+
+enum class interrupt_delay_confidence_t : uint8_t {
+  NONE = 0,
+  LOW_CONFIDENCE = 1,
+  MEDIUM_CONFIDENCE = 2,
+  HIGH_CONFIDENCE = 3,
+  EXACT_CONFIDENCE = 4,
+};
+
+// Endpoint delay plus the signed contamination it contributes to the current
+// one-second interval.  interval_delay_cycles is:
+//
+//   current_endpoint_delay - previous_endpoint_delay
+//
+// so a positive value lengthens the current observed interval and a negative
+// value is the rebound from a previously delayed endpoint.  Raw DWT remains
+// immutable testimony; this is a parallel causal explanation surface.
+struct interrupt_delay_forensics_t {
+  bool valid = false;
+  interrupt_delay_verdict_t verdict = interrupt_delay_verdict_t::UNKNOWN;
+  bool delayed = false;
+  interrupt_delay_cause_t delayed_by = interrupt_delay_cause_t::NONE;
+  interrupt_delay_confidence_t confidence =
+      interrupt_delay_confidence_t::NONE;
+  bool delay_cycles_valid = false;
+  uint32_t delay_cycles = 0;
+  uint32_t uncertainty_cycles = 0;
+
+  bool previous_endpoint_valid = false;
+  bool previous_endpoint_delayed = false;
+  interrupt_delay_cause_t previous_delayed_by =
+      interrupt_delay_cause_t::NONE;
+  uint32_t previous_delay_cycles = 0;
+
+  bool interval_delay_valid = false;
+  int32_t interval_delay_cycles = 0;
+  interrupt_delay_cause_t interval_delayed_by =
+      interrupt_delay_cause_t::NONE;
+
+  // raw_cycles residuals are current_interval - previous_interval.  Their ISR
+  // contamination is therefore the second difference of endpoint delay:
+  //
+  //   residual_delay = current_interval_delay - previous_interval_delay
+  bool previous_interval_delay_valid = false;
+  int32_t previous_interval_delay_cycles = 0;
+  interrupt_delay_cause_t previous_interval_delayed_by =
+      interrupt_delay_cause_t::NONE;
+  bool residual_delay_valid = false;
+  int32_t residual_delay_cycles = 0;
+  interrupt_delay_cause_t residual_delayed_by =
+      interrupt_delay_cause_t::NONE;
+};
+
 // Historical publication-court bit assignments retained for wire/source
 // compatibility.  The observed-only implementation authors only
 // INTERRUPT_DWT_PUBLICATION_VERDICT_OK; all alternative-estimator bits remain
@@ -269,6 +342,10 @@ struct interrupt_capture_diag_t {
   uint32_t spinidle_shadow_dwt = 0;
   uint32_t spinidle_shadow_to_isr_entry_cycles = 0;
   uint32_t spinidle_shadow_valid_threshold_cycles = 0;
+
+  // Integrated endpoint/interval verdict delivered through the ordinary
+  // subscriber diagnostic callback object.
+  interrupt_delay_forensics_t interrupt_delay{};
 
   bool     dwt_synthetic = false;
   bool     dwt_repair_candidate = false;
@@ -925,6 +1002,7 @@ struct pps_edge_snapshot_t {
   uint32_t spinidle_shadow_dwt = 0;
   uint32_t spinidle_shadow_to_isr_entry_cycles = 0;
   uint32_t spinidle_shadow_valid_threshold_cycles = 0;
+  interrupt_delay_forensics_t interrupt_delay{};
 
   uint32_t vclock_epoch_counter32              = 0;
   uint16_t vclock_epoch_ch3                    = 0;
@@ -1117,3 +1195,7 @@ uint32_t interrupt_dynamic_cps(void);
 const char* interrupt_subscriber_kind_str(interrupt_subscriber_kind_t kind);
 const char* interrupt_provider_kind_str  (interrupt_provider_kind_t   provider);
 const char* interrupt_lane_str           (interrupt_lane_t            lane);
+const char* interrupt_delay_verdict_str  (interrupt_delay_verdict_t verdict);
+const char* interrupt_delay_cause_str    (interrupt_delay_cause_t cause);
+const char* interrupt_delay_confidence_str(
+    interrupt_delay_confidence_t confidence);

@@ -930,6 +930,10 @@ struct clocks_alpha_lane_forensics_t {
   uint32_t spinidle_shadow_to_isr_entry_cycles;
   uint32_t spinidle_shadow_valid_threshold_cycles;
 
+  // process_interrupt's integrated causal conclusion.  Alpha transports this
+  // verbatim; Beta renders it into each completed TIMEBASE row.
+  interrupt_delay_forensics_t interrupt_delay{};
+
 };
 
 bool clocks_alpha_lane_forensics(time_clock_id_t clock,

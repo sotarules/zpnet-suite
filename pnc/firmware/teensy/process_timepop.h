@@ -149,9 +149,14 @@ void timepop_ch2_capture_lost_foreground(void);
 
 // Global idle DWT witness.  TimePop updates this foreground/thread-mode
 // shadow whenever scheduled-context dispatch is fully drained and the runtime
-// would otherwise be idle.  ISR clients may read the exported volatile shadow
-// directly; command/report code should use the snapshot helper.
+// would otherwise be idle.  g_timepop_idle_witness_running remains true across
+// an interrupt and any exception tail-chain until thread mode actually resumes,
+// allowing a later ISR to distinguish a genuine SpinIdle breadcrumb from a stale
+// shadow left before ordinary foreground work.  ISR clients may read these two
+// exported volatile scalars directly; command/report code should use the snapshot
+// helper.
 extern volatile uint32_t g_timepop_idle_witness_shadow_dwt;
+extern volatile bool g_timepop_idle_witness_running;
 
 struct timepop_idle_witness_snapshot_t {
   bool supported = false;

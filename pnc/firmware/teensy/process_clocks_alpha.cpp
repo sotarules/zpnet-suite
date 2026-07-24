@@ -1894,6 +1894,7 @@ struct alpha_lane_forensics_store_t {
   uint32_t spinidle_shadow_dwt = 0;
   uint32_t spinidle_shadow_to_isr_entry_cycles = 0;
   uint32_t spinidle_shadow_valid_threshold_cycles = 0;
+  interrupt_delay_forensics_t interrupt_delay{};
 
 };
 
@@ -6132,6 +6133,7 @@ static void alpha_forensics_reset_store(alpha_lane_forensics_store_t& s) {
   s.spinidle_shadow_dwt = 0;
   s.spinidle_shadow_to_isr_entry_cycles = 0;
   s.spinidle_shadow_valid_threshold_cycles = 0;
+  s.interrupt_delay = interrupt_delay_forensics_t{};
 
   clocks_alpha_dmb();
   s.seq++;
@@ -6423,6 +6425,7 @@ static void alpha_forensics_publish(time_clock_id_t clock_id,
         diag->spinidle_shadow_to_isr_entry_cycles;
     s->spinidle_shadow_valid_threshold_cycles =
         diag->spinidle_shadow_valid_threshold_cycles;
+    s->interrupt_delay = diag->interrupt_delay;
 
   } else {
     s->dwt_synthetic = false;
@@ -6565,6 +6568,7 @@ static void alpha_forensics_publish(time_clock_id_t clock_id,
     s->spinidle_shadow_dwt = 0;
     s->spinidle_shadow_to_isr_entry_cycles = 0;
     s->spinidle_shadow_valid_threshold_cycles = 0;
+    s->interrupt_delay = interrupt_delay_forensics_t{};
   }
 
   clocks_alpha_dmb();
@@ -6798,6 +6802,7 @@ bool clocks_alpha_lane_forensics(time_clock_id_t clock,
         s->spinidle_shadow_to_isr_entry_cycles;
     out->spinidle_shadow_valid_threshold_cycles =
         s->spinidle_shadow_valid_threshold_cycles;
+    out->interrupt_delay = s->interrupt_delay;
 
     clocks_alpha_dmb();
     const uint32_t seq2 = s->seq;
@@ -8553,6 +8558,14 @@ static void publish_pps_witness_diag(const pps_edge_snapshot_t& snap) {
   }
   g_prev_pps_dwt_at_edge = physical_pps_dwt;
   g_prev_pps_dwt_at_edge_valid = true;
+
+  g_pps_witness_diag.spinidle_shadow_valid = snap.spinidle_shadow_valid;
+  g_pps_witness_diag.spinidle_shadow_dwt = snap.spinidle_shadow_dwt;
+  g_pps_witness_diag.spinidle_shadow_to_isr_entry_cycles =
+      snap.spinidle_shadow_to_isr_entry_cycles;
+  g_pps_witness_diag.spinidle_shadow_valid_threshold_cycles =
+      snap.spinidle_shadow_valid_threshold_cycles;
+  g_pps_witness_diag.interrupt_delay = snap.interrupt_delay;
 
   g_pps_witness_diag.pps_edge_sequence = snap.sequence;
   g_pps_witness_diag.pps_edge_dwt_isr_entry_raw = physical_pps_dwt;

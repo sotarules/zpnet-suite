@@ -31,6 +31,11 @@
 // There is no alternative endpoint estimator, repair candidate, FloorLine, or
 // alternative publication court in this module.  OCXO compare custody is 1 Hz;
 // ambient counter reads are rollover witnesses and never event truth.
+//
+// SpinIdle/predecessor/QTimer evidence is integrated into a parallel causal
+// verdict: whether an ISR endpoint was delayed, who delayed it, and the signed
+// delay contribution to the current interval.  The observed DWT endpoint is
+// never overwritten by that verdict.
 // ============================================================================
 
 #include "process_interrupt.h"
@@ -189,6 +194,7 @@ struct interrupt_isr_runtime_diag_t {
   volatile uint32_t last_entry_basepri = 0U;
   volatile uint32_t last_entry_primask = 0U;
   volatile uint32_t last_entry_ipsr = 0U;
+  volatile bool preempted_during_current_entry = false;
   volatile uint32_t entry_with_basepri_nonzero_count = 0U;
   volatile uint32_t entry_with_primask_nonzero_count = 0U;
   volatile uint32_t preempted_by_higher_tier_count = 0U;
@@ -248,6 +254,7 @@ static inline uint32_t interrupt_primask(void) {
 static inline void interrupt_isr_diag_enter(
     interrupt_isr_runtime_diag_t& diag,
     uint32_t entry_dwt) {
+  diag.preempted_during_current_entry = false;
   diag.active = true;
   dmb_barrier();
   diag.entry_count++;
@@ -282,6 +289,7 @@ static inline void interrupt_isr_diag_exit(
 static inline void interrupt_note_science_preemption(
     volatile uint32_t& qtimer1_counter) {
   if (g_interrupt_priority_runtime.qtimer1.active) {
+    g_interrupt_priority_runtime.qtimer1.preempted_during_current_entry = true;
     qtimer1_counter++;
     g_interrupt_priority_runtime.qtimer1.preempted_by_higher_tier_count++;
   }
@@ -644,6 +652,19 @@ struct interrupt_subscriber_runtime_t {
   bool active = false;
   interrupt_event_t last_event{};
   interrupt_capture_diag_t last_diag{};
+
+  // Previous endpoint verdict retained solely to render the signed delay
+  // contamination of the next one-second interval.
+  bool previous_delay_valid = false;
+  bool previous_endpoint_delayed = false;
+  interrupt_delay_cause_t previous_delayed_by =
+      interrupt_delay_cause_t::NONE;
+  uint32_t previous_delay_cycles = 0U;
+  bool previous_interval_delay_valid = false;
+  int32_t previous_interval_delay_cycles = 0;
+  interrupt_delay_cause_t previous_interval_delayed_by =
+      interrupt_delay_cause_t::NONE;
+
   bool has_fired = false;
   uint32_t binding_generation = 1U;
   interrupt_deferred_dispatch_t deferred{};
@@ -2417,9 +2438,44 @@ static interrupt_handoff_source_diag_t g_handoff_ocxo2{};
 static interrupt_handoff_source_diag_t g_handoff_pps{};
 static volatile uint32_t g_interrupt_capture_sequence = 0U;
 
+// Minimal entry witness copied before handler work.  Classification is deferred
+// to Priority 32 so sovereign capture remains short and the diagnostic itself
+// cannot create the latency it is trying to measure.
+enum class interrupt_execution_source_t : uint8_t {
+  NONE = 0,
+  QTIMER1 = 1,
+  OCXO1 = 2,
+  OCXO2 = 3,
+  PPS = 4,
+  CONTINUATION = 5,
+};
+
+struct interrupt_arrival_capture_t {
+  bool spinidle_running = false;
+  uint32_t spinidle_shadow_dwt = 0U;
+  uint32_t pending_mask_at_entry = 0U;
+  interrupt_execution_source_t blocker =
+      interrupt_execution_source_t::NONE;
+  uint32_t blocker_exit_dwt = 0U;
+  uint32_t blocker_wall_cycles = 0U;
+  bool target_pending_at_blocker_entry = false;
+  uint32_t lower_context_active_mask = 0U;
+};
+
+struct interrupt_arrival_observation_t {
+  interrupt_arrival_capture_t capture{};
+  bool spinidle_shadow_valid = false;
+  uint32_t spinidle_age_cycles = 0U;
+  uint32_t spinidle_valid_threshold_cycles = 0U;
+  uint32_t spinidle_excess_cycles = 0U;
+  interrupt_delay_forensics_t delay{};
+};
+
 struct vclock_capture_packet_t {
   uint32_t sequence = 0;
   uint32_t isr_entry_dwt_raw = 0;
+  interrupt_arrival_capture_t arrival{};
+  bool preempted_after_entry = false;
   uint32_t target_counter32 = 0;
   uint16_t target_low16 = 0;
   uint16_t service_low16 = 0;
@@ -2434,6 +2490,7 @@ struct ch2_capture_packet_t {
 struct ocxo_capture_packet_t {
   uint32_t sequence = 0;
   uint32_t isr_entry_dwt_raw = 0;
+  interrupt_arrival_capture_t arrival{};
   uint32_t target_counter32 = 0;
   uint16_t target_low16 = 0;
   uint16_t ambient_low16 = 0;
@@ -2444,6 +2501,7 @@ struct ocxo_capture_packet_t {
 struct pps_capture_packet_t {
   uint32_t sequence = 0;
   uint32_t isr_entry_dwt_raw = 0;
+  interrupt_arrival_capture_t arrival{};
   uint16_t vclock_hardware16 = 0;
   uint16_t ocxo1_hardware16 = 0;
   uint16_t ocxo2_hardware16 = 0;
@@ -2890,6 +2948,733 @@ static inline bool interrupt_nvic_active(uint32_t irq) {
           interrupt_nvic_irq_mask(irq)) != 0U;
 }
 
+// ============================================================================
+// ISR entry-delay courtroom
+// ============================================================================
+//
+// SpinIdle supplies the last thread-mode DWT breadcrumb.  A small per-source
+// baseline learns the normal shadow-to-first-instruction age.  Per-target
+// pending-at-blocker-exit latches distinguish ordinary preemption from actual
+// equal/higher-priority serialization.  QTimer counter-vs-target lateness
+// is used as a second, quantized witness.  No result mutates the captured edge.
+
+static constexpr uint32_t INTERRUPT_DELAY_SPIN_BASELINE_MIN_SAMPLES = 3U;
+static constexpr uint32_t INTERRUPT_DELAY_SPIN_CANDIDATE_MAX_CYCLES = 256U;
+static constexpr uint32_t INTERRUPT_DELAY_SPIN_GUARD_CYCLES = 12U;
+static constexpr uint32_t INTERRUPT_DELAY_TAILCHAIN_MAX_GAP_CYCLES = 512U;
+static constexpr uint32_t INTERRUPT_DELAY_SERVICE_BASELINE_MIN_SAMPLES = 3U;
+static constexpr int32_t INTERRUPT_DELAY_SERVICE_NORMAL_JITTER_TICKS = 1;
+static constexpr int32_t INTERRUPT_DELAY_SERVICE_CANDIDATE_MIN_TICKS = -2;
+static constexpr int32_t INTERRUPT_DELAY_SERVICE_CANDIDATE_MAX_TICKS = 8;
+
+static constexpr uint32_t INTERRUPT_DELAY_SOURCE_BIT_QTIMER1 = 1U << 0;
+static constexpr uint32_t INTERRUPT_DELAY_SOURCE_BIT_OCXO1 = 1U << 1;
+static constexpr uint32_t INTERRUPT_DELAY_SOURCE_BIT_OCXO2 = 1U << 2;
+static constexpr uint32_t INTERRUPT_DELAY_SOURCE_BIT_PPS = 1U << 3;
+static constexpr uint32_t INTERRUPT_DELAY_SOURCE_BIT_CONTINUATION = 1U << 4;
+
+struct interrupt_delay_baseline_runtime_t {
+  bool spin_valid = false;
+  uint32_t spin_sample_count = 0U;
+  uint32_t spin_baseline_cycles = 0U;
+
+  bool service_valid = false;
+  uint32_t service_sample_count = 0U;
+  int32_t service_baseline_ticks = 0;
+};
+
+struct interrupt_delay_blocker_latch_t {
+  volatile uint32_t seq = 0U;
+  volatile uint32_t publish_token = 0U;
+  volatile interrupt_execution_source_t blocker =
+      interrupt_execution_source_t::NONE;
+  volatile uint32_t blocker_exit_dwt = 0U;
+  volatile uint32_t blocker_wall_cycles = 0U;
+  volatile bool target_pending_at_blocker_entry = false;
+};
+
+static interrupt_delay_baseline_runtime_t g_delay_qtimer1{};
+static interrupt_delay_baseline_runtime_t g_delay_ocxo1{};
+static interrupt_delay_baseline_runtime_t g_delay_ocxo2{};
+static interrupt_delay_baseline_runtime_t g_delay_pps{};
+static interrupt_delay_blocker_latch_t g_delay_latch_qtimer1{};
+static interrupt_delay_blocker_latch_t g_delay_latch_ocxo1{};
+static interrupt_delay_blocker_latch_t g_delay_latch_ocxo2{};
+static interrupt_delay_blocker_latch_t g_delay_latch_pps{};
+static uint32_t g_delay_seen_qtimer1_token = 0U;
+static uint32_t g_delay_seen_ocxo1_token = 0U;
+static uint32_t g_delay_seen_ocxo2_token = 0U;
+static uint32_t g_delay_seen_pps_token = 0U;
+
+static interrupt_delay_forensics_t g_pps_interrupt_delay{};
+static interrupt_arrival_capture_t g_pps_arrival_capture{};
+static uint32_t g_pps_arrival_entry_dwt = 0U;
+static bool g_pps_previous_delay_valid = false;
+static bool g_pps_previous_endpoint_delayed = false;
+static interrupt_delay_cause_t g_pps_previous_delayed_by =
+    interrupt_delay_cause_t::NONE;
+static uint32_t g_pps_previous_delay_cycles = 0U;
+static bool g_pps_previous_interval_delay_valid = false;
+static int32_t g_pps_previous_interval_delay_cycles = 0;
+static interrupt_delay_cause_t g_pps_previous_interval_delayed_by =
+    interrupt_delay_cause_t::NONE;
+
+static void interrupt_delay_runtime_reset(void) {
+  g_delay_qtimer1 = interrupt_delay_baseline_runtime_t{};
+  g_delay_ocxo1 = interrupt_delay_baseline_runtime_t{};
+  g_delay_ocxo2 = interrupt_delay_baseline_runtime_t{};
+  g_delay_pps = interrupt_delay_baseline_runtime_t{};
+  g_delay_latch_qtimer1 = interrupt_delay_blocker_latch_t{};
+  g_delay_latch_ocxo1 = interrupt_delay_blocker_latch_t{};
+  g_delay_latch_ocxo2 = interrupt_delay_blocker_latch_t{};
+  g_delay_latch_pps = interrupt_delay_blocker_latch_t{};
+  g_delay_seen_qtimer1_token = 0U;
+  g_delay_seen_ocxo1_token = 0U;
+  g_delay_seen_ocxo2_token = 0U;
+  g_delay_seen_pps_token = 0U;
+  g_pps_interrupt_delay = interrupt_delay_forensics_t{};
+  g_pps_arrival_capture = interrupt_arrival_capture_t{};
+  g_pps_arrival_entry_dwt = 0U;
+  g_pps_previous_delay_valid = false;
+  g_pps_previous_endpoint_delayed = false;
+  g_pps_previous_delayed_by = interrupt_delay_cause_t::NONE;
+  g_pps_previous_delay_cycles = 0U;
+  g_pps_previous_interval_delay_valid = false;
+  g_pps_previous_interval_delay_cycles = 0;
+  g_pps_previous_interval_delayed_by = interrupt_delay_cause_t::NONE;
+}
+
+static uint32_t interrupt_delay_source_bit(interrupt_execution_source_t source) {
+  switch (source) {
+    case interrupt_execution_source_t::QTIMER1:
+      return INTERRUPT_DELAY_SOURCE_BIT_QTIMER1;
+    case interrupt_execution_source_t::OCXO1:
+      return INTERRUPT_DELAY_SOURCE_BIT_OCXO1;
+    case interrupt_execution_source_t::OCXO2:
+      return INTERRUPT_DELAY_SOURCE_BIT_OCXO2;
+    case interrupt_execution_source_t::PPS:
+      return INTERRUPT_DELAY_SOURCE_BIT_PPS;
+    case interrupt_execution_source_t::CONTINUATION:
+      return INTERRUPT_DELAY_SOURCE_BIT_CONTINUATION;
+    default:
+      return 0U;
+  }
+}
+
+static uint32_t interrupt_delay_source_priority(
+    interrupt_execution_source_t source) {
+  switch (source) {
+    case interrupt_execution_source_t::OCXO1:
+    case interrupt_execution_source_t::OCXO2:
+    case interrupt_execution_source_t::PPS:
+      return INTERRUPT_PRIORITY_SCIENCE;
+    case interrupt_execution_source_t::QTIMER1:
+      return INTERRUPT_PRIORITY_VCLOCK_TIMEPOP;
+    case interrupt_execution_source_t::CONTINUATION:
+      return INTERRUPT_PRIORITY_CONTINUATION;
+    default:
+      return UINT32_MAX;
+  }
+}
+
+static interrupt_delay_cause_t interrupt_delay_cause_from_source(
+    interrupt_execution_source_t source) {
+  switch (source) {
+    case interrupt_execution_source_t::QTIMER1:
+      return interrupt_delay_cause_t::VCLOCK_TIMEPOP;
+    case interrupt_execution_source_t::OCXO1:
+      return interrupt_delay_cause_t::OCXO1;
+    case interrupt_execution_source_t::OCXO2:
+      return interrupt_delay_cause_t::OCXO2;
+    case interrupt_execution_source_t::PPS:
+      return interrupt_delay_cause_t::PPS;
+    case interrupt_execution_source_t::CONTINUATION:
+      return interrupt_delay_cause_t::CONTINUATION;
+    default:
+      return interrupt_delay_cause_t::UNKNOWN;
+  }
+}
+
+static interrupt_delay_baseline_runtime_t* interrupt_delay_baseline_for(
+    interrupt_execution_source_t source) {
+  switch (source) {
+    case interrupt_execution_source_t::QTIMER1: return &g_delay_qtimer1;
+    case interrupt_execution_source_t::OCXO1: return &g_delay_ocxo1;
+    case interrupt_execution_source_t::OCXO2: return &g_delay_ocxo2;
+    case interrupt_execution_source_t::PPS: return &g_delay_pps;
+    default: return nullptr;
+  }
+}
+
+static uint32_t interrupt_delay_pending_mask(void) {
+  static_assert(((uint32_t)IRQ_QTIMER1 >> 5U) ==
+                    ((uint32_t)IRQ_QTIMER2 >> 5U) &&
+                ((uint32_t)IRQ_QTIMER2 >> 5U) ==
+                    ((uint32_t)IRQ_QTIMER3 >> 5U),
+                "QTimer delay witnesses must share one NVIC pending word");
+
+  // This executes only at sparse Priority-0 exits.  Read the three QTimer IRQs
+  // from one NVIC word so the witness minimally extends the collision it records.
+  const uint32_t qtimer_pending =
+      interrupt_nvic_ispr_word((uint32_t)IRQ_QTIMER1);
+  const uint32_t gpio_pending =
+      interrupt_nvic_ispr_word((uint32_t)IRQ_GPIO6789);
+
+  uint32_t mask = 0U;
+  if ((qtimer_pending & interrupt_nvic_irq_mask((uint32_t)IRQ_QTIMER1)) != 0U) {
+    mask |= INTERRUPT_DELAY_SOURCE_BIT_QTIMER1;
+  }
+  if (!OCXO1_DISABLED &&
+      (qtimer_pending & interrupt_nvic_irq_mask((uint32_t)IRQ_QTIMER2)) != 0U) {
+    mask |= INTERRUPT_DELAY_SOURCE_BIT_OCXO1;
+  }
+  if (!OCXO2_DISABLED &&
+      (qtimer_pending & interrupt_nvic_irq_mask((uint32_t)IRQ_QTIMER3)) != 0U) {
+    mask |= INTERRUPT_DELAY_SOURCE_BIT_OCXO2;
+  }
+  if ((gpio_pending & interrupt_nvic_irq_mask((uint32_t)IRQ_GPIO6789)) != 0U) {
+    mask |= INTERRUPT_DELAY_SOURCE_BIT_PPS;
+  }
+  return mask;
+}
+
+static uint32_t interrupt_delay_lower_active_mask(
+    interrupt_execution_source_t source) {
+  uint32_t mask = 0U;
+  if (source == interrupt_execution_source_t::OCXO1 ||
+      source == interrupt_execution_source_t::OCXO2 ||
+      source == interrupt_execution_source_t::PPS) {
+    if (g_interrupt_priority_runtime.qtimer1.active) {
+      mask |= INTERRUPT_DELAY_SOURCE_BIT_QTIMER1;
+    }
+    if (g_interrupt_priority_runtime.continuation.active) {
+      mask |= INTERRUPT_DELAY_SOURCE_BIT_CONTINUATION;
+    }
+  } else if (source == interrupt_execution_source_t::QTIMER1) {
+    if (g_interrupt_priority_runtime.continuation.active) {
+      mask |= INTERRUPT_DELAY_SOURCE_BIT_CONTINUATION;
+    }
+  }
+  return mask;
+}
+
+static interrupt_delay_blocker_latch_t* interrupt_delay_latch_for(
+    interrupt_execution_source_t target) {
+  switch (target) {
+    case interrupt_execution_source_t::QTIMER1:
+      return &g_delay_latch_qtimer1;
+    case interrupt_execution_source_t::OCXO1:
+      return &g_delay_latch_ocxo1;
+    case interrupt_execution_source_t::OCXO2:
+      return &g_delay_latch_ocxo2;
+    case interrupt_execution_source_t::PPS:
+      return &g_delay_latch_pps;
+    default:
+      return nullptr;
+  }
+}
+
+static uint32_t* interrupt_delay_seen_token_for(
+    interrupt_execution_source_t target) {
+  switch (target) {
+    case interrupt_execution_source_t::QTIMER1:
+      return &g_delay_seen_qtimer1_token;
+    case interrupt_execution_source_t::OCXO1:
+      return &g_delay_seen_ocxo1_token;
+    case interrupt_execution_source_t::OCXO2:
+      return &g_delay_seen_ocxo2_token;
+    case interrupt_execution_source_t::PPS:
+      return &g_delay_seen_pps_token;
+    default:
+      return nullptr;
+  }
+}
+
+static bool interrupt_delay_source_active(
+    interrupt_execution_source_t source) {
+  switch (source) {
+    case interrupt_execution_source_t::QTIMER1:
+      return g_interrupt_priority_runtime.qtimer1.active;
+    case interrupt_execution_source_t::OCXO1:
+      return g_interrupt_priority_runtime.qtimer2.active;
+    case interrupt_execution_source_t::OCXO2:
+      return g_interrupt_priority_runtime.qtimer3.active;
+    case interrupt_execution_source_t::PPS:
+      return g_interrupt_priority_runtime.pps.active;
+    case interrupt_execution_source_t::CONTINUATION:
+      return g_interrupt_priority_runtime.continuation.active;
+    default:
+      return false;
+  }
+}
+
+// Publish a predecessor only when the target was still pending at the
+// predecessor's exit and the predecessor's priority could actually have blocked
+// it.  Sequence-guarded publication keeps the lower-priority QTimer1 reader
+// coherent if another science ISR arrives while it is copying the latch.
+static void interrupt_delay_publish_blocker(
+    interrupt_execution_source_t blocker,
+    interrupt_execution_source_t target,
+    uint32_t exit_dwt,
+    uint32_t blocker_wall_cycles,
+    uint32_t pending_mask_at_blocker_entry,
+    uint32_t pending_mask_at_blocker_exit) {
+  const uint32_t target_bit = interrupt_delay_source_bit(target);
+  if (target_bit == 0U ||
+      (pending_mask_at_blocker_exit & target_bit) == 0U) {
+    return;
+  }
+  if (blocker == target) return;
+  if (interrupt_delay_source_priority(blocker) >
+      interrupt_delay_source_priority(target)) {
+    return;
+  }
+
+  // A target already active beneath a higher-priority blocker was preempted,
+  // not delayed before entry.  Its pending bit may represent another event on
+  // the same vector; do not let that future event consume a stale predecessor
+  // latch and claim that the current active invocation was serialized.
+  if (interrupt_delay_source_active(target)) return;
+
+  interrupt_delay_blocker_latch_t* latch = interrupt_delay_latch_for(target);
+  if (!latch) return;
+  uint32_t token = latch->publish_token + 1U;
+  if (token == 0U) token = 1U;
+  latch->seq++;
+  dmb_barrier();
+  latch->blocker_exit_dwt = exit_dwt;
+  latch->blocker_wall_cycles = blocker_wall_cycles;
+  latch->target_pending_at_blocker_entry =
+      (pending_mask_at_blocker_entry & target_bit) != 0U;
+  latch->blocker = blocker;
+  latch->publish_token = token;
+  dmb_barrier();
+  latch->seq++;
+}
+
+static interrupt_arrival_capture_t interrupt_delay_capture_entry_fast(
+    interrupt_execution_source_t source) {
+  // Assign every scalar explicitly: this path is the first handful of
+  // instructions in the ISR and must not invite compiler-generated memset.
+  interrupt_arrival_capture_t capture;
+  capture.spinidle_running = g_timepop_idle_witness_running;
+  capture.spinidle_shadow_dwt = g_timepop_idle_witness_shadow_dwt;
+  capture.pending_mask_at_entry = interrupt_delay_pending_mask();
+  capture.blocker = interrupt_execution_source_t::NONE;
+  capture.blocker_exit_dwt = 0U;
+  capture.blocker_wall_cycles = 0U;
+  capture.target_pending_at_blocker_entry = false;
+  capture.lower_context_active_mask =
+      interrupt_delay_lower_active_mask(source);
+
+  interrupt_delay_blocker_latch_t* latch = interrupt_delay_latch_for(source);
+  uint32_t* seen_token = interrupt_delay_seen_token_for(source);
+  if (latch && seen_token) {
+    for (uint32_t attempt = 0U; attempt < 3U; ++attempt) {
+      const uint32_t seq1 = latch->seq;
+      if ((seq1 & 1U) != 0U) continue;
+      dmb_barrier();
+      const uint32_t token = latch->publish_token;
+      const interrupt_execution_source_t blocker = latch->blocker;
+      const uint32_t blocker_exit_dwt = latch->blocker_exit_dwt;
+      const uint32_t blocker_wall_cycles = latch->blocker_wall_cycles;
+      const bool target_pending_at_blocker_entry =
+          latch->target_pending_at_blocker_entry;
+      dmb_barrier();
+      const uint32_t seq2 = latch->seq;
+      if (seq1 == seq2 && (seq2 & 1U) == 0U) {
+        // A token is consumed exactly once.  This prevents a years-old latch
+        // from becoming spuriously "recent" when 32-bit DWT later wraps.
+        if (token != 0U && token != *seen_token) {
+          *seen_token = token;
+          capture.blocker = blocker;
+          capture.blocker_exit_dwt =
+              blocker == interrupt_execution_source_t::NONE
+                  ? 0U
+                  : blocker_exit_dwt;
+          capture.blocker_wall_cycles = blocker_wall_cycles;
+          capture.target_pending_at_blocker_entry =
+              target_pending_at_blocker_entry;
+        }
+        break;
+      }
+    }
+  }
+  return capture;
+}
+
+static void interrupt_delay_note_isr_exit(
+    interrupt_execution_source_t source,
+    uint32_t entry_dwt,
+    const interrupt_arrival_capture_t& arrival) {
+  // Read pending as late as practical.  A target already pending when this ISR
+  // entered waited for the full blocker and may use SpinIdle as a fine ruler.
+  // A target that appeared during the blocker is still attributed correctly,
+  // but compare-service evidence remains the duration authority.
+  const uint32_t pending_mask_at_exit = interrupt_delay_pending_mask();
+  const uint32_t exit_dwt = ARM_DWT_CYCCNT;
+  const uint32_t blocker_wall_cycles = exit_dwt - entry_dwt;
+
+  interrupt_delay_publish_blocker(
+      source, interrupt_execution_source_t::QTIMER1,
+      exit_dwt, blocker_wall_cycles,
+      arrival.pending_mask_at_entry, pending_mask_at_exit);
+  interrupt_delay_publish_blocker(
+      source, interrupt_execution_source_t::OCXO1,
+      exit_dwt, blocker_wall_cycles,
+      arrival.pending_mask_at_entry, pending_mask_at_exit);
+  interrupt_delay_publish_blocker(
+      source, interrupt_execution_source_t::OCXO2,
+      exit_dwt, blocker_wall_cycles,
+      arrival.pending_mask_at_entry, pending_mask_at_exit);
+  interrupt_delay_publish_blocker(
+      source, interrupt_execution_source_t::PPS,
+      exit_dwt, blocker_wall_cycles,
+      arrival.pending_mask_at_entry, pending_mask_at_exit);
+}
+
+static void interrupt_delay_learn_spin_baseline(
+    interrupt_delay_baseline_runtime_t& runtime,
+    bool shadow_valid,
+    uint32_t spinidle_age_cycles) {
+  if (!shadow_valid ||
+      spinidle_age_cycles > INTERRUPT_DELAY_SPIN_CANDIDATE_MAX_CYCLES) {
+    return;
+  }
+
+  if (runtime.spin_sample_count == 0U ||
+      spinidle_age_cycles < runtime.spin_baseline_cycles) {
+    runtime.spin_baseline_cycles = spinidle_age_cycles;
+  }
+  if (runtime.spin_sample_count != UINT32_MAX) runtime.spin_sample_count++;
+  runtime.spin_valid = runtime.spin_sample_count >=
+      INTERRUPT_DELAY_SPIN_BASELINE_MIN_SAMPLES;
+}
+
+static void interrupt_delay_learn_service_baseline(
+    interrupt_delay_baseline_runtime_t& runtime,
+    int32_t service_offset_ticks) {
+  if (service_offset_ticks < INTERRUPT_DELAY_SERVICE_CANDIDATE_MIN_TICKS ||
+      service_offset_ticks > INTERRUPT_DELAY_SERVICE_CANDIDATE_MAX_TICKS) {
+    return;
+  }
+
+  if (runtime.service_sample_count == 0U ||
+      service_offset_ticks < runtime.service_baseline_ticks) {
+    runtime.service_baseline_ticks = service_offset_ticks;
+  }
+  if (runtime.service_sample_count != UINT32_MAX) runtime.service_sample_count++;
+  runtime.service_valid = runtime.service_sample_count >=
+      INTERRUPT_DELAY_SERVICE_BASELINE_MIN_SAMPLES;
+}
+
+static interrupt_arrival_observation_t interrupt_delay_classify_entry(
+    interrupt_execution_source_t source,
+    uint32_t entry_dwt,
+    const interrupt_arrival_capture_t& capture) {
+  interrupt_arrival_observation_t out{};
+  out.capture = capture;
+
+  // A nonzero shadow is meaningful only when the interrupted thread was still
+  // inside SpinIdle.  The running bit deliberately remains true across ISR
+  // execution and exception tail-chaining, then falls only after thread mode
+  // resumes.  This prevents an old foreground shadow from masquerading as an
+  // exact delay ruler.
+  out.spinidle_shadow_valid = capture.spinidle_running &&
+      capture.spinidle_shadow_dwt != 0U;
+  out.spinidle_age_cycles = out.spinidle_shadow_valid
+      ? (uint32_t)(entry_dwt - capture.spinidle_shadow_dwt)
+      : 0U;
+
+  interrupt_delay_baseline_runtime_t* runtime =
+      interrupt_delay_baseline_for(source);
+  if (!runtime) return out;
+
+  const uint32_t tail_gap =
+      capture.blocker != interrupt_execution_source_t::NONE
+          ? (uint32_t)(entry_dwt - capture.blocker_exit_dwt)
+          : UINT32_MAX;
+  const bool blocker_recent =
+      capture.blocker != interrupt_execution_source_t::NONE &&
+      tail_gap <= INTERRUPT_DELAY_TAILCHAIN_MAX_GAP_CYCLES;
+  const bool blocker_could_block =
+      capture.blocker != interrupt_execution_source_t::NONE &&
+      interrupt_delay_source_priority(capture.blocker) <=
+          interrupt_delay_source_priority(source);
+
+  interrupt_delay_learn_spin_baseline(
+      *runtime, out.spinidle_shadow_valid, out.spinidle_age_cycles);
+
+  if (runtime->spin_valid && out.spinidle_shadow_valid) {
+    out.spinidle_valid_threshold_cycles =
+        runtime->spin_baseline_cycles + INTERRUPT_DELAY_SPIN_GUARD_CYCLES;
+    out.spinidle_excess_cycles = out.spinidle_age_cycles >
+            runtime->spin_baseline_cycles
+        ? out.spinidle_age_cycles - runtime->spin_baseline_cycles
+        : 0U;
+
+    if (out.spinidle_excess_cycles <= INTERRUPT_DELAY_SPIN_GUARD_CYCLES) {
+      out.delay.valid = true;
+      out.delay.verdict = interrupt_delay_verdict_t::ON_TIME;
+      out.delay.delayed = false;
+      out.delay.delayed_by = interrupt_delay_cause_t::NONE;
+      out.delay.confidence = interrupt_delay_confidence_t::HIGH_CONFIDENCE;
+      out.delay.delay_cycles_valid = true;
+      out.delay.delay_cycles = 0U;
+      out.delay.uncertainty_cycles = INTERRUPT_DELAY_SPIN_GUARD_CYCLES;
+      return out;
+    }
+
+    // Only a target that was already pending when the blocker entered waited
+    // for the blocker's full residence.  In that case the SpinIdle excess is a
+    // fine-grained estimate of the endpoint displacement.  If the target became
+    // pending later, SpinIdle still proves non-idle ancestry but overstates its
+    // actual wait; the QTimer classifier below must quantify that case.
+    if (blocker_recent && blocker_could_block &&
+        capture.target_pending_at_blocker_entry) {
+      out.delay.valid = true;
+      out.delay.verdict = interrupt_delay_verdict_t::DELAYED;
+      out.delay.delayed = true;
+      out.delay.delayed_by =
+          interrupt_delay_cause_from_source(capture.blocker);
+      out.delay.confidence = interrupt_delay_confidence_t::HIGH_CONFIDENCE;
+      out.delay.delay_cycles_valid = true;
+      out.delay.delay_cycles = out.spinidle_excess_cycles;
+      out.delay.uncertainty_cycles = INTERRUPT_DELAY_SPIN_GUARD_CYCLES;
+      return out;
+    }
+  }
+
+  // Pending-at-exit proves this endpoint was serialized behind the named ISR,
+  // even when the request arrived partway through the blocker and SpinIdle
+  // cannot tell us the exact wait.  Preserve that verdict and cause; compare-
+  // driven lanes will add a quantified duration below.
+  if (blocker_recent && blocker_could_block) {
+    out.delay.valid = true;
+    out.delay.verdict = interrupt_delay_verdict_t::DELAYED;
+    out.delay.delayed = true;
+    out.delay.delayed_by =
+        interrupt_delay_cause_from_source(capture.blocker);
+    out.delay.confidence = interrupt_delay_confidence_t::LOW_CONFIDENCE;
+    out.delay.delay_cycles_valid = false;
+    out.delay.delay_cycles = 0U;
+    out.delay.uncertainty_cycles = capture.blocker_wall_cycles;
+    return out;
+  }
+
+  // A higher-priority source entering while a lower tier remains active did not
+  // wait for that lower tier; it preempted it.  A stale/missing SpinIdle witness
+  // in this case describes prior CPU occupancy, not service delay.
+  if (capture.lower_context_active_mask != 0U) {
+    out.delay.valid = true;
+    out.delay.verdict = interrupt_delay_verdict_t::ON_TIME;
+    out.delay.delayed = false;
+    out.delay.delayed_by = interrupt_delay_cause_t::NONE;
+    out.delay.confidence = interrupt_delay_confidence_t::HIGH_CONFIDENCE;
+    out.delay.delay_cycles_valid = true;
+    out.delay.delay_cycles = 0U;
+    out.delay.uncertainty_cycles = INTERRUPT_DELAY_SPIN_GUARD_CYCLES;
+  }
+
+  return out;
+}
+
+static uint32_t interrupt_delay_ticks_to_cycles(uint32_t ticks) {
+  const uint32_t cps = interrupt_vclock_cycles_per_second();
+  if (ticks == 0U || cps == 0U) return 0U;
+  return (uint32_t)(((uint64_t)ticks * (uint64_t)cps +
+                     (uint64_t)OCXO_ONE_SECOND_TICKS / 2ULL) /
+                    (uint64_t)OCXO_ONE_SECOND_TICKS);
+}
+
+static interrupt_arrival_observation_t interrupt_delay_classify_qtimer(
+    interrupt_execution_source_t source,
+    uint32_t entry_dwt,
+    const interrupt_arrival_capture_t& capture,
+    int32_t service_offset_ticks,
+    bool service_witness_contaminated = false) {
+  interrupt_arrival_observation_t out =
+      interrupt_delay_classify_entry(source, entry_dwt, capture);
+  interrupt_delay_baseline_runtime_t* runtime =
+      interrupt_delay_baseline_for(source);
+  if (!runtime) return out;
+
+  // A higher-priority ISR may preempt QTimer1 after the first-instruction DWT
+  // was already captured but before CNTR is read.  That makes the service-offset
+  // witness late without making the endpoint late.  Preserve the entry verdict
+  // and refuse both learning and adjudication from that contaminated witness.
+  if (service_witness_contaminated) return out;
+
+  // Learn the ordinary counter-vs-compare offset only from an independently
+  // clean SpinIdle verdict.  A delayed sample must never teach the delay ruler.
+  if (out.delay.valid &&
+      out.delay.verdict == interrupt_delay_verdict_t::ON_TIME &&
+      out.spinidle_shadow_valid &&
+      out.spinidle_excess_cycles <= INTERRUPT_DELAY_SPIN_GUARD_CYCLES) {
+    interrupt_delay_learn_service_baseline(*runtime, service_offset_ticks);
+  }
+  if (!runtime->service_valid) return out;
+
+  const int32_t service_extra_ticks =
+      service_offset_ticks - runtime->service_baseline_ticks;
+  const uint32_t one_tick_cycles = interrupt_delay_ticks_to_cycles(1U);
+
+  if (service_extra_ticks <= INTERRUPT_DELAY_SERVICE_NORMAL_JITTER_TICKS) {
+    // The hardware compare was serviced at its learned ordinary offset.  This
+    // outranks a long SpinIdle ancestry interval: the target may have become
+    // pending only at the blocker's final instruction and did not suffer a
+    // measurable endpoint displacement.
+    out.delay.valid = true;
+    out.delay.verdict = interrupt_delay_verdict_t::ON_TIME;
+    out.delay.delayed = false;
+    out.delay.delayed_by = interrupt_delay_cause_t::NONE;
+    out.delay.confidence = interrupt_delay_confidence_t::MEDIUM_CONFIDENCE;
+    out.delay.delay_cycles_valid = true;
+    out.delay.delay_cycles = 0U;
+    out.delay.uncertainty_cycles = one_tick_cycles;
+    return out;
+  }
+
+  const uint32_t service_delay_cycles =
+      interrupt_delay_ticks_to_cycles((uint32_t)service_extra_ticks);
+  const uint32_t agreement_gate = one_tick_cycles +
+      INTERRUPT_DELAY_SPIN_GUARD_CYCLES;
+  uint32_t selected_delay = service_delay_cycles;
+  uint32_t selected_uncertainty = agreement_gate;
+
+  // SpinIdle supplies sub-QTimer-tick precision only when the target was already
+  // pending at blocker entry (so the full blocker residence belongs to its wait)
+  // and the independent timer ruler agrees within one tick.
+  if (capture.target_pending_at_blocker_entry &&
+      out.spinidle_excess_cycles > INTERRUPT_DELAY_SPIN_GUARD_CYCLES) {
+    const uint32_t difference =
+        out.spinidle_excess_cycles >= service_delay_cycles
+            ? out.spinidle_excess_cycles - service_delay_cycles
+            : service_delay_cycles - out.spinidle_excess_cycles;
+    if (difference <= agreement_gate) {
+      selected_delay = out.spinidle_excess_cycles;
+      selected_uncertainty = INTERRUPT_DELAY_SPIN_GUARD_CYCLES;
+    }
+  }
+
+  out.delay.valid = true;
+  out.delay.verdict = interrupt_delay_verdict_t::DELAYED;
+  out.delay.delayed = true;
+  if (out.delay.delayed_by == interrupt_delay_cause_t::NONE ||
+      out.delay.delayed_by == interrupt_delay_cause_t::UNKNOWN) {
+    out.delay.delayed_by = interrupt_delay_cause_t::MASKING_OR_UNKNOWN_CPU;
+  }
+  if ((uint8_t)out.delay.confidence <
+      (uint8_t)interrupt_delay_confidence_t::MEDIUM_CONFIDENCE) {
+    out.delay.confidence = interrupt_delay_confidence_t::MEDIUM_CONFIDENCE;
+  }
+  out.delay.delay_cycles_valid = true;
+  out.delay.delay_cycles = selected_delay;
+  out.delay.uncertainty_cycles = selected_uncertainty;
+  return out;
+}
+
+static int32_t interrupt_delay_signed_difference(uint32_t current,
+                                                 uint32_t previous) {
+  const int64_t value = (int64_t)(uint64_t)current -
+                        (int64_t)(uint64_t)previous;
+  if (value > INT32_MAX) return INT32_MAX;
+  if (value < INT32_MIN) return INT32_MIN;
+  return (int32_t)value;
+}
+
+static interrupt_delay_cause_t interrupt_delay_combine_causes(
+    interrupt_delay_cause_t a,
+    interrupt_delay_cause_t b) {
+  if (a == interrupt_delay_cause_t::NONE) return b;
+  if (b == interrupt_delay_cause_t::NONE) return a;
+  if (a == b) return a;
+  if (a == interrupt_delay_cause_t::UNKNOWN ||
+      b == interrupt_delay_cause_t::UNKNOWN) {
+    return interrupt_delay_cause_t::UNKNOWN;
+  }
+  return interrupt_delay_cause_t::MULTIPLE_ISR;
+}
+
+static void interrupt_delay_attach_interval_history(
+    bool& previous_valid,
+    bool& previous_delayed,
+    interrupt_delay_cause_t& previous_cause,
+    uint32_t& previous_cycles,
+    bool& previous_interval_valid,
+    int32_t& previous_interval_cycles,
+    interrupt_delay_cause_t& previous_interval_cause,
+    const interrupt_delay_forensics_t& endpoint,
+    interrupt_delay_forensics_t& out) {
+  out = endpoint;
+  out.previous_endpoint_valid = previous_valid;
+  out.previous_endpoint_delayed = previous_valid && previous_delayed;
+  out.previous_delayed_by = previous_valid
+      ? previous_cause
+      : interrupt_delay_cause_t::NONE;
+  out.previous_delay_cycles = previous_valid ? previous_cycles : 0U;
+
+  out.interval_delay_valid = endpoint.valid &&
+      endpoint.delay_cycles_valid && previous_valid;
+  out.interval_delay_cycles = out.interval_delay_valid
+      ? interrupt_delay_signed_difference(endpoint.delay_cycles,
+                                          previous_cycles)
+      : 0;
+  if (!out.interval_delay_valid || out.interval_delay_cycles == 0) {
+    out.interval_delayed_by = interrupt_delay_cause_t::NONE;
+  } else if (out.interval_delay_cycles > 0) {
+    out.interval_delayed_by = endpoint.delayed_by;
+  } else {
+    out.interval_delayed_by = previous_cause;
+  }
+
+  out.previous_interval_delay_valid = previous_interval_valid;
+  out.previous_interval_delay_cycles = previous_interval_valid
+      ? previous_interval_cycles
+      : 0;
+  out.previous_interval_delayed_by = previous_interval_valid
+      ? previous_interval_cause
+      : interrupt_delay_cause_t::NONE;
+  out.residual_delay_valid = out.interval_delay_valid &&
+      previous_interval_valid;
+  out.residual_delay_cycles = 0;
+  if (out.residual_delay_valid) {
+    const int64_t residual64 = (int64_t)out.interval_delay_cycles -
+                               (int64_t)previous_interval_cycles;
+    out.residual_delay_cycles = residual64 > INT32_MAX
+        ? INT32_MAX
+        : (residual64 < INT32_MIN ? INT32_MIN : (int32_t)residual64);
+  }
+
+  if (!out.residual_delay_valid || out.residual_delay_cycles == 0) {
+    out.residual_delayed_by = interrupt_delay_cause_t::NONE;
+  } else if (out.interval_delay_cycles == 0) {
+    out.residual_delayed_by = previous_interval_cause;
+  } else if (previous_interval_cycles == 0) {
+    out.residual_delayed_by = out.interval_delayed_by;
+  } else {
+    out.residual_delayed_by = interrupt_delay_combine_causes(
+        out.interval_delayed_by, previous_interval_cause);
+  }
+
+  previous_valid = endpoint.valid && endpoint.delay_cycles_valid;
+  previous_delayed = endpoint.valid && endpoint.delayed;
+  previous_cause = endpoint.valid
+      ? endpoint.delayed_by
+      : interrupt_delay_cause_t::UNKNOWN;
+  previous_cycles = endpoint.valid && endpoint.delay_cycles_valid
+      ? endpoint.delay_cycles
+      : 0U;
+
+  previous_interval_valid = out.interval_delay_valid;
+  previous_interval_cycles = out.interval_delay_valid
+      ? out.interval_delay_cycles
+      : 0;
+  previous_interval_cause = out.interval_delay_valid
+      ? out.interval_delayed_by
+      : interrupt_delay_cause_t::UNKNOWN;
+}
+
 static bool interrupt_priority_readback_all_match(void) {
   bool match =
       interrupt_nvic_priority_read((uint32_t)IRQ_QTIMER1) ==
@@ -3070,7 +3855,9 @@ static void fill_observed_diag(interrupt_capture_diag_t& diag,
                                uint32_t isr_entry_dwt_raw,
                                uint16_t ambient_low16,
                                uint16_t target_low16,
-                               uint32_t sequence) {
+                               uint32_t sequence,
+                               const interrupt_arrival_observation_t* arrival =
+                                   nullptr) {
   diag.enabled = true;
   diag.provider = event.provider;
   diag.lane = event.lane;
@@ -3078,6 +3865,22 @@ static void fill_observed_diag(interrupt_capture_diag_t& diag,
   diag.dwt_at_event = event.dwt_at_event;
   diag.gnss_ns_at_event = event.gnss_ns_at_event;
   diag.counter32_at_event = event.counter32_at_event;
+  if (arrival) {
+    diag.spinidle_shadow_valid =
+        arrival->spinidle_shadow_valid;
+    diag.spinidle_shadow_dwt = arrival->capture.spinidle_shadow_dwt;
+    diag.spinidle_shadow_to_isr_entry_cycles =
+        arrival->spinidle_age_cycles;
+    diag.spinidle_shadow_valid_threshold_cycles =
+        arrival->spinidle_valid_threshold_cycles;
+    diag.interrupt_delay = arrival->delay;
+  } else {
+    diag.spinidle_shadow_valid = false;
+    diag.spinidle_shadow_dwt = 0U;
+    diag.spinidle_shadow_to_isr_entry_cycles = 0U;
+    diag.spinidle_shadow_valid_threshold_cycles = 0U;
+    diag.interrupt_delay = interrupt_delay_forensics_t{};
+  }
   diag.dwt_synthetic = false;
   diag.dwt_repair_candidate = false;
   diag.dwt_original_at_event = event.dwt_at_event;
@@ -3140,7 +3943,8 @@ static bool emit_observed_event(interrupt_subscriber_runtime_t& rt,
                                 uint16_t ambient_low16,
                                 uint16_t target_low16,
                                 uint32_t sequence,
-                                uint32_t pps_sequence) {
+                                uint32_t pps_sequence,
+                                const interrupt_arrival_observation_t& arrival) {
   if (!rt.active || !rt.desc || dwt_at_event == 0U) return false;
 
   const uint32_t prior = interrupt_priority0_guard_enter();
@@ -3164,7 +3968,18 @@ static bool emit_observed_event(interrupt_subscriber_runtime_t& rt,
                      isr_entry_dwt_raw,
                      ambient_low16,
                      target_low16,
-                     sequence);
+                     sequence,
+                     &arrival);
+  interrupt_delay_attach_interval_history(
+      rt.previous_delay_valid,
+      rt.previous_endpoint_delayed,
+      rt.previous_delayed_by,
+      rt.previous_delay_cycles,
+      rt.previous_interval_delay_valid,
+      rt.previous_interval_delay_cycles,
+      rt.previous_interval_delayed_by,
+      arrival.delay,
+      rt.last_diag.interrupt_delay);
   rt.has_fired = true;
   rt.event_count++;
   return interrupt_dispatch_begin(rt, rt.last_event);
@@ -3235,6 +4050,15 @@ static void process_vclock_packet(const vclock_capture_packet_t& packet) {
   const uint16_t target_low16 = packet.target_low16;
   const uint32_t service_counter32 =
       vclock_synthetic_from_hardware_low16(packet.service_low16);
+  const int32_t service_offset_ticks =
+      (int32_t)((int16_t)(uint16_t)(packet.service_low16 - target_low16));
+  const interrupt_arrival_observation_t arrival =
+      interrupt_delay_classify_qtimer(
+          interrupt_execution_source_t::QTIMER1,
+          packet.isr_entry_dwt_raw,
+          packet.arrival,
+          service_offset_ticks,
+          packet.preempted_after_entry);
   uint32_t event_target = captured_target;
 
   vclock_anchor_hardware(captured_target, target_low16);
@@ -3312,7 +4136,8 @@ static void process_vclock_packet(const vclock_capture_packet_t& packet) {
                                 packet.service_low16,
                                 target_low16,
                                 sequence,
-                                sequence);
+                                sequence,
+                                arrival);
     }
   }
 }
@@ -3372,6 +4197,16 @@ static void process_ocxo_packet(const ocxo_runtime_context_t& ctx,
   lane.last_ambient_minus_target_ticks =
       (int32_t)((int16_t)(uint16_t)(packet.ambient_low16 -
                                     packet.target_low16));
+  const interrupt_execution_source_t delay_source =
+      ctx.kind == interrupt_subscriber_kind_t::OCXO1
+          ? interrupt_execution_source_t::OCXO1
+          : interrupt_execution_source_t::OCXO2;
+  const interrupt_arrival_observation_t arrival =
+      interrupt_delay_classify_qtimer(
+          delay_source,
+          packet.isr_entry_dwt_raw,
+          packet.arrival,
+          lane.last_ambient_minus_target_ticks);
 
   // The semantic event identity is the target authored before the match.  The
   // ambient read is witness-only and cannot advance, reject, or replace it.
@@ -3476,7 +4311,8 @@ static void process_ocxo_packet(const ocxo_runtime_context_t& ctx,
                               lane.dispatch_sequence,
                               g_last_pps_witness_valid
                                   ? g_last_pps_witness.sequence
-                                  : 0U);
+                                  : 0U,
+                              arrival);
   } else {
     lane.miss_count++;
   }
@@ -3484,6 +4320,24 @@ static void process_ocxo_packet(const ocxo_runtime_context_t& ctx,
 
 static void process_pps_packet(const pps_capture_packet_t& packet) {
   crash_stack_tripwire_isr_check(CRASH_TRIPWIRE_SITE_PPS_GPIO);
+  const interrupt_arrival_observation_t arrival =
+      interrupt_delay_classify_entry(
+          interrupt_execution_source_t::PPS,
+          packet.isr_entry_dwt_raw,
+          packet.arrival);
+  g_pps_arrival_capture = packet.arrival;
+  g_pps_arrival_entry_dwt = packet.isr_entry_dwt_raw;
+  interrupt_delay_attach_interval_history(
+      g_pps_previous_delay_valid,
+      g_pps_previous_endpoint_delayed,
+      g_pps_previous_delayed_by,
+      g_pps_previous_delay_cycles,
+      g_pps_previous_interval_delay_valid,
+      g_pps_previous_interval_delay_cycles,
+      g_pps_previous_interval_delayed_by,
+      arrival.delay,
+      g_pps_interrupt_delay);
+
   pps_t pps{};
   pps.sequence = ++g_pps_gpio_heartbeat.edge_count;
   pps.dwt_at_edge = pps_dwt_from_isr_entry_raw(packet.isr_entry_dwt_raw);
@@ -3787,14 +4641,22 @@ qtimer_defuse_ocxo_priority0(IMXRT_TMR_t& module, uint8_t channel) {
 }
 
 static __attribute__((always_inline)) inline bool
-qtimer1_capture_vclock_priority16(uint32_t isr_entry_dwt_raw,
-                                uint16_t service_low16) {
+qtimer1_capture_vclock_priority16(
+    uint32_t isr_entry_dwt_raw,
+    uint16_t service_low16,
+    const interrupt_arrival_capture_t& arrival) {
   const uint32_t target = g_vclock_heartbeat_next_counter32;
   const uint16_t target_low16 = g_vclock_heartbeat_target_low16;
   qtimer1_defuse_vclock_priority16();
 
-  vclock_capture_packet_t packet{};
+  // Every member is assigned explicitly; avoid a compiler-generated packet
+  // memset in the Priority-16 capture path.
+  vclock_capture_packet_t packet;
+  packet.sequence = 0U;
   packet.isr_entry_dwt_raw = isr_entry_dwt_raw;
+  packet.arrival = arrival;
+  packet.preempted_after_entry =
+      g_interrupt_priority_runtime.qtimer1.preempted_during_current_entry;
   packet.target_counter32 = target;
   packet.target_low16 = target_low16;
   packet.service_low16 = service_low16;
@@ -3880,6 +4742,9 @@ static void qtimer1_isr(void) {
   const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;
   interrupt_isr_diag_enter(
       g_interrupt_priority_runtime.qtimer1, isr_entry_dwt_raw);
+  const interrupt_arrival_capture_t arrival =
+      interrupt_delay_capture_entry_fast(
+          interrupt_execution_source_t::QTIMER1);
   if (g_interrupt_priority_runtime.continuation.active) {
     g_interrupt_priority_runtime.qtimer1_preempted_continuation_count++;
     g_interrupt_priority_runtime.continuation
@@ -3897,7 +4762,8 @@ static void qtimer1_isr(void) {
     const uint16_t service_low16 =
         IMXRT_TMR1.CH[QTIMER1_VCLOCK_CH].CNTR;
     handoff_needed |=
-        qtimer1_capture_vclock_priority16(isr_entry_dwt_raw, service_low16);
+        qtimer1_capture_vclock_priority16(
+            isr_entry_dwt_raw, service_low16, arrival);
   }
   if ((ch2_csctrl & TMR_CSCTRL_TCF1) != 0U) {
     handoff_needed |=
@@ -3917,7 +4783,8 @@ static __attribute__((always_inline)) inline bool ocxo_capture_priority0(
     interrupt_capture_ring_t<ocxo_capture_packet_t,
                              HANDOFF_OCXO_RING_SIZE>& ring,
     interrupt_handoff_source_diag_t& handoff,
-    uint32_t isr_entry_dwt_raw) {
+    uint32_t isr_entry_dwt_raw,
+    const interrupt_arrival_capture_t& arrival) {
   const uint32_t csctrl = module.CH[CHANNEL].CSCTRL;
   if ((csctrl & TMR_CSCTRL_TCF1) == 0U) {
     lane.false_irq_count++;
@@ -3938,8 +4805,12 @@ static __attribute__((always_inline)) inline bool ocxo_capture_priority0(
   qtimer_defuse_ocxo_priority0(module, CHANNEL);
   lane.compare_armed = false;
 
-  ocxo_capture_packet_t packet{};
+  // Every member is assigned explicitly; avoid a compiler-generated packet
+  // memset in the sovereign Priority-0 capture path.
+  ocxo_capture_packet_t packet;
+  packet.sequence = 0U;
   packet.isr_entry_dwt_raw = isr_entry_dwt_raw;
+  packet.arrival = arrival;
   packet.target_counter32 = target_counter32;
   packet.target_low16 = target_low16;
   packet.ambient_low16 = ambient_low16;
@@ -3966,6 +4837,9 @@ static __attribute__((always_inline)) inline bool ocxo_capture_priority0(
 
 static void qtimer2_isr(void) {
   const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;
+  const interrupt_arrival_capture_t arrival =
+      interrupt_delay_capture_entry_fast(
+          interrupt_execution_source_t::OCXO1);
   interrupt_isr_diag_enter(
       g_interrupt_priority_runtime.qtimer2, isr_entry_dwt_raw);
   interrupt_note_science_preemption(
@@ -3975,15 +4849,23 @@ static void qtimer2_isr(void) {
           IMXRT_TMR2,
           g_ocxo1_capture_ring,
           g_handoff_ocxo1,
-          isr_entry_dwt_raw)) {
+          isr_entry_dwt_raw,
+          arrival)) {
     interrupt_handoff_request_isr(isr_entry_dwt_raw);
   }
   interrupt_isr_diag_exit(
       g_interrupt_priority_runtime.qtimer2, isr_entry_dwt_raw);
+  // Pending-at-exit attribution must be the final ISR action so a peer edge
+  // arriving late in this handler is still named as the blocker.
+  interrupt_delay_note_isr_exit(
+      interrupt_execution_source_t::OCXO1, isr_entry_dwt_raw, arrival);
 }
 
 static void qtimer3_isr(void) {
   const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;
+  const interrupt_arrival_capture_t arrival =
+      interrupt_delay_capture_entry_fast(
+          interrupt_execution_source_t::OCXO2);
   interrupt_isr_diag_enter(
       g_interrupt_priority_runtime.qtimer3, isr_entry_dwt_raw);
   interrupt_note_science_preemption(
@@ -3993,14 +4875,21 @@ static void qtimer3_isr(void) {
           IMXRT_TMR3,
           g_ocxo2_capture_ring,
           g_handoff_ocxo2,
-          isr_entry_dwt_raw)) {
+          isr_entry_dwt_raw,
+          arrival)) {
     interrupt_handoff_request_isr(isr_entry_dwt_raw);
   }
   interrupt_isr_diag_exit(
       g_interrupt_priority_runtime.qtimer3, isr_entry_dwt_raw);
+  // Pending-at-exit attribution must be the final ISR action so a peer edge
+  // arriving late in this handler is still named as the blocker.
+  interrupt_delay_note_isr_exit(
+      interrupt_execution_source_t::OCXO2, isr_entry_dwt_raw, arrival);
 }
 
-void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
+static void process_interrupt_gpio6789_irq(
+    uint32_t isr_entry_dwt_raw,
+    const interrupt_arrival_capture_t& arrival) {
   const uint16_t vclock_hardware16 = qtimer1_ch0_counter_now();
   const bool ocxo1_valid = !OCXO1_DISABLED && g_ocxo1_lane.initialized;
   const bool ocxo2_valid = !OCXO2_DISABLED && g_ocxo2_lane.initialized;
@@ -4019,8 +4908,12 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
   g_pps_relay_countdown_cells = PPS_RELAY_OFF_CELLS;
   g_pps_relay_assert_count++;
 
-  pps_capture_packet_t packet{};
+  // Every member is assigned explicitly; avoid a compiler-generated packet
+  // memset in the sovereign Priority-0 capture path.
+  pps_capture_packet_t packet;
+  packet.sequence = 0U;
   packet.isr_entry_dwt_raw = isr_entry_dwt_raw;
+  packet.arrival = arrival;
   packet.vclock_hardware16 = vclock_hardware16;
   packet.ocxo1_hardware16 = ocxo1_hardware16;
   packet.ocxo2_hardware16 = ocxo2_hardware16;
@@ -4035,15 +4928,31 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
   }
 }
 
+void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
+  const interrupt_arrival_capture_t arrival =
+      interrupt_delay_capture_entry_fast(
+          interrupt_execution_source_t::PPS);
+  process_interrupt_gpio6789_irq(isr_entry_dwt_raw, arrival);
+  interrupt_delay_note_isr_exit(
+      interrupt_execution_source_t::PPS, isr_entry_dwt_raw, arrival);
+}
+
 static void pps_gpio_isr(void) {
   const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;
+  const interrupt_arrival_capture_t arrival =
+      interrupt_delay_capture_entry_fast(
+          interrupt_execution_source_t::PPS);
   interrupt_isr_diag_enter(
       g_interrupt_priority_runtime.pps, isr_entry_dwt_raw);
   interrupt_note_science_preemption(
       g_interrupt_priority_runtime.pps_preempted_qtimer1_count);
-  process_interrupt_gpio6789_irq(isr_entry_dwt_raw);
+  process_interrupt_gpio6789_irq(isr_entry_dwt_raw, arrival);
   interrupt_isr_diag_exit(
       g_interrupt_priority_runtime.pps, isr_entry_dwt_raw);
+  // Pending-at-exit attribution must be the final ISR action so a peer edge
+  // arriving late in this handler is still named as the blocker.
+  interrupt_delay_note_isr_exit(
+      interrupt_execution_source_t::PPS, isr_entry_dwt_raw, arrival);
 }
 
 // ============================================================================
@@ -4100,6 +5009,22 @@ pps_edge_snapshot_t interrupt_last_pps_edge(void) {
   out.physical_pps_dwt_normalized_at_edge = pps.dwt_at_edge;
   out.physical_pps_counter32_at_read = pps.counter32_at_edge;
   out.physical_pps_ch3_at_read = pps.ch3_at_edge;
+  out.spinidle_shadow_valid =
+      g_pps_arrival_capture.spinidle_running &&
+      g_pps_arrival_capture.spinidle_shadow_dwt != 0U;
+  out.spinidle_shadow_dwt = g_pps_arrival_capture.spinidle_shadow_dwt;
+  out.spinidle_shadow_to_isr_entry_cycles = out.spinidle_shadow_valid
+      ? (uint32_t)(g_pps_arrival_entry_dwt -
+                   g_pps_arrival_capture.spinidle_shadow_dwt)
+      : 0U;
+  const interrupt_delay_baseline_runtime_t* pps_delay_runtime =
+      interrupt_delay_baseline_for(interrupt_execution_source_t::PPS);
+  out.spinidle_shadow_valid_threshold_cycles =
+      pps_delay_runtime && pps_delay_runtime->spin_valid
+          ? pps_delay_runtime->spin_baseline_cycles +
+                INTERRUPT_DELAY_SPIN_GUARD_CYCLES
+          : 0U;
+  out.interrupt_delay = g_pps_interrupt_delay;
   out.vclock_epoch_counter32 = pvc.counter32_at_edge;
   out.vclock_epoch_ch3 = pvc.ch3_at_edge;
   out.vclock_epoch_ticks_after_pps =
@@ -4242,6 +5167,14 @@ void ocxo1_recovery_runtime_reset_bound(void) {
   interrupt_dispatch_invalidate_locked(rt);
   rt.last_event = interrupt_event_t{};
   rt.last_diag = interrupt_capture_diag_t{};
+  rt.previous_delay_valid = false;
+  rt.previous_endpoint_delayed = false;
+  rt.previous_delayed_by = interrupt_delay_cause_t::NONE;
+  rt.previous_delay_cycles = 0U;
+  rt.previous_interval_delay_valid = false;
+  rt.previous_interval_delay_cycles = 0;
+  rt.previous_interval_delayed_by = interrupt_delay_cause_t::NONE;
+  g_delay_seen_ocxo1_token = g_delay_latch_ocxo1.publish_token;
   rt.has_fired = false;
   rt.active = true;
 }
@@ -4253,6 +5186,14 @@ void ocxo2_recovery_runtime_reset_bound(void) {
   interrupt_dispatch_invalidate_locked(rt);
   rt.last_event = interrupt_event_t{};
   rt.last_diag = interrupt_capture_diag_t{};
+  rt.previous_delay_valid = false;
+  rt.previous_endpoint_delayed = false;
+  rt.previous_delayed_by = interrupt_delay_cause_t::NONE;
+  rt.previous_delay_cycles = 0U;
+  rt.previous_interval_delay_valid = false;
+  rt.previous_interval_delay_cycles = 0;
+  rt.previous_interval_delayed_by = interrupt_delay_cause_t::NONE;
+  g_delay_seen_ocxo2_token = g_delay_latch_ocxo2.publish_token;
   rt.has_fired = false;
   rt.active = true;
 }
@@ -4919,6 +5860,7 @@ static void runtime_init_subscribers(void) {
 void process_interrupt_init(void) {
   if (g_interrupt_runtime_ready) return;
   runtime_init_subscribers();
+  interrupt_delay_runtime_reset();
   g_interrupt_integrity = interrupt_integrity_snapshot_t{};
   g_store = snapshot_store_t{};
   g_epoch_capture = epoch_capture_store_t{};
@@ -5969,6 +6911,40 @@ const char* interrupt_lane_str(interrupt_lane_t lane) {
     case interrupt_lane_t::QTIMER3_CH1_COMP: return "QTIMER3_CH1_COMP";
     case interrupt_lane_t::QTIMER3_CH3_COMP: return "QTIMER3_CH3_COMP";
     case interrupt_lane_t::GPIO_EDGE: return "GPIO_EDGE";
+    default: return "NONE";
+  }
+}
+
+const char* interrupt_delay_verdict_str(interrupt_delay_verdict_t verdict) {
+  switch (verdict) {
+    case interrupt_delay_verdict_t::ON_TIME: return "ON_TIME";
+    case interrupt_delay_verdict_t::DELAYED: return "DELAYED";
+    default: return "UNKNOWN";
+  }
+}
+
+const char* interrupt_delay_cause_str(interrupt_delay_cause_t cause) {
+  switch (cause) {
+    case interrupt_delay_cause_t::NONE: return "NONE";
+    case interrupt_delay_cause_t::VCLOCK_TIMEPOP: return "VCLOCK_TIMEPOP";
+    case interrupt_delay_cause_t::OCXO1: return "OCXO1";
+    case interrupt_delay_cause_t::OCXO2: return "OCXO2";
+    case interrupt_delay_cause_t::PPS: return "PPS";
+    case interrupt_delay_cause_t::CONTINUATION: return "CONTINUATION";
+    case interrupt_delay_cause_t::MASKING_OR_UNKNOWN_CPU:
+      return "MASKING_OR_UNKNOWN_CPU";
+    case interrupt_delay_cause_t::MULTIPLE_ISR: return "MULTIPLE_ISR";
+    default: return "UNKNOWN";
+  }
+}
+
+const char* interrupt_delay_confidence_str(
+    interrupt_delay_confidence_t confidence) {
+  switch (confidence) {
+    case interrupt_delay_confidence_t::LOW_CONFIDENCE: return "LOW";
+    case interrupt_delay_confidence_t::MEDIUM_CONFIDENCE: return "MEDIUM";
+    case interrupt_delay_confidence_t::HIGH_CONFIDENCE: return "HIGH";
+    case interrupt_delay_confidence_t::EXACT_CONFIDENCE: return "EXACT";
     default: return "NONE";
   }
 }

@@ -160,6 +160,7 @@ static constexpr bool TIMEBASE_FORENSICS_MINIMAL_PAYLOAD_ENABLED = true;
 // forensics row.  The payload carries measured endpoints and intervals only.
 static constexpr bool TIMEBASE_FORENSICS_MICRO_RAW_CYCLES_ENABLED = true;
 static constexpr bool TIMEBASE_FORENSICS_MINIMAL_HEALTH_FIELDS_ENABLED = false;
+static constexpr uint32_t TIMEBASE_ISR_DELAY_EXPLANATION_GATE_CYCLES = 16U;
 
 // Draconian embedded-forensics diet.
 //
@@ -7273,6 +7274,79 @@ static FLASHMEM void payload_add_raw_cycles_observed(Payload& p) {
   p.add_object("raw_cycles", raw);
 }
 
+static FLASHMEM uint32_t interrupt_delay_abs_i32(int32_t value) {
+  return value < 0 ? (uint32_t)(-(int64_t)value) : (uint32_t)value;
+}
+
+static FLASHMEM int32_t interrupt_delay_clamp_i64(int64_t value) {
+  return value > INT32_MAX
+      ? INT32_MAX
+      : (value < INT32_MIN ? INT32_MIN : (int32_t)value);
+}
+
+static FLASHMEM void payload_add_micro_interrupt_delay(
+    Payload& p,
+    const char* prefix,
+    const interrupt_delay_forensics_t& delay,
+    const clocks_static_prediction_snapshot_t& raw_cycles) {
+  char key[48];
+  auto add_bool = [&](const char* suffix, bool value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value);
+  };
+  auto add_u32 = [&](const char* suffix, uint32_t value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value);
+  };
+  auto add_i32 = [&](const char* suffix, int32_t value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value);
+  };
+  auto add_text = [&](const char* suffix, const char* value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value ? value : "UNKNOWN");
+  };
+
+  const bool interval_valid = delay.interval_delay_valid && raw_cycles.valid;
+  const bool residual_valid = delay.residual_delay_valid && raw_cycles.valid;
+  const int32_t residual_after_delay = residual_valid
+      ? interrupt_delay_clamp_i64(
+            (int64_t)raw_cycles.static_residual_cycles -
+            (int64_t)delay.residual_delay_cycles)
+      : 0;
+  const bool explains = residual_valid &&
+      delay.residual_delay_cycles != 0 &&
+      interrupt_delay_abs_i32(residual_after_delay) <=
+          TIMEBASE_ISR_DELAY_EXPLANATION_GATE_CYCLES;
+
+  // This is the ordinary 1 Hz expert-witness surface.  It deliberately omits
+  // SpinIdle shadows, NVIC registers, and compare counters.  Focused reports may
+  // retain those observations; TIMEBASE receives only the integrated verdict.
+  add_text("delay_status", interrupt_delay_verdict_str(delay.verdict));
+  add_text("delay_by", interrupt_delay_cause_str(delay.delayed_by));
+  add_bool("delay_cycles_valid", delay.valid && delay.delay_cycles_valid);
+  add_u32("delay_cycles",
+          delay.valid && delay.delay_cycles_valid ? delay.delay_cycles : 0U);
+  add_text("delay_confidence",
+           interrupt_delay_confidence_str(delay.confidence));
+  add_u32("delay_uncertainty_cycles",
+          delay.valid ? delay.uncertainty_cycles : 0U);
+
+  add_bool("interval_delay_valid", interval_valid);
+  add_i32("interval_delay_cycles",
+          interval_valid ? delay.interval_delay_cycles : 0);
+
+  add_bool("residual_delay_valid", residual_valid);
+  add_i32("residual_delay_cycles",
+          residual_valid ? delay.residual_delay_cycles : 0);
+  add_text("residual_delay_by",
+           residual_valid
+               ? interrupt_delay_cause_str(delay.residual_delayed_by)
+               : "UNKNOWN");
+  add_i32("residual_after_delay_cycles", residual_after_delay);
+  add_bool("delay_explains_residual", explains);
+}
+
 static FLASHMEM void payload_add_vclock_fragment(Payload& p,
                                           uint64_t public_gnss_ns,
                                           uint32_t public_count,
@@ -9566,6 +9640,26 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
     f.add("paired_fragment_schema", "TIMEBASE_FRAGMENT_V4");
     f.add("paired_fragment_version", 4U);
     payload_add_recovery_continuity_forensics(f, public_count);
+
+    // Every TIMEBASE row carries the expert-witness verdict regardless of
+    // whether the remaining forensic body is minimal, slim, or full.
+    f.add("interrupt_delay_schema", "ISR_DELAY_VERDICT_V3");
+    f.add("interrupt_delay_interval_definition",
+          "CURRENT_ENDPOINT_DELAY_MINUS_PREVIOUS_ENDPOINT_DELAY");
+    f.add("interrupt_delay_residual_definition",
+          "CURRENT_INTERVAL_DELAY_MINUS_PREVIOUS_INTERVAL_DELAY");
+    payload_add_micro_interrupt_delay(
+        f, "pps", g_pps_witness_diag.interrupt_delay,
+        g_beta_pps_cycle_prediction);
+    payload_add_micro_interrupt_delay(
+        f, "v", vclock_forensics.interrupt_delay,
+        g_beta_vclock_cycle_prediction);
+    payload_add_micro_interrupt_delay(
+        f, "o1", ocxo1_forensics.interrupt_delay,
+        g_beta_ocxo1_cycle_prediction);
+    payload_add_micro_interrupt_delay(
+        f, "o2", ocxo2_forensics.interrupt_delay,
+        g_beta_ocxo2_cycle_prediction);
 
     if (TIMEBASE_FORENSICS_MINIMAL_PAYLOAD_ENABLED) {
       // Minimal embedded mode: retain the raw-cycle evidence needed by Pi-side
