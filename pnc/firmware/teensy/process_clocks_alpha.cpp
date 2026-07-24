@@ -2384,6 +2384,8 @@ struct alpha_pps_counterledger_lane_t {
   bool     phase_last_edge_pair_valid = false;
   uint32_t phase_last_edge_pair_previous_dwt = 0;
   uint32_t phase_last_edge_pair_next_dwt = 0;
+  uint32_t phase_last_edge_pair_previous_counter32 = 0;
+  uint32_t phase_last_edge_pair_next_counter32 = 0;
   uint32_t phase_last_edge_pair_interval_cycles = 0;
   uint32_t phase_last_edge_pair_counter_delta_ticks = 0;
   uint32_t phase_last_edge_pair_update_count = 0;
@@ -2406,6 +2408,20 @@ struct alpha_pps_counterledger_lane_t {
   uint32_t phase_next_ocxo_dwt_at_edge = 0;
   uint32_t phase_ocxo_interval_cycles = 0;
   uint32_t phase_pps_delta_cycles = 0;
+
+  // Passive whole-cell reconciliation. CounterLedger supplies the ambient
+  // PPS-sampled 100 ns cell; PhaseLedger geometry independently implies the
+  // last complete OCXO tick before PPS. These fields expose disagreement but
+  // never repair, gate, or replace either candidate.
+  bool     phase_counter_cell_check_valid = false;
+  uint32_t phase_prev_ocxo_counter32_at_edge = 0;
+  uint32_t phase_next_ocxo_counter32_at_edge = 0;
+  uint32_t phase_implied_ticks_since_prev_edge = 0;
+  uint32_t phase_tick_remainder_cycles = 0;
+  uint32_t phase_implied_counter32_at_pps = 0;
+  uint32_t phase_sampled_counter32_at_pps = 0;
+  int32_t  phase_sampled_minus_implied_ticks = 0;
+
   uint32_t phase_after_last_00_ns = 0;
   uint32_t phase_to_next_00_ns = 0;
 
@@ -2985,6 +3001,8 @@ static void alpha_counterledger_reprime_lane_for_recover(
   s.phase_last_edge_pair_valid = false;
   s.phase_last_edge_pair_previous_dwt = 0;
   s.phase_last_edge_pair_next_dwt = 0;
+  s.phase_last_edge_pair_previous_counter32 = 0;
+  s.phase_last_edge_pair_next_counter32 = 0;
   s.phase_last_edge_pair_interval_cycles = 0;
   s.phase_last_edge_pair_counter_delta_ticks = 0;
   s.phase_last_edge_pair_update_count = 0;
@@ -3006,6 +3024,14 @@ static void alpha_counterledger_reprime_lane_for_recover(
   s.phase_next_ocxo_dwt_at_edge = 0;
   s.phase_ocxo_interval_cycles = 0;
   s.phase_pps_delta_cycles = 0;
+  s.phase_counter_cell_check_valid = false;
+  s.phase_prev_ocxo_counter32_at_edge = 0;
+  s.phase_next_ocxo_counter32_at_edge = 0;
+  s.phase_implied_ticks_since_prev_edge = 0;
+  s.phase_tick_remainder_cycles = 0;
+  s.phase_implied_counter32_at_pps = 0;
+  s.phase_sampled_counter32_at_pps = 0;
+  s.phase_sampled_minus_implied_ticks = 0;
   s.phase_after_last_00_ns = 0;
   s.phase_to_next_00_ns = 0;
   s.phase_raw_delta_ns = 0;
@@ -3560,6 +3586,7 @@ static bool alpha_counterledger_resolve_phase_from_ocxo_edge(
     time_clock_id_t clock,
     uint32_t previous_ocxo_dwt_at_edge,
     uint32_t next_ocxo_dwt_at_edge,
+    uint32_t next_ocxo_counter32_at_edge,
     uint32_t counter_delta_ticks,
     uint32_t resolve_source_id) {
   alpha_pps_counterledger_lane_t* s = alpha_counterledger_lane_mut(clock);
@@ -3570,6 +3597,9 @@ static bool alpha_counterledger_resolve_phase_from_ocxo_edge(
     s->phase_last_edge_pair_valid = true;
     s->phase_last_edge_pair_previous_dwt = previous_ocxo_dwt_at_edge;
     s->phase_last_edge_pair_next_dwt = next_ocxo_dwt_at_edge;
+    s->phase_last_edge_pair_previous_counter32 =
+        next_ocxo_counter32_at_edge - counter_delta_ticks;
+    s->phase_last_edge_pair_next_counter32 = next_ocxo_counter32_at_edge;
     s->phase_last_edge_pair_interval_cycles =
         next_ocxo_dwt_at_edge - previous_ocxo_dwt_at_edge;
     s->phase_last_edge_pair_counter_delta_ticks = counter_delta_ticks;
@@ -3664,8 +3694,31 @@ static bool alpha_counterledger_resolve_phase_from_ocxo_edge(
 
   const uint64_t scaled_ticks =
       (uint64_t)pps_delta_cycles * (uint64_t)VCLOCK_COUNTS_PER_SECOND;
+  const uint32_t phase_implied_ticks_since_prev_edge =
+      interval_cycles
+          ? (uint32_t)(scaled_ticks / (uint64_t)interval_cycles)
+          : 0U;
   const uint64_t tick_remainder_cycles =
       interval_cycles ? (scaled_ticks % (uint64_t)interval_cycles) : 0ULL;
+  const uint32_t previous_ocxo_counter32_at_edge =
+      next_ocxo_counter32_at_edge - counter_delta_ticks;
+  const uint32_t phase_implied_counter32_at_pps =
+      previous_ocxo_counter32_at_edge + phase_implied_ticks_since_prev_edge;
+  const bool phase_counter_cell_check_valid =
+      pending.pps_sequence == s->pps_sequence &&
+      s->last_capture_available &&
+      s->last_capture_valid &&
+      s->last_capture_lane_valid &&
+      s->last_capture_sequence_match &&
+      s->last_capture_sequence == pending.pps_sequence;
+  const uint32_t phase_sampled_counter32_at_pps =
+      phase_counter_cell_check_valid ? s->last_counter32 : 0U;
+  const int32_t phase_sampled_minus_implied_ticks =
+      phase_counter_cell_check_valid
+          ? (int32_t)(phase_sampled_counter32_at_pps -
+                      phase_implied_counter32_at_pps)
+          : 0;
+
   uint32_t phase_after_last_00_ns = (uint32_t)(
       (tick_remainder_cycles * (uint64_t)NS_PER_10MHZ_TICK) /
       (uint64_t)interval_cycles);
@@ -3714,6 +3767,16 @@ static bool alpha_counterledger_resolve_phase_from_ocxo_edge(
   s->phase_next_ocxo_dwt_at_edge = next_ocxo_dwt_at_edge;
   s->phase_ocxo_interval_cycles = interval_cycles;
   s->phase_pps_delta_cycles = pps_delta_cycles;
+  s->phase_counter_cell_check_valid = phase_counter_cell_check_valid;
+  s->phase_prev_ocxo_counter32_at_edge = previous_ocxo_counter32_at_edge;
+  s->phase_next_ocxo_counter32_at_edge = next_ocxo_counter32_at_edge;
+  s->phase_implied_ticks_since_prev_edge =
+      phase_implied_ticks_since_prev_edge;
+  s->phase_tick_remainder_cycles = (uint32_t)tick_remainder_cycles;
+  s->phase_implied_counter32_at_pps = phase_implied_counter32_at_pps;
+  s->phase_sampled_counter32_at_pps = phase_sampled_counter32_at_pps;
+  s->phase_sampled_minus_implied_ticks =
+      phase_sampled_minus_implied_ticks;
   s->phase_after_last_00_ns = phase_after_last_00_ns;
   s->phase_to_next_00_ns = phase_to_next_00_ns;
   s->phase_raw_delta_ns = raw_phase_delta_ns;
@@ -3765,6 +3828,7 @@ static bool alpha_counterledger_phase_catchup_from_last_edge_pair(
       clock,
       s.phase_last_edge_pair_previous_dwt,
       s.phase_last_edge_pair_next_dwt,
+      s.phase_last_edge_pair_next_counter32,
       s.phase_last_edge_pair_counter_delta_ticks,
       CLOCKS_PHASELEDGER_RESOLVE_SOURCE_PPS_CATCHUP);
   s.phase_last_catchup_reason_id = s.last_phase_resolve_reason_id;
@@ -4985,6 +5049,21 @@ bool clocks_alpha_ocxo_counterledger_snapshot(
   out->phase_next_ocxo_dwt_at_edge = s->phase_next_ocxo_dwt_at_edge;
   out->phase_ocxo_interval_cycles = s->phase_ocxo_interval_cycles;
   out->phase_pps_delta_cycles = s->phase_pps_delta_cycles;
+  out->phase_counter_cell_check_valid =
+      s->phase_counter_cell_check_valid;
+  out->phase_prev_ocxo_counter32_at_edge =
+      s->phase_prev_ocxo_counter32_at_edge;
+  out->phase_next_ocxo_counter32_at_edge =
+      s->phase_next_ocxo_counter32_at_edge;
+  out->phase_implied_ticks_since_prev_edge =
+      s->phase_implied_ticks_since_prev_edge;
+  out->phase_tick_remainder_cycles = s->phase_tick_remainder_cycles;
+  out->phase_implied_counter32_at_pps =
+      s->phase_implied_counter32_at_pps;
+  out->phase_sampled_counter32_at_pps =
+      s->phase_sampled_counter32_at_pps;
+  out->phase_sampled_minus_implied_ticks =
+      s->phase_sampled_minus_implied_ticks;
   out->phase_after_last_00_ns = s->phase_after_last_00_ns;
   out->phase_to_next_00_ns = s->phase_to_next_00_ns;
   out->phase_raw_delta_ns = s->phase_raw_delta_ns;
@@ -8502,6 +8581,7 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
           time_clock,
           meas.prev_dwt_at_edge,
           applied_event.dwt_at_event,
+          applied_event.counter32_at_event,
           counter32_delta_since_previous_event,
           CLOCKS_PHASELEDGER_RESOLVE_SOURCE_OCXO_EDGE);
     }

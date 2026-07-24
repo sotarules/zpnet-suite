@@ -6618,7 +6618,7 @@ static FLASHMEM void payload_add_clock_science_common(Payload& science,
       row.clock_id == (uint32_t)((uint8_t)time_clock_id_t::OCXO2);
 
   if (TIMEBASE_FRAGMENT_COMPACT_SCIENCE_ENABLED) {
-    science.add("schema", "TIMEBASE_CLOCK_SCIENCE_COMPACT_V3");
+    science.add("schema", "TIMEBASE_CLOCK_SCIENCE_COMPACT_V4");
     science.add("valid", row.valid);
     science.add("science_worthy", row.science_worthy);
     science.add("forensic_override", row.forensic_override);
@@ -6635,6 +6635,8 @@ static FLASHMEM void payload_add_clock_science_common(Payload& science,
     // reports.
     science.add("gnss_interval_ns", row.gnss_interval_ns);
     science.add("clock_interval_ns", row.clock_interval_ns);
+    science.add("clock_observed_interval_cycles",
+                row.clock_observed_interval_cycles);
     science.add("fast_residual_ns", row.fast_residual_ns);
     science.add("fast_residual_ns_exact", toFixedDecimal(row.fast_residual_ns_exact, 6));
     science.add("tau_1s", toFixedDecimal(row.tau_1s, 12));
@@ -6665,13 +6667,19 @@ static FLASHMEM void payload_add_clock_science_common(Payload& science,
                   row.delta_raw_reference_interval_cycles);
       science.add("delta_raw_clock_interval_cycles",
                   row.delta_raw_clock_interval_cycles);
+      science.add("delta_raw_residual_cycles",
+                  row.delta_raw_residual_cycles);
+      science.add("delta_raw_fast_residual_cycles",
+                  row.delta_raw_fast_residual_cycles);
+      science.add("delta_raw_fast_residual_ns",
+                  row.delta_raw_fast_residual_ns);
       science.add("delta_raw_fast_residual_ns_exact",
                   toFixedDecimal(row.delta_raw_fast_residual_ns_exact, 6));
     }
     return;
   }
 
-  science.add("schema", "TIMEBASE_CLOCK_SCIENCE_V3");
+  science.add("schema", "TIMEBASE_CLOCK_SCIENCE_V4");
   science.add("valid", row.valid);
   science.add("science_worthy", row.science_worthy);
   science.add("forensic_override", row.forensic_override);
@@ -6843,6 +6851,19 @@ static FLASHMEM void payload_add_vclock_science_object(Payload& lane,
       vclock_valid ? vclock_f.dwt_cycles_between_edges : 0U;
   row.clock_effective_interval_cycles =
       vclock_valid ? vclock_f.dwt_interval_effective_cycles : 0U;
+
+  // Passive VCLOCK sanity candidate: compare the observed VCLOCK interval
+  // against the exact same selected PPS/VCLOCK reference interval used by
+  // OCXO Delta Cycles. This does not alter VCLOCK's GNSS identity authority.
+  const delta_residual_reference_t vclock_delta_reference =
+      delta_residual_capture_vclock_reference(public_count,
+                                              vclock_valid,
+                                              vclock_f);
+  delta_residual_apply_one(row,
+                           vclock_delta_reference,
+                           vclock_valid,
+                           vclock_f);
+
   row.prior_edge_gnss_ns = beta_i64_from_u64_saturating(public_gnss_ns) -
                            beta_i64_from_u64_saturating(CLOCKS_BETA_NS_PER_SECOND);
   row.current_edge_gnss_ns = beta_i64_from_u64_saturating(public_gnss_ns);
@@ -6878,7 +6899,9 @@ static FLASHMEM void payload_add_ocxo_science_object(Payload& lane,
                                             bool reported_valid,
                                             uint64_t reported_gnss_interval_ns,
                                             uint64_t reported_clock_interval_ns,
-                                            int64_t reported_fast_residual_ns) {
+                                            int64_t reported_fast_residual_ns,
+                                            bool forensics_valid,
+                                            const clocks_alpha_lane_forensics_t& forensics) {
   Payload science;
   payload_add_clock_science_common(science, row);
   science.add("edge_species",
@@ -6910,6 +6933,8 @@ static FLASHMEM void payload_add_ocxo_science_object(Payload& lane,
               (reported_valid && row.valid)
                   ? (reported_fast_residual_ns - row.fast_residual_ns)
                   : 0LL);
+  science.add("service_offset_ticks",
+              forensics_valid ? forensics.diag_service_offset_signed_ticks : 0);
   lane.add_object("science", science);
 }
 
@@ -7431,6 +7456,13 @@ static FLASHMEM void payload_add_counterledger_candidate_object(
   phase.add("next_ocxo_dwt_at_edge", c.phase_next_ocxo_dwt_at_edge);
   phase.add("ocxo_interval_cycles", c.phase_ocxo_interval_cycles);
   phase.add("pps_delta_cycles", c.phase_pps_delta_cycles);
+  phase.add("counter_cell_check_valid",
+            c.phase_counter_cell_check_valid);
+  phase.add("implied_ticks_since_prev_edge",
+            c.phase_implied_ticks_since_prev_edge);
+  phase.add("tick_remainder_cycles", c.phase_tick_remainder_cycles);
+  phase.add("sampled_minus_implied_ticks",
+            c.phase_sampled_minus_implied_ticks);
   phase.add("phase_after_last_00_ns", c.phase_after_last_00_ns);
   phase.add("phase_to_next_00_ns", c.phase_to_next_00_ns);
   phase.add("raw_delta_ns", c.phase_raw_delta_ns);
@@ -7534,7 +7566,9 @@ static FLASHMEM void payload_add_ocxo_fragment(Payload& p,
                                       uint64_t public_gnss_ns,
                                       bool clockface_valid,
                                       bool recovery_degraded,
-                                      const clock_science_row_t& science_row) {
+                                      const clock_science_row_t& science_row,
+                                      bool forensics_valid,
+                                      const clocks_alpha_lane_forensics_t& forensics) {
   Payload lane;
 
   // Compact science surface.  The public OCXO clockface may be authored by
@@ -7581,7 +7615,9 @@ static FLASHMEM void payload_add_ocxo_fragment(Payload& p,
                                   pps_residual_valid,
                                   pps_gnss_interval_ns,
                                   pps_clock_interval_ns,
-                                  pps_fast_residual_ns);
+                                  pps_fast_residual_ns,
+                                  forensics_valid,
+                                  forensics);
 
   p.add_object(key, lane);
 }
@@ -9616,7 +9652,9 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
                               public_gnss_ns,
                               ocxo1_clockface_valid,
                               recover_degraded_science_hold,
-                              ocxo1_science);
+                              ocxo1_science,
+                              ocxo1_forensics_valid,
+                              ocxo1_forensics);
 
     timebase_build_stage(TIMEBASE_BUILD_STAGE_OCXO2);
     payload_add_ocxo_fragment(p,
@@ -9634,7 +9672,9 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
                               public_gnss_ns,
                               ocxo2_clockface_valid,
                               recover_degraded_science_hold,
-                              ocxo2_science);
+                              ocxo2_science,
+                              ocxo2_forensics_valid,
+                              ocxo2_forensics);
 
     timebase_build_stage(TIMEBASE_BUILD_STAGE_STATS);
     payload_add_stats_summary_hierarchical(p,

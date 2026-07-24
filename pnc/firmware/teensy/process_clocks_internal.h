@@ -384,6 +384,21 @@ struct clocks_alpha_ocxo_counterledger_snapshot_t {
   uint32_t phase_next_ocxo_dwt_at_edge = 0;
   uint32_t phase_ocxo_interval_cycles = 0;
   uint32_t phase_pps_delta_cycles = 0;
+
+  // Whole-cell reconciliation witness. PhaseLedger geometry independently
+  // identifies the last complete OCXO tick before PPS. Compare that implied
+  // counter identity with CounterLedger's ambient PPS sample without changing
+  // either authority. sampled_minus_implied_ticks should be zero when both
+  // methods selected the same 100 ns cell.
+  bool     phase_counter_cell_check_valid = false;
+  uint32_t phase_prev_ocxo_counter32_at_edge = 0;
+  uint32_t phase_next_ocxo_counter32_at_edge = 0;
+  uint32_t phase_implied_ticks_since_prev_edge = 0;
+  uint32_t phase_tick_remainder_cycles = 0;
+  uint32_t phase_implied_counter32_at_pps = 0;
+  uint32_t phase_sampled_counter32_at_pps = 0;
+  int32_t  phase_sampled_minus_implied_ticks = 0;
+
   uint32_t phase_after_last_00_ns = 0;
   uint32_t phase_to_next_00_ns = 0;
   int32_t  phase_raw_delta_ns = 0;
