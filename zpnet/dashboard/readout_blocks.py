@@ -1,858 +1,505 @@
 """
-ZPNet Dashboard Readout Blocks — v10 GNSS_RAW Edition
+ZPNet Dashboard Readout Blocks — TIMEBASE_V3 / SYSTEM 2026 Edition
 
-All readouts are derived directly from the authoritative SYSTEM snapshot
-or from direct process queries.
-
-v10 changes:
-  • GNSS_RAW synthetic clock domain added to tau, comparison, and
-    prediction readouts.  GNSS_RAW is a Pi-side clock synthesized
-    from the GF-8802's clock_drift_ppb (TPS1), representing the
-    environmental forcing function on an undisciplined crystal.
-  • _CLOCK_DOMAINS now includes five domains: GNSS, DWT, OCXO1,
-    OCXO2, GNSS_RAW.
-
-v9 changes:
-  • clocks_prediction_readout() displays Teensy prediction statistics
-    (pred_stddev, pred_n, pred_residual) for DWT, OCXO1, and OCXO2.
-  • Dual OCXO.  _CLOCK_DOMAINS includes OCXO1 and OCXO2.
-    All tau, prediction, and comparison readouts show four domains.
-    Baseline comparison handles ocxo1 and ocxo2 PPB keys.
-
-Invariants:
-  • No database access
-  • No aggregates
-  • No events
-  • No inference beyond explicit tests
-  • Always fresh
-  • Defenseless (exceptions propagate to outer fault barrier)
-
-Author: The Mule + GPT
+The rotating pygame dashboard is an observer. Clock science is read from the
+Pi CLOCKS report backed by the latest accepted TIMEBASE row. Platform, feature,
+environment, power, and transport state is read from the Pi SYSTEM snapshot.
+No dashboard panel reconstructs firmware statistics or polls Teensy CLOCKS
+imperatively.
 """
-import logging
+from __future__ import annotations
+
+import math
 from collections.abc import Generator
 
 from zpnet.processes.processes import send_command
 
-log = logging.getLogger("zpnet.dashboard")
+VREF = 5.0
+DAC_CODE_SCALE = 65536.0
 
-# ---------------------------------------------------------------------
-# Shared SYSTEM snapshot fetcher (AUTHORITATIVE)
-# ---------------------------------------------------------------------
 
 def get_system_snapshot() -> dict:
     return send_command(machine="PI", subsystem="SYSTEM", command="REPORT")["payload"]
 
-def get_teensy_clocks_report() -> dict:
-    return send_command(machine="TEENSY", subsystem="CLOCKS", command="REPORT")["payload"]
 
 def get_pi_clocks_report() -> dict:
     return send_command(machine="PI", subsystem="CLOCKS", command="REPORT")["payload"]
 
-# ---------------------------------------------------------------------
-# GNSS REPORT (snapshot)
-# ---------------------------------------------------------------------
-
-def gnss_report_readout() -> Generator[str, None, None]:
-    g = get_system_snapshot()["gnss"]
-
-    # Headline
-    yield f"GNSS REPORT: {g.get('lock_quality', 'UNKNOWN')}"
-
-    # Time validity & PPS
-    time_valid = g.get("time_valid")
-    pps_valid  = g.get("pps_valid")
-
-    yield (
-        f"TIME VALID: {'YES' if time_valid else 'NO'}"
-        f" | PPS: {'YES' if pps_valid else 'NO'}"
-    )
-
-    # UTC date/time
-    if "date" in g or "time" in g:
-        yield (
-            f"UTC: "
-            f"{g.get('date', '----')} "
-            f"{g.get('time', '--:--:--')}"
-        )
-
-    # Discipline & constellations
-    if "discipline" in g or "position_mode" in g:
-        yield (
-            f"DISCIPLINE: {g.get('discipline', 'N/A')}"
-            f" | MODE: {g.get('position_mode', '---')}"
-        )
-
-    # Satellites & geometry
-    if "satellites" in g or "hdop" in g:
-        yield (
-            f"SATELLITES: {g.get('satellites', '?')}"
-            f" | HDOP: {g.get('hdop', float('nan')):.2f}"
-        )
-
-    # Position
-    if "latitude_deg" in g and "longitude_deg" in g:
-        yield f"LATITUDE:  {g['latitude_deg']:.6f}°"
-        yield f"LONGITUDE: {g['longitude_deg']:.6f}°"
-
-    # Altitude stack
-    if "altitude_m" in g:
-        yield f"ALTITUDE (MSL): {g['altitude_m']:.1f} m"
-
-    if "ellipsoid_height_m" in g or "geoid_sep_m" in g:
-        yield (
-            f"ELLIPSOID: {g.get('ellipsoid_height_m', float('nan')):.1f} m"
-            f" | GEOID Δ: {g.get('geoid_sep_m', float('nan')):.1f} m"
-        )
-
-    # Motion (optional but compact)
-    if "speed_knots" in g or "course_deg" in g:
-        yield (
-            f"SPEED / COURSE: "
-            f"{g.get('speed_knots', 0.0):.2f} kn"
-            f" / {g.get('course_deg', 0.0):.1f}°"
-        )
-
-
-# ---------------------------------------------------------------------
-# CLOCKS — shared helpers
-# ---------------------------------------------------------------------
-
-# Five clock domains: GNSS (reference), GNSS_RAW (synthetic), DWT, OCXO1, OCXO2
-_CLOCK_DOMAINS = [
-    ("GNSS", "gnss"),
-    ("GN_RAW", "gnss_raw"),
-    ("DWT", "dwt"),
-    ("OCXO1", "ocxo1"),
-    ("OCXO2", "ocxo2"),
-]
-
-# Teensy-owned clock domains (have prediction stats)
-_TEENSY_CLOCK_DOMAINS = [
-    ("DWT", "dwt"),
-    ("OCXO1", "ocxo1"),
-    ("OCXO2", "ocxo2"),
-]
-
 
 def _get_clocks_baseline() -> dict | None:
-    """Fetch baseline info from CLOCKS subsystem. Returns payload or None."""
     try:
-        resp = send_command(machine="PI", subsystem="CLOCKS", command="BASELINE_INFO")
-        if resp.get("success"):
-            p = resp.get("payload", {})
-            if p.get("baseline_set"):
-                return p
+        response = send_command(machine="PI", subsystem="CLOCKS", command="BASELINE_INFO")
+        payload = response.get("payload", {})
+        return payload if response.get("success") and payload.get("baseline_set") else None
     except Exception:
-        pass
+        return None
+
+
+def _dict(value) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
+def _path_get(obj, path: str, default=None):
+    cur = obj
+    for part in path.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            return default
+        cur = cur.get(part)
+    return default if cur is None else cur
+
+
+def _payload_root(report: dict) -> dict:
+    return _dict(report.get("payload")) or _dict(report)
+
+
+def _fragment_root(report: dict) -> dict:
+    root = _payload_root(report)
+    return _dict(root.get("fragment")) or root
+
+
+def _field(report: dict, *paths, default=None):
+    root = _payload_root(report)
+    fragment = _fragment_root(report)
+    for source in (fragment, root):
+        for path in paths:
+            value = _path_get(source, path, None)
+            if value is not None:
+                return value
+    return default
+
+
+def _extra(report: dict, path: str, default=None):
+    root = _payload_root(report)
+    value = _path_get(_dict(root.get("extra_clocks")), path, None)
+    return default if value is None else value
+
+
+def _to_int(value):
+    try:
+        return None if value is None else int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_float(value):
+    try:
+        return None if value is None else float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_bool(value):
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text in {"true", "1", "yes", "on"}:
+        return True
+    if text in {"false", "0", "no", "off"}:
+        return False
     return None
 
 
-def _clocks_header() -> tuple[dict | None, str]:
-    """Fetch clocks report; return (report_dict, header_line) or (None, status)."""
-    p = get_pi_clocks_report()
-    state = p.get("report", {}).get("campaign_state") or p.get("campaign_state", "IDLE")
-    if state != "STARTED":
-        return None, f"CLOCKS: {state}"
-    r = p["report"]
-    campaign = r.get("campaign", "?")
-    elapsed = r.get("campaign_elapsed", "00:00:00")
-    n = r.get("pps_count", 0)
-    return r, f"CLOCKS: {campaign} {elapsed} n={n}"
+def _num(value, decimals=3, signed=False, suffix="") -> str:
+    number = _to_float(value)
+    if number is None or not math.isfinite(number):
+        return "---"
+    sign = "+" if signed else ""
+    return f"{number:{sign}.{decimals}f}{suffix}"
 
 
-# ---------------------------------------------------------------------
-# CLOCKS 1/5 — Tau
-# ---------------------------------------------------------------------
+def _integer(value, comma=False, signed=False) -> str:
+    number = _to_int(value)
+    if number is None:
+        return "---"
+    if comma and signed:
+        return f"{number:+,d}"
+    if comma:
+        return f"{number:,d}"
+    return f"{number:+d}" if signed else str(number)
+
+
+def _yes_no(value) -> str:
+    flag = _to_bool(value)
+    return "YES" if flag is True else "NO" if flag is False else "---"
+
+
+def _clock_report() -> tuple[dict | None, str]:
+    payload = get_pi_clocks_report()
+    report = _dict(payload.get("report")) or payload
+    state = report.get("campaign_state") or payload.get("campaign_state")
+    if state is None:
+        state = "STARTED" if _fragment_root(report) else "IDLE"
+    if str(state).upper() != "STARTED":
+        return None, f"CLOCKS: {str(state).upper()}"
+
+    campaign = report.get("campaign", "?")
+    elapsed = report.get("campaign_elapsed", "00:00:00")
+    count = _to_int(_field(report, "teensy_pps_vclock_count", "teensy_pps_count", "pps_count")) or 0
+    return report, f"CLOCKS: {campaign} {elapsed} n={count}"
+
+
+def _frequency(report: dict, lane: str) -> tuple[float | None, float | None]:
+    if lane == "gnss":
+        return 1.0, 0.0
+    if lane == "gnss_raw":
+        tau = _to_float(_extra(report, "gnss_raw_tau"))
+        ppb = _to_float(_extra(report, "gnss_raw_ppb"))
+        return tau, ppb
+    tau = _to_float(_field(report, f"stats.{lane}.tau", f"{lane}_tau"))
+    ppb = _to_float(_field(report, f"stats.{lane}.ppb", f"{lane}_ppb"))
+    return tau, ppb
+
+
+def _welford(report: dict, lane: str, field: str):
+    paths = [f"stats.{lane}.welford.{field}", f"stats.{lane}.{field}", f"{lane}_welford_{field}"]
+    if lane.endswith("_dac"):
+        clock = lane[:-4]
+        paths.insert(0, f"stats.dac.{clock}.{field}")
+    return _field(report, *paths)
+
+
+def _prediction(report: dict, lane: str, field: str):
+    aliases = {
+        "prediction_cycles": ("prediction_cycles", "static_prediction_cycles"),
+        "actual_cycles": ("actual_cycles",),
+        "residual_cycles": ("residual_cycles", "static_residual_cycles"),
+        "completed_interval_count": ("completed_interval_count",),
+        "valid": ("valid", "prediction_valid", "static_prediction_valid"),
+    }.get(field, (field,))
+    paths = []
+    for alias in aliases:
+        paths.extend((f"prediction.{lane}.{alias}", f"prediction.{lane}_{alias}", f"{lane}_{alias}"))
+    return _field(report, *paths)
+
+
+def _ocxo_residual(report: dict, lane: str):
+    return _field(report,
+                  f"{lane}.pps_residual.fast_residual_ns",
+                  f"{lane}.science.fast_residual_ns",
+                  f"{lane}_second_residual_ns")
+
+
+def _dac_value(report: dict, lane: str):
+    return _to_float(_field(report,
+                            f"dac.{lane}_dac",
+                            f"dac.{lane}.value",
+                            f"dac.{lane}.dac",
+                            f"stats.dac.{lane}.value",
+                            f"stats.dac.{lane}.mean",
+                            f"{lane}_dac"))
+
+
+def _dac_voltage(code) -> float | None:
+    value = _to_float(code)
+    return None if value is None else value * VREF / DAC_CODE_SCALE
+
+
+def _servo_mode(report: dict) -> str:
+    for path in ("dac.servo_mode", "dac.calibrate_ocxo", "servo.mode", "servo_mode", "calibrate_ocxo"):
+        value = _field(report, path)
+        if value is not None and str(value).strip():
+            text = str(value).strip().upper()
+            return "IDLE" if text in {"OFF", "NONE", "IDLE"} else text
+    return "IDLE"
+
+
+def _dither_label(code) -> str:
+    value = _to_float(code)
+    if value is None:
+        return "---"
+    low = int(value)
+    high = min(65535, low + 1)
+    high_ms = max(0, min(1000, int(round((value - low) * 1000.0))))
+    return f"{low}:{1000-high_ms:03d}/{high}:{high_ms:03d}"
+
+
+def gnss_report_readout() -> Generator[str, None, None]:
+    g = _dict(get_system_snapshot().get("gnss"))
+    discipline = _dict(g.get("discipline"))
+    clock = _dict(g.get("clock"))
+    integrity = _dict(g.get("integrity"))
+    survey = _dict(g.get("survey_mode"))
+    pps = _dict(g.get("pps"))
+
+    lock = g.get("lock_quality", "UNKNOWN")
+    yield f"GNSS REPORT: {lock}"
+    yield f"MODE: {integrity.get('pos_mode') or survey.get('receiver_mode') or g.get('pos_mode') or '?'}  DISC: {discipline.get('freq_mode_name') or g.get('freq_mode_name') or '?'}"
+    yield f"TIME: {clock.get('time_status_name') or g.get('time_status') or '?'}  PPS: {_yes_no(g.get('pps_valid'))}  TRAIM: {integrity.get('traim') or g.get('traim') or '?'}"
+    yield f"SATS: {_integer(g.get('satellites'))}  HDOP: {_num(g.get('hdop'), 2)}  PPS ERR: {_num(discipline.get('pps_timing_error_ns') or g.get('pps_timing_error_ns'), 1, True, ' ns')}"
+    if g.get("latitude_deg") is not None and g.get("longitude_deg") is not None:
+        yield f"LAT: {_num(g.get('latitude_deg'), 6)}  LON: {_num(g.get('longitude_deg'), 6)}"
+    yield f"ALT MSL: {_num(g.get('altitude_m'), 1, False, ' m')}  ELLIP: {_num(g.get('ellipsoid_height_m'), 1, False, ' m')}"
+    yield f"GEOID: {_num(g.get('geoid_sep_m'), 1, False, ' m')}  TEMP: {_num(clock.get('temperature_c') or g.get('temperature_c'), 1, False, ' C')}"
+
 
 def clocks_tau_readout() -> Generator[str, None, None]:
-    r, hdr = _clocks_header()
-    yield hdr
-    if r is None:
+    report, header = _clock_report()
+    yield header
+    if report is None:
         return
+    yield f"{'CLK':<7}{'TAU':>17}{'PPB':>12}"
+    for label, lane in (("GNSS", "gnss"), ("VCLOCK", "vclock"), ("OCXO1", "ocxo1"),
+                        ("OCXO2", "ocxo2"), ("GN_RAW", "gnss_raw"), ("DWT", "dwt")):
+        tau, ppb = _frequency(report, lane)
+        tau_text = "---" if tau is None else f"{tau:.12f}"
+        ppb_text = "---" if ppb is None else f"{ppb:+.3f}"
+        yield f"{label:<7}{tau_text:>17}{ppb_text:>12}"
 
-    yield f"{'CLK':<6} {'TAU':>16} {'PPB':>10}"
-    yield f"{'GNSS':<6} {'1.0000000000':>16} {'0.000':>10}"
-
-    for name, key in _CLOCK_DOMAINS[1:]:
-        blk = r.get(key, {})
-        tau = blk.get("tau")
-        ppb = blk.get("ppb")
-        if tau is not None and ppb is not None:
-            yield f"{name:<6} {tau:>16.10f} {ppb:>10.3f}"
-        else:
-            yield f"{name:<6} {'---':>16} {'---':>10}"
-
-
-# ---------------------------------------------------------------------
-# CLOCKS 2/5 — Prediction Statistics (v8, replaces Welford readout)
-# ---------------------------------------------------------------------
 
 def clocks_prediction_readout() -> Generator[str, None, None]:
-    """
-    Display Teensy prediction statistics for DWT, OCXO1, and OCXO2.
-
-    The prediction residual stddev is the authoritative interpolation
-    uncertainty metric — "how wrong is my best estimate of this
-    second's crystal rate?"
-
-    For DWT this is typically ~3-4 cycles (3-4 ns).
-    For OCXO1/OCXO2 this is typically ~1 tick (100 ns) when servo-locked.
-
-    GNSS is phase-coherent by definition (residual always 0), so
-    we show the stream health canary instead.
-
-    GNSS_RAW shows drift_ppb (the instantaneous GF-8802 clock drift)
-    instead of prediction stats (it has no Teensy predictor).
-    """
-    r, hdr = _clocks_header()
-    yield hdr
-    if r is None:
+    report, header = _clock_report()
+    yield header
+    if report is None:
         return
+    yield "STATIC PREDICTION (prior interval -> current)"
+    yield f"{'LANE':<6}{'PRED':>16}{'ACTUAL':>16}"
+    for label, lane in (("PPS", "pps"), ("VCLK", "vclock"), ("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")):
+        valid = _to_bool(_prediction(report, lane, "valid"))
+        pred = _to_int(_prediction(report, lane, "prediction_cycles"))
+        actual = _to_int(_prediction(report, lane, "actual_cycles"))
+        if valid is not True:
+            pred = actual = None
+        yield f"{label:<6}{_integer(pred, True):>16}{_integer(actual, True):>16}"
 
-    yield f"{'CLK':<6} {'RES':>6} {'MEAN':>8} {'SD':>8} {'N':>6}"
-
-    # GNSS — stream health canary (no prediction needed)
-    gnss_blk = r.get("gnss", {})
-    gnss_res = gnss_blk.get("pps_residual", 0)
-    yield f"{'GNSS':<6} {gnss_res:>6} {'---':>8} {'---':>8} {'---':>6}"
-
-    # GNSS_RAW — Pi-side Welford on drift_ppb
-    gnss_raw_blk = r.get("gnss_raw", {})
-    gnss_raw_n = gnss_raw_blk.get("pred_n")
-    if gnss_raw_n is not None and gnss_raw_n > 0:
-        gr_res = gnss_raw_blk.get("pred_residual", 0.0)
-        gr_mean = gnss_raw_blk.get("pred_mean", 0.0)
-        gr_sd = gnss_raw_blk.get("pred_stddev", 0.0)
-        yield f"{'GN_RAW':<6} {gr_res:>6.1f} {gr_mean:>8.3f} {gr_sd:>8.3f} {gnss_raw_n:>6}"
-    else:
-        yield f"{'GN_RAW':<6} {'---':>6} {'---':>8} {'---':>8} {'---':>6}"
-
-    # DWT, OCXO1, OCXO2 — Teensy prediction stats
-    for name, key in _TEENSY_CLOCK_DOMAINS:
-        blk = r.get(key, {})
-        pred_n = blk.get("pred_n")
-
-        if pred_n is not None and pred_n > 0:
-            res    = blk.get("pred_residual", 0)
-            mean   = blk.get("pred_mean", 0.0)
-            stddev = blk.get("pred_stddev", 0.0)
-            yield f"{name:<6} {res:>6} {mean:>8.3f} {stddev:>8.3f} {pred_n:>6}"
-        else:
-            # Not enough history yet (need 3 deltas for first scored prediction)
-            yield f"{name:<6} {'---':>6} {'---':>8} {'---':>8} {'---':>6}"
-
-
-# ---------------------------------------------------------------------
-# CLOCKS 3/5 — Comparison vs baseline
-# ---------------------------------------------------------------------
 
 def clocks_comparison_readout() -> Generator[str, None, None]:
-    r, hdr = _clocks_header()
-    yield hdr
-    if r is None:
+    report, header = _clock_report()
+    yield header
+    if report is None:
         return
-
     baseline = _get_clocks_baseline()
-    if baseline is None:
+    if not baseline:
         yield "NO BASELINE SET"
-        yield "USE: .pc clocks SET_BASELINE id=<N>"
+        yield "USE: .pc clocks set_baseline id=<N>"
         return
+    yield f"BASELINE: {baseline.get('baseline_campaign', '?')} (#{baseline.get('baseline_id', '?')})"
+    yield f"{'CLK':<7}{'BASE':>10}{'NOW':>10}{'DELTA':>10}"
+    baseline_ppb = _dict(baseline.get("baseline_ppb"))
+    for label, lane in (("GNSS", "gnss"), ("VCLK", "vclock"), ("OCXO1", "ocxo1"),
+                        ("OCXO2", "ocxo2"), ("GN_RAW", "gnss_raw"), ("DWT", "dwt")):
+        _, now = _frequency(report, lane)
+        base = _to_float(baseline_ppb.get(lane))
+        delta = None if base is None or now is None else now - base
+        yield f"{label:<7}{_num(base):>10}{_num(now):>10}{_num(delta, 3, True):>10}"
 
-    baseline_ppb = baseline.get("baseline_ppb", {})
-    baseline_id = baseline.get("baseline_id", "?")
-    baseline_campaign = baseline.get("baseline_campaign", "?")
-
-    yield f"BASELINE: {baseline_campaign} (#{baseline_id})"
-    yield f"{'CLK':<6} {'BASE':>10} {'NOW':>10} {'DELTA':>10}"
-
-    for name, key in _CLOCK_DOMAINS:
-        blk = r.get(key, {})
-        base_ppb = baseline_ppb.get(key)
-        now_ppb = blk.get("ppb")
-
-        if base_ppb is not None and now_ppb is not None:
-            delta = now_ppb - base_ppb
-            yield f"{name:<6} {base_ppb:>10.3f} {now_ppb:>10.3f} {delta:>+10.3f}"
-        else:
-            yield f"{name:<6} {'---':>10} {'---':>10} {'---':>10}"
-
-    # DAC mean baseline comparison (TEMPEST DAC test)
-    baseline_dac_mean = baseline.get("baseline_dac_mean", {})
-    if baseline_dac_mean:
-        yield f"{'DAC':<6} {'BASE':>10} {'NOW':>10} {'DELTA':>10}"
-        for name, key in [("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")]:
-            blk = r.get(key, {})
-            base_dac = baseline_dac_mean.get(key)
-            now_dac = blk.get("dac_mean")
-
-            if base_dac is not None and now_dac is not None:
-                delta = now_dac - base_dac
-                yield f"{name:<6} {base_dac:>10.3f} {now_dac:>10.3f} {delta:>+10.3f}"
-            else:
-                yield f"{name:<6} {'---':>10} {'---':>10} {'---':>10}"
-
-
-# ---------------------------------------------------------------------
-# CLOCKS 4/5 — OCXO Servo Status
-# ---------------------------------------------------------------------
 
 def clocks_servo_readout() -> Generator[str, None, None]:
-    """
-    Display OCXO1 and OCXO2 servo/DAC state from the Teensy CLOCKS report.
-    """
-    try:
-        t = get_teensy_clocks_report()
-    except Exception:
-        yield "SERVO: UNAVAILABLE"
+    report, header = _clock_report()
+    yield header
+    if report is None:
         return
+    yield f"SERVO: {_servo_mode(report)}"
+    yield f"{'OCXO':<6}{'DAC':>10}{'VOUT':>9}{'RES NS':>9}{'PPB':>9}"
+    for label, lane in (("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")):
+        code = _dac_value(report, lane)
+        volts = _dac_voltage(code)
+        _, ppb = _frequency(report, lane)
+        residual = _to_int(_ocxo_residual(report, lane))
+        yield f"{label:<6}{_num(code):>10}{_num(volts, 6):>9}{_integer(residual, False, True):>9}{_num(ppb, 3, True):>9}"
+        yield f"  DITHER: {_dither_label(code)}"
 
-    cal = t.get("calibrate_ocxo", "OFF")
-    yield f"SERVO: {cal if cal and cal != 'OFF' else 'IDLE'}"
-
-    for label, dac_key, adj_key, res_key in [
-        ("OCXO1", "ocxo1_dac", "ocxo1_servo_adjustments", "isr_residual_ocxo1"),
-        ("OCXO2", "ocxo2_dac", "ocxo2_servo_adjustments", "isr_residual_ocxo2"),
-    ]:
-        dac = t.get(dac_key)
-        adj = t.get(adj_key, 0)
-        res = t.get(res_key)
-
-        if dac is not None:
-            res_str = f"{res:+d}" if res is not None else "---"
-            yield f"{label:<6} DAC={dac:>10.3f}  ADJ={adj:>4}  RES={res_str}"
-        else:
-            yield f"{label:<6} ---"
-
-
-# ---------------------------------------------------------------------
-# CLOCKS — DAC Welford Statistics (TEMPEST DAC test)
-# ---------------------------------------------------------------------
 
 def clocks_dac_welford_readout() -> Generator[str, None, None]:
-    """
-    Display campaign-cumulative Welford statistics on OCXO DAC values.
-
-    These are the masthead facts for the TEMPEST DAC test: the true
-    campaign mean of each OCXO's DAC fractional value.  When both
-    means shift in tandem across campaigns under different environmental
-    conditions, even a tiny correlated shift is a candidate signal.
-    """
-    r, hdr = _clocks_header()
-    yield hdr
-    if r is None:
+    report, header = _clock_report()
+    yield header
+    if report is None:
         return
-
     yield "DAC WELFORD (campaign cumulative)"
-    yield f"{'OCXO':<6} {'MEAN':>10} {'SD':>8} {'SE':>8} {'MIN':>10} {'MAX':>10} {'N':>6}"
-
-    for name, key in [("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")]:
-        blk = r.get(key, {})
-        dac_n = blk.get("dac_n")
-
-        if dac_n is not None and dac_n > 0:
-            mean   = blk.get("dac_mean", 0.0)
-            stddev = blk.get("dac_stddev", 0.0)
-            stderr = blk.get("dac_stderr", 0.0)
-            mn     = blk.get("dac_min", 0.0)
-            mx     = blk.get("dac_max", 0.0)
-            yield (
-                f"{name:<6} {mean:>10.3f} {stddev:>8.3f} {stderr:>8.3f}"
-                f" {mn:>10.3f} {mx:>10.3f} {dac_n:>6}"
-            )
-        else:
-            yield f"{name:<6} {'---':>10} {'---':>8} {'---':>8} {'---':>10} {'---':>10} {'---':>6}"
-
-# ---------------------------------------------------------------------
-# CLOCKS 5/5 — GNSS_RAW detail
-# ---------------------------------------------------------------------
-
-def clocks_gnss_raw_readout() -> Generator[str, None, None]:
-    """
-    Display GNSS_RAW synthetic clock detail from the Pi CLOCKS report.
-    Shows the GF-8802 internal TCXO behavior as a clock domain.
-    """
-    r, hdr = _clocks_header()
-    yield hdr
-    if r is None:
-        return
-
-    yield "GNSS RAW CLOCK (GF-8802 TCXO drift)"
-
-    blk = r.get("gnss_raw", {})
-    tau = blk.get("tau")
-    ppb = blk.get("ppb")
-    drift = blk.get("drift_ppb")
-
-    if tau is not None:
-        yield f"  TAU:       {tau:.12f}"
-    else:
-        yield f"  TAU:       ---"
-
-    if ppb is not None:
-        yield f"  PPB:       {ppb:+.3f}"
-    else:
-        yield f"  PPB:       ---"
-
-    if drift is not None:
-        yield f"  DRIFT NOW: {drift:+.3f} ppb"
-    else:
-        yield f"  DRIFT NOW: ---"
+    yield f"{'OCXO':<6}{'MEAN':>10}{'SD':>8}{'SE':>8}{'N':>7}"
+    for label, lane in (("OCXO1", "ocxo1_dac"), ("OCXO2", "ocxo2_dac")):
+        yield f"{label:<6}{_num(_welford(report, lane, 'mean')):>10}{_num(_welford(report, lane, 'stddev')):>8}{_num(_welford(report, lane, 'stderr')):>8}{_integer(_welford(report, lane, 'n')):>7}"
+        yield f"  MIN {_num(_welford(report, lane, 'min'))}  MAX {_num(_welford(report, lane, 'max'))}"
 
 
-# ---------------------------------------------------------------------
-# SENSOR SCAN
-# ---------------------------------------------------------------------
+_FEATURE_CELLS = (
+    ("T SYS", "TEENSY.SYSTEM.FEATURE_STATUS"),
+    ("OBS EDGE", "TEENSY.INTERRUPT.OBSERVED_EDGE_AUTHORITY"),
+    ("PPS/V", "TEENSY.INTERRUPT.PPS_VCLOCK_AUTHORITY"),
+    ("QTIMER", "TEENSY.INTERRUPT.QTIMER_COUNTER_CUSTODY"),
+    ("CTR32", "TEENSY.INTERRUPT.COUNTER32_LINEAGE"),
+    ("DWT CAL", "TEENSY.CLOCKS.DWT_CALIBRATION"),
+    ("PRED", "TEENSY.CLOCKS.STATIC_PREDICTION"),
+    ("SMARTZERO", "TEENSY.CLOCKS.SMARTZERO"),
+    ("EPOCH", "TEENSY.CLOCKS.ALPHA_EPOCH"),
+    ("ORIGIN", "TEENSY.CLOCKS.OCXO_PUBLIC_ORIGIN"),
+    ("SCIENCE", "TEENSY.CLOCKS.SCIENCE_RESIDUALS"),
+    ("TIMEBASE", "TEENSY.CLOCKS.TIMEBASE_PUBLICATION"),
+    ("PI NET", "PI.SYSTEM.NETWORK"),
+    ("PI GNSS", "PI.GNSS.REPORT"),
+    ("PI POWER", "PI.SYSTEM.POWER"),
+    ("PI HOST", "PI.SYSTEM.HOST"),
+)
+
+
+def feature_status_readout() -> Generator[str, None, None]:
+    features = _dict(get_system_snapshot().get("features"))
+    yield "FEATURE READINESS"
+    cells = []
+    for label, path in _FEATURE_CELLS:
+        value = _path_get(features, path, "---")
+        cells.append(f"{label}:{str(value).upper()}")
+    for index in range(0, len(cells), 2):
+        left = cells[index]
+        right = cells[index + 1] if index + 1 < len(cells) else ""
+        yield f"{left:<21}{right}"
+
 
 def sensor_scan_readout() -> Generator[str, None, None]:
-    sensors = get_system_snapshot()["sensors"]
-
-    health = sensors.get("health_state", "UNKNOWN")
-    yield f"SENSOR SCAN: {health}"
-
-    for bus_key, devices in sensors.items():
-        # Skip roll-up key
-        if bus_key == "health_state":
+    sensors = _dict(get_system_snapshot().get("sensors"))
+    yield f"SENSOR SCAN: {sensors.get('health_state', 'UNKNOWN')}"
+    found = False
+    for bus_name, devices in sensors.items():
+        if not str(bus_name).startswith("i2c-") or not isinstance(devices, dict):
             continue
+        for address, state in devices.items():
+            found = True
+            yield f"{str(bus_name).upper():<7}{str(address).upper():<7}{str(state).upper()}"
+    if not found:
+        yield "NO SENSOR INVENTORY"
 
-        # bus_key is "i2c-1", "i2c-2", etc.
-        bus_num = bus_key.split("-")[1]
-
-        for name, state in devices.items():
-            yield f"{bus_num} {name.upper()}: {state}"
-
-
-# ---------------------------------------------------------------------
-# ENVIRONMENT
-# ---------------------------------------------------------------------
 
 def environment_status_readout() -> Generator[str, None, None]:
-    e = get_system_snapshot()["environment"]
+    env = _dict(get_system_snapshot().get("environment"))
+    yield f"ENVIRONMENT: {env.get('health_state', 'UNKNOWN')}"
+    yield f"TEMP: {_num(env.get('temperature_c'), 2, False, ' C')}"
+    yield f"HUMIDITY: {_num(env.get('humidity_pct'), 2, False, ' %')}"
+    yield f"PRESSURE: {_num(env.get('pressure_hpa'), 2, False, ' HPA')}"
+    yield f"BARO ALT: {_num(env.get('altitude_m'), 1, False, ' M')}"
+    yield f"READ OK: {_yes_no(env.get('read_ok'))}  STALE: {_yes_no(env.get('stale'))}"
+    yield f"FAILURES: {_integer(env.get('read_fail_count'))}  RECOVERIES: {_integer(env.get('recovery_count'))}"
 
-    yield f"ENVIRONMENT: {e['health_state']}"
-    yield f"TEMPERATURE: {e['temperature_c']:.2f} C"
-    yield f"HUMIDITY: {e['humidity_pct']:.2f} %"
-    yield f"PRESSURE: {e['pressure_hpa']:.2f} HPA"
-    yield f"ALTITUDE: {e['altitude_m']:.1f} M"
-
-
-# ---------------------------------------------------------------------
-# LASER
-# ---------------------------------------------------------------------
-
-def laser_status_readout() -> Generator[str, None, None]:
-    l = get_system_snapshot()["laser"]
-
-    yield f"LASER STATUS: {l['health_state']}"
-    yield f"I2C ADDRESS: {l['i2c_address']}"
-    yield f"SYSTEM ENABLED: {'YES' if l['sys_enabled'] else 'NO'}"
-    yield f"ID1 ENABLED: {'YES' if l['id1_enabled'] else 'NO'}"
-    yield f"ID1 CURRENT: {l['id1_current_ma']:.2f} MA"
-    yield f"LASER EMITTING: {'YES' if l['laser_emitting'] else 'NO'}"
-    yield f"PD VOLTAGE: {l['pd_voltage']:.4f} V"
-
-
-# ---------------------------------------------------------------------
-# NETWORK
-# ---------------------------------------------------------------------
 
 def network_status_readout() -> Generator[str, None, None]:
-    n = get_system_snapshot()["network"]
+    net = _dict(get_system_snapshot().get("network"))
+    yield f"NETWORK STATUS: {net.get('network_status', 'UNKNOWN')}"
+    yield f"SSID: {net.get('ssid') or '---'}"
+    yield f"LOCAL IP: {net.get('local_ip') or '---'}"
+    yield f"PING: {_num(net.get('ping_ms'), 2, False, ' MS')}"
+    yield f"DOWNLOAD: {_num(net.get('download_mbps'), 2, False, ' MBPS')}"
+    yield f"UPLOAD: {_num(net.get('upload_mbps'), 2, False, ' MBPS')}"
 
-    yield f"NETWORK STATUS: {n['network_status']}"
-    yield f"SSID: {n['ssid']}"
-    yield f"LOCAL IP: {n['local_ip']}"
-    yield f"PING: {n['ping_ms']:.2f} MS"
-    yield f"DOWNLOAD: {n['download_mbps']:.2f} MBPS"
-    yield f"UPLOAD: {n['upload_mbps']:.2f} MBPS"
 
+def _power_rails(snapshot: dict) -> list[dict]:
+    rails = []
+    for bus_name, devices in _dict(snapshot.get("power")).items():
+        if str(bus_name).startswith("i2c-") and isinstance(devices, dict):
+            for value in devices.values():
+                if isinstance(value, dict):
+                    rails.append(value)
+    return rails
 
-# ---------------------------------------------------------------------
-# POWER STATUS
-# ---------------------------------------------------------------------
 
 def power_status_readout() -> Generator[str, None, None]:
-    p = get_system_snapshot()["power"]
+    snapshot = get_system_snapshot()
+    power = _dict(snapshot.get("power"))
+    yield f"POWER STATUS: {power.get('health_state', 'UNKNOWN')}"
+    load = 0.0
+    for rail in _power_rails(snapshot):
+        label = str(rail.get("label", "UNKNOWN"))[:13].upper()
+        volts = _to_float(rail.get("volts"))
+        amps = _to_float(rail.get("amps"))
+        watts = _to_float(rail.get("watts"))
+        stale = " *" if rail.get("stale") else ""
+        current = "---" if amps is None else f"{int(round(amps))}mA"
+        yield f"{label:<13}{_num(volts,3):>7}V {current:>8} {_num(watts,3):>7}W{stale}"
+        if label != "BATTERY" and watts is not None:
+            load += watts
+    yield f"TOTAL LOAD: {load:.3f} W   *=STALE"
 
-    yield f"POWER STATUS: {p['health_state']}"
-
-    load_total = 0.0
-    battery_power = None
-
-    for bus_key, devices in p.items():
-        if bus_key == "health_state":
-            continue
-
-        # bus_key is "i2c-1", "i2c-2", etc.
-        bus_num = bus_key.split("-")[1]
-
-        for _, r in devices.items():
-            label = r.get("label", "UNKNOWN")
-            v  = r["volts"]
-            i  = r["amps"]
-            pw = r["watts"]
-
-            yield f"{label.upper():<14} {v:>6.3f} V {i:>7.1f} MA {pw:>6.3f} W"
-
-            if label.lower() == "battery":
-                battery_power = pw
-            else:
-                load_total += pw
-
-    yield f"TOTAL LOAD POWER: {load_total:.3f} W"
-
-    if battery_power and battery_power > 0:
-        yield f"EFFICIENCY: {(load_total / battery_power) * 100.0:.1f} %"
-
-
-# ---------------------------------------------------------------------
-# BATTERY STATUS
-# ---------------------------------------------------------------------
 
 def battery_status_readout() -> Generator[str, None, None]:
-    p = get_system_snapshot()["power"]
+    snapshot = get_system_snapshot()
+    battery = _dict(snapshot.get("battery"))
+    rail = next((r for r in _power_rails(snapshot) if str(r.get("label", "")).lower() == "battery"), {})
+    yield f"BATTERY STATUS: {battery.get('health_state', 'UNKNOWN')}"
+    yield f"REMAINING: {_num(battery.get('remaining_pct'), 1, False, ' %')}"
+    tte = _to_float(battery.get("tte_minutes"))
+    yield f"TIME TO EMPTY: {'---' if tte is None or not math.isfinite(tte) else f'{tte:.1f} MIN'}"
+    yield f"VOLTAGE: {_num(rail.get('volts'), 3, False, ' V')}"
+    yield f"CURRENT: {_num(rail.get('amps'), 3, False, ' A')}"
+    yield f"POWER: {_num(rail.get('watts'), 3, False, ' W')}"
+    yield f"USED: {_num(battery.get('wh_used_since_recharge'), 2, False, ' WH')}  LEFT: {_num(battery.get('wh_remaining_estimate'), 2, False, ' WH')}"
+    yield f"SAMPLES: {_integer(battery.get('samples_used'))}"
 
-    yield f"BATTERY STATUS: {p['health_state']}"
-
-    # Flatten all rails across all I2C buses
-    rails = []
-    for bus_name, bus in p.items():
-        if bus_name == "health_state":
-            continue
-        if isinstance(bus, dict):
-            rails.extend(bus.values())
-
-    # Find the battery rail
-    battery = next(
-        r for r in rails
-        if r.get("label", "").lower() == "battery"
-    )
-
-    yield f"VOLTAGE: {battery['volts']:.3f} V"
-    yield f"CURRENT: {battery['amps']:.1f} MA"
-    yield f"POWER:   {battery['watts']:.3f} W"
-
-    if battery.get("ideal_voltage_v") is not None:
-        yield f"IDEAL VOLTAGE: {battery['ideal_voltage_v']:.1f} V"
-
-
-# ---------------------------------------------------------------------
-# TEENSY
-# ---------------------------------------------------------------------
 
 def teensy_status_readout() -> Generator[str, None, None]:
-    t = get_system_snapshot()["teensy"]
+    teensy = _dict(get_system_snapshot().get("teensy"))
+    usage_milli = _to_float(teensy.get("cpu_usage_pct_milli"))
+    idle_milli = _to_float(teensy.get("cpu_idle_spin_pct_milli"))
+    yield f"TEENSY STATUS: {teensy.get('health_state', 'UNKNOWN')}"
+    yield f"FW VERSION: {teensy.get('fw_version', '---')}"
+    yield f"CPU: {_integer(teensy.get('cpu_freq_mhz'))} MHZ"
+    yield f"WORK: {'---' if usage_milli is None else f'{usage_milli/1000.0:.3f}%'}  IDLE: {'---' if idle_milli is None else f'{idle_milli/1000.0:.3f}%'}"
+    yield f"WALL CYCLES: {_integer(teensy.get('cpu_wall_cycles'), True)}"
+    yield f"CRASH REPORT: {'PRESENT' if teensy.get('crash_report_present') else 'NONE'}"
+    yield f"FEATURE COURT: {'OK' if teensy.get('feature_status_foreground_court_ok') else 'ANOMALY'}"
 
-    yield f"TEENSY STATUS: {t['health_state']}"
-    yield f"FW VERSION: {t['fw_version']}"
-    yield f"CPU TEMP: {t['cpu_temp_c']:.2f} C"
-    yield f"CPU USAGE: {t['cpu_usage_pct']:.4f} %"
-    yield f"FREE HEAP: {t['free_heap_bytes']} BYTES"
-
-
-# ---------------------------------------------------------------------
-# PHOTODIODE STATUS (laser-owned ground truth)
-# ---------------------------------------------------------------------
-
-def photodiode_status_readout() -> Generator[str, None, None]:
-    l = get_system_snapshot()["laser"]
-
-    yield f"PHOTODIODE STATUS: {l['health_state']}"
-    yield f"ANALOG VOLTAGE: {l['pd_voltage']:.5f} V"
-    yield f"LIGHT PRESENT: {'YES' if l['laser_emitting'] else 'NO'}"
-
-
-# ---------------------------------------------------------------------
-# RASPBERRY PI
-# ---------------------------------------------------------------------
 
 def raspberry_pi_status_readout() -> Generator[str, None, None]:
-    p = get_system_snapshot()["pi"]
-    mem = p["memory"]
-    disk = p["disk"]
-    uv = p["undervoltage_flags"]
-
-    yield f"RASPBERRY PI STATUS: {p['health_state']}"
-    yield f"DEVICE: {p['device_name']}"
-    yield f"CPU TEMP: {p['cpu_temp_c']:.1f} C"
-    yield f"LOAD (1/5/15): {p['load_1m']:.2f} / {p['load_5m']:.2f} / {p['load_15m']:.2f}"
-    yield f"UPTIME: {p['uptime_s'] / 3600:.2f} H"
-    yield f"MEM USED: {mem['used_mb']:.0f} / {mem['total_mb']:.0f} MB ({mem['percent']:.1f}%)"
-    yield f"DISK USED: {disk['used_gb']:.2f} / {disk['total_gb']:.2f} GB ({disk['percent']:.1f}%)"
-
-    if uv["currently_undervolted"]:
+    pi = _dict(get_system_snapshot().get("pi"))
+    memory = _dict(pi.get("memory"))
+    disk = _dict(pi.get("disk"))
+    uv = _dict(pi.get("undervoltage_flags"))
+    yield f"RASPBERRY PI STATUS: {pi.get('health_state', 'UNKNOWN')}"
+    yield f"DEVICE: {pi.get('device_name', '---')}"
+    yield f"CPU TEMP: {_num(pi.get('cpu_temp_c'), 1, False, ' C')}"
+    yield f"LOAD 1/5/15: {_num(pi.get('load_1m'),2)} / {_num(pi.get('load_5m'),2)} / {_num(pi.get('load_15m'),2)}"
+    uptime = _to_float(pi.get("uptime_s"))
+    yield f"UPTIME: {'---' if uptime is None else f'{uptime/3600.0:.2f} H'}"
+    yield f"MEM: {_num(memory.get('used_mb'),0)} / {_num(memory.get('total_mb'),0)} MB ({_num(memory.get('percent'),1)}%)"
+    yield f"DISK: {_num(disk.get('used_gb'),2)} / {_num(disk.get('total_gb'),2)} GB ({_num(disk.get('percent'),1)}%)"
+    if uv.get("currently_undervolted"):
         yield "UNDERVOLTAGE: ACTIVE"
-    elif uv["previously_undervolted"]:
+    elif uv.get("previously_undervolted"):
         yield "UNDERVOLTAGE: RECOVERED"
     else:
         yield "UNDERVOLTAGE: NONE"
 
-"""
-Teensy Subsystem Health Readout
 
-Renders independent Pi-side health judgment for:
-  • Process (RPC pipeline invariants)
-  • Transport (TX/RX accounting, framing errors)
-  • Payload (allocator health, leak detection)
-  • Memory (heap growth, stack usage, fragmentation)
+def _process_health(proc: dict) -> str:
+    checks = ("rpc_counter_order_ok", "invariant_received_ok", "invariant_routed_ok",
+              "invariant_handler_ok", "invariant_response_ok")
+    return "NOMINAL" if all(proc.get(key) is True for key in checks) else "ANOMALY"
 
-Health levels:
-  NOMINAL  — all invariants hold, counters are healthy
-  ANOMALY  — something unexpected but still livable
-  FAIL     — something is broken, investigate immediately
 
-These judgments are INDEPENDENT of Teensy-reported health_state.
-The Pi does its own math on the raw numbers.
-"""
+def _transport_health(tx: dict) -> str:
+    failures = sum(_to_int(tx.get(key)) or 0 for key in (
+        "tx_alloc_fail", "tx_budget_fail", "tx_queue_full", "tx_rr_drop_count",
+        "rx_bad_stx", "rx_bad_etx", "rx_len_overflow", "rx_guard_failure_count"))
+    return "NOMINAL" if failures == 0 and tx.get("rx_buffer_alignment_ok") is not False else "ANOMALY"
 
-from typing import Generator
 
-# ============================================================================
-# Health classification
-# ============================================================================
+def _payload_health(payload: dict) -> str:
+    failures = sum(_to_int(payload.get(key)) or 0 for key in (
+        "payload_entry_alloc_fail", "payload_entry_overflow", "payload_arena_alloc_fail",
+        "payload_serialize_overflow", "payload_to_json_fail", "payload_parse_error"))
+    expected_alive = (_to_int(payload.get("payload_instances_constructed")) or 0) - (_to_int(payload.get("payload_instances_destroyed")) or 0)
+    alive = _to_int(payload.get("payload_alive_now")) or 0
+    return "NOMINAL" if failures == 0 and expected_alive == alive else "ANOMALY"
 
-NOMINAL = "NOMINAL"
-ANOMALY = "ANOMALY"
-FAIL = "FAIL"
-
-def _worst(*levels: str) -> str:
-    """Return the worst health level from a set."""
-    if FAIL in levels:
-        return FAIL
-    if ANOMALY in levels:
-        return ANOMALY
-    return NOMINAL
-
-# ============================================================================
-# Process health analysis
-# ============================================================================
-
-def _assess_process(proc: dict) -> tuple[str, list[str]]:
-    """
-    Analyze RPC pipeline invariants.
-
-    Invariants:
-      received == routed + err_missing + err_unknown_subsys + err_unknown_command
-      handler_invoked == handler_completed  (±1 for in-flight query)
-      handler_completed == response_sent    (±1 for in-flight query)
-    """
-    findings = []
-
-    received = proc.get("rpc_received", 0)
-    routed = proc.get("rpc_routed", 0)
-    invoked = proc.get("rpc_handler_invoked", 0)
-    completed = proc.get("rpc_handler_completed", 0)
-    sent = proc.get("rpc_response_sent", 0)
-
-    err_missing = proc.get("rpc_err_missing_fields", 0)
-    err_subsys = proc.get("rpc_err_unknown_subsys", 0)
-    err_cmd = proc.get("rpc_err_unknown_command", 0)
-
-    # Accounting invariant
-    expected_received = routed + err_missing + err_subsys + err_cmd
-    if received != expected_received:
-        findings.append(f"RECEIVED MISMATCH: {received} != {expected_received}")
-
-    # Handler invariant (allow ±1 for in-flight query)
-    if abs(invoked - completed) > 1:
-        findings.append(f"STUCK HANDLER: invoked={invoked} completed={completed}")
-
-    # Response invariant (allow ±1 for in-flight query)
-    if abs(completed - sent) > 1:
-        findings.append(f"LOST RESPONSE: completed={completed} sent={sent}")
-
-    # Error rates — anomaly if any errors exist
-    total_errors = err_missing + err_subsys + err_cmd
-    if total_errors > 0:
-        findings.append(f"RPC ERRORS: {total_errors} total")
-
-    if any("MISMATCH" in f or "STUCK" in f or "LOST" in f for f in findings):
-        return FAIL, findings
-    elif findings:
-        return ANOMALY, findings
-
-    return NOMINAL, [f"RPC {received} OK, PS {proc.get('ps_dispatched', 0)} dispatched"]
-
-# ============================================================================
-# Transport health analysis
-# ============================================================================
-
-def _assess_transport(tx: dict) -> tuple[str, list[str]]:
-    """
-    Analyze transport TX/RX accounting and framing health.
-    """
-    findings = []
-
-    enqueued = tx.get("tx_jobs_enqueued", 0)
-    sent = tx.get("tx_jobs_sent", 0)
-    bytes_enq = tx.get("tx_bytes_enqueued", 0)
-    bytes_sent = tx.get("tx_bytes_sent", 0)
-    rr_drops = tx.get("tx_rr_drop_count", 0)
-    alloc_fail = tx.get("tx_arena_alloc_fail", 0)
-    job_count = tx.get("tx_job_count", 0)
-
-    bad_stx = tx.get("rx_bad_stx", 0)
-    bad_etx = tx.get("rx_bad_etx", 0)
-    overflow = tx.get("rx_len_overflow", 0)
-    overlap = tx.get("rx_overlap", 0)
-
-    # TX job accounting
-    pending = enqueued - sent
-    if pending > 10:
-        findings.append(f"TX BACKLOG: {pending} jobs pending")
-
-    # Byte-perfect accounting
-    if bytes_enq != bytes_sent and job_count == 0:
-        findings.append(f"TX BYTE MISMATCH: enqueued={bytes_enq} sent={bytes_sent}")
-
-    # RR drops
-    if rr_drops > 0:
-        findings.append(f"RR DROPS: {rr_drops}")
-
-    # Arena exhaustion
-    if alloc_fail > 0:
-        findings.append(f"ARENA ALLOC FAIL: {alloc_fail}")
-
-    # Framing errors
-    framing_errors = bad_stx + bad_etx + overflow
-    if framing_errors > 0:
-        findings.append(f"FRAMING ERRORS: stx={bad_stx} etx={bad_etx} overflow={overflow}")
-
-    # Overlap (new frame before previous completed)
-    if overlap > 5:
-        findings.append(f"RX OVERLAP: {overlap}")
-
-    if any("MISMATCH" in f or "DROPS" in f or "ALLOC FAIL" in f for f in findings):
-        return FAIL, findings
-    elif findings:
-        return ANOMALY, findings
-
-    return NOMINAL, [f"TX {sent} jobs, RX clean"]
-
-# ============================================================================
-# Payload health analysis
-# ============================================================================
-
-def _assess_payload(pl: dict) -> tuple[str, list[str]]:
-    """
-    Analyze payload allocator health.
-    """
-    findings = []
-
-    constructed = pl.get("payload_instances_constructed", 0)
-    destroyed = pl.get("payload_instances_destroyed", 0)
-    alive = pl.get("payload_alive_now", 0)
-    alive_hwm = pl.get("payload_alive_high_water", 0)
-    alloc_fail = pl.get("payload_arena_alloc_fail", 0)
-    overflow = pl.get("payload_entry_overflow", 0)
-
-    # Leak detection
-    expected_alive = constructed - destroyed
-    if expected_alive != alive:
-        findings.append(f"LEAK: constructed-destroyed={expected_alive} but alive={alive}")
-
-    # Alive count sanity
-    if alive > 20:
-        findings.append(f"HIGH ALIVE: {alive} payloads (hwm={alive_hwm})")
-
-    # Allocation failures
-    if alloc_fail > 0:
-        findings.append(f"ARENA ALLOC FAIL: {alloc_fail}")
-
-    # Entry overflow
-    if overflow > 0:
-        findings.append(f"ENTRY OVERFLOW: {overflow}")
-
-    if any("LEAK" in f or "ALLOC FAIL" in f for f in findings):
-        return FAIL, findings
-    elif findings:
-        return ANOMALY, findings
-
-    return NOMINAL, [f"{constructed} constructed, {alive} alive"]
-
-# ============================================================================
-# Memory health analysis
-# ============================================================================
-
-def _assess_memory(mem: dict) -> tuple[str, list[str]]:
-    """
-    Analyze Teensy memory health.
-    """
-    findings = []
-
-    heap_growing = mem.get("heap_growing", False)
-    stack_pct = mem.get("stack_usage_pct", 0)
-    heap_free = mem.get("heap_free_above", 0)
-    heap_total = mem.get("heap_total", 1)
-    heap_frag = mem.get("heap_fragmentation_pct", 0)
-    heap_arena = mem.get("heap_arena", 0)
-    heap_used = mem.get("heap_used", 0)
-    heap_free_above = mem.get("heap_free_above", 0)
-
-    # Heap growth (leak indicator)
-    if heap_growing:
-        findings.append("HEAP GROWING (possible leak)")
-
-    # Stack usage
-    if stack_pct > 75:
-        findings.append(f"STACK CRITICAL: {stack_pct}% used")
-    elif stack_pct > 50:
-        findings.append(f"STACK ELEVATED: {stack_pct}% used")
-
-    # Heap headroom
-    heap_used_pct = (heap_arena * 100) // heap_total if heap_total > 0 else 0
-    if heap_used_pct > 80:
-        findings.append(f"HEAP CRITICAL: {heap_used_pct}% committed")
-    elif heap_used_pct > 50:
-        findings.append(f"HEAP ELEVATED: {heap_used_pct}% committed")
-
-    # Fragmentation (only matters if heap is large)
-    if heap_frag > 80 and heap_arena > 16384 and heap_free_above < 32768:
-        findings.append(f"FRAGMENTATION: {heap_frag}% of {heap_arena} bytes")
-
-    if any("CRITICAL" in f or "GROWING" in f for f in findings):
-        return FAIL, findings
-    elif findings:
-        return ANOMALY, findings
-
-    stack_hw = mem.get("stack_high_water", 0)
-    return NOMINAL, [f"stack={stack_hw}B heap={heap_used}/{heap_arena}B"]
-
-# ============================================================================
-# Public readout
-# ============================================================================
 
 def teensy_metrics_readout() -> Generator[str, None, None]:
-
     snapshot = get_system_snapshot()
+    proc = _dict(snapshot.get("process"))
+    tx = _dict(snapshot.get("transport"))
+    payload = _dict(snapshot.get("payload"))
+    p_health = _process_health(proc)
+    t_health = _transport_health(tx)
+    a_health = _payload_health(payload)
+    overall = "NOMINAL" if p_health == t_health == a_health == "NOMINAL" else "ANOMALY"
 
-    proc_data = snapshot.get("process", {})
-    tx_data = snapshot.get("transport", {})
-    pl_data = snapshot.get("payload", {})
-    mem_data = snapshot.get("memory", {})
-
-    proc_health, proc_notes = _assess_process(proc_data)
-    tx_health, tx_notes = _assess_transport(tx_data)
-    pl_health, pl_notes = _assess_payload(pl_data)
-    mem_health, mem_notes = _assess_memory(mem_data)
-
-    overall = _worst(proc_health, tx_health, pl_health, mem_health)
-
-    yield f"TEENSY METRICS: {overall}"
-    yield ""
-
-    yield f"  PROCESS:   {proc_health}"
-    for note in proc_notes:
-        yield f"    {note}"
-
-    yield f"  TRANSPORT: {tx_health}"
-    for note in tx_notes:
-        yield f"    {note}"
-
-    yield f"  PAYLOAD:   {pl_health}"
-    for note in pl_notes:
-        yield f"    {note}"
-
-    yield f"  MEMORY:    {mem_health}"
-    for note in mem_notes:
-        yield f"    {note}"
+    yield f"TEENSY PIPELINE: {overall}"
+    yield f"RPC {p_health}: RX {_integer(proc.get('rpc_received'))} ROUTED {_integer(proc.get('rpc_routed'))} SENT {_integer(proc.get('rpc_response_sent'))}"
+    yield f"RPC INFLIGHT: {_integer(proc.get('rpc_handler_inflight'))}  PENDING: {_integer(proc.get('rpc_response_pending'))}  PS: {_integer(proc.get('ps_dispatched'))}"
+    rpc_errors = sum(_to_int(proc.get(key)) or 0 for key in ("rpc_err_missing_fields", "rpc_err_unknown_subsys", "rpc_err_unknown_command"))
+    yield f"RPC ERRORS: {rpc_errors}"
+    yield f"TX {t_health}: JOBS {_integer(tx.get('tx_jobs_sent'))}/{_integer(tx.get('tx_jobs_enqueued'))}  QUEUE {_integer(tx.get('tx_job_count'))}"
+    yield f"RX: FRAMES {_integer(tx.get('rx_frames_dispatched'))}/{_integer(tx.get('rx_frames_complete'))}  OVERLAP {_integer(tx.get('rx_overlap'))}"
+    framing = sum(_to_int(tx.get(key)) or 0 for key in ("rx_bad_stx", "rx_bad_etx", "rx_len_overflow"))
+    yield f"RX ERRORS: {framing}  GUARD: {_integer(tx.get('rx_guard_failure_count'))}  DMAMEM: {_yes_no(tx.get('rx_buffer_in_dmamem'))}"
+    yield f"PAYLOAD {a_health}: ALIVE {_integer(payload.get('payload_alive_now'))}  HWM {_integer(payload.get('payload_alive_high_water'))}"
+    yield f"HEAP: {_integer(payload.get('payload_heap_bytes_alive'), True)} / HWM {_integer(payload.get('payload_heap_bytes_high_water'), True)}"
+    payload_faults = sum(_to_int(payload.get(key)) or 0 for key in ("payload_entry_alloc_fail", "payload_entry_overflow", "payload_arena_alloc_fail", "payload_serialize_overflow", "payload_to_json_fail", "payload_parse_error"))
+    yield f"PAYLOAD FAULTS: {payload_faults}"

@@ -8,7 +8,7 @@ Key invariants:
   • No imperative hardware queries in core
   • WebSocket failures must never affect UI
   • Dashboard is an observer, not an instrument
-  • SYSTEM snapshot is the sole source of truth
+  • SYSTEM snapshot owns platform health; accepted TIMEBASE owns clock science
 
 Author: The Mule + GPT
 """
@@ -88,18 +88,18 @@ def header_readout(prefix: str = "") -> list[str]:
     # ------------------------------------------------------------
     # Header fields
     # ------------------------------------------------------------
-    ssid = system.get("network", {}).get("ssid", "UNKNOWN")
+    network = system.get("network", {}) if isinstance(system.get("network"), dict) else {}
+    net_state = network.get("network_status", "UNKNOWN")
 
-    battery = system.get("battery", {})
+    battery = system.get("battery", {}) if isinstance(system.get("battery"), dict) else {}
     remaining_pct = battery.get("remaining_pct")
+    batt_str = f"{remaining_pct:.1f}%" if isinstance(remaining_pct, (int, float)) else "N/A"
 
-    if isinstance(remaining_pct, (int, float)):
-        batt_str = f"{remaining_pct:.1f}%"
-    else:
-        batt_str = "N/A"
+    teensy = system.get("teensy", {}) if isinstance(system.get("teensy"), dict) else {}
+    fw = teensy.get("fw_version", "---")
 
     return [
-        f"{prefix}NET: {ssid}  BAT: {batt_str}  SYS: {overall}",
+        f"{prefix}NET: {net_state}  BAT: {batt_str}  SYS: {overall}",
         "",
     ]
 
@@ -114,16 +114,15 @@ from zpnet.dashboard.readout_blocks import (
     clocks_servo_readout,
     clocks_dac_welford_readout,
     gnss_report_readout,
-    laser_status_readout,
+    feature_status_readout,
     environment_status_readout,
     sensor_scan_readout,
     battery_status_readout,
     power_status_readout,
     network_status_readout,
     teensy_status_readout,
-    photodiode_status_readout,
     raspberry_pi_status_readout,
-    teensy_metrics_readout
+    teensy_metrics_readout,
 )
 
 Readout = Generator[str, None, None]
@@ -135,16 +134,15 @@ READOUTS: list[Callable[[], Readout]] = [
     clocks_servo_readout,
     clocks_dac_welford_readout,
     gnss_report_readout,
-    laser_status_readout,
+    feature_status_readout,
     environment_status_readout,
     sensor_scan_readout,
     battery_status_readout,
     power_status_readout,
     network_status_readout,
     teensy_status_readout,
-    photodiode_status_readout,
     raspberry_pi_status_readout,
-    teensy_metrics_readout
+    teensy_metrics_readout,
 ]
 
 # ---------------------------------------------------------------------
