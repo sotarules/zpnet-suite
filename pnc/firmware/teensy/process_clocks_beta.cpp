@@ -1721,13 +1721,13 @@ static uint32_t          g_recover_lifecycle_last_abort_campaign_seconds = 0;
 static char              g_recover_lifecycle_reason[64] = "idle";
 static char              g_recover_lifecycle_abort_reason[64] = "none";
 
-// RECOVER presentation continuity.  Reattachment proves fresh OCXO custody,
-// but the raw CounterLedger/PhaseLedger intercept can differ from the
-// Pi-projected campaign ledger by a few hundred ns.  That is lawful evidence,
-// but it makes panel-facing total TAU/PPB look like it restarted.  At the
-// first clean recovered public row, apply one signed presentation offset so
-// public OCXO ns lands on the recovered campaign ratio.  One-second science,
-// Welfords, and servo NOW/MEAN inputs continue to consume fresh OCXO evidence.
+// RECOVER presentation continuity.  A cold SmartZero epoch creates a fresh
+// local CounterLedger/PhaseLedger intercept, while the Pi-projected campaign
+// clockface must continue across the outage.  Arm one signed presentation
+// transform at the recovery splice and apply it on the first public row whose
+// CounterLedger clockfaces exist, including an explicitly degraded row.
+// One-second science, Welfords, and servo NOW/MEAN inputs remain independently
+// gated until fresh post-recovery interval custody is complete.
 static volatile bool g_recover_continuity_align_pending = false;
 static uint32_t g_recover_continuity_align_count = 0;
 static uint32_t g_recover_continuity_align_failure_count = 0;
@@ -1961,7 +1961,7 @@ static void recover_continuity_align_arm(void) {
   g_recover_continuity_align_pending = true;
   g_recover_continuity_align_requested_public_count =
       (uint32_t)(campaign_seconds + 1ULL);
-  recover_continuity_set_reason("armed_for_first_clean_public_row");
+  recover_continuity_set_reason("armed_for_first_recovered_public_row");
 }
 
 static void recover_continuity_align_reset(const char* reason) {
@@ -1974,8 +1974,18 @@ static void recover_continuity_align_if_pending(uint32_t public_count,
                                                 uint64_t public_gnss_ns) {
   if (!g_recover_continuity_align_pending) return;
 
-  const uint64_t raw_o1 = current_raw_ocxo1_ns();
-  const uint64_t raw_o2 = current_raw_ocxo2_ns();
+  const uint64_t raw_c1 =
+      current_raw_counterledger_ns(time_clock_id_t::OCXO1);
+  const uint64_t raw_c2 =
+      current_raw_counterledger_ns(time_clock_id_t::OCXO2);
+  const bool counterledger_authority =
+      clocks_ocxo_counterledger_mode_enabled();
+  const uint64_t raw_o1 = counterledger_authority
+      ? raw_c1
+      : current_raw_ocxo1_ns();
+  const uint64_t raw_o2 = counterledger_authority
+      ? raw_c2
+      : current_raw_ocxo2_ns();
   const uint64_t target_o1 =
       campaign_recover_project_ocxo_to_public_gnss(public_gnss_ns,
                                                    recover_ocxo1_ns);
@@ -1983,14 +1993,25 @@ static void recover_continuity_align_if_pending(uint32_t public_count,
       campaign_recover_project_ocxo_to_public_gnss(public_gnss_ns,
                                                    recover_ocxo2_ns);
 
-  if (raw_o1 == 0ULL || raw_o2 == 0ULL ||
-      target_o1 == 0ULL || target_o2 == 0ULL) {
+  if (target_o1 == 0ULL || target_o2 == 0ULL) {
     g_recover_continuity_align_pending = false;
     g_recover_continuity_align_failure_count++;
-    g_recover_continuity_align_last_public_count = public_count;
     g_recover_continuity_ocxo1_target_ns = target_o1;
     g_recover_continuity_ocxo2_target_ns = target_o2;
-    recover_continuity_set_reason("missing_raw_or_target");
+    recover_continuity_set_reason("missing_recovered_target");
+    return;
+  }
+
+  if (raw_o1 == 0ULL || raw_o2 == 0ULL) {
+    // CounterLedger authority may not exist at the RECOVER command boundary on
+    // a freshly flashed Teensy.  Keep the one-shot armed until the first exact
+    // post-SmartZero row supplies both local clockfaces; publishing them with a
+    // zero/stale offset would leak the fresh local epoch into campaign time.
+    g_recover_continuity_ocxo1_target_ns = target_o1;
+    g_recover_continuity_ocxo2_target_ns = target_o2;
+    recover_continuity_set_reason(counterledger_authority
+        ? "waiting_for_counterledger_clockface"
+        : "waiting_for_raw_ocxo_clockface");
     return;
   }
 
@@ -2015,8 +2036,6 @@ static void recover_continuity_align_if_pending(uint32_t public_count,
         campaign_public_offset_for_recovered_value(raw_m2, target_o2);
   }
 
-  const uint64_t raw_c1 = current_raw_counterledger_ns(time_clock_id_t::OCXO1);
-  const uint64_t raw_c2 = current_raw_counterledger_ns(time_clock_id_t::OCXO2);
   if (raw_c1 != 0ULL) {
     g_campaign_public_counterledger_ocxo1_offset =
         campaign_public_offset_for_recovered_value(raw_c1, target_o1);
@@ -2780,7 +2799,8 @@ static FLASHMEM void recover_reattach_reset(const char* reason) {
 }
 
 static FLASHMEM void recover_reattach_begin(void) {
-  recover_continuity_align_reset("waiting_for_ocxo_reattach");
+  recover_continuity_align_reset("recover_clockface_alignment_reset");
+  recover_continuity_align_arm();
   g_recover_reattach_active = true;
   g_recover_reattach_degraded_active = false;
   g_recover_reattach_clockface_ready = false;
@@ -2821,7 +2841,9 @@ static FLASHMEM void recover_reattach_release(const char* reason, bool degraded)
     pps_interval_residuals_begin_recover_quarantine(
         CLOCKS_RECOVER_SCIENCE_QUARANTINE_ROWS);
   } else {
-    recover_continuity_align_arm();
+    // Campaign clockface continuity was armed when RECOVER reattachment began
+    // and therefore precedes every public row, including degraded testimony.
+    // Science readiness must not author a second presentation intercept.
     if (g_recover_reattach_degraded_active) {
       g_recover_reattach_degraded_active = false;
       g_recover_reattach_degraded_clear_count++;
@@ -3110,12 +3132,9 @@ static FLASHMEM bool recover_reattach_degraded_science_hold_active(void) {
     recover_reattach_set_stall_reason("cleared_by_science_ready");
     g_recover_reattach_degraded_clear_count++;
 
-    // A direct clean release arms the campaign-presentation continuity
-    // transform in recover_reattach_release(..., false).  The degraded-to-clean
-    // path bypasses that helper, so explicitly arm the same one-shot transform
-    // here.  It executes at the start of the next quarantined row, before the
-    // public OCXO clockfaces are rendered and before science/Welford resumes.
-    recover_continuity_align_arm();
+    // Campaign presentation was aligned before the first recovered public
+    // row.  This transition releases science custody only; it must not create a
+    // second OCXO clockface intercept.
 
     // The row that proves reattachment is still a boundary row: it may carry
     // PhaseLedger/CounterLedger state formed across the degraded window.
@@ -8985,12 +9004,18 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
   g_timebase_last_per_second_campaign_seconds = campaign_seconds;
   timebase_build_stage(TIMEBASE_BUILD_STAGE_PER_SECOND);
 
-  dwt_cycle_count_total = campaign_public_dwt_total();
-  gnss_raw_64           = campaign_public_gnss_ns() / 100ull;
+  const uint32_t public_count = (uint32_t)campaign_seconds;
+  const uint64_t public_gnss_ns = campaign_public_gnss_ns();
+  const uint64_t public_dwt_total = campaign_public_dwt_total();
+
+  // RECOVER public presentation must be aligned before any shadow ledger,
+  // Welford gate, science row, or payload field observes the new local epoch.
+  recover_continuity_align_if_pending(public_count, public_gnss_ns);
+
+  dwt_cycle_count_total = public_dwt_total;
+  gnss_raw_64           = public_gnss_ns / 100ull;
   ocxo1_measured_gnss_ticks_64        = campaign_public_ocxo1_ns() / 100ull;
   ocxo2_measured_gnss_ticks_64        = campaign_public_ocxo2_ns() / 100ull;
-
-  const uint32_t public_count = (uint32_t)campaign_seconds;
 
   // ── Welford updates ──
   //
@@ -9033,10 +9058,8 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
   // from the same canonical Delta Cycles totals that feed pps_residual,
   // Welford, servo, and stats, so authoritative fields tell one story.
   // The Alpha PPS-projection snapshots remain courtroom collateral.
-  const uint64_t public_gnss_ns   = campaign_public_gnss_ns();
-  const uint64_t public_dwt_total = campaign_public_dwt_total();
-
-  recover_continuity_align_if_pending(public_count, public_gnss_ns);
+  // public_gnss_ns/public_dwt_total and any RECOVER presentation transform
+  // were captured before per-second consumers above.
 
   const uint64_t public_ocxo1_measured_ns = campaign_public_ocxo1_measured_ns();
   const uint64_t public_ocxo2_measured_ns = campaign_public_ocxo2_measured_ns();

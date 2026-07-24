@@ -1,5 +1,5 @@
 """
-ZPNet Campaign Analyzer — v16 (TIMEBASE_V3 / TIMEBASE_FRAGMENT_V4)
+ZPNet Campaign Analyzer — v17 (TIMEBASE_V3 / TIMEBASE_FRAGMENT_V4)
 
 Rewritten for the current paired TIMEBASE architecture:
 
@@ -24,17 +24,19 @@ Recovery doctrine:
   after each gap is consistent with the prior public campaign ledgers projected
   to the new GNSS/PPS identity.
 
-  Current clean-recovery doctrine:
-    • transitional RECOVER rows may be discarded Pi-side before persistence
-    • persisted post-recovery rows must have clean OCXO science
-    • Welford cardinality is segment-aware: START private PPS0 lets DWT/OCXO
-      enter public PPS1 with n=1, while each RECOVER boundary consumes one
-      non-sample bookend for DWT/OCXO before science resumes
-    • stats.<lane>.tau/.ppb must match the continuity-aligned campaign
-      clockface ledger ratio and the compact science total_* fields
-    • OCXO recovery must preserve the panel-facing total TAU/PPB experience:
-      a recovery boundary may skip rows, but it must not introduce a visible
-      OCXO clockface-ratio step
+  Current truthful-recovery doctrine:
+    • transitional RECOVER rows may be persisted as explicit degraded timeline
+      testimony while OCXO science, Welfords, and servo authority remain held
+    • public clockface continuity is certified independently from one-second
+      science readiness
+    • pps_residual.valid is the authoritative per-second science gate; a valid
+      projection or clockface never overrides an explicit false residual gate
+    • OCXO Welfords may remain frozen through the degraded hold and catch up to
+      segment cardinality only when clean science resumes
+    • stats.<lane>.tau/.ppb consistency is enforced only on science-authoritative
+      rows; held recovery rows remain visible but are not judged as samples
+    • recovery must preserve the panel-facing OCXO clockface ratio without a
+      visible TAU/PPB step
 
 Usage:
     python -m zpnet.tests.campaign_analyzer <campaign_name>
@@ -369,10 +371,26 @@ def _ocxo_gnss_interval(row: Dict[str, Any], prefix: str) -> Optional[int]:
 
 
 def _ocxo_valid(row: Dict[str, Any], prefix: str) -> bool:
+    """Return whether the row carries authoritative one-second OCXO science.
+
+    RECOVER separates clockface validity from science validity.  An explicit
+    pps_residual.valid verdict is sovereign and must not be overridden by a
+    valid projection or public clockface.
+    """
     frag = _fragment(row)
-    return bool(_to_bool(_path_get(frag, f"{prefix}.pps_residual.valid")) or
-                _to_bool(_path_get(frag, f"{prefix}.pps_projected_valid")) or
-                _ocxo_clock_interval(row, prefix))
+    explicit = _to_bool(_path_get(frag, f"{prefix}.pps_residual.valid"))
+    if explicit is not None:
+        return explicit
+
+    science_valid = _science_bool(row, prefix, "valid")
+    if science_valid is not None:
+        return science_valid
+
+    # Legacy fallback for rows that predate explicit validity fields.
+    clock_interval = _ocxo_clock_interval(row, prefix)
+    gnss_interval = _ocxo_gnss_interval(row, prefix)
+    return (clock_interval not in (None, 0) and
+            gnss_interval not in (None, 0))
 
 
 def _ocxo_phase_offset(row: Dict[str, Any], prefix: str) -> Optional[int]:
@@ -472,7 +490,30 @@ def _row_recovery_status(row: Dict[str, Any]) -> Dict[str, Any]:
         "reason": frag.get("recover_reattach_reason"),
         "degraded_active": bool(_to_bool(frag.get("recover_degraded_active"))),
         "degraded_science_hold": bool(_to_bool(frag.get("recover_degraded_science_hold"))),
+        "science_quarantine_active": bool(_to_bool(frag.get("recover_science_quarantine_active"))),
+        "transition_active": bool(_to_bool(frag.get("recover_transition_active"))),
+        "timeline_ready": _to_bool(frag.get("recover_timeline_ready")),
+        "clockface_ready": _to_bool(frag.get("recover_clockface_ready")),
+        "science_ready": _to_bool(frag.get("recover_science_ready")),
     }
+
+
+def _row_recovery_science_hold(row: Dict[str, Any]) -> bool:
+    status = _row_recovery_status(row)
+    return bool(
+        status.get("degraded_science_hold") or
+        status.get("science_quarantine_active") or
+        status.get("transition_active") or
+        (status.get("degraded_active") and status.get("science_ready") is not True)
+    )
+
+
+def _ocxo_statistics_authoritative(row: Dict[str, Any], prefix: str) -> bool:
+    if _row_recovery_science_hold(row):
+        return False
+    if _science_bool(row, prefix, "total_valid") is False:
+        return False
+    return _ocxo_valid(row, prefix)
 
 
 def _recovery_continuity_forensics(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -535,16 +576,16 @@ def _expected_welford_n(
 ) -> Optional[int]:
     """Expected published Welford cardinality for the current TIMEBASE model.
 
-    START and RECOVER have intentionally different bookend semantics.  START
-    has a private PPS0/prologue, so DWT and OCXO public PPS1 may already carry
-    n=1.  RECOVER cuts custody and the first persisted clean row after each
-    recovery boundary is a reattachment/bookend row, not an additional DWT/OCXO
-    science sample.  Therefore DWT/OCXO cardinality is public_count minus the
-    number of persisted recovery boundaries at or before this row.
+    START has a private PPS0/prologue, so DWT and OCXO public PPS1 may carry
+    n=1.  Each RECOVER boundary contributes one non-sample bookend, making the
+    mature DWT/OCXO target public_count minus the number of recovery boundaries.
+
+    During an explicit recovery science hold, OCXO Welfords may lawfully remain
+    frozen at the pre-gap N; callers must defer this mature target until
+    _ocxo_statistics_authoritative() becomes true.
 
     VCLOCK remains an interval/self-test surface with no public PPS1 sample, so
-    it stays pps_count - 1 across START/RECOVER.  DAC Welfords are row/intent
-    surfaces and remain pps_count.
+    it stays pps_count - 1.  DAC Welfords remain row/intent surfaces at pps_count.
     """
     pps = int(pps_count)
     recoveries = _recovery_count_at_or_before(pps, recovery_boundaries or set())
@@ -625,7 +666,7 @@ def print_campaign_overview(rows: List[Dict[str, Any]], recovery_boundaries: Set
     secs = campaign_seconds % 60
 
     print("=" * 78)
-    print(f"CAMPAIGN ANALYSIS: {rows[0].get('campaign', '?')}  (v16 TIMEBASE_V3/FRAGMENT_V4)")
+    print(f"CAMPAIGN ANALYSIS: {rows[0].get('campaign', '?')}  (v17 TIMEBASE_V3/FRAGMENT_V4)")
     print("=" * 78)
     print()
     print(f"  Time range:        {first_ts}")
@@ -756,15 +797,14 @@ def analyze_recovery_projection(rows: List[Dict[str, Any]], recovery_boundaries:
 def analyze_recovery_cleanliness(rows: List[Dict[str, Any]], recovery_boundaries: Set[int]) -> List[str]:
     """Audit the first persisted row after each recovery gap.
 
-    core.py now discards transitional TIMEBASE pairs until OCXO science is clean.
-    This check proves that the rows that *did* make it into PostgreSQL have the
-    corresponding firmware evidence: no degraded hold, clean OCXO science, and
-    restored Welford cardinality.
+    Transitional rows are lawful timeline testimony.  They must prove timeline
+    and clockface continuity, while OCXO science/Welfords may remain explicitly
+    held until fresh interval custody matures.
     """
     anomalies: List[str] = []
     print()
     print("-" * 78)
-    print("RECOVERY CLEAN-ROW / CARRY-OVER AUDIT")
+    print("RECOVERY TRANSITION / CARRY-OVER AUDIT")
     print("-" * 78)
 
     if not recovery_boundaries:
@@ -780,19 +820,32 @@ def analyze_recovery_cleanliness(rows: List[Dict[str, Any]], recovery_boundaries
             continue
 
         status = _row_recovery_status(curr)
+        held = _row_recovery_science_hold(curr)
         print(f"\n  Recovery public row: {prev_pps} -> {curr_pps}")
         print(f"    recover_reattach_reason:       {status.get('reason')}")
         print(f"    recover_degraded_active:       {status.get('degraded_active')}")
         print(f"    recover_degraded_science_hold: {status.get('degraded_science_hold')}")
+        print(f"    recover_science_quarantine:    {status.get('science_quarantine_active')}")
+        print(f"    recover_timeline_ready:        {status.get('timeline_ready')}")
+        print(f"    recover_clockface_ready:       {status.get('clockface_ready')}")
+        print(f"    recover_science_ready:         {status.get('science_ready')}")
+        print(f"    recovery row role:             "
+              f"{'TIMELINE-ONLY / SCIENCE HELD' if held else 'SCIENCE-AUTHORITATIVE'}")
 
-        if status.get("degraded_active") or status.get("degraded_science_hold"):
-            anomalies.append(f"recovery {curr_pps}: degraded recovery row persisted")
+        if status.get("timeline_ready") is False:
+            anomalies.append(f"recovery {curr_pps}: timeline not ready")
+        if status.get("clockface_ready") is False:
+            anomalies.append(f"recovery {curr_pps}: OCXO clockface not ready")
 
         rc = _recovery_continuity_forensics(curr)
         if rc:
-            print(f"    recovery continuity proof:  present aligned={_to_bool(rc.get('aligned'))} reason={rc.get('reason')}")
+            aligned = _to_bool(rc.get("aligned"))
+            print(f"    recovery continuity proof:  present aligned={aligned} reason={rc.get('reason')}")
+            if aligned is not True:
+                anomalies.append(f"recovery {curr_pps}: continuity proof not aligned")
         else:
             print("    recovery continuity proof:  not present in TIMEBASE_FORENSICS")
+            anomalies.append(f"recovery {curr_pps}: continuity proof missing")
 
         for label, prefix in [("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")]:
             clean = _ocxo_science_clean(curr, prefix)
@@ -807,9 +860,13 @@ def analyze_recovery_cleanliness(rows: List[Dict[str, Any]], recovery_boundaries
                 anomalies.append(
                     f"recovery {curr_pps}: {label} panel TAU/PPB is AlphaTau, not public-ledger continuity"
                 )
-            if not clean:
+            if held and clean:
                 anomalies.append(
-                    f"recovery {curr_pps}: {label} science not clean "
+                    f"recovery {curr_pps}: {label} claims clean science while hold is active"
+                )
+            elif not held and not clean:
+                anomalies.append(
+                    f"recovery {curr_pps}: {label} science not clean after hold release "
                     f"(valid={science.get('valid')} antecedents={science.get('antecedents_complete')} "
                     f"total_valid={science.get('total_valid')})"
                 )
@@ -823,19 +880,37 @@ def analyze_recovery_cleanliness(rows: List[Dict[str, Any]], recovery_boundaries
             ("OCXO2_DAC", "ocxo2_dac"),
         ]:
             if prefix.endswith("_dac"):
-                actual_n = _dac_welford_int(curr, prefix.replace("_dac", ""), "n")
+                lane = prefix.replace("_dac", "")
+                actual_n = _dac_welford_int(curr, lane, "n")
+                previous_n = _dac_welford_int(prev, lane, "n")
             else:
                 actual_n = _welford_int(curr, prefix, "n")
+                previous_n = _welford_int(prev, prefix, "n")
+
             expected_n = _expected_welford_n(curr_pps, prefix, recovery_boundaries)
             if expected_n is None or actual_n is None:
                 continue
-            print(f"    {label:<9s} Welford N: actual={actual_n:,} expected={expected_n:,}")
-            if abs(int(actual_n) - int(expected_n)) > WELFORD_N_TOLERANCE:
-                anomalies.append(
-                    f"recovery {curr_pps}: {label} Welford N {actual_n} != expected {expected_n}"
-                )
+
+            if prefix in ("ocxo1", "ocxo2") and held:
+                print(f"    {label:<9s} Welford N: actual={actual_n:,} "
+                      f"expected_hold={previous_n if previous_n is not None else '---'}")
+                if previous_n is not None and int(actual_n) != int(previous_n):
+                    anomalies.append(
+                        f"recovery {curr_pps}: {label} Welford changed during science hold "
+                        f"({previous_n} -> {actual_n})"
+                    )
+            else:
+                print(f"    {label:<9s} Welford N: actual={actual_n:,} expected={expected_n:,}")
+                if abs(int(actual_n) - int(expected_n)) > WELFORD_N_TOLERANCE:
+                    anomalies.append(
+                        f"recovery {curr_pps}: {label} Welford N {actual_n} != expected {expected_n}"
+                    )
 
         for label, prefix in [("DWT", "dwt"), ("VCLOCK", "vclock"), ("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")]:
+            if prefix in ("ocxo1", "ocxo2") and not _ocxo_statistics_authoritative(curr, prefix):
+                print(f"    {label:<6s} recovery TAU/PPB: held — consistency court deferred")
+                continue
+
             pub_ppb = _published_ppb(curr, prefix)
             pub_tau = _published_tau(curr, prefix)
             total_ppb = _campaign_total_ppb(curr, prefix)
@@ -851,7 +926,7 @@ def analyze_recovery_cleanliness(rows: List[Dict[str, Any]], recovery_boundaries
                     anomalies.append(f"recovery {curr_pps}: {label} published TAU mismatch {d:+.12e}")
 
     if not anomalies:
-        print("\n  Verdict: OK — persisted recovery rows are clean and Welford cardinality carried over")
+        print("\n  Verdict: OK — aligned continuity with truthful degraded science hold")
     return anomalies
 
 
@@ -956,6 +1031,7 @@ def analyze_ocxo_integrity(rows: List[Dict[str, Any]], recovery_boundaries: Set[
         prev_ns_count: Optional[int] = None
         valid_seconds = 0
         null_count = 0
+        recovery_held_count = 0
 
         for row in rows:
             pps = _row_pps_count(row)
@@ -963,6 +1039,12 @@ def analyze_ocxo_integrity(rows: List[Dict[str, Any]], recovery_boundaries: Set[
                 prev_phase_offset = None
                 prev_ppb = None
                 prev_ns_count = None
+
+            if _row_recovery_science_hold(row):
+                prev_phase_offset = None
+                prev_ppb = None
+                prev_ns_count = None
+                recovery_held_count += 1
                 continue
 
             clock_interval = _ocxo_clock_interval(row, prefix)
@@ -1044,8 +1126,9 @@ def analyze_ocxo_integrity(rows: List[Dict[str, Any]], recovery_boundaries: Set[
             prev_ppb = ppb
             prev_ns_count = ns_count
 
-        print(f"\n  Valid seconds:     {valid_seconds:,}")
-        print(f"  Null/invalid rows: {null_count}")
+        print(f"\n  Valid seconds:       {valid_seconds:,}")
+        print(f"  Recovery-held rows: {recovery_held_count:,}")
+        print(f"  Null/invalid rows:   {null_count}")
 
         print("\n  OCXO clock interval (fragment.ocxoN.pps_residual.clock_interval_ns):")
         print(f"    {clock_interval_stats.summary()}")
@@ -1181,6 +1264,8 @@ def analyze_welford_contamination(rows: List[Dict[str, Any]], recovery_boundarie
     for label, prefix, kind, threshold, unit in lane_specs:
         points: List[Tuple[int, int, float, float, float]] = []
         n_alarms: List[str] = []
+        held_rows = 0
+        previous_n: Optional[int] = None
 
         for row_index, row in enumerate(rows, start=1):
             pps = _row_pps_count(row)
@@ -1208,7 +1293,17 @@ def analyze_welford_contamination(rows: List[Dict[str, Any]], recovery_boundarie
 
             if kind == "interval":
                 expected = _expected_welford_n(pps, prefix, recovery_boundaries)
-                if expected is not None and abs(int(n) - int(expected)) > WELFORD_N_TOLERANCE:
+                held = (
+                    prefix in ("ocxo1", "ocxo2") and
+                    _row_recovery_science_hold(row)
+                )
+                if held:
+                    held_rows += 1
+                    if previous_n is not None and int(n) != previous_n:
+                        n_alarms.append(
+                            f"pps={pps:>7d}  n={n:,} changed_during_hold_from={previous_n:,}"
+                        )
+                elif expected is not None and abs(int(n) - int(expected)) > WELFORD_N_TOLERANCE:
                     n_alarms.append(f"pps={pps:>7d}  n={n:,} expected={expected:,}")
             elif kind == "dac":
                 expected = _expected_welford_n(pps, prefix, recovery_boundaries)
@@ -1222,6 +1317,8 @@ def analyze_welford_contamination(rows: List[Dict[str, Any]], recovery_boundarie
                 if int(n) != expected:
                     n_alarms.append(f"row={row_index:>7d} pps={pps:>7d}  n={n:,} expected_persisted_rows={expected:,}")
 
+            previous_n = int(n)
+
         if not points:
             print(f"\n  [{label}] No Welford data")
             continue
@@ -1234,6 +1331,8 @@ def analyze_welford_contamination(rows: List[Dict[str, Any]], recovery_boundarie
         print(f"    First: pps={first_pps} n={first_n:,} mean={first_mean:+.6f} sd={first_sd:.6f}")
         print(f"    Final: pps={final_pps} n={final_n:,} mean={final_mean:+.6f} sd={final_sd:.6f} se={final_se:.6f}")
         print(f"    Peak SD: pps={max_pps} n={max_n:,} sd={max_sd:.6f}")
+        if held_rows:
+            print(f"    INFO: {held_rows} recovery-held row(s) preserved pre-gap N")
 
         jumps: List[str] = []
         n_regressions: List[str] = []
@@ -1291,6 +1390,7 @@ def analyze_ppb_sanity(rows: List[Dict[str, Any]], recovery_boundaries: Set[int]
         science_ppb_mismatch_stats = WelfordStats()
         violations: List[str] = []
         mismatches: List[str] = []
+        held_consistency_rows = 0
 
         for row in rows:
             pps = _row_pps_count(row)
@@ -1314,6 +1414,14 @@ def analyze_ppb_sanity(rows: List[Dict[str, Any]], recovery_boundaries: Set[int]
             if total_tau is not None:
                 if abs(float(total_tau) - 1.0) > TAU_ABSOLUTE_DEVIATION_THRESHOLD:
                     violations.append(f"pps={pps:>7d}  ledger_total_tau={total_tau:.12f}")
+
+            consistency_authoritative = (
+                prefix not in ("ocxo1", "ocxo2") or
+                _ocxo_statistics_authoritative(row, prefix)
+            )
+            if not consistency_authoritative:
+                held_consistency_rows += 1
+                continue
 
             if published_ppb is not None and total_ppb is not None:
                 d = float(published_ppb) - float(total_ppb)
@@ -1347,6 +1455,9 @@ def analyze_ppb_sanity(rows: List[Dict[str, Any]], recovery_boundaries: Set[int]
         print(f"    {published_ppb_stats.summary()}")
         print(f"  [{label}] Campaign-total PPB computed from public ledgers:")
         print(f"    {total_ppb_stats.summary()}")
+        if held_consistency_rows:
+            print(f"  [{label}] Consistency court deferred on "
+                  f"{held_consistency_rows} recovery-held row(s)")
         if ppb_mismatch_stats.n:
             print(f"  [{label}] Published minus campaign-total PPB:")
             print(f"    {ppb_mismatch_stats.summary(fmt='.6f')}")

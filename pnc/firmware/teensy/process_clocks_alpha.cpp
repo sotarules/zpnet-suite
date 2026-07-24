@@ -7284,6 +7284,45 @@ static void alpha_ocxo_grid_rephase_callback(
       : alpha_ocxo_grid_rephase_stage_t::COMPLETE;
 }
 
+static bool alpha_ocxo_grid_rephase_deadline_reached(uint32_t now_dwt,
+                                                       uint32_t earliest_dwt) {
+  // DWT32 modular ordering is unambiguous for deadlines less than half a wrap
+  // away.  Grid steps are checked every PPS and are only 50 ms apart, so the
+  // comparison remains comfortably inside that window even after a missed fire.
+  return (uint32_t)(now_dwt - earliest_dwt) < 0x80000000UL;
+}
+
+static void alpha_ocxo_grid_rephase_catch_up_overdue(void) {
+  alpha_ocxo_grid_rephase_transaction_t& tx = g_alpha_ocxo_grid_rephase;
+  const clocks_alpha_smartzero_delay_snapshot_t& local =
+      g_alpha_smartzero_delay_install_scratch;
+
+  uint32_t earliest_dwt = 0U;
+  if (tx.stage == alpha_ocxo_grid_rephase_stage_t::WAIT_OCXO1) {
+    earliest_dwt = local.ocxo1_earliest_dwt;
+  } else if (tx.stage == alpha_ocxo_grid_rephase_stage_t::WAIT_OCXO2) {
+    earliest_dwt = local.ocxo2_earliest_dwt;
+  } else {
+    return;
+  }
+
+  if (!alpha_ocxo_grid_rephase_deadline_reached(DWT_CYCCNT,
+                                                earliest_dwt)) {
+    return;
+  }
+
+  // TimePop timed one-shots are exact-edge facts: a missed compare is retired,
+  // not delivered late.  PPS is the sovereign foreground heartbeat, so use it
+  // as a liveness backstop for an overdue grid step.  Cancelling the old handle
+  // prevents a later duplicate callback; the ordinary callback performs the
+  // same install and records the actual (possibly enlarged) separation.
+  if (tx.handle != TIMEPOP_INVALID_HANDLE) {
+    (void)timepop_cancel(tx.handle);
+    tx.handle = TIMEPOP_INVALID_HANDLE;
+  }
+  alpha_ocxo_grid_rephase_callback(nullptr, nullptr, nullptr);
+}
+
 static bool alpha_ocxo_grid_rephase_begin(
     clocks_alpha_ocxo_grid_rephase_owner_t owner,
     interrupt_ocxo_grid_rephase_mode_t interrupt_mode,
@@ -9198,6 +9237,11 @@ static void update_pps_vclock_bridge_anchor(const pps_edge_snapshot_t& snap) {
 static void pps_selector_callback(const pps_edge_snapshot_t& snap) {
   g_alpha_latest_selector_reference_sequence = snap.sequence;
   g_alpha_latest_selector_reference_dwt = snap.dwt_at_edge;
+
+  // A TimePop one-shot that missed its exact compare edge must not strand the
+  // physical-grid transaction forever.  Service only already-overdue stages;
+  // this may enlarge the required spacing but can never compress it.
+  alpha_ocxo_grid_rephase_catch_up_overdue();
 
   // Startup epoch install is SmartZero-gated.  Explicit START/ZERO requests
   // are serviced through Beta's sequence-zero control probe below; startup
