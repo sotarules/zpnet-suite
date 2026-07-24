@@ -1697,6 +1697,21 @@ static uint32_t          g_recover_lifecycle_gate_custody_reset_count = 0;
 static uint32_t          g_recover_lifecycle_interrupt_service_rearm_count = 0;
 static uint32_t          g_recover_lifecycle_interrupt_service_rearm_failure_count = 0;
 static bool              g_recover_lifecycle_last_interrupt_service_rearm_ok = false;
+
+enum class recover_lifecycle_mode_t : uint8_t {
+  NONE           = 0,
+  LIVE_REATTACH  = 1,
+  COLD_BOOTSTRAP = 2,
+};
+
+static volatile recover_lifecycle_mode_t g_recover_lifecycle_mode =
+    recover_lifecycle_mode_t::NONE;
+static bool     g_recover_lifecycle_cold_bootstrap_epoch_ready = false;
+static uint32_t g_recover_lifecycle_cold_bootstrap_begin_count = 0;
+static uint32_t g_recover_lifecycle_cold_bootstrap_wait_count = 0;
+static uint32_t g_recover_lifecycle_cold_bootstrap_ready_count = 0;
+static uint32_t g_recover_lifecycle_cold_bootstrap_commit_count = 0;
+static uint32_t g_recover_lifecycle_cold_bootstrap_start_failure_count = 0;
 static uint32_t          g_recover_lifecycle_complete_count = 0;
 static uint32_t          g_recover_lifecycle_abort_count = 0;
 static uint32_t          g_recover_lifecycle_stale_gate_count = 0;
@@ -2882,6 +2897,44 @@ static void recover_lifecycle_set_abort_reason(const char* reason) {
            reason ? reason : "recover_abort");
 }
 
+static const char* recover_lifecycle_mode_name(
+    recover_lifecycle_mode_t mode) {
+  switch (mode) {
+    case recover_lifecycle_mode_t::LIVE_REATTACH:  return "LIVE_REATTACH";
+    case recover_lifecycle_mode_t::COLD_BOOTSTRAP: return "COLD_BOOTSTRAP";
+    default:                                       return "NONE";
+  }
+}
+
+static bool recover_lifecycle_prepare_cold_bootstrap(void) {
+  g_recover_lifecycle_mode = recover_lifecycle_mode_t::COLD_BOOTSTRAP;
+  g_recover_lifecycle_cold_bootstrap_epoch_ready = false;
+  g_recover_lifecycle_cold_bootstrap_begin_count++;
+
+  if (clocks_alpha_installed_smartzero_backing_epoch()) {
+    g_recover_lifecycle_cold_bootstrap_epoch_ready = true;
+    g_recover_lifecycle_cold_bootstrap_ready_count++;
+    return true;
+  }
+
+  // process_clocks_init() normally has startup SmartZero already running.
+  // Preserve that acquisition (or its completed proof) across RECOVER.  Only
+  // start a replacement acquisition when neither proof nor install transaction
+  // is currently alive.
+  if (interrupt_smartzero_running() ||
+      interrupt_smartzero_complete() ||
+      clocks_alpha_epoch_install_in_progress()) {
+    return true;
+  }
+
+  if (!clocks_alpha_begin_smartzero_epoch("recover_cold_bootstrap")) {
+    g_recover_lifecycle_cold_bootstrap_start_failure_count++;
+    return false;
+  }
+
+  return true;
+}
+
 static bool recover_lifecycle_enter_from_command(const char* reason) {
   g_recover_lifecycle_begin_count++;
   g_recover_lifecycle_last_begin_campaign_seconds = (uint32_t)campaign_seconds;
@@ -2896,10 +2949,30 @@ static bool recover_lifecycle_enter_from_command(const char* reason) {
   interrupt_recover_reset_publication_custody();
   g_recover_lifecycle_command_custody_reset_count++;
 
-  // A live TIMEBASE blackout does not reboot the Teensy.  Verify sovereign
+  // A flashed/rebooted Teensy has durable campaign state on the Pi but no
+  // installed local service epoch.  That is not a failed live rearm.  Preserve
+  // or start startup SmartZero, enter RECOVERING, and let sovereign PPS drive
+  // the epoch install before the ordinary RECOVER grid-rephase transaction.
+  if (!clocks_alpha_installed_smartzero_backing_epoch()) {
+    if (!recover_lifecycle_prepare_cold_bootstrap()) {
+      recover_lifecycle_set_reason("recover_cold_bootstrap_start_failed");
+      return false;
+    }
+
+    g_recover_lifecycle_last_interrupt_service_rearm_ok = false;
+    clocks_watchdog_clear_surrender_for_new_lifecycle();
+    clocks_watchdog_disarm_campaign_publication();
+    campaign_state = clocks_campaign_state_t::RECOVERING;
+    recover_lifecycle_set_reason("recover_cold_bootstrap_wait_smartzero");
+    return true;
+  }
+
+  g_recover_lifecycle_mode = recover_lifecycle_mode_t::LIVE_REATTACH;
+  g_recover_lifecycle_cold_bootstrap_epoch_ready = true;
+
+  // Live recovery preserves the installed service epoch.  Verify sovereign
   // VCLOCK service, then launch the shared TimePop-staged OCXO physical-grid
-  // rephase before the reattachment timeout starts.  RECOVER preserves logical
-  // epoch state but receives the same 50 ms OCXO1-to-OCXO2 geometry as START.
+  // rephase before the reattachment timeout starts.
   g_recover_lifecycle_interrupt_service_rearm_count++;
   g_recover_lifecycle_last_interrupt_service_rearm_ok =
       clocks_alpha_recover_rearm_interrupt_service();
@@ -2926,6 +2999,13 @@ static void recover_lifecycle_abort(const char* reason) {
   g_recover_lifecycle_last_abort_campaign_seconds = (uint32_t)campaign_seconds;
   recover_lifecycle_set_abort_reason(reason ? reason : "recover_aborted");
   recover_lifecycle_set_reason("idle");
+
+  if (g_recover_lifecycle_mode ==
+          recover_lifecycle_mode_t::COLD_BOOTSTRAP &&
+      !clocks_alpha_installed_smartzero_backing_epoch()) {
+    interrupt_smartzero_abort();
+    clocks_alpha_smartzero_pending_clear();
+  }
 
   clocks_alpha_ocxo_grid_rephase_acknowledge(
       clocks_alpha_ocxo_grid_rephase_owner_t::RECOVER);
@@ -8653,29 +8733,62 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
     clocks_watchdog_clear_surrender_for_new_lifecycle();
     request_zero = false;
 
-    clocks_alpha_ocxo_grid_rephase_status_t rephase_status =
-        clocks_alpha_ocxo_grid_rephase_status(
+    if (g_recover_lifecycle_mode ==
+            recover_lifecycle_mode_t::COLD_BOOTSTRAP &&
+        !clocks_alpha_installed_smartzero_backing_epoch()) {
+      g_recover_lifecycle_cold_bootstrap_wait_count++;
+      recover_lifecycle_set_reason("recover_cold_bootstrap_wait_smartzero");
+      publish_dac_tick("RECOVER_COLD_BOOTSTRAP_PENDING");
+      return;
+    }
+
+    if (g_recover_lifecycle_mode ==
+            recover_lifecycle_mode_t::COLD_BOOTSTRAP &&
+        !g_recover_lifecycle_cold_bootstrap_epoch_ready) {
+      g_recover_lifecycle_cold_bootstrap_epoch_ready = true;
+      g_recover_lifecycle_cold_bootstrap_ready_count++;
+      recover_lifecycle_set_reason("recover_cold_bootstrap_epoch_ready");
+    }
+
+    const bool cold_bootstrap_commit =
+        g_recover_lifecycle_mode ==
+            recover_lifecycle_mode_t::COLD_BOOTSTRAP;
+
+    if (cold_bootstrap_commit) {
+      // SmartZero has already created and physically staggered the fresh OCXO
+      // service grids for this firmware generation.  Starting a second
+      // RECOVER-owned rephase here would stop those newly installed lanes while
+      // request_recover suppresses ordinary Alpha rows, creating a circular
+      // wait in which OCXO_PUBLIC_ORIGIN and STATIC_PREDICTION can never mature.
+      // Treat the installed SmartZero-backed epoch as the completed cold-service
+      // bootstrap and splice the durable campaign onto it directly below.
+      g_recover_lifecycle_last_interrupt_service_rearm_ok = true;
+      recover_lifecycle_set_reason("recover_cold_bootstrap_commit_ready");
+    } else {
+      clocks_alpha_ocxo_grid_rephase_status_t rephase_status =
+          clocks_alpha_ocxo_grid_rephase_status(
+              clocks_alpha_ocxo_grid_rephase_owner_t::RECOVER);
+      if (rephase_status == clocks_alpha_ocxo_grid_rephase_status_t::IDLE) {
+        g_recover_lifecycle_interrupt_service_rearm_count++;
+        g_recover_lifecycle_last_interrupt_service_rearm_ok =
+            clocks_alpha_recover_rearm_interrupt_service();
+        rephase_status = clocks_alpha_ocxo_grid_rephase_status(
             clocks_alpha_ocxo_grid_rephase_owner_t::RECOVER);
-    if (rephase_status == clocks_alpha_ocxo_grid_rephase_status_t::IDLE) {
-      g_recover_lifecycle_interrupt_service_rearm_count++;
-      g_recover_lifecycle_last_interrupt_service_rearm_ok =
-          clocks_alpha_recover_rearm_interrupt_service();
-      rephase_status = clocks_alpha_ocxo_grid_rephase_status(
-          clocks_alpha_ocxo_grid_rephase_owner_t::RECOVER);
-    }
-    if (rephase_status == clocks_alpha_ocxo_grid_rephase_status_t::PENDING) {
-      recover_lifecycle_set_reason("recover_ocxo_grid_rephase_pending");
-      publish_dac_tick("RECOVER_GRID_REPHASE_PENDING");
-      return;
-    }
-    if (rephase_status != clocks_alpha_ocxo_grid_rephase_status_t::COMPLETE) {
-      g_recover_lifecycle_last_interrupt_service_rearm_ok = false;
-      g_recover_lifecycle_interrupt_service_rearm_failure_count++;
-      clocks_alpha_ocxo_grid_rephase_acknowledge(
-          clocks_alpha_ocxo_grid_rephase_owner_t::RECOVER);
-      recover_lifecycle_abort("recover_ocxo_grid_rephase_failed");
-      publish_dac_tick("RECOVER_GRID_REPHASE_FAILED");
-      return;
+      }
+      if (rephase_status == clocks_alpha_ocxo_grid_rephase_status_t::PENDING) {
+        recover_lifecycle_set_reason("recover_ocxo_grid_rephase_pending");
+        publish_dac_tick("RECOVER_GRID_REPHASE_PENDING");
+        return;
+      }
+      if (rephase_status != clocks_alpha_ocxo_grid_rephase_status_t::COMPLETE) {
+        g_recover_lifecycle_last_interrupt_service_rearm_ok = false;
+        g_recover_lifecycle_interrupt_service_rearm_failure_count++;
+        clocks_alpha_ocxo_grid_rephase_acknowledge(
+            clocks_alpha_ocxo_grid_rephase_owner_t::RECOVER);
+        recover_lifecycle_abort("recover_ocxo_grid_rephase_failed");
+        publish_dac_tick("RECOVER_GRID_REPHASE_FAILED");
+        return;
+      }
     }
 
     ocxo_dac_pacing_abort_all();
@@ -8696,11 +8809,14 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
     // coordinate.
     campaign_public_offsets_reset_for_recover();
 
-    // Alpha owns OCXO previous/pending edge machinery.  RECOVER must not allow
-    // those surfaces to bridge the outage.  Beta then restores the campaign
-    // statistics and quarantines the first public residual rows so Welford
-    // receives only post-recovery, post-warmup intervals.
-    clocks_alpha_recover_reprime_ocxo_state();
+    // Live reattach must cut pre-recovery edge history so no interval bridges
+    // the outage.  Cold bootstrap is already a fresh SmartZero epoch: its Alpha
+    // ledgers, CounterLedger seeds, PhaseLedger state, and visible-origin basis
+    // were created from scratch during the just-completed epoch commit.  Do not
+    // erase that new state a second time.
+    if (!cold_bootstrap_commit) {
+      clocks_alpha_recover_reprime_ocxo_state();
+    }
     interrupt_recover_reset_publication_custody();
     g_recover_lifecycle_gate_custody_reset_count++;
     pps_interval_residuals_begin_recover_quarantine(
@@ -8709,8 +8825,12 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
 
     request_recover = false;
     flash_cut_clear_pending();
-    clocks_alpha_ocxo_grid_rephase_acknowledge(
-        clocks_alpha_ocxo_grid_rephase_owner_t::RECOVER);
+    if (cold_bootstrap_commit) {
+      g_recover_lifecycle_cold_bootstrap_commit_count++;
+    } else {
+      clocks_alpha_ocxo_grid_rephase_acknowledge(
+          clocks_alpha_ocxo_grid_rephase_owner_t::RECOVER);
+    }
     recover_lifecycle_complete_at_pps();
     campaign_warmup_begin(campaign_warmup_mode_t::RECOVER);
     publish_dac_tick("RECOVER_GATE");
@@ -10630,7 +10750,12 @@ static FLASHMEM Payload cmd_recover(const Payload& args) {
   g_recover_last_base_ocxo2_ns = recover_ocxo2_ns;
 
   clocks_watchdog_disarm_campaign_publication();
-  interrupt_smartzero_abort();
+  // A live epoch may have a stray replacement SmartZero acquisition; abort it
+  // before live reattach.  After a flash there is no epoch yet, and startup
+  // SmartZero is the lawful bootstrap proof RECOVER must preserve.
+  if (clocks_alpha_installed_smartzero_backing_epoch()) {
+    interrupt_smartzero_abort();
+  }
   request_recover = true;
   request_start   = false;
   request_stop    = false;
@@ -10674,6 +10799,18 @@ static FLASHMEM Payload cmd_recover(const Payload& args) {
   p.add("campaign_state", clocks_campaign_state_name(campaign_state));
   p.add("recover_lifecycle", clocks_campaign_recovery_lifecycle_active());
   p.add("recover_lifecycle_reason", g_recover_lifecycle_reason);
+  p.add("recover_mode",
+        recover_lifecycle_mode_name(g_recover_lifecycle_mode));
+  p.add("recover_cold_bootstrap_active",
+        g_recover_lifecycle_mode ==
+            recover_lifecycle_mode_t::COLD_BOOTSTRAP &&
+        clocks_campaign_recovery_lifecycle_active());
+  p.add("recover_cold_bootstrap_epoch_ready",
+        g_recover_lifecycle_cold_bootstrap_epoch_ready);
+  p.add("recover_smartzero_running", interrupt_smartzero_running());
+  p.add("recover_smartzero_complete", interrupt_smartzero_complete());
+  p.add("recover_epoch_ready",
+        clocks_alpha_installed_smartzero_backing_epoch());
   p.add("recover_command_custody_reset_count",
         g_recover_lifecycle_command_custody_reset_count);
   p.add("recover_interrupt_service_rearm_count",
@@ -12720,6 +12857,29 @@ static FLASHMEM Payload cmd_report_recovery(const Payload&) {
         (uint32_t)g_recover_lifecycle_interrupt_service_rearm_failure_count);
   p.add("recover_interrupt_service_rearm_ok",
         g_recover_lifecycle_last_interrupt_service_rearm_ok);
+  p.add("recover_mode",
+        recover_lifecycle_mode_name(g_recover_lifecycle_mode));
+  p.add("recover_cold_bootstrap_active",
+        g_recover_lifecycle_mode ==
+            recover_lifecycle_mode_t::COLD_BOOTSTRAP &&
+        clocks_campaign_recovery_lifecycle_active());
+  p.add("recover_cold_bootstrap_epoch_ready",
+        g_recover_lifecycle_cold_bootstrap_epoch_ready);
+  p.add("recover_cold_bootstrap_begin_count",
+        g_recover_lifecycle_cold_bootstrap_begin_count);
+  p.add("recover_cold_bootstrap_wait_count",
+        g_recover_lifecycle_cold_bootstrap_wait_count);
+  p.add("recover_cold_bootstrap_ready_count",
+        g_recover_lifecycle_cold_bootstrap_ready_count);
+  p.add("recover_cold_bootstrap_commit_count",
+        g_recover_lifecycle_cold_bootstrap_commit_count);
+  p.add("recover_cold_bootstrap_start_failure_count",
+        g_recover_lifecycle_cold_bootstrap_start_failure_count);
+  p.add("recover_smartzero_running", interrupt_smartzero_running());
+  p.add("recover_smartzero_complete", interrupt_smartzero_complete());
+  p.add("recover_epoch_ready",
+        clocks_alpha_installed_smartzero_backing_epoch());
+
 
   p.add("request_count", g_recover_request_count);
   p.add("base_count", g_recover_last_base_count);
@@ -12896,6 +13056,28 @@ static FLASHMEM Payload cmd_report_recovery_deep(const Payload&) {
                   (uint32_t)g_recover_lifecycle_interrupt_service_rearm_failure_count);
     lifecycle.add("interrupt_service_rearm_ok",
                   g_recover_lifecycle_last_interrupt_service_rearm_ok);
+    lifecycle.add("mode",
+                  recover_lifecycle_mode_name(g_recover_lifecycle_mode));
+    lifecycle.add("cold_bootstrap_active",
+                  g_recover_lifecycle_mode ==
+                      recover_lifecycle_mode_t::COLD_BOOTSTRAP &&
+                  clocks_campaign_recovery_lifecycle_active());
+    lifecycle.add("cold_bootstrap_epoch_ready",
+                  g_recover_lifecycle_cold_bootstrap_epoch_ready);
+    lifecycle.add("cold_bootstrap_begin_count",
+                  g_recover_lifecycle_cold_bootstrap_begin_count);
+    lifecycle.add("cold_bootstrap_wait_count",
+                  g_recover_lifecycle_cold_bootstrap_wait_count);
+    lifecycle.add("cold_bootstrap_ready_count",
+                  g_recover_lifecycle_cold_bootstrap_ready_count);
+    lifecycle.add("cold_bootstrap_commit_count",
+                  g_recover_lifecycle_cold_bootstrap_commit_count);
+    lifecycle.add("cold_bootstrap_start_failure_count",
+                  g_recover_lifecycle_cold_bootstrap_start_failure_count);
+    lifecycle.add("smartzero_running", interrupt_smartzero_running());
+    lifecycle.add("smartzero_complete", interrupt_smartzero_complete());
+    lifecycle.add("epoch_ready",
+                  clocks_alpha_installed_smartzero_backing_epoch());
     lifecycle.add("complete_count", (uint32_t)g_recover_lifecycle_complete_count);
     lifecycle.add("abort_count", (uint32_t)g_recover_lifecycle_abort_count);
     lifecycle.add("stale_gate_count", (uint32_t)g_recover_lifecycle_stale_gate_count);

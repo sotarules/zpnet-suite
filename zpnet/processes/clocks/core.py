@@ -126,6 +126,12 @@ SYNC_RECOVER_CLEAN_TIMEOUT_S = 90.0
 # recovery thread.
 RECOVERY_FIRST_ROW_TIMEOUT_S = 45.0
 
+# A post-flash RECOVER may first need startup SmartZero to acquire and install a
+# fresh local service epoch before firmware can launch the ordinary RECOVER grid
+# rephase. Keep the normal live-reattach timeout tight, but allow the explicit
+# COLD_BOOTSTRAP mode the full recovery-admission window.
+RECOVERY_COLD_BOOTSTRAP_FIRST_ROW_TIMEOUT_S = 90.0
+
 # If a new WATCHDOG_ANOMALY arrives while an auto-recovery attempt is already
 # waiting for the first clean public row, the current attempt has been
 # invalidated.  Abort that wait immediately, clean the Teensy RECOVER
@@ -2390,6 +2396,16 @@ def _end_sync_wait(
                 "last_timebase_activity_topic": _timebase_last_activity_topic,
                 "last_timebase_activity_pps_vclock_count": _timebase_last_activity_pps_vclock_count,
                 "last_accepted_pps_vclock_count": _accepted_pps_vclock_count,
+                "last_firmware_status": (
+                    dict(recovery_monitor.get("last_firmware_status") or {})
+                    if recovery_monitor
+                    else {}
+                ),
+                "firmware_no_progress_s": (
+                    round(float(recovery_monitor.get("firmware_no_progress_s") or 0.0), 3)
+                    if recovery_monitor
+                    else 0.0
+                ),
             }
             _diag["last_sync_wait"] = {
                 "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -2400,11 +2416,28 @@ def _end_sync_wait(
             raise RecoverySyncTimeout("sync_timeout_waiting_for_fragment", details)
 
         if now - last_log >= SYNC_LOG_INTERVAL_S:
+            firmware_status = (
+                recovery_monitor.get("last_firmware_status")
+                if recovery_monitor
+                else {}
+            ) or {}
             logging.info(
-                "⏳ [recovery] still waiting for first public row >= %s (%.1fs/%.0fs)",
+                "⏳ [recovery] still waiting for first public row >= %s "
+                "(%.1fs/%.0fs) mode=%s reason=%s epoch_ready=%s "
+                "cold_commits=%s stage=%s candidates=%s no_progress=%.1fs",
                 str(_sync_expected_pps_vclock),
                 now - t0,
                 timeout_s,
+                firmware_status.get("recover_mode") or "UNKNOWN",
+                firmware_status.get("recover_lifecycle_reason") or "unknown",
+                firmware_status.get("recover_cold_bootstrap_epoch_ready"),
+                firmware_status.get("recover_cold_bootstrap_commit_count"),
+                firmware_status.get("timebase_last_stage_name") or
+                    firmware_status.get("timebase_last_stage"),
+                firmware_status.get("candidate_count"),
+                float(
+                    recovery_monitor.get("firmware_no_progress_s") or 0.0
+                ) if recovery_monitor else 0.0,
             )
             last_log = now
 
@@ -2737,6 +2770,32 @@ def _recovery_inflight_status_compact(status: Dict[str, Any]) -> Dict[str, Any]:
         "campaign_seconds": _as_int(status.get("campaign_seconds")),
         "recover_lifecycle_active": _recovery_bool(status.get("recover_lifecycle_active")),
         "recover_lifecycle_reason": status.get("recover_lifecycle_reason"),
+        "recover_mode": str(status.get("recover_mode") or "NONE").upper(),
+        "recover_cold_bootstrap_active": _recovery_bool(
+            status.get("recover_cold_bootstrap_active")
+        ),
+        "recover_cold_bootstrap_epoch_ready": _recovery_bool(
+            status.get("recover_cold_bootstrap_epoch_ready")
+        ),
+        "recover_cold_bootstrap_begin_count": _as_int(
+            status.get("recover_cold_bootstrap_begin_count")
+        ),
+        "recover_cold_bootstrap_wait_count": _as_int(
+            status.get("recover_cold_bootstrap_wait_count")
+        ),
+        "recover_cold_bootstrap_ready_count": _as_int(
+            status.get("recover_cold_bootstrap_ready_count")
+        ),
+        "recover_cold_bootstrap_commit_count": _as_int(
+            status.get("recover_cold_bootstrap_commit_count")
+        ),
+        "recover_smartzero_running": _recovery_bool(
+            status.get("recover_smartzero_running")
+        ),
+        "recover_smartzero_complete": _recovery_bool(
+            status.get("recover_smartzero_complete")
+        ),
+        "recover_epoch_ready": _recovery_bool(status.get("recover_epoch_ready")),
         "recover_interrupt_service_rearm_ok": _recovery_bool(
             status.get("recover_interrupt_service_rearm_ok")
         ),
@@ -2848,6 +2907,35 @@ def _check_recovery_inflight_monitor(
         return
 
     compact = _recovery_inflight_status_compact(status)
+
+    # Preserve a compact stage transcript in the caller-owned monitor.  RECOVER
+    # identity can remain perfectly stable while firmware is stuck at one
+    # lifecycle stage, so base/expected-count equality alone is not enough
+    # observability.  This is diagnostic only: it never manufactures progress
+    # or aborts a lawful slow bootstrap.
+    now_monotonic = time.monotonic()
+    progress_signature = (
+        compact.get("recover_lifecycle_reason"),
+        compact.get("recover_cold_bootstrap_epoch_ready"),
+        compact.get("recover_cold_bootstrap_commit_count"),
+        compact.get("recover_reattach_active"),
+        compact.get("recover_reattach_degraded_active"),
+        compact.get("recover_clockface_ready"),
+        compact.get("recover_science_ready"),
+        compact.get("candidate_count"),
+        compact.get("last_public_count"),
+        compact.get("timebase_last_stage"),
+    )
+    if progress_signature != monitor.get("firmware_progress_signature"):
+        monitor["firmware_progress_signature"] = progress_signature
+        monitor["firmware_last_progress_monotonic"] = now_monotonic
+        monitor["firmware_last_progress_status"] = dict(compact)
+    last_progress = float(
+        monitor.get("firmware_last_progress_monotonic") or now_monotonic
+    )
+    monitor["firmware_no_progress_s"] = max(0.0, now_monotonic - last_progress)
+    monitor["last_firmware_status"] = dict(compact)
+
     snapshot = {
         "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "context": context,
@@ -6390,20 +6478,21 @@ def _recover_campaign() -> None:
     _wait_for_timebase_routes(context="recovery")
 
     # ------------------------------------------------------------------
-    # Quiesce Pi ingress without stopping the always-on Teensy clock lanes
+    # Quiesce Pi ingress without issuing an operator STOP
     # ------------------------------------------------------------------
     #
-    # A live TIMEBASE blackout is a publication/control-plane failure, not an
-    # operator STOP.  CLOCKS.RECOVER is itself the firmware lifecycle boundary:
-    # it enters RECOVERING at command acceptance and consumes the recovered
-    # bases at the next PPS/VCLOCK edge.  Sending STOP here can strand a
-    # still-running Teensy's OCXO subscriber/cadence service before RECOVER has
-    # a chance to reattach it.  Reserve STOP/RECOVER_ABORT for explicit failed
-    # recovery cleanup; warm recovery goes directly from the last durable row
-    # to RECOVER, matching the post-flash/power-cycle transaction.
+    # CLOCKS.RECOVER is the firmware lifecycle boundary for both cases:
+    #   * LIVE_REATTACH preserves an installed Teensy service epoch.
+    #   * COLD_BOOTSTRAP creates a fresh SmartZero-backed local epoch after a
+    #     flash/reboot, then maps it onto the durable campaign coordinates.
+    #
+    # Sending STOP here would destroy useful live-service custody and is also
+    # unnecessary after a reboot. Preserve the campaign transaction, quiesce
+    # only Pi ingress, and let firmware select the lawful recovery mode.
     logging.info(
-        "📡 [recovery] @%s preserving Teensy clock service; "
-        "quiescing Pi TIMEBASE ingress before direct RECOVER...",
+        "📡 [recovery] @%s preserving durable campaign identity; "
+        "quiescing Pi TIMEBASE ingress before direct RECOVER "
+        "(firmware selects live reattach or cold bootstrap)...",
         system_time_z(),
     )
 
@@ -6529,7 +6618,7 @@ def _recover_campaign() -> None:
         "recover_calibrate_ocxo": recover_calibrate,
         "teensy_stop_sent": False,
         "teensy_recover_abort_sent": False,
-        "interrupt_service_preserved": True,
+        "interrupt_service_preserved": None,
         "tau_dwt": round(tau_dwt, 12),
         "tau_ocxo1": round(tau_ocxo1, 12),
         "tau_ocxo2": round(tau_ocxo2, 12),
@@ -6580,12 +6669,56 @@ def _recover_campaign() -> None:
         else {}
     )
 
+    recover_mode = str(
+        teensy_recover_payload.get("recover_mode") or "LIVE_REATTACH"
+    ).strip().upper()
+    cold_bootstrap = recover_mode == "COLD_BOOTSTRAP"
+    first_row_timeout_s = (
+        RECOVERY_COLD_BOOTSTRAP_FIRST_ROW_TIMEOUT_S
+        if cold_bootstrap
+        else RECOVERY_FIRST_ROW_TIMEOUT_S
+    )
+
+    _diag["last_recovery"].update({
+        "recover_mode": recover_mode,
+        "cold_bootstrap": bool(cold_bootstrap),
+        "interrupt_service_preserved": not cold_bootstrap,
+        "recover_cold_bootstrap_active": bool(
+            teensy_recover_payload.get("recover_cold_bootstrap_active")
+        ),
+        "recover_cold_bootstrap_epoch_ready": bool(
+            teensy_recover_payload.get("recover_cold_bootstrap_epoch_ready")
+        ),
+        "first_row_timeout_s": float(first_row_timeout_s),
+    })
+
+    if cold_bootstrap:
+        logging.info(
+            "🧭 [recovery] Teensy selected COLD_BOOTSTRAP: preserving campaign "
+            "base=%d while startup SmartZero installs a fresh local epoch",
+            recover_base_pps_vclock_count,
+        )
+    else:
+        logging.info(
+            "🧭 [recovery] Teensy selected LIVE_REATTACH for campaign base=%d",
+            recover_base_pps_vclock_count,
+        )
+
     recovery_monitor = {
         "campaign": campaign_name,
         "recover_base_pps_vclock_count": int(recover_base_pps_vclock_count),
         "expected_first_public_pps_vclock_count": int(expected_first_public_pps_vclock_count),
         "recovery_generation": _as_int(teensy_recover_payload.get("recovery_generation")),
         "recover_status": teensy_recover_payload.get("status"),
+        "recover_mode": recover_mode,
+        "cold_bootstrap": bool(cold_bootstrap),
+        "recover_cold_bootstrap_active": bool(
+            teensy_recover_payload.get("recover_cold_bootstrap_active")
+        ),
+        "recover_cold_bootstrap_epoch_ready": bool(
+            teensy_recover_payload.get("recover_cold_bootstrap_epoch_ready")
+        ),
+        "first_row_timeout_s": float(first_row_timeout_s),
         "sent_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "sent_monotonic": time.monotonic(),
     }
@@ -6601,6 +6734,9 @@ def _recover_campaign() -> None:
             details = {
                 "campaign": campaign_name,
                 "expected_first_public_pps_vclock_count": int(expected_first_public_pps_vclock_count),
+                "recover_mode": recover_mode,
+                "cold_bootstrap": bool(cold_bootstrap),
+                "first_row_timeout_s": float(first_row_timeout_s),
                 "discarded_transitional_rows": int(discarded_transitional_rows),
                 "last_admission_verdict": recovery_admission_verdict,
                 "admission_timeout_s": float(SYNC_RECOVER_CLEAN_TIMEOUT_S),
@@ -6612,7 +6748,7 @@ def _recover_campaign() -> None:
 
         try:
             frag, waited_s = _end_sync_wait(
-                timeout_s=min(float(remaining), float(RECOVERY_FIRST_ROW_TIMEOUT_S)),
+                timeout_s=min(float(remaining), float(first_row_timeout_s)),
                 recovery_monitor=recovery_monitor,
             )
         except RecoverySyncTimeout as e:
@@ -6626,6 +6762,9 @@ def _recover_campaign() -> None:
                 "campaign": campaign_name,
                 "recover_base_pps_vclock_count": int(recover_base_pps_vclock_count),
                 "expected_first_public_pps_vclock_count": int(expected_first_public_pps_vclock_count),
+                "recover_mode": recover_mode,
+                "cold_bootstrap": bool(cold_bootstrap),
+                "first_row_timeout_s": float(first_row_timeout_s),
                 "discarded_transitional_rows": int(discarded_transitional_rows),
                 "last_admission_verdict": recovery_admission_verdict,
             }

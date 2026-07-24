@@ -4414,6 +4414,11 @@ static void alpha_ocxo_pps_projection_reset_all(void) {
 
 static bool g_clocks_alpha_dmamem_initialized = false;
 
+// SmartZero/grid-rephase transaction types are declared later in this file.
+// Keep their RAM2 cold reset behind one narrow helper so the early hardware
+// initialization path can clear every Alpha DMAMEM owner before use.
+static void alpha_smartzero_dmamem_cold_init(void);
+
 static FLASHMEM void clocks_alpha_cold_diagnostics_init(void) {
   if (g_clocks_alpha_dmamem_initialized) return;
 
@@ -4446,6 +4451,11 @@ static FLASHMEM void clocks_alpha_cold_diagnostics_init(void) {
   g_ocxo1_pps_projection_guard = alpha_ocxo_pps_projection_guard_t{};
   g_ocxo2_pps_projection_guard = alpha_ocxo_pps_projection_guard_t{};
   alpha_ocxo_pps_projection_reset_all();
+
+  // These transaction objects also live in NOLOAD RAM2.  A flash/reboot
+  // invalidates their TimePop handles and callbacks, so stale owner/stage
+  // state must never survive into startup SmartZero.
+  alpha_smartzero_dmamem_cold_init();
 
   alpha_tau_reset_all();
   g_clocks_alpha_dmamem_initialized = true;
@@ -7036,6 +7046,18 @@ struct alpha_ocxo_grid_rephase_transaction_t {
 
 static alpha_ocxo_grid_rephase_transaction_t
     g_alpha_ocxo_grid_rephase DMAMEM = {};
+
+static void alpha_smartzero_dmamem_cold_init(void) {
+  // Teensy DMAMEM is NOLOAD.  Initializers above document the desired state
+  // but do not execute after a flash/reboot.  In particular, a stale pending
+  // grid transaction can retain an owner, stage, and TimePop handle whose
+  // callback belonged to the previous firmware image, deadlocking epoch install.
+  g_alpha_smartzero_delay_snapshot =
+      clocks_alpha_smartzero_delay_snapshot_t{};
+  g_alpha_smartzero_delay_install_scratch =
+      clocks_alpha_smartzero_delay_snapshot_t{};
+  g_alpha_ocxo_grid_rephase = alpha_ocxo_grid_rephase_transaction_t{};
+}
 
 static constexpr const char* ALPHA_OCXO_GRID_REPHASE_OCXO1_TIMER =
     "clocks-ocxo-grid-o1";
