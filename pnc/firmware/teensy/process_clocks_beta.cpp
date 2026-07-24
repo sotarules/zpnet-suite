@@ -2896,14 +2896,10 @@ static bool recover_lifecycle_enter_from_command(const char* reason) {
   interrupt_recover_reset_publication_custody();
   g_recover_lifecycle_command_custody_reset_count++;
 
-  // A post-flash/power-cycle recovery gets this service restoration from boot.
-  // A live TIMEBASE blackout does not reboot the Teensy, so verify sovereign
-  // VCLOCK service and deliberately re-open both OCXO publication ferries here.
-  // A hardware-verified live OCXO compare ladder is preserved; stale capture,
-  // handoff, fact-drain, and subscriber custody are cut, and an unverified
-  // ladder is re-armed from its installed grid.  Do this before the reattachment
-  // timeout starts, and fail RECOVER rather than spending hidden candidates on
-  // a lane that cannot prove compare/IRQ service.
+  // A live TIMEBASE blackout does not reboot the Teensy.  Verify sovereign
+  // VCLOCK service, then launch the shared TimePop-staged OCXO physical-grid
+  // rephase before the reattachment timeout starts.  RECOVER preserves logical
+  // epoch state but receives the same 50 ms OCXO1-to-OCXO2 geometry as START.
   g_recover_lifecycle_interrupt_service_rearm_count++;
   g_recover_lifecycle_last_interrupt_service_rearm_ok =
       clocks_alpha_recover_rearm_interrupt_service();
@@ -2931,6 +2927,8 @@ static void recover_lifecycle_abort(const char* reason) {
   recover_lifecycle_set_abort_reason(reason ? reason : "recover_aborted");
   recover_lifecycle_set_reason("idle");
 
+  clocks_alpha_ocxo_grid_rephase_acknowledge(
+      clocks_alpha_ocxo_grid_rephase_owner_t::RECOVER);
   request_recover = false;
   request_start = false;
   request_stop = false;
@@ -8487,8 +8485,21 @@ static bool clocks_try_finish_pending_smartzero(void) {
   if (!interrupt_smartzero_complete()) return false;
 
   const bool finishing_start = request_start;
-  const bool zero_ok = clocks_alpha_zero_from_smartzero(finishing_start ? "start" : "zero");
+  const bool zero_ok = clocks_alpha_zero_from_smartzero(
+      finishing_start ? "start" : "zero");
   if (!zero_ok) {
+    const clocks_alpha_ocxo_grid_rephase_status_t status =
+        clocks_alpha_ocxo_grid_rephase_status(
+            clocks_alpha_ocxo_grid_rephase_owner_t::SMARTZERO_EPOCH);
+    if (status == clocks_alpha_ocxo_grid_rephase_status_t::PENDING) {
+      // The completed SmartZero proof is now installing physical grids through
+      // TimePop.  Preserve request_start/request_zero until Alpha commits.
+      return false;
+    }
+    if (status == clocks_alpha_ocxo_grid_rephase_status_t::FAILED) {
+      clocks_alpha_ocxo_grid_rephase_acknowledge(
+          clocks_alpha_ocxo_grid_rephase_owner_t::SMARTZERO_EPOCH);
+    }
     request_start = false;
     request_zero = false;
     return false;
@@ -8605,6 +8616,32 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
     timebase_build_stage(TIMEBASE_BUILD_STAGE_RECOVER_GATE);
     clocks_watchdog_clear_surrender_for_new_lifecycle();
     request_zero = false;
+
+    clocks_alpha_ocxo_grid_rephase_status_t rephase_status =
+        clocks_alpha_ocxo_grid_rephase_status(
+            clocks_alpha_ocxo_grid_rephase_owner_t::RECOVER);
+    if (rephase_status == clocks_alpha_ocxo_grid_rephase_status_t::IDLE) {
+      g_recover_lifecycle_interrupt_service_rearm_count++;
+      g_recover_lifecycle_last_interrupt_service_rearm_ok =
+          clocks_alpha_recover_rearm_interrupt_service();
+      rephase_status = clocks_alpha_ocxo_grid_rephase_status(
+          clocks_alpha_ocxo_grid_rephase_owner_t::RECOVER);
+    }
+    if (rephase_status == clocks_alpha_ocxo_grid_rephase_status_t::PENDING) {
+      recover_lifecycle_set_reason("recover_ocxo_grid_rephase_pending");
+      publish_dac_tick("RECOVER_GRID_REPHASE_PENDING");
+      return;
+    }
+    if (rephase_status != clocks_alpha_ocxo_grid_rephase_status_t::COMPLETE) {
+      g_recover_lifecycle_last_interrupt_service_rearm_ok = false;
+      g_recover_lifecycle_interrupt_service_rearm_failure_count++;
+      clocks_alpha_ocxo_grid_rephase_acknowledge(
+          clocks_alpha_ocxo_grid_rephase_owner_t::RECOVER);
+      recover_lifecycle_abort("recover_ocxo_grid_rephase_failed");
+      publish_dac_tick("RECOVER_GRID_REPHASE_FAILED");
+      return;
+    }
+
     ocxo_dac_pacing_abort_all();
     ocxo_dac_predictor_reset(ocxo1_dac);
     ocxo_dac_predictor_reset(ocxo2_dac);
@@ -8636,6 +8673,8 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
 
     request_recover = false;
     flash_cut_clear_pending();
+    clocks_alpha_ocxo_grid_rephase_acknowledge(
+        clocks_alpha_ocxo_grid_rephase_owner_t::RECOVER);
     recover_lifecycle_complete_at_pps();
     campaign_warmup_begin(campaign_warmup_mode_t::RECOVER);
     publish_dac_tick("RECOVER_GATE");

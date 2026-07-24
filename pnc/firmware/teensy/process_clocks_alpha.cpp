@@ -1492,7 +1492,14 @@ static inline void dwt_enable(void) {
 }
 
 bool clocks_epoch_pending(void) {
-  return interrupt_smartzero_running() || g_alpha_epoch_install_in_progress;
+  return interrupt_smartzero_running() ||
+         g_alpha_epoch_install_in_progress ||
+         clocks_alpha_ocxo_grid_rephase_status(
+             clocks_alpha_ocxo_grid_rephase_owner_t::SMARTZERO_EPOCH) ==
+             clocks_alpha_ocxo_grid_rephase_status_t::PENDING ||
+         clocks_alpha_ocxo_grid_rephase_status(
+             clocks_alpha_ocxo_grid_rephase_owner_t::RECOVER) ==
+             clocks_alpha_ocxo_grid_rephase_status_t::PENDING;
 }
 
 static inline bool epoch_ready(void) {
@@ -6920,6 +6927,46 @@ static clocks_alpha_smartzero_delay_snapshot_t
 static clocks_alpha_smartzero_delay_snapshot_t
     g_alpha_smartzero_delay_install_scratch DMAMEM = {};
 
+enum class alpha_ocxo_grid_rephase_stage_t : uint8_t {
+  IDLE = 0,
+  WAIT_OCXO1,
+  WAIT_OCXO2,
+  READY_SMARTZERO_COMMIT,
+  COMPLETE,
+  FAILED,
+};
+
+struct alpha_ocxo_grid_rephase_transaction_t {
+  clocks_alpha_ocxo_grid_rephase_owner_t owner =
+      clocks_alpha_ocxo_grid_rephase_owner_t::NONE;
+  alpha_ocxo_grid_rephase_stage_t stage =
+      alpha_ocxo_grid_rephase_stage_t::IDLE;
+  interrupt_ocxo_grid_rephase_mode_t interrupt_mode =
+      interrupt_ocxo_grid_rephase_mode_t::PRESERVE_LOGICAL_EPOCH;
+  timepop_handle_t handle = TIMEPOP_INVALID_HANDLE;
+  uint32_t generation = 0U;
+  uint32_t logical_ocxo1_counter32 = 0U;
+  uint32_t logical_ocxo2_counter32 = 0U;
+  uint32_t next_epoch_sequence = 0U;
+  uint32_t smartzero_sequence = 0U;
+  bool prior_epoch_valid = false;
+  uint32_t prior_ocxo1_counter32 = 0U;
+  uint32_t prior_ocxo2_counter32 = 0U;
+  interrupt_smartzero_snapshot_t smartzero{};
+};
+
+static alpha_ocxo_grid_rephase_transaction_t
+    g_alpha_ocxo_grid_rephase DMAMEM = {};
+
+static constexpr const char* ALPHA_OCXO_GRID_REPHASE_OCXO1_TIMER =
+    "clocks-ocxo-grid-o1";
+static constexpr const char* ALPHA_OCXO_GRID_REPHASE_OCXO2_TIMER =
+    "clocks-ocxo-grid-o2";
+
+static void alpha_smartzero_install_fail(uint32_t stage,
+                                         uint32_t failure_code);
+static bool alpha_smartzero_finish_epoch_commit(void);
+
 // Tiny current-selector witness used by the SmartZero install transaction.
 // pps_selector_callback authors it before any START/ZERO control path runs.
 static volatile uint32_t g_alpha_latest_selector_reference_sequence = 0;
@@ -6975,48 +7022,213 @@ static uint32_t alpha_smartzero_minimum_separation_cycles(void) {
   // Ceil the ns->DWT conversion: this is a minimum-separation contract, so
   // truncation by even one fractional DWT cycle is not admissible.
   const uint64_t numerator =
-      CLOCKS_SMARTZERO_MIN_EDGE_SEPARATION_NS * (uint64_t)DWT_NS_DEN +
+      CLOCKS_OCXO_GRID_REPHASE_DELAY_NS * (uint64_t)DWT_NS_DEN +
       ((uint64_t)DWT_NS_NUM - 1ULL);
   const uint64_t cycles = numerator / (uint64_t)DWT_NS_NUM;
   return cycles > (uint64_t)UINT32_MAX ? UINT32_MAX : (uint32_t)cycles;
 }
 
-static void alpha_smartzero_wait_until_dwt(uint32_t earliest_dwt) {
-  while ((int32_t)(DWT_CYCCNT - earliest_dwt) < 0) {
-    // Intentional sub-millisecond spin.  Priority-0 capture remains enabled;
-    // preemption may enlarge the gap but can never make it smaller.
+static bool alpha_ocxo_grid_rephase_active(void) {
+  return g_alpha_ocxo_grid_rephase.stage ==
+             alpha_ocxo_grid_rephase_stage_t::WAIT_OCXO1 ||
+         g_alpha_ocxo_grid_rephase.stage ==
+             alpha_ocxo_grid_rephase_stage_t::WAIT_OCXO2 ||
+         g_alpha_ocxo_grid_rephase.stage ==
+             alpha_ocxo_grid_rephase_stage_t::READY_SMARTZERO_COMMIT;
+}
+
+clocks_alpha_ocxo_grid_rephase_status_t
+clocks_alpha_ocxo_grid_rephase_status(
+    clocks_alpha_ocxo_grid_rephase_owner_t owner) {
+  if (owner == clocks_alpha_ocxo_grid_rephase_owner_t::NONE ||
+      g_alpha_ocxo_grid_rephase.owner != owner) {
+    return clocks_alpha_ocxo_grid_rephase_status_t::IDLE;
+  }
+  switch (g_alpha_ocxo_grid_rephase.stage) {
+    case alpha_ocxo_grid_rephase_stage_t::WAIT_OCXO1:
+    case alpha_ocxo_grid_rephase_stage_t::WAIT_OCXO2:
+    case alpha_ocxo_grid_rephase_stage_t::READY_SMARTZERO_COMMIT:
+      return clocks_alpha_ocxo_grid_rephase_status_t::PENDING;
+    case alpha_ocxo_grid_rephase_stage_t::COMPLETE:
+      return clocks_alpha_ocxo_grid_rephase_status_t::COMPLETE;
+    case alpha_ocxo_grid_rephase_stage_t::FAILED:
+      return clocks_alpha_ocxo_grid_rephase_status_t::FAILED;
+    default:
+      return clocks_alpha_ocxo_grid_rephase_status_t::IDLE;
   }
 }
 
-static void alpha_smartzero_restore_ocxo_service_after_failure(
-    bool prior_epoch_valid,
-    uint32_t prior_ocxo1_counter32,
-    uint32_t prior_ocxo2_counter32) {
-  if (prior_epoch_valid) {
-    interrupt_ocxo_logical_grid_epoch(prior_ocxo1_counter32,
-                                      prior_ocxo2_counter32);
+void clocks_alpha_ocxo_grid_rephase_acknowledge(
+    clocks_alpha_ocxo_grid_rephase_owner_t owner) {
+  if (g_alpha_ocxo_grid_rephase.owner != owner ||
+      alpha_ocxo_grid_rephase_active()) {
+    return;
   }
-  (void)interrupt_start(interrupt_subscriber_kind_t::OCXO1);
-  (void)interrupt_start(interrupt_subscriber_kind_t::OCXO2);
+  if (g_alpha_ocxo_grid_rephase.handle != TIMEPOP_INVALID_HANDLE) {
+    (void)timepop_cancel(g_alpha_ocxo_grid_rephase.handle);
+  }
+  g_alpha_ocxo_grid_rephase = alpha_ocxo_grid_rephase_transaction_t{};
 }
 
-static bool alpha_smartzero_install_staggered_ocxo_grids(
-    const interrupt_smartzero_lane_snapshot_t& ocxo1,
-    const interrupt_smartzero_lane_snapshot_t& ocxo2,
-    uint32_t epoch_sequence,
-    uint32_t smartzero_sequence,
-    uint32_t* out_failure_code) {
+static void alpha_ocxo_grid_rephase_restore_after_failure(void) {
+  const clocks_alpha_ocxo_grid_rephase_owner_t owner =
+      g_alpha_ocxo_grid_rephase.owner;
+  if (owner == clocks_alpha_ocxo_grid_rephase_owner_t::SMARTZERO_EPOCH) {
+    if (g_alpha_ocxo_grid_rephase.prior_epoch_valid) {
+      interrupt_ocxo_logical_grid_epoch(
+          g_alpha_ocxo_grid_rephase.prior_ocxo1_counter32,
+          g_alpha_ocxo_grid_rephase.prior_ocxo2_counter32);
+    }
+    (void)interrupt_start(interrupt_subscriber_kind_t::OCXO1);
+    (void)interrupt_start(interrupt_subscriber_kind_t::OCXO2);
+    return;
+  }
+
+  if (owner == clocks_alpha_ocxo_grid_rephase_owner_t::RECOVER) {
+    (void)interrupt_recover_rebootstrap_ocxo_service(
+        interrupt_subscriber_kind_t::OCXO1);
+    (void)interrupt_recover_rebootstrap_ocxo_service(
+        interrupt_subscriber_kind_t::OCXO2);
+  }
+}
+
+static void alpha_ocxo_grid_rephase_fail(uint32_t failure_code) {
+  if (g_alpha_ocxo_grid_rephase.handle != TIMEPOP_INVALID_HANDLE) {
+    (void)timepop_cancel(g_alpha_ocxo_grid_rephase.handle);
+    g_alpha_ocxo_grid_rephase.handle = TIMEPOP_INVALID_HANDLE;
+  }
+  alpha_smartzero_delay_publish(g_alpha_smartzero_delay_install_scratch);
+  alpha_ocxo_grid_rephase_restore_after_failure();
+  const clocks_alpha_ocxo_grid_rephase_owner_t owner =
+      g_alpha_ocxo_grid_rephase.owner;
+  g_alpha_ocxo_grid_rephase.stage = alpha_ocxo_grid_rephase_stage_t::FAILED;
+  if (owner == clocks_alpha_ocxo_grid_rephase_owner_t::SMARTZERO_EPOCH) {
+    alpha_smartzero_install_fail(SMARTZERO_INSTALL_STAGE_STAGGER_GRIDS,
+                                 failure_code);
+  }
+}
+
+static void alpha_ocxo_grid_rephase_callback(
+    timepop_ctx_t*, timepop_diag_t*, void*) {
+  alpha_ocxo_grid_rephase_transaction_t& tx = g_alpha_ocxo_grid_rephase;
   clocks_alpha_smartzero_delay_snapshot_t& local =
       g_alpha_smartzero_delay_install_scratch;
-  local = clocks_alpha_smartzero_delay_snapshot_t{};
-  local.epoch_sequence = epoch_sequence;
-  local.smartzero_sequence = smartzero_sequence;
+  tx.handle = TIMEPOP_INVALID_HANDLE;
+
+  if (tx.stage == alpha_ocxo_grid_rephase_stage_t::WAIT_OCXO1) {
+    local.ocxo1_earliest_dwt =
+        local.reference_dwt + local.minimum_separation_cycles;
+    local.ocxo1_install_begin_dwt = DWT_CYCCNT;
+    local.ocxo1_zero_ok = interrupt_ocxo_grid_rephase_install_lane(
+        interrupt_subscriber_kind_t::OCXO1,
+        tx.interrupt_mode,
+        tx.logical_ocxo1_counter32);
+    local.ocxo1_install_complete_dwt = DWT_CYCCNT;
+    local.ocxo1_reference_gap_cycles =
+        local.ocxo1_install_begin_dwt - local.reference_dwt;
+    local.ocxo1_lateness_cycles =
+        local.ocxo1_install_begin_dwt - local.ocxo1_earliest_dwt;
+    local.ocxo1_minimum_satisfied =
+        local.ocxo1_reference_gap_cycles >= local.minimum_separation_cycles;
+    if (!local.ocxo1_zero_ok || !local.ocxo1_minimum_satisfied) {
+      alpha_ocxo_grid_rephase_fail(
+          local.ocxo1_zero_ok ? SMARTZERO_INSTALL_FAIL_MIN_SEPARATION
+                              : SMARTZERO_INSTALL_FAIL_GRID_ZERO);
+      return;
+    }
+
+    local.ocxo2_earliest_dwt =
+        local.ocxo1_install_complete_dwt + local.minimum_separation_cycles;
+    tx.stage = alpha_ocxo_grid_rephase_stage_t::WAIT_OCXO2;
+    tx.handle = timepop_arm(CLOCKS_OCXO_GRID_REPHASE_DELAY_NS,
+                            false,
+                            alpha_ocxo_grid_rephase_callback,
+                            nullptr,
+                            ALPHA_OCXO_GRID_REPHASE_OCXO2_TIMER);
+    if (tx.handle == TIMEPOP_INVALID_HANDLE) {
+      alpha_ocxo_grid_rephase_fail(SMARTZERO_INSTALL_FAIL_SERVICE_STOP);
+    }
+    return;
+  }
+
+  if (tx.stage != alpha_ocxo_grid_rephase_stage_t::WAIT_OCXO2) return;
+
+  local.ocxo2_install_begin_dwt = DWT_CYCCNT;
+  local.ocxo2_zero_ok = interrupt_ocxo_grid_rephase_install_lane(
+      interrupt_subscriber_kind_t::OCXO2,
+      tx.interrupt_mode,
+      tx.logical_ocxo2_counter32);
+  local.ocxo2_install_complete_dwt = DWT_CYCCNT;
+  local.ocxo2_from_ocxo1_gap_cycles =
+      local.ocxo2_install_begin_dwt - local.ocxo1_install_complete_dwt;
+  local.ocxo2_lateness_cycles =
+      local.ocxo2_install_begin_dwt - local.ocxo2_earliest_dwt;
+  local.ocxo2_minimum_satisfied =
+      local.ocxo2_from_ocxo1_gap_cycles >= local.minimum_separation_cycles;
+  local.all_minimums_satisfied =
+      local.ocxo1_minimum_satisfied && local.ocxo2_minimum_satisfied;
+  local.valid = local.ocxo1_zero_ok && local.ocxo2_zero_ok &&
+      local.all_minimums_satisfied;
+  alpha_smartzero_delay_publish(local);
+  if (!local.valid) {
+    alpha_ocxo_grid_rephase_fail(
+        local.ocxo2_zero_ok ? SMARTZERO_INSTALL_FAIL_MIN_SEPARATION
+                            : SMARTZERO_INSTALL_FAIL_GRID_ZERO);
+    return;
+  }
+
+  tx.stage = tx.owner ==
+          clocks_alpha_ocxo_grid_rephase_owner_t::SMARTZERO_EPOCH
+      ? alpha_ocxo_grid_rephase_stage_t::READY_SMARTZERO_COMMIT
+      : alpha_ocxo_grid_rephase_stage_t::COMPLETE;
+}
+
+static bool alpha_ocxo_grid_rephase_begin(
+    clocks_alpha_ocxo_grid_rephase_owner_t owner,
+    interrupt_ocxo_grid_rephase_mode_t interrupt_mode,
+    uint32_t logical_ocxo1_counter32,
+    uint32_t logical_ocxo2_counter32,
+    uint32_t next_epoch_sequence,
+    const interrupt_smartzero_snapshot_t* smartzero) {
+  const clocks_alpha_ocxo_grid_rephase_status_t existing =
+      clocks_alpha_ocxo_grid_rephase_status(owner);
+  if (existing == clocks_alpha_ocxo_grid_rephase_status_t::PENDING ||
+      existing == clocks_alpha_ocxo_grid_rephase_status_t::COMPLETE) {
+    return true;
+  }
+  if (existing == clocks_alpha_ocxo_grid_rephase_status_t::FAILED ||
+      alpha_ocxo_grid_rephase_active() ||
+      owner == clocks_alpha_ocxo_grid_rephase_owner_t::NONE) {
+    return false;
+  }
+
+  alpha_ocxo_grid_rephase_transaction_t tx{};
+  tx.owner = owner;
+  tx.stage = alpha_ocxo_grid_rephase_stage_t::WAIT_OCXO1;
+  tx.interrupt_mode = interrupt_mode;
+  tx.generation = g_alpha_ocxo_grid_rephase.generation + 1U;
+  if (tx.generation == 0U) tx.generation = 1U;
+  tx.logical_ocxo1_counter32 = logical_ocxo1_counter32;
+  tx.logical_ocxo2_counter32 = logical_ocxo2_counter32;
+  tx.next_epoch_sequence = next_epoch_sequence;
+  tx.smartzero_sequence = smartzero ? smartzero->sequence : 0U;
+  tx.prior_epoch_valid =
+      g_epoch_initialized &&
+      g_alpha_epoch_last_ocxo1_zero_valid &&
+      g_alpha_epoch_last_ocxo2_zero_valid;
+  tx.prior_ocxo1_counter32 = g_alpha_epoch_last_ocxo1_counter32;
+  tx.prior_ocxo2_counter32 = g_alpha_epoch_last_ocxo2_counter32;
+  if (smartzero) tx.smartzero = *smartzero;
+
+  clocks_alpha_smartzero_delay_snapshot_t local{};
+  local.epoch_sequence = next_epoch_sequence;
+  local.smartzero_sequence = tx.smartzero_sequence;
   local.install_count = g_alpha_smartzero_delay_snapshot.install_count + 1U;
-  local.minimum_separation_us = CLOCKS_SMARTZERO_MIN_EDGE_SEPARATION_US;
-  local.minimum_separation_cycles =
-      alpha_smartzero_minimum_separation_cycles();
-  local.ocxo1_zero_counter32 = ocxo1.anchor_counter32;
-  local.ocxo2_zero_counter32 = ocxo2.anchor_counter32;
+  local.minimum_separation_us =
+      CLOCKS_OCXO_GRID_REPHASE_DELAY_MS * 1000U;
+  local.minimum_separation_cycles = alpha_smartzero_minimum_separation_cycles();
+  local.ocxo1_zero_counter32 = logical_ocxo1_counter32;
+  local.ocxo2_zero_counter32 = logical_ocxo2_counter32;
 
   const uint32_t reference_probe_dwt = DWT_CYCCNT;
   const uint32_t selector_sequence =
@@ -7032,90 +7244,26 @@ static bool alpha_smartzero_install_staggered_ocxo_grids(
   local.reference_dwt = local.reference_from_pps_vclock
       ? selector_dwt
       : reference_probe_dwt;
-
-  const bool prior_epoch_valid =
-      g_epoch_initialized &&
-      g_alpha_epoch_last_ocxo1_zero_valid &&
-      g_alpha_epoch_last_ocxo2_zero_valid;
-  const uint32_t prior_ocxo1_counter32 = g_alpha_epoch_last_ocxo1_counter32;
-  const uint32_t prior_ocxo2_counter32 = g_alpha_epoch_last_ocxo2_counter32;
-
-  const bool ocxo1_stopped =
-      interrupt_stop(interrupt_subscriber_kind_t::OCXO1);
-  const bool ocxo2_stopped =
-      interrupt_stop(interrupt_subscriber_kind_t::OCXO2);
-  if (!ocxo1_stopped || !ocxo2_stopped) {
-    alpha_smartzero_restore_ocxo_service_after_failure(
-        prior_epoch_valid, prior_ocxo1_counter32, prior_ocxo2_counter32);
-    if (out_failure_code) {
-      *out_failure_code = SMARTZERO_INSTALL_FAIL_SERVICE_STOP;
-    }
-    alpha_smartzero_delay_publish(local);
-    return false;
-  }
-
   local.ocxo1_earliest_dwt =
       local.reference_dwt + local.minimum_separation_cycles;
-  alpha_smartzero_wait_until_dwt(local.ocxo1_earliest_dwt);
-  local.ocxo1_install_begin_dwt = DWT_CYCCNT;
-  const bool ocxo1_zeroed = interrupt_clock32_zero_from_ns(
-      interrupt_subscriber_kind_t::OCXO1,
-      (uint64_t)ocxo1.anchor_counter32 * (uint64_t)NS_PER_10MHZ_TICK);
-  const bool ocxo1_started =
-      interrupt_start(interrupt_subscriber_kind_t::OCXO1);
-  local.ocxo1_install_complete_dwt = DWT_CYCCNT;
-  local.ocxo1_zero_ok = ocxo1_zeroed && ocxo1_started;
-  local.ocxo1_reference_gap_cycles =
-      local.ocxo1_install_begin_dwt - local.reference_dwt;
-  local.ocxo1_lateness_cycles =
-      local.ocxo1_install_begin_dwt - local.ocxo1_earliest_dwt;
-  local.ocxo1_minimum_satisfied =
-      local.ocxo1_reference_gap_cycles >= local.minimum_separation_cycles;
 
-  if (!local.ocxo1_zero_ok) {
-    alpha_smartzero_restore_ocxo_service_after_failure(
-        prior_epoch_valid, prior_ocxo1_counter32, prior_ocxo2_counter32);
-    if (out_failure_code) *out_failure_code = SMARTZERO_INSTALL_FAIL_GRID_ZERO;
-    alpha_smartzero_delay_publish(local);
+  g_alpha_ocxo_grid_rephase = tx;
+  g_alpha_smartzero_delay_install_scratch = local;
+  if (!interrupt_ocxo_grid_rephase_prepare()) {
+    alpha_ocxo_grid_rephase_fail(SMARTZERO_INSTALL_FAIL_SERVICE_STOP);
     return false;
   }
 
-  local.ocxo2_earliest_dwt =
-      local.ocxo1_install_complete_dwt + local.minimum_separation_cycles;
-  alpha_smartzero_wait_until_dwt(local.ocxo2_earliest_dwt);
-  local.ocxo2_install_begin_dwt = DWT_CYCCNT;
-  const bool ocxo2_zeroed = interrupt_clock32_zero_from_ns(
-      interrupt_subscriber_kind_t::OCXO2,
-      (uint64_t)ocxo2.anchor_counter32 * (uint64_t)NS_PER_10MHZ_TICK);
-  const bool ocxo2_started =
-      interrupt_start(interrupt_subscriber_kind_t::OCXO2);
-  local.ocxo2_install_complete_dwt = DWT_CYCCNT;
-  local.ocxo2_zero_ok = ocxo2_zeroed && ocxo2_started;
-  local.ocxo2_from_ocxo1_gap_cycles =
-      local.ocxo2_install_begin_dwt - local.ocxo1_install_complete_dwt;
-  local.ocxo2_lateness_cycles =
-      local.ocxo2_install_begin_dwt - local.ocxo2_earliest_dwt;
-  local.ocxo2_minimum_satisfied =
-      local.ocxo2_from_ocxo1_gap_cycles >= local.minimum_separation_cycles;
-  local.all_minimums_satisfied =
-      local.ocxo1_minimum_satisfied && local.ocxo2_minimum_satisfied;
-  local.valid = local.ocxo1_zero_ok && local.ocxo2_zero_ok &&
-      local.all_minimums_satisfied;
-
-  if (!local.valid) {
-    alpha_smartzero_restore_ocxo_service_after_failure(
-        prior_epoch_valid, prior_ocxo1_counter32, prior_ocxo2_counter32);
-    if (out_failure_code) {
-      *out_failure_code = local.ocxo2_zero_ok
-          ? SMARTZERO_INSTALL_FAIL_MIN_SEPARATION
-          : SMARTZERO_INSTALL_FAIL_GRID_ZERO;
-    }
-    alpha_smartzero_delay_publish(local);
+  g_alpha_ocxo_grid_rephase.handle =
+      timepop_arm(CLOCKS_OCXO_GRID_REPHASE_DELAY_NS,
+                  false,
+                  alpha_ocxo_grid_rephase_callback,
+                  nullptr,
+                  ALPHA_OCXO_GRID_REPHASE_OCXO1_TIMER);
+  if (g_alpha_ocxo_grid_rephase.handle == TIMEPOP_INVALID_HANDLE) {
+    alpha_ocxo_grid_rephase_fail(SMARTZERO_INSTALL_FAIL_SERVICE_STOP);
     return false;
   }
-
-  if (out_failure_code) *out_failure_code = SMARTZERO_INSTALL_FAIL_NONE;
-  alpha_smartzero_delay_publish(local);
   return true;
 }
 
@@ -7312,23 +7460,39 @@ volatile bool     g_alpha_runtime_epoch_capture_last_cap_vclock_valid = false;
 volatile bool     g_alpha_runtime_epoch_capture_last_cap_all_lanes_valid = false;
 
 bool clocks_alpha_recover_rearm_interrupt_service(void) {
-  // VCLOCK remains the sovereign running anchor.  Its ensure path is a strict
-  // no-op while the native heartbeat is alive and therefore does not reset the
-  // live PPS/VCLOCK anchor ring.
-  //
-  // OCXO RECOVER is deliberately stronger.  CounterLedger can keep sampling
-  // PPS counters while the one-second capture/handoff/fact-drain ferry is
-  // wedged, so runtime_active alone is not a liveness proof. Cut each stale
-  // delivery pipeline while preserving a hardware-verified live one-second
-  // compare; re-arm from the installed logical grid only if that target is not
-  // provably alive.
-  const bool vclock_ok =
-      interrupt_ensure_service(interrupt_subscriber_kind_t::VCLOCK);
-  const bool ocxo1_ok = interrupt_recover_rebootstrap_ocxo_service(
-      interrupt_subscriber_kind_t::OCXO1);
-  const bool ocxo2_ok = interrupt_recover_rebootstrap_ocxo_service(
-      interrupt_subscriber_kind_t::OCXO2);
-  return vclock_ok && ocxo1_ok && ocxo2_ok;
+  const clocks_alpha_ocxo_grid_rephase_status_t status =
+      clocks_alpha_ocxo_grid_rephase_status(
+          clocks_alpha_ocxo_grid_rephase_owner_t::RECOVER);
+  if (status == clocks_alpha_ocxo_grid_rephase_status_t::PENDING ||
+      status == clocks_alpha_ocxo_grid_rephase_status_t::COMPLETE) {
+    return true;
+  }
+  if (status == clocks_alpha_ocxo_grid_rephase_status_t::FAILED ||
+      !g_epoch_initialized || g_alpha_epoch_install_in_progress) {
+    return false;
+  }
+
+  // VCLOCK remains sovereign and continuous.  Both OCXO lanes then enter the
+  // same staged physical-grid transaction used by START, but their installed
+  // logical zeros and long Alpha ledgers remain untouched.
+  if (!interrupt_ensure_service(interrupt_subscriber_kind_t::VCLOCK)) {
+    return false;
+  }
+
+  interrupt_clock_snapshot_t ocxo1{};
+  interrupt_clock_snapshot_t ocxo2{};
+  if (!interrupt_clock_snapshot(interrupt_subscriber_kind_t::OCXO1, &ocxo1) ||
+      !interrupt_clock_snapshot(interrupt_subscriber_kind_t::OCXO2, &ocxo2)) {
+    return false;
+  }
+
+  return alpha_ocxo_grid_rephase_begin(
+      clocks_alpha_ocxo_grid_rephase_owner_t::RECOVER,
+      interrupt_ocxo_grid_rephase_mode_t::PRESERVE_LOGICAL_EPOCH,
+      ocxo1.counter32,
+      ocxo2.counter32,
+      g_alpha_epoch_sequence,
+      nullptr);
 }
 
 void clocks_alpha_recover_reprime_ocxo_state(void) {
@@ -7344,13 +7508,10 @@ void clocks_alpha_recover_reprime_ocxo_state(void) {
   // through pre-recovery state.
   g_alpha_recover_reprime_count++;
 
-  // The row that carried the RECOVER command has already captured both OCXO
-  // edges.  Preserve those two observed endpoints only as the left bookends of
-  // the new chain; all interval, phase, bridge, and publication custody below
-  // is still cut.  The next post-recovery edge therefore forms a wholly fresh
-  // adjacent interval without sacrificing a public PPS row.
-  const uint32_t ocxo1_recover_seed_dwt = g_ocxo1_measurement.dwt_at_edge;
-  const uint32_t ocxo2_recover_seed_dwt = g_ocxo2_measurement.dwt_at_edge;
+  // The physical grids were rephased before this PPS gate.  Any Alpha OCXO
+  // endpoint still visible here belongs to the old grid and must not seed the
+  // replacement chain.  The first post-recovery edge becomes the new left
+  // bookend; the following adjacent edge forms the first lawful interval.
 
   alpha_timebase_row_reset_all();         // no pre-recovery PPS row may survive
   alpha_measured_ns_reset_all();          // bridge anchors + pending OCXO edges
@@ -7359,8 +7520,6 @@ void clocks_alpha_recover_reprime_ocxo_state(void) {
 
   g_ocxo1_measurement = clock_measurement_t{};
   g_ocxo2_measurement = clock_measurement_t{};
-  g_ocxo1_measurement.prev_dwt_at_edge = ocxo1_recover_seed_dwt;
-  g_ocxo2_measurement.prev_dwt_at_edge = ocxo2_recover_seed_dwt;
 
   // Window-error mirrors are report diagnostics.  Clear the OCXO evidence that
   // is interval-relative, but keep public-origin and epoch state intact.
@@ -7914,64 +8073,21 @@ bool clocks_alpha_begin_smartzero_epoch(const char* reason) {
   return ok;
 }
 
-bool clocks_alpha_zero_from_smartzero(const char* reason) {
-  const char* install_reason = (reason && *reason) ? reason : "smartzero";
-
-  if (g_alpha_epoch_install_in_progress) {
-    g_alpha_smartzero_install_attempt_count++;
-    safeCopy(g_alpha_smartzero_install_last_reason,
-             sizeof(g_alpha_smartzero_install_last_reason),
-             install_reason);
-    g_alpha_smartzero_install_last_failure_stage = SMARTZERO_INSTALL_STAGE_SNAPSHOT;
-    g_alpha_smartzero_install_last_failure_code = SMARTZERO_INSTALL_FAIL_REENTRANT;
-    g_alpha_smartzero_install_last_success = false;
-    g_alpha_smartzero_install_last_atomic = false;
-    g_alpha_smartzero_install_failure_count++;
-    g_alpha_epoch_install_failures++;
-    g_alpha_smartzero_install_last_stage = SMARTZERO_INSTALL_STAGE_FAIL;
-    clocks_feature_set_cached("SMARTZERO",
-                              g_clocks_feature_smartzero,
-                              system_feature_status_t::ANOMALY);
-    clocks_feature_set_cached("ALPHA_EPOCH",
-                              g_clocks_feature_alpha_epoch,
-                              system_feature_status_t::ANOMALY);
+static bool alpha_smartzero_finish_epoch_commit(void) {
+  alpha_ocxo_grid_rephase_transaction_t& tx = g_alpha_ocxo_grid_rephase;
+  if (tx.owner !=
+          clocks_alpha_ocxo_grid_rephase_owner_t::SMARTZERO_EPOCH ||
+      tx.stage != alpha_ocxo_grid_rephase_stage_t::READY_SMARTZERO_COMMIT) {
     return false;
   }
 
-  alpha_smartzero_install_begin_transaction(install_reason);
-
-  interrupt_smartzero_snapshot_t z{};
-  if (!interrupt_smartzero_snapshot(&z) || !z.complete) {
-    alpha_smartzero_install_fail(SMARTZERO_INSTALL_STAGE_SNAPSHOT,
-                                 SMARTZERO_INSTALL_FAIL_NO_COMPLETE_PROOF);
-    return false;
-  }
-  g_alpha_smartzero_install_last_live_sequence = z.sequence;
-
-  alpha_smartzero_install_mark_stage(SMARTZERO_INSTALL_STAGE_VALIDATE);
-  if (!smartzero_completed_proof_valid(z)) {
-    alpha_smartzero_install_fail(SMARTZERO_INSTALL_STAGE_VALIDATE,
-                                 SMARTZERO_INSTALL_FAIL_BAD_LANE_PROOF);
-    return false;
-  }
-
+  const interrupt_smartzero_snapshot_t& z = tx.smartzero;
   const interrupt_smartzero_lane_snapshot_t& vclock = z.lanes[0];
   const interrupt_smartzero_lane_snapshot_t& ocxo1  = z.lanes[1];
   const interrupt_smartzero_lane_snapshot_t& ocxo2  = z.lanes[2];
-  const uint32_t next_epoch_sequence = g_alpha_epoch_sequence + 1U;
+  const uint32_t next_epoch_sequence = tx.next_epoch_sequence;
+  const char* install_reason = g_alpha_smartzero_install_last_reason;
 
-  // Re-author the two physical OCXO grids before destroying the prior Alpha
-  // epoch.  g_alpha_epoch_install_in_progress already prevents event consumers
-  // from applying facts during this bounded stop/zero/start transaction.
-  alpha_smartzero_install_mark_stage(SMARTZERO_INSTALL_STAGE_STAGGER_GRIDS);
-  uint32_t stagger_failure = SMARTZERO_INSTALL_FAIL_NONE;
-  if (!alpha_smartzero_install_staggered_ocxo_grids(
-          ocxo1, ocxo2, next_epoch_sequence, z.sequence,
-          &stagger_failure)) {
-    alpha_smartzero_install_fail(SMARTZERO_INSTALL_STAGE_STAGGER_GRIDS,
-                                 stagger_failure);
-    return false;
-  }
   const clocks_alpha_smartzero_delay_snapshot_t& stagger =
       g_alpha_smartzero_delay_install_scratch;
 
@@ -8103,7 +8219,83 @@ bool clocks_alpha_zero_from_smartzero(const char* reason) {
                             true);
   clocks_feature_update_alpha_epoch();
   clocks_feature_update_ocxo_public_origin();
+  tx.stage = alpha_ocxo_grid_rephase_stage_t::COMPLETE;
+  clocks_alpha_ocxo_grid_rephase_acknowledge(
+      clocks_alpha_ocxo_grid_rephase_owner_t::SMARTZERO_EPOCH);
   return true;
+}
+
+bool clocks_alpha_zero_from_smartzero(const char* reason) {
+  const char* install_reason = (reason && *reason) ? reason : "smartzero";
+  const clocks_alpha_ocxo_grid_rephase_owner_t owner =
+      clocks_alpha_ocxo_grid_rephase_owner_t::SMARTZERO_EPOCH;
+  const clocks_alpha_ocxo_grid_rephase_status_t status =
+      clocks_alpha_ocxo_grid_rephase_status(owner);
+
+  if (status == clocks_alpha_ocxo_grid_rephase_status_t::PENDING) {
+    if (g_alpha_ocxo_grid_rephase.stage ==
+        alpha_ocxo_grid_rephase_stage_t::READY_SMARTZERO_COMMIT) {
+      return alpha_smartzero_finish_epoch_commit();
+    }
+    return false;
+  }
+  if (status == clocks_alpha_ocxo_grid_rephase_status_t::COMPLETE) {
+    clocks_alpha_ocxo_grid_rephase_acknowledge(owner);
+    return true;
+  }
+  if (status == clocks_alpha_ocxo_grid_rephase_status_t::FAILED) {
+    // Command-owned START/ZERO lets Beta consume and report the failure.
+    // Autonomous cold startup has no such owner, so release the terminal state
+    // and allow the completed SmartZero proof to retry on a later PPS.
+    if (!request_start && !request_zero) {
+      clocks_alpha_ocxo_grid_rephase_acknowledge(owner);
+    }
+    return false;
+  }
+
+  if (g_alpha_epoch_install_in_progress || alpha_ocxo_grid_rephase_active()) {
+    return false;
+  }
+
+  alpha_smartzero_install_begin_transaction(install_reason);
+
+  interrupt_smartzero_snapshot_t z{};
+  if (!interrupt_smartzero_snapshot(&z) || !z.complete) {
+    alpha_smartzero_install_fail(SMARTZERO_INSTALL_STAGE_SNAPSHOT,
+                                 SMARTZERO_INSTALL_FAIL_NO_COMPLETE_PROOF);
+    return false;
+  }
+  g_alpha_smartzero_install_last_live_sequence = z.sequence;
+
+  alpha_smartzero_install_mark_stage(SMARTZERO_INSTALL_STAGE_VALIDATE);
+  if (!smartzero_completed_proof_valid(z)) {
+    alpha_smartzero_install_fail(SMARTZERO_INSTALL_STAGE_VALIDATE,
+                                 SMARTZERO_INSTALL_FAIL_BAD_LANE_PROOF);
+    return false;
+  }
+
+  const interrupt_smartzero_lane_snapshot_t& ocxo1 = z.lanes[1];
+  const interrupt_smartzero_lane_snapshot_t& ocxo2 = z.lanes[2];
+  const uint32_t next_epoch_sequence = g_alpha_epoch_sequence + 1U;
+  alpha_smartzero_install_mark_stage(SMARTZERO_INSTALL_STAGE_STAGGER_GRIDS);
+  if (!alpha_ocxo_grid_rephase_begin(
+          owner,
+          interrupt_ocxo_grid_rephase_mode_t::NEW_LOGICAL_EPOCH,
+          ocxo1.anchor_counter32,
+          ocxo2.anchor_counter32,
+          next_epoch_sequence,
+          &z)) {
+    if (clocks_alpha_ocxo_grid_rephase_status(owner) !=
+        clocks_alpha_ocxo_grid_rephase_status_t::FAILED) {
+      alpha_smartzero_install_fail(SMARTZERO_INSTALL_STAGE_STAGGER_GRIDS,
+                                   SMARTZERO_INSTALL_FAIL_SERVICE_STOP);
+    }
+    return false;
+  }
+
+  // The TimePop transaction owns the next 100 ms.  A later PPS/control pass
+  // resumes here and commits the epoch only after both physical grids exist.
+  return false;
 }
 
 bool clocks_alpha_zero_from_interrupt_capture(const char* reason) {

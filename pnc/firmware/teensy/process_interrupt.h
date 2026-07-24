@@ -1084,12 +1084,30 @@ bool interrupt_start(interrupt_subscriber_kind_t kind);
 // runtime or lane-local compare service is actually inactive.
 bool interrupt_ensure_service(interrupt_subscriber_kind_t kind);
 
-// RECOVER-only OCXO observed-edge rebootstrap.  Clears stale capture and
-// deferred-dispatch custody, preserves the installed logical clock zero, and
-// rebuilds one fresh wrap-proof one-second target from the live hardware
-// coordinate.  VCLOCK resumes low-word rollover tending until that target can
-// be armed safely, even if the prior 32-bit coordinate lost grid phase.
-// Does not touch VCLOCK, SmartZero proof state, the OCXO logical zero, or DACs.
+// Shared START/ZERO/RECOVER physical-grid rephase custody.
+//
+// prepare() quiesces both OCXO lanes before either replacement grid is
+// installed.  It clears capture/deferred/delay custody and disables active
+// compares, but preserves each synthetic logical clock and its installed zero.
+//
+// install_lane() is called by CLOCKS/Alpha at the TimePop-authored physical
+// installation instant.  NEW_LOGICAL_EPOCH maps the supplied logical counter
+// coordinate onto the live hardware counter.  PRESERVE_LOGICAL_EPOCH advances
+// the existing logical clock to the live hardware coordinate.  Both modes
+// author the next one-second target from that instant and restart the lane.
+enum class interrupt_ocxo_grid_rephase_mode_t : uint8_t {
+  NEW_LOGICAL_EPOCH      = 0,
+  PRESERVE_LOGICAL_EPOCH = 1,
+};
+
+bool interrupt_ocxo_grid_rephase_prepare(void);
+bool interrupt_ocxo_grid_rephase_install_lane(
+    interrupt_subscriber_kind_t kind,
+    interrupt_ocxo_grid_rephase_mode_t mode,
+    uint32_t logical_counter32);
+
+// Compatibility wrapper for older callers.  New lifecycle code must use the
+// two-stage shared rephase API above.
 bool interrupt_recover_rebootstrap_ocxo_service(
     interrupt_subscriber_kind_t kind);
 

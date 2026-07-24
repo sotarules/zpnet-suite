@@ -60,6 +60,9 @@ class Rail:
     delay_explains_residual: Optional[bool] = None
     residual_after_difference: Optional[int] = None
 
+    # First-instruction DWT captured at the current event's ISR entry.
+    dwt_at_edge: Optional[int] = None
+
 
 @dataclass
 class Row:
@@ -159,6 +162,12 @@ def first_int(*values: Any) -> Optional[int]:
         if parsed is not None:
             return parsed
     return None
+
+
+def signed_dwt_delta(later: int, earlier: int) -> int:
+    """Return later-earlier as an unambiguous signed modulo-2^32 DWT delta."""
+    value = (later - earlier) & 0xFFFFFFFF
+    return value - 0x100000000 if value & 0x80000000 else value
 
 
 def record_root(record: Dict[str, Any]) -> Dict[str, Any]:
@@ -304,6 +313,7 @@ def collect(records: Sequence[Dict[str, Any]]) -> List[Row]:
                     forensic.get(f"{prefix}_delay_explains_residual")
                 ),
                 residual_after_difference=residual_after_difference,
+                dwt_at_edge=i(forensic.get(f"{prefix}_raw")),
             )
             previous[name] = observed
 
@@ -423,6 +433,52 @@ def verdict_note(row: Row, selected: Sequence[str]) -> str:
 
 
 
+def collision_crosscheck(row: Row, victim_name: str) -> Optional[str]:
+    """Crosscheck a claimed OCXO-on-OCXO delay against captured ISR-entry DWTs.
+
+    The delayed endpoint's captured DWT already includes the service delay.  For
+    a genuine same-epoch collision, the signed service-entry separation should
+    therefore agree with the victim's positive endpoint delay within the
+    producer's stated uncertainty envelope.
+    """
+    victim = row.rails[victim_name]
+    cause_name = victim.delay_by
+    if victim.delay_status != "DELAYED" or cause_name not in {"OCXO1", "OCXO2"}:
+        return None
+
+    cause = row.rails[cause_name]
+    if victim.dwt_at_edge is None or cause.dwt_at_edge is None:
+        return "DWT crosscheck unavailable"
+
+    signed_sep = signed_dwt_delta(victim.dwt_at_edge, cause.dwt_at_edge)
+    abs_sep = abs(signed_sep)
+
+    expected = victim.delay_cycles if victim.delay_cycles_valid is True else None
+    uncertainty = victim.delay_uncertainty_cycles
+
+    plausible: Optional[bool] = None
+    mismatch: Optional[int] = None
+    if expected is not None:
+        mismatch = signed_sep - expected
+        if uncertainty is not None:
+            plausible = signed_sep >= 0 and abs(mismatch) <= uncertainty
+
+    parts = [
+        f"victim_dwt={victim.dwt_at_edge:,d}",
+        f"cause_dwt={cause.dwt_at_edge:,d}",
+        f"service_sep={signed_sep:+,d}",
+        f"abs={abs_sep:,d}",
+    ]
+    if expected is not None:
+        parts.append(f"expected_delay={expected:+,d}")
+    if mismatch is not None:
+        parts.append(f"mismatch={mismatch:+,d}")
+    if uncertainty is not None:
+        parts.append(f"tolerance={uncertainty:,d}")
+    parts.append(f"plausible={bool_text(plausible)}")
+    return "  ".join(parts)
+
+
 def bool_text(value: Optional[bool]) -> str:
     if value is True:
         return "YES"
@@ -462,6 +518,9 @@ def print_extended_row(row: Row, selected: Sequence[str]) -> None:
             f"status={rail.delay_status}  cause={cause}  "
             f"confidence={rail.delay_confidence}"
         )
+        crosscheck = collision_crosscheck(row, name)
+        if crosscheck is not None:
+            print(f"           Collision {crosscheck}")
         print(
             "           Endpoint  "
             f"valid={bool_text(rail.delay_cycles_valid)}  "
@@ -582,8 +641,11 @@ def main(argv: Sequence[str]) -> None:
         fields.append(note)
         print("  ".join(fields))
         if any(
-            row.rails[name].published_residual is not None
-            and abs(row.rails[name].published_residual) > 12
+            (
+                row.rails[name].published_residual is not None
+                and abs(row.rails[name].published_residual) > 12
+            )
+            or row.rails[name].delay_status != "ON_TIME"
             for name in selected
         ):
             print_extended_row(row, selected)

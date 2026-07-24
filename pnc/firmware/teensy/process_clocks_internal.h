@@ -1197,14 +1197,13 @@ bool clocks_alpha_ocxo_public_origin_ready(void);
 // must not bridge the outage into the first post-recovery residual.
 //
 // A live warm recovery may arrive after a Pi-side publication blackout while
-// the Teensy itself never rebooted.  Preserve the healthy sovereign VCLOCK
-// service exactly as it stands, but deliberately cut and re-open each OCXO
-// one-second delivery pipeline.  CounterLedger PPS capture can remain alive
-// while capture/handoff/fact-drain delivery is wedged, so OCXO logical active
-// flags are not sufficient recovery proof.  A hardware-verified live compare
-// ladder is preserved; only an unverified ladder is re-armed from the installed
-// grid.  This does not replace the Alpha epoch, re-subscribe callbacks, reset
-// SmartZero/public-origin state, or disturb VCLOCK anchors.
+// the Teensy itself never rebooted.  This call begins the same asynchronous
+// 50 ms + 50 ms physical-grid rephase used by START, but selects PRESERVE
+// logical-epoch semantics.  It does not replace the Alpha epoch, re-subscribe
+// callbacks, reset SmartZero/public-origin state, or disturb VCLOCK anchors.
+// A true return means the transaction was accepted or already completed; Beta
+// must consult clocks_alpha_ocxo_grid_rephase_status(RECOVER) before consuming
+// the PPS recovery gate.
 bool clocks_alpha_recover_rearm_interrupt_service(void);
 
 // Beta calls this from the RECOVER gate after the recovery request is observed
@@ -1829,11 +1828,31 @@ void clocks_watchdog_anomaly_payload(const char* reason,
 // The legacy interrupt-capture entry point is retained as a compatibility
 // wrapper during migration.
 //
-// Physical-grid staggering is a separate installation fact.  All three
-// clocks retain one logical zero, while Alpha installs OCXO1 no earlier than
-// the selected PPS/VCLOCK reference plus the configured minimum and installs
-// OCXO2 no earlier than the actual OCXO1 completion plus that same minimum.
-// Priority-0 preemption may enlarge either gap; it must never compress one.
+// Physical-grid rephase is a separate asynchronous installation fact.  START,
+// ZERO, and RECOVER share the same TimePop-staged OCXO1-then-OCXO2 transaction;
+// the owner determines whether logical epoch state is replaced or preserved.
+// Priority-0 preemption may enlarge either 50 ms gap; it must never compress it.
+enum class clocks_alpha_ocxo_grid_rephase_owner_t : uint8_t {
+  NONE            = 0,
+  SMARTZERO_EPOCH = 1,
+  RECOVER         = 2,
+};
+
+enum class clocks_alpha_ocxo_grid_rephase_status_t : uint8_t {
+  IDLE     = 0,
+  PENDING  = 1,
+  COMPLETE = 2,
+  FAILED   = 3,
+};
+
+clocks_alpha_ocxo_grid_rephase_status_t
+clocks_alpha_ocxo_grid_rephase_status(
+    clocks_alpha_ocxo_grid_rephase_owner_t owner);
+void clocks_alpha_ocxo_grid_rephase_acknowledge(
+    clocks_alpha_ocxo_grid_rephase_owner_t owner);
+
+// Compatibility report transcript.  The historic SmartZero naming remains on
+// the wire, but RECOVER now travels through the same physical-grid machinery.
 struct clocks_alpha_smartzero_delay_snapshot_t {
   bool     valid = false;
   bool     reference_from_pps_vclock = false;

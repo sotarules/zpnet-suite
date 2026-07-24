@@ -5156,12 +5156,11 @@ static uint32_t capture_ring_discard_pending(
   return head - tail;
 }
 
-// Recovery is intentionally duplicated by lane.  Every phase accepts no
-// pointers or references, reloads only literal permanent objects, and has an
-// explicit compiler boundary.  No context or runtime address survives across
-// the large diagnostic clears or across the final service-start boundary.
+// Physical-grid rephase remains deliberately lane-bound.  Each helper reloads
+// only literal permanent objects across its compiler boundary; the public API
+// selects a lane but never carries a runtime/context pointer into these clears.
 static __attribute__((noinline, noclone))
-void ocxo1_recovery_runtime_reset_bound(void) {
+void ocxo1_rephase_runtime_reset_bound(bool active) {
   interrupt_subscriber_runtime_t& rt =
       g_subscribers[INTERRUPT_SUBSCRIBER_INDEX_OCXO1];
   interrupt_dispatch_invalidate_locked(rt);
@@ -5176,11 +5175,11 @@ void ocxo1_recovery_runtime_reset_bound(void) {
   rt.previous_interval_delayed_by = interrupt_delay_cause_t::NONE;
   g_delay_seen_ocxo1_token = g_delay_latch_ocxo1.publish_token;
   rt.has_fired = false;
-  rt.active = true;
+  rt.active = active;
 }
 
 static __attribute__((noinline, noclone))
-void ocxo2_recovery_runtime_reset_bound(void) {
+void ocxo2_rephase_runtime_reset_bound(bool active) {
   interrupt_subscriber_runtime_t& rt =
       g_subscribers[INTERRUPT_SUBSCRIBER_INDEX_OCXO2];
   interrupt_dispatch_invalidate_locked(rt);
@@ -5195,13 +5194,15 @@ void ocxo2_recovery_runtime_reset_bound(void) {
   rt.previous_interval_delayed_by = interrupt_delay_cause_t::NONE;
   g_delay_seen_ocxo2_token = g_delay_latch_ocxo2.publish_token;
   rt.has_fired = false;
-  rt.active = true;
+  rt.active = active;
 }
 
 static __attribute__((noinline, noclone))
-void ocxo1_recovery_lane_reset_bound(void) {
-  g_ocxo1_lane.active = true;
+void ocxo1_rephase_lane_quiesce_bound(void) {
+  g_ocxo1_lane.active = false;
   g_ocxo1_lane.previous_event_valid = false;
+  g_ocxo1_lane.previous_event_counter32 = 0U;
+  g_ocxo1_lane.last_counter_delta_ticks = 0U;
   if (g_ocxo1_lane.capture_pending) {
     g_ocxo1_lane.capture_pending_recovery_discard_count++;
     g_ocxo1_lane.capture_pending_clear_count++;
@@ -5210,20 +5211,18 @@ void ocxo1_recovery_lane_reset_bound(void) {
   dmb_barrier();
   g_ocxo1_lane.capture_pending = false;
   dmb_barrier();
-  if (g_ocxo1_lane.compare_armed) {
-    ocxo_disable_compare(g_ocxo1_lane);
-  }
-  // RECOVER rebuilds one provable one-second target from the live hardware
-  // coordinate; VCLOCK resumes rollover tending after this reset.
-  synthetic_clock_tend_from_hardware(g_ocxo1_clock32, ocxo_counter_now(g_ocxo1_lane));
-  ocxo_reset_target_grid(g_ocxo1_lane, g_ocxo1_clock32);
+  if (g_ocxo1_lane.compare_armed) ocxo_disable_compare(g_ocxo1_lane);
+  g_ocxo1_lane.target_grid_valid = false;
+  g_ocxo1_lane.next_target_counter32 = 0U;
   g_ocxo1_lane.rebootstrap_count++;
 }
 
 static __attribute__((noinline, noclone))
-void ocxo2_recovery_lane_reset_bound(void) {
-  g_ocxo2_lane.active = true;
+void ocxo2_rephase_lane_quiesce_bound(void) {
+  g_ocxo2_lane.active = false;
   g_ocxo2_lane.previous_event_valid = false;
+  g_ocxo2_lane.previous_event_counter32 = 0U;
+  g_ocxo2_lane.last_counter_delta_ticks = 0U;
   if (g_ocxo2_lane.capture_pending) {
     g_ocxo2_lane.capture_pending_recovery_discard_count++;
     g_ocxo2_lane.capture_pending_clear_count++;
@@ -5232,91 +5231,174 @@ void ocxo2_recovery_lane_reset_bound(void) {
   dmb_barrier();
   g_ocxo2_lane.capture_pending = false;
   dmb_barrier();
-  if (g_ocxo2_lane.compare_armed) {
-    ocxo_disable_compare(g_ocxo2_lane);
-  }
-  // RECOVER rebuilds one provable one-second target from the live hardware
-  // coordinate; VCLOCK resumes rollover tending after this reset.
-  synthetic_clock_tend_from_hardware(g_ocxo2_clock32, ocxo_counter_now(g_ocxo2_lane));
-  ocxo_reset_target_grid(g_ocxo2_lane, g_ocxo2_clock32);
+  if (g_ocxo2_lane.compare_armed) ocxo_disable_compare(g_ocxo2_lane);
+  g_ocxo2_lane.target_grid_valid = false;
+  g_ocxo2_lane.next_target_counter32 = 0U;
   g_ocxo2_lane.rebootstrap_count++;
 }
 
 static __attribute__((noinline, noclone))
-void ocxo1_recovery_prepare_bound(void) {
-  const uint32_t prior = interrupt_priority0_guard_enter();
-  (void)capture_ring_discard_pending(g_ocxo1_capture_ring);
-  ocxo1_recovery_runtime_reset_bound();
-  ocxo1_recovery_lane_reset_bound();
-  interrupt_priority0_guard_exit(prior);
-}
-
-static __attribute__((noinline, noclone))
-void ocxo2_recovery_prepare_bound(void) {
-  const uint32_t prior = interrupt_priority0_guard_enter();
-  (void)capture_ring_discard_pending(g_ocxo2_capture_ring);
-  ocxo2_recovery_runtime_reset_bound();
-  ocxo2_recovery_lane_reset_bound();
-  interrupt_priority0_guard_exit(prior);
-}
-
-static __attribute__((noinline, noclone))
-bool ocxo1_recovery_ready_bound(void) {
+bool ocxo1_rephase_ready_bound(void) {
   return ocxo1_binding_identity_check() && g_ocxo1_lane.initialized;
 }
 
 static __attribute__((noinline, noclone))
-bool ocxo2_recovery_ready_bound(void) {
+bool ocxo2_rephase_ready_bound(void) {
   return ocxo2_binding_identity_check() && g_ocxo2_lane.initialized;
 }
 
 static __attribute__((noinline, noclone))
-void ocxo1_recovery_complete_bound(void) {
-  g_ocxo1_lane.recover_count++;
-}
-
-static __attribute__((noinline, noclone))
-void ocxo2_recovery_complete_bound(void) {
-  g_ocxo2_lane.recover_count++;
-}
-
-static __attribute__((noinline, noclone))
-bool ocxo1_recover_rebootstrap_bound(void) {
+bool ocxo1_rephase_install_bound(
+    interrupt_ocxo_grid_rephase_mode_t mode,
+    uint32_t logical_counter32) {
   if (OCXO1_DISABLED) return true;
-  if (!ocxo1_recovery_ready_bound()) return false;
+  if (!ocxo1_rephase_ready_bound()) return false;
+
+  const uint32_t prior = interrupt_priority0_guard_enter();
+  const uint16_t hardware16 = ocxo_counter_now(g_ocxo1_lane);
+  if (mode == interrupt_ocxo_grid_rephase_mode_t::NEW_LOGICAL_EPOCH) {
+    synthetic_clock_zero(g_ocxo1_clock32,
+                         (uint64_t)logical_counter32 * 100ULL);
+    g_ocxo1_clock32.hardware16 = hardware16;
+  } else {
+    synthetic_clock_tend_from_hardware(g_ocxo1_clock32, hardware16);
+  }
+  ocxo_reset_target_grid(g_ocxo1_lane, g_ocxo1_clock32);
+  g_ocxo1_lane.previous_event_valid = false;
+  g_ocxo1_lane.previous_event_counter32 = 0U;
+  g_ocxo1_lane.last_counter_delta_ticks = 0U;
+  g_ocxo1_lane.active = true;
+  ocxo1_rephase_runtime_reset_bound(true);
+  if (mode == interrupt_ocxo_grid_rephase_mode_t::NEW_LOGICAL_EPOCH) {
+    g_subscribers[INTERRUPT_SUBSCRIBER_INDEX_OCXO1].start_count++;
+  }
+  interrupt_priority0_guard_exit(prior);
+
+  const bool started = ocxo1_start_one_second_service_bound();
+  if (started &&
+      mode == interrupt_ocxo_grid_rephase_mode_t::PRESERVE_LOGICAL_EPOCH) {
+    g_ocxo1_lane.recover_count++;
+  }
+  return started;
+}
+
+static __attribute__((noinline, noclone))
+bool ocxo2_rephase_install_bound(
+    interrupt_ocxo_grid_rephase_mode_t mode,
+    uint32_t logical_counter32) {
+  if (OCXO2_DISABLED) return true;
+  if (!ocxo2_rephase_ready_bound()) return false;
+
+  const uint32_t prior = interrupt_priority0_guard_enter();
+  const uint16_t hardware16 = ocxo_counter_now(g_ocxo2_lane);
+  if (mode == interrupt_ocxo_grid_rephase_mode_t::NEW_LOGICAL_EPOCH) {
+    synthetic_clock_zero(g_ocxo2_clock32,
+                         (uint64_t)logical_counter32 * 100ULL);
+    g_ocxo2_clock32.hardware16 = hardware16;
+  } else {
+    synthetic_clock_tend_from_hardware(g_ocxo2_clock32, hardware16);
+  }
+  ocxo_reset_target_grid(g_ocxo2_lane, g_ocxo2_clock32);
+  g_ocxo2_lane.previous_event_valid = false;
+  g_ocxo2_lane.previous_event_counter32 = 0U;
+  g_ocxo2_lane.last_counter_delta_ticks = 0U;
+  g_ocxo2_lane.active = true;
+  ocxo2_rephase_runtime_reset_bound(true);
+  if (mode == interrupt_ocxo_grid_rephase_mode_t::NEW_LOGICAL_EPOCH) {
+    g_subscribers[INTERRUPT_SUBSCRIBER_INDEX_OCXO2].start_count++;
+  }
+  interrupt_priority0_guard_exit(prior);
+
+  const bool started = ocxo2_start_one_second_service_bound();
+  if (started &&
+      mode == interrupt_ocxo_grid_rephase_mode_t::PRESERVE_LOGICAL_EPOCH) {
+    g_ocxo2_lane.recover_count++;
+  }
+  return started;
+}
+
+bool interrupt_ocxo_grid_rephase_prepare(void) {
+  if ((!OCXO1_DISABLED && !ocxo1_rephase_ready_bound()) ||
+      (!OCXO2_DISABLED && !ocxo2_rephase_ready_bound())) {
+    return false;
+  }
 
   NVIC_DISABLE_IRQ(IRQ_QTIMER2);
-  ocxo1_recovery_prepare_bound();
-  const bool started = ocxo1_start_one_second_service_bound();
-  NVIC_ENABLE_IRQ(IRQ_QTIMER2);
-  ocxo1_recovery_complete_bound();
-  return started;
-}
-
-static __attribute__((noinline, noclone))
-bool ocxo2_recover_rebootstrap_bound(void) {
-  if (OCXO2_DISABLED) return true;
-  if (!ocxo2_recovery_ready_bound()) return false;
-
   NVIC_DISABLE_IRQ(IRQ_QTIMER3);
-  ocxo2_recovery_prepare_bound();
-  const bool started = ocxo2_start_one_second_service_bound();
+  const uint32_t prior = interrupt_priority0_guard_enter();
+  if (!OCXO1_DISABLED) {
+    (void)capture_ring_discard_pending(g_ocxo1_capture_ring);
+    ocxo1_rephase_runtime_reset_bound(false);
+    ocxo1_rephase_lane_quiesce_bound();
+  }
+  if (!OCXO2_DISABLED) {
+    (void)capture_ring_discard_pending(g_ocxo2_capture_ring);
+    ocxo2_rephase_runtime_reset_bound(false);
+    ocxo2_rephase_lane_quiesce_bound();
+  }
+  interrupt_priority0_guard_exit(prior);
   NVIC_ENABLE_IRQ(IRQ_QTIMER3);
-  ocxo2_recovery_complete_bound();
-  return started;
+  NVIC_ENABLE_IRQ(IRQ_QTIMER2);
+  return true;
 }
 
+bool interrupt_ocxo_grid_rephase_install_lane(
+    interrupt_subscriber_kind_t kind,
+    interrupt_ocxo_grid_rephase_mode_t mode,
+    uint32_t logical_counter32) {
+  if (mode != interrupt_ocxo_grid_rephase_mode_t::NEW_LOGICAL_EPOCH &&
+      mode != interrupt_ocxo_grid_rephase_mode_t::PRESERVE_LOGICAL_EPOCH) {
+    return false;
+  }
+  if (kind == interrupt_subscriber_kind_t::OCXO1) {
+    NVIC_DISABLE_IRQ(IRQ_QTIMER2);
+    const bool ok = ocxo1_rephase_install_bound(mode, logical_counter32);
+    NVIC_ENABLE_IRQ(IRQ_QTIMER2);
+    return ok;
+  }
+  if (kind == interrupt_subscriber_kind_t::OCXO2) {
+    NVIC_DISABLE_IRQ(IRQ_QTIMER3);
+    const bool ok = ocxo2_rephase_install_bound(mode, logical_counter32);
+    NVIC_ENABLE_IRQ(IRQ_QTIMER3);
+    return ok;
+  }
+  return false;
+}
+
+// Compatibility one-lane RECOVER path.  START/ZERO/RECOVER lifecycle code now
+// uses interrupt_ocxo_grid_rephase_prepare() followed by two scheduled installs.
 __attribute__((noinline, noclone))
 bool interrupt_recover_rebootstrap_ocxo_service(
     interrupt_subscriber_kind_t kind) {
-  switch (kind) {
-    case interrupt_subscriber_kind_t::OCXO1:
-      return ocxo1_recover_rebootstrap_bound();
-    case interrupt_subscriber_kind_t::OCXO2:
-      return ocxo2_recover_rebootstrap_bound();
-    default:
-      return false;
+  if (kind == interrupt_subscriber_kind_t::OCXO1) {
+    if (OCXO1_DISABLED) return true;
+    if (!ocxo1_rephase_ready_bound()) return false;
+    NVIC_DISABLE_IRQ(IRQ_QTIMER2);
+    const uint32_t prior = interrupt_priority0_guard_enter();
+    (void)capture_ring_discard_pending(g_ocxo1_capture_ring);
+    ocxo1_rephase_runtime_reset_bound(false);
+    ocxo1_rephase_lane_quiesce_bound();
+    interrupt_priority0_guard_exit(prior);
+    const bool ok = ocxo1_rephase_install_bound(
+        interrupt_ocxo_grid_rephase_mode_t::PRESERVE_LOGICAL_EPOCH, 0U);
+    NVIC_ENABLE_IRQ(IRQ_QTIMER2);
+    return ok;
   }
+  if (kind == interrupt_subscriber_kind_t::OCXO2) {
+    if (OCXO2_DISABLED) return true;
+    if (!ocxo2_rephase_ready_bound()) return false;
+    NVIC_DISABLE_IRQ(IRQ_QTIMER3);
+    const uint32_t prior = interrupt_priority0_guard_enter();
+    (void)capture_ring_discard_pending(g_ocxo2_capture_ring);
+    ocxo2_rephase_runtime_reset_bound(false);
+    ocxo2_rephase_lane_quiesce_bound();
+    interrupt_priority0_guard_exit(prior);
+    const bool ok = ocxo2_rephase_install_bound(
+        interrupt_ocxo_grid_rephase_mode_t::PRESERVE_LOGICAL_EPOCH, 0U);
+    NVIC_ENABLE_IRQ(IRQ_QTIMER3);
+    return ok;
+  }
+  return false;
 }
 
 bool interrupt_stop(interrupt_subscriber_kind_t kind) {
