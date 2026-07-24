@@ -404,12 +404,22 @@ def fmt(value: Optional[int], width: int, signed: bool = False) -> str:
     return f"{text:>{width}}"
 
 
+def delay_verdict_is_exceptional(rail: Rail) -> bool:
+    """Return True only when endpoint testimony asserts an abnormal verdict.
+
+    UNKNOWN with no valid delay evidence means the producer could not classify
+    that endpoint.  It is unavailable testimony, not evidence of a pathology.
+    """
+    return rail.delay_status not in {"ON_TIME", "UNKNOWN"}
+
+
 def verdict_note(row: Row, selected: Sequence[str]) -> str:
     """Return one compact, row-wide interrupt timing verdict.
 
     Quiet rows are deliberately reduced to ON_TIME.  Exceptional clocks are
     named explicitly so the report can be scanned without reading a separate
-    forensic column for every rail.
+    forensic column for every rail.  Unclassified endpoints remain quiet unless
+    the producer reports an affirmative abnormal status.
     """
     aliases = {
         "VCLOCK_TIMEPOP": "VCLOCK",
@@ -425,9 +435,7 @@ def verdict_note(row: Row, selected: Sequence[str]) -> str:
         if rail.delay_status == "DELAYED":
             cause = aliases.get(rail.delay_by, rail.delay_by)
             notes.append(f"{name} DELAYED BY {cause}")
-        elif rail.delay_status == "UNKNOWN":
-            notes.append(f"{name} UNKNOWN")
-        else:
+        elif delay_verdict_is_exceptional(rail):
             notes.append(f"{name} {rail.delay_status}")
     return " | ".join(notes) if notes else "ON_TIME"
 
@@ -487,22 +495,20 @@ def bool_text(value: Optional[bool]) -> str:
     return "UNKNOWN"
 
 
-def print_extended_row(row: Row, selected: Sequence[str]) -> None:
-    """Print focused forensic testimony beneath an interesting compact row.
+def print_extended_row(row: Row, selected: Sequence[str], gate: int) -> None:
+    """Print focused forensic testimony beneath a genuinely exceptional row.
 
-    A row is expanded by the caller when any displayed published raw residual has
-    magnitude greater than 12 cycles.  Within the expansion, only rails whose
-    own residual exceeds that threshold or whose endpoint verdict is exceptional
-    are shown.  This keeps the ordinary report narrow while preserving the
-    evidence needed to reason about OCXO1 Disease and larger ISR events.
+    Residual testimony is expanded only when it exceeds the configured pathology
+    gate.  Endpoint testimony is expanded only for an affirmative abnormal
+    verdict.  UNKNOWN without evidence is intentionally quiet.
     """
     interesting = [
         name for name in selected
         if (
             row.rails[name].published_residual is not None
-            and abs(row.rails[name].published_residual) > 12
+            and abs(row.rails[name].published_residual) > gate
         )
-        or row.rails[name].delay_status != "ON_TIME"
+        or delay_verdict_is_exceptional(row.rails[name])
     ]
     if not interesting:
         return
@@ -643,12 +649,12 @@ def main(argv: Sequence[str]) -> None:
         if any(
             (
                 row.rails[name].published_residual is not None
-                and abs(row.rails[name].published_residual) > 12
+                and abs(row.rails[name].published_residual) > gate
             )
-            or row.rails[name].delay_status != "ON_TIME"
+            or delay_verdict_is_exceptional(row.rails[name])
             for name in selected
         ):
-            print_extended_row(row, selected)
+            print_extended_row(row, selected, gate)
         displayed += 1
 
     if pathology_only:
