@@ -1341,64 +1341,44 @@ def _welford_cols_fragment_or_zero(r, prefix, w_mean, w_sd, w_se, w_n, n=None, m
 
 
 def _dwt_expected_cycles(r: dict):
-    """Return the DWT EXPECTED interval for the DWT detail block.
+    """Return the firmware-authored PPS static prediction in DWT cycles.
 
-    EXPECTED is the GNSS/PPS FloorLine interval in DWT cycles: the cycle
-    distance between the current pair of VCLOCK/GNSS FloorLine edges.  Do not
-    use the static-prediction rail here and do not reconstruct from the DWT
-    residual, because those surfaces can legitimately resolve to the nominal
-    1.008 GHz constant.  If the FloorLine witness is not present, show ---.
+    The canonical TIMEBASE field is prediction.pps.prediction_cycles.  It is
+    deliberately distinct from dwt.cycles_between_pps_vclock, which is the
+    current row's ACTUAL interval.  Older explicit prediction/FloorLine aliases
+    remain readable, but ACTUAL is never used as an EXPECTED fallback.
     """
+    explicit = _prediction_value(r, "pps", "prediction_cycles")
+    if explicit is not None:
+        return _to_int(explicit)
+
     return _to_int(_field(
         r,
-        # Current compact science spine: fragment.vclock.science.*
+        # Transitional explicit DWT/GNSS prediction aliases.
+        "prediction.dwt.prediction_cycles",
+        "dwt.prediction_cycles",
+        "dwt.static_prediction_cycles",
+        "dwt_prediction_cycles",
+        "dwt_static_prediction_cycles",
+        # Older FloorLine prediction surfaces retained only for historical rows.
         "vclock.science.clock_floorline_interval_cycles",
         "vclock.science.vclock_floorline_interval_cycles",
         "vclock.science.floorline_interval_cycles",
         "vclock.science.clock_floorline.endpoint_interval_cycles",
         "vclock.science.floorline.endpoint_interval_cycles",
-        # Paired TIMEBASE_FORENSICS micro raw-cycle companion.
         "forensics.v_fl_cyc",
         "forensics.v_court_fl_int",
-        "forensics.v.floorline_interval_cycles",
-        "forensics.v.clock_floorline_interval_cycles",
-        "forensics.v.lower_envelope.inferred_interval_cycles",
-        "forensics.vclock.floorline.inferred_interval_cycles",
-        "forensics.vclock.forensics.lower_envelope.inferred_interval_cycles",
-        "forensics.vclock.forensics.floorline.inferred_interval_cycles",
-        "forensics.vclock.dwt_forensics.lower_envelope.inferred_interval_cycles",
-        # Direct/root compatibility aliases.
         "v_fl_cyc",
         "v_court_fl_int",
         "vclock_floorline_interval_cycles",
         "vclock_fl_cyc",
         "gnss_floorline_interval_cycles",
         "gnss_fl_cyc",
-        # Older explicit GNSS/FloorLine spellings, but only if they are truly
-        # named as FloorLine fields rather than static prediction fields.
-        "gnss.floorline.cycles_between_edges",
-        "gnss.floorline.cycles_between_floorline_edges",
-        "gnss.floorline.interval_cycles",
-        "gnss.floorline.dwt_interval_cycles",
-        "gnss.floor_line.cycles_between_edges",
-        "gnss.floor_line.interval_cycles",
-        "gnss.floor_line.dwt_interval_cycles",
-        "floorline.gnss.cycles_between_edges",
-        "floorline.gnss.cycles_between_floorline_edges",
-        "floorline.gnss.interval_cycles",
-        "floorline.gnss.dwt_interval_cycles",
-        "floor_line.gnss.cycles_between_edges",
-        "floor_line.gnss.interval_cycles",
-        "floor_line.gnss.dwt_interval_cycles",
         "prediction.gnss.floorline_cycles",
         "prediction.gnss.floorline_interval_cycles",
         "prediction.gnss.floorline_prediction_cycles",
         "prediction.gnss.floorline.prediction_cycles",
         "prediction.gnss.floorline.interval_cycles",
-        "prediction.gnss_floorline.prediction_cycles",
-        "prediction.gnss_floorline.interval_cycles",
-        "prediction.floorline.gnss.prediction_cycles",
-        "prediction.floorline.gnss.interval_cycles",
         "prediction.pps.floorline_prediction_cycles",
         "prediction.pps.floorline_interval_cycles",
     ))
@@ -1652,10 +1632,9 @@ def clocks_combined_readout() -> list[str]:
         "dwt_second_residual_cycles",
     ))
 
-    # EXPECTED is the DWT-cycle interval predicted by the GNSS/PPS
-    # FloorLine surface between the current pair of FloorLine edges.
-    # If the paired TIMEBASE row does not carry that FloorLine witness, show
-    # --- rather than falling back to the nominal/static-prediction rail.
+    # EXPECTED is the next-second DWT-cycle prediction.  Contemporary firmware
+    # uses the prior completed GNSS/PPS interval as its static prediction, while
+    # older rows may still expose an explicit prediction or FloorLine witness.
     dwt_expected = _dwt_expected_cycles(r)
 
     dwt_at_anchor = _field(

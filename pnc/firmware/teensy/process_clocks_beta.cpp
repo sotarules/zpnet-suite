@@ -175,12 +175,12 @@ static constexpr bool TIMEBASE_FORENSICS_MICRO_COUNTERLEDGER_FIELDS_ENABLED = fa
 static constexpr bool TIMEBASE_FORENSICS_SLIM_RAW_CYCLES_PAYLOAD_ENABLED = false;
 
 // TIMEBASE_FRAGMENT must stay comfortably below the Payload arena ceiling.
-// Keep the 1 Hz fragment as the durable science spine and move/omit bulky
-// courtroom detail.  Focused reports and TIMEBASE_FORENSICS carry the richer
-// diagnostic surfaces while the fragment preserves the values needed by panels
-// and raw_nanoseconds-style reports.
+// Keep the 1 Hz fragment as the durable science spine, but retain the compact
+// four-lane static-prediction object as first-class campaign evidence.  Each
+// lane carries the prior completed interval, current actual interval, and
+// current-minus-prior residual.
 static constexpr bool TIMEBASE_FRAGMENT_COMPACT_SCIENCE_ENABLED = true;
-static constexpr bool TIMEBASE_FRAGMENT_PUBLISH_PREDICTION_ENABLED = false;
+static constexpr bool TIMEBASE_FRAGMENT_PUBLISH_PREDICTION_ENABLED = true;
 
 static constexpr uint32_t TIMEBASE_CANDIDATE_INVALID_OCXO1_CUSTODY = 1U << 0;
 static constexpr uint32_t TIMEBASE_CANDIDATE_INVALID_OCXO2_CUSTODY = 1U << 1;
@@ -9764,9 +9764,9 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
     // participates in this object.
     payload_add_raw_cycles_observed(p);
 
-    // Prediction remains available through focused reports and forensics.
-    // Omit it from the 1 Hz fragment when compact mode is active; raw_cycles
-    // can still recover intervals from PPS endpoints and micro raw-cycle fields.
+    // Publish the complete four-lane static-prediction transcript in every
+    // TIMEBASE row.  The prediction for each lane is the prior completed
+    // interval; actual and residual remain separate same-row evidence.
     timebase_build_stage(TIMEBASE_BUILD_STAGE_PREDICTION);
     if (TIMEBASE_FRAGMENT_PUBLISH_PREDICTION_ENABLED) {
       payload_add_prediction_summary_hierarchical(p);
