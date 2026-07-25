@@ -60,7 +60,7 @@ TEENSY_SERIAL_PATH = getattr(constants, "TEENSY_SERIAL_PORT", "/dev/zpnet-teensy
 # Constants (must match Teensy)
 # ---------------------------------------------------------------------
 
-TRANSPORT_MAX_MESSAGE = 32 * 1024
+TRANSPORT_MAX_MESSAGE = 40 * 1024
 FRAME_SLACK = 64
 RX_BUF_MAX = TRANSPORT_MAX_MESSAGE + FRAME_SLACK
 

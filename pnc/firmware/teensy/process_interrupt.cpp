@@ -1015,6 +1015,14 @@ struct ocxo_lane_t {
   uint32_t last_arm_counter32 = 0;
   uint16_t last_arm_hardware16 = 0;
   uint32_t last_arm_remaining_ticks = 0;
+  uint16_t last_arm_counter_low16 = 0;
+  uint16_t last_arm_software_target_low16 = 0;
+  uint16_t last_arm_compare_low16 = 0;
+  uint16_t last_arm_cmpld1_low16 = 0;
+  uint32_t arm_comp1_mismatch_count = 0;
+  uint32_t arm_cmpld1_mismatch_count = 0;
+  uint32_t isr_comp1_mismatch_count = 0;
+  uint32_t isr_cmpld1_mismatch_count = 0;
   uint32_t last_isr_entry_dwt_raw = 0;
   uint32_t last_dwt_at_edge = 0;
   uint32_t last_event_counter32 = 0;
@@ -2026,6 +2034,10 @@ static void ocxo_tend_and_arm(const ocxo_runtime_context_t& ctx) {
   lane.last_arm_counter32 = clock.current_counter32;
   lane.last_arm_hardware16 = clock.hardware16;
   lane.last_arm_remaining_ticks = remaining;
+  lane.last_arm_counter_low16 = ambient_low16;
+  lane.last_arm_software_target_low16 = target_low16;
+  lane.last_arm_compare_low16 = 0U;
+  lane.last_arm_cmpld1_low16 = 0U;
   lane.armed_target_counter32 = lane.next_target_counter32;
   lane.armed_target_low16 = target_low16;
 
@@ -2034,6 +2046,20 @@ static void ocxo_tend_and_arm(const ocxo_runtime_context_t& ctx) {
   lane.compare_armed = true;
   dmb_barrier();
   qtimer_program_compare(*lane.module, lane.channel, target_low16);
+
+  // Read back both physical compare registers while the arm transaction is still
+  // in custody.  The 64-tick minimum lead leaves ample room for these scalar
+  // reads before the compare can lawfully fire.
+  lane.last_arm_compare_low16 =
+      lane.module->CH[lane.channel].COMP1;
+  lane.last_arm_cmpld1_low16 =
+      lane.module->CH[lane.channel].CMPLD1;
+  if (lane.last_arm_compare_low16 != target_low16) {
+    lane.arm_comp1_mismatch_count++;
+  }
+  if (lane.last_arm_cmpld1_low16 != target_low16) {
+    lane.arm_cmpld1_mismatch_count++;
+  }
   lane.arm_count++;
 }
 
@@ -2438,29 +2464,8 @@ static interrupt_handoff_source_diag_t g_handoff_ocxo2{};
 static interrupt_handoff_source_diag_t g_handoff_pps{};
 static volatile uint32_t g_interrupt_capture_sequence = 0U;
 
-// Minimal entry witness copied before handler work.  Classification is deferred
-// to Priority 32 so sovereign capture remains short and the diagnostic itself
-// cannot create the latency it is trying to measure.
-enum class interrupt_execution_source_t : uint8_t {
-  NONE = 0,
-  QTIMER1 = 1,
-  OCXO1 = 2,
-  OCXO2 = 3,
-  PPS = 4,
-  CONTINUATION = 5,
-};
-
-struct interrupt_arrival_capture_t {
-  bool spinidle_running = false;
-  uint32_t spinidle_shadow_dwt = 0U;
-  uint32_t pending_mask_at_entry = 0U;
-  interrupt_execution_source_t blocker =
-      interrupt_execution_source_t::NONE;
-  uint32_t blocker_exit_dwt = 0U;
-  uint32_t blocker_wall_cycles = 0U;
-  bool target_pending_at_blocker_entry = false;
-  uint32_t lower_context_active_mask = 0U;
-};
+// Minimal entry witness types are public in process_interrupt.h so the exact
+// first-instruction transcript can cross Interrupt -> Alpha -> Beta losslessly.
 
 struct interrupt_arrival_observation_t {
   interrupt_arrival_capture_t capture{};
@@ -2493,9 +2498,28 @@ struct ocxo_capture_packet_t {
   interrupt_arrival_capture_t arrival{};
   uint32_t target_counter32 = 0;
   uint16_t target_low16 = 0;
+
+  // Immutable arm testimony copied from lane custody before the compare is
+  // defused.  These values belong to the compare that produced this packet.
+  uint32_t arm_dwt = 0;
+  uint32_t arm_counter32 = 0;
+  uint16_t arm_hardware16 = 0;
+  uint32_t arm_remaining_ticks = 0;
+  uint16_t arm_counter_low16 = 0;
+  uint16_t arm_compare_low16 = 0;
+  uint16_t arm_cmpld1_low16 = 0;
+  uint32_t arm_comp1_mismatch_count = 0;
+  uint32_t arm_cmpld1_mismatch_count = 0;
+
+  // Contemporaneous ISR-entry hardware readbacks.
   uint16_t ambient_low16 = 0;
   uint16_t compare_low16 = 0;
+  uint16_t cmpld1_low16 = 0;
+  bool lane_active_at_capture = false;
+  bool compare_owned_at_capture = false;
   bool active_at_capture = false;
+  uint32_t isr_comp1_mismatch_count = 0;
+  uint32_t isr_cmpld1_mismatch_count = 0;
 };
 
 struct pps_capture_packet_t {
@@ -2966,12 +2990,6 @@ static constexpr uint32_t INTERRUPT_DELAY_SERVICE_BASELINE_MIN_SAMPLES = 3U;
 static constexpr int32_t INTERRUPT_DELAY_SERVICE_NORMAL_JITTER_TICKS = 1;
 static constexpr int32_t INTERRUPT_DELAY_SERVICE_CANDIDATE_MIN_TICKS = -2;
 static constexpr int32_t INTERRUPT_DELAY_SERVICE_CANDIDATE_MAX_TICKS = 8;
-
-static constexpr uint32_t INTERRUPT_DELAY_SOURCE_BIT_QTIMER1 = 1U << 0;
-static constexpr uint32_t INTERRUPT_DELAY_SOURCE_BIT_OCXO1 = 1U << 1;
-static constexpr uint32_t INTERRUPT_DELAY_SOURCE_BIT_OCXO2 = 1U << 2;
-static constexpr uint32_t INTERRUPT_DELAY_SOURCE_BIT_PPS = 1U << 3;
-static constexpr uint32_t INTERRUPT_DELAY_SOURCE_BIT_CONTINUATION = 1U << 4;
 
 struct interrupt_delay_baseline_runtime_t {
   bool spin_valid = false;
@@ -3850,14 +3868,16 @@ static void update_handoff_latency(interrupt_handoff_source_diag_t& diag,
 // Observed event authorship
 // ============================================================================
 
-static void fill_observed_diag(interrupt_capture_diag_t& diag,
-                               const interrupt_event_t& event,
-                               uint32_t isr_entry_dwt_raw,
-                               uint16_t ambient_low16,
-                               uint16_t target_low16,
-                               uint32_t sequence,
-                               const interrupt_arrival_observation_t* arrival =
-                                   nullptr) {
+static void fill_observed_diag(
+    interrupt_capture_diag_t& diag,
+    const interrupt_event_t& event,
+    uint32_t isr_entry_dwt_raw,
+    uint16_t ambient_low16,
+    uint16_t software_target_low16,
+    uint32_t sequence,
+    const interrupt_arrival_observation_t* arrival = nullptr,
+    const ocxo_capture_packet_t* ocxo_packet = nullptr,
+    bool preempted_after_entry = false) {
   diag.enabled = true;
   diag.provider = event.provider;
   diag.lane = event.lane;
@@ -3865,22 +3885,33 @@ static void fill_observed_diag(interrupt_capture_diag_t& diag,
   diag.dwt_at_event = event.dwt_at_event;
   diag.gnss_ns_at_event = event.gnss_ns_at_event;
   diag.counter32_at_event = event.counter32_at_event;
+
   if (arrival) {
-    diag.spinidle_shadow_valid =
-        arrival->spinidle_shadow_valid;
+    diag.arrival.valid = true;
+    diag.arrival.capture = arrival->capture;
+    diag.arrival.spinidle_shadow_valid = arrival->spinidle_shadow_valid;
+    diag.arrival.spinidle_age_cycles = arrival->spinidle_age_cycles;
+    diag.arrival.spinidle_valid_threshold_cycles =
+        arrival->spinidle_valid_threshold_cycles;
+    diag.arrival.spinidle_excess_cycles = arrival->spinidle_excess_cycles;
+    diag.arrival.preempted_after_entry = preempted_after_entry;
+
+    // Legacy compatibility aliases.
+    diag.spinidle_shadow_valid = arrival->spinidle_shadow_valid;
     diag.spinidle_shadow_dwt = arrival->capture.spinidle_shadow_dwt;
-    diag.spinidle_shadow_to_isr_entry_cycles =
-        arrival->spinidle_age_cycles;
+    diag.spinidle_shadow_to_isr_entry_cycles = arrival->spinidle_age_cycles;
     diag.spinidle_shadow_valid_threshold_cycles =
         arrival->spinidle_valid_threshold_cycles;
     diag.interrupt_delay = arrival->delay;
   } else {
+    diag.arrival = interrupt_arrival_forensics_t{};
     diag.spinidle_shadow_valid = false;
     diag.spinidle_shadow_dwt = 0U;
     diag.spinidle_shadow_to_isr_entry_cycles = 0U;
     diag.spinidle_shadow_valid_threshold_cycles = 0U;
     diag.interrupt_delay = interrupt_delay_forensics_t{};
   }
+
   diag.dwt_synthetic = false;
   diag.dwt_repair_candidate = false;
   diag.dwt_original_at_event = event.dwt_at_event;
@@ -3900,19 +3931,80 @@ static void fill_observed_diag(interrupt_capture_diag_t& diag,
   diag.dwt_publication_verdict_reason_id =
       INTERRUPT_DWT_PUBLICATION_REASON_OK;
 
-  // Compatibility ABI fields below carry observed/target facts only.  No
-  // alternative estimator is computed or selected.
+  diag.ocxo_compare = interrupt_ocxo_compare_forensics_t{};
+  uint16_t physical_compare_low16 = software_target_low16;
+  if (ocxo_packet) {
+    interrupt_ocxo_compare_forensics_t& c = diag.ocxo_compare;
+    c.valid = true;
+    c.capture_sequence = ocxo_packet->sequence;
+    c.lane_active_at_capture = ocxo_packet->lane_active_at_capture;
+    c.compare_owned_at_capture = ocxo_packet->compare_owned_at_capture;
+    c.active_at_capture = ocxo_packet->active_at_capture;
+    c.target_counter32 = ocxo_packet->target_counter32;
+
+    c.arm_dwt = ocxo_packet->arm_dwt;
+    c.arm_counter32 = ocxo_packet->arm_counter32;
+    c.arm_hardware16 = ocxo_packet->arm_hardware16;
+    c.arm_remaining_ticks = ocxo_packet->arm_remaining_ticks;
+    c.arm_counter_low16 = ocxo_packet->arm_counter_low16;
+    c.arm_software_target_low16 = ocxo_packet->target_low16;
+    c.arm_comp1_low16 = ocxo_packet->arm_compare_low16;
+    c.arm_cmpld1_low16 = ocxo_packet->arm_cmpld1_low16;
+    c.arm_comp1_matches_software_target =
+        c.arm_comp1_low16 == c.arm_software_target_low16;
+    c.arm_cmpld1_matches_software_target =
+        c.arm_cmpld1_low16 == c.arm_software_target_low16;
+    c.arm_comp1_mismatch_count = ocxo_packet->arm_comp1_mismatch_count;
+    c.arm_cmpld1_mismatch_count = ocxo_packet->arm_cmpld1_mismatch_count;
+    c.arm_counter_minus_comp1_ticks =
+        (uint32_t)((uint16_t)(c.arm_counter_low16 - c.arm_comp1_low16));
+    c.arm_comp1_remaining_ticks =
+        (uint32_t)((uint16_t)(c.arm_comp1_low16 - c.arm_counter_low16));
+
+    c.arm_to_isr_ticks =
+        (uint32_t)((uint16_t)(ocxo_packet->ambient_low16 -
+                             ocxo_packet->arm_counter_low16));
+    c.arm_to_isr_dwt_cycles =
+        ocxo_packet->isr_entry_dwt_raw - ocxo_packet->arm_dwt;
+
+    c.isr_counter_low16 = ocxo_packet->ambient_low16;
+    c.isr_software_target_low16 = ocxo_packet->target_low16;
+    c.isr_comp1_low16 = ocxo_packet->compare_low16;
+    c.isr_cmpld1_low16 = ocxo_packet->cmpld1_low16;
+    c.isr_comp1_matches_software_target =
+        c.isr_comp1_low16 == c.isr_software_target_low16;
+    c.isr_cmpld1_matches_software_target =
+        c.isr_cmpld1_low16 == c.isr_software_target_low16;
+    c.isr_comp1_mismatch_count = ocxo_packet->isr_comp1_mismatch_count;
+    c.isr_cmpld1_mismatch_count = ocxo_packet->isr_cmpld1_mismatch_count;
+    c.isr_counter_minus_comp1_ticks =
+        (uint32_t)((uint16_t)(c.isr_counter_low16 - c.isr_comp1_low16));
+    c.isr_counter_minus_comp1_signed_ticks =
+        (int32_t)((int16_t)(uint16_t)(c.isr_counter_low16 -
+                                     c.isr_comp1_low16));
+    c.isr_counter_minus_software_target_ticks =
+        (uint32_t)((uint16_t)(c.isr_counter_low16 -
+                             c.isr_software_target_low16));
+    c.isr_counter_minus_software_target_signed_ticks =
+        (int32_t)((int16_t)(uint16_t)(c.isr_counter_low16 -
+                                     c.isr_software_target_low16));
+    physical_compare_low16 = c.isr_comp1_low16;
+  }
+
+  // Compatibility ABI fields mirror the lossless compare transcript.  Service
+  // timing is measured against physical COMP1, never against software intent.
   diag.ocxo_perishable_fact_sequence = sequence;
   diag.ocxo_service_corrected_dwt_at_event = event.dwt_at_event;
   diag.ocxo_boundary_dwt_at_event = event.dwt_at_event;
   diag.ocxo_boundary_counter32_at_event = event.counter32_at_event;
   diag.ocxo_boundary_correction_cycles = 0;
   diag.ocxo_isr_counter_low16 = ambient_low16;
-  diag.ocxo_isr_compare_low16 = target_low16;
+  diag.ocxo_isr_compare_low16 = physical_compare_low16;
   diag.ocxo_compare_delta_mod65536_ticks =
-      (uint32_t)((uint16_t)(ambient_low16 - target_low16));
+      (uint32_t)((uint16_t)(ambient_low16 - physical_compare_low16));
   diag.ocxo_compare_service_offset_signed_ticks =
-      (int32_t)((int16_t)(uint16_t)(ambient_low16 - target_low16));
+      (int32_t)((int16_t)(uint16_t)(ambient_low16 -
+                                   physical_compare_low16));
   diag.ocxo_compare_interpreted_late_ticks =
       diag.ocxo_compare_service_offset_signed_ticks >= 0
           ? (uint32_t)diag.ocxo_compare_service_offset_signed_ticks
@@ -3934,17 +4026,35 @@ static void fill_observed_diag(interrupt_capture_diag_t& diag,
   diag.ocxo_sample_period_ticks = OCXO_COMPARE_PERIOD_TICKS;
   diag.ocxo_sample_dwt_at_event = event.dwt_at_event;
   diag.ocxo_sample_counter32_at_event = event.counter32_at_event;
+
+  if (ocxo_packet) {
+    const interrupt_ocxo_compare_forensics_t& c = diag.ocxo_compare;
+    diag.ocxo_arm_remaining_ticks = c.arm_remaining_ticks;
+    diag.ocxo_arm_to_isr_ticks = c.arm_to_isr_ticks;
+    diag.ocxo_arm_to_isr_dwt_cycles = c.arm_to_isr_dwt_cycles;
+    diag.ocxo_arm_counter_low16 = c.arm_counter_low16;
+    diag.ocxo_arm_compare_low16 = c.arm_comp1_low16;
+    diag.ocxo_arm_counter_minus_compare_ticks =
+        c.arm_counter_minus_comp1_ticks;
+    diag.ocxo_arm_compare_remaining_ticks = c.arm_comp1_remaining_ticks;
+    diag.ocxo_isr_counter_minus_compare_ticks =
+        c.isr_counter_minus_comp1_ticks;
+    diag.ocxo_compare_arm_to_isr_ticks = c.arm_to_isr_ticks;
+  }
 }
 
-static bool emit_observed_event(interrupt_subscriber_runtime_t& rt,
-                                uint32_t dwt_at_event,
-                                uint32_t counter32_at_event,
-                                uint32_t isr_entry_dwt_raw,
-                                uint16_t ambient_low16,
-                                uint16_t target_low16,
-                                uint32_t sequence,
-                                uint32_t pps_sequence,
-                                const interrupt_arrival_observation_t& arrival) {
+static bool emit_observed_event(
+    interrupt_subscriber_runtime_t& rt,
+    uint32_t dwt_at_event,
+    uint32_t counter32_at_event,
+    uint32_t isr_entry_dwt_raw,
+    uint16_t ambient_low16,
+    uint16_t target_low16,
+    uint32_t sequence,
+    uint32_t pps_sequence,
+    const interrupt_arrival_observation_t& arrival,
+    const ocxo_capture_packet_t* ocxo_packet = nullptr,
+    bool preempted_after_entry = false) {
   if (!rt.active || !rt.desc || dwt_at_event == 0U) return false;
 
   const uint32_t prior = interrupt_priority0_guard_enter();
@@ -3969,7 +4079,9 @@ static bool emit_observed_event(interrupt_subscriber_runtime_t& rt,
                      ambient_low16,
                      target_low16,
                      sequence,
-                     &arrival);
+                     &arrival,
+                     ocxo_packet,
+                     preempted_after_entry);
   interrupt_delay_attach_interval_history(
       rt.previous_delay_valid,
       rt.previous_endpoint_delayed,
@@ -4137,7 +4249,9 @@ static void process_vclock_packet(const vclock_capture_packet_t& packet) {
                                 target_low16,
                                 sequence,
                                 sequence,
-                                arrival);
+                                arrival,
+                                nullptr,
+                                packet.preempted_after_entry);
     }
   }
 }
@@ -4194,9 +4308,12 @@ static void process_ocxo_packet(const ocxo_runtime_context_t& ctx,
   lane.last_isr_entry_dwt_raw = packet.isr_entry_dwt_raw;
   lane.last_ambient_low16 = packet.ambient_low16;
   lane.last_compare_low16 = packet.compare_low16;
+  // ISR service delay is the ambient counter displacement from the physical
+  // COMP1 that asserted the interrupt.  Software target intent is preserved
+  // separately in the lossless compare transcript.
   lane.last_ambient_minus_target_ticks =
       (int32_t)((int16_t)(uint16_t)(packet.ambient_low16 -
-                                    packet.target_low16));
+                                    packet.compare_low16));
   const interrupt_execution_source_t delay_source =
       ctx.kind == interrupt_subscriber_kind_t::OCXO1
           ? interrupt_execution_source_t::OCXO1
@@ -4312,7 +4429,8 @@ static void process_ocxo_packet(const ocxo_runtime_context_t& ctx,
                               g_last_pps_witness_valid
                                   ? g_last_pps_witness.sequence
                                   : 0U,
-                              arrival);
+                              arrival,
+                              &packet);
   } else {
     lane.miss_count++;
   }
@@ -4795,12 +4913,19 @@ static __attribute__((always_inline)) inline bool ocxo_capture_priority0(
   // semantic identity and no later hardware read may replace it.
   const uint16_t ambient_low16 = module.CH[CHANNEL].CNTR;
   const uint16_t compare_low16 = module.CH[CHANNEL].COMP1;
+  const uint16_t cmpld1_low16 = module.CH[CHANNEL].CMPLD1;
   const bool compare_owned = lane.compare_armed;
   dmb_barrier();
   const uint32_t target_counter32 = lane.armed_target_counter32;
   const uint16_t target_low16 = lane.armed_target_low16;
   const bool active = lane.active && compare_owned &&
       target_counter32 != 0U;
+  if (compare_owned && compare_low16 != target_low16) {
+    lane.isr_comp1_mismatch_count++;
+  }
+  if (compare_owned && cmpld1_low16 != target_low16) {
+    lane.isr_cmpld1_mismatch_count++;
+  }
 
   qtimer_defuse_ocxo_priority0(module, CHANNEL);
   lane.compare_armed = false;
@@ -4813,9 +4938,23 @@ static __attribute__((always_inline)) inline bool ocxo_capture_priority0(
   packet.arrival = arrival;
   packet.target_counter32 = target_counter32;
   packet.target_low16 = target_low16;
+  packet.arm_dwt = lane.last_arm_dwt;
+  packet.arm_counter32 = lane.last_arm_counter32;
+  packet.arm_hardware16 = lane.last_arm_hardware16;
+  packet.arm_remaining_ticks = lane.last_arm_remaining_ticks;
+  packet.arm_counter_low16 = lane.last_arm_counter_low16;
+  packet.arm_compare_low16 = lane.last_arm_compare_low16;
+  packet.arm_cmpld1_low16 = lane.last_arm_cmpld1_low16;
+  packet.arm_comp1_mismatch_count = lane.arm_comp1_mismatch_count;
+  packet.arm_cmpld1_mismatch_count = lane.arm_cmpld1_mismatch_count;
   packet.ambient_low16 = ambient_low16;
   packet.compare_low16 = compare_low16;
+  packet.cmpld1_low16 = cmpld1_low16;
+  packet.lane_active_at_capture = lane.active;
+  packet.compare_owned_at_capture = compare_owned;
   packet.active_at_capture = active;
+  packet.isr_comp1_mismatch_count = lane.isr_comp1_mismatch_count;
+  packet.isr_cmpld1_mismatch_count = lane.isr_cmpld1_mismatch_count;
   if (capture_ring_push_isr(ring, handoff, packet)) {
     if (active) {
       lane.capture_pending_target_counter32 = target_counter32;
@@ -5009,21 +5148,41 @@ pps_edge_snapshot_t interrupt_last_pps_edge(void) {
   out.physical_pps_dwt_normalized_at_edge = pps.dwt_at_edge;
   out.physical_pps_counter32_at_read = pps.counter32_at_edge;
   out.physical_pps_ch3_at_read = pps.ch3_at_edge;
-  out.spinidle_shadow_valid =
-      g_pps_arrival_capture.spinidle_running &&
-      g_pps_arrival_capture.spinidle_shadow_dwt != 0U;
-  out.spinidle_shadow_dwt = g_pps_arrival_capture.spinidle_shadow_dwt;
-  out.spinidle_shadow_to_isr_entry_cycles = out.spinidle_shadow_valid
-      ? (uint32_t)(g_pps_arrival_entry_dwt -
-                   g_pps_arrival_capture.spinidle_shadow_dwt)
-      : 0U;
   const interrupt_delay_baseline_runtime_t* pps_delay_runtime =
       interrupt_delay_baseline_for(interrupt_execution_source_t::PPS);
-  out.spinidle_shadow_valid_threshold_cycles =
+  out.physical_pps_arrival.valid = g_pps_arrival_entry_dwt != 0U;
+  out.physical_pps_arrival.capture = g_pps_arrival_capture;
+  out.physical_pps_arrival.spinidle_shadow_valid =
+      g_pps_arrival_capture.spinidle_running &&
+      g_pps_arrival_capture.spinidle_shadow_dwt != 0U;
+  out.physical_pps_arrival.spinidle_age_cycles =
+      out.physical_pps_arrival.spinidle_shadow_valid
+          ? (uint32_t)(g_pps_arrival_entry_dwt -
+                       g_pps_arrival_capture.spinidle_shadow_dwt)
+          : 0U;
+  out.physical_pps_arrival.spinidle_valid_threshold_cycles =
       pps_delay_runtime && pps_delay_runtime->spin_valid
           ? pps_delay_runtime->spin_baseline_cycles +
                 INTERRUPT_DELAY_SPIN_GUARD_CYCLES
           : 0U;
+  out.physical_pps_arrival.spinidle_excess_cycles =
+      out.physical_pps_arrival.spinidle_shadow_valid &&
+              pps_delay_runtime && pps_delay_runtime->spin_valid &&
+              out.physical_pps_arrival.spinidle_age_cycles >
+                  pps_delay_runtime->spin_baseline_cycles
+          ? out.physical_pps_arrival.spinidle_age_cycles -
+                pps_delay_runtime->spin_baseline_cycles
+          : 0U;
+  out.physical_pps_arrival.preempted_after_entry = false;
+
+  out.spinidle_shadow_valid =
+      out.physical_pps_arrival.spinidle_shadow_valid;
+  out.spinidle_shadow_dwt =
+      out.physical_pps_arrival.capture.spinidle_shadow_dwt;
+  out.spinidle_shadow_to_isr_entry_cycles =
+      out.physical_pps_arrival.spinidle_age_cycles;
+  out.spinidle_shadow_valid_threshold_cycles =
+      out.physical_pps_arrival.spinidle_valid_threshold_cycles;
   out.interrupt_delay = g_pps_interrupt_delay;
   out.vclock_epoch_counter32 = pvc.counter32_at_edge;
   out.vclock_epoch_ch3 = pvc.ch3_at_edge;
@@ -6112,12 +6271,34 @@ static FLASHMEM void add_ocxo_lane_report(Payload& payload,
           lane.last_target_commit_delta_ticks);
   add_u32("last_target_commit_rollback_ticks",
           lane.last_target_commit_rollback_ticks);
+  add_u32("last_arm_dwt", lane.last_arm_dwt);
+  add_u32("last_arm_counter32", lane.last_arm_counter32);
+  add_u32("last_arm_hardware16", (uint32_t)lane.last_arm_hardware16);
   add_u32("last_arm_remaining_ticks", lane.last_arm_remaining_ticks);
+  add_u32("last_arm_counter_low16",
+          (uint32_t)lane.last_arm_counter_low16);
+  add_u32("last_arm_software_target_low16",
+          (uint32_t)lane.last_arm_software_target_low16);
+  add_u32("last_arm_comp1_low16",
+          (uint32_t)lane.last_arm_compare_low16);
+  add_u32("last_arm_cmpld1_low16",
+          (uint32_t)lane.last_arm_cmpld1_low16);
+  add_u32("arm_comp1_mismatch_count",
+          lane.arm_comp1_mismatch_count);
+  add_u32("arm_cmpld1_mismatch_count",
+          lane.arm_cmpld1_mismatch_count);
+  add_u32("isr_comp1_mismatch_count",
+          lane.isr_comp1_mismatch_count);
+  add_u32("isr_cmpld1_mismatch_count",
+          lane.isr_cmpld1_mismatch_count);
   add_u32("last_dwt_at_edge", lane.last_dwt_at_edge);
   add_u32("last_event_counter32", lane.last_event_counter32);
   add_u32("last_ambient_low16", (uint32_t)lane.last_ambient_low16);
   add_u32("last_compare_low16", (uint32_t)lane.last_compare_low16);
+  // Compatibility key retained; semantics are now physical CNTR - COMP1.
   add_i32("ambient_minus_target_ticks",
+          lane.last_ambient_minus_target_ticks);
+  add_i32("ambient_minus_comp1_ticks",
           lane.last_ambient_minus_target_ticks);
   add_u32("cadence_delta_ticks", 0U);
   add_u32("cadence_delta_violation_count", 0U);
@@ -7017,6 +7198,18 @@ const char* interrupt_delay_cause_str(interrupt_delay_cause_t cause) {
       return "MASKING_OR_UNKNOWN_CPU";
     case interrupt_delay_cause_t::MULTIPLE_ISR: return "MULTIPLE_ISR";
     default: return "UNKNOWN";
+  }
+}
+
+const char* interrupt_execution_source_str(
+    interrupt_execution_source_t source) {
+  switch (source) {
+    case interrupt_execution_source_t::QTIMER1: return "QTIMER1";
+    case interrupt_execution_source_t::OCXO1: return "OCXO1";
+    case interrupt_execution_source_t::OCXO2: return "OCXO2";
+    case interrupt_execution_source_t::PPS: return "PPS";
+    case interrupt_execution_source_t::CONTINUATION: return "CONTINUATION";
+    default: return "NONE";
   }
 }
 

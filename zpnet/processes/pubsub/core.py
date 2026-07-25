@@ -44,6 +44,11 @@ from zpnet.shared.constants import (
     TRAFFIC_PUBLISH_SUBSCRIBE,
 )
 from zpnet.shared.logger import setup_logging
+from zpnet.shared.socket_io import (
+    recv_json_until_eof,
+    recv_until_eof,
+    send_bytes_and_shutdown,
+)
 from zpnet.shared.transport import (
     transport_send,
     transport_register_receive_callback,
@@ -301,11 +306,10 @@ def on_receive_publish_subscribe(payload: Dict[str, Any]) -> None:
 
 def handle_client(conn: socket.socket) -> None:
     try:
-        raw = conn.recv(65536)
-        if not raw:
+        try:
+            req = recv_json_until_eof(conn)
+        except RuntimeError:
             return
-
-        req = json.loads(raw.decode("utf-8"))
 
         req_id = None
 
@@ -712,8 +716,7 @@ def route_publish(msg: Dict[str, Any], *, forward_to_teensy: bool) -> None:
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
                 sock.connect(sock_path)
-                sock.sendall(raw)
-                sock.shutdown(socket.SHUT_WR)
+                send_bytes_and_shutdown(sock, raw)
         except Exception:
             logging.warning("⚠️ [pubsub] fan-out failed %s -> %s:%s", topic, machine, subsystem)
 
@@ -1070,8 +1073,7 @@ def _server_handle_publish(msg: Dict[str, Any]) -> None:
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
                 sock.connect(sock_path)
-                sock.sendall(raw)
-                sock.shutdown(socket.SHUT_WR)
+                send_bytes_and_shutdown(sock, raw)
         except Exception:
             logging.warning("⚠️ [pubsub] fan-out failed %s -> %s:%s", topic, machine, subsystem)
 
@@ -1169,11 +1171,10 @@ def _handle_server_cmd_client(conn: socket.socket) -> None:
     If SERVER is not connected, returns an immediate error.
     """
     try:
-        raw = conn.recv(65536)
-        if not raw:
+        try:
+            req = recv_json_until_eof(conn)
+        except RuntimeError:
             return
-
-        req = json.loads(raw.decode("utf-8"))
 
         # Check SERVER connectivity before attempting relay
         with server_conn_lock:
@@ -1253,10 +1254,23 @@ def pubsub_server() -> None:
     while True:
         conn, _ = srv.accept()
         with conn:
-            raw = conn.recv(65536)
+            raw = recv_until_eof(conn)
             if not raw:
                 continue
-            msg = json.loads(raw.decode())
+
+            try:
+                msg = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                # One malformed or abandoned publisher must never terminate
+                # the long-lived authoritative pub/sub routing thread.
+                logging.exception(
+                    "⚠️ [pubsub] malformed PI publication ignored "
+                    "(bytes=%d preview=%r)",
+                    len(raw),
+                    raw[:256],
+                )
+                continue
+
             route_publish(msg, forward_to_teensy=True)
 
 def rpc_server() -> None:

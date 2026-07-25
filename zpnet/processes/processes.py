@@ -33,6 +33,7 @@ import json
 import logging
 import os
 import socket
+import sys
 import threading
 import time
 from typing import Any, Dict, Callable, Optional
@@ -156,6 +157,22 @@ def send_command(
         "command": command,
     }
 
+    # Diagnostic provenance for direct Pi command traffic.  Unknown/custom
+    # clients omit this block, which is itself useful evidence when a caller
+    # disconnects before consuming a response.
+    if machine == "PI":
+        req["_client"] = {
+            "schema": "ZPNET_COMMAND_CLIENT_V1",
+            "process": os.path.basename(sys.argv[0]) or "<unknown>",
+            "pid": os.getpid(),
+            "thread": threading.current_thread().name,
+            "request_id": (
+                f"{os.getpid()}:{threading.current_thread().name}:"
+                f"{time.monotonic_ns()}"
+            ),
+            "sent_time_ns": time.time_ns(),
+        }
+
     if args is not None:
         req["args"] = args
 
@@ -174,10 +191,21 @@ def send_command(
                 sock.sendall(raw)
                 sock.shutdown(socket.SHUT_WR)
 
-                resp_raw = sock.recv(65536)
-                if not resp_raw:
+                # The server closes this one-command connection after sending
+                # exactly one JSON response. A Unix stream socket may split a
+                # lawful response across multiple recv() calls, so EOF—not the
+                # first recv() boundary—is the response frame delimiter.
+                response_chunks: list[bytes] = []
+                while True:
+                    chunk = sock.recv(65536)
+                    if not chunk:
+                        break
+                    response_chunks.append(chunk)
+
+                if not response_chunks:
                     raise RuntimeError("empty response")
 
+                resp_raw = b"".join(response_chunks)
                 return json.loads(resp_raw.decode("utf-8"))
 
         except (
@@ -260,6 +288,48 @@ def _bind_unix_socket(path: str) -> socket.socket:
 # Command server (internal)
 # =============================================================================
 
+def _send_command_response(
+    conn: socket.socket,
+    *,
+    subsystem: str,
+    command: str,
+    response: dict,
+    client_meta: Optional[Dict[str, Any]] = None,
+    handler_ms: Optional[float] = None,
+    request_age_ms: Optional[float] = None,
+) -> bool:
+    raw = json.dumps(response, separators=(",", ":")).encode("utf-8")
+
+    try:
+        conn.sendall(raw)
+        return True
+    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError) as exc:
+        # A command client may time out, close its websocket, or otherwise
+        # disappear while a slow handler is still producing its response.
+        # That abandons this one response; it must never terminate the
+        # subsystem's long-lived command-serving thread.
+        meta = client_meta if isinstance(client_meta, dict) else {}
+        canonical_client = meta.get("schema") == "ZPNET_COMMAND_CLIENT_V1"
+        logging.warning(
+            "[commands] %s client disconnected before response "
+            "command=%s bytes=%d handler_ms=%s request_age_ms=%s "
+            "canonical_client=%s client_process=%r client_pid=%r "
+            "client_thread=%r request_id=%r error=%r",
+            subsystem,
+            command,
+            len(raw),
+            f"{handler_ms:.3f}" if handler_ms is not None else "unknown",
+            f"{request_age_ms:.3f}" if request_age_ms is not None else "unknown",
+            canonical_client,
+            meta.get("process"),
+            meta.get("pid"),
+            meta.get("thread"),
+            meta.get("request_id"),
+            exc,
+        )
+        return False
+
+
 def _serve_commands(
     *,
     subsystem: str,
@@ -272,6 +342,7 @@ def _serve_commands(
 
     while True:
         conn, _ = srv.accept()
+        request_started_ns = time.monotonic_ns()
         with conn:
             raw = conn.recv(65536)
             if not raw:
@@ -295,6 +366,7 @@ def _serve_commands(
 
             cmd = req["command"]
             args = req.get("args")
+            client_meta = req.get("_client")
 
             # ------------------------------------------------------------
             # Minimal defensive check for invalid command
@@ -307,16 +379,32 @@ def _serve_commands(
                         "error": "unknown command"
                     }
                 }
-                conn.sendall(
-                    json.dumps(resp, separators=(",", ":")).encode("utf-8")
+                request_age_ms = (time.monotonic_ns() - request_started_ns) / 1_000_000.0
+                _send_command_response(
+                    conn,
+                    subsystem=subsystem,
+                    command=cmd,
+                    response=resp,
+                    client_meta=client_meta,
+                    handler_ms=0.0,
+                    request_age_ms=request_age_ms,
                 )
                 continue
 
             handler = commands[cmd]
+            handler_started_ns = time.monotonic_ns()
             resp = handler(args)
+            handler_ms = (time.monotonic_ns() - handler_started_ns) / 1_000_000.0
+            request_age_ms = (time.monotonic_ns() - request_started_ns) / 1_000_000.0
 
-            conn.sendall(
-                json.dumps(resp, separators=(",", ":")).encode("utf-8")
+            _send_command_response(
+                conn,
+                subsystem=subsystem,
+                command=cmd,
+                response=resp,
+                client_meta=client_meta,
+                handler_ms=handler_ms,
+                request_age_ms=request_age_ms,
             )
 
 

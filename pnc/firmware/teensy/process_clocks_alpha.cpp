@@ -348,6 +348,9 @@ static void alpha_pps_vclock_edge_forensics_publish(
              : -(int64_t)(expected_gnss_ns - counter_identity_ns))
       : 0LL;
 
+  local.physical_pps_arrival = snap.physical_pps_arrival;
+  local.physical_pps_interrupt_delay = snap.interrupt_delay;
+
   g_pps_vclock_edge_forensics_seq++;
   clocks_alpha_dmb();
   g_pps_vclock_edge_forensics = local;
@@ -1896,6 +1899,9 @@ struct alpha_lane_forensics_store_t {
   uint32_t diag_boundary_dwt_at_event = 0;
   uint32_t diag_boundary_counter32_at_event = 0;
   int32_t  diag_boundary_correction_cycles = 0;
+
+  interrupt_arrival_forensics_t arrival{};
+  interrupt_ocxo_compare_forensics_t ocxo_compare{};
 
   bool     spinidle_shadow_valid = false;
   uint32_t spinidle_shadow_dwt = 0;
@@ -6515,6 +6521,8 @@ static void alpha_forensics_publish(time_clock_id_t clock_id,
     s->diag_boundary_counter32_at_event = diag->ocxo_boundary_counter32_at_event;
     s->diag_boundary_correction_cycles = diag->ocxo_boundary_correction_cycles;
 
+    s->arrival = diag->arrival;
+    s->ocxo_compare = diag->ocxo_compare;
     s->spinidle_shadow_valid = diag->spinidle_shadow_valid;
     s->spinidle_shadow_dwt = diag->spinidle_shadow_dwt;
     s->spinidle_shadow_to_isr_entry_cycles =
@@ -6660,6 +6668,8 @@ static void alpha_forensics_publish(time_clock_id_t clock_id,
     s->diag_boundary_dwt_at_event = 0;
     s->diag_boundary_counter32_at_event = 0;
     s->diag_boundary_correction_cycles = 0;
+    s->arrival = interrupt_arrival_forensics_t{};
+    s->ocxo_compare = interrupt_ocxo_compare_forensics_t{};
     s->spinidle_shadow_valid = false;
     s->spinidle_shadow_dwt = 0;
     s->spinidle_shadow_to_isr_entry_cycles = 0;
@@ -6892,6 +6902,8 @@ bool clocks_alpha_lane_forensics(time_clock_id_t clock,
     out->diag_boundary_dwt_at_event = s->diag_boundary_dwt_at_event;
     out->diag_boundary_counter32_at_event = s->diag_boundary_counter32_at_event;
     out->diag_boundary_correction_cycles = s->diag_boundary_correction_cycles;
+    out->arrival = s->arrival;
+    out->ocxo_compare = s->ocxo_compare;
     out->spinidle_shadow_valid = s->spinidle_shadow_valid;
     out->spinidle_shadow_dwt = s->spinidle_shadow_dwt;
     out->spinidle_shadow_to_isr_entry_cycles =

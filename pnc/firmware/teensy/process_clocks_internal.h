@@ -938,6 +938,12 @@ struct clocks_alpha_lane_forensics_t {
   uint32_t diag_boundary_counter32_at_event;
   int32_t  diag_boundary_correction_cycles;
 
+  // Lossless first-instruction and OCXO compare transcripts transported
+  // verbatim from process_interrupt.  The legacy SpinIdle aliases below remain
+  // for existing reports.
+  interrupt_arrival_forensics_t arrival{};
+  interrupt_ocxo_compare_forensics_t ocxo_compare{};
+
   // SpinIdle / SpinCatch ISR-entry witness copied from interrupt_capture_diag_t.
   // These are diagnostic only: Alpha does not use them as timing authority.
   bool     spinidle_shadow_valid;
@@ -1009,6 +1015,10 @@ struct clocks_pps_vclock_edge_forensics_t {
   bool     counter_identity_valid;
   uint64_t counter_identity_gnss_ns_at_edge;
   int64_t  counter_identity_minus_expected_ns;
+
+  // Lossless physical-PPS entry transcript transported from process_interrupt.
+  interrupt_arrival_forensics_t physical_pps_arrival{};
+  interrupt_delay_forensics_t physical_pps_interrupt_delay{};
 };
 
 bool clocks_alpha_pps_vclock_edge_forensics(

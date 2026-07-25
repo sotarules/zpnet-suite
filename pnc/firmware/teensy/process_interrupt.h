@@ -127,6 +127,93 @@ enum class interrupt_delay_confidence_t : uint8_t {
   EXACT_CONFIDENCE = 4,
 };
 
+// Stable execution-source identities and bit assignments used by the raw
+// arrival transcript.  These values are published into TIMEBASE verbatim.
+enum class interrupt_execution_source_t : uint8_t {
+  NONE = 0,
+  QTIMER1 = 1,
+  OCXO1 = 2,
+  OCXO2 = 3,
+  PPS = 4,
+  CONTINUATION = 5,
+};
+
+static constexpr uint32_t INTERRUPT_DELAY_SOURCE_BIT_QTIMER1 = 1U << 0;
+static constexpr uint32_t INTERRUPT_DELAY_SOURCE_BIT_OCXO1 = 1U << 1;
+static constexpr uint32_t INTERRUPT_DELAY_SOURCE_BIT_OCXO2 = 1U << 2;
+static constexpr uint32_t INTERRUPT_DELAY_SOURCE_BIT_PPS = 1U << 3;
+static constexpr uint32_t INTERRUPT_DELAY_SOURCE_BIT_CONTINUATION = 1U << 4;
+
+// First-instruction testimony captured before handler work.  This is intentionally
+// scalar-only so Priority 0 can preserve it without allocation or borrowed state.
+struct interrupt_arrival_capture_t {
+  bool spinidle_running = false;
+  uint32_t spinidle_shadow_dwt = 0;
+  uint32_t pending_mask_at_entry = 0;
+  interrupt_execution_source_t blocker =
+      interrupt_execution_source_t::NONE;
+  uint32_t blocker_exit_dwt = 0;
+  uint32_t blocker_wall_cycles = 0;
+  bool target_pending_at_blocker_entry = false;
+  uint32_t lower_context_active_mask = 0;
+};
+
+// Lossless public rendering of the raw arrival capture plus the derived SpinIdle
+// quantities used by the classifier.  The adjudicated delay verdict remains a
+// separate object so downstream consumers can inspect both evidence and verdict.
+struct interrupt_arrival_forensics_t {
+  bool valid = false;
+  interrupt_arrival_capture_t capture{};
+  bool spinidle_shadow_valid = false;
+  uint32_t spinidle_age_cycles = 0;
+  uint32_t spinidle_valid_threshold_cycles = 0;
+  uint32_t spinidle_excess_cycles = 0;
+  bool preempted_after_entry = false;
+};
+
+// Immutable arm->ISR compare transcript.  Software target identity, physical
+// COMP1/CMPLD1 readbacks, and ambient CNTR are kept distinct so a misprogrammed
+// compare can never masquerade as an on-time service of the intended target.
+struct interrupt_ocxo_compare_forensics_t {
+  bool valid = false;
+  uint32_t capture_sequence = 0;
+  bool lane_active_at_capture = false;
+  bool compare_owned_at_capture = false;
+  bool active_at_capture = false;
+  uint32_t target_counter32 = 0;
+
+  uint32_t arm_dwt = 0;
+  uint32_t arm_counter32 = 0;
+  uint16_t arm_hardware16 = 0;
+  uint32_t arm_remaining_ticks = 0;
+  uint16_t arm_counter_low16 = 0;
+  uint16_t arm_software_target_low16 = 0;
+  uint16_t arm_comp1_low16 = 0;
+  uint16_t arm_cmpld1_low16 = 0;
+  bool arm_comp1_matches_software_target = false;
+  bool arm_cmpld1_matches_software_target = false;
+  uint32_t arm_comp1_mismatch_count = 0;
+  uint32_t arm_cmpld1_mismatch_count = 0;
+  uint32_t arm_counter_minus_comp1_ticks = 0;
+  uint32_t arm_comp1_remaining_ticks = 0;
+
+  uint32_t arm_to_isr_ticks = 0;
+  uint32_t arm_to_isr_dwt_cycles = 0;
+
+  uint16_t isr_counter_low16 = 0;
+  uint16_t isr_software_target_low16 = 0;
+  uint16_t isr_comp1_low16 = 0;
+  uint16_t isr_cmpld1_low16 = 0;
+  bool isr_comp1_matches_software_target = false;
+  bool isr_cmpld1_matches_software_target = false;
+  uint32_t isr_comp1_mismatch_count = 0;
+  uint32_t isr_cmpld1_mismatch_count = 0;
+  uint32_t isr_counter_minus_comp1_ticks = 0;
+  int32_t isr_counter_minus_comp1_signed_ticks = 0;
+  uint32_t isr_counter_minus_software_target_ticks = 0;
+  int32_t isr_counter_minus_software_target_signed_ticks = 0;
+};
+
 // Endpoint delay plus the signed contamination it contributes to the current
 // one-second interval.  interval_delay_cycles is:
 //
@@ -343,6 +430,14 @@ struct interrupt_capture_diag_t {
   uint32_t spinidle_shadow_to_isr_entry_cycles = 0;
   uint32_t spinidle_shadow_valid_threshold_cycles = 0;
 
+  // Lossless first-instruction evidence.  The legacy SpinIdle fields above remain
+  // compatibility aliases of this transcript's derived members.
+  interrupt_arrival_forensics_t arrival{};
+
+  // Lossless OCXO arm/compare transcript.  VCLOCK/PPS diagnostics leave this
+  // defaulted; OCXO diagnostics carry both software intent and hardware readback.
+  interrupt_ocxo_compare_forensics_t ocxo_compare{};
+
   // Integrated endpoint/interval verdict delivered through the ordinary
   // subscriber diagnostic callback object.
   interrupt_delay_forensics_t interrupt_delay{};
@@ -462,10 +557,9 @@ struct interrupt_capture_diag_t {
   uint32_t ocxo_arm_to_isr_ticks = 0;
   uint32_t ocxo_arm_to_isr_dwt_cycles = 0;
 
-  // Split-channel compare/counter custody witness.  OCXO1 currently uses
-  // QTimer2 CH0 as the passive counter and CH1 as the active compare rail;
-  // OCXO2 uses one physical CH3 rail.  These fields prove whether the counter
-  // rail and compare rail remain phase-coherent across arm->ISR.
+  // Compatibility aliases for the lossless ocxo_compare transcript above.
+  // The current implementation uses one count/compare channel per OCXO lane;
+  // software target identity and physical COMP1 readback remain distinct.
   uint16_t ocxo_arm_counter_low16 = 0;
   uint16_t ocxo_arm_compare_low16 = 0;
   uint32_t ocxo_arm_counter_minus_compare_ticks = 0;
@@ -998,6 +1092,10 @@ struct pps_edge_snapshot_t {
   uint32_t physical_pps_counter32_at_read      = 0;
   uint16_t physical_pps_ch3_at_read            = 0;
 
+  // Lossless physical-PPS first-instruction testimony.  The legacy SpinIdle
+  // aliases and verdict below mirror this object for compatibility.
+  interrupt_arrival_forensics_t physical_pps_arrival{};
+
   bool     spinidle_shadow_valid = false;
   uint32_t spinidle_shadow_dwt = 0;
   uint32_t spinidle_shadow_to_isr_entry_cycles = 0;
@@ -1215,5 +1313,7 @@ const char* interrupt_provider_kind_str  (interrupt_provider_kind_t   provider);
 const char* interrupt_lane_str           (interrupt_lane_t            lane);
 const char* interrupt_delay_verdict_str  (interrupt_delay_verdict_t verdict);
 const char* interrupt_delay_cause_str    (interrupt_delay_cause_t cause);
+const char* interrupt_execution_source_str(
+    interrupt_execution_source_t source);
 const char* interrupt_delay_confidence_str(
     interrupt_delay_confidence_t confidence);

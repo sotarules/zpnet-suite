@@ -2818,6 +2818,73 @@ static FLASHMEM Payload cmd_transport_info(const Payload& /*args*/) {
   p.add("tx_rr_drop_count",     info.tx_rr_drop_count);
 
   // ==========================================================
+  // TX — Per-message custody transcript
+  // ==========================================================
+
+  p.add("tx_send_attempt_count", info.tx_send_attempt_count);
+  p.add("tx_send_serialized_count", info.tx_send_serialized_count);
+  p.add("tx_send_reject_count", info.tx_send_reject_count);
+  p.add("tx_send_enqueued_count", info.tx_send_enqueued_count);
+  p.add("tx_send_completed_count", info.tx_send_completed_count);
+  p.add("tx_message_too_large_count", info.tx_message_too_large_count);
+  p.add("tx_header_format_fail_count", info.tx_header_format_fail_count);
+  p.add("tx_outstanding_budget_fail_count",
+        info.tx_outstanding_budget_fail_count);
+  p.add("tx_empty_serialization_count", info.tx_empty_serialization_count);
+  p.add("tx_semantic_empty_count", info.tx_semantic_empty_count);
+
+  p.add("tx_last_sequence", info.tx_last_sequence);
+  p.add("tx_last_traffic", info.tx_last_traffic);
+  p.add_fmt("tx_last_traffic_hex", "0x%02lX",
+            (unsigned long)info.tx_last_traffic);
+  p.add("tx_last_topic", info.tx_last_topic);
+  p.add("tx_last_json_bytes", info.tx_last_json_bytes);
+  p.add("tx_last_wire_bytes", info.tx_last_wire_bytes);
+  p.add("tx_last_outcome_id", info.tx_last_outcome_id);
+  p.add("tx_last_outcome",
+        transport_tx_outcome_name(info.tx_last_outcome_id));
+  p.add("tx_last_reason_id", info.tx_last_reason_id);
+  p.add("tx_last_reason", transport_tx_reason_name(info.tx_last_reason_id));
+
+  p.add("tx_largest_json_bytes", info.tx_largest_json_bytes);
+  p.add("tx_largest_wire_bytes", info.tx_largest_wire_bytes);
+  p.add("tx_largest_topic", info.tx_largest_topic);
+
+  p.add("tx_last_reject_sequence", info.tx_last_reject_sequence);
+  p.add("tx_last_reject_traffic", info.tx_last_reject_traffic);
+  p.add("tx_last_reject_topic", info.tx_last_reject_topic);
+  p.add("tx_last_reject_json_bytes", info.tx_last_reject_json_bytes);
+  p.add("tx_last_reject_wire_bytes", info.tx_last_reject_wire_bytes);
+  p.add("tx_last_reject_reason_id", info.tx_last_reject_reason_id);
+  p.add("tx_last_reject_reason",
+        transport_tx_reason_name(info.tx_last_reject_reason_id));
+
+  p.add("tx_last_completed_sequence", info.tx_last_completed_sequence);
+  p.add("tx_last_completed_traffic", info.tx_last_completed_traffic);
+  p.add("tx_last_completed_topic", info.tx_last_completed_topic);
+  p.add("tx_last_completed_json_bytes", info.tx_last_completed_json_bytes);
+  p.add("tx_last_completed_wire_bytes", info.tx_last_completed_wire_bytes);
+
+  p.add("tx_timebase_attempt_count", info.tx_timebase_attempt_count);
+  p.add("tx_timebase_serialized_count", info.tx_timebase_serialized_count);
+  p.add("tx_timebase_reject_count", info.tx_timebase_reject_count);
+  p.add("tx_timebase_enqueued_count", info.tx_timebase_enqueued_count);
+  p.add("tx_timebase_completed_count", info.tx_timebase_completed_count);
+  p.add("tx_timebase_last_sequence", info.tx_timebase_last_sequence);
+  p.add("tx_timebase_last_json_bytes", info.tx_timebase_last_json_bytes);
+  p.add("tx_timebase_last_wire_bytes", info.tx_timebase_last_wire_bytes);
+  p.add("tx_timebase_last_outcome_id", info.tx_timebase_last_outcome_id);
+  p.add("tx_timebase_last_outcome",
+        transport_tx_outcome_name(info.tx_timebase_last_outcome_id));
+  p.add("tx_timebase_last_reason_id", info.tx_timebase_last_reason_id);
+  p.add("tx_timebase_last_reason",
+        transport_tx_reason_name(info.tx_timebase_last_reason_id));
+  p.add("tx_timebase_largest_json_bytes",
+        info.tx_timebase_largest_json_bytes);
+  p.add("tx_timebase_largest_wire_bytes",
+        info.tx_timebase_largest_wire_bytes);
+
+  // ==========================================================
   // RX — Raw ingress
   // ==========================================================
 

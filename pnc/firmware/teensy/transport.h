@@ -55,7 +55,7 @@
 // Transport limits (authoritative)
 // =============================================================
 
-static constexpr size_t TRANSPORT_MAX_MESSAGE = 32 * 1024;
+static constexpr size_t TRANSPORT_MAX_MESSAGE = 40 * 1024;
 
 
 // =============================================================
@@ -167,6 +167,60 @@ typedef struct {
   uint32_t tx_rr_drop_count;      // RR messages dropped (any reason)
 
   // ===========================================================
+  // TX — Per-message custody transcript
+  // ===========================================================
+
+  uint32_t tx_send_attempt_count;
+  uint32_t tx_send_serialized_count;
+  uint32_t tx_send_reject_count;
+  uint32_t tx_send_enqueued_count;
+  uint32_t tx_send_completed_count;
+
+  uint32_t tx_message_too_large_count;
+  uint32_t tx_header_format_fail_count;
+  uint32_t tx_outstanding_budget_fail_count;
+  uint32_t tx_empty_serialization_count;
+  uint32_t tx_semantic_empty_count;
+
+  uint32_t tx_last_sequence;
+  uint32_t tx_last_traffic;
+  uint32_t tx_last_json_bytes;
+  uint32_t tx_last_wire_bytes;
+  uint32_t tx_last_outcome_id;
+  uint32_t tx_last_reason_id;
+  char     tx_last_topic[48];
+
+  uint32_t tx_largest_json_bytes;
+  uint32_t tx_largest_wire_bytes;
+  char     tx_largest_topic[48];
+
+  uint32_t tx_last_reject_sequence;
+  uint32_t tx_last_reject_traffic;
+  uint32_t tx_last_reject_json_bytes;
+  uint32_t tx_last_reject_wire_bytes;
+  uint32_t tx_last_reject_reason_id;
+  char     tx_last_reject_topic[48];
+
+  uint32_t tx_last_completed_sequence;
+  uint32_t tx_last_completed_traffic;
+  uint32_t tx_last_completed_json_bytes;
+  uint32_t tx_last_completed_wire_bytes;
+  char     tx_last_completed_topic[48];
+
+  uint32_t tx_timebase_attempt_count;
+  uint32_t tx_timebase_serialized_count;
+  uint32_t tx_timebase_reject_count;
+  uint32_t tx_timebase_enqueued_count;
+  uint32_t tx_timebase_completed_count;
+  uint32_t tx_timebase_last_sequence;
+  uint32_t tx_timebase_last_json_bytes;
+  uint32_t tx_timebase_last_wire_bytes;
+  uint32_t tx_timebase_last_outcome_id;
+  uint32_t tx_timebase_last_reason_id;
+  uint32_t tx_timebase_largest_json_bytes;
+  uint32_t tx_timebase_largest_wire_bytes;
+
+  // ===========================================================
   // RX — Raw ingress
   // ===========================================================
 
@@ -248,6 +302,9 @@ typedef struct {
 void transport_get_info(
   transport_info_t* out
 );
+
+const char* transport_tx_outcome_name(uint32_t outcome_id);
+const char* transport_tx_reason_name(uint32_t reason_id);
 
 
 // =============================================================

@@ -150,11 +150,11 @@ extern uint32_t clocks_alpha_ocxo_projection_guard_sanity_reject_count(time_cloc
 //
 // Focused report: CLOCKS.REPORT_TIMEBASE_PUBLISH
 
-// Embedded-forensics profile.  Keep the forensic child deliberately tiny so a
-// single candidate stays well below Payload::ARENA_MAX.  The legacy constant
-// remains report-visible but is false because no second publication is emitted.
+// Embedded-forensics profile.  The campaign stream now publishes the full
+// Interrupt -> Alpha transcript every second.  Standalone publication remains
+// retired; lossless forensics is embedded in the authoritative TIMEBASE row.
 static constexpr bool TIMEBASE_FORENSICS_PUBLISH_ENABLED = false;
-static constexpr bool TIMEBASE_FORENSICS_MINIMAL_PAYLOAD_ENABLED = true;
+static constexpr bool TIMEBASE_FORENSICS_MINIMAL_PAYLOAD_ENABLED = false;
 
 // Ultra-slim observed-cycle companion fields for the embedded TIMEBASE
 // forensics row.  The payload carries measured endpoints and intervals only.
@@ -170,8 +170,8 @@ static constexpr uint32_t TIMEBASE_ISR_DELAY_EXPLANATION_GATE_CYCLES = 16U;
 static constexpr bool TIMEBASE_FORENSICS_MICRO_COURT_FIELDS_ENABLED = false;
 static constexpr bool TIMEBASE_FORENSICS_MICRO_COUNTERLEDGER_FIELDS_ENABLED = false;
 
-// The richer slim/full forensics builders remain compiled for focused future
-// experiments, but they are not used by the 1 Hz campaign stream in this step.
+// Select the full builder.  Minimal and slim profiles remain compiled only as
+// compatibility fallbacks; the ordinary 1 Hz stream is lossless.
 static constexpr bool TIMEBASE_FORENSICS_SLIM_RAW_CYCLES_PAYLOAD_ENABLED = false;
 
 // TIMEBASE_FRAGMENT must stay comfortably below the Payload arena ceiling.
@@ -5004,6 +5004,158 @@ static FLASHMEM const char* pps_vclock_edge_decision_name(uint32_t decision) {
 
 
 
+static FLASHMEM void payload_add_interrupt_delay_forensics_object(
+    Payload& parent,
+    const interrupt_delay_forensics_t& d) {
+  Payload obj;
+  obj.add("valid", d.valid);
+  obj.add("verdict_id", (uint32_t)d.verdict);
+  obj.add("verdict", interrupt_delay_verdict_str(d.verdict));
+  obj.add("delayed", d.delayed);
+  obj.add("delayed_by_id", (uint32_t)d.delayed_by);
+  obj.add("delayed_by", interrupt_delay_cause_str(d.delayed_by));
+  obj.add("confidence_id", (uint32_t)d.confidence);
+  obj.add("confidence", interrupt_delay_confidence_str(d.confidence));
+  obj.add("delay_cycles_valid", d.delay_cycles_valid);
+  obj.add("delay_cycles", d.delay_cycles);
+  obj.add("uncertainty_cycles", d.uncertainty_cycles);
+
+  obj.add("previous_endpoint_valid", d.previous_endpoint_valid);
+  obj.add("previous_endpoint_delayed", d.previous_endpoint_delayed);
+  obj.add("previous_delayed_by_id", (uint32_t)d.previous_delayed_by);
+  obj.add("previous_delayed_by",
+          interrupt_delay_cause_str(d.previous_delayed_by));
+  obj.add("previous_delay_cycles", d.previous_delay_cycles);
+
+  obj.add("interval_delay_valid", d.interval_delay_valid);
+  obj.add("interval_delay_cycles", d.interval_delay_cycles);
+  obj.add("interval_delayed_by_id", (uint32_t)d.interval_delayed_by);
+  obj.add("interval_delayed_by",
+          interrupt_delay_cause_str(d.interval_delayed_by));
+
+  obj.add("previous_interval_delay_valid",
+          d.previous_interval_delay_valid);
+  obj.add("previous_interval_delay_cycles",
+          d.previous_interval_delay_cycles);
+  obj.add("previous_interval_delayed_by_id",
+          (uint32_t)d.previous_interval_delayed_by);
+  obj.add("previous_interval_delayed_by",
+          interrupt_delay_cause_str(d.previous_interval_delayed_by));
+
+  obj.add("residual_delay_valid", d.residual_delay_valid);
+  obj.add("residual_delay_cycles", d.residual_delay_cycles);
+  obj.add("residual_delayed_by_id", (uint32_t)d.residual_delayed_by);
+  obj.add("residual_delayed_by",
+          interrupt_delay_cause_str(d.residual_delayed_by));
+  parent.add_object("interrupt_delay", obj);
+}
+
+static FLASHMEM void payload_add_arrival_forensics_object(
+    Payload& parent,
+    const interrupt_arrival_forensics_t& a) {
+  Payload obj;
+  const interrupt_arrival_capture_t& c = a.capture;
+  obj.add("schema", "INTERRUPT_ARRIVAL_CAPTURE_V1");
+  obj.add("valid", a.valid);
+  obj.add("spinidle_running", c.spinidle_running);
+  obj.add("spinidle_shadow_dwt", c.spinidle_shadow_dwt);
+  obj.add("pending_mask_at_entry", c.pending_mask_at_entry);
+  obj.add("pending_qtimer1",
+          (c.pending_mask_at_entry &
+           INTERRUPT_DELAY_SOURCE_BIT_QTIMER1) != 0U);
+  obj.add("pending_ocxo1",
+          (c.pending_mask_at_entry &
+           INTERRUPT_DELAY_SOURCE_BIT_OCXO1) != 0U);
+  obj.add("pending_ocxo2",
+          (c.pending_mask_at_entry &
+           INTERRUPT_DELAY_SOURCE_BIT_OCXO2) != 0U);
+  obj.add("pending_pps",
+          (c.pending_mask_at_entry &
+           INTERRUPT_DELAY_SOURCE_BIT_PPS) != 0U);
+  obj.add("pending_continuation",
+          (c.pending_mask_at_entry &
+           INTERRUPT_DELAY_SOURCE_BIT_CONTINUATION) != 0U);
+
+  obj.add("blocker_id", (uint32_t)c.blocker);
+  obj.add("blocker", interrupt_execution_source_str(c.blocker));
+  obj.add("blocker_exit_dwt", c.blocker_exit_dwt);
+  obj.add("blocker_wall_cycles", c.blocker_wall_cycles);
+  obj.add("target_pending_at_blocker_entry",
+          c.target_pending_at_blocker_entry);
+
+  obj.add("lower_context_active_mask", c.lower_context_active_mask);
+  obj.add("lower_qtimer1_active",
+          (c.lower_context_active_mask &
+           INTERRUPT_DELAY_SOURCE_BIT_QTIMER1) != 0U);
+  obj.add("lower_continuation_active",
+          (c.lower_context_active_mask &
+           INTERRUPT_DELAY_SOURCE_BIT_CONTINUATION) != 0U);
+
+  obj.add("spinidle_shadow_valid", a.spinidle_shadow_valid);
+  obj.add("spinidle_age_cycles", a.spinidle_age_cycles);
+  obj.add("spinidle_valid_threshold_cycles",
+          a.spinidle_valid_threshold_cycles);
+  obj.add("spinidle_excess_cycles", a.spinidle_excess_cycles);
+  obj.add("preempted_after_entry", a.preempted_after_entry);
+  parent.add_object("arrival", obj);
+}
+
+static FLASHMEM void payload_add_ocxo_compare_forensics_object(
+    Payload& parent,
+    const interrupt_ocxo_compare_forensics_t& c) {
+  Payload obj;
+  obj.add("schema", "OCXO_COMPARE_TRANSCRIPT_V1");
+  obj.add("valid", c.valid);
+  obj.add("capture_sequence", c.capture_sequence);
+  obj.add("lane_active_at_capture", c.lane_active_at_capture);
+  obj.add("compare_owned_at_capture", c.compare_owned_at_capture);
+  obj.add("active_at_capture", c.active_at_capture);
+  obj.add("target_counter32", c.target_counter32);
+
+  obj.add("arm_dwt", c.arm_dwt);
+  obj.add("arm_counter32", c.arm_counter32);
+  obj.add("arm_hardware16", (uint32_t)c.arm_hardware16);
+  obj.add("arm_remaining_ticks", c.arm_remaining_ticks);
+  obj.add("arm_counter_low16", (uint32_t)c.arm_counter_low16);
+  obj.add("arm_software_target_low16",
+          (uint32_t)c.arm_software_target_low16);
+  obj.add("arm_comp1_low16", (uint32_t)c.arm_comp1_low16);
+  obj.add("arm_cmpld1_low16", (uint32_t)c.arm_cmpld1_low16);
+  obj.add("arm_comp1_matches_software_target",
+          c.arm_comp1_matches_software_target);
+  obj.add("arm_cmpld1_matches_software_target",
+          c.arm_cmpld1_matches_software_target);
+  obj.add("arm_comp1_mismatch_count", c.arm_comp1_mismatch_count);
+  obj.add("arm_cmpld1_mismatch_count", c.arm_cmpld1_mismatch_count);
+  obj.add("arm_counter_minus_comp1_ticks",
+          c.arm_counter_minus_comp1_ticks);
+  obj.add("arm_comp1_remaining_ticks", c.arm_comp1_remaining_ticks);
+  obj.add("arm_to_isr_ticks", c.arm_to_isr_ticks);
+  obj.add("arm_to_isr_dwt_cycles", c.arm_to_isr_dwt_cycles);
+
+  obj.add("isr_counter_low16", (uint32_t)c.isr_counter_low16);
+  obj.add("isr_software_target_low16",
+          (uint32_t)c.isr_software_target_low16);
+  obj.add("isr_comp1_low16", (uint32_t)c.isr_comp1_low16);
+  obj.add("isr_cmpld1_low16", (uint32_t)c.isr_cmpld1_low16);
+  obj.add("isr_comp1_matches_software_target",
+          c.isr_comp1_matches_software_target);
+  obj.add("isr_cmpld1_matches_software_target",
+          c.isr_cmpld1_matches_software_target);
+  obj.add("isr_comp1_mismatch_count", c.isr_comp1_mismatch_count);
+  obj.add("isr_cmpld1_mismatch_count", c.isr_cmpld1_mismatch_count);
+  obj.add("isr_counter_minus_comp1_ticks",
+          c.isr_counter_minus_comp1_ticks);
+  obj.add("isr_counter_minus_comp1_signed_ticks",
+          c.isr_counter_minus_comp1_signed_ticks);
+  obj.add("isr_counter_minus_software_target_ticks",
+          c.isr_counter_minus_software_target_ticks);
+  obj.add("isr_counter_minus_software_target_signed_ticks",
+          c.isr_counter_minus_software_target_signed_ticks);
+
+  parent.add_object("compare", obj);
+}
+
 static FLASHMEM void payload_add_pps_vclock_edge_forensics(
     Payload& parent,
     bool available,
@@ -5038,6 +5190,17 @@ static FLASHMEM void payload_add_pps_vclock_edge_forensics(
   edge.add("mapped_gnss_ns_at_edge",
            available ? e.mapped_gnss_ns_at_edge : 0ULL);
   edge.add("gnss_self_error_ns", available ? e.gnss_self_error_ns : 0LL);
+
+  edge.add("arrival_species", "PHYSICAL_PPS_GPIO");
+  payload_add_arrival_forensics_object(
+      edge,
+      available ? e.physical_pps_arrival
+                : interrupt_arrival_forensics_t{});
+  payload_add_interrupt_delay_forensics_object(
+      edge,
+      available ? e.physical_pps_interrupt_delay
+                : interrupt_delay_forensics_t{});
+
   parent.add_object("pps_vclock_edge", edge);
 }
 
@@ -5045,6 +5208,7 @@ static FLASHMEM void payload_add_lane_forensics_object(Payload& parent,
                                               bool valid,
                                               const clocks_alpha_lane_forensics_t& f) {
   Payload forensics;
+  forensics.add("schema", "CLOCK_LANE_FORENSICS_LOSSLESS_V1");
   forensics.add("valid", valid);
   forensics.add("update_count", valid ? f.update_count : 0U);
   forensics.add("last_event_dwt", valid ? f.last_event_dwt : 0U);
@@ -5059,6 +5223,15 @@ static FLASHMEM void payload_add_lane_forensics_object(Payload& parent,
                 valid ? f.visible_origin_phase_offset_ns : 0U);
   forensics.add("counter32_delta_since_previous_event",
                 valid ? f.counter32_delta_since_previous_event : 0U);
+
+  // Preserve the exact first-instruction capture and the full causal verdict.
+  // These objects are copied through Alpha without interpretation.
+  payload_add_arrival_forensics_object(forensics,
+                                       valid ? f.arrival
+                                             : interrupt_arrival_forensics_t{});
+  payload_add_interrupt_delay_forensics_object(
+      forensics,
+      valid ? f.interrupt_delay : interrupt_delay_forensics_t{});
 
   // Raw/effective DWT authority proof.  This is the durable per-row evidence
   // needed by raw_cycles-style reports after the 500-cycle catastrophic gate.
@@ -5144,9 +5317,8 @@ static FLASHMEM void payload_add_lane_forensics_object(Payload& parent,
 
 
 
-  // Keep the paired TIMEBASE_FORENSICS row lean enough to arrive before the
-  // next fragment.  REPORT_DWT_CAPTURE carries the full SlipLedger dossier;
-  // TIMEBASE carries only the durable campaign-row summary.
+  // SlipLedger is retired in the observed-only implementation, but when an
+  // active transcript exists preserve it beside the other lossless evidence.
   if (valid && f.slipledger_active) {
     Payload slip;
     slip.add("active", true);
@@ -5169,59 +5341,36 @@ static FLASHMEM void payload_add_lane_forensics_object(Payload& parent,
   parent.add_object("forensics", forensics);
 }
 
-static FLASHMEM void payload_add_ocxo_service_object(Payload& parent,
-                                            interrupt_subscriber_kind_t kind,
-                                            bool valid,
-                                            const clocks_alpha_lane_forensics_t& f) {
+static FLASHMEM void payload_add_ocxo_service_object(
+    Payload& parent,
+    interrupt_subscriber_kind_t kind,
+    bool valid,
+    const clocks_alpha_lane_forensics_t& f) {
   Payload service;
-  const interrupt_capture_diag_t* direct_diag = valid ? interrupt_last_diag(kind) : nullptr;
-  const bool direct_valid = direct_diag && direct_diag->enabled &&
-                            direct_diag->kind == kind &&
-                            direct_diag->counter32_at_event == f.last_event_counter32;
-
-  // Excursion hunt surface.  Keep this object numerically compact, but publish
-  // the compare-service and perishable-fact custody fields needed to decide
-  // whether a bad raw interval was born in compare presentation, low-word
-  // generation math, or deferred fact association.
+  service.add("schema", "OCXO_SERVICE_LOSSLESS_V1");
+  service.add("kind", interrupt_subscriber_kind_str(kind));
   service.add("class", valid ? f.diag_service_class : 0U);
-  service.add("offset_ticks", valid ? f.diag_service_offset_signed_ticks : 0);
-  service.add("offset_abs_ticks", valid ? f.diag_service_offset_abs_ticks : 0U);
-  service.add("interpreted_late_ticks", valid ? f.diag_interpreted_late_ticks : 0U);
+  service.add("offset_ticks",
+              valid ? f.diag_service_offset_signed_ticks : 0);
+  service.add("offset_abs_ticks",
+              valid ? f.diag_service_offset_abs_ticks : 0U);
+  service.add("interpreted_late_ticks",
+              valid ? f.diag_interpreted_late_ticks : 0U);
   service.add("early_ticks", valid ? f.diag_early_ticks : 0U);
   service.add("target_delta_mod65536_ticks",
               valid ? f.diag_target_delta_mod65536_ticks : 0U);
-  service.add("arm_remaining_ticks", valid ? f.diag_arm_remaining_ticks : 0U);
-  service.add("arm_to_isr_ticks", valid ? f.diag_arm_to_isr_ticks : 0U);
+  service.add("arm_remaining_ticks",
+              valid ? f.diag_arm_remaining_ticks : 0U);
+  service.add("arm_to_isr_ticks",
+              valid ? f.diag_arm_to_isr_ticks : 0U);
   service.add("arm_to_isr_dwt_cycles",
               valid ? f.diag_arm_to_isr_dwt_cycles : 0U);
 
-  // Counter-vs-compare rail courtroom.  These are read directly from the
-  // latest process_interrupt diagnostic because Alpha's durable lane snapshot
-  // intentionally stays smaller than this temporary split-channel autopsy.
-  service.add("arm_counter_low16",
-              direct_valid ? (uint32_t)direct_diag->ocxo_arm_counter_low16 : 0U);
-  service.add("arm_compare_low16",
-              direct_valid ? (uint32_t)direct_diag->ocxo_arm_compare_low16 : 0U);
-  service.add("arm_counter_minus_compare_ticks",
-              direct_valid ? direct_diag->ocxo_arm_counter_minus_compare_ticks : 0U);
-  service.add("arm_compare_remaining_ticks",
-              direct_valid ? direct_diag->ocxo_arm_compare_remaining_ticks : 0U);
-  service.add("isr_counter_low16",
-              direct_valid ? (uint32_t)direct_diag->ocxo_isr_counter_low16 : 0U);
-  service.add("isr_compare_low16",
-              direct_valid ? (uint32_t)direct_diag->ocxo_isr_compare_low16 : 0U);
-  service.add("isr_counter_minus_compare_ticks",
-              direct_valid ? direct_diag->ocxo_isr_counter_minus_compare_ticks : 0U);
-  service.add("compare_target_delta_mod65536_ticks",
-              direct_valid ? direct_diag->ocxo_compare_delta_mod65536_ticks : 0U);
-  service.add("compare_offset_ticks",
-              direct_valid ? direct_diag->ocxo_compare_service_offset_signed_ticks : 0);
-  service.add("compare_interpreted_late_ticks",
-              direct_valid ? direct_diag->ocxo_compare_interpreted_late_ticks : 0U);
-  service.add("compare_early_ticks",
-              direct_valid ? direct_diag->ocxo_compare_early_ticks : 0U);
-  service.add("compare_arm_to_isr_ticks",
-              direct_valid ? direct_diag->ocxo_compare_arm_to_isr_ticks : 0U);
+  // The nested transcript is row-consistent Alpha custody, not a late direct
+  // read of process_interrupt's most recent diagnostic.
+  payload_add_ocxo_compare_forensics_object(
+      service,
+      valid ? f.ocxo_compare : interrupt_ocxo_compare_forensics_t{});
 
   service.add("perishable_fact_sequence",
               valid ? f.diag_perishable_fact_sequence : 0U);
@@ -5237,10 +5386,26 @@ static FLASHMEM void payload_add_ocxo_service_object(Payload& parent,
               valid ? f.diag_last_bad_counter_delta : 0U);
   service.add("last_counter_delta_ticks",
               valid ? f.diag_last_counter_delta_ticks : 0U);
+  service.add("sample_phase_valid",
+              valid && f.diag_sample_phase_valid);
+  service.add("sample_phase_ticks",
+              valid ? f.diag_sample_phase_ticks : 0U);
+  service.add("sample_phase_ns",
+              valid ? f.diag_sample_phase_ns : 0U);
+  service.add("sample_phase_us",
+              valid ? f.diag_sample_phase_us : 0U);
+  service.add("sample_period_ticks",
+              valid ? f.diag_sample_period_ticks : 0U);
   service.add("sample_dwt_at_event",
               valid ? f.diag_sample_dwt_at_event : 0U);
   service.add("sample_counter32_at_event",
               valid ? f.diag_sample_counter32_at_event : 0U);
+  service.add("boundary_dwt_at_event",
+              valid ? f.diag_boundary_dwt_at_event : 0U);
+  service.add("boundary_counter32_at_event",
+              valid ? f.diag_boundary_counter32_at_event : 0U);
+  service.add("boundary_correction_cycles",
+              valid ? f.diag_boundary_correction_cycles : 0);
   parent.add_object("service", service);
 }
 
@@ -7493,10 +7658,8 @@ static FLASHMEM void payload_add_vclock_forensics(Payload& p,
   lane.add("ns", public_gnss_ns);
   lane.add("counter32_at_pps_vclock", (uint32_t)g_counter32_at_pps_vclock);
 
-  // TIMEBASE_FORENSICS is now a compact per-row courtroom audit.  Deep
-  // measurement and SpinCatch/SpinIdle surfaces remain available
-  // through focused reports; the paired 1 Hz stream carries only the DWT
-  // authority proof needed to explain the science row.
+  // Full row-consistent interrupt and clock testimony is embedded directly in
+  // TIMEBASE; focused reports are convenience views, not hidden evidence stores.
   payload_add_lane_forensics_object(lane, forensics_valid, f);
   p.add_object("vclock", lane);
 }
@@ -7743,11 +7906,9 @@ static FLASHMEM void payload_add_ocxo_forensics(Payload& p,
 
   Payload lane;
 
-  // Compact forensic surface for the paired TIMEBASE row.  Keep the public
-  // clock value, source identity, the raw PPS-projection value, the Delta
-  // residual rendering, the DWT gate courtroom, and the tiny OCXO service/counter ladder
-  // proof.  Retired quiet-phase sample fields, measurement/window counters,
-  // SpinCatch/SpinIdle and verbose projection deltas are report-only.
+  // Lossless forensic surface for the paired TIMEBASE row.  The public clock,
+  // projection/Delta evidence, complete Interrupt arrival transcript, and exact
+  // arm/COMP1/CMPLD1/CNTR custody all travel with the same row identity.
   lane.add("ns", public_ns);
   lane.add("ns_source_id", clocks_ocxo_counterledger_mode_enabled()
       ? 4U
@@ -9882,6 +10043,15 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
     payload_add_micro_interrupt_delay(
         f, "o2", ocxo2_forensics.interrupt_delay,
         g_beta_ocxo2_cycle_prediction);
+
+    f.add("lossless", !TIMEBASE_FORENSICS_MINIMAL_PAYLOAD_ENABLED &&
+                      !TIMEBASE_FORENSICS_SLIM_RAW_CYCLES_PAYLOAD_ENABLED);
+    f.add("forensics_profile",
+          TIMEBASE_FORENSICS_MINIMAL_PAYLOAD_ENABLED
+              ? "MINIMAL_EMBEDDED"
+              : (TIMEBASE_FORENSICS_SLIM_RAW_CYCLES_PAYLOAD_ENABLED
+                     ? "SLIM_RAW_CYCLES"
+                     : "FULL_LOSSLESS"));
 
     if (TIMEBASE_FORENSICS_MINIMAL_PAYLOAD_ENABLED) {
       // Minimal embedded mode: retain the raw-cycle evidence needed by Pi-side
@@ -12299,6 +12469,9 @@ static FLASHMEM Payload cmd_report_timebase_publish(const Payload&) {
   p.add("standalone_forensics_publish_enabled", TIMEBASE_FORENSICS_PUBLISH_ENABLED);
   p.add("forensics_minimal_payload_enabled",
         TIMEBASE_FORENSICS_MINIMAL_PAYLOAD_ENABLED);
+  p.add("forensics_lossless_enabled",
+        !TIMEBASE_FORENSICS_MINIMAL_PAYLOAD_ENABLED &&
+        !TIMEBASE_FORENSICS_SLIM_RAW_CYCLES_PAYLOAD_ENABLED);
   p.add("forensics_micro_raw_cycles_enabled",
         TIMEBASE_FORENSICS_MICRO_RAW_CYCLES_ENABLED);
   p.add("forensics_micro_court_enabled",
@@ -12444,6 +12617,9 @@ static FLASHMEM Payload cmd_report_timebase_publish_deep(const Payload&) {
   Payload gates;
   gates.add("standalone_forensics_publish_enabled", TIMEBASE_FORENSICS_PUBLISH_ENABLED);
   gates.add("forensics_minimal_payload_enabled", TIMEBASE_FORENSICS_MINIMAL_PAYLOAD_ENABLED);
+  gates.add("forensics_lossless_enabled",
+            !TIMEBASE_FORENSICS_MINIMAL_PAYLOAD_ENABLED &&
+            !TIMEBASE_FORENSICS_SLIM_RAW_CYCLES_PAYLOAD_ENABLED);
   gates.add("forensics_micro_raw_cycles_enabled",
             TIMEBASE_FORENSICS_MICRO_RAW_CYCLES_ENABLED);
   gates.add("forensics_micro_court_enabled",
@@ -12634,6 +12810,9 @@ static FLASHMEM Payload cmd_report_timebase_publish_deep(const Payload&) {
            g_timebase_forensics_publish_return_count);
   gaps.add("standalone_forensics_disabled", !TIMEBASE_FORENSICS_PUBLISH_ENABLED);
   gaps.add("forensics_minimal_payload", TIMEBASE_FORENSICS_MINIMAL_PAYLOAD_ENABLED);
+  gaps.add("forensics_lossless",
+           !TIMEBASE_FORENSICS_MINIMAL_PAYLOAD_ENABLED &&
+           !TIMEBASE_FORENSICS_SLIM_RAW_CYCLES_PAYLOAD_ENABLED);
   gaps.add("forensics_micro_raw_cycles",
            TIMEBASE_FORENSICS_MICRO_RAW_CYCLES_ENABLED);
   gaps.add("forensics_micro_court",
