@@ -4,7 +4,9 @@ For PPS, VCLOCK, OCXO1, and OCXO2 the report intentionally shows only the
 producer-published observed cycle count and producer-published last-second raw
 residual.  A single NOTE column summarizes current endpoint-delay verdicts for
 all displayed clocks.  Raw endpoints remain immutable; no projection, repair,
-or cross-rail subtraction is performed.
+or cross-rail subtraction is performed.  The report treats a RECOVER gap as a
+non-adjacent timeline seam: it preserves the producer's observed interval, but
+suppresses current-minus-previous residual and lineage comparisons for that row.
 """
 
 from __future__ import annotations
@@ -72,6 +74,10 @@ class Row:
     rails: Dict[str, Rail]
     issues: List[str]
     explanations: List[str]
+    previous_count: Optional[int] = None
+    count_delta: Optional[int] = None
+    gap_from_previous: bool = False
+    recovery_boundary: bool = False
 
 
 def fetch(campaign: str, skip: int = 0, limit: int = 0) -> List[Dict[str, Any]]:
@@ -215,13 +221,49 @@ def fallback_observed(frag: Dict[str, Any], rail: str) -> Optional[int]:
     )
 
 
+
+def recovery_status(frag: Dict[str, Any]) -> Dict[str, Optional[bool]]:
+    """Extract explicit RECOVER testimony from the TIMEBASE fragment."""
+    return {
+        "degraded_active": b(frag.get("recover_degraded_active")),
+        "degraded_science_hold": b(frag.get("recover_degraded_science_hold")),
+        "science_quarantine_active": b(frag.get("recover_science_quarantine_active")),
+        "transition_active": b(frag.get("recover_transition_active")),
+        "timeline_ready": b(frag.get("recover_timeline_ready")),
+        "clockface_ready": b(frag.get("recover_clockface_ready")),
+        "science_ready": b(frag.get("recover_science_ready")),
+    }
+
+
+def explicit_recovery_row(frag: Dict[str, Any]) -> bool:
+    """Return True only when the row itself carries RECOVER lifecycle evidence."""
+    status = recovery_status(frag)
+    reason = str(frag.get("recover_reattach_reason") or "").strip().lower()
+    return bool(
+        reason not in {"", "idle", "none"}
+        or status["degraded_active"] is True
+        or status["degraded_science_hold"] is True
+        or status["science_quarantine_active"] is True
+        or status["transition_active"] is True
+        or status["timeline_ready"] is True
+        or status["clockface_ready"] is True
+        or status["science_ready"] is True
+    )
+
+
 def collect(records: Sequence[Dict[str, Any]]) -> List[Row]:
     rows: List[Row] = []
     previous: Dict[str, Optional[int]] = {name: None for name in RAILS}
+    previous_count: Optional[int] = None
     delay_prefix = {"PPS": "pps", "VCLOCK": "v", "OCXO1": "o1", "OCXO2": "o2"}
 
     for record in records:
         frag = fragment(record)
+        count = count_of(record, frag)
+        count_delta = (count - previous_count) if count is not None and previous_count is not None else None
+        gap_from_previous = count_delta is not None and count_delta != 1
+        recovery_boundary = bool(gap_from_previous and count_delta is not None and count_delta > 1
+                                 and explicit_recovery_row(frag))
         forensic = forensics(record, frag)
         raw = d(frag.get("raw_cycles"))
         rails: Dict[str, Rail] = {}
@@ -234,7 +276,7 @@ def collect(records: Sequence[Dict[str, Any]]) -> List[Row]:
 
             published_previous = i(obj.get("previous_observed_cycles"))
             published_residual = i(obj.get("residual_cycles"))
-            computed_previous = previous[name]
+            computed_previous = previous[name] if not gap_from_previous else None
             computed_residual = (
                 observed - computed_previous
                 if observed is not None and computed_previous is not None
@@ -318,13 +360,18 @@ def collect(records: Sequence[Dict[str, Any]]) -> List[Row]:
             previous[name] = observed
 
         rows.append(Row(
-            count=count_of(record, frag),
+            count=count,
             disposition=str(frag.get("candidate_disposition") or "ACCEPT").upper(),
             timeline_valid=b(frag.get("timeline_valid")),
             rails=rails,
             issues=[],
             explanations=[],
+            previous_count=previous_count,
+            count_delta=count_delta,
+            gap_from_previous=gap_from_previous,
+            recovery_boundary=recovery_boundary,
         ))
+        previous_count = count
     return rows
 
 
@@ -337,6 +384,11 @@ def classify(row: Row, selected: Sequence[str], gate: int) -> List[str]:
         issues.append(f"candidate disposition is {row.disposition}")
     if row.timeline_valid is False:
         issues.append("timeline_valid is false")
+    if row.gap_from_previous and not row.recovery_boundary:
+        issues.append(
+            f"non-adjacent PPS identity {row.previous_count} -> {row.count} "
+            f"(delta={row.count_delta}); residual comparison suppressed"
+        )
     for name in selected:
         rail = row.rails[name]
         if rail.observed is None:
@@ -347,7 +399,7 @@ def classify(row: Row, selected: Sequence[str], gate: int) -> List[str]:
         if rail.valid is False:
             issues.append(f"{name}: producer marked raw-cycle sample invalid")
 
-        if rail.computed_residual is not None and abs(rail.computed_residual) > gate:
+        if not row.gap_from_previous and rail.computed_residual is not None and abs(rail.computed_residual) > gate:
             normalized = rail.residual_after_delay_cycles
             explained = (
                 rail.residual_delay_valid is True
@@ -379,17 +431,17 @@ def classify(row: Row, selected: Sequence[str], gate: int) -> List[str]:
                     f"{rail.computed_residual:+,d} exceeds gate{detail}"
                 )
 
-        if rail.previous_difference not in (None, 0):
+        if not row.gap_from_previous and rail.previous_difference not in (None, 0):
             issues.append(
                 f"{name}: published previous differs from displayed previous by "
                 f"{rail.previous_difference:+,d} cycles"
             )
-        if rail.residual_difference not in (None, 0):
+        if not row.gap_from_previous and rail.residual_difference not in (None, 0):
             issues.append(
                 f"{name}: published residual differs from computed residual by "
                 f"{rail.residual_difference:+,d} cycles"
             )
-        if rail.residual_after_difference not in (None, 0):
+        if not row.gap_from_previous and rail.residual_after_difference not in (None, 0):
             issues.append(
                 f"{name}: firmware normalized residual differs from report math by "
                 f"{rail.residual_after_difference:+,d} cycles"
@@ -428,6 +480,11 @@ def verdict_note(row: Row, selected: Sequence[str]) -> str:
         "MULTIPLE_ISR": "MULTIPLE ISR",
     }
     notes: List[str] = []
+    if row.recovery_boundary:
+        skipped = (row.count_delta - 1) if row.count_delta is not None else None
+        return f"RECOVER GAP ({skipped} skipped); residuals suppressed"
+    if row.gap_from_previous:
+        return f"NON-ADJACENT GAP delta={row.count_delta}; residuals suppressed"
     for name in selected:
         rail = row.rails[name]
         if rail.delay_status == "ON_TIME":
@@ -502,6 +559,9 @@ def print_extended_row(row: Row, selected: Sequence[str], gate: int) -> None:
     gate.  Endpoint testimony is expanded only for an affirmative abnormal
     verdict.  UNKNOWN without evidence is intentionally quiet.
     """
+    if row.gap_from_previous:
+        return
+
     interesting = [
         name for name in selected
         if (
@@ -629,7 +689,7 @@ def main(argv: Sequence[str]) -> None:
     displayed = 0
     for row in rows:
         note = verdict_note(row, selected)
-        has_raw_pathology = any(
+        has_raw_pathology = (not row.gap_from_previous) and any(
             row.rails[name].published_residual is not None
             and abs(row.rails[name].published_residual) > gate
             for name in selected
@@ -642,11 +702,11 @@ def main(argv: Sequence[str]) -> None:
             rail = row.rails[name]
             fields += [
                 fmt(rail.observed, 13),
-                fmt(rail.published_residual, 9, True),
+                fmt(None if row.gap_from_previous else rail.published_residual, 9, True),
             ]
         fields.append(note)
         print("  ".join(fields))
-        if any(
+        if not row.gap_from_previous and any(
             (
                 row.rails[name].published_residual is not None
                 and abs(row.rails[name].published_residual) > gate

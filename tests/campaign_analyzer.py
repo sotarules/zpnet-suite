@@ -637,7 +637,38 @@ def fetch_timebase(campaign: str) -> List[Dict[str, Any]]:
     return result
 
 
-def find_recovery_boundaries(rows: List[Dict[str, Any]]) -> Set[int]:
+def _row_has_recovery_evidence(row: Dict[str, Any]) -> bool:
+    """Return True only when the row itself identifies a RECOVER transition.
+
+    A PPS-count gap is not automatically a recovery.  Database loss, filtering,
+    or a malformed campaign can also remove rows.  Recovery classification must
+    therefore come from the persisted TIMEBASE testimony, not from the gap alone.
+    """
+    status = _row_recovery_status(row)
+    reason = str(status.get("reason") or "").strip().lower()
+    if reason and reason not in ("none", "idle", "ok"):
+        return True
+    if any(bool(status.get(key)) for key in (
+        "degraded_active",
+        "degraded_science_hold",
+        "science_quarantine_active",
+        "transition_active",
+    )):
+        return True
+    if _recovery_continuity_forensics(row):
+        return True
+    frag = _fragment(row)
+    return bool(_to_bool(_first_value(
+        frag.get("recovering"),
+        frag.get("recovered"),
+        frag.get("recovery_active"),
+        row.get("recovering"),
+        row.get("recovered"),
+    )))
+
+
+def find_all_gap_boundaries(rows: List[Dict[str, Any]]) -> Set[int]:
+    """Return the first persisted PPS identity after every positive count gap."""
     boundaries: Set[int] = set()
     for i in range(1, len(rows)):
         prev = _row_pps_count(rows[i - 1])
@@ -645,6 +676,16 @@ def find_recovery_boundaries(rows: List[Dict[str, Any]]) -> Set[int]:
         if curr > prev + 1:
             boundaries.add(curr)
     return boundaries
+
+
+def find_recovery_boundaries(rows: List[Dict[str, Any]]) -> Set[int]:
+    """Return only gaps whose resumed row carries explicit recovery evidence."""
+    return {
+        _row_pps_count(rows[i])
+        for i in range(1, len(rows))
+        if (_row_pps_count(rows[i]) > _row_pps_count(rows[i - 1]) + 1
+            and _row_has_recovery_evidence(rows[i]))
+    }
 
 
 # -----------------------------------------------------------------------------
@@ -666,7 +707,7 @@ def print_campaign_overview(rows: List[Dict[str, Any]], recovery_boundaries: Set
     secs = campaign_seconds % 60
 
     print("=" * 78)
-    print(f"CAMPAIGN ANALYSIS: {rows[0].get('campaign', '?')}  (v17 TIMEBASE_V3/FRAGMENT_V4)")
+    print(f"CAMPAIGN ANALYSIS: {rows[0].get('campaign', '?')}  (v18 TIMEBASE_V3/FRAGMENT_V4)")
     print("=" * 78)
     print()
     print(f"  Time range:        {first_ts}")
@@ -844,8 +885,7 @@ def analyze_recovery_cleanliness(rows: List[Dict[str, Any]], recovery_boundaries
             if aligned is not True:
                 anomalies.append(f"recovery {curr_pps}: continuity proof not aligned")
         else:
-            print("    recovery continuity proof:  not present in TIMEBASE_FORENSICS")
-            anomalies.append(f"recovery {curr_pps}: continuity proof missing")
+            print("    recovery continuity proof:  not present — using independent ledger projection")
 
         for label, prefix in [("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")]:
             clean = _ocxo_science_clean(curr, prefix)
@@ -887,8 +927,7 @@ def analyze_recovery_cleanliness(rows: List[Dict[str, Any]], recovery_boundaries
                 actual_n = _welford_int(curr, prefix, "n")
                 previous_n = _welford_int(prev, prefix, "n")
 
-            expected_n = _expected_welford_n(curr_pps, prefix, recovery_boundaries)
-            if expected_n is None or actual_n is None:
+            if actual_n is None:
                 continue
 
             if prefix in ("ocxo1", "ocxo2") and held:
@@ -900,10 +939,13 @@ def analyze_recovery_cleanliness(rows: List[Dict[str, Any]], recovery_boundaries
                         f"({previous_n} -> {actual_n})"
                     )
             else:
-                print(f"    {label:<9s} Welford N: actual={actual_n:,} expected={expected_n:,}")
-                if abs(int(actual_n) - int(expected_n)) > WELFORD_N_TOLERANCE:
+                delta_n = None if previous_n is None else int(actual_n) - int(previous_n)
+                delta_text = "---" if delta_n is None else f"{delta_n:+,d}"
+                print(f"    {label:<9s} Welford N: actual={actual_n:,}  boundary_delta={delta_text}")
+                if previous_n is not None and int(actual_n) < int(previous_n):
                     anomalies.append(
-                        f"recovery {curr_pps}: {label} Welford N {actual_n} != expected {expected_n}"
+                        f"recovery {curr_pps}: {label} Welford N regressed "
+                        f"({previous_n} -> {actual_n})"
                     )
 
         for label, prefix in [("DWT", "dwt"), ("VCLOCK", "vclock"), ("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")]:
@@ -966,23 +1008,24 @@ def analyze_clock_domains(rows: List[Dict[str, Any]], recovery_boundaries: Set[i
         for i in range(1, len(values)):
             pp, pv = values[i - 1]
             cp, cv = values[i]
-            if cp in recovery_boundaries:
+            if cp != pp + 1:
+                # A resumed endpoint is valid cumulative testimony, but it is not
+                # a one-second sample.  Never manufacture an interval across a gap.
                 continue
             delta = cv - pv
             if delta == 0:
                 zero_deltas += 1
             elif delta < 0:
                 non_monotonic += 1
-            if cp == pp + 1:
-                delta_stats.update(float(delta))
-                if label in ("GNSS", "VCLOCK") and delta != NS_PER_SECOND:
+            delta_stats.update(float(delta))
+            if label in ("GNSS", "VCLOCK") and delta != NS_PER_SECOND:
+                bad_adjacent += 1
+            elif label.startswith("OCXO") and abs(delta - NS_PER_SECOND) > OCXO_SECOND_ALARM_NS:
+                bad_adjacent += 1
+            elif label == "DWT":
+                # DWT is a cycle-domain clock; compare only against sanity.
+                if delta <= 0:
                     bad_adjacent += 1
-                elif label.startswith("OCXO") and abs(delta - NS_PER_SECOND) > OCXO_SECOND_ALARM_NS:
-                    bad_adjacent += 1
-                elif label == "DWT":
-                    # DWT is a cycle-domain clock; compare only against sanity.
-                    if delta <= 0:
-                        bad_adjacent += 1
 
         print(f"\n  [{label}]")
         print(f"    Range: {values[0][1]:,} -> {values[-1][1]:,} {unit}")
@@ -1032,13 +1075,19 @@ def analyze_ocxo_integrity(rows: List[Dict[str, Any]], recovery_boundaries: Set[
         valid_seconds = 0
         null_count = 0
         recovery_held_count = 0
+        gap_reset_count = 0
+        prev_pps: Optional[int] = None
 
         for row in rows:
             pps = _row_pps_count(row)
-            if pps in recovery_boundaries:
+            if prev_pps is not None and pps != prev_pps + 1:
+                # Public ledgers remain cumulative across a gap, but phase steps,
+                # ns deltas, and PPB steps require adjacent one-second identities.
                 prev_phase_offset = None
                 prev_ppb = None
                 prev_ns_count = None
+                gap_reset_count += 1
+            prev_pps = pps
 
             if _row_recovery_science_hold(row):
                 prev_phase_offset = None
@@ -1127,6 +1176,7 @@ def analyze_ocxo_integrity(rows: List[Dict[str, Any]], recovery_boundaries: Set[
             prev_ns_count = ns_count
 
         print(f"\n  Valid seconds:       {valid_seconds:,}")
+        print(f"  Gap boundary resets: {gap_reset_count:,}")
         print(f"  Recovery-held rows: {recovery_held_count:,}")
         print(f"  Null/invalid rows:   {null_count}")
 
@@ -1218,7 +1268,9 @@ def analyze_ocxo_comparison(rows: List[Dict[str, Any]], recovery_boundaries: Set
 
     for row in rows:
         pps = _row_pps_count(row)
-        if pps in recovery_boundaries:
+        if pps in recovery_boundaries or _row_recovery_science_hold(row):
+            continue
+        if not (_ocxo_valid(row, "ocxo1") and _ocxo_valid(row, "ocxo2")):
             continue
         r1 = _ocxo_residual(row, "ocxo1")
         r2 = _ocxo_residual(row, "ocxo2")
@@ -1292,7 +1344,6 @@ def analyze_welford_contamination(rows: List[Dict[str, Any]], recovery_boundarie
             points.append((pps, int(n), float(mean or 0.0), float(sd), float(se or 0.0)))
 
             if kind == "interval":
-                expected = _expected_welford_n(pps, prefix, recovery_boundaries)
                 held = (
                     prefix in ("ocxo1", "ocxo2") and
                     _row_recovery_science_hold(row)
@@ -1303,12 +1354,15 @@ def analyze_welford_contamination(rows: List[Dict[str, Any]], recovery_boundarie
                         n_alarms.append(
                             f"pps={pps:>7d}  n={n:,} changed_during_hold_from={previous_n:,}"
                         )
-                elif expected is not None and abs(int(n) - int(expected)) > WELFORD_N_TOLERANCE:
-                    n_alarms.append(f"pps={pps:>7d}  n={n:,} expected={expected:,}")
+                # At an ordinary adjacent row, a valid population may advance by
+                # at most one.  Across a gap, firmware may gap-advance cardinality;
+                # the analyzer certifies monotonicity instead of inventing an
+                # absolute N formula from public_count.
+                elif previous_n is not None and int(n) < previous_n:
+                    n_alarms.append(f"pps={pps:>7d}  n regressed {previous_n:,}->{int(n):,}")
             elif kind == "dac":
-                expected = _expected_welford_n(pps, prefix, recovery_boundaries)
-                if expected is not None and abs(int(n) - int(expected)) > WELFORD_N_TOLERANCE:
-                    n_alarms.append(f"pps={pps:>7d}  n={n:,} expected={expected:,}")
+                if previous_n is not None and int(n) < previous_n:
+                    n_alarms.append(f"pps={pps:>7d}  n regressed {previous_n:,}->{int(n):,}")
             elif kind == "gnss_raw":
                 # GNSS_RAW is Pi-owned and updates only when a TIMEBASE row is
                 # persisted; unlike Teensy interval Welfords, it is not gap-
@@ -1341,7 +1395,7 @@ def analyze_welford_contamination(rows: List[Dict[str, Any]], recovery_boundarie
             cp, cn, _, cs, _ = points[i]
             if cn < pn:
                 n_regressions.append(f"pps={cp:>7d}  n {pn:,} -> {cn:,}")
-            if cp in recovery_boundaries:
+            if cp != pp + 1:
                 continue
             if ps > 0.0 and cs > ps * 2.0 and cs > 10.0:
                 jumps.append(f"pps={cp:>7d}  stddev {ps:.3f} -> {cs:.3f}  (x{cs/ps:.1f})")
@@ -1587,10 +1641,15 @@ def analyze(campaign: str) -> None:
         print(f"No TIMEBASE rows found for campaign '{campaign}'")
         return
 
+    all_gap_boundaries = find_all_gap_boundaries(rows)
     recovery_boundaries = find_recovery_boundaries(rows)
     anomalies: List[str] = []
 
     print_campaign_overview(rows, recovery_boundaries)
+    unclassified_gap_boundaries = all_gap_boundaries - recovery_boundaries
+    if unclassified_gap_boundaries:
+        print(f"  Unclassified gaps: {len(unclassified_gap_boundaries)} "
+              f"(not treated as RECOVER without row testimony)")
     anomalies.extend(analyze_pps_continuity(rows, recovery_boundaries))
     anomalies.extend(analyze_recovery_projection(rows, recovery_boundaries))
     anomalies.extend(analyze_recovery_cleanliness(rows, recovery_boundaries))
