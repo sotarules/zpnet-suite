@@ -44,6 +44,7 @@ import threading
 import time
 
 from zpnet.processes.processes import send_command
+from zpnet.shared.db import open_db
 
 # AD5693R DAC doctrine mirrors firmware: internal 2.5 V reference with 2x
 # gain, yielding an effective 0..5 V code span.  This is presentation-only;
@@ -1384,6 +1385,108 @@ def _dwt_expected_cycles(r: dict):
 
 
 # ---------------------------------------------------------------------
+# Campaign history readout
+# ---------------------------------------------------------------------
+
+def _get_campaign_rows() -> list[dict]:
+    """Return compact campaign ledger rows, newest first.
+
+    ``campaigns.payload`` stores the full TIMEBASE dossier as JSON text.  Metrics
+    asks PostgreSQL to project only the five values needed by this panel, avoiding
+    a one-second transfer and parse of every historical forensic payload.  The
+    active row is denormalized by PI CLOCKS on every accepted TIMEBASE row, so the
+    newest campaign remains live while completed campaigns remain frozen.
+    """
+    with open_db(row_dict=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    id,
+                    ts,
+                    campaign,
+                    active,
+                    payload::jsonb #>> '{report,fragment,ocxo1,ns}'
+                        AS ocxo1_ns,
+                    COALESCE(
+                        payload::jsonb #>> '{report,fragment,ocxo1,science,total_tau}',
+                        payload::jsonb #>> '{report,fragment,stats,ocxo1,tau}'
+                    ) AS ocxo1_tau,
+                    COALESCE(
+                        payload::jsonb #>> '{report,fragment,ocxo1,science,total_ppb}',
+                        payload::jsonb #>> '{report,fragment,stats,ocxo1,ppb}'
+                    ) AS ocxo1_ppb,
+                    payload::jsonb #>> '{report,fragment,ocxo2,ns}'
+                        AS ocxo2_ns,
+                    COALESCE(
+                        payload::jsonb #>> '{report,fragment,ocxo2,science,total_tau}',
+                        payload::jsonb #>> '{report,fragment,stats,ocxo2,tau}'
+                    ) AS ocxo2_tau,
+                    COALESCE(
+                        payload::jsonb #>> '{report,fragment,ocxo2,science,total_ppb}',
+                        payload::jsonb #>> '{report,fragment,stats,ocxo2,ppb}'
+                    ) AS ocxo2_ppb
+                FROM campaigns
+                ORDER BY ts DESC, id DESC
+                """
+            )
+            return list(cur.fetchall())
+
+
+def campaigns_readout() -> list[str]:
+    """Render the live campaign ledger with cumulative OCXO clock results."""
+    try:
+        rows = _get_campaign_rows()
+    except Exception as e:
+        return ["\0CAMPAIGNS:ERROR", f"CAMPAIGNS: UNAVAILABLE: {e}"]
+
+    newest_identity = str(rows[0].get("id")) if rows else "EMPTY"
+    lines = [f"\0CAMPAIGN:{newest_identity}"]
+
+    W_CAMPAIGN = 27
+    W_DEV = 8
+    W_VALUE = 22
+    W_TAU = 18
+    W_PPB = 10
+
+    lines.append(
+        f"{'CAMPAIGN':<{W_CAMPAIGN}}"
+        f"{'DEV':<{W_DEV}}"
+        f"{'VALUE':>{W_VALUE}}"
+        f"{'TAU':>{W_TAU}}"
+        f"{'PPB':>{W_PPB}}"
+    )
+
+    if not rows:
+        lines.append("")
+        lines.append("NO CAMPAIGNS")
+        return lines
+
+    for row_index, row in enumerate(rows):
+        campaign = str(row.get("campaign") or "?")
+        if row.get("active"):
+            campaign += "*"
+
+        for lane_name, lane_key in (("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")):
+            value = _to_int(row.get(f"{lane_key}_ns"))
+            tau = _to_float(row.get(f"{lane_key}_tau"))
+            ppb = _to_float(row.get(f"{lane_key}_ppb"))
+
+            lines.append(
+                f"{campaign:<{W_CAMPAIGN}}"
+                f"{lane_name:<{W_DEV}}"
+                f"{_comma_int(value, W_VALUE)}"
+                f"{_fmt(tau, f'>{W_TAU}.12f', W_TAU)}"
+                f"{_fmt(ppb, f'>{W_PPB}.3f', W_PPB)}"
+            )
+
+        if row_index != len(rows) - 1:
+            lines.append("")
+
+    return lines
+
+
+# ---------------------------------------------------------------------
 # Combined clocks readout
 # ---------------------------------------------------------------------
 
@@ -1734,5 +1837,6 @@ def clocks_combined_readout() -> list[str]:
 
 
 READOUTS = [
-    ("CLOCKS", lambda: _safe_lines(clocks_combined_readout)),
+    ("CLOCKS", lambda: _safe_lines(clocks_combined_readout), False),
+    ("CAMPAIGNS", lambda: _safe_lines(campaigns_readout), True),
 ]

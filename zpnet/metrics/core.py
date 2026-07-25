@@ -32,6 +32,8 @@ Author: The Mule + GPT
 import curses
 import logging
 import time
+from dataclasses import dataclass
+from typing import Callable
 
 from zpnet.shared.logger import setup_logging
 from zpnet.metrics.readout_blocks import READOUTS, adjust_ocxo_dac, status_header
@@ -47,6 +49,31 @@ DAC_KEY_HELP = (
     "O1 F9/F10/F11/F12=coarse-/fine-/fine+/coarse+  "
     "O2 F5/F6/F7/F8=coarse-/fine-/fine+/coarse+"
 )
+
+
+@dataclass(frozen=True)
+class ReadoutSpec:
+    """Core-owned readout registration and body behavior."""
+
+    name: str
+    render: Callable[[], list[str]]
+    scrollable: bool = False
+
+
+def _normalize_readout(entry) -> ReadoutSpec:
+    """Accept the new descriptor and the legacy ``(name, render)`` tuple."""
+    if isinstance(entry, ReadoutSpec):
+        return entry
+    if len(entry) == 3:
+        name, render, scrollable = entry
+        return ReadoutSpec(name=name, render=render, scrollable=bool(scrollable))
+    name, render = entry
+    return ReadoutSpec(name=name, render=render, scrollable=False)
+
+
+def _page_step(body_height: int) -> int:
+    """Move by almost one viewport so adjacent pages retain one context line."""
+    return max(1, body_height - 1)
 
 
 # ---------------------------------------------------------------------
@@ -158,8 +185,11 @@ def _main(stdscr: curses.window) -> None:
     # ---------------------------------------------------------
     # State
     # ---------------------------------------------------------
+    readouts = [_normalize_readout(entry) for entry in READOUTS]
     readout_index = 0
     locked = False
+    scroll_offsets = {readout.name: 0 for readout in readouts}
+    readout_top_identity = {readout.name: None for readout in readouts}
     last_cycle_time = time.monotonic()
     last_control_message = ""
     last_control_time = 0.0
@@ -184,7 +214,20 @@ def _main(stdscr: curses.window) -> None:
 
         elif key == ord(" "):
             if locked:
-                readout_index = (readout_index + 1) % len(READOUTS)
+                readout_index = (readout_index + 1) % len(readouts)
+                scroll_offsets[readouts[readout_index].name] = 0
+
+        elif key in (curses.KEY_PPAGE, curses.KEY_NPAGE):
+            readout = readouts[readout_index]
+            if readout.scrollable:
+                max_y, _ = stdscr.getmaxyx()
+                body_height = max(1, max_y - 6)
+                step = _page_step(body_height)
+                current = scroll_offsets.get(readout.name, 0)
+                if key == curses.KEY_PPAGE:
+                    scroll_offsets[readout.name] = max(0, current - step)
+                else:
+                    scroll_offsets[readout.name] = current + step
 
         elif key in dac_key_bindings:
             lane, direction, step_kind = dac_key_bindings[key]
@@ -201,13 +244,15 @@ def _main(stdscr: curses.window) -> None:
         if not locked:
             now = time.monotonic()
             if now - last_cycle_time >= CYCLE_INTERVAL_S:
-                readout_index = (readout_index + 1) % len(READOUTS)
+                readout_index = (readout_index + 1) % len(readouts)
+                scroll_offsets[readouts[readout_index].name] = 0
                 last_cycle_time = now
 
         # -----------------------------------------------------
         # Fetch data
         # -----------------------------------------------------
-        readout_name, readout_fn = READOUTS[readout_index]
+        readout = readouts[readout_index]
+        readout_name = readout.name
 
         try:
             header = status_header()
@@ -215,7 +260,7 @@ def _main(stdscr: curses.window) -> None:
             header = " STATUS: ERROR"
 
         try:
-            lines = readout_fn()
+            lines = readout.render()
         except Exception as e:
             lines = [f"ERROR: {e}"]
 
@@ -224,6 +269,25 @@ def _main(stdscr: curses.window) -> None:
         # -----------------------------------------------------
         stdscr.erase()
         max_y, max_x = stdscr.getmaxyx()
+        body_height = max(0, max_y - 6)
+
+        scroll_offset = 0
+        max_scroll = max(0, len(lines) - body_height)
+        if readout.scrollable:
+            # The first body line is a stable identity token supplied by the
+            # readout.  A new newest campaign resets CAMPAIGNS to the top, while
+            # ordinary live value changes do not disturb the operator's position.
+            top_identity = lines[0][1:] if lines and lines[0].startswith("\0") else None
+            previous_identity = readout_top_identity.get(readout.name)
+            if previous_identity is not None and top_identity != previous_identity:
+                scroll_offsets[readout.name] = 0
+            readout_top_identity[readout.name] = top_identity
+
+            if lines and lines[0].startswith("\0"):
+                lines = lines[1:]
+                max_scroll = max(0, len(lines) - body_height)
+            scroll_offset = min(scroll_offsets.get(readout.name, 0), max_scroll)
+            scroll_offsets[readout.name] = scroll_offset
 
         # Row 0 — status header (inverse video)
         header_text = header[:max_x - 1].ljust(max_x - 1)
@@ -241,7 +305,12 @@ def _main(stdscr: curses.window) -> None:
 
         # Row 2 — readout name + lock state
         lock_indicator = " [LOCKED]" if locked else ""
-        nav_label = f" {readout_name}{lock_indicator}"
+        scroll_indicator = ""
+        if readout.scrollable and max_scroll > 0:
+            first = scroll_offset + 1
+            last = min(len(lines), scroll_offset + body_height)
+            scroll_indicator = f"  [{first}-{last}/{len(lines)}]"
+        nav_label = f" {readout_name}{lock_indicator}{scroll_indicator}"
         try:
             stdscr.addstr(2, 0, nav_label, COLOR_BRIGHT)
         except curses.error:
@@ -254,7 +323,8 @@ def _main(stdscr: curses.window) -> None:
             pass
 
         # Row 4+ — readout content
-        for i, line in enumerate(lines):
+        visible_lines = lines[scroll_offset:scroll_offset + body_height]
+        for i, line in enumerate(visible_lines):
             row = 4 + i
             if row >= max_y - 2:
                 break
@@ -272,7 +342,8 @@ def _main(stdscr: curses.window) -> None:
                 pass
 
         # Bottom row — help bar
-        help_text = " L=Lock  SPACE=Next  " + DAC_KEY_HELP + "  Q=Quit"
+        scroll_help = " PGUP/PGDN=Scroll " if readout.scrollable else ""
+        help_text = " L=Lock  SPACE=Next " + scroll_help + " " + DAC_KEY_HELP + "  Q=Quit"
         try:
             stdscr.addstr(max_y - 1, 0, help_text[:max_x - 1], COLOR_DIM)
         except curses.error:
