@@ -595,6 +595,42 @@ static FLASHMEM Payload system_crash_core_forensics_payload(
   return out;
 }
 
+static FLASHMEM Payload system_raw_fault_entry_payload(
+    const crash_raw_entry_record_t& r) {
+  Payload out;
+  out.add("schema", "ZPNET_RAW_FAULT_ENTRY_V1");
+  out.add("schema_version", r.schema_version);
+  out.add("record_size", r.record_size);
+  out.add("sequence", r.sequence);
+  out.add("exception_number", r.exception_number);
+  out.add("exception_name", crash_forensics_exception_name(r.exception_number));
+  system_crash_add_hex32(out, "exc_return", r.exc_return);
+  system_crash_add_hex32(out, "frame_sp", r.frame_sp);
+  system_crash_add_hex32(out, "original_msp", r.original_msp);
+  system_crash_add_hex32(out, "original_psp", r.original_psp);
+  system_crash_add_hex32(out, "dwt", r.dwt_cyccnt);
+  system_crash_add_hex32(out, "cfsr", r.cfsr);
+  system_crash_add_hex32(out, "hfsr", r.hfsr);
+  system_crash_add_hex32(out, "icsr", r.icsr);
+  out.add_object("raw_words", system_crash_word_window_payload(
+      r.frame_sp, r.word_count, r.words, CRASH_RAW_ENTRY_WORDS));
+  return out;
+}
+static FLASHMEM Payload system_rx_dispatch_breadcrumb_payload(
+    const transport_rx_dispatch_breadcrumb_t& b) {
+  Payload out;
+  out.add("sequence", b.sequence); out.add("stage_id", b.stage);
+  out.add("stage", transport_rx_dispatch_stage_name(b.stage));
+  system_crash_add_hex32(out, "dwt", b.dwt);
+  system_crash_add_hex32(out, "msp_before", b.msp_before);
+  system_crash_add_hex32(out, "msp_after", b.msp_after);
+  system_crash_add_hex32(out, "min_msp", b.min_msp);
+  system_crash_add_hex32(out, "callback", b.callback);
+  out.add("traffic", b.traffic); system_crash_add_hex32(out, "payload", b.payload);
+  out.add("payload_count", b.payload_count); out.add("ipsr", b.ipsr);
+  system_crash_add_hex32(out, "lr", b.lr); return out;
+}
+
 static FLASHMEM Payload system_crash_forensics_payload(void) {
   crash_forensics_status_t status{};
   crash_forensics_get_status(&status);
@@ -617,6 +653,21 @@ static FLASHMEM Payload system_crash_forensics_payload(void) {
   out.add("crc_valid", status.crc_valid);
   system_crash_add_hex32(out, "stored_crc", status.stored_crc);
   system_crash_add_hex32(out, "computed_crc", status.computed_crc);
+
+  const crash_raw_entry_record_t* raw_entry = crash_forensics_raw_entry_record();
+  out.add("raw_entry_present", raw_entry != nullptr);
+  if (raw_entry) out.add_object("raw_entry", system_raw_fault_entry_payload(*raw_entry));
+
+  transport_rx_dispatch_snapshot_t rx_dispatch{};
+  transport_rx_dispatch_snapshot(&rx_dispatch);
+  Payload rx_breadcrumb;
+  rx_breadcrumb.add("live_valid", rx_dispatch.live_valid);
+  if (rx_dispatch.live_valid)
+    rx_breadcrumb.add_object("live", system_rx_dispatch_breadcrumb_payload(rx_dispatch.live));
+  rx_breadcrumb.add("retained_valid", rx_dispatch.retained_valid);
+  if (rx_dispatch.retained_valid)
+    rx_breadcrumb.add_object("retained", system_rx_dispatch_breadcrumb_payload(rx_dispatch.retained));
+  out.add_object("rx_dispatch_breadcrumb", rx_breadcrumb);
 
   const crash_forensics_core_record_t* core =
       crash_forensics_core_record();
@@ -2918,6 +2969,8 @@ static FLASHMEM Payload cmd_transport_info(const Payload& /*args*/) {
 
   p.add("rx_overlap",                 info.rx_overlap);
   p.add("rx_expected_traffic_missing", info.rx_expected_traffic_missing);
+  p.add("rx_dispatch_invalid_callback", info.rx_dispatch_invalid_callback);
+  p.add("rx_dispatch_stack_mismatch", info.rx_dispatch_stack_mismatch);
 
   // ==========================================================
   // RX — Guarded RAM2 placement experiment

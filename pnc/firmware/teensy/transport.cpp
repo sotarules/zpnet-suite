@@ -35,6 +35,7 @@
 #include "debug.h"
 #include "process_performance.h"
 #include "timepop.h"
+#include "crash_forensics.h"
 
 #include <Arduino.h>
 #include <string.h>
@@ -363,6 +364,74 @@ static bool    rx_dispatch_pending = false;
 static uint8_t rx_dispatch_traffic = 0;
 static Payload rx_dispatch_payload;
 static volatile uint32_t rx_dispatch_alap_arm_fail = 0;
+static volatile uint32_t rx_dispatch_invalid_callback = 0;
+static volatile uint32_t rx_dispatch_stack_mismatch = 0;
+
+static constexpr uint32_t RX_DISPATCH_BREADCRUMB_MAGIC = 0x5A505258UL;
+alignas(32) static transport_rx_dispatch_breadcrumb_t
+    g_rx_dispatch_breadcrumb_live[2] DMAMEM;
+alignas(32) static transport_rx_dispatch_breadcrumb_t
+    g_rx_dispatch_breadcrumb_retained DMAMEM;
+static bool g_rx_dispatch_breadcrumb_boot_latched = false;
+static uint32_t g_rx_dispatch_min_msp = 0xFFFFFFFFUL;
+
+static inline uint32_t transport_read_msp() {
+  uint32_t v; __asm__ volatile("mrs %0, msp" : "=r"(v) :: "memory"); return v;
+}
+static inline uint32_t transport_read_ipsr() {
+  uint32_t v; __asm__ volatile("mrs %0, ipsr" : "=r"(v) :: "memory"); return v & 0x1FFU;
+}
+static inline uint32_t transport_read_lr() {
+  uint32_t v; __asm__ volatile("mov %0, lr" : "=r"(v) :: "memory"); return v;
+}
+static bool transport_code_address(uintptr_t bits) {
+  if (bits == 0U || (bits & 1U) == 0U) return false;
+  const uintptr_t a = bits & ~uintptr_t(1U);
+  return (a >= 0x00000400UL && a < 0x00100000UL) ||
+         (a >= 0x60001000UL && a < 0x61000000UL);
+}
+static bool rx_dispatch_breadcrumb_valid(const transport_rx_dispatch_breadcrumb_t& b) {
+  return b.sequence != 0U && (b.sequence ^ b.sequence_inv) == 0xFFFFFFFFUL &&
+         b.schema_version == TRANSPORT_RX_DISPATCH_SCHEMA_VERSION &&
+         b.reserved0 == RX_DISPATCH_BREADCRUMB_MAGIC &&
+         b.reserved1 == ~RX_DISPATCH_BREADCRUMB_MAGIC;
+}
+static void rx_dispatch_breadcrumb_note(uint32_t stage, uint8_t traffic,
+                                        transport_receive_cb_t callback,
+                                        uint32_t before, uint32_t after) {
+  uint32_t sequence = g_rx_dispatch_breadcrumb_live[0].sequence;
+  if ((int32_t)(g_rx_dispatch_breadcrumb_live[1].sequence - sequence) > 0)
+    sequence = g_rx_dispatch_breadcrumb_live[1].sequence;
+  if (++sequence == 0U) sequence = 1U;
+  transport_rx_dispatch_breadcrumb_t& b = g_rx_dispatch_breadcrumb_live[sequence & 1U];
+  b.sequence = 0U; b.sequence_inv = 0U;
+  b.schema_version = TRANSPORT_RX_DISPATCH_SCHEMA_VERSION; b.stage = stage;
+  b.dwt = ARM_DWT_CYCCNT; b.msp_before = before; b.msp_after = after;
+  b.min_msp = g_rx_dispatch_min_msp; b.callback = (uint32_t)(uintptr_t)callback;
+  b.traffic = traffic; b.payload = (uint32_t)(uintptr_t)&rx_dispatch_payload;
+  b.payload_count = (uint32_t)rx_dispatch_payload.count();
+  b.ipsr = transport_read_ipsr(); b.lr = transport_read_lr();
+  b.reserved0 = RX_DISPATCH_BREADCRUMB_MAGIC; b.reserved1 = ~RX_DISPATCH_BREADCRUMB_MAGIC;
+  b.sequence_inv = ~sequence; __asm__ volatile("dmb" ::: "memory");
+  b.sequence = sequence; __asm__ volatile("dmb" ::: "memory");
+  arm_dcache_flush(&b, sizeof(b));
+}
+static void rx_dispatch_breadcrumb_boot_latch() {
+  if (g_rx_dispatch_breadcrumb_boot_latched) return;
+  g_rx_dispatch_breadcrumb_boot_latched = true;
+  const bool v0 = rx_dispatch_breadcrumb_valid(g_rx_dispatch_breadcrumb_live[0]);
+  const bool v1 = rx_dispatch_breadcrumb_valid(g_rx_dispatch_breadcrumb_live[1]);
+  const transport_rx_dispatch_breadcrumb_t* newest = nullptr;
+  if (v0 && v1) newest = (int32_t)(g_rx_dispatch_breadcrumb_live[1].sequence -
+                                   g_rx_dispatch_breadcrumb_live[0].sequence) > 0
+      ? &g_rx_dispatch_breadcrumb_live[1] : &g_rx_dispatch_breadcrumb_live[0];
+  else if (v0) newest = &g_rx_dispatch_breadcrumb_live[0];
+  else if (v1) newest = &g_rx_dispatch_breadcrumb_live[1];
+  if (newest) { g_rx_dispatch_breadcrumb_retained = *newest;
+    arm_dcache_flush(&g_rx_dispatch_breadcrumb_retained, sizeof(g_rx_dispatch_breadcrumb_retained)); }
+  memset(g_rx_dispatch_breadcrumb_live, 0, sizeof(g_rx_dispatch_breadcrumb_live));
+  arm_dcache_flush(g_rx_dispatch_breadcrumb_live, sizeof(g_rx_dispatch_breadcrumb_live));
+}
 
 enum class rx_guard_stage_t : uint32_t {
   NONE          = 0U,
@@ -792,18 +861,38 @@ static void rx_dispatch_alap(
   void*
 ) {
   const uint8_t traffic = rx_dispatch_traffic;
+  const transport_receive_cb_t callback = recv_cb[traffic];
+  const uint32_t msp_before = transport_read_msp();
+  g_rx_dispatch_min_msp = msp_before;
   rx_dispatch_pending = false;
+  rx_dispatch_breadcrumb_note(TRANSPORT_RX_DISPATCH_ENTER,
+                              traffic, callback, msp_before, 0U);
 
-  if (recv_cb[traffic]) {
+  if (callback && transport_code_address((uintptr_t)callback)) {
     rx_frames_dispatched++;
-    recv_cb[traffic](rx_dispatch_payload);
+    callback(rx_dispatch_payload);
+  } else if (callback) {
+    rx_dispatch_invalid_callback++;
+    rx_dispatch_breadcrumb_note(TRANSPORT_RX_DISPATCH_INVALID_CALLBACK,
+                                traffic, callback, msp_before,
+                                transport_read_msp());
   }
 
+  const uint32_t msp_after = transport_read_msp();
+  if (msp_after < g_rx_dispatch_min_msp) g_rx_dispatch_min_msp = msp_after;
+  if (msp_after != msp_before) {
+    rx_dispatch_stack_mismatch++;
+    rx_dispatch_breadcrumb_note(TRANSPORT_RX_DISPATCH_STACK_MISMATCH,
+                                traffic, callback, msp_before, msp_after);
+    __asm__ volatile("udf #0");
+  }
+  rx_dispatch_breadcrumb_note(TRANSPORT_RX_DISPATCH_CALLBACK_RETURN,
+                              traffic, callback, msp_before, msp_after);
   rx_dispatch_payload.clear();
-
-  if (!rx_guard_check(rx_guard_stage_t::AFTER_DISPATCH)) {
-    rx_reset_hard();
-  }
+  if (!rx_guard_check(rx_guard_stage_t::AFTER_DISPATCH)) rx_reset_hard();
+  rx_dispatch_breadcrumb_note(TRANSPORT_RX_DISPATCH_COMPLETE,
+                              traffic, callback, msp_before,
+                              transport_read_msp());
 }
 
 static bool dispatch_if_complete() {
@@ -997,6 +1086,33 @@ void transport_note_runtime_loop(void) {
   transport_runtime_loop_count++;
 }
 
+const char* transport_rx_dispatch_stage_name(uint32_t stage) {
+  switch (stage) {
+    case TRANSPORT_RX_DISPATCH_ENTER: return "ENTER";
+    case TRANSPORT_RX_DISPATCH_CALLBACK_RETURN: return "CALLBACK_RETURN";
+    case TRANSPORT_RX_DISPATCH_COMPLETE: return "COMPLETE";
+    case TRANSPORT_RX_DISPATCH_INVALID_CALLBACK: return "INVALID_CALLBACK";
+    case TRANSPORT_RX_DISPATCH_STACK_MISMATCH: return "STACK_MISMATCH";
+    default: return "NONE";
+  }
+}
+void transport_rx_dispatch_snapshot(transport_rx_dispatch_snapshot_t* out) {
+  if (!out) return; rx_dispatch_breadcrumb_boot_latch();
+  *out = transport_rx_dispatch_snapshot_t{};
+  const bool v0 = rx_dispatch_breadcrumb_valid(g_rx_dispatch_breadcrumb_live[0]);
+  const bool v1 = rx_dispatch_breadcrumb_valid(g_rx_dispatch_breadcrumb_live[1]);
+  if (v0 || v1) {
+    const transport_rx_dispatch_breadcrumb_t* n = v0 && v1
+      ? ((int32_t)(g_rx_dispatch_breadcrumb_live[1].sequence - g_rx_dispatch_breadcrumb_live[0].sequence) > 0
+         ? &g_rx_dispatch_breadcrumb_live[1] : &g_rx_dispatch_breadcrumb_live[0])
+      : (v0 ? &g_rx_dispatch_breadcrumb_live[0] : &g_rx_dispatch_breadcrumb_live[1]);
+    out->live_valid = true; out->live = *n;
+  }
+  if (rx_dispatch_breadcrumb_valid(g_rx_dispatch_breadcrumb_retained)) {
+    out->retained_valid = true; out->retained = g_rx_dispatch_breadcrumb_retained;
+  }
+}
+
 // =============================================================
 // transport_get_info()
 // =============================================================
@@ -1091,6 +1207,8 @@ FLASHMEM void transport_get_info(transport_info_t* out) {
   out->rx_len_overflow              = rx_len_overflow_count;
   out->rx_overlap                   = rx_overlap_count;
   out->rx_expected_traffic_missing  = rx_expected_traffic_missing;
+  out->rx_dispatch_invalid_callback = rx_dispatch_invalid_callback;
+  out->rx_dispatch_stack_mismatch = rx_dispatch_stack_mismatch;
 
   out->rx_buffer_in_dmamem = 1U;
   out->rx_buffer_address = (uint32_t)(uintptr_t)rx_buffer();
@@ -1134,6 +1252,7 @@ FLASHMEM void transport_get_info(transport_info_t* out) {
 
 void transport_init(void) {
 
+  rx_dispatch_breadcrumb_boot_latch();
   rx_storage_initialize();
 
   ZPNET_SERIAL.begin(USB_SERIAL_BAUD);

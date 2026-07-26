@@ -117,6 +117,41 @@ void transport_note_runtime_loop(void);
 
 
 // =============================================================
+// Retained RX semantic-dispatch breadcrumb
+// =============================================================
+
+static constexpr uint32_t TRANSPORT_RX_DISPATCH_SCHEMA_VERSION = 1U;
+
+enum transport_rx_dispatch_stage_t : uint32_t {
+  TRANSPORT_RX_DISPATCH_NONE = 0U,
+  TRANSPORT_RX_DISPATCH_ENTER = 1U,
+  TRANSPORT_RX_DISPATCH_CALLBACK_RETURN = 2U,
+  TRANSPORT_RX_DISPATCH_COMPLETE = 3U,
+  TRANSPORT_RX_DISPATCH_INVALID_CALLBACK = 4U,
+  TRANSPORT_RX_DISPATCH_STACK_MISMATCH = 5U,
+};
+
+struct transport_rx_dispatch_breadcrumb_t {
+  uint32_t sequence, sequence_inv, schema_version, stage;
+  uint32_t dwt, msp_before, msp_after, min_msp;
+  uint32_t callback, traffic, payload, payload_count;
+  uint32_t ipsr, lr, reserved0, reserved1;
+};
+
+static_assert(sizeof(transport_rx_dispatch_breadcrumb_t) == 64U,
+              "RX dispatch breadcrumb must stay two cache lines");
+
+struct transport_rx_dispatch_snapshot_t {
+  bool live_valid;
+  bool retained_valid;
+  transport_rx_dispatch_breadcrumb_t live;
+  transport_rx_dispatch_breadcrumb_t retained;
+};
+
+void transport_rx_dispatch_snapshot(transport_rx_dispatch_snapshot_t* out);
+const char* transport_rx_dispatch_stage_name(uint32_t stage);
+
+// =============================================================
 // Transport diagnostics snapshot
 // =============================================================
 //
@@ -254,6 +289,8 @@ typedef struct {
 
   uint32_t rx_overlap;                  // New traffic while RX active / resync
   uint32_t rx_expected_traffic_missing; // Expected traffic byte absent
+  uint32_t rx_dispatch_invalid_callback;
+  uint32_t rx_dispatch_stack_mismatch;
 
   // ===========================================================
   // RX — Guarded RAM2 placement experiment

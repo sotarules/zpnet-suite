@@ -319,6 +319,28 @@ const char* crash_forensics_capture_stage_name(uint32_t stage);
 const char* crash_forensics_capture_skip_reason_name(uint32_t reason);
 
 // ============================================================================
+// Earliest raw fault-entry witness
+// ============================================================================
+
+static constexpr uint32_t CRASH_RAW_ENTRY_SCHEMA_VERSION = 1U;
+static constexpr size_t CRASH_RAW_ENTRY_WORDS = 26U;
+
+struct crash_raw_entry_record_t {
+    uint32_t magic, magic_inv, schema_version, record_size;
+    uint32_t sequence, sequence_inv;
+    uint32_t exception_number, exc_return, frame_sp;
+    uint32_t original_msp, original_psp, dwt_cyccnt;
+    uint32_t cfsr, hfsr, icsr, word_count;
+    uint32_t words[CRASH_RAW_ENTRY_WORDS];
+    uint32_t reserved[6];
+};
+
+static_assert((sizeof(crash_raw_entry_record_t) % 32U) == 0U,
+              "Raw entry record must occupy complete Cortex-M7 cache lines");
+
+const crash_raw_entry_record_t* crash_forensics_raw_entry_record(void);
+
+// ============================================================================
 // Retained deferred-dispatch breadcrumb
 // ============================================================================
 

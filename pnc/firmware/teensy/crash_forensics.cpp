@@ -29,6 +29,7 @@ alignas(8) uint32_t g_crash_forensics_emergency_stack[512];
 alignas(32) static crash_forensics_core_record_t
     g_crash_forensics_core_record DMAMEM;
 alignas(32) static crash_forensics_record_t g_crash_forensics_record DMAMEM;
+alignas(32) static crash_raw_entry_record_t g_crash_raw_entry_record DMAMEM;
 alignas(32) static crash_dispatch_breadcrumb_t
     g_crash_dispatch_breadcrumb_live[2] DMAMEM;
 alignas(32) static crash_dispatch_breadcrumb_t
@@ -39,6 +40,7 @@ static bool g_crash_dispatch_breadcrumb_boot_latched = false;
 static constexpr uint32_t CRASH_FORENSICS_CORE_MAGIC = 0x5A504343UL; // "ZPCC"
 static constexpr uint32_t CRASH_FORENSICS_CORE_COMMITTED = 0x434F5245UL; // "CORE"
 static constexpr uint32_t CRASH_FORENSICS_MAGIC = 0x5A504346UL;     // "ZPCF"
+static constexpr uint32_t CRASH_RAW_ENTRY_MAGIC = 0x5A505245UL;      // "ZPRE"
 static constexpr uint32_t CRASH_FORENSICS_COMMITTED = 0x434F4D54UL; // "COMT"
 static constexpr size_t CRASH_FORENSICS_VECTOR_HARDFAULT = 3U;
 static constexpr size_t CRASH_FORENSICS_VECTOR_MEMMANAGE = 4U;
@@ -975,12 +977,74 @@ static uint32_t coherent_prior_sequence(void) {
 }
 
 // ============================================================================
+// Earliest raw fault-entry witness
+// ============================================================================
+
+static bool crash_raw_entry_valid(const crash_raw_entry_record_t& r) {
+    return r.magic == CRASH_RAW_ENTRY_MAGIC &&
+           r.magic_inv == ~CRASH_RAW_ENTRY_MAGIC &&
+           r.schema_version == CRASH_RAW_ENTRY_SCHEMA_VERSION &&
+           r.record_size == sizeof(crash_raw_entry_record_t) &&
+           r.sequence != 0U &&
+           (r.sequence ^ r.sequence_inv) == 0xFFFFFFFFUL &&
+           r.word_count <= CRASH_RAW_ENTRY_WORDS;
+}
+
+static void capture_raw_entry_witness(
+    const crash_forensics_entry_context_t* entry) {
+    crash_raw_entry_record_t& r = g_crash_raw_entry_record;
+    uint32_t sequence = r.sequence + 1U;
+    if (sequence == 0U) sequence = 1U;
+
+    r.magic = 0U;
+    r.sequence = 0U;
+    r.sequence_inv = 0U;
+    crash_barrier();
+
+    r.schema_version = CRASH_RAW_ENTRY_SCHEMA_VERSION;
+    r.record_size = sizeof(crash_raw_entry_record_t);
+    r.exception_number = read_ipsr() & 0x1FFU;
+    r.exc_return = entry->exc_return;
+    r.frame_sp = entry->frame_sp;
+    r.original_msp = entry->msp;
+    r.original_psp = entry->psp;
+    r.dwt_cyccnt = reg32(REG_DWT_CYCCNT);
+    r.cfsr = reg32(REG_CFSR);
+    r.hfsr = reg32(REG_HFSR);
+    r.icsr = reg32(REG_ICSR);
+    r.word_count = 0U;
+
+    uintptr_t begin = 0U, end = 0U;
+    if ((entry->frame_sp & 3U) == 0U &&
+        stack_region_for(entry->frame_sp, &begin, &end)) {
+        const size_t available = (end - entry->frame_sp) / sizeof(uint32_t);
+        const size_t count = available < CRASH_RAW_ENTRY_WORDS
+            ? available : CRASH_RAW_ENTRY_WORDS;
+        volatile const uint32_t* source =
+            reinterpret_cast<volatile const uint32_t*>(entry->frame_sp);
+        for (size_t i = 0U; i < count; ++i) r.words[i] = source[i];
+        r.word_count = static_cast<uint32_t>(count);
+    }
+
+    r.sequence_inv = ~sequence;
+    r.sequence = sequence;
+    r.magic_inv = ~CRASH_RAW_ENTRY_MAGIC;
+    r.magic = CRASH_RAW_ENTRY_MAGIC;
+    crash_barrier();
+    arm_dcache_flush_delete(&r, sizeof(r));
+    crash_barrier();
+}
+
+// ============================================================================
 // Fault-time recorder
 // ============================================================================
 
 extern "C" void crash_forensics_capture_from_entry(
     const crash_forensics_entry_context_t* entry) {
     if (!entry) return;
+
+    // First durable act: preserve the untouched architectural stack image.
+    capture_raw_entry_witness(entry);
 
     crash_forensics_record_t& record = g_crash_forensics_record;
     uint32_t sequence = coherent_prior_sequence() + 1U;
@@ -2041,6 +2105,12 @@ FLASHMEM void crash_forensics_get_status(crash_forensics_status_t* out) {
     out->present = out->core_present || out->extended_present;
 }
 
+FLASHMEM const crash_raw_entry_record_t*
+crash_forensics_raw_entry_record(void) {
+    return crash_raw_entry_valid(g_crash_raw_entry_record)
+        ? &g_crash_raw_entry_record : nullptr;
+}
+
 FLASHMEM const crash_forensics_core_record_t*
 crash_forensics_core_record(void) {
     crash_forensics_status_t status{};
@@ -2061,6 +2131,7 @@ FLASHMEM void crash_forensics_clear(void) {
     disable_interrupts();
     zero_core_record(g_crash_forensics_core_record);
     zero_record(g_crash_forensics_record);
+    memset((void*)&g_crash_raw_entry_record, 0, sizeof(g_crash_raw_entry_record));
     crash_dispatch_breadcrumb_zero(
         g_crash_dispatch_breadcrumb_retained);
     crash_barrier();
@@ -2068,6 +2139,8 @@ FLASHMEM void crash_forensics_clear(void) {
                             sizeof(g_crash_forensics_core_record));
     arm_dcache_flush_delete(&g_crash_forensics_record,
                             sizeof(g_crash_forensics_record));
+    arm_dcache_flush_delete(&g_crash_raw_entry_record,
+                            sizeof(g_crash_raw_entry_record));
     crash_dispatch_breadcrumb_flush(
         g_crash_dispatch_breadcrumb_retained);
     crash_barrier();
