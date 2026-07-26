@@ -1487,6 +1487,7 @@ const char* payload_contract_reason_name(uint32_t reason) {
         case payload_contract_reason_t::EXPECTED_PRESERVATION: return "EXPECTED_PRESERVATION";
         case payload_contract_reason_t::EXPECTED_ARRAY_DELTA: return "EXPECTED_ARRAY_DELTA";
         case payload_contract_reason_t::INTERNAL_FAILURE: return "INTERNAL_FAILURE";
+        case payload_contract_reason_t::OBJECT_POINTER: return "OBJECT_POINTER";
         default: return "NONE";
     }
 }
@@ -2773,6 +2774,9 @@ struct payload_contract_state_t {
 
 static bool payload_contract_span_readable_pure(const void* ptr,
                                                   size_t len);
+static bool payload_contract_object_pointer_safe(const void* object,
+                                                 size_t object_size,
+                                                 size_t object_alignment);
 
 struct payload_contract_prefix_writer_t {
     char* out;
@@ -3044,7 +3048,8 @@ static void payload_contract_capture_prefix(
     bool captured = false;
     switch (payload_contract_prefix_kind_for_operation(operation_id)) {
         case payload_contract_prefix_kind_t::PAYLOAD:
-            if (payload_contract_span_readable_pure(self, sizeof(Payload))) {
+            if (payload_contract_object_pointer_safe(
+                    self, sizeof(Payload), alignof(Payload))) {
                 captured = payload_contract_prefix_access_t::capture(
                     *reinterpret_cast<const Payload*>(self),
                     event->payload_prefix,
@@ -3055,8 +3060,8 @@ static void payload_contract_capture_prefix(
             break;
 
         case payload_contract_prefix_kind_t::ARRAY:
-            if (payload_contract_span_readable_pure(
-                    self, sizeof(PayloadArray))) {
+            if (payload_contract_object_pointer_safe(
+                    self, sizeof(PayloadArray), alignof(PayloadArray))) {
                 captured = payload_contract_prefix_access_t::capture(
                     *reinterpret_cast<const PayloadArray*>(self),
                     event->payload_prefix,
@@ -3120,6 +3125,15 @@ static bool payload_contract_span_readable_pure(const void* ptr, size_t len) {
     uint32_t ignored_reason = 0U;
     return payload_pointer_remaining(ptr, &remaining, &ignored_reason) &&
            len <= remaining;
+}
+
+static bool payload_contract_object_pointer_safe(const void* object,
+                                                 size_t object_size,
+                                                 size_t object_alignment) {
+    if (!object || object_alignment == 0U) return false;
+    const uintptr_t address = (uintptr_t)object;
+    if ((address % object_alignment) != 0U) return false;
+    return payload_contract_span_readable_pure(object, object_size);
 }
 
 static bool payload_contract_heap_capacity_pure(const void* raw,
@@ -3309,6 +3323,15 @@ uint32_t Payload::_json_hash_unchecked() const {
 bool Payload::_contract_inspect(payload_contract_state_t* out) const {
     if (!out) return false;
     *out = payload_contract_state_t{};
+
+    // `this` is evidence, not yet a trusted C++ object.  A contract failure may
+    // arrive with an arbitrary address; reject it using scalar pointer custody
+    // before any member load can compile into an alignment-sensitive LDRD.
+    if (!payload_contract_object_pointer_safe(
+            this, sizeof(Payload), alignof(Payload))) {
+        out->reason = payload_contract_reason_t::OBJECT_POINTER;
+        return false;
+    }
 
     if (!_heap_guard_ok()) {
         out->reason = payload_contract_reason_t::HEAP_GUARD;
@@ -3801,6 +3824,12 @@ uint32_t PayloadArray::_json_hash_unchecked() const {
 bool PayloadArray::_contract_inspect(payload_contract_state_t* out) const {
     if (!out) return false;
     *out = payload_contract_state_t{};
+
+    if (!payload_contract_object_pointer_safe(
+            this, sizeof(PayloadArray), alignof(PayloadArray))) {
+        out->reason = payload_contract_reason_t::OBJECT_POINTER;
+        return false;
+    }
 
     if (!_heap_guard_ok()) {
         out->reason = payload_contract_reason_t::HEAP_GUARD;

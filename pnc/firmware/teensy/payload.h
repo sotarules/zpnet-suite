@@ -121,6 +121,7 @@ enum class payload_contract_reason_t : uint32_t {
   EXPECTED_PRESERVATION        = 34,
   EXPECTED_ARRAY_DELTA         = 35,
   INTERNAL_FAILURE             = 36,
+  OBJECT_POINTER               = 37,
 };
 
 struct payload_contract_incident_t {

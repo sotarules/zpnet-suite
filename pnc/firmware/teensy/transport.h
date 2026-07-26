@@ -217,6 +217,10 @@ typedef struct {
   uint32_t tx_empty_serialization_count;
   uint32_t tx_semantic_empty_count;
 
+  uint32_t tx_trace_valid, tx_trace_sequence, tx_trace_stage, tx_trace_dwt;
+  uint32_t tx_trace_payload_ptr, tx_trace_topic_ptr, tx_trace_json_ptr, tx_trace_wire_ptr;
+  uint32_t tx_trace_json_bytes, tx_trace_wire_bytes;
+
   uint32_t tx_last_sequence;
   uint32_t tx_last_traffic;
   uint32_t tx_last_json_bytes;

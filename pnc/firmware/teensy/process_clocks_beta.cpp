@@ -10274,6 +10274,12 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
   g_timebase_last_publish_return_campaign_seconds = campaign_seconds;
   timebase_build_stage(TIMEBASE_BUILD_STAGE_PUBLISH_RETURN);
 
+  // Observational side rail.  TIMEBASE remains the authoritative campaign row;
+  // MONITOR_FRAGMENT is a replaceable latest-value display snapshot.  Failure
+  // in the monitor path is deliberately unable to alter campaign, servo, or
+  // watchdog state.
+  system_monitor_publish_from_timebase(p);
+
   p.clear();
   f.clear();
 

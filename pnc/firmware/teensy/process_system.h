@@ -1,6 +1,7 @@
 #pragma once
 
 #include "process.h"
+#include "payload.h"
 #include <Arduino.h>
 
 /**
@@ -71,6 +72,18 @@
 
 // Register SYSTEM command surface
 void process_system_register(void);
+
+// ============================================================================
+// MONITOR fragment publication
+// ============================================================================
+//
+// CLOCKS calls this once after a coherent TIMEBASE_FRAGMENT has returned from
+// publish().  SYSTEM emits a compact, nonpersistent MONITOR_FRAGMENT assembled
+// only from the already-built campaign payload plus cached SYSTEM-owned scalars.
+// The monitor path is observational: failure never changes TIMEBASE, campaign,
+// servo, or watchdog authority.
+
+void system_monitor_publish_from_timebase(const Payload& timebase_fragment);
 
 // ============================================================================
 // Foreground crash breadcrumbs
