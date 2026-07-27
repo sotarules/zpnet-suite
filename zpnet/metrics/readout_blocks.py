@@ -114,6 +114,23 @@ def _get_pi_clocks_report_dac() -> dict:
     return {}
 
 
+def _get_clocks_baseline() -> dict | None:
+    """Return the configured CLOCKS baseline, or None when unavailable."""
+    try:
+        response = send_command(
+            machine="PI",
+            subsystem="CLOCKS",
+            command="BASELINE_INFO",
+        )
+        payload = response.get("payload", {})
+        if response.get("success") and isinstance(payload, dict) and payload.get("baseline_set"):
+            return payload
+    except Exception:
+        pass
+
+    return None
+
+
 # ---------------------------------------------------------------------
 # GNSS normalization
 # ---------------------------------------------------------------------

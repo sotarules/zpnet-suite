@@ -8,11 +8,13 @@ Key invariants:
   • No imperative hardware queries in core
   • WebSocket failures must never affect UI
   • Dashboard is an observer, not an instrument
+  • Dashboard must never initialize host audio
   • SYSTEM snapshot owns platform health; accepted TIMEBASE owns clock science
 
 Author: The Mule + GPT
 """
 
+import os
 import json
 import signal
 import sys
@@ -21,6 +23,10 @@ import threading
 import asyncio
 from collections.abc import Generator
 from typing import Callable
+
+# This dashboard is visual-only.  Keep SDL away from PipeWire/RTKit even if a
+# future refactor accidentally calls pygame.init() again.
+os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
 import pygame
 import websockets
@@ -249,7 +255,10 @@ def ws_broadcast(payload: dict) -> None:
 # Main Loop
 # ---------------------------------------------------------------------
 def main() -> None:
-    pygame.init()
+    # Initialize only the subsystems the dashboard actually uses.  pygame.init()
+    # also starts SDL audio, creating an unnecessary real-time SDLAudio thread.
+    pygame.display.init()
+    pygame.font.init()
     screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
     pygame.display.set_caption("ZPNET TERMINAL DASHBOARD")
     font = pygame.font.SysFont(FONT_NAME, FONT_SIZE, bold=False)

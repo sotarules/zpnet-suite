@@ -2581,6 +2581,34 @@ static timepop_foreground_diag_t g_timepop_foreground_diag{};
 static volatile bool g_timepop_foreground_rearm_requested = false;
 static bool g_interrupt_foreground_service_running = false;
 
+// Always-on MONITOR custody. The authoritative one-second PPS/VCLOCK edge is
+// observed in Priority 32, but SYSTEM publication remains foreground-only.
+// This latest-value mailbox deliberately coalesces if foreground is ever held
+// across more than one second; MONITOR is operational state, not science rows.
+static volatile uint32_t g_interrupt_monitor_pending_sequence = 0U;
+static volatile bool g_interrupt_monitor_pending = false;
+
+static void interrupt_monitor_note_pps_vclock(uint32_t sequence) {
+  g_interrupt_monitor_pending_sequence = sequence;
+  dmb_barrier();
+  g_interrupt_monitor_pending = true;
+  g_process_interrupt_foreground_pending = true;
+}
+
+static bool interrupt_monitor_take_pps_vclock(uint32_t* sequence) {
+  if (!sequence) return false;
+  const uint32_t prior = interrupt_priority0_guard_enter();
+  if (!g_interrupt_monitor_pending) {
+    interrupt_priority0_guard_exit(prior);
+    return false;
+  }
+  dmb_barrier();
+  *sequence = g_interrupt_monitor_pending_sequence;
+  g_interrupt_monitor_pending = false;
+  interrupt_priority0_guard_exit(prior);
+  return true;
+}
+
 // ============================================================================
 // Foreground forensic black box
 // ============================================================================
@@ -4140,6 +4168,10 @@ static void publish_observed_pps_vclock(uint32_t sequence,
   store_publish(pps, pvc);
   g_pps_gpio_heartbeat.last_dwt = dwt_at_edge;
   g_pps_gpio_heartbeat.last_gnss_ns = -1;
+
+  // This one-second identity exists independently of CLOCKS campaign state.
+  // Hand only the scalar sequence to foreground; SYSTEM builds MONITOR later.
+  interrupt_monitor_note_pps_vclock(sequence);
 }
 
 static void pps_relay_tick_from_vclock(void) {
@@ -5720,6 +5752,15 @@ void process_interrupt_foreground_service(void) {
       ARM_DWT_CYCCNT - phase_start;
 
   phase_start = ARM_DWT_CYCCNT;
+  // Establish the always-on owner before application subscribers run.  An
+  // active CLOCKS campaign may still issue its transitional tick later in this
+  // pass, but SYSTEM ignores that legacy call once this canonical edge arrives.
+  // Publication itself remains deferred to foreground ALAP service, so a
+  // matching TIMEBASE row may still be emitted first.
+  uint32_t monitor_sequence = 0U;
+  if (interrupt_monitor_take_pps_vclock(&monitor_sequence)) {
+    system_monitor_pps_tick_from_interrupt(monitor_sequence);
+  }
   interrupt_dispatch_foreground_service();
   g_interrupt_foreground_forensic_live.subscriber_cycles =
       ARM_DWT_CYCCNT - phase_start;
@@ -5884,6 +5925,7 @@ static void interrupt_features_foreground_flush(void) {
 static bool interrupt_foreground_work_pending_locked(void) {
   if (g_timepop_foreground_mailbox_pending ||
       g_timepop_foreground_rearm_requested ||
+      g_interrupt_monitor_pending ||
       g_interrupt_feature_pending.dirty) {
     return true;
   }
@@ -6116,6 +6158,8 @@ void process_interrupt_init(void) {
   g_timepop_foreground_rearm_requested = false;
   g_process_interrupt_foreground_pending = false;
   g_interrupt_foreground_service_running = false;
+  g_interrupt_monitor_pending_sequence = 0U;
+  g_interrupt_monitor_pending = false;
   g_interrupt_foreground_forensics =
       interrupt_foreground_forensic_runtime_t{};
   g_interrupt_foreground_forensic_live =

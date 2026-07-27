@@ -152,14 +152,19 @@ static uint32_t g_system_feature_handler_last_ipsr = 0;
 // --------------------------------------------------------------
 // PPS-aligned MONITOR_FRAGMENT publication custody
 // --------------------------------------------------------------
-// CLOCKS contributes only the completed-second sequence. SYSTEM gathers the
-// current non-TIMEBASE operational state later in foreground ALAP service.
+// process_interrupt contributes only the completed PPS/VCLOCK sequence.
+// SYSTEM gathers the current non-TIMEBASE operational state later in foreground
+// ALAP service. The former CLOCKS campaign-side tick remains as a compatibility
+// entry point but is ignored after the always-on interrupt owner is observed.
 static volatile uint32_t g_system_monitor_pending_sequence = 0U;
 static volatile bool g_system_monitor_pending = false;
 static volatile bool g_system_monitor_service_armed = false;
 static uint32_t g_system_monitor_publish_count = 0U;
 static uint32_t g_system_monitor_coalesce_count = 0U;
 static uint32_t g_system_monitor_service_arm_failures = 0U;
+static bool g_system_monitor_interrupt_owner_seen = false;
+static bool g_system_monitor_last_tick_valid = false;
+static uint32_t g_system_monitor_last_tick_sequence = 0U;
 
 static bool g_system_monitor_cpu_window_initialized = false;
 static uint64_t g_system_monitor_cpu_last_wall_cycles = 0U;
@@ -3576,12 +3581,30 @@ static void system_monitor_schedule_publish(void) {
   g_system_monitor_service_armed = true;
 }
 
-void system_monitor_pps_tick(uint32_t completed_second_sequence) {
-  if (system_feature_current_ipsr() != 0U) return;
+static void system_monitor_accept_tick(uint32_t completed_second_sequence) {
+  if (g_system_monitor_last_tick_valid &&
+      completed_second_sequence == g_system_monitor_last_tick_sequence) {
+    return;
+  }
+  g_system_monitor_last_tick_sequence = completed_second_sequence;
+  g_system_monitor_last_tick_valid = true;
   if (g_system_monitor_pending) g_system_monitor_coalesce_count++;
   g_system_monitor_pending_sequence = completed_second_sequence;
   g_system_monitor_pending = true;
   system_monitor_schedule_publish();
+}
+
+void system_monitor_pps_tick_from_interrupt(
+    uint32_t completed_second_sequence) {
+  if (system_feature_current_ipsr() != 0U) return;
+  g_system_monitor_interrupt_owner_seen = true;
+  system_monitor_accept_tick(completed_second_sequence);
+}
+
+void system_monitor_pps_tick(uint32_t completed_second_sequence) {
+  if (system_feature_current_ipsr() != 0U) return;
+  if (g_system_monitor_interrupt_owner_seen) return;
+  system_monitor_accept_tick(completed_second_sequence);
 }
 
 

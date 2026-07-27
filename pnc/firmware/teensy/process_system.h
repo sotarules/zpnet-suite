@@ -141,7 +141,14 @@ bool system_feature_is_nominal(const char* subsystem,
 // ============================================================================
 // PPS-aligned MONITOR_FRAGMENT side rail
 // ============================================================================
-// CLOCKS calls this after publishing the completed TIMEBASE row. The function
-// records only the completed-second sequence and arms foreground publication;
-// it never inspects or copies TIMEBASE.
+// Canonical always-on tick. process_interrupt calls this for every completed
+// PPS/VCLOCK second whether or not a CLOCKS campaign is active. It records only
+// the scalar sequence and arms foreground publication; it never inspects
+// TIMEBASE.
+void system_monitor_pps_tick_from_interrupt(
+    uint32_t completed_second_sequence);
+
+// Transitional CLOCKS-side entry point. It remains source-compatible with the
+// campaign-coupled caller but is ignored after the canonical interrupt owner
+// has supplied its first tick.
 void system_monitor_pps_tick(uint32_t completed_second_sequence);
