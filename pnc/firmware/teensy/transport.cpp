@@ -102,27 +102,6 @@ static inline bool is_valid_traffic(uint8_t b) {
     b == TRAFFIC_PUBLISH_SUBSCRIBE;
 }
 
-enum transport_tx_trace_stage_t : uint32_t {
-  TX_TRACE_NONE = 0U, TX_TRACE_ENTER = 1U, TX_TRACE_TOPIC_READ = 2U,
-  TX_TRACE_SERIALIZE_ENTER = 3U, TX_TRACE_SERIALIZED = 4U, TX_TRACE_ALLOCATED = 5U,
-  TX_TRACE_WIRE_COPIED = 6U, TX_TRACE_JOB_COMMITTED = 7U, TX_TRACE_COMPLETE = 8U,
-};
-struct transport_tx_trace_t {
-  uint32_t valid, sequence, stage, dwt, payload_ptr, topic_ptr, json_ptr, wire_ptr;
-  uint32_t json_bytes, wire_bytes;
-};
-static transport_tx_trace_t g_tx_trace DMAMEM;
-static void tx_trace_note(uint32_t stage, const Payload* payload, const char* topic,
-                          const char* json, const void* wire, size_t json_bytes, size_t wire_bytes) {
-  uint32_t sequence = g_tx_trace.sequence + 1U; if (sequence == 0U) sequence = 1U;
-  g_tx_trace.valid = 0U; g_tx_trace.sequence = sequence; g_tx_trace.stage = stage;
-  g_tx_trace.dwt = ARM_DWT_CYCCNT; g_tx_trace.payload_ptr = (uint32_t)(uintptr_t)payload;
-  g_tx_trace.topic_ptr = (uint32_t)(uintptr_t)topic; g_tx_trace.json_ptr = (uint32_t)(uintptr_t)json;
-  g_tx_trace.wire_ptr = (uint32_t)(uintptr_t)wire; g_tx_trace.json_bytes = (uint32_t)json_bytes;
-  g_tx_trace.wire_bytes = (uint32_t)wire_bytes; __asm__ volatile("dmb" ::: "memory");
-  g_tx_trace.valid = 1U; arm_dcache_flush(&g_tx_trace, sizeof(g_tx_trace));
-}
-
 // =============================================================
 // TX Job Queue
 // =============================================================
@@ -671,19 +650,15 @@ static void tx_pump_once() {
 
 void transport_send(uint8_t traffic, const Payload& payload) {
 
-  tx_trace_note(TX_TRACE_ENTER, &payload, nullptr, nullptr, nullptr, 0U, 0U);
   const uint32_t sequence = ++tx_send_attempt_count;
   const char* topic = payload.getString("topic");
-  tx_trace_note(TX_TRACE_TOPIC_READ, &payload, topic, nullptr, nullptr, 0U, 0U);
   const bool timebase = tx_topic_is_timebase(topic);
   if (timebase) {
     tx_timebase_attempt_count++;
     tx_timebase_last_sequence = sequence;
   }
 
-  tx_trace_note(TX_TRACE_SERIALIZE_ENTER, &payload, topic, nullptr, nullptr, 0U, 0U);
   String json = payload.to_json();
-  tx_trace_note(TX_TRACE_SERIALIZED, &payload, topic, json.c_str(), nullptr, json.length(), 0U);
   if (json.length() == 0) {
     tx_empty_serialization_count++;
     tx_note_reject(sequence, traffic, topic, 0U, 0U,
@@ -768,7 +743,6 @@ void transport_send(uint8_t traffic, const Payload& payload) {
   }
 
   uint8_t* data = (uint8_t*)malloc(wire_len);
-  tx_trace_note(TX_TRACE_ALLOCATED, &payload, topic, json.c_str(), data, json_len, wire_len);
 
   if (!data) {
     tx_alloc_fail++;
@@ -787,7 +761,6 @@ void transport_send(uint8_t traffic, const Payload& payload) {
   memcpy(data + pos, json.c_str(), json_len);
   pos += json_len;
   memcpy(data + pos, ETX_SEQ, ETX_LEN);
-  tx_trace_note(TX_TRACE_WIRE_COPIED, &payload, topic, json.c_str(), data, json_len, wire_len);
 
   tx_job_t& job = tx_jobs[tx_job_head];
   job = tx_job_t{};
@@ -814,7 +787,6 @@ void transport_send(uint8_t traffic, const Payload& payload) {
     tx_timebase_last_reason_id = TX_REASON_NONE;
   }
 
-  tx_trace_note(TX_TRACE_JOB_COMMITTED, &payload, topic, json.c_str(), data, json_len, wire_len);
   tx_budget_used += wire_len;
 
   if (tx_budget_used > tx_budget_high_water)
@@ -822,7 +794,6 @@ void transport_send(uint8_t traffic, const Payload& payload) {
 
   if (tx_job_count > tx_job_high_water)
     tx_job_high_water = tx_job_count;
-  tx_trace_note(TX_TRACE_COMPLETE, &payload, topic, json.c_str(), data, json_len, wire_len);
 }
 
 // =============================================================
@@ -1185,11 +1156,6 @@ FLASHMEM void transport_get_info(transport_info_t* out) {
   out->tx_outstanding_budget_fail_count = tx_outstanding_budget_fail_count;
   out->tx_empty_serialization_count = tx_empty_serialization_count;
   out->tx_semantic_empty_count = tx_semantic_empty_count;
-  out->tx_trace_valid = g_tx_trace.valid; out->tx_trace_sequence = g_tx_trace.sequence;
-  out->tx_trace_stage = g_tx_trace.stage; out->tx_trace_dwt = g_tx_trace.dwt;
-  out->tx_trace_payload_ptr = g_tx_trace.payload_ptr; out->tx_trace_topic_ptr = g_tx_trace.topic_ptr;
-  out->tx_trace_json_ptr = g_tx_trace.json_ptr; out->tx_trace_wire_ptr = g_tx_trace.wire_ptr;
-  out->tx_trace_json_bytes = g_tx_trace.json_bytes; out->tx_trace_wire_bytes = g_tx_trace.wire_bytes;
 
   out->tx_last_sequence = tx_last_sequence;
   out->tx_last_traffic = tx_last_traffic;

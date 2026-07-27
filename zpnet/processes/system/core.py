@@ -9,20 +9,17 @@ Responsibilities:
   • Emit SYSTEM_STATUS events on fixed cadence
   • Publish FEATURE_STATUS whenever readiness state changes
   • Republish FEATURE_STATUS periodically even when quiescent
-  • Consume MONITOR_FRAGMENT and publish decorated MONITOR_STATUS
 
 Process model:
   • One systemd service
   • One polling thread
   • One blocking command socket
   • One FEATURE_STATUS_FRAGMENT subscription from Teensy SYSTEM
-  • One MONITOR_FRAGMENT subscription from Teensy SYSTEM
 """
 
 from __future__ import annotations
 
 import datetime
-import json
 import logging
 import os
 import platform
@@ -66,7 +63,6 @@ from zpnet.shared.util import (
 POLL_INTERVAL_SEC = 30
 FEATURE_STATUS_PUBLISH_INTERVAL_SEC = 10
 STARTUP_TEENSY_QUIET_DELAY_S = 10.0
-MONITOR_FRAGMENT_MAX_BYTES = 4096
 
 # ------------------------------------------------------------------
 # Raspberry Pi status configuration
@@ -235,31 +231,6 @@ POWER_SAMPLE_STEP = 5                # same semantics as before
 SYSTEM: Dict[str, object] = {}
 
 _SYSTEM_LOCK = threading.Lock()
-_SYSTEM_UPDATED_MONOTONIC = 0.0
-_SYSTEM_UPDATED_AT_UTC = ""
-
-# ------------------------------------------------------------------
-# MONITOR_STATUS latest-value feed
-# ------------------------------------------------------------------
-#
-# MONITOR_FRAGMENT is Teensy-authored and arrives once per completed public
-# second.  This first migration phase only makes the new feed available; the
-# existing Dashboard and Metrics clients continue using their command paths.
-# The handler performs no report commands.  It decorates the fragment from the
-# most recent cached Pi SYSTEM snapshot and publishes one replaceable status.
-
-_MONITOR_LOCK = threading.Lock()
-_MONITOR_STATUS: Dict[str, object] = {}
-_MONITOR_FRAGMENT_RECEIVED_COUNT = 0
-_MONITOR_FRAGMENT_MALFORMED_COUNT = 0
-_MONITOR_FRAGMENT_OVERSIZE_COUNT = 0
-_MONITOR_SEQUENCE_GAP_COUNT = 0
-_MONITOR_SEQUENCE_REPEAT_COUNT = 0
-_MONITOR_SEQUENCE_REGRESSION_COUNT = 0
-_MONITOR_STATUS_PUBLISH_COUNT = 0
-_MONITOR_LAST_SEQUENCE: Optional[int] = None
-_MONITOR_LAST_RECEIVED_MONOTONIC = 0.0
-_MONITOR_LAST_RECEIVED_AT_UTC = ""
 
 # ------------------------------------------------------------------
 # Feature status clearing house
@@ -1534,7 +1505,7 @@ def build_process_status() -> dict:
 # ------------------------------------------------------------------
 
 def system_poller() -> None:
-    global SYSTEM, _SYSTEM_UPDATED_MONOTONIC, _SYSTEM_UPDATED_AT_UTC
+    global SYSTEM
 
     try:
         while True:
@@ -1585,15 +1556,8 @@ def system_poller() -> None:
                 "features": features,
             }
 
-            updated_monotonic = time.monotonic()
-            updated_at_utc = datetime.datetime.now(
-                datetime.timezone.utc
-            ).isoformat().replace("+00:00", "Z")
-
             with _SYSTEM_LOCK:
                 SYSTEM = snapshot
-                _SYSTEM_UPDATED_MONOTONIC = updated_monotonic
-                _SYSTEM_UPDATED_AT_UTC = updated_at_utc
 
             _publish_feature_status_if_changed(features)
             # ----------------------------------------------------------
@@ -1624,187 +1588,6 @@ def on_feature_status_fragment(payload: Optional[dict]) -> None:
     _publish_feature_status_if_changed(features)
 
 
-def _monitor_sequence(payload: Dict[str, Any]) -> Optional[int]:
-    for key in ("sequence", "teensy_pps_vclock_count", "pps_count"):
-        value = payload.get(key)
-        if value is None or isinstance(value, bool):
-            continue
-        try:
-            return int(value)
-        except (TypeError, ValueError, OverflowError):
-            continue
-    return None
-
-
-def _monitor_fields(source: Any, names: Tuple[str, ...]) -> Dict[str, Any]:
-    if not isinstance(source, dict):
-        return {}
-    return {name: source[name] for name in names if name in source}
-
-
-def _monitor_system_projection(system_snapshot: Dict[str, object]) -> Dict[str, object]:
-    """Project cached SYSTEM state into the bounded display union set."""
-    status: Dict[str, object] = {}
-
-    # Pi-owned contextual blocks are already compact enough for the display feed.
-    for key in ("pi", "network", "sensors", "environment", "gnss",
-                "power", "battery", "features"):
-        value = system_snapshot.get(key)
-        if isinstance(value, dict):
-            status[key] = value
-
-    status["teensy"] = _monitor_fields(
-        system_snapshot.get("teensy"),
-        (
-            "health_state", "fw_version", "cpu_freq_mhz",
-            "cpu_usage_pct_milli", "cpu_work_pct_milli",
-            "cpu_idle_spin_pct_milli", "cpu_wall_cycles",
-            "crash_report_present", "feature_status_foreground_court_ok",
-        ),
-    )
-    status["process"] = _monitor_fields(
-        system_snapshot.get("process"),
-        (
-            "health_state", "rpc_received", "rpc_routed",
-            "rpc_handler_invoked", "rpc_handler_completed",
-            "rpc_response_sent", "rpc_err_missing_fields",
-            "rpc_err_unknown_subsys", "rpc_err_unknown_command",
-            "rpc_err_response_sent", "ps_dispatched",
-            "rpc_counter_order_ok", "rpc_handler_inflight",
-            "rpc_response_pending", "invariant_received_ok",
-            "invariant_routed_ok", "invariant_handler_ok",
-            "invariant_response_ok",
-        ),
-    )
-    status["transport"] = _monitor_fields(
-        system_snapshot.get("transport"),
-        (
-            "health_state", "tx_jobs_enqueued", "tx_jobs_sent",
-            "tx_job_count", "tx_job_high_water", "tx_alloc_fail",
-            "tx_budget_fail", "tx_queue_full", "tx_rr_drop_count",
-            "rx_frames_complete", "rx_frames_dispatched", "rx_overlap",
-            "rx_bad_stx", "rx_bad_etx", "rx_len_overflow",
-            "rx_guard_failure_count", "rx_buffer_in_dmamem",
-            "rx_buffer_alignment_ok",
-        ),
-    )
-    status["payload"] = _monitor_fields(
-        system_snapshot.get("payload"),
-        (
-            "health_state", "payload_instances_constructed",
-            "payload_instances_destroyed", "payload_alive_now",
-            "payload_alive_high_water", "payload_heap_bytes_alive",
-            "payload_heap_bytes_high_water", "payload_entry_alloc_fail",
-            "payload_entry_overflow", "payload_arena_alloc_fail",
-            "payload_serialize_overflow", "payload_to_json_fail",
-            "payload_parse_error",
-        ),
-    )
-    return status
-
-
-def on_monitor_fragment(payload: Optional[dict]) -> None:
-    """Decorate one Teensy MONITOR_FRAGMENT without issuing any commands."""
-    global _MONITOR_FRAGMENT_RECEIVED_COUNT
-    global _MONITOR_FRAGMENT_MALFORMED_COUNT
-    global _MONITOR_FRAGMENT_OVERSIZE_COUNT
-    global _MONITOR_SEQUENCE_GAP_COUNT
-    global _MONITOR_SEQUENCE_REPEAT_COUNT
-    global _MONITOR_SEQUENCE_REGRESSION_COUNT
-    global _MONITOR_STATUS_PUBLISH_COUNT
-    global _MONITOR_LAST_SEQUENCE
-    global _MONITOR_LAST_RECEIVED_MONOTONIC
-    global _MONITOR_LAST_RECEIVED_AT_UTC
-    global _MONITOR_STATUS
-
-    if not isinstance(payload, dict):
-        _MONITOR_FRAGMENT_MALFORMED_COUNT += 1
-        logging.warning("[system] ignoring malformed MONITOR_FRAGMENT: %r", payload)
-        return
-
-    try:
-        fragment_bytes = len(
-            json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-        )
-    except (TypeError, ValueError, OverflowError):
-        _MONITOR_FRAGMENT_MALFORMED_COUNT += 1
-        logging.warning("[system] MONITOR_FRAGMENT is not JSON-serializable")
-        return
-
-    if fragment_bytes > MONITOR_FRAGMENT_MAX_BYTES:
-        _MONITOR_FRAGMENT_OVERSIZE_COUNT += 1
-        logging.warning(
-            "[system] MONITOR_FRAGMENT exceeds hard limit: bytes=%d limit=%d",
-            fragment_bytes, MONITOR_FRAGMENT_MAX_BYTES,
-        )
-        return
-
-    sequence = _monitor_sequence(payload)
-    if sequence is None:
-        _MONITOR_FRAGMENT_MALFORMED_COUNT += 1
-        logging.warning("[system] MONITOR_FRAGMENT missing sequence: %r", payload)
-        return
-
-    received_monotonic = time.monotonic()
-    received_at_utc = datetime.datetime.now(
-        datetime.timezone.utc
-    ).isoformat().replace("+00:00", "Z")
-
-    with _SYSTEM_LOCK:
-        system_snapshot = dict(SYSTEM)
-        system_updated_monotonic = _SYSTEM_UPDATED_MONOTONIC
-        system_updated_at_utc = _SYSTEM_UPDATED_AT_UTC
-
-    if _MONITOR_LAST_SEQUENCE is not None:
-        if sequence == _MONITOR_LAST_SEQUENCE:
-            _MONITOR_SEQUENCE_REPEAT_COUNT += 1
-        elif sequence < _MONITOR_LAST_SEQUENCE:
-            _MONITOR_SEQUENCE_REGRESSION_COUNT += 1
-        elif sequence > _MONITOR_LAST_SEQUENCE + 1:
-            _MONITOR_SEQUENCE_GAP_COUNT += sequence - _MONITOR_LAST_SEQUENCE - 1
-
-    _MONITOR_FRAGMENT_RECEIVED_COUNT += 1
-    _MONITOR_STATUS_PUBLISH_COUNT += 1
-    _MONITOR_LAST_SEQUENCE = sequence
-    _MONITOR_LAST_RECEIVED_MONOTONIC = received_monotonic
-    _MONITOR_LAST_RECEIVED_AT_UTC = received_at_utc
-
-    system_age_ms = None
-    if system_updated_monotonic > 0.0:
-        system_age_ms = max(
-            0, int(round((received_monotonic - system_updated_monotonic) * 1000.0))
-        )
-
-    # Preserve the familiar display-facing SYSTEM sections, then attach the live
-    # firmware fragment and feed provenance.  Deliberately exclude the cached
-    # verbose CLOCKS report and deep forensic blocks from this 1 Hz publication.
-    # Existing clients do not consume this object yet, so no command-path
-    # behavior changes in this phase.
-    status = _monitor_system_projection(system_snapshot)
-    status["fragment"] = dict(payload)
-    status["monitor"] = {
-        "sequence": sequence,
-        "received_at_utc": received_at_utc,
-        "fragment_age_ms": 0,
-        "fragment_bytes": fragment_bytes,
-        "fragment_hard_limit_bytes": MONITOR_FRAGMENT_MAX_BYTES,
-        "system_snapshot_age_ms": system_age_ms,
-        "system_snapshot_updated_at_utc": system_updated_at_utc or None,
-        "fragment_received_count": _MONITOR_FRAGMENT_RECEIVED_COUNT,
-        "fragment_malformed_count": _MONITOR_FRAGMENT_MALFORMED_COUNT,
-        "fragment_oversize_count": _MONITOR_FRAGMENT_OVERSIZE_COUNT,
-        "sequence_gap_count": _MONITOR_SEQUENCE_GAP_COUNT,
-        "sequence_repeat_count": _MONITOR_SEQUENCE_REPEAT_COUNT,
-        "sequence_regression_count": _MONITOR_SEQUENCE_REGRESSION_COUNT,
-        "status_publish_count": _MONITOR_STATUS_PUBLISH_COUNT,
-    }
-
-    with _MONITOR_LOCK:
-        _MONITOR_STATUS = status
-
-    publish("MONITOR_STATUS", status)
-
-
 # ------------------------------------------------------------------
 # Command handlers
 # ------------------------------------------------------------------
@@ -1817,38 +1600,6 @@ def cmd_report(_: Optional[dict]) -> Dict:
         "success": True,
         "message": "OK",
         "payload": snapshot,
-    }
-
-
-def cmd_monitor_report(_: Optional[dict]) -> Dict:
-    """Return the latest cached MONITOR_STATUS for explicit bench inspection."""
-    with _MONITOR_LOCK:
-        status = dict(_MONITOR_STATUS)
-
-    now = time.monotonic()
-    age_ms = None
-    if _MONITOR_LAST_RECEIVED_MONOTONIC > 0.0:
-        age_ms = max(
-            0, int(round((now - _MONITOR_LAST_RECEIVED_MONOTONIC) * 1000.0))
-        )
-
-    return {
-        "success": True,
-        "message": "OK",
-        "payload": {
-            "available": bool(status),
-            "age_ms": age_ms,
-            "last_sequence": _MONITOR_LAST_SEQUENCE,
-            "last_received_at_utc": _MONITOR_LAST_RECEIVED_AT_UTC or None,
-            "fragment_received_count": _MONITOR_FRAGMENT_RECEIVED_COUNT,
-            "fragment_malformed_count": _MONITOR_FRAGMENT_MALFORMED_COUNT,
-            "fragment_oversize_count": _MONITOR_FRAGMENT_OVERSIZE_COUNT,
-            "sequence_gap_count": _MONITOR_SEQUENCE_GAP_COUNT,
-            "sequence_repeat_count": _MONITOR_SEQUENCE_REPEAT_COUNT,
-            "sequence_regression_count": _MONITOR_SEQUENCE_REGRESSION_COUNT,
-            "status_publish_count": _MONITOR_STATUS_PUBLISH_COUNT,
-            "status": status,
-        },
     }
 
 
@@ -1952,7 +1703,6 @@ def cmd_swap_battery(_: Optional[dict]) -> Dict:
 
 COMMANDS = {
     "REPORT": cmd_report,
-    "MONITOR_REPORT": cmd_monitor_report,
     "FEATURES": cmd_features,
     "REPORT_FEATURES": cmd_features,
     "GET_FEATURE": cmd_get_feature,
@@ -1990,7 +1740,6 @@ def run() -> None:
             commands=COMMANDS,
             subscriptions={
                 "FEATURE_STATUS_FRAGMENT": on_feature_status_fragment,
-                "MONITOR_FRAGMENT": on_monitor_fragment,
             },
             blocking=False,
         )
