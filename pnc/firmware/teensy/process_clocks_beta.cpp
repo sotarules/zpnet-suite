@@ -10274,6 +10274,10 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
   g_timebase_last_publish_return_campaign_seconds = campaign_seconds;
   timebase_build_stage(TIMEBASE_BUILD_STAGE_PUBLISH_RETURN);
 
+  // PPS-aligned operational side rail. SYSTEM receives only the completed
+  // second identity; it never parses or copies TIMEBASE.
+  system_monitor_pps_tick(public_count);
+
   p.clear();
   f.clear();
 

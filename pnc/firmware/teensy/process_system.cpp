@@ -149,6 +149,24 @@ static uint32_t g_system_feature_fragment_service_arm_failures = 0;
 static uint32_t g_system_feature_handler_reject_count = 0;
 static uint32_t g_system_feature_handler_last_ipsr = 0;
 
+// --------------------------------------------------------------
+// PPS-aligned MONITOR_FRAGMENT publication custody
+// --------------------------------------------------------------
+// CLOCKS contributes only the completed-second sequence. SYSTEM gathers the
+// current non-TIMEBASE operational state later in foreground ALAP service.
+static volatile uint32_t g_system_monitor_pending_sequence = 0U;
+static volatile bool g_system_monitor_pending = false;
+static volatile bool g_system_monitor_service_armed = false;
+static uint32_t g_system_monitor_publish_count = 0U;
+static uint32_t g_system_monitor_coalesce_count = 0U;
+static uint32_t g_system_monitor_service_arm_failures = 0U;
+
+static bool g_system_monitor_cpu_window_initialized = false;
+static uint64_t g_system_monitor_cpu_last_wall_cycles = 0U;
+static uint64_t g_system_monitor_cpu_last_idle_cycles = 0U;
+
+static void system_monitor_schedule_publish(void);
+
 // ================================================================
 // Feature status substrate
 // ================================================================
@@ -3354,6 +3372,216 @@ static FLASHMEM Payload cmd_payload_info(const Payload& /*args*/) {
         info.contract_event_incidents_suppressed);
 
   return p;
+}
+
+
+// ============================================================================
+// MONITOR_FRAGMENT — compact non-TIMEBASE operational status
+// ============================================================================
+//
+// This publication intentionally contains only the union of Teensy operational
+// fields consumed by Dashboard/Metrics. Scientific clock rows remain in
+// TIMEBASE_FRAGMENT and are never parsed or copied here.
+
+static Payload system_monitor_teensy_payload(void) {
+  Payload p;
+  p.add("health_state", "NOMINAL");
+  p.add("fw_version", FW_VERSION);
+  p.add("cpu_freq_mhz", (uint32_t)(F_CPU_ACTUAL / 1000000UL));
+  p.add("crash_report_present", (bool)CrashReport);
+  p.add("feature_status_foreground_court_ok",
+        g_system_feature_handler_reject_count == 0U);
+
+  timepop_idle_witness_snapshot_t idle{};
+  timepop_idle_witness_snapshot(&idle);
+  const uint64_t wall_now = idle.snapshot_wall_cycles;
+  const uint64_t idle_now = idle.snapshot_total_cycles;
+  uint64_t total = 0U;
+  uint64_t idle_cycles = 0U;
+  uint64_t work = 0U;
+  uint32_t work_pct_milli = 0U;
+  uint32_t idle_pct_milli = 0U;
+
+  if (g_system_monitor_cpu_window_initialized) {
+    total = wall_now - g_system_monitor_cpu_last_wall_cycles;
+    idle_cycles = idle_now - g_system_monitor_cpu_last_idle_cycles;
+    if (idle_cycles > total) idle_cycles = total;
+    work = total - idle_cycles;
+    if (total != 0U) {
+      work_pct_milli =
+          (uint32_t)((work * 100000ULL + total / 2ULL) / total);
+      idle_pct_milli =
+          (uint32_t)((idle_cycles * 100000ULL + total / 2ULL) / total);
+    }
+  } else {
+    g_system_monitor_cpu_window_initialized = true;
+  }
+
+  g_system_monitor_cpu_last_wall_cycles = wall_now;
+  g_system_monitor_cpu_last_idle_cycles = idle_now;
+  p.add("cpu_usage_pct_milli", work_pct_milli);
+  p.add("cpu_work_pct_milli", work_pct_milli);
+  p.add("cpu_idle_spin_pct_milli", idle_pct_milli);
+  p.add("cpu_work_cycles64", work);
+  p.add("cpu_idle_spin_cycles64", idle_cycles);
+  p.add("cpu_window_total_cycles64", total);
+  p.add("cpu_wall_cycles", wall_now);
+  return p;
+}
+
+static Payload system_monitor_process_payload(void) {
+  process_rpc_info_t info{};
+  process_get_rpc_info(&info);
+
+  Payload p;
+  p.add("rpc_received", info.received);
+  p.add("rpc_routed", info.routed);
+  p.add("rpc_handler_invoked", info.handler_invoked);
+  p.add("rpc_handler_completed", info.handler_completed);
+  p.add("rpc_response_sent", info.response_sent);
+  p.add("rpc_err_missing_fields", info.error_missing_fields);
+  p.add("rpc_err_unknown_subsys", info.error_unknown_subsys);
+  p.add("rpc_err_unknown_command", info.error_unknown_command);
+  p.add("rpc_err_response_sent", info.error_response_sent);
+  p.add("ps_dispatched", info.ps_dispatched);
+
+  const uint32_t expected_received = info.routed + info.error_missing_fields +
+      info.error_unknown_subsys + info.error_unknown_command;
+  const bool order_ok = info.received >= info.routed &&
+      info.routed >= info.handler_invoked &&
+      info.handler_invoked >= info.handler_completed &&
+      info.handler_completed >= info.response_sent;
+  const uint32_t inflight = info.handler_invoked >= info.handler_completed
+      ? info.handler_invoked - info.handler_completed : 0xFFFFFFFFUL;
+  const uint32_t pending = info.handler_completed >= info.response_sent
+      ? info.handler_completed - info.response_sent : 0xFFFFFFFFUL;
+
+  p.add("rpc_counter_order_ok", order_ok);
+  p.add("rpc_handler_inflight", inflight);
+  p.add("rpc_response_pending", pending);
+  p.add("invariant_received_ok", info.received == expected_received);
+  p.add("invariant_routed_ok", order_ok && info.routed == info.handler_invoked);
+  p.add("invariant_handler_ok", order_ok && inflight <= 1U);
+  p.add("invariant_response_ok", order_ok && pending == 0U);
+  p.add("health_state", order_ok && inflight <= 1U && pending == 0U
+      ? "NOMINAL" : "ANOMALY");
+  return p;
+}
+
+static Payload system_monitor_transport_payload(void) {
+  transport_info_t info{};
+  transport_get_info(&info);
+
+  Payload p;
+  p.add("tx_job_count", info.tx_job_count);
+  p.add("tx_job_high_water", info.tx_job_high_water);
+  p.add("tx_jobs_enqueued", info.tx_jobs_enqueued);
+  p.add("tx_jobs_sent", info.tx_jobs_sent);
+  p.add("tx_alloc_fail", info.tx_alloc_fail);
+  p.add("tx_budget_fail", info.tx_budget_fail);
+  p.add("tx_queue_full", info.tx_queue_full);
+  p.add("tx_rr_drop_count", info.tx_rr_drop_count);
+  p.add("rx_frames_complete", info.rx_frames_complete);
+  p.add("rx_frames_dispatched", info.rx_frames_dispatched);
+  p.add("rx_bad_stx", info.rx_bad_stx);
+  p.add("rx_bad_etx", info.rx_bad_etx);
+  p.add("rx_len_overflow", info.rx_len_overflow);
+  p.add("rx_overlap", info.rx_overlap);
+  p.add("rx_buffer_in_dmamem", info.rx_buffer_in_dmamem != 0U);
+  p.add("rx_buffer_alignment_ok", info.rx_buffer_alignment_ok != 0U);
+  p.add("rx_guard_failure_count", info.rx_guard_failure_count);
+
+  const bool nominal = info.tx_alloc_fail == 0U &&
+      info.tx_budget_fail == 0U && info.tx_queue_full == 0U &&
+      info.tx_rr_drop_count == 0U && info.rx_bad_stx == 0U &&
+      info.rx_bad_etx == 0U && info.rx_len_overflow == 0U &&
+      info.rx_guard_failure_count == 0U &&
+      info.rx_buffer_alignment_ok != 0U;
+  p.add("health_state", nominal ? "NOMINAL" : "ANOMALY");
+  return p;
+}
+
+static Payload system_monitor_payload_payload(void) {
+  payload_info_t info{};
+  payload_get_info(&info);
+
+  Payload p;
+  p.add("payload_instances_constructed", info.instances_constructed);
+  p.add("payload_instances_destroyed", info.instances_destroyed);
+  p.add("payload_alive_now", info.alive_now);
+  p.add("payload_alive_high_water", info.alive_high_water);
+  p.add("payload_heap_bytes_alive",
+        info.entry_heap_bytes_alive + info.arena_heap_bytes_alive);
+  p.add("payload_heap_bytes_high_water",
+        info.entry_heap_bytes_high_water + info.arena_heap_bytes_high_water);
+  p.add("payload_entry_alloc_fail", info.entry_alloc_fail);
+  p.add("payload_entry_overflow", info.entry_overflow);
+  p.add("payload_arena_alloc_fail", info.arena_alloc_fail);
+  p.add("payload_serialize_overflow", info.serialize_overflow);
+  p.add("payload_to_json_fail", info.to_json_fail);
+  p.add("payload_parse_error", info.parse_error);
+  p.add("payload_integrity_fail", info.integrity_fail);
+  p.add("payload_alloc_overlap_detected", info.alloc_overlap_detected);
+  p.add("payload_handler_ctx_alloc", info.handler_ctx_alloc);
+  p.add("payload_handler_ctx_free", info.handler_ctx_free);
+
+  const uint32_t expected_alive =
+      info.instances_constructed - info.instances_destroyed;
+  const bool nominal = info.entry_alloc_fail == 0U &&
+      info.entry_overflow == 0U && info.arena_alloc_fail == 0U &&
+      info.serialize_overflow == 0U && info.to_json_fail == 0U &&
+      info.parse_error == 0U && info.integrity_fail == 0U &&
+      expected_alive == info.alive_now;
+  p.add("health_state", nominal ? "NOMINAL" : "ANOMALY");
+  return p;
+}
+
+static void system_monitor_publish_service(timepop_ctx_t*,
+                                           timepop_diag_t*,
+                                           void*) {
+  g_system_monitor_service_armed = false;
+  if (!g_system_monitor_pending) return;
+
+  const uint32_t sequence = g_system_monitor_pending_sequence;
+  g_system_monitor_pending = false;
+
+  Payload fragment;
+  fragment.add("schema", "MONITOR_FRAGMENT_V1");
+  fragment.add("sequence", sequence);
+  fragment.add("generated_dwt", ARM_DWT_CYCCNT);
+  fragment.add_object("teensy", system_monitor_teensy_payload());
+  fragment.add_object("process", system_monitor_process_payload());
+  fragment.add_object("transport", system_monitor_transport_payload());
+  fragment.add_object("payload", system_monitor_payload_payload());
+  fragment.add_object("features", system_features_tree_payload());
+  fragment.add("monitor_publish_count", g_system_monitor_publish_count + 1U);
+  fragment.add("monitor_coalesce_count", g_system_monitor_coalesce_count);
+  fragment.add("monitor_service_arm_failures",
+               g_system_monitor_service_arm_failures);
+
+  publish("MONITOR_FRAGMENT", fragment);
+  g_system_monitor_publish_count++;
+  fragment.clear();
+  if (g_system_monitor_pending) system_monitor_schedule_publish();
+}
+
+static void system_monitor_schedule_publish(void) {
+  if (!g_system_monitor_pending || g_system_monitor_service_armed) return;
+  const timepop_handle_t handle = timepop_arm_alap(
+      system_monitor_publish_service, nullptr, "SYSTEM_MONITOR_FRAGMENT");
+  if (handle == TIMEPOP_INVALID_HANDLE) {
+    g_system_monitor_service_arm_failures++;
+    return;
+  }
+  g_system_monitor_service_armed = true;
+}
+
+void system_monitor_pps_tick(uint32_t completed_second_sequence) {
+  if (system_feature_current_ipsr() != 0U) return;
+  if (g_system_monitor_pending) g_system_monitor_coalesce_count++;
+  g_system_monitor_pending_sequence = completed_second_sequence;
+  g_system_monitor_pending = true;
+  system_monitor_schedule_publish();
 }
 
 

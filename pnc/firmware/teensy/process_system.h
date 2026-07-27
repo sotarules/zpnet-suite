@@ -137,3 +137,11 @@ const char* system_feature_get_status(const char* subsystem,
 
 bool system_feature_is_nominal(const char* subsystem,
                                const char* feature);
+
+// ============================================================================
+// PPS-aligned MONITOR_FRAGMENT side rail
+// ============================================================================
+// CLOCKS calls this after publishing the completed TIMEBASE row. The function
+// records only the completed-second sequence and arms foreground publication;
+// it never inspects or copies TIMEBASE.
+void system_monitor_pps_tick(uint32_t completed_second_sequence);
