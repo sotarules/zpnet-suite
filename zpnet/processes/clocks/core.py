@@ -103,8 +103,9 @@ GNSS_WAIT_LOG_INTERVAL = 60
 
 # Sync waits
 #
-# START/RECOVER are gated by readiness preflight. The Pi no longer expects
-# fixed row burial/warmup suppression as part of normal campaign admission:
+# Cold START, Flash Cut, and zero-row cold recovery are readiness-gated.
+# Warm recovery uses its narrower recovery-specific lifecycle contract. The
+# Pi no longer expects fixed row burial/warmup suppression during admission:
 # the first public TIMEBASE row is supposed to be useful, and if it is not,
 # the responsible readiness or handoff gate should be fixed.
 RECOVERY_FIRST_PUBLIC_OFFSET = 1
@@ -164,6 +165,8 @@ SYNC_LOG_INTERVAL_S = 5.0
 # join in the live architecture.
 TIMEBASE_INGRESS_QUEUE_MAXSIZE = 0
 TIMEBASE_FRAGMENT_TOPIC = "TIMEBASE_FRAGMENT"
+MONITOR_TOPIC = "MONITOR"
+MONITOR_PREFLIGHT_MAX_AGE_S = 5.0
 CLOCKS_RECOVERY_STALLED_TOPIC = "CLOCKS_RECOVERY_STALLED"
 TIMEBASE_CANDIDATE_ACCEPT = "ACCEPT"
 TIMEBASE_CANDIDATE_SCIENCE_REJECT = "SCIENCE_REJECT"
@@ -277,35 +280,36 @@ TEENSY_HEALTH_RETRY_S = 60.0
 START_FIRST_FRAGMENT_TIMEOUT_S = 90.0
 FLASH_CUT_FIRST_FRAGMENT_TIMEOUT_S = 180.0
 
-# Feature-status campaign preflight.
+# MONITOR-backed campaign preflight.
 #
-# This first-pass gate deliberately uses the global PI SYSTEM feature tree,
-# because Pi SYSTEM has the broadest horizon: Pi-local GNSS/host/power state
-# plus imported Teensy-local timing readiness.  Runtime TIMEBASE row
-# integrity, database command-contract checks, GNSS mode reconciliation, and
-# recovery projection remain local CLOCKS logic.
+# MONITOR is the sole recurring readiness feed consumed by CLOCKS.  The former
+# FEATURE_STATUS / FEATURE_STATUS_FRAGMENT aggregate feeds no longer exist, so
+# campaign admission must depend only on concrete readiness leaves carried in
+# MONITOR.features.  Runtime TIMEBASE row integrity, database command-contract
+# checks, GNSS mode reconciliation, and recovery projection remain local CLOCKS
+# logic.
 #
 # FLOORLINE and QTIMER_DWT_RULER are intentionally not campaign-admission
 # gates.  Both remain valuable imported Teensy INTERRUPT feature surfaces, but
 # they are diagnostic / quality witnesses whose current definitions can strobe
 # during startup, recovery, and report-pressure windows.
 #
-# The Pi gate deliberately mirrors the Teensy CLOCKS campaign-custody gate.
-# COUNTER32_LINEAGE and OCXO_PUBLIC_ORIGIN are admission prerequisites because
-# Teensy START rejects while either is not NOMINAL.  STATIC_PREDICTION remains
-# post-start evidence because it is not part of the Teensy admission court.
-# CLOCKS also polls Teensy REPORT_GATE directly before START/RECOVER.  That
-# report is the exact firmware admission authority.  When it is open, stale
-# TEENSY.* INITIALIZING entries in PI SYSTEM's asynchronously imported feature
-# mirror are retained as diagnostics but cannot veto the lawful transition.
+# COUNTER32_LINEAGE and OCXO_PUBLIC_ORIGIN remain admission prerequisites in
+# MONITOR because they protect the physical identity/custody rails needed by the
+# startup handoff.  STATIC_PREDICTION remains post-start evidence.
+#
+# Pi CLOCKS owns the one global policy gate.  Teensy CLOCKS does not mirror or
+# re-evaluate MONITOR policy; it enforces command/state integrity, SmartZero,
+# private PPS0/PhaseLedger maturity, watchdog custody, and the actual lifecycle
+# command verdict.
 FEATURE_PREFLIGHT_PROFILE = "CAMPAIGN_PREFLIGHT"
 FEATURE_PREFLIGHT_REQUIRED = (
-    "PI.SYSTEM.FEATURE_STATUS",
+    # Concrete readiness leaves from the unified MONITOR.features tree.
+    # Do not gate on the retired FEATURE_STATUS aggregate nodes or the old
+    # FEATURE_STATUS-driven Teensy import sentinel.
     "PI.SYSTEM.HOST",
     "PI.SYSTEM.POWER",
-    "PI.SYSTEM.TEENSY_FEATURE_IMPORT",
     "PI.GNSS.REPORT",
-    "TEENSY.SYSTEM.FEATURE_STATUS",
     "TEENSY.INTERRUPT.PPS_VCLOCK_AUTHORITY",
     "TEENSY.INTERRUPT.QTIMER_COUNTER_CUSTODY",
     "TEENSY.INTERRUPT.COUNTER32_LINEAGE",
@@ -318,17 +322,6 @@ FEATURE_PREFLIGHT_REQUIRED = (
 FEATURE_PREFLIGHT_POST_START_EXPECTED = (
     "TEENSY.CLOCKS.STATIC_PREDICTION",
 )
-
-TEENSY_CAMPAIGN_GATE_LABEL_TO_FEATURE = {
-    "T_FEATURE": "TEENSY.SYSTEM.FEATURE_STATUS",
-    "PPS/V_AUTH": "TEENSY.INTERRUPT.PPS_VCLOCK_AUTHORITY",
-    "QTIMER_CNT": "TEENSY.INTERRUPT.QTIMER_COUNTER_CUSTODY",
-    "CTR32_LINE": "TEENSY.INTERRUPT.COUNTER32_LINEAGE",
-    "DWT_CAL": "TEENSY.CLOCKS.DWT_CALIBRATION",
-    "SMARTZERO": "TEENSY.CLOCKS.SMARTZERO",
-    "ALPHA_EPOCH": "TEENSY.CLOCKS.ALPHA_EPOCH",
-    "OCXO_ORIGIN": "TEENSY.CLOCKS.OCXO_PUBLIC_ORIGIN",
-}
 
 # ---------------------------------------------------------------------
 # TIMEBASE ingress queue
@@ -492,17 +485,16 @@ _diag: Dict[str, Any] = {
     "gnss_wait_seconds_last": 0.0,
     "last_gnss_wait": {},
 
-    # Feature-status campaign preflight
+    # MONITOR-backed campaign preflight
     "preflight_feature_checks": 0,
     "preflight_feature_blocked": 0,
     "preflight_feature_unavailable": 0,
-    "preflight_teensy_mirror_bypass_count": 0,
-    "last_preflight_teensy_mirror_bypass": {},
+    "preflight_monitor_updates": 0,
+    "preflight_monitor_malformed": 0,
+    "preflight_monitor_missing_features": 0,
+    "preflight_monitor_stale": 0,
+    "last_preflight_monitor": {},
     "last_preflight_feature_gate": {},
-    "teensy_campaign_gate_checks": 0,
-    "teensy_campaign_gate_blocked": 0,
-    "teensy_campaign_gate_unavailable": 0,
-    "last_teensy_campaign_gate": {},
     "preflight_wait_log_count": 0,
     "last_preflight_wait": {},
 
@@ -1123,6 +1115,13 @@ _gate_mode_last_teensy_payload: Dict[str, Any] = {}
 # The command server is exposed early so PUBSUB can discover subscriptions, but
 # START/RESUME must not race the boot DAC push and active-campaign recovery.
 _startup_control_ready = threading.Event()
+
+# Latest unified operational heartbeat.  CLOCKS consumes MONITOR.features for
+# campaign preflight; it never polls or subscribes to a feature-only side feed.
+_monitor_lock = threading.Lock()
+_latest_monitor: Dict[str, Any] = {}
+_latest_monitor_received_monotonic: Optional[float] = None
+_latest_monitor_received_utc: Optional[str] = None
 
 _last_pps_vclock_count_seen: Optional[int] = None
 
@@ -2040,6 +2039,15 @@ def _ensure_gnss_mode_for_current_location() -> Optional[str]:
 def _persist_timebase(tb: Dict[str, Any]) -> None:
     """Append TIMEBASE row and denormalize as active campaign report."""
     try:
+        # Persist the canonical Teensy-authored PPS/VCLOCK identity as a scalar
+        # column beside the immutable JSONB evidence.  The final court has already
+        # required this top-level field and verified that it agrees with the
+        # fragment and forensics identities.
+        pps_count = _extract_teensy_pps_vclock_count(
+            tb,
+            topic="TIMEBASE persistence",
+        )
+
         report = dict(tb)
         report["campaign_state"] = "STARTED"
 
@@ -2047,10 +2055,10 @@ def _persist_timebase(tb: Dict[str, Any]) -> None:
             cur = conn.cursor()
             cur.execute(
                 """
-                INSERT INTO timebase (campaign, payload)
-                VALUES (%s, %s)
+                INSERT INTO timebase (campaign, payload, pps_count)
+                VALUES (%s, %s, %s)
                 """,
-                (tb["campaign"], json.dumps(tb)),
+                (tb["campaign"], json.dumps(tb), int(pps_count)),
             )
             cur.execute(
                 """
@@ -6447,12 +6455,10 @@ def _recover_campaign() -> None:
     except Exception as e:
         raise RuntimeError(f"recovery failed: {e}")
 
-    # Warm recovery after a Teensy reboot must not depend on the exact
-    # campaign-admission gate used by START.  REPORT_GATE may legitimately
-    # report FEATURE_STATUS unseen immediately after reboot, which creates a
-    # circular wait: the Pi refuses RECOVER until the Teensy has republished
-    # readiness state, while the Teensy needs RECOVER to resume the campaign
-    # publication lifecycle.
+    # Warm recovery deliberately bypasses the full START MONITOR profile:
+    # SmartZero/Alpha-epoch/OCXO-origin leaves may be exactly what RECOVER must
+    # reconstruct after a Teensy reboot.  Requiring them here would create a
+    # circular wait.
     #
     # Keep all concrete recovery safeguards below:
     #   * GNSS mode has already been reconciled above.
@@ -7038,17 +7044,60 @@ def cmd_set_baseline(args: Optional[dict]) -> Dict[str, Any]:
 # ---------------------------------------------------------------------
 
 
-def _fetch_system_features() -> Dict[str, Any]:
-    """Fetch the global feature tree from Pi SYSTEM.  Command/response only."""
-    resp = send_command(machine="PI", subsystem="SYSTEM", command="FEATURES")
-    if not resp.get("success"):
-        raise RuntimeError(f"PI SYSTEM FEATURES failed: {resp.get('message', '?')}")
+def on_monitor(payload: Optional[dict]) -> None:
+    """Cache the latest unified MONITOR heartbeat for campaign preflight."""
+    global _latest_monitor
+    global _latest_monitor_received_monotonic
+    global _latest_monitor_received_utc
 
-    payload = resp.get("payload", {})
     if not isinstance(payload, dict):
-        raise RuntimeError("PI SYSTEM FEATURES returned non-dict payload")
+        _diag["preflight_monitor_malformed"] += 1
+        return
 
-    return payload
+    now_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    with _monitor_lock:
+        _latest_monitor = copy.deepcopy(payload)
+        _latest_monitor_received_monotonic = time.monotonic()
+        _latest_monitor_received_utc = now_utc
+
+    _diag["preflight_monitor_updates"] += 1
+
+
+def _monitor_features() -> Dict[str, Any]:
+    """Return fresh MONITOR.features or raise while the heartbeat is unavailable."""
+    with _monitor_lock:
+        monitor = copy.deepcopy(_latest_monitor)
+        received_monotonic = _latest_monitor_received_monotonic
+        received_utc = _latest_monitor_received_utc
+
+    if received_monotonic is None or not monitor:
+        raise RuntimeError("MONITOR heartbeat not yet received")
+
+    age_s = max(0.0, time.monotonic() - received_monotonic)
+    if age_s > MONITOR_PREFLIGHT_MAX_AGE_S:
+        _diag["preflight_monitor_stale"] += 1
+        _diag["last_preflight_monitor"] = {
+            "status": "STALE",
+            "received_at_utc": received_utc,
+            "age_s": round(age_s, 3),
+            "max_age_s": float(MONITOR_PREFLIGHT_MAX_AGE_S),
+        }
+        raise RuntimeError(
+            f"MONITOR heartbeat stale ({age_s:.1f}s > {MONITOR_PREFLIGHT_MAX_AGE_S:.1f}s)"
+        )
+
+    features = monitor.get("features")
+    if not isinstance(features, dict) or not features:
+        _diag["preflight_monitor_missing_features"] += 1
+        raise RuntimeError("MONITOR heartbeat has no feature tree")
+
+    _diag["last_preflight_monitor"] = {
+        "status": "NOMINAL",
+        "received_at_utc": received_utc,
+        "age_s": round(age_s, 3),
+        "sequence": monitor.get("sequence"),
+    }
+    return features
 
 
 def _feature_gate_reason(blocker: Dict[str, Any]) -> str:
@@ -7060,24 +7109,16 @@ def _feature_gate_reason(blocker: Dict[str, Any]) -> str:
     return f"{name} is {status}"
 
 
-def _check_feature_preflight(
-    context: str,
-    *,
-    direct_teensy_gate_open: bool = False,
-) -> tuple[bool, list[str]]:
-    """Check the standardized feature-status campaign preflight profile.
+def _check_feature_preflight(context: str) -> tuple[bool, list[str]]:
+    """Check the single standardized MONITOR campaign preflight profile.
 
-    PI.SYSTEM.FEATURES is authoritative for Pi-local prerequisites.  Its
-    TEENSY subtree is an asynchronously imported mirror, so it may temporarily
-    retain INITIALIZING after the live Teensy gate has already opened.  When
-    CLOCKS.REPORT_GATE directly proves the exact firmware admission gate open,
-    stale TEENSY.* mirror blockers become diagnostic evidence rather than a
-    second veto.
+    Every required leaf is evaluated from one fresh MONITOR.features snapshot.
+    There is no second firmware-policy cache and no mirror-bypass path.
     """
     _diag["preflight_feature_checks"] += 1
 
     try:
-        features = _fetch_system_features()
+        features = _monitor_features()
     except Exception as e:
         _diag["preflight_feature_unavailable"] += 1
         _diag["last_preflight_feature_gate"] = {
@@ -7085,10 +7126,9 @@ def _check_feature_preflight(
             "context": context,
             "profile": FEATURE_PREFLIGHT_PROFILE,
             "status": "UNAVAILABLE",
-            "direct_teensy_gate_open": bool(direct_teensy_gate_open),
             "error": str(e),
         }
-        return False, [f"{FEATURE_PREFLIGHT_PROFILE}: feature tree unavailable ({e})"]
+        return False, [f"{FEATURE_PREFLIGHT_PROFILE}: MONITOR feature tree unavailable ({e})"]
 
     raw_blockers = blocking_features(features, FEATURE_PREFLIGHT_REQUIRED)
     compact_raw_blockers = [
@@ -7100,30 +7140,7 @@ def _check_feature_preflight(
         for b in raw_blockers
     ]
 
-    bypassed_teensy_blockers: list[Dict[str, str]] = []
     compact_blockers = compact_raw_blockers
-    if direct_teensy_gate_open:
-        bypassed_teensy_blockers = [
-            blocker
-            for blocker in compact_raw_blockers
-            if str(blocker.get("name") or "").startswith("TEENSY.")
-        ]
-        compact_blockers = [
-            blocker
-            for blocker in compact_raw_blockers
-            if not str(blocker.get("name") or "").startswith("TEENSY.")
-        ]
-
-        if bypassed_teensy_blockers:
-            _diag["preflight_teensy_mirror_bypass_count"] = (
-                _diag.get("preflight_teensy_mirror_bypass_count", 0) + 1
-            )
-            _diag["last_preflight_teensy_mirror_bypass"] = {
-                "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                "context": context,
-                "authority": "TEENSY.CLOCKS.REPORT_GATE",
-                "blockers": bypassed_teensy_blockers,
-            }
 
     if compact_blockers:
         _diag["preflight_feature_blocked"] += 1
@@ -7133,10 +7150,7 @@ def _check_feature_preflight(
             "profile": FEATURE_PREFLIGHT_PROFILE,
             "status": "BLOCKED",
             "required_count": len(FEATURE_PREFLIGHT_REQUIRED),
-            "direct_teensy_gate_open": bool(direct_teensy_gate_open),
             "blockers": compact_blockers,
-            "raw_blockers": compact_raw_blockers,
-            "bypassed_teensy_blockers": bypassed_teensy_blockers,
         }
         return False, [
             f"{FEATURE_PREFLIGHT_PROFILE}: {_feature_gate_reason(blocker)}"
@@ -7149,86 +7163,13 @@ def _check_feature_preflight(
         "profile": FEATURE_PREFLIGHT_PROFILE,
         "status": "NOMINAL",
         "required_count": len(FEATURE_PREFLIGHT_REQUIRED),
-        "direct_teensy_gate_open": bool(direct_teensy_gate_open),
-        "raw_blockers": compact_raw_blockers,
-        "bypassed_teensy_blockers": bypassed_teensy_blockers,
-        "teensy_mirror_reconciled": bool(bypassed_teensy_blockers),
+        "blockers": [],
     }
     return True, []
 
 
-def _check_teensy_campaign_gate(context: str) -> tuple[bool, list[str]]:
-    """Read the exact Teensy campaign gate that CLOCKS.START will enforce."""
-    _diag["teensy_campaign_gate_checks"] = (
-        _diag.get("teensy_campaign_gate_checks", 0) + 1
-    )
-    now_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-    try:
-        resp = send_command(
-            machine="TEENSY",
-            subsystem="CLOCKS",
-            command="REPORT_GATE",
-            retries=1,
-            retry_delay_s=0.0,
-        )
-    except Exception as e:
-        _diag["teensy_campaign_gate_unavailable"] = (
-            _diag.get("teensy_campaign_gate_unavailable", 0) + 1
-        )
-        _diag["last_teensy_campaign_gate"] = {
-            "ts_utc": now_utc,
-            "context": context,
-            "status": "UNAVAILABLE",
-            "error": str(e),
-        }
-        return False, [f"TEENSY.CLOCKS.CAMPAIGN_GATE unavailable ({e})"]
-
-    payload = resp.get("payload") if isinstance(resp, dict) else None
-    if not isinstance(resp, dict) or not resp.get("success") or not isinstance(payload, dict):
-        _diag["teensy_campaign_gate_unavailable"] = (
-            _diag.get("teensy_campaign_gate_unavailable", 0) + 1
-        )
-        _diag["last_teensy_campaign_gate"] = {
-            "ts_utc": now_utc,
-            "context": context,
-            "status": "UNAVAILABLE",
-            "outer_message": resp.get("message") if isinstance(resp, dict) else None,
-        }
-        return False, ["TEENSY.CLOCKS.CAMPAIGN_GATE report unavailable"]
-
-    gate_open = _recovery_bool(payload.get("campaign_gate_open"))
-    gate_reason = str(payload.get("campaign_gate_reason") or "campaign gate closed")
-    first_problem = str(payload.get("campaign_gate_first_problem") or "")
-    first_problem_feature = TEENSY_CAMPAIGN_GATE_LABEL_TO_FEATURE.get(
-        first_problem,
-        f"TEENSY.CLOCKS.{first_problem or 'CAMPAIGN_GATE'}",
-    )
-    snapshot = {
-        "ts_utc": now_utc,
-        "context": context,
-        "status": "NOMINAL" if gate_open else "BLOCKED",
-        "campaign_gate_open": bool(gate_open),
-        "campaign_gate_seen": _recovery_bool(payload.get("campaign_gate_seen")),
-        "campaign_gate_reason": gate_reason,
-        "campaign_gate_first_problem": first_problem,
-        "campaign_gate_first_problem_feature": first_problem_feature,
-        "campaign_gate_update_count": _as_int(payload.get("campaign_gate_update_count")),
-        "campaign_gate_transition_count": _as_int(payload.get("campaign_gate_transition_count")),
-    }
-    _diag["last_teensy_campaign_gate"] = snapshot
-
-    if gate_open:
-        return True, []
-
-    _diag["teensy_campaign_gate_blocked"] = (
-        _diag.get("teensy_campaign_gate_blocked", 0) + 1
-    )
-    return False, [f"{first_problem_feature}: {gate_reason}"]
-
-
 def _preflight_wait_items(reasons: list[str]) -> list[str]:
-    """Return a compact, stable list of pending prerequisites for the log."""
+    """Return a compact, stable list of pending MONITOR prerequisites."""
     items: list[str] = []
 
     feature_gate = _diag.get("last_preflight_feature_gate") or {}
@@ -7247,66 +7188,36 @@ def _preflight_wait_items(reasons: list[str]) -> list[str]:
                 item += f" ({detail})"
             items.append(item)
 
-    teensy_gate = _diag.get("last_teensy_campaign_gate") or {}
-    if teensy_gate.get("status") == "BLOCKED":
-        feature = str(
-            teensy_gate.get("campaign_gate_first_problem_feature")
-            or "TEENSY.CLOCKS.CAMPAIGN_GATE"
-        )
-        reason = str(
-            teensy_gate.get("campaign_gate_reason") or "campaign gate closed"
-        )
-        if feature not in blocker_names:
-            items.append(f"{feature}=BLOCKED ({reason})")
-    elif teensy_gate.get("status") == "UNAVAILABLE":
-        items.append("TEENSY.CLOCKS.CAMPAIGN_GATE=UNAVAILABLE")
-
     for reason in reasons:
         if reason.startswith(f"{FEATURE_PREFLIGHT_PROFILE}:"):
             if not blockers:
                 items.append(reason)
             continue
         reason_feature = reason.split(":", 1)[0]
-        if reason_feature in blocker_names:
-            continue
-        if reason_feature == str(
-            teensy_gate.get("campaign_gate_first_problem_feature") or ""
-        ):
-            continue
-        items.append(reason)
+        if reason_feature not in blocker_names:
+            items.append(reason)
 
     # Preserve order while removing duplicates.
     return list(dict.fromkeys(items))
 
 
 # ---------------------------------------------------------------------
-# Preflight gate — prerequisites for campaign start/recovery
+# Preflight gate — prerequisites for START / Flash Cut / cold recovery
 # ---------------------------------------------------------------------
 
 
 def _check_preflight(context: str = "campaign") -> tuple[bool, list[str]]:
-    """
-    Check whether the system is ready to start or recover a campaign.
+    """Check the MONITOR policy gate plus fresh local Pi prerequisites.
+
+    This path is used for cold START, Flash Cut, and zero-row cold recovery.
+    Warm recovery has its own narrower lifecycle contract.
     """
     reasons: list[str] = []
 
     # -----------------------------------------------------------------
-    # 0. Exact Teensy CLOCKS admission gate
+    # 0. Single unified MONITOR readiness profile
     # -----------------------------------------------------------------
-    # Poll the firmware authority first.  The PI SYSTEM feature tree contains
-    # an asynchronously imported TEENSY mirror; an open direct gate is allowed
-    # to reconcile stale TEENSY.* INITIALIZING entries in that mirror.
-    teensy_gate_ready, teensy_gate_reasons = _check_teensy_campaign_gate(context)
-    if not teensy_gate_ready:
-        reasons.extend(teensy_gate_reasons)
-
-    # -----------------------------------------------------------------
-    # 0b. Standardized feature-status readiness profile
-    # -----------------------------------------------------------------
-    feature_ready, feature_reasons = _check_feature_preflight(
-        context,
-        direct_teensy_gate_open=teensy_gate_ready,
-    )
+    feature_ready, feature_reasons = _check_feature_preflight(context)
     if not feature_ready:
         reasons.extend(feature_reasons)
 
@@ -7386,7 +7297,7 @@ def _check_preflight(context: str = "campaign") -> tuple[bool, list[str]]:
 
 
 def _wait_for_preflight(context: str = "recovery") -> None:
-    """Wait quietly until every Pi and Teensy campaign gate is open.
+    """Wait quietly until the unified MONITOR readiness profile is open.
 
     Readiness is polled frequently so startup proceeds promptly.  The log is
     intentionally sparse: no normal-path success line, and while blocked only
@@ -7721,9 +7632,10 @@ def cmd_clocks_info(_: Optional[dict]) -> Dict[str, Any]:
             "profile": FEATURE_PREFLIGHT_PROFILE,
             "required_features": list(FEATURE_PREFLIGHT_REQUIRED),
             "post_start_expected_features": list(FEATURE_PREFLIGHT_POST_START_EXPECTED),
-            "teensy_admission_authority": "TEENSY.CLOCKS.REPORT_GATE",
-            "pi_teensy_feature_mirror_role": (
-                "diagnostic when direct gate is open; fallback blocker otherwise"
+            "admission_authority": "MONITOR.features",
+            "firmware_policy_gate_used": False,
+            "firmware_start_contract": (
+                "COMMAND_STATE_NUMERIC_DAC_SMARTZERO_PRIVATE_HANDOFF"
             ),
         },
         "timebase_silence_monitor": {
@@ -8305,7 +8217,7 @@ def run() -> None:
         "START while active performs seamless flash-cut to new campaign. "
         "Commands: START, STOP, RESUME, RECOVER_ABORT, REPORT, CLEAR, DELETE, TRUNCATE, SET_DAC, DITHER, GATE_MODE, "
         "SET_BASELINE, BASELINE_INFO, LIST_CAMPAIGNS, CLOCKS_INFO. "
-        "Subscriptions: TIMEBASE_FRAGMENT, WATCHDOG_ANOMALY, CLOCKS_RECOVERY_STALLED."
+        "Subscriptions: MONITOR, TIMEBASE_FRAGMENT, WATCHDOG_ANOMALY, CLOCKS_RECOVERY_STALLED."
     )
 
     # Start command + pubsub servers first, but hold off on active work.
@@ -8317,6 +8229,7 @@ def run() -> None:
         subsystem="CLOCKS",
         commands=COMMANDS,
         subscriptions={
+            MONITOR_TOPIC: on_monitor,
             "TIMEBASE_FRAGMENT": on_timebase_fragment,
             "WATCHDOG_ANOMALY": on_watchdog_anomaly,
             CLOCKS_RECOVERY_STALLED_TOPIC: on_recovery_stalled,

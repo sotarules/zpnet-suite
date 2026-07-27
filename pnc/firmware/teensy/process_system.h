@@ -92,13 +92,10 @@ void zpnet_foreground_phase_note(zpnet_foreground_phase_t phase);
 // Feature status substrate
 // ============================================================================
 //
-// Teensy SYSTEM owns only Teensy-local feature state.  Pi SYSTEM asks for this
-// tree and unions it with Pi-local feature state into the global dashboard /
+// Teensy SYSTEM owns only Teensy-local feature state.  Every always-on
+// MONITOR_FRAGMENT carries the current Teensy feature tree; Pi SYSTEM unions it
+// with Pi-local feature state into the unified MONITOR dashboard /
 // campaign-readiness surface.
-//
-// Teensy also publishes FEATURE_STATUS_FRAGMENT whenever any local feature
-// scalar changes.  The fragment contains only Teensy-owned feature paths; the
-// Pi-side SYSTEM service relays the unified FEATURE_STATUS tree.
 //
 // Feature paths are reported as:
 //

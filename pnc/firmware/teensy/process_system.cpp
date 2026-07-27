@@ -40,7 +40,6 @@ void system_enter_quiescence(void);
 extern "C" void enter_bootloader_cleanly(void);
 
 static FLASHMEM Payload system_features_tree_payload(void);
-static void system_feature_schedule_fragment_publish(void);
 static void system_dmamem_ensure_initialized(void);
 
 // --------------------------------------------------------------
@@ -128,21 +127,6 @@ void zpnet_foreground_phase_note(zpnet_foreground_phase_t phase) {
   g_runtime_ledger.foreground_sequence = sequence;  // commit last
 }
 
-
-// --------------------------------------------------------------
-// FEATURE_STATUS_FRAGMENT publication custody
-// --------------------------------------------------------------
-// system_feature_set() may be reached by timing subsystems, so it only marks the
-// scalar feature tree dirty and requests an ALAP foreground service.  The service
-// publishes one compact FEATURE_STATUS_FRAGMENT containing Teensy-owned feature
-// state.  zpnet-system on the Pi relays the unified FEATURE_STATUS tree.
-
-static volatile bool g_system_feature_fragment_publish_enabled = false;
-static volatile bool g_system_feature_fragment_dirty = false;
-static volatile bool g_system_feature_fragment_service_armed = false;
-static uint32_t g_system_feature_fragment_publish_count = 0;
-static uint32_t g_system_feature_fragment_service_arm_count = 0;
-static uint32_t g_system_feature_fragment_service_arm_failures = 0;
 
 // Runtime court: feature-registry mutation and publication scheduling are
 // foreground-only.
@@ -233,7 +217,7 @@ static bool system_cstr_equal_ci(const char* a, const char* b) {
   return *a == *b;
 }
 
-// Public FEATURE_STATUS is the mission-readiness annunciator, not a dump of
+// The MONITOR feature tree is the mission-readiness annunciator, not a dump of
 // every diagnostic witness. QTIMER_DWT_RULER remains in the internal registry
 // and in INTERRUPT.REPORT_INTEGRITY, but its ISR-displacement-sensitive state
 // must not strobe the operator-facing feature tree.
@@ -275,53 +259,6 @@ bool system_feature_status_parse(const char* status,
   }
 
   return false;
-}
-
-static FLASHMEM void system_feature_fragment_publish_service(timepop_ctx_t*,
-                                                    timepop_diag_t*,
-                                                    void*) {
-  g_system_feature_fragment_service_armed = false;
-
-  if (!g_system_feature_fragment_publish_enabled ||
-      !g_system_feature_fragment_dirty) {
-    return;
-  }
-
-  g_system_feature_fragment_dirty = false;
-
-  Payload fragment = system_features_tree_payload();
-  publish("FEATURE_STATUS_FRAGMENT", fragment);
-  g_system_feature_fragment_publish_count++;
-
-  if (g_system_feature_fragment_dirty) {
-    system_feature_schedule_fragment_publish();
-  }
-}
-
-static void system_feature_schedule_fragment_publish(void) {
-  if (!g_system_feature_fragment_publish_enabled ||
-      !g_system_feature_fragment_dirty ||
-      g_system_feature_fragment_service_armed) {
-    return;
-  }
-
-  const timepop_handle_t handle =
-      timepop_arm_alap(system_feature_fragment_publish_service,
-                       nullptr,
-                       "SYSTEM_FEATURE_STATUS_FRAGMENT");
-
-  if (handle == TIMEPOP_INVALID_HANDLE) {
-    g_system_feature_fragment_service_arm_failures++;
-    return;
-  }
-
-  g_system_feature_fragment_service_armed = true;
-  g_system_feature_fragment_service_arm_count++;
-}
-
-static void system_feature_note_changed(void) {
-  g_system_feature_fragment_dirty = true;
-  system_feature_schedule_fragment_publish();
 }
 
 static int system_feature_find(const char* subsystem,
@@ -400,9 +337,6 @@ bool system_feature_set(const char* subsystem,
 
   slot.status = status;
   (void)detail;
-  if (system_feature_publicly_visible(slot)) {
-    system_feature_note_changed();
-  }
   return true;
 }
 
@@ -2719,11 +2653,6 @@ static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
   p.add("cpu_idle_witness_exit_count", idle.exit_count);
   p.add("cpu_idle_witness_last_residency_cycles", idle.last_residency_cycles);
 
-  p.add("feature_status_fragment_publish_count", g_system_feature_fragment_publish_count);
-  p.add("feature_status_fragment_dirty", (bool)g_system_feature_fragment_dirty);
-  p.add("feature_status_fragment_service_armed", (bool)g_system_feature_fragment_service_armed);
-  p.add("feature_status_fragment_service_arm_count", g_system_feature_fragment_service_arm_count);
-  p.add("feature_status_fragment_service_arm_failures", g_system_feature_fragment_service_arm_failures);
   p.add("feature_status_handler_reject_count",
         g_system_feature_handler_reject_count);
   p.add("feature_status_handler_last_ipsr",
@@ -3911,14 +3840,12 @@ static const process_vtable_t SYSTEM_PROCESS = {
 void process_system_register(void) {
   system_dmamem_ensure_initialized();
 
-  // Preserve feature states already published during early INTERRUPT/CLOCKS
+  // Preserve feature states already authored during early INTERRUPT/CLOCKS
   // hardware initialization.  The old unconditional registry reset occurred
   // after those publishers and erased their coherent boot evidence.
   system_feature_set("SYSTEM", "FEATURE_STATUS",
                      system_feature_status_t::NOMINAL,
                      "Teensy SYSTEM feature registry online");
   process_register("SYSTEM", &SYSTEM_PROCESS);
-  g_system_feature_fragment_publish_enabled = true;
-  system_feature_schedule_fragment_publish();
 
 }
