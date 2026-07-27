@@ -56,6 +56,104 @@ def pubsub_socket_path(subsystem: str) -> str:
 TEENSY_REQUEST_RESPONSE_SOCKET = "/tmp/zpnet_teensy_rt.sock"
 TEENSY_PUBLISH_SUBSCRIBE_SOCKET = "/tmp/zpnet_teensy_ps.sock"
 
+
+# Read-only local tap exposed by the Pi PUBSUB broker. Dashboard-style clients
+# use this surface to keep last-known-good topic snapshots without issuing
+# command/response requests during repaint.
+PUBSUB_TAP_SOCKET = "/tmp/zpnet_pubsub_tap.sock"
+
+
+class PubSubTapCache:
+    """Maintain latest payloads for a fixed set of local PUBSUB topics."""
+
+    def __init__(self, *topics: str, reconnect_s: float = 1.0):
+        normalized = tuple(sorted({str(topic) for topic in topics if str(topic)}))
+        if not normalized:
+            raise ValueError("at least one topic is required")
+        self._topics = normalized
+        self._reconnect_s = float(reconnect_s)
+        self._lock = threading.Lock()
+        self._payloads: Dict[str, Dict[str, Any]] = {}
+        self._updated_monotonic: Dict[str, float] = {}
+        self._error: Optional[str] = None
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> "PubSubTapCache":
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return self
+            self._thread = threading.Thread(
+                target=self._listen_loop,
+                name="zpnet-pubsub-tap-" + "-".join(t.lower() for t in self._topics),
+                daemon=True,
+            )
+            self._thread.start()
+        return self
+
+    def get(self, topic: str) -> Optional[Dict[str, Any]]:
+        self.start()
+        with self._lock:
+            payload = self._payloads.get(str(topic))
+            return dict(payload) if isinstance(payload, dict) else None
+
+    def age_s(self, topic: str) -> Optional[float]:
+        self.start()
+        with self._lock:
+            updated = self._updated_monotonic.get(str(topic))
+        return None if updated is None else max(0.0, time.monotonic() - updated)
+
+    def error(self) -> Optional[str]:
+        self.start()
+        with self._lock:
+            return self._error
+
+    def _listen_loop(self) -> None:
+        subscribe = (
+            json.dumps(
+                {"type": "set_topics", "topics": list(self._topics)},
+                separators=(",", ":"),
+            ).encode("utf-8")
+            + b"\n"
+        )
+
+        while True:
+            try:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                    sock.settimeout(2.0)
+                    sock.connect(PUBSUB_TAP_SOCKET)
+                    sock.settimeout(None)
+
+                    with sock.makefile("rwb") as stream:
+                        stream.write(subscribe)
+                        stream.flush()
+                        with self._lock:
+                            self._error = None
+
+                        for raw in stream:
+                            try:
+                                msg = json.loads(raw.decode("utf-8"))
+                            except Exception:
+                                continue
+                            if not isinstance(msg, dict) or msg.get("type") != "publish":
+                                continue
+                            topic = str(msg.get("topic") or "")
+                            payload = msg.get("payload")
+                            if topic not in self._topics or not isinstance(payload, dict):
+                                continue
+                            with self._lock:
+                                self._payloads[topic] = dict(payload)
+                                self._updated_monotonic[topic] = time.monotonic()
+                                self._error = None
+            except Exception as exc:
+                with self._lock:
+                    self._error = str(exc)
+                time.sleep(self._reconnect_s)
+
+
+def create_pubsub_cache(*topics: str, reconnect_s: float = 1.0) -> PubSubTapCache:
+    """Create and start a last-known-good cache for local PUBSUB topics."""
+    return PubSubTapCache(*topics, reconnect_s=reconnect_s).start()
+
 # =============================================================================
 # SERVER command relay socket
 # =============================================================================

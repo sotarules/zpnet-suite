@@ -12,18 +12,24 @@ from __future__ import annotations
 import math
 from collections.abc import Generator
 
-from zpnet.processes.processes import send_command
+from zpnet.processes.processes import create_pubsub_cache, send_command
 
 VREF = 5.0
 DAC_CODE_SCALE = 65536.0
 
+_MONITOR_TOPIC = "MONITOR"
+_TIMEBASE_TOPIC = "TIMEBASE"
+_LIVE_CACHE = create_pubsub_cache(_MONITOR_TOPIC, _TIMEBASE_TOPIC)
+
 
 def get_system_snapshot() -> dict:
-    return send_command(machine="PI", subsystem="SYSTEM", command="REPORT")["payload"]
+    """Return the latest unified MONITOR snapshot without issuing a command."""
+    return _LIVE_CACHE.get(_MONITOR_TOPIC) or {}
 
 
 def get_pi_clocks_report() -> dict:
-    return send_command(machine="PI", subsystem="CLOCKS", command="REPORT")["payload"]
+    """Return the latest accepted TIMEBASE publication without issuing a command."""
+    return _LIVE_CACHE.get(_TIMEBASE_TOPIC) or {}
 
 
 def _get_clocks_baseline() -> dict | None:

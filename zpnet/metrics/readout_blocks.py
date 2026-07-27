@@ -38,12 +38,9 @@ Column layout (INT rows):
   NAME   END_GNSS_NS   DELTA_NS
 """
 
-import json
-import socket
-import threading
 import time
 
-from zpnet.processes.processes import send_command
+from zpnet.processes.processes import create_pubsub_cache, send_command
 from zpnet.shared.db import open_db
 
 # AD5693R DAC doctrine mirrors firmware: internal 2.5 V reference with 2x
@@ -59,12 +56,12 @@ DAC_MAX_CODE = 65535.0
 FEATURE_GRID_COLUMNS = 4
 FEATURE_GRID_CELL_WIDTH = 39
 
-PUBSUB_TAP_SOCKET = "/tmp/zpnet_pubsub_tap.sock"
-FEATURE_STATUS_TOPIC = "FEATURE_STATUS"
-FEATURE_STATUS_RECONNECT_S = 1.0
-# Mission-control readiness board.  The feature payload remains scalar-only;
-# this table is just the operator-facing projection of the global PI SYSTEM
-# feature tree into the CLOCKS panel's empty space.
+MONITOR_TOPIC = "MONITOR"
+TIMEBASE_TOPIC = "TIMEBASE"
+_LIVE_CACHE = create_pubsub_cache(MONITOR_TOPIC, TIMEBASE_TOPIC)
+
+# Mission-control readiness board. The feature payload remains scalar-only;
+# this table is just the operator-facing projection of MONITOR.features.
 FEATURE_STATUS_GRID = (
     ("NET", "PI.SYSTEM.NETWORK"),
     ("BATTERY", "PI.SYSTEM.BATTERY"),
@@ -87,165 +84,34 @@ FEATURE_STATUS_GRID = (
     ("SENSORS", "PI.SYSTEM.SENSORS"),
 )
 
-_FEATURE_STATUS_CACHE: dict | None = None
-_FEATURE_STATUS_CACHE_TS = 0.0
-_FEATURE_STATUS_CACHE_ERROR: str | None = None
-_FEATURE_STATUS_THREAD: threading.Thread | None = None
-_FEATURE_STATUS_LOCK = threading.Lock()
-
-
 
 # ---------------------------------------------------------------------
 # Data fetchers
 # ---------------------------------------------------------------------
 
 def _get_system_snapshot() -> dict:
-    return send_command(machine="PI", subsystem="SYSTEM", command="REPORT")["payload"]
-
-
-def _feature_status_listener_loop() -> None:
-    """Background tap listener for the unified FEATURE_STATUS feed.
-
-    FEATURE_STATUS is a change-driven pub/sub snapshot authored by PI SYSTEM.
-    Metrics keeps the latest tree in memory and never polls SYSTEM.FEATURES once
-    the feed is alive.  A one-shot command fallback remains for cold start and
-    for direct tests when pubsub is not running yet.
-    """
-    global _FEATURE_STATUS_CACHE, _FEATURE_STATUS_CACHE_TS, _FEATURE_STATUS_CACHE_ERROR
-
-    subscribe = json.dumps(
-        {"type": "set_topics", "topics": [FEATURE_STATUS_TOPIC]},
-        separators=(",", ":"),
-    ).encode("utf-8") + b"\n"
-
-    while True:
-        try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-                sock.settimeout(2.0)
-                sock.connect(PUBSUB_TAP_SOCKET)
-                sock.settimeout(None)
-
-                with sock.makefile("rwb") as stream:
-                    stream.write(subscribe)
-                    stream.flush()
-
-                    with _FEATURE_STATUS_LOCK:
-                        _FEATURE_STATUS_CACHE_ERROR = None
-
-                    for raw in stream:
-                        try:
-                            msg = json.loads(raw.decode("utf-8"))
-                        except Exception:
-                            continue
-
-                        if not isinstance(msg, dict):
-                            continue
-                        if msg.get("type") != "publish":
-                            continue
-                        if msg.get("topic") != FEATURE_STATUS_TOPIC:
-                            continue
-
-                        payload = msg.get("payload")
-                        if not isinstance(payload, dict):
-                            continue
-
-                        with _FEATURE_STATUS_LOCK:
-                            _FEATURE_STATUS_CACHE = payload
-                            _FEATURE_STATUS_CACHE_TS = time.monotonic()
-                            _FEATURE_STATUS_CACHE_ERROR = None
-
-        except Exception as e:
-            with _FEATURE_STATUS_LOCK:
-                _FEATURE_STATUS_CACHE_ERROR = str(e)
-            time.sleep(FEATURE_STATUS_RECONNECT_S)
-
-
-def _ensure_feature_status_listener() -> None:
-    global _FEATURE_STATUS_THREAD
-
-    if _FEATURE_STATUS_THREAD is not None and _FEATURE_STATUS_THREAD.is_alive():
-        return
-
-    with _FEATURE_STATUS_LOCK:
-        if _FEATURE_STATUS_THREAD is not None and _FEATURE_STATUS_THREAD.is_alive():
-            return
-        _FEATURE_STATUS_THREAD = threading.Thread(
-            target=_feature_status_listener_loop,
-            name="zpnet-feature-status-listener",
-            daemon=True,
-        )
-        _FEATURE_STATUS_THREAD.start()
+    """Return latest MONITOR without command/response traffic."""
+    return _LIVE_CACHE.get(MONITOR_TOPIC) or {}
 
 
 def _get_feature_status_payload(force: bool = False) -> tuple[dict, str | None]:
-    """Return the global PI SYSTEM feature tree from FEATURE_STATUS.
-
-    The normal path is the pubsub tap.  Command/response is retained only as a
-    cold-start seed or explicit force-refresh; it is not used as a repaint-time
-    polling loop.
-    """
-    global _FEATURE_STATUS_CACHE, _FEATURE_STATUS_CACHE_TS, _FEATURE_STATUS_CACHE_ERROR
-
-    _ensure_feature_status_listener()
-
-    now = time.monotonic()
-    with _FEATURE_STATUS_LOCK:
-        cached = _FEATURE_STATUS_CACHE
-        error = _FEATURE_STATUS_CACHE_ERROR
-
-
-    try:
-        resp = send_command(machine="PI", subsystem="SYSTEM", command="FEATURES")
-        if not resp.get("success", True):
-            raise RuntimeError(resp.get("message") or "PI SYSTEM FEATURES failed")
-        payload = resp.get("payload", {})
-        if not isinstance(payload, dict):
-            raise RuntimeError("PI SYSTEM FEATURES returned a non-object payload")
-
-        with _FEATURE_STATUS_LOCK:
-            _FEATURE_STATUS_CACHE = payload
-            _FEATURE_STATUS_CACHE_TS = now
-            _FEATURE_STATUS_CACHE_ERROR = None
-        return payload, None
-
-    except Exception as e:
-        with _FEATURE_STATUS_LOCK:
-            _FEATURE_STATUS_CACHE_TS = now
-            _FEATURE_STATUS_CACHE_ERROR = str(e)
-            cached = _FEATURE_STATUS_CACHE
-            error = _FEATURE_STATUS_CACHE_ERROR
-
-        if cached is not None:
-            return cached, error
-        return {}, error
+    """Return the feature tree carried by the latest MONITOR snapshot."""
+    _ = force
+    monitor = _get_system_snapshot()
+    features = monitor.get("features")
+    if isinstance(features, dict):
+        return features, None
+    return {}, _LIVE_CACHE.error()
 
 
 def _get_pi_clocks_report() -> dict:
-    return send_command(machine="PI", subsystem="CLOCKS", command="REPORT")["payload"]
+    """Return latest accepted TIMEBASE without command/response traffic."""
+    return _LIVE_CACHE.get(TIMEBASE_TOPIC) or {}
 
 
 def _get_pi_clocks_report_dac() -> dict:
-    # Servo/DAC telemetry no longer has a separate pub/sub feed.  Metrics reads
-    # the compact DAC persistence object already present in TIMEBASE/CLOCKS
-    # reports, and focused REPORT_DAC remains an explicit operator command.
+    # Servo/DAC telemetry is already present in TIMEBASE.
     return {}
-
-
-def _get_pi_gnss_report() -> dict:
-    return send_command(machine="PI", subsystem="GNSS", command="REPORT")["payload"]
-
-
-def _get_clocks_baseline() -> dict | None:
-    try:
-        resp = send_command(machine="PI", subsystem="CLOCKS", command="BASELINE_INFO")
-        if resp.get("success"):
-            p = resp.get("payload", {})
-            if p.get("baseline_set"):
-                return p
-    except Exception:
-        pass
-    return None
-
 
 
 # ---------------------------------------------------------------------
@@ -392,12 +258,9 @@ def _gnss_from_system_snapshot(snapshot: dict) -> dict:
 
 
 def _gnss_status(r: dict | None = None, snapshot: dict | None = None) -> dict:
-    # Priority order:
-    #   1. Direct PI/GNSS report, if available.
-    #   2. Current TIMEBASE record carried by the CLOCKS report.
-    #   3. Consolidated SYSTEM report as a compatibility fallback.
+    # TIMEBASE owns accepted clock-correlated GNSS evidence. MONITOR supplies
+    # the broader last-known-good receiver snapshot.
     g: dict = {}
-    _merge_missing(g, _gnss_from_direct_report())
     if r is not None:
         _merge_missing(g, _gnss_from_timebase(r))
     if snapshot is not None:

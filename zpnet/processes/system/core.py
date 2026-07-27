@@ -2,19 +2,17 @@
 ZPNet SYSTEM Process (Pi-side, authoritative aggregator)
 
 Responsibilities:
-  • Query authoritative SYSTEM state from the Teensy
-  • Collect Raspberry Pi host metrics
-  • Maintain last-known-good SYSTEM snapshot
-  • Expose SYSTEM.REPORT
-  • Emit SYSTEM_STATUS events on fixed cadence
-  • Publish FEATURE_STATUS whenever readiness state changes
-  • Republish FEATURE_STATUS periodically even when quiescent
+  • Consume the PPS-aligned Teensy MONITOR_FRAGMENT feed
+  • Collect Raspberry Pi host metrics on a slower local cadence
+  • Decorate each Teensy fragment with last-known-good Pi-owned state
+  • Publish one unified MONITOR snapshot per Teensy campaign second
+  • Preserve SYSTEM.REPORT and FEATURE_STATUS during staged migration
 
 Process model:
   • One systemd service
-  • One polling thread
+  • One Pi-context polling thread
   • One blocking command socket
-  • One FEATURE_STATUS_FRAGMENT subscription from Teensy SYSTEM
+  • MONITOR_FRAGMENT and transitional FEATURE_STATUS_FRAGMENT subscriptions
 """
 
 from __future__ import annotations
@@ -1456,115 +1454,84 @@ def build_battery_status() -> dict:
 
 
 # ------------------------------------------------------------------
-# Teensy status helpers (migrated from teensy_monitor)
+# Pi context poller and MONITOR aggregation
 # ------------------------------------------------------------------
 
-def build_teensy_status() -> dict:
-    response = send_command(machine="TEENSY", subsystem="SYSTEM", command="REPORT")
-    payload = response["payload"]
-    payload["health_state"] = "NOMINAL"
-    return payload
+def _dict_copy(value: Any) -> dict:
+    return dict(value) if isinstance(value, dict) else {}
 
 
-def build_clocks_status() -> dict:
-    response = send_command(machine="TEENSY", subsystem="CLOCKS", command="REPORT")
-    payload = response["payload"]
-    payload["health_state"] = "NOMINAL"
-    return payload
+def _monitor_fragment_count(fragment: Dict[str, Any]) -> Optional[int]:
+    for key in ("sequence", "teensy_pps_vclock_count", "teensy_pps_count", "pps_count"):
+        value = fragment.get(key)
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
-def build_transport_status() -> dict:
-    response = send_command(machine="TEENSY", subsystem="SYSTEM", command="TRANSPORT_INFO")
-    payload = response["payload"]
-    payload["health_state"] = "NOMINAL"
-    return payload
+def _monitor_fragment_teensy(fragment: Dict[str, Any]) -> dict:
+    for key in ("teensy", "system"):
+        value = fragment.get(key)
+        if isinstance(value, dict):
+            return dict(value)
+    return {}
 
 
-def build_payload_status() -> dict:
-    response = send_command(machine="TEENSY", subsystem="SYSTEM", command="PAYLOAD_INFO")
-    payload = response["payload"]
-    payload["health_state"] = "NOMINAL"
-    return payload
+def _update_pi_context(snapshot: Dict[str, Any]) -> None:
+    """Replace Pi-owned context while preserving the latest Teensy fragment."""
+    global SYSTEM
+    with _SYSTEM_LOCK:
+        current = dict(SYSTEM)
+        current.update(snapshot)
+        current["features"] = _feature_tree_snapshot()
+        SYSTEM = current
 
-
-def build_memory_status() -> dict:
-    response = send_command(machine="TEENSY", subsystem="SYSTEM", command="MEMORY_INFO")
-    payload = response["payload"]
-    payload["health_state"] = "NOMINAL"
-    return payload
-
-
-def build_process_status() -> dict:
-    response = send_command(machine="TEENSY", subsystem="SYSTEM", command="PROCESS_INFO")
-    payload = response["payload"]
-    payload["health_state"] = "NOMINAL"
-    return payload
-
-# ------------------------------------------------------------------
-# System poller thread
-# ------------------------------------------------------------------
 
 def system_poller() -> None:
-    global SYSTEM
+    """Refresh only Pi-owned operational context.
 
+    This thread deliberately issues no recurring Teensy commands. The current
+    Teensy/process/transport/Payload surfaces arrive through MONITOR_FRAGMENT.
+    """
     try:
         while True:
-
             pi_payload = build_pi_status()
-            teensy_payload = build_teensy_status()
             network_payload = build_network_status()
-            # laser_payload = build_laser_status()
             sensor_payload = build_sensor_scan_status()
             environment_payload = build_environment_status()
             gnss_payload = build_gnss_status()
             power_payload = build_power_status()
             battery_payload = build_battery_status()
-            clocks_payload = build_clocks_status()
-            transport_payload = build_transport_status()
-            payload_payload = build_payload_status()
-            # MULE: do not ask for memory information too dangerous because of mallinfo
-            #memory_payload = build_memory_status()
-            process_payload = build_process_status()
-
-            teensy_features = _teensy_feature_tree_from_report(teensy_payload)
-            if teensy_features:
-                _replace_teensy_feature_tree(teensy_features)
 
             _update_builtin_pi_features(
-                pi_payload=pi_payload, network_payload=network_payload,
-                sensor_payload=sensor_payload, environment_payload=environment_payload,
-                gnss_payload=gnss_payload, power_payload=power_payload,
+                pi_payload=pi_payload,
+                network_payload=network_payload,
+                sensor_payload=sensor_payload,
+                environment_payload=environment_payload,
+                gnss_payload=gnss_payload,
+                power_payload=power_payload,
                 battery_payload=battery_payload,
                 teensy_features_available=bool(_teensy_feature_tree_snapshot()),
             )
-            features = _feature_tree_snapshot()
-            snapshot = {
+
+            _update_pi_context({
                 "pi": dict(pi_payload),
-                "teensy": dict(teensy_payload),
                 "network": dict(network_payload),
-                # "laser": dict(laser_payload),
                 "sensors": dict(sensor_payload),
                 "environment": dict(environment_payload),
                 "gnss": dict(gnss_payload),
                 "power": dict(power_payload),
                 "battery": dict(battery_payload),
-                "clocks": dict(clocks_payload),
-                "transport": dict(transport_payload),
-                "payload": dict(payload_payload),
-                #"memory": dict(memory_payload),
-                "process": dict(process_payload),
-                "features": features,
-            }
+            })
 
+            _publish_feature_status_if_changed()
             with _SYSTEM_LOCK:
-                SYSTEM = snapshot
-
-            _publish_feature_status_if_changed(features)
-            # ----------------------------------------------------------
-            # Emit consolidated system event
-            # ----------------------------------------------------------
-            create_event("SYSTEM_STATUS", dict(SYSTEM))
-
+                snapshot = dict(SYSTEM)
+            create_event("SYSTEM_STATUS", snapshot)
             time.sleep(POLL_INTERVAL_SEC)
 
     except Exception:
@@ -1575,8 +1542,59 @@ def system_poller() -> None:
 # Pub/Sub handlers
 # ------------------------------------------------------------------
 
+def on_monitor_fragment(payload: Optional[dict]) -> None:
+    """Decorate one Teensy MONITOR_FRAGMENT and rebroadcast it as MONITOR."""
+    global SYSTEM
+
+    if not isinstance(payload, dict):
+        logging.warning("[system] ignoring malformed MONITOR_FRAGMENT: %r", payload)
+        return
+
+    fragment = dict(payload)
+    count = _monitor_fragment_count(fragment)
+
+    teensy_features = _copy_feature_tree(fragment.get("features"))
+    if teensy_features:
+        _replace_teensy_feature_tree(teensy_features)
+
+    features = _feature_tree_snapshot()
+    with _SYSTEM_LOCK:
+        current = dict(SYSTEM)
+
+    monitor = {
+        "schema": "MONITOR_V1",
+        "source_schema": fragment.get("schema"),
+        "sequence": count,
+        "teensy_pps_vclock_count": count,
+        "teensy_pps_count": count,
+        "pps_count": count,
+        "published_at_utc": datetime.datetime.now(datetime.timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z"),
+        "pi": _dict_copy(current.get("pi")),
+        "network": _dict_copy(current.get("network")),
+        "sensors": _dict_copy(current.get("sensors")),
+        "environment": _dict_copy(current.get("environment")),
+        "gnss": _dict_copy(current.get("gnss")),
+        "power": _dict_copy(current.get("power")),
+        "battery": _dict_copy(current.get("battery")),
+        "teensy": _monitor_fragment_teensy(fragment),
+        "process": _dict_copy(fragment.get("process")),
+        "transport": _dict_copy(fragment.get("transport")),
+        "payload": _dict_copy(fragment.get("payload")),
+        "features": features,
+        "monitor_fragment": fragment,
+    }
+
+    with _SYSTEM_LOCK:
+        SYSTEM = dict(monitor)
+
+    _publish_feature_status_if_changed(features)
+    publish("MONITOR", monitor)
+
+
 def on_feature_status_fragment(payload: Optional[dict]) -> None:
-    """Consume Teensy FEATURE_STATUS_FRAGMENT and relay the unified tree."""
+    """Consume the transitional Teensy feature feed during staged rollout."""
     if not isinstance(payload, dict):
         logging.warning("[system] ignoring malformed FEATURE_STATUS_FRAGMENT: %r", payload)
         return
@@ -1739,6 +1757,7 @@ def run() -> None:
             subsystem="SYSTEM",
             commands=COMMANDS,
             subscriptions={
+                "MONITOR_FRAGMENT": on_monitor_fragment,
                 "FEATURE_STATUS_FRAGMENT": on_feature_status_fragment,
             },
             blocking=False,
