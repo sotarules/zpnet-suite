@@ -405,7 +405,7 @@ def update(audit: Audit, prev: Optional[CompactRow], cur: CompactRow) -> None:
         ("ocxo1", cur.ocxo1_interval_ns, cur.ocxo1_residual_ns, cur.ocxo1_valid),
         ("ocxo2", cur.ocxo2_interval_ns, cur.ocxo2_residual_ns, cur.ocxo2_valid),
     ):
-        if interval is not None:
+        if interval is not None and valid is True:
             audit.stats[f"{lane}_interval"].update(float(interval))
             deviation = interval - NS_PER_SECOND
             if abs(deviation) > OCXO_SECOND_ALARM_NS:
@@ -415,12 +415,14 @@ def update(audit: Audit, prev: Optional[CompactRow], cur: CompactRow) -> None:
                     f"{lane.upper()} interval",
                     f"pps={cur.pps} interval={interval} deviation={deviation:+d} valid={valid}",
                 )
-        if residual is not None:
+        if residual is not None and valid is True:
             audit.stats[f"{lane}_residual"].update(float(residual))
 
     if (
         cur.ocxo1_residual_ns is not None
         and cur.ocxo2_residual_ns is not None
+        and cur.ocxo1_valid is True
+        and cur.ocxo2_valid is True
         and not cur.recovery_hold
     ):
         audit.stats["ocxo_divergence"].update(
