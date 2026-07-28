@@ -1,28 +1,9 @@
 """
-ZPNet Raw PPB — naive vs GNSS-confession-corrected running PPB.
+ZPNet Raw PPB — canonical running OCXO PPB.
 
 Reads TIMEBASE rows for one campaign and prints one line per campaign PPS row
-for the two OCXO lanes.  Every row shows the one-second fast residual and the
-running cumulative PPB two ways, side by side:
-
-  naive      — the residual exactly as measured against the PPS/VCLOCK
-               reference (what raw_ppb always showed).
-  corrected  — the same residual with the GF-8802's own published PPS
-               placement change subtracted:
-
-                   res_corrected(t) = res(t) - [g_pps_err(t) - g_pps_err(t-1)]
-
-The idea: g_pps_err is the receiver's running confession of where its PPS
-pulse actually landed relative to true GNSS time.  When that value is FLAT the
-yardstick's frequency is honest (whatever its level).  When it MOVES, the
-interval between pulses was stretched or shrunk by exactly the amount it
-moved, and that amount is deposited into every clock's residual as a fake
-frequency excursion.  Subtracting the per-row change intercepts the deposit
-before it enters the ledger, so corrected PPB holds steady through receiver
-steering events instead of walking away and slowly crawling back at 1/T.
-
-The correction is always on.  Both columns are always printed so the naive
-surface remains auditable.
+for the two OCXO lanes. Every row shows the canonical one-second fast residual
+and its running cumulative mean in ns/s, numerically equivalent to PPB.
 
 Usage:
     python -m zpnet.tests.raw_ppb <campaign_name>
@@ -30,33 +11,16 @@ Usage:
 
 Columns:
     pps       Campaign PPS/VCLOCK row identity.
-    o1_res    OCXO1 one-second fast residual, ns.  Positive means fast.
-    o1_cres   OCXO1 corrected residual (confession delta subtracted).
-    o1_ppb    Running cumulative mean of naive residuals (ns/s == ppb).
-    o1_cppb   Running cumulative mean of corrected residuals.
-    o2_*      Same four for OCXO2.
-    g_err     gnss.pps_timing_error_ns — the receiver's confession: its own
-              estimate of this PPS pulse's placement error vs true GNSS time.
-    d_g       Per-row change in g_err.  This exact value is what gets
-              subtracted from each lane's residual on this row.
-    g_acc     gnss.estimated_accuracy_ns — receiver's estimate of its own
-              time accuracy (context for how much UNconfessed wander exists).
-    g_frq     gnss.freq_error_ppb — receiver's coarse estimate of its output
-              frequency error (quantized; corroborates events).
-    g_clk     gnss.clock_drift_ppb — receiver internal crystal drift vs GNSS
-              (thermal proxy for the receiver).
-    g_raw     extra_clocks.gnss_raw_drift_ppb — raw receiver crystal drift
-              (another thermal proxy; useful against slow common-mode swell).
-    fl        Row flags:
-                c   correction applied this row (d_g != 0)
-                S   confession step exceeded the segment gate (treated as a
-                    solution redefinition, NOT corrected; segment boundary)
-                g   PPS gap before this row (no correction across a gap)
-                m   g_err missing this row (no correction possible)
-
-What the correction does NOT fix: only confessed error is corrected.  Slow
-reference/environment wander that g_pps_err does not narrate passes through
-both columns identically and is only tamed by integration time.
+    o1_res    OCXO1 canonical one-second fast residual, ns.
+    o1_ppb    OCXO1 running cumulative mean residual, ppb.
+    o2_res    OCXO2 canonical one-second fast residual, ns.
+    o2_ppb    OCXO2 running cumulative mean residual, ppb.
+    pps_err   GF-8802 pps_timing_error_ns, retained as receiver telemetry.
+    g_acc     GF-8802 estimated_accuracy_ns.
+    g_frq     GF-8802 output-frequency-error estimate.
+    g_clk     GF-8802 internal crystal drift.
+    g_raw     Pi-owned GNSS_RAW drift.
+    fl        "g" when the campaign PPS identity contains a gap, "." otherwise.
 
 This report intentionally computes no tau and no Welfords.
 """
@@ -74,13 +38,6 @@ from zpnet.shared.db import open_db
 NS_PER_SECOND = 1_000_000_000
 LANE_KEYS = {"OCXO1": "ocxo1", "OCXO2": "ocxo2"}
 LANE_MICRO_PREFIXES = {"ocxo1": "o1", "ocxo2": "o2"}
-
-# A single-row confession step at or beyond this many ns is treated as a
-# receiver solution redefinition (reacquisition / mode change), not steering.
-# Delta-correction is only lawful for steering; redefinitions are segment
-# boundaries and are flagged instead of corrected.
-SEGMENT_STEP_GATE_NS = 50.0
-
 
 # -----------------------------------------------------------------------------
 # Database and schema helpers
@@ -291,13 +248,13 @@ def _micro_first_int(root: Dict[str, Any],
 
 def gnss_discipline_fields(root: Dict[str, Any],
                            frag: Dict[str, Any]) -> Dict[str, Optional[float]]:
-    """GNSS receiver discipline fields for reference-movement accounting."""
+    """GNSS receiver discipline fields retained as contextual telemetry."""
     gnss = root.get("gnss") if isinstance(root.get("gnss"), dict) else {}
     frag_gnss = frag.get("gnss") if isinstance(frag.get("gnss"), dict) else {}
     extra = root.get("extra_clocks") if isinstance(root.get("extra_clocks"), dict) else {}
 
     return {
-        "g_err": _first_float(gnss.get("pps_timing_error_ns"), frag_gnss.get("pps_timing_error_ns")),
+        "pps_err": _first_float(gnss.get("pps_timing_error_ns"), frag_gnss.get("pps_timing_error_ns")),
         "g_acc": _first_float(gnss.get("estimated_accuracy_ns"), frag_gnss.get("estimated_accuracy_ns")),
         "g_frq": _first_float(gnss.get("freq_error_ppb"), frag_gnss.get("freq_error_ppb")),
         "g_clk": _first_float(gnss.get("clock_drift_ppb"), frag_gnss.get("clock_drift_ppb")),
@@ -368,19 +325,11 @@ def collect_rows(records: Iterable[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]
         "records_seen": 0,
         "rows_collected": 0,
         "gaps": 0,
-        "corrected_rows": 0,
-        "segment_steps": 0,
-        "g_err_missing": 0,
-        "correction_abs_total_ns": 0.0,
-        "g_err_first": None,
-        "g_err_last": None,
     }
 
-    naive = {"OCXO1": RunningMean(), "OCXO2": RunningMean()}
-    corrected = {"OCXO1": RunningMean(), "OCXO2": RunningMean()}
+    running = {"OCXO1": RunningMean(), "OCXO2": RunningMean()}
 
     prev_pps: Optional[int] = None
-    prev_g_err: Optional[float] = None
 
     for rec in records:
         stats["records_seen"] += 1
@@ -394,46 +343,15 @@ def collect_rows(records: Iterable[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]
         gap = prev_pps is not None and pps != prev_pps + 1
         if gap:
             stats["gaps"] += 1
-            # A gap breaks confession continuity; do not delta across it.
-            prev_g_err = None
 
         ref = selected_reference_cycles(root, frag, forensic)
         o1_res = ocxo_residual(root, frag, forensic, "OCXO1", ref)
         o2_res = ocxo_residual(root, frag, forensic, "OCXO2", ref)
         g = gnss_discipline_fields(root, frag)
-        g_err = g["g_err"]
 
-        if g_err is not None:
-            if stats["g_err_first"] is None:
-                stats["g_err_first"] = g_err
-            stats["g_err_last"] = g_err
-
-        # --- confession delta ---------------------------------------------
-        d_g: Optional[float] = None
-        segment_step = False
-        if g_err is None:
-            stats["g_err_missing"] += 1
-        elif prev_g_err is not None:
-            d_g = g_err - prev_g_err
-            if abs(d_g) >= SEGMENT_STEP_GATE_NS:
-                # Solution redefinition, not steering.  Correction is not
-                # lawful; mark the boundary and pass the row through naive.
-                segment_step = True
-                stats["segment_steps"] += 1
-                d_g = None
-
-        correction = d_g if d_g is not None else 0.0
-        if d_g is not None and d_g != 0.0:
-            stats["corrected_rows"] += 1
-            stats["correction_abs_total_ns"] += abs(d_g)
-
-        # --- residuals, naive and corrected --------------------------------
         row: Dict[str, Any] = {
             "pps": pps,
             "gap": gap,
-            "segment_step": segment_step,
-            "g_err_missing": g_err is None,
-            "d_g": d_g,
             **g,
         }
 
@@ -441,23 +359,14 @@ def collect_rows(records: Iterable[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]
             prefix = "o1" if clock == "OCXO1" else "o2"
             row[f"{prefix}_res"] = res
             if res is not None:
-                naive[clock].add(res)
-                cres = float(res) - correction
-                corrected[clock].add(cres)
-                row[f"{prefix}_cres"] = cres
-            else:
-                row[f"{prefix}_cres"] = None
-            row[f"{prefix}_ppb"] = naive[clock].mean
-            row[f"{prefix}_cppb"] = corrected[clock].mean
+                running[clock].add(res)
+            row[f"{prefix}_ppb"] = running[clock].mean
 
         rows.append(row)
         stats["rows_collected"] += 1
         prev_pps = pps
-        if g_err is not None:
-            prev_g_err = g_err
 
-    stats["naive"] = naive
-    stats["corrected"] = corrected
+    stats["running"] = running
     return rows, stats
 
 
@@ -467,31 +376,17 @@ def collect_rows(records: Iterable[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]
 
 
 def _row_flags(row: Dict[str, Any]) -> str:
-    flags = ""
-    if row.get("d_g") not in (None, 0.0):
-        flags += "c"
-    if row.get("segment_step"):
-        flags += "S"
-    if row.get("gap"):
-        flags += "g"
-    if row.get("g_err_missing"):
-        flags += "m"
-    return flags if flags else "."
+    return "g" if row.get("gap") else "."
 
 
 def print_table(rows: List[Dict[str, Any]]) -> None:
     columns = [
         ("pps", lambda r: _fmt_int(r.get("pps"))),
         ("o1_res", lambda r: _fmt_int(r.get("o1_res"), signed=True)),
-        ("o1_cres", lambda r: _fmt_float(r.get("o1_cres"), decimals=1, signed=True)),
         ("o1_ppb", lambda r: _fmt_float(r.get("o1_ppb"), signed=True)),
-        ("o1_cppb", lambda r: _fmt_float(r.get("o1_cppb"), signed=True)),
         ("o2_res", lambda r: _fmt_int(r.get("o2_res"), signed=True)),
-        ("o2_cres", lambda r: _fmt_float(r.get("o2_cres"), decimals=1, signed=True)),
         ("o2_ppb", lambda r: _fmt_float(r.get("o2_ppb"), signed=True)),
-        ("o2_cppb", lambda r: _fmt_float(r.get("o2_cppb"), signed=True)),
-        ("g_err", lambda r: _fmt_float(r.get("g_err"), decimals=1, signed=True)),
-        ("d_g", lambda r: _fmt_float(r.get("d_g"), decimals=1, signed=True)),
+        ("pps_err", lambda r: _fmt_float(r.get("pps_err"), decimals=1, signed=True)),
         ("g_acc", lambda r: _fmt_float(r.get("g_acc"), decimals=1)),
         ("g_frq", lambda r: _fmt_float(r.get("g_frq"), decimals=1, signed=True)),
         ("g_clk", lambda r: _fmt_float(r.get("g_clk"), decimals=3, signed=True)),
@@ -525,55 +420,27 @@ def analyze(campaign: str) -> None:
 
     print_table(rows)
 
-    naive = stats["naive"]
-    corrected = stats["corrected"]
-
-    print()
-    print("Correction audit")
-    print("════════════════")
-    print(f"  rows corrected (d_g != 0)     : {stats['corrected_rows']:,}")
-    print(f"  total |correction| applied    : {stats['correction_abs_total_ns']:,.1f} ns")
-    print(f"  segment steps (>= {SEGMENT_STEP_GATE_NS:.0f} ns gate) : {stats['segment_steps']:,}")
-    print(f"  rows with g_err missing       : {stats['g_err_missing']:,}")
-    g0, g1 = stats["g_err_first"], stats["g_err_last"]
-    if g0 is not None and g1 is not None and naive["OCXO1"].n:
-        net = g1 - g0
-        print(f"  confession endpoints          : {g0:+.1f} -> {g1:+.1f} ns  (net {net:+.1f} ns)")
-        print(f"  max naive-vs-corrected final  : {abs(net) / naive['OCXO1'].n:.4f} ppb "
-              f"(net confession / {naive['OCXO1'].n:,} s — the telescoped bound)")
+    running = stats["running"]
 
     print()
     print("Final PPB")
     print("═════════")
-    for clock, prefix in (("OCXO1", "o1"), ("OCXO2", "o2")):
-        n_ppb = naive[clock].mean
-        c_ppb = corrected[clock].mean
-        d = (c_ppb - n_ppb) if (n_ppb is not None and c_ppb is not None) else None
-        print(f"  {clock}: naive {_fmt_float(n_ppb, 0, 3, signed=True)}   "
-              f"corrected {_fmt_float(c_ppb, 0, 3, signed=True)}   "
-              f"(corrected-naive {_fmt_float(d, 0, 4, signed=True)})")
+    for clock in ("OCXO1", "OCXO2"):
+        print(f"  {clock}: {_fmt_float(running[clock].mean, 0, 3, signed=True)}")
 
     print()
     print("Notes")
     print("═════")
-    print("  • res_corrected(t) = res(t) - [g_err(t) - g_err(t-1)].  The correction is")
-    print("    applied to every row; on flat-confession rows it is zero by construction.")
-    print("  • g_err (gnss.pps_timing_error_ns) is the receiver's own running estimate of")
-    print("    where its PPS pulse landed relative to true GNSS time — its confession.")
-    print("    Its LEVEL is harmless to frequency; only its CHANGES stretch the yardstick.")
-    print("  • The two running means converge as the confession returns toward its start:")
-    print("    the total possible difference is (final - first confession) / campaign_s.")
-    print("  • g_acc (estimated_accuracy_ns) is the receiver's claim about its own time")
-    print("    accuracy — a ceiling on how much UNconfessed wander to expect.  The")
-    print("    correction only launders confessed error; slow unconfessed wander passes")
-    print("    through both columns and is only tamed by integration time.")
+    print("  • OCXO residual and PPB values come from the canonical Teensy-authored")
+    print("    science surface, with raw cycle evidence used only as a schema fallback.")
+    print("  • pps_err (gnss.pps_timing_error_ns) remains visible as receiver telemetry;")
+    print("    it is not applied to OCXO residuals or accumulated PPB.")
+    print("  • g_acc (estimated_accuracy_ns) is the receiver's time-accuracy estimate.")
     print("  • g_frq (freq_error_ppb) is the receiver's coarse output-frequency-error")
-    print("    estimate; it typically pulses during the same events g_err narrates.")
+    print("    estimate.")
     print("  • g_clk (clock_drift_ppb) and g_raw (extra_clocks.gnss_raw_drift_ppb) are")
     print("    receiver-crystal drift measures — thermal proxies, useful when deciding")
     print("    whether slow common-mode wander is GNSS or enclosure temperature.")
-    print("  • Confession steps >= the segment gate are treated as solution")
-    print("    redefinitions (reacquisition/mode change): flagged 'S', never corrected.")
     print("  • Positive residual means the OCXO is running fast (project convention).")
 
 
