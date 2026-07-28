@@ -28,7 +28,6 @@
 #include "process_system.h"
 
 #include "debug.h"
-#include "timebase.h"
 #include "time.h"
 
 #include "payload.h"
@@ -8197,7 +8196,6 @@ bool clocks_alpha_begin_smartzero_epoch(const char* reason) {
     // system to preserve. Retain the old cleanup only for first-ever acquisition.
     alpha_reset_canonical_clock_state_for_new_epoch();
     g_epoch_initialized = false;
-    timebase_invalidate();
     time_pps_vclock_epoch_reset(0, 0);
     time_clock_reset_all();
     g_alpha_smartzero_begin_cold_count++;
@@ -9350,7 +9348,6 @@ static void subscribe_clock(interrupt_subscriber_kind_t kind,
 }
 
 void process_clocks_init(void) {
-  timebase_init();
   clocks_beta_features_init();
 
   // Startup epoch is installed locally by alpha from the first valid

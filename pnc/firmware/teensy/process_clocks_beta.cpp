@@ -66,7 +66,6 @@
 #include "process_system.h"
 
 #include "debug.h"
-#include "timebase.h"
 #include "time.h"
 
 #include "payload.h"
@@ -2886,7 +2885,6 @@ static void recover_lifecycle_abort(const char* reason) {
   clocks_watchdog_clear_surrender_for_new_lifecycle();
   campaign_state = clocks_campaign_state_t::STOPPED;
   campaign_warmup_reset();
-  timebase_invalidate();
 }
 
 static uint64_t campaign_public_dwt_total(void) {
@@ -6634,7 +6632,6 @@ static void campaign_start_prologue_abort_launch(const char* reason) {
   calibrate_ocxo_mode = servo_mode_t::OFF;
   clocks_watchdog_clear_surrender_for_new_lifecycle();
   ocxo_dac_pacing_abort_all();
-  timebase_invalidate();
 }
 
 static bool campaign_start_prologue_should_hold(
@@ -8511,7 +8508,6 @@ static void clocks_force_stop_campaign(void) {
   calibrate_ocxo_mode = servo_mode_t::OFF;
   ocxo_dac_pacing_abort_all();
   campaign_warmup_reset();
-  timebase_invalidate();
 }
 
 static bool clocks_watchdog_surrender_now(const char* reason,
@@ -8718,7 +8714,6 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
   if (request_stop) {
     g_timebase_stop_gate_count++;
     timebase_build_stage(TIMEBASE_BUILD_STAGE_STOP_GATE);
-    const bool was_started = (campaign_state == clocks_campaign_state_t::STARTED);
     clocks_watchdog_clear_surrender_for_new_lifecycle();
     clocks_science_reject_clear();
     campaign_state = clocks_campaign_state_t::STOPPED;
@@ -8728,9 +8723,6 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
     calibrate_ocxo_mode = servo_mode_t::OFF;
     ocxo_dac_pacing_abort_all();
     campaign_warmup_reset();
-    if (was_started) {
-      timebase_invalidate();
-    }
     publish_dac_tick("STOP_GATE");
     return;
   }
@@ -14455,19 +14447,10 @@ static const process_command_entry_t CLOCKS_COMMANDS[] = {
   { nullptr,              nullptr               }
 };
 
-static const process_subscription_entry_t CLOCKS_SUBSCRIPTIONS[] = {
-  { "TIMEBASE_FRAGMENT", on_timebase_fragment },
-  { nullptr, nullptr },
-};
-
-const process_subscription_entry_t* timebase_subscriptions(void) {
-  return CLOCKS_SUBSCRIPTIONS;
-}
-
 static const process_vtable_t CLOCKS_PROCESS = {
   .process_id    = "CLOCKS",
   .commands      = CLOCKS_COMMANDS,
-  .subscriptions = CLOCKS_SUBSCRIPTIONS
+  .subscriptions = nullptr
 };
 
 void process_clocks_register(void) {

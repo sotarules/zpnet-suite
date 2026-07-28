@@ -77,7 +77,6 @@ set(ZPNET_SOURCES
     process_time.cpp
     publish.cpp
     teensy.cpp
-    timebase.cpp
     transport.cpp
     util.cpp
     teensy.ino
@@ -106,7 +105,6 @@ set(ZPNET_HEADERS
     process_timepop.h
     process_time.h
     publish.h
-    timebase.h
     timepop.h
     transport.h
     util.h
