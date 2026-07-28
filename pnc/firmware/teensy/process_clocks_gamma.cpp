@@ -1,32 +1,33 @@
 // ============================================================================
-// process_time.cpp -- TIME compatibility anchor and projection backing store
+// process_clocks_gamma.cpp -- CLOCKS support layer
 // ============================================================================
 //
-// process_time remains alive.  It owns the live PPS/VCLOCK anchor consumed by
-// TimePop through time_anchor_snapshot(), plus the per-clock projection backing
-// store consumed by the TIME facade.
+// Gamma owns the live PPS/VCLOCK anchor consumed by TimePop through
+// time_anchor_snapshot(), plus the per-clock projection backing store consumed
+// by the TIME facade.
 //
-// Retired behavior has been removed from this file:
+// Gamma is not a registered process and exposes no command surface.  The public
+// time_* interface remains in time.h so all existing callers retain the same
+// symbols and behavior.
+//
+// Retired behavior remains retired:
 //   * dynamic-CPS prediction
 //   * prior-second prediction history
 //   * prediction-detail reports
 //   * legacy conversion aliases
 //
-// CLOCKS/Alpha now owns the real four-rail prediction audit, and CLOCKS/Beta
-// publishes that audit in TIMEBASE_FRAGMENT.  This module is intentionally
-// narrow: anchor state, per-clock projection state, TIME.REPORT, and process
-// registration.
+// CLOCKS/Alpha owns the real four-rail prediction audit, and CLOCKS/Beta
+// publishes that audit in TIMEBASE_FRAGMENT.  The Gamma name is intentionally
+// responsibility-neutral so other CLOCKS implementation can move here without
+// changing subsystem ownership or public command identity.
 //
-// All DWT inputs are already authored event-coordinate values.  This module
-// performs no latency adjustment and never captures "now" except in the legacy
+// All DWT inputs are already authored event-coordinate values.  Gamma performs
+// no latency adjustment and never captures "now" except in the legacy
 // time_gnss_ns_now() convenience call.
 // ============================================================================
 
-#include "process_time.h"
 #include "time.h"
 #include "config.h"
-#include "process.h"
-#include "payload.h"
 
 #include <Arduino.h>
 #include "imxrt.h"
@@ -412,78 +413,3 @@ void time_init(void) {
   time_clock_reset_all();
 }
 
-void process_time_init(void) {
-  time_init();
-}
-
-// ============================================================================
-// Report
-// ============================================================================
-
-static void add_clock_snapshot(Payload& parent,
-                               const char* key,
-                               time_clock_id_t clock) {
-  time_clock_snapshot_t s{};
-  const bool load_ok = time_clock_snapshot(clock, &s);
-
-  Payload p;
-  p.add("load_ok", load_ok);
-  p.add("valid", load_ok && s.valid);
-  p.add("prediction_valid", load_ok && s.prediction_valid);
-  p.add("dwt_at_update", load_ok ? s.dwt_at_update : 0U);
-  p.add("ns_at_update", load_ok ? s.ns_at_update : 0ULL);
-  p.add("predicted_dwt_cycles_per_second",
-        load_ok ? s.predicted_dwt_cycles_per_second : 0U);
-  p.add("update_count", load_ok ? s.update_count : 0U);
-  p.add("last_observed_dwt_cycles",
-        load_ok ? s.last_observed_dwt_cycles : 0U);
-  p.add("last_observed_ns", load_ok ? s.last_observed_ns : 0ULL);
-  p.add("last_prediction_residual_cycles",
-        load_ok ? s.last_prediction_residual_cycles : 0);
-
-  parent.add_object(key, p);
-}
-
-static Payload cmd_report(const Payload&) {
-  const time_anchor_snapshot_t a = time_anchor_snapshot();
-
-  Payload out;
-  out.add("model", "TIME_COMPAT_ANCHOR_PROJECTION_REPORT");
-  out.add("note", "process_time owns only the PPS/VCLOCK anchor and per-clock projection backing store");
-  out.add("time_valid", time_valid());
-
-  Payload anchor_payload;
-  anchor_payload.add("ok", a.ok);
-  anchor_payload.add("valid", a.valid);
-  anchor_payload.add("dwt_at_pps_vclock", a.dwt_at_pps_vclock);
-  anchor_payload.add("dwt_cycles_per_pps_vclock_s", a.dwt_cycles_per_pps_vclock_s);
-  anchor_payload.add("counter32_at_pps_vclock", a.counter32_at_pps_vclock);
-  anchor_payload.add("pps_vclock_count", a.pps_vclock_count);
-  out.add_object("anchor", anchor_payload);
-
-  Payload projections;
-  add_clock_snapshot(projections, "vclock", time_clock_id_t::VCLOCK);
-  add_clock_snapshot(projections, "ocxo1", time_clock_id_t::OCXO1);
-  add_clock_snapshot(projections, "ocxo2", time_clock_id_t::OCXO2);
-  out.add_object("projections", projections);
-
-  out.add("prediction_surfaces_retired", true);
-  out.add("dynamic_cps_retired", true);
-  out.add("retired_dead_code_removed", true);
-  return out;
-}
-
-static const process_command_entry_t TIME_COMMANDS[] = {
-  { "REPORT", cmd_report },
-  { nullptr,  nullptr    }
-};
-
-static const process_vtable_t TIME_PROCESS = {
-  .process_id    = "TIME",
-  .commands      = TIME_COMMANDS,
-  .subscriptions = nullptr,
-};
-
-void process_time_register(void) {
-  process_register("TIME", &TIME_PROCESS);
-}

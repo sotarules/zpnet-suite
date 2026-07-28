@@ -7,14 +7,14 @@
 // time.cpp -- caller-facing TIME conversion facade
 // ============================================================================
 //
-// process_time remains alive and owns the PPS/VCLOCK anchor plus per-clock
-// projection backing store.  This file defines only the preferred conversion
-// facade names that are not already owned by process_time.
+// CLOCKS/Gamma owns the PPS/VCLOCK anchor plus per-clock projection backing
+// store.  This file defines only the caller-facing conversion facade names not
+// already implemented by Gamma.
 //
 // Rules:
 //   • Callers provide authored DWT coordinates; this file never captures DWT.
 //   • Conversion math is DWT <-> clock-domain nanoseconds.
-//   • process_time supplies the current per-clock basis through
+//   • CLOCKS/Gamma supplies the current per-clock basis through
 //     time_clock_snapshot() / time_clock_ns_at_dwt().
 //   • CLOCKS static prediction is a fallback denominator only.
 //   • Obsolete *_to_* aliases are intentionally gone from this facade.

@@ -6,11 +6,11 @@
 #include <stdbool.h>
 
 // ============================================================================
-// time.h -- Preferred TIME facade + live process_time backing-store contract
+// time.h -- Preferred TIME facade + CLOCKS/Gamma backing-store contract
 // ============================================================================
 //
-// process_time remains alive.  It owns the PPS/VCLOCK anchor and per-clock
-// projection backing store consumed by CLOCKS, TimePop, and the facade below.
+// CLOCKS/Gamma owns the PPS/VCLOCK anchor and per-clock projection backing
+// store consumed by CLOCKS, TimePop, and the facade below.
 //
 // The public conversion language is now the explicit "at" form:
 //
@@ -21,9 +21,8 @@
 // these conversions and does not apply latency correction; those facts must
 // already have been authored by the interrupt/capture layer.
 //
-// Retired prediction/dynamic-CPS data shapes are retained only because
-// process_time.cpp still defines inert compatibility stubs that return them.
-// Their callable declarations are intentionally absent from this facade.
+// Retired prediction/dynamic-CPS data shapes remain as source-compatibility
+// types only.  Their callable declarations are intentionally absent.
 // ============================================================================
 
 struct time_anchor_snapshot_t {
@@ -305,7 +304,7 @@ uint64_t time_ocxo2_ns_at_dwt(uint32_t authored_dwt_cycle_count);
 uint32_t time_dwt_at_ocxo2_ns(uint64_t ocxo2_ns);
 
 // ============================================================================
-// Live process_time backing-store / anchor contract
+// Live CLOCKS/Gamma backing-store / anchor contract
 // ============================================================================
 
 int64_t time_gnss_ns_now(void);

@@ -66,6 +66,7 @@ set(ZPNET_SOURCES
     process.cpp
     process_clocks_alpha.cpp
     process_clocks_beta.cpp
+    process_clocks_gamma.cpp
     process_events.cpp
     process_interrupt.cpp
     process_laser.cpp
@@ -74,7 +75,6 @@ set(ZPNET_SOURCES
     process_pubsub.cpp
     process_system.cpp
     process_timepop.cpp
-    process_time.cpp
     publish.cpp
     teensy.cpp
     transport.cpp
@@ -103,7 +103,6 @@ set(ZPNET_HEADERS
     process_pubsub.h
     process_system.h
     process_timepop.h
-    process_time.h
     publish.h
     timepop.h
     transport.h

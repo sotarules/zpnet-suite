@@ -46,11 +46,6 @@
 #include <stdio.h>
 #include <strings.h>
 
-// process_time.cpp defines this reset hook; time.h may not expose it on older
-// branches, so Alpha declares the narrow symbol it needs when SmartZero makes
-// the old projection bases invalid.
-void time_clock_reset_all(void);
-
 static constexpr uint64_t NS_PER_SECOND_U64 = 1000000000ULL;
 
 static void alpha_science_reject(clocks_science_reject_reason_t reason,
@@ -9348,6 +9343,7 @@ static void subscribe_clock(interrupt_subscriber_kind_t kind,
 }
 
 void process_clocks_init(void) {
+  time_init();
   clocks_beta_features_init();
 
   // Startup epoch is installed locally by alpha from the first valid
