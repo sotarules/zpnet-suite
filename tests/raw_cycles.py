@@ -256,8 +256,41 @@ def build_row(
             else None
         )
         prefix = prefixes[name]
-        residual_delay_valid = b(forensic.get(f"{prefix}_residual_delay_valid"))
-        residual_delay_cycles = i(forensic.get(f"{prefix}_residual_delay_cycles"))
+
+        # TIMEBASE_FRAGMENT_V5 carries the compact ISR-delay verdict beside
+        # each raw-cycle rail.  Fall back to the retired flat forensics keys so
+        # the report remains able to audit older campaigns.
+        delay_status = str(
+            obj.get("delay_status")
+            or forensic.get(f"{prefix}_delay_status")
+            or "UNKNOWN"
+        ).upper()
+        delay_by = str(
+            obj.get("delay_by")
+            or forensic.get(f"{prefix}_delay_by")
+            or "UNKNOWN"
+        ).upper()
+        residual_delay_valid = b(obj.get("residual_delay_valid"))
+        if residual_delay_valid is None:
+            residual_delay_valid = b(
+                forensic.get(f"{prefix}_residual_delay_valid")
+            )
+        residual_delay_cycles = i(obj.get("residual_delay_cycles"))
+        if residual_delay_cycles is None:
+            residual_delay_cycles = i(
+                forensic.get(f"{prefix}_residual_delay_cycles")
+            )
+        residual_delay_by = str(
+            obj.get("residual_delay_by")
+            or forensic.get(f"{prefix}_residual_delay_by")
+            or "UNKNOWN"
+        ).upper()
+        delay_explains_residual = b(obj.get("delay_explains_residual"))
+        if delay_explains_residual is None:
+            delay_explains_residual = b(
+                forensic.get(f"{prefix}_delay_explains_residual")
+            )
+
         normalized = (
             computed_residual - residual_delay_cycles
             if computed_residual is not None
@@ -283,17 +316,13 @@ def build_row(
                 else None
             ),
             valid=b(obj.get("valid")),
-            delay_status=str(forensic.get(f"{prefix}_delay_status") or "UNKNOWN").upper(),
-            delay_by=str(forensic.get(f"{prefix}_delay_by") or "UNKNOWN").upper(),
+            delay_status=delay_status,
+            delay_by=delay_by,
             residual_delay_valid=residual_delay_valid,
             residual_delay_cycles=residual_delay_cycles,
-            residual_delay_by=str(
-                forensic.get(f"{prefix}_residual_delay_by") or "UNKNOWN"
-            ).upper(),
+            residual_delay_by=residual_delay_by,
             residual_after_delay_cycles=normalized,
-            delay_explains_residual=b(
-                forensic.get(f"{prefix}_delay_explains_residual")
-            ),
+            delay_explains_residual=delay_explains_residual,
         )
         previous_observed[name] = observed
 

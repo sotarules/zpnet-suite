@@ -512,6 +512,7 @@ def _ocxo_interval_ns(r: dict, key: str):
     return _to_int(_field(
         r,
         f"{key}.pps_residual.clock_interval_ns",
+        f"{key}.science.clock_interval_ns",
         f"{key}.measurement.clock_interval_ns",
         f"{key}.measurement.gnss_ns_between_edges",
         f"{key}.interval.clock_interval_ns",
@@ -524,6 +525,7 @@ def _ocxo_residual_ns(r: dict, key: str):
     return _to_int(_field(
         r,
         f"{key}.pps_residual.fast_residual_ns",
+        f"{key}.science.fast_residual_ns",
         f"{key}.measurement.second_residual_ns",
         f"{key}_second_residual_ns",
     ))
@@ -539,10 +541,23 @@ def _prediction_value(r: dict, lane: str, field: str, default=None):
       <lane>_prediction_cycles / <lane>_actual_cycles / <lane>_residual_cycles
       prediction.<lane>_static_prediction_cycles / ...
     """
+    raw_field = {
+        "prediction_cycles": "previous_observed_cycles",
+        "actual_cycles": "observed_cycles",
+        "residual_cycles": "residual_cycles",
+        "completed_interval_count": "completed_interval_count",
+        "valid": "valid",
+    }.get(field)
+    if raw_field is not None:
+        value = _field(r, f"raw_cycles.{lane}.{raw_field}", default=None)
+        if value is not None:
+            return value
+
     aliases = {
         "prediction_cycles": ("prediction_cycles", "static_prediction_cycles"),
         "actual_cycles":     ("actual_cycles",),
         "residual_cycles":   ("residual_cycles", "static_residual_cycles"),
+        "completed_interval_count": ("completed_interval_count",),
         "valid":             ("valid", "prediction_valid", "static_prediction_valid"),
     }.get(field, (field,))
 
@@ -1223,10 +1238,9 @@ def _welford_cols_fragment_or_zero(r, prefix, w_mean, w_sd, w_se, w_n, n=None, m
 def _dwt_expected_cycles(r: dict):
     """Return the firmware-authored PPS static prediction in DWT cycles.
 
-    The canonical TIMEBASE field is prediction.pps.prediction_cycles.  It is
-    deliberately distinct from dwt.cycles_between_pps_vclock, which is the
-    current row's ACTUAL interval.  Older explicit prediction/FloorLine aliases
-    remain readable, but ACTUAL is never used as an EXPECTED fallback.
+    TIMEBASE_FRAGMENT_V5 carries this as
+    raw_cycles.pps.previous_observed_cycles. Older prediction/FloorLine aliases
+    remain readable, but the current ACTUAL interval is never used as EXPECTED.
     """
     explicit = _prediction_value(r, "pps", "prediction_cycles")
     if explicit is not None:
@@ -1573,7 +1587,12 @@ def clocks_combined_readout() -> list[str]:
         dwt_tau   = _to_float(_freq_value(r, "dwt", "tau"))
         dwt_ppb   = _to_float(_freq_value(r, "dwt", "ppb"))
         dwt_raw   = _to_int(_field(r, "dwt.cycles_between_pps_vclock", "dwt_cycles_between_pps_vclock", "dwt_cycle_count_between_pps"))
-        dwt_res   = _to_int(_field(r, "dwt.second_residual_cycles", "dwt_second_residual_cycles"))
+        dwt_res   = _to_int(_field(
+            r,
+            "dwt.second_residual_cycles",
+            "raw_cycles.pps.residual_cycles",
+            "dwt_second_residual_cycles",
+        ))
         lines.append(
             f"{'DWT':<{W_NAME}}"
             f"{_comma_int(dwt_total, W_VALUE)}"
@@ -1611,6 +1630,7 @@ def clocks_combined_readout() -> list[str]:
     dwt_residual = _to_int(_field(
         r,
         "dwt.second_residual_cycles",
+        "raw_cycles.pps.residual_cycles",
         "dwt_second_residual_cycles",
     ))
 
@@ -1625,7 +1645,12 @@ def clocks_combined_readout() -> list[str]:
         "dwt_at_pps_vclock",
         "dwt_cycle_count_at_pps",
     )
-    counter32 = _field(r, "counter32_at_pps_vclock", "qtimer_at_pps")
+    counter32 = _field(
+        r,
+        "dwt.counter32_at_pps_vclock",
+        "counter32_at_pps_vclock",
+        "qtimer_at_pps",
+    )
     if any(v is not None for v in [dwt_actual, dwt_expected, dwt_at_anchor, counter32]):
         dwt_label_w = 12
         dwt_num_w = 20

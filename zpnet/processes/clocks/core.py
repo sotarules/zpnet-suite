@@ -5,10 +5,10 @@ Core contract:
 
   CLOCKS is a traffic cop and final TIMEBASE arbiter. It owns no Teensy
   clock state. It receives one unified TIMEBASE_FRAGMENT candidate from
-  the Teensy. That candidate contains the science fragment and an embedded
-  forensics object. CLOCKS decorates the accepted candidate with Pi-owned
-  environment, GF-8802, GNSS_RAW, and system-time evidence, then persists a
-  compatible immutable TIMEBASE row shaped as {fragment, forensics}.
+  the Teensy. TIMEBASE_FRAGMENT_V5 contains the compact science fragment;
+  older fragment versions may also contain embedded forensics. CLOCKS decorates
+  the accepted candidate with Pi-owned environment, GF-8802, GNSS_RAW, and
+  system-time evidence, then persists the immutable TIMEBASE row.
 
   There is no standalone TIMEBASE_FORENSICS subscription in this process and
   no two-topic pair join. The durable split between ``fragment`` and
@@ -1807,7 +1807,7 @@ def _persist_timebase(tb: Dict[str, Any]) -> None:
         # Persist the canonical Teensy-authored PPS/VCLOCK identity as a scalar
         # column beside the immutable JSONB evidence.  The final court has already
         # required this top-level field and verified that it agrees with the
-        # fragment and forensics identities.
+        # fragment identity (and legacy forensics identity when present).
         pps_count = _extract_teensy_pps_vclock_count(
             tb,
             topic="TIMEBASE persistence",
@@ -2811,6 +2811,7 @@ def _fragment_recovery_timeline_ready(
         "dwt_cycles",
         "dwt.cycles",
         "dwt.total_cycles",
+        "dwt.cycle_count_total",
         default=0,
     )
     return int(pps_vclock_count) > 0 and gnss_ns > 0 and dwt_cycles > 0
@@ -3223,18 +3224,10 @@ def _timebase_final_court_check_candidate_envelope(
             },
         )
 
-    if not isinstance(forensics, dict) or not forensics:
-        _timebase_final_court_add_violation(
-            violations,
-            rule="embedded_forensics_present",
-            lane="candidate",
-            message="unified TIMEBASE candidate has no embedded forensics object",
-            fields={
-                "bad_field": "forensics",
-                "bad_value": forensics,
-                "fragment_forensics_embedded": fragment.get("forensics_embedded"),
-            },
-        )
+    # TIMEBASE_FRAGMENT_V5 deliberately retired the embedded deep-forensics
+    # transcript. Older fragments may still carry it, but its absence is no
+    # longer a structural defect.
+    forensics_present = isinstance(forensics, dict) and bool(forensics)
 
     outer_count = _first_present_int_path(
         timebase,
@@ -3252,21 +3245,20 @@ def _timebase_final_court_check_candidate_envelope(
             "teensy_pps_vclock_count",
             "pps_count",
         )
-        if isinstance(forensics, dict)
+        if forensics_present
         else None
     )
     if (
         outer_count is None
         or fragment_count is None
-        or forensics_count is None
         or outer_count != fragment_count
-        or outer_count != forensics_count
+        or (forensics_present and forensics_count != outer_count)
     ):
         _timebase_final_court_add_violation(
             violations,
             rule="candidate_identity_consistent",
             lane="candidate",
-            message="candidate, fragment, and forensics PPS/VCLOCK identities must agree",
+            message="candidate and fragment PPS/VCLOCK identities must agree; legacy forensics must agree when present",
             fields={
                 "outer_count": outer_count,
                 "fragment_count": fragment_count,
@@ -3279,7 +3271,7 @@ def _timebase_final_court_check_candidate_envelope(
     fragment_campaign = str(fragment.get("campaign") or "")
     forensics_campaign = (
         str(forensics.get("campaign") or "")
-        if isinstance(forensics, dict)
+        if forensics_present
         else ""
     )
     if (
@@ -4925,7 +4917,8 @@ def _process_loop() -> None:
         )
 
         # --- Extract GNSS ns for stream health canary ---
-        gnss_ns = int(frag.get("gnss_ns") or 0)
+        # V5 keeps gnss_ns temporarily, but gnss.ns is the canonical ledger.
+        gnss_ns = _fragment_ns(frag, "gnss.ns", "gnss_ns", default=0)
 
         # --- GNSS stream health canary (Pi-side diagnostic only) ---
         if gnss_ns > 0:

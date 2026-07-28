@@ -50,11 +50,9 @@
 // Servo inputs consume the same PPS-founded OCXO residual surface that feeds
 // the OCXO Welfords, and DAC/TIMEBASE reports expose that provenance.
 //
-// TIMEBASE publication is one continuous candidate stream:
-//   TIMEBASE_FRAGMENT — science spine plus an embedded "forensics" object.
-//
-// The Pi remains the final arbiter and stores accepted candidates in the
-// compatible PostgreSQL { fragment, forensics } shape.  START may privately
+// TIMEBASE publication is one compact continuous candidate stream.
+// TIMEBASE_FRAGMENT V5 carries canonical clocks, cycle evidence, residuals,
+// Welfords, and conditional rejection/recovery testimony.  START may privately
 // acquire a PPS0 bookend before public campaign time begins; after public PPS1
 // is released, every campaign identity is emitted continuously.
 //
@@ -138,37 +136,12 @@ extern volatile bool     g_pps_vclock_dwt_cycles_between_edges_valid;
 // Keep only the minimal stage, candidate, and last-public identity required by
 // REPORT_RECOVERY. Detailed publication flight-recorder reports are retired.
 
-// Embedded-forensics profile.  The campaign stream now publishes the full
-// Interrupt -> Alpha transcript every second.  Standalone publication remains
-// retired; lossless forensics is embedded in the authoritative TIMEBASE row.
-static constexpr bool TIMEBASE_FORENSICS_PUBLISH_ENABLED = false;
-static constexpr bool TIMEBASE_FORENSICS_MINIMAL_PAYLOAD_ENABLED = false;
-
-// Ultra-slim observed-cycle companion fields for the embedded TIMEBASE
-// forensics row.  The payload carries measured endpoints and intervals only.
-static constexpr bool TIMEBASE_FORENSICS_MICRO_RAW_CYCLES_ENABLED = true;
-static constexpr bool TIMEBASE_FORENSICS_MINIMAL_HEALTH_FIELDS_ENABLED = false;
+// TIMEBASE_FRAGMENT V5 is the compact canonical campaign row.  It carries
+// clocks, observed cycle intervals, residuals, Welfords, and only the integrated
+// ISR-delay verdict needed by raw_cycles.  Deep Interrupt/Alpha transcripts,
+// serialized CounterLedger state, duplicate predictions, and compatibility
+// aliases are deliberately not transported at 1 Hz.
 static constexpr uint32_t TIMEBASE_ISR_DELAY_EXPLANATION_GATE_CYCLES = 16U;
-
-// Draconian embedded-forensics diet.
-//
-// The child object carries only the per-lane DWT endpoint and interval facts
-// needed by raw_cycles / raw_nanoseconds. Bulky courtroom transcripts and
-// CounterLedger/PhaseLedger liveness evidence are intentionally not published.
-static constexpr bool TIMEBASE_FORENSICS_MICRO_COURT_FIELDS_ENABLED = false;
-static constexpr bool TIMEBASE_FORENSICS_MICRO_COUNTERLEDGER_FIELDS_ENABLED = false;
-
-// Select the full builder.  Minimal and slim profiles remain compiled only as
-// compatibility fallbacks; the ordinary 1 Hz stream is lossless.
-static constexpr bool TIMEBASE_FORENSICS_SLIM_RAW_CYCLES_PAYLOAD_ENABLED = false;
-
-// TIMEBASE_FRAGMENT must stay comfortably below the Payload arena ceiling.
-// Keep the 1 Hz fragment as the durable science spine, but retain the compact
-// four-lane static-prediction object as first-class campaign evidence.  Each
-// lane carries the prior completed interval, current actual interval, and
-// current-minus-prior residual.
-static constexpr bool TIMEBASE_FRAGMENT_COMPACT_SCIENCE_ENABLED = true;
-static constexpr bool TIMEBASE_FRAGMENT_PUBLISH_PREDICTION_ENABLED = true;
 
 static constexpr uint32_t TIMEBASE_CANDIDATE_INVALID_OCXO1_CUSTODY = 1U << 0;
 static constexpr uint32_t TIMEBASE_CANDIDATE_INVALID_OCXO2_CUSTODY = 1U << 1;
@@ -437,7 +410,6 @@ static clocks_alpha_ocxo_counterledger_snapshot_t
 // RAM1/DTCM stack margin on another automatic Payload object.  Their arenas are
 // already heap-backed and are reused by clear() between rows.
 static Payload g_timebase_candidate_payload DMAMEM;
-static Payload g_timebase_forensics_payload DMAMEM;
 
 
 // FLASH_CUT flight recorder.  These counters are deliberately Beta-local:
@@ -500,7 +472,6 @@ static void clocks_beta_features_mark_initializing(void) {
 void clocks_beta_features_init(void) {
   clocks_beta_cold_diagnostics_init();
   g_timebase_candidate_payload.clear();
-  g_timebase_forensics_payload.clear();
   clocks_beta_features_mark_initializing();
 }
 
@@ -1545,10 +1516,9 @@ static pps_interval_residuals_t pps_interval_residuals_update(
 
 static uint64_t current_raw_gnss_ns(void) {
   // At the selected PPS/VCLOCK edge, GNSS time is identity, not discovery.
-  // The DWT projection path remains a forensic self-check in
-  // TIMEBASE_FORENSICS.pps_vclock_edge; it must not author the public GNSS
-  // ledger because doing so turns bridge rounding/projection error into a
-  // common-mode OCXO residual.
+  // The DWT projection path remains an Alpha edge self-check; it must not
+  // author the public GNSS ledger because doing so turns bridge rounding/
+  // projection error into a common-mode OCXO residual.
   return g_gnss_ns_at_pps_vclock;
 }
 
@@ -4367,12 +4337,11 @@ static FLASHMEM clocks_static_prediction_snapshot_t prediction_snapshot_for_cloc
 // TIMEBASE publication pair — hierarchical helpers
 // ============================================================================
 //
-// TIMEBASE_FRAGMENT is now the compact canonical campaign row / science spine.
-// The former TIMEBASE_FORENSICS companion is embedded under fragment.forensics.
-// Pi-side clocks reconstructs the durable compatible TIMEBASE record with
-// { fragment, forensics } from that single unified publication.
+// TIMEBASE_FRAGMENT V5 is the compact canonical campaign row / science spine.
+// Deep forensic transcripts are no longer transported at 1 Hz. Pi-side CLOCKS
+// persists the fragment and may retain an empty compatibility forensics object.
 //
-// The publication path uses the hierarchical helpers below.
+// The publication path uses the compact helpers below.
 
 static FLASHMEM void payload_add_welford_object(Payload& parent,
                                        const char* key,
@@ -4474,492 +4443,11 @@ static FLASHMEM void payload_add_stats_summary_hierarchical(Payload& p,
   p.add_object("stats", stats);
 }
 
-static FLASHMEM void payload_add_prediction_lane_object(Payload& parent,
-                                               const char* key,
-                                               const clocks_static_prediction_snapshot_t& s) {
-  Payload lane;
-  lane.add("valid", s.valid);
-  lane.add("completed_interval_count", s.completed_interval_count);
-  lane.add("prediction_cycles", s.static_prediction_cycles);
-  lane.add("actual_cycles", s.actual_cycles);
-  lane.add("residual_cycles", s.static_residual_cycles);
-  parent.add_object(key, lane);
-}
-
-static FLASHMEM void payload_add_prediction_summary_hierarchical(Payload& p) {
-  Payload prediction;
-  payload_add_prediction_lane_object(prediction, "pps", prediction_snapshot_for_pps());
-  payload_add_prediction_lane_object(prediction, "vclock", prediction_snapshot_for_clock(time_clock_id_t::VCLOCK));
-  payload_add_prediction_lane_object(prediction, "ocxo1", prediction_snapshot_for_clock(time_clock_id_t::OCXO1));
-  payload_add_prediction_lane_object(prediction, "ocxo2", prediction_snapshot_for_clock(time_clock_id_t::OCXO2));
-  p.add_object("prediction", prediction);
-}
-
-static FLASHMEM const char* pps_vclock_edge_decision_name(uint32_t decision) {
-  switch (decision) {
-    case PPS_VCLOCK_EDGE_DECISION_LOWER_LAWFUL:
-      return "LOWER_LAWFUL";
-    case PPS_VCLOCK_EDGE_DECISION_PREDICTION_FALLBACK:
-      return "PREDICTION_FALLBACK";
-    case PPS_VCLOCK_EDGE_DECISION_PPS_PHASE_FALLBACK:
-      return "PPS_PHASE_FALLBACK";
-    case PPS_VCLOCK_EDGE_DECISION_OBSERVED_FALLBACK:
-      return "OBSERVED_FALLBACK";
-    default:
-      return "NONE";
-  }
-}
 
 
 
-static FLASHMEM void payload_add_interrupt_delay_forensics_object(
-    Payload& parent,
-    const interrupt_delay_forensics_t& d) {
-  Payload obj;
-  obj.add("valid", d.valid);
-  obj.add("verdict_id", (uint32_t)d.verdict);
-  obj.add("verdict", interrupt_delay_verdict_str(d.verdict));
-  obj.add("delayed", d.delayed);
-  obj.add("delayed_by_id", (uint32_t)d.delayed_by);
-  obj.add("delayed_by", interrupt_delay_cause_str(d.delayed_by));
-  obj.add("confidence_id", (uint32_t)d.confidence);
-  obj.add("confidence", interrupt_delay_confidence_str(d.confidence));
-  obj.add("delay_cycles_valid", d.delay_cycles_valid);
-  obj.add("delay_cycles", d.delay_cycles);
-  obj.add("uncertainty_cycles", d.uncertainty_cycles);
-
-  obj.add("previous_endpoint_valid", d.previous_endpoint_valid);
-  obj.add("previous_endpoint_delayed", d.previous_endpoint_delayed);
-  obj.add("previous_delayed_by_id", (uint32_t)d.previous_delayed_by);
-  obj.add("previous_delayed_by",
-          interrupt_delay_cause_str(d.previous_delayed_by));
-  obj.add("previous_delay_cycles", d.previous_delay_cycles);
-
-  obj.add("interval_delay_valid", d.interval_delay_valid);
-  obj.add("interval_delay_cycles", d.interval_delay_cycles);
-  obj.add("interval_delayed_by_id", (uint32_t)d.interval_delayed_by);
-  obj.add("interval_delayed_by",
-          interrupt_delay_cause_str(d.interval_delayed_by));
-
-  obj.add("previous_interval_delay_valid",
-          d.previous_interval_delay_valid);
-  obj.add("previous_interval_delay_cycles",
-          d.previous_interval_delay_cycles);
-  obj.add("previous_interval_delayed_by_id",
-          (uint32_t)d.previous_interval_delayed_by);
-  obj.add("previous_interval_delayed_by",
-          interrupt_delay_cause_str(d.previous_interval_delayed_by));
-
-  obj.add("residual_delay_valid", d.residual_delay_valid);
-  obj.add("residual_delay_cycles", d.residual_delay_cycles);
-  obj.add("residual_delayed_by_id", (uint32_t)d.residual_delayed_by);
-  obj.add("residual_delayed_by",
-          interrupt_delay_cause_str(d.residual_delayed_by));
-  parent.add_object("interrupt_delay", obj);
-}
-
-static FLASHMEM void payload_add_arrival_forensics_object(
-    Payload& parent,
-    const interrupt_arrival_forensics_t& a) {
-  Payload obj;
-  const interrupt_arrival_capture_t& c = a.capture;
-  obj.add("schema", "INTERRUPT_ARRIVAL_CAPTURE_V1");
-  obj.add("valid", a.valid);
-  obj.add("spinidle_running", c.spinidle_running);
-  obj.add("spinidle_shadow_dwt", c.spinidle_shadow_dwt);
-  obj.add("pending_mask_at_entry", c.pending_mask_at_entry);
-  obj.add("pending_qtimer1",
-          (c.pending_mask_at_entry &
-           INTERRUPT_DELAY_SOURCE_BIT_QTIMER1) != 0U);
-  obj.add("pending_ocxo1",
-          (c.pending_mask_at_entry &
-           INTERRUPT_DELAY_SOURCE_BIT_OCXO1) != 0U);
-  obj.add("pending_ocxo2",
-          (c.pending_mask_at_entry &
-           INTERRUPT_DELAY_SOURCE_BIT_OCXO2) != 0U);
-  obj.add("pending_pps",
-          (c.pending_mask_at_entry &
-           INTERRUPT_DELAY_SOURCE_BIT_PPS) != 0U);
-  obj.add("pending_continuation",
-          (c.pending_mask_at_entry &
-           INTERRUPT_DELAY_SOURCE_BIT_CONTINUATION) != 0U);
-
-  obj.add("blocker_id", (uint32_t)c.blocker);
-  obj.add("blocker", interrupt_execution_source_str(c.blocker));
-  obj.add("blocker_exit_dwt", c.blocker_exit_dwt);
-  obj.add("blocker_wall_cycles", c.blocker_wall_cycles);
-  obj.add("target_pending_at_blocker_entry",
-          c.target_pending_at_blocker_entry);
-
-  obj.add("lower_context_active_mask", c.lower_context_active_mask);
-  obj.add("lower_qtimer1_active",
-          (c.lower_context_active_mask &
-           INTERRUPT_DELAY_SOURCE_BIT_QTIMER1) != 0U);
-  obj.add("lower_continuation_active",
-          (c.lower_context_active_mask &
-           INTERRUPT_DELAY_SOURCE_BIT_CONTINUATION) != 0U);
-
-  obj.add("spinidle_shadow_valid", a.spinidle_shadow_valid);
-  obj.add("spinidle_age_cycles", a.spinidle_age_cycles);
-  obj.add("spinidle_valid_threshold_cycles",
-          a.spinidle_valid_threshold_cycles);
-  obj.add("spinidle_excess_cycles", a.spinidle_excess_cycles);
-  obj.add("preempted_after_entry", a.preempted_after_entry);
-  parent.add_object("arrival", obj);
-}
-
-static FLASHMEM void payload_add_ocxo_compare_forensics_object(
-    Payload& parent,
-    const interrupt_ocxo_compare_forensics_t& c) {
-  Payload obj;
-  obj.add("schema", "OCXO_COMPARE_TRANSCRIPT_V1");
-  obj.add("valid", c.valid);
-  obj.add("capture_sequence", c.capture_sequence);
-  obj.add("lane_active_at_capture", c.lane_active_at_capture);
-  obj.add("compare_owned_at_capture", c.compare_owned_at_capture);
-  obj.add("active_at_capture", c.active_at_capture);
-  obj.add("target_counter32", c.target_counter32);
-
-  obj.add("arm_dwt", c.arm_dwt);
-  obj.add("arm_counter32", c.arm_counter32);
-  obj.add("arm_hardware16", (uint32_t)c.arm_hardware16);
-  obj.add("arm_remaining_ticks", c.arm_remaining_ticks);
-  obj.add("arm_counter_low16", (uint32_t)c.arm_counter_low16);
-  obj.add("arm_software_target_low16",
-          (uint32_t)c.arm_software_target_low16);
-  obj.add("arm_comp1_low16", (uint32_t)c.arm_comp1_low16);
-  obj.add("arm_cmpld1_low16", (uint32_t)c.arm_cmpld1_low16);
-  obj.add("arm_comp1_matches_software_target",
-          c.arm_comp1_matches_software_target);
-  obj.add("arm_cmpld1_matches_software_target",
-          c.arm_cmpld1_matches_software_target);
-  obj.add("arm_comp1_mismatch_count", c.arm_comp1_mismatch_count);
-  obj.add("arm_cmpld1_mismatch_count", c.arm_cmpld1_mismatch_count);
-  obj.add("arm_counter_minus_comp1_ticks",
-          c.arm_counter_minus_comp1_ticks);
-  obj.add("arm_comp1_remaining_ticks", c.arm_comp1_remaining_ticks);
-  obj.add("arm_to_isr_ticks", c.arm_to_isr_ticks);
-  obj.add("arm_to_isr_dwt_cycles", c.arm_to_isr_dwt_cycles);
-
-  obj.add("isr_counter_low16", (uint32_t)c.isr_counter_low16);
-  obj.add("isr_software_target_low16",
-          (uint32_t)c.isr_software_target_low16);
-  obj.add("isr_comp1_low16", (uint32_t)c.isr_comp1_low16);
-  obj.add("isr_cmpld1_low16", (uint32_t)c.isr_cmpld1_low16);
-  obj.add("isr_comp1_matches_software_target",
-          c.isr_comp1_matches_software_target);
-  obj.add("isr_cmpld1_matches_software_target",
-          c.isr_cmpld1_matches_software_target);
-  obj.add("isr_comp1_mismatch_count", c.isr_comp1_mismatch_count);
-  obj.add("isr_cmpld1_mismatch_count", c.isr_cmpld1_mismatch_count);
-  obj.add("isr_counter_minus_comp1_ticks",
-          c.isr_counter_minus_comp1_ticks);
-  obj.add("isr_counter_minus_comp1_signed_ticks",
-          c.isr_counter_minus_comp1_signed_ticks);
-  obj.add("isr_counter_minus_software_target_ticks",
-          c.isr_counter_minus_software_target_ticks);
-  obj.add("isr_counter_minus_software_target_signed_ticks",
-          c.isr_counter_minus_software_target_signed_ticks);
-
-  parent.add_object("compare", obj);
-}
-
-static FLASHMEM void payload_add_pps_vclock_edge_forensics(
-    Payload& parent,
-    bool available,
-    const clocks_pps_vclock_edge_forensics_t& e) {
-  Payload edge;
-  edge.add("available", available);
-  edge.add("valid", available && e.valid);
-  edge.add("sequence", available ? e.sequence : 0U);
-  edge.add("update_count", available ? e.update_count : 0U);
-  edge.add("reject_count", available ? e.reject_count : 0U);
-
-  edge.add("authority_dwt_at_edge", available ? e.authority_dwt_at_edge : 0U);
-  edge.add("pps_dwt_at_edge", available ? e.pps_dwt_at_edge : 0U);
-  edge.add("decision", pps_vclock_edge_decision_name(available ? e.decision : 0U));
-  edge.add("decision_id", available ? e.decision : 0U);
-  edge.add("invalid_mask", available ? e.invalid_mask : 0U);
-  edge.add("authority_minus_pps_cycles",
-           available ? e.authority_minus_pps_cycles : 0);
-  edge.add("counter32_at_edge", available ? e.counter32_at_edge : 0U);
-  edge.add("ch3_at_edge", available ? (uint32_t)e.ch3_at_edge : 0U);
-  edge.add("dwt_cycles_between_edges",
-           available ? e.dwt_cycles_between_edges : 0U);
-  edge.add("effective_dwt_cycles_per_second",
-           available ? e.effective_dwt_cycles_per_second : 0U);
-
-  edge.add("gnss_self_map_valid", available && e.gnss_self_map_valid);
-  edge.add("gnss_self_error_ok", available && e.gnss_self_error_ok);
-  edge.add("gnss_self_error_gate_ns",
-           available ? e.gnss_self_error_gate_ns : 0U);
-  edge.add("expected_gnss_ns_at_edge",
-           available ? e.expected_gnss_ns_at_edge : 0ULL);
-  edge.add("mapped_gnss_ns_at_edge",
-           available ? e.mapped_gnss_ns_at_edge : 0ULL);
-  edge.add("gnss_self_error_ns", available ? e.gnss_self_error_ns : 0LL);
-
-  edge.add("arrival_species", "PHYSICAL_PPS_GPIO");
-  payload_add_arrival_forensics_object(
-      edge,
-      available ? e.physical_pps_arrival
-                : interrupt_arrival_forensics_t{});
-  payload_add_interrupt_delay_forensics_object(
-      edge,
-      available ? e.physical_pps_interrupt_delay
-                : interrupt_delay_forensics_t{});
-
-  parent.add_object("pps_vclock_edge", edge);
-}
-
-static FLASHMEM void payload_add_lane_forensics_object(Payload& parent,
-                                              bool valid,
-                                              const clocks_alpha_lane_forensics_t& f) {
-  Payload forensics;
-  forensics.add("schema", "CLOCK_LANE_FORENSICS_LOSSLESS_V1");
-  forensics.add("valid", valid);
-  forensics.add("update_count", valid ? f.update_count : 0U);
-  forensics.add("last_event_dwt", valid ? f.last_event_dwt : 0U);
-  forensics.add("last_event_counter32", valid ? f.last_event_counter32 : 0U);
-  forensics.add("dwt_cycles_between_edges", valid ? f.dwt_cycles_between_edges : 0U);
-  forensics.add("physical_measured_ns_at_edge",
-                valid ? f.physical_measured_ns_at_edge : 0ULL);
-  forensics.add("visible_ns_at_edge", valid ? f.visible_ns_at_edge : 0ULL);
-  forensics.add("visible_origin_phase_valid",
-                valid && f.visible_origin_phase_valid);
-  forensics.add("visible_origin_phase_offset_ns",
-                valid ? f.visible_origin_phase_offset_ns : 0U);
-  forensics.add("counter32_delta_since_previous_event",
-                valid ? f.counter32_delta_since_previous_event : 0U);
-
-  // Preserve the exact first-instruction capture and the full causal verdict.
-  // These objects are copied through Alpha without interpretation.
-  payload_add_arrival_forensics_object(forensics,
-                                       valid ? f.arrival
-                                             : interrupt_arrival_forensics_t{});
-  payload_add_interrupt_delay_forensics_object(
-      forensics,
-      valid ? f.interrupt_delay : interrupt_delay_forensics_t{});
-
-  // Raw/effective DWT authority proof.  This is the durable per-row evidence
-  // needed by raw_cycles-style reports after the 500-cycle catastrophic gate.
-  forensics.add("dwt_synthetic", valid && f.dwt_synthetic);
-  forensics.add("dwt_original_at_event", valid ? f.dwt_original_at_event : 0U);
-  forensics.add("dwt_predicted_at_event", valid ? f.dwt_predicted_at_event : 0U);
-  forensics.add("dwt_ema_dwt_at_event", valid ? f.dwt_ema_dwt_at_event : 0U);
-  forensics.add("dwt_used_at_event", valid ? f.dwt_used_at_event : 0U);
-  forensics.add("dwt_isr_entry_raw", valid ? f.dwt_isr_entry_raw : 0U);
-  forensics.add("dwt_event_from_isr_entry_raw",
-                valid ? f.dwt_event_from_isr_entry_raw : 0U);
-  forensics.add("dwt_isr_entry_to_event_correction_cycles",
-                valid ? f.dwt_isr_entry_to_event_correction_cycles : 0);
-  forensics.add("dwt_published_minus_event_cycles",
-                valid ? f.dwt_published_minus_event_cycles : 0);
-  forensics.add("dwt_used_minus_event_cycles",
-                valid ? f.dwt_used_minus_event_cycles : 0);
-  forensics.add("dwt_synthetic_error_cycles",
-                valid ? f.dwt_synthetic_error_cycles : 0);
-  forensics.add("dwt_synthetic_threshold_cycles",
-                valid ? f.dwt_synthetic_threshold_cycles : 0U);
-
-  Payload gate;
-  gate.add("valid", valid && f.dwt_interval_gate_valid);
-  gate.add("accepted", valid && f.dwt_interval_sample_accepted);
-  gate.add("rejected", valid && f.dwt_interval_sample_rejected);
-  gate.add("observed_cycles", valid ? f.dwt_interval_observed_cycles : 0U);
-  gate.add("prediction_cycles", valid ? f.dwt_interval_prediction_cycles : 0U);
-  gate.add("effective_cycles", valid ? f.dwt_interval_effective_cycles : 0U);
-  gate.add("residual_cycles", valid ? f.dwt_interval_residual_cycles : 0);
-  gate.add("threshold_cycles", valid ? f.dwt_interval_gate_threshold_cycles : 0U);
-  gate.add("reject_count", valid ? f.dwt_interval_reject_count : 0U);
-  gate.add("resync_applied", valid && f.dwt_interval_resync_applied);
-  gate.add("resync_count", valid ? f.dwt_interval_resync_count : 0U);
-  gate.add("reject_streak", valid ? f.dwt_interval_reject_streak : 0U);
-  forensics.add_object("dwt_interval_gate", gate);
-
-  Payload adjacency;
-  adjacency.add("valid", valid && f.dwt_interval_adjacency_gate_valid);
-  adjacency.add("ok", valid && f.dwt_interval_adjacency_ok);
-  adjacency.add("rejected", valid && f.dwt_interval_adjacency_rejected);
-  adjacency.add("counter_delta_ticks",
-                valid ? f.dwt_interval_counter_delta_ticks : 0U);
-  adjacency.add("expected_counter_delta_ticks",
-                valid ? f.dwt_interval_expected_counter_delta_ticks : 0U);
-  adjacency.add("reject_count",
-                valid ? f.dwt_interval_adjacency_reject_count : 0U);
-  forensics.add_object("dwt_interval_adjacency", adjacency);
-
-  // PPS-Yardstick inference rail (Stage 1 -- observational).  Compact per-row
-  // evidence: the unquantized PPS yardstick pair consumed, the inferred Q16
-  // interval/endpoint, the gate verdict it WOULD have given, and chain-walk
-  // audit, published beside the EMA surfaces above for side-by-side analysis.
-  Payload yardstick;
-  yardstick.add("valid", valid && f.dwt_yardstick_valid);
-  yardstick.add("stale", valid && f.dwt_yardstick_stale);
-  yardstick.add("seeded", valid && f.dwt_yardstick_seeded);
-  yardstick.add("excursion", valid && f.dwt_yardstick_excursion);
-  yardstick.add("pps_sequence", valid ? f.dwt_yardstick_pps_sequence : 0U);
-  yardstick.add("pps_seq_delta", valid ? f.dwt_yardstick_pps_seq_delta : 0U);
-  yardstick.add("g_now_cycles", valid ? f.dwt_yardstick_g_now_cycles : 0U);
-  yardstick.add("g_prev_cycles", valid ? f.dwt_yardstick_g_prev_cycles : 0U);
-  yardstick.add("inferred_interval_cycles",
-                valid ? f.dwt_yardstick_inferred_interval_cycles : 0U);
-  yardstick.add("observed_interval_cycles",
-                valid ? f.dwt_yardstick_observed_interval_cycles : 0U);
-  yardstick.add("inferred_minus_observed_cycles",
-                valid ? f.dwt_yardstick_inferred_minus_observed_cycles : 0);
-  yardstick.add("endpoint_minus_observed_cycles",
-                valid ? f.dwt_yardstick_endpoint_minus_observed_cycles : 0);
-  yardstick.add("gate_threshold_cycles",
-                valid ? f.dwt_yardstick_gate_threshold_cycles : 0U);
-  yardstick.add("gate_agree_count",
-                valid ? f.dwt_yardstick_gate_agree_count : 0U);
-  yardstick.add("gate_excursion_count",
-                valid ? f.dwt_yardstick_gate_excursion_count : 0U);
-  yardstick.add("authority", valid && f.dwt_yardstick_authority);
-  yardstick.add("auth_error_cycles",
-                valid ? f.dwt_yardstick_auth_error_cycles : 0);
-  yardstick.add("auth_anchor_applied",
-                valid && f.dwt_yardstick_auth_anchor_applied);
-  forensics.add_object("dwt_yardstick", yardstick);
 
 
-
-  // SlipLedger is retired in the observed-only implementation, but when an
-  // active transcript exists preserve it beside the other lossless evidence.
-  if (valid && f.slipledger_active) {
-    Payload slip;
-    slip.add("active", true);
-    slip.add("ticks", f.slipledger_ticks);
-    slip.add("generation", f.slipledger_generation);
-    slip.add("violation_count", f.slipledger_violation_count);
-    slip.add("correction_count", f.slipledger_correction_count);
-    slip.add("event_violation", f.slipledger_event_violation);
-    slip.add("event_corrected", f.slipledger_event_corrected);
-    slip.add("last_dwt_error_cycles", f.slipledger_last_dwt_error_cycles);
-    slip.add("last_correction_ticks", f.slipledger_last_correction_ticks);
-    slip.add("last_correction_dwt_error_cycles",
-             f.slipledger_last_correction_dwt_error_cycles);
-    slip.add("reason_code", f.slipledger_reason_code);
-    slip.add("last_correction_reason_code",
-             f.slipledger_last_correction_reason_code);
-    forensics.add_object("slipledger", slip);
-  }
-
-  parent.add_object("forensics", forensics);
-}
-
-static FLASHMEM void payload_add_ocxo_service_object(
-    Payload& parent,
-    interrupt_subscriber_kind_t kind,
-    bool valid,
-    const clocks_alpha_lane_forensics_t& f) {
-  Payload service;
-  service.add("schema", "OCXO_SERVICE_LOSSLESS_V1");
-  service.add("kind", interrupt_subscriber_kind_str(kind));
-  service.add("class", valid ? f.diag_service_class : 0U);
-  service.add("offset_ticks",
-              valid ? f.diag_service_offset_signed_ticks : 0);
-  service.add("offset_abs_ticks",
-              valid ? f.diag_service_offset_abs_ticks : 0U);
-  service.add("interpreted_late_ticks",
-              valid ? f.diag_interpreted_late_ticks : 0U);
-  service.add("early_ticks", valid ? f.diag_early_ticks : 0U);
-  service.add("target_delta_mod65536_ticks",
-              valid ? f.diag_target_delta_mod65536_ticks : 0U);
-  service.add("arm_remaining_ticks",
-              valid ? f.diag_arm_remaining_ticks : 0U);
-  service.add("arm_to_isr_ticks",
-              valid ? f.diag_arm_to_isr_ticks : 0U);
-  service.add("arm_to_isr_dwt_cycles",
-              valid ? f.diag_arm_to_isr_dwt_cycles : 0U);
-
-  // The nested transcript is row-consistent Alpha custody, not a late direct
-  // read of process_interrupt's most recent diagnostic.
-  payload_add_ocxo_compare_forensics_object(
-      service,
-      valid ? f.ocxo_compare : interrupt_ocxo_compare_forensics_t{});
-
-  service.add("perishable_fact_sequence",
-              valid ? f.diag_perishable_fact_sequence : 0U);
-  service.add("service_correction_cycles",
-              valid ? f.diag_service_correction_cycles : 0);
-  service.add("service_corrected_dwt_at_event",
-              valid ? f.diag_service_corrected_dwt_at_event : 0U);
-  service.add("fact_ring_overflow_count",
-              valid ? f.diag_fact_ring_overflow_count : 0U);
-  service.add("counter_delta_violation_count",
-              valid ? f.diag_counter_delta_violation_count : 0U);
-  service.add("last_bad_counter_delta",
-              valid ? f.diag_last_bad_counter_delta : 0U);
-  service.add("last_counter_delta_ticks",
-              valid ? f.diag_last_counter_delta_ticks : 0U);
-  service.add("sample_phase_valid",
-              valid && f.diag_sample_phase_valid);
-  service.add("sample_phase_ticks",
-              valid ? f.diag_sample_phase_ticks : 0U);
-  service.add("sample_phase_ns",
-              valid ? f.diag_sample_phase_ns : 0U);
-  service.add("sample_phase_us",
-              valid ? f.diag_sample_phase_us : 0U);
-  service.add("sample_period_ticks",
-              valid ? f.diag_sample_period_ticks : 0U);
-  service.add("sample_dwt_at_event",
-              valid ? f.diag_sample_dwt_at_event : 0U);
-  service.add("sample_counter32_at_event",
-              valid ? f.diag_sample_counter32_at_event : 0U);
-  service.add("boundary_dwt_at_event",
-              valid ? f.diag_boundary_dwt_at_event : 0U);
-  service.add("boundary_counter32_at_event",
-              valid ? f.diag_boundary_counter32_at_event : 0U);
-  service.add("boundary_correction_cycles",
-              valid ? f.diag_boundary_correction_cycles : 0);
-  parent.add_object("service", service);
-}
-
-// ============================================================================
-// OCXO cycle-domain residual diagnostic
-// ============================================================================
-//
-// Courtroom-only legacy diagnostic for the OCXO residual authority chain.
-// The authoritative cycle-domain residual is the exact same-row observed-edge
-// Delta carried in clock_science_row_t::delta_raw_* is authoritative.
-//
-// This older object compares the GNSS/PPS static-prediction DWT interval and
-// each OCXO static-prediction DWT interval in the same Teensy coordinate
-// species.  It remains useful as a rough audit, but it is not the canonical
-// same-row observed-edge Delta residual.
-//
-// Sign convention is aligned with pps_residual.fast_residual_ns:
-//   positive diagnostic_fast_residual_cycles => OCXO running fast.
-//
-// Since a fast OCXO produces a shorter OCXO one-second period in DWT cycles,
-// the sign-aligned diagnostic is:
-//
-//   diagnostic_fast_residual_cycles = gnss_actual_cycles - ocxo_actual_cycles
-//
-// The raw Dave-subtraction is also published as clock_minus_gnss_actual_cycles.
-
-struct ocxo_cycle_residual_diag_t {
-  bool     valid = false;
-  bool     traditional_valid = false;
-
-  uint32_t gnss_prediction_cycles = 0;
-  uint32_t clock_prediction_cycles = 0;
-  int64_t  prediction_fast_residual_cycles = 0;
-  int64_t  clock_minus_gnss_prediction_cycles = 0;
-
-  uint32_t gnss_actual_cycles = 0;
-  uint32_t clock_actual_cycles = 0;
-  int64_t  diagnostic_fast_residual_cycles = 0;
-  int64_t  clock_minus_gnss_actual_cycles = 0;
-
-  int64_t  traditional_fast_residual_ns = 0;
-  int64_t  diagnostic_minus_traditional = 0;
-};
-
-static ocxo_cycle_residual_diag_t g_beta_ocxo1_cycle_residual_diag DMAMEM = {};
-static ocxo_cycle_residual_diag_t g_beta_ocxo2_cycle_residual_diag DMAMEM = {};
 
 static FLASHMEM void clocks_beta_cold_diagnostics_init(void) {
   if (g_clocks_beta_dmamem_initialized) return;
@@ -5053,97 +4541,13 @@ static FLASHMEM void clocks_beta_cold_diagnostics_init(void) {
   g_clocks_payload_numeric_court_scratch =
       clocks_payload_numeric_court_t{};
 
-  g_beta_ocxo1_cycle_residual_diag = ocxo_cycle_residual_diag_t{};
-  g_beta_ocxo2_cycle_residual_diag = ocxo_cycle_residual_diag_t{};
-
   g_clocks_beta_dmamem_initialized = true;
 }
 
-static void ocxo_cycle_residual_diag_build(
-    ocxo_cycle_residual_diag_t& d,
-    const clocks_static_prediction_snapshot_t& gnss,
-    const clocks_static_prediction_snapshot_t& clock,
-    bool traditional_valid,
-    int64_t traditional_fast_residual_ns) {
-  d = ocxo_cycle_residual_diag_t{};
 
-  d.valid = gnss.valid && clock.valid &&
-      gnss.actual_cycles != 0U && clock.actual_cycles != 0U;
-  d.traditional_valid = traditional_valid;
 
-  d.gnss_prediction_cycles = gnss.static_prediction_cycles;
-  d.clock_prediction_cycles = clock.static_prediction_cycles;
-  d.prediction_fast_residual_cycles =
-      (int64_t)gnss.static_prediction_cycles -
-      (int64_t)clock.static_prediction_cycles;
-  d.clock_minus_gnss_prediction_cycles =
-      (int64_t)clock.static_prediction_cycles -
-      (int64_t)gnss.static_prediction_cycles;
 
-  d.gnss_actual_cycles = gnss.actual_cycles;
-  d.clock_actual_cycles = clock.actual_cycles;
-  d.diagnostic_fast_residual_cycles =
-      (int64_t)gnss.actual_cycles - (int64_t)clock.actual_cycles;
-  d.clock_minus_gnss_actual_cycles =
-      (int64_t)clock.actual_cycles - (int64_t)gnss.actual_cycles;
 
-  d.traditional_fast_residual_ns =
-      traditional_valid ? traditional_fast_residual_ns : 0LL;
-  d.diagnostic_minus_traditional =
-      traditional_valid ? (d.diagnostic_fast_residual_cycles -
-                           traditional_fast_residual_ns) : 0LL;
-}
-
-static FLASHMEM void payload_add_ocxo_pps_residual_object(Payload& parent,
-                                                bool valid,
-                                                uint64_t gnss_interval_ns,
-                                                uint64_t clock_interval_ns,
-                                                int64_t fast_residual_ns) {
-  Payload residual;
-  residual.add("valid", valid);
-  residual.add("gnss_interval_ns", valid ? gnss_interval_ns : 0ULL);
-  residual.add("clock_interval_ns", valid ? clock_interval_ns : 0ULL);
-  residual.add("fast_residual_ns", valid ? fast_residual_ns : 0LL);
-  residual.add("positive_means", "clock_fast");
-  residual.add("source", "DELTA_OBSERVED_DWT_EDGE");
-  residual.add("traditional_preserved_under", "science.traditional_fast_residual_ns");
-  parent.add_object("pps_residual", residual);
-}
-
-static FLASHMEM void payload_add_ocxo_cycle_residual_diag_object(
-    Payload& parent,
-    const ocxo_cycle_residual_diag_t& d) {
-  Payload diag;
-
-  diag.add("valid", d.valid);
-  diag.add("diagnostic_only", true);
-  diag.add("doctrine", "DWT_SAME_YARDSTICK_RESIDUAL_CHECK");
-  diag.add("positive_means", "clock_fast");
-  diag.add("welford_source", false);
-  diag.add("servo_source", false);
-
-  diag.add("gnss_prediction_cycles", d.gnss_prediction_cycles);
-  diag.add("clock_prediction_cycles", d.clock_prediction_cycles);
-  diag.add("prediction_fast_residual_cycles",
-           d.prediction_fast_residual_cycles);
-  diag.add("clock_minus_gnss_prediction_cycles",
-           d.clock_minus_gnss_prediction_cycles);
-
-  diag.add("gnss_actual_cycles", d.gnss_actual_cycles);
-  diag.add("clock_actual_cycles", d.clock_actual_cycles);
-  diag.add("diagnostic_fast_residual_cycles",
-           d.diagnostic_fast_residual_cycles);
-  diag.add("clock_minus_gnss_actual_cycles",
-           d.clock_minus_gnss_actual_cycles);
-
-  diag.add("traditional_residual_valid", d.traditional_valid);
-  diag.add("traditional_fast_residual_ns",
-           d.traditional_fast_residual_ns);
-  diag.add("diagnostic_minus_traditional",
-           d.diagnostic_minus_traditional);
-
-  parent.add_object("cycle_residual_diagnostic", diag);
-}
 
 
 static int32_t beta_signed_delta_u32(uint32_t observed, uint32_t expected) {
@@ -5154,190 +4558,7 @@ static int32_t beta_signed_delta_u32(uint32_t observed, uint32_t expected) {
 
 
 
-static FLASHMEM void payload_add_micro_court_fields(
-    Payload& parent,
-    const char* prefix,
-    bool valid,
-    const clocks_alpha_lane_forensics_t& f) {
-  if (!TIMEBASE_FORENSICS_MICRO_COURT_FIELDS_ENABLED) {
-    (void)parent;
-    (void)prefix;
-    (void)valid;
-    (void)f;
-    return;
-  }
 
-  char key[96];
-
-  auto add_bool = [&](const char* suffix, bool value) {
-    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
-    parent.add(key, value);
-  };
-  auto add_u32 = [&](const char* suffix, uint32_t value) {
-    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
-    parent.add(key, value);
-  };
-  auto add_i32 = [&](const char* suffix, int32_t value) {
-    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
-    parent.add(key, value);
-  };
-  auto add_i64 = [&](const char* suffix, int64_t value) {
-    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
-    parent.add(key, value);
-  };
-  auto add_str = [&](const char* suffix, const char* value) {
-    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
-    parent.add(key, value ? value : "");
-  };
-
-  add_bool("court_valid", valid);
-  add_u32("court_mask", valid ? f.dwt_publication_verdict_mask : 0U);
-  const uint32_t court_reason_id = valid
-      ? f.dwt_publication_verdict_reason_id
-      : INTERRUPT_DWT_PUBLICATION_REASON_OK;
-  add_u32("court_reason_id", court_reason_id);
-  add_str("court_reason", interrupt_dwt_publication_reason_name(court_reason_id));
-  add_u32("court_wd", valid ? f.dwt_publication_watchdog_count : 0U);
-  add_u32("court_gate", valid ? f.dwt_publication_gate_cycles : 0U);
-  add_u32("court_xgate",
-          valid ? f.dwt_publication_cross_rail_gate_cycles : 0U);
-  add_u32("court_svc_gate",
-          valid ? f.dwt_publication_service_offset_gate_ticks : 0U);
-  add_u32("court_exp_cnt",
-          valid ? f.dwt_publication_expected_counter_delta_ticks : 0U);
-  add_u32("court_obs_cnt",
-          valid ? f.dwt_publication_observed_counter_delta_ticks : 0U);
-  add_u32("court_exp_int",
-          valid ? f.dwt_publication_expected_interval_cycles : 0U);
-  add_u32("court_pub_int",
-          valid ? f.dwt_publication_published_interval_cycles : 0U);
-  add_u32("court_obs_int",
-          valid ? f.dwt_publication_observed_interval_cycles : 0U);
-  add_i32("court_pub_err",
-          valid ? f.dwt_publication_published_interval_error_cycles : 0);
-  add_i32("court_obs_err",
-          valid ? f.dwt_publication_observed_interval_error_cycles : 0);
-  add_i32("court_pub_obs",
-          valid ? f.dwt_publication_published_minus_observed_cycles : 0);
-  add_i32("court_svc_off",
-          valid ? f.dwt_publication_service_offset_signed_ticks : 0);
-  add_i64("court_gnss_err",
-          valid ? f.dwt_publication_vclock_gnss_error_ns : 0LL);
-}
-
-
-static FLASHMEM void payload_add_micro_counterledger_fields(
-    Payload& parent,
-    const char* prefix,
-    const clocks_alpha_ocxo_counterledger_snapshot_t& s) {
-  if (!TIMEBASE_FORENSICS_MICRO_COUNTERLEDGER_FIELDS_ENABLED) {
-    (void)parent;
-    (void)prefix;
-    (void)s;
-    return;
-  }
-
-  char key[96];
-
-  auto add_bool = [&](const char* suffix, bool value) {
-    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
-    parent.add(key, value);
-  };
-  auto add_u32 = [&](const char* suffix, uint32_t value) {
-    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
-    parent.add(key, value);
-  };
-  auto add_u64 = [&](const char* suffix, uint64_t value) {
-    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
-    parent.add(key, value);
-  };
-  auto add_i64 = [&](const char* suffix, int64_t value) {
-    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
-    parent.add(key, value);
-  };
-  auto add_str = [&](const char* suffix, const char* value) {
-    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
-    parent.add(key, value ? value : "");
-  };
-
-  add_bool("cl_valid", s.valid);
-  add_bool("cl_init", s.initialized);
-  add_bool("cl_interval", s.interval_valid);
-  add_bool("cl_phase", s.phase_valid);
-  add_bool("cl_phase_pending", s.phase_pending);
-  add_bool("cl_refined", s.refined_valid);
-  add_bool("cl_refined_interval", s.refined_interval_valid);
-  add_u32("cl_pps", s.pps_sequence);
-  add_u32("cl_phase_pps", s.phase_pps_sequence);
-  add_u32("cl_phase_lag", s.phase_lag_pps);
-  add_u32("cl_last_delta_ticks", s.last_delta_ticks);
-  add_u64("cl_interval_ns", s.interval_ns);
-  add_i64("cl_fast_ns", s.fast_residual_ns);
-  add_u64("cl_refined_ns", s.refined_ns);
-  add_u64("cl_refined_int_ns", s.refined_interval_ns);
-  add_i64("cl_refined_fast_ns", s.refined_fast_residual_ns);
-
-  add_u32("cl_pend_cap", s.phase_pending_capacity);
-  add_u32("cl_pend_depth", s.phase_pending_depth);
-  add_u32("cl_pend_max", s.phase_pending_depth_max);
-  add_u32("cl_pend_enq", s.phase_pending_enqueue_count);
-  add_u32("cl_pend_ovf", s.phase_pending_overflow_count);
-  add_u32("cl_pend_drop", s.phase_pending_drop_count);
-  add_u32("cl_pend_res", s.phase_pending_resolve_count);
-  add_u32("cl_pend_unbr", s.phase_pending_unbracketed_count);
-  add_u32("cl_pend_old", s.phase_pending_oldest_pps_sequence);
-  add_u32("cl_pend_new", s.phase_pending_newest_pps_sequence);
-  add_u32("cl_pend_res_seq", s.phase_pending_last_resolved_pps_sequence);
-  add_u32("cl_pend_drop_seq", s.phase_pending_last_dropped_pps_sequence);
-  add_u32("cl_pend_idx", s.phase_pending_last_matched_index);
-  add_u32("cl_pend_legacy_ovw", s.phase_pending_overwrite_count);
-  add_bool("cl_edge_pair", s.phase_last_edge_pair_valid);
-  add_u32("cl_edge_pair_prev", s.phase_last_edge_pair_previous_dwt);
-  add_u32("cl_edge_pair_next", s.phase_last_edge_pair_next_dwt);
-  add_u32("cl_edge_pair_int", s.phase_last_edge_pair_interval_cycles);
-  add_u32("cl_edge_pair_ctr", s.phase_last_edge_pair_counter_delta_ticks);
-  add_u32("cl_edge_pair_upd", s.phase_last_edge_pair_update_count);
-  add_u32("cl_catch_attempt", s.phase_catchup_attempt_count);
-  add_u32("cl_catch_success", s.phase_catchup_success_count);
-  add_u32("cl_catch_no_pair", s.phase_catchup_no_edge_pair_count);
-  add_u32("cl_catch_no_pending", s.phase_catchup_no_pending_count);
-  add_u32("cl_catch_unbr", s.phase_catchup_unbracketed_count);
-  add_u32("cl_catch_bad_ctr", s.phase_catchup_bad_counter_delta_count);
-  add_u32("cl_catch_pps", s.phase_last_catchup_pps_sequence);
-  add_u32("cl_catch_reason", s.phase_last_catchup_reason_id);
-  add_str("cl_catch_reason_name",
-          clocks_phaseledger_resolve_reason_name(s.phase_last_catchup_reason_id));
-  add_u32("cl_last_res_source", s.phase_last_resolve_source_id);
-  add_str("cl_last_res_source_name",
-          clocks_phaseledger_resolve_source_name(s.phase_last_resolve_source_id));
-
-  add_u32("cl_res_attempt", s.phase_resolve_attempt_count);
-  add_u32("cl_res_no_pending", s.phase_resolve_no_pending_count);
-  add_u32("cl_res_zero", s.phase_resolve_zero_interval_count);
-  add_u32("cl_res_unbr", s.phase_resolve_unbracketed_count);
-  add_u32("cl_res_bad_ctr", s.phase_resolve_counter_delta_bad_count);
-  add_u32("cl_last_res_reason", s.last_phase_resolve_reason_id);
-  add_str("cl_last_res_reason_name",
-          clocks_phaseledger_resolve_reason_name(s.last_phase_resolve_reason_id));
-  add_u32("cl_last_res_pps", s.last_phase_resolve_pps_sequence);
-  add_u32("cl_last_res_ctr", s.last_phase_resolve_counter_delta_ticks);
-  add_u32("cl_last_res_int", s.last_phase_resolve_interval_cycles);
-  add_u32("cl_last_res_delta", s.last_phase_resolve_pps_delta_cycles);
-
-  add_u32("cl_sample_decision", s.last_sample_decision_id);
-  add_str("cl_sample_decision_name",
-          clocks_counterledger_sample_decision_name(s.last_sample_decision_id));
-  add_u32("cl_sample_pps", s.last_sample_pps_sequence);
-  add_u32("cl_sample_prev_pps", s.last_sample_previous_pps_sequence);
-  add_u32("cl_sample_delta", s.last_sample_delta_ticks);
-  add_u32("cl_cap_reason", s.capture_gate_reason_id);
-  add_str("cl_cap_reason_name",
-          clocks_counterledger_capture_gate_reason_name(s.capture_gate_reason_id));
-  add_bool("cl_cap_ready",
-           s.last_capture_available && s.last_capture_valid &&
-           s.last_capture_lane_valid && s.last_capture_sequence_match &&
-           s.last_capture_sequence == s.pps_sequence);
-}
 
 
 
@@ -6305,1085 +5526,140 @@ static bool campaign_start_prologue_should_hold(
 }
 
 
-static FLASHMEM void payload_add_clock_science_common(Payload& science,
-                                             const clock_science_row_t& row) {
-  const bool ocxo_science_row =
-      row.clock_id == (uint32_t)((uint8_t)time_clock_id_t::OCXO1) ||
-      row.clock_id == (uint32_t)((uint8_t)time_clock_id_t::OCXO2);
-
-  if (TIMEBASE_FRAGMENT_COMPACT_SCIENCE_ENABLED) {
-    science.add("schema", "TIMEBASE_CLOCK_SCIENCE_COMPACT_V4");
-    science.add("valid", row.valid);
-    science.add("science_worthy", row.science_worthy);
-    science.add("forensic_override", row.forensic_override);
-    science.add("antecedents_complete", row.antecedents_complete);
-    science.add("clock_id", row.clock_id);
-    science.add("public_count", row.public_count);
-    science.add("positive_means", "clock_fast");
-    science.add("public_ns_mode", clocks_ocxo_public_ns_authority_name());
-
-    // Compact mode must stay comfortably below the 16 KB Payload arena.
-    // Keep only the scalar science needed by dashboards/analyzers.  Rich
-    // provenance strings, projection antecedents, AlphaTau, traditional totals,
-    // and recovery-continuity diagnostics live in TIMEBASE_FORENSICS or focused
-    // reports.
-    science.add("gnss_interval_ns", row.gnss_interval_ns);
-    science.add("clock_interval_ns", row.clock_interval_ns);
-    science.add("clock_observed_interval_cycles",
-                row.clock_observed_interval_cycles);
-    science.add("fast_residual_ns", row.fast_residual_ns);
-    science.add("fast_residual_ns_exact", toFixedDecimal(row.fast_residual_ns_exact, 6));
-    science.add("tau_1s", toFixedDecimal(row.tau_1s, 12));
-    science.add("ppb_1s", toFixedDecimal(row.ppb_1s, 6));
-
-    // Campaign-total frequency summary.  These five fields are the panel-facing
-    // public clockface ratio and must remain in TIMEBASE_FRAGMENT.
-    science.add("total_valid", row.total_valid);
-    science.add("total_sample_count", row.total_sample_count);
-    science.add("total_fast_residual_ns", row.total_fast_residual_ns);
-    science.add("total_tau", toFixedDecimal(row.total_tau, 12));
-    science.add("total_ppb", toFixedDecimal(row.total_ppb, 6));
-
-    // Canonical Delta residual identity.  Keep this numeric and compact; verbose
-    // species labels and traditional projected-GNSS comparisons are forensics.
-    const bool publish_delta = row.delta_reference_public_count != 0U ||
-                               row.delta_publication_public_count != 0U ||
-                               row.delta_raw_valid;
-    if (publish_delta) {
-      science.add("delta_reference_public_count", row.delta_reference_public_count);
-      science.add("delta_publication_public_count", row.delta_publication_public_count);
-      science.add("delta_raw_valid", row.delta_raw_valid);
-      science.add("delta_raw_reference_plausible",
-                  row.delta_raw_reference_plausible);
-      science.add("delta_raw_clock_plausible",
-                  row.delta_raw_clock_plausible);
-      science.add("delta_raw_reference_interval_cycles",
-                  row.delta_raw_reference_interval_cycles);
-      science.add("delta_raw_clock_interval_cycles",
-                  row.delta_raw_clock_interval_cycles);
-      science.add("delta_raw_residual_cycles",
-                  row.delta_raw_residual_cycles);
-      science.add("delta_raw_fast_residual_cycles",
-                  row.delta_raw_fast_residual_cycles);
-      science.add("delta_raw_fast_residual_ns",
-                  row.delta_raw_fast_residual_ns);
-      science.add("delta_raw_fast_residual_ns_exact",
-                  toFixedDecimal(row.delta_raw_fast_residual_ns_exact, 6));
-    }
-    return;
-  }
-
-  science.add("schema", "TIMEBASE_CLOCK_SCIENCE_V4");
+static FLASHMEM void payload_add_clock_science_common(
+    Payload& science,
+    const clock_science_row_t& row) {
   science.add("valid", row.valid);
   science.add("science_worthy", row.science_worthy);
-  science.add("forensic_override", row.forensic_override);
   science.add("antecedents_complete", row.antecedents_complete);
-  science.add("clock_id", row.clock_id);
-  science.add("public_count", row.public_count);
-  science.add("positive_means", "clock_fast");
-  science.add("public_ns_mode", clocks_ocxo_public_ns_authority_name());
-  science.add("residual_source",
-              ocxo_science_row
-                  ? "DELTA_OBSERVED_DWT_EDGE"
-                  : "GNSS_IDENTITY");
-  science.add("traditional_residual_source",
-              ocxo_science_row ? "PROJECTED_GNSS_OBSERVED_DWT_CPS" : "NONE");
+  science.add("gnss_interval_ns", row.gnss_interval_ns);
+  science.add("clock_interval_ns", row.clock_interval_ns);
+  science.add("fast_residual_ns", row.fast_residual_ns);
+  science.add("fast_residual_ns_exact",
+              toFixedDecimal(row.fast_residual_ns_exact, 6));
 
-  science.add("pps_vclock_dwt_at_edge", row.pps_vclock_dwt_at_edge);
-  science.add("pps_vclock_gnss_ns_at_edge", row.pps_vclock_gnss_ns_at_edge);
-  science.add("projection_cps_cycles", row.projection_cps_cycles);
-
-  science.add("clock_published_dwt_at_edge", row.clock_published_dwt_at_edge);
-  science.add("clock_raw_dwt_at_edge", row.clock_raw_dwt_at_edge);
-  science.add("clock_observed_interval_cycles", row.clock_observed_interval_cycles);
-  science.add("clock_effective_interval_cycles", row.clock_effective_interval_cycles);
-
-  science.add("delta_alignment", "REFERENCE_SAME_TIMEBASE_ROW");
-  science.add("delta_reference_species", "SELECTED_PPS_VCLOCK_DWT_EDGE_INTERVAL");
-  science.add("delta_clock_species", "OCXO_OBSERVED_DWT_EDGE_INTERVAL");
-  science.add("delta_positive_means", "clock_slow_for_residual_clock_minus_reference");
-  science.add("delta_fast_positive_means", "clock_fast");
-  science.add("delta_reference_public_count", row.delta_reference_public_count);
-  science.add("delta_publication_public_count", row.delta_publication_public_count);
-
+  // Pi's final court requires the exact same-row DWT intervals whenever Delta
+  // is valid.  The signed fast residual remains as an independent audit value.
   science.add("delta_raw_valid", row.delta_raw_valid);
-  science.add("delta_raw_reference_plausible",
-              row.delta_raw_reference_plausible);
-  science.add("delta_raw_clock_plausible",
-              row.delta_raw_clock_plausible);
   science.add("delta_raw_reference_interval_cycles",
               row.delta_raw_reference_interval_cycles);
   science.add("delta_raw_clock_interval_cycles",
               row.delta_raw_clock_interval_cycles);
-  science.add("delta_raw_residual_cycles", row.delta_raw_residual_cycles);
   science.add("delta_raw_fast_residual_cycles",
               row.delta_raw_fast_residual_cycles);
-  science.add("delta_raw_residual_ns", row.delta_raw_residual_ns);
-  science.add("delta_raw_fast_residual_ns",
-              row.delta_raw_fast_residual_ns);
-  science.add("delta_raw_residual_ns_exact",
-              toFixedDecimal(row.delta_raw_residual_ns_exact, 6));
-  science.add("delta_raw_fast_residual_ns_exact",
-              toFixedDecimal(row.delta_raw_fast_residual_ns_exact, 6));
-
-
-  science.add("delta_raw_fast_minus_traditional_ns",
-              row.delta_raw_fast_minus_traditional_ns);
-
-  science.add("prior_edge_gnss_ns", row.prior_edge_gnss_ns);
-  science.add("current_edge_gnss_ns", row.current_edge_gnss_ns);
-  science.add("prior_edge_gnss_ns_exact", toFixedDecimal(row.prior_edge_gnss_ns_exact, 6));
-  science.add("current_edge_gnss_ns_exact", toFixedDecimal(row.current_edge_gnss_ns_exact, 6));
-  science.add("gnss_interval_ns", row.gnss_interval_ns);
-  science.add("clock_interval_ns", row.clock_interval_ns);
-  science.add("fast_residual_ns", row.fast_residual_ns);
-  science.add("gnss_interval_ns_exact", toFixedDecimal(row.gnss_interval_ns_exact, 6));
-  science.add("clock_interval_ns_exact", toFixedDecimal(row.clock_interval_ns_exact, 6));
-  science.add("fast_residual_ns_exact", toFixedDecimal(row.fast_residual_ns_exact, 6));
-  science.add("tau_1s", toFixedDecimal(row.tau_1s, 12));
-  science.add("ppb_1s", toFixedDecimal(row.ppb_1s, 6));
-
-  science.add("traditional_valid", row.traditional_valid);
-  science.add("traditional_gnss_interval_ns", row.traditional_gnss_interval_ns);
-  science.add("traditional_clock_interval_ns", row.traditional_clock_interval_ns);
-  science.add("traditional_fast_residual_ns", row.traditional_fast_residual_ns);
-  science.add("traditional_gnss_interval_ns_exact",
-              toFixedDecimal(row.traditional_gnss_interval_ns_exact, 6));
-  science.add("traditional_clock_interval_ns_exact",
-              toFixedDecimal(row.traditional_clock_interval_ns_exact, 6));
-  science.add("traditional_fast_residual_ns_exact",
-              toFixedDecimal(row.traditional_fast_residual_ns_exact, 6));
-  science.add("traditional_tau_1s", toFixedDecimal(row.traditional_tau_1s, 12));
-  science.add("traditional_ppb_1s", toFixedDecimal(row.traditional_ppb_1s, 6));
-
-  const bool recovery_continuity_aligned =
-      ocxo_science_row &&
-      row.public_count != 0U &&
-      row.public_count == g_recover_continuity_align_last_public_count;
-  science.add("total_ratio_source",
-              ocxo_science_row
-                  ? (recovery_continuity_aligned
-                         ? "RECOVERY_ALIGNED_PUBLIC_CLOCK_NS_OVER_GNSS_NS"
-                         : "PUBLIC_CLOCK_NS_OVER_GNSS_NS")
-                  : "GNSS_IDENTITY");
-  science.add("total_valid", row.total_valid);
-  science.add("total_sample_count", row.total_sample_count);
-  science.add("total_clock_interval_ns", row.total_clock_interval_ns);
-  science.add("total_gnss_interval_ns", row.total_gnss_interval_ns);
-  science.add("total_fast_residual_ns", row.total_fast_residual_ns);
-  science.add("total_clock_interval_ns_exact", toFixedDecimal(row.total_clock_interval_ns_exact, 6));
-  science.add("total_gnss_interval_ns_exact", toFixedDecimal(row.total_gnss_interval_ns_exact, 6));
-  science.add("total_fast_residual_ns_exact", toFixedDecimal(row.total_fast_residual_ns_exact, 6));
-  science.add("total_tau", toFixedDecimal(row.total_tau, 12));
-  science.add("total_ppb", toFixedDecimal(row.total_ppb, 6));
-  science.add("recovery_continuity_aligned", recovery_continuity_aligned);
-  science.add("recovery_continuity_target_ns",
-              recovery_continuity_aligned
-                  ? (row.clock_id == (uint32_t)((uint8_t)time_clock_id_t::OCXO1)
-                         ? g_recover_continuity_ocxo1_target_ns
-                         : g_recover_continuity_ocxo2_target_ns)
-                  : 0ULL);
-  science.add("recovery_continuity_correction_ns",
-              recovery_continuity_aligned
-                  ? (row.clock_id == (uint32_t)((uint8_t)time_clock_id_t::OCXO1)
-                         ? g_recover_continuity_ocxo1_correction_ns
-                         : g_recover_continuity_ocxo2_correction_ns)
-                  : 0LL);
-  science.add("alpha_tau_valid", row.alpha_tau_valid);
-  science.add("alpha_tau_sample_count", row.alpha_tau_sample_count);
-  science.add("alpha_tau_interval_count", row.alpha_tau_interval_count);
-  science.add("alpha_tau_last_pps_sequence", row.alpha_tau_last_pps_sequence);
-  science.add("alpha_tau_last_interval_pps_sequence",
-              row.alpha_tau_last_interval_pps_sequence);
-  science.add("alpha_tau", toFixedDecimal(row.alpha_tau, 12));
-  science.add("alpha_tau_ppb", toFixedDecimal(row.alpha_tau_ppb, 6));
-  science.add("alpha_tau_stderr_ppb", toFixedDecimal(row.alpha_tau_stderr_ppb, 6));
-  science.add("alpha_tau_interval_mean_ppb",
-              toFixedDecimal(row.alpha_tau_interval_mean_ppb, 6));
-  science.add("alpha_tau_interval_stderr_ppb",
-              toFixedDecimal(row.alpha_tau_interval_stderr_ppb, 6));
-  science.add("alpha_tau_intercept_ns", row.alpha_tau_intercept_ns);
-  science.add("alpha_tau_detrended_fast_residual_ns",
-              row.alpha_tau_detrended_fast_residual_ns);
-
-  science.add("traditional_total_valid", row.traditional_total_valid);
-  science.add("traditional_total_sample_count", row.traditional_total_sample_count);
-  science.add("traditional_total_clock_interval_ns",
-              row.traditional_total_clock_interval_ns);
-  science.add("traditional_total_gnss_interval_ns",
-              row.traditional_total_gnss_interval_ns);
-  science.add("traditional_total_fast_residual_ns",
-              row.traditional_total_fast_residual_ns);
-  science.add("traditional_total_clock_interval_ns_exact",
-              toFixedDecimal(row.traditional_total_clock_interval_ns_exact, 6));
-  science.add("traditional_total_gnss_interval_ns_exact",
-              toFixedDecimal(row.traditional_total_gnss_interval_ns_exact, 6));
-  science.add("traditional_total_fast_residual_ns_exact",
-              toFixedDecimal(row.traditional_total_fast_residual_ns_exact, 6));
-  science.add("traditional_total_tau", toFixedDecimal(row.traditional_total_tau, 12));
-  science.add("traditional_total_ppb", toFixedDecimal(row.traditional_total_ppb, 6));
 }
 
-static FLASHMEM void payload_add_vclock_science_object(Payload& lane,
-                                              uint32_t public_count,
-                                              uint64_t public_gnss_ns,
-                                              bool vclock_valid,
-                                              const clocks_alpha_lane_forensics_t& vclock_f) {
+
+
+static FLASHMEM void payload_add_ocxo_science_object(
+    Payload& lane,
+    const clock_science_row_t& row) {
   Payload science;
-  clock_science_row_t& row = g_beta_vclock_science_row;
-  row = clock_science_row_t{};
-  row.valid = true;
-  row.antecedents_complete = true;
-  row.clock_id = (uint32_t)((uint8_t)time_clock_id_t::VCLOCK);
-  row.public_count = public_count;
-  row.pps_vclock_dwt_at_edge = (uint32_t)g_dwt_at_pps_vclock;
-  row.pps_vclock_gnss_ns_at_edge = public_gnss_ns;
-  row.projection_cps_cycles = (uint32_t)g_dwt_cycles_between_pps_vclock;
-  row.clock_published_dwt_at_edge = vclock_valid ? vclock_f.dwt_used_at_event : 0U;
-  row.clock_raw_dwt_at_edge = vclock_valid ? vclock_f.dwt_original_at_event : 0U;
-  row.clock_observed_interval_cycles =
-      vclock_valid ? vclock_f.dwt_cycles_between_edges : 0U;
-  row.clock_effective_interval_cycles =
-      vclock_valid ? vclock_f.dwt_interval_effective_cycles : 0U;
-
-  // Passive VCLOCK sanity candidate: compare the observed VCLOCK interval
-  // against the exact same selected PPS/VCLOCK reference interval used by
-  // OCXO Delta Cycles. This does not alter VCLOCK's GNSS identity authority.
-  const delta_residual_reference_t vclock_delta_reference =
-      delta_residual_capture_vclock_reference(public_count,
-                                              vclock_valid,
-                                              vclock_f);
-  delta_residual_apply_one(row,
-                           vclock_delta_reference,
-                           vclock_valid,
-                           vclock_f);
-
-  row.prior_edge_gnss_ns = beta_i64_from_u64_saturating(public_gnss_ns) -
-                           beta_i64_from_u64_saturating(CLOCKS_BETA_NS_PER_SECOND);
-  row.current_edge_gnss_ns = beta_i64_from_u64_saturating(public_gnss_ns);
-  row.prior_edge_gnss_ns_exact = (double)row.prior_edge_gnss_ns;
-  row.current_edge_gnss_ns_exact = (double)public_gnss_ns;
-  row.gnss_interval_ns = CLOCKS_BETA_NS_PER_SECOND;
-  row.clock_interval_ns = CLOCKS_BETA_NS_PER_SECOND;
-  row.fast_residual_ns = 0;
-  row.gnss_interval_ns_exact = (double)CLOCKS_BETA_NS_PER_SECOND;
-  row.clock_interval_ns_exact = (double)CLOCKS_BETA_NS_PER_SECOND;
-  row.fast_residual_ns_exact = 0.0;
-  row.tau_1s = 1.0;
-  row.ppb_1s = 0.0;
-  row.total_valid = public_gnss_ns != 0ULL;
-  row.total_sample_count = public_count;
-  row.total_clock_interval_ns = public_gnss_ns;
-  row.total_gnss_interval_ns = public_gnss_ns;
-  row.total_fast_residual_ns = 0;
-  row.total_clock_interval_ns_exact = (double)public_gnss_ns;
-  row.total_gnss_interval_ns_exact = (double)public_gnss_ns;
-  row.total_fast_residual_ns_exact = 0.0;
-  row.total_tau = 1.0;
-  row.total_ppb = 0.0;
-
   payload_add_clock_science_common(science, row);
-  science.add("edge_species", TIMEBASE_FRAGMENT_COMPACT_SCIENCE_ENABLED ? "PPS_VCLOCK" : "PPS_VCLOCK_AUTHORITY");
-  science.add("frequency_source", TIMEBASE_FRAGMENT_COMPACT_SCIENCE_ENABLED ? "GNSS" : "GNSS_IDENTITY");
   lane.add_object("science", science);
 }
 
-static FLASHMEM void payload_add_ocxo_science_object(Payload& lane,
-                                            const clock_science_row_t& row,
-                                            bool reported_valid,
-                                            uint64_t reported_gnss_interval_ns,
-                                            uint64_t reported_clock_interval_ns,
-                                            int64_t reported_fast_residual_ns,
-                                            bool forensics_valid,
-                                            const clocks_alpha_lane_forensics_t& forensics) {
-  Payload science;
-  payload_add_clock_science_common(science, row);
-  science.add("edge_species",
-              TIMEBASE_FRAGMENT_COMPACT_SCIENCE_ENABLED
-                  ? "OBSERVED_DWT_EDGE"
-                  : "OBSERVED_DWT_EDGE_AUTHORITY");
-  science.add("frequency_source",
-              TIMEBASE_FRAGMENT_COMPACT_SCIENCE_ENABLED
-                  ? "DELTA_OBSERVED_DWT_EDGE"
-                  : "DELTA_CYCLES_SAME_ROW_OBSERVED_DWT");
-  if (!TIMEBASE_FRAGMENT_COMPACT_SCIENCE_ENABLED) {
-    science.add("delta_formula",
-                "fast = same_row_pps_vclock_cycles - ocxo_observed_dwt_cycles");
-    science.add("traditional_projection_formula",
-                "pps_vclock_gnss_ns + signed(clock_raw_dwt - pps_vclock_dwt) * 1e9 / projection_cps");
-  }
-  science.add("reported_pps_residual_valid", reported_valid);
-  science.add("reported_pps_gnss_interval_ns",
-              reported_valid ? reported_gnss_interval_ns : 0ULL);
-  science.add("reported_pps_clock_interval_ns",
-              reported_valid ? reported_clock_interval_ns : 0ULL);
-  science.add("reported_pps_fast_residual_ns",
-              reported_valid ? reported_fast_residual_ns : 0LL);
-  science.add("reported_minus_canonical_residual_ns",
-              (reported_valid && row.valid)
-                  ? (reported_fast_residual_ns - row.fast_residual_ns)
-                  : 0LL);
-  science.add("reported_minus_observed_residual_ns",
-              (reported_valid && row.valid)
-                  ? (reported_fast_residual_ns - row.fast_residual_ns)
-                  : 0LL);
-  science.add("service_offset_ticks",
-              forensics_valid ? forensics.diag_service_offset_signed_ticks : 0);
-  lane.add_object("science", science);
-}
-
-static FLASHMEM void payload_add_slim_dwt_lane_forensics(
-    Payload& parent,
-    bool valid,
-    const clocks_alpha_lane_forensics_t& f) {
-  Payload dwt;
-  dwt.add("valid", valid);
-  dwt.add("update_count", valid ? f.update_count : 0U);
-  dwt.add("last_event_dwt", valid ? f.last_event_dwt : 0U);
-  dwt.add("last_event_counter32", valid ? f.last_event_counter32 : 0U);
-  dwt.add("counter32_delta_since_previous_event",
-          valid ? f.counter32_delta_since_previous_event : 0U);
-
-  dwt.add("cycles_between_edges", valid ? f.dwt_cycles_between_edges : 0U);
-  dwt.add("original_at_event", valid ? f.dwt_original_at_event : 0U);
-  dwt.add("predicted_at_event", valid ? f.dwt_predicted_at_event : 0U);
-  dwt.add("ema_dwt_at_event", valid ? f.dwt_ema_dwt_at_event : 0U);
-  dwt.add("used_at_event", valid ? f.dwt_used_at_event : 0U);
-  dwt.add("isr_entry_raw", valid ? f.dwt_isr_entry_raw : 0U);
-  dwt.add("event_from_isr_entry_raw",
-          valid ? f.dwt_event_from_isr_entry_raw : 0U);
-  dwt.add("isr_entry_to_event_correction_cycles",
-          valid ? f.dwt_isr_entry_to_event_correction_cycles : 0);
-  dwt.add("published_minus_event_cycles",
-          valid ? f.dwt_published_minus_event_cycles : 0);
-  dwt.add("used_minus_event_cycles",
-          valid ? f.dwt_used_minus_event_cycles : 0);
-  dwt.add("synthetic", valid && f.dwt_synthetic);
-  dwt.add("synthetic_error_cycles",
-          valid ? f.dwt_synthetic_error_cycles : 0);
-  dwt.add("synthetic_threshold_cycles",
-          valid ? f.dwt_synthetic_threshold_cycles : 0U);
-
-  Payload gate;
-  gate.add("valid", valid && f.dwt_interval_gate_valid);
-  gate.add("accepted", valid && f.dwt_interval_sample_accepted);
-  gate.add("rejected", valid && f.dwt_interval_sample_rejected);
-  gate.add("ema_updated", valid && f.dwt_interval_ema_updated);
-  gate.add("observed_cycles", valid ? f.dwt_interval_observed_cycles : 0U);
-  gate.add("prediction_cycles", valid ? f.dwt_interval_prediction_cycles : 0U);
-  gate.add("effective_cycles", valid ? f.dwt_interval_effective_cycles : 0U);
-  gate.add("residual_cycles", valid ? f.dwt_interval_residual_cycles : 0);
-  gate.add("threshold_cycles", valid ? f.dwt_interval_gate_threshold_cycles : 0U);
-  gate.add("accept_count", valid ? f.dwt_interval_accept_count : 0U);
-  gate.add("reject_count", valid ? f.dwt_interval_reject_count : 0U);
-  gate.add("reject_streak", valid ? f.dwt_interval_reject_streak : 0U);
-  dwt.add_object("interval_gate", gate);
-
-  Payload adjacency;
-  adjacency.add("valid", valid && f.dwt_interval_adjacency_gate_valid);
-  adjacency.add("ok", valid && f.dwt_interval_adjacency_ok);
-  adjacency.add("rejected", valid && f.dwt_interval_adjacency_rejected);
-  adjacency.add("counter_delta_ticks",
-                valid ? f.dwt_interval_counter_delta_ticks : 0U);
-  adjacency.add("expected_counter_delta_ticks",
-                valid ? f.dwt_interval_expected_counter_delta_ticks : 0U);
-  adjacency.add("reject_count",
-                valid ? f.dwt_interval_adjacency_reject_count : 0U);
-  dwt.add_object("adjacency", adjacency);
-
-  Payload yardstick;
-  yardstick.add("valid", valid && f.dwt_yardstick_valid);
-  yardstick.add("stale", valid && f.dwt_yardstick_stale);
-  yardstick.add("seeded", valid && f.dwt_yardstick_seeded);
-  yardstick.add("excursion", valid && f.dwt_yardstick_excursion);
-  yardstick.add("pps_sequence", valid ? f.dwt_yardstick_pps_sequence : 0U);
-  yardstick.add("pps_seq_delta", valid ? f.dwt_yardstick_pps_seq_delta : 0U);
-  yardstick.add("g_now_cycles", valid ? f.dwt_yardstick_g_now_cycles : 0U);
-  yardstick.add("g_prev_cycles", valid ? f.dwt_yardstick_g_prev_cycles : 0U);
-  yardstick.add("inferred_interval_cycles",
-                valid ? f.dwt_yardstick_inferred_interval_cycles : 0U);
-  yardstick.add("observed_interval_cycles",
-                valid ? f.dwt_yardstick_observed_interval_cycles : 0U);
-  yardstick.add("inferred_minus_observed_cycles",
-                valid ? f.dwt_yardstick_inferred_minus_observed_cycles : 0);
-  yardstick.add("endpoint_minus_observed_cycles",
-                valid ? f.dwt_yardstick_endpoint_minus_observed_cycles : 0);
-  yardstick.add("gate_threshold_cycles",
-                valid ? f.dwt_yardstick_gate_threshold_cycles : 0U);
-  yardstick.add("gate_agree_count",
-                valid ? f.dwt_yardstick_gate_agree_count : 0U);
-  yardstick.add("gate_excursion_count",
-                valid ? f.dwt_yardstick_gate_excursion_count : 0U);
-  yardstick.add("authority", valid && f.dwt_yardstick_authority);
-  yardstick.add("auth_error_cycles",
-                valid ? f.dwt_yardstick_auth_error_cycles : 0);
-  yardstick.add("auth_anchor_applied",
-                valid && f.dwt_yardstick_auth_anchor_applied);
-  dwt.add_object("yardstick", yardstick);
 
 
-  parent.add_object("dwt_forensics", dwt);
-}
-
-static FLASHMEM void payload_add_slim_pps_vclock_edge_forensics(
-    Payload& parent,
-    bool available,
-    const clocks_pps_vclock_edge_forensics_t& e) {
-  Payload edge;
-  edge.add("available", available);
-  edge.add("valid", available && e.valid);
-  edge.add("sequence", available ? e.sequence : 0U);
-  edge.add("update_count", available ? e.update_count : 0U);
-  edge.add("reject_count", available ? e.reject_count : 0U);
-  edge.add("decision", pps_vclock_edge_decision_name(available ? e.decision : 0U));
-  edge.add("decision_id", available ? e.decision : 0U);
-  edge.add("invalid_mask", available ? e.invalid_mask : 0U);
-
-  edge.add("authority_dwt_at_edge", available ? e.authority_dwt_at_edge : 0U);
-  edge.add("pps_dwt_at_edge", available ? e.pps_dwt_at_edge : 0U);
-  edge.add("vclock_observed_dwt_at_edge",
-           available ? e.vclock_observed_dwt_at_edge : 0U);
-  edge.add("vclock_predicted_dwt_at_edge",
-           available ? e.vclock_predicted_dwt_at_edge : 0U);
-  edge.add("pps_projected_vclock_dwt_at_edge",
-           available ? e.pps_projected_vclock_dwt_at_edge : 0U);
-
-  edge.add("authority_minus_pps_cycles",
-           available ? e.authority_minus_pps_cycles : 0);
-  edge.add("authority_minus_vclock_observed_cycles",
-           available ? e.authority_minus_vclock_observed_cycles : 0);
-  edge.add("authority_minus_prediction_cycles",
-           available ? e.authority_minus_prediction_cycles : 0);
-  edge.add("prediction_minus_pps_projected_cycles",
-           available ? e.prediction_minus_pps_projected_cycles : 0);
-  edge.add("pps_projected_minus_observed_cycles",
-           available ? e.pps_projected_minus_observed_cycles : 0);
-  edge.add("observed_minus_prediction_cycles",
-           available ? e.observed_minus_prediction_cycles : 0);
-
-  edge.add("counter32_at_edge", available ? e.counter32_at_edge : 0U);
-  edge.add("ch3_at_edge", available ? (uint32_t)e.ch3_at_edge : 0U);
-  edge.add("dwt_cycles_between_edges",
-           available ? e.dwt_cycles_between_edges : 0U);
-  edge.add("effective_dwt_cycles_per_second",
-           available ? e.effective_dwt_cycles_per_second : 0U);
-
-  edge.add("gnss_self_map_valid", available && e.gnss_self_map_valid);
-  edge.add("gnss_self_error_ok", available && e.gnss_self_error_ok);
-  edge.add("gnss_self_error_ns", available ? e.gnss_self_error_ns : 0LL);
-
-  parent.add_object("pps_vclock_edge", edge);
-}
-
-static FLASHMEM void payload_add_slim_compare_service(
-    Payload& parent,
-    interrupt_subscriber_kind_t kind,
-    bool valid,
-    const clocks_alpha_lane_forensics_t& f) {
-  Payload service;
-  service.add("class", valid ? f.diag_service_class : 0U);
-  service.add("offset_ticks", valid ? f.diag_service_offset_signed_ticks : 0);
-  service.add("offset_abs_ticks", valid ? f.diag_service_offset_abs_ticks : 0U);
-  service.add("interpreted_late_ticks",
-              valid ? f.diag_interpreted_late_ticks : 0U);
-  service.add("early_ticks", valid ? f.diag_early_ticks : 0U);
-  service.add("target_delta_mod65536_ticks",
-              valid ? f.diag_target_delta_mod65536_ticks : 0U);
-  service.add("arm_remaining_ticks",
-              valid ? f.diag_arm_remaining_ticks : 0U);
-  service.add("arm_to_isr_ticks",
-              valid ? f.diag_arm_to_isr_ticks : 0U);
-  service.add("arm_to_isr_dwt_cycles",
-              valid ? f.diag_arm_to_isr_dwt_cycles : 0U);
-  service.add("service_correction_cycles",
-              valid ? f.diag_service_correction_cycles : 0);
-  service.add("service_corrected_dwt_at_event",
-              valid ? f.diag_service_corrected_dwt_at_event : 0U);
-  service.add("perishable_fact_sequence",
-              valid ? f.diag_perishable_fact_sequence : 0U);
-  service.add("fact_ring_overflow_count",
-              valid ? f.diag_fact_ring_overflow_count : 0U);
-  service.add("counter_delta_violation_count",
-              valid ? f.diag_counter_delta_violation_count : 0U);
-  service.add("last_bad_counter_delta",
-              valid ? f.diag_last_bad_counter_delta : 0U);
-  service.add("last_counter_delta_ticks",
-              valid ? f.diag_last_counter_delta_ticks : 0U);
-
-  const interrupt_capture_diag_t* direct_diag =
-      valid ? interrupt_last_diag(kind) : nullptr;
-  const bool direct_valid = direct_diag && direct_diag->enabled &&
-                            direct_diag->kind == kind &&
-                            direct_diag->counter32_at_event == f.last_event_counter32;
-
-  Payload compare;
-  compare.add("direct_valid", direct_valid);
-  compare.add("arm_counter_low16",
-              direct_valid ? (uint32_t)direct_diag->ocxo_arm_counter_low16 : 0U);
-  compare.add("arm_compare_low16",
-              direct_valid ? (uint32_t)direct_diag->ocxo_arm_compare_low16 : 0U);
-  compare.add("arm_counter_minus_compare_ticks",
-              direct_valid ? direct_diag->ocxo_arm_counter_minus_compare_ticks : 0U);
-  compare.add("arm_compare_remaining_ticks",
-              direct_valid ? direct_diag->ocxo_arm_compare_remaining_ticks : 0U);
-  compare.add("isr_counter_low16",
-              direct_valid ? (uint32_t)direct_diag->ocxo_isr_counter_low16 : 0U);
-  compare.add("isr_compare_low16",
-              direct_valid ? (uint32_t)direct_diag->ocxo_isr_compare_low16 : 0U);
-  compare.add("isr_counter_minus_compare_ticks",
-              direct_valid ? direct_diag->ocxo_isr_counter_minus_compare_ticks : 0U);
-  compare.add("compare_delta_mod65536_ticks",
-              direct_valid ? direct_diag->ocxo_compare_delta_mod65536_ticks : 0U);
-  compare.add("compare_service_offset_signed_ticks",
-              direct_valid ? direct_diag->ocxo_compare_service_offset_signed_ticks : 0);
-  compare.add("compare_interpreted_late_ticks",
-              direct_valid ? direct_diag->ocxo_compare_interpreted_late_ticks : 0U);
-  compare.add("compare_early_ticks",
-              direct_valid ? direct_diag->ocxo_compare_early_ticks : 0U);
-  compare.add("compare_arm_to_isr_ticks",
-              direct_valid ? direct_diag->ocxo_compare_arm_to_isr_ticks : 0U);
-  service.add_object("compare", compare);
-
-  parent.add_object("compare_service", service);
-}
-
-static FLASHMEM void payload_add_slim_vclock_forensics(Payload& parent,
-                                              uint64_t public_ns,
-                                              bool valid,
-                                              const clocks_alpha_lane_forensics_t& f) {
-  Payload lane;
-  lane.add("ns", public_ns);
-  lane.add("public_ns", public_ns);
-  payload_add_slim_dwt_lane_forensics(lane, valid, f);
-  parent.add_object("vclock", lane);
-}
-
-static FLASHMEM void payload_add_slim_ocxo_forensics(
-    Payload& parent,
-    const char* key,
-    uint64_t public_ns,
-    uint64_t public_measured_ns,
-    bool forensics_valid,
-    const clocks_alpha_lane_forensics_t& f,
-    bool pps_projection_valid,
-    const clocks_alpha_ocxo_pps_projection_snapshot_t& pps_projection,
-    bool pps_residual_valid,
-    uint64_t pps_gnss_interval_ns,
-    uint64_t pps_clock_interval_ns,
-    int64_t pps_fast_residual_ns,
-    const ocxo_cycle_residual_diag_t& cycle_diag) {
-  Payload lane;
-  lane.add("ns", public_ns);
-  lane.add("public_ns", public_ns);
-  lane.add("measured_gnss_ns", public_measured_ns);
-  lane.add("pps_projected_valid", pps_projection_valid);
-  lane.add("pps_projected_raw_ns",
-           pps_projection_valid ? pps_projection.projected_ocxo_ns_at_pps : 0ULL);
-  lane.add("pps_projection_source",
-           pps_projection_valid ? pps_projection.source : 0U);
-
-  payload_add_ocxo_pps_residual_object(lane,
-                                       pps_residual_valid,
-                                       pps_gnss_interval_ns,
-                                       pps_clock_interval_ns,
-                                       pps_fast_residual_ns);
-
-  payload_add_ocxo_cycle_residual_diag_object(lane, cycle_diag);
-  payload_add_slim_dwt_lane_forensics(lane, forensics_valid, f);
-
-  const interrupt_subscriber_kind_t service_kind =
-      (key && key[4] == '1')
-          ? interrupt_subscriber_kind_t::OCXO1
-          : interrupt_subscriber_kind_t::OCXO2;
-  payload_add_slim_compare_service(lane, service_kind, forensics_valid, f);
-
-  parent.add_object(key, lane);
-}
 
 
-static FLASHMEM void payload_add_timebase_pair_identity(Payload& p,
-                                               const char* schema,
-                                               const char* version_key,
-                                               uint32_t version,
-                                               const char* pair_role,
-                                               uint32_t public_count,
-                                               uint64_t public_gnss_ns) {
-  p.add("schema", schema);
-  p.add(version_key, version);
-  p.add("timebase_pair_version", 1U);
-  p.add("pair_role", pair_role ? pair_role : "");
-  p.add("campaign", campaign_name);
-  p.add("teensy_pps_vclock_count", public_count);
-  p.add("teensy_pps_count",        public_count);
-  p.add("pps_count",               public_count);
-  p.add("gnss_ns",                 public_gnss_ns);
-  p.add("pps_vclock_gnss_ns_at_edge", public_gnss_ns);
-  p.add("dwt_at_pps_vclock",       (uint32_t)g_dwt_at_pps_vclock);
-  p.add("dwt_cycles_between_pps_vclock", (uint32_t)g_dwt_cycles_between_pps_vclock);
-  p.add("counter32_at_pps_vclock", (uint32_t)g_counter32_at_pps_vclock);
-  p.add("pps_dwt_at_edge",         (uint32_t)g_pps_dwt_at_edge);
-  p.add("pps_vclock_phase_cycles", (int32_t)g_pps_vclock_phase_cycles);
 
-  // Durable servo mode identity.  TIMEBASE consumers should not infer active
-  // calibration merely from the presence of DAC persistence values.  Publish
-  // the explicit CLOCKS-owned servo mode in both the fragment and forensics
-  // halves of the paired row.
-  p.add("servo_mode", servo_mode_str(calibrate_ocxo_mode));
-  p.add("servo_active", calibrate_ocxo_mode != servo_mode_t::OFF);
-}
 
-static FLASHMEM void payload_add_recovery_continuity_forensics(Payload& f,
-                                                              uint32_t public_count) {
-  if (g_recover_continuity_align_last_public_count != public_count) {
-    return;
-  }
 
-  // Recovery-continuity proof is useful, but not hot-fragment science. Keep it
-  // flat in the companion row: nested add_object_json() is exactly the Payload
-  // operation that overflowed when this proof lived in TIMEBASE_FRAGMENT.
-  f.add("rc_schema", "RECOVERY_CONTINUITY_V1");
-  f.add("rc_aligned", true);
-  f.add("rc_public_count", public_count);
-  f.add("rc_align_count", g_recover_continuity_align_count);
-  f.add("rc_requested_public_count",
-        g_recover_continuity_align_requested_public_count);
-  f.add("rc_reason", g_recover_continuity_last_reason);
-  f.add("rc_o1_target_ns", g_recover_continuity_ocxo1_target_ns);
-  f.add("rc_o2_target_ns", g_recover_continuity_ocxo2_target_ns);
-  f.add("rc_o1_before_ns", g_recover_continuity_ocxo1_before_ns);
-  f.add("rc_o2_before_ns", g_recover_continuity_ocxo2_before_ns);
-  f.add("rc_o1_after_ns", g_recover_continuity_ocxo1_after_ns);
-  f.add("rc_o2_after_ns", g_recover_continuity_ocxo2_after_ns);
-  f.add("rc_o1_correction_ns", g_recover_continuity_ocxo1_correction_ns);
-  f.add("rc_o2_correction_ns", g_recover_continuity_ocxo2_correction_ns);
-}
+
+
+
+
+
+
 
 static FLASHMEM void payload_add_raw_cycles_lane(
     Payload& parent,
     const char* key,
-    const char* edge_species,
-    const clocks_static_prediction_snapshot_t& sample) {
+    const clocks_static_prediction_snapshot_t& sample,
+    const interrupt_delay_forensics_t& delay) {
   Payload lane;
   lane.add("valid", sample.valid);
-  lane.add("edge_species", edge_species);
   lane.add("completed_interval_count", sample.completed_interval_count);
   lane.add("observed_cycles", sample.actual_cycles);
   lane.add("previous_observed_cycles", sample.static_prediction_cycles);
   lane.add("residual_cycles", sample.static_residual_cycles);
+
+  const char* delay_status = interrupt_delay_verdict_str(delay.verdict);
+  lane.add("delay_status", delay_status);
+  if (strcmp(delay_status, "ON_TIME") != 0) {
+    const bool residual_valid = delay.residual_delay_valid && sample.valid;
+    const int64_t residual_after_delay_64 = residual_valid
+        ? (int64_t)sample.static_residual_cycles -
+              (int64_t)delay.residual_delay_cycles
+        : 0LL;
+    const int32_t residual_after_delay =
+        residual_after_delay_64 > INT32_MAX
+            ? INT32_MAX
+            : (residual_after_delay_64 < INT32_MIN
+                   ? INT32_MIN
+                   : (int32_t)residual_after_delay_64);
+    const uint32_t residual_after_delay_abs = residual_after_delay < 0
+        ? (uint32_t)(-(int64_t)residual_after_delay)
+        : (uint32_t)residual_after_delay;
+    const bool explains = residual_valid &&
+        delay.residual_delay_cycles != 0 &&
+        residual_after_delay_abs <=
+            TIMEBASE_ISR_DELAY_EXPLANATION_GATE_CYCLES;
+
+    lane.add("delay_by", interrupt_delay_cause_str(delay.delayed_by));
+    lane.add("residual_delay_valid", residual_valid);
+    lane.add("residual_delay_cycles",
+             residual_valid ? delay.residual_delay_cycles : 0);
+    lane.add("residual_delay_by",
+             residual_valid
+                 ? interrupt_delay_cause_str(delay.residual_delayed_by)
+                 : "UNKNOWN");
+    lane.add("delay_explains_residual", explains);
+  }
+
   parent.add_object(key, lane);
 }
 
 static FLASHMEM void payload_add_raw_cycles_observed(Payload& p) {
   Payload raw;
-  raw.add("schema", "RAW_CYCLES_OBSERVED_V1");
-  raw.add("residual_definition", "CURRENT_OBSERVED_MINUS_PREVIOUS_OBSERVED");
-  raw.add("cross_rail_residuals", false);
-  raw.add("projection_used", false);
-
-  payload_add_raw_cycles_lane(raw, "pps", "PHYSICAL_PPS_DWT_EDGE",
-                              g_beta_pps_cycle_prediction);
-  payload_add_raw_cycles_lane(raw, "vclock", "OBSERVED_VCLOCK_DWT_EDGE",
-                              g_beta_vclock_cycle_prediction);
-  payload_add_raw_cycles_lane(raw, "ocxo1", "OBSERVED_OCXO_DWT_EDGE",
-                              g_beta_ocxo1_cycle_prediction);
-  payload_add_raw_cycles_lane(raw, "ocxo2", "OBSERVED_OCXO_DWT_EDGE",
-                              g_beta_ocxo2_cycle_prediction);
+  payload_add_raw_cycles_lane(raw,
+                              "pps",
+                              g_beta_pps_cycle_prediction,
+                              g_pps_witness_diag.interrupt_delay);
+  payload_add_raw_cycles_lane(raw,
+                              "vclock",
+                              g_beta_vclock_cycle_prediction,
+                              g_beta_pps_vclock_forensics.interrupt_delay);
+  payload_add_raw_cycles_lane(raw,
+                              "ocxo1",
+                              g_beta_ocxo1_cycle_prediction,
+                              g_beta_pps_ocxo1_forensics.interrupt_delay);
+  payload_add_raw_cycles_lane(raw,
+                              "ocxo2",
+                              g_beta_ocxo2_cycle_prediction,
+                              g_beta_pps_ocxo2_forensics.interrupt_delay);
   p.add_object("raw_cycles", raw);
 }
 
-static FLASHMEM uint32_t interrupt_delay_abs_i32(int32_t value) {
-  return value < 0 ? (uint32_t)(-(int64_t)value) : (uint32_t)value;
-}
 
-static FLASHMEM int32_t interrupt_delay_clamp_i64(int64_t value) {
-  return value > INT32_MAX
-      ? INT32_MAX
-      : (value < INT32_MIN ? INT32_MIN : (int32_t)value);
-}
 
-static FLASHMEM void payload_add_micro_interrupt_delay(
+
+
+static FLASHMEM void payload_add_ocxo_fragment(
     Payload& p,
-    const char* prefix,
-    const interrupt_delay_forensics_t& delay,
-    const clocks_static_prediction_snapshot_t& raw_cycles) {
-  char key[48];
-  auto add_bool = [&](const char* suffix, bool value) {
-    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
-    p.add(key, value);
-  };
-  auto add_u32 = [&](const char* suffix, uint32_t value) {
-    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
-    p.add(key, value);
-  };
-  auto add_i32 = [&](const char* suffix, int32_t value) {
-    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
-    p.add(key, value);
-  };
-  auto add_text = [&](const char* suffix, const char* value) {
-    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
-    p.add(key, value ? value : "UNKNOWN");
-  };
-
-  const bool interval_valid = delay.interval_delay_valid && raw_cycles.valid;
-  const bool residual_valid = delay.residual_delay_valid && raw_cycles.valid;
-  const int32_t residual_after_delay = residual_valid
-      ? interrupt_delay_clamp_i64(
-            (int64_t)raw_cycles.static_residual_cycles -
-            (int64_t)delay.residual_delay_cycles)
-      : 0;
-  const bool explains = residual_valid &&
-      delay.residual_delay_cycles != 0 &&
-      interrupt_delay_abs_i32(residual_after_delay) <=
-          TIMEBASE_ISR_DELAY_EXPLANATION_GATE_CYCLES;
-
-  // This is the ordinary 1 Hz expert-witness surface.  It deliberately omits
-  // SpinIdle shadows, NVIC registers, and compare counters.  Focused reports may
-  // retain those observations; TIMEBASE receives only the integrated verdict.
-  add_text("delay_status", interrupt_delay_verdict_str(delay.verdict));
-  add_text("delay_by", interrupt_delay_cause_str(delay.delayed_by));
-  add_bool("delay_cycles_valid", delay.valid && delay.delay_cycles_valid);
-  add_u32("delay_cycles",
-          delay.valid && delay.delay_cycles_valid ? delay.delay_cycles : 0U);
-  add_text("delay_confidence",
-           interrupt_delay_confidence_str(delay.confidence));
-  add_u32("delay_uncertainty_cycles",
-          delay.valid ? delay.uncertainty_cycles : 0U);
-
-  add_bool("interval_delay_valid", interval_valid);
-  add_i32("interval_delay_cycles",
-          interval_valid ? delay.interval_delay_cycles : 0);
-
-  add_bool("residual_delay_valid", residual_valid);
-  add_i32("residual_delay_cycles",
-          residual_valid ? delay.residual_delay_cycles : 0);
-  add_text("residual_delay_by",
-           residual_valid
-               ? interrupt_delay_cause_str(delay.residual_delayed_by)
-               : "UNKNOWN");
-  add_i32("residual_after_delay_cycles", residual_after_delay);
-  add_bool("delay_explains_residual", explains);
-}
-
-static FLASHMEM void payload_add_vclock_fragment(Payload& p,
-                                          uint64_t public_gnss_ns,
-                                          uint32_t public_count,
-                                          bool vclock_forensics_valid,
-                                          const clocks_alpha_lane_forensics_t& vclock_forensics) {
+    const char* key,
+    uint64_t public_ns,
+    bool clockface_valid,
+    const clock_science_row_t& science_row) {
   Payload lane;
-  lane.add("ns", public_gnss_ns);
-  lane.add("counter32_at_pps_vclock", (uint32_t)g_counter32_at_pps_vclock);
-  payload_add_vclock_science_object(lane,
-                                    public_count,
-                                    public_gnss_ns,
-                                    vclock_forensics_valid,
-                                    vclock_forensics);
-  p.add_object("vclock", lane);
-}
-
-static FLASHMEM void payload_add_vclock_forensics(Payload& p,
-                                         uint64_t public_gnss_ns,
-                                         bool forensics_valid,
-                                         const clocks_alpha_lane_forensics_t& f) {
-  Payload lane;
-  lane.add("ns", public_gnss_ns);
-  lane.add("counter32_at_pps_vclock", (uint32_t)g_counter32_at_pps_vclock);
-
-  // Full row-consistent interrupt and clock testimony is embedded directly in
-  // TIMEBASE; focused reports are convenience views, not hidden evidence stores.
-  payload_add_lane_forensics_object(lane, forensics_valid, f);
-  p.add_object("vclock", lane);
-}
-
-static FLASHMEM const char* counterledger_phase_source_name(uint32_t source_id) {
-  switch (source_id) {
-    case 1U:
-      return "PHYSICAL_PPS_TO_OBSERVED_OCXO_EDGE";
-    default:
-      return "NONE";
-  }
-}
-
-static FLASHMEM void payload_add_counterledger_candidate_object(
-    Payload& lane,
-    const clocks_alpha_ocxo_counterledger_snapshot_t& c,
-    uint64_t candidate_public_ns,
-    uint64_t canonical_public_ns,
-    uint64_t public_gnss_ns) {
-  Payload obj;
-  obj.add("enabled", clocks_ocxo_counterledger_report_enabled());
-  obj.add("authority", clocks_ocxo_counterledger_mode_enabled());
-  obj.add("report_only", !clocks_ocxo_counterledger_mode_enabled());
-  obj.add("sample_source", "EPOCH_CAPTURE_COUNTER32");
-  obj.add("pps_capture_exact", false);
-  obj.add("valid", c.valid);
-  obj.add("initialized", c.initialized);
-  obj.add("interval_valid", c.interval_valid);
-  obj.add("clock_id", c.clock_id);
-  obj.add("pps_sequence", c.pps_sequence);
-  obj.add("sample_count", c.sample_count);
-  obj.add("zero_counter32", c.zero_counter32);
-  obj.add("last_counter32", c.last_counter32);
-  obj.add("ticks64", c.ticks64);
-  obj.add("ns", c.ns);
-  obj.add("interval_ticks", c.last_delta_ticks);
-  obj.add("interval_ns", c.interval_ns);
-  obj.add("fast_residual_ns", c.interval_valid ? c.fast_residual_ns : 0LL);
-  obj.add("refined_valid", c.refined_valid);
-  obj.add("refined_ns", c.refined_valid ? c.refined_ns : 0ULL);
-  obj.add("refined_interval_valid", c.refined_interval_valid);
-  obj.add("refined_interval_ns",
-          c.refined_interval_valid ? c.refined_interval_ns : 0ULL);
-  obj.add("refined_fast_residual_ns",
-          c.refined_interval_valid ? c.refined_fast_residual_ns : 0LL);
-
-  Payload phase;
-  phase.add("valid", c.phase_valid);
-  phase.add("pending", c.phase_pending);
-  phase.add("source_id", c.phase_source_id);
-  phase.add("source", counterledger_phase_source_name(c.phase_source_id));
-  phase.add("pps_sequence", c.phase_pps_sequence);
-  phase.add("lag_pps", c.phase_lag_pps);
-  phase.add("pps_dwt_at_edge", c.phase_pps_dwt_at_edge);
-  phase.add("prev_ocxo_dwt_at_edge", c.phase_prev_ocxo_dwt_at_edge);
-  phase.add("next_ocxo_dwt_at_edge", c.phase_next_ocxo_dwt_at_edge);
-  phase.add("ocxo_interval_cycles", c.phase_ocxo_interval_cycles);
-  phase.add("pps_delta_cycles", c.phase_pps_delta_cycles);
-  phase.add("counter_cell_check_valid",
-            c.phase_counter_cell_check_valid);
-  phase.add("implied_ticks_since_prev_edge",
-            c.phase_implied_ticks_since_prev_edge);
-  phase.add("tick_remainder_cycles", c.phase_tick_remainder_cycles);
-  phase.add("sampled_minus_implied_ticks",
-            c.phase_sampled_minus_implied_ticks);
-  phase.add("phase_after_last_00_ns", c.phase_after_last_00_ns);
-  phase.add("phase_to_next_00_ns", c.phase_to_next_00_ns);
-  phase.add("raw_delta_ns", c.phase_raw_delta_ns);
-  phase.add("unwrapped_delta_ns", c.phase_unwrapped_delta_ns);
-  phase.add("unwrapped_carry_ticks", c.phase_unwrapped_carry_ticks);
-  phase.add("wrap_event", c.phase_wrap_event);
-  phase.add("wrap_count", c.phase_wrap_count);
-  phase.add("near_boundary", c.phase_near_boundary);
-  phase.add("resolve_count", c.phase_resolve_count);
-  phase.add("pending_overwrite_count", c.phase_pending_overwrite_count);
-  phase.add("invalid_count", c.phase_invalid_count);
-  obj.add_object("phaseledger", phase);
-
-  obj.add("candidate_public_ns", candidate_public_ns);
-  obj.add("candidate_minus_public_ns",
-          (candidate_public_ns && canonical_public_ns)
-              ? beta_signed_delta_u64(candidate_public_ns, canonical_public_ns)
-              : 0LL);
-  obj.add("candidate_minus_gnss_ns",
-          (candidate_public_ns && public_gnss_ns)
-              ? beta_signed_delta_u64(candidate_public_ns, public_gnss_ns)
-              : 0LL);
-  obj.add("capture_available", c.last_capture_available);
-  obj.add("capture_valid", c.last_capture_valid);
-  obj.add("capture_lane_valid", c.last_capture_lane_valid);
-  obj.add("capture_all_lanes_valid", c.last_capture_all_lanes_valid);
-  obj.add("capture_sequence_match", c.last_capture_sequence_match);
-  obj.add("capture_sequence", c.last_capture_sequence);
-  obj.add("capture_window_cycles", c.last_capture_window_cycles);
-  obj.add("update_count", c.update_count);
-  obj.add("capture_missing_count", c.capture_missing_count);
-  obj.add("capture_invalid_count", c.capture_invalid_count);
-  obj.add("lane_capture_invalid_count", c.lane_capture_invalid_count);
-  obj.add("sequence_mismatch_count", c.sequence_mismatch_count);
-  obj.add("all_lanes_invalid_count", c.all_lanes_invalid_count);
-  obj.add("interval_gap_count", c.interval_gap_count);
-  obj.add("interval_implausible_count", c.interval_implausible_count);
-  obj.add("last_implausible_delta_ticks", c.last_implausible_delta_ticks);
-  obj.add("recover_reprime_count", c.recover_reprime_count);
-  obj.add("plausible_min_delta_ticks", c.plausible_min_delta_ticks);
-  obj.add("plausible_max_delta_ticks", c.plausible_max_delta_ticks);
-
-  obj.add("block_window_seconds", c.block_window_seconds);
-  obj.add("block_valid", c.block_valid);
-  obj.add("block_start_pps_sequence", c.block_start_pps_sequence);
-  obj.add("block_end_pps_sequence", c.block_end_pps_sequence);
-  obj.add("block_interval_count", c.block_interval_count);
-  obj.add("block_ticks", c.block_ticks);
-  obj.add("block_fast_residual_sum_ns", c.block_fast_residual_sum_ns);
-  obj.add("block_mean_fast_residual_ns", toFixedDecimal(c.block_mean_fast_residual_ns, 6));
-  obj.add("block_tau", toFixedDecimal(c.block_tau, 12));
-  obj.add("block_ppb", toFixedDecimal(c.block_ppb, 6));
-  obj.add("block_phase_valid", c.block_phase_valid);
-  obj.add("block_ns_with_phase", c.block_ns_with_phase);
-  obj.add("block_fast_residual_sum_ns_with_phase",
-          c.block_fast_residual_sum_ns_with_phase);
-  obj.add("block_mean_fast_residual_ns_with_phase",
-          toFixedDecimal(c.block_mean_fast_residual_ns_with_phase, 6));
-  obj.add("block_tau_with_phase", toFixedDecimal(c.block_tau_with_phase, 12));
-  obj.add("block_ppb_with_phase", toFixedDecimal(c.block_ppb_with_phase, 6));
-  obj.add("completed_block_count", c.completed_block_count);
-  obj.add("completed_block_valid", c.completed_block_valid);
-  obj.add("completed_block_start_pps_sequence",
-          c.completed_block_start_pps_sequence);
-  obj.add("completed_block_end_pps_sequence",
-          c.completed_block_end_pps_sequence);
-  obj.add("completed_block_interval_count", c.completed_block_interval_count);
-  obj.add("completed_block_ticks", c.completed_block_ticks);
-  obj.add("completed_block_fast_residual_sum_ns",
-          c.completed_block_fast_residual_sum_ns);
-  obj.add("completed_block_mean_fast_residual_ns",
-          toFixedDecimal(c.completed_block_mean_fast_residual_ns, 6));
-  obj.add("completed_block_tau", toFixedDecimal(c.completed_block_tau, 12));
-  obj.add("completed_block_ppb", toFixedDecimal(c.completed_block_ppb, 6));
-  obj.add("completed_block_phase_valid", c.completed_block_phase_valid);
-  obj.add("completed_block_ns_with_phase", c.completed_block_ns_with_phase);
-  obj.add("completed_block_fast_residual_sum_ns_with_phase",
-          c.completed_block_fast_residual_sum_ns_with_phase);
-  obj.add("completed_block_mean_fast_residual_ns_with_phase",
-          toFixedDecimal(c.completed_block_mean_fast_residual_ns_with_phase, 6));
-  obj.add("completed_block_tau_with_phase",
-          toFixedDecimal(c.completed_block_tau_with_phase, 12));
-  obj.add("completed_block_ppb_with_phase",
-          toFixedDecimal(c.completed_block_ppb_with_phase, 6));
-  obj.add("block_gap_reset_count", c.block_gap_reset_count);
-  lane.add_object("counterledger", obj);
-}
-
-static FLASHMEM void payload_add_ocxo_fragment(Payload& p,
-                                      const char* key,
-                                      uint64_t public_ns,
-                                      uint64_t public_measured_ns,
-                                      bool pps_projection_valid,
-                                      uint32_t pps_projection_source,
-                                      bool pps_residual_valid,
-                                      uint64_t pps_gnss_interval_ns,
-                                      uint64_t pps_clock_interval_ns,
-                                      int64_t pps_fast_residual_ns,
-                                      const clocks_alpha_ocxo_counterledger_snapshot_t& counterledger,
-                                      uint64_t counterledger_public_ns,
-                                      uint64_t public_gnss_ns,
-                                      bool clockface_valid,
-                                      bool recovery_degraded,
-                                      const clock_science_row_t& science_row,
-                                      bool forensics_valid,
-                                      const clocks_alpha_lane_forensics_t& forensics) {
-  Payload lane;
-
-  // Compact science surface.  The public OCXO clockface may be authored by
-  // CounterLedger/PhaseLedger, while the per-second residual, Welford, and servo
-  // surfaces remain same-row observed Delta Cycles.  measured_gnss_ns and PPS
-  // projection flags remain legacy/forensic side-channels.
   lane.add("ns", public_ns);
-  lane.add("ns_source_id", clocks_ocxo_counterledger_mode_enabled()
-      ? 4U
-      : (pps_residual_valid ? 3U : 1U));
-  lane.add("ns_source_name",
-           clocks_ocxo_counterledger_mode_enabled()
-               ? "COUNTERLEDGER_PPS_CAPTURE"
-               : (pps_residual_valid ? "DELTA_CYCLES_TOTAL" : "MEASURED_GNSS_FALLBACK"));
-  lane.add("pps_projected_valid", pps_projection_valid);
-  lane.add("pps_projection_source", pps_projection_valid ? pps_projection_source : 0U);
-  lane.add("measured_gnss_ns", public_measured_ns);
   lane.add("clockface_valid", clockface_valid);
-  lane.add("science_ready",
-           science_row.valid && science_row.antecedents_complete);
-  lane.add("recovery_degraded", recovery_degraded);
-  const int64_t measured_minus_ns =
-      (public_measured_ns >= public_ns)
-          ? (int64_t)(public_measured_ns - public_ns)
-          : -(int64_t)(public_ns - public_measured_ns);
-  lane.add("measured_minus_ns", measured_minus_ns);
-
-  payload_add_ocxo_pps_residual_object(lane,
-                                       pps_residual_valid,
-                                       pps_gnss_interval_ns,
-                                       pps_clock_interval_ns,
-                                       pps_fast_residual_ns);
-
-  if (clocks_ocxo_counterledger_report_enabled()) {
-    payload_add_counterledger_candidate_object(lane,
-                                               counterledger,
-                                               counterledger_public_ns,
-                                               public_ns,
-                                               public_gnss_ns);
-  }
-
-  payload_add_ocxo_science_object(lane,
-                                  science_row,
-                                  pps_residual_valid,
-                                  pps_gnss_interval_ns,
-                                  pps_clock_interval_ns,
-                                  pps_fast_residual_ns,
-                                  forensics_valid,
-                                  forensics);
-
+  payload_add_ocxo_science_object(lane, science_row);
   p.add_object(key, lane);
 }
 
-static FLASHMEM void payload_add_ocxo_forensics(Payload& p,
-                                       const char* key,
-                                       uint64_t public_ns,
-                                       uint64_t public_measured_ns,
-                                       const clock_state_t& clock,
-                                       const clock_measurement_t& meas,
-                                       bool forensics_valid,
-                                       const clocks_alpha_lane_forensics_t& f,
-                                       bool pps_projection_valid,
-                                       const clocks_alpha_ocxo_pps_projection_snapshot_t& pps_projection,
-                                       uint64_t public_pps_projected_ns,
-                                       bool pps_residual_valid,
-                                       uint64_t pps_gnss_interval_ns,
-                                       uint64_t pps_clock_interval_ns,
-                                       int64_t pps_fast_residual_ns,
-                                       const ocxo_cycle_residual_diag_t& cycle_diag) {
-  (void)clock;
-  (void)meas;
-  (void)public_pps_projected_ns;
 
-  Payload lane;
-
-  // Lossless forensic surface for the paired TIMEBASE row.  The public clock,
-  // projection/Delta evidence, complete Interrupt arrival transcript, and exact
-  // arm/COMP1/CMPLD1/CNTR custody all travel with the same row identity.
-  lane.add("ns", public_ns);
-  lane.add("ns_source_id", clocks_ocxo_counterledger_mode_enabled()
-      ? 4U
-      : (pps_residual_valid ? 3U : 1U));
-  lane.add("ns_source_name",
-           clocks_ocxo_counterledger_mode_enabled()
-               ? "COUNTERLEDGER_PPS_CAPTURE"
-               : (pps_residual_valid ? "DELTA_CYCLES_TOTAL" : "MEASURED_GNSS_FALLBACK"));
-  lane.add("pps_projected_valid", pps_projection_valid);
-  lane.add("pps_projected_raw_ns",
-           pps_projection_valid ? pps_projection.projected_ocxo_ns_at_pps : 0ULL);
-  lane.add("pps_projection_source", pps_projection_valid ? pps_projection.source : 0U);
-  lane.add("measured_gnss_ns", public_measured_ns);
-  if (key && key[4] == '1') {
-    lane.add("physical_measured_gnss_ns_at_pps_vclock",
-             (uint64_t)g_ocxo1_physical_measured_gnss_ns_at_pps_vclock);
-    lane.add("visible_measured_gnss_ns_at_pps_vclock",
-             (uint64_t)g_ocxo1_measured_gnss_ns_at_pps_vclock);
-  } else {
-    lane.add("physical_measured_gnss_ns_at_pps_vclock",
-             (uint64_t)g_ocxo2_physical_measured_gnss_ns_at_pps_vclock);
-    lane.add("visible_measured_gnss_ns_at_pps_vclock",
-             (uint64_t)g_ocxo2_measured_gnss_ns_at_pps_vclock);
-  }
-
-  payload_add_ocxo_pps_residual_object(lane,
-                                       pps_residual_valid,
-                                       pps_gnss_interval_ns,
-                                       pps_clock_interval_ns,
-                                       pps_fast_residual_ns);
-
-  // Temporarily suppress the same-yardstick residual object in
-  // TIMEBASE_FORENSICS to make room for the OCXO compare-service excursion
-  // dossier below.  The scalar science residual remains in pps_residual, and
-  // the static prediction/object rails still expose the underlying cycles.
-  (void)cycle_diag;
-
-  payload_add_lane_forensics_object(lane, forensics_valid, f);
-  const interrupt_subscriber_kind_t service_kind =
-      (key && key[4] == '1')
-          ? interrupt_subscriber_kind_t::OCXO1
-          : interrupt_subscriber_kind_t::OCXO2;
-  payload_add_ocxo_service_object(lane, service_kind, forensics_valid, f);
-  p.add_object(key, lane);
-}
 
 // Servo source doctrine. MEAN and NOW always consume the same-row observed
 // Delta Cycles residual that feeds the OCXO Welfords and public pps_residual.
@@ -8706,12 +6982,9 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
   } else {
   }
 
-  // ── Legacy cycle-domain residual diagnostics ──
-  //
-  // This older static-prediction diagnostic remains forensic-only.  Canonical
-  // Delta residuals are carried in ocxoN.science.delta_raw_* and feed
-  // Welford, tau, public pps_residual, and servo all consume the same
-  // observed Delta science row.
+  // Four local observed-interval snapshots feed raw_cycles.  The prior
+  // completed interval is the prediction field; no duplicate prediction or
+  // cycle-residual diagnostic object is serialized.
   g_beta_pps_cycle_prediction = prediction_snapshot_for_pps();
   g_beta_vclock_cycle_prediction =
       prediction_snapshot_for_clock(time_clock_id_t::VCLOCK);
@@ -8719,26 +6992,6 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
       prediction_snapshot_for_clock(time_clock_id_t::OCXO1);
   g_beta_ocxo2_cycle_prediction =
       prediction_snapshot_for_clock(time_clock_id_t::OCXO2);
-  const clocks_static_prediction_snapshot_t& pps_cycle_prediction =
-      g_beta_pps_cycle_prediction;
-  const clocks_static_prediction_snapshot_t& vclock_cycle_prediction =
-      g_beta_vclock_cycle_prediction;
-  const clocks_static_prediction_snapshot_t& ocxo1_cycle_prediction =
-      g_beta_ocxo1_cycle_prediction;
-  const clocks_static_prediction_snapshot_t& ocxo2_cycle_prediction =
-      g_beta_ocxo2_cycle_prediction;
-  ocxo_cycle_residual_diag_build(g_beta_ocxo1_cycle_residual_diag,
-                                 pps_cycle_prediction, ocxo1_cycle_prediction,
-                                 ocxo1_science.traditional_valid,
-                                 ocxo1_science.traditional_fast_residual_ns);
-  ocxo_cycle_residual_diag_build(g_beta_ocxo2_cycle_residual_diag,
-                                 pps_cycle_prediction, ocxo2_cycle_prediction,
-                                 ocxo2_science.traditional_valid,
-                                 ocxo2_science.traditional_fast_residual_ns);
-  const ocxo_cycle_residual_diag_t& ocxo1_cycle_residual_diag =
-      g_beta_ocxo1_cycle_residual_diag;
-  const ocxo_cycle_residual_diag_t& ocxo2_cycle_residual_diag =
-      g_beta_ocxo2_cycle_residual_diag;
 
   // SERVOS live command handoff is control-plane state, so it still commits on
   // a rejected science row.  Scientific inputs, statistics, and DAC motion do not.
@@ -9009,7 +7262,7 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
 
   publish_dac_tick("STARTED");
 
-  // ── Build TIMEBASE_FRAGMENT ──
+  // ── Build compact TIMEBASE_FRAGMENT V5 ──
   g_timebase_last_public_count = public_count;
   g_timebase_last_public_gnss_ns = public_gnss_ns;
   g_timebase_last_public_dwt_total = public_dwt_total;
@@ -9017,38 +7270,28 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
   clocks_stack_witness_note_hot(CLOCKS_STACK_CONTEXT_BETA_PPS_BUILD);
 
   Payload& p = g_timebase_candidate_payload;
-  Payload& f = g_timebase_forensics_payload;
   p.clear();
-  f.clear();
 
-  {
-    payload_add_timebase_pair_identity(p,
-                                       "TIMEBASE_FRAGMENT_V4",
-                                       "fragment_version",
-                                       4U,
-                                       "fragment",
-                                       public_count,
-                                       public_gnss_ns);
-    p.add("paired_forensics_topic", "EMBEDDED");
-    p.add("paired_forensics_schema", "TIMEBASE_FORENSICS_V1");
-    p.add("timebase_message_version", 1U);
-    p.add("forensics_mode", "EMBEDDED");
-    p.add("campaign", campaign_name);
-    p.add("physical_pps_sequence", completed_pps_sequence);
-    p.add("campaign_state", clocks_campaign_state_name(campaign_state));
-    p.add("campaign_seconds", campaign_seconds);
-    p.add("gate_mode_schema", "CLOCKS_GATE_MODE_V1");
-    p.add("gate_mode", clocks_gate_mode_name(clocks_gate_mode()));
-    p.add("forensic_math_enabled", clocks_gate_mode_forensic());
-    p.add("candidate_math_applied", candidate_math_permitted);
-    p.add("candidate_disposition_schema",
-          "TIMEBASE_CANDIDATE_DISPOSITION_V1");
-    p.add("candidate_disposition",
-          candidate_science_reject ? "SCIENCE_REJECT" : "ACCEPT");
-    p.add("candidate_use",
-          candidate_science_reject ? "DO_NOT_USE" : "CANONICAL_CANDIDATE");
-    p.add("candidate_reason_code",
-          (uint32_t)candidate_reject.reason);
+  p.add("schema", "TIMEBASE_FRAGMENT_V5");
+  p.add("campaign", campaign_name);
+  p.add("campaign_state", clocks_campaign_state_name(campaign_state));
+  p.add("teensy_pps_vclock_count", public_count);
+
+  // Keep the flat GNSS alias for the current Pi stream-health canary.  The
+  // canonical clock value is also carried under gnss.ns.
+  p.add("gnss_ns", public_gnss_ns);
+  p.add("gate_mode", clocks_gate_mode_name(clocks_gate_mode()));
+  p.add("candidate_disposition",
+        candidate_science_reject ? "SCIENCE_REJECT" : "ACCEPT");
+  p.add("servo_mode", servo_mode_str(calibrate_ocxo_mode));
+  p.add("timeline_valid", recover_timeline_ready);
+  p.add("ocxo_clockface_valid", recover_clockface_ready);
+  p.add("ocxo_science_valid", recover_science_ready);
+
+  // Accepted rows need no empty courtroom dossier.  A rejected row keeps the
+  // complete first-failure testimony consumed by Pi CLOCKS.
+  if (candidate_science_reject) {
+    p.add("candidate_reason_code", (uint32_t)candidate_reject.reason);
     p.add("candidate_reason",
           clocks_science_reject_reason_name(candidate_reject.reason));
     p.add("candidate_source",
@@ -9059,9 +7302,22 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
     p.add("candidate_detail2", candidate_reject.detail2);
     p.add("candidate_detail3", candidate_reject.detail3);
     p.add("candidate_reject_mask", ocxo_science_invalid_mask);
-    p.add("timeline_valid", recover_timeline_ready);
-    p.add("ocxo_clockface_valid", recover_clockface_ready);
-    p.add("ocxo_science_valid", recover_science_ready);
+  }
+
+  // Recovery evidence is conditional.  The first splice row and every active,
+  // degraded, quarantined, or stalled row remain self-describing; ordinary
+  // steady-state rows no longer repeat an idle recovery transcript forever.
+  const bool recovery_row =
+      recover_transition_active ||
+      g_recover_reattach_active ||
+      g_recover_reattach_degraded_active ||
+      recover_degraded_science_hold ||
+      recover_science_quarantine_applied ||
+      g_science_residual_quarantine_remaining != 0U ||
+      g_recover_reattach_stalled ||
+      g_recover_continuity_align_last_public_count == public_count ||
+      g_recover_reattach_last_release_public_count == public_count;
+  if (recovery_row) {
     p.add("recover_generation", g_recover_request_count);
     p.add("recover_transition_active", recover_transition_active);
     p.add("recover_timeline_ready", recover_timeline_ready);
@@ -9070,11 +7326,9 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
     p.add("recover_ocxo1_clockface_ready", ocxo1_clockface_valid);
     p.add("recover_ocxo2_clockface_ready", ocxo2_clockface_valid);
     p.add("recover_ocxo1_science_ready",
-          ocxo1_science.valid &&
-          ocxo1_science.antecedents_complete);
+          ocxo1_science.valid && ocxo1_science.antecedents_complete);
     p.add("recover_ocxo2_science_ready",
-          ocxo2_science.valid &&
-          ocxo2_science.antecedents_complete);
+          ocxo2_science.valid && ocxo2_science.antecedents_complete);
     p.add("recover_science_quarantine_active",
           recover_science_quarantine_applied ||
           g_science_residual_quarantine_remaining != 0U);
@@ -9085,450 +7339,65 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
     p.add("recover_last_progress_public_count",
           g_recover_reattach_last_progress_public_count);
     p.add("recover_reattach_active", (bool)g_recover_reattach_active);
-    p.add("recover_degraded_active", (bool)g_recover_reattach_degraded_active);
+    p.add("recover_degraded_active",
+          (bool)g_recover_reattach_degraded_active);
     p.add("recover_degraded_science_hold", recover_degraded_science_hold);
     p.add("recover_reattach_stalled", (bool)g_recover_reattach_stalled);
     p.add("recover_reattach_reason", g_recover_reattach_last_reason);
-    p.add("teensy_evidence_invalid_mask", ocxo_science_invalid_mask);
-    p.add("teensy_evidence_status",
-          ocxo_science_invalid_mask == 0U ? "NOMINAL" : "CUSTODY_WARNING");
-    p.add("teensy_evidence_reason",
-          ocxo_science_invalid_mask == 0U
-              ? "none"
-              : "beta_ocxo_science_custody_invalid");
-
-    // Minimal flat compatibility spine.  TIMEBASE stores this fragment as an
-    // opaque object, but Pi-side indexing and older tools still need these few
-    // top-level identities while reports migrate to the paired schema.
-    timebase_build_stage(TIMEBASE_BUILD_STAGE_SPINE);
-
-    {
-      timebase_build_stage(TIMEBASE_BUILD_STAGE_GNSS);
-      Payload gnss;
-      gnss.add("ns", public_gnss_ns);
-      gnss.add("ocxo1_ns", public_ocxo1_ns);
-      gnss.add("ocxo2_ns", public_ocxo2_ns);
-      p.add_object("gnss", gnss);
-    }
-
-    {
-      timebase_build_stage(TIMEBASE_BUILD_STAGE_DWT);
-      Payload dwt;
-      // DWT is a first-class clock, but its native ledger unit is CPU cycles,
-      // not nanoseconds.  Keep a generic value/unit pair for dashboards while
-      // retaining the explicit cycle_count_total name for durable tools.
-      dwt.add("value", public_dwt_total);
-      dwt.add("unit", "cycles");
-      dwt.add("cycles", public_dwt_total);
-      dwt.add("cycle_count_total", public_dwt_total);
-      dwt.add("cycles_between_pps_vclock", (uint32_t)g_dwt_cycles_between_pps_vclock);
-      dwt.add("second_residual_cycles",
-              (int32_t)((int64_t)g_dwt_cycles_between_pps_vclock -
-                        (int64_t)DWT_EXPECTED_PER_PPS));
-      if (!TIMEBASE_FRAGMENT_COMPACT_SCIENCE_ENABLED) {
-        Payload science;
-        const double dwt_ppb_1s =
-            ((double)g_dwt_cycles_between_pps_vclock -
-             (double)DWT_EXPECTED_PER_PPS) /
-            (double)DWT_EXPECTED_PER_PPS * 1.0e9;
-        const uint64_t expected_total_cycles = dwt_ns_to_cycles(public_gnss_ns);
-        const double dwt_total_ppb = campaign_total_dwt_ppb(public_gnss_ns,
-                                                            public_dwt_total);
-        science.add("schema", "TIMEBASE_CLOCK_SCIENCE_V2");
-        science.add("valid", g_dwt_cycles_between_pps_vclock != 0U);
-        science.add("clock_id", 0U);
-        science.add("edge_species", "PPS_GNSS_DWT_RULER");
-        science.add("frequency_source", "DWT_CYCLES_OVER_IDEAL_CPU_CYCLES");
-        science.add("cycles_between_edges", (uint32_t)g_dwt_cycles_between_pps_vclock);
-        science.add("expected_cycles_between_edges", (uint32_t)DWT_EXPECTED_PER_PPS);
-        science.add("second_residual_cycles",
-                    (int32_t)((int64_t)g_dwt_cycles_between_pps_vclock -
-                              (int64_t)DWT_EXPECTED_PER_PPS));
-        science.add("tau_1s", toFixedDecimal(1.0 + dwt_ppb_1s / 1.0e9, 12));
-        science.add("ppb_1s", toFixedDecimal(dwt_ppb_1s, 6));
-        science.add("total_cycles", public_dwt_total);
-        science.add("total_expected_cycles", expected_total_cycles);
-        science.add("total_tau", toFixedDecimal(1.0 + dwt_total_ppb / 1.0e9, 12));
-        science.add("total_ppb", toFixedDecimal(dwt_total_ppb, 6));
-        dwt.add_object("science", science);
-      }
-      p.add_object("dwt", dwt);
-    }
-
-    {
-      timebase_build_stage(TIMEBASE_BUILD_STAGE_PPS);
-      Payload pps;
-      pps.add("sequence", completed_pps_sequence);
-      pps.add("dwt_cycles_between_edges",
-              g_pps_dwt_cycles_between_edges_valid
-                  ? (uint32_t)g_pps_dwt_cycles_between_edges
-                  : 0U);
-      pps.add("dwt_cycles_between_edges_valid",
-              (bool)g_pps_dwt_cycles_between_edges_valid);
-      pps.add("vclock_phase_cycles", (int32_t)g_pps_vclock_phase_cycles);
-      if (!TIMEBASE_FRAGMENT_COMPACT_SCIENCE_ENABLED) {
-        Payload science;
-        science.add("schema", "TIMEBASE_CLOCK_SCIENCE_V2");
-        science.add("valid", (bool)g_pps_dwt_cycles_between_edges_valid);
-        science.add("clock_id", 0U);
-        science.add("edge_species", "PHYSICAL_PPS_WITNESS");
-        science.add("frequency_source", "GNSS_IDENTITY_WITNESS");
-        science.add("positive_means", "clock_fast");
-        science.add("pps_dwt_at_edge", (uint32_t)g_pps_dwt_at_edge);
-        science.add("pps_vclock_dwt_at_edge", (uint32_t)g_dwt_at_pps_vclock);
-        science.add("pps_vclock_gnss_ns_at_edge", public_gnss_ns);
-        science.add("pps_vclock_phase_cycles", (int32_t)g_pps_vclock_phase_cycles);
-        science.add("dwt_cycles_between_edges",
-                    g_pps_dwt_cycles_between_edges_valid
-                        ? (uint32_t)g_pps_dwt_cycles_between_edges
-                        : 0U);
-        science.add("gnss_interval_ns", CLOCKS_BETA_NS_PER_SECOND);
-        science.add("clock_interval_ns", CLOCKS_BETA_NS_PER_SECOND);
-        science.add("fast_residual_ns", 0LL);
-        science.add("gnss_interval_ns_exact", toFixedDecimal((double)CLOCKS_BETA_NS_PER_SECOND, 6));
-        science.add("clock_interval_ns_exact", toFixedDecimal((double)CLOCKS_BETA_NS_PER_SECOND, 6));
-        science.add("fast_residual_ns_exact", toFixedDecimal(0.0, 6));
-        science.add("tau_1s", toFixedDecimal(1.0, 12));
-        science.add("ppb_1s", toFixedDecimal(0.0, 6));
-        pps.add_object("science", science);
-      }
-      p.add_object("pps", pps);
-    }
-
-    // Canonical four-rail raw-cycle surface.  Each residual is local to its
-    // own clock: current observed one-second interval minus the prior observed
-    // one-second interval.  No cross-rail subtraction or alternate estimator
-    // participates in this object.
-    payload_add_raw_cycles_observed(p);
-
-    // Publish the complete four-lane static-prediction transcript in every
-    // TIMEBASE row.  The prediction for each lane is the prior completed
-    // interval; actual and residual remain separate same-row evidence.
-    timebase_build_stage(TIMEBASE_BUILD_STAGE_PREDICTION);
-    if (TIMEBASE_FRAGMENT_PUBLISH_PREDICTION_ENABLED) {
-      payload_add_prediction_summary_hierarchical(p);
-    }
-
-    timebase_build_stage(TIMEBASE_BUILD_STAGE_VCLOCK);
-    payload_add_vclock_fragment(p,
-                                public_gnss_ns,
-                                public_count,
-                                vclock_forensics_valid,
-                                vclock_forensics);
-
-    timebase_build_stage(TIMEBASE_BUILD_STAGE_OCXO1);
-    payload_add_ocxo_fragment(p,
-                              "ocxo1",
-                              public_ocxo1_ns,
-                              public_ocxo1_measured_ns,
-                              ocxo1_pps_projected_valid,
-                              ocxo1_pps_projection.source,
-                              pps_residuals.ocxo1_valid,
-                              pps_residuals.gnss_interval_ns,
-                              pps_residuals.ocxo1_interval_ns,
-                              pps_residuals.ocxo1_fast_residual_ns,
-                              ocxo1_counterledger,
-                              public_ocxo1_counterledger_ns,
-                              public_gnss_ns,
-                              ocxo1_clockface_valid,
-                              recover_degraded_science_hold,
-                              ocxo1_science,
-                              ocxo1_forensics_valid,
-                              ocxo1_forensics);
-
-    timebase_build_stage(TIMEBASE_BUILD_STAGE_OCXO2);
-    payload_add_ocxo_fragment(p,
-                              "ocxo2",
-                              public_ocxo2_ns,
-                              public_ocxo2_measured_ns,
-                              ocxo2_pps_projected_valid,
-                              ocxo2_pps_projection.source,
-                              pps_residuals.ocxo2_valid,
-                              pps_residuals.gnss_interval_ns,
-                              pps_residuals.ocxo2_interval_ns,
-                              pps_residuals.ocxo2_fast_residual_ns,
-                              ocxo2_counterledger,
-                              public_ocxo2_counterledger_ns,
-                              public_gnss_ns,
-                              ocxo2_clockface_valid,
-                              recover_degraded_science_hold,
-                              ocxo2_science,
-                              ocxo2_forensics_valid,
-                              ocxo2_forensics);
-
-    timebase_build_stage(TIMEBASE_BUILD_STAGE_STATS);
-    payload_add_stats_summary_hierarchical(p,
-                                           public_gnss_ns,
-                                           public_dwt_total,
-                                           ocxo1_science,
-                                           ocxo2_science);
-
-    // System DAC persistence feed.  The Pi should update the simplified
-    // system config only while the servo is actively tuning; manual/static DAC
-    // values are loaded at START/SET_DAC but are not re-persisted every second.
-    if (clocks_servo_active()) {
-      payload_add_servo_dac_values(p);
-    }
-
-    timebase_build_stage(TIMEBASE_BUILD_STAGE_BUILD_COMPLETE);
-
-    timebase_build_stage(TIMEBASE_BUILD_STAGE_ASSIGN_LAST_FRAGMENT);
-    // The candidate remains in the reusable RAM2 Payload until its embedded
-    // forensics child has been attached and the single publish returns.
   }
 
+  timebase_build_stage(TIMEBASE_BUILD_STAGE_GNSS);
   {
-    timebase_build_stage(TIMEBASE_BUILD_STAGE_FORENSICS_BUILD_BEGIN);
-
-    payload_add_timebase_pair_identity(f,
-                                       "TIMEBASE_FORENSICS_V1",
-                                       "forensics_version",
-                                       1U,
-                                       "forensics",
-                                       public_count,
-                                       public_gnss_ns);
-    f.add("embedded", true);
-    f.add("physical_pps_sequence", completed_pps_sequence);
-    f.add("paired_fragment_topic", "TIMEBASE_FRAGMENT");
-    f.add("paired_fragment_schema", "TIMEBASE_FRAGMENT_V4");
-    f.add("paired_fragment_version", 4U);
-    payload_add_recovery_continuity_forensics(f, public_count);
-
-    // Every TIMEBASE row carries the expert-witness verdict regardless of
-    // whether the remaining forensic body is minimal, slim, or full.
-    f.add("interrupt_delay_schema", "ISR_DELAY_VERDICT_V3");
-    f.add("interrupt_delay_interval_definition",
-          "CURRENT_ENDPOINT_DELAY_MINUS_PREVIOUS_ENDPOINT_DELAY");
-    f.add("interrupt_delay_residual_definition",
-          "CURRENT_INTERVAL_DELAY_MINUS_PREVIOUS_INTERVAL_DELAY");
-    payload_add_micro_interrupt_delay(
-        f, "pps", g_pps_witness_diag.interrupt_delay,
-        g_beta_pps_cycle_prediction);
-    payload_add_micro_interrupt_delay(
-        f, "v", vclock_forensics.interrupt_delay,
-        g_beta_vclock_cycle_prediction);
-    payload_add_micro_interrupt_delay(
-        f, "o1", ocxo1_forensics.interrupt_delay,
-        g_beta_ocxo1_cycle_prediction);
-    payload_add_micro_interrupt_delay(
-        f, "o2", ocxo2_forensics.interrupt_delay,
-        g_beta_ocxo2_cycle_prediction);
-
-    f.add("lossless", !TIMEBASE_FORENSICS_MINIMAL_PAYLOAD_ENABLED &&
-                      !TIMEBASE_FORENSICS_SLIM_RAW_CYCLES_PAYLOAD_ENABLED);
-    f.add("forensics_profile",
-          TIMEBASE_FORENSICS_MINIMAL_PAYLOAD_ENABLED
-              ? "MINIMAL_EMBEDDED"
-              : (TIMEBASE_FORENSICS_SLIM_RAW_CYCLES_PAYLOAD_ENABLED
-                     ? "SLIM_RAW_CYCLES"
-                     : "FULL_LOSSLESS"));
-
-    if (TIMEBASE_FORENSICS_MINIMAL_PAYLOAD_ENABLED) {
-      // Minimal embedded mode: retain the raw-cycle evidence needed by Pi-side
-      // adjudication and focused tools without reintroducing the large deep
-      // forensic body into the one-second candidate.
-      f.add("minimal", true);
-      f.add("temporary_safety_mode", "MINIMAL_EMBEDDED");
-
-      if (TIMEBASE_FORENSICS_MINIMAL_HEALTH_FIELDS_ENABLED) {
-        f.add("pps_vclock_edge_available", pps_vclock_edge_forensics_valid);
-        f.add("vclock_forensics_available", vclock_forensics_valid);
-        f.add("ocxo1_forensics_available", ocxo1_forensics_valid);
-        f.add("ocxo2_forensics_available", ocxo2_forensics_valid);
-        f.add("ocxo1_pps_projected", ocxo1_pps_projected_valid);
-        f.add("ocxo2_pps_projected", ocxo2_pps_projected_valid);
-        f.add("ocxo1_pps_residual_valid", pps_residuals.ocxo1_valid);
-        f.add("ocxo2_pps_residual_valid", pps_residuals.ocxo2_valid);
-      }
-
-      if (TIMEBASE_FORENSICS_MICRO_RAW_CYCLES_ENABLED) {
-        // Flat bounded telemetry for raw_cycles/raw_cycles_excursions.
-        // The retired fitted-endpoint rail is not transported.
-        f.add("micro_raw_cycles", true);
-        f.add("micro_schema", "MICRO_RAW_CYCLES_V4_OBSERVED");
-        f.add("micro_profile", "OBSERVED_DWT_ENDPOINTS");
-        if (TIMEBASE_FORENSICS_MICRO_COURT_FIELDS_ENABLED) {
-          f.add("court_schema", "DWT_PUBLICATION_COURT_V1");
-        }
-
-        f.add("pps_obs", g_pps_dwt_cycles_between_edges_valid
-                         ? g_pps_dwt_cycles_between_edges
-                         : 0U);
-
-        if (g_start_prologue_last_release_public_count == public_count &&
-            g_start_prologue_pps0_interval_valid) {
-          f.add("start_pps0_valid", true);
-          f.add("pps_prev_obs", (uint32_t)g_start_prologue_pps0_pps_obs);
-          f.add("v_prev_obs", (uint32_t)g_start_prologue_pps0_v_obs);
-          f.add("o1_prev_obs", (uint32_t)g_start_prologue_pps0_o1_obs);
-          f.add("o2_prev_obs", (uint32_t)g_start_prologue_pps0_o2_obs);
-        }
-
-        const bool v_ok = vclock_forensics_valid;
-        const uint32_t v_raw_dwt =
-            v_ok ? vclock_forensics.dwt_original_at_event : 0U;
-        const uint32_t v_ema_dwt =
-            v_ok ? vclock_forensics.dwt_ema_dwt_at_event : 0U;
-        const uint32_t v_pub_dwt =
-            v_ok ? vclock_forensics.dwt_used_at_event : 0U;
-        f.add("v_obs", v_ok ? vclock_forensics.dwt_interval_observed_cycles : 0U);
-        f.add("v_eff", v_ok ? vclock_forensics.dwt_interval_effective_cycles : 0U);
-        f.add("v_res", v_ok ? vclock_forensics.dwt_interval_residual_cycles : 0);
-        f.add("v_raw", v_raw_dwt);
-        f.add("v_ema", v_ema_dwt);
-        f.add("v_pub", v_pub_dwt);
-        f.add("v_orig", v_raw_dwt);
-        f.add("v_used", v_pub_dwt);
-        payload_add_micro_court_fields(f, "v", v_ok, vclock_forensics);
-
-        const bool o1_ok = ocxo1_forensics_valid;
-        const uint32_t o1_raw_dwt =
-            o1_ok ? ocxo1_forensics.dwt_original_at_event : 0U;
-        const uint32_t o1_ema_dwt =
-            o1_ok ? ocxo1_forensics.dwt_ema_dwt_at_event : 0U;
-        const uint32_t o1_pub_dwt =
-            o1_ok ? ocxo1_forensics.dwt_used_at_event : 0U;
-        f.add("o1_obs", o1_ok ? ocxo1_forensics.dwt_interval_observed_cycles : 0U);
-        f.add("o1_eff", o1_ok ? ocxo1_forensics.dwt_interval_effective_cycles : 0U);
-        f.add("o1_res", o1_ok ? ocxo1_forensics.dwt_interval_residual_cycles : 0);
-        f.add("o1_raw", o1_raw_dwt);
-        f.add("o1_ema", o1_ema_dwt);
-        f.add("o1_pub", o1_pub_dwt);
-        f.add("o1_orig", o1_raw_dwt);
-        f.add("o1_used", o1_pub_dwt);
-        payload_add_micro_court_fields(f, "o1", o1_ok, ocxo1_forensics);
-        payload_add_micro_counterledger_fields(f, "o1", ocxo1_counterledger);
-
-        const bool o2_ok = ocxo2_forensics_valid;
-        const uint32_t o2_raw_dwt =
-            o2_ok ? ocxo2_forensics.dwt_original_at_event : 0U;
-        const uint32_t o2_ema_dwt =
-            o2_ok ? ocxo2_forensics.dwt_ema_dwt_at_event : 0U;
-        const uint32_t o2_pub_dwt =
-            o2_ok ? ocxo2_forensics.dwt_used_at_event : 0U;
-        f.add("o2_obs", o2_ok ? ocxo2_forensics.dwt_interval_observed_cycles : 0U);
-        f.add("o2_eff", o2_ok ? ocxo2_forensics.dwt_interval_effective_cycles : 0U);
-        f.add("o2_res", o2_ok ? ocxo2_forensics.dwt_interval_residual_cycles : 0);
-        f.add("o2_raw", o2_raw_dwt);
-        f.add("o2_ema", o2_ema_dwt);
-        f.add("o2_pub", o2_pub_dwt);
-        f.add("o2_orig", o2_raw_dwt);
-        f.add("o2_used", o2_pub_dwt);
-        payload_add_micro_court_fields(f, "o2", o2_ok, ocxo2_forensics);
-        payload_add_micro_counterledger_fields(f, "o2", ocxo2_counterledger);
-      }
-
-    } else if (TIMEBASE_FORENSICS_SLIM_RAW_CYCLES_PAYLOAD_ENABLED) {
-      // Curated campaign-row forensics: enough for raw_cycles /
-      // raw_cycles_excursions, including observed, EMA, and Yardstick cycle
-      // surfaces, while omitting bulky deep-autopsy objects.
-      f.add("minimal", false);
-      f.add("slim_raw_cycles", true);
-
-      payload_add_slim_pps_vclock_edge_forensics(
-          f, pps_vclock_edge_forensics_valid, pps_vclock_edge_forensics);
-
-      timebase_build_stage(TIMEBASE_BUILD_STAGE_VCLOCK);
-      payload_add_slim_vclock_forensics(f,
-                                        public_gnss_ns,
-                                        vclock_forensics_valid,
-                                        vclock_forensics);
-
-      timebase_build_stage(TIMEBASE_BUILD_STAGE_OCXO1);
-      payload_add_slim_ocxo_forensics(f,
-                                      "ocxo1",
-                                      public_ocxo1_ns,
-                                      public_ocxo1_measured_ns,
-                                      ocxo1_forensics_valid,
-                                      ocxo1_forensics,
-                                      ocxo1_pps_projected_valid,
-                                      ocxo1_pps_projection,
-                                      pps_residuals.ocxo1_valid,
-                                      pps_residuals.gnss_interval_ns,
-                                      pps_residuals.ocxo1_interval_ns,
-                                      pps_residuals.ocxo1_fast_residual_ns,
-                                      ocxo1_cycle_residual_diag);
-
-      timebase_build_stage(TIMEBASE_BUILD_STAGE_OCXO2);
-      payload_add_slim_ocxo_forensics(f,
-                                      "ocxo2",
-                                      public_ocxo2_ns,
-                                      public_ocxo2_measured_ns,
-                                      ocxo2_forensics_valid,
-                                      ocxo2_forensics,
-                                      ocxo2_pps_projected_valid,
-                                      ocxo2_pps_projection,
-                                      pps_residuals.ocxo2_valid,
-                                      pps_residuals.gnss_interval_ns,
-                                      pps_residuals.ocxo2_interval_ns,
-                                      pps_residuals.ocxo2_fast_residual_ns,
-                                      ocxo2_cycle_residual_diag);
-    } else {
-      payload_add_pps_vclock_edge_forensics(f,
-                                            pps_vclock_edge_forensics_valid,
-                                            pps_vclock_edge_forensics);
-
-      timebase_build_stage(TIMEBASE_BUILD_STAGE_VCLOCK);
-      payload_add_vclock_forensics(f,
-                                   public_gnss_ns,
-                                   vclock_forensics_valid,
-                                   vclock_forensics);
-
-      timebase_build_stage(TIMEBASE_BUILD_STAGE_OCXO1);
-      payload_add_ocxo_forensics(f,
-                                 "ocxo1",
-                                 public_ocxo1_ns,
-                                 public_ocxo1_measured_ns,
-                                 g_ocxo1_clock,
-                                 g_ocxo1_measurement,
-                                 ocxo1_forensics_valid,
-                                 ocxo1_forensics,
-                                 ocxo1_pps_projected_valid,
-                                 ocxo1_pps_projection,
-                                 0ULL,
-                                 pps_residuals.ocxo1_valid,
-                                 pps_residuals.gnss_interval_ns,
-                                 pps_residuals.ocxo1_interval_ns,
-                                 pps_residuals.ocxo1_fast_residual_ns,
-                                 ocxo1_cycle_residual_diag);
-
-      timebase_build_stage(TIMEBASE_BUILD_STAGE_OCXO2);
-      payload_add_ocxo_forensics(f,
-                                 "ocxo2",
-                                 public_ocxo2_ns,
-                                 public_ocxo2_measured_ns,
-                                 g_ocxo2_clock,
-                                 g_ocxo2_measurement,
-                                 ocxo2_forensics_valid,
-                                 ocxo2_forensics,
-                                 ocxo2_pps_projected_valid,
-                                 ocxo2_pps_projection,
-                                 0ULL,
-                                 pps_residuals.ocxo2_valid,
-                                 pps_residuals.gnss_interval_ns,
-                                 pps_residuals.ocxo2_interval_ns,
-                                 pps_residuals.ocxo2_fast_residual_ns,
-                                 ocxo2_cycle_residual_diag);
-    }
-
-    timebase_build_stage(TIMEBASE_BUILD_STAGE_FORENSICS_BUILD_COMPLETE);
-
-    // Legacy counter variables now describe the embedded-forensics attach operation.
-    timebase_build_stage(TIMEBASE_BUILD_STAGE_FORENSICS_PUBLISH_ATTEMPT);
-    const bool forensics_embedded = p.add_object("forensics", f);
-    p.add("forensics_embedded", forensics_embedded);
-    p.add("forensics_schema", "TIMEBASE_FORENSICS_V1");
-
-    timebase_build_stage(TIMEBASE_BUILD_STAGE_FORENSICS_PUBLISH_RETURN);
+    Payload gnss;
+    gnss.add("ns", public_gnss_ns);
+    p.add_object("gnss", gnss);
   }
 
-  // One publish attempt per completed PPS identity. Even an embed failure is emitted;
-  // the Pi envelope court will log and drop that candidate rather than mistake
-  // firmware qualification silence for a dead TIMEBASE pipeline.
+  timebase_build_stage(TIMEBASE_BUILD_STAGE_DWT);
+  {
+    Payload dwt;
+    dwt.add("cycle_count_total", public_dwt_total);
+    dwt.add("cycles_between_pps_vclock",
+            (uint32_t)g_dwt_cycles_between_pps_vclock);
+    // Compact metrics-panel edge identity. These two values are not derivable
+    // from raw_cycles: they identify the selected PPS/VCLOCK capture itself.
+    dwt.add("at_pps_vclock", (uint32_t)g_dwt_at_pps_vclock);
+    dwt.add("counter32_at_pps_vclock",
+            (uint32_t)g_counter32_at_pps_vclock);
+    p.add_object("dwt", dwt);
+  }
+
+  payload_add_raw_cycles_observed(p);
+
+  timebase_build_stage(TIMEBASE_BUILD_STAGE_OCXO1);
+  payload_add_ocxo_fragment(p,
+                            "ocxo1",
+                            public_ocxo1_ns,
+                            ocxo1_clockface_valid,
+                            ocxo1_science);
+
+  timebase_build_stage(TIMEBASE_BUILD_STAGE_OCXO2);
+  payload_add_ocxo_fragment(p,
+                            "ocxo2",
+                            public_ocxo2_ns,
+                            ocxo2_clockface_valid,
+                            ocxo2_science);
+
+  timebase_build_stage(TIMEBASE_BUILD_STAGE_STATS);
+  payload_add_stats_summary_hierarchical(p,
+                                         public_gnss_ns,
+                                         public_dwt_total,
+                                         ocxo1_science,
+                                         ocxo2_science);
+
+  if (clocks_servo_active()) {
+    payload_add_servo_dac_values(p);
+  }
+
+  timebase_build_stage(TIMEBASE_BUILD_STAGE_BUILD_COMPLETE);
   timebase_build_stage(TIMEBASE_BUILD_STAGE_PUBLISH_ATTEMPT);
   clocks_stack_witness_note_hot(CLOCKS_STACK_CONTEXT_BETA_PPS_PUBLISH);
   publish("TIMEBASE_FRAGMENT", p);
-
   timebase_build_stage(TIMEBASE_BUILD_STAGE_PUBLISH_RETURN);
 
   // PPS-aligned operational side rail. SYSTEM receives only the completed
@@ -9536,7 +7405,6 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
   system_monitor_pps_tick(public_count);
 
   p.clear();
-  f.clear();
 
   clocks_beta_feature_set_cached("TIMEBASE_PUBLICATION",
                                  g_clocks_feature_timebase_publication,

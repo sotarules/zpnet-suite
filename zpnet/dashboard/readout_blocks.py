@@ -167,6 +167,20 @@ def _welford(report: dict, lane: str, field: str):
 
 
 def _prediction(report: dict, lane: str, field: str):
+    # TIMEBASE_FRAGMENT_V5 folds the former prediction object into raw_cycles.
+    # The previous completed interval is the prediction for the current row.
+    raw_field = {
+        "prediction_cycles": "previous_observed_cycles",
+        "actual_cycles": "observed_cycles",
+        "residual_cycles": "residual_cycles",
+        "completed_interval_count": "completed_interval_count",
+        "valid": "valid",
+    }.get(field)
+    if raw_field is not None:
+        value = _field(report, f"raw_cycles.{lane}.{raw_field}")
+        if value is not None:
+            return value
+
     aliases = {
         "prediction_cycles": ("prediction_cycles", "static_prediction_cycles"),
         "actual_cycles": ("actual_cycles",),
