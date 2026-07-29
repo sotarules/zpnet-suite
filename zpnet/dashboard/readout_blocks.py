@@ -159,6 +159,8 @@ def _frequency(report: dict, lane: str) -> tuple[float | None, float | None]:
 
 
 def _welford(report: dict, lane: str, field: str):
+    if lane == "gnss_raw":
+        return _extra(report, f"gnss_raw_welford_{field}")
     paths = [f"stats.{lane}.welford.{field}", f"stats.{lane}.{field}", f"{lane}_welford_{field}"]
     if lane.endswith("_dac"):
         clock = lane[:-4]
@@ -259,13 +261,14 @@ def clocks_tau_readout() -> Generator[str, None, None]:
     yield header
     if report is None:
         return
-    yield f"{'CLK':<7}{'TAU':>17}{'PPB':>12}"
+    yield f"{'CLK':<7}{'TAU':>17}{'PPB':>12}{'N':>8}"
     for label, lane in (("GNSS", "gnss"), ("VCLOCK", "vclock"), ("OCXO1", "ocxo1"),
                         ("OCXO2", "ocxo2"), ("GN_RAW", "gnss_raw"), ("DWT", "dwt")):
         tau, ppb = _frequency(report, lane)
         tau_text = "---" if tau is None else f"{tau:.12f}"
         ppb_text = "---" if ppb is None else f"{ppb:+.3f}"
-        yield f"{label:<7}{tau_text:>17}{ppb_text:>12}"
+        sample_n = _to_int(_welford(report, lane, "n"))
+        yield f"{label:<7}{tau_text:>17}{ppb_text:>12}{_integer(sample_n):>8}"
 
 
 def clocks_prediction_readout() -> Generator[str, None, None]:
@@ -326,7 +329,7 @@ def clocks_dac_welford_readout() -> Generator[str, None, None]:
     yield header
     if report is None:
         return
-    yield "DAC WELFORD (campaign cumulative)"
+    yield "DAC WELFORD (always-on cumulative)"
     yield f"{'OCXO':<6}{'MEAN':>10}{'SD':>8}{'SE':>8}{'N':>7}"
     for label, lane in (("OCXO1", "ocxo1_dac"), ("OCXO2", "ocxo2_dac")):
         yield f"{label:<6}{_num(_welford(report, lane, 'mean')):>10}{_num(_welford(report, lane, 'stddev')):>8}{_num(_welford(report, lane, 'stderr')):>8}{_integer(_welford(report, lane, 'n')):>7}"

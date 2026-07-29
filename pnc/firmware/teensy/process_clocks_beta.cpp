@@ -17,8 +17,9 @@
 //     <prefix>_welford_min
 //     <prefix>_welford_max
 //
-//   Seven published Welford prefixes:
+//   Eight published Welford prefixes:
 //
+//     gnss_welford        — exact GNSS reference residual (ns, always 0)
 //     dwt_welford         — Teensy CPU XTAL offset (ppb, positive = fast)
 //     vclock_welford      — bridge interpolation residual (ns)
 //     ocxo1_welford       — OCXO1 PPS-interval residual (ns, positive = fast)
@@ -3999,6 +4000,7 @@ static FLASHMEM void report_add_stats_summary_from_snapshot(
   stats.add("last_pps_sequence", instrument.last_pps_sequence);
   stats.add("completed_row_coherent", instrument.completed_row_coherent);
 
+  report_add_stats_clock(stats, "gnss", instrument.gnss_welford, true, 0.0);
   report_add_stats_clock(stats, "dwt", instrument.dwt_welford, true,
                          instrument.dwt_frequency.ppb);
   report_add_stats_clock(stats, "vclock", instrument.vclock_welford, true,
@@ -4012,6 +4014,7 @@ static FLASHMEM void report_add_stats_summary_from_snapshot(
 
   Payload& maturity = g_report_child_maturity;
   maturity.clear();
+  maturity.add("gnss_samples", instrument.gnss_welford.n);
   maturity.add("dwt_samples", instrument.dwt_frequency.sample_count);
   maturity.add("vclock_samples", instrument.vclock_frequency.sample_count);
   maturity.add("vclock_intervals", instrument.vclock_frequency.interval_count);
@@ -4061,6 +4064,7 @@ static FLASHMEM void payload_add_stats_summary_from_snapshot(
   stats.add("last_pps_sequence", instrument.last_pps_sequence);
   stats.add("completed_row_coherent", instrument.completed_row_coherent);
 
+  payload_add_stats_clock(stats, "gnss", instrument.gnss_welford, true, 0.0);
   payload_add_stats_clock(stats, "dwt", instrument.dwt_welford, true,
                           instrument.dwt_frequency.ppb);
   payload_add_stats_clock(stats, "vclock", instrument.vclock_welford, true,
@@ -4073,6 +4077,7 @@ static FLASHMEM void payload_add_stats_summary_from_snapshot(
                           instrument.pps_witness_welford, false);
 
   Payload maturity;
+  maturity.add("gnss_samples", instrument.gnss_welford.n);
   maturity.add("dwt_samples", instrument.dwt_frequency.sample_count);
   maturity.add("vclock_samples", instrument.vclock_frequency.sample_count);
   maturity.add("vclock_intervals", instrument.vclock_frequency.interval_count);

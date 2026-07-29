@@ -2551,6 +2551,7 @@ static uint32_t g_alpha_last_installed_timebase_pps_sequence = 0U;
 // Alpha-owned unified Welford accumulators
 // ============================================================================
 
+welford_t welford_gnss         = {};
 welford_t welford_dwt          = {};
 welford_t welford_vclock       = {};
 welford_t welford_ocxo1        = {};
@@ -2904,6 +2905,7 @@ void clocks_alpha_instrument_stats_reset(void) {
   g_instrument_stats_seq++;
   clocks_alpha_dmb();
 
+  welford_reset(welford_gnss);
   welford_reset(welford_dwt);
   welford_reset(welford_vclock);
   welford_reset(welford_ocxo1);
@@ -2945,6 +2947,12 @@ static void alpha_instrument_stats_note_completed_row(uint32_t pps_sequence) {
 
   g_instrument_stats_seq++;
   clocks_alpha_dmb();
+
+  // GNSS is the exact reference clock.  Give it a real always-on Welford
+  // population of zero residual samples so systemwide N retains one meaning:
+  // the number of observations represented by MEAN/SD/SE.  Campaign PPS count
+  // must never masquerade as a statistical sample count.
+  welford_update(welford_gnss, 0.0);
 
   const uint32_t cps = g_dwt_cycles_between_pps_vclock;
   if (g_dwt_calibration_valid && cps != 0U) {
@@ -3080,6 +3088,7 @@ FLASHMEM bool clocks_alpha_instrument_stats_snapshot(
     local.ocxo2_frequency =
         alpha_frequency_from_tau(time_clock_id_t::OCXO2);
 
+    local.gnss_welford = welford_gnss;
     local.dwt_welford = welford_dwt;
     local.vclock_welford = welford_vclock;
     local.ocxo1_welford = welford_ocxo1;

@@ -9,8 +9,9 @@ Data source:
 
 Stats policy (Pi is a stenographer):
   Every statistical quantity shown in this panel is read verbatim from the
-  Teensy-authored TIMEBASE_FRAGMENT, except the GNSS reference row, whose
-  residual/Welford surface is definitionally zero for display consistency.
+  Teensy-authored TIMEBASE_FRAGMENT, including the GNSS reference Welford.
+  GNSS residual samples are definitionally zero, but its N is the real
+  Alpha-owned always-on Welford population, never campaign PPS count.
   No Pi-side means, stddevs, stderrs, or residuals are computed here.  The only
   Pi-side arithmetic is presentation conversion (DAC code → voltage) and
   baseline delta (NOW - BASE), neither of which is a statistic.
@@ -1209,14 +1210,12 @@ def _welford_cols_zero(w_mean, w_sd, w_se, w_n, n=None, mean_decimals=3):
     )
 
 
-def _welford_cols_fragment_or_zero(r, prefix, w_mean, w_sd, w_se, w_n, n=None, mean_decimals=3):
-    """Render firmware Welford stats, falling back to a visible zero row.
+def _welford_cols_fragment_or_zero(r, prefix, w_mean, w_sd, w_se, w_n, mean_decimals=3):
+    """Render firmware Welford stats, falling back to zero values with no N.
 
-    Reference-style rows such as VCLOCK may not have a published Welford
-    object in older TIMEBASE builds, or may publish n=0 while the visible
-    residual surface is definitionally zero.  In either case, render a zero
-    accumulator with the current campaign count so the top clock block remains
-    visually consistent.
+    Older TIMEBASE rows may omit a reference-style Welford.  Zero-valued
+    MEAN/SD/SE remain truthful, but campaign PPS count is not a statistical
+    population and must never be substituted for Welford N.
     """
     mean = _to_float(_welford_value(r, prefix, "mean"))
     sd   = _to_float(_welford_value(r, prefix, "stddev"))
@@ -1224,7 +1223,7 @@ def _welford_cols_fragment_or_zero(r, prefix, w_mean, w_sd, w_se, w_n, n=None, m
     wn   = _to_int  (_welford_value(r, prefix, "n"))
 
     if (mean is None and sd is None and se is None and wn is None) or not wn:
-        return _welford_cols_zero(w_mean, w_sd, w_se, w_n, n=n, mean_decimals=mean_decimals)
+        return _welford_cols_zero(w_mean, w_sd, w_se, w_n, n=None, mean_decimals=mean_decimals)
 
     return (
         f"{_fmt(mean, f'>{w_mean}.{mean_decimals}f', w_mean)}"
@@ -1482,7 +1481,7 @@ def clocks_combined_readout() -> list[str]:
         f"{_fmt(gnss_ppb, f'>{W_PPB}.3f', W_PPB)}"
         f"{_comma_int(gnss_raw, W_RAW)}"
         f"{_sign_int(gnss_res, W_RES)}"
-        f"{_welford_cols_zero(W_MEAN, W_SD, W_SE, W_N, n)}"
+        f"{_welford_cols_fragment(r, 'gnss', W_MEAN, W_SD, W_SE, W_N)}"
         f"  {_baseline_comp(baseline_ppb.get('gnss'), gnss_ppb)}"
     )
 
@@ -1521,7 +1520,7 @@ def clocks_combined_readout() -> list[str]:
         f"{_fmt(vclock_ppb, f'>{W_PPB}.3f', W_PPB)}"
         f"{_comma_int(vclock_raw, W_RAW)}"
         f"{_sign_int(vclock_res, W_RES)}"
-        f"{_welford_cols_fragment_or_zero(r, 'vclock', W_MEAN, W_SD, W_SE, W_N, n=n)}"
+        f"{_welford_cols_fragment_or_zero(r, 'vclock', W_MEAN, W_SD, W_SE, W_N)}"
         f"  {_baseline_comp(baseline_ppb.get('vclock'), vclock_ppb)}"
     )
 

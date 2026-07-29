@@ -1770,6 +1770,7 @@ extern uint64_t recover_ocxo2_ns;
 // reset or restore them.  Beta may read them for TIMEBASE/servo compatibility,
 // but Alpha is the sole update/reset authority.
 //
+//   welford_gnss         — exact GNSS reference residual, always 0 ns
 //   welford_dwt          — Teensy CPU XTAL offset, in ppb
 //   welford_vclock       — bridge interpolation residual, in ns
 //   welford_ocxo1        — OCXO1 PPS-interval residual, in ns
@@ -1788,6 +1789,7 @@ struct welford_t {
   double   max_val;
 };
 
+extern welford_t welford_gnss;
 extern welford_t welford_dwt;
 extern welford_t welford_vclock;
 extern welford_t welford_ocxo1;
@@ -1854,6 +1856,7 @@ struct clocks_instrument_stats_snapshot_t {
   clocks_instrument_frequency_snapshot_t ocxo1_frequency{};
   clocks_instrument_frequency_snapshot_t ocxo2_frequency{};
 
+  welford_t gnss_welford{};
   welford_t dwt_welford{};
   welford_t vclock_welford{};
   welford_t ocxo1_welford{};
