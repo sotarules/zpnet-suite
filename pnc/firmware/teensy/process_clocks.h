@@ -13,10 +13,13 @@
 // Responsibilities:
 //   • Consumption of process_interrupt-authored clock captures
 //   • PPS-synchronous CounterLedger plus exact-row PhaseLedger clockfaces
-//   • Local CLOCKS-owned ZERO/START logical zero-offset installation
+//   • Local CLOCKS-owned autonomous startup and explicit ZERO epoch install
 //   • Campaign Flash Cut: hot campaign boundary without Alpha epoch rebase
 //   • PPS/VCLOCK-selected truth capture
 //   • Deferred 1 Hz publication after both post-PPS OCXO edges complete
+//   • Serialized command reporting: Priority 0 capture remains live while the
+//     Priority 16 TimePop/handoff tier is excluded from re-entering Payload
+//     construction; report and TIMEBASE scratch never overlap
 //   • Continuous DWT-to-GNSS calibration (campaign-independent)
 //   • Static PPS/GPIO-based one-second prediction audit for VCLOCK and OCXO lanes
 //   • VCLOCK heartbeat and OCXO one-second compare consumption as observed
@@ -63,8 +66,9 @@
 // OCXO physical one-second grid rephase spacing
 // -----------------------------------------------------------------------------
 //
-// START, ZERO, and RECOVER share one staged physical-grid transaction.  The
-// transaction keeps the logical clock doctrine owned by the caller while
+// Autonomous startup, explicit ZERO, and RECOVER use the staged physical-grid
+// transaction.  Campaign START is recording-only and never rebases Alpha.
+// The transaction keeps the logical clock doctrine owned by its caller while
 // deliberately placing the recurring OCXO compare grids far apart in real
 // time:
 //
@@ -244,11 +248,11 @@ bool clocks_dwt_calibration_valid(void);
 // -----------------------------------------------------------------------------
 // Alpha always-on OCXO TAU estimator
 // -----------------------------------------------------------------------------
-// Alpha estimates OCXO frequency continuously from lawful PhaseLedger refined
-// endpoints. This surface is reset by SmartZero/Alpha epoch replacement, not by
-// campaign START/STOP, so Beta can publish a mature frequency estimate at the
-// first public campaign row instead of rediscovering TAU from a launch-origin
-// quotient.
+// Alpha estimates OCXO frequency continuously from lawful completed-row Delta
+// intervals.  It survives START, STOP, FLASH_CUT, warm RECOVER, and logical
+// epoch replacement; only reboot or CLOCKS.STATS_RESET clears the estimator.
+// Beta can therefore publish a mature frequency estimate on the first campaign
+// row instead of rediscovering TAU from a launch-origin quotient.
 #ifndef CLOCKS_ALPHA_TAU_SNAPSHOT_T_DEFINED
 #define CLOCKS_ALPHA_TAU_SNAPSHOT_T_DEFINED
 struct clocks_alpha_tau_snapshot_t {

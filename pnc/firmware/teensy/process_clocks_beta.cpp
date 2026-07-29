@@ -44,8 +44,10 @@
 //   welford_dwt, welford_vclock, welford_ocxo1, welford_ocxo2,
 //   welford_pps_witness, welford_ocxo1_dac, welford_ocxo2_dac.
 //
-// Campaign lifecycle and watchdog behavior remain unchanged. Servo DAC updates
-// are now planned from the 1 Hz science path but physically committed by a
+// Campaign lifecycle is now recording-only with respect to clock statistics.
+// Alpha owns boot-lifetime PPB/TAU/Welford state; Beta snapshots it for
+// TIMEBASE and reports. Servo DAC updates remain planned from the 1 Hz science
+// path but physically committed by a
 // low-priority actuator sandbox so I2C failures cannot poison TIMEBASE.
 // Servo inputs consume the same PPS-founded OCXO residual surface that feeds
 // the OCXO Welfords, and DAC/TIMEBASE reports expose that provenance.
@@ -100,8 +102,9 @@ volatile bool request_recover = false;
 volatile bool request_zero    = false;
 
 // FLASH_CUT is a hot campaign boundary: preserve the installed Alpha/service
-// epoch and learned timing state, change the campaign identity, and rebase
-// Beta's campaign-public clocks/statistics at the next PPS/VCLOCK edge.
+// epoch and all learned instrument statistics, change the campaign identity,
+// and rebase only Beta's campaign-public clock presentation at the next
+// PPS/VCLOCK edge.
 static volatile bool request_flash_cut = false;
 static char flash_cut_campaign_name[64] = {0};
 
@@ -411,6 +414,74 @@ static clocks_alpha_ocxo_counterledger_snapshot_t
 // already heap-backed and are reused by clear() between rows.
 static Payload g_timebase_candidate_payload DMAMEM;
 
+// Command-report construction is a serialized foreground service. Priority-0
+// capture remains live, but the priority-16 TimePop/handoff tier may not enter a
+// second Payload-building path while a report owns the allocator/formatting
+// surface. Report and TIMEBASE paths also keep completely separate snapshot and
+// Payload scratch objects.
+static constexpr uint32_t CLOCKS_REPORT_BASEPRI_GUARD = 16U;
+static volatile bool g_clocks_report_build_active = false;
+static uint32_t g_clocks_report_build_count = 0U;
+static uint32_t g_clocks_report_busy_reject_count = 0U;
+static uint32_t g_clocks_report_max_duration_cycles = 0U;
+
+static clocks_instrument_stats_snapshot_t
+    g_beta_report_instrument_stats DMAMEM = {};
+static Payload g_report_clocks_payload DMAMEM;
+static Payload g_report_stats_payload DMAMEM;
+static Payload g_report_child_clocks DMAMEM;
+static Payload g_report_child_stats DMAMEM;
+static Payload g_report_child_clock DMAMEM;
+static Payload g_report_child_welford DMAMEM;
+static Payload g_report_child_maturity DMAMEM;
+static Payload g_report_child_admission DMAMEM;
+static Payload g_report_child_dac DMAMEM;
+
+static inline uint32_t clocks_report_irq_save(void) {
+  uint32_t prior_basepri = 0U;
+  __asm__ volatile ("mrs %0, basepri" : "=r" (prior_basepri) :: "memory");
+  if (prior_basepri == 0U || prior_basepri > CLOCKS_REPORT_BASEPRI_GUARD) {
+    __asm__ volatile ("msr basepri, %0"
+                      :: "r" (CLOCKS_REPORT_BASEPRI_GUARD) : "memory");
+  }
+  __asm__ volatile ("dmb" ::: "memory");
+  return prior_basepri;
+}
+
+static inline void clocks_report_irq_restore(uint32_t prior_basepri) {
+  __asm__ volatile ("dmb" ::: "memory");
+  __asm__ volatile ("msr basepri, %0" :: "r" (prior_basepri) : "memory");
+}
+
+struct clocks_report_build_guard_t {
+  uint32_t prior_basepri = 0U;
+  uint32_t begin_dwt = 0U;
+  bool acquired = false;
+
+  clocks_report_build_guard_t() {
+    prior_basepri = clocks_report_irq_save();
+    if (!g_clocks_report_build_active) {
+      g_clocks_report_build_active = true;
+      g_clocks_report_build_count++;
+      begin_dwt = DWT_CYCCNT;
+      acquired = true;
+    } else {
+      g_clocks_report_busy_reject_count++;
+      clocks_report_irq_restore(prior_basepri);
+    }
+  }
+
+  ~clocks_report_build_guard_t() {
+    if (!acquired) return;
+    const uint32_t elapsed = (uint32_t)(DWT_CYCCNT - begin_dwt);
+    if (elapsed > g_clocks_report_max_duration_cycles) {
+      g_clocks_report_max_duration_cycles = elapsed;
+    }
+    g_clocks_report_build_active = false;
+    clocks_report_irq_restore(prior_basepri);
+  }
+};
+
 
 // FLASH_CUT flight recorder.  These counters are deliberately Beta-local:
 // Flash Cut does not install a new Alpha epoch and must not perturb the
@@ -472,6 +543,15 @@ static void clocks_beta_features_mark_initializing(void) {
 void clocks_beta_features_init(void) {
   clocks_beta_cold_diagnostics_init();
   g_timebase_candidate_payload.clear();
+  g_report_clocks_payload.clear();
+  g_report_stats_payload.clear();
+  g_report_child_clocks.clear();
+  g_report_child_stats.clear();
+  g_report_child_clock.clear();
+  g_report_child_welford.clear();
+  g_report_child_maturity.clear();
+  g_report_child_admission.clear();
+  g_report_child_dac.clear();
   clocks_beta_features_mark_initializing();
 }
 
@@ -1075,6 +1155,8 @@ static clocks_pps_vclock_edge_forensics_t
     g_beta_pps_vclock_edge_forensics DMAMEM = {};
 static clocks_alpha_tau_snapshot_t g_beta_pps_ocxo1_alpha_tau DMAMEM = {};
 static clocks_alpha_tau_snapshot_t g_beta_pps_ocxo2_alpha_tau DMAMEM = {};
+static clocks_instrument_stats_snapshot_t
+    g_beta_instrument_stats DMAMEM = {};
 static clocks_static_prediction_snapshot_t g_beta_pps_cycle_prediction DMAMEM = {};
 static clocks_static_prediction_snapshot_t g_beta_vclock_cycle_prediction DMAMEM = {};
 static clocks_static_prediction_snapshot_t g_beta_ocxo1_cycle_prediction DMAMEM = {};
@@ -1275,14 +1357,9 @@ static uint32_t g_science_residual_quarantine_begin_count = 0;
 static uint32_t g_science_residual_quarantine_consumed_count = 0;
 static uint32_t g_science_residual_quarantine_last_public_count = 0;
 
-// DWT is an always-on calibration rail, but its campaign Welford must not learn
-// from the RECOVER boundary itself.  If a genuinely stopped VCLOCK service has
-// to be rebuilt, or recovery is still aligning/quarantining clock custody, the
-// raw interval remains visible in TIMEBASE forensics while the statistical
-// population records the row as a canonical missing sample.
-static uint32_t g_dwt_welford_recovery_quarantine_count = 0;
-static uint32_t g_dwt_welford_recovery_quarantine_last_public_count = 0;
-static uint32_t g_dwt_welford_recovery_quarantine_last_cycles = 0;
+// Alpha-owned instrument statistics continue across RECOVER.  Beta still
+// quarantines campaign science/servo inputs formed across a recovery custody
+// boundary; the raw interval remains visible in TIMEBASE forensics.
 
 // RECOVER OCXO reattachment gate.  Alpha deliberately cuts OCXO measurement
 // custody during warm recovery.  Beta initially treats recovered candidates as
@@ -2912,160 +2989,6 @@ bool clocks_watchdog_campaign_armed(void) {
 }
 
 // ============================================================================
-// Welford — unified accumulator
-// ============================================================================
-
-welford_t welford_dwt          = {};
-welford_t welford_vclock       = {};
-welford_t welford_ocxo1        = {};
-welford_t welford_ocxo2        = {};
-welford_t welford_pps_witness  = {};
-welford_t welford_ocxo1_dac    = {};
-welford_t welford_ocxo2_dac    = {};
-
-
-struct recover_welford_state_t {
-  bool has_dwt = false;
-  bool has_vclock = false;
-  bool has_ocxo1 = false;
-  bool has_ocxo2 = false;
-  bool has_pps_witness = false;
-  bool has_ocxo1_dac = false;
-  bool has_ocxo2_dac = false;
-  uint32_t restored_lane_count = 0;
-  welford_t dwt = {};
-  welford_t vclock = {};
-  welford_t ocxo1 = {};
-  welford_t ocxo2 = {};
-  welford_t pps_witness = {};
-  welford_t ocxo1_dac = {};
-  welford_t ocxo2_dac = {};
-};
-
-static recover_welford_state_t g_recover_welfords_pending DMAMEM = {};
-static uint32_t g_recover_welford_capture_count = 0;
-static uint32_t g_recover_welford_restore_count = 0;
-static uint32_t g_recover_welford_last_restored_lane_count = 0;
-static uint32_t g_welford_gap_advance_count = 0;
-static uint32_t g_welford_gap_advance_last_public_count = 0;
-static uint32_t g_welford_gap_advance_last_lane_count = 0;
-
-void welford_reset(welford_t& w) {
-  w.n       = 0;
-  w.mean    = 0.0;
-  w.m2      = 0.0;
-  w.min_val = 1e30;
-  w.max_val = -1e30;
-}
-
-void welford_update(welford_t& w, double sample) {
-  w.n++;
-  const double d1 = sample - w.mean;
-  w.mean += d1 / (double)w.n;
-  const double d2 = sample - w.mean;
-  w.m2 += d1 * d2;
-  if (sample < w.min_val) w.min_val = sample;
-  if (sample > w.max_val) w.max_val = sample;
-}
-
-double welford_stddev(const welford_t& w) {
-  return (w.n >= 2) ? sqrt(w.m2 / (double)(w.n - 1)) : 0.0;
-}
-
-double welford_stderr(const welford_t& w) {
-  if (w.n < 2) return 0.0;
-  const double sd = sqrt(w.m2 / (double)(w.n - 1));
-  return sd / sqrt((double)w.n);
-}
-
-static bool welford_advance_missing_to_n(welford_t& w, uint64_t target_n) {
-  if (target_n <= w.n) return false;
-
-  const double sd = welford_stddev(w);
-  if (w.n == 0ULL) {
-    w.mean = 0.0;
-    w.min_val = 0.0;
-    w.max_val = 0.0;
-  }
-
-  w.n = target_n;
-  w.m2 = (target_n >= 2ULL)
-      ? (sd * sd * (double)(target_n - 1ULL))
-      : 0.0;
-  return true;
-}
-
-static void welfords_note_gap_advance(uint32_t public_count,
-                                      uint32_t advanced) {
-  if (advanced == 0U) return;
-  g_welford_gap_advance_count++;
-  g_welford_gap_advance_last_public_count = public_count;
-  g_welford_gap_advance_last_lane_count = advanced;
-}
-
-static uint32_t welfords_advance_non_ocxo_gap_before_row(uint32_t public_count) {
-  // TIMEBASE gaps are canonical campaign seconds.  DWT/VCLOCK/DAC surfaces
-  // remain valid during recovery because public GNSS/DWT/VCLOCK time and DAC
-  // intent continue to advance.  OCXO Welfords are different: they must not be
-  // gap-advanced until the current row has valid OCXO science, otherwise a
-  // degraded/recovery hold can make N march while no OCXO sample exists.
-  const uint64_t before_row_n =
-      (public_count > 0U) ? (uint64_t)(public_count - 1U) : 0ULL;
-
-  uint32_t advanced = 0;
-  if (welford_advance_missing_to_n(welford_dwt, before_row_n)) advanced++;
-  if (welford_advance_missing_to_n(welford_vclock, before_row_n)) advanced++;
-  if (welford_advance_missing_to_n(welford_ocxo1_dac, before_row_n)) advanced++;
-  if (welford_advance_missing_to_n(welford_ocxo2_dac, before_row_n)) advanced++;
-
-  welfords_note_gap_advance(public_count, advanced);
-  return advanced;
-}
-
-static uint32_t welfords_advance_ocxo_gap_before_valid_row(
-    uint32_t public_count,
-    bool ocxo1_valid,
-    bool ocxo2_valid) {
-  // Delta/CounterLedger OCXO science is a one-second interval surface and
-  // intentionally lags the public PPS identity by one row.  Advance its
-  // cardinality only when that lane is about to accept a real sample.
-  const uint64_t before_row_ocxo_n =
-      (public_count > 1U) ? (uint64_t)(public_count - 2U) : 0ULL;
-
-  uint32_t advanced = 0;
-  if (ocxo1_valid &&
-      welford_advance_missing_to_n(welford_ocxo1, before_row_ocxo_n)) {
-    advanced++;
-  }
-  if (ocxo2_valid &&
-      welford_advance_missing_to_n(welford_ocxo2, before_row_ocxo_n)) {
-    advanced++;
-  }
-
-  welfords_note_gap_advance(public_count, advanced);
-  return advanced;
-}
-
-static FLASHMEM void welford_restore_from_summary(welford_t& w,
-                                         uint64_t n,
-                                         double mean,
-                                         double stddev,
-                                         double min_val,
-                                         double max_val) {
-  if (n == 0ULL) {
-    welford_reset(w);
-    return;
-  }
-
-  const double sd = (stddev >= 0.0) ? stddev : -stddev;
-  w.n = n;
-  w.mean = mean;
-  w.m2 = (n >= 2ULL) ? (sd * sd * (double)(n - 1ULL)) : 0.0;
-  w.min_val = min_val;
-  w.max_val = max_val;
-}
-
-// ============================================================================
 // CLOCKS-local Payload numeric integrity court
 // ============================================================================
 //
@@ -3616,361 +3539,6 @@ static FLASHMEM Payload clocks_payload_numeric_reject_response(
   return err;
 }
 
-static FLASHMEM bool payload_try_get_welford_object(const Payload& obj,
-                                           const char* path,
-                                           const char* lane,
-                                           welford_t& out) {
-  if (g_clocks_payload_numeric_integrity_failed) return false;
-
-  uint64_t n = 0;
-  double mean = 0.0;
-  if (clocks_payload_try_get_u64_checked(obj, "n",
-                                         "recovery_welford",
-                                         path,
-                                         lane,
-                                         "n",
-                                         n) != CLOCKS_PAYLOAD_FIELD_OK ||
-      clocks_payload_try_get_double_checked(obj, "mean",
-                                            "recovery_welford",
-                                            path,
-                                            lane,
-                                            "mean",
-                                            mean) != CLOCKS_PAYLOAD_FIELD_OK) {
-    return false;
-  }
-
-  double stddev = 0.0;
-  const clocks_payload_checked_status_t stddev_status =
-      clocks_payload_try_get_double_checked(obj, "stddev",
-                                            "recovery_welford",
-                                            path,
-                                            lane,
-                                            "stddev",
-                                            stddev);
-  if (stddev_status == CLOCKS_PAYLOAD_FIELD_INVALID) {
-    return false;
-  }
-  if (stddev_status == CLOCKS_PAYLOAD_FIELD_MISSING) {
-    double stderr_value = 0.0;
-    const clocks_payload_checked_status_t stderr_status =
-        clocks_payload_try_get_double_checked(obj, "stderr",
-                                              "recovery_welford",
-                                              path,
-                                              lane,
-                                              "stderr",
-                                              stderr_value);
-    if (stderr_status == CLOCKS_PAYLOAD_FIELD_INVALID) {
-      return false;
-    }
-    if (stderr_status == CLOCKS_PAYLOAD_FIELD_OK && n > 0ULL) {
-      stddev = stderr_value * sqrt((double)n);
-    }
-  }
-
-  double min_val = mean;
-  double max_val = mean;
-  const clocks_payload_checked_status_t min_status =
-      clocks_payload_try_get_double_checked(obj, "min",
-                                            "recovery_welford",
-                                            path,
-                                            lane,
-                                            "min",
-                                            min_val);
-  if (min_status == CLOCKS_PAYLOAD_FIELD_INVALID) return false;
-  const clocks_payload_checked_status_t max_status =
-      clocks_payload_try_get_double_checked(obj, "max",
-                                            "recovery_welford",
-                                            path,
-                                            lane,
-                                            "max",
-                                            max_val);
-  if (max_status == CLOCKS_PAYLOAD_FIELD_INVALID) return false;
-
-  welford_restore_from_summary(out, n, mean, stddev, min_val, max_val);
-  return true;
-}
-
-static FLASHMEM bool payload_try_get_welford_flat(const Payload& args,
-                                         const char* prefix,
-                                         const char* path,
-                                         welford_t& out) {
-  if (g_clocks_payload_numeric_integrity_failed) return false;
-
-  char key[64];
-
-  uint64_t n = 0;
-  snprintf(key, sizeof(key), "%s_welford_n", prefix);
-  if (clocks_payload_try_get_u64_checked(args, key,
-                                         "recovery_welford_flat",
-                                         path,
-                                         prefix,
-                                         "n",
-                                         n) != CLOCKS_PAYLOAD_FIELD_OK) {
-    return false;
-  }
-
-  double mean = 0.0;
-  snprintf(key, sizeof(key), "%s_welford_mean", prefix);
-  if (clocks_payload_try_get_double_checked(args, key,
-                                            "recovery_welford_flat",
-                                            path,
-                                            prefix,
-                                            "mean",
-                                            mean) != CLOCKS_PAYLOAD_FIELD_OK) {
-    return false;
-  }
-
-  double stddev = 0.0;
-  snprintf(key, sizeof(key), "%s_welford_stddev", prefix);
-  const clocks_payload_checked_status_t stddev_status =
-      clocks_payload_try_get_double_checked(args, key,
-                                            "recovery_welford_flat",
-                                            path,
-                                            prefix,
-                                            "stddev",
-                                            stddev);
-  if (stddev_status == CLOCKS_PAYLOAD_FIELD_INVALID) return false;
-  if (stddev_status == CLOCKS_PAYLOAD_FIELD_MISSING) {
-    double stderr_value = 0.0;
-    snprintf(key, sizeof(key), "%s_welford_stderr", prefix);
-    const clocks_payload_checked_status_t stderr_status =
-        clocks_payload_try_get_double_checked(args, key,
-                                              "recovery_welford_flat",
-                                              path,
-                                              prefix,
-                                              "stderr",
-                                              stderr_value);
-    if (stderr_status == CLOCKS_PAYLOAD_FIELD_INVALID) return false;
-    if (stderr_status == CLOCKS_PAYLOAD_FIELD_OK && n > 0ULL) {
-      stddev = stderr_value * sqrt((double)n);
-    }
-  }
-
-  double min_val = mean;
-  double max_val = mean;
-  snprintf(key, sizeof(key), "%s_welford_min", prefix);
-  const clocks_payload_checked_status_t min_status =
-      clocks_payload_try_get_double_checked(args, key,
-                                            "recovery_welford_flat",
-                                            path,
-                                            prefix,
-                                            "min",
-                                            min_val);
-  if (min_status == CLOCKS_PAYLOAD_FIELD_INVALID) return false;
-  snprintf(key, sizeof(key), "%s_welford_max", prefix);
-  const clocks_payload_checked_status_t max_status =
-      clocks_payload_try_get_double_checked(args, key,
-                                            "recovery_welford_flat",
-                                            path,
-                                            prefix,
-                                            "max",
-                                            max_val);
-  if (max_status == CLOCKS_PAYLOAD_FIELD_INVALID) return false;
-
-  welford_restore_from_summary(out, n, mean, stddev, min_val, max_val);
-  return true;
-}
-
-static FLASHMEM bool payload_try_get_stats_welford(const Payload& root,
-                                          const char* root_path,
-                                          const char* stats_key,
-                                          welford_t& out) {
-  if (g_clocks_payload_numeric_integrity_failed) return false;
-
-  const Payload stats = root.getPayload("stats");
-  if (stats.empty()) return false;
-
-  const Payload lane = stats.getPayload(stats_key);
-  if (lane.empty()) return false;
-
-  const char* path = root_path ? root_path : "root";
-
-  const Payload nested = lane.getPayload("welford");
-  if (!nested.empty()) {
-    if (payload_try_get_welford_object(nested, path, stats_key, out)) {
-      return true;
-    }
-    if (g_clocks_payload_numeric_integrity_failed) return false;
-  }
-
-  return payload_try_get_welford_object(lane, path, stats_key, out);
-}
-
-static FLASHMEM bool payload_try_get_stats_dac_welford(const Payload& root,
-                                              const char* root_path,
-                                              const char* dac_key,
-                                              welford_t& out) {
-  if (g_clocks_payload_numeric_integrity_failed) return false;
-
-  const Payload stats = root.getPayload("stats");
-  if (stats.empty()) return false;
-
-  const Payload dac = stats.getPayload("dac");
-  if (dac.empty()) return false;
-
-  const Payload lane = dac.getPayload(dac_key);
-  if (lane.empty()) return false;
-
-  const char* path = root_path ? root_path : "root";
-  return payload_try_get_welford_object(lane, path, dac_key, out);
-}
-
-static FLASHMEM bool payload_try_get_recovery_welford(const Payload& args,
-                                             const char* flat_prefix,
-                                             const char* stats_key,
-                                             bool dac_stats,
-                                             welford_t& out) {
-  if (g_clocks_payload_numeric_integrity_failed) return false;
-
-  if (payload_try_get_welford_flat(args, flat_prefix, "args", out)) return true;
-  if (g_clocks_payload_numeric_integrity_failed) return false;
-  if (dac_stats) {
-    if (payload_try_get_stats_dac_welford(args, "args", stats_key, out)) return true;
-  } else if (payload_try_get_stats_welford(args, "args", stats_key, out)) {
-    return true;
-  }
-  if (g_clocks_payload_numeric_integrity_failed) return false;
-
-  const Payload fragment = args.getPayload("fragment");
-  if (!fragment.empty()) {
-    if (payload_try_get_welford_flat(fragment, flat_prefix, "args.fragment", out)) return true;
-    if (g_clocks_payload_numeric_integrity_failed) return false;
-    if (dac_stats) {
-      if (payload_try_get_stats_dac_welford(fragment, "args.fragment", stats_key, out)) return true;
-    } else if (payload_try_get_stats_welford(fragment, "args.fragment", stats_key, out)) {
-      return true;
-    }
-    if (g_clocks_payload_numeric_integrity_failed) return false;
-  }
-
-  const Payload payload = args.getPayload("payload");
-  if (!payload.empty()) {
-    if (payload_try_get_welford_flat(payload, flat_prefix, "args.payload", out)) return true;
-    if (g_clocks_payload_numeric_integrity_failed) return false;
-    if (dac_stats) {
-      if (payload_try_get_stats_dac_welford(payload, "args.payload", stats_key, out)) return true;
-    } else if (payload_try_get_stats_welford(payload, "args.payload", stats_key, out)) {
-      return true;
-    }
-    if (g_clocks_payload_numeric_integrity_failed) return false;
-
-    const Payload payload_fragment = payload.getPayload("fragment");
-    if (!payload_fragment.empty()) {
-      if (payload_try_get_welford_flat(payload_fragment, flat_prefix,
-                                       "args.payload.fragment", out)) return true;
-      if (g_clocks_payload_numeric_integrity_failed) return false;
-      if (dac_stats) {
-        return payload_try_get_stats_dac_welford(payload_fragment,
-                                                "args.payload.fragment",
-                                                stats_key,
-                                                out);
-      }
-      return payload_try_get_stats_welford(payload_fragment,
-                                          "args.payload.fragment",
-                                          stats_key,
-                                          out);
-    }
-  }
-
-  return false;
-}
-
-static FLASHMEM bool recover_welford_capture_lane(const Payload& args,
-                                         const char* flat_prefix,
-                                         const char* stats_key,
-                                         bool dac_stats,
-                                         bool& has_lane,
-                                         welford_t& dst,
-                                         uint32_t& count) {
-  has_lane = payload_try_get_recovery_welford(args,
-                                             flat_prefix,
-                                             stats_key,
-                                             dac_stats,
-                                             dst);
-  if (has_lane) count++;
-  return has_lane;
-}
-
-static FLASHMEM bool recover_welfords_capture(const Payload& args) {
-  g_recover_welfords_pending = recover_welford_state_t{};
-
-  uint32_t count = 0;
-
-#define RECOVER_WELFORD_CAPTURE_ONE(flat_prefix, stats_key, dac_stats, has_flag, dst) \
-  do { \
-    (void)recover_welford_capture_lane(args, flat_prefix, stats_key, dac_stats, \
-                                       has_flag, dst, count); \
-    if (g_clocks_payload_numeric_integrity_failed) { \
-      g_recover_welfords_pending = recover_welford_state_t{}; \
-      return false; \
-    } \
-  } while (0)
-
-  RECOVER_WELFORD_CAPTURE_ONE("dwt", "dwt", false,
-                              g_recover_welfords_pending.has_dwt,
-                              g_recover_welfords_pending.dwt);
-  RECOVER_WELFORD_CAPTURE_ONE("vclock", "vclock", false,
-                              g_recover_welfords_pending.has_vclock,
-                              g_recover_welfords_pending.vclock);
-  RECOVER_WELFORD_CAPTURE_ONE("ocxo1", "ocxo1", false,
-                              g_recover_welfords_pending.has_ocxo1,
-                              g_recover_welfords_pending.ocxo1);
-  RECOVER_WELFORD_CAPTURE_ONE("ocxo2", "ocxo2", false,
-                              g_recover_welfords_pending.has_ocxo2,
-                              g_recover_welfords_pending.ocxo2);
-  RECOVER_WELFORD_CAPTURE_ONE("pps_witness", "pps_witness", false,
-                              g_recover_welfords_pending.has_pps_witness,
-                              g_recover_welfords_pending.pps_witness);
-  RECOVER_WELFORD_CAPTURE_ONE("ocxo1_dac", "ocxo1", true,
-                              g_recover_welfords_pending.has_ocxo1_dac,
-                              g_recover_welfords_pending.ocxo1_dac);
-  RECOVER_WELFORD_CAPTURE_ONE("ocxo2_dac", "ocxo2", true,
-                              g_recover_welfords_pending.has_ocxo2_dac,
-                              g_recover_welfords_pending.ocxo2_dac);
-
-#undef RECOVER_WELFORD_CAPTURE_ONE
-
-  g_recover_welfords_pending.restored_lane_count = count;
-  if (count != 0U) {
-    g_recover_welford_capture_count++;
-  }
-  return true;
-}
-
-static void recover_welfords_apply_pending(void) {
-  if (g_recover_welfords_pending.restored_lane_count == 0U) {
-    g_recover_welford_last_restored_lane_count = 0U;
-    return;
-  }
-
-  if (g_recover_welfords_pending.has_dwt) {
-    welford_dwt = g_recover_welfords_pending.dwt;
-  }
-  if (g_recover_welfords_pending.has_vclock) {
-    welford_vclock = g_recover_welfords_pending.vclock;
-  }
-  if (g_recover_welfords_pending.has_ocxo1) {
-    welford_ocxo1 = g_recover_welfords_pending.ocxo1;
-  }
-  if (g_recover_welfords_pending.has_ocxo2) {
-    welford_ocxo2 = g_recover_welfords_pending.ocxo2;
-  }
-  if (g_recover_welfords_pending.has_pps_witness) {
-    welford_pps_witness = g_recover_welfords_pending.pps_witness;
-  }
-  if (g_recover_welfords_pending.has_ocxo1_dac) {
-    welford_ocxo1_dac = g_recover_welfords_pending.ocxo1_dac;
-  }
-  if (g_recover_welfords_pending.has_ocxo2_dac) {
-    welford_ocxo2_dac = g_recover_welfords_pending.ocxo2_dac;
-  }
-
-  g_recover_welford_last_restored_lane_count =
-      g_recover_welfords_pending.restored_lane_count;
-  g_recover_welford_restore_count++;
-  g_recover_welfords_pending = recover_welford_state_t{};
-}
-
 // ============================================================================
 // Payload helpers — standardized publication
 // ============================================================================
@@ -4344,8 +3912,8 @@ static FLASHMEM clocks_static_prediction_snapshot_t prediction_snapshot_for_cloc
 // The publication path uses the compact helpers below.
 
 static FLASHMEM void payload_add_welford_object(Payload& parent,
-                                       const char* key,
-                                       const welford_t& w) {
+                                        const char* key,
+                                        const welford_t& w) {
   Payload obj;
   obj.add("n", w.n);
   obj.add("mean", toFixedDecimal(w.mean, 6));
@@ -4363,7 +3931,7 @@ static FLASHMEM void payload_add_frequency_fields(Payload& obj, double ppb_value
 }
 
 static double campaign_total_tau_from_ratio(uint64_t reference_value,
-                                            uint64_t clock_value) {
+                                             uint64_t clock_value) {
   if (reference_value == 0ULL) return 1.0;
   return (double)clock_value / (double)reference_value;
 }
@@ -4372,77 +3940,183 @@ static double campaign_total_ppb_from_tau(double tau) {
   return (tau - 1.0) * 1.0e9;
 }
 
-static double campaign_total_ppb_from_ratio(uint64_t reference_value,
-                                            uint64_t clock_value) {
-  return campaign_total_ppb_from_tau(
-      campaign_total_tau_from_ratio(reference_value, clock_value));
-}
-
-static double campaign_total_dwt_ppb(uint64_t public_gnss_ns,
-                                     uint64_t public_dwt_total_cycles) {
-  const uint64_t expected_cycles = dwt_ns_to_cycles(public_gnss_ns);
-  if (expected_cycles == 0ULL) return 0.0;
-  return campaign_total_ppb_from_ratio(expected_cycles,
-                                       public_dwt_total_cycles);
-}
-
 static FLASHMEM void payload_add_stats_clock(Payload& parent,
-                                    const char* key,
-                                    const welford_t& w,
-                                    bool include_frequency,
-                                    double campaign_ppb = 0.0) {
+                                     const char* key,
+                                     const welford_t& w,
+                                     bool include_frequency,
+                                     double campaign_ppb = 0.0) {
   Payload obj;
   payload_add_welford_object(obj, "welford", w);
   if (include_frequency) {
-    // Frequency fields are campaign-total ratios.  The Welford object remains
-    // the per-second residual statistics surface.  Do not publish w.mean as
-    // tau/ppb: that makes TAU/PPB indistinguishable from MEAN and hides the
-    // accumulated campaign clock/GNSS ratio.
     payload_add_frequency_fields(obj, campaign_ppb);
   }
   parent.add_object(key, obj);
 }
 
-static FLASHMEM void payload_add_stats_ocxo_clock(Payload& parent,
-                                         const char* key,
-                                         const welford_t& w,
-                                         const clock_science_row_t& science) {
-  Payload obj;
-  payload_add_welford_object(obj, "welford", w);
-
-  // Keep the public stats object compact.  The panel-facing OCXO frequency
-  // value is the continuity-aligned campaign clockface ratio published in
-  // science.total_ppb/total_tau: public_ocxo_ns / public_gnss_ns.  Welford
-  // continues to describe the per-second Delta/PhaseLedger residual
-  // distribution.
-  const double ppb = science.total_valid ? science.total_ppb : 0.0;
-  payload_add_frequency_fields(obj, ppb);
-
+// Report-only serializer: every child Payload header lives in RAM2 and is reused.
+// It is called only while clocks_report_build_guard_t excludes priority-16
+// TimePop/handoff entry. TIMEBASE retains its independent ordinary serializer.
+static FLASHMEM void report_add_welford_object(Payload& parent,
+                                               const char* key,
+                                               const welford_t& w) {
+  Payload& obj = g_report_child_welford;
+  obj.clear();
+  obj.add("n", w.n);
+  obj.add("mean", toFixedDecimal(w.mean, 6));
+  obj.add("stddev", toFixedDecimal(welford_stddev(w), 6));
+  obj.add("stderr", toFixedDecimal(welford_stderr(w), 6));
+  obj.add("min", toFixedDecimal((w.n > 0) ? w.min_val : 0.0, 6));
+  obj.add("max", toFixedDecimal((w.n > 0) ? w.max_val : 0.0, 6));
   parent.add_object(key, obj);
+  obj.clear();
 }
 
-static FLASHMEM void payload_add_stats_summary_hierarchical(Payload& p,
-                                                   uint64_t public_gnss_ns,
-                                                   uint64_t public_dwt_total,
-                                                   const clock_science_row_t& ocxo1_science,
-                                                   const clock_science_row_t& ocxo2_science) {
+static FLASHMEM void report_add_stats_clock(Payload& parent,
+                                             const char* key,
+                                             const welford_t& w,
+                                             bool include_frequency,
+                                             double ppb_value = 0.0) {
+  Payload& obj = g_report_child_clock;
+  obj.clear();
+  report_add_welford_object(obj, "welford", w);
+  if (include_frequency) payload_add_frequency_fields(obj, ppb_value);
+  parent.add_object(key, obj);
+  obj.clear();
+}
+
+static FLASHMEM void report_add_stats_summary_from_snapshot(
+    Payload& p,
+    const clocks_instrument_stats_snapshot_t& instrument) {
+  Payload& stats = g_report_child_stats;
+  stats.clear();
+  stats.add("schema", "CLOCKS_INSTRUMENT_STATS_V2");
+  stats.add("always_on", true);
+  stats.add("owner", "ALPHA");
+  stats.add("lifetime", "BOOT_TO_REBOOT_OR_STATS_RESET");
+  stats.add("valid", instrument.valid);
+  stats.add("reset_count", instrument.reset_count);
+  stats.add("update_count", instrument.update_count);
+  stats.add("last_pps_sequence", instrument.last_pps_sequence);
+  stats.add("completed_row_coherent", instrument.completed_row_coherent);
+
+  report_add_stats_clock(stats, "dwt", instrument.dwt_welford, true,
+                         instrument.dwt_frequency.ppb);
+  report_add_stats_clock(stats, "vclock", instrument.vclock_welford, true,
+                         instrument.vclock_frequency.ppb);
+  report_add_stats_clock(stats, "ocxo1", instrument.ocxo1_welford, true,
+                         instrument.ocxo1_frequency.ppb);
+  report_add_stats_clock(stats, "ocxo2", instrument.ocxo2_welford, true,
+                         instrument.ocxo2_frequency.ppb);
+  report_add_stats_clock(stats, "pps_witness",
+                         instrument.pps_witness_welford, false);
+
+  Payload& maturity = g_report_child_maturity;
+  maturity.clear();
+  maturity.add("dwt_samples", instrument.dwt_frequency.sample_count);
+  maturity.add("vclock_samples", instrument.vclock_frequency.sample_count);
+  maturity.add("vclock_intervals", instrument.vclock_frequency.interval_count);
+  maturity.add("ocxo1_samples", instrument.ocxo1_frequency.sample_count);
+  maturity.add("ocxo1_intervals", instrument.ocxo1_frequency.interval_count);
+  maturity.add("ocxo1_stderr_ppb",
+               toFixedDecimal(instrument.ocxo1_frequency.stderr_ppb, 6));
+  maturity.add("ocxo2_samples", instrument.ocxo2_frequency.sample_count);
+  maturity.add("ocxo2_intervals", instrument.ocxo2_frequency.interval_count);
+  maturity.add("ocxo2_stderr_ppb",
+               toFixedDecimal(instrument.ocxo2_frequency.stderr_ppb, 6));
+  stats.add_object("maturity", maturity);
+  maturity.clear();
+
+  Payload& admission = g_report_child_admission;
+  admission.clear();
+  admission.add("interval_min_cycles", 900000000UL);
+  admission.add("interval_max_cycles", 1100000000UL);
+  admission.add("vclock_reject_count", instrument.vclock_interval_reject_count);
+  admission.add("ocxo1_reject_count", instrument.ocxo1_interval_reject_count);
+  admission.add("ocxo2_reject_count", instrument.ocxo2_interval_reject_count);
+  stats.add_object("interval_admission", admission);
+  admission.clear();
+
+  Payload& dac = g_report_child_dac;
+  dac.clear();
+  report_add_welford_object(dac, "ocxo1", instrument.ocxo1_dac_welford);
+  report_add_welford_object(dac, "ocxo2", instrument.ocxo2_dac_welford);
+  stats.add_object("dac", dac);
+  dac.clear();
+
+  p.add_object("stats", stats);
+  stats.clear();
+}
+
+static FLASHMEM void payload_add_stats_summary_from_snapshot(
+    Payload& p,
+    const clocks_instrument_stats_snapshot_t& instrument) {
   Payload stats;
-  payload_add_stats_clock(stats, "dwt", welford_dwt, true,
-                          campaign_total_dwt_ppb(public_gnss_ns,
-                                                 public_dwt_total));
-  payload_add_stats_clock(stats, "vclock", welford_vclock, true, 0.0);
-  payload_add_stats_ocxo_clock(stats, "ocxo1", welford_ocxo1, ocxo1_science);
-  payload_add_stats_ocxo_clock(stats, "ocxo2", welford_ocxo2, ocxo2_science);
-  payload_add_stats_clock(stats, "pps_witness", welford_pps_witness, false);
+  stats.add("schema", "CLOCKS_INSTRUMENT_STATS_V1");
+  stats.add("always_on", true);
+  stats.add("owner", "ALPHA");
+  stats.add("lifetime", "BOOT_TO_REBOOT_OR_STATS_RESET");
+  stats.add("valid", instrument.valid);
+  stats.add("reset_count", instrument.reset_count);
+  stats.add("update_count", instrument.update_count);
+  stats.add("last_pps_sequence", instrument.last_pps_sequence);
+  stats.add("completed_row_coherent", instrument.completed_row_coherent);
+
+  payload_add_stats_clock(stats, "dwt", instrument.dwt_welford, true,
+                          instrument.dwt_frequency.ppb);
+  payload_add_stats_clock(stats, "vclock", instrument.vclock_welford, true,
+                          instrument.vclock_frequency.ppb);
+  payload_add_stats_clock(stats, "ocxo1", instrument.ocxo1_welford, true,
+                          instrument.ocxo1_frequency.ppb);
+  payload_add_stats_clock(stats, "ocxo2", instrument.ocxo2_welford, true,
+                          instrument.ocxo2_frequency.ppb);
+  payload_add_stats_clock(stats, "pps_witness",
+                          instrument.pps_witness_welford, false);
+
+  Payload maturity;
+  maturity.add("dwt_samples", instrument.dwt_frequency.sample_count);
+  maturity.add("vclock_samples", instrument.vclock_frequency.sample_count);
+  maturity.add("vclock_intervals", instrument.vclock_frequency.interval_count);
+  maturity.add("ocxo1_samples", instrument.ocxo1_frequency.sample_count);
+  maturity.add("ocxo1_intervals", instrument.ocxo1_frequency.interval_count);
+  maturity.add("ocxo1_stderr_ppb",
+               toFixedDecimal(instrument.ocxo1_frequency.stderr_ppb, 6));
+  maturity.add("ocxo2_samples", instrument.ocxo2_frequency.sample_count);
+  maturity.add("ocxo2_intervals", instrument.ocxo2_frequency.interval_count);
+  maturity.add("ocxo2_stderr_ppb",
+               toFixedDecimal(instrument.ocxo2_frequency.stderr_ppb, 6));
+  stats.add_object("maturity", maturity);
+
+  Payload admission;
+  admission.add("interval_min_cycles", 900000000UL);
+  admission.add("interval_max_cycles", 1100000000UL);
+  admission.add("vclock_reject_count", instrument.vclock_interval_reject_count);
+  admission.add("ocxo1_reject_count", instrument.ocxo1_interval_reject_count);
+  admission.add("ocxo2_reject_count", instrument.ocxo2_interval_reject_count);
+  stats.add_object("interval_admission", admission);
 
   Payload dac;
-  payload_add_welford_object(dac, "ocxo1", welford_ocxo1_dac);
-  payload_add_welford_object(dac, "ocxo2", welford_ocxo2_dac);
+  payload_add_welford_object(dac, "ocxo1", instrument.ocxo1_dac_welford);
+  payload_add_welford_object(dac, "ocxo2", instrument.ocxo2_dac_welford);
   stats.add_object("dac", dac);
 
   p.add_object("stats", stats);
 }
 
+static FLASHMEM void payload_add_stats_summary_hierarchical(
+    Payload& p,
+    uint64_t public_gnss_ns,
+    uint64_t public_dwt_total,
+    const clock_science_row_t& ocxo1_science,
+    const clock_science_row_t& ocxo2_science) {
+  (void)public_gnss_ns;
+  (void)public_dwt_total;
+  (void)ocxo1_science;
+  (void)ocxo2_science;
+
+  g_beta_instrument_stats = clocks_instrument_stats_snapshot_t{};
+  (void)clocks_alpha_instrument_stats_snapshot(&g_beta_instrument_stats);
+  payload_add_stats_summary_from_snapshot(p, g_beta_instrument_stats);
+}
 
 
 
@@ -4518,12 +4192,17 @@ static FLASHMEM void clocks_beta_cold_diagnostics_init(void) {
   g_beta_probe_ocxo2_science_row = clock_science_row_t{};
   g_beta_probe_science_totals_o1 = ocxo_science_totals_t{};
   g_beta_probe_science_totals_o2 = ocxo_science_totals_t{};
+  g_beta_instrument_stats = clocks_instrument_stats_snapshot_t{};
+  g_beta_report_instrument_stats = clocks_instrument_stats_snapshot_t{};
+  g_clocks_report_build_active = false;
+  g_clocks_report_build_count = 0U;
+  g_clocks_report_busy_reject_count = 0U;
+  g_clocks_report_max_duration_cycles = 0U;
 
   g_recover_reattach_last_ocxo1 =
       clocks_alpha_recover_reattach_snapshot_t{};
   g_recover_reattach_last_ocxo2 =
       clocks_alpha_recover_reattach_snapshot_t{};
-  g_recover_welfords_pending = recover_welford_state_t{};
 
   g_clocks_payload_numeric_integrity_failed = false;
   g_clocks_payload_numeric_integrity_fail_count = 0U;
@@ -5818,9 +5497,7 @@ static uint16_t        g_ocxo_dac_commit_target_hw_code = 0;
 static uint64_t        g_ocxo_dac_last_schedule_second = 0;
 static uint8_t         g_ocxo_dac_last_winner = 0;
 static uint32_t        g_ocxo_dac_arbitration_passes = 0;
-static uint32_t        g_ocxo_dac_no_candidate_passes = 0;
 static uint32_t        g_ocxo_dac_deferred_candidates = 0;
-static uint32_t        g_ocxo_dac_schedule_failures = 0;
 
 static uint8_t ocxo_dac_lane_id(const ocxo_dac_state_t& dac) {
   return (&dac == &ocxo1_dac) ? 1U : 2U;
@@ -5979,13 +5656,7 @@ static void campaign_accounting_reset_common(bool reset_servo_runtime) {
 
   campaign_public_offsets_reset_to_current();
 
-  welford_reset(welford_dwt);
-  welford_reset(welford_vclock);
-  welford_reset(welford_ocxo1);
-  welford_reset(welford_ocxo2);
-  welford_reset(welford_pps_witness);
-  welford_reset(welford_ocxo1_dac);
-  welford_reset(welford_ocxo2_dac);
+  // Alpha's instrument statistics deliberately survive campaign boundaries.
 
   pps_interval_residuals_reset();
   clocks_beta_feature_set_cached("TIMEBASE_PUBLICATION",
@@ -6207,8 +5878,9 @@ static void campaign_flash_cut_commit_at_pps(void) {
            sizeof(g_flash_cut_last_to_campaign),
            campaign_name);
 
-  // This is the cut itself: Beta rebases campaign-public clocks/statistics at
-  // the already-authored PPS/VCLOCK edge, then returns without emitting a
+  // This is the cut itself: Beta rebases campaign-public clock presentation at
+  // the already-authored PPS/VCLOCK edge while Alpha statistics continue, then
+  // returns without emitting a
   // TIMEBASE pair for the boundary row.  The next PPS publishes count=1 and
   // public GNSS/DWT/OCXO ledgers approximately +1 second from this boundary.
   campaign_flash_cut_accounting_reset();
@@ -6355,38 +6027,30 @@ static void clocks_finish_start_accounting(void) {
 
 
 static bool clocks_try_finish_pending_smartzero(void) {
-  if (!request_start && !request_zero) return false;
+  if (!request_zero) return false;
   if (!interrupt_smartzero_complete()) return false;
 
-  const bool finishing_start = request_start;
-  const bool zero_ok = clocks_alpha_zero_from_smartzero(
-      finishing_start ? "start" : "zero");
+  const bool zero_ok = clocks_alpha_zero_from_smartzero("zero");
   if (!zero_ok) {
     const clocks_alpha_ocxo_grid_rephase_status_t status =
         clocks_alpha_ocxo_grid_rephase_status(
             clocks_alpha_ocxo_grid_rephase_owner_t::SMARTZERO_EPOCH);
     if (status == clocks_alpha_ocxo_grid_rephase_status_t::PENDING) {
-      // The completed SmartZero proof is now installing physical grids through
-      // TimePop.  Preserve request_start/request_zero until Alpha commits.
       return false;
     }
     if (status == clocks_alpha_ocxo_grid_rephase_status_t::FAILED) {
       clocks_alpha_ocxo_grid_rephase_acknowledge(
           clocks_alpha_ocxo_grid_rephase_owner_t::SMARTZERO_EPOCH);
     }
-    request_start = false;
     request_zero = false;
     return false;
   }
 
-  if (finishing_start) {
-    clocks_finish_start_accounting();
-  } else {
-    campaign_state = clocks_campaign_state_t::STOPPED;
-    clocks_finish_zero_accounting();
-  }
+  campaign_state = clocks_campaign_state_t::STOPPED;
+  clocks_finish_zero_accounting();
   return true;
 }
+
 
 static bool clocks_servo_active(void) {
   return calibrate_ocxo_mode != servo_mode_t::OFF;
@@ -6434,8 +6098,8 @@ static FLASHMEM void publish_dac_tick(const char*) {
 // clocks_beta_pps — PPS control probe or exact completed-row publication
 // ============================================================================
 //
-// completed_pps_sequence == 0 is a control-only physical-PPS probe used while
-// START/ZERO SmartZero installation is pending.  A non-zero sequence is one
+// completed_pps_sequence == 0 is a control-only physical-PPS probe used for
+// recording START boundaries, explicit ZERO, and RECOVER. A non-zero sequence is one
 // immutable Alpha row released only after both post-PPS OCXO edges resolve the
 // exact CounterLedger + PhaseLedger clockfaces for that same PPS.
 
@@ -6458,10 +6122,17 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
     return;
   }
 
-  if (request_start || request_zero) {
+  if (request_start) {
+    timebase_build_stage(TIMEBASE_BUILD_STAGE_START_ZERO_GATE);
+    clocks_finish_start_accounting();
+    publish_dac_tick("START_RECORDING_GATE");
+    return;
+  }
+
+  if (request_zero) {
     timebase_build_stage(TIMEBASE_BUILD_STAGE_START_ZERO_GATE);
     (void)clocks_try_finish_pending_smartzero();
-    publish_dac_tick("START_ZERO_GATE");
+    publish_dac_tick("ZERO_GATE");
     return;
   }
 
@@ -6568,7 +6239,7 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
     g_recover_lifecycle_gate_custody_reset_count++;
     pps_interval_residuals_begin_recover_quarantine(
         CLOCKS_RECOVER_SCIENCE_QUARANTINE_ROWS);
-    recover_welfords_apply_pending();
+    // Alpha-owned PPB/TAU/Welfords remain live across warm recovery.
 
     request_recover = false;
     flash_cut_clear_pending();
@@ -6740,26 +6411,9 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
   ocxo1_measured_gnss_ticks_64        = campaign_public_ocxo1_ns() / 100ull;
   ocxo2_measured_gnss_ticks_64        = campaign_public_ocxo2_ns() / 100ull;
 
-  // ── Welford updates ──
-  //
-  // DWT sample is fed directly as ppb using the uniform sign convention:
-  // positive ppb → Teensy running FAST (measured cycles > expected).
-  //
-  // RECOVER boundary rows are canonical campaign seconds, so the later
-  // welford gap-advance preserves their cardinality.  They are not lawful DWT
-  // population samples, however: service reattachment, continuity alignment,
-  // and the two-row science quarantine may carry a one-row catch-up interval.
-  // Keep that evidence in the raw clocks, but do not let it poison Welford.
-  const bool dwt_welford_recovery_quarantine =
-      g_recover_reattach_active ||
-      g_recover_reattach_degraded_active ||
-      g_science_residual_quarantine_remaining != 0U ||
-      g_recover_continuity_align_pending ||
-      clocks_campaign_recovery_lifecycle_active();
-
-  // DWT Welford mutation is deferred until after the candidate disposition
-  // court below.  A SCIENCE_REJECT row advances campaign identity but may not
-  // enter any campaign statistical population.
+  // Alpha already advanced the boot-lifetime instrument statistics for this
+  // completed row before entering Beta.  The remaining work is campaign
+  // presentation, candidate disposition, and servo selection.
 
   clocks_alpha_ocxo_pps_projection_snapshot_t& ocxo1_pps_projection =
       g_beta_pps_ocxo1_projection;
@@ -6994,42 +6648,13 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
       prediction_snapshot_for_clock(time_clock_id_t::OCXO2);
 
   // SERVOS live command handoff is control-plane state, so it still commits on
-  // a rejected science row.  Scientific inputs, statistics, and DAC motion do not.
+  // a rejected campaign row.  Alpha instrument statistics are independent of
+  // this campaign disposition; campaign servo/DAC motion remains gated below.
   clocks_commit_pending_servo_mode_change();
 
   if (candidate_math_permitted) {
-    if (dwt_welford_recovery_quarantine) {
-      g_dwt_welford_recovery_quarantine_count++;
-      g_dwt_welford_recovery_quarantine_last_public_count = public_count;
-      g_dwt_welford_recovery_quarantine_last_cycles =
-          (uint32_t)g_dwt_cycles_between_pps_vclock;
-    } else {
-      const double cycles = (double)g_dwt_cycles_between_pps_vclock;
-      const double expected = (double)DWT_EXPECTED_PER_PPS;
-      const double dwt_ppb_sample = (cycles - expected) / expected * 1e9;
-      welford_update(welford_dwt, dwt_ppb_sample);
-    }
-
-    // VCLOCK measurement Welford — bridge-interpolation self-test.
-    if (g_vclock_measurement.gnss_ns_between_edges != 0) {
-      welford_update(welford_vclock,
-                     (double)g_vclock_measurement.second_residual_ns);
-    }
-
-    (void)welfords_advance_non_ocxo_gap_before_row(public_count);
-    (void)welfords_advance_ocxo_gap_before_valid_row(
-        public_count,
-        ocxo1_science.valid,
-        ocxo2_science.valid);
-
-    if (ocxo1_science.valid) {
-      welford_update(welford_ocxo1,
-                     ocxo1_science.fast_residual_ns_exact);
-    }
-    if (ocxo2_science.valid) {
-      welford_update(welford_ocxo2,
-                     ocxo2_science.fast_residual_ns_exact);
-    }
+    // Welford/TAU/PPB are Alpha-owned and were updated before this call.
+    // Beta reads the mature populations below for servo compatibility only.
 
     const bool ocxo1_total_slope_valid =
         pps_residuals.ocxo1_valid && ocxo1_science.total_valid;
@@ -7250,10 +6875,7 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
     ocxo_calibration_servo();
     timebase_build_stage(TIMEBASE_BUILD_STAGE_SERVO);
 
-    welford_update(welford_ocxo1_dac,
-                   ocxo_dac_fractional_snapshot(ocxo1_dac));
-    welford_update(welford_ocxo2_dac,
-                   ocxo_dac_fractional_snapshot(ocxo2_dac));
+    // DAC populations are sampled by Alpha with the same completed row.
   } else {
     servo_input_diag_reset(g_servo_input_ocxo1);
     servo_input_diag_reset(g_servo_input_ocxo2);
@@ -7718,6 +7340,18 @@ static FLASHMEM Payload cmd_start(const Payload& args) {
     return err;
   }
 
+  if (!clocks_alpha_installed_smartzero_backing_epoch() ||
+      clocks_alpha_epoch_install_in_progress()) {
+    Payload err;
+    err.add("error", "instrument clock epoch is not ready");
+    err.add("status", "start_rejected_instrument_initializing");
+    err.add("epoch_ready", clocks_alpha_installed_smartzero_backing_epoch());
+    err.add("epoch_install_in_progress",
+            clocks_alpha_epoch_install_in_progress());
+    err.add("retry", "START after CLOCKS.REPORT_CLOCKS shows valid=true");
+    return err;
+  }
+
   safeCopy(campaign_name, sizeof(campaign_name), name);
 
   ocxo_dac_pacing_abort_all();
@@ -7754,32 +7388,17 @@ static FLASHMEM Payload cmd_start(const Payload& args) {
   campaign_state = clocks_campaign_state_t::STOPPED;
   campaign_warmup_reset();
 
-  // Non-destructive SmartZero begin: preserve the currently installed service
-  // epoch while the replacement proof is acquired. The destructive science
-  // rebase happens only after clocks_alpha_zero_from_smartzero() succeeds.
-  const bool smartzero_started = clocks_alpha_begin_smartzero_epoch("start");
-  if (!smartzero_started) {
-    request_start = false;
-  }
-
   Payload p;
-  p.add("status", !smartzero_started
-                      ? "start_rejected_smartzero_start_failed"
-                      : ((!dac1_ok || !dac2_ok)
-                            ? "start_pending_smartzero_dac_fault"
-                            : "start_pending_smartzero"));
+  p.add("status", (!dac1_ok || !dac2_ok)
+                      ? "start_requested_dac_fault_servos_off"
+                      : "start_requested");
   p.add("campaign_admission_source", "PI_MONITOR_PREFLIGHT");
-  p.add("firmware_policy_gate_used", false);
-  p.add("zero_installed", false);
-  p.add("smartzero_required", true);
-  p.add("smartzero_started", smartzero_started);
-  p.add("service_epoch_preserved",
-        clocks_alpha_smartzero_last_begin_preserved_epoch());
-  p.add("smartzero_begin_destructive", false);
-  p.add("smartzero_begin_reason", clocks_alpha_smartzero_last_begin_reason());
-  p.add("smartzero_pending_active", clocks_alpha_smartzero_pending_active());
-  p.add("smartzero_pending_reason", clocks_alpha_smartzero_pending_reason());
-  p.add("epoch_owner", "CLOCKS_SMARTZERO");
+  p.add("recording_boundary", "NEXT_COMPLETED_PPS");
+  p.add("instrument_always_on", true);
+  p.add("service_epoch_preserved", true);
+  p.add("statistics_preserved", true);
+  p.add("smartzero_required", false);
+  p.add("epoch_owner", "CLOCKS_ALPHA");
   p.add("epoch_sequence", clocks_alpha_epoch_sequence());
   p.add("epoch_reason", clocks_alpha_epoch_last_reason());
   p.add("ocxo1_dac", toFixedDecimal(ocxo1_dac.dac_fractional, 6));
@@ -7791,12 +7410,12 @@ static FLASHMEM Payload cmd_start(const Payload& args) {
   p.add("ocxo2_dac_voltage",
         toFixedDecimal(ocxo_dac_voltage_from_code((double)ocxo2_dac.dac_hw_code), 9));
   p.add("dac_reference_mode", OCXO_DAC_REFERENCE_MODE);
-  p.add("dac_safe_max_output_voltage", toFixedDecimal(OCXO_DAC_SAFE_MAX_OUTPUT_VOLTAGE, 9));
+  p.add("dac_safe_max_output_voltage",
+        toFixedDecimal(OCXO_DAC_SAFE_MAX_OUTPUT_VOLTAGE, 9));
   p.add("dac_safe_max_hw_code", (uint32_t)OCXO_DAC_SAFE_MAX_HW_CODE);
   p.add("ocxo1_dac_last_write_ok", ocxo1_dac.io_last_write_ok);
   p.add("ocxo2_dac_last_write_ok", ocxo2_dac.io_last_write_ok);
   p.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
-  payload_add_smartzero_summary(p);
   return p;
 }
 
@@ -7823,7 +7442,8 @@ static FLASHMEM Payload cmd_stop(const Payload&) {
       !had_pending_recover && !had_recovering) {
     request_stop = true;
     p.add("status", "stop_requested");
-    p.add("service_epoch_preserved", false);
+    p.add("service_epoch_preserved", true);
+    p.add("statistics_preserved", true);
     return p;
   }
 
@@ -8026,11 +7646,6 @@ static FLASHMEM Payload cmd_recover(const Payload& args) {
     return p;
   }
 
-  if (!recover_welfords_capture(args)) {
-    return clocks_payload_numeric_reject_response(
-        "recover_rejected_welford_numeric_integrity");
-  }
-
   g_recover_last_campaign_supplied = campaign_supplied;
   if (campaign_supplied) {
     safeCopy(campaign_name, sizeof(campaign_name), requested_campaign);
@@ -8099,10 +7714,10 @@ static FLASHMEM Payload cmd_recover(const Payload& args) {
   p.add("status", "recover_requested");
   p.add("idempotent", false);
   p.add("recovery_generation", g_recover_request_count);
-  p.add("welford_recovery_lane_count",
-        g_recover_welfords_pending.restored_lane_count);
-  p.add("welford_recovery_supplied",
-        g_recover_welfords_pending.restored_lane_count != 0U);
+  p.add("instrument_statistics_preserved",
+        clocks_alpha_installed_smartzero_backing_epoch());
+  p.add("instrument_statistics_restored", false);
+  p.add("instrument_statistics_recovery_source", "LIVE_ALPHA_OR_COLD_REFILL");
   p.add("base_count", g_recover_last_base_count);
   p.add("expected_first_public_count",
         g_recover_last_expected_first_public_count);
@@ -8229,6 +7844,9 @@ static FLASHMEM Payload cmd_report_recovery(const Payload&) {
         g_recover_reattach_last_progress_public_count);
   p.add("science_quarantine_remaining",
         g_science_residual_quarantine_remaining);
+  p.add("instrument_statistics_owner", "ALPHA");
+  p.add("instrument_statistics_preserved", true);
+  p.add("instrument_statistics_restored", false);
   p.add("warmup_active", campaign_warmup_active());
 
   const bool recover_timeline_ready =
@@ -8246,6 +7864,144 @@ static FLASHMEM Payload cmd_report_recovery(const Payload&) {
   return p;
 }
 
+
+static FLASHMEM void report_add_instrument_clock_values(
+    Payload& parent,
+    const clocks_instrument_stats_snapshot_t& instrument) {
+  Payload& clocks = g_report_child_clocks;
+  clocks.clear();
+  clocks.add("gnss_ns", instrument.gnss_ns);
+  clocks.add("dwt_cycles", instrument.dwt_cycles);
+  clocks.add("ocxo1_ns", instrument.ocxo1_ns);
+  clocks.add("ocxo2_ns", instrument.ocxo2_ns);
+  clocks.add("completed_pps_sequence", instrument.last_pps_sequence);
+  clocks.add("completed_row_coherent", instrument.completed_row_coherent);
+  clocks.add("dwt_cycles_per_second", instrument.dwt_cycles_per_second);
+  clocks.add("selected_reference_interval_cycles",
+             instrument.selected_reference_interval_cycles);
+  clocks.add("vclock_interval_cycles", instrument.vclock_interval_cycles);
+  clocks.add("ocxo1_interval_cycles", instrument.ocxo1_interval_cycles);
+  clocks.add("ocxo2_interval_cycles", instrument.ocxo2_interval_cycles);
+  parent.add_object("clocks", clocks);
+  clocks.clear();
+}
+
+static FLASHMEM Payload clocks_report_busy_response(const char* report) {
+  Payload p;
+  p.add("error", "clock report builder busy");
+  p.add("status", "report_deferred_busy");
+  p.add("report", report ? report : "CLOCKS_REPORT");
+  p.add("retry", true);
+  p.add("report_busy_reject_count", g_clocks_report_busy_reject_count);
+  return p;
+}
+
+static FLASHMEM void report_add_common_metadata(
+    Payload& p,
+    const char* report,
+    const char* schema,
+    bool snapshot_ok) {
+  p.add("report", report);
+  p.add("schema", schema);
+  p.add("instrument_always_on", true);
+  p.add("instrument_owner", "ALPHA");
+  p.add("snapshot_ok", snapshot_ok);
+  p.add("valid", g_beta_report_instrument_stats.valid);
+  p.add("completed_row_coherent",
+        g_beta_report_instrument_stats.completed_row_coherent);
+  p.add("completed_pps_sequence",
+        g_beta_report_instrument_stats.last_pps_sequence);
+  p.add("campaign_state", clocks_campaign_state_name(campaign_state));
+  p.add("recording", campaign_state == clocks_campaign_state_t::STARTED);
+  p.add("campaign", campaign_name);
+  p.add("campaign_seconds", campaign_seconds);
+  p.add("epoch_ready", clocks_alpha_installed_smartzero_backing_epoch());
+  p.add("epoch_sequence", clocks_alpha_epoch_sequence());
+  p.add("report_priority0_capture_live", true);
+  p.add("report_priority16_excluded", true);
+  p.add("report_build_count", g_clocks_report_build_count);
+  p.add("report_busy_reject_count", g_clocks_report_busy_reject_count);
+  p.add("report_max_duration_cycles", g_clocks_report_max_duration_cycles);
+}
+
+static FLASHMEM Payload cmd_report_clocks(const Payload&) {
+  clocks_report_build_guard_t guard;
+  if (!guard.acquired) return clocks_report_busy_response("CLOCKS_INSTRUMENT");
+
+  g_beta_report_instrument_stats = clocks_instrument_stats_snapshot_t{};
+  const bool snapshot_ok = clocks_alpha_instrument_stats_snapshot(
+      &g_beta_report_instrument_stats);
+
+  Payload& built = g_report_clocks_payload;
+  built.clear();
+  report_add_common_metadata(built,
+                             "CLOCKS_INSTRUMENT",
+                             "CLOCKS_INSTRUMENT_REPORT_V2",
+                             snapshot_ok);
+  report_add_instrument_clock_values(built, g_beta_report_instrument_stats);
+
+  // Deliberately compact: full distributions live under REPORT_STATS.
+  built.add("stats_reset_count", g_beta_report_instrument_stats.reset_count);
+  built.add("stats_update_count", g_beta_report_instrument_stats.update_count);
+  built.add("dwt_ppb",
+            toFixedDecimal(g_beta_report_instrument_stats.dwt_frequency.ppb, 3));
+  built.add("vclock_ppb",
+            toFixedDecimal(g_beta_report_instrument_stats.vclock_frequency.ppb, 3));
+  built.add("ocxo1_ppb",
+            toFixedDecimal(g_beta_report_instrument_stats.ocxo1_frequency.ppb, 3));
+  built.add("ocxo2_ppb",
+            toFixedDecimal(g_beta_report_instrument_stats.ocxo2_frequency.ppb, 3));
+  built.add("dwt_samples",
+            g_beta_report_instrument_stats.dwt_frequency.sample_count);
+  built.add("vclock_samples",
+            g_beta_report_instrument_stats.vclock_frequency.sample_count);
+  built.add("ocxo1_samples",
+            g_beta_report_instrument_stats.ocxo1_frequency.sample_count);
+  built.add("ocxo2_samples",
+            g_beta_report_instrument_stats.ocxo2_frequency.sample_count);
+
+  Payload response = built;
+  built.clear();
+  return response;
+}
+
+static FLASHMEM Payload cmd_report_stats(const Payload&) {
+  clocks_report_build_guard_t guard;
+  if (!guard.acquired) return clocks_report_busy_response("CLOCKS_STATS");
+
+  g_beta_report_instrument_stats = clocks_instrument_stats_snapshot_t{};
+  const bool snapshot_ok = clocks_alpha_instrument_stats_snapshot(
+      &g_beta_report_instrument_stats);
+
+  Payload& built = g_report_stats_payload;
+  built.clear();
+  report_add_common_metadata(built,
+                             "CLOCKS_STATS",
+                             "CLOCKS_INSTRUMENT_STATS_REPORT_V2",
+                             snapshot_ok);
+  report_add_stats_summary_from_snapshot(built, g_beta_report_instrument_stats);
+
+  Payload response = built;
+  built.clear();
+  return response;
+}
+
+static FLASHMEM Payload cmd_stats_reset(const Payload&) {
+  clocks_alpha_instrument_stats_reset();
+
+  // Keep reset acknowledgment tiny. The operator may request REPORT_CLOCKS or
+  // REPORT_STATS after the next completed row without recursively entering the
+  // heavy report builder from this command.
+  Payload p;
+  p.add("status", "instrument_statistics_reset");
+  p.add("reset", true);
+  p.add("clocks_reset", false);
+  p.add("campaign_changed", false);
+  p.add("instrument_owner", "ALPHA");
+  p.add("lifetime", "BOOT_TO_REBOOT_OR_STATS_RESET");
+  p.add("next_report", "REPORT_CLOCKS");
+  return p;
+}
 
 static FLASHMEM Payload cmd_stack_witness_reset(const Payload&) {
   clocks_stack_witness_reset();
@@ -8443,6 +8199,9 @@ static const process_command_entry_t CLOCKS_COMMANDS[] = {
   { "RECOVER_ABORT",       cmd_recover_abort       },
   { "SERVOS",              cmd_servos              },
   { "GATE_MODE",           cmd_gate_mode           },
+  { "REPORT_CLOCKS",       cmd_report_clocks       },
+  { "REPORT_STATS",        cmd_report_stats        },
+  { "STATS_RESET",         cmd_stats_reset         },
   { "REPORT_RECOVERY",     cmd_report_recovery     },
   { "STACK_WITNESS_RESET", cmd_stack_witness_reset },
   { "DITHER_ENABLE",       cmd_dither_enable       },

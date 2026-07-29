@@ -2548,13 +2548,53 @@ static uint32_t g_alpha_last_ocxo2_pps_sequence = 0U;
 static uint32_t g_alpha_last_installed_timebase_pps_sequence = 0U;
 
 // ============================================================================
+// Alpha-owned unified Welford accumulators
+// ============================================================================
+
+welford_t welford_dwt          = {};
+welford_t welford_vclock       = {};
+welford_t welford_ocxo1        = {};
+welford_t welford_ocxo2        = {};
+welford_t welford_pps_witness  = {};
+welford_t welford_ocxo1_dac    = {};
+welford_t welford_ocxo2_dac    = {};
+
+void welford_reset(welford_t& w) {
+  w.n       = 0;
+  w.mean    = 0.0;
+  w.m2      = 0.0;
+  w.min_val = 1e30;
+  w.max_val = -1e30;
+}
+
+void welford_update(welford_t& w, double sample) {
+  w.n++;
+  const double d1 = sample - w.mean;
+  w.mean += d1 / (double)w.n;
+  const double d2 = sample - w.mean;
+  w.m2 += d1 * d2;
+  if (sample < w.min_val) w.min_val = sample;
+  if (sample > w.max_val) w.max_val = sample;
+}
+
+double welford_stddev(const welford_t& w) {
+  return (w.n >= 2) ? sqrt(w.m2 / (double)(w.n - 1)) : 0.0;
+}
+
+double welford_stderr(const welford_t& w) {
+  if (w.n < 2) return 0.0;
+  return welford_stddev(w) / sqrt((double)w.n);
+}
+
+// ============================================================================
 // Alpha always-on TAU estimator — PhaseLedger slope authority
 // ============================================================================
 // Public OCXO clockface values may have arbitrary launch intercepts. TAU is a
 // slope, so Alpha estimates it continuously from lawful contiguous PhaseLedger
 // refined endpoints and Beta snapshots that mature value at campaign START.
-// SmartZero/Alpha epoch replacement resets this surface; campaign START/STOP
-// deliberately does not.
+// Public clockface intercept changes do not reset this surface.  It advances on
+// instrument-lifetime contiguous refined intervals and is reset only at boot or
+// by the explicit statistics-reset command.
 
 struct alpha_tau_estimator_t {
   volatile uint32_t seq = 0;
@@ -2570,6 +2610,12 @@ struct alpha_tau_estimator_t {
   uint64_t first_refined_ns = 0;
   uint64_t last_refined_ns = 0;
   int64_t  last_fast_residual_ns = 0;
+
+  // Instrument-lifetime cumulative regression coordinates.  They are detached
+  // from campaign/epoch clockface intercepts.
+  uint64_t cumulative_reference_ns = 0;
+  uint64_t cumulative_clock_ns = 0;
+  double   cumulative_clock_ns_exact = 0.0;
 
   double   mean_x = 0.0;
   double   mean_y = 0.0;
@@ -2623,25 +2669,23 @@ static void alpha_tau_reset_all(void) {
 }
 
 static void alpha_tau_recompute(alpha_tau_estimator_t& s) {
-  if (s.sample_count >= 2U && s.sxx > 0.0) {
-    const double slope_ns_per_s = s.sxy / s.sxx;
-    s.tau = slope_ns_per_s / (double)NS_PER_SECOND_U64;
-    s.ppb = slope_ns_per_s - (double)NS_PER_SECOND_U64;
-    const double intercept = s.mean_y - slope_ns_per_s * s.mean_x;
-    s.intercept_ns = (intercept >= 0.0)
-        ? (int64_t)(intercept + 0.5)
-        : (int64_t)(intercept - 0.5);
-
-    if (s.sample_count >= 3U) {
-      const double explained = (s.sxy * s.sxy) / s.sxx;
-      double sse = s.syy - explained;
-      if (sse < 0.0) sse = 0.0;
-      const double sigma2 = sse / (double)(s.sample_count - 2U);
-      s.stderr_ppb = sqrt(sigma2 / s.sxx);
+  if (s.interval_count != 0U &&
+      s.cumulative_reference_ns != 0ULL &&
+      s.cumulative_clock_ns_exact > 0.0) {
+    // TAU is the frequency ratio, not the period ratio.  A physically fast
+    // clock has a shorter measured interval and therefore tau > 1.
+    s.tau = (double)s.cumulative_reference_ns /
+            s.cumulative_clock_ns_exact;
+    s.ppb = (s.tau - 1.0) * 1.0e9;
+    if (s.interval_count >= 2U) {
+      const double stddev = sqrt(
+          s.interval_m2_ppb / (double)(s.interval_count - 1U));
+      s.stderr_ppb = stddev / sqrt((double)s.interval_count);
     } else {
       s.stderr_ppb = 0.0;
     }
-    s.valid = s.interval_count >= 1U;
+    s.valid = true;
+    s.intercept_ns = 0;
   } else {
     s.valid = false;
     s.tau = 1.0;
@@ -2661,59 +2705,73 @@ static void alpha_tau_interval_update(alpha_tau_estimator_t& s,
   s.interval_m2_ppb += d1 * d2;
 }
 
-static void alpha_tau_note_refined_endpoint(time_clock_id_t clock,
-                                            uint32_t pps_sequence,
-                                            uint64_t refined_ns,
-                                            bool interval_valid,
-                                            uint64_t refined_interval_ns,
-                                            int64_t refined_fast_residual_ns) {
+static constexpr uint32_t ALPHA_INSTRUMENT_INTERVAL_MIN_CYCLES =
+    900000000UL;
+static constexpr uint32_t ALPHA_INSTRUMENT_INTERVAL_MAX_CYCLES =
+    1100000000UL;
+
+static bool alpha_instrument_interval_plausible(uint32_t cycles) {
+  return cycles >= ALPHA_INSTRUMENT_INTERVAL_MIN_CYCLES &&
+         cycles <= ALPHA_INSTRUMENT_INTERVAL_MAX_CYCLES;
+}
+
+static int64_t alpha_round_double_to_i64(double value) {
+  return value >= 0.0
+      ? (int64_t)(value + 0.5)
+      : (int64_t)(value - 0.5);
+}
+
+static void alpha_tau_note_delta_interval(time_clock_id_t clock,
+                                          uint32_t pps_sequence,
+                                          uint32_t reference_cycles,
+                                          uint32_t clock_cycles,
+                                          uint64_t clockface_ns) {
   alpha_tau_estimator_t* s = alpha_tau_store_mut(clock);
-  if (!s || pps_sequence == 0U || refined_ns == 0ULL) return;
+  if (!s || pps_sequence == 0U) return;
 
   s->seq++;
   clocks_alpha_dmb();
 
-  const bool had_prior = s->sample_count != 0U;
-  const bool contiguous = !had_prior ||
-      pps_sequence == (uint32_t)(s->last_pps_sequence + 1U);
-  const bool monotonic = !had_prior || refined_ns >= s->last_refined_ns;
-
-  if (had_prior && (!contiguous || !monotonic)) {
-    const uint32_t reset_count = s->reset_count;
-    const uint32_t gap_count = s->gap_reset_count + 1U;
-    const uint32_t reject_count = s->reject_count + 1U;
-    const uint32_t seq = s->seq;
-    *s = alpha_tau_estimator_t{};
-    s->seq = seq;
-    s->clock_id = (uint32_t)((uint8_t)clock);
-    s->reset_count = reset_count;
-    s->gap_reset_count = gap_count;
-    s->reject_count = reject_count;
+  if (s->last_pps_sequence != 0U &&
+      pps_sequence != (uint32_t)(s->last_pps_sequence + 1U)) {
+    s->gap_reset_count++;
   }
-
-  if (s->sample_count == 0U) {
-    s->first_refined_ns = refined_ns;
-  } else if (interval_valid && refined_interval_ns != 0ULL) {
-    s->last_interval_pps_sequence = pps_sequence;
-    s->last_fast_residual_ns = refined_fast_residual_ns;
-    alpha_tau_interval_update(*s, (double)refined_fast_residual_ns);
-  } else {
-    s->reject_count++;
-  }
-
-  const double x = (double)pps_sequence;
-  const double y = (double)refined_ns;
-  s->sample_count++;
-  const double n = (double)s->sample_count;
-  const double dx = x - s->mean_x;
-  const double dy = y - s->mean_y;
-  s->mean_x += dx / n;
-  s->mean_y += dy / n;
-  s->sxx += dx * (x - s->mean_x);
-  s->sxy += dx * (y - s->mean_y);
-  s->syy += dy * (y - s->mean_y);
   s->last_pps_sequence = pps_sequence;
-  s->last_refined_ns = refined_ns;
+  s->last_refined_ns = clockface_ns;
+  if (s->first_refined_ns == 0ULL) s->first_refined_ns = clockface_ns;
+
+  if (!alpha_instrument_interval_plausible(reference_cycles) ||
+      !alpha_instrument_interval_plausible(clock_cycles)) {
+    s->reject_count++;
+    clocks_alpha_dmb();
+    s->seq++;
+    return;
+  }
+
+  const double clock_interval_ns_exact =
+      ((double)clock_cycles * (double)NS_PER_SECOND_U64) /
+      (double)reference_cycles;
+  if (!(clock_interval_ns_exact > 0.0)) {
+    s->reject_count++;
+    clocks_alpha_dmb();
+    s->seq++;
+    return;
+  }
+
+  const double interval_tau =
+      (double)reference_cycles / (double)clock_cycles;
+  const double interval_ppb = (interval_tau - 1.0) * 1.0e9;
+  const double fast_residual_ns =
+      (double)NS_PER_SECOND_U64 - clock_interval_ns_exact;
+
+  s->last_interval_pps_sequence = pps_sequence;
+  s->last_fast_residual_ns = alpha_round_double_to_i64(fast_residual_ns);
+  alpha_tau_interval_update(*s, interval_ppb);
+  s->sample_count = s->interval_count;
+  s->cumulative_reference_ns += NS_PER_SECOND_U64;
+  s->cumulative_clock_ns_exact += clock_interval_ns_exact;
+  s->cumulative_clock_ns +=
+      (uint64_t)(clock_interval_ns_exact + 0.5);
   alpha_tau_recompute(*s);
 
   clocks_alpha_dmb();
@@ -2782,6 +2840,253 @@ FLASHMEM bool clocks_alpha_tau_snapshot(time_clock_id_t clock,
   return clocks_alpha_ocxo_tau_snapshot(clock, out);
 }
 
+// ============================================================================
+// Alpha always-on instrument statistics
+// ============================================================================
+
+static volatile uint32_t g_instrument_stats_seq = 0U;
+static uint32_t g_instrument_stats_reset_count = 0U;
+static uint32_t g_instrument_stats_update_count = 0U;
+static uint32_t g_instrument_stats_last_pps_sequence = 0U;
+static bool     g_instrument_stats_completed_row_coherent = false;
+static uint64_t g_instrument_stats_gnss_ns = 0ULL;
+static uint64_t g_instrument_stats_dwt_cycles = 0ULL;
+static uint64_t g_instrument_stats_ocxo1_ns = 0ULL;
+static uint64_t g_instrument_stats_ocxo2_ns = 0ULL;
+static uint32_t g_instrument_stats_dwt_cycles_per_second = 0U;
+static uint32_t g_instrument_stats_reference_interval_cycles = 0U;
+static uint32_t g_instrument_stats_vclock_interval_cycles = 0U;
+static uint32_t g_instrument_stats_ocxo1_interval_cycles = 0U;
+static uint32_t g_instrument_stats_ocxo2_interval_cycles = 0U;
+static uint32_t g_instrument_stats_vclock_interval_reject_count = 0U;
+static uint32_t g_instrument_stats_ocxo1_interval_reject_count = 0U;
+static uint32_t g_instrument_stats_ocxo2_interval_reject_count = 0U;
+
+static clocks_instrument_frequency_snapshot_t
+alpha_frequency_from_welford(const welford_t& w) {
+  clocks_instrument_frequency_snapshot_t f{};
+  f.valid = w.n != 0ULL;
+  f.sample_count = w.n;
+  f.interval_count = w.n;
+  f.ppb = f.valid ? w.mean : 0.0;
+  f.tau = 1.0 + f.ppb / 1.0e9;
+  f.stderr_ppb = welford_stderr(w);
+  return f;
+}
+
+static clocks_instrument_frequency_snapshot_t
+alpha_frequency_from_tau(time_clock_id_t clock) {
+  clocks_instrument_frequency_snapshot_t f{};
+  clocks_alpha_tau_snapshot_t tau{};
+  (void)clocks_alpha_ocxo_tau_snapshot(clock, &tau);
+  f.valid = tau.valid;
+  f.sample_count = tau.sample_count;
+  f.interval_count = tau.interval_count;
+  f.tau = tau.valid ? tau.tau : 1.0;
+  f.ppb = tau.valid ? tau.ppb : 0.0;
+  f.stderr_ppb = tau.valid ? tau.stderr_ppb : 0.0;
+  return f;
+}
+
+void clocks_alpha_instrument_stats_reset(void) {
+  g_instrument_stats_seq++;
+  clocks_alpha_dmb();
+
+  welford_reset(welford_dwt);
+  welford_reset(welford_vclock);
+  welford_reset(welford_ocxo1);
+  welford_reset(welford_ocxo2);
+  welford_reset(welford_pps_witness);
+  welford_reset(welford_ocxo1_dac);
+  welford_reset(welford_ocxo2_dac);
+  alpha_tau_reset_all();
+
+  g_instrument_stats_reset_count++;
+  g_instrument_stats_update_count = 0U;
+  // STATS_RESET clears populations, not clocks.  Preserve the latest coherent
+  // completed-row clockface so REPORT_CLOCKS remains truthful immediately.
+  g_instrument_stats_vclock_interval_reject_count = 0U;
+  g_instrument_stats_ocxo1_interval_reject_count = 0U;
+  g_instrument_stats_ocxo2_interval_reject_count = 0U;
+
+  clocks_alpha_dmb();
+  g_instrument_stats_seq++;
+}
+
+static double alpha_instrument_delta_fast_ns(uint32_t reference_cycles,
+                                             uint32_t clock_cycles) {
+  if (reference_cycles == 0U || clock_cycles == 0U) return 0.0;
+
+  // Match Beta's canonical Delta Cycles conversion exactly: the same-row
+  // selected PPS/VCLOCK interval is both the subtraction reference and the
+  // cycles-per-second denominator.
+  return ((double)((int64_t)reference_cycles - (int64_t)clock_cycles) *
+          (double)NS_PER_SECOND_U64) /
+         (double)reference_cycles;
+}
+
+static void alpha_instrument_stats_note_completed_row(uint32_t pps_sequence) {
+  if (pps_sequence == 0U ||
+      g_instrument_stats_last_pps_sequence == pps_sequence) {
+    return;
+  }
+
+  g_instrument_stats_seq++;
+  clocks_alpha_dmb();
+
+  const uint32_t cps = g_dwt_cycles_between_pps_vclock;
+  if (g_dwt_calibration_valid && cps != 0U) {
+    const double expected = (double)DWT_EXPECTED_PER_PPS;
+    const double dwt_ppb = ((double)cps - expected) / expected * 1.0e9;
+    welford_update(welford_dwt, dwt_ppb);
+  }
+
+  const uint32_t reference_cycles =
+      g_pps_vclock_dwt_cycles_between_edges_valid
+          ? g_pps_vclock_dwt_cycles_between_edges
+          : 0U;
+  const bool reference_valid =
+      alpha_instrument_interval_plausible(reference_cycles);
+
+  const uint32_t vclock_cycles =
+      g_vclock_measurement.dwt_cycles_between_edges;
+  if (reference_valid && alpha_instrument_interval_plausible(vclock_cycles)) {
+    welford_update(welford_vclock,
+                   alpha_instrument_delta_fast_ns(reference_cycles,
+                                                  vclock_cycles));
+  } else {
+    g_instrument_stats_vclock_interval_reject_count++;
+  }
+
+  const uint32_t ocxo1_cycles =
+      g_ocxo1_measurement.dwt_cycles_between_edges;
+  if (reference_valid && alpha_instrument_interval_plausible(ocxo1_cycles)) {
+    welford_update(welford_ocxo1,
+                   alpha_instrument_delta_fast_ns(reference_cycles,
+                                                  ocxo1_cycles));
+    alpha_tau_note_delta_interval(time_clock_id_t::OCXO1,
+                                  pps_sequence,
+                                  reference_cycles,
+                                  ocxo1_cycles,
+                                  g_ocxo1_measured_gnss_ns_at_pps_vclock);
+  } else {
+    g_instrument_stats_ocxo1_interval_reject_count++;
+  }
+
+  const uint32_t ocxo2_cycles =
+      g_ocxo2_measurement.dwt_cycles_between_edges;
+  if (reference_valid && alpha_instrument_interval_plausible(ocxo2_cycles)) {
+    welford_update(welford_ocxo2,
+                   alpha_instrument_delta_fast_ns(reference_cycles,
+                                                  ocxo2_cycles));
+    alpha_tau_note_delta_interval(time_clock_id_t::OCXO2,
+                                  pps_sequence,
+                                  reference_cycles,
+                                  ocxo2_cycles,
+                                  g_ocxo2_measured_gnss_ns_at_pps_vclock);
+  } else {
+    g_instrument_stats_ocxo2_interval_reject_count++;
+  }
+
+  if (reference_valid && cps != 0U) {
+    const double pps_phase_ns =
+        ((double)g_pps_vclock_phase_cycles *
+         (double)NS_PER_SECOND_U64) /
+        (double)cps;
+    welford_update(welford_pps_witness, pps_phase_ns);
+  }
+
+  welford_update(welford_ocxo1_dac,
+                 ocxo_dac_fractional_snapshot(ocxo1_dac));
+  welford_update(welford_ocxo2_dac,
+                 ocxo_dac_fractional_snapshot(ocxo2_dac));
+
+  // Freeze one coherent completed-row clockface under the same sequence lock
+  // as the statistics.  REPORT_CLOCKS must never mix the next PPS bookend with
+  // the previous row's OCXO completions.
+  g_instrument_stats_completed_row_coherent = true;
+  g_instrument_stats_gnss_ns = g_gnss_ns_at_pps_vclock;
+  g_instrument_stats_dwt_cycles = g_dwt_cycle_count_total;
+  g_instrument_stats_ocxo1_ns =
+      g_ocxo1_measured_gnss_ns_at_pps_vclock;
+  g_instrument_stats_ocxo2_ns =
+      g_ocxo2_measured_gnss_ns_at_pps_vclock;
+  g_instrument_stats_dwt_cycles_per_second = cps;
+  g_instrument_stats_reference_interval_cycles = reference_cycles;
+  g_instrument_stats_vclock_interval_cycles = vclock_cycles;
+  g_instrument_stats_ocxo1_interval_cycles = ocxo1_cycles;
+  g_instrument_stats_ocxo2_interval_cycles = ocxo2_cycles;
+
+  g_instrument_stats_last_pps_sequence = pps_sequence;
+  g_instrument_stats_update_count++;
+
+  clocks_alpha_dmb();
+  g_instrument_stats_seq++;
+}
+
+FLASHMEM bool clocks_alpha_instrument_stats_snapshot(
+    clocks_instrument_stats_snapshot_t* out) {
+  if (!out) return false;
+  *out = clocks_instrument_stats_snapshot_t{};
+
+  for (int attempt = 0; attempt < 4; attempt++) {
+    const uint32_t seq1 = g_instrument_stats_seq;
+    clocks_alpha_dmb();
+
+    clocks_instrument_stats_snapshot_t local{};
+    local.valid = g_instrument_stats_completed_row_coherent;
+    local.reset_count = g_instrument_stats_reset_count;
+    local.update_count = g_instrument_stats_update_count;
+    local.last_pps_sequence = g_instrument_stats_last_pps_sequence;
+    local.completed_row_coherent =
+        g_instrument_stats_completed_row_coherent;
+    local.gnss_ns = g_instrument_stats_gnss_ns;
+    local.dwt_cycles = g_instrument_stats_dwt_cycles;
+    local.ocxo1_ns = g_instrument_stats_ocxo1_ns;
+    local.ocxo2_ns = g_instrument_stats_ocxo2_ns;
+    local.dwt_cycles_per_second =
+        g_instrument_stats_dwt_cycles_per_second;
+    local.selected_reference_interval_cycles =
+        g_instrument_stats_reference_interval_cycles;
+    local.vclock_interval_cycles =
+        g_instrument_stats_vclock_interval_cycles;
+    local.ocxo1_interval_cycles =
+        g_instrument_stats_ocxo1_interval_cycles;
+    local.ocxo2_interval_cycles =
+        g_instrument_stats_ocxo2_interval_cycles;
+    local.vclock_interval_reject_count =
+        g_instrument_stats_vclock_interval_reject_count;
+    local.ocxo1_interval_reject_count =
+        g_instrument_stats_ocxo1_interval_reject_count;
+    local.ocxo2_interval_reject_count =
+        g_instrument_stats_ocxo2_interval_reject_count;
+
+    local.dwt_frequency = alpha_frequency_from_welford(welford_dwt);
+    local.vclock_frequency = alpha_frequency_from_welford(welford_vclock);
+    local.ocxo1_frequency =
+        alpha_frequency_from_tau(time_clock_id_t::OCXO1);
+    local.ocxo2_frequency =
+        alpha_frequency_from_tau(time_clock_id_t::OCXO2);
+
+    local.dwt_welford = welford_dwt;
+    local.vclock_welford = welford_vclock;
+    local.ocxo1_welford = welford_ocxo1;
+    local.ocxo2_welford = welford_ocxo2;
+    local.pps_witness_welford = welford_pps_witness;
+    local.ocxo1_dac_welford = welford_ocxo1_dac;
+    local.ocxo2_dac_welford = welford_ocxo2_dac;
+
+    clocks_alpha_dmb();
+    const uint32_t seq2 = g_instrument_stats_seq;
+    if (seq1 == seq2 && (seq1 & 1U) == 0U) {
+      *out = local;
+      return local.valid;
+    }
+  }
+
+  return false;
+}
+
 static void alpha_counterledger_reset_lane(alpha_pps_counterledger_lane_t& s) {
   s = alpha_pps_counterledger_lane_t{};
 }
@@ -2789,7 +3094,6 @@ static void alpha_counterledger_reset_lane(alpha_pps_counterledger_lane_t& s) {
 static void alpha_counterledger_reset_all(void) {
   alpha_counterledger_reset_lane(g_ocxo1_pps_counterledger);
   alpha_counterledger_reset_lane(g_ocxo2_pps_counterledger);
-  alpha_tau_reset_all();
 }
 
 static bool alpha_counterledger_epoch_ready(void) {
@@ -3229,12 +3533,6 @@ static bool alpha_counterledger_refresh_refined_from_phase(
         s.refined_fast_residual_ns);
   }
 
-  alpha_tau_note_refined_endpoint(clock,
-                                  s.refined_phase_pps_sequence,
-                                  s.refined_ns,
-                                  s.refined_interval_valid,
-                                  s.refined_interval_ns,
-                                  s.refined_fast_residual_ns);
   return true;
 }
 
@@ -4457,7 +4755,7 @@ static FLASHMEM void clocks_alpha_cold_diagnostics_init(void) {
   // state must never survive into startup SmartZero.
   alpha_smartzero_dmamem_cold_init();
 
-  alpha_tau_reset_all();
+  clocks_alpha_instrument_stats_reset();
   g_clocks_alpha_dmamem_initialized = true;
 }
 
@@ -5746,6 +6044,11 @@ static void alpha_timebase_row_try_complete(void) {
     alpha_timebase_row_clear();
     return;
   }
+
+  // Continuous instrument science advances before campaign publication gates.
+  // Beta may record or ignore this row, but campaign lifecycle cannot prevent
+  // Alpha from learning from it.
+  alpha_instrument_stats_note_completed_row(pps_sequence);
 
   // Clear before entering Beta.  Publication may execute command/lifecycle
   // paths, but it cannot observe or overwrite an open Alpha row.
@@ -8137,10 +8440,8 @@ static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
   ocxo1_measured_gnss_ticks_64        = 0;
   ocxo2_measured_gnss_ticks_64        = 0;
 
-  welford_reset(welford_dwt);
-  welford_reset(welford_vclock);
-  welford_reset(welford_ocxo1);
-  welford_reset(welford_ocxo2);
+  // Instrument statistics deliberately survive Alpha epoch replacement.
+  // SmartZero changes clockface intercepts; it is not a statistics reset.
 }
 
 bool clocks_alpha_begin_smartzero_epoch(const char* reason) {

@@ -577,11 +577,11 @@ bool clocks_alpha_ocxo_counterledger_ready(void);
 // ============================================================================
 // Alpha always-on OCXO TAU estimator
 // ============================================================================
-// Alpha estimates OCXO frequency continuously from lawful PhaseLedger refined
-// endpoints. This surface is reset by SmartZero/Alpha epoch replacement, not by
-// campaign START/STOP, so Beta can publish a mature frequency estimate at the
-// first public campaign row instead of rediscovering TAU from a launch-origin
-// quotient.
+// Alpha estimates OCXO frequency continuously from lawful completed-row Delta
+// intervals.  The estimator accumulates reference/clock interval totals across
+// campaign boundaries and is reset only by reboot or CLOCKS.STATS_RESET.  The
+// PhaseLedger remains the clockface suffix authority, but campaign-independent
+// frequency maturity no longer depends on its refined-interval side rail.
 #ifndef CLOCKS_ALPHA_TAU_SNAPSHOT_T_DEFINED
 #define CLOCKS_ALPHA_TAU_SNAPSHOT_T_DEFINED
 struct clocks_alpha_tau_snapshot_t {
@@ -717,7 +717,8 @@ struct clocks_alpha_lane_forensics_t {
   uint32_t last_event_counter32;
 
   // New preferred names.  The zero offset is the synthetic counter32 value
-  // captured at CLOCKS.ZERO/START and used as the lane's logical origin.
+  // captured at autonomous startup or CLOCKS.ZERO and used as the lane's
+  // logical origin.  Campaign START never replaces this offset.
   bool     zero_offset_valid;
   uint32_t zero_offset_counter32;
   uint32_t counter32_delta_since_zero_offset;
@@ -1764,7 +1765,10 @@ extern uint64_t recover_ocxo2_ns;
 // Samples are stored in the semantic unit of the signal being measured
 // (ppb for frequency clocks, ns for phase offsets, LSB for DAC codes).
 //
-// Global Welford instances, one per published prefix:
+// Alpha-owned always-on Welford instances, one per published prefix.  Their
+// lifetime is boot-to-reboot; START, STOP, FLASH_CUT, and warm RECOVER never
+// reset or restore them.  Beta may read them for TIMEBASE/servo compatibility,
+// but Alpha is the sole update/reset authority.
 //
 //   welford_dwt          — Teensy CPU XTAL offset, in ppb
 //   welford_vclock       — bridge interpolation residual, in ns
@@ -1798,7 +1802,73 @@ double welford_stddev(const welford_t& w);
 double welford_stderr(const welford_t& w);
 
 // ============================================================================
-// Campaign-scoped accumulators
+// Alpha always-on instrument statistics snapshot
+// ============================================================================
+//
+// This is the campaign-neutral statistical surface.  Alpha updates it whenever
+// a complete lawful PPS/VCLOCK + OCXO row exists, including while campaign_state
+// is STOPPED.  Campaign code may snapshot and serialize it, but must not rebase,
+// restore, or reset it as part of campaign lifecycle. Command reports and the
+// completed-row TIMEBASE path must use separate snapshot/Payload scratch. Report
+// construction keeps Priority 0 capture live and excludes only the Priority 16
+// TimePop/handoff tier until the response has been fully copied.
+
+struct clocks_instrument_frequency_snapshot_t {
+  bool     valid = false;
+  uint64_t sample_count = 0;
+  uint64_t interval_count = 0;
+  double   tau = 1.0;
+  double   ppb = 0.0;
+  double   stderr_ppb = 0.0;
+};
+
+struct clocks_instrument_stats_snapshot_t {
+  bool     valid = false;
+  uint32_t reset_count = 0;
+  uint32_t update_count = 0;
+  uint32_t last_pps_sequence = 0;
+
+  // All clock values below are captured atomically from the same completed
+  // Alpha row.  They never mix the next PPS with prior OCXO completions.
+  bool     completed_row_coherent = false;
+
+  uint64_t gnss_ns = 0;
+  uint64_t dwt_cycles = 0;
+  uint64_t ocxo1_ns = 0;
+  uint64_t ocxo2_ns = 0;
+
+  uint32_t dwt_cycles_per_second = 0;
+  // selected_reference is the PPS-selected VCLOCK edge interval used by Delta.
+  // vclock_observed is the independent VCLOCK subscriber interval.
+  uint32_t selected_reference_interval_cycles = 0;
+  uint32_t vclock_interval_cycles = 0;
+  uint32_t ocxo1_interval_cycles = 0;
+  uint32_t ocxo2_interval_cycles = 0;
+
+  uint32_t vclock_interval_reject_count = 0;
+  uint32_t ocxo1_interval_reject_count = 0;
+  uint32_t ocxo2_interval_reject_count = 0;
+
+  clocks_instrument_frequency_snapshot_t dwt_frequency{};
+  clocks_instrument_frequency_snapshot_t vclock_frequency{};
+  clocks_instrument_frequency_snapshot_t ocxo1_frequency{};
+  clocks_instrument_frequency_snapshot_t ocxo2_frequency{};
+
+  welford_t dwt_welford{};
+  welford_t vclock_welford{};
+  welford_t ocxo1_welford{};
+  welford_t ocxo2_welford{};
+  welford_t pps_witness_welford{};
+  welford_t ocxo1_dac_welford{};
+  welford_t ocxo2_dac_welford{};
+};
+
+bool clocks_alpha_instrument_stats_snapshot(
+    clocks_instrument_stats_snapshot_t* out);
+void clocks_alpha_instrument_stats_reset(void);
+
+// ============================================================================
+// Beta campaign-public shadow accumulators
 // ============================================================================
 
 extern uint64_t dwt_cycle_count_total;
@@ -1972,6 +2042,8 @@ const char* clocks_alpha_epoch_last_reason(void);
 // Campaign/accounting reset
 // ============================================================================
 
-// Beta-local campaign/statistical reset.  Alpha owns epoch installation; beta
-// invokes this after CLOCKS.ZERO/START successfully installs logical origins.
+// Beta-local campaign presentation reset.  Alpha owns epoch installation and
+// all boot-lifetime statistics.  START may rebase campaign-public offsets, while
+// explicit ZERO may replace the logical epoch; neither operation grants Beta
+// statistical ownership.
 void clocks_zero_all(void);
