@@ -21,7 +21,7 @@ Core contract:
     • Pi owns: GNSS_RAW, GF-8802 correlation, environment correlation,
       campaign lifecycle, final acceptance court, recovery orchestration,
       and PostgreSQL persistence.
-    • GNSS owns: receiver discipline state exposed through GET_GNSS_INFO.
+    • GNSS owns: receiver discipline state published through GNSS_ANNOUNCEMENT.
 
   START behavior:
 
@@ -43,7 +43,7 @@ Core contract:
 Responsibilities:
   * Receive unified TIMEBASE_FRAGMENT candidates from Teensy.
   * Adjudicate each candidate and log every rejected raw record.
-  * Fetch GF-8802 discipline snapshots from GNSS.
+  * Subscribe to predictive GF-8802 announcements and bind them to PPS-aligned rows.
   * Augment accepted rows with environment, GNSS_RAW, and system time.
   * Publish and persist TIMEBASE rows.
   * Denormalize the latest accepted TIMEBASE row into the active campaign.
@@ -62,6 +62,7 @@ Semantics:
 from __future__ import annotations
 
 import copy
+from collections import deque
 import json
 import logging
 import math
@@ -102,6 +103,8 @@ GNSS_POLL_INTERVAL = 5
 GNSS_WAIT_LOG_INTERVAL = 60
 GNSS_RAW_STATS_POLL_INTERVAL_S = 1.0
 GNSS_RAW_INFO_MAX_AGE_S = 2.5
+GNSS_ANNOUNCEMENT_TOPIC = "GNSS_ANNOUNCEMENT"
+GNSS_ANNOUNCEMENT_HISTORY_MAX = 8
 
 # Sync waits
 #
@@ -478,6 +481,12 @@ _diag: Dict[str, Any] = {
     "gnss_info_requests": 0,
     "gnss_info_hits": 0,
     "gnss_info_misses": 0,
+    "gnss_announcements_received": 0,
+    "gnss_announcements_valid": 0,
+    "gnss_announcements_malformed": 0,
+    "gnss_announcement_exact_matches": 0,
+    "gnss_announcement_fallback_matches": 0,
+    "last_gnss_announcement": {},
 
     # GNSS_RAW recovery projection / sanity rebuild
     "gnss_raw_recovery_restore_count": 0,
@@ -893,6 +902,11 @@ _gnss_raw_welford_min: float = 1e30
 _gnss_raw_welford_max: float = -1e30
 _gnss_raw_latest_info: Dict[str, Any] = {}
 _gnss_raw_latest_info_monotonic: Optional[float] = None
+
+# Retain a short predictive-UTC history so completed PPS seconds remain
+# selectable after the receiver has staged the following second.
+_gnss_announcement_history: deque[Dict[str, Any]] = deque(maxlen=GNSS_ANNOUNCEMENT_HISTORY_MAX)
+_gnss_announcement_event = threading.Event()
 
 def _gnss_raw_clock_reset() -> None:
     """Reset only the campaign/recovery synthetic clockface."""
@@ -1985,47 +1999,93 @@ def _wait_for_timebase_routes(
         time.sleep(poll_s)
 
 
+def _parse_utc(value: Any) -> Optional[datetime]:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return datetime.fromisoformat(value.strip().replace("Z", "+00:00")).astimezone(timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def _announcement_receiver_info(announcement: Dict[str, Any]) -> Dict[str, Any]:
+    receiver = announcement.get("receiver")
+    info = dict(receiver) if isinstance(receiver, dict) else {}
+    next_utc = str(announcement.get("next_utc") or "")
+    info.update({
+        "announcement_schema": announcement.get("schema"),
+        "semantics": announcement.get("semantics"),
+        "next_utc": next_utc or None,
+        "gnss_time_utc": next_utc or None,
+        "source_sentence": announcement.get("source_sentence"),
+        "announcement_sequence": announcement.get("announcement_sequence"),
+        "received_at_utc": announcement.get("received_at_utc"),
+        "received_wall_ns": announcement.get("received_wall_ns"),
+        "received_monotonic_ns": announcement.get("received_monotonic_ns"),
+        "time_valid": announcement.get("time_valid"),
+        "time_status": announcement.get("time_status"),
+        "pps_sync": announcement.get("pps_sync"),
+        "leap_second": announcement.get("leap_second"),
+        "clock_drift_ppb": announcement.get("clock_drift_ppb"),
+        "temperature_c": announcement.get("temperature_c"),
+        "raw_tps1": announcement.get("raw_tps1"),
+    })
+    return info
+
+
+def _gnss_announcement_for_utc(target_utc: datetime) -> Optional[Dict[str, Any]]:
+    """Select the announcement naming target UTC, never the next staged second."""
+    target = target_utc.astimezone(timezone.utc).replace(microsecond=0)
+    with _gnss_raw_stats_lock:
+        history = [dict(item) for item in _gnss_announcement_history]
+    for item in history:
+        named = _parse_utc(item.get("next_utc"))
+        if named is not None and named.replace(microsecond=0) == target:
+            _diag["gnss_announcement_exact_matches"] += 1
+            return item
+    return None
+
+
+def _gnss_info_for_utc(target_utc: datetime) -> Optional[Dict[str, Any]]:
+    item = _gnss_announcement_for_utc(target_utc)
+    return _announcement_receiver_info(item) if item else None
+
+
 def _wait_for_gnss_time() -> str:
-    """Patiently wait for GNSS time to be available. Instrumented."""
+    """Wait for a publication naming the current PPS/UTC second."""
     _diag["gnss_waits"] += 1
     t0 = time.monotonic()
     last_log = t0
     start_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
     while True:
-        try:
-            resp = send_command(machine="PI", subsystem="GNSS", command="GET_TIME")
-            if resp.get("success"):
-                gnss_time = resp["payload"]["gnss_time"]
-                waited = time.monotonic() - t0
-
-                _diag["gnss_wait_success"] += 1
-                _diag["gnss_wait_seconds_total"] += float(waited)
-                _diag["gnss_wait_seconds_last"] = float(waited)
-                _diag["last_gnss_wait"] = {
-                    "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                    "start_utc": start_utc,
-                    "waited_s": round(float(waited), 3),
-                    "poll_interval_s": int(GNSS_POLL_INTERVAL),
-                }
-                return gnss_time
-        except Exception:
-            pass
-
+        now_utc = datetime.now(timezone.utc)
+        item = _gnss_announcement_for_utc(now_utc)
+        if item and item.get("next_utc"):
+            waited = time.monotonic() - t0
+            _diag["gnss_wait_success"] += 1
+            _diag["gnss_wait_seconds_total"] += float(waited)
+            _diag["gnss_wait_seconds_last"] = float(waited)
+            _diag["last_gnss_wait"] = {
+                "ts_utc": now_utc.isoformat().replace("+00:00", "Z"),
+                "start_utc": start_utc,
+                "waited_s": round(float(waited), 3),
+                "source": GNSS_ANNOUNCEMENT_TOPIC,
+            }
+            return str(item["next_utc"])
         now = time.monotonic()
         if now - last_log >= GNSS_WAIT_LOG_INTERVAL:
-            logging.info("⏳ [clocks] waiting for GNSS time... (%.0fs elapsed)", now - t0)
+            logging.info("⏳ [clocks] waiting for GNSS_ANNOUNCEMENT... (%.0fs elapsed)", now - t0)
             last_log = now
-
-        time.sleep(GNSS_POLL_INTERVAL)
+        _gnss_announcement_event.wait(timeout=0.5)
+        _gnss_announcement_event.clear()
 
 
 def _get_gnss_time() -> str:
-    """Get GNSS time (non-blocking, raises on failure)."""
-    resp = send_command(machine="PI", subsystem="GNSS", command="GET_TIME")
-    if not resp.get("success"):
-        raise RuntimeError(f"GNSS GET_TIME failed: {resp.get('message', '?')}")
-    return resp["payload"]["gnss_time"]
+    """Return the announcement naming the current UTC/PPS second."""
+    item = _gnss_announcement_for_utc(datetime.now(timezone.utc))
+    if not item or not item.get("next_utc"):
+        raise RuntimeError("no GNSS_ANNOUNCEMENT names the current UTC second")
+    return str(item["next_utc"])
 
 
 def _set_gnss_mode_to(location: str) -> Dict[str, Any]:
@@ -2127,28 +2187,14 @@ def _fetch_environment() -> Optional[Dict[str, Any]]:
 
 
 def _fetch_gnss_info() -> Optional[Dict[str, Any]]:
-    """
-    Fetch GF-8802 discipline snapshot from GNSS GET_GNSS_INFO.
-
-    Returns the flat payload dict or None if unavailable.
-    Best-effort — a miss here should never block TIMEBASE production.
-    """
+    """Return the published GF-8802 snapshot bound to the current PPS second."""
     _diag["gnss_info_requests"] += 1
-    try:
-        resp = send_command(
-            machine="PI",
-            subsystem="GNSS",
-            command="GET_GNSS_INFO",
-        )
-        if resp.get("success"):
-            _diag["gnss_info_hits"] += 1
-            return resp.get("payload", {}) if isinstance(resp, dict) else {}
-        _diag["gnss_info_misses"] += 1
-        return None
-    except Exception:
-        _diag["gnss_info_misses"] += 1
-        logging.debug("⚠️ [clocks] _fetch_gnss_info failed (ignored)")
-        return None
+    info = _gnss_info_for_utc(datetime.now(timezone.utc))
+    if info is not None:
+        _diag["gnss_info_hits"] += 1
+        return info
+    _diag["gnss_info_misses"] += 1
+    return None
 
 
 def _gnss_raw_drift_from_info(info: Optional[Dict[str, Any]]) -> Optional[float]:
@@ -4887,6 +4933,69 @@ def _clear_start_wait_state() -> None:
 # ---------------------------------------------------------------------
 
 
+def on_gnss_announcement(payload: Payload) -> None:
+    """Admit one predictive TPS1 publication and advance GNSS_RAW exactly once."""
+    global _gnss_raw_welford_n, _gnss_raw_welford_mean, _gnss_raw_welford_m2
+    global _gnss_raw_welford_min, _gnss_raw_welford_max
+    global _gnss_raw_latest_info, _gnss_raw_latest_info_monotonic
+    global _gnss_raw_instrument_ns, _gnss_raw_instrument_n, _gnss_raw_instrument_valid
+
+    _diag["gnss_announcements_received"] += 1
+    item = dict(payload)
+    next_utc = _parse_utc(item.get("next_utc"))
+    if (
+        item.get("schema") != "GNSS_ANNOUNCEMENT_V1"
+        or item.get("semantics") != "NEXT_PPS_UTC"
+        or next_utc is None
+    ):
+        _diag["gnss_announcements_malformed"] += 1
+        logging.warning("[clocks] ignoring malformed GNSS_ANNOUNCEMENT: %r", item)
+        return
+
+    now = time.monotonic()
+    info = _announcement_receiver_info(item)
+    sample = _gnss_raw_drift_from_info(info)
+    with _gnss_raw_stats_lock:
+        _gnss_announcement_history.append(dict(item))
+        _gnss_raw_latest_info = dict(info)
+        _gnss_raw_latest_info_monotonic = now
+        _gnss_raw_instrument_ns += NS_PER_SECOND + (sample if sample is not None else 0.0)
+        _gnss_raw_instrument_n += 1
+        _gnss_raw_instrument_valid = True
+        if sample is not None:
+            _gnss_raw_welford_n += 1
+            d1 = sample - _gnss_raw_welford_mean
+            _gnss_raw_welford_mean += d1 / _gnss_raw_welford_n
+            d2 = sample - _gnss_raw_welford_mean
+            _gnss_raw_welford_m2 += d1 * d2
+            _gnss_raw_welford_min = min(_gnss_raw_welford_min, sample)
+            _gnss_raw_welford_max = max(_gnss_raw_welford_max, sample)
+            n = int(_gnss_raw_welford_n)
+        else:
+            n = int(_gnss_raw_welford_n)
+
+    _diag["gnss_announcements_valid"] += 1
+    _diag["gnss_raw_stats_poll_count"] += 1
+    if sample is None:
+        _diag["gnss_raw_stats_missing_count"] += 1
+    else:
+        _diag["gnss_raw_stats_sample_count"] += 1
+        _diag["last_gnss_raw_stats_sample"] = {
+            "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "drift_ppb": round(float(sample), 6),
+            "n": n,
+            "source": GNSS_ANNOUNCEMENT_TOPIC,
+        }
+    _diag["last_gnss_announcement"] = {
+        "next_utc": item.get("next_utc"),
+        "announcement_sequence": item.get("announcement_sequence"),
+        "received_at_utc": item.get("received_at_utc"),
+        "clock_drift_ppb": sample,
+    }
+    _gnss_announcement_event.set()
+    _publish_clocks_monitor()
+
+
 def on_watchdog_anomaly(payload: Payload) -> None:
     """
     PUBSUB handler for WATCHDOG_ANOMALY from Teensy CLOCKS.
@@ -4974,8 +5083,12 @@ def on_recovery_stalled(payload: Payload) -> None:
 
 
 def _enqueue_timebase_piece(topic: str, payload: Dict[str, Any]) -> None:
-    """Enqueue one Teensy TIMEBASE candidate for processor-thread adjudication."""
-    _fragment_queue.put({"topic": topic, "payload": dict(payload)})
+    """Enqueue one Teensy TIMEBASE candidate with its Pi receive timestamp."""
+    _fragment_queue.put({
+        "topic": topic,
+        "payload": dict(payload),
+        "received_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    })
 
     depth = _fragment_queue.qsize()
     _diag["queue_depth_current"] = depth
@@ -5055,6 +5168,7 @@ def _process_loop() -> None:
         _diag["queue_depth_current"] = _fragment_queue.qsize()
 
         topic = str(piece.get("topic") or "")
+        candidate_received_utc = _parse_utc(piece.get("received_at_utc"))
         payload = piece.get("payload")
         if not isinstance(payload, dict):
             logging.error("💥 [clocks] processor received malformed TIMEBASE candidate: %s", piece)
@@ -5260,7 +5374,7 @@ def _process_loop() -> None:
         # --- GNSS discipline snapshot (best-effort, never blocks TIMEBASE) ---
         # The always-on sampler owns polling and Welford admission. Reuse its
         # fresh cached report so campaign publication cannot double-count N.
-        gnss_info = _gnss_raw_latest_info_snapshot()
+        gnss_info = _gnss_info_for_utc(candidate_received_utc or system_time_utc)
 
         # --- GNSS_RAW synthetic clock ---
         gnss_raw_drift_ppb = _gnss_raw_drift_from_info(gnss_info)
@@ -5290,7 +5404,9 @@ def _process_loop() -> None:
             "location": campaign_payload.get("location"),
 
             "system_time_utc": system_time_str,
-            "gnss_time_utc": system_time_z(),
+            "gnss_time_utc": (
+                gnss_info.get("gnss_time_utc") if isinstance(gnss_info, dict) else None
+            ),
 
             "teensy_pps_vclock_count": int(pps_vclock_count),
             "teensy_pps_count": int(pps_vclock_count),   # legacy alias
@@ -6789,7 +6905,7 @@ def _recover_campaign() -> None:
     # ------------------------------------------------------------------
     # Step 3: Compute elapsed GNSS seconds
     # ------------------------------------------------------------------
-    current_gnss_time_str = _get_gnss_time()
+    current_gnss_time_str = _wait_for_gnss_time()
     logging.info("📐 [recovery] current GNSS time: %s", current_gnss_time_str)
 
     last_gnss_utc = datetime.fromisoformat(last_gnss_time_str.replace("Z", "+00:00"))
@@ -7500,12 +7616,10 @@ def _check_preflight(context: str = "campaign") -> tuple[bool, list[str]]:
     # 1. GNSS time valid
     # -----------------------------------------------------------------
     try:
-        gnss_resp = send_command(machine="PI", subsystem="GNSS", command="REPORT")
-        if not gnss_resp.get("success"):
-            reasons.append("GNSS REPORT unavailable")
+        gnss = _gnss_info_for_utc(datetime.now(timezone.utc))
+        if not gnss:
+            reasons.append("GNSS_ANNOUNCEMENT unavailable for current UTC second")
         else:
-            gnss = gnss_resp.get("payload", {})
-
             if not gnss.get("time_valid"):
                 reasons.append("GNSS time not valid (no satellite time/date)")
 
@@ -7531,7 +7645,7 @@ def _check_preflight(context: str = "campaign") -> tuple[bool, list[str]]:
                     )
 
     except Exception as e:
-        reasons.append(f"GNSS REPORT failed: {e}")
+        reasons.append(f"GNSS_ANNOUNCEMENT preflight failed: {e}")
 
     # -----------------------------------------------------------------
     # 4. Chrony PPS selected
@@ -8495,7 +8609,7 @@ def run() -> None:
         "START while active performs seamless flash-cut to new campaign. "
         "Commands: START, STOP, RESUME, RECOVER_ABORT, REPORT, REPORT_CLOCKS, REPORT_STATS, STATS_RESET, CLEAR, DELETE, TRUNCATE, SET_DAC, DITHER, GATE_MODE, "
         "SET_BASELINE, BASELINE_INFO, LIST_CAMPAIGNS, CLOCKS_INFO. "
-        "Subscriptions: MONITOR, TIMEBASE_FRAGMENT, WATCHDOG_ANOMALY, CLOCKS_RECOVERY_STALLED. "
+        "Subscriptions: MONITOR, GNSS_ANNOUNCEMENT, TIMEBASE_FRAGMENT, WATCHDOG_ANOMALY, CLOCKS_RECOVERY_STALLED. "
         "Publications: TIMEBASE, CLOCKS_MONITOR."
     )
 
@@ -8509,6 +8623,7 @@ def run() -> None:
         commands=COMMANDS,
         subscriptions={
             MONITOR_TOPIC: on_monitor,
+            GNSS_ANNOUNCEMENT_TOPIC: on_gnss_announcement,
             "TIMEBASE_FRAGMENT": on_timebase_fragment,
             "WATCHDOG_ANOMALY": on_watchdog_anomaly,
             CLOCKS_RECOVERY_STALLED_TOPIC: on_recovery_stalled,
@@ -8603,12 +8718,7 @@ def run() -> None:
     except Exception:
         logging.exception("⚠️ [clocks] boot control-state push failed (Teensy keeps defaults)")
 
-    # Start Pi-owned GNSS_RAW statistics independently of campaigns.
-    threading.Thread(
-        target=_gnss_raw_stats_loop,
-        daemon=True,
-        name="clocks-gnss-raw-stats",
-    ).start()
+    # GNSS_RAW statistics now advance directly from GNSS_ANNOUNCEMENT.
 
     # Start processor thread
     threading.Thread(

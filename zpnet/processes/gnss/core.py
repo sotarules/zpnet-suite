@@ -8,6 +8,7 @@ Responsibilities:
   • Expose cached GNSS time via GET_TIME (ISO8601 Zulu correlation key)
   • Expose discipline snapshot via GET_GNSS_INFO (for TIMEBASE records)
   • Expose raw NMEA sentences via a live stream socket
+  • Publish each fresh TPS1 next-PPS UTC announcement for subscribers
   • Profile and persist antenna locations for Time Only mode
   • Switch receiver between NAV and Time Only (TO) modes
 
@@ -63,7 +64,7 @@ from typing import Dict, Optional, Set, TextIO
 
 import serial
 
-from zpnet.processes.processes import server_setup
+from zpnet.processes.processes import publish, server_setup
 from zpnet.shared.db import open_db
 from zpnet.shared.logger import setup_logging
 
@@ -72,6 +73,7 @@ GNSS_BAUD   = int(os.environ.get("ZPNET_GNSS_BAUD", "38400"))
 
 STREAM_SOCKET_PATH = "/tmp/zpnet-gnss-stream.sock"
 STARTUP_TEENSY_QUIET_DELAY_S = 10.0
+GNSS_ANNOUNCEMENT_TOPIC = "GNSS_ANNOUNCEMENT"
 
 
 # ------------------------------------------------------------------
@@ -173,6 +175,12 @@ class GnssState:
     hour: int = 0
     minute: int = 0
     second: int = 0
+
+    # Predictive UTC announced by TPS1 for the upcoming PPS edge.
+    next_utc_iso: str = ""
+    next_utc_received_wall_ns: int = 0
+    next_utc_received_monotonic_ns: int = 0
+    next_utc_announcement_sequence: int = 0
     year: int = 0
     month: int = 0
     day: int = 0
@@ -523,6 +531,19 @@ def parse_crw(line: str) -> None:
     """
     parts = line.split(",")
     try:
+        # TPS1 carries the receiver's prediction for the upcoming PPS.
+        # Keep this in dedicated custody rather than allowing later RMC/GNS
+        # sentence updates to overwrite the value before subscribers bind it.
+        datetime_s = parts[2]
+        if len(datetime_s) >= 14 and datetime_s[:14].isdigit():
+            GNSS.next_utc_iso = (
+                f"{datetime_s[0:4]}-{datetime_s[4:6]}-{datetime_s[6:8]}"
+                f"T{datetime_s[8:10]}:{datetime_s[10:12]}:{datetime_s[12:14]}Z"
+            )
+            GNSS.next_utc_received_wall_ns = time.time_ns()
+            GNSS.next_utc_received_monotonic_ns = time.monotonic_ns()
+            GNSS.next_utc_announcement_sequence += 1
+
         GNSS.tps1_time_status      = int(parts[3])
         GNSS.tps1_time_status_name = TIME_STATUS_NAMES.get(GNSS.tps1_time_status, f"UNKNOWN({GNSS.tps1_time_status})")
         GNSS.tps1_present_ls       = int(parts[5])
@@ -627,6 +648,7 @@ def ingest_line(line: str) -> None:
     if line.startswith("$PERDCRW,"):
         GNSS.last_crw = line
         parse_crw(line)
+        publish_gnss_announcement()
         return
 
     if line.startswith("$PERDCRX,"):
@@ -865,6 +887,50 @@ def get_gnss_payload(_: Optional[dict]) -> Dict:
         }.items() if v
     }
     return p
+
+
+def publish_gnss_announcement() -> None:
+    """Publish the fresh TPS1 prediction for the upcoming PPS edge."""
+    if not GNSS.next_utc_iso:
+        return
+
+    receiver = get_gnss_payload(None)
+    receiver.pop("raw", None)
+
+    wall_ns = GNSS.next_utc_received_wall_ns
+    received_at_utc = None
+    if wall_ns > 0:
+        from datetime import datetime, timezone
+        received_at_utc = datetime.fromtimestamp(wall_ns / 1_000_000_000, timezone.utc) \
+            .isoformat(timespec="microseconds") \
+            .replace("+00:00", "Z")
+
+    payload: Dict[str, object] = {
+        "schema": "GNSS_ANNOUNCEMENT_V1",
+        "semantics": "NEXT_PPS_UTC",
+        "next_utc": GNSS.next_utc_iso,
+        "source_sentence": "TPS1",
+        "announcement_sequence": GNSS.next_utc_announcement_sequence,
+        "received_at_utc": received_at_utc,
+        "received_wall_ns": wall_ns,
+        "received_monotonic_ns": GNSS.next_utc_received_monotonic_ns,
+        "time_valid": GNSS.tps1_time_status >= 0,
+        "time_status": GNSS.tps1_time_status_name or None,
+        "pps_sync": GNSS.tps1_pps_status_name or None,
+        "leap_second": GNSS.tps1_present_ls or None,
+        "clock_drift_ppb": (
+            None if math.isnan(GNSS.tps1_clock_drift_ppb)
+            else GNSS.tps1_clock_drift_ppb
+        ),
+        "temperature_c": (
+            None if math.isnan(GNSS.tps1_temperature_c)
+            else GNSS.tps1_temperature_c
+        ),
+        "receiver": receiver,
+        "raw_tps1": GNSS.last_crw,
+    }
+
+    publish(GNSS_ANNOUNCEMENT_TOPIC, payload)
 
 # ------------------------------------------------------------------
 # PROFILE_LOCATION — quality gate check
