@@ -5103,7 +5103,14 @@ class TeensyStartRejected(RuntimeError):
         super().__init__(f"Teensy CLOCKS.START rejected: status={status!r} error={error!r}")
 
 
+# START is asynchronous.  These statuses mean that firmware accepted the
+# lifecycle request; they do not claim that the first public TIMEBASE row has
+# already been emitted.  Keep the legacy SmartZero/Flash Cut vocabulary for
+# older firmware while accepting the current always-on recording-boundary
+# contract returned by CLOCKS.START.
 _TEENSY_START_ACCEPTED_STATUSES = {
+    "start_requested",
+    "start_requested_dac_fault_servos_off",
     "start_pending_smartzero",
     "start_pending_smartzero_dac_fault",
     "flash_cut_requested",
