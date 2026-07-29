@@ -179,44 +179,6 @@ def _derive_gnss_lock_quality(g: dict) -> str:
     return "WEAK"
 
 
-def _gnss_from_direct_report() -> dict:
-    try:
-        p = _get_pi_gnss_report()
-    except Exception:
-        return {}
-
-    if not isinstance(p, dict):
-        return {}
-
-    discipline = p.get("discipline", {}) if isinstance(p.get("discipline"), dict) else {}
-    clock = p.get("clock", {}) if isinstance(p.get("clock"), dict) else {}
-    integrity = p.get("integrity", {}) if isinstance(p.get("integrity"), dict) else {}
-    survey = p.get("survey_mode", {}) if isinstance(p.get("survey_mode"), dict) else {}
-    pps = p.get("pps", {}) if isinstance(p.get("pps"), dict) else {}
-
-    return {
-        "lock_quality": p.get("lock_quality"),
-        "pos_mode": integrity.get("pos_mode") or survey.get("receiver_mode"),
-        "freq_mode_name": discipline.get("freq_mode_name"),
-        "satellites": p.get("satellites"),
-        "hdop": p.get("hdop"),
-        "traim": integrity.get("traim"),
-        "latitude_deg": p.get("latitude_deg"),
-        "longitude_deg": p.get("longitude_deg"),
-        "altitude_m": p.get("altitude_m"),
-        "ellipsoid_height_m": p.get("ellipsoid_height_m"),
-        "geoid_sep_m": p.get("geoid_sep_m"),
-        "pps_valid": p.get("pps_valid"),
-        "pps_active": pps.get("active"),
-        "estimated_accuracy_ns": pps.get("estimated_accuracy_ns"),
-        "pps_timing_error_ns": discipline.get("pps_timing_error_ns"),
-        "time_status": clock.get("time_status_name"),
-        "pps_sync": clock.get("pps_sync"),
-        "clock_drift_ppb": clock.get("drift_ppb"),
-        "temperature_c": clock.get("temperature_c"),
-    }
-
-
 def _gnss_from_timebase(r: dict) -> dict:
     return {
         "lock_quality": _field(r, "gnss.lock_quality"),
