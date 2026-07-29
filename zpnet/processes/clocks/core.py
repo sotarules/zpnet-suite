@@ -100,6 +100,8 @@ DWT_EXPECTED_PER_PPS = 1_008_000_000
 
 GNSS_POLL_INTERVAL = 5
 GNSS_WAIT_LOG_INTERVAL = 60
+GNSS_RAW_STATS_POLL_INTERVAL_S = 1.0
+GNSS_RAW_INFO_MAX_AGE_S = 2.5
 
 # Sync waits
 #
@@ -479,6 +481,20 @@ _diag: Dict[str, Any] = {
     "gnss_raw_recovery_restore_count": 0,
     "gnss_raw_recovery_rebuild_count": 0,
     "last_gnss_raw_recovery": {},
+    "gnss_raw_stats_loop_started": False,
+    "gnss_raw_stats_poll_count": 0,
+    "gnss_raw_stats_sample_count": 0,
+    "gnss_raw_stats_missing_count": 0,
+    "last_gnss_raw_stats_sample": {},
+    "stats_reset_requests": 0,
+    "stats_reset_success": 0,
+    "stats_reset_teensy_failures": 0,
+    "last_stats_reset": {},
+    "report_clocks_requests": 0,
+    "report_stats_requests": 0,
+    "report_transitive_failures": 0,
+    "last_report_clocks": {},
+    "last_report_stats": {},
 
     # GNSS stream health (Pi-side canary only)
     "gnss_residual_nonzero": 0,
@@ -848,26 +864,43 @@ _gnss_raw_ns: float = 0.0
 _gnss_raw_n: int = 0
 _gnss_raw_valid: bool = False
 
-# Welford accumulator for GNSS_RAW drift_ppb residuals
+# GNSS_RAW statistics are Pi-owned and always-on. Campaign lifecycle may
+# rebase the synthetic clockface, but it never resets this population.
+_gnss_raw_stats_lock = threading.Lock()
 _gnss_raw_welford_n: int = 0
 _gnss_raw_welford_mean: float = 0.0
 _gnss_raw_welford_m2: float = 0.0
 _gnss_raw_welford_min: float = 1e30
 _gnss_raw_welford_max: float = -1e30
+_gnss_raw_latest_info: Dict[str, Any] = {}
+_gnss_raw_latest_info_monotonic: Optional[float] = None
 
-def _gnss_raw_reset() -> None:
-    """Reset GNSS_RAW accumulator (on campaign start/stop/recover)."""
+def _gnss_raw_clock_reset() -> None:
+    """Reset only the campaign/recovery synthetic clockface."""
     global _gnss_raw_ns, _gnss_raw_n, _gnss_raw_valid
-    global _gnss_raw_welford_n, _gnss_raw_welford_mean, _gnss_raw_welford_m2
-    global _gnss_raw_welford_min, _gnss_raw_welford_max
     _gnss_raw_ns = 0.0
     _gnss_raw_n = 0
     _gnss_raw_valid = False
-    _gnss_raw_welford_n = 0
-    _gnss_raw_welford_mean = 0.0
-    _gnss_raw_welford_m2 = 0.0
-    _gnss_raw_welford_min = 1e30
-    _gnss_raw_welford_max = -1e30
+
+
+def _gnss_raw_welford_reset() -> Dict[str, Any]:
+    """Reset only the Pi-owned always-on GNSS_RAW statistical population."""
+    global _gnss_raw_welford_n, _gnss_raw_welford_mean, _gnss_raw_welford_m2
+    global _gnss_raw_welford_min, _gnss_raw_welford_max
+    with _gnss_raw_stats_lock:
+        previous = {
+            "n": int(_gnss_raw_welford_n),
+            "mean": float(_gnss_raw_welford_mean),
+            "m2": float(_gnss_raw_welford_m2),
+            "min": float(_gnss_raw_welford_min) if _gnss_raw_welford_n else 0.0,
+            "max": float(_gnss_raw_welford_max) if _gnss_raw_welford_n else 0.0,
+        }
+        _gnss_raw_welford_n = 0
+        _gnss_raw_welford_mean = 0.0
+        _gnss_raw_welford_m2 = 0.0
+        _gnss_raw_welford_min = 1e30
+        _gnss_raw_welford_max = -1e30
+    return previous
 
 # ---------------------------------------------------------------------
 # Local state (process lifetime)
@@ -2099,6 +2132,91 @@ def _fetch_gnss_info() -> Optional[Dict[str, Any]]:
         return None
 
 
+def _gnss_raw_drift_from_info(info: Optional[Dict[str, Any]]) -> Optional[float]:
+    """Return one finite receiver drift sample, or None when unavailable."""
+    if not isinstance(info, dict):
+        return None
+    value = info.get("clock_drift_ppb")
+    if value is None:
+        return None
+    try:
+        sample = float(value)
+    except (TypeError, ValueError):
+        return None
+    return sample if math.isfinite(sample) else None
+
+
+def _gnss_raw_welford_snapshot() -> Dict[str, Any]:
+    """Return one coherent snapshot of the always-on Pi Welford."""
+    with _gnss_raw_stats_lock:
+        n = int(_gnss_raw_welford_n)
+        mean = float(_gnss_raw_welford_mean)
+        m2 = float(_gnss_raw_welford_m2)
+        min_val = float(_gnss_raw_welford_min)
+        max_val = float(_gnss_raw_welford_max)
+    stddev = math.sqrt(m2 / (n - 1)) if n >= 2 else 0.0
+    stderr = stddev / math.sqrt(n) if n >= 2 else 0.0
+    return {
+        "n": n,
+        "mean": mean,
+        "stddev": stddev,
+        "stderr": stderr,
+        "min": min_val if n else 0.0,
+        "max": max_val if n else 0.0,
+    }
+
+
+def _gnss_raw_latest_info_snapshot() -> Optional[Dict[str, Any]]:
+    """Return a fresh cached GNSS discipline sample for TIMEBASE decoration."""
+    with _gnss_raw_stats_lock:
+        received = _gnss_raw_latest_info_monotonic
+        info = dict(_gnss_raw_latest_info)
+    if received is None or not info:
+        return None
+    if time.monotonic() - received > GNSS_RAW_INFO_MAX_AGE_S:
+        return None
+    return info
+
+
+def _gnss_raw_stats_loop() -> None:
+    """Poll GF-8802 drift continuously, independent of campaign recording."""
+    global _gnss_raw_welford_n, _gnss_raw_welford_mean, _gnss_raw_welford_m2
+    global _gnss_raw_welford_min, _gnss_raw_welford_max
+    global _gnss_raw_latest_info, _gnss_raw_latest_info_monotonic
+    _diag["gnss_raw_stats_loop_started"] = True
+    logging.info("📊 [clocks] GNSS_RAW always-on statistics loop started")
+    next_poll = time.monotonic()
+    while True:
+        next_poll += GNSS_RAW_STATS_POLL_INTERVAL_S
+        _diag["gnss_raw_stats_poll_count"] += 1
+        info = _fetch_gnss_info()
+        sample = _gnss_raw_drift_from_info(info)
+        now = time.monotonic()
+        if isinstance(info, dict) and info:
+            with _gnss_raw_stats_lock:
+                _gnss_raw_latest_info = dict(info)
+                _gnss_raw_latest_info_monotonic = now
+        if sample is None:
+            _diag["gnss_raw_stats_missing_count"] += 1
+        else:
+            with _gnss_raw_stats_lock:
+                _gnss_raw_welford_n += 1
+                d1 = sample - _gnss_raw_welford_mean
+                _gnss_raw_welford_mean += d1 / _gnss_raw_welford_n
+                d2 = sample - _gnss_raw_welford_mean
+                _gnss_raw_welford_m2 += d1 * d2
+                _gnss_raw_welford_min = min(_gnss_raw_welford_min, sample)
+                _gnss_raw_welford_max = max(_gnss_raw_welford_max, sample)
+                n = int(_gnss_raw_welford_n)
+            _diag["gnss_raw_stats_sample_count"] += 1
+            _diag["last_gnss_raw_stats_sample"] = {
+                "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "drift_ppb": round(float(sample), 6),
+                "n": n,
+            }
+        time.sleep(max(0.0, next_poll - time.monotonic()))
+
+
 
 # ---------------------------------------------------------------------
 # Draconian sync primitives
@@ -2469,16 +2587,22 @@ def _restore_gnss_raw_from_last_timebase(
     min_val = _first_float(extra.get("gnss_raw_welford_min"), last_tb.get("gnss_raw_welford_min"))
     max_val = _first_float(extra.get("gnss_raw_welford_max"), last_tb.get("gnss_raw_welford_max"))
 
-    welford_restored = n is not None
+    welford_restored = False
     if n is not None:
         if stddev is None:
             stddev = (stderr_value * math.sqrt(float(n))) if stderr_value is not None and n > 0 else 0.0
 
-        _gnss_raw_welford_n = int(n)
-        _gnss_raw_welford_mean = float(mean)
-        _gnss_raw_welford_m2 = (float(stddev) * float(stddev) * float(n - 1)) if n >= 2 else 0.0
-        _gnss_raw_welford_min = float(min_val) if min_val is not None else float(mean)
-        _gnss_raw_welford_max = float(max_val) if max_val is not None else float(mean)
+        # On process restart the live population is empty, so restore the
+        # durable generation. During an in-process recovery the always-on
+        # sampler may already be newer; never roll N or moments backward.
+        with _gnss_raw_stats_lock:
+            if int(n) > int(_gnss_raw_welford_n):
+                _gnss_raw_welford_n = int(n)
+                _gnss_raw_welford_mean = float(mean)
+                _gnss_raw_welford_m2 = (float(stddev) * float(stddev) * float(n - 1)) if n >= 2 else 0.0
+                _gnss_raw_welford_min = float(min_val) if min_val is not None else float(mean)
+                _gnss_raw_welford_max = float(max_val) if max_val is not None else float(mean)
+                welford_restored = True
 
     restored_ppb = _compute_ppb(int(round(_gnss_raw_ns)), int(raw_ref_ns)) if raw_ref_ns > 0 else 0.0
     restore_diag = {
@@ -2491,8 +2615,8 @@ def _restore_gnss_raw_from_last_timebase(
         "restored_n": int(_gnss_raw_n),
         "restored_ppb": round(float(restored_ppb), 6),
         "welford_restored": bool(welford_restored),
-        "welford_n": int(_gnss_raw_welford_n),
-        "welford_mean": round(float(_gnss_raw_welford_mean), 6),
+        "welford_n": int(_gnss_raw_welford_snapshot()["n"]),
+        "welford_mean": round(float(_gnss_raw_welford_snapshot()["mean"]), 6),
         "projection": projection_details or {},
     }
     _diag["gnss_raw_recovery_restore_count"] = _diag.get("gnss_raw_recovery_restore_count", 0) + 1
@@ -4710,8 +4834,6 @@ def _process_loop() -> None:
     Runs forever.
     """
     global _campaign_active, _accepted_pps_vclock_count, _gnss_raw_ns, _gnss_raw_n, _gnss_raw_valid
-    global _gnss_raw_welford_n, _gnss_raw_welford_mean, _gnss_raw_welford_m2
-    global _gnss_raw_welford_min, _gnss_raw_welford_max
 
     logging.info("🚀 [clocks] processor thread started")
 
@@ -4928,42 +5050,21 @@ def _process_loop() -> None:
         env_snapshot = _fetch_environment()
 
         # --- GNSS discipline snapshot (best-effort, never blocks TIMEBASE) ---
-        gnss_info = _fetch_gnss_info()
+        # The always-on sampler owns polling and Welford admission. Reuse its
+        # fresh cached report so campaign publication cannot double-count N.
+        gnss_info = _gnss_raw_latest_info_snapshot()
 
         # --- GNSS_RAW synthetic clock ---
-        gnss_raw_drift_ppb = None
-        if gnss_info and isinstance(gnss_info, dict):
-            v = gnss_info.get("clock_drift_ppb")
-            if v is not None:
-                try:
-                    v_f = float(v)
-                    if not math.isnan(v_f):
-                        gnss_raw_drift_ppb = v_f
-                except (ValueError, TypeError):
-                    pass
+        gnss_raw_drift_ppb = _gnss_raw_drift_from_info(gnss_info)
 
-        # Always accumulate one second; add drift correction when available
+        # The clockface remains campaign/recovery-relative. Its statistical
+        # population is independent and continues in the sampler above.
         _gnss_raw_ns += NS_PER_SECOND + (gnss_raw_drift_ppb if gnss_raw_drift_ppb is not None else 0.0)
         _gnss_raw_n += 1
         _gnss_raw_valid = True
         gnss_raw_ns_int = int(round(_gnss_raw_ns))
         gnss_raw_ref_ns = _gnss_raw_n * NS_PER_SECOND
-
-        # Welford update on drift_ppb (treating it as the per-second residual)
-        gnss_raw_pred_residual = gnss_raw_drift_ppb if gnss_raw_drift_ppb is not None else 0.0
-        _gnss_raw_welford_n += 1
-        d1 = gnss_raw_pred_residual - _gnss_raw_welford_mean
-        _gnss_raw_welford_mean += d1 / _gnss_raw_welford_n
-        d2 = gnss_raw_pred_residual - _gnss_raw_welford_mean
-        _gnss_raw_welford_m2 += d1 * d2
-        if gnss_raw_pred_residual < _gnss_raw_welford_min:
-            _gnss_raw_welford_min = gnss_raw_pred_residual
-        if gnss_raw_pred_residual > _gnss_raw_welford_max:
-            _gnss_raw_welford_max = gnss_raw_pred_residual
-        gnss_raw_welford_stddev = math.sqrt(
-            _gnss_raw_welford_m2 / (_gnss_raw_welford_n - 1)) if _gnss_raw_welford_n >= 2 else 0.0
-        gnss_raw_welford_stderr = (
-            gnss_raw_welford_stddev / math.sqrt(_gnss_raw_welford_n)) if _gnss_raw_welford_n >= 2 else 0.0
+        gnss_raw_welford = _gnss_raw_welford_snapshot()
 
         # --- Build TIMEBASE record ---
         timebase = {
@@ -5004,12 +5105,12 @@ def _process_loop() -> None:
                 "gnss_raw_drift_ppb": gnss_raw_drift_ppb,
                 "gnss_raw_tau": round(_compute_tau(gnss_raw_ns_int, gnss_raw_ref_ns), 12) if _gnss_raw_valid else None,
                 "gnss_raw_ppb": round(_compute_ppb(gnss_raw_ns_int, gnss_raw_ref_ns), 3) if _gnss_raw_valid else None,
-                "gnss_raw_welford_n": _gnss_raw_welford_n,
-                "gnss_raw_welford_mean": round(_gnss_raw_welford_mean, 3),
-                "gnss_raw_welford_stddev": round(gnss_raw_welford_stddev, 3),
-                "gnss_raw_welford_stderr": round(gnss_raw_welford_stderr, 3),
-                "gnss_raw_welford_min": round(_gnss_raw_welford_min, 3),
-                "gnss_raw_welford_max": round(_gnss_raw_welford_max, 3),
+                "gnss_raw_welford_n": gnss_raw_welford["n"],
+                "gnss_raw_welford_mean": round(gnss_raw_welford["mean"], 3),
+                "gnss_raw_welford_stddev": round(gnss_raw_welford["stddev"], 3),
+                "gnss_raw_welford_stderr": round(gnss_raw_welford["stderr"], 3),
+                "gnss_raw_welford_min": round(gnss_raw_welford["min"], 3),
+                "gnss_raw_welford_max": round(gnss_raw_welford["max"], 3),
             },
         }
 
@@ -5081,7 +5182,7 @@ def _reset_trackers() -> int:
     _timebase_last_activity_pps_vclock_count = None
     _diag["last_timebase_activity"] = {}
     _gnss_canary_reset()
-    _gnss_raw_reset()
+    _gnss_raw_clock_reset()
     _timebase_final_court_reset_row_fatal_streak("trackers_reset")
     return _drain_timebase_ingress()
 
@@ -5662,6 +5763,216 @@ def cmd_stop(_: Optional[dict]) -> dict:
 
     logging.info("⏹️ [clocks] campaign stopped")
     return {"success": True, "message": "OK"}
+
+
+def _gnss_raw_clock_snapshot() -> Dict[str, Any]:
+    """Return one coherent Pi-owned GNSS_RAW clockface/statistics snapshot."""
+    with _gnss_raw_stats_lock:
+        latest_info = dict(_gnss_raw_latest_info)
+        latest_received = _gnss_raw_latest_info_monotonic
+    welford = _gnss_raw_welford_snapshot()
+    ref_ns = int(_gnss_raw_n) * NS_PER_SECOND
+    raw_ns = int(round(_gnss_raw_ns))
+    age_s = (
+        None
+        if latest_received is None
+        else max(0.0, time.monotonic() - latest_received)
+    )
+    return {
+        "owner": "PI",
+        "clock": "GNSS_RAW",
+        "always_on_statistics": True,
+        "clockface_campaign_relative": True,
+        "valid": bool(_gnss_raw_valid),
+        "ns": raw_ns,
+        "ref_ns": ref_ns,
+        "clockface_n": int(_gnss_raw_n),
+        "tau": round(_compute_tau(raw_ns, ref_ns), 12) if _gnss_raw_valid and ref_ns > 0 else None,
+        "ppb": round(_compute_ppb(raw_ns, ref_ns), 3) if _gnss_raw_valid and ref_ns > 0 else None,
+        "drift_ppb": _gnss_raw_drift_from_info(latest_info),
+        "welford": welford,
+        "latest_info_age_s": None if age_s is None else round(age_s, 3),
+        "latest_info_fresh": bool(age_s is not None and age_s <= GNSS_RAW_INFO_MAX_AGE_S),
+    }
+
+
+def _combined_teensy_report(teensy_command: str, *, report_name: str) -> Dict[str, Any]:
+    """Return one operator-facing CLOCKS report spanning Teensy and Pi owners."""
+    try:
+        teensy_response = send_command(
+            machine="TEENSY",
+            subsystem="CLOCKS",
+            command=teensy_command,
+        )
+    except Exception as exc:
+        _diag["report_transitive_failures"] = _diag.get("report_transitive_failures", 0) + 1
+        return {
+            "success": False,
+            "message": f"Teensy CLOCKS.{teensy_command} failed: {exc}",
+            "payload": {
+                "report": report_name,
+                "scope": "SYSTEMWIDE_CLOCKS",
+                "teensy_command": teensy_command,
+                "error": str(exc),
+                "pi_gnss_raw": _gnss_raw_clock_snapshot(),
+            },
+        }
+
+    teensy_ok = isinstance(teensy_response, dict) and bool(teensy_response.get("success"))
+    if not teensy_ok:
+        _diag["report_transitive_failures"] = _diag.get("report_transitive_failures", 0) + 1
+        return {
+            "success": False,
+            "message": f"Teensy CLOCKS.{teensy_command} rejected",
+            "payload": {
+                "report": report_name,
+                "scope": "SYSTEMWIDE_CLOCKS",
+                "teensy_command": teensy_command,
+                "teensy": teensy_response,
+                "pi_gnss_raw": _gnss_raw_clock_snapshot(),
+            },
+        }
+
+    active = _get_active_campaign()
+    campaign_payload = active.get("payload", {}) if isinstance(active, dict) else {}
+    combined = {
+        "schema": "CLOCKS_SYSTEM_REPORT_V1",
+        "report": report_name,
+        "scope": "SYSTEMWIDE_CLOCKS",
+        "generated_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "campaign_active": bool(active),
+        "campaign": active.get("campaign") if isinstance(active, dict) else None,
+        "campaign_state": (
+            "STARTED" if active else "IDLE"
+        ),
+        "startup": _start_status_payload(),
+        "owners": {
+            "teensy": ["GNSS", "VCLOCK", "DWT", "OCXO1", "OCXO2", "DAC"],
+            "pi": ["GNSS_RAW"],
+        },
+        "teensy": teensy_response,
+        "pi": {
+            "gnss_raw": _gnss_raw_clock_snapshot(),
+            "stats_reset": {
+                "requests": int(_diag.get("stats_reset_requests") or 0),
+                "success": int(_diag.get("stats_reset_success") or 0),
+                "last": _diag.get("last_stats_reset") or {},
+            },
+            "campaign_report_present": bool(
+                isinstance(campaign_payload, dict) and isinstance(campaign_payload.get("report"), dict)
+            ),
+        },
+    }
+    return {"success": True, "message": "OK", "payload": combined}
+
+
+def cmd_report_clocks(_: Optional[dict]) -> Dict[str, Any]:
+    """Return the compact systemwide clock/instrument report."""
+    _diag["report_clocks_requests"] = _diag.get("report_clocks_requests", 0) + 1
+    response = _combined_teensy_report("REPORT_CLOCKS", report_name="CLOCKS_SYSTEM_INSTRUMENT")
+    _diag["last_report_clocks"] = {
+        "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "success": bool(response.get("success")),
+    }
+    return response
+
+
+def cmd_report_stats(_: Optional[dict]) -> Dict[str, Any]:
+    """Return the detailed systemwide statistical report."""
+    _diag["report_stats_requests"] = _diag.get("report_stats_requests", 0) + 1
+    response = _combined_teensy_report("REPORT_STATS", report_name="CLOCKS_SYSTEM_STATS")
+    _diag["last_report_stats"] = {
+        "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "success": bool(response.get("success")),
+    }
+    return response
+
+
+def cmd_stats_reset(_: Optional[dict]) -> Dict[str, Any]:
+    """Reset all CLOCKS statistical populations as one operator command.
+
+    Teensy owns the real-clock Welfords; Pi owns GNSS_RAW.  Require the
+    Teensy reset to succeed before resetting Pi state so a transport failure
+    cannot silently split the statistical epoch.
+    """
+    _diag["stats_reset_requests"] = _diag.get("stats_reset_requests", 0) + 1
+    startup_busy = _startup_control_gate("STATS_RESET")
+    if startup_busy is not None:
+        return startup_busy
+
+    requested_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    pi_before = _gnss_raw_welford_snapshot()
+
+    try:
+        teensy_response = send_command(
+            machine="TEENSY",
+            subsystem="CLOCKS",
+            command="STATS_RESET",
+        )
+    except Exception as exc:
+        _diag["stats_reset_teensy_failures"] = (
+            _diag.get("stats_reset_teensy_failures", 0) + 1
+        )
+        failure = {
+            "requested_at_utc": requested_at,
+            "success": False,
+            "stage": "TEENSY",
+            "error": str(exc),
+            "pi_gnss_raw_before": pi_before,
+            "pi_reset_applied": False,
+        }
+        _diag["last_stats_reset"] = failure
+        logging.exception("❌ [clocks] transitive STATS_RESET failed at Teensy; Pi stats preserved")
+        return {
+            "success": False,
+            "message": f"Teensy CLOCKS.STATS_RESET failed: {exc}",
+            "payload": failure,
+        }
+
+    teensy_ok = isinstance(teensy_response, dict) and bool(teensy_response.get("success"))
+    if not teensy_ok:
+        _diag["stats_reset_teensy_failures"] = (
+            _diag.get("stats_reset_teensy_failures", 0) + 1
+        )
+        failure = {
+            "requested_at_utc": requested_at,
+            "success": False,
+            "stage": "TEENSY",
+            "teensy_response": teensy_response,
+            "pi_gnss_raw_before": pi_before,
+            "pi_reset_applied": False,
+        }
+        _diag["last_stats_reset"] = failure
+        logging.error("❌ [clocks] Teensy rejected STATS_RESET; Pi stats preserved: %s", teensy_response)
+        return {
+            "success": False,
+            "message": "Teensy CLOCKS.STATS_RESET rejected",
+            "payload": failure,
+        }
+
+    pi_previous = _gnss_raw_welford_reset()
+    pi_after = _gnss_raw_welford_snapshot()
+    completed_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    result = {
+        "requested_at_utc": requested_at,
+        "completed_at_utc": completed_at,
+        "success": True,
+        "scope": "SYSTEMWIDE_CLOCK_STATISTICS",
+        "campaign_unchanged": True,
+        "clockfaces_unchanged": True,
+        "teensy": teensy_response,
+        "pi_gnss_raw_before": pi_previous,
+        "pi_gnss_raw_after": pi_after,
+    }
+    _diag["stats_reset_success"] = _diag.get("stats_reset_success", 0) + 1
+    _diag["last_stats_reset"] = result
+    logging.warning(
+        "📊 [clocks] transitive STATS_RESET complete: Teensy accepted; "
+        "GNSS_RAW N %d -> %d; campaign and clockfaces preserved",
+        int(pi_previous.get("n") or 0),
+        int(pi_after.get("n") or 0),
+    )
+    return {"success": True, "message": "OK", "payload": result}
 
 
 def cmd_report(_: Optional[dict]) -> Dict[str, Any]:
@@ -7920,6 +8231,9 @@ COMMANDS = {
     "RECOVER_ABORT": cmd_recover_abort,
     "RECOVERY_ABORT": cmd_recover_abort,
     "REPORT": cmd_report,
+    "REPORT_CLOCKS": cmd_report_clocks,
+    "REPORT_STATS": cmd_report_stats,
+    "STATS_RESET": cmd_stats_reset,
     "CLEAR": cmd_clear,
     "DELETE": cmd_delete,
     "TRUNCATE": cmd_truncate,
@@ -7966,7 +8280,7 @@ def run() -> None:
         "The Teensy emits one TIMEBASE_FRAGMENT candidate containing fragment + embedded forensics; the Pi is the final row arbiter. "
         "STRICT drops science-rejected numeric candidates; FORENSIC persists them and allows mathematical contamination. "
         "START while active performs seamless flash-cut to new campaign. "
-        "Commands: START, STOP, RESUME, RECOVER_ABORT, REPORT, CLEAR, DELETE, TRUNCATE, SET_DAC, DITHER, GATE_MODE, "
+        "Commands: START, STOP, RESUME, RECOVER_ABORT, REPORT, REPORT_CLOCKS, REPORT_STATS, STATS_RESET, CLEAR, DELETE, TRUNCATE, SET_DAC, DITHER, GATE_MODE, "
         "SET_BASELINE, BASELINE_INFO, LIST_CAMPAIGNS, CLOCKS_INFO. "
         "Subscriptions: MONITOR, TIMEBASE_FRAGMENT, WATCHDOG_ANOMALY, CLOCKS_RECOVERY_STALLED."
     )
@@ -8074,6 +8388,13 @@ def run() -> None:
             logging.info("🔧 [clocks] no DAC defaults or baseline DAC values in SYSTEM config — Teensy keeps defaults")
     except Exception:
         logging.exception("⚠️ [clocks] boot control-state push failed (Teensy keeps defaults)")
+
+    # Start Pi-owned GNSS_RAW statistics independently of campaigns.
+    threading.Thread(
+        target=_gnss_raw_stats_loop,
+        daemon=True,
+        name="clocks-gnss-raw-stats",
+    ).start()
 
     # Start processor thread
     threading.Thread(
