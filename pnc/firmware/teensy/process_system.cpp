@@ -14,6 +14,7 @@
 // =============================================================
 
 #include "process_system.h"
+#include "process_clocks.h"
 #include "crash_forensics.h"
 #include "config.h"
 #include "process.h"
@@ -3313,9 +3314,10 @@ static FLASHMEM Payload cmd_payload_info(const Payload& /*args*/) {
 // MONITOR_FRAGMENT — compact non-TIMEBASE operational status
 // ============================================================================
 //
-// This publication intentionally contains only the union of Teensy operational
-// fields consumed by Dashboard/Metrics. Scientific clock rows remain in
-// TIMEBASE_FRAGMENT and are never parsed or copied here.
+// This publication contains the union of Teensy operational fields consumed by
+// Dashboard/Metrics.  CLOCKS contributes a compact live view built directly
+// from Alpha's latest coherent completed row.  It is observational telemetry:
+// no TIMEBASE candidate is parsed, copied, manufactured, or persisted here.
 
 static Payload system_monitor_teensy_payload(void) {
   Payload p;
@@ -3480,9 +3482,10 @@ static void system_monitor_publish_service(timepop_ctx_t*,
   g_system_monitor_pending = false;
 
   Payload fragment;
-  fragment.add("schema", "MONITOR_FRAGMENT_V1");
+  fragment.add("schema", "MONITOR_FRAGMENT_V2");
   fragment.add("sequence", sequence);
   fragment.add("generated_dwt", ARM_DWT_CYCCNT);
+  fragment.add_object("clocks", clocks_monitor_payload());
   fragment.add_object("teensy", system_monitor_teensy_payload());
   fragment.add_object("process", system_monitor_process_payload());
   fragment.add_object("transport", system_monitor_transport_payload());

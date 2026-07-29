@@ -12,7 +12,7 @@ Process model:
   • One systemd service
   • One Pi-context polling thread
   • One blocking command socket
-  • One MONITOR_FRAGMENT subscription
+  • MONITOR_FRAGMENT and CLOCKS_MONITOR subscriptions
 """
 
 from __future__ import annotations
@@ -60,6 +60,8 @@ from zpnet.shared.util import (
 
 POLL_INTERVAL_SEC = 30
 STARTUP_TEENSY_QUIET_DELAY_S = 10.0
+CLOCKS_MONITOR_TOPIC = "CLOCKS_MONITOR"
+GNSS_MONITOR_FRESHNESS_MAX_AGE_S = 2.5
 
 # ------------------------------------------------------------------
 # Raspberry Pi status configuration
@@ -228,6 +230,28 @@ POWER_SAMPLE_STEP = 5                # same semantics as before
 SYSTEM: Dict[str, object] = {}
 
 _SYSTEM_LOCK = threading.Lock()
+
+# Pi CLOCKS publishes its Pi-owned GNSS_RAW/baseline decoration independently
+# of the PPS-aligned Teensy fragment.  SYSTEM retains only the latest value and
+# folds it into the next ephemeral MONITOR snapshot.
+_CLOCKS_MONITOR_LOCK = threading.Lock()
+_LATEST_CLOCKS_MONITOR: Dict[str, Any] = {}
+_LATEST_CLOCKS_MONITOR_RECEIVED_MONOTONIC: Optional[float] = None
+_LATEST_CLOCKS_MONITOR_RECEIVED_UTC: Optional[str] = None
+
+# MONITOR requires a current GNSS/Chrony side-by-side time witness.  Until
+# GNSS publishes its own status topic, SYSTEM obtains one local REPORT for
+# each PPS-aligned MONITOR build and keeps a last-known-good fallback.
+_GNSS_MONITOR_LOCK = threading.Lock()
+_LATEST_GNSS_MONITOR: Dict[str, Any] = {}
+_LATEST_GNSS_MONITOR_RECEIVED_MONOTONIC: Optional[float] = None
+_LATEST_GNSS_MONITOR_RECEIVED_UTC: Optional[str] = None
+_GNSS_MONITOR_REQUEST_COUNT = 0
+_GNSS_MONITOR_SUCCESS_COUNT = 0
+_GNSS_MONITOR_FAILURE_COUNT = 0
+_GNSS_MONITOR_LAST_LATENCY_MS: Optional[float] = None
+_GNSS_MONITOR_MAX_LATENCY_MS: float = 0.0
+_GNSS_MONITOR_LAST_ERROR: str = ""
 
 # ------------------------------------------------------------------
 # Feature status clearing house
@@ -743,11 +767,86 @@ def build_laser_status() -> dict:
 # GNSS helpers (migrated from gnss_monitor)
 # ------------------------------------------------------------------
 
+def _request_gnss_report() -> dict:
+    """Return one validated Pi GNSS.REPORT payload."""
+    response = send_command(machine="PI", subsystem="GNSS", command="REPORT")
+    if not isinstance(response, dict) or not response.get("success"):
+        raise RuntimeError(f"GNSS.REPORT rejected: {response!r}")
+    payload = response.get("payload")
+    if not isinstance(payload, dict):
+        raise RuntimeError("GNSS.REPORT returned no dictionary payload")
+    return dict(payload)
+
+
 def build_gnss_status() -> dict:
     return {
-        **send_command(machine="PI", subsystem="GNSS", command="REPORT")["payload"],
+        **_request_gnss_report(),
         "health_state": "NOMINAL",
     }
+
+
+def _gnss_monitor_snapshot() -> tuple[dict, dict]:
+    """Fetch current GNSS state for MONITOR, with explicit stale fallback."""
+    global _LATEST_GNSS_MONITOR
+    global _LATEST_GNSS_MONITOR_RECEIVED_MONOTONIC
+    global _LATEST_GNSS_MONITOR_RECEIVED_UTC
+    global _GNSS_MONITOR_REQUEST_COUNT
+    global _GNSS_MONITOR_SUCCESS_COUNT
+    global _GNSS_MONITOR_FAILURE_COUNT
+    global _GNSS_MONITOR_LAST_LATENCY_MS
+    global _GNSS_MONITOR_MAX_LATENCY_MS
+    global _GNSS_MONITOR_LAST_ERROR
+
+    _GNSS_MONITOR_REQUEST_COUNT += 1
+    began = time.monotonic()
+    now_utc = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+    fresh = False
+    error = ""
+
+    try:
+        payload = _request_gnss_report()
+        received = time.monotonic()
+        received_utc = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+        with _GNSS_MONITOR_LOCK:
+            _LATEST_GNSS_MONITOR = dict(payload)
+            _LATEST_GNSS_MONITOR_RECEIVED_MONOTONIC = received
+            _LATEST_GNSS_MONITOR_RECEIVED_UTC = received_utc
+        _GNSS_MONITOR_SUCCESS_COUNT += 1
+        _GNSS_MONITOR_LAST_ERROR = ""
+        fresh = True
+    except Exception as exc:
+        _GNSS_MONITOR_FAILURE_COUNT += 1
+        error = f"{type(exc).__name__}: {exc}"
+        _GNSS_MONITOR_LAST_ERROR = error
+        logging.warning("[system] GNSS refresh for MONITOR failed; using last-known-good: %s", error)
+
+    latency_ms = (time.monotonic() - began) * 1000.0
+    _GNSS_MONITOR_LAST_LATENCY_MS = latency_ms
+    _GNSS_MONITOR_MAX_LATENCY_MS = max(_GNSS_MONITOR_MAX_LATENCY_MS, latency_ms)
+
+    with _GNSS_MONITOR_LOCK:
+        payload = dict(_LATEST_GNSS_MONITOR)
+        received = _LATEST_GNSS_MONITOR_RECEIVED_MONOTONIC
+        received_utc = _LATEST_GNSS_MONITOR_RECEIVED_UTC
+    age_s = None if received is None else max(0.0, time.monotonic() - received)
+    source_fresh = bool(
+        payload and age_s is not None and age_s <= GNSS_MONITOR_FRESHNESS_MAX_AGE_S
+    )
+    metadata = {
+        "requested_at_utc": now_utc,
+        "received_at_utc": received_utc,
+        "source_age_s": None if age_s is None else round(age_s, 3),
+        "source_fresh": source_fresh,
+        "request_succeeded": fresh,
+        "used_last_known_good": bool(payload) and not fresh,
+        "latency_ms": round(latency_ms, 3),
+        "request_count": int(_GNSS_MONITOR_REQUEST_COUNT),
+        "success_count": int(_GNSS_MONITOR_SUCCESS_COUNT),
+        "failure_count": int(_GNSS_MONITOR_FAILURE_COUNT),
+        "max_latency_ms": round(_GNSS_MONITOR_MAX_LATENCY_MS, 3),
+        "last_error": error or _GNSS_MONITOR_LAST_ERROR,
+    }
+    return payload, metadata
 
 # ------------------------------------------------------------------
 # Sensor scan
@@ -1416,6 +1515,88 @@ def _dict_copy(value: Any) -> dict:
     return dict(value) if isinstance(value, dict) else {}
 
 
+def _seconds_to_hms(seconds: Any) -> str:
+    try:
+        total = max(0, int(seconds))
+    except (TypeError, ValueError):
+        total = 0
+    return f"{total // 3600:02d}:{(total % 3600) // 60:02d}:{total % 60:02d}"
+
+
+def _gnss_time_utc(gnss: Dict[str, Any]) -> Optional[str]:
+    date = str(gnss.get("date") or "").strip()
+    clock = str(gnss.get("time") or "").strip()
+    if not date or not clock:
+        return None
+    return f"{date}T{clock}Z"
+
+
+def _clocks_monitor_snapshot() -> tuple[Dict[str, Any], Optional[float], Optional[str]]:
+    with _CLOCKS_MONITOR_LOCK:
+        payload = dict(_LATEST_CLOCKS_MONITOR)
+        received = _LATEST_CLOCKS_MONITOR_RECEIVED_MONOTONIC
+        received_utc = _LATEST_CLOCKS_MONITOR_RECEIVED_UTC
+    age_s = None if received is None else max(0.0, time.monotonic() - received)
+    return payload, age_s, received_utc
+
+
+def _combine_live_clocks(fragment: Dict[str, Any],
+                         gnss: Dict[str, Any],
+                         published_at_utc: str) -> Dict[str, Any]:
+    """Combine Teensy physical clocks with Pi-owned GNSS_RAW/baseline state."""
+    teensy_clocks = _dict_copy(fragment.get("clocks"))
+    pi_clocks, pi_age_s, pi_received_utc = _clocks_monitor_snapshot()
+
+    clocks = dict(teensy_clocks)
+    clocks["schema"] = "CLOCKS_LIVE_V1"
+    clocks["teensy_schema"] = teensy_clocks.get("schema")
+    clocks["pi_schema"] = pi_clocks.get("schema")
+    clocks["system_time_utc"] = published_at_utc
+    clocks["gnss_time_utc"] = _gnss_time_utc(gnss)
+
+    presentation_count = (
+        clocks.get("teensy_pps_vclock_count")
+        or clocks.get("campaign_seconds")
+        or 0
+    )
+    clocks["display_elapsed"] = _seconds_to_hms(presentation_count)
+    clocks["campaign_elapsed"] = (
+        _seconds_to_hms(clocks.get("campaign_seconds"))
+        if clocks.get("campaign_present")
+        else None
+    )
+    clocks["instrument_elapsed"] = _seconds_to_hms(
+        clocks.get("instrument_age_seconds")
+    )
+    completed_sequence = clocks.get("completed_pps_sequence")
+    monitor_sequence = _monitor_fragment_count(fragment)
+    try:
+        clocks["teensy_clock_source_age_sequences"] = max(
+            0, int(monitor_sequence) - int(completed_sequence)
+        )
+    except (TypeError, ValueError):
+        clocks["teensy_clock_source_age_sequences"] = None
+
+    clocks["pi"] = pi_clocks
+    clocks["gnss_raw"] = _dict_copy(pi_clocks.get("gnss_raw"))
+    clocks["extra_clocks"] = _dict_copy(pi_clocks.get("extra_clocks"))
+    clocks["baseline"] = _dict_copy(pi_clocks.get("baseline"))
+    clocks["stats_reset"] = _dict_copy(pi_clocks.get("stats_reset"))
+    clocks["pi_clock_source_age_s"] = (
+        None if pi_age_s is None else round(pi_age_s, 3)
+    )
+    clocks["pi_clock_source_received_at_utc"] = pi_received_utc
+    clocks["pi_clock_source_fresh"] = bool(
+        pi_age_s is not None and pi_age_s <= 2.5
+    )
+    clocks["complete_for_display"] = bool(
+        teensy_clocks and pi_clocks.get("gnss_raw")
+    )
+    clocks["ephemeral"] = True
+    clocks["persisted"] = False
+    return clocks
+
+
 def _monitor_fragment_count(fragment: Dict[str, Any]) -> Optional[int]:
     for key in ("sequence", "teensy_pps_vclock_count", "teensy_pps_count", "pps_count"):
         value = fragment.get(key)
@@ -1473,7 +1654,7 @@ def system_poller() -> None:
                 teensy_features_available=bool(_teensy_feature_tree_snapshot()),
             )
 
-            _update_pi_context({
+            pi_context = {
                 "pi": dict(pi_payload),
                 "network": dict(network_payload),
                 "sensors": dict(sensor_payload),
@@ -1481,11 +1662,13 @@ def system_poller() -> None:
                 "gnss": dict(gnss_payload),
                 "power": dict(power_payload),
                 "battery": dict(battery_payload),
-            })
+            }
+            _update_pi_context(pi_context)
 
-            with _SYSTEM_LOCK:
-                snapshot = dict(SYSTEM)
-            create_event("SYSTEM_STATUS", snapshot)
+            # Persist only the slow Pi context.  The 1 Hz MONITOR publication,
+            # its Teensy fragment, and live CLOCKS block are intentionally
+            # ephemeral latest-state telemetry.
+            create_event("SYSTEM_STATUS", pi_context)
             time.sleep(POLL_INTERVAL_SEC)
 
     except Exception:
@@ -1495,6 +1678,25 @@ def system_poller() -> None:
 # ------------------------------------------------------------------
 # Pub/Sub handlers
 # ------------------------------------------------------------------
+
+def on_clocks_monitor(payload: Optional[dict]) -> None:
+    """Cache the latest Pi-owned CLOCKS decoration; never persist it."""
+    global _LATEST_CLOCKS_MONITOR
+    global _LATEST_CLOCKS_MONITOR_RECEIVED_MONOTONIC
+    global _LATEST_CLOCKS_MONITOR_RECEIVED_UTC
+
+    if not isinstance(payload, dict):
+        logging.warning("[system] ignoring malformed CLOCKS_MONITOR: %r", payload)
+        return
+
+    received_utc = datetime.datetime.now(datetime.timezone.utc) \
+        .isoformat() \
+        .replace("+00:00", "Z")
+    with _CLOCKS_MONITOR_LOCK:
+        _LATEST_CLOCKS_MONITOR = dict(payload)
+        _LATEST_CLOCKS_MONITOR_RECEIVED_MONOTONIC = time.monotonic()
+        _LATEST_CLOCKS_MONITOR_RECEIVED_UTC = received_utc
+
 
 def on_monitor_fragment(payload: Optional[dict]) -> None:
     """Decorate one Teensy MONITOR_FRAGMENT and rebroadcast it as MONITOR."""
@@ -1515,29 +1717,49 @@ def on_monitor_fragment(payload: Optional[dict]) -> None:
     with _SYSTEM_LOCK:
         current = dict(SYSTEM)
 
+    gnss, gnss_monitor = _gnss_monitor_snapshot()
+    published_at_utc = datetime.datetime.now(datetime.timezone.utc) \
+        .isoformat() \
+        .replace("+00:00", "Z")
+    clocks = _combine_live_clocks(fragment, gnss, published_at_utc)
+    gnss_time_utc = _gnss_time_utc(gnss)
+    time_sanity = {
+        "schema": "MONITOR_TIME_SANITY_V1",
+        "gnss_utc": gnss_time_utc,
+        "system_utc": published_at_utc,
+        "gnss_source_fresh": bool(gnss_monitor.get("source_fresh")),
+        "gnss_source_age_s": gnss_monitor.get("source_age_s"),
+        "gnss_request_latency_ms": gnss_monitor.get("latency_ms"),
+    }
+    fragment_evidence = dict(fragment)
+    # The normalized top-level clocks block is the display authority.  Avoid
+    # duplicating that comparatively large object inside monitor_fragment.
+    fragment_evidence.pop("clocks", None)
+
     monitor = {
-        "schema": "MONITOR_V1",
+        "schema": "MONITOR_V2",
         "source_schema": fragment.get("schema"),
         "sequence": count,
         "teensy_pps_vclock_count": count,
         "teensy_pps_count": count,
         "pps_count": count,
-        "published_at_utc": datetime.datetime.now(datetime.timezone.utc)
-            .isoformat()
-            .replace("+00:00", "Z"),
+        "published_at_utc": published_at_utc,
         "pi": _dict_copy(current.get("pi")),
         "network": _dict_copy(current.get("network")),
         "sensors": _dict_copy(current.get("sensors")),
         "environment": _dict_copy(current.get("environment")),
-        "gnss": _dict_copy(current.get("gnss")),
+        "gnss": gnss,
+        "gnss_monitor": gnss_monitor,
+        "time_sanity": time_sanity,
         "power": _dict_copy(current.get("power")),
         "battery": _dict_copy(current.get("battery")),
+        "clocks": clocks,
         "teensy": _monitor_fragment_teensy(fragment),
         "process": _dict_copy(fragment.get("process")),
         "transport": _dict_copy(fragment.get("transport")),
         "payload": _dict_copy(fragment.get("payload")),
         "features": features,
-        "monitor_fragment": fragment,
+        "monitor_fragment": fragment_evidence,
     }
 
     with _SYSTEM_LOCK:
@@ -1697,6 +1919,7 @@ def run() -> None:
             commands=COMMANDS,
             subscriptions={
                 "MONITOR_FRAGMENT": on_monitor_fragment,
+                CLOCKS_MONITOR_TOPIC: on_clocks_monitor,
             },
             blocking=False,
         )

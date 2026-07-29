@@ -2866,6 +2866,8 @@ static uint64_t g_instrument_stats_gnss_ns = 0ULL;
 static uint64_t g_instrument_stats_dwt_cycles = 0ULL;
 static uint64_t g_instrument_stats_ocxo1_ns = 0ULL;
 static uint64_t g_instrument_stats_ocxo2_ns = 0ULL;
+static uint32_t g_instrument_stats_dwt_at_pps_vclock = 0U;
+static uint32_t g_instrument_stats_counter32_at_pps_vclock = 0U;
 static uint32_t g_instrument_stats_dwt_cycles_per_second = 0U;
 static uint32_t g_instrument_stats_reference_interval_cycles = 0U;
 static uint32_t g_instrument_stats_vclock_interval_cycles = 0U;
@@ -3031,6 +3033,9 @@ static void alpha_instrument_stats_note_completed_row(uint32_t pps_sequence) {
       g_ocxo1_measured_gnss_ns_at_pps_vclock;
   g_instrument_stats_ocxo2_ns =
       g_ocxo2_measured_gnss_ns_at_pps_vclock;
+  g_instrument_stats_dwt_at_pps_vclock = g_dwt_at_pps_vclock;
+  g_instrument_stats_counter32_at_pps_vclock =
+      g_counter32_at_pps_vclock;
   g_instrument_stats_dwt_cycles_per_second = cps;
   g_instrument_stats_reference_interval_cycles = reference_cycles;
   g_instrument_stats_vclock_interval_cycles = vclock_cycles;
@@ -3064,6 +3069,10 @@ FLASHMEM bool clocks_alpha_instrument_stats_snapshot(
     local.dwt_cycles = g_instrument_stats_dwt_cycles;
     local.ocxo1_ns = g_instrument_stats_ocxo1_ns;
     local.ocxo2_ns = g_instrument_stats_ocxo2_ns;
+    local.dwt_at_pps_vclock =
+        g_instrument_stats_dwt_at_pps_vclock;
+    local.counter32_at_pps_vclock =
+        g_instrument_stats_counter32_at_pps_vclock;
     local.dwt_cycles_per_second =
         g_instrument_stats_dwt_cycles_per_second;
     local.selected_reference_interval_cycles =

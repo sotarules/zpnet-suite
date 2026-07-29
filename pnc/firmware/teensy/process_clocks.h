@@ -4,6 +4,8 @@
 #include "process.h"
 #include "time.h"
 
+class Payload;
+
 // ============================================================================
 // CLOCKS — Authoritative Temporal Subsystem (Teensy) — v12
 // ============================================================================
@@ -285,3 +287,13 @@ bool clocks_alpha_ocxo_tau_snapshot(time_clock_id_t clock,
 // Compatibility alias; equivalent to clocks_alpha_ocxo_tau_snapshot().
 bool clocks_alpha_tau_snapshot(time_clock_id_t clock,
                                clocks_alpha_tau_snapshot_t* out);
+
+
+// -----------------------------------------------------------------------------
+// Always-on MONITOR_FRAGMENT clock view
+// -----------------------------------------------------------------------------
+// Build one compact, read-only CLOCKS payload from the latest coherent Alpha
+// completed row.  When a campaign is active, the presentation clockfaces are
+// campaign-relative; otherwise they remain Alpha service-epoch relative.
+// Statistics are always Alpha-owned and campaign-neutral.
+Payload clocks_monitor_payload(void);

@@ -140,8 +140,11 @@ bool system_feature_is_nominal(const char* subsystem,
 // ============================================================================
 // Canonical always-on tick. process_interrupt calls this for every completed
 // PPS/VCLOCK second whether or not a CLOCKS campaign is active. It records only
-// the scalar sequence and arms foreground publication; it never inspects
-// TIMEBASE.
+// the scalar sequence and arms foreground publication.
+//
+// Foreground SYSTEM then adds a compact CLOCKS live view built from Alpha's
+// coherent completed-row snapshot.  This is ephemeral observation state, not a
+// TIMEBASE row and not a second scientific authority.
 void system_monitor_pps_tick_from_interrupt(
     uint32_t completed_second_sequence);
 

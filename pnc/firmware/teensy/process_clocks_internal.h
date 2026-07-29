@@ -1839,6 +1839,12 @@ struct clocks_instrument_stats_snapshot_t {
   uint64_t ocxo1_ns = 0;
   uint64_t ocxo2_ns = 0;
 
+  // Exact selected PPS/VCLOCK edge identity belonging to the same completed
+  // Alpha row as the clockfaces above.  The always-on MONITOR feed uses these
+  // fields instead of mixing ambient next-row globals into a coherent snapshot.
+  uint32_t dwt_at_pps_vclock = 0;
+  uint32_t counter32_at_pps_vclock = 0;
+
   uint32_t dwt_cycles_per_second = 0;
   // selected_reference is the PPS-selected VCLOCK edge interval used by Delta.
   // vclock_observed is the independent VCLOCK subscriber interval.

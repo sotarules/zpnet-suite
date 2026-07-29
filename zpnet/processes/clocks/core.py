@@ -168,6 +168,8 @@ SYNC_LOG_INTERVAL_S = 5.0
 TIMEBASE_INGRESS_QUEUE_MAXSIZE = 0
 TIMEBASE_FRAGMENT_TOPIC = "TIMEBASE_FRAGMENT"
 MONITOR_TOPIC = "MONITOR"
+CLOCKS_MONITOR_TOPIC = "CLOCKS_MONITOR"
+CLOCKS_MONITOR_BASELINE_REFRESH_S = 30.0
 MONITOR_PREFLIGHT_MAX_AGE_S = 5.0
 CLOCKS_RECOVERY_STALLED_TOPIC = "CLOCKS_RECOVERY_STALLED"
 TIMEBASE_CANDIDATE_ACCEPT = "ACCEPT"
@@ -486,6 +488,11 @@ _diag: Dict[str, Any] = {
     "gnss_raw_stats_sample_count": 0,
     "gnss_raw_stats_missing_count": 0,
     "last_gnss_raw_stats_sample": {},
+    "clocks_monitor_publish_count": 0,
+    "clocks_monitor_publish_failures": 0,
+    "clocks_monitor_baseline_refresh_count": 0,
+    "clocks_monitor_baseline_refresh_failures": 0,
+    "last_clocks_monitor": {},
     "stats_reset_requests": 0,
     "stats_reset_success": 0,
     "stats_reset_teensy_failures": 0,
@@ -863,6 +870,18 @@ def _gnss_canary_reset() -> None:
 _gnss_raw_ns: float = 0.0
 _gnss_raw_n: int = 0
 _gnss_raw_valid: bool = False
+
+# Process-lifetime GNSS_RAW instrument clockface.  Unlike the campaign view
+# above, this advances continuously in the same 1 Hz loop that owns the
+# always-on Welford, so an idle display still has a live synthetic clock.
+_gnss_raw_instrument_ns: float = 0.0
+_gnss_raw_instrument_n: int = 0
+_gnss_raw_instrument_valid: bool = False
+
+# Cached baseline decoration for CLOCKS_MONITOR.  Refreshing this slow-changing
+# DB state is bounded and never occurs in a display repaint path.
+_clocks_monitor_baseline_cache: Dict[str, Any] = {}
+_clocks_monitor_baseline_refreshed_monotonic: Optional[float] = None
 
 # GNSS_RAW statistics are Pi-owned and always-on. Campaign lifecycle may
 # rebase the synthetic clockface, but it never resets this population.
@@ -2178,11 +2197,191 @@ def _gnss_raw_latest_info_snapshot() -> Optional[Dict[str, Any]]:
     return info
 
 
+def _clocks_monitor_set_baseline_cache(value: Optional[Dict[str, Any]]) -> None:
+    global _clocks_monitor_baseline_cache
+    global _clocks_monitor_baseline_refreshed_monotonic
+    _clocks_monitor_baseline_cache = dict(value or {})
+    _clocks_monitor_baseline_refreshed_monotonic = time.monotonic()
+
+
+def _clocks_monitor_baseline_snapshot(*, force: bool = False) -> Dict[str, Any]:
+    """Return bounded-refresh baseline state for the ephemeral monitor feed."""
+    now = time.monotonic()
+    due = (
+        force
+        or _clocks_monitor_baseline_refreshed_monotonic is None
+        or now - _clocks_monitor_baseline_refreshed_monotonic
+            >= CLOCKS_MONITOR_BASELINE_REFRESH_S
+    )
+    if due:
+        try:
+            _clocks_monitor_set_baseline_cache(_get_baseline_from_config())
+            _diag["clocks_monitor_baseline_refresh_count"] += 1
+        except Exception:
+            _diag["clocks_monitor_baseline_refresh_failures"] += 1
+            logging.debug("CLOCKS_MONITOR baseline refresh failed", exc_info=True)
+    return dict(_clocks_monitor_baseline_cache)
+
+
+def _gnss_raw_monitor_snapshot() -> Dict[str, Any]:
+    """Build the Pi-owned portion of the always-on CLOCKS monitor view."""
+    with _gnss_raw_stats_lock:
+        latest_info = dict(_gnss_raw_latest_info)
+        latest_received = _gnss_raw_latest_info_monotonic
+        instrument_ns = int(round(_gnss_raw_instrument_ns))
+        instrument_n = int(_gnss_raw_instrument_n)
+        instrument_valid = bool(_gnss_raw_instrument_valid)
+    welford = _gnss_raw_welford_snapshot()
+
+    instrument_ref_ns = instrument_n * NS_PER_SECOND
+    campaign_ref_ns = int(_gnss_raw_n) * NS_PER_SECOND
+    campaign_ns = int(round(_gnss_raw_ns))
+    campaign_valid = bool(_campaign_active and _gnss_raw_valid and campaign_ref_ns > 0)
+
+    if campaign_valid:
+        presentation_mode = "CAMPAIGN"
+        presentation_basis = "CAMPAIGN_RELATIVE"
+        presentation_ns = campaign_ns
+        presentation_ref_ns = campaign_ref_ns
+    else:
+        presentation_mode = "INSTRUMENT"
+        presentation_basis = "PI_PROCESS_LIFETIME"
+        presentation_ns = instrument_ns
+        presentation_ref_ns = instrument_ref_ns
+
+    age_s = (
+        None
+        if latest_received is None
+        else max(0.0, time.monotonic() - latest_received)
+    )
+    drift_ppb = _gnss_raw_drift_from_info(latest_info)
+    presentation_valid = presentation_ref_ns > 0
+
+    instrument = {
+        "valid": instrument_valid and instrument_ref_ns > 0,
+        "ns": instrument_ns,
+        "ref_ns": instrument_ref_ns,
+        "clockface_n": instrument_n,
+        "tau": (
+            round(_compute_tau(instrument_ns, instrument_ref_ns), 12)
+            if instrument_valid and instrument_ref_ns > 0 else None
+        ),
+        "ppb": (
+            round(_compute_ppb(instrument_ns, instrument_ref_ns), 3)
+            if instrument_valid and instrument_ref_ns > 0 else None
+        ),
+    }
+    campaign = {
+        "valid": campaign_valid,
+        "ns": campaign_ns,
+        "ref_ns": campaign_ref_ns,
+        "clockface_n": int(_gnss_raw_n),
+        "tau": (
+            round(_compute_tau(campaign_ns, campaign_ref_ns), 12)
+            if campaign_valid else None
+        ),
+        "ppb": (
+            round(_compute_ppb(campaign_ns, campaign_ref_ns), 3)
+            if campaign_valid else None
+        ),
+    }
+    presentation = {
+        "mode": presentation_mode,
+        "basis": presentation_basis,
+        "valid": presentation_valid,
+        "ns": presentation_ns,
+        "ref_ns": presentation_ref_ns,
+        "clockface_n": int(presentation_ref_ns // NS_PER_SECOND),
+        "tau": (
+            round(_compute_tau(presentation_ns, presentation_ref_ns), 12)
+            if presentation_valid else None
+        ),
+        "ppb": (
+            round(_compute_ppb(presentation_ns, presentation_ref_ns), 3)
+            if presentation_valid else None
+        ),
+    }
+    return {
+        "owner": "PI",
+        "clock": "GNSS_RAW",
+        "always_on_statistics": True,
+        "instrument": instrument,
+        "campaign": campaign,
+        "presentation": presentation,
+        "drift_ppb": drift_ppb,
+        "welford": welford,
+        "latest_info_age_s": None if age_s is None else round(age_s, 3),
+        "latest_info_fresh": bool(
+            age_s is not None and age_s <= GNSS_RAW_INFO_MAX_AGE_S
+        ),
+    }
+
+
+def _publish_clocks_monitor() -> None:
+    """Publish Pi CLOCKS decoration without command/response or persistence."""
+    gnss_raw = _gnss_raw_monitor_snapshot()
+    presentation = gnss_raw["presentation"]
+    welford = gnss_raw["welford"]
+    baseline = _clocks_monitor_baseline_snapshot()
+    baseline = (
+        {"baseline_set": True, **baseline}
+        if baseline
+        else {"baseline_set": False}
+    )
+    payload = {
+        "schema": "PI_CLOCKS_MONITOR_V1",
+        "published_at_utc": datetime.now(timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z"),
+        "campaign_active": bool(_campaign_active),
+        "startup": _start_status_payload(),
+        "gnss_raw": gnss_raw,
+        "extra_clocks": {
+            "gnss_raw_ns": presentation.get("ns"),
+            "gnss_raw_ref_ns": presentation.get("ref_ns"),
+            "gnss_raw_drift_ppb": gnss_raw.get("drift_ppb"),
+            "gnss_raw_tau": presentation.get("tau"),
+            "gnss_raw_ppb": presentation.get("ppb"),
+            "gnss_raw_welford_n": welford.get("n"),
+            "gnss_raw_welford_mean": welford.get("mean"),
+            "gnss_raw_welford_stddev": welford.get("stddev"),
+            "gnss_raw_welford_stderr": welford.get("stderr"),
+            "gnss_raw_welford_min": welford.get("min"),
+            "gnss_raw_welford_max": welford.get("max"),
+        },
+        "baseline": baseline,
+        "stats_reset": {
+            "requests": int(_diag.get("stats_reset_requests") or 0),
+            "success": int(_diag.get("stats_reset_success") or 0),
+            "last": _diag.get("last_stats_reset") or {},
+        },
+    }
+    try:
+        publish(CLOCKS_MONITOR_TOPIC, payload)
+        _diag["clocks_monitor_publish_count"] += 1
+        _diag["last_clocks_monitor"] = {
+            "published_at_utc": payload["published_at_utc"],
+            "gnss_raw_n": int(welford.get("n") or 0),
+            "presentation_mode": presentation.get("mode"),
+            "success": True,
+        }
+    except Exception as exc:
+        _diag["clocks_monitor_publish_failures"] += 1
+        _diag["last_clocks_monitor"] = {
+            "published_at_utc": payload["published_at_utc"],
+            "success": False,
+            "error": str(exc),
+        }
+        logging.debug("CLOCKS_MONITOR publish failed", exc_info=True)
+
+
 def _gnss_raw_stats_loop() -> None:
     """Poll GF-8802 drift continuously, independent of campaign recording."""
     global _gnss_raw_welford_n, _gnss_raw_welford_mean, _gnss_raw_welford_m2
     global _gnss_raw_welford_min, _gnss_raw_welford_max
     global _gnss_raw_latest_info, _gnss_raw_latest_info_monotonic
+    global _gnss_raw_instrument_ns, _gnss_raw_instrument_n
+    global _gnss_raw_instrument_valid
     _diag["gnss_raw_stats_loop_started"] = True
     logging.info("📊 [clocks] GNSS_RAW always-on statistics loop started")
     next_poll = time.monotonic()
@@ -2196,6 +2395,13 @@ def _gnss_raw_stats_loop() -> None:
             with _gnss_raw_stats_lock:
                 _gnss_raw_latest_info = dict(info)
                 _gnss_raw_latest_info_monotonic = now
+        with _gnss_raw_stats_lock:
+            _gnss_raw_instrument_ns += (
+                NS_PER_SECOND + (sample if sample is not None else 0.0)
+            )
+            _gnss_raw_instrument_n += 1
+            _gnss_raw_instrument_valid = True
+
         if sample is None:
             _diag["gnss_raw_stats_missing_count"] += 1
         else:
@@ -2214,6 +2420,8 @@ def _gnss_raw_stats_loop() -> None:
                 "drift_ppb": round(float(sample), 6),
                 "n": n,
             }
+
+        _publish_clocks_monitor()
         time.sleep(max(0.0, next_poll - time.monotonic()))
 
 
@@ -5778,11 +5986,14 @@ def _gnss_raw_clock_snapshot() -> Dict[str, Any]:
         if latest_received is None
         else max(0.0, time.monotonic() - latest_received)
     )
+    monitor_snapshot = _gnss_raw_monitor_snapshot()
     return {
         "owner": "PI",
         "clock": "GNSS_RAW",
         "always_on_statistics": True,
         "clockface_campaign_relative": True,
+        "instrument": monitor_snapshot.get("instrument", {}),
+        "presentation": monitor_snapshot.get("presentation", {}),
         "valid": bool(_gnss_raw_valid),
         "ns": raw_ns,
         "ref_ns": ref_ns,
@@ -7095,6 +7306,8 @@ def cmd_set_baseline(args: Optional[dict]) -> Dict[str, Any]:
         logging.exception("❌ [clocks] failed to persist baseline to config")
         return {"success": False, "message": "Failed to persist baseline to config"}
 
+    _clocks_monitor_set_baseline_cache(baseline_blob)
+
     logging.info(
         "✅ [clocks] baseline set: id=%d campaign='%s' ppb=%s dac_mean=%s",
         baseline_id, row["campaign"], baseline_ppb, baseline_dac_mean,
@@ -8282,7 +8495,8 @@ def run() -> None:
         "START while active performs seamless flash-cut to new campaign. "
         "Commands: START, STOP, RESUME, RECOVER_ABORT, REPORT, REPORT_CLOCKS, REPORT_STATS, STATS_RESET, CLEAR, DELETE, TRUNCATE, SET_DAC, DITHER, GATE_MODE, "
         "SET_BASELINE, BASELINE_INFO, LIST_CAMPAIGNS, CLOCKS_INFO. "
-        "Subscriptions: MONITOR, TIMEBASE_FRAGMENT, WATCHDOG_ANOMALY, CLOCKS_RECOVERY_STALLED."
+        "Subscriptions: MONITOR, TIMEBASE_FRAGMENT, WATCHDOG_ANOMALY, CLOCKS_RECOVERY_STALLED. "
+        "Publications: TIMEBASE, CLOCKS_MONITOR."
     )
 
     # Start command + pubsub servers first, but hold off on active work.

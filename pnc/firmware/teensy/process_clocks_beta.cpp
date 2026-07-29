@@ -438,6 +438,25 @@ static Payload g_report_child_maturity DMAMEM;
 static Payload g_report_child_admission DMAMEM;
 static Payload g_report_child_dac DMAMEM;
 
+// Dedicated MONITOR scratch.  The 1 Hz side rail must never borrow the command
+// report Payload headers or the campaign TIMEBASE candidate scratch.
+static clocks_instrument_stats_snapshot_t
+    g_beta_monitor_instrument_stats DMAMEM = {};
+static clocks_static_prediction_snapshot_t
+    g_beta_monitor_pps_prediction DMAMEM = {};
+static clocks_static_prediction_snapshot_t
+    g_beta_monitor_vclock_prediction DMAMEM = {};
+static clocks_static_prediction_snapshot_t
+    g_beta_monitor_ocxo1_prediction DMAMEM = {};
+static clocks_static_prediction_snapshot_t
+    g_beta_monitor_ocxo2_prediction DMAMEM = {};
+static clocks_alpha_lane_forensics_t
+    g_beta_monitor_vclock_forensics DMAMEM = {};
+static clocks_alpha_lane_forensics_t
+    g_beta_monitor_ocxo1_forensics DMAMEM = {};
+static clocks_alpha_lane_forensics_t
+    g_beta_monitor_ocxo2_forensics DMAMEM = {};
+
 static inline uint32_t clocks_report_irq_save(void) {
   uint32_t prior_basepri = 0U;
   __asm__ volatile ("mrs %0, basepri" : "=r" (prior_basepri) :: "memory");
@@ -6081,6 +6100,305 @@ static FLASHMEM void payload_add_servo_dac_values(Payload& parent) {
   dac.add("ocxo2_hw_code", (uint32_t)ocxo2_dac.dac_hw_code);
 
   parent.add_object("dac", dac);
+}
+
+
+static bool clocks_monitor_interval_plausible(uint32_t cycles) {
+  return cycles >= CLOCKS_DELTA_RAW_INTERVAL_MIN_CYCLES &&
+         cycles <= CLOCKS_DELTA_RAW_INTERVAL_MAX_CYCLES &&
+         cycles != CLOCKS_DELTA_RAW_INTERVAL_SENTINEL_U32;
+}
+
+static double clocks_monitor_fast_residual_ns_exact(
+    uint32_t reference_cycles,
+    uint32_t clock_cycles) {
+  if (!clocks_monitor_interval_plausible(reference_cycles) ||
+      !clocks_monitor_interval_plausible(clock_cycles)) {
+    return 0.0;
+  }
+  return ((double)((int64_t)reference_cycles - (int64_t)clock_cycles) *
+          (double)CLOCKS_BETA_NS_PER_SECOND) /
+         (double)reference_cycles;
+}
+
+static int64_t clocks_monitor_round_i64(double value) {
+  return value >= 0.0
+      ? (int64_t)(value + 0.5)
+      : (int64_t)(value - 0.5);
+}
+
+static void payload_add_monitor_residual(Payload& parent,
+                                         const char* key,
+                                         uint32_t reference_cycles,
+                                         uint32_t clock_cycles) {
+  const bool valid =
+      clocks_monitor_interval_plausible(reference_cycles) &&
+      clocks_monitor_interval_plausible(clock_cycles);
+  const int64_t fast_cycles = valid
+      ? (int64_t)reference_cycles - (int64_t)clock_cycles
+      : 0LL;
+  const double fast_ns_exact = valid
+      ? clocks_monitor_fast_residual_ns_exact(reference_cycles, clock_cycles)
+      : 0.0;
+  const int64_t fast_ns = valid
+      ? clocks_monitor_round_i64(fast_ns_exact)
+      : 0LL;
+  const int64_t clock_interval_ns =
+      (int64_t)CLOCKS_BETA_NS_PER_SECOND - fast_ns;
+
+  Payload residual;
+  residual.add("valid", valid);
+  residual.add("science_worthy", valid);
+  residual.add("antecedents_complete", valid);
+  residual.add("gnss_interval_ns",
+               valid ? CLOCKS_BETA_NS_PER_SECOND : 0ULL);
+  residual.add("clock_interval_ns",
+               valid && clock_interval_ns > 0
+                   ? (uint64_t)clock_interval_ns
+                   : 0ULL);
+  residual.add("fast_residual_ns", fast_ns);
+  residual.add("fast_residual_ns_exact",
+               toFixedDecimal(fast_ns_exact, 6));
+  residual.add("delta_raw_valid", valid);
+  residual.add("delta_raw_reference_interval_cycles", reference_cycles);
+  residual.add("delta_raw_clock_interval_cycles", clock_cycles);
+  residual.add("delta_raw_fast_residual_cycles", fast_cycles);
+  residual.add("delta_raw_fast_residual_ns", fast_ns);
+  residual.add("delta_raw_fast_residual_ns_exact",
+               toFixedDecimal(fast_ns_exact, 6));
+  parent.add_object(key, residual);
+}
+
+static void payload_add_monitor_ocxo_lane(
+    Payload& parent,
+    const char* key,
+    uint64_t ns,
+    uint32_t reference_cycles,
+    uint32_t clock_cycles,
+    bool clockface_valid) {
+  Payload lane;
+  lane.add("ns", ns);
+  lane.add("clockface_valid", clockface_valid);
+  payload_add_monitor_residual(
+      lane, "science", reference_cycles, clock_cycles);
+  parent.add_object(key, lane);
+}
+
+static void payload_add_monitor_vclock(
+    Payload& parent,
+    uint64_t ns,
+    uint32_t reference_cycles,
+    uint32_t clock_cycles) {
+  Payload lane;
+  lane.add("ns", ns);
+  payload_add_monitor_residual(
+      lane, "pps_residual", reference_cycles, clock_cycles);
+  parent.add_object("vclock", lane);
+}
+
+static void clocks_monitor_refresh_prediction_snapshots(void) {
+  g_beta_monitor_pps_prediction = prediction_snapshot_for_pps();
+  g_beta_monitor_vclock_prediction =
+      prediction_snapshot_for_clock(time_clock_id_t::VCLOCK);
+  g_beta_monitor_ocxo1_prediction =
+      prediction_snapshot_for_clock(time_clock_id_t::OCXO1);
+  g_beta_monitor_ocxo2_prediction =
+      prediction_snapshot_for_clock(time_clock_id_t::OCXO2);
+
+  g_beta_monitor_vclock_forensics = clocks_alpha_lane_forensics_t{};
+  g_beta_monitor_ocxo1_forensics = clocks_alpha_lane_forensics_t{};
+  g_beta_monitor_ocxo2_forensics = clocks_alpha_lane_forensics_t{};
+  (void)clocks_alpha_lane_forensics(
+      time_clock_id_t::VCLOCK, &g_beta_monitor_vclock_forensics);
+  (void)clocks_alpha_lane_forensics(
+      time_clock_id_t::OCXO1, &g_beta_monitor_ocxo1_forensics);
+  (void)clocks_alpha_lane_forensics(
+      time_clock_id_t::OCXO2, &g_beta_monitor_ocxo2_forensics);
+}
+
+static void payload_add_monitor_raw_cycles(Payload& parent) {
+  clocks_monitor_refresh_prediction_snapshots();
+
+  Payload raw;
+  payload_add_raw_cycles_lane(
+      raw,
+      "pps",
+      g_beta_monitor_pps_prediction,
+      g_pps_witness_diag.interrupt_delay);
+  payload_add_raw_cycles_lane(
+      raw,
+      "vclock",
+      g_beta_monitor_vclock_prediction,
+      g_beta_monitor_vclock_forensics.interrupt_delay);
+  payload_add_raw_cycles_lane(
+      raw,
+      "ocxo1",
+      g_beta_monitor_ocxo1_prediction,
+      g_beta_monitor_ocxo1_forensics.interrupt_delay);
+  payload_add_raw_cycles_lane(
+      raw,
+      "ocxo2",
+      g_beta_monitor_ocxo2_prediction,
+      g_beta_monitor_ocxo2_forensics.interrupt_delay);
+  parent.add_object("raw_cycles", raw);
+}
+
+static void payload_add_monitor_dither_lane(
+    Payload& parent,
+    const char* key,
+    const ocxo_dac_state_t& dac) {
+  Payload lane;
+  lane.add("value", toFixedDecimal(dac.dac_fractional, 6));
+  lane.add("dac", toFixedDecimal(dac.dac_fractional, 6));
+  lane.add("hw_code", (uint32_t)dac.dac_hw_code);
+
+  Payload dither;
+  dither.add("enabled", clocks_ocxo_dac_dither_operator_enabled());
+  dither.add("active", dac.dither_active_this_frame);
+  dither.add("low_code", (uint32_t)dac.dither_low_code);
+  dither.add("high_code", (uint32_t)dac.dither_high_code);
+  dither.add("high_ms", (uint32_t)dac.dither_high_ms);
+  dither.add("phase_high", dac.dither_current_phase_high);
+  lane.add_object("dither", dither);
+
+  parent.add_object(key, lane);
+}
+
+static void payload_add_monitor_dac(Payload& parent) {
+  Payload dac;
+  dac.add("schema", "CLOCKS_LIVE_DAC_V1");
+  dac.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
+  dac.add("servo_mode", servo_mode_str(calibrate_ocxo_mode));
+  dac.add("servo_active", clocks_servo_active());
+  dac.add("realization_mode", ocxo_dac_realization_mode_runtime());
+  dac.add("dither_operator_enabled", clocks_ocxo_dac_dither_operator_enabled());
+  dac.add("ocxo1_dac", toFixedDecimal(ocxo1_dac.dac_fractional, 6));
+  dac.add("ocxo2_dac", toFixedDecimal(ocxo2_dac.dac_fractional, 6));
+  dac.add("ocxo1_hw_code", (uint32_t)ocxo1_dac.dac_hw_code);
+  dac.add("ocxo2_hw_code", (uint32_t)ocxo2_dac.dac_hw_code);
+  payload_add_monitor_dither_lane(dac, "ocxo1", ocxo1_dac);
+  payload_add_monitor_dither_lane(dac, "ocxo2", ocxo2_dac);
+  parent.add_object("dac", dac);
+}
+
+FLASHMEM Payload clocks_monitor_payload(void) {
+  g_beta_monitor_instrument_stats =
+      clocks_instrument_stats_snapshot_t{};
+  const bool snapshot_ok = clocks_alpha_instrument_stats_snapshot(
+      &g_beta_monitor_instrument_stats);
+  const clocks_instrument_stats_snapshot_t& instrument =
+      g_beta_monitor_instrument_stats;
+
+  const bool campaign_bound =
+      campaign_state != clocks_campaign_state_t::STOPPED &&
+      campaign_name[0] != '\0';
+  const bool campaign_presentation_ready =
+      campaign_bound && campaign_seconds > 0ULL;
+
+  const uint64_t presentation_gnss_ns = campaign_presentation_ready
+      ? campaign_public_from_offset(
+            instrument.gnss_ns, g_campaign_public_gnss_offset)
+      : instrument.gnss_ns;
+  const uint64_t presentation_dwt_cycles = campaign_presentation_ready
+      ? campaign_public_from_offset(
+            instrument.dwt_cycles, g_campaign_public_dwt_offset)
+      : instrument.dwt_cycles;
+  const uint64_t presentation_ocxo1_ns = campaign_presentation_ready
+      ? campaign_public_from_offset(
+            instrument.ocxo1_ns, g_campaign_public_ocxo1_offset)
+      : instrument.ocxo1_ns;
+  const uint64_t presentation_ocxo2_ns = campaign_presentation_ready
+      ? campaign_public_from_offset(
+            instrument.ocxo2_ns, g_campaign_public_ocxo2_offset)
+      : instrument.ocxo2_ns;
+  const uint32_t presentation_count =
+      (uint32_t)(presentation_gnss_ns / CLOCKS_BETA_NS_PER_SECOND);
+
+  Payload p;
+  p.add("schema", "CLOCKS_LIVE_TEENSY_V1");
+  p.add("instrument_always_on", true);
+  p.add("instrument_owner", "ALPHA");
+  p.add("snapshot_ok", snapshot_ok);
+  p.add("valid", instrument.valid);
+  p.add("completed_row_coherent", instrument.completed_row_coherent);
+  p.add("completed_pps_sequence", instrument.last_pps_sequence);
+  p.add("instrument_age_seconds",
+        (uint32_t)(instrument.gnss_ns / CLOCKS_BETA_NS_PER_SECOND));
+  p.add("campaign_state", clocks_campaign_state_name(campaign_state));
+  p.add("recording", campaign_state == clocks_campaign_state_t::STARTED);
+  p.add("campaign_present", campaign_bound);
+  if (campaign_bound) p.add("campaign", campaign_name);
+  p.add("last_campaign", campaign_name);
+  p.add("campaign_seconds", campaign_seconds);
+  p.add("campaign_presentation_ready", campaign_presentation_ready);
+  p.add("presentation_mode",
+        campaign_presentation_ready
+            ? "CAMPAIGN"
+            : (campaign_bound ? "CAMPAIGN_ARMING" : "INSTRUMENT"));
+  p.add("presentation_basis",
+        campaign_presentation_ready
+            ? "CAMPAIGN_RELATIVE"
+            : "ALPHA_SERVICE_EPOCH");
+  p.add("presentation_clockfaces_zeroed", campaign_presentation_ready);
+  p.add("teensy_pps_vclock_count", presentation_count);
+  p.add("gnss_ns", presentation_gnss_ns);
+  p.add("servo_mode", servo_mode_str(calibrate_ocxo_mode));
+  p.add("timeline_valid",
+        instrument.valid && presentation_gnss_ns != 0ULL &&
+        presentation_dwt_cycles != 0ULL);
+  p.add("ocxo_clockface_valid",
+        instrument.valid &&
+        presentation_ocxo1_ns != 0ULL &&
+        presentation_ocxo2_ns != 0ULL);
+
+  Payload instrument_identity;
+  instrument_identity.add("gnss_ns", instrument.gnss_ns);
+  instrument_identity.add("dwt_cycles", instrument.dwt_cycles);
+  instrument_identity.add("ocxo1_ns", instrument.ocxo1_ns);
+  instrument_identity.add("ocxo2_ns", instrument.ocxo2_ns);
+  instrument_identity.add("pps_sequence", instrument.last_pps_sequence);
+  p.add_object("instrument_clockfaces", instrument_identity);
+
+  Payload gnss;
+  gnss.add("ns", presentation_gnss_ns);
+  gnss.add("clock_interval_ns", CLOCKS_BETA_NS_PER_SECOND);
+  gnss.add("second_residual_ns", 0LL);
+  p.add_object("gnss", gnss);
+
+  payload_add_monitor_vclock(
+      p,
+      presentation_gnss_ns,
+      instrument.selected_reference_interval_cycles,
+      instrument.vclock_interval_cycles);
+
+  Payload dwt;
+  dwt.add("cycle_count_total", presentation_dwt_cycles);
+  dwt.add("cycles_between_pps_vclock",
+          instrument.dwt_cycles_per_second);
+  dwt.add("at_pps_vclock", instrument.dwt_at_pps_vclock);
+  dwt.add("counter32_at_pps_vclock",
+          instrument.counter32_at_pps_vclock);
+  p.add_object("dwt", dwt);
+
+  payload_add_monitor_ocxo_lane(
+      p,
+      "ocxo1",
+      presentation_ocxo1_ns,
+      instrument.selected_reference_interval_cycles,
+      instrument.ocxo1_interval_cycles,
+      instrument.valid && presentation_ocxo1_ns != 0ULL);
+  payload_add_monitor_ocxo_lane(
+      p,
+      "ocxo2",
+      presentation_ocxo2_ns,
+      instrument.selected_reference_interval_cycles,
+      instrument.ocxo2_interval_cycles,
+      instrument.valid && presentation_ocxo2_ns != 0ULL);
+
+  payload_add_monitor_raw_cycles(p);
+  payload_add_stats_summary_from_snapshot(p, instrument);
+  payload_add_monitor_dac(p);
+  return p;
 }
 
 // ----------------------------------------------------------------------------
