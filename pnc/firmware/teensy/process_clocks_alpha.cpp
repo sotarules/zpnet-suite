@@ -2654,13 +2654,25 @@ static const alpha_tau_estimator_t* alpha_tau_store(time_clock_id_t clock) {
 static void alpha_tau_reset_lane(alpha_tau_estimator_t& s,
                                  time_clock_id_t clock) {
   const uint32_t prior_reset_count = s.reset_count;
-  s.seq++;
+
+  // Preserve the seqlock generation outside the aggregate reset.  Assigning
+  // alpha_tau_estimator_t{} also resets seq to zero; the old code then
+  // incremented it once and permanently published an odd (writer-owned)
+  // generation.  Every snapshot consequently failed even while interval
+  // updates and Welfords continued normally.
+  uint32_t reset_seq = s.seq;
+  if (reset_seq & 1U) reset_seq++;
+  s.seq = reset_seq + 1U;
   clocks_alpha_dmb();
-  s = alpha_tau_estimator_t{};
-  s.clock_id = (uint32_t)((uint8_t)clock);
-  s.reset_count = prior_reset_count + 1U;
+
+  alpha_tau_estimator_t cleared{};
+  cleared.seq = reset_seq + 1U;
+  cleared.clock_id = (uint32_t)((uint8_t)clock);
+  cleared.reset_count = prior_reset_count + 1U;
+  s = cleared;
+
   clocks_alpha_dmb();
-  s.seq++;
+  s.seq = reset_seq + 2U;
 }
 
 static void alpha_tau_reset_all(void) {
