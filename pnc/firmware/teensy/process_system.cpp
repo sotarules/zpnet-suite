@@ -137,10 +137,11 @@ static uint32_t g_system_feature_handler_last_ipsr = 0;
 // --------------------------------------------------------------
 // PPS-aligned MONITOR_FRAGMENT publication custody
 // --------------------------------------------------------------
-// process_interrupt contributes only the completed PPS/VCLOCK sequence.
-// SYSTEM gathers the current non-TIMEBASE operational state later in foreground
-// ALAP service. The former CLOCKS campaign-side tick remains as a compatibility
-// entry point but is ignored after the always-on interrupt owner is observed.
+// process_interrupt contributes only the completed PPS/VCLOCK sequence. SYSTEM
+// later takes one typed CLOCKS snapshot in foreground ALAP service and authors the
+// complete MONITOR_FRAGMENT, including optional campaign facts. The former CLOCKS
+// campaign-side tick remains as a compatibility entry point but is ignored after
+// the always-on interrupt owner is observed.
 static volatile uint32_t g_system_monitor_pending_sequence = 0U;
 static volatile bool g_system_monitor_pending = false;
 static volatile bool g_system_monitor_service_armed = false;
@@ -156,6 +157,10 @@ static uint32_t g_system_monitor_last_tick_sequence = 0U;
 static bool g_system_monitor_cpu_window_initialized = false;
 static uint64_t g_system_monitor_cpu_last_wall_cycles = 0U;
 static uint64_t g_system_monitor_cpu_last_idle_cycles = 0U;
+
+// The CLOCKS handoff is intentionally large and must never become a foreground
+// stack local. SYSTEM owns this RAM2 snapshot and all serialization derived from it.
+static clocks_monitor_snapshot_t g_system_monitor_clocks_snapshot DMAMEM = {};
 
 static void system_monitor_schedule_publish(void);
 
@@ -228,6 +233,17 @@ static bool system_feature_publicly_visible(
     const system_feature_slot_t& slot) {
   return !(system_cstr_equal(slot.subsystem, "INTERRUPT") &&
            system_cstr_equal(slot.feature, "QTIMER_DWT_RULER"));
+}
+
+static const char* system_feature_public_name(
+    const system_feature_slot_t& slot) {
+  // CLOCKS speaks in domain terms. SYSTEM retains the established wire spelling
+  // so Pi readiness policy remains unchanged during this ownership migration.
+  if (system_cstr_equal(slot.subsystem, "CLOCKS") &&
+      system_cstr_equal(slot.feature, "CAMPAIGN_RECORD_HANDOFF")) {
+    return "TIMEBASE_PUBLICATION";
+  }
+  return slot.feature;
 }
 
 const char* system_feature_status_str(system_feature_status_t status) {
@@ -400,7 +416,7 @@ static FLASHMEM Payload system_features_tree_payload(void) {
       if (!system_cstr_equal(g_system_features[k].subsystem, subsystem)) continue;
 
       subsystem_payload.add(
-        g_system_features[k].feature,
+        system_feature_public_name(g_system_features[k]),
         system_feature_status_str(g_system_features[k].status)
       );
     }
@@ -3313,13 +3329,13 @@ static FLASHMEM Payload cmd_payload_info(const Payload& /*args*/) {
 
 
 // ============================================================================
-// MONITOR_FRAGMENT — compact non-TIMEBASE operational status
+// MONITOR_FRAGMENT — canonical Teensy observation
 // ============================================================================
 //
-// This publication contains the union of Teensy operational fields consumed by
-// Dashboard/Metrics.  CLOCKS contributes a compact live view built directly
-// from Alpha's latest coherent completed row.  It is observational telemetry:
-// no TIMEBASE candidate is parsed, copied, manufactured, or persisted here.
+// SYSTEM owns the complete wire shape consumed by Dashboard/Metrics and Pi CLOCKS.
+// CLOCKS contributes only typed facts from its latest coherent completed row and,
+// when recording, an optional completed campaign observation. SYSTEM renders both
+// the always-on clocks view and the compatibility campaign_row from that snapshot.
 
 static Payload system_monitor_teensy_payload(void) {
   Payload p;
@@ -3474,31 +3490,541 @@ static Payload system_monitor_payload_payload(void) {
   return p;
 }
 
+// ============================================================================
+// SYSTEM-owned CLOCKS serialization
+// ============================================================================
+//
+// CLOCKS supplies immutable domain facts. These helpers are the sole authority
+// for the CLOCKS and campaign_row shapes carried by MONITOR_FRAGMENT.
+
+static constexpr uint64_t SYSTEM_MONITOR_NS_PER_SECOND = 1000000000ULL;
+static constexpr uint32_t SYSTEM_MONITOR_INTERVAL_MIN_CYCLES = 900000000UL;
+static constexpr uint32_t SYSTEM_MONITOR_INTERVAL_MAX_CYCLES = 1100000000UL;
+static constexpr uint32_t SYSTEM_MONITOR_INTERVAL_SENTINEL = 0xFFFFFFFFUL;
+
+static void system_monitor_add_welford(
+    Payload& parent,
+    const char* key,
+    const clocks_monitor_welford_snapshot_t& sample) {
+  Payload value;
+  value.add("n", sample.n);
+  value.add("mean", toFixedDecimal(sample.mean, 6));
+  value.add("stddev", toFixedDecimal(sample.stddev, 6));
+  value.add("stderr", toFixedDecimal(sample.stderr_value, 6));
+  value.add("min", toFixedDecimal(sample.min, 6));
+  value.add("max", toFixedDecimal(sample.max, 6));
+  parent.add_object(key, value);
+}
+
+static void system_monitor_add_stats_clock(
+    Payload& parent,
+    const char* key,
+    const clocks_monitor_stats_clock_snapshot_t& clock) {
+  Payload value;
+  system_monitor_add_welford(value, "welford", clock.welford);
+  if (clock.frequency_present) {
+    value.add("tau", toFixedDecimal(clock.tau, 12));
+    value.add("ppb", toFixedDecimal(clock.ppb, 3));
+  }
+  parent.add_object(key, value);
+}
+
+static void system_monitor_add_stats(
+    Payload& parent,
+    const clocks_monitor_stats_snapshot_t& snapshot) {
+  Payload stats;
+  stats.add("schema", "CLOCKS_INSTRUMENT_STATS_V1");
+  stats.add("always_on", true);
+  stats.add("owner", "ALPHA");
+  stats.add("lifetime", "BOOT_TO_REBOOT_OR_STATS_RESET");
+  stats.add("valid", snapshot.valid);
+  stats.add("reset_count", snapshot.reset_count);
+  stats.add("update_count", snapshot.update_count);
+  stats.add("last_pps_sequence", snapshot.last_pps_sequence);
+  stats.add("completed_row_coherent", snapshot.completed_row_coherent);
+
+  system_monitor_add_stats_clock(stats, "gnss", snapshot.gnss);
+  system_monitor_add_stats_clock(stats, "dwt", snapshot.dwt);
+  system_monitor_add_stats_clock(stats, "vclock", snapshot.vclock);
+  system_monitor_add_stats_clock(stats, "ocxo1", snapshot.ocxo1);
+  system_monitor_add_stats_clock(stats, "ocxo2", snapshot.ocxo2);
+  system_monitor_add_stats_clock(stats, "pps_witness", snapshot.pps_witness);
+
+  Payload maturity;
+  maturity.add("gnss_samples", snapshot.maturity_gnss_samples);
+  maturity.add("dwt_samples", snapshot.maturity_dwt_samples);
+  maturity.add("vclock_samples", snapshot.maturity_vclock_samples);
+  maturity.add("vclock_intervals", snapshot.maturity_vclock_intervals);
+  maturity.add("ocxo1_samples", snapshot.maturity_ocxo1_samples);
+  maturity.add("ocxo1_intervals", snapshot.maturity_ocxo1_intervals);
+  maturity.add("ocxo1_stderr_ppb",
+               toFixedDecimal(snapshot.maturity_ocxo1_stderr_ppb, 6));
+  maturity.add("ocxo2_samples", snapshot.maturity_ocxo2_samples);
+  maturity.add("ocxo2_intervals", snapshot.maturity_ocxo2_intervals);
+  maturity.add("ocxo2_stderr_ppb",
+               toFixedDecimal(snapshot.maturity_ocxo2_stderr_ppb, 6));
+  stats.add_object("maturity", maturity);
+
+  Payload admission;
+  admission.add("interval_min_cycles", snapshot.interval_min_cycles);
+  admission.add("interval_max_cycles", snapshot.interval_max_cycles);
+  admission.add("vclock_reject_count", snapshot.vclock_reject_count);
+  admission.add("ocxo1_reject_count", snapshot.ocxo1_reject_count);
+  admission.add("ocxo2_reject_count", snapshot.ocxo2_reject_count);
+  stats.add_object("interval_admission", admission);
+
+  Payload dac;
+  system_monitor_add_welford(dac, "ocxo1", snapshot.ocxo1_dac);
+  system_monitor_add_welford(dac, "ocxo2", snapshot.ocxo2_dac);
+  stats.add_object("dac", dac);
+
+  parent.add_object("stats", stats);
+}
+
+static void system_monitor_add_raw_cycles_lane(
+    Payload& parent,
+    const char* key,
+    const clocks_monitor_raw_cycles_lane_t& sample) {
+  Payload lane;
+  lane.add("valid", sample.valid);
+  lane.add("completed_interval_count", sample.completed_interval_count);
+  lane.add("observed_cycles", sample.observed_cycles);
+  lane.add("previous_observed_cycles", sample.previous_observed_cycles);
+  lane.add("residual_cycles", sample.residual_cycles);
+  lane.add("delay_status", sample.delay_status);
+  if (sample.delay_detail_present) {
+    lane.add("delay_by", sample.delay_by);
+    lane.add("residual_delay_valid", sample.residual_delay_valid);
+    lane.add("residual_delay_cycles", sample.residual_delay_cycles);
+    lane.add("residual_delay_by", sample.residual_delay_by);
+    lane.add("delay_explains_residual", sample.delay_explains_residual);
+  }
+  parent.add_object(key, lane);
+}
+
+static void system_monitor_add_raw_cycles(
+    Payload& parent,
+    const clocks_monitor_raw_cycles_snapshot_t& snapshot) {
+  Payload raw;
+  system_monitor_add_raw_cycles_lane(raw, "pps", snapshot.pps);
+  system_monitor_add_raw_cycles_lane(raw, "vclock", snapshot.vclock);
+  system_monitor_add_raw_cycles_lane(raw, "ocxo1", snapshot.ocxo1);
+  system_monitor_add_raw_cycles_lane(raw, "ocxo2", snapshot.ocxo2);
+  parent.add_object("raw_cycles", raw);
+}
+
+static void system_monitor_add_science(
+    Payload& parent,
+    const clocks_monitor_science_snapshot_t& science) {
+  Payload value;
+  value.add("valid", science.valid);
+  value.add("science_worthy", science.science_worthy);
+  value.add("antecedents_complete", science.antecedents_complete);
+  value.add("gnss_interval_ns", science.gnss_interval_ns);
+  value.add("clock_interval_ns", science.clock_interval_ns);
+  value.add("fast_residual_ns", science.fast_residual_ns);
+  value.add("fast_residual_ns_exact",
+            toFixedDecimal(science.fast_residual_ns_exact, 6));
+  value.add("delta_raw_valid", science.delta_raw_valid);
+  value.add("delta_raw_reference_interval_cycles",
+            science.delta_raw_reference_interval_cycles);
+  value.add("delta_raw_clock_interval_cycles",
+            science.delta_raw_clock_interval_cycles);
+  value.add("delta_raw_fast_residual_cycles",
+            science.delta_raw_fast_residual_cycles);
+  parent.add_object("science", value);
+}
+
+static bool system_monitor_interval_plausible(uint32_t cycles) {
+  return cycles >= SYSTEM_MONITOR_INTERVAL_MIN_CYCLES &&
+         cycles <= SYSTEM_MONITOR_INTERVAL_MAX_CYCLES &&
+         cycles != SYSTEM_MONITOR_INTERVAL_SENTINEL;
+}
+
+static double system_monitor_fast_residual_ns_exact(
+    uint32_t reference_cycles,
+    uint32_t clock_cycles) {
+  if (!system_monitor_interval_plausible(reference_cycles) ||
+      !system_monitor_interval_plausible(clock_cycles)) {
+    return 0.0;
+  }
+  return ((double)((int64_t)reference_cycles - (int64_t)clock_cycles) *
+          (double)SYSTEM_MONITOR_NS_PER_SECOND) /
+         (double)reference_cycles;
+}
+
+static int64_t system_monitor_round_i64(double value) {
+  return value >= 0.0
+      ? (int64_t)(value + 0.5)
+      : (int64_t)(value - 0.5);
+}
+
+static void system_monitor_add_live_residual(
+    Payload& parent,
+    const char* key,
+    uint32_t reference_cycles,
+    uint32_t clock_cycles) {
+  const bool valid =
+      system_monitor_interval_plausible(reference_cycles) &&
+      system_monitor_interval_plausible(clock_cycles);
+  const int64_t fast_cycles = valid
+      ? (int64_t)reference_cycles - (int64_t)clock_cycles
+      : 0LL;
+  const double fast_ns_exact = valid
+      ? system_monitor_fast_residual_ns_exact(reference_cycles, clock_cycles)
+      : 0.0;
+  const int64_t fast_ns = valid
+      ? system_monitor_round_i64(fast_ns_exact)
+      : 0LL;
+  const int64_t clock_interval_ns =
+      (int64_t)SYSTEM_MONITOR_NS_PER_SECOND - fast_ns;
+
+  Payload residual;
+  residual.add("valid", valid);
+  residual.add("science_worthy", valid);
+  residual.add("antecedents_complete", valid);
+  residual.add("gnss_interval_ns",
+               valid ? SYSTEM_MONITOR_NS_PER_SECOND : 0ULL);
+  residual.add("clock_interval_ns",
+               valid && clock_interval_ns > 0
+                   ? (uint64_t)clock_interval_ns
+                   : 0ULL);
+  residual.add("fast_residual_ns", fast_ns);
+  residual.add("fast_residual_ns_exact", toFixedDecimal(fast_ns_exact, 6));
+  residual.add("delta_raw_valid", valid);
+  residual.add("delta_raw_reference_interval_cycles", reference_cycles);
+  residual.add("delta_raw_clock_interval_cycles", clock_cycles);
+  residual.add("delta_raw_fast_residual_cycles", fast_cycles);
+  residual.add("delta_raw_fast_residual_ns", fast_ns);
+  residual.add("delta_raw_fast_residual_ns_exact",
+               toFixedDecimal(fast_ns_exact, 6));
+  parent.add_object(key, residual);
+}
+
+static void system_monitor_add_live_dither_lane(
+    Payload& parent,
+    const char* key,
+    const clocks_monitor_dither_lane_t& lane_snapshot,
+    bool dither_operator_enabled) {
+  Payload lane;
+  lane.add("value", toFixedDecimal(lane_snapshot.value, 6));
+  lane.add("dac", toFixedDecimal(lane_snapshot.value, 6));
+  lane.add("hw_code", (uint32_t)lane_snapshot.hw_code);
+
+  Payload dither;
+  dither.add("enabled", dither_operator_enabled);
+  dither.add("active", lane_snapshot.active);
+  dither.add("low_code", (uint32_t)lane_snapshot.low_code);
+  dither.add("high_code", (uint32_t)lane_snapshot.high_code);
+  dither.add("high_ms", (uint32_t)lane_snapshot.high_ms);
+  dither.add("phase_high", lane_snapshot.phase_high);
+  lane.add_object("dither", dither);
+  parent.add_object(key, lane);
+}
+
+static void system_monitor_add_live_dac(
+    Payload& parent,
+    const clocks_monitor_dac_snapshot_t& snapshot) {
+  Payload dac;
+  dac.add("schema", "CLOCKS_LIVE_DAC_V1");
+  dac.add("calibrate_ocxo", snapshot.servo_mode);
+  dac.add("servo_mode", snapshot.servo_mode);
+  dac.add("servo_active", snapshot.servo_active);
+  dac.add("realization_mode", snapshot.realization_mode);
+  dac.add("dither_operator_enabled", snapshot.dither_operator_enabled);
+  dac.add("ocxo1_dac", toFixedDecimal(snapshot.ocxo1.value, 6));
+  dac.add("ocxo2_dac", toFixedDecimal(snapshot.ocxo2.value, 6));
+  dac.add("ocxo1_hw_code", (uint32_t)snapshot.ocxo1.hw_code);
+  dac.add("ocxo2_hw_code", (uint32_t)snapshot.ocxo2.hw_code);
+  system_monitor_add_live_dither_lane(
+      dac, "ocxo1", snapshot.ocxo1, snapshot.dither_operator_enabled);
+  system_monitor_add_live_dither_lane(
+      dac, "ocxo2", snapshot.ocxo2, snapshot.dither_operator_enabled);
+  parent.add_object("dac", dac);
+}
+
+static void system_monitor_add_campaign_dac(
+    Payload& parent,
+    const clocks_monitor_dac_snapshot_t& snapshot) {
+  Payload dac;
+  dac.add("schema", "TIMEBASE_DAC_PERSISTENCE_V2");
+  dac.add("calibrate_ocxo", snapshot.servo_mode);
+  dac.add("servo_mode", snapshot.servo_mode);
+  dac.add("servo_active", snapshot.servo_active);
+  dac.add("realization_mode", snapshot.realization_mode);
+  dac.add("dither_operator_enabled", snapshot.dither_operator_enabled);
+  dac.add("ocxo1_dac", toFixedDecimal(snapshot.ocxo1.value, 6));
+  dac.add("ocxo2_dac", toFixedDecimal(snapshot.ocxo2.value, 6));
+  dac.add("ocxo1_hw_code", (uint32_t)snapshot.ocxo1.hw_code);
+  dac.add("ocxo2_hw_code", (uint32_t)snapshot.ocxo2.hw_code);
+  dac.add("ocxo1_readback_valid", snapshot.ocxo1.readback_valid);
+  dac.add("ocxo2_readback_valid", snapshot.ocxo2.readback_valid);
+  dac.add("ocxo1_readback_code", (uint32_t)snapshot.ocxo1.readback_code);
+  dac.add("ocxo2_readback_code", (uint32_t)snapshot.ocxo2.readback_code);
+  dac.add("servo_request_pending", snapshot.servo_request_pending);
+  dac.add("actuator_service_pending", snapshot.actuator_service_pending);
+  parent.add_object("dac", dac);
+}
+
+static void system_monitor_add_live_vclock(
+    Payload& parent,
+    const clocks_monitor_live_snapshot_t& snapshot) {
+  Payload lane;
+  lane.add("ns", snapshot.presentation_gnss_ns);
+  system_monitor_add_live_residual(
+      lane,
+      "pps_residual",
+      snapshot.selected_reference_interval_cycles,
+      snapshot.vclock_interval_cycles);
+  parent.add_object("vclock", lane);
+}
+
+static void system_monitor_add_live_ocxo(
+    Payload& parent,
+    const char* key,
+    uint64_t ns,
+    bool clockface_valid,
+    uint32_t reference_cycles,
+    uint32_t clock_cycles) {
+  Payload lane;
+  lane.add("ns", ns);
+  lane.add("clockface_valid", clockface_valid);
+  system_monitor_add_live_residual(
+      lane, "science", reference_cycles, clock_cycles);
+  parent.add_object(key, lane);
+}
+
+static Payload system_monitor_clocks_payload(
+    const clocks_monitor_live_snapshot_t& snapshot) {
+  Payload clocks;
+  clocks.add("schema", "CLOCKS_LIVE_TEENSY_V1");
+  clocks.add("instrument_always_on", true);
+  clocks.add("instrument_owner", "ALPHA");
+  clocks.add("snapshot_ok", snapshot.snapshot_ok);
+  clocks.add("valid", snapshot.valid);
+  clocks.add("completed_row_coherent", snapshot.completed_row_coherent);
+  clocks.add("completed_pps_sequence", snapshot.completed_pps_sequence);
+  clocks.add("instrument_age_seconds", snapshot.instrument_age_seconds);
+  clocks.add("campaign_state", snapshot.campaign_state);
+  clocks.add("recording", snapshot.recording);
+  clocks.add("campaign_present", snapshot.campaign_present);
+  if (snapshot.campaign_present) clocks.add("campaign", snapshot.campaign);
+  clocks.add("last_campaign", snapshot.last_campaign);
+  clocks.add("campaign_seconds", snapshot.campaign_seconds);
+  clocks.add("campaign_presentation_ready",
+             snapshot.campaign_presentation_ready);
+  clocks.add("presentation_mode", snapshot.presentation_mode);
+  clocks.add("presentation_basis", snapshot.presentation_basis);
+  clocks.add("presentation_clockfaces_zeroed",
+             snapshot.presentation_clockfaces_zeroed);
+  clocks.add("teensy_pps_vclock_count", snapshot.presentation_count);
+  clocks.add("gnss_ns", snapshot.presentation_gnss_ns);
+  clocks.add("servo_mode", snapshot.dac.servo_mode);
+  clocks.add("servo_request_pending", snapshot.dac.servo_request_pending);
+  clocks.add("actuator_service_pending", snapshot.dac.actuator_service_pending);
+  clocks.add("timeline_valid", snapshot.timeline_valid);
+  clocks.add("ocxo_clockface_valid", snapshot.ocxo_clockface_valid);
+
+  Payload instrument;
+  instrument.add("gnss_ns", snapshot.instrument_gnss_ns);
+  instrument.add("dwt_cycles", snapshot.instrument_dwt_cycles);
+  instrument.add("ocxo1_ns", snapshot.instrument_ocxo1_ns);
+  instrument.add("ocxo2_ns", snapshot.instrument_ocxo2_ns);
+  instrument.add("pps_sequence", snapshot.instrument_pps_sequence);
+  clocks.add_object("instrument_clockfaces", instrument);
+
+  Payload gnss;
+  gnss.add("ns", snapshot.presentation_gnss_ns);
+  gnss.add("clock_interval_ns", SYSTEM_MONITOR_NS_PER_SECOND);
+  gnss.add("second_residual_ns", 0LL);
+  clocks.add_object("gnss", gnss);
+
+  system_monitor_add_live_vclock(clocks, snapshot);
+
+  Payload dwt;
+  dwt.add("cycle_count_total", snapshot.presentation_dwt_cycles);
+  dwt.add("cycles_between_pps_vclock", snapshot.dwt_cycles_per_second);
+  dwt.add("at_pps_vclock", snapshot.dwt_at_pps_vclock);
+  dwt.add("counter32_at_pps_vclock", snapshot.counter32_at_pps_vclock);
+  clocks.add_object("dwt", dwt);
+
+  system_monitor_add_live_ocxo(
+      clocks,
+      "ocxo1",
+      snapshot.presentation_ocxo1_ns,
+      snapshot.valid && snapshot.presentation_ocxo1_ns != 0ULL,
+      snapshot.selected_reference_interval_cycles,
+      snapshot.ocxo1_interval_cycles);
+  system_monitor_add_live_ocxo(
+      clocks,
+      "ocxo2",
+      snapshot.presentation_ocxo2_ns,
+      snapshot.valid && snapshot.presentation_ocxo2_ns != 0ULL,
+      snapshot.selected_reference_interval_cycles,
+      snapshot.ocxo2_interval_cycles);
+
+  system_monitor_add_raw_cycles(clocks, snapshot.raw_cycles);
+  system_monitor_add_stats(clocks, snapshot.stats);
+  system_monitor_add_live_dac(clocks, snapshot.dac);
+  return clocks;
+}
+
+static void system_monitor_add_campaign_ocxo(
+    Payload& parent,
+    const char* key,
+    uint64_t ns,
+    bool clockface_valid,
+    const clocks_monitor_science_snapshot_t& science) {
+  Payload lane;
+  lane.add("ns", ns);
+  lane.add("clockface_valid", clockface_valid);
+  system_monitor_add_science(lane, science);
+  parent.add_object(key, lane);
+}
+
+static Payload system_monitor_campaign_row_payload(
+    const clocks_monitor_campaign_snapshot_t& snapshot) {
+  Payload row;
+  row.add("schema", "TIMEBASE_FRAGMENT_V5");
+  row.add("campaign", snapshot.campaign);
+  row.add("campaign_state", snapshot.campaign_state);
+  row.add("teensy_pps_vclock_count", snapshot.public_count);
+  row.add("gnss_ns", snapshot.gnss_ns);
+  row.add("gate_mode", snapshot.gate_mode);
+  row.add("candidate_disposition", snapshot.disposition);
+  row.add("servo_mode", snapshot.servo_mode);
+  row.add("timeline_valid", snapshot.timeline_valid);
+  row.add("ocxo_clockface_valid", snapshot.ocxo_clockface_valid);
+  row.add("ocxo_science_valid", snapshot.ocxo_science_valid);
+
+  if (snapshot.rejection.present) {
+    row.add("candidate_reason_code", snapshot.rejection.reason_code);
+    row.add("candidate_reason", snapshot.rejection.reason);
+    row.add("candidate_source", snapshot.rejection.source);
+    row.add("candidate_lane", snapshot.rejection.lane);
+    row.add("candidate_detail0", snapshot.rejection.detail0);
+    row.add("candidate_detail1", snapshot.rejection.detail1);
+    row.add("candidate_detail2", snapshot.rejection.detail2);
+    row.add("candidate_detail3", snapshot.rejection.detail3);
+    row.add("candidate_reject_mask", snapshot.rejection.reject_mask);
+  }
+
+  if (snapshot.recovery.present) {
+    row.add("recover_generation", snapshot.recovery.generation);
+    row.add("recover_transition_active",
+            snapshot.recovery.transition_active);
+    row.add("recover_timeline_ready", snapshot.recovery.timeline_ready);
+    row.add("recover_clockface_ready", snapshot.recovery.clockface_ready);
+    row.add("recover_science_ready", snapshot.recovery.science_ready);
+    row.add("recover_ocxo1_clockface_ready",
+            snapshot.recovery.ocxo1_clockface_ready);
+    row.add("recover_ocxo2_clockface_ready",
+            snapshot.recovery.ocxo2_clockface_ready);
+    row.add("recover_ocxo1_science_ready",
+            snapshot.recovery.ocxo1_science_ready);
+    row.add("recover_ocxo2_science_ready",
+            snapshot.recovery.ocxo2_science_ready);
+    row.add("recover_science_quarantine_active",
+            snapshot.recovery.science_quarantine_active);
+    row.add("recover_science_quarantine_remaining",
+            snapshot.recovery.science_quarantine_remaining);
+    row.add("recover_no_progress_rows", snapshot.recovery.no_progress_rows);
+    row.add("recover_last_progress_public_count",
+            snapshot.recovery.last_progress_public_count);
+    row.add("recover_reattach_active", snapshot.recovery.reattach_active);
+    row.add("recover_degraded_active", snapshot.recovery.degraded_active);
+    row.add("recover_degraded_science_hold",
+            snapshot.recovery.degraded_science_hold);
+    row.add("recover_reattach_stalled", snapshot.recovery.reattach_stalled);
+    row.add("recover_reattach_reason", snapshot.recovery.reattach_reason);
+  }
+
+  Payload gnss;
+  gnss.add("ns", snapshot.gnss_ns);
+  row.add_object("gnss", gnss);
+
+  Payload dwt;
+  dwt.add("cycle_count_total", snapshot.dwt_cycle_count_total);
+  dwt.add("cycles_between_pps_vclock",
+          snapshot.dwt_cycles_between_pps_vclock);
+  dwt.add("at_pps_vclock", snapshot.dwt_at_pps_vclock);
+  dwt.add("counter32_at_pps_vclock", snapshot.counter32_at_pps_vclock);
+  row.add_object("dwt", dwt);
+
+  system_monitor_add_raw_cycles(row, snapshot.raw_cycles);
+  system_monitor_add_campaign_ocxo(
+      row,
+      "ocxo1",
+      snapshot.ocxo1_ns,
+      snapshot.ocxo1_clockface_valid,
+      snapshot.ocxo1_science);
+  system_monitor_add_campaign_ocxo(
+      row,
+      "ocxo2",
+      snapshot.ocxo2_ns,
+      snapshot.ocxo2_clockface_valid,
+      snapshot.ocxo2_science);
+  system_monitor_add_stats(row, snapshot.stats);
+  if (snapshot.dac_present) {
+    system_monitor_add_campaign_dac(row, snapshot.dac);
+  }
+  return row;
+}
+
 static void system_monitor_publish_service(timepop_ctx_t*,
                                            timepop_diag_t*,
                                            void*) {
   g_system_monitor_service_armed = false;
   if (!g_system_monitor_pending) return;
 
+  system_dmamem_ensure_initialized();
   const uint32_t sequence = g_system_monitor_pending_sequence;
   g_system_monitor_pending = false;
+
+  memset(&g_system_monitor_clocks_snapshot, 0,
+         sizeof(g_system_monitor_clocks_snapshot));
+  const bool clocks_snapshot_ok = clocks_monitor_snapshot_take(
+      sequence, &g_system_monitor_clocks_snapshot);
+
+  const bool campaign_row_present = clocks_snapshot_ok &&
+      g_system_monitor_clocks_snapshot.campaign.present &&
+      g_system_monitor_clocks_snapshot.campaign.completed_second_sequence ==
+          sequence;
+
+  // During active recording the interrupt tick can reach SYSTEM before Beta has
+  // completed both OCXO lanes and frozen the matching campaign observation.
+  // Do not publish an observation-only copy carrying the prior coherent row.
+  // Restore custody of this sequence and wait for
+  // system_monitor_campaign_row_ready(), which will arm the single canonical
+  // publication once the exact campaign observation exists.
+  if (clocks_snapshot_ok &&
+      g_system_monitor_clocks_snapshot.live.recording &&
+      !campaign_row_present) {
+    g_system_monitor_pending_sequence = sequence;
+    g_system_monitor_pending = true;
+    memset(&g_system_monitor_clocks_snapshot, 0,
+           sizeof(g_system_monitor_clocks_snapshot));
+    return;
+  }
 
   Payload fragment;
   fragment.add("schema", "MONITOR_FRAGMENT_V2");
   fragment.add("sequence", sequence);
   fragment.add("generated_dwt", ARM_DWT_CYCCNT);
-  fragment.add_object("clocks", clocks_monitor_payload());
+  fragment.add_object(
+      "clocks",
+      system_monitor_clocks_payload(g_system_monitor_clocks_snapshot.live));
   fragment.add_object("teensy", system_monitor_teensy_payload());
   fragment.add_object("process", system_monitor_process_payload());
   fragment.add_object("transport", system_monitor_transport_payload());
   fragment.add_object("payload", system_monitor_payload_payload());
 
-  Payload campaign_row;
-  const bool campaign_row_present =
-      clocks_monitor_campaign_row_take(sequence, &campaign_row);
   fragment.add("campaign_row_present", campaign_row_present);
   if (campaign_row_present) {
-    fragment.add_object("campaign_row", campaign_row);
+    fragment.add_object(
+        "campaign_row",
+        system_monitor_campaign_row_payload(
+            g_system_monitor_clocks_snapshot.campaign));
     g_system_monitor_campaign_rows_embedded++;
   }
 
@@ -3515,6 +4041,8 @@ static void system_monitor_publish_service(timepop_ctx_t*,
   publish("MONITOR_FRAGMENT", fragment);
   g_system_monitor_publish_count++;
   fragment.clear();
+  memset(&g_system_monitor_clocks_snapshot, 0,
+         sizeof(g_system_monitor_clocks_snapshot));
   if (g_system_monitor_pending) system_monitor_schedule_publish();
 }
 
@@ -3561,8 +4089,9 @@ void system_monitor_campaign_row_ready(uint32_t completed_second_sequence) {
   }
 
   // If the canonical interrupt tick is still pending, keep one publication and
-  // let the campaign row ride along. If that sequence already published, arm a
-  // deliberate same-sequence decorated copy rather than losing durable truth.
+  // let the completed campaign observation ride along. If that sequence already
+  // published, arm a deliberate same-sequence decorated copy rather than losing
+  // durable truth.
   if (g_system_monitor_pending &&
       g_system_monitor_pending_sequence == completed_second_sequence) {
     system_monitor_schedule_publish();
@@ -3592,6 +4121,8 @@ static void system_dmamem_ensure_initialized(void) {
   // process_system_register().
   runtime_ledger_boot_latch();
   system_feature_registry_reset();
+  memset(&g_system_monitor_clocks_snapshot, 0,
+         sizeof(g_system_monitor_clocks_snapshot));
   memset(g_system_crash_report_text, 0, sizeof(g_system_crash_report_text));
   memset(g_system_debug_buffer, 0, sizeof(g_system_debug_buffer));
   memset((void*)&g_system_timepop_dispatch_trace_scratch, 0,

@@ -1,10 +1,9 @@
 #pragma once
 
 #include <stdint.h>
+#include <stddef.h>
 #include "process.h"
 #include "time.h"
-
-class Payload;
 
 // ============================================================================
 // CLOCKS — Authoritative Temporal Subsystem (Teensy) — v12
@@ -18,10 +17,10 @@ class Payload;
 //   • Local CLOCKS-owned autonomous startup and explicit ZERO epoch install
 //   • Campaign Flash Cut: hot campaign boundary without Alpha epoch rebase
 //   • PPS/VCLOCK-selected truth capture
-//   • Deferred 1 Hz publication after both post-PPS OCXO edges complete
+//   • Deferred 1 Hz completed-row handoff after both post-PPS OCXO edges complete
 //   • Serialized command reporting: Priority 0 capture remains live while the
-//     Priority 16 TimePop/handoff tier is excluded from re-entering Payload
-//     construction; report and TIMEBASE scratch never overlap
+//     Priority 16 TimePop/handoff tier is excluded from re-entering command
+//     report construction; SYSTEM independently owns MONITOR_FRAGMENT formatting
 //   • Continuous DWT-to-GNSS calibration (campaign-independent)
 //   • Static PPS/GPIO-based one-second prediction audit for VCLOCK and OCXO lanes
 //   • VCLOCK heartbeat and OCXO one-second compare consumption as observed
@@ -43,13 +42,14 @@ class Payload;
 //     codes without updating VOUT, then initializes subscriptions and CLOCKS
 //     state.  Must be called AFTER timepop_init().
 //
-// TIMEBASE row lifecycle:
+// Completed campaign-row lifecycle:
 //
 //   PPS opens one active scientific row.  The first OCXO1 and OCXO2
 //   one-second edges carrying that PPS sequence complete their lanes and
-//   resolve the PhaseLedger suffixes.  Only then may Beta publish.  There is
-//   no TIMEBASE row queue; a later PPS finding the row incomplete is a
-//   structural timing failure, not permission to overwrite or infer data.
+//   resolve the PhaseLedger suffixes.  Only then may Beta expose the immutable
+//   campaign result to SYSTEM.  There is no completed-row queue; a later PPS
+//   finding the row incomplete is a structural timing failure, not permission
+//   to overwrite or infer data.
 //
 // DWT-to-GNSS Calibration:
 //
@@ -144,11 +144,11 @@ bool clocks_gate_mode_forensic(void);
 // -----------------------------------------------------------------------------
 //
 // Once public PPS1 exists, survivable lane-science failures must remain visible
-// as TIMEBASE_FRAGMENT candidates instead of silently stopping the campaign.
+// as completed campaign records instead of silently stopping the campaign.
 // Alpha and process_interrupt report those failures through this tiny latch;
 // Beta consumes the first pending verdict at the next candidate boundary and
-// stamps the fragment SCIENCE_REJECT.  Fundamental PPS/VCLOCK identity, memory,
-// payload, and publication failures continue to use WATCHDOG_ANOMALY.
+// stamps the record SCIENCE_REJECT. Fundamental PPS/VCLOCK identity, memory,
+// handoff, and publication failures continue to use WATCHDOG_ANOMALY.
 
 enum class clocks_science_reject_source_t : uint8_t {
   NONE      = 0,
@@ -292,18 +292,255 @@ bool clocks_alpha_tau_snapshot(time_clock_id_t clock,
 
 
 // -----------------------------------------------------------------------------
-// Always-on MONITOR_FRAGMENT clock view and optional campaign decoration
+// Typed CLOCKS -> SYSTEM MONITOR handoff
 // -----------------------------------------------------------------------------
-// Build one compact, read-only CLOCKS payload from the latest coherent Alpha
-// completed row.  When a campaign is active, the presentation clockfaces are
-// campaign-relative; otherwise they remain Alpha service-epoch relative.
-// Statistics are always Alpha-owned and campaign-neutral.
-Payload clocks_monitor_payload(void);
+//
+// CLOCKS owns measurement, campaign lifecycle, and scientific verdicts. SYSTEM
+// owns the complete MONITOR_FRAGMENT wire schema. The structures below contain
+// immutable domain facts only: no Payload objects, field names, or nested
+// serialized fragments cross the subsystem boundary.
+//
+// clocks_monitor_snapshot_take() always returns the latest coherent live
+// instrument view. If Beta has completed a public campaign record for the
+// requested sequence, that record is copied into campaign and atomically
+// consumed. A later SYSTEM publication therefore cannot accidentally combine
+// campaign facts from different completed seconds.
 
-// Beta retains campaign/science custody and builds the exact legacy
-// TIMEBASE_FRAGMENT_V5 candidate after all START/RECOVER/science courts pass.
-// SYSTEM calls this from its foreground MONITOR publisher to move that candidate
-// into the matching MONITOR_FRAGMENT as ``campaign_row``.  A false return means
-// this completed instrument second has no public campaign row.
-bool clocks_monitor_campaign_row_take(uint32_t completed_second_sequence,
-                                      Payload* out);
+static constexpr size_t CLOCKS_MONITOR_CAMPAIGN_NAME_MAX = 64U;
+static constexpr size_t CLOCKS_MONITOR_STATE_NAME_MAX = 40U;
+static constexpr size_t CLOCKS_MONITOR_REASON_MAX = 64U;
+static constexpr size_t CLOCKS_MONITOR_DELAY_NAME_MAX = 40U;
+
+struct clocks_monitor_welford_snapshot_t {
+  uint64_t n = 0;
+  double mean = 0.0;
+  double stddev = 0.0;
+  double stderr_value = 0.0;
+  double min = 0.0;
+  double max = 0.0;
+};
+
+struct clocks_monitor_stats_clock_snapshot_t {
+  clocks_monitor_welford_snapshot_t welford{};
+  bool frequency_present = false;
+  double tau = 1.0;
+  double ppb = 0.0;
+};
+
+struct clocks_monitor_stats_snapshot_t {
+  bool valid = false;
+  uint32_t reset_count = 0;
+  uint32_t update_count = 0;
+  uint32_t last_pps_sequence = 0;
+  bool completed_row_coherent = false;
+
+  clocks_monitor_stats_clock_snapshot_t gnss{};
+  clocks_monitor_stats_clock_snapshot_t dwt{};
+  clocks_monitor_stats_clock_snapshot_t vclock{};
+  clocks_monitor_stats_clock_snapshot_t ocxo1{};
+  clocks_monitor_stats_clock_snapshot_t ocxo2{};
+  clocks_monitor_stats_clock_snapshot_t pps_witness{};
+
+  uint64_t maturity_gnss_samples = 0;
+  uint64_t maturity_dwt_samples = 0;
+  uint64_t maturity_vclock_samples = 0;
+  uint64_t maturity_vclock_intervals = 0;
+  uint64_t maturity_ocxo1_samples = 0;
+  uint64_t maturity_ocxo1_intervals = 0;
+  double maturity_ocxo1_stderr_ppb = 0.0;
+  uint64_t maturity_ocxo2_samples = 0;
+  uint64_t maturity_ocxo2_intervals = 0;
+  double maturity_ocxo2_stderr_ppb = 0.0;
+
+  uint32_t interval_min_cycles = 0;
+  uint32_t interval_max_cycles = 0;
+  uint32_t vclock_reject_count = 0;
+  uint32_t ocxo1_reject_count = 0;
+  uint32_t ocxo2_reject_count = 0;
+
+  clocks_monitor_welford_snapshot_t ocxo1_dac{};
+  clocks_monitor_welford_snapshot_t ocxo2_dac{};
+};
+
+struct clocks_monitor_raw_cycles_lane_t {
+  bool valid = false;
+  uint32_t completed_interval_count = 0;
+  uint32_t observed_cycles = 0;
+  uint32_t previous_observed_cycles = 0;
+  int32_t residual_cycles = 0;
+
+  char delay_status[CLOCKS_MONITOR_DELAY_NAME_MAX] = {0};
+  bool delay_detail_present = false;
+  char delay_by[CLOCKS_MONITOR_DELAY_NAME_MAX] = {0};
+  bool residual_delay_valid = false;
+  int32_t residual_delay_cycles = 0;
+  char residual_delay_by[CLOCKS_MONITOR_DELAY_NAME_MAX] = {0};
+  bool delay_explains_residual = false;
+};
+
+struct clocks_monitor_raw_cycles_snapshot_t {
+  clocks_monitor_raw_cycles_lane_t pps{};
+  clocks_monitor_raw_cycles_lane_t vclock{};
+  clocks_monitor_raw_cycles_lane_t ocxo1{};
+  clocks_monitor_raw_cycles_lane_t ocxo2{};
+};
+
+struct clocks_monitor_dither_lane_t {
+  double value = 0.0;
+  uint16_t hw_code = 0;
+  bool readback_valid = false;
+  uint16_t readback_code = 0;
+  bool active = false;
+  uint16_t low_code = 0;
+  uint16_t high_code = 0;
+  uint16_t high_ms = 0;
+  bool phase_high = false;
+};
+
+struct clocks_monitor_dac_snapshot_t {
+  char servo_mode[CLOCKS_MONITOR_STATE_NAME_MAX] = {0};
+  bool servo_active = false;
+  char realization_mode[CLOCKS_MONITOR_STATE_NAME_MAX] = {0};
+  bool dither_operator_enabled = false;
+  bool servo_request_pending = false;
+  bool actuator_service_pending = false;
+  clocks_monitor_dither_lane_t ocxo1{};
+  clocks_monitor_dither_lane_t ocxo2{};
+};
+
+struct clocks_monitor_science_snapshot_t {
+  bool valid = false;
+  bool science_worthy = false;
+  bool antecedents_complete = false;
+  uint64_t gnss_interval_ns = 0;
+  uint64_t clock_interval_ns = 0;
+  int64_t fast_residual_ns = 0;
+  double fast_residual_ns_exact = 0.0;
+  bool delta_raw_valid = false;
+  uint32_t delta_raw_reference_interval_cycles = 0;
+  uint32_t delta_raw_clock_interval_cycles = 0;
+  int64_t delta_raw_fast_residual_cycles = 0;
+};
+
+struct clocks_monitor_rejection_snapshot_t {
+  bool present = false;
+  uint32_t reason_code = 0;
+  char reason[CLOCKS_MONITOR_REASON_MAX] = {0};
+  char source[CLOCKS_MONITOR_STATE_NAME_MAX] = {0};
+  uint32_t lane = 0;
+  uint32_t detail0 = 0;
+  uint32_t detail1 = 0;
+  uint32_t detail2 = 0;
+  uint32_t detail3 = 0;
+  uint32_t reject_mask = 0;
+};
+
+struct clocks_monitor_recovery_snapshot_t {
+  bool present = false;
+  uint32_t generation = 0;
+  bool transition_active = false;
+  bool timeline_ready = false;
+  bool clockface_ready = false;
+  bool science_ready = false;
+  bool ocxo1_clockface_ready = false;
+  bool ocxo2_clockface_ready = false;
+  bool ocxo1_science_ready = false;
+  bool ocxo2_science_ready = false;
+  bool science_quarantine_active = false;
+  uint32_t science_quarantine_remaining = 0;
+  uint32_t no_progress_rows = 0;
+  uint32_t last_progress_public_count = 0;
+  bool reattach_active = false;
+  bool degraded_active = false;
+  bool degraded_science_hold = false;
+  bool reattach_stalled = false;
+  char reattach_reason[CLOCKS_MONITOR_REASON_MAX] = {0};
+};
+
+struct clocks_monitor_campaign_snapshot_t {
+  bool present = false;
+  uint32_t completed_second_sequence = 0;
+  char campaign[CLOCKS_MONITOR_CAMPAIGN_NAME_MAX] = {0};
+  char campaign_state[CLOCKS_MONITOR_STATE_NAME_MAX] = {0};
+  uint32_t public_count = 0;
+  uint64_t gnss_ns = 0;
+  char gate_mode[CLOCKS_MONITOR_STATE_NAME_MAX] = {0};
+  char disposition[CLOCKS_MONITOR_STATE_NAME_MAX] = {0};
+  char servo_mode[CLOCKS_MONITOR_STATE_NAME_MAX] = {0};
+  bool timeline_valid = false;
+  bool ocxo_clockface_valid = false;
+  bool ocxo_science_valid = false;
+
+  clocks_monitor_rejection_snapshot_t rejection{};
+  clocks_monitor_recovery_snapshot_t recovery{};
+
+  uint64_t dwt_cycle_count_total = 0;
+  uint32_t dwt_cycles_between_pps_vclock = 0;
+  uint32_t dwt_at_pps_vclock = 0;
+  uint32_t counter32_at_pps_vclock = 0;
+  clocks_monitor_raw_cycles_snapshot_t raw_cycles{};
+
+  uint64_t ocxo1_ns = 0;
+  bool ocxo1_clockface_valid = false;
+  clocks_monitor_science_snapshot_t ocxo1_science{};
+  uint64_t ocxo2_ns = 0;
+  bool ocxo2_clockface_valid = false;
+  clocks_monitor_science_snapshot_t ocxo2_science{};
+
+  clocks_monitor_stats_snapshot_t stats{};
+  bool dac_present = false;
+  clocks_monitor_dac_snapshot_t dac{};
+};
+
+struct clocks_monitor_live_snapshot_t {
+  bool snapshot_ok = false;
+  bool valid = false;
+  bool completed_row_coherent = false;
+  uint32_t completed_pps_sequence = 0;
+  uint32_t instrument_age_seconds = 0;
+
+  char campaign_state[CLOCKS_MONITOR_STATE_NAME_MAX] = {0};
+  bool recording = false;
+  bool campaign_present = false;
+  char campaign[CLOCKS_MONITOR_CAMPAIGN_NAME_MAX] = {0};
+  char last_campaign[CLOCKS_MONITOR_CAMPAIGN_NAME_MAX] = {0};
+  uint64_t campaign_seconds = 0;
+  bool campaign_presentation_ready = false;
+  char presentation_mode[CLOCKS_MONITOR_STATE_NAME_MAX] = {0};
+  char presentation_basis[CLOCKS_MONITOR_STATE_NAME_MAX] = {0};
+  bool presentation_clockfaces_zeroed = false;
+
+  uint32_t presentation_count = 0;
+  uint64_t presentation_gnss_ns = 0;
+  uint64_t presentation_dwt_cycles = 0;
+  uint64_t presentation_ocxo1_ns = 0;
+  uint64_t presentation_ocxo2_ns = 0;
+  bool timeline_valid = false;
+  bool ocxo_clockface_valid = false;
+
+  uint64_t instrument_gnss_ns = 0;
+  uint64_t instrument_dwt_cycles = 0;
+  uint64_t instrument_ocxo1_ns = 0;
+  uint64_t instrument_ocxo2_ns = 0;
+  uint32_t instrument_pps_sequence = 0;
+
+  uint32_t dwt_cycles_per_second = 0;
+  uint32_t dwt_at_pps_vclock = 0;
+  uint32_t counter32_at_pps_vclock = 0;
+  uint32_t selected_reference_interval_cycles = 0;
+  uint32_t vclock_interval_cycles = 0;
+  uint32_t ocxo1_interval_cycles = 0;
+  uint32_t ocxo2_interval_cycles = 0;
+
+  clocks_monitor_raw_cycles_snapshot_t raw_cycles{};
+  clocks_monitor_stats_snapshot_t stats{};
+  clocks_monitor_dac_snapshot_t dac{};
+};
+
+struct clocks_monitor_snapshot_t {
+  clocks_monitor_live_snapshot_t live{};
+  clocks_monitor_campaign_snapshot_t campaign{};
+};
+
+bool clocks_monitor_snapshot_take(uint32_t completed_second_sequence,
+                                  clocks_monitor_snapshot_t* out);

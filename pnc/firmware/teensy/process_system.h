@@ -142,9 +142,9 @@ bool system_feature_is_nominal(const char* subsystem,
 // PPS/VCLOCK second whether or not a CLOCKS campaign is active. It records only
 // the scalar sequence and arms foreground publication.
 //
-// Foreground SYSTEM then adds a compact CLOCKS live view built from Alpha's
-// coherent completed-row snapshot.  This is ephemeral observation state, not a
-// TIMEBASE row and not a second scientific authority.
+// Foreground SYSTEM then takes one typed CLOCKS snapshot and authors the full
+// MONITOR_FRAGMENT wire shape. The always-on clock view is observational; an
+// optional campaign observation is included only for a completed public record.
 void system_monitor_pps_tick_from_interrupt(
     uint32_t completed_second_sequence);
 
@@ -153,9 +153,9 @@ void system_monitor_pps_tick_from_interrupt(
 // has supplied its first tick.
 void system_monitor_pps_tick(uint32_t completed_second_sequence);
 
-// CLOCKS/Beta calls this after it has staged a public campaign row for the
-// completed instrument sequence. Usually the interrupt-owned MONITOR tick is
-// already pending and this merely coalesces into it. If SYSTEM already emitted
-// the observation-only fragment, this deliberately schedules one second copy
-// carrying the campaign decoration so durable truth cannot be lost.
+// CLOCKS/Beta calls this after it has frozen a typed public campaign observation
+// for the completed instrument sequence. Usually the interrupt-owned MONITOR tick
+// is already pending and this merely coalesces into it. If SYSTEM already emitted
+// the observation-only fragment, this deliberately schedules one same-sequence
+// copy carrying the campaign facts so durable truth cannot be lost.
 void system_monitor_campaign_row_ready(uint32_t completed_second_sequence);
