@@ -6474,13 +6474,20 @@ FLASHMEM Payload clocks_monitor_payload(void) {
       ? campaign_public_from_offset(
             instrument.dwt_cycles, g_campaign_public_dwt_offset)
       : instrument.dwt_cycles;
+  // Alpha's coherent instrument snapshot carries the public-origin-normalized
+  // OCXO clockfaces.  The primary campaign OCXO offsets, however, belong to
+  // the raw CounterLedger/PhaseLedger authority used by TIMEBASE.  Applying a
+  // raw-ledger offset to an Alpha-normalized clockface leaks the deliberately
+  // staggered +50 ms / +100 ms physical compare-grid origins into MONITOR at
+  // campaign START.  Use the measured/public-normalized offsets for this
+  // presentation species; keep the primary offsets untouched for TIMEBASE.
   const uint64_t presentation_ocxo1_ns = campaign_presentation_ready
       ? campaign_public_from_offset(
-            instrument.ocxo1_ns, g_campaign_public_ocxo1_offset)
+            instrument.ocxo1_ns, g_campaign_public_ocxo1_measured_offset)
       : instrument.ocxo1_ns;
   const uint64_t presentation_ocxo2_ns = campaign_presentation_ready
       ? campaign_public_from_offset(
-            instrument.ocxo2_ns, g_campaign_public_ocxo2_offset)
+            instrument.ocxo2_ns, g_campaign_public_ocxo2_measured_offset)
       : instrument.ocxo2_ns;
   const uint32_t presentation_count =
       (uint32_t)(presentation_gnss_ns / CLOCKS_BETA_NS_PER_SECOND);
