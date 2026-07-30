@@ -1509,6 +1509,18 @@ extern bool g_ad5693r_init_ok;
 struct ocxo_dac_state_t {
   double   dac_fractional;
   uint16_t dac_hw_code;
+
+  // Physical custody acquired at firmware startup by AD5693R register readback.
+  // These fields distinguish observed hardware from desired software intent.
+  bool     hw_readback_valid;
+  uint16_t hw_readback_code;
+  bool     hw_reset_signature;
+  uint32_t hw_readback_count;
+  uint32_t hw_readback_failures;
+  uint32_t hw_adopt_count;
+  uint32_t io_skip_same_code_count;
+  uint8_t  io_last_author_source;
+
   uint32_t dac_min;
   uint32_t dac_max;
 
@@ -1625,6 +1637,11 @@ static constexpr uint8_t SERVO_HOLD_SETTLE_QUARANTINE    = 2;
 static constexpr uint8_t SERVO_HOLD_COMMIT_FAULT_BACKOFF = 3;
 static constexpr uint8_t SERVO_HOLD_SMALL_STATIC_DELTA   = 4;
 
+static constexpr uint8_t OCXO_DAC_AUTHOR_NONE            = 0;
+static constexpr uint8_t OCXO_DAC_AUTHOR_STARTUP_OBSERVED = 1;
+static constexpr uint8_t OCXO_DAC_AUTHOR_EXPLICIT_COMMAND = 2;
+static constexpr uint8_t OCXO_DAC_AUTHOR_SERVO            = 3;
+
 static constexpr uint32_t SERVO_DITHER_OWNER_SETTLE_QUARANTINE_ROWS = 2U;
 static constexpr uint32_t SERVO_DITHER_OWNER_FAILURE_BACKOFF_ROWS    = 3U;
 
@@ -1682,6 +1699,7 @@ void ocxo_dac_request_servo_target(ocxo_dac_state_t& s,
                                    double planned_step,
                                    uint64_t request_second);
 void ocxo_dac_clear_servo_request(ocxo_dac_state_t& s);
+void clocks_ocxo_dac_cancel_all_motion(void);
 double ocxo_dac_fractional_snapshot(const ocxo_dac_state_t& s);
 bool ocxo_dac_write_hw_code(ocxo_dac_state_t& s,
                             uint16_t hw_code,

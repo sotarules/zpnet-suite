@@ -50,7 +50,7 @@ static constexpr uint8_t AD5693R_ADDR_OCXO2 = 0x4C;   // A0 = LOW
 static constexpr uint16_t AD5693R_DAC_MIN = 0;
 static constexpr uint16_t AD5693R_DAC_MAX = 65535;
 
-// Default DAC value at init
+// Midscale safety fallback for explicit recovery only
 static constexpr uint16_t AD5693R_DAC_DEFAULT = 32768;
 
 // Control words.  The active production configuration is internal VREF with
@@ -65,12 +65,13 @@ static constexpr uint16_t AD5693R_CTRL_ACTIVE = AD5693R_CTRL_INTERNAL_VREF_2X;
 // Lifecycle
 // ============================================================================
 
-// Initialize both DACs: configure control registers for internal VREF,
-// 2× gain, normal mode, then write the default value and force an
-// explicit DAC update.
+// Configure both DAC control registers for internal VREF, 2× gain, and normal
+// mode.  This function deliberately does NOT write either input register and
+// does NOT update either analog output.  Firmware restart is not authority to
+// disturb a surviving DAC/OCXO operating point.
 //
 // Wire.begin() must have been called before this.
-// Returns true if both DACs acknowledged all required writes.
+// Returns true if both DACs acknowledged the control-register writes.
 bool ad5693r_init(void);
 
 // ============================================================================

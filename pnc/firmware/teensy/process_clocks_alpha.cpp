@@ -398,13 +398,18 @@ static constexpr bool OCXO_DAC_HARDWARE_TOUCH_ENABLED = true;
 
 static ocxo_dac_state_t make_default_ocxo_dac_state() {
   ocxo_dac_state_t s = {};
-  s.dac_fractional = (double)AD5693R_DAC_DEFAULT;
-  s.dac_hw_code = AD5693R_DAC_DEFAULT;
+  // Until hardware readback succeeds, software owns no claim about VOUT.
+  s.dac_fractional = 0.0;
+  s.dac_hw_code = 0;
+  s.hw_readback_valid = false;
+  s.hw_readback_code = 0;
+  s.hw_reset_signature = false;
+  s.io_last_author_source = OCXO_DAC_AUTHOR_NONE;
   s.dac_min = AD5693R_DAC_MIN;
   s.dac_max = OCXO_DAC_SAFE_MAX_HW_CODE;
   s.io_last_write_ok = true;
-  s.io_last_attempted_hw_code = AD5693R_DAC_DEFAULT;
-  s.io_last_good_hw_code = AD5693R_DAC_DEFAULT;
+  s.io_last_attempted_hw_code = 0;
+  s.io_last_good_hw_code = 0;
   return s;
 }
 
@@ -462,8 +467,8 @@ servo_mode_t servo_mode_parse(const char* s) {
 // is a pure stop/clear operation.  It cancels timers and pending work without
 // writing a final static-rounded code that could perturb the EFC voltage during
 // a science campaign.
-static constexpr bool     OCXO_DAC_DITHER_DEFAULT_ENABLED = false;
-static constexpr bool     OCXO_DAC_DITHER_COMPILED_ENABLED = false;
+static constexpr bool     OCXO_DAC_DITHER_DEFAULT_ENABLED = true;
+static constexpr bool     OCXO_DAC_DITHER_COMPILED_ENABLED = true;
 static constexpr bool     OCXO_DAC_SERVO_REQUESTS_ENABLED = true;
 static constexpr bool     OCXO_DAC_DITHER_DISABLE_STATIC_WRITE_ENABLED = false;
 static constexpr bool     OCXO_DAC_DITHER_ALLOW_HARDWARE_WRITES = true;
@@ -502,6 +507,8 @@ static void ocxo_dac_dither_begin_frame(void);
 static void ocxo_dac_dither_schedule_next_transition(uint16_t after_ms);
 static void ocxo_dac_dither_service_callback(timepop_ctx_t*, timepop_diag_t*, void*);
 static void ocxo_dac_dither_request_service(void);
+static void ocxo_dac_dither_cancel_service(void);
+static void ocxo_dac_dither_clear_pending(ocxo_dac_state_t& s);
 
 // DAC control state has one hardware owner: the dither/actuator layer.
 // Servo/Beta may queue request packets, but only this owner installs targets
@@ -563,6 +570,16 @@ void ocxo_dac_clear_servo_request(ocxo_dac_state_t& s) {
   s.pacing_pending_hw_code = 0;
   s.pacing_pending_since_second = 0;
   ocxo_dac_state_irq_restore(primask);
+}
+
+void clocks_ocxo_dac_cancel_all_motion(void) {
+  // OFF is a terminal actuator state: no queued target and no deferred service
+  // may survive to author VOUT later.
+  ocxo_dac_dither_cancel_service();
+  ocxo_dac_clear_servo_request(ocxo1_dac);
+  ocxo_dac_clear_servo_request(ocxo2_dac);
+  ocxo_dac_dither_clear_pending(ocxo1_dac);
+  ocxo_dac_dither_clear_pending(ocxo2_dac);
 }
 
 static bool ocxo_dac_dither_install_servo_request(ocxo_dac_state_t& s,
@@ -698,6 +715,14 @@ void ocxo_dac_request_servo_target(ocxo_dac_state_t& s,
                                    double value,
                                    double planned_step,
                                    uint64_t request_second) {
+  if (calibrate_ocxo_mode == servo_mode_t::OFF) {
+    ocxo_dac_clear_servo_request(s);
+    ocxo_dac_dither_clear_pending(s);
+    s.servo_last_step = 0.0;
+    s.servo_hold_reason = SERVO_HOLD_NONE;
+    return;
+  }
+
   if (!OCXO_DAC_SERVO_REQUESTS_ENABLED) {
     (void)value;
     (void)planned_step;
@@ -849,6 +874,10 @@ static void ocxo_dac_dither_service_callback(timepop_ctx_t*,
 
   if (!g_ocxo_dac_dither_operator_enabled ||
       !g_ocxo_dac_dither_started) {
+    if (calibrate_ocxo_mode == servo_mode_t::OFF) {
+      clocks_ocxo_dac_cancel_all_motion();
+      return;
+    }
     if (!OCXO_DAC_SERVO_REQUESTS_ENABLED) {
       ocxo_dac_clear_servo_request(ocxo1_dac);
       ocxo_dac_clear_servo_request(ocxo2_dac);
@@ -1288,7 +1317,8 @@ bool ocxo_dac_write_hw_code(ocxo_dac_state_t& s,
     return true;
   }
 
-  if (hw_code == s.dac_hw_code) {
+  if (s.hw_readback_valid && hw_code == s.dac_hw_code) {
+    s.io_skip_same_code_count++;
     s.io_last_write_ok = true;
     s.io_last_failure_stage = 0;
     return true;
@@ -1324,6 +1354,12 @@ bool ocxo_dac_write_hw_code(ocxo_dac_state_t& s,
   }
 
   s.dac_hw_code = hw_code;
+  s.hw_readback_valid = true;
+  s.hw_readback_code = hw_code;
+  s.hw_reset_signature = (hw_code == 0U);
+  s.io_last_author_source = (calibrate_ocxo_mode == servo_mode_t::OFF)
+      ? OCXO_DAC_AUTHOR_EXPLICIT_COMMAND
+      : OCXO_DAC_AUTHOR_SERVO;
   s.io_last_write_ok = true;
   s.io_write_successes++;
   s.io_last_good_hw_code = hw_code;
@@ -9692,19 +9728,43 @@ void process_clocks_init(void) {
   ocxo_dac_predictor_reset(ocxo1_dac);
   ocxo_dac_predictor_reset(ocxo2_dac);
 
-  if (OCXO_DAC_HARDWARE_TOUCH_ENABLED) {
-    (void)ocxo_dac_set(ocxo1_dac, (double)AD5693R_DAC_DEFAULT);
-    (void)ocxo_dac_set(ocxo2_dac, (double)AD5693R_DAC_DEFAULT);
+  if (g_ad5693r_init_ok) {
+    uint16_t observed1 = 0U;
+    uint16_t observed2 = 0U;
+    const bool read1 = ad5693r_read_input_register(
+        AD5693R_ADDR_OCXO1, observed1);
+    const bool read2 = ad5693r_read_input_register(
+        AD5693R_ADDR_OCXO2, observed2);
+
+    auto adopt = [](ocxo_dac_state_t& dac, bool valid, uint16_t code) {
+      if (!valid) {
+        dac.hw_readback_valid = false;
+        dac.hw_readback_failures++;
+        dac.io_last_write_ok = false;
+        dac.io_last_failure_stage = 4;
+        return;
+      }
+      dac.hw_readback_valid = true;
+      dac.hw_readback_code = code;
+      dac.hw_reset_signature = (code == 0U);
+      dac.hw_readback_count++;
+      dac.hw_adopt_count++;
+      dac.dac_hw_code = code;
+      dac.dac_fractional = (double)code;
+      dac.io_last_attempted_hw_code = code;
+      dac.io_last_good_hw_code = code;
+      dac.io_last_author_source = OCXO_DAC_AUTHOR_STARTUP_OBSERVED;
+      dac.io_last_write_ok = true;
+      dac.io_last_failure_stage = 0;
+    };
+
+    adopt(ocxo1_dac, read1, observed1);
+    adopt(ocxo2_dac, read2, observed2);
   } else {
-    // Memory-only startup intent.  Do not touch DAC hardware and do not
-    // report an I/O fault merely because this diagnostic build refuses all
-    // DAC transactions.
-    ocxo1_dac.dac_fractional = (double)AD5693R_DAC_DEFAULT;
-    ocxo2_dac.dac_fractional = (double)AD5693R_DAC_DEFAULT;
-    ocxo1_dac.io_last_write_ok = true;
-    ocxo2_dac.io_last_write_ok = true;
-    ocxo1_dac.io_last_failure_stage = 0;
-    ocxo2_dac.io_last_failure_stage = 0;
+    // Unknown physical custody is reported honestly; initialization never
+    // fabricates a midscale output or claims that one exists.
+    ocxo1_dac.hw_readback_valid = false;
+    ocxo2_dac.hw_readback_valid = false;
   }
 
   if (OCXO_DAC_DITHER_DEFAULT_ENABLED) {

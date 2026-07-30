@@ -532,6 +532,10 @@ _diag: Dict[str, Any] = {
     "startup_control_ready": False,
     "startup_control_busy_rejections": 0,
     "last_startup_control_rejection": {},
+    "dac_boot_reconciliation_count": 0,
+    "dac_boot_restore_count": 0,
+    "dac_boot_hold_count": 0,
+    "last_dac_boot_reconciliation": {},
 
     # TIMEBASE silence / Teensy restart detection
     "timebase_silence_monitor_started": False,
@@ -944,7 +948,7 @@ _gate_mode: str = GATE_MODE_DEFAULT
 _gate_mode_last_teensy_payload: Dict[str, Any] = {}
 
 # The command server is exposed early so PUBSUB can discover subscriptions, but
-# START/RESUME must not race the boot DAC push and active-campaign recovery.
+# START/RESUME must not race the boot DAC reconciliation and active-campaign recovery.
 _startup_control_ready = threading.Event()
 
 # Latest unified operational heartbeat.  CLOCKS consumes MONITOR.features for
@@ -4746,6 +4750,97 @@ def _configured_boot_dacs(cfg: Dict[str, Any]) -> Tuple[Optional[float], Optiona
                 source = "baseline_dac"
 
     return d1, d2, source
+
+
+def _lawful_static_codes(value: float) -> set[int]:
+    """Return integer DAC codes that lawfully represent one persisted target."""
+    clamped = max(0.0, min(65535.0, float(value)))
+    low = int(math.floor(clamped))
+    high = min(65535, low + 1)
+    rounded = int(math.floor(clamped + 0.5))
+    return {low, high, rounded}
+
+
+def _teensy_dac_custody() -> Dict[str, Any]:
+    """Read the Teensy-observed AD5693R custody surface without changing VOUT."""
+    response = send_command(
+        machine="TEENSY",
+        subsystem="CLOCKS",
+        command="DAC_INFO",
+        args={},
+    )
+    if not isinstance(response, dict) or response.get("success") is False:
+        raise RuntimeError(f"Teensy DAC_INFO failed: {response!r}")
+    payload = response.get("payload")
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Teensy DAC_INFO returned no payload: {response!r}")
+    return dict(payload)
+
+
+def _reconcile_boot_dacs(
+    desired1: Optional[float],
+    desired2: Optional[float],
+    source: str,
+) -> Dict[str, Any]:
+    """Restore only positively reset/unsafe DACs; preserve every plausible survivor."""
+    custody = _teensy_dac_custody()
+    set_args: Dict[str, Any] = {}
+    decisions: Dict[str, Any] = {}
+
+    for lane, desired, arg_name in (
+        ("ocxo1", desired1, "set_dac1"),
+        ("ocxo2", desired2, "set_dac2"),
+    ):
+        observed = custody.get(lane) if isinstance(custody.get(lane), dict) else {}
+        valid = observed.get("readback_valid") is True
+        code = _as_int(observed.get("readback_code"))
+        safe_max = _as_int(observed.get("safe_max_hw_code")) or 43253
+
+        decision: Dict[str, Any] = {
+            "desired": desired,
+            "readback_valid": valid,
+            "observed_code": code,
+            "source": source,
+            "action": "PRESERVE",
+        }
+
+        if desired is None:
+            decision["reason"] = "no_persisted_target"
+        elif not valid or code is None:
+            decision["action"] = "HOLD"
+            decision["reason"] = "readback_unavailable"
+        elif code in _lawful_static_codes(desired):
+            decision["reason"] = "already_at_desired_code"
+        elif code == 0 or code > safe_max:
+            decision["action"] = "RESTORE"
+            decision["reason"] = "power_on_or_unsafe_signature"
+            set_args[arg_name] = str(float(desired))
+        else:
+            decision["action"] = "HOLD"
+            decision["reason"] = "plausible_live_code_differs_from_config"
+
+        decisions[lane] = decision
+
+    response: Dict[str, Any] = {}
+    if set_args:
+        response = send_command(
+            machine="TEENSY",
+            subsystem="CLOCKS",
+            command="SET_DAC",
+            args=set_args,
+        )
+        if not isinstance(response, dict) or response.get("success") is False:
+            raise RuntimeError(f"boot DAC restore failed: {response!r}")
+
+    result = {
+        "schema": "PI_DAC_BOOT_RECONCILIATION_V1",
+        "custody": custody,
+        "decisions": decisions,
+        "restore_args": set_args,
+        "response": response,
+    }
+    logging.info("🧤 [clocks] boot DAC reconciliation: %s", result)
+    return result
 
 
 def _normalize_start_args(args: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -8589,16 +8684,16 @@ COMMANDS = {
 
 def startup_teensy_quiet_delay() -> None:
     """
-    Let pubsub discover CLOCKS routes before boot pushes or campaign recovery.
+    Let pubsub discover CLOCKS routes before boot reconciliation or campaign recovery.
     """
     logging.info(
         "⏳ [clocks] waiting %.1fs for pubsub routing and Teensy initialization "
-        "before boot control-state push or campaign recovery",
+        "before boot control-state reconciliation or campaign recovery",
         STARTUP_TEENSY_QUIET_DELAY_S,
     )
     time.sleep(STARTUP_TEENSY_QUIET_DELAY_S)
     logging.info(
-        "✅ [clocks] startup quiet delay complete — boot control-state push "
+        "✅ [clocks] startup quiet delay complete — boot control-state reconciliation "
         "and recovery may begin"
     )
 
@@ -8670,60 +8765,32 @@ def run() -> None:
                 _gate_mode,
             )
 
-        boot_dither = cfg.get("dither")
-        boot_dither_bool = None
-        if isinstance(boot_dither, bool):
-            boot_dither_bool = boot_dither
-        elif isinstance(boot_dither, str):
-            lowered = boot_dither.strip().lower()
-            if lowered in ("true", "1", "yes", "on"):
-                boot_dither_bool = True
-            elif lowered in ("false", "0", "no", "off"):
-                boot_dither_bool = False
-        boot_rate_hz = None
-        try:
-            if cfg.get("dither_rate_hz") is not None:
-                boot_rate_hz = int(cfg.get("dither_rate_hz"))
-        except (TypeError, ValueError):
-            boot_rate_hz = None
-        if boot_dither_bool is not None or boot_rate_hz is not None:
-            try:
-                dither_args: Dict[str, Any] = {}
-                if boot_dither_bool is not None:
-                    dither_args["dither"] = boot_dither_bool
-                else:
-                    dither_args["dither"] = True
-                if boot_rate_hz is not None:
-                    dither_args["rate_hz"] = boot_rate_hz
-                resp = send_command(
-                    machine="TEENSY",
-                    subsystem="CLOCKS",
-                    command="DITHER",
-                    args=dither_args,
-                )
-                logging.info(
-                    "🔧 [clocks] boot dither push: dither=%s rate_hz=%s resp=%s",
-                    boot_dither_bool, boot_rate_hz, resp.get("message", "?"),
-                )
-            except Exception:
-                logging.exception("⚠️ [clocks] boot dither push failed (ignored)")
+        # Dither is an actuator, not harmless configuration.  Never arm it as a
+        # side effect of process startup; an operator command or an active servo
+        # lifecycle must make that physical choice explicitly.
+        if cfg.get("dither") is not None or cfg.get("dither_rate_hz") is not None:
+            logging.info(
+                "🧤 [clocks] preserved boot DAC state; configured dither=%s rate_hz=%s "
+                "was not armed during initialization",
+                cfg.get("dither"), cfg.get("dither_rate_hz"),
+            )
 
         boot_dac1, boot_dac2, boot_dac_source = _configured_boot_dacs(cfg)
-        if boot_dac1 is not None or boot_dac2 is not None:
-            dac_args: Dict[str, Any] = {}
-            if boot_dac1 is not None:
-                dac_args["set_dac1"] = str(float(boot_dac1))
-            if boot_dac2 is not None:
-                dac_args["set_dac2"] = str(float(boot_dac2))
-            resp = send_command(
-                machine="TEENSY", subsystem="CLOCKS", command="SET_DAC", args=dac_args,
-            )
-            logging.info(
-                "🔧 [clocks] boot DAC push (%s): ocxo1=%s ocxo2=%s resp=%s",
-                boot_dac_source, boot_dac1, boot_dac2, resp.get("message", "?"),
-            )
-        else:
-            logging.info("🔧 [clocks] no DAC defaults or baseline DAC values in SYSTEM config — Teensy keeps defaults")
+        reconciliation = _reconcile_boot_dacs(
+            boot_dac1, boot_dac2, boot_dac_source,
+        )
+        _diag["dac_boot_reconciliation_count"] += 1
+        _diag["last_dac_boot_reconciliation"] = reconciliation
+        restore_count = sum(
+            1 for d in reconciliation["decisions"].values()
+            if d.get("action") == "RESTORE"
+        )
+        hold_count = sum(
+            1 for d in reconciliation["decisions"].values()
+            if d.get("action") == "HOLD"
+        )
+        _diag["dac_boot_restore_count"] += restore_count
+        _diag["dac_boot_hold_count"] += hold_count
     except Exception:
         logging.exception("⚠️ [clocks] boot control-state push failed (Teensy keeps defaults)")
 

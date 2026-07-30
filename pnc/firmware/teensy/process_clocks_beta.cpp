@@ -2971,6 +2971,8 @@ static uint32_t               g_servo_mode_commit_count = 0;
 static servo_mode_t           g_servo_mode_last_requested = servo_mode_t::OFF;
 static servo_mode_t           g_servo_mode_last_committed = servo_mode_t::OFF;
 
+static void clocks_apply_servo_mode_now(servo_mode_t mode);
+
 static void clocks_watchdog_disarm_campaign_publication(void) {
   watchdog_campaign_publication_armed = false;
 }
@@ -5606,6 +5608,7 @@ static void clocks_apply_servo_mode_now(servo_mode_t mode) {
 
   if (mode == servo_mode_t::OFF) {
     ocxo_dac_pacing_abort_all();
+    clocks_ocxo_dac_cancel_all_motion();
     ocxo1_dac.servo_last_step = 0.0;
     ocxo2_dac.servo_last_step = 0.0;
   }
@@ -5936,8 +5939,7 @@ static void clocks_force_stop_campaign(void) {
   flash_cut_clear_pending();
   request_servo_mode_change = false;
   requested_servo_mode = servo_mode_t::OFF;
-  calibrate_ocxo_mode = servo_mode_t::OFF;
-  ocxo_dac_pacing_abort_all();
+  clocks_apply_servo_mode_now(servo_mode_t::OFF);
   campaign_warmup_reset();
 }
 
@@ -6098,6 +6100,14 @@ static FLASHMEM void payload_add_servo_dac_values(Payload& parent) {
   dac.add("ocxo2_dac", toFixedDecimal(ocxo2_dac.dac_fractional, 6));
   dac.add("ocxo1_hw_code", (uint32_t)ocxo1_dac.dac_hw_code);
   dac.add("ocxo2_hw_code", (uint32_t)ocxo2_dac.dac_hw_code);
+  dac.add("ocxo1_readback_valid", ocxo1_dac.hw_readback_valid);
+  dac.add("ocxo2_readback_valid", ocxo2_dac.hw_readback_valid);
+  dac.add("ocxo1_readback_code", (uint32_t)ocxo1_dac.hw_readback_code);
+  dac.add("ocxo2_readback_code", (uint32_t)ocxo2_dac.hw_readback_code);
+  dac.add("servo_request_pending",
+          ocxo1_dac.pacing_pending || ocxo2_dac.pacing_pending);
+  dac.add("actuator_service_pending",
+          clocks_ocxo_dac_actuator_service_pending());
 
   parent.add_object("dac", dac);
 }
@@ -6343,6 +6353,10 @@ FLASHMEM Payload clocks_monitor_payload(void) {
   p.add("teensy_pps_vclock_count", presentation_count);
   p.add("gnss_ns", presentation_gnss_ns);
   p.add("servo_mode", servo_mode_str(calibrate_ocxo_mode));
+  p.add("servo_request_pending",
+        ocxo1_dac.pacing_pending || ocxo2_dac.pacing_pending);
+  p.add("actuator_service_pending",
+        clocks_ocxo_dac_actuator_service_pending());
   p.add("timeline_valid",
         instrument.valid && presentation_gnss_ns != 0ULL &&
         presentation_dwt_cycles != 0ULL);
@@ -6438,7 +6452,7 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
     request_stop = false;
     request_zero = false;
     flash_cut_clear_pending();
-    calibrate_ocxo_mode = servo_mode_t::OFF;
+    clocks_apply_servo_mode_now(servo_mode_t::OFF);
     ocxo_dac_pacing_abort_all();
     campaign_warmup_reset();
     publish_dac_tick("STOP_GATE");
@@ -7596,10 +7610,10 @@ static FLASHMEM Payload cmd_flash_cut(const Payload& args) {
   }
 
   if (servo_supplied) {
-    calibrate_ocxo_mode = servo_mode_parse(servo_arg);
+    clocks_apply_servo_mode_now(servo_mode_parse(servo_arg));
   }
   if (!dac1_ok || !dac2_ok) {
-    calibrate_ocxo_mode = servo_mode_t::OFF;
+    clocks_apply_servo_mode_now(servo_mode_t::OFF);
   }
 
   safeCopy(g_flash_cut_last_requested_campaign,
@@ -7695,8 +7709,11 @@ static FLASHMEM Payload cmd_start(const Payload& args) {
     return clocks_payload_numeric_reject_response("start_rejected_numeric_integrity");
   }
 
-  calibrate_ocxo_mode = servo_mode_parse(args.getString("calibrate_ocxo"));
-  if (!dac1_ok || !dac2_ok) calibrate_ocxo_mode = servo_mode_t::OFF;
+  clocks_apply_servo_mode_now(
+      servo_mode_parse(args.getString("calibrate_ocxo")));
+  if (!dac1_ok || !dac2_ok) {
+    clocks_apply_servo_mode_now(servo_mode_t::OFF);
+  }
 
   ocxo_dac_predictor_reset(ocxo1_dac);
   ocxo_dac_predictor_reset(ocxo2_dac);
@@ -7784,8 +7801,7 @@ static FLASHMEM Payload cmd_stop(const Payload&) {
   clocks_watchdog_clear_surrender_for_new_lifecycle();
   request_servo_mode_change = false;
   requested_servo_mode = servo_mode_t::OFF;
-  calibrate_ocxo_mode = servo_mode_t::OFF;
-  ocxo_dac_pacing_abort_all();
+  clocks_apply_servo_mode_now(servo_mode_t::OFF);
 
   p.add("status", (had_live_smartzero || had_pending_start || had_pending_zero)
                       ? "smartzero_abort_requested"
@@ -7986,9 +8002,8 @@ static FLASHMEM Payload cmd_recover(const Payload& args) {
   servo_mode_t recovered_servo_mode = servo_mode_t::OFF;
   const bool servo_supplied =
       payload_try_get_servo_mode(args, recovered_servo_mode, raw_servo_mode);
-  calibrate_ocxo_mode = servo_supplied
-      ? recovered_servo_mode
-      : servo_mode_t::OFF;
+  clocks_apply_servo_mode_now(
+      servo_supplied ? recovered_servo_mode : servo_mode_t::OFF);
   request_servo_mode_change = false;
   requested_servo_mode = calibrate_ocxo_mode;
   g_servo_mode_last_requested = calibrate_ocxo_mode;
@@ -8460,6 +8475,46 @@ static FLASHMEM Payload cmd_dither_disable(const Payload&) {
 }
 
 
+static FLASHMEM void payload_add_dac_lane_custody(
+    Payload& parent,
+    const char* key,
+    const ocxo_dac_state_t& dac) {
+  Payload lane;
+  lane.add("readback_valid", dac.hw_readback_valid);
+  lane.add("readback_code", (uint32_t)dac.hw_readback_code);
+  lane.add("reset_signature", dac.hw_reset_signature);
+  lane.add("desired", toFixedDecimal(dac.dac_fractional, 6));
+  lane.add("hw_code", (uint32_t)dac.dac_hw_code);
+  lane.add("safe_max_hw_code", (uint32_t)OCXO_DAC_SAFE_MAX_HW_CODE);
+  lane.add("request_pending", dac.pacing_pending);
+  lane.add("pending_target", toFixedDecimal(dac.pacing_pending_target, 6));
+  lane.add("last_author_source", (uint32_t)dac.io_last_author_source);
+  lane.add("readback_count", dac.hw_readback_count);
+  lane.add("readback_failures", dac.hw_readback_failures);
+  lane.add("adopt_count", dac.hw_adopt_count);
+  lane.add("same_code_skip_count", dac.io_skip_same_code_count);
+  lane.add("write_attempts", dac.io_write_attempts);
+  lane.add("write_successes", dac.io_write_successes);
+  lane.add("write_failures", dac.io_write_failures);
+  parent.add_object(key, lane);
+}
+
+static FLASHMEM Payload cmd_dac_info(const Payload&) {
+  Payload p;
+  p.add("schema", "CLOCKS_DAC_CUSTODY_V1");
+  p.add("status", "ok");
+  p.add("servo_mode", servo_mode_str(calibrate_ocxo_mode));
+  p.add("servo_active", clocks_servo_active());
+  p.add("servo_request_pending",
+        ocxo1_dac.pacing_pending || ocxo2_dac.pacing_pending);
+  p.add("actuator_service_pending",
+        clocks_ocxo_dac_actuator_service_pending());
+  p.add("initialization_authored_output", false);
+  payload_add_dac_lane_custody(p, "ocxo1", ocxo1_dac);
+  payload_add_dac_lane_custody(p, "ocxo2", ocxo2_dac);
+  return p;
+}
+
 static FLASHMEM Payload cmd_set_dac(const Payload& args) {
   clocks_payload_numeric_integrity_reset();
   ocxo_dac_pacing_abort_all();
@@ -8530,6 +8585,7 @@ static const process_command_entry_t CLOCKS_COMMANDS[] = {
   { "DITHER_ENABLE",       cmd_dither_enable       },
   { "DITHER_DISABLE",      cmd_dither_disable      },
   { "WATCHDOG_TEST",       cmd_watchdog_test       },
+  { "DAC_INFO",            cmd_dac_info            },
   { "SET_DAC",             cmd_set_dac             },
   { nullptr,                 nullptr                 }
 };

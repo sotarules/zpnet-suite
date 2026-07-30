@@ -84,28 +84,12 @@ static bool ad5693r_configure(uint8_t addr) {
   return ad5693r_write_ctrl(addr, AD5693R_CTRL_ACTIVE);
 }
 
-static bool ad5693r_prime_default(uint8_t addr) {
-  // Be explicit during bring-up:
-  //   1) write input register
-  //   2) force DAC update
-  //
-  // This avoids assuming that "write DAC and input" is behaving
-  // the way we think on the current hardware.
-  if (!ad5693r_write_input(addr, AD5693R_DAC_DEFAULT)) {
-    return false;
-  }
-  if (!ad5693r_update_dac(addr)) {
-    return false;
-  }
-  return true;
-}
-
 bool ad5693r_init(void) {
+  // Kid-gloves startup doctrine: configure the control register only.
+  // Never author an output code merely because firmware restarted.  CLOCKS
+  // separately reads the live input register and adopts that observed state;
+  // an explicit SET_DAC or enabled servo is responsible for later mutation.
   const bool ok1_cfg = ad5693r_configure(AD5693R_ADDR_OCXO1);
   const bool ok2_cfg = ad5693r_configure(AD5693R_ADDR_OCXO2);
-
-  const bool ok1_val = ok1_cfg ? ad5693r_prime_default(AD5693R_ADDR_OCXO1) : false;
-  const bool ok2_val = ok2_cfg ? ad5693r_prime_default(AD5693R_ADDR_OCXO2) : false;
-
-  return ok1_cfg && ok2_cfg && ok1_val && ok2_val;
+  return ok1_cfg && ok2_cfg;
 }

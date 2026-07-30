@@ -39,7 +39,8 @@ class Payload;
 //     Must be called before full process init so DWT timing is available.
 //
 //   Phase 2: process_clocks_init()
-//     Configures OCXO DACs (both), PPS ISR, relay pins, and CLOCKS
+//     Configures OCXO DAC control registers, observes their surviving input
+//     codes without updating VOUT, then initializes subscriptions and CLOCKS
 //     state.  Must be called AFTER timepop_init().
 //
 // TIMEBASE row lifecycle:
@@ -108,7 +109,8 @@ void process_clocks_init_hardware(void);
 // Initialization — Phase 2 (full lifecycle, requires TimePop)
 // -----------------------------------------------------------------------------
 
-/// Configure OCXO DACs (both), subscriptions, and CLOCKS state.
+/// Configure and observe OCXO DACs without authoring VOUT, then initialize
+/// subscriptions and CLOCKS state.
 /// Must be called after timepop_init().
 void process_clocks_init(void);
 
