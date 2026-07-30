@@ -1,7 +1,8 @@
 """
-ZPNet Metrics — Full-Screen Terminal Display
+ZPNet Metrics — Full-Screen MONITOR Display
 
 Green-screen curses application for SSH-based system monitoring.
+Consumes the unified MONITOR heartbeat; TIMEBASE is not a repaint dependency.
 Designed for the road: run from a ThinkPad over SSH, maximized
 in Putty with 3270 font.
 

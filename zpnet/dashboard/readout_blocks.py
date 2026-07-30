@@ -1,11 +1,10 @@
 """
 ZPNet Dashboard Readout Blocks — TIMEBASE_V3 / SYSTEM 2026 Edition
 
-The rotating pygame dashboard is an observer. Clock science is read from the
-Pi CLOCKS report backed by the latest accepted TIMEBASE row. Platform, feature,
-environment, power, and transport state is read from the Pi SYSTEM snapshot.
-No dashboard panel reconstructs firmware statistics or polls Teensy CLOCKS
-imperatively.
+The rotating pygame dashboard is an observer.  Both platform state and live
+clock science are read from the unified MONITOR heartbeat.  MONITOR.clocks is
+the always-on instrument surface; campaign state merely decorates it.  No
+dashboard panel reads TIMEBASE or polls Teensy CLOCKS imperatively.
 """
 from __future__ import annotations
 
@@ -18,8 +17,7 @@ VREF = 5.0
 DAC_CODE_SCALE = 65536.0
 
 _MONITOR_TOPIC = "MONITOR"
-_TIMEBASE_TOPIC = "TIMEBASE"
-_LIVE_CACHE = create_pubsub_cache(_MONITOR_TOPIC, _TIMEBASE_TOPIC)
+_LIVE_CACHE = create_pubsub_cache(_MONITOR_TOPIC)
 
 
 def get_system_snapshot() -> dict:
@@ -27,18 +25,38 @@ def get_system_snapshot() -> dict:
     return _LIVE_CACHE.get(_MONITOR_TOPIC) or {}
 
 
+def _monitor_root() -> dict:
+    """Return the MONITOR publication itself.
+
+    PubSubTapCache already removes the transport envelope and returns the
+    published payload.  MONITOR also legitimately contains a top-level
+    ``payload`` block for Teensy Payload allocator/serialization metrics; that
+    block is data, not another message envelope.  Unwrapping it hides sibling
+    surfaces such as ``clocks``, ``features``, and ``gnss``.
+    """
+    return get_system_snapshot()
+
+
 def get_pi_clocks_report() -> dict:
-    """Return the latest accepted TIMEBASE publication without issuing a command."""
-    return _LIVE_CACHE.get(_TIMEBASE_TOPIC) or {}
+    """Return the live MONITOR.clocks surface without issuing a command."""
+    root = _monitor_root()
+    clocks = root.get("clocks")
+    if not isinstance(clocks, dict):
+        return {}
+    report = dict(clocks)
+    for key in (
+        "campaign", "campaign_state", "campaign_present", "campaign_elapsed",
+        "instrument_elapsed", "instrument_always_on", "gnss_time_utc",
+        "system_time_utc", "published_at_utc",
+    ):
+        if report.get(key) is None and root.get(key) is not None:
+            report[key] = root.get(key)
+    return report
 
 
 def _get_clocks_baseline() -> dict | None:
-    try:
-        response = send_command(machine="PI", subsystem="CLOCKS", command="BASELINE_INFO")
-        payload = response.get("payload", {})
-        return payload if response.get("success") and payload.get("baseline_set") else None
-    except Exception:
-        return None
+    baseline = get_pi_clocks_report().get("baseline")
+    return baseline if isinstance(baseline, dict) and baseline.get("baseline_set") else None
 
 
 def _dict(value) -> dict:
@@ -77,7 +95,27 @@ def _field(report: dict, *paths, default=None):
 def _extra(report: dict, path: str, default=None):
     root = _payload_root(report)
     value = _path_get(_dict(root.get("extra_clocks")), path, None)
-    return default if value is None else value
+    if value is not None:
+        return value
+    gnss_raw = _dict(root.get("gnss_raw"))
+    aliases = {
+        "gnss_raw_ns": ("presentation.ns", "instrument.ns", "ns"),
+        "gnss_raw_ref_ns": ("presentation.ref_ns", "instrument.ref_ns", "ref_ns"),
+        "gnss_raw_tau": ("presentation.tau", "instrument.tau", "tau"),
+        "gnss_raw_ppb": ("presentation.ppb", "instrument.ppb", "ppb"),
+        "gnss_raw_drift_ppb": ("drift_ppb",),
+        "gnss_raw_welford_n": ("welford.n",),
+        "gnss_raw_welford_mean": ("welford.mean",),
+        "gnss_raw_welford_stddev": ("welford.stddev",),
+        "gnss_raw_welford_stderr": ("welford.stderr",),
+        "gnss_raw_welford_min": ("welford.min",),
+        "gnss_raw_welford_max": ("welford.max",),
+    }
+    for alias in aliases.get(path, (path,)):
+        value = _path_get(gnss_raw, alias, None)
+        if value is not None:
+            return value
+    return default
 
 
 def _to_int(value):
@@ -132,18 +170,24 @@ def _yes_no(value) -> str:
 
 
 def _clock_report() -> tuple[dict | None, str]:
-    payload = get_pi_clocks_report()
-    report = _dict(payload.get("report")) or payload
-    state = report.get("campaign_state") or payload.get("campaign_state")
-    if state is None:
-        state = "STARTED" if _fragment_root(report) else "IDLE"
-    if str(state).upper() != "STARTED":
-        return None, f"CLOCKS: {str(state).upper()}"
+    report = get_pi_clocks_report()
+    if not report:
+        return None, "CLOCKS: MONITOR UNAVAILABLE"
 
-    campaign = report.get("campaign", "?")
-    elapsed = report.get("campaign_elapsed", "00:00:00")
-    count = _to_int(_field(report, "teensy_pps_vclock_count", "teensy_pps_count", "pps_count")) or 0
-    return report, f"CLOCKS: {campaign} {elapsed} n={count}"
+    state = str(report.get("campaign_state") or ("STARTED" if report.get("campaign_present") else "STOPPED")).upper()
+    count = _to_int(_field(
+        report, "instrument_count", "instrument_seconds",
+        "stats.ocxo1.welford.n", "stats.ocxo1.n",
+        "teensy_pps_vclock_count", "pps_count",
+    )) or 0
+    if state == "STARTED" or report.get("campaign_present"):
+        campaign = report.get("campaign", "?")
+        elapsed = report.get("campaign_elapsed", "00:00:00")
+        header = f"CLOCKS: {campaign} {elapsed} n={count}"
+    else:
+        elapsed = report.get("instrument_elapsed", "00:00:00")
+        header = f"CLOCKS: INSTRUMENT {elapsed} n={count}"
+    return report, header
 
 
 def _frequency(report: dict, lane: str) -> tuple[float | None, float | None]:

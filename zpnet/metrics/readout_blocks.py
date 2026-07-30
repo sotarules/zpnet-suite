@@ -2,10 +2,10 @@
 ZPNet Metrics Readout Blocks — Dense Clocks Panel
 
 Data source:
-  The Pi CLOCKS report is the most recent TIMEBASE record plus campaign_state.
-  TIMEBASE_FRAGMENT_V2 is hierarchical: canonical clock state lives in the
-  fragment object, with lane-owned objects for dwt, vclock, ocxo1, ocxo2,
-  stats, dac, prediction, and pps.
+  The unified MONITOR heartbeat owns the live operator view.  Clock science is
+  read from MONITOR.clocks, including the always-on instrument clockfaces,
+  Alpha statistics, raw-cycle evidence, DAC state, campaign decoration, and
+  baseline comparison.  Metrics never waits for or reads TIMEBASE.
 
 Stats policy (Pi is a stenographer):
   Every statistical quantity shown in this panel is read verbatim from the
@@ -58,8 +58,7 @@ FEATURE_GRID_COLUMNS = 4
 FEATURE_GRID_CELL_WIDTH = 39
 
 MONITOR_TOPIC = "MONITOR"
-TIMEBASE_TOPIC = "TIMEBASE"
-_LIVE_CACHE = create_pubsub_cache(MONITOR_TOPIC, TIMEBASE_TOPIC)
+_LIVE_CACHE = create_pubsub_cache(MONITOR_TOPIC)
 
 # Mission-control readiness board. The feature payload remains scalar-only;
 # this table is just the operator-facing projection of MONITOR.features.
@@ -105,31 +104,50 @@ def _get_feature_status_payload(force: bool = False) -> tuple[dict, str | None]:
     return {}, _LIVE_CACHE.error()
 
 
+def _monitor_root() -> dict:
+    """Return the MONITOR publication itself.
+
+    PubSubTapCache already removes the transport envelope and returns the
+    published payload.  MONITOR also legitimately contains a top-level
+    ``payload`` block for Teensy Payload allocator/serialization metrics; that
+    block is data, not another message envelope.  Unwrapping it hides sibling
+    surfaces such as ``clocks``, ``features``, and ``gnss``.
+    """
+    return _get_system_snapshot()
+
+
 def _get_pi_clocks_report() -> dict:
-    """Return latest accepted TIMEBASE without command/response traffic."""
-    return _LIVE_CACHE.get(TIMEBASE_TOPIC) or {}
+    """Return the live MONITOR.clocks surface without command/response traffic."""
+    root = _monitor_root()
+    clocks = root.get("clocks")
+    if not isinstance(clocks, dict):
+        return {}
+
+    # Keep MONITOR's ownership boundaries visible while presenting a convenient
+    # report-like object to the existing pure formatting helpers.
+    report = dict(clocks)
+    for key in (
+        "campaign", "campaign_state", "campaign_present", "campaign_elapsed",
+        "instrument_elapsed", "instrument_always_on", "gnss_time_utc",
+        "system_time_utc", "published_at_utc",
+    ):
+        if report.get(key) is None and root.get(key) is not None:
+            report[key] = root.get(key)
+    return report
 
 
 def _get_pi_clocks_report_dac() -> dict:
-    # Servo/DAC telemetry is already present in TIMEBASE.
+    # MONITOR.clocks.dac is already folded into the live report surface.
     return {}
 
 
 def _get_clocks_baseline() -> dict | None:
-    """Return the configured CLOCKS baseline, or None when unavailable."""
-    try:
-        response = send_command(
-            machine="PI",
-            subsystem="CLOCKS",
-            command="BASELINE_INFO",
-        )
-        payload = response.get("payload", {})
-        if response.get("success") and isinstance(payload, dict) and payload.get("baseline_set"):
-            return payload
-    except Exception:
-        pass
-
-    return None
+    """Return the baseline embedded in MONITOR.clocks, never an RPC query."""
+    clocks = _get_pi_clocks_report()
+    baseline = clocks.get("baseline")
+    if not isinstance(baseline, dict) or not baseline.get("baseline_set"):
+        return None
+    return baseline
 
 
 # ---------------------------------------------------------------------
@@ -305,6 +323,8 @@ def _payload_root(r: dict) -> dict:
 
 
 def _fragment_root(r: dict) -> dict:
+    # MONITOR.clocks is already the canonical live clock root.  Retain support
+    # for historical report-shaped dictionaries used by campaign-history code.
     root = _payload_root(r)
     frag = root.get("fragment")
     return frag if isinstance(frag, dict) else root
@@ -333,6 +353,27 @@ def _extra(r: dict, key: str, default=None):
         val = _path_get(ec, key, None)
         if val is not None:
             return val
+
+    # Pi-owned GNSS_RAW is a first-class MONITOR clock, not a TIMEBASE extra.
+    gnss_raw = root.get("gnss_raw")
+    if isinstance(gnss_raw, dict):
+        aliases = {
+            "gnss_raw_ns": ("presentation.ns", "instrument.ns", "ns"),
+            "gnss_raw_ref_ns": ("presentation.ref_ns", "instrument.ref_ns", "ref_ns"),
+            "gnss_raw_tau": ("presentation.tau", "instrument.tau", "tau"),
+            "gnss_raw_ppb": ("presentation.ppb", "instrument.ppb", "ppb"),
+            "gnss_raw_drift_ppb": ("drift_ppb",),
+            "gnss_raw_welford_n": ("welford.n",),
+            "gnss_raw_welford_mean": ("welford.mean",),
+            "gnss_raw_welford_stddev": ("welford.stddev",),
+            "gnss_raw_welford_stderr": ("welford.stderr",),
+            "gnss_raw_welford_min": ("welford.min",),
+            "gnss_raw_welford_max": ("welford.max",),
+        }
+        for path in aliases.get(key, (key,)):
+            val = _path_get(gnss_raw, path, None)
+            if val is not None:
+                return val
     return default
 
 
@@ -766,7 +807,7 @@ def _clamp_dac_code(value: float) -> float:
 def _manual_dac_current_value(lane: str) -> float:
     """Fetch the live DAC value for keyboard nudging.
 
-    Read the live DAC value from the current CLOCKS report/TIMEBASE value.
+    Read the live DAC value from the current MONITOR.clocks surface.
     Metrics does not subscribe to CLOCKS_DAC_TICK and does not poll verbose
     TEENSY REPORT_DAC during repaint or keyboard nudging.
     """
@@ -840,7 +881,7 @@ def _dac_dither_summary_from_fractional_code(dac_code) -> str:
     The firmware dither doctrine is a one-second fractional-code realization:
     low=floor(code), high=ceil(code), and the fractional part determines the
     high-code duty count over 1000 scheduler ticks.  This is presentation only;
-    the desired fractional code itself still comes from TIMEBASE.
+    the desired fractional code itself still comes from MONITOR.
     """
     code = _to_float(dac_code)
     if code is None:
@@ -1341,6 +1382,36 @@ def campaigns_readout() -> list[str]:
     return lines
 
 
+def _clockface_value(r: dict, lane: str):
+    """Return the MONITOR presentation clockface for one lane."""
+    for path in (
+        f"instrument_clockfaces.{lane}",
+        f"presentation_clockfaces.{lane}",
+        f"clockfaces.{lane}",
+        f"{lane}.presentation.ns",
+        f"{lane}.instrument.ns",
+        f"{lane}.ns",
+    ):
+        value = _field(r, path, default=None)
+        if isinstance(value, dict):
+            value = value.get("ns") if value.get("ns") is not None else value.get("value")
+        if value is not None:
+            return _to_int(value)
+    return None
+
+
+def _monitor_count(r: dict) -> int:
+    for path in (
+        "instrument_count", "instrument_seconds", "clockface_n",
+        "stats.ocxo1.welford.n", "stats.ocxo1.n",
+        "teensy_pps_vclock_count", "pps_count",
+    ):
+        value = _to_int(_field(r, path, default=None))
+        if value is not None:
+            return value
+    return 0
+
+
 # ---------------------------------------------------------------------
 # Combined clocks readout
 # ---------------------------------------------------------------------
@@ -1360,25 +1431,15 @@ def clocks_combined_readout() -> list[str]:
         report_dac = None
 
     report = p.get("report") if isinstance(p.get("report"), dict) else p
-    state = report.get("campaign_state") or p.get("campaign_state")
-    if state is None:
-        # TIMEBASE-bearing CLOCKS reports imply a running campaign even if the
-        # wrapper did not include campaign_state.
-        state = "STARTED" if _fragment_root(report) else "IDLE"
-    if state != "STARTED":
-        # No campaign means no campaign-public TIMEBASE DAC spine.  Suppress the
-        # DAC block here; the operator-facing DAC display belongs to active
-        # campaign rows where the Teensy-authored TIMEBASE stats identify the
-        # current fractional code and dither realization.
-        lines.append(f"CLOCKS: {state}")
-        lines.append("")
-        lines.extend(feature_status_grid_lines())
-        return lines
+    if not isinstance(report, dict) or not report:
+        return ["CLOCKS: MONITOR UNAVAILABLE", "", *feature_status_grid_lines()]
 
     r = report
-    campaign = r.get("campaign", "?")
-    elapsed = r.get("campaign_elapsed", "00:00:00")
-    n = _to_int(_field(r, "teensy_pps_vclock_count", "teensy_pps_count", "pps_count")) or 0
+    state = str(r.get("campaign_state") or ("STARTED" if r.get("campaign_present") else "STOPPED")).upper()
+    campaign = r.get("campaign") or "STOPPED"
+    elapsed = r.get("campaign_elapsed") or "00:00:00"
+    instrument_elapsed = r.get("instrument_elapsed") or "00:00:00"
+    n = _monitor_count(r)
 
     servo_state = str(report_dac.get("servo") or _servo_state(r)).upper() if isinstance(report_dac, dict) else _servo_state(r)
 
@@ -1390,11 +1451,11 @@ def clocks_combined_readout() -> list[str]:
     servo_str = servo_state
     baseline_str = f"BASELINE: {baseline_campaign}" if baseline_id else "BASELINE: NONE"
 
-    lines.append(
-        f"CAMPAIGN: {campaign}  ELAPSED: {elapsed}  n={n}"
-        f"    SERVO: {servo_str}"
-        f"    {baseline_str}"
-    )
+    if state == "STARTED" or r.get("campaign_present"):
+        identity = f"CAMPAIGN: {campaign}  ELAPSED: {elapsed}  n={n}"
+    else:
+        identity = f"CAMPAIGN: STOPPED  INSTRUMENT: {instrument_elapsed}  n={n}"
+    lines.append(identity + f"    SERVO: {servo_str}" + f"    {baseline_str}")
     lines.append("")
 
     # ── Column widths ──
@@ -1431,7 +1492,7 @@ def clocks_combined_readout() -> list[str]:
     )
 
     # ── GNSS (reference nanosecond clock) ──
-    gnss_ns = _to_int(_field(r, "gnss.ns", "gnss_ns"))
+    gnss_ns = _clockface_value(r, "gnss")
     gnss_tau = 1.0
     gnss_ppb = 0.0
     gnss_raw = _to_int(_field(r, "gnss.clock_interval_ns", "gnss.interval_ns", "gnss_interval_ns")) or 1_000_000_000
@@ -1448,7 +1509,7 @@ def clocks_combined_readout() -> list[str]:
     )
 
     # ── VCLOCK (GNSS-disciplined nanosecond clock) ──
-    vclock_ns  = _to_int(_field(r, "vclock.ns", "gnss.vclock_ns", "gnss.pps_vclock_ns", "vclock_gnss_ns_at_pps_vclock", "gnss_ns"))
+    vclock_ns  = _clockface_value(r, "vclock")
     vclock_tau = _to_float(_freq_value(r, "vclock", "tau"))
     vclock_ppb = _to_float(_freq_value(r, "vclock", "ppb"))
 
@@ -1488,7 +1549,7 @@ def clocks_combined_readout() -> list[str]:
 
     # ── OCXO1, OCXO2 (nanosecond clocks) ──
     for name, key in [("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")]:
-        ocxo_ns = _to_int(_field(r, f"{key}.ns", f"gnss.{key}_ns", f"{key}_ns", f"{key}_ns_at_pps_vclock", f"{key}_ns_count_at_pps"))
+        ocxo_ns = _clockface_value(r, key)
         tau     = _to_float(_freq_value(r, key, "tau"))
         ppb     = _to_float(_freq_value(r, key, "ppb"))
         raw     = _none_if_zero(_ocxo_interval_ns(r, key))
@@ -1576,8 +1637,8 @@ def clocks_combined_readout() -> list[str]:
     lines.append("")
 
     # ── Time ──
-    gnss_time = r.get("gnss_time_utc", "---")
-    system_time = r.get("system_time_utc", "---")
+    gnss_time = r.get("gnss_time_utc") or _field(r, "time.gnss", default="---")
+    system_time = r.get("system_time_utc") or r.get("published_at_utc") or _field(r, "time.system", default="---")
     lines.append(f"TIME  GNSS: {gnss_time}    SYSTEM: {system_time}")
     lines.append("")
 

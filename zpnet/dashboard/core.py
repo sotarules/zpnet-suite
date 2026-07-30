@@ -9,7 +9,7 @@ Key invariants:
   • WebSocket failures must never affect UI
   • Dashboard is an observer, not an instrument
   • Dashboard must never initialize host audio
-  • SYSTEM snapshot owns platform health; accepted TIMEBASE owns clock science
+  • Unified MONITOR owns platform health and live always-on clock science
 
 Author: The Mule + GPT
 """

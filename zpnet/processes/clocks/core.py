@@ -1,5 +1,5 @@
 """
-ZPNet CLOCKS Process — TIMEBASE Authority (Pi-side)
+ZPNet CLOCKS Process — TIMEBASE Authority + MONITOR Decoration (Pi-side)
 
 Core contract:
 
@@ -2374,12 +2374,21 @@ def _publish_clocks_monitor() -> None:
         if baseline
         else {"baseline_set": False}
     )
+    campaign_seconds = int(_accepted_pps_vclock_count or 0) if _campaign_active else 0
+    instrument_seconds = int(gnss_raw.get("instrument", {}).get("clockface_n") or 0)
     payload = {
-        "schema": "PI_CLOCKS_MONITOR_V1",
+        "schema": "PI_CLOCKS_MONITOR_V2",
         "published_at_utc": datetime.now(timezone.utc)
             .isoformat()
             .replace("+00:00", "Z"),
+        "instrument_always_on": True,
+        "instrument_elapsed": _seconds_to_hms(instrument_seconds),
         "campaign_active": bool(_campaign_active),
+        "campaign_present": bool(_campaign_active),
+        "campaign_state": "STARTED" if _campaign_active else "STOPPED",
+        "campaign": _start_requested_campaign if _campaign_active else None,
+        "campaign_elapsed": _seconds_to_hms(campaign_seconds),
+        "complete_for_display": True,
         "startup": _start_status_payload(),
         "gnss_raw": gnss_raw,
         "extra_clocks": {
@@ -8610,7 +8619,7 @@ def run() -> None:
         "Commands: START, STOP, RESUME, RECOVER_ABORT, REPORT, REPORT_CLOCKS, REPORT_STATS, STATS_RESET, CLEAR, DELETE, TRUNCATE, SET_DAC, DITHER, GATE_MODE, "
         "SET_BASELINE, BASELINE_INFO, LIST_CAMPAIGNS, CLOCKS_INFO. "
         "Subscriptions: MONITOR, GNSS_ANNOUNCEMENT, TIMEBASE_FRAGMENT, WATCHDOG_ANOMALY, CLOCKS_RECOVERY_STALLED. "
-        "Publications: TIMEBASE, CLOCKS_MONITOR."
+        "Publications: TIMEBASE, CLOCKS_MONITOR (Pi decoration merged into unified MONITOR)."
     )
 
     # Start command + pubsub servers first, but hold off on active work.
