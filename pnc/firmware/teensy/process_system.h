@@ -152,3 +152,10 @@ void system_monitor_pps_tick_from_interrupt(
 // campaign-coupled caller but is ignored after the canonical interrupt owner
 // has supplied its first tick.
 void system_monitor_pps_tick(uint32_t completed_second_sequence);
+
+// CLOCKS/Beta calls this after it has staged a public campaign row for the
+// completed instrument sequence. Usually the interrupt-owned MONITOR tick is
+// already pending and this merely coalesces into it. If SYSTEM already emitted
+// the observation-only fragment, this deliberately schedules one second copy
+// carrying the campaign decoration so durable truth cannot be lost.
+void system_monitor_campaign_row_ready(uint32_t completed_second_sequence);

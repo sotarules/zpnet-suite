@@ -114,9 +114,11 @@ uint64_t recover_gnss_ns  = 0;
 uint64_t recover_ocxo1_ns = 0;
 uint64_t recover_ocxo2_ns = 0;
 
-// Do not retain a copy of the most recent TIMEBASE_FRAGMENT here.
-// The Pi persists the authoritative row, and keeping a second heap-backed
-// Payload alive on Teensy made campaign publication unnecessarily fragile.
+// The separate TIMEBASE_FRAGMENT transport is retired. Beta still owns the
+// campaign/science court and constructs the exact legacy V5 candidate, but it
+// stages at most one completed row for SYSTEM to move into MONITOR_FRAGMENT.
+// The Pi remains the final TIMEBASE arbiter and persists the same downstream
+// schema; only the Teensy transport envelope changes.
 
 // Alpha-authored physical PPS witness DWT audit surface.  These are published
 // into the TIMEBASE publication so Pi-side reports can compare physical PPS-to-PPS
@@ -414,6 +416,12 @@ static clocks_alpha_ocxo_counterledger_snapshot_t
 // RAM1/DTCM stack margin on another automatic Payload object.  Their arenas are
 // already heap-backed and are reused by clear() between rows.
 static Payload g_timebase_candidate_payload DMAMEM;
+static Payload g_monitor_campaign_row_payload DMAMEM;
+static bool     g_monitor_campaign_row_pending = false;
+static uint32_t g_monitor_campaign_row_sequence = 0U;
+static uint32_t g_monitor_campaign_row_stage_count = 0U;
+static uint32_t g_monitor_campaign_row_take_count = 0U;
+static uint32_t g_monitor_campaign_row_backlog_count = 0U;
 
 // Command-report construction is a serialized foreground service. Priority-0
 // capture remains live, but the priority-16 TimePop/handoff tier may not enter a
@@ -563,6 +571,9 @@ static void clocks_beta_features_mark_initializing(void) {
 void clocks_beta_features_init(void) {
   clocks_beta_cold_diagnostics_init();
   g_timebase_candidate_payload.clear();
+  g_monitor_campaign_row_payload.clear();
+  g_monitor_campaign_row_pending = false;
+  g_monitor_campaign_row_sequence = 0U;
   g_report_clocks_payload.clear();
   g_report_stats_payload.clear();
   g_report_child_clocks.clear();
@@ -6452,6 +6463,21 @@ static void payload_add_monitor_dac(Payload& parent) {
   parent.add_object("dac", dac);
 }
 
+bool clocks_monitor_campaign_row_take(uint32_t completed_second_sequence,
+                                      Payload* out) {
+  if (!out || !g_monitor_campaign_row_pending ||
+      g_monitor_campaign_row_sequence != completed_second_sequence) {
+    return false;
+  }
+
+  *out = g_monitor_campaign_row_payload;
+  g_monitor_campaign_row_payload.clear();
+  g_monitor_campaign_row_pending = false;
+  g_monitor_campaign_row_sequence = 0U;
+  g_monitor_campaign_row_take_count++;
+  return true;
+}
+
 FLASHMEM Payload clocks_monitor_payload(void) {
   g_beta_monitor_instrument_stats =
       clocks_instrument_stats_snapshot_t{};
@@ -7527,12 +7553,31 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
   timebase_build_stage(TIMEBASE_BUILD_STAGE_BUILD_COMPLETE);
   timebase_build_stage(TIMEBASE_BUILD_STAGE_PUBLISH_ATTEMPT);
   clocks_stack_witness_note_hot(CLOCKS_STACK_CONTEXT_BETA_PPS_PUBLISH);
-  publish("TIMEBASE_FRAGMENT", p);
+
+  // One transport, one row. Beta owns the candidate math/courts; SYSTEM owns
+  // MONITOR_FRAGMENT publication. Never overwrite an unconsumed campaign row:
+  // that would turn transport pressure into silent campaign data loss.
+  if (g_monitor_campaign_row_pending) {
+    g_monitor_campaign_row_backlog_count++;
+    clocks_watchdog_anomaly("monitor_campaign_row_backlog",
+                            g_monitor_campaign_row_sequence,
+                            completed_pps_sequence,
+                            g_monitor_campaign_row_backlog_count,
+                            public_count);
+    p.clear();
+    return;
+  }
+
+  g_monitor_campaign_row_payload = p;
+  g_monitor_campaign_row_sequence = completed_pps_sequence;
+  g_monitor_campaign_row_pending = true;
+  g_monitor_campaign_row_stage_count++;
   timebase_build_stage(TIMEBASE_BUILD_STAGE_PUBLISH_RETURN);
 
-  // PPS-aligned operational side rail. SYSTEM receives only the completed
-  // second identity; it never parses or copies TIMEBASE.
-  system_monitor_pps_tick(public_count);
+  // The interrupt-owned tick normally already has this sequence pending. This
+  // call coalesces the decoration into that fragment, or schedules a second
+  // same-sequence fragment if the observation-only copy already escaped.
+  system_monitor_campaign_row_ready(completed_pps_sequence);
 
   p.clear();
 

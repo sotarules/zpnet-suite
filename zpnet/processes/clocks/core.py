@@ -1,11 +1,12 @@
 """
-ZPNet CLOCKS Process — TIMEBASE Authority + MONITOR Decoration (Pi-side)
+ZPNet CLOCKS Process — MONITOR_FRAGMENT Campaign Ingress + TIMEBASE Authority (Pi-side)
 
 Core contract:
 
   CLOCKS is a traffic cop and final TIMEBASE arbiter. It owns no Teensy
-  clock state. It receives one unified TIMEBASE_FRAGMENT candidate from
-  the Teensy. TIMEBASE_FRAGMENT_V5 contains the compact science fragment;
+  clock state. It receives the always-on MONITOR_FRAGMENT stream from the
+  Teensy. During a campaign, MONITOR_FRAGMENT carries an optional campaign_row
+  whose TIMEBASE_FRAGMENT_V5-compatible body is the compact science fragment;
   older fragment versions may also contain embedded forensics. CLOCKS decorates
   the accepted candidate with Pi-owned environment, GF-8802, GNSS_RAW, and
   system-time evidence, then persists the immutable TIMEBASE row.
@@ -41,7 +42,7 @@ Core contract:
     incoherent candidates.
 
 Responsibilities:
-  * Receive unified TIMEBASE_FRAGMENT candidates from Teensy.
+  * Receive campaign_row candidates from the unified MONITOR_FRAGMENT stream.
   * Adjudicate each candidate and log every rejected raw record.
   * Subscribe to predictive GF-8802 announcements and bind them to PPS-aligned rows.
   * Augment accepted rows with environment, GNSS_RAW, and system time.
@@ -169,7 +170,8 @@ SYNC_LOG_INTERVAL_S = 5.0
 # adjudication, but there is no standalone forensics route or two-topic pair
 # join in the live architecture.
 TIMEBASE_INGRESS_QUEUE_MAXSIZE = 0
-TIMEBASE_FRAGMENT_TOPIC = "TIMEBASE_FRAGMENT"
+TIMEBASE_FRAGMENT_TOPIC = "MONITOR_FRAGMENT.campaign_row"
+MONITOR_FRAGMENT_TOPIC = "MONITOR_FRAGMENT"
 MONITOR_TOPIC = "MONITOR"
 CLOCKS_MONITOR_TOPIC = "CLOCKS_MONITOR"
 CLOCKS_MONITOR_BASELINE_REFRESH_S = 30.0
@@ -1960,8 +1962,8 @@ def _wait_for_timebase_routes(
     timeout_s: float = 30.0,
     poll_s: float = 0.5,
 ) -> None:
-    """Confirm the unified TIMEBASE candidate route."""
-    required = {TIMEBASE_FRAGMENT_TOPIC}
+    """Confirm the unified always-on MONITOR_FRAGMENT ingress route."""
+    required = {MONITOR_FRAGMENT_TOPIC}
     t0 = time.monotonic()
     last_log = t0
     last_missing = sorted(required)
@@ -5225,17 +5227,31 @@ def _drain_timebase_ingress() -> int:
 # ---------------------------------------------------------------------
 
 
-def on_timebase_fragment(payload: Payload) -> None:
-    """
-    PUBSUB handler for the unified Teensy TIMEBASE candidate.
+def on_monitor_fragment(payload: Payload) -> None:
+    """Consume the raw Teensy MONITOR_FRAGMENT and enqueue campaign decoration.
 
-    Fast path only: copy, note liveness, and enqueue.  Identity and scientific
-    validity are adjudicated in the processor thread so even malformed rows are
-    captured in the dedicated invalid-TIMEBASE log.
+    Observation-only fragments are intentionally ignored by the TIMEBASE path.
+    When ``campaign_row`` is present, its body is the unchanged Teensy-authored
+    TIMEBASE_FRAGMENT_V5 candidate and enters the existing final court verbatim.
     """
+    if not isinstance(payload, dict):
+        _diag["monitor_fragments_malformed"] = _diag.get("monitor_fragments_malformed", 0) + 1
+        return
+
+    monitor_fragment = dict(payload)
+    candidate = monitor_fragment.get("campaign_row")
+    if not isinstance(candidate, dict):
+        _diag["monitor_fragments_observation_only"] = (
+            _diag.get("monitor_fragments_observation_only", 0) + 1
+        )
+        return
+
+    _diag["monitor_fragments_with_campaign_row"] = (
+        _diag.get("monitor_fragments_with_campaign_row", 0) + 1
+    )
     _diag["timebase_candidates_received"] += 1
     _diag["fragments_received"] += 1
-    candidate = dict(payload)
+    candidate = dict(candidate)
 
     pps_vclock_count: Optional[int]
     try:
@@ -8715,12 +8731,12 @@ def run() -> None:
     logging.info(
         "🕐 [clocks] unified PPS/VCLOCK TIMEBASE candidate schema. Teensy PPS/VCLOCK count is canonical. "
         "Four clock domains: GNSS (reference), DWT, OCXO1, OCXO2. "
-        "The Teensy emits one TIMEBASE_FRAGMENT candidate containing fragment + embedded forensics; the Pi is the final row arbiter. "
+        "The Teensy emits one always-on MONITOR_FRAGMENT; campaign rows ride inside campaign_row and the Pi is the final TIMEBASE arbiter. "
         "STRICT drops science-rejected numeric candidates; FORENSIC persists them and allows mathematical contamination. "
         "START while active performs seamless flash-cut to new campaign. "
         "Commands: START, STOP, RESUME, RECOVER_ABORT, REPORT, REPORT_CLOCKS, REPORT_STATS, STATS_RESET, CLEAR, DELETE, TRUNCATE, SET_DAC, DITHER, GATE_MODE, "
         "SET_BASELINE, BASELINE_INFO, LIST_CAMPAIGNS, CLOCKS_INFO. "
-        "Subscriptions: MONITOR, GNSS_ANNOUNCEMENT, TIMEBASE_FRAGMENT, WATCHDOG_ANOMALY, CLOCKS_RECOVERY_STALLED. "
+        "Subscriptions: MONITOR, MONITOR_FRAGMENT, GNSS_ANNOUNCEMENT, WATCHDOG_ANOMALY, CLOCKS_RECOVERY_STALLED. "
         "Publications: TIMEBASE, CLOCKS_MONITOR (Pi decoration merged into unified MONITOR)."
     )
 
@@ -8734,8 +8750,8 @@ def run() -> None:
         commands=COMMANDS,
         subscriptions={
             MONITOR_TOPIC: on_monitor,
+            MONITOR_FRAGMENT_TOPIC: on_monitor_fragment,
             GNSS_ANNOUNCEMENT_TOPIC: on_gnss_announcement,
-            "TIMEBASE_FRAGMENT": on_timebase_fragment,
             "WATCHDOG_ANOMALY": on_watchdog_anomaly,
             CLOCKS_RECOVERY_STALLED_TOPIC: on_recovery_stalled,
         },

@@ -292,10 +292,18 @@ bool clocks_alpha_tau_snapshot(time_clock_id_t clock,
 
 
 // -----------------------------------------------------------------------------
-// Always-on MONITOR_FRAGMENT clock view
+// Always-on MONITOR_FRAGMENT clock view and optional campaign decoration
 // -----------------------------------------------------------------------------
 // Build one compact, read-only CLOCKS payload from the latest coherent Alpha
 // completed row.  When a campaign is active, the presentation clockfaces are
 // campaign-relative; otherwise they remain Alpha service-epoch relative.
 // Statistics are always Alpha-owned and campaign-neutral.
 Payload clocks_monitor_payload(void);
+
+// Beta retains campaign/science custody and builds the exact legacy
+// TIMEBASE_FRAGMENT_V5 candidate after all START/RECOVER/science courts pass.
+// SYSTEM calls this from its foreground MONITOR publisher to move that candidate
+// into the matching MONITOR_FRAGMENT as ``campaign_row``.  A false return means
+// this completed instrument second has no public campaign row.
+bool clocks_monitor_campaign_row_take(uint32_t completed_second_sequence,
+                                      Payload* out);

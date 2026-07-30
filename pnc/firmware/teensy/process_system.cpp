@@ -147,6 +147,8 @@ static volatile bool g_system_monitor_service_armed = false;
 static uint32_t g_system_monitor_publish_count = 0U;
 static uint32_t g_system_monitor_coalesce_count = 0U;
 static uint32_t g_system_monitor_service_arm_failures = 0U;
+static uint32_t g_system_monitor_campaign_rows_embedded = 0U;
+static uint32_t g_system_monitor_campaign_ready_republish_count = 0U;
 static bool g_system_monitor_interrupt_owner_seen = false;
 static bool g_system_monitor_last_tick_valid = false;
 static uint32_t g_system_monitor_last_tick_sequence = 0U;
@@ -3490,11 +3492,25 @@ static void system_monitor_publish_service(timepop_ctx_t*,
   fragment.add_object("process", system_monitor_process_payload());
   fragment.add_object("transport", system_monitor_transport_payload());
   fragment.add_object("payload", system_monitor_payload_payload());
+
+  Payload campaign_row;
+  const bool campaign_row_present =
+      clocks_monitor_campaign_row_take(sequence, &campaign_row);
+  fragment.add("campaign_row_present", campaign_row_present);
+  if (campaign_row_present) {
+    fragment.add_object("campaign_row", campaign_row);
+    g_system_monitor_campaign_rows_embedded++;
+  }
+
   fragment.add_object("features", system_features_tree_payload());
   fragment.add("monitor_publish_count", g_system_monitor_publish_count + 1U);
   fragment.add("monitor_coalesce_count", g_system_monitor_coalesce_count);
   fragment.add("monitor_service_arm_failures",
                g_system_monitor_service_arm_failures);
+  fragment.add("monitor_campaign_rows_embedded",
+               g_system_monitor_campaign_rows_embedded);
+  fragment.add("monitor_campaign_ready_republish_count",
+               g_system_monitor_campaign_ready_republish_count);
 
   publish("MONITOR_FRAGMENT", fragment);
   g_system_monitor_publish_count++;
@@ -3536,6 +3552,32 @@ void system_monitor_pps_tick_from_interrupt(
 void system_monitor_pps_tick(uint32_t completed_second_sequence) {
   if (system_feature_current_ipsr() != 0U) return;
   if (g_system_monitor_interrupt_owner_seen) return;
+  system_monitor_accept_tick(completed_second_sequence);
+}
+
+void system_monitor_campaign_row_ready(uint32_t completed_second_sequence) {
+  if (system_feature_current_ipsr() != 0U || completed_second_sequence == 0U) {
+    return;
+  }
+
+  // If the canonical interrupt tick is still pending, keep one publication and
+  // let the campaign row ride along. If that sequence already published, arm a
+  // deliberate same-sequence decorated copy rather than losing durable truth.
+  if (g_system_monitor_pending &&
+      g_system_monitor_pending_sequence == completed_second_sequence) {
+    system_monitor_schedule_publish();
+    return;
+  }
+
+  if (g_system_monitor_last_tick_valid &&
+      g_system_monitor_last_tick_sequence == completed_second_sequence) {
+    g_system_monitor_campaign_ready_republish_count++;
+    g_system_monitor_pending_sequence = completed_second_sequence;
+    g_system_monitor_pending = true;
+    system_monitor_schedule_publish();
+    return;
+  }
+
   system_monitor_accept_tick(completed_second_sequence);
 }
 
