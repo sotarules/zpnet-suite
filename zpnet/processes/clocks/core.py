@@ -4810,7 +4810,14 @@ def _reconcile_boot_dacs(
             decision["action"] = "HOLD"
             decision["reason"] = "readback_unavailable"
         elif code in _lawful_static_codes(desired):
-            decision["reason"] = "already_at_desired_code"
+            # Preserve the physical output, but reinstall the persisted
+            # fractional target as Teensy control intent.  SET_DAC is a physical
+            # no-op when the current hardware code is already lawful; with
+            # dither enabled it restores the decimal target so the next frame
+            # may realize the floor/ceiling duty cycle.
+            decision["action"] = "INSTALL_INTENT"
+            decision["reason"] = "hardware_preserved_fractional_intent_restored"
+            set_args[arg_name] = str(float(desired))
         elif code == 0 or code > safe_max:
             decision["action"] = "RESTORE"
             decision["reason"] = "power_on_or_unsafe_signature"

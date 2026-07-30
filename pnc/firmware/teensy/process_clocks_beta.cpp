@@ -5524,6 +5524,7 @@ static uint64_t        g_ocxo_dac_last_schedule_second = 0;
 static uint8_t         g_ocxo_dac_last_winner = 0;
 static uint32_t        g_ocxo_dac_arbitration_passes = 0;
 static uint32_t        g_ocxo_dac_deferred_candidates = 0;
+static uint64_t        g_servo_control_second = 0;
 
 static uint8_t ocxo_dac_lane_id(const ocxo_dac_state_t& dac) {
   return (&dac == &ocxo1_dac) ? 1U : 2U;
@@ -5655,10 +5656,11 @@ static void ocxo_dac_apply_synthetic_servo_step(ocxo_dac_state_t& dac,
   g_ocxo_dac_commit_selected = &dac;
   g_ocxo_dac_commit_target = target;
   g_ocxo_dac_commit_target_hw_code = target_hw_code;
-  g_ocxo_dac_last_schedule_second = campaign_seconds;
+  g_ocxo_dac_last_schedule_second = g_servo_control_second;
   g_ocxo_dac_last_winner = ocxo_dac_lane_id(dac);
 
-  ocxo_dac_request_servo_target(dac, target, planned_step, campaign_seconds);
+  ocxo_dac_request_servo_target(
+      dac, target, planned_step, g_servo_control_second);
 }
 
 // ============================================================================
@@ -5872,6 +5874,165 @@ static void ocxo_calibration_servo(void) {
     ocxo_servo_now(ocxo1_dac, g_servo_input_ocxo1);
     ocxo_servo_now(ocxo2_dac, g_servo_input_ocxo2);
   }
+}
+
+
+// ============================================================================
+// Always-on instrument servo
+// ============================================================================
+//
+// Campaigns are recording namespaces, not owners of the physical instrument.
+// When no campaign is active, drive the selected servo from Alpha's coherent
+// boot-lifetime instrument snapshot instead of campaign_seconds/public totals.
+// This keeps MEAN/TOTAL/NOW behavior available whenever the instrument has a
+// lawful completed row.
+//
+// TOTAL uses Alpha's boot-lifetime frequency estimate and update count.  The
+// catch-up controller therefore retains its long-horizon semantics while idle:
+// it burns down the accumulated instrument frequency error rather than waiting
+// forever for campaign_seconds to become non-zero.
+//
+// NOW derives the latest one-second fast residual directly from the coherent
+// selected-reference and OCXO DWT intervals.  MEAN uses Alpha's always-on
+// Welford population.
+static clocks_instrument_stats_snapshot_t
+    g_beta_idle_servo_instrument_stats DMAMEM = {};
+
+static double idle_servo_fast_ppb_from_cycles(uint32_t reference_cycles,
+                                               uint32_t clock_cycles) {
+  if (reference_cycles == 0U || clock_cycles == 0U) return 0.0;
+  const int64_t fast_cycles =
+      (int64_t)reference_cycles - (int64_t)clock_cycles;
+  return ((double)fast_cycles * 1.0e9) / (double)reference_cycles;
+}
+
+static void idle_servo_populate_lane(
+    servo_input_diag_t& input,
+    const clocks_instrument_frequency_snapshot_t& frequency,
+    const welford_t& residual_welford,
+    uint32_t reference_cycles,
+    uint32_t clock_cycles,
+    uint64_t elapsed_seconds) {
+  input = servo_input_diag_t{};
+
+  const bool interval_valid =
+      reference_cycles != 0U && clock_cycles != 0U;
+  const double now_ppb = interval_valid
+      ? idle_servo_fast_ppb_from_cycles(reference_cycles, clock_cycles)
+      : 0.0;
+
+  input.pps_residual_valid = interval_valid;
+  input.pps_gnss_interval_ns = interval_valid
+      ? CLOCKS_BETA_NS_PER_SECOND
+      : 0ULL;
+  input.pps_clock_interval_ns = interval_valid
+      ? (uint64_t)((double)CLOCKS_BETA_NS_PER_SECOND -
+                   now_ppb)
+      : 0ULL;
+  input.pps_fast_residual_ns = interval_valid
+      ? (int64_t)llround(now_ppb)
+      : 0LL;
+
+  input.mean_welford_n = residual_welford.n;
+  input.mean_welford_ppb =
+      residual_welford.n ? residual_welford.mean : 0.0;
+  input.mean_input_valid =
+      interval_valid && residual_welford.n >= SERVO_MIN_SAMPLES;
+
+  input.total_tau = frequency.valid ? frequency.tau : 1.0;
+  input.total_ppb = frequency.valid ? frequency.ppb : 0.0;
+  input.total_input_valid =
+      interval_valid &&
+      frequency.valid &&
+      frequency.sample_count >= SERVO_MIN_SAMPLES &&
+      elapsed_seconds >= SERVO_MIN_SAMPLES;
+
+  input.now_ppb = now_ppb;
+  input.now_input_valid = interval_valid;
+
+  input.total_catchup_elapsed_seconds = (double)elapsed_seconds;
+  input.total_catchup_horizon_seconds =
+      SERVO_TOTAL_CATCHUP_HORIZON_SECONDS;
+  input.total_catchup_max_target_ppb =
+      SERVO_TOTAL_CATCHUP_MAX_TARGET_PPB;
+  input.total_catchup_target_now_ppb = 0.0;
+  input.total_catchup_control_error_ppb = input.total_ppb;
+  input.total_catchup_active = false;
+
+  if (input.total_input_valid && input.now_input_valid) {
+    input.total_catchup_target_now_ppb =
+        servo_total_catchup_target_now_ppb(
+            input.total_ppb, elapsed_seconds);
+    input.total_catchup_control_error_ppb =
+        input.now_ppb - input.total_catchup_target_now_ppb;
+    input.total_catchup_active = true;
+  }
+
+  input.selected_residual_ns = 0;
+  if (calibrate_ocxo_mode == servo_mode_t::MEAN) {
+    input.selected_source =
+        SERVO_INPUT_SOURCE_MEAN_PPS_RESIDUAL_WELFORD;
+    input.selected_input_valid = input.mean_input_valid;
+    input.selected_input_ppb =
+        input.mean_input_valid ? input.mean_welford_ppb : 0.0;
+    input.selected_residual_ns =
+        (int64_t)llround(input.selected_input_ppb);
+  } else if (calibrate_ocxo_mode == servo_mode_t::TOTAL) {
+    input.selected_source = SERVO_INPUT_SOURCE_TOTAL_PUBLIC_TAU;
+    input.selected_input_valid = input.total_input_valid;
+    input.selected_input_ppb = input.total_input_valid
+        ? input.total_catchup_control_error_ppb
+        : 0.0;
+    input.selected_residual_ns =
+        (int64_t)llround(input.selected_input_ppb);
+  } else if (calibrate_ocxo_mode == servo_mode_t::NOW) {
+    input.selected_source = SERVO_INPUT_SOURCE_NOW_PPS_RESIDUAL;
+    input.selected_input_valid = input.now_input_valid;
+    input.selected_input_ppb =
+        input.now_input_valid ? input.now_ppb : 0.0;
+    input.selected_residual_ns =
+        input.now_input_valid ? input.pps_fast_residual_ns : 0LL;
+  } else {
+    input.selected_source = SERVO_INPUT_SOURCE_NONE;
+    input.selected_input_valid = false;
+    input.selected_input_ppb = 0.0;
+  }
+}
+
+static void clocks_idle_instrument_servo(uint32_t completed_pps_sequence) {
+  if (calibrate_ocxo_mode == servo_mode_t::OFF) return;
+
+  g_beta_idle_servo_instrument_stats =
+      clocks_instrument_stats_snapshot_t{};
+  if (!clocks_alpha_instrument_stats_snapshot(
+          &g_beta_idle_servo_instrument_stats) ||
+      !g_beta_idle_servo_instrument_stats.valid ||
+      !g_beta_idle_servo_instrument_stats.completed_row_coherent ||
+      g_beta_idle_servo_instrument_stats.last_pps_sequence !=
+          completed_pps_sequence) {
+    return;
+  }
+
+  const uint64_t elapsed_seconds =
+      (uint64_t)g_beta_idle_servo_instrument_stats.update_count;
+
+  idle_servo_populate_lane(
+      g_servo_input_ocxo1,
+      g_beta_idle_servo_instrument_stats.ocxo1_frequency,
+      g_beta_idle_servo_instrument_stats.ocxo1_welford,
+      g_beta_idle_servo_instrument_stats.selected_reference_interval_cycles,
+      g_beta_idle_servo_instrument_stats.ocxo1_interval_cycles,
+      elapsed_seconds);
+  idle_servo_populate_lane(
+      g_servo_input_ocxo2,
+      g_beta_idle_servo_instrument_stats.ocxo2_frequency,
+      g_beta_idle_servo_instrument_stats.ocxo2_welford,
+      g_beta_idle_servo_instrument_stats.selected_reference_interval_cycles,
+      g_beta_idle_servo_instrument_stats.ocxo2_interval_cycles,
+      elapsed_seconds);
+
+  g_servo_control_second = elapsed_seconds;
+  ocxo_calibration_servo();
 }
 
 // ============================================================================
@@ -6452,8 +6613,8 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
     request_stop = false;
     request_zero = false;
     flash_cut_clear_pending();
-    clocks_apply_servo_mode_now(servo_mode_t::OFF);
-    ocxo_dac_pacing_abort_all();
+    // STOP closes the recording namespace only.  Servo mode and any lawful
+    // always-on instrument control continue independently of campaigns.
     campaign_warmup_reset();
     publish_dac_tick("STOP_GATE");
     return;
@@ -6604,10 +6765,17 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
     publish_dac_tick("WATCHDOG_GATE");
     return;
   }
+  // Servo mode is instrument control state, not campaign state.  Commit a live
+  // mode change before the campaign publication gate so OFF/MEAN/TOTAL/NOW take
+  // effect while the instrument is idle.
+  clocks_commit_pending_servo_mode_change();
+
   if (campaign_state != clocks_campaign_state_t::STARTED) {
-    // Idle completed rows still mature Alpha's always-on exact OCXO clockfaces,
-    // but Beta never advances campaign identity or publishes them.
+    // Idle completed rows still mature Alpha's always-on exact OCXO clockfaces.
+    // They now also drive the selected servo from Alpha's coherent instrument
+    // statistics; campaigns remain recording-only.
     timebase_build_stage(TIMEBASE_BUILD_STAGE_NOT_STARTED_GATE);
+    clocks_idle_instrument_servo(completed_pps_sequence);
     publish_dac_tick("NOT_STARTED_GATE");
     return;
   }
@@ -6984,11 +7152,6 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
   g_beta_ocxo2_cycle_prediction =
       prediction_snapshot_for_clock(time_clock_id_t::OCXO2);
 
-  // SERVOS live command handoff is control-plane state, so it still commits on
-  // a rejected campaign row.  Alpha instrument statistics are independent of
-  // this campaign disposition; campaign servo/DAC motion remains gated below.
-  clocks_commit_pending_servo_mode_change();
-
   if (candidate_math_permitted) {
     // Welford/TAU/PPB are Alpha-owned and were updated before this call.
     // Beta reads the mature populations below for servo compatibility only.
@@ -7209,6 +7372,7 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
     }
 
     timebase_build_stage(TIMEBASE_BUILD_STAGE_WELFORD);
+    g_servo_control_second = campaign_seconds;
     ocxo_calibration_servo();
     timebase_build_stage(TIMEBASE_BUILD_STAGE_SERVO);
 
