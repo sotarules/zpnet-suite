@@ -177,8 +177,6 @@ MONITOR_TOPIC = "MONITOR"
 CLOCKS_MONITOR_TOPIC = "CLOCKS_MONITOR"
 CLOCKS_MONITOR_BASELINE_REFRESH_S = 30.0
 MONITOR_PREFLIGHT_MAX_AGE_S = 5.0
-MONITOR_RESTORE_TIMEOUT_S = 60.0
-MONITOR_CHECKPOINT_CONFIG_KEY = "MONITOR"
 CLOCKS_RECOVERY_STALLED_TOPIC = "CLOCKS_RECOVERY_STALLED"
 TIMEBASE_CANDIDATE_ACCEPT = "ACCEPT"
 TIMEBASE_CANDIDATE_SCIENCE_EXCLUDE = "SCIENCE_EXCLUDE"
@@ -508,30 +506,17 @@ _diag: Dict[str, Any] = {
     "recovery_stalled_event_enqueue_failures": 0,
     "last_recovery_stalled": {},
 
-    # Durable raw MONITOR checkpoint / non-campaign recovery.
-    "monitor_checkpoint_updates_queued": 0,
-    "monitor_checkpoint_updates_replaced": 0,
-    "monitor_checkpoint_writes": 0,
-    "monitor_checkpoint_write_failures": 0,
-    "monitor_checkpoint_reads": 0,
-    "monitor_checkpoint_read_failures": 0,
-    "monitor_checkpoint_missing": 0,
-    "monitor_restore_attempts": 0,
-    "monitor_restore_success": 0,
-    "monitor_restore_failures": 0,
-    "monitor_restore_wait_timeouts": 0,
-    "last_monitor_checkpoint_write": {},
-    "last_monitor_checkpoint_read": {},
-    "last_monitor_restore": {},
+    # SYSTEM-owned MONITOR recovery may hand the Pi-owned GNSS_RAW state back
+    # to CLOCKS before CLOCKS startup campaign reconciliation completes.
+    "gnss_raw_monitor_restore_requests": 0,
+    "gnss_raw_monitor_restore_success": 0,
+    "gnss_raw_monitor_restore_failures": 0,
+    "last_gnss_raw_monitor_restore": {},
 
     # CLOCKS startup lifecycle serialization
     "startup_control_ready": False,
     "startup_control_busy_rejections": 0,
     "last_startup_control_rejection": {},
-    "dac_boot_reconciliation_count": 0,
-    "dac_boot_restore_count": 0,
-    "dac_boot_hold_count": 0,
-    "last_dac_boot_reconciliation": {},
 
     # MONITOR_FRAGMENT silence / Teensy restart detection
     "timebase_silence_monitor_started": False,
@@ -840,7 +825,7 @@ def _gnss_raw_welford_reset() -> Dict[str, Any]:
 _campaign_active: bool = False
 
 # The command server is exposed early so PUBSUB can discover subscriptions, but
-# START/RESUME must not race the boot DAC reconciliation and active-campaign recovery.
+# START/RESUME must not race active-campaign recovery.
 _startup_control_ready = threading.Event()
 
 # Latest unified operational heartbeat.  CLOCKS consumes MONITOR.features for
@@ -849,14 +834,6 @@ _monitor_lock = threading.Lock()
 _latest_monitor: Dict[str, Any] = {}
 _latest_monitor_received_monotonic: Optional[float] = None
 _latest_monitor_received_utc: Optional[str] = None
-
-# Raw unified MONITOR persistence is latest-only.  The callback always stages the
-# newest heartbeat, but the writer thread is deliberately started only after boot
-# recovery has consumed the previous config.MONITOR checkpoint.  This prevents a
-# fresh post-reboot empty instrument image from erasing the state needed to
-# resurrect the Teensy.
-_monitor_checkpoint_queue: queue.Queue[Dict[str, Any]] = queue.Queue(maxsize=1)
-_monitor_checkpoint_writer_started = threading.Event()
 
 _last_pps_vclock_count_seen: Optional[int] = None
 
@@ -1771,143 +1748,6 @@ def _ensure_gnss_mode_for_current_location() -> Optional[str]:
     return location
 
 
-def _read_monitor_checkpoint() -> Optional[Dict[str, Any]]:
-    """Read the last raw unified MONITOR checkpoint without changing it."""
-    _diag["monitor_checkpoint_reads"] += 1
-    try:
-        with open_db(row_dict=True) as conn:
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT payload FROM config WHERE config_key = %s",
-                (MONITOR_CHECKPOINT_CONFIG_KEY,),
-            )
-            row = cur.fetchone()
-    except Exception as exc:
-        _diag["monitor_checkpoint_read_failures"] += 1
-        _diag["last_monitor_checkpoint_read"] = {
-            "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-            "success": False,
-            "error": str(exc),
-        }
-        logging.exception("⚠️ [clocks] failed to read config.MONITOR")
-        return None
-
-    if row is None:
-        _diag["monitor_checkpoint_missing"] += 1
-        _diag["last_monitor_checkpoint_read"] = {
-            "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-            "success": True,
-            "present": False,
-        }
-        return None
-
-    payload = row["payload"]
-    if isinstance(payload, str):
-        try:
-            payload = json.loads(payload)
-        except Exception:
-            payload = None
-    if not isinstance(payload, dict):
-        _diag["monitor_checkpoint_read_failures"] += 1
-        _diag["last_monitor_checkpoint_read"] = {
-            "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-            "success": False,
-            "error": "config.MONITOR payload is not an object",
-        }
-        return None
-
-    checkpoint = copy.deepcopy(payload)
-    _diag["last_monitor_checkpoint_read"] = {
-        "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        "success": True,
-        "present": True,
-        "schema": checkpoint.get("schema"),
-        "sequence": checkpoint.get("sequence"),
-    }
-    return checkpoint
-
-
-def _persist_monitor_checkpoint(monitor: Dict[str, Any]) -> None:
-    """Replace config.MONITOR with one completely unchanged raw MONITOR payload."""
-    encoded = json.dumps(monitor, separators=(",", ":"), ensure_ascii=False)
-    with open_db() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            WITH updated AS (
-                UPDATE config
-                SET "timestamp" = now(), payload = %s::jsonb
-                WHERE config_key = %s
-                RETURNING 1
-            )
-            INSERT INTO config (config_key, payload)
-            SELECT %s, %s::jsonb
-            WHERE NOT EXISTS (SELECT 1 FROM updated)
-            """,
-            (
-                encoded,
-                MONITOR_CHECKPOINT_CONFIG_KEY,
-                MONITOR_CHECKPOINT_CONFIG_KEY,
-                encoded,
-            ),
-        )
-
-
-def _queue_monitor_checkpoint(monitor: Dict[str, Any]) -> None:
-    """Stage only the newest recoverable raw MONITOR; never block pub/sub."""
-    if _monitor_recovery_capsule(monitor) is None:
-        return
-    item = copy.deepcopy(monitor)
-    try:
-        _monitor_checkpoint_queue.put_nowait(item)
-    except queue.Full:
-        try:
-            _monitor_checkpoint_queue.get_nowait()
-            _diag["monitor_checkpoint_updates_replaced"] += 1
-        except queue.Empty:
-            pass
-        try:
-            _monitor_checkpoint_queue.put_nowait(item)
-        except queue.Full:
-            # A simultaneous callback won the replacement race.  The queue still
-            # contains a newer-or-equivalent latest-state checkpoint.
-            _diag["monitor_checkpoint_updates_replaced"] += 1
-            return
-    _diag["monitor_checkpoint_updates_queued"] += 1
-
-
-def _monitor_checkpoint_writer_loop() -> None:
-    """Persist latest-state MONITOR checkpoints after boot recovery is complete."""
-    _monitor_checkpoint_writer_started.set()
-    while True:
-        monitor = _monitor_checkpoint_queue.get()
-        # Collapse any backlog produced while the preceding PostgreSQL write was
-        # in flight.  Intermediate monitor samples are intentionally disposable.
-        while True:
-            try:
-                monitor = _monitor_checkpoint_queue.get_nowait()
-                _diag["monitor_checkpoint_updates_replaced"] += 1
-            except queue.Empty:
-                break
-        try:
-            _persist_monitor_checkpoint(monitor)
-            _diag["monitor_checkpoint_writes"] += 1
-            _diag["last_monitor_checkpoint_write"] = {
-                "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                "success": True,
-                "schema": monitor.get("schema"),
-                "sequence": monitor.get("sequence"),
-            }
-        except Exception as exc:
-            _diag["monitor_checkpoint_write_failures"] += 1
-            _diag["last_monitor_checkpoint_write"] = {
-                "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                "success": False,
-                "error": str(exc),
-            }
-            logging.exception("⚠️ [clocks] failed to persist config.MONITOR")
-
-
 def _monitor_clocks_payload(monitor: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if not isinstance(monitor, dict):
         return {}
@@ -1929,16 +1769,15 @@ def _monitor_recovery_capsule(monitor: Optional[Dict[str, Any]]) -> Optional[Dic
     return out
 
 
-def _restore_gnss_raw_from_monitor(monitor: Dict[str, Any]) -> Dict[str, Any]:
+def _restore_gnss_raw_payload(gnss_raw: Dict[str, Any]) -> Dict[str, Any]:
     """Restore the complete Pi-owned always-on GNSS_RAW state."""
     global _gnss_raw_instrument_ns, _gnss_raw_instrument_n
     global _gnss_raw_instrument_valid
     global _gnss_raw_welford_n, _gnss_raw_welford_mean, _gnss_raw_welford_m2
     global _gnss_raw_welford_min, _gnss_raw_welford_max
 
-    gnss_raw = _monitor_clocks_payload(monitor).get("gnss_raw")
     if not isinstance(gnss_raw, dict):
-        return {"restored": False, "reason": "missing clocks.gnss_raw"}
+        return {"restored": False, "reason": "GNSS_RAW state is not an object"}
     instrument = gnss_raw.get("instrument")
     welford = gnss_raw.get("welford")
     if not isinstance(instrument, dict) or not isinstance(welford, dict):
@@ -1958,8 +1797,14 @@ def _restore_gnss_raw_from_monitor(monitor: Dict[str, Any]) -> Dict[str, Any]:
     finite = all(math.isfinite(v) for v in (instrument_ns, mean, m2))
     if n:
         finite = finite and math.isfinite(min_val) and math.isfinite(max_val)
-    if (not finite or instrument_ns < 0.0 or instrument_n < 0 or n < 0 or m2 < 0.0
-            or (n and min_val > max_val)):
+    if (
+        not finite
+        or instrument_ns < 0.0
+        or instrument_n < 0
+        or n < 0
+        or m2 < 0.0
+        or (n and min_val > max_val)
+    ):
         return {"restored": False, "reason": "GNSS_RAW state failed numeric court"}
 
     with _gnss_raw_stats_lock:
@@ -1980,6 +1825,8 @@ def _restore_gnss_raw_from_monitor(monitor: Dict[str, Any]) -> Dict[str, Any]:
         "welford_mean": mean,
         "welford_m2": m2,
     }
+
+
 
 
 def _persist_timebase(tb: Dict[str, Any]) -> None:
@@ -4820,164 +4667,6 @@ def _baseline_dac_stats_from_report(report: Dict[str, Any]) -> Dict[str, Dict[st
     return out
 
 
-def _configured_boot_dacs(cfg: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], str]:
-    """
-    Return DAC values to push to Teensy at boot.
-
-    Precedence is intentionally explicit:
-
-      1. SYSTEM ocxo*_dac — user-selected boot seed, written by SET_DAC
-      2. SYSTEM baseline_dac_mean / baseline_dac — historical baseline fallback
-
-    The processor thread deliberately stores live campaign DAC observations
-    under last_ocxo*_dac so ordinary TIMEBASE ingestion cannot overwrite the
-    operator-selected boot seed.
-    """
-    d1 = _first_float(cfg.get("ocxo1_dac"))
-    d2 = _first_float(cfg.get("ocxo2_dac"))
-    source = "system_ocxo_dac"
-
-    if d1 is None or d2 is None:
-        baseline_mean = cfg.get("baseline_dac_mean") if isinstance(cfg.get("baseline_dac_mean"), dict) else {}
-        baseline_dac = cfg.get("baseline_dac") if isinstance(cfg.get("baseline_dac"), dict) else {}
-        if d1 is None:
-            d1 = _first_float(baseline_mean.get("ocxo1"), baseline_dac.get("ocxo1"))
-            if d1 is not None:
-                source = "baseline_dac"
-        if d2 is None:
-            d2 = _first_float(baseline_mean.get("ocxo2"), baseline_dac.get("ocxo2"))
-            if d2 is not None:
-                source = "baseline_dac"
-
-    return d1, d2, source
-
-
-def _lawful_static_codes(value: float) -> set[int]:
-    """Return integer DAC codes that lawfully represent one persisted target."""
-    clamped = max(0.0, min(65535.0, float(value)))
-    low = int(math.floor(clamped))
-    high = min(65535, low + 1)
-    rounded = int(math.floor(clamped + 0.5))
-    return {low, high, rounded}
-
-
-def _teensy_dac_custody() -> Dict[str, Any]:
-    """Read the Teensy-observed AD5693R custody surface without changing VOUT."""
-    response = send_command(
-        machine="TEENSY",
-        subsystem="CLOCKS",
-        command="DAC_INFO",
-        args={},
-    )
-    if not isinstance(response, dict) or response.get("success") is False:
-        raise RuntimeError(f"Teensy DAC_INFO failed: {response!r}")
-    payload = response.get("payload")
-    if not isinstance(payload, dict):
-        raise RuntimeError(f"Teensy DAC_INFO returned no payload: {response!r}")
-    return dict(payload)
-
-
-def _reconcile_boot_dacs(
-    desired1: Optional[float],
-    desired2: Optional[float],
-    source: str,
-) -> Dict[str, Any]:
-    """Restore only positively reset/unsafe DACs; preserve every plausible survivor."""
-    custody = _teensy_dac_custody()
-    set_args: Dict[str, Any] = {}
-    decisions: Dict[str, Any] = {}
-
-    for lane, desired, arg_name in (
-        ("ocxo1", desired1, "set_dac1"),
-        ("ocxo2", desired2, "set_dac2"),
-    ):
-        observed = custody.get(lane) if isinstance(custody.get(lane), dict) else {}
-        valid = observed.get("readback_valid") is True
-        code = _as_int(observed.get("readback_code"))
-        safe_max = _as_int(observed.get("safe_max_hw_code")) or 43253
-
-        decision: Dict[str, Any] = {
-            "desired": desired,
-            "readback_valid": valid,
-            "observed_code": code,
-            "source": source,
-            "action": "PRESERVE",
-        }
-
-        if desired is None:
-            decision["reason"] = "no_persisted_target"
-        elif not valid or code is None:
-            decision["action"] = "HOLD"
-            decision["reason"] = "readback_unavailable"
-        elif code in _lawful_static_codes(desired):
-            # Preserve the physical output, but reinstall the persisted
-            # fractional target as Teensy control intent.  SET_DAC is a physical
-            # no-op when the current hardware code is already lawful; with
-            # dither enabled it restores the decimal target so the next frame
-            # may realize the floor/ceiling duty cycle.
-            decision["action"] = "INSTALL_INTENT"
-            decision["reason"] = "hardware_preserved_fractional_intent_restored"
-            set_args[arg_name] = str(float(desired))
-        elif code == 0 or code > safe_max:
-            decision["action"] = "RESTORE"
-            decision["reason"] = "power_on_or_unsafe_signature"
-            set_args[arg_name] = str(float(desired))
-        else:
-            decision["action"] = "HOLD"
-            decision["reason"] = "plausible_live_code_differs_from_config"
-
-        decisions[lane] = decision
-
-    response: Dict[str, Any] = {}
-    if set_args:
-        response = send_command(
-            machine="TEENSY",
-            subsystem="CLOCKS",
-            command="SET_DAC",
-            args=set_args,
-        )
-        if not isinstance(response, dict) or response.get("success") is False:
-            raise RuntimeError(f"boot DAC restore failed: {response!r}")
-
-    result = {
-        "schema": "PI_DAC_BOOT_RECONCILIATION_V1",
-        "custody": custody,
-        "decisions": decisions,
-        "restore_args": set_args,
-        "response": response,
-    }
-
-    response_payload = (
-        response.get("payload", {})
-        if isinstance(response, dict) and isinstance(response.get("payload"), dict)
-        else {}
-    )
-    for lane in ("ocxo1", "ocxo2"):
-        decision = decisions[lane]
-        action = str(decision.get("action") or "HOLD")
-        desired = _first_float(decision.get("desired"))
-        observed_code = _as_int(decision.get("observed_code"))
-        value = desired if action in ("INSTALL_INTENT", "RESTORE") else (
-            float(observed_code) if observed_code is not None else desired
-        )
-        voltage = _first_float(response_payload.get(f"{lane}_dac_voltage"))
-        if voltage is None and value is not None:
-            voltage = float(value) * 5.0 / 65536.0
-
-        verb = "set" if action == "RESTORE" else "carried over"
-        if value is None:
-            logging.info("🧤 [clocks] %s DAC %s", lane.upper(), verb)
-        else:
-            logging.info(
-                "🧤 [clocks] %s DAC %s: %.6f (%.6f V)",
-                lane.upper(),
-                verb,
-                float(value),
-                float(voltage or 0.0),
-            )
-    return result
-
-
 def _normalize_start_args(args: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """Return START args with tolerant aliases normalized to firmware names."""
     out: Dict[str, Any] = dict(args or {})
@@ -5921,202 +5610,6 @@ _TEENSY_MONITOR_RESTORE_ACCEPTED_STATUSES = {
 }
 
 
-def _request_teensy_monitor_restore(capsule: str) -> Dict[str, Any]:
-    """Stage one non-campaign restore, retrying only a transient STOP/busy gate."""
-    deadline = time.monotonic() + 10.0
-    last_status = ""
-    last_resp: Any = None
-    while True:
-        resp = send_command(
-            machine="TEENSY",
-            subsystem="CLOCKS",
-            command="RESTORE_MONITOR",
-            args={"recovery_capsule": capsule},
-        )
-        last_resp = resp
-        outer_success = isinstance(resp, dict) and bool(resp.get("success"))
-        payload = resp.get("payload") if isinstance(resp, dict) else None
-        status = str(payload.get("status") or "") if isinstance(payload, dict) else ""
-        last_status = status
-        if outer_success and status in _TEENSY_MONITOR_RESTORE_ACCEPTED_STATUSES:
-            return resp
-        if status == "monitor_restore_rejected_busy" and time.monotonic() < deadline:
-            time.sleep(0.25)
-            continue
-        raise RuntimeError(
-            "Teensy CLOCKS.RESTORE_MONITOR rejected: "
-            f"status={last_status or 'missing_handler_status'} "
-            f"outer_success={outer_success} response={last_resp!r}"
-        )
-
-
-def _monitor_restore_probe(monitor: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """Extract the durable surfaces used to prove an idle restore completed."""
-    clocks = _monitor_clocks_payload(monitor)
-    instrument = clocks.get("instrument_clockfaces")
-    stats = clocks.get("stats")
-    dac = clocks.get("dac")
-    if not isinstance(instrument, dict):
-        instrument = {}
-    if not isinstance(stats, dict):
-        stats = {}
-    if not isinstance(dac, dict):
-        dac = {}
-
-    welford_n: Dict[str, int] = {}
-    for lane in ("gnss", "dwt", "vclock", "ocxo1", "ocxo2", "pps_witness"):
-        node = stats.get(lane)
-        wf = node.get("welford") if isinstance(node, dict) else None
-        try:
-            welford_n[lane] = int(wf.get("n") or 0) if isinstance(wf, dict) else 0
-        except (TypeError, ValueError):
-            welford_n[lane] = 0
-    dac_stats = stats.get("dac")
-    for lane in ("ocxo1", "ocxo2"):
-        wf = dac_stats.get(lane) if isinstance(dac_stats, dict) else None
-        try:
-            welford_n[f"dac.{lane}"] = int(wf.get("n") or 0) if isinstance(wf, dict) else 0
-        except (TypeError, ValueError):
-            welford_n[f"dac.{lane}"] = 0
-
-    def _int_value(value: Any) -> int:
-        try:
-            return int(value or 0)
-        except (TypeError, ValueError):
-            return 0
-
-    def _float_value(value: Any) -> Optional[float]:
-        try:
-            out = float(value)
-        except (TypeError, ValueError):
-            return None
-        return out if math.isfinite(out) else None
-
-    return {
-        "instrument_gnss_ns": _int_value(instrument.get("gnss_ns")),
-        "instrument_dwt_cycles": _int_value(instrument.get("dwt_cycles")),
-        "instrument_ocxo1_ns": _int_value(instrument.get("ocxo1_ns")),
-        "instrument_ocxo2_ns": _int_value(instrument.get("ocxo2_ns")),
-        "welford_n": welford_n,
-        "servo_mode": str(dac.get("servo_mode") or dac.get("calibrate_ocxo") or "OFF").upper(),
-        "dither_operator_enabled": bool(dac.get("dither_operator_enabled")),
-        "ocxo1_dac": _float_value(dac.get("ocxo1_dac")),
-        "ocxo2_dac": _float_value(dac.get("ocxo2_dac")),
-    }
-
-
-def _monitor_restore_probe_satisfied(
-    expected: Dict[str, Any],
-    observed: Dict[str, Any],
-) -> bool:
-    for key in (
-        "instrument_gnss_ns",
-        "instrument_dwt_cycles",
-        "instrument_ocxo1_ns",
-        "instrument_ocxo2_ns",
-    ):
-        target = int(expected.get(key) or 0)
-        if target > 0 and int(observed.get(key) or 0) < target:
-            return False
-
-    expected_n = expected.get("welford_n")
-    observed_n = observed.get("welford_n")
-    if isinstance(expected_n, dict) and isinstance(observed_n, dict):
-        for key, target_value in expected_n.items():
-            target = int(target_value or 0)
-            if target > 0 and int(observed_n.get(key) or 0) < target:
-                return False
-
-    if str(observed.get("servo_mode") or "OFF").upper() != str(
-        expected.get("servo_mode") or "OFF"
-    ).upper():
-        return False
-    if bool(observed.get("dither_operator_enabled")) != bool(
-        expected.get("dither_operator_enabled")
-    ):
-        return False
-    for key in ("ocxo1_dac", "ocxo2_dac"):
-        target = expected.get(key)
-        value = observed.get(key)
-        if target is not None and (value is None or abs(float(value) - float(target)) > 0.01):
-            return False
-    return True
-
-
-def _wait_for_monitor_restore(
-    checkpoint: Dict[str, Any],
-    *,
-    requested_monotonic: float,
-    timeout_s: float = MONITOR_RESTORE_TIMEOUT_S,
-) -> Dict[str, Any]:
-    """Wait for a fresh unified MONITOR proving the staged restore committed."""
-    expected = _monitor_restore_probe(checkpoint)
-    deadline = time.monotonic() + float(timeout_s)
-    last_observed: Dict[str, Any] = {}
-    while time.monotonic() < deadline:
-        with _monitor_lock:
-            monitor = copy.deepcopy(_latest_monitor)
-            received = _latest_monitor_received_monotonic
-        if received is not None and received > requested_monotonic and monitor:
-            last_observed = _monitor_restore_probe(monitor)
-            if _monitor_restore_probe_satisfied(expected, last_observed):
-                return {
-                    "proved": True,
-                    "expected": expected,
-                    "observed": last_observed,
-                    "monitor_sequence": monitor.get("sequence"),
-                    "waited_s": round(max(0.0, time.monotonic() - requested_monotonic), 3),
-                }
-        time.sleep(0.1)
-
-    _diag["monitor_restore_wait_timeouts"] += 1
-    raise TimeoutError(
-        "timed out waiting for restored MONITOR state "
-        f"after {timeout_s:.1f}s; expected={expected!r} observed={last_observed!r}"
-    )
-
-
-def _recover_idle_monitor(checkpoint: Dict[str, Any]) -> Dict[str, Any]:
-    """Restore non-campaign Teensy and Pi instrument state from config.MONITOR."""
-    _diag["monitor_restore_attempts"] += 1
-    capsule = _monitor_recovery_capsule(checkpoint)
-    if capsule is None:
-        raise RuntimeError("config.MONITOR has no firmware recovery capsule")
-
-    encoded = str(capsule.get("capsule") or "").strip()
-    requested_monotonic = time.monotonic()
-    teensy_resp = _request_teensy_monitor_restore(encoded)
-    pi_restore = _restore_gnss_raw_from_monitor(checkpoint)
-    if not pi_restore.get("restored"):
-        raise RuntimeError(f"Pi GNSS_RAW restore failed: {pi_restore.get('reason')}")
-    proof = _wait_for_monitor_restore(
-        checkpoint,
-        requested_monotonic=requested_monotonic,
-    )
-    result = {
-        "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        "success": True,
-        "mode": "NON_CAMPAIGN_MONITOR",
-        "checkpoint_sequence": checkpoint.get("sequence"),
-        "capsule_version": capsule.get("version"),
-        "capsule_crc32": capsule.get("crc32"),
-        "pi_gnss_raw": pi_restore,
-        "teensy": teensy_resp.get("payload") if isinstance(teensy_resp, dict) else None,
-        "proof": proof,
-    }
-    _diag["monitor_restore_success"] += 1
-    _diag["last_monitor_restore"] = result
-    logging.info(
-        "✅ [recovery/monitor] restored idle instrument state: sequence=%s "
-        "gnss_n=%s servo=%s waited=%.3fs",
-        checkpoint.get("sequence"),
-        pi_restore.get("welford_n"),
-        proof.get("observed", {}).get("servo_mode"),
-        float(proof.get("waited_s") or 0.0),
-    )
-    return result
-
-
 _TEENSY_RECOVER_ACCEPTED_STATUSES = {
     "recover_requested",
     "recover_already_active",
@@ -6793,6 +6286,46 @@ def cmd_stats_reset(_: Optional[dict]) -> Dict[str, Any]:
         "GNSS_RAW N %d -> %d; campaign and clockfaces preserved",
         int(pi_previous.get("n") or 0),
         int(pi_after.get("n") or 0),
+    )
+    return {"success": True, "message": "OK", "payload": result}
+
+
+def cmd_restore_gnss_raw(args: Optional[dict]) -> Dict[str, Any]:
+    """Restore Pi-owned GNSS_RAW state under SYSTEM-owned MONITOR recovery."""
+    _diag["gnss_raw_monitor_restore_requests"] += 1
+    raw_state: Any = (args or {}).get("state")
+    if isinstance(raw_state, str):
+        try:
+            raw_state = json.loads(raw_state)
+        except Exception as exc:
+            _diag["gnss_raw_monitor_restore_failures"] += 1
+            result = {
+                "restored": False,
+                "reason": f"invalid GNSS_RAW JSON: {exc}",
+            }
+            _diag["last_gnss_raw_monitor_restore"] = result
+            return {"success": False, "message": result["reason"], "payload": result}
+
+    result = _restore_gnss_raw_payload(raw_state)
+    result = {
+        "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        **result,
+    }
+    _diag["last_gnss_raw_monitor_restore"] = result
+    if not result.get("restored"):
+        _diag["gnss_raw_monitor_restore_failures"] += 1
+        return {
+            "success": False,
+            "message": str(result.get("reason") or "GNSS_RAW restore failed"),
+            "payload": result,
+        }
+
+    _diag["gnss_raw_monitor_restore_success"] += 1
+    _publish_clocks_monitor()
+    logging.info(
+        "✅ [clocks] SYSTEM restored GNSS_RAW monitor state: instrument_n=%s welford_n=%s",
+        result.get("instrument_n"),
+        result.get("welford_n"),
     )
     return {"success": True, "message": "OK", "payload": result}
 
@@ -7894,7 +7427,6 @@ def on_monitor(payload: Optional[dict]) -> None:
         _latest_monitor_received_utc = now_utc
 
     _diag["preflight_monitor_updates"] += 1
-    _queue_monitor_checkpoint(payload)
 
 
 def _monitor_features() -> Dict[str, Any]:
@@ -9006,6 +8538,7 @@ COMMANDS = {
     "REPORT_CLOCKS": cmd_report_clocks,
     "REPORT_STATS": cmd_report_stats,
     "STATS_RESET": cmd_stats_reset,
+    "RESTORE_GNSS_RAW": cmd_restore_gnss_raw,
     "CLEAR": cmd_clear,
     "DELETE": cmd_delete,
     "TRUNCATE": cmd_truncate,
@@ -9021,56 +8554,18 @@ COMMANDS = {
 # Entrypoint
 # ---------------------------------------------------------------------
 
-def _legacy_boot_control_reconcile() -> Dict[str, Any]:
-    """Fallback for installations that do not yet have a recoverable MONITOR."""
-    cfg = _get_system_config()
-    if cfg.get("dither") is not None or cfg.get("dither_rate_hz") is not None:
-        logging.info(
-            "🧤 [clocks] legacy boot fallback preserved hardware dither state; "
-            "configured dither=%s rate_hz=%s was not armed",
-            cfg.get("dither"),
-            cfg.get("dither_rate_hz"),
-        )
-    boot_dac1, boot_dac2, boot_dac_source = _configured_boot_dacs(cfg)
-    reconciliation = _reconcile_boot_dacs(
-        boot_dac1, boot_dac2, boot_dac_source,
-    )
-    _diag["dac_boot_reconciliation_count"] += 1
-    _diag["last_dac_boot_reconciliation"] = reconciliation
-    _diag["dac_boot_restore_count"] += sum(
-        1 for decision in reconciliation["decisions"].values()
-        if decision.get("action") == "RESTORE"
-    )
-    _diag["dac_boot_hold_count"] += sum(
-        1 for decision in reconciliation["decisions"].values()
-        if decision.get("action") == "HOLD"
-    )
-    return reconciliation
-
-
-def _start_monitor_checkpoint_writer() -> None:
-    if _monitor_checkpoint_writer_started.is_set():
-        return
-    threading.Thread(
-        target=_monitor_checkpoint_writer_loop,
-        daemon=True,
-        name="clocks-monitor-checkpoint-writer",
-    ).start()
-
-
 def startup_teensy_quiet_delay() -> None:
     """
-    Let pubsub discover CLOCKS routes before boot reconciliation or campaign recovery.
+    Let pubsub discover CLOCKS routes before active-campaign recovery.
     """
     logging.info(
         "⏳ [clocks] waiting %.1fs for pubsub routing and Teensy initialization "
-        "before boot control-state reconciliation or campaign recovery",
+        "before active-campaign recovery",
         STARTUP_TEENSY_QUIET_DELAY_S,
     )
     time.sleep(STARTUP_TEENSY_QUIET_DELAY_S)
     logging.info(
-        "✅ [clocks] startup quiet delay complete — boot control-state reconciliation "
-        "and recovery may begin"
+        "✅ [clocks] startup quiet delay complete — campaign recovery may begin"
     )
 
 
@@ -9085,19 +8580,18 @@ def run() -> None:
         "🕐 [clocks] unified PPS/VCLOCK TIMEBASE candidate schema. Teensy PPS/VCLOCK count is canonical. "
         "Four clock domains: GNSS (reference), DWT, OCXO1, OCXO2. "
         "The Teensy emits one always-on MONITOR_FRAGMENT; campaign rows ride inside campaign_row and the Pi is the final TIMEBASE arbiter. "
+        "SYSTEM owns MONITOR checkpoint persistence and always-on restore; CLOCKS restores only active campaigns from TIMEBASE. "
         "Every coherent PPS second persists; objections make it AUDIT_ONLY while continuity loss triggers recovery. "
         "START while active performs seamless flash-cut to new campaign. "
-        "Commands: START, STOP, RESUME, RECOVER_ABORT, REPORT, REPORT_CLOCKS, REPORT_STATS, STATS_RESET, CLEAR, DELETE, TRUNCATE, SET_DAC, DITHER, "
+        "Commands: START, STOP, RESUME, RECOVER_ABORT, RESTORE_GNSS_RAW, REPORT, REPORT_CLOCKS, REPORT_STATS, STATS_RESET, CLEAR, DELETE, TRUNCATE, SET_DAC, DITHER, "
         "SET_BASELINE, BASELINE_INFO, LIST_CAMPAIGNS, CLOCKS_INFO. "
         "Subscriptions: MONITOR, MONITOR_FRAGMENT, GNSS_ANNOUNCEMENT, WATCHDOG_ANOMALY, CLOCKS_RECOVERY_STALLED. "
         "Publications: TIMEBASE, CLOCKS_MONITOR (Pi decoration merged into unified MONITOR)."
     )
 
-    # Start command + pubsub servers first, but hold off on active work.
-    #
-    # Pubsub can now query CLOCKS.SUBSCRIPTIONS and build routing while CLOCKS
-    # avoids the dangerous post-flash behavior: boot DAC/DITHER pushes and
-    # active campaign recovery colliding with other startup traffic.
+    # Expose commands and subscriptions immediately.  SYSTEM may invoke the
+    # startup-safe RESTORE_GNSS_RAW handoff while this process is still inside
+    # its longer quiet barrier.
     server_setup(
         subsystem="CLOCKS",
         commands=COMMANDS,
@@ -9113,129 +8607,51 @@ def run() -> None:
 
     startup_teensy_quiet_delay()
 
-    # Read the previous durable MONITOR before any writer is allowed to run.
-    # Pub/sub callbacks may already be staging fresh post-boot heartbeats in the
-    # latest-only queue, but they cannot overwrite PostgreSQL until recovery has
-    # selected its authority and completed.
-    boot_monitor_checkpoint = _read_monitor_checkpoint()
-
-    # GNSS_RAW statistics now advance directly from GNSS_ANNOUNCEMENT.
-
-    # Start processor thread
     threading.Thread(
         target=_process_loop,
         daemon=True,
         name="clocks-processor",
     ).start()
 
-    # Start live Teensy reboot / MONITOR_FRAGMENT silence monitor.
     threading.Thread(
         target=_timebase_silence_monitor_loop,
         daemon=True,
         name="clocks-timebase-silence-monitor",
     ).start()
 
-    # Select exactly one recovery authority.  TIMEBASE owns an active campaign;
-    # config.MONITOR owns the always-on instrument when no campaign is active.
-    # The checkpoint writer remains closed until this transaction finishes.
-    checkpoint_writer_allowed = True
+    # Campaign recovery is the only CLOCKS-owned boot recovery.  With no active
+    # campaign, _recover_campaign() returns without touching the always-on state
+    # already restored by SYSTEM.  With an active campaign, TIMEBASE deliberately
+    # supersedes that earlier MONITOR restore.
     try:
-        row = _get_active_campaign()
-        if row is None:
-            _request_teensy_stop_best_effort()
-            checkpoint_capsule = _monitor_recovery_capsule(boot_monitor_checkpoint)
-            if checkpoint_capsule is not None and boot_monitor_checkpoint is not None:
-                try:
-                    _recover_idle_monitor(boot_monitor_checkpoint)
-                except Exception as exc:
-                    _diag["monitor_restore_failures"] += 1
-                    _diag["last_monitor_restore"] = {
-                        "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                        "success": False,
-                        "mode": "NON_CAMPAIGN_MONITOR",
-                        "error": str(exc),
-                        "checkpoint_sequence": boot_monitor_checkpoint.get("sequence"),
-                    }
-                    # Preserve the last known-good config.MONITOR for another
-                    # reboot/retry.  Continue in a degraded legacy-control mode,
-                    # but do not let this boot overwrite the recovery evidence.
-                    checkpoint_writer_allowed = False
-                    logging.exception(
-                        "💥 [recovery/monitor] idle instrument restore failed; "
-                        "preserving config.MONITOR and applying legacy DAC fallback"
-                    )
-                    try:
-                        _legacy_boot_control_reconcile()
-                    except Exception:
-                        logging.exception(
-                            "⚠️ [clocks] legacy boot control fallback also failed"
-                        )
-            else:
-                logging.info(
-                    "ℹ️ [recovery/monitor] no recoverable config.MONITOR; "
-                    "using legacy SYSTEM control seeds"
-                )
-                _legacy_boot_control_reconcile()
-
-            try:
-                effective_location = _ensure_gnss_mode_for_current_location()
-                if effective_location:
-                    logging.info(
-                        "📡 [clocks] boot idle state — GNSS kept in TO mode for '%s'",
-                        effective_location,
-                    )
-                else:
-                    logging.info("📡 [clocks] boot idle state — GNSS in NORMAL mode")
-            except Exception:
-                logging.exception(
-                    "⚠️ [clocks] failed to reconcile GNSS mode at boot idle"
-                )
-        else:
-            try:
-                _recover_campaign()
-            except TeensyStartRejected as e:
-                logging.error(
-                    "💥 [clocks] boot START rejected (%s); command interface remains available",
-                    e.status,
-                )
-                _cleanup_after_recovery_failure(
-                    "boot_start_rejected",
-                    {"error": str(e), "status": e.status},
-                )
-            except Exception as e:
-                logging.exception(
-                    "💥 [clocks] boot campaign recovery failed; command interface remains available"
-                )
-                _cleanup_after_recovery_failure(
-                    "boot_recovery_failed",
-                    {"error": str(e)},
-                )
-    except Exception as e:
+        _recover_campaign()
+    except TeensyStartRejected as exc:
+        logging.error(
+            "💥 [clocks] boot START rejected (%s); command interface remains available",
+            exc.status,
+        )
+        _cleanup_after_recovery_failure(
+            "boot_start_rejected",
+            {"error": str(exc), "status": exc.status},
+        )
+    except Exception as exc:
         logging.exception(
-            "💥 [clocks] boot lifecycle reconciliation failed; command interface remains available"
+            "💥 [clocks] boot campaign recovery failed; command interface remains available"
         )
         try:
             _cleanup_after_recovery_failure(
-                "boot_lifecycle_reconciliation_failed",
-                {"error": str(e)},
+                "boot_recovery_failed",
+                {"error": str(exc)},
             )
         except Exception:
-            logging.exception("⚠️ [clocks] boot lifecycle cleanup also failed")
+            logging.exception("⚠️ [clocks] boot campaign cleanup also failed")
     finally:
-        if checkpoint_writer_allowed:
-            _start_monitor_checkpoint_writer()
-        else:
-            logging.warning(
-                "🧤 [clocks] MONITOR checkpoint writer held closed to preserve "
-                "the last recoverable checkpoint after restore failure"
-            )
         _startup_control_ready.set()
         _diag["startup_control_ready"] = True
         logging.info(
-            "✅ [clocks] startup control reconciliation complete — START/RESUME enabled"
+            "✅ [clocks] startup campaign reconciliation complete — START/RESUME enabled"
         )
 
-    # Block forever
     logging.info("🏁 [clocks] entering main loop")
     while True:
         time.sleep(3600)

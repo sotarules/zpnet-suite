@@ -17,9 +17,13 @@ Process model:
 
 from __future__ import annotations
 
+import copy
 import datetime
 from collections import deque
+import json
 import logging
+import math
+import queue
 import os
 import platform
 import random
@@ -65,6 +69,13 @@ CLOCKS_MONITOR_TOPIC = "CLOCKS_MONITOR"
 GNSS_ANNOUNCEMENT_TOPIC = "GNSS_ANNOUNCEMENT"
 GNSS_MONITOR_FRESHNESS_MAX_AGE_S = 2.5
 GNSS_ANNOUNCEMENT_HISTORY_MAX = 8
+MONITOR_CHECKPOINT_CONFIG_KEY = "MONITOR"
+MONITOR_RESTORE_TIMEOUT_S = 60.0
+MONITOR_RESTORE_COMMAND_RETRY_S = 10.0
+
+_TEENSY_MONITOR_RESTORE_ACCEPTED_STATUSES = {
+    "monitor_restore_requested",
+}
 
 # ------------------------------------------------------------------
 # Raspberry Pi status configuration
@@ -251,6 +262,14 @@ _GNSS_ANNOUNCEMENT_RECEIVED = 0
 _GNSS_ANNOUNCEMENT_MALFORMED = 0
 _GNSS_ANNOUNCEMENT_EXACT_MATCHES = 0
 _GNSS_ANNOUNCEMENT_FALLBACK_MATCHES = 0
+
+# SYSTEM owns the durable unified MONITOR checkpoint and the boot restore
+# transaction.  Callbacks may stage fresh checkpoints immediately, but the
+# writer starts only after the previous checkpoint has been consumed and its
+# restore has either succeeded or been found unavailable.
+_LATEST_MONITOR_RECEIVED_MONOTONIC: Optional[float] = None
+_MONITOR_CHECKPOINT_QUEUE: queue.Queue[Dict[str, Any]] = queue.Queue(maxsize=1)
+_MONITOR_CHECKPOINT_WRITER_STARTED = threading.Event()
 
 # ------------------------------------------------------------------
 # Feature status clearing house
@@ -1509,6 +1528,455 @@ def build_battery_status() -> dict:
 
 
 # ------------------------------------------------------------------
+# Durable MONITOR checkpoint and boot recovery
+# ------------------------------------------------------------------
+
+def _read_monitor_checkpoint() -> Optional[Dict[str, Any]]:
+    """Read the last unified MONITOR checkpoint without changing it."""
+    try:
+        with open_db(row_dict=True) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT payload FROM config WHERE config_key = %s",
+                (MONITOR_CHECKPOINT_CONFIG_KEY,),
+            )
+            row = cur.fetchone()
+    except Exception:
+        logging.exception("⚠️ [system/recovery] failed to read config.MONITOR")
+        return None
+
+    if row is None:
+        return None
+
+    payload = row["payload"]
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except Exception:
+            payload = None
+    if not isinstance(payload, dict):
+        logging.error("💥 [system/recovery] config.MONITOR payload is not an object")
+        return None
+    return copy.deepcopy(payload)
+
+
+def _persist_monitor_checkpoint(monitor: Dict[str, Any]) -> None:
+    """Replace config.MONITOR with one unchanged unified MONITOR payload."""
+    encoded = json.dumps(monitor, separators=(",", ":"), ensure_ascii=False)
+    with open_db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            WITH updated AS (
+                UPDATE config
+                SET "timestamp" = now(), payload = %s::jsonb
+                WHERE config_key = %s
+                RETURNING 1
+            )
+            INSERT INTO config (config_key, payload)
+            SELECT %s, %s::jsonb
+            WHERE NOT EXISTS (SELECT 1 FROM updated)
+            """,
+            (
+                encoded,
+                MONITOR_CHECKPOINT_CONFIG_KEY,
+                MONITOR_CHECKPOINT_CONFIG_KEY,
+                encoded,
+            ),
+        )
+
+
+def _monitor_clocks_payload(monitor: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not isinstance(monitor, dict):
+        return {}
+    clocks = monitor.get("clocks")
+    return clocks if isinstance(clocks, dict) else {}
+
+
+def _monitor_recovery_capsule(monitor: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Return the opaque firmware capsule object from a unified MONITOR."""
+    capsule = _monitor_clocks_payload(monitor).get("restore_capsule")
+    if not isinstance(capsule, dict):
+        return None
+    encoded = capsule.get("capsule")
+    if not isinstance(encoded, str) or not encoded.strip():
+        return None
+    result = copy.deepcopy(capsule)
+    result["capsule"] = encoded.strip()
+    return result
+
+
+def _monitor_gnss_raw_payload(monitor: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Return the Pi CLOCKS-owned GNSS_RAW state carried by MONITOR."""
+    gnss_raw = _monitor_clocks_payload(monitor).get("gnss_raw")
+    return copy.deepcopy(gnss_raw) if isinstance(gnss_raw, dict) else None
+
+
+def _queue_monitor_checkpoint(monitor: Dict[str, Any]) -> None:
+    """Stage only the newest fully recoverable MONITOR; never block pub/sub."""
+    if (
+        _monitor_recovery_capsule(monitor) is None
+        or _monitor_gnss_raw_payload(monitor) is None
+    ):
+        return
+
+    item = copy.deepcopy(monitor)
+    try:
+        _MONITOR_CHECKPOINT_QUEUE.put_nowait(item)
+        return
+    except queue.Full:
+        pass
+
+    try:
+        _MONITOR_CHECKPOINT_QUEUE.get_nowait()
+    except queue.Empty:
+        pass
+
+    try:
+        _MONITOR_CHECKPOINT_QUEUE.put_nowait(item)
+    except queue.Full:
+        # Another callback won the latest-state replacement race.
+        pass
+
+
+def _monitor_checkpoint_writer_loop() -> None:
+    """Persist latest-state MONITOR checkpoints after boot recovery completes."""
+    _MONITOR_CHECKPOINT_WRITER_STARTED.set()
+    while True:
+        monitor = _MONITOR_CHECKPOINT_QUEUE.get()
+        while True:
+            try:
+                monitor = _MONITOR_CHECKPOINT_QUEUE.get_nowait()
+            except queue.Empty:
+                break
+        try:
+            _persist_monitor_checkpoint(monitor)
+        except Exception:
+            logging.exception("⚠️ [system] failed to persist config.MONITOR")
+
+
+def _start_monitor_checkpoint_writer() -> None:
+    if _MONITOR_CHECKPOINT_WRITER_STARTED.is_set():
+        return
+    threading.Thread(
+        target=_monitor_checkpoint_writer_loop,
+        daemon=True,
+        name="system-monitor-checkpoint-writer",
+    ).start()
+
+
+def _seed_system_from_checkpoint(checkpoint: Dict[str, Any]) -> None:
+    """Publish the last unified state immediately and seed CLOCKS decoration."""
+    global SYSTEM
+    global _LATEST_MONITOR_RECEIVED_MONOTONIC
+    global _LATEST_CLOCKS_MONITOR
+    global _LATEST_CLOCKS_MONITOR_RECEIVED_MONOTONIC
+    global _LATEST_CLOCKS_MONITOR_RECEIVED_UTC
+
+    seeded_at_utc = datetime.datetime.now(datetime.timezone.utc) \
+        .isoformat() \
+        .replace("+00:00", "Z")
+    clocks = _monitor_clocks_payload(checkpoint)
+    pi_clocks = clocks.get("pi")
+    if not isinstance(pi_clocks, dict):
+        pi_clocks = {
+            "schema": clocks.get("pi_schema"),
+            "gnss_raw": _dict_copy(clocks.get("gnss_raw")),
+            "extra_clocks": _dict_copy(clocks.get("extra_clocks")),
+            "baseline": _dict_copy(clocks.get("baseline")),
+            "stats_reset": _dict_copy(clocks.get("stats_reset")),
+        }
+
+    with _CLOCKS_MONITOR_LOCK:
+        _LATEST_CLOCKS_MONITOR = copy.deepcopy(pi_clocks)
+        _LATEST_CLOCKS_MONITOR_RECEIVED_MONOTONIC = time.monotonic()
+        _LATEST_CLOCKS_MONITOR_RECEIVED_UTC = seeded_at_utc
+
+    with _SYSTEM_LOCK:
+        SYSTEM = copy.deepcopy(checkpoint)
+        _LATEST_MONITOR_RECEIVED_MONOTONIC = time.monotonic()
+
+    # The checkpoint writer is still closed, so this immediate display seed
+    # cannot overwrite the durable recovery authority.
+    publish("MONITOR", copy.deepcopy(checkpoint))
+
+
+def _request_teensy_monitor_restore(capsule: str) -> Dict[str, Any]:
+    """Stage one firmware MONITOR restore, retrying only the transient busy gate."""
+    deadline = time.monotonic() + MONITOR_RESTORE_COMMAND_RETRY_S
+    last_response: Any = None
+    while True:
+        response = send_command(
+            machine="TEENSY",
+            subsystem="CLOCKS",
+            command="RESTORE_MONITOR",
+            args={"recovery_capsule": capsule},
+        )
+        last_response = response
+        outer_success = isinstance(response, dict) and bool(response.get("success"))
+        payload = response.get("payload") if isinstance(response, dict) else None
+        status = str(payload.get("status") or "") if isinstance(payload, dict) else ""
+        if outer_success and status in _TEENSY_MONITOR_RESTORE_ACCEPTED_STATUSES:
+            return response
+        if outer_success and status == "monitor_restore_rejected_busy":
+            campaign_state = str(
+                payload.get("campaign_state") or ""
+            ).strip().upper() if isinstance(payload, dict) else ""
+            if campaign_state == "STARTED":
+                # A live Teensy campaign already owns the instrument.  This is a
+                # lawful supersession of MONITOR recovery, not a restore fault.
+                return response
+            if time.monotonic() < deadline:
+                time.sleep(0.25)
+                continue
+        raise RuntimeError(
+            "Teensy CLOCKS.RESTORE_MONITOR rejected: "
+            f"status={status or 'missing_handler_status'} "
+            f"outer_success={outer_success} response={last_response!r}"
+        )
+
+
+def _request_clocks_gnss_raw_restore(gnss_raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Hand Pi-owned GNSS_RAW state to its CLOCKS process owner."""
+    deadline = time.monotonic() + MONITOR_RESTORE_COMMAND_RETRY_S
+    last_error: Optional[BaseException] = None
+    while True:
+        try:
+            response = send_command(
+                machine="PI",
+                subsystem="CLOCKS",
+                command="RESTORE_GNSS_RAW",
+                args={
+                    "state": json.dumps(
+                        gnss_raw,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                    )
+                },
+                retries=1,
+                retry_delay_s=0.0,
+            )
+            if isinstance(response, dict) and response.get("success"):
+                return response
+            last_error = RuntimeError(f"CLOCKS.RESTORE_GNSS_RAW rejected: {response!r}")
+        except Exception as exc:
+            last_error = exc
+
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"CLOCKS.RESTORE_GNSS_RAW unavailable: {last_error}"
+            ) from last_error
+        time.sleep(0.25)
+
+
+def _monitor_restore_probe(monitor: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Extract the durable surfaces used to prove a MONITOR restore completed."""
+    clocks = _monitor_clocks_payload(monitor)
+    instrument = clocks.get("instrument_clockfaces")
+    stats = clocks.get("stats")
+    dac = clocks.get("dac")
+    if not isinstance(instrument, dict):
+        instrument = {}
+    if not isinstance(stats, dict):
+        stats = {}
+    if not isinstance(dac, dict):
+        dac = {}
+
+    welford_n: Dict[str, int] = {}
+    for lane in ("gnss", "dwt", "vclock", "ocxo1", "ocxo2", "pps_witness"):
+        node = stats.get(lane)
+        wf = node.get("welford") if isinstance(node, dict) else None
+        try:
+            welford_n[lane] = int(wf.get("n") or 0) if isinstance(wf, dict) else 0
+        except (TypeError, ValueError):
+            welford_n[lane] = 0
+
+    dac_stats = stats.get("dac")
+    for lane in ("ocxo1", "ocxo2"):
+        wf = dac_stats.get(lane) if isinstance(dac_stats, dict) else None
+        try:
+            welford_n[f"dac.{lane}"] = int(wf.get("n") or 0) if isinstance(wf, dict) else 0
+        except (TypeError, ValueError):
+            welford_n[f"dac.{lane}"] = 0
+
+    def _int_value(value: Any) -> int:
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _float_value(value: Any) -> Optional[float]:
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            return None
+        return result if math.isfinite(result) else None
+
+    return {
+        "instrument_gnss_ns": _int_value(instrument.get("gnss_ns")),
+        "instrument_dwt_cycles": _int_value(instrument.get("dwt_cycles")),
+        "instrument_ocxo1_ns": _int_value(instrument.get("ocxo1_ns")),
+        "instrument_ocxo2_ns": _int_value(instrument.get("ocxo2_ns")),
+        "welford_n": welford_n,
+        "servo_mode": str(dac.get("servo_mode") or dac.get("calibrate_ocxo") or "OFF").upper(),
+        "dither_operator_enabled": bool(dac.get("dither_operator_enabled")),
+        "ocxo1_dac": _float_value(dac.get("ocxo1_dac")),
+        "ocxo2_dac": _float_value(dac.get("ocxo2_dac")),
+    }
+
+
+def _monitor_restore_probe_satisfied(
+    expected: Dict[str, Any],
+    observed: Dict[str, Any],
+) -> bool:
+    for key in (
+        "instrument_gnss_ns",
+        "instrument_dwt_cycles",
+        "instrument_ocxo1_ns",
+        "instrument_ocxo2_ns",
+    ):
+        target = int(expected.get(key) or 0)
+        if target > 0 and int(observed.get(key) or 0) < target:
+            return False
+
+    expected_n = expected.get("welford_n")
+    observed_n = observed.get("welford_n")
+    if isinstance(expected_n, dict) and isinstance(observed_n, dict):
+        for key, target_value in expected_n.items():
+            target = int(target_value or 0)
+            if target > 0 and int(observed_n.get(key) or 0) < target:
+                return False
+
+    if str(observed.get("servo_mode") or "OFF").upper() != str(
+        expected.get("servo_mode") or "OFF"
+    ).upper():
+        return False
+    if bool(observed.get("dither_operator_enabled")) != bool(
+        expected.get("dither_operator_enabled")
+    ):
+        return False
+    for key in ("ocxo1_dac", "ocxo2_dac"):
+        target = expected.get(key)
+        value = observed.get(key)
+        if target is not None and (
+            value is None or abs(float(value) - float(target)) > 0.01
+        ):
+            return False
+    return True
+
+
+def _wait_for_monitor_restore(
+    checkpoint: Dict[str, Any],
+    *,
+    requested_monotonic: float,
+    timeout_s: float = MONITOR_RESTORE_TIMEOUT_S,
+) -> Dict[str, Any]:
+    """Wait for a fresh unified MONITOR proving the staged restore committed."""
+    expected = _monitor_restore_probe(checkpoint)
+    deadline = time.monotonic() + float(timeout_s)
+    last_observed: Dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        with _SYSTEM_LOCK:
+            monitor = copy.deepcopy(SYSTEM)
+            received = _LATEST_MONITOR_RECEIVED_MONOTONIC
+        if received is not None and received > requested_monotonic and monitor:
+            last_observed = _monitor_restore_probe(monitor)
+            if _monitor_restore_probe_satisfied(expected, last_observed):
+                return {
+                    "proved": True,
+                    "expected": expected,
+                    "observed": last_observed,
+                    "monitor_sequence": monitor.get("sequence"),
+                    "waited_s": round(
+                        max(0.0, time.monotonic() - requested_monotonic),
+                        3,
+                    ),
+                }
+        time.sleep(0.1)
+
+    raise TimeoutError(
+        "timed out waiting for restored MONITOR state "
+        f"after {timeout_s:.1f}s; expected={expected!r} observed={last_observed!r}"
+    )
+
+
+def _recover_monitor_checkpoint(checkpoint: Dict[str, Any]) -> Dict[str, Any]:
+    """Restore always-on Teensy and Pi clock state without campaign policy."""
+    capsule = _monitor_recovery_capsule(checkpoint)
+    if capsule is None:
+        raise RuntimeError("config.MONITOR has no firmware recovery capsule")
+    gnss_raw = _monitor_gnss_raw_payload(checkpoint)
+    if gnss_raw is None:
+        raise RuntimeError("config.MONITOR has no clocks.gnss_raw state")
+
+    _seed_system_from_checkpoint(checkpoint)
+    requested_monotonic = time.monotonic()
+    teensy_response = _request_teensy_monitor_restore(str(capsule["capsule"]))
+    teensy_payload = (
+        teensy_response.get("payload", {})
+        if isinstance(teensy_response, dict)
+        and isinstance(teensy_response.get("payload"), dict)
+        else {}
+    )
+    teensy_status = str(teensy_payload.get("status") or "")
+    teensy_campaign_state = str(
+        teensy_payload.get("campaign_state") or ""
+    ).strip().upper()
+    if (
+        teensy_status == "monitor_restore_rejected_busy"
+        and teensy_campaign_state == "STARTED"
+    ):
+        result = {
+            "success": True,
+            "mode": "LIVE_CAMPAIGN_SUPERSEDED_MONITOR_RESTORE",
+            "checkpoint_sequence": checkpoint.get("sequence"),
+            "capsule_version": capsule.get("version"),
+            "capsule_crc32": capsule.get("crc32"),
+            "teensy": teensy_payload,
+            "clocks": None,
+            "proof": {
+                "proved": True,
+                "basis": "TEENSY_LIVE_CAMPAIGN_CUSTODY",
+                "campaign_state": teensy_campaign_state,
+            },
+        }
+        logging.info(
+            "♻️ [system/recovery] live Teensy campaign superseded MONITOR "
+            "restore: sequence=%s campaign_state=%s; checkpoint writing may resume",
+            checkpoint.get("sequence"),
+            teensy_campaign_state,
+        )
+        return result
+
+    clocks_response = _request_clocks_gnss_raw_restore(gnss_raw)
+    proof = _wait_for_monitor_restore(
+        checkpoint,
+        requested_monotonic=requested_monotonic,
+    )
+
+    result = {
+        "success": True,
+        "mode": "SYSTEM_MONITOR",
+        "checkpoint_sequence": checkpoint.get("sequence"),
+        "capsule_version": capsule.get("version"),
+        "capsule_crc32": capsule.get("crc32"),
+        "teensy": teensy_response.get("payload")
+            if isinstance(teensy_response, dict) else None,
+        "clocks": clocks_response.get("payload")
+            if isinstance(clocks_response, dict) else None,
+        "proof": proof,
+    }
+    logging.info(
+        "✅ [system/recovery] restored MONITOR state: sequence=%s "
+        "servo=%s waited=%.3fs",
+        checkpoint.get("sequence"),
+        proof.get("observed", {}).get("servo_mode"),
+        float(proof.get("waited_s") or 0.0),
+    )
+    return result
+
+
+# ------------------------------------------------------------------
 # Pi context poller and MONITOR aggregation
 # ------------------------------------------------------------------
 
@@ -1725,6 +2193,7 @@ def on_clocks_monitor(payload: Optional[dict]) -> None:
 def on_monitor_fragment(payload: Optional[dict]) -> None:
     """Decorate one Teensy MONITOR_FRAGMENT and rebroadcast it as MONITOR."""
     global SYSTEM
+    global _LATEST_MONITOR_RECEIVED_MONOTONIC
 
     if not isinstance(payload, dict):
         logging.warning("[system] ignoring malformed MONITOR_FRAGMENT: %r", payload)
@@ -1788,8 +2257,10 @@ def on_monitor_fragment(payload: Optional[dict]) -> None:
 
     with _SYSTEM_LOCK:
         SYSTEM = dict(monitor)
+        _LATEST_MONITOR_RECEIVED_MONOTONIC = time.monotonic()
 
     publish("MONITOR", monitor)
+    _queue_monitor_checkpoint(monitor)
 
 
 # ------------------------------------------------------------------
@@ -1919,15 +2390,17 @@ COMMANDS = {
 
 def startup_teensy_quiet_delay() -> None:
     """
-    Let pubsub discover this process before SYSTEM begins polling the cluster.
+    Let pubsub discover SYSTEM before MONITOR recovery and active polling.
     """
     logging.info(
         "⏳ [system] waiting %.1fs for pubsub routing and Teensy initialization "
-        "before active polling",
+        "before MONITOR recovery or active polling",
         STARTUP_TEENSY_QUIET_DELAY_S,
     )
     time.sleep(STARTUP_TEENSY_QUIET_DELAY_S)
-    logging.info("✅ [system] startup quiet delay complete — polling may begin")
+    logging.info(
+        "✅ [system] startup quiet delay complete — MONITOR recovery may begin"
+    )
 
 
 # ---------------------------------------------------------------------
@@ -1951,9 +2424,45 @@ def run() -> None:
 
         startup_teensy_quiet_delay()
 
+        # SYSTEM always restores the latest recoverable MONITOR, independent of
+        # campaign state.  CLOCKS may later supersede this with TIMEBASE recovery
+        # when an active campaign exists.  Keep the checkpoint writer closed
+        # until this transaction has consumed the previous durable authority.
+        checkpoint_writer_allowed = True
+        checkpoint = _read_monitor_checkpoint()
+        checkpoint_recoverable = bool(
+            checkpoint is not None
+            and _monitor_recovery_capsule(checkpoint) is not None
+            and _monitor_gnss_raw_payload(checkpoint) is not None
+        )
+        if checkpoint_recoverable:
+            try:
+                assert checkpoint is not None
+                _recover_monitor_checkpoint(checkpoint)
+            except Exception:
+                checkpoint_writer_allowed = False
+                logging.exception(
+                    "💥 [system/recovery] MONITOR restore failed; preserving "
+                    "config.MONITOR and continuing with the seeded last-known state"
+                )
+        else:
+            logging.info(
+                "ℹ️ [system/recovery] no recoverable config.MONITOR; "
+                "starting from live MONITOR_FRAGMENT state"
+            )
+
+        if checkpoint_writer_allowed:
+            _start_monitor_checkpoint_writer()
+        else:
+            logging.warning(
+                "🧤 [system] MONITOR checkpoint writer held closed to preserve "
+                "the last recoverable checkpoint after restore failure"
+            )
+
         threading.Thread(
             target=system_poller,
             daemon=True,
+            name="system-poller",
         ).start()
 
         logging.info("🏁 [system] entering main loop")
