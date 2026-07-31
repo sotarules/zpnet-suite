@@ -48,19 +48,28 @@
 
 static constexpr uint64_t NS_PER_SECOND_U64 = 1000000000ULL;
 
-static void alpha_science_reject(clocks_science_reject_reason_t reason,
-                                 time_clock_id_t clock,
-                                 uint32_t detail0 = 0U,
-                                 uint32_t detail1 = 0U,
-                                 uint32_t detail2 = 0U,
-                                 uint32_t detail3 = 0U) {
-  clocks_science_reject(clocks_science_reject_source_t::ALPHA,
-                        reason,
-                        (uint32_t)((uint8_t)clock),
-                        detail0,
-                        detail1,
-                        detail2,
-                        detail3);
+static uint32_t alpha_row_lane_mask(time_clock_id_t clock) {
+  switch (clock) {
+    case time_clock_id_t::VCLOCK: return CLOCKS_ROW_LANE_VCLOCK;
+    case time_clock_id_t::OCXO1:  return CLOCKS_ROW_LANE_OCXO1;
+    case time_clock_id_t::OCXO2:  return CLOCKS_ROW_LANE_OCXO2;
+    default:                      return 0U;
+  }
+}
+
+static void alpha_row_exclude(clocks_row_objection_reason_t reason,
+                              time_clock_id_t clock,
+                              uint32_t detail0 = 0U,
+                              uint32_t detail1 = 0U,
+                              uint32_t detail2 = 0U,
+                              uint32_t detail3 = 0U) {
+  clocks_row_exclude(clocks_row_objection_source_t::ALPHA,
+                     reason,
+                     alpha_row_lane_mask(clock),
+                     detail0,
+                     detail1,
+                     detail2,
+                     detail3);
 }
 
 static_assert(NS_PER_SECOND_U64 ==
@@ -2977,7 +2986,9 @@ static double alpha_instrument_delta_fast_ns(uint32_t reference_cycles,
          (double)reference_cycles;
 }
 
-static void alpha_instrument_stats_note_completed_row(uint32_t pps_sequence) {
+static void alpha_instrument_stats_note_completed_row(
+    uint32_t pps_sequence,
+    bool science_eligible) {
   if (pps_sequence == 0U ||
       g_instrument_stats_last_pps_sequence == pps_sequence) {
     return;
@@ -2986,78 +2997,84 @@ static void alpha_instrument_stats_note_completed_row(uint32_t pps_sequence) {
   g_instrument_stats_seq++;
   clocks_alpha_dmb();
 
-  // GNSS is the exact reference clock.  Give it a real always-on Welford
-  // population of zero residual samples so systemwide N retains one meaning:
-  // the number of observations represented by MEAN/SD/SE.  Campaign PPS count
-  // must never masquerade as a statistical sample count.
-  welford_update(welford_gnss, 0.0);
-
   const uint32_t cps = g_dwt_cycles_between_pps_vclock;
-  if (g_dwt_calibration_valid && cps != 0U) {
-    const double expected = (double)DWT_EXPECTED_PER_PPS;
-    const double dwt_ppb = ((double)cps - expected) / expected * 1.0e9;
-    welford_update(welford_dwt, dwt_ppb);
-  }
-
   const uint32_t reference_cycles =
       g_pps_vclock_dwt_cycles_between_edges_valid
           ? g_pps_vclock_dwt_cycles_between_edges
           : 0U;
   const bool reference_valid =
       alpha_instrument_interval_plausible(reference_cycles);
-
   const uint32_t vclock_cycles =
       g_vclock_measurement.dwt_cycles_between_edges;
-  if (reference_valid && alpha_instrument_interval_plausible(vclock_cycles)) {
-    welford_update(welford_vclock,
-                   alpha_instrument_delta_fast_ns(reference_cycles,
-                                                  vclock_cycles));
-  } else {
-    g_instrument_stats_vclock_interval_reject_count++;
-  }
-
   const uint32_t ocxo1_cycles =
       g_ocxo1_measurement.dwt_cycles_between_edges;
-  if (reference_valid && alpha_instrument_interval_plausible(ocxo1_cycles)) {
-    welford_update(welford_ocxo1,
-                   alpha_instrument_delta_fast_ns(reference_cycles,
-                                                  ocxo1_cycles));
-    alpha_tau_note_delta_interval(time_clock_id_t::OCXO1,
-                                  pps_sequence,
-                                  reference_cycles,
-                                  ocxo1_cycles,
-                                  g_ocxo1_measured_gnss_ns_at_pps_vclock);
-  } else {
-    g_instrument_stats_ocxo1_interval_reject_count++;
-  }
-
   const uint32_t ocxo2_cycles =
       g_ocxo2_measurement.dwt_cycles_between_edges;
-  if (reference_valid && alpha_instrument_interval_plausible(ocxo2_cycles)) {
-    welford_update(welford_ocxo2,
-                   alpha_instrument_delta_fast_ns(reference_cycles,
-                                                  ocxo2_cycles));
-    alpha_tau_note_delta_interval(time_clock_id_t::OCXO2,
-                                  pps_sequence,
-                                  reference_cycles,
-                                  ocxo2_cycles,
-                                  g_ocxo2_measured_gnss_ns_at_pps_vclock);
+
+  if (science_eligible) {
+    // GNSS is the exact reference clock. Give it a real Welford population of
+    // admitted zero-residual samples; PPS count remains a timeline identity.
+    welford_update(welford_gnss, 0.0);
+
+    if (g_dwt_calibration_valid && cps != 0U) {
+      const double expected = (double)DWT_EXPECTED_PER_PPS;
+      const double dwt_ppb = ((double)cps - expected) / expected * 1.0e9;
+      welford_update(welford_dwt, dwt_ppb);
+    }
+
+    if (reference_valid && alpha_instrument_interval_plausible(vclock_cycles)) {
+      welford_update(welford_vclock,
+                     alpha_instrument_delta_fast_ns(reference_cycles,
+                                                    vclock_cycles));
+    } else {
+      g_instrument_stats_vclock_interval_reject_count++;
+    }
+
+    if (reference_valid && alpha_instrument_interval_plausible(ocxo1_cycles)) {
+      welford_update(welford_ocxo1,
+                     alpha_instrument_delta_fast_ns(reference_cycles,
+                                                    ocxo1_cycles));
+      alpha_tau_note_delta_interval(time_clock_id_t::OCXO1,
+                                    pps_sequence,
+                                    reference_cycles,
+                                    ocxo1_cycles,
+                                    g_ocxo1_measured_gnss_ns_at_pps_vclock);
+    } else {
+      g_instrument_stats_ocxo1_interval_reject_count++;
+    }
+
+    if (reference_valid && alpha_instrument_interval_plausible(ocxo2_cycles)) {
+      welford_update(welford_ocxo2,
+                     alpha_instrument_delta_fast_ns(reference_cycles,
+                                                    ocxo2_cycles));
+      alpha_tau_note_delta_interval(time_clock_id_t::OCXO2,
+                                    pps_sequence,
+                                    reference_cycles,
+                                    ocxo2_cycles,
+                                    g_ocxo2_measured_gnss_ns_at_pps_vclock);
+    } else {
+      g_instrument_stats_ocxo2_interval_reject_count++;
+    }
+
+    if (reference_valid && cps != 0U) {
+      const double pps_phase_ns =
+          ((double)g_pps_vclock_phase_cycles *
+           (double)NS_PER_SECOND_U64) /
+          (double)cps;
+      welford_update(welford_pps_witness, pps_phase_ns);
+    }
+
+    welford_update(welford_ocxo1_dac,
+                   ocxo_dac_fractional_snapshot(ocxo1_dac));
+    welford_update(welford_ocxo2_dac,
+                   ocxo_dac_fractional_snapshot(ocxo2_dac));
   } else {
+    // One objection excludes the whole PPS second. These counters explain why
+    // lane Welford N can be lower than the completed-row/PPS count.
+    g_instrument_stats_vclock_interval_reject_count++;
+    g_instrument_stats_ocxo1_interval_reject_count++;
     g_instrument_stats_ocxo2_interval_reject_count++;
   }
-
-  if (reference_valid && cps != 0U) {
-    const double pps_phase_ns =
-        ((double)g_pps_vclock_phase_cycles *
-         (double)NS_PER_SECOND_U64) /
-        (double)cps;
-    welford_update(welford_pps_witness, pps_phase_ns);
-  }
-
-  welford_update(welford_ocxo1_dac,
-                 ocxo_dac_fractional_snapshot(ocxo1_dac));
-  welford_update(welford_ocxo2_dac,
-                 ocxo_dac_fractional_snapshot(ocxo2_dac));
 
   // Freeze one coherent completed-row clockface under the same sequence lock
   // as the statistics.  REPORT_CLOCKS must never mix the next PPS bookend with
@@ -3808,10 +3825,10 @@ static bool alpha_counterledger_apply_pps_sample(
 
   if (implausible_reseed) {
     // Preserve the bad capture and re-seed this lane, but keep the campaign
-    // timeline alive.  Beta will publish the next candidate as SCIENCE_REJECT
-    // and the Pi will retain it only in the rejected-row evidence log.
-    alpha_science_reject(
-        clocks_science_reject_reason_t::ALPHA_COUNTERLEDGER_INTERVAL,
+    // timeline alive.  Beta will publish the next candidate as SCIENCE_EXCLUDE
+    // and the Pi will retain it only in the excluded TIMEBASE row.
+    alpha_row_exclude(
+        clocks_row_objection_reason_t::ALPHA_COUNTERLEDGER_INTERVAL,
         clock,
         pps_sequence,
         delta_ticks,
@@ -4353,19 +4370,26 @@ static void alpha_static_prediction_record(time_clock_id_t clock,
   if (!s) return;
 
   const uint32_t prior_actual = s->last_actual_cycles;
-  const bool have_prior = (prior_actual != 0);
+  const bool actual_plausible =
+      alpha_instrument_interval_plausible(actual_cycles);
+  const bool prior_plausible =
+      prior_actual != 0U && alpha_instrument_interval_plausible(prior_actual);
+  const bool prediction_valid = actual_plausible && prior_plausible;
 
   s->seq++;
   clocks_alpha_dmb();
 
   s->completed_interval_count++;
-  s->valid = have_prior;
-  s->static_prediction_cycles = have_prior ? prior_actual : 0U;
+  s->valid = prediction_valid;
+  s->static_prediction_cycles = prediction_valid ? prior_actual : 0U;
   s->actual_cycles = actual_cycles;
-  s->static_residual_cycles = have_prior
+  s->static_residual_cycles = prediction_valid
       ? (int32_t)((int64_t)actual_cycles - (int64_t)prior_actual)
       : 0;
-  s->last_actual_cycles = actual_cycles;
+  // An impossible interval may be valuable raw evidence, but it must never
+  // become the predictor for the next clean second. Drop the antecedent and
+  // require a fresh plausible interval to reseed this rail.
+  s->last_actual_cycles = actual_plausible ? actual_cycles : 0U;
 
   clocks_alpha_dmb();
   s->seq++;
@@ -4377,19 +4401,25 @@ static void alpha_static_prediction_record_pps(uint32_t actual_cycles) {
 
   alpha_static_prediction_store_t& s = g_static_prediction_pps;
   const uint32_t prior_actual = s.last_actual_cycles;
-  const bool have_prior = (prior_actual != 0);
+  const bool actual_plausible =
+      alpha_instrument_interval_plausible(actual_cycles);
+  const bool prior_plausible =
+      prior_actual != 0U && alpha_instrument_interval_plausible(prior_actual);
+  const bool prediction_valid = actual_plausible && prior_plausible;
 
   s.seq++;
   clocks_alpha_dmb();
 
   s.completed_interval_count++;
-  s.valid = have_prior;
-  s.static_prediction_cycles = have_prior ? prior_actual : 0U;
+  s.valid = prediction_valid;
+  s.static_prediction_cycles = prediction_valid ? prior_actual : 0U;
   s.actual_cycles = actual_cycles;
-  s.static_residual_cycles = have_prior
+  s.static_residual_cycles = prediction_valid
       ? (int32_t)((int64_t)actual_cycles - (int64_t)prior_actual)
       : 0;
-  s.last_actual_cycles = actual_cycles;
+  // Keep impossible PPS intervals as raw testimony, never as the next static
+  // predictor. A clean PPS interval reseeds; the following one becomes valid.
+  s.last_actual_cycles = actual_plausible ? actual_cycles : 0U;
 
   clocks_alpha_dmb();
   s.seq++;
@@ -4479,6 +4509,189 @@ static void clocks_feature_update_static_prediction(void) {
       (pps_ok && vclock_ok && ocxo1_ok && ocxo2_ok)
           ? system_feature_status_t::NOMINAL
           : system_feature_status_t::INITIALIZING);
+}
+
+// First reject any impossible one-second interval as a whole-row science
+// exclusion. Then compare the four static residuals to their median: a common-
+// mode DWT step can move every rail together without implying a bad clock
+// sample, while a lane-specific excursion remains visible. 256 cycles is far
+// above the normal few-cycle lattice while catching the observed +1480/+9844
+// pathology.
+static constexpr uint32_t ALPHA_ROW_CYCLE_EXCURSION_GATE_CYCLES = 256U;
+
+static uint32_t alpha_cycle_actual_median4(const uint32_t values[4]) {
+  uint32_t sorted[4] = {values[0], values[1], values[2], values[3]};
+  for (uint32_t i = 1U; i < 4U; ++i) {
+    const uint32_t value = sorted[i];
+    uint32_t j = i;
+    while (j != 0U && sorted[j - 1U] > value) {
+      sorted[j] = sorted[j - 1U];
+      --j;
+    }
+    sorted[j] = value;
+  }
+  return (uint32_t)(((uint64_t)sorted[1] + (uint64_t)sorted[2]) / 2ULL);
+}
+
+static void alpha_static_prediction_forget_antecedent(uint32_t lane_bit) {
+  alpha_static_prediction_store_t* store = nullptr;
+  if (lane_bit == CLOCKS_ROW_LANE_PPS) {
+    store = &g_static_prediction_pps;
+  } else if (lane_bit == CLOCKS_ROW_LANE_VCLOCK) {
+    store = &g_static_prediction_vclock;
+  } else if (lane_bit == CLOCKS_ROW_LANE_OCXO1) {
+    store = &g_static_prediction_ocxo1;
+  } else if (lane_bit == CLOCKS_ROW_LANE_OCXO2) {
+    store = &g_static_prediction_ocxo2;
+  }
+  if (!store) return;
+
+  store->seq++;
+  clocks_alpha_dmb();
+  // Preserve this row's actual/prediction/residual testimony, but do not let
+  // an interval rejected by the four-rail court become next second's prior.
+  store->last_actual_cycles = 0U;
+  clocks_alpha_dmb();
+  store->seq++;
+}
+
+static int32_t alpha_cycle_residual_median4(const int32_t values[4]) {
+  int32_t sorted[4] = {values[0], values[1], values[2], values[3]};
+  for (uint32_t i = 1U; i < 4U; ++i) {
+    const int32_t value = sorted[i];
+    uint32_t j = i;
+    while (j != 0U && sorted[j - 1U] > value) {
+      sorted[j] = sorted[j - 1U];
+      --j;
+    }
+    sorted[j] = value;
+  }
+  return (int32_t)(((int64_t)sorted[1] + (int64_t)sorted[2]) / 2LL);
+}
+
+static void alpha_row_adjudicate_cycle_integrity(uint32_t pps_sequence) {
+  clocks_static_prediction_snapshot_t pps{};
+  clocks_static_prediction_snapshot_t vclock{};
+  clocks_static_prediction_snapshot_t ocxo1{};
+  clocks_static_prediction_snapshot_t ocxo2{};
+  (void)clocks_static_prediction_pps_snapshot(&pps);
+  (void)clocks_static_prediction_snapshot(time_clock_id_t::VCLOCK, &vclock);
+  (void)clocks_static_prediction_snapshot(time_clock_id_t::OCXO1, &ocxo1);
+  (void)clocks_static_prediction_snapshot(time_clock_id_t::OCXO2, &ocxo2);
+
+  const uint32_t actual_cycles[4] = {
+      pps.actual_cycles,
+      vclock.actual_cycles,
+      ocxo1.actual_cycles,
+      ocxo2.actual_cycles};
+  const int32_t residuals[4] = {
+      pps.static_residual_cycles,
+      vclock.static_residual_cycles,
+      ocxo1.static_residual_cycles,
+      ocxo2.static_residual_cycles};
+  const uint32_t lane_bits[4] = {
+      CLOCKS_ROW_LANE_PPS,
+      CLOCKS_ROW_LANE_VCLOCK,
+      CLOCKS_ROW_LANE_OCXO1,
+      CLOCKS_ROW_LANE_OCXO2};
+
+  // A failed/incomplete snapshot is not evidence of a zero-cycle interval.
+  // Defer adjudication rather than manufacturing an objection from absence.
+  for (uint32_t i = 0U; i < 4U; ++i) {
+    if (actual_cycles[i] == 0U) return;
+  }
+
+  uint32_t implausible_lane_mask = 0U;
+  uint32_t min_actual = actual_cycles[0];
+  uint32_t max_actual = actual_cycles[0];
+  for (uint32_t i = 0U; i < 4U; ++i) {
+    if (actual_cycles[i] < min_actual) min_actual = actual_cycles[i];
+    if (actual_cycles[i] > max_actual) max_actual = actual_cycles[i];
+    if (!alpha_instrument_interval_plausible(actual_cycles[i])) {
+      implausible_lane_mask |= lane_bits[i];
+    }
+  }
+  if (implausible_lane_mask != 0U) {
+    clocks_row_exclude(
+        clocks_row_objection_source_t::ALPHA,
+        clocks_row_objection_reason_t::ALPHA_CYCLE_INTERVAL_IMPLAUSIBLE,
+        implausible_lane_mask,
+        pps_sequence,
+        min_actual,
+        max_actual,
+        0U);
+    for (uint32_t i = 0U; i < 4U; ++i) {
+      if ((implausible_lane_mask & lane_bits[i]) != 0U) {
+        alpha_static_prediction_forget_antecedent(lane_bits[i]);
+      }
+    }
+    return;
+  }
+
+  // Absolute plausibility alone is not enough during startup/recovery. A
+  // truncated interval can still land inside 900M..1.1B while disagreeing by
+  // tens of millions of cycles with the other three rails. Preserve that raw
+  // value, exclude the row, and force only the incoherent rail to reseed.
+  const uint32_t actual_median = alpha_cycle_actual_median4(actual_cycles);
+  uint32_t actual_incoherent_lane_mask = 0U;
+  for (uint32_t i = 0U; i < 4U; ++i) {
+    const int64_t delta =
+        (int64_t)actual_cycles[i] - (int64_t)actual_median;
+    const uint32_t abs_delta = delta < 0
+        ? (uint32_t)(-delta)
+        : (uint32_t)delta;
+    if (abs_delta > ALPHA_ROW_CYCLE_EXCURSION_GATE_CYCLES) {
+      actual_incoherent_lane_mask |= lane_bits[i];
+    }
+  }
+  if (actual_incoherent_lane_mask != 0U) {
+    const uint32_t actual_span = max_actual - min_actual;
+    clocks_row_exclude(
+        clocks_row_objection_source_t::ALPHA,
+        clocks_row_objection_reason_t::ALPHA_CYCLE_EXCURSION,
+        actual_incoherent_lane_mask,
+        pps_sequence,
+        actual_span,
+        ALPHA_ROW_CYCLE_EXCURSION_GATE_CYCLES,
+        actual_median);
+    for (uint32_t i = 0U; i < 4U; ++i) {
+      if ((actual_incoherent_lane_mask & lane_bits[i]) != 0U) {
+        alpha_static_prediction_forget_antecedent(lane_bits[i]);
+      }
+    }
+    return;
+  }
+
+  if (!pps.valid || !vclock.valid || !ocxo1.valid || !ocxo2.valid) return;
+
+  const int32_t median = alpha_cycle_residual_median4(residuals);
+
+  int32_t min_residual = residuals[0];
+  int32_t max_residual = residuals[0];
+  uint32_t lane_mask = 0U;
+  for (uint32_t i = 0U; i < 4U; ++i) {
+    if (residuals[i] < min_residual) min_residual = residuals[i];
+    if (residuals[i] > max_residual) max_residual = residuals[i];
+    const int64_t delta = (int64_t)residuals[i] - (int64_t)median;
+    const uint32_t abs_delta = delta < 0
+        ? (uint32_t)(-delta)
+        : (uint32_t)delta;
+    if (abs_delta > ALPHA_ROW_CYCLE_EXCURSION_GATE_CYCLES) {
+      lane_mask |= lane_bits[i];
+    }
+  }
+
+  if (lane_mask == 0U) return;
+  const uint32_t span =
+      (uint32_t)((int64_t)max_residual - (int64_t)min_residual);
+  clocks_row_exclude(
+      clocks_row_objection_source_t::ALPHA,
+      clocks_row_objection_reason_t::ALPHA_CYCLE_EXCURSION,
+      lane_mask,
+      pps_sequence,
+      span,
+      ALPHA_ROW_CYCLE_EXCURSION_GATE_CYCLES,
+      (uint32_t)median);
 }
 
 // ============================================================================
@@ -6111,10 +6324,12 @@ static void alpha_timebase_row_try_complete(void) {
     return;
   }
 
-  // Continuous instrument science advances before campaign publication gates.
-  // Beta may record or ignore this row, but campaign lifecycle cannot prevent
-  // Alpha from learning from it.
-  alpha_instrument_stats_note_completed_row(pps_sequence);
+  // Adjudicate the complete four-rail interval tuple before any irreversible
+  // statistical or control mutation. Existing objections raised earlier in the
+  // path and this cross-rail cycle court share one row-level latch.
+  alpha_row_adjudicate_cycle_integrity(pps_sequence);
+  const bool science_eligible = clocks_row_science_eligible(pps_sequence);
+  alpha_instrument_stats_note_completed_row(pps_sequence, science_eligible);
 
   // Clear before entering Beta.  Publication may execute command/lifecycle
   // paths, but it cannot observe or overwrite an open Alpha row.
@@ -6245,8 +6460,8 @@ static uint64_t alpha_ocxo_apply_measured_second(time_clock_id_t clock,
       // forensic evidence, but it must not reject an otherwise lawful row.
       // Traditional projection mode retains the historical science gate.
       if (!clocks_ocxo_counterledger_mode()) {
-        alpha_science_reject(
-            clocks_science_reject_reason_t::ALPHA_BRIDGE_NONMONOTONIC,
+        alpha_row_exclude(
+            clocks_row_objection_reason_t::ALPHA_BRIDGE_NONMONOTONIC,
             clock,
             pending_edge_dwt,
             (uint32_t)resolved_ns,
@@ -6329,8 +6544,8 @@ static uint64_t alpha_ocxo_project_measured_ns_to_dwt(time_clock_id_t clock,
       (uint64_t)alpha_projection_signed_window_cycles()) {
     alpha_ocxo_pps_projection_guard_t* g = alpha_ocxo_pps_projection_guard(clock);
     if (g) g->measured_projection_reject_count++;
-    alpha_science_reject(
-        clocks_science_reject_reason_t::ALPHA_OCXO_PROJECTION_WINDOW,
+    alpha_row_exclude(
+        clocks_row_objection_reason_t::ALPHA_OCXO_PROJECTION_WINDOW,
         clock,
         target_dwt,
         m->dwt_at_edge,
@@ -6394,8 +6609,8 @@ static uint64_t alpha_ocxo_project_measured_ns_to_dwt_live(time_clock_id_t clock
       (uint64_t)alpha_projection_signed_window_cycles()) {
     alpha_ocxo_pps_projection_guard_t* g = alpha_ocxo_pps_projection_guard(clock);
     if (g) g->measured_projection_reject_count++;
-    alpha_science_reject(
-        clocks_science_reject_reason_t::ALPHA_OCXO_PROJECTION_WINDOW,
+    alpha_row_exclude(
+        clocks_row_objection_reason_t::ALPHA_OCXO_PROJECTION_WINDOW,
         clock,
         target_dwt,
         m->pending_edge_dwt,
@@ -8924,8 +9139,8 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
                               applied_event.dwt_at_event,
                               0);
     } else {
-      alpha_science_reject(
-          clocks_science_reject_reason_t::ALPHA_OCXO_CLOCK_APPLY,
+      alpha_row_exclude(
+          clocks_row_objection_reason_t::ALPHA_OCXO_CLOCK_APPLY,
           time_clock,
           applied_event.counter32_at_event,
           applied_event.dwt_at_event,
@@ -9362,18 +9577,21 @@ static bool alpha_sample_all_clocks_at_pps_vclock(const pps_edge_snapshot_t& sna
                                              nullptr);
 
     if ((!applied_ocxo1 || !applied_ocxo2) && counterledger_authority_enabled) {
-      const uint32_t lane_bits =
+      const uint32_t rejected_lane_mask =
+          (!applied_ocxo1 ? CLOCKS_ROW_LANE_OCXO1 : 0U) |
+          (!applied_ocxo2 ? CLOCKS_ROW_LANE_OCXO2 : 0U);
+      const uint32_t capture_evidence_bits =
           (cap.ocxo1_capture_valid ? 1U : 0U) |
           (cap.ocxo2_capture_valid ? 2U : 0U) |
           (cap.all_lanes_capture_valid ? 4U : 0U);
-      clocks_science_reject(
-          clocks_science_reject_source_t::ALPHA,
-          clocks_science_reject_reason_t::ALPHA_COUNTERLEDGER_CAPTURE,
-          lane_bits,
+      clocks_row_exclude(
+          clocks_row_objection_source_t::ALPHA,
+          clocks_row_objection_reason_t::ALPHA_COUNTERLEDGER_CAPTURE,
+          rejected_lane_mask,
           snap.sequence,
           cap.sequence,
           cap.valid ? 1U : 0U,
-          lane_bits);
+          capture_evidence_bits);
       // Continue the PPS/VCLOCK timeline.  Invalid OCXO clockfaces remain zero
       // or stale evidence and Beta marks the candidate DO_NOT_USE.
     }

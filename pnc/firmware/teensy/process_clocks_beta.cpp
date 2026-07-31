@@ -145,165 +145,277 @@ extern volatile bool     g_pps_vclock_dwt_cycles_between_edges_valid;
 // aliases are deliberately not transported at 1 Hz.
 static constexpr uint32_t CAMPAIGN_RECORD_ISR_DELAY_EXPLANATION_GATE_CYCLES = 16U;
 
-static constexpr uint32_t CAMPAIGN_RECORD_INVALID_OCXO1_CUSTODY = 1U << 0;
-static constexpr uint32_t CAMPAIGN_RECORD_INVALID_OCXO2_CUSTODY = 1U << 1;
+static constexpr uint32_t CAMPAIGN_RECORD_INVALID_OCXO1_CUSTODY =
+    CLOCKS_ROW_LANE_OCXO1;
+static constexpr uint32_t CAMPAIGN_RECORD_INVALID_OCXO2_CUSTODY =
+    CLOCKS_ROW_LANE_OCXO2;
 
-// Runtime gate mode is Pi-controlled through CLOCKS.GATE_MODE.  FORENSIC is the
-// temporary diagnostic default: scientific verdicts remain honest, but rejected
-// numeric rows are allowed to flow through campaign math and downstream campaign record.
-// Structural/watchdog courts are intentionally outside this switch.
-static volatile clocks_gate_mode_t g_clocks_gate_mode =
-    clocks_gate_mode_t::FORENSIC;
-static uint32_t g_clocks_gate_mode_request_count = 0U;
-static uint32_t g_clocks_gate_mode_transition_count = 0U;
+// Row objections are the only survivable-science disposition.  They are
+// authored as soon as a layer has enough evidence, consulted by Alpha before
+// Welford/TAU mutation, consumed by Beta at the completed-row boundary, and
+// always serialized for TIMEBASE.  There is no runtime gate mode.
 
-const char* clocks_gate_mode_name(clocks_gate_mode_t mode) {
-  switch (mode) {
-    case clocks_gate_mode_t::STRICT:   return "STRICT";
-    case clocks_gate_mode_t::FORENSIC: return "FORENSIC";
-    default:                            return "FORENSIC";
-  }
-}
-
-clocks_gate_mode_t clocks_gate_mode(void) {
-  return g_clocks_gate_mode;
-}
-
-bool clocks_gate_mode_forensic(void) {
-  return clocks_gate_mode() == clocks_gate_mode_t::FORENSIC;
-}
-
-static bool clocks_gate_mode_parse(const char* raw, clocks_gate_mode_t& out) {
-  if (!raw || !*raw) return false;
-  if (!strcasecmp(raw, "STRICT")) {
-    out = clocks_gate_mode_t::STRICT;
-    return true;
-  }
-  if (!strcasecmp(raw, "FORENSIC")) {
-    out = clocks_gate_mode_t::FORENSIC;
-    return true;
-  }
-  return false;
-}
-
-static void clocks_gate_mode_apply(clocks_gate_mode_t mode) {
-  g_clocks_gate_mode_request_count++;
-  if (g_clocks_gate_mode != mode) {
-    g_clocks_gate_mode_transition_count++;
-    g_clocks_gate_mode = mode;
-  }
-}
-
-// Defined with the watchdog state later in this translation unit.  The science
-// reject latch is intentionally armed only after the first public candidate has
-// returned, so pre-campaign/start-prologue evidence cannot poison public PPS1.
+// Defined with the watchdog/recovery state later in this translation unit.
 bool clocks_watchdog_campaign_armed(void);
+static uint32_t clocks_row_lifecycle_science_hold_flags(void);
 
-// Cross-layer science-reject latch.  State is an atomic three-state word:
+// Cross-layer row-objection latch. State is an atomic three-state word:
 //   0 = idle, 1 = writer owns the record, 2 = complete record awaits Beta.
-// The first survivable failure wins the next candidate; later failures coalesce
-// into counters rather than replacing the original testimony.
-struct clocks_science_reject_record_t {
-  clocks_science_reject_source_t source = clocks_science_reject_source_t::NONE;
-  clocks_science_reject_reason_t reason = clocks_science_reject_reason_t::NONE;
+// The first objection is the primary human explanation. Later objections add
+// to the count and lane mask without replacing the original testimony.
+struct clocks_row_objection_record_t {
+  clocks_row_objection_source_t source = clocks_row_objection_source_t::NONE;
+  clocks_row_objection_reason_t reason = clocks_row_objection_reason_t::NONE;
   uint32_t lane = 0U;
+  uint32_t lane_mask = 0U;
+  uint32_t objection_count = 0U;
   uint32_t detail0 = 0U;
   uint32_t detail1 = 0U;
   uint32_t detail2 = 0U;
   uint32_t detail3 = 0U;
 };
 
-static volatile uint32_t g_science_reject_latch_state = 0U;
-static clocks_science_reject_record_t g_science_reject_latch DMAMEM = {};
-static volatile uint32_t g_science_reject_raise_count = 0U;
-static volatile uint32_t g_science_reject_coalesced_count = 0U;
-static uint32_t g_science_reject_consumed_count = 0U;
-static uint32_t g_science_reject_last_public_count = 0U;
-static clocks_science_reject_record_t g_science_reject_last DMAMEM = {};
+static volatile uint32_t g_row_objection_latch_state = 0U;
+static clocks_row_objection_record_t g_row_objection_latch DMAMEM = {};
+static volatile uint32_t g_row_objection_pending_count = 0U;
+static volatile uint32_t g_row_objection_pending_lane_mask = 0U;
+static volatile uint32_t g_row_objection_raise_count = 0U;
+static volatile uint32_t g_row_objection_coalesced_count = 0U;
+static uint32_t g_row_objection_consumed_count = 0U;
+static uint32_t g_row_objection_last_public_count = 0U;
+static clocks_row_objection_record_t g_row_objection_last DMAMEM = {};
 
-static const char* clocks_science_reject_source_name(
-    clocks_science_reject_source_t source) {
+// One-shot diagnostic injection. The command surface is intentionally open-ended
+// (type=...), but only type=excursion is implemented initially. Alpha consumes
+// an armed injection through the ordinary pre-statistics eligibility query, so
+// the real SCIENCE_EXCLUDE path is exercised without falsifying counters,
+// clockfaces, or interrupt custody.
+// State: 0=idle, 1=command writer owns parameters, 2=armed for one completed row.
+static volatile uint32_t g_problem_injection_armed = 0U;
+static volatile uint32_t g_problem_injection_lane = CLOCKS_ROW_LANE_OCXO1;
+static volatile uint32_t g_problem_injection_cycles = 1000U;
+static volatile uint32_t g_problem_injection_arm_count = 0U;
+static volatile uint32_t g_problem_injection_fire_count = 0U;
+
+static const char* clocks_row_objection_source_name(
+    clocks_row_objection_source_t source) {
   switch (source) {
-    case clocks_science_reject_source_t::BETA: return "BETA";
-    case clocks_science_reject_source_t::ALPHA: return "ALPHA";
-    case clocks_science_reject_source_t::INTERRUPT: return "INTERRUPT";
+    case clocks_row_objection_source_t::BETA: return "BETA";
+    case clocks_row_objection_source_t::ALPHA: return "ALPHA";
+    case clocks_row_objection_source_t::INTERRUPT: return "INTERRUPT";
     default: return "NONE";
   }
 }
 
-static const char* clocks_science_reject_reason_name(
-    clocks_science_reject_reason_t reason) {
+static const char* clocks_row_objection_reason_name(
+    clocks_row_objection_reason_t reason) {
   switch (reason) {
-    case clocks_science_reject_reason_t::BETA_OCXO_SCIENCE_CUSTODY:
+    case clocks_row_objection_reason_t::BETA_OCXO_SCIENCE_CUSTODY:
       return "beta_ocxo_science_custody";
-    case clocks_science_reject_reason_t::ALPHA_COUNTERLEDGER_INTERVAL:
+    case clocks_row_objection_reason_t::BETA_RECOVERY_SCIENCE_HOLD:
+      return "beta_recovery_science_hold";
+    case clocks_row_objection_reason_t::ALPHA_COUNTERLEDGER_INTERVAL:
       return "alpha_counterledger_interval";
-    case clocks_science_reject_reason_t::ALPHA_BRIDGE_NONMONOTONIC:
+    case clocks_row_objection_reason_t::ALPHA_BRIDGE_NONMONOTONIC:
       return "alpha_bridge_nonmonotonic";
-    case clocks_science_reject_reason_t::ALPHA_OCXO_PROJECTION_WINDOW:
+    case clocks_row_objection_reason_t::ALPHA_OCXO_PROJECTION_WINDOW:
       return "alpha_ocxo_projection_window";
-    case clocks_science_reject_reason_t::ALPHA_OCXO_CLOCK_APPLY:
+    case clocks_row_objection_reason_t::ALPHA_OCXO_CLOCK_APPLY:
       return "alpha_ocxo_clock_apply";
-    case clocks_science_reject_reason_t::ALPHA_COUNTERLEDGER_CAPTURE:
+    case clocks_row_objection_reason_t::ALPHA_COUNTERLEDGER_CAPTURE:
       return "alpha_counterledger_capture";
+    case clocks_row_objection_reason_t::ALPHA_CYCLE_EXCURSION:
+      return "alpha_cycle_excursion";
+    case clocks_row_objection_reason_t::ALPHA_CYCLE_INTERVAL_IMPLAUSIBLE:
+      return "alpha_cycle_interval_implausible";
     default: return "none";
   }
 }
 
-void clocks_science_reject(clocks_science_reject_source_t source,
-                           clocks_science_reject_reason_t reason,
-                           uint32_t lane,
-                           uint32_t detail0,
-                           uint32_t detail1,
-                           uint32_t detail2,
-                           uint32_t detail3) {
-  if (reason == clocks_science_reject_reason_t::NONE ||
-      !clocks_watchdog_campaign_armed()) {
+static void clocks_row_objection_format_reason(
+    char* out,
+    size_t out_size,
+    const clocks_row_objection_record_t& objection) {
+  if (!out || out_size == 0U) return;
+  if (objection.reason == clocks_row_objection_reason_t::ALPHA_CYCLE_EXCURSION) {
+    const bool injected =
+        objection.source == clocks_row_objection_source_t::BETA;
+    if (injected) {
+      snprintf(out, out_size,
+               "PPS %lu injected cycle excursion: lanes=0x%02lX "
+               "residual span=%lu cycles exceeds gate=%lu; "
+               "excluded from science/control",
+               (unsigned long)objection.detail0,
+               (unsigned long)objection.lane_mask,
+               (unsigned long)objection.detail1,
+               (unsigned long)objection.detail2);
+    } else {
+      snprintf(out, out_size,
+               "PPS %lu cycle excursion: lanes=0x%02lX cycle span=%lu cycles "
+               "exceeds gate=%lu (median=%ld); excluded from science/control",
+               (unsigned long)objection.detail0,
+               (unsigned long)objection.lane_mask,
+               (unsigned long)objection.detail1,
+               (unsigned long)objection.detail2,
+               (long)(int32_t)objection.detail3);
+    }
     return;
   }
 
+  if (objection.reason ==
+      clocks_row_objection_reason_t::ALPHA_CYCLE_INTERVAL_IMPLAUSIBLE) {
+    snprintf(out, out_size,
+             "PPS %lu implausible one-second interval: lanes=0x%02lX "
+             "min=%lu max=%lu cycles; excluded from science/control",
+             (unsigned long)objection.detail0,
+             (unsigned long)objection.lane_mask,
+             (unsigned long)objection.detail1,
+             (unsigned long)objection.detail2);
+    return;
+  }
+
+  if (objection.reason ==
+      clocks_row_objection_reason_t::BETA_RECOVERY_SCIENCE_HOLD) {
+    snprintf(out, out_size,
+             "PPS %lu recovery science hold: lanes=0x%02lX flags=0x%02lX; "
+             "persisted for audit and excluded from science/control",
+             (unsigned long)objection.detail0,
+             (unsigned long)objection.lane_mask,
+             (unsigned long)objection.detail1);
+    return;
+  }
+
+  snprintf(out, out_size,
+           "%s: lane=0x%08lX detail0=%lu detail1=%lu detail2=%lu detail3=%lu; "
+           "excluded from Welford/TAU/PPB/servo",
+           clocks_row_objection_reason_name(objection.reason),
+           (unsigned long)objection.lane,
+           (unsigned long)objection.detail0,
+           (unsigned long)objection.detail1,
+           (unsigned long)objection.detail2,
+           (unsigned long)objection.detail3);
+}
+
+void clocks_row_exclude(clocks_row_objection_source_t source,
+                        clocks_row_objection_reason_t reason,
+                        uint32_t lane,
+                        uint32_t detail0,
+                        uint32_t detail1,
+                        uint32_t detail2,
+                        uint32_t detail3) {
+  if (reason == clocks_row_objection_reason_t::NONE) return;
+
   uint32_t expected = 0U;
-  if (!__atomic_compare_exchange_n(&g_science_reject_latch_state,
+  if (!__atomic_compare_exchange_n(&g_row_objection_latch_state,
                                    &expected,
                                    1U,
                                    false,
                                    __ATOMIC_ACQ_REL,
                                    __ATOMIC_ACQUIRE)) {
-    (void)__atomic_add_fetch(&g_science_reject_coalesced_count,
+    (void)__atomic_add_fetch(&g_row_objection_pending_count,
+                             1U,
+                             __ATOMIC_RELAXED);
+    (void)__atomic_or_fetch(&g_row_objection_pending_lane_mask,
+                            lane,
+                            __ATOMIC_RELAXED);
+    (void)__atomic_add_fetch(&g_row_objection_coalesced_count,
                              1U,
                              __ATOMIC_RELAXED);
     return;
   }
 
-  g_science_reject_latch.source = source;
-  g_science_reject_latch.reason = reason;
-  g_science_reject_latch.lane = lane;
-  g_science_reject_latch.detail0 = detail0;
-  g_science_reject_latch.detail1 = detail1;
-  g_science_reject_latch.detail2 = detail2;
-  g_science_reject_latch.detail3 = detail3;
-  (void)__atomic_add_fetch(&g_science_reject_raise_count,
+  g_row_objection_latch.source = source;
+  g_row_objection_latch.reason = reason;
+  g_row_objection_latch.lane = lane;
+  g_row_objection_latch.lane_mask = lane;
+  g_row_objection_latch.objection_count = 1U;
+  g_row_objection_latch.detail0 = detail0;
+  g_row_objection_latch.detail1 = detail1;
+  g_row_objection_latch.detail2 = detail2;
+  g_row_objection_latch.detail3 = detail3;
+  (void)__atomic_add_fetch(&g_row_objection_pending_count,
                            1U,
                            __ATOMIC_RELAXED);
-  __atomic_store_n(&g_science_reject_latch_state, 2U, __ATOMIC_RELEASE);
+  (void)__atomic_or_fetch(&g_row_objection_pending_lane_mask,
+                          lane,
+                          __ATOMIC_RELAXED);
+  (void)__atomic_add_fetch(&g_row_objection_raise_count,
+                           1U,
+                           __ATOMIC_RELAXED);
+  __atomic_store_n(&g_row_objection_latch_state, 2U, __ATOMIC_RELEASE);
 }
 
-static bool clocks_science_reject_consume(
-    clocks_science_reject_record_t& out) {
-  if (__atomic_load_n(&g_science_reject_latch_state,
+bool clocks_row_science_eligible(uint32_t pps_sequence) {
+  uint32_t armed = 2U;
+  if (__atomic_compare_exchange_n(&g_problem_injection_armed,
+                                  &armed,
+                                  0U,
+                                  false,
+                                  __ATOMIC_ACQ_REL,
+                                  __ATOMIC_ACQUIRE)) {
+    const uint32_t lane =
+        __atomic_load_n(&g_problem_injection_lane, __ATOMIC_RELAXED);
+    const uint32_t cycles =
+        __atomic_load_n(&g_problem_injection_cycles, __ATOMIC_RELAXED);
+    (void)__atomic_add_fetch(&g_problem_injection_fire_count,
+                             1U,
+                             __ATOMIC_RELAXED);
+    clocks_row_exclude(
+        clocks_row_objection_source_t::BETA,
+        clocks_row_objection_reason_t::ALPHA_CYCLE_EXCURSION,
+        lane,
+        pps_sequence,
+        cycles,
+        256U,
+        0U);
+  }
+
+  const uint32_t hold_flags = clocks_row_lifecycle_science_hold_flags();
+  if (hold_flags != 0U) {
+    clocks_row_exclude(
+        clocks_row_objection_source_t::BETA,
+        clocks_row_objection_reason_t::BETA_RECOVERY_SCIENCE_HOLD,
+        CLOCKS_ROW_LANE_OCXO1 | CLOCKS_ROW_LANE_OCXO2,
+        pps_sequence,
+        hold_flags,
+        0U,
+        0U);
+  }
+
+  // Read after any lifecycle objection is raised. This also closes the small
+  // window in which a future Interrupt-owned objection could arrive between
+  // the first read and Alpha's irreversible Welford/TAU update.
+  const bool objection_pending =
+      __atomic_load_n(&g_row_objection_latch_state,
+                      __ATOMIC_ACQUIRE) != 0U;
+  return !objection_pending && hold_flags == 0U;
+}
+
+static bool clocks_row_objection_consume(
+    clocks_row_objection_record_t& out) {
+  if (__atomic_load_n(&g_row_objection_latch_state,
                       __ATOMIC_ACQUIRE) != 2U) {
-    out = clocks_science_reject_record_t{};
+    out = clocks_row_objection_record_t{};
     return false;
   }
 
-  out = g_science_reject_latch;
-  g_science_reject_consumed_count++;
-  __atomic_store_n(&g_science_reject_latch_state, 0U, __ATOMIC_RELEASE);
-  return out.reason != clocks_science_reject_reason_t::NONE;
+  out = g_row_objection_latch;
+  out.objection_count = __atomic_load_n(&g_row_objection_pending_count,
+                                        __ATOMIC_RELAXED);
+  out.lane_mask = __atomic_load_n(&g_row_objection_pending_lane_mask,
+                                  __ATOMIC_RELAXED);
+  g_row_objection_consumed_count++;
+  __atomic_store_n(&g_row_objection_latch_state, 0U, __ATOMIC_RELEASE);
+  __atomic_store_n(&g_row_objection_pending_count, 0U, __ATOMIC_RELAXED);
+  __atomic_store_n(&g_row_objection_pending_lane_mask, 0U, __ATOMIC_RELAXED);
+  return out.reason != clocks_row_objection_reason_t::NONE;
 }
 
-static void clocks_science_reject_clear(void) {
-  __atomic_store_n(&g_science_reject_latch_state, 0U, __ATOMIC_RELEASE);
+static void clocks_row_objection_clear(void) {
+  __atomic_store_n(&g_problem_injection_armed, 0U, __ATOMIC_RELEASE);
+  __atomic_store_n(&g_row_objection_latch_state, 0U, __ATOMIC_RELEASE);
+  __atomic_store_n(&g_row_objection_pending_count, 0U, __ATOMIC_RELAXED);
+  __atomic_store_n(&g_row_objection_pending_lane_mask, 0U, __ATOMIC_RELAXED);
 }
 
 
@@ -1168,10 +1280,9 @@ static clocks_alpha_ocxo_visible_origin_snapshot_t
     g_beta_report_visible_origin_scratch DMAMEM = {};
 struct clock_science_row_t {
   // valid means the row contains numeric material usable by the currently
-  // selected gate mode. science_worthy remains the strict production verdict.
+  // unified row-admission contract. science_worthy is the numeric court verdict.
   bool     valid = false;
   bool     science_worthy = false;
-  bool     forensic_override = false;
   bool     antecedents_complete = false;
   uint32_t clock_id = 0;
   uint32_t public_count = 0;
@@ -1494,6 +1605,15 @@ static FLASHMEM void recover_reattach_begin(void);
 static FLASHMEM bool recover_reattach_should_hold(void);
 static FLASHMEM bool recover_reattach_degraded_science_hold_active(void);
 static FLASHMEM void recover_reattach_apply_degraded_science_hold(clock_science_row_t& row);
+
+static uint32_t clocks_row_lifecycle_science_hold_flags(void) {
+  uint32_t flags = 0U;
+  if (g_recover_reattach_active) flags |= 1U << 0;
+  if (g_recover_reattach_degraded_active) flags |= 1U << 1;
+  if (g_science_residual_quarantine_remaining != 0U) flags |= 1U << 2;
+  if (g_recover_continuity_align_pending) flags |= 1U << 3;
+  return flags;
+}
 
 static void pps_interval_residuals_reset(void) {
   ocxo_science_totals_reset();
@@ -4328,12 +4448,9 @@ static void delta_residual_apply_one(clock_science_row_t& row,
           delta_raw_interval_reject_reason(row.delta_raw_clock_interval_cycles));
     }
 
-    const bool permit_numeric_row =
-        row.science_worthy || clocks_gate_mode_forensic();
-    row.delta_raw_valid = permit_numeric_row;
-    row.forensic_override = permit_numeric_row && !row.science_worthy;
+    row.delta_raw_valid = row.science_worthy;
 
-    if (permit_numeric_row) {
+    if (row.delta_raw_valid) {
       row.delta_raw_residual_cycles =
           (int64_t)row.delta_raw_clock_interval_cycles -
           (int64_t)row.delta_raw_reference_interval_cycles;
@@ -4658,9 +4775,8 @@ static void clock_science_build_ocxo(
   // Delta Cycles is canonical: compare the OCXO observed interval against the
   // exact same-row selected PPS/VCLOCK observed interval.
   row.valid = row.delta_raw_valid;
-  // Keep the strict verdict independent from FORENSIC numeric admission.
-  // A rejected interval may flow numerically for diagnosis while the
-  // SCIENCE_REJECT verdict remains explicit.
+  // Science eligibility and numeric validity are one contract. Rejected
+  // intervals remain visible in raw_cycles but cannot author science totals.
   row.antecedents_complete = row.science_worthy &&
                              row.delta_raw_reference_interval_cycles != 0U &&
                              row.delta_raw_clock_interval_cycles != 0U;
@@ -5207,8 +5323,7 @@ static FLASHMEM void clocks_monitor_raw_cycles_lane_snapshot(
   clocks_monitor_copy_text(out.delay_status,
                            sizeof(out.delay_status),
                            delay_status);
-  out.delay_detail_present = strcmp(delay_status, "ON_TIME") != 0;
-  if (!out.delay_detail_present) return;
+  out.delay_detail_present = true;
 
   out.residual_delay_valid = delay.residual_delay_valid && sample.valid;
   const int64_t residual_after_delay_64 = out.residual_delay_valid
@@ -5225,9 +5340,12 @@ static FLASHMEM void clocks_monitor_raw_cycles_lane_snapshot(
       ? (uint32_t)(-(int64_t)residual_after_delay)
       : (uint32_t)residual_after_delay;
 
-  clocks_monitor_copy_text(out.delay_by,
-                           sizeof(out.delay_by),
-                           interrupt_delay_cause_str(delay.delayed_by));
+  clocks_monitor_copy_text(
+      out.delay_by,
+      sizeof(out.delay_by),
+      (delay.valid && delay.delayed)
+          ? interrupt_delay_cause_str(delay.delayed_by)
+          : "NONE");
   out.residual_delay_cycles = out.residual_delay_valid
       ? delay.residual_delay_cycles
       : 0;
@@ -5564,7 +5682,7 @@ static void ocxo_dac_apply_synthetic_servo_step(ocxo_dac_state_t& dac,
 
 static void campaign_accounting_reset_common(bool reset_servo_runtime) {
   clocks_watchdog_disarm_campaign_publication();
-  clocks_science_reject_clear();
+  clocks_row_objection_clear();
 
   // Beta-local accounting reset only.  Alpha owns the active time/epoch
   // projection. Do not invalidate it here: after SmartZero install the new
@@ -6350,7 +6468,7 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
   if (request_stop) {
     campaign_record_stage(CAMPAIGN_RECORD_STAGE_STOP_GATE);
     clocks_watchdog_clear_surrender_for_new_lifecycle();
-    clocks_science_reject_clear();
+    clocks_row_objection_clear();
     campaign_state = clocks_campaign_state_t::STOPPED;
     request_stop = false;
     request_zero = false;
@@ -6513,11 +6631,17 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
   clocks_commit_pending_servo_mode_change();
 
   if (campaign_state != clocks_campaign_state_t::STARTED) {
-    // Idle completed rows still mature Alpha's always-on exact OCXO clockfaces.
-    // They now also drive the selected servo from Alpha's coherent instrument
-    // statistics; campaigns remain recording-only.
+    // Idle rows share the same exclusion contract. Alpha already declined any
+    // Welford/TAU mutation; Beta must also prevent NOW/servo control from using
+    // the excluded second. There is no campaign row to serialize while idle.
     campaign_record_stage(CAMPAIGN_RECORD_STAGE_NOT_STARTED_GATE);
-    clocks_idle_instrument_servo(completed_pps_sequence);
+    if (clocks_row_science_eligible(completed_pps_sequence)) {
+      clocks_idle_instrument_servo(completed_pps_sequence);
+    } else {
+      servo_input_diag_reset(g_servo_input_ocxo1);
+      servo_input_diag_reset(g_servo_input_ocxo2);
+    }
+    clocks_row_objection_clear();
     publish_dac_tick("NOT_STARTED_GATE");
     return;
   }
@@ -6633,6 +6757,7 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
           vclock_forensics_valid, vclock_forensics,
           ocxo1_forensics_valid, ocxo1_forensics,
           ocxo2_forensics_valid, ocxo2_forensics)) {
+    clocks_row_objection_clear();
     campaign_record_stage(CAMPAIGN_RECORD_STAGE_WARMUP_GATE);
     publish_dac_tick("WARMUP_GATE");
     return;
@@ -6838,8 +6963,9 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
                                     ocxo1_science,
                                     ocxo2_science);
 
-  // Preserve the former pre-publication court as compact evidence.  The Pi
-  // decides whether this candidate becomes a canonical campaign record row.
+  // Preserve the pre-publication court as compact evidence. Every structurally
+  // coherent candidate becomes a durable TIMEBASE row; this court decides only
+  // whether science/control consumers may use it.
   const uint32_t ocxo_science_invalid_mask =
       clocks_beta_public_ocxo_science_invalid_mask(
           public_count,
@@ -6848,39 +6974,41 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
           ocxo1_science,
           ocxo2_science);
 
-  clocks_science_reject_record_t candidate_reject{};
-  const bool external_science_reject =
-      clocks_science_reject_consume(candidate_reject);
-  if (!external_science_reject && ocxo_science_invalid_mask != 0U) {
-    candidate_reject.source = clocks_science_reject_source_t::BETA;
-    candidate_reject.reason =
-        clocks_science_reject_reason_t::BETA_OCXO_SCIENCE_CUSTODY;
-    candidate_reject.lane = ocxo_science_invalid_mask;
-    candidate_reject.detail0 = ocxo_science_invalid_mask;
+  clocks_row_objection_record_t candidate_objection{};
+  const bool external_row_objection =
+      clocks_row_objection_consume(candidate_objection);
+  if (!external_row_objection && ocxo_science_invalid_mask != 0U) {
+    candidate_objection.source = clocks_row_objection_source_t::BETA;
+    candidate_objection.reason =
+        clocks_row_objection_reason_t::BETA_OCXO_SCIENCE_CUSTODY;
+    candidate_objection.lane = ocxo_science_invalid_mask;
+    candidate_objection.lane_mask = ocxo_science_invalid_mask;
+    candidate_objection.objection_count = 1U;
+    candidate_objection.detail0 = ocxo_science_invalid_mask;
+  } else if (external_row_objection && ocxo_science_invalid_mask != 0U) {
+    candidate_objection.lane_mask |= ocxo_science_invalid_mask;
+    candidate_objection.objection_count++;
   }
-  const bool candidate_science_reject =
-      candidate_reject.reason != clocks_science_reject_reason_t::NONE ||
+  const bool candidate_science_excluded =
+      candidate_objection.reason != clocks_row_objection_reason_t::NONE ||
       ocxo_science_invalid_mask != 0U;
 
-  const bool candidate_math_permitted =
-      !candidate_science_reject || clocks_gate_mode_forensic();
+  const bool candidate_math_permitted = !candidate_science_excluded;
 
-  if (candidate_science_reject) {
-    // STRICT rolls back totals exactly as before.  FORENSIC deliberately keeps
-    // the mutations so the rejected row contaminates the same math we need to
-    // diagnose.  The candidate disposition and SCIENCE_RESIDUALS verdict remain
-    // SCIENCE_REJECT / ANOMALY in both modes.
-    if (!clocks_gate_mode_forensic()) {
-      g_ocxo_science_totals_ocxo1 = g_beta_row_science_totals_o1_before;
-      g_ocxo_science_totals_ocxo2 = g_beta_row_science_totals_o2_before;
-    }
-    g_science_reject_last_public_count = public_count;
-    g_science_reject_last = candidate_reject;
+  if (candidate_science_excluded) {
+    // Beta science totals were tentatively formed to preserve complete row
+    // testimony. Restore them unconditionally; no mode may authorize
+    // contamination. Alpha Welford/TAU mutation was already prevented upstream.
+    g_ocxo_science_totals_ocxo1 = g_beta_row_science_totals_o1_before;
+    g_ocxo_science_totals_ocxo2 = g_beta_row_science_totals_o2_before;
+    ocxo1_science.science_worthy = false;
+    ocxo2_science.science_worthy = false;
+    g_row_objection_last_public_count = public_count;
+    g_row_objection_last = candidate_objection;
     clocks_beta_feature_set_cached("SCIENCE_RESIDUALS",
                                    g_clocks_feature_science_residuals,
                                    system_feature_status_t::ANOMALY,
                                    true);
-  } else {
   }
 
   // Four local observed-interval snapshots feed raw_cycles.  The prior
@@ -7161,38 +7289,49 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
                            clocks_campaign_state_name(campaign_state));
   record.public_count = public_count;
   record.gnss_ns = public_gnss_ns;
-  clocks_monitor_copy_text(record.gate_mode,
-                           sizeof(record.gate_mode),
-                           clocks_gate_mode_name(clocks_gate_mode()));
   clocks_monitor_copy_text(record.disposition,
                            sizeof(record.disposition),
-                           candidate_science_reject
-                               ? "SCIENCE_REJECT"
+                           candidate_science_excluded
+                               ? "SCIENCE_EXCLUDE"
                                : "ACCEPT");
   clocks_monitor_copy_text(record.servo_mode,
                            sizeof(record.servo_mode),
                            servo_mode_str(calibrate_ocxo_mode));
   record.timeline_valid = recover_timeline_ready;
   record.ocxo_clockface_valid = recover_clockface_ready;
-  record.ocxo_science_valid = recover_science_ready;
+  record.ocxo_science_valid = recover_science_ready &&
+                              !candidate_science_excluded;
+  record.science_eligible = !candidate_science_excluded;
+  record.control_eligible = !candidate_science_excluded;
+  record.persist = true;
+  record.science_excluded = candidate_science_excluded;
 
-  if (candidate_science_reject) {
+  if (candidate_science_excluded) {
     record.rejection.present = true;
-    record.rejection.reason_code = (uint32_t)candidate_reject.reason;
+    record.rejection.reason_code = (uint32_t)candidate_objection.reason;
     clocks_monitor_copy_text(
+        record.rejection.reason_name,
+        sizeof(record.rejection.reason_name),
+        clocks_row_objection_reason_name(candidate_objection.reason));
+    clocks_row_objection_format_reason(
         record.rejection.reason,
         sizeof(record.rejection.reason),
-        clocks_science_reject_reason_name(candidate_reject.reason));
+        candidate_objection);
     clocks_monitor_copy_text(
         record.rejection.source,
         sizeof(record.rejection.source),
-        clocks_science_reject_source_name(candidate_reject.source));
-    record.rejection.lane = candidate_reject.lane;
-    record.rejection.detail0 = candidate_reject.detail0;
-    record.rejection.detail1 = candidate_reject.detail1;
-    record.rejection.detail2 = candidate_reject.detail2;
-    record.rejection.detail3 = candidate_reject.detail3;
-    record.rejection.reject_mask = ocxo_science_invalid_mask;
+        clocks_row_objection_source_name(candidate_objection.source));
+    record.rejection.lane = candidate_objection.lane;
+    record.rejection.detail0 = candidate_objection.detail0;
+    record.rejection.detail1 = candidate_objection.detail1;
+    record.rejection.detail2 = candidate_objection.detail2;
+    record.rejection.detail3 = candidate_objection.detail3;
+    record.rejection.reject_mask =
+        ocxo_science_invalid_mask | candidate_objection.lane_mask;
+    record.rejection.objection_count =
+        candidate_objection.objection_count != 0U
+            ? candidate_objection.objection_count
+            : 1U;
   }
 
   // Recovery testimony remains conditional so ordinary steady-state records do
@@ -8035,6 +8174,125 @@ static FLASHMEM Payload cmd_watchdog_test(const Payload&) {
   return p;
 }
 
+static uint32_t clocks_problem_injection_lane_parse(const char* lane) {
+  if (!lane || !*lane || !strcasecmp(lane, "OCXO1")) {
+    return CLOCKS_ROW_LANE_OCXO1;
+  }
+  if (!strcasecmp(lane, "PPS")) return CLOCKS_ROW_LANE_PPS;
+  if (!strcasecmp(lane, "VCLOCK")) return CLOCKS_ROW_LANE_VCLOCK;
+  if (!strcasecmp(lane, "OCXO2")) return CLOCKS_ROW_LANE_OCXO2;
+  return 0U;
+}
+
+static FLASHMEM Payload cmd_inject_problem(const Payload& args) {
+  const char* type = args.getString("type");
+  if (!type || !*type || strcasecmp(type, "excursion") != 0) {
+    Payload err;
+    err.add("error", type && *type
+                         ? "unsupported problem type"
+                         : "missing problem type");
+    err.add("status", "inject_problem_rejected_type");
+    err.add("supplied", type ? type : "");
+    err.add("supported", "excursion");
+    return err;
+  }
+
+  const char* lane_text = args.getString("lane");
+  const uint32_t lane = clocks_problem_injection_lane_parse(lane_text);
+  if (lane == 0U) {
+    Payload err;
+    err.add("error", "invalid excursion lane");
+    err.add("status", "inject_problem_rejected_lane");
+    err.add("supplied", lane_text ? lane_text : "");
+    err.add("expected", "PPS|VCLOCK|OCXO1|OCXO2");
+    return err;
+  }
+
+  double cycles_value = 1000.0;
+  if (args.has("cycles") || args.has("CYCLES") || args.has("magnitude")) {
+    clocks_payload_numeric_integrity_reset();
+    if (!payload_try_get_double_alias(args,
+                                      "command.inject_problem",
+                                      "cycles",
+                                      cycles_value,
+                                      "cycles",
+                                      "CYCLES",
+                                      "magnitude") ||
+        g_clocks_payload_numeric_integrity_failed) {
+      return clocks_payload_numeric_reject_response(
+          "inject_problem_rejected_numeric_integrity");
+    }
+  }
+
+  if (!isfinite(cycles_value) || cycles_value < 257.0 ||
+      cycles_value > 1000000.0) {
+    Payload err;
+    err.add("error", "excursion cycles outside supported range");
+    err.add("status", "inject_problem_rejected_cycles");
+    err.add("minimum", 257U);
+    err.add("maximum", 1000000U);
+    err.add("supplied", toFixedDecimal(cycles_value, 3));
+    return err;
+  }
+  const uint32_t cycles = (uint32_t)llround(cycles_value);
+
+  const bool stable_campaign =
+      campaign_state == clocks_campaign_state_t::STARTED &&
+      !campaign_warmup_active() &&
+      !clocks_watchdog_publication_blocked() &&
+      !request_start && !request_stop && !request_recover &&
+      !request_zero && !request_flash_cut;
+  if (!stable_campaign) {
+    Payload err;
+    err.add("error", "problem injection requires a stable active campaign");
+    err.add("status", "inject_problem_rejected_campaign_state");
+    err.add("campaign_state", clocks_campaign_state_name(campaign_state));
+    err.add("campaign", campaign_name);
+    err.add("campaign_seconds", campaign_seconds);
+    err.add("warmup_active", campaign_warmup_active());
+    err.add("watchdog_blocked", clocks_watchdog_publication_blocked());
+    return err;
+  }
+
+  uint32_t expected = 0U;
+  if (!__atomic_compare_exchange_n(&g_problem_injection_armed,
+                                   &expected,
+                                   1U,
+                                   false,
+                                   __ATOMIC_ACQ_REL,
+                                   __ATOMIC_ACQUIRE)) {
+    Payload err;
+    err.add("error", "a problem injection is already armed");
+    err.add("status", "inject_problem_rejected_already_armed");
+    err.add("armed_state", expected);
+    err.add("arm_count", (uint32_t)g_problem_injection_arm_count);
+    err.add("fire_count", (uint32_t)g_problem_injection_fire_count);
+    return err;
+  }
+
+  __atomic_store_n(&g_problem_injection_lane, lane, __ATOMIC_RELAXED);
+  __atomic_store_n(&g_problem_injection_cycles, cycles, __ATOMIC_RELAXED);
+  (void)__atomic_add_fetch(&g_problem_injection_arm_count,
+                           1U,
+                           __ATOMIC_RELAXED);
+  __atomic_store_n(&g_problem_injection_armed, 2U, __ATOMIC_RELEASE);
+
+  Payload p;
+  p.add("status", "inject_problem_armed");
+  p.add("type", "excursion");
+  p.add("lane", lane_text && *lane_text ? lane_text : "OCXO1");
+  p.add("lane_mask", lane);
+  p.add("cycles", cycles);
+  p.add("one_shot", true);
+  p.add("boundary", "next_completed_pps_row");
+  p.add("raw_counters_modified", false);
+  p.add("campaign", campaign_name);
+  p.add("campaign_seconds", campaign_seconds);
+  p.add("arm_count", (uint32_t)g_problem_injection_arm_count);
+  p.add("fire_count", (uint32_t)g_problem_injection_fire_count);
+  return p;
+}
+
 
 // ============================================================================
 // Recovery polling report
@@ -8273,45 +8531,6 @@ static FLASHMEM Payload cmd_stack_witness_reset(const Payload&) {
 }
 
 
-static FLASHMEM Payload cmd_gate_mode(const Payload& args) {
-  const char* raw = nullptr;
-  (void)payload_try_get_string_alias(args, raw,
-                                     "gate_mode",
-                                     "GATE_MODE",
-                                     "mode",
-                                     "MODE",
-                                     nullptr,
-                                     nullptr,
-                                     nullptr);
-
-  clocks_gate_mode_t requested = clocks_gate_mode_t::FORENSIC;
-  if (!clocks_gate_mode_parse(raw, requested)) {
-    Payload err;
-    err.add("status", "gate_mode_rejected");
-    err.add("error", raw ? "invalid gate_mode" : "missing gate_mode");
-    err.add("expected", "STRICT|FORENSIC");
-    err.add("supplied", raw ? raw : "");
-    err.add("gate_mode", clocks_gate_mode_name(clocks_gate_mode()));
-    return err;
-  }
-
-  const clocks_gate_mode_t previous = clocks_gate_mode();
-  clocks_gate_mode_apply(requested);
-
-  Payload p;
-  p.add("status", "gate_mode_updated");
-  p.add("schema", "CLOCKS_GATE_MODE_V1");
-  p.add("previous_gate_mode", clocks_gate_mode_name(previous));
-  p.add("gate_mode", clocks_gate_mode_name(clocks_gate_mode()));
-  p.add("default_gate_mode", "FORENSIC");
-  p.add("forensic_math_enabled", clocks_gate_mode_forensic());
-  p.add("structural_gates_bypassed", false);
-  p.add("request_count", g_clocks_gate_mode_request_count);
-  p.add("transition_count", g_clocks_gate_mode_transition_count);
-  return p;
-}
-
-
 static FLASHMEM void payload_add_dither_status_lane_compact(
     Payload& parent,
     const char* key,
@@ -8496,7 +8715,6 @@ static const process_command_entry_t CLOCKS_COMMANDS[] = {
   { "RECOVER",             cmd_recover             },
   { "RECOVER_ABORT",       cmd_recover_abort       },
   { "SERVOS",              cmd_servos              },
-  { "GATE_MODE",           cmd_gate_mode           },
   { "REPORT_CLOCKS",       cmd_report_clocks       },
   { "REPORT_STATS",        cmd_report_stats        },
   { "STATS_RESET",         cmd_stats_reset         },
@@ -8505,6 +8723,7 @@ static const process_command_entry_t CLOCKS_COMMANDS[] = {
   { "DITHER_ENABLE",       cmd_dither_enable       },
   { "DITHER_DISABLE",      cmd_dither_disable      },
   { "WATCHDOG_TEST",       cmd_watchdog_test       },
+  { "INJECT_PROBLEM",      cmd_inject_problem      },
   { "DAC_INFO",            cmd_dac_info            },
   { "SET_DAC",             cmd_set_dac             },
   { nullptr,                 nullptr                 }

@@ -3592,13 +3592,14 @@ static void system_monitor_add_raw_cycles_lane(
   lane.add("previous_observed_cycles", sample.previous_observed_cycles);
   lane.add("residual_cycles", sample.residual_cycles);
   lane.add("delay_status", sample.delay_status);
-  if (sample.delay_detail_present) {
-    lane.add("delay_by", sample.delay_by);
-    lane.add("residual_delay_valid", sample.residual_delay_valid);
-    lane.add("residual_delay_cycles", sample.residual_delay_cycles);
-    lane.add("residual_delay_by", sample.residual_delay_by);
-    lane.add("delay_explains_residual", sample.delay_explains_residual);
-  }
+  // Stable four-rail contract: ON_TIME lanes carry explicit NONE/zero detail
+  // rather than a shorter object. Reports can compare PPS, VCLOCK, OCXO1, and
+  // OCXO2 without treating missing JSON fields as semantic evidence.
+  lane.add("delay_by", sample.delay_by);
+  lane.add("residual_delay_valid", sample.residual_delay_valid);
+  lane.add("residual_delay_cycles", sample.residual_delay_cycles);
+  lane.add("residual_delay_by", sample.residual_delay_by);
+  lane.add("delay_explains_residual", sample.delay_explains_residual);
   parent.add_object(key, lane);
 }
 
@@ -3885,29 +3886,40 @@ static void system_monitor_add_campaign_ocxo(
 static Payload system_monitor_campaign_row_payload(
     const clocks_monitor_campaign_snapshot_t& snapshot) {
   Payload row;
-  row.add("schema", "TIMEBASE_FRAGMENT_V5");
+  row.add("schema", "TIMEBASE_FRAGMENT_V6");
   row.add("campaign", snapshot.campaign);
   row.add("campaign_state", snapshot.campaign_state);
   row.add("teensy_pps_vclock_count", snapshot.public_count);
   row.add("gnss_ns", snapshot.gnss_ns);
-  row.add("gate_mode", snapshot.gate_mode);
   row.add("candidate_disposition", snapshot.disposition);
+  row.add("candidate_use", snapshot.science_excluded
+      ? "AUDIT_ONLY"
+      : "SCIENCE_AND_CONTROL");
+  row.add("science_eligible", snapshot.science_eligible);
+  row.add("control_eligible", snapshot.control_eligible);
+  row.add("persist", snapshot.persist);
+  row.add("science_excluded", snapshot.science_excluded);
   row.add("servo_mode", snapshot.servo_mode);
   row.add("timeline_valid", snapshot.timeline_valid);
   row.add("ocxo_clockface_valid", snapshot.ocxo_clockface_valid);
   row.add("ocxo_science_valid", snapshot.ocxo_science_valid);
 
-  if (snapshot.rejection.present) {
-    row.add("candidate_reason_code", snapshot.rejection.reason_code);
-    row.add("candidate_reason", snapshot.rejection.reason);
-    row.add("candidate_source", snapshot.rejection.source);
-    row.add("candidate_lane", snapshot.rejection.lane);
-    row.add("candidate_detail0", snapshot.rejection.detail0);
-    row.add("candidate_detail1", snapshot.rejection.detail1);
-    row.add("candidate_detail2", snapshot.rejection.detail2);
-    row.add("candidate_detail3", snapshot.rejection.detail3);
-    row.add("candidate_reject_mask", snapshot.rejection.reject_mask);
-  }
+  // Stable objection transcript. Accepted rows carry zero/NONE values; excluded
+  // rows carry the first reason plus the combined lane mask/count.
+  row.add("candidate_reason_code", snapshot.rejection.reason_code);
+  row.add("candidate_reason_name",
+          snapshot.rejection.present ? snapshot.rejection.reason_name : "none");
+  row.add("candidate_reason",
+          snapshot.rejection.present ? snapshot.rejection.reason : "");
+  row.add("candidate_source",
+          snapshot.rejection.present ? snapshot.rejection.source : "NONE");
+  row.add("candidate_lane", snapshot.rejection.lane);
+  row.add("candidate_detail0", snapshot.rejection.detail0);
+  row.add("candidate_detail1", snapshot.rejection.detail1);
+  row.add("candidate_detail2", snapshot.rejection.detail2);
+  row.add("candidate_detail3", snapshot.rejection.detail3);
+  row.add("candidate_reject_mask", snapshot.rejection.reject_mask);
+  row.add("candidate_objection_count", snapshot.rejection.objection_count);
 
   if (snapshot.recovery.present) {
     row.add("recover_generation", snapshot.recovery.generation);

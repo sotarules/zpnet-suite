@@ -121,59 +121,55 @@ void process_clocks_init(void);
 void process_clocks_register(void);
 
 // -----------------------------------------------------------------------------
-// Runtime science gate mode
+// Per-PPS science exclusion contract
 // -----------------------------------------------------------------------------
 //
-// STRICT preserves the production court: a science-rejected candidate remains
-// visible testimony but cannot mutate campaign math and is expected to be
-// dropped by the Pi.  FORENSIC preserves the same honest verdict while allowing
-// the candidate to flow through totals/Welfords/servo math for diagnosis.
-// Structural corruption and WATCHDOG_ANOMALY behavior are never bypassed.
-
-enum class clocks_gate_mode_t : uint8_t {
-  STRICT   = 0,
-  FORENSIC = 1,
-};
-
-const char* clocks_gate_mode_name(clocks_gate_mode_t mode);
-clocks_gate_mode_t clocks_gate_mode(void);
-bool clocks_gate_mode_forensic(void);
-
-// -----------------------------------------------------------------------------
-// Campaign candidate science disposition
-// -----------------------------------------------------------------------------
+// There is no runtime science/forensic mode. Every completed PPS second is
+// preserved for MONITOR/TIMEBASE. Any layer may object while it still owns the
+// evidence needed to adjudicate the second. A pending objection excludes the
+// whole PPS second from Welford, TAU/PPB, servo, and DAC-control math, but does
+// not suppress publication or PostgreSQL persistence.
 //
-// Once public PPS1 exists, survivable lane-science failures must remain visible
-// as completed campaign records instead of silently stopping the campaign.
-// Alpha and process_interrupt report those failures through this tiny latch;
-// Beta consumes the first pending verdict at the next candidate boundary and
-// stamps the record SCIENCE_REJECT. Fundamental PPS/VCLOCK identity, memory,
-// handoff, and publication failures continue to use WATCHDOG_ANOMALY.
+// WATCHDOG_ANOMALY is reserved for continuity surrender: the instrument can no
+// longer guarantee timeline or counter identity and requires campaign recovery.
 
-enum class clocks_science_reject_source_t : uint8_t {
+enum class clocks_row_objection_source_t : uint8_t {
   NONE      = 0,
   BETA      = 1,
   ALPHA     = 2,
   INTERRUPT = 3,
 };
 
-enum class clocks_science_reject_reason_t : uint16_t {
+enum class clocks_row_objection_reason_t : uint16_t {
   NONE                                = 0,
   BETA_OCXO_SCIENCE_CUSTODY           = 100,
+  BETA_RECOVERY_SCIENCE_HOLD           = 101,
   ALPHA_COUNTERLEDGER_INTERVAL        = 300,
   ALPHA_BRIDGE_NONMONOTONIC           = 301,
   ALPHA_OCXO_PROJECTION_WINDOW        = 302,
   ALPHA_OCXO_CLOCK_APPLY              = 303,
   ALPHA_COUNTERLEDGER_CAPTURE         = 304,
+  ALPHA_CYCLE_EXCURSION               = 305,
+  ALPHA_CYCLE_INTERVAL_IMPLAUSIBLE     = 306,
 };
 
-void clocks_science_reject(clocks_science_reject_source_t source,
-                           clocks_science_reject_reason_t reason,
-                           uint32_t lane,
-                           uint32_t detail0 = 0U,
-                           uint32_t detail1 = 0U,
-                           uint32_t detail2 = 0U,
-                           uint32_t detail3 = 0U);
+static constexpr uint32_t CLOCKS_ROW_LANE_PPS    = 1U << 0;
+static constexpr uint32_t CLOCKS_ROW_LANE_VCLOCK = 1U << 1;
+static constexpr uint32_t CLOCKS_ROW_LANE_OCXO1  = 1U << 2;
+static constexpr uint32_t CLOCKS_ROW_LANE_OCXO2  = 1U << 3;
+
+void clocks_row_exclude(clocks_row_objection_source_t source,
+                        clocks_row_objection_reason_t reason,
+                        uint32_t lane,
+                        uint32_t detail0 = 0U,
+                        uint32_t detail1 = 0U,
+                        uint32_t detail2 = 0U,
+                        uint32_t detail3 = 0U);
+
+// True only when no layer has objected to the candidate currently being built.
+// Alpha calls this before irreversible statistical mutation; Beta consumes and
+// serializes the same objection at the candidate boundary.
+bool clocks_row_science_eligible(uint32_t pps_sequence = 0U);
 
 // -----------------------------------------------------------------------------
 // Direct accessors (escape hatches)
@@ -308,7 +304,7 @@ bool clocks_alpha_tau_snapshot(time_clock_id_t clock,
 
 static constexpr size_t CLOCKS_MONITOR_CAMPAIGN_NAME_MAX = 64U;
 static constexpr size_t CLOCKS_MONITOR_STATE_NAME_MAX = 40U;
-static constexpr size_t CLOCKS_MONITOR_REASON_MAX = 64U;
+static constexpr size_t CLOCKS_MONITOR_REASON_MAX = 160U;
 static constexpr size_t CLOCKS_MONITOR_DELAY_NAME_MAX = 40U;
 
 struct clocks_monitor_welford_snapshot_t {
@@ -425,6 +421,7 @@ struct clocks_monitor_science_snapshot_t {
 struct clocks_monitor_rejection_snapshot_t {
   bool present = false;
   uint32_t reason_code = 0;
+  char reason_name[CLOCKS_MONITOR_STATE_NAME_MAX] = {0};
   char reason[CLOCKS_MONITOR_REASON_MAX] = {0};
   char source[CLOCKS_MONITOR_STATE_NAME_MAX] = {0};
   uint32_t lane = 0;
@@ -433,6 +430,7 @@ struct clocks_monitor_rejection_snapshot_t {
   uint32_t detail2 = 0;
   uint32_t detail3 = 0;
   uint32_t reject_mask = 0;
+  uint32_t objection_count = 0;
 };
 
 struct clocks_monitor_recovery_snapshot_t {
@@ -464,12 +462,15 @@ struct clocks_monitor_campaign_snapshot_t {
   char campaign_state[CLOCKS_MONITOR_STATE_NAME_MAX] = {0};
   uint32_t public_count = 0;
   uint64_t gnss_ns = 0;
-  char gate_mode[CLOCKS_MONITOR_STATE_NAME_MAX] = {0};
   char disposition[CLOCKS_MONITOR_STATE_NAME_MAX] = {0};
   char servo_mode[CLOCKS_MONITOR_STATE_NAME_MAX] = {0};
   bool timeline_valid = false;
   bool ocxo_clockface_valid = false;
   bool ocxo_science_valid = false;
+  bool science_eligible = true;
+  bool control_eligible = true;
+  bool persist = true;
+  bool science_excluded = false;
 
   clocks_monitor_rejection_snapshot_t rejection{};
   clocks_monitor_recovery_snapshot_t recovery{};

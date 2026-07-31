@@ -11,15 +11,12 @@
 //
 // Candidate disposition:
 //
-//   After public PPS1, every survivable campaign second is still published.
-//   ACCEPT candidates may advance Welford/servo state and may become durable
-//   TIMEBASE rows.  SCIENCE_REJECT candidates testify to the same campaign
-//   identity and remain explicitly DO_NOT_USE.  In STRICT mode Beta protects
-//   statistical/servo state and the Pi logs rather than persists them.  In
-//   FORENSIC mode the verdict remains honest, but Beta deliberately permits the
-//   rejected numbers to contaminate campaign math and the Pi persists the row.
-//   WATCHDOG_ANOMALY remains the continuity surrender path when an honest
-//   candidate cannot be authored; gate mode never bypasses structural failure.
+//   After public PPS1, every survivable campaign second is published and
+//   persisted. ACCEPT candidates may advance Welford/TAU/PPB/servo state.
+//   SCIENCE_EXCLUDE candidates retain the same campaign identity and complete
+//   testimony, but no scientific accumulator or control path may consume them.
+//   WATCHDOG_ANOMALY is reserved for continuity surrender when timeline or
+//   counter identity can no longer be guaranteed and recovery is required.
 //
 // Epoch authority:
 //

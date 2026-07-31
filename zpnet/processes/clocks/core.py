@@ -6,7 +6,7 @@ Core contract:
   CLOCKS is a traffic cop and final TIMEBASE arbiter. It owns no Teensy
   clock state. It receives the always-on MONITOR_FRAGMENT stream from the
   Teensy. During a campaign, MONITOR_FRAGMENT carries an optional campaign_row
-  whose TIMEBASE_FRAGMENT_V5-compatible body is the compact science fragment;
+  whose TIMEBASE_FRAGMENT_V6 body carries observation plus mode-free eligibility;
   older fragment versions may also contain embedded forensics. CLOCKS decorates
   the accepted candidate with Pi-owned environment, GF-8802, GNSS_RAW, and
   system-time evidence, then persists the immutable TIMEBASE row.
@@ -44,7 +44,7 @@ Core contract:
 
 Responsibilities:
   * Receive campaign_row candidates from the unified MONITOR_FRAGMENT stream.
-  * Adjudicate each candidate and log every rejected raw record.
+  * Adjudicate each candidate: persist coherent audit rows and recover on structural loss.
   * Subscribe to predictive GF-8802 announcements and bind them to PPS-aligned rows.
   * Augment accepted rows with environment, GNSS_RAW, and system time.
   * Publish and persist TIMEBASE rows.
@@ -56,7 +56,7 @@ Responsibilities:
 Semantics:
   * No Pi-side smoothing, inference, or repair of Teensy clock state.
   * TIMEBASE records are immutable.
-  * Gaps, jumps, regressions, and rejected rows are recorded as evidence.
+  * Gaps, jumps, regressions, and science exclusions are recorded as evidence.
   * WATCHDOG_ANOMALY is an explicit Teensy continuity surrender and starts
     Pi-side recovery from the latest canonical TIMEBASE row.
 """
@@ -179,19 +179,15 @@ CLOCKS_MONITOR_BASELINE_REFRESH_S = 30.0
 MONITOR_PREFLIGHT_MAX_AGE_S = 5.0
 CLOCKS_RECOVERY_STALLED_TOPIC = "CLOCKS_RECOVERY_STALLED"
 TIMEBASE_CANDIDATE_ACCEPT = "ACCEPT"
-TIMEBASE_CANDIDATE_SCIENCE_REJECT = "SCIENCE_REJECT"
+TIMEBASE_CANDIDATE_SCIENCE_EXCLUDE = "SCIENCE_EXCLUDE"
+# Rolling-deploy compatibility only: an older firmware SCIENCE_REJECT is treated
+# exactly like SCIENCE_EXCLUDE. It never selects a mode or causes row burial.
+TIMEBASE_CANDIDATE_LEGACY_SCIENCE_REJECT = "SCIENCE_REJECT"
 TIMEBASE_CANDIDATE_DISPOSITIONS = {
     TIMEBASE_CANDIDATE_ACCEPT,
-    TIMEBASE_CANDIDATE_SCIENCE_REJECT,
+    TIMEBASE_CANDIDATE_SCIENCE_EXCLUDE,
+    TIMEBASE_CANDIDATE_LEGACY_SCIENCE_REJECT,
 }
-
-# Runtime science gate.  The Pi owns the operator-facing value and pushes it to
-# Teensy CLOCKS.  FORENSIC is the temporary diagnostic default; STRICT will
-# become the production default after the underlying clock math is repaired.
-GATE_MODE_STRICT = "STRICT"
-GATE_MODE_FORENSIC = "FORENSIC"
-GATE_MODES = {GATE_MODE_STRICT, GATE_MODE_FORENSIC}
-GATE_MODE_DEFAULT = GATE_MODE_FORENSIC
 
 INVALID_TIMEBASE_LOG_PATH = os.environ.get(
     "ZPNET_INVALID_TIMEBASE_LOG_PATH",
@@ -226,15 +222,6 @@ TIMEBASE_FINAL_COURT_DELTA_RAW_INTERVAL_GATE_CYCLES = 500
 # reattaches OCXO custody, but once a public TIMEBASE row reaches the Pi,
 # zero OCXO ns plus zero endpoints/intervals is lane absence, not science.
 TIMEBASE_FINAL_COURT_OCXO_ZERO_MATURE_PUBLIC_COUNT = 2
-
-# Final-court violations are row verdicts.  They are logged and dropped; a
-# repeated scientific rejection remains a canonical campaign gap and does not
-# become a recovery request merely by repetition.  These legacy constants stay
-# visible in REPORT output during the transition, but no longer control recovery.
-TIMEBASE_FINAL_COURT_ROW_FATAL_RULES = {
-    "ocxo_science_valid",
-}
-TIMEBASE_FINAL_COURT_ROW_FATAL_ESCALATE_CONSECUTIVE = 3
 
 # GNSS_RAW recovery sanity gate.  GNSS_RAW is a Pi-owned synthetic clockface
 # accumulated from receiver drift_ppb.  Its accumulated tau/ppb should stay in
@@ -344,28 +331,16 @@ _diag: Dict[str, Any] = {
     "timebase_final_court_delta_raw_offset_observed": 0,
     "last_timebase_final_court_delta_raw_offset": {},
     "timebase_final_court_row_dropped": 0,
-    "timebase_final_court_row_fatal_escalated": 0,
     "timebase_final_court_degraded_recovery_admitted": 0,
-    "timebase_final_court_forensic_admitted": 0,
-    "timebase_final_court_forensic_science_violations": 0,
-    "timebase_final_court_consecutive_row_fatal": 0,
-    "timebase_final_court_row_fatal_escalate_threshold": TIMEBASE_FINAL_COURT_ROW_FATAL_ESCALATE_CONSECUTIVE,
+    "timebase_final_court_science_excluded": 0,
+    "timebase_final_court_science_exclusion_violations": 0,
     "last_timebase_final_court_row_drop": {},
 
-    # Firmware-authored candidate disposition.  SCIENCE_REJECT is heartbeat
-    # testimony, not a canonical TIMEBASE row and not a recovery request.
-    "firmware_science_reject_received": 0,
-    "firmware_science_reject_logged": 0,
-    "firmware_science_reject_log_failures": 0,
-    "firmware_science_reject_forensic_admitted": 0,
-    "last_firmware_science_reject": {},
-
-    # Pi-owned transitive gate mode.
-    "gate_mode": GATE_MODE_DEFAULT,
-    "gate_mode_set_count": 0,
-    "gate_mode_transition_count": 0,
-    "gate_mode_teensy_push_failures": 0,
-    "last_gate_mode_teensy_payload": {},
+    # Firmware-authored whole-row science exclusions. Coherent rows are always
+    # persisted; these counters explain audit-only admissions.
+    "firmware_science_exclude_received": 0,
+    "firmware_science_exclude_legacy_received": 0,
+    "last_firmware_science_exclude": {},
 
     # Dedicated invalid-TIMEBASE JSONL evidence log.
     "invalid_timebase_log_path": INVALID_TIMEBASE_LOG_PATH,
@@ -645,165 +620,63 @@ def _log_invalid_timebase(
         )
 
 
-def _normalize_gate_mode(value: Any, *, default: Optional[str] = None) -> Optional[str]:
-    if value is None:
-        return default
-    mode = str(value).strip().upper()
-    return mode if mode in GATE_MODES else default
-
-
-def _gate_mode_forensic() -> bool:
-    return _gate_mode == GATE_MODE_FORENSIC
-
-
-def _set_gate_mode_local(mode: str) -> None:
-    global _gate_mode
-    normalized = _normalize_gate_mode(mode)
-    if normalized is None:
-        raise ValueError(f"invalid gate_mode: {mode!r}")
-    previous = _gate_mode
-    _gate_mode = normalized
-    _diag["gate_mode"] = normalized
-    _diag["gate_mode_set_count"] = int(_diag.get("gate_mode_set_count") or 0) + 1
-    if previous != normalized:
-        _diag["gate_mode_transition_count"] = (
-            int(_diag.get("gate_mode_transition_count") or 0) + 1
-        )
-
-
-def _push_gate_mode_to_teensy(mode: str) -> Dict[str, Any]:
-    normalized = _normalize_gate_mode(mode)
-    if normalized is None:
-        raise ValueError(f"invalid gate_mode: {mode!r}")
-    resp = send_command(
-        machine="TEENSY",
-        subsystem="CLOCKS",
-        command="GATE_MODE",
-        args={"gate_mode": normalized},
-    )
-    if not isinstance(resp, dict) or resp.get("success") is False:
-        raise RuntimeError(f"Teensy GATE_MODE transport failure: {resp!r}")
-    payload = resp.get("payload")
-    payload = dict(payload) if isinstance(payload, dict) else {}
-    effective = _normalize_gate_mode(payload.get("gate_mode"))
-    status = str(payload.get("status") or "")
-    if effective != normalized or status == "gate_mode_rejected":
-        raise RuntimeError(
-            f"Teensy GATE_MODE rejected/mismatched: requested={normalized} payload={payload!r}"
-        )
-    global _gate_mode_last_teensy_payload
-    _gate_mode_last_teensy_payload = payload
-    _diag["last_gate_mode_teensy_payload"] = payload
-    return payload
-
-
-def _persist_gate_mode_config(mode: str) -> None:
-    with open_db() as conn:
-        cur = conn.cursor()
-        blob = json.dumps({"gate_mode": mode})
-        cur.execute(
-            """
-            WITH updated AS (
-                UPDATE config
-                SET payload = COALESCE(payload, '{}'::jsonb) || %s::jsonb
-                WHERE config_key = 'SYSTEM'
-                RETURNING 1
-            )
-            INSERT INTO config (config_key, payload)
-            SELECT 'SYSTEM', %s::jsonb
-            WHERE NOT EXISTS (SELECT 1 FROM updated)
-            """,
-            (blob, blob),
-        )
-
-
 def _candidate_disposition(fragment: Dict[str, Any]) -> str:
     """Return the normalized firmware-authored candidate disposition."""
     raw = str(fragment.get("candidate_disposition") or TIMEBASE_CANDIDATE_ACCEPT)
     return raw.strip().upper()
 
 
-def _drop_firmware_science_reject(
-    *,
-    campaign: str,
-    pps_vclock_count: int,
-    fragment: Dict[str, Any],
-    raw_record: Dict[str, Any],
-    assembled_timebase: Dict[str, Any],
-) -> None:
-    """Log one explicit firmware science rejection without publishing TIMEBASE."""
-    reason_code = _as_int(fragment.get("candidate_reason_code")) or 0
-    reason = str(fragment.get("candidate_reason") or "unspecified")
-    source = str(fragment.get("candidate_source") or "UNKNOWN")
-    lane = _as_int(fragment.get("candidate_lane")) or 0
-    reject_mask = _as_int(fragment.get("candidate_reject_mask")) or 0
-    details = {
+def _firmware_science_exclusion(fragment: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the firmware objection transcript, or an empty dict if admitted."""
+    disposition = _candidate_disposition(fragment)
+    explicit_excluded = _timebase_final_court_bool(
+        fragment.get("science_excluded")
+    )
+    explicit_ineligible = (
+        "science_eligible" in fragment
+        and not _timebase_final_court_bool(fragment.get("science_eligible"))
+    )
+    explicit_control_ineligible = (
+        "control_eligible" in fragment
+        and not _timebase_final_court_bool(fragment.get("control_eligible"))
+    )
+    excluded = (
+        disposition in {
+            TIMEBASE_CANDIDATE_SCIENCE_EXCLUDE,
+            TIMEBASE_CANDIDATE_LEGACY_SCIENCE_REJECT,
+        }
+        or explicit_excluded
+        or explicit_ineligible
+        or explicit_control_ineligible
+    )
+    if not excluded:
+        return {}
+
+    return {
+        "source": str(fragment.get("candidate_source") or "TEENSY_CLOCKS"),
+        "reason_code": _as_int(fragment.get("candidate_reason_code")) or 0,
+        "reason_name": str(
+            fragment.get("candidate_reason_name")
+            or fragment.get("candidate_reason")
+            or "unspecified"
+        ),
+        "reason": str(fragment.get("candidate_reason") or "unspecified"),
+        "lane": _as_int(fragment.get("candidate_lane")) or 0,
+        "reject_mask": _as_int(fragment.get("candidate_reject_mask")) or 0,
+        "objection_count": _as_int(fragment.get("candidate_objection_count")) or 1,
         "detail0": _as_int(fragment.get("candidate_detail0")) or 0,
         "detail1": _as_int(fragment.get("candidate_detail1")) or 0,
         "detail2": _as_int(fragment.get("candidate_detail2")) or 0,
         "detail3": _as_int(fragment.get("candidate_detail3")) or 0,
+        "disposition": disposition,
+        "science_eligible": _timebase_final_court_bool(
+            fragment.get("science_eligible", not explicit_ineligible)
+        ),
+        "control_eligible": _timebase_final_court_bool(
+            fragment.get("control_eligible", not explicit_control_ineligible)
+        ),
+        "legacy_disposition": disposition == TIMEBASE_CANDIDATE_LEGACY_SCIENCE_REJECT,
     }
-    verdict = {
-        "schema": "PI_FIRMWARE_SCIENCE_REJECT_V1",
-        "valid": False,
-        "classification": "FIRMWARE_SCIENCE_REJECT",
-        "court_classification": "DROP_ROW",
-        "reason": "firmware_science_reject",
-        "primary_rule": "candidate_disposition",
-        "rationale": "firmware testified that this campaign second is not canonical science",
-        "source": source,
-        "source_process": "TEENSY_CLOCKS",
-        "source_report": "TIMEBASE_FRAGMENT",
-        "campaign": campaign,
-        "teensy_pps_vclock_count": int(pps_vclock_count),
-        "teensy_pps_count": int(pps_vclock_count),
-        "pps_count": int(pps_vclock_count),
-        "candidate_disposition": TIMEBASE_CANDIDATE_SCIENCE_REJECT,
-        "candidate_use": fragment.get("candidate_use"),
-        "candidate_reason_code": int(reason_code),
-        "candidate_reason": reason,
-        "candidate_source": source,
-        "candidate_lane": int(lane),
-        "candidate_reject_mask": int(reject_mask),
-        "candidate_details": details,
-        "timeline_valid": fragment.get("timeline_valid"),
-        "ocxo_clockface_valid": fragment.get("ocxo_clockface_valid"),
-        "ocxo_science_valid": fragment.get("ocxo_science_valid"),
-        "recovery_requested": False,
-        "invalid_timebase_log_path": INVALID_TIMEBASE_LOG_PATH,
-    }
-
-    _diag["firmware_science_reject_received"] += 1
-    _diag["last_firmware_science_reject"] = {
-        "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        **verdict,
-    }
-    before_writes = int(_diag.get("invalid_timebase_log_writes") or 0)
-    _log_invalid_timebase(
-        verdict=verdict,
-        raw_record=raw_record,
-        assembled_timebase=assembled_timebase,
-    )
-    if int(_diag.get("invalid_timebase_log_writes") or 0) > before_writes:
-        _diag["firmware_science_reject_logged"] += 1
-    else:
-        _diag["firmware_science_reject_log_failures"] += 1
-
-    logging.error(
-        "🧪 [clocks] firmware SCIENCE_REJECT — campaign=%s count=%d "
-        "source=%s reason=%s(%d) lane=%d mask=0x%08x details=%s; "
-        "candidate remains heartbeat evidence but will NOT publish TIMEBASE or persist PostgreSQL. "
-        "Full raw candidate follows: %s",
-        campaign,
-        int(pps_vclock_count),
-        source,
-        reason,
-        int(reason_code),
-        int(lane),
-        int(reject_mask),
-        details,
-        json.dumps(raw_record, sort_keys=True, separators=(",", ":"), default=str),
-    )
 
 
 # ---------------------------------------------------------------------
@@ -947,8 +820,6 @@ def _gnss_raw_welford_reset() -> Dict[str, Any]:
 # ---------------------------------------------------------------------
 
 _campaign_active: bool = False
-_gate_mode: str = GATE_MODE_DEFAULT
-_gate_mode_last_teensy_payload: Dict[str, Any] = {}
 
 # The command server is exposed early so PUBSUB can discover subscriptions, but
 # START/RESUME must not race the boot DAC reconciliation and active-campaign recovery.
@@ -3591,9 +3462,9 @@ def _timebase_final_court_check_candidate_envelope(
             },
         )
 
-    # TIMEBASE_FRAGMENT_V5 deliberately retired the embedded deep-forensics
-    # transcript. Older fragments may still carry it, but its absence is no
-    # longer a structural defect.
+    # TIMEBASE_FRAGMENT_V6 keeps deep forensics optional; the durable row
+    # carries compact objections and cycle evidence. Older fragments may still
+    # carry a transcript, but its absence is not a structural defect.
     forensics_present = isinstance(forensics, dict) and bool(forensics)
 
     outer_count = _first_present_int_path(
@@ -3858,7 +3729,6 @@ def _timebase_final_court_check_ocxo_lane_alive(
             "science_worthy": _timebase_final_court_bool(
                 science.get("science_worthy", science.get("valid"))
             ),
-            "forensic_override": _timebase_final_court_bool(science.get("forensic_override")),
             "antecedents_complete": _timebase_final_court_bool(science.get("antecedents_complete")),
             "clock_floorline_valid": _timebase_final_court_bool(science.get("clock_floorline_valid")),
             "delta_raw_valid": _timebase_final_court_bool(science.get("delta_raw_valid")),
@@ -3969,29 +3839,54 @@ def _timebase_final_court_check_ocxo_lane_alive(
 
 
 def _timebase_final_court_evaluate(timebase: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
-    """Return (accepted, verdict), honoring STRICT versus FORENSIC science gates."""
+    """Return (structurally_accepted, verdict) under the mode-free contract."""
     structural_violations: List[Dict[str, Any]] = []
     science_violations: List[Dict[str, Any]] = []
 
-    # Structural failures are never bypassed.  They mean there is no coherent
-    # record to persist or analyze.
+    # Structural failures mean the final object cannot truthfully identify the
+    # campaign second. They remain the only drop/recovery class.
     _timebase_final_court_check_candidate_envelope(
         timebase, structural_violations
     )
 
-    # Numeric/science courts remain fully evaluated in both modes.  FORENSIC
-    # changes only the consequence: evidence is retained and persisted.
+    # Scientific objections never bury a coherent row. They only remove science
+    # and control eligibility while preserving the complete audit record.
     _timebase_final_court_check_delta_raw_interval(timebase, science_violations)
     _timebase_final_court_check_ocxo_lane_alive(timebase, science_violations)
 
-    mode = _normalize_gate_mode(timebase.get("gate_mode"), default=_gate_mode)
-    assert mode is not None
-    fatal_violations = list(structural_violations)
-    if mode == GATE_MODE_STRICT:
-        fatal_violations.extend(science_violations)
+    # A missing mature OCXO lane is not merely questionable science: the Pi can
+    # no longer prove that the lane/timeline identity survived. Promote only
+    # that rule to continuity surrender; ordinary science-custody failures stay
+    # in the persist-and-exclude class.
+    promoted = [
+        violation
+        for violation in science_violations
+        if violation.get("rule") == "ocxo_lane_alive"
+    ]
+    if promoted:
+        structural_violations.extend(promoted)
+        science_violations = [
+            violation
+            for violation in science_violations
+            if violation.get("rule") != "ocxo_lane_alive"
+        ]
+
+    for violation in structural_violations:
+        violation["severity"] = "continuity_fatal"
+    for violation in science_violations:
+        violation["severity"] = "science_exclude"
+
+    fragment = timebase.get("fragment")
+    firmware_exclusion = (
+        _firmware_science_exclusion(fragment)
+        if isinstance(fragment, dict)
+        else {}
+    )
+    science_excluded = bool(firmware_exclusion or science_violations)
+    accepted = not structural_violations
 
     recovery_degraded = _timebase_final_court_recovery_degraded_context(timebase)
-    if recovery_degraded and not fatal_violations:
+    if recovery_degraded and accepted:
         _diag["timebase_final_court_degraded_recovery_admitted"] = (
             _diag.get("timebase_final_court_degraded_recovery_admitted", 0) + 1
         )
@@ -4002,32 +3897,41 @@ def _timebase_final_court_evaluate(timebase: Dict[str, Any]) -> Tuple[bool, Dict
         "fragment.teensy_pps_vclock_count",
         "pps_count",
     )
-    primary = (fatal_violations or science_violations or [{}])[0]
-    accepted = len(fatal_violations) == 0
-    forensic_admission = (
-        accepted
-        and mode == GATE_MODE_FORENSIC
-        and len(science_violations) != 0
+
+    if structural_violations:
+        primary = structural_violations[0]
+    elif firmware_exclusion:
+        primary = {
+            "rule": "firmware_row_objection",
+            "message": firmware_exclusion.get("reason") or "firmware excluded row",
+        }
+    elif science_violations:
+        primary = science_violations[0]
+    else:
+        primary = {}
+
+    classification = (
+        "DROP_CONTINUITY_FATAL"
+        if not accepted
+        else "ACCEPT_SCIENCE_EXCLUDE"
+        if science_excluded
+        else "ACCEPT"
     )
 
     verdict: Dict[str, Any] = {
-        "schema": "PI_TIMEBASE_FINAL_COURT_V3",
+        "schema": "PI_TIMEBASE_FINAL_COURT_V4",
         "valid": accepted,
-        "science_valid": len(science_violations) == 0,
-        "classification": (
-            "ACCEPT_FORENSIC" if forensic_admission
-            else "ACCEPT" if accepted
-            else "DROP_ROW"
-        ),
-        "gate_mode": mode,
-        "forensic_admission": forensic_admission,
+        "continuity_valid": accepted,
+        "science_valid": not science_excluded,
+        "science_eligible": accepted and not science_excluded,
+        "control_eligible": accepted and not science_excluded,
+        "persist": accepted,
+        "science_excluded": science_excluded,
+        "candidate_use": "AUDIT_ONLY" if science_excluded else "SCIENCE_AND_CONTROL",
+        "classification": classification,
         "reason": TIMEBASE_FINAL_COURT_REASON,
         "primary_rule": primary.get("rule"),
-        "rationale": (
-            primary.get("message")
-            if primary
-            else "candidate accepted"
-        ),
+        "rationale": primary.get("message") if primary else "candidate accepted",
         "source": TIMEBASE_FINAL_COURT_SOURCE,
         "source_process": "CLOCKS",
         "source_report": "TIMEBASE_FINAL_COURT",
@@ -4047,11 +3951,19 @@ def _timebase_final_court_evaluate(timebase: Dict[str, Any]) -> Tuple[bool, Dict
         ),
         "timebase_pair_version": timebase.get("timebase_pair_version"),
         "rule_count": 4,
-        "violation_count": len(structural_violations) + len(science_violations),
-        "fatal_violation_count": len(fatal_violations),
+        "violation_count": (
+            len(structural_violations)
+            + len(science_violations)
+            + (1 if firmware_exclusion else 0)
+        ),
+        "fatal_violation_count": len(structural_violations),
         "structural_violation_count": len(structural_violations),
         "science_violation_count": len(science_violations),
+        "firmware_objection_count": int(
+            firmware_exclusion.get("objection_count") or 0
+        ),
         "recovery_degraded_context": recovery_degraded,
+        "firmware_exclusion": firmware_exclusion,
         "violations": structural_violations + science_violations,
         "structural_violations": structural_violations,
         "science_violations": science_violations,
@@ -4060,139 +3972,75 @@ def _timebase_final_court_evaluate(timebase: Dict[str, Any]) -> Tuple[bool, Dict
     return accepted, verdict
 
 
-_final_court_row_fatal_consecutive: int = 0
-_final_court_row_fatal_signature: Optional[str] = None
-_final_court_row_fatal_first_pps: Optional[int] = None
-_final_court_row_fatal_last_pps: Optional[int] = None
-
-
-def _timebase_final_court_violation_rules(verdict: Dict[str, Any]) -> List[str]:
-    violations = verdict.get("violations")
-    if not isinstance(violations, list):
-        return []
-    return [str(v.get("rule") or "") for v in violations if isinstance(v, dict)]
-
-
-def _timebase_final_court_row_fatal(verdict: Dict[str, Any]) -> bool:
-    rules = _timebase_final_court_violation_rules(verdict)
-    return bool(rules) and all(rule in TIMEBASE_FINAL_COURT_ROW_FATAL_RULES for rule in rules)
-
-
-def _timebase_final_court_signature(verdict: Dict[str, Any]) -> str:
-    violations = verdict.get("violations")
-    if not isinstance(violations, list):
-        return ""
-    parts: List[str] = []
-    for v in violations:
-        if not isinstance(v, dict):
-            continue
-        parts.append(f"{v.get('rule', '')}:{v.get('lane', '')}")
-    return ",".join(sorted(parts))
-
-
-def _timebase_final_court_reset_row_fatal_streak(reason: str) -> None:
-    global _final_court_row_fatal_consecutive
-    global _final_court_row_fatal_signature
-    global _final_court_row_fatal_first_pps
-    global _final_court_row_fatal_last_pps
-
-    if _final_court_row_fatal_consecutive:
-        _diag["last_timebase_final_court_row_drop"] = {
-            **(_diag.get("last_timebase_final_court_row_drop") or {}),
-            "reset_reason": reason,
-            "reset_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        }
-
-    _final_court_row_fatal_consecutive = 0
-    _final_court_row_fatal_signature = None
-    _final_court_row_fatal_first_pps = None
-    _final_court_row_fatal_last_pps = None
-    _diag["timebase_final_court_consecutive_row_fatal"] = 0
-
-
-def _timebase_final_court_note_row_drop(verdict: Dict[str, Any]) -> bool:
-    """Record a rejected-row streak for diagnostics only."""
-    global _final_court_row_fatal_consecutive
-    global _final_court_row_fatal_signature
-    global _final_court_row_fatal_first_pps
-    global _final_court_row_fatal_last_pps
-
-    pps = _as_int(verdict.get("teensy_pps_vclock_count"))
-    signature = _timebase_final_court_signature(verdict)
-
-    if (
-        _final_court_row_fatal_signature == signature
-        and _final_court_row_fatal_last_pps is not None
-        and pps is not None
-        and int(pps) == int(_final_court_row_fatal_last_pps) + 1
-    ):
-        _final_court_row_fatal_consecutive += 1
-    else:
-        _final_court_row_fatal_consecutive = 1
-        _final_court_row_fatal_signature = signature
-        _final_court_row_fatal_first_pps = pps
-
-    _final_court_row_fatal_last_pps = pps
-    _diag["timebase_final_court_row_dropped"] = (
-        _diag.get("timebase_final_court_row_dropped", 0) + 1
-    )
-    _diag["timebase_final_court_consecutive_row_fatal"] = (
-        _final_court_row_fatal_consecutive
-    )
-    _diag["last_timebase_final_court_row_drop"] = {
-        "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        "campaign": verdict.get("campaign"),
-        "teensy_pps_vclock_count": pps,
-        "pps_count": pps,
-        "signature": signature,
-        "first_pps_vclock_count": _final_court_row_fatal_first_pps,
-        "consecutive": _final_court_row_fatal_consecutive,
-        "threshold": TIMEBASE_FINAL_COURT_ROW_FATAL_ESCALATE_CONSECUTIVE,
-        "rules": _timebase_final_court_violation_rules(verdict),
-        "verdict": verdict,
-    }
-    return (
-        _final_court_row_fatal_consecutive
-        >= TIMEBASE_FINAL_COURT_ROW_FATAL_ESCALATE_CONSECUTIVE
-    )
-
-
 def _timebase_final_court_block(
     verdict: Dict[str, Any],
     *,
     raw_record: Dict[str, Any],
     assembled_timebase: Dict[str, Any],
 ) -> None:
-    """Log and drop one invalid row without converting it into recovery."""
+    """Drop one structurally incoherent row and surrender continuity."""
     _diag["timebase_final_court_blocked"] += 1
+    _diag["timebase_final_court_row_dropped"] = (
+        _diag.get("timebase_final_court_row_dropped", 0) + 1
+    )
     verdict["valid"] = False
-    verdict["classification"] = "DROP_ROW"
-    verdict["court_classification"] = "DROP_ROW"
-    verdict["recovery_requested"] = False
+    verdict["continuity_valid"] = False
+    verdict["science_valid"] = False
+    verdict["science_eligible"] = False
+    verdict["control_eligible"] = False
+    verdict["persist"] = False
+    verdict["classification"] = "DROP_CONTINUITY_FATAL"
+    verdict["court_classification"] = "DROP_CONTINUITY_FATAL"
+    verdict["continuity_fatal"] = True
     _diag["last_timebase_final_court"] = verdict
+    _diag["last_timebase_final_court_row_drop"] = {
+        "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "campaign": verdict.get("campaign"),
+        "teensy_pps_vclock_count": verdict.get("teensy_pps_vclock_count"),
+        "primary_rule": verdict.get("primary_rule"),
+        "rationale": verdict.get("rationale"),
+        "verdict": verdict,
+    }
 
-    _timebase_final_court_note_row_drop(verdict)
     _log_invalid_timebase(
         verdict=verdict,
         raw_record=raw_record,
         assembled_timebase=assembled_timebase,
     )
 
-    logging.warning(
-        "⚠️ [clocks] invalid TIMEBASE candidate dropped: campaign=%s pps=%s "
-        "rule=%s rationale=%s",
+    recovery_started = False
+    if _campaign_active or _auto_recovery_in_progress:
+        recovery_started = _begin_auto_recovery(
+            "timebase_structural_integrity_failure",
+            {
+                "campaign": verdict.get("campaign"),
+                "teensy_pps_vclock_count": verdict.get("teensy_pps_vclock_count"),
+                "primary_rule": verdict.get("primary_rule"),
+                "rationale": verdict.get("rationale"),
+                "structural_violations": verdict.get("structural_violations"),
+            },
+            source=TIMEBASE_FINAL_COURT_SOURCE,
+        )
+        if recovery_started:
+            _diag["timebase_final_court_recovery_started"] += 1
+    verdict["recovery_requested"] = recovery_started
+
+    logging.error(
+        "💥 [clocks] structurally incoherent TIMEBASE candidate dropped: "
+        "campaign=%s pps=%s rule=%s rationale=%s recovery_started=%s",
         verdict.get("campaign"),
         verdict.get("teensy_pps_vclock_count"),
         verdict.get("primary_rule"),
         verdict.get("rationale"),
+        recovery_started,
     )
 
     try:
-        create_event("TIMEBASE_ROW_DROPPED", verdict)
+        create_event("TIMEBASE_CONTINUITY_FATAL", verdict)
     except Exception:
         _diag["timebase_final_court_event_enqueue_failures"] += 1
         logging.debug(
-            "⚠️ [clocks] failed to enqueue TIMEBASE_ROW_DROPPED event",
+            "⚠️ [clocks] failed to enqueue TIMEBASE_CONTINUITY_FATAL event",
             exc_info=True,
         )
 
@@ -5326,7 +5174,6 @@ def _process_loop() -> None:
             court_timebase = {
                 "schema": "TIMEBASE_V3",
                 "campaign": str(frag.get("campaign") or ""),
-                "gate_mode": _gate_mode,
                 "fragment": frag,
                 "forensics": forensics,
                 "identity_error": str(exc),
@@ -5360,7 +5207,6 @@ def _process_loop() -> None:
             "timebase_message_version": frag.get("timebase_message_version"),
             "timebase_pair_version": frag.get("timebase_pair_version"),
             "campaign": campaign,
-            "gate_mode": _gate_mode,
             "teensy_pps_vclock_count": int(pps_vclock_count),
             "teensy_pps_count": int(pps_vclock_count),
             "pps_count": int(pps_vclock_count),
@@ -5368,44 +5214,47 @@ def _process_loop() -> None:
             "forensics": forensics,
         }
 
-        firmware_science_reject = (
-            _candidate_disposition(frag) == TIMEBASE_CANDIDATE_SCIENCE_REJECT
-        )
-        if firmware_science_reject and not _gate_mode_forensic():
-            # STRICT preserves the production behavior exactly: retain complete
-            # evidence, but do not advance Pi math, publication, or PostgreSQL.
-            _note_pps_vclock_count(int(pps_vclock_count))
-            _timebase_final_court_reset_row_fatal_streak(
-                "firmware_science_reject"
-            )
-            _drop_firmware_science_reject(
-                campaign=campaign,
-                pps_vclock_count=int(pps_vclock_count),
-                fragment=frag,
-                raw_record=raw_record,
-                assembled_timebase=court_timebase,
-            )
-            continue
-        if firmware_science_reject:
-            _diag["firmware_science_reject_received"] += 1
-            _diag["firmware_science_reject_forensic_admitted"] += 1
-            _diag["last_firmware_science_reject"] = {
+        firmware_exclusion = _firmware_science_exclusion(frag)
+        if firmware_exclusion:
+            _diag["firmware_science_exclude_received"] += 1
+            if firmware_exclusion.get("legacy_disposition"):
+                _diag["firmware_science_exclude_legacy_received"] += 1
+            _diag["last_firmware_science_exclude"] = {
                 "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 "campaign": campaign,
                 "teensy_pps_vclock_count": int(pps_vclock_count),
-                "candidate_reason": frag.get("candidate_reason"),
-                "candidate_reason_code": frag.get("candidate_reason_code"),
-                "candidate_reject_mask": frag.get("candidate_reject_mask"),
-                "gate_mode": _gate_mode,
-                "forensic_admission": True,
+                **firmware_exclusion,
             }
+            raw_cycles = frag.get("raw_cycles")
+            if not isinstance(raw_cycles, dict):
+                raw_cycles = {}
+
+            def _cycle_evidence(lane: str) -> str:
+                sample = raw_cycles.get(lane)
+                if not isinstance(sample, dict):
+                    return f"{lane}=missing"
+                return (
+                    f"{lane}[obs={sample.get('observed_cycles')} "
+                    f"prev={sample.get('previous_observed_cycles')} "
+                    f"res={sample.get('residual_cycles')}]"
+                )
+
+            cycle_evidence = " ".join(
+                _cycle_evidence(lane)
+                for lane in ("pps", "vclock", "ocxo1", "ocxo2")
+            )
             logging.warning(
-                "🧪 [clocks] FORENSIC admission of firmware SCIENCE_REJECT: campaign=%s count=%d reason=%s mask=%s",
+                "🧪 [clocks] firmware science exclusion retained for TIMEBASE: "
+                "campaign=%s count=%d reason=%s mask=0x%08x objections=%d "
+                "raw_cycles=%s",
                 campaign,
                 int(pps_vclock_count),
-                frag.get("candidate_reason"),
-                frag.get("candidate_reject_mask"),
+                firmware_exclusion.get("reason"),
+                int(firmware_exclusion.get("reject_mask") or 0),
+                int(firmware_exclusion.get("objection_count") or 1),
+                cycle_evidence,
             )
+
 
         _diag["timebase_final_court_checks"] += 1
         court_ok, court_verdict = _timebase_final_court_evaluate(court_timebase)
@@ -5417,14 +5266,13 @@ def _process_loop() -> None:
             )
             continue
 
-        _timebase_final_court_reset_row_fatal_streak("final_court_passed")
         _diag["timebase_final_court_passed"] += 1
-        if court_verdict.get("forensic_admission"):
-            _diag["timebase_final_court_forensic_admitted"] += 1
-            _diag["timebase_final_court_forensic_science_violations"] += int(
+        _diag["last_timebase_final_court"] = court_verdict
+        if court_verdict.get("science_excluded"):
+            _diag["timebase_final_court_science_excluded"] += 1
+            _diag["timebase_final_court_science_exclusion_violations"] += int(
                 court_verdict.get("science_violation_count") or 0
             )
-            _diag["last_timebase_final_court"] = court_verdict
 
         sync_matched = _signal_sync_candidate_if_needed(frag, pps_vclock_count)
         if sync_matched and not _campaign_active:
@@ -5473,6 +5321,10 @@ def _process_loop() -> None:
                 )
                 continue
 
+        science_eligible = bool(court_verdict.get("science_eligible"))
+        control_eligible = bool(court_verdict.get("control_eligible"))
+        science_excluded = bool(court_verdict.get("science_excluded"))
+
         _diag["fragments_processed"] += 1
         _note_pps_vclock_count(pps_vclock_count)
 
@@ -5490,7 +5342,7 @@ def _process_loop() -> None:
         )
 
         # --- Extract GNSS ns for stream health canary ---
-        # V5 keeps gnss_ns temporarily, but gnss.ns is the canonical ledger.
+        # V6 keeps gnss_ns temporarily, but gnss.ns is the canonical ledger.
         gnss_ns = _fragment_ns(frag, "gnss.ns", "gnss_ns", default=0)
 
         # --- GNSS stream health canary (Pi-side diagnostic only) ---
@@ -5508,11 +5360,16 @@ def _process_loop() -> None:
         # --- GNSS_RAW synthetic clock ---
         gnss_raw_drift_ppb = _gnss_raw_drift_from_info(gnss_info)
 
-        # The clockface remains campaign/recovery-relative. Its statistical
-        # population is independent and continues in the sampler above.
-        _gnss_raw_ns += NS_PER_SECOND + (gnss_raw_drift_ppb if gnss_raw_drift_ppb is not None else 0.0)
-        _gnss_raw_n += 1
-        _gnss_raw_valid = True
+        # The campaign-relative synthetic clock is a scientific accumulator.
+        # Preserve its current value on an audit-only row; its admitted N may
+        # therefore be lower than the PPS/VCLOCK timeline count. The independent
+        # always-on GNSS_RAW sampler remains observational and continues above.
+        if science_eligible:
+            _gnss_raw_ns += NS_PER_SECOND + (
+                gnss_raw_drift_ppb if gnss_raw_drift_ppb is not None else 0.0
+            )
+            _gnss_raw_n += 1
+            _gnss_raw_valid = True
         gnss_raw_ns_int = int(round(_gnss_raw_ns))
         gnss_raw_ref_ns = _gnss_raw_n * NS_PER_SECOND
         gnss_raw_welford = _gnss_raw_welford_snapshot()
@@ -5524,11 +5381,11 @@ def _process_loop() -> None:
             "timebase_pair_version": frag.get("timebase_pair_version"),
             "campaign": campaign,
             "campaign_elapsed": _seconds_to_hms(int(pps_vclock_count)),
-            "gate_mode": _gate_mode,
-            "forensic_admission": bool(
-                firmware_science_reject
-                or court_verdict.get("forensic_admission")
-            ),
+            "science_eligible": science_eligible,
+            "control_eligible": control_eligible,
+            "persist": True,
+            "science_excluded": science_excluded,
+            "candidate_use": "AUDIT_ONLY" if science_excluded else "SCIENCE_AND_CONTROL",
             "final_court": court_verdict,
             "location": campaign_payload.get("location"),
 
@@ -5587,7 +5444,11 @@ def _process_loop() -> None:
             frag.get("ocxo2_dac"),
         )
 
-        if ocxo1_dac_seed is not None and ocxo2_dac_seed is not None:
+        if (
+            control_eligible
+            and ocxo1_dac_seed is not None
+            and ocxo2_dac_seed is not None
+        ):
             try:
                 with open_db() as conn:
                     cur = conn.cursor()
@@ -5636,7 +5497,6 @@ def _reset_trackers() -> int:
     _diag["last_timebase_activity"] = {}
     _gnss_canary_reset()
     _gnss_raw_clock_reset()
-    _timebase_final_court_reset_row_fatal_streak("trackers_reset")
     return _drain_timebase_ingress()
 
 def _request_teensy_stop_best_effort() -> None:
@@ -6433,106 +6293,27 @@ def cmd_stats_reset(_: Optional[dict]) -> Dict[str, Any]:
 
 def cmd_report(_: Optional[dict]) -> Dict[str, Any]:
     row = _get_active_campaign()
+    contract = {
+        "mode_free": True,
+        "coherent_rows_persist": True,
+        "science_exclusions_are_audit_only": True,
+        "continuity_fatal_triggers_recovery": True,
+    }
     if not row:
         return {
             "success": True,
             "message": "OK",
             "payload": {
                 "campaign_state": "IDLE",
-                "gate_mode": _gate_mode,
-                "gate_mode_default": GATE_MODE_DEFAULT,
-                "teensy_gate_mode": _gate_mode_last_teensy_payload,
+                "integrity_contract": contract,
                 "startup": _start_status_payload(),
             },
         }
 
     payload = dict(row["payload"])
-    payload["gate_mode"] = _gate_mode
-    payload["gate_mode_default"] = GATE_MODE_DEFAULT
-    payload["teensy_gate_mode"] = _gate_mode_last_teensy_payload
+    payload["integrity_contract"] = contract
     payload["startup"] = _start_status_payload()
     return {"success": True, "message": "OK", "payload": payload}
-
-
-def cmd_gate_mode(args: Optional[dict]) -> Dict[str, Any]:
-    raw = None
-    if args:
-        raw = args.get("gate_mode", args.get("mode"))
-
-    # No argument is a report operation.
-    if raw is None:
-        teensy_payload: Dict[str, Any] = {}
-        try:
-            resp = send_command(
-                machine="TEENSY",
-                subsystem="CLOCKS",
-                command="REPORT_GATE_MODE",
-            )
-            if isinstance(resp, dict) and isinstance(resp.get("payload"), dict):
-                teensy_payload = dict(resp["payload"])
-        except Exception:
-            logging.debug("CLOCKS.REPORT_GATE_MODE unavailable", exc_info=True)
-        return {
-            "success": True,
-            "message": "OK",
-            "payload": {
-                "gate_mode": _gate_mode,
-                "default_gate_mode": GATE_MODE_DEFAULT,
-                "allowed": sorted(GATE_MODES),
-                "teensy": teensy_payload or _gate_mode_last_teensy_payload,
-            },
-        }
-
-    requested = _normalize_gate_mode(raw)
-    if requested is None:
-        return {
-            "success": False,
-            "message": f"gate_mode must be STRICT or FORENSIC, got {raw!r}",
-        }
-
-    previous = _gate_mode
-    try:
-        teensy_payload = _push_gate_mode_to_teensy(requested)
-    except Exception as exc:
-        _diag["gate_mode_teensy_push_failures"] += 1
-        logging.exception("❌ [clocks] GATE_MODE Teensy push failed")
-        return {
-            "success": False,
-            "message": str(exc),
-            "payload": {
-                "previous_gate_mode": previous,
-                "requested_gate_mode": requested,
-                "gate_mode": _gate_mode,
-            },
-        }
-
-    _set_gate_mode_local(requested)
-    persist_error = None
-    try:
-        _persist_gate_mode_config(requested)
-    except Exception as exc:
-        persist_error = str(exc)
-        logging.exception(
-            "⚠️ [clocks] GATE_MODE applied at runtime but SYSTEM persistence failed"
-        )
-
-    logging.warning(
-        "🧪 [clocks] gate_mode changed %s -> %s (FORENSIC admits and contaminates rejected numeric rows)",
-        previous,
-        requested,
-    )
-    return {
-        "success": True,
-        "message": "OK",
-        "payload": {
-            "previous_gate_mode": previous,
-            "gate_mode": _gate_mode,
-            "default_gate_mode": GATE_MODE_DEFAULT,
-            "persisted": persist_error is None,
-            "persist_error": persist_error,
-            "teensy": teensy_payload,
-        },
-    }
 
 
 def cmd_clear(_: Optional[dict]) -> dict:
@@ -8137,10 +7918,12 @@ def cmd_list_campaigns(_: Optional[dict]) -> Dict[str, Any]:
 def cmd_clocks_info(_: Optional[dict]) -> Dict[str, Any]:
     payload = {
         "campaign_active": _campaign_active,
-        "gate_mode": _gate_mode,
-        "gate_mode_default": GATE_MODE_DEFAULT,
-        "gate_mode_allowed": sorted(GATE_MODES),
-        "teensy_gate_mode": _gate_mode_last_teensy_payload,
+        "integrity_contract": {
+            "mode_free": True,
+            "coherent_rows_persist": True,
+            "science_exclusions_are_audit_only": True,
+            "continuity_fatal_triggers_recovery": True,
+        },
         "last_pps_vclock_count_seen": _last_pps_vclock_count_seen,
         "accepted_pps_vclock_count": _accepted_pps_vclock_count,
         "sync_expected_pps_vclock": _sync_expected_pps_vclock,
@@ -8695,8 +8478,6 @@ COMMANDS = {
     "TRUNCATE": cmd_truncate,
     "SET_DAC": cmd_set_dac,
     "DITHER": cmd_set_dither,
-    "GATE_MODE": cmd_gate_mode,
-    "SET_GATE_MODE": cmd_gate_mode,
     "SET_BASELINE": cmd_set_baseline,
     "BASELINE_INFO": cmd_baseline_info,
     "LIST_CAMPAIGNS": cmd_list_campaigns,
@@ -8734,9 +8515,9 @@ def run() -> None:
         "🕐 [clocks] unified PPS/VCLOCK TIMEBASE candidate schema. Teensy PPS/VCLOCK count is canonical. "
         "Four clock domains: GNSS (reference), DWT, OCXO1, OCXO2. "
         "The Teensy emits one always-on MONITOR_FRAGMENT; campaign rows ride inside campaign_row and the Pi is the final TIMEBASE arbiter. "
-        "STRICT drops science-rejected numeric candidates; FORENSIC persists them and allows mathematical contamination. "
+        "Every coherent PPS second persists; objections make it AUDIT_ONLY while continuity loss triggers recovery. "
         "START while active performs seamless flash-cut to new campaign. "
-        "Commands: START, STOP, RESUME, RECOVER_ABORT, REPORT, REPORT_CLOCKS, REPORT_STATS, STATS_RESET, CLEAR, DELETE, TRUNCATE, SET_DAC, DITHER, GATE_MODE, "
+        "Commands: START, STOP, RESUME, RECOVER_ABORT, REPORT, REPORT_CLOCKS, REPORT_STATS, STATS_RESET, CLEAR, DELETE, TRUNCATE, SET_DAC, DITHER, "
         "SET_BASELINE, BASELINE_INFO, LIST_CAMPAIGNS, CLOCKS_INFO. "
         "Subscriptions: MONITOR, MONITOR_FRAGMENT, GNSS_ANNOUNCEMENT, WATCHDOG_ANOMALY, CLOCKS_RECOVERY_STALLED. "
         "Publications: TIMEBASE, CLOCKS_MONITOR (Pi decoration merged into unified MONITOR)."
@@ -8769,25 +8550,6 @@ def run() -> None:
     # starts or recovers.
     try:
         cfg = _get_system_config()
-
-        configured_gate_mode = _normalize_gate_mode(
-            cfg.get("gate_mode"),
-            default=GATE_MODE_DEFAULT,
-        )
-        assert configured_gate_mode is not None
-        try:
-            teensy_gate_payload = _push_gate_mode_to_teensy(configured_gate_mode)
-            _set_gate_mode_local(configured_gate_mode)
-            logging.info(
-                "🧪 [clocks] campaign gate mode is %s",
-                configured_gate_mode,
-            )
-        except Exception:
-            _diag["gate_mode_teensy_push_failures"] += 1
-            logging.exception(
-                "⚠️ [clocks] boot gate_mode push failed; retaining synchronized default %s",
-                _gate_mode,
-            )
 
         # Dither is an actuator, not harmless configuration.  Never arm it as a
         # side effect of process startup; an operator command or an active servo
