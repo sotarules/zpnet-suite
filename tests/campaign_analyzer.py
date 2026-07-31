@@ -94,6 +94,72 @@ def first_float(*values: Any) -> Optional[float]:
     return None
 
 
+def first_bool(*values: Any) -> Optional[bool]:
+    for value in values:
+        out = b(value)
+        if out is not None:
+            return out
+    return None
+
+
+def science_disposition(payload: Dict[str, Any],
+                        frag: Dict[str, Any]) -> tuple[bool, bool, str]:
+    """Resolve completed TIMEBASE science custody.
+
+    The Pi final court is authoritative when present.  Top-level TIMEBASE and
+    firmware-fragment fields are compatibility witnesses for older rows.
+    Unknown legacy rows remain admitted unless an explicit exclusion signal is
+    present; this preserves historical analyzer behavior without allowing a
+    known SCIENCE_EXCLUDE row into science statistics or courts.
+    """
+    court = d(payload.get("final_court"))
+
+    excluded = first_bool(
+        court.get("science_excluded"),
+        payload.get("science_excluded"),
+        frag.get("science_excluded"),
+    )
+    eligible = first_bool(
+        court.get("science_eligible"),
+        payload.get("science_eligible"),
+        frag.get("science_eligible"),
+    )
+
+    candidate_use = str(
+        court.get("candidate_use")
+        or payload.get("candidate_use")
+        or frag.get("candidate_use")
+        or ""
+    ).strip().upper()
+    classification = str(court.get("classification") or "").strip().upper()
+    disposition = str(frag.get("candidate_disposition") or "").strip().upper()
+
+    explicit_exclusion = bool(
+        excluded is True
+        or eligible is False
+        or candidate_use in {"AUDIT_ONLY", "SCIENCE_EXCLUDE", "EXCLUDE"}
+        or classification in {"SCIENCE_EXCLUDE", "AUDIT_ONLY"}
+        or disposition in {"SCIENCE_EXCLUDE", "AUDIT_ONLY"}
+    )
+    if explicit_exclusion:
+        reason = str(
+            court.get("rationale")
+            or court.get("primary_rule")
+            or frag.get("candidate_reason")
+            or frag.get("candidate_reason_name")
+            or candidate_use
+            or classification
+            or disposition
+            or "science excluded"
+        )
+        return False, True, reason
+
+    if eligible is True or excluded is False or candidate_use == "SCIENCE_AND_CONTROL":
+        return True, False, "science admitted"
+
+    return True, False, "legacy row without explicit science disposition"
+
+
 @dataclass
 class RunningStats:
     n: int = 0
@@ -145,6 +211,9 @@ class CompactRow:
     vclock_ppb: Optional[float]
     ocxo1_ppb: Optional[float]
     ocxo2_ppb: Optional[float]
+    science_eligible: bool
+    science_excluded: bool
+    science_reason: str
     recovery_evidence: bool
     recovery_hold: bool
     timeline_ready: Optional[bool]
@@ -166,6 +235,8 @@ class Audit:
     first_ts: str = ""
     last_ts: str = ""
     rows: int = 0
+    science_rows: int = 0
+    science_excluded_rows: int = 0
     expected_rows: int = 0
     gaps: int = 0
     recovery_gaps: int = 0
@@ -303,6 +374,9 @@ def compact(db_id: int, db_pps: int, ts: str, payload: Dict[str, Any]) -> Compac
 
     o1_ns, o1_int, o1_res, o1_valid = ocxo("ocxo1")
     o2_ns, o2_int, o2_res, o2_valid = ocxo("ocxo2")
+    row_science_eligible, row_science_excluded, row_science_reason = (
+        science_disposition(payload, frag)
+    )
 
     reason = str(frag.get("recover_reattach_reason") or "").strip().lower()
     recovery_evidence = bool(
@@ -358,6 +432,9 @@ def compact(db_id: int, db_pps: int, ts: str, payload: Dict[str, Any]) -> Compac
         vclock_ppb=first_float(path(frag, "stats.vclock.ppb"), frag.get("vclock_ppb")),
         ocxo1_ppb=first_float(path(frag, "stats.ocxo1.ppb"), frag.get("ocxo1_ppb")),
         ocxo2_ppb=first_float(path(frag, "stats.ocxo2.ppb"), frag.get("ocxo2_ppb")),
+        science_eligible=row_science_eligible,
+        science_excluded=row_science_excluded,
+        science_reason=row_science_reason,
         recovery_evidence=recovery_evidence,
         recovery_hold=recovery_hold,
         timeline_ready=b(frag.get("recover_timeline_ready")),
@@ -379,6 +456,11 @@ def compact(db_id: int, db_pps: int, ts: str, payload: Dict[str, Any]) -> Compac
 
 def update(audit: Audit, prev: Optional[CompactRow], cur: CompactRow) -> None:
     audit.rows += 1
+    if cur.science_eligible:
+        audit.science_rows += 1
+    else:
+        audit.science_excluded_rows += 1
+        audit.note("Science excluded", f"pps={cur.pps} reason={cur.science_reason}")
     audit.first_pps = cur.pps if audit.first_pps is None else audit.first_pps
     audit.last_pps = cur.pps
     audit.first_ts = cur.ts if not audit.first_ts else audit.first_ts
@@ -395,7 +477,7 @@ def update(audit: Audit, prev: Optional[CompactRow], cur: CompactRow) -> None:
         ("ocxo1_ppb", cur.ocxo1_ppb),
         ("ocxo2_ppb", cur.ocxo2_ppb),
     ):
-        if value is not None:
+        if value is not None and cur.science_eligible:
             audit.stats[key].update(value)
             if abs(value) > PPB_ABSOLUTE_ALARM:
                 audit.ppb_alarms += 1
@@ -405,7 +487,7 @@ def update(audit: Audit, prev: Optional[CompactRow], cur: CompactRow) -> None:
         ("ocxo1", cur.ocxo1_interval_ns, cur.ocxo1_residual_ns, cur.ocxo1_valid),
         ("ocxo2", cur.ocxo2_interval_ns, cur.ocxo2_residual_ns, cur.ocxo2_valid),
     ):
-        if interval is not None and valid is True:
+        if interval is not None and valid is True and cur.science_eligible:
             audit.stats[f"{lane}_interval"].update(float(interval))
             deviation = interval - NS_PER_SECOND
             if abs(deviation) > OCXO_SECOND_ALARM_NS:
@@ -415,7 +497,7 @@ def update(audit: Audit, prev: Optional[CompactRow], cur: CompactRow) -> None:
                     f"{lane.upper()} interval",
                     f"pps={cur.pps} interval={interval} deviation={deviation:+d} valid={valid}",
                 )
-        if residual is not None and valid is True:
+        if residual is not None and valid is True and cur.science_eligible:
             audit.stats[f"{lane}_residual"].update(float(residual))
 
     if (
@@ -423,7 +505,7 @@ def update(audit: Audit, prev: Optional[CompactRow], cur: CompactRow) -> None:
         and cur.ocxo2_residual_ns is not None
         and cur.ocxo1_valid is True
         and cur.ocxo2_valid is True
-        and not cur.recovery_hold
+        and cur.science_eligible
     ):
         audit.stats["ocxo_divergence"].update(
             float(cur.ocxo1_residual_ns - cur.ocxo2_residual_ns)
@@ -460,7 +542,8 @@ def update(audit: Audit, prev: Optional[CompactRow], cur: CompactRow) -> None:
 
     if prev.dwt_cycles is not None and cur.dwt_cycles is not None:
         dwt_delta = cur.dwt_cycles - prev.dwt_cycles
-        audit.stats["dwt_delta"].update(float(dwt_delta))
+        if prev.science_eligible and cur.science_eligible:
+            audit.stats["dwt_delta"].update(float(dwt_delta))
         if dwt_delta <= 0:
             audit.dwt_nonmonotonic += 1
             audit.note("DWT nonmonotonic", f"pps={cur.pps} delta={dwt_delta}")
@@ -471,7 +554,13 @@ def update(audit: Audit, prev: Optional[CompactRow], cur: CompactRow) -> None:
         interval = getattr(cur, f"{lane}_interval_ns")
         if prev_ns is not None and cur_ns is not None and interval is not None:
             error = (cur_ns - prev_ns) - interval
-            if abs(error) > OCXO_SECOND_WARN_NS and not cur.recovery_hold:
+            if (
+                abs(error) > OCXO_SECOND_WARN_NS
+                and prev.science_eligible
+                and cur.science_eligible
+                and getattr(prev, f"{lane}_valid") is True
+                and getattr(cur, f"{lane}_valid") is True
+            ):
                 setattr(audit, f"{lane}_ledger_errors",
                         getattr(audit, f"{lane}_ledger_errors") + 1)
                 audit.note(
@@ -487,14 +576,21 @@ def update(audit: Audit, prev: Optional[CompactRow], cur: CompactRow) -> None:
         if cn < pn:
             audit.welford_regressions += 1
             audit.note("Welford regression", f"pps={cur.pps} {lane} {pn}->{cn}")
-        if cur.recovery_hold and lane in {"ocxo1", "ocxo2"} and cn != pn:
+        if cur.science_excluded and cn != pn:
             audit.welford_hold_changes += 1
-            audit.note("Welford changed in hold", f"pps={cur.pps} {lane} {pn}->{cn}")
+            audit.note("Welford changed while science excluded",
+                       f"pps={cur.pps} {lane} {pn}->{cn}")
 
     for lane in ("dwt", "vclock", "ocxo1", "ocxo2"):
         pv = getattr(prev, f"{lane}_ppb")
         cv = getattr(cur, f"{lane}_ppb")
-        if pv is not None and cv is not None and abs(cv - pv) > PPB_STEP_ALARM:
+        if (
+            prev.science_eligible
+            and cur.science_eligible
+            and pv is not None
+            and cv is not None
+            and abs(cv - pv) > PPB_STEP_ALARM
+        ):
             audit.ppb_steps += 1
             audit.note("PPB step", f"pps={cur.pps} {lane} {pv:+.3f}->{cv:+.3f}")
 
@@ -517,6 +613,8 @@ def print_report(audit: Audit, batch_size: int, pause_ms: int) -> None:
     print(f"  Time range:        {audit.first_ts} -> {audit.last_ts}")
     print(f"  PPS range:         {audit.first_pps} -> {audit.last_pps}")
     print(f"  Actual rows:       {audit.rows:,}")
+    print(f"  Science rows:      {audit.science_rows:,}")
+    print(f"  Science excluded:  {audit.science_excluded_rows:,}")
     print(f"  Expected rows:     {audit.expected_rows:,}")
     print(f"  Missing identities:{audit.expected_rows - audit.rows:>10,d}")
     print(f"  Recovery gaps:     {audit.recovery_gaps:,}")
@@ -525,7 +623,7 @@ def print_report(audit: Audit, batch_size: int, pause_ms: int) -> None:
     print(f"  Final servo mode:  {final.servo_mode}")
     print(f"  Location:          {final.location}")
 
-    print("\nONLINE STATISTICS")
+    print("\nONLINE STATISTICS (SCIENCE-ELIGIBLE ROWS)")
     for key in (
         "dwt_delta",
         "ocxo1_interval",
@@ -541,6 +639,7 @@ def print_report(audit: Audit, batch_size: int, pause_ms: int) -> None:
         print(f"  {key:<18s} {audit.stats[key].text(6 if 'ppb' in key else 3)}")
 
     print("\nCOURTS")
+    print("  Science courts use only science-eligible rows; timeline courts use all rows.")
     courts = [
         ("GNSS identity errors", audit.gnss_identity_errors),
         ("GNSS adjacent errors", audit.gnss_adjacent_errors),
@@ -581,9 +680,14 @@ def print_report(audit: Audit, batch_size: int, pause_ms: int) -> None:
 
     print()
     if total or audit.unclassified_gaps or audit.repeats or audit.regressions:
-        print("VERDICT: ANOMALIES FOUND")
-    elif audit.recovery_gaps:
-        print(f"VERDICT: CLEAN WITH {audit.recovery_gaps} RECOVERY GAP(S)")
+        print("VERDICT: ANOMALIES FOUND IN ADMITTED SCIENCE OR TIMELINE")
+    elif audit.recovery_gaps or audit.science_excluded_rows:
+        details = []
+        if audit.recovery_gaps:
+            details.append(f"{audit.recovery_gaps} RECOVERY GAP(S)")
+        if audit.science_excluded_rows:
+            details.append(f"{audit.science_excluded_rows} QUARANTINED ROW(S)")
+        print(f"VERDICT: SCIENCE CLEAN WITH {' AND '.join(details)}")
     else:
         print("VERDICT: CLEAN")
 
