@@ -3516,6 +3516,21 @@ static void system_monitor_add_welford(
   parent.add_object(key, value);
 }
 
+static void system_monitor_add_recovery_capsule(
+    Payload& parent,
+    const clocks_monitor_recovery_capsule_t& snapshot) {
+  if (!snapshot.present || !snapshot.capsule[0]) return;
+
+  Payload recovery;
+  recovery.add("schema", "CLOCKS_RECOVERY_CAPSULE_V1");
+  recovery.add("version", snapshot.version);
+  recovery.add("encoding", snapshot.encoding);
+  recovery.add("binary_size", snapshot.binary_size);
+  recovery.add("crc32", snapshot.crc32);
+  recovery.add("capsule", snapshot.capsule);
+  parent.add_object("restore_capsule", recovery);
+}
+
 static void system_monitor_add_stats_clock(
     Payload& parent,
     const char* key,
@@ -3798,7 +3813,7 @@ static void system_monitor_add_live_ocxo(
 static Payload system_monitor_clocks_payload(
     const clocks_monitor_live_snapshot_t& snapshot) {
   Payload clocks;
-  clocks.add("schema", "CLOCKS_LIVE_TEENSY_V1");
+  clocks.add("schema", "CLOCKS_LIVE_TEENSY_V2");
   clocks.add("instrument_always_on", true);
   clocks.add("instrument_owner", "ALPHA");
   clocks.add("snapshot_ok", snapshot.snapshot_ok);
@@ -3867,6 +3882,7 @@ static Payload system_monitor_clocks_payload(
   system_monitor_add_raw_cycles(clocks, snapshot.raw_cycles);
   system_monitor_add_stats(clocks, snapshot.stats);
   system_monitor_add_live_dac(clocks, snapshot.dac);
+  system_monitor_add_recovery_capsule(clocks, snapshot.restore_capsule);
   return clocks;
 }
 

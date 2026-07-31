@@ -269,6 +269,19 @@ struct clocks_alpha_tau_snapshot_t {
   uint64_t first_refined_ns = 0;
   uint64_t last_refined_ns = 0;
   int64_t  last_fast_residual_ns = 0;
+
+  // Stable sufficient state for persistence/recovery.  Writer seqlock state is
+  // intentionally not exposed.
+  uint64_t cumulative_reference_ns = 0;
+  uint64_t cumulative_clock_ns = 0;
+  double   cumulative_clock_ns_exact = 0.0;
+  double   mean_x = 0.0;
+  double   mean_y = 0.0;
+  double   sxx = 0.0;
+  double   sxy = 0.0;
+  double   syy = 0.0;
+  double   interval_m2_ppb = 0.0;
+
   double   tau = 1.0;
   double   ppb = 0.0;
   double   stderr_ppb = 0.0;
@@ -306,14 +319,52 @@ static constexpr size_t CLOCKS_MONITOR_CAMPAIGN_NAME_MAX = 64U;
 static constexpr size_t CLOCKS_MONITOR_STATE_NAME_MAX = 40U;
 static constexpr size_t CLOCKS_MONITOR_REASON_MAX = 160U;
 static constexpr size_t CLOCKS_MONITOR_DELAY_NAME_MAX = 40U;
+static constexpr size_t CLOCKS_MONITOR_RECOVERY_ENCODING_MAX = 16U;
+static constexpr size_t CLOCKS_MONITOR_RECOVERY_CAPSULE_MAX = 1200U;
 
 struct clocks_monitor_welford_snapshot_t {
   uint64_t n = 0;
   double mean = 0.0;
+
+  // Hidden sufficient statistic required for exact resurrection.  stddev and
+  // stderr remain the operator-facing derived values; m2 lets a restored
+  // accumulator continue without manufacturing a new population.
+  double m2 = 0.0;
   double stddev = 0.0;
   double stderr_value = 0.0;
   double min = 0.0;
   double max = 0.0;
+};
+
+// Complete Alpha TAU estimator state.  MONITOR persists this verbatim so the
+// Pi can restore the instrument after a non-campaign reboot without reducing a
+// mature slope estimator to its displayed tau/ppb result.  Seqlock state and
+// other transient writer custody are intentionally excluded.
+struct clocks_monitor_tau_recovery_snapshot_t {
+  bool valid = false;
+  uint32_t reset_count = 0;
+  uint32_t sample_count = 0;
+  uint32_t interval_count = 0;
+  uint32_t reject_count = 0;
+  uint32_t gap_reset_count = 0;
+  uint32_t last_pps_sequence = 0;
+  uint32_t last_interval_pps_sequence = 0;
+  uint64_t first_refined_ns = 0;
+  uint64_t last_refined_ns = 0;
+  int64_t last_fast_residual_ns = 0;
+
+  uint64_t cumulative_reference_ns = 0;
+  uint64_t cumulative_clock_ns = 0;
+  double cumulative_clock_ns_exact = 0.0;
+
+  double mean_x = 0.0;
+  double mean_y = 0.0;
+  double sxx = 0.0;
+  double sxy = 0.0;
+  double syy = 0.0;
+
+  double interval_mean_ppb = 0.0;
+  double interval_m2_ppb = 0.0;
 };
 
 struct clocks_monitor_stats_clock_snapshot_t {
@@ -336,6 +387,12 @@ struct clocks_monitor_stats_snapshot_t {
   clocks_monitor_stats_clock_snapshot_t ocxo1{};
   clocks_monitor_stats_clock_snapshot_t ocxo2{};
   clocks_monitor_stats_clock_snapshot_t pps_witness{};
+
+  // Raw always-on OCXO frequency estimators.  These are persistence state, not
+  // a second scientific authority; the displayed frequency fields above remain
+  // the canonical read surface.
+  clocks_monitor_tau_recovery_snapshot_t ocxo1_tau_state{};
+  clocks_monitor_tau_recovery_snapshot_t ocxo2_tau_state{};
 
   uint64_t maturity_gnss_samples = 0;
   uint64_t maturity_dwt_samples = 0;
@@ -391,6 +448,20 @@ struct clocks_monitor_dither_lane_t {
   uint16_t high_code = 0;
   uint16_t high_ms = 0;
   bool phase_high = false;
+
+  // Stable servo knowledge that must survive reboot.  Pending requests,
+  // quarantine counters, and in-flight hardware service state are deliberately
+  // absent because they are transient custody, not durable instrument memory.
+  double servo_last_step = 0.0;
+  double servo_last_residual = 0.0;
+  uint32_t servo_settle_count = 0;
+  uint32_t servo_adjustments = 0;
+  bool servo_predictor_initialized = false;
+  double servo_last_raw_residual = 0.0;
+  double servo_filtered_residual = 0.0;
+  double servo_filtered_slope = 0.0;
+  double servo_predicted_residual = 0.0;
+  uint32_t servo_predictor_updates = 0;
 };
 
 struct clocks_monitor_dac_snapshot_t {
@@ -453,6 +524,19 @@ struct clocks_monitor_recovery_snapshot_t {
   bool degraded_science_hold = false;
   bool reattach_stalled = false;
   char reattach_reason[CLOCKS_MONITOR_REASON_MAX] = {0};
+};
+
+// Opaque firmware-owned sufficient-state capsule.  The Pi persists and returns
+// this string verbatim; it never interprets estimator layout.  Version, size,
+// and CRC remain visible so recovery failures can be diagnosed without decoding
+// the capsule outside firmware.
+struct clocks_monitor_recovery_capsule_t {
+  bool present = false;
+  uint32_t version = 0;
+  uint32_t binary_size = 0;
+  uint32_t crc32 = 0;
+  char encoding[CLOCKS_MONITOR_RECOVERY_ENCODING_MAX] = {0};
+  char capsule[CLOCKS_MONITOR_RECOVERY_CAPSULE_MAX] = {0};
 };
 
 struct clocks_monitor_campaign_snapshot_t {
@@ -536,6 +620,7 @@ struct clocks_monitor_live_snapshot_t {
   clocks_monitor_raw_cycles_snapshot_t raw_cycles{};
   clocks_monitor_stats_snapshot_t stats{};
   clocks_monitor_dac_snapshot_t dac{};
+  clocks_monitor_recovery_capsule_t restore_capsule{};
 };
 
 struct clocks_monitor_snapshot_t {

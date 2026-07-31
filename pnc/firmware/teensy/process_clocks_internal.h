@@ -595,6 +595,19 @@ struct clocks_alpha_tau_snapshot_t {
   uint64_t first_refined_ns = 0;
   uint64_t last_refined_ns = 0;
   int64_t  last_fast_residual_ns = 0;
+
+  // Stable sufficient state for persistence/recovery.  Writer seqlock state is
+  // intentionally not exposed.
+  uint64_t cumulative_reference_ns = 0;
+  uint64_t cumulative_clock_ns = 0;
+  double   cumulative_clock_ns_exact = 0.0;
+  double   mean_x = 0.0;
+  double   mean_y = 0.0;
+  double   sxx = 0.0;
+  double   sxy = 0.0;
+  double   syy = 0.0;
+  double   interval_m2_ppb = 0.0;
+
   double   tau = 1.0;
   double   ppb = 0.0;
   double   stderr_ppb = 0.0;
@@ -607,6 +620,9 @@ struct clocks_alpha_tau_snapshot_t {
 
 bool clocks_alpha_ocxo_tau_snapshot(time_clock_id_t clock,
                                     clocks_alpha_tau_snapshot_t* out);
+bool clocks_alpha_ocxo_tau_restore(
+    time_clock_id_t clock,
+    const clocks_alpha_tau_snapshot_t* state);
 
 // Compatibility alias; equivalent to clocks_alpha_ocxo_tau_snapshot().
 bool clocks_alpha_tau_snapshot(time_clock_id_t clock,
@@ -1815,6 +1831,7 @@ extern welford_t welford_ocxo2_dac;
 
 void   welford_reset(welford_t& w);
 void   welford_update(welford_t& w, double sample);
+bool   welford_restore(welford_t& w, const welford_t& state);
 double welford_stddev(const welford_t& w);
 double welford_stderr(const welford_t& w);
 
@@ -1877,6 +1894,9 @@ struct clocks_instrument_stats_snapshot_t {
   clocks_instrument_frequency_snapshot_t ocxo1_frequency{};
   clocks_instrument_frequency_snapshot_t ocxo2_frequency{};
 
+  clocks_alpha_tau_snapshot_t ocxo1_tau_state{};
+  clocks_alpha_tau_snapshot_t ocxo2_tau_state{};
+
   welford_t gnss_welford{};
   welford_t dwt_welford{};
   welford_t vclock_welford{};
@@ -1889,6 +1909,8 @@ struct clocks_instrument_stats_snapshot_t {
 
 bool clocks_alpha_instrument_stats_snapshot(
     clocks_instrument_stats_snapshot_t* out);
+bool clocks_alpha_instrument_stats_restore(
+    const clocks_instrument_stats_snapshot_t* state);
 void clocks_alpha_instrument_stats_reset(void);
 
 // ============================================================================

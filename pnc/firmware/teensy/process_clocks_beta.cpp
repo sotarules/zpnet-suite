@@ -556,6 +556,72 @@ static clocks_alpha_lane_forensics_t
 static clocks_alpha_lane_forensics_t
     g_beta_monitor_ocxo2_forensics DMAMEM = {};
 
+
+// ============================================================================
+// Durable always-on recovery capsule
+// ============================================================================
+//
+// PostgreSQL persists the raw MONITOR heartbeat.  Firmware therefore owns a
+// compact, versioned capsule containing only sufficient durable state.  The Pi
+// does not interpret estimator internals; it returns the capsule verbatim on a
+// cold campaign or idle-instrument recovery.  Hardware endpoints, pending DAC
+// motion, row objections, and interrupt custody are deliberately absent.
+
+static_assert(sizeof(double) == sizeof(uint64_t),
+              "CLOCKS recovery capsule requires 64-bit IEEE double storage");
+
+static constexpr uint32_t CLOCKS_RECOVERY_CAPSULE_MAGIC = 0x5A504D52UL; // ZPMR
+static constexpr uint16_t CLOCKS_RECOVERY_CAPSULE_VERSION = 1U;
+static constexpr size_t CLOCKS_RECOVERY_CAPSULE_BINARY_MAX = 896U;
+
+struct clocks_recovery_restore_state_t {
+  bool valid = false;
+  uint32_t capsule_crc32 = 0U;
+
+  uint64_t instrument_gnss_ns = 0ULL;
+  uint64_t instrument_dwt_cycles = 0ULL;
+  uint64_t instrument_ocxo1_ns = 0ULL;
+  uint64_t instrument_ocxo2_ns = 0ULL;
+
+  clocks_instrument_stats_snapshot_t stats{};
+  clocks_monitor_dither_lane_t ocxo1_dac{};
+  clocks_monitor_dither_lane_t ocxo2_dac{};
+  servo_mode_t servo_mode = servo_mode_t::OFF;
+  bool dither_operator_enabled = false;
+};
+
+static clocks_recovery_restore_state_t
+    g_monitor_restore_state DMAMEM = {};
+static clocks_recovery_restore_state_t
+    g_campaign_restore_state DMAMEM = {};
+static volatile bool g_monitor_restore_requested = false;
+static uint32_t g_monitor_restore_request_count = 0U;
+static uint32_t g_monitor_restore_commit_count = 0U;
+static uint32_t g_monitor_restore_failure_count = 0U;
+static uint32_t g_campaign_capsule_restore_count = 0U;
+static uint32_t g_campaign_capsule_failure_count = 0U;
+static uint32_t g_campaign_capsule_ignored_live_count = 0U;
+
+// Campaign-neutral presentation transform.  The fresh SmartZero epoch remains
+// Alpha's physical coordinate; this transform makes the durable instrument
+// clockfaces continue across a reboot without fabricating cross-reboot edge
+// intervals.
+static bool    g_instrument_continuity_active = false;
+static int64_t g_instrument_gnss_offset = 0;
+static int64_t g_instrument_dwt_offset = 0;
+static int64_t g_instrument_ocxo1_offset = 0;
+static int64_t g_instrument_ocxo2_offset = 0;
+static uint32_t g_instrument_continuity_install_count = 0U;
+static uint32_t g_instrument_continuity_reset_count = 0U;
+
+// Large codec buffers live in RAM2, never on the DTCM stack.  Encode and decode
+// use separate storage so command parsing cannot overwrite an ALAP MONITOR
+// snapshot already being serialized.
+static uint8_t g_recovery_capsule_encode_binary[
+    CLOCKS_RECOVERY_CAPSULE_BINARY_MAX] DMAMEM = {};
+static uint8_t g_recovery_capsule_decode_binary[
+    CLOCKS_RECOVERY_CAPSULE_BINARY_MAX] DMAMEM = {};
+
 static inline uint32_t clocks_report_irq_save(void) {
   uint32_t prior_basepri = 0U;
   __asm__ volatile ("mrs %0, basepri" : "=r" (prior_basepri) :: "memory");
@@ -570,6 +636,443 @@ static inline uint32_t clocks_report_irq_save(void) {
 static inline void clocks_report_irq_restore(uint32_t prior_basepri) {
   __asm__ volatile ("dmb" ::: "memory");
   __asm__ volatile ("msr basepri, %0" :: "r" (prior_basepri) : "memory");
+}
+
+
+struct clocks_capsule_writer_t {
+  uint8_t* data = nullptr;
+  size_t capacity = 0U;
+  size_t size = 0U;
+  bool ok = true;
+};
+
+struct clocks_capsule_reader_t {
+  const uint8_t* data = nullptr;
+  size_t size = 0U;
+  size_t pos = 0U;
+  bool ok = true;
+};
+
+static void capsule_put_u8(clocks_capsule_writer_t& w, uint8_t value) {
+  if (!w.ok || w.size + 1U > w.capacity) { w.ok = false; return; }
+  w.data[w.size++] = value;
+}
+
+static void capsule_put_u16(clocks_capsule_writer_t& w, uint16_t value) {
+  capsule_put_u8(w, (uint8_t)(value & 0xFFU));
+  capsule_put_u8(w, (uint8_t)((value >> 8) & 0xFFU));
+}
+
+static void capsule_put_u32(clocks_capsule_writer_t& w, uint32_t value) {
+  for (uint32_t shift = 0U; shift < 32U; shift += 8U) {
+    capsule_put_u8(w, (uint8_t)((value >> shift) & 0xFFU));
+  }
+}
+
+static void capsule_put_u64(clocks_capsule_writer_t& w, uint64_t value) {
+  for (uint32_t shift = 0U; shift < 64U; shift += 8U) {
+    capsule_put_u8(w, (uint8_t)((value >> shift) & 0xFFU));
+  }
+}
+
+static void capsule_put_i64(clocks_capsule_writer_t& w, int64_t value) {
+  capsule_put_u64(w, (uint64_t)value);
+}
+
+static void capsule_put_double(clocks_capsule_writer_t& w, double value) {
+  union { double d; uint64_t u; } bits{};
+  bits.d = value;
+  capsule_put_u64(w, bits.u);
+}
+
+static uint8_t capsule_get_u8(clocks_capsule_reader_t& r) {
+  if (!r.ok || r.pos + 1U > r.size) { r.ok = false; return 0U; }
+  return r.data[r.pos++];
+}
+
+static uint16_t capsule_get_u16(clocks_capsule_reader_t& r) {
+  uint16_t value = 0U;
+  value |= (uint16_t)capsule_get_u8(r);
+  value |= (uint16_t)capsule_get_u8(r) << 8;
+  return value;
+}
+
+static uint32_t capsule_get_u32(clocks_capsule_reader_t& r) {
+  uint32_t value = 0U;
+  for (uint32_t shift = 0U; shift < 32U; shift += 8U) {
+    value |= (uint32_t)capsule_get_u8(r) << shift;
+  }
+  return value;
+}
+
+static uint64_t capsule_get_u64(clocks_capsule_reader_t& r) {
+  uint64_t value = 0ULL;
+  for (uint32_t shift = 0U; shift < 64U; shift += 8U) {
+    value |= (uint64_t)capsule_get_u8(r) << shift;
+  }
+  return value;
+}
+
+static int64_t capsule_get_i64(clocks_capsule_reader_t& r) {
+  return (int64_t)capsule_get_u64(r);
+}
+
+static double capsule_get_double(clocks_capsule_reader_t& r) {
+  union { double d; uint64_t u; } bits{};
+  bits.u = capsule_get_u64(r);
+  return bits.d;
+}
+
+static uint32_t clocks_recovery_capsule_crc32(const uint8_t* data,
+                                              size_t size) {
+  uint32_t crc = 0xFFFFFFFFUL;
+  for (size_t i = 0; i < size; i++) {
+    crc ^= (uint32_t)data[i];
+    for (uint32_t bit = 0; bit < 8U; bit++) {
+      crc = (crc & 1U) ? ((crc >> 1) ^ 0xEDB88320UL) : (crc >> 1);
+    }
+  }
+  return crc ^ 0xFFFFFFFFUL;
+}
+
+static const char CLOCKS_RECOVERY_BASE64[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static bool clocks_recovery_base64_encode(const uint8_t* src,
+                                          size_t src_size,
+                                          char* dst,
+                                          size_t dst_size) {
+  if (!src || !dst) return false;
+  const size_t required = ((src_size + 2U) / 3U) * 4U + 1U;
+  if (required > dst_size) return false;
+
+  size_t i = 0U;
+  size_t o = 0U;
+  while (i < src_size) {
+    const uint32_t a = src[i++];
+    const bool have_b = i < src_size;
+    const uint32_t b = have_b ? src[i++] : 0U;
+    const bool have_c = i < src_size;
+    const uint32_t c = have_c ? src[i++] : 0U;
+    const uint32_t triple = (a << 16) | (b << 8) | c;
+    dst[o++] = CLOCKS_RECOVERY_BASE64[(triple >> 18) & 0x3FU];
+    dst[o++] = CLOCKS_RECOVERY_BASE64[(triple >> 12) & 0x3FU];
+    dst[o++] = have_b ? CLOCKS_RECOVERY_BASE64[(triple >> 6) & 0x3FU] : '=';
+    dst[o++] = have_c ? CLOCKS_RECOVERY_BASE64[triple & 0x3FU] : '=';
+  }
+  dst[o] = '\0';
+  return true;
+}
+
+static int clocks_recovery_base64_value(char c) {
+  if (c >= 'A' && c <= 'Z') return c - 'A';
+  if (c >= 'a' && c <= 'z') return 26 + c - 'a';
+  if (c >= '0' && c <= '9') return 52 + c - '0';
+  if (c == '+') return 62;
+  if (c == '/') return 63;
+  return -1;
+}
+
+static bool clocks_recovery_base64_decode(const char* src,
+                                          uint8_t* dst,
+                                          size_t dst_size,
+                                          size_t& out_size) {
+  out_size = 0U;
+  if (!src || !*src || !dst) return false;
+  const size_t len = strlen(src);
+  if ((len & 3U) != 0U) return false;
+
+  for (size_t i = 0U; i < len; i += 4U) {
+    const int a = clocks_recovery_base64_value(src[i]);
+    const int b = clocks_recovery_base64_value(src[i + 1U]);
+    const bool pad_c = src[i + 2U] == '=';
+    const bool pad_d = src[i + 3U] == '=';
+    const int c = pad_c ? 0 : clocks_recovery_base64_value(src[i + 2U]);
+    const int d = pad_d ? 0 : clocks_recovery_base64_value(src[i + 3U]);
+    if (a < 0 || b < 0 || c < 0 || d < 0 || (pad_c && !pad_d)) return false;
+    if ((pad_c || pad_d) && i + 4U != len) return false;
+
+    const uint32_t triple = ((uint32_t)a << 18) | ((uint32_t)b << 12) |
+                            ((uint32_t)c << 6) | (uint32_t)d;
+    if (out_size + 1U > dst_size) return false;
+    dst[out_size++] = (uint8_t)((triple >> 16) & 0xFFU);
+    if (!pad_c) {
+      if (out_size + 1U > dst_size) return false;
+      dst[out_size++] = (uint8_t)((triple >> 8) & 0xFFU);
+    }
+    if (!pad_d) {
+      if (out_size + 1U > dst_size) return false;
+      dst[out_size++] = (uint8_t)(triple & 0xFFU);
+    }
+  }
+  return true;
+}
+
+static void capsule_put_welford(clocks_capsule_writer_t& w,
+                                const welford_t& state) {
+  capsule_put_u64(w, state.n);
+  capsule_put_double(w, state.mean);
+  capsule_put_double(w, state.m2);
+  capsule_put_double(w, state.min_val);
+  capsule_put_double(w, state.max_val);
+}
+
+static void capsule_get_welford(clocks_capsule_reader_t& r,
+                                welford_t& state) {
+  state.n = capsule_get_u64(r);
+  state.mean = capsule_get_double(r);
+  state.m2 = capsule_get_double(r);
+  state.min_val = capsule_get_double(r);
+  state.max_val = capsule_get_double(r);
+}
+
+static void capsule_put_tau(clocks_capsule_writer_t& w,
+                            const clocks_alpha_tau_snapshot_t& state) {
+  capsule_put_u8(w, state.valid ? 1U : 0U);
+  capsule_put_u32(w, state.reset_count);
+  capsule_put_u32(w, state.sample_count);
+  capsule_put_u32(w, state.interval_count);
+  capsule_put_u32(w, state.reject_count);
+  capsule_put_u32(w, state.gap_reset_count);
+  capsule_put_u64(w, state.first_refined_ns);
+  capsule_put_u64(w, state.last_refined_ns);
+  capsule_put_i64(w, state.last_fast_residual_ns);
+  capsule_put_u64(w, state.cumulative_reference_ns);
+  capsule_put_u64(w, state.cumulative_clock_ns);
+  capsule_put_double(w, state.cumulative_clock_ns_exact);
+  capsule_put_double(w, state.mean_x);
+  capsule_put_double(w, state.mean_y);
+  capsule_put_double(w, state.sxx);
+  capsule_put_double(w, state.sxy);
+  capsule_put_double(w, state.syy);
+  capsule_put_double(w, state.interval_mean_ppb);
+  capsule_put_double(w, state.interval_m2_ppb);
+}
+
+static void capsule_get_tau(clocks_capsule_reader_t& r,
+                            time_clock_id_t clock,
+                            clocks_alpha_tau_snapshot_t& state) {
+  state = clocks_alpha_tau_snapshot_t{};
+  state.valid = capsule_get_u8(r) != 0U;
+  state.clock_id = (uint32_t)((uint8_t)clock);
+  state.reset_count = capsule_get_u32(r);
+  state.sample_count = capsule_get_u32(r);
+  state.interval_count = capsule_get_u32(r);
+  state.reject_count = capsule_get_u32(r);
+  state.gap_reset_count = capsule_get_u32(r);
+  state.first_refined_ns = capsule_get_u64(r);
+  state.last_refined_ns = capsule_get_u64(r);
+  state.last_fast_residual_ns = capsule_get_i64(r);
+  state.cumulative_reference_ns = capsule_get_u64(r);
+  state.cumulative_clock_ns = capsule_get_u64(r);
+  state.cumulative_clock_ns_exact = capsule_get_double(r);
+  state.mean_x = capsule_get_double(r);
+  state.mean_y = capsule_get_double(r);
+  state.sxx = capsule_get_double(r);
+  state.sxy = capsule_get_double(r);
+  state.syy = capsule_get_double(r);
+  state.interval_mean_ppb = capsule_get_double(r);
+  state.interval_m2_ppb = capsule_get_double(r);
+}
+
+static void capsule_put_dac_lane(clocks_capsule_writer_t& w,
+                                 const ocxo_dac_state_t& state) {
+  capsule_put_double(w, ocxo_dac_fractional_snapshot(state));
+  capsule_put_double(w, state.servo_last_step);
+  capsule_put_double(w, state.servo_last_residual);
+  capsule_put_u32(w, state.servo_settle_count);
+  capsule_put_u32(w, state.servo_adjustments);
+  capsule_put_u8(w, state.servo_predictor_initialized ? 1U : 0U);
+  capsule_put_double(w, state.servo_last_raw_residual);
+  capsule_put_double(w, state.servo_filtered_residual);
+  capsule_put_double(w, state.servo_filtered_slope);
+  capsule_put_double(w, state.servo_predicted_residual);
+  capsule_put_u32(w, state.servo_predictor_updates);
+}
+
+static void capsule_get_dac_lane(clocks_capsule_reader_t& r,
+                                 clocks_monitor_dither_lane_t& state) {
+  state = clocks_monitor_dither_lane_t{};
+  state.value = capsule_get_double(r);
+  state.servo_last_step = capsule_get_double(r);
+  state.servo_last_residual = capsule_get_double(r);
+  state.servo_settle_count = capsule_get_u32(r);
+  state.servo_adjustments = capsule_get_u32(r);
+  state.servo_predictor_initialized = capsule_get_u8(r) != 0U;
+  state.servo_last_raw_residual = capsule_get_double(r);
+  state.servo_filtered_residual = capsule_get_double(r);
+  state.servo_filtered_slope = capsule_get_double(r);
+  state.servo_predicted_residual = capsule_get_double(r);
+  state.servo_predictor_updates = capsule_get_u32(r);
+}
+
+static bool clocks_recovery_dac_lane_valid(
+    const clocks_monitor_dither_lane_t& state) {
+  return isfinite(state.value) &&
+         state.value >= 0.0 &&
+         state.value <= (double)OCXO_DAC_SAFE_MAX_HW_CODE &&
+         isfinite(state.servo_last_step) &&
+         isfinite(state.servo_last_residual) &&
+         isfinite(state.servo_last_raw_residual) &&
+         isfinite(state.servo_filtered_residual) &&
+         isfinite(state.servo_filtered_slope) &&
+         isfinite(state.servo_predicted_residual);
+}
+
+static bool clocks_recovery_restore_state_basic_valid(
+    const clocks_recovery_restore_state_t& state) {
+  return state.valid &&
+         state.instrument_gnss_ns != 0ULL &&
+         state.instrument_dwt_cycles != 0ULL &&
+         state.instrument_ocxo1_ns != 0ULL &&
+         state.instrument_ocxo2_ns != 0ULL &&
+         (uint8_t)state.servo_mode <= (uint8_t)servo_mode_t::NOW &&
+         clocks_recovery_dac_lane_valid(state.ocxo1_dac) &&
+         clocks_recovery_dac_lane_valid(state.ocxo2_dac);
+}
+
+static bool clocks_recovery_capsule_encode(
+    clocks_monitor_recovery_capsule_t& out,
+    const clocks_instrument_stats_snapshot_t& instrument,
+    uint64_t logical_gnss_ns,
+    uint64_t logical_dwt_cycles,
+    uint64_t logical_ocxo1_ns,
+    uint64_t logical_ocxo2_ns) {
+  out = clocks_monitor_recovery_capsule_t{};
+  const uint32_t guard = clocks_report_irq_save();
+
+  clocks_capsule_writer_t w{
+      g_recovery_capsule_encode_binary,
+      sizeof(g_recovery_capsule_encode_binary),
+      0U,
+      true};
+  capsule_put_u32(w, CLOCKS_RECOVERY_CAPSULE_MAGIC);
+  capsule_put_u16(w, CLOCKS_RECOVERY_CAPSULE_VERSION);
+  const size_t length_offset = w.size;
+  capsule_put_u16(w, 0U);
+  const size_t body_begin = w.size;
+
+  capsule_put_u64(w, logical_gnss_ns);
+  capsule_put_u64(w, logical_dwt_cycles);
+  capsule_put_u64(w, logical_ocxo1_ns);
+  capsule_put_u64(w, logical_ocxo2_ns);
+
+  capsule_put_u8(w, instrument.valid ? 1U : 0U);
+  capsule_put_u8(w, instrument.completed_row_coherent ? 1U : 0U);
+  capsule_put_u32(w, instrument.reset_count);
+  capsule_put_u32(w, instrument.update_count);
+  capsule_put_u32(w, instrument.vclock_interval_reject_count);
+  capsule_put_u32(w, instrument.ocxo1_interval_reject_count);
+  capsule_put_u32(w, instrument.ocxo2_interval_reject_count);
+
+  capsule_put_welford(w, instrument.gnss_welford);
+  capsule_put_welford(w, instrument.dwt_welford);
+  capsule_put_welford(w, instrument.vclock_welford);
+  capsule_put_welford(w, instrument.ocxo1_welford);
+  capsule_put_welford(w, instrument.ocxo2_welford);
+  capsule_put_welford(w, instrument.pps_witness_welford);
+  capsule_put_welford(w, instrument.ocxo1_dac_welford);
+  capsule_put_welford(w, instrument.ocxo2_dac_welford);
+
+  capsule_put_tau(w, instrument.ocxo1_tau_state);
+  capsule_put_tau(w, instrument.ocxo2_tau_state);
+  capsule_put_dac_lane(w, ocxo1_dac);
+  capsule_put_dac_lane(w, ocxo2_dac);
+  capsule_put_u8(w, (uint8_t)calibrate_ocxo_mode);
+  capsule_put_u8(w, clocks_ocxo_dac_dither_operator_enabled() ? 1U : 0U);
+
+  const size_t body_size = w.size - body_begin;
+  if (body_size > 0xFFFFU) w.ok = false;
+  if (w.ok) {
+    w.data[length_offset] = (uint8_t)(body_size & 0xFFU);
+    w.data[length_offset + 1U] = (uint8_t)((body_size >> 8) & 0xFFU);
+  }
+  const uint32_t crc = w.ok
+      ? clocks_recovery_capsule_crc32(w.data, w.size)
+      : 0U;
+  capsule_put_u32(w, crc);
+
+  const bool encoded = w.ok && clocks_recovery_base64_encode(
+      w.data, w.size, out.capsule, sizeof(out.capsule));
+  if (encoded) {
+    out.present = true;
+    out.version = CLOCKS_RECOVERY_CAPSULE_VERSION;
+    out.binary_size = (uint32_t)w.size;
+    out.crc32 = crc;
+    safeCopy(out.encoding, sizeof(out.encoding), "BASE64_LE");
+  }
+
+  clocks_report_irq_restore(guard);
+  return encoded;
+}
+
+static bool clocks_recovery_capsule_decode(
+    const char* encoded,
+    clocks_recovery_restore_state_t& out) {
+  out = clocks_recovery_restore_state_t{};
+  size_t binary_size = 0U;
+  if (!clocks_recovery_base64_decode(
+          encoded,
+          g_recovery_capsule_decode_binary,
+          sizeof(g_recovery_capsule_decode_binary),
+          binary_size)) {
+    return false;
+  }
+  if (binary_size < 12U) return false;
+
+  const uint32_t stored_crc =
+      (uint32_t)g_recovery_capsule_decode_binary[binary_size - 4U] |
+      ((uint32_t)g_recovery_capsule_decode_binary[binary_size - 3U] << 8) |
+      ((uint32_t)g_recovery_capsule_decode_binary[binary_size - 2U] << 16) |
+      ((uint32_t)g_recovery_capsule_decode_binary[binary_size - 1U] << 24);
+  const uint32_t computed_crc = clocks_recovery_capsule_crc32(
+      g_recovery_capsule_decode_binary, binary_size - 4U);
+  if (stored_crc != computed_crc) return false;
+
+  clocks_capsule_reader_t r{
+      g_recovery_capsule_decode_binary, binary_size - 4U, 0U, true};
+  if (capsule_get_u32(r) != CLOCKS_RECOVERY_CAPSULE_MAGIC) return false;
+  if (capsule_get_u16(r) != CLOCKS_RECOVERY_CAPSULE_VERSION) return false;
+  const uint16_t body_size = capsule_get_u16(r);
+  if ((size_t)body_size + 8U != r.size) return false;
+
+  out.instrument_gnss_ns = capsule_get_u64(r);
+  out.instrument_dwt_cycles = capsule_get_u64(r);
+  out.instrument_ocxo1_ns = capsule_get_u64(r);
+  out.instrument_ocxo2_ns = capsule_get_u64(r);
+
+  out.stats.valid = capsule_get_u8(r) != 0U;
+  out.stats.completed_row_coherent = capsule_get_u8(r) != 0U;
+  out.stats.reset_count = capsule_get_u32(r);
+  out.stats.update_count = capsule_get_u32(r);
+  out.stats.vclock_interval_reject_count = capsule_get_u32(r);
+  out.stats.ocxo1_interval_reject_count = capsule_get_u32(r);
+  out.stats.ocxo2_interval_reject_count = capsule_get_u32(r);
+
+  capsule_get_welford(r, out.stats.gnss_welford);
+  capsule_get_welford(r, out.stats.dwt_welford);
+  capsule_get_welford(r, out.stats.vclock_welford);
+  capsule_get_welford(r, out.stats.ocxo1_welford);
+  capsule_get_welford(r, out.stats.ocxo2_welford);
+  capsule_get_welford(r, out.stats.pps_witness_welford);
+  capsule_get_welford(r, out.stats.ocxo1_dac_welford);
+  capsule_get_welford(r, out.stats.ocxo2_dac_welford);
+
+  capsule_get_tau(r, time_clock_id_t::OCXO1, out.stats.ocxo1_tau_state);
+  capsule_get_tau(r, time_clock_id_t::OCXO2, out.stats.ocxo2_tau_state);
+  capsule_get_dac_lane(r, out.ocxo1_dac);
+  capsule_get_dac_lane(r, out.ocxo2_dac);
+  out.servo_mode = (servo_mode_t)capsule_get_u8(r);
+  out.dither_operator_enabled = capsule_get_u8(r) != 0U;
+
+  out.capsule_crc32 = stored_crc;
+  out.valid = r.ok && r.pos == r.size;
+  out.stats.last_pps_sequence = 0U;
+  out.stats.gnss_ns = out.instrument_gnss_ns;
+  out.stats.dwt_cycles = out.instrument_dwt_cycles;
+  out.stats.ocxo1_ns = out.instrument_ocxo1_ns;
+  out.stats.ocxo2_ns = out.instrument_ocxo2_ns;
+  return clocks_recovery_restore_state_basic_valid(out);
 }
 
 struct clocks_report_build_guard_t {
@@ -1785,6 +2288,54 @@ static uint64_t campaign_public_from_offset(uint64_t raw, int64_t offset) {
   return (raw >= sub) ? (raw - sub) : 0ULL;
 }
 
+
+static void instrument_continuity_reset(void) {
+  g_instrument_continuity_active = false;
+  g_instrument_gnss_offset = 0;
+  g_instrument_dwt_offset = 0;
+  g_instrument_ocxo1_offset = 0;
+  g_instrument_ocxo2_offset = 0;
+  g_instrument_continuity_reset_count++;
+}
+
+static void instrument_continuity_install(
+    const clocks_recovery_restore_state_t& state) {
+  g_instrument_gnss_offset = campaign_public_offset_for_recovered_value(
+      current_raw_gnss_ns(), state.instrument_gnss_ns);
+  g_instrument_dwt_offset = campaign_public_offset_for_recovered_value(
+      g_dwt_cycle_count_total, state.instrument_dwt_cycles);
+  g_instrument_ocxo1_offset = campaign_public_offset_for_recovered_value(
+      current_raw_ocxo1_measured_ns(), state.instrument_ocxo1_ns);
+  g_instrument_ocxo2_offset = campaign_public_offset_for_recovered_value(
+      current_raw_ocxo2_measured_ns(), state.instrument_ocxo2_ns);
+  g_instrument_continuity_active = true;
+  g_instrument_continuity_install_count++;
+}
+
+static uint64_t instrument_continuity_gnss_ns(uint64_t raw) {
+  return g_instrument_continuity_active
+      ? campaign_public_from_offset(raw, g_instrument_gnss_offset)
+      : raw;
+}
+
+static uint64_t instrument_continuity_dwt_cycles(uint64_t raw) {
+  return g_instrument_continuity_active
+      ? campaign_public_from_offset(raw, g_instrument_dwt_offset)
+      : raw;
+}
+
+static uint64_t instrument_continuity_ocxo1_ns(uint64_t raw) {
+  return g_instrument_continuity_active
+      ? campaign_public_from_offset(raw, g_instrument_ocxo1_offset)
+      : raw;
+}
+
+static uint64_t instrument_continuity_ocxo2_ns(uint64_t raw) {
+  return g_instrument_continuity_active
+      ? campaign_public_from_offset(raw, g_instrument_ocxo2_offset)
+      : raw;
+}
+
 static int64_t campaign_recover_signed_delta_u64(uint64_t lhs, uint64_t rhs) {
   return (lhs >= rhs)
       ? ((lhs - rhs) > (uint64_t)INT64_MAX ? INT64_MAX : (int64_t)(lhs - rhs))
@@ -2815,6 +3366,7 @@ static void recover_lifecycle_abort(const char* reason) {
   clocks_alpha_ocxo_grid_rephase_acknowledge(
       clocks_alpha_ocxo_grid_rephase_owner_t::RECOVER);
   request_recover = false;
+  g_campaign_restore_state = clocks_recovery_restore_state_t{};
   request_start = false;
   request_stop = false;
   request_zero = false;
@@ -4143,6 +4695,7 @@ static FLASHMEM clocks_monitor_welford_snapshot_t clocks_monitor_welford_snapsho
   clocks_monitor_welford_snapshot_t out{};
   out.n = w.n;
   out.mean = w.mean;
+  out.m2 = w.m2;
   out.stddev = welford_stddev(w);
   out.stderr_value = welford_stderr(w);
   out.min = (w.n > 0U) ? w.min_val : 0.0;
@@ -4159,6 +4712,34 @@ static FLASHMEM clocks_monitor_stats_clock_snapshot_t clocks_monitor_stats_clock
   out.frequency_present = frequency_present;
   out.ppb = frequency_present ? ppb : 0.0;
   out.tau = frequency_present ? (1.0 + ppb / 1.0e9) : 1.0;
+  return out;
+}
+
+static FLASHMEM clocks_monitor_tau_recovery_snapshot_t
+clocks_monitor_tau_recovery_snapshot(
+    const clocks_alpha_tau_snapshot_t& state) {
+  clocks_monitor_tau_recovery_snapshot_t out{};
+  out.valid = state.valid;
+  out.reset_count = state.reset_count;
+  out.sample_count = state.sample_count;
+  out.interval_count = state.interval_count;
+  out.reject_count = state.reject_count;
+  out.gap_reset_count = state.gap_reset_count;
+  out.last_pps_sequence = state.last_pps_sequence;
+  out.last_interval_pps_sequence = state.last_interval_pps_sequence;
+  out.first_refined_ns = state.first_refined_ns;
+  out.last_refined_ns = state.last_refined_ns;
+  out.last_fast_residual_ns = state.last_fast_residual_ns;
+  out.cumulative_reference_ns = state.cumulative_reference_ns;
+  out.cumulative_clock_ns = state.cumulative_clock_ns;
+  out.cumulative_clock_ns_exact = state.cumulative_clock_ns_exact;
+  out.mean_x = state.mean_x;
+  out.mean_y = state.mean_y;
+  out.sxx = state.sxx;
+  out.sxy = state.sxy;
+  out.syy = state.syy;
+  out.interval_mean_ppb = state.interval_mean_ppb;
+  out.interval_m2_ppb = state.interval_m2_ppb;
   return out;
 }
 
@@ -4183,6 +4764,10 @@ static FLASHMEM void clocks_monitor_stats_snapshot_from_instrument(
       instrument.ocxo2_welford, true, instrument.ocxo2_frequency.ppb);
   out.pps_witness = clocks_monitor_stats_clock(
       instrument.pps_witness_welford, false, 0.0);
+  out.ocxo1_tau_state = clocks_monitor_tau_recovery_snapshot(
+      instrument.ocxo1_tau_state);
+  out.ocxo2_tau_state = clocks_monitor_tau_recovery_snapshot(
+      instrument.ocxo2_tau_state);
 
   out.maturity_gnss_samples = instrument.gnss_welford.n;
   out.maturity_dwt_samples = instrument.dwt_frequency.sample_count;
@@ -4276,6 +4861,13 @@ static FLASHMEM void clocks_beta_cold_diagnostics_init(void) {
   g_beta_probe_science_totals_o2 = ocxo_science_totals_t{};
   g_beta_instrument_stats = clocks_instrument_stats_snapshot_t{};
   g_beta_report_instrument_stats = clocks_instrument_stats_snapshot_t{};
+  g_beta_monitor_instrument_stats = clocks_instrument_stats_snapshot_t{};
+  g_monitor_restore_state = clocks_recovery_restore_state_t{};
+  g_campaign_restore_state = clocks_recovery_restore_state_t{};
+  memset(g_recovery_capsule_encode_binary, 0,
+         sizeof(g_recovery_capsule_encode_binary));
+  memset(g_recovery_capsule_decode_binary, 0,
+         sizeof(g_recovery_capsule_decode_binary));
   g_clocks_report_build_active = false;
   g_clocks_report_build_count = 0U;
   g_clocks_report_busy_reject_count = 0U;
@@ -5638,6 +6230,81 @@ static void clocks_commit_pending_servo_mode_change(void) {
   g_servo_mode_commit_count++;
 }
 
+
+static void clocks_recovery_restore_dac_lane_runtime(
+    ocxo_dac_state_t& dst,
+    const clocks_monitor_dither_lane_t& src) {
+  dst.servo_last_step = src.servo_last_step;
+  dst.servo_last_residual = src.servo_last_residual;
+  dst.servo_settle_count = src.servo_settle_count;
+  dst.servo_adjustments = src.servo_adjustments;
+  dst.servo_predictor_initialized = src.servo_predictor_initialized;
+  dst.servo_last_raw_residual = src.servo_last_raw_residual;
+  dst.servo_filtered_residual = src.servo_filtered_residual;
+  dst.servo_filtered_slope = src.servo_filtered_slope;
+  dst.servo_predicted_residual = src.servo_predicted_residual;
+  dst.servo_predictor_updates = src.servo_predictor_updates;
+
+  // Reboot cannot preserve an in-flight actuator transaction or a row-local
+  // quarantine.  Resume only the learned plant model.
+  dst.servo_hold_reason = SERVO_HOLD_NONE;
+  dst.servo_quarantine_reason = SERVO_HOLD_NONE;
+  dst.servo_quarantine_remaining = 0U;
+}
+
+static bool clocks_recovery_install_dac_control(
+    const clocks_recovery_restore_state_t& state) {
+  if (!clocks_recovery_restore_state_basic_valid(state)) return false;
+
+  ocxo_dac_pacing_abort_all();
+  clocks_ocxo_dac_cancel_all_motion();
+  (void)clocks_ocxo_dac_dither_disable();
+
+  // Restore the physical operating point while firmware is in a foreground
+  // command context.  The PPS commit later restores statistics and logical
+  // clock presentation without performing I2C in the timing path.
+  calibrate_ocxo_mode = servo_mode_t::OFF;
+  const bool dac1_ok = ocxo_dac_set(ocxo1_dac, state.ocxo1_dac.value);
+  const bool dac2_ok = ocxo_dac_set(ocxo2_dac, state.ocxo2_dac.value);
+  if (!dac1_ok || !dac2_ok) {
+    calibrate_ocxo_mode = servo_mode_t::OFF;
+    requested_servo_mode = servo_mode_t::OFF;
+    request_servo_mode_change = false;
+    return false;
+  }
+
+  clocks_recovery_restore_dac_lane_runtime(ocxo1_dac, state.ocxo1_dac);
+  clocks_recovery_restore_dac_lane_runtime(ocxo2_dac, state.ocxo2_dac);
+
+  // Do not call clocks_apply_servo_mode_now(): a mode transition there
+  // deliberately erases the predictor state we just restored.
+  calibrate_ocxo_mode = state.servo_mode;
+  requested_servo_mode = state.servo_mode;
+  request_servo_mode_change = false;
+  g_servo_mode_last_requested = state.servo_mode;
+  g_servo_mode_last_committed = state.servo_mode;
+
+  if (state.dither_operator_enabled) {
+    if (!clocks_ocxo_dac_dither_enable()) {
+      (void)clocks_ocxo_dac_dither_disable();
+      clocks_ocxo_dac_cancel_all_motion();
+      calibrate_ocxo_mode = servo_mode_t::OFF;
+      requested_servo_mode = servo_mode_t::OFF;
+      request_servo_mode_change = false;
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool clocks_recovery_commit_statistics_and_clockfaces(
+    const clocks_recovery_restore_state_t& state) {
+  if (!clocks_recovery_restore_state_basic_valid(state)) return false;
+  if (!clocks_alpha_instrument_stats_restore(&state.stats)) return false;
+  instrument_continuity_install(state);
+  return true;
+}
+
 static void ocxo_dac_apply_synthetic_servo_step(ocxo_dac_state_t& dac,
                                                 double step) {
   const double before = ocxo_dac_fractional_snapshot(dac);
@@ -6059,7 +6726,8 @@ static void flash_cut_clear_pending(void) {
 
 static bool flash_cut_busy(void) {
   return request_flash_cut || request_start || request_stop ||
-         request_recover || request_zero || interrupt_smartzero_running() ||
+         request_recover || request_zero || g_monitor_restore_requested ||
+         interrupt_smartzero_running() ||
          clocks_alpha_epoch_install_in_progress();
 }
 
@@ -6213,11 +6881,12 @@ void clocks_watchdog_anomaly_payload(const char* reason,
 
 static void clocks_finish_zero_accounting(void) {
   clocks_zero_all();
+  instrument_continuity_reset();
   request_zero = false;
 }
 
 static void clocks_finish_start_accounting(void) {
-  clocks_zero_all();
+  campaign_accounting_reset_common(false);
   request_zero = false;
   request_start = false;
   clocks_watchdog_clear_surrender_for_new_lifecycle();
@@ -6270,6 +6939,16 @@ static FLASHMEM void clocks_monitor_dac_lane_snapshot(
   out.high_code = dac.dither_high_code;
   out.high_ms = dac.dither_high_ms;
   out.phase_high = dac.dither_current_phase_high;
+  out.servo_last_step = dac.servo_last_step;
+  out.servo_last_residual = dac.servo_last_residual;
+  out.servo_settle_count = dac.servo_settle_count;
+  out.servo_adjustments = dac.servo_adjustments;
+  out.servo_predictor_initialized = dac.servo_predictor_initialized;
+  out.servo_last_raw_residual = dac.servo_last_raw_residual;
+  out.servo_filtered_residual = dac.servo_filtered_residual;
+  out.servo_filtered_slope = dac.servo_filtered_slope;
+  out.servo_predicted_residual = dac.servo_predicted_residual;
+  out.servo_predictor_updates = dac.servo_predictor_updates;
 }
 
 static FLASHMEM void clocks_monitor_dac_snapshot(
@@ -6325,11 +7004,20 @@ static FLASHMEM void clocks_monitor_live_snapshot_fill(
   const bool campaign_presentation_ready =
       campaign_bound && campaign_seconds > 0ULL;
 
+  const uint64_t logical_instrument_gnss_ns =
+      instrument_continuity_gnss_ns(instrument.gnss_ns);
+  const uint64_t logical_instrument_dwt_cycles =
+      instrument_continuity_dwt_cycles(instrument.dwt_cycles);
+  const uint64_t logical_instrument_ocxo1_ns =
+      instrument_continuity_ocxo1_ns(instrument.ocxo1_ns);
+  const uint64_t logical_instrument_ocxo2_ns =
+      instrument_continuity_ocxo2_ns(instrument.ocxo2_ns);
+
   out.valid = instrument.valid;
   out.completed_row_coherent = instrument.completed_row_coherent;
   out.completed_pps_sequence = instrument.last_pps_sequence;
   out.instrument_age_seconds =
-      (uint32_t)(instrument.gnss_ns / CLOCKS_BETA_NS_PER_SECOND);
+      (uint32_t)(logical_instrument_gnss_ns / CLOCKS_BETA_NS_PER_SECOND);
 
   clocks_monitor_copy_text(out.campaign_state,
                            sizeof(out.campaign_state),
@@ -6355,17 +7043,19 @@ static FLASHMEM void clocks_monitor_live_snapshot_fill(
       sizeof(out.presentation_basis),
       campaign_presentation_ready
           ? "CAMPAIGN_RELATIVE"
-          : "ALPHA_SERVICE_EPOCH");
+          : (g_instrument_continuity_active
+                 ? "RESTORED_INSTRUMENT_CONTINUITY"
+                 : "ALPHA_SERVICE_EPOCH"));
   out.presentation_clockfaces_zeroed = campaign_presentation_ready;
 
   out.presentation_gnss_ns = campaign_presentation_ready
       ? campaign_public_from_offset(
             instrument.gnss_ns, g_campaign_public_gnss_offset)
-      : instrument.gnss_ns;
+      : logical_instrument_gnss_ns;
   out.presentation_dwt_cycles = campaign_presentation_ready
       ? campaign_public_from_offset(
             instrument.dwt_cycles, g_campaign_public_dwt_offset)
-      : instrument.dwt_cycles;
+      : logical_instrument_dwt_cycles;
 
   // Alpha's coherent snapshot carries public-origin-normalized OCXO values.
   // Use the matching measured/public offsets for the live presentation species;
@@ -6373,11 +7063,11 @@ static FLASHMEM void clocks_monitor_live_snapshot_fill(
   out.presentation_ocxo1_ns = campaign_presentation_ready
       ? campaign_public_from_offset(
             instrument.ocxo1_ns, g_campaign_public_ocxo1_measured_offset)
-      : instrument.ocxo1_ns;
+      : logical_instrument_ocxo1_ns;
   out.presentation_ocxo2_ns = campaign_presentation_ready
       ? campaign_public_from_offset(
             instrument.ocxo2_ns, g_campaign_public_ocxo2_measured_offset)
-      : instrument.ocxo2_ns;
+      : logical_instrument_ocxo2_ns;
   out.presentation_count = (uint32_t)(
       out.presentation_gnss_ns / CLOCKS_BETA_NS_PER_SECOND);
   out.timeline_valid = instrument.valid &&
@@ -6387,10 +7077,10 @@ static FLASHMEM void clocks_monitor_live_snapshot_fill(
       out.presentation_ocxo1_ns != 0ULL &&
       out.presentation_ocxo2_ns != 0ULL;
 
-  out.instrument_gnss_ns = instrument.gnss_ns;
-  out.instrument_dwt_cycles = instrument.dwt_cycles;
-  out.instrument_ocxo1_ns = instrument.ocxo1_ns;
-  out.instrument_ocxo2_ns = instrument.ocxo2_ns;
+  out.instrument_gnss_ns = logical_instrument_gnss_ns;
+  out.instrument_dwt_cycles = logical_instrument_dwt_cycles;
+  out.instrument_ocxo1_ns = logical_instrument_ocxo1_ns;
+  out.instrument_ocxo2_ns = logical_instrument_ocxo2_ns;
   out.instrument_pps_sequence = instrument.last_pps_sequence;
 
   out.dwt_cycles_per_second = instrument.dwt_cycles_per_second;
@@ -6415,6 +7105,13 @@ static FLASHMEM void clocks_monitor_live_snapshot_fill(
       g_beta_monitor_ocxo2_forensics.interrupt_delay);
   clocks_monitor_stats_snapshot_from_instrument(out.stats, instrument);
   clocks_monitor_dac_snapshot(out.dac);
+  (void)clocks_recovery_capsule_encode(
+      out.restore_capsule,
+      instrument,
+      logical_instrument_gnss_ns,
+      logical_instrument_dwt_cycles,
+      logical_instrument_ocxo1_ns,
+      logical_instrument_ocxo2_ns);
 }
 
 FLASHMEM bool clocks_monitor_snapshot_take(
@@ -6568,8 +7265,19 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
     }
 
     ocxo_dac_pacing_abort_all();
-    ocxo_dac_predictor_reset(ocxo1_dac);
-    ocxo_dac_predictor_reset(ocxo2_dac);
+    if (cold_bootstrap_commit && g_campaign_restore_state.valid) {
+      if (!clocks_recovery_commit_statistics_and_clockfaces(
+              g_campaign_restore_state)) {
+        g_campaign_capsule_failure_count++;
+        recover_lifecycle_abort("recover_capsule_commit_failed");
+        publish_dac_tick("RECOVER_CAPSULE_COMMIT_FAILED");
+        return;
+      }
+      g_campaign_capsule_restore_count++;
+    } else {
+      ocxo_dac_predictor_reset(ocxo1_dac);
+      ocxo_dac_predictor_reset(ocxo2_dac);
+    }
 
     dwt_cycle_count_total = dwt_ns_to_cycles(recover_dwt_ns);
     gnss_raw_64           = recover_gnss_ns / 100ull;
@@ -6600,6 +7308,7 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
     // Alpha-owned PPB/TAU/Welfords remain live across warm recovery.
 
     request_recover = false;
+    g_campaign_restore_state = clocks_recovery_restore_state_t{};
     flash_cut_clear_pending();
     if (cold_bootstrap_commit) {
       g_recover_lifecycle_cold_bootstrap_commit_count++;
@@ -6610,6 +7319,31 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
     recover_lifecycle_complete_at_pps();
     campaign_warmup_begin(campaign_warmup_mode_t::RECOVER);
     publish_dac_tick("RECOVER_GATE");
+    return;
+  }
+
+  if (g_monitor_restore_requested) {
+    campaign_record_stage(CAMPAIGN_RECORD_STAGE_RECOVER_GATE);
+    if (!clocks_alpha_installed_smartzero_backing_epoch() ||
+        clocks_alpha_epoch_install_in_progress()) {
+      publish_dac_tick("MONITOR_RESTORE_WAIT_EPOCH");
+      return;
+    }
+
+    if (!clocks_recovery_commit_statistics_and_clockfaces(
+            g_monitor_restore_state)) {
+      g_monitor_restore_requested = false;
+      g_monitor_restore_failure_count++;
+      clocks_apply_servo_mode_now(servo_mode_t::OFF);
+      publish_dac_tick("MONITOR_RESTORE_COMMIT_FAILED");
+      return;
+    }
+
+    g_monitor_restore_requested = false;
+    g_monitor_restore_commit_count++;
+    g_monitor_restore_state = clocks_recovery_restore_state_t{};
+    clocks_row_objection_clear();
+    publish_dac_tick("MONITOR_RESTORE_COMMITTED");
     return;
   }
 
@@ -7714,6 +8448,13 @@ static FLASHMEM Payload cmd_flash_cut(const Payload& args) {
 static FLASHMEM Payload cmd_start(const Payload& args) {
   clocks_payload_numeric_integrity_reset();
 
+  if (g_monitor_restore_requested) {
+    Payload err;
+    err.add("error", "MONITOR restore is pending");
+    err.add("status", "start_rejected_monitor_restore_pending");
+    return err;
+  }
+
   const char* name = args.getString("campaign");
   if (!name || !*name) {
     Payload err;
@@ -7750,33 +8491,50 @@ static FLASHMEM Payload cmd_start(const Payload& args) {
 
   safeCopy(campaign_name, sizeof(campaign_name), name);
 
-  ocxo_dac_pacing_abort_all();
   ocxo_dac_io_reset(ocxo1_dac);
   ocxo_dac_io_reset(ocxo2_dac);
 
-  double dac_val;
+  double dac_val = 0.0;
   bool dac1_ok = true;
   bool dac2_ok = true;
-  if (payload_try_get_ocxo1_dac(args, "command.start", dac_val)) {
+  const bool dac1_supplied =
+      payload_try_get_ocxo1_dac(args, "command.start", dac_val);
+  if (dac1_supplied) {
+    const double prior = ocxo_dac_fractional_snapshot(ocxo1_dac);
+    ocxo_dac_pacing_abort_all();
     dac1_ok = ocxo_dac_set(ocxo1_dac, dac_val);
+    if (dac1_ok && fabs(dac_val - prior) > 0.000001) {
+      ocxo_dac_predictor_reset(ocxo1_dac);
+      ocxo1_dac.servo_settle_count = 0U;
+    }
   }
-  if (payload_try_get_ocxo2_dac(args, "command.start", dac_val)) {
+
+  const bool dac2_supplied =
+      payload_try_get_ocxo2_dac(args, "command.start", dac_val);
+  if (dac2_supplied) {
+    const double prior = ocxo_dac_fractional_snapshot(ocxo2_dac);
+    ocxo_dac_pacing_abort_all();
     dac2_ok = ocxo_dac_set(ocxo2_dac, dac_val);
+    if (dac2_ok && fabs(dac_val - prior) > 0.000001) {
+      ocxo_dac_predictor_reset(ocxo2_dac);
+      ocxo2_dac.servo_settle_count = 0U;
+    }
   }
 
   if (g_clocks_payload_numeric_integrity_failed) {
     return clocks_payload_numeric_reject_response("start_rejected_numeric_integrity");
   }
 
-  clocks_apply_servo_mode_now(
-      servo_mode_parse(args.getString("calibrate_ocxo")));
+  const char* raw_servo_mode = nullptr;
+  servo_mode_t start_servo_mode = calibrate_ocxo_mode;
+  const bool servo_supplied =
+      payload_try_get_servo_mode(args, start_servo_mode, raw_servo_mode);
+  if (servo_supplied) {
+    clocks_apply_servo_mode_now(start_servo_mode);
+  }
   if (!dac1_ok || !dac2_ok) {
     clocks_apply_servo_mode_now(servo_mode_t::OFF);
   }
-
-  ocxo_dac_predictor_reset(ocxo1_dac);
-  ocxo_dac_predictor_reset(ocxo2_dac);
-  ocxo_dac_pacing_reset();
 
   request_start = true;
   request_zero = false;
@@ -7815,10 +8573,17 @@ static FLASHMEM Payload cmd_start(const Payload& args) {
   p.add("ocxo1_dac_last_write_ok", ocxo1_dac.io_last_write_ok);
   p.add("ocxo2_dac_last_write_ok", ocxo2_dac.io_last_write_ok);
   p.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
+  p.add("calibrate_ocxo_supplied", servo_supplied);
+  p.add("ocxo1_dac_supplied", dac1_supplied);
+  p.add("ocxo2_dac_supplied", dac2_supplied);
+  p.add("instrument_control_preserved",
+        !servo_supplied && !dac1_supplied && !dac2_supplied);
   return p;
 }
 
 static FLASHMEM Payload cmd_stop(const Payload&) {
+  g_monitor_restore_requested = false;
+  g_monitor_restore_state = clocks_recovery_restore_state_t{};
   const bool had_live_smartzero = interrupt_smartzero_running();
   const bool had_pending_start = request_start;
   const bool had_pending_zero = request_zero;
@@ -7875,6 +8640,8 @@ static FLASHMEM Payload cmd_stop(const Payload&) {
 
 
 static FLASHMEM Payload cmd_zero(const Payload&) {
+  g_monitor_restore_requested = false;
+  g_monitor_restore_state = clocks_recovery_restore_state_t{};
   if (clocks_campaign_recovery_lifecycle_active() || request_recover) {
     recover_lifecycle_abort("zero_command_abort_recover");
   }
@@ -7915,8 +8682,109 @@ static FLASHMEM Payload cmd_zero(const Payload&) {
   return p;
 }
 
+static FLASHMEM Payload cmd_restore_monitor(const Payload& args) {
+  const char* capsule = args.getString("recovery_capsule");
+  if (!capsule || !*capsule) capsule = args.getString("capsule");
+  if (!capsule || !*capsule) {
+    Payload err;
+    err.add("error", "missing recovery capsule");
+    err.add("status", "monitor_restore_rejected_missing_capsule");
+    return err;
+  }
+
+  if (campaign_state != clocks_campaign_state_t::STOPPED ||
+      request_start || request_stop || request_recover || request_zero ||
+      request_flash_cut || g_monitor_restore_requested ||
+      clocks_campaign_recovery_lifecycle_active()) {
+    Payload err;
+    err.add("error", "instrument lifecycle busy");
+    err.add("status", "monitor_restore_rejected_busy");
+    err.add("campaign_state", clocks_campaign_state_name(campaign_state));
+    return err;
+  }
+
+  g_monitor_restore_state = clocks_recovery_restore_state_t{};
+  if (!clocks_recovery_capsule_decode(capsule, g_monitor_restore_state)) {
+    g_monitor_restore_failure_count++;
+    Payload err;
+    err.add("error", "invalid recovery capsule");
+    err.add("status", "monitor_restore_rejected_capsule");
+    err.add("capsule_version", (uint32_t)CLOCKS_RECOVERY_CAPSULE_VERSION);
+    return err;
+  }
+
+  if (!clocks_recovery_install_dac_control(g_monitor_restore_state)) {
+    g_monitor_restore_state = clocks_recovery_restore_state_t{};
+    g_monitor_restore_failure_count++;
+    Payload err;
+    err.add("error", "failed to restore DAC/control state");
+    err.add("status", "monitor_restore_rejected_dac");
+    err.add("servo_mode", servo_mode_str(calibrate_ocxo_mode));
+    return err;
+  }
+
+  if (!clocks_alpha_installed_smartzero_backing_epoch() &&
+      !interrupt_smartzero_running() &&
+      !interrupt_smartzero_complete() &&
+      !clocks_alpha_epoch_install_in_progress()) {
+    if (!clocks_alpha_begin_smartzero_epoch("monitor_restore")) {
+      g_monitor_restore_state = clocks_recovery_restore_state_t{};
+      g_monitor_restore_failure_count++;
+      clocks_apply_servo_mode_now(servo_mode_t::OFF);
+      Payload err;
+      err.add("error", "failed to start SmartZero for monitor restore");
+      err.add("status", "monitor_restore_rejected_smartzero");
+      return err;
+    }
+  }
+
+  g_monitor_restore_requested = true;
+  g_monitor_restore_request_count++;
+
+  Payload p;
+  p.add("status", "monitor_restore_requested");
+  p.add("boundary", "next_completed_pps_after_epoch_ready");
+  p.add("capsule_version", (uint32_t)CLOCKS_RECOVERY_CAPSULE_VERSION);
+  p.add("capsule_crc32", g_monitor_restore_state.capsule_crc32);
+  p.add("request_count", g_monitor_restore_request_count);
+  p.add("epoch_ready", clocks_alpha_installed_smartzero_backing_epoch());
+  p.add("smartzero_running", interrupt_smartzero_running());
+  p.add("servo_mode", servo_mode_str(calibrate_ocxo_mode));
+  p.add("dither_operator_enabled",
+        clocks_ocxo_dac_dither_operator_enabled());
+  p.add("ocxo1_dac", toFixedDecimal(
+      ocxo_dac_fractional_snapshot(ocxo1_dac), 6));
+  p.add("ocxo2_dac", toFixedDecimal(
+      ocxo_dac_fractional_snapshot(ocxo2_dac), 6));
+  return p;
+}
+
 static FLASHMEM Payload cmd_recover(const Payload& args) {
   clocks_payload_numeric_integrity_reset();
+
+  if (g_monitor_restore_requested) {
+    Payload err;
+    err.add("error", "MONITOR restore is pending");
+    err.add("status", "recover_rejected_monitor_restore_pending");
+    return err;
+  }
+
+  g_campaign_restore_state = clocks_recovery_restore_state_t{};
+  const char* recovery_capsule = args.getString("recovery_capsule");
+  if (!recovery_capsule || !*recovery_capsule) {
+    recovery_capsule = args.getString("capsule");
+  }
+  const bool recovery_capsule_supplied =
+      recovery_capsule && *recovery_capsule;
+  if (recovery_capsule_supplied &&
+      !clocks_recovery_capsule_decode(
+          recovery_capsule, g_campaign_restore_state)) {
+    Payload err;
+    err.add("error", "invalid recovery capsule");
+    err.add("status", "recover_rejected_capsule");
+    err.add("capsule_version", (uint32_t)CLOCKS_RECOVERY_CAPSULE_VERSION);
+    return err;
+  }
 
   uint64_t dwt_ns = 0ULL;
   uint64_t gnss_ns = 0ULL;
@@ -8107,14 +8975,44 @@ static FLASHMEM Payload cmd_recover(const Payload& args) {
     return err;
   }
 
+  if (g_recover_lifecycle_mode ==
+          recover_lifecycle_mode_t::COLD_BOOTSTRAP &&
+      g_campaign_restore_state.valid) {
+    if (!clocks_recovery_install_dac_control(g_campaign_restore_state)) {
+      recover_lifecycle_abort("recover_capsule_dac_restore_failed");
+      g_campaign_capsule_failure_count++;
+      g_campaign_restore_state = clocks_recovery_restore_state_t{};
+      Payload err;
+      err.add("error", "failed to restore campaign DAC/control capsule");
+      err.add("status", "recover_rejected_capsule_dac");
+      return err;
+    }
+  } else if (g_recover_lifecycle_mode ==
+                 recover_lifecycle_mode_t::LIVE_REATTACH &&
+             g_campaign_restore_state.valid) {
+    // The running Teensy is newer than the last durable TIMEBASE row.  Preserve
+    // its live statistics and actuator state rather than rolling them backward.
+    g_campaign_capsule_ignored_live_count++;
+    g_campaign_restore_state = clocks_recovery_restore_state_t{};
+  }
+
   Payload p;
   p.add("status", "recover_requested");
   p.add("idempotent", false);
   p.add("recovery_generation", g_recover_request_count);
   p.add("instrument_statistics_preserved",
         clocks_alpha_installed_smartzero_backing_epoch());
+  p.add("instrument_statistics_restore_staged",
+        g_recover_lifecycle_mode == recover_lifecycle_mode_t::COLD_BOOTSTRAP &&
+        g_campaign_restore_state.valid);
   p.add("instrument_statistics_restored", false);
-  p.add("instrument_statistics_recovery_source", "LIVE_ALPHA_OR_COLD_REFILL");
+  p.add("instrument_statistics_recovery_source",
+        g_recover_lifecycle_mode == recover_lifecycle_mode_t::COLD_BOOTSTRAP &&
+        g_campaign_restore_state.valid
+            ? "TIMEBASE_RECOVERY_CAPSULE"
+            : "LIVE_ALPHA_OR_LEGACY_COLD_REFILL");
+  p.add("recovery_capsule_supplied", recovery_capsule_supplied);
+  p.add("recovery_capsule_crc32", g_campaign_restore_state.capsule_crc32);
   p.add("base_count", g_recover_last_base_count);
   p.add("expected_first_public_count",
         g_recover_last_expected_first_public_count);
@@ -8713,6 +9611,7 @@ static const process_command_entry_t CLOCKS_COMMANDS[] = {
   { "STOP",                cmd_stop                },
   { "ZERO",                cmd_zero                },
   { "RECOVER",             cmd_recover             },
+  { "RESTORE_MONITOR",     cmd_restore_monitor     },
   { "RECOVER_ABORT",       cmd_recover_abort       },
   { "SERVOS",              cmd_servos              },
   { "REPORT_CLOCKS",       cmd_report_clocks       },

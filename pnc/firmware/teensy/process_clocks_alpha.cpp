@@ -2623,6 +2623,28 @@ void welford_update(welford_t& w, double sample) {
   if (sample > w.max_val) w.max_val = sample;
 }
 
+static bool welford_restore_state_valid(const welford_t& state) {
+  if (!isfinite(state.mean) || !isfinite(state.m2) ||
+      !isfinite(state.min_val) || !isfinite(state.max_val)) {
+    return false;
+  }
+  if (state.m2 < 0.0) return false;
+  if (state.n == 0ULL) return true;
+  return state.min_val <= state.max_val &&
+         state.mean >= state.min_val &&
+         state.mean <= state.max_val;
+}
+
+bool welford_restore(welford_t& w, const welford_t& state) {
+  if (!welford_restore_state_valid(state)) return false;
+  if (state.n == 0ULL) {
+    welford_reset(w);
+    return true;
+  }
+  w = state;
+  return true;
+}
+
 double welford_stddev(const welford_t& w) {
   return (w.n >= 2) ? sqrt(w.m2 / (double)(w.n - 1)) : 0.0;
 }
@@ -2874,6 +2896,15 @@ FLASHMEM bool clocks_alpha_ocxo_tau_snapshot(time_clock_id_t clock,
     local.first_refined_ns = s->first_refined_ns;
     local.last_refined_ns = s->last_refined_ns;
     local.last_fast_residual_ns = s->last_fast_residual_ns;
+    local.cumulative_reference_ns = s->cumulative_reference_ns;
+    local.cumulative_clock_ns = s->cumulative_clock_ns;
+    local.cumulative_clock_ns_exact = s->cumulative_clock_ns_exact;
+    local.mean_x = s->mean_x;
+    local.mean_y = s->mean_y;
+    local.sxx = s->sxx;
+    local.sxy = s->sxy;
+    local.syy = s->syy;
+    local.interval_m2_ppb = s->interval_m2_ppb;
     local.tau = s->tau;
     local.ppb = s->ppb;
     local.stderr_ppb = s->stderr_ppb;
@@ -2891,6 +2922,72 @@ FLASHMEM bool clocks_alpha_ocxo_tau_snapshot(time_clock_id_t clock,
   }
 
   return false;
+}
+
+static bool alpha_tau_restore_state_valid(
+    time_clock_id_t clock,
+    const clocks_alpha_tau_snapshot_t& state) {
+  const uint32_t expected_clock_id = (uint32_t)((uint8_t)clock);
+  if (state.clock_id != 0U && state.clock_id != expected_clock_id) return false;
+  if (!isfinite(state.cumulative_clock_ns_exact) ||
+      !isfinite(state.mean_x) || !isfinite(state.mean_y) ||
+      !isfinite(state.sxx) || !isfinite(state.sxy) ||
+      !isfinite(state.syy) || !isfinite(state.interval_mean_ppb) ||
+      !isfinite(state.interval_m2_ppb)) {
+    return false;
+  }
+  if (state.interval_m2_ppb < 0.0) return false;
+  if (state.interval_count == 0U) return true;
+  return state.cumulative_reference_ns != 0ULL &&
+         state.cumulative_clock_ns_exact > 0.0;
+}
+
+bool clocks_alpha_ocxo_tau_restore(
+    time_clock_id_t clock,
+    const clocks_alpha_tau_snapshot_t* state) {
+  alpha_tau_estimator_t* dst = alpha_tau_store_mut(clock);
+  if (!dst || !state || !alpha_tau_restore_state_valid(clock, *state)) {
+    return false;
+  }
+
+  uint32_t seq = dst->seq;
+  if (seq & 1U) seq++;
+  dst->seq = seq + 1U;
+  clocks_alpha_dmb();
+
+  alpha_tau_estimator_t restored{};
+  restored.seq = seq + 1U;
+  restored.clock_id = (uint32_t)((uint8_t)clock);
+  restored.reset_count = state->reset_count;
+  restored.sample_count = state->sample_count;
+  restored.interval_count = state->interval_count;
+  restored.reject_count = state->reject_count;
+  restored.gap_reset_count = state->gap_reset_count;
+
+  // PPS sequence is boot-local adjacency custody.  Preserve the mature
+  // estimator but require the first post-restore row to establish a fresh
+  // sequence antecedent.
+  restored.last_pps_sequence = 0U;
+  restored.last_interval_pps_sequence = 0U;
+  restored.first_refined_ns = state->first_refined_ns;
+  restored.last_refined_ns = state->last_refined_ns;
+  restored.last_fast_residual_ns = state->last_fast_residual_ns;
+  restored.cumulative_reference_ns = state->cumulative_reference_ns;
+  restored.cumulative_clock_ns = state->cumulative_clock_ns;
+  restored.cumulative_clock_ns_exact = state->cumulative_clock_ns_exact;
+  restored.mean_x = state->mean_x;
+  restored.mean_y = state->mean_y;
+  restored.sxx = state->sxx;
+  restored.sxy = state->sxy;
+  restored.syy = state->syy;
+  restored.interval_mean_ppb = state->interval_mean_ppb;
+  restored.interval_m2_ppb = state->interval_m2_ppb;
+  alpha_tau_recompute(restored);
+
+  *dst = restored;
+  clocks_alpha_dmb();
+  dst->seq = seq + 2U;
+  return true;
 }
 
 FLASHMEM bool clocks_alpha_tau_snapshot(time_clock_id_t clock,
@@ -3149,6 +3246,10 @@ FLASHMEM bool clocks_alpha_instrument_stats_snapshot(
         alpha_frequency_from_tau(time_clock_id_t::OCXO1);
     local.ocxo2_frequency =
         alpha_frequency_from_tau(time_clock_id_t::OCXO2);
+    (void)clocks_alpha_ocxo_tau_snapshot(
+        time_clock_id_t::OCXO1, &local.ocxo1_tau_state);
+    (void)clocks_alpha_ocxo_tau_snapshot(
+        time_clock_id_t::OCXO2, &local.ocxo2_tau_state);
 
     local.gnss_welford = welford_gnss;
     local.dwt_welford = welford_dwt;
@@ -3168,6 +3269,82 @@ FLASHMEM bool clocks_alpha_instrument_stats_snapshot(
   }
 
   return false;
+}
+
+bool clocks_alpha_instrument_stats_restore(
+    const clocks_instrument_stats_snapshot_t* state) {
+  if (!state) return false;
+
+  const welford_t* populations[] = {
+      &state->gnss_welford, &state->dwt_welford,
+      &state->vclock_welford, &state->ocxo1_welford,
+      &state->ocxo2_welford, &state->pps_witness_welford,
+      &state->ocxo1_dac_welford, &state->ocxo2_dac_welford};
+  for (const welford_t* population : populations) {
+    if (!population || !welford_restore_state_valid(*population)) return false;
+  }
+  if (!alpha_tau_restore_state_valid(
+          time_clock_id_t::OCXO1, state->ocxo1_tau_state) ||
+      !alpha_tau_restore_state_valid(
+          time_clock_id_t::OCXO2, state->ocxo2_tau_state)) {
+    return false;
+  }
+
+  g_instrument_stats_seq++;
+  clocks_alpha_dmb();
+
+  (void)welford_restore(welford_gnss, state->gnss_welford);
+  (void)welford_restore(welford_dwt, state->dwt_welford);
+  (void)welford_restore(welford_vclock, state->vclock_welford);
+  (void)welford_restore(welford_ocxo1, state->ocxo1_welford);
+  (void)welford_restore(welford_ocxo2, state->ocxo2_welford);
+  (void)welford_restore(welford_pps_witness, state->pps_witness_welford);
+  (void)welford_restore(welford_ocxo1_dac, state->ocxo1_dac_welford);
+  (void)welford_restore(welford_ocxo2_dac, state->ocxo2_dac_welford);
+  (void)clocks_alpha_ocxo_tau_restore(
+      time_clock_id_t::OCXO1, &state->ocxo1_tau_state);
+  (void)clocks_alpha_ocxo_tau_restore(
+      time_clock_id_t::OCXO2, &state->ocxo2_tau_state);
+
+  g_instrument_stats_reset_count = state->reset_count;
+  g_instrument_stats_update_count = state->update_count;
+  g_instrument_stats_last_pps_sequence = 0U;
+  g_instrument_stats_completed_row_coherent = state->valid;
+
+  // Clockface continuation is rendered by Beta's campaign-neutral instrument
+  // offsets.  Keep Alpha's newly booted hardware coordinate here so no stale
+  // endpoint is introduced into interval custody.
+  g_instrument_stats_gnss_ns = g_gnss_ns_at_pps_vclock;
+  g_instrument_stats_dwt_cycles = g_dwt_cycle_count_total;
+  g_instrument_stats_ocxo1_ns =
+      g_ocxo1_measured_gnss_ns_at_pps_vclock;
+  g_instrument_stats_ocxo2_ns =
+      g_ocxo2_measured_gnss_ns_at_pps_vclock;
+  g_instrument_stats_dwt_at_pps_vclock = g_dwt_at_pps_vclock;
+  g_instrument_stats_counter32_at_pps_vclock =
+      g_counter32_at_pps_vclock;
+  g_instrument_stats_dwt_cycles_per_second =
+      g_dwt_cycles_between_pps_vclock;
+  g_instrument_stats_reference_interval_cycles =
+      g_pps_vclock_dwt_cycles_between_edges_valid
+          ? g_pps_vclock_dwt_cycles_between_edges
+          : 0U;
+  g_instrument_stats_vclock_interval_cycles =
+      g_vclock_measurement.dwt_cycles_between_edges;
+  g_instrument_stats_ocxo1_interval_cycles =
+      g_ocxo1_measurement.dwt_cycles_between_edges;
+  g_instrument_stats_ocxo2_interval_cycles =
+      g_ocxo2_measurement.dwt_cycles_between_edges;
+  g_instrument_stats_vclock_interval_reject_count =
+      state->vclock_interval_reject_count;
+  g_instrument_stats_ocxo1_interval_reject_count =
+      state->ocxo1_interval_reject_count;
+  g_instrument_stats_ocxo2_interval_reject_count =
+      state->ocxo2_interval_reject_count;
+
+  clocks_alpha_dmb();
+  g_instrument_stats_seq++;
+  return true;
 }
 
 static void alpha_counterledger_reset_lane(alpha_pps_counterledger_lane_t& s) {
