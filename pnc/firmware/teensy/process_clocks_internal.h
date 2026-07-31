@@ -1574,6 +1574,15 @@ struct ocxo_dac_state_t {
   uint32_t servo_settle_count;
   uint32_t servo_adjustments;
 
+  // Mode-shared servo telemetry.  MEAN/NOW retain the historical filtered
+  // residual interpretation.  TOTAL uses these legacy field names as a compact
+  // cascaded-controller transcript:
+  //   last_residual        = long-baseline TOTAL PPB position
+  //   last_raw_residual    = newest admitted one-second residual
+  //   filtered_residual    = short-window residual mean (live rate)
+  //   filtered_slope       = requested live rate
+  //   predicted_residual   = live-rate error sent to the DAC controller
+  //   predictor_updates    = admitted samples since the current DAC point
   bool     servo_predictor_initialized;
   double   servo_last_raw_residual;
   double   servo_filtered_residual;

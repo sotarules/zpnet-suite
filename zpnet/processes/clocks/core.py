@@ -1755,19 +1755,100 @@ def _monitor_clocks_payload(monitor: Optional[Dict[str, Any]]) -> Dict[str, Any]
     return clocks if isinstance(clocks, dict) else {}
 
 
-def _monitor_recovery_capsule(monitor: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """Return the opaque firmware capsule object from a unified MONITOR."""
-    clocks = _monitor_clocks_payload(monitor)
-    capsule = clocks.get("restore_capsule")
-    if not isinstance(capsule, dict):
+def _monitor_restore_state(monitor: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Return firmware-authored structured sufficient state from MONITOR."""
+    state = _monitor_clocks_payload(monitor).get("restore_state")
+    if not isinstance(state, dict):
         return None
-    encoded = capsule.get("capsule")
-    if not isinstance(encoded, str) or not encoded.strip():
+    try:
+        version = int(state.get("version") or state.get("schema_version") or 0)
+    except (TypeError, ValueError):
         return None
-    out = copy.deepcopy(capsule)
-    out["capsule"] = encoded.strip()
-    return out
+    if version != 2 or not state.get("present", True):
+        return None
+    return copy.deepcopy(state)
 
+
+def _structured_restore_args(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Flatten structured MONITOR state into ordinary CLOCKS command fields."""
+    instrument = state.get("instrument_clockfaces")
+    stats = state.get("stats")
+    dac = state.get("dac")
+    if not isinstance(instrument, dict) or not isinstance(stats, dict) or not isinstance(dac, dict):
+        raise ValueError("structured restore missing instrument_clockfaces/stats/dac")
+
+    out: Dict[str, Any] = {
+        "restore_schema_version": 2,
+        "restore_instrument_gnss_ns": instrument.get("gnss_ns"),
+        "restore_instrument_dwt_cycles": instrument.get("dwt_cycles"),
+        "restore_instrument_ocxo1_ns": instrument.get("ocxo1_ns"),
+        "restore_instrument_ocxo2_ns": instrument.get("ocxo2_ns"),
+        "restore_stats_valid": stats.get("valid"),
+        "restore_stats_completed_row_coherent": stats.get("completed_row_coherent"),
+        "restore_stats_reset_count": stats.get("reset_count"),
+        "restore_stats_update_count": stats.get("update_count"),
+        "restore_stats_vclock_interval_reject_count": _path_get(stats, "interval_admission.vclock_reject_count"),
+        "restore_stats_ocxo1_interval_reject_count": _path_get(stats, "interval_admission.ocxo1_reject_count"),
+        "restore_stats_ocxo2_interval_reject_count": _path_get(stats, "interval_admission.ocxo2_reject_count"),
+        "restore_servo_mode": dac.get("servo_mode") or dac.get("calibrate_ocxo") or "OFF",
+        "restore_dither_operator_enabled": dac.get("dither_operator_enabled", False),
+    }
+
+    welfords = {
+        "gnss": _path_get(stats, "gnss.welford"),
+        "dwt": _path_get(stats, "dwt.welford"),
+        "vclock": _path_get(stats, "vclock.welford"),
+        "ocxo1": _path_get(stats, "ocxo1.welford"),
+        "ocxo2": _path_get(stats, "ocxo2.welford"),
+        "pps_witness": _path_get(stats, "pps_witness.welford"),
+        "ocxo1_dac": _path_get(stats, "dac.ocxo1"),
+        "ocxo2_dac": _path_get(stats, "dac.ocxo2"),
+    }
+    for name, wf in welfords.items():
+        if not isinstance(wf, dict):
+            raise ValueError(f"structured restore missing {name} Welford")
+        for field in ("n", "mean", "m2", "min", "max"):
+            out[f"restore_{name}_welford_{field}"] = wf.get(field)
+
+    for lane in ("ocxo1", "ocxo2"):
+        tau = _path_get(stats, f"{lane}_tau_state")
+        if not isinstance(tau, dict):
+            raise ValueError(f"structured restore missing {lane} TAU state")
+        for field in (
+            "valid", "reset_count", "sample_count", "interval_count",
+            "reject_count", "gap_reset_count", "last_pps_sequence",
+            "last_interval_pps_sequence", "first_refined_ns", "last_refined_ns",
+            "last_fast_residual_ns", "cumulative_reference_ns",
+            "cumulative_clock_ns", "cumulative_clock_ns_exact", "mean_x",
+            "mean_y", "sxx", "sxy", "syy", "interval_mean_ppb",
+            "interval_m2_ppb",
+        ):
+            out[f"restore_{lane}_tau_{field}"] = tau.get(field)
+
+        lane_state = dac.get(lane)
+        servo = lane_state.get("servo") if isinstance(lane_state, dict) else None
+        if not isinstance(lane_state, dict) or not isinstance(servo, dict):
+            raise ValueError(f"structured restore missing {lane} DAC/servo state")
+        out[f"restore_{lane}_dac_value"] = lane_state.get("value", lane_state.get("dac"))
+        field_map = {
+            "servo_last_step": "last_step",
+            "servo_last_residual": "last_residual",
+            "servo_settle_count": "settle_count",
+            "servo_adjustments": "adjustments",
+            "servo_predictor_initialized": "predictor_initialized",
+            "servo_last_raw_residual": "last_raw_residual",
+            "servo_filtered_residual": "filtered_residual",
+            "servo_filtered_slope": "filtered_slope",
+            "servo_predicted_residual": "predicted_residual",
+            "servo_predictor_updates": "predictor_updates",
+        }
+        for command_field, json_field in field_map.items():
+            out[f"restore_{lane}_dac_{command_field}"] = servo.get(json_field)
+
+    missing = [key for key, value in out.items() if value is None]
+    if missing:
+        raise ValueError(f"structured restore missing fields: {missing}")
+    return out
 
 def _restore_gnss_raw_payload(gnss_raw: Dict[str, Any]) -> Dict[str, Any]:
     """Restore the complete Pi-owned always-on GNSS_RAW state."""
@@ -4282,9 +4363,9 @@ def _recovery_timebase_snapshot(tb: Dict[str, Any]) -> Dict[str, Any]:
         or last_tb.get("system_time_utc")
         or system_time_z()
     )
-    recovery_capsule = last_tb.get("recovery_capsule")
-    if not isinstance(recovery_capsule, dict):
-        recovery_capsule = None
+    restore_state = last_tb.get("restore_state")
+    if not isinstance(restore_state, dict):
+        restore_state = None
 
     recoverable = (
         last_pps_vclock_count > 0
@@ -4308,7 +4389,7 @@ def _recovery_timebase_snapshot(tb: Dict[str, Any]) -> Dict[str, Any]:
         "last_gnss_raw_ref_ns": int(last_gnss_raw_ref_ns),
         "last_gnss_raw_welford_mean": float(last_gnss_raw_welford_mean),
         "last_gnss_time_str": str(last_gnss_time_str),
-        "recovery_capsule": copy.deepcopy(recovery_capsule),
+        "restore_state": copy.deepcopy(restore_state),
         "recoverable": bool(recoverable),
     }
 
@@ -5014,14 +5095,14 @@ def _enqueue_timebase_piece(
     topic: str,
     payload: Dict[str, Any],
     *,
-    recovery_capsule: Optional[Dict[str, Any]] = None,
+    restore_state: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """Enqueue one campaign row plus the same-second live recovery capsule."""
+    """Enqueue one campaign row plus same-second structured recovery state."""
     _fragment_queue.put({
         "topic": topic,
         "payload": dict(payload),
-        "recovery_capsule": copy.deepcopy(recovery_capsule)
-            if isinstance(recovery_capsule, dict) else None,
+        "restore_state": copy.deepcopy(restore_state)
+            if isinstance(restore_state, dict) else None,
         "received_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     })
 
@@ -5090,7 +5171,7 @@ def on_monitor_fragment(payload: Payload) -> None:
     _enqueue_timebase_piece(
         TIMEBASE_FRAGMENT_TOPIC,
         candidate,
-        recovery_capsule=_monitor_recovery_capsule(monitor_fragment),
+        restore_state=_monitor_restore_state(monitor_fragment),
     )
     _diag["timebase_candidates_queued"] += 1
     _diag["fragments_queued"] += 1
@@ -5123,9 +5204,9 @@ def _process_loop() -> None:
         topic = str(piece.get("topic") or "")
         candidate_received_utc = _parse_utc(piece.get("received_at_utc"))
         payload = piece.get("payload")
-        recovery_capsule = piece.get("recovery_capsule")
-        if not isinstance(recovery_capsule, dict):
-            recovery_capsule = None
+        restore_state = piece.get("restore_state")
+        if not isinstance(restore_state, dict):
+            restore_state = None
         if not isinstance(payload, dict):
             logging.error("💥 [clocks] processor received malformed MONITOR_FRAGMENT campaign row: %s", piece)
             continue
@@ -5412,11 +5493,10 @@ def _process_loop() -> None:
             },
         }
 
-        if recovery_capsule is not None:
-            # The opaque capsule is authored by the same firmware snapshot as
-            # this campaign_row.  Persist it beside TIMEBASE so a cold Teensy
-            # campaign recovery can restore hidden estimator/control state.
-            timebase["recovery_capsule"] = copy.deepcopy(recovery_capsule)
+        if restore_state is not None:
+            # Same-second firmware-authored sufficient state remains ordinary,
+            # inspectable JSON and becomes the cold-recovery authority.
+            timebase["restore_state"] = copy.deepcopy(restore_state)
 
         publish("TIMEBASE", timebase)
         _persist_timebase(timebase)
@@ -6725,9 +6805,9 @@ def _recover_campaign() -> None:
     last_gnss_raw_ref_ns = int(recovery_snapshot.get("last_gnss_raw_ref_ns") or (last_pps_vclock_count * NS_PER_SECOND))
     last_gnss_raw_welford_mean = float(recovery_snapshot.get("last_gnss_raw_welford_mean") or 0.0)
     last_gnss_time_str = str(recovery_snapshot["last_gnss_time_str"])
-    recovery_capsule = recovery_snapshot.get("recovery_capsule")
-    if not isinstance(recovery_capsule, dict):
-        recovery_capsule = None
+    restore_state = recovery_snapshot.get("restore_state")
+    if not isinstance(restore_state, dict):
+        restore_state = None
 
     if not recovery_snapshot.get("recoverable"):
         raise RuntimeError(
@@ -6989,29 +7069,17 @@ def _recover_campaign() -> None:
         "ocxo2_ns": str(int(projected_ocxo2_ns)),
     }
 
-    capsule_text = (
-        recovery_capsule.get("capsule")
-        if isinstance(recovery_capsule, dict) else None
-    )
-    if isinstance(capsule_text, str) and capsule_text.strip():
-        teensy_recover_args["recovery_capsule"] = capsule_text.strip()
-        _diag["last_recovery"]["recovery_capsule_present"] = True
-        _diag["last_recovery"]["recovery_capsule_version"] = (
-            recovery_capsule.get("version")
-        )
-    else:
-        _diag["last_recovery"]["recovery_capsule_present"] = False
-
-    if "recovery_capsule" in teensy_recover_args:
-        # The capsule is the complete sufficient-state authority.  Do not also
-        # send the legacy expanded Welford field set; that would bloat the
-        # command and create two competing restore representations.
+    if isinstance(restore_state, dict):
+        teensy_recover_args.update(_structured_restore_args(restore_state))
+        _diag["last_recovery"]["structured_restore_present"] = True
+        _diag["last_recovery"]["restore_schema_version"] = 2
         recovered_welford_count = 0
         logging.info(
-            "📊 [recovery] using opaque TIMEBASE recovery capsule for Teensy "
+            "📊 [recovery] using structured TIMEBASE state for Teensy "
             "statistics/control restoration"
         )
     else:
+        _diag["last_recovery"]["structured_restore_present"] = False
         recovered_welford_count = _add_welford_recovery_args(
             teensy_recover_args,
             last_tb=last_tb,

@@ -319,8 +319,6 @@ static constexpr size_t CLOCKS_MONITOR_CAMPAIGN_NAME_MAX = 64U;
 static constexpr size_t CLOCKS_MONITOR_STATE_NAME_MAX = 40U;
 static constexpr size_t CLOCKS_MONITOR_REASON_MAX = 160U;
 static constexpr size_t CLOCKS_MONITOR_DELAY_NAME_MAX = 40U;
-static constexpr size_t CLOCKS_MONITOR_RECOVERY_ENCODING_MAX = 16U;
-static constexpr size_t CLOCKS_MONITOR_RECOVERY_CAPSULE_MAX = 1200U;
 
 struct clocks_monitor_welford_snapshot_t {
   uint64_t n = 0;
@@ -456,6 +454,10 @@ struct clocks_monitor_dither_lane_t {
   double servo_last_residual = 0.0;
   uint32_t servo_settle_count = 0;
   uint32_t servo_adjustments = 0;
+
+  // Mode-shared telemetry.  In TOTAL, the historical predictor names carry the
+  // cascaded position/rate transcript: newest residual, recent residual mean,
+  // requested live rate, and resulting live-rate error respectively.
   bool servo_predictor_initialized = false;
   double servo_last_raw_residual = 0.0;
   double servo_filtered_residual = 0.0;
@@ -526,17 +528,20 @@ struct clocks_monitor_recovery_snapshot_t {
   char reattach_reason[CLOCKS_MONITOR_REASON_MAX] = {0};
 };
 
-// Opaque firmware-owned sufficient-state capsule.  The Pi persists and returns
-// this string verbatim; it never interprets estimator layout.  Version, size,
-// and CRC remain visible so recovery failures can be diagnosed without decoding
-// the capsule outside firmware.
-struct clocks_monitor_recovery_capsule_t {
+// Human-readable sufficient state for cold instrument resurrection.  Every
+// floating quantity is published through Payload fixed-decimal JSON numbers;
+// no opaque binary representation exists at any layer.
+struct clocks_monitor_restore_state_t {
   bool present = false;
-  uint32_t version = 0;
-  uint32_t binary_size = 0;
-  uint32_t crc32 = 0;
-  char encoding[CLOCKS_MONITOR_RECOVERY_ENCODING_MAX] = {0};
-  char capsule[CLOCKS_MONITOR_RECOVERY_CAPSULE_MAX] = {0};
+  uint32_t schema_version = 2;
+
+  uint64_t instrument_gnss_ns = 0;
+  uint64_t instrument_dwt_cycles = 0;
+  uint64_t instrument_ocxo1_ns = 0;
+  uint64_t instrument_ocxo2_ns = 0;
+
+  clocks_monitor_stats_snapshot_t stats{};
+  clocks_monitor_dac_snapshot_t dac{};
 };
 
 struct clocks_monitor_campaign_snapshot_t {
@@ -620,7 +625,7 @@ struct clocks_monitor_live_snapshot_t {
   clocks_monitor_raw_cycles_snapshot_t raw_cycles{};
   clocks_monitor_stats_snapshot_t stats{};
   clocks_monitor_dac_snapshot_t dac{};
-  clocks_monitor_recovery_capsule_t restore_capsule{};
+  clocks_monitor_restore_state_t restore_state{};
 };
 
 struct clocks_monitor_snapshot_t {

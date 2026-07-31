@@ -3508,27 +3508,13 @@ static void system_monitor_add_welford(
     const clocks_monitor_welford_snapshot_t& sample) {
   Payload value;
   value.add("n", sample.n);
-  value.add("mean", toFixedDecimal(sample.mean, 6));
+  value.add("mean", toFixedDecimal(sample.mean, 12));
+  value.add("m2", toFixedDecimal(sample.m2, 12));
   value.add("stddev", toFixedDecimal(sample.stddev, 6));
   value.add("stderr", toFixedDecimal(sample.stderr_value, 6));
-  value.add("min", toFixedDecimal(sample.min, 6));
-  value.add("max", toFixedDecimal(sample.max, 6));
+  value.add("min", toFixedDecimal(sample.min, 12));
+  value.add("max", toFixedDecimal(sample.max, 12));
   parent.add_object(key, value);
-}
-
-static void system_monitor_add_recovery_capsule(
-    Payload& parent,
-    const clocks_monitor_recovery_capsule_t& snapshot) {
-  if (!snapshot.present || !snapshot.capsule[0]) return;
-
-  Payload recovery;
-  recovery.add("schema", "CLOCKS_RECOVERY_CAPSULE_V1");
-  recovery.add("version", snapshot.version);
-  recovery.add("encoding", snapshot.encoding);
-  recovery.add("binary_size", snapshot.binary_size);
-  recovery.add("crc32", snapshot.crc32);
-  recovery.add("capsule", snapshot.capsule);
-  parent.add_object("restore_capsule", recovery);
 }
 
 static void system_monitor_add_stats_clock(
@@ -3541,6 +3527,39 @@ static void system_monitor_add_stats_clock(
     value.add("tau", toFixedDecimal(clock.tau, 12));
     value.add("ppb", toFixedDecimal(clock.ppb, 3));
   }
+  parent.add_object(key, value);
+}
+
+static void system_monitor_add_tau_state(
+    Payload& parent,
+    const char* key,
+    const clocks_monitor_tau_recovery_snapshot_t& state) {
+  Payload value;
+  value.add("valid", state.valid);
+  value.add("reset_count", state.reset_count);
+  value.add("sample_count", state.sample_count);
+  value.add("interval_count", state.interval_count);
+  value.add("reject_count", state.reject_count);
+  value.add("gap_reset_count", state.gap_reset_count);
+  value.add("last_pps_sequence", state.last_pps_sequence);
+  value.add("last_interval_pps_sequence",
+            state.last_interval_pps_sequence);
+  value.add("first_refined_ns", state.first_refined_ns);
+  value.add("last_refined_ns", state.last_refined_ns);
+  value.add("last_fast_residual_ns", state.last_fast_residual_ns);
+  value.add("cumulative_reference_ns", state.cumulative_reference_ns);
+  value.add("cumulative_clock_ns", state.cumulative_clock_ns);
+  value.add("cumulative_clock_ns_exact",
+            toFixedDecimal(state.cumulative_clock_ns_exact, 12));
+  value.add("mean_x", toFixedDecimal(state.mean_x, 12));
+  value.add("mean_y", toFixedDecimal(state.mean_y, 12));
+  value.add("sxx", toFixedDecimal(state.sxx, 12));
+  value.add("sxy", toFixedDecimal(state.sxy, 12));
+  value.add("syy", toFixedDecimal(state.syy, 12));
+  value.add("interval_mean_ppb",
+            toFixedDecimal(state.interval_mean_ppb, 12));
+  value.add("interval_m2_ppb",
+            toFixedDecimal(state.interval_m2_ppb, 12));
   parent.add_object(key, value);
 }
 
@@ -3564,6 +3583,10 @@ static void system_monitor_add_stats(
   system_monitor_add_stats_clock(stats, "ocxo1", snapshot.ocxo1);
   system_monitor_add_stats_clock(stats, "ocxo2", snapshot.ocxo2);
   system_monitor_add_stats_clock(stats, "pps_witness", snapshot.pps_witness);
+  system_monitor_add_tau_state(
+      stats, "ocxo1_tau_state", snapshot.ocxo1_tau_state);
+  system_monitor_add_tau_state(
+      stats, "ocxo2_tau_state", snapshot.ocxo2_tau_state);
 
   Payload maturity;
   maturity.add("gnss_samples", snapshot.maturity_gnss_samples);
@@ -3727,6 +3750,25 @@ static void system_monitor_add_live_dither_lane(
   lane.add("dac", toFixedDecimal(lane_snapshot.value, 6));
   lane.add("hw_code", (uint32_t)lane_snapshot.hw_code);
 
+  Payload servo;
+  servo.add("last_step", toFixedDecimal(lane_snapshot.servo_last_step, 12));
+  servo.add("last_residual",
+            toFixedDecimal(lane_snapshot.servo_last_residual, 12));
+  servo.add("settle_count", lane_snapshot.servo_settle_count);
+  servo.add("adjustments", lane_snapshot.servo_adjustments);
+  servo.add("predictor_initialized",
+            lane_snapshot.servo_predictor_initialized);
+  servo.add("last_raw_residual",
+            toFixedDecimal(lane_snapshot.servo_last_raw_residual, 12));
+  servo.add("filtered_residual",
+            toFixedDecimal(lane_snapshot.servo_filtered_residual, 12));
+  servo.add("filtered_slope",
+            toFixedDecimal(lane_snapshot.servo_filtered_slope, 12));
+  servo.add("predicted_residual",
+            toFixedDecimal(lane_snapshot.servo_predicted_residual, 12));
+  servo.add("predictor_updates", lane_snapshot.servo_predictor_updates);
+  lane.add_object("servo", servo);
+
   Payload dither;
   dither.add("enabled", dither_operator_enabled);
   dither.add("active", lane_snapshot.active);
@@ -3757,6 +3799,28 @@ static void system_monitor_add_live_dac(
   system_monitor_add_live_dither_lane(
       dac, "ocxo2", snapshot.ocxo2, snapshot.dither_operator_enabled);
   parent.add_object("dac", dac);
+}
+
+static void system_monitor_add_restore_state(
+    Payload& parent,
+    const clocks_monitor_restore_state_t& snapshot) {
+  if (!snapshot.present) return;
+
+  Payload state;
+  state.add("schema", "CLOCKS_STRUCTURED_RESTORE_V2");
+  state.add("version", snapshot.schema_version);
+  state.add("present", snapshot.present);
+
+  Payload instrument;
+  instrument.add("gnss_ns", snapshot.instrument_gnss_ns);
+  instrument.add("dwt_cycles", snapshot.instrument_dwt_cycles);
+  instrument.add("ocxo1_ns", snapshot.instrument_ocxo1_ns);
+  instrument.add("ocxo2_ns", snapshot.instrument_ocxo2_ns);
+  state.add_object("instrument_clockfaces", instrument);
+
+  system_monitor_add_stats(state, snapshot.stats);
+  system_monitor_add_live_dac(state, snapshot.dac);
+  parent.add_object("restore_state", state);
 }
 
 static void system_monitor_add_campaign_dac(
@@ -3882,7 +3946,7 @@ static Payload system_monitor_clocks_payload(
   system_monitor_add_raw_cycles(clocks, snapshot.raw_cycles);
   system_monitor_add_stats(clocks, snapshot.stats);
   system_monitor_add_live_dac(clocks, snapshot.dac);
-  system_monitor_add_recovery_capsule(clocks, snapshot.restore_capsule);
+  system_monitor_add_restore_state(clocks, snapshot.restore_state);
   return clocks;
 }
 

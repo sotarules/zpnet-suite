@@ -1593,18 +1593,102 @@ def _monitor_clocks_payload(monitor: Optional[Dict[str, Any]]) -> Dict[str, Any]
     return clocks if isinstance(clocks, dict) else {}
 
 
-def _monitor_recovery_capsule(monitor: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """Return the opaque firmware capsule object from a unified MONITOR."""
-    capsule = _monitor_clocks_payload(monitor).get("restore_capsule")
-    if not isinstance(capsule, dict):
+def _monitor_restore_state(monitor: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Return firmware-authored structured sufficient state from MONITOR."""
+    state = _monitor_clocks_payload(monitor).get("restore_state")
+    if not isinstance(state, dict):
         return None
-    encoded = capsule.get("capsule")
-    if not isinstance(encoded, str) or not encoded.strip():
+    try:
+        version = int(state.get("version") or state.get("schema_version") or 0)
+    except (TypeError, ValueError):
         return None
-    result = copy.deepcopy(capsule)
-    result["capsule"] = encoded.strip()
-    return result
+    if version != 2 or not state.get("present", True):
+        return None
+    return copy.deepcopy(state)
 
+
+def _structured_restore_args(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Flatten structured MONITOR state into ordinary CLOCKS command fields."""
+    instrument = state.get("instrument_clockfaces")
+    stats = state.get("stats")
+    dac = state.get("dac")
+    if not isinstance(instrument, dict) or not isinstance(stats, dict) or not isinstance(dac, dict):
+        raise ValueError("structured restore missing instrument_clockfaces/stats/dac")
+
+    def path(mapping: Dict[str, Any], dotted: str) -> Any:
+        current: Any = mapping
+        for part in dotted.split("."):
+            if not isinstance(current, dict):
+                return None
+            current = current.get(part)
+        return current
+
+    out: Dict[str, Any] = {
+        "restore_schema_version": 2,
+        "restore_instrument_gnss_ns": instrument.get("gnss_ns"),
+        "restore_instrument_dwt_cycles": instrument.get("dwt_cycles"),
+        "restore_instrument_ocxo1_ns": instrument.get("ocxo1_ns"),
+        "restore_instrument_ocxo2_ns": instrument.get("ocxo2_ns"),
+        "restore_stats_valid": stats.get("valid"),
+        "restore_stats_completed_row_coherent": stats.get("completed_row_coherent"),
+        "restore_stats_reset_count": stats.get("reset_count"),
+        "restore_stats_update_count": stats.get("update_count"),
+        "restore_stats_vclock_interval_reject_count": path(stats, "interval_admission.vclock_reject_count"),
+        "restore_stats_ocxo1_interval_reject_count": path(stats, "interval_admission.ocxo1_reject_count"),
+        "restore_stats_ocxo2_interval_reject_count": path(stats, "interval_admission.ocxo2_reject_count"),
+        "restore_servo_mode": dac.get("servo_mode") or dac.get("calibrate_ocxo") or "OFF",
+        "restore_dither_operator_enabled": dac.get("dither_operator_enabled", False),
+    }
+    welfords = {
+        "gnss": path(stats, "gnss.welford"),
+        "dwt": path(stats, "dwt.welford"),
+        "vclock": path(stats, "vclock.welford"),
+        "ocxo1": path(stats, "ocxo1.welford"),
+        "ocxo2": path(stats, "ocxo2.welford"),
+        "pps_witness": path(stats, "pps_witness.welford"),
+        "ocxo1_dac": path(stats, "dac.ocxo1"),
+        "ocxo2_dac": path(stats, "dac.ocxo2"),
+    }
+    for name, wf in welfords.items():
+        if not isinstance(wf, dict):
+            raise ValueError(f"structured restore missing {name} Welford")
+        for field in ("n", "mean", "m2", "min", "max"):
+            out[f"restore_{name}_welford_{field}"] = wf.get(field)
+    for lane in ("ocxo1", "ocxo2"):
+        tau = path(stats, f"{lane}_tau_state")
+        if not isinstance(tau, dict):
+            raise ValueError(f"structured restore missing {lane} TAU state")
+        for field in (
+            "valid", "reset_count", "sample_count", "interval_count",
+            "reject_count", "gap_reset_count", "last_pps_sequence",
+            "last_interval_pps_sequence", "first_refined_ns", "last_refined_ns",
+            "last_fast_residual_ns", "cumulative_reference_ns",
+            "cumulative_clock_ns", "cumulative_clock_ns_exact", "mean_x",
+            "mean_y", "sxx", "sxy", "syy", "interval_mean_ppb",
+            "interval_m2_ppb",
+        ):
+            out[f"restore_{lane}_tau_{field}"] = tau.get(field)
+        lane_state = dac.get(lane)
+        servo = lane_state.get("servo") if isinstance(lane_state, dict) else None
+        if not isinstance(lane_state, dict) or not isinstance(servo, dict):
+            raise ValueError(f"structured restore missing {lane} DAC/servo state")
+        out[f"restore_{lane}_dac_value"] = lane_state.get("value", lane_state.get("dac"))
+        field_map = {
+            "servo_last_step": "last_step", "servo_last_residual": "last_residual",
+            "servo_settle_count": "settle_count", "servo_adjustments": "adjustments",
+            "servo_predictor_initialized": "predictor_initialized",
+            "servo_last_raw_residual": "last_raw_residual",
+            "servo_filtered_residual": "filtered_residual",
+            "servo_filtered_slope": "filtered_slope",
+            "servo_predicted_residual": "predicted_residual",
+            "servo_predictor_updates": "predictor_updates",
+        }
+        for command_field, json_field in field_map.items():
+            out[f"restore_{lane}_dac_{command_field}"] = servo.get(json_field)
+    missing = [key for key, value in out.items() if value is None]
+    if missing:
+        raise ValueError(f"structured restore missing fields: {missing}")
+    return out
 
 def _monitor_gnss_raw_payload(monitor: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """Return the Pi CLOCKS-owned GNSS_RAW state carried by MONITOR."""
@@ -1615,7 +1699,7 @@ def _monitor_gnss_raw_payload(monitor: Optional[Dict[str, Any]]) -> Optional[Dic
 def _queue_monitor_checkpoint(monitor: Dict[str, Any]) -> None:
     """Stage only the newest fully recoverable MONITOR; never block pub/sub."""
     if (
-        _monitor_recovery_capsule(monitor) is None
+        _monitor_restore_state(monitor) is None
         or _monitor_gnss_raw_payload(monitor) is None
     ):
         return
@@ -1701,16 +1785,17 @@ def _seed_system_from_checkpoint(checkpoint: Dict[str, Any]) -> None:
     publish("MONITOR", copy.deepcopy(checkpoint))
 
 
-def _request_teensy_monitor_restore(capsule: str) -> Dict[str, Any]:
-    """Stage one firmware MONITOR restore, retrying only the transient busy gate."""
+def _request_teensy_monitor_restore(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Stage one structured firmware MONITOR restore, retrying only busy."""
     deadline = time.monotonic() + MONITOR_RESTORE_COMMAND_RETRY_S
     last_response: Any = None
+    restore_args = _structured_restore_args(state)
     while True:
         response = send_command(
             machine="TEENSY",
             subsystem="CLOCKS",
             command="RESTORE_MONITOR",
-            args={"recovery_capsule": capsule},
+            args=restore_args,
         )
         last_response = response
         outer_success = isinstance(response, dict) and bool(response.get("success"))
@@ -1723,8 +1808,6 @@ def _request_teensy_monitor_restore(capsule: str) -> Dict[str, Any]:
                 payload.get("campaign_state") or ""
             ).strip().upper() if isinstance(payload, dict) else ""
             if campaign_state == "STARTED":
-                # A live Teensy campaign already owns the instrument.  This is a
-                # lawful supersession of MONITOR recovery, not a restore fault.
                 return response
             if time.monotonic() < deadline:
                 time.sleep(0.25)
@@ -1734,7 +1817,6 @@ def _request_teensy_monitor_restore(capsule: str) -> Dict[str, Any]:
             f"status={status or 'missing_handler_status'} "
             f"outer_success={outer_success} response={last_response!r}"
         )
-
 
 def _request_clocks_gnss_raw_restore(gnss_raw: Dict[str, Any]) -> Dict[str, Any]:
     """Hand Pi-owned GNSS_RAW state to its CLOCKS process owner."""
@@ -1902,16 +1984,16 @@ def _wait_for_monitor_restore(
 
 def _recover_monitor_checkpoint(checkpoint: Dict[str, Any]) -> Dict[str, Any]:
     """Restore always-on Teensy and Pi clock state without campaign policy."""
-    capsule = _monitor_recovery_capsule(checkpoint)
-    if capsule is None:
-        raise RuntimeError("config.MONITOR has no firmware recovery capsule")
+    restore_state = _monitor_restore_state(checkpoint)
+    if restore_state is None:
+        raise RuntimeError("config.MONITOR has no structured firmware restore state")
     gnss_raw = _monitor_gnss_raw_payload(checkpoint)
     if gnss_raw is None:
         raise RuntimeError("config.MONITOR has no clocks.gnss_raw state")
 
     _seed_system_from_checkpoint(checkpoint)
     requested_monotonic = time.monotonic()
-    teensy_response = _request_teensy_monitor_restore(str(capsule["capsule"]))
+    teensy_response = _request_teensy_monitor_restore(restore_state)
     teensy_payload = (
         teensy_response.get("payload", {})
         if isinstance(teensy_response, dict)
@@ -1930,8 +2012,7 @@ def _recover_monitor_checkpoint(checkpoint: Dict[str, Any]) -> Dict[str, Any]:
             "success": True,
             "mode": "LIVE_CAMPAIGN_SUPERSEDED_MONITOR_RESTORE",
             "checkpoint_sequence": checkpoint.get("sequence"),
-            "capsule_version": capsule.get("version"),
-            "capsule_crc32": capsule.get("crc32"),
+            "restore_schema_version": 2,
             "teensy": teensy_payload,
             "clocks": None,
             "proof": {
@@ -1958,8 +2039,7 @@ def _recover_monitor_checkpoint(checkpoint: Dict[str, Any]) -> Dict[str, Any]:
         "success": True,
         "mode": "SYSTEM_MONITOR",
         "checkpoint_sequence": checkpoint.get("sequence"),
-        "capsule_version": capsule.get("version"),
-        "capsule_crc32": capsule.get("crc32"),
+        "restore_schema_version": 2,
         "teensy": teensy_response.get("payload")
             if isinstance(teensy_response, dict) else None,
         "clocks": clocks_response.get("payload")
@@ -2432,7 +2512,7 @@ def run() -> None:
         checkpoint = _read_monitor_checkpoint()
         checkpoint_recoverable = bool(
             checkpoint is not None
-            and _monitor_recovery_capsule(checkpoint) is not None
+            and _monitor_restore_state(checkpoint) is not None
             and _monitor_gnss_raw_payload(checkpoint) is not None
         )
         if checkpoint_recoverable:
@@ -2447,7 +2527,7 @@ def run() -> None:
                 )
         else:
             logging.info(
-                "ℹ️ [system/recovery] no recoverable config.MONITOR; "
+                "ℹ️ [system/recovery] no structured-recoverable config.MONITOR; "
                 "starting from live MONITOR_FRAGMENT state"
             )
 
