@@ -70,23 +70,7 @@ void clocks_watchdog_anomaly_payload(const char* reason,
                                      uint32_t detail0,
                                      uint32_t detail1,
                                      uint32_t detail2,
-                                     uint32_t detail3)
-    __attribute__((weak));
-
-__attribute__((weak)) void clocks_watchdog_anomaly_payload(
-    const char* reason,
-    const Payload& payload,
-    uint32_t detail0,
-    uint32_t detail1,
-    uint32_t detail2,
-    uint32_t detail3) {
-  (void)reason;
-  (void)detail0;
-  (void)detail1;
-  (void)detail2;
-  (void)detail3;
-  publish("WATCHDOG_ANOMALY", payload);
-}
+                                     uint32_t detail3);
 
 // ============================================================================
 // Fixed doctrine
