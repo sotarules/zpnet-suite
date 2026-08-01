@@ -1040,7 +1040,12 @@ def _dac_detail_lines(r: dict, baseline: dict | None, report_dac: dict | None,
 
         base_dac = None
         if baseline:
-            base_dac = baseline.get("baseline_dac_mean", {}).get(key)
+            # BASE is the selected campaign's final instantaneous DAC
+            # setpoint.  The DAC Welford mean remains the MEAN column and is
+            # only a compatibility fallback for older baseline records.
+            base_dac = baseline.get("baseline_dac", {}).get(key)
+            if base_dac is None:
+                base_dac = baseline.get("baseline_dac_mean", {}).get(key)
 
         lines.append(
             f"{name:<{W_NAME}}"

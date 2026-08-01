@@ -3559,10 +3559,11 @@ static volatile uint32_t watchdog_anomaly_legacy_publish_count = 0;
 
 // Live servo-mode command handoff.
 //
-// CALIBRATE_OCXO remains the START/RECOVER campaign parameter.  SERVOS is the
-// live operator control surface: foreground command context records the desired
-// mode, and Beta applies it at the next safe PPS campaign boundary before the
-// servo input is selected for that row.
+// SERVOS is the sole operator control surface. Campaign START, STOP, FLASH_CUT,
+// and RECOVER neither author nor clear servo mode. Foreground command context
+// records the desired mode; Beta applies it at a safe completed-row boundary
+// while campaign publication is live, or immediately while the instrument is
+// otherwise idle.
 static volatile bool          request_servo_mode_change = false;
 static volatile servo_mode_t  requested_servo_mode = servo_mode_t::OFF;
 static uint32_t               g_servo_mode_request_count = 0;
@@ -5736,11 +5737,11 @@ static void campaign_start_prologue_abort_launch(const char* reason) {
   request_recover = false;
   request_zero = false;
   flash_cut_clear_pending();
-  request_servo_mode_change = false;
-  requested_servo_mode = servo_mode_t::OFF;
-  calibrate_ocxo_mode = servo_mode_t::OFF;
+
+  // A failed START closes only the requested recording namespace. Servo mode,
+  // controller memory, and queued actuator intent belong to the always-on
+  // instrument and must survive the campaign admission failure.
   clocks_watchdog_clear_surrender_for_new_lifecycle();
-  ocxo_dac_pacing_abort_all();
 }
 
 static bool campaign_start_prologue_should_hold(
@@ -6961,9 +6962,10 @@ static void clocks_force_stop_campaign(void) {
   request_recover = false;
   request_zero = false;
   flash_cut_clear_pending();
-  request_servo_mode_change = false;
-  requested_servo_mode = servo_mode_t::OFF;
-  clocks_apply_servo_mode_now(servo_mode_t::OFF);
+
+  // Continuity surrender stops campaign publication, not the independent servo
+  // control plane. The watchdog gate already prevents suspect rows from feeding
+  // servo math until recovery clears custody.
   campaign_warmup_reset();
 }
 
@@ -6995,8 +6997,10 @@ static bool clocks_watchdog_surrender_now(const char* reason,
   watchdog_campaign_publication_armed = false;
   watchdog_anomaly_active = true;
   watchdog_anomaly_publish_pending = publish_pending && first;
-  ocxo_dac_pacing_abort_all();
 
+  // Campaign continuity failure must not cancel an already-lawful actuator
+  // request. The publication/watchdog gate holds further servo input until the
+  // lifecycle is recovered.
   return first;
 }
 
@@ -8711,13 +8715,11 @@ static FLASHMEM Payload cmd_stop(const Payload&) {
     return p;
   }
 
-  // STOP while no campaign is running is a control-plane abort. It must not
-  // invalidate the installed epoch or defer a destructive stop branch to PPS.
+  // STOP while no campaign is running is a campaign/control-plane abort. It
+  // must not invalidate the installed epoch or alter the independent servo
+  // control plane.
   request_stop = false;
   clocks_watchdog_clear_surrender_for_new_lifecycle();
-  request_servo_mode_change = false;
-  requested_servo_mode = servo_mode_t::OFF;
-  clocks_apply_servo_mode_now(servo_mode_t::OFF);
 
   p.add("status", (had_live_smartzero || had_pending_start || had_pending_zero)
                       ? "smartzero_abort_requested"

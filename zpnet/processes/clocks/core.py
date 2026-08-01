@@ -4592,6 +4592,7 @@ def _baseline_dac_from_report(report: Dict[str, Any]) -> Dict[str, float]:
         v = _first_float(
             _path_get(forensics, f"dac.{key}.value"),
             _path_get(frag, f"dac.{key}.value"),
+            _path_get(frag, f"dac.{key}_dac"),
             frag.get(f"{key}_dac"),
             report.get(f"{key}_dac"),
         )
