@@ -2580,9 +2580,6 @@ void system_enter_quiescence(void) {
 static FLASHMEM Payload cmd_report(const Payload& /*args*/) {
   Payload p;
 
-  // Firmware identity
-  p.add("fw_version", FW_VERSION);
-
   // CrashReport presence only.  This is intentionally non-destructive: the
   // full printable CrashReport is captured by explicit SYSTEM.CRASH_INFO.
   p.add("crash_report_present", (bool)CrashReport);
@@ -3340,7 +3337,6 @@ static FLASHMEM Payload cmd_payload_info(const Payload& /*args*/) {
 static Payload system_monitor_teensy_payload(void) {
   Payload p;
   p.add("health_state", "NOMINAL");
-  p.add("fw_version", FW_VERSION);
   p.add("cpu_freq_mhz", (uint32_t)(F_CPU_ACTUAL / 1000000UL));
   p.add("crash_report_present", (bool)CrashReport);
   p.add("feature_status_foreground_court_ok",

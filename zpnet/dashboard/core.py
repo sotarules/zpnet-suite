@@ -101,9 +101,6 @@ def header_readout(prefix: str = "") -> list[str]:
     remaining_pct = battery.get("remaining_pct")
     batt_str = f"{remaining_pct:.1f}%" if isinstance(remaining_pct, (int, float)) else "N/A"
 
-    teensy = system.get("teensy", {}) if isinstance(system.get("teensy"), dict) else {}
-    fw = teensy.get("fw_version", "---")
-
     return [
         f"{prefix}NET: {net_state}  BAT: {batt_str}  SYS: {overall}",
         "",
@@ -122,7 +119,6 @@ from zpnet.dashboard.readout_blocks import (
     gnss_report_readout,
     feature_status_readout,
     environment_status_readout,
-    sensor_scan_readout,
     battery_status_readout,
     power_status_readout,
     network_status_readout,
@@ -142,7 +138,6 @@ READOUTS: list[Callable[[], Readout]] = [
     gnss_report_readout,
     feature_status_readout,
     environment_status_readout,
-    sensor_scan_readout,
     battery_status_readout,
     power_status_readout,
     network_status_readout,

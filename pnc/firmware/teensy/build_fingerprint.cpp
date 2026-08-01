@@ -26,7 +26,6 @@ const char ZPNET_BUILD_FINGERPRINT[] =
   "ZPNET_BUILD{"
   "TRANSPORT=SERIAL;"
   "USB=CDC;"
-  "FW_VERSION=" FW_VERSION_STR ";"
   "}";
 
 } // extern "C"

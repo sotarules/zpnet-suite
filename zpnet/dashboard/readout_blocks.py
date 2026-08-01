@@ -413,20 +413,6 @@ def feature_status_readout() -> Generator[str, None, None]:
         yield f"{left:<21}{right}"
 
 
-def sensor_scan_readout() -> Generator[str, None, None]:
-    sensors = _dict(get_system_snapshot().get("sensors"))
-    yield f"SENSOR SCAN: {sensors.get('health_state', 'UNKNOWN')}"
-    found = False
-    for bus_name, devices in sensors.items():
-        if not str(bus_name).startswith("i2c-") or not isinstance(devices, dict):
-            continue
-        for address, state in devices.items():
-            found = True
-            yield f"{str(bus_name).upper():<7}{str(address).upper():<7}{str(state).upper()}"
-    if not found:
-        yield "NO SENSOR INVENTORY"
-
-
 def environment_status_readout() -> Generator[str, None, None]:
     env = _dict(get_system_snapshot().get("environment"))
     yield f"ENVIRONMENT: {env.get('health_state', 'UNKNOWN')}"
@@ -496,7 +482,6 @@ def teensy_status_readout() -> Generator[str, None, None]:
     usage_milli = _to_float(teensy.get("cpu_usage_pct_milli"))
     idle_milli = _to_float(teensy.get("cpu_idle_spin_pct_milli"))
     yield f"TEENSY STATUS: {teensy.get('health_state', 'UNKNOWN')}"
-    yield f"FW VERSION: {teensy.get('fw_version', '---')}"
     yield f"CPU: {_integer(teensy.get('cpu_freq_mhz'))} MHZ"
     yield f"WORK: {'---' if usage_milli is None else f'{usage_milli/1000.0:.3f}%'}  IDLE: {'---' if idle_milli is None else f'{idle_milli/1000.0:.3f}%'}"
     yield f"WALL CYCLES: {_integer(teensy.get('cpu_wall_cycles'), True)}"
