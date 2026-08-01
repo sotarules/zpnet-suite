@@ -185,6 +185,14 @@ static uint32_t g_row_objection_consumed_count = 0U;
 static uint32_t g_row_objection_last_public_count = 0U;
 static clocks_row_objection_record_t g_row_objection_last DMAMEM = {};
 
+// A rejected endpoint participates in two adjacent intervals.  When Alpha
+// excludes PPS X for a cycle/interval excursion, this one-shot holds PPS
+// X+1 out of science so no accumulator or servo consumes an interval whose
+// opening endpoint was already rejected.  TIMEBASE still persists the row.
+static volatile uint32_t g_row_antecedent_hold_target_pps = 0U;
+static volatile uint32_t g_row_antecedent_hold_source_pps = 0U;
+static volatile uint32_t g_row_antecedent_hold_lane_mask = 0U;
+
 // One-shot diagnostic injection. The command surface is intentionally open-ended
 // (type=...), but only type=excursion is implemented initially. Alpha consumes
 // an armed injection through the ordinary pre-statistics eligibility query, so
@@ -196,6 +204,97 @@ static volatile uint32_t g_problem_injection_lane = CLOCKS_ROW_LANE_OCXO1;
 static volatile uint32_t g_problem_injection_cycles = 1000U;
 static volatile uint32_t g_problem_injection_arm_count = 0U;
 static volatile uint32_t g_problem_injection_fire_count = 0U;
+
+static bool clocks_row_objection_requires_antecedent_hold(
+    clocks_row_objection_reason_t reason) {
+  return reason == clocks_row_objection_reason_t::ALPHA_CYCLE_EXCURSION ||
+      reason ==
+          clocks_row_objection_reason_t::ALPHA_CYCLE_INTERVAL_IMPLAUSIBLE;
+}
+
+static void clocks_row_antecedent_hold_arm(
+    clocks_row_objection_reason_t reason,
+    uint32_t lane_mask,
+    uint32_t source_pps) {
+  if (!clocks_row_objection_requires_antecedent_hold(reason) ||
+      source_pps == 0U) {
+    return;
+  }
+
+  const uint32_t target_pps = source_pps + 1U;
+  const uint32_t existing_target =
+      __atomic_load_n(&g_row_antecedent_hold_target_pps,
+                      __ATOMIC_ACQUIRE);
+  if (existing_target == target_pps) {
+    (void)__atomic_or_fetch(&g_row_antecedent_hold_lane_mask,
+                            lane_mask,
+                            __ATOMIC_RELAXED);
+    return;
+  }
+
+  __atomic_store_n(&g_row_antecedent_hold_source_pps,
+                   source_pps,
+                   __ATOMIC_RELAXED);
+  __atomic_store_n(&g_row_antecedent_hold_lane_mask,
+                   lane_mask,
+                   __ATOMIC_RELAXED);
+  __atomic_store_n(&g_row_antecedent_hold_target_pps,
+                   target_pps,
+                   __ATOMIC_RELEASE);
+}
+
+static void clocks_row_antecedent_hold_apply(uint32_t pps_sequence) {
+  if (pps_sequence == 0U) return;
+
+  const uint32_t target_pps =
+      __atomic_load_n(&g_row_antecedent_hold_target_pps,
+                      __ATOMIC_ACQUIRE);
+  if (target_pps == 0U) return;
+
+  if (pps_sequence == target_pps) {
+    uint32_t expected = target_pps;
+    if (!__atomic_compare_exchange_n(&g_row_antecedent_hold_target_pps,
+                                     &expected,
+                                     0U,
+                                     false,
+                                     __ATOMIC_ACQ_REL,
+                                     __ATOMIC_ACQUIRE)) {
+      return;
+    }
+
+    const uint32_t source_pps =
+        __atomic_load_n(&g_row_antecedent_hold_source_pps,
+                        __ATOMIC_RELAXED);
+    uint32_t lane_mask =
+        __atomic_load_n(&g_row_antecedent_hold_lane_mask,
+                        __ATOMIC_RELAXED);
+    if (lane_mask == 0U) {
+      lane_mask = CLOCKS_ROW_LANE_PPS | CLOCKS_ROW_LANE_VCLOCK |
+          CLOCKS_ROW_LANE_OCXO1 | CLOCKS_ROW_LANE_OCXO2;
+    }
+    clocks_row_exclude(
+        clocks_row_objection_source_t::BETA,
+        clocks_row_objection_reason_t::BETA_ANTECEDENT_SCIENCE_HOLD,
+        lane_mask,
+        pps_sequence,
+        source_pps,
+        0U,
+        0U);
+    return;
+  }
+
+  // If publication jumped over the one adjacent identity, the suspect
+  // interval was never presented and the one-shot no longer applies.
+  if ((int32_t)(pps_sequence - target_pps) > 0) {
+    uint32_t expected = target_pps;
+    (void)__atomic_compare_exchange_n(&g_row_antecedent_hold_target_pps,
+                                      &expected,
+                                      0U,
+                                      false,
+                                      __ATOMIC_ACQ_REL,
+                                      __ATOMIC_ACQUIRE);
+  }
+}
 
 static const char* clocks_row_objection_source_name(
     clocks_row_objection_source_t source) {
@@ -214,6 +313,8 @@ static const char* clocks_row_objection_reason_name(
       return "beta_ocxo_science_custody";
     case clocks_row_objection_reason_t::BETA_RECOVERY_SCIENCE_HOLD:
       return "beta_recovery_science_hold";
+    case clocks_row_objection_reason_t::BETA_ANTECEDENT_SCIENCE_HOLD:
+      return "beta_antecedent_science_hold";
     case clocks_row_objection_reason_t::ALPHA_COUNTERLEDGER_INTERVAL:
       return "alpha_counterledger_interval";
     case clocks_row_objection_reason_t::ALPHA_BRIDGE_NONMONOTONIC:
@@ -285,6 +386,18 @@ static void clocks_row_objection_format_reason(
     return;
   }
 
+  if (objection.reason ==
+      clocks_row_objection_reason_t::BETA_ANTECEDENT_SCIENCE_HOLD) {
+    snprintf(out, out_size,
+             "PPS %lu antecedent science hold: prior PPS %lu had a rejected "
+             "endpoint in lanes=0x%02lX; persisted for audit and excluded "
+             "from science/control",
+             (unsigned long)objection.detail0,
+             (unsigned long)objection.detail1,
+             (unsigned long)objection.lane_mask);
+    return;
+  }
+
   snprintf(out, out_size,
            "%s: lane=0x%08lX detail0=%lu detail1=%lu detail2=%lu detail3=%lu; "
            "excluded from Welford/TAU/PPB/servo",
@@ -304,6 +417,8 @@ void clocks_row_exclude(clocks_row_objection_source_t source,
                         uint32_t detail2,
                         uint32_t detail3) {
   if (reason == clocks_row_objection_reason_t::NONE) return;
+
+  clocks_row_antecedent_hold_arm(reason, lane, detail0);
 
   uint32_t expected = 0U;
   if (!__atomic_compare_exchange_n(&g_row_objection_latch_state,
@@ -346,6 +461,8 @@ void clocks_row_exclude(clocks_row_objection_source_t source,
 }
 
 bool clocks_row_science_eligible(uint32_t pps_sequence) {
+  clocks_row_antecedent_hold_apply(pps_sequence);
+
   uint32_t armed = 2U;
   if (__atomic_compare_exchange_n(&g_problem_injection_armed,
                                   &armed,
@@ -3216,9 +3333,11 @@ static uint64_t campaign_public_dwt_total(void) {
                                      g_campaign_public_dwt_offset);
 }
 
-static uint64_t campaign_public_gnss_ns(void) {
-  return campaign_public_from_offset(current_raw_gnss_ns(),
-                                     g_campaign_public_gnss_offset);
+static uint64_t campaign_public_gnss_ns(uint32_t public_count) {
+  // Campaign GNSS is an identity surface, not a recovered projection.
+  // Rendering it directly from the public PPS identity prevents a warm
+  // RECOVER splice from inheriting an ambient raw-ledger phase of +1 second.
+  return (uint64_t)public_count * CLOCKS_BETA_NS_PER_SECOND;
 }
 
 static uint64_t campaign_public_ocxo1_ns(void) {
@@ -7564,7 +7683,7 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
   campaign_record_stage(CAMPAIGN_RECORD_STAGE_PER_SECOND);
 
   const uint32_t public_count = (uint32_t)campaign_seconds;
-  const uint64_t public_gnss_ns = campaign_public_gnss_ns();
+  const uint64_t public_gnss_ns = campaign_public_gnss_ns(public_count);
   const uint64_t public_dwt_total = campaign_public_dwt_total();
 
   // RECOVER public presentation must be aligned before any shadow ledger,

@@ -16,6 +16,7 @@ import json
 import math
 import sys
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, Optional, Sequence, Tuple
 
@@ -26,6 +27,7 @@ DWT_EXPECTED_PER_PPS = 1_008_000_000
 DEFAULT_BATCH_SIZE = 8
 DEFAULT_PAUSE_MS = 50
 MAX_EXAMPLES = 12
+OCXO_SCIENCE_OUTLIER_NS = 50
 OCXO_SECOND_WARN_NS = 500
 OCXO_SECOND_ALARM_NS = 10_000
 PPB_ABSOLUTE_ALARM = 10_000.0
@@ -168,13 +170,20 @@ class RunningStats:
     min_value: float = math.inf
     max_value: float = -math.inf
 
-    def update(self, value: float) -> None:
+    min_pps: Optional[int] = None
+    max_pps: Optional[int] = None
+
+    def update(self, value: float, pps: Optional[int] = None) -> None:
         self.n += 1
         delta = value - self.mean
         self.mean += delta / self.n
         self.m2 += delta * (value - self.mean)
-        self.min_value = min(self.min_value, value)
-        self.max_value = max(self.max_value, value)
+        if value < self.min_value:
+            self.min_value = value
+            self.min_pps = pps
+        if value > self.max_value:
+            self.max_value = value
+            self.max_pps = pps
 
     @property
     def stddev(self) -> float:
@@ -186,7 +195,8 @@ class RunningStats:
         return (
             f"n={self.n:,} mean={self.mean:+.{digits}f} "
             f"sd={self.stddev:.{digits}f} "
-            f"min={self.min_value:+.{digits}f} max={self.max_value:+.{digits}f}"
+            f"min={self.min_value:+.{digits}f}@{self.min_pps} "
+            f"max={self.max_value:+.{digits}f}@{self.max_pps}"
         )
 
 
@@ -247,16 +257,25 @@ class Audit:
     timeline_errors: int = 0
     gnss_identity_errors: int = 0
     gnss_adjacent_errors: int = 0
+    gnss_identity_offsets_ns: Counter[int] = field(default_factory=Counter)
     dwt_nonmonotonic: int = 0
     ocxo1_interval_alarms: int = 0
     ocxo2_interval_alarms: int = 0
+    ocxo1_science_outliers: int = 0
+    ocxo2_science_outliers: int = 0
+    divergence_science_outliers: int = 0
     ocxo1_ledger_errors: int = 0
     ocxo2_ledger_errors: int = 0
     ppb_alarms: int = 0
     ppb_steps: int = 0
     welford_regressions: int = 0
     welford_hold_changes: int = 0
+    science_event_rows: int = 0
+    last_science_event_pps: Optional[int] = None
     examples: Dict[str, list[str]] = field(default_factory=dict)
+    missing_identities: int = 0
+    recovery_missing_identities: int = 0
+    unclassified_missing_identities: int = 0
     stats: Dict[str, RunningStats] = field(default_factory=lambda: {
         "dwt_delta": RunningStats(),
         "ocxo1_interval": RunningStats(),
@@ -275,6 +294,12 @@ class Audit:
         bucket = self.examples.setdefault(kind, [])
         if len(bucket) < MAX_EXAMPLES:
             bucket.append(message)
+
+    def note_science_event(self, pps: int) -> None:
+        """Count one anomalous PPS once even when several courts fire."""
+        if self.last_science_event_pps != pps:
+            self.science_event_rows += 1
+            self.last_science_event_pps = pps
 
 
 def _assert_campaign_indexed(cur: Any, campaign: str) -> None:
@@ -467,9 +492,15 @@ def update(audit: Audit, prev: Optional[CompactRow], cur: CompactRow) -> None:
     audit.last_ts = cur.ts
     audit.final_row = cur
 
-    if cur.gnss_ns is not None and cur.gnss_ns != cur.pps * NS_PER_SECOND:
-        audit.gnss_identity_errors += 1
-        audit.note("GNSS identity", f"pps={cur.pps} gnss={cur.gnss_ns}")
+    if cur.gnss_ns is not None:
+        identity_offset = cur.gnss_ns - cur.pps * NS_PER_SECOND
+        audit.gnss_identity_offsets_ns[identity_offset] += 1
+        if identity_offset != 0:
+            audit.gnss_identity_errors += 1
+            audit.note(
+                "GNSS identity",
+                f"pps={cur.pps} gnss={cur.gnss_ns} offset_ns={identity_offset:+d}",
+            )
 
     for key, value in (
         ("dwt_ppb", cur.dwt_ppb),
@@ -478,9 +509,10 @@ def update(audit: Audit, prev: Optional[CompactRow], cur: CompactRow) -> None:
         ("ocxo2_ppb", cur.ocxo2_ppb),
     ):
         if value is not None and cur.science_eligible:
-            audit.stats[key].update(value)
+            audit.stats[key].update(value, cur.pps)
             if abs(value) > PPB_ABSOLUTE_ALARM:
                 audit.ppb_alarms += 1
+                audit.note_science_event(cur.pps)
                 audit.note("PPB absolute", f"pps={cur.pps} {key}={value:+.3f}")
 
     for lane, interval, residual, valid in (
@@ -488,17 +520,38 @@ def update(audit: Audit, prev: Optional[CompactRow], cur: CompactRow) -> None:
         ("ocxo2", cur.ocxo2_interval_ns, cur.ocxo2_residual_ns, cur.ocxo2_valid),
     ):
         if interval is not None and valid is True and cur.science_eligible:
-            audit.stats[f"{lane}_interval"].update(float(interval))
+            audit.stats[f"{lane}_interval"].update(float(interval), cur.pps)
             deviation = interval - NS_PER_SECOND
             if abs(deviation) > OCXO_SECOND_ALARM_NS:
                 setattr(audit, f"{lane}_interval_alarms",
                         getattr(audit, f"{lane}_interval_alarms") + 1)
+                audit.note_science_event(cur.pps)
                 audit.note(
                     f"{lane.upper()} interval",
                     f"pps={cur.pps} interval={interval} deviation={deviation:+d} valid={valid}",
                 )
         if residual is not None and valid is True and cur.science_eligible:
-            audit.stats[f"{lane}_residual"].update(float(residual))
+            audit.stats[f"{lane}_residual"].update(float(residual), cur.pps)
+
+        if interval is not None and valid is True and cur.science_eligible:
+            deviation = interval - NS_PER_SECOND
+            if abs(deviation) > OCXO_SCIENCE_OUTLIER_NS:
+                attr = f"{lane}_science_outliers"
+                setattr(audit, attr, getattr(audit, attr) + 1)
+                audit.note_science_event(cur.pps)
+                previous_context = (
+                    "none"
+                    if prev is None
+                    else (
+                        f"pps={prev.pps} eligible={prev.science_eligible} "
+                        f"excluded={prev.science_excluded} valid={getattr(prev, f'{lane}_valid')}"
+                    )
+                )
+                audit.note(
+                    f"Admitted {lane.upper()} interval outlier",
+                    f"pps={cur.pps} interval={interval} deviation={deviation:+d} "
+                    f"residual={residual} previous=[{previous_context}]",
+                )
 
     if (
         cur.ocxo1_residual_ns is not None
@@ -507,9 +560,17 @@ def update(audit: Audit, prev: Optional[CompactRow], cur: CompactRow) -> None:
         and cur.ocxo2_valid is True
         and cur.science_eligible
     ):
-        audit.stats["ocxo_divergence"].update(
-            float(cur.ocxo1_residual_ns - cur.ocxo2_residual_ns)
-        )
+        divergence = cur.ocxo1_residual_ns - cur.ocxo2_residual_ns
+        audit.stats["ocxo_divergence"].update(float(divergence), cur.pps)
+        if abs(divergence) > OCXO_SCIENCE_OUTLIER_NS:
+            audit.divergence_science_outliers += 1
+            audit.note_science_event(cur.pps)
+            audit.note(
+                "Admitted OCXO divergence outlier",
+                f"pps={cur.pps} divergence={divergence:+d} "
+                f"ocxo1_residual={cur.ocxo1_residual_ns:+d} "
+                f"ocxo2_residual={cur.ocxo2_residual_ns:+d}",
+            )
 
     if prev is None:
         return
@@ -522,12 +583,22 @@ def update(audit: Audit, prev: Optional[CompactRow], cur: CompactRow) -> None:
         audit.regressions += 1
         audit.note("PPS regression", f"{prev.pps}->{cur.pps}")
     elif delta_pps > 1:
+        missing = delta_pps - 1
         audit.gaps += 1
+        audit.missing_identities += missing
         if cur.recovery_evidence:
             audit.recovery_gaps += 1
+            audit.recovery_missing_identities += missing
+            audit.note(
+                "Recovery gap",
+                f"{prev.pps}->{cur.pps} missing={missing} "
+                f"timeline_ready={cur.timeline_ready} clockface_ready={cur.clockface_ready} "
+                f"science_ready={cur.science_ready}",
+            )
         else:
             audit.unclassified_gaps += 1
-            audit.note("Unclassified gap", f"{prev.pps}->{cur.pps}")
+            audit.unclassified_missing_identities += missing
+            audit.note("Unclassified gap", f"{prev.pps}->{cur.pps} missing={missing}")
 
     if delta_pps != 1:
         return
@@ -543,9 +614,10 @@ def update(audit: Audit, prev: Optional[CompactRow], cur: CompactRow) -> None:
     if prev.dwt_cycles is not None and cur.dwt_cycles is not None:
         dwt_delta = cur.dwt_cycles - prev.dwt_cycles
         if prev.science_eligible and cur.science_eligible:
-            audit.stats["dwt_delta"].update(float(dwt_delta))
+            audit.stats["dwt_delta"].update(float(dwt_delta), cur.pps)
         if dwt_delta <= 0:
             audit.dwt_nonmonotonic += 1
+            audit.note_science_event(cur.pps)
             audit.note("DWT nonmonotonic", f"pps={cur.pps} delta={dwt_delta}")
 
     for lane in ("ocxo1", "ocxo2"):
@@ -563,6 +635,7 @@ def update(audit: Audit, prev: Optional[CompactRow], cur: CompactRow) -> None:
             ):
                 setattr(audit, f"{lane}_ledger_errors",
                         getattr(audit, f"{lane}_ledger_errors") + 1)
+                audit.note_science_event(cur.pps)
                 audit.note(
                     f"{lane.upper()} ledger",
                     f"pps={cur.pps} ledger_delta={cur_ns - prev_ns} interval={interval} error={error:+d}",
@@ -575,9 +648,11 @@ def update(audit: Audit, prev: Optional[CompactRow], cur: CompactRow) -> None:
             continue
         if cn < pn:
             audit.welford_regressions += 1
+            audit.note_science_event(cur.pps)
             audit.note("Welford regression", f"pps={cur.pps} {lane} {pn}->{cn}")
         if cur.science_excluded and cn != pn:
             audit.welford_hold_changes += 1
+            audit.note_science_event(cur.pps)
             audit.note("Welford changed while science excluded",
                        f"pps={cur.pps} {lane} {pn}->{cn}")
 
@@ -592,6 +667,7 @@ def update(audit: Audit, prev: Optional[CompactRow], cur: CompactRow) -> None:
             and abs(cv - pv) > PPB_STEP_ALARM
         ):
             audit.ppb_steps += 1
+            audit.note_science_event(cur.pps)
             audit.note("PPB step", f"pps={cur.pps} {lane} {pv:+.3f}->{cv:+.3f}")
 
 
@@ -616,9 +692,12 @@ def print_report(audit: Audit, batch_size: int, pause_ms: int) -> None:
     print(f"  Science rows:      {audit.science_rows:,}")
     print(f"  Science excluded:  {audit.science_excluded_rows:,}")
     print(f"  Expected rows:     {audit.expected_rows:,}")
-    print(f"  Missing identities:{audit.expected_rows - audit.rows:>10,d}")
-    print(f"  Recovery gaps:     {audit.recovery_gaps:,}")
-    print(f"  Unclassified gaps: {audit.unclassified_gaps:,}")
+    computed_missing = audit.expected_rows - audit.rows
+    print(f"  Missing identities:{computed_missing:>10,d}")
+    print(f"    Recovery-classified:   {audit.recovery_missing_identities:>10,d}")
+    print(f"    Unclassified:          {audit.unclassified_missing_identities:>10,d}")
+    print(f"  Recovery gap ranges:     {audit.recovery_gaps:,}")
+    print(f"  Unclassified gap ranges: {audit.unclassified_gaps:,}")
     print(f"  Repeats/regress:   {audit.repeats:,}/{audit.regressions:,}")
     print(f"  Final servo mode:  {final.servo_mode}")
     print(f"  Location:          {final.location}")
@@ -646,6 +725,9 @@ def print_report(audit: Audit, batch_size: int, pause_ms: int) -> None:
         ("DWT non-monotonic", audit.dwt_nonmonotonic),
         ("OCXO1 interval alarms", audit.ocxo1_interval_alarms),
         ("OCXO2 interval alarms", audit.ocxo2_interval_alarms),
+        ("OCXO1 admitted outliers", audit.ocxo1_science_outliers),
+        ("OCXO2 admitted outliers", audit.ocxo2_science_outliers),
+        ("OCXO divergence outliers", audit.divergence_science_outliers),
         ("OCXO1 ledger errors", audit.ocxo1_ledger_errors),
         ("OCXO2 ledger errors", audit.ocxo2_ledger_errors),
         ("PPB absolute alarms", audit.ppb_alarms),
@@ -657,6 +739,30 @@ def print_report(audit: Audit, batch_size: int, pause_ms: int) -> None:
     for label, count in courts:
         total += count
         print(f"  {label:<28s} {count:,}")
+    print(f"  {'Unique science-event PPS':<28s} {audit.science_event_rows:,}")
+
+    print("\nGNSS IDENTITY DIAGNOSIS")
+    if audit.gnss_identity_offsets_ns:
+        ranked_offsets = audit.gnss_identity_offsets_ns.most_common(5)
+        for offset_ns, count in ranked_offsets:
+            seconds = offset_ns / NS_PER_SECOND
+            print(
+                f"  offset={offset_ns:+d} ns ({seconds:+.9f} s) rows={count:,}"
+            )
+        nonzero = [(offset, count) for offset, count in ranked_offsets if offset != 0]
+        if audit.gnss_identity_errors and len(nonzero) == 1:
+            offset, count = nonzero[0]
+            if count == audit.gnss_identity_errors:
+                print(
+                    "  Classification: systematic fixed identity offset; "
+                    "GNSS adjacency may remain lawful even though the PPS/GNSS contract disagrees."
+                )
+        elif audit.gnss_identity_errors:
+            print("  Classification: mixed identity offsets; inspect bounded examples.")
+        else:
+            print("  Classification: identity contract clean.")
+    else:
+        print("  No GNSS identity data")
 
     if audit.examples:
         print("\nBOUNDED EXAMPLES")
@@ -678,18 +784,93 @@ def print_report(audit: Audit, batch_size: int, pause_ms: int) -> None:
     else:
         print("  Forensics: no data")
 
-    print()
-    if total or audit.unclassified_gaps or audit.repeats or audit.regressions:
-        print("VERDICT: ANOMALIES FOUND IN ADMITTED SCIENCE OR TIMELINE")
-    elif audit.recovery_gaps or audit.science_excluded_rows:
-        details = []
-        if audit.recovery_gaps:
-            details.append(f"{audit.recovery_gaps} RECOVERY GAP(S)")
-        if audit.science_excluded_rows:
-            details.append(f"{audit.science_excluded_rows} QUARANTINED ROW(S)")
-        print(f"VERDICT: SCIENCE CLEAN WITH {' AND '.join(details)}")
+    print("\nVERDICTS")
+    science_anomalies = sum((
+        audit.dwt_nonmonotonic,
+        audit.ocxo1_interval_alarms,
+        audit.ocxo2_interval_alarms,
+        audit.ocxo1_science_outliers,
+        audit.ocxo2_science_outliers,
+        audit.divergence_science_outliers,
+        audit.ocxo1_ledger_errors,
+        audit.ocxo2_ledger_errors,
+        audit.ppb_alarms,
+        audit.ppb_steps,
+        audit.welford_regressions,
+        audit.welford_hold_changes,
+    ))
+    timeline_anomalies = sum((
+        audit.gnss_identity_errors,
+        audit.gnss_adjacent_errors,
+        audit.repeats,
+        audit.regressions,
+        audit.unclassified_gaps,
+    ))
+
+    if science_anomalies:
+        print(
+            "  SCIENCE:    ANOMALIES IN ADMITTED SCIENCE "
+            f"({audit.science_event_rows:,} unique PPS event(s), "
+            f"{science_anomalies:,} court finding(s))"
+        )
     else:
-        print("VERDICT: CLEAN")
+        print("  SCIENCE:    CLEAN")
+
+    if timeline_anomalies:
+        fixed_nonzero = [
+            (offset, count)
+            for offset, count in audit.gnss_identity_offsets_ns.items()
+            if offset != 0
+        ]
+        systematic_identity = (
+            audit.gnss_identity_errors > 0
+            and len(fixed_nonzero) == 1
+            and fixed_nonzero[0][1] == audit.gnss_identity_errors
+            and audit.gnss_adjacent_errors == 0
+            and audit.repeats == 0
+            and audit.regressions == 0
+            and audit.unclassified_gaps == 0
+        )
+        if systematic_identity:
+            offset, _ = fixed_nonzero[0]
+            print(
+                "  TIMELINE:   SYSTEMATIC GNSS IDENTITY CONTRACT OFFSET "
+                f"({offset:+d} ns); adjacency and ordering remain clean"
+            )
+        else:
+            print(f"  TIMELINE:   ANOMALIES ({timeline_anomalies:,} court finding(s))")
+    else:
+        print("  TIMELINE:   CLEAN")
+
+    if audit.unclassified_missing_identities:
+        print(
+            "  CONTINUITY: UNEXPLAINED LOSS "
+            f"({audit.unclassified_missing_identities:,} missing identity/identities)"
+        )
+    elif audit.recovery_missing_identities:
+        print(
+            "  CONTINUITY: ALL MISSING IDENTITIES CLASSIFIED AS RECOVERY DOWNTIME "
+            f"({audit.recovery_missing_identities:,} across {audit.recovery_gaps} range(s))"
+        )
+    else:
+        print("  CONTINUITY: COMPLETE")
+
+    if audit.science_excluded_rows:
+        print(
+            "  QUARANTINE: ACTIVE AND EFFECTIVE "
+            f"({audit.science_excluded_rows:,} row(s) retained for audit and excluded)"
+        )
+    else:
+        print("  QUARANTINE: NO EXCLUSIONS")
+
+    if science_anomalies:
+        print("  OVERALL:    SCIENCE INVESTIGATION REQUIRED")
+    elif timeline_anomalies:
+        print("  OVERALL:    SCIENCE CLEAN; TIMELINE CONTRACT REQUIRES RECONCILIATION")
+    elif audit.recovery_missing_identities or audit.science_excluded_rows:
+        print("  OVERALL:    SCIENCE CLEAN WITH TRUTHFUL RECOVERY/QUARANTINE EVENTS")
+    else:
+        print("  OVERALL:    CLEAN")
 
 
 def list_campaigns() -> None:

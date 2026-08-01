@@ -144,6 +144,7 @@ enum class clocks_row_objection_reason_t : uint16_t {
   NONE                                = 0,
   BETA_OCXO_SCIENCE_CUSTODY           = 100,
   BETA_RECOVERY_SCIENCE_HOLD           = 101,
+  BETA_ANTECEDENT_SCIENCE_HOLD         = 102,
   ALPHA_COUNTERLEDGER_INTERVAL        = 300,
   ALPHA_BRIDGE_NONMONOTONIC           = 301,
   ALPHA_OCXO_PROJECTION_WINDOW        = 302,
