@@ -271,6 +271,17 @@ _LATEST_MONITOR_RECEIVED_MONOTONIC: Optional[float] = None
 _MONITOR_CHECKPOINT_QUEUE: queue.Queue[Dict[str, Any]] = queue.Queue(maxsize=1)
 _MONITOR_CHECKPOINT_WRITER_STARTED = threading.Event()
 
+# Compact cross-process startup barrier consumed by Pi CLOCKS before campaign
+# recovery.  This is lifecycle narration only; the durable MONITOR checkpoint
+# and the fresh-MONITOR proof remain the actual recovery authorities.
+_MONITOR_RECOVERY_STATUS: Dict[str, Any] = {
+    "state": "STARTING",
+    "detail": "SYSTEM process starting",
+    "checkpoint_sequence": None,
+    "started_at_utc": None,
+    "completed_at_utc": None,
+}
+
 # ------------------------------------------------------------------
 # Feature status clearing house
 # ------------------------------------------------------------------
@@ -1723,6 +1734,30 @@ def _queue_monitor_checkpoint(monitor: Dict[str, Any]) -> None:
         pass
 
 
+def _set_monitor_recovery_status(
+    state: str,
+    detail: str,
+    *,
+    checkpoint_sequence: Any = None,
+) -> None:
+    """Publish a compact startup-recovery phase for dependent Pi processes."""
+    now_utc = datetime.datetime.now(datetime.timezone.utc) \
+        .isoformat() \
+        .replace("+00:00", "Z")
+    with _SYSTEM_LOCK:
+        _MONITOR_RECOVERY_STATUS["state"] = str(state).strip().upper()
+        _MONITOR_RECOVERY_STATUS["detail"] = str(detail)
+        _MONITOR_RECOVERY_STATUS["checkpoint_sequence"] = checkpoint_sequence
+        if _MONITOR_RECOVERY_STATUS.get("started_at_utc") is None:
+            _MONITOR_RECOVERY_STATUS["started_at_utc"] = now_utc
+        _MONITOR_RECOVERY_STATUS["completed_at_utc"] = (
+            now_utc
+            if _MONITOR_RECOVERY_STATUS["state"]
+            in {"COMPLETE", "NO_CHECKPOINT", "FAILED"}
+            else None
+        )
+
+
 def _monitor_checkpoint_writer_loop() -> None:
     """Persist latest-state MONITOR checkpoints after boot recovery completes."""
     _MONITOR_CHECKPOINT_WRITER_STARTED.set()
@@ -2425,6 +2460,7 @@ def cmd_report(_: Optional[dict]) -> Dict:
     """Return the most recent SYSTEM snapshot."""
     with _SYSTEM_LOCK:
         snapshot = dict(SYSTEM)
+        snapshot["monitor_recovery"] = copy.deepcopy(_MONITOR_RECOVERY_STATUS)
     return {
         "success": True,
         "message": "OK",
@@ -2576,6 +2612,10 @@ def run() -> None:
             blocking=False,
         )
 
+        _set_monitor_recovery_status(
+            "QUIET_DELAY",
+            "waiting for pubsub routing and Teensy initialization",
+        )
         startup_teensy_quiet_delay()
 
         # SYSTEM always restores the latest recoverable MONITOR, independent of
@@ -2592,14 +2632,35 @@ def run() -> None:
         if checkpoint_recoverable:
             try:
                 assert checkpoint is not None
+                _set_monitor_recovery_status(
+                    "RESTORING",
+                    "restoring always-on MONITOR state and awaiting fresh proof",
+                    checkpoint_sequence=checkpoint.get("sequence"),
+                )
                 _recover_monitor_checkpoint(checkpoint)
+                _set_monitor_recovery_status(
+                    "COMPLETE",
+                    "fresh MONITOR proved restored clockfaces and statistics",
+                    checkpoint_sequence=checkpoint.get("sequence"),
+                )
             except Exception:
                 checkpoint_writer_allowed = False
+                _set_monitor_recovery_status(
+                    "FAILED",
+                    "MONITOR restore failed; durable checkpoint preserved",
+                    checkpoint_sequence=(
+                        checkpoint.get("sequence") if checkpoint else None
+                    ),
+                )
                 logging.exception(
                     "💥 [system/recovery] MONITOR restore failed; preserving "
                     "config.MONITOR and continuing with the seeded last-known state"
                 )
         else:
+            _set_monitor_recovery_status(
+                "NO_CHECKPOINT",
+                "no structured-recoverable MONITOR checkpoint; using live state",
+            )
             logging.info(
                 "ℹ️ [system/recovery] no structured-recoverable config.MONITOR; "
                 "starting from live MONITOR_FRAGMENT state"

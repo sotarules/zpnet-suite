@@ -238,6 +238,9 @@ PREFLIGHT_QUIET_GRACE_S = 15.0
 PREFLIGHT_STATUS_LOG_INTERVAL_S = 30.0
 PREFLIGHT_LOG_PREFIX = "🛡️ [preflight]"
 STARTUP_TEENSY_QUIET_DELAY_S = 20.0
+SYSTEM_MONITOR_RECOVERY_WAIT_TIMEOUT_S = 120.0
+SYSTEM_MONITOR_RECOVERY_POLL_S = 1.0
+SYSTEM_MONITOR_RECOVERY_LOG_INTERVAL_S = 10.0
 TIMEBASE_SILENCE_TIMEOUT_S = 30.0
 TIMEBASE_SILENCE_MONITOR_POLL_S = 1.0
 TEENSY_HEALTH_RETRY_S = 60.0
@@ -6436,6 +6439,73 @@ def cmd_resume(args: Optional[dict]) -> dict:
 # Recovery — v4 Nanosecond Architecture
 # ---------------------------------------------------------------------
 
+def _wait_for_system_monitor_recovery() -> None:
+    """Hold boot campaign recovery until SYSTEM finishes MONITOR restoration."""
+    terminal_success = {"COMPLETE", "NO_CHECKPOINT"}
+    deadline = time.monotonic() + SYSTEM_MONITOR_RECOVERY_WAIT_TIMEOUT_S
+    started = time.monotonic()
+    next_log = started
+    last_state = "UNAVAILABLE"
+    last_detail = "SYSTEM.REPORT unavailable"
+
+    while time.monotonic() < deadline:
+        try:
+            response = send_command(
+                machine="PI",
+                subsystem="SYSTEM",
+                command="REPORT",
+                retries=1,
+                retry_delay_s=0.0,
+            )
+            payload = response.get("payload") if isinstance(response, dict) else None
+            recovery = (
+                payload.get("monitor_recovery")
+                if isinstance(payload, dict)
+                and isinstance(payload.get("monitor_recovery"), dict)
+                else {}
+            )
+            last_state = str(recovery.get("state") or "UNAVAILABLE").upper()
+            last_detail = str(recovery.get("detail") or "status not yet published")
+            if last_state in terminal_success:
+                logging.info(
+                    "✅ [recovery] SYSTEM MONITOR barrier open: state=%s; "
+                    "campaign recovery may supersede the always-on restore",
+                    last_state,
+                )
+                return
+            if last_state == "FAILED":
+                raise RecoveryRetryableFailure(
+                    "system_monitor_restore_failed",
+                    {"state": last_state, "detail": last_detail},
+                )
+        except RecoveryRetryableFailure:
+            raise
+        except Exception as exc:
+            last_state = "UNAVAILABLE"
+            last_detail = str(exc)
+
+        now = time.monotonic()
+        if now >= next_log:
+            logging.info(
+                "⏳ [recovery] waiting for SYSTEM MONITOR restore before campaign "
+                "recovery: state=%s elapsed=%.1fs detail=%s",
+                last_state,
+                now - started,
+                last_detail,
+            )
+            next_log = now + SYSTEM_MONITOR_RECOVERY_LOG_INTERVAL_S
+        time.sleep(SYSTEM_MONITOR_RECOVERY_POLL_S)
+
+    raise RecoveryRetryableFailure(
+        "system_monitor_restore_timeout",
+        {
+            "timeout_s": SYSTEM_MONITOR_RECOVERY_WAIT_TIMEOUT_S,
+            "state": last_state,
+            "detail": last_detail,
+        },
+    )
+
+
 def _recover_campaign() -> None:
     """
     RECOVER — v7 exact-first-row architecture.
@@ -8151,11 +8221,11 @@ def run() -> None:
         name="clocks-timebase-silence-monitor",
     ).start()
 
-    # Campaign recovery is the only CLOCKS-owned boot recovery.  With no active
-    # campaign, _recover_campaign() returns without touching the always-on state
-    # already restored by SYSTEM.  With an active campaign, TIMEBASE deliberately
-    # supersedes that earlier MONITOR restore.
+    # Campaign recovery is the only CLOCKS-owned boot recovery.  SYSTEM owns
+    # the first boot transaction, so wait until its MONITOR restore is complete
+    # before TIMEBASE deliberately supersedes that always-on state.
     try:
+        _wait_for_system_monitor_recovery()
         _recover_campaign()
     except TeensyStartRejected as exc:
         logging.error(
