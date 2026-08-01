@@ -582,6 +582,7 @@ struct clocks_recovery_restore_state_t {
   uint64_t instrument_ocxo2_ns = 0ULL;
 
   clocks_instrument_stats_snapshot_t stats{};
+  bool control_present = false;
   clocks_monitor_dither_lane_t ocxo1_dac{};
   clocks_monitor_dither_lane_t ocxo2_dac{};
   servo_mode_t servo_mode = servo_mode_t::OFF;
@@ -641,13 +642,19 @@ static bool clocks_recovery_dac_lane_valid(
          isfinite(state.servo_predicted_residual);
 }
 
-static bool clocks_recovery_restore_state_basic_valid(
+static bool clocks_recovery_restore_statistics_valid(
     const clocks_recovery_restore_state_t& state) {
   return state.valid &&
          state.instrument_gnss_ns != 0ULL &&
          state.instrument_dwt_cycles != 0ULL &&
          state.instrument_ocxo1_ns != 0ULL &&
-         state.instrument_ocxo2_ns != 0ULL &&
+         state.instrument_ocxo2_ns != 0ULL;
+}
+
+static bool clocks_recovery_restore_control_valid(
+    const clocks_recovery_restore_state_t& state) {
+  return clocks_recovery_restore_statistics_valid(state) &&
+         state.control_present &&
          (uint8_t)state.servo_mode <= (uint8_t)servo_mode_t::NOW &&
          clocks_recovery_dac_lane_valid(state.ocxo1_dac) &&
          clocks_recovery_dac_lane_valid(state.ocxo2_dac);
@@ -798,7 +805,8 @@ static bool restore_parse_dac_lane(const Payload& args,
 
 static bool clocks_recovery_state_from_args(
     const Payload& args,
-    clocks_recovery_restore_state_t& out) {
+    clocks_recovery_restore_state_t& out,
+    bool require_control) {
   out = clocks_recovery_restore_state_t{};
   uint32_t version = 0U;
   if (!restore_get_u32(args, "restore_schema_version", version) ||
@@ -847,19 +855,31 @@ static bool clocks_recovery_state_from_args(
                          out.stats.ocxo1_tau_state) ||
       !restore_parse_tau(args, "restore_ocxo2_tau",
                          time_clock_id_t::OCXO2,
-                         out.stats.ocxo2_tau_state) ||
-      !restore_parse_dac_lane(args, "restore_ocxo1_dac", out.ocxo1_dac) ||
-      !restore_parse_dac_lane(args, "restore_ocxo2_dac", out.ocxo2_dac)) {
+                         out.stats.ocxo2_tau_state)) {
     return false;
   }
 
-  const char* mode = args.getString("restore_servo_mode");
-  if (!mode || !*mode) return false;
-  out.servo_mode = servo_mode_parse(mode);
-  if (strcmp(mode, "OFF") != 0 && strcmp(mode, "MEAN") != 0 &&
-      strcmp(mode, "TOTAL") != 0 && strcmp(mode, "NOW") != 0) return false;
-  if (!restore_get_bool(args, "restore_dither_operator_enabled",
-                        out.dither_operator_enabled)) return false;
+  if (require_control) {
+    if (!restore_parse_dac_lane(args, "restore_ocxo1_dac",
+                                out.ocxo1_dac) ||
+        !restore_parse_dac_lane(args, "restore_ocxo2_dac",
+                                out.ocxo2_dac)) {
+      return false;
+    }
+
+    const char* mode = args.getString("restore_servo_mode");
+    if (!mode || !*mode) return false;
+    out.servo_mode = servo_mode_parse(mode);
+    if (strcmp(mode, "OFF") != 0 && strcmp(mode, "MEAN") != 0 &&
+        strcmp(mode, "TOTAL") != 0 && strcmp(mode, "NOW") != 0) {
+      return false;
+    }
+    if (!restore_get_bool(args, "restore_dither_operator_enabled",
+                          out.dither_operator_enabled)) {
+      return false;
+    }
+    out.control_present = true;
+  }
 
   out.stats.last_pps_sequence = 0U;
   out.stats.gnss_ns = out.instrument_gnss_ns;
@@ -867,8 +887,11 @@ static bool clocks_recovery_state_from_args(
   out.stats.ocxo1_ns = out.instrument_ocxo1_ns;
   out.stats.ocxo2_ns = out.instrument_ocxo2_ns;
   out.valid = true;
-  return clocks_recovery_restore_state_basic_valid(out);
+  return require_control
+      ? clocks_recovery_restore_control_valid(out)
+      : clocks_recovery_restore_statistics_valid(out);
 }
+
 
 static void clocks_recovery_state_snapshot(
     clocks_monitor_restore_state_t& out,
@@ -936,10 +959,6 @@ static uint64_t g_flash_cut_last_raw_dwt_cycles = 0;
 static uint64_t g_flash_cut_last_raw_ocxo1_ns = 0;
 static uint64_t g_flash_cut_last_raw_ocxo2_ns = 0;
 static uint32_t g_flash_cut_last_boundary_pps_count = 0;
-static bool     g_flash_cut_last_dac1_ok = true;
-static bool     g_flash_cut_last_dac2_ok = true;
-static bool     g_flash_cut_last_servo_mode_supplied = false;
-static servo_mode_t g_flash_cut_last_servo_mode = servo_mode_t::OFF;
 static char     g_flash_cut_last_status[48] = {0};
 
 // ============================================================================
@@ -5795,7 +5814,6 @@ static constexpr uint32_t SERVO_INPUT_SOURCE_TOTAL_PUBLIC_TAU = 2;
 static constexpr uint32_t SERVO_INPUT_SOURCE_NOW_PPS_RESIDUAL = 3;
 
 static constexpr uint32_t SERVO_TOTAL_BASIS_NONE = 0;
-static constexpr uint32_t SERVO_TOTAL_BASIS_CAMPAIGN = 1;
 static constexpr uint32_t SERVO_TOTAL_BASIS_INSTRUMENT = 2;
 
 
@@ -6231,7 +6249,7 @@ static void clocks_recovery_restore_dac_lane_runtime(
 
 static bool clocks_recovery_install_dac_control(
     const clocks_recovery_restore_state_t& state) {
-  if (!clocks_recovery_restore_state_basic_valid(state)) return false;
+  if (!clocks_recovery_restore_control_valid(state)) return false;
 
   ocxo_dac_pacing_abort_all();
   clocks_ocxo_dac_cancel_all_motion();
@@ -6281,7 +6299,7 @@ static bool clocks_recovery_install_dac_control(
 
 static bool clocks_recovery_commit_statistics_and_clockfaces(
     const clocks_recovery_restore_state_t& state) {
-  if (!clocks_recovery_restore_state_basic_valid(state)) return false;
+  if (!clocks_recovery_restore_statistics_valid(state)) return false;
   if (!clocks_alpha_instrument_stats_restore(&state.stats)) return false;
   instrument_continuity_install(state);
   return true;
@@ -6329,82 +6347,39 @@ static void ocxo_dac_apply_synthetic_servo_step(ocxo_dac_state_t& dac,
 // Zeroing
 // ============================================================================
 
-static void campaign_accounting_reset_common(bool reset_servo_runtime) {
+static void campaign_accounting_reset_common() {
   clocks_watchdog_disarm_campaign_publication();
   clocks_row_objection_clear();
 
-  // Beta-local accounting reset only.  Alpha owns the active time/epoch
-  // projection. Do not invalidate it here: after SmartZero install the new
-  // epoch has just been authored; during acquisition the old service epoch
-  // must remain alive.  FLASH_CUT also uses this path, but with servo runtime
-  // intentionally preserved so the hot control state survives the boundary.
+  // Beta-local recording/accounting reset only. Instrument statistics, DAC
+  // targets, dither ownership, servo mode, controller memory, and pending
+  // actuator intent survive every campaign boundary.
   campaign_seconds = 0;
 
   dwt_cycle_count_total = 0;
   gnss_raw_64           = 0;
-  ocxo1_measured_gnss_ticks_64        = 0;
-  ocxo2_measured_gnss_ticks_64        = 0;
+  ocxo1_measured_gnss_ticks_64 = 0;
+  ocxo2_measured_gnss_ticks_64 = 0;
 
   campaign_public_offsets_reset_to_current();
-
-  // Alpha's instrument statistics deliberately survive campaign boundaries.
-  // TOTAL's short-window controller does not: a new campaign/public-total basis
-  // must acquire fresh residual rate evidence before moving the DAC.
-  servo_total_reset_all();
-  if (calibrate_ocxo_mode == servo_mode_t::TOTAL) {
-    ocxo_dac_predictor_reset(ocxo1_dac);
-    ocxo_dac_predictor_reset(ocxo2_dac);
-  }
-
   pps_interval_residuals_reset();
   clocks_beta_feature_set_cached("CAMPAIGN_RECORD_HANDOFF",
                                  g_clocks_feature_campaign_record,
                                  system_feature_status_t::INITIALIZING,
                                  true);
 
-  if (reset_servo_runtime) {
-    ocxo_dac_predictor_reset(ocxo1_dac);
-    ocxo_dac_predictor_reset(ocxo2_dac);
-    ocxo_dac_pacing_reset();
-    ocxo1_dac.servo_hold_count = 0;
-    ocxo2_dac.servo_hold_count = 0;
-    ocxo1_dac.servo_hold_reason = SERVO_HOLD_NONE;
-    ocxo2_dac.servo_hold_reason = SERVO_HOLD_NONE;
-    ocxo1_dac.servo_quarantine_reason = SERVO_HOLD_NONE;
-    ocxo2_dac.servo_quarantine_reason = SERVO_HOLD_NONE;
-    ocxo1_dac.servo_quarantine_remaining = 0;
-    ocxo2_dac.servo_quarantine_remaining = 0;
-    ocxo1_dac.servo_quarantine_begin_count = 0;
-    ocxo2_dac.servo_quarantine_begin_count = 0;
-    ocxo1_dac.servo_quarantine_consumed_count = 0;
-    ocxo2_dac.servo_quarantine_consumed_count = 0;
-    ocxo1_dac.servo_commit_fault_hold_count = 0;
-    ocxo2_dac.servo_commit_fault_hold_count = 0;
-    ocxo1_dac.servo_request_overwrite_count = 0;
-    ocxo2_dac.servo_request_overwrite_count = 0;
-    ocxo1_dac.servo_request_install_count = 0;
-    ocxo2_dac.servo_request_install_count = 0;
-    ocxo1_dac.servo_request_dither_frame_install_count = 0;
-    ocxo2_dac.servo_request_dither_frame_install_count = 0;
-    ocxo1_dac.servo_request_static_install_count = 0;
-    ocxo2_dac.servo_request_static_install_count = 0;
-    ocxo1_dac.servo_request_static_write_failure_count = 0;
-    ocxo2_dac.servo_request_static_write_failure_count = 0;
-  }
-
-  // Input diagnostics are campaign-row products, not plant state.  Clear them
-  // even for FLASH_CUT so campaign record cannot surface stale residuals
-  // across the campaign name boundary.
+  // These are row-presentation diagnostics, not controller memory.
   servo_input_diag_reset(g_servo_input_ocxo1);
   servo_input_diag_reset(g_servo_input_ocxo2);
 }
 
+
 void clocks_zero_all(void) {
-  campaign_accounting_reset_common(true);
+  campaign_accounting_reset_common();
 }
 
 static void campaign_flash_cut_accounting_reset(void) {
-  campaign_accounting_reset_common(false);
+  campaign_accounting_reset_common();
 }
 
 // ============================================================================
@@ -6974,7 +6949,7 @@ static void clocks_finish_zero_accounting(void) {
 }
 
 static void clocks_finish_start_accounting(void) {
-  campaign_accounting_reset_common(false);
+  campaign_accounting_reset_common();
   request_zero = false;
   request_start = false;
   clocks_watchdog_clear_surrender_for_new_lifecycle();
@@ -7352,7 +7327,6 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
       }
     }
 
-    ocxo_dac_pacing_abort_all();
     if (cold_bootstrap_commit && g_campaign_restore_state.valid) {
       if (!clocks_recovery_commit_statistics_and_clockfaces(
               g_campaign_restore_state)) {
@@ -7362,9 +7336,6 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
         return;
       }
       g_campaign_restore_count++;
-    } else {
-      ocxo_dac_predictor_reset(ocxo1_dac);
-      ocxo_dac_predictor_reset(ocxo2_dac);
     }
 
     dwt_cycle_count_total = dwt_ns_to_cycles(recover_dwt_ns);
@@ -7844,20 +7815,29 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
   g_beta_ocxo2_cycle_prediction =
       prediction_snapshot_for_clock(time_clock_id_t::OCXO2);
 
+  g_beta_instrument_stats = clocks_instrument_stats_snapshot_t{};
+  bool instrument_stats_ready =
+      clocks_alpha_instrument_stats_snapshot(&g_beta_instrument_stats) &&
+      g_beta_instrument_stats.valid &&
+      g_beta_instrument_stats.completed_row_coherent &&
+      g_beta_instrument_stats.last_pps_sequence == completed_pps_sequence;
+
   if (candidate_math_permitted) {
     // Welford/TAU/PPB are Alpha-owned and were updated before this call.
     // Beta reads the mature populations below for servo compatibility only.
 
+    const clocks_instrument_frequency_snapshot_t& ocxo1_frequency =
+        g_beta_instrument_stats.ocxo1_frequency;
+    const clocks_instrument_frequency_snapshot_t& ocxo2_frequency =
+        g_beta_instrument_stats.ocxo2_frequency;
     const bool ocxo1_total_slope_valid =
-        pps_residuals.ocxo1_valid && ocxo1_science.total_valid;
+        instrument_stats_ready &&
+        pps_residuals.ocxo1_valid &&
+        ocxo1_frequency.valid;
     const bool ocxo2_total_slope_valid =
-        pps_residuals.ocxo2_valid && ocxo2_science.total_valid;
-    const double ocxo1_total_tau = ocxo1_science.total_valid
-        ? ocxo1_science.total_tau
-        : 1.0;
-    const double ocxo2_total_tau = ocxo2_science.total_valid
-        ? ocxo2_science.total_tau
-        : 1.0;
+        instrument_stats_ready &&
+        pps_residuals.ocxo2_valid &&
+        ocxo2_frequency.valid;
 
     // Populate OCXO1 servo diagnostics directly.  This deliberately avoids a
     // reference-heavy helper boundary on the completed-row hot path.
@@ -7880,16 +7860,17 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
         (welford_ocxo1.n >= SERVO_MIN_SAMPLES);
 
     g_servo_input_ocxo1.total_tau =
-        ocxo1_total_slope_valid ? ocxo1_total_tau : 1.0;
-    g_servo_input_ocxo1.total_ppb = ocxo1_total_slope_valid
-        ? servo_total_ppb_from_tau(ocxo1_total_tau)
-        : 0.0;
-    g_servo_input_ocxo1.total_basis = SERVO_TOTAL_BASIS_CAMPAIGN;
-    g_servo_input_ocxo1.total_population_seconds = campaign_seconds;
+        ocxo1_total_slope_valid ? ocxo1_frequency.tau : 1.0;
+    g_servo_input_ocxo1.total_ppb =
+        ocxo1_total_slope_valid ? ocxo1_frequency.ppb : 0.0;
+    g_servo_input_ocxo1.total_basis = SERVO_TOTAL_BASIS_INSTRUMENT;
+    g_servo_input_ocxo1.total_population_seconds =
+        ocxo1_total_slope_valid
+            ? ocxo1_frequency.sample_count
+            : 0ULL;
     g_servo_input_ocxo1.total_input_valid =
         ocxo1_total_slope_valid &&
-        pps_residuals.ocxo1_valid &&
-        (campaign_seconds >= SERVO_MIN_SAMPLES);
+        ocxo1_frequency.sample_count >= SERVO_MIN_SAMPLES;
 
     // A one-second residual in ns is numerically ppb over a one-second gate.
     g_servo_input_ocxo1.now_ppb = pps_residuals.ocxo1_valid
@@ -7961,16 +7942,17 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
         (welford_ocxo2.n >= SERVO_MIN_SAMPLES);
 
     g_servo_input_ocxo2.total_tau =
-        ocxo2_total_slope_valid ? ocxo2_total_tau : 1.0;
-    g_servo_input_ocxo2.total_ppb = ocxo2_total_slope_valid
-        ? servo_total_ppb_from_tau(ocxo2_total_tau)
-        : 0.0;
-    g_servo_input_ocxo2.total_basis = SERVO_TOTAL_BASIS_CAMPAIGN;
-    g_servo_input_ocxo2.total_population_seconds = campaign_seconds;
+        ocxo2_total_slope_valid ? ocxo2_frequency.tau : 1.0;
+    g_servo_input_ocxo2.total_ppb =
+        ocxo2_total_slope_valid ? ocxo2_frequency.ppb : 0.0;
+    g_servo_input_ocxo2.total_basis = SERVO_TOTAL_BASIS_INSTRUMENT;
+    g_servo_input_ocxo2.total_population_seconds =
+        ocxo2_total_slope_valid
+            ? ocxo2_frequency.sample_count
+            : 0ULL;
     g_servo_input_ocxo2.total_input_valid =
         ocxo2_total_slope_valid &&
-        pps_residuals.ocxo2_valid &&
-        (campaign_seconds >= SERVO_MIN_SAMPLES);
+        ocxo2_frequency.sample_count >= SERVO_MIN_SAMPLES;
 
     g_servo_input_ocxo2.now_ppb = pps_residuals.ocxo2_valid
         ? ocxo2_science.fast_residual_ns_exact
@@ -8022,7 +8004,9 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
     }
 
     campaign_record_stage(CAMPAIGN_RECORD_STAGE_WELFORD);
-    g_servo_control_second = campaign_seconds;
+    g_servo_control_second = instrument_stats_ready
+        ? (uint64_t)g_beta_instrument_stats.update_count
+        : (uint64_t)completed_pps_sequence;
     ocxo_calibration_servo();
     campaign_record_stage(CAMPAIGN_RECORD_STAGE_SERVO);
 
@@ -8183,15 +8167,18 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
   clocks_monitor_science_snapshot_from_row(
       record.ocxo2_science, ocxo2_science);
 
-  g_beta_instrument_stats = clocks_instrument_stats_snapshot_t{};
-  (void)clocks_alpha_instrument_stats_snapshot(&g_beta_instrument_stats);
+  if (!instrument_stats_ready) {
+    g_beta_instrument_stats = clocks_instrument_stats_snapshot_t{};
+    instrument_stats_ready =
+        clocks_alpha_instrument_stats_snapshot(&g_beta_instrument_stats);
+  }
   clocks_monitor_stats_snapshot_from_instrument(
       record.stats, g_beta_instrument_stats);
 
-  record.dac_present = clocks_servo_active();
-  if (record.dac_present) {
-    clocks_monitor_dac_snapshot(record.dac);
-  }
+  // DAC/servo state is scientific context regardless of whether a servo is
+  // active. Campaigns observe it; they never own it.
+  record.dac_present = true;
+  clocks_monitor_dac_snapshot(record.dac);
 
   clocks_stack_witness_note_hot(CLOCKS_STACK_CONTEXT_BETA_PPS_PUBLISH);
   g_monitor_campaign_record_sequence = completed_pps_sequence;
@@ -8244,8 +8231,8 @@ static bool payload_try_get_double_alias(const Payload& args,
 static bool payload_try_get_ocxo1_dac(const Payload& args,
                                       const char* path,
                                       double& out) {
-  // New system-config contract: { "ocxo1_dac": <code>, "ocxo2_dac": <code> }.
-  // Retain the old command aliases so existing Pi-side callers do not break.
+  // Dedicated SET_DAC accepts these historical aliases. Campaign commands
+  // reject every DAC alias through payload_campaign_control_argument().
   return payload_try_get_double_alias(args, path, "ocxo1_dac", out,
                                       "ocxo1_dac",
                                       "dac1",
@@ -8326,6 +8313,38 @@ static bool payload_try_get_servo_mode(const Payload& args,
   return servo_mode_parse_strict(raw, out);
 }
 
+
+static bool payload_campaign_control_argument(
+    const Payload& args,
+    const char*& out_key) {
+  static const char* const keys[] = {
+    "ocxo1_dac", "dac1", "set_dac1",
+    "ocxo2_dac", "dac2", "set_dac2",
+    "servos", "SERVOS", "servo", "SERVO",
+    "mode", "MODE", "calibrate_ocxo",
+  };
+  for (const char* key : keys) {
+    if (args.has(key)) {
+      out_key = key;
+      return true;
+    }
+  }
+  out_key = nullptr;
+  return false;
+}
+
+static Payload campaign_control_argument_rejected(
+    const char* command,
+    const char* key) {
+  Payload err;
+  err.add("error", "campaign command does not accept DAC/servo control");
+  err.add("status", "campaign_control_argument_rejected");
+  err.add("command", command ? command : "");
+  err.add("argument", key ? key : "");
+  err.add("control_surface", "CLOCKS.SET_DAC / CLOCKS.SERVOS");
+  return err;
+}
+
 static FLASHMEM Payload cmd_servos(const Payload& args) {
   const servo_mode_t previous = calibrate_ocxo_mode;
   const bool campaign_live =
@@ -8385,8 +8404,6 @@ static FLASHMEM Payload cmd_servos(const Payload& args) {
 }
 
 static FLASHMEM Payload cmd_flash_cut(const Payload& args) {
-  clocks_payload_numeric_integrity_reset();
-
   const char* name = args.getString("campaign");
   if (!name || !*name) {
     g_flash_cut_reject_count++;
@@ -8394,6 +8411,12 @@ static FLASHMEM Payload cmd_flash_cut(const Payload& args) {
     err.add("error", "missing campaign");
     err.add("status", "flash_cut_rejected_missing_campaign");
     return err;
+  }
+
+  const char* retired_argument = nullptr;
+  if (payload_campaign_control_argument(args, retired_argument)) {
+    g_flash_cut_reject_count++;
+    return campaign_control_argument_rejected("FLASH_CUT", retired_argument);
   }
 
   if (campaign_state != clocks_campaign_state_t::STARTED) {
@@ -8423,52 +8446,14 @@ static FLASHMEM Payload cmd_flash_cut(const Payload& args) {
     return err;
   }
 
-  const char* servo_arg = nullptr;
-  const bool servo_supplied =
-      payload_try_get_nonempty_string(args, "calibrate_ocxo", servo_arg);
-
-  double dac_val;
-  bool dac1_ok = true;
-  bool dac2_ok = true;
-  const bool dac1_supplied = payload_try_get_ocxo1_dac(args, "command.flash_cut", dac_val);
-  if (dac1_supplied) {
-    ocxo_dac_pacing_abort_all();
-    dac1_ok = ocxo_dac_set(ocxo1_dac, dac_val);
-    if (dac1_ok) ocxo_dac_retry_reset(ocxo1_dac);
-  }
-  const bool dac2_supplied = payload_try_get_ocxo2_dac(args, "command.flash_cut", dac_val);
-  if (dac2_supplied) {
-    ocxo_dac_pacing_abort_all();
-    dac2_ok = ocxo_dac_set(ocxo2_dac, dac_val);
-    if (dac2_ok) ocxo_dac_retry_reset(ocxo2_dac);
-  }
-
-  if (g_clocks_payload_numeric_integrity_failed) {
-    g_flash_cut_reject_count++;
-    return clocks_payload_numeric_reject_response("flash_cut_rejected_numeric_integrity");
-  }
-
-  if (servo_supplied) {
-    clocks_apply_servo_mode_now(servo_mode_parse(servo_arg));
-  }
-  if (!dac1_ok || !dac2_ok) {
-    clocks_apply_servo_mode_now(servo_mode_t::OFF);
-  }
-
   safeCopy(g_flash_cut_last_requested_campaign,
            sizeof(g_flash_cut_last_requested_campaign),
            name);
   safeCopy(flash_cut_campaign_name, sizeof(flash_cut_campaign_name), name);
-  g_flash_cut_last_dac1_ok = dac1_ok;
-  g_flash_cut_last_dac2_ok = dac2_ok;
-  g_flash_cut_last_servo_mode_supplied = servo_supplied;
-  g_flash_cut_last_servo_mode = calibrate_ocxo_mode;
   g_flash_cut_request_count++;
   request_flash_cut = true;
   safeCopy(g_flash_cut_last_status, sizeof(g_flash_cut_last_status),
-           (!dac1_ok || !dac2_ok)
-               ? "flash_cut_requested_dac_fault_servo_off"
-               : "flash_cut_requested");
+           "flash_cut_requested");
 
   Payload p;
   p.add("status", g_flash_cut_last_status);
@@ -8484,16 +8469,13 @@ static FLASHMEM Payload cmd_flash_cut(const Payload& args) {
   p.add("commit_count", g_flash_cut_commit_count);
   p.add("ocxo1_dac", toFixedDecimal(ocxo1_dac.dac_fractional, 6));
   p.add("ocxo2_dac", toFixedDecimal(ocxo2_dac.dac_fractional, 6));
-  p.add("ocxo1_dac_last_write_ok", ocxo1_dac.io_last_write_ok);
-  p.add("ocxo2_dac_last_write_ok", ocxo2_dac.io_last_write_ok);
-  p.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
-  p.add("calibrate_ocxo_supplied", servo_supplied);
+  p.add("servo_mode", servo_mode_str(calibrate_ocxo_mode));
+  p.add("instrument_control_preserved", true);
   return p;
 }
 
-static FLASHMEM Payload cmd_start(const Payload& args) {
-  clocks_payload_numeric_integrity_reset();
 
+static FLASHMEM Payload cmd_start(const Payload& args) {
   if (g_monitor_restore_requested) {
     Payload err;
     err.add("error", "MONITOR restore is pending");
@@ -8506,6 +8488,11 @@ static FLASHMEM Payload cmd_start(const Payload& args) {
     Payload err;
     err.add("error", "missing campaign");
     return err;
+  }
+
+  const char* retired_argument = nullptr;
+  if (payload_campaign_control_argument(args, retired_argument)) {
+    return campaign_control_argument_rejected("START", retired_argument);
   }
 
   if (campaign_state == clocks_campaign_state_t::STARTED) {
@@ -8537,51 +8524,6 @@ static FLASHMEM Payload cmd_start(const Payload& args) {
 
   safeCopy(campaign_name, sizeof(campaign_name), name);
 
-  ocxo_dac_io_reset(ocxo1_dac);
-  ocxo_dac_io_reset(ocxo2_dac);
-
-  double dac_val = 0.0;
-  bool dac1_ok = true;
-  bool dac2_ok = true;
-  const bool dac1_supplied =
-      payload_try_get_ocxo1_dac(args, "command.start", dac_val);
-  if (dac1_supplied) {
-    const double prior = ocxo_dac_fractional_snapshot(ocxo1_dac);
-    ocxo_dac_pacing_abort_all();
-    dac1_ok = ocxo_dac_set(ocxo1_dac, dac_val);
-    if (dac1_ok && fabs(dac_val - prior) > 0.000001) {
-      ocxo_dac_predictor_reset(ocxo1_dac);
-      ocxo1_dac.servo_settle_count = 0U;
-    }
-  }
-
-  const bool dac2_supplied =
-      payload_try_get_ocxo2_dac(args, "command.start", dac_val);
-  if (dac2_supplied) {
-    const double prior = ocxo_dac_fractional_snapshot(ocxo2_dac);
-    ocxo_dac_pacing_abort_all();
-    dac2_ok = ocxo_dac_set(ocxo2_dac, dac_val);
-    if (dac2_ok && fabs(dac_val - prior) > 0.000001) {
-      ocxo_dac_predictor_reset(ocxo2_dac);
-      ocxo2_dac.servo_settle_count = 0U;
-    }
-  }
-
-  if (g_clocks_payload_numeric_integrity_failed) {
-    return clocks_payload_numeric_reject_response("start_rejected_numeric_integrity");
-  }
-
-  const char* raw_servo_mode = nullptr;
-  servo_mode_t start_servo_mode = calibrate_ocxo_mode;
-  const bool servo_supplied =
-      payload_try_get_servo_mode(args, start_servo_mode, raw_servo_mode);
-  if (servo_supplied) {
-    clocks_apply_servo_mode_now(start_servo_mode);
-  }
-  if (!dac1_ok || !dac2_ok) {
-    clocks_apply_servo_mode_now(servo_mode_t::OFF);
-  }
-
   request_start = true;
   request_zero = false;
   request_stop = false;
@@ -8592,9 +8534,7 @@ static FLASHMEM Payload cmd_start(const Payload& args) {
   campaign_warmup_reset();
 
   Payload p;
-  p.add("status", (!dac1_ok || !dac2_ok)
-                      ? "start_requested_dac_fault_servos_off"
-                      : "start_requested");
+  p.add("status", "start_requested");
   p.add("campaign_admission_source", "PI_MONITOR_PREFLIGHT");
   p.add("recording_boundary", "NEXT_COMPLETED_PPS");
   p.add("instrument_always_on", true);
@@ -8608,24 +8548,11 @@ static FLASHMEM Payload cmd_start(const Payload& args) {
   p.add("ocxo2_dac", toFixedDecimal(ocxo2_dac.dac_fractional, 6));
   p.add("ocxo1_dac_hw_code", (uint32_t)ocxo1_dac.dac_hw_code);
   p.add("ocxo2_dac_hw_code", (uint32_t)ocxo2_dac.dac_hw_code);
-  p.add("ocxo1_dac_voltage",
-        toFixedDecimal(ocxo_dac_voltage_from_code((double)ocxo1_dac.dac_hw_code), 9));
-  p.add("ocxo2_dac_voltage",
-        toFixedDecimal(ocxo_dac_voltage_from_code((double)ocxo2_dac.dac_hw_code), 9));
-  p.add("dac_reference_mode", OCXO_DAC_REFERENCE_MODE);
-  p.add("dac_safe_max_output_voltage",
-        toFixedDecimal(OCXO_DAC_SAFE_MAX_OUTPUT_VOLTAGE, 9));
-  p.add("dac_safe_max_hw_code", (uint32_t)OCXO_DAC_SAFE_MAX_HW_CODE);
-  p.add("ocxo1_dac_last_write_ok", ocxo1_dac.io_last_write_ok);
-  p.add("ocxo2_dac_last_write_ok", ocxo2_dac.io_last_write_ok);
-  p.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
-  p.add("calibrate_ocxo_supplied", servo_supplied);
-  p.add("ocxo1_dac_supplied", dac1_supplied);
-  p.add("ocxo2_dac_supplied", dac2_supplied);
-  p.add("instrument_control_preserved",
-        !servo_supplied && !dac1_supplied && !dac2_supplied);
+  p.add("servo_mode", servo_mode_str(calibrate_ocxo_mode));
+  p.add("instrument_control_preserved", true);
   return p;
 }
+
 
 static FLASHMEM Payload cmd_stop(const Payload&) {
   g_monitor_restore_requested = false;
@@ -8741,7 +8668,8 @@ static FLASHMEM Payload cmd_restore_monitor(const Payload& args) {
   }
 
   g_monitor_restore_state = clocks_recovery_restore_state_t{};
-  if (!clocks_recovery_state_from_args(args, g_monitor_restore_state)) {
+  if (!clocks_recovery_state_from_args(
+          args, g_monitor_restore_state, true)) {
     g_monitor_restore_failure_count++;
     Payload err;
     err.add("error", "invalid structured recovery state");
@@ -8805,10 +8733,16 @@ static FLASHMEM Payload cmd_recover(const Payload& args) {
     return err;
   }
 
+  const char* retired_argument = nullptr;
+  if (payload_campaign_control_argument(args, retired_argument)) {
+    return campaign_control_argument_rejected("RECOVER", retired_argument);
+  }
+
   g_campaign_restore_state = clocks_recovery_restore_state_t{};
   const bool recovery_state_supplied = args.has("restore_schema_version");
   if (recovery_state_supplied &&
-      !clocks_recovery_state_from_args(args, g_campaign_restore_state)) {
+      !clocks_recovery_state_from_args(
+          args, g_campaign_restore_state, false)) {
     Payload err;
     err.add("error", "invalid structured recovery state");
     err.add("status", "recover_rejected_state");
@@ -8955,17 +8889,6 @@ static FLASHMEM Payload cmd_recover(const Payload& args) {
   recover_ocxo1_ns = ocxo1_ns;
   recover_ocxo2_ns = ocxo2_ns;
 
-  const char* raw_servo_mode = nullptr;
-  servo_mode_t recovered_servo_mode = servo_mode_t::OFF;
-  const bool servo_supplied =
-      payload_try_get_servo_mode(args, recovered_servo_mode, raw_servo_mode);
-  clocks_apply_servo_mode_now(
-      servo_supplied ? recovered_servo_mode : servo_mode_t::OFF);
-  request_servo_mode_change = false;
-  requested_servo_mode = calibrate_ocxo_mode;
-  g_servo_mode_last_requested = calibrate_ocxo_mode;
-  g_servo_mode_last_committed = calibrate_ocxo_mode;
-
   g_recover_request_count++;
   g_recover_last_base_count = requested_base_count;
   g_recover_last_expected_first_public_count =
@@ -9006,22 +8929,10 @@ static FLASHMEM Payload cmd_recover(const Payload& args) {
   }
 
   if (g_recover_lifecycle_mode ==
-          recover_lifecycle_mode_t::COLD_BOOTSTRAP &&
+          recover_lifecycle_mode_t::LIVE_REATTACH &&
       g_campaign_restore_state.valid) {
-    if (!clocks_recovery_install_dac_control(g_campaign_restore_state)) {
-      recover_lifecycle_abort("recover_state_dac_restore_failed");
-      g_campaign_restore_failure_count++;
-      g_campaign_restore_state = clocks_recovery_restore_state_t{};
-      Payload err;
-      err.add("error", "failed to restore campaign DAC/control state");
-      err.add("status", "recover_rejected_state_dac");
-      return err;
-    }
-  } else if (g_recover_lifecycle_mode ==
-                 recover_lifecycle_mode_t::LIVE_REATTACH &&
-             g_campaign_restore_state.valid) {
-    // The running Teensy is newer than the last durable TIMEBASE row.  Preserve
-    // its live statistics and actuator state rather than rolling them backward.
+    // The running Teensy is newer than the last durable TIMEBASE row. Preserve
+    // its live statistics and all instrument control state.
     g_campaign_restore_ignored_live_count++;
     g_campaign_restore_state = clocks_recovery_restore_state_t{};
   }
@@ -9049,8 +8960,8 @@ static FLASHMEM Payload cmd_recover(const Payload& args) {
   p.add("campaign", campaign_name);
   p.add("campaign_supplied", g_recover_last_campaign_supplied);
   p.add("recover_last_campaign", g_recover_last_campaign);
-  p.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
-  p.add("calibrate_ocxo_supplied", servo_supplied);
+  p.add("servo_mode", servo_mode_str(calibrate_ocxo_mode));
+  p.add("instrument_control_preserved", true);
   p.add("recover_status_report", "REPORT_RECOVERY");
   p.add("campaign_state", clocks_campaign_state_name(campaign_state));
   p.add("recover_lifecycle", clocks_campaign_recovery_lifecycle_active());

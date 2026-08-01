@@ -1636,7 +1636,7 @@ def _structured_restore_args(state: Dict[str, Any]) -> Dict[str, Any]:
         "restore_stats_vclock_interval_reject_count": path(stats, "interval_admission.vclock_reject_count"),
         "restore_stats_ocxo1_interval_reject_count": path(stats, "interval_admission.ocxo1_reject_count"),
         "restore_stats_ocxo2_interval_reject_count": path(stats, "interval_admission.ocxo2_reject_count"),
-        "restore_servo_mode": dac.get("servo_mode") or dac.get("calibrate_ocxo") or "OFF",
+        "restore_servo_mode": dac.get("servo_mode") or "OFF",
         "restore_dither_operator_enabled": dac.get("dither_operator_enabled", False),
     }
     welfords = {
@@ -1900,7 +1900,7 @@ def _monitor_restore_probe(monitor: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         "instrument_ocxo1_ns": _int_value(instrument.get("ocxo1_ns")),
         "instrument_ocxo2_ns": _int_value(instrument.get("ocxo2_ns")),
         "welford_n": welford_n,
-        "servo_mode": str(dac.get("servo_mode") or dac.get("calibrate_ocxo") or "OFF").upper(),
+        "servo_mode": str(dac.get("servo_mode") or "OFF").upper(),
         "dither_operator_enabled": bool(dac.get("dither_operator_enabled")),
         "ocxo1_dac": _float_value(dac.get("ocxo1_dac")),
         "ocxo2_dac": _float_value(dac.get("ocxo2_dac")),

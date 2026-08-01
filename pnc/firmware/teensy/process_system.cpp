@@ -3785,7 +3785,6 @@ static void system_monitor_add_live_dac(
     const clocks_monitor_dac_snapshot_t& snapshot) {
   Payload dac;
   dac.add("schema", "CLOCKS_LIVE_DAC_V1");
-  dac.add("calibrate_ocxo", snapshot.servo_mode);
   dac.add("servo_mode", snapshot.servo_mode);
   dac.add("servo_active", snapshot.servo_active);
   dac.add("realization_mode", snapshot.realization_mode);
@@ -3828,7 +3827,6 @@ static void system_monitor_add_campaign_dac(
     const clocks_monitor_dac_snapshot_t& snapshot) {
   Payload dac;
   dac.add("schema", "TIMEBASE_DAC_PERSISTENCE_V2");
-  dac.add("calibrate_ocxo", snapshot.servo_mode);
   dac.add("servo_mode", snapshot.servo_mode);
   dac.add("servo_active", snapshot.servo_active);
   dac.add("realization_mode", snapshot.realization_mode);

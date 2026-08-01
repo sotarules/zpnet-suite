@@ -418,8 +418,6 @@ _diag: Dict[str, Any] = {
     "recovery_elapsed_seconds_nonpositive": 0,
     "recovery_last_timebase_unrecoverable": 0,
     "recovery_last_timebase_scan_count": 0,
-    "recovery_control_state_reassertions": 0,
-    "last_recovery_control_state": {},
     "last_recovery": {},
     "recovery_transitional_rows_discarded": 0,
     "recovery_clean_timeouts": 0,
@@ -1769,13 +1767,24 @@ def _monitor_restore_state(monitor: Optional[Dict[str, Any]]) -> Optional[Dict[s
     return copy.deepcopy(state)
 
 
-def _structured_restore_args(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Flatten structured MONITOR state into ordinary CLOCKS command fields."""
+def _structured_restore_args(
+    state: Dict[str, Any],
+    *,
+    include_control: bool = True,
+) -> Dict[str, Any]:
+    """Flatten structured state into ordinary CLOCKS command fields.
+
+    Generalized MONITOR restore includes DAC/servo control state. Campaign
+    RECOVER deliberately excludes it: campaigns restore timeline/statistics
+    only and leave the live instrument control plane untouched.
+    """
     instrument = state.get("instrument_clockfaces")
     stats = state.get("stats")
     dac = state.get("dac")
-    if not isinstance(instrument, dict) or not isinstance(stats, dict) or not isinstance(dac, dict):
-        raise ValueError("structured restore missing instrument_clockfaces/stats/dac")
+    if not isinstance(instrument, dict) or not isinstance(stats, dict):
+        raise ValueError("structured restore missing instrument_clockfaces/stats")
+    if include_control and not isinstance(dac, dict):
+        raise ValueError("structured restore missing dac")
 
     out: Dict[str, Any] = {
         "restore_schema_version": 2,
@@ -1787,11 +1796,15 @@ def _structured_restore_args(state: Dict[str, Any]) -> Dict[str, Any]:
         "restore_stats_completed_row_coherent": stats.get("completed_row_coherent"),
         "restore_stats_reset_count": stats.get("reset_count"),
         "restore_stats_update_count": stats.get("update_count"),
-        "restore_stats_vclock_interval_reject_count": _path_get(stats, "interval_admission.vclock_reject_count"),
-        "restore_stats_ocxo1_interval_reject_count": _path_get(stats, "interval_admission.ocxo1_reject_count"),
-        "restore_stats_ocxo2_interval_reject_count": _path_get(stats, "interval_admission.ocxo2_reject_count"),
-        "restore_servo_mode": dac.get("servo_mode") or dac.get("calibrate_ocxo") or "OFF",
-        "restore_dither_operator_enabled": dac.get("dither_operator_enabled", False),
+        "restore_stats_vclock_interval_reject_count": _path_get(
+            stats, "interval_admission.vclock_reject_count"
+        ),
+        "restore_stats_ocxo1_interval_reject_count": _path_get(
+            stats, "interval_admission.ocxo1_reject_count"
+        ),
+        "restore_stats_ocxo2_interval_reject_count": _path_get(
+            stats, "interval_admission.ocxo2_reject_count"
+        ),
     }
 
     welfords = {
@@ -1825,30 +1838,42 @@ def _structured_restore_args(state: Dict[str, Any]) -> Dict[str, Any]:
         ):
             out[f"restore_{lane}_tau_{field}"] = tau.get(field)
 
-        lane_state = dac.get(lane)
-        servo = lane_state.get("servo") if isinstance(lane_state, dict) else None
-        if not isinstance(lane_state, dict) or not isinstance(servo, dict):
-            raise ValueError(f"structured restore missing {lane} DAC/servo state")
-        out[f"restore_{lane}_dac_value"] = lane_state.get("value", lane_state.get("dac"))
-        field_map = {
-            "servo_last_step": "last_step",
-            "servo_last_residual": "last_residual",
-            "servo_settle_count": "settle_count",
-            "servo_adjustments": "adjustments",
-            "servo_predictor_initialized": "predictor_initialized",
-            "servo_last_raw_residual": "last_raw_residual",
-            "servo_filtered_residual": "filtered_residual",
-            "servo_filtered_slope": "filtered_slope",
-            "servo_predicted_residual": "predicted_residual",
-            "servo_predictor_updates": "predictor_updates",
-        }
-        for command_field, json_field in field_map.items():
-            out[f"restore_{lane}_dac_{command_field}"] = servo.get(json_field)
+        if include_control:
+            lane_state = dac.get(lane)
+            servo = lane_state.get("servo") if isinstance(lane_state, dict) else None
+            if not isinstance(lane_state, dict) or not isinstance(servo, dict):
+                raise ValueError(f"structured restore missing {lane} DAC/servo state")
+            out[f"restore_{lane}_dac_value"] = lane_state.get(
+                "value", lane_state.get("dac")
+            )
+            field_map = {
+                "servo_last_step": "last_step",
+                "servo_last_residual": "last_residual",
+                "servo_settle_count": "settle_count",
+                "servo_adjustments": "adjustments",
+                "servo_predictor_initialized": "predictor_initialized",
+                "servo_last_raw_residual": "last_raw_residual",
+                "servo_filtered_residual": "filtered_residual",
+                "servo_filtered_slope": "filtered_slope",
+                "servo_predicted_residual": "predicted_residual",
+                "servo_predictor_updates": "predictor_updates",
+            }
+            for command_field, json_field in field_map.items():
+                out[f"restore_{lane}_dac_{command_field}"] = servo.get(json_field)
+
+    if include_control:
+        out["restore_servo_mode"] = (
+            dac.get("servo_mode") or "OFF"
+        )
+        out["restore_dither_operator_enabled"] = dac.get(
+            "dither_operator_enabled", False
+        )
 
     missing = [key for key, value in out.items() if value is None]
     if missing:
         raise ValueError(f"structured restore missing fields: {missing}")
     return out
+
 
 def _restore_gnss_raw_payload(gnss_raw: Dict[str, Any]) -> Dict[str, Any]:
     """Restore the complete Pi-owned always-on GNSS_RAW state."""
@@ -4468,129 +4493,12 @@ def _load_last_recoverable_timebase(
     raise RuntimeError(f"recovery failed: no parseable TIMEBASE payloads ({newest_error or 'unknown error'})")
 
 
-def _normalize_recovery_servo_mode(value: Any) -> Optional[str]:
-    if value is None:
-        return None
-    mode = str(value).strip().upper()
-    if not mode:
-        return None
-    return mode if mode in ("MEAN", "TOTAL", "NOW", "OFF") else None
 
 
-def _system_dither_args_from_config(cfg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    boot_dither = cfg.get("dither")
-    boot_dither_bool: Optional[bool] = None
-    if isinstance(boot_dither, bool):
-        boot_dither_bool = boot_dither
-    elif isinstance(boot_dither, str):
-        lowered = boot_dither.strip().lower()
-        if lowered in ("true", "1", "yes", "on"):
-            boot_dither_bool = True
-        elif lowered in ("false", "0", "no", "off"):
-            boot_dither_bool = False
-
-    boot_rate_hz = None
-    try:
-        if cfg.get("dither_rate_hz") is not None:
-            boot_rate_hz = int(cfg.get("dither_rate_hz"))
-    except (TypeError, ValueError):
-        boot_rate_hz = None
-
-    if boot_dither_bool is None and boot_rate_hz is None:
-        return None
-
-    args: Dict[str, Any] = {"dither": boot_dither_bool if boot_dither_bool is not None else True}
-    if boot_rate_hz is not None:
-        args["rate_hz"] = int(boot_rate_hz)
-    return args
 
 
-def _reassert_system_dither(context: str, cfg: Optional[Dict[str, Any]] = None) -> None:
-    """Best-effort reassertion of global dither state before START/RECOVER."""
-    cfg = cfg if isinstance(cfg, dict) else _get_system_config()
-    dither_args = _system_dither_args_from_config(cfg)
-    if not dither_args:
-        return
-
-    try:
-        resp = send_command(
-            machine="TEENSY",
-            subsystem="CLOCKS",
-            command="DITHER",
-            args=dither_args,
-        )
-        _diag["recovery_control_state_reassertions"] = (
-            _diag.get("recovery_control_state_reassertions", 0) + 1
-        )
-        logging.info(
-            "🔧 [%s] dither reassertion: %s resp=%s",
-            context,
-            dither_args,
-            resp.get("message", "?"),
-        )
-    except Exception:
-        logging.exception("⚠️ [%s] dither reassertion failed (ignored)", context)
 
 
-def _recovery_control_state(
-    *,
-    campaign_payload: Dict[str, Any],
-    last_tb: Optional[Dict[str, Any]] = None,
-    last_frag: Optional[Dict[str, Any]] = None,
-    system_cfg: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """Choose START/RECOVER DAC and servo arguments from live truth first.
-
-    Cold START is allowed to use operator/SYSTEM seed values.  Warm recovery is
-    different: it should continue the last accepted campaign control state.
-    Prefer the last good TIMEBASE DAC/servo surfaces, then SYSTEM, then the
-    original campaign payload.
-    """
-    campaign_payload = campaign_payload if isinstance(campaign_payload, dict) else {}
-    last_tb = last_tb if isinstance(last_tb, dict) else {}
-    last_frag = last_frag if isinstance(last_frag, dict) else _report_fragment(last_tb)
-    system_cfg = system_cfg if isinstance(system_cfg, dict) else _get_system_config()
-
-    dac1, dac1_source = _first_float_with_source(
-        ("last.fragment.dac.ocxo1_dac", _path_get(last_frag, "dac.ocxo1_dac")),
-        ("last.fragment.dac.ocxo1.value", _path_get(last_frag, "dac.ocxo1.value")),
-        ("last.fragment.ocxo1_dac", last_frag.get("ocxo1_dac")),
-        ("last.forensics.dac.ocxo1.value", _path_get(last_tb, "forensics.dac.ocxo1.value")),
-        ("SYSTEM.ocxo1_dac", system_cfg.get("ocxo1_dac")),
-        ("campaign.payload.ocxo1_dac", campaign_payload.get("ocxo1_dac")),
-    )
-    dac2, dac2_source = _first_float_with_source(
-        ("last.fragment.dac.ocxo2_dac", _path_get(last_frag, "dac.ocxo2_dac")),
-        ("last.fragment.dac.ocxo2.value", _path_get(last_frag, "dac.ocxo2.value")),
-        ("last.fragment.ocxo2_dac", last_frag.get("ocxo2_dac")),
-        ("last.forensics.dac.ocxo2.value", _path_get(last_tb, "forensics.dac.ocxo2.value")),
-        ("SYSTEM.ocxo2_dac", system_cfg.get("ocxo2_dac")),
-        ("campaign.payload.ocxo2_dac", campaign_payload.get("ocxo2_dac")),
-    )
-
-    servo_mode = _normalize_recovery_servo_mode(
-        _path_get(last_frag, "dac.calibrate_ocxo")
-        or last_frag.get("servo_mode")
-        or _path_get(last_tb, "forensics.dac.calibrate_ocxo")
-        or campaign_payload.get("calibrate_ocxo")
-    )
-    if servo_mode is None:
-        servo_active_raw = last_frag.get("servo_active")
-        if servo_active_raw is not None and not _timebase_final_court_bool(servo_active_raw):
-            servo_mode = "OFF"
-
-    out: Dict[str, Any] = {
-        "ocxo1_dac": dac1,
-        "ocxo2_dac": dac2,
-        "ocxo1_dac_source": dac1_source,
-        "ocxo2_dac_source": dac2_source,
-        "calibrate_ocxo": servo_mode,
-        "calibrate_ocxo_source": (
-            "last_timebase_or_campaign" if servo_mode is not None else None
-        ),
-        "dither_args": _system_dither_args_from_config(system_cfg),
-    }
-    return out
 
 
 def _first_float(*values: Any) -> Optional[float]:
@@ -4749,25 +4657,9 @@ def _baseline_dac_stats_from_report(report: Dict[str, Any]) -> Dict[str, Dict[st
 
 
 def _normalize_start_args(args: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """Return START args with tolerant aliases normalized to firmware names."""
-    out: Dict[str, Any] = dict(args or {})
+    """Return campaign lifecycle arguments without control-plane rewriting."""
+    return dict(args or {})
 
-    # The typo is common enough to be worth forgiving.  The firmware only
-    # understands calibrate_ocxo, so normalize all accepted spellings here.
-    if not out.get("calibrate_ocxo"):
-        for alias in ("calibrate_oxco", "calibrate_oxo", "calibrate", "calibrate_ocxo_mode"):
-            value = out.get(alias)
-            if value is not None and str(value).strip():
-                out["calibrate_ocxo"] = str(value).strip().upper()
-                logging.warning(
-                    "⚠️ [clocks] START argument '%s' is deprecated/forgiven; use calibrate_ocxo=%s",
-                    alias, out["calibrate_ocxo"],
-                )
-                break
-    elif isinstance(out.get("calibrate_ocxo"), str):
-        out["calibrate_ocxo"] = out["calibrate_ocxo"].strip().upper()
-
-    return out
 
 
 
@@ -5501,56 +5393,6 @@ def _process_loop() -> None:
         publish("TIMEBASE", timebase)
         _persist_timebase(timebase)
 
-        # Persist live desired DAC values as the SYSTEM boot seeds (best-effort).
-        #
-        # DAC Welfords are still useful servo-effort statistics, but they are
-        # not actuator state.  With 1 kHz sigma-delta realization, the boot seed
-        # is the Teensy-authored synthetic real DAC value that the dither layer
-        # is honoring, not a historical mean that can lag the current target.
-        ocxo1_dac_seed = _first_float(
-            _path_get(frag, "dac.ocxo1_dac"),
-            _path_get(frag, "dac.ocxo1.value"),
-            frag.get("ocxo1_dac"),
-        )
-        ocxo2_dac_seed = _first_float(
-            _path_get(frag, "dac.ocxo2_dac"),
-            _path_get(frag, "dac.ocxo2.value"),
-            frag.get("ocxo2_dac"),
-        )
-
-        if (
-            control_eligible
-            and ocxo1_dac_seed is not None
-            and ocxo2_dac_seed is not None
-        ):
-            try:
-                with open_db() as conn:
-                    cur = conn.cursor()
-                    cur.execute(
-                        """
-                        UPDATE config
-                        SET timestamp = now(),
-                            payload = jsonb_set(
-                                jsonb_set(
-                                    COALESCE(payload, '{}'::jsonb),
-                                    '{ocxo1_dac}',
-                                    to_jsonb(%s::double precision),
-                                    true
-                                ),
-                                '{ocxo2_dac}',
-                                to_jsonb(%s::double precision),
-                                true
-                            )
-                        WHERE config_key = 'SYSTEM'
-                        """,
-                        (
-                            round(float(ocxo1_dac_seed), 6),
-                            round(float(ocxo2_dac_seed), 6),
-                        ),
-                    )
-            except Exception:
-                logging.exception("⚠️ [clocks] failed to persist DAC Welford means to SYSTEM config (ignored)")
-
 # ---------------------------------------------------------------------
 # Control-plane: START / STOP / CLEAR / RECOVER
 # ---------------------------------------------------------------------
@@ -5820,6 +5662,26 @@ def cmd_start(args: Optional[dict]) -> dict:
     if not campaign:
         return {"success": False, "message": "START requires 'campaign' argument"}
 
+    retired_control_args = (
+        "set_dac1", "set_dac2", "calibrate_ocxo",
+        "SET_DAC1", "SET_DAC2", "OCXO1_DAC", "OCXO2_DAC",
+        "calibrate_oxco", "calibrate_oxo", "calibrate",
+        "calibrate_ocxo_mode",
+    )
+    supplied_control_args = [
+        key for key in retired_control_args if key in start_args
+    ]
+    if supplied_control_args:
+        return {
+            "success": False,
+            "message": (
+                "START no longer accepts DAC or servo-calibration parameters: "
+                + ", ".join(supplied_control_args)
+                + ". Use the dedicated CLOCKS control commands before or after "
+                  "campaign START."
+            ),
+        }
+
     active_row = _get_active_campaign()
     flash_cut = active_row is not None
     prev_campaign = active_row["campaign"] if flash_cut else None
@@ -5854,32 +5716,6 @@ def cmd_start(args: Optional[dict]) -> dict:
         }
 
     location = current_location
-    set_dac1 = start_args.get("set_dac1")
-    set_dac2 = start_args.get("set_dac2")
-    calibrate_ocxo = start_args.get("calibrate_ocxo") or None
-    if isinstance(calibrate_ocxo, str):
-        calibrate_ocxo = calibrate_ocxo.strip().upper() or None
-    if calibrate_ocxo and calibrate_ocxo not in ("MEAN", "TOTAL", "NOW", "OFF"):
-        return {"success": False, "message": f"calibrate_ocxo must be 'MEAN' 'TOTAL' 'NOW' or 'OFF', got '{calibrate_ocxo}'"}
-
-    dac_source = "operator" if (set_dac1 is not None or set_dac2 is not None) else "none"
-    if not flash_cut and (set_dac1 is None or set_dac2 is None):
-        try:
-            with open_db(row_dict=True) as conn:
-                cur = conn.cursor()
-                cur.execute("SELECT payload FROM config WHERE config_key = 'SYSTEM'")
-                row = cur.fetchone()
-                if row:
-                    if set_dac1 is None and row["payload"].get("ocxo1_dac") is not None:
-                        set_dac1 = float(row["payload"]["ocxo1_dac"])
-                        dac_source = "SYSTEM"
-                    if set_dac2 is None and row["payload"].get("ocxo2_dac") is not None:
-                        set_dac2 = float(row["payload"]["ocxo2_dac"])
-                        dac_source = "SYSTEM"
-        except Exception:
-            logging.exception("⚠️ [clocks] failed to read SYSTEM config (ignored)")
-    elif flash_cut and (set_dac1 is None or set_dac2 is None):
-        dac_source = "operator+live" if (set_dac1 is not None or set_dac2 is not None) else "live"
 
     if flash_cut:
         prev_location = prev_payload.get("location")
@@ -5892,15 +5728,11 @@ def cmd_start(args: Optional[dict]) -> dict:
         return {"success": False, "message": str(e)}
 
     logging.info(
-        "%s [start] campaign='%s' mode=%s location=%s servo=%s dac1=%s dac2=%s dac_source=%s",
+        "%s [start] campaign='%s' mode=%s location=%s",
         "⚡" if flash_cut else "▶️",
         campaign,
         "FLASH_CUT" if flash_cut else "COLD_START",
         location or "none",
-        calibrate_ocxo or "OFF",
-        str(set_dac1),
-        str(set_dac2),
-        dac_source,
     )
 
     cutover_ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -5908,16 +5740,6 @@ def cmd_start(args: Optional[dict]) -> dict:
         "location": location,
         "started_at": cutover_ts,
     }
-    if set_dac1 is not None:
-        campaign_payload["ocxo1_dac"] = float(set_dac1)
-    if set_dac2 is not None:
-        campaign_payload["ocxo2_dac"] = float(set_dac2)
-    if calibrate_ocxo is not None:
-        # OFF is an explicit command in Flash Cut: stop servo but preserve the
-        # current DAC/output state. Omitted means preserve current mode on hot
-        # Teensy firmware and default OFF on cold firmware.
-        campaign_payload["calibrate_ocxo"] = calibrate_ocxo
-
     if flash_cut:
         campaign_payload.update({
             "flash_cut_from": prev_campaign,
@@ -5966,12 +5788,6 @@ def cmd_start(args: Optional[dict]) -> dict:
     _arm_timebase_silence_watch("FLASH_CUT" if flash_cut else "START")
 
     teensy_args: Dict[str, Any] = {"campaign": campaign}
-    if set_dac1 is not None:
-        teensy_args["set_dac1"] = str(set_dac1)
-    if set_dac2 is not None:
-        teensy_args["set_dac2"] = str(set_dac2)
-    if calibrate_ocxo is not None:
-        teensy_args["calibrate_ocxo"] = calibrate_ocxo
 
     teensy_start_resp: Dict[str, Any] = {}
     try:
@@ -6077,9 +5893,6 @@ def cmd_start(args: Optional[dict]) -> dict:
         "payload": {
             "campaign": campaign,
             "location": location,
-            "set_dac1": set_dac1,
-            "set_dac2": set_dac2,
-            "calibrate_ocxo": calibrate_ocxo,
             "waiting_for_first_fragment": True,
             "teensy_start_status": teensy_start_status,
             "teensy_start_payload": teensy_start_payload,
@@ -6088,7 +5901,6 @@ def cmd_start(args: Optional[dict]) -> dict:
             "previous_campaign": prev_campaign,
             "sync_wait_removed": True,
             "teensy_stop_sent": not flash_cut,
-            "default_dac_push_suppressed": bool(flash_cut),
             "first_fragment_timeout_s": (
                 FLASH_CUT_FIRST_FRAGMENT_TIMEOUT_S if flash_cut else START_FIRST_FRAGMENT_TIMEOUT_S
             ),
@@ -6718,27 +6530,9 @@ def _recover_campaign() -> None:
             logging.info("🧹 [recovery/cold] drained %d stale MONITOR_FRAGMENT campaign row(s)", drained)
         _clear_sync_wait()
 
-        system_cfg = _get_system_config()
-        control_state = _recovery_control_state(
-            campaign_payload=campaign_payload,
-            system_cfg=system_cfg,
-        )
-        _diag["last_recovery_control_state"] = {
-            "context": "recovery/cold",
-            **control_state,
-        }
-        _reassert_system_dither("recovery/cold", system_cfg)
-
+        # Campaign recovery is recording-only. The live DAC, servo, and dither
+        # state is generalized MONITOR state and is not re-authored here.
         teensy_args: Dict[str, Any] = {"campaign": campaign_name}
-        recover_ocxo1_dac = control_state.get("ocxo1_dac")
-        recover_ocxo2_dac = control_state.get("ocxo2_dac")
-        recover_calibrate = control_state.get("calibrate_ocxo")
-        if recover_ocxo1_dac is not None:
-            teensy_args["set_dac1"] = str(float(recover_ocxo1_dac))
-        if recover_ocxo2_dac is not None:
-            teensy_args["set_dac2"] = str(float(recover_ocxo2_dac))
-        if recover_calibrate:
-            teensy_args["calibrate_ocxo"] = str(recover_calibrate)
 
         _accepted_pps_vclock_count = None
         _diag["accepted_pps_count"] = None
@@ -6838,32 +6632,6 @@ def _recover_campaign() -> None:
         last_gnss_raw_welford_mean, last_gnss_time_str,
     )
 
-    system_cfg = _get_system_config()
-    control_state = _recovery_control_state(
-        campaign_payload=campaign_payload,
-        last_tb=last_tb,
-        last_frag=last_frag,
-        system_cfg=system_cfg,
-    )
-    recover_ocxo1_dac = control_state.get("ocxo1_dac")
-    recover_ocxo2_dac = control_state.get("ocxo2_dac")
-    recover_calibrate = control_state.get("calibrate_ocxo")
-    _diag["last_recovery_control_state"] = {
-        "context": "recovery",
-        "skipped_unrecoverable_rows": int(skipped_unrecoverable_rows),
-        **control_state,
-    }
-
-    logging.info(
-        "🔧 [recovery] control state: ocxo1_dac=%s (%s) ocxo2_dac=%s (%s) servo=%s dither=%s",
-        recover_ocxo1_dac,
-        control_state.get("ocxo1_dac_source"),
-        recover_ocxo2_dac,
-        control_state.get("ocxo2_dac_source"),
-        recover_calibrate or "OFF",
-        control_state.get("dither_args"),
-    )
-
     # ------------------------------------------------------------------
     # Step 2: Wait for preflight
     # ------------------------------------------------------------------
@@ -6926,8 +6694,6 @@ def _recover_campaign() -> None:
     _drained = _drain_timebase_ingress()
     if _drained > 0:
         logging.info("🧹 [recovery] drained %d stale MONITOR_FRAGMENT campaign row(s)", _drained)
-
-    _reassert_system_dither("recovery", system_cfg)
 
     now_frac = time.time() % 1.0
     sleep_to_boundary = (1.0 - now_frac) + 0.050
@@ -7040,9 +6806,6 @@ def _recover_campaign() -> None:
         "last_gnss_raw_ref_ns": int(last_gnss_raw_ref_ns),
         "last_gnss_raw_welford_mean": round(float(last_gnss_raw_welford_mean), 6),
         "skipped_unrecoverable_rows": int(skipped_unrecoverable_rows),
-        "recover_ocxo1_dac": None if recover_ocxo1_dac is None else round(float(recover_ocxo1_dac), 6),
-        "recover_ocxo2_dac": None if recover_ocxo2_dac is None else round(float(recover_ocxo2_dac), 6),
-        "recover_calibrate_ocxo": recover_calibrate,
         "teensy_stop_sent": False,
         "teensy_recover_abort_sent": False,
         "interrupt_service_preserved": None,
@@ -7070,13 +6833,15 @@ def _recover_campaign() -> None:
     }
 
     if isinstance(restore_state, dict):
-        teensy_recover_args.update(_structured_restore_args(restore_state))
+        teensy_recover_args.update(
+            _structured_restore_args(restore_state, include_control=False)
+        )
         _diag["last_recovery"]["structured_restore_present"] = True
         _diag["last_recovery"]["restore_schema_version"] = 2
         recovered_welford_count = 0
         logging.info(
             "📊 [recovery] using structured TIMEBASE state for Teensy "
-            "statistics/control restoration"
+            "statistics restoration; live DAC/servo state is preserved"
         )
     else:
         _diag["last_recovery"]["structured_restore_present"] = False
@@ -7089,13 +6854,6 @@ def _recover_campaign() -> None:
             "📊 [recovery] restored %d legacy Teensy Welford payload(s) into RECOVER args",
             recovered_welford_count,
         )
-
-    if recover_ocxo1_dac is not None:
-        teensy_recover_args["set_dac1"] = str(float(recover_ocxo1_dac))
-    if recover_ocxo2_dac is not None:
-        teensy_recover_args["set_dac2"] = str(float(recover_ocxo2_dac))
-    if recover_calibrate:
-        teensy_recover_args["calibrate_ocxo"] = str(recover_calibrate)
 
     teensy_recover_resp = _request_teensy_recover(
         int(recover_base_pps_vclock_count),
@@ -7428,11 +7186,8 @@ def cmd_set_baseline(args: Optional[dict]) -> Dict[str, Any]:
 
     baseline_pps_vclock_n = _extract_last_timebase_count(report, _report_fragment(report))
 
-    # A baseline should be self-contained, but it should also update the
-    # boot DAC defaults.  Prefer firmware DAC means for startup setpoints;
-    # fall back to instantaneous DAC values.
-    ocxo1_boot_dac = _first_float(baseline_dac_mean.get("ocxo1"), baseline_dac.get("ocxo1"))
-    ocxo2_boot_dac = _first_float(baseline_dac_mean.get("ocxo2"), baseline_dac.get("ocxo2"))
+    # DAC values remain baseline science/metrics only. They do not become a
+    # second persistence authority for the live instrument control plane.
 
     baseline_blob: Dict[str, Any] = {
         "baseline_id": baseline_id,
@@ -7445,10 +7200,6 @@ def cmd_set_baseline(args: Optional[dict]) -> Dict[str, Any]:
         "baseline_pps_vclock_n": baseline_pps_vclock_n,
         "baseline_pps_n": baseline_pps_vclock_n,  # legacy alias
     }
-    if ocxo1_boot_dac is not None:
-        baseline_blob["ocxo1_dac"] = round(ocxo1_boot_dac, 6)
-    if ocxo2_boot_dac is not None:
-        baseline_blob["ocxo2_dac"] = round(ocxo2_boot_dac, 6)
 
     try:
         with open_db() as conn:
@@ -8127,74 +7878,8 @@ def _parse_dac_arg(args: Dict[str, Any], label: str, *aliases: str) -> Tuple[boo
     return True, value, matched
 
 
-def _system_config_upsert(update_blob: Dict[str, Any]) -> None:
-    """Merge update_blob into the SYSTEM config row, creating it if absent."""
-    with open_db() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            WITH updated AS (
-                UPDATE config
-                SET payload = COALESCE(payload, '{}'::jsonb) || %s::jsonb
-                WHERE config_key = 'SYSTEM'
-                RETURNING 1
-            )
-            INSERT INTO config (config_key, payload)
-            SELECT 'SYSTEM', %s::jsonb
-            WHERE NOT EXISTS (SELECT 1 FROM updated)
-            """,
-            (json.dumps(update_blob), json.dumps(update_blob)),
-        )
 
 
-def _manual_dac_config_blob(
-    *,
-    dac1: Optional[float],
-    dac2: Optional[float],
-    input_aliases: Dict[str, str],
-) -> Dict[str, Any]:
-    """
-    Build the SYSTEM config payload for an operator DAC override.
-
-    SET_DAC owns ocxo*_dac as the explicit next-run boot seed.  It also updates
-    baseline_dac_mean / baseline_dac so legacy baseline fallback paths cannot
-    resurrect an older mean from a previous campaign.
-    """
-    now_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-    existing = _get_system_config()
-    baseline_dac_mean = dict(existing.get("baseline_dac_mean") or {})
-    baseline_dac = dict(existing.get("baseline_dac") or {})
-
-    manual_args: Dict[str, float] = {}
-
-    update_blob: Dict[str, Any] = {
-        "manual_dac_override": True,
-        "manual_dac_override_at_utc": now_utc,
-        "manual_dac_override_source": "CLOCKS.SET_DAC",
-    }
-
-    if dac1 is not None:
-        dac1_rounded = round(float(dac1), 6)
-        update_blob["ocxo1_dac"] = dac1_rounded
-        baseline_dac_mean["ocxo1"] = dac1_rounded
-        baseline_dac["ocxo1"] = dac1_rounded
-        manual_args["dac1"] = dac1_rounded
-
-    if dac2 is not None:
-        dac2_rounded = round(float(dac2), 6)
-        update_blob["ocxo2_dac"] = dac2_rounded
-        baseline_dac_mean["ocxo2"] = dac2_rounded
-        baseline_dac["ocxo2"] = dac2_rounded
-        manual_args["dac2"] = dac2_rounded
-
-    update_blob["manual_dac_override_args"] = manual_args
-    update_blob["manual_dac_override_aliases"] = input_aliases
-
-    update_blob["baseline_dac_mean"] = baseline_dac_mean
-    update_blob["baseline_dac"] = baseline_dac
-
-    return update_blob
 
 
 def _get_campaign_row_by_name(campaign_name: str) -> Optional[Dict[str, Any]]:
@@ -8229,289 +7914,83 @@ def _get_campaign_row_by_name(campaign_name: str) -> Optional[Dict[str, Any]]:
     }
 
 
-def _first_float_with_source(*candidates: Tuple[str, Any]) -> Tuple[Optional[float], Optional[str]]:
-    """Return the first parseable float and its descriptive source path."""
-    for source, value in candidates:
-        parsed = _first_float(value)
-        if parsed is not None:
-            return parsed, source
-    return None, None
 
 
-def _campaign_report_dac_values(
-    campaign_payload: Dict[str, Any],
-) -> Tuple[Optional[float], Optional[float], Dict[str, Optional[str]]]:
-    """Extract OCXO DAC values from the campaign's last report fragment.
-
-    The intended authority is campaigns.payload.report.fragment.dac, which is
-    the last TIMEBASE_FRAGMENT denormalized into the CAMPAIGNS row.  Small
-    legacy fallbacks are retained so older campaign rows can still seed the
-    boot DAC defaults, but the returned source map makes the provenance visible.
-    """
-    report = campaign_payload.get("report")
-    report_obj = report if isinstance(report, dict) else {}
-    fragment = report_obj.get("fragment")
-    frag = fragment if isinstance(fragment, dict) else {}
-
-    dac1, dac1_source = _first_float_with_source(
-        ("campaign.report.fragment.dac.ocxo1_dac", _path_get(frag, "dac.ocxo1_dac")),
-        ("campaign.report.fragment.dac.ocxo1.value", _path_get(frag, "dac.ocxo1.value")),
-        ("campaign.report.fragment.ocxo1_dac", frag.get("ocxo1_dac")),
-        ("campaign.report.ocxo1_dac", report_obj.get("ocxo1_dac")),
-        ("campaign.payload.ocxo1_dac", campaign_payload.get("ocxo1_dac")),
-    )
-    dac2, dac2_source = _first_float_with_source(
-        ("campaign.report.fragment.dac.ocxo2_dac", _path_get(frag, "dac.ocxo2_dac")),
-        ("campaign.report.fragment.dac.ocxo2.value", _path_get(frag, "dac.ocxo2.value")),
-        ("campaign.report.fragment.ocxo2_dac", frag.get("ocxo2_dac")),
-        ("campaign.report.ocxo2_dac", report_obj.get("ocxo2_dac")),
-        ("campaign.payload.ocxo2_dac", campaign_payload.get("ocxo2_dac")),
-    )
-
-    return dac1, dac2, {"ocxo1": dac1_source, "ocxo2": dac2_source}
 
 
-def _campaign_dac_config_blob(
-    *,
-    campaign_name: str,
-    campaign_id: int,
-    dac1: float,
-    dac2: float,
-    source_paths: Dict[str, Optional[str]],
-    input_aliases: Dict[str, str],
-) -> Dict[str, Any]:
-    """Build a SYSTEM config payload from a historical campaign DAC snapshot."""
-    now_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-    existing = _get_system_config()
-    baseline_dac_mean = dict(existing.get("baseline_dac_mean") or {})
-    baseline_dac = dict(existing.get("baseline_dac") or {})
-
-    dac1_rounded = round(float(dac1), 6)
-    dac2_rounded = round(float(dac2), 6)
-    baseline_dac_mean["ocxo1"] = dac1_rounded
-    baseline_dac_mean["ocxo2"] = dac2_rounded
-    baseline_dac["ocxo1"] = dac1_rounded
-    baseline_dac["ocxo2"] = dac2_rounded
-
-    return {
-        "ocxo1_dac": dac1_rounded,
-        "ocxo2_dac": dac2_rounded,
-        "baseline_dac_mean": baseline_dac_mean,
-        "baseline_dac": baseline_dac,
-        "manual_dac_override": True,
-        "manual_dac_override_at_utc": now_utc,
-        "manual_dac_override_source": "CLOCKS.SET_DAC_CAMPAIGN",
-        "manual_dac_override_campaign": campaign_name,
-        "manual_dac_override_campaign_id": int(campaign_id),
-        "manual_dac_override_args": {
-            "campaign": campaign_name,
-            "dac1": dac1_rounded,
-            "dac2": dac2_rounded,
-        },
-        "manual_dac_override_aliases": input_aliases,
-        "manual_dac_override_dac_source": source_paths,
-    }
 
 
-def _cmd_set_dac_from_campaign(
-    *,
-    campaign_name: str,
-    campaign_alias: Optional[str],
-) -> Dict[str, Any]:
-    """Set SYSTEM boot DAC defaults from a historical campaign's last fragment."""
-    campaign_name = str(campaign_name or "").strip()
-    if not campaign_name:
-        return {"success": False, "message": "SET_DAC campaign=... requires a non-empty campaign name"}
-
-    try:
-        row = _get_campaign_row_by_name(campaign_name)
-    except Exception as e:
-        logging.exception("❌ [clocks] SET_DAC campaign lookup failed")
-        return {"success": False, "message": str(e)}
-
-    if row is None:
-        return {"success": False, "message": f"No campaign named '{campaign_name}'"}
-
-    payload = row.get("payload") if isinstance(row, dict) else {}
-    payload = payload if isinstance(payload, dict) else {}
-    report = payload.get("report")
-    if not isinstance(report, dict) or not report:
-        return {
-            "success": False,
-            "message": f"Campaign '{campaign_name}' has no denormalized report / last TIMEBASE fragment",
-        }
-
-    dac1, dac2, source_paths = _campaign_report_dac_values(payload)
-    if dac1 is None or dac2 is None:
-        missing = []
-        if dac1 is None:
-            missing.append("ocxo1_dac")
-        if dac2 is None:
-            missing.append("ocxo2_dac")
-        return {
-            "success": False,
-            "message": (
-                f"Campaign '{campaign_name}' last TIMEBASE fragment does not contain "
-                f"required DAC value(s): {', '.join(missing)}"
-            ),
-            "payload": {"source_paths": source_paths},
-        }
-
-    update_blob = _campaign_dac_config_blob(
-        campaign_name=str(row["campaign"]),
-        campaign_id=int(row["id"]),
-        dac1=float(dac1),
-        dac2=float(dac2),
-        source_paths=source_paths,
-        input_aliases={"campaign": campaign_alias or "campaign"},
-    )
-
-    try:
-        _system_config_upsert(update_blob)
-    except Exception as e:
-        logging.exception("❌ [clocks] SET_DAC campaign SYSTEM config update failed")
-        return {"success": False, "message": str(e)}
-
-    result_payload = {
-        "source_campaign": str(row["campaign"]),
-        "source_campaign_id": int(row["id"]),
-        "source_campaign_active": bool(row.get("active")),
-        "ocxo1_dac": update_blob["ocxo1_dac"],
-        "ocxo2_dac": update_blob["ocxo2_dac"],
-        "source_paths": source_paths,
-        "baseline_dac": update_blob.get("baseline_dac", {}),
-        "baseline_dac_mean": update_blob.get("baseline_dac_mean", {}),
-        "manual_dac_override": True,
-        "manual_dac_override_source": update_blob["manual_dac_override_source"],
-        "manual_dac_override_at_utc": update_blob["manual_dac_override_at_utc"],
-        "applies_to": "next START/boot/recovery DAC seed only; running Teensy DAC is not changed",
-        "teensy_pushed_now": False,
-    }
-
-    logging.info("🔧 [clocks] SET_DAC campaign override: %s", result_payload)
-    return {"success": True, "message": "OK", "payload": result_payload}
 
 
 def cmd_set_dac(args: Optional[dict]) -> Dict[str, Any]:
-    """
-    SET_DAC(DAC1=foo, DAC2=bar) or SET_DAC(campaign=Payload4)
-
-    Persist explicit OCXO DAC boot seeds in the SYSTEM config record.
-
-    Accepted direct aliases:
-      DAC1, dac1, set_dac1, ocxo1_dac
-      DAC2, dac2, set_dac2, ocxo2_dac
-
-    Accepted campaign-source form:
-      campaign=<historical campaign name>
-
-    Direct DAC arguments update SYSTEM config and push the running Teensy
-    best-effort.  The campaign-source form updates SYSTEM config only: it
-    copies the DAC values from the campaign row's last denormalized
-    TIMEBASE_FRAGMENT so the next START/boot/recovery uses those defaults.
-
-    Both forms intentionally update baseline_dac_mean / baseline_dac too, so
-    older fallback paths cannot resurrect an unwanted servo-derived value.
-    """
+    """Set the live Teensy DAC target without creating a persistence side path."""
     if not args:
+        return {"success": False, "message": "SET_DAC requires DAC1 and/or DAC2"}
+
+    if "campaign" in args:
         return {
             "success": False,
-            "message": "SET_DAC requires DAC1/DAC2 or campaign argument",
+            "message": (
+                "SET_DAC campaign=... has been retired. DAC history remains "
+                "available in TIMEBASE, while current control is explicit."
+            ),
         }
-
-    campaign_alias, campaign_value = _arg_first_present(args, "campaign")
 
     try:
         has_dac1, dac1, alias1 = _parse_dac_arg(
-            args, "DAC1", "dac1", "DAC1", "set_dac1", "SET_DAC1", "ocxo1_dac", "OCXO1_DAC"
+            args, "DAC1", "dac1", "DAC1", "set_dac1", "SET_DAC1",
+            "ocxo1_dac", "OCXO1_DAC"
         )
         has_dac2, dac2, alias2 = _parse_dac_arg(
-            args, "DAC2", "dac2", "DAC2", "set_dac2", "SET_DAC2", "ocxo2_dac", "OCXO2_DAC"
+            args, "DAC2", "dac2", "DAC2", "set_dac2", "SET_DAC2",
+            "ocxo2_dac", "OCXO2_DAC"
         )
-    except ValueError as e:
-        return {"success": False, "message": str(e)}
-
-    if campaign_alias is not None:
-        if has_dac1 or has_dac2:
-            return {
-                "success": False,
-                "message": "SET_DAC campaign=... cannot be combined with explicit DAC values",
-            }
-        return _cmd_set_dac_from_campaign(
-            campaign_name=str(campaign_value),
-            campaign_alias=campaign_alias,
-        )
+    except ValueError as exc:
+        return {"success": False, "message": str(exc)}
 
     if not has_dac1 and not has_dac2:
-        return {
-            "success": False,
-            "message": "SET_DAC requires DAC1/DAC2 or campaign argument",
-        }
+        return {"success": False, "message": "SET_DAC requires DAC1 and/or DAC2"}
 
-    input_aliases: Dict[str, str] = {}
-    if alias1:
-        input_aliases["dac1"] = alias1
-    if alias2:
-        input_aliases["dac2"] = alias2
-
-    update_blob = _manual_dac_config_blob(
-        dac1=dac1 if has_dac1 else None,
-        dac2=dac2 if has_dac2 else None,
-        input_aliases=input_aliases,
-    )
+    teensy_args: Dict[str, Any] = {}
+    if has_dac1 and dac1 is not None:
+        teensy_args["set_dac1"] = str(float(dac1))
+    if has_dac2 and dac2 is not None:
+        teensy_args["set_dac2"] = str(float(dac2))
 
     try:
-        _system_config_upsert(update_blob)
-    except Exception as e:
-        logging.exception("❌ [clocks] SET_DAC failed")
-        return {"success": False, "message": str(e)}
+        response = send_command(
+            machine="TEENSY",
+            subsystem="CLOCKS",
+            command="SET_DAC",
+            args=teensy_args,
+        )
+    except Exception as exc:
+        logging.exception("❌ [clocks] live SET_DAC failed")
+        return {"success": False, "message": str(exc)}
 
-    teensy_pushed_now = False
-    teensy_push_error = None
-    teensy_message = None
-    try:
-        teensy_args: Dict[str, Any] = {}
-        if has_dac1 and dac1 is not None:
-            teensy_args["set_dac1"] = str(float(dac1))
-        if has_dac2 and dac2 is not None:
-            teensy_args["set_dac2"] = str(float(dac2))
-        if teensy_args:
-            resp = send_command(machine="TEENSY", subsystem="CLOCKS", command="SET_DAC", args=teensy_args)
-            teensy_pushed_now = bool(resp.get("success"))
-            teensy_message = resp.get("message")
-    except Exception as e:
-        teensy_push_error = str(e)
-        logging.exception("⚠️ [clocks] SET_DAC persisted but Teensy push failed")
-
-    payload = {
-        "ocxo1_dac": update_blob.get("ocxo1_dac"),
-        "ocxo2_dac": update_blob.get("ocxo2_dac"),
-        "baseline_dac": update_blob.get("baseline_dac", {}),
-        "baseline_dac_mean": update_blob.get("baseline_dac_mean", {}),
-        "manual_dac_override": True,
-        "manual_dac_override_args": update_blob.get("manual_dac_override_args", {}),
-        "manual_dac_override_aliases": update_blob.get("manual_dac_override_aliases", {}),
-        "manual_dac_override_at_utc": update_blob["manual_dac_override_at_utc"],
-        "applies_to": "current Teensy desired DAC and next START/boot/recovery DAC seed",
-        "teensy_pushed_now": teensy_pushed_now,
-        "teensy_message": teensy_message,
-        "teensy_push_error": teensy_push_error,
-        "dither_realizes_desired": True,
+    payload = response.get("payload") if isinstance(response, dict) else None
+    result = {
+        "ocxo1_dac": float(dac1) if has_dac1 and dac1 is not None else None,
+        "ocxo2_dac": float(dac2) if has_dac2 and dac2 is not None else None,
+        "input_aliases": {
+            **({"dac1": alias1} if alias1 else {}),
+            **({"dac2": alias2} if alias2 else {}),
+        },
+        "persistence": "MONITOR",
+        "teensy_message": response.get("message") if isinstance(response, dict) else None,
+        "teensy_payload": payload if isinstance(payload, dict) else {},
+    }
+    logging.info("🔧 [clocks] live SET_DAC: %s", result)
+    return {
+        "success": bool(response.get("success")) if isinstance(response, dict) else False,
+        "message": response.get("message", "OK") if isinstance(response, dict) else "SET_DAC failed",
+        "payload": result,
     }
 
-    logging.info("🔧 [clocks] SET_DAC boot seed override: %s", payload)
-    return {"success": True, "message": "OK", "payload": payload}
 
 
 def cmd_set_dither(args: Optional[dict]) -> Dict[str, Any]:
-    """
-    DITHER(dither, rate_hz=None)
-
-    Update the global OCXO dithering flag and optional dither frequency in the
-    SYSTEM config record.  This is a system-level setting, not a campaign
-    attribute.
-    """
+    """Set live Teensy dithering state; MONITOR owns restart continuity."""
     if not args or "dither" not in args:
         return {"success": False, "message": "DITHER requires 'dither' argument"}
 
@@ -8535,65 +8014,50 @@ def cmd_set_dither(args: Optional[dict]) -> Dict[str, Any]:
             try:
                 rate_hz = int(args.get(key))
             except (TypeError, ValueError):
-                return {"success": False, "message": f"Invalid dither rate for {key}: {args.get(key)!r}"}
+                return {
+                    "success": False,
+                    "message": f"Invalid dither rate for {key}: {args.get(key)!r}",
+                }
             break
 
     if rate_hz is not None and not (1 <= rate_hz <= 1000):
-        return {"success": False, "message": f"dither rate_hz must be 1..1000, got {rate_hz}"}
+        return {
+            "success": False,
+            "message": f"dither rate_hz must be 1..1000, got {rate_hz}",
+        }
 
-    update_blob = {"dither": dither}
+    teensy_args: Dict[str, Any] = {"dither": dither}
     if rate_hz is not None:
-        update_blob["dither_rate_hz"] = int(rate_hz)
+        teensy_args["rate_hz"] = int(rate_hz)
 
     try:
-        with open_db() as conn:
-            cur = conn.cursor()
-            cur.execute(
-                """
-                WITH updated AS (
-                    UPDATE config
-                    SET payload = COALESCE(payload, '{}'::jsonb) || %s::jsonb
-                    WHERE config_key = 'SYSTEM'
-                    RETURNING 1
-                )
-                INSERT INTO config (config_key, payload)
-                SELECT 'SYSTEM', %s::jsonb
-                WHERE NOT EXISTS (SELECT 1 FROM updated)
-                """,
-                (json.dumps(update_blob), json.dumps(update_blob)),
-            )
-    except Exception as e:
-        logging.exception("❌ [clocks] DITHER failed")
-        return {"success": False, "message": str(e)}
-
-    try:
-        teensy_args: Dict[str, Any] = {"dither": dither}
-        if rate_hz is not None:
-            teensy_args["rate_hz"] = int(rate_hz)
-        teensy_resp = send_command(
+        response = send_command(
             machine="TEENSY",
             subsystem="CLOCKS",
             command="DITHER",
             args=teensy_args,
         )
-    except Exception as e:
-        logging.exception("⚠️ [clocks] DITHER persisted but Teensy update failed")
-        return {
-            "success": False,
-            "message": f"SYSTEM config updated but Teensy DITHER command failed: {e}",
-            "payload": update_blob,
-        }
+    except Exception as exc:
+        logging.exception("❌ [clocks] live DITHER update failed")
+        return {"success": False, "message": str(exc)}
 
-    logging.info("🔧 [clocks] DITHER: %s resp=%s", update_blob, teensy_resp.get("message", "?"))
+    logging.info(
+        "🔧 [clocks] live DITHER: %s resp=%s",
+        teensy_args,
+        response.get("message", "?") if isinstance(response, dict) else "?",
+    )
     return {
-        "success": True,
-        "message": "OK",
+        "success": bool(response.get("success")) if isinstance(response, dict) else False,
+        "message": response.get("message", "OK") if isinstance(response, dict) else "DITHER failed",
         "payload": {
-            **update_blob,
-            "teensy_message": teensy_resp.get("message"),
-            "teensy_payload": teensy_resp.get("payload"),
+            **teensy_args,
+            "persistence": "MONITOR",
+            "teensy_payload": (
+                response.get("payload", {}) if isinstance(response, dict) else {}
+            ),
         },
     }
+
 
 
 COMMANDS = {
