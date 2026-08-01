@@ -394,13 +394,6 @@ static bool store_load(pps_t& pps, pps_vclock_t& pvc) {
   return false;
 }
 
-static pps_vclock_t store_load_pvc(void) {
-  pps_t pps{};
-  pps_vclock_t pvc{};
-  (void)store_load(pps, pvc);
-  return pvc;
-}
-
 struct epoch_capture_store_t {
   volatile uint32_t seq = 0;
   interrupt_epoch_capture_t value{};
@@ -418,16 +411,22 @@ static void epoch_capture_publish(const interrupt_epoch_capture_t& value) {
 
 bool interrupt_last_epoch_capture(interrupt_epoch_capture_t* out) {
   if (!out) return false;
+  *out = interrupt_epoch_capture_t{};
+
   for (uint32_t attempt = 0; attempt < 4U; ++attempt) {
     const uint32_t seq1 = g_epoch_capture.seq;
     if (seq1 & 1U) continue;
     dmb_barrier();
-    *out = g_epoch_capture.value;
+    interrupt_epoch_capture_t local = g_epoch_capture.value;
     dmb_barrier();
     const uint32_t seq2 = g_epoch_capture.seq;
-    if (seq1 == seq2 && (seq2 & 1U) == 0U) return out->valid;
+    if (seq1 == seq2 && (seq2 & 1U) == 0U) {
+      local.snapshot_ok = true;
+      *out = local;
+      return true;
+    }
   }
-  *out = interrupt_epoch_capture_t{};
+
   return false;
 }
 
@@ -788,8 +787,8 @@ static bool interrupt_dispatch_begin(interrupt_subscriber_runtime_t& rt,
   g_process_interrupt_foreground_pending = true;
 
   if (rt.desc->kind == interrupt_subscriber_kind_t::VCLOCK) {
-    rt.deferred.pps_continuation_valid = true;
-    rt.deferred.pps_continuation = interrupt_last_pps_edge();
+    rt.deferred.pps_continuation_valid =
+        interrupt_last_pps_edge(&rt.deferred.pps_continuation);
   }
   interrupt_priority0_guard_exit(prior_basepri);
 
@@ -1826,6 +1825,7 @@ static bool smartzero_snapshot_load(
     if (seq1 & 1U) continue;
     dmb_barrier();
     interrupt_smartzero_snapshot_t local{};
+    local.snapshot_ok = true;
     smartzero_lane_vote_report_t local_votes[SMARTZERO_LANE_COUNT]{};
     local.phase = g_smartzero.phase;
     local.running = g_smartzero.running;
@@ -1879,11 +1879,11 @@ static bool smartzero_snapshot_load(
 }
 
 bool interrupt_smartzero_live_snapshot(interrupt_smartzero_snapshot_t* out) {
-  return smartzero_snapshot_load(out) && out->complete;
+  return smartzero_snapshot_load(out);
 }
 
 bool interrupt_smartzero_snapshot(interrupt_smartzero_snapshot_t* out) {
-  return interrupt_smartzero_live_snapshot(out);
+  return smartzero_snapshot_load(out);
 }
 
 // ============================================================================
@@ -5121,8 +5121,11 @@ void interrupt_pps_edge_register_dispatch(pps_edge_dispatch_fn callback) {
           : nullptr;
 }
 
-pps_vclock_t interrupt_last_pps_vclock(void) {
-  return store_load_pvc();
+bool interrupt_last_pps_vclock(pps_vclock_t* out) {
+  if (!out) return false;
+  pps_t pps{};
+  *out = pps_vclock_t{};
+  return store_load(pps, *out);
 }
 
 bool interrupt_last_pps_vclock_phase_estimate(
@@ -5148,68 +5151,73 @@ bool interrupt_last_pps_vclock_phase_estimate(
   return estimate.valid;
 }
 
-pps_edge_snapshot_t interrupt_last_pps_edge(void) {
+bool interrupt_last_pps_edge(pps_edge_snapshot_t* out) {
+  if (!out) return false;
+  *out = pps_edge_snapshot_t{};
+
   pps_t pps{};
   pps_vclock_t pvc{};
-  (void)store_load(pps, pvc);
+  if (!store_load(pps, pvc)) return false;
 
-  pps_edge_snapshot_t out{};
-  out.sequence = pvc.sequence;
-  out.dwt_at_edge = pvc.dwt_at_edge;
-  out.dwt_raw_at_edge = pvc.dwt_at_edge;
-  out.counter32_at_edge = pvc.counter32_at_edge;
-  out.ch3_at_edge = pvc.ch3_at_edge;
-  out.gnss_ns_at_edge = -1;
-  out.physical_pps_dwt_raw_at_edge = pps.dwt_at_edge;
-  out.physical_pps_dwt_normalized_at_edge = pps.dwt_at_edge;
-  out.physical_pps_counter32_at_read = pps.counter32_at_edge;
-  out.physical_pps_ch3_at_read = pps.ch3_at_edge;
+  pps_edge_snapshot_t local{};
+  local.snapshot_ok = true;
+  local.sequence = pvc.sequence;
+  local.dwt_at_edge = pvc.dwt_at_edge;
+  local.dwt_raw_at_edge = pvc.dwt_at_edge;
+  local.counter32_at_edge = pvc.counter32_at_edge;
+  local.ch3_at_edge = pvc.ch3_at_edge;
+  local.gnss_ns_at_edge = -1;
+  local.physical_pps_dwt_raw_at_edge = pps.dwt_at_edge;
+  local.physical_pps_dwt_normalized_at_edge = pps.dwt_at_edge;
+  local.physical_pps_counter32_at_read = pps.counter32_at_edge;
+  local.physical_pps_ch3_at_read = pps.ch3_at_edge;
   const interrupt_delay_baseline_runtime_t* pps_delay_runtime =
       interrupt_delay_baseline_for(interrupt_execution_source_t::PPS);
-  out.physical_pps_arrival.valid = g_pps_arrival_entry_dwt != 0U;
-  out.physical_pps_arrival.capture = g_pps_arrival_capture;
-  out.physical_pps_arrival.spinidle_shadow_valid =
+  local.physical_pps_arrival.valid = g_pps_arrival_entry_dwt != 0U;
+  local.physical_pps_arrival.capture = g_pps_arrival_capture;
+  local.physical_pps_arrival.spinidle_shadow_valid =
       g_pps_arrival_capture.spinidle_running &&
       g_pps_arrival_capture.spinidle_shadow_dwt != 0U;
-  out.physical_pps_arrival.spinidle_age_cycles =
-      out.physical_pps_arrival.spinidle_shadow_valid
+  local.physical_pps_arrival.spinidle_age_cycles =
+      local.physical_pps_arrival.spinidle_shadow_valid
           ? (uint32_t)(g_pps_arrival_entry_dwt -
                        g_pps_arrival_capture.spinidle_shadow_dwt)
           : 0U;
-  out.physical_pps_arrival.spinidle_valid_threshold_cycles =
+  local.physical_pps_arrival.spinidle_valid_threshold_cycles =
       pps_delay_runtime && pps_delay_runtime->spin_valid
           ? pps_delay_runtime->spin_baseline_cycles +
                 INTERRUPT_DELAY_SPIN_GUARD_CYCLES
           : 0U;
-  out.physical_pps_arrival.spinidle_excess_cycles =
-      out.physical_pps_arrival.spinidle_shadow_valid &&
+  local.physical_pps_arrival.spinidle_excess_cycles =
+      local.physical_pps_arrival.spinidle_shadow_valid &&
               pps_delay_runtime && pps_delay_runtime->spin_valid &&
-              out.physical_pps_arrival.spinidle_age_cycles >
+              local.physical_pps_arrival.spinidle_age_cycles >
                   pps_delay_runtime->spin_baseline_cycles
-          ? out.physical_pps_arrival.spinidle_age_cycles -
+          ? local.physical_pps_arrival.spinidle_age_cycles -
                 pps_delay_runtime->spin_baseline_cycles
           : 0U;
-  out.physical_pps_arrival.preempted_after_entry = false;
+  local.physical_pps_arrival.preempted_after_entry = false;
 
-  out.spinidle_shadow_valid =
-      out.physical_pps_arrival.spinidle_shadow_valid;
-  out.spinidle_shadow_dwt =
-      out.physical_pps_arrival.capture.spinidle_shadow_dwt;
-  out.spinidle_shadow_to_isr_entry_cycles =
-      out.physical_pps_arrival.spinidle_age_cycles;
-  out.spinidle_shadow_valid_threshold_cycles =
-      out.physical_pps_arrival.spinidle_valid_threshold_cycles;
-  out.interrupt_delay = g_pps_interrupt_delay;
-  out.vclock_epoch_counter32 = pvc.counter32_at_edge;
-  out.vclock_epoch_ch3 = pvc.ch3_at_edge;
-  out.vclock_epoch_ticks_after_pps =
+  local.spinidle_shadow_valid =
+      local.physical_pps_arrival.spinidle_shadow_valid;
+  local.spinidle_shadow_dwt =
+      local.physical_pps_arrival.capture.spinidle_shadow_dwt;
+  local.spinidle_shadow_to_isr_entry_cycles =
+      local.physical_pps_arrival.spinidle_age_cycles;
+  local.spinidle_shadow_valid_threshold_cycles =
+      local.physical_pps_arrival.spinidle_valid_threshold_cycles;
+  local.interrupt_delay = g_pps_interrupt_delay;
+  local.vclock_epoch_counter32 = pvc.counter32_at_edge;
+  local.vclock_epoch_ch3 = pvc.ch3_at_edge;
+  local.vclock_epoch_ticks_after_pps =
       VCLOCK_EPOCH_TICKS_AFTER_PHYSICAL_PPS;
-  out.vclock_epoch_counter32_offset_ticks =
+  local.vclock_epoch_counter32_offset_ticks =
       VCLOCK_EPOCH_COUNTER32_OFFSET_TICKS;
-  out.vclock_epoch_dwt_offset_cycles = 0;
-  out.vclock_epoch_selected = pvc.sequence != 0U;
-  out.vclock_edge_authority = g_pps_vclock_edge_authority;
-  return out;
+  local.vclock_epoch_dwt_offset_cycles = 0;
+  local.vclock_epoch_selected = pvc.sequence != 0U;
+  local.vclock_edge_authority = g_pps_vclock_edge_authority;
+  *out = local;
+  return true;
 }
 
 interrupt_pps_edge_heartbeat_t interrupt_pps_edge_heartbeat(void) {
@@ -6495,14 +6503,17 @@ static FLASHMEM Payload cmd_report_fpu_context(const Payload&) {
 static FLASHMEM Payload cmd_report_pps(const Payload&) {
   Payload payload;
   payload.add("report", "INTERRUPT_PPS");
-  const pps_edge_snapshot_t snapshot = interrupt_last_pps_edge();
+  pps_edge_snapshot_t snapshot{};
+  const bool snapshot_ok = interrupt_last_pps_edge(&snapshot);
+  payload.add("snapshot_ok", snapshot_ok);
   payload.add("sequence", snapshot.sequence);
   payload.add("pps_dwt_at_edge",
               snapshot.physical_pps_dwt_normalized_at_edge);
   payload.add("vclock_dwt_at_edge", snapshot.dwt_at_edge);
   payload.add("vclock_counter32_at_edge", snapshot.counter32_at_edge);
   payload.add("vclock_target_low16", (uint32_t)snapshot.ch3_at_edge);
-  payload.add("authority", "OBSERVED_QTIMER_EDGE");
+  payload.add("authority",
+              snapshot_ok ? "OBSERVED_QTIMER_EDGE" : "SNAPSHOT_UNAVAILABLE");
   payload.add("gpio_irq_count", g_gpio_irq_count);
   payload.add("gpio_miss_count", g_gpio_miss_count);
   payload.add("relay_active", (bool)g_pps_relay_active);
@@ -6637,7 +6648,8 @@ static FLASHMEM Payload cmd_report_smartzero(const Payload&) {
   payload.add("report", "INTERRUPT_SMARTZERO");
   interrupt_smartzero_snapshot_t snapshot{};
   smartzero_lane_vote_report_t votes[SMARTZERO_LANE_COUNT]{};
-  (void)smartzero_snapshot_load(&snapshot, votes);
+  const bool snapshot_ok = smartzero_snapshot_load(&snapshot, votes);
+  payload.add("snapshot_ok", snapshot_ok);
   payload.add("phase", smartzero_phase_name(snapshot.phase));
   payload.add("running", snapshot.running);
   payload.add("complete", snapshot.complete);

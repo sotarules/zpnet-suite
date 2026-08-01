@@ -582,6 +582,7 @@ bool clocks_alpha_ocxo_counterledger_ready(void);
 #ifndef CLOCKS_ALPHA_TAU_SNAPSHOT_T_DEFINED
 #define CLOCKS_ALPHA_TAU_SNAPSHOT_T_DEFINED
 struct clocks_alpha_tau_snapshot_t {
+  bool     snapshot_ok = false;
   bool     valid = false;
   uint32_t clock_id = 0;
   uint32_t epoch_sequence = 0;
@@ -723,6 +724,7 @@ extern clock_measurement_t g_ocxo2_measurement;
 // diagnostic only; summary remains the compact system-health surface.
 
 struct clocks_alpha_lane_forensics_t {
+  bool     snapshot_ok = false;
   bool     valid;
   uint32_t update_count;
 
@@ -985,6 +987,7 @@ bool clocks_alpha_lane_forensics(time_clock_id_t clock,
 // gate, and the tautological GNSS self-map check.
 
 struct clocks_pps_vclock_edge_forensics_t {
+  bool     snapshot_ok = false;
   bool     valid;
   uint32_t sequence;
   uint32_t update_count;
@@ -1185,6 +1188,7 @@ bool clocks_alpha_event_flow_snapshot(time_clock_id_t clock,
 // no public clock coordinate is adjusted yet.
 
 struct clocks_alpha_ocxo_visible_origin_snapshot_t {
+  bool     snapshot_ok = false;
   bool     valid = false;
   // Retained for report compatibility; direct SmartZero-anchor computation
   // should complete synchronously at epoch install, so this should be false.
@@ -1427,6 +1431,7 @@ bool clocks_alpha_recover_ocxo_reattach_ready(void);
 // that value into g_ocxo*_measured_gnss_ns_at_pps_vclock or TIMEBASE.
 
 struct clocks_alpha_ocxo_pps_projection_snapshot_t {
+  bool     snapshot_ok = false;
   bool     valid;
   uint32_t clock_id;
   uint32_t update_count;
@@ -1866,6 +1871,7 @@ struct clocks_instrument_frequency_snapshot_t {
 };
 
 struct clocks_instrument_stats_snapshot_t {
+  bool     snapshot_ok = false;
   bool     valid = false;
   uint32_t reset_count = 0;
   uint32_t update_count = 0;
@@ -2004,6 +2010,7 @@ void clocks_alpha_ocxo_grid_rephase_acknowledge(
 // Compatibility report transcript.  The historic SmartZero naming remains on
 // the wire, but RECOVER now travels through the same physical-grid machinery.
 struct clocks_alpha_smartzero_delay_snapshot_t {
+  bool     snapshot_ok = false;
   bool     valid = false;
   bool     reference_from_pps_vclock = false;
   bool     ocxo1_zero_ok = false;

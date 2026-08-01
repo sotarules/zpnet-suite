@@ -708,6 +708,8 @@ struct interrupt_smartzero_lane_snapshot_t {
 };
 
 struct interrupt_smartzero_snapshot_t {
+  // Snapshot acquisition is independent of SmartZero lifecycle validity.
+  bool snapshot_ok = false;
   interrupt_smartzero_phase_t phase = interrupt_smartzero_phase_t::IDLE;
   bool running = false;
   bool complete = false;
@@ -729,6 +731,8 @@ void interrupt_smartzero_abort(void);
 bool interrupt_smartzero_running(void);
 bool interrupt_smartzero_complete(void);
 
+// Boolean return means a coherent snapshot was acquired.  Lifecycle state is
+// carried separately by running/complete/aborted and snapshot_ok.
 bool interrupt_smartzero_live_snapshot(interrupt_smartzero_snapshot_t* out);
 
 bool interrupt_smartzero_snapshot(interrupt_smartzero_snapshot_t* out);
@@ -1079,6 +1083,7 @@ struct pps_vclock_phase_estimate_t {
 };
 
 struct pps_edge_snapshot_t {
+  bool     snapshot_ok       = false;
   uint32_t sequence          = 0;
 
   uint32_t dwt_at_edge       = 0;
@@ -1114,6 +1119,7 @@ struct pps_edge_snapshot_t {
 };
 
 struct interrupt_epoch_capture_t {
+  bool     snapshot_ok = false;
   bool     valid = false;
   uint32_t sequence = 0;
 
@@ -1140,6 +1146,8 @@ struct interrupt_epoch_capture_t {
   uint32_t ocxo2_counter32 = 0;
 };
 
+// Boolean return means a coherent copy was acquired; out->valid describes
+// whether that copy contains a completed epoch capture.
 bool interrupt_last_epoch_capture(interrupt_epoch_capture_t* out);
 
 void interrupt_ocxo_logical_grid_epoch(uint32_t ocxo1_epoch_counter32,
@@ -1219,7 +1227,8 @@ const interrupt_capture_diag_t* interrupt_last_diag (interrupt_subscriber_kind_t
 
 void interrupt_pps_edge_register_dispatch(pps_edge_dispatch_fn fn);
 
-pps_vclock_t interrupt_last_pps_vclock(void);
+// Boolean return means the shared PPS/VCLOCK store was copied coherently.
+bool interrupt_last_pps_vclock(pps_vclock_t* out);
 
 void interrupt_pps_vclock_label_anchor(uint32_t sequence,
                                        uint32_t counter32_at_edge,
@@ -1239,7 +1248,8 @@ bool interrupt_dwt_publication_launch_acquisition_active(void);
 bool interrupt_last_pps_vclock_phase_estimate(
     pps_vclock_phase_estimate_t* out);
 
-pps_edge_snapshot_t interrupt_last_pps_edge(void);
+// Boolean return means the shared PPS/VCLOCK store was copied coherently.
+bool interrupt_last_pps_edge(pps_edge_snapshot_t* out);
 
 using interrupt_pps_entry_latency_handler_fn =
     void (*)(uint32_t sequence, uint32_t isr_entry_dwt_raw);

@@ -214,6 +214,7 @@ uint64_t clocks_ocxo2_measured_gnss_ns_now(void);
 // Each lane uses the prior completed interval as the next-second prediction.
 
 struct clocks_static_prediction_snapshot_t {
+  bool     snapshot_ok = false;
   uint32_t clock_id = 0;
   bool     valid = false;
 
@@ -228,6 +229,9 @@ struct clocks_static_prediction_snapshot_t {
 };
 
 void clocks_static_prediction_reset_all(void);
+
+// Return value reports coherent snapshot acquisition only.  snapshot.valid
+// separately reports whether enough intervals exist for a scientific residual.
 bool clocks_static_prediction_pps_snapshot(clocks_static_prediction_snapshot_t* out);
 bool clocks_static_prediction_snapshot(time_clock_id_t clock,
                                        clocks_static_prediction_snapshot_t* out);
@@ -257,6 +261,7 @@ bool clocks_dwt_calibration_valid(void);
 #ifndef CLOCKS_ALPHA_TAU_SNAPSHOT_T_DEFINED
 #define CLOCKS_ALPHA_TAU_SNAPSHOT_T_DEFINED
 struct clocks_alpha_tau_snapshot_t {
+  bool     snapshot_ok = false;
   bool     valid = false;
   uint32_t clock_id = 0;
   uint32_t epoch_sequence = 0;
@@ -293,6 +298,8 @@ struct clocks_alpha_tau_snapshot_t {
 };
 #endif
 
+// Return value reports coherent snapshot acquisition only.  snapshot.valid
+// separately reports whether the estimator has a mature frequency result.
 bool clocks_alpha_ocxo_tau_snapshot(time_clock_id_t clock,
                                     clocks_alpha_tau_snapshot_t* out);
 
@@ -310,11 +317,13 @@ bool clocks_alpha_tau_snapshot(time_clock_id_t clock,
 // immutable domain facts only: no Payload objects, field names, or nested
 // serialized fragments cross the subsystem boundary.
 //
-// clocks_monitor_snapshot_take() always returns the latest coherent live
-// instrument view. If Beta has completed a public campaign record for the
-// requested sequence, that record is copied into campaign and atomically
-// consumed. A later SYSTEM publication therefore cannot accidentally combine
-// campaign facts from different completed seconds.
+// clocks_monitor_snapshot_take() returns whether the typed handoff package was
+// constructed.  live.snapshot_ok separately reports whether Alpha supplied a
+// coherent live instrument snapshot; SYSTEM may therefore publish explicit
+// unavailability instead of suppressing the heartbeat.  If Beta has completed
+// a public campaign record for the requested sequence, that record is copied
+// into campaign and atomically consumed. A later SYSTEM publication therefore
+// cannot accidentally combine campaign facts from different completed seconds.
 
 static constexpr size_t CLOCKS_MONITOR_CAMPAIGN_NAME_MAX = 64U;
 static constexpr size_t CLOCKS_MONITOR_STATE_NAME_MAX = 40U;
@@ -374,6 +383,7 @@ struct clocks_monitor_stats_clock_snapshot_t {
 };
 
 struct clocks_monitor_stats_snapshot_t {
+  bool snapshot_ok = false;
   bool valid = false;
   uint32_t reset_count = 0;
   uint32_t update_count = 0;
@@ -415,6 +425,8 @@ struct clocks_monitor_stats_snapshot_t {
 };
 
 struct clocks_monitor_raw_cycles_lane_t {
+  bool snapshot_ok = false;
+  bool forensics_snapshot_ok = false;
   bool valid = false;
   uint32_t completed_interval_count = 0;
   uint32_t observed_cycles = 0;

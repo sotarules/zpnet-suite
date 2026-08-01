@@ -4295,8 +4295,10 @@ static FLASHMEM void payload_add_smartzero_delay_transaction(Payload& p) {
   clocks_alpha_smartzero_delay_snapshot_t& s =
       g_beta_report_smartzero_delay_scratch;
   s = clocks_alpha_smartzero_delay_snapshot_t{};
-  const bool available = clocks_alpha_smartzero_delay_snapshot(&s);
+  const bool snapshot_ok = clocks_alpha_smartzero_delay_snapshot(&s);
+  const bool available = snapshot_ok && s.install_count != 0U;
 
+  p.add("smartzero_delay_snapshot_ok", snapshot_ok);
   p.add("smartzero_delay_available", available);
   p.add("smartzero_delay_valid", available && s.valid);
   p.add("smartzero_delay_reference_from_pps_vclock",
@@ -4389,10 +4391,12 @@ static FLASHMEM void payload_add_visible_origin_snapshot(Payload& parent,
                                                 time_clock_id_t clock) {
   clocks_alpha_ocxo_visible_origin_snapshot_t& s = g_beta_report_visible_origin_scratch;
   s = clocks_alpha_ocxo_visible_origin_snapshot_t{};
-  const bool available =
+  const bool snapshot_ok =
       clocks_alpha_ocxo_visible_origin_snapshot(clock, &s);
+  const bool available = snapshot_ok && (s.valid || s.pending);
 
   Payload obj;
+  obj.add("snapshot_ok", snapshot_ok);
   obj.add("available", available);
   obj.add("valid", available && s.valid);
   obj.add("pending", available && s.pending);
@@ -4442,7 +4446,8 @@ static FLASHMEM void payload_add_visible_origin_summary(Payload& p) {
 static FLASHMEM void payload_add_smartzero_summary(Payload& p) {
   interrupt_smartzero_snapshot_t& live = g_beta_report_live_smartzero_scratch;
   live = interrupt_smartzero_snapshot_t{};
-  (void)interrupt_smartzero_live_snapshot(&live);
+  const bool live_snapshot_ok = interrupt_smartzero_live_snapshot(&live);
+  p.add("live_smartzero_snapshot_ok", live_snapshot_ok);
 
   interrupt_smartzero_snapshot_t& installed = g_beta_report_installed_smartzero_scratch;
   installed = interrupt_smartzero_snapshot_t{};
@@ -4468,7 +4473,8 @@ static FLASHMEM void payload_add_smartzero_summary(Payload& p) {
     p.add("installed_smartzero_ocxo2_anchor_counter32", 0U);
   }
 
-  payload_add_prefixed_smartzero_compact(p, "live_smartzero", live, true);
+  payload_add_prefixed_smartzero_compact(
+      p, "live_smartzero", live, live_snapshot_ok);
   p.add("smartzero_pending_active", clocks_alpha_smartzero_pending_active());
   p.add("smartzero_pending_reason", clocks_alpha_smartzero_pending_reason());
   payload_add_smartzero_install_transaction(p);
@@ -4500,7 +4506,8 @@ static FLASHMEM void payload_add_smartzero_summary(Payload& p) {
   p.add("smartzero_tolerance_cycles", live.tolerance_cycles);
 
   payload_add_smartzero_snapshot_object(p, "installed_smartzero", installed, installed_valid, true);
-  payload_add_smartzero_snapshot_object(p, "live_smartzero", live, true, true);
+  payload_add_smartzero_snapshot_object(
+      p, "live_smartzero", live, live_snapshot_ok, true);
 
   Payload live_lanes;
   payload_add_smartzero_lane(live_lanes, "vclock", live.lanes[0]);
@@ -4510,16 +4517,21 @@ static FLASHMEM void payload_add_smartzero_summary(Payload& p) {
 }
 
 
-static FLASHMEM clocks_static_prediction_snapshot_t prediction_snapshot_for_pps(void) {
-  clocks_static_prediction_snapshot_t s{};
-  (void)clocks_static_prediction_pps_snapshot(&s);
-  return s;
+static FLASHMEM void prediction_snapshot_for_pps(
+    clocks_static_prediction_snapshot_t& out) {
+  out = clocks_static_prediction_snapshot_t{};
+  if (!clocks_static_prediction_pps_snapshot(&out)) {
+    out = clocks_static_prediction_snapshot_t{};
+  }
 }
 
-static FLASHMEM clocks_static_prediction_snapshot_t prediction_snapshot_for_clock(time_clock_id_t clock) {
-  clocks_static_prediction_snapshot_t s{};
-  (void)clocks_static_prediction_snapshot(clock, &s);
-  return s;
+static FLASHMEM void prediction_snapshot_for_clock(
+    time_clock_id_t clock,
+    clocks_static_prediction_snapshot_t& out) {
+  out = clocks_static_prediction_snapshot_t{};
+  if (!clocks_static_prediction_snapshot(clock, &out)) {
+    out = clocks_static_prediction_snapshot_t{};
+  }
 }
 
 
@@ -4589,6 +4601,7 @@ static FLASHMEM void report_add_stats_summary_from_snapshot(
   stats.add("always_on", true);
   stats.add("owner", "ALPHA");
   stats.add("lifetime", "BOOT_TO_REBOOT_OR_STATS_RESET");
+  stats.add("snapshot_ok", instrument.snapshot_ok);
   stats.add("valid", instrument.valid);
   stats.add("reset_count", instrument.reset_count);
   stats.add("update_count", instrument.update_count);
@@ -4702,6 +4715,7 @@ static FLASHMEM void clocks_monitor_stats_snapshot_from_instrument(
     clocks_monitor_stats_snapshot_t& out,
     const clocks_instrument_stats_snapshot_t& instrument) {
   memset(&out, 0, sizeof(out));
+  out.snapshot_ok = instrument.snapshot_ok;
   out.valid = instrument.valid;
   out.reset_count = instrument.reset_count;
   out.update_count = instrument.update_count;
@@ -5854,13 +5868,24 @@ static FLASHMEM void clocks_monitor_science_snapshot_from_row(
 static FLASHMEM void clocks_monitor_raw_cycles_lane_snapshot(
     clocks_monitor_raw_cycles_lane_t& out,
     const clocks_static_prediction_snapshot_t& sample,
+    bool forensics_snapshot_ok,
     const interrupt_delay_forensics_t& delay) {
   out = clocks_monitor_raw_cycles_lane_t{};
-  out.valid = sample.valid;
+  out.snapshot_ok = sample.snapshot_ok;
+  out.forensics_snapshot_ok = forensics_snapshot_ok;
+  out.valid = sample.snapshot_ok && sample.valid;
   out.completed_interval_count = sample.completed_interval_count;
   out.observed_cycles = sample.actual_cycles;
   out.previous_observed_cycles = sample.static_prediction_cycles;
   out.residual_cycles = sample.static_residual_cycles;
+
+  if (!forensics_snapshot_ok) {
+    clocks_monitor_copy_text(out.delay_status,
+                             sizeof(out.delay_status),
+                             "SNAPSHOT_UNAVAILABLE");
+    out.delay_detail_present = false;
+    return;
+  }
 
   const char* delay_status = interrupt_delay_verdict_str(delay.verdict);
   clocks_monitor_copy_text(out.delay_status,
@@ -5868,7 +5893,7 @@ static FLASHMEM void clocks_monitor_raw_cycles_lane_snapshot(
                            delay_status);
   out.delay_detail_present = true;
 
-  out.residual_delay_valid = delay.residual_delay_valid && sample.valid;
+  out.residual_delay_valid = delay.residual_delay_valid && out.valid;
   const int64_t residual_after_delay_64 = out.residual_delay_valid
       ? (int64_t)sample.static_residual_cycles -
             (int64_t)delay.residual_delay_cycles
@@ -5911,14 +5936,20 @@ static FLASHMEM void clocks_monitor_raw_cycles_snapshot(
     const clocks_static_prediction_snapshot_t& ocxo1,
     const clocks_static_prediction_snapshot_t& ocxo2,
     const interrupt_delay_forensics_t& pps_delay,
-    const interrupt_delay_forensics_t& vclock_delay,
-    const interrupt_delay_forensics_t& ocxo1_delay,
-    const interrupt_delay_forensics_t& ocxo2_delay) {
+    const clocks_alpha_lane_forensics_t& vclock_forensics,
+    const clocks_alpha_lane_forensics_t& ocxo1_forensics,
+    const clocks_alpha_lane_forensics_t& ocxo2_forensics) {
   memset(&out, 0, sizeof(out));
-  clocks_monitor_raw_cycles_lane_snapshot(out.pps, pps, pps_delay);
-  clocks_monitor_raw_cycles_lane_snapshot(out.vclock, vclock, vclock_delay);
-  clocks_monitor_raw_cycles_lane_snapshot(out.ocxo1, ocxo1, ocxo1_delay);
-  clocks_monitor_raw_cycles_lane_snapshot(out.ocxo2, ocxo2, ocxo2_delay);
+  clocks_monitor_raw_cycles_lane_snapshot(out.pps, pps, true, pps_delay);
+  clocks_monitor_raw_cycles_lane_snapshot(
+      out.vclock, vclock, vclock_forensics.snapshot_ok,
+      vclock_forensics.interrupt_delay);
+  clocks_monitor_raw_cycles_lane_snapshot(
+      out.ocxo1, ocxo1, ocxo1_forensics.snapshot_ok,
+      ocxo1_forensics.interrupt_delay);
+  clocks_monitor_raw_cycles_lane_snapshot(
+      out.ocxo2, ocxo2, ocxo2_forensics.snapshot_ok,
+      ocxo2_forensics.interrupt_delay);
 }
 
 
@@ -7156,23 +7187,29 @@ static FLASHMEM void clocks_monitor_dac_snapshot(
 }
 
 static FLASHMEM void clocks_monitor_refresh_prediction_snapshots(void) {
-  g_beta_monitor_pps_prediction = prediction_snapshot_for_pps();
-  g_beta_monitor_vclock_prediction =
-      prediction_snapshot_for_clock(time_clock_id_t::VCLOCK);
-  g_beta_monitor_ocxo1_prediction =
-      prediction_snapshot_for_clock(time_clock_id_t::OCXO1);
-  g_beta_monitor_ocxo2_prediction =
-      prediction_snapshot_for_clock(time_clock_id_t::OCXO2);
+  prediction_snapshot_for_pps(g_beta_monitor_pps_prediction);
+  prediction_snapshot_for_clock(
+      time_clock_id_t::VCLOCK, g_beta_monitor_vclock_prediction);
+  prediction_snapshot_for_clock(
+      time_clock_id_t::OCXO1, g_beta_monitor_ocxo1_prediction);
+  prediction_snapshot_for_clock(
+      time_clock_id_t::OCXO2, g_beta_monitor_ocxo2_prediction);
 
   g_beta_monitor_vclock_forensics = clocks_alpha_lane_forensics_t{};
   g_beta_monitor_ocxo1_forensics = clocks_alpha_lane_forensics_t{};
   g_beta_monitor_ocxo2_forensics = clocks_alpha_lane_forensics_t{};
-  (void)clocks_alpha_lane_forensics(
-      time_clock_id_t::VCLOCK, &g_beta_monitor_vclock_forensics);
-  (void)clocks_alpha_lane_forensics(
-      time_clock_id_t::OCXO1, &g_beta_monitor_ocxo1_forensics);
-  (void)clocks_alpha_lane_forensics(
-      time_clock_id_t::OCXO2, &g_beta_monitor_ocxo2_forensics);
+  if (!clocks_alpha_lane_forensics(
+          time_clock_id_t::VCLOCK, &g_beta_monitor_vclock_forensics)) {
+    g_beta_monitor_vclock_forensics = clocks_alpha_lane_forensics_t{};
+  }
+  if (!clocks_alpha_lane_forensics(
+          time_clock_id_t::OCXO1, &g_beta_monitor_ocxo1_forensics)) {
+    g_beta_monitor_ocxo1_forensics = clocks_alpha_lane_forensics_t{};
+  }
+  if (!clocks_alpha_lane_forensics(
+          time_clock_id_t::OCXO2, &g_beta_monitor_ocxo2_forensics)) {
+    g_beta_monitor_ocxo2_forensics = clocks_alpha_lane_forensics_t{};
+  }
 }
 
 static FLASHMEM void clocks_monitor_live_snapshot_fill(
@@ -7286,9 +7323,9 @@ static FLASHMEM void clocks_monitor_live_snapshot_fill(
       g_beta_monitor_ocxo1_prediction,
       g_beta_monitor_ocxo2_prediction,
       g_pps_witness_diag.interrupt_delay,
-      g_beta_monitor_vclock_forensics.interrupt_delay,
-      g_beta_monitor_ocxo1_forensics.interrupt_delay,
-      g_beta_monitor_ocxo2_forensics.interrupt_delay);
+      g_beta_monitor_vclock_forensics,
+      g_beta_monitor_ocxo1_forensics,
+      g_beta_monitor_ocxo2_forensics);
   clocks_monitor_stats_snapshot_from_instrument(out.stats, instrument);
   clocks_monitor_dac_snapshot(out.dac);
   clocks_recovery_state_snapshot(
@@ -7574,9 +7611,11 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
   clocks_alpha_lane_forensics_t& vclock_forensics =
       g_beta_pps_vclock_forensics;
   vclock_forensics = clocks_alpha_lane_forensics_t{};
-  const bool vclock_forensics_valid =
+  const bool vclock_forensics_snapshot_ok =
       clocks_alpha_lane_forensics(time_clock_id_t::VCLOCK,
                                   &vclock_forensics);
+  const bool vclock_forensics_valid =
+      vclock_forensics_snapshot_ok && vclock_forensics.valid;
   // Form the complete current-row forensic tuple before the START prologue
   // decides whether this candidate remains private PPS0 or becomes public PPS1.
   // The old ordering ran the warmup court first, so it could suppress the very
@@ -7586,10 +7625,14 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
   ocxo1_forensics = clocks_alpha_lane_forensics_t{};
   ocxo2_forensics = clocks_alpha_lane_forensics_t{};
 
-  const bool ocxo1_forensics_valid =
+  const bool ocxo1_forensics_snapshot_ok =
       clocks_alpha_lane_forensics(time_clock_id_t::OCXO1, &ocxo1_forensics);
-  const bool ocxo2_forensics_valid =
+  const bool ocxo2_forensics_snapshot_ok =
       clocks_alpha_lane_forensics(time_clock_id_t::OCXO2, &ocxo2_forensics);
+  const bool ocxo1_forensics_valid =
+      ocxo1_forensics_snapshot_ok && ocxo1_forensics.valid;
+  const bool ocxo2_forensics_valid =
+      ocxo2_forensics_snapshot_ok && ocxo2_forensics.valid;
 
   // The completed row is one immutable scientific identity.  Snapshot every
   // Alpha authority once, then prove that the PPS/VCLOCK bookend, both
@@ -7598,8 +7641,11 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
   clocks_pps_vclock_edge_forensics_t& pps_vclock_edge_forensics =
       g_beta_pps_vclock_edge_forensics;
   pps_vclock_edge_forensics = clocks_pps_vclock_edge_forensics_t{};
-  const bool pps_vclock_edge_forensics_valid =
+  const bool pps_vclock_edge_forensics_snapshot_ok =
       clocks_alpha_pps_vclock_edge_forensics(&pps_vclock_edge_forensics);
+  const bool pps_vclock_edge_forensics_valid =
+      pps_vclock_edge_forensics_snapshot_ok &&
+      pps_vclock_edge_forensics.valid;
 
   g_beta_ocxo1_counterledger_row = clocks_alpha_ocxo_counterledger_snapshot_t{};
   g_beta_ocxo2_counterledger_row = clocks_alpha_ocxo_counterledger_snapshot_t{};
@@ -7930,13 +7976,13 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
   // Four local observed-interval snapshots feed raw_cycles.  The prior
   // completed interval is the prediction field; no duplicate prediction or
   // cycle-residual diagnostic object is serialized.
-  g_beta_pps_cycle_prediction = prediction_snapshot_for_pps();
-  g_beta_vclock_cycle_prediction =
-      prediction_snapshot_for_clock(time_clock_id_t::VCLOCK);
-  g_beta_ocxo1_cycle_prediction =
-      prediction_snapshot_for_clock(time_clock_id_t::OCXO1);
-  g_beta_ocxo2_cycle_prediction =
-      prediction_snapshot_for_clock(time_clock_id_t::OCXO2);
+  prediction_snapshot_for_pps(g_beta_pps_cycle_prediction);
+  prediction_snapshot_for_clock(
+      time_clock_id_t::VCLOCK, g_beta_vclock_cycle_prediction);
+  prediction_snapshot_for_clock(
+      time_clock_id_t::OCXO1, g_beta_ocxo1_cycle_prediction);
+  prediction_snapshot_for_clock(
+      time_clock_id_t::OCXO2, g_beta_ocxo2_cycle_prediction);
 
   g_beta_instrument_stats = clocks_instrument_stats_snapshot_t{};
   bool instrument_stats_ready =
@@ -8277,9 +8323,9 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
       g_beta_ocxo1_cycle_prediction,
       g_beta_ocxo2_cycle_prediction,
       g_pps_witness_diag.interrupt_delay,
-      g_beta_pps_vclock_forensics.interrupt_delay,
-      g_beta_pps_ocxo1_forensics.interrupt_delay,
-      g_beta_pps_ocxo2_forensics.interrupt_delay);
+      g_beta_pps_vclock_forensics,
+      g_beta_pps_ocxo1_forensics,
+      g_beta_pps_ocxo2_forensics);
 
   record.ocxo1_ns = public_ocxo1_ns;
   record.ocxo1_clockface_valid = ocxo1_clockface_valid;
@@ -8292,8 +8338,10 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
 
   if (!instrument_stats_ready) {
     g_beta_instrument_stats = clocks_instrument_stats_snapshot_t{};
-    instrument_stats_ready =
+    const bool instrument_stats_snapshot_ok =
         clocks_alpha_instrument_stats_snapshot(&g_beta_instrument_stats);
+    instrument_stats_ready =
+        instrument_stats_snapshot_ok && g_beta_instrument_stats.valid;
   }
   clocks_monitor_stats_snapshot_from_instrument(
       record.stats, g_beta_instrument_stats);

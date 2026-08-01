@@ -32,6 +32,7 @@ OCXO_SECOND_WARN_NS = 500
 OCXO_SECOND_ALARM_NS = 10_000
 PPB_ABSOLUTE_ALARM = 10_000.0
 PPB_STEP_ALARM = 100.0
+SNAPSHOT_LANES = ("pps", "vclock", "ocxo1", "ocxo2")
 
 
 def d(v: Any) -> Dict[str, Any]:
@@ -231,6 +232,16 @@ class CompactRow:
     science_ready: Optional[bool]
     welford_n: Dict[str, Optional[int]]
     welford_sd: Dict[str, Optional[float]]
+    snapshot_contract_present: bool
+    snapshot_contract_missing: Tuple[str, ...]
+    stats_snapshot_ok: Optional[bool]
+    stats_valid: Optional[bool]
+    stats_completed_row_coherent: Optional[bool]
+    raw_snapshot_ok: Dict[str, Optional[bool]]
+    raw_valid: Dict[str, Optional[bool]]
+    forensics_snapshot_ok: Dict[str, Optional[bool]]
+    delay_detail_present: Dict[str, Optional[bool]]
+    delay_status: Dict[str, str]
     servo_mode: str
     location: str
     environment: Dict[str, Any]
@@ -270,6 +281,23 @@ class Audit:
     ppb_steps: int = 0
     welford_regressions: int = 0
     welford_hold_changes: int = 0
+    snapshot_contract_rows: int = 0
+    snapshot_clean_rows: int = 0
+    snapshot_legacy_rows: int = 0
+    first_snapshot_contract_pps: Optional[int] = None
+    last_snapshot_contract_pps: Optional[int] = None
+    snapshot_missing_after_activation: int = 0
+    snapshot_contract_omissions: Counter[str] = field(default_factory=Counter)
+    snapshot_contract_violations: int = 0
+    snapshot_contract_violation_rows: int = 0
+    snapshot_failure_rows: int = 0
+    snapshot_failure_science_rows: int = 0
+    stats_snapshot_failures: int = 0
+    prediction_snapshot_failures: Counter[str] = field(default_factory=Counter)
+    forensics_snapshot_failures: Counter[str] = field(default_factory=Counter)
+    coherent_immature_snapshots: Counter[str] = field(default_factory=Counter)
+    coherent_immature_rows: int = 0
+    last_coherent_immature_pps: Optional[int] = None
     science_event_rows: int = 0
     last_science_event_pps: Optional[int] = None
     examples: Dict[str, list[str]] = field(default_factory=dict)
@@ -403,6 +431,81 @@ def compact(db_id: int, db_pps: int, ts: str, payload: Dict[str, Any]) -> Compac
         science_disposition(payload, frag)
     )
 
+    stats_obj = d(frag.get("stats"))
+    raw_cycles = d(frag.get("raw_cycles"))
+    raw_lanes = {lane: d(raw_cycles.get(lane)) for lane in SNAPSHOT_LANES}
+
+    stats_snapshot_ok = b(stats_obj.get("snapshot_ok"))
+    stats_valid = b(stats_obj.get("valid"))
+    stats_completed_row_coherent = b(stats_obj.get("completed_row_coherent"))
+    raw_snapshot_ok = {
+        lane: b(raw_lanes[lane].get("snapshot_ok")) for lane in SNAPSHOT_LANES
+    }
+    raw_valid = {
+        lane: b(raw_lanes[lane].get("valid")) for lane in SNAPSHOT_LANES
+    }
+    forensics_snapshot_ok = {
+        lane: b(raw_lanes[lane].get("forensics_snapshot_ok"))
+        for lane in SNAPSHOT_LANES
+    }
+    delay_detail_present = {
+        lane: b(raw_lanes[lane].get("delay_detail_present"))
+        for lane in SNAPSHOT_LANES
+    }
+    delay_status = {
+        lane: str(raw_lanes[lane].get("delay_status") or "").strip().upper()
+        for lane in SNAPSHOT_LANES
+    }
+
+    snapshot_contract_present = bool(
+        "snapshot_ok" in stats_obj
+        or any(
+            "snapshot_ok" in raw_lanes[lane]
+            or "forensics_snapshot_ok" in raw_lanes[lane]
+            or "delay_detail_present" in raw_lanes[lane]
+            for lane in SNAPSHOT_LANES
+        )
+    )
+    snapshot_contract_missing: list[str] = []
+    if snapshot_contract_present:
+        for name, value in (
+            ("stats.snapshot_ok", stats_snapshot_ok),
+            ("stats.valid", stats_valid),
+            ("stats.completed_row_coherent", stats_completed_row_coherent),
+        ):
+            if value is None:
+                snapshot_contract_missing.append(name)
+        for lane in SNAPSHOT_LANES:
+            for name, value in (
+                (f"raw_cycles.{lane}.snapshot_ok", raw_snapshot_ok[lane]),
+                (f"raw_cycles.{lane}.valid", raw_valid[lane]),
+                (
+                    f"raw_cycles.{lane}.forensics_snapshot_ok",
+                    forensics_snapshot_ok[lane],
+                ),
+                (
+                    f"raw_cycles.{lane}.delay_detail_present",
+                    delay_detail_present[lane],
+                ),
+            ):
+                if value is None:
+                    snapshot_contract_missing.append(name)
+            if not delay_status[lane]:
+                snapshot_contract_missing.append(f"raw_cycles.{lane}.delay_status")
+
+    # Legacy rows retain historical behavior.  Once the explicit contract is
+    # present, statistics are admissible only from a coherent, valid completed
+    # statistics row.
+    stats_usable = (
+        stats_valid is not False
+        if not snapshot_contract_present
+        else (
+            stats_snapshot_ok is True
+            and stats_valid is True
+            and stats_completed_row_coherent is True
+        )
+    )
+
     reason = str(frag.get("recover_reattach_reason") or "").strip().lower()
     recovery_evidence = bool(
         reason not in {"", "idle", "none", "ok"}
@@ -422,15 +525,23 @@ def compact(db_id: int, db_pps: int, ts: str, payload: Dict[str, Any]) -> Compac
     welford_n: Dict[str, Optional[int]] = {}
     welford_sd: Dict[str, Optional[float]] = {}
     for lane in ("dwt", "vclock", "ocxo1", "ocxo2"):
-        welford_n[lane] = first_int(
-            path(frag, f"stats.{lane}.welford.n"),
-            path(frag, f"stats.{lane}.n"),
-            frag.get(f"{lane}_welford_n"),
+        welford_n[lane] = (
+            first_int(
+                path(frag, f"stats.{lane}.welford.n"),
+                path(frag, f"stats.{lane}.n"),
+                frag.get(f"{lane}_welford_n"),
+            )
+            if stats_usable
+            else None
         )
-        welford_sd[lane] = first_float(
-            path(frag, f"stats.{lane}.welford.stddev"),
-            path(frag, f"stats.{lane}.stddev"),
-            frag.get(f"{lane}_welford_stddev"),
+        welford_sd[lane] = (
+            first_float(
+                path(frag, f"stats.{lane}.welford.stddev"),
+                path(frag, f"stats.{lane}.stddev"),
+                frag.get(f"{lane}_welford_stddev"),
+            )
+            if stats_usable
+            else None
         )
 
     return CompactRow(
@@ -453,10 +564,26 @@ def compact(db_id: int, db_pps: int, ts: str, payload: Dict[str, Any]) -> Compac
         ocxo2_residual_ns=o2_res,
         ocxo1_valid=o1_valid,
         ocxo2_valid=o2_valid,
-        dwt_ppb=first_float(path(frag, "stats.dwt.ppb"), frag.get("dwt_ppb")),
-        vclock_ppb=first_float(path(frag, "stats.vclock.ppb"), frag.get("vclock_ppb")),
-        ocxo1_ppb=first_float(path(frag, "stats.ocxo1.ppb"), frag.get("ocxo1_ppb")),
-        ocxo2_ppb=first_float(path(frag, "stats.ocxo2.ppb"), frag.get("ocxo2_ppb")),
+        dwt_ppb=(
+            first_float(path(frag, "stats.dwt.ppb"), frag.get("dwt_ppb"))
+            if stats_usable
+            else None
+        ),
+        vclock_ppb=(
+            first_float(path(frag, "stats.vclock.ppb"), frag.get("vclock_ppb"))
+            if stats_usable
+            else None
+        ),
+        ocxo1_ppb=(
+            first_float(path(frag, "stats.ocxo1.ppb"), frag.get("ocxo1_ppb"))
+            if stats_usable
+            else None
+        ),
+        ocxo2_ppb=(
+            first_float(path(frag, "stats.ocxo2.ppb"), frag.get("ocxo2_ppb"))
+            if stats_usable
+            else None
+        ),
         science_eligible=row_science_eligible,
         science_excluded=row_science_excluded,
         science_reason=row_science_reason,
@@ -467,6 +594,16 @@ def compact(db_id: int, db_pps: int, ts: str, payload: Dict[str, Any]) -> Compac
         science_ready=b(frag.get("recover_science_ready")),
         welford_n=welford_n,
         welford_sd=welford_sd,
+        snapshot_contract_present=snapshot_contract_present,
+        snapshot_contract_missing=tuple(snapshot_contract_missing),
+        stats_snapshot_ok=stats_snapshot_ok,
+        stats_valid=stats_valid,
+        stats_completed_row_coherent=stats_completed_row_coherent,
+        raw_snapshot_ok=raw_snapshot_ok,
+        raw_valid=raw_valid,
+        forensics_snapshot_ok=forensics_snapshot_ok,
+        delay_detail_present=delay_detail_present,
+        delay_status=delay_status,
         servo_mode=str(
             path(frag, "dac.servo_mode")
             or frag.get("servo_mode")
@@ -477,6 +614,124 @@ def compact(db_id: int, db_pps: int, ts: str, payload: Dict[str, Any]) -> Compac
         environment=d(payload.get("environment")),
         final_forensics=forensic,
     )
+
+
+def update_snapshot_contract(audit: Audit, cur: CompactRow) -> None:
+    """Audit explicit snapshot acquisition separately from scientific validity."""
+    if not cur.snapshot_contract_present:
+        if audit.first_snapshot_contract_pps is None:
+            audit.snapshot_legacy_rows += 1
+        else:
+            audit.snapshot_missing_after_activation += 1
+            audit.note(
+                "Snapshot contract missing",
+                f"pps={cur.pps} contract absent after "
+                f"first_pps={audit.first_snapshot_contract_pps}",
+            )
+        return
+
+    audit.snapshot_contract_rows += 1
+    if audit.first_snapshot_contract_pps is None:
+        audit.first_snapshot_contract_pps = cur.pps
+    audit.last_snapshot_contract_pps = cur.pps
+
+    row_has_omission = bool(cur.snapshot_contract_missing)
+    for field_name in cur.snapshot_contract_missing:
+        audit.snapshot_contract_omissions[field_name] += 1
+        audit.note(
+            "Snapshot field missing/invalid",
+            f"pps={cur.pps} field={field_name}",
+        )
+
+    row_failed = False
+    row_immature = False
+    if cur.stats_snapshot_ok is False:
+        audit.stats_snapshot_failures += 1
+        row_failed = True
+        audit.note("Statistics snapshot unavailable", f"pps={cur.pps}")
+    elif cur.stats_snapshot_ok is True and (
+        cur.stats_valid is False or cur.stats_completed_row_coherent is False
+    ):
+        audit.coherent_immature_snapshots["stats"] += 1
+        row_immature = True
+        audit.note(
+            "Coherent but immature snapshot",
+            f"pps={cur.pps} scope=stats valid={cur.stats_valid} "
+            f"completed_row_coherent={cur.stats_completed_row_coherent}",
+        )
+
+    contradictions: list[str] = []
+    if cur.stats_snapshot_ok is False and cur.stats_valid is True:
+        contradictions.append("stats snapshot_ok=false but valid=true")
+    if (
+        cur.stats_snapshot_ok is False
+        and cur.stats_completed_row_coherent is True
+    ):
+        contradictions.append(
+            "stats snapshot_ok=false but completed_row_coherent=true"
+        )
+
+    for lane in SNAPSHOT_LANES:
+        if cur.raw_snapshot_ok[lane] is False:
+            audit.prediction_snapshot_failures[lane] += 1
+            row_failed = True
+            audit.note(
+                "Prediction snapshot unavailable",
+                f"pps={cur.pps} lane={lane}",
+            )
+        elif cur.raw_snapshot_ok[lane] is True and cur.raw_valid[lane] is False:
+            audit.coherent_immature_snapshots[lane] += 1
+            row_immature = True
+            audit.note(
+                "Coherent but immature snapshot",
+                f"pps={cur.pps} scope=prediction lane={lane} valid=false",
+            )
+
+        if cur.forensics_snapshot_ok[lane] is False:
+            audit.forensics_snapshot_failures[lane] += 1
+            row_failed = True
+            audit.note(
+                "Forensics snapshot unavailable",
+                f"pps={cur.pps} lane={lane}",
+            )
+
+        if cur.raw_snapshot_ok[lane] is False and cur.raw_valid[lane] is True:
+            contradictions.append(
+                f"{lane} snapshot_ok=false but valid=true"
+            )
+        if (
+            cur.forensics_snapshot_ok[lane] is False
+            and cur.delay_detail_present[lane] is True
+        ):
+            contradictions.append(
+                f"{lane} forensics_snapshot_ok=false but delay_detail_present=true"
+            )
+        if (
+            cur.forensics_snapshot_ok[lane] is False
+            and cur.delay_status[lane]
+            and cur.delay_status[lane] != "SNAPSHOT_UNAVAILABLE"
+        ):
+            contradictions.append(
+                f"{lane} forensics_snapshot_ok=false but delay_status={cur.delay_status[lane]}"
+            )
+
+    if contradictions:
+        audit.snapshot_contract_violation_rows += 1
+    for detail in contradictions:
+        audit.snapshot_contract_violations += 1
+        audit.note("Snapshot contract violation", f"pps={cur.pps} {detail}")
+
+    if row_immature and audit.last_coherent_immature_pps != cur.pps:
+        audit.coherent_immature_rows += 1
+        audit.last_coherent_immature_pps = cur.pps
+
+    if not row_failed and not row_has_omission and not contradictions:
+        audit.snapshot_clean_rows += 1
+
+    if row_failed:
+        audit.snapshot_failure_rows += 1
+        if cur.science_eligible:
+            audit.snapshot_failure_science_rows += 1
 
 
 def update(audit: Audit, prev: Optional[CompactRow], cur: CompactRow) -> None:
@@ -491,6 +746,7 @@ def update(audit: Audit, prev: Optional[CompactRow], cur: CompactRow) -> None:
     audit.first_ts = cur.ts if not audit.first_ts else audit.first_ts
     audit.last_ts = cur.ts
     audit.final_row = cur
+    update_snapshot_contract(audit, cur)
 
     if cur.gnss_ns is not None:
         identity_offset = cur.gnss_ns - cur.pps * NS_PER_SECOND
@@ -717,6 +973,59 @@ def print_report(audit: Audit, batch_size: int, pause_ms: int) -> None:
     ):
         print(f"  {key:<18s} {audit.stats[key].text(6 if 'ppb' in key else 3)}")
 
+    print("\nSNAPSHOT CONTRACT")
+    print(f"  Contract-bearing rows:        {audit.snapshot_contract_rows:,}")
+    print(f"  Clean contract rows:          {audit.snapshot_clean_rows:,}")
+    print(f"  Legacy rows before contract:  {audit.snapshot_legacy_rows:,}")
+    first_contract = (
+        str(audit.first_snapshot_contract_pps)
+        if audit.first_snapshot_contract_pps is not None
+        else "not observed"
+    )
+    last_contract = (
+        str(audit.last_snapshot_contract_pps)
+        if audit.last_snapshot_contract_pps is not None
+        else "not observed"
+    )
+    print(f"  First contract PPS:           {first_contract}")
+    print(f"  Last contract PPS:            {last_contract}")
+    if audit.first_snapshot_contract_pps is not None:
+        contract_expected = audit.last_pps - audit.first_snapshot_contract_pps + 1
+        contract_coverage = (
+            100.0 * audit.snapshot_clean_rows / contract_expected
+            if contract_expected > 0
+            else 0.0
+        )
+        print(f"  Expected identity span:       {contract_expected:,}")
+        print(f"  Clean identity coverage:      {contract_coverage:.3f}%")
+    print(
+        f"  Missing after activation:     {audit.snapshot_missing_after_activation:,}"
+    )
+
+    omission_count = sum(audit.snapshot_contract_omissions.values())
+    print("  Acquisition failures:")
+    print(f"    Statistics                   {audit.stats_snapshot_failures:,}")
+    print("    Prediction:")
+    for lane in SNAPSHOT_LANES:
+        print(f"      {lane.upper():<8s} {audit.prediction_snapshot_failures[lane]:,}")
+    print("    Forensics:")
+    for lane in SNAPSHOT_LANES:
+        print(f"      {lane.upper():<8s} {audit.forensics_snapshot_failures[lane]:,}")
+    print(f"    Failure-bearing PPS          {audit.snapshot_failure_rows:,}")
+    print(
+        f"    Science-admitted failure PPS: {audit.snapshot_failure_science_rows:>8,d}"
+    )
+
+    immature_count = sum(audit.coherent_immature_snapshots.values())
+    print("  Coherent acquisition; scientific state immature:")
+    print(f"    Unique PPS events            {audit.coherent_immature_rows:,}")
+    print(f"    Scope/lane observations      {immature_count:,}")
+
+    print("  Contract integrity:")
+    print(f"    Missing/invalid fields       {omission_count:,}")
+    print(f"    Violation-bearing PPS        {audit.snapshot_contract_violation_rows:,}")
+    print(f"    Contract violations          {audit.snapshot_contract_violations:,}")
+
     print("\nCOURTS")
     print("  Science courts use only science-eligible rows; timeline courts use all rows.")
     courts = [
@@ -771,6 +1080,66 @@ def print_report(audit: Audit, batch_size: int, pause_ms: int) -> None:
             for example in examples:
                 print(f"    {example}")
 
+    science_confidence = (
+        100.0 * max(0, audit.science_rows - audit.science_event_rows) / audit.science_rows
+        if audit.science_rows > 0
+        else 0.0
+    )
+    continuity_confidence = (
+        100.0
+        * max(0, audit.expected_rows - audit.unclassified_missing_identities)
+        / audit.expected_rows
+        if audit.expected_rows > 0
+        else 0.0
+    )
+    snapshot_confidence: Optional[float] = None
+    if audit.first_snapshot_contract_pps is not None:
+        contract_expected = audit.last_pps - audit.first_snapshot_contract_pps + 1
+        snapshot_confidence = (
+            100.0 * audit.snapshot_clean_rows / contract_expected
+            if contract_expected > 0
+            else 0.0
+        )
+
+    contract_integrity = (
+        audit.snapshot_missing_after_activation == 0
+        and not audit.snapshot_contract_omissions
+        and audit.snapshot_contract_violations == 0
+    )
+    statistics_integrity = (
+        audit.welford_regressions == 0
+        and audit.welford_hold_changes == 0
+    )
+    quarantine_integrity = (
+        audit.snapshot_failure_science_rows == 0
+        and audit.welford_hold_changes == 0
+    )
+    confidence_components = [science_confidence, continuity_confidence]
+    if snapshot_confidence is not None:
+        confidence_components.append(snapshot_confidence)
+    campaign_confidence = min(confidence_components) if confidence_components else 0.0
+    if not contract_integrity or not statistics_integrity or not quarantine_integrity:
+        campaign_confidence = 0.0
+
+    print("\nCAMPAIGN CONFIDENCE (DETERMINISTIC FLOOR)")
+    print(f"  Science custody:             {science_confidence:8.3f}%")
+    if snapshot_confidence is None:
+        print("  Snapshot custody:                 N/A (legacy)")
+    else:
+        print(f"  Snapshot custody:            {snapshot_confidence:8.3f}%")
+    print(f"  Timeline continuity:         {continuity_confidence:8.3f}%")
+    print(
+        f"  Contract integrity:          {'PASS' if contract_integrity else 'FAIL'}"
+    )
+    print(
+        f"  Statistics integrity:        {'PASS' if statistics_integrity else 'FAIL'}"
+    )
+    print(
+        f"  Quarantine integrity:        {'PASS' if quarantine_integrity else 'FAIL'}"
+    )
+    print(f"  Campaign confidence:         {campaign_confidence:8.3f}%")
+    print("  Rule: lowest measurable custody percentage; integrity failure forces 0%")
+
     print("\nFINAL CONTEXT")
     if final.environment:
         print(f"  Environment keys: {', '.join(sorted(final.environment.keys()))}")
@@ -806,6 +1175,32 @@ def print_report(audit: Audit, batch_size: int, pause_ms: int) -> None:
         audit.regressions,
         audit.unclassified_gaps,
     ))
+    snapshot_acquisition_failures = (
+        audit.stats_snapshot_failures
+        + sum(audit.prediction_snapshot_failures.values())
+        + sum(audit.forensics_snapshot_failures.values())
+    )
+    snapshot_contract_errors = (
+        audit.snapshot_missing_after_activation
+        + sum(audit.snapshot_contract_omissions.values())
+        + audit.snapshot_contract_violations
+    )
+
+    if audit.snapshot_contract_rows == 0:
+        print("  SNAPSHOTS:  LEGACY CAMPAIGN; EXPLICIT CONTRACT NOT OBSERVED")
+    elif snapshot_contract_errors:
+        print(
+            "  SNAPSHOTS:  CONTRACT VIOLATION "
+            f"({snapshot_contract_errors:,} finding(s))"
+        )
+    elif snapshot_acquisition_failures:
+        print(
+            "  SNAPSHOTS:  ACQUISITION FAILURES OBSERVED "
+            f"({snapshot_acquisition_failures:,} failure(s) across "
+            f"{audit.snapshot_failure_rows:,} row(s)); unavailable values withheld"
+        )
+    else:
+        print("  SNAPSHOTS:  CLEAN")
 
     if science_anomalies:
         print(
@@ -863,12 +1258,21 @@ def print_report(audit: Audit, batch_size: int, pause_ms: int) -> None:
     else:
         print("  QUARANTINE: NO EXCLUSIONS")
 
-    if science_anomalies:
+    if snapshot_contract_errors:
+        print("  OVERALL:    SNAPSHOT CONTRACT INVESTIGATION REQUIRED")
+    elif science_anomalies:
         print("  OVERALL:    SCIENCE INVESTIGATION REQUIRED")
     elif timeline_anomalies:
         print("  OVERALL:    SCIENCE CLEAN; TIMELINE CONTRACT REQUIRES RECONCILIATION")
-    elif audit.recovery_missing_identities or audit.science_excluded_rows:
-        print("  OVERALL:    SCIENCE CLEAN WITH TRUTHFUL RECOVERY/QUARANTINE EVENTS")
+    elif (
+        snapshot_acquisition_failures
+        or audit.recovery_missing_identities
+        or audit.science_excluded_rows
+    ):
+        print(
+            "  OVERALL:    SCIENCE CLEAN WITH TRUTHFUL "
+            "SNAPSHOT/RECOVERY/QUARANTINE EVENTS"
+        )
     else:
         print("  OVERALL:    CLEAN")
 

@@ -3567,6 +3567,7 @@ static void system_monitor_add_stats(
   stats.add("always_on", true);
   stats.add("owner", "ALPHA");
   stats.add("lifetime", "BOOT_TO_REBOOT_OR_STATS_RESET");
+  stats.add("snapshot_ok", snapshot.snapshot_ok);
   stats.add("valid", snapshot.valid);
   stats.add("reset_count", snapshot.reset_count);
   stats.add("update_count", snapshot.update_count);
@@ -3620,12 +3621,15 @@ static void system_monitor_add_raw_cycles_lane(
     const char* key,
     const clocks_monitor_raw_cycles_lane_t& sample) {
   Payload lane;
+  lane.add("snapshot_ok", sample.snapshot_ok);
+  lane.add("forensics_snapshot_ok", sample.forensics_snapshot_ok);
   lane.add("valid", sample.valid);
   lane.add("completed_interval_count", sample.completed_interval_count);
   lane.add("observed_cycles", sample.observed_cycles);
   lane.add("previous_observed_cycles", sample.previous_observed_cycles);
   lane.add("residual_cycles", sample.residual_cycles);
   lane.add("delay_status", sample.delay_status);
+  lane.add("delay_detail_present", sample.delay_detail_present);
   // Stable four-rail contract: ON_TIME lanes carry explicit NONE/zero detail
   // rather than a shorter object. Reports can compare PPS, VCLOCK, OCXO1, and
   // OCXO2 without treating missing JSON fields as semantic evidence.

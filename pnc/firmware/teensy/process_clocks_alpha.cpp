@@ -364,6 +364,7 @@ static void alpha_pps_vclock_edge_forensics_publish(
 FLASHMEM bool clocks_alpha_pps_vclock_edge_forensics(
     clocks_pps_vclock_edge_forensics_t* out) {
   if (!out) return false;
+  *out = clocks_pps_vclock_edge_forensics_t{};
 
   for (int attempt = 0; attempt < 4; attempt++) {
     const uint32_t seq1 = g_pps_vclock_edge_forensics_seq;
@@ -372,12 +373,12 @@ FLASHMEM bool clocks_alpha_pps_vclock_edge_forensics(
     clocks_alpha_dmb();
     const uint32_t seq2 = g_pps_vclock_edge_forensics_seq;
     if (seq1 == seq2 && (seq1 & 1u) == 0u) {
+      local.snapshot_ok = true;
       *out = local;
-      return local.update_count != 0;
+      return true;
     }
   }
 
-  *out = clocks_pps_vclock_edge_forensics_t{};
   return false;
 }
 
@@ -2916,8 +2917,9 @@ FLASHMEM bool clocks_alpha_ocxo_tau_snapshot(time_clock_id_t clock,
     clocks_alpha_dmb();
     const uint32_t seq2 = s->seq;
     if (seq1 == seq2 && (seq1 & 1u) == 0u) {
+      local.snapshot_ok = true;
       *out = local;
-      return local.valid;
+      return true;
     }
   }
 
@@ -3032,10 +3034,8 @@ alpha_frequency_from_welford(const welford_t& w) {
 }
 
 static clocks_instrument_frequency_snapshot_t
-alpha_frequency_from_tau(time_clock_id_t clock) {
+alpha_frequency_from_tau(const clocks_alpha_tau_snapshot_t& tau) {
   clocks_instrument_frequency_snapshot_t f{};
-  clocks_alpha_tau_snapshot_t tau{};
-  (void)clocks_alpha_ocxo_tau_snapshot(clock, &tau);
   f.valid = tau.valid;
   f.sample_count = tau.sample_count;
   f.interval_count = tau.interval_count;
@@ -3242,14 +3242,17 @@ FLASHMEM bool clocks_alpha_instrument_stats_snapshot(
 
     local.dwt_frequency = alpha_frequency_from_welford(welford_dwt);
     local.vclock_frequency = alpha_frequency_from_welford(welford_vclock);
-    local.ocxo1_frequency =
-        alpha_frequency_from_tau(time_clock_id_t::OCXO1);
-    local.ocxo2_frequency =
-        alpha_frequency_from_tau(time_clock_id_t::OCXO2);
-    (void)clocks_alpha_ocxo_tau_snapshot(
+    const bool ocxo1_tau_snapshot_ok = clocks_alpha_ocxo_tau_snapshot(
         time_clock_id_t::OCXO1, &local.ocxo1_tau_state);
-    (void)clocks_alpha_ocxo_tau_snapshot(
+    const bool ocxo2_tau_snapshot_ok = clocks_alpha_ocxo_tau_snapshot(
         time_clock_id_t::OCXO2, &local.ocxo2_tau_state);
+    if (!ocxo1_tau_snapshot_ok || !ocxo2_tau_snapshot_ok) {
+      continue;
+    }
+    local.ocxo1_frequency =
+        alpha_frequency_from_tau(local.ocxo1_tau_state);
+    local.ocxo2_frequency =
+        alpha_frequency_from_tau(local.ocxo2_tau_state);
 
     local.gnss_welford = welford_gnss;
     local.dwt_welford = welford_dwt;
@@ -3263,8 +3266,9 @@ FLASHMEM bool clocks_alpha_instrument_stats_snapshot(
     clocks_alpha_dmb();
     const uint32_t seq2 = g_instrument_stats_seq;
     if (seq1 == seq2 && (seq1 & 1U) == 0U) {
+      local.snapshot_ok = true;
       *out = local;
-      return local.valid;
+      return true;
     }
   }
 
@@ -4610,6 +4614,7 @@ static uint32_t alpha_static_prediction_clock_id(time_clock_id_t clock) {
 bool clocks_static_prediction_snapshot(time_clock_id_t clock,
                                        clocks_static_prediction_snapshot_t* out) {
   if (!out) return false;
+  *out = clocks_static_prediction_snapshot_t{};
   alpha_static_prediction_store_t* s = alpha_static_prediction_store(clock);
   if (!s) return false;
 
@@ -4628,8 +4633,9 @@ bool clocks_static_prediction_snapshot(time_clock_id_t clock,
     clocks_alpha_dmb();
     const uint32_t seq2 = s->seq;
     if (seq1 == seq2 && (seq1 & 1u) == 0u) {
+      local.snapshot_ok = true;
       *out = local;
-      return local.valid;
+      return true;
     }
   }
 
@@ -4641,6 +4647,7 @@ static bool alpha_static_prediction_snapshot_store(const alpha_static_prediction
                                                    uint32_t clock_id,
                                                    clocks_static_prediction_snapshot_t* out) {
   if (!out) return false;
+  *out = clocks_static_prediction_snapshot_t{};
 
   for (int attempt = 0; attempt < 4; attempt++) {
     const uint32_t seq1 = store.seq;
@@ -4657,8 +4664,9 @@ static bool alpha_static_prediction_snapshot_store(const alpha_static_prediction
     clocks_alpha_dmb();
     const uint32_t seq2 = store.seq;
     if (seq1 == seq2 && (seq1 & 1u) == 0u) {
+      local.snapshot_ok = true;
       *out = local;
-      return local.valid;
+      return true;
     }
   }
 
@@ -4683,7 +4691,8 @@ static void clocks_feature_update_static_prediction(void) {
   clocks_feature_set_cached(
       "STATIC_PREDICTION",
       g_clocks_feature_static_prediction,
-      (pps_ok && vclock_ok && ocxo1_ok && ocxo2_ok)
+      (pps_ok && vclock_ok && ocxo1_ok && ocxo2_ok &&
+       pps.valid && vclock.valid && ocxo1.valid && ocxo2.valid)
           ? system_feature_status_t::NOMINAL
           : system_feature_status_t::INITIALIZING);
 }
@@ -4751,10 +4760,18 @@ static void alpha_row_adjudicate_cycle_integrity(uint32_t pps_sequence) {
   clocks_static_prediction_snapshot_t vclock{};
   clocks_static_prediction_snapshot_t ocxo1{};
   clocks_static_prediction_snapshot_t ocxo2{};
-  (void)clocks_static_prediction_pps_snapshot(&pps);
-  (void)clocks_static_prediction_snapshot(time_clock_id_t::VCLOCK, &vclock);
-  (void)clocks_static_prediction_snapshot(time_clock_id_t::OCXO1, &ocxo1);
-  (void)clocks_static_prediction_snapshot(time_clock_id_t::OCXO2, &ocxo2);
+  const bool pps_snapshot_ok =
+      clocks_static_prediction_pps_snapshot(&pps);
+  const bool vclock_snapshot_ok = clocks_static_prediction_snapshot(
+      time_clock_id_t::VCLOCK, &vclock);
+  const bool ocxo1_snapshot_ok = clocks_static_prediction_snapshot(
+      time_clock_id_t::OCXO1, &ocxo1);
+  const bool ocxo2_snapshot_ok = clocks_static_prediction_snapshot(
+      time_clock_id_t::OCXO2, &ocxo2);
+  if (!pps_snapshot_ok || !vclock_snapshot_ok ||
+      !ocxo1_snapshot_ok || !ocxo2_snapshot_ok) {
+    return;
+  }
 
   const uint32_t actual_cycles[4] = {
       pps.actual_cycles,
@@ -5672,6 +5689,7 @@ FLASHMEM bool clocks_alpha_ocxo_pps_projection_snapshot(
     time_clock_id_t clock,
     clocks_alpha_ocxo_pps_projection_snapshot_t* out) {
   if (!out) return false;
+  *out = clocks_alpha_ocxo_pps_projection_snapshot_t{};
   alpha_ocxo_pps_projection_store_t* s = alpha_ocxo_pps_projection_store(clock);
   if (!s) return false;
 
@@ -5682,12 +5700,12 @@ FLASHMEM bool clocks_alpha_ocxo_pps_projection_snapshot(
     clocks_alpha_dmb();
     const uint32_t seq2 = s->seq;
     if (seq1 == seq2 && (seq1 & 1u) == 0u) {
+      local.snapshot_ok = true;
       *out = local;
-      return local.valid;
+      return true;
     }
   }
 
-  *out = clocks_alpha_ocxo_pps_projection_snapshot_t{};
   return false;
 }
 
@@ -6242,6 +6260,7 @@ bool clocks_alpha_ocxo_visible_origin_snapshot(
     time_clock_id_t clock,
     clocks_alpha_ocxo_visible_origin_snapshot_t* out) {
   if (!out) return false;
+  *out = clocks_alpha_ocxo_visible_origin_snapshot_t{};
   alpha_ocxo_visible_origin_state_t* s =
       alpha_ocxo_visible_origin_store(clock);
   if (!s) return false;
@@ -6253,12 +6272,12 @@ bool clocks_alpha_ocxo_visible_origin_snapshot(
     clocks_alpha_dmb();
     const uint32_t seq2 = s->seq;
     if (seq1 == seq2 && (seq1 & 1u) == 0u) {
+      local.snapshot_ok = true;
       *out = local;
-      return local.valid || local.pending;
+      return true;
     }
   }
 
-  *out = clocks_alpha_ocxo_visible_origin_snapshot_t{};
   return false;
 }
 
@@ -7440,6 +7459,7 @@ static void alpha_forensics_publish(time_clock_id_t clock_id,
 bool clocks_alpha_lane_forensics(time_clock_id_t clock,
                                  clocks_alpha_lane_forensics_t* out) {
   if (!out) return false;
+  *out = clocks_alpha_lane_forensics_t{};
   alpha_event_flow_note_snapshot_request(clock);
   alpha_lane_forensics_store_t* s = alpha_forensics_store(clock);
   if (!s) {
@@ -7670,12 +7690,14 @@ bool clocks_alpha_lane_forensics(time_clock_id_t clock,
     clocks_alpha_dmb();
     const uint32_t seq2 = s->seq;
     if (seq1 == seq2 && (seq1 & 1u) == 0u) {
-      alpha_event_flow_note_snapshot(clock, true, out->valid, out->valid,
+      out->snapshot_ok = true;
+      alpha_event_flow_note_snapshot(clock, true, true, out->valid,
                                      out->update_count, seq2);
-      return out->valid;
+      return true;
     }
   }
 
+  *out = clocks_alpha_lane_forensics_t{};
   alpha_event_flow_note_snapshot(clock, false, false, false, 0, 0);
   return false;
 }
@@ -7871,18 +7893,21 @@ static void alpha_smartzero_delay_publish(
 bool clocks_alpha_smartzero_delay_snapshot(
     clocks_alpha_smartzero_delay_snapshot_t* out) {
   if (!out) return false;
+  *out = clocks_alpha_smartzero_delay_snapshot_t{};
   for (int attempt = 0; attempt < 4; ++attempt) {
     const uint32_t seq1 = g_alpha_smartzero_delay_seq;
     if (seq1 & 1U) continue;
     clocks_alpha_dmb();
-    *out = g_alpha_smartzero_delay_snapshot;
+    clocks_alpha_smartzero_delay_snapshot_t local =
+        g_alpha_smartzero_delay_snapshot;
     clocks_alpha_dmb();
     const uint32_t seq2 = g_alpha_smartzero_delay_seq;
     if (seq1 == seq2 && (seq2 & 1U) == 0U) {
-      return out->install_count != 0U;
+      local.snapshot_ok = true;
+      *out = local;
+      return true;
     }
   }
-  *out = clocks_alpha_smartzero_delay_snapshot_t{};
   return false;
 }
 
@@ -8501,6 +8526,7 @@ bool clocks_alpha_ocxo_recover_reattach_snapshot(
   // Do not instantiate the full projection snapshot on this stack.
   const alpha_ocxo_pps_projection_store_t* ps =
       alpha_ocxo_pps_projection_store(clock);
+  bool projection_snapshot_ok = false;
   if (ps) {
     for (int attempt = 0; attempt < 4; attempt++) {
       const uint32_t seq1 = ps->seq;
@@ -8520,13 +8546,21 @@ bool clocks_alpha_ocxo_recover_reattach_snapshot(
       clocks_alpha_dmb();
       const uint32_t seq2 = ps->seq;
       if (seq1 == seq2 && (seq1 & 1U) == 0U) {
+        projection_snapshot_ok = true;
         break;
       }
-
-      if (attempt == 3) {
-        r.projection_valid = false;
-      }
     }
+  }
+  if (!projection_snapshot_ok) {
+    r.projection_valid = false;
+    r.projection_available = false;
+    r.projection_update_count = 0U;
+    r.projection_compute_count = 0U;
+    r.projection_source = 0U;
+    r.projection_pps_sequence = 0U;
+    r.projection_pps_vclock_ns = 0ULL;
+    r.projection_projected_ocxo_ns_at_pps = 0ULL;
+    r.projection_interval_dwt_cycles = 0U;
   }
 
   r.expected_pps_vclock_ns = g_gnss_ns_at_pps_vclock;
@@ -9693,7 +9727,8 @@ static void publish_pps_witness_diag(const pps_edge_snapshot_t& snap) {
 static bool alpha_sample_all_clocks_at_pps_vclock(const pps_edge_snapshot_t& snap,
                                                    uint64_t vclock_ns) {
   interrupt_epoch_capture_t cap{};
-  const bool cap_available = interrupt_last_epoch_capture(&cap);
+  const bool cap_snapshot_ok = interrupt_last_epoch_capture(&cap);
+  const bool cap_available = cap_snapshot_ok && cap.valid;
 
   g_alpha_runtime_epoch_capture_last_snap_sequence = snap.sequence;
   g_alpha_runtime_epoch_capture_last_cap_sequence = cap.sequence;
