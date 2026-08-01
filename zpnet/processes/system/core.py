@@ -1947,6 +1947,55 @@ def _monitor_restore_probe_satisfied(
     return True
 
 
+def _monitor_restore_pending_categories(
+    expected: Dict[str, Any],
+    observed: Dict[str, Any],
+) -> list[str]:
+    """Summarize restore proof gaps without logging payloads or numeric state."""
+    pending: list[str] = []
+
+    clockface_keys = {
+        "instrument_gnss_ns": "GNSS_CLOCKFACE",
+        "instrument_dwt_cycles": "DWT_CLOCKFACE",
+        "instrument_ocxo1_ns": "OCXO_CLOCKFACES",
+        "instrument_ocxo2_ns": "OCXO_CLOCKFACES",
+    }
+    for key, category in clockface_keys.items():
+        target = int(expected.get(key) or 0)
+        if target > 0 and int(observed.get(key) or 0) < target:
+            if category not in pending:
+                pending.append(category)
+
+    expected_n = expected.get("welford_n")
+    observed_n = observed.get("welford_n")
+    if isinstance(expected_n, dict):
+        observed_n = observed_n if isinstance(observed_n, dict) else {}
+        if any(
+            int(target or 0) > 0
+            and int(observed_n.get(key) or 0) < int(target or 0)
+            for key, target in expected_n.items()
+        ):
+            pending.append("STATISTICS")
+
+    control_pending = (
+        str(observed.get("servo_mode") or "OFF").upper()
+        != str(expected.get("servo_mode") or "OFF").upper()
+        or bool(observed.get("dither_operator_enabled"))
+        != bool(expected.get("dither_operator_enabled"))
+    )
+    for key in ("ocxo1_dac", "ocxo2_dac"):
+        target = expected.get(key)
+        value = observed.get(key)
+        if target is not None and (
+            value is None or abs(float(value) - float(target)) > 0.01
+        ):
+            control_pending = True
+    if control_pending:
+        pending.append("DAC_CONTROL")
+
+    return pending or ["FRESH_MONITOR_PROOF"]
+
+
 def _wait_for_monitor_restore(
     checkpoint: Dict[str, Any],
     *,
@@ -1956,6 +2005,7 @@ def _wait_for_monitor_restore(
     """Wait for a fresh unified MONITOR proving the staged restore committed."""
     expected = _monitor_restore_probe(checkpoint)
     deadline = time.monotonic() + float(timeout_s)
+    next_progress_log = requested_monotonic + 10.0
     last_observed: Dict[str, Any] = {}
     while time.monotonic() < deadline:
         with _SYSTEM_LOCK:
@@ -1974,6 +2024,17 @@ def _wait_for_monitor_restore(
                         3,
                     ),
                 }
+
+        now = time.monotonic()
+        if now >= next_progress_log:
+            pending = _monitor_restore_pending_categories(expected, last_observed)
+            logging.info(
+                "⏳ [system/recovery] MONITOR restore still converging after %.1fs; "
+                "waiting for %s",
+                max(0.0, now - requested_monotonic),
+                ", ".join(pending),
+            )
+            next_progress_log = now + 10.0
         time.sleep(0.1)
 
     raise TimeoutError(
@@ -1991,8 +2052,17 @@ def _recover_monitor_checkpoint(checkpoint: Dict[str, Any]) -> Dict[str, Any]:
     if gnss_raw is None:
         raise RuntimeError("config.MONITOR has no clocks.gnss_raw state")
 
+    logging.info(
+        "♻️ [system/recovery] found recoverable MONITOR checkpoint sequence=%s; "
+        "seeding last-known display state and restoring the always-on instrument",
+        checkpoint.get("sequence"),
+    )
     _seed_system_from_checkpoint(checkpoint)
     requested_monotonic = time.monotonic()
+    logging.info(
+        "⏳ [system/recovery] last-known MONITOR published; requesting Teensy "
+        "clockface, statistics, DAC, servo, and dither restoration"
+    )
     teensy_response = _request_teensy_monitor_restore(restore_state)
     teensy_payload = (
         teensy_response.get("payload", {})
@@ -2030,6 +2100,10 @@ def _recover_monitor_checkpoint(checkpoint: Dict[str, Any]) -> Dict[str, Any]:
         return result
 
     clocks_response = _request_clocks_gnss_raw_restore(gnss_raw)
+    logging.info(
+        "⏳ [system/recovery] restore commands accepted; waiting for a fresh "
+        "MONITOR to prove clockfaces, statistics, DACs, servo mode, and dithering"
+    )
     proof = _wait_for_monitor_restore(
         checkpoint,
         requested_monotonic=requested_monotonic,
@@ -2047,9 +2121,9 @@ def _recover_monitor_checkpoint(checkpoint: Dict[str, Any]) -> Dict[str, Any]:
         "proof": proof,
     }
     logging.info(
-        "✅ [system/recovery] restored MONITOR state: sequence=%s "
-        "servo=%s waited=%.3fs",
-        checkpoint.get("sequence"),
+        "✅ [system/recovery] MONITOR restore proved by fresh sequence=%s: "
+        "clockfaces and statistics resumed, servo=%s, waited=%.3fs",
+        proof.get("monitor_sequence"),
         proof.get("observed", {}).get("servo_mode"),
         float(proof.get("waited_s") or 0.0),
     )
