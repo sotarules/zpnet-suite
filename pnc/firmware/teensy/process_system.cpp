@@ -3948,15 +3948,79 @@ static Payload system_monitor_clocks_payload(
   return clocks;
 }
 
+static const char* system_monitor_clock_candidate_status_name(
+    clocks_monitor_clock_candidate_status_t status) {
+  switch (status) {
+    case clocks_monitor_clock_candidate_status_t::SEEDED:
+      return "SEEDED";
+    case clocks_monitor_clock_candidate_status_t::ADVANCED:
+      return "ADVANCED";
+    case clocks_monitor_clock_candidate_status_t::DELTA_INVALID:
+      return "DELTA_INVALID";
+    case clocks_monitor_clock_candidate_status_t::PUBLIC_COUNT_GAP:
+      return "PUBLIC_COUNT_GAP";
+    case clocks_monitor_clock_candidate_status_t::ARITHMETIC_FAILURE:
+      return "ARITHMETIC_FAILURE";
+    case clocks_monitor_clock_candidate_status_t::UNAVAILABLE:
+    default:
+      return "UNAVAILABLE";
+  }
+}
+
+static void system_monitor_add_clock_candidate(
+    Payload& parent,
+    const char* key,
+    const clocks_monitor_clock_candidate_t& candidate) {
+  Payload out;
+  out.add("available", candidate.available);
+  out.add("continuity_valid", candidate.continuity_valid);
+  out.add("status_id", (uint32_t)candidate.status);
+  out.add("status",
+          system_monitor_clock_candidate_status_name(candidate.status));
+  out.add("start_public_count", candidate.start_public_count);
+  out.add("last_public_count", candidate.last_public_count);
+  out.add("interval_count", candidate.interval_count);
+  out.add("ns", candidate.ns);
+  out.add("fractional_ns", toFixedDecimal(candidate.fractional_ns, 12));
+  out.add("residual_available", candidate.residual_available);
+  out.add("residual_ns", candidate.residual_ns);
+  out.add("residual_ns_exact",
+          toFixedDecimal(candidate.residual_ns_exact, 12));
+  parent.add_object(key, out);
+}
+
+static void system_monitor_add_clock_candidates(
+    Payload& parent,
+    const clocks_monitor_clock_candidates_snapshot_t& snapshot) {
+  Payload candidates;
+  candidates.add("schema", "OCXO_CLOCK_CANDIDATES_V1");
+  candidates.add("published_source", snapshot.published_source);
+  system_monitor_add_clock_candidate(
+      candidates, "phaseledger", snapshot.phaseledger);
+  system_monitor_add_clock_candidate(
+      candidates, "delta_cycles", snapshot.delta_cycles);
+  candidates.add("comparable", snapshot.comparable);
+  candidates.add("delta_cycles_minus_phaseledger_ns",
+                 snapshot.delta_cycles_minus_phaseledger_ns);
+  candidates.add("residuals_comparable", snapshot.residuals_comparable);
+  candidates.add(
+      "delta_cycles_minus_phaseledger_residual_ns_exact",
+      toFixedDecimal(
+          snapshot.delta_cycles_minus_phaseledger_residual_ns_exact, 12));
+  parent.add_object("clock_candidates", candidates);
+}
+
 static void system_monitor_add_campaign_ocxo(
     Payload& parent,
     const char* key,
     uint64_t ns,
     bool clockface_valid,
+    const clocks_monitor_clock_candidates_snapshot_t& clock_candidates,
     const clocks_monitor_science_snapshot_t& science) {
   Payload lane;
   lane.add("ns", ns);
   lane.add("clockface_valid", clockface_valid);
+  system_monitor_add_clock_candidates(lane, clock_candidates);
   system_monitor_add_science(lane, science);
   parent.add_object(key, lane);
 }
@@ -3964,7 +4028,7 @@ static void system_monitor_add_campaign_ocxo(
 static Payload system_monitor_campaign_row_payload(
     const clocks_monitor_campaign_snapshot_t& snapshot) {
   Payload row;
-  row.add("schema", "TIMEBASE_FRAGMENT_V6");
+  row.add("schema", "TIMEBASE_FRAGMENT_V7");
   row.add("campaign", snapshot.campaign);
   row.add("campaign_state", snapshot.campaign_state);
   row.add("teensy_pps_vclock_count", snapshot.public_count);
@@ -4047,12 +4111,14 @@ static Payload system_monitor_campaign_row_payload(
       "ocxo1",
       snapshot.ocxo1_ns,
       snapshot.ocxo1_clockface_valid,
+      snapshot.ocxo1_clock_candidates,
       snapshot.ocxo1_science);
   system_monitor_add_campaign_ocxo(
       row,
       "ocxo2",
       snapshot.ocxo2_ns,
       snapshot.ocxo2_clockface_valid,
+      snapshot.ocxo2_clock_candidates,
       snapshot.ocxo2_science);
   system_monitor_add_stats(row, snapshot.stats);
   if (snapshot.dac_present) {

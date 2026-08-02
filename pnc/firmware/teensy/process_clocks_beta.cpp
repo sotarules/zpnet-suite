@@ -1681,6 +1681,55 @@ struct ocxo_science_totals_t {
 static ocxo_science_totals_t g_ocxo_science_totals_ocxo1 DMAMEM = {};
 static ocxo_science_totals_t g_ocxo_science_totals_ocxo2 DMAMEM = {};
 
+// Campaign-scoped Delta-Cycles shadow clocks.  The canonical public OCXO
+// clockface remains CounterLedger + PhaseLedger.  These states independently
+// advance from the same-row Delta residual and are never repaired from the
+// canonical clock after their lifecycle seed.
+struct delta_clock_candidate_state_t {
+  bool seeded = false;
+  bool continuity_valid = false;
+  clocks_monitor_clock_candidate_status_t status =
+      clocks_monitor_clock_candidate_status_t::UNAVAILABLE;
+  uint32_t start_public_count = 0;
+  uint32_t last_public_count = 0;
+  uint32_t interval_count = 0;
+  uint64_t ns = 0;
+  double fractional_ns = 0.0;
+};
+
+static delta_clock_candidate_state_t
+    g_delta_clock_candidate_ocxo1 DMAMEM = {};
+static delta_clock_candidate_state_t
+    g_delta_clock_candidate_ocxo2 DMAMEM = {};
+
+static void delta_clock_candidate_seed(delta_clock_candidate_state_t& state,
+                                       uint64_t ns,
+                                       uint32_t public_count) {
+  state = delta_clock_candidate_state_t{};
+  state.seeded = true;
+  state.continuity_valid = true;
+  state.status = clocks_monitor_clock_candidate_status_t::SEEDED;
+  state.start_public_count = public_count;
+  state.last_public_count = public_count;
+  state.ns = ns;
+}
+
+static void delta_clock_candidates_seed_zero(void) {
+  delta_clock_candidate_seed(g_delta_clock_candidate_ocxo1, 0ULL, 0U);
+  delta_clock_candidate_seed(g_delta_clock_candidate_ocxo2, 0ULL, 0U);
+}
+
+static void delta_clock_candidates_seed_recover(void) {
+  const uint32_t recovered_public_count =
+      (uint32_t)(recover_gnss_ns / CLOCKS_BETA_NS_PER_SECOND);
+  delta_clock_candidate_seed(g_delta_clock_candidate_ocxo1,
+                             recover_ocxo1_ns,
+                             recovered_public_count);
+  delta_clock_candidate_seed(g_delta_clock_candidate_ocxo2,
+                             recover_ocxo2_ns,
+                             recovered_public_count);
+}
+
 struct delta_residual_reference_t {
   bool     captured = false;
   bool     gnss_available = false;
@@ -1846,6 +1895,89 @@ static ocxo_science_totals_t g_beta_probe_science_totals_o1 DMAMEM = {};
 static ocxo_science_totals_t g_beta_probe_science_totals_o2 DMAMEM = {};
 static ocxo_science_totals_t g_beta_row_science_totals_o1_before DMAMEM = {};
 static ocxo_science_totals_t g_beta_row_science_totals_o2_before DMAMEM = {};
+
+static void delta_clock_candidate_fail(
+    delta_clock_candidate_state_t& state,
+    clocks_monitor_clock_candidate_status_t status,
+    uint32_t public_count) {
+  state.continuity_valid = false;
+  state.status = status;
+  state.last_public_count = public_count;
+}
+
+static void delta_clock_candidate_advance(
+    delta_clock_candidate_state_t& state,
+    uint32_t public_count,
+    const clock_science_row_t& row) {
+  if (!state.seeded) {
+    state.status = clocks_monitor_clock_candidate_status_t::UNAVAILABLE;
+    state.last_public_count = public_count;
+    return;
+  }
+  if (!state.continuity_valid) {
+    // Preserve the first specific failure verdict.  Later rows may show that
+    // the candidate remained unavailable, but they must not erase why the
+    // independent clock stopped advancing.
+    state.last_public_count = public_count;
+    return;
+  }
+
+  if (public_count != state.last_public_count + 1U) {
+    delta_clock_candidate_fail(
+        state,
+        clocks_monitor_clock_candidate_status_t::PUBLIC_COUNT_GAP,
+        public_count);
+    return;
+  }
+
+  if (!row.delta_raw_valid ||
+      !isfinite(row.delta_raw_fast_residual_ns_exact)) {
+    delta_clock_candidate_fail(
+        state,
+        clocks_monitor_clock_candidate_status_t::DELTA_INVALID,
+        public_count);
+    return;
+  }
+
+  // The familiar Delta fast residual is the first-order expression of this
+  // relationship.  Advance the shadow clock from the underlying interval ratio
+  // itself so the candidate does not accumulate a known second-order residual
+  // approximation error.
+  const double exact_increment_ns =
+      ((double)CLOCKS_BETA_NS_PER_SECOND *
+       (double)row.delta_raw_reference_interval_cycles) /
+      (double)row.delta_raw_clock_interval_cycles;
+  const double increment_with_carry =
+      state.fractional_ns + exact_increment_ns;
+  if (!isfinite(increment_with_carry) ||
+      increment_with_carry > (double)INT64_MAX ||
+      increment_with_carry < 1.0) {
+    delta_clock_candidate_fail(
+        state,
+        clocks_monitor_clock_candidate_status_t::ARITHMETIC_FAILURE,
+        public_count);
+    return;
+  }
+
+  const int64_t increment_ns = increment_with_carry >= 0.0
+      ? (int64_t)(increment_with_carry + 0.5)
+      : (int64_t)(increment_with_carry - 0.5);
+  if (increment_ns <= 0 ||
+      UINT64_MAX - state.ns < (uint64_t)increment_ns) {
+    delta_clock_candidate_fail(
+        state,
+        clocks_monitor_clock_candidate_status_t::ARITHMETIC_FAILURE,
+        public_count);
+    return;
+  }
+
+  state.ns += (uint64_t)increment_ns;
+  state.fractional_ns =
+      increment_with_carry - (double)increment_ns;
+  state.last_public_count = public_count;
+  state.interval_count++;
+  state.status = clocks_monitor_clock_candidate_status_t::ADVANCED;
+}
 
 static const char* delta_raw_interval_reject_reason(uint32_t cycles) {
   if (cycles == 0U) return "interval_zero";
@@ -2498,6 +2630,7 @@ static void campaign_public_offsets_reset_to_current(void) {
   g_campaign_public_ocxo2_measured_offset =
       campaign_public_offset_to_zero(current_raw_ocxo2_measured_ns());
   campaign_public_counterledger_offsets_reset_to_current();
+  delta_clock_candidates_seed_zero();
 }
 
 static void campaign_public_offsets_reset_for_recover(void) {
@@ -2521,6 +2654,7 @@ static void campaign_public_offsets_reset_for_recover(void) {
       campaign_public_offset_for_recovered_value(current_raw_ocxo2_measured_ns(),
                                                  recover_ocxo2_ns);
   campaign_public_counterledger_offsets_reset_for_recover();
+  delta_clock_candidates_seed_recover();
 }
 
 static void campaign_start_phaseledger_set_reason(const char* reason,
@@ -2534,14 +2668,14 @@ static void campaign_start_phaseledger_set_reason(const char* reason,
 }
 
 
-static bool campaign_start_phaseledger_capture_ready(
+static bool campaign_start_phaseledger_counter_identity_ready(
     const clocks_alpha_ocxo_counterledger_snapshot_t& s) {
-  return s.last_capture_available &&
-         s.last_capture_valid &&
-         s.last_capture_lane_valid &&
-         s.last_capture_all_lanes_valid &&
-         s.last_capture_sequence_match &&
-         s.last_capture_sequence == s.pps_sequence;
+  // Alpha commits only the whole-cell identity derived from programmed OCXO
+  // compare targets plus PPS DWT-at-edge.  The ambient PPS CNTR capture remains
+  // report-only and must not participate in START admission.
+  return s.phase_valid &&
+         s.phase_pps_sequence == s.pps_sequence &&
+         s.phase_implied_counter32_at_pps == s.last_counter32;
 }
 
 
@@ -2587,7 +2721,7 @@ static bool campaign_start_phaseledger_lane_ready(
   return snapshot_ok &&
          s.valid &&
          s.initialized &&
-         campaign_start_phaseledger_capture_ready(s) &&
+         campaign_start_phaseledger_counter_identity_ready(s) &&
          campaign_start_phaseledger_integer_interval_ready(s) &&
          campaign_start_phaseledger_phase_ready(s) &&
          campaign_start_phaseledger_lag_ready(s) &&
@@ -2606,8 +2740,8 @@ static const char* campaign_start_phaseledger_lane_problem(
     snprintf(reason, sizeof(reason), "%s_snapshot", lane);
     return reason;
   }
-  if (!campaign_start_phaseledger_capture_ready(s)) {
-    snprintf(reason, sizeof(reason), "%s_capture", lane);
+  if (!campaign_start_phaseledger_counter_identity_ready(s)) {
+    snprintf(reason, sizeof(reason), "%s_counter_identity", lane);
     return reason;
   }
   if (!campaign_start_phaseledger_integer_interval_ready(s)) {
@@ -4786,6 +4920,8 @@ static FLASHMEM void clocks_beta_cold_diagnostics_init(void) {
   g_ocxo_science_totals_ocxo1 = ocxo_science_totals_t{};
   g_ocxo_science_totals_ocxo2 = ocxo_science_totals_t{};
   g_delta_previous_vclock_reference = delta_residual_reference_t{};
+  g_delta_clock_candidate_ocxo1 = delta_clock_candidate_state_t{};
+  g_delta_clock_candidate_ocxo2 = delta_clock_candidate_state_t{};
 
   g_beta_pps_vclock_forensics = clocks_alpha_lane_forensics_t{};
   g_beta_pps_ocxo1_forensics = clocks_alpha_lane_forensics_t{};
@@ -5179,13 +5315,8 @@ static bool clocks_beta_counterledger_completed_row_ready(
          ledger.valid &&
          ledger.initialized &&
          ledger.pps_sequence == completed_pps_sequence &&
-         ledger.last_capture_available &&
-         ledger.last_capture_valid &&
-         ledger.last_capture_lane_valid &&
-         ledger.last_capture_all_lanes_valid &&
-         ledger.last_capture_sequence_match &&
-         ledger.last_capture_sequence == completed_pps_sequence &&
          ledger.phase_valid &&
+         ledger.phase_implied_counter32_at_pps == ledger.last_counter32 &&
          !ledger.phase_pending &&
          ledger.phase_pps_sequence == completed_pps_sequence &&
          ledger.phase_lag_pps == 0U &&
@@ -5845,6 +5976,72 @@ static FLASHMEM void clocks_monitor_copy_text(char* dst,
                                      const char* src) {
   if (!dst || capacity == 0U) return;
   safeCopy(dst, capacity, src ? src : "");
+}
+
+static FLASHMEM void clocks_monitor_clock_candidates_snapshot_from_row(
+    clocks_monitor_clock_candidates_snapshot_t& out,
+    const delta_clock_candidate_state_t& delta_state,
+    uint32_t public_count,
+    uint64_t phaseledger_ns,
+    bool phaseledger_clockface_valid,
+    const clocks_alpha_ocxo_counterledger_snapshot_t& phaseledger,
+    const clock_science_row_t& delta_row) {
+  out = clocks_monitor_clock_candidates_snapshot_t{};
+  clocks_monitor_copy_text(out.published_source,
+                           sizeof(out.published_source),
+                           "COUNTERLEDGER_PHASELEDGER");
+
+  out.phaseledger.available = phaseledger_clockface_valid;
+  out.phaseledger.continuity_valid = phaseledger_clockface_valid;
+  out.phaseledger.status = phaseledger_clockface_valid
+      ? clocks_monitor_clock_candidate_status_t::ADVANCED
+      : clocks_monitor_clock_candidate_status_t::UNAVAILABLE;
+  out.phaseledger.start_public_count = delta_state.start_public_count;
+  out.phaseledger.last_public_count = public_count;
+  out.phaseledger.interval_count =
+      public_count >= delta_state.start_public_count
+          ? public_count - delta_state.start_public_count
+          : 0U;
+  out.phaseledger.ns = phaseledger_ns;
+  out.phaseledger.residual_available =
+      phaseledger_clockface_valid && phaseledger.refined_interval_valid;
+  out.phaseledger.residual_ns = out.phaseledger.residual_available
+      ? phaseledger.refined_fast_residual_ns
+      : 0LL;
+  out.phaseledger.residual_ns_exact =
+      (double)out.phaseledger.residual_ns;
+
+  out.delta_cycles.available =
+      delta_state.seeded && delta_state.continuity_valid &&
+      delta_state.last_public_count == public_count;
+  out.delta_cycles.continuity_valid = delta_state.continuity_valid;
+  out.delta_cycles.status = delta_state.status;
+  out.delta_cycles.start_public_count = delta_state.start_public_count;
+  out.delta_cycles.last_public_count = delta_state.last_public_count;
+  out.delta_cycles.interval_count = delta_state.interval_count;
+  out.delta_cycles.ns = delta_state.ns;
+  out.delta_cycles.fractional_ns = delta_state.fractional_ns;
+  out.delta_cycles.residual_available = delta_row.delta_raw_valid;
+  out.delta_cycles.residual_ns = delta_row.delta_raw_valid
+      ? delta_row.delta_raw_fast_residual_ns
+      : 0LL;
+  out.delta_cycles.residual_ns_exact = delta_row.delta_raw_valid
+      ? delta_row.delta_raw_fast_residual_ns_exact
+      : 0.0;
+
+  out.comparable =
+      out.phaseledger.available && out.delta_cycles.available;
+  out.delta_cycles_minus_phaseledger_ns = out.comparable
+      ? beta_signed_delta_u64(out.delta_cycles.ns, out.phaseledger.ns)
+      : 0LL;
+  out.residuals_comparable =
+      out.phaseledger.residual_available &&
+      out.delta_cycles.residual_available;
+  out.delta_cycles_minus_phaseledger_residual_ns_exact =
+      out.residuals_comparable
+          ? out.delta_cycles.residual_ns_exact -
+                out.phaseledger.residual_ns_exact
+          : 0.0;
 }
 
 static FLASHMEM void clocks_monitor_science_snapshot_from_row(
@@ -7860,6 +8057,17 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
                                                    public_ocxo2_ns)
       : (public_ocxo2_ns != 0ULL && ocxo2_pps_projected_valid);
 
+  // Advance the independent Delta-Cycles campaign clocks before any science
+  // exclusion can suppress statistical/control mutation.  The candidate is
+  // audit evidence; a missing Delta interval permanently breaks its continuity
+  // until the next explicit campaign or RECOVER seed.
+  delta_clock_candidate_advance(g_delta_clock_candidate_ocxo1,
+                                public_count,
+                                ocxo1_science);
+  delta_clock_candidate_advance(g_delta_clock_candidate_ocxo2,
+                                public_count,
+                                ocxo2_science);
+
   clock_science_apply_counterledger_row(ocxo1_science,
                                         ocxo1_counterledger,
                                         public_gnss_ns);
@@ -8329,10 +8537,26 @@ void clocks_beta_pps(uint32_t completed_pps_sequence) {
 
   record.ocxo1_ns = public_ocxo1_ns;
   record.ocxo1_clockface_valid = ocxo1_clockface_valid;
+  clocks_monitor_clock_candidates_snapshot_from_row(
+      record.ocxo1_clock_candidates,
+      g_delta_clock_candidate_ocxo1,
+      public_count,
+      public_ocxo1_ns,
+      ocxo1_clockface_valid,
+      ocxo1_counterledger,
+      ocxo1_science);
   clocks_monitor_science_snapshot_from_row(
       record.ocxo1_science, ocxo1_science);
   record.ocxo2_ns = public_ocxo2_ns;
   record.ocxo2_clockface_valid = ocxo2_clockface_valid;
+  clocks_monitor_clock_candidates_snapshot_from_row(
+      record.ocxo2_clock_candidates,
+      g_delta_clock_candidate_ocxo2,
+      public_count,
+      public_ocxo2_ns,
+      ocxo2_clockface_valid,
+      ocxo2_counterledger,
+      ocxo2_science);
   clocks_monitor_science_snapshot_from_row(
       record.ocxo2_science, ocxo2_science);
 

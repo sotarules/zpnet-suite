@@ -490,6 +490,44 @@ struct clocks_monitor_dac_snapshot_t {
   clocks_monitor_dither_lane_t ocxo2{};
 };
 
+// Two independent OCXO clock constructions carried in every campaign row.
+// CounterLedger/PhaseLedger remains the initial published authority; Delta Cycles
+// advances a separate campaign clock from the same-row differential residual.
+// Neither candidate repairs or overwrites the other.
+enum class clocks_monitor_clock_candidate_status_t : uint8_t {
+  UNAVAILABLE        = 0,
+  SEEDED             = 1,
+  ADVANCED           = 2,
+  DELTA_INVALID      = 3,
+  PUBLIC_COUNT_GAP   = 4,
+  ARITHMETIC_FAILURE = 5,
+};
+
+struct clocks_monitor_clock_candidate_t {
+  bool available = false;
+  bool continuity_valid = false;
+  clocks_monitor_clock_candidate_status_t status =
+      clocks_monitor_clock_candidate_status_t::UNAVAILABLE;
+  uint32_t start_public_count = 0;
+  uint32_t last_public_count = 0;
+  uint32_t interval_count = 0;
+  uint64_t ns = 0;
+  double fractional_ns = 0.0;
+  bool residual_available = false;
+  int64_t residual_ns = 0;
+  double residual_ns_exact = 0.0;
+};
+
+struct clocks_monitor_clock_candidates_snapshot_t {
+  char published_source[CLOCKS_MONITOR_STATE_NAME_MAX] = {0};
+  clocks_monitor_clock_candidate_t phaseledger{};
+  clocks_monitor_clock_candidate_t delta_cycles{};
+  bool comparable = false;
+  int64_t delta_cycles_minus_phaseledger_ns = 0;
+  bool residuals_comparable = false;
+  double delta_cycles_minus_phaseledger_residual_ns_exact = 0.0;
+};
+
 struct clocks_monitor_science_snapshot_t {
   bool valid = false;
   bool science_worthy = false;
@@ -585,9 +623,11 @@ struct clocks_monitor_campaign_snapshot_t {
 
   uint64_t ocxo1_ns = 0;
   bool ocxo1_clockface_valid = false;
+  clocks_monitor_clock_candidates_snapshot_t ocxo1_clock_candidates{};
   clocks_monitor_science_snapshot_t ocxo1_science{};
   uint64_t ocxo2_ns = 0;
   bool ocxo2_clockface_valid = false;
+  clocks_monitor_clock_candidates_snapshot_t ocxo2_clock_candidates{};
   clocks_monitor_science_snapshot_t ocxo2_science{};
 
   clocks_monitor_stats_snapshot_t stats{};

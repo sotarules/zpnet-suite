@@ -6,7 +6,7 @@ Core contract:
   CLOCKS is a traffic cop and final TIMEBASE arbiter. It owns no Teensy
   clock state. It receives the always-on MONITOR_FRAGMENT stream from the
   Teensy. During a campaign, MONITOR_FRAGMENT carries an optional campaign_row
-  whose TIMEBASE_FRAGMENT_V6 body carries observation plus mode-free eligibility;
+  whose TIMEBASE_FRAGMENT_V7 body carries observation plus mode-free eligibility;
   older fragment versions may also contain embedded forensics. CLOCKS decorates
   the accepted candidate with Pi-owned environment, GF-8802, GNSS_RAW, and
   system-time evidence, then persists the immutable TIMEBASE row.
@@ -3690,7 +3690,7 @@ def _timebase_final_court_check_candidate_envelope(
             },
         )
 
-    # TIMEBASE_FRAGMENT_V6 keeps deep forensics optional; the durable row
+    # TIMEBASE_FRAGMENT_V7 keeps deep forensics optional; the durable row
     # carries compact objections and cycle evidence. Older fragments may still
     # carry a transcript, but its absence is not a structural defect.
     forensics_present = isinstance(forensics, dict) and bool(forensics)
@@ -5031,7 +5031,7 @@ def on_monitor_fragment(payload: Payload) -> None:
 
     Observation-only fragments are intentionally ignored by the TIMEBASE path.
     When ``campaign_row`` is present, its body is the unchanged Teensy-authored
-    TIMEBASE_FRAGMENT_V5 candidate and enters the existing final court verbatim.
+    TIMEBASE_FRAGMENT_V7 candidate and enters the existing final court verbatim.
     """
     if not isinstance(payload, dict):
         _diag["monitor_fragments_malformed"] = _diag.get("monitor_fragments_malformed", 0) + 1
@@ -5298,7 +5298,7 @@ def _process_loop() -> None:
         )
 
         # --- Extract GNSS ns for stream health canary ---
-        # V6 keeps gnss_ns temporarily, but gnss.ns is the canonical ledger.
+        # V7 keeps gnss_ns temporarily, but gnss.ns is the canonical ledger.
         gnss_ns = _fragment_ns(frag, "gnss.ns", "gnss_ns", default=0)
 
         # --- GNSS stream health canary (Pi-side diagnostic only) ---

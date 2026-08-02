@@ -2349,16 +2349,15 @@ static alpha_lane_logical_ticks_t g_ocxo1_ticks64 = {};
 static alpha_lane_logical_ticks_t g_ocxo2_ticks64 = {};
 
 // PPS CounterLedger state.  This is deliberately separate from the ordinary
-// OCXO event tick ledgers above.  The event ledgers advance on OCXO subscriber
-// one-second facts; CounterLedger advances only from process_interrupt's
-// PPS-authored epoch-capture packet.  The capture packet is produced by the
-// priority-0 PPS GPIO ISR, so these are PPS-synchronous samples, not foreground
-// ambient reads.
+// OCXO event tick ledgers above.  The event ledgers advance on observed OCXO
+// one-second compare facts.  CounterLedger advances only after PhaseLedger has
+// bracketed physical PPS between two such facts and derived the exact whole-tick
+// identity from their programmed compare targets.
 //
-// PhaseLedger is the bounded low-order companion to CounterLedger.  The
-// integer rail owns whole OCXO ticks.  PhaseLedger resolves only the 0..99 ns
-// suffix by bracketing a PPS DWT coordinate between two observed OCXO 00-edge
-// DWT facts and reducing that position modulo one 10 MHz tick.
+// The PPS ISR may still carry an ambient CNTR read, but that value is witness
+// only: it has no event-coordinate meaning inside the 100 ns cell and therefore
+// cannot choose the authoritative tooth.  DWT-at-edge plus programmed targets
+// author both the CounterLedger whole cell and the PhaseLedger 0..99 ns suffix.
 static constexpr uint32_t ALPHA_COUNTERLEDGER_PHASE_SOURCE_NONE = 0U;
 static constexpr uint32_t ALPHA_COUNTERLEDGER_PHASE_SOURCE_PHYSICAL_PPS_TO_OBSERVED_OCXO_EDGE = 1U;
 static constexpr uint32_t ALPHA_COUNTERLEDGER_PHASE_NEAR_BOUNDARY_NS = 8U;
@@ -2368,7 +2367,7 @@ static constexpr uint32_t ALPHA_COUNTERLEDGER_PHASE_NEAR_BOUNDARY_NS = 8U;
 // the next PPS.  This is one scalar slot, not a queue.
 static constexpr uint32_t ALPHA_COUNTERLEDGER_PHASE_PENDING_SLOT_CAPACITY = 1U;
 
-// CounterLedger is a PPS-sampled 10 MHz integer rail.  A lawful contiguous
+// CounterLedger is a PPS-resolved, edge-authored 10 MHz integer rail.  A lawful contiguous
 // PPS interval must remain within 10,000 ticks of the nominal 10,000,000-tick
 // second.  A deviation of 10,000 ticks is exactly 1 ms / 1,000 ppm: far beyond
 // plausible OCXO physics, but exactly the discrete injury produced when a
@@ -2389,6 +2388,12 @@ struct alpha_counterledger_phase_pending_t {
   bool     valid = false;
   uint32_t pps_sequence = 0;
   uint32_t pps_dwt_at_edge = 0;
+
+  // Optional ambient PPS-time CNTR testimony.  This is carried with the exact
+  // pending PPS identity so the later resolver can compare it with the
+  // edge-implied tooth without ever using it as authority.
+  bool     ambient_counter_witness_valid = false;
+  uint32_t ambient_counter32 = 0;
 };
 
 struct alpha_pps_counterledger_lane_t {
@@ -2412,6 +2417,8 @@ struct alpha_pps_counterledger_lane_t {
   bool     phase_pending = false;
   uint32_t pending_phase_pps_sequence = 0;
   uint32_t pending_phase_pps_dwt_at_edge = 0;
+  bool     pending_ambient_counter_witness_valid = false;
+  uint32_t pending_ambient_counter32 = 0;
   uint32_t phase_pending_overwrite_count = 0;
 
   uint32_t phase_pending_depth = 0;
@@ -2455,10 +2462,10 @@ struct alpha_pps_counterledger_lane_t {
   uint32_t phase_ocxo_interval_cycles = 0;
   uint32_t phase_pps_delta_cycles = 0;
 
-  // Passive whole-cell reconciliation. CounterLedger supplies the ambient
-  // PPS-sampled 100 ns cell; PhaseLedger geometry independently implies the
-  // last complete OCXO tick before PPS. These fields expose disagreement but
-  // never repair, gate, or replace either candidate.
+  // Whole-cell authorship plus ambient witness.  The programmed edge targets
+  // and DWT geometry author phase_implied_counter32_at_pps.  The later ambient
+  // PPS CNTR read is copied into phase_sampled_counter32_at_pps only so a
+  // boundary straddle remains visible.
   bool     phase_counter_cell_check_valid = false;
   uint32_t phase_prev_ocxo_counter32_at_edge = 0;
   uint32_t phase_next_ocxo_counter32_at_edge = 0;
@@ -3440,6 +3447,8 @@ static void alpha_counterledger_phase_pending_clear(
   s.phase_pending = false;
   s.pending_phase_pps_sequence = 0U;
   s.pending_phase_pps_dwt_at_edge = 0U;
+  s.pending_ambient_counter_witness_valid = false;
+  s.pending_ambient_counter32 = 0U;
   alpha_counterledger_phase_pending_refresh(s);
 }
 
@@ -3447,12 +3456,18 @@ static void alpha_counterledger_phase_pending_enqueue(
     time_clock_id_t clock,
     alpha_pps_counterledger_lane_t& s,
     uint32_t pps_sequence,
-    uint32_t pps_dwt_at_edge) {
+    uint32_t pps_dwt_at_edge,
+    bool ambient_counter_witness_valid,
+    uint32_t ambient_counter32) {
   if (pps_sequence == 0U || pps_dwt_at_edge == 0U) return;
 
   if (s.phase_pending) {
     if (s.pending_phase_pps_sequence == pps_sequence) {
       s.pending_phase_pps_dwt_at_edge = pps_dwt_at_edge;
+      s.pending_ambient_counter_witness_valid =
+          ambient_counter_witness_valid;
+      s.pending_ambient_counter32 =
+          ambient_counter_witness_valid ? ambient_counter32 : 0U;
       alpha_counterledger_phase_pending_refresh(s);
       return;
     }
@@ -3474,6 +3489,9 @@ static void alpha_counterledger_phase_pending_enqueue(
   s.phase_pending = true;
   s.pending_phase_pps_sequence = pps_sequence;
   s.pending_phase_pps_dwt_at_edge = pps_dwt_at_edge;
+  s.pending_ambient_counter_witness_valid = ambient_counter_witness_valid;
+  s.pending_ambient_counter32 =
+      ambient_counter_witness_valid ? ambient_counter32 : 0U;
   s.phase_pending_enqueue_count++;
   alpha_counterledger_phase_pending_refresh(s);
 }
@@ -3536,6 +3554,12 @@ static bool alpha_counterledger_phase_pending_find_bracketed(
     out_pending->valid = true;
     out_pending->pps_sequence = s.pending_phase_pps_sequence;
     out_pending->pps_dwt_at_edge = s.pending_phase_pps_dwt_at_edge;
+    out_pending->ambient_counter_witness_valid =
+        s.pending_ambient_counter_witness_valid;
+    out_pending->ambient_counter32 =
+        s.pending_ambient_counter_witness_valid
+            ? s.pending_ambient_counter32
+            : 0U;
   }
   if (out_pps_delta_cycles) *out_pps_delta_cycles = delta;
   return true;
@@ -3546,8 +3570,8 @@ static void alpha_counterledger_reprime_lane_for_recover(
   if (!s.initialized) return;
 
   // Preserve the absolute tick ledger and zero-offset authority.  Cut only
-  // interval/phase custody so the first post-recovery PPS sample becomes a
-  // seed, and the next clean samples must prove fresh CounterLedger +
+  // interval/phase custody so the first post-recovery edge-implied PPS identity
+  // becomes a seed, and later clean identities must prove fresh CounterLedger +
   // PhaseLedger continuity before RECOVER reattachment can clear.
   s.sample_count = 0;
   s.pps_sequence = 0;
@@ -3729,7 +3753,8 @@ static double alpha_counterledger_block_ppb(uint64_t block_ns,
 static uint64_t alpha_phaseledger_refined_ns(
     uint64_t integer_ns,
     uint32_t phase_after_last_00_ns) {
-  // CounterLedger already owns every whole 100 ns OCXO tick observed at PPS.
+  // CounterLedger already owns every whole 100 ns OCXO tick implied at PPS
+  // by the adjacent programmed compare targets.
   // PhaseLedger contributes only the bounded 0..99 ns suffix inside that tick.
   // A cumulative wrap carry here would count the same hardware tick twice.
   const uint64_t phase = (uint64_t)phase_after_last_00_ns;
@@ -3765,7 +3790,7 @@ static bool alpha_counterledger_refresh_refined_from_phase(
   if (s.last_refined_phase_pps_sequence != 0U &&
       s.refined_phase_pps_sequence ==
           (uint32_t)(s.last_refined_phase_pps_sequence + 1U)) {
-    // The PPS-sampled integer interval already includes any whole-tick change
+    // The edge-implied integer interval already includes any whole-tick change
     // that accompanied a 99->0 or 0->99 phase-cell crossing.  Pair it with the
     // raw signed suffix delta.  Using the unwrapped delta (or a cumulative carry)
     // would add or remove that same 100 ns tick a second time.
@@ -3885,18 +3910,14 @@ static bool alpha_counterledger_phase_catchup_from_last_edge_pair(
     time_clock_id_t clock,
     alpha_pps_counterledger_lane_t& s);
 
-static bool alpha_counterledger_apply_pps_sample(
+static bool alpha_counterledger_commit_implied_pps_sample(
     time_clock_id_t clock,
     alpha_pps_counterledger_lane_t& s,
     uint32_t pps_sequence,
-    uint32_t pps_dwt_at_edge,
-    uint32_t sampled_counter32,
-    uint64_t* out_ns) {
-  if (out_ns) *out_ns = 0ULL;
-
+    uint32_t implied_counter32) {
   const uint32_t previous_pps_sequence = s.pps_sequence;
   const uint32_t previous_counter32 = s.last_counter32;
-  const uint32_t delta_ticks = sampled_counter32 - previous_counter32;
+  const uint32_t delta_ticks = implied_counter32 - previous_counter32;
 
   if (!s.initialized) {
     alpha_counterledger_note_sample_decision(
@@ -3904,7 +3925,7 @@ static bool alpha_counterledger_apply_pps_sample(
         CLOCKS_COUNTERLEDGER_SAMPLE_DECISION_NOT_INITIALIZED,
         pps_sequence,
         previous_pps_sequence,
-        sampled_counter32,
+        implied_counter32,
         previous_counter32,
         delta_ticks);
     return false;
@@ -3931,7 +3952,7 @@ static bool alpha_counterledger_apply_pps_sample(
                                            sample_decision,
                                            pps_sequence,
                                            previous_pps_sequence,
-                                           sampled_counter32,
+                                           implied_counter32,
                                            previous_counter32,
                                            delta_ticks);
 
@@ -3940,19 +3961,17 @@ static bool alpha_counterledger_apply_pps_sample(
   const uint32_t previous_refined_phase_pps_sequence =
       s.refined_phase_pps_sequence;
 
-  // Advance the long integer ledger on the first post-zero/post-recover seed,
-  // on lawful contiguous intervals, and across explicit sequence gaps where
-  // the hardware counter delta is the only absolute elapsed-time witness.
-  // Do not advance on a contiguous-but-impossible interval: that is a stale or
-  // mis-associated PPS capture and must become a re-seed, not a 0/1/36k tick
-  // science interval.
+  // Advance only from the counter identity implied by the programmed OCXO
+  // compare targets and the physical PPS DWT coordinate.  The optional ambient
+  // CNTR witness never enters this arithmetic.  A contiguous-but-impossible
+  // interval remains a re-seed/exclusion rather than fabricated clock time.
   if (!had_prior_sample || admissible_interval || !contiguous) {
     s.ticks64 += (uint64_t)delta_ticks;
   } else {
     alpha_counterledger_reject_interval(s, delta_ticks);
   }
 
-  s.last_counter32 = sampled_counter32;
+  s.last_counter32 = implied_counter32;
   s.pps_sequence = pps_sequence;
   s.sample_count++;
   s.update_count++;
@@ -3990,19 +4009,6 @@ static bool alpha_counterledger_apply_pps_sample(
     s.last_fast_residual_ns =
         (int64_t)s.last_interval_ns - (int64_t)NS_PER_SECOND_U64;
   }
-
-  if (alpha_counterledger_phase_left_edge_ready(clock)) {
-    alpha_counterledger_phase_pending_enqueue(clock, s, pps_sequence,
-                                               pps_dwt_at_edge);
-
-    // PPS-sample-side catch-up: the OCXO edge resolver may have run moments
-    // before this PPS capture was enqueued.  Re-try the cached adjacent edge
-    // pair; exact-row refinement remains mandatory.
-    (void)alpha_counterledger_phase_catchup_from_last_edge_pair(clock, s);
-    (void)alpha_counterledger_refresh_refined_from_phase(clock, s);
-  }
-
-  if (out_ns) *out_ns = s.refined_valid ? s.refined_ns : s.ns;
 
   if (implausible_reseed) {
     // Preserve the bad capture and re-seed this lane, but keep the campaign
@@ -4096,6 +4102,45 @@ static void alpha_counterledger_note_capture_status(
 }
 
 
+
+// Stage one physical PPS fact for later resolution by the adjacent programmed
+// OCXO compare targets.  The ambient counter is copied only as a witness tied to
+// this PPS sequence; missing witness data never blocks the authoritative path.
+static bool alpha_counterledger_stage_pps_fact(
+    time_clock_id_t clock,
+    alpha_pps_counterledger_lane_t& s,
+    uint32_t pps_sequence,
+    uint32_t pps_dwt_at_edge,
+    bool ambient_counter_witness_valid,
+    uint32_t ambient_counter32) {
+  if (!s.initialized || pps_sequence == 0U || pps_dwt_at_edge == 0U ||
+      !alpha_counterledger_phase_left_edge_ready(clock)) {
+    return false;
+  }
+
+  alpha_counterledger_phase_pending_enqueue(
+      clock,
+      s,
+      pps_sequence,
+      pps_dwt_at_edge,
+      ambient_counter_witness_valid,
+      ambient_counter32);
+
+  // The post-PPS OCXO edge may have reached Alpha before the PPS continuation.
+  // Re-run the cached edge pair; both orderings still converge on the same
+  // edge-authored resolver and no ambient value can become authority.
+  (void)alpha_counterledger_phase_catchup_from_last_edge_pair(clock, s);
+
+  const bool resolved =
+      s.pps_sequence == pps_sequence &&
+      s.phase_valid &&
+      s.phase_pps_sequence == pps_sequence &&
+      s.refined_valid &&
+      s.refined_phase_pps_sequence == pps_sequence;
+  const bool pending =
+      s.phase_pending && s.pending_phase_pps_sequence == pps_sequence;
+  return resolved || pending;
+}
 
 static alpha_pps_counterledger_lane_t* alpha_counterledger_lane_mut(
     time_clock_id_t clock) {
@@ -4266,20 +4311,32 @@ static bool alpha_counterledger_resolve_phase_from_ocxo_edge(
       next_ocxo_counter32_at_edge - counter_delta_ticks;
   const uint32_t phase_implied_counter32_at_pps =
       previous_ocxo_counter32_at_edge + phase_implied_ticks_since_prev_edge;
+  // The programmed edge targets plus PPS DWT-at-edge choose the authoritative
+  // whole 100 ns tooth.  The later ambient CNTR read remains an optional witness
+  // and may legitimately differ by one when the read straddles the boundary.
   const bool phase_counter_cell_check_valid =
-      pending.pps_sequence == s->pps_sequence &&
-      s->last_capture_available &&
-      s->last_capture_valid &&
-      s->last_capture_lane_valid &&
-      s->last_capture_sequence_match &&
-      s->last_capture_sequence == pending.pps_sequence;
+      pending.ambient_counter_witness_valid;
   const uint32_t phase_sampled_counter32_at_pps =
-      phase_counter_cell_check_valid ? s->last_counter32 : 0U;
+      phase_counter_cell_check_valid ? pending.ambient_counter32 : 0U;
   const int32_t phase_sampled_minus_implied_ticks =
       phase_counter_cell_check_valid
           ? (int32_t)(phase_sampled_counter32_at_pps -
                       phase_implied_counter32_at_pps)
           : 0;
+
+  if (!alpha_counterledger_commit_implied_pps_sample(
+          clock, *s, pending.pps_sequence, phase_implied_counter32_at_pps)) {
+    s->phase_invalid_count++;
+    alpha_counterledger_phase_pending_remove_at(*s, pending_index, false);
+    alpha_counterledger_note_phase_resolve(
+        *s,
+        CLOCKS_PHASELEDGER_RESOLVE_REASON_COUNTERLEDGER_COMMIT_FAILED,
+        pending.pps_sequence,
+        counter_delta_ticks,
+        interval_cycles,
+        pps_delta_cycles);
+    return false;
+  }
 
   uint32_t phase_after_last_00_ns = (uint32_t)(
       (tick_remainder_cycles * (uint64_t)NS_PER_10MHZ_TICK) /
@@ -6054,8 +6111,11 @@ static bool alpha_counterledger_lane_ready_light(
       s.phase_pps_sequence != 0U &&
       s.phase_pps_sequence == s.pps_sequence;
 
+  const bool counter_identity_ready =
+      phase_ready && s.phase_implied_counter32_at_pps == s.last_counter32;
+
   return s.interval_valid && s.last_interval_ns != 0ULL &&
-         phase_ready &&
+         counter_identity_ready &&
          s.refined_valid &&
          s.refined_phase_pps_sequence == s.pps_sequence &&
          s.refined_interval_valid && s.refined_interval_ns != 0ULL;
@@ -6392,21 +6452,19 @@ static void alpha_timebase_row_reset_all(void) {
   g_alpha_last_installed_timebase_pps_sequence = 0U;
 }
 
-static bool alpha_timebase_lane_capture_ready(
+static bool alpha_timebase_lane_counter_identity_ready(
     const alpha_pps_counterledger_lane_t& s,
     uint32_t pps_sequence) {
   return s.initialized && s.pps_sequence == pps_sequence &&
-      s.last_capture_available && s.last_capture_valid &&
-      s.last_capture_lane_valid && s.last_capture_all_lanes_valid &&
-      s.last_capture_sequence_match &&
-      s.last_capture_sequence == pps_sequence;
+      s.phase_valid && s.phase_pps_sequence == pps_sequence &&
+      s.phase_implied_counter32_at_pps == s.last_counter32;
 }
 
 static bool alpha_timebase_lane_ready(time_clock_id_t clock,
                                       uint32_t pps_sequence) {
   const alpha_pps_counterledger_lane_t* s =
       alpha_counterledger_lane(clock);
-  return s && alpha_timebase_lane_capture_ready(*s, pps_sequence) &&
+  return s && alpha_timebase_lane_counter_identity_ready(*s, pps_sequence) &&
       s->phase_valid && s->phase_pps_sequence == pps_sequence &&
       !s->phase_pending && s->refined_valid &&
       s->refined_phase_pps_sequence == pps_sequence &&
@@ -6416,8 +6474,7 @@ static bool alpha_timebase_lane_ready(time_clock_id_t clock,
 static bool alpha_timebase_lane_waiting_for_phase(
     const alpha_pps_counterledger_lane_t& s,
     uint32_t pps_sequence) {
-  return alpha_timebase_lane_capture_ready(s, pps_sequence) &&
-      s.phase_pending &&
+  return s.initialized && s.phase_pending &&
       s.pending_phase_pps_sequence == pps_sequence;
 }
 
@@ -8598,19 +8655,15 @@ bool clocks_alpha_ocxo_recover_reattach_snapshot(
     const bool ledger_snapshot_ok = ledger != nullptr;
     const bool ledger_valid =
         ledger_snapshot_ok && ledger->initialized && ledger->sample_count != 0U;
-    const bool capture_ready =
-        ledger_valid &&
-        ledger->last_capture_available &&
-        ledger->last_capture_valid &&
-        ledger->last_capture_lane_valid &&
-        ledger->last_capture_sequence_match &&
-        ledger->last_capture_sequence == ledger->pps_sequence;
     const bool phase_ready =
         ledger_valid &&
         ledger->phase_valid &&
         !ledger->phase_pending &&
         ledger->phase_pps_sequence != 0U &&
         ledger->phase_pps_sequence == ledger->pps_sequence;
+    const bool counter_identity_ready =
+        phase_ready &&
+        ledger->phase_implied_counter32_at_pps == ledger->last_counter32;
     const uint32_t phase_lag = phase_ready ? 0U :
         ((ledger_valid && ledger->phase_valid &&
           ledger->phase_pps_sequence <= ledger->pps_sequence)
@@ -8634,7 +8687,7 @@ bool clocks_alpha_ocxo_recover_reattach_snapshot(
     // this lane.  Integer CounterLedger state without its matching PhaseLedger
     // suffix is useful testimony, but it is not a publishable OCXO clockface.
     const bool clockface_ready =
-        ledger_valid && capture_ready && phase_ready &&
+        ledger_valid && counter_identity_ready && phase_ready &&
         refined_valid && ledger->ns != 0ULL;
     const bool science_ready =
         clockface_ready && interval_valid && refined_interval_valid;
@@ -8643,7 +8696,9 @@ bool clocks_alpha_ocxo_recover_reattach_snapshot(
     r.counterledger_snapshot_ok = ledger_snapshot_ok;
     r.counterledger_valid = ledger_valid;
     r.counterledger_initialized = ledger_snapshot_ok && ledger->initialized;
-    r.counterledger_capture_ready = capture_ready;
+    // Legacy field name: this now reports successful edge-derived whole-cell
+    // authorship.  Ambient witness status remains in last_capture_* below.
+    r.counterledger_capture_ready = counter_identity_ready;
     r.counterledger_interval_valid = interval_valid;
     r.counterledger_phase_valid = phase_ready;
     r.counterledger_phase_lag_ok = phase_lag_ok;
@@ -9763,49 +9818,48 @@ static bool alpha_sample_all_clocks_at_pps_vclock(const pps_edge_snapshot_t& sna
                                             cap,
                                             snap.sequence);
 
-    const bool counterledger_capture_ready_ocxo1 =
-        cap_available &&
-        cap.valid &&
-        cap.ocxo1_capture_valid &&
+    const bool ambient_witness_valid_ocxo1 =
+        cap_available && cap.valid && cap.ocxo1_capture_valid &&
         cap.sequence == snap.sequence;
-    const bool counterledger_capture_ready_ocxo2 =
-        cap_available &&
-        cap.valid &&
-        cap.ocxo2_capture_valid &&
+    const bool ambient_witness_valid_ocxo2 =
+        cap_available && cap.valid && cap.ocxo2_capture_valid &&
         cap.sequence == snap.sequence;
-    const bool applied_ocxo1 = counterledger_capture_ready_ocxo1 &&
-        alpha_counterledger_apply_pps_sample(time_clock_id_t::OCXO1,
-                                             g_ocxo1_pps_counterledger,
-                                             snap.sequence,
-                                             snap.physical_pps_dwt_normalized_at_edge,
-                                             cap.ocxo1_counter32,
-                                             nullptr);
-    const bool applied_ocxo2 = counterledger_capture_ready_ocxo2 &&
-        alpha_counterledger_apply_pps_sample(time_clock_id_t::OCXO2,
-                                             g_ocxo2_pps_counterledger,
-                                             snap.sequence,
-                                             snap.physical_pps_dwt_normalized_at_edge,
-                                             cap.ocxo2_counter32,
-                                             nullptr);
 
-    if ((!applied_ocxo1 || !applied_ocxo2) && counterledger_authority_enabled) {
+    const bool staged_ocxo1 = alpha_counterledger_stage_pps_fact(
+        time_clock_id_t::OCXO1,
+        g_ocxo1_pps_counterledger,
+        snap.sequence,
+        snap.physical_pps_dwt_normalized_at_edge,
+        ambient_witness_valid_ocxo1,
+        ambient_witness_valid_ocxo1 ? cap.ocxo1_counter32 : 0U);
+    const bool staged_ocxo2 = alpha_counterledger_stage_pps_fact(
+        time_clock_id_t::OCXO2,
+        g_ocxo2_pps_counterledger,
+        snap.sequence,
+        snap.physical_pps_dwt_normalized_at_edge,
+        ambient_witness_valid_ocxo2,
+        ambient_witness_valid_ocxo2 ? cap.ocxo2_counter32 : 0U);
+
+    if ((!staged_ocxo1 || !staged_ocxo2) && counterledger_authority_enabled) {
       const uint32_t rejected_lane_mask =
-          (!applied_ocxo1 ? CLOCKS_ROW_LANE_OCXO1 : 0U) |
-          (!applied_ocxo2 ? CLOCKS_ROW_LANE_OCXO2 : 0U);
-      const uint32_t capture_evidence_bits =
-          (cap.ocxo1_capture_valid ? 1U : 0U) |
-          (cap.ocxo2_capture_valid ? 2U : 0U) |
-          (cap.all_lanes_capture_valid ? 4U : 0U);
+          (!staged_ocxo1 ? CLOCKS_ROW_LANE_OCXO1 : 0U) |
+          (!staged_ocxo2 ? CLOCKS_ROW_LANE_OCXO2 : 0U);
+      const uint32_t stage_evidence_bits =
+          (alpha_counterledger_phase_left_edge_ready(time_clock_id_t::OCXO1)
+               ? 1U : 0U) |
+          (alpha_counterledger_phase_left_edge_ready(time_clock_id_t::OCXO2)
+               ? 2U : 0U) |
+          (snap.physical_pps_dwt_normalized_at_edge != 0U ? 4U : 0U);
       clocks_row_exclude(
           clocks_row_objection_source_t::ALPHA,
           clocks_row_objection_reason_t::ALPHA_COUNTERLEDGER_CAPTURE,
           rejected_lane_mask,
           snap.sequence,
-          cap.sequence,
-          cap.valid ? 1U : 0U,
-          capture_evidence_bits);
-      // Continue the PPS/VCLOCK timeline.  Invalid OCXO clockfaces remain zero
-      // or stale evidence and Beta marks the candidate DO_NOT_USE.
+          snap.physical_pps_dwt_normalized_at_edge,
+          stage_evidence_bits,
+          0U);
+      // Ambient witness loss alone never enters this branch.  A failure here
+      // means Alpha could not stage the physical PPS DWT for edge resolution.
     }
   }
 
@@ -9875,7 +9929,7 @@ static bool alpha_sample_all_clocks_at_pps_vclock(const pps_edge_snapshot_t& sna
   // In traditional mode, capture the large campaign public-origin correction
   // only from PPS-row clock-domain projections, never from the conservative
   // measured-edge fallback.  In CounterLedger mode, do not let the projection
-  // path install the public branch; the PPS-sampled integer ledger below owns
+  // path install the public branch; the edge-authored integer ledger below owns
   // that origin.
   if (!clocks_ocxo_counterledger_mode() &&
       ocxo1_projected_visible_valid && ocxo2_projected_visible_valid) {

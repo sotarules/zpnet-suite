@@ -224,8 +224,9 @@ uint64_t clocks_dwt_cycles_at_dwt(uint32_t dwt32);
 // totals.
 //
 // PPS_COUNTERLEDGER makes the public OCXO nanosecond clocks the exact
-// PPS-synchronous CounterLedger whole-tick value plus the PhaseLedger 0..99 ns
-// suffix resolved by the first observed OCXO one-second edge after that PPS.
+// edge-authored CounterLedger whole-tick value plus the PhaseLedger 0..99 ns
+// suffix.  The same adjacent programmed OCXO compare targets and DWT-at-edge
+// geometry author both pieces; the PPS-time ambient CNTR read is witness only.
 // Alpha does not release the row to Beta until both lanes resolve the same PPS
 // sequence.  Delta Cycles remains the independent observed-edge frequency
 // candidate; bridge and static projection surfaces remain forensic only.
@@ -323,6 +324,7 @@ static constexpr uint32_t CLOCKS_PHASELEDGER_RESOLVE_REASON_ZERO_INTERVAL = 3U;
 static constexpr uint32_t CLOCKS_PHASELEDGER_RESOLVE_REASON_UNBRACKETED = 4U;
 static constexpr uint32_t CLOCKS_PHASELEDGER_RESOLVE_REASON_BAD_COUNTER_DELTA = 5U;
 static constexpr uint32_t CLOCKS_PHASELEDGER_RESOLVE_REASON_RESOLVED = 6U;
+static constexpr uint32_t CLOCKS_PHASELEDGER_RESOLVE_REASON_COUNTERLEDGER_COMMIT_FAILED = 7U;
 
 static inline const char* clocks_phaseledger_resolve_reason_name(uint32_t id) {
   switch (id) {
@@ -333,6 +335,8 @@ static inline const char* clocks_phaseledger_resolve_reason_name(uint32_t id) {
     case CLOCKS_PHASELEDGER_RESOLVE_REASON_UNBRACKETED: return "UNBRACKETED";
     case CLOCKS_PHASELEDGER_RESOLVE_REASON_BAD_COUNTER_DELTA: return "BAD_COUNTER_DELTA";
     case CLOCKS_PHASELEDGER_RESOLVE_REASON_RESOLVED: return "RESOLVED";
+    case CLOCKS_PHASELEDGER_RESOLVE_REASON_COUNTERLEDGER_COMMIT_FAILED:
+      return "COUNTERLEDGER_COMMIT_FAILED";
     default: return "UNKNOWN";
   }
 }
@@ -366,10 +370,10 @@ struct clocks_alpha_ocxo_counterledger_snapshot_t {
   uint64_t interval_ns = 0;
   int64_t  fast_residual_ns = 0;
 
-  // PhaseLedger suffix for CounterLedger.  The integer CounterLedger rail
-  // owns whole 100 ns OCXO ticks sampled at PPS.  PhaseLedger supplies only
-  // the bounded 0..99 ns low-order suffix by measuring where the PPS edge
-  // landed inside the adjacent observed OCXO tick lattice.
+  // CounterLedger and PhaseLedger are one edge-authored construction.  The
+  // adjacent programmed OCXO compare targets identify the whole 100 ns cell;
+  // DWT-at-edge locates physical PPS inside that cell and supplies the 0..99 ns
+  // suffix.  No ambient CNTR read participates in the authoritative clockface.
   bool     phase_valid = false;
   bool     phase_pending = false;
   bool     phase_near_boundary = false;
@@ -382,11 +386,10 @@ struct clocks_alpha_ocxo_counterledger_snapshot_t {
   uint32_t phase_ocxo_interval_cycles = 0;
   uint32_t phase_pps_delta_cycles = 0;
 
-  // Whole-cell reconciliation witness. PhaseLedger geometry independently
-  // identifies the last complete OCXO tick before PPS. Compare that implied
-  // counter identity with CounterLedger's ambient PPS sample without changing
-  // either authority. sampled_minus_implied_ticks should be zero when both
-  // methods selected the same 100 ns cell.
+  // Whole-cell authorship plus ambient witness.  phase_implied_counter32_at_pps
+  // is authoritative: it comes from the adjacent programmed compare targets and
+  // PPS DWT-at-edge.  phase_sampled_counter32_at_pps is the later ambient CNTR
+  // witness only.  sampled_minus_implied_ticks exposes boundary straddles.
   bool     phase_counter_cell_check_valid = false;
   uint32_t phase_prev_ocxo_counter32_at_edge = 0;
   uint32_t phase_next_ocxo_counter32_at_edge = 0;
@@ -453,8 +456,9 @@ struct clocks_alpha_ocxo_counterledger_snapshot_t {
   uint64_t refined_interval_ns = 0;
   int64_t  refined_fast_residual_ns = 0;
 
-  // Capture-custody counters.  These are report-only unless
-  // CLOCKS_OCXO_PUBLIC_NS_AUTHORITY == PPS_COUNTERLEDGER.
+  // PPS-time ambient CNTR capture testimony.  These fields are report-only in
+  // every authority mode; missing or boundary-straddled ambient reads never gate
+  // or author CounterLedger/PhaseLedger.
   bool     last_capture_available = false;
   bool     last_capture_valid = false;
   bool     last_capture_lane_valid = false;
@@ -475,11 +479,10 @@ struct clocks_alpha_ocxo_counterledger_snapshot_t {
   uint32_t plausible_min_delta_ticks = 0;
   uint32_t plausible_max_delta_ticks = 0;
 
-  // RECOVER/capture instrumentation. Lifetime counters describe the current
-  // SmartZero epoch. recover_* counters are reset at each RECOVER reprime and
-  // answer whether the post-recovery PPS capture path is missing, rejecting,
-  // seeding, accepting intervals, resolving PhaseLedger, and maturing refined
-  // intervals.
+  // RECOVER instrumentation.  Capture counters describe the optional ambient
+  // witness.  Sample counters describe edge-implied CounterLedger commits.
+  // recover_* counters are reset at each RECOVER reprime and show the path from
+  // staged PPS DWT through PhaseLedger resolution to a refined interval.
   uint32_t capture_gate_attempt_count = 0;
   uint32_t capture_gate_ready_count = 0;
   uint32_t capture_gate_reject_count = 0;
@@ -1313,6 +1316,9 @@ struct clocks_alpha_recover_reattach_snapshot_t {
   bool     counterledger_snapshot_ok = false;
   bool     counterledger_valid = false;
   bool     counterledger_initialized = false;
+  // Legacy name: now means the edge-derived whole-cell identity agrees with
+  // CounterLedger's committed last_counter32.  Ambient witness readiness remains
+  // visible separately in counterledger_last_capture_* fields below.
   bool     counterledger_capture_ready = false;
   bool     counterledger_interval_valid = false;
   bool     counterledger_phase_valid = false;
