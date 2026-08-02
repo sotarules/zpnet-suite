@@ -13,24 +13,20 @@ Stats policy (Pi is a stenographer):
   GNSS residual samples are definitionally zero, but its N is the real
   Alpha-owned always-on Welford population, never campaign PPS count.
   No Pi-side means, stddevs, stderrs, or residuals are computed here.  The only
-  Pi-side arithmetic is presentation conversion (DAC code → voltage) and
-  baseline delta (NOW - BASE), neither of which is a statistic.
+  Pi-side arithmetic is deterministic presentation conversion: DAC code →
+  voltage, baseline delta (NOW - BASE), and campaign PPB reconstructed from the
+  campaign-scoped clockface identity.  None is a statistical estimator.
 
 Clock row doctrine:
   VALUE is the canonical 64-bit clock value.
-  RAW is the firmware-published one-second interval surface.  For standard
-  nanosecond clocks (GNSS, VCLOCK, OCXO1, OCXO2), RAW is nanoseconds added to
-  that clock during the prior GNSS/PPS second.  DWT is the deliberate exception:
-  its VALUE and RAW fields are cycle-oriented.
-  RES is the firmware-published residual for that interval.
-
-  For OCXO lanes, RAW/RES come from ocxoN.pps_residual, not the older
-  edge-domain bridge measurement.  That keeps the metrics panel locked to the
-  same PPS-founded residual doctrine used by TIMEBASE statistics and servo
-  input.
+  TAU/PPB are the Alpha-owned always-on instrument estimate.
+  CAMP PPB is the current campaign clockface ratio relative to GNSS.  It prefers
+  a firmware-published campaign total when present and otherwise reconstructs
+  the exact identity from the campaign OCXO/GNSS clockfaces already in MONITOR.
+  RES is the firmware-published residual for the prior PPS interval.
 
 Column layout (CLK rows):
-  NAME   VALUE   TAU   PPB   RAW   RES   MEAN   SD   SE   N   BASE   NOW   DELTA
+  NAME   VALUE   TAU   PPB   CAMP PPB   RES   MEAN   SD   SE   N   BASE   NOW   DELTA
 
 Column layout (DAC rows):
   NAME   DAC_VALUE_VOLTAGE   (blanks)   MEAN   SD   SE   N   BASE   NOW   DELTA
@@ -1008,7 +1004,7 @@ def _dac_report_dither_summary(r: dict, report_dac: dict | None, lane: str, dac_
 
 def _dac_detail_lines(r: dict, baseline: dict | None, report_dac: dict | None,
                       W_NAME: int, W_VALUE: int, W_TAU: int, W_PPB: int,
-                      W_RAW: int, W_RES: int, W_MEAN: int, W_SD: int,
+                      W_CAMP_PPB: int, W_RES: int, W_MEAN: int, W_SD: int,
                       W_SE: int, W_N: int, W_BASE: int, W_NOW: int,
                       W_DELTA: int) -> list[str]:
     lines: list[str] = []
@@ -1018,7 +1014,7 @@ def _dac_detail_lines(r: dict, baseline: dict | None, report_dac: dict | None,
     # Welford MEAN/SD/SE/N columns therefore start at exactly the same screen
     # position as the clock rows.
     dac_value_width = W_VALUE + DAC_VOLTAGE_EXTRA_DECIMALS
-    dither_width = max(0, W_TAU + W_PPB + W_RAW + W_RES - DAC_VOLTAGE_EXTRA_DECIMALS)
+    dither_width = max(0, W_TAU + W_PPB + W_CAMP_PPB + W_RES - DAC_VOLTAGE_EXTRA_DECIMALS)
 
     lines.append(
         f"{'DAC':<{W_NAME}}"
@@ -1405,6 +1401,47 @@ def _clockface_value(r: dict, lane: str):
     return None
 
 
+def _campaign_ppb(r: dict, lane: str):
+    """Return campaign-scoped PPB from the campaign clockface identity.
+
+    Prefer an explicit firmware-authored campaign total when a future/current
+    fragment publishes one.  Contemporary TIMEBASE_FRAGMENT_V6 already carries
+    the sufficient campaign clockfaces, so the fallback uses the cancellation-
+    safe form of (clock / GNSS - 1) * 1e9:
+
+        (clock_ns - gnss_ns) * 1e9 / gnss_ns
+
+    Outside an active campaign the visible clockfaces may be instrument-scoped,
+    so no campaign value is published.
+    """
+    state = str(
+        r.get("campaign_state")
+        or ("STARTED" if r.get("campaign_present") else "STOPPED")
+    ).upper()
+    if state != "STARTED" and not r.get("campaign_present"):
+        return None
+
+    if lane == "gnss":
+        return 0.0
+
+    explicit = _to_float(_field(
+        r,
+        f"{lane}.science.total_ppb",
+        f"{lane}.campaign.ppb",
+        f"campaign.{lane}.ppb",
+        default=None,
+    ))
+    if explicit is not None:
+        return explicit
+
+    gnss_ns = _clockface_value(r, "gnss")
+    clock_ns = _clockface_value(r, lane)
+    if gnss_ns is None or clock_ns is None or gnss_ns <= 0:
+        return None
+
+    return float(clock_ns - gnss_ns) * 1_000_000_000.0 / float(gnss_ns)
+
+
 def _monitor_count(r: dict) -> int:
     for path in (
         "instrument_count", "instrument_seconds", "clockface_n",
@@ -1468,12 +1505,12 @@ def clocks_combined_readout() -> list[str]:
     W_VALUE = 20
     W_TAU   = 18
     W_PPB   = 10
-    W_RAW   = 14
+    W_CAMP_PPB = 14
     W_RES   = 8
     W_MEAN  = 10
     W_SD    = 8
     W_SE    = 8
-    W_N     = 6
+    W_N     = 8
     W_BASE  = 10
     W_NOW   = 10
     W_DELTA = 10
@@ -1484,7 +1521,7 @@ def clocks_combined_readout() -> list[str]:
         f"{'VALUE':>{W_VALUE}}"
         f"{'TAU':>{W_TAU}}"
         f"{'PPB':>{W_PPB}}"
-        f"{'RAW':>{W_RAW}}"
+        f"{'CAMP PPB':>{W_CAMP_PPB}}"
         f"{'RES':>{W_RES}}"
         f"{'MEAN':>{W_MEAN}}"
         f"{'SD':>{W_SD}}"
@@ -1500,14 +1537,14 @@ def clocks_combined_readout() -> list[str]:
     gnss_ns = _clockface_value(r, "gnss")
     gnss_tau = 1.0
     gnss_ppb = 0.0
-    gnss_raw = _to_int(_field(r, "gnss.clock_interval_ns", "gnss.interval_ns", "gnss_interval_ns")) or 1_000_000_000
+    gnss_campaign_ppb = _campaign_ppb(r, "gnss")
     gnss_res = _to_int(_field(r, "gnss.second_residual_ns", "gnss_residual_ns")) or 0
     lines.append(
         f"{'GNSS':<{W_NAME}}"
         f"{_comma_int(gnss_ns, W_VALUE)}"
         f"{_fmt(gnss_tau, f'>{W_TAU}.12f', W_TAU)}"
         f"{_fmt(gnss_ppb, f'>{W_PPB}.3f', W_PPB)}"
-        f"{_comma_int(gnss_raw, W_RAW)}"
+        f"{_fmt(gnss_campaign_ppb, f'>{W_CAMP_PPB}.3f', W_CAMP_PPB)}"
         f"{_sign_int(gnss_res, W_RES)}"
         f"{_welford_cols_fragment(r, 'gnss', W_MEAN, W_SD, W_SE, W_N)}"
         f"  {_baseline_comp(baseline_ppb.get('gnss'), gnss_ppb)}"
@@ -1518,10 +1555,7 @@ def clocks_combined_readout() -> list[str]:
     vclock_tau = _to_float(_freq_value(r, "vclock", "tau"))
     vclock_ppb = _to_float(_freq_value(r, "vclock", "ppb"))
 
-    # RAW for VCLOCK is intentionally nanoseconds added to the VCLOCK ledger
-    # during the prior PPS second.  Cycle-domain truth still exists elsewhere
-    # (raw_cycles/DWT detail), but this panel groups VCLOCK with the standard
-    # nanosecond clocks.
+    vclock_campaign_ppb = _campaign_ppb(r, "vclock")
     vclock_res = _vclock_residual_ns(r)
     vclock_raw = _vclock_interval_ns(r)
 
@@ -1546,7 +1580,7 @@ def clocks_combined_readout() -> list[str]:
         f"{_comma_int(vclock_ns, W_VALUE)}"
         f"{_fmt(vclock_tau, f'>{W_TAU}.12f', W_TAU)}"
         f"{_fmt(vclock_ppb, f'>{W_PPB}.3f', W_PPB)}"
-        f"{_comma_int(vclock_raw, W_RAW)}"
+        f"{_fmt(vclock_campaign_ppb, f'>{W_CAMP_PPB}.3f', W_CAMP_PPB)}"
         f"{_sign_int(vclock_res, W_RES)}"
         f"{_welford_cols_fragment_or_zero(r, 'vclock', W_MEAN, W_SD, W_SE, W_N)}"
         f"  {_baseline_comp(baseline_ppb.get('vclock'), vclock_ppb)}"
@@ -1557,14 +1591,14 @@ def clocks_combined_readout() -> list[str]:
         ocxo_ns = _clockface_value(r, key)
         tau     = _to_float(_freq_value(r, key, "tau"))
         ppb     = _to_float(_freq_value(r, key, "ppb"))
-        raw     = _none_if_zero(_ocxo_interval_ns(r, key))
-        res     = _ocxo_residual_ns(r, key)
+        campaign_ppb = _campaign_ppb(r, key)
+        res          = _ocxo_residual_ns(r, key)
         lines.append(
             f"{name:<{W_NAME}}"
             f"{_comma_int(ocxo_ns, W_VALUE)}"
             f"{_fmt(tau, f'>{W_TAU}.12f', W_TAU)}"
             f"{_fmt(ppb, f'>{W_PPB}.3f', W_PPB)}"
-            f"{_comma_int(raw, W_RAW)}"
+            f"{_fmt(campaign_ppb, f'>{W_CAMP_PPB}.3f', W_CAMP_PPB)}"
             f"{_sign_int(res, W_RES)}"
             f"{_welford_cols_fragment(r, key, W_MEAN, W_SD, W_SE, W_N)}"
             f"  {_baseline_comp(baseline_ppb.get(key), ppb)}"
@@ -1584,7 +1618,7 @@ def clocks_combined_readout() -> list[str]:
         f"{_comma_int(gnss_raw_ns, W_VALUE)}"
         f"{_fmt(gnss_raw_tau, f'>{W_TAU}.12f', W_TAU)}"
         f"{_fmt(gnss_raw_ppb, f'>{W_PPB}.3f', W_PPB)}"
-        f"{_comma_int(gnss_raw_interval_ns, W_RAW)}"
+        f"{_fmt(gnss_raw_ppb, f'>{W_CAMP_PPB}.3f', W_CAMP_PPB)}"
         f"{_fmt(gnss_raw_res, f'>{W_RES}.1f', W_RES)}"
         f"{_welford_cols_extra(r, 'gnss_raw', W_MEAN, W_SD, W_SE, W_N)}"
         f"  {_baseline_comp(baseline_ppb.get('gnss_raw'), gnss_raw_ppb)}"
@@ -1625,7 +1659,7 @@ def clocks_combined_readout() -> list[str]:
             f"{_comma_int(dwt_total, W_VALUE)}"
             f"{_fmt(dwt_tau, f'>{W_TAU}.12f', W_TAU)}"
             f"{_fmt(dwt_ppb, f'>{W_PPB}.3f', W_PPB)}"
-            f"{_comma_int(dwt_raw, W_RAW)}"
+            f"{_fmt(None, f'>{W_CAMP_PPB}.3f', W_CAMP_PPB)}"
             f"{_sign_int(dwt_res, W_RES)}"
             f"{_welford_cols_fragment(r, 'dwt', W_MEAN, W_SD, W_SE, W_N)}"
             f"  {_baseline_comp(baseline_ppb.get('dwt'), dwt_ppb)}"
@@ -1635,7 +1669,7 @@ def clocks_combined_readout() -> list[str]:
     lines.append("")
     lines.extend(_dac_detail_lines(
         r, baseline, report_dac,
-        W_NAME, W_VALUE, W_TAU, W_PPB, W_RAW, W_RES,
+        W_NAME, W_VALUE, W_TAU, W_PPB, W_CAMP_PPB, W_RES,
         W_MEAN, W_SD, W_SE, W_N, W_BASE, W_NOW, W_DELTA,
     ))
 

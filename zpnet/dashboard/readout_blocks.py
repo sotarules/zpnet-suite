@@ -202,6 +202,55 @@ def _frequency(report: dict, lane: str) -> tuple[float | None, float | None]:
     return tau, ppb
 
 
+def _clockface_value(report: dict, lane: str):
+    """Return the MONITOR campaign/presentation clockface for one lane."""
+    for path in (
+        f"presentation_clockfaces.{lane}",
+        f"clockfaces.{lane}",
+        f"{lane}.presentation.ns",
+        f"{lane}.ns",
+    ):
+        value = _field(report, path)
+        if isinstance(value, dict):
+            value = value.get("ns") if value.get("ns") is not None else value.get("value")
+        if value is not None:
+            return _to_int(value)
+    return None
+
+
+def _campaign_ppb(report: dict, lane: str):
+    """Return campaign PPB from the active campaign clockface identity."""
+    state = str(
+        report.get("campaign_state")
+        or ("STARTED" if report.get("campaign_present") else "STOPPED")
+    ).upper()
+    if state != "STARTED" and not report.get("campaign_present"):
+        return None
+
+    if lane == "gnss":
+        return 0.0
+    if lane == "gnss_raw":
+        return _to_float(_extra(report, "gnss_raw_ppb"))
+    if lane == "dwt":
+        return None
+
+    explicit = _to_float(_field(
+        report,
+        f"{lane}.science.total_ppb",
+        f"{lane}.campaign.ppb",
+        f"campaign.{lane}.ppb",
+    ))
+    if explicit is not None:
+        return explicit
+
+    gnss_ns = _clockface_value(report, "gnss")
+    clock_ns = _clockface_value(report, lane)
+    if gnss_ns is None or clock_ns is None or gnss_ns <= 0:
+        return None
+
+    return float(clock_ns - gnss_ns) * 1_000_000_000.0 / float(gnss_ns)
+
+
 def _welford(report: dict, lane: str, field: str):
     if lane == "gnss_raw":
         return _extra(report, f"gnss_raw_welford_{field}")
@@ -305,14 +354,16 @@ def clocks_tau_readout() -> Generator[str, None, None]:
     yield header
     if report is None:
         return
-    yield f"{'CLK':<7}{'TAU':>17}{'PPB':>12}{'N':>8}"
+    yield f"{'CLK':<7}{'TAU':>17}{'PPB':>12}{'CAMP PPB':>12}{'N':>8}"
     for label, lane in (("GNSS", "gnss"), ("VCLOCK", "vclock"), ("OCXO1", "ocxo1"),
                         ("OCXO2", "ocxo2"), ("GN_RAW", "gnss_raw"), ("DWT", "dwt")):
         tau, ppb = _frequency(report, lane)
         tau_text = "---" if tau is None else f"{tau:.12f}"
         ppb_text = "---" if ppb is None else f"{ppb:+.3f}"
+        campaign_ppb = _campaign_ppb(report, lane)
+        campaign_ppb_text = "---" if campaign_ppb is None else f"{campaign_ppb:+.3f}"
         sample_n = _to_int(_welford(report, lane, "n"))
-        yield f"{label:<7}{tau_text:>17}{ppb_text:>12}{_integer(sample_n):>8}"
+        yield f"{label:<7}{tau_text:>17}{ppb_text:>12}{campaign_ppb_text:>12}{_integer(sample_n):>8}"
 
 
 def clocks_prediction_readout() -> Generator[str, None, None]:
